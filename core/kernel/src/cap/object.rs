@@ -1543,6 +1543,10 @@ unsafe fn dealloc_object_one(
                                     &mut ep.send_head,
                                     &mut ep.send_tail,
                                 );
+                                // Republish send-queue level (#285-adjacent):
+                                // this unlink can empty the queue, and the
+                                // wait-set self-heal reads the shadow locklessly.
+                                ep.refresh_send_ready();
                                 ep.lock.unlock_raw(saved);
                             }
                             IpcThreadState::BlockedOnRecv =>
@@ -2086,6 +2090,9 @@ unsafe fn dealloc_object_one(
                     }
                     ep.send_head = core::ptr::null_mut();
                     ep.send_tail = core::ptr::null_mut();
+                    // Keep the send-ready shadow consistent with send_head even
+                    // on the dealloc drain path (#285-adjacent).
+                    ep.refresh_send_ready();
                     // Wake receivers.
                     let mut tcb = ep.recv_head;
                     while !tcb.is_null()

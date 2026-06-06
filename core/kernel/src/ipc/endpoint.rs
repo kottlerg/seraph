@@ -40,6 +40,15 @@ pub struct EndpointState
     pub send_head: *mut ThreadControlBlock,
     /// Tail of the blocked-senders queue.
     pub send_tail: *mut ThreadControlBlock,
+    /// `1` iff `send_head != null`. Atomic shadow of send-queue non-emptiness
+    /// so the wait-set level-readiness self-heal (`wait_set::source_is_ready`)
+    /// can observe it with `Acquire` ordering without taking `lock` — taking
+    /// `lock` there would invert the `lock → ws.lock` order `waitset_notify`
+    /// uses and deadlock. Maintained (Release-stored) under `lock` at every
+    /// `send_head` mutation via [`EndpointState::refresh_send_ready`]; pairs
+    /// with the Acquire load so a queued sender whose enqueue fired no edge
+    /// notify is never missed on weak-memory targets (#285-adjacent).
+    pub send_nonempty: core::sync::atomic::AtomicU32,
     /// Head of the blocked-receivers queue (servers waiting for a caller).
     pub recv_head: *mut ThreadControlBlock,
     /// Tail of the blocked-receivers queue.
@@ -59,6 +68,13 @@ unsafe impl Send for EndpointState {}
 // SAFETY: EndpointState is accessed only under the relevant scheduler lock.
 unsafe impl Sync for EndpointState {}
 
+// Pins the retype-slot budget assumed by `cap::retype::dispatch_for(Endpoint)`:
+// the 24 B `EndpointObject` wrapper plus this state must fit BIN_128 (128 B).
+// Catches a future field addition that would overflow the bin.
+const _: () = {
+    assert!(24 + core::mem::size_of::<EndpointState>() <= 128);
+};
+
 impl EndpointState
 {
     /// Create a new, empty endpoint with no waiting threads.
@@ -67,12 +83,29 @@ impl EndpointState
         Self {
             send_head: core::ptr::null_mut(),
             send_tail: core::ptr::null_mut(),
+            send_nonempty: core::sync::atomic::AtomicU32::new(0),
             recv_head: core::ptr::null_mut(),
             recv_tail: core::ptr::null_mut(),
             wait_set: core::ptr::null_mut(),
             wait_set_member_idx: 0,
             lock: crate::sync::Spinlock::new(),
         }
+    }
+
+    /// Republish the `send_nonempty` shadow from the current `send_head`.
+    ///
+    /// MUST be called under `lock` after every `send_head` mutation so the
+    /// lockless `Acquire` reader in `wait_set::source_is_ready` observes the
+    /// current level. `Release` pairs with that `Acquire`.
+    ///
+    /// # Safety
+    /// Caller holds `self.lock` (serialises with all `send_head` writers).
+    pub unsafe fn refresh_send_ready(&self)
+    {
+        self.send_nonempty.store(
+            u32::from(!self.send_head.is_null()),
+            core::sync::atomic::Ordering::Release,
+        );
     }
 }
 
@@ -274,6 +307,8 @@ pub unsafe fn endpoint_call(
     unsafe {
         (*caller).ipc_msg = *msg;
         enqueue(&mut ep.send_head, &mut ep.send_tail, caller);
+        // Publish the send-queue level before the wait-set notify below.
+        ep.refresh_send_ready();
     }
     #[allow(clippy::cast_ptr_alignment)]
     let blocked_on = core::ptr::from_mut::<EndpointState>(ep).cast::<u8>();
@@ -291,6 +326,7 @@ pub unsafe fn endpoint_call(
         // SAFETY: ep.lock held.
         unsafe {
             unlink_from_wait_queue(caller, &mut ep.send_head, &mut ep.send_tail);
+            ep.refresh_send_ready();
             (*caller)
                 .context_saved
                 .store(1, core::sync::atomic::Ordering::Relaxed);
@@ -328,6 +364,9 @@ pub unsafe fn endpoint_recv(
 
     // SAFETY: send_head/send_tail maintained by enqueue/dequeue operations.
     let caller = unsafe { dequeue(&mut ep.send_head, &mut ep.send_tail) };
+    // Republish the send-queue level after the dequeue (may now be empty).
+    // SAFETY: ep.lock held.
+    unsafe { ep.refresh_send_ready() };
     if !caller.is_null()
     {
         // SAFETY: caller dequeued from send_head.

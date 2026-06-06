@@ -124,18 +124,25 @@ Best-effort replies may use the full reply-side capacity.
 
 ### Label 2: `RELEASE_MEMORY_CAPS`
 
-Voluntarily return Memory caps to the pool. Privilege: universal.
-Typically called by `unreserve_pages` after the caller has unmapped the
-range, or by long-lived services pruning their working set.
+Voluntarily return previously-granted Memory caps to the pool mid-life.
+Privilege: universal. Called by a long-lived process pruning its working
+set — e.g. ruststd releasing a reclaimed thread's Thread-retype slab so a
+bounded thread-churn loop holds a bounded pool footprint.
+
+The caller names each region by the `phys_base` memmgr reported in the
+granting `REQUEST_MEMORY_CAPS` reply, *not* by transferring the cap: a
+caller that has retyped the region (e.g. into a Thread) and dropped the
+inner cap no longer holds a cap to send back. memmgr keeps the outer cap
+as the per-process tracking anchor and uses `phys_base` to find it.
 
 **Request:**
 
 | Field | Value |
 |---|---|
 | label | 2 |
-| data[0] | `cap_count` (u32) |
-| data[1+i] | `page_count_for_cap_i` (u32) for each released cap |
-| cap[0..cap_count] | Memory capabilities being released |
+| data[0] | `count` (u32) |
+| data[1+i] | `phys_base_i` (u64) — physical base of region `i` to release |
+| cap[..] | any inner caps the caller still holds (dropped defensively) |
 
 **Reply (success):**
 
@@ -153,11 +160,16 @@ range, or by long-lived services pruning their working set.
 
 | Code | Name | Meaning |
 |---|---|---|
-| 4 | `InvalidArgument` | `cap_count == 0`, cap not previously issued to this badge, or page-count mismatch |
+| 4 | `InvalidArgument` | caller's badge is unknown |
 
-memmgr removes the listed caps from the per-process tracking entry,
-inserts them back into the appropriate free-pool buckets, and runs
-coalescing on adjacent runs.
+For each `phys_base`, memmgr finds the matching caller-owned grant
+(`FRAME_VA_UNMAPPED`) in the per-process tracking entry, returns its run to
+the free pool (coalescing where possible), and frees the tracking node.
+Bases that match no outstanding grant are ignored — release is idempotent,
+so a racing double-release (join plus reaper) is harmless. The caller MUST
+have already deleted every kernel object retyped from the region; releasing
+a region with a live retype is correctness-safe (the kernel refuses to
+re-hand-out live bytes) but strands the run until that retype is freed.
 
 ### Label 3: `REGISTER_PROCESS`
 

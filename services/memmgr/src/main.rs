@@ -588,6 +588,63 @@ impl ProcessRecord
         }
     }
 
+    /// Return a single caller-owned grant — identified by `phys` — to the pool
+    /// mid-life, freeing its tracking node. Matches the first `Node::Frame`
+    /// with `phys_base == phys` and `va == FRAME_VA_UNMAPPED`: only frames
+    /// issued via `REQUEST_MEMORY_CAPS` (caller owns the mapping) are
+    /// releasable this way; demand-mapped chunks (`va != FRAME_VA_UNMAPPED`)
+    /// are reclaimed only via `UNREGISTER_REGION` / `PROCESS_DIED` and are
+    /// skipped. Returns whether a grant matched.
+    ///
+    /// The run may be "dirty": its `MemoryObject` keeps the retype bump pointer
+    /// advanced even after the caller's retype was freed. `push_or_coalesce` is
+    /// sound regardless — `coalesce`'s `memory_merge` guards every join with
+    /// `.is_err()` and the kernel refuses to merge a non-virgin tail
+    /// (`sys_memory_merge`) or split past the bump (`sys_memory_split`), so a
+    /// dirty run is parked discrete and re-granted whole, reusing the kernel's
+    /// retype free-list. A varied-size workload that releases dirty runs may
+    /// see mild fragmentation (no sub-splitting until the run goes virgin);
+    /// same-size churn (the Thread-retype slab) is unaffected.
+    fn release_frame_by_phys(&mut self, phys: u64, pool: &mut FreePool) -> bool
+    {
+        let mut prev = NODE_NULL;
+        let mut cur = self.frame_head;
+        while cur != NODE_NULL
+        {
+            // SAFETY: cur is a live frame node.
+            let s = unsafe { *slot_ptr(cur) };
+            if let Node::Frame {
+                cap_slot,
+                page_count,
+                phys_base,
+                va,
+            } = s.node
+                && va == FRAME_VA_UNMAPPED
+                && phys_base == phys
+            {
+                let _ = pool.push_or_coalesce(FreeRun {
+                    cap_slot,
+                    page_count,
+                    phys_base,
+                });
+                if prev == NODE_NULL
+                {
+                    self.frame_head = s.next;
+                }
+                else
+                {
+                    // SAFETY: prev is a live frame node.
+                    unsafe { (*slot_ptr(prev)).next = s.next };
+                }
+                node_free(cur);
+                return true;
+            }
+            prev = cur;
+            cur = s.next;
+        }
+        false
+    }
+
     /// Reclaim every frame and region node on process death: each frame cap
     /// returns to the pool (the kernel's cspace-revoke cascade, run by procmgr
     /// before this point, already tore down the child's mappings, so no unmap
@@ -1158,7 +1215,19 @@ fn select_memory_caps(
         return Ok((granted, 1));
     }
 
-    // Best-effort: greedy, largest-first, bounded by reply slots.
+    // Best-effort: a single best-fit run satisfies the request with the fewest
+    // caps and reuses a freed run of the requested size instead of re-splitting
+    // a larger one, so churn that frees and re-requests a fixed size cycles the
+    // same run (and the same anchor slot) rather than leaking one per request.
+    // Fall back to greedy largest-first only when no single run is large enough.
+    if let Some(idx) = pool.smallest_fit(want_pages)
+        && let Some((outer, phys)) = take_exactly(pool, idx, want_pages)
+    {
+        granted[0] = (outer, want_pages, phys);
+        return Ok((granted, 1));
+    }
+
+    // Fallback: greedy, largest-first across multiple runs, bounded by reply slots.
     let mut count: usize = 0;
     let mut remaining = want_pages;
     while remaining > 0 && count < MAX_REPLY_CAPS
@@ -1320,16 +1389,39 @@ fn handle_request_memory_caps(req: &IpcMessage, ipc_buf: *mut u64)
 
 fn handle_release_memory_caps(req: &IpcMessage, ipc_buf: *mut u64)
 {
-    // First-cut RELEASE: receive the caller's caps, drop them. Per-process
-    // tracking is not updated; the underlying physical region remains
-    // pinned by memmgr's outer derivation until PROCESS_DIED reclaims the
-    // process. This is correctness-safe (no double-free) and intentionally
-    // conservative until userspace has a way to identify outers from
-    // received inner caps.
+    // Drop any inner caps the caller still holds. The common caller (ruststd
+    // releasing a reclaimed Thread-retype slab) already deleted its inner cap
+    // after retype, so this is usually empty; it is defensive for callers that
+    // hand the cap back too.
     for &slot in req.caps()
     {
         let _ = syscall::cap_delete(slot);
     }
+
+    let pool = pool_mut();
+    let Some(record) = table_mut().find_mut(req.badge)
+    else
+    {
+        reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
+        return;
+    };
+
+    // Each word names a previously-granted region by physical base (the value
+    // memmgr reported in the grant reply). Return every match to the pool;
+    // unmatched bases are ignored, so release is idempotent and a racing
+    // double-release (a joined thread plus the detached-thread reaper) is
+    // harmless. Clamp to the words actually present to stay in bounds.
+    let count = (req.word(0) as usize).min(req.word_count().saturating_sub(1));
+    for i in 0..count
+    {
+        let phys = req.word(1 + i);
+        let _ = record.release_frame_by_phys(phys, pool);
+    }
+    // Restore contiguity across the released runs. As in `handle_unregister_region`,
+    // `push_or_coalesce` only coalesces under slot pressure, so a release-heavy
+    // churn (ruststd returning Thread-retype slabs on join/reap) would otherwise
+    // fragment the pool monotonically.
+    pool.coalesce();
     reply_label(ipc_buf, memmgr_errors::SUCCESS);
 }
 
@@ -1628,6 +1720,12 @@ fn handle_unregister_region(req: &IpcMessage, ipc_buf: *mut u64)
     let end = region.va_base.saturating_add(region.len);
     let aspace_cap = record.aspace_cap;
     record.reclaim_frames_in(region.va_base, end, aspace_cap, pool);
+    // Restore contiguity across the reclaimed runs. The per-frame
+    // `push_or_coalesce` only fires `coalesce` under slot pressure, so a churn
+    // working set that never fills the array would otherwise leave the pool more
+    // fragmented after each register/unregister cycle, drifting the run (and
+    // tracking-anchor) count up monotonically across a long run.
+    pool.coalesce();
     reply_label(ipc_buf, memmgr_errors::SUCCESS);
 }
 

@@ -10,6 +10,7 @@ init-protocol = { workspace = true }
 font = { workspace = true }
 mmio = { workspace = true }
 syscall = { workspace = true }
+text = { workspace = true }
 
 [[bin]]
 name = "kernel"

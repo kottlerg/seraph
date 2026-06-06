@@ -45,10 +45,11 @@ jobs:
         # recipe (or swaps boot.conf for ktest), then runs once. Avoids
         # back-to-back fatfs/sysroot state accumulation across harnesses
         # and lets a failing tier surface as a single named cell. The
-        # svctest cell additionally runs the virtio-input smoke test as a
-        # second boot — it needs the QMP `test-input` runner (not
-        # run-parallel), and colocating it avoids a matrix dimension that
-        # would multiply with every arch. See docs/testing.md.
+        # usertest cell additionally runs the terminal interactive test as
+        # a second boot — it needs the QMP `test-terminal` runner (not
+        # run-parallel), and colocating it (both programs-surface) avoids a
+        # matrix dimension that would multiply with every arch. See
+        # docs/testing.md.
         tester: [svctest, usertest, ktest]
     steps:
       - uses: actions/checkout@v6
@@ -104,6 +105,13 @@ jobs:
         # svctest without racing pwrmgr shutdown; its bounded faults
         # finish long before svctest's terminal marker. This is the only
         # automated boot crasher runs in.
+        #
+        # The functional harness boots also drop the autostarted `terminal`
+        # (a user-facing program, not part of the services/programs substrate
+        # under test) so the boot is controlled and to avoid a flaky bringup
+        # deadlock under load (#290). `--repack-only` makes the removal stick:
+        # a normal repack re-mirrors rootfs, which would restore terminal.svc.
+        # The terminal is exercised in its own boot (test-terminal, below).
         run: |
           case "${{ matrix.tester }}" in
             svctest)
@@ -111,12 +119,14 @@ jobs:
                  sysroot/config/svcmgr/services/
               cp sysroot/config/svcmgr/tests/crasher.svc \
                  sysroot/config/svcmgr/services/
-              cargo xtask mkdisk --arch ${{ matrix.arch }}
+              rm -f sysroot/config/svcmgr/services/terminal.svc
+              cargo xtask mkdisk --arch ${{ matrix.arch }} --repack-only
               ;;
             usertest)
               cp sysroot/config/svcmgr/tests/usertest.svc \
                  sysroot/config/svcmgr/services/
-              cargo xtask mkdisk --arch ${{ matrix.arch }}
+              rm -f sysroot/config/svcmgr/services/terminal.svc
+              cargo xtask mkdisk --arch ${{ matrix.arch }} --repack-only
               ;;
             ktest)
               cargo xtask compose-bundle --arch ${{ matrix.arch }} --harness ktest
@@ -128,18 +138,17 @@ jobs:
           cargo xtask run-parallel \
             --arch ${{ matrix.arch }} \
             --parallel 1 --runs 1 --timeout 180
-          if [ "${{ matrix.tester }}" = "svctest" ]; then
-            # Second boot: the virtio-input keyboard smoke test. It needs the
-            # QMP `test-input` runner (host-side key injection) and so cannot
-            # ride run-parallel; colocated here (both services-surface,
-            # shutdown-invoking) to avoid a separate matrix dimension.
-            # Re-stage so only inputtest runs this boot.
-            rm -f sysroot/config/svcmgr/services/svctest.svc \
-                  sysroot/config/svcmgr/services/crasher.svc
-            cp sysroot/config/svcmgr/tests/inputtest.svc \
-               sysroot/config/svcmgr/services/
+          if [ "${{ matrix.tester }}" = "usertest" ]; then
+            # Second boot: the terminal interactive test (keyboard input
+            # through the terminal). It needs the QMP `test-terminal` runner
+            # (host-side key injection) and so cannot ride run-parallel;
+            # colocated here (both programs-surface) to avoid a separate
+            # matrix dimension. Drop usertest.svc and repack with the rootfs
+            # re-mirror, which restores terminal.svc — yielding exactly the
+            # default interactive boot that `cargo xtask run` produces.
+            rm -f sysroot/config/svcmgr/services/usertest.svc
             cargo xtask mkdisk --arch ${{ matrix.arch }}
-            cargo xtask test-input --arch ${{ matrix.arch }}
+            cargo xtask test-terminal --arch ${{ matrix.arch }}
           fi
 
       - name: Upload run-parallel logs

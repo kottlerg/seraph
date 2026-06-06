@@ -280,13 +280,6 @@ const SPECS: &[Spec] = &[
         arch_only: None,
     },
     Spec {
-        name: "inputtest",
-        install_name: None,
-        profile: BuildProfile::StdUser,
-        dest: InstallDest::Tests,
-        arch_only: None,
-    },
-    Spec {
         name: "hello",
         install_name: None,
         profile: BuildProfile::StdUser,
@@ -302,6 +295,20 @@ const SPECS: &[Spec] = &[
     },
     Spec {
         name: "fb-charset",
+        install_name: None,
+        profile: BuildProfile::StdUser,
+        dest: InstallDest::Programs,
+        arch_only: None,
+    },
+    Spec {
+        name: "terminal",
+        install_name: None,
+        profile: BuildProfile::StdUser,
+        dest: InstallDest::Programs,
+        arch_only: None,
+    },
+    Spec {
+        name: "echosh",
         install_name: None,
         profile: BuildProfile::StdUser,
         dest: InstallDest::Programs,
@@ -406,6 +413,8 @@ fn spec_for(component: BuildComponent) -> Option<&'static Spec>
         BuildComponent::Hello => "hello",
         BuildComponent::HelloTester => "hello-tester",
         BuildComponent::FbCharset => "fb-charset",
+        BuildComponent::Terminal => "terminal",
+        BuildComponent::Echosh => "echosh",
         BuildComponent::Fsbench => "fsbench",
         BuildComponent::Stackoverflow => "stackoverflow",
         BuildComponent::Pipefault => "pipefault",

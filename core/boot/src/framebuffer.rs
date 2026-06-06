@@ -5,12 +5,20 @@
 
 //! Framebuffer text renderer.
 //!
-//! Renders glyphs from the embedded 9×20 bitmap font into a linear
-//! RGBX/BGRX framebuffer. Tracks cursor position, handles line wrap,
-//! and scrolls when the last row is filled.
+//! Decodes a UTF-8 byte stream and renders glyphs from the embedded 9×20
+//! bitmap font into a linear RGBX/BGRX framebuffer. Tracks cursor
+//! position, handles line wrap, and scrolls when the last row is filled.
+//! Codepoint → bitmap resolution (CP437 reverse → font extension → ASCII
+//! fallback → `U+FFFD`) is shared with the userspace driver through
+//! `shared/text::render_codepoint`.
 
 use boot_protocol::{FramebufferInfo, PixelFormat};
-use font::{FONT_9X20, GLYPH_HEIGHT, GLYPH_WIDTH};
+use font::{GLYPH_HEIGHT, GLYPH_WIDTH};
+use text::{DecodeOutcome, Utf8Decoder};
+
+/// `U+FFFD` replacement character, rendered for any byte that does not
+/// extend a valid UTF-8 sequence.
+const REPLACEMENT_CODEPOINT: u32 = 0xFFFD;
 
 /// Framebuffer text renderer.
 ///
@@ -27,6 +35,7 @@ pub struct FramebufferWriter
     max_rows: u32,
     col: u32,
     row: u32,
+    decoder: Utf8Decoder,
 }
 
 impl FramebufferWriter
@@ -58,6 +67,7 @@ impl FramebufferWriter
             max_rows,
             col: 0,
             row: 0,
+            decoder: Utf8Decoder::new(),
         };
 
         // SAFETY: caller guarantees the framebuffer is a valid, writable region.
@@ -67,10 +77,11 @@ impl FramebufferWriter
         Some(writer)
     }
 
-    /// Write one byte to the framebuffer, advancing the cursor.
-    ///
-    /// Handles `\n` (newline + carriage return), `\r` (carriage return),
-    /// and printable ASCII/Latin-1. Non-renderable bytes are silently ignored.
+    /// Feed one byte of a UTF-8 stream to the framebuffer, advancing the
+    /// cursor. `\n`/`\r` reset the decoder and move the cursor; other
+    /// bytes accumulate in the decoder until a codepoint completes, then
+    /// render through the shared resolver chain. A byte that breaks the
+    /// UTF-8 stream renders `U+FFFD`.
     ///
     /// # Safety
     /// The framebuffer pointer must remain valid and writable.
@@ -80,45 +91,65 @@ impl FramebufferWriter
         {
             b'\n' =>
             {
-                self.col = 0;
-                self.row += 1;
-                // SAFETY: framebuffer pointer is valid per struct invariant.
-                if self.row >= self.max_rows
-                {
-                    // SAFETY: framebuffer base/pitch validated during init; scroll writes within bounds.
-                    unsafe {
-                        self.scroll();
-                    }
+                self.decoder.reset();
+                // SAFETY: framebuffer base/pitch validated during init; scroll writes within bounds.
+                unsafe {
+                    self.newline();
                 }
             }
             b'\r' =>
             {
+                self.decoder.reset();
                 self.col = 0;
             }
-            0x20..=0xFF =>
+            _ =>
             {
-                // SAFETY: framebuffer is valid; cursor is within bounds.
-                unsafe {
-                    self.draw_glyph(byte);
-                }
-                self.col += 1;
-                if self.col >= self.max_cols
+                let cp = match self.decoder.push(byte)
                 {
-                    self.col = 0;
-                    self.row += 1;
-                    // SAFETY: framebuffer pointer is valid.
-                    if self.row >= self.max_rows
-                    {
-                        // SAFETY: framebuffer base/pitch validated during init; scroll writes within bounds.
-                        unsafe {
-                            self.scroll();
-                        }
-                    }
+                    DecodeOutcome::Codepoint(cp) => cp,
+                    DecodeOutcome::Invalid => REPLACEMENT_CODEPOINT,
+                    DecodeOutcome::NeedMore => return,
+                };
+                // SAFETY: framebuffer is valid; cursor is bounded by max_cols/max_rows.
+                unsafe {
+                    self.draw_codepoint(cp);
                 }
             }
-            _ =>
-            {}
         }
+    }
+
+    /// Advance the cursor to the start of the next line, scrolling if the
+    /// last row is filled.
+    ///
+    /// # Safety
+    /// The framebuffer pointer must remain valid and writable.
+    unsafe fn newline(&mut self)
+    {
+        self.col = 0;
+        self.row += 1;
+        if self.row >= self.max_rows
+        {
+            // SAFETY: framebuffer base/pitch validated during init; scroll writes within bounds.
+            unsafe {
+                self.scroll();
+            }
+        }
+    }
+
+    /// Resolve `cp` to one or more 9×20 glyph bitmaps and blit them at the
+    /// cursor.
+    ///
+    /// # Safety
+    /// The framebuffer pointer must remain valid and writable.
+    unsafe fn draw_codepoint(&mut self, cp: u32)
+    {
+        text::render_codepoint(cp, &mut |bitmap| {
+            // SAFETY: framebuffer pointer is valid; bitmap is a 20-entry
+            // glyph slice from the shared font tables.
+            unsafe {
+                self.draw_glyph_bitmap(bitmap);
+            }
+        });
     }
 
     /// Clear the entire framebuffer to black.
@@ -140,19 +171,20 @@ impl FramebufferWriter
         }
     }
 
-    /// Draw glyph for `byte` at current cursor position.
+    /// Blit a 9×20 glyph bitmap at the current cursor and advance one
+    /// column, wrapping to the next line at the right margin. The bitmap
+    /// encoding matches `font::FONT_9X20`: 20 u16 scanlines, bits 15..=7
+    /// being the 9 pixels (MSB leftmost).
     ///
     /// # Safety
     /// Framebuffer pointer must be valid; cursor must be within bounds.
-    unsafe fn draw_glyph(&mut self, byte: u8)
+    unsafe fn draw_glyph_bitmap(&mut self, bitmap: &[u16])
     {
-        let glyph_idx = byte as usize;
         let pixel_x = self.col * GLYPH_WIDTH;
         let pixel_y = self.row * GLYPH_HEIGHT;
 
-        for row_idx in 0..(GLYPH_HEIGHT as usize)
+        for (row_idx, &bits) in bitmap.iter().enumerate().take(GLYPH_HEIGHT as usize)
         {
-            let bits = FONT_9X20[glyph_idx * (GLYPH_HEIGHT as usize) + row_idx];
             let scan_y = pixel_y as usize + row_idx;
             let row_base = scan_y * self.stride as usize;
 
@@ -188,6 +220,15 @@ impl FramebufferWriter
                         }
                     }
                 }
+            }
+        }
+
+        self.col += 1;
+        if self.col >= self.max_cols
+        {
+            // SAFETY: framebuffer base/pitch validated during init; wrap writes within bounds.
+            unsafe {
+                self.newline();
             }
         }
     }

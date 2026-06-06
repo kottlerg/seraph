@@ -3,7 +3,7 @@
 
 // shared/text/src/lib.rs
 
-//! Byte-stream → glyph primitives for the userspace framebuffer driver.
+//! Byte-stream → glyph primitives shared by every framebuffer console.
 //!
 //! `no_std`, no allocation. Depends only on `shared/font` for the bitmap
 //! data. Provides:
@@ -20,10 +20,10 @@
 //!   into the four sources above and emits 9×20 glyph bitmaps via a
 //!   caller-supplied sink closure.
 //!
-//! The framebuffer driver is the sole consumer today. A follow-up issue
-//! tracks back-porting the same resolver chain into the kernel,
-//! bootloader, and ktest renderers so the early-boot consoles can print
-//! the same characters.
+//! Consumed by the userspace framebuffer driver and the early-boot
+//! framebuffer consoles (kernel, bootloader, ktest); each holds its own
+//! [`Utf8Decoder`] and resolves the same glyph set through
+//! [`render_codepoint`].
 
 #![no_std]
 

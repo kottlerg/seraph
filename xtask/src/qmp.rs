@@ -3,9 +3,9 @@
 
 //! qmp.rs
 //!
-//! Minimal QMP (QEMU Machine Protocol) client for the interactive-input test.
+//! Minimal QMP (QEMU Machine Protocol) client for the interactive-input tests.
 //! Connects to QEMU's `-qmp unix:...` socket, completes the capabilities
-//! handshake, and injects a fixed keyboard sequence via `input-send-event`.
+//! handshake, and injects keyboard events via `input-send-event`.
 //!
 //! Hand-rolled (no JSON dependency): the handful of QMP messages are fixed
 //! strings and responses are matched by substring. QMP messages are
@@ -19,23 +19,11 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
 
-/// The key sequence injected by the input smoke test, as `(QKeyCode, down)`
-/// pairs. After virtio-input decode this yields `a`, `A` (shifted), and Return
-/// — the sequence `services/inputtest` asserts.
-const SEQUENCE: &[(&str, bool)] = &[
-    ("a", true),
-    ("a", false),
-    ("shift", true),
-    ("a", true),
-    ("a", false),
-    ("shift", false),
-    ("ret", true),
-    ("ret", false),
-];
-
-/// Connect to the QMP socket, complete the handshake, and inject the input
-/// test key sequence.
-pub fn inject_input_test_sequence(socket: &Path) -> Result<()>
+/// Connect to the QMP socket, complete the handshake, and inject each
+/// `(qcode, down)` event via `input-send-event`, in order. Callers build the
+/// event list (taps are a down/up pair; held modifiers wrap the keys they
+/// modify).
+pub fn inject_events(socket: &Path, events: &[(&str, bool)]) -> Result<()>
 {
     let stream = connect_with_retry(socket)?;
     stream
@@ -50,7 +38,7 @@ pub fn inject_input_test_sequence(socket: &Path) -> Result<()>
     send(&mut writer, r#"{"execute":"qmp_capabilities"}"#)?;
     read_response(&mut reader).context("qmp_capabilities handshake")?;
 
-    for &(qcode, down) in SEQUENCE
+    for &(qcode, down) in events
     {
         // Omit the `device` argument: in headless mode virtio-keyboard is the
         // sole keyboard, so the event routes to it unambiguously.

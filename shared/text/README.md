@@ -1,6 +1,6 @@
 # shared/text
 
-Byte-stream → glyph primitives for the userspace framebuffer driver.
+Byte-stream → glyph primitives shared by every Seraph framebuffer console.
 
 ---
 
@@ -44,10 +44,13 @@ nothing matches, slot 0 of `FONT_9X20_EXT` (`U+FFFD`) is emitted.
 | Consumer | Use |
 |---|---|
 | `services/drivers/framebuffer` | Owns one `Utf8Decoder` in its service loop; dispatches every assembled codepoint via `render_codepoint`. |
+| `core/kernel` | Early-boot / panic framebuffer console (`core/kernel/src/framebuffer.rs`). |
+| `core/boot` | UEFI bootloader pre-`ExitBootServices` framebuffer console (`core/boot/src/framebuffer.rs`). |
+| `core/ktest` | ktest harness direct framebuffer output (`core/ktest/src/framebuffer.rs`). |
 
-A follow-up issue tracks back-porting the same chain into the kernel,
-bootloader, and ktest renderers so the early-boot consoles can print
-the same characters.
+Each consumer holds its own `Utf8Decoder` and feeds bytes through the
+same `render_codepoint` chain, so every framebuffer surface resolves the
+identical glyph set.
 
 ## Licensing
 

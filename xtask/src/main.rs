@@ -58,7 +58,7 @@ fn main()
         CliCommand::RunParallel(args) => commands::run_parallel::run(&ctx, args),
         CliCommand::Mkdisk(args) => commands::mkdisk::run(&ctx, args),
         CliCommand::ComposeBundle(args) => commands::compose_bundle::run(&ctx, args),
-        CliCommand::TestInput(args) => commands::test_input::run(&ctx, args),
+        CliCommand::TestTerminal(args) => commands::test_terminal::run(&ctx, args),
     };
 
     if let Err(err) = result

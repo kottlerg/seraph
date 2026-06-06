@@ -884,10 +884,11 @@ pub unsafe fn exit_boot_services(
 /// Both architectures acquire the framebuffer through the same UEFI GOP path,
 /// so issuing one `SetMode` request here gives a consistent framebuffer — and
 /// QEMU window — size across x86-64 and RISC-V, independent of firmware or
-/// QEMU-version defaults. 1024x768 is the largest mode QEMU's RISC-V `ramfb`
-/// GOP (`QemuRamfbDxe`) offers and is also present in x86-64 OVMF's mode list;
-/// when a firmware does not offer it, `set_target_mode` leaves the active mode
-/// untouched and boot proceeds at whatever resolution firmware selected.
+/// QEMU-version defaults. 1024x768 is a near-universal VESA mode offered by
+/// both arches' GOP (under QEMU both run std VGA, same `QemuVideoDxe` mode
+/// table). When a firmware does not offer it, `set_target_mode` leaves the
+/// active mode untouched and boot proceeds at whatever resolution firmware
+/// selected.
 const TARGET_FB_WIDTH: u32 = 1024;
 const TARGET_FB_HEIGHT: u32 = 768;
 

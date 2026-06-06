@@ -150,6 +150,9 @@ fn extend_x86(args: &mut Vec<String>, spec: &QemuLaunchSpec, accel: Accel)
         ),
     ]);
 
+    // Non-headless x86-64 uses the q35 default adapter (QEMU std VGA) — the
+    // same device riscv64 selects explicitly via `-device VGA`. Headless drops
+    // it so no framebuffer is advertised.
     if spec.headless
     {
         args.extend(["-vga".into(), "none".into()]);
@@ -190,15 +193,16 @@ fn extend_riscv(args: &mut Vec<String>, spec: &QemuLaunchSpec)
 
     if !spec.headless
     {
-        // The virt machine has no built-in display. ramfb provides a
-        // framebuffer, but without a graphical display backend QEMU falls back
-        // to VNC. Only add display devices when a graphical backend is
-        // available.
+        // The virt machine has no built-in display. Use QEMU std VGA — the
+        // same adapter q35 gives x86-64 by default — so both arches present an
+        // identical UEFI GOP (`QemuVideoDxe`, same mode table). Without a
+        // graphical display backend QEMU falls back to VNC, so only add the
+        // display devices when a backend is available.
         if let Some(backend) = preferred_display_backend(spec.arch.qemu_binary())
         {
             args.extend([
                 "-device".into(),
-                "ramfb".into(),
+                "VGA".into(),
                 "-device".into(),
                 "qemu-xhci".into(),
                 "-device".into(),

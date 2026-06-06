@@ -182,7 +182,9 @@ cargo xtask test-input
 ```
 
 This QMP-injection mechanism is the reusable foundation for future
-interactive tests (terminal, shell, line editing).
+interactive tests (terminal, shell, line editing). In CI it runs as a
+second boot inside the `svctest` cell (after svctest's own run), rather
+than as a separate matrix dimension that would multiply with each arch.
 
 ### One shutdown-invoking harness per boot
 
@@ -197,7 +199,10 @@ the services-surface CI cell so its restart loop is exercised there; its
 bounded faults complete long before `svctest`'s terminal marker, so the
 kernel fault dump never clobbers it.
 
-CI matrix cells follow this rule: one shutdown-invoking harness per cell.
+CI matrix cells follow this rule per boot. The `svctest` cell runs two
+boots in sequence — `svctest` (via `run-parallel`), then `inputtest` (via
+`test-input`) after re-staging — so each boot still has exactly one
+shutdown-invoking harness.
 
 ---
 

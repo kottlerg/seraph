@@ -44,9 +44,12 @@ jobs:
         # One harness per cell: each cell builds once, stages exactly one
         # recipe (or swaps boot.conf for ktest), then runs once. Avoids
         # back-to-back fatfs/sysroot state accumulation across harnesses
-        # and lets a failing tier surface as a single named cell. See
-        # docs/testing.md for the recipe-dir gating contract.
-        tester: [svctest, usertest, ktest, inputtest]
+        # and lets a failing tier surface as a single named cell. The
+        # svctest cell additionally runs the virtio-input smoke test as a
+        # second boot — it needs the QMP `test-input` runner (not
+        # run-parallel), and colocating it avoids a matrix dimension that
+        # would multiply with every arch. See docs/testing.md.
+        tester: [svctest, usertest, ktest]
     steps:
       - uses: actions/checkout@v6
 
@@ -115,11 +118,6 @@ jobs:
                  sysroot/config/svcmgr/services/
               cargo xtask mkdisk --arch ${{ matrix.arch }}
               ;;
-            inputtest)
-              cp sysroot/config/svcmgr/tests/inputtest.svc \
-                 sysroot/config/svcmgr/services/
-              cargo xtask mkdisk --arch ${{ matrix.arch }}
-              ;;
             ktest)
               cargo xtask compose-bundle --arch ${{ matrix.arch }} --harness ktest
               ;;
@@ -127,14 +125,21 @@ jobs:
 
       - name: Run ${{ matrix.tester }}
         run: |
-          if [ "${{ matrix.tester }}" = "inputtest" ]; then
-            # Interactive cell: boot with a QMP control socket and inject a
-            # known key sequence, asserting the guest's ALL TESTS PASSED marker.
+          cargo xtask run-parallel \
+            --arch ${{ matrix.arch }} \
+            --parallel 1 --runs 1 --timeout 180
+          if [ "${{ matrix.tester }}" = "svctest" ]; then
+            # Second boot: the virtio-input keyboard smoke test. It needs the
+            # QMP `test-input` runner (host-side key injection) and so cannot
+            # ride run-parallel; colocated here (both services-surface,
+            # shutdown-invoking) to avoid a separate matrix dimension.
+            # Re-stage so only inputtest runs this boot.
+            rm -f sysroot/config/svcmgr/services/svctest.svc \
+                  sysroot/config/svcmgr/services/crasher.svc
+            cp sysroot/config/svcmgr/tests/inputtest.svc \
+               sysroot/config/svcmgr/services/
+            cargo xtask mkdisk --arch ${{ matrix.arch }}
             cargo xtask test-input --arch ${{ matrix.arch }}
-          else
-            cargo xtask run-parallel \
-              --arch ${{ matrix.arch }} \
-              --parallel 1 --runs 1 --timeout 180
           fi
 
       - name: Upload run-parallel logs

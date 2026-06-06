@@ -16,7 +16,7 @@ acquisition, `ExitBootServices`, and error handling.
 |---|---|---|---|
 | `EFI_LOADED_IMAGE_PROTOCOL` | `HandleProtocol(image_handle)` | Obtain device handle for the boot volume | Yes |
 | `EFI_SIMPLE_FILE_SYSTEM_PROTOCOL` | `HandleProtocol(device_handle)` | Open the ESP root directory | Yes |
-| `EFI_GRAPHICS_OUTPUT_PROTOCOL` | `LocateProtocol(NULL)` | Record framebuffer address, dimensions, format | No |
+| `EFI_GRAPHICS_OUTPUT_PROTOCOL` | `LocateHandleBuffer(ByProtocol)` | Select a fixed mode; record framebuffer address, dimensions, format | No |
 | `EFI_GET_MEMORY_MAP` | `BootServices->GetMemoryMap` | Query physical memory layout | Yes |
 | `EFI_ALLOCATE_PAGES` | `BootServices->AllocatePages` | Allocate physical memory for all loaded data | Yes |
 | `EFI_CONFIGURATION_TABLE` | `SystemTable->ConfigurationTable` | Locate ACPI RSDP or Device Tree blob | Arch-specific |
@@ -24,6 +24,14 @@ acquisition, `ExitBootServices`, and error handling.
 `EFI_GRAPHICS_OUTPUT_PROTOCOL` is optional — its absence is handled gracefully by
 zeroing the `framebuffer.physical_base` field in `BootInfo`. A headless system or a
 virtual machine without a GOP framebuffer is a valid configuration.
+
+When GOP is present, the bootloader requests a fixed 1024x768 mode via `SetMode`
+before recording the active mode for handoff (`TARGET_FB_WIDTH` /
+`TARGET_FB_HEIGHT` in [`boot/src/uefi.rs`](../src/uefi.rs)). Both architectures
+acquire the framebuffer through this same GOP path, so the fixed request yields a
+consistent framebuffer size across x86-64 and RISC-V rather than one dependent on
+per-firmware or per-QEMU defaults. The request is best-effort: if the firmware's
+GOP does not offer the target mode, the active mode is left unchanged.
 
 `EFI_CONFIGURATION_TABLE` entries are needed for firmware table parsing: on x86-64
 the ACPI `EFI_ACPI_20_TABLE_GUID` entry locates the RSDP; on RISC-V the

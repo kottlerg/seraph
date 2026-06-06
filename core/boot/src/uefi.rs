@@ -434,7 +434,7 @@ pub struct EfiGraphicsOutputProtocol
         size_of_info: *mut usize,
         info: *mut *mut EfiGopModeInfo,
     ) -> EfiStatus,
-    pub set_mode: usize,
+    pub set_mode: unsafe extern "efiapi" fn(this: *mut Self, mode_number: u32) -> EfiStatus,
     pub blt: usize,
     pub mode: *mut EfiGopMode,
 }
@@ -879,6 +879,119 @@ pub unsafe fn exit_boot_services(
     }
 }
 
+/// Framebuffer resolution the bootloader requests from GOP at boot.
+///
+/// Both architectures acquire the framebuffer through the same UEFI GOP path,
+/// so issuing one `SetMode` request here gives a consistent framebuffer — and
+/// QEMU window — size across x86-64 and RISC-V, independent of firmware or
+/// QEMU-version defaults. 1024x768 is the largest mode QEMU's RISC-V `ramfb`
+/// GOP (`QemuRamfbDxe`) offers and is also present in x86-64 OVMF's mode list;
+/// when a firmware does not offer it, `set_target_mode` leaves the active mode
+/// untouched and boot proceeds at whatever resolution firmware selected.
+const TARGET_FB_WIDTH: u32 = 1024;
+const TARGET_FB_HEIGHT: u32 = 768;
+
+/// Classify a GOP mode's pixel layout as a supported [`PixelFormat`].
+///
+/// Returns `None` for layouts the framebuffer console cannot consume:
+/// `PixelBltOnly` (no linear buffer) or a `PixelBitMask` whose channel masks
+/// are neither of the two standard 8bpc RGBX / BGRX layouts.
+fn classify_pixel_format(info: &EfiGopModeInfo) -> Option<PixelFormat>
+{
+    if info.pixel_format == GOP_PIXEL_RED_GREEN_BLUE_RESERVED_8BIT_PER_COLOR
+    {
+        Some(PixelFormat::Rgbx8)
+    }
+    else if info.pixel_format == GOP_PIXEL_BLUE_GREEN_RED_RESERVED_8BIT_PER_COLOR
+    {
+        Some(PixelFormat::Bgrx8)
+    }
+    else if info.pixel_format == GOP_PIXEL_BIT_MASK
+    {
+        let masks = info.pixel_information;
+        if masks == BITMASK_RGBX8
+        {
+            Some(PixelFormat::Rgbx8)
+        }
+        else if masks == BITMASK_BGRX8
+        {
+            Some(PixelFormat::Bgrx8)
+        }
+        else
+        {
+            None
+        }
+    }
+    else
+    {
+        None
+    }
+}
+
+/// Request [`TARGET_FB_WIDTH`]×[`TARGET_FB_HEIGHT`] on `gop`, best-effort.
+///
+/// Scans the GOP mode list; on the first mode that matches the target
+/// resolution with a console-supported pixel format, issues `SetMode` unless
+/// it is already active. Any `QueryMode` / `SetMode` failure — or no match —
+/// leaves the firmware's current mode in place; the caller then hands off
+/// whatever mode is active. `QueryMode` allocates each info buffer from pool,
+/// so every successful query is paired with a `FreePool`.
+///
+/// # Safety
+/// `bs` must be valid boot services; `gop` must point to a valid
+/// `EFI_GRAPHICS_OUTPUT_PROTOCOL` whose `mode` is populated by firmware.
+unsafe fn set_target_mode(bs: *mut EfiBootServices, gop: *mut EfiGraphicsOutputProtocol)
+{
+    // SAFETY: gop is valid; mode is populated by firmware.
+    let max_mode = unsafe { (*(*gop).mode).max_mode };
+    // SAFETY: gop is valid; mode is populated by firmware.
+    let current = unsafe { (*(*gop).mode).mode };
+
+    for i in 0..max_mode
+    {
+        let mut size: usize = 0;
+        let mut info: *mut EfiGopModeInfo = core::ptr::null_mut();
+        // SAFETY: gop is valid; query_mode writes size/info on success.
+        let status = unsafe {
+            ((*gop).query_mode)(
+                gop,
+                i,
+                core::ptr::addr_of_mut!(size),
+                core::ptr::addr_of_mut!(info),
+            )
+        };
+        if status != EFI_SUCCESS || info.is_null()
+        {
+            continue;
+        }
+
+        let is_target = {
+            // SAFETY: query_mode populated info on success.
+            let mode_info = unsafe { &*info };
+            mode_info.horizontal_resolution == TARGET_FB_WIDTH
+                && mode_info.vertical_resolution == TARGET_FB_HEIGHT
+                && classify_pixel_format(mode_info).is_some()
+        };
+
+        // QueryMode allocated the info buffer from pool; release it before the
+        // next iteration regardless of match.
+        // SAFETY: info came from query_mode and is unused after this point.
+        unsafe {
+            ((*bs).free_pool)(info.cast::<core::ffi::c_void>());
+        }
+
+        if is_target
+        {
+            if i != current
+            {
+                // SAFETY: gop is valid; i < max_mode is a valid mode number.
+                let _ = unsafe { ((*gop).set_mode)(gop, i) };
+            }
+            return;
+        }
+    }
+}
+
 /// Locate a usable `EFI_GRAPHICS_OUTPUT_PROTOCOL` and return framebuffer information.
 ///
 /// Enumerates all handles supporting GOP via `LocateHandleBuffer(ByProtocol)` and
@@ -931,38 +1044,21 @@ pub unsafe fn query_gop(bs: *mut EfiBootServices) -> Option<FramebufferInfo>
             continue;
         }
         let gop = iface.cast::<EfiGraphicsOutputProtocol>();
-        // SAFETY: gop is a valid protocol pointer; mode is populated by firmware.
+        // Request the target mode before reading the active one, so the
+        // framebuffer (and the QEMU window) is the same size on both arches.
+        // Best-effort: on failure the firmware's current mode is kept.
+        // SAFETY: bs is valid; gop is a valid GOP protocol pointer.
+        unsafe {
+            set_target_mode(bs, gop);
+        }
+
+        // SAFETY: gop is a valid protocol pointer; mode/info are populated by
+        // firmware and reflect the now-active mode.
         let mode = unsafe { &*(*gop).mode };
         // SAFETY: mode.info is populated by firmware.
         let info = unsafe { &*mode.info };
 
-        // Skip PixelBltOnly (format 3) — no linear framebuffer exists.
-        // For PixelBitMask (format 2), accept only the two standard 8bpc layouts
-        // that map exactly to our Rgbx8 / Bgrx8 variants; skip all others.
-        let pixel_format = if info.pixel_format == GOP_PIXEL_RED_GREEN_BLUE_RESERVED_8BIT_PER_COLOR
-        {
-            PixelFormat::Rgbx8
-        }
-        else if info.pixel_format == GOP_PIXEL_BLUE_GREEN_RED_RESERVED_8BIT_PER_COLOR
-        {
-            PixelFormat::Bgrx8
-        }
-        else if info.pixel_format == GOP_PIXEL_BIT_MASK
-        {
-            let masks = info.pixel_information;
-            if masks == BITMASK_RGBX8
-            {
-                PixelFormat::Rgbx8
-            }
-            else if masks == BITMASK_BGRX8
-            {
-                PixelFormat::Bgrx8
-            }
-            else
-            {
-                continue; // non-standard bitmask layout; skip
-            }
-        }
+        let Some(pixel_format) = classify_pixel_format(info)
         else
         {
             continue;

@@ -25,6 +25,7 @@ mod concurrent_ipc;
 mod concurrent_map_unmap;
 mod concurrent_notification;
 mod cspace_recycle;
+mod double_enqueue_storm;
 mod event_queue_fill_drain;
 mod fpu_migration_churn;
 mod idle_wake_race;
@@ -65,6 +66,10 @@ pub fn run_all(ctx: &TestContext)
     run_integration_test!(
         "stress::priority_dealloc_race",
         priority_dealloc_race::run(ctx)
+    );
+    run_integration_test!(
+        "stress::double_enqueue_storm",
+        double_enqueue_storm::run(ctx)
     );
     run_integration_test!(
         "stress::concurrent_notification",

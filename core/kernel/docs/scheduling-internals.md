@@ -192,6 +192,29 @@ affinity recheck rather than at dispatch). This is the same eventual-
 consistency window as for any other `enqueue_and_wake` racing
 `sys_thread_set_affinity`; see issue #116.
 
+**Enqueue-chokepoint enforcement (issue #244).** Every run-queue insertion —
+`enqueue_and_wake`, `schedule()`'s outgoing requeue, `sys_thread_set_priority`'s
+re-enqueue, and `migrate_ready_thread`'s destination link — funnels through
+`PerCpuScheduler::enqueue`. That chokepoint refuses a double-link: if `tcb` is
+already linked on a run queue (`run_queue_next.is_some()`, or it is the target
+priority queue's tail), re-linking it would self-cycle the intrusive list
+(`tail.next = Some(tail)`, the `head=tail=tcb` corruption #244 reported). The
+condition is read under the owning `scheduler.lock` — the same state and lock
+the `RunQueue::enqueue` tripwire asserts on, so it identifies only genuine
+double-links. Debug builds panic via that tripwire, naming the racing call
+sites through the debug-only `last_enqueue` breadcrumb; release builds skip the
+redundant link so the "Ready ⇒ linked on exactly one queue" invariant holds by
+construction rather than corrupting. The skip is lossless: the target TCB is
+already `Ready` and linked, so it is dispatched and consumes its wakeup payload
+from where it is already queued. The guard precedes `increment_load`, so a
+skipped link leaves the load counter exact. The legitimate Ready-on-entry
+callers (the cross-CPU outgoing branch, `sys_thread_start`) reach
+`PerCpuScheduler::enqueue` with the TCB *unlinked* (it was just `current`, or
+`Created`/`Stopped`), so the guard never fires on them. This makes the
+invariant self-enforcing at the single insertion chokepoint, closing the
+double-link class (#22/#116/#117/#122/#142/#144/#244) against any residual
+racing path.
+
 ---
 
 ## Cross-CPU TCB Ownership

@@ -180,6 +180,29 @@ pub enum ThreadState
     Exited,
 }
 
+// ── EnqueueBreadcrumb ─────────────────────────────────────────────────────────
+
+/// Debug-only record of the most recent run-queue link of a TCB.
+///
+/// Captured under the owning `PerCpuScheduler.lock` after each successful
+/// enqueue so the `RunQueue::enqueue` double-enqueue tripwires can name the
+/// *prior* link site (the panic banner names only the current caller). Used to
+/// pin the racing pair behind the issue #244 "Ready ⇒ linked on exactly one
+/// queue" double-enqueue. Stripped entirely in release builds.
+#[cfg(debug_assertions)]
+#[derive(Clone, Copy, Debug)]
+pub struct EnqueueBreadcrumb
+{
+    /// Call site that performed the prior enqueue (`#[track_caller]` location).
+    pub site: &'static core::panic::Location<'static>,
+    /// CPU whose run queue linked the TCB.
+    pub cpu: u32,
+    /// `ipc_state` observed at the prior enqueue.
+    pub ipc_state: IpcThreadState,
+    /// `preferred_cpu` observed at the prior enqueue.
+    pub preferred_cpu: u32,
+}
+
 // ── ThreadControlBlock ────────────────────────────────────────────────────────
 
 /// Per-thread kernel state.
@@ -214,6 +237,13 @@ pub struct ThreadControlBlock
     /// Intrusive run-queue link — next TCB at the same priority.
     /// `None` when not on any run queue.
     pub run_queue_next: Option<*mut ThreadControlBlock>,
+
+    /// Debug-only breadcrumb of the most recent run-queue link, recorded under
+    /// the owning `PerCpuScheduler.lock` in `PerCpuScheduler::enqueue`. Read by
+    /// the `RunQueue::enqueue` double-enqueue tripwires to name the prior link
+    /// site (issue #244). Stripped in release builds.
+    #[cfg(debug_assertions)]
+    pub last_enqueue: Option<EnqueueBreadcrumb>,
 
     // === IPC state ===
     /// Current IPC blocking reason (None when not blocked on IPC).

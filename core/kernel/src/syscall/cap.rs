@@ -900,6 +900,7 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 cpu_affinity: AFFINITY_ANY,
                 preferred_cpu: 0,
                 run_queue_next: None,
+                queued_on: core::sync::atomic::AtomicI16::new(-1),
                 #[cfg(debug_assertions)]
                 last_enqueue: None,
                 ipc_state: IpcThreadState::None,

@@ -326,12 +326,40 @@ pub unsafe fn endpoint_recv(
     // SAFETY: lock serialises call/recv/reply; paired with unlock_raw below.
     let saved = unsafe { ep.lock.lock_raw() };
 
-    // SAFETY: send_head/send_tail maintained by enqueue/dequeue operations.
-    let caller = unsafe { dequeue(&mut ep.send_head, &mut ep.send_tail) };
-    if !caller.is_null()
+    // Dequeue successive senders, skipping any that died / were stopped
+    // mid-rebind. The BlockedOnSend → BlockedOnReply transition publishes the
+    // reply binding (`server.reply_tcb`, the caller's `ipc_state` /
+    // `blocked_on_object`), and `dealloc_object(Thread)` uses the caller's
+    // `(ipc_state, blocked_on_object)` to find and clear that binding when the
+    // caller dies. `endpoint_call` keeps the two consistent by committing the
+    // transition under the scheduler lock (`commit_blocked_under_local_lock`);
+    // this path must do the same via `commit_reply_rebind_under_local_lock`. If
+    // the caller died concurrently the commit fails: tear the binding down so no
+    // stale `reply_tcb` survives to fire against the freed/reused slot
+    // (#289 use-after-free / double-enqueue; #284 TCB-field corruption), then
+    // skip to the next queued sender.
+    loop
     {
+        // SAFETY: send_head/send_tail maintained by enqueue/dequeue operations.
+        let caller = unsafe { dequeue(&mut ep.send_head, &mut ep.send_tail) };
+        if caller.is_null()
+        {
+            break;
+        }
         // SAFETY: caller dequeued from send_head.
         let msg = unsafe { (*caller).ipc_msg };
+        // A fault sender (kernel-synthesized delivery) parks as BlockedOnFault
+        // so its resume re-executes the faulting instruction and its
+        // cancellation kills it; a normal call sender parks as BlockedOnReply.
+        // SAFETY: caller dequeued from send_head; in_fault_delivery always valid.
+        let parked = if unsafe { (*caller).in_fault_delivery }
+        {
+            IpcThreadState::BlockedOnFault
+        }
+        else
+        {
+            IpcThreadState::BlockedOnReply
+        };
         // SAFETY: server validated by syscall layer.
         unsafe {
             // Caller transitions BlockedOnSend → BlockedOnReply: claim it for
@@ -345,26 +373,41 @@ pub unsafe fn endpoint_recv(
                 .reply_tcb
                 .store(caller, core::sync::atomic::Ordering::Release);
         }
-        // A fault sender (kernel-synthesized delivery) parks as BlockedOnFault
-        // so its resume re-executes the faulting instruction and its
-        // cancellation kills it; a normal call sender parks as BlockedOnReply.
-        // SAFETY: caller dequeued from send_head; in_fault_delivery always valid.
-        let parked = if unsafe { (*caller).in_fault_delivery }
-        {
-            IpcThreadState::BlockedOnFault
-        }
-        else
-        {
-            IpcThreadState::BlockedOnReply
+        // Commit the rebind under the caller's scheduler lock so the
+        // (ipc_state, blocked_on_object) publication is serialised with
+        // dealloc_object(Thread)'s all-CPU-locks Exited mark and SYS_THREAD_STOP.
+        // SAFETY: caller is a valid Blocked TCB dequeued from the send queue.
+        let committed = unsafe {
+            crate::sched::commit_reply_rebind_under_local_lock(caller, parked, server.cast::<u8>())
         };
-        // SAFETY: caller dequeued from send_head.
-        unsafe {
-            (*caller).ipc_state = parked;
-            (*caller).blocked_on_object = server.cast::<u8>();
+        if committed
+        {
+            // SAFETY: paired with lock_raw above.
+            unsafe { ep.lock.unlock_raw(saved) };
+            return Ok((caller, msg));
         }
-        // SAFETY: paired with lock_raw above.
-        unsafe { ep.lock.unlock_raw(saved) };
-        return Ok((caller, msg));
+        // Rollback: the caller is dying. CAS the reply binding back to null
+        // (the caller's own dealloc may have beaten us; if so it owns the
+        // teardown) and release the wake-in-flight claim so its dealloc can
+        // proceed past the #160 gate. Then skip this dead sender.
+        // SAFETY: server / caller validated.
+        unsafe {
+            let cleared = (*server)
+                .reply_tcb
+                .compare_exchange(
+                    caller,
+                    core::ptr::null_mut(),
+                    core::sync::atomic::Ordering::AcqRel,
+                    core::sync::atomic::Ordering::Acquire,
+                )
+                .is_ok();
+            if cleared
+            {
+                (*caller)
+                    .wake_in_flight
+                    .store(0, core::sync::atomic::Ordering::Release);
+            }
+        }
     }
 
     // No sender — block server on recv queue.

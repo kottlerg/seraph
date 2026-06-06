@@ -951,6 +951,7 @@ pub fn init(cpu_count: u32) -> u32
                     cpu_affinity: cpu as u32,
                     preferred_cpu: cpu as u32,
                     run_queue_next: None,
+                    queued_on: core::sync::atomic::AtomicI16::new(-1),
                     #[cfg(debug_assertions)]
                     last_enqueue: None,
                     ipc_state: IpcThreadState::None,
@@ -1350,6 +1351,78 @@ pub unsafe fn commit_blocked_under_local_lock(
 #[cfg(test)]
 #[allow(unused_variables)]
 pub unsafe fn commit_blocked_under_local_lock(
+    _tcb: *mut ThreadControlBlock,
+    _ipc: thread::IpcThreadState,
+    _blocked_on: *mut u8,
+) -> bool
+{
+    true
+}
+
+/// Commit a `BlockedOnSend → BlockedOnReply`/`BlockedOnFault` reply rebind for a
+/// thread that is *already* `Blocked` (dequeued from an endpoint send queue by
+/// [`crate::ipc::endpoint::endpoint_recv`]), under the current CPU's
+/// scheduler.lock.
+///
+/// `endpoint_call` commits its reply binding through
+/// [`commit_blocked_under_local_lock`]; `endpoint_recv` must use this sibling so
+/// the binding's `(ipc_state, blocked_on_object)` publication is serialised with
+/// `dealloc_object(Thread)`'s all-CPU-locks `Exited` mark and `SYS_THREAD_STOP`.
+/// Without it, a dying caller's dealloc reads a stale `BlockedOnSend` state,
+/// takes the wrong unlink arm, and never clears the server's `reply_tcb` —
+/// leaving a dangling binding that later fires against the freed/reused slot
+/// (#289 use-after-free / double-enqueue; #284 TCB-field corruption).
+///
+/// Returns `true` if the rebind committed (caller still `Blocked`); `false` if a
+/// concurrent stop/exit already won, in which case the caller MUST tear down the
+/// reply binding it published (clear the server's `reply_tcb` and the caller's
+/// `wake_in_flight`) and skip this dead sender.
+///
+/// # Safety
+/// `tcb` must be a valid, send-queue-dequeued `Blocked` TCB; `blocked_on` must be
+/// the replying server's TCB pointer.
+#[cfg(not(test))]
+pub unsafe fn commit_reply_rebind_under_local_lock(
+    tcb: *mut ThreadControlBlock,
+    ipc: thread::IpcThreadState,
+    blocked_on: *mut u8,
+) -> bool
+{
+    let cpu = crate::arch::current::cpu::current_cpu() as usize;
+    // SAFETY: cpu is the current CPU; scheduler slab initialised by init().
+    let sched = unsafe { scheduler_for(cpu) };
+    // SAFETY: lock_raw paired with unlock_raw below.
+    let saved = unsafe { sched.lock.lock_raw() };
+
+    // SAFETY: tcb validated by caller; state field always valid.
+    let committed = match unsafe { (*tcb).state }
+    {
+        thread::ThreadState::Blocked =>
+        {
+            // SAFETY: under sched.lock; cross-CPU stop/dealloc writers serialise
+            // here (dealloc holds every CPU's lock, including this one).
+            unsafe {
+                (*tcb).ipc_state = ipc;
+                (*tcb).blocked_on_object = blocked_on;
+            }
+            true
+        }
+        thread::ThreadState::Stopped
+        | thread::ThreadState::Exited
+        | thread::ThreadState::Running
+        | thread::ThreadState::Ready
+        | thread::ThreadState::Created => false,
+    };
+
+    // SAFETY: paired with lock_raw above.
+    unsafe { sched.lock.unlock_raw(saved) };
+    committed
+}
+
+/// Test stub.
+#[cfg(test)]
+#[allow(unused_variables)]
+pub unsafe fn commit_reply_rebind_under_local_lock(
     _tcb: *mut ThreadControlBlock,
     _ipc: thread::IpcThreadState,
     _blocked_on: *mut u8,

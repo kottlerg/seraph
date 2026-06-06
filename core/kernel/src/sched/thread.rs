@@ -238,6 +238,16 @@ pub struct ThreadControlBlock
     /// `None` when not on any run queue.
     pub run_queue_next: Option<*mut ThreadControlBlock>,
 
+    /// Global single-link tag: the priority level this TCB is currently linked
+    /// at, or `-1` when not on any run queue. Written only under the owning
+    /// `PerCpuScheduler.lock` (set in `PerCpuScheduler::enqueue`, cleared in
+    /// `dequeue_highest` / `remove_from_queue`). The enqueue chokepoint rejects a
+    /// TCB whose tag is already `>= 0`, enforcing "Ready ⇒ linked on exactly one
+    /// queue" across *all* CPUs and priorities — stronger than the per-queue
+    /// `run_queue_next`/tail check, which cannot see a TCB that is the sole
+    /// element of a different priority queue or another CPU's queue (#244/#289).
+    pub queued_on: core::sync::atomic::AtomicI16,
+
     /// Debug-only breadcrumb of the most recent run-queue link, recorded under
     /// the owning `PerCpuScheduler.lock` in `PerCpuScheduler::enqueue`. Read by
     /// the `RunQueue::enqueue` double-enqueue tripwires to name the prior link

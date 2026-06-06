@@ -192,28 +192,31 @@ affinity recheck rather than at dispatch). This is the same eventual-
 consistency window as for any other `enqueue_and_wake` racing
 `sys_thread_set_affinity`; see issue #116.
 
-**Enqueue-chokepoint enforcement (issue #244).** Every run-queue insertion —
-`enqueue_and_wake`, `schedule()`'s outgoing requeue, `sys_thread_set_priority`'s
-re-enqueue, and `migrate_ready_thread`'s destination link — funnels through
-`PerCpuScheduler::enqueue`. That chokepoint refuses a double-link: if `tcb` is
-already linked on a run queue (`run_queue_next.is_some()`, or it is the target
-priority queue's tail), re-linking it would self-cycle the intrusive list
-(`tail.next = Some(tail)`, the `head=tail=tcb` corruption #244 reported). The
-condition is read under the owning `scheduler.lock` — the same state and lock
-the `RunQueue::enqueue` tripwire asserts on, so it identifies only genuine
-double-links. Debug builds panic via that tripwire, naming the racing call
-sites through the debug-only `last_enqueue` breadcrumb; release builds skip the
-redundant link so the "Ready ⇒ linked on exactly one queue" invariant holds by
-construction rather than corrupting. The skip is lossless: the target TCB is
-already `Ready` and linked, so it is dispatched and consumes its wakeup payload
-from where it is already queued. The guard precedes `increment_load`, so a
-skipped link leaves the load counter exact. The legitimate Ready-on-entry
-callers (the cross-CPU outgoing branch, `sys_thread_start`) reach
+**Enqueue-chokepoint enforcement (issues #244, #289).** Every run-queue
+insertion — `enqueue_and_wake`, `schedule()`'s outgoing requeue,
+`sys_thread_set_priority`'s re-enqueue, and `migrate_ready_thread`'s destination
+link — funnels through `PerCpuScheduler::enqueue`. That chokepoint refuses a
+double-link via the per-TCB `queued_on` tag: the priority level the TCB is
+currently linked at, or `-1` when unlinked, written only under the owning
+`scheduler.lock` (set on link, cleared in `dequeue_highest` /
+`remove_from_queue`). If `queued_on >= 0` the TCB is already linked on *some*
+CPU's run queue, and re-linking would self-cycle the intrusive list
+(`tail.next = Some(tail)`, the `head=tail=tcb` corruption #244 reported). The tag
+is global: unlike the earlier `run_queue_next.is_some() || is_tail` check it also
+catches a TCB that is the sole element of a *different* priority queue or
+*another CPU's* queue — the residual gap #289 hit, where a stale reply binding
+woke an already-queued slot from a second `enqueue_and_wake`. Debug builds panic
+(naming the prior link via the debug-only `last_enqueue` breadcrumb); release
+builds skip the redundant link so the "Ready ⇒ linked on exactly one queue"
+invariant holds by construction rather than corrupting. The skip is lossless: the
+target TCB is already `Ready` and linked, so it is dispatched and consumes its
+wakeup payload from where it is already queued. The guard precedes
+`increment_load`, so a skipped link leaves the load counter exact. The legitimate
+Ready-on-entry callers (the cross-CPU outgoing branch, `sys_thread_start`) reach
 `PerCpuScheduler::enqueue` with the TCB *unlinked* (it was just `current`, or
-`Created`/`Stopped`), so the guard never fires on them. This makes the
-invariant self-enforcing at the single insertion chokepoint, closing the
-double-link class (#22/#116/#117/#122/#142/#144/#244) against any residual
-racing path.
+`Created`/`Stopped`), so the guard never fires on them. This makes the invariant
+self-enforcing at the single insertion chokepoint, closing the double-link class
+(#22/#116/#117/#122/#142/#144/#244/#289) against any residual racing path.
 
 ---
 
@@ -225,7 +228,7 @@ The TCB is owned in pieces. Different field groups have different lock disciplin
 |---|---|---|---|
 | **Scheduling** | `state`, `priority`, `slice_remaining`, `cpu_affinity`, `preferred_cpu`, `run_queue_next` | The scheduler.lock of whichever CPU's run queue currently links the TCB. For threads not on any run queue (blocked or running), the *home* CPU's scheduler.lock — the one that would re-enqueue on wake. | Cross-CPU writers MUST acquire the home CPU's scheduler.lock. |
 | **IPC blocking** | `ipc_state`, `blocked_on_object`, `ipc_msg`, `ipc_wait_next`, `wakeup_value`, `timed_out` | The source IPC lock matching `ipc_state` (or `None` if not blocked). | Cross-CPU writers MUST acquire the matching source lock; reads from another CPU MUST do the same. |
-| **Reply slot** | `reply_tcb` | `AtomicPtr<ThreadControlBlock>`; lock-free with `Acquire`/`Release` ordering, and `compare_exchange` for cancel. | Endpoint paths set/clear it under `ep.lock`; cancel/dealloc paths on a remote CPU use `compare_exchange(client, null)` so they never clobber a different client's binding. `reply_tcb` is the one TCB field with no single owning lock — multiple lock domains write it (the various `endpoint_*` paths under `ep.lock`, plus `cancel_ipc_block`, the `dealloc_object(Thread)` reply-bound waker, and the fault-redirection reply/cancel paths, from outside any lock), which is why it is atomic. The fault redirection (`BlockedOnFault`) reuses this slot identically: `fault_dispatch` parks the faulter exactly as a caller, so every CAS claimant arbitrates over the same slot. |
+| **Reply slot** | `reply_tcb` | `AtomicPtr<ThreadControlBlock>`; lock-free with `Acquire`/`Release` ordering, and `compare_exchange` for cancel. | Endpoint paths set/clear it under `ep.lock`; cancel/dealloc paths on a remote CPU use `compare_exchange(client, null)` so they never clobber a different client's binding. `reply_tcb` is the one TCB field with no single owning lock — multiple lock domains write it (the various `endpoint_*` paths under `ep.lock`, plus `cancel_ipc_block`, the `dealloc_object(Thread)` reply-bound waker, and the fault-redirection reply/cancel paths, from outside any lock), which is why it is atomic. The fault redirection (`BlockedOnFault`) reuses this slot identically: `fault_dispatch` parks the faulter exactly as a caller, so every CAS claimant arbitrates over the same slot. **The binding must be published consistently with the `(ipc_state, blocked_on_object)` pair `dealloc_object(Thread)` uses to find and clear it (#289):** `endpoint_call` commits that pair under the scheduler lock via `commit_blocked_under_local_lock`; the `BlockedOnSend → BlockedOnReply` rebind in `endpoint_recv` does the same via `commit_reply_rebind_under_local_lock`, serialising with dealloc's all-CPU-locks `Exited` mark. If the caller died concurrently the commit fails and `endpoint_recv` tears the binding down (CAS `reply_tcb` back to null, clear `wake_in_flight`) before skipping the dead sender — without this, dealloc reads a stale `BlockedOnSend` state, takes the wrong unlink arm, and leaves a dangling `reply_tcb` that fires against the freed/reused slot (#289 use-after-free / double-enqueue; #284 TCB-field corruption). |
 | **Context save/restore** | `saved_state`, `kernel_stack_top`, `trap_frame`, `context_saved` | Owning-CPU's scheduler.lock for read; the running CPU writes `saved_state` during `context::switch` (no lock; write is serialised with the next reader by `context_saved` Acquire/Release). | A remote CPU dequeueing this TCB MUST spin-wait on `context_saved` (Acquire load) before reading any other context field. |
 | **Address-space / capability** | `address_space`, `cspace`, `iopb` | Set once at create-time / configure-time; treated as read-only after `sys_thread_start`. | No cross-CPU write is permitted; reads need no lock. |
 | **Identity** | `thread_id`, `magic` | Immutable after construction. | Read freely. |
@@ -454,6 +457,7 @@ Pairing table for every load-bearing atomic in the scheduling and IPC paths. "Lo
 |---|---|---|---|---|
 | `RESCHEDULE_PENDING` (`AtomicCpuMask`) | `sched/mod.rs:189` (decl), `:196–207` (ops) | Release on `set_reschedule_pending_for` (`set_cpu`) | AcqRel on `take_reschedule_pending` (`take_cpu`) | Release publishes the producer's prior enqueue; AcqRel ensures the consumer sees the enqueue and synchronises both directions of the bit clear. |
 | `non_empty` (per PerCpuScheduler) | `sched/run_queue.rs` (decl in `PerCpuScheduler`; writes in `enqueue`, `dequeue_highest`, `remove_from_queue`; read in `has_runnable`) | Release on `enqueue.fetch_or`, `dequeue_highest.fetch_and`, `remove_from_queue.fetch_and` | Acquire on `has_runnable.load` | Release publishes the queue-mutation stores; the lockless idle-loop Acquire is the only synchronisation edge with cross-CPU enqueues on RVWMO. |
+| `queued_on` (per TCB) | `sched/thread.rs` (decl); writes in `PerCpuScheduler::enqueue` (set to priority), `dequeue_highest` / `remove_from_queue` (set to `-1`); read in the `PerCpuScheduler::enqueue` double-link guard | Relaxed `store` | Relaxed `load` | The global single-link tag (#244/#289). Every access — set, clear, and the guard read — is performed under the owning `scheduler.lock`, which supplies all required ordering; the atomic type exists only so a cross-CPU `enqueue_and_wake` guard read of a TCB linked on *another* CPU is well-defined, not for lock-free synchronisation. A `>= 0` value means linked at that priority on the CPU that set it. |
 | `context_saved` (per TCB) | `sched/thread.rs:254` (decl) | Release after `context::switch` returns on the outgoing CPU | Acquire on the remote-dequeue spin-loop | Closes the partial-`SavedState`-visibility race on RVWMO; see [Cross-CPU TCB Ownership](#cross-cpu-tcb-ownership) for the full sequence. |
 | `bits` (Notification) | `ipc/notification.rs:39` (decl), `:109,130,237` (ops) | Relaxed `fetch_or` in `notification_send` (`:109`), Relaxed `swap` in `notification_wait` (`:237`) and `notification_send` slow path (`:130`) | (same — paired with the SeqCst fences below) | The Dekker fence pair below provides the cross-side ordering; the bits ops themselves are Relaxed because no other field needs to be synchronised relative to them. |
 | `has_observer` (Notification) + `bits` Dekker pair | `ipc/notification.rs:54` (decl) | Relaxed store on `:231` (notification_wait), Relaxed load on `:118` (notification_send) | (same) | Paired SeqCst fences in `notification_send` (`:115`, between `bits.fetch_or` and `has_observer.load`) and `notification_wait` (`:234`, between `has_observer.store` and `bits.swap`) form the Dekker pattern: either `notification_send` observes `has_observer == 1` and falls through to the slow path lock acquisition, or `notification_wait`'s swap observes the OR'd bits and returns without parking. The fences are the only ordering edge; weakening to plain `Acquire`/`Release` is **insufficient** because the read-and-write sites span two distinct atomics. |

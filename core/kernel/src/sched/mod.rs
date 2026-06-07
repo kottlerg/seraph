@@ -477,9 +477,32 @@ static mut SLEEP_COUNT: usize = 0;
 /// ISR's borrowed kernel stack. `sleep_check_wakeups` runs only on CPU0 (see
 /// `timer_tick`'s `cpu == 0` gate) behind an interrupt gate (IF=0), so it is
 /// non-reentrant and this single buffer needs no lock of its own.
+/// One expired sleeper, snapshotted under `SLEEP_LIST_LOCK` at pop. The
+/// per-entry claim loop dispatches off this snapshot rather than re-reading the
+/// TCB, so a concurrent `dealloc_object(Thread)` that frees the TCB after the
+/// lock is dropped is never observed as a torn binding (it cannot be observed at
+/// all on the no-claim paths, which never dereference the TCB).
 #[cfg(not(test))]
-static mut EXPIRED_SCRATCH: [*mut ThreadControlBlock; MAX_SLEEPING] =
-    [core::ptr::null_mut(); MAX_SLEEPING];
+#[derive(Clone, Copy)]
+struct ExpiredWaiter
+{
+    tcb: *mut ThreadControlBlock,
+    ipc_state: thread::IpcThreadState,
+    blocked_on: *mut u8,
+}
+
+#[cfg(not(test))]
+impl ExpiredWaiter
+{
+    const EMPTY: Self = Self {
+        tcb: core::ptr::null_mut(),
+        ipc_state: thread::IpcThreadState::None,
+        blocked_on: core::ptr::null_mut(),
+    };
+}
+
+#[cfg(not(test))]
+static mut EXPIRED_SCRATCH: [ExpiredWaiter; MAX_SLEEPING] = [ExpiredWaiter::EMPTY; MAX_SLEEPING];
 
 /// Add a thread to the sleep list. The TCB must already have
 /// `sleep_deadline` set and state = Blocked.
@@ -583,7 +606,32 @@ pub fn sleep_check_wakeups()
             let tcb = SLEEP_LIST[i];
             if !tcb.is_null() && (*tcb).sleep_deadline <= now
             {
-                expired[n] = tcb;
+                // Snapshot the binding under SLEEP_LIST_LOCK, where the TCB is
+                // provably alive: dealloc_object(Thread) removes its entry from
+                // this list under the same lock before freeing. The claim loop
+                // below dispatches off this snapshot and never dereferences the
+                // TCB to choose its arm.
+                let ipc_state = (*tcb).ipc_state;
+                let blocked_on = (*tcb).blocked_on_object;
+                // A plain sleeper (no IPC source object) has no competing waker,
+                // so claim it here: set wake_in_flight = 1 under the lock so a
+                // concurrent dealloc_object(Thread) that lost the list race waits
+                // at its wake-in-flight gate for our enqueue_and_wake instead of
+                // freeing this TCB after the pop. (Cleared by enqueue_and_wake.)
+                // The IPC arms instead claim under their own source lock at the win
+                // below; BlockedOnReply/Fault already carry wake_in_flight = 1 from
+                // the block entry.
+                if matches!(ipc_state, thread::IpcThreadState::None)
+                {
+                    (*tcb)
+                        .wake_in_flight
+                        .store(1, core::sync::atomic::Ordering::Release);
+                }
+                expired[n] = ExpiredWaiter {
+                    tcb,
+                    ipc_state,
+                    blocked_on,
+                };
                 n += 1;
                 // Remove from list by swapping with last entry.
                 SLEEP_COUNT -= 1;
@@ -603,17 +651,22 @@ pub fn sleep_check_wakeups()
 
     // For each expired tcb, try to claim the wake. Timed-wait IPC entries
     // arbitrate via the IPC object's lock against a concurrent sender.
-    for &tcb in expired.iter().take(n)
+    for &ExpiredWaiter {
+        tcb,
+        ipc_state,
+        blocked_on,
+    } in expired.iter().take(n)
     {
         if tcb.is_null()
         {
             continue;
         }
-        // SAFETY: tcb pointer was placed on the sleep list by a live thread
-        // and is only removed when the thread is destroyed (exit/fault),
-        // both of which first stop the thread's blocked state. At this
-        // point the thread is still Blocked.
-        let (ipc_state, blocked_on) = unsafe { ((*tcb).ipc_state, (*tcb).blocked_on_object) };
+        // ipc_state/blocked_on are the pop-time snapshot (taken under
+        // SLEEP_LIST_LOCK), NOT a fresh (*tcb) read: a concurrent
+        // dealloc_object(Thread) may have freed the TCB once the lock was dropped,
+        // so dispatching off a live dereference here would be a use-after-free.
+        // The matching source object (blocked_on) is independently refcounted and
+        // remains valid; the no-claim arms below touch only it, never the TCB.
 
         let claimed = match ipc_state
         {
@@ -635,11 +688,19 @@ pub fn sleep_check_wakeups()
                 let we_win = unsafe { (*sig_state).waiter } == tcb;
                 if we_win
                 {
-                    // SAFETY: we hold sig.lock. wakeup_value=0 is the
-                    // timeout marker (notification_send rejects 0-bit sends, so
-                    // 0 is unambiguous). State/ipc_state/blocked_on are
-                    // committed by enqueue_and_wake under sched.lock.
+                    // SAFETY: we hold sig.lock and sig.waiter == tcb, so a
+                    // dealloc(tcb) BlockedOnNotification unlink (which needs
+                    // sig.lock to clear the waiter) cannot have freed tcb yet.
+                    // Claim it for wake under sig.lock: set wake_in_flight = 1
+                    // before the TCB writes so a concurrent dealloc(tcb) waits at
+                    // its gate (#160); cleared by enqueue_and_wake. wakeup_value=0
+                    // is the timeout marker (notification_send rejects 0-bit
+                    // sends). State/ipc_state/blocked_on are committed by
+                    // enqueue_and_wake under sched.lock.
                     unsafe {
+                        (*tcb)
+                            .wake_in_flight
+                            .store(1, core::sync::atomic::Ordering::Release);
                         (*sig_state).waiter = core::ptr::null_mut();
                         (*sig_state).has_observer.store(
                             u8::from(!(*sig_state).wait_set.is_null()),
@@ -672,11 +733,19 @@ pub fn sleep_check_wakeups()
                 let we_win = unsafe { (*eq_state).waiter } == tcb;
                 if we_win
                 {
-                    // SAFETY: we hold eq.lock. Event payloads can be any
-                    // u64 (including 0); `timed_out` is the out-of-band
-                    // timeout marker, read-and-cleared by sys_event_recv
-                    // on resume. State/etc. committed by enqueue_and_wake.
+                    // SAFETY: we hold eq.lock and eq.waiter == tcb, so a
+                    // dealloc(tcb) BlockedOnEventQueue unlink (which needs eq.lock
+                    // to clear the waiter) cannot have freed tcb yet. Claim it for
+                    // wake under eq.lock: set wake_in_flight = 1 before the TCB
+                    // writes so a concurrent dealloc(tcb) waits at its gate (#160);
+                    // cleared by enqueue_and_wake. Event payloads can be any u64
+                    // (including 0); `timed_out` is the out-of-band timeout marker,
+                    // read-and-cleared by sys_event_recv on resume. State/etc.
+                    // committed by enqueue_and_wake.
                     unsafe {
+                        (*tcb)
+                            .wake_in_flight
+                            .store(1, core::sync::atomic::Ordering::Release);
                         (*eq_state).waiter = core::ptr::null_mut();
                         (*tcb).wakeup_value = 0;
                         (*tcb).timed_out = true;
@@ -787,8 +856,11 @@ pub fn sleep_check_wakeups()
 
             _ =>
             {
-                // Plain sleep — we are the only waker.
-                // SAFETY: tcb still valid; see above.
+                // Plain sleep — the timer is the only waker (reachable only for
+                // ipc_state None; the IPC-bound states have explicit arms above).
+                // We claimed it under SLEEP_LIST_LOCK at pop (wake_in_flight = 1),
+                // so a concurrent dealloc(tcb) is gated and tcb is still valid.
+                // SAFETY: tcb valid per the wake-in-flight claim at pop.
                 unsafe {
                     (*tcb).sleep_deadline = 0;
                 }
@@ -798,10 +870,16 @@ pub fn sleep_check_wakeups()
 
         if claimed
         {
-            // SAFETY: tcb is valid and still Blocked here — only payload/marker
-            // fields were written above; enqueue_and_wake commits Blocked→Ready.
+            // SAFETY: tcb is kept valid by wake_in_flight = 1 (set at the claim
+            // above — at pop for plain sleep, under the source lock for the IPC
+            // arms, or at block entry for reply/fault), so a concurrent
+            // dealloc(tcb) waits at its gate rather than freeing it.
+            // enqueue_and_wake reads state under sched_lock and either links a
+            // still-Blocked thread or, if dealloc already marked it Exited, aborts
+            // the link — both clear wake_in_flight, releasing that gate.
             let cpu = unsafe { (*tcb).preferred_cpu as usize };
-            // SAFETY: tcb valid and Blocked; enqueue_and_wake links it.
+            // SAFETY: tcb valid (wake-in-flight gated); enqueue_and_wake commits
+            // the transition by state.
             unsafe { enqueue_and_wake(tcb, cpu) };
         }
     }

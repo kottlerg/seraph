@@ -298,6 +298,18 @@ pub fn sys_thread_stop(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 let sched_remote = crate::sched::scheduler_for(run_cpu);
                 let spin_start = crate::arch::current::timer::current_tick();
                 let mut warned = false;
+                // The drain spins until the remote CPU deschedules `target_tcb`.
+                // This syscall runs with IF=0; spinning at IF=0 would block an
+                // inbound TLB-shootdown IPI targeted at this CPU and deadlock it
+                // (the initiator spins for our ACK with IF enabled). Enable
+                // interrupts across the spin and disable preemption so the
+                // scheduler cannot migrate us mid-drain — the #207 pattern
+                // dealloc's UAF gate uses.
+                crate::percpu::preempt_disable();
+                // SAFETY: ring 0; restored after the spin below.
+                let drain_saved_int = crate::arch::current::cpu::save_and_disable_interrupts();
+                // SAFETY: ring 0; IDT loaded; preempt disabled.
+                crate::arch::current::interrupts::enable();
                 while {
                     let s = sched_remote.lock.lock_raw();
                     let still_current = sched_remote.current == target_tcb;
@@ -333,6 +345,9 @@ pub fn sys_thread_stop(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                     }
                     core::hint::spin_loop();
                 }
+                // SAFETY: drain_saved_int from save_and_disable_interrupts above.
+                crate::arch::current::cpu::restore_interrupts(drain_saved_int);
+                crate::percpu::preempt_enable();
             }
         }
     }

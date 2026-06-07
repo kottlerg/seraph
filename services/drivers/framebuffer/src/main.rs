@@ -186,6 +186,20 @@ fn handle_request(
         }
         IpcMessage::new(fb_errors::SUCCESS)
     }
+    else if msg.label & 0xFFFF == fb_labels::FB_SET_ATTRS
+    {
+        // Sticky fg/bg for subsequent glyph blits. Payload is six bytes:
+        // [fg_r, fg_g, fg_b, bg_r, bg_g, bg_b].
+        let bytes = msg.data_bytes();
+        if bytes.len() >= 6
+        {
+            writer.set_attrs(
+                [bytes[0], bytes[1], bytes[2]],
+                [bytes[3], bytes[4], bytes[5]],
+            );
+        }
+        IpcMessage::new(fb_errors::SUCCESS)
+    }
     else
     {
         IpcMessage::new(fb_errors::UNKNOWN_OPCODE)

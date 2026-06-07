@@ -97,15 +97,15 @@ fn main() -> !
     let kbd_tx = tx.clone();
     std::thread::spawn(move || input::keyboard_loop(input_cap, &kbd_tx));
 
-    let sink = Sink::new(fb_cap, serial_cap);
+    let mut sink = Sink::new(fb_cap, serial_cap);
     std::os::seraph::log!("{READY_MARKER}");
 
-    run(&child_path, &rx, &tx, &sink)
+    run(&child_path, &rx, &tx, &mut sink)
 }
 
 /// Spawn the child, relay its stdio to the sink, feed it line-disciplined
 /// input, and respawn it when it exits. Never returns.
-fn run(child_path: &str, rx: &Receiver<Msg>, tx: &Sender<Msg>, sink: &Sink) -> !
+fn run(child_path: &str, rx: &Receiver<Msg>, tx: &Sender<Msg>, sink: &mut Sink) -> !
 {
     loop
     {
@@ -159,7 +159,7 @@ fn run(child_path: &str, rx: &Receiver<Msg>, tx: &Sender<Msg>, sink: &Sink) -> !
 
 /// Apply the v0.0.1 line discipline to a run of input bytes: local echo to the
 /// sink, single-line backspace, and CR→LF translation to the child on Enter.
-fn discipline(bytes: &[u8], line: &mut Vec<u8>, sink: &Sink, mut stdin: Option<&mut ChildStdin>)
+fn discipline(bytes: &[u8], line: &mut Vec<u8>, sink: &mut Sink, mut stdin: Option<&mut ChildStdin>)
 {
     for &b in bytes
     {

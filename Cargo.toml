@@ -29,6 +29,7 @@ members = [
     "abi/init-protocol",
     "abi/process-abi",
     "abi/syscall",
+    "shared/ansi",
     "shared/elf",
     "shared/font",
     "shared/mmio",
@@ -82,6 +83,7 @@ unwrap_used                      = "deny"
 expect_used                      = "deny"
 
 [workspace.dependencies]
+ansi = { path = "shared/ansi" }
 boot-protocol = { path = "abi/boot-protocol" }
 init-protocol = { path = "abi/init-protocol" }
 process-abi = { path = "abi/process-abi" }

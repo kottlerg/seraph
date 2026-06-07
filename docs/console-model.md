@@ -87,9 +87,16 @@ earlier ones, which remain as fallbacks.
      driver's rendering. It is run from the shell and is not auto-started.
 
    A compositor / display broker arrives in a follow-up issue and resolves
-   the cap through the same name. v1 exposes one verb only — `FB_WRITE_BYTES`
-   — interpreting payloads as UTF-8 with `\n`/`\r` short-circuited; graphical
-   primitives are listed under the driver README's "Planned future surface".
+   the cap through the same name. v1 exposes two verbs — `FB_WRITE_BYTES`
+   (UTF-8 payloads, `\n`/`\r` short-circuited) and `FB_SET_ATTRS` (sticky
+   24-bit foreground/background colour). The terminal owns ANSI SGR parsing
+   (`ESC[…m` → `FB_SET_ATTRS`); the driver never interprets control sequences,
+   so replacing the terminal does not touch the driver. The colour state is a
+   single global, shared by the terminal and logd's concurrent log mirror like
+   the single cursor — a log line written while the terminal holds a non-default
+   colour inherits it; per-client attribute state arrives with the compositor
+   (#153). Graphical primitives are listed under the driver README's "Planned
+   future surface".
 
 ## The serial driver as sole userspace UART owner
 

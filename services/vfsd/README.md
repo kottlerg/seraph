@@ -38,18 +38,21 @@ vfsd/
   lookups to the root mount via transparent delegation. See
   [`docs/namespace-composition.md`](docs/namespace-composition.md).
 - **Root self-mount** — at startup, after parsing the GPT, vfsd mounts
-  the Seraph root partition at `/` and the ESP at `/esp` on its own
-  initiative, before any service thread begins serving. The namespace
-  dispatcher is spawned first because the `/esp` mount re-enters vfsd's
-  namespace endpoint to resolve `/services/fs/fatfs`; service threads
-  are spawned only after the mount, so `GET_SYSTEM_ROOT_CAP` is never
-  served against an unmounted root.
+  the Seraph root partition at `/`, the ESP at `/esp`, and the data
+  partition at `/data` on its own initiative, before any service thread
+  begins serving. The namespace dispatcher is spawned first because the
+  `/esp` and `/data` mounts re-enter vfsd's namespace endpoint to
+  resolve `/services/fs/fatfs`; service threads are spawned only after
+  the mounts, so `GET_SYSTEM_ROOT_CAP` is never served against an
+  unmounted root. The `/esp` and `/data` mounts are best-effort: an
+  absent partition is skipped (non-fatal) and the mount point falls
+  through to the root partition.
 - **Service endpoint** — handles `MOUNT` and `GET_SYSTEM_ROOT_CAP` on
   its un-badged service endpoint, with multi-threaded recv so a
   worker-driven `CREATE_FROM_FILE` re-entry cannot deadlock an in-
   flight reply. `MOUNT` is the runtime explicit-mount surface
   (foreign-GUID disks, user-invoked mounts); no in-tree caller issues
-  it, since root and `/esp` are self-mounted. See
+  it, since root, `/esp`, and `/data` are self-mounted. See
   [`docs/vfs-ipc-interface.md`](docs/vfs-ipc-interface.md).
 - **System-root cap delivery** — vfsd does not push a system-root
   cap anywhere at boot. Init pulls one via
@@ -73,8 +76,9 @@ vfsd/
   table from a single scratch memory cap at startup, then resolves the
   arch-conditional root GUID in `src/role_guids.rs` via
   `gpt::lookup_partition_by_type_guid` for the self-mount. The EFI
-  System Partition (matched by its standard type GUID) auto-mounts at
-  `/esp` immediately after root; there is no `mounts.conf` and no
+  System Partition (standard type GUID) and the Seraph data partition
+  (arch-neutral `SERAPH_DATA` GUID) auto-mount at `/esp` and `/data`
+  immediately after root; there is no `mounts.conf` and no
   `INGEST_CONFIG_MOUNTS` IPC. The runtime `MOUNT` handler decodes a
   `MountRole` byte from the wire payload and reuses the same
   resolution path. See

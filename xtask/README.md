@@ -100,6 +100,17 @@ fails if the bundle is missing. The bundle is composed by
 [`cargo xtask compose-bundle`](#cargo-xtask-compose-bundle) (any
 harness).
 
+`disk.img` carries three GPT partitions: the EFI System Partition
+(from `sysroot/esp/`), the arch-specific Seraph root (from `sysroot/`,
+excluding `esp/` and `data/`), and an arch-neutral `SERAPH_DATA`
+partition (from `sysroot/data/`). The data partition is authored
+unconditionally — there is no flag to toggle it. vfsd auto-mounts it at
+`/data`; the data tree lives only on this partition, not on root.
+(vfsd's fall-through would also serve `/data` from a root-fs directory,
+so a dedicated partition is a disk-authoring choice — the in-tree image
+uses the partition.) This applies to `build`, `mkdisk`, and
+`compose-bundle` alike.
+
 ```
 cargo xtask mkdisk [--arch x86_64|riscv64]
 ```

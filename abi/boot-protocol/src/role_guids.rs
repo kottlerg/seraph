@@ -36,8 +36,8 @@ pub const SERAPH_ROOT_RISCV64: [u8; 16] = [
 
 /// Type-GUID for a Seraph data partition (arch-neutral).
 ///
-/// UUID: `036dcef6-d862-4242-93f8-4757a8b333de`. Reserved; no consumer in
-/// the current tree.
+/// UUID: `036dcef6-d862-4242-93f8-4757a8b333de`. Consumed by vfsd's
+/// `/data` auto-mount (DPS-style: the type GUID is the mount point).
 pub const SERAPH_DATA: [u8; 16] = [
     0xf6, 0xce, 0x6d, 0x03, 0x62, 0xd8, 0x42, 0x42, 0x93, 0xf8, 0x47, 0x57, 0xa8, 0xb3, 0x33, 0xde,
 ];

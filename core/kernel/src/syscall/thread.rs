@@ -832,14 +832,20 @@ pub fn sys_thread_set_priority(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         return Err(SyscallError::InvalidCapability);
     }
 
-    // `priority`, `state`, and `run_queue_next` are in the Scheduling field
-    // group (docs/scheduling-internals.md § Cross-CPU TCB Ownership);
-    // cross-CPU writers MUST hold the home CPU's scheduler.lock. Identifying
-    // the home CPU is itself a read of the same field group, so the
-    // locate-write-relocate sequence is serialised by acquiring every CPU's
-    // scheduler.lock in ascending order — the same shape used by
-    // `dealloc_object(Thread)` and `sched::set_state_under_all_locks`.
+    // `priority`, `state`, and `queued_on` are in the Scheduling field group,
+    // whose authoritative serializer is the per-TCB `sched_lock`
+    // (docs/scheduling-internals.md § Cross-CPU TCB Ownership). Acquire it FIRST
+    // (outermost), then every CPU's run-queue lock in ascending order — the same
+    // shape as `dealloc_object(Thread)` and `set_state_under_all_locks`. Without
+    // `sched_lock` this `state` read and the `remove_from_queue` / `enqueue`
+    // below race `enqueue_and_wake` / `commit_blocked` / `schedule`, which write
+    // those fields under `sched_lock` — an unserialized Scheduling-group writer
+    // the per-TCB-lock redesign (STEP 5) converted everywhere else but here.
     let cpu_count = crate::sched::CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
+
+    // SAFETY: target_tcb validated non-null; lock_raw paired with the unlock_raw
+    // after the all-CPU-locks release below (released last, restoring caller IF).
+    let tcb_sched_saved = unsafe { (*target_tcb).sched_lock.lock_raw() };
 
     // Ascending order matches the lock hierarchy rule. Each CPU's saved
     // interrupt-flag word is stashed in its own scheduler (under that lock).
@@ -852,9 +858,10 @@ pub fn sys_thread_set_priority(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         }
     }
 
-    // SAFETY: target_tcb validated non-null; all-CPU scheduler.locks serialise
-    // every Scheduling-group writer (`dealloc_object(Thread)`,
-    // `migrate_ready_thread`, `set_state_under_all_locks`).
+    // SAFETY: target_tcb validated non-null. `sched_lock` (held, outermost)
+    // serializes the `state` read and the `queued_on` mutation against every
+    // other Scheduling-group writer; the all-CPU run-queue locks (held) cover
+    // the intrusive remove/enqueue list structure.
     unsafe {
         let old_prio = (*target_tcb).priority;
         let state = (*target_tcb).state;
@@ -896,6 +903,13 @@ pub fn sys_thread_set_priority(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             let s = crate::sched::scheduler_for(cpu);
             s.lock.unlock_raw(s.saved_lock_flags);
         }
+    }
+
+    // Release `sched_lock` LAST (first-acquired → last-released), restoring the
+    // caller's interrupt state.
+    // SAFETY: tcb_sched_saved from the lock_raw above.
+    unsafe {
+        (*target_tcb).sched_lock.unlock_raw(tcb_sched_saved);
     }
 
     Ok(0)

@@ -123,7 +123,7 @@ loop.
 | Symptom | Cause | Recovery |
 |---|---|---|
 | `HANDOVER_PULL` IPC returns error mid-drain | A kernel IPC rendezvous race on the shared endpoint, or an invalid `log_ep_handover_send` | `pull_all` returns; logd still issues `HANDOVER_RELEASE`, so init-logd is released. At most some pre-handover history is lost. |
-| `HANDOVER_RELEASE` never delivered (cap is `0`, e.g. a logd restart; or logd never launches) | No init-logd→logd channel exists | init-logd would otherwise run forever. procmgr's reap backstop force-stops it after a bounded grace and reaps init regardless (see `services/procmgr/src/init_reap.rs`). |
+| `HANDOVER_RELEASE` never delivered (cap is `0`, e.g. a logd restart; or logd never launches) | No init-logd→logd channel exists | init-logd keeps serving and procmgr never reaps init; init's memory caps stay held until shutdown — a benign hold, not a wedge. procmgr does not force-stop init-logd (see `services/procmgr/src/init_reap.rs`). |
 | Reply with unknown `word(0)` kind | Wire-format drift; one side built against an out-of-sync `shared/ipc` revision | Real-logd skips the chunk and continues. A bounded iteration cap (`MAX_ITERS`) in `pull_all` guarantees termination on a malformed reply stream. |
 
 ## Reference

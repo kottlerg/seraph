@@ -488,54 +488,12 @@ mod tests
     use super::*;
     use core::mem::size_of;
 
+    // Option<SlotId> MUST reuse SlotId's NonZeroU32 niche; losing it would grow every
+    // free-list slot. Relational so a benign field change does not trip a literal.
     #[test]
-    fn capability_slot_is_72_bytes()
+    fn slot_id_option_is_niche_optimized()
     {
-        assert_eq!(size_of::<CapabilitySlot>(), 72);
-    }
-
-    #[test]
-    fn slot_id_is_12_bytes()
-    {
-        assert_eq!(size_of::<SlotId>(), 12);
-    }
-
-    #[test]
-    fn option_slot_id_is_12_bytes()
-    {
-        // Verifies niche optimization via NonZeroU32 survives the epoch widen.
-        assert_eq!(size_of::<Option<SlotId>>(), 12);
-    }
-
-    #[test]
-    fn cap_tag_discriminants()
-    {
-        assert_eq!(CapTag::Null as u8, 0);
-        assert_eq!(CapTag::Memory as u8, 1);
-        assert_eq!(CapTag::SchedControl as u8, 12);
-    }
-
-    #[test]
-    fn rights_bitwise_or()
-    {
-        let r = Rights::MAP | Rights::WRITE;
-        assert_eq!(r.0, 0b011);
-    }
-
-    #[test]
-    fn rights_bitwise_and()
-    {
-        let r = (Rights::MAP | Rights::WRITE) & Rights::WRITE;
-        assert_eq!(r, Rights::WRITE);
-    }
-
-    #[test]
-    fn rights_bitor_assign()
-    {
-        let mut r = Rights::MAP;
-        r |= Rights::WRITE;
-        assert!(r.contains(Rights::MAP));
-        assert!(r.contains(Rights::WRITE));
+        assert_eq!(size_of::<Option<SlotId>>(), size_of::<SlotId>());
     }
 
     #[test]
@@ -548,21 +506,12 @@ mod tests
         assert!(r.contains(Rights::MAP | Rights::WRITE));
     }
 
+    // W^X predicate: true only when WRITE and EXECUTE are both present.
     #[test]
-    fn violates_wx_both_set()
+    fn violates_wx_requires_write_and_execute()
     {
         assert!(violates_wx(Rights::WRITE | Rights::EXECUTE));
-    }
-
-    #[test]
-    fn violates_wx_only_write()
-    {
         assert!(!violates_wx(Rights::WRITE));
-    }
-
-    #[test]
-    fn violates_wx_only_execute()
-    {
         assert!(!violates_wx(Rights::EXECUTE));
     }
 

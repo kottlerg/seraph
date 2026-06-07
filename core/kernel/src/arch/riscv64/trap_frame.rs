@@ -188,41 +188,17 @@ mod tests
     use super::*;
     use core::mem::{offset_of, size_of};
 
+    // ABI contract: the trap entry/exit assembly saves and restores registers at these
+    // exact TrapFrame offsets. Layout and asm MUST agree, or a fault corrupts user state.
     #[test]
-    fn trap_frame_size_is_280()
+    fn trap_frame_layout_matches_asm()
     {
         assert_eq!(size_of::<TrapFrame>(), 280);
-    }
-
-    #[test]
-    fn sepc_offset_is_248()
-    {
-        assert_eq!(offset_of!(TrapFrame, sepc), 248);
-    }
-
-    #[test]
-    fn scause_offset_is_256()
-    {
-        assert_eq!(offset_of!(TrapFrame, scause), 256);
-    }
-
-    #[test]
-    fn stval_offset_is_264()
-    {
-        assert_eq!(offset_of!(TrapFrame, stval), 264);
-    }
-
-    #[test]
-    fn a7_offset_is_128()
-    {
-        // a7 = x17 is the 17th register stored (after x1-x16 = 16 regs)
-        assert_eq!(offset_of!(TrapFrame, a7), 128);
-    }
-
-    #[test]
-    fn a0_offset_is_72()
-    {
-        // a0 = x10 is the 10th register stored (after x1-x9 = 9 regs)
+        // a0 = x10 (10th GPR saved), a7 = x17 (17th); the CSRs trail the GPRs.
         assert_eq!(offset_of!(TrapFrame, a0), 72);
+        assert_eq!(offset_of!(TrapFrame, a7), 128);
+        assert_eq!(offset_of!(TrapFrame, sepc), 248);
+        assert_eq!(offset_of!(TrapFrame, scause), 256);
+        assert_eq!(offset_of!(TrapFrame, stval), 264);
     }
 }

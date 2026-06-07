@@ -2626,35 +2626,16 @@ mod tests
     use super::*;
     use core::mem::{offset_of, size_of};
 
-    // Verify header is at offset 0 in each concrete type — required for safe
-    // pointer casts from *mut ConcreteObject to *mut KernelObjectHeader.
+    // Header MUST sit at offset 0 in every concrete object type: the kernel casts
+    // *mut ConcreteObject to *mut KernelObjectHeader to read the refcount and type
+    // generically, which is sound only if the header is the first field.
     #[test]
-    fn memory_object_header_at_offset_zero()
+    fn concrete_object_headers_at_offset_zero()
     {
         assert_eq!(offset_of!(MemoryObject, header), 0);
-    }
-
-    #[test]
-    fn mmio_object_header_at_offset_zero()
-    {
         assert_eq!(offset_of!(MmioObject, header), 0);
-    }
-
-    #[test]
-    fn interrupt_object_header_at_offset_zero()
-    {
         assert_eq!(offset_of!(InterruptObject, header), 0);
-    }
-
-    #[test]
-    fn ioport_object_header_at_offset_zero()
-    {
         assert_eq!(offset_of!(IoPortObject, header), 0);
-    }
-
-    #[test]
-    fn sched_control_object_header_at_offset_zero()
-    {
         assert_eq!(offset_of!(SchedControlObject, header), 0);
     }
 

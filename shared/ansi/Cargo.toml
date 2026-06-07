@@ -1,0 +1,12 @@
+[package]
+name = "ansi"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+test = true
+doctest = false
+
+[lints]
+workspace = true

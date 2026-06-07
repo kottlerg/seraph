@@ -11,9 +11,9 @@
 //!
 //! The verdict is computed here, not emitted by the guest: the terminal cannot
 //! know the expected sequence, so the host scans the post-READY serial
-//! transcript. This is the reusable pattern for interactive
-//! programs (the `programs/shell` test under #112 reuses it by swapping the
-//! child and the expected strings).
+//! transcript. The child is `programs/shell` (#112); the injected `help`
+//! exercises a built-in whose output and the shell's `$ ` prompt are asserted
+//! on serial.
 //!
 //! A pure runner: it neither builds nor stages. `terminal.svc` ships in the
 //! default boot set, so a plain `cargo xtask build` + `mkdisk` suffices; the CI
@@ -41,39 +41,43 @@ use crate::util::{require_tool, step};
 /// keyboard thread is running. Kept in sync with `programs/terminal`.
 const READY_MARKER: &str = "terminal: READY for injection";
 
-/// Injected key events as `(qcode, down)`: `a`, then Shift+`a` (→ `A`,
-/// exercising modifier-applied decode and modifier-event filtering), then `b`,
-/// then Backspace (drops the `b`), then Enter. After the line discipline the
-/// child receives `aA\n`. This covers the keysym-decode cases — lowercase,
-/// shifted uppercase, modifier-event filtering, Return — plus backspace and
-/// CR→LF, end-to-end through the real driver and the terminal.
+/// Injected key events as `(qcode, down)`: types `help`, then a stray `x`
+/// dropped by Backspace, then Enter. After the line discipline the child
+/// receives `help\n`. This covers the keysym decode (lowercase letters,
+/// Return), single-line backspace (the `x` is erased before send), and CR→LF,
+/// end-to-end through the real driver and the terminal.
 const EVENTS: &[(&str, bool)] = &[
-    ("a", true),
-    ("a", false),
-    ("shift", true),
-    ("a", true),
-    ("a", false),
-    ("shift", false),
-    ("b", true),
-    ("b", false),
+    ("h", true),
+    ("h", false),
+    ("e", true),
+    ("e", false),
+    ("l", true),
+    ("l", false),
+    ("p", true),
+    ("p", false),
+    ("x", true),
+    ("x", false),
     ("backspace", true),
     ("backspace", false),
     ("ret", true),
     ("ret", false),
 ];
 
-/// Child output line. Its presence proves the full loop: keyboard input reached
-/// the child (incl. the Shift-decoded `A`), modifier events were filtered (no
-/// stray bytes corrupting the line), single-line backspace dropped the `b`
-/// before send, CR→LF delivered the line, and the child's stdout was relayed
-/// back to serial. The driver writes it as one `SERIAL_WRITE_BYTES` call, so it
-/// lands contiguously.
-const CHILD_LINE: &str = "[echosh] aA";
+/// Child output marker. Its presence proves the full loop: keyboard input
+/// reached the shell (the typed `help`), single-line backspace dropped the `x`
+/// before send, CR→LF delivered the line, the shell ran the `help` built-in,
+/// and its stdout was relayed back to serial. The shell writes the help block
+/// in one `write_all`, so this first line lands contiguously.
+const CHILD_LINE: &str = "shell built-ins:";
 
 /// Local-echo proof: each typed key-down is echoed to serial as its own write,
 /// so the characters appear (interleaving-tolerant) as this subsequence —
-/// including the `b` typed before the backspace erased it from the line.
-const ECHO_SUBSEQUENCE: &str = "aAb";
+/// including the `x` typed before the backspace erased it from the line.
+const ECHO_SUBSEQUENCE: &str = "helpx";
+
+/// The shell's prompt, rendered to serial via the terminal. Acceptance for
+/// #112 requires it appears once the shell is the terminal's child.
+const PROMPT: &str = "$ ";
 
 /// Overall wall-clock budget for boot + inject + assert.
 const TIMEOUT: Duration = Duration::from_secs(180);
@@ -164,6 +168,7 @@ pub fn run(ctx: &Context, args: &TestTerminalArgs) -> Result<()>
                     transcript.push_str(&line);
                     transcript.push('\n');
                     if transcript.contains(CHILD_LINE)
+                        && transcript.contains(PROMPT)
                         && is_subsequence(&transcript, ECHO_SUBSEQUENCE)
                     {
                         verdict = Some(true);
@@ -204,10 +209,12 @@ pub fn run(ctx: &Context, args: &TestTerminalArgs) -> Result<()>
         None =>
         {
             let saw_child = transcript.contains(CHILD_LINE);
+            let saw_prompt = transcript.contains(PROMPT);
             let saw_echo = is_subsequence(&transcript, ECHO_SUBSEQUENCE);
             bail!(
                 "terminal interactive test: incomplete within {}s \
-                 (ready+inject={injected}, child output={saw_child}, local echo={saw_echo})",
+                 (ready+inject={injected}, prompt={saw_prompt}, child output={saw_child}, \
+                 local echo={saw_echo})",
                 TIMEOUT.as_secs()
             )
         }

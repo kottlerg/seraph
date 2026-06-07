@@ -289,10 +289,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "echosh"
-version = "0.1.0"
-
-[[package]]
 name = "elf"
 version = "0.1.0"
 dependencies = [
@@ -882,6 +878,14 @@ dependencies = [
  "syscall",
  "syscall-abi",
 ]
+
+[[package]]
+name = "shell"
+version = "0.1.0"
+
+[[package]]
+name = "shell-tester"
+version = "0.1.0"
 
 [[package]]
 name = "shlex"

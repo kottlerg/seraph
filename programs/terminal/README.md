@@ -86,3 +86,9 @@ the `usertest` cell. See [docs/testing.md](../../docs/testing.md).
 [#67]: https://github.com/kottlerg/seraph/issues/67
 [#110]: https://github.com/kottlerg/seraph/issues/110
 [#112]: https://github.com/kottlerg/seraph/issues/112
+
+---
+
+## Summarized By
+
+[Testing](../../docs/testing.md)

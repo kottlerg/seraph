@@ -102,3 +102,9 @@ Real RISC-V boards diverge from QEMU `virt`. Per-board RTC support
 requires DT parsing infrastructure and per-board drivers; tracked
 as a follow-up. This driver covers the QEMU target seraph currently
 ships.
+
+---
+
+## Summarized By
+
+None

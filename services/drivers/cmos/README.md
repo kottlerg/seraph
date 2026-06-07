@@ -75,3 +75,9 @@ returns a sensible BCD century (`0x19`, `0x20`, `0x21`) it is used,
 otherwise the year is interpreted as `2000 + yy` (so seraph runs
 cleanly on QEMU CMOS, which leaves register `0x32` zero, through
 the year 2099).
+
+---
+
+## Summarized By
+
+None

@@ -257,4 +257,4 @@ svcmgr if needed.
 
 ## Summarized By
 
-[init/README.md](../README.md), [docs/bootstrap.md](../../../docs/bootstrap.md), [docs/process-lifecycle.md](../../../docs/process-lifecycle.md)
+[init/README.md](../README.md), [docs/bootstrap.md](../../../docs/bootstrap.md)

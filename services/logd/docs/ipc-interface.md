@@ -129,3 +129,9 @@ logd's drain consumes each event as
 `(process_badge as u32) << 32 | exit_reason` and evicts the
 matching slot from the hash-keyed badge table. Idempotent on
 already-evicted badges.
+
+---
+
+## Summarized By
+
+[logd/README.md](../README.md)

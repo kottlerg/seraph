@@ -463,6 +463,15 @@ fn namespace_loop(rt: &'static VfsdRuntime) -> !
             continue;
         }
 
+        // Fall-through enumeration: an `NS_READDIR` on a synthetic node
+        // with a `fallthrough_cap` lists its local children first, then
+        // the underlying root-fs directory's entries, so a listing shows
+        // both mounts and root-fs contents (mirroring lookup fall-through).
+        if try_forward_readdir_fallthrough(rt, &recv, ipc_buf)
+        {
+            continue;
+        }
+
         let mut backend = rt
             .root_backend
             .lock()
@@ -565,6 +574,131 @@ fn try_forward_lookup_fallthrough(
     // SAFETY: ipc_buf is the thread-registered IPC buffer.
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
     true
+}
+
+/// If `recv` is an `NS_READDIR` on a synthetic tree node that carries a
+/// `fallthrough_cap`, serve the merged enumeration and return `true`
+/// (caller skips normal dispatch). The node's local children occupy
+/// indices `0..local_count` and are served by normal dispatch; this
+/// handler serves higher indices from the fall-through directory,
+/// skipping any name shadowed by a local child. Without it, listing a
+/// synthetic node would show only its in-tree mounts and hide root-fs
+/// entries reachable by name (e.g. `/programs`, `/data` under the
+/// synthetic root), making enumeration inconsistent with lookup.
+///
+/// `NS_READDIR` surfaces names only — no caps — so, unlike lookup
+/// fall-through, there is no authority to launder: the caller's
+/// `READDIR` right is checked via [`gate`], and the fall-through probe
+/// rides vfsd's own full-rights root cap.
+///
+/// Assumption: the probe applies no per-entry visibility filter (the
+/// backend's `visible_requires` per `docs/namespace-model.md`). That is
+/// sound only because no current fs backend hides entries by rights; a
+/// backend that did would need the probe to compose the caller's rights
+/// (as the lookup path does) before enumerating. Per client `NS_READDIR`
+/// this re-probes the fall-through dir from index 0, so a full listing is
+/// O(n²); acceptable for the small synthetic nodes (root, `/esp`).
+fn try_forward_readdir_fallthrough(
+    rt: &'static VfsdRuntime,
+    recv: &IpcMessage,
+    ipc_buf: *mut u64,
+) -> bool
+{
+    let opcode = recv.label & 0xFFFF;
+    if opcode != ns_labels::NS_READDIR
+    {
+        return false;
+    }
+    // Enforce the caller's READDIR right and resolve the directory node.
+    // On `Err`, fall through to normal dispatch, which emits the matching
+    // error reply.
+    let dir = match gate(recv.label, recv.badge)
+    {
+        Ok((node, _)) => node,
+        Err(GateError::PermissionDenied | GateError::UnknownLabel) => return false,
+    };
+    // Cast is range-safe: the readdir cursor is bounded by directory size.
+    #[allow(clippy::cast_possible_truncation)]
+    let idx = recv.word(0) as u32;
+
+    let backend = rt
+        .root_backend
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let Some(parent_idx) = backend.resolve(dir)
+    else
+    {
+        return false;
+    };
+    let fallthrough = backend.fallthrough_of(parent_idx);
+    let local_count = backend.local_child_count(parent_idx);
+    drop(backend);
+
+    // No fall-through, or still within the local children: normal dispatch
+    // serves it (a local child, then `END_OF_DIR` past the last one).
+    if fallthrough == 0 || idx < local_count
+    {
+        return false;
+    }
+
+    // Enumerate the fall-through directory, skipping names shadowed by a
+    // local child, until the `(idx - local_count)`-th survivor.
+    let target = idx - local_count;
+    let mut matched = 0u32;
+    let mut probe = 0u32;
+    loop
+    {
+        let req = IpcMessage::builder(ns_labels::NS_READDIR)
+            .word(0, u64::from(probe))
+            .build();
+        // SAFETY: ipc_buf is the thread-registered IPC buffer.
+        let Ok(reply) = (unsafe { ipc::ipc_call(fallthrough, &req, ipc_buf) })
+        else
+        {
+            return false;
+        };
+        // `END_OF_DIR` or any upstream error terminates the merged
+        // enumeration; forward it verbatim as the client's terminator.
+        if reply.label != 0
+        {
+            // SAFETY: ipc_buf is the thread-registered IPC buffer.
+            let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+            return true;
+        }
+        // Cast is range-safe: name_len rides word 1, bounded by the
+        // protocol's max name length.
+        #[allow(clippy::cast_possible_truncation)]
+        let name_len = reply.word(1) as usize;
+        let data = reply.data_bytes();
+        // Reply layout: word 0 = kind, word 1 = name_len, name at byte 16.
+        if name_len == 0 || data.len() < 16 + name_len
+        {
+            // Malformed upstream reply: terminate enumeration cleanly.
+            let end = IpcMessage::new(ipc::fs_labels::END_OF_DIR);
+            // SAFETY: ipc_buf is the thread-registered IPC buffer.
+            let _ = unsafe { ipc::ipc_reply(&end, ipc_buf) };
+            return true;
+        }
+        let name = &data[16..16 + name_len];
+        let shadowed = {
+            let backend = rt
+                .root_backend
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            backend.has_local_child(parent_idx, name)
+        };
+        if !shadowed
+        {
+            if matched == target
+            {
+                // SAFETY: ipc_buf is the thread-registered IPC buffer.
+                let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+                return true;
+            }
+            matched += 1;
+        }
+        probe += 1;
+    }
 }
 
 // ── System-root cap delivery ─────────────────────────────────────────────

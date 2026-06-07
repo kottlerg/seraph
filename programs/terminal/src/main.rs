@@ -8,7 +8,7 @@
 //! Relays a byte stream between hardware drivers and a child process's stdio,
 //! with a tiny line discipline. Input is the virtio-input keyboard (#110);
 //! output renders on the framebuffer (#67) and mirrors to serial TX (#66). The
-//! child (`/programs/echosh` by default, overridable via `argv[1]`) is spawned
+//! child (`/programs/shell` by default, overridable via `argv[1]`) is spawned
 //! with piped stdio over the `ProcessInfo` stdio contract.
 //!
 //! Structure: a persistent keyboard thread decodes key-downs to bytes and
@@ -33,9 +33,9 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use ipc::IpcMessage;
 use output::Sink;
 
-/// Child spawned when the recipe passes no `argv[1]`. #112 retargets the
-/// terminal at `/programs/shell` by setting `argv` in `terminal.svc`.
-const DEFAULT_CHILD: &str = "/programs/echosh";
+/// Child spawned when the recipe passes no `argv[1]`. `terminal.svc` sets it
+/// explicitly; this is the fallback.
+const DEFAULT_CHILD: &str = "/programs/shell";
 
 /// Printed once all driver caps are held and the keyboard thread is running;
 /// the host test harness injects keys on seeing it. Kept in sync with

@@ -134,7 +134,8 @@ pub unsafe fn pull_all(handover_send_cap: u32, ipc_buf: *mut u64, table: &mut Sl
 /// call is acknowledged and returns `Ok`. The retry recovers a `RELEASE`
 /// whose request was dropped (init-logd never saw it, so it is still
 /// serving). The cap bounds the loop; a genuinely unreachable init-logd is
-/// covered by procmgr's reap backstop, never by an unbounded spin here.
+/// left serving (procmgr reaps init only on init-logd's natural exit), never
+/// wedged by an unbounded spin here.
 ///
 /// # Safety
 /// `ipc_buf` must be the calling thread's registered IPC buffer.

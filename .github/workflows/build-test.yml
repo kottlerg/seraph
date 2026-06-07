@@ -108,10 +108,10 @@ jobs:
         #
         # The functional harness boots also drop the autostarted `terminal`
         # (a user-facing program, not part of the services/programs substrate
-        # under test) so the boot is controlled and to avoid a flaky bringup
-        # deadlock under load (#290). `--repack-only` makes the removal stick:
-        # a normal repack re-mirrors rootfs, which would restore terminal.svc.
-        # The terminal is exercised in its own boot (test-terminal, below).
+        # under test) so the boot is controlled. `--repack-only` makes the
+        # removal stick: a normal repack re-mirrors rootfs, which would restore
+        # terminal.svc. The terminal is exercised in its own boot
+        # (test-terminal, below).
         run: |
           case "${{ matrix.tester }}" in
             svctest)

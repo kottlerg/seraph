@@ -25,18 +25,20 @@
 //!   │  INIT_TEARDOWN_DONE
 //!   ▼
 //! Armed   (pending_deaths = 2; waiting for both threads' INIT_REAP_CORRELATOR
-//!          death events — run_reap counts down, reaping on the last. The
-//!          first death stamps first_death_us, arming the liveness backstop.)
+//!          death events — run_reap counts down, reaping on the last.)
 //!   │
-//!   ├─▼  dispatch_death sees correlator == INIT_REAP_CORRELATOR (×2)
-//!   │  Reaping (run_reap, last death) → do_reap
-//!   │
-//!   └─▼  init-logd never released (dropped HANDOVER_RELEASE) and
-//!        now - first_death_us > BACKSTOP_GRACE_US
-//!      Reaping (check_backstop): thread_stop(logd_thread) → do_reap
+//!   └─▼  dispatch_death sees correlator == INIT_REAP_CORRELATOR (×2)
+//!      Reaping (run_reap, last death) → do_reap
 //!
-//! do_reap (both entry paths):
-//!   1. cap_delete(logd_thread)                — Exited, or Stopped→Exited
+//! init-logd outlives init's main thread until svcmgr-launched real-logd pulls
+//! its handover and releases it (`HANDOVER_RELEASE` → init-logd `thread_exit`).
+//! The reap is purely death-driven: procmgr waits for init-logd's natural exit
+//! and never force-stops it. If a handover genuinely never completes (real-logd
+//! crashes mid-pull or never launches), init-logd serves on and init's memory
+//! caps stay held — a benign hold, not a wedge — until shutdown.
+//!
+//! do_reap:
+//!   1. cap_delete(logd_thread)                — Exited
 //!   2. cap_delete(main_thread)
 //!   3. cap_revoke + cap_delete(aspace)        — mappings gone
 //!   4. DONATE_MEMORY_CAPS(caps[..]) → memmgr       — safe; no aliasing
@@ -80,24 +82,7 @@ pub struct InitReapState
     /// and reaps on the last. init-logd outlives the main thread until the
     /// svcmgr-launched real-logd pulls its handover and releases it.
     pending_deaths: u8,
-    /// Boot-microsecond timestamp of the first init-thread death (the main
-    /// thread, in practice), recorded when `pending_deaths` drops to 1. Zero
-    /// until then. Anchors the liveness backstop: if init-logd has not exited
-    /// within [`BACKSTOP_GRACE_US`] of this instant — because a dropped
-    /// `HANDOVER_RELEASE` (e.g. a logd restart with no handover source, or
-    /// logd never launching) left it serving forever — `check_backstop`
-    /// force-stops it and reaps anyway, so a wedged handover can never
-    /// permanently block reclamation of init's memory caps.
-    first_death_us: u64,
 }
-
-/// Liveness deadline: how long after the first init-thread death the reap will
-/// wait for init-logd to exit on its own before force-stopping it. A liveness
-/// bound (sized like the kernel's idle watchdog), NOT a capacity constant —
-/// the normal handover releases init-logd in well under a second, and the
-/// bound stays far below the point at which svctest first queries the
-/// all-RAM-accounted identity, so the forced donation always lands first.
-const BACKSTOP_GRACE_US: u64 = 3_000_000;
 
 /// State machine slot. `None` until init's first
 /// `REGISTER_INIT_TEARDOWN`; populated and progressively filled by
@@ -184,7 +169,6 @@ pub fn handle_register(req: &IpcMessage, ipc_buf: *mut u64, death_eq: u32)
             donate_caps: Vec::with_capacity(32),
             armed: false,
             pending_deaths: 2,
-            first_death_us: 0,
         });
         reply(ipc_buf, procmgr_errors::SUCCESS);
         return;
@@ -252,15 +236,11 @@ pub fn run_reap(memmgr_ep: u32, ipc_buf: *mut u64)
         // (first round) before the svcmgr handover can release init-logd, so
         // init-logd's exit may fire while init is still streaming donation
         // rounds — i.e. pre-arm. Dropping a pre-arm death would strand
-        // `pending_deaths` and force the liveness backstop. Anchor the backstop
-        // from the first death regardless. Only the *execution* of the reap
-        // waits for `armed`: init must finish donating its reclaimable caps,
-        // and `do_reap` consumes the kernel-object caps that round delivers.
+        // `pending_deaths` and the reap would never fire. Only the *execution*
+        // of the reap waits for `armed`: init must finish donating its
+        // reclaimable caps, and `do_reap` consumes the kernel-object caps that
+        // round delivers.
         s.pending_deaths = s.pending_deaths.saturating_sub(1);
-        if s.first_death_us == 0
-        {
-            s.first_death_us = elapsed_us();
-        }
         if s.pending_deaths > 0
         {
             std::os::seraph::log!(
@@ -274,8 +254,8 @@ pub fn run_reap(memmgr_ep: u32, ipc_buf: *mut u64)
             // Both threads exited before arming. init's main thread sends
             // `INIT_TEARDOWN_DONE` before its own `thread_exit`, so main's death
             // is always post-arm and this branch is unreachable in well-formed
-            // teardown; leave the reap for the arming path / backstop rather
-            // than reaping before init has finished donating.
+            // teardown; leave the reap for the arming path rather than reaping
+            // before init has finished donating.
             return;
         }
         guard.take().expect("init-reap state present")
@@ -284,63 +264,9 @@ pub fn run_reap(memmgr_ep: u32, ipc_buf: *mut u64)
     do_reap(state, memmgr_ep, ipc_buf);
 }
 
-/// Liveness backstop, called from procmgr's main loop. If the main thread has
-/// exited but init-logd has not within [`BACKSTOP_GRACE_US`] — a dropped
-/// `HANDOVER_RELEASE` (a logd restart with no handover source, or logd never
-/// launching) left it serving forever — force-stop it and reap anyway.
-///
-/// `thread_stop` transitions a `Blocked`-in-`ipc_recv` init-logd to `Stopped`;
-/// it posts no death notification, which is why this path reaps directly
-/// rather than waiting for the death count. The `cap_delete` in `do_reap` then
-/// drives the `Stopped` TCB to `Exited` and wakes any thread blocked on a
-/// reply from it (a real-logd stuck mid-pull).
-///
-/// Best-effort scheduling: this only runs when procmgr's main loop is already
-/// awake for some other event. The cases it covers coincide with boot-time
-/// process-death and service traffic that keeps procmgr scheduled, so the
-/// deadline is observed well before svctest first queries the identity. A hard
-/// wall-clock guarantee would require a timed `wait_set` primitive the kernel
-/// does not expose today.
-pub fn check_backstop(memmgr_ep: u32, ipc_buf: *mut u64)
-{
-    let state = {
-        let mut guard = STATE.lock().expect("init-reap state poisoned");
-        let Some(s) = guard.as_mut()
-        else
-        {
-            return;
-        };
-        if !s.armed || s.pending_deaths != 1 || s.first_death_us == 0
-        {
-            return;
-        }
-        if elapsed_us().saturating_sub(s.first_death_us) < BACKSTOP_GRACE_US
-        {
-            return;
-        }
-        // The lagging init thread (init-logd in practice; main is straight-line
-        // to thread_exit) is still alive. Force BOTH off-CPU before reaping —
-        // thread_stop is a harmless InvalidState no-op on whichever already
-        // exited — so do_reap's cap_delete never frees a TCB still running on a
-        // CPU, regardless of which thread lagged. The cap_delete then drives a
-        // Stopped TCB to Exited and wakes any real-logd stuck on init-logd's
-        // reply.
-        let _ = syscall::thread_stop(s.main_thread);
-        let _ = syscall::thread_stop(s.logd_thread);
-        std::os::seraph::log!(
-            "init-reap: handover-release backstop fired; force-stopped init after \
-             {} ms grace",
-            BACKSTOP_GRACE_US / 1000
-        );
-        guard.take().expect("armed init-reap state present")
-    };
-
-    do_reap(state, memmgr_ep, ipc_buf);
-}
-
-/// Tear init down once it is threadless: both threads `Exited` (normal path),
-/// or init-logd forced `Stopped` by [`check_backstop`]. Ordering matters — see
-/// the inline steps.
+/// Tear init down once it is threadless: both threads `Exited` via the normal
+/// handover path (init-logd exits on real-logd's `HANDOVER_RELEASE`). Ordering
+/// matters — see the inline steps.
 fn do_reap(state: InitReapState, memmgr_ep: u32, ipc_buf: *mut u64)
 {
     // Consume the teardown state — this reap is one-shot.
@@ -353,10 +279,9 @@ fn do_reap(state: InitReapState, memmgr_ep: u32, ipc_buf: *mut u64)
         ..
     } = state;
 
-    // 1. Reap init-logd's TCB. It is `Exited` (it released and exited) or
-    //    `Stopped` (forced by the backstop); `dealloc_object` drives either to
-    //    `Exited`, removes it from scheduler queues, and wakes any reply-bound
-    //    client (a real-logd blocked mid-handover) with `Interrupted`.
+    // 1. Reap init-logd's TCB. It is `Exited` (it released on real-logd's
+    //    `HANDOVER_RELEASE` and exited); `dealloc_object` removes it from
+    //    scheduler queues and frees the slot.
     let _ = syscall::cap_delete(logd_thread);
 
     // 2. Reap init's main thread TCB; it exited earlier in the countdown, so
@@ -396,13 +321,6 @@ fn do_reap(state: InitReapState, memmgr_ep: u32, ipc_buf: *mut u64)
         donated_pages * 4,
         pool_total,
     );
-}
-
-/// Boot-microsecond clock via `SYS_SYSTEM_INFO(ElapsedUs)`; never errors
-/// (`unwrap_or(0)` matches the kernel handler's infallible contract).
-fn elapsed_us() -> u64
-{
-    syscall::system_info(syscall_abi::SystemInfoType::ElapsedUs as u64).unwrap_or(0)
 }
 
 fn donate_to_memmgr(memmgr_ep: u32, caps: &[u32], ipc_buf: *mut u64) -> (u32, u64, u64)

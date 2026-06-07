@@ -97,3 +97,9 @@ path (the `$ ` prompt rendered via the terminal) is covered by
 [#29]: https://github.com/kottlerg/seraph/issues/29
 [#111]: https://github.com/kottlerg/seraph/issues/111
 [#112]: https://github.com/kottlerg/seraph/issues/112
+
+---
+
+## Summarized By
+
+None

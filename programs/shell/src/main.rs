@@ -24,9 +24,11 @@
 //! the next input line. This is the interim stand-in for a shared-tty /
 //! foreground-process-group model; real job control is #29.
 //!
-//! Limitations (v0.0.1): absolute paths only — `.`/`..`/cwd-relative paths are
-//! rejected by the namespace walk; no pipes/redirection, quoting/escaping,
-//! variable expansion, or job control.
+//! Paths are resolved lexically against an absolute working directory the shell
+//! owns (`resolve_path`): absolute and cwd-relative inputs both work, including
+//! `.`/`..`, and `cd` keeps the process cwd cap in lockstep. Limitations
+//! (v0.0.1): no pipes/redirection, quoting/escaping, variable expansion,
+//! globbing, or job control.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Command, Stdio};

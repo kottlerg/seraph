@@ -590,6 +590,14 @@ fn try_forward_lookup_fallthrough(
 /// fall-through, there is no authority to launder: the caller's
 /// `READDIR` right is checked via [`gate`], and the fall-through probe
 /// rides vfsd's own full-rights root cap.
+///
+/// Assumption: the probe applies no per-entry visibility filter (the
+/// backend's `visible_requires` per `docs/namespace-model.md`). That is
+/// sound only because no current fs backend hides entries by rights; a
+/// backend that did would need the probe to compose the caller's rights
+/// (as the lookup path does) before enumerating. Per client `NS_READDIR`
+/// this re-probes the fall-through dir from index 0, so a full listing is
+/// O(n²); acceptable for the small synthetic nodes (root, `/esp`).
 fn try_forward_readdir_fallthrough(
     rt: &'static VfsdRuntime,
     recv: &IpcMessage,

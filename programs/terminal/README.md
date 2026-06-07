@@ -63,8 +63,8 @@ feeding the same channel with raw bytes (see deferrals).
 ## Known limitations
 
 - Framebuffer and serial are shared, unbrokered sinks: terminal output
-  interleaves with logd (serial) and the boot-time `fb-charset` dump
-  (framebuffer). Cosmetic until a broker exists.
+  interleaves with logd on both (serial, and logd's framebuffer mirror).
+  Cosmetic until a broker exists.
 - Non-printable named keys (arrows, Home/End/Delete, Tab, Escape) are ignored.
 - Backspace is byte-wise: it erases one byte of the current line, so
   backspacing a multi-byte UTF-8 character is incorrect. Grapheme-aware editing

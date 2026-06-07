@@ -326,11 +326,6 @@ dependencies = [
 [[package]]
 name = "fb-charset"
 version = "0.1.0"
-dependencies = [
- "ipc",
- "syscall",
- "syscall-abi",
-]
 
 [[package]]
 name = "find-msvc-tools"

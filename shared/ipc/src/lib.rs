@@ -726,9 +726,9 @@ pub mod published_names
 
     /// `REGISTRY_QUERY_AUTHORITY`-badged SEND on devmgr's registry
     /// endpoint. Consumers needing to resolve a device driver
-    /// themselves (today: `programs/fb-charset` →
-    /// `QUERY_FRAMEBUFFER_DEVICE`; future: any non-init caller of
-    /// devmgr's discovery surface) seed this name. svcmgr publishes it
+    /// themselves (today: `programs/terminal` → `QUERY_FRAMEBUFFER_DEVICE` /
+    /// `QUERY_INPUT_DEVICE` / `QUERY_SERIAL_DEVICE`; future: any non-init
+    /// caller of devmgr's discovery surface) seed this name. svcmgr publishes it
     /// post-handover from the devmgr-registry source cap init endows it
     /// with; the `REGISTRY_QUERY_AUTHORITY` badge bit is preserved
     /// through svcmgr's plain `cap_derive` in `registry_lookup_derived`.

@@ -9,10 +9,5 @@ name = "fb-charset"
 path = "src/main.rs"
 test = false
 
-[dependencies]
-ipc = { path = "../../shared/ipc" }
-syscall = { path = "../../shared/syscall" }
-syscall-abi = { path = "../../abi/syscall" }
-
 [lints]
 workspace = true

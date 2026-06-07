@@ -194,10 +194,11 @@ pub fn sys_thread_start(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         // All-CPU lock commit closes the cross-CPU dealloc race; see
         // docs/thread-lifecycle-and-sleep.md § Lifecycle State Machine.
         crate::sched::set_state_under_all_locks(target_tcb, ThreadState::Ready);
-        // Route to correct CPU based on affinity. enqueue_and_wake reads
-        // priority from the TCB under the target scheduler's lock.
+        // Route to correct CPU based on affinity. The thread is already Ready
+        // (committed above), so use enqueue_ready_thread to link it: the gated
+        // enqueue_and_wake would coalesce an already-Ready thread and drop it.
         let target_cpu = crate::sched::select_target_cpu(target_tcb);
-        crate::sched::enqueue_and_wake(target_tcb, target_cpu);
+        crate::sched::enqueue_ready_thread(target_tcb, target_cpu);
     }
 
     Ok(0)

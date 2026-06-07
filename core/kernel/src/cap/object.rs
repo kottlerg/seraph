@@ -1321,6 +1321,15 @@ unsafe fn dealloc_object_one(
                         .load(core::sync::atomic::Ordering::Relaxed)
                         as usize;
 
+                    // Acquire (*tcb).sched_lock FIRST (outermost) so the Exited
+                    // write serialises with schedule()'s dispatch flip and
+                    // enqueue_and_wake/commit on the SAME per-TCB lock (STEP 4/5
+                    // data-race fix). Released right after the CPU locks below,
+                    // BEFORE the UAF gate (which re-enables interrupts and where a
+                    // CPU switching away from `tcb` needs tcb.sched_lock). Order
+                    // tcb.sched_lock → CPU locks matches schedule(), so no ABBA.
+                    let tcb_sched_saved = (*tcb).sched_lock.lock_raw();
+
                     // Acquire all scheduler locks in ascending CPU order to
                     // prevent ABBA deadlock. Each CPU's saved interrupt-flag
                     // word is stashed in its own scheduler (under that lock).
@@ -1403,12 +1412,17 @@ unsafe fn dealloc_object_one(
                         }
                     };
 
-                    // Release all locks.
+                    // Release all CPU locks, then (*tcb).sched_lock last — BEFORE
+                    // the UAF gate, which spins with interrupts ENABLED (holding
+                    // an IRQ-disabling sched_lock across it would be inconsistent,
+                    // and a CPU switching away from `tcb` must be able to take
+                    // tcb.sched_lock).
                     for cpu in (0..cpu_count).rev()
                     {
                         let s = crate::sched::scheduler_for(cpu);
                         s.lock.unlock_raw(s.saved_lock_flags);
                     }
+                    (*tcb).sched_lock.unlock_raw(tcb_sched_saved);
 
                     // UAF gate: a TCB that is `current` on any CPU MUST NOT be
                     // reclaimed until every CPU has switched away from it AND
@@ -1502,8 +1516,11 @@ unsafe fn dealloc_object_one(
                 // region (enqueue_and_wake takes a scheduler.lock).
                 if let Some((bound, bcpu)) = server_reply_wake
                 {
-                    // SAFETY: bound prepared under all-CPU locks above.
-                    unsafe { crate::sched::enqueue_and_wake(bound, bcpu) };
+                    // SAFETY: bound prepared (state=Ready, return value/outcome
+                    // set) under all-CPU locks above; enqueue_ready_thread links
+                    // it — the gated enqueue_and_wake would coalesce the now-Ready
+                    // thread and the orphaned client would hang.
+                    unsafe { crate::sched::enqueue_ready_thread(bound, bcpu) };
                 }
 
                 // Unlink this thread from any IPC object it's blocked on.

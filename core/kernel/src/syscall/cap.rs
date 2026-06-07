@@ -904,6 +904,8 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 queued_on: core::sync::atomic::AtomicI16::new(-1),
                 #[cfg(debug_assertions)]
                 last_enqueue: None,
+                sched_lock: crate::sync::Spinlock::new(),
+                wake_pending: false,
                 ipc_state: IpcThreadState::None,
                 ipc_msg: Message::default(),
                 reply_tcb: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),

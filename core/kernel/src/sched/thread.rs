@@ -255,6 +255,27 @@ pub struct ThreadControlBlock
     #[cfg(debug_assertions)]
     pub last_enqueue: Option<EnqueueBreadcrumb>,
 
+    /// Authoritative serializer for this TCB's entire Scheduling field group.
+    ///
+    /// Keyed on the TCB itself, not on whichever run queue happens to link it:
+    /// the owning lock of `{state, ipc_state, queued_on, run_queue_next,
+    /// preferred_cpu, blocked_on_object, wake_pending}` is always this lock,
+    /// regardless of which CPU the TCB is on. This is what collapses the
+    /// positional-ownership race class — two CPUs can no longer pick two
+    /// different locks for one TCB. Lock order: source IPC lock → `sched_lock`
+    /// → per-CPU `PerCpuScheduler.lock`. See
+    /// `docs/scheduling-internals.md` § Cross-CPU TCB Ownership.
+    pub sched_lock: crate::sync::Spinlock,
+
+    /// A wake arrived while this thread was still live (`Running`/`Ready`).
+    ///
+    /// Set under [`sched_lock`](Self::sched_lock) by a waker that coalesces such
+    /// a wake instead of linking the live incarnation; the park-commit re-reads
+    /// it under `sched_lock` and refuses to park when set, closing the
+    /// wake-before-park lost-wake without a timing dependence. Only ever
+    /// accessed under `sched_lock`.
+    pub wake_pending: bool,
+
     // === IPC state ===
     /// Current IPC blocking reason (None when not blocked on IPC).
     pub ipc_state: IpcThreadState,

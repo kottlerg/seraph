@@ -51,7 +51,7 @@ Mount the partition identified by a Seraph-minted GPT type GUID at the
 given path. vfsd resolves the role byte to an arch-conditional type
 GUID (see [`services/vfsd/src/role_guids.rs`](../src/role_guids.rs)),
 looks the partition up in its parsed GPT table via
-[`gpt::lookup_partition_by_type_guid`](../src/gpt.rs) (DPS-style
+[`gpt::lookup_partition_by_type_guid`](../gpt/src/lib.rs) (DPS-style
 priority tie-break on attribute bits 48-63; tied priorities are
 fatal), registers the partition bound with virtio-blk, spawns a fatfs
 driver, sends `FS_MOUNT` to validate the BPB, captures the driver's

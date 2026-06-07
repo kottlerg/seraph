@@ -15,10 +15,11 @@ the I/O path after the walk. vfsd self-mounts the Seraph root partition
 vfsd/
 ├── Cargo.toml
 ├── README.md
+├── gpt/                     # `vfsd-gpt` crate: pure host-tested GPT-format parser
 ├── src/
 │   ├── main.rs              # Entry, root self-mount, service + namespace loops, MOUNT handler
 │   ├── driver.rs            # Spawning fatfs driver instances
-│   ├── gpt.rs               # GPT partition table parsing
+│   ├── partition.rs         # Boot-disk partition discovery: block I/O over the gpt crate
 │   ├── role_guids.rs        # Compile-time arch-conditional root + ESP GUIDs
 │   ├── root_backend.rs      # VfsdRootBackend (NamespaceBackend impl)
 │   ├── worker.rs            # Worker thread implementation

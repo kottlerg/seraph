@@ -2,7 +2,7 @@
 # Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
 [package]
-name = "gpt"
+name = "vfsd-gpt"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true

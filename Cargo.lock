@@ -416,10 +416,6 @@ dependencies = [
 
 [[package]]
 name = "gpt"
-version = "0.1.0"
-
-[[package]]
-name = "gpt"
 version = "4.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3696fafb1ecdcc2ae3ce337de73e9202806068594b77d22fdf2f3573c5ec2219"
@@ -1073,12 +1069,16 @@ name = "vfsd"
 version = "0.1.0"
 dependencies = [
  "boot-protocol",
- "gpt 0.1.0",
  "ipc",
  "namespace-protocol",
  "syscall",
  "syscall-abi",
+ "vfsd-gpt",
 ]
+
+[[package]]
+name = "vfsd-gpt"
+version = "0.1.0"
 
 [[package]]
 name = "virtio-blk"
@@ -1458,7 +1458,7 @@ dependencies = [
  "clap",
  "ctrlc",
  "fatfs 0.3.6",
- "gpt 4.1.0",
+ "gpt",
  "libc",
  "regex",
  "uuid",

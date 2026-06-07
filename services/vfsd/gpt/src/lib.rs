@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
+// vfsd/gpt/src/lib.rs
+
 //! Pure GUID Partition Table parsing.
 //!
 //! Decodes a GPT header and partition entries from raw sector bytes, and
@@ -8,7 +10,7 @@
 //! priority tie-breaking. This crate performs no I/O: a caller reads sectors
 //! off a block device (over IPC, in `vfsd`) and hands the bytes here. Keeping
 //! the parse of untrusted on-disk structures pure and host-testable is the
-//! point — see [coding-standards.md](../../../docs/coding-standards.md#d-testing-invariants).
+//! point — see [coding-standards.md](../../../../docs/coding-standards.md#d-testing-invariants).
 
 #![cfg_attr(not(test), no_std)]
 

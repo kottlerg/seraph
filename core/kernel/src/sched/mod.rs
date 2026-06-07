@@ -2545,7 +2545,6 @@ pub unsafe fn post_death_notification(tcb: *mut thread::ThreadControlBlock, exit
     }
 
     let exit_bits = exit_reason & 0xFFFF_FFFF;
-    let cpu = crate::arch::current::cpu::current_cpu() as usize;
 
     for i in 0..count
     {
@@ -2564,9 +2563,18 @@ pub unsafe fn post_death_notification(tcb: *mut thread::ThreadControlBlock, exit
         let result = unsafe { crate::ipc::event_queue::event_queue_post(observer.eq, payload) };
         if let Ok(Some(woken_tcb)) = result
         {
-            // SAFETY: cpu is valid; woken_tcb is valid and Ready.
+            // Route through `select_target_cpu` like every other waker so the
+            // save-window pin holds: an observer woken while still mid-block has
+            // `context_saved == 0`, and the pin keeps it on its own saving CPU.
+            // Enqueuing on the dying thread's CPU instead would land the wake on
+            // a different CPU, whose `schedule()` then spins cross-CPU on the
+            // observer's in-flight register save — and if the observer is itself
+            // mid-block on its CPU, that save never publishes, deadlocking both
+            // CPUs (the observer ends up `current` on two CPUs). See #289.
+            // SAFETY: woken_tcb is a valid Ready TCB; select_target_cpu is lock-free.
             unsafe {
-                enqueue_and_wake(woken_tcb, cpu);
+                let target_cpu = select_target_cpu(woken_tcb);
+                enqueue_and_wake(woken_tcb, target_cpu);
             }
         }
     }
@@ -2611,7 +2619,6 @@ pub unsafe fn post_aspace_death_notification(
     }
 
     let exit_bits = exit_reason & 0xFFFF_FFFF;
-    let cpu = crate::arch::current::cpu::current_cpu() as usize;
 
     for observer in &observers[..count]
     {
@@ -2626,9 +2633,12 @@ pub unsafe fn post_aspace_death_notification(
         let result = unsafe { crate::ipc::event_queue::event_queue_post(observer.eq, payload) };
         if let Ok(Some(woken_tcb)) = result
         {
-            // SAFETY: cpu is valid; woken_tcb is valid and Ready.
+            // Route through `select_target_cpu` so the save-window pin holds —
+            // see `post_death_notification` for the full rationale (#289).
+            // SAFETY: woken_tcb is a valid Ready TCB; select_target_cpu is lock-free.
             unsafe {
-                enqueue_and_wake(woken_tcb, cpu);
+                let target_cpu = select_target_cpu(woken_tcb);
+                enqueue_and_wake(woken_tcb, target_cpu);
             }
         }
     }

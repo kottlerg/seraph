@@ -346,8 +346,10 @@ pub fn sys_thread_stop(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// return value to `Interrupted` so the halted syscall returns that error.
 ///
 /// # Safety
-/// `tcb` must be a valid TCB in `Blocked` state. Must be called with the
-/// scheduler lock held (or in single-CPU context).
+/// `tcb` must be a valid TCB. The caller MUST NOT hold the target's `sched_lock`
+/// or any per-CPU scheduler lock: this function acquires `tcb.sched_lock` itself
+/// for the binding read-and-clear, and per-source IPC locks for the unlink (lock
+/// order: source IPC → `sched_lock`, so the two are never held together).
 // too_many_lines: flat dispatch over every `IpcThreadState` variant; splitting
 // adds no clarity (each arm is independent and short).
 #[allow(clippy::too_many_lines)]
@@ -361,15 +363,32 @@ unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadControlBlock)
     use crate::sched::thread::IpcThreadState;
     use syscall::SyscallError;
 
-    // SAFETY: tcb validated by caller; ipc_state field always valid.
-    let ipc_state = unsafe { (*tcb).ipc_state };
-    // SAFETY: tcb validated by caller; blocked_on_object field always valid.
-    let blocked_on = unsafe { (*tcb).blocked_on_object };
+    // Snapshot (state, ipc_state, blocked_on_object) under the per-TCB sched_lock
+    // — the authoritative serializer for the Scheduling field group. Reading the
+    // pair without it would race enqueue_and_wake / commit_blocked (which write
+    // these under sched_lock) and could observe a torn binding. If a concurrent
+    // waker already moved the thread off Blocked, its wake stands: there is
+    // nothing to cancel, so return without touching the source or the trap frame.
+    // sched_lock is released before any per-source IPC lock is taken below (lock
+    // order is source IPC → sched_lock, so the two are never held together).
+    // SAFETY: tcb validated by caller; fields read/written under sched_lock.
+    let (ipc_state, blocked_on) = unsafe {
+        let saved = (*tcb).sched_lock.lock_raw();
+        let snap = ((*tcb).ipc_state, (*tcb).blocked_on_object);
+        let blocked = (*tcb).state == crate::sched::thread::ThreadState::Blocked;
+        (*tcb).sched_lock.unlock_raw(saved);
+        if !blocked
+        {
+            return;
+        }
+        snap
+    };
 
-    // Each branch acquires the source IPC lock matching `ipc_state` before
-    // touching the source's waiter / queue. Lock order: scheduler.lock
-    // (outer, held by caller) → source IPC lock (inner). See
-    // docs/scheduling-internals.md § Lock Hierarchy rule 7.
+    // Each branch takes only the source IPC lock matching `ipc_state` (the
+    // sched_lock snapshot above is already released; lock order source IPC →
+    // sched_lock means the two are never nested) and unlinks this thread from the
+    // source's waiter / queue, racing any concurrent waker for the binding under
+    // that same source lock. See docs/scheduling-internals.md § Lock Hierarchy.
     match ipc_state
     {
         IpcThreadState::BlockedOnSend =>
@@ -574,11 +593,21 @@ unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadControlBlock)
         }
     }
 
-    // Reset IPC state and blocked_on_object.
-    // SAFETY: tcb is valid.
+    // Clear the binding under sched_lock, but only if the thread is still Blocked
+    // on the same object we cancelled: a waker that won the source-lock race above
+    // may have already woken (and possibly re-bound) it, in which case
+    // enqueue_and_wake already cleared these fields and we must not clobber a
+    // fresh binding.
+    // SAFETY: tcb is valid; fields written under sched_lock.
     unsafe {
-        (*tcb).ipc_state = IpcThreadState::None;
-        (*tcb).blocked_on_object = core::ptr::null_mut();
+        let saved = (*tcb).sched_lock.lock_raw();
+        if (*tcb).state == crate::sched::thread::ThreadState::Blocked
+            && (*tcb).ipc_state == ipc_state
+        {
+            (*tcb).ipc_state = IpcThreadState::None;
+            (*tcb).blocked_on_object = core::ptr::null_mut();
+        }
+        (*tcb).sched_lock.unlock_raw(saved);
     }
 
     // Write Interrupted into the stopped thread's trap-frame return slot so

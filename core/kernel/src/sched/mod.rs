@@ -1551,69 +1551,72 @@ pub unsafe fn migrate_ready_thread(
     // SAFETY: as above.
     let hi_sched = unsafe { scheduler_for(hi) };
 
-    // SAFETY: lock_raw/unlock_raw paired below in reverse order.
+    // Acquire the per-TCB sched_lock FIRST (outer), then both run-queue locks in
+    // ascending-CPU order (inner). sched_lock is the authoritative serializer for
+    // the Scheduling field group, so reading `state` under it is race-free even
+    // though `tcb` may currently be Running on a third CPU (its dispatch flip
+    // holds the same lock), and writing `preferred_cpu` under it keeps that field
+    // consistent with every other writer. Lock order: source IPC → sched_lock →
+    // per-CPU run-queue (docs/sched-ipc-redesign.md §2).
+    // SAFETY: tcb valid by caller contract; lock_raw paired with unlock below.
+    let tcb_sched_saved = unsafe { (*tcb).sched_lock.lock_raw() };
+    // SAFETY: lock_raw/unlock_raw paired below.
     let saved_lo = unsafe { lo_sched.lock.lock_raw() };
     // SAFETY: lo lock held; acquiring hi second satisfies ascending-CPU order.
     let saved_hi = unsafe { hi_sched.lock.lock_raw() };
 
-    // Re-check under both locks: this is the only legal observation point
-    // for cross-CPU state. The state could have moved to Running, Blocked,
-    // Stopped, or Exited since the unlocked read in the caller.
-    //
-    // The `preferred_cpu == src_cpu` check relies on the invariant that
-    // for a Ready thread, `preferred_cpu` names the CPU whose run queue
-    // currently links it. Every cross-CPU placement site writes
-    // `preferred_cpu = dst_cpu` under the destination's scheduler.lock —
-    // `enqueue_and_wake`, `pull_unpinned_ready`, and this function.
-    // SAFETY: tcb valid by caller contract.
-    let (state, located_cpu, priority) =
-        unsafe { ((*tcb).state, (*tcb).preferred_cpu as usize, (*tcb).priority) };
+    // Authoritative read under sched_lock: only a Ready thread is migratable.
+    // `remove_from_queue(src)` below is the authoritative "located on src" check —
+    // it fails (and we bail) if the thread is Ready on a different CPU's queue or
+    // in the benign Ready-but-unlinked publication window — so no separate
+    // preferred_cpu heuristic is needed.
+    // SAFETY: tcb valid; state/priority read under sched_lock + run-queue locks.
+    let (state, priority) = unsafe { ((*tcb).state, (*tcb).priority) };
 
-    if state != thread::ThreadState::Ready || located_cpu != src_cpu
+    if state != thread::ThreadState::Ready
     {
-        // SAFETY: paired with lock_raw above; release hi first (reverse order).
-        unsafe { hi_sched.lock.unlock_raw(saved_hi) };
-        // SAFETY: paired with lock_raw above.
-        unsafe { lo_sched.lock.unlock_raw(saved_lo) };
+        // SAFETY: paired above; release inner (hi, lo) then outer (sched_lock).
+        unsafe {
+            hi_sched.lock.unlock_raw(saved_hi);
+            lo_sched.lock.unlock_raw(saved_lo);
+            (*tcb).sched_lock.unlock_raw(tcb_sched_saved);
+        }
         return false;
     }
 
-    // SAFETY: src and dst schedulers initialised; tcb is Ready on src; both
+    // SAFETY: src and dst schedulers initialised; tcb is Ready; both run-queue
     // locks held so neither queue's structure can change underneath us.
     let removed = unsafe { scheduler_for(src_cpu).remove_from_queue(tcb, priority) };
     if !removed
     {
-        // Benign Ready-but-unlinked window. The Ready ⇒ linked-on-exactly-
-        // one-queue invariant has a transient exception while a caller has
-        // published `state = Ready` on `tcb` but the matching
-        // `enqueue_and_wake` has not yet acquired the destination scheduler's
-        // lock — most commonly `schedule()`'s cross-CPU outgoing branch
-        // (`sched/mod.rs:1918-1953`), which writes `state = Ready` and
-        // `preferred_cpu` is the stale source CPU until `enqueue_and_wake`
-        // overwrites it under the destination's lock. See
-        // `docs/scheduling-internals.md` § Cross-CPU TCB Ownership
-        // (Ready-priority-change paragraph). The pending `enqueue_and_wake`
-        // will place the tcb shortly; nothing to do on this side.
-        // SAFETY: paired with lock_raw above; release hi first.
-        unsafe { hi_sched.lock.unlock_raw(saved_hi) };
-        // SAFETY: paired with lock_raw above.
-        unsafe { lo_sched.lock.unlock_raw(saved_lo) };
+        // Ready but not linked on src — either the benign Ready-but-unlinked
+        // publication window (a pending enqueue_and_wake will place it), or it is
+        // Ready on a different CPU's queue. Either way nothing to do here; that
+        // CPU's schedule()/enqueue honours the new affinity.
+        // SAFETY: paired above; release inner (hi, lo) then outer (sched_lock).
+        unsafe {
+            hi_sched.lock.unlock_raw(saved_hi);
+            lo_sched.lock.unlock_raw(saved_lo);
+            (*tcb).sched_lock.unlock_raw(tcb_sched_saved);
+        }
         return false;
     }
 
     // SAFETY: dst scheduler initialised; tcb is no longer on src's queue.
     unsafe { scheduler_for(dst_cpu).enqueue(tcb, priority) };
-    // SAFETY: tcb valid; both locks held.
+    // SAFETY: tcb valid; sched_lock + both run-queue locks held.
     unsafe { (*tcb).preferred_cpu = dst_cpu as u32 };
 
     // Publish reschedule-pending before the unlock so the dst CPU's idle
     // loop / schedule() sees it via the Release on unlock.
     set_reschedule_pending_for(dst_cpu);
 
-    // SAFETY: paired with lock_raw above; release hi first (reverse order).
-    unsafe { hi_sched.lock.unlock_raw(saved_hi) };
-    // SAFETY: paired with lock_raw above.
-    unsafe { lo_sched.lock.unlock_raw(saved_lo) };
+    // SAFETY: paired above; release inner (hi, lo) then outer (sched_lock).
+    unsafe {
+        hi_sched.lock.unlock_raw(saved_hi);
+        lo_sched.lock.unlock_raw(saved_lo);
+        (*tcb).sched_lock.unlock_raw(tcb_sched_saved);
+    }
 
     // Always-IPI per the wake-protocol invariant.
     // SAFETY: dst_cpu validated < cpu_count above.
@@ -1797,7 +1800,28 @@ unsafe fn pull_unpinned_ready(src_cpu: usize, dst_cpu: usize)
     let Some((tcb, priority)) = pick
     else
     {
-        // SAFETY: paired with lock_raw above; release hi first.
+        // SAFETY: paired with lock_raw above; release hi first, lo last (lo
+        // captured the caller's interrupt flags).
+        unsafe { hi_sched.lock.unlock_raw(saved_hi) };
+        // SAFETY: paired with lock_raw above.
+        unsafe { lo_sched.lock.unlock_raw(saved_lo) };
+        return;
+    };
+
+    // Acquire the candidate's sched_lock so the Scheduling-field write below
+    // (preferred_cpu) serialises with every other writer (dispatch flip,
+    // enqueue_and_wake, migrate). It is taken AFTER the run-queue locks — the
+    // reverse of the canonical sched_lock→run-queue order — so use try_lock to
+    // stay deadlock-free: a canonical holder (sched_lock then src's run-queue
+    // lock) makes the try fail and we back off. The src run-queue lock is held
+    // throughout, which pins `tcb` (Ready on src; dispatch/migrate/dealloc all
+    // need that lock), so the pointer cannot be freed under us; a failed try just
+    // defers this pull to the next balance tick.
+    // SAFETY: tcb valid (linked on src under the held lock); paired with unlock.
+    let Some(tcb_sched_saved) = (unsafe { (*tcb).sched_lock.try_lock_raw() })
+    else
+    {
+        // SAFETY: paired with lock_raw above; release hi first, lo last.
         unsafe { hi_sched.lock.unlock_raw(saved_hi) };
         // SAFETY: paired with lock_raw above.
         unsafe { lo_sched.lock.unlock_raw(saved_lo) };
@@ -1808,24 +1832,30 @@ unsafe fn pull_unpinned_ready(src_cpu: usize, dst_cpu: usize)
     let removed = unsafe { scheduler_for(src_cpu).remove_from_queue(tcb, priority) };
     if !removed
     {
-        // SAFETY: paired with lock_raw above; release hi first.
-        unsafe { hi_sched.lock.unlock_raw(saved_hi) };
-        // SAFETY: paired with lock_raw above.
-        unsafe { lo_sched.lock.unlock_raw(saved_lo) };
+        // SAFETY: paired above; release the candidate's sched_lock and hi, then
+        // lo last (lo captured the caller's interrupt flags).
+        unsafe {
+            (*tcb).sched_lock.unlock_raw(tcb_sched_saved);
+            hi_sched.lock.unlock_raw(saved_hi);
+            lo_sched.lock.unlock_raw(saved_lo);
+        }
         return;
     }
 
     // SAFETY: tcb is no longer on src; dst_cpu scheduler is valid.
     unsafe { scheduler_for(dst_cpu).enqueue(tcb, priority) };
-    // SAFETY: tcb valid; both locks held.
+    // SAFETY: tcb valid; sched_lock + both run-queue locks held.
     unsafe { (*tcb).preferred_cpu = dst_cpu as u32 };
 
     set_reschedule_pending_for(dst_cpu);
 
-    // SAFETY: paired with lock_raw above; release hi first.
-    unsafe { hi_sched.lock.unlock_raw(saved_hi) };
-    // SAFETY: paired with lock_raw above.
-    unsafe { lo_sched.lock.unlock_raw(saved_lo) };
+    // SAFETY: paired above; release the candidate's sched_lock and hi, then lo
+    // last (lo captured the caller's interrupt flags).
+    unsafe {
+        (*tcb).sched_lock.unlock_raw(tcb_sched_saved);
+        hi_sched.lock.unlock_raw(saved_hi);
+        lo_sched.lock.unlock_raw(saved_lo);
+    }
 
     // SAFETY: dst_cpu validated < cpu_count.
     unsafe { wake_idle_cpu(dst_cpu) };
@@ -2396,6 +2426,12 @@ pub unsafe fn schedule(requeue_current: bool)
                 else
                 {
                     (*current).state = ThreadState::Ready;
+                    // Requeued on THIS CPU: keep preferred_cpu authoritative.
+                    // Leaving it stale lets a preferred_cpu-keyed path (wake
+                    // routing, migrate) dispatch this thread on another CPU while
+                    // it is still linked here — the residual cross-CPU
+                    // double-dispatch (docs/sched-ipc-redesign.md §8).
+                    (*current).preferred_cpu = cpu as u32;
                     sched.enqueue(current, prio);
                 }
             }
@@ -2445,6 +2481,10 @@ pub unsafe fn schedule(requeue_current: bool)
             // SAFETY: current is a valid TCB; state written under its sched_lock.
             unsafe {
                 (*current).state = ThreadState::Running;
+                // Still running on THIS CPU: keep preferred_cpu authoritative
+                // (the re-mark, like the local requeue above, must not leave it
+                // stale — docs/sched-ipc-redesign.md §8).
+                (*current).preferred_cpu = cpu as u32;
                 // A running thread carries no pending park-wake (see the
                 // dispatch flip below).
                 (*current).wake_pending = false;

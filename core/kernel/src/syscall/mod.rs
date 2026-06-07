@@ -226,22 +226,50 @@ fn sys_thread_sleep(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         return Err(SyscallError::InvalidCapability);
     }
 
-    // SAFETY: tcb validated non-null; fields always valid for initialized TCB.
+    // SAFETY: tcb validated non-null; sleep_deadline read by the timer path only
+    // after sleep_list_add below.
     unsafe {
         (*tcb).sleep_deadline = deadline;
-        (*tcb).state = crate::sched::thread::ThreadState::Blocked;
+    }
+
+    // Commit Running→Blocked under the per-TCB sched_lock (the authoritative
+    // serializer for the Scheduling field group). A sleep has no IPC source, so
+    // ipc_state stays None. A false return means a concurrent stop/exit won or a
+    // wake was deposited (refuse-to-park): abandon the sleep and stay runnable.
+    // SAFETY: tcb is this CPU's current (running) thread.
+    let committed = unsafe {
+        crate::sched::commit_blocked_under_local_lock(
+            tcb,
+            crate::sched::thread::IpcThreadState::None,
+            core::ptr::null_mut(),
+        )
+    };
+    if !committed
+    {
+        // SAFETY: tcb valid; no sleep-list entry was added.
+        unsafe {
+            (*tcb).sleep_deadline = 0;
+        }
+        return Ok(0);
     }
 
     if crate::sched::sleep_list_add(tcb).is_err()
     {
-        // Sleep list at capacity. Roll back: sys_thread_sleep has no IPC
-        // source to fall back on; the only honest answer is to surface the
-        // failure to userspace. See docs/thread-lifecycle-and-sleep.md
-        // § Sleep List Invariants.
-        // SAFETY: tcb valid; restoring to Ready before any schedule().
+        // Sleep list at capacity. Roll back the Blocked commit: sys_thread_sleep
+        // has no IPC source to fall back on; the only honest answer is to surface
+        // the failure to userspace. See docs/thread-lifecycle-and-sleep.md
+        // § Sleep List Invariants. No IPC source binding and no waker targets a
+        // sleeping thread before sleep_list_add, so the thread is still Blocked
+        // here; restore Running under sched_lock.
+        // SAFETY: tcb valid; restoring before any schedule().
         unsafe {
+            let saved = (*tcb).sched_lock.lock_raw();
+            if (*tcb).state == crate::sched::thread::ThreadState::Blocked
+            {
+                (*tcb).state = crate::sched::thread::ThreadState::Running;
+            }
             (*tcb).sleep_deadline = 0;
-            (*tcb).state = crate::sched::thread::ThreadState::Running;
+            (*tcb).sched_lock.unlock_raw(saved);
         }
         return Err(SyscallError::OutOfMemory);
     }

@@ -43,13 +43,14 @@ labels live in [`ipc::vfsd_labels`] in `shared/ipc`.
 ## Label 10: `MOUNT`
 
 Runtime explicit-mount surface (foreign-GUID disks, user-invoked
-mounts). vfsd self-mounts root and `/esp` at startup through the same
-resolution path, so no in-tree caller currently issues `MOUNT`; the
-label is retained for runtime mounts.
+mounts). vfsd self-mounts root, `/esp`, and `/data` at startup through
+the same resolution path, so no in-tree caller currently issues
+`MOUNT`; the label is retained for runtime mounts.
 
 Mount the partition identified by a Seraph-minted GPT type GUID at the
-given path. vfsd resolves the role byte to an arch-conditional type
-GUID (see [`services/vfsd/src/role_guids.rs`](../src/role_guids.rs)),
+given path. vfsd resolves the role byte to a type GUID (arch-conditional
+for the root role, arch-neutral for data; see
+[`services/vfsd/src/role_guids.rs`](../src/role_guids.rs)),
 looks the partition up in its parsed GPT table via
 [`gpt::lookup_partition_by_type_guid`](../src/gpt.rs) (DPS-style
 priority tie-break on attribute bits 48-63; tied priorities are
@@ -60,19 +61,22 @@ the new filesystem's namespace endpoint addressing its root. A mount
 on `/` is rejected (`NO_MOUNT`) once root is already mounted.
 
 When the requested role is the rootfs (`MountRole::Root`, byte `0`),
-vfsd additionally auto-mounts the EFI System Partition at `/esp`
-inside the same handler before replying — the same logic the startup
-self-mount uses. The ESP mount is best-effort: failure logs a
-diagnostic but does not propagate into the root mount reply. The ESP
-is identified by the standard EFI System Partition type GUID
-(`c12a7328-f81f-11d2-ba4b-00a0c93ec93b`).
+vfsd additionally auto-mounts the EFI System Partition at `/esp` and
+the data partition at `/data` inside the same handler before replying —
+the same logic the startup self-mount uses. Both auto-mounts are
+best-effort: a missing or duplicate-priority partition logs a
+diagnostic and is skipped (leaving `/esp` / `/data` to resolve through
+the root-fs fall-through) without propagating into the root mount
+reply. The ESP is identified by the standard EFI System Partition type
+GUID (`c12a7328-f81f-11d2-ba4b-00a0c93ec93b`); the data partition by
+the arch-neutral `SERAPH_DATA` GUID.
 
 **Request**
 
 | Field | Value |
 |---|---|
 | `label` | `10` |
-| `data[0]` low byte | `MountRole` discriminant (`0` = `Root`; other roles reserved) |
+| `data[0]` low byte | `MountRole` discriminant (`0` = `Root`; `1` = `Data`; other roles reserved) |
 | `data[1]` | Mount path length (1..=64) |
 | `data[2..]` | Mount path bytes packed little-endian |
 

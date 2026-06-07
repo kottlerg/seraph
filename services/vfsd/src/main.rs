@@ -14,8 +14,9 @@
 //! from client to driver.
 //!
 //! vfsd self-mounts the Seraph root partition at `/` (and the ESP at
-//! `/esp`) during startup, before serving any request; the runtime
-//! `MOUNT` IPC remains for explicit/foreign-GUID mounts.
+//! `/esp` and the data partition at `/data`) during startup, before
+//! serving any request; the runtime `MOUNT` IPC remains for
+//! explicit/foreign-GUID mounts.
 //!
 //! See `vfsd/README.md` for the design and `fs/docs/fs-driver-protocol.md`
 //! for the driver-side protocol.
@@ -766,6 +767,9 @@ enum MountRole
 {
     /// Seraph rootfs (`role_guids::SERAPH_ROOT`).
     Root,
+    /// Seraph data partition (`role_guids::SERAPH_DATA`), auto-mounted at
+    /// `/data`.
+    Data,
 }
 
 impl MountRole
@@ -775,6 +779,7 @@ impl MountRole
         match byte
         {
             0 => Some(MountRole::Root),
+            1 => Some(MountRole::Data),
             _ => None,
         }
     }
@@ -784,19 +789,21 @@ impl MountRole
         match self
         {
             MountRole::Root => &role_guids::SERAPH_ROOT,
+            MountRole::Data => &role_guids::SERAPH_DATA,
         }
     }
 }
 
 /// Mount the Seraph root partition at `/`, then auto-mount the ESP at
-/// `/esp`, during vfsd startup.
+/// `/esp` and the data partition at `/data`, during vfsd startup.
 ///
 /// Runs on the main thread before any service handler exists, so a
 /// `GET_SYSTEM_ROOT_CAP` request can never observe an unmounted root.
-/// The namespace dispatcher must already be running: the `/esp` mount
-/// takes the VFS spawn path, which re-enters vfsd's namespace endpoint
-/// to resolve `/services/fs/fatfs`. Returns whether the root mount
-/// succeeded; `/esp` is best-effort and never gates the return value.
+/// The namespace dispatcher must already be running: the `/esp` and
+/// `/data` mounts take the VFS spawn path, which re-enters vfsd's
+/// namespace endpoint to resolve `/services/fs/fatfs`. Returns whether
+/// the root mount succeeded; `/esp` and `/data` are best-effort and never
+/// gate the return value.
 fn self_mount(rt: &VfsdRuntime, ipc_buf: *mut u64) -> bool
 {
     match do_mount_internal(rt, ipc_buf, &role_guids::SERAPH_ROOT, b"/")
@@ -816,14 +823,15 @@ fn self_mount(rt: &VfsdRuntime, ipc_buf: *mut u64) -> bool
         }
     }
 
-    auto_mount_esp(rt, ipc_buf);
+    auto_mount_role(rt, ipc_buf, &role_guids::EFI_SYSTEM_PARTITION, "/esp");
+    auto_mount_role(rt, ipc_buf, &role_guids::SERAPH_DATA, "/data");
     true
 }
 
 /// Handle a runtime MOUNT request from an authorized client.
 ///
-/// vfsd self-mounts root and `/esp` at startup ([`self_mount`]), so no
-/// in-tree caller currently issues MOUNT; it remains the explicit /
+/// vfsd self-mounts root, `/esp`, and `/data` at startup ([`self_mount`]),
+/// so no in-tree caller currently issues MOUNT; it remains the explicit /
 /// runtime-mount surface (foreign-GUID disks, user-invoked mounts).
 ///
 /// IPC data layout (boot protocol v8+):
@@ -833,7 +841,8 @@ fn self_mount(rt: &VfsdRuntime, ipc_buf: *mut u64) -> bool
 ///
 /// Decodes the wire payload and delegates to [`do_mount`] for the
 /// real work. When the requested role is [`MountRole::Root`], vfsd
-/// additionally auto-mounts the EFI System Partition at `/esp`.
+/// additionally auto-mounts the EFI System Partition at `/esp` and the
+/// data partition at `/data`.
 #[allow(clippy::cast_possible_truncation)]
 fn handle_mount_request(recv: &IpcMessage, ipc_buf: *mut u64, rt: &VfsdRuntime)
 {
@@ -879,44 +888,50 @@ fn handle_mount_request(recv: &IpcMessage, ipc_buf: *mut u64, rt: &VfsdRuntime)
         Err(label) => IpcMessage::new(label),
     };
 
-    // Auto-mount the EFI System Partition at /esp once root is up so
-    // userspace can read kernel + bundle + bootloader without a separate
-    // MOUNT call. Best-effort — failure does not propagate into the root
-    // mount's reply.
+    // Auto-mount the EFI System Partition at /esp and the data partition
+    // at /data once root is up, so userspace can read kernel + bundle +
+    // bootloader and the data tree without a separate MOUNT call.
+    // Best-effort — failure does not propagate into the root mount's reply.
     if matches!(role, MountRole::Root) && reply.label == ipc::vfsd_errors::SUCCESS
     {
-        auto_mount_esp(rt, ipc_buf);
+        auto_mount_role(rt, ipc_buf, &role_guids::EFI_SYSTEM_PARTITION, "/esp");
+        auto_mount_role(rt, ipc_buf, &role_guids::SERAPH_DATA, "/data");
     }
 
     // SAFETY: ipc_buf is the registered IPC buffer.
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
 }
 
-/// One-shot best-effort mount of the EFI System Partition at `/esp`. Logs
-/// a diagnostic on any failure. Idempotent if invoked twice — the
-/// install attempt against an already-terminal mount path is rejected by
+/// One-shot best-effort mount of the partition tagged `type_guid` at
+/// `mount_path`. Scans the parsed GPT for an active matching partition; if
+/// none is present (or its role lookup is ambiguous), logs a diagnostic
+/// and returns without mounting, leaving `mount_path` to resolve through
+/// the root-fs fall-through. On a match, runs the mount transaction and
+/// logs the outcome. Never fatal — distinct from the root self-mount,
+/// whose failure gates boot. Idempotent if invoked twice: the install
+/// against an already-terminal mount path is rejected by
 /// `root_backend::install_mount`.
-fn auto_mount_esp(rt: &VfsdRuntime, ipc_buf: *mut u64)
+fn auto_mount_role(rt: &VfsdRuntime, ipc_buf: *mut u64, type_guid: &[u8; 16], mount_path: &str)
 {
-    let parts = &rt.gpt_parts;
-    let mut esp_found = false;
-    for p in parts
+    let present = rt
+        .gpt_parts
+        .iter()
+        .any(|p| p.active && &p.type_guid == type_guid);
+    if !present
     {
-        if p.active && p.type_guid == role_guids::EFI_SYSTEM_PARTITION
-        {
-            esp_found = true;
-            break;
-        }
-    }
-    if !esp_found
-    {
-        std::os::seraph::log!("MOUNT: no EFI System Partition found; skipping /esp auto-mount");
+        std::os::seraph::log!("MOUNT: no partition for {mount_path}; skipping auto-mount");
         return;
     }
-    match do_mount_internal(rt, ipc_buf, &role_guids::EFI_SYSTEM_PARTITION, b"/esp")
+    match do_mount_internal(rt, ipc_buf, type_guid, mount_path.as_bytes())
     {
-        Ok(_) => std::os::seraph::log!("MOUNT: /esp auto-mounted"),
-        Err(code) => std::os::seraph::log!("MOUNT: /esp auto-mount failed: code={code:#x}"),
+        Ok(caller_cap) =>
+        {
+            // The auto-mount has no IPC caller for the returned badged SEND;
+            // vfsd reaches the mount through its synthetic backend.
+            log_cap_delete("auto-mount caller cap", caller_cap);
+            std::os::seraph::log!("MOUNT: {mount_path} auto-mounted");
+        }
+        Err(code) => std::os::seraph::log!("MOUNT: {mount_path} auto-mount failed: code={code:#x}"),
     }
 }
 
@@ -966,9 +981,9 @@ pub(crate) fn do_mount(
 }
 
 /// Shared implementation for both role-driven (`do_mount`) and
-/// internally-triggered (`auto_mount_esp`) mounts. Takes a type-GUID
-/// directly so callers without a [`MountRole`] (the ESP auto-mount)
-/// can reuse the transaction body.
+/// internally-triggered (`auto_mount_role`) mounts. Takes a type-GUID
+/// directly so callers without a [`MountRole`] (the `/esp` and `/data`
+/// auto-mounts) can reuse the transaction body.
 #[allow(clippy::too_many_lines)]
 fn do_mount_internal(
     rt: &VfsdRuntime,
@@ -988,8 +1003,11 @@ fn do_mount_internal(
             }
             Err(gpt::GptLookupError::DuplicateTie) =>
             {
+                // Non-fatal here; the caller decides (root self-mount treats
+                // the returned error as fatal, the /esp and /data auto-mounts
+                // skip and fall through).
                 std::os::seraph::log!(
-                    "MOUNT: FATAL — multiple partitions share the role GUID with tied priority"
+                    "MOUNT: role GUID matched by multiple tied-priority partitions; not mounting"
                 );
                 return Err(ipc::vfsd_errors::NO_MOUNT);
             }

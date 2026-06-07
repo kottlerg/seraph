@@ -118,8 +118,8 @@ namespace endpoint, both addressing the driver's root at full
 namespace rights:
 
 - `caller_root_cap` is returned to the `MOUNT` caller (or dropped on
-  the internal `auto_mount_esp` path that handles the `/esp` mount
-  without a synchronous caller).
+  the internal `auto_mount_role` path that handles the `/esp` and
+  `/data` mounts without a synchronous caller).
 - `synthetic_root_cap` is captured into [`VfsdRootBackend`] so the
   composition above can `cap_derive` from it on every `NS_LOOKUP`.
 

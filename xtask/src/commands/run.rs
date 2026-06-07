@@ -69,6 +69,7 @@ pub fn run(ctx: &BuildContext, args: &RunArgs) -> Result<()>
         cpus: args.cpus,
         headless: args.headless,
         gdb: args.gdb,
+        qmp_socket: None,
     };
     let qemu_args = build_qemu_argv(&spec);
 

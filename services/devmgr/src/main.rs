@@ -163,6 +163,24 @@ fn main() -> !
         std::os::seraph::log!("devmgr: framebuffer driver spawned");
     }
 
+    // Enumerate the virtio-input (keyboard) device now — PCI scan, catalog
+    // entry, and carve of its BAR/IRQ caps — but defer the spawn. The driver
+    // binary lives on the rootfs, not the boot bundle (it is not
+    // bootstrap-essential), so it loads inside the SET_DRIVERS_DIR handler like
+    // the RTC. `pending_input` stashes the carved caps across the boot →
+    // registry-loop transition; `take()` in that handler makes the spawn
+    // at-most-once.
+    let mut pending_input = enumerate_virtio_input(
+        &devices[..dev_count],
+        &mut caps,
+        &mut irq_root,
+        &mut catalog,
+    );
+    if pending_input.is_some()
+    {
+        std::os::seraph::log!("devmgr: virtio-input device enumerated (deferred spawn)");
+    }
+
     // On-disk driver state. The RTC binary lives on the rootfs at
     // `/services/drivers/<chip>`, not in the boot bundle — RTC is not
     // bootstrap-essential. svcmgr delivers a `LOOKUP | READ`-attenuated
@@ -178,6 +196,10 @@ fn main() -> !
     let mut drivers_dir_cap: u32 = 0;
     let mut rtc_ep: u32 = 0;
     let mut rtc_spawn_attempted: bool = false;
+    // Service endpoint for the on-disk virtio-input driver. devmgr owns it and
+    // mints client SEND caps on `QUERY_INPUT_DEVICE`. Zero until the
+    // `SET_DRIVERS_DIR` handler spawns the driver (or permanently, on failure).
+    let mut input_ep: u32 = 0;
 
     // TODO(#165): remove with the devmgr enumeration redesign. Outcome of the
     // last TEST_SPAWN_ORPHAN trigger, reported by TEST_ORPHAN_RESULT. 0=not
@@ -433,6 +455,21 @@ fn main() -> !
                     {
                         rtc_ep = new_ep;
                     }
+                    // virtio-input is on-disk too (not bootstrap-essential).
+                    // Spawn it here, after the reply, like the RTC. `take()`
+                    // makes the attempt at-most-once and sticky on failure:
+                    // a failed spawn leaves `input_ep == 0`, so
+                    // `QUERY_INPUT_DEVICE` replies `NO_DEVICE` thereafter.
+                    if let Some(pending) = pending_input.take()
+                        && let Some(new_ep) = spawn_virtio_input_from_disk(
+                            &mut caps,
+                            &pending,
+                            drivers_dir_cap,
+                            ipc_buf,
+                        )
+                    {
+                        input_ep = new_ep;
+                    }
                 }
             }
             ipc::devmgr_labels::QUERY_RTC_DEVICE =>
@@ -484,6 +521,55 @@ fn main() -> !
                 {
                     // Terminal for the boot — see SET_DRIVERS_DIR arm
                     // for the at-most-once spawn contract.
+                    let reply = IpcMessage::new(ipc::devmgr_errors::NO_DEVICE);
+                    // SAFETY: ipc_buf is the registered IPC buffer.
+                    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+                }
+            }
+            ipc::devmgr_labels::QUERY_INPUT_DEVICE =>
+            {
+                // Like QUERY_RTC_DEVICE: the driver is spawned on-disk by the
+                // SET_DRIVERS_DIR handler, so `input_ep` is zero until then (or
+                // permanently on spawn failure) — reply NO_DEVICE in that case.
+                // Do not `seraph::log!` here (deadlock risk if logd ever fans
+                // input queries through devmgr).
+                if badge & ipc::devmgr_labels::REGISTRY_QUERY_AUTHORITY == 0
+                {
+                    let reply = IpcMessage::new(ipc::devmgr_errors::UNAUTHORIZED);
+                    // SAFETY: ipc_buf is the registered IPC buffer.
+                    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+                }
+                else if msg.word(0) != u64::from(ipc::DEVMGR_LABELS_VERSION)
+                {
+                    let reply = IpcMessage::new(ipc::devmgr_errors::LABEL_VERSION_MISMATCH);
+                    // SAFETY: ipc_buf is the registered IPC buffer.
+                    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+                }
+                else if input_ep != 0
+                {
+                    // Mint a badged SEND_GRANT cap carrying the READ_AUTHORITY
+                    // verb bit on the input driver's service endpoint.
+                    if let Ok(derived) = syscall::cap_derive_badge(
+                        input_ep,
+                        syscall::RIGHTS_SEND_GRANT,
+                        ipc::input_labels::READ_AUTHORITY,
+                    )
+                    {
+                        let reply = IpcMessage::builder(ipc::devmgr_errors::SUCCESS)
+                            .cap(derived)
+                            .build();
+                        // SAFETY: ipc_buf is the registered IPC buffer.
+                        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+                    }
+                    else
+                    {
+                        let reply = IpcMessage::new(ipc::devmgr_errors::INVALID_REQUEST);
+                        // SAFETY: ipc_buf is the registered IPC buffer.
+                        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+                    }
+                }
+                else
+                {
                     let reply = IpcMessage::new(ipc::devmgr_errors::NO_DEVICE);
                     // SAFETY: ipc_buf is the registered IPC buffer.
                     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
@@ -1270,7 +1356,7 @@ fn spawn_virtio_blk(
         let config = spawn::DriverSpawnConfig {
             procmgr_ep: caps.procmgr_ep,
             bootstrap_ep: caps.self_bootstrap_ep,
-            module_cap,
+            source: spawn::CreateSource::Module(module_cap),
             bars: spawn::BarSpec {
                 caps: &bar_info.0[..bar_info.2],
                 bases: &bar_info.1[..bar_info.2],
@@ -1371,6 +1457,159 @@ fn find_virtio_bar_cap(
     }
 
     (bar_caps, bar_bases, count, bar_sizes)
+}
+
+// ── VirtIO input (keyboard) driver: deferred on-disk spawn ──────────────────
+
+/// A virtio-input PCI device discovered during enumeration, with its BAR/IRQ
+/// caps carved and its catalog entry filled, awaiting an on-disk spawn in the
+/// `SET_DRIVERS_DIR` handler.
+struct PendingInputDevice
+{
+    bar_cap: u32,
+    bar_base: u64,
+    bar_size: u64,
+    irq_cap: Option<u32>,
+    device_badge: u64,
+}
+
+/// Discover the virtio-input device: fill its `DeviceCatalog` entry and carve
+/// its BAR + IRQ caps, returning the stash for a deferred on-disk spawn.
+/// Mirrors the discovery half of [`spawn_virtio_blk`] but does not spawn — the
+/// binary lives on the rootfs and is loaded later by the `SET_DRIVERS_DIR`
+/// handler (it is not bootstrap-essential).
+fn enumerate_virtio_input(
+    devices: &[pci::PciDevice],
+    caps: &mut caps::DevmgrCaps,
+    irq_root: &mut IrqRootAllocator,
+    catalog: &mut DeviceCatalog,
+) -> Option<PendingInputDevice>
+{
+    for pci_dev in devices
+    {
+        if !pci::is_virtio_input(pci_dev)
+        {
+            continue;
+        }
+
+        std::os::seraph::log!(
+            "devmgr: found virtio-input PCI device IRQ line={:#x} pin={:#x}",
+            u64::from(pci_dev.irq_line),
+            u64::from(pci_dev.irq_pin)
+        );
+
+        let dev_idx = *catalog.count;
+        if dev_idx >= catalog.entries.len()
+        {
+            std::os::seraph::log!("virtio-input: device catalog full");
+            return None;
+        }
+        // Serialise the virtio startup info into the generic catalog entry, as
+        // virtio-blk does; the driver deserialises it on QUERY_DEVICE_INFO.
+        let mut buf = [0u8; virtio_core::VirtioPciStartupInfo::SIZE];
+        if pci_dev.virtio_info.to_bytes(&mut buf).is_none()
+        {
+            std::os::seraph::log!("virtio-input: to_bytes overflowed (skipped)");
+            return None;
+        }
+        if !catalog.entries[dev_idx].fill(
+            ipc::device_info_kind::VIRTIO_PCI,
+            virtio_core::VIRTIO_PCI_INFO_VERSION,
+            &buf,
+        )
+        {
+            std::os::seraph::log!("virtio-input: catalog entry payload too large");
+            return None;
+        }
+        *catalog.count += 1;
+        let device_badge = (dev_idx as u64) + 1;
+
+        let bar_info = find_virtio_bar_cap(pci_dev, caps);
+        if bar_info.2 == 0
+        {
+            std::os::seraph::log!("virtio-input: BAR not covered by any aperture");
+            return None;
+        }
+        let irq_cap = acquire_single_irq_cap(pci_dev, irq_root);
+
+        return Some(PendingInputDevice {
+            bar_cap: bar_info.0[0],
+            bar_base: bar_info.1[0],
+            bar_size: bar_info.3[0],
+            irq_cap,
+            device_badge,
+        });
+    }
+
+    None
+}
+
+/// Spawn the on-disk virtio-input driver. Walks
+/// `/services/drivers/virtio-input` through the `SET_DRIVERS_DIR` subtree cap,
+/// then hands the carved BAR/IRQ caps (stashed at enumeration) to the
+/// file-source PCI spawn path. Returns the freshly created service endpoint on
+/// success; the caller stores it for `QUERY_INPUT_DEVICE`. Mirrors
+/// [`spawn_rtc_from_disk`], but uses [`spawn::spawn_driver`] (BAR + IRQ +
+/// device-info) rather than the simple-device path.
+fn spawn_virtio_input_from_disk(
+    caps: &mut caps::DevmgrCaps,
+    pending: &PendingInputDevice,
+    drivers_dir_cap: u32,
+    ipc_buf: *mut u64,
+) -> Option<u32>
+{
+    let requested_rights = u64::from(namespace_protocol::rights::READ);
+    let Some(walked) =
+        ns_client::walk_to_file(drivers_dir_cap, b"virtio-input", requested_rights, ipc_buf)
+    else
+    {
+        std::os::seraph::log!("virtio-input: walk_to_file failed (binary missing on rootfs)");
+        return None;
+    };
+
+    let input_ep = std::os::seraph::object_slab_acquire(88)
+        .and_then(|slab| syscall::cap_create_endpoint(slab).ok())
+        .unwrap_or(0);
+    if input_ep == 0
+    {
+        std::os::seraph::log!("virtio-input: failed to create service endpoint");
+        let _ = syscall::cap_delete(walked.file_cap);
+        return None;
+    }
+
+    let bar_caps = [pending.bar_cap];
+    let bar_bases = [pending.bar_base];
+    let bar_sizes = [pending.bar_size];
+    let config = spawn::DriverSpawnConfig {
+        procmgr_ep: caps.procmgr_ep,
+        bootstrap_ep: caps.self_bootstrap_ep,
+        source: spawn::CreateSource::File {
+            file_cap: walked.file_cap,
+            size: walked.size,
+        },
+        bars: spawn::BarSpec {
+            caps: &bar_caps,
+            bases: &bar_bases,
+            sizes: &bar_sizes,
+        },
+        irq_cap: pending.irq_cap,
+        service_ep: input_ep,
+        registry_ep: caps.registry_ep,
+        device_badge: pending.device_badge,
+    };
+
+    // `spawn_driver` owns the file cap's lifecycle from here (consumed by
+    // CREATE_FROM_FILE, or released on failure).
+    if spawn::spawn_driver(&config, ipc_buf)
+    {
+        std::os::seraph::log!("devmgr: virtio-input driver spawned from disk");
+        Some(input_ep)
+    }
+    else
+    {
+        let _ = syscall::cap_delete(input_ep);
+        None
+    }
 }
 
 // ── Serial (UART) driver spawn ──────────────────────────────────────────────

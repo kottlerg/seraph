@@ -14,7 +14,7 @@ Three harnesses exercise three surfaces:
 |---|---|---|---|
 | `ktest` | Kernel | `core/ktest/` | Bootloader-loaded init replacement (`cargo xtask compose-bundle --harness ktest`) |
 | `svctest` | Services | `services/svctest/` | `svcmgr` spawns from `/config/svcmgr/services/` recipe |
-| `usertest` | Programs | `services/usertest/` | `svcmgr` spawns from `/config/svcmgr/services/` recipe; drives binaries under `programs/` through their real I/O surfaces |
+| `usertest` | Programs | `services/usertest/` | `svcmgr` spawns from `/config/svcmgr/services/` recipe; drives binaries under `programs/` through their real I/O surfaces. Also hosts the terminal interactive test (`cargo xtask test-terminal`), which injects keys over QMP through the live virtio-input driver and the autostarted terminal |
 
 `ktest` and `svctest` are authoritative for their own surface; the harness
 itself owns its phases. `usertest` is an orchestrator that runs per-program
@@ -114,7 +114,10 @@ build amounts to dropping `/tests/`.
 
 ## Gating
 
-The default boot is interactive: no harness runs.
+The default boot is interactive: no harness runs. It brings up the system
+services and the `terminal` program, which autostarts from
+`/config/svcmgr/services/terminal.svc` and is the keyboard consumer (see
+[programs/terminal/README.md](../programs/terminal/README.md)).
 
 `svcmgr` walks `/config/svcmgr/services/` and launches every `.svc` recipe
 it finds (see [services/svcmgr/README.md](../services/svcmgr/README.md)).
@@ -157,12 +160,51 @@ Reset to the default-init bundle by re-running `cargo xtask build` or
 compile-time defaults in `core/ktest/src/cmdline.rs::KtestConfig::DEFAULT`
 (see [xtask/README.md](../xtask/README.md#cargo-xtask-compose-bundle)).
 
+### Interactive input (`test-terminal`)
+
+Keyboard input cannot be exercised by an autonomous recipe: its keysyms must
+come from real `EV_KEY` events on the virtio-input device, which the guest
+cannot synthesise for itself. It is also not tested by a second device reader —
+the `terminal` program is the system's keyboard consumer (it autostarts from
+`/config/svcmgr/services/terminal.svc`), and the virtio-input driver delivers a
+given event to one reader. So input is tested *through* the terminal.
+
+`cargo xtask test-terminal` boots QEMU with a QMP control socket, waits for the
+terminal's `terminal: READY for injection` marker, injects a known key sequence
+via QMP `input-send-event`, and asserts — host-side — that the terminal's local
+echo and the relayed child output appear on the serial stream. Unlike the other
+harnesses the verdict is computed by the host (the terminal cannot know the
+expected sequence), and the host kills QEMU on success. The driver carries no
+test hooks — injection happens at the hardware boundary, so the whole stack
+(device DMA → decode → IPC → terminal → child → output) is exercised as in
+production. Both arches use `virtio-keyboard-pci`.
+
+The terminal autostarts on a normal boot, so no recipe staging is needed; just
+build, repack, and run the host driver (not `run-parallel`, which cannot
+inject):
+
+```sh
+cargo xtask build
+cargo xtask mkdisk
+cargo xtask test-terminal
+```
+
+This is the reusable foundation for interactive tests of the terminal, the
+shell (#112), and future consumers — they reuse the runner by swapping the
+terminal's child and the expected strings. It subsumes the keysym-decode
+coverage of the former standalone input smoke test: the echoed `a` vs `A`
+proves lowercase/shifted decode, the absence of stray bytes proves
+modifier-event filtering, and Return/Backspace prove the named-key decodes. In
+CI it runs as a second boot inside the `usertest` cell (after usertest's own
+run), rather than as a separate matrix dimension that would multiply with each
+arch.
+
 ### One shutdown-invoking harness per boot
 
-`svctest` and `usertest` both invoke `pwrmgr` shutdown on completion. Two
-such harnesses staged together race on shutdown — the slower one may not
-finish. Per boot, exactly one *shutdown-invoking* harness recipe MUST be
-staged in `/config/svcmgr/services/`.
+`svctest` and `usertest` invoke `pwrmgr` shutdown on completion. Two such
+harnesses staged together race on shutdown — the slower one may not finish.
+Per boot, at most one *shutdown-invoking* harness recipe MUST be staged in
+`/config/svcmgr/services/`.
 
 Non-shutdown fixtures may co-stage alongside one harness. `crasher`
 (`restart = always`, never shuts down) is co-staged with `svctest` in
@@ -170,7 +212,20 @@ the services-surface CI cell so its restart loop is exercised there; its
 bounded faults complete long before `svctest`'s terminal marker, so the
 kernel fault dump never clobbers it.
 
-CI matrix cells follow this rule: one shutdown-invoking harness per cell.
+**Test isolation.** The functional harness boots run a controlled substrate:
+they drop the autostarted `terminal` (a user-facing program, not part of the
+services/programs surface under test). Because `terminal.svc` lives in the
+default service set, the harness staging removes it and repacks with
+`cargo xtask mkdisk --repack-only` (a normal repack re-mirrors `rootfs/`,
+which would restore it). The terminal is exercised in its own boot
+(`test-terminal`) and runs in the real default boot.
+
+CI matrix cells follow these rules per boot. The `usertest` cell runs two
+boots in sequence — `usertest` (via `run-parallel`, terminal dropped), then
+the terminal interactive test (via `test-terminal`) after dropping
+`usertest.svc` and repacking to restore the default boot (terminal present).
+The terminal test boot has *no* shutdown-invoking harness: `test-terminal`
+computes the verdict host-side and kills QEMU itself.
 
 ---
 
@@ -208,4 +263,4 @@ note in full.
 
 ## Summarized By
 
-[Conventions](conventions.md), [Root README](../README.md), [core/ktest/README.md](../core/ktest/README.md), [services/svcmgr/README.md](../services/svcmgr/README.md), [services/usertest/README.md](../services/usertest/README.md)
+[Conventions](conventions.md), [Root README](../README.md), [core/ktest/README.md](../core/ktest/README.md), [services/svcmgr/README.md](../services/svcmgr/README.md), [services/usertest/README.md](../services/usertest/README.md), [programs/terminal/README.md](../programs/terminal/README.md)

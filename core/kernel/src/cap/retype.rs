@@ -891,9 +891,11 @@ pub fn dispatch_for(object_type: ObjectType, size_arg: u64) -> Option<DispatchEn
     match object_type
     {
         // Sub-page wrappers + state. Header (16) + state (variable).
-        // Endpoint: 24 wrapper + 64 EndpointState = 88 → BIN_128.
+        // Endpoint: 24 wrapper + EndpointState → BIN_128. Computed from
+        // size_of so a field addition cannot silently drift the budget (a
+        // bin-overflow is caught by the const-assert in endpoint.rs).
         ObjectType::Endpoint => Some(DispatchEntry {
-            raw_bytes: 88,
+            raw_bytes: 24 + core::mem::size_of::<crate::ipc::endpoint::EndpointState>() as u64,
             split: false,
         }),
         // Notification: 24 wrapper + 96 NotificationState = 120 → BIN_128.

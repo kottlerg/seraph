@@ -172,12 +172,6 @@ fn main() -> !
             &mut recent,
         );
 
-        // Liveness backstop: if init's main thread has exited but init-logd is
-        // still wedged past the grace (a dropped HANDOVER_RELEASE), force-stop
-        // it and reap so init's memory caps cannot be pinned indefinitely. No-op
-        // until the deadline, and once init is reaped.
-        init_reap::check_backstop(ctx.memmgr_ep, ipc_buf);
-
         match badge
         {
             WS_BADGE_SERVICE =>

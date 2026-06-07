@@ -382,6 +382,8 @@ unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadControlBlock)
                 unsafe {
                     let saved = (*ep).lock.lock_raw();
                     unlink_from_wait_queue(tcb, &mut (*ep).send_head, &mut (*ep).send_tail);
+                    // Republish send-queue level after the unlink (#285-adjacent).
+                    (*ep).refresh_send_ready();
                     (*ep).lock.unlock_raw(saved);
                 }
             }

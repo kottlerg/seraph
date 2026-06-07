@@ -251,6 +251,32 @@ discarded.
 
 ---
 
+### `cargo xtask test-terminal`
+
+Boot the terminal interactive test, exercising keyboard input end-to-end
+through the live virtio-input driver and the autostarted `terminal`. Launches
+QEMU headless with a QMP control socket, waits for the guest to print
+`terminal: READY for injection` on the serial log, injects a known key
+sequence (`a`, Shift+`a`, `b`, Backspace, Return) via QMP `input-send-event`,
+and asserts — host-side — that the terminal's local echo and the relayed child
+output (`[echosh] aA`) appear on the serial stream. Exits non-zero on an
+injection error or the 180 s timeout. This subsumes the former standalone
+keyboard smoke test: the echoed `a`/`A` prove keysym/modifier decode, and
+Return/Backspace prove the named-key decodes.
+
+A pure runner — it neither builds nor stages. `terminal.svc` is in the default
+boot set, so the terminal autostarts; just build and repack:
+
+```sh
+cargo xtask build
+cargo xtask mkdisk
+cargo xtask test-terminal [--arch x86_64|riscv64] [--cpus N]
+```
+
+See [docs/testing.md](../docs/testing.md) for the harness model.
+
+---
+
 ## Sub-crates
 
 | Sub-crate | Purpose |

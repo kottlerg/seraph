@@ -1200,7 +1200,8 @@ pub fn phase3_svcmgr_handover(
     // the observer bind ran after that release it would land on an already
     // -exited init-logd and silently lose the death — the kernel bind only
     // appends an observer, it does not fire for a thread that has already
-    // exited — stranding the reap on the liveness backstop. Transferring init's
+    // exited — so the reap's death countdown would wait forever for an exit it
+    // already missed, and init would never be reaped. Transferring init's
     // kernel-object caps here is safe: svcmgr is already created and endowed
     // (the only consumer of init's own CSpace cap), and the cap handles move
     // while the underlying objects keep backing init's still-running threads.

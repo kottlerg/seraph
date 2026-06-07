@@ -73,9 +73,12 @@ init's Phase 3: init's own `AddressSpace` / `CSpace` / `Thread` caps
 plus every reclaimable Memory cap. Procmgr binds a death-EQ observer on
 **both** init threads (main + init-logd) with `INIT_REAP_CORRELATOR` and
 reaps once both have exited — init-logd outlives main until the
-svcmgr-launched real-logd releases it via `HANDOVER_RELEASE`. A liveness
-backstop force-stops a never-released init-logd past a grace, so a
-dropped log handover cannot pin init's memory caps. The reap path tears down
+svcmgr-launched real-logd releases it via `HANDOVER_RELEASE`. The reap is
+purely death-driven: procmgr waits for that natural exit and never force-stops
+init-logd. If a handover never completes (real-logd crashes mid-pull or never
+launches), init-logd serves on and init's memory caps stay held until shutdown
+— a benign hold, not a wedge; the all-RAM-accounted identity correspondingly
+closes only once the handover completes. The reap path tears down
 init's kernel objects in order — Threads → AddressSpace → donate Memory
 caps to memmgr via `DONATE_MEMORY_CAPS` → CSpace cascade — leaving zero init
 residue. Implementation in [`src/init_reap.rs`](src/init_reap.rs).

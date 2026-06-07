@@ -66,14 +66,23 @@ earlier ones, which remain as fallbacks.
 5. **Framebuffer-driver-mediated path** — once devmgr has spawned the
    framebuffer driver (`services/drivers/framebuffer/`), userspace
    framebuffer writers route bytes to it via `fb_labels::FB_WRITE_BYTES`.
-   v1 has one consumer: `programs/fb-charset`, a small demo program
-   (a step above "hello world") launched once per default boot by
-   svcmgr via `/config/svcmgr/services/fb-charset.svc` (`seed =
-   devmgr.registry`). It resolves the framebuffer write cap via
-   `devmgr_labels::QUERY_FRAMEBUFFER_DEVICE` and emits a structured
-   UTF-8 sequence covering every glyph class (ASCII, CP437 high half,
-   box-drawing, font-extension, ASCII fallback, and one ill-formed
-   sequence so the U+FFFD glyph is reachable on screen), then exits.
+   Two consumers:
+   - **real-logd** (`services/logd/src/main.rs`) resolves the framebuffer
+     write cap via `devmgr_labels::QUERY_FRAMEBUFFER_DEVICE` — the same
+     registry cap it already holds for the serial driver — and mirrors
+     every log line it writes to serial onto the framebuffer too, so the
+     steady-state userspace log stream reaches the screen as well as the
+     UART. The mirror soft-degrades to serial-only whenever the driver is
+     unresolvable (headless boot, or before it is spawned), so serial
+     stays the authoritative channel.
+   - **`programs/fb-charset`**, a small demo program (a step above
+     "hello world") launched once per default boot by svcmgr via
+     `/config/svcmgr/services/fb-charset.svc` (`seed = devmgr.registry`).
+     It resolves the same write cap and emits a structured UTF-8 sequence
+     covering every glyph class (ASCII, CP437 high half, box-drawing,
+     font-extension, ASCII fallback, and one ill-formed sequence so the
+     U+FFFD glyph is reachable on screen), then exits.
+
    Production consumers (terminal, shell, compositor) arrive in
    follow-up issues and resolve the cap through the same name. v1
    exposes one verb only — `FB_WRITE_BYTES` — interpreting payloads as
@@ -115,6 +124,33 @@ these can depend on the IPC machinery that the drivers require. They
 share the hardware with the drivers — an accepted physical aliasing,
 since the drivers are the steady-state writers and the direct paths
 fire only in early boot and failure windows.
+
+## Test-harness output
+
+The in-tree harnesses send their markers and diagnostics to the
+framebuffer as well as serial, matching the early-kernel console — by two
+different routes:
+
+- **ktest** (`core/ktest/`) is a monolithic init replacement: its bundle
+  carries no devmgr and no framebuffer driver, so it renders directly,
+  mapping the framebuffer from `InitInfo.framebuffer` and carving the
+  pixel span out of the MMIO aperture it holds (`core/ktest/src/framebuffer.rs`).
+  This is the harness analogue of the kernel's direct renderer — there is
+  no driver in its bundle to route through — so it does not contradict the
+  framebuffer driver's sole ownership in a normally-composed boot.
+- **svctest / usertest** are std-built services whose output flows through
+  the system log stream, so they reach the framebuffer through real-logd's
+  driver-mediated mirror (path 5 above) once logd is up. No
+  harness-specific framebuffer path exists.
+
+Serial remains the authoritative marker channel: CI scrapes serial and
+runs the harnesses headless, where the framebuffer mirrors are no-ops.
+
+Every framebuffer renderer — the bootloader, kernel, and ktest direct
+renderers and the userspace driver — shares one byte→glyph chain
+(`shared/text`): an incremental UTF-8 decoder feeding the CP437-reverse →
+font-extension → ASCII-fallback → `U+FFFD` resolver, so every framebuffer
+surface prints the identical glyph set.
 
 ---
 

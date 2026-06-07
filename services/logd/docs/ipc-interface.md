@@ -24,7 +24,7 @@ The shape mirrors the README's "Bootstrap caps" table:
 | 0 | `RECV` on the master log endpoint |
 | 1 | `SEND` on the master log endpoint (single-use; `HANDOVER_PULL` only). `0` on a restart — no init-logd remains to pull from, so logd skips the history pull |
 | 2 | badged `SEND` on procmgr's service endpoint carrying `DEATH_EQ_AUTHORITY` |
-| 3 | badged `SEND` on devmgr's registry endpoint carrying `REGISTRY_QUERY_AUTHORITY` (resolves the serial driver via `QUERY_SERIAL_DEVICE`) |
+| 3 | badged `SEND` on devmgr's registry endpoint carrying `REGISTRY_QUERY_AUTHORITY` (resolves the serial driver via `QUERY_SERIAL_DEVICE` and the framebuffer driver via `QUERY_FRAMEBUFFER_DEVICE`) |
 
 Every (re)launch mints `cap[0]` fresh from svcmgr's persistent master-log
 source, so a restarted logd re-attaches its RECV to the same endpoint
@@ -49,8 +49,10 @@ label's upper 16 bits (`label | ((len << 16))`). Inline bytes
 arrive in the IPC message's data words, packed at word 0. logd
 appends the bytes to the slot keyed by the kernel-delivered
 `msg.badge`; every `\n` flushes the slot's partial buffer as one
-line (rendered to serial as `[sec.usfrac] [name] <line>\r\n` and
-appended to the slot's history ring).
+line, emitted as `[sec.usfrac] [name] <line>\r\n` to the serial
+driver (`SERIAL_WRITE_BYTES`) and mirrored to the framebuffer driver
+(`FB_WRITE_BYTES`) when one is present, then appended to the slot's
+history ring.
 
 Lines exceeding `LINE_BUF_SIZE` (256 bytes) flush without a
 trailing `\n` to keep the per-line attribution visible. Senders

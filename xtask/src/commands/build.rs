@@ -178,6 +178,13 @@ const SPECS: &[Spec] = &[
         arch_only: None,
     },
     Spec {
+        name: "virtio-input",
+        install_name: None,
+        profile: BuildProfile::StdUser,
+        dest: InstallDest::ServicesDrivers,
+        arch_only: None,
+    },
+    Spec {
         name: "serial",
         install_name: None,
         profile: BuildProfile::StdUser,
@@ -294,6 +301,20 @@ const SPECS: &[Spec] = &[
         arch_only: None,
     },
     Spec {
+        name: "terminal",
+        install_name: None,
+        profile: BuildProfile::StdUser,
+        dest: InstallDest::Programs,
+        arch_only: None,
+    },
+    Spec {
+        name: "echosh",
+        install_name: None,
+        profile: BuildProfile::StdUser,
+        dest: InstallDest::Programs,
+        arch_only: None,
+    },
+    Spec {
         name: "fsbench",
         install_name: None,
         profile: BuildProfile::StdUser,
@@ -392,6 +413,8 @@ fn spec_for(component: BuildComponent) -> Option<&'static Spec>
         BuildComponent::Hello => "hello",
         BuildComponent::HelloTester => "hello-tester",
         BuildComponent::FbCharset => "fb-charset",
+        BuildComponent::Terminal => "terminal",
+        BuildComponent::Echosh => "echosh",
         BuildComponent::Fsbench => "fsbench",
         BuildComponent::Stackoverflow => "stackoverflow",
         BuildComponent::Pipefault => "pipefault",

@@ -199,6 +199,7 @@ pub fn run(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
                     cpus,
                     headless: true,
                     gdb: false,
+                    qmp_socket: None,
                 };
                 let qemu_args = build_qemu_argv(&spec);
 

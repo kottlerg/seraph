@@ -2114,11 +2114,32 @@ pub unsafe fn schedule(requeue_current: bool)
 
     let current = sched.current;
 
-    // Re-enqueue the current thread if the caller requested it (preemption,
-    // yield). Voluntary-block callers pass requeue_current=false because the
-    // thread is already Blocked/Exited and may have been woken and migrated
-    // to another CPU between the IPC lock release and this point.
-    if !current.is_null() && requeue_current
+    // Decide whether `current` must be (re)placed on a run queue before we pick
+    // the next thread.
+    //
+    // `requeue_current` is the caller's intent: preemption/yield pass `true`;
+    // voluntary-block callers pass `false` because the thread committed `Blocked`
+    // and means to park. But the block is not the whole story: between becoming
+    // wakeable and reaching this `schedule()`, a concurrent waker may have moved
+    // `current` to `Ready` (its wake-before-park window) — and a timer tick may
+    // then have redispatched it to `Running`. In either case `current` is now
+    // runnable and MUST NOT be parked, or its delivered wake is lost. So requeue
+    // when the caller asks OR when `current` is already runnable (`Running` /
+    // `Ready`), and only ever park a `current` that is genuinely still `Blocked`.
+    //
+    // Two guards keep this sound:
+    //   * Never requeue a thread a concurrent path has committed to `Exited`
+    //     (dealloc) or `Stopped` under all-CPU locks — re-marking it `Ready` and
+    //     linking it would leave a dangling run-queue entry over a TCB that
+    //     `retype_free` may reclaim (use-after-free). This stays a denylist; a
+    //     `== Running` allowlist perturbs this hot path's instruction timing
+    //     enough to widen the #116 all-CPUs-idle stall race under TCG SMP
+    //     (measured ~0% → ~12%).
+    //   * Never enqueue a thread a waker has *already* linked
+    //     (`queued_on >= 0`): re-enqueuing double-links it (the `queued_on`
+    //     single-link guard's tripwire — #289). Leave it where the waker placed
+    //     it; the next-thread selection below picks it up.
+    if !current.is_null()
     {
         // SAFETY: current is a valid TCB set by enter() or a previous schedule();
         // state, priority, cpu_affinity fields are always valid.
@@ -2127,20 +2148,16 @@ pub unsafe fn schedule(requeue_current: bool)
                 (*current).magic == thread::TCB_MAGIC,
                 "schedule: current TCB magic corrupt on cpu {cpu}"
             );
-            // Do not re-enqueue a thread that a concurrent path has already
-            // committed to Exited (dealloc) or Stopped under all-CPU scheduler
-            // locks: re-enqueuing would overwrite that state to Ready and leave
-            // a dangling run-queue entry over a TCB that retype_free may reclaim
-            // — a use-after-free. Every other state at a `requeue_current` call
-            // (Running in the common preemption/yield case) is requeue-legitimate.
-            //
-            // This MUST stay a denylist (`!= Exited && != Stopped`). A tighter
-            // `== Running` allowlist is logically equivalent on the audited
-            // callers but perturbs this hot path's instruction timing enough to
-            // widen the #116 all-CPUs-idle stall race dramatically under TCG SMP
-            // (measured ~0% → ~12% across run-parallel sweeps).
             let cur_state = (*current).state;
-            if cur_state != ThreadState::Exited && cur_state != ThreadState::Stopped
+            let runnable = matches!(cur_state, ThreadState::Running | ThreadState::Ready);
+            let already_queued = (*current)
+                .queued_on
+                .load(core::sync::atomic::Ordering::Relaxed)
+                >= 0;
+            if (requeue_current || runnable)
+                && cur_state != ThreadState::Exited
+                && cur_state != ThreadState::Stopped
+                && !already_queued
             {
                 let prio = (*current).priority;
                 debug_assert!(

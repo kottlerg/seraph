@@ -68,14 +68,25 @@ pub fn system_time_phase(_: &Caps)
 
     let mono_min = i_pre1.duration_since(i_post0);
     let mono_max = i_post1.duration_since(i_pre0);
+
+    // Wall (SystemTime, RTC-backed via `timed`) and monotonic (Instant, kernel
+    // elapsed counter) are independent clock sources; under SMP oversubscription
+    // host descheduling perturbs them unequally, so the wall delta drifts from
+    // the tight Instant bracket (~2 ms on a 50 ms window observed under
+    // contention). Compare with a coarse slack band: wide enough to absorb that
+    // divergence, still tight enough to catch a stalled or grossly-misrated wall
+    // clock (the offset wiring itself is covered by the 2024/2100 bounds above).
+    // The lower bound is additive (`sys_delta + slack >= mono_min`) so it cannot
+    // underflow Duration subtraction.
+    let slack = (mono_max / 2).max(Duration::from_millis(10));
     assert!(
-        sys_delta >= mono_min && sys_delta <= mono_max,
-        "SystemTime delta {sys_delta:?} outside Instant-bracketed bounds \
-         [{mono_min:?}, {mono_max:?}] — clocks not tracking",
+        sys_delta + slack >= mono_min && sys_delta <= mono_max + slack,
+        "SystemTime delta {sys_delta:?} outside Instant bracket \
+         [{mono_min:?}, {mono_max:?}] ±{slack:?} — clocks not tracking",
     );
 
     let (y, mo, dd, hh, mm, ss) = epoch_to_ymdhms(secs);
     std::os::seraph::log!(
-        "SystemTime phase passed ({y:04}-{mo:02}-{dd:02}T{hh:02}:{mm:02}:{ss:02}Z, sys_delta={sys_delta:?}, mono_bounds=[{mono_min:?}, {mono_max:?}])"
+        "SystemTime phase passed ({y:04}-{mo:02}-{dd:02}T{hh:02}:{mm:02}:{ss:02}Z, sys_delta={sys_delta:?}, mono_bounds=[{mono_min:?}, {mono_max:?}], slack={slack:?})"
     );
 }

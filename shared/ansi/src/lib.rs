@@ -17,10 +17,11 @@
 //! `90..=97`, background `40..=47` / `100..=107`, `0` reset, `1` bold
 //! (promotes a base colour to its bright variant), `22` normal intensity,
 //! `39` / `49` default fg / bg. Every other SGR code (italic, underline,
-//! blink, reverse, and the `38` / `48` 256-colour / truecolour escapes)
-//! is silently ignored. Non-`m` CSI sequences (cursor movement, erase)
-//! and non-CSI escapes are swallowed rather than rendered as literal
-//! glyphs.
+//! blink, reverse) is silently ignored. The `38` / `48` 256-colour /
+//! truecolour introducers are also ignored, along with their operands
+//! (`5;<n>` or `2;<r>;<g>;<b>`), so the operands are not misread as further
+//! SGR codes. Non-`m` CSI sequences (cursor movement, erase) and non-CSI
+//! escapes are swallowed rather than rendered as literal glyphs.
 //!
 //! The 16 → RGB mapping lives here, not in the driver: the driver renders
 //! whatever 24-bit colour it is handed and holds no palette, so a future
@@ -105,9 +106,15 @@ pub struct AnsiParser
     bg_idx: u8,
     /// Bold/bright: promotes a base foreground in `0..=7` to `+8`.
     bold: bool,
-    /// Last `(fg, bg)` RGB pair emitted, used to suppress redundant
-    /// `Attrs`. Seeded to the driver's default so an opening reset to
-    /// default emits nothing.
+    /// Operands still to swallow for a `38`/`48` extended-colour introducer
+    /// (`ESC[38;2;r;g;bm` / `ESC[38;5;nm`); the v1 palette does not use them.
+    sgr_skip: u8,
+    /// Saw a `38`/`48`; the next parameter is its `2`/`5` selector.
+    sgr_await_sel: bool,
+    /// Last `(fg, bg)` RGB pair confirmed delivered, used to suppress
+    /// redundant `Attrs`. Seeded to the driver's default so an opening reset
+    /// to default emits nothing; only updated when the sink reports success,
+    /// so a failed `FB_SET_ATTRS` is retried rather than masked.
     last_sent: Option<([u8; 3], [u8; 3])>,
 }
 
@@ -133,6 +140,8 @@ impl AnsiParser
             fg_base: DEFAULT_FG,
             bg_idx: DEFAULT_BG,
             bold: false,
+            sgr_skip: 0,
+            sgr_await_sel: false,
             last_sent: Some((
                 ANSI_RGB[usize::from(DEFAULT_FG)],
                 ANSI_RGB[usize::from(DEFAULT_BG)],
@@ -160,6 +169,31 @@ impl AnsiParser
     fn apply_param(&mut self, value: u16, seen: bool)
     {
         let code = if seen { value } else { 0 };
+        // `38`/`48` (256-colour / truecolour) introduce operands the v1
+        // palette cannot represent; swallow the introducer and its operands so
+        // they are not misread as independent SGR codes — a colour component of
+        // `0`, `1`, `30..=47`, … would otherwise change or reset the attrs.
+        if self.sgr_await_sel
+        {
+            self.sgr_await_sel = false;
+            self.sgr_skip = match code
+            {
+                5 => 1, // 256-colour: one index operand
+                2 => 3, // truecolour: r, g, b operands
+                _ => 0, // malformed selector: swallow nothing further
+            };
+            return;
+        }
+        if self.sgr_skip > 0
+        {
+            self.sgr_skip -= 1;
+            return;
+        }
+        if code == 38 || code == 48
+        {
+            self.sgr_await_sel = true;
+            return;
+        }
         match code
         {
             0 =>
@@ -177,29 +211,34 @@ impl AnsiParser
             100..=107 => self.bg_idx = (code - 100) as u8 + 8,
             49 => self.bg_idx = DEFAULT_BG,
             _ =>
-            {} // italic/underline/blink/reverse/38/48/…: out of scope, ignored
+            {} // italic/underline/blink/reverse/…: out of scope, ignored
         }
     }
 
     /// Resolve the current colours and emit an [`Event::Attrs`] through
-    /// `sink` if they differ from the last pair emitted.
-    fn emit_attrs<'a>(&mut self, sink: &mut impl FnMut(Event<'a>))
+    /// `sink` if they differ from the last pair confirmed delivered. The sink
+    /// returns whether delivery succeeded; `last_sent` advances only on
+    /// success, so a failed `FB_SET_ATTRS` is retried on the next change.
+    fn emit_attrs<'a>(&mut self, sink: &mut impl FnMut(Event<'a>) -> bool)
     {
         let attrs = (
             ANSI_RGB[usize::from(self.eff_fg())],
             ANSI_RGB[usize::from(self.bg_idx)],
         );
-        if self.last_sent != Some(attrs)
+        if self.last_sent != Some(attrs) && sink(Event::Attrs(attrs.0, attrs.1))
         {
             self.last_sent = Some(attrs);
-            sink(Event::Attrs(attrs.0, attrs.1));
         }
     }
 
     /// Feed a run of bytes, emitting [`Event`]s through `sink` in stream
     /// order. Literal-text events borrow `bytes`; colour events carry owned
-    /// RGB. A sequence split across calls resumes from the carried state.
-    pub fn feed<'a>(&mut self, bytes: &'a [u8], mut sink: impl FnMut(Event<'a>))
+    /// RGB. A sequence split across calls resumes from the carried state. The
+    /// sink returns whether the event was delivered; the return is used only
+    /// for [`Event::Attrs`] dedup (see [`emit_attrs`]), and ignored for text.
+    ///
+    /// [`emit_attrs`]: AnsiParser::emit_attrs
+    pub fn feed<'a>(&mut self, bytes: &'a [u8], mut sink: impl FnMut(Event<'a>) -> bool)
     {
         // Start of the current contiguous Ground text run within `bytes`.
         let mut run_start = 0usize;
@@ -229,6 +268,8 @@ impl AnsiParser
                             self.phase = Phase::Csi;
                             self.acc = 0;
                             self.acc_seen = false;
+                            self.sgr_skip = 0;
+                            self.sgr_await_sel = false;
                         }
                         0x1B =>
                         {} // consecutive ESC supersedes; stay in Esc
@@ -336,6 +377,7 @@ mod tests
                 assert!(n < 16, "too many events");
                 evs[n] = Some(e);
                 n += 1;
+                true // tests model a sink that always delivers
             });
         }
         (evs, n)
@@ -464,5 +506,32 @@ mod tests
     fn lone_escape_drops_esc_keeps_text()
     {
         assert_evs(&[b"\x1bX"], &[text(b"X")]);
+    }
+
+    #[test]
+    fn truecolour_fg_swallowed_keeps_prior_colour()
+    {
+        // `ESC[38;2;r;g;bm` is out of scope; its operands must not be read as
+        // SGR codes (the `0`/`30`-range values would otherwise change attrs).
+        // Foreground stays the red set just before.
+        assert_evs(
+            &[b"\x1b[31m\x1b[38;2;10;20;30mX"],
+            &[attrs(1, 0), text(b"X")],
+        );
+    }
+
+    #[test]
+    fn colour_256_fg_swallowed_keeps_prior_colour()
+    {
+        // `ESC[38;5;nm` — the `5` selector consumes one index operand (`1`,
+        // which would otherwise set bold and brighten the green).
+        assert_evs(&[b"\x1b[32m\x1b[38;5;1mY"], &[attrs(2, 0), text(b"Y")]);
+    }
+
+    #[test]
+    fn truecolour_bg_swallowed_keeps_prior_colour()
+    {
+        // `ESC[48;2;0;0;0m` — the three `0` operands must not reset the bg.
+        assert_evs(&[b"\x1b[44m\x1b[48;2;0;0;0mZ"], &[attrs(15, 4), text(b"Z")]);
     }
 }

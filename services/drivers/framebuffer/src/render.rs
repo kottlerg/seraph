@@ -193,6 +193,8 @@ impl FramebufferWriter
     unsafe fn clear(&mut self)
     {
         let [b0, b1, b2, b3] = self.pixel_bytes(self.bg);
+        // RGBX/BGRX is 4 bytes per pixel, so `stride * height` is a multiple of
+        // 4; the `/ 4` therefore drops no visible pixels.
         let pixels = (self.stride * self.height) as usize / 4;
         let mut p = self.base;
         for _ in 0..pixels
@@ -252,6 +254,7 @@ impl FramebufferWriter
             let [b0, b1, b2, b3] = self.pixel_bytes(self.bg);
             // SAFETY: the last row starts at last_row_start within the framebuffer.
             let mut p = unsafe { self.base.add(last_row_start) };
+            // `row_bytes = GLYPH_HEIGHT * stride` is a multiple of 4 (4 bytes/pixel).
             for _ in 0..(row_bytes / 4)
             {
                 // SAFETY: p stays within the last row (row_bytes wide).

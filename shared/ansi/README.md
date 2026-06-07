@@ -32,8 +32,9 @@ ansi/
 Recognised SGR codes: foreground `30..=37` / `90..=97`, background
 `40..=47` / `100..=107`, `0` reset, `1` bold (promotes a base colour to its
 bright variant), `22` normal intensity, `39` / `49` default fg / bg. Every
-other SGR code — italic, underline, blink, reverse, and the `38` / `48`
-256-colour / truecolour escapes — is silently ignored. Non-`m` CSI
+other SGR code — italic, underline, blink, reverse — is silently ignored,
+as are the `38` / `48` 256-colour / truecolour introducers together with
+their `5;<n>` / `2;<r>;<g>;<b>` operands. Non-`m` CSI
 sequences (cursor movement, erase) and non-CSI escapes are swallowed, not
 rendered as literal glyphs.
 

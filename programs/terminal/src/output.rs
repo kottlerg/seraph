@@ -58,14 +58,18 @@ impl Sink
             self.parser.feed(bytes, |ev| match ev
             {
                 Event::Attrs(fg, bg) => fb_set_attrs(fb, fg, bg, ipc_buf),
-                Event::Text(text) => write_chunked(
-                    fb,
-                    fb_labels::FB_WRITE_BYTES,
-                    fb_errors::SUCCESS,
-                    text,
-                    ipc_buf,
-                    "framebuffer",
-                ),
+                Event::Text(text) =>
+                {
+                    write_chunked(
+                        fb,
+                        fb_labels::FB_WRITE_BYTES,
+                        fb_errors::SUCCESS,
+                        text,
+                        ipc_buf,
+                        "framebuffer",
+                    );
+                    true // text is not deduped; the sink result is for attrs
+                }
             });
         }
         // Serial mirror (debug): raw bytes, ESC sequences intact so
@@ -82,9 +86,10 @@ impl Sink
 }
 
 /// Send an `FB_SET_ATTRS` colour change (six-byte RGB payload) to the
-/// framebuffer driver. Errors are logged and abandon the attribute for this
-/// call; subsequent writes proceed.
-fn fb_set_attrs(cap: u32, fg: [u8; 3], bg: [u8; 3], ipc_buf: *mut u64)
+/// framebuffer driver. Returns whether the driver acknowledged with `SUCCESS`;
+/// the parser advances its dedup only on success, so a failed set is retried on
+/// the next change rather than masked.
+fn fb_set_attrs(cap: u32, fg: [u8; 3], bg: [u8; 3], ipc_buf: *mut u64) -> bool
 {
     let payload = [fg[0], fg[1], fg[2], bg[0], bg[1], bg[2]];
     let msg = IpcMessage::builder(fb_labels::FB_SET_ATTRS | (6u64 << 16))
@@ -93,18 +98,19 @@ fn fb_set_attrs(cap: u32, fg: [u8; 3], bg: [u8; 3], ipc_buf: *mut u64)
     // SAFETY: ipc_buf is this thread's kernel-registered IPC buffer.
     match unsafe { ipc::ipc_call(cap, &msg, ipc_buf) }
     {
-        Ok(reply) if reply.label == fb_errors::SUCCESS =>
-        {}
+        Ok(reply) if reply.label == fb_errors::SUCCESS => true,
         Ok(reply) =>
         {
             std::os::seraph::log!(
                 "terminal: framebuffer FB_SET_ATTRS returned label={:#x}",
                 reply.label
             );
+            false
         }
         Err(_) =>
         {
             std::os::seraph::log!("terminal: framebuffer FB_SET_ATTRS ipc_call failed");
+            false
         }
     }
 }

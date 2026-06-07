@@ -109,6 +109,12 @@ fn run(child_path: &str, rx: &Receiver<Msg>, tx: &Sender<Msg>, sink: &mut Sink) 
 {
     loop
     {
+        // Start each child with default colours: a previous child that exited
+        // mid-colour (e.g. crashed before its trailing `ESC[0m`) must not tint
+        // the next child or the shell prompt. Dedups to a no-op when already
+        // default (the common first-spawn case).
+        sink.write(b"\x1b[0m");
+
         let mut child = match Command::new(child_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

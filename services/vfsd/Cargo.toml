@@ -13,6 +13,8 @@ test = false
 # Seraph-minted GPT partition type GUIDs (per-arch root and EFI ESP);
 # vfsd compares GPT entries against these to identify the rootfs.
 boot-protocol = { path = "../../abi/boot-protocol" }
+# Pure GPT-format parser; vfsd wraps it with block-device I/O in partition.rs.
+gpt = { path = "gpt" }
 ipc = { path = "../../shared/ipc" }
 namespace-protocol = { path = "../../shared/namespace-protocol" }
 syscall = { path = "../../shared/syscall" }

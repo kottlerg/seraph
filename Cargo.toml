@@ -16,6 +16,7 @@ members = [
     "services/pwrmgr",
     "services/timed",
     "services/vfsd",
+    "services/vfsd/gpt",
     "services/drivers/cmos",
     "services/drivers/framebuffer",
     "services/drivers/goldfish-rtc",

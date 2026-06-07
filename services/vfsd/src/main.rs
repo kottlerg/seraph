@@ -23,7 +23,7 @@
 #![allow(clippy::cast_possible_truncation)]
 
 mod driver;
-mod gpt;
+mod partition;
 mod role_guids;
 mod root_backend;
 mod worker;
@@ -181,7 +181,7 @@ fn main() -> !
     // target memory cap; vfsd reuses one scratch page across all GPT reads.
     // The memory cap and its VA reservation are process-lifetime-leaked.
     let Some((mut scratch_cap, scratch_va)) =
-        gpt::alloc_scratch(caps.memmgr_ep, caps.self_aspace, ipc_buf)
+        partition::alloc_scratch(caps.memmgr_ep, caps.self_aspace, ipc_buf)
     else
     {
         std::os::seraph::log!("FATAL: GPT scratch allocation failed");
@@ -190,7 +190,7 @@ fn main() -> !
 
     // Parse GPT partition table — stored for UUID lookups on MOUNT requests.
     let mut gpt_parts = gpt::new_gpt_table();
-    match gpt::parse_gpt(
+    match partition::parse_gpt(
         blk_ep,
         ipc_buf,
         &mut gpt_parts,

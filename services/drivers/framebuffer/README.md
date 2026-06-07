@@ -69,7 +69,10 @@ the bytes are packed into the data words.
 The driver feeds each byte to its `text::Utf8Decoder`:
 
 * `\n` advances to the start of the next line (scrolling if at the
-  bottom); `\r` returns the cursor to column 0. Both bypass the decoder.
+  bottom); `\r` returns the cursor to column 0; `\x08` (backspace) moves
+  the cursor back one column (clamped at column 0). All three bypass the
+  decoder. The terminal pairs `\x08` with an overwriting space for a
+  destructive backspace.
 * Other bytes drive the decoder; on a completed codepoint the driver
   calls `text::render_codepoint`, which dispatches in order:
   CP437 reverse (`font::FONT_9X20`) → font-extension table

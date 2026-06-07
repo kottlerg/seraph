@@ -26,7 +26,8 @@
 //! calls. Each assembled codepoint is resolved via the CP437 reverse →
 //! font-extension → ASCII-fallback → `U+FFFD` chain in
 //! `text::render_codepoint`, which feeds one or more 9×20 bitmaps to
-//! the `FramebufferWriter`. `\n` and `\r` short-circuit the decoder.
+//! the `FramebufferWriter`. `\n`, `\r`, and `\x08` (backspace) short-circuit
+//! the decoder.
 //!
 //! Like the serial driver, this driver MUST NOT call
 //! `std::os::seraph::log!`: a future logd fanout that routes its own
@@ -173,6 +174,13 @@ fn handle_request(
                     {
                         decoder.reset();
                         writer.carriage_return();
+                    }
+                    // Backspace moves the cursor back one column; the terminal
+                    // pairs it with an overwriting space for a destructive erase.
+                    b'\x08' =>
+                    {
+                        decoder.reset();
+                        writer.backspace();
                     }
                     _ => match decoder.push(b)
                     {

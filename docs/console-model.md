@@ -88,7 +88,7 @@ earlier ones, which remain as fallbacks.
 
    A compositor / display broker arrives in a follow-up issue and resolves
    the cap through the same name. v1 exposes two verbs — `FB_WRITE_BYTES`
-   (UTF-8 payloads, `\n`/`\r` short-circuited) and `FB_SET_ATTRS` (sticky
+   (UTF-8 payloads, `\n`/`\r`/`\x08` short-circuited) and `FB_SET_ATTRS` (sticky
    24-bit foreground/background colour). The terminal owns ANSI SGR parsing
    (`ESC[…m` → `FB_SET_ATTRS`); the driver never interprets control sequences,
    so replacing the terminal does not touch the driver. The colour state is a

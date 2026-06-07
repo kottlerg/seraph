@@ -101,6 +101,15 @@ impl FramebufferWriter
         self.col = 0;
     }
 
+    /// Move the cursor back one column, clamping at column 0 (no wrap to the
+    /// previous row). The terminal's single-line backspace echoes `\x08 \x08`
+    /// (back, space, back), so the intervening space overwrites the cell and
+    /// this re-parks the cursor on it — a destructive backspace.
+    pub fn backspace(&mut self)
+    {
+        self.col = self.col.saturating_sub(1);
+    }
+
     /// Set the foreground/background colour for subsequent glyph blits and
     /// background fills. Both are 24-bit RGB; the driver holds no palette
     /// (the terminal maps ANSI SGR colours to RGB before sending).

@@ -496,6 +496,22 @@ mod tests
         assert_eq!(size_of::<Option<SlotId>>(), size_of::<SlotId>());
     }
 
+    // Cross-boundary ABI contract: userspace receives capabilities tagged by
+    // `init_protocol::CapType`, whose discriminants MUST equal the kernel's `CapTag`.
+    // Anchored to the authoritative ABI enum (not a re-stated literal), so drift on
+    // either side trips here instead of mis-typing a cap in userspace.
+    #[test]
+    fn cap_tag_discriminants_match_userspace_captype()
+    {
+        use init_protocol::CapType;
+        assert_eq!(CapTag::Memory as u8, CapType::Memory as u8);
+        assert_eq!(CapTag::Interrupt as u8, CapType::Interrupt as u8);
+        assert_eq!(CapTag::Mmio as u8, CapType::Mmio as u8);
+        assert_eq!(CapTag::IoPort as u8, CapType::IoPort as u8);
+        assert_eq!(CapTag::SchedControl as u8, CapType::SchedControl as u8);
+        assert_eq!(CapTag::SbiControl as u8, CapType::SbiControl as u8);
+    }
+
     #[test]
     fn rights_contains()
     {
@@ -504,6 +520,21 @@ mod tests
         assert!(r.contains(Rights::WRITE));
         assert!(!r.contains(Rights::EXECUTE));
         assert!(r.contains(Rights::MAP | Rights::WRITE));
+    }
+
+    // Rights' bitwise operators are hand-written (impl BitOr/BitAnd/BitOrAssign); a
+    // transposed `&`/`|` would silently widen or drop capability authority. One
+    // behaviour: the operators compose and mask rights bits as expected.
+    #[test]
+    fn rights_operators_compose_bits()
+    {
+        let rw = Rights::MAP | Rights::WRITE;
+        assert!(rw.contains(Rights::MAP));
+        assert!(rw.contains(Rights::WRITE));
+        assert_eq!(rw & Rights::WRITE, Rights::WRITE);
+        let mut acc = Rights::MAP;
+        acc |= Rights::WRITE;
+        assert_eq!(acc, rw);
     }
 
     // W^X predicate: true only when WRITE and EXECUTE are both present.

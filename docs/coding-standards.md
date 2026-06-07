@@ -393,6 +393,14 @@ fn boot_protocol_struct_sizes_are_stable()
 }
 ```
 
+The same rule extends to **enum-discriminant values that form a cross-boundary contract** — a
+kernel enum whose discriminants are mirrored by a userspace or ABI enum or constant. Such an
+assertion is legitimate, but it MUST be anchored to the authoritative ABI definition (assert the
+two sides agree), never a re-stated literal, so that drift on either side trips the test. A bare
+`assert_eq!(MyEnum::Variant as u8, 3)` that mirrors the enum's own definition is a constant
+mirror and is forbidden; `assert_eq!(KernelTag::X as u8, abi::Tag::X as u8)` is the legitimate
+form.
+
 ---
 
 ## E. Exception Policy

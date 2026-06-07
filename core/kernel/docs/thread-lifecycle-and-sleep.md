@@ -285,4 +285,4 @@ This section lists ordering invariants specific to the sleep-list + lifecycle su
 
 ## Summarized By
 
-None
+[kernel/README.md](../README.md)

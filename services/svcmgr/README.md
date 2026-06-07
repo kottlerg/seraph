@@ -150,7 +150,9 @@ no init-side `PUBLISH_ENDPOINT` traffic. The first three are published in
 endows svcmgr with at handover; the provider names are published on each
 provider's launch path. Names are FS-driver- and platform-agnostic by
 design; consumers resolve them through their `.svc` `seed = ...` lines or
-via direct `QUERY_ENDPOINT` calls.
+via direct `QUERY_ENDPOINT` calls. The handover endowment and
+`PUBLISH_ENDPOINT` / `QUERY_ENDPOINT` wire format are specified in
+[docs/ipc-interface.md](docs/ipc-interface.md).
 
 | Name | Source | Cap shape |
 |---|---|---|

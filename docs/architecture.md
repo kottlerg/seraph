@@ -162,7 +162,7 @@ live in the component scope:
 Boot modules (procmgr, memmgr, devmgr, vfsd, virtio-blk, fatfs) are packed into
 `\EFI\seraph\bootstrap.bundle` by `cargo xtask build` (see
 [`xtask/README.md`](../xtask/README.md) for the producer side and
-[`abi/boot-protocol/src/bundle.rs`](../abi/boot-protocol/src/bundle.rs) for the
+[`abi/boot-protocol`](../abi/boot-protocol/README.md)'s [`bundle.rs`](../abi/boot-protocol/src/bundle.rs) for the
 wire format); the bootloader exposes each entry as a named `BootModule` and
 init looks them up by `BootModule.name`.
 

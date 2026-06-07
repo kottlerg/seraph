@@ -146,4 +146,4 @@ require a POSIX layer; it maps directly onto Seraph primitives.
 
 ## Summarized By
 
-[Userspace Memory Model](../../docs/userspace-memory-model.md)
+None

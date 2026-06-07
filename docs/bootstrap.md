@@ -82,7 +82,7 @@ handover endowment, and exits.
 
 Init runs a second thread, init-logd, that drains the master log endpoint and
 writes lines to serial directly from early boot onward. svcmgr launches and
-supervises the real `logd` post-handover, minting its bootstrap caps from the
+supervises the real [`logd`](../services/logd/README.md) post-handover, minting its bootstrap caps from the
 reserved log-sink sources init endows; the real `logd` then takes the receive
 side of the master log endpoint and pulls init-logd's captured history. The
 kernel endpoint object is unchanged across the transition, so existing badged
@@ -116,7 +116,5 @@ Once init exits, svcmgr is the resident supervisor. See
 ## Summarized By
 
 [README.md](../README.md),
-[abi/boot-protocol/README.md](../abi/boot-protocol/README.md),
 [init/README.md](../services/init/README.md),
-[logd/README.md](../services/logd/README.md),
-[svcmgr/README.md](../services/svcmgr/README.md)
+[logd/README.md](../services/logd/README.md)

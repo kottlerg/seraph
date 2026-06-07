@@ -1,7 +1,8 @@
 # Storage
 
-System-scope composition of the Seraph storage stack: how `vfsd`,
-filesystem drivers, and block drivers are linked by capability
+System-scope composition of the Seraph storage stack: how
+[`vfsd`](../services/vfsd/README.md),
+[filesystem drivers](../services/fs/README.md), and block drivers are linked by capability
 delegation and how mounts are established at boot.
 
 ---

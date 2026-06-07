@@ -132,3 +132,9 @@ Wire-format constants are defined in
 [`services/init/src/logging.rs`](../../init/src/logging.rs) (sender
 side) and [`services/logd/src/handover.rs`](../src/handover.rs)
 (receiver side). Both files cross-reference each other.
+
+---
+
+## Summarized By
+
+[logd/README.md](../README.md)

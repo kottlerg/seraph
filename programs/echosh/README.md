@@ -14,3 +14,9 @@ This is a stand-in for the real interactive shell, which lands as
 editing the `argv` line of `terminal.svc`, and `echosh` can be removed.
 
 No capabilities, no IPC — `std::io` over the stdio pipes the terminal provides.
+
+---
+
+## Summarized By
+
+None

@@ -33,4 +33,4 @@ runtime.
 
 ## Summarized By
 
-[Root README](../../README.md), [docs/testing.md](../../docs/testing.md)
+[docs/testing.md](../../docs/testing.md)

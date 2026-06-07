@@ -76,3 +76,9 @@ exceeds `kernel_us`. `wrapping_add(wrapping_sub(x, y), y) == x`
 holds for unsigned, so the reply value equals `rtc_us` at the
 instant of the original RTC read, plus exactly the elapsed
 monotonic time since.
+
+---
+
+## Summarized By
+
+None

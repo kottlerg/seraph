@@ -110,4 +110,4 @@ transfer table.
 
 ## Summarized By
 
-[Architecture Overview](../../docs/architecture.md), [System Bootstrap](../../docs/bootstrap.md), [Process Lifecycle](../../docs/process-lifecycle.md), [logd](../logd/README.md), [memmgr](../memmgr/README.md), [pwrmgr](../pwrmgr/README.md)
+[Architecture Overview](../../docs/architecture.md), [System Bootstrap](../../docs/bootstrap.md), [Process Lifecycle](../../docs/process-lifecycle.md), [logd](../logd/README.md), [memmgr](../memmgr/README.md)

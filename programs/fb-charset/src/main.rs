@@ -59,7 +59,7 @@ fn emit(out: &mut std::io::Stdout) -> std::io::Result<()>
 
     // Box drawing — joined grids so single-↔-double junctions read. Grid rows
     // are indented to the 10-column content margin to align under the titles.
-    out.write_all("box     : single        double        mixed (d-h)   mixed (d-v)\n".as_bytes())?;
+    out.write_all("box     : single       double       mixed (d-h)  mixed (d-v)\n".as_bytes())?;
     out.write_all("          ┌──┬──┐      ╔══╦══╗      ╒══╤══╕      ╓──╥──╖\n".as_bytes())?;
     out.write_all("          │  │  │      ║  ║  ║      │  │  │      ║  ║  ║\n".as_bytes())?;
     out.write_all("          ├──┼──┤      ╠══╬══╣      ╞══╪══╡      ╟──╫──╢\n".as_bytes())?;

@@ -281,6 +281,14 @@ booted runtime is exercised by the harnesses in [testing.md](testing.md), not by
 tests. Mocking the kernel ABI to manufacture a host test is forbidden — such a test exercises
 the mock, not the system.
 
+Where a component's pure logic is non-trivial — a parser of external input, a codec, an
+allocator, a state machine — it SHOULD be factored so that logic is host-reachable: a
+`no_std` library crate, or a trait boundary that injects the platform, rather than logic
+entangled with IPC, syscall, or `std::os::seraph` calls. The goal is keeping the algorithmic
+core separable from mechanism, as the kernel already does for its allocators and capability
+tree; host-testability is the symptom of that separation, not the goal. This is a SHOULD that
+applies to non-trivial logic — it is not a mandate to extract trivial glue into crates.
+
 ### Tests assert behaviour, not surface area
 
 Coverage is the set of behaviours and failure modes that can no longer regress silently. It

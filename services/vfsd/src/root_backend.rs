@@ -24,7 +24,11 @@
 //! child, vfsd's namespace dispatcher forwards the request verbatim
 //! to that fall-through cap, preserving the namespace-model
 //! invariant that root-fs entries remain reachable unless explicitly
-//! shadowed by a registered mount.
+//! shadowed by a registered mount. `NS_READDIR` is consistent with
+//! this: the dispatcher enumerates the node's synthetic children
+//! first, then the fall-through directory's entries (skipping any
+//! shadowed by a local child), so a listing of a synthetic node shows
+//! both its mounts and the underlying root-fs contents.
 //!
 //! The synthetic root (`NodeId::ROOT`) is itself a tree node whose
 //! `fallthrough_cap` is the root mount cap captured when
@@ -378,6 +382,31 @@ impl VfsdRootBackend
             return 0;
         }
         self.nodes[idx as usize].fallthrough_cap
+    }
+
+    /// Number of active children of the directory at pool index `idx`.
+    /// `NS_READDIR` enumerates these synthetic children first; the
+    /// dispatcher's fall-through readdir serves higher indices from the
+    /// node's `fallthrough_cap`.
+    #[must_use]
+    pub fn local_child_count(&self, idx: u32) -> u32
+    {
+        if (idx as usize) >= MAX_TREE_NODES
+        {
+            return 0;
+        }
+        let mut count = 0u32;
+        let mut cur = self.nodes[idx as usize].first_child;
+        while cur != NONE
+        {
+            let n = &self.nodes[cur as usize];
+            if n.active
+            {
+                count += 1;
+            }
+            cur = n.next_sibling;
+        }
+        count
     }
 
     fn alloc_slot(&self) -> Option<u32>

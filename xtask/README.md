@@ -88,12 +88,20 @@ Default firmware search paths per host:
 
 Re-mirror `rootfs/` into `sysroot/`, re-synthesise test fixtures, and
 regenerate `disk.img` without invoking cargo. Use after editing
-`rootfs/` or the sysroot directly (e.g. staging a test recipe by
-copying it from `sysroot/config/svcmgr/tests/` into
-`sysroot/config/svcmgr/services/`) to refresh the boot image without
-paying for a full `cargo xtask build` (which would also run cargo
-fmt + clippy + check + binary install). Requires a populated,
-arch-tagged sysroot from a prior `cargo xtask build`.
+`rootfs/` to refresh the boot image without paying for a full
+`cargo xtask build` (which would also run cargo fmt + clippy + check +
+binary install). Requires a populated, arch-tagged sysroot from a prior
+`cargo xtask build`.
+
+The mirror is authoritative over the rootfs-managed subtrees (`config/`,
+`data/`): files deleted from `rootfs/` are pruned from the sysroot, while
+build-owned trees (`esp/`, `services/`, `programs/`, `tests/`) and the
+synthesised `data/svctest/` fixtures are left untouched. To pack a
+hand-staged sysroot that diverges from `rootfs/` — e.g. a test recipe
+copied from `sysroot/config/svcmgr/tests/` into
+`sysroot/config/svcmgr/services/` — use `--repack-only`, which skips the
+re-mirror and packs the sysroot exactly as it stands (a plain repack would
+prune the hand-added recipe).
 
 `mkdisk` does **not** author `sysroot/EFI/seraph/bootstrap.bundle` — it
 fails if the bundle is missing. The bundle is composed by
@@ -113,18 +121,20 @@ uses the partition.) This applies to `build`, `mkdisk`, and
 `compose-bundle` alike.
 
 ```
-cargo xtask mkdisk [--arch x86_64|riscv64]
+cargo xtask mkdisk [--arch x86_64|riscv64] [--repack-only]
 ```
 
 | Option | Default | Description |
 |---|---|---|
 | `--arch` | `x86_64` | Target architecture — must match the existing sysroot's arch tag |
+| `--repack-only` | `false` | Skip the `rootfs/` re-mirror and pack the sysroot as it stands — preserves a hand-staged service set the authoritative mirror would otherwise reconcile |
 
-Example — stage `svctest` and run it:
+Example — stage `svctest` and run it (`--repack-only` keeps the hand-added
+recipe; a plain repack would prune it):
 
 ```sh
 cp sysroot/config/svcmgr/tests/svctest.svc sysroot/config/svcmgr/services/
-cargo xtask mkdisk --arch x86_64
+cargo xtask mkdisk --repack-only --arch x86_64
 cargo xtask run --arch x86_64
 ```
 

@@ -280,9 +280,10 @@ fn assemble_provided_boot_caps(
 ///
 /// `bind_target` carries the `(deaths_eq, correlator)` for supervised
 /// launches: when present, death-notification is bound BEFORE
-/// `START_PROCESS` so an immediate post-start death cannot be lost
-/// (the kernel walks the observer set at the moment of death; an
-/// empty observer set silently drops the event). For one-shot
+/// `START_PROCESS` so the observer is in place the instant the thread
+/// runs. (A death before the bind is delivered regardless — the kernel
+/// retains the exit reason and replays it to a later bind — but binding
+/// up front keeps the common path a single in-place post.) For one-shot
 /// launches (`restart = never`, e.g. `svctest`) the caller passes
 /// `None` and forgoes supervision binding.
 pub fn launch(

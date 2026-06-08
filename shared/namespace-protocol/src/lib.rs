@@ -127,10 +127,27 @@ pub enum EntryTarget
     /// Backend-internal node — the cap returned by `NS_LOOKUP` is
     /// freshly minted on this server's namespace endpoint.
     Local(NodeId),
-    /// Pre-installed cap on a different server's namespace endpoint.
-    /// Returned via `cap_copy` with namespace rights intersected per
-    /// the per-entry policy.
-    External(u32),
+    /// A mount point: the entry resolves into a *different* server's
+    /// namespace (a child filesystem mounted under this directory).
+    ///
+    /// The cap returned by `NS_LOOKUP` is a fresh badged SEND minted on
+    /// `endpoint` at `node`, carrying the composed
+    /// `parent ∩ max_rights ∩ requested` rights — identical attenuation
+    /// to a [`Local`](Self::Local) entry, applied across the mount
+    /// boundary. The composing backend stores the peer's *unbadged*
+    /// namespace endpoint, never a pre-badged cap: the kernel forbids
+    /// re-badging an already-badged cap (`SYS_CAP_DERIVE_BADGE` rejects
+    /// a badged source), so attenuation can only cross the mount by
+    /// minting afresh from the endpoint.
+    External
+    {
+        /// Unbadged SEND on the peer server's namespace endpoint, held
+        /// by this server and never handed out directly.
+        endpoint: u32,
+        /// Peer-side node the mount resolves to (`NodeId::ROOT` for a
+        /// whole-filesystem mount).
+        node: NodeId,
+    },
 }
 
 /// Per-entry directory record returned by [`NamespaceBackend::lookup`].
@@ -394,13 +411,25 @@ fn handle_lookup<B: NamespaceBackend>(
                 Err(_) => return ipc::IpcMessage::new(NsError::OutOfResources.as_label()),
             }
         }
-        EntryTarget::External(src) =>
+        EntryTarget::External { endpoint, node } =>
         {
-            // External entries (mount points) carry pre-installed caps
-            // on a peer server's namespace endpoint. Forward via
-            // cap_derive — the peer's namespace rights enforcement
-            // happens at the next NS_LOOKUP hop.
-            match syscall::cap_derive(src, syscall_abi::RIGHTS_SEND)
+            // Mount-boundary crossing: mint a fresh badged SEND on the
+            // peer server's endpoint carrying the composed rights —
+            // exactly as the `Local` arm does on this server's own
+            // endpoint. Deriving the badge from the (unbadged) peer
+            // endpoint, rather than copying a pre-badged mount cap, is
+            // what lets attenuation cross the mount: the kernel forbids
+            // re-badging an already-badged cap (`SYS_CAP_DERIVE_BADGE`
+            // rejects a badged source), so a stored badged cap could
+            // only ever be copied at its original full rights.
+            let badge = pack(node, returned_rights);
+            if badge == 0
+            {
+                // cap_derive_badge requires a non-zero badge; empty
+                // composed rights means no access.
+                return ipc::IpcMessage::new(NsError::PermissionDenied.as_label());
+            }
+            match syscall::cap_derive_badge(endpoint, syscall_abi::RIGHTS_SEND, badge)
             {
                 Ok(slot) => slot,
                 Err(_) => return ipc::IpcMessage::new(NsError::OutOfResources.as_label()),

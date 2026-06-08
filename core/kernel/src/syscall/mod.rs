@@ -40,9 +40,9 @@ use syscall::{
     SYS_EVENT_POST, SYS_EVENT_RECV, SYS_IOPORT_BIND, SYS_IOPORT_SPLIT, SYS_IPC_BUFFER_SET,
     SYS_IPC_CALL, SYS_IPC_RECV, SYS_IPC_REPLY, SYS_IRQ_ACK, SYS_IRQ_REGISTER, SYS_IRQ_SPLIT,
     SYS_MEM_MAP, SYS_MEM_PROTECT, SYS_MEM_UNMAP, SYS_MEMORY_MERGE, SYS_MEMORY_SPLIT, SYS_MMIO_MAP,
-    SYS_MMIO_SPLIT, SYS_NOTIFICATION_SEND, SYS_NOTIFICATION_WAIT, SYS_SBI_CALL, SYS_SCHED_SPLIT,
-    SYS_SYSTEM_INFO, SYS_THREAD_BIND_NOTIFICATION, SYS_THREAD_CONFIGURE, SYS_THREAD_EXIT,
-    SYS_THREAD_READ_REGS, SYS_THREAD_SET_AFFINITY, SYS_THREAD_SET_FAULT_HANDLER,
+    SYS_MMIO_SPLIT, SYS_NOTIFICATION_SEND, SYS_NOTIFICATION_WAIT, SYS_PROCESS_EXIT, SYS_SBI_CALL,
+    SYS_SCHED_SPLIT, SYS_SYSTEM_INFO, SYS_THREAD_BIND_NOTIFICATION, SYS_THREAD_CONFIGURE,
+    SYS_THREAD_EXIT, SYS_THREAD_READ_REGS, SYS_THREAD_SET_AFFINITY, SYS_THREAD_SET_FAULT_HANDLER,
     SYS_THREAD_SET_PRIORITY, SYS_THREAD_SLEEP, SYS_THREAD_START, SYS_THREAD_STOP,
     SYS_THREAD_WRITE_REGS, SYS_THREAD_YIELD, SYS_WAIT_SET_ADD, SYS_WAIT_SET_REMOVE,
     SYS_WAIT_SET_WAIT,
@@ -105,6 +105,7 @@ pub unsafe fn dispatch(tf: *mut TrapFrame)
         SYS_IPC_BUFFER_SET => sys_ipc_buffer_set(tf),
         SYS_THREAD_YIELD => sys_yield(tf),
         SYS_THREAD_EXIT => sys_exit(tf),
+        SYS_PROCESS_EXIT => sys_process_exit(tf),
         SYS_SYSTEM_INFO => sysinfo::sys_system_info(tf),
         SYS_ASPACE_QUERY => sysinfo::sys_aspace_query(tf),
         SYS_EVENT_POST => ipc::sys_event_post(tf),
@@ -187,6 +188,67 @@ fn sys_exit(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
         // SAFETY: tcb is valid; post_death_notification handles null eq check.
         unsafe {
             crate::sched::post_death_notification(tcb, 0);
+        }
+    }
+    // Switch to the next runnable thread. The exited thread must not be
+    // re-enqueued.
+    // SAFETY: called from syscall handler on a valid kernel stack.
+    unsafe {
+        crate::sched::schedule(false);
+    }
+    // schedule() returns here if the same thread is re-selected (shouldn't
+    // happen for an Exited thread, but halt as a safety net).
+    crate::arch::current::cpu::halt_loop();
+}
+
+/// `SYS_PROCESS_EXIT` (54): terminate the calling process with an exit code.
+///
+/// Encodes `arg0` via [`syscall::encode_exit_code`] into the voluntary range
+/// `[0, EXIT_FAULT_BASE)`, records it as the calling thread's exit reason, and
+/// posts it to the calling thread's death observers — a parent that bound the
+/// main thread (so `ExitStatus::code()` carries it) and procmgr's per-thread
+/// observer (which reaps the process). Structurally identical to [`sys_exit`]
+/// but with a non-zero reason; in particular it schedules away immediately
+/// after the post, with no further dereference of the thread or its address
+/// space, so it cannot race procmgr's cap-revoke teardown.
+///
+/// It does NOT post to the address-space death-observer surface (reserved for
+/// terminal faults): doing so on every clean exit dereferences the address
+/// space after the thread post has already woken procmgr to reap, and procmgr's
+/// teardown can unmap the dying process while this thread is still on-CPU. The
+/// thread observer alone covers the single-threaded process model; whole-process
+/// exit from a non-main thread is not yet modelled.
+///
+/// Like [`sys_exit`], this stops only the calling thread; sibling threads are
+/// reaped by procmgr's cap-revoke teardown once it observes the death. Full
+/// resource cleanup is procmgr-driven and not performed here.
+#[cfg(not(test))]
+// cast_possible_truncation: arg0 carries a u32 exit code zero-extended to u64
+// by the `process_exit` wrapper; truncating back to u32 is the intended decode.
+#[allow(clippy::cast_possible_truncation)]
+fn sys_process_exit(tf: &mut TrapFrame) -> Result<u64, SyscallError>
+{
+    use crate::sched::thread::ThreadState;
+    let reason = syscall::encode_exit_code(tf.arg(0) as u32);
+    // SAFETY: current_tcb() returns current thread; interrupt context ensures it is set.
+    let tcb = unsafe { current_tcb() };
+    if !tcb.is_null()
+    {
+        // Commit Exited under all-CPU scheduler.locks (see sys_exit): write
+        // exit_reason first so any subsequent sched.lock acquire observes the
+        // reason alongside the Exited transition.
+        // SAFETY: tcb validated non-null.
+        unsafe {
+            (*tcb).exit_reason = reason;
+            crate::sched::set_state_under_all_locks(tcb, ThreadState::Exited);
+        }
+
+        // Notify the calling thread's observers (a parent that bound the main
+        // thread; procmgr's per-thread observer), then schedule immediately —
+        // no further tcb/aspace dereference, matching sys_exit's safe window.
+        // SAFETY: tcb is valid; post_death_notification handles null eq check.
+        unsafe {
+            crate::sched::post_death_notification(tcb, reason);
         }
     }
     // Switch to the next runnable thread. The exited thread must not be
@@ -602,4 +664,40 @@ fn sys_ipc_buffer_set(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         (*tcb).ipc_buffer = virt;
     }
     Ok(0)
+}
+
+// Host unit test for the kernel-owned exit-code encoding. Lives here because
+// the ABI crate that defines `encode_exit_code` builds `no_std` with
+// `test = false`; the kernel is the encoder's authority and runs host tests.
+#[cfg(test)]
+mod exit_code_tests
+{
+    use syscall::{EXIT_FAULT_BASE, EXIT_VOLUNTARY, encode_exit_code};
+
+    #[test]
+    fn zero_is_voluntary_success()
+    {
+        assert_eq!(encode_exit_code(0), EXIT_VOLUNTARY);
+    }
+
+    #[test]
+    fn small_codes_roundtrip_below_fault_base()
+    {
+        for code in [1u32, 2, 42, 255, 0x0FFE, 0x0FFF]
+        {
+            assert_eq!(encode_exit_code(code), u64::from(code));
+            assert!(encode_exit_code(code) < EXIT_FAULT_BASE);
+        }
+    }
+
+    #[test]
+    fn large_codes_saturate_and_never_alias()
+    {
+        // Saturates to the top of the voluntary range: never reaches the fault
+        // range, and never aliases success (0).
+        assert_eq!(encode_exit_code(0x1000), EXIT_FAULT_BASE - 1);
+        assert_eq!(encode_exit_code(u32::MAX), EXIT_FAULT_BASE - 1);
+        assert_ne!(encode_exit_code(u32::MAX), EXIT_VOLUNTARY);
+        assert!(encode_exit_code(u32::MAX) < EXIT_FAULT_BASE);
+    }
 }

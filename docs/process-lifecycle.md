@@ -318,10 +318,40 @@ starting it; see [Fault Handling](fault-handling.md).
 
 A process dies when:
 
-- It calls `sys_thread_exit` on its last thread.
+- It calls `sys_process_exit` (the `std::process::exit` / `main`-return path),
+  carrying a voluntary exit code.
+- It calls `sys_thread_exit` on its last thread (a thread completing).
 - Its `AddressSpace` capability is revoked (the "kill process" pattern;
   see [`capability-model.md`](capability-model.md) §`"Kill process" pattern`).
 - An unhandled fault terminates its threads.
+
+### Exit reason
+
+The kernel records a single 32-bit **exit reason** at death and delivers it
+(low 32 bits) through the thread death-observer surface. It is a flat,
+kernel-owned space partitioned into disjoint ranges so userspace can never forge
+a fault or kill reason — defined once in `syscall_abi`:
+
+| Reason value | Class | Meaning |
+|---|---|---|
+| `0` (`EXIT_VOLUNTARY`) | Voluntary, clean | success — `sys_process_exit(0)`, `sys_thread_exit`, `ExitCode::SUCCESS` |
+| `1 ..= 0x0FFF` | Voluntary, code | `sys_process_exit(code)` via `encode_exit_code` (saturating); `std::process::exit(n)` / non-zero `ExitCode` |
+| `0x1000 ..= 0x1FFF` (`EXIT_FAULT_BASE + vector`) | Fault | unhandled CPU/VM fault; kernel-terminated |
+| `0x2000` (`EXIT_KILLED`) | Killed (synthetic) | posted by userspace (`Child::kill`); the kernel never emits it |
+
+`sys_process_exit` records the encoded reason as the calling thread's exit
+reason and posts it to that thread's death observers — a parent that bound the
+main thread (so `ExitStatus::code()` carries it) and procmgr's per-thread
+observer (which reaps the process). It is structurally identical to
+`sys_thread_exit` but with a non-zero reason, and schedules away immediately
+after the post; it does **not** post to the address-space death surface
+(reserved for terminal faults), because doing so on every clean exit would
+dereference the address space after procmgr had already been woken to reap it.
+The kernel only *notifies*; it does not enumerate or stop sibling threads — they
+are reaped by procmgr's cap-revoke teardown below. `ExitStatus::success()`/`code()`
+decode the reason on the consumer side. This is a Seraph-native encoding, not
+POSIX: codes are not 8-bit `WEXITSTATUS`-truncated and faults are native fault
+classes, not signals.
 
 The death-notification flow:
 

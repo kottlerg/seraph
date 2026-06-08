@@ -14,7 +14,7 @@
 //! window a supervisor (svcmgr) hits when it binds a service init had already
 //! started (#106 Window 2).
 //!
-//! Three scenarios, all on the real exit/fault paths:
+//! Four scenarios, all on the real exit/fault paths:
 //!   1. A child exits cleanly with no observer bound; a later bind delivers
 //!      the retained clean reason (`0`).
 //!   2. A child faults with no observer bound; a later bind delivers the
@@ -22,12 +22,17 @@
 //!   3. Negative control: an observer bound *before* start still fires
 //!      exactly once — guarding the pre-existing path against a double-post
 //!      from the new retained-delivery branch.
+//!   4. A child voluntarily exits via `SYS_PROCESS_EXIT(code)` with no observer
+//!      bound; a later bind delivers the retained `encode_exit_code(code)`,
+//!      proving the process-exit syscall records the encoded code on the thread.
 
 use syscall::{
-    cap_delete, cap_info, event_queue_create, event_try_recv, thread_bind_notification,
-    thread_exit, thread_sleep,
+    cap_delete, cap_info, event_queue_create, event_try_recv, process_exit,
+    thread_bind_notification, thread_exit, thread_sleep,
 };
-use syscall_abi::{CAP_INFO_THREAD_STATE, EXIT_FAULT_BASE, SyscallError, THREAD_STATE_EXITED};
+use syscall_abi::{
+    CAP_INFO_THREAD_STATE, EXIT_FAULT_BASE, SyscallError, THREAD_STATE_EXITED, encode_exit_code,
+};
 
 use crate::{ChildStack, TestContext, TestResult};
 
@@ -46,6 +51,12 @@ const FAULT_VECTOR: u64 = 15; // store/AMO page fault
 const CORR_CLEAN: u32 = 0x1111;
 const CORR_FAULT: u32 = 0x2222;
 const CORR_LIVE: u32 = 0x3333;
+const CORR_PROC_EXIT: u32 = 0x4444;
+
+/// Voluntary exit code scenario 4's child passes to `process_exit`. Distinct
+/// from the correlators and inside the voluntary range so `encode_exit_code`
+/// returns it verbatim.
+const PROC_EXIT_CODE: u32 = 0x0123;
 
 /// Poll bound: ~2 s at 1 ms/poll before declaring a child never reached
 /// `Exited` (a mis-classified fault would otherwise loop forever).
@@ -63,6 +74,14 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     // Scenario 3: negative control — bind before start fires exactly once.
     bind_before_start_fires_once(ctx)?;
+
+    // Scenario 4: voluntary process exit carries the encoded code, bind after death.
+    late_bind_after_death(
+        ctx,
+        proc_exit_child,
+        CORR_PROC_EXIT,
+        encode_exit_code(PROC_EXIT_CODE),
+    )?;
 
     Ok(())
 }
@@ -196,6 +215,13 @@ fn poll_event(eq: u32) -> Result<u64, &'static str>
 fn clean_exit_child(_arg: u64) -> !
 {
     thread_exit()
+}
+
+/// Child: exit the process voluntarily with `PROC_EXIT_CODE`; the kernel
+/// records `encode_exit_code(PROC_EXIT_CODE)` as the thread's exit reason.
+fn proc_exit_child(_arg: u64) -> !
+{
+    process_exit(PROC_EXIT_CODE)
 }
 
 /// Child: store to an unmapped address, killed by the kernel with exit reason

@@ -346,6 +346,8 @@ pub const SYS_IOPORT_SPLIT: u64 = 51;
 pub const SYS_SCHED_SPLIT: u64 = 52;
 /// Bind a death notification `EventQueue` to an address space (terminal fault).
 pub const SYS_ASPACE_BIND_NOTIFICATION: u64 = 53;
+/// Exit the whole process with a caller-chosen exit code.
+pub const SYS_PROCESS_EXIT: u64 = 54;
 
 // ── Error codes ───────────────────────────────────────────────────────────────
 
@@ -528,15 +530,66 @@ pub const RIGHTS_SBI_PMU: u64 = 1 << 26;
 
 // ── Exit reason constants ─────────────────────────────────────────────────────
 //
-// Values passed via death notification when a thread exits or faults.
+// The exit reason is the value a death notification delivers (low 32 bits) when
+// a thread or process dies. It is a single flat space partitioned into disjoint
+// ranges, kernel-owned so userspace can never forge a fault or kill reason:
+//
+//   | Reason            | Class               | Meaning                          |
+//   |-------------------|---------------------|----------------------------------|
+//   | `0`               | Voluntary, clean    | success (`SYS_THREAD_EXIT`, or    |
+//   |                   |                     | `SYS_PROCESS_EXIT(0)`)            |
+//   | `1 ..= 0x0FFF`    | Voluntary, code     | `SYS_PROCESS_EXIT(code)`, where   |
+//   |                   |                     | reason == `encode_exit_code(code)`|
+//   | `0x1000 ..0x2000` | Fault               | `EXIT_FAULT_BASE + vector/cause`  |
+//   | `0x2000`          | Killed (synthetic)  | `EXIT_KILLED`; never kernel-emitted|
+//
+// This is a Seraph-native encoding, not POSIX: exit codes are not 8-bit
+// `WEXITSTATUS`-truncated, and faults are native fault classes, not signals.
 
-/// Clean voluntary exit via `SYS_THREAD_EXIT`.
+/// Clean voluntary exit (success): `SYS_THREAD_EXIT`, or `SYS_PROCESS_EXIT(0)`.
 pub const EXIT_VOLUNTARY: u64 = 0;
 
 /// Base value for fault-induced exits. The kernel adds the architecture-specific
 /// fault vector/cause to this base: `EXIT_FAULT_BASE + vector` (x86-64) or
-/// `EXIT_FAULT_BASE + cause` (RISC-V).
+/// `EXIT_FAULT_BASE + cause` (RISC-V). Voluntary exit codes occupy the disjoint
+/// range `[1, EXIT_FAULT_BASE)` below it, so a fault and an exit code can never
+/// alias.
 pub const EXIT_FAULT_BASE: u64 = 0x1000;
+
+/// Synthetic exit reason for a process killed by its supervisor (address-space
+/// cap revoked). Posted by userspace (e.g. `std::process::Child::kill`) so a
+/// waiter observes a defined status; the kernel never records this value — a
+/// revoke-driven teardown is silent on the kernel side. Sits just above the
+/// fault range so consumers tell a user-initiated kill from a hardware fault.
+pub const EXIT_KILLED: u64 = 0x2000;
+
+/// Encode a voluntary process exit `code` into the flat exit-reason space.
+///
+/// - `0` → [`EXIT_VOLUNTARY`] (success).
+/// - `1 ..= 0x0FFF` → the code verbatim (the gap below [`EXIT_FAULT_BASE`]).
+/// - `>= 0x1000` → saturates to `EXIT_FAULT_BASE - 1` (`0x0FFF`).
+///
+/// Saturating (never masking) guarantees a non-zero code can never alias to
+/// `0`/success — unlike POSIX 8-bit truncation, where `exit(256)` becomes `0`.
+/// The 12-bit ceiling is deliberate: it slots codes below the established fault
+/// range, and tier-3 verdicts are binary while shell codes are `0..=255`, both
+/// well inside the range.
+#[must_use]
+pub const fn encode_exit_code(code: u32) -> u64
+{
+    if code == 0
+    {
+        EXIT_VOLUNTARY
+    }
+    else if (code as u64) < EXIT_FAULT_BASE
+    {
+        code as u64
+    }
+    else
+    {
+        EXIT_FAULT_BASE - 1
+    }
+}
 
 // ── Fault-handler protocol ─────────────────────────────────────────────────────
 //

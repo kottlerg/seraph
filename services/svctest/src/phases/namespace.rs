@@ -76,11 +76,18 @@ fn sandbox_child_main() -> !
     {
         std::process::exit(3);
     }
-    match std::fs::File::open("/data/test.txt")
+    // The delivered root cap *is* the stat-only `/data` node (namespace_cap
+    // overrides system_root_cap), so `test.txt` is `/test.txt` from this root.
+    // A stat-only cap must deny the read with PermissionDenied.
+    match std::fs::File::open("/test.txt")
     {
         Ok(_) => std::process::exit(1),
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => std::process::exit(0),
-        Err(_) => std::process::exit(2),
+        Err(e) =>
+        {
+            std::os::seraph::log!("sandbox-child: unexpected open error kind {:?}", e.kind());
+            std::process::exit(2)
+        }
     }
 }
 

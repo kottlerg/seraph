@@ -25,6 +25,7 @@
 //! `qemu.rs::prepare_riscv_firmware` — this module is pure discovery.
 
 use std::ffi::OsStr;
+use std::fmt::Write;
 use std::path::PathBuf;
 
 use anyhow::{Result, anyhow};
@@ -281,9 +282,10 @@ fn not_found_error(label: &str, env_var: &str, tried: &[&str], hints: &str) -> a
             msg.push('\n');
         }
     }
-    msg.push_str(&format!(
-        "\nSet ${env_var} to a direct path, or install the firmware:\n",
-    ));
+    let _ = write!(
+        msg,
+        "\nSet ${env_var} to a direct path, or install the firmware:\n"
+    );
     msg.push_str(hints);
     anyhow!(msg)
 }
@@ -291,7 +293,7 @@ fn not_found_error(label: &str, env_var: &str, tried: &[&str], hints: &str) -> a
 /// Build the "discovered file missing" error.
 fn missing_file_error(label: &str, path: &std::path::Path) -> anyhow::Error
 {
-    anyhow!("{label} not found at resolved path: {}", path.display(),)
+    anyhow!("{label} not found at resolved path: {}", path.display())
 }
 
 /// Build the "env var set to a path that doesn't exist" error.

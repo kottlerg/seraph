@@ -446,6 +446,7 @@ pub fn run(ctx: &BuildContext, args: &BuildArgs) -> Result<()>
     if !args.skip_lints
     {
         fmt_workspace(ctx)?;
+        clippy_host(ctx)?;
     }
 
     match args.component
@@ -519,60 +520,57 @@ fn build_boot(ctx: &BuildContext, args: &BuildArgs) -> Result<()>
     fs::create_dir_all(&efi_seraph_dir)
         .with_context(|| format!("creating {}", efi_seraph_dir.display()))?;
 
-    match args.arch
+    if args.arch == Arch::Riscv64
     {
-        Arch::Riscv64 =>
+        // RISC-V: cargo produces an ELF; convert to a flat PE32+ binary via
+        // llvm-objcopy. The UEFI spec requires a PE32+ image on disk.
+        let elf_out = ctx.cargo_output_dir(boot_triple, args.release).join("boot");
+        if !elf_out.exists()
         {
-            // RISC-V: cargo produces an ELF; convert to a flat PE32+ binary via
-            // llvm-objcopy. The UEFI spec requires a PE32+ image on disk.
-            let elf_out = ctx.cargo_output_dir(boot_triple, args.release).join("boot");
-            if !elf_out.exists()
-            {
-                bail!("expected ELF output not found: {}", elf_out.display());
-            }
-
-            let objcopy = find_llvm_objcopy()?;
-            let dst_boot = efi_seraph_dir.join("boot.efi");
-            run_cmd(
-                Command::new(&objcopy)
-                    .args(["-O", "binary"])
-                    .arg(&elf_out)
-                    .arg(&dst_boot),
-            )?;
-            let dst_efi = efi_boot_dir.join(efi_name);
-            copy_file(&dst_boot, &dst_efi)?;
-
-            step(&format!(
-                "Bootloader: {} (ELF → flat binary)",
-                efi_seraph_dir.join("boot.efi").display()
-            ));
-            step(&format!(
-                "Bootloader: {} (ELF → flat binary)",
-                dst_efi.display()
-            ));
+            bail!("expected ELF output not found: {}", elf_out.display());
         }
-        _ =>
+
+        let objcopy = find_llvm_objcopy()?;
+        let dst_boot = efi_seraph_dir.join("boot.efi");
+        run_cmd(
+            Command::new(&objcopy)
+                .args(["-O", "binary"])
+                .arg(&elf_out)
+                .arg(&dst_boot),
+        )?;
+        let dst_efi = efi_boot_dir.join(efi_name);
+        copy_file(&dst_boot, &dst_efi)?;
+
+        step(&format!(
+            "Bootloader: {} (ELF → flat binary)",
+            efi_seraph_dir.join("boot.efi").display()
+        ));
+        step(&format!(
+            "Bootloader: {} (ELF → flat binary)",
+            dst_efi.display()
+        ));
+    }
+    else
+    {
+        // x86_64 (and future PE-native archs): cargo produces a .efi PE directly.
+        let cargo_out = ctx
+            .cargo_output_dir(boot_triple, args.release)
+            .join("boot.efi");
+        if !cargo_out.exists()
         {
-            // x86_64 (and future PE-native archs): cargo produces a .efi PE directly.
-            let cargo_out = ctx
-                .cargo_output_dir(boot_triple, args.release)
-                .join("boot.efi");
-            if !cargo_out.exists()
-            {
-                bail!("expected EFI output not found: {}", cargo_out.display());
-            }
-
-            let dst_boot = efi_seraph_dir.join("boot.efi");
-            copy_file(&cargo_out, &dst_boot)?;
-            let dst_efi = efi_boot_dir.join(efi_name);
-            copy_file(&dst_boot, &dst_efi)?;
-
-            step(&format!(
-                "Bootloader: {}",
-                efi_seraph_dir.join("boot.efi").display()
-            ));
-            step(&format!("Bootloader: {}", dst_efi.display()));
+            bail!("expected EFI output not found: {}", cargo_out.display());
         }
+
+        let dst_boot = efi_seraph_dir.join("boot.efi");
+        copy_file(&cargo_out, &dst_boot)?;
+        let dst_efi = efi_boot_dir.join(efi_name);
+        copy_file(&dst_boot, &dst_efi)?;
+
+        step(&format!(
+            "Bootloader: {}",
+            efi_seraph_dir.join("boot.efi").display()
+        ));
+        step(&format!("Bootloader: {}", dst_efi.display()));
     }
 
     Ok(())
@@ -689,7 +687,7 @@ fn build_group(
                 cargo_out.display()
             );
         }
-        for dst in install_paths(ctx, spec)?
+        for dst in install_paths(ctx, spec)
         {
             if let Some(parent) = dst.parent()
             {
@@ -786,7 +784,7 @@ fn build_spec(ctx: &BuildContext, args: &BuildArgs, spec: &Spec) -> Result<()>
         );
     }
 
-    for dst in install_paths(ctx, spec)?
+    for dst in install_paths(ctx, spec)
     {
         if let Some(parent) = dst.parent()
         {
@@ -818,10 +816,10 @@ fn profile_params(arch: Arch, profile: BuildProfile) -> (&'static str, &'static 
     }
 }
 
-fn install_paths(ctx: &BuildContext, spec: &Spec) -> Result<Vec<PathBuf>>
+fn install_paths(ctx: &BuildContext, spec: &Spec) -> Vec<PathBuf>
 {
     let n = spec.install_name();
-    Ok(match spec.dest
+    match spec.dest
     {
         InstallDest::EfiSeraph => vec![ctx.sysroot_efi_seraph().join(n)],
         InstallDest::Services => vec![ctx.sysroot_services().join(n)],
@@ -836,7 +834,7 @@ fn install_paths(ctx: &BuildContext, spec: &Spec) -> Result<Vec<PathBuf>>
         {
             vec![ctx.sysroot.join("tests").join("programs").join(n)]
         }
-    })
+    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -849,6 +847,16 @@ fn fmt_workspace(ctx: &BuildContext) -> Result<()>
     run_cmd(&mut cmd)
 }
 
+/// Clippy-gate the host crates (`xtask`, `seraph-wrapper-shim`) under the
+/// workspace deny-lints. The sysroot crates are linted per-component via the
+/// seraph-toolchain path in `clippy_check_ext`; the host crates build with the
+/// plain host toolchain, which a rustc-only build never clippy-checks. Runs
+/// `cargo clippy -p xtask -p seraph-wrapper-shim -- -D warnings`.
+fn clippy_host(ctx: &BuildContext) -> Result<()>
+{
+    clippy_check(ctx, &["-p", "xtask", "-p", "seraph-wrapper-shim"])
+}
+
 /// Run `cargo clippy` with the given flags and treat all warnings as errors.
 ///
 /// Called before every `cargo build` invocation with identical flags, so lints
@@ -859,10 +867,10 @@ fn clippy_check(ctx: &BuildContext, flags: &[&str]) -> Result<()>
 }
 
 /// Clippy invocation that optionally wires the seraph toolchain mirror so
-/// StdUser lints see the overlaid `std::sys::seraph`.
+/// `StdUser` lints see the overlaid `std::sys::seraph`.
 ///
 /// For non-StdUser builds this is a straightforward `cargo clippy -- -D
-/// warnings`. For StdUser builds the path differs: `cargo clippy` hard-
+/// warnings`. For `StdUser` builds the path differs: `cargo clippy` hard-
 /// sets `RUSTC_WORKSPACE_WRAPPER=clippy-driver` itself, clobbering any
 /// value callers set. That baked-in clippy-driver reports the real rustup
 /// sysroot regardless of `RUSTC`, so cargo's build-std probe reads std
@@ -878,30 +886,27 @@ fn clippy_check_ext(
 ) -> Result<()>
 {
     let mut cmd = cargo(&ctx.root);
-    match seraph
+    if let Some(s) = seraph
     {
-        Some(s) =>
-        {
-            cmd.arg("check").args(flags);
-            // Routes RUSTC + RUSTC_WORKSPACE_WRAPPER through the shim,
-            // sets the SERAPH_SHIM_* config, and re-applies
-            // RUSTC_BOOTSTRAP=1. `std` is a recognised (non-restricted)
-            // target via the std `build.rs` overlay, so service code
-            // stays preamble-free.
-            s.apply_env(&mut cmd);
-            // Clippy-driver splits CLIPPY_ARGS on __CLIPPY_HACKERY__; this
-            // matches the encoding cargo-clippy uses internally when
-            // forwarding post-`--` args.
-            cmd.env(
-                "CLIPPY_ARGS",
-                "__CLIPPY_HACKERY__-D__CLIPPY_HACKERY__warnings__CLIPPY_HACKERY__",
-            );
-        }
-        None =>
-        {
-            cmd.arg("clippy").args(flags);
-            cmd.args(["--", "-D", "warnings"]);
-        }
+        cmd.arg("check").args(flags);
+        // Routes RUSTC + RUSTC_WORKSPACE_WRAPPER through the shim,
+        // sets the SERAPH_SHIM_* config, and re-applies
+        // RUSTC_BOOTSTRAP=1. `std` is a recognised (non-restricted)
+        // target via the std `build.rs` overlay, so service code
+        // stays preamble-free.
+        s.apply_env(&mut cmd);
+        // Clippy-driver splits CLIPPY_ARGS on __CLIPPY_HACKERY__; this
+        // matches the encoding cargo-clippy uses internally when
+        // forwarding post-`--` args.
+        cmd.env(
+            "CLIPPY_ARGS",
+            "__CLIPPY_HACKERY__-D__CLIPPY_HACKERY__warnings__CLIPPY_HACKERY__",
+        );
+    }
+    else
+    {
+        cmd.arg("clippy").args(flags);
+        cmd.args(["--", "-D", "warnings"]);
     }
     run_cmd(&mut cmd)
 }

@@ -93,8 +93,12 @@ const PROMPT: &str = "$ ";
 const SERIAL_INPUT: &[u8] = b"helpx\x7f\r";
 
 /// Overall wall-clock budget for boot + inject + assert.
-const TIMEOUT: Duration = Duration::from_secs(180);
+const TIMEOUT: Duration = Duration::from_mins(3);
 
+// too_many_lines: a linear QMP-driven test (boot, wait for READY, inject keys
+// and serial RX, assert echoed markers). Splitting the sequential assertions
+// would obscure the flow without reducing complexity.
+#[allow(clippy::too_many_lines)]
 pub fn run(ctx: &Context, args: &TestTerminalArgs) -> Result<()>
 {
     validate_sysroot_for_launch(ctx, args.arch)?;
@@ -126,7 +130,7 @@ pub fn run(ctx: &Context, args: &TestTerminalArgs) -> Result<()>
         gdb: false,
         qmp_socket: Some(&sock_path),
     };
-    let qemu_args = build_qemu_argv(&spec);
+    let qemu_args = build_qemu_argv(&spec)?;
     let qemu_binary = require_tool(args.arch.qemu_binary())?;
 
     step("Launching QEMU for the terminal interactive test (QMP key + serial RX injection)");

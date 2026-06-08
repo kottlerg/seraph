@@ -11,12 +11,12 @@
 //! (`SERAPH_ACCEL`), then per-`cfg(target_os)` detection, then a TCG
 //! fallback for hosts without a registered native accelerator.
 //!
-//! Scope: cross-architecture emulation (e.g. riscv64 guest on x86_64
+//! Scope: cross-architecture emulation (e.g. riscv64 guest on `x86_64`
 //! host) only ever has TCG available; this module's detection routines
 //! report the *host's* native accelerator, and a guest of a different
 //! arch is resolved to `Tcg` via `detect_for_arch`. The current Seraph
-//! launch flow uses native acceleration only for x86_64 guests on
-//! x86_64 hosts; everything else (riscv64 guest on any host, x86_64
+//! launch flow uses native acceleration only for `x86_64` guests on
+//! `x86_64` hosts; everything else (riscv64 guest on any host, `x86_64`
 //! guest on a non-x86_64 host) uses TCG.
 //!
 //! Env var:
@@ -27,7 +27,7 @@
 //!   to detection so a typo doesn't silently miss-accelerate.
 //!
 //! Cross-arch precedence: when the guest arch doesn't match the host
-//! arch (e.g. riscv64 guest on x86_64 host), native acceleration is
+//! arch (e.g. riscv64 guest on `x86_64` host), native acceleration is
 //! impossible and the result is always `Tcg`. If the user also set
 //! `SERAPH_ACCEL` to something other than `tcg`/`auto`, a stderr
 //! warning is emitted so the silent downgrade is visible.

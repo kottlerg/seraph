@@ -14,6 +14,11 @@
 //! 3. Add a match arm in `main` below.
 //! 4. Re-export the module in `commands/mod.rs`.
 
+// multiple_crate_versions: duplicate transitive versions (bitflags, hashbrown,
+// windows-sys, wit-bindgen) come from third-party host deps (clap, gpt, fatfs,
+// libc, which); not resolvable without upstream releases.
+#![allow(clippy::multiple_crate_versions)]
+
 use clap::Parser;
 
 mod accel;
@@ -38,7 +43,15 @@ use context::Context;
 fn main()
 {
     let cli = Cli::parse();
-    let ctx = Context::from_manifest_dir();
+    let ctx = match Context::from_manifest_dir()
+    {
+        Ok(ctx) => ctx,
+        Err(err) =>
+        {
+            eprintln!("error: {err:#}");
+            std::process::exit(1);
+        }
+    };
 
     // Install a no-op Ctrl+C handler so SIGINT terminates the inner
     // subprocess (cargo, QEMU) without killing xtask itself. Allows

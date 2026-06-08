@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-//! commands/run_parallel.rs
+//! `commands/run_parallel.rs`
 //!
 //! Run-parallel command: launch N QEMU instances concurrently against an
 //! already-built sysroot, classifying each run's outcome via user-supplied
@@ -18,7 +18,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -59,7 +59,7 @@ impl Status
             Status::Ok => "OK".into(),
             Status::Fail => "FAIL".into(),
             Status::Hang => "HANG".into(),
-            Status::Err(rc) => format!("ERR rc={}", rc),
+            Status::Err(rc) => format!("ERR rc={rc}"),
         }
     }
 
@@ -100,6 +100,10 @@ struct FirmwareSet
     vars_template: Option<PathBuf>,
 }
 
+// too_many_lines: a linear dispatch-and-collect driver (wave loop, per-slot
+// thread spawn, join, summary). Splitting it would scatter the shared per-run
+// state across helpers without reducing complexity.
+#[allow(clippy::too_many_lines)]
 pub fn run(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
 {
     validate_args(args)?;
@@ -120,7 +124,7 @@ pub fn run(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
     let workdir = ctx.target_dir.join("xtask").join("run-parallel");
     std::fs::create_dir_all(&workdir)
         .with_context(|| format!("creating workdir {}", workdir.display()))?;
-    purge_prior_logs(&workdir)?;
+    purge_prior_logs(&workdir);
 
     step(&format!(
         "Starting run-parallel: arch={:?} parallel={} runs={} timeout={}s workdir={}",
@@ -132,7 +136,7 @@ pub fn run(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
     ));
 
     let disk_src = ctx.disk_image();
-    let next_run = Arc::new(AtomicUsize::new(1));
+    let next_run = Arc::new(AtomicU32::new(1));
     let mut outcomes: Vec<RunOutcome> = Vec::with_capacity(args.runs as usize);
 
     let total_runs = args.runs;
@@ -145,9 +149,9 @@ pub fn run(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
 
         for slot in 0..wave_size
         {
-            let run_id = next_run.fetch_add(1, Ordering::AcqRel) as u32;
+            let run_id = next_run.fetch_add(1, Ordering::AcqRel);
             let slot_dir = workdir.join(slot.to_string());
-            let log_path = workdir.join(format!("log-{}.log", run_id));
+            let log_path = workdir.join(format!("log-{run_id}.log"));
             let disk_dst = slot_dir.join("disk.img");
             let vars_dst = slot_dir.join("VARS.fd");
 
@@ -177,7 +181,7 @@ pub fn run(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
                 {
                     let template = firmware_vars_template
                         .as_ref()
-                        .expect("riscv64 must produce a vars template");
+                        .context("riscv64 must produce a vars template")?;
                     std::fs::copy(template, &vars_dst).with_context(|| {
                         format!(
                             "copying vars template {} -> {}",
@@ -202,7 +206,7 @@ pub fn run(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
                     gdb: false,
                     qmp_socket: None,
                 };
-                let qemu_args = build_qemu_argv(&spec);
+                let qemu_args = build_qemu_argv(&spec)?;
 
                 // O_APPEND on the log fds so the kernel writes atomically
                 // at end-of-file. Both the per-slot stdout-forwarder thread
@@ -212,7 +216,6 @@ pub fn run(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
                 // two writers share the file.
                 let log_file = OpenOptions::new()
                     .create(true)
-                    .write(true)
                     .append(true)
                     .open(&log_path)
                     .with_context(|| format!("creating log file {}", log_path.display()))?;
@@ -334,12 +337,12 @@ fn resolve_firmware(ctx: &BuildContext, arch: Arch) -> Result<FirmwareSet>
     }
 }
 
-fn purge_prior_logs(workdir: &Path) -> Result<()>
+fn purge_prior_logs(workdir: &Path)
 {
-    let entries = match std::fs::read_dir(workdir)
+    let Ok(entries) = std::fs::read_dir(workdir)
+    else
     {
-        Ok(e) => e,
-        Err(_) => return Ok(()),
+        return;
     };
     for entry in entries.flatten()
     {
@@ -349,7 +352,9 @@ fn purge_prior_logs(workdir: &Path) -> Result<()>
         {
             continue;
         };
-        let is_log = name.ends_with(".log")
+        let is_log = Path::new(name)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("log"))
             && (name.starts_with("log-")
                 || name.starts_with("FAIL-")
                 || name.starts_with("HANG-")
@@ -359,7 +364,6 @@ fn purge_prior_logs(workdir: &Path) -> Result<()>
             let _ = std::fs::remove_file(&path);
         }
     }
-    Ok(())
 }
 
 /// Spawn a thread that forwards `child_stdout` through `FilterWriter`
@@ -398,7 +402,7 @@ fn join_forwarder(handle: JoinHandle<Result<()>>, run_id: u32)
     }
 }
 
-/// Block until `child` exits or a watchdog deadline elapses, SIGKILLing it
+/// Block until `child` exits or a watchdog deadline elapses, `SIGKILLing` it
 /// on the deadline.
 ///
 /// Two deadlines apply, whichever comes first:
@@ -462,7 +466,7 @@ fn wait_with_timeout(
 /// missed live match only forgoes the early abort, never the verdict.
 fn fail_marker_present(log_path: &Path, last_len: &mut u64, fail_re: &Regex) -> bool
 {
-    let len = std::fs::metadata(log_path).map(|m| m.len()).unwrap_or(0);
+    let len = std::fs::metadata(log_path).map_or(0, |m| m.len());
     if len == *last_len
     {
         return false;
@@ -515,7 +519,7 @@ fn classify(
             .lines()
             .rev()
             .find(|l| !l.trim().is_empty())
-            .map(|s| s.to_string());
+            .map(ToString::to_string);
         return (Status::Hang, last);
     }
     if exit_rc == 0
@@ -527,11 +531,10 @@ fn classify(
 
 fn line_containing(text: &str, byte_offset: usize) -> String
 {
-    let start = text[..byte_offset].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let start = text[..byte_offset].rfind('\n').map_or(0, |i| i + 1);
     let end = text[byte_offset..]
         .find('\n')
-        .map(|i| byte_offset + i)
-        .unwrap_or(text.len());
+        .map_or(text.len(), |i| byte_offset + i);
     text[start..end].trim_end_matches(['\r', '\n']).to_string()
 }
 
@@ -545,7 +548,7 @@ fn finalize_log(workdir: &Path, log_path: &Path, run_id: u32, status: &Status) -
         }
         Some(prefix) =>
         {
-            let dest = workdir.join(format!("{}-{}.log", prefix, run_id));
+            let dest = workdir.join(format!("{prefix}-{run_id}.log"));
             std::fs::rename(log_path, &dest).with_context(|| {
                 format!("renaming {} -> {}", log_path.display(), dest.display())
             })?;
@@ -559,8 +562,8 @@ fn format_outcome_line(outcome: &RunOutcome) -> String
     let elapsed = format!("{:.2}s", outcome.elapsed.as_secs_f64());
     let tail = match (&outcome.status, &outcome.matched)
     {
-        (Status::Hang, Some(last)) => format!("last={:?}", last),
-        (_, Some(m)) => format!("match={:?}", m),
+        (Status::Hang, Some(last)) => format!("last={last:?}"),
+        (_, Some(m)) => format!("match={m:?}"),
         (_, None) => String::new(),
     };
     let base = format!(
@@ -576,7 +579,7 @@ fn format_outcome_line(outcome: &RunOutcome) -> String
     }
     else
     {
-        format!("{}  {}", base, tail)
+        format!("{base}  {tail}")
     }
 }
 
@@ -671,7 +674,7 @@ fn print_failing_tails(workdir: &Path, outcomes: &[RunOutcome])
         }
         else
         {
-            println!("{}", tail);
+            println!("{tail}");
         }
     }
 }
@@ -694,6 +697,9 @@ fn tail_text(body: &str, max_lines: usize, max_bytes: usize) -> String
     tail
 }
 
+// cast_precision_loss: micros→seconds for human-readable display only; run
+// elapsed times are far below f64's exact-integer range.
+#[allow(clippy::cast_precision_loss)]
 fn us_to_s(us: u128) -> f64
 {
     us as f64 / 1_000_000.0

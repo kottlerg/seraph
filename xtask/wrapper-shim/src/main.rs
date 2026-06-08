@@ -20,7 +20,7 @@
 //!
 //! - **`ws-clippy`**: cargo invokes `RUSTC_WORKSPACE_WRAPPER` as
 //!   `<wrapper> <rustc_path> <args...>`. Drop the cargo-prepended
-//!   rustc_path, set `SYSROOT=<mirror>` in the env, and re-drive
+//!   `rustc_path`, set `SYSROOT=<mirror>` in the env, and re-drive
 //!   `clippy-driver` with both `<mirror>/bin/rustc` and an explicit
 //!   `--sysroot=<mirror>` arg. clippy-driver bakes its rustup env
 //!   vars at compile time, so both the env var and the flag are
@@ -55,10 +55,10 @@ const ENV_MIRROR_SYSROOT: &str = "SERAPH_SHIM_MIRROR_SYSROOT";
 fn main() -> !
 {
     let mut argv = env::args_os();
-    let argv0 = match argv.next()
+    let Some(argv0) = argv.next()
+    else
     {
-        Some(a) => a,
-        None => die("argv[0] missing (impossible per POSIX/Windows)"),
+        die("argv[0] missing (impossible per POSIX/Windows)")
     };
     let argv_rest: Vec<OsString> = argv.collect();
 
@@ -99,7 +99,7 @@ fn exec_rustc(args: Vec<OsString>) -> !
     run_or_exec(cmd, "rustc")
 }
 
-/// Drop cargo's prepended rustc_path arg and re-drive clippy-driver
+/// Drop cargo's prepended `rustc_path` arg and re-drive clippy-driver
 /// with both `SYSROOT` env and `--sysroot=` flag pointing at the
 /// seraph mirror. Never returns on success.
 fn exec_ws_clippy(mut args: Vec<OsString>) -> !

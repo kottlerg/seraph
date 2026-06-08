@@ -2,7 +2,7 @@
 
 [alias]
 # `cargo xtask <command>` runs the xtask build runner.
-xtask = "run --package xtask --release --"
+xtask = "run --package xtask --"
 
 #
 # build-std flags are passed explicitly by the build scripts rather than here,

@@ -31,6 +31,7 @@ mod fpu_migration_churn;
 mod idle_wake_race;
 mod priority_dealloc_race;
 mod retype_concurrent;
+mod stop_reply_race;
 mod thread_churn;
 
 use crate::{ChildStack, TestContext, run_integration_test};
@@ -67,6 +68,7 @@ pub fn run_all(ctx: &TestContext)
         "stress::priority_dealloc_race",
         priority_dealloc_race::run(ctx)
     );
+    run_integration_test!("stress::stop_reply_race", stop_reply_race::run(ctx));
     run_integration_test!(
         "stress::double_enqueue_storm",
         double_enqueue_storm::run(ctx)

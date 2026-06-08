@@ -881,6 +881,13 @@ dependencies = [
 [[package]]
 name = "shell"
 version = "0.1.0"
+dependencies = [
+ "shell-path",
+]
+
+[[package]]
+name = "shell-path"
+version = "0.1.0"
 
 [[package]]
 name = "shell-tester"
@@ -1077,7 +1084,12 @@ dependencies = [
  "namespace-protocol",
  "syscall",
  "syscall-abi",
+ "vfsd-gpt",
 ]
+
+[[package]]
+name = "vfsd-gpt"
+version = "0.1.0"
 
 [[package]]
 name = "virtio-blk"

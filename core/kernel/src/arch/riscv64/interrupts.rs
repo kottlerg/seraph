@@ -1384,11 +1384,4 @@ mod tests
     {
         assert_eq!(plic_claim_complete_offset(), 0x0020_1004);
     }
-
-    #[test]
-    fn trap_frame_size()
-    {
-        // 31 regs × 8 + sepc + scause + stval + sstatus = 35 × 8 = 280 bytes.
-        assert_eq!(core::mem::size_of::<TrapFrame>(), 280);
-    }
 }

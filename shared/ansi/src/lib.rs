@@ -534,4 +534,70 @@ mod tests
         // `ESC[48;2;0;0;0m` — the three `0` operands must not reset the bg.
         assert_evs(&[b"\x1b[44m\x1b[48;2;0;0;0mZ"], &[attrs(15, 4), text(b"Z")]);
     }
+
+    #[test]
+    fn multiple_params_apply_in_one_sgr()
+    {
+        // `ESC[1;32;41m` = bold + green fg + red bg → bright green (10) on red (1).
+        assert_evs(&[b"\x1b[1;32;41mX"], &[attrs(10, 1), text(b"X")]);
+    }
+
+    #[test]
+    fn malformed_extended_colour_selector_leaves_colour_unchanged()
+    {
+        // `ESC[38;7m` — selector 7 is neither 2 nor 5, so nothing further is
+        // swallowed and the prior colour stands (no spurious change from the 7).
+        assert_evs(&[b"\x1b[31m\x1b[38;7mX"], &[attrs(1, 0), text(b"X")]);
+    }
+
+    #[test]
+    fn private_marker_sequence_is_swallowed()
+    {
+        // `ESC[?25h` (cursor-show) is a non-SGR private sequence: swallowed whole.
+        assert_evs(&[b"\x1b[?25hX"], &[text(b"X")]);
+    }
+
+    #[test]
+    fn colour_code_range_edges_map_to_palette()
+    {
+        assert_evs(&[b"\x1b[37mX"], &[attrs(7, 0), text(b"X")]); // normal fg top (30..=37)
+        assert_evs(&[b"\x1b[90mX"], &[attrs(8, 0), text(b"X")]); // bright fg bottom (90..=97)
+        assert_evs(&[b"\x1b[47mX"], &[attrs(15, 7), text(b"X")]); // normal bg top (40..=47)
+        assert_evs(&[b"\x1b[107mX"], &[attrs(15, 15), text(b"X")]); // bright bg top (100..=107)
+    }
+
+    #[test]
+    fn trailing_empty_param_is_reset()
+    {
+        // `ESC[31;m` = [red, empty→reset]; the final state is the reset.
+        assert_evs(
+            &[b"\x1b[32m\x1b[31;mX"],
+            &[attrs(2, 0), attrs(15, 0), text(b"X")],
+        );
+    }
+
+    #[test]
+    fn failed_attrs_delivery_is_retried()
+    {
+        // emit_attrs advances last_sent only on a successful sink, so a dropped
+        // FB_SET_ATTRS is re-offered on the next colour resolution.
+        let mut p = AnsiParser::new();
+        let mut offered = 0usize;
+        p.feed(b"\x1b[31m", |ev| {
+            if let Event::Attrs(..) = ev
+            {
+                offered += 1;
+            }
+            false // reject delivery
+        });
+        assert_eq!(offered, 1, "red offered once");
+        p.feed(b"\x1b[31mX", |ev| {
+            if let Event::Attrs(..) = ev
+            {
+                offered += 1;
+            }
+            true
+        });
+        assert_eq!(offered, 2, "red re-offered after the failed delivery");
+    }
 }

@@ -215,15 +215,12 @@ mod tests
     use super::*;
     use core::mem::{offset_of, size_of};
 
+    // ABI contract: the trap entry/exit assembly saves and restores registers at these
+    // exact TrapFrame offsets. Layout and asm MUST agree, or a fault corrupts user state.
     #[test]
-    fn trap_frame_size_is_168()
+    fn trap_frame_layout_matches_asm()
     {
         assert_eq!(size_of::<TrapFrame>(), 168);
-    }
-
-    #[test]
-    fn field_offsets()
-    {
         assert_eq!(offset_of!(TrapFrame, rax), 0);
         assert_eq!(offset_of!(TrapFrame, rbx), 8);
         assert_eq!(offset_of!(TrapFrame, rcx), 16);

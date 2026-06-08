@@ -16,6 +16,7 @@ members = [
     "services/pwrmgr",
     "services/timed",
     "services/vfsd",
+    "services/vfsd/gpt",
     "services/drivers/cmos",
     "services/drivers/framebuffer",
     "services/drivers/goldfish-rtc",
@@ -49,6 +50,7 @@ members = [
     "programs/hello/tester",
     "programs/pipefault",
     "programs/shell",
+    "programs/shell/path",
     "programs/shell/tester",
     "programs/stackoverflow",
     "programs/stdiotest",
@@ -94,12 +96,21 @@ syscall = { path = "abi/syscall", package = "syscall-abi" }
 syscall-abi = { path = "abi/syscall" }
 virtio-core = { path = "services/drivers/virtio/core" }
 
+# opt-level = 2 and debug = 0 are unified across both profiles; debuginfo is
+# opt-in per-package via `cargo xtask build --debug <comp>`. dev and release
+# differ only in {debug-assertions, overflow-checks} (iterate) and
+# {lto, codegen-units} (ship). LTO has no per-package form, so two profiles
+# must persist.
 [profile.dev]
 panic = "abort"
-opt-level = 1
+opt-level = 2
+debug = 0
+debug-assertions = true
+overflow-checks = true
 
 [profile.release]
 panic = "abort"
+opt-level = 2
+debug = 0
 lto = true
 codegen-units = 1
-opt-level = "s"

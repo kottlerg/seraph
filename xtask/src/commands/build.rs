@@ -509,6 +509,7 @@ fn build_boot(ctx: &BuildContext, args: &BuildArgs) -> Result<()>
 
     let mut cmd = cargo(&ctx.root);
     cmd.arg("build").args(&flags);
+    cmd.args(debug_config_flags(args, "boot"));
     run_cmd(&mut cmd)?;
 
     let efi_boot_dir = ctx.sysroot_efi_boot();
@@ -666,6 +667,10 @@ fn build_group(
 
     let mut cmd = cargo(&ctx.root);
     cmd.arg("build").args(&flags_ref);
+    for &pkg in &names
+    {
+        cmd.args(debug_config_flags(args, pkg));
+    }
     if let Some(s) = seraph.as_ref()
     {
         s.apply_env(&mut cmd);
@@ -755,6 +760,7 @@ fn build_spec(ctx: &BuildContext, args: &BuildArgs, spec: &Spec) -> Result<()>
 
     let mut cmd = cargo(&ctx.root);
     cmd.arg("build").args(&flags_ref);
+    cmd.args(debug_config_flags(args, spec.name));
     if let Some(s) = seraph.as_ref()
     {
         // Routes RUSTC + RUSTC_WORKSPACE_WRAPPER through the shim,
@@ -920,4 +926,48 @@ fn copy_file(src: &Path, dst: &Path) -> Result<()>
 fn profile_name(release: bool) -> &'static str
 {
     if release { "release" } else { "debug" }
+}
+
+/// Cargo profile *selector* name (`dev`/`release`) for `--config` keys.
+///
+/// Distinct from [`profile_name`], which returns the output-directory name
+/// (`debug`/`release`). The cargo profile is literally named `dev`; no profile
+/// is named `debug`, so a per-package `--config` key MUST use this name —
+/// `profile.debug.package.*` would be a silent no-op. Do not fold this into
+/// [`profile_name`].
+fn active_profile(release: bool) -> &'static str
+{
+    if release { "release" } else { "dev" }
+}
+
+/// Whether `--debug` selected `pkg` for debuginfo. [`BuildComponent::All`]
+/// selects every package; [`BuildComponent::Boot`] selects only `boot` (which
+/// has no [`Spec`], hence the explicit arm).
+fn debug_includes(args: &BuildArgs, pkg: &str) -> bool
+{
+    args.debug.iter().any(|c| match c
+    {
+        BuildComponent::All => true,
+        BuildComponent::Boot => pkg == "boot",
+        other => spec_for(*other).is_some_and(|s| s.name == pkg),
+    })
+}
+
+/// `--config` flags opting `pkg` into debuginfo (`debug = 2`, `opt-level = 1`)
+/// within the active profile. Empty unless `--debug` named `pkg`. The package
+/// segment is quoted so hyphenated names (`virtio-blk`, `cmos-rtc`, `*-tester`)
+/// parse as a single TOML key.
+fn debug_config_flags(args: &BuildArgs, pkg: &str) -> Vec<String>
+{
+    if !debug_includes(args, pkg)
+    {
+        return Vec::new();
+    }
+    let profile = active_profile(args.release);
+    vec![
+        "--config".into(),
+        format!("profile.{profile}.package.\"{pkg}\".debug=2"),
+        "--config".into(),
+        format!("profile.{profile}.package.\"{pkg}\".opt-level=1"),
+    ]
 }

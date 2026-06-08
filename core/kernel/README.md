@@ -79,6 +79,7 @@ kernel/
     ├── ipc-internals.md        # IPC subsystem implementation details
     ├── scheduler.md                  # Scheduler internals and algorithms
     ├── scheduling-internals.md       # SMP locking, wake protocol, IPI taxonomy, BSP boot transient
+    ├── sched-ipc-redesign.md         # Design rationale: per-TCB sched_lock SMP hotpath redesign (#292)
     └── thread-lifecycle-and-sleep.md # Lifecycle syscalls, sleep list, dealloc drain protocol
 ```
 

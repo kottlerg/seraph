@@ -238,12 +238,43 @@ pub struct ThreadControlBlock
     /// `None` when not on any run queue.
     pub run_queue_next: Option<*mut ThreadControlBlock>,
 
+    /// Global single-link tag: the priority level this TCB is currently linked
+    /// at, or `-1` when not on any run queue. Written only under the owning
+    /// `PerCpuScheduler.lock` (set in `PerCpuScheduler::enqueue`, cleared in
+    /// `dequeue_highest` / `remove_from_queue`). The enqueue chokepoint rejects a
+    /// TCB whose tag is already `>= 0`, enforcing "Ready ⇒ linked on exactly one
+    /// queue" across *all* CPUs and priorities — stronger than the per-queue
+    /// `run_queue_next`/tail check, which cannot see a TCB that is the sole
+    /// element of a different priority queue or another CPU's queue (#244/#289).
+    pub queued_on: core::sync::atomic::AtomicI16,
+
     /// Debug-only breadcrumb of the most recent run-queue link, recorded under
     /// the owning `PerCpuScheduler.lock` in `PerCpuScheduler::enqueue`. Read by
     /// the `RunQueue::enqueue` double-enqueue tripwires to name the prior link
     /// site (issue #244). Stripped in release builds.
     #[cfg(debug_assertions)]
     pub last_enqueue: Option<EnqueueBreadcrumb>,
+
+    /// Authoritative serializer for this TCB's entire Scheduling field group.
+    ///
+    /// Keyed on the TCB itself, not on whichever run queue happens to link it:
+    /// the owning lock of `{state, ipc_state, queued_on, run_queue_next,
+    /// preferred_cpu, blocked_on_object, wake_pending}` is always this lock,
+    /// regardless of which CPU the TCB is on. This is what collapses the
+    /// positional-ownership race class — two CPUs can no longer pick two
+    /// different locks for one TCB. Lock order: source IPC lock → `sched_lock`
+    /// → per-CPU `PerCpuScheduler.lock`. See
+    /// `docs/scheduling-internals.md` § Cross-CPU TCB Ownership.
+    pub sched_lock: crate::sync::Spinlock,
+
+    /// A wake arrived while this thread was still live (`Running`/`Ready`).
+    ///
+    /// Set under [`sched_lock`](Self::sched_lock) by a waker that coalesces such
+    /// a wake instead of linking the live incarnation; the park-commit re-reads
+    /// it under `sched_lock` and refuses to park when set, closing the
+    /// wake-before-park lost-wake without a timing dependence. Only ever
+    /// accessed under `sched_lock`.
+    pub wake_pending: bool,
 
     // === IPC state ===
     /// Current IPC blocking reason (None when not blocked on IPC).

@@ -1232,12 +1232,19 @@ pub fn sys_event_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         let still_waiter = unsafe { (*eq_state).waiter } == tcb;
         if still_waiter
         {
+            // Roll back the commit_blocked. Clear the waiter slot under eq.lock,
+            // then the Scheduling-group fields under tcb.sched_lock (lock order
+            // source eq.lock → sched_lock, matching event_queue_post) so the
+            // writes do not race a concurrent cancel_ipc_block / enqueue_and_wake
+            // reading state/ipc_state/blocked_on_object under sched_lock.
             // SAFETY: tcb valid; eq.lock held excludes event_queue_post wake.
             unsafe {
                 (*eq_state).waiter = core::ptr::null_mut();
+                let s = (*tcb).sched_lock.lock_raw();
                 (*tcb).state = crate::sched::thread::ThreadState::Ready;
                 (*tcb).ipc_state = crate::sched::thread::IpcThreadState::None;
                 (*tcb).blocked_on_object = core::ptr::null_mut();
+                (*tcb).sched_lock.unlock_raw(s);
             }
             // SAFETY: paired with lock_raw above.
             unsafe { (*eq_state).lock.unlock_raw(saved) };

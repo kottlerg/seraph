@@ -278,17 +278,23 @@ pub unsafe fn event_queue_recv(
 /// nothing for this function to deallocate.
 ///
 /// # Safety
-/// Must be called with the scheduler lock held. `eq` must be a valid
-/// pointer to a live `EventQueueState`.
+/// `eq` must be a valid pointer to a live `EventQueueState`. Acquires `eq.lock`
+/// internally to claim the waiter; the caller MUST NOT hold it.
 #[cfg(not(test))]
 pub unsafe fn event_queue_drop(eq: *mut EventQueueState)
 {
     // SAFETY: eq is a valid pointer.
     let eq = unsafe { &mut *eq };
 
-    if !eq.waiter.is_null()
+    // Claim the waiter under eq.lock — the #160 discipline event_queue_post
+    // uses — so a concurrent dealloc(waiter) BlockedOnEventQueue unlink (which
+    // takes eq.lock and spins on wake_in_flight) cannot free the TCB before our
+    // enqueue_and_wake commits.
+    // SAFETY: lock_raw paired with unlock_raw below.
+    let saved = unsafe { eq.lock.lock_raw() };
+    let waiter = eq.waiter;
+    if !waiter.is_null()
     {
-        let waiter = eq.waiter;
         eq.waiter = core::ptr::null_mut();
         // SAFETY: waiter is a valid TCB.
         unsafe {
@@ -297,6 +303,16 @@ pub unsafe fn event_queue_drop(eq: *mut EventQueueState)
             (*waiter)
                 .wake_in_flight
                 .store(1, core::sync::atomic::Ordering::Release);
+        }
+    }
+    // SAFETY: paired with lock_raw above.
+    unsafe { eq.lock.unlock_raw(saved) };
+
+    if !waiter.is_null()
+    {
+        // SAFETY: waiter kept valid by wake_in_flight = 1 above; enqueue_and_wake
+        // commits the Blocked→Ready transition under the waiter's sched_lock.
+        unsafe {
             let target_cpu = crate::sched::select_target_cpu(waiter);
             crate::sched::enqueue_and_wake(waiter, target_cpu);
         }

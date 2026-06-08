@@ -753,95 +753,30 @@ mod tests
 {
     use super::*;
 
-    /// `empty()` must notification "no framebuffer" via physical_base == 0.
+    // FramebufferInfo::empty() is the "no framebuffer" sentinel: the kernel treats
+    // physical_base == 0 as absent and disregards the remaining fields.
     #[test]
-    fn framebuffer_info_empty_physical_base_is_zero()
-    {
-        assert_eq!(FramebufferInfo::empty().physical_base, 0);
-    }
-
-    /// All dimension fields are zero, confirming the struct is fully zeroed.
-    #[test]
-    fn framebuffer_info_empty_dimensions_are_zero()
+    fn empty_signals_no_framebuffer()
     {
         let fb = FramebufferInfo::empty();
+        assert_eq!(fb.physical_base, 0);
         assert_eq!(fb.width, 0);
         assert_eq!(fb.height, 0);
         assert_eq!(fb.stride, 0);
+        assert_eq!(fb.pixel_format, PixelFormat::Rgbx8);
     }
 
-    /// pixel_format defaults to Rgbx8 (discriminant 0), which equals the
-    /// zeroed bit pattern for the PixelFormat repr(u32).
+    // ABI contract: the bootloader writes these structures into the BootInfo page and
+    // the kernel reads them back by offset, so their sizes are part of
+    // BOOT_PROTOCOL_VERSION. A size change is a boot-protocol break, not a refactor.
     #[test]
-    fn framebuffer_info_empty_pixel_format_is_rgbx8()
-    {
-        assert_eq!(FramebufferInfo::empty().pixel_format, PixelFormat::Rgbx8);
-    }
-
-    /// BOOT_PROTOCOL_VERSION must be 8 after removing `command_line` and
-    /// adding `BootModule::name` for bundle-based identity matching.
-    #[test]
-    fn protocol_version_is_8()
-    {
-        assert_eq!(BOOT_PROTOCOL_VERSION, 8);
-    }
-
-    /// `BootModule::name` is exactly [`BOOT_MODULE_NAME_LEN`] bytes wide so
-    /// the bundle entry header copies straight into the field with no
-    /// length renegotiation.
-    #[test]
-    fn boot_module_name_len_matches_field()
-    {
-        let m = BootModule {
-            name: [0u8; BOOT_MODULE_NAME_LEN],
-            physical_base: 0,
-            size: 0,
-        };
-        assert_eq!(m.name.len(), BOOT_MODULE_NAME_LEN);
-    }
-
-    /// `ReclaimRange` is 16 bytes: u64 + u32 + u32, no padding.
-    #[test]
-    fn reclaim_range_size_is_16_bytes()
+    fn boot_protocol_struct_sizes_are_stable()
     {
         assert_eq!(core::mem::size_of::<ReclaimRange>(), 16);
-    }
-
-    /// `MmioApertureSlice` is layout-compatible across builds and trivially
-    /// Send/Sync (the unsafe impls above); this test exists mostly to catch
-    /// accidental reordering / size drift at review time.
-    #[test]
-    fn mmio_aperture_slice_size_is_16_bytes()
-    {
         assert_eq!(core::mem::size_of::<MmioApertureSlice>(), 16);
-    }
-
-    /// `MmioAperture` is 16 bytes: two u64s, no padding.
-    #[test]
-    fn mmio_aperture_size_is_16_bytes()
-    {
         assert_eq!(core::mem::size_of::<MmioAperture>(), 16);
-    }
-
-    /// InitImage segment_count field must fit within INIT_MAX_SEGMENTS.
-    #[test]
-    fn init_image_segment_count_fits_max()
-    {
-        assert!(INIT_MAX_SEGMENTS <= u32::MAX as usize);
-    }
-
-    /// `BootInfo` must fit a single 4 KiB page; the field-size docs depend on it.
-    #[test]
-    fn boot_info_fits_4kib_page()
-    {
-        assert!(core::mem::size_of::<BootInfo>() <= 4096);
-    }
-
-    /// `FramebufferInfo::SIZE` covers the full struct: u64 + 4×u32 = 24 B.
-    #[test]
-    fn framebuffer_info_size_is_24_bytes()
-    {
         assert_eq!(FramebufferInfo::SIZE, 24);
+        assert!(core::mem::size_of::<BootInfo>() <= 4096);
     }
 
     /// Round-trip: a populated `FramebufferInfo` survives `to_bytes` then

@@ -24,7 +24,7 @@
 #![allow(clippy::cast_possible_truncation)]
 
 mod driver;
-mod gpt;
+mod partition;
 mod role_guids;
 mod root_backend;
 mod worker;
@@ -182,7 +182,7 @@ fn main() -> !
     // target memory cap; vfsd reuses one scratch page across all GPT reads.
     // The memory cap and its VA reservation are process-lifetime-leaked.
     let Some((mut scratch_cap, scratch_va)) =
-        gpt::alloc_scratch(caps.memmgr_ep, caps.self_aspace, ipc_buf)
+        partition::alloc_scratch(caps.memmgr_ep, caps.self_aspace, ipc_buf)
     else
     {
         std::os::seraph::log!("FATAL: GPT scratch allocation failed");
@@ -191,7 +191,7 @@ fn main() -> !
 
     // Parse GPT partition table — stored for UUID lookups on MOUNT requests.
     let mut gpt_parts = gpt::new_gpt_table();
-    match gpt::parse_gpt(
+    match partition::parse_gpt(
         blk_ep,
         ipc_buf,
         &mut gpt_parts,
@@ -760,7 +760,7 @@ fn handle_get_system_root_cap(ipc_buf: *mut u64, rt: &VfsdRuntime)
 
 /// Mount role decoded from the MOUNT IPC wire byte. The producer
 /// (init) declares which partition role it wants; vfsd resolves the
-/// role to a GPT type-GUID via [`role_for_type_guid`] and then to a
+/// role to a GPT type-GUID via [`MountRole::type_guid`] and then to a
 /// partition entry via [`gpt::lookup_partition_by_type_guid`].
 #[derive(Clone, Copy, Debug)]
 enum MountRole

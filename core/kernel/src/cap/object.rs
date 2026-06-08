@@ -1321,6 +1321,15 @@ unsafe fn dealloc_object_one(
                         .load(core::sync::atomic::Ordering::Relaxed)
                         as usize;
 
+                    // Acquire (*tcb).sched_lock FIRST (outermost) so the Exited
+                    // write serialises with schedule()'s dispatch flip and
+                    // enqueue_and_wake/commit on the SAME per-TCB lock (STEP 4/5
+                    // data-race fix). Released right after the CPU locks below,
+                    // BEFORE the UAF gate (which re-enables interrupts and where a
+                    // CPU switching away from `tcb` needs tcb.sched_lock). Order
+                    // tcb.sched_lock → CPU locks matches schedule(), so no ABBA.
+                    let tcb_sched_saved = (*tcb).sched_lock.lock_raw();
+
                     // Acquire all scheduler locks in ascending CPU order to
                     // prevent ABBA deadlock. Each CPU's saved interrupt-flag
                     // word is stashed in its own scheduler (under that lock).
@@ -1346,11 +1355,20 @@ unsafe fn dealloc_object_one(
                         crate::sched::scheduler_for(cpu).remove_from_queue(tcb, prio);
                     }
 
-                    // Wake any reply-bound client with Interrupted; otherwise
-                    // they would remain BlockedOnReply with a dangling
-                    // blocked_on_object pointing at this freed server.
-                    // The enqueue is deferred until after the all-locks
-                    // release (enqueue_and_wake takes a scheduler.lock).
+                    // A dying server orphans any reply-bound client. Claim the
+                    // reply slot (CAS) and DEFER the wake past the all-locks
+                    // release: deposit the resume disposition now, but leave the
+                    // client Blocked and route it through the GATED
+                    // enqueue_and_wake below. The client's Scheduling-group fields
+                    // (state/ipc_state/blocked_on_object) are written ONLY by
+                    // enqueue_and_wake under the CLIENT's own sched_lock — never
+                    // here under the server's locks. Writing `state = Ready` here
+                    // was the residual #284: a concurrent dealloc(client) marks the
+                    // client Exited under the client's sched_lock, racing this
+                    // unsynchronised Ready write, and the old enqueue_ready_thread
+                    // then linked the Exited-and-being-freed client → freed-but-
+                    // linked run-queue corruption / torn dispatch. The gated
+                    // enqueue_and_wake instead observes Exited and aborts the link.
                     server_reply_wake = {
                         use core::sync::atomic::Ordering;
                         let bound = (*tcb).reply_tcb.load(Ordering::Acquire);
@@ -1368,15 +1386,21 @@ unsafe fn dealloc_object_one(
                             )
                             .is_ok()
                         {
-                            // Distinguish a fault-blocked client (handler death
-                            // cancels its in-flight fault → Kill on resume in the
-                            // fault helper) from a syscall caller (returns
-                            // Interrupted). Read the state before clearing it.
+                            // Keep the client TCB alive against a concurrent
+                            // dealloc(client) until the deferred enqueue_and_wake
+                            // clears it (#160 wake-in-flight gate). A BlockedOnReply
+                            // client already carries wake_in_flight = 1 from
+                            // endpoint_call/recv; refresh it unconditionally so the
+                            // gate also covers the BlockedOnFault entry path.
+                            (*bound).wake_in_flight.store(1, Ordering::Release);
+                            // Deposit the resume disposition (read on resume per the
+                            // DEPOSIT model). A fault-blocked client cancels to Kill
+                            // (the fault helper terminates it on resume); a syscall
+                            // caller returns Interrupted. Reading ipc_state here is a
+                            // read of a value stable until our own wake (we hold the
+                            // sole claim via the reply_tcb CAS).
                             let was_fault = (*bound).ipc_state
                                 == crate::sched::thread::IpcThreadState::BlockedOnFault;
-                            (*bound).blocked_on_object = core::ptr::null_mut();
-                            (*bound).ipc_state = crate::sched::thread::IpcThreadState::None;
-                            (*bound).state = ThreadState::Ready;
                             if was_fault
                             {
                                 (*bound).fault_outcome.store(
@@ -1403,12 +1427,17 @@ unsafe fn dealloc_object_one(
                         }
                     };
 
-                    // Release all locks.
+                    // Release all CPU locks, then (*tcb).sched_lock last — BEFORE
+                    // the UAF gate, which spins with interrupts ENABLED (holding
+                    // an IRQ-disabling sched_lock across it would be inconsistent,
+                    // and a CPU switching away from `tcb` must be able to take
+                    // tcb.sched_lock).
                     for cpu in (0..cpu_count).rev()
                     {
                         let s = crate::sched::scheduler_for(cpu);
                         s.lock.unlock_raw(s.saved_lock_flags);
                     }
+                    (*tcb).sched_lock.unlock_raw(tcb_sched_saved);
 
                     // UAF gate: a TCB that is `current` on any CPU MUST NOT be
                     // reclaimed until every CPU has switched away from it AND
@@ -1499,10 +1528,16 @@ unsafe fn dealloc_object_one(
                 }
 
                 // Wake the captured reply-bound client outside the all-locks
-                // region (enqueue_and_wake takes a scheduler.lock).
+                // region. The client is still Blocked (we deposited its
+                // disposition above but did NOT pre-set Ready), so the gated
+                // enqueue_and_wake links it under the client's own sched_lock —
+                // and if a concurrent dealloc(client) already won the reap, the
+                // gate observes Exited and aborts the link instead of resurrecting
+                // a freed TCB. wake_in_flight (set above) kept the client alive
+                // until here and is cleared on every enqueue_and_wake exit path.
                 if let Some((bound, bcpu)) = server_reply_wake
                 {
-                    // SAFETY: bound prepared under all-CPU locks above.
+                    // SAFETY: bound kept valid by wake_in_flight = 1 above.
                     unsafe { crate::sched::enqueue_and_wake(bound, bcpu) };
                 }
 
@@ -1673,6 +1708,20 @@ unsafe fn dealloc_object_one(
                         );
                     }
                 }
+
+                // Remove this thread from the global sleep list before the
+                // wake-in-flight gate below. A plain sleeper (sys_thread_sleep) or
+                // a timed IPC waiter sits on the list as a raw TCB pointer; freeing
+                // without removing it would let the next timer tick dereference the
+                // freed pointer in sleep_check_wakeups. The remove races that pop
+                // under SLEEP_LIST_LOCK: if we win, the entry is gone and no timer
+                // wake fires; if the timer already popped it, the timer set
+                // wake_in_flight = 1 at pop (under the same lock), so the gate
+                // below waits for that wake to commit before the free. Placed
+                // OUTSIDE the all-locks region — no sched.lock → SLEEP_LIST_LOCK
+                // order edge (the timer takes SLEEP_LIST_LOCK first, then releases
+                // it before any sched_lock).
+                crate::sched::sleep_list_remove(tcb);
 
                 // Wake-in-flight gate (#160): a waker that popped this thread
                 // from a wait object (notification/endpoint/event_queue/wait_set)
@@ -2061,11 +2110,20 @@ unsafe fn dealloc_object_one(
                 // reading a zero-length message (effectively an ObjectGone hint).
                 // TODO: set TrapFrame return to SyscallError::ObjectGone when
                 // a proper per-thread wakeup error path is added.
-                // SAFETY: state validated non-null; wake queue traversal under sched lock.
+                // SAFETY: state validated non-null. The drain runs under ep.lock:
+                // a concurrent dealloc(waiter) BlockedOnSend/Recv unlink takes the
+                // same lock, so it cannot mutate these queues or free a waiter
+                // mid-walk, and the per-waiter wake_in_flight = 1 set here (the
+                // #160 discipline) makes any dealloc(waiter) that already left the
+                // queue wait at its wake-in-flight gate for our enqueue_and_wake
+                // rather than free the TCB under it. Lock order ep.lock (source) →
+                // sched_lock → run-queue lock is canonical, so holding ep.lock
+                // across enqueue_and_wake is deadlock-free.
                 unsafe {
                     let ep = &mut *state;
+                    let saved = ep.lock.lock_raw();
                     // Wake senders. enqueue_and_wake commits the state
-                    // transitions under sched.lock; we only detach the
+                    // transitions under sched_lock; we only detach the
                     // intrusive list pointers here.
                     let mut tcb = ep.send_head;
                     while !tcb.is_null()
@@ -2084,6 +2142,11 @@ unsafe fn dealloc_object_one(
                                 core::sync::atomic::Ordering::Release,
                             );
                         }
+                        // Claim for wake under ep.lock (#160). Cleared by
+                        // enqueue_and_wake.
+                        (*tcb)
+                            .wake_in_flight
+                            .store(1, core::sync::atomic::Ordering::Release);
                         let target_cpu = crate::sched::select_target_cpu(tcb);
                         crate::sched::enqueue_and_wake(tcb, target_cpu);
                         tcb = next.unwrap_or(core::ptr::null_mut());
@@ -2099,12 +2162,18 @@ unsafe fn dealloc_object_one(
                     {
                         let next = (*tcb).ipc_wait_next;
                         (*tcb).ipc_wait_next = None;
+                        // Claim for wake under ep.lock (#160). Cleared by
+                        // enqueue_and_wake.
+                        (*tcb)
+                            .wake_in_flight
+                            .store(1, core::sync::atomic::Ordering::Release);
                         let target_cpu = crate::sched::select_target_cpu(tcb);
                         crate::sched::enqueue_and_wake(tcb, target_cpu);
                         tcb = next.unwrap_or(core::ptr::null_mut());
                     }
                     ep.recv_head = core::ptr::null_mut();
                     ep.recv_tail = core::ptr::null_mut();
+                    ep.lock.unlock_raw(saved);
                 }
             }
 
@@ -2205,16 +2274,29 @@ unsafe fn dealloc_object_one(
                 // Wake a blocked waiter with wakeup_value = 0.
                 // TODO: return SyscallError::ObjectGone when a proper wakeup
                 // error path is available in sys_notification_wait.
-                // SAFETY: state validated non-null; waiter TCB still valid.
+                // SAFETY: state validated non-null. Claim the waiter under sig.lock
+                // — the #160 discipline notification_send uses — so a concurrent
+                // dealloc(waiter) BlockedOnNotification unlink (which takes sig.lock
+                // and spins on wake_in_flight) cannot free the TCB before our
+                // enqueue_and_wake commits.
                 unsafe {
                     let sig = &mut *state;
+                    let saved = sig.lock.lock_raw();
                     let waiter = sig.waiter;
                     if !waiter.is_null()
                     {
                         sig.waiter = core::ptr::null_mut();
                         // wakeup_value=0 = drop semantics; state transitions
-                        // committed by enqueue_and_wake.
+                        // committed by enqueue_and_wake. Claim for wake under
+                        // sig.lock (#160); cleared by enqueue_and_wake.
                         (*waiter).wakeup_value = 0;
+                        (*waiter)
+                            .wake_in_flight
+                            .store(1, core::sync::atomic::Ordering::Release);
+                    }
+                    sig.lock.unlock_raw(saved);
+                    if !waiter.is_null()
+                    {
                         let target_cpu = crate::sched::select_target_cpu(waiter);
                         crate::sched::enqueue_and_wake(waiter, target_cpu);
                     }

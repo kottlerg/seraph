@@ -477,9 +477,32 @@ static mut SLEEP_COUNT: usize = 0;
 /// ISR's borrowed kernel stack. `sleep_check_wakeups` runs only on CPU0 (see
 /// `timer_tick`'s `cpu == 0` gate) behind an interrupt gate (IF=0), so it is
 /// non-reentrant and this single buffer needs no lock of its own.
+/// One expired sleeper, snapshotted under `SLEEP_LIST_LOCK` at pop. The
+/// per-entry claim loop dispatches off this snapshot rather than re-reading the
+/// TCB, so a concurrent `dealloc_object(Thread)` that frees the TCB after the
+/// lock is dropped is never observed as a torn binding (it cannot be observed at
+/// all on the no-claim paths, which never dereference the TCB).
 #[cfg(not(test))]
-static mut EXPIRED_SCRATCH: [*mut ThreadControlBlock; MAX_SLEEPING] =
-    [core::ptr::null_mut(); MAX_SLEEPING];
+#[derive(Clone, Copy)]
+struct ExpiredWaiter
+{
+    tcb: *mut ThreadControlBlock,
+    ipc_state: thread::IpcThreadState,
+    blocked_on: *mut u8,
+}
+
+#[cfg(not(test))]
+impl ExpiredWaiter
+{
+    const EMPTY: Self = Self {
+        tcb: core::ptr::null_mut(),
+        ipc_state: thread::IpcThreadState::None,
+        blocked_on: core::ptr::null_mut(),
+    };
+}
+
+#[cfg(not(test))]
+static mut EXPIRED_SCRATCH: [ExpiredWaiter; MAX_SLEEPING] = [ExpiredWaiter::EMPTY; MAX_SLEEPING];
 
 /// Add a thread to the sleep list. The TCB must already have
 /// `sleep_deadline` set and state = Blocked.
@@ -583,7 +606,32 @@ pub fn sleep_check_wakeups()
             let tcb = SLEEP_LIST[i];
             if !tcb.is_null() && (*tcb).sleep_deadline <= now
             {
-                expired[n] = tcb;
+                // Snapshot the binding under SLEEP_LIST_LOCK, where the TCB is
+                // provably alive: dealloc_object(Thread) removes its entry from
+                // this list under the same lock before freeing. The claim loop
+                // below dispatches off this snapshot and never dereferences the
+                // TCB to choose its arm.
+                let ipc_state = (*tcb).ipc_state;
+                let blocked_on = (*tcb).blocked_on_object;
+                // A plain sleeper (no IPC source object) has no competing waker,
+                // so claim it here: set wake_in_flight = 1 under the lock so a
+                // concurrent dealloc_object(Thread) that lost the list race waits
+                // at its wake-in-flight gate for our enqueue_and_wake instead of
+                // freeing this TCB after the pop. (Cleared by enqueue_and_wake.)
+                // The IPC arms instead claim under their own source lock at the win
+                // below; BlockedOnReply/Fault already carry wake_in_flight = 1 from
+                // the block entry.
+                if matches!(ipc_state, thread::IpcThreadState::None)
+                {
+                    (*tcb)
+                        .wake_in_flight
+                        .store(1, core::sync::atomic::Ordering::Release);
+                }
+                expired[n] = ExpiredWaiter {
+                    tcb,
+                    ipc_state,
+                    blocked_on,
+                };
                 n += 1;
                 // Remove from list by swapping with last entry.
                 SLEEP_COUNT -= 1;
@@ -603,17 +651,22 @@ pub fn sleep_check_wakeups()
 
     // For each expired tcb, try to claim the wake. Timed-wait IPC entries
     // arbitrate via the IPC object's lock against a concurrent sender.
-    for &tcb in expired.iter().take(n)
+    for &ExpiredWaiter {
+        tcb,
+        ipc_state,
+        blocked_on,
+    } in expired.iter().take(n)
     {
         if tcb.is_null()
         {
             continue;
         }
-        // SAFETY: tcb pointer was placed on the sleep list by a live thread
-        // and is only removed when the thread is destroyed (exit/fault),
-        // both of which first stop the thread's blocked state. At this
-        // point the thread is still Blocked.
-        let (ipc_state, blocked_on) = unsafe { ((*tcb).ipc_state, (*tcb).blocked_on_object) };
+        // ipc_state/blocked_on are the pop-time snapshot (taken under
+        // SLEEP_LIST_LOCK), NOT a fresh (*tcb) read: a concurrent
+        // dealloc_object(Thread) may have freed the TCB once the lock was dropped,
+        // so dispatching off a live dereference here would be a use-after-free.
+        // The matching source object (blocked_on) is independently refcounted and
+        // remains valid; the no-claim arms below touch only it, never the TCB.
 
         let claimed = match ipc_state
         {
@@ -635,11 +688,19 @@ pub fn sleep_check_wakeups()
                 let we_win = unsafe { (*sig_state).waiter } == tcb;
                 if we_win
                 {
-                    // SAFETY: we hold sig.lock. wakeup_value=0 is the
-                    // timeout marker (notification_send rejects 0-bit sends, so
-                    // 0 is unambiguous). State/ipc_state/blocked_on are
-                    // committed by enqueue_and_wake under sched.lock.
+                    // SAFETY: we hold sig.lock and sig.waiter == tcb, so a
+                    // dealloc(tcb) BlockedOnNotification unlink (which needs
+                    // sig.lock to clear the waiter) cannot have freed tcb yet.
+                    // Claim it for wake under sig.lock: set wake_in_flight = 1
+                    // before the TCB writes so a concurrent dealloc(tcb) waits at
+                    // its gate (#160); cleared by enqueue_and_wake. wakeup_value=0
+                    // is the timeout marker (notification_send rejects 0-bit
+                    // sends). State/ipc_state/blocked_on are committed by
+                    // enqueue_and_wake under sched.lock.
                     unsafe {
+                        (*tcb)
+                            .wake_in_flight
+                            .store(1, core::sync::atomic::Ordering::Release);
                         (*sig_state).waiter = core::ptr::null_mut();
                         (*sig_state).has_observer.store(
                             u8::from(!(*sig_state).wait_set.is_null()),
@@ -672,11 +733,19 @@ pub fn sleep_check_wakeups()
                 let we_win = unsafe { (*eq_state).waiter } == tcb;
                 if we_win
                 {
-                    // SAFETY: we hold eq.lock. Event payloads can be any
-                    // u64 (including 0); `timed_out` is the out-of-band
-                    // timeout marker, read-and-cleared by sys_event_recv
-                    // on resume. State/etc. committed by enqueue_and_wake.
+                    // SAFETY: we hold eq.lock and eq.waiter == tcb, so a
+                    // dealloc(tcb) BlockedOnEventQueue unlink (which needs eq.lock
+                    // to clear the waiter) cannot have freed tcb yet. Claim it for
+                    // wake under eq.lock: set wake_in_flight = 1 before the TCB
+                    // writes so a concurrent dealloc(tcb) waits at its gate (#160);
+                    // cleared by enqueue_and_wake. Event payloads can be any u64
+                    // (including 0); `timed_out` is the out-of-band timeout marker,
+                    // read-and-cleared by sys_event_recv on resume. State/etc.
+                    // committed by enqueue_and_wake.
                     unsafe {
+                        (*tcb)
+                            .wake_in_flight
+                            .store(1, core::sync::atomic::Ordering::Release);
                         (*eq_state).waiter = core::ptr::null_mut();
                         (*tcb).wakeup_value = 0;
                         (*tcb).timed_out = true;
@@ -787,8 +856,11 @@ pub fn sleep_check_wakeups()
 
             _ =>
             {
-                // Plain sleep — we are the only waker.
-                // SAFETY: tcb still valid; see above.
+                // Plain sleep — the timer is the only waker (reachable only for
+                // ipc_state None; the IPC-bound states have explicit arms above).
+                // We claimed it under SLEEP_LIST_LOCK at pop (wake_in_flight = 1),
+                // so a concurrent dealloc(tcb) is gated and tcb is still valid.
+                // SAFETY: tcb valid per the wake-in-flight claim at pop.
                 unsafe {
                     (*tcb).sleep_deadline = 0;
                 }
@@ -798,9 +870,16 @@ pub fn sleep_check_wakeups()
 
         if claimed
         {
-            // SAFETY: tcb is valid; transitioned to Ready above.
+            // SAFETY: tcb is kept valid by wake_in_flight = 1 (set at the claim
+            // above — at pop for plain sleep, under the source lock for the IPC
+            // arms, or at block entry for reply/fault), so a concurrent
+            // dealloc(tcb) waits at its gate rather than freeing it.
+            // enqueue_and_wake reads state under sched_lock and either links a
+            // still-Blocked thread or, if dealloc already marked it Exited, aborts
+            // the link — both clear wake_in_flight, releasing that gate.
             let cpu = unsafe { (*tcb).preferred_cpu as usize };
-            // SAFETY: tcb valid, Ready.
+            // SAFETY: tcb valid (wake-in-flight gated); enqueue_and_wake commits
+            // the transition by state.
             unsafe { enqueue_and_wake(tcb, cpu) };
         }
     }
@@ -951,8 +1030,11 @@ pub fn init(cpu_count: u32) -> u32
                     cpu_affinity: cpu as u32,
                     preferred_cpu: cpu as u32,
                     run_queue_next: None,
+                    queued_on: core::sync::atomic::AtomicI16::new(-1),
                     #[cfg(debug_assertions)]
                     last_enqueue: None,
+                    sched_lock: crate::sync::Spinlock::new(),
+                    wake_pending: false,
                     ipc_state: IpcThreadState::None,
                     ipc_msg: crate::ipc::message::Message::default(),
                     reply_tcb: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
@@ -1224,6 +1306,15 @@ pub unsafe fn set_state_under_all_locks(
 {
     let cpu_count = CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
 
+    // Acquire (*tcb).sched_lock FIRST (outermost): the lifecycle Stopped/Exited
+    // write must serialise with schedule()'s dispatch flip and with
+    // enqueue_and_wake/commit on the SAME per-TCB lock (the other half of STEP
+    // 4's data-race fix). Then all CPU locks ascending (the drain + current scan
+    // run under them). Order tcb.sched_lock → CPU locks matches schedule()'s
+    // current.sched_lock → CPU lock, so no ABBA.
+    // SAFETY: tcb validated by caller; lock_raw paired with the release below.
+    let tcb_sched_saved = unsafe { (*tcb).sched_lock.lock_raw() };
+
     // Acquire all scheduler locks in ascending CPU order to prevent ABBA.
     // Each CPU's saved interrupt-flag word is stashed in its own scheduler
     // (written under that lock), so no MAX_CPUS-wide stack scratch is needed.
@@ -1277,7 +1368,7 @@ pub unsafe fn set_state_under_all_locks(
         }
     }
 
-    // Release all locks in descending order.
+    // Release all CPU locks in descending order, then (*tcb).sched_lock last.
     for cpu in (0..cpu_count).rev()
     {
         // SAFETY: lock_raw above paired with this unlock.
@@ -1285,6 +1376,11 @@ pub unsafe fn set_state_under_all_locks(
             let s = scheduler_for(cpu);
             s.lock.unlock_raw(s.saved_lock_flags);
         }
+    }
+    // SAFETY: paired with the lock_raw above; restores the caller's interrupt
+    // state (the CPU-lock releases restored to "already disabled").
+    unsafe {
+        (*tcb).sched_lock.unlock_raw(tcb_sched_saved);
     }
 
     running_on
@@ -1301,10 +1397,23 @@ pub unsafe fn set_state_under_all_locks(
     None
 }
 
-/// Commit `Running|Ready → Blocked` under the current CPU's scheduler.lock.
-/// Returns `false` if a concurrent stop or exit already won; the caller
-/// MUST roll back its source-side waiter registration on `false`.
-/// See docs/scheduling-internals.md § Lock Hierarchy rule 8.
+/// Commit `Running|Ready → Blocked` under the TCB's `sched_lock` (the
+/// authoritative serializer for its Scheduling field group).
+///
+/// Returns `false` in two cases, both handled identically by the caller's
+/// rollback because the post-`schedule()` outcome is state-driven (one path
+/// serves both — see docs/sched-ipc-redesign.md §2.1):
+/// - a concurrent stop/exit already won (`state` is `Stopped`/`Exited`/…); the
+///   thread is then drained by `schedule()`;
+/// - `wake_pending` is set: a waker raced ahead, found this thread still live,
+///   coalesced its link, and recorded the wake under `sched_lock`. Parking now
+///   would lose it, so we REFUSE to park (consume the flag, leave the thread
+///   `Running`); `schedule()` requeues the runnable thread, and on resume the
+///   syscall consumes the payload the waker already deposited.
+///
+/// On `false` the caller MUST roll back its source-side waiter registration and
+/// MUST NOT clobber any deposited `wakeup_value`/`ipc_msg`.
+/// See docs/scheduling-internals.md § Lock Hierarchy.
 ///
 /// # Safety
 /// `tcb` must point to the current CPU's running thread.
@@ -1315,25 +1424,34 @@ pub unsafe fn commit_blocked_under_local_lock(
     blocked_on: *mut u8,
 ) -> bool
 {
-    let cpu = crate::arch::current::cpu::current_cpu() as usize;
-    // SAFETY: cpu is the current CPU; scheduler slab initialised by init().
-    let sched = unsafe { scheduler_for(cpu) };
-    // SAFETY: lock_raw paired with unlock_raw below.
-    let saved = unsafe { sched.lock.lock_raw() };
+    // SAFETY: tcb validated by caller; `sched_lock` is the authoritative
+    // serializer for the Scheduling field group. lock_raw paired below.
+    let saved = unsafe { (*tcb).sched_lock.lock_raw() };
 
     // SAFETY: tcb validated by caller; state field always valid.
-    let cur = unsafe { (*tcb).state };
-    let committed = match cur
+    let committed = match unsafe { (*tcb).state }
     {
         thread::ThreadState::Running | thread::ThreadState::Ready =>
         {
-            // SAFETY: under sched.lock; cross-CPU stop writers are serialised.
+            // SAFETY: wake_pending and the Scheduling fields are read/written
+            // only under sched_lock, which is held here.
             unsafe {
-                (*tcb).state = thread::ThreadState::Blocked;
-                (*tcb).ipc_state = ipc;
-                (*tcb).blocked_on_object = blocked_on;
+                if (*tcb).wake_pending
+                {
+                    // A wake raced ahead and coalesced; refuse to park and
+                    // consume it so the resume path delivers the deposited
+                    // payload (resume model is DEPOSIT — see sched-ipc-redesign.md §2.1).
+                    (*tcb).wake_pending = false;
+                    false
+                }
+                else
+                {
+                    (*tcb).state = thread::ThreadState::Blocked;
+                    (*tcb).ipc_state = ipc;
+                    (*tcb).blocked_on_object = blocked_on;
+                    true
+                }
             }
-            true
         }
         thread::ThreadState::Stopped
         | thread::ThreadState::Exited
@@ -1342,7 +1460,7 @@ pub unsafe fn commit_blocked_under_local_lock(
     };
 
     // SAFETY: paired with lock_raw above.
-    unsafe { sched.lock.unlock_raw(saved) };
+    unsafe { (*tcb).sched_lock.unlock_raw(saved) };
     committed
 }
 
@@ -1350,6 +1468,76 @@ pub unsafe fn commit_blocked_under_local_lock(
 #[cfg(test)]
 #[allow(unused_variables)]
 pub unsafe fn commit_blocked_under_local_lock(
+    _tcb: *mut ThreadControlBlock,
+    _ipc: thread::IpcThreadState,
+    _blocked_on: *mut u8,
+) -> bool
+{
+    true
+}
+
+/// Commit a `BlockedOnSend → BlockedOnReply`/`BlockedOnFault` reply rebind for a
+/// thread that is *already* `Blocked` (dequeued from an endpoint send queue by
+/// [`crate::ipc::endpoint::endpoint_recv`]), under the TCB's `sched_lock`.
+///
+/// `endpoint_call` commits its reply binding through
+/// [`commit_blocked_under_local_lock`]; `endpoint_recv` must use this sibling so
+/// the binding's `(ipc_state, blocked_on_object)` publication is serialised with
+/// `dealloc_object(Thread)`'s `Exited` mark and `SYS_THREAD_STOP` on the shared
+/// per-TCB `sched_lock`.
+/// Without it, a dying caller's dealloc reads a stale `BlockedOnSend` state,
+/// takes the wrong unlink arm, and never clears the server's `reply_tcb` —
+/// leaving a dangling binding that later fires against the freed/reused slot
+/// (#289 use-after-free / double-enqueue; #284 TCB-field corruption).
+///
+/// Returns `true` if the rebind committed (caller still `Blocked`); `false` if a
+/// concurrent stop/exit already won, in which case the caller MUST tear down the
+/// reply binding it published (clear the server's `reply_tcb` and the caller's
+/// `wake_in_flight`) and skip this dead sender.
+///
+/// # Safety
+/// `tcb` must be a valid, send-queue-dequeued `Blocked` TCB; `blocked_on` must be
+/// the replying server's TCB pointer.
+#[cfg(not(test))]
+pub unsafe fn commit_reply_rebind_under_local_lock(
+    tcb: *mut ThreadControlBlock,
+    ipc: thread::IpcThreadState,
+    blocked_on: *mut u8,
+) -> bool
+{
+    // SAFETY: tcb validated by caller; `sched_lock` serializes the Scheduling
+    // field group. lock_raw paired with unlock_raw below.
+    let saved = unsafe { (*tcb).sched_lock.lock_raw() };
+
+    // SAFETY: tcb validated by caller; state field always valid.
+    let committed = match unsafe { (*tcb).state }
+    {
+        thread::ThreadState::Blocked =>
+        {
+            // SAFETY: under sched_lock; cross-CPU stop/dealloc writers serialise
+            // here on this same per-TCB lock.
+            unsafe {
+                (*tcb).ipc_state = ipc;
+                (*tcb).blocked_on_object = blocked_on;
+            }
+            true
+        }
+        thread::ThreadState::Stopped
+        | thread::ThreadState::Exited
+        | thread::ThreadState::Running
+        | thread::ThreadState::Ready
+        | thread::ThreadState::Created => false,
+    };
+
+    // SAFETY: paired with lock_raw above.
+    unsafe { (*tcb).sched_lock.unlock_raw(saved) };
+    committed
+}
+
+/// Test stub.
+#[cfg(test)]
+#[allow(unused_variables)]
+pub unsafe fn commit_reply_rebind_under_local_lock(
     _tcb: *mut ThreadControlBlock,
     _ipc: thread::IpcThreadState,
     _blocked_on: *mut u8,
@@ -1441,69 +1629,72 @@ pub unsafe fn migrate_ready_thread(
     // SAFETY: as above.
     let hi_sched = unsafe { scheduler_for(hi) };
 
-    // SAFETY: lock_raw/unlock_raw paired below in reverse order.
+    // Acquire the per-TCB sched_lock FIRST (outer), then both run-queue locks in
+    // ascending-CPU order (inner). sched_lock is the authoritative serializer for
+    // the Scheduling field group, so reading `state` under it is race-free even
+    // though `tcb` may currently be Running on a third CPU (its dispatch flip
+    // holds the same lock), and writing `preferred_cpu` under it keeps that field
+    // consistent with every other writer. Lock order: source IPC → sched_lock →
+    // per-CPU run-queue (docs/sched-ipc-redesign.md §2).
+    // SAFETY: tcb valid by caller contract; lock_raw paired with unlock below.
+    let tcb_sched_saved = unsafe { (*tcb).sched_lock.lock_raw() };
+    // SAFETY: lock_raw/unlock_raw paired below.
     let saved_lo = unsafe { lo_sched.lock.lock_raw() };
     // SAFETY: lo lock held; acquiring hi second satisfies ascending-CPU order.
     let saved_hi = unsafe { hi_sched.lock.lock_raw() };
 
-    // Re-check under both locks: this is the only legal observation point
-    // for cross-CPU state. The state could have moved to Running, Blocked,
-    // Stopped, or Exited since the unlocked read in the caller.
-    //
-    // The `preferred_cpu == src_cpu` check relies on the invariant that
-    // for a Ready thread, `preferred_cpu` names the CPU whose run queue
-    // currently links it. Every cross-CPU placement site writes
-    // `preferred_cpu = dst_cpu` under the destination's scheduler.lock —
-    // `enqueue_and_wake`, `pull_unpinned_ready`, and this function.
-    // SAFETY: tcb valid by caller contract.
-    let (state, located_cpu, priority) =
-        unsafe { ((*tcb).state, (*tcb).preferred_cpu as usize, (*tcb).priority) };
+    // Authoritative read under sched_lock: only a Ready thread is migratable.
+    // `remove_from_queue(src)` below is the authoritative "located on src" check —
+    // it fails (and we bail) if the thread is Ready on a different CPU's queue or
+    // in the benign Ready-but-unlinked publication window — so no separate
+    // preferred_cpu heuristic is needed.
+    // SAFETY: tcb valid; state/priority read under sched_lock + run-queue locks.
+    let (state, priority) = unsafe { ((*tcb).state, (*tcb).priority) };
 
-    if state != thread::ThreadState::Ready || located_cpu != src_cpu
+    if state != thread::ThreadState::Ready
     {
-        // SAFETY: paired with lock_raw above; release hi first (reverse order).
-        unsafe { hi_sched.lock.unlock_raw(saved_hi) };
-        // SAFETY: paired with lock_raw above.
-        unsafe { lo_sched.lock.unlock_raw(saved_lo) };
+        // SAFETY: paired above; release inner (hi, lo) then outer (sched_lock).
+        unsafe {
+            hi_sched.lock.unlock_raw(saved_hi);
+            lo_sched.lock.unlock_raw(saved_lo);
+            (*tcb).sched_lock.unlock_raw(tcb_sched_saved);
+        }
         return false;
     }
 
-    // SAFETY: src and dst schedulers initialised; tcb is Ready on src; both
+    // SAFETY: src and dst schedulers initialised; tcb is Ready; both run-queue
     // locks held so neither queue's structure can change underneath us.
     let removed = unsafe { scheduler_for(src_cpu).remove_from_queue(tcb, priority) };
     if !removed
     {
-        // Benign Ready-but-unlinked window. The Ready ⇒ linked-on-exactly-
-        // one-queue invariant has a transient exception while a caller has
-        // published `state = Ready` on `tcb` but the matching
-        // `enqueue_and_wake` has not yet acquired the destination scheduler's
-        // lock — most commonly `schedule()`'s cross-CPU outgoing branch
-        // (`sched/mod.rs:1918-1953`), which writes `state = Ready` and
-        // `preferred_cpu` is the stale source CPU until `enqueue_and_wake`
-        // overwrites it under the destination's lock. See
-        // `docs/scheduling-internals.md` § Cross-CPU TCB Ownership
-        // (Ready-priority-change paragraph). The pending `enqueue_and_wake`
-        // will place the tcb shortly; nothing to do on this side.
-        // SAFETY: paired with lock_raw above; release hi first.
-        unsafe { hi_sched.lock.unlock_raw(saved_hi) };
-        // SAFETY: paired with lock_raw above.
-        unsafe { lo_sched.lock.unlock_raw(saved_lo) };
+        // Ready but not linked on src — either the benign Ready-but-unlinked
+        // publication window (a pending enqueue_and_wake will place it), or it is
+        // Ready on a different CPU's queue. Either way nothing to do here; that
+        // CPU's schedule()/enqueue honours the new affinity.
+        // SAFETY: paired above; release inner (hi, lo) then outer (sched_lock).
+        unsafe {
+            hi_sched.lock.unlock_raw(saved_hi);
+            lo_sched.lock.unlock_raw(saved_lo);
+            (*tcb).sched_lock.unlock_raw(tcb_sched_saved);
+        }
         return false;
     }
 
     // SAFETY: dst scheduler initialised; tcb is no longer on src's queue.
     unsafe { scheduler_for(dst_cpu).enqueue(tcb, priority) };
-    // SAFETY: tcb valid; both locks held.
+    // SAFETY: tcb valid; sched_lock + both run-queue locks held.
     unsafe { (*tcb).preferred_cpu = dst_cpu as u32 };
 
     // Publish reschedule-pending before the unlock so the dst CPU's idle
     // loop / schedule() sees it via the Release on unlock.
     set_reschedule_pending_for(dst_cpu);
 
-    // SAFETY: paired with lock_raw above; release hi first (reverse order).
-    unsafe { hi_sched.lock.unlock_raw(saved_hi) };
-    // SAFETY: paired with lock_raw above.
-    unsafe { lo_sched.lock.unlock_raw(saved_lo) };
+    // SAFETY: paired above; release inner (hi, lo) then outer (sched_lock).
+    unsafe {
+        hi_sched.lock.unlock_raw(saved_hi);
+        lo_sched.lock.unlock_raw(saved_lo);
+        (*tcb).sched_lock.unlock_raw(tcb_sched_saved);
+    }
 
     // Always-IPI per the wake-protocol invariant.
     // SAFETY: dst_cpu validated < cpu_count above.
@@ -1687,7 +1878,28 @@ unsafe fn pull_unpinned_ready(src_cpu: usize, dst_cpu: usize)
     let Some((tcb, priority)) = pick
     else
     {
-        // SAFETY: paired with lock_raw above; release hi first.
+        // SAFETY: paired with lock_raw above; release hi first, lo last (lo
+        // captured the caller's interrupt flags).
+        unsafe { hi_sched.lock.unlock_raw(saved_hi) };
+        // SAFETY: paired with lock_raw above.
+        unsafe { lo_sched.lock.unlock_raw(saved_lo) };
+        return;
+    };
+
+    // Acquire the candidate's sched_lock so the Scheduling-field write below
+    // (preferred_cpu) serialises with every other writer (dispatch flip,
+    // enqueue_and_wake, migrate). It is taken AFTER the run-queue locks — the
+    // reverse of the canonical sched_lock→run-queue order — so use try_lock to
+    // stay deadlock-free: a canonical holder (sched_lock then src's run-queue
+    // lock) makes the try fail and we back off. The src run-queue lock is held
+    // throughout, which pins `tcb` (Ready on src; dispatch/migrate/dealloc all
+    // need that lock), so the pointer cannot be freed under us; a failed try just
+    // defers this pull to the next balance tick.
+    // SAFETY: tcb valid (linked on src under the held lock); paired with unlock.
+    let Some(tcb_sched_saved) = (unsafe { (*tcb).sched_lock.try_lock_raw() })
+    else
+    {
+        // SAFETY: paired with lock_raw above; release hi first, lo last.
         unsafe { hi_sched.lock.unlock_raw(saved_hi) };
         // SAFETY: paired with lock_raw above.
         unsafe { lo_sched.lock.unlock_raw(saved_lo) };
@@ -1698,24 +1910,30 @@ unsafe fn pull_unpinned_ready(src_cpu: usize, dst_cpu: usize)
     let removed = unsafe { scheduler_for(src_cpu).remove_from_queue(tcb, priority) };
     if !removed
     {
-        // SAFETY: paired with lock_raw above; release hi first.
-        unsafe { hi_sched.lock.unlock_raw(saved_hi) };
-        // SAFETY: paired with lock_raw above.
-        unsafe { lo_sched.lock.unlock_raw(saved_lo) };
+        // SAFETY: paired above; release the candidate's sched_lock and hi, then
+        // lo last (lo captured the caller's interrupt flags).
+        unsafe {
+            (*tcb).sched_lock.unlock_raw(tcb_sched_saved);
+            hi_sched.lock.unlock_raw(saved_hi);
+            lo_sched.lock.unlock_raw(saved_lo);
+        }
         return;
     }
 
     // SAFETY: tcb is no longer on src; dst_cpu scheduler is valid.
     unsafe { scheduler_for(dst_cpu).enqueue(tcb, priority) };
-    // SAFETY: tcb valid; both locks held.
+    // SAFETY: tcb valid; sched_lock + both run-queue locks held.
     unsafe { (*tcb).preferred_cpu = dst_cpu as u32 };
 
     set_reschedule_pending_for(dst_cpu);
 
-    // SAFETY: paired with lock_raw above; release hi first.
-    unsafe { hi_sched.lock.unlock_raw(saved_hi) };
-    // SAFETY: paired with lock_raw above.
-    unsafe { lo_sched.lock.unlock_raw(saved_lo) };
+    // SAFETY: paired above; release the candidate's sched_lock and hi, then lo
+    // last (lo captured the caller's interrupt flags).
+    unsafe {
+        (*tcb).sched_lock.unlock_raw(tcb_sched_saved);
+        hi_sched.lock.unlock_raw(saved_hi);
+        lo_sched.lock.unlock_raw(saved_lo);
+    }
 
     // SAFETY: dst_cpu validated < cpu_count.
     unsafe { wake_idle_cpu(dst_cpu) };
@@ -1726,19 +1944,31 @@ unsafe fn pull_unpinned_ready(src_cpu: usize, dst_cpu: usize)
 #[allow(unused_variables)]
 unsafe fn pull_unpinned_ready(_src_cpu: usize, _dst_cpu: usize) {}
 
-/// Enqueue a thread on a target CPU's run queue and wake the CPU if idle.
+/// Make a not-live thread `Ready` and link it on `target_cpu`'s run queue,
+/// waking that CPU if idle — the cross-CPU wake primitive (IPC, IRQ, timer).
 ///
-/// This function acquires the target CPU's scheduler lock, enqueues the thread,
-/// releases the lock, and then sends a wakeup IPI if the target CPU is idle.
+/// Acquires the per-TCB `sched_lock` (the authoritative serializer for the
+/// Scheduling field group) FIRST, then classifies `state` under it — the
+/// "enqueue requires not-live" gate that closes the cross-CPU double-link /
+/// double-dispatch class:
+/// - `Running`: the thread is live (mid-park, or a duplicate of a wake it
+///   already consumed). Record `wake_pending` and coalesce — never link a live
+///   thread; its `commit_blocked` sees the flag and refuses to park, delivering
+///   the payload the waker already deposited (see docs/sched-ipc-redesign.md §2.1).
+/// - `Ready`: already linked; coalesce (a Ready coalesce is only ever a
+///   same-event duplicate, so dropping it is lost-wake-safe; do not set
+///   `wake_pending`).
+/// - `Stopped`/`Exited`: a concurrent stop/dealloc won; abort.
+/// - `Blocked`/`Created`: not live — make `Ready` and link under the target
+///   run-queue lock (`sched_lock` outer → run-queue lock inner).
 ///
-/// This is the preferred way to enqueue a thread from cross-CPU contexts (IPC,
-/// IRQ handlers, etc.) as it handles both enqueuing and wakeup atomically.
+/// `target_cpu` is a placement hint (from `select_target_cpu`); exclusivity is
+/// decided by `state` under `sched_lock`, not by the CPU choice. Priority is
+/// read under the run-queue lock so a concurrent `sys_thread_set_priority`
+/// (all-CPU-locks, ascending) serialises against the link.
 ///
-/// The enqueue priority is read from `(*tcb).priority` under the target
-/// scheduler's lock so a concurrent `sys_thread_set_priority` (which takes
-/// every CPU's scheduler.lock in ascending order) is serialised against the
-/// enqueue — the TCB is always linked at whichever priority value is observed
-/// last under lock.
+/// Every exit path clears `wake_in_flight` so a waiting `dealloc_object(Thread)`
+/// can proceed.
 ///
 /// # Safety
 /// - `tcb` must be a valid [`ThreadControlBlock`] pointer
@@ -1761,77 +1991,99 @@ pub unsafe fn enqueue_and_wake(tcb: *mut ThreadControlBlock, target_cpu: usize)
     // a canonical area; the next `#NM` on the destination CPU XRSTORs
     // the correct bytes.
 
-    // SAFETY: caller guarantees tcb is valid and target_cpu is initialized.
-    let sched = unsafe { scheduler_for(target_cpu) };
+    // Acquire the per-TCB sched_lock FIRST: it is the authoritative serializer
+    // for the Scheduling field group, so the live/not-live classification below
+    // is mutually exclusive with the dispatcher's Ready→Running flip and the
+    // parker's Running→Blocked commit (closing roots (a)/(b)/(c)). Lock order:
+    // sched_lock (outer) → per-CPU run-queue lock (inner).
+    // SAFETY: tcb valid; lock_raw paired with an unlock_raw on every path below.
+    let sched_saved = unsafe { (*tcb).sched_lock.lock_raw() };
 
-    // Acquire the scheduler lock.
-    // SAFETY: lock_raw must be paired with unlock_raw below.
-    let saved = unsafe { sched.lock.lock_raw() };
-
-    // Skip the enqueue if a concurrent stop or dealloc has already won
-    // under all-CPU locks; otherwise commit the wake-side transition under
-    // this CPU's sched.lock. See docs/scheduling-internals.md § Lock
-    // Hierarchy rule 9.
-    // SAFETY: tcb valid; lock held.
-    let cur = unsafe { (*tcb).state };
-    if matches!(
-        cur,
-        thread::ThreadState::Stopped | thread::ThreadState::Exited
-    )
+    // SAFETY: state read under sched_lock.
+    let state = unsafe { (*tcb).state };
+    match state
     {
-        // Wake aborted (a concurrent stop/dealloc won). Still clear the
-        // wake-in-flight gate the waker set at pop time so a waiting
-        // `dealloc_object(Thread)` can proceed to free this TCB.
-        // SAFETY: tcb valid; lock held.
-        unsafe {
-            (*tcb)
-                .wake_in_flight
-                .store(0, core::sync::atomic::Ordering::Release);
+        // Live (executing): mid-park or a duplicate of a consumed wake. Record
+        // the wake under sched_lock so commit_blocked refuses to park and the
+        // resume path delivers the already-deposited payload (§2.1); coalesce —
+        // never link a live thread (the dispatcher holds this same lock to mark
+        // it Running).
+        thread::ThreadState::Running =>
+        {
+            // SAFETY: wake_pending / wake_in_flight written under sched_lock.
+            unsafe {
+                (*tcb).wake_pending = true;
+                (*tcb)
+                    .wake_in_flight
+                    .store(0, core::sync::atomic::Ordering::Release);
+                (*tcb).sched_lock.unlock_raw(sched_saved);
+            }
+            return;
         }
-        // SAFETY: paired with lock_raw above.
-        unsafe { sched.lock.unlock_raw(saved) };
-        return;
+        // Not live — make Ready and link below.
+        thread::ThreadState::Blocked | thread::ThreadState::Created =>
+        {}
+        // Already Ready (will be dispatched and consume the deposit; a Ready
+        // coalesce is only a same-event duplicate), or a concurrent stop/dealloc
+        // already won (Stopped/Exited). Either way: do not link. Release the
+        // wake-in-flight gate so a waiting dealloc_object(Thread) can proceed.
+        thread::ThreadState::Ready | thread::ThreadState::Stopped | thread::ThreadState::Exited =>
+        {
+            // SAFETY: wake_in_flight written under sched_lock.
+            unsafe {
+                (*tcb)
+                    .wake_in_flight
+                    .store(0, core::sync::atomic::Ordering::Release);
+                (*tcb).sched_lock.unlock_raw(sched_saved);
+            }
+            return;
+        }
     }
 
-    // SAFETY: tcb valid; lock held. Read priority under the lock so the
-    // enqueue links at whatever value sys_thread_set_priority's all-CPU-locks
-    // region last published.
+    // Link path (state was Blocked|Created). Acquire the target run-queue lock
+    // UNDER sched_lock.
+    // SAFETY: caller guarantees target_cpu is initialized.
+    let sched = unsafe { scheduler_for(target_cpu) };
+    // SAFETY: lock_raw paired with unlock_raw below.
+    let saved = unsafe { sched.lock.lock_raw() };
+
+    // SAFETY: both locks held; tcb valid. Read priority under the run-queue lock
+    // so the enqueue links at whatever value sys_thread_set_priority's all-CPU
+    // region last published. preferred_cpu is updated so dealloc_object targets
+    // the correct scheduler; wake_pending cleared defensively.
     let priority = unsafe {
         (*tcb).state = thread::ThreadState::Ready;
         (*tcb).ipc_state = thread::IpcThreadState::None;
         (*tcb).blocked_on_object = core::ptr::null_mut();
+        (*tcb).wake_pending = false;
+        (*tcb).preferred_cpu = target_cpu as u32;
         (*tcb).priority
     };
 
-    // Enqueue the thread while holding the lock.
-    // SAFETY: lock is held; tcb is valid.
+    // SAFETY: both locks held; tcb is valid.
     sched.enqueue(tcb, priority);
 
-    // Update preferred_cpu under the lock so dealloc_object always
-    // targets the correct scheduler. Without this, preferred_cpu can be stale
-    // if select_target_cpu chose a different CPU than the thread last ran on.
-    // SAFETY: tcb is valid; lock is held.
-    unsafe { (*tcb).preferred_cpu = target_cpu as u32 };
-
-    // Release-ordered: subsequent unlock publishes the enqueue + flag to any
-    // CPU observing the bit. Idle loop sees the flag (or the IPI hits its
-    // halt boundary). See docs/scheduling-internals.md § Wake Protocol.
+    // Release-ordered: the unlock publishes the enqueue + flag to any CPU
+    // observing the bit. See docs/scheduling-internals.md § Wake Protocol.
     set_reschedule_pending_for(target_cpu);
 
-    // Wake committed: the thread is Ready and enqueued under sched.lock. Clear
-    // the wake-in-flight gate so a waiting `dealloc_object(Thread)` may proceed
-    // (it will then observe the thread via the run queue / current and apply
-    // its existing removal + context_saved gate). Release pairs with the
-    // Acquire spin in dealloc.
-    // SAFETY: tcb valid; lock held.
+    // Wake committed: Ready and enqueued. Clear the wake-in-flight gate so a
+    // waiting dealloc_object(Thread) may proceed (it then observes the thread
+    // via the run queue / current and applies its removal + context_saved gate).
+    // SAFETY: tcb valid; locks held.
     unsafe {
         (*tcb)
             .wake_in_flight
             .store(0, core::sync::atomic::Ordering::Release);
     }
 
-    // SAFETY: saved was returned by the matching lock_raw above.
-    unsafe { sched.lock.unlock_raw(saved) };
+    // Release inner (run-queue) then outer (sched_lock). Never IPI under
+    // sched_lock.
+    // SAFETY: each unlock_raw is paired with its lock_raw above.
+    unsafe {
+        sched.lock.unlock_raw(saved);
+        (*tcb).sched_lock.unlock_raw(sched_saved);
+    }
 
     // SAFETY: target_cpu is validated < MAX_CPUS by scheduler_for.
     unsafe { wake_idle_cpu(target_cpu) };
@@ -1841,6 +2093,79 @@ pub unsafe fn enqueue_and_wake(tcb: *mut ThreadControlBlock, target_cpu: usize)
 #[cfg(test)]
 #[allow(unused_variables)]
 pub unsafe fn enqueue_and_wake(_tcb: *mut ThreadControlBlock, _target_cpu: usize) {}
+
+/// Unconditionally make `tcb` `Ready` and link it on `target_cpu`'s run queue,
+/// under the per-TCB `sched_lock` — the DELIBERATE-placement primitive.
+///
+/// Unlike [`enqueue_and_wake`], this does NOT classify `state`: it forces the
+/// `→Ready` transition and links. Use it only when the caller owns the
+/// transition and has established the thread is not live on any CPU — start /
+/// resume (`Created`/`Stopped` → run), the dealloc reply-bound-client wake, and
+/// `schedule()`'s cross-affinity requeue of `current`. Routing those through the
+/// gated `enqueue_and_wake` would be wrong: their thread is already (or becomes)
+/// `Ready`, which the gate coalesces — dropping it from every run queue.
+///
+/// Lock order: `(*tcb).sched_lock` (outer) → target run-queue lock (inner), then
+/// `wake_idle_cpu` after both are released — identical to `enqueue_and_wake`'s
+/// link path. Clears `wake_pending` and `wake_in_flight`.
+///
+/// # Safety
+/// - `tcb` must be a valid [`ThreadControlBlock`] pointer, not live or linked on
+///   any CPU.
+/// - `target_cpu` must be < [`MAX_CPUS`] and initialized by `sched::init`.
+/// - The caller must hold no run-queue lock.
+#[cfg(not(test))]
+pub unsafe fn enqueue_ready_thread(tcb: *mut ThreadControlBlock, target_cpu: usize)
+{
+    // SAFETY: tcb valid; sched_lock (outer) paired with unlock below.
+    let sched_saved = unsafe { (*tcb).sched_lock.lock_raw() };
+    // SAFETY: caller guarantees target_cpu is initialized.
+    let sched = unsafe { scheduler_for(target_cpu) };
+    // SAFETY: run-queue lock (inner) paired with unlock below.
+    let saved = unsafe { sched.lock.lock_raw() };
+
+    // SAFETY: both locks held; tcb valid. Force Ready and read priority under
+    // the run-queue lock (serialises against sys_thread_set_priority's all-CPU
+    // region).
+    let priority = unsafe {
+        (*tcb).state = thread::ThreadState::Ready;
+        (*tcb).ipc_state = thread::IpcThreadState::None;
+        (*tcb).blocked_on_object = core::ptr::null_mut();
+        (*tcb).wake_pending = false;
+        (*tcb).preferred_cpu = target_cpu as u32;
+        (*tcb).priority
+    };
+
+    // SAFETY: both locks held; tcb valid.
+    sched.enqueue(tcb, priority);
+
+    set_reschedule_pending_for(target_cpu);
+
+    // Clear the wake-in-flight gate defensively so a waiting dealloc may proceed
+    // (deliberate placements do not set it, but keep the invariant uniform).
+    // SAFETY: tcb valid; locks held.
+    unsafe {
+        (*tcb)
+            .wake_in_flight
+            .store(0, core::sync::atomic::Ordering::Release);
+    }
+
+    // Release inner (run-queue) then outer (sched_lock); never IPI under
+    // sched_lock.
+    // SAFETY: each unlock_raw is paired with its lock_raw above.
+    unsafe {
+        sched.lock.unlock_raw(saved);
+        (*tcb).sched_lock.unlock_raw(sched_saved);
+    }
+
+    // SAFETY: target_cpu validated < MAX_CPUS by scheduler_for.
+    unsafe { wake_idle_cpu(target_cpu) };
+}
+
+/// Test stub for `enqueue_ready_thread` (no-op in test mode).
+#[cfg(test)]
+#[allow(unused_variables)]
+pub unsafe fn enqueue_ready_thread(_tcb: *mut ThreadControlBlock, _target_cpu: usize) {}
 
 /// Select target CPU for enqueueing a thread based on affinity, soft
 /// affinity (cache warmth), and load.
@@ -2037,15 +2362,58 @@ pub unsafe fn schedule(requeue_current: bool)
     // methods on `sched` while the lock is logically held.
     // SAFETY: lock_raw must be paired with unlock_raw before function return
     // (or before the context switch that may change the stack).
-    let mut saved_flags = unsafe { sched.lock.lock_raw() };
-
+    // Read `current` before any lock: `sched.current` is written only by this
+    // CPU's own dispatch, so a lock-free read here is sound.
     let current = sched.current;
 
-    // Re-enqueue the current thread if the caller requested it (preemption,
-    // yield). Voluntary-block callers pass requeue_current=false because the
-    // thread is already Blocked/Exited and may have been woken and migrated
-    // to another CPU between the IPC lock release and this point.
-    if !current.is_null() && requeue_current
+    // Lock order: `current.sched_lock` (outer) → per-CPU run-queue lock (inner).
+    // The outgoing requeue writes `current.state` (Running→Ready), which
+    // `enqueue_and_wake` / `set_state` read under `sched_lock`; holding current's
+    // `sched_lock` across the requeue serialises those writes with those readers
+    // (no data race). The returned flags carry the caller's true interrupt state
+    // and govern the final `restore_interrupts_from`.
+    // SAFETY: current is valid when non-null; paired with the release below.
+    let cur_sched_saved: Option<u64> = if current.is_null()
+    {
+        None
+    }
+    else
+    {
+        // SAFETY: current is non-null here; lock_raw paired with the release on
+        // every path below (next==current return, or the dispatch path).
+        Some(unsafe { (*current).sched_lock.lock_raw() })
+    };
+
+    // SAFETY: lock_raw paired with unlock_raw / release_lock_only before any
+    // return or the context switch.
+    let mut saved_flags = unsafe { sched.lock.lock_raw() };
+
+    // Decide whether `current` must be (re)placed on a run queue before we pick
+    // the next thread.
+    //
+    // `requeue_current` is the caller's intent: preemption/yield pass `true`;
+    // voluntary-block callers pass `false` because the thread committed `Blocked`
+    // and means to park. But the block is not the whole story: between becoming
+    // wakeable and reaching this `schedule()`, a concurrent waker may have moved
+    // `current` to `Ready` (its wake-before-park window) — and a timer tick may
+    // then have redispatched it to `Running`. In either case `current` is now
+    // runnable and MUST NOT be parked, or its delivered wake is lost. So requeue
+    // when the caller asks OR when `current` is already runnable (`Running` /
+    // `Ready`), and only ever park a `current` that is genuinely still `Blocked`.
+    //
+    // Two guards keep this sound:
+    //   * Never requeue a thread a concurrent path has committed to `Exited`
+    //     (dealloc) or `Stopped` under all-CPU locks — re-marking it `Ready` and
+    //     linking it would leave a dangling run-queue entry over a TCB that
+    //     `retype_free` may reclaim (use-after-free). This stays a denylist; a
+    //     `== Running` allowlist perturbs this hot path's instruction timing
+    //     enough to widen the #116 all-CPUs-idle stall race under TCG SMP
+    //     (measured ~0% → ~12%).
+    //   * Never enqueue a thread a waker has *already* linked
+    //     (`queued_on >= 0`): re-enqueuing double-links it (the `queued_on`
+    //     single-link guard's tripwire — #289). Leave it where the waker placed
+    //     it; the next-thread selection below picks it up.
+    if !current.is_null()
     {
         // SAFETY: current is a valid TCB set by enter() or a previous schedule();
         // state, priority, cpu_affinity fields are always valid.
@@ -2054,20 +2422,16 @@ pub unsafe fn schedule(requeue_current: bool)
                 (*current).magic == thread::TCB_MAGIC,
                 "schedule: current TCB magic corrupt on cpu {cpu}"
             );
-            // Do not re-enqueue a thread that a concurrent path has already
-            // committed to Exited (dealloc) or Stopped under all-CPU scheduler
-            // locks: re-enqueuing would overwrite that state to Ready and leave
-            // a dangling run-queue entry over a TCB that retype_free may reclaim
-            // — a use-after-free. Every other state at a `requeue_current` call
-            // (Running in the common preemption/yield case) is requeue-legitimate.
-            //
-            // This MUST stay a denylist (`!= Exited && != Stopped`). A tighter
-            // `== Running` allowlist is logically equivalent on the audited
-            // callers but perturbs this hot path's instruction timing enough to
-            // widen the #116 all-CPUs-idle stall race dramatically under TCG SMP
-            // (measured ~0% → ~12% across run-parallel sweeps).
             let cur_state = (*current).state;
-            if cur_state != ThreadState::Exited && cur_state != ThreadState::Stopped
+            let runnable = matches!(cur_state, ThreadState::Running | ThreadState::Ready);
+            let already_queued = (*current)
+                .queued_on
+                .load(core::sync::atomic::Ordering::Relaxed)
+                >= 0;
+            if (requeue_current || runnable)
+                && cur_state != ThreadState::Exited
+                && cur_state != ThreadState::Stopped
+                && !already_queued
             {
                 let prio = (*current).priority;
                 debug_assert!(
@@ -2119,13 +2483,33 @@ pub unsafe fn schedule(requeue_current: bool)
                     // (`percpu::preemption_disabled()` in `timer_tick`).
                     crate::percpu::preempt_disable();
                     sched.lock.unlock_raw(saved_flags);
-                    enqueue_and_wake(current, aff as usize);
+                    // `current.sched_lock` is already held (outer); link `current`
+                    // directly on `aff`'s run queue under it + aff's run-queue
+                    // lock. The local lock was dropped first, so ascending-CPU
+                    // order holds. Calling enqueue_ready_thread / enqueue_and_wake
+                    // here would re-acquire current.sched_lock → re-entrant
+                    // deadlock. `current.state` was set Ready above (under
+                    // current.sched_lock); ipc_state/wake_pending are untouched,
+                    // matching the local-requeue arm below.
+                    let aff_sched = scheduler_for(aff as usize);
+                    let aff_saved = aff_sched.lock.lock_raw();
+                    (*current).preferred_cpu = aff;
+                    aff_sched.enqueue(current, prio);
+                    set_reschedule_pending_for(aff as usize);
+                    aff_sched.lock.unlock_raw(aff_saved);
+                    wake_idle_cpu(aff as usize);
                     saved_flags = sched.lock.lock_raw();
                     crate::percpu::preempt_enable();
                 }
                 else
                 {
                     (*current).state = ThreadState::Ready;
+                    // Requeued on THIS CPU: keep preferred_cpu authoritative.
+                    // Leaving it stale lets a preferred_cpu-keyed path (wake
+                    // routing, migrate) dispatch this thread on another CPU while
+                    // it is still linked here — the residual cross-CPU
+                    // double-dispatch (docs/sched-ipc-redesign.md §3).
+                    (*current).preferred_cpu = cpu as u32;
                     sched.enqueue(current, prio);
                 }
             }
@@ -2167,12 +2551,21 @@ pub unsafe fn schedule(requeue_current: bool)
     // If the scheduler selected the same thread, nothing to do.
     if next == current
     {
-        // Re-mark as running, release lock, and return.
+        // Same thread re-selected (no switch). Re-mark Running under
+        // `current.sched_lock` (held); `context_saved` is untouched because no
+        // register save happens.
         if !current.is_null()
         {
-            // SAFETY: current is a valid TCB; state field is always valid.
+            // SAFETY: current is a valid TCB; state written under its sched_lock.
             unsafe {
                 (*current).state = ThreadState::Running;
+                // Still running on THIS CPU: keep preferred_cpu authoritative
+                // (the re-mark, like the local requeue above, must not leave it
+                // stale — docs/sched-ipc-redesign.md §3).
+                (*current).preferred_cpu = cpu as u32;
+                // A running thread carries no pending park-wake (see the
+                // dispatch flip below).
+                (*current).wake_pending = false;
             }
         }
         // Watchdog: count this as a non-idle dispatch so the softlockup
@@ -2183,21 +2576,119 @@ pub unsafe fn schedule(requeue_current: bool)
         {
             watchdog_mark_non_idle(cpu);
         }
-        // SAFETY: saved_flags was returned by the matching lock_raw above.
+        // Release inner (CPU run-queue) then outer (current.sched_lock); the
+        // outer unlock restores the caller's interrupt state.
+        // SAFETY: saved_flags / cur_sched_saved returned by the matching
+        // lock_raw calls above.
         unsafe {
             sched.lock.unlock_raw(saved_flags);
+        }
+        if let Some(s) = cur_sched_saved
+        {
+            // SAFETY: current is non-null when cur_sched_saved is Some.
+            unsafe {
+                (*current).sched_lock.unlock_raw(s);
+            }
         }
         return;
     }
 
-    // Activate next thread.
-    // SAFETY: next is a valid TCB from the run queue or idle; state field is always valid.
-    unsafe {
-        (*next).state = ThreadState::Running;
-        // Record the CPU this thread is running on as its preferred CPU.
-        (*next).preferred_cpu = crate::arch::current::cpu::current_cpu();
+    // We will switch (next != current). Clear `current`'s context_saved BEFORE
+    // releasing the locks: a remote CPU that pulls the just-requeued `current`
+    // must observe cs=0 and spin until switch() republishes its saved state.
+    if !current.is_null()
+    {
+        // SAFETY: current is valid (non-null); context_saved is AtomicU32.
+        unsafe {
+            (*current)
+                .context_saved
+                .store(0, core::sync::atomic::Ordering::Relaxed);
+        }
     }
+
+    // Claim `next` as current under the CPU lock, but DEFER its Running flip: the
+    // Ready→Running write goes under `next.sched_lock` after the CPU lock is
+    // released, so it serialises with enqueue_and_wake / set_state on the same
+    // per-TCB lock (a flip here under the CPU lock would data-race them).
     sched.set_current(next);
+
+    // Capture `current`'s save pointers before dropping the locks.
+    let current_state: *mut crate::arch::current::context::SavedState = if current.is_null()
+    {
+        core::ptr::null_mut()
+    }
+    else
+    {
+        // SAFETY: current is a valid TCB; saved_state field is always valid.
+        unsafe { core::ptr::addr_of_mut!((*current).saved_state) }
+    };
+    let save_flag: *const core::sync::atomic::AtomicU32 = if current.is_null()
+    {
+        core::ptr::null()
+    }
+    else
+    {
+        // SAFETY: current is a valid TCB; context_saved field is always valid.
+        unsafe { core::ptr::addr_of!((*current).context_saved) }
+    };
+
+    // Release inner (CPU run-queue) then outer (current.sched_lock), keeping
+    // interrupts disabled (release_lock_only) until restore after switch().
+    // SAFETY: matched with the lock_raw acquisitions at the top of schedule().
+    unsafe {
+        sched.lock.release_lock_only();
+    }
+    if !current.is_null()
+    {
+        // SAFETY: current non-null ⇒ current.sched_lock was acquired at the top.
+        unsafe {
+            (*current).sched_lock.release_lock_only();
+        }
+    }
+
+    // Incoming dispatch flip — THE exclusivity point. Mark `next` Running under
+    // its `sched_lock` so a concurrent enqueue_and_wake(next) serialises here and
+    // coalesces (it cannot link a thread the dispatcher is committing to run). If
+    // `next` was set_state'd Stopped/Exited between dequeue and here (reachable:
+    // dealloc marks Exited under all-CPU locks before its not-current spin
+    // blocks), it is now off-queue and drained — fall back to idle this cycle
+    // (the next tick re-schedules).
+    if !core::ptr::eq(next, sched.idle)
+    {
+        // SAFETY: next is a valid TCB; sched_lock paired with unlock below.
+        let ns = unsafe { (*next).sched_lock.lock_raw() };
+        // SAFETY: next valid; state read/written under its sched_lock.
+        let dispatchable = unsafe { (*next).state == ThreadState::Ready };
+        if dispatchable
+        {
+            // SAFETY: under next.sched_lock.
+            unsafe {
+                (*next).state = ThreadState::Running;
+                (*next).preferred_cpu = cpu as u32;
+                // A running thread has no outstanding park-wake to honour; clear
+                // wake_pending so a stale flag can never survive into a later,
+                // unrelated commit_blocked (defensive — the `Running` coalesce
+                // that sets it is currently unreachable; see
+                // docs/sched-ipc-redesign.md §2.1).
+                (*next).wake_pending = false;
+            }
+        }
+        // SAFETY: paired with lock_raw above.
+        unsafe { (*next).sched_lock.unlock_raw(ns) };
+        if !dispatchable
+        {
+            // Re-claim idle (set_current needs the CPU lock briefly); IRQs stay
+            // disabled across the relock/release.
+            // SAFETY: lock_raw/release_lock_only paired.
+            unsafe {
+                let relock = sched.lock.lock_raw();
+                sched.set_current(sched.idle);
+                sched.lock.release_lock_only();
+                let _ = relock;
+            }
+            next = sched.idle;
+        }
+    }
 
     // Watchdog: mark this CPU as having dispatched a non-idle thread.
     if !core::ptr::eq(next, sched.idle)
@@ -2346,52 +2837,14 @@ pub unsafe fn schedule(requeue_current: bool)
         }
     }
 
-    // Capture saved-state pointers before releasing the lock.
-    let current_state: *mut crate::arch::current::context::SavedState = if current.is_null()
-    {
-        core::ptr::null_mut()
-    }
-    else
-    {
-        // SAFETY: current is a valid TCB; saved_state field is always valid.
-        unsafe { core::ptr::addr_of_mut!((*current).saved_state) }
-    };
+    // `next` may have been redirected to idle by the dispatch-flip fallback
+    // above, so capture its saved-state pointer here (post-flip). `current_state`
+    // / `save_flag` were captured and the CPU + current.sched_lock released
+    // earlier — the cross-CPU `context_saved` spin and `switch()` below run
+    // lockless (the synchroniser is `context_saved` Acquire/Release, not the
+    // lock; holding it across the spin would re-introduce issue #144's deadlock).
     // SAFETY: next is a valid TCB; saved_state field is always valid.
     let next_state = unsafe { core::ptr::addr_of!((*next).saved_state) };
-
-    // Prepare the context_saved flag for the current thread. Clear it so
-    // a remote CPU that dequeues this thread (after wakeup) spins until
-    // switch() has finished saving the registers.
-    let save_flag: *const core::sync::atomic::AtomicU32 = if current.is_null()
-    {
-        core::ptr::null()
-    }
-    else
-    {
-        // SAFETY: current is a valid TCB; context_saved field is always valid.
-        unsafe { core::ptr::addr_of!((*current).context_saved) }
-    };
-    if !save_flag.is_null()
-    {
-        // SAFETY: save_flag points to a valid AtomicU32 on a live TCB.
-        unsafe { (*save_flag).store(0, core::sync::atomic::Ordering::Relaxed) };
-    }
-
-    // Release the local scheduler lock before the cross-CPU publication-barrier
-    // spin and before `switch()` (both arches). The lock is not the synchroniser
-    // for `next.saved_state` — `context_saved` Acquire/Release is. Holding the
-    // lock across the spin re-introduces issue #144's cross-CPU deadlock: CPU A
-    // spinning on `next.context_saved` under A.lock while CPU B is blocked
-    // acquiring A.lock to deliver the cross-CPU enqueue that lets B reach
-    // `switch()` and publish. `release_lock_only` advances the ticket without
-    // restoring interrupts; `restore_interrupts_from(saved_flags)` runs after
-    // `switch()` returns. See `docs/scheduling-internals.md` § `context_saved`
-    // protocol.
-    // SAFETY: matched with the `lock_raw` at the top of `schedule()`;
-    // interrupts remain disabled until `restore_interrupts_from` below.
-    unsafe {
-        sched.lock.release_lock_only();
-    }
 
     // Wait for the next thread's SavedState to be fully committed by its
     // previous CPU's switch(). On RISC-V RVWMO, without this Acquire the
@@ -2437,15 +2890,16 @@ pub unsafe fn schedule(requeue_current: bool)
         }
     }
 
-    // Now on the new thread's stack. Restore the interrupt state that was
-    // saved when this thread last called lock_raw in its own schedule().
-    // For the very first switch (from boot/idle), saved_flags is 0 (interrupts
-    // were disabled during boot), which is correct.
-    // SAFETY: saved_flags was returned by the matching lock_raw above (and
-    // was saved/restored across the context switch via the callee-saved
-    // register convention).
+    // Now on the new thread's stack. Restore the caller's interrupt state. With
+    // `current.sched_lock` as the outermost lock, ITS saved flags
+    // (`cur_sched_saved`) carry the caller's true state; `saved_flags` (the inner
+    // CPU lock) is "already disabled" when current was non-null. Fall back to
+    // `saved_flags` only when current was null (first switch from boot/idle:
+    // flags 0 = interrupts disabled, which is correct). Both locals survive the
+    // switch via the callee-saved register / stack convention.
+    // SAFETY: flags were returned by the matching lock_raw calls at the top.
     unsafe {
-        crate::sync::restore_interrupts_from(saved_flags);
+        crate::sync::restore_interrupts_from(cur_sched_saved.unwrap_or(saved_flags));
     }
 }
 
@@ -2472,7 +2926,6 @@ pub unsafe fn post_death_notification(tcb: *mut thread::ThreadControlBlock, exit
     }
 
     let exit_bits = exit_reason & 0xFFFF_FFFF;
-    let cpu = crate::arch::current::cpu::current_cpu() as usize;
 
     for i in 0..count
     {
@@ -2491,9 +2944,18 @@ pub unsafe fn post_death_notification(tcb: *mut thread::ThreadControlBlock, exit
         let result = unsafe { crate::ipc::event_queue::event_queue_post(observer.eq, payload) };
         if let Ok(Some(woken_tcb)) = result
         {
-            // SAFETY: cpu is valid; woken_tcb is valid and Ready.
+            // Route through `select_target_cpu` like every other waker so the
+            // save-window pin holds: an observer woken while still mid-block has
+            // `context_saved == 0`, and the pin keeps it on its own saving CPU.
+            // Enqueuing on the dying thread's CPU instead would land the wake on
+            // a different CPU, whose `schedule()` then spins cross-CPU on the
+            // observer's in-flight register save — and if the observer is itself
+            // mid-block on its CPU, that save never publishes, deadlocking both
+            // CPUs (the observer ends up `current` on two CPUs). See #289.
+            // SAFETY: woken_tcb is a valid Ready TCB; select_target_cpu is lock-free.
             unsafe {
-                enqueue_and_wake(woken_tcb, cpu);
+                let target_cpu = select_target_cpu(woken_tcb);
+                enqueue_and_wake(woken_tcb, target_cpu);
             }
         }
     }
@@ -2538,7 +3000,6 @@ pub unsafe fn post_aspace_death_notification(
     }
 
     let exit_bits = exit_reason & 0xFFFF_FFFF;
-    let cpu = crate::arch::current::cpu::current_cpu() as usize;
 
     for observer in &observers[..count]
     {
@@ -2553,9 +3014,12 @@ pub unsafe fn post_aspace_death_notification(
         let result = unsafe { crate::ipc::event_queue::event_queue_post(observer.eq, payload) };
         if let Ok(Some(woken_tcb)) = result
         {
-            // SAFETY: cpu is valid; woken_tcb is valid and Ready.
+            // Route through `select_target_cpu` so the save-window pin holds —
+            // see `post_death_notification` for the full rationale (#289).
+            // SAFETY: woken_tcb is a valid Ready TCB; select_target_cpu is lock-free.
             unsafe {
-                enqueue_and_wake(woken_tcb, cpu);
+                let target_cpu = select_target_cpu(woken_tcb);
+                enqueue_and_wake(woken_tcb, target_cpu);
             }
         }
     }

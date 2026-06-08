@@ -39,19 +39,20 @@ extern crate rustc_std_workspace_core as core;
 use core::prelude::rust_2024::*;
 
 use syscall_abi::{
-    MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX, SYS_ASPACE_BIND_NOTIFICATION, SYS_ASPACE_QUERY,
-    SYS_CAP_COPY, SYS_CAP_CREATE_ASPACE, SYS_CAP_CREATE_CSPACE, SYS_CAP_CREATE_ENDPOINT,
-    SYS_CAP_CREATE_EVENT_Q, SYS_CAP_CREATE_NOTIFICATION, SYS_CAP_CREATE_THREAD,
-    SYS_CAP_CREATE_WAIT_SET, SYS_CAP_DELETE, SYS_CAP_DERIVE, SYS_CAP_DERIVE_BADGE, SYS_CAP_INFO,
-    SYS_CAP_MOVE, SYS_CAP_REVOKE, SYS_EVENT_POST, SYS_EVENT_RECV, SYS_IOPORT_BIND,
-    SYS_IOPORT_SPLIT, SYS_IPC_BUFFER_SET, SYS_IPC_CALL, SYS_IPC_RECV, SYS_IPC_REPLY, SYS_IRQ_ACK,
-    SYS_IRQ_REGISTER, SYS_IRQ_SPLIT, SYS_MEM_MAP, SYS_MEM_PROTECT, SYS_MEM_UNMAP, SYS_MEMORY_MERGE,
-    SYS_MEMORY_SPLIT, SYS_MMIO_MAP, SYS_MMIO_SPLIT, SYS_NOTIFICATION_SEND, SYS_NOTIFICATION_WAIT,
-    SYS_PROCESS_EXIT, SYS_SBI_CALL, SYS_SCHED_SPLIT, SYS_SYSTEM_INFO, SYS_THREAD_BIND_NOTIFICATION,
-    SYS_THREAD_CONFIGURE, SYS_THREAD_EXIT, SYS_THREAD_READ_REGS, SYS_THREAD_SET_AFFINITY,
-    SYS_THREAD_SET_FAULT_HANDLER, SYS_THREAD_SET_PRIORITY, SYS_THREAD_SLEEP, SYS_THREAD_START,
-    SYS_THREAD_STOP, SYS_THREAD_WRITE_REGS, SYS_THREAD_YIELD, SYS_WAIT_SET_ADD,
-    SYS_WAIT_SET_REMOVE, SYS_WAIT_SET_WAIT,
+    MEM_UNMAP_RECLAIM_PTS, MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX, SYS_ASPACE_BIND_NOTIFICATION,
+    SYS_ASPACE_QUERY, SYS_CAP_COPY, SYS_CAP_CREATE_ASPACE, SYS_CAP_CREATE_CSPACE,
+    SYS_CAP_CREATE_ENDPOINT, SYS_CAP_CREATE_EVENT_Q, SYS_CAP_CREATE_NOTIFICATION,
+    SYS_CAP_CREATE_THREAD, SYS_CAP_CREATE_WAIT_SET, SYS_CAP_DELETE, SYS_CAP_DERIVE,
+    SYS_CAP_DERIVE_BADGE, SYS_CAP_INFO, SYS_CAP_MOVE, SYS_CAP_REVOKE, SYS_EVENT_POST,
+    SYS_EVENT_RECV, SYS_IOPORT_BIND, SYS_IOPORT_SPLIT, SYS_IPC_BUFFER_SET, SYS_IPC_CALL,
+    SYS_IPC_RECV, SYS_IPC_REPLY, SYS_IRQ_ACK, SYS_IRQ_REGISTER, SYS_IRQ_SPLIT, SYS_MEM_MAP,
+    SYS_MEM_PROTECT, SYS_MEM_UNMAP, SYS_MEMORY_MERGE, SYS_MEMORY_SPLIT, SYS_MMIO_MAP,
+    SYS_MMIO_SPLIT, SYS_NOTIFICATION_SEND, SYS_NOTIFICATION_WAIT, SYS_PROCESS_EXIT, SYS_SBI_CALL,
+    SYS_SCHED_SPLIT, SYS_SYSTEM_INFO, SYS_THREAD_BIND_NOTIFICATION, SYS_THREAD_CONFIGURE,
+    SYS_THREAD_EXIT, SYS_THREAD_READ_REGS, SYS_THREAD_SET_AFFINITY, SYS_THREAD_SET_FAULT_HANDLER,
+    SYS_THREAD_SET_PRIORITY, SYS_THREAD_SLEEP, SYS_THREAD_START, SYS_THREAD_STOP,
+    SYS_THREAD_WRITE_REGS, SYS_THREAD_YIELD, SYS_WAIT_SET_ADD, SYS_WAIT_SET_REMOVE,
+    SYS_WAIT_SET_WAIT,
 };
 
 pub use syscall_abi::{
@@ -978,6 +979,10 @@ pub fn mem_map(
 
 /// Remove `page_count` mappings starting at `virt` from `aspace_cap`.
 ///
+/// Clears leaf PTEs only; intermediate page tables persist until the address
+/// space is destroyed. To also reclaim now-empty intermediate tables to the
+/// page-table growth pool, use [`mem_unmap_reclaim`].
+///
 /// Unmapping a page that is not mapped is a no-op (not an error).
 /// `virt` must be page-aligned and in the user address range.
 ///
@@ -987,9 +992,38 @@ pub fn mem_map(
 #[inline]
 pub fn mem_unmap(aspace_cap: u32, virt: u64, page_count: u64) -> Result<(), i64>
 {
-    // SAFETY: syscall3 issues raw syscall instruction; all arguments are scalar u64 values
-    // (cap index, virtual address, page count); kernel validates cap and unmaps pages.
-    let ret = unsafe { syscall3(SYS_MEM_UNMAP, u64::from(aspace_cap), virt, page_count) };
+    // SAFETY: syscall4 issues raw syscall instruction; all arguments are scalar u64 values
+    // (cap index, virtual address, page count, flags=0); kernel validates cap and unmaps pages.
+    // arg3 is passed explicitly so it is never an uninitialised register (the flag path keys on it).
+    let ret = unsafe { syscall4(SYS_MEM_UNMAP, u64::from(aspace_cap), virt, page_count, 0) };
+    if ret < 0 { Err(ret) } else { Ok(()) }
+}
+
+/// Like [`mem_unmap`], but additionally reclaims every intermediate page table
+/// the cleared span leaves empty back to `aspace_cap`'s page-table growth pool
+/// (crediting `pt_growth_budget_bytes`), with a single coarse TLB +
+/// paging-structure-cache shootdown for the whole teardown.
+///
+/// Intended for region teardown (memmgr `UNREGISTER_REGION`): pass the whole
+/// region span in one call so a wholly-covered intermediate table is reclaimed.
+///
+/// # Errors
+/// Returns a negative `i64` error code if the cap is invalid or `virt` is
+/// not page-aligned.
+#[inline]
+pub fn mem_unmap_reclaim(aspace_cap: u32, virt: u64, page_count: u64) -> Result<(), i64>
+{
+    // SAFETY: syscall4 issues raw syscall instruction; all arguments are scalar u64 values
+    // (cap index, virtual address, page count, reclaim flag); kernel validates cap and unmaps pages.
+    let ret = unsafe {
+        syscall4(
+            SYS_MEM_UNMAP,
+            u64::from(aspace_cap),
+            virt,
+            page_count,
+            MEM_UNMAP_RECLAIM_PTS,
+        )
+    };
     if ret < 0 { Err(ret) } else { Ok(()) }
 }
 

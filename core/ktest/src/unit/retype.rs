@@ -31,7 +31,7 @@
 
 use syscall::{
     cap_copy, cap_create_aspace, cap_create_cspace, cap_create_endpoint, cap_delete, cap_info,
-    mem_map, mem_unmap,
+    mem_map, mem_unmap, mem_unmap_reclaim,
 };
 use syscall_abi::{
     CAP_INFO_ASPACE_PT_BUDGET, CAP_INFO_CSPACE_BUDGET, CAP_INFO_CSPACE_USED, MAP_WRITABLE,
@@ -177,6 +177,132 @@ pub fn deep_pt_walk_consumes_pool(ctx: &TestContext) -> TestResult
     }
 
     cap_delete(aspace).ok();
+    Ok(())
+}
+
+/// `mem_unmap_reclaim` (the `MEM_UNMAP_RECLAIM_PTS` path) returns the
+/// intermediate page tables a freed span empties back to the per-AS pool,
+/// crediting `pt_growth_budget_bytes`. A fresh single-page mapping at a clean
+/// VA allocates three intermediate tables (PDPT+PD+PT on x86-64, L2+L1+L0 on
+/// Sv48); tearing the region down reclaims all three (the budget round-trips to
+/// its pre-map value), and the same VA then remaps from the returned pool pages.
+pub fn region_unmap_reclaims_pt_budget(ctx: &TestContext) -> TestResult
+{
+    let memory = ctx.memory_base;
+
+    // Slab: page 0 = wrapper, page 1 = root PT, pages 2..8 = 6 pool pages —
+    // ample for the 3 intermediate PTs a single fresh mapping needs.
+    let aspace = cap_create_aspace(memory, 0, 8)
+        .map_err(|_| "retype::region_reclaim: cap_create_aspace failed")?;
+
+    let budget0 = cap_info(aspace, CAP_INFO_ASPACE_PT_BUDGET)
+        .map_err(|_| "retype::region_reclaim: cap_info(budget0) failed")?;
+
+    // Map one page at a fresh 2 MiB-aligned VA: allocates the full intermediate
+    // chain (3 pages) from the pool.
+    if mem_map(memory, aspace, TEST_VA_BASE, 0, 1, MAP_WRITABLE).is_err()
+    {
+        cap_delete(aspace).ok();
+        return Err("retype::region_reclaim: initial mem_map failed");
+    }
+    let budget1 = cap_info(aspace, CAP_INFO_ASPACE_PT_BUDGET)
+        .map_err(|_| "retype::region_reclaim: cap_info(budget1) failed")?;
+    if budget1 >= budget0
+    {
+        cap_delete(aspace).ok();
+        return Err("retype::region_reclaim: mapping did not consume PT budget");
+    }
+
+    // Reclaiming unmap: clears the leaf, empties PT→PD→PDPT, returns all three
+    // to the pool and credits the budget.
+    if mem_unmap_reclaim(aspace, TEST_VA_BASE, 1).is_err()
+    {
+        cap_delete(aspace).ok();
+        return Err("retype::region_reclaim: mem_unmap_reclaim failed");
+    }
+    let budget2 = cap_info(aspace, CAP_INFO_ASPACE_PT_BUDGET)
+        .map_err(|_| "retype::region_reclaim: cap_info(budget2) failed")?;
+    if budget2 <= budget1
+    {
+        cap_delete(aspace).ok();
+        return Err("retype::region_reclaim: unmap did not credit PT budget");
+    }
+    if budget2 != budget0
+    {
+        cap_delete(aspace).ok();
+        return Err("retype::region_reclaim: reclaimed budget != pre-map budget");
+    }
+
+    // The returned pages are reusable: remap the same VA (re-allocates the
+    // chain from the pool), then tear it down again.
+    if mem_map(memory, aspace, TEST_VA_BASE, 0, 1, MAP_WRITABLE).is_err()
+    {
+        cap_delete(aspace).ok();
+        return Err("retype::region_reclaim: remap after reclaim failed");
+    }
+    mem_unmap_reclaim(aspace, TEST_VA_BASE, 1).ok();
+
+    cap_delete(aspace).ok();
+    Ok(())
+}
+
+/// A burst of concurrent distinct-VA regions holds peak PT-pool RAM while all
+/// are mapped; reclaiming-unmap of each returns its intermediate tables, so the
+/// budget recovers to its pre-burst value instead of staying depressed until
+/// address-space death. This is the #273 peak-concurrency retention case: the
+/// 1 GiB stride gives every region its own PD+PT under a shared PDPT, and the
+/// final unmap empties and frees the PDPT too — a full round-trip to baseline.
+pub fn concurrent_regions_release_pt_budget_on_unmap(ctx: &TestContext) -> TestResult
+{
+    const N: u64 = 6;
+    const STRIDE: u64 = 0x4000_0000; // 1 GiB — distinct PDPT slot per region.
+
+    let memory = ctx.memory_base;
+
+    // Generous pool: 1 PDPT + N*(PD+PT) intermediate pages plus slack.
+    let aspace = cap_create_aspace(memory, 0, 64)
+        .map_err(|_| "retype::concurrent_regions: cap_create_aspace failed")?;
+
+    let baseline = cap_info(aspace, CAP_INFO_ASPACE_PT_BUDGET)
+        .map_err(|_| "retype::concurrent_regions: cap_info(baseline) failed")?;
+
+    // Map the whole burst (peak concurrency): budget drops as PTs allocate.
+    for i in 0..N
+    {
+        let va = TEST_VA_BASE + i * STRIDE;
+        if mem_map(memory, aspace, va, 0, 1, MAP_WRITABLE).is_err()
+        {
+            cap_delete(aspace).ok();
+            return Err("retype::concurrent_regions: mem_map failed");
+        }
+    }
+    let peak = cap_info(aspace, CAP_INFO_ASPACE_PT_BUDGET)
+        .map_err(|_| "retype::concurrent_regions: cap_info(peak) failed")?;
+    if peak >= baseline
+    {
+        cap_delete(aspace).ok();
+        return Err("retype::concurrent_regions: burst did not consume PT budget");
+    }
+
+    // Reclaiming-unmap each region; the budget must climb back to baseline.
+    for i in 0..N
+    {
+        let va = TEST_VA_BASE + i * STRIDE;
+        if mem_unmap_reclaim(aspace, va, 1).is_err()
+        {
+            cap_delete(aspace).ok();
+            return Err("retype::concurrent_regions: mem_unmap_reclaim failed");
+        }
+    }
+    let after = cap_info(aspace, CAP_INFO_ASPACE_PT_BUDGET)
+        .map_err(|_| "retype::concurrent_regions: cap_info(after) failed")?;
+
+    cap_delete(aspace).ok();
+
+    if after != baseline
+    {
+        return Err("retype::concurrent_regions: PT budget not fully released on unmap");
+    }
     Ok(())
 }
 

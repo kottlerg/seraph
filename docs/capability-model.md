@@ -447,6 +447,14 @@ the budget returns `NoMemory`; the budget refills via *augment mode* on
 the same create syscall (passing the existing AS/CS slot as the augment
 target merges a new slab of pages into its growth budget).
 
+An `AddressSpace`'s intermediate page tables are also returned to its
+growth budget mid-life when a region is torn down: `SYS_MEM_UNMAP` with
+`MEM_UNMAP_RECLAIM_PTS` (issued by memmgr at `UNREGISTER_REGION`) clears
+the span's leaf entries and frees each now-empty intermediate page table
+back to the pool, crediting the budget. Without the flag, intermediate
+page tables persist until the `AddressSpace` is destroyed. The credited
+budget is observable via `SYS_CAP_INFO`.
+
 This means every kernel-half page-table and slot-page allocation is
 gated by a Memory cap the owning process holds. There is no untracked
 kernel growth path.

@@ -357,12 +357,16 @@ mid-life — e.g. ruststd freeing a joined thread's guarded stack.
 | data[0] | `va_base` (must equal the registered base) |
 | data[1] | `len_bytes` (must equal the registered length) |
 
-memmgr finds the exact-match region, unmaps each backing frame from the
-caller's delegated `AddressSpace`, returns the frame to the free pool, and
-frees the region. Frames the caller mapped itself (e.g. `REQUEST_MEMORY_CAPS`
-grants) are never unmapped — only frames memmgr backed on fault inside the
-region. The frames return to the pool as on `PROCESS_DIED`, so the
-all-RAM-accounted identity is unaffected.
+memmgr finds the exact-match region and tears the whole span down in one
+`mem_unmap_reclaim` call against the caller's delegated `AddressSpace`: the
+kernel clears the span's leaf PTEs and returns the now-empty intermediate page
+tables to that address space's PT growth budget (observable via
+`CAP_INFO_ASPACE_PT_BUDGET`) under a single coarse TLB shootdown. memmgr then
+returns each backing frame to the free pool and frees the region. The region
+occupies its own VA surface, so the span unmap touches only frames memmgr
+backed on fault; frames the caller mapped itself (e.g. `REQUEST_MEMORY_CAPS`
+grants) live on a disjoint surface and are untouched. The frames return to the
+pool as on `PROCESS_DIED`, so the all-RAM-accounted identity is unaffected.
 
 **Reply (success):** `label` 0.
 

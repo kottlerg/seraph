@@ -502,11 +502,13 @@ impl ProcessRecord
         None
     }
 
-    /// Unmap and reclaim every memmgr-mapped frame whose page base lies in
-    /// `[base, end)`: unmap from `aspace_cap`, return the cap to the pool, free
-    /// the node. Used by `UNREGISTER_REGION` on a live process. Frames the
-    /// caller mapped ([`FRAME_VA_UNMAPPED`]) are left untouched.
-    fn reclaim_frames_in(&mut self, base: u64, end: u64, aspace_cap: u32, pool: &mut FreePool)
+    /// Return to the pool every memmgr-mapped frame whose page base lies in
+    /// `[base, end)`, freeing its tracking node. Used by `UNREGISTER_REGION`:
+    /// the caller has already cleared the span's leaf PTEs and reclaimed the
+    /// intermediate page tables via `mem_unmap_reclaim`, so this only re-pools
+    /// the backing frames. Frames the caller mapped ([`FRAME_VA_UNMAPPED`]) are
+    /// left untouched.
+    fn return_frames_in(&mut self, base: u64, end: u64, pool: &mut FreePool)
     {
         let mut prev = NODE_NULL;
         let mut cur = self.frame_head;
@@ -525,7 +527,6 @@ impl ProcessRecord
                 && va >= base
                 && va < end
             {
-                let _ = syscall::mem_unmap(aspace_cap, va, u64::from(page_count));
                 let _ = pool.push_or_coalesce(FreeRun {
                     cap_slot,
                     page_count,
@@ -1491,7 +1492,12 @@ fn handle_unregister_region(req: &IpcMessage, ipc_buf: *mut u64)
     };
     let end = region.va_base.saturating_add(region.len);
     let aspace_cap = record.aspace_cap;
-    record.reclaim_frames_in(region.va_base, end, aspace_cap, pool);
+    // Tear down the whole region span in the child AS in one call: clear every
+    // leaf PTE and reclaim the now-empty intermediate page tables to the child's
+    // PT growth pool (one coarse shootdown). Done before re-pooling the backing
+    // frames so no frame is re-handed to a future fault before its PTE clears.
+    let _ = syscall::mem_unmap_reclaim(aspace_cap, region.va_base, region.len / PAGE_SIZE);
+    record.return_frames_in(region.va_base, end, pool);
     // Restore contiguity across the reclaimed runs. The per-frame
     // `push_or_coalesce` only fires `coalesce` under slot pressure, so a churn
     // working set that never fills the array would otherwise leave the pool more

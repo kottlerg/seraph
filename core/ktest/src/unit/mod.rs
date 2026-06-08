@@ -162,6 +162,14 @@ pub fn run_all(ctx: &TestContext)
         retype::deep_pt_walk_consumes_pool(ctx)
     );
     run_test!(
+        "retype::region_unmap_reclaims_pt_budget",
+        retype::region_unmap_reclaims_pt_budget(ctx)
+    );
+    run_test!(
+        "retype::concurrent_regions_release_pt_budget_on_unmap",
+        retype::concurrent_regions_release_pt_budget_on_unmap(ctx)
+    );
+    run_test!(
         "retype::cspace_grow_consumes_pool",
         retype::cspace_grow_consumes_pool(ctx)
     );

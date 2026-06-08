@@ -7,7 +7,11 @@
 //!
 //! Exercises the TLB shootdown protocol by creating threads pinned to different
 //! CPUs and performing map/unmap operations that trigger inter-processor
-//! interrupts (IPIs) for TLB invalidation.
+//! interrupts (IPIs) for TLB invalidation. A second phase repeats the cycles
+//! with `mem_unmap_reclaim` (the `MEM_UNMAP_RECLAIM_PTS` path), which frees the
+//! now-empty intermediate page table back to the AS pool and issues one coarse
+//! full-flush shootdown *while holding `pt_lock`* — a distinct path from the
+//! per-VA shootdown above.
 //!
 //! ktest threads run in user mode, so a stale-TLB access the shootdown failed
 //! to flush would surface as a page fault. The kernel retries only faults the
@@ -16,16 +20,19 @@
 //! `integration::fault_kills_thread`). This test does not construct such a
 //! window — it verifies that:
 //!
-//! 1. Repeated map/unmap cycles across CPUs complete without deadlock
-//! 2. Threads on different CPUs can safely access newly mapped memory
-//! 3. The shootdown protocol doesn't panic or corrupt kernel state
+//! 1. Repeated map/unmap cycles across CPUs complete without deadlock — for
+//!    both the per-VA and the coarse pool-reclaiming shootdown paths.
+//! 2. Threads on different CPUs read back the sentinel from newly mapped
+//!    memory, including after a same-VA remap whose intermediate page table was
+//!    reclaimed and re-allocated from the pool.
+//! 3. The shootdown protocol doesn't panic or corrupt kernel state.
 //!
 //! This validates Phase E.4's TLB shootdown IPI mechanism indirectly by
 //! confirming the protocol operates correctly under concurrent access.
 
 use syscall::{
-    cap_copy, cap_create_notification, cap_delete, mem_map, mem_unmap, notification_send,
-    notification_wait, system_info, thread_exit,
+    cap_copy, cap_create_notification, cap_delete, mem_map, mem_unmap, mem_unmap_reclaim,
+    notification_send, notification_wait, system_info, thread_exit,
 };
 use syscall_abi::SystemInfoType;
 
@@ -34,6 +41,9 @@ use crate::{ChildStack, TestContext, TestResult};
 const TEST_VA: u64 = 0x5000_0000; // 1.25 GiB — distinct from other integration tests.
 const RIGHTS_NOTIFY_WAIT: u64 = (1 << 7) | (1 << 8);
 const CYCLES: usize = 100;
+/// Value the parent writes into the mapped frame each cycle; the child reads it
+/// back to confirm the translation resolves to the right frame.
+const SENTINEL: u64 = 0xA5A5_5A5A_DEAD_BEEF;
 
 static mut CHILD_STACK: ChildStack = ChildStack::ZERO;
 
@@ -96,49 +106,74 @@ pub fn run(ctx: &TestContext) -> TestResult
         return Err("integration::tlb_coherency: child sent wrong readiness bits");
     }
 
-    // ── 4. Perform multiple map/unmap cycles to exercise TLB shootdown. ──────
+    // ── 4. Map/access/unmap cycles to exercise TLB shootdown. ────────────────
     //
     // Each cycle:
-    //   a. Map page at TEST_VA
-    //   b. Notification child on p2c that page is mapped (0x2)
-    //   c. Wait for child to confirm access on c2p (0x4)
-    //   d. Unmap page (triggers TLB shootdown IPI to CPU 1)
+    //   a. Map page at TEST_VA and write SENTINEL into it.
+    //   b. Notify child on p2c that the page is mapped (0x2).
+    //   c. Wait for child to confirm it read SENTINEL back on c2p (0x4); a
+    //      stale translation resolving to the wrong frame acks 0x10.
+    //   d. Unmap the page (triggers a TLB shootdown IPI to CPU 1).
     //
-    // If TLB shootdown is broken, the kernel would panic or deadlock.
-
-    for cycle in 0..CYCLES
+    // Phase 0 uses per-page `mem_unmap` (single-VA shootdown). Phase 1 uses
+    // `mem_unmap_reclaim` (the MEM_UNMAP_RECLAIM_PTS path): it frees the
+    // now-empty intermediate page table back to the AS pool and issues one
+    // coarse full-flush shootdown *while holding pt_lock*. The next cycle
+    // remaps the same VA, re-allocating an intermediate table (often the same
+    // frame) from the pool. A broken shootdown would panic, deadlock, fault the
+    // child, or read the wrong frame.
+    for phase in 0..2u32
     {
-        // Map the page.
-        mem_map(
-            memory_cap,
-            ctx.aspace_cap,
-            TEST_VA,
-            0,
-            1,
-            syscall::MAP_WRITABLE,
-        )
-        .map_err(|_| "integration::tlb_coherency: mem_map failed")?;
-
-        // Notification child on p2c: page is mapped, you may access it.
-        notification_send(p2c, 0x2)
-            .map_err(|_| "integration::tlb_coherency: notification_send (map) failed")?;
-
-        // Wait for child to confirm access on c2p.
-        let ack = notification_wait(c2p)
-            .map_err(|_| "integration::tlb_coherency: notification_wait (ack) failed")?;
-        if ack != 0x4
+        let reclaim = phase == 1;
+        for cycle in 0..CYCLES
         {
-            return Err("integration::tlb_coherency: child sent wrong ack bits");
-        }
+            mem_map(
+                memory_cap,
+                ctx.aspace_cap,
+                TEST_VA,
+                0,
+                1,
+                syscall::MAP_WRITABLE,
+            )
+            .map_err(|_| "integration::tlb_coherency: mem_map failed")?;
 
-        // Unmap the page. This triggers TLB shootdown IPI to CPU 1.
-        mem_unmap(ctx.aspace_cap, TEST_VA, 1)
-            .map_err(|_| "integration::tlb_coherency: mem_unmap failed")?;
+            // Stamp the freshly mapped frame so the child can validate the
+            // translation by value.
+            // SAFETY: TEST_VA is mapped writable on this CPU by the map above.
+            unsafe { (TEST_VA as *mut u64).write_volatile(SENTINEL) };
 
-        // Log progress every 5 cycles.
-        if cycle % 5 == 0
-        {
-            crate::log_u64("ktest: integration::tlb_coherency: cycle ", cycle as u64);
+            notification_send(p2c, 0x2)
+                .map_err(|_| "integration::tlb_coherency: notification_send (map) failed")?;
+
+            let ack = notification_wait(c2p)
+                .map_err(|_| "integration::tlb_coherency: notification_wait (ack) failed")?;
+            if ack == 0x10
+            {
+                return Err(
+                    "integration::tlb_coherency: child read wrong frame (stale translation)",
+                );
+            }
+            if ack != 0x4
+            {
+                return Err("integration::tlb_coherency: child sent wrong ack bits");
+            }
+
+            // Unmap. Phase 1 also reclaims the now-empty intermediate PT.
+            if reclaim
+            {
+                mem_unmap_reclaim(ctx.aspace_cap, TEST_VA, 1)
+                    .map_err(|_| "integration::tlb_coherency: mem_unmap_reclaim failed")?;
+            }
+            else
+            {
+                mem_unmap(ctx.aspace_cap, TEST_VA, 1)
+                    .map_err(|_| "integration::tlb_coherency: mem_unmap failed")?;
+            }
+
+            if cycle % 25 == 0
+            {
+                crate::log_u64("ktest: integration::tlb_coherency: cycle ", cycle as u64);
+            }
         }
     }
 
@@ -188,18 +223,19 @@ fn tlb_worker_thread(p2c_slot: u64) -> !
 
         if bits & 0x2 != 0
         {
-            // Page is mapped. Access it (read) to load TLB entry.
+            // Page is mapped and stamped with SENTINEL. Read it back to load
+            // the TLB entry and validate the translation by value.
             //
-            // SAFETY: Parent maps TEST_VA before notifying 0x2. The parent's
-            // prior-cycle unmap shot down this hart's entry, so the read sees
-            // the fresh mapping; a broken shootdown would instead fault here
-            // and terminate this thread.
-            let ptr = TEST_VA as *const u64;
-            // SAFETY: TEST_VA is mapped by parent; see comment above.
-            let _value = unsafe { ptr.read_volatile() };
+            // SAFETY: Parent maps + writes TEST_VA before notifying 0x2. The
+            // parent's prior-cycle unmap (or reclaiming unmap) shot down this
+            // hart's entry, so the read sees the fresh mapping; a broken
+            // shootdown would instead fault here (terminating this thread) or,
+            // if it resolved to a stale frame, read a non-SENTINEL value.
+            let value = unsafe { (TEST_VA as *const u64).read_volatile() };
 
-            // Acknowledge to parent on c2p: we've accessed the page.
-            notification_send(c2p, 0x4).ok();
+            // Ack match (0x4) or wrong-frame (0x10).
+            let ack = if value == SENTINEL { 0x4 } else { 0x10 };
+            notification_send(c2p, ack).ok();
         }
     }
 

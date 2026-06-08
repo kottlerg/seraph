@@ -21,15 +21,16 @@ use crate::util::step;
 
 const SECTOR_SIZE: u64 = 512;
 
-/// ESP partition size. The ESP holds just kernel + bundle + bootloader EFI
-/// (init and modules live inside the bundle); 256 MiB leaves comfortable
-/// headroom for additional bundle modules.
-const ESP_PARTITION_SIZE: u64 = 256 * 1024 * 1024;
+/// ESP partition size. Holds the kernel, the boot bundle (init + modules),
+/// and the bootloader EFI. 64 MiB covers these with headroom for `--debug`
+/// debuginfo and future bundle modules.
+const ESP_PARTITION_SIZE: u64 = 64 * 1024 * 1024;
 
 /// Root partition size. Holds every installed userspace binary under
-/// `/services/` and `/programs/` plus the `/tests/` harness binaries;
-/// 512 MiB leaves generous headroom.
-const ROOT_PARTITION_SIZE: u64 = 512 * 1024 * 1024;
+/// `/services/` and `/programs/` plus the `/tests/` harness binaries. With
+/// debuginfo off by default the tree is ~10 MiB; 192 MiB covers a full
+/// `--debug` rebuild and ample future components.
+const ROOT_PARTITION_SIZE: u64 = 192 * 1024 * 1024;
 
 /// First partition starts at LBA 2048 (1 MiB alignment, standard GPT practice).
 const ESP_START_LBA: u64 = 2048;

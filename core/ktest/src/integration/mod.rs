@@ -39,10 +39,14 @@
 //! - `fault_exception_no_handler_kills.rs` — a non-page-fault CPU exception with no handler bound terminates the thread
 //! - `irq_preserves_user_regs.rs` — a ring-3 thread's callee-saved registers survive a timer preemption (frame-authoritative IRQ path)
 //! - `tlb_widen_retry.rs`        — a permission-widen elides its shootdown; a remote stale-TLB write still completes via spurious-fault retry
+//! - `death_notification_late_bind.rs` — a death observer bound after the thread already died still receives the retained exit reason
+//! - `aspace_fault_notification_late_bind.rs` — an aspace terminal-fault observer bound after the space already faulted still receives the retained reason
 
+pub mod aspace_fault_notification_late_bind;
 pub mod cap_delegation_chain;
 pub mod cap_move_into_fresh_cspace_then_ipc;
 pub mod cap_transfer;
+pub mod death_notification_late_bind;
 pub mod fault_exception_no_handler_kills;
 pub mod fault_exception_redirect;
 pub mod fault_handler_declines_kills;
@@ -73,6 +77,14 @@ use crate::run_integration_test;
 pub fn run_all(ctx: &TestContext)
 {
     run_integration_test!("integration::thread_lifecycle", thread_lifecycle::run(ctx));
+    run_integration_test!(
+        "integration::death_notification_late_bind",
+        death_notification_late_bind::run(ctx)
+    );
+    run_integration_test!(
+        "integration::aspace_fault_notification_late_bind",
+        aspace_fault_notification_late_bind::run(ctx)
+    );
     run_integration_test!("integration::cap_transfer", cap_transfer::run(ctx));
     run_integration_test!("integration::wait_concurrency", wait_concurrency::run(ctx));
     run_integration_test!("integration::memory_lifecycle", memory_lifecycle::run(ctx));

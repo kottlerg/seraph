@@ -1057,11 +1057,11 @@ fn apply_stdio_overlay(rust_src: &Path, overlay_root: &Path) -> Result<()>
 }
 
 /// Patch `library/std/src/sys/exit.rs` to route `exit(code)` through
-/// `syscall::thread_exit()` on seraph, so `std::process::exit` exits the
-/// calling thread cleanly instead of trapping via `intrinsics::abort()` (the
-/// unsupported-fallback behaviour). Closes stdio pipes first so any
-/// parent blocked on a `read_to_end` / `write` observes EOF /
-/// `BrokenPipe` instead of hanging.
+/// `syscall::process_exit(code)` on seraph, so `std::process::exit` terminates
+/// the process and carries the code (via the kernel exit-reason encoding)
+/// instead of trapping via `intrinsics::abort()` (the unsupported-fallback
+/// behaviour). Closes stdio pipes first so any parent blocked on a
+/// `read_to_end` / `write` observes EOF / `BrokenPipe` instead of hanging.
 fn apply_exit_overlay(rust_src: &Path) -> Result<()>
 {
     let exit_rs = rust_src.join("library/std/src/sys/exit.rs");
@@ -1070,10 +1070,10 @@ fn apply_exit_overlay(rust_src: &Path) -> Result<()>
         "sys/exit.rs",
         "        target_os = \"xous\" => {\n            crate::os::xous::ffi::exit(code as u32)\n        }\n",
         "        target_os = \"xous\" => {\n            crate::os::xous::ffi::exit(code as u32)\n        }\n        \
-         // seraph-overlay: exit via SYS_THREAD_EXIT for clean shutdown\n        \
-         target_os = \"seraph\" => {\n            let _ = code;\n            \
+         // seraph-overlay: exit the process via SYS_PROCESS_EXIT, forwarding the code\n        \
+         target_os = \"seraph\" => {\n            \
          crate::sys::stdio::seraph::close_all();\n            \
-         syscall::thread_exit()\n        }\n",
+         syscall::process_exit(code as u32)\n        }\n",
     )
 }
 

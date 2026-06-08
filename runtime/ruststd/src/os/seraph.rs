@@ -7,7 +7,8 @@
 //     `ProcessInfo` at the well-known VA, registers the IPC buffer, wires
 //     stdio caps, bootstraps the heap, then jumps to the rustc-synthesised
 //     `extern "C" fn main` which calls `std::rt::lang_start` and in turn the
-//     user's idiomatic `fn main`. Exits via `thread_exit` if `main` returns.
+//     user's idiomatic `fn main`. When `main` returns, exits the process via
+//     `process_exit`, forwarding its code.
 //   * `startup_info()` / `try_startup_info()` — accessors for the
 //     `StartupInfo` stashed by `_start`. Services use these to obtain their
 //     initial caps.
@@ -295,6 +296,16 @@ pub fn try_startup_info() -> Option<&'static StartupInfo> {
 
 // ── Entry point ─────────────────────────────────────────────────────────────
 
+/// Voluntary exit code reported when `_start` aborts before user `main` runs
+/// because the `ProcessInfo` ABI version is unrecognised. In the voluntary
+/// range (`< EXIT_FAULT_BASE`) and distinct from plausible application codes, so
+/// a supervisor sees a defined startup failure rather than a false success-`0`.
+const STARTUP_FAIL_BAD_ABI: u32 = 0x0F01;
+
+/// Voluntary exit code reported when `_start` aborts because the heap bootstrap
+/// failed (typically memmgr frame-pool exhaustion). See [`STARTUP_FAIL_BAD_ABI`].
+const STARTUP_FAIL_HEAP: u32 = 0x0F02;
+
 /// Process entry point. Exported with the conventional ELF entry symbol name
 /// so the linker sets `e_entry` here and procmgr jumps directly in.
 ///
@@ -302,9 +313,10 @@ pub fn try_startup_info() -> Option<&'static StartupInfo> {
 /// [`PROCESS_INFO_VADDR`], registers the pre-mapped IPC buffer, stashes the
 /// derived [`StartupInfo`] in process-global storage, then hands off to the
 /// rustc-synthesised `extern "C" fn main` which in turn drives
-/// `std::rt::lang_start` and the user's `fn main`. If `main` returns, this
-/// function calls `thread_exit` as a safety net so the process never
-/// re-enters kernel entry code with an undefined stack frame.
+/// `std::rt::lang_start` and the user's `fn main`. When `main` returns, this
+/// function exits the process via `process_exit`, forwarding `main`'s `i32`
+/// return (the `ExitCode`/`lang_start` value) so the parent's `ExitStatus`
+/// carries it; the process never re-enters kernel entry code.
 ///
 /// # Safety
 ///
@@ -320,7 +332,7 @@ pub extern "C" fn _start() -> ! {
     let info = unsafe { process_info_ref(PROCESS_INFO_VADDR) };
 
     if info.version != PROCESS_ABI_VERSION {
-        syscall::thread_exit();
+        syscall::process_exit(STARTUP_FAIL_BAD_ABI);
     }
 
     // Register the IPC buffer before any IPC-using code runs. Idempotent in
@@ -465,7 +477,7 @@ pub extern "C" fn _start() -> ! {
                     info.memmgr_endpoint_cap,
                 ),
             );
-            syscall::thread_exit();
+            syscall::process_exit(STARTUP_FAIL_HEAP);
         }
         // Wire the object-slab refill path against the same memmgr endpoint.
         // Cap-create syscalls retype memory out of a slab Memory cap acquired
@@ -479,15 +491,17 @@ pub extern "C" fn _start() -> ! {
 
     // SAFETY: `main` is rustc-synthesised for any bin crate that defines
     // `fn main` (i.e., not `#![no_main]`). It invokes `lang_start` and the
-    // user's `fn main`.
-    let _ = unsafe { main(0, core::ptr::null()) };
+    // user's `fn main`, returning the `ExitCode`/`lang_start` value as `i32`.
+    let code = unsafe { main(0, core::ptr::null()) };
 
     // Tear down stdio pipes before exit so the close protocol fires
     // (header `closed` flag + notification kick) and any parent blocked on
     // a read/write returns cleanly.
     pal_stdio::close_all();
 
-    syscall::thread_exit();
+    // Exit the process carrying `main`'s code; the kernel encodes it into the
+    // exit reason so the parent's `ExitStatus` reflects it.
+    syscall::process_exit(code as u32);
 }
 
 // Force the linker to keep `_start` in the final binary even when the std

@@ -100,10 +100,15 @@ The server MUST:
    Hidden and absent MUST be indistinguishable to the caller.
 5. Compute returned rights as
    `parent_rights ∩ entry.max_rights ∩ caller_requested`.
-6. Mint the child cap from the server's namespace endpoint via
-   `cap_derive_badge` for [`EntryTarget::Local`], or via `cap_derive`
-   of a stored cap for [`EntryTarget::External`] (mount points and
-   other cross-server entries).
+6. Mint the child cap carrying the returned rights via
+   `cap_derive_badge`: for [`EntryTarget::Local`], on the server's own
+   namespace endpoint at the entry's `NodeId`; for
+   [`EntryTarget::External`] (mount points and other cross-server
+   entries), on the peer server's namespace endpoint at the peer node.
+   External mints afresh from the peer's *unbadged* endpoint — rather
+   than copying a stored cap — because the kernel forbids re-badging an
+   already-badged cap, so attenuation can only cross the boundary by a
+   fresh mint.
 
 The dispatch crate's [`dispatch_request`] enforces all of the above;
 backends own only the storage lookup.
@@ -270,11 +275,12 @@ Migration of the read surface to `NS_*` labels is a follow-up phase.
 
 ## Composing servers
 
-A server MAY return entries whose target is a node cap on a different
-server's namespace endpoint ([`EntryTarget::External`]). `NS_LOOKUP`
-hands such a cap to the caller verbatim (with rights intersected) and
-subsequent operations bypass the composing server. This is how
-filesystem mounting works:
+A server MAY return entries whose target lies on a different server's
+namespace endpoint ([`EntryTarget::External`]). `NS_LOOKUP` mints a
+fresh cap on that peer endpoint carrying the composed rights
+(`parent_rights ∩ entry.max_rights ∩ caller_requested`), and subsequent
+operations bypass the composing server. This is how filesystem mounting
+works:
 [`services/vfsd/docs/namespace-composition.md`](../../services/vfsd/docs/namespace-composition.md)
 describes vfsd's synthetic-root composition in detail.
 

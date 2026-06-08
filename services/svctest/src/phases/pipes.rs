@@ -154,9 +154,7 @@ pub fn pipe_fault_eof_phase(_: &Caps)
 {
     use std::io::Read;
     use std::process::{Command, Stdio};
-
-    const EXIT_FAULT_BASE: u64 = 0x1000;
-    const EXIT_KILLED: u64 = 0x2000;
+    use syscall::{EXIT_FAULT_BASE, EXIT_KILLED};
 
     let mut child = Command::new("/programs/pipefault")
         .stdout(Stdio::piped())

@@ -13,7 +13,7 @@ drivers/
 ├── cmos/                           # x86-64 CMOS / MC146818 RTC driver (binary)
 ├── framebuffer/                    # Linear-framebuffer text driver (binary)
 │   ├── Cargo.toml
-│   ├── README.md                   # Framebuffer IPC interface (FB_WRITE_BYTES)
+│   ├── README.md                   # Framebuffer IPC interface (FB_WRITE_BYTES, FB_SET_ATTRS)
 │   └── src/
 │       ├── main.rs
 │       ├── render.rs               # 9×20 bitmap glyph blit + cursor + scroll

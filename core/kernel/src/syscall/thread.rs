@@ -194,10 +194,11 @@ pub fn sys_thread_start(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         // All-CPU lock commit closes the cross-CPU dealloc race; see
         // docs/thread-lifecycle-and-sleep.md § Lifecycle State Machine.
         crate::sched::set_state_under_all_locks(target_tcb, ThreadState::Ready);
-        // Route to correct CPU based on affinity. enqueue_and_wake reads
-        // priority from the TCB under the target scheduler's lock.
+        // Route to correct CPU based on affinity. The thread is already Ready
+        // (committed above), so use enqueue_ready_thread to link it: the gated
+        // enqueue_and_wake would coalesce an already-Ready thread and drop it.
         let target_cpu = crate::sched::select_target_cpu(target_tcb);
-        crate::sched::enqueue_and_wake(target_tcb, target_cpu);
+        crate::sched::enqueue_ready_thread(target_tcb, target_cpu);
     }
 
     Ok(0)
@@ -297,6 +298,18 @@ pub fn sys_thread_stop(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 let sched_remote = crate::sched::scheduler_for(run_cpu);
                 let spin_start = crate::arch::current::timer::current_tick();
                 let mut warned = false;
+                // The drain spins until the remote CPU deschedules `target_tcb`.
+                // This syscall runs with IF=0; spinning at IF=0 would block an
+                // inbound TLB-shootdown IPI targeted at this CPU and deadlock it
+                // (the initiator spins for our ACK with IF enabled). Enable
+                // interrupts across the spin and disable preemption so the
+                // scheduler cannot migrate us mid-drain — the #207 pattern
+                // dealloc's UAF gate uses.
+                crate::percpu::preempt_disable();
+                // SAFETY: ring 0; restored after the spin below.
+                let drain_saved_int = crate::arch::current::cpu::save_and_disable_interrupts();
+                // SAFETY: ring 0; IDT loaded; preempt disabled.
+                crate::arch::current::interrupts::enable();
                 while {
                     let s = sched_remote.lock.lock_raw();
                     let still_current = sched_remote.current == target_tcb;
@@ -332,6 +345,9 @@ pub fn sys_thread_stop(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                     }
                     core::hint::spin_loop();
                 }
+                // SAFETY: drain_saved_int from save_and_disable_interrupts above.
+                crate::arch::current::cpu::restore_interrupts(drain_saved_int);
+                crate::percpu::preempt_enable();
             }
         }
     }
@@ -345,8 +361,10 @@ pub fn sys_thread_stop(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// return value to `Interrupted` so the halted syscall returns that error.
 ///
 /// # Safety
-/// `tcb` must be a valid TCB in `Blocked` state. Must be called with the
-/// scheduler lock held (or in single-CPU context).
+/// `tcb` must be a valid TCB. The caller MUST NOT hold the target's `sched_lock`
+/// or any per-CPU scheduler lock: this function acquires `tcb.sched_lock` itself
+/// for the binding read-and-clear, and per-source IPC locks for the unlink (lock
+/// order: source IPC → `sched_lock`, so the two are never held together).
 // too_many_lines: flat dispatch over every `IpcThreadState` variant; splitting
 // adds no clarity (each arm is independent and short).
 #[allow(clippy::too_many_lines)]
@@ -360,15 +378,32 @@ unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadControlBlock)
     use crate::sched::thread::IpcThreadState;
     use syscall::SyscallError;
 
-    // SAFETY: tcb validated by caller; ipc_state field always valid.
-    let ipc_state = unsafe { (*tcb).ipc_state };
-    // SAFETY: tcb validated by caller; blocked_on_object field always valid.
-    let blocked_on = unsafe { (*tcb).blocked_on_object };
+    // Snapshot (state, ipc_state, blocked_on_object) under the per-TCB sched_lock
+    // — the authoritative serializer for the Scheduling field group. Reading the
+    // pair without it would race enqueue_and_wake / commit_blocked (which write
+    // these under sched_lock) and could observe a torn binding. If a concurrent
+    // waker already moved the thread off Blocked, its wake stands: there is
+    // nothing to cancel, so return without touching the source or the trap frame.
+    // sched_lock is released before any per-source IPC lock is taken below (lock
+    // order is source IPC → sched_lock, so the two are never held together).
+    // SAFETY: tcb validated by caller; fields read/written under sched_lock.
+    let (ipc_state, blocked_on) = unsafe {
+        let saved = (*tcb).sched_lock.lock_raw();
+        let snap = ((*tcb).ipc_state, (*tcb).blocked_on_object);
+        let blocked = (*tcb).state == crate::sched::thread::ThreadState::Blocked;
+        (*tcb).sched_lock.unlock_raw(saved);
+        if !blocked
+        {
+            return;
+        }
+        snap
+    };
 
-    // Each branch acquires the source IPC lock matching `ipc_state` before
-    // touching the source's waiter / queue. Lock order: scheduler.lock
-    // (outer, held by caller) → source IPC lock (inner). See
-    // docs/scheduling-internals.md § Lock Hierarchy rule 7.
+    // Each branch takes only the source IPC lock matching `ipc_state` (the
+    // sched_lock snapshot above is already released; lock order source IPC →
+    // sched_lock means the two are never nested) and unlinks this thread from the
+    // source's waiter / queue, racing any concurrent waker for the binding under
+    // that same source lock. See docs/scheduling-internals.md § Lock Hierarchy.
     match ipc_state
     {
         IpcThreadState::BlockedOnSend =>
@@ -573,11 +608,21 @@ unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadControlBlock)
         }
     }
 
-    // Reset IPC state and blocked_on_object.
-    // SAFETY: tcb is valid.
+    // Clear the binding under sched_lock, but only if the thread is still Blocked
+    // on the same object we cancelled: a waker that won the source-lock race above
+    // may have already woken (and possibly re-bound) it, in which case
+    // enqueue_and_wake already cleared these fields and we must not clobber a
+    // fresh binding.
+    // SAFETY: tcb is valid; fields written under sched_lock.
     unsafe {
-        (*tcb).ipc_state = IpcThreadState::None;
-        (*tcb).blocked_on_object = core::ptr::null_mut();
+        let saved = (*tcb).sched_lock.lock_raw();
+        if (*tcb).state == crate::sched::thread::ThreadState::Blocked
+            && (*tcb).ipc_state == ipc_state
+        {
+            (*tcb).ipc_state = IpcThreadState::None;
+            (*tcb).blocked_on_object = core::ptr::null_mut();
+        }
+        (*tcb).sched_lock.unlock_raw(saved);
     }
 
     // Write Interrupted into the stopped thread's trap-frame return slot so
@@ -787,14 +832,20 @@ pub fn sys_thread_set_priority(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         return Err(SyscallError::InvalidCapability);
     }
 
-    // `priority`, `state`, and `run_queue_next` are in the Scheduling field
-    // group (docs/scheduling-internals.md § Cross-CPU TCB Ownership);
-    // cross-CPU writers MUST hold the home CPU's scheduler.lock. Identifying
-    // the home CPU is itself a read of the same field group, so the
-    // locate-write-relocate sequence is serialised by acquiring every CPU's
-    // scheduler.lock in ascending order — the same shape used by
-    // `dealloc_object(Thread)` and `sched::set_state_under_all_locks`.
+    // `priority`, `state`, and `queued_on` are in the Scheduling field group,
+    // whose authoritative serializer is the per-TCB `sched_lock`
+    // (docs/scheduling-internals.md § Cross-CPU TCB Ownership). Acquire it FIRST
+    // (outermost), then every CPU's run-queue lock in ascending order — the same
+    // shape as `dealloc_object(Thread)` and `set_state_under_all_locks`. Without
+    // `sched_lock` this `state` read and the `remove_from_queue` / `enqueue`
+    // below race `enqueue_and_wake` / `commit_blocked` / `schedule`, which write
+    // those fields under `sched_lock` — an unserialized Scheduling-group writer
+    // the per-TCB-lock redesign (STEP 5) converted everywhere else but here.
     let cpu_count = crate::sched::CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
+
+    // SAFETY: target_tcb validated non-null; lock_raw paired with the unlock_raw
+    // after the all-CPU-locks release below (released last, restoring caller IF).
+    let tcb_sched_saved = unsafe { (*target_tcb).sched_lock.lock_raw() };
 
     // Ascending order matches the lock hierarchy rule. Each CPU's saved
     // interrupt-flag word is stashed in its own scheduler (under that lock).
@@ -807,9 +858,10 @@ pub fn sys_thread_set_priority(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         }
     }
 
-    // SAFETY: target_tcb validated non-null; all-CPU scheduler.locks serialise
-    // every Scheduling-group writer (`dealloc_object(Thread)`,
-    // `migrate_ready_thread`, `set_state_under_all_locks`).
+    // SAFETY: target_tcb validated non-null. `sched_lock` (held, outermost)
+    // serializes the `state` read and the `queued_on` mutation against every
+    // other Scheduling-group writer; the all-CPU run-queue locks (held) cover
+    // the intrusive remove/enqueue list structure.
     unsafe {
         let old_prio = (*target_tcb).priority;
         let state = (*target_tcb).state;
@@ -851,6 +903,13 @@ pub fn sys_thread_set_priority(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             let s = crate::sched::scheduler_for(cpu);
             s.lock.unlock_raw(s.saved_lock_flags);
         }
+    }
+
+    // Release `sched_lock` LAST (first-acquired → last-released), restoring the
+    // caller's interrupt state.
+    // SAFETY: tcb_sched_saved from the lock_raw above.
+    unsafe {
+        (*target_tcb).sched_lock.unlock_raw(tcb_sched_saved);
     }
 
     Ok(0)

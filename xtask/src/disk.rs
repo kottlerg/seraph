@@ -3,9 +3,10 @@
 
 //! disk.rs
 //!
-//! Build a GPT disk image from sysroot contents. The image contains two FAT32
-//! partitions: an EFI System Partition (populated from sysroot/) and an empty
-//! root partition for future use.
+//! Build a GPT disk image from sysroot contents. The image contains three
+//! FAT32 partitions: an EFI System Partition (from sysroot/esp/), a Seraph
+//! root partition (from sysroot/), and a Seraph data partition (from
+//! sysroot/data/) that vfsd auto-mounts at /data.
 
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -40,8 +41,17 @@ const ESP_SIZE_LBA: u64 = ESP_PARTITION_SIZE / SECTOR_SIZE;
 const ROOT_START_LBA: u64 = ESP_START_LBA + ESP_SIZE_LBA;
 const ROOT_SIZE_LBA: u64 = ROOT_PARTITION_SIZE / SECTOR_SIZE;
 
+/// Data partition size. Backs the `/data` mountpoint (namespace-marker
+/// fixture plus svctest scratch space); 256 MiB leaves generous headroom
+/// for the test phases' scratch writes.
+const DATA_PARTITION_SIZE: u64 = 256 * 1024 * 1024;
+
+/// Third partition follows immediately after the root partition.
+const DATA_START_LBA: u64 = ROOT_START_LBA + ROOT_SIZE_LBA;
+const DATA_SIZE_LBA: u64 = DATA_PARTITION_SIZE / SECTOR_SIZE;
+
 /// Total image size: partitions + 1 MiB lead-in + 1 MiB trailing GPT backup.
-const IMAGE_SIZE: u64 = (ROOT_START_LBA + ROOT_SIZE_LBA + 2048) * SECTOR_SIZE;
+const IMAGE_SIZE: u64 = (DATA_START_LBA + DATA_SIZE_LBA + 2048) * SECTOR_SIZE;
 
 /// A read/write/seek view into a byte range of an underlying file.
 /// Lets the `fatfs` crate operate on a single partition without knowing
@@ -150,14 +160,19 @@ impl Seek for PartitionSlice
 
 /// Create a GPT disk image at `<project_root>/disk.img`.
 ///
-/// The image contains two FAT32 partitions:
+/// The image contains three FAT32 partitions:
 /// - Partition 1 (ESP, [`ESP_PARTITION_SIZE`]): populated from `sysroot/esp/`
 /// - Partition 2 (ROOT, [`ROOT_PARTITION_SIZE`]): populated from `sysroot/`
-///   excluding `esp/`
+///   excluding `esp/` and `data/`
+/// - Partition 3 (DATA, [`DATA_PARTITION_SIZE`]): populated from `sysroot/data/`
 ///
-/// Partition 2's GPT type-GUID is the arch-specific Seraph root GUID
-/// (see [`boot_protocol::role_guids`]) so vfsd can identify the root by
-/// role without consulting a config file.
+/// Partition 2's GPT type-GUID is the arch-specific Seraph root GUID and
+/// partition 3's is the arch-neutral Seraph data GUID (see
+/// [`boot_protocol::role_guids`]) so vfsd can identify each by role
+/// without consulting a config file. vfsd auto-mounts the data partition
+/// at `/data`. The data tree is placed only on the data partition, not
+/// duplicated onto root; vfsd's fall-through still serves `/data` from
+/// root on images that choose to carry it there instead.
 pub fn create_disk_image(ctx: &BuildContext, arch: Arch) -> Result<()>
 {
     let image_path = ctx.disk_image();
@@ -198,6 +213,16 @@ pub fn create_disk_image(ctx: &BuildContext, arch: Arch) -> Result<()>
         &ctx.sysroot,
     )?;
 
+    // Format and populate the data partition from sysroot/data/. vfsd
+    // auto-mounts it at /data. The tree is not also written to the root
+    // partition (populate_dir skips top-level data/).
+    format_and_populate_partition(
+        &image_path,
+        DATA_START_LBA,
+        DATA_PARTITION_SIZE,
+        &ctx.sysroot.join("data"),
+    )?;
+
     step("Disk image complete");
     Ok(())
 }
@@ -210,6 +235,7 @@ pub fn create_disk_image(ctx: &BuildContext, arch: Arch) -> Result<()>
 /// partition's role; these identify the specific partition instance.
 pub const ESP_UNIQUE_UUID: &str = "a1b2c3d4-e5f6-7890-abcd-ef0123456789";
 pub const ROOT_UNIQUE_UUID: &str = "12345678-abcd-ef01-2345-6789abcdef01";
+pub const DATA_UNIQUE_UUID: &str = "c0ffee01-2345-6789-abcd-ef0123456789";
 
 /// Return the Seraph root partition type-GUID for `arch`, wrapped as a
 /// `gpt::partition_types::Type` ready for `add_partition_at`.
@@ -226,7 +252,18 @@ fn seraph_root_type(arch: Arch) -> gpt::partition_types::Type
     }
 }
 
-/// Write a GPT partition table with two partitions and deterministic UUIDs.
+/// Return the Seraph data partition type-GUID, wrapped as a
+/// `gpt::partition_types::Type` ready for `add_partition_at`. The data
+/// GUID is arch-neutral, so this takes no `arch`.
+fn seraph_data_type() -> gpt::partition_types::Type
+{
+    gpt::partition_types::Type {
+        guid: uuid::Uuid::from_bytes_le(role_guids::SERAPH_DATA),
+        os: gpt::partition_types::OperatingSystem::None,
+    }
+}
+
+/// Write a GPT partition table with three partitions and deterministic UUIDs.
 fn write_gpt(image_path: &Path, arch: Arch) -> Result<()>
 {
     let mut file = fs::OpenOptions::new()
@@ -273,9 +310,22 @@ fn write_gpt(image_path: &Path, arch: Arch) -> Result<()>
     )
     .context("failed to add ROOT partition")?;
 
+    // Partition 3: Seraph data, arch-neutral type-GUID per
+    // `boot_protocol::role_guids`. Flags 0 ⇒ DPS priority 0.
+    disk.add_partition_at(
+        "DATA",
+        3,
+        DATA_START_LBA,
+        DATA_SIZE_LBA,
+        seraph_data_type(),
+        0,
+    )
+    .context("failed to add DATA partition")?;
+
     // Set deterministic per-partition unique GUIDs for reproducible builds.
     let esp_uuid: uuid::Uuid = ESP_UNIQUE_UUID.parse().expect("invalid ESP_UNIQUE_UUID");
     let root_uuid: uuid::Uuid = ROOT_UNIQUE_UUID.parse().expect("invalid ROOT_UNIQUE_UUID");
+    let data_uuid: uuid::Uuid = DATA_UNIQUE_UUID.parse().expect("invalid DATA_UNIQUE_UUID");
 
     let mut parts = disk.take_partitions();
     if let Some(p) = parts.get_mut(&1)
@@ -285,6 +335,10 @@ fn write_gpt(image_path: &Path, arch: Arch) -> Result<()>
     if let Some(p) = parts.get_mut(&2)
     {
         p.part_guid = root_uuid;
+    }
+    if let Some(p) = parts.get_mut(&3)
+    {
+        p.part_guid = data_uuid;
     }
     disk.update_partitions(parts)
         .context("failed to update partition UUIDs")?;
@@ -297,8 +351,9 @@ fn write_gpt(image_path: &Path, arch: Arch) -> Result<()>
 
 /// Format a partition as FAT32 and populate it from a source directory.
 ///
-/// Skips `.arch`, `NvVars`, and the `esp` subdirectory (which is the ESP
-/// mount point, not root content) when populating.
+/// Skips build metadata (`.arch`, `NvVars`) and the top-level `esp` and
+/// `data` subdirectories, each a mount point with its own partition and so
+/// not root content.
 fn format_and_populate_partition(
     image_path: &Path,
     start_lba: u64,
@@ -364,6 +419,15 @@ fn populate_dir<T: Read + Write + Seek>(
 
         // Skip build metadata and the ESP mount point (populated separately).
         if name_str == ".arch" || name_str == "NvVars" || name_str == "esp"
+        {
+            continue;
+        }
+
+        // `data` is a mount point with its own SERAPH_DATA partition, so it
+        // is excluded from the root partition (symmetric with `esp`). Skip
+        // it only at the sysroot top level — a nested `data/` elsewhere in
+        // the tree is still copied.
+        if name_str == "data" && host_dir == sysroot_root
         {
             continue;
         }

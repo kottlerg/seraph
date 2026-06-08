@@ -30,6 +30,7 @@ members = [
     "abi/init-protocol",
     "abi/process-abi",
     "abi/syscall",
+    "shared/ansi",
     "shared/elf",
     "shared/font",
     "shared/mmio",
@@ -43,12 +44,13 @@ members = [
     "shared/shmem",
     "shared/text",
     "programs/demandpaged",
-    "programs/echosh",
     "programs/fb-charset",
     "programs/fsbench",
     "programs/hello",
     "programs/hello/tester",
     "programs/pipefault",
+    "programs/shell",
+    "programs/shell/tester",
     "programs/stackoverflow",
     "programs/stdiotest",
     "programs/stdiotest/tester",
@@ -82,6 +84,7 @@ unwrap_used                      = "deny"
 expect_used                      = "deny"
 
 [workspace.dependencies]
+ansi = { path = "shared/ansi" }
 boot-protocol = { path = "abi/boot-protocol" }
 init-protocol = { path = "abi/init-protocol" }
 process-abi = { path = "abi/process-abi" }

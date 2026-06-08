@@ -124,17 +124,6 @@ impl RunQueue
         self.head.is_none()
     }
 
-    /// True iff `tcb` is this queue's tail. Used only by the release-safe
-    /// double-link guard in [`PerCpuScheduler::enqueue`]; in debug builds the
-    /// `RunQueue::enqueue` tripwire checks `self.tail` directly, so this
-    /// accessor is release-only. Reads only this queue's own `tail`, so it is
-    /// sound under the owning scheduler.lock.
-    #[cfg(not(debug_assertions))]
-    fn is_tail(&self, tcb: *mut ThreadControlBlock) -> bool
-    {
-        self.tail == Some(tcb)
-    }
-
     /// Find the first TCB in this queue satisfying `pred`. Returns the TCB
     /// pointer without removing it; the caller decides whether to migrate
     /// or skip. Read-only walk.
@@ -307,30 +296,46 @@ impl PerCpuScheduler
             "priority {p} out of range [0, {NUM_PRIORITY_LEVELS})"
         );
 
-        // Release-safe double-link guard (issue #244). A non-`None`
-        // `run_queue_next`, or `tcb` already being this priority queue's tail,
-        // means `tcb` is already linked on a run queue; re-linking it would
-        // self-cycle the intrusive list (`tail.next = Some(tail)`) and corrupt
-        // it. This is the exact condition the `RunQueue::enqueue` tripwire
-        // asserts on, read under the same owning scheduler.lock — so it
-        // identifies only genuine double-links. In debug the tripwire still
-        // panics below (naming the racing pair via the `last_enqueue`
-        // breadcrumb); in release, skip the link so the "Ready ⇒ linked on
-        // exactly one queue" invariant holds by construction instead of
-        // corrupting. The skip is lossless: `tcb` is already Ready and linked,
-        // so it is dispatched and consumes its wakeup payload from where it is
-        // already queued; no wake is lost. Placed before `increment_load` so a
-        // skipped link leaves the load counter exact.
-        #[cfg(not(debug_assertions))]
+        // Global single-link guard (issue #244, residual gap hit by #289).
+        // `queued_on` holds the priority this TCB is currently linked at, or -1
+        // when unlinked; it is written only under the owning scheduler.lock, so
+        // a `>= 0` value means `tcb` is already linked on some CPU's run queue
+        // and re-linking would corrupt the intrusive list. Unlike the old
+        // `run_queue_next`/tail check this also catches a TCB that is the sole
+        // element of a *different* priority queue or *another CPU's* queue —
+        // exactly the case #289 reproduced. In debug, panic naming the prior
+        // link's breadcrumb; in release, skip the redundant link losslessly
+        // (`tcb` is already Ready and queued, so it is dispatched from where it
+        // sits — no wake is lost). Checked before `increment_load` so a skipped
+        // link leaves the load counter exact.
         // SAFETY: tcb is valid; the caller holds this scheduler's lock, so
-        // run_queue_next is stable for this read.
-        if unsafe { (*tcb).run_queue_next.is_some() } || self.queues[p].is_tail(tcb)
+        // queued_on is stable for this read.
+        let prior_link = unsafe { (*tcb).queued_on.load(Ordering::Relaxed) };
+        if prior_link >= 0
         {
+            #[cfg(debug_assertions)]
+            // SAFETY: tcb valid; fields stable under the owning scheduler.lock.
+            unsafe {
+                let tid = (*tcb).thread_id;
+                let prior = (*tcb).last_enqueue;
+                panic!(
+                    "PerCpuScheduler::enqueue: tcb {tcb:p} tid={tid} already \
+                     linked at queued_on={prior_link} (re-enqueue at prio={p}) \
+                     — global double-enqueue; prior={prior:?}",
+                );
+            }
+            #[cfg(not(debug_assertions))]
             return;
         }
 
         self.increment_load();
         self.queues[p].enqueue(tcb);
+        // Tag the link under the owning scheduler.lock so any subsequent enqueue
+        // (this or another CPU) observes it via the guard above. `priority` is a
+        // u8 in [0, NUM_PRIORITY_LEVELS), so the widening to i16 is lossless.
+        let tag = i16::from(priority);
+        // SAFETY: tcb valid; owning scheduler.lock held.
+        unsafe { (*tcb).queued_on.store(tag, Ordering::Relaxed) };
         // Record the link breadcrumb (issue #244 diagnosis) under the owning
         // scheduler.lock, after the inner enqueue so a tripping case still
         // observes the *prior* breadcrumb. `Location::caller()` resolves
@@ -394,6 +399,9 @@ impl PerCpuScheduler
             self.non_empty
                 .fetch_and(!(1 << priority), Ordering::Release);
         }
+        // Clear the single-link tag: the TCB is no longer on any queue.
+        // SAFETY: tcb is a valid TCB; owning scheduler.lock held.
+        unsafe { (*tcb).queued_on.store(-1, Ordering::Relaxed) };
         self.decrement_load();
         tcb
     }
@@ -452,6 +460,9 @@ impl PerCpuScheduler
         let removed = self.queues[p].remove(tcb);
         if removed
         {
+            // Clear the single-link tag: the TCB is no longer on any queue.
+            // SAFETY: tcb is a valid TCB; owning scheduler.lock held.
+            unsafe { (*tcb).queued_on.store(-1, Ordering::Relaxed) };
             self.decrement_load();
             if self.queues[p].is_empty()
             {
@@ -552,15 +563,18 @@ mod tests
 
     /// Allocate a zero-initialized TCB for tests with magic cookie set.
     ///
-    /// SAFETY: only `run_queue_next`, `last_enqueue`, `ipc_state`,
+    /// SAFETY: only `run_queue_next`, `queued_on`, `last_enqueue`, `ipc_state`,
     /// `preferred_cpu`, and `magic` are accessed by RunQueue/PerCpuScheduler;
     /// all other TCB fields remain zero/null. The debug-only `last_enqueue:
     /// Option<EnqueueBreadcrumb>` field zeroes to `None` via the null-pointer
     /// niche of its `&'static Location`, so the tripwire reads a valid `None`.
+    /// `queued_on` zeroes to `0` ("linked at prio 0"), so it must be reset to the
+    /// `-1` unlinked sentinel the single-link guard expects.
     fn make_tcb() -> Box<ThreadControlBlock>
     {
         let mut tcb: ThreadControlBlock = unsafe { core::mem::zeroed() };
         tcb.magic = crate::sched::thread::TCB_MAGIC;
+        tcb.queued_on = core::sync::atomic::AtomicI16::new(-1);
         Box::new(tcb)
     }
 
@@ -620,13 +634,17 @@ mod tests
     fn enqueue_sets_non_empty_bit()
     {
         let mut sched = PerCpuScheduler::new();
+        // Distinct TCBs per priority: a single TCB linked at two priorities at
+        // once is a double-link the single-link guard (`queued_on`) rejects.
         let mut a = make_tcb();
+        let mut b = make_tcb();
         let pa = &mut *a as *mut _;
+        let pb = &mut *b as *mut _;
 
         assert_eq!(sched.non_empty.load(Ordering::Relaxed), 0);
         sched.enqueue(pa, 7);
         assert_eq!(sched.non_empty.load(Ordering::Relaxed), 1 << 7);
-        sched.enqueue(pa, 15);
+        sched.enqueue(pb, 15);
         assert_eq!(
             sched.non_empty.load(Ordering::Relaxed),
             (1 << 7) | (1 << 15)

@@ -100,6 +100,45 @@ impl Spinlock
     {
         self.now_serving.fetch_add(1, Ordering::Release);
     }
+
+    /// Attempt to acquire the lock without spinning.
+    ///
+    /// Returns `Some(saved_flags)` — interrupts disabled, exactly as
+    /// [`lock_raw`][Self::lock_raw] — if the lock was free and is now held by the
+    /// caller. Returns `None`, with interrupt state left unchanged, if the lock
+    /// was contended. Never blocks.
+    ///
+    /// Lets a caller acquire a lock out of the canonical lock order without
+    /// deadlock risk: a `None` return means a canonical holder is in flight, so
+    /// the caller backs off rather than waiting (which would close an ABBA cycle).
+    ///
+    /// # Safety
+    /// On `Some`, the returned `u64` must be passed verbatim to `unlock_raw`.
+    pub unsafe fn try_lock_raw(&self) -> Option<u64>
+    {
+        let saved = save_and_disable_interrupts();
+        // The lock is free iff no ticket is outstanding (next_ticket ==
+        // now_serving). Claim it by bumping next_ticket from that value; the CAS
+        // fails if another CPU issued a ticket in between (lock now contended).
+        let serving = self.now_serving.load(Ordering::Acquire);
+        if self
+            .next_ticket
+            .compare_exchange(
+                serving,
+                serving.wrapping_add(1),
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            Some(saved)
+        }
+        else
+        {
+            restore_interrupts(saved);
+            None
+        }
+    }
 }
 
 /// Restore interrupt state saved by `lock_raw`.
@@ -180,6 +219,33 @@ mod tests
                 let s = sl.lock_raw();
                 sl.unlock_raw(s);
             }
+        }
+    }
+
+    #[test]
+    fn try_lock_succeeds_when_free_and_rejects_when_held()
+    {
+        let sl = Spinlock::new();
+        unsafe {
+            let first = sl.try_lock_raw();
+            assert!(first.is_some(), "free lock must try-acquire");
+            assert!(
+                sl.try_lock_raw().is_none(),
+                "held lock must reject a try-acquire"
+            );
+            if let Some(s) = first
+            {
+                sl.unlock_raw(s);
+            }
+            // Released: a subsequent try-acquire and a blocking acquire both work.
+            let second = sl.try_lock_raw();
+            assert!(second.is_some(), "released lock must try-acquire again");
+            if let Some(s) = second
+            {
+                sl.unlock_raw(s);
+            }
+            let s3 = sl.lock_raw();
+            sl.unlock_raw(s3);
         }
     }
 }

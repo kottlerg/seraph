@@ -726,9 +726,9 @@ pub mod published_names
 
     /// `REGISTRY_QUERY_AUTHORITY`-badged SEND on devmgr's registry
     /// endpoint. Consumers needing to resolve a device driver
-    /// themselves (today: `programs/fb-charset` →
-    /// `QUERY_FRAMEBUFFER_DEVICE`; future: any non-init caller of
-    /// devmgr's discovery surface) seed this name. svcmgr publishes it
+    /// themselves (today: `programs/terminal` → `QUERY_FRAMEBUFFER_DEVICE` /
+    /// `QUERY_INPUT_DEVICE` / `QUERY_SERIAL_DEVICE`; future: any non-init
+    /// caller of devmgr's discovery surface) seed this name. svcmgr publishes it
     /// post-handover from the devmgr-registry source cap init endows it
     /// with; the `REGISTRY_QUERY_AUTHORITY` badge bit is preserved
     /// through svcmgr's plain `cap_derive` in `registry_lookup_derived`.
@@ -1441,11 +1441,12 @@ pub mod serial_errors
     pub const LABEL_VERSION_MISMATCH: u64 = 3;
 }
 
-pub const FB_LABELS_VERSION: u32 = 1;
+pub const FB_LABELS_VERSION: u32 = 2;
 /// IPC labels for the framebuffer device driver
 /// (`services/drivers/framebuffer`).
 ///
-/// The driver answers a single write operation today. It owns the
+/// The driver answers a byte-write ([`fb_labels::FB_WRITE_BYTES`]) and a
+/// colour-attribute set ([`fb_labels::FB_SET_ATTRS`]). It owns the
 /// bootloader-handed GOP linear-framebuffer MMIO end-to-end and is the
 /// sole driver-mediated sink for userspace framebuffer bytes. devmgr
 /// spawns it and hands clients a [`fb_labels::WRITE_AUTHORITY`]-badged
@@ -1469,6 +1470,29 @@ pub mod fb_labels
     /// - Bits 0-15: label ID (`FB_WRITE_BYTES`)
     /// - Bits 16-31: byte length of the payload in this call (0..=512).
     pub const FB_WRITE_BYTES: u64 = 1;
+
+    /// Set the foreground/background colour for subsequent
+    /// [`FB_WRITE_BYTES`] glyph rendering.
+    ///
+    /// The driver holds the pair as sticky state: an `FB_SET_ATTRS`
+    /// applies to every following `FB_WRITE_BYTES` until the next
+    /// `FB_SET_ATTRS`. The colours are 24-bit truecolour, packed as a
+    /// six-byte payload `[fg_r, fg_g, fg_b, bg_r, bg_g, bg_b]` via
+    /// `.bytes(0, …)`; the byte length rides bits 16-31 of the label,
+    /// mirroring [`FB_WRITE_BYTES`]. The driver renders the bytes it is
+    /// given and holds no palette — mapping the 16 ANSI SGR colours to
+    /// RGB is the terminal's job (`shared/ansi`). Reply: empty body,
+    /// status code in the reply label.
+    ///
+    /// The default (never set) is full-white-on-black, matching the
+    /// pre-colour monochrome output, so callers that never send
+    /// `FB_SET_ATTRS` (logd's framebuffer mirror, pre-terminal callers)
+    /// render unchanged.
+    ///
+    /// # Label encoding
+    /// - Bits 0-15: label ID (`FB_SET_ATTRS`)
+    /// - Bits 16-31: payload byte length (`6`).
+    pub const FB_SET_ATTRS: u64 = 2;
 
     /// Authority bit in the framebuffer-service-endpoint badge's high
     /// u64 bit. Set on caps devmgr mints in response to

@@ -21,6 +21,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ansi"
+version = "0.1.0"
+
+[[package]]
 name = "anstream"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -289,10 +293,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "echosh"
-version = "0.1.0"
-
-[[package]]
 name = "elf"
 version = "0.1.0"
 dependencies = [
@@ -330,11 +330,6 @@ dependencies = [
 [[package]]
 name = "fb-charset"
 version = "0.1.0"
-dependencies = [
- "ipc",
- "syscall",
- "syscall-abi",
-]
 
 [[package]]
 name = "find-msvc-tools"
@@ -884,6 +879,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "shell"
+version = "0.1.0"
+
+[[package]]
+name = "shell-tester"
+version = "0.1.0"
+
+[[package]]
 name = "shlex"
 version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -980,6 +983,7 @@ dependencies = [
 name = "terminal"
 version = "0.1.0"
 dependencies = [
+ "ansi",
  "ipc",
  "syscall",
 ]

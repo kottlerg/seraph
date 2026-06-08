@@ -1,13 +1,12 @@
 [package]
-name = "fb-charset"
+name = "ansi"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
-[[bin]]
-name = "fb-charset"
-path = "src/main.rs"
-test = false
+[lib]
+test = true
+doctest = false
 
 [lints]
 workspace = true

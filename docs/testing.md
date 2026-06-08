@@ -268,4 +268,4 @@ note in full.
 
 ## Summarized By
 
-[Conventions](conventions.md), [Root README](../README.md), [core/ktest/README.md](../core/ktest/README.md), [services/svcmgr/README.md](../services/svcmgr/README.md), [services/usertest/README.md](../services/usertest/README.md), [programs/terminal/README.md](../programs/terminal/README.md)
+[Conventions](conventions.md), [Root README](../README.md), [core/ktest/README.md](../core/ktest/README.md), [services/svcmgr/README.md](../services/svcmgr/README.md), [services/usertest/README.md](../services/usertest/README.md), [programs/terminal/README.md](../programs/terminal/README.md), [programs/shell/README.md](../programs/shell/README.md)

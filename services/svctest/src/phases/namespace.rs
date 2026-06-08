@@ -370,10 +370,9 @@ pub fn ns_multi_component_phase(_: &Caps)
     let _ = syscall::cap_delete(esp_cap);
     std::os::seraph::log!("ns_multi_component: NS_LOOKUP /esp/EFI (terminal contents) ok");
 
-    // Root-fs fixture: `/data/test.txt` is a plain rootfs file (the
-    // mount that previously covered the storage path is gone), so the
-    // cap walked from the system root resolves through the root-fs
-    // backend unchanged. Marker check verifies the byte content.
+    // `/data/test.txt` resolves through the SERAPH_DATA partition vfsd
+    // auto-mounts at `/data`; the in-tree image carries the fixture there.
+    // The marker check is content-only.
     let body = std::fs::read_to_string("/data/test.txt")
         .expect("ns_multi_component: std::fs::read_to_string(/data/test.txt) failed");
     assert!(

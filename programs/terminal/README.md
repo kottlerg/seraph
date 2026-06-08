@@ -28,7 +28,7 @@ does not change.
   - CR→LF translation (Enter sends `\n` to the child).
 - **Child**: spawned with piped stdin/stdout/stderr over the `ProcessInfo`
   stdio contract via `std::process::Command`. The child path defaults to
-  `/programs/echosh` and is overridable through `argv[1]` (set in the recipe).
+  `/programs/shell` and is overridable through `argv[1]` (set in the recipe).
   On child exit the terminal respawns it.
 - **Supervision**: a non-bootstrap svcmgr service
   (`/config/svcmgr/services/terminal.svc`), `critical = no`, `restart = never`.
@@ -58,16 +58,13 @@ feeding the same channel with raw bytes (see deferrals).
   toggle**, **job control**, **multi-session / multi-terminal**, **pty
   equivalents**, **cross-process line buffering** — line-discipline maturity,
   tracked under [#29].
-- **A real interactive shell** — `echosh` is a placeholder; the shell lands as
-  `programs/shell` under [#112], at which point this terminal's `argv` retargets
-  to it.
 - **Any input/display broker layer** — separate future design issue.
 
 ## Known limitations
 
 - Framebuffer and serial are shared, unbrokered sinks: terminal output
-  interleaves with logd (serial) and the boot-time `fb-charset` dump
-  (framebuffer). Cosmetic until a broker exists.
+  interleaves with logd on both (serial, and logd's framebuffer mirror).
+  Cosmetic until a broker exists.
 - Non-printable named keys (arrows, Home/End/Delete, Tab, Escape) are ignored.
 - Backspace is byte-wise: it erases one byte of the current line, so
   backspacing a multi-byte UTF-8 character is incorrect. Grapheme-aware editing

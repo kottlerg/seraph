@@ -66,7 +66,7 @@ earlier ones, which remain as fallbacks.
 5. **Framebuffer-driver-mediated path** — once devmgr has spawned the
    framebuffer driver (`services/drivers/framebuffer/`), userspace
    framebuffer writers route bytes to it via `fb_labels::FB_WRITE_BYTES`.
-   Two consumers:
+   Consumers:
    - **real-logd** (`services/logd/src/main.rs`) resolves the framebuffer
      write cap via `devmgr_labels::QUERY_FRAMEBUFFER_DEVICE` — the same
      registry cap it already holds for the serial driver — and mirrors
@@ -75,19 +75,28 @@ earlier ones, which remain as fallbacks.
      UART. The mirror soft-degrades to serial-only whenever the driver is
      unresolvable (headless boot, or before it is spawned), so serial
      stays the authoritative channel.
-   - **`programs/fb-charset`**, a small demo program (a step above
-     "hello world") launched once per default boot by svcmgr via
-     `/config/svcmgr/services/fb-charset.svc` (`seed = devmgr.registry`).
-     It resolves the same write cap and emits a structured UTF-8 sequence
-     covering every glyph class (ASCII, CP437 high half, box-drawing,
-     font-extension, ASCII fallback, and one ill-formed sequence so the
-     U+FFFD glyph is reachable on screen), then exits.
+   - **`programs/terminal`** (#111) resolves the framebuffer write cap via
+     `QUERY_FRAMEBUFFER_DEVICE` and renders its child's stdout — the shell
+     (#112) and anything the shell runs — to the screen, mirrored to serial.
+     This is the production console path: ordinary programs do not resolve the
+     framebuffer themselves; they write stdout and the terminal relays it.
+     `programs/fb-charset` is one such program — a manual demo (a step above
+     "hello world") that prints a sample of every glyph class (ASCII, CP437
+     high half, box-drawing, font-extension, ASCII fallback, and one ill-formed
+     sequence so the U+FFFD glyph is reachable) to stdout for eyeballing the
+     driver's rendering. It is run from the shell and is not auto-started.
 
-   Production consumers (terminal, shell, compositor) arrive in
-   follow-up issues and resolve the cap through the same name. v1
-   exposes one verb only — `FB_WRITE_BYTES` — interpreting payloads as
-   UTF-8 with `\n`/`\r` short-circuited; graphical primitives are
-   listed under the driver README's "Planned future surface".
+   A compositor / display broker arrives in a follow-up issue and resolves
+   the cap through the same name. v1 exposes two verbs — `FB_WRITE_BYTES`
+   (UTF-8 payloads, `\n`/`\r`/`\x08` short-circuited) and `FB_SET_ATTRS` (sticky
+   24-bit foreground/background colour). The terminal owns ANSI SGR parsing
+   (`ESC[…m` → `FB_SET_ATTRS`); the driver never interprets control sequences,
+   so replacing the terminal does not touch the driver. The colour state is a
+   single global, shared by the terminal and logd's concurrent log mirror like
+   the single cursor — a log line written while the terminal holds a non-default
+   colour inherits it; per-client attribute state arrives with the compositor
+   (#153). Graphical primitives are listed under the driver README's "Planned
+   future surface".
 
 ## The serial driver as sole userspace UART owner
 

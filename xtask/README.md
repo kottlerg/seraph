@@ -100,6 +100,17 @@ fails if the bundle is missing. The bundle is composed by
 [`cargo xtask compose-bundle`](#cargo-xtask-compose-bundle) (any
 harness).
 
+`disk.img` carries three GPT partitions: the EFI System Partition
+(from `sysroot/esp/`), the arch-specific Seraph root (from `sysroot/`,
+excluding `esp/` and `data/`), and an arch-neutral `SERAPH_DATA`
+partition (from `sysroot/data/`). The data partition is authored
+unconditionally — there is no flag to toggle it. vfsd auto-mounts it at
+`/data`; the data tree lives only on this partition, not on root.
+(vfsd's fall-through would also serve `/data` from a root-fs directory,
+so a dedicated partition is a disk-authoring choice — the in-tree image
+uses the partition.) This applies to `build`, `mkdisk`, and
+`compose-bundle` alike.
+
 ```
 cargo xtask mkdisk [--arch x86_64|riscv64]
 ```
@@ -209,7 +220,8 @@ cargo xtask run-parallel \
     [--timeout SECONDS] \
     [--cpus N] \
     [--pass REGEX] \
-    [--fail REGEX]
+    [--fail REGEX] \
+    [--fail-grace-secs SECONDS]
 ```
 
 | Option | Default | Description |
@@ -221,6 +233,7 @@ cargo xtask run-parallel \
 | `--cpus` | `4` | vCPUs per guest |
 | `--pass` | `ALL TESTS PASSED` | Regex marking a successful run. The default matches the cross-harness terminal marker `[<harness>] ALL TESTS PASSED` standardised in [docs/testing.md](../docs/testing.md). On match the log is discarded and the run is classified `PASS` |
 | `--fail` | `SOME TESTS FAILED\|KERNEL EXCEPTION\|FATAL:\|PANIC( at \|: )` | Regex marking a failed run; the **first** match wins. Matches the cross-harness terminal marker `[<harness>] SOME TESTS FAILED` ([docs/testing.md](../docs/testing.md)) plus the kernel's own death markers (`KERNEL EXCEPTION` + `FATAL:` for a hardware trap, `PANIC at`/`PANIC:` for a Rust `panic!`) so a crash classifies `FAIL` rather than `HANG`. The benign `USERSPACE FAULT` path matches none of these. On match the log is preserved as `FAIL-<run>.log`. Failure takes precedence over success. Override with a never-matching pattern (e.g. `'$.^'`) to disable |
+| `--fail-grace-secs` | `10` | After the first `--fail` match, wait this many seconds (bounded by `--timeout`) before SIGKILL, so the trailing fault dump still lands in the log. A crashed run thus aborts ~grace seconds after the first match instead of idling to `--timeout` |
 
 **Mode-agnostic**: xtask does not know about ktest, svctest, or any other
 rootfs configuration. Pass/fail markers come from the invoker. The default
@@ -242,7 +255,8 @@ non-passing runs are preserved under `target/xtask/run-parallel/` as
 discarded.
 
 **Outcome precedence**:
-1. `--fail` regex matches → `FAIL`
+1. `--fail` regex matches → `FAIL` (a live match also triggers early abort
+   after `--fail-grace-secs`, bounded by `--timeout`; the verdict is unchanged)
 2. `--pass` regex matches → `PASS` (even if QEMU was watchdog-killed,
    which is the normal case for kernels that idle after success)
 3. Watchdog timeout → `HANG`
@@ -257,12 +271,12 @@ Boot the terminal interactive test, exercising keyboard input end-to-end
 through the live virtio-input driver and the autostarted `terminal`. Launches
 QEMU headless with a QMP control socket, waits for the guest to print
 `terminal: READY for injection` on the serial log, injects a known key
-sequence (`a`, Shift+`a`, `b`, Backspace, Return) via QMP `input-send-event`,
-and asserts — host-side — that the terminal's local echo and the relayed child
-output (`[echosh] aA`) appear on the serial stream. Exits non-zero on an
-injection error or the 180 s timeout. This subsumes the former standalone
-keyboard smoke test: the echoed `a`/`A` prove keysym/modifier decode, and
-Return/Backspace prove the named-key decodes.
+sequence (`help`, a stray `x`, Backspace, Return) via QMP `input-send-event`,
+and asserts — host-side — that the terminal's local echo, the shell's `$ `
+prompt, and the relayed `help` output (`shell built-ins:`) appear on the serial
+stream. Exits non-zero on an injection error or the 180 s timeout. This subsumes
+the former standalone keyboard smoke test: the echoed `help` proves keysym
+decode, and Return/Backspace prove the named-key decodes.
 
 A pure runner — it neither builds nor stages. `terminal.svc` is in the default
 boot set, so the terminal autostarts; just build and repack:

@@ -7,13 +7,14 @@
 # not auto-restart it; a post-login session model owns terminal lifecycle in a
 # later release). It is never in the ESP bundle and init never loads it.
 #
-# argv[1] is the child binary the terminal spawns; #112 retargets this to
-# /programs/shell. namespace = universal + cwd = /data so the terminal can
-# resolve and spawn the child via procmgr (mirrors the program-spawning test
-# harnesses). seed = devmgr.registry is the REGISTRY_QUERY_AUTHORITY SEND used
-# for QUERY_INPUT_DEVICE / QUERY_FRAMEBUFFER_DEVICE / QUERY_SERIAL_DEVICE.
+# argv[1] is the child binary the terminal spawns: /programs/shell (#112).
+# namespace = universal + cwd = /data so the terminal can resolve and spawn the
+# child via procmgr (mirrors the program-spawning test harnesses); the shell
+# re-seeds its own cwd to the namespace root at startup. seed = devmgr.registry
+# is the REGISTRY_QUERY_AUTHORITY SEND used for QUERY_INPUT_DEVICE /
+# QUERY_FRAMEBUFFER_DEVICE / QUERY_SERIAL_DEVICE.
 binary    = /programs/terminal
-argv      = terminal /programs/echosh
+argv      = terminal /programs/shell
 restart   = never
 critical  = no
 namespace = universal

@@ -123,9 +123,10 @@ pub enum BuildComponent
     HelloTester,
     FbCharset,
     Terminal,
-    Echosh,
     Fsbench,
     Pipefault,
+    Shell,
+    ShellTester,
     Stackoverflow,
     Demandpaged,
     Stdiotest,
@@ -300,4 +301,13 @@ pub struct RunParallelArgs
     /// Override with a never-matching pattern (e.g. `'$.^'`) to disable.
     #[arg(long, default_value = DEFAULT_FAIL_REGEX)]
     pub fail: String,
+
+    /// Grace window, in seconds, after the first `--fail` match before the
+    /// run is SIGKILLed. A kernel fault dump is multi-line and may be
+    /// followed by secondary-CPU faults; killing on the first matching byte
+    /// truncates the diagnostics. The run is killed at whichever is first:
+    /// this window, or the `--timeout` deadline. 0 kills on the next poll
+    /// after the match.
+    #[arg(long, default_value = "10")]
+    pub fail_grace_secs: u64,
 }

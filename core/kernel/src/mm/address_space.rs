@@ -767,6 +767,17 @@ impl AddressSpace
         // cache is clean. The contended `pt_lock` path enables interrupts while
         // spinning, so a remote CPU waiting on this lock still services and acks
         // our IPI: no deadlock.
+        // INV-3 Dekker A-side: bump tlb_gen and fence BEFORE snapshotting
+        // active_cpus (the same order as `shootdown_remote`). This guarantees
+        // that for any CPU caching this space, either it is in the snapshot
+        // below (gets the IPI) or it observes the bumped tlb_gen on its next
+        // reactivation (flushes the tag then). Snapshotting first would leave a
+        // CPU that activates concurrently in neither cover.
+        if crate::mm::tag_allocator::tagging_enabled()
+        {
+            self.tlb_gen.fetch_add(1, Ordering::Release);
+            core::sync::atomic::fence(Ordering::SeqCst);
+        }
         let current = crate::arch::current::cpu::current_cpu() as usize;
         // Only CPUs that run this AS cache its translations — the kernel edits
         // these page tables through the direct map, never by loading this root.
@@ -779,13 +790,6 @@ impl AddressSpace
         }
         let mut remote = self.active_cpu_mask();
         remote.clear(current);
-        if crate::mm::tag_allocator::tagging_enabled()
-        {
-            // Late-joiner cover: a CPU switched away (absent from `remote`, no
-            // IPI) flushes this tag on reactivation. Mirrors `shootdown_remote`.
-            self.tlb_gen.fetch_add(1, Ordering::Release);
-            core::sync::atomic::fence(Ordering::SeqCst);
-        }
         if !remote.is_empty()
         {
             // virt = u64::MAX routes the remote handler to flush_tlb_all()

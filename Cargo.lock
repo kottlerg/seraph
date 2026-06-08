@@ -747,9 +747,14 @@ dependencies = [
  "ipc",
  "namespace-protocol",
  "process-abi",
+ "procmgr-process-table",
  "syscall",
  "syscall-abi",
 ]
+
+[[package]]
+name = "procmgr-process-table"
+version = "0.1.0"
 
 [[package]]
 name = "pwrmgr"

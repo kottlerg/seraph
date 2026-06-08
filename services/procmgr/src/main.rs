@@ -25,6 +25,10 @@ mod loader;
 mod process;
 
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels, procmgr_errors, procmgr_labels};
+// Brings `configure_pipe` / `configure_namespace` into method-call scope; their
+// pipe/namespace logic moved onto an extension trait when `ProcessTable` was
+// extracted into the `procmgr-process-table` crate.
+use process::TableExt;
 use std::os::seraph::startup_info;
 
 /// Init → procmgr bootstrap plan (one round on procmgr's creator endpoint):

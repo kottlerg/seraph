@@ -19,6 +19,7 @@ from memmgr, not from a procmgr-owned pool.
 procmgr/
 ├── Cargo.toml                  # Workspace member; std-using binary
 ├── README.md
+├── process-table/              # `procmgr-process-table` crate: pure host-tested table + badge logic
 ├── src/
 │   ├── main.rs                 # _start() entry point, IPC dispatch loop
 │   ├── loader.rs               # ELF load pipeline

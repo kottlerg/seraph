@@ -42,6 +42,18 @@ fn page_round_up(n: u64) -> u64
     (n + 0xFFF) & !0xFFF
 }
 
+/// Physical `(base, size)` of the boot console UART that needs a dedicated
+/// `Mmio` capability minted at Phase 7. On RISC-V the `ns16550` UART sits outside
+/// the coarse aperture list, so it is surfaced here for init.
+// unnecessary_wraps: the Option is part of the cross-arch contract — x86-64's
+// `console_mmio` returns None (its console is a legacy I/O-port UART).
+#[allow(clippy::unnecessary_wraps)]
+#[must_use]
+pub fn console_mmio() -> Option<(u64, u64)>
+{
+    Some((uart_base(), uart_size()))
+}
+
 /// UART physical base. Returns the bootloader-discovered value when non-zero,
 /// otherwise [`DEFAULT_UART_BASE`].
 #[must_use]

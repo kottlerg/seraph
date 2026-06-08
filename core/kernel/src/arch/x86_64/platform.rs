@@ -94,6 +94,16 @@ pub fn uart_base_for_boot_info(_km: &KernelMmio) -> u64
     0
 }
 
+/// Physical `(base, size)` of a boot console UART needing a dedicated `Mmio`
+/// capability at Phase 7. Returns `None` on x86-64: the boot console is the
+/// legacy COM1 I/O-port UART (`0x3F8`), reached via an `IoPort` capability, not
+/// MMIO.
+#[must_use]
+pub fn console_mmio() -> Option<(u64, u64)>
+{
+    None
+}
+
 /// Fill `out` with all kernel-internal MMIO regions that must be direct-mapped
 /// during Phase 3 page-table setup. Returns the number of populated entries.
 ///

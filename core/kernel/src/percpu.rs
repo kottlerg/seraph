@@ -378,7 +378,11 @@ pub fn preemption_disabled() -> bool
 /// `cpu` must be < [`MAX_CPUS`]. The returned reference is `'static` because
 /// `PER_CPU` outlives any conceivable caller; concurrent access is safe via
 /// the [`AtomicPtr`] interior mutability.
-#[cfg(all(not(test), target_arch = "x86_64"))]
+// dead_code: consumed only by arch/x86_64 (lazy-FPU owner cache + #NM handler);
+// present unconditionally so no architecture cfg-gate is needed here. RISC-V
+// uses eager FS/VS-dirty FPU tracking and never reads this slot.
+#[allow(dead_code)]
+#[cfg(not(test))]
 pub fn fpu_owner_for(cpu: usize) -> &'static AtomicPtr<ThreadControlBlock>
 {
     // SAFETY: cpu < CPU_COUNT by caller contract; AtomicPtr permits concurrent

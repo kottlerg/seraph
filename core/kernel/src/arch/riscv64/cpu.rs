@@ -50,6 +50,20 @@ pub fn halt_until_interrupt()
     }
 }
 
+/// Read the current stack pointer (`sp`, x2).
+///
+/// Used by the panic-path backtrace scanner to bound the kernel-stack walk.
+#[cfg(not(test))]
+pub fn current_stack_pointer() -> u64
+{
+    let sp: u64;
+    // SAFETY: reads the stack pointer register only; no memory access, no clobbers.
+    unsafe {
+        core::arch::asm!("mv {}, sp", out(reg) sp, options(nomem, nostack, preserves_flags));
+    }
+    sp
+}
+
 /// Return the current hart ID.
 ///
 /// Phase 5: only the BSP is running; returns 0.

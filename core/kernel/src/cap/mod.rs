@@ -1390,14 +1390,11 @@ fn populate_cspace(
 {
     use init_protocol::CapType;
 
-    /// Width of the root `Interrupt` range cap minted at Phase 7.
-    /// x86-64 IOAPICs cover GSI 0..256; RISC-V PLIC spec max is 1024
-    /// sources. Sized at the per-arch spec max — arch helpers reject
+    /// Width of the root `Interrupt` range cap minted at Phase 7 — the per-arch
+    /// interrupt-controller spec maximum (`arch::current::ROOT_IRQ_COUNT`: 256
+    /// GSIs on x86-64, 1024 PLIC sources on RISC-V). Arch helpers reject
     /// out-of-range ids, so oversizing is safe.
-    #[cfg(target_arch = "x86_64")]
-    const ROOT_IRQ_COUNT: u32 = 256;
-    #[cfg(target_arch = "riscv64")]
-    const ROOT_IRQ_COUNT: u32 = 1024;
+    const ROOT_IRQ_COUNT: u32 = crate::arch::current::ROOT_IRQ_COUNT;
 
     /// Maximum number of `AcpiReclaimable` regions to mint caps for.
     /// Real firmware reports 1–2; the cap guards against pathological
@@ -1547,10 +1544,8 @@ fn populate_cspace(
     let mut hw_cap_base: u32 = 0;
     let mut hw_cap_count: u32 = 0;
 
-    #[cfg(target_arch = "riscv64")]
+    if let Some((uart_base, uart_size)) = crate::arch::current::platform::console_mmio()
     {
-        let uart_base = crate::arch::current::platform::uart_base();
-        let uart_size = crate::arch::current::platform::uart_size();
         let ptr = mint_phase7_body(MmioObject {
             header: KernelObjectHeader::with_ancestor(ObjectType::Mmio, seed_header_nn()),
             base: uart_base,
@@ -1828,10 +1823,10 @@ fn populate_cspace(
         0
     };
 
-    // x86-64: root IoPort covering the full 64K I/O port space.
-    // This is a static architectural fact, not derived from any bootloader
-    // field. Init subdivides and delegates sub-ranges to services as needed.
-    #[cfg(target_arch = "x86_64")]
+    // Root IoPort covering the full 64K I/O port space (x86-64 only). This is
+    // a static architectural fact, not derived from any bootloader field. Init
+    // subdivides and delegates sub-ranges to services as needed.
+    if crate::arch::current::HAS_IO_PORTS
     {
         let ptr = mint_phase7_body(IoPortObject {
             header: KernelObjectHeader::with_ancestor(ObjectType::IoPort, seed_header_nn()),
@@ -1861,8 +1856,8 @@ fn populate_cspace(
     // RISC-V: one SbiControl capability — the root forwarding authority. It
     // carries every sanctioned SBI right; init attenuates per-consumer copies
     // (devmgr serves pwrmgr a `SBI_RESET`-only derivative).
-    #[cfg(target_arch = "riscv64")]
-    let sbi_control_slot = {
+    let sbi_control_slot = if crate::arch::current::HAS_SBI
+    {
         let ptr = mint_phase7_body(SbiControlObject {
             header: KernelObjectHeader::with_ancestor(ObjectType::SbiControl, seed_header_nn()),
         });
@@ -1889,9 +1884,11 @@ fn populate_cspace(
             },
         );
         slot
+    }
+    else
+    {
+        0u32
     };
-    #[cfg(not(target_arch = "riscv64"))]
-    let sbi_control_slot = 0u32;
 
     CSpaceLayout {
         memory_base,

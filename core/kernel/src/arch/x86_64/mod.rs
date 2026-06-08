@@ -36,12 +36,40 @@ pub const MAX_IRQ_ID: u32 = 255;
 pub const MIN_IRQ_ID: u32 = 0;
 
 /// x86-64 has I/O port space; `IoPort` resources are valid here.
-#[allow(dead_code)]
 pub const HAS_IO_PORTS: bool = true;
+
+/// x86-64 has no SBI firmware interface; `SbiControl` is a RISC-V-only concept.
+pub const HAS_SBI: bool = false;
+
+/// Width of the root `Interrupt` range capability minted at Phase 7. x86-64
+/// I/O APICs cover GSI 0..256.
+pub const ROOT_IRQ_COUNT: u32 = 256;
 
 /// Size of the I/O Permission Bitmap in bytes (re-exported from gdt for use
 /// in architecture-independent code such as `ThreadControlBlock`).
 pub use gdt::IOPB_SIZE;
+
+/// Forward a sanctioned SBI call — unsupported on x86-64.
+///
+/// x86-64 has no SBI firmware interface, so this always fails. Unreachable in
+/// practice: `syscall::sbi::sys_sbi_call` gates on [`HAS_SBI`] before calling.
+#[cfg(not(test))]
+pub fn sbi_forward(_extension: u64, _function: u64, _a0: u64, _a1: u64, _a2: u64)
+-> Result<u64, ()>
+{
+    Err(())
+}
+
+/// Allocate the x86-64 per-CPU tables (per-AP GDT/TSS, AP IST stacks, and the
+/// NMI-backtrace request slab) for `cpu_count` CPUs. Called once on the BSP
+/// during SMP bring-up.
+#[cfg(not(test))]
+pub fn init_ap_percpu_storage(cpu_count: usize, allocator: &mut crate::mm::BuddyAllocator)
+{
+    gdt::init_ap_storage(cpu_count, allocator);
+    ap_trampoline::init_ap_ist_storage(cpu_count, allocator);
+    interrupts::init_nmi_backtrace_storage(cpu_count, allocator);
+}
 
 // MMIO regions that must be direct-mapped during Phase 3 page-table setup are
 // supplied by [`platform::collect_mmio_direct_map_regions`], which reads

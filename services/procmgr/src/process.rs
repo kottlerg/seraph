@@ -53,7 +53,7 @@ fn next_process_badge() -> u64
     loop
     {
         let t = NEXT_BADGE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if (t as u32) != ipc::procmgr_labels::INIT_REAP_CORRELATOR
+        if badge_is_acceptable(t, ipc::procmgr_labels::INIT_REAP_CORRELATOR)
         {
             return t;
         }
@@ -125,216 +125,44 @@ pub fn install_logd_death_eq(table: &mut ProcessTable, logd_eq: u32) -> bool
     true
 }
 
-/// Maximum concurrent child processes procmgr tracks.
+// Pure process-table, badge, and recent-exit logic now lives in the
+// host-testable `procmgr-process-table` crate; the syscall/IPC-bearing
+// operations below stay in the service and drive its lookups. Re-exported so
+// the `process::{ProcessTable, ProcessEntry, RecentExits, MAX_PROCESSES}` paths
+// `main.rs` already uses keep resolving unchanged.
+pub use process_table::{
+    MAX_PROCESSES, ProcessEntry, ProcessTable, RecentExits, badge_is_acceptable,
+};
+
+// ── Process table (impure operations) ─────────────────────────────────────────
+
+/// Service-private extension trait carrying the syscall/IPC-bearing
+/// operations on the (now-foreign) [`ProcessTable`]. Rust forbids inherent
+/// `impl` blocks on a type from another crate, so the pipe- and
+/// namespace-configuration methods — which `cap_copy`, `cap_delete`, and map
+/// the child's `ProcessInfo` page — live here as a trait the service alone
+/// sees. Pure slot/badge logic stays on the type itself in the crate.
 ///
-/// Independent of any wait-set capacity — the shared death queue fans in
-/// all children's exit events with kernel-side multi-bind, so there is no
-/// per-child wait-set slot. Raise this (and the death queue capacity in
-/// `main.rs`) as real workloads demand.
-pub const MAX_PROCESSES: usize = 32;
-
-// ── Process table ───────────────────────────────────────────────────────────
-
-/// Per-process resource record. Fields read when teardown is implemented.
-///
-/// All fields are non-atomic. Concurrent access is precluded by
-/// procmgr's structurally single-threaded dispatch: every mutating
-/// path (`configure_namespace`, `start_process`, `teardown_entry`,
-/// memmgr reclaim handlers) runs sequentially under the lone
-/// `service_ep` recv loop in `main.rs`. If procmgr is ever made
-/// multi-threaded — as vfsd was, for spawn-deadlock avoidance — the
-/// `started` bool (read by `configure_namespace`, read+written by
-/// `start_process`) must become `AtomicBool` with compare-and-swap
-/// transitions, and the namespace/cwd-override slots need per-entry
-/// serialisation to keep the install-once contract.
-#[allow(dead_code)]
-pub struct ProcessEntry
+/// `pub(crate)` so the IPC dispatch handlers in `main.rs` can bring it into
+/// scope and keep calling `table.configure_pipe(..)` / `configure_namespace(..)`
+/// with the original method syntax.
+pub(crate) trait TableExt
 {
-    badge: u64,
-    aspace_cap: u32,
-    cspace_cap: u32,
-    thread_cap: u32,
-    pi_memory_cap: u32,
-    tls_memory_cap: u32,
-    /// Slot in procmgr's `CSpace` of the badged SEND cap on memmgr's
-    /// endpoint that procmgr minted via `REGISTER_PROCESS` for this child.
-    /// Held until `PROCESS_DIED`. Zero when memmgr was unwired at create
-    /// time (early-boot regression path).
-    memmgr_send_cap: u32,
-    /// Memmgr-side process badge for this child. Sent in the
-    /// `PROCESS_DIED` payload so memmgr can reclaim the right record.
-    memmgr_badge: u64,
-    /// Per-process system-root cap installed by
-    /// [`ProcessTable::configure_namespace`]. Zero means the child
-    /// runs with no namespace authority (`ProcessInfo.system_root_cap`
-    /// stays zero; std-side fs ops on absolute paths return
-    /// `Unsupported`). Held in procmgr's `CSpace` from
-    /// `CONFIGURE_NAMESPACE` until [`start_process`] consumes it
-    /// (`cap_copy` into the child, then `cap_delete` of the procmgr-side
-    /// slot) or the entry is torn down (`teardown_entry` deletes the
-    /// slot if still present).
-    namespace_override: u32,
-    /// Per-process cwd cap installed by
-    /// [`ProcessTable::configure_namespace`]. Zero means the child has
-    /// no cwd cap (`ProcessInfo.current_dir_cap` stays zero; relative
-    /// paths return `Unsupported` until installed). Same lifetime
-    /// rules as `namespace_override`.
-    cwd_override: u32,
-    entry_point: u64,
-    tls_base_va: u64,
-    started: bool,
+    fn configure_pipe(
+        &mut self,
+        badge: u64,
+        self_aspace: u32,
+        direction: u64,
+        memory_cap: u32,
+        data_notification: u32,
+        space_notification: u32,
+    ) -> Result<(), u64>;
+
+    fn configure_namespace(&mut self, badge: u64, root_cap: u32, cwd_cap: u32) -> Result<(), u64>;
 }
 
-impl ProcessEntry
+impl TableExt for ProcessTable
 {
-    pub fn badge(&self) -> u64
-    {
-        self.badge
-    }
-}
-
-/// Ring of recently auto-reaped processes, queried on `QUERY_PROCESS`
-/// table miss to distinguish "exited recently" from "never existed".
-/// Best-effort retention: oldest entries are overwritten as new ones
-/// arrive; queries on rotated-out badges return `None`.
-#[derive(Clone, Copy)]
-pub struct RecentExits
-{
-    ring: [Option<RecentExit>; RECENT_EXITS_SLOTS],
-    head: usize,
-}
-
-#[derive(Clone, Copy)]
-struct RecentExit
-{
-    badge: u64,
-    exit_reason: u64,
-}
-
-const RECENT_EXITS_SLOTS: usize = 16;
-
-impl RecentExits
-{
-    pub const fn new() -> Self
-    {
-        Self {
-            ring: [None; RECENT_EXITS_SLOTS],
-            head: 0,
-        }
-    }
-
-    pub fn record(&mut self, badge: u64, exit_reason: u64)
-    {
-        self.ring[self.head] = Some(RecentExit { badge, exit_reason });
-        self.head = (self.head + 1) % RECENT_EXITS_SLOTS;
-    }
-
-    pub fn find(&self, badge: u64) -> Option<u64>
-    {
-        self.ring
-            .iter()
-            .filter_map(|s| s.as_ref())
-            .find(|e| e.badge == badge)
-            .map(|e| e.exit_reason)
-    }
-}
-
-pub struct ProcessTable
-{
-    entries: [Option<ProcessEntry>; MAX_PROCESSES],
-}
-
-impl ProcessTable
-{
-    pub const fn new() -> Self
-    {
-        const NONE: Option<ProcessEntry> = None;
-        Self {
-            entries: [NONE; MAX_PROCESSES],
-        }
-    }
-
-    fn insert(&mut self, entry: ProcessEntry) -> bool
-    {
-        for slot in &mut self.entries
-        {
-            if slot.is_none()
-            {
-                *slot = Some(entry);
-                return true;
-            }
-        }
-        false
-    }
-
-    fn find_mut_by_badge(&mut self, badge: u64) -> Option<&mut ProcessEntry>
-    {
-        self.entries
-            .iter_mut()
-            .filter_map(|s| s.as_mut())
-            .find(|e| e.badge == badge)
-    }
-
-    fn take_by_badge(&mut self, badge: u64) -> Option<ProcessEntry>
-    {
-        for slot in &mut self.entries
-        {
-            if let Some(entry) = slot.as_ref()
-                && entry.badge == badge
-            {
-                return slot.take();
-            }
-        }
-        None
-    }
-
-    /// Remove and return the entry whose badge matches `correlator` in its
-    /// low 32 bits. Used by the auto-reap dispatch to resolve a death event
-    /// back to its process. Stale correlators (entry already reaped)
-    /// return `None`; callers drop such events silently.
-    pub fn take_by_correlator(&mut self, correlator: u32) -> Option<ProcessEntry>
-    {
-        for slot in &mut self.entries
-        {
-            if let Some(entry) = slot.as_ref()
-                && (entry.badge as u32) == correlator
-            {
-                return slot.take();
-            }
-        }
-        None
-    }
-
-    /// Visit every live entry in insertion order. Used by
-    /// `install_logd_death_eq` to retroactively bind logd's EQ as a
-    /// second death observer on each child's main thread.
-    pub fn for_each<F: FnMut(&ProcessEntry)>(&self, mut f: F)
-    {
-        for slot in &self.entries
-        {
-            if let Some(entry) = slot.as_ref()
-            {
-                f(entry);
-            }
-        }
-    }
-
-    /// Lightweight status lookup for `QUERY_PROCESS`. Returns
-    /// `(started, thread_cap)` when an entry is present; `None` if the
-    /// badge is unknown (already reaped or never existed).
-    ///
-    /// `thread_cap` is procmgr's `CSpace` slot for the child's main thread,
-    /// suitable for `cap_info`'s `CAP_INFO_THREAD_STATE` selector to
-    /// fetch the kernel-authoritative lifecycle snapshot.
-    pub fn query_by_badge(&self, badge: u64) -> Option<(bool, u32)>
-    {
-        self.entries
-            .iter()
-            .filter_map(|s| s.as_ref())
-            .find(|e| e.badge == badge)
-            .map(|e| (e.started, e.thread_cap))
-    }
-
     /// Install one direction's shmem pipe on a suspended child
     /// identified by `badge`.
     ///
@@ -358,7 +186,7 @@ impl ProcessTable
     /// - `procmgr_errors::INVALID_ARGUMENT` — bad direction selector or
     ///   any cap is zero.
     /// - `procmgr_errors::OUT_OF_MEMORY` — mapping / `cap_copy` failure.
-    pub fn configure_pipe(
+    fn configure_pipe(
         &mut self,
         badge: u64,
         self_aspace: u32,
@@ -437,12 +265,7 @@ impl ProcessTable
     /// - `procmgr_errors::INVALID_BADGE` — no entry for `badge` (caps dropped).
     /// - `procmgr_errors::ALREADY_STARTED` — target is already running (caps dropped).
     /// - `procmgr_errors::INVALID_ARGUMENT` — `root_cap` is zero.
-    pub fn configure_namespace(
-        &mut self,
-        badge: u64,
-        root_cap: u32,
-        cwd_cap: u32,
-    ) -> Result<(), u64>
+    fn configure_namespace(&mut self, badge: u64, root_cap: u32, cwd_cap: u32) -> Result<(), u64>
     {
         if root_cap == 0
         {

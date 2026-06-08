@@ -8,6 +8,7 @@ members = [
     "services/memmgr",
     "services/memmgr/free-pool",
     "services/procmgr",
+    "services/procmgr/process-table",
     "services/svcmgr",
     "services/svctest",
     "services/usertest",

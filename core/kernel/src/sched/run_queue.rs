@@ -54,9 +54,9 @@ impl RunQueue
     /// from a duplicate wake source). It reports the prior link's breadcrumb
     /// (recorded by [`PerCpuScheduler::enqueue`]) so the racing call site is
     /// named alongside the current one. `#[track_caller]` propagates the
-    /// panic location to the kernel's panic handler
-    /// (`core/kernel/src/main.rs:1186-1198`), so the panic banner names the
-    /// current call site (e.g. `sched/mod.rs:1806` for `enqueue_and_wake`).
+    /// panic location to the kernel's `#[panic_handler]`
+    /// (`core/kernel/src/main.rs`), so the panic banner names the
+    /// current call site (e.g. `enqueue_and_wake` in `core/kernel/src/sched/mod.rs`).
     #[track_caller]
     fn enqueue(&mut self, tcb: *mut ThreadControlBlock)
     {

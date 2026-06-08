@@ -636,8 +636,8 @@ extern "C" fn child_cross_entry(_arg: u64) -> !
             "ecall",
             // SIGNAL_WAIT(sig_resume, 0): a7=4, a0=sig_resume, a1=0 (no
             // timeout). MUST zero a1 explicitly — the kernel reads
-            // tf.arg(1) as `timeout_ms` (sys_notification_wait at
-            // core/kernel/src/syscall/ipc.rs:895), and the previous
+            // tf.arg(1) as `timeout_ms` (sys_notification_wait in
+            // core/kernel/src/syscall/ipc.rs), and the previous
             // SIGNAL_SEND left a1=1 in the register file. Without this
             // store the wait runs with a 1 ms timeout and the test
             // races past the migration step it claims to validate.

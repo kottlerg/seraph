@@ -625,11 +625,11 @@ fn populate_child_info(
         // `cap_derive_badge(..., process_badge)` shape used for
         // `procmgr_endpoint_cap` just above. The reason:
         // `universals.memmgr_endpoint` is the per-child badged cap
-        // memmgr minted in its `REGISTER_PROCESS` handler at
-        // `services/memmgr/src/main.rs:781`
-        // (`cap_derive_badge(service_ep, SEND_GRANT, new_badge)`),
+        // memmgr minted in its `REGISTER_PROCESS` handler
+        // `handle_register_process` (`services/memmgr/src/main.rs`) via
+        // `cap_derive_badge(service_ep, SEND_GRANT, new_badge)`,
         // returned via IPC in `register_with_memmgr`
-        // (`services/procmgr/src/main.rs:222-244`). The source is
+        // (`services/procmgr/src/main.rs`). The source is
         // already kernel-badged with a memmgr-private per-child
         // value; `cap_copy` propagates the badge to the child slot.
         // Children therefore cannot `sys_cap_derive_badge` to mint a

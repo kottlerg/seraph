@@ -760,7 +760,7 @@ pub unsafe fn unmap_user_page(root_virt: u64, virt: u64)
 ///
 /// Intermediate tables are NOT freed — they may host other low-VA
 /// mappings (notably the boot-stack identity mapping installed by
-/// `mm/paging.rs:572-599` and any future low-PA identity entries).
+/// `map_boot_stack` in `mm/paging.rs`, and any future low-PA identity entries).
 // similar_names: root_va and root_pa are a VA/PA pair — the similarity is
 // intentional and follows the pattern used elsewhere in this file.
 #[cfg(not(test))]

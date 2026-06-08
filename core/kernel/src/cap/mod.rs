@@ -2382,7 +2382,8 @@ pub unsafe fn move_cap_between_cspaces(
     let (src_parent, src_first_child, src_prev, src_next) = {
         // SAFETY: src_cspace is a valid CSpace pointer; guaranteed by caller contract.
         let cs = unsafe { &*src_cspace };
-        // SAFETY: We validated src_idx exists at line 434
+        // SAFETY: src_idx was validated to index a live slot by the
+        // cs.slot(src_idx).ok_or(...) check in the source-slot read above.
         #[allow(clippy::unwrap_used)]
         let slot = cs.slot(src_idx).unwrap();
         (

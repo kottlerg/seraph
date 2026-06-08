@@ -1104,7 +1104,7 @@ fn blocker_entry(arg: u64) -> !
 /// The CPU id is encoded as `1u64 << cpu` (one bit per CPU) rather than
 /// the raw integer. Raw encoding fails when `cpu == 0`: `notification_send`
 /// rejects zero-bit sends with `InvalidArgument` (see
-/// `core/kernel/src/syscall/ipc.rs:832–835`), the child silently exits,
+/// `sys_notification_send` in `core/kernel/src/syscall/ipc.rs`), the child silently exits,
 /// and the parent's `notification_wait` parks indefinitely — manifesting as the
 /// all-CPUs-idle stall in issue #116. The bit-per-CPU encoding is always
 /// non-zero for any valid CPU id, so the wake always lands; a stale-CPU

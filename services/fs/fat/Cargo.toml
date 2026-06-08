@@ -10,6 +10,11 @@ path = "src/main.rs"
 test = false
 
 [dependencies]
+# Pure FAT BPB + directory decoders; fatfs wraps them with block I/O and the
+# log!-emitting state machine. Package is `fatfs-parse` (the bare `fatfs` name
+# is this crate); the short `fat_parse` key keeps in-crate `use` paths terse,
+# mirroring vfsd's `gpt`.
+fat_parse = { path = "fat-parse", package = "fatfs-parse" }
 ipc = { path = "../../../shared/ipc" }
 namespace-protocol = { path = "../../../shared/namespace-protocol" }
 syscall = { path = "../../../shared/syscall" }

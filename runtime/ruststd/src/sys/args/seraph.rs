@@ -17,6 +17,8 @@
 // preserves the raw bytes. Callers that need to tolerate non-UTF-8 argv
 // should use `args_os`.
 
+use argv_env::next_field;
+
 use crate::ffi::OsString;
 use crate::fmt;
 use crate::os::seraph::try_startup_info;
@@ -48,13 +50,12 @@ impl fmt::Debug for Args {
         let mut list = f.debug_list();
         let mut cur = self.cursor;
         let mut left = self.remaining;
-        while left > 0 && cur < self.blob.len() {
-            let end = match self.blob[cur..].iter().position(|&b| b == 0) {
-                Some(off) => cur + off,
-                None => self.blob.len(),
+        while left > 0 {
+            let Some((field, next)) = next_field(self.blob, cur) else {
+                break;
             };
-            list.entry(&String::from_utf8_lossy(&self.blob[cur..end]));
-            cur = end.saturating_add(1);
+            list.entry(&String::from_utf8_lossy(field));
+            cur = next;
             left -= 1;
         }
         list.finish()
@@ -65,19 +66,15 @@ impl Iterator for Args {
     type Item = OsString;
 
     fn next(&mut self) -> Option<OsString> {
-        if self.remaining == 0 || self.cursor >= self.blob.len() {
+        if self.remaining == 0 {
             return None;
         }
-        let start = self.cursor;
-        let end = match self.blob[start..].iter().position(|&b| b == 0) {
-            Some(off) => start + off,
-            None => self.blob.len(),
-        };
-        self.cursor = end.saturating_add(1);
+        let (field, next) = next_field(self.blob, self.cursor)?;
+        self.cursor = next;
         self.remaining -= 1;
         // OsString on seraph is UTF-8 bytes; lossless for valid UTF-8,
         // lossy substitution for ill-formed sequences at the boundary.
-        Some(OsString::from(String::from_utf8_lossy(&self.blob[start..end]).into_owned()))
+        Some(OsString::from(String::from_utf8_lossy(field).into_owned()))
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {

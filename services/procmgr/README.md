@@ -23,7 +23,9 @@ procmgr/
 ├── src/
 │   ├── main.rs                 # _start() entry point, IPC dispatch loop
 │   ├── loader.rs               # ELF load pipeline
-│   └── process.rs              # Per-process state, kernel-object allocation
+│   ├── process.rs              # Per-process state, kernel-object allocation
+│   ├── init_reap.rs            # Init-reap: tears down init's residue after handover
+│   └── arch/                   # Arch-specific helpers
 └── docs/
     └── ipc-interface.md        # procmgr IPC interface specification
 ```

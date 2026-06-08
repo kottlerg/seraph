@@ -11,7 +11,7 @@ Build task runner for Seraph. Invoke via `cargo xtask <command>`.
 Build Seraph components and populate `sysroot/`.
 
 ```
-cargo xtask build [--arch x86_64|riscv64] [--release] [--component boot|kernel|init|all]
+cargo xtask build [--arch x86_64|riscv64] [--release] [--component boot|kernel|init|all] [--debug <comp>[,...]]
 ```
 
 | Option | Default | Description |
@@ -19,6 +19,7 @@ cargo xtask build [--arch x86_64|riscv64] [--release] [--component boot|kernel|i
 | `--arch` | `x86_64` | Target architecture |
 | `--release` | off | Build in release mode |
 | `--component` | `all` | Build a single component (`boot`, `kernel`, `init`, or `all`) |
+| `--debug` | (none) | Emit debuginfo (`debug=2`, `opt-level=1`) for the named component(s) only, e.g. `--debug kernel,procmgr`; applies within the active profile. See [Build Profiles](../docs/build-system.md#build-profiles). |
 
 The sysroot is architecture-specific. Building for a different arch than the
 existing sysroot is an error — run `cargo xtask clean` first.

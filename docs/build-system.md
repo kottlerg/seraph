@@ -106,6 +106,47 @@ opt-in.
 
 ---
 
+## Build Profiles
+
+Two Cargo profiles are defined at the workspace root (`Cargo.toml`): `dev`
+(the default) and `release` (selected by `--release`). Both share
+`opt-level = 2` and `debug = 0`; they differ only in two key pairs:
+
+| Concern | `dev` | `release` |
+|---|---|---|
+| Iterate (runtime checks) | `debug-assertions`, `overflow-checks` on | off |
+| Ship (codegen) | — | `lto = true`, `codegen-units = 1` |
+
+Both set `panic = "abort"`. LTO has no per-package form, which is the only
+reason two profiles persist rather than one. Cargo names the profiles `dev`
+and `release` but writes their output to `target/<triple>/debug/` and
+`target/<triple>/release/`; the CI cells and branch-protection status checks
+use the directory names `debug`/`release`.
+
+### Debuginfo is opt-in
+
+`debug = 0` means a plain `cargo xtask build` (or `--release`) emits no
+per-binary DWARF — every installed binary is symbol-free. To debug specific
+components, opt them in:
+
+```
+cargo xtask build --debug <component>[,<component>…]
+```
+
+This injects `--config profile.<active>.package."<pkg>".debug=2` plus
+`opt-level=1` for the named package(s) only, leaving every other binary
+symbol-free. `<active>` is `dev` by default, `release` under `--release`.
+The debugged crate drops to `opt-level = 1` (not `0`): opt-0 inflates stack
+frames and risks overflowing the tight kernel/thread stacks.
+
+Limits: under `--release`, fat LTO reoptimizes at the profile opt-level and
+partially overrides the per-package `opt-level=1`, so step fidelity is
+degraded — the normal debug flow uses the default (`dev`) profile. No `strip`
+is configured: debuginfo is already absent by default, and stripping would
+risk panic/fault backtrace symbolization.
+
+---
+
 ## Build Output: the Sysroot
 
 Build artifacts are staged in `sysroot/`, which is then packaged into the

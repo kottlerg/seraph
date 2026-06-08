@@ -1449,6 +1449,19 @@ pub unsafe fn commit_blocked_under_local_lock(
                     (*tcb).state = thread::ThreadState::Blocked;
                     (*tcb).ipc_state = ipc;
                     (*tcb).blocked_on_object = blocked_on;
+                    // Clear the publication barrier as part of the park commit so
+                    // EVERY parker carries context_saved = 0 while Blocked: a
+                    // cross-CPU waker's dispatch then spins on the cs barrier
+                    // until this thread's own schedule(false) -> switch()
+                    // republishes its saved state, instead of dispatching a
+                    // not-yet-saved register file. The IPC parkers already
+                    // pre-clear cs (ordered before their reply_tcb publish, and
+                    // retained); folding it here makes the clear-before-park rule
+                    // self-enforcing and idempotent for them, and closes
+                    // sys_thread_sleep, which had no pre-clear.
+                    (*tcb)
+                        .context_saved
+                        .store(0, core::sync::atomic::Ordering::Relaxed);
                     true
                 }
             }
@@ -1643,15 +1656,28 @@ pub unsafe fn migrate_ready_thread(
     // SAFETY: lo lock held; acquiring hi second satisfies ascending-CPU order.
     let saved_hi = unsafe { hi_sched.lock.lock_raw() };
 
-    // Authoritative read under sched_lock: only a Ready thread is migratable.
+    // Authoritative read under sched_lock: only a Ready thread that has FULLY
+    // saved its context (`context_saved == 1`) is migratable. A Ready-but-
+    // `cs == 0` thread is mid-handoff — woken (e.g. a fast IPC reply) while still
+    // `current`/live on its source CPU and not yet switched away; relocating it
+    // cross-CPU would dispatch it on two CPUs at once (#314/#293). `cs == 1`
+    // proves it has switched out and is not `current` anywhere. A skipped
+    // mid-handoff thread keeps its (already-written) affinity and is placed
+    // correctly by its source CPU's `schedule()` cross-affinity arm.
     // `remove_from_queue(src)` below is the authoritative "located on src" check —
     // it fails (and we bail) if the thread is Ready on a different CPU's queue or
     // in the benign Ready-but-unlinked publication window — so no separate
     // preferred_cpu heuristic is needed.
-    // SAFETY: tcb valid; state/priority read under sched_lock + run-queue locks.
-    let (state, priority) = unsafe { ((*tcb).state, (*tcb).priority) };
+    // SAFETY: tcb valid; state/cs/priority read under sched_lock + run-queue locks.
+    let (state, cs, priority) = unsafe {
+        (
+            (*tcb).state,
+            (*tcb).context_saved.load(Ordering::Acquire),
+            (*tcb).priority,
+        )
+    };
 
-    if state != thread::ThreadState::Ready
+    if state != thread::ThreadState::Ready || cs != 1
     {
         // SAFETY: paired above; release inner (hi, lo) then outer (sched_lock).
         unsafe {
@@ -1870,9 +1896,22 @@ unsafe fn pull_unpinned_ready(src_cpu: usize, dst_cpu: usize)
     // threads; the matching `switch_out_save` clears ownership before
     // the thread re-enters the Ready state. So every Ready candidate's
     // XSAVE area is already canonical and safe to pull.
+    // Only steal a FULLY-SAVED Ready thread (`context_saved == 1`). A
+    // Ready-but-`context_saved == 0` candidate is mid-handoff: it was woken
+    // (e.g. a fast IPC reply) while still `current`/live on `src_cpu` and has
+    // not yet reached its own `schedule()` to switch away. Relocating it to
+    // `dst_cpu` and dispatching it there marks it `Running` on two CPUs at once
+    // — the cross-CPU double-dispatch behind #314/#293. `cs == 1` provably means
+    // the thread has switched out and is not `current` on any CPU, so it is safe
+    // to pull (every parker clears `cs = 0` at the block commit; the source
+    // CPU's `switch()` republishes `cs = 1` once the register save is
+    // committed). A skipped mid-handoff thread is dispatched by its source CPU
+    // and pulled on a later balance tick once `cs == 1`.
     // SAFETY: src_cpu valid; lock held; predicate is read-only.
     let pick = unsafe {
-        (*scheduler_ptr(src_cpu)).find_runnable(|tcb| (*tcb).cpu_affinity == AFFINITY_ANY)
+        (*scheduler_ptr(src_cpu)).find_runnable(|tcb| {
+            (*tcb).cpu_affinity == AFFINITY_ANY && (*tcb).context_saved.load(Ordering::Acquire) == 1
+        })
     };
 
     let Some((tcb, priority)) = pick

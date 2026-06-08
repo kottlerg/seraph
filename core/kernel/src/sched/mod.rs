@@ -1580,6 +1580,125 @@ pub unsafe fn prod_remote_cpu(target_cpu: usize)
 #[allow(unused_variables)]
 pub unsafe fn prod_remote_cpu(_target_cpu: usize) {}
 
+/// Spin until `tcb` is `current` on no CPU and its register save is published
+/// (`context_saved == 1`), prodding the owning remote CPU so it reaches
+/// `schedule()` promptly.
+///
+/// This is the "wait until the target has provably switched away on every CPU
+/// and committed its register file" barrier that `dealloc_object(Thread)`
+/// (`cap/object.rs`, the #207 free-gate) and `sys_thread_stop`'s drain already
+/// depend on. `sys_thread_start` reuses it before force-linking a resumed
+/// thread: a thread stopped while Running may still be `current`/executing on a
+/// remote CPU, and `enqueue_ready_thread` would otherwise dispatch it on a
+/// second CPU while it still runs on the first (the cross-CPU double-dispatch of
+/// #314/#293).
+///
+/// The caller MUST hold no scheduler lock and MUST have left `tcb` in a state
+/// `schedule()`'s requeue denylist rejects (`Stopped`/`Exited`/`Created`) so the
+/// owning CPU deschedules it WITHOUT re-linking it onto a run queue. The scan
+/// and spins take each per-CPU `scheduler.lock` one at a time and hold no lock
+/// across the wait; they run preempt-disabled with interrupts ENABLED (the #207
+/// envelope) so an inbound TLB/FPU IPI to this CPU stays serviceable.
+///
+/// # Safety
+/// `tcb` must be a valid [`ThreadControlBlock`] pointer.
+#[cfg(not(test))]
+pub unsafe fn await_descheduled(tcb: *mut thread::ThreadControlBlock)
+{
+    use core::sync::atomic::Ordering;
+
+    let cpu_count = CPU_COUNT.load(Ordering::Relaxed) as usize;
+    let me = crate::arch::current::cpu::current_cpu() as usize;
+
+    // #207 spin envelope: preempt-disabled, interrupts enabled. We enter at
+    // IF=0 (syscall); spinning at IF=0 would block an inbound TLB/FPU shootdown
+    // IPI targeted at this CPU and deadlock its initiator. Enabling IF keeps it
+    // serviceable while `preempt_disable` pins us so the scheduler cannot
+    // migrate us mid-drain. Mirrors `dealloc_object(Thread)` and the stop drain.
+    crate::percpu::preempt_disable();
+    // SAFETY: ring 0; restored below.
+    let saved_int = unsafe { crate::arch::current::cpu::save_and_disable_interrupts() };
+    // SAFETY: ring 0; IDT loaded; preempt disabled.
+    unsafe { crate::arch::current::interrupts::enable() };
+
+    // Step 1: not `current` on any CPU. Find the (at most one) CPU still naming
+    // `tcb` as current, prod it into `schedule()`, and spin on just that CPU's
+    // lock until it switches away; then re-scan. The target is denylisted, so
+    // the owning CPU drops it without re-linking — once a full scan is clean no
+    // CPU can re-install it.
+    loop
+    {
+        let run_cpu = 'scan: {
+            for cpu in 0..cpu_count
+            {
+                // SAFETY: cpu < cpu_count; scheduler slab initialised by init().
+                let s = unsafe { scheduler_for(cpu) };
+                // SAFETY: lock_raw/unlock_raw paired; no other lock held across.
+                let is_cur = unsafe {
+                    let f = s.lock.lock_raw();
+                    let c = s.current == tcb;
+                    s.lock.unlock_raw(f);
+                    c
+                };
+                if is_cur
+                {
+                    break 'scan Some(cpu);
+                }
+            }
+            None
+        };
+        let Some(run_cpu) = run_cpu
+        else
+        {
+            break;
+        };
+        // The target is Created/Stopped and the caller is the Running thread, so
+        // the target can never be `current` on the calling CPU; the prod always
+        // targets a remote. The assert fails loudly if a future change breaks
+        // that invariant (a self-`current` target would spin forever below).
+        debug_assert!(
+            run_cpu != me,
+            "await_descheduled: target is current on the calling CPU"
+        );
+        if run_cpu != me
+        {
+            // SAFETY: run_cpu < cpu_count.
+            unsafe { prod_remote_cpu(run_cpu) };
+        }
+        // SAFETY: run_cpu < cpu_count.
+        let sched = unsafe { scheduler_for(run_cpu) };
+        // SAFETY: lock_raw/unlock_raw paired; no other lock held across the spin.
+        while unsafe {
+            let f = sched.lock.lock_raw();
+            let still_current = sched.current == tcb;
+            sched.lock.unlock_raw(f);
+            still_current
+        }
+        {
+            core::hint::spin_loop();
+        }
+    }
+
+    // Step 2: register save published. The owning CPU's `switch()` stores
+    // `context_saved = 1` (Release) after saving `tcb`; pair with an Acquire
+    // load here. A Created/never-run thread inits `context_saved = 1`, so this
+    // is immediate on the first-start path.
+    // SAFETY: tcb valid; context_saved is AtomicU32.
+    while unsafe { (*tcb).context_saved.load(Ordering::Acquire) } == 0
+    {
+        core::hint::spin_loop();
+    }
+
+    // SAFETY: saved_int from save_and_disable_interrupts above.
+    unsafe { crate::arch::current::cpu::restore_interrupts(saved_int) };
+    crate::percpu::preempt_enable();
+}
+
+/// Test stub.
+#[cfg(test)]
+#[allow(unused_variables)]
+pub unsafe fn await_descheduled(_tcb: *mut thread::ThreadControlBlock) {}
+
 /// Migrate a `Ready` thread from `src_cpu`'s run queue onto `dst_cpu`'s
 /// run queue.
 ///

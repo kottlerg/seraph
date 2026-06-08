@@ -703,6 +703,10 @@ fn apply_std_cargo_deps_overlay(rust_src: &Path, project_root: &Path) -> Result<
         .join("shared/registry-client")
         .canonicalize()
         .context("canonicalising shared/registry-client")?;
+    let argv_env_path = project_root
+        .join("runtime/ruststd/argv-env")
+        .canonicalize()
+        .context("canonicalising runtime/ruststd/argv-env")?;
     let block = format!(
         "\n\
          # seraph-overlay: workspace ABI crates as std deps.\n\
@@ -718,7 +722,8 @@ fn apply_std_cargo_deps_overlay(rust_src: &Path, project_root: &Path) -> Result<
          process-abi = {{ path = \"{proc}\", features = [\"rustc-dep-of-std\"] }}\n\
          shmem = {{ path = \"{shmem}\", features = [\"rustc-dep-of-std\"] }}\n\
          namespace-protocol = {{ path = \"{ns}\", features = [\"rustc-dep-of-std\"] }}\n\
-         registry-client = {{ path = \"{regcli}\", features = [\"rustc-dep-of-std\"] }}\n",
+         registry-client = {{ path = \"{regcli}\", features = [\"rustc-dep-of-std\"] }}\n\
+         argv-env = {{ path = \"{argv_env}\", package = \"ruststd-argv-env\", features = [\"rustc-dep-of-std\"] }}\n",
         abi = syscall_abi_path.display(),
         sys = syscall_path.display(),
         ipc = ipc_path.display(),
@@ -727,6 +732,7 @@ fn apply_std_cargo_deps_overlay(rust_src: &Path, project_root: &Path) -> Result<
         shmem = shmem_path.display(),
         ns = namespace_protocol_path.display(),
         regcli = registry_client_path.display(),
+        argv_env = argv_env_path.display(),
     );
 
     let text = fs::read_to_string(&cargo_toml)
@@ -740,11 +746,13 @@ fn apply_std_cargo_deps_overlay(rust_src: &Path, project_root: &Path) -> Result<
     let has_shmem_dep = text.contains("shmem = { path");
     let has_namespace_protocol_dep = text.contains("namespace-protocol = { path");
     let has_registry_client_dep = text.contains("registry-client = { path");
+    let has_argv_env_dep = text.contains("argv-env = { path");
     if text.contains(marker)
         && has_log_dep
         && has_shmem_dep
         && has_namespace_protocol_dep
         && has_registry_client_dep
+        && has_argv_env_dep
     {
         return Ok(());
     }

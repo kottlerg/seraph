@@ -41,21 +41,16 @@ fn env_map() -> &'static Mutex<BTreeMap<OsString, OsString>> {
 fn seed_from_blob(map: &mut BTreeMap<OsString, OsString>, blob: &[u8], count: usize) {
     let mut cursor = 0;
     let mut left = count;
-    while left > 0 && cursor < blob.len() {
-        let end = match blob[cursor..].iter().position(|&b| b == 0) {
-            Some(off) => cursor + off,
-            None => blob.len(),
+    while left > 0 {
+        let Some((entry, next)) = argv_env::next_field(blob, cursor) else {
+            break;
         };
-        if let Some(eq) = blob[cursor..end].iter().position(|&b| b == b'=') {
-            let key = OsString::from(
-                String::from_utf8_lossy(&blob[cursor..cursor + eq]).into_owned(),
-            );
-            let val = OsString::from(
-                String::from_utf8_lossy(&blob[cursor + eq + 1..end]).into_owned(),
-            );
+        if let Some((k, v)) = argv_env::split_key_value(entry) {
+            let key = OsString::from(String::from_utf8_lossy(k).into_owned());
+            let val = OsString::from(String::from_utf8_lossy(v).into_owned());
             map.insert(key, val);
         }
-        cursor = end.saturating_add(1);
+        cursor = next;
         left -= 1;
     }
 }

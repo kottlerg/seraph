@@ -9,16 +9,9 @@
 //! populates a [`FatState`] with geometry fields needed by the rest of the
 //! driver (cluster size, FAT start, data region start, FAT type).
 
-/// Sector size in bytes (fixed at 512 for block device IPC).
-pub const SECTOR_SIZE: usize = 512;
-
-/// FAT variant detected from cluster count.
-#[derive(Clone, Copy)]
-pub enum FatType
-{
-    Fat16,
-    Fat32,
-}
+// SECTOR_SIZE and FatType are decoded by the pure, host-testable fat_parse
+// crate; the geometry/state machine and block I/O below consume them.
+pub use fat_parse::{FatType, SECTOR_SIZE};
 
 /// Parsed FAT filesystem geometry and cached FAT sector.
 pub struct FatState
@@ -101,9 +94,8 @@ impl FatState
                 "WARNING: cluster_to_sector({cluster}) — reserved cluster \
                  reached; caller should filter"
             );
-            return self.data_start_sector;
         }
-        self.data_start_sector + (cluster - 2) * u32::from(self.sectors_per_cluster)
+        fat_parse::cluster_to_sector(self.data_start_sector, self.sectors_per_cluster, cluster)
     }
 
     /// Bytes per cluster.
@@ -113,115 +105,57 @@ impl FatState
     }
 }
 
-/// Parse the BIOS Parameter Block from sector 0.
-// clippy::too_many_lines: parse_bpb is a linear decoder for a fixed binary
-// layout (FAT16/FAT32 BPB — Microsoft FAT32 File System Specification §3.1).
-// Each field extraction has no independent meaning; there is no natural
-// split into phases. The validation checks at the end depend on every
-// field being in scope. Factoring into per-field helpers would replicate
-// boilerplate without improving comprehension.
-#[allow(clippy::too_many_lines)]
+/// Parse the BIOS Parameter Block from sector 0 into `state`.
+///
+/// Decodes geometry via [`fat_parse::parse_bpb_geometry`], copies it into
+/// `state`, and emits the detection and geometry log lines the driver has
+/// always produced. Returns `false` after logging the reason on an invalid
+/// boot signature or a zero `bytes_per_sector` / `sectors_per_cluster`.
 pub fn parse_bpb(sector_data: &[u8; SECTOR_SIZE], state: &mut FatState) -> bool
 {
-    // Validate boot signature.
-    if sector_data[510] != 0x55 || sector_data[511] != 0xAA
+    let geom = match fat_parse::parse_bpb_geometry(sector_data)
     {
-        std::os::seraph::log!("invalid boot signature");
-        return false;
-    }
-
-    state.bytes_per_sector = u16::from_le_bytes([sector_data[11], sector_data[12]]);
-    state.sectors_per_cluster = sector_data[13];
-    state.reserved_sectors = u16::from_le_bytes([sector_data[14], sector_data[15]]);
-    state.num_fats = sector_data[16];
-    state.root_entry_count = u16::from_le_bytes([sector_data[17], sector_data[18]]);
-
-    // Validate fields used as divisors to prevent division by zero.
-    if state.bytes_per_sector == 0 || state.sectors_per_cluster == 0
-    {
-        std::os::seraph::log!("invalid BPB: bytes_per_sector or sectors_per_cluster is zero");
-        return false;
-    }
-
-    let total_sectors_16 = u16::from_le_bytes([sector_data[19], sector_data[20]]);
-    let fat_size_16 = u16::from_le_bytes([sector_data[22], sector_data[23]]);
-    let total_sectors_32 = u32::from_le_bytes([
-        sector_data[32],
-        sector_data[33],
-        sector_data[34],
-        sector_data[35],
-    ]);
-
-    // FAT32 extended BPB.
-    let fat_size_32 = u32::from_le_bytes([
-        sector_data[36],
-        sector_data[37],
-        sector_data[38],
-        sector_data[39],
-    ]);
-    state.root_cluster = u32::from_le_bytes([
-        sector_data[44],
-        sector_data[45],
-        sector_data[46],
-        sector_data[47],
-    ]);
-
-    state.fat_size = if fat_size_16 != 0
-    {
-        u32::from(fat_size_16)
-    }
-    else
-    {
-        fat_size_32
-    };
-
-    let total_sectors = if total_sectors_16 != 0
-    {
-        u32::from(total_sectors_16)
-    }
-    else
-    {
-        total_sectors_32
-    };
-
-    // Root directory sectors (FAT16 only).
-    let root_dir_sectors =
-        (u32::from(state.root_entry_count) * 32).div_ceil(u32::from(state.bytes_per_sector));
-
-    state.data_start_sector = u32::from(state.reserved_sectors)
-        + u32::from(state.num_fats) * state.fat_size
-        + root_dir_sectors;
-
-    let data_sectors = total_sectors.saturating_sub(state.data_start_sector);
-    let total_clusters = data_sectors / u32::from(state.sectors_per_cluster);
-    state.total_clusters = total_clusters;
-
-    // FAT type determination per Microsoft specification.
-    if total_clusters < 65525
-    {
-        state.fat_type = FatType::Fat16;
-        std::os::seraph::log!("detected FAT16");
-    }
-    else
-    {
-        state.fat_type = FatType::Fat32;
-        std::os::seraph::log!("detected FAT32");
-        // FAT32 extended BPB: `FSInfo` sector LBA at offset 48 (2 bytes).
-        // A value of 0 or 0xFFFF means "no `FSInfo` sector"; we hold the
-        // u32::MAX sentinel in those cases so the allocator skips load
-        // and falls back to a full FAT scan.
-        let fsinfo = u16::from_le_bytes([sector_data[48], sector_data[49]]);
-        if fsinfo != 0 && fsinfo != 0xFFFF
+        Ok(geom) => geom,
+        Err(fat_parse::BpbError::BadSignature) =>
         {
-            state.fsinfo_sector = u32::from(fsinfo);
+            std::os::seraph::log!("invalid boot signature");
+            return false;
         }
+        Err(fat_parse::BpbError::ZeroDivisor) =>
+        {
+            std::os::seraph::log!("invalid BPB: bytes_per_sector or sectors_per_cluster is zero");
+            return false;
+        }
+    };
+
+    state.bytes_per_sector = geom.bytes_per_sector;
+    state.sectors_per_cluster = geom.sectors_per_cluster;
+    state.reserved_sectors = geom.reserved_sectors;
+    state.num_fats = geom.num_fats;
+    state.root_entry_count = geom.root_entry_count;
+    state.fat_size = geom.fat_size;
+    state.root_cluster = geom.root_cluster;
+    state.data_start_sector = geom.data_start_sector;
+    state.total_clusters = geom.total_clusters;
+    state.fat_type = geom.fat_type;
+    // FSInfo is set only for a FAT32 volume that names a real sector; otherwise
+    // the u32::MAX sentinel from FatState::new() stands.
+    if let Some(fsinfo) = geom.fsinfo_sector
+    {
+        state.fsinfo_sector = fsinfo;
+    }
+
+    match geom.fat_type
+    {
+        FatType::Fat16 => std::os::seraph::log!("detected FAT16"),
+        FatType::Fat32 => std::os::seraph::log!("detected FAT32"),
     }
 
     std::os::seraph::log!(
         "sectors_per_cluster={:#018x}",
         u64::from(state.sectors_per_cluster)
     );
-    std::os::seraph::log!("total_clusters={:#018x}", u64::from(total_clusters));
+    std::os::seraph::log!("total_clusters={:#018x}", u64::from(geom.total_clusters));
     std::os::seraph::log!(
         "data_start_sector={:#018x}",
         u64::from(state.data_start_sector)

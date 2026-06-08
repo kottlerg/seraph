@@ -1151,10 +1151,9 @@ pub fn sys_thread_set_affinity(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         // call would dispatch the Ready target locally — `schedule()`'s
         // skip loop checks state but not `cpu_affinity` on the incoming
         // dispatched thread (see scheduling-internals.md § Cross-CPU TCB
-        // Ownership). Mirrors the load-bearing pattern in
-        // `core/kernel/src/sched/mod.rs:1815-1819` (cross-CPU re-enqueue
-        // branch of `schedule()`, where the inter-lock window IS visible
-        // to interrupts).
+        // Ownership). Mirrors the load-bearing pattern in `schedule()`'s
+        // cross-CPU re-enqueue branch (`core/kernel/src/sched/mod.rs`), where
+        // the inter-lock window IS visible to interrupts.
         //
         // `sys_thread_set_priority` above takes every CPU's scheduler.lock
         // in ascending order around its Scheduling-group writes, so it

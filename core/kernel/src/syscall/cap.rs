@@ -1752,7 +1752,8 @@ pub fn sys_cap_move(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     let (src_parent, src_first_child, src_prev, src_next) = {
         // SAFETY: caller_cspace validated; DERIVATION_LOCK held.
         let cs = unsafe { &*caller_cspace };
-        // SAFETY: We validated src_idx exists at line 752
+        // SAFETY: src_idx was validated to index a live slot by the
+        // cs.slot(src_idx).ok_or(...) check in the source-slot read above.
         #[allow(clippy::unwrap_used)]
         let slot = cs.slot(src_idx).unwrap();
         (

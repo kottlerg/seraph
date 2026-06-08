@@ -231,6 +231,10 @@ let value = unsafe { ptr.read() };
 - TODO comments MUST state what needs doing and why it was deferred.
 - Architecture decisions not obvious from the code belong in the relevant `docs/` file,
   not only in inline comments.
+- Comments and rustdoc MUST reference code by stable identifier (symbol, function, const,
+  type, or behaviour), never by line number. A `path:line` reference rots silently as files
+  shift; reserve it for review and chat. A bare file path (no line) is acceptable for
+  cross-file navigation.
 
 ---
 

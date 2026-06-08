@@ -506,8 +506,7 @@ pub fn memory_split_at_end_err(_ctx: &TestContext) -> TestResult
 ///
 /// Regression for issue #56: with the Phase 9 cap-mint masking off, the
 /// non-zero `fpu::SUB_PAGE_SENTINEL` static would push the RW segment's VA
-/// off a page boundary and trigger
-/// `core/kernel/src/arch/riscv64/paging.rs:80`'s
+/// off a page boundary and trigger `PageTableEntry::new_page`'s
 /// `page PA not 4 KiB-aligned` panic during the first mapping below.
 pub fn init_segment_caps_aligned(ctx: &TestContext) -> TestResult
 {

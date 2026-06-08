@@ -2413,6 +2413,15 @@ pub unsafe fn schedule(requeue_current: bool)
     //     (`queued_on >= 0`): re-enqueuing double-links it (the `queued_on`
     //     single-link guard's tripwire — #289). Leave it where the waker placed
     //     it; the next-thread selection below picks it up.
+    //   * Never requeue a `current` that has committed to a voluntary block
+    //     (`Blocked`) but not yet reached its own `schedule(false)`. A timer
+    //     preemption in that window calls `schedule(true)` (`requeue_current =
+    //     true`), which would otherwise re-mark the parking thread `Ready` and
+    //     enqueue it — racing the pending `enqueue_and_wake` into a `queued_on`
+    //     double-enqueue (#299). `cur_state` is read under `current.sched_lock`
+    //     (held from the top of `schedule()`), so the `Blocked` observation is
+    //     authoritative, not a racy heuristic; park it instead and let the
+    //     deposited wake redispatch it (the resume-DEPOSIT model, §2.1).
     if !current.is_null()
     {
         // SAFETY: current is a valid TCB set by enter() or a previous schedule();
@@ -2431,6 +2440,7 @@ pub unsafe fn schedule(requeue_current: bool)
             if (requeue_current || runnable)
                 && cur_state != ThreadState::Exited
                 && cur_state != ThreadState::Stopped
+                && cur_state != ThreadState::Blocked
                 && !already_queued
             {
                 let prio = (*current).priority;

@@ -773,4 +773,36 @@ mod tests
             Status::Ok
         ));
     }
+
+    #[test]
+    fn fail_marker_present_guards_on_size_then_matches()
+    {
+        use std::io::Write;
+
+        let path =
+            std::env::temp_dir().join(format!("seraph-failmarker-{}.log", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let re = Regex::new("PANIC").unwrap();
+        let mut last_len = 0u64;
+
+        // Written without the marker: no match, length is now tracked.
+        std::fs::write(&path, b"booting\n").unwrap();
+        assert!(!fail_marker_present(&path, &mut last_len, &re));
+        let tracked = last_len;
+        assert!(tracked > 0);
+
+        // Unchanged size: the guard short-circuits before re-reading.
+        assert!(!fail_marker_present(&path, &mut last_len, &re));
+        assert_eq!(last_len, tracked);
+
+        // The log grows with the marker: it now matches.
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        f.write_all(b"kernel PANIC at 0x0\n").unwrap();
+        assert!(fail_marker_present(&path, &mut last_len, &re));
+
+        let _ = std::fs::remove_file(&path);
+    }
 }

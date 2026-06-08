@@ -33,6 +33,7 @@
 use crate::runner::Phase;
 
 pub mod devmgr;
+pub mod exit_code;
 pub mod fs_ipc;
 pub mod fs_std;
 pub mod memmgr;
@@ -57,6 +58,7 @@ pub fn all() -> Vec<Phase>
     out.extend_from_slice(threading::phases());
     out.extend_from_slice(procmgr::spawn_only());
     out.extend_from_slice(process_faults::phases());
+    out.extend_from_slice(exit_code::phases());
     out.extend_from_slice(devmgr::phases());
     out.extend_from_slice(pager::phases());
     out.extend_from_slice(shmem::phases());

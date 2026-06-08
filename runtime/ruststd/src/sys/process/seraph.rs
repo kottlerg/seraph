@@ -68,10 +68,7 @@ use ipc::{procmgr_errors, procmgr_labels};
 /// on a real death), so `u64::MAX` is unambiguous.
 const BRIDGE_SENTINEL_DROP: u64 = u64::MAX;
 
-/// Reasons the bridge writes to the shared `exit_reason` atom outside
-/// the normal kernel-encoded range. Outside `EXIT_FAULT_BASE..0x2000`
-/// to remain distinguishable from real fault codes.
-const EXIT_KILLED: u64 = 0x2000;
+use syscall::EXIT_KILLED;
 
 // ── Stdio ───────────────────────────────────────────────────────────────────
 
@@ -1077,9 +1074,11 @@ impl ExitStatus {
     }
 
     pub fn code(&self) -> Option<i32> {
-        // exit_reason packs a clean-exit value (0) or kernel fault encoding
-        // (0x1000 + vector). Widen to i32 by saturating to preserve sign
-        // semantics; callers distinguish "clean" via `.exit_ok()`.
+        // exit_reason is a voluntary exit code (`0` clean, or `1..0x1000` from
+        // `process::exit`/`ExitCode`) or a kernel fault encoding (`0x1000 +
+        // vector`). The voluntary code is the reason value itself, so widening
+        // to i32 yields it directly; callers distinguish "clean" via `.exit_ok()`
+        // and "fault" via the `>= 0x1000` range (see `Display`).
         Some(self.0 as i32)
     }
 }

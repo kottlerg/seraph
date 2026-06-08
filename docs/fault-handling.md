@@ -83,7 +83,10 @@ own (e.g. an access to an unmapped page that is not a stale-TLB artifact), the k
 
 If the thread has **no** fault handler bound, the fault is terminal: the thread is killed
 with exit reason `EXIT_FAULT_BASE + <fault code>`, the behavior for all faults absent this
-mechanism.
+mechanism. Voluntary exit codes occupy the disjoint range `[1, EXIT_FAULT_BASE)` below it
+(see [Process Lifecycle](process-lifecycle.md#exit-reason)), so a fault reason and a
+voluntary exit code can never alias; `ExitStatus::success()`/`code()` distinguish them
+without ambiguity.
 
 Fault delivery reuses the synchronous IPC machinery of [IPC Design](ipc-design.md): the
 suspended thread occupies the same role as a caller blocked awaiting a reply, and the

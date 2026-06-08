@@ -47,7 +47,7 @@ use syscall_abi::{
     SYS_IOPORT_SPLIT, SYS_IPC_BUFFER_SET, SYS_IPC_CALL, SYS_IPC_RECV, SYS_IPC_REPLY, SYS_IRQ_ACK,
     SYS_IRQ_REGISTER, SYS_IRQ_SPLIT, SYS_MEM_MAP, SYS_MEM_PROTECT, SYS_MEM_UNMAP, SYS_MEMORY_MERGE,
     SYS_MEMORY_SPLIT, SYS_MMIO_MAP, SYS_MMIO_SPLIT, SYS_NOTIFICATION_SEND, SYS_NOTIFICATION_WAIT,
-    SYS_SBI_CALL, SYS_SCHED_SPLIT, SYS_SYSTEM_INFO, SYS_THREAD_BIND_NOTIFICATION,
+    SYS_PROCESS_EXIT, SYS_SBI_CALL, SYS_SCHED_SPLIT, SYS_SYSTEM_INFO, SYS_THREAD_BIND_NOTIFICATION,
     SYS_THREAD_CONFIGURE, SYS_THREAD_EXIT, SYS_THREAD_READ_REGS, SYS_THREAD_SET_AFFINITY,
     SYS_THREAD_SET_FAULT_HANDLER, SYS_THREAD_SET_PRIORITY, SYS_THREAD_SLEEP, SYS_THREAD_START,
     SYS_THREAD_STOP, SYS_THREAD_WRITE_REGS, SYS_THREAD_YIELD, SYS_WAIT_SET_ADD,
@@ -58,10 +58,11 @@ pub use syscall_abi::{
     CAP_INFO_ASPACE_PT_BUDGET, CAP_INFO_CSPACE_BUDGET, CAP_INFO_CSPACE_CAPACITY,
     CAP_INFO_CSPACE_USED, CAP_INFO_MEMORY_AVAILABLE, CAP_INFO_MEMORY_HAS_RETYPE,
     CAP_INFO_MEMORY_PHYS_BASE, CAP_INFO_MEMORY_SIZE, CAP_INFO_TAG_RIGHTS, CAP_TAG_MEMORY,
-    MAP_EXECUTABLE, MAP_READ, MAP_READONLY, MAP_WRITABLE, RIGHTS_ALL, RIGHTS_CONTROL,
-    RIGHTS_CSPACE, RIGHTS_MAP_READ, RIGHTS_MAP_RW, RIGHTS_MAP_RX, RIGHTS_POST, RIGHTS_RECEIVE,
-    RIGHTS_RETYPE, RIGHTS_SBI_BASE, RIGHTS_SBI_CPPC, RIGHTS_SBI_DBCN, RIGHTS_SBI_PMU,
-    RIGHTS_SBI_RESET, RIGHTS_SBI_SUSPEND, RIGHTS_SEND, RIGHTS_SEND_GRANT, RIGHTS_THREAD,
+    EXIT_FAULT_BASE, EXIT_KILLED, EXIT_VOLUNTARY, MAP_EXECUTABLE, MAP_READ, MAP_READONLY,
+    MAP_WRITABLE, RIGHTS_ALL, RIGHTS_CONTROL, RIGHTS_CSPACE, RIGHTS_MAP_READ, RIGHTS_MAP_RW,
+    RIGHTS_MAP_RX, RIGHTS_POST, RIGHTS_RECEIVE, RIGHTS_RETYPE, RIGHTS_SBI_BASE, RIGHTS_SBI_CPPC,
+    RIGHTS_SBI_DBCN, RIGHTS_SBI_PMU, RIGHTS_SBI_RESET, RIGHTS_SBI_SUSPEND, RIGHTS_SEND,
+    RIGHTS_SEND_GRANT, RIGHTS_THREAD,
 };
 
 // ── Raw syscall entry ─────────────────────────────────────────────────────────
@@ -580,6 +581,25 @@ pub fn thread_exit() -> !
 {
     // SAFETY: syscall2 issues raw syscall instruction; no pointer arguments; never returns.
     unsafe { syscall2(SYS_THREAD_EXIT, 0, 0) };
+    // The syscall never returns; loop to satisfy the diverging type.
+    loop
+    {
+        core::hint::spin_loop();
+    }
+}
+
+/// Exit the whole process with the voluntary exit `code`. Never returns.
+///
+/// The kernel records `syscall_abi::encode_exit_code(code)` as the exit reason
+/// and posts it to the calling thread's and the address space's death observers,
+/// so a waiting parent's `ExitStatus` carries the code. Unlike [`thread_exit`]
+/// (which ends only the calling thread), this signals process death on the
+/// address-space surface; sibling teardown is procmgr-driven via cap revocation.
+#[inline]
+pub fn process_exit(code: u32) -> !
+{
+    // SAFETY: syscall2 issues raw syscall instruction; no pointer arguments; never returns.
+    unsafe { syscall2(SYS_PROCESS_EXIT, u64::from(code), 0) };
     // The syscall never returns; loop to satisfy the diverging type.
     loop
     {

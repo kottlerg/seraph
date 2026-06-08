@@ -76,7 +76,11 @@ program opt in or skip; absence is the default.
 ### Contract
 
 - The tester binary MUST exit `0` on pass and non-zero on fail.
-- The tester binary's exit code is the authoritative verdict.
+- The tester binary's exit code is the authoritative verdict. Seraph propagates
+  it natively: `sys_process_exit` encodes the code into the thread/address-space
+  exit reason via `syscall_abi::encode_exit_code` (codes `1..0x0FFF`, saturating),
+  which the orchestrator reads through `ExitStatus::success()`/`code()`. This is a
+  native flat encoding, not POSIX `WEXITSTATUS` — no 8-bit truncation.
 - The tester SHOULD emit a final stdout line `[<name>-tester] PASS` or
   `[<name>-tester] FAIL` for log readability. The orchestrator does not
   rely on this line for the verdict.

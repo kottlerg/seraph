@@ -76,8 +76,7 @@ fn demand_paging_phase(_: &Caps)
 fn demand_paging_segfault_phase(_: &Caps)
 {
     use std::process::Command;
-
-    const EXIT_FAULT_BASE: u64 = 0x1000;
+    use syscall::EXIT_FAULT_BASE;
 
     let mut child = Command::new("/programs/demandpaged")
         .arg("oor")
@@ -103,8 +102,7 @@ fn demand_paging_segfault_phase(_: &Caps)
 fn demand_paging_pinned_phase(_: &Caps)
 {
     use std::process::Command;
-
-    const EXIT_FAULT_BASE: u64 = 0x1000;
+    use syscall::EXIT_FAULT_BASE;
 
     // Pinned: procmgr binds no fault handler and delegates no address space.
     // The child still registers its region (memmgr records it against the badge

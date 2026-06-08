@@ -21,10 +21,9 @@ use crate::util::step;
 
 const SECTOR_SIZE: u64 = 512;
 
-/// ESP partition size. Debug binaries weigh ~14 MiB each; the ESP now holds
-/// just kernel + bundle + bootloader EFI (init and modules live inside the
-/// bundle), so 256 MiB leaves comfortable headroom for additional bundle
-/// modules.
+/// ESP partition size. The ESP holds just kernel + bundle + bootloader EFI
+/// (init and modules live inside the bundle); 256 MiB leaves comfortable
+/// headroom for additional bundle modules.
 const ESP_PARTITION_SIZE: u64 = 256 * 1024 * 1024;
 
 /// Root partition size. Sized at 512 MiB to comfortably hold every

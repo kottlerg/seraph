@@ -149,7 +149,7 @@ devmgr loads driver binaries from one of two places:
   MODULE bootstrap round. devmgr spawns them via
   `procmgr_labels::CREATE_PROCESS` during initial enumeration.
 - **On-disk rootfs** — non-essentials (the per-arch RTC and the
-  virtio-input keyboard driver) live at `/services/drivers/` and are
+  [virtio-input keyboard driver](../services/drivers/virtio/input/README.md)) live at `/services/drivers/` and are
   loaded via `procmgr_labels::CREATE_FROM_FILE`. virtio-input is
   PCI-enumerated during the initial scan — its BAR/IRQ caps are carved
   and stashed then — but its spawn is deferred to this path, since a

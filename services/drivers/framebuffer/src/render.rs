@@ -26,6 +26,11 @@ pub struct FramebufferWriter
     height: u32,
     stride: u32, // bytes per row
     format: PixelFormat,
+    /// Foreground / background colour for glyph blits, 24-bit RGB. Sticky:
+    /// set via `FB_SET_ATTRS`, applied to every subsequent blit. Default is
+    /// full-white-on-black, matching the pre-colour monochrome output.
+    fg: [u8; 3],
+    bg: [u8; 3],
     max_cols: u32,
     max_rows: u32,
     col: u32,
@@ -57,6 +62,8 @@ impl FramebufferWriter
             height: fb.height,
             stride: fb.stride,
             format: fb.pixel_format,
+            fg: [0xFF, 0xFF, 0xFF],
+            bg: [0x00, 0x00, 0x00],
             max_cols,
             max_rows,
             col: 0,
@@ -94,6 +101,36 @@ impl FramebufferWriter
         self.col = 0;
     }
 
+    /// Move the cursor back one column, clamping at column 0 (no wrap to the
+    /// previous row). The terminal's single-line backspace echoes `\x08 \x08`
+    /// (back, space, back), so the intervening space overwrites the cell and
+    /// this re-parks the cursor on it — a destructive backspace.
+    pub fn backspace(&mut self)
+    {
+        self.col = self.col.saturating_sub(1);
+    }
+
+    /// Set the foreground/background colour for subsequent glyph blits and
+    /// background fills. Both are 24-bit RGB; the driver holds no palette
+    /// (the terminal maps ANSI SGR colours to RGB before sending).
+    pub fn set_attrs(&mut self, fg: [u8; 3], bg: [u8; 3])
+    {
+        self.fg = fg;
+        self.bg = bg;
+    }
+
+    /// The four framebuffer bytes for an RGB colour under the active pixel
+    /// format (the X byte is always 0).
+    fn pixel_bytes(&self, c: [u8; 3]) -> [u8; 4]
+    {
+        let [r, g, b] = c;
+        match self.format
+        {
+            PixelFormat::Rgbx8 => [r, g, b, 0],
+            PixelFormat::Bgrx8 => [b, g, r, 0],
+        }
+    }
+
     /// Blit a 9×20 glyph bitmap at the current cursor and advance one
     /// column. The bitmap encoding matches `font::FONT_9X20`: 20 u16
     /// scanlines, bits 15..=7 = the 9 pixels (MSB leftmost).
@@ -122,8 +159,7 @@ impl FramebufferWriter
             {
                 // Bit 15 is leftmost pixel; shift down for each column.
                 let lit = (bits >> (15 - col_idx)) & 1 != 0;
-                // White (0xFF) if lit, black (0x00) if not.
-                let intensity: u8 = if lit { 0xFF } else { 0x00 };
+                let [b0, b1, b2, b3] = self.pixel_bytes(if lit { self.fg } else { self.bg });
 
                 let px = (pixel_x as usize + col_idx) * 4;
                 let offset = row_base + px;
@@ -132,23 +168,10 @@ impl FramebufferWriter
                 // by stride * height (caller ensures valid mapping).
                 unsafe {
                     let p = self.base.add(offset);
-                    match self.format
-                    {
-                        PixelFormat::Rgbx8 =>
-                        {
-                            core::ptr::write_volatile(p, intensity); // R
-                            core::ptr::write_volatile(p.add(1), intensity); // G
-                            core::ptr::write_volatile(p.add(2), intensity); // B
-                            core::ptr::write_volatile(p.add(3), 0u8); // X
-                        }
-                        PixelFormat::Bgrx8 =>
-                        {
-                            core::ptr::write_volatile(p, intensity); // B
-                            core::ptr::write_volatile(p.add(1), intensity); // G
-                            core::ptr::write_volatile(p.add(2), intensity); // R
-                            core::ptr::write_volatile(p.add(3), 0u8); // X
-                        }
-                    }
+                    core::ptr::write_volatile(p, b0);
+                    core::ptr::write_volatile(p.add(1), b1);
+                    core::ptr::write_volatile(p.add(2), b2);
+                    core::ptr::write_volatile(p.add(3), b3);
                 }
             }
         }
@@ -163,22 +186,28 @@ impl FramebufferWriter
         }
     }
 
-    /// Clear the entire framebuffer to black.
+    /// Clear the entire framebuffer to the current background colour.
     ///
     /// # Safety
     /// Framebuffer pointer must be valid and writable.
     unsafe fn clear(&mut self)
     {
-        let total = (self.stride * self.height) as usize;
+        let [b0, b1, b2, b3] = self.pixel_bytes(self.bg);
+        // RGBX/BGRX is 4 bytes per pixel, so `stride * height` is a multiple of
+        // 4; the `/ 4` therefore drops no visible pixels.
+        let pixels = (self.stride * self.height) as usize / 4;
         let mut p = self.base;
-        for _ in 0..total
+        for _ in 0..pixels
         {
-            // SAFETY: p is within the framebuffer allocation; stride * height bounds total bytes.
+            // SAFETY: p is within the framebuffer allocation; pixels * 4 <= stride * height.
             unsafe {
-                core::ptr::write_volatile(p, 0);
+                core::ptr::write_volatile(p, b0);
+                core::ptr::write_volatile(p.add(1), b1);
+                core::ptr::write_volatile(p.add(2), b2);
+                core::ptr::write_volatile(p.add(3), b3);
             }
-            // SAFETY: p remains within framebuffer bounds throughout loop.
-            p = unsafe { p.add(1) };
+            // SAFETY: p stays within framebuffer bounds; advanced one pixel.
+            p = unsafe { p.add(4) };
         }
     }
 
@@ -205,13 +234,38 @@ impl FramebufferWriter
             );
         }
 
-        // Zero the last row.
+        // Fill the freed last row with the background colour.
         let last_row_start = (total_rows - 1) * row_bytes;
-        for i in 0..row_bytes
+        if self.bg == [0, 0, 0]
         {
-            // SAFETY: last_row_start + i is within the framebuffer.
-            unsafe {
-                core::ptr::write_volatile(self.base.add(last_row_start + i), 0);
+            // Fast path: a black background is a plain byte zero-fill. Scroll
+            // runs on every bottom-line newline, so the common default path
+            // stays a tight per-byte loop.
+            for i in 0..row_bytes
+            {
+                // SAFETY: last_row_start + i is within the framebuffer.
+                unsafe {
+                    core::ptr::write_volatile(self.base.add(last_row_start + i), 0);
+                }
+            }
+        }
+        else
+        {
+            let [b0, b1, b2, b3] = self.pixel_bytes(self.bg);
+            // SAFETY: the last row starts at last_row_start within the framebuffer.
+            let mut p = unsafe { self.base.add(last_row_start) };
+            // `row_bytes = GLYPH_HEIGHT * stride` is a multiple of 4 (4 bytes/pixel).
+            for _ in 0..(row_bytes / 4)
+            {
+                // SAFETY: p stays within the last row (row_bytes wide).
+                unsafe {
+                    core::ptr::write_volatile(p, b0);
+                    core::ptr::write_volatile(p.add(1), b1);
+                    core::ptr::write_volatile(p.add(2), b2);
+                    core::ptr::write_volatile(p.add(3), b3);
+                }
+                // SAFETY: advanced one pixel within the last row.
+                p = unsafe { p.add(4) };
             }
         }
 

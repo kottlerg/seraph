@@ -1,7 +1,8 @@
 # framebuffer
 
 Userspace framebuffer device driver. Owns the bootloader-discovered GOP
-linear-framebuffer MMIO end-to-end and exposes a single byte-write IPC.
+linear-framebuffer MMIO end-to-end and exposes a byte-write IPC plus an
+`FB_SET_ATTRS` colour-attribute IPC.
 Payload bytes are interpreted as UTF-8: the driver carries a `text::Utf8Decoder`
 across calls (so a multi-byte sequence may straddle two payloads), then
 resolves each codepoint via CP437 reverse → font-extension → ASCII-fallback
@@ -55,7 +56,7 @@ devmgr-registry badge must carry `REGISTRY_QUERY_AUTHORITY`.
 
 ## Messages
 
-One synchronous operation. Labels are defined in `shared/ipc::fb_labels`;
+Two synchronous operations. Labels are defined in `shared/ipc::fb_labels`;
 error codes in `shared/ipc::fb_errors`.
 
 ### Label 1: `FB_WRITE_BYTES`
@@ -68,7 +69,10 @@ the bytes are packed into the data words.
 The driver feeds each byte to its `text::Utf8Decoder`:
 
 * `\n` advances to the start of the next line (scrolling if at the
-  bottom); `\r` returns the cursor to column 0. Both bypass the decoder.
+  bottom); `\r` returns the cursor to column 0; `\x08` (backspace) moves
+  the cursor back one column (clamped at column 0). All three bypass the
+  decoder. The terminal pairs `\x08` with an overwriting space for a
+  destructive backspace.
 * Other bytes drive the decoder; on a completed codepoint the driver
   calls `text::render_codepoint`, which dispatches in order:
   CP437 reverse (`font::FONT_9X20`) → font-extension table
@@ -94,10 +98,45 @@ There is one decoder per driver process, alongside the single cursor.
 |---|---|
 | label | `0` (`SUCCESS`) or `2` (`UNKNOWN_OPCODE`) |
 
-The driver's UTF-8 / font output is exercised by `programs/fb-charset`,
-a small demo program launched once per default boot by svcmgr via
-`/config/svcmgr/services/fb-charset.svc` (`seed = devmgr.registry`).
-It prints a representative sample of every glyph class and exits.
+The driver's UTF-8 / font output is exercised by `programs/fb-charset`, a
+manual demo run from the shell — it prints a representative sample of every
+glyph class to stdout, which `programs/terminal` relays to this driver. It is
+no longer auto-started.
+
+### Label 2: `FB_SET_ATTRS`
+
+Set the foreground/background colour for subsequent `FB_WRITE_BYTES` glyph
+rendering. The pair is sticky driver state: an `FB_SET_ATTRS` applies to every
+following write until the next one. `clear` and `scroll` fill with the current
+background. Colours are 24-bit truecolour; the driver renders the bytes it is
+handed and holds no palette — mapping the 16 ANSI SGR colours to RGB is the
+terminal's job (`shared/ansi`).
+
+The default (never set) is full-white-on-black, matching the pre-colour
+monochrome output, so callers that never send `FB_SET_ATTRS` — logd's
+framebuffer log mirror, any pre-terminal caller — render unchanged.
+
+**Request:**
+
+| Field | Value |
+|---|---|
+| label | `2 \| (6 << 16)` — opcode in bits 0-15, payload byte length (`6`) in bits 16-31 |
+| data[0..6] | `[fg_r, fg_g, fg_b, bg_r, bg_g, bg_b]`, packed via `.bytes(0, …)` |
+
+**Reply:**
+
+| Field | Value |
+|---|---|
+| label | `0` (`SUCCESS`) or `2` (`UNKNOWN_OPCODE`) |
+
+The terminal owns ANSI SGR parsing (`ESC[…m` → `FB_SET_ATTRS`); the driver
+never sees `ESC`. See [docs/console-model.md](../../../docs/console-model.md).
+
+> **v1 limitation:** the attribute pair is a single global state shared by
+> every client of the one framebuffer (the terminal and logd's concurrent log
+> mirror), like the single global cursor. A log line written while the terminal
+> holds a non-default colour inherits it. Per-client attribute/cursor state
+> arrives with the compositor (#153).
 
 ---
 
@@ -110,7 +149,6 @@ until implemented.
 - `FB_SET_CURSOR` — move the text cursor to a (col, row) cell.
 - `FB_BLIT_RECT` — blit a caller-supplied pixel buffer into a rectangle.
 - `FB_REGISTER_RESIZE_NOTIFY` — register a notification cap kicked on geometry change.
-- `FB_SET_PALETTE` — set the foreground/background colour palette.
 
 Multi-head dispatch (v1 binds the single bootloader-handed framebuffer)
 and mode-set are deferred to a follow-up issue when a real consumer

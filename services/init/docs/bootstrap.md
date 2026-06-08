@@ -153,10 +153,11 @@ services, and talks to devmgr, all from the endowment.
   - `svcmgr` — un-badged SEND on svcmgr's own service endpoint.
   - `devmgr.registry` — `REGISTRY_QUERY_AUTHORITY`-badged SEND minted
     from the endowed devmgr-registry source. Consumers needing to
-    resolve a device driver themselves (`programs/fb-charset` →
-    `QUERY_FRAMEBUFFER_DEVICE`; timed and pwrmgr → their devmgr queries;
-    future: any non-init caller of devmgr's discovery surface) seed this
-    name. The badge bit survives svcmgr's plain `cap_derive` in
+    resolve a device driver themselves (`programs/terminal` →
+    `QUERY_FRAMEBUFFER_DEVICE` / `QUERY_INPUT_DEVICE` / `QUERY_SERIAL_DEVICE`;
+    timed and pwrmgr → their devmgr queries; future: any non-init caller of
+    devmgr's discovery surface) seed this name. The badge bit survives
+    svcmgr's plain `cap_derive` in
     `registry_lookup_derived`.
   - `SET_DRIVERS_DIR` — svcmgr walks its universal root to
     `/services/drivers/` at `LOOKUP | READ` and hands devmgr the subtree
@@ -257,4 +258,4 @@ svcmgr if needed.
 
 ## Summarized By
 
-[init/README.md](../README.md), [docs/bootstrap.md](../../../docs/bootstrap.md), [docs/process-lifecycle.md](../../../docs/process-lifecycle.md)
+[init/README.md](../README.md), [docs/bootstrap.md](../../../docs/bootstrap.md)

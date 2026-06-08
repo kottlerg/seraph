@@ -473,4 +473,4 @@ that CPU only; the BSP and other CPUs continue.
 
 ## Summarized By
 
-None
+[kernel/README.md](../README.md)

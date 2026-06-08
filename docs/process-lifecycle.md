@@ -9,7 +9,7 @@ System-wide model of userspace process creation, identity, and destruction from 
 This document is authoritative for:
 
 - The boot ordering of userspace tier-1 services
-  (`init` → `memmgr` → `procmgr` → `svcmgr`).
+  ([`init`](../services/init/README.md) → [`memmgr`](../services/memmgr/README.md) → [`procmgr`](../services/procmgr/README.md) → [`svcmgr`](../services/svcmgr/README.md)).
 - The capability flow at each step — who hands what to whom.
 - The `ProcessInfo` / `InitInfo` handover discipline: which fields are
   parent-chosen runtime values and which are ABI constants.

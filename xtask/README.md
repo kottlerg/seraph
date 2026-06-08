@@ -100,6 +100,17 @@ fails if the bundle is missing. The bundle is composed by
 [`cargo xtask compose-bundle`](#cargo-xtask-compose-bundle) (any
 harness).
 
+`disk.img` carries three GPT partitions: the EFI System Partition
+(from `sysroot/esp/`), the arch-specific Seraph root (from `sysroot/`,
+excluding `esp/` and `data/`), and an arch-neutral `SERAPH_DATA`
+partition (from `sysroot/data/`). The data partition is authored
+unconditionally — there is no flag to toggle it. vfsd auto-mounts it at
+`/data`; the data tree lives only on this partition, not on root.
+(vfsd's fall-through would also serve `/data` from a root-fs directory,
+so a dedicated partition is a disk-authoring choice — the in-tree image
+uses the partition.) This applies to `build`, `mkdisk`, and
+`compose-bundle` alike.
+
 ```
 cargo xtask mkdisk [--arch x86_64|riscv64]
 ```
@@ -257,12 +268,12 @@ Boot the terminal interactive test, exercising keyboard input end-to-end
 through the live virtio-input driver and the autostarted `terminal`. Launches
 QEMU headless with a QMP control socket, waits for the guest to print
 `terminal: READY for injection` on the serial log, injects a known key
-sequence (`a`, Shift+`a`, `b`, Backspace, Return) via QMP `input-send-event`,
-and asserts — host-side — that the terminal's local echo and the relayed child
-output (`[echosh] aA`) appear on the serial stream. Exits non-zero on an
-injection error or the 180 s timeout. This subsumes the former standalone
-keyboard smoke test: the echoed `a`/`A` prove keysym/modifier decode, and
-Return/Backspace prove the named-key decodes.
+sequence (`help`, a stray `x`, Backspace, Return) via QMP `input-send-event`,
+and asserts — host-side — that the terminal's local echo, the shell's `$ `
+prompt, and the relayed `help` output (`shell built-ins:`) appear on the serial
+stream. Exits non-zero on an injection error or the 180 s timeout. This subsumes
+the former standalone keyboard smoke test: the echoed `help` proves keysym
+decode, and Return/Backspace prove the named-key decodes.
 
 A pure runner — it neither builds nor stages. `terminal.svc` is in the default
 boot set, so the terminal autostarts; just build and repack:

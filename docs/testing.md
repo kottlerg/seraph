@@ -12,9 +12,9 @@ Three harnesses exercise three surfaces:
 
 | Harness | Surface | Crate | Launch mechanism |
 |---|---|---|---|
-| `ktest` | Kernel | `core/ktest/` | Bootloader-loaded init replacement (`cargo xtask compose-bundle --harness ktest`) |
+| `ktest` | Kernel | [`core/ktest/`](../core/ktest/README.md) | Bootloader-loaded init replacement (`cargo xtask compose-bundle --harness ktest`) |
 | `svctest` | Services | `services/svctest/` | `svcmgr` spawns from `/config/svcmgr/services/` recipe |
-| `usertest` | Programs | `services/usertest/` | `svcmgr` spawns from `/config/svcmgr/services/` recipe; drives binaries under `programs/` through their real I/O surfaces. Also hosts the terminal interactive test (`cargo xtask test-terminal`), which injects keys over QMP through the live virtio-input driver and the autostarted terminal |
+| `usertest` | Programs | [`services/usertest/`](../services/usertest/README.md) | `svcmgr` spawns from `/config/svcmgr/services/` recipe; drives binaries under `programs/` through their real I/O surfaces. Also hosts the terminal interactive test (`cargo xtask test-terminal`), which injects keys over QMP through the live virtio-input driver and the autostarted terminal |
 
 `ktest` and `svctest` are authoritative for their own surface; the harness
 itself owns its phases. `usertest` is an orchestrator that runs per-program
@@ -263,4 +263,4 @@ note in full.
 
 ## Summarized By
 
-[Conventions](conventions.md), [Root README](../README.md), [core/ktest/README.md](../core/ktest/README.md), [services/svcmgr/README.md](../services/svcmgr/README.md), [services/usertest/README.md](../services/usertest/README.md), [programs/terminal/README.md](../programs/terminal/README.md)
+[Conventions](conventions.md), [Root README](../README.md), [core/ktest/README.md](../core/ktest/README.md), [services/svcmgr/README.md](../services/svcmgr/README.md), [services/usertest/README.md](../services/usertest/README.md), [programs/terminal/README.md](../programs/terminal/README.md), [programs/shell/README.md](../programs/shell/README.md)

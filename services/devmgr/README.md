@@ -74,10 +74,10 @@ responsibilities are:
 - **Expose device registry** — maintain an IPC service that other services
   query to discover device endpoints after drivers are bound: vfsd resolves
   the block device (`QUERY_BLOCK_DEVICE`), logd resolves the serial driver
-  (`QUERY_SERIAL_DEVICE`), `programs/fb-charset` resolves the framebuffer
-  driver (`QUERY_FRAMEBUFFER_DEVICE`), timed resolves the platform RTC
-  (`QUERY_RTC_DEVICE`), and netd in due course. devmgr owns each driver's
-  service endpoint and mints a badged SEND on query.
+  (`QUERY_SERIAL_DEVICE`), `programs/terminal` resolves the framebuffer and
+  input drivers (`QUERY_FRAMEBUFFER_DEVICE` / `QUERY_INPUT_DEVICE`), timed
+  resolves the platform RTC (`QUERY_RTC_DEVICE`), and netd in due course.
+  devmgr owns each driver's service endpoint and mints a badged SEND on query.
 - **Broker ACPI and shutdown hardware to pwrmgr** — devmgr is the sole
   owner of the ACPI Memory caps and the only service that walks the ACPI
   table tree (RSDP → XSDT). `QUERY_ACPI_TABLE` locates a table by
@@ -143,4 +143,4 @@ MUST NOT be started independently of devmgr. See
 
 ## Summarized By
 
-[docs/device-management.md](../../docs/device-management.md), [docs/storage.md](../../docs/storage.md)
+[docs/device-management.md](../../docs/device-management.md)

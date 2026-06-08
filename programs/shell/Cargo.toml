@@ -1,11 +1,11 @@
 [package]
-name = "fb-charset"
+name = "shell"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
 [[bin]]
-name = "fb-charset"
+name = "shell"
 path = "src/main.rs"
 test = false
 

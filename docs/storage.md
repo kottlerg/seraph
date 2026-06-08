@@ -1,7 +1,8 @@
 # Storage
 
-System-scope composition of the Seraph storage stack: how `vfsd`,
-filesystem drivers, and block drivers are linked by capability
+System-scope composition of the Seraph storage stack: how
+[`vfsd`](../services/vfsd/README.md),
+[filesystem drivers](../services/fs/README.md), and block drivers are linked by capability
 delegation and how mounts are established at boot.
 
 ---
@@ -98,6 +99,18 @@ or on-disk UUID. The model is:
   `c12a7328-f81f-11d2-ba4b-00a0c93ec93b`. No caller issues a
   `MOUNT` for `/esp`; vfsd does so internally at startup. ESP mount
   is best-effort and failure is non-fatal.
+- **The Seraph data partition is auto-mounted at `/data`** immediately
+  after the ESP, using the arch-neutral `SERAPH_DATA` type GUID. vfsd
+  mounts it internally at startup, like the ESP. The mount is
+  best-effort: when no `SERAPH_DATA` partition is present — or its
+  lookup is ambiguous (duplicate tied priority) — vfsd skips the mount
+  and `/data` falls through to the root partition, serving any `/data`
+  tree present there (or resolving as absent if none). Unlike the root
+  self-mount, an absent or ambiguous data partition is never fatal.
+  Whether `/data` is a dedicated partition or a root-fs directory is
+  therefore a disk-authoring choice, not a vfsd concern; the in-tree
+  image (see [build-system.md](build-system.md)) carries the tree on the
+  partition only.
 - **DPS-style priority tie-break.** Where multiple partitions match
   a role GUID, GPT attribute bits 48–63 are compared as an unsigned
   priority; the highest wins. Tied non-zero priorities are a fatal
@@ -133,10 +146,11 @@ its parsed table, registers the partition bound with virtio-blk,
 spawns the fs driver, sends `FS_MOUNT` to validate the BPB, and
 captures the driver's root cap into the synthetic root (see
 [`services/vfsd/docs/namespace-composition.md`](../services/vfsd/docs/namespace-composition.md)).
-It then auto-mounts the ESP at `/esp`. Both run before any service
-thread serves a request, so `GET_SYSTEM_ROOT_CAP` never observes an
-unmounted root. The runtime `MOUNT` label is retained for explicit /
-foreign-GUID mounts and shares this resolution path.
+It then auto-mounts the ESP at `/esp` and the data partition at
+`/data`. All three run before any service thread serves a request, so
+`GET_SYSTEM_ROOT_CAP` never observes an unmounted root. The runtime
+`MOUNT` label is retained for explicit / foreign-GUID mounts and shares
+this resolution path.
 
 **fs driver** runs as a separate process. After `FS_MOUNT` succeeds,
 it serves the cap-native `NS_*` protocol plus the surviving

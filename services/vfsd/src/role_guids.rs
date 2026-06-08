@@ -24,3 +24,8 @@ pub const SERAPH_ROOT: [u8; 16] = boot_protocol::role_guids::SERAPH_ROOT_RISCV64
 pub const EFI_SYSTEM_PARTITION: [u8; 16] = [
     0x28, 0x73, 0x2a, 0xc1, 0x1f, 0xf8, 0xd2, 0x11, 0xba, 0x4b, 0x00, 0xa0, 0xc9, 0x3e, 0xc9, 0x3b,
 ];
+
+/// The Seraph data partition type-GUID (arch-neutral). Used to auto-mount
+/// `/data` after `/esp` when present; otherwise `/data` resolves through
+/// the root-fs fall-through.
+pub const SERAPH_DATA: [u8; 16] = boot_protocol::role_guids::SERAPH_DATA;

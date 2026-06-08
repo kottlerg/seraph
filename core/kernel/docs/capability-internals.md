@@ -446,4 +446,4 @@ CSpace. The kernel clears the per-thread reply slot after `SYS_IPC_REPLY`.
 
 ## Summarized By
 
-None
+[kernel/README.md](../README.md)

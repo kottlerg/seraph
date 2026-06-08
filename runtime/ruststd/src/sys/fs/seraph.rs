@@ -519,6 +519,10 @@ struct WalkedNode
 /// per-entry `max_rights`. Callers wanting "everything I'm allowed"
 /// pass `0xFFFF`; callers walking-and-attenuating a subtree pass the
 /// target rights mask directly.
+///
+/// A path with no components (e.g. `"/"`) denotes the anchor directory
+/// itself: directory walks (`Dir`/`Any`) return an owned derived copy
+/// of `root_cap`; file walks reject it with `InvalidInput`.
 fn walk_components(
     root_cap: u32,
     path_str: &str,
@@ -534,10 +538,31 @@ fn walk_components(
         .collect();
     if components.is_empty()
     {
-        return Err(io::const_error!(
-            io::ErrorKind::InvalidInput,
-            "seraph fs: path resolves to no components",
-        ));
+        // A path with no components (e.g. "/") denotes the anchor
+        // directory itself. Directory walks resolve it to the anchor;
+        // file walks have no such target. Return an owned derived copy
+        // so the caller's `cap_delete` bookkeeping is uniform with the
+        // walked-child case — handing back the borrowed `root_cap`
+        // would let a later release delete the anchor cap.
+        return match expect_kind
+        {
+            ExpectKind::File => Err(io::const_error!(
+                io::ErrorKind::InvalidInput,
+                "seraph fs: path resolves to no components",
+            )),
+            ExpectKind::Dir | ExpectKind::Any =>
+            {
+                let dup = syscall::cap_derive(root_cap, requested_rights)
+                    .map_err(|_| {
+                        io::Error::other("seraph fs: cap_derive of anchor dir failed")
+                    })?;
+                Ok(WalkedNode {
+                    cap: dup,
+                    size: 0,
+                    kind: NodeKind::Dir,
+                })
+            }
+        };
     }
     for c in &components
     {

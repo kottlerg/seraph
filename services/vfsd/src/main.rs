@@ -14,8 +14,9 @@
 //! from client to driver.
 //!
 //! vfsd self-mounts the Seraph root partition at `/` (and the ESP at
-//! `/esp`) during startup, before serving any request; the runtime
-//! `MOUNT` IPC remains for explicit/foreign-GUID mounts.
+//! `/esp` and the data partition at `/data`) during startup, before
+//! serving any request; the runtime `MOUNT` IPC remains for
+//! explicit/foreign-GUID mounts.
 //!
 //! See `vfsd/README.md` for the design and `fs/docs/fs-driver-protocol.md`
 //! for the driver-side protocol.
@@ -463,6 +464,15 @@ fn namespace_loop(rt: &'static VfsdRuntime) -> !
             continue;
         }
 
+        // Fall-through enumeration: an `NS_READDIR` on a synthetic node
+        // with a `fallthrough_cap` lists its local children first, then
+        // the underlying root-fs directory's entries, so a listing shows
+        // both mounts and root-fs contents (mirroring lookup fall-through).
+        if try_forward_readdir_fallthrough(rt, &recv, ipc_buf)
+        {
+            continue;
+        }
+
         let mut backend = rt
             .root_backend
             .lock()
@@ -567,6 +577,131 @@ fn try_forward_lookup_fallthrough(
     true
 }
 
+/// If `recv` is an `NS_READDIR` on a synthetic tree node that carries a
+/// `fallthrough_cap`, serve the merged enumeration and return `true`
+/// (caller skips normal dispatch). The node's local children occupy
+/// indices `0..local_count` and are served by normal dispatch; this
+/// handler serves higher indices from the fall-through directory,
+/// skipping any name shadowed by a local child. Without it, listing a
+/// synthetic node would show only its in-tree mounts and hide root-fs
+/// entries reachable by name (e.g. `/programs`, `/data` under the
+/// synthetic root), making enumeration inconsistent with lookup.
+///
+/// `NS_READDIR` surfaces names only — no caps — so, unlike lookup
+/// fall-through, there is no authority to launder: the caller's
+/// `READDIR` right is checked via [`gate`], and the fall-through probe
+/// rides vfsd's own full-rights root cap.
+///
+/// Assumption: the probe applies no per-entry visibility filter (the
+/// backend's `visible_requires` per `docs/namespace-model.md`). That is
+/// sound only because no current fs backend hides entries by rights; a
+/// backend that did would need the probe to compose the caller's rights
+/// (as the lookup path does) before enumerating. Per client `NS_READDIR`
+/// this re-probes the fall-through dir from index 0, so a full listing is
+/// O(n²); acceptable for the small synthetic nodes (root, `/esp`).
+fn try_forward_readdir_fallthrough(
+    rt: &'static VfsdRuntime,
+    recv: &IpcMessage,
+    ipc_buf: *mut u64,
+) -> bool
+{
+    let opcode = recv.label & 0xFFFF;
+    if opcode != ns_labels::NS_READDIR
+    {
+        return false;
+    }
+    // Enforce the caller's READDIR right and resolve the directory node.
+    // On `Err`, fall through to normal dispatch, which emits the matching
+    // error reply.
+    let dir = match gate(recv.label, recv.badge)
+    {
+        Ok((node, _)) => node,
+        Err(GateError::PermissionDenied | GateError::UnknownLabel) => return false,
+    };
+    // Cast is range-safe: the readdir cursor is bounded by directory size.
+    #[allow(clippy::cast_possible_truncation)]
+    let idx = recv.word(0) as u32;
+
+    let backend = rt
+        .root_backend
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let Some(parent_idx) = backend.resolve(dir)
+    else
+    {
+        return false;
+    };
+    let fallthrough = backend.fallthrough_of(parent_idx);
+    let local_count = backend.local_child_count(parent_idx);
+    drop(backend);
+
+    // No fall-through, or still within the local children: normal dispatch
+    // serves it (a local child, then `END_OF_DIR` past the last one).
+    if fallthrough == 0 || idx < local_count
+    {
+        return false;
+    }
+
+    // Enumerate the fall-through directory, skipping names shadowed by a
+    // local child, until the `(idx - local_count)`-th survivor.
+    let target = idx - local_count;
+    let mut matched = 0u32;
+    let mut probe = 0u32;
+    loop
+    {
+        let req = IpcMessage::builder(ns_labels::NS_READDIR)
+            .word(0, u64::from(probe))
+            .build();
+        // SAFETY: ipc_buf is the thread-registered IPC buffer.
+        let Ok(reply) = (unsafe { ipc::ipc_call(fallthrough, &req, ipc_buf) })
+        else
+        {
+            return false;
+        };
+        // `END_OF_DIR` or any upstream error terminates the merged
+        // enumeration; forward it verbatim as the client's terminator.
+        if reply.label != 0
+        {
+            // SAFETY: ipc_buf is the thread-registered IPC buffer.
+            let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+            return true;
+        }
+        // Cast is range-safe: name_len rides word 1, bounded by the
+        // protocol's max name length.
+        #[allow(clippy::cast_possible_truncation)]
+        let name_len = reply.word(1) as usize;
+        let data = reply.data_bytes();
+        // Reply layout: word 0 = kind, word 1 = name_len, name at byte 16.
+        if name_len == 0 || data.len() < 16 + name_len
+        {
+            // Malformed upstream reply: terminate enumeration cleanly.
+            let end = IpcMessage::new(ipc::fs_labels::END_OF_DIR);
+            // SAFETY: ipc_buf is the thread-registered IPC buffer.
+            let _ = unsafe { ipc::ipc_reply(&end, ipc_buf) };
+            return true;
+        }
+        let name = &data[16..16 + name_len];
+        let shadowed = {
+            let backend = rt
+                .root_backend
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            backend.has_local_child(parent_idx, name)
+        };
+        if !shadowed
+        {
+            if matched == target
+            {
+                // SAFETY: ipc_buf is the thread-registered IPC buffer.
+                let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+                return true;
+            }
+            matched += 1;
+        }
+        probe += 1;
+    }
+}
+
 // ── System-root cap delivery ─────────────────────────────────────────────
 
 /// Handle [`vfsd_labels::GET_SYSTEM_ROOT_CAP`]: mint a fresh badged SEND
@@ -632,6 +767,9 @@ enum MountRole
 {
     /// Seraph rootfs (`role_guids::SERAPH_ROOT`).
     Root,
+    /// Seraph data partition (`role_guids::SERAPH_DATA`), auto-mounted at
+    /// `/data`.
+    Data,
 }
 
 impl MountRole
@@ -641,6 +779,7 @@ impl MountRole
         match byte
         {
             0 => Some(MountRole::Root),
+            1 => Some(MountRole::Data),
             _ => None,
         }
     }
@@ -650,19 +789,21 @@ impl MountRole
         match self
         {
             MountRole::Root => &role_guids::SERAPH_ROOT,
+            MountRole::Data => &role_guids::SERAPH_DATA,
         }
     }
 }
 
 /// Mount the Seraph root partition at `/`, then auto-mount the ESP at
-/// `/esp`, during vfsd startup.
+/// `/esp` and the data partition at `/data`, during vfsd startup.
 ///
 /// Runs on the main thread before any service handler exists, so a
 /// `GET_SYSTEM_ROOT_CAP` request can never observe an unmounted root.
-/// The namespace dispatcher must already be running: the `/esp` mount
-/// takes the VFS spawn path, which re-enters vfsd's namespace endpoint
-/// to resolve `/services/fs/fatfs`. Returns whether the root mount
-/// succeeded; `/esp` is best-effort and never gates the return value.
+/// The namespace dispatcher must already be running: the `/esp` and
+/// `/data` mounts take the VFS spawn path, which re-enters vfsd's
+/// namespace endpoint to resolve `/services/fs/fatfs`. Returns whether
+/// the root mount succeeded; `/esp` and `/data` are best-effort and never
+/// gate the return value.
 fn self_mount(rt: &VfsdRuntime, ipc_buf: *mut u64) -> bool
 {
     match do_mount_internal(rt, ipc_buf, &role_guids::SERAPH_ROOT, b"/")
@@ -682,14 +823,15 @@ fn self_mount(rt: &VfsdRuntime, ipc_buf: *mut u64) -> bool
         }
     }
 
-    auto_mount_esp(rt, ipc_buf);
+    auto_mount_role(rt, ipc_buf, &role_guids::EFI_SYSTEM_PARTITION, "/esp");
+    auto_mount_role(rt, ipc_buf, &role_guids::SERAPH_DATA, "/data");
     true
 }
 
 /// Handle a runtime MOUNT request from an authorized client.
 ///
-/// vfsd self-mounts root and `/esp` at startup ([`self_mount`]), so no
-/// in-tree caller currently issues MOUNT; it remains the explicit /
+/// vfsd self-mounts root, `/esp`, and `/data` at startup ([`self_mount`]),
+/// so no in-tree caller currently issues MOUNT; it remains the explicit /
 /// runtime-mount surface (foreign-GUID disks, user-invoked mounts).
 ///
 /// IPC data layout (boot protocol v8+):
@@ -699,7 +841,8 @@ fn self_mount(rt: &VfsdRuntime, ipc_buf: *mut u64) -> bool
 ///
 /// Decodes the wire payload and delegates to [`do_mount`] for the
 /// real work. When the requested role is [`MountRole::Root`], vfsd
-/// additionally auto-mounts the EFI System Partition at `/esp`.
+/// additionally auto-mounts the EFI System Partition at `/esp` and the
+/// data partition at `/data`.
 #[allow(clippy::cast_possible_truncation)]
 fn handle_mount_request(recv: &IpcMessage, ipc_buf: *mut u64, rt: &VfsdRuntime)
 {
@@ -745,44 +888,50 @@ fn handle_mount_request(recv: &IpcMessage, ipc_buf: *mut u64, rt: &VfsdRuntime)
         Err(label) => IpcMessage::new(label),
     };
 
-    // Auto-mount the EFI System Partition at /esp once root is up so
-    // userspace can read kernel + bundle + bootloader without a separate
-    // MOUNT call. Best-effort — failure does not propagate into the root
-    // mount's reply.
+    // Auto-mount the EFI System Partition at /esp and the data partition
+    // at /data once root is up, so userspace can read kernel + bundle +
+    // bootloader and the data tree without a separate MOUNT call.
+    // Best-effort — failure does not propagate into the root mount's reply.
     if matches!(role, MountRole::Root) && reply.label == ipc::vfsd_errors::SUCCESS
     {
-        auto_mount_esp(rt, ipc_buf);
+        auto_mount_role(rt, ipc_buf, &role_guids::EFI_SYSTEM_PARTITION, "/esp");
+        auto_mount_role(rt, ipc_buf, &role_guids::SERAPH_DATA, "/data");
     }
 
     // SAFETY: ipc_buf is the registered IPC buffer.
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
 }
 
-/// One-shot best-effort mount of the EFI System Partition at `/esp`. Logs
-/// a diagnostic on any failure. Idempotent if invoked twice — the
-/// install attempt against an already-terminal mount path is rejected by
+/// One-shot best-effort mount of the partition tagged `type_guid` at
+/// `mount_path`. Scans the parsed GPT for an active matching partition; if
+/// none is present (or its role lookup is ambiguous), logs a diagnostic
+/// and returns without mounting, leaving `mount_path` to resolve through
+/// the root-fs fall-through. On a match, runs the mount transaction and
+/// logs the outcome. Never fatal — distinct from the root self-mount,
+/// whose failure gates boot. Idempotent if invoked twice: the install
+/// against an already-terminal mount path is rejected by
 /// `root_backend::install_mount`.
-fn auto_mount_esp(rt: &VfsdRuntime, ipc_buf: *mut u64)
+fn auto_mount_role(rt: &VfsdRuntime, ipc_buf: *mut u64, type_guid: &[u8; 16], mount_path: &str)
 {
-    let parts = &rt.gpt_parts;
-    let mut esp_found = false;
-    for p in parts
+    let present = rt
+        .gpt_parts
+        .iter()
+        .any(|p| p.active && &p.type_guid == type_guid);
+    if !present
     {
-        if p.active && p.type_guid == role_guids::EFI_SYSTEM_PARTITION
-        {
-            esp_found = true;
-            break;
-        }
-    }
-    if !esp_found
-    {
-        std::os::seraph::log!("MOUNT: no EFI System Partition found; skipping /esp auto-mount");
+        std::os::seraph::log!("MOUNT: no partition for {mount_path}; skipping auto-mount");
         return;
     }
-    match do_mount_internal(rt, ipc_buf, &role_guids::EFI_SYSTEM_PARTITION, b"/esp")
+    match do_mount_internal(rt, ipc_buf, type_guid, mount_path.as_bytes())
     {
-        Ok(_) => std::os::seraph::log!("MOUNT: /esp auto-mounted"),
-        Err(code) => std::os::seraph::log!("MOUNT: /esp auto-mount failed: code={code:#x}"),
+        Ok(caller_cap) =>
+        {
+            // The auto-mount has no IPC caller for the returned badged SEND;
+            // vfsd reaches the mount through its synthetic backend.
+            log_cap_delete("auto-mount caller cap", caller_cap);
+            std::os::seraph::log!("MOUNT: {mount_path} auto-mounted");
+        }
+        Err(code) => std::os::seraph::log!("MOUNT: {mount_path} auto-mount failed: code={code:#x}"),
     }
 }
 
@@ -832,9 +981,9 @@ pub(crate) fn do_mount(
 }
 
 /// Shared implementation for both role-driven (`do_mount`) and
-/// internally-triggered (`auto_mount_esp`) mounts. Takes a type-GUID
-/// directly so callers without a [`MountRole`] (the ESP auto-mount)
-/// can reuse the transaction body.
+/// internally-triggered (`auto_mount_role`) mounts. Takes a type-GUID
+/// directly so callers without a [`MountRole`] (the `/esp` and `/data`
+/// auto-mounts) can reuse the transaction body.
 #[allow(clippy::too_many_lines)]
 fn do_mount_internal(
     rt: &VfsdRuntime,
@@ -854,8 +1003,11 @@ fn do_mount_internal(
             }
             Err(gpt::GptLookupError::DuplicateTie) =>
             {
+                // Non-fatal here; the caller decides (root self-mount treats
+                // the returned error as fatal, the /esp and /data auto-mounts
+                // skip and fall through).
                 std::os::seraph::log!(
-                    "MOUNT: FATAL — multiple partitions share the role GUID with tied priority"
+                    "MOUNT: role GUID matched by multiple tied-priority partitions; not mounting"
                 );
                 return Err(ipc::vfsd_errors::NO_MOUNT);
             }

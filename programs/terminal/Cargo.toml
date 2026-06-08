@@ -10,6 +10,7 @@ path = "src/main.rs"
 test = false
 
 [dependencies]
+ansi = { workspace = true }
 ipc = { path = "../../shared/ipc" }
 syscall = { path = "../../shared/syscall" }
 

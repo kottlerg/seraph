@@ -42,7 +42,7 @@ binary. Components targeting the kernel, bootloader, or std-userspace triples
 must be built via `cargo xtask build` so the correct custom target JSON and
 `-Zbuild-std` flags are passed.
 
-`abi/boot-protocol` is the source of truth for the boot protocol ABI; both
+[`abi/boot-protocol`](../abi/boot-protocol/README.md) is the source of truth for the boot protocol ABI; both
 the bootloader and kernel depend on it. The kernel-entry contract the ABI
 supports is in [`core/boot/docs/kernel-handoff.md`](../core/boot/docs/kernel-handoff.md).
 `abi/syscall` defines syscall numbers, argument layout, and return codes; both
@@ -167,11 +167,16 @@ The UEFI firmware discovers the bootloader at `EFI/BOOT/BOOT<arch>.EFI`
 services live alongside it under `EFI/seraph/`, the Seraph vendor directory
 within the EFI partition.
 
-Non-ESP directories (`services/`, `programs/`, `tests/`, `config/`,
-`data/`) populate the GPT image's root partition, which userspace
-services mount via vfsd / fatfs after boot. The split mirrors real
-deployments: anything the firmware must reach lives on the ESP;
-everything else lives on the root partition.
+Non-ESP, non-`data` directories (`services/`, `programs/`, `tests/`,
+`config/`) populate the GPT image's root partition, which userspace
+services mount via vfsd / fatfs after boot. `data/` populates a
+dedicated `SERAPH_DATA` partition instead of the root partition; vfsd
+auto-mounts it at `/data`. (vfsd would also serve `/data` from a root-fs
+directory via fall-through, so carrying it on its own partition is a
+disk-authoring choice — see [storage.md](storage.md); the in-tree image
+uses the partition.) The split mirrors real deployments: anything the
+firmware must reach lives on the ESP; everything else lives on the root
+partition, except the discoverable `/data` mountpoint.
 
 The `esp/` and root-partition trees are populated from two sources:
 

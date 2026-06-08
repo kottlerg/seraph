@@ -100,10 +100,14 @@ endpoint dispatches in two stages, from `vfsd::namespace_loop`:
 3. If neither stage matches, the dispatch loop falls through to the
    protocol crate, which replies `NotFound`.
 
-`NS_READDIR` and `NS_STAT` against synthetic tree nodes see only
-the local children — root-fs contents reachable via fall-through are
-not enumerated through the synthetic surface; clients walk to them
-by name.
+`NS_READDIR` against a synthetic tree node enumerates its local
+children first, then the fall-through directory's entries (skipping
+any name shadowed by a local child), via
+`try_forward_readdir_fallthrough` in `services/vfsd/src/main.rs`. A
+listing therefore shows both the node's mounts and the underlying
+root-fs contents, consistent with lookup fall-through. `NS_STAT`
+against a synthetic node reports the node itself (a directory) and
+does not consult the fall-through.
 
 ---
 
@@ -114,8 +118,8 @@ namespace endpoint, both addressing the driver's root at full
 namespace rights:
 
 - `caller_root_cap` is returned to the `MOUNT` caller (or dropped on
-  the internal `auto_mount_esp` path that handles the `/esp` mount
-  without a synchronous caller).
+  the internal `auto_mount_role` path that handles the `/esp` and
+  `/data` mounts without a synchronous caller).
 - `synthetic_root_cap` is captured into [`VfsdRootBackend`] so the
   composition above can `cap_derive` from it on every `NS_LOOKUP`.
 

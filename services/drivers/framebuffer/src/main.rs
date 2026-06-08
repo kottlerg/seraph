@@ -26,7 +26,8 @@
 //! calls. Each assembled codepoint is resolved via the CP437 reverse →
 //! font-extension → ASCII-fallback → `U+FFFD` chain in
 //! `text::render_codepoint`, which feeds one or more 9×20 bitmaps to
-//! the `FramebufferWriter`. `\n` and `\r` short-circuit the decoder.
+//! the `FramebufferWriter`. `\n`, `\r`, and `\x08` (backspace) short-circuit
+//! the decoder.
 //!
 //! Like the serial driver, this driver MUST NOT call
 //! `std::os::seraph::log!`: a future logd fanout that routes its own
@@ -174,6 +175,13 @@ fn handle_request(
                         decoder.reset();
                         writer.carriage_return();
                     }
+                    // Backspace moves the cursor back one column; the terminal
+                    // pairs it with an overwriting space for a destructive erase.
+                    b'\x08' =>
+                    {
+                        decoder.reset();
+                        writer.backspace();
+                    }
                     _ => match decoder.push(b)
                     {
                         DecodeOutcome::Codepoint(cp) => render_at(writer, cp),
@@ -183,6 +191,20 @@ fn handle_request(
                     },
                 }
             }
+        }
+        IpcMessage::new(fb_errors::SUCCESS)
+    }
+    else if msg.label & 0xFFFF == fb_labels::FB_SET_ATTRS
+    {
+        // Sticky fg/bg for subsequent glyph blits. Payload is six bytes:
+        // [fg_r, fg_g, fg_b, bg_r, bg_g, bg_b].
+        let bytes = msg.data_bytes();
+        if bytes.len() >= 6
+        {
+            writer.set_attrs(
+                [bytes[0], bytes[1], bytes[2]],
+                [bytes[3], bytes[4], bytes[5]],
+            );
         }
         IpcMessage::new(fb_errors::SUCCESS)
     }

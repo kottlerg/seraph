@@ -8,7 +8,7 @@
 //! Relays a byte stream between hardware drivers and a child process's stdio,
 //! with a tiny line discipline. Input is the virtio-input keyboard (#110);
 //! output renders on the framebuffer (#67) and mirrors to serial TX (#66). The
-//! child (`/programs/echosh` by default, overridable via `argv[1]`) is spawned
+//! child (`/programs/shell` by default, overridable via `argv[1]`) is spawned
 //! with piped stdio over the `ProcessInfo` stdio contract.
 //!
 //! Structure: a persistent keyboard thread decodes key-downs to bytes and
@@ -33,9 +33,9 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use ipc::IpcMessage;
 use output::Sink;
 
-/// Child spawned when the recipe passes no `argv[1]`. #112 retargets the
-/// terminal at `/programs/shell` by setting `argv` in `terminal.svc`.
-const DEFAULT_CHILD: &str = "/programs/echosh";
+/// Child spawned when the recipe passes no `argv[1]`. `terminal.svc` sets it
+/// explicitly; this is the fallback.
+const DEFAULT_CHILD: &str = "/programs/shell";
 
 /// Printed once all driver caps are held and the keyboard thread is running;
 /// the host test harness injects keys on seeing it. Kept in sync with
@@ -97,18 +97,24 @@ fn main() -> !
     let kbd_tx = tx.clone();
     std::thread::spawn(move || input::keyboard_loop(input_cap, &kbd_tx));
 
-    let sink = Sink::new(fb_cap, serial_cap);
+    let mut sink = Sink::new(fb_cap, serial_cap);
     std::os::seraph::log!("{READY_MARKER}");
 
-    run(&child_path, &rx, &tx, &sink)
+    run(&child_path, &rx, &tx, &mut sink)
 }
 
 /// Spawn the child, relay its stdio to the sink, feed it line-disciplined
 /// input, and respawn it when it exits. Never returns.
-fn run(child_path: &str, rx: &Receiver<Msg>, tx: &Sender<Msg>, sink: &Sink) -> !
+fn run(child_path: &str, rx: &Receiver<Msg>, tx: &Sender<Msg>, sink: &mut Sink) -> !
 {
     loop
     {
+        // Start each child with default colours: a previous child that exited
+        // mid-colour (e.g. crashed before its trailing `ESC[0m`) must not tint
+        // the next child or the shell prompt. Dedups to a no-op when already
+        // default (the common first-spawn case).
+        sink.write(b"\x1b[0m");
+
         let mut child = match Command::new(child_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -159,7 +165,7 @@ fn run(child_path: &str, rx: &Receiver<Msg>, tx: &Sender<Msg>, sink: &Sink) -> !
 
 /// Apply the v0.0.1 line discipline to a run of input bytes: local echo to the
 /// sink, single-line backspace, and CR→LF translation to the child on Enter.
-fn discipline(bytes: &[u8], line: &mut Vec<u8>, sink: &Sink, mut stdin: Option<&mut ChildStdin>)
+fn discipline(bytes: &[u8], line: &mut Vec<u8>, sink: &mut Sink, mut stdin: Option<&mut ChildStdin>)
 {
     for &b in bytes
     {

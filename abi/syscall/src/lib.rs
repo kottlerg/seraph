@@ -454,6 +454,22 @@ pub const MAP_READONLY: u64 = 0;
 /// trivially (neither WRITE nor EXECUTE set).
 pub const MAP_READ: u64 = 0x1;
 
+// ── Unmap flags ──────────────────────────────────────────────────────────────
+
+/// `SYS_MEM_UNMAP` flags (arg3): reclaim intermediate page tables.
+///
+/// After clearing the leaf PTEs across the requested span, reclaim each
+/// intermediate page table that the cleared span leaves empty back to the
+/// address space's page-table growth pool, crediting `pt_growth_budget_bytes`
+/// (observable via `cap_info(CAP_INFO_ASPACE_PT_BUDGET)`). A single coarse
+/// TLB + paging-structure-cache shootdown covers the whole teardown. memmgr
+/// sets this at `UNREGISTER_REGION` to release a demand region's page tables
+/// mid-life rather than holding them until address-space death.
+///
+/// Without this bit `SYS_MEM_UNMAP` clears only leaf PTEs and issues a per-page
+/// shootdown; intermediate tables persist until the address space is destroyed.
+pub const MEM_UNMAP_RECLAIM_PTS: u64 = 0x1;
+
 // ── Capability rights masks ─────────────────────────────────────────────────
 //
 // `u64` masks for `cap_derive` / `cap_copy` / `cap_insert` rights parameters.

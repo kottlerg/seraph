@@ -744,6 +744,134 @@ pub unsafe fn unmap_user_page(root_virt: u64, virt: u64)
     unsafe { flush_page(virt) };
 }
 
+/// `true` if no entry in `table` is present (all 512 slots clear).
+#[cfg(not(test))]
+fn table_is_empty(table: &[PageTableEntry; 512]) -> bool
+{
+    table.iter().all(|e| !e.is_present())
+}
+
+/// Unmap every 4 KiB leaf in `[virt_base, virt_base + page_count*4 KiB)` and
+/// reclaim each intermediate table the cleared span leaves empty back to
+/// `aso`'s page-table growth pool. Returns the number of L0/L1/L2 frames freed.
+///
+/// Walks VPN[3] → VPN[2] → VPN[1] → VPN[0] over the span, clearing in-range
+/// leaf PTEs. A table is freed only when it is fully empty afterwards **and**
+/// `aso` owns the frame
+/// ([`owns_phys`](crate::cap::object::AddressSpaceObject::owns_phys)) —
+/// emptiness, not span-containment, is the gate, so a boundary table shared
+/// with a live neighbour (or the guard-page table whose first slot sits just
+/// outside the span) is reclaimed exactly when its last live entry clears.
+/// Leaf entries at a non-leaf level (mega/gigapages: R/W/X set) are not
+/// produced by the user mapping path; they are skipped (never descended, never
+/// freed), so a table holding one is never seen as empty. The root frame is
+/// never freed.
+///
+/// Issues no TLB flush: the caller performs one coarse `sfence.vma` shootdown
+/// for the whole span and holds `pt_lock` across it, so a freed frame cannot be
+/// popped and reused before every hart is coherent.
+///
+/// # Safety
+/// `root_virt` must be the direct-map VA of a valid 4 KiB Sv48 root frame, `aso`
+/// must wrap that page table, and the caller must hold the address space's
+/// `pt_lock`. `[virt_base, virt_base + page_count*4 KiB)` must lie in the user
+/// half.
+#[cfg(not(test))]
+pub unsafe fn unmap_user_region_pooled(
+    root_virt: u64,
+    virt_base: u64,
+    page_count: usize,
+    aso: &crate::cap::object::AddressSpaceObject,
+) -> usize
+{
+    use crate::mm::PAGE_SIZE;
+    use crate::mm::paging::phys_to_virt;
+
+    // A leaf at any level sets at least one of R/W/X; a table pointer has none.
+    const LEAF_BITS: u64 = READ | WRITE | EXECUTE;
+    let p = PAGE_SIZE as u64;
+    let virt_end = virt_base + page_count as u64 * p;
+    let mut freed = 0usize;
+
+    // SAFETY: root_virt is the direct-map VA of a valid Sv48 root (caller's contract).
+    let root = unsafe { table_at(root_virt) };
+    let mut va = virt_base;
+    while va < virt_end
+    {
+        let i3 = vpn3_index(va);
+        let e3_end = virt_end.min(((va >> 39) + 1) << 39);
+        let r3 = root[i3];
+        // Skip 512 GiB gigapage leaves (not produced by the user path).
+        if r3.is_present() && r3.0 & LEAF_BITS == 0
+        {
+            let l2_pa = r3.phys_addr();
+            // SAFETY: present non-leaf VPN[3] entry points at a live L2 frame.
+            let l2 = unsafe { table_at(phys_to_virt(l2_pa)) };
+            let mut va2 = va;
+            while va2 < e3_end
+            {
+                let i2 = vpn2_index(va2);
+                let e2_end = e3_end.min(((va2 >> 30) + 1) << 30);
+                let r2 = l2[i2];
+                // Skip 1 GiB gigapage leaves.
+                if r2.is_present() && r2.0 & LEAF_BITS == 0
+                {
+                    let l1_pa = r2.phys_addr();
+                    // SAFETY: present non-leaf VPN[2] entry points at a live L1 frame.
+                    let l1 = unsafe { table_at(phys_to_virt(l1_pa)) };
+                    let mut va1 = va2;
+                    while va1 < e2_end
+                    {
+                        let i1 = vpn1_index(va1);
+                        let e1_end = e2_end.min(((va1 >> 21) + 1) << 21);
+                        let r1 = l1[i1];
+                        // Skip 2 MiB megapage leaves.
+                        if r1.is_present() && r1.0 & LEAF_BITS == 0
+                        {
+                            let l0_pa = r1.phys_addr();
+                            // SAFETY: present non-leaf VPN[1] entry points at a live L0 frame.
+                            let l0 = unsafe { table_at(phys_to_virt(l0_pa)) };
+                            let mut va0 = va1;
+                            while va0 < e1_end
+                            {
+                                l0[vpn0_index(va0)] = PageTableEntry(0);
+                                va0 += p;
+                            }
+                            if table_is_empty(l0) && aso.owns_phys(l0_pa)
+                            {
+                                l1[i1] = PageTableEntry(0);
+                                // SAFETY: L0 is empty and unlinked above; frame
+                                // came from this aso's pool (owns_phys).
+                                unsafe { aso.free_pt_page(l0_pa) };
+                                freed += 1;
+                            }
+                        }
+                        va1 = e1_end;
+                    }
+                    if table_is_empty(l1) && aso.owns_phys(l1_pa)
+                    {
+                        l2[i2] = PageTableEntry(0);
+                        // SAFETY: L1 is empty and unlinked above; aso-owned.
+                        unsafe { aso.free_pt_page(l1_pa) };
+                        freed += 1;
+                    }
+                }
+                va2 = e2_end;
+            }
+            if table_is_empty(l2) && aso.owns_phys(l2_pa)
+            {
+                root[i3] = PageTableEntry(0);
+                // SAFETY: L2 is empty and unlinked above; aso-owned.
+                unsafe { aso.free_pt_page(l2_pa) };
+                freed += 1;
+            }
+        }
+        va = e3_end;
+    }
+
+    freed
+}
+
 /// RISC-V counterpart to [`crate::mm::paging::unmap_identity_page`].
 ///
 /// Walks the kernel Sv48 root from `phys_to_virt(kernel_pml4_pa())` down

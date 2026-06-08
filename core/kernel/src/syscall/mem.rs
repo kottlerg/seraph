@@ -240,12 +240,17 @@ pub fn sys_mem_map(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// arg0 = `AddressSpace` cap index (must have MAP right).
 /// arg1 = virtual address of the first page to unmap (page-aligned, user range).
 /// arg2 = number of pages to unmap (non-zero).
+/// arg3 = flags. `MEM_UNMAP_RECLAIM_PTS` additionally reclaims each now-empty
+///        intermediate page table the cleared span leaves to the address
+///        space's growth pool (one coarse TLB + paging-structure-cache
+///        shootdown); otherwise only leaf PTEs are cleared, with a per-page
+///        shootdown.
 ///
 /// Unmapping a page that is not mapped is a no-op (not an error).
 /// Returns 0 on success.
 ///
-/// Note: intermediate page table frames are not reclaimed; full teardown
-/// happens when the address space object is destroyed.
+/// Without `MEM_UNMAP_RECLAIM_PTS`, intermediate page table frames are not
+/// reclaimed; full teardown happens when the address space object is destroyed.
 #[cfg(not(test))]
 pub fn sys_mem_unmap(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
@@ -254,10 +259,12 @@ pub fn sys_mem_unmap(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     const USER_HALF_TOP: u64 = 0x0000_8000_0000_0000;
     use crate::mm::PAGE_SIZE;
     use crate::syscall::current_tcb;
+    use syscall::MEM_UNMAP_RECLAIM_PTS;
 
     let aspace_idx = tf.arg(0) as u32;
     let virt_base = tf.arg(1);
     let page_count = tf.arg(2) as usize;
+    let flags = tf.arg(3);
 
     // ── Validation ────────────────────────────────────────────────────────────
 
@@ -302,22 +309,34 @@ pub fn sys_mem_unmap(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
     let aspace_slot =
         unsafe { super::lookup_cap(caller_cspace, aspace_idx, CapTag::AddressSpace, Rights::MAP) }?;
-    let as_ptr = {
+    let (as_ptr, aso_raw) = {
         let obj = aspace_slot.object.ok_or(SyscallError::InvalidCapability)?;
-        // SAFETY: tag confirmed AddressSpace.
         // cast_ptr_alignment: header at offset 0; allocator guarantees alignment.
         #[allow(clippy::cast_ptr_alignment)]
-        let as_obj = unsafe { &*(obj.as_ptr().cast::<AddressSpaceObject>()) };
-        as_obj.address_space
+        let aso = obj.as_ptr().cast::<AddressSpaceObject>();
+        // SAFETY: tag confirmed AddressSpace; aso is a valid AddressSpaceObject.
+        let as_inner = unsafe { (*aso).address_space };
+        (as_inner, aso)
     };
 
-    // ── Unmap loop ────────────────────────────────────────────────────────────
+    // ── Unmap ───────────────────────────────────────────────────────────────
 
-    for i in 0..page_count
+    if flags & MEM_UNMAP_RECLAIM_PTS != 0
     {
-        let virt = virt_base + (i * PAGE_SIZE) as u64;
-        // SAFETY: virt is in user range (validated above); as_ptr is valid.
-        unsafe { (*as_ptr).unmap_page(virt) };
+        // Region teardown: clear the whole span and reclaim each now-empty
+        // intermediate page table to the AS's pool, with one coarse shootdown.
+        // SAFETY: as_ptr is valid; aso_raw wraps it; the span is user-range
+        // (validated above).
+        unsafe { (*as_ptr).unmap_region_pooled(virt_base, page_count, &*aso_raw) };
+    }
+    else
+    {
+        for i in 0..page_count
+        {
+            let virt = virt_base + (i * PAGE_SIZE) as u64;
+            // SAFETY: virt is in user range (validated above); as_ptr is valid.
+            unsafe { (*as_ptr).unmap_page(virt) };
+        }
     }
 
     Ok(0)

@@ -862,6 +862,132 @@ pub unsafe fn unmap_user_page(root_virt: u64, virt: u64)
     unsafe { flush_page(virt) };
 }
 
+/// `true` if no entry in `table` is present (all 512 slots clear).
+#[cfg(not(test))]
+fn table_is_empty(table: &[PageTableEntry; 512]) -> bool
+{
+    table.iter().all(|e| !e.is_present())
+}
+
+/// Unmap every 4 KiB leaf in `[virt_base, virt_base + page_count*4 KiB)` and
+/// reclaim each intermediate table the cleared span leaves empty back to
+/// `aso`'s page-table growth pool. Returns the number of PT/PD/PDPT frames
+/// freed.
+///
+/// Walks PML4 → PDPT → PD → PT over the span, clearing in-range leaf PTEs. A
+/// table is freed only when it is fully empty afterwards **and** `aso` owns the
+/// frame ([`owns_phys`](crate::cap::object::AddressSpaceObject::owns_phys)) —
+/// emptiness, not span-containment, is the gate, so a boundary table shared
+/// with a live neighbour (or the guard-page table whose first slot sits just
+/// outside the span) is reclaimed exactly when its last live entry clears.
+/// Large-page leaves (1 GiB / 2 MiB) are not produced by the user mapping path;
+/// they are skipped (never descended, never freed), so a table holding one is
+/// never seen as empty. The root PML4 frame is never freed.
+///
+/// Issues no TLB flush: the caller performs one coarse TLB +
+/// paging-structure-cache shootdown for the whole span and holds `pt_lock`
+/// across it, so a freed frame cannot be popped and reused before every CPU is
+/// coherent.
+///
+/// # Safety
+/// `root_virt` must be the direct-map VA of a valid 4 KiB PML4 frame, `aso`
+/// must wrap that page table, and the caller must hold the address space's
+/// `pt_lock`. `[virt_base, virt_base + page_count*4 KiB)` must lie in the user
+/// half.
+#[cfg(not(test))]
+pub unsafe fn unmap_user_region_pooled(
+    root_virt: u64,
+    virt_base: u64,
+    page_count: usize,
+    aso: &crate::cap::object::AddressSpaceObject,
+) -> usize
+{
+    use crate::mm::PAGE_SIZE;
+    use crate::mm::paging::phys_to_virt;
+
+    let p = PAGE_SIZE as u64;
+    let virt_end = virt_base + page_count as u64 * p;
+    let mut freed = 0usize;
+
+    // SAFETY: root_virt is the direct-map VA of a valid user PML4 (caller's contract).
+    let pml4 = unsafe { table_at(root_virt) };
+    let mut va = virt_base;
+    while va < virt_end
+    {
+        let l4 = pml4_index(va);
+        let l4_end = virt_end.min(((va >> 39) + 1) << 39);
+        let e4 = pml4[l4];
+        // PML4 entries never encode a leaf on this target.
+        if e4.is_present()
+        {
+            let pdpt_pa = e4.phys_addr();
+            // SAFETY: present PML4E points at a live PDPT frame.
+            let pdpt = unsafe { table_at(phys_to_virt(pdpt_pa)) };
+            let mut va3 = va;
+            while va3 < l4_end
+            {
+                let l3 = pdpt_index(va3);
+                let l3_end = l4_end.min(((va3 >> 30) + 1) << 30);
+                let e3 = pdpt[l3];
+                // Skip 1 GiB large-page leaves (not produced by the user path).
+                if e3.is_present() && e3.0 & LARGE_PAGE == 0
+                {
+                    let pd_pa = e3.phys_addr();
+                    // SAFETY: present PDPTE (non-large) points at a live PD frame.
+                    let pd = unsafe { table_at(phys_to_virt(pd_pa)) };
+                    let mut va2 = va3;
+                    while va2 < l3_end
+                    {
+                        let l2 = pd_index(va2);
+                        let l2_end = l3_end.min(((va2 >> 21) + 1) << 21);
+                        let e2 = pd[l2];
+                        // Skip 2 MiB large-page leaves.
+                        if e2.is_present() && e2.0 & LARGE_PAGE == 0
+                        {
+                            let pt_pa = e2.phys_addr();
+                            // SAFETY: present PDE (non-large) points at a live PT frame.
+                            let pt = unsafe { table_at(phys_to_virt(pt_pa)) };
+                            let mut va1 = va2;
+                            while va1 < l2_end
+                            {
+                                pt[pt_index(va1)] = PageTableEntry(0);
+                                va1 += p;
+                            }
+                            if table_is_empty(pt) && aso.owns_phys(pt_pa)
+                            {
+                                pd[l2] = PageTableEntry(0);
+                                // SAFETY: PT is empty and unlinked above; frame
+                                // came from this aso's pool (owns_phys).
+                                unsafe { aso.free_pt_page(pt_pa) };
+                                freed += 1;
+                            }
+                        }
+                        va2 = l2_end;
+                    }
+                    if table_is_empty(pd) && aso.owns_phys(pd_pa)
+                    {
+                        pdpt[l3] = PageTableEntry(0);
+                        // SAFETY: PD is empty and unlinked above; aso-owned.
+                        unsafe { aso.free_pt_page(pd_pa) };
+                        freed += 1;
+                    }
+                }
+                va3 = l3_end;
+            }
+            if table_is_empty(pdpt) && aso.owns_phys(pdpt_pa)
+            {
+                pml4[l4] = PageTableEntry(0);
+                // SAFETY: PDPT is empty and unlinked above; aso-owned.
+                unsafe { aso.free_pt_page(pdpt_pa) };
+                freed += 1;
+            }
+        }
+        va = l4_end;
+    }
+
+    freed
+}
+
 /// x86-64 implementation of [`crate::mm::paging::unmap_identity_page`].
 ///
 /// Walks the kernel PML4 from `phys_to_virt(kernel_pml4_pa())` down to the

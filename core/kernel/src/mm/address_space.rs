@@ -80,9 +80,11 @@ pub use init_protocol::{INIT_STACK_PAGES, INIT_STACK_TOP};
 
 /// A user-mode virtual address space.
 ///
-/// Owns the physical frame of the root page table. All intermediate frames
-/// allocated during mapping are tracked only implicitly through the page table
-/// structure (full tracking + freeing is deferred to a future phase).
+/// Owns the physical frame of the root page table. Intermediate frames
+/// allocated during mapping are tracked implicitly through the page table
+/// structure; they are returned to the per-AS pool on region teardown
+/// ([`unmap_region_pooled`](Self::unmap_region_pooled)) and reclaimed wholesale
+/// at address-space death.
 pub struct AddressSpace
 {
     /// Physical address of the root page table frame (PML4 / Sv48 root).
@@ -685,8 +687,9 @@ impl AddressSpace
     /// Remove the mapping for a single 4 KiB page at `virt`.
     ///
     /// If `virt` is not mapped, this is a no-op (safe to call redundantly).
-    /// Does not free intermediate page table frames. Invalidates TLB entries
-    /// on all CPUs where this address space is active.
+    /// Does not free intermediate page table frames; the reclaiming region path
+    /// is [`unmap_region_pooled`](Self::unmap_region_pooled). Invalidates TLB
+    /// entries on all CPUs where this address space is active.
     ///
     /// # Safety
     /// `virt` must be in the user half. Caller must not access `virt` after
@@ -719,6 +722,85 @@ impl AddressSpace
         self.pt_unlock();
         self.shootdown_remote(virt);
         crate::percpu::preempt_enable();
+    }
+
+    /// Unmap `page_count` pages from `[virt_base, ..)` and reclaim every
+    /// intermediate page table the cleared span leaves empty back to `aso`'s
+    /// growth pool (crediting `pt_growth_budget_bytes`). Returns the number of
+    /// page-table frames reclaimed.
+    ///
+    /// Drives `SYS_MEM_UNMAP` with `MEM_UNMAP_RECLAIM_PTS` (memmgr region
+    /// teardown). Unlike the per-page [`unmap_page`](Self::unmap_page), it tears
+    /// the whole span down under a single `pt_lock` hold and a single coarse TLB
+    /// + paging-structure-cache shootdown.
+    ///
+    /// `aso` MUST wrap *this* `AddressSpace`; `sys_mem_unmap` enforces this by
+    /// resolving both from the same capability.
+    ///
+    /// # Safety
+    /// `virt_base` must be page-aligned and the span `[virt_base, virt_base +
+    /// page_count * PAGE_SIZE)` must lie in the user half (caller validates).
+    #[cfg(not(test))]
+    pub unsafe fn unmap_region_pooled(
+        &self,
+        virt_base: u64,
+        page_count: usize,
+        aso: &crate::cap::object::AddressSpaceObject,
+    ) -> usize
+    {
+        use crate::arch::current::paging::{flush_tlb_all, unmap_user_region_pooled};
+
+        crate::percpu::preempt_disable();
+        self.pt_lock();
+
+        // Clear every leaf in the span and free each now-empty, aso-owned
+        // intermediate table back to the pool.
+        // SAFETY: root_virt is valid; aso wraps this AS; the span is user-range
+        // (caller's contract); pt_lock is held.
+        let freed = unsafe { unmap_user_region_pooled(self.root_virt, virt_base, page_count, aso) };
+
+        // ONE coarse shootdown for the whole teardown, performed UNDER pt_lock
+        // (the per-VA `unmap_page` drops the lock first for throughput; here it
+        // must stay held). A freed PT frame is poppable only via `alloc_pt_page`,
+        // which runs under THIS `pt_lock`, so no other CPU reuses a just-freed
+        // frame until we release — by then every CPU's TLB + paging-structure
+        // cache is clean. The contended `pt_lock` path enables interrupts while
+        // spinning, so a remote CPU waiting on this lock still services and acks
+        // our IPI: no deadlock.
+        let current = crate::arch::current::cpu::current_cpu() as usize;
+        // Only CPUs that run this AS cache its translations — the kernel edits
+        // these page tables through the direct map, never by loading this root.
+        // The caller is normally memmgr, which does not run the target AS, so
+        // the local flush is usually skipped.
+        if self.active_cpus.test_cpu(current, Ordering::Acquire)
+        {
+            // SAFETY: ring 0 / S-mode; full flush clears TLB + PS-caches.
+            unsafe { flush_tlb_all() };
+        }
+        let mut remote = self.active_cpu_mask();
+        remote.clear(current);
+        if crate::mm::tag_allocator::tagging_enabled()
+        {
+            // Late-joiner cover: a CPU switched away (absent from `remote`, no
+            // IPI) flushes this tag on reactivation. Mirrors `shootdown_remote`.
+            self.tlb_gen.fetch_add(1, Ordering::Release);
+            core::sync::atomic::fence(Ordering::SeqCst);
+        }
+        if !remote.is_empty()
+        {
+            // virt = u64::MAX routes the remote handler to flush_tlb_all()
+            // (ignores tag) — correct even cross-AS where this AS's tag is not
+            // stable on the current CPU.
+            // SAFETY: root_phys is a valid root; remote excludes current; preempt
+            // is held and pt_lock no-pop invariant holds; tag unused on this path.
+            unsafe {
+                crate::mm::tlb_shootdown::shootdown(self.root_phys, &remote, u64::MAX, 0);
+            }
+        }
+
+        self.pt_unlock();
+        crate::percpu::preempt_enable();
+        freed
     }
 
     /// Change the permission flags on an existing 4 KiB leaf mapping at `virt`.

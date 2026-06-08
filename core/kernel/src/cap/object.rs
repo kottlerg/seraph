@@ -693,7 +693,6 @@ impl AddressSpaceObject
     /// `phys` must come from a prior [`alloc_pt_page`] call on this AS, and
     /// the page must no longer be in use as a page table.
     #[cfg(not(test))]
-    #[allow(dead_code)]
     pub unsafe fn free_pt_page(&self, phys: u64)
     {
         pool_lock(&self.pt_pool_lock);
@@ -703,6 +702,47 @@ impl AddressSpaceObject
         pool_unlock(&self.pt_pool_lock);
         self.pt_growth_budget_bytes
             .fetch_add(crate::mm::PAGE_SIZE as u64, Ordering::AcqRel);
+    }
+
+    /// Whether `phys` lies inside one of this AS's retype-source chunks — i.e.
+    /// the page was carved from this AS's PT pool (rather than `kernel_pt_pool`
+    /// or another allocator).
+    ///
+    /// The region-reclaim walk consults this before returning a now-empty
+    /// intermediate page table via [`free_pt_page`]: only pool-owned pages may
+    /// re-enter the pool. Every intermediate PT the walk reaches in a
+    /// retype-backed AS is pool-owned; the check defends a heap-backed AS (or
+    /// any future non-pooled user mapping) against corrupting the pool's
+    /// free-list and budget accounting.
+    #[cfg(not(test))]
+    pub fn owns_phys(&self, phys: u64) -> bool
+    {
+        let p = crate::mm::PAGE_SIZE as u64;
+        pool_lock(&self.pt_pool_lock);
+        let mut owned = false;
+        for slot in &self.pt_chunks
+        {
+            let anc = slot.ancestor.load(Ordering::Acquire);
+            if anc.is_null()
+            {
+                continue;
+            }
+            // SAFETY: ancestor is published with Release at chunk recording and
+            // kept alive by the chunk's inc_ref for the AS's lifetime;
+            // MemoryObject.base is immutable after creation.
+            // cast_ptr_alignment: header at offset 0; MemoryObject is repr(C).
+            #[allow(clippy::cast_ptr_alignment)]
+            let base = unsafe { (*anc.cast::<MemoryObject>()).base };
+            let start = base + slot.base_offset.load(Ordering::Relaxed);
+            let end = start + slot.page_count.load(Ordering::Relaxed) * p;
+            if phys >= start && phys < end
+            {
+                owned = true;
+                break;
+            }
+        }
+        pool_unlock(&self.pt_pool_lock);
+        owned
     }
 
     /// Record a freshly-retyped chunk and seed its pages onto the pool.

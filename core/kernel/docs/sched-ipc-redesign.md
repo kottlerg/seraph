@@ -137,8 +137,8 @@ blocking syscall (`sys_notification_wait`/`sys_event_recv`/`sys_wait_set_wait`/
 `sys_ipc_call`/`sys_ipc_recv`), on resume after `schedule()`, reads a TCB field
 the waker wrote (`wakeup_value`/`timed_out`/`ipc_msg`) and returns it WITHOUT
 re-reading the source object (traced: e.g. `sys_notification_wait` reads
-`(*tcb).wakeup_value` at ipc.rs:1090; `sys_ipc_call` reads `(*tcb).ipc_msg` at
-ipc.rs:490-510). There is NO re-check loop anywhere.
+`(*tcb).wakeup_value`; `sys_ipc_call` reads `(*tcb).ipc_msg`). There is NO
+re-check loop anywhere.
 
 The refuse-to-park is therefore lost-wake-safe ONLY via this invariant chain,
 which the `enqueue_and_wake` gate and its callers preserve:

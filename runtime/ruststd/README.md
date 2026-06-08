@@ -21,6 +21,34 @@ rather than `restricted_std`-gated. Downstream seraph bins therefore consume
 
 ---
 
+## Source Layout
+
+```
+ruststd/
+├── README.md
+├── argv-env/                   # `ruststd-argv-env` crate: pure, host-tested argv/env
+│   └── src/lib.rs              #   blob parsers; also a rustc-dep-of-std dep of overlaid std
+├── docs/                       # ruststd design documents
+├── patches/                    # upstream library/std patches applied during overlay assembly
+└── src/                        # std PAL overlay, copied into vendored library/std at build time
+    ├── os/
+    │   └── seraph.rs           # std::os::seraph surface (startup info, caps, cwd)
+    └── sys/                    # std::sys::seraph backends, one directory per area
+        ├── alloc/              # byte heap (#[global_allocator])
+        ├── args/               # std::env::args — consumes argv_env::next_field
+        ├── env/                # std::env::{var,vars,…} — consumes argv_env::{next_field,split_key_value}
+        ├── fs/                 # filesystem over the namespace protocol
+        ├── pipe/               # stdio pipe backing
+        ├── process/            # process spawn
+        ├── reserve/            # page-reservation surface
+        ├── stdio/              # stdout/stderr
+        ├── sync/               # mutex / rwlock / once / condvar / thread parking
+        ├── thread/             # thread spawn and join
+        └── time/               # monotonic and system clocks
+```
+
+---
+
 ## VA Management Surfaces
 
 `std::sys::seraph` is the per-process owner of virtual-address policy. It

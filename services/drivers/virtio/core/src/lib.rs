@@ -9,7 +9,7 @@
 //! and the startup message format used by devmgr to pass PCI capability info
 //! to `VirtIO` drivers.
 
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 
 pub mod pci;
 pub mod virtqueue;
@@ -112,73 +112,6 @@ impl VirtioPciStartupInfo
         Some(())
     }
 
-    /// Number of IPC data words needed to hold the serialised form (7 words).
-    pub const IPC_WORD_COUNT: usize = 7;
-
-    /// Pack the startup info into 7 `u64` data words for an `IpcMessage`.
-    ///
-    /// Layout: 2 words per cap location (bar|offset in lo, length in hi),
-    /// except the last cap shares its hi word with `notify_off_multiplier`.
-    #[must_use]
-    #[allow(clippy::cast_possible_truncation)]
-    pub fn to_words(&self) -> [u64; Self::IPC_WORD_COUNT]
-    {
-        let mut out = [0u64; Self::IPC_WORD_COUNT];
-        let caps = [
-            &self.common_cfg,
-            &self.notify_cfg,
-            &self.isr_cfg,
-            &self.device_cfg,
-        ];
-        for (i, cap) in caps.iter().enumerate()
-        {
-            out[i * 2] = u64::from(cap.bar) | (u64::from(cap.offset) << 32);
-            if i < 3
-            {
-                out[i * 2 + 1] = u64::from(cap.length);
-            }
-        }
-        // Word 6: device_cfg.length | (notify_off_multiplier << 32).
-        out[6] = u64::from(self.device_cfg.length) | (u64::from(self.notify_off_multiplier) << 32);
-        out
-    }
-
-    /// Unpack the startup info from 7 `u64` data words delivered over IPC.
-    ///
-    /// If `words` has fewer than [`Self::IPC_WORD_COUNT`] entries the
-    /// remaining fields are read as zero.
-    #[must_use]
-    #[allow(clippy::cast_possible_truncation)]
-    pub fn from_words(words: &[u64]) -> Self
-    {
-        let mut info = Self::default();
-        let read = |i: usize| -> u64 { words.get(i).copied().unwrap_or(0) };
-
-        let caps = [
-            &mut info.common_cfg,
-            &mut info.notify_cfg,
-            &mut info.isr_cfg,
-            &mut info.device_cfg,
-        ];
-        for (i, cap) in caps.into_iter().enumerate()
-        {
-            let lo = read(i * 2);
-            cap.bar = lo as u8;
-            cap.offset = (lo >> 32) as u32;
-            if i < 3
-            {
-                let hi = read(i * 2 + 1);
-                cap.length = hi as u32;
-            }
-        }
-        // Word 6: device_cfg.length | (notify_off_multiplier << 32).
-        let last = read(6);
-        info.device_cfg.length = last as u32;
-        info.notify_off_multiplier = (last >> 32) as u32;
-
-        info
-    }
-
     /// Number of 4 KiB pages spanned by the highest reach across all four
     /// capability regions in BAR 0. Drivers use this to size the VA
     /// reservation backing `mmio_map` for the BAR.
@@ -214,3 +147,73 @@ pub const VIRTIO_PCI_CAP_NOTIFY_CFG: u8 = 2;
 pub const VIRTIO_PCI_CAP_ISR_CFG: u8 = 3;
 /// Device-specific configuration capability type.
 pub const VIRTIO_PCI_CAP_DEVICE_CFG: u8 = 4;
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+
+    fn cap(bar: u8, offset: u32, length: u32) -> VirtioCapLocation
+    {
+        VirtioCapLocation {
+            bar,
+            pad: [0; 3],
+            offset,
+            length,
+        }
+    }
+
+    fn populated() -> VirtioPciStartupInfo
+    {
+        VirtioPciStartupInfo {
+            common_cfg: cap(1, 0x100, 0x10),
+            notify_cfg: cap(2, 0x200, 0x20),
+            isr_cfg: cap(3, 0x300, 0x30),
+            device_cfg: cap(4, 0x400, 0x40),
+            notify_off_multiplier: 0x55,
+            pad: 0,
+        }
+    }
+
+    #[test]
+    fn startup_info_bytes_round_trip_preserves_populated_value()
+    {
+        let info = populated();
+        let mut buf = [0u8; VirtioPciStartupInfo::SIZE];
+        info.to_bytes(&mut buf).expect("buffer is SIZE bytes");
+        // common_cfg.bar is byte 0: proves to_bytes actually wrote the value
+        // (so the round trip below is not a zero-equals-zero tautology).
+        assert_eq!(buf[0], 1);
+
+        let back = VirtioPciStartupInfo::from_bytes(&buf).expect("slice is SIZE bytes");
+        let mut reserialised = [0u8; VirtioPciStartupInfo::SIZE];
+        back.to_bytes(&mut reserialised)
+            .expect("buffer is SIZE bytes");
+        assert_eq!(buf, reserialised);
+    }
+
+    #[test]
+    fn startup_info_marshalling_rejects_undersized_buffer()
+    {
+        let info = populated();
+        let mut small = [0u8; VirtioPciStartupInfo::SIZE - 1];
+        assert!(info.to_bytes(&mut small).is_none());
+        assert!(VirtioPciStartupInfo::from_bytes(&small).is_none());
+    }
+
+    #[test]
+    fn bar_aperture_pages_spans_max_reach_across_all_caps()
+    {
+        let mut info = populated();
+        // The 4th cap reaches furthest, one byte into the second page; the
+        // result must take the max over all caps and round the partial page up.
+        info.device_cfg = cap(0, 0x1000, 0x10);
+        assert_eq!(info.bar_aperture_pages(), 2);
+    }
+
+    #[test]
+    fn bar_aperture_pages_floors_to_one_page_when_all_zero()
+    {
+        assert_eq!(VirtioPciStartupInfo::default().bar_aperture_pages(), 1);
+    }
+}

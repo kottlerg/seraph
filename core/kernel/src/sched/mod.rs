@@ -1449,6 +1449,19 @@ pub unsafe fn commit_blocked_under_local_lock(
                     (*tcb).state = thread::ThreadState::Blocked;
                     (*tcb).ipc_state = ipc;
                     (*tcb).blocked_on_object = blocked_on;
+                    // Clear the publication barrier as part of the park commit so
+                    // EVERY parker carries context_saved = 0 while Blocked: a
+                    // cross-CPU waker's dispatch then spins on the cs barrier
+                    // until this thread's own schedule(false) -> switch()
+                    // republishes its saved state, instead of dispatching a
+                    // not-yet-saved register file. The IPC parkers already
+                    // pre-clear cs (ordered before their reply_tcb publish, and
+                    // retained); folding it here makes the clear-before-park rule
+                    // self-enforcing and idempotent for them, and closes
+                    // sys_thread_sleep, which had no pre-clear.
+                    (*tcb)
+                        .context_saved
+                        .store(0, core::sync::atomic::Ordering::Relaxed);
                     true
                 }
             }
@@ -1567,6 +1580,125 @@ pub unsafe fn prod_remote_cpu(target_cpu: usize)
 #[allow(unused_variables)]
 pub unsafe fn prod_remote_cpu(_target_cpu: usize) {}
 
+/// Spin until `tcb` is `current` on no CPU and its register save is published
+/// (`context_saved == 1`), prodding the owning remote CPU so it reaches
+/// `schedule()` promptly.
+///
+/// This is the "wait until the target has provably switched away on every CPU
+/// and committed its register file" barrier that `dealloc_object(Thread)`
+/// (`cap/object.rs`, the #207 free-gate) and `sys_thread_stop`'s drain already
+/// depend on. `sys_thread_start` reuses it before force-linking a resumed
+/// thread: a thread stopped while Running may still be `current`/executing on a
+/// remote CPU, and `enqueue_ready_thread` would otherwise dispatch it on a
+/// second CPU while it still runs on the first (the cross-CPU double-dispatch of
+/// #314/#293).
+///
+/// The caller MUST hold no scheduler lock and MUST have left `tcb` in a state
+/// `schedule()`'s requeue denylist rejects (`Stopped`/`Exited`/`Created`) so the
+/// owning CPU deschedules it WITHOUT re-linking it onto a run queue. The scan
+/// and spins take each per-CPU `scheduler.lock` one at a time and hold no lock
+/// across the wait; they run preempt-disabled with interrupts ENABLED (the #207
+/// envelope) so an inbound TLB/FPU IPI to this CPU stays serviceable.
+///
+/// # Safety
+/// `tcb` must be a valid [`ThreadControlBlock`] pointer.
+#[cfg(not(test))]
+pub unsafe fn await_descheduled(tcb: *mut thread::ThreadControlBlock)
+{
+    use core::sync::atomic::Ordering;
+
+    let cpu_count = CPU_COUNT.load(Ordering::Relaxed) as usize;
+    let me = crate::arch::current::cpu::current_cpu() as usize;
+
+    // #207 spin envelope: preempt-disabled, interrupts enabled. We enter at
+    // IF=0 (syscall); spinning at IF=0 would block an inbound TLB/FPU shootdown
+    // IPI targeted at this CPU and deadlock its initiator. Enabling IF keeps it
+    // serviceable while `preempt_disable` pins us so the scheduler cannot
+    // migrate us mid-drain. Mirrors `dealloc_object(Thread)` and the stop drain.
+    crate::percpu::preempt_disable();
+    // SAFETY: ring 0; restored below.
+    let saved_int = unsafe { crate::arch::current::cpu::save_and_disable_interrupts() };
+    // SAFETY: ring 0; IDT loaded; preempt disabled.
+    unsafe { crate::arch::current::interrupts::enable() };
+
+    // Step 1: not `current` on any CPU. Find the (at most one) CPU still naming
+    // `tcb` as current, prod it into `schedule()`, and spin on just that CPU's
+    // lock until it switches away; then re-scan. The target is denylisted, so
+    // the owning CPU drops it without re-linking — once a full scan is clean no
+    // CPU can re-install it.
+    loop
+    {
+        let run_cpu = 'scan: {
+            for cpu in 0..cpu_count
+            {
+                // SAFETY: cpu < cpu_count; scheduler slab initialised by init().
+                let s = unsafe { scheduler_for(cpu) };
+                // SAFETY: lock_raw/unlock_raw paired; no other lock held across.
+                let is_cur = unsafe {
+                    let f = s.lock.lock_raw();
+                    let c = s.current == tcb;
+                    s.lock.unlock_raw(f);
+                    c
+                };
+                if is_cur
+                {
+                    break 'scan Some(cpu);
+                }
+            }
+            None
+        };
+        let Some(run_cpu) = run_cpu
+        else
+        {
+            break;
+        };
+        // The target is Created/Stopped and the caller is the Running thread, so
+        // the target can never be `current` on the calling CPU; the prod always
+        // targets a remote. The assert fails loudly if a future change breaks
+        // that invariant (a self-`current` target would spin forever below).
+        debug_assert!(
+            run_cpu != me,
+            "await_descheduled: target is current on the calling CPU"
+        );
+        if run_cpu != me
+        {
+            // SAFETY: run_cpu < cpu_count.
+            unsafe { prod_remote_cpu(run_cpu) };
+        }
+        // SAFETY: run_cpu < cpu_count.
+        let sched = unsafe { scheduler_for(run_cpu) };
+        // SAFETY: lock_raw/unlock_raw paired; no other lock held across the spin.
+        while unsafe {
+            let f = sched.lock.lock_raw();
+            let still_current = sched.current == tcb;
+            sched.lock.unlock_raw(f);
+            still_current
+        }
+        {
+            core::hint::spin_loop();
+        }
+    }
+
+    // Step 2: register save published. The owning CPU's `switch()` stores
+    // `context_saved = 1` (Release) after saving `tcb`; pair with an Acquire
+    // load here. A Created/never-run thread inits `context_saved = 1`, so this
+    // is immediate on the first-start path.
+    // SAFETY: tcb valid; context_saved is AtomicU32.
+    while unsafe { (*tcb).context_saved.load(Ordering::Acquire) } == 0
+    {
+        core::hint::spin_loop();
+    }
+
+    // SAFETY: saved_int from save_and_disable_interrupts above.
+    unsafe { crate::arch::current::cpu::restore_interrupts(saved_int) };
+    crate::percpu::preempt_enable();
+}
+
+/// Test stub.
+#[cfg(test)]
+#[allow(unused_variables)]
+pub unsafe fn await_descheduled(_tcb: *mut thread::ThreadControlBlock) {}
+
 /// Migrate a `Ready` thread from `src_cpu`'s run queue onto `dst_cpu`'s
 /// run queue.
 ///
@@ -1643,15 +1775,28 @@ pub unsafe fn migrate_ready_thread(
     // SAFETY: lo lock held; acquiring hi second satisfies ascending-CPU order.
     let saved_hi = unsafe { hi_sched.lock.lock_raw() };
 
-    // Authoritative read under sched_lock: only a Ready thread is migratable.
+    // Authoritative read under sched_lock: only a Ready thread that has FULLY
+    // saved its context (`context_saved == 1`) is migratable. A Ready-but-
+    // `cs == 0` thread is mid-handoff — woken (e.g. a fast IPC reply) while still
+    // `current`/live on its source CPU and not yet switched away; relocating it
+    // cross-CPU would dispatch it on two CPUs at once (#314/#293). `cs == 1`
+    // proves it has switched out and is not `current` anywhere. A skipped
+    // mid-handoff thread keeps its (already-written) affinity and is placed
+    // correctly by its source CPU's `schedule()` cross-affinity arm.
     // `remove_from_queue(src)` below is the authoritative "located on src" check —
     // it fails (and we bail) if the thread is Ready on a different CPU's queue or
     // in the benign Ready-but-unlinked publication window — so no separate
     // preferred_cpu heuristic is needed.
-    // SAFETY: tcb valid; state/priority read under sched_lock + run-queue locks.
-    let (state, priority) = unsafe { ((*tcb).state, (*tcb).priority) };
+    // SAFETY: tcb valid; state/cs/priority read under sched_lock + run-queue locks.
+    let (state, cs, priority) = unsafe {
+        (
+            (*tcb).state,
+            (*tcb).context_saved.load(Ordering::Acquire),
+            (*tcb).priority,
+        )
+    };
 
-    if state != thread::ThreadState::Ready
+    if state != thread::ThreadState::Ready || cs != 1
     {
         // SAFETY: paired above; release inner (hi, lo) then outer (sched_lock).
         unsafe {
@@ -1870,9 +2015,22 @@ unsafe fn pull_unpinned_ready(src_cpu: usize, dst_cpu: usize)
     // threads; the matching `switch_out_save` clears ownership before
     // the thread re-enters the Ready state. So every Ready candidate's
     // XSAVE area is already canonical and safe to pull.
+    // Only steal a FULLY-SAVED Ready thread (`context_saved == 1`). A
+    // Ready-but-`context_saved == 0` candidate is mid-handoff: it was woken
+    // (e.g. a fast IPC reply) while still `current`/live on `src_cpu` and has
+    // not yet reached its own `schedule()` to switch away. Relocating it to
+    // `dst_cpu` and dispatching it there marks it `Running` on two CPUs at once
+    // — the cross-CPU double-dispatch behind #314/#293. `cs == 1` provably means
+    // the thread has switched out and is not `current` on any CPU, so it is safe
+    // to pull (every parker clears `cs = 0` at the block commit; the source
+    // CPU's `switch()` republishes `cs = 1` once the register save is
+    // committed). A skipped mid-handoff thread is dispatched by its source CPU
+    // and pulled on a later balance tick once `cs == 1`.
     // SAFETY: src_cpu valid; lock held; predicate is read-only.
     let pick = unsafe {
-        (*scheduler_ptr(src_cpu)).find_runnable(|tcb| (*tcb).cpu_affinity == AFFINITY_ANY)
+        (*scheduler_ptr(src_cpu)).find_runnable(|tcb| {
+            (*tcb).cpu_affinity == AFFINITY_ANY && (*tcb).context_saved.load(Ordering::Acquire) == 1
+        })
     };
 
     let Some((tcb, priority)) = pick

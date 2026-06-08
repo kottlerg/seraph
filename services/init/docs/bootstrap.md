@@ -13,31 +13,31 @@ names used in source `log()` strings — `"phase 1 bootstrap complete"`,
 
 ### Raw bootstrap
 
-Init reaches `run()` (`../src/main.rs:350`) with the kernel-supplied
+Init reaches `run()` (`../src/main.rs`) with the kernel-supplied
 `InitInfo` populated and the initial CSpace seeded (see
 [Capability flow](#capability-flow)). It performs the work required to
 stand memmgr and procmgr up via raw syscalls, then delegates further
 process creation to procmgr IPC.
 
 - Version-check `InitInfo` against `INIT_PROTOCOL_VERSION` and exit
-  on mismatch (`../src/main.rs:357`).
+  on mismatch (`INIT_PROTOCOL_VERSION` check in `run()`, `../src/main.rs`).
 - Initialise the per-arch serial path used for FATAL pre-IPC errors
-  (`../src/main.rs:364`).
+  (`arch::current::serial_init`, `../src/main.rs`).
 - Build the `MemoryAlloc` bump allocator over the kernel-provided
-  memory pool (`../src/main.rs:366`).
+  memory pool (`MemoryAlloc::new`, `../src/main.rs`).
 - Reserve a Memory cap to back kernel-object retypes (the endpoint slab;
   one page suffices for the eight endpoints init creates)
-  (`../src/main.rs:377`).
+  (`../src/main.rs`).
 - Map a fresh IPC buffer page at `INIT_IPC_BUF_VA` and register it
-  with the kernel (`../src/main.rs:393`–`../src/main.rs:405`).
+  with the kernel (`syscall::ipc_buffer_set`, `../src/main.rs`).
 - Mint endpoint objects: init's bootstrap endpoint, procmgr's
   service endpoint, memmgr's service endpoint, svcmgr's service
-  endpoint (`../src/main.rs:439`; minted here so procmgr can receive
+  endpoint (`syscall::cap_create_endpoint`, `../src/main.rs`; minted here so procmgr can receive
   an un-badged SEND on it during procmgr's bootstrap round), and
-  the master log endpoint (`../src/main.rs:460`).
+  the master log endpoint (`../src/main.rs`).
 - Spawn the init-logd thread — a second thread of the init process
   that drains the master log endpoint and writes lines to the serial
-  UART directly (`../src/main.rs:472`, with the receive loop in
+  UART directly (`logging::spawn_log_thread`, `../src/main.rs`, with the receive loop in
   `../src/logging.rs`). After this point init's own `log()` lines
   ride IPC through init-logd to the serial UART. init-logd outlives
   init's main thread: it covers the console across the init→svcmgr
@@ -48,36 +48,36 @@ process creation to procmgr IPC.
   / `cap_create_thread`, ELF-load it from the `memmgr` bundle
   entry, prepare its `ProcessInfo` page, and configure its main
   thread but defer `thread_start`
-  (`bootstrap::bootstrap_memmgr` at `../src/bootstrap.rs:521`,
-  called from `../src/main.rs:506`).
+  (`bootstrap::bootstrap_memmgr` in `../src/bootstrap.rs`,
+  called from `run()` in `../src/main.rs`).
 - Bootstrap procmgr the same way; procmgr's `ProcessInfo` receives
   the memmgr SEND cap so its std heap reaches memmgr on the first
-  allocation (`bootstrap::bootstrap_procmgr` at
-  `../src/bootstrap.rs:1119`, called from `../src/main.rs:515`).
+  allocation (`bootstrap::bootstrap_procmgr` in
+  `../src/bootstrap.rs`, called from `run()` in `../src/main.rs`).
 - Delegate all remaining RAM Memory caps to memmgr's CSpace via
   `finalize_memmgr` and serve a single bootstrap-IPC round carrying
   the pool's memory-cap range + a read-only phys-table cap (so memmgr can
-  ingest its pool) (`../src/main.rs:543`, serve at `../src/main.rs:574`).
+  ingest its pool) (`finalize_memmgr`, served via `ipc::bootstrap::serve_round`; `../src/main.rs`).
   Init retains every boot-module Memory cap (its self-loaded
   memmgr/procmgr ELFs plus the devmgr/vfsd/driver modules) as sole
   owner; those donate to memmgr's pool on the reap-handoff route, not
-  here (`../src/main.rs:628`).
+  here (`../src/main.rs`).
 - Start procmgr's thread and serve procmgr's bootstrap IPC, handing
   it the log endpoint SEND and svcmgr's service endpoint SEND
-  (`../src/main.rs:634`).
+  (`bootstrap::start_procmgr`, `../src/main.rs`).
 - Request procmgr to create devmgr via boot-module
   `CREATE_PROCESS` and serve devmgr's multi-round bootstrap
   (hardware caps: MMIO apertures, Interrupt range, ACPI Memory caps,
   DTB Memory cap on riscv64, and a `FRAMEBUFFER_INFO` round carrying
   the bootloader-discovered `boot_protocol::FramebufferInfo` so devmgr
   can spawn the userspace framebuffer driver)
-  (`../src/main.rs:720` + `service::create_devmgr_with_caps` at
-  `../src/service.rs:341`).
+  (`run()` in `../src/main.rs` + `service::create_devmgr_with_caps` in
+  `../src/service.rs`).
 - Request procmgr to create vfsd the same way and serve its
-  bootstrap (`../src/main.rs:738` +
-  `service::create_vfsd_with_caps` at `../src/service.rs:738`).
+  bootstrap (`run()` in `../src/main.rs` +
+  `service::create_vfsd_with_caps` in `../src/service.rs`).
 - Closing marker: `"phase 1 bootstrap complete"`
-  (`../src/main.rs:755`).
+  (`../src/main.rs`).
 
 ### Root acquisition
 
@@ -103,7 +103,7 @@ init's wait-for-root barrier.
   captured state via `HANDOVER_PULL`. See
   [`../../logd/docs/handover-protocol.md`](../../logd/docs/handover-protocol.md).
 - Closing marker: `"phase 2 bootstrap complete"`
-  (`../src/main.rs:783`).
+  (`../src/main.rs`).
 
 ### Handover
 

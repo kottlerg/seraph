@@ -19,10 +19,13 @@ from memmgr, not from a procmgr-owned pool.
 procmgr/
 ├── Cargo.toml                  # Workspace member; std-using binary
 ├── README.md
+├── process-table/              # `procmgr-process-table` crate: pure host-tested table + badge logic
 ├── src/
 │   ├── main.rs                 # _start() entry point, IPC dispatch loop
 │   ├── loader.rs               # ELF load pipeline
-│   └── process.rs              # Per-process state, kernel-object allocation
+│   ├── process.rs              # Per-process state, kernel-object allocation
+│   ├── init_reap.rs            # Init-reap: tears down init's residue after handover
+│   └── arch/                   # Arch-specific helpers
 └── docs/
     └── ipc-interface.md        # procmgr IPC interface specification
 ```

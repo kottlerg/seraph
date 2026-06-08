@@ -309,6 +309,7 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 name = "fatfs"
 version = "0.1.0"
 dependencies = [
+ "fatfs-parse",
  "ipc",
  "namespace-protocol",
  "syscall",
@@ -326,6 +327,10 @@ dependencies = [
  "chrono",
  "log 0.4.29",
 ]
+
+[[package]]
+name = "fatfs-parse"
+version = "0.1.0"
 
 [[package]]
 name = "fb-charset"
@@ -615,8 +620,16 @@ name = "memmgr"
 version = "0.1.0"
 dependencies = [
  "ipc",
+ "memmgr-free-pool",
  "process-abi",
  "syscall",
+ "syscall-abi",
+]
+
+[[package]]
+name = "memmgr-free-pool"
+version = "0.1.0"
+dependencies = [
  "syscall-abi",
 ]
 
@@ -734,9 +747,14 @@ dependencies = [
  "ipc",
  "namespace-protocol",
  "process-abi",
+ "procmgr-process-table",
  "syscall",
  "syscall-abi",
 ]
+
+[[package]]
+name = "procmgr-process-table"
+version = "0.1.0"
 
 [[package]]
 name = "pwrmgr"
@@ -810,6 +828,13 @@ name = "rustc-std-workspace-core"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aa9c45b374136f52f2d6311062c7146bff20fec063c3f5d46a410bd937746955"
+
+[[package]]
+name = "ruststd-argv-env"
+version = "0.1.0"
+dependencies = [
+ "rustc-std-workspace-core",
+]
 
 [[package]]
 name = "rustversion"

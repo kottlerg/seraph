@@ -78,7 +78,7 @@ impl Harness
 /// devmgr through its `SET_DRIVERS_DIR` subtree cap; growing the bundle
 /// with non-essentials directly wastes permanently-leaked
 /// post-`ExitBootServices` UEFI allocation
-/// (see `core/boot/src/main.rs:1076-1091`).
+/// (see `step9_populate_boot_info` in `core/boot/src/main.rs`).
 ///
 /// All entries are mandatory; a missing source binary hard-errors.
 /// Order is preserved across builds to keep the disk-image byte-stable.

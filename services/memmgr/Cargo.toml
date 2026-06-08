@@ -10,6 +10,9 @@ path = "src/main.rs"
 test = false
 
 [dependencies]
+# Pure free-pool allocator + region-interval logic, extracted so it is
+# host-testable; the bin injects memory_merge/memory_split as closures.
+free_pool = { path = "free-pool", package = "memmgr-free-pool" }
 process-abi = { path = "../../abi/process-abi" }
 ipc = { path = "../../shared/ipc" }
 syscall = { path = "../../shared/syscall" }

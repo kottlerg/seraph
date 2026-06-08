@@ -89,6 +89,9 @@ Code comments explain local intent, constraints, or non-obvious rationale.
 - Comments MUST NOT duplicate documentation content.
 - Where a comment depends on a documented invariant, it MUST reference the relevant document
   rather than restate the invariant inline.
+- Comments and documentation MUST reference code by stable identifier (symbol, function,
+  const, type) or behavior, never by line number; a `path:line` reference is for review and
+  chat only.
 
 Detailed comment conventions are in [coding-standards.md](coding-standards.md).
 

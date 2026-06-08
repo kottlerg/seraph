@@ -323,6 +323,12 @@ fn sys_thread_sleep(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         // § Sleep List Invariants. No IPC source binding and no waker targets a
         // sleeping thread before sleep_list_add, so the thread is still Blocked
         // here; restore Running under sched_lock.
+        // The successful commit_blocked above cleared context_saved = 0; this
+        // rollback leaves the thread Running with cs = 0, which is intentional
+        // and benign — cs = 0 truthfully means "live registers authoritative"
+        // for a still-`current`, never-switched-out thread, no path dispatches a
+        // not-linked `current` thread cross-CPU, and the next switch-out
+        // republishes cs = 1. Do NOT "restore" cs = 1 here.
         // SAFETY: tcb valid; restoring before any schedule().
         unsafe {
             let saved = (*tcb).sched_lock.lock_raw();

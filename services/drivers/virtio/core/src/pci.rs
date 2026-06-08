@@ -25,6 +25,20 @@ pub struct PciTransport
     notify_off_multiplier: u32,
 }
 
+/// Byte offset of a queue's notification register from the start of the
+/// notification capability region (`VirtIO` 1.2 §4.1.4.4).
+///
+/// `queue_notify_off` is the per-queue offset the device reports; scaling it
+/// by `notify_off_multiplier` and adding the capability's own `notify_off`
+/// yields the doorbell address. Operands widen to `u64` before the multiply,
+/// matching the address arithmetic in [`PciTransport::notify`].
+#[must_use]
+pub fn notify_addr_offset(notify_off: u32, queue_notify_off: u16, notify_off_multiplier: u32)
+-> u64
+{
+    u64::from(notify_off) + u64::from(queue_notify_off) * u64::from(notify_off_multiplier)
+}
+
 impl PciTransport
 {
     /// Create a new PCI transport from a mapped BAR base address and startup info.
@@ -165,8 +179,11 @@ impl PciTransport
     {
         mmio::dma_to_mmio_barrier();
 
-        let offset = u64::from(self.notify_off)
-            + u64::from(queue_notify_off) * u64::from(self.notify_off_multiplier);
+        let offset = notify_addr_offset(
+            self.notify_off,
+            queue_notify_off,
+            self.notify_off_multiplier,
+        );
         let addr = (self.bar_va + offset) as *mut u16;
         // SAFETY: notification region is within the mapped BAR; addr is
         // naturally aligned (notify_off and multiplier are set by the device
@@ -305,5 +322,26 @@ impl PciTransport
             core::ptr::write_volatile(addr as *mut u32, val);
         }
         mmio::mmio_to_mmio_barrier();
+    }
+}
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+
+    #[test]
+    fn notify_addr_offset_scales_queue_offset_by_multiplier()
+    {
+        // notify_off + queue_notify_off * notify_off_multiplier, all in u64.
+        assert_eq!(notify_addr_offset(0x3000, 2, 4), 0x3008);
+    }
+
+    #[test]
+    fn notify_addr_offset_gates_queue_offset_when_multiplier_zero()
+    {
+        // A zero multiplier collapses every queue onto notify_off: the queue
+        // term must be multiplied, not added.
+        assert_eq!(notify_addr_offset(0x3000, 2, 0), 0x3000);
     }
 }

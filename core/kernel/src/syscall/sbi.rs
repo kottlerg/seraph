@@ -34,27 +34,27 @@ use crate::arch::current::trap_frame::TrapFrame;
 use syscall::SyscallError;
 
 /// SBI System Reset (SRST) extension ID — ASCII "SRST".
-#[cfg(all(not(test), target_arch = "riscv64"))]
+#[cfg(not(test))]
 const SBI_EXT_SRST: u64 = 0x5352_5354;
 
 /// SBI System Suspend (SUSP) extension ID — ASCII "SUSP".
-#[cfg(all(not(test), target_arch = "riscv64"))]
+#[cfg(not(test))]
 const SBI_EXT_SUSP: u64 = 0x5355_5350;
 
 /// SBI CPPC (processor performance control) extension ID — ASCII "CPPC".
-#[cfg(all(not(test), target_arch = "riscv64"))]
+#[cfg(not(test))]
 const SBI_EXT_CPPC: u64 = 0x4350_5043;
 
 /// SBI Base extension ID (version / extension probe; read-only).
-#[cfg(all(not(test), target_arch = "riscv64"))]
+#[cfg(not(test))]
 const SBI_EXT_BASE: u64 = 0x10;
 
 /// SBI Debug Console (DBCN) extension ID — ASCII "DBCN".
-#[cfg(all(not(test), target_arch = "riscv64"))]
+#[cfg(not(test))]
 const SBI_EXT_DBCN: u64 = 0x4442_434E;
 
 /// SBI Performance Monitoring Unit (PMU) extension ID — ASCII "PMU".
-#[cfg(all(not(test), target_arch = "riscv64"))]
+#[cfg(not(test))]
 const SBI_EXT_PMU: u64 = 0x0050_4D55;
 
 /// Map an SBI extension ID to the `SbiControl` right required to forward it.
@@ -65,7 +65,7 @@ const SBI_EXT_PMU: u64 = 0x0050_4D55;
 /// receives a cap bearing that right is userspace cap-distribution policy.
 /// Adding a sanctioned extension is one entry here plus one `Rights` bit in
 /// `cap::slot::Rights`.
-#[cfg(all(not(test), target_arch = "riscv64"))]
+#[cfg(not(test))]
 fn sbi_required_right(extension: u64) -> Option<crate::cap::slot::Rights>
 {
     use crate::cap::slot::Rights;
@@ -82,11 +82,17 @@ fn sbi_required_right(extension: u64) -> Option<crate::cap::slot::Rights>
 }
 
 /// `SYS_SBI_CALL` handler — RISC-V implementation.
-#[cfg(all(not(test), target_arch = "riscv64"))]
+#[cfg(not(test))]
 pub fn sys_sbi_call(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::slot::CapTag;
     use crate::syscall::current_tcb;
+
+    // SBI is a RISC-V firmware interface; x86-64 has no equivalent.
+    if !crate::arch::current::HAS_SBI
+    {
+        return Err(SyscallError::NotSupported);
+    }
 
     #[allow(clippy::cast_possible_truncation)] // CSpace slot indices are u32.
     let sbi_cap_idx = tf.arg(0) as u32;
@@ -113,23 +119,9 @@ pub fn sys_sbi_call(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // SAFETY: cspace from current TCB; lookup_cap validates tag and rights.
     let _slot = unsafe { super::lookup_cap(cspace, sbi_cap_idx, CapTag::SbiControl, required) }?;
 
-    // Forward the SBI call.
-    let ret = crate::arch::current::sbi::sbi_call(extension, function, a0, a1, a2);
-
-    if ret.error != 0
-    {
-        // SBI errors are small negative integers (-1 through -9).
-        return Err(SyscallError::NotSupported);
-    }
-
-    Ok(ret.value)
-}
-
-/// `SYS_SBI_CALL` stub — x86-64 (SBI does not exist on x86-64).
-#[cfg(all(not(test), target_arch = "x86_64"))]
-pub fn sys_sbi_call(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
-{
-    Err(SyscallError::NotSupported)
+    // Forward the SBI call to firmware; SBI errors map to NotSupported.
+    crate::arch::current::sbi_forward(extension, function, a0, a1, a2)
+        .map_err(|()| SyscallError::NotSupported)
 }
 
 /// Test stub.

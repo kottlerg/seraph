@@ -56,10 +56,13 @@ pub mod current;
 pub mod current;
 ```
 
-The sections below document the **cross-architecture contract surface** — the functions and
-types architecture-neutral code depends on. Some submodules are arch-private support code
-(`gdt`, `idt`, `ioapic`/`sbi`, `fpu`, `platform`, `ap_trampoline`) whose internals are not
-part of the cross-architecture contract and are not documented here.
+The sections below document the **cross-architecture contract surface** — the functions,
+types, and module-level constants architecture-neutral code depends on. Some submodules are
+mostly arch-private support code (`gdt`, `idt`, `ioapic`/`sbi`, `fpu`, `platform`,
+`ap_trampoline`) whose internals are not part of the contract; the few items neutral code
+does call — `gdt::{load_iopb, permit_port_range_u32, IOPB_SIZE}` and `platform::console_mmio`
+— are listed in the module-level section below and are contract surface (both `gdt` helpers
+are no-ops on RISC-V).
 
 Addresses cross this boundary as raw `u64`. Page-permission and page-table-rewrite types
 (`PageFlags`, `MapOutcome`, `PagingError`) are architecture-neutral and defined in
@@ -207,6 +210,10 @@ pub fn new_state(entry: u64, stack_top: u64, arg: u64, is_user: bool) -> SavedSt
 /// Seed the thread-local-storage base in a `SavedState` before first run.
 pub fn seed_tls_base(saved: &mut SavedState, tls_base: u64);
 
+/// Round a user-supplied stack pointer to the entry point's `extern "C"` ABI
+/// alignment (x86-64 SysV `rsp ≡ 8 (mod 16)`; RISC-V LP64D `sp ≡ 0 (mod 16)`).
+pub fn align_initial_stack(sp: u64) -> u64;
+
 /// Switch from `current` to `next`, saving callee-saved registers into `current`
 /// and restoring them from `next`. `save_flag` is published once `current`'s
 /// state is fully saved, so another CPU may observe the thread as switched-out.
@@ -262,6 +269,11 @@ pub fn acknowledge(irq: u32);
 pub fn mask(irq: u32);
 pub fn unmask(irq: u32);
 
+/// Route a device IRQ to the BSP and leave it masked at the controller; the
+/// driver unmasks via `SYS_IRQ_ACK`. x86-64 installs an IOAPIC redirection
+/// entry; RISC-V enables then masks the PLIC source.
+pub unsafe fn route_device_irq(irq: u32);
+
 /// Send a TLB-shootdown or wakeup IPI to the CPU with the given hardware id
 /// (APIC id on x86-64; hart id on RISC-V).
 pub unsafe fn send_tlb_shootdown_ipi(target_hw_id: u32);
@@ -272,10 +284,11 @@ pub unsafe fn send_wakeup_ipi(target_hw_id: u32);
 pub unsafe fn wait_for_ack(cond: impl FnMut() -> bool, ctx: &IpiWaitCtx<'_>);
 ```
 
-External-IRQ routing is performed through arch-private modules (`ioapic::route` on x86-64;
-the PLIC path on RISC-V) and is not part of the cross-architecture contract surface.
-NMI-backtrace storage allocation (`init_nmi_backtrace_storage`) is likewise x86-64-private
-(no RISC-V counterpart; its caller is `#[cfg(target_arch = "x86_64")]`-gated).
+External-IRQ routing is reached through the `route_device_irq` surface function above; the
+underlying controller programming (`ioapic::route` on x86-64; the PLIC enable path on
+RISC-V) remains arch-private. Per-CPU table allocation that exists only on x86-64 (GDT/TSS,
+AP IST stacks, NMI-backtrace storage) is reached through the `init_ap_percpu_storage`
+module-level surface function (a no-op on RISC-V), not a `cfg(target_arch)`-gated call.
 
 ---
 
@@ -325,6 +338,10 @@ storage is architecture-managed (GS-base on x86-64; `sscratch` on RISC-V).
 /// index used by arch-neutral code).
 pub fn current_id() -> u32;
 pub fn current_cpu() -> u32;
+
+/// Read the current stack pointer (`rsp` / `sp`). Used by the panic-path
+/// backtrace scanner to bound the kernel-stack walk.
+pub fn current_stack_pointer() -> u64;
 
 /// Install the current CPU's per-CPU data block at `addr`. Call once per CPU
 /// before any per-CPU access.
@@ -386,6 +403,14 @@ impl TrapFrame {
     pub fn syscall_nr(&self) -> u64;
     pub fn set_return(&mut self, val: i64);
 
+    /// User-mode instruction pointer (rip / sepc).
+    pub fn instruction_pointer(&self) -> u64;
+
+    /// Validate and sanitize a user-supplied register snapshot before resuming
+    /// it in user mode: reject a non-canonical/non-user PC or SP and force safe
+    /// privilege state. `Err(())` maps to `SyscallError::InvalidArgument`.
+    pub fn sanitize_for_user_resume(&mut self) -> Result<(), ()>;
+
     /// Read syscall argument `n` (rdi/rsi/rdx/r10/r8/r9 or a0..a5); 0 for n >= 6.
     pub fn arg(&self, n: usize) -> u64;
 
@@ -402,6 +427,66 @@ impl TrapFrame {
     pub fn set_arg0(&mut self, val: u64);
     pub fn set_tls_base(&mut self, tls_base: u64);
 }
+```
+
+---
+
+## Module-level constants and free functions — `arch::current::*`
+
+Cross-architecture items that live directly on the arch module rather than in a per-concern
+submodule:
+
+```rust
+/// Diagnostic architecture name ("x86_64" / "riscv64").
+pub const ARCH_NAME: &str;
+
+/// Valid external-interrupt id range (0..=255 GSIs on x86-64; PLIC sources
+/// 1..=127 on RISC-V).
+pub const MIN_IRQ_ID: u32;
+pub const MAX_IRQ_ID: u32;
+
+/// Width of the root `Interrupt` range capability minted at Phase 7 (256 on
+/// x86-64; 1024 on RISC-V, the PLIC spec maximum). Oversizing is safe — arch
+/// helpers reject out-of-range ids.
+pub const ROOT_IRQ_COUNT: u32;
+
+/// Whether the architecture has an I/O port space — `IoPort` capabilities and
+/// the `sys_ioport_*` syscalls are meaningful. true on x86-64; false on RISC-V.
+pub const HAS_IO_PORTS: bool;
+
+/// Whether the architecture exposes SBI firmware — a root `SbiControl`
+/// capability is minted and `SYS_SBI_CALL` is forwardable. false on x86-64;
+/// true on RISC-V.
+pub const HAS_SBI: bool;
+
+/// Size in bytes of the per-thread I/O Permission Bitmap (8192 on x86-64; 0 on
+/// RISC-V). Sizes the `iopb` field in `ThreadControlBlock` uniformly.
+pub const IOPB_SIZE: usize;
+
+/// Forward a sanctioned SBI call to firmware, mapping SBI errors to `Err(())`
+/// (and always `Err(())` on x86-64, which has no SBI). The neutral
+/// `syscall::sbi` handler enforces the required `SbiControl` right and gates on
+/// `HAS_SBI` before calling.
+pub fn sbi_forward(extension: u64, function: u64, a0: u64, a1: u64, a2: u64) -> Result<u64, ()>;
+
+/// Allocate architecture-specific per-CPU tables during SMP bring-up: x86-64
+/// per-AP GDT/TSS, AP IST stacks, and NMI-backtrace storage; a no-op on RISC-V.
+pub fn init_ap_percpu_storage(cpu_count: usize, allocator: &mut mm::BuddyAllocator);
+```
+
+Two `gdt` helpers and one `platform` accessor are also contract surface (the rest of those
+modules is arch-private):
+
+```rust
+/// Load a thread's IOPB into the TSS, or clear it (x86-64); no-op on RISC-V.
+pub unsafe fn gdt::load_iopb(iopb: Option<&[u8; IOPB_SIZE]>);
+/// Permit an I/O port range in a thread's IOPB (x86-64); no-op on RISC-V.
+pub fn gdt::permit_port_range_u32(iopb: &mut [u8; IOPB_SIZE], base: u32, count: u32);
+
+/// Physical (base, size) of a boot console UART needing a dedicated `Mmio`
+/// capability at Phase 7: `Some` on RISC-V (ns16550, outside the aperture list);
+/// `None` on x86-64 (legacy I/O-port COM1).
+pub fn platform::console_mmio() -> Option<(u64, u64)>;
 ```
 
 ---

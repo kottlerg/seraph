@@ -229,9 +229,8 @@ fn subpage_link_ok(link: u64, memory_size: u64) -> bool
 /// or a span whose top exceeds `base + size`.
 ///
 /// Pure and `cfg`-independent (mirrors [`subpage_link_ok`]) so the host
-/// `#[cfg(test)]` suite can exercise it even though its sole runtime caller
-/// `free_seed_scratch` is `cfg(target_arch = "x86_64")`-gated.
-#[cfg_attr(target_arch = "riscv64", allow(dead_code))]
+/// `#[cfg(test)]` suite can exercise it directly. Its sole runtime caller is
+/// `free_seed_scratch` (IOPB teardown, meaningful only on x86-64).
 fn seed_scratch_offset(phys: u64, base: u64, size: u64, bytes: u64) -> Option<u64>
 {
     let need = round_to_class(bytes);
@@ -772,13 +771,14 @@ pub fn alloc_in_seed<T>(body: T) -> Result<NonNull<KernelObjectHeader>, SyscallE
 /// Unlike [`alloc_in_seed`], no `KernelObjectHeader` is written and the
 /// region does not enter any `CSpace`; the returned pointer is opaque.
 ///
-/// Gated `cfg(target_arch = "x86_64")` because the only consumer is the
-/// IOPB allocation in `sys_iopb_set`. RISC-V has no I/O port permission
-/// bitmap and never calls this. The per-thread FPU/SIMD/V save area is
-/// not allocated through this path — it is carved as part of the Thread
-/// retype slot (an extra page beyond kstack + wrapper) so its memory
-/// comes from the user's Memory cap rather than the SEED bootstrap reserve.
-#[cfg(all(not(test), target_arch = "x86_64"))]
+/// Compiled on every architecture but only exercised on x86-64 (per-thread
+/// IOPB pages); RISC-V has no I/O permission bitmap, so the only caller
+/// (`sys_ioport_bind`) is `HAS_IO_PORTS`-gated and never reaches this on that
+/// arch. The per-thread FPU/SIMD/V save area is not allocated through this
+/// path — it is carved as part of the Thread retype slot (an extra page beyond
+/// kstack + wrapper) so its memory comes from the user's Memory cap rather than
+/// the SEED bootstrap reserve.
+#[cfg(not(test))]
 pub fn alloc_seed_scratch(bytes: u64) -> Result<*mut u8, SyscallError>
 {
     let seed = crate::cap::seed_memory_ref();
@@ -794,7 +794,7 @@ pub fn alloc_seed_scratch(bytes: u64) -> Result<*mut u8, SyscallError>
 /// SEED is statically pinned (initial refcount 1 + Phase-7 `inc_ref` pin),
 /// so its refcount can never drop to zero in normal operation; the
 /// `dec_ref` here is bookkeeping for the scratch lease.
-#[cfg(all(not(test), target_arch = "x86_64"))]
+#[cfg(not(test))]
 pub fn free_seed_scratch(ptr: *mut u8, bytes: u64)
 {
     let seed = crate::cap::seed_memory_ref();

@@ -45,6 +45,22 @@ pub fn cpuid(leaf: u32) -> (u32, u32, u32, u32)
     (eax, ebx, ecx, edx)
 }
 
+// ── Stack pointer ───────────────────────────────────────────────────────────────
+
+/// Read the current stack pointer (`rsp`).
+///
+/// Used by the panic-path backtrace scanner to bound the kernel-stack walk.
+#[cfg(not(test))]
+pub fn current_stack_pointer() -> u64
+{
+    let sp: u64;
+    // SAFETY: reads the stack pointer register only; no memory access, no clobbers.
+    unsafe {
+        core::arch::asm!("mov {}, rsp", out(reg) sp, options(nomem, nostack, preserves_flags));
+    }
+    sp
+}
+
 // ── CR4 ───────────────────────────────────────────────────────────────────────
 
 /// Read the current value of CR4.

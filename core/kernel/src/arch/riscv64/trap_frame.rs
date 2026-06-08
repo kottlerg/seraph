@@ -178,6 +178,37 @@ impl TrapFrame
     {
         self.tp = tls_base;
     }
+
+    /// User-mode instruction pointer (`sepc`). Used by diagnostics that report
+    /// where a thread last entered the kernel.
+    pub fn instruction_pointer(&self) -> u64
+    {
+        self.sepc
+    }
+
+    /// Validate and sanitize a user-supplied register snapshot before it is
+    /// resumed in user mode: reject a non-user `sepc` and clear the
+    /// kernel-internal trap-cause fields.
+    ///
+    /// Returns `Err(())` if `sepc` is not a user address; the caller maps this
+    /// to `SyscallError::InvalidArgument`.
+    pub fn sanitize_for_user_resume(&mut self) -> Result<(), ()>
+    {
+        // sepc must be a valid user address. On RV64, virtual addresses in the
+        // supervisor range start at 0xFFFF_FFC0_0000_0000 (sv39). Any address
+        // >= 0x8000_0000_0000_0000 is non-user.
+        const USER_ADDR_LIMIT: u64 = 0x8000_0000_0000_0000;
+        if self.sepc >= USER_ADDR_LIMIT
+        {
+            return Err(());
+        }
+
+        // scause and stval are kernel-internal; zero them out to prevent
+        // spurious fault handling on resume.
+        self.scause = 0;
+        self.stval = 0;
+        Ok(())
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

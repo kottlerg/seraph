@@ -205,6 +205,40 @@ impl TrapFrame
     {
         self.fs_base = tls_base;
     }
+
+    /// User-mode instruction pointer (`rip`). Used by diagnostics that report
+    /// where a thread last entered the kernel.
+    pub fn instruction_pointer(&self) -> u64
+    {
+        self.rip
+    }
+
+    /// Validate and sanitize a user-supplied register snapshot before it is
+    /// resumed in user mode: reject a non-canonical instruction or stack
+    /// pointer, force ring-3 segment selectors, and clear privilege bits from
+    /// RFLAGS.
+    ///
+    /// Returns `Err(())` if `rip` or `rsp` is non-canonical; the caller maps
+    /// this to `SyscallError::InvalidArgument`.
+    pub fn sanitize_for_user_resume(&mut self) -> Result<(), ()>
+    {
+        // Canonical user address: bits [63:47] must all be zero.
+        const USER_ADDR_MASK: u64 = 0xFFFF_8000_0000_0000;
+        if self.rip & USER_ADDR_MASK != 0 || self.rsp & USER_ADDR_MASK != 0
+        {
+            return Err(());
+        }
+
+        // Force segment selectors to user-mode values (ring 3, RPL=3).
+        self.cs = super::gdt::USER_CS as u64;
+        self.ss = super::gdt::USER_DS as u64;
+
+        // rflags: must have IF (bit 9) set. Clear IOPL (bits 12-13), VM (bit
+        // 17), VIF (bit 19), VIP (bit 20) — none of which should be set in
+        // user mode. Bit 1 (reserved) must be 1 per the x86 spec.
+        self.rflags = (self.rflags | 0x202) & !0x0013_F000;
+        Ok(())
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

@@ -827,6 +827,25 @@ pub fn unmask(irq: u32)
     let _ = irq;
 }
 
+/// Route device IRQ (PLIC source) `irq` to the BSP, leaving it masked at the
+/// controller. The driver unmasks via `SYS_IRQ_ACK` once it has registered a
+/// handler.
+///
+/// # Safety
+/// Must be called after PLIC init with a valid source id.
+#[cfg(not(test))]
+pub unsafe fn route_device_irq(irq: u32)
+{
+    // Enable at the PLIC, then immediately mask until the driver ACKs — the
+    // x86-64 IOAPIC path leaves the line masked the same way.
+    plic_enable(irq);
+    mask(irq);
+}
+
+/// No-op test stub.
+#[cfg(test)]
+pub unsafe fn route_device_irq(_irq: u32) {}
+
 /// Dispatch an external interrupt from the PLIC to its registered notification.
 ///
 /// Called from `trap_dispatch` after claiming the interrupt. Routing is

@@ -1792,23 +1792,21 @@ unsafe fn dealloc_object_one(
                 unsafe { crate::arch::current::cpu::restore_interrupts(wake_saved_int) };
                 crate::percpu::preempt_enable();
 
-                // x86-64: release the per-thread IOPB to SEED if one was
-                // bound via `sys_iopb_set`. RISC-V threads never set this
-                // field; it stays null and the cleanup is a no-op.
-                #[cfg(target_arch = "x86_64")]
+                // Release the per-thread IOPB to SEED if one was bound via
+                // `sys_ioport_bind` (x86-64 only). RISC-V threads never set this
+                // field — there is no I/O port space — so `iopb` is always null
+                // and this is a no-op there.
+                // SAFETY: tcb validated non-null; iopb field always valid.
+                let iopb_ptr = unsafe { (*tcb).iopb };
+                if !iopb_ptr.is_null()
                 {
-                    // SAFETY: tcb validated non-null; iopb field always valid.
-                    let iopb_ptr = unsafe { (*tcb).iopb };
-                    if !iopb_ptr.is_null()
-                    {
-                        crate::cap::retype::free_seed_scratch(
-                            iopb_ptr.cast::<u8>(),
-                            crate::arch::current::gdt::IOPB_SIZE as u64,
-                        );
-                        // SAFETY: tcb validated non-null.
-                        unsafe {
-                            (*tcb).iopb = core::ptr::null_mut();
-                        }
+                    crate::cap::retype::free_seed_scratch(
+                        iopb_ptr.cast::<u8>(),
+                        crate::arch::current::IOPB_SIZE as u64,
+                    );
+                    // SAFETY: tcb validated non-null.
+                    unsafe {
+                        (*tcb).iopb = core::ptr::null_mut();
                     }
                 }
 

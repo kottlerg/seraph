@@ -374,3 +374,175 @@ pub const fn ring_pages(queue_size: u16) -> usize
     let total = used_ring_offset(queue_size) + used_ring_size(queue_size);
     total.div_ceil(4096)
 }
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+
+    #[test]
+    fn avail_and_used_ring_sizes_include_event_suffix_bytes()
+    {
+        // The 6-byte (not 4-byte) header carries the trailing used_event /
+        // avail_event field; reverting to 4 truncates the last ring slot.
+        // Expected values are spelled out, not the formula, so a header-size
+        // regression trips visibly rather than mirroring the function body.
+        assert_eq!(avail_ring_size(4), 14);
+        assert_eq!(used_ring_size(4), 38);
+    }
+
+    #[test]
+    fn used_ring_offset_rounds_descriptor_plus_avail_up_to_four_bytes()
+    {
+        // queue_size 1: desc 16 + avail 8 = 24, already 4-aligned.
+        assert_eq!(used_ring_offset(1), 24);
+        // queue_size 2: desc 32 + avail 10 = 42, must round UP to 44, not down.
+        assert_eq!(used_ring_offset(2), 44);
+    }
+
+    #[test]
+    fn ring_pages_rounds_up_partial_trailing_page()
+    {
+        // 38 bytes still needs a whole page (a truncating /4096 would yield 0).
+        assert_eq!(ring_pages(1), 1);
+        // queue_size 256 spans 6670 bytes: two pages, not one.
+        assert_eq!(ring_pages(256), 2);
+    }
+
+    /// Zeroed, 8-byte-aligned host buffers standing in for the DMA pages a real
+    /// driver reserves. Backing the descriptor/avail/used pointers with host
+    /// memory exercises the pure free-list and chain index arithmetic — the
+    /// platform-injection seam coding-standards.md §D endorses, not the kernel
+    /// ABI. Only the device wire format (a hand-written used-ring entry in
+    /// [`Rings::publish_used`]) is simulated.
+    struct Rings
+    {
+        desc: Vec<VirtqDesc>,
+        avail: Vec<u64>,
+        used: Vec<u64>,
+    }
+
+    impl Rings
+    {
+        fn new(queue_size: u16) -> Self
+        {
+            Self {
+                desc: vec![VirtqDesc::default(); queue_size as usize],
+                avail: vec![0u64; avail_ring_size(queue_size).div_ceil(8)],
+                used: vec![0u64; used_ring_size(queue_size).div_ceil(8)],
+            }
+        }
+
+        fn queue(&mut self, queue_size: u16) -> SplitVirtqueue
+        {
+            // SAFETY: the three buffers are zeroed, 8-byte aligned (Vec<u64> /
+            // Vec<VirtqDesc>), non-overlapping, sized to the VirtIO 1.2 ring
+            // helpers, and outlive the returned queue (the caller holds `self`).
+            unsafe {
+                SplitVirtqueue::new(
+                    self.desc.as_mut_ptr(),
+                    self.avail.as_mut_ptr().cast::<VirtqAvail>(),
+                    self.used.as_mut_ptr().cast::<VirtqUsed>(),
+                    queue_size,
+                )
+            }
+        }
+
+        /// Simulate the device publishing one completion: write a used-ring
+        /// element at `ring_idx` and advance `used.idx`.
+        fn publish_used(&mut self, ring_idx: usize, id: u32, len: u32, used_idx: u16)
+        {
+            let used = self.used.as_mut_ptr().cast::<VirtqUsed>();
+            // SAFETY: `used` is sized for queue_size elements via used_ring_size;
+            // ring_idx is in range for the queue sizes used here. Single-threaded.
+            #[allow(clippy::cast_ptr_alignment)]
+            unsafe {
+                let elem = used
+                    .cast::<u8>()
+                    .add(4)
+                    .cast::<VirtqUsedElem>()
+                    .add(ring_idx);
+                core::ptr::write(elem, VirtqUsedElem { id, len });
+                (*used).idx = used_idx;
+            }
+        }
+
+        fn desc(&self, idx: usize) -> VirtqDesc
+        {
+            self.desc[idx]
+        }
+    }
+
+    #[test]
+    fn add_chain_links_multi_buffer_chain_and_sets_next_flag()
+    {
+        let mut rings = Rings::new(8);
+        let mut vq = rings.queue(8);
+        let head = vq
+            .add_chain(&[
+                (0xA000, 0x10, false),
+                (0xB000, 0x20, true),
+                (0xC000, 0x30, false),
+            ])
+            .expect("three free descriptors available");
+        assert_eq!(head, 0);
+
+        let (d0, d1, d2) = (rings.desc(0), rings.desc(1), rings.desc(2));
+
+        // Head and middle carry NEXT and point at the following allocated index.
+        assert_ne!(d0.flags & VRING_DESC_F_NEXT, 0);
+        assert_eq!(d0.next, 1);
+        assert_ne!(d1.flags & VRING_DESC_F_NEXT, 0);
+        assert_eq!(d1.next, 2);
+        // The tail clears NEXT.
+        assert_eq!(d2.flags & VRING_DESC_F_NEXT, 0);
+        // Only the device-writable buffer carries WRITE.
+        assert_eq!(d0.flags & VRING_DESC_F_WRITE, 0);
+        assert_ne!(d1.flags & VRING_DESC_F_WRITE, 0);
+        // Each buffer's addr/len lands in its descriptor.
+        assert_eq!((d0.addr, d0.len), (0xA000, 0x10));
+        assert_eq!((d1.addr, d1.len), (0xB000, 0x20));
+        assert_eq!((d2.addr, d2.len), (0xC000, 0x30));
+    }
+
+    #[test]
+    fn add_chain_returns_none_when_free_descriptors_exhausted()
+    {
+        let mut rings = Rings::new(2);
+        let mut vq = rings.queue(2);
+        // A chain longer than the free count is refused, as is an empty chain,
+        // and neither consumes descriptors.
+        assert!(
+            vq.add_chain(&[(0xA000, 1, false), (0xB000, 1, false), (0xC000, 1, false)])
+                .is_none()
+        );
+        assert!(vq.add_chain(&[]).is_none());
+        // The free list is intact: a chain that exactly fills it still succeeds.
+        assert!(
+            vq.add_chain(&[(0xA000, 1, false), (0xB000, 1, false)])
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn poll_used_frees_completed_chain_and_advances_last_used_idx()
+    {
+        let mut rings = Rings::new(8);
+        let mut vq = rings.queue(8);
+        let head = vq
+            .add_chain(&[(0xA000, 0x200, false), (0xB000, 0x200, false)])
+            .expect("two free descriptors available");
+
+        // Device publishes the completion: ring[0] = {id: head, len: 0x200}.
+        rings.publish_used(0, u32::from(head), 0x200, 1);
+
+        assert_eq!(vq.poll_used(), Some((head, 0x200)));
+        // Idempotent until the device advances its index again.
+        assert_eq!(vq.poll_used(), None);
+
+        // Both descriptors — not just the head — returned to the free list: a
+        // fresh chain spanning the whole queue now succeeds.
+        let full: Vec<(u64, u32, bool)> = vec![(0xC000, 1, false); 8];
+        assert!(vq.add_chain(&full).is_some());
+    }
+}

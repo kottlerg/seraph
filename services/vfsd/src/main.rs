@@ -952,13 +952,24 @@ fn log_cap_delete(context: &str, slot: u32)
     }
 }
 
+/// Whether `path` denotes the mount root — `/`, the empty path, or an
+/// all-separator string like `///` — i.e. has no non-empty component.
+/// Mirrors [`VfsdRootBackend::install`]'s root-vs-terminal split so the
+/// mount transaction stores the matching cap kind for each role: a
+/// badged fall-through SEND for the root, the unbadged driver endpoint
+/// for a terminal mount.
+fn mount_path_is_root(path: &[u8]) -> bool
+{
+    path.split(|&b| b == b'/').all(<[u8]>::is_empty)
+}
+
 /// Mount a partition identified by `uuid` at `path`.
 ///
 /// Looks up the UUID in the GPT table, registers the partition bound
 /// with virtio-blk, spawns a fatfs driver, registers a mount entry,
-/// and captures a badged SEND on the driver's namespace endpoint
-/// into [`VfsdRootBackend`] so the system-root cap can resolve through
-/// the new mount.
+/// and captures the driver's namespace endpoint (terminal mounts) or a
+/// badged SEND on the root fs (the root mount) into [`VfsdRootBackend`]
+/// so the system-root cap can resolve through the new mount.
 ///
 /// On success returns a fresh badged SEND for the caller (zero if
 /// minting failed; the mount itself still landed). On failure
@@ -1058,45 +1069,55 @@ fn do_mount_internal(
     // transferred a derived child to procmgr; this releases vfsd's outer slot.
     log_cap_delete("module_cap (post-spawn)", module_cap_for_spawn);
 
-    // Mint two badged SEND caps on the driver's namespace endpoint,
-    // both addressing this mount's root at full namespace rights:
-    //   - `caller_root_cap` rides back to the caller (or is dropped
-    //     by an internal caller).
-    //   - `synthetic_root_cap` is captured into vfsd's
-    //     `VfsdRootBackend` so `NS_LOOKUP` against the system-root
-    //     cap returns a `cap_derive`-d copy of the underlying
-    //     driver's root.
-    //
-    // Two derives instead of one cap_copy because vfsd must be able
-    // to `cap_delete` either slot in isolation (e.g. an unmount drops
-    // the synthetic-root entry without forcing the caller to drop its
-    // copy). For revocation, the supported primitive is
+    // The MOUNT caller receives a full-rights badged SEND on this
+    // mount's root (the mounter holds full authority over the mount it
+    // requested); internal/auto callers drop it. Revocation is
     // destroy-the-fs-driver: `cap_revoke` on the driver's namespace
     // endpoint cascades through the kernel derivation graph and
-    // invalidates every cap ever derived from it (caller copies
-    // included), which is the namespace-model `kill the server` shape
-    // (see `docs/namespace-model.md` § Revocation). Per-cap revocation
-    // (e.g. revoking the synthetic-root entry without affecting the
-    // caller's copy) is not supported by this scheme.
+    // invalidates every cap ever derived from it — the namespace-model
+    // `kill the server` shape (see `docs/namespace-model.md`
+    // § Revocation). Per-cap revocation is not supported by this scheme.
     let root_badge = namespace_protocol::pack(
         namespace_protocol::NodeId::ROOT,
         namespace_protocol::NamespaceRights::ALL,
     );
     let caller_root_cap =
         syscall::cap_derive_badge(driver_ep, syscall::RIGHTS_SEND, root_badge).ok();
-    let synthetic_root_cap =
-        syscall::cap_derive_badge(driver_ep, syscall::RIGHTS_SEND, root_badge).ok();
 
-    let Some(cap) = synthetic_root_cap
+    // What the backend retains for this mount depends on its role:
+    //   - Root mount (`/`): a *badged* full-rights SEND on the root fs,
+    //     kept as the synthetic root's `fallthrough_cap`. The
+    //     fall-through forwarder pre-composes each forwarded request
+    //     with the caller's own rights (`compose_forward_lookup_rights`),
+    //     so a full-rights badge here cannot over-grant; `driver_ep` is
+    //     not retained (the root fs is never unmounted).
+    //   - Terminal mount (`/esp`, `/data`, …): the *unbadged* driver
+    //     endpoint itself. Every `NS_LOOKUP` crossing the mount mints a
+    //     freshly-attenuated badged SEND from it (the
+    //     `EntryTarget::External` arm of `handle_lookup`). Storing the
+    //     endpoint rather than a pre-badged root cap is what carries
+    //     attenuation across the mount boundary: the kernel forbids
+    //     re-badging an already-badged cap, so a stored badged cap
+    //     could only ever be `cap_derive`-copied at full rights.
+    let install_cap = if mount_path_is_root(path)
+    {
+        let Ok(c) = syscall::cap_derive_badge(driver_ep, syscall::RIGHTS_SEND, root_badge)
+        else
+        {
+            std::os::seraph::log!("MOUNT: root fall-through cap derive failed");
+            log_cap_delete(
+                "caller_root_cap (derive-fail)",
+                caller_root_cap.unwrap_or(0),
+            );
+            return Err(ipc::vfsd_errors::IO_ERROR);
+        };
+        c
+    }
     else
     {
-        std::os::seraph::log!("MOUNT: synthetic-root cap derive failed");
-        log_cap_delete(
-            "caller_root_cap (derive-fail)",
-            caller_root_cap.unwrap_or(0),
-        );
-        return Err(ipc::vfsd_errors::IO_ERROR);
+        driver_ep
     };
+
     // Install the mount; capture any synthetic intermediates created
     // along the path so we can populate their fall-through caps after
     // releasing the lock (the walk needs IPC and we must not block
@@ -1106,13 +1127,13 @@ fn do_mount_internal(
             .root_backend
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        backend.install(path, cap)
+        backend.install(path, install_cap)
     };
     let Some(install_result) = install_result
     else
     {
         std::os::seraph::log!("MOUNT: synthetic-root install full or oversized");
-        log_cap_delete("synthetic_root_cap (install-full)", cap);
+        log_cap_delete("install_cap (install-full)", install_cap);
         log_cap_delete(
             "caller_root_cap (install-full)",
             caller_root_cap.unwrap_or(0),

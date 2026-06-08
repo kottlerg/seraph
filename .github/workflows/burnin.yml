@@ -66,22 +66,26 @@ jobs:
       - name: Stage ${{ matrix.tester }} and repack disk
         # Recipe staging: svctest and usertest live in
         # `sysroot/config/svcmgr/tests/` (svcmgr does not scan that
-        # directory); cp into services/ to enable. `cargo xtask mkdisk`
-        # re-mirrors rootfs and repacks the FAT image without invoking
-        # cargo. ktest swaps the bundle's `init` entry via
-        # `cargo xtask compose-bundle --harness ktest`, which repacks
-        # the disk image as part of the compose step.
+        # directory); cp into services/ to enable. These functional harness
+        # boots drop the autostarted `terminal` (a user-facing program, not
+        # part of the services/programs substrate under test) so the boot is
+        # controlled. `--repack-only` makes the removal stick: a normal repack
+        # re-mirrors rootfs, which would restore terminal.svc. ktest swaps the
+        # bundle's `init` entry via `cargo xtask compose-bundle --harness
+        # ktest`, which repacks the disk image as part of the compose step.
         run: |
           case "${{ matrix.tester }}" in
             svctest)
               cp sysroot/config/svcmgr/tests/svctest.svc \
                  sysroot/config/svcmgr/services/
-              cargo xtask mkdisk --arch ${{ matrix.arch }}
+              rm -f sysroot/config/svcmgr/services/terminal.svc
+              cargo xtask mkdisk --arch ${{ matrix.arch }} --repack-only
               ;;
             usertest)
               cp sysroot/config/svcmgr/tests/usertest.svc \
                  sysroot/config/svcmgr/services/
-              cargo xtask mkdisk --arch ${{ matrix.arch }}
+              rm -f sysroot/config/svcmgr/services/terminal.svc
+              cargo xtask mkdisk --arch ${{ matrix.arch }} --repack-only
               ;;
             ktest)
               cargo xtask compose-bundle --arch ${{ matrix.arch }} --harness ktest

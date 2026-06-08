@@ -2915,70 +2915,101 @@ pub unsafe fn schedule(requeue_current: bool)
 
 // ── Death notification ───────────────────────────────────────────────────────
 
-/// Post a death notification for a thread that is about to exit or has faulted.
+/// Post one death payload to `eq` and route any woken receiver through
+/// [`select_target_cpu`] so the #289 save-window pin holds.
 ///
-/// Walks the thread's `death_observers` array and posts
-/// `(correlator as u64) << 32 | (exit_reason & 0xFFFF_FFFF)` to each
-/// registered `EventQueue`. If any post wakes a blocked receiver, enqueues
-/// it on the local run queue.
+/// Shared by the death walk ([`post_death_notification`]) and the late-bind
+/// retained-delivery path (`sys_thread_bind_notification`): a bind onto an
+/// already-`Exited` thread re-delivers the retained `exit_reason` to the
+/// newly-bound observer.
 ///
 /// # Safety
-/// `tcb` must be a valid, non-null TCB pointer. Must be called with the
-/// thread's state already set to `Exited` (or about to be).
+/// `eq` must be null or a valid `EventQueueState` pointer. The caller must
+/// NOT hold the dying thread's `sched_lock` — this posts to the event queue
+/// and may wake and enqueue a receiver.
 #[cfg(not(test))]
-pub unsafe fn post_death_notification(tcb: *mut thread::ThreadControlBlock, exit_reason: u64)
+pub(crate) unsafe fn post_one_death_event(
+    eq: *mut crate::ipc::event_queue::EventQueueState,
+    correlator: u32,
+    exit_reason: u64,
+)
 {
-    // SAFETY: tcb validated by caller.
-    let count = unsafe { (*tcb).death_observer_count } as usize;
-    if count == 0
+    if eq.is_null()
     {
         return;
     }
+    let payload = (u64::from(correlator) << 32) | (exit_reason & 0xFFFF_FFFF);
 
-    let exit_bits = exit_reason & 0xFFFF_FFFF;
-
-    for i in 0..count
+    // SAFETY: eq validated non-null; event_queue_post acquires its own lock.
+    let result = unsafe { crate::ipc::event_queue::event_queue_post(eq, payload) };
+    if let Ok(Some(woken_tcb)) = result
     {
-        // SAFETY: indices below count were populated by
-        // sys_thread_bind_notification; array has fixed length
-        // MAX_DEATH_OBSERVERS.
-        let observer = unsafe { (*tcb).death_observers[i] };
-        if observer.eq.is_null()
-        {
-            continue;
-        }
-        let payload = (u64::from(observer.correlator) << 32) | exit_bits;
-
-        // SAFETY: observer.eq is a valid EventQueueState pointer stored by
-        // SYS_THREAD_BIND_NOTIFICATION; event_queue_post acquires its own lock.
-        let result = unsafe { crate::ipc::event_queue::event_queue_post(observer.eq, payload) };
-        if let Ok(Some(woken_tcb)) = result
-        {
-            // Route through `select_target_cpu` like every other waker so the
-            // save-window pin holds: an observer woken while still mid-block has
-            // `context_saved == 0`, and the pin keeps it on its own saving CPU.
-            // Enqueuing on the dying thread's CPU instead would land the wake on
-            // a different CPU, whose `schedule()` then spins cross-CPU on the
-            // observer's in-flight register save — and if the observer is itself
-            // mid-block on its CPU, that save never publishes, deadlocking both
-            // CPUs (the observer ends up `current` on two CPUs). See #289.
-            // SAFETY: woken_tcb is a valid Ready TCB; select_target_cpu is lock-free.
-            unsafe {
-                let target_cpu = select_target_cpu(woken_tcb);
-                enqueue_and_wake(woken_tcb, target_cpu);
-            }
+        // Route through `select_target_cpu` like every other waker so the
+        // save-window pin holds: an observer woken while still mid-block has
+        // `context_saved == 0`, and the pin keeps it on its own saving CPU.
+        // Enqueuing on the dying thread's CPU instead would land the wake on
+        // a different CPU, whose `schedule()` then spins cross-CPU on the
+        // observer's in-flight register save — and if the observer is itself
+        // mid-block on its CPU, that save never publishes, deadlocking both
+        // CPUs (the observer ends up `current` on two CPUs). See #289.
+        // SAFETY: woken_tcb is a valid Ready TCB; select_target_cpu is lock-free.
+        unsafe {
+            let target_cpu = select_target_cpu(woken_tcb);
+            enqueue_and_wake(woken_tcb, target_cpu);
         }
     }
 }
 
-/// Post a terminal-fault notification to an address space's death observers.
+/// Post a death notification for a thread that is about to exit or has faulted.
 ///
-/// Mirrors [`post_death_notification`] but iterates the per-address-space
-/// observer set bound by `SYS_ASPACE_BIND_NOTIFICATION`. Walks the observers
-/// and posts `(correlator as u64) << 32 | (exit_reason & 0xFFFF_FFFF)` to each
-/// registered `EventQueue`; any post that wakes a blocked receiver enqueues it
-/// on the local run queue. The kernel only notifies here — it does not
-/// enumerate or terminate the address space's threads.
+/// Snapshots the thread's `death_observers` under `sched_lock`, then posts
+/// `(correlator as u64) << 32 | (exit_reason & 0xFFFF_FFFF)` to each
+/// registered `EventQueue` outside the lock via [`post_one_death_event`].
+/// Snapshotting under the lock serialises against a late
+/// `sys_thread_bind_notification` on a still-live thread, which takes the
+/// same lock and appends only while the thread is not yet `Exited`.
+///
+/// # Safety
+/// `tcb` must be a valid, non-null TCB pointer. Must be called without
+/// holding `(*tcb).sched_lock`, with the thread's state already set to
+/// `Exited` (or about to be).
+#[cfg(not(test))]
+pub unsafe fn post_death_notification(tcb: *mut thread::ThreadControlBlock, exit_reason: u64)
+{
+    // Snapshot the observer set under `sched_lock` so a concurrent late bind
+    // cannot mutate `death_observers`/`death_observer_count` mid-read; post
+    // after release to avoid holding the lock across event_queue_post /
+    // enqueue_and_wake. The whole fixed-size array is `Copy`, so snapshot it by
+    // value — no reference taken into the TCB.
+    // SAFETY: tcb validated by caller; caller does not hold sched_lock.
+    let (observers, count) = unsafe {
+        let saved = (*tcb).sched_lock.lock_raw();
+        let snapshot = (*tcb).death_observers;
+        let count = (*tcb).death_observer_count as usize;
+        (*tcb).sched_lock.unlock_raw(saved);
+        (snapshot, count)
+    };
+
+    for observer in &observers[..count]
+    {
+        // SAFETY: observer.eq is null (unused slot) or a valid EventQueueState
+        // stored by SYS_THREAD_BIND_NOTIFICATION; sched_lock is released.
+        unsafe { post_one_death_event(observer.eq, observer.correlator, exit_reason) };
+    }
+}
+
+/// Post a terminal-fault notification to an address space's death observers,
+/// recording the fault so an observer bound *after* it still learns of the
+/// death.
+///
+/// Mirrors [`post_death_notification`]: it records the terminal-fault reason on
+/// the address space (first fault wins) and snapshots the observer set under
+/// the space's `death_lock`, then posts
+/// `(correlator as u64) << 32 | (exit_reason & 0xFFFF_FFFF)` to each registered
+/// `EventQueue` outside the lock. A bind that arrives after the fault receives
+/// the retained reason via `AddressSpace::bind_or_retained`. The kernel only
+/// notifies here — it does not enumerate or terminate the address space's
+/// threads.
 ///
 /// On a main-thread terminal fault this fires in addition to the per-thread
 /// [`post_death_notification`]; when both target the same consumer queue
@@ -2987,8 +3018,8 @@ pub unsafe fn post_death_notification(tcb: *mut thread::ThreadControlBlock, exit
 ///
 /// # Safety
 /// `as_ptr` may be null (no-op) or a valid `AddressSpace` pointer. Must be
-/// called from the terminal-fault path after the faulting thread has been
-/// marked `Exited`.
+/// called from the terminal-fault path, after the faulting thread has been
+/// marked `Exited`, without holding the space's `death_lock`.
 #[cfg(not(test))]
 pub unsafe fn post_aspace_death_notification(
     as_ptr: *mut crate::mm::address_space::AddressSpace,
@@ -3000,38 +3031,20 @@ pub unsafe fn post_aspace_death_notification(
         return;
     }
 
-    // SAFETY: as_ptr validated non-null; the fault path holds it exclusively
-    // for the duration of this read.
-    let aspace = unsafe { &*as_ptr };
-    let (observers, count) = aspace.death_observers();
-    if count == 0
-    {
-        return;
-    }
-
-    let exit_bits = exit_reason & 0xFFFF_FFFF;
+    // Record the terminal fault (so an observer bound after it still learns of
+    // the death) and snapshot the observer set under the space's death_lock;
+    // post outside the lock.
+    // SAFETY: as_ptr validated non-null; not called holding death_lock.
+    let (observers, count) = unsafe {
+        crate::mm::address_space::AddressSpace::record_fault_and_snapshot(as_ptr, exit_reason)
+    };
 
     for observer in &observers[..count]
     {
-        if observer.eq.is_null()
-        {
-            continue;
-        }
-        let payload = (u64::from(observer.correlator) << 32) | exit_bits;
-
-        // SAFETY: observer.eq is a valid EventQueueState pointer stored by
-        // SYS_ASPACE_BIND_NOTIFICATION; event_queue_post acquires its own lock.
-        let result = unsafe { crate::ipc::event_queue::event_queue_post(observer.eq, payload) };
-        if let Ok(Some(woken_tcb)) = result
-        {
-            // Route through `select_target_cpu` so the save-window pin holds —
-            // see `post_death_notification` for the full rationale (#289).
-            // SAFETY: woken_tcb is a valid Ready TCB; select_target_cpu is lock-free.
-            unsafe {
-                let target_cpu = select_target_cpu(woken_tcb);
-                enqueue_and_wake(woken_tcb, target_cpu);
-            }
-        }
+        // SAFETY: observer.eq is null (unused slot) or a valid EventQueueState
+        // stored by SYS_ASPACE_BIND_NOTIFICATION; not called holding a thread's
+        // sched_lock.
+        unsafe { post_one_death_event(observer.eq, observer.correlator, exit_reason) };
     }
 }
 

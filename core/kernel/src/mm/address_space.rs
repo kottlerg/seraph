@@ -140,12 +140,29 @@ pub struct AddressSpace
     /// Number of populated entries in `death_observers`
     /// (`0..=MAX_DEATH_OBSERVERS`).
     death_observer_count: u8,
+    /// Serialises `death_observers`/`death_observer_count` and the retained
+    /// terminal-fault state below against a concurrent bind
+    /// (`sys_aspace_bind_notification`) and the terminal-fault post
+    /// (`post_aspace_death_notification`) — the address-space analogue of a
+    /// thread's `sched_lock` role for `ThreadControlBlock::death_observers`.
+    death_lock: crate::sync::Spinlock,
+    /// Set when a thread in this address space takes a terminal fault. A later
+    /// bind onto an already-faulted space delivers `terminal_fault_reason` to
+    /// the new observer instead of dropping the event — the address-space
+    /// analogue of retaining a thread's `exit_reason` past death. First fault
+    /// wins; subsequent faults do not overwrite.
+    terminal_faulted: bool,
+    /// Retained terminal-fault reason (`EXIT_FAULT_BASE + vector`), valid when
+    /// `terminal_faulted`.
+    terminal_fault_reason: u64,
 }
 
-// SAFETY: All mutable state is protected by pt_lock (page tables) or atomic
-// operations (active_cpus). Safe to share across threads and CPUs.
+// SAFETY: All mutable state is protected by pt_lock (page tables), death_lock
+// (death observers + retained terminal-fault state), or atomic operations
+// (active_cpus). Safe to share across threads and CPUs.
 unsafe impl Send for AddressSpace {}
-// SAFETY: pt_lock serializes page table modifications; active_cpus is atomic.
+// SAFETY: pt_lock serializes page table modifications; death_lock serializes the
+// death-observer set; active_cpus is atomic.
 unsafe impl Sync for AddressSpace {}
 
 impl AddressSpace
@@ -313,6 +330,9 @@ impl AddressSpace
             death_observers: [crate::sched::thread::DeathObserver::empty();
                 crate::sched::thread::MAX_DEATH_OBSERVERS],
             death_observer_count: 0,
+            death_lock: crate::sync::Spinlock::new(),
+            terminal_faulted: false,
+            terminal_fault_reason: 0,
         }
     }
 
@@ -357,6 +377,9 @@ impl AddressSpace
             death_observers: [crate::sched::thread::DeathObserver::empty();
                 crate::sched::thread::MAX_DEATH_OBSERVERS],
             death_observer_count: 0,
+            death_lock: crate::sync::Spinlock::new(),
+            terminal_faulted: false,
+            terminal_fault_reason: 0,
         }
     }
 
@@ -386,40 +409,94 @@ impl AddressSpace
         }
     }
 
-    /// Append a terminal-fault death observer to this address space.
+    /// Bind a terminal-fault observer, or — if this address space has already
+    /// terminal-faulted — return the retained reason for the caller to deliver
+    /// to the new observer immediately.
     ///
-    /// Mirrors `sys_thread_bind_notification`'s append onto a TCB. Returns
-    /// `Err(())` if `death_observers` is already full (`MAX_DEATH_OBSERVERS`).
+    /// The address-space analogue of `sys_thread_bind_notification`'s
+    /// retained-delivery branch. Serialises on `death_lock` against the
+    /// terminal-fault post ([`crate::sched::post_aspace_death_notification`]),
+    /// so a fault concurrent with a bind is delivered exactly once and never
+    /// dropped — closing the bind-after-fault window for an observer bound after
+    /// the space was already running.
     ///
-    /// No intrinsic lock guards `death_observers`/`death_observer_count` against
-    /// the terminal-fault reader ([`crate::sched::post_aspace_death_notification`]).
-    /// Soundness relies on all observers being bound *before* the address space
-    /// runs: procmgr binds them in `finalize_creation` before `thread_start`, so
-    /// no thread can fault and read the array until binds complete. Binding on an
-    /// already-running address space would race the reader and needs a lock first.
+    /// Returns `Ok(None)` if the observer was appended, `Ok(Some(reason))` if
+    /// the space already faulted (caller posts `reason` to `eq`), or `Err(())`
+    /// if the observer array is full.
+    ///
+    /// # Safety
+    /// `this` must be a valid `AddressSpace` pointer. The caller must NOT hold
+    /// `death_lock`.
     #[cfg(not(test))]
-    pub fn bind_death_observer(
-        &mut self,
+    pub unsafe fn bind_or_retained(
+        this: *mut Self,
         eq: *mut crate::ipc::event_queue::EventQueueState,
         correlator: u32,
-    ) -> Result<(), ()>
+    ) -> Result<Option<u64>, ()>
     {
-        let count = self.death_observer_count as usize;
-        if count >= crate::sched::thread::MAX_DEATH_OBSERVERS
+        // SAFETY: this validated by caller; lock_raw is paired with an
+        // unlock_raw on every path.
+        let saved = unsafe { (*this).death_lock.lock_raw() };
+        // SAFETY: terminal_faulted/terminal_fault_reason read under death_lock.
+        let (faulted, reason) =
+            unsafe { ((*this).terminal_faulted, (*this).terminal_fault_reason) };
+        if faulted
         {
-            return Err(());
+            // SAFETY: paired with the lock_raw above.
+            unsafe { (*this).death_lock.unlock_raw(saved) };
+            return Ok(Some(reason));
         }
-        self.death_observers[count] = crate::sched::thread::DeathObserver { eq, correlator };
-        self.death_observer_count = (count + 1) as u8;
-        Ok(())
+        // SAFETY: lock held; the append stays within MAX_DEATH_OBSERVERS.
+        let result = unsafe {
+            let count = (*this).death_observer_count as usize;
+            if count >= crate::sched::thread::MAX_DEATH_OBSERVERS
+            {
+                Err(())
+            }
+            else
+            {
+                (*this).death_observers[count] =
+                    crate::sched::thread::DeathObserver { eq, correlator };
+                (*this).death_observer_count = (count + 1) as u8;
+                Ok(None)
+            }
+        };
+        // SAFETY: paired with the lock_raw above.
+        unsafe { (*this).death_lock.unlock_raw(saved) };
+        result
     }
 
-    /// Return the populated death-observer slots for the terminal-fault post
-    /// path: the full backing array plus the count of valid leading entries.
+    /// Record a terminal fault (first fault wins) and snapshot the observer set
+    /// under `death_lock`. The terminal-fault post path posts to the returned
+    /// snapshot outside the lock; recording the reason lets a later
+    /// `bind_or_retained` deliver it to an observer bound after the fault.
+    ///
+    /// # Safety
+    /// `this` must be a valid `AddressSpace` pointer. The caller must NOT hold
+    /// `death_lock`.
     #[cfg(not(test))]
-    pub fn death_observers(&self) -> (&[crate::sched::thread::DeathObserver], usize)
+    pub unsafe fn record_fault_and_snapshot(
+        this: *mut Self,
+        reason: u64,
+    ) -> (
+        [crate::sched::thread::DeathObserver; crate::sched::thread::MAX_DEATH_OBSERVERS],
+        usize,
+    )
     {
-        (&self.death_observers, self.death_observer_count as usize)
+        // SAFETY: this validated by caller; the observer array is Copy, so it is
+        // snapshotted by value with no reference taken into the address space.
+        unsafe {
+            let saved = (*this).death_lock.lock_raw();
+            if !(*this).terminal_faulted
+            {
+                (*this).terminal_faulted = true;
+                (*this).terminal_fault_reason = reason;
+            }
+            let snapshot = (*this).death_observers;
+            let count = (*this).death_observer_count as usize;
+            (*this).death_lock.unlock_raw(saved);
+            (snapshot, count)
+        }
     }
 
     /// Map `virt` → `phys` as a 4 KiB page with the given permission flags.

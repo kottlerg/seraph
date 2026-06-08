@@ -15,13 +15,16 @@
 //   * stdout/stderr write returns Ok(buf.len()) (silent drop).
 //   * stdin read returns Ok(0) (immediate EOF).
 //
-// Panic output continues to route through the system log endpoint
-// (pre-seeded badged SEND cap in `ProcessInfo.log_send_cap`); this
-// file does NOT touch the log.
+// Panic output defaults to the system log endpoint (pre-seeded badged
+// SEND cap in `ProcessInfo.log_send_cap`); the stdio rings here do NOT
+// touch the log. A process that serves the log endpoint registers a
+// sink via `set_panic_sink` so its own panic / alloc-error output routes
+// elsewhere (logd → serial driver) rather than self-IPCing into the
+// endpoint it serves.
 
 use crate::cell::UnsafeCell;
 use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut};
-use crate::sync::atomic::{AtomicBool, Ordering};
+use crate::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use crate::sys::pipe::seraph::{Pipe, Role};
 
 use crate::os::seraph::current_ipc_buf;
@@ -268,17 +271,44 @@ pub fn close_all() {
     }
 }
 
-/// Panic-output sink that emits through the system log endpoint.
-///
-/// Uses the process's pre-seeded badged SEND cap from
-/// `ProcessInfo.log_send_cap` (installed by `_start`) and sends each
-/// `write` as `STREAM_BYTES` chunks. Non-allocating — `log::write_bytes`
-/// stages bytes into the per-thread IPC buffer, so panics survive
-/// allocator failure. Silent-drops on a zero cap or any IPC error.
-pub struct LogPanicWriter;
+/// Optional process-global panic-output sink. `0` means unset — panic
+/// output then takes the default log-endpoint path. A non-zero value is a
+/// `fn(&[u8])` pointer registered via [`set_panic_sink`]; panic output is
+/// forwarded to it instead. A process that serves the log endpoint (logd)
+/// registers a serial-driver sink so its own faults never self-IPC into
+/// the endpoint it serves.
+static PANIC_SINK: AtomicUsize = AtomicUsize::new(0);
 
-impl io::Write for LogPanicWriter {
+/// Register `sink` as this process's panic-output sink. `sink` must be
+/// non-allocating and must not itself panic: it runs from the panic hook
+/// and from the non-unwinding `handle_alloc_error` / precondition paths,
+/// which all share the [`panic_output`] chokepoint. Last writer wins.
+pub fn set_panic_sink(sink: fn(&[u8])) {
+    PANIC_SINK.store(sink as usize, Ordering::Release);
+}
+
+/// Panic-output sink. Prefers a registered [`set_panic_sink`] sink; absent
+/// one, falls back to the system log endpoint via the process's pre-seeded
+/// badged SEND cap from `ProcessInfo.log_send_cap` (installed by `_start`),
+/// sending each `write` as `STREAM_BYTES` chunks. Non-allocating —
+/// `log::write_bytes` stages bytes into the per-thread IPC buffer, so
+/// panics survive allocator failure. Silent-drops on a zero cap or any IPC
+/// error.
+pub struct PanicWriter;
+
+impl io::Write for PanicWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let raw = PANIC_SINK.load(Ordering::Acquire);
+        if raw != 0 {
+            // SAFETY: the `raw != 0` guard is what licenses the *call*:
+            // `set_panic_sink` only ever stores a valid `fn(&[u8])` (never a
+            // null/dangling value), and a usize and a thin fn pointer are the
+            // same width on this target, so the round-trip reproduces a live,
+            // callable function.
+            let sink: fn(&[u8]) = unsafe { crate::mem::transmute::<usize, fn(&[u8])>(raw) };
+            sink(buf);
+            return Ok(buf.len());
+        }
         let ipc_ptr = current_ipc_buf();
         let cap = ::log::ensure_badged_cap(ipc_ptr);
         if cap == 0 || ipc_ptr.is_null() {
@@ -294,8 +324,9 @@ impl io::Write for LogPanicWriter {
 }
 
 pub fn panic_output() -> Option<impl io::Write> {
-    if current_ipc_buf().is_null() {
+    // A registered sink needs no IPC buffer; the log fallback does.
+    if PANIC_SINK.load(Ordering::Acquire) == 0 && current_ipc_buf().is_null() {
         return None;
     }
-    Some(LogPanicWriter)
+    Some(PanicWriter)
 }

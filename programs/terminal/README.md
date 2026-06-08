@@ -12,10 +12,12 @@ does not change.
 
 ---
 
-## v0.0.1 scope
+## Scope
 
-- **Input**: virtio-input keyboard ([#110]). Key-down events are decoded to a
-  byte stream; the matching key-up and modifier-key events are dropped.
+- **Input**: two sources feeding one channel — the virtio-input keyboard
+  ([#110], key-down events decoded to a byte stream, key-up and modifier-key
+  events dropped) and serial RX ([#291], received UART bytes forwarded
+  verbatim). A headless boot with no keyboard is still interactive over serial.
 - **Output**: framebuffer text ([#67], primary) mirrored to serial TX ([#66],
   debug). Both share one wire format (`*_WRITE_BYTES`, length in the label's
   high bits, payload chunked at 512 bytes). The framebuffer is optional: a
@@ -37,23 +39,22 @@ does not change.
 
 ## Architecture
 
-A persistent keyboard thread blocks on the keysym stream, decodes key-downs to
-bytes, and sends them down an `mpsc` channel. Per-child relay threads forward
-the child's stdout/stderr down the same channel. The single consumer thread
-owns the output sink and the child's stdin, applies the line discipline, and
-respawns the child on exit. Sole ownership of the sink by one thread is why no
-locking is needed; each thread issues driver IPC on its own per-thread IPC
+One producer thread per input source feeds an `mpsc` channel: the keyboard
+thread blocks on the keysym stream and decodes key-downs to bytes; the serial
+thread wakes on the UART receive interrupt (`SERIAL_REGISTER_RX_NOTIFY`, with a
+bounded-timeout fallback) and forwards received bytes. Per-child relay threads
+forward the child's stdout/stderr down the same channel. The single consumer
+thread owns the output sink and the child's stdin, applies the line discipline,
+and respawns the child on exit. Sole ownership of the sink by one thread is why
+no locking is needed; each thread issues driver IPC on its own per-thread IPC
 buffer (`std::os::seraph::current_ipc_buf`).
 
-Decoding to bytes lives in the keyboard source, so the consumer is
-source-agnostic: a future serial-RX input source becomes another producer
-feeding the same channel with raw bytes (see deferrals).
+Decoding to bytes lives in each input source, so the consumer is
+source-agnostic: keyboard and serial bytes flow through one line discipline,
+and a further source would be just another producer.
 
 ## Deferred
 
-- **Serial RX as a second input source** — the serial driver ([#66]) is
-  TX-only today (`SERIAL_READ_BYTES` is unimplemented). Tracked for a future
-  release; the input layer is already source-generic to accommodate it.
 - **Signals** (`^C`→SIGINT, `^D`→EOF, `^Z`→SIGTSTP), **cooked/raw mode
   toggle**, **job control**, **multi-session / multi-terminal**, **pty
   equivalents**, **cross-process line buffering** — line-discipline maturity,
@@ -73,16 +74,20 @@ feeding the same channel with raw bytes (see deferrals).
 ## Testing
 
 Driven host-side by `cargo xtask test-terminal`, which boots with a QMP control
-socket, waits for the `terminal: READY for injection` marker, injects a known
-key sequence through the real virtio-input driver, and asserts the echoed input
-and the relayed child output appear on the serial stream. It runs as a boot in
-the `usertest` cell. See [docs/testing.md](../../docs/testing.md).
+socket, waits for the `terminal: READY for injection` marker, then exercises
+both input sources in one boot: a keyboard round (key sequence injected through
+the real virtio-input driver over QMP) and a serial round (the same sequence
+written to the guest UART via QEMU's bidirectional `-serial stdio`). Each round
+asserts the echoed input and the relayed child output appear on the serial
+stream. It runs as a boot in the `usertest` cell. See
+[docs/testing.md](../../docs/testing.md).
 
 [#29]: https://github.com/kottlerg/seraph/issues/29
 [#66]: https://github.com/kottlerg/seraph/issues/66
 [#67]: https://github.com/kottlerg/seraph/issues/67
 [#110]: https://github.com/kottlerg/seraph/issues/110
 [#112]: https://github.com/kottlerg/seraph/issues/112
+[#291]: https://github.com/kottlerg/seraph/issues/291
 
 ---
 

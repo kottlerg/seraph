@@ -3,19 +3,27 @@
 
 // programs/terminal/src/input.rs
 
-//! Keyboard input source: block on the virtio-input keysym stream, decode
-//! key-down events into a byte stream, and forward it to the consumer.
+//! Input sources, one producer thread each, all feeding the consumer's channel
+//! as raw [`Msg::Input`] byte runs:
+//! - [`keyboard_loop`]: block on the virtio-input keysym stream and decode
+//!   key-down events to bytes.
+//! - [`serial_loop`]: wake on serial receive interrupts and forward the UART's
+//!   received bytes verbatim.
 //!
-//! Decoding to bytes happens here so the consumer is source-agnostic: a future
-//! serial-RX source (#66 RX is unimplemented today) becomes another producer
-//! feeding the same channel with raw bytes, with no change to the line
-//! discipline.
+//! Decoding to bytes happens in each source, so the consumer's line discipline
+//! is source-agnostic — keyboard and serial bytes flow through the same path.
 
 use std::sync::mpsc::Sender;
 
-use ipc::{IpcMessage, input_errors, input_labels, keysym};
+use ipc::{IpcMessage, input_errors, input_labels, keysym, serial_errors, serial_labels};
 
 use crate::Msg;
+
+/// Bounded wait between serial RX drains. Backstops the x86 IOAPIC's
+/// edge-triggered delivery (a byte racing the driver's interrupt re-arm is
+/// recovered on the next tick) and degrades to plain polling when the serial
+/// driver holds no IRQ cap. Matches the virtio-input driver's poll interval.
+const SERIAL_RX_POLL_MS: u64 = 20;
 
 /// Block reading the keysym stream and forward decoded bytes as [`Msg::Input`].
 /// Returns (ending the thread) only on a fatal IPC error or a closed channel.
@@ -62,6 +70,82 @@ pub fn keyboard_loop(input_cap: u32, tx: &Sender<Msg>)
         {
             return;
         }
+    }
+}
+
+/// Wake on serial receive interrupts and forward incoming UART bytes as
+/// [`Msg::Input`]. Registers a notification with the serial driver, then loops:
+/// drain everything available via `SERIAL_READ_BYTES`, then wait on the
+/// notification with a bounded timeout (see [`SERIAL_RX_POLL_MS`]). Received
+/// bytes are raw — the consumer's line discipline already handles CR, DEL/BS,
+/// and printables, so no decoding is needed here. Returns (ending the thread)
+/// only on a fatal IPC error or a closed channel.
+pub fn serial_loop(serial_cap: u32, tx: &Sender<Msg>)
+{
+    let ipc_buf = std::os::seraph::current_ipc_buf();
+    if ipc_buf.is_null()
+    {
+        std::os::seraph::log!("terminal: serial RX thread has no IPC buffer");
+        return;
+    }
+
+    // Notification the driver kicks on receive-data-ready. Keep `notif` to wait
+    // on; send a derived copy to the driver — IPC moves caps, so sending the
+    // original would forfeit our wait handle.
+    let Some(notif) = std::os::seraph::object_slab_acquire(120)
+        .and_then(|slab| syscall::cap_create_notification(slab).ok())
+    else
+    {
+        std::os::seraph::log!("terminal: serial RX notification create failed");
+        return;
+    };
+    if let Ok(notif_send) = syscall::cap_derive(notif, syscall::RIGHTS_ALL)
+    {
+        let req = IpcMessage::builder(serial_labels::SERIAL_REGISTER_RX_NOTIFY)
+            .cap(notif_send)
+            .build();
+        // SAFETY: ipc_buf is this thread's kernel-registered IPC buffer. A
+        // REGISTER_FAILED reply (driver holds no IRQ) is non-fatal — the bounded
+        // wait below then degrades to timed polling.
+        let _ = unsafe { ipc::ipc_call(serial_cap, &req, ipc_buf) };
+    }
+
+    loop
+    {
+        // Drain everything currently buffered before sleeping.
+        loop
+        {
+            let req = IpcMessage::new(serial_labels::SERIAL_READ_BYTES);
+            // SAFETY: ipc_buf is this thread's kernel-registered IPC buffer.
+            let Ok(reply) = (unsafe { ipc::ipc_call(serial_cap, &req, ipc_buf) })
+            else
+            {
+                std::os::seraph::log!("terminal: SERIAL_READ_BYTES ipc_call failed");
+                return;
+            };
+            if reply.label & 0xFFFF != serial_errors::SUCCESS
+            {
+                std::os::seraph::log!("terminal: SERIAL_READ_BYTES error label={:#x}", reply.label);
+                return;
+            }
+            // Count rides bits 16-31 of the reply label; bytes are packed in the
+            // data words. Clamp to the byte view so a misbehaving driver cannot
+            // over-read.
+            let count = ((reply.label >> 16) & 0xFFFF) as usize;
+            let bytes = reply.data_bytes();
+            let n = count.min(bytes.len());
+            if n == 0
+            {
+                break;
+            }
+            if tx.send(Msg::Input(bytes[..n].to_vec())).is_err()
+            {
+                return;
+            }
+        }
+        // Block until the next RX interrupt, bounded so an edge-triggered miss
+        // (or a missing IRQ) is recovered by the next drain.
+        let _ = syscall::notification_wait_timeout(notif, SERIAL_RX_POLL_MS);
     }
 }
 

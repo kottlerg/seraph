@@ -49,6 +49,7 @@ requirements, sysroot layout, and QEMU / firmware configuration are in
 ```sh
 cargo xtask build                            # build (defaults: x86_64, debug)
 cargo xtask build --arch riscv64             # build for RISC-V
+cargo xtask build --debug kernel             # build all; debuginfo for kernel only
 cargo xtask mkdisk                           # repack disk.img after rootfs/ edits
 cargo xtask compose-bundle --harness ktest   # swap boot bundle to ktest harness
 cargo xtask run                              # launch existing sysroot under QEMU

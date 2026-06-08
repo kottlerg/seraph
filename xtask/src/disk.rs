@@ -4,7 +4,7 @@
 //! disk.rs
 //!
 //! Build a GPT disk image from sysroot contents. The image contains three
-//! FAT32 partitions: an EFI System Partition (from sysroot/esp/), a Seraph
+//! FAT partitions: an EFI System Partition (from sysroot/esp/), a Seraph
 //! root partition (from sysroot/), and a Seraph data partition (from
 //! sysroot/data/) that vfsd auto-mounts at /data.
 
@@ -21,17 +21,16 @@ use crate::util::step;
 
 const SECTOR_SIZE: u64 = 512;
 
-/// ESP partition size. Debug binaries weigh ~14 MiB each; the ESP now holds
-/// just kernel + bundle + bootloader EFI (init and modules live inside the
-/// bundle), so 256 MiB leaves comfortable headroom for additional bundle
-/// modules.
-const ESP_PARTITION_SIZE: u64 = 256 * 1024 * 1024;
+/// ESP partition size. Holds the kernel, the boot bundle (init + modules),
+/// and the bootloader EFI. 64 MiB covers these with headroom for `--debug`
+/// debuginfo and future bundle modules.
+const ESP_PARTITION_SIZE: u64 = 64 * 1024 * 1024;
 
-/// Root partition size. Sized at 512 MiB to comfortably hold every
-/// debug-build userspace binary under `/services/` and `/programs/`
-/// alongside the harness binaries under `/tests/`. Release builds remain
-/// comfortable well under half of this.
-const ROOT_PARTITION_SIZE: u64 = 512 * 1024 * 1024;
+/// Root partition size. Holds every installed userspace binary under
+/// `/services/` and `/programs/` plus the `/tests/` harness binaries. With
+/// debuginfo off by default the tree is ~10 MiB; 192 MiB covers a full
+/// `--debug` rebuild and ample future components.
+const ROOT_PARTITION_SIZE: u64 = 192 * 1024 * 1024;
 
 /// First partition starts at LBA 2048 (1 MiB alignment, standard GPT practice).
 const ESP_START_LBA: u64 = 2048;
@@ -160,7 +159,7 @@ impl Seek for PartitionSlice
 
 /// Create a GPT disk image at `<project_root>/disk.img`.
 ///
-/// The image contains three FAT32 partitions:
+/// The image contains three FAT partitions:
 /// - Partition 1 (ESP, [`ESP_PARTITION_SIZE`]): populated from `sysroot/esp/`
 /// - Partition 2 (ROOT, [`ROOT_PARTITION_SIZE`]): populated from `sysroot/`
 ///   excluding `esp/` and `data/`
@@ -349,7 +348,7 @@ fn write_gpt(image_path: &Path, arch: Arch) -> Result<()>
     Ok(())
 }
 
-/// Format a partition as FAT32 and populate it from a source directory.
+/// Format a partition as FAT and populate it from a source directory.
 ///
 /// Skips build metadata (`.arch`, `NvVars`) and the top-level `esp` and
 /// `data` subdirectories, each a mount point with its own partition and so
@@ -379,7 +378,7 @@ fn format_and_populate_partition(
         let opts = fatfs::FormatVolumeOptions::new()
             .bytes_per_cluster(4096)
             .fat_type(fatfs::FatType::Fat32);
-        fatfs::format_volume(&mut slice, opts).context("failed to format partition as FAT32")?;
+        fatfs::format_volume(&mut slice, opts).context("failed to format partition as FAT")?;
     }
 
     // Populate (if source directory exists).

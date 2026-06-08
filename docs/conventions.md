@@ -58,7 +58,7 @@ Every Issue MUST carry at least one **Subsystem** label and at least one **Class
 
 ### Milestones
 
-Each `Y` bump (`v0.1.0`, `v0.2.0`, …) has a GitHub milestone. Issues blocking a milestone MUST be assigned to it; everything else MUST stay unassigned.
+Each `Y` bump (`v0.1.0`, `v0.2.0`, …) and each shipped `Z` patch (`v0.1.1`, …) has a GitHub milestone. Issues blocking a milestone MUST be assigned to it; everything else MUST stay unassigned.
 
 ### Commit and PR cross-references
 

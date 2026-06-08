@@ -19,7 +19,7 @@ Three harnesses exercise three surfaces:
 |---|---|---|---|
 | `ktest` | Kernel | [`core/ktest/`](../core/ktest/README.md) | Bootloader-loaded init replacement (`cargo xtask compose-bundle --harness ktest`) |
 | `svctest` | Services | `services/svctest/` | `svcmgr` spawns from `/config/svcmgr/services/` recipe |
-| `usertest` | Programs | [`services/usertest/`](../services/usertest/README.md) | `svcmgr` spawns from `/config/svcmgr/services/` recipe; drives binaries under `programs/` through their real I/O surfaces. Also hosts the terminal interactive test (`cargo xtask test-terminal`), which injects keys over QMP through the live virtio-input driver and the autostarted terminal |
+| `usertest` | Programs | [`services/usertest/`](../services/usertest/README.md) | `svcmgr` spawns from `/config/svcmgr/services/` recipe; drives binaries under `programs/` through their real I/O surfaces. Also hosts the terminal interactive test (`cargo xtask test-terminal`), which drives the autostarted terminal through both input sources — keys over QMP through the live virtio-input driver, then the same sequence over the guest serial RX |
 
 `ktest` and `svctest` are authoritative for their own surface; the harness
 itself owns its phases. `usertest` is an orchestrator that runs per-program
@@ -167,22 +167,30 @@ compile-time defaults in `core/ktest/src/cmdline.rs::KtestConfig::DEFAULT`
 
 ### Interactive input (`test-terminal`)
 
-Keyboard input cannot be exercised by an autonomous recipe: its keysyms must
-come from real `EV_KEY` events on the virtio-input device, which the guest
-cannot synthesise for itself. It is also not tested by a second device reader —
-the `terminal` program is the system's keyboard consumer (it autostarts from
-`/config/svcmgr/services/terminal.svc`), and the virtio-input driver delivers a
-given event to one reader. So input is tested *through* the terminal.
+Interactive input cannot be exercised by an autonomous recipe: keysyms must come
+from real `EV_KEY` events on the virtio-input device, and serial bytes from a
+real UART receive, neither of which the guest can synthesise for itself. Input
+is also not tested by a second device reader — the `terminal` program is the
+system's input consumer (it autostarts from
+`/config/svcmgr/services/terminal.svc`), and each device delivers a given event
+to one reader. So input is tested *through* the terminal.
 
 `cargo xtask test-terminal` boots QEMU with a QMP control socket, waits for the
-terminal's `terminal: READY for injection` marker, injects a known key sequence
-via QMP `input-send-event`, and asserts — host-side — that the terminal's local
-echo and the relayed child output appear on the serial stream. Unlike the other
-harnesses the verdict is computed by the host (the terminal cannot know the
-expected sequence), and the host kills QEMU on success. The driver carries no
-test hooks — injection happens at the hardware boundary, so the whole stack
-(device DMA → decode → IPC → terminal → child → output) is exercised as in
-production. Both arches use `virtio-keyboard-pci`.
+terminal's `terminal: READY for injection` marker, then drives both input
+sources in one boot:
+
+1. **Keyboard round** — inject a known key sequence via QMP `input-send-event`
+   (through the live `virtio-keyboard-pci`), assert the terminal's local echo
+   and the relayed child output appear on the serial stream.
+2. **Serial RX round** — on a cleared transcript, write the same sequence to the
+   guest UART receive path via QEMU's bidirectional `-serial stdio` (host stdin
+   reaches the guest serial RX), assert the same echo + child round-trip.
+
+Unlike the other harnesses the verdict is computed by the host (the terminal
+cannot know the expected sequence), and the host kills QEMU on success. The
+driver carries no test hooks — injection happens at the hardware boundary, so
+the whole stack (device → decode/IRQ → IPC → terminal → child → output) is
+exercised as in production. Both rounds run on both arches.
 
 The terminal autostarts on a normal boot, so no recipe staging is needed; just
 build, repack, and run the host driver (not `run-parallel`, which cannot

@@ -86,6 +86,13 @@ pub struct BuildArgs
     #[arg(long, default_value = "all")]
     pub component: BuildComponent,
 
+    /// Emit debuginfo (`debug = 2`, `opt-level = 1`) for the named
+    /// component(s) only, within the active profile (default or `--release`).
+    /// Comma-separated, e.g. `--debug kernel,procmgr`; names match
+    /// `--component`. Only components in the current build are affected.
+    #[arg(long, value_delimiter = ',')]
+    pub debug: Vec<BuildComponent>,
+
     /// Skip `cargo fmt` and per-component `cargo check` (clippy). `cargo
     /// xtask run` sets this internally to keep the tight edit → rebuild →
     /// launch loop responsive — an unchanged tree would otherwise pay for

@@ -123,6 +123,13 @@ fn main() -> !
     // IRQ allocator state: consume the root range cap ascending.
     let mut irq_root = IrqRootAllocator::new(caps.irq_range_cap);
 
+    // Carve the UART interrupt before any PCI device IRQ. The allocator is
+    // monotonic (it discards lines below each isolate point), and the UART line
+    // (x86 ISA IRQ4 / riscv PLIC source 10) sits below the PCI GSI/PLIC range,
+    // so it must be isolated first. Zero on failure: the serial driver then
+    // degrades to client-side timeout polling for RX.
+    let uart_irq = carve_uart_irq(&mut irq_root).unwrap_or(0);
+
     // Generic device-info catalog: each entry carries a kind discriminant +
     // version + opaque payload bytes. virtio populates entries with kind
     // VIRTIO_PCI; framebuffer (spawned later) uses kind FRAMEBUFFER.
@@ -147,7 +154,7 @@ fn main() -> !
     // Spawn the serial (UART) driver via the non-PCI simple-device path.
     // devmgr owns `serial_ep` and mints client SEND caps on
     // `QUERY_SERIAL_DEVICE`.
-    let (serial_spawned, serial_ep) = spawn_serial(&mut caps, ipc_buf);
+    let (serial_spawned, serial_ep) = spawn_serial(&mut caps, uart_irq, ipc_buf);
     if serial_spawned
     {
         std::os::seraph::log!("devmgr: serial driver spawned");
@@ -303,13 +310,15 @@ fn main() -> !
                 }
                 else if serial_spawned && serial_ep != 0
                 {
-                    // Mint a badged SEND_GRANT cap carrying the
-                    // WRITE_AUTHORITY verb bit on the serial driver's
-                    // service endpoint, mirroring QUERY_BLOCK_DEVICE.
+                    // Mint a badged SEND_GRANT cap carrying both the
+                    // WRITE_AUTHORITY and READ_AUTHORITY verb bits on the
+                    // serial driver's service endpoint, mirroring
+                    // QUERY_BLOCK_DEVICE. SEND_GRANT also lets the holder pass
+                    // its RX-notify notification cap to the driver.
                     if let Ok(derived) = syscall::cap_derive_badge(
                         serial_ep,
                         syscall::RIGHTS_SEND_GRANT,
-                        ipc::serial_labels::WRITE_AUTHORITY,
+                        ipc::serial_labels::WRITE_AUTHORITY | ipc::serial_labels::READ_AUTHORITY,
                     )
                     {
                         let reply = IpcMessage::builder(ipc::devmgr_errors::SUCCESS)
@@ -1620,7 +1629,7 @@ fn spawn_virtio_input_from_disk(
 /// SEND caps on `QUERY_SERIAL_DEVICE`. devmgr does not retain UART-specific
 /// authority after a successful spawn — the carved cap is moved to the
 /// driver.
-fn spawn_serial(caps: &mut caps::DevmgrCaps, ipc_buf: *mut u64) -> (bool, u32)
+fn spawn_serial(caps: &mut caps::DevmgrCaps, uart_irq: u32, ipc_buf: *mut u64) -> (bool, u32)
 {
     let module_cap = caps.module_cap_for_kind(caps::module_kind::SERIAL);
     if module_cap == 0
@@ -1657,7 +1666,8 @@ fn spawn_serial(caps: &mut caps::DevmgrCaps, ipc_buf: *mut u64) -> (bool, u32)
         spawn::CreateSource::Module(module_cap),
         serial_ep,
         hw_cap,
-        0, // no devmgr_query_ep: serial driver needs no runtime platform metadata
+        uart_irq, // UART interrupt; 0 falls back to client-side RX polling
+        0,        // no devmgr_query_ep: serial driver needs no runtime platform metadata
         ipc_buf,
     );
     (spawned, serial_ep)
@@ -1789,6 +1799,7 @@ fn spawn_framebuffer(
         spawn::CreateSource::Module(module_cap),
         fb_ep,
         hw_cap,
+        0, // no UART IRQ: framebuffer has no interrupt-driven path
         devmgr_query_ep,
         ipc_buf,
     );
@@ -1867,6 +1878,7 @@ fn spawn_rtc_from_disk(
         },
         rtc_ep,
         hw_cap,
+        0, // no UART IRQ: RTC is polled
         0, // no devmgr_query_ep: RTC driver needs no runtime platform metadata
         ipc_buf,
     );
@@ -1947,6 +1959,7 @@ fn test_spawn_orphan(
         },
         service_ep,
         hw_cap,
+        0, // no UART IRQ: this device has no interrupt-driven path
         query_ep,
         ipc_buf,
     );
@@ -1998,6 +2011,24 @@ fn carve_rtc_authority(caps: &mut caps::DevmgrCaps) -> Option<u32>
 fn carve_uart_authority(caps: &mut caps::DevmgrCaps) -> Option<u32>
 {
     carve_subrange(caps, 0x1000_0000, 0x1000)
+}
+
+/// Isolate the UART interrupt cap from the IRQ root so the serial driver can
+/// route RX wakeups to its client. COM1 is ISA IRQ 4 on x86-64; the QEMU
+/// `virt` NS16550 is PLIC source 10. Both are platform-static and hardcoded on
+/// the same basis as the UART MMIO/IoPort above, pending the data-driven
+/// (ACPI/DTB) device-binding follow-up. Carve before the PCI device IRQs: the
+/// allocator is monotonic and the UART line is below the PCI GSI/PLIC range.
+#[cfg(target_arch = "x86_64")]
+fn carve_uart_irq(irq_root: &mut IrqRootAllocator) -> Option<u32>
+{
+    irq_root.isolate_one(4)
+}
+
+#[cfg(target_arch = "riscv64")]
+fn carve_uart_irq(irq_root: &mut IrqRootAllocator) -> Option<u32>
+{
+    irq_root.isolate_one(10)
 }
 
 /// Carve a narrow `IoPort` of `count` ports starting at `base` out of

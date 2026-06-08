@@ -162,25 +162,13 @@ pub fn sys_irq_register(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         crate::arch::current::cpu::restore_interrupts(saved);
     }
 
-    // Program arch-specific interrupt routing.
-    // x86_64: write IOAPIC redirection entry (entry starts masked; driver ACKs
-    //         to unmask after registering).
-    // RISC-V: enable the PLIC source (starts masked at controller; ACK unmasks).
-    #[cfg(target_arch = "x86_64")]
-    // SAFETY: irq_id validated from capability; route() requires valid IRQ number.
+    // Route the device IRQ at the interrupt controller. The line is left
+    // masked (x86_64 IOAPIC redirection entry / RISC-V PLIC source); the driver
+    // unmasks via SYS_IRQ_ACK after registering.
+    // SAFETY: irq_id validated from capability; route_device_irq requires a
+    // valid IRQ number.
     unsafe {
-        crate::arch::current::ioapic::route(
-            irq_id,
-            crate::arch::current::ioapic::DEVICE_VECTOR_BASE + irq_id as u8,
-        );
-        // Entry is left masked by route(); driver unmasks via SYS_IRQ_ACK.
-    }
-
-    #[cfg(target_arch = "riscv64")]
-    {
-        // Enable at PLIC, then immediately mask until the driver ACKs.
-        crate::arch::current::interrupts::plic_enable(irq_id);
-        crate::arch::current::interrupts::mask(irq_id);
+        crate::arch::current::interrupts::route_device_irq(irq_id);
     }
 
     Ok(0)
@@ -353,22 +341,15 @@ pub fn sys_mmio_map(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// On RISC-V: always returns `NotSupported` (no I/O port concept).
 ///
 /// Returns 0 on success.
-// needless_return: the cfg-gated early return is required to terminate the
-// riscv64 path; the x86_64 path follows in the same function body.
 #[cfg(not(test))]
-#[allow(clippy::needless_return)]
 pub fn sys_ioport_bind(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
-    // RISC-V has no I/O port space.
-    #[cfg(target_arch = "riscv64")]
+    // RISC-V has no I/O port space; the IOPB machinery below is x86-64-only.
+    if !crate::arch::current::HAS_IO_PORTS
     {
-        let _ = tf;
-        // unnecessary_wraps suppressed: sys_ioport_bind must match the dispatch
-        // table signature Result<u64, SyscallError> on all targets.
         return Err(SyscallError::NotSupported);
     }
 
-    #[cfg(target_arch = "x86_64")]
     {
         use crate::arch::current::gdt;
         use crate::cap::object::{IoPortObject, ThreadObject};
@@ -756,21 +737,18 @@ pub fn sys_irq_split(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// On RISC-V: always returns `NotSupported` (no I/O port concept).
 ///
 /// Returns `slot1 | (slot2 << 32)` on success.
-// needless_return: the cfg-gated early return is required to terminate the
-// riscv64 path; the x86_64 path follows in the same function body.
 // too_many_lines: mirrors sys_irq_split exactly; the shape is unavoidable.
-#[allow(clippy::needless_return, clippy::too_many_lines)]
+#[allow(clippy::too_many_lines)]
 #[cfg(not(test))]
 pub fn sys_ioport_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
-    // RISC-V has no I/O port space.
-    #[cfg(target_arch = "riscv64")]
+    // RISC-V has no I/O port space; the IoPort cap-split logic below is
+    // x86-64-only (no IoPort capability is ever minted on RISC-V).
+    if !crate::arch::current::HAS_IO_PORTS
     {
-        let _ = tf;
         return Err(SyscallError::NotSupported);
     }
 
-    #[cfg(target_arch = "x86_64")]
     {
         use crate::cap::object::{IoPortObject, KernelObjectHeader, ObjectType, dealloc_object};
         use crate::cap::retype::alloc_in_seed;

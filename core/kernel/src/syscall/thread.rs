@@ -45,18 +45,9 @@ pub fn sys_thread_configure(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     let thread_idx = tf.arg(0) as u32;
     let entry = tf.arg(1);
-    // Round the user stack pointer to match the entry point's `extern "C"`
-    // ABI expectations. On x86-64 SysV the convention is `rsp = 8 mod 16`
-    // at function entry (the 8 accounts for the return address a normal
-    // caller would have pushed); without this, the first 128-bit-aligned
-    // SSE/AVX memory operand in user code (e.g. a compiler-emitted
-    // `vmovaps (%rsp)` from a struct init) #GPs. On RISC-V LP64D the
-    // return address lives in `ra`, not on the stack, so function entry
-    // expects `sp = 0 mod 16`.
-    #[cfg(target_arch = "x86_64")]
-    let stack_ptr = (tf.arg(2) & !0xFu64).wrapping_sub(8);
-    #[cfg(target_arch = "riscv64")]
-    let stack_ptr = tf.arg(2) & !0xFu64;
+    // Round the user stack pointer to the entry point's `extern "C"` ABI
+    // alignment (arch-specific; see `context::align_initial_stack`).
+    let stack_ptr = crate::arch::current::context::align_initial_stack(tf.arg(2));
     let arg = tf.arg(3);
     let tls_base = tf.arg(4);
 
@@ -1423,55 +1414,16 @@ pub fn sys_thread_write_regs(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// Mutates `regs` in place to force safe segment/flag values.
 ///
 /// # Adding new checks
-/// Add per-field validation below the existing blocks. Use `InvalidArgument`
-/// for bad user data (not a kernel invariant violation).
+/// Add per-field validation in the per-arch `TrapFrame::sanitize_for_user_resume`
+/// implementations (`arch/<target>/trap_frame.rs`). Use `InvalidArgument` for
+/// bad user data (not a kernel invariant violation).
 #[cfg(not(test))]
 fn validate_write_regs(
     regs: &mut crate::arch::current::trap_frame::TrapFrame,
 ) -> Result<(), SyscallError>
 {
-    #[cfg(target_arch = "x86_64")]
-    {
-        // Canonical user address: bits [63:47] must all be zero.
-        const USER_ADDR_MASK: u64 = 0xFFFF_8000_0000_0000;
-
-        if regs.rip & USER_ADDR_MASK != 0
-        {
-            return Err(SyscallError::InvalidArgument);
-        }
-        if regs.rsp & USER_ADDR_MASK != 0
-        {
-            return Err(SyscallError::InvalidArgument);
-        }
-
-        // Force segment selectors to user-mode values (ring 3, RPL=3).
-        regs.cs = u64::from(crate::arch::current::gdt::USER_CS);
-        regs.ss = u64::from(crate::arch::current::gdt::USER_DS);
-
-        // rflags: must have IF (bit 9) set. Clear IOPL (bits 12-13), VM (bit
-        // 17), VIF (bit 19), VIP (bit 20) — none of which should be set in
-        // user mode. Bit 1 (reserved) must be 1 per the x86 spec.
-        regs.rflags = (regs.rflags | 0x202) & !0x0013_F000;
-    }
-
-    #[cfg(target_arch = "riscv64")]
-    {
-        // sepc must be a valid user address. On RV64, virtual addresses in
-        // the supervisor range start at 0xFFFF_FFC0_0000_0000 (sv39). Any
-        // address ≥ 0x8000_0000_0000_0000 is non-user.
-        const USER_ADDR_LIMIT: u64 = 0x8000_0000_0000_0000;
-        if regs.sepc >= USER_ADDR_LIMIT
-        {
-            return Err(SyscallError::InvalidArgument);
-        }
-
-        // scause and stval are kernel-internal; zero them out to prevent
-        // spurious fault handling on resume.
-        regs.scause = 0;
-        regs.stval = 0;
-    }
-
-    Ok(())
+    regs.sanitize_for_user_resume()
+        .map_err(|()| SyscallError::InvalidArgument)
 }
 
 // Test stubs.

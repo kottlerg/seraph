@@ -91,6 +91,17 @@ pub fn seed_tls_base(saved: &mut SavedState, tls_base: u64)
     saved.fs_base = tls_base;
 }
 
+/// Round a user-supplied stack pointer to the ABI alignment expected at an
+/// `extern "C"` entry point. On x86-64 `SysV`, `rsp` ≡ 8 (mod 16) at function
+/// entry — the 8 accounts for the return address a normal `call` would have
+/// pushed — so the first 16-byte-aligned SSE/AVX access in the callee (e.g. a
+/// compiler-emitted `vmovaps (%rsp)`) does not `#GP`.
+#[inline]
+pub fn align_initial_stack(sp: u64) -> u64
+{
+    (sp & !0xF).wrapping_sub(8)
+}
+
 // ── new_state ─────────────────────────────────────────────────────────────────
 
 /// Construct the initial [`SavedState`] for a new thread.

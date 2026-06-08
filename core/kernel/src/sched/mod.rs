@@ -366,7 +366,7 @@ fn watchdog_tick_and_check()
         // SAFETY: trap_frame is set by every userspace-syscall entry and
         // cleared on userspace return; reading the pointed-to TrapFrame
         // races benignly with concurrent writes (we're already in stall).
-        let (tf_present, tf_rip, tf_rax) = unsafe {
+        let (tf_present, tf_ip, tf_syscall_nr) = unsafe {
             let s = scheduler_for(cpu);
             let cur = s.current;
             if cur.is_null()
@@ -382,20 +382,13 @@ fn watchdog_tick_and_check()
                 }
                 else
                 {
-                    #[cfg(target_arch = "x86_64")]
-                    {
-                        (true, (*tf).rip, (*tf).rax)
-                    }
-                    #[cfg(target_arch = "riscv64")]
-                    {
-                        (true, (*tf).sepc, (*tf).a7)
-                    }
+                    (true, (*tf).instruction_pointer(), (*tf).syscall_nr())
                 }
             }
         };
         if tf_present
         {
-            crate::kprintln!("    user_rip=0x{:x} syscall_nr={}", tf_rip, tf_rax);
+            crate::kprintln!("    user_pc=0x{:x} syscall_nr={}", tf_ip, tf_syscall_nr);
         }
     }
     // Dump sleep list.
@@ -1166,13 +1159,9 @@ fn init_per_cpu_storage(cpu_count: u32, allocator: &mut BuddyAllocator)
     // Per-CPU arch data (PerCpuData) and APIC-ID slabs.
     crate::percpu::init_storage(n, allocator);
 
-    // Arch-specific per-CPU tables. x86_64 only.
-    #[cfg(target_arch = "x86_64")]
-    {
-        crate::arch::current::gdt::init_ap_storage(n, allocator);
-        crate::arch::current::ap_trampoline::init_ap_ist_storage(n, allocator);
-        crate::arch::current::interrupts::init_nmi_backtrace_storage(n, allocator);
-    }
+    // Arch-specific per-CPU tables (x86-64 per-AP GDT/TSS, AP IST stacks, and
+    // NMI-backtrace storage; a no-op on RISC-V).
+    crate::arch::current::init_ap_percpu_storage(n, allocator);
 }
 
 /// Allocate `bytes` of contiguous physical pages, zero-fill, return a
@@ -2959,10 +2948,11 @@ pub unsafe fn schedule(requeue_current: bool)
         }
     }
 
-    // Load the per-thread IOPB into the TSS (x86_64 only).
-    // If the thread has no port bindings, fill the TSS IOPB with 0xFF (deny all).
-    #[cfg(all(not(test), target_arch = "x86_64"))]
+    // Load the per-thread IOPB into the TSS (x86-64 only; `load_iopb` is a
+    // no-op on RISC-V, where `iopb` is always null). If the thread has no port
+    // bindings, fill the TSS IOPB with 0xFF (deny all).
     // SAFETY: next is a valid TCB; iopb pointer is null or a valid heap-allocated [u8; IOPB_SIZE].
+    #[cfg(not(test))]
     unsafe {
         let iopb_ptr = (*next).iopb;
         if iopb_ptr.is_null()

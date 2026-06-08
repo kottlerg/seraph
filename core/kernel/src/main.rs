@@ -1433,17 +1433,10 @@ unsafe fn backtrace_scan(stack_top: u64)
     const MAX_BYTES: usize = 8 * 1024;
     const MAX_HITS: usize = 24;
 
-    let mut sp: usize;
-    // SAFETY: reads the stack pointer register only.
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        core::arch::asm!("mov {}, rsp", out(reg) sp, options(nomem, nostack, preserves_flags));
-    }
-    // SAFETY: reads the stack pointer register only.
-    #[cfg(target_arch = "riscv64")]
-    unsafe {
-        core::arch::asm!("mv {}, sp", out(reg) sp, options(nomem, nostack, preserves_flags));
-    }
+    // cast_possible_truncation: usize is 64-bit on every Seraph target, so the
+    // stack-pointer value always fits.
+    #[allow(clippy::cast_possible_truncation)]
+    let sp = crate::arch::current::cpu::current_stack_pointer() as usize;
 
     let text_start = core::ptr::addr_of!(__text_start) as usize;
     let text_end = core::ptr::addr_of!(__text_end) as usize;

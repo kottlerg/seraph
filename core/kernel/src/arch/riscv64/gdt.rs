@@ -30,3 +30,21 @@ pub fn bsp_tss_ptr() -> u64
 #[cfg(not(test))]
 #[allow(unused_variables)]
 pub unsafe fn init_ap(_cpu_id: u32, _rsp0: u64, _ist1_top: u64, _ist2_top: u64) {}
+
+/// Load the per-thread IOPB into the TSS — no-op on RISC-V.
+///
+/// RISC-V has no TSS or I/O permission bitmap (no I/O port space). Present so
+/// the context-switch path calls it unconditionally on both arches.
+///
+/// # Safety
+/// No preconditions — the body is empty. The `unsafe` qualifier exists only to
+/// match the x86-64 surface signature.
+#[cfg(not(test))]
+pub unsafe fn load_iopb(_iopb: Option<&[u8; IOPB_SIZE]>) {}
+
+/// Permit an I/O port range in a thread's IOPB — no-op on RISC-V.
+///
+/// RISC-V has no I/O port space, so there is nothing to permit. Present so
+/// `sys_ioport_bind` compiles on both arches; the `HAS_IO_PORTS` gate makes
+/// this unreachable on RISC-V.
+pub fn permit_port_range_u32(_iopb: &mut [u8; IOPB_SIZE], _base: u32, _count: u32) {}

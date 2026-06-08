@@ -100,6 +100,15 @@ impl SavedState
 #[inline]
 pub fn seed_tls_base(_saved: &mut SavedState, _tls_base: u64) {}
 
+/// Round a user-supplied stack pointer to the ABI alignment expected at an
+/// `extern "C"` entry point. On RISC-V `LP64D` the return address lives in `ra`,
+/// not on the stack, so function entry expects `sp` ≡ 0 (mod 16).
+#[inline]
+pub fn align_initial_stack(sp: u64) -> u64
+{
+    sp & !0xF
+}
+
 // ── new_state ─────────────────────────────────────────────────────────────────
 
 /// Construct the initial [`SavedState`] for a new thread.

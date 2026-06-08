@@ -780,6 +780,29 @@ pub fn unmask(irq: u32)
 #[cfg(test)]
 pub fn unmask(_irq: u32) {}
 
+/// Route device IRQ (GSI) `irq` to the BSP's local APIC, leaving the line
+/// masked at the I/O APIC. The driver unmasks via `SYS_IRQ_ACK` once it has
+/// registered a handler.
+///
+/// # Safety
+/// Must be called after Phase 5 init (IOAPIC initialised) with a valid GSI.
+// cast_possible_truncation: device GSIs are < 256, so the u32→u8 narrowing of
+// the vector offset is exact.
+#[allow(clippy::cast_possible_truncation)]
+#[cfg(not(test))]
+pub unsafe fn route_device_irq(irq: u32)
+{
+    // SAFETY: caller guarantees a valid GSI and post-Phase-5 IOAPIC. route()
+    // installs the redirection entry masked; the driver unmasks via SYS_IRQ_ACK.
+    unsafe {
+        super::ioapic::route(irq, super::ioapic::DEVICE_VECTOR_BASE + irq as u8);
+    }
+}
+
+/// No-op test stub.
+#[cfg(test)]
+pub unsafe fn route_device_irq(_irq: u32) {}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

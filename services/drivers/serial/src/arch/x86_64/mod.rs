@@ -20,18 +20,27 @@ const UART_IER: u16 = 1;
 const UART_LSR: u16 = 5;
 
 /// Bind the COM1 `IoPort` cap to `self_thread` so `out`/`in` against the UART
-/// do not fault, then enable the receive-data interrupt. `self_aspace` is
-/// unused on x86-64. Returns `false` if the bind fails.
-pub fn serial_init(self_thread: u32, _self_aspace: u32, ioport_cap: u32) -> bool
+/// do not fault, then enable the receive-data interrupt when `enable_rx_irq` is
+/// set. `self_aspace` is unused on x86-64. Returns `false` if the bind fails.
+pub fn serial_init(
+    self_thread: u32,
+    _self_aspace: u32,
+    ioport_cap: u32,
+    enable_rx_irq: bool,
+) -> bool
 {
     if syscall::ioport_bind(self_thread, ioport_cap).is_err()
     {
         return false;
     }
-    // Enable Received Data Available interrupt (ERBFI). Earlier boot stages
-    // left IER cleared; without this the 16550 never asserts its IRQ line.
-    // SAFETY: COM1 is bound to this thread by the ioport_bind above.
-    unsafe { outb(COM1 + UART_IER, 0x01) };
+    if enable_rx_irq
+    {
+        // Enable Received Data Available interrupt (ERBFI). Earlier boot stages
+        // left IER cleared; without this the 16550 never asserts its IRQ line.
+        // Skipped when the driver holds no IRQ cap (RX then relies on polling).
+        // SAFETY: COM1 is bound to this thread by the ioport_bind above.
+        unsafe { outb(COM1 + UART_IER, 0x01) };
+    }
     true
 }
 

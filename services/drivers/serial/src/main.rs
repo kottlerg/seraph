@@ -80,7 +80,23 @@ fn handle_request(msg: &IpcMessage, irq_cap: u32, ipc_buf: *mut u64)
     // Label encoding mirrors `stream_labels::STREAM_BYTES`: opcode in bits
     // 0-15, payload byte length in bits 16-31.
     let op = msg.label & 0xFFFF;
-    let reply = if op == serial_labels::SERIAL_WRITE_BYTES
+    // Verb-bit gate (docs/capability-model.md): writes need WRITE_AUTHORITY,
+    // reads and RX-notify need READ_AUTHORITY. Unknown opcodes carry no gate
+    // and fall through to the UNKNOWN_OPCODE arm.
+    let required_authority = match op
+    {
+        serial_labels::SERIAL_WRITE_BYTES => serial_labels::WRITE_AUTHORITY,
+        serial_labels::SERIAL_READ_BYTES | serial_labels::SERIAL_REGISTER_RX_NOTIFY =>
+        {
+            serial_labels::READ_AUTHORITY
+        }
+        _ => 0,
+    };
+    let reply = if required_authority != 0 && msg.badge & required_authority == 0
+    {
+        IpcMessage::new(serial_errors::UNAUTHORIZED)
+    }
+    else if op == serial_labels::SERIAL_WRITE_BYTES
     {
         let byte_len = ((msg.label >> 16) & 0xFFFF) as usize;
         let bytes = msg.data_bytes();
@@ -173,7 +189,12 @@ fn main() -> !
         syscall::thread_exit();
     }
 
-    if !arch::current::serial_init(info.self_thread, info.self_aspace, caps.hw_cap)
+    if !arch::current::serial_init(
+        info.self_thread,
+        info.self_aspace,
+        caps.hw_cap,
+        caps.irq_cap != 0,
+    )
     {
         syscall::thread_exit();
     }

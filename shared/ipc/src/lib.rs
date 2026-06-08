@@ -1415,8 +1415,8 @@ pub mod serial_labels
     /// Wire format mirrors [`stream_labels::STREAM_BYTES`]: the payload byte
     /// length rides bits 16-31 of the label, the bytes are packed via
     /// `.bytes(0, …)` into the data words, and the receiver reads
-    /// `byte_len.div_ceil(8)` words. Reply: empty body, status code in the
-    /// reply label.
+    /// `byte_len.div_ceil(8)` words. The caller's badge must carry
+    /// [`WRITE_AUTHORITY`]. Reply: empty body, status code in the reply label.
     ///
     /// # Label encoding
     /// - Bits 0-15: label ID (`SERIAL_WRITE_BYTES`)
@@ -1476,6 +1476,10 @@ pub mod serial_errors
     /// `SERIAL_REGISTER_RX_NOTIFY` could not bind the UART interrupt: the
     /// driver holds no IRQ cap, or no notification cap was supplied.
     pub const REGISTER_FAILED: u64 = 4;
+    /// Caller's badge lacks the verb bit gating the requested label
+    /// ([`super::serial_labels::WRITE_AUTHORITY`] for writes,
+    /// [`super::serial_labels::READ_AUTHORITY`] for reads and RX-notify).
+    pub const UNAUTHORIZED: u64 = 5;
 }
 
 pub const FB_LABELS_VERSION: u32 = 2;

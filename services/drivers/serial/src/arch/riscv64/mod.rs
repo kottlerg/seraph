@@ -27,10 +27,11 @@ const UART_LSR: u64 = 5; // line status register
 static UART_BASE: AtomicU64 = AtomicU64::new(0);
 
 /// Reserve a VA page, map the UART `Mmio` cap into it, and enable the
-/// receive-data interrupt. The reservation lives for the process's lifetime.
-/// `self_thread` is unused on RISC-V. Returns `false` if reservation or
-/// mapping fails.
-pub fn serial_init(_self_thread: u32, self_aspace: u32, mmio_cap: u32) -> bool
+/// receive-data interrupt when `enable_rx_irq` is set. The reservation lives
+/// for the process's lifetime. `self_thread` is unused on RISC-V. Returns
+/// `false` if reservation or mapping fails.
+pub fn serial_init(_self_thread: u32, self_aspace: u32, mmio_cap: u32, enable_rx_irq: bool)
+-> bool
 {
     let Ok(range) = reserve_pages(1)
     else
@@ -46,10 +47,14 @@ pub fn serial_init(_self_thread: u32, self_aspace: u32, mmio_cap: u32) -> bool
     {
         return false;
     }
-    // Enable Received Data Available interrupt (ERBFI). Earlier boot stages
-    // left IER cleared; without this the NS16550 never raises its PLIC source.
-    // SAFETY: base_va was just mapped via mmio_map; IER is within the page.
-    unsafe { core::ptr::write_volatile((base_va + UART_IER) as *mut u8, 0x01) };
+    if enable_rx_irq
+    {
+        // Enable Received Data Available interrupt (ERBFI). Earlier boot stages
+        // left IER cleared; without this the NS16550 never raises its PLIC
+        // source. Skipped when the driver holds no IRQ cap (RX then polls).
+        // SAFETY: base_va was just mapped via mmio_map; IER is within the page.
+        unsafe { core::ptr::write_volatile((base_va + UART_IER) as *mut u8, 0x01) };
+    }
     UART_BASE.store(base_va, Ordering::Release);
     true
 }

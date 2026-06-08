@@ -75,7 +75,7 @@ polling the line status register, then replies empty. Gated by
 
 | Field | Value |
 |---|---|
-| label | `0` (`SUCCESS`) or `2` (`UNKNOWN_OPCODE`) |
+| label | `0` (`SUCCESS`), `5` (`UNAUTHORIZED` — badge lacks `WRITE_AUTHORITY`), or `2` (`UNKNOWN_OPCODE`) |
 
 ### Label 2: `SERIAL_READ_BYTES`
 
@@ -96,7 +96,7 @@ rides the label's high bits, the bytes are packed in the data words. Gated by
 
 | Field | Value |
 |---|---|
-| label | `0 \| (n << 16)` — `SUCCESS` in bits 0-15, byte count `n` in bits 16-31 (`0..=512`) |
+| label | `0 \| (n << 16)` — `SUCCESS` in bits 0-15, byte count `n` in bits 16-31 (`0..=512`); or `5` (`UNAUTHORIZED` — badge lacks `READ_AUTHORITY`) |
 | data[0..] | `n` received bytes, packed contiguously (`.bytes(0, …)`) |
 
 ### Label 3: `SERIAL_REGISTER_RX_NOTIFY`
@@ -117,7 +117,7 @@ with a bounded timeout). Gated by `READ_AUTHORITY`.
 
 | Field | Value |
 |---|---|
-| label | `0` (`SUCCESS`) or `4` (`REGISTER_FAILED` — no IRQ cap held, or no notification supplied) |
+| label | `0` (`SUCCESS`), `4` (`REGISTER_FAILED` — no IRQ cap held, or no notification supplied), or `5` (`UNAUTHORIZED` — badge lacks `READ_AUTHORITY`) |
 
 ---
 

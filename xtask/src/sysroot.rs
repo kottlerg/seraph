@@ -313,4 +313,49 @@ mod tests
         prune_stale(&roots, &HashSet::new()).unwrap();
         fs::remove_dir_all(&sysroot).unwrap();
     }
+
+    /// End-to-end: `install_rootfs` mirrors `rootfs/`, synthesises the fixtures,
+    /// and prunes a stale sysroot recipe while leaving a build-owned binary
+    /// untouched. Covers `ROOTFS_MANAGED_ROOTS` and the keep-set construction —
+    /// the pieces that make the prune safe — which the `prune_stale` unit tests,
+    /// rebuilding roots and keep by hand, do not.
+    #[test]
+    fn install_rootfs_mirrors_synthesises_and_prunes()
+    {
+        let base = scratch("install");
+        let root = base.join("root");
+        let sysroot = base.join("sysroot");
+
+        // Source rootfs/: one default recipe and one data file.
+        let rootfs_services = root.join("rootfs/config/svcmgr/services");
+        fs::create_dir_all(&rootfs_services).unwrap();
+        fs::write(rootfs_services.join("procmgr.svc"), b"binary = /services/procmgr\n").unwrap();
+        fs::create_dir_all(root.join("rootfs/data")).unwrap();
+        fs::write(root.join("rootfs/data/test.txt"), b"marker").unwrap();
+
+        // Pre-existing sysroot: a stale recipe under a managed root (no rootfs
+        // source) and a build-owned binary outside the managed roots.
+        let sys_services = sysroot.join("config/svcmgr/services");
+        fs::create_dir_all(&sys_services).unwrap();
+        fs::write(sys_services.join("stale.svc"), b"binary = /services/stale\n").unwrap();
+        let bin_dir = sysroot.join("services");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::write(bin_dir.join("procmgr"), b"\x7fELF").unwrap();
+
+        let ctx = BuildContext {
+            root: root.clone(),
+            sysroot: sysroot.clone(),
+            target_dir: base.join("target"),
+        };
+        install_rootfs(&ctx).unwrap();
+
+        assert!(sys_services.join("procmgr.svc").exists(), "rootfs recipe mirrored");
+        assert!(sysroot.join("data/test.txt").exists(), "rootfs data file mirrored");
+        assert!(sysroot.join("data/svctest/large.bin").exists(), "large fixture kept");
+        assert!(sysroot.join("data/svctest/bench.bin").exists(), "bench fixture kept");
+        assert!(!sys_services.join("stale.svc").exists(), "stale recipe pruned");
+        assert!(bin_dir.join("procmgr").exists(), "build-owned binary untouched");
+
+        fs::remove_dir_all(&base).unwrap();
+    }
 }

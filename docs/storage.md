@@ -212,16 +212,14 @@ The supported failure-handling primitives are:
   to `/services/<driver>`.
 - **Mount-tree-wide revocation.** `cap_revoke` on an fs driver's
   namespace endpoint cascades through the kernel derivation graph
-  and invalidates every cap ever derived from it: the synthetic-
-  root entry, the `MOUNT` caller's copy, and every per-file cap
-  previously walked through that mount. This is the supported
+  and invalidates every cap ever derived from it: vfsd's retained
+  endpoint for the mount, the `MOUNT` caller's copy, and every node
+  cap minted for a lookup through that mount. This is the supported
   primitive for "tear down a mount."
-- **Per-mount per-cap revocation is not supported.** The two-derive
-  install scheme (one cap to the `MOUNT` caller, one captured by
-  vfsd's synthetic root) gives per-slot ownership for `cap_delete`
-  but not per-cap revocation. Revoking the synthetic-root entry
-  alone cascades to sibling derivations and behaves equivalently to
-  the destroy-driver hammer. See
+- **Per-cap revocation is not supported.** A terminal mount retains
+  the driver's unbadged namespace endpoint and mints a fresh
+  attenuated cap per lookup; there is no scheme to invalidate one
+  issued node cap without cascading to its siblings. See
   [`services/vfsd/docs/namespace-composition.md`](../services/vfsd/docs/namespace-composition.md)
   §"Revocation".
 - **Unmount is not implemented.** The mount tree is permanent for

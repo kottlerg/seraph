@@ -139,9 +139,11 @@ but a number in active use is never reassigned.
 24  SYS_CAP_COPY                 50  SYS_MEMORY_MERGE
 25  SYS_CAP_MOVE                 51  SYS_IOPORT_SPLIT
                                  52  SYS_SCHED_SPLIT
+                                 53  SYS_ASPACE_BIND_NOTIFICATION
+                                 54  SYS_PROCESS_EXIT
 ```
 
-**Implementation status.** Every number 0–52 has a handler. (Slot 32 formerly
+**Implementation status.** Every number 0–54 has a handler. (Slot 32 formerly
 held `SYS_CAP_INSERT`, whose caller-chosen-slot behaviour is now reached through
 `SYS_CAP_COPY`'s destination-slot argument — a value of `0` auto-allocates; the
 number was reclaimed for `SYS_THREAD_SET_FAULT_HANDLER`.) Unallocated numbers
@@ -788,12 +790,39 @@ capability is required — this syscall acts on the calling thread implicitly.
 
 ---
 
-### `SYS_THREAD_EXIT` (23)
+### `SYS_THREAD_EXIT` (22)
 
-Exit the calling thread. The thread's TCB is freed and another thread is scheduled.
-This is the correct way for any thread to terminate itself, including init.
+Exit the calling thread. The thread is marked `Exited` and another thread is
+scheduled; it is never re-enqueued. This is the correct way for an individual
+thread (e.g. a `std::thread`) to terminate itself. To exit the whole process
+with a code, use `SYS_PROCESS_EXIT`.
 
 **Arguments:** None.
+
+**Return:** Does not return.
+
+**Errors:** None (this syscall cannot fail).
+
+---
+
+### `SYS_PROCESS_EXIT` (54)
+
+Exit the calling process with a voluntary exit code (the `std::process::exit` /
+`main`-return path). The kernel encodes `code` via `syscall_abi::encode_exit_code`
+into the exit-reason space (`0` clean, `1..0x0FFF` saturating; disjoint from the
+fault range `0x1000+`), records it as the calling thread's exit reason, and posts
+it to that thread's death observers — a parent that bound the main thread (so
+`ExitStatus::code()` carries it) and procmgr's per-thread observer (which reaps
+the process). Structurally identical to `SYS_THREAD_EXIT` but with a non-zero
+reason; it does not post to the address-space death surface (reserved for
+terminal faults). Sibling threads are reaped by procmgr's cap-revoke teardown;
+the kernel does not enumerate or stop them here.
+
+**Arguments:**
+
+| # | Name | Description |
+|---|---|---|
+| 0 | `code` | Voluntary exit code (`u32`); `0` = success |
 
 **Return:** Does not return.
 

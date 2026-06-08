@@ -6,16 +6,17 @@
 //! Synthetic system-root [`NamespaceBackend`] composed at boot time.
 //!
 //! `VfsdRootBackend` is vfsd's in-process namespace server. It owns no
-//! storage; every directory entry is either a badged SEND on a peer
-//! filesystem driver's namespace endpoint (a *terminal* mount node) or
+//! storage; every directory entry is either the unbadged namespace
+//! endpoint of a peer filesystem driver (a *terminal* mount node) or
 //! a synthetic intermediate directory created on demand to host a
 //! multi-component mount path (a *synthetic intermediate* node). A
 //! client holding a badged SEND on vfsd's namespace endpoint at
 //! `NodeId::ROOT` walks into mounts via `NS_LOOKUP`; the protocol crate
-//! returns either a `cap_derive`-d copy of the underlying driver's
-//! root cap (External entry, terminal node) or a badged SEND on
-//! vfsd's own namespace endpoint addressing the intermediate's
-//! `NodeId` (Local entry, synthetic intermediate).
+//! returns either a freshly-minted, rights-attenuated badged SEND on
+//! the underlying driver's namespace endpoint (External entry,
+//! terminal node) or a badged SEND on vfsd's own namespace endpoint
+//! addressing the intermediate's `NodeId` (Local entry, synthetic
+//! intermediate).
 //!
 //! Each synthetic intermediate may also carry a `fallthrough_cap` —
 //! a badged SEND on the root mount's namespace endpoint addressing
@@ -55,8 +56,8 @@ const NONE: u32 = u32::MAX;
 /// One node in the synthetic-root tree.
 ///
 /// A node is either a *terminal* (a mount point installed by `MOUNT`,
-/// `terminal_cap != 0`) or a *synthetic intermediate* (created on
-/// demand to host a multi-component mount path, `terminal_cap == 0`).
+/// `terminal_endpoint != 0`) or a *synthetic intermediate* (created on
+/// demand to host a multi-component mount path, `terminal_endpoint == 0`).
 /// Both forms may carry a `fallthrough_cap` addressing the
 /// corresponding directory in the root filesystem; the synthetic
 /// root's `fallthrough_cap` is the root mount cap itself.
@@ -68,10 +69,13 @@ pub struct TreeNode
     pub parent: u32,
     pub first_child: u32,
     pub next_sibling: u32,
-    /// Badged SEND on the underlying driver's namespace endpoint,
-    /// captured at MOUNT time. Non-zero on terminal nodes, zero on
-    /// synthetic intermediates.
-    pub terminal_cap: u32,
+    /// Unbadged SEND on the mounted driver's namespace endpoint,
+    /// captured at MOUNT time. Non-zero on terminal (mount-point)
+    /// nodes, zero on synthetic intermediates. Each `NS_LOOKUP` that
+    /// crosses this mount mints a freshly-attenuated badged SEND from
+    /// it (see `EntryTarget::External`); the endpoint is held here and
+    /// never handed out directly.
+    pub terminal_endpoint: u32,
     /// Badged SEND on the root mount's namespace endpoint addressing
     /// the directory at the path corresponding to this node, used to
     /// forward unmatched `NS_LOOKUP` requests so root-fs entries
@@ -93,7 +97,7 @@ impl TreeNode
             parent: NONE,
             first_child: NONE,
             next_sibling: NONE,
-            terminal_cap: 0,
+            terminal_endpoint: 0,
             fallthrough_cap: 0,
             active: false,
         }
@@ -164,9 +168,15 @@ impl VfsdRootBackend
     /// Install one mount-point entry.
     ///
     /// Walks `path`'s components, creating synthetic intermediates on
-    /// demand, and sets `terminal_cap` on the final node. The empty
-    /// path (`/`) installs `cap` as the synthetic root's
-    /// `fallthrough_cap` (the root mount).
+    /// demand, and stores `cap` on the final node's `terminal_endpoint`.
+    /// The empty path (`/`) instead stores `cap` as the synthetic
+    /// root's `fallthrough_cap` (the root mount).
+    ///
+    /// `cap`'s kind is the caller's responsibility and differs by role:
+    /// a terminal mount passes the peer driver's *unbadged* namespace
+    /// endpoint (each crossing `NS_LOOKUP` mints an attenuated badge
+    /// from it); the root mount passes a *badged* SEND on the root fs
+    /// (the fall-through forwarder pre-composes the caller's rights).
     ///
     /// Returns `Some(InstallResult)` listing newly-created
     /// intermediate indices on success; the caller is expected to
@@ -233,12 +243,12 @@ impl VfsdRootBackend
             {
                 if is_last
                 {
-                    if self.nodes[child as usize].terminal_cap != 0
+                    if self.nodes[child as usize].terminal_endpoint != 0
                     {
                         // Path is already a mount point.
                         return None;
                     }
-                    self.nodes[child as usize].terminal_cap = cap;
+                    self.nodes[child as usize].terminal_endpoint = cap;
                 }
                 current = child;
             }
@@ -256,7 +266,7 @@ impl VfsdRootBackend
                 }
                 n.first_child = NONE;
                 n.next_sibling = parent_first_child;
-                n.terminal_cap = if is_last { cap } else { 0 };
+                n.terminal_endpoint = if is_last { cap } else { 0 };
                 n.fallthrough_cap = 0;
                 self.nodes[current as usize].first_child = new_idx;
                 if !is_last && !result.push(new_idx)
@@ -460,9 +470,15 @@ impl NamespaceBackend for VfsdRootBackend
             return Err(NsError::NotFound);
         };
         let child = &self.nodes[child_idx as usize];
-        let target = if child.terminal_cap != 0
+        let target = if child.terminal_endpoint != 0
         {
-            EntryTarget::External(child.terminal_cap)
+            // Terminal mount: cross into the peer fs by minting a fresh
+            // attenuated badge on its endpoint at its root. vfsd mounts
+            // whole filesystems, so the peer node is always the root.
+            EntryTarget::External {
+                endpoint: child.terminal_endpoint,
+                node: NodeId::ROOT,
+            }
         }
         else
         {

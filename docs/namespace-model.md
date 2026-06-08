@@ -209,14 +209,21 @@ A directory entry's stored target is one of:
 
 - a backend-internal `node_id` — `NS_LOOKUP` mints a fresh node cap on
   this server, or
-- a node capability on a different server — `NS_LOOKUP` returns a copy
-  of that capability with rights intersected per the per-entry policy.
+- another server's namespace endpoint (a mount point) — `NS_LOOKUP`
+  mints a fresh node cap on *that* server, with rights intersected per
+  the per-entry policy. Minting afresh — rather than copying a stored
+  cap — is what carries attenuation across the mount boundary: a node
+  cap's rights live in its badge, and the kernel forbids re-badging an
+  already-badged capability, so a stored cross-server cap could only be
+  copied at its original rights, laundering authority. The composing
+  server therefore stores the peer's unbadged endpoint and badges each
+  crossing lookup's result itself.
 
 This is how mounting works: there is no runtime mount-resolution table.
-A "mount" is a directory entry whose stored target is a capability into
-the mounted filesystem's server. The composing server holds those
-capabilities at boot or from runtime mount events; lookups crossing the
-mount point return cross-server capabilities and subsequent operations
+A "mount" is a directory entry whose stored target is the mounted
+filesystem server's namespace endpoint. The composing server holds those
+endpoints at boot or from runtime mount events; lookups crossing the
+mount point mint cross-server capabilities and subsequent operations
 go directly to the owning backend with no proxy hop.
 
 A "view" — for example, a per-process sandbox root — is a directory

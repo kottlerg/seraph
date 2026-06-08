@@ -26,10 +26,9 @@ const SECTOR_SIZE: u64 = 512;
 /// headroom for additional bundle modules.
 const ESP_PARTITION_SIZE: u64 = 256 * 1024 * 1024;
 
-/// Root partition size. Sized at 512 MiB to comfortably hold every
-/// debug-build userspace binary under `/services/` and `/programs/`
-/// alongside the harness binaries under `/tests/`. Release builds remain
-/// comfortable well under half of this.
+/// Root partition size. Holds every installed userspace binary under
+/// `/services/` and `/programs/` plus the `/tests/` harness binaries;
+/// 512 MiB leaves generous headroom.
 const ROOT_PARTITION_SIZE: u64 = 512 * 1024 * 1024;
 
 /// First partition starts at LBA 2048 (1 MiB alignment, standard GPT practice).

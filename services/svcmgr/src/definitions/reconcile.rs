@@ -285,12 +285,11 @@ fn handle_definition(
 /// is `0` for these services (init never shared its handle); first
 /// death cannot `DESTROY_PROCESS` — see `restart::restart_process`.
 ///
-/// Race window: the thread has been running since init's spawn; a
-/// death between then and this bind is lost (the kernel walks an
-/// empty observer set on death). For long-running daemons the
-/// window is theoretical; closing it requires either a kernel-side
-/// death-queue or init binding onto its own EQ and forwarding at
-/// handover. Tracked as a follow-up.
+/// Race-free despite binding after the thread was started: the kernel
+/// retains a thread's `exit_reason` past death and `thread_bind_notification`
+/// serialises on the thread's `sched_lock`. A death in the window between
+/// init's spawn and this bind is therefore delivered to `deaths_eq` when the
+/// bind lands on the already-exited thread, not dropped (#106 Window 2).
 fn bind_only(
     def: &Definition,
     thread_cap: u32,

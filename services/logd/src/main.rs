@@ -36,6 +36,13 @@
 //! per-slot history ring; the pre-driver boot window is covered by
 //! init-logd's direct-UART fallback (see `docs/console-model.md`).
 //!
+//! Logd's *panic / alloc-error / precondition* output must not ride the
+//! log endpoint either. `main` registers a `std::os::seraph::set_panic_sink`
+//! sink (`panic_to_serial`) that routes that output to the serial driver,
+//! and drops the procmgr-seeded badged SEND on the log endpoint
+//! (`ProcessInfo.log_send_cap`) so no path can self-IPC into the endpoint
+//! logd receives on.
+//!
 //! The pre-existing badged SEND caps held by memmgr, procmgr,
 //! tier-1 services, and every Phase-3 child remain valid across the
 //! handover — same kernel endpoint object, only the RECV-holder
@@ -122,6 +129,14 @@ fn main() -> !
     // `QUERY_SERIAL_DEVICE`; until then serial output is dropped (init-logd
     // covered the pre-driver window) while history still accrues.
     serial_init(caps.devmgr_registry_ep, ipc_buf);
+
+    // logd serves the log endpoint, so it must never emit through it. Route
+    // panic / alloc-error / precondition output to the serial driver (the
+    // path `self_log` already uses) via the std panic sink, and drop the
+    // procmgr-seeded badged SEND so no path — panic, alloc-error, or a stray
+    // `log!` — can self-IPC into the endpoint logd receives on.
+    std::os::seraph::set_panic_sink(panic_to_serial);
+    let _ = syscall::cap_delete(startup.log_send_cap);
 
     let mut table = SlotTable::default();
 
@@ -766,6 +781,20 @@ fn emit_line(_badge: u64, name: &[u8], line: &[u8])
     out.push(b'\r');
     out.push(b'\n');
     out.flush();
+}
+
+/// Panic-output sink registered with std via `set_panic_sink`. Routes
+/// logd's own panic / alloc-error / precondition output to the serial
+/// driver — never through the log endpoint logd serves. Forwards raw bytes
+/// (std frames the panic message); `serial_write` silent-drops until the
+/// driver is resolvable. Must stay non-allocating and panic-free: it runs
+/// from the panic path. Correct only while logd is single-threaded:
+/// `serial_write` issues its `ipc_call` against the cached `IPC_BUF_PTR`
+/// (logd's main-thread IPC buffer), so a panic on a future worker thread
+/// would target the wrong IPC page.
+fn panic_to_serial(bytes: &[u8])
+{
+    serial_write(bytes);
 }
 
 /// Emit `[sec.usfrac] [logd] <payload>\r\n` to the serial driver. Used for

@@ -303,15 +303,23 @@ fn sys_thread_sleep(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// `EventQueue`. Passing `correlator = 0` makes the payload equal to the
 /// exit reason (the pre-multi-bind behaviour).
 ///
+/// Binding onto a thread that has *already* exited posts the retained
+/// `exit_reason` to the `EventQueue` immediately. The bind serialises on the
+/// thread's `sched_lock` against the death transition and the post-death
+/// observer walk, so a death concurrent with the bind is delivered exactly
+/// once and never dropped — letting a supervisor that binds after the thread
+/// was started still observe a death in the bind-after-start window.
+///
 /// Multiple independent observers may be registered (up to
-/// `MAX_DEATH_OBSERVERS`); all fire on death. Returns
-/// `OutOfMemory` if the per-thread observer array is full.
+/// `MAX_DEATH_OBSERVERS`); all fire on death. Returns `OutOfMemory` if the
+/// per-thread observer array is full (only reachable while the thread is
+/// still live — a bind onto an already-exited thread consumes no slot).
 #[cfg(not(test))]
 #[allow(clippy::cast_possible_truncation)]
 fn sys_thread_bind_notification(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::slot::{CapTag, Rights};
-    use crate::sched::thread::{DeathObserver, MAX_DEATH_OBSERVERS};
+    use crate::sched::thread::{DeathObserver, MAX_DEATH_OBSERVERS, ThreadState};
 
     let thread_cap_idx = tf.arg(0) as u32;
     let eq_cap_idx = tf.arg(1) as u32;
@@ -354,30 +362,59 @@ fn sys_thread_bind_notification(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         .state
     };
 
-    // Append a new observer. No intrinsic lock guards `death_observers`/
-    // `death_observer_count` against the death-post reader
-    // ([`crate::sched::post_death_notification`]); soundness relies on binds
-    // completing before the thread runs (procmgr binds the main-thread observer
-    // in `finalize_creation` before `thread_start`). Binding on an already
-    // -running thread would race the reader and needs a lock first. Mirrors
-    // `AddressSpace::bind_death_observer`.
+    // Serialise on the target thread's `sched_lock` against the death
+    // transition (`set_state_under_all_locks`) and the post-death observer
+    // snapshot (`post_death_notification`):
     //
-    // SAFETY: target_tcb is a valid TCB from a validated Thread cap; the
-    // append stays within MAX_DEATH_OBSERVERS (bounds-checked below).
-    unsafe {
+    //   * Already `Exited`: the death walk ran without this observer. The
+    //     thread's `exit_reason` was written before the `Exited` commit under
+    //     this same lock, so it is visible here; re-deliver it to the newly
+    //     bound queue and do not append (the thread cannot die again). Closes
+    //     the bind-after-death window for services bound after start (#106).
+    //   * Not yet `Exited`: append the observer; the eventual death walk posts
+    //     to it.
+    //
+    // Deliver outside the lock — `post_one_death_event` posts to the event
+    // queue and may wake a receiver.
+    // SAFETY: target_tcb is a valid TCB from a validated Thread cap; lock_raw
+    // pairs with an unlock_raw on every path below.
+    let saved = unsafe { (*target_tcb).sched_lock.lock_raw() };
+    // SAFETY: state and exit_reason are plain TCB fields read under sched_lock.
+    let (already_exited, retained_reason) = unsafe {
+        (
+            (*target_tcb).state == ThreadState::Exited,
+            (*target_tcb).exit_reason,
+        )
+    };
+    if already_exited
+    {
+        // SAFETY: paired with the lock_raw above.
+        unsafe { (*target_tcb).sched_lock.unlock_raw(saved) };
+        // SAFETY: eq_state is a valid EventQueueState from a validated cap;
+        // sched_lock is released.
+        unsafe { crate::sched::post_one_death_event(eq_state, correlator, retained_reason) };
+        return Ok(0);
+    }
+    // SAFETY: lock held; the append stays within MAX_DEATH_OBSERVERS.
+    let result = unsafe {
         let count = (*target_tcb).death_observer_count as usize;
         if count >= MAX_DEATH_OBSERVERS
         {
-            return Err(SyscallError::OutOfMemory);
+            Err(SyscallError::OutOfMemory)
         }
-        (*target_tcb).death_observers[count] = DeathObserver {
-            eq: eq_state,
-            correlator,
-        };
-        (*target_tcb).death_observer_count = (count + 1) as u8;
-    }
-
-    Ok(0)
+        else
+        {
+            (*target_tcb).death_observers[count] = DeathObserver {
+                eq: eq_state,
+                correlator,
+            };
+            (*target_tcb).death_observer_count = (count + 1) as u8;
+            Ok(0)
+        }
+    };
+    // SAFETY: paired with the lock_raw above.
+    unsafe { (*target_tcb).sched_lock.unlock_raw(saved) };
+    result
 }
 
 /// `SYS_ASPACE_BIND_NOTIFICATION` (53): bind a terminal-fault death observer
@@ -390,8 +427,13 @@ fn sys_thread_bind_notification(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// On a terminal fault by any thread in the address space (no handler bound,
 /// or handler replied `KILL`), the kernel posts the fault class to each bound
 /// observer. The kernel only notifies; it never enumerates or terminates
-/// threads, and normal `thread_exit` does NOT fire these observers. Returns
-/// `OutOfMemory` if the per-address-space observer array is full.
+/// threads, and normal `thread_exit` does NOT fire these observers.
+///
+/// Binding onto an address space that has *already* terminal-faulted posts the
+/// retained fault reason to the `EventQueue` immediately (serialised on the
+/// space's `death_lock`), so an observer bound after the space was running does
+/// not miss the fault. Returns `OutOfMemory` if the per-address-space observer
+/// array is full (only reachable before the first fault).
 #[cfg(not(test))]
 #[allow(clippy::cast_possible_truncation)]
 fn sys_aspace_bind_notification(tf: &mut TrapFrame) -> Result<u64, SyscallError>
@@ -455,18 +497,27 @@ fn sys_aspace_bind_notification(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         .state
     };
 
-    // Append the observer. No intrinsic lock guards the observer array against
-    // the terminal-fault reader; soundness relies on binds completing before the
-    // address space runs (procmgr binds in `finalize_creation` before
-    // `thread_start`). See `AddressSpace::bind_death_observer`.
+    // Bind the observer, or — if the address space already terminal-faulted —
+    // deliver the retained reason to the new queue immediately.
+    // `bind_or_retained` serialises on the space's `death_lock` against the
+    // terminal-fault post, so a fault before this bind is not lost (the
+    // address-space analogue of the thread bind-after-death path above).
     //
     // SAFETY: as_ptr is a valid AddressSpace from a validated AddressSpace cap.
-    let aspace = unsafe { &mut *as_ptr };
-    aspace
-        .bind_death_observer(eq_state, correlator)
-        .map_err(|()| SyscallError::OutOfMemory)?;
-
-    Ok(0)
+    match unsafe {
+        crate::mm::address_space::AddressSpace::bind_or_retained(as_ptr, eq_state, correlator)
+    }
+    {
+        Ok(None) => Ok(0),
+        Ok(Some(reason)) =>
+        {
+            // SAFETY: eq_state is a valid EventQueueState from a validated cap;
+            // death_lock is released.
+            unsafe { crate::sched::post_one_death_event(eq_state, correlator, reason) };
+            Ok(0)
+        }
+        Err(()) => Err(SyscallError::OutOfMemory),
+    }
 }
 
 // ── Scheduler / IPC helpers ───────────────────────────────────────────────────

@@ -456,9 +456,10 @@ fn wait_with_timeout(
 /// match, when the log is still small, so re-reading is cheap and there is
 /// no split-across-reads boundary to mishandle. The `last_len` guard skips
 /// the read when the file has not grown, bounding cost on a quiescent guest
-/// or a disabled `--fail`. Errors collapse to `false`; the final `classify`
-/// read is authoritative, so a missed live match only forgoes the early
-/// abort, never the verdict.
+/// or a disabled `--fail`. Best-effort: a `read_log` error returns `false`
+/// and a `metadata` failure falls back to length 0 (re-reading unless the
+/// log is still empty). The final `classify` read is authoritative, so a
+/// missed live match only forgoes the early abort, never the verdict.
 fn fail_marker_present(log_path: &Path, last_len: &mut u64, fail_re: &Regex) -> bool
 {
     let len = std::fs::metadata(log_path).map(|m| m.len()).unwrap_or(0);

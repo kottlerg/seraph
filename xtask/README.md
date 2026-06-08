@@ -220,7 +220,8 @@ cargo xtask run-parallel \
     [--timeout SECONDS] \
     [--cpus N] \
     [--pass REGEX] \
-    [--fail REGEX]
+    [--fail REGEX] \
+    [--fail-grace-secs SECONDS]
 ```
 
 | Option | Default | Description |
@@ -232,6 +233,7 @@ cargo xtask run-parallel \
 | `--cpus` | `4` | vCPUs per guest |
 | `--pass` | `ALL TESTS PASSED` | Regex marking a successful run. The default matches the cross-harness terminal marker `[<harness>] ALL TESTS PASSED` standardised in [docs/testing.md](../docs/testing.md). On match the log is discarded and the run is classified `PASS` |
 | `--fail` | `SOME TESTS FAILED\|KERNEL EXCEPTION\|FATAL:\|PANIC( at \|: )` | Regex marking a failed run; the **first** match wins. Matches the cross-harness terminal marker `[<harness>] SOME TESTS FAILED` ([docs/testing.md](../docs/testing.md)) plus the kernel's own death markers (`KERNEL EXCEPTION` + `FATAL:` for a hardware trap, `PANIC at`/`PANIC:` for a Rust `panic!`) so a crash classifies `FAIL` rather than `HANG`. The benign `USERSPACE FAULT` path matches none of these. On match the log is preserved as `FAIL-<run>.log`. Failure takes precedence over success. Override with a never-matching pattern (e.g. `'$.^'`) to disable |
+| `--fail-grace-secs` | `10` | After the first `--fail` match, wait this many seconds (bounded by `--timeout`) before SIGKILL, so the trailing fault dump still lands in the log. A crashed run thus aborts ~grace seconds after the first match instead of idling to `--timeout` |
 
 **Mode-agnostic**: xtask does not know about ktest, svctest, or any other
 rootfs configuration. Pass/fail markers come from the invoker. The default
@@ -253,7 +255,8 @@ non-passing runs are preserved under `target/xtask/run-parallel/` as
 discarded.
 
 **Outcome precedence**:
-1. `--fail` regex matches → `FAIL`
+1. `--fail` regex matches → `FAIL` (a live match also triggers early abort
+   after `--fail-grace-secs`, bounded by `--timeout`; the verdict is unchanged)
 2. `--pass` regex matches → `PASS` (even if QEMU was watchdog-killed,
    which is the normal case for kernels that idle after success)
 3. Watchdog timeout → `HANG`

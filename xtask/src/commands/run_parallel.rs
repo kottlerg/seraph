@@ -157,6 +157,7 @@ pub fn run(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
             let arch = args.arch;
             let cpus = args.cpus;
             let timeout = Duration::from_secs(args.timeout);
+            let fail_grace = Duration::from_secs(args.fail_grace_secs);
             let pass_re = pass_re.clone();
             let fail_re = fail_re.clone();
             let workdir = workdir.clone();
@@ -234,7 +235,8 @@ pub fn run(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
                     .context("QEMU stdout was piped but unavailable")?;
                 let forwarder = spawn_stdout_forwarder(qemu_stdout, log_file, slot)?;
 
-                let (exit_rc, hung) = wait_with_timeout(&mut child, timeout)?;
+                let (exit_rc, hung) =
+                    wait_with_timeout(&mut child, timeout, &log_path, &fail_re, fail_grace)?;
                 // Drain the forwarder before reading the log so classify()
                 // sees the complete byte stream even when the watchdog
                 // killed QEMU mid-write.
@@ -396,28 +398,79 @@ fn join_forwarder(handle: JoinHandle<Result<()>>, run_id: u32)
     }
 }
 
-/// Block waiting for `child` to exit or `timeout` to elapse.
+/// Block until `child` exits or a watchdog deadline elapses, SIGKILLing it
+/// on the deadline.
 ///
-/// On timeout the child is SIGKILLed and reaped. Returns
-/// `(exit_code, was_hung)`: `exit_code` is the process's reported status
-/// (or 137 on a watchdog kill, matching SIGKILL semantics); `was_hung`
-/// distinguishes a clean exit-by-coincidence from a watchdog-induced kill.
-fn wait_with_timeout(child: &mut Child, timeout: Duration) -> Result<(i32, bool)>
+/// Two deadlines apply, whichever comes first:
+/// - the hard `timeout` (a run still alive here is classified `HANG`);
+/// - a `fail_grace` window armed on the first `--fail` (`fail_re`) match in
+///   the live log. A crashed guest halts without shutting QEMU down, so
+///   without this it would idle to `timeout`; the grace window bounds that
+///   idle while still letting the multi-line fault dump finish landing in
+///   the log before the kill.
+///
+/// Returns `(exit_code, was_hung)`: `exit_code` is the process's reported
+/// status (or 137 on a watchdog kill, matching SIGKILL semantics);
+/// `was_hung` marks any watchdog kill (hard timeout or grace). `classify`
+/// disambiguates — a grace kill carries the `--fail` marker in the final
+/// log read, so it resolves to `FAIL`, not `HANG`.
+fn wait_with_timeout(
+    child: &mut Child,
+    timeout: Duration,
+    log_path: &Path,
+    fail_re: &Regex,
+    fail_grace: Duration,
+) -> Result<(i32, bool)>
 {
     let deadline = Instant::now() + timeout;
+    let mut grace_deadline: Option<Instant> = None;
+    let mut last_log_len: u64 = 0;
     loop
     {
+        // try_wait first: a guest that prints the fail marker then exits
+        // cleanly within the grace window must report its real exit code.
         if let Some(status) = child.try_wait().context("polling child")?
         {
             return Ok((status.code().unwrap_or(-1), false));
         }
-        if Instant::now() >= deadline
+        // Arm the grace window on the first --fail match in the live log.
+        if grace_deadline.is_none() && fail_marker_present(log_path, &mut last_log_len, fail_re)
+        {
+            grace_deadline = Some(Instant::now() + fail_grace);
+        }
+        let effective = grace_deadline.map_or(deadline, |g| g.min(deadline));
+        if Instant::now() >= effective
         {
             let _ = child.kill();
             let status = child.wait().context("reaping killed child")?;
             return Ok((status.code().unwrap_or(137), true));
         }
         thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// Best-effort live scan of the per-run log for the `--fail` marker.
+///
+/// Reuses the whole-file `read_log` (the verdict authority in `classify`)
+/// rather than incremental tailing: the scan runs only until the first
+/// match, when the log is still small, so re-reading is cheap and there is
+/// no split-across-reads boundary to mishandle. The `last_len` guard skips
+/// the read when the file has not grown, bounding cost on a quiescent guest
+/// or a disabled `--fail`. Errors collapse to `false`; the final `classify`
+/// read is authoritative, so a missed live match only forgoes the early
+/// abort, never the verdict.
+fn fail_marker_present(log_path: &Path, last_len: &mut u64, fail_re: &Regex) -> bool
+{
+    let len = std::fs::metadata(log_path).map(|m| m.len()).unwrap_or(0);
+    if len == *last_len
+    {
+        return false;
+    }
+    *last_len = len;
+    match read_log(log_path)
+    {
+        Ok(text) => fail_re.is_match(&text),
+        Err(_) => false,
     }
 }
 

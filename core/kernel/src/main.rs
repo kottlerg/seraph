@@ -1339,6 +1339,121 @@ pub(crate) fn fatal(msg: &str) -> !
     arch::current::cpu::halt_loop();
 }
 
+// Kernel `.text` bounds (linker-provided) for the panic backtrace scan.
+// SAFETY: provided by the linker script; only their addresses are taken.
+#[cfg(not(test))]
+unsafe extern "C" {
+    static __text_start: u8;
+    static __text_end: u8;
+}
+
+/// Best-effort panic context: CPU, current thread, the in-flight syscall, and a
+/// kernel-text stack scan. The in-flight syscall is the load-bearing line for
+/// issue #316: a torn-context (#314) makes a syscall execute with garbage
+/// register args, which reach a stdlib precondition (`slice::get_unchecked`) and
+/// panic — this dump shows the syscall + args, pinning kernel-side corruption vs
+/// a deterministic kernel bug. Serial-only / lock-bypassing, mirroring the panic
+/// banner; every read is null-checked or stack-bounded so the dump cannot fault.
+///
+/// # Safety
+/// Called only from the panic handler.
+#[cfg(not(test))]
+unsafe fn panic_context_dump()
+{
+    let cpu = arch::current::cpu::current_cpu();
+    // SAFETY: current_tcb may be null very early in boot; checked before deref.
+    let cur = unsafe { crate::syscall::current_tcb() };
+    if cur.is_null()
+    {
+        // SAFETY: panic path; lock-bypassing serial write.
+        unsafe {
+            console::panic_write_fmt(format_args!(
+                "  context: cpu={cpu} (no current thread; backtrace skipped)\n"
+            ));
+        }
+        return;
+    }
+    // SAFETY: cur non-null; thread_id / trap_frame / kernel_stack_top are
+    // always valid to read on a live TCB.
+    let (tid, tf, stack_top) =
+        unsafe { ((*cur).thread_id, (*cur).trap_frame, (*cur).kernel_stack_top) };
+    // SAFETY: panic path; lock-bypassing serial write.
+    unsafe {
+        console::panic_write_fmt(format_args!("  context: cpu={cpu} tid={tid}\n"));
+    }
+    if !tf.is_null()
+    {
+        // SAFETY: a non-null trap_frame is the in-flight userspace register
+        // snapshot; syscall_nr/arg are plain field reads.
+        let (nr, a0, a1, a2) =
+            unsafe { ((*tf).syscall_nr(), (*tf).arg(0), (*tf).arg(1), (*tf).arg(2)) };
+        // SAFETY: panic path; lock-bypassing serial write.
+        unsafe {
+            console::panic_write_fmt(format_args!(
+                "  in-flight syscall: nr={nr} args=[{a0:#x}, {a1:#x}, {a2:#x}]\n"
+            ));
+        }
+    }
+    // SAFETY: cur non-null; kernel_stack_top bounds the scan to mapped stack.
+    unsafe { backtrace_scan(stack_top) };
+}
+
+/// Scan the current kernel stack for words in the kernel `.text` range and print
+/// them as probable return addresses (resolve offline with addr2line against the
+/// kernel ELF). Frame pointers are not forced (dev `opt-level=1` / release
+/// `opt-level="s"`), so this is a heuristic scan, not an exact unwind. Bounded by
+/// `stack_top` (the thread's kernel-stack base) and a hard cap, and read-only, so
+/// it cannot fault during the panic.
+///
+/// # Safety
+/// `stack_top` must be the current thread's `kernel_stack_top`.
+#[cfg(not(test))]
+unsafe fn backtrace_scan(stack_top: u64)
+{
+    const MAX_BYTES: usize = 8 * 1024;
+    const MAX_HITS: usize = 24;
+
+    let mut sp: usize;
+    // SAFETY: reads the stack pointer register only.
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::asm!("mov {}, rsp", out(reg) sp, options(nomem, nostack, preserves_flags));
+    }
+    // SAFETY: reads the stack pointer register only.
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        core::arch::asm!("mv {}, sp", out(reg) sp, options(nomem, nostack, preserves_flags));
+    }
+
+    let text_start = core::ptr::addr_of!(__text_start) as usize;
+    let text_end = core::ptr::addr_of!(__text_end) as usize;
+    let top = usize::try_from(stack_top)
+        .unwrap_or(usize::MAX)
+        .min(sp.saturating_add(MAX_BYTES));
+    // SAFETY: panic path; lock-bypassing serial write.
+    unsafe {
+        console::panic_write_fmt(format_args!(
+            "  backtrace (kernel-text words on stack; addr2line offline):\n"
+        ));
+    }
+    let mut addr = (sp + 7) & !7usize;
+    let mut hits = 0usize;
+    while addr < top && hits < MAX_HITS
+    {
+        // SAFETY: addr in [sp, stack_top) is mapped kernel stack; 8-byte aligned.
+        let val = unsafe { *(addr as *const usize) };
+        if val >= text_start && val < text_end
+        {
+            // SAFETY: panic path; lock-bypassing serial write.
+            unsafe {
+                console::panic_write_fmt(format_args!("    {val:#018x}\n"));
+            }
+            hits += 1;
+        }
+        addr += 8;
+    }
+}
+
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> !
@@ -1368,6 +1483,14 @@ fn panic(info: &PanicInfo) -> !
         unsafe {
             console::panic_write_fmt(format_args!("\nPANIC: {}\n", info.message()));
         }
+    }
+    // Best-effort context: CPU, current thread, the in-flight syscall, and a
+    // kernel-text stack scan. A torn-context (#314) makes a syscall execute with
+    // garbage register args that reach a stdlib precondition (e.g.
+    // slice::get_unchecked) — this dump pins the kernel call site #316 needs.
+    // SAFETY: panic path; every read inside is bounded / null-checked.
+    unsafe {
+        panic_context_dump();
     }
     arch::current::cpu::halt_loop();
 }

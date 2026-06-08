@@ -620,8 +620,16 @@ name = "memmgr"
 version = "0.1.0"
 dependencies = [
  "ipc",
+ "memmgr-free-pool",
  "process-abi",
  "syscall",
+ "syscall-abi",
+]
+
+[[package]]
+name = "memmgr-free-pool"
+version = "0.1.0"
+dependencies = [
  "syscall-abi",
 ]
 

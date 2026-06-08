@@ -9,5 +9,9 @@ name = "shell"
 path = "src/main.rs"
 test = false
 
+[dependencies]
+# Pure lexical path resolver, extracted so its logic is host-testable.
+shell-path = { path = "path" }
+
 [lints]
 workspace = true

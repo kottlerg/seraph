@@ -35,6 +35,8 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread;
 
+use shell_path::resolve_path;
+
 /// The prompt. The terminal renders none, so the shell prints its own.
 const PROMPT: &[u8] = b"$ ";
 
@@ -146,46 +148,6 @@ fn repl(rx: &Receiver<Event>, tx: &Sender<Event>)
             }
         }
     }
-}
-
-/// Resolve `arg` against `cwd` into a normalized absolute path. Handles
-/// `.`/`..` and cwd-relative inputs lexically (no namespace I/O), so the
-/// result is always absolute and free of `.`/`..` — which the namespace walk
-/// requires. `..` at the root is a no-op.
-fn resolve_path(cwd: &str, arg: &str) -> String
-{
-    let combined = if arg.starts_with('/')
-    {
-        arg.to_string()
-    }
-    else
-    {
-        format!("{cwd}/{arg}")
-    };
-    let mut stack: Vec<&str> = Vec::new();
-    for component in combined.split('/')
-    {
-        match component
-        {
-            "" | "." =>
-            {}
-            ".." =>
-            {
-                stack.pop();
-            }
-            other => stack.push(other),
-        }
-    }
-    let mut out = String::from("/");
-    for (i, part) in stack.iter().enumerate()
-    {
-        if i > 0
-        {
-            out.push('/');
-        }
-        out.push_str(part);
-    }
-    out
 }
 
 /// Write an error line to stderr. Write failures are unrecoverable here and

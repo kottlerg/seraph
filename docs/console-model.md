@@ -101,11 +101,13 @@ earlier ones, which remain as fallbacks.
 ## The serial driver as sole userspace UART owner
 
 The serial driver owns the platform UART authority cap end-to-end — an
-`IoPort` for COM1 on x86-64, an `Mmio` for the NS16550 on RISC-V —
-delegated by devmgr at spawn. It is a device driver, not a console daemon:
-no name registry, no log routing, no VT/ANSI, no read path. Clients obtain a
-write capability through devmgr (a device authority), not through svcmgr (a
-service registry): a UART is a device, not a service. The driver's IPC
+`IoPort` for COM1 on x86-64, an `Mmio` for the NS16550 on RISC-V, plus the
+UART interrupt cap — delegated by devmgr at spawn. It is a device driver, not a
+console daemon: no name registry, no log routing, no VT/ANSI. It carries a
+minimal interrupt-driven read path (the terminal's serial input source) but no
+line editing or cooked-mode processing — those live in the terminal. Clients
+obtain a read/write capability through devmgr (a device authority), not through
+svcmgr (a service registry): a UART is a device, not a service. The driver's IPC
 contract is specified in [services/drivers/serial/README.md](../services/drivers/serial/README.md).
 
 ## The framebuffer driver as sole userspace framebuffer owner

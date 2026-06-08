@@ -6,22 +6,23 @@
 //! Terminal abstraction, v0.0.1 (#111).
 //!
 //! Relays a byte stream between hardware drivers and a child process's stdio,
-//! with a tiny line discipline. Input is the virtio-input keyboard (#110);
-//! output renders on the framebuffer (#67) and mirrors to serial TX (#66). The
-//! child (`/programs/shell` by default, overridable via `argv[1]`) is spawned
-//! with piped stdio over the `ProcessInfo` stdio contract.
+//! with a tiny line discipline. Input arrives from two sources — the
+//! virtio-input keyboard (#110) and serial RX (#66) — and output renders on the
+//! framebuffer (#67) and mirrors to serial TX (#66). The child
+//! (`/programs/shell` by default, overridable via `argv[1]`) is spawned with
+//! piped stdio over the `ProcessInfo` stdio contract.
 //!
-//! Structure: a persistent keyboard thread decodes key-downs to bytes and
-//! sends them down an `mpsc` channel; per-child relay threads forward the
-//! child's stdout/stderr down the same channel; the single consumer thread
-//! (this `main`) owns the output sink and the child's stdin, applies the line
-//! discipline (local echo, single-line backspace, CR→LF), and respawns the
-//! child when it exits. The consumer's sole ownership of the sink is why no
-//! locking is needed.
+//! Structure: one producer thread per input source (keyboard decodes key-downs
+//! to bytes; serial forwards received UART bytes) sends down a shared `mpsc`
+//! channel; per-child relay threads forward the child's stdout/stderr down the
+//! same channel; the single consumer thread (this `main`) owns the output sink
+//! and the child's stdin, applies the line discipline (local echo, single-line
+//! backspace, CR→LF), and respawns the child when it exits. The consumer's sole
+//! ownership of the sink is why no locking is needed, and its source-agnostic
+//! discipline is why a new input source is just another producer.
 //!
-//! v0.0.1 deferrals are documented in `README.md`: serial RX as a second input
-//! source (#66 RX is unimplemented), signals/cooked-raw/job-control/
-//! multi-session (#29), and the real interactive shell (#112).
+//! Remaining deferrals are documented in `README.md`: signals/cooked-raw/
+//! job-control/multi-session (#29) and the real interactive shell (#112).
 
 mod input;
 mod output;
@@ -96,6 +97,10 @@ fn main() -> !
     let (tx, rx) = channel::<Msg>();
     let kbd_tx = tx.clone();
     std::thread::spawn(move || input::keyboard_loop(input_cap, &kbd_tx));
+    // Second input producer: serial RX. `serial_cap` is also the Sink's TX cap
+    // (a Copy `u32`); the driver multiplexes read and write on the one endpoint.
+    let serial_rx_tx = tx.clone();
+    std::thread::spawn(move || input::serial_loop(serial_cap, &serial_rx_tx));
 
     let mut sink = Sink::new(fb_cap, serial_cap);
     std::os::seraph::log!("{READY_MARKER}");

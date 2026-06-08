@@ -445,12 +445,17 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64) -> bool
 // extracting helpers requires threading the same parameters through. The
 // linear presentation matches the bootstrap protocol one-to-one.
 #[allow(clippy::too_many_lines)]
+// too_many_arguments: each parameter is a distinct cap or endpoint handed to
+// the child's bootstrap round; they have no natural grouping beyond "the spawn
+// inputs", and threading them positionally keeps the four call sites readable.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_simple_device(
     procmgr_ep: u32,
     bootstrap_ep: u32,
     source: CreateSource,
     service_ep: u32,
     hw_cap: u32,
+    irq_cap: u32,
     devmgr_query_ep: u32,
     ipc_buf: *mut u64,
 ) -> bool
@@ -474,6 +479,10 @@ pub fn spawn_simple_device(
     };
     let cleanup_on_fail = |hw: u32, query: u32, srccap: u32| {
         let _ = syscall::cap_delete(hw);
+        if irq_cap != 0
+        {
+            let _ = syscall::cap_delete(irq_cap);
+        }
         if query != 0
         {
             let _ = syscall::cap_delete(query);
@@ -533,6 +542,10 @@ pub fn spawn_simple_device(
         // slot. Be conservative and skip our source cleanup; let
         // any residual leak be handled by the broader procmgr error.
         let _ = syscall::cap_delete(hw_cap);
+        if irq_cap != 0
+        {
+            let _ = syscall::cap_delete(irq_cap);
+        }
         if devmgr_query_ep != 0
         {
             let _ = syscall::cap_delete(devmgr_query_ep);
@@ -547,6 +560,10 @@ pub fn spawn_simple_device(
         // success.
         std::os::seraph::log!("simple-device CREATE_PROCESS reply missing caps");
         let _ = syscall::cap_delete(hw_cap);
+        if irq_cap != 0
+        {
+            let _ = syscall::cap_delete(irq_cap);
+        }
         if devmgr_query_ep != 0
         {
             let _ = syscall::cap_delete(devmgr_query_ep);
@@ -567,6 +584,10 @@ pub fn spawn_simple_device(
     else
     {
         let _ = syscall::cap_delete(hw_cap);
+        if irq_cap != 0
+        {
+            let _ = syscall::cap_delete(irq_cap);
+        }
         if devmgr_query_ep != 0
         {
             let _ = syscall::cap_delete(devmgr_query_ep);
@@ -586,6 +607,10 @@ pub fn spawn_simple_device(
         std::os::seraph::log!("simple-device START_PROCESS failed");
         let _ = syscall::cap_delete(service_copy);
         let _ = syscall::cap_delete(hw_cap);
+        if irq_cap != 0
+        {
+            let _ = syscall::cap_delete(irq_cap);
+        }
         if devmgr_query_ep != 0
         {
             let _ = syscall::cap_delete(devmgr_query_ep);
@@ -594,9 +619,13 @@ pub fn spawn_simple_device(
     }
 
     // Bootstrap rounds. With no query endpoint, one terminal round
-    // [service, hw_cap]. With a query endpoint, two rounds: round 1
-    // non-terminal [service, hw_cap], round 2 terminal [query_ep].
+    // [service, hw_cap, irq_cap?]. With a query endpoint, two rounds: round 1
+    // non-terminal [service, hw_cap, irq_cap?], round 2 terminal [query_ep].
+    // irq_cap rides round 1 only when present (the serial driver); other
+    // simple devices pass 0 and the round carries the bare [service, hw_cap].
     let round1_done = devmgr_query_ep == 0;
+    let round1_caps: [u32; 3] = [service_copy, hw_cap, irq_cap];
+    let round1_len = if irq_cap != 0 { 3 } else { 2 };
     // SAFETY: ipc_buf is the registered IPC buffer.
     if unsafe {
         ipc::bootstrap::serve_round(
@@ -604,7 +633,7 @@ pub fn spawn_simple_device(
             child_badge,
             ipc_buf,
             round1_done,
-            &[service_copy, hw_cap],
+            &round1_caps[..round1_len],
             &[],
         )
     }
@@ -615,6 +644,10 @@ pub fn spawn_simple_device(
         // delete is safe (deleting a transferred slot is a no-op).
         let _ = syscall::cap_delete(service_copy);
         let _ = syscall::cap_delete(hw_cap);
+        if irq_cap != 0
+        {
+            let _ = syscall::cap_delete(irq_cap);
+        }
         if devmgr_query_ep != 0
         {
             let _ = syscall::cap_delete(devmgr_query_ep);

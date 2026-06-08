@@ -128,7 +128,7 @@ init
  ├── devmgr  (platform caps + firmware table caps)
  │    ├── driver/virtio-blk        (MMIO + IRQ caps; QUERY_BLOCK_DEVICE)
  │    ├── driver/virtio-input      (MMIO + opt. IRQ; QUERY_INPUT_DEVICE; on-disk)
- │    ├── driver/serial            (UART hw cap; QUERY_SERIAL_DEVICE)
+ │    ├── driver/serial            (UART hw + IRQ caps; QUERY_SERIAL_DEVICE)
  │    ├── driver/framebuffer       (MMIO cap; QUERY_FRAMEBUFFER_DEVICE)
  │    └── driver/{cmos,goldfish-rtc} (RTC hw cap; QUERY_RTC_DEVICE)
  ├── vfsd  (receives storage endpoint via QUERY_BLOCK_DEVICE)

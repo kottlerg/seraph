@@ -191,8 +191,22 @@ pub fn sys_thread_start(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             return Err(SyscallError::InvalidArgument);
         }
 
+        // A thread stopped while Running may still be `current` and physically
+        // executing on a remote CPU (a SYS_THREAD_STOP drain and this resume can
+        // race). Force-linking it via enqueue_ready_thread while it is still live
+        // there would dispatch it on a second CPU — the cross-CPU double-dispatch
+        // behind #314/#293. Drain it off every CPU's `current` (and wait for its
+        // register save to publish) BEFORE committing Ready: while it is still
+        // Stopped/Created the owning CPU's schedule() requeue denylist drops it
+        // without re-linking, so the drain leaves it not-`current` and (for a
+        // single start) unlinked. The same barrier dealloc_object(Thread) (#207)
+        // and sys_thread_stop use. A Created (never-dispatched) thread is
+        // `current` nowhere, so first-start returns from the drain immediately.
+        crate::sched::await_descheduled(target_tcb);
         // All-CPU lock commit closes the cross-CPU dealloc race; see
-        // docs/thread-lifecycle-and-sleep.md § Lifecycle State Machine.
+        // docs/thread-lifecycle-and-sleep.md § Lifecycle State Machine. The
+        // target is now not-`current` and unlinked, so the force-link below
+        // establishes enqueue_ready_thread's not-live precondition.
         crate::sched::set_state_under_all_locks(target_tcb, ThreadState::Ready);
         // Route to correct CPU based on affinity. The thread is already Ready
         // (committed above), so use enqueue_ready_thread to link it: the gated

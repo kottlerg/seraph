@@ -6,6 +6,7 @@ members = [
     "core/ktest",
     "services/init",
     "services/memmgr",
+    "services/memmgr/free-pool",
     "services/procmgr",
     "services/svcmgr",
     "services/svctest",

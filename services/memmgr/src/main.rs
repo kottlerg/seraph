@@ -17,6 +17,7 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use free_pool::{DemandRegion, FreePool, FreeRun, chunk_for, region_contains, regions_overlap};
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels};
 use process_abi::{
     PROCESS_ABI_VERSION, PROCESS_INFO_VADDR, ProcessInfo, StartupInfo, process_info_ref,
@@ -94,20 +95,6 @@ fn panic(_info: &core::panic::PanicInfo) -> !
 
 /// Maximum concurrent processes memmgr will track.
 const MAX_PROCESSES: usize = 64;
-/// Maximum free runs in the pool. Each run is one Memory cap covering one
-/// or more contiguous pages.
-const MAX_FREE_RUNS: usize = 512;
-/// Pages backed per demand fault. memmgr maps a contiguous chunk of up to this
-/// many pages (clamped to the region) on each fault rather than a single page,
-/// so a process's demand-backed cap-slot use is `backed_pages /
-/// DEMAND_CHUNK_PAGES`, not one cap per page. Stacks grow contiguously, so a
-/// chunk's pages are consumed as the stack descends; the only over-commit is
-/// the partial deepest chunk (≤ `DEMAND_CHUNK_PAGES - 1` pages). This bounds
-/// memmgr's `CSpace` pressure — one Memory cap (and its `memory_split` tail) per
-/// chunk — so a deep demand stack cannot exhaust the fixed `CSpace`. The
-/// remaining ceiling (a fixed `CSpace`) is the growable-`CSpace` work (#41); the
-/// broader fixed-limit sweep is #177.
-const DEMAND_CHUNK_PAGES: u32 = 16;
 
 /// Rights every pool frame MUST carry. A pool frame is general anonymous RAM:
 /// memmgr derives an R / RW / RX inner from it on demand (`cap_derive`, which
@@ -122,27 +109,6 @@ const DEMAND_CHUNK_PAGES: u32 = 16;
 const POOL_FRAME_RIGHTS: u64 = ((syscall::RIGHTS_MAP_RW | syscall::RIGHTS_MAP_RX)
     & !syscall::RIGHTS_MAP_READ)
     | syscall::RIGHTS_RETYPE;
-
-/// One free run: a Memory cap memmgr owns, covering `page_count` pages
-/// starting at physical address `phys_base`.
-#[derive(Clone, Copy)]
-struct FreeRun
-{
-    cap_slot: u32,
-    page_count: u32,
-    phys_base: u64,
-}
-
-/// One demand-paged anonymous region a process registered via
-/// `REGISTER_REGION`. A page fault inside `[va_base, va_base + len)` is backed
-/// on demand with `prot`; a fault outside every region is declined.
-#[derive(Clone, Copy)]
-struct DemandRegion
-{
-    va_base: u64,
-    len: u64,
-    prot: u64,
-}
 
 // ── Metadata arena ────────────────────────────────────────────────────────────
 //
@@ -424,19 +390,15 @@ impl ProcessRecord
     /// `memmgr_errors` code to reply with on failure.
     fn add_region(&mut self, region: DemandRegion, pool: &mut FreePool) -> Result<(), u64>
     {
-        let new_end = region.va_base.saturating_add(region.len);
         let mut cur = self.region_head;
         while cur != NODE_NULL
         {
             // SAFETY: cur is a live region node.
             let s = unsafe { *slot_ptr(cur) };
             if let Node::Region { va_base, len, .. } = s.node
+                && regions_overlap(region.va_base, region.len, va_base, len)
             {
-                let end = va_base.saturating_add(len);
-                if region.va_base < end && va_base < new_end
-                {
-                    return Err(memmgr_errors::INVALID_ARGUMENT);
-                }
+                return Err(memmgr_errors::INVALID_ARGUMENT);
             }
             cur = s.next;
         }
@@ -468,8 +430,7 @@ impl ProcessRecord
             // SAFETY: cur is a live region node.
             let s = unsafe { *slot_ptr(cur) };
             if let Node::Region { va_base, len, prot } = s.node
-                && va >= va_base
-                && va < va_base.saturating_add(len)
+                && region_contains(va_base, len, va)
             {
                 return Some(DemandRegion { va_base, len, prot });
             }
@@ -683,184 +644,6 @@ impl ProcessRecord
             cur = next;
         }
         self.region_head = NODE_NULL;
-    }
-}
-
-/// Free pool: array of runs. Order is irrelevant; allocation scans linearly.
-struct FreePool
-{
-    runs: [Option<FreeRun>; MAX_FREE_RUNS],
-}
-
-impl FreePool
-{
-    // large_stack_arrays: FreePool lives in a `static mut` so this
-    // initializer never lands on a runtime stack frame.
-    #[allow(clippy::large_stack_arrays)]
-    const fn new() -> Self
-    {
-        Self {
-            runs: [None; MAX_FREE_RUNS],
-        }
-    }
-
-    /// Pages currently parked in free runs — owned by memmgr but lent to no
-    /// process. Unlike `pool_total` (monotonic owned-RAM), this falls as pages
-    /// are allocated and rises as they are reclaimed (`PROCESS_DIED`,
-    /// `RELEASE_MEMORY_CAPS`, `UNREGISTER_REGION`), so it is the observable a
-    /// caller polls to confirm a dead process's pages came back.
-    fn free_pages(&self) -> u64
-    {
-        let mut total: u64 = 0;
-        for run in self.runs.iter().flatten()
-        {
-            total = total.saturating_add(u64::from(run.page_count));
-        }
-        total
-    }
-
-    fn push(&mut self, run: FreeRun) -> Result<(), ()>
-    {
-        for slot in &mut self.runs
-        {
-            if slot.is_none()
-            {
-                *slot = Some(run);
-                return Ok(());
-            }
-        }
-        Err(())
-    }
-
-    /// Push a run, coalescing once and retrying if the array is full.
-    ///
-    /// `push` fails only when all `MAX_FREE_RUNS` slots are occupied.
-    /// Occupancy is dominated by fragmentation — many small runs `memory_merge`
-    /// can fold into fewer, larger ones — so on a full array we `coalesce`
-    /// (freeing a slot per successful merge) and retry the push once. `Err`
-    /// means the array is still full afterward (every run physically
-    /// disjoint). This governs free-pool *residency*, not ownership: a caller
-    /// that retains the cap must account for it on ownership regardless of
-    /// this result. Eliminating the fixed array (so residency cannot fail
-    /// while RAM remains) is tracked as a separate redesign.
-    fn push_or_coalesce(&mut self, run: FreeRun) -> Result<(), ()>
-    {
-        if self.push(run).is_ok()
-        {
-            return Ok(());
-        }
-        self.coalesce();
-        self.push(run)
-    }
-
-    /// Find the smallest run covering at least `want` pages. Returns the
-    /// array index, or `None` if no run is large enough.
-    fn smallest_fit(&self, want: u32) -> Option<usize>
-    {
-        let mut best: Option<usize> = None;
-        let mut best_size: u32 = u32::MAX;
-        for (i, slot) in self.runs.iter().enumerate()
-        {
-            if let Some(run) = slot
-                && run.page_count >= want
-                && run.page_count < best_size
-            {
-                best = Some(i);
-                best_size = run.page_count;
-            }
-        }
-        best
-    }
-
-    /// Find the largest run regardless of size. Used by best-effort
-    /// allocation to greedily pick the biggest available chunk.
-    fn largest(&self) -> Option<usize>
-    {
-        let mut best: Option<usize> = None;
-        let mut best_size: u32 = 0;
-        for (i, slot) in self.runs.iter().enumerate()
-        {
-            if let Some(run) = slot
-                && run.page_count > best_size
-            {
-                best = Some(i);
-                best_size = run.page_count;
-            }
-        }
-        best
-    }
-
-    /// Coalesce free runs into larger physically-contiguous chunks.
-    ///
-    /// `memory_merge` only joins runs adjacent in physical memory, so sorting
-    /// the populated runs by `phys_base` places every mergeable pair
-    /// consecutively. A single linear pass then folds each run into its
-    /// lower-addressed neighbour with one `memory_merge` per pair: O(P)
-    /// syscalls over P populated runs, versus the O(P²) of blind all-pairs
-    /// probing. The distinction is load-bearing once the pool spans the whole
-    /// machine and every process death coalesces — a syscall per ordered pair
-    /// dominates teardown latency.
-    // cast_possible_truncation: slot indices are bounded by MAX_FREE_RUNS
-    // (512), so `i as u16` cannot truncate.
-    #[allow(clippy::cast_possible_truncation)]
-    fn coalesce(&mut self)
-    {
-        // Collect populated slot indices (slot < MAX_FREE_RUNS fits u16).
-        let mut order = [0u16; MAX_FREE_RUNS];
-        let mut n = 0usize;
-        for (i, slot) in self.runs.iter().enumerate()
-        {
-            if slot.is_some()
-            {
-                order[n] = i as u16;
-                n += 1;
-            }
-        }
-        // Insertion sort by phys_base: P is small in practice and this needs
-        // no allocator. None never appears in `order`, so map_or's default is
-        // unreachable.
-        for a in 1..n
-        {
-            let key = order[a];
-            let key_phys = self.runs[key as usize].map_or(0, |r| r.phys_base);
-            let mut b = a;
-            while b > 0 && self.runs[order[b - 1] as usize].map_or(0, |r| r.phys_base) > key_phys
-            {
-                order[b] = order[b - 1];
-                b -= 1;
-            }
-            order[b] = key;
-        }
-        // Fold each run into the current survivor while `memory_merge` accepts
-        // the pair. The survivor is the lower-addressed run, so it is always
-        // the merge parent; a rejection (non-adjacent or foreign parent) ends
-        // this survivor's run and promotes the rejecting run to survivor.
-        let mut s = 0usize;
-        while s < n
-        {
-            let surv = order[s] as usize;
-            let mut t = s + 1;
-            while t < n
-            {
-                let (Some(parent), Some(tail)) = (self.runs[surv], self.runs[order[t] as usize])
-                else
-                {
-                    break;
-                };
-                if syscall::memory_merge(parent.cap_slot, tail.cap_slot).is_err()
-                {
-                    break;
-                }
-                self.runs[surv] = Some(FreeRun {
-                    cap_slot: parent.cap_slot,
-                    page_count: parent.page_count + tail.page_count,
-                    phys_base: parent.phys_base,
-                });
-                self.runs[order[t] as usize] = None;
-                t += 1;
-            }
-            s = t;
-        }
     }
 }
 
@@ -1117,33 +900,40 @@ fn bootstrap_from_init(
 
 // ── Allocation primitives ────────────────────────────────────────────────────
 
-/// Peel exactly `want` pages off the run at index `idx`. If the run is
-/// larger, splits via `memory_split`; the residue is reinserted into the
-/// pool. Returns the cap slot (in memmgr's `CSpace`) covering exactly `want`
-/// pages plus that slot's physical base address.
+/// Binds the free pool's platform-injected merge/split operations to the real
+/// kernel syscalls. The pure allocator in `free_pool` takes `memory_merge` /
+/// `memory_split` as closures so it stays host-testable; this trait re-presents
+/// the bound `coalesce` / `push_or_coalesce` so every call site keeps its
+/// original shape. `memory_merge`'s `Ok` is the pure-logic "join accepted".
+trait PoolExt
+{
+    fn coalesce(&mut self);
+    fn push_or_coalesce(&mut self, run: FreeRun) -> Result<(), ()>;
+}
+
+impl PoolExt for FreePool
+{
+    fn coalesce(&mut self)
+    {
+        self.coalesce_with(|parent, tail| syscall::memory_merge(parent, tail).is_ok());
+    }
+
+    fn push_or_coalesce(&mut self, run: FreeRun) -> Result<(), ()>
+    {
+        self.push_or_coalesce_with(run, |parent, tail| {
+            syscall::memory_merge(parent, tail).is_ok()
+        })
+    }
+}
+
+/// Peel exactly `want` pages off the run at index `idx`, binding the kernel's
+/// `memory_split` (Option-D: shrink in place, return the tail cap) to the
+/// pool's injected split closure.
 fn take_exactly(pool: &mut FreePool, idx: usize, want: u32) -> Option<(u32, u64)>
 {
-    let run = pool.runs[idx]?;
-    if run.page_count == want
-    {
-        pool.runs[idx] = None;
-        return Some((run.cap_slot, run.phys_base));
-    }
-    if run.page_count < want
-    {
-        return None;
-    }
-    let split_offset = u64::from(want) * PAGE_SIZE;
-    // Option-D memory_split: `run.cap_slot` shrinks in place to cover the
-    // first `split_offset` bytes; the returned slot is the new tail covering
-    // the remainder at `phys_base + split_offset`.
-    let tail = syscall::memory_split(run.cap_slot, split_offset).ok()?;
-    pool.runs[idx] = Some(FreeRun {
-        cap_slot: tail,
-        page_count: run.page_count - want,
-        phys_base: run.phys_base + split_offset,
-    });
-    Some((run.cap_slot, run.phys_base))
+    pool.take_exactly(idx, want, |cap, offset| {
+        syscall::memory_split(cap, offset).ok()
+    })
 }
 
 /// Derive an inner copy of the outer cap to hand to the caller. The outer
@@ -1158,24 +948,6 @@ fn take_exactly(pool: &mut FreePool, idx: usize, want: u32) -> Option<(u32, u64)
 fn derive_for_caller(outer_slot: u32) -> Option<u32>
 {
     syscall::cap_derive(outer_slot, syscall::RIGHTS_ALL).ok()
-}
-
-/// The contiguous chunk of `region` that backs a fault at `page_base`: the
-/// `DEMAND_CHUNK_PAGES`-aligned window within the region containing the page,
-/// clamped to the region end (the last chunk may be shorter). Chunks are
-/// fixed and non-overlapping, so each region page belongs to exactly one.
-/// Returns `(chunk_base, chunk_pages)` with `chunk_pages ∈ [1, DEMAND_CHUNK_PAGES]`.
-fn chunk_for(region: &DemandRegion, page_base: u64) -> (u64, u32)
-{
-    let chunk_bytes = u64::from(DEMAND_CHUNK_PAGES) * PAGE_SIZE;
-    // page_base >= region.va_base: region_for matched `va`, and va_base is
-    // page-aligned, so the page containing `va` cannot precede it.
-    let chunk_idx = (page_base - region.va_base) / chunk_bytes;
-    let chunk_base = region.va_base + chunk_idx * chunk_bytes;
-    let region_end = region.va_base + region.len;
-    let chunk_end = (chunk_base + chunk_bytes).min(region_end);
-    let chunk_pages = ((chunk_end - chunk_base) / PAGE_SIZE) as u32;
-    (chunk_base, chunk_pages)
 }
 
 // ── IPC handlers ─────────────────────────────────────────────────────────────
@@ -1772,7 +1544,7 @@ fn handle_delegate_aspace(req: &IpcMessage, ipc_buf: *mut u64, procmgr_badge: u6
 /// `[kind, faulting_va, access, ip]`. On a VM fault whose address lies in a
 /// registered region of a process with a delegated address space, memmgr backs
 /// the [`chunk_for`] chunk containing the faulting page — one contiguous
-/// Memory cap mapped across up to [`DEMAND_CHUNK_PAGES`] pages — and replies
+/// Memory cap mapped across up to `DEMAND_CHUNK_PAGES` pages — and replies
 /// [`syscall_abi::FAULT_REPLY_RESUME`]. Backing a chunk rather than a single
 /// page bounds cap-slot consumption (one cap per chunk) so a deep demand stack
 /// cannot exhaust memmgr's `CSpace`. Every other case — non-VM fault, unknown

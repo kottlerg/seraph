@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (C) 2026 George Kottler <mail@kottlerg.com>
+
+[package]
+name = "memmgr-free-pool"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+# PAGE_SIZE is the single source of truth in the syscall ABI; the split-offset
+# and demand-chunk arithmetic here works in page units.
+syscall-abi = { path = "../../../abi/syscall" }
+
+[lints]
+workspace = true

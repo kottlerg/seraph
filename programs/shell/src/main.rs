@@ -24,8 +24,9 @@
 //! the next input line. This is the interim stand-in for a shared-tty /
 //! foreground-process-group model; real job control is #29.
 //!
-//! Paths are resolved lexically against an absolute working directory the shell
-//! owns (`resolve_path`): absolute and cwd-relative inputs both work, including
+//! Paths are resolved lexically by the `shell-path` crate (`resolve_path`) against
+//! an absolute working directory the shell owns: absolute and cwd-relative inputs
+//! both work, including
 //! `.`/`..`, and `cd` keeps the process cwd cap in lockstep. Limitations
 //! (v0.0.1): no pipes/redirection, quoting/escaping, variable expansion,
 //! globbing, or job control.

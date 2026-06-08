@@ -760,7 +760,7 @@ fn handle_get_system_root_cap(ipc_buf: *mut u64, rt: &VfsdRuntime)
 
 /// Mount role decoded from the MOUNT IPC wire byte. The producer
 /// (init) declares which partition role it wants; vfsd resolves the
-/// role to a GPT type-GUID via [`role_for_type_guid`] and then to a
+/// role to a GPT type-GUID via [`MountRole::type_guid`] and then to a
 /// partition entry via [`gpt::lookup_partition_by_type_guid`].
 #[derive(Clone, Copy, Debug)]
 enum MountRole

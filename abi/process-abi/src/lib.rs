@@ -426,6 +426,10 @@ pub struct ProcessInfo
     /// Zero when no logger is reachable (init, memmgr, procmgr
     /// themselves; processes spawned before the log endpoint exists).
     /// `seraph::log!` silently drops in that case.
+    ///
+    /// The log receiver itself (logd) deletes its seeded copy at startup:
+    /// it must hold no SEND on the endpoint it serves, so its own panic /
+    /// alloc-error output cannot self-IPC into it.
     pub log_send_cap: u32,
 
     // ── Stdio pipe wakeup notifications ──────────────────────────────────────

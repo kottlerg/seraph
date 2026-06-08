@@ -238,6 +238,22 @@ pub fn current_ipc_buf() -> *mut u64 {
     IPC_BUF_TLS.get()
 }
 
+/// Register a process-global panic-output sink. When set, std's panic
+/// machinery routes panic bytes to `sink` instead of the system log
+/// endpoint — covering the default hook AND the non-unwinding
+/// `handle_alloc_error` / precondition paths, which share one
+/// `panic_output()` chokepoint.
+///
+/// A process that serves the log endpoint (logd) registers a sink that
+/// writes to the serial driver, so its own faults never self-IPC into the
+/// endpoint it serves. Processes that leave it unset keep the default
+/// log-endpoint path. `sink` must be non-allocating and must not itself
+/// panic.
+#[stable(feature = "seraph_ext", since = "1.0.0")]
+pub fn set_panic_sink(sink: fn(&[u8])) {
+    pal_stdio::set_panic_sink(sink);
+}
+
 // ── Startup storage ─────────────────────────────────────────────────────────
 
 struct StartupCell(UnsafeCell<MaybeUninit<StartupInfo>>);

@@ -32,9 +32,13 @@ the one-time init-logd history pull is skipped on restart.
   holds no UART hardware authority. It cannot route its own
   diagnostics through `seraph::log!` because it IS the log receiver;
   the macro would self-IPC into the endpoint logd serves and
-  deadlock. Until the driver is resolvable, serial output is dropped
-  while history still accrues; early-boot output is covered by
-  init-logd's direct-UART fallback. See
+  deadlock. For the same reason its panic / alloc-error / precondition
+  output routes to the serial driver through a
+  `std::os::seraph::set_panic_sink` sink rather than the log endpoint,
+  and logd deletes its procmgr-seeded `ProcessInfo.log_send_cap` at
+  startup so no path can self-IPC. Until the driver is resolvable,
+  serial output is dropped while history still accrues; early-boot
+  output is covered by init-logd's direct-UART fallback. See
   [docs/console-model.md](../../docs/console-model.md).
 
 * **Driver-mediated framebuffer mirror.** logd also mirrors each line

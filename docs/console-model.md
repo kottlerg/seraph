@@ -50,8 +50,11 @@ earlier ones, which remain as fallbacks.
    (`services/logd/src/main.rs`) is the primary client: svcmgr launches and
    supervises it, it resolves the driver's write endpoint through devmgr's
    `devmgr_labels::QUERY_SERIAL_DEVICE`, and it emits both received log lines
-   and its own diagnostics through it. No userspace process other than the
-   serial driver and init-logd holds UART hardware authority.
+   and its own diagnostics through it — including its own panic / alloc-error
+   output, routed here via a `std::os::seraph::set_panic_sink` sink rather than
+   the log endpoint logd serves (logd deletes its seeded `log_send_cap` at
+   startup so a fault cannot self-IPC into it). No userspace process other than
+   the serial driver and init-logd holds UART hardware authority.
 
    real-logd is restartable (`restart = on_failure`). svcmgr holds the
    master-log endpoint source for the system's life, so a restarted logd

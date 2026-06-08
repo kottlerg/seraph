@@ -4,7 +4,7 @@
 //! disk.rs
 //!
 //! Build a GPT disk image from sysroot contents. The image contains three
-//! FAT32 partitions: an EFI System Partition (from sysroot/esp/), a Seraph
+//! FAT partitions: an EFI System Partition (from sysroot/esp/), a Seraph
 //! root partition (from sysroot/), and a Seraph data partition (from
 //! sysroot/data/) that vfsd auto-mounts at /data.
 
@@ -159,7 +159,7 @@ impl Seek for PartitionSlice
 
 /// Create a GPT disk image at `<project_root>/disk.img`.
 ///
-/// The image contains three FAT32 partitions:
+/// The image contains three FAT partitions:
 /// - Partition 1 (ESP, [`ESP_PARTITION_SIZE`]): populated from `sysroot/esp/`
 /// - Partition 2 (ROOT, [`ROOT_PARTITION_SIZE`]): populated from `sysroot/`
 ///   excluding `esp/` and `data/`
@@ -348,7 +348,7 @@ fn write_gpt(image_path: &Path, arch: Arch) -> Result<()>
     Ok(())
 }
 
-/// Format a partition as FAT32 and populate it from a source directory.
+/// Format a partition as FAT and populate it from a source directory.
 ///
 /// Skips build metadata (`.arch`, `NvVars`) and the top-level `esp` and
 /// `data` subdirectories, each a mount point with its own partition and so
@@ -378,7 +378,7 @@ fn format_and_populate_partition(
         let opts = fatfs::FormatVolumeOptions::new()
             .bytes_per_cluster(4096)
             .fat_type(fatfs::FatType::Fat32);
-        fatfs::format_volume(&mut slice, opts).context("failed to format partition as FAT32")?;
+        fatfs::format_volume(&mut slice, opts).context("failed to format partition as FAT")?;
     }
 
     // Populate (if source directory exists).

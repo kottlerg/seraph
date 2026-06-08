@@ -363,6 +363,15 @@ impl PerCpuScheduler
     ///
     /// Clears the `non_empty` bit if the queue at that priority becomes empty.
     /// Decrements load counter when a non-idle thread is dequeued.
+    ///
+    /// This local dispatch path MUST NOT gate on `context_saved`: the owning CPU
+    /// is the only dispatcher that can advance a mid-handoff (`cs == 0`,
+    /// woken-while-current) thread back to `cs == 1`. The cross-CPU load balancer
+    /// (`pull_unpinned_ready` / `migrate_ready_thread`) deliberately skips
+    /// `cs == 0` candidates to avoid cross-CPU double-dispatch (#314/#293); if
+    /// this path skipped them too, such a thread would become permanently
+    /// un-dispatchable — a lost wake. See `docs/scheduling-internals.md`
+    /// § `context_saved` protocol.
     pub fn dequeue_highest(&mut self) -> *mut ThreadControlBlock
     {
         let ne = self.non_empty.load(Ordering::Relaxed);

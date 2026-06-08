@@ -2,11 +2,12 @@
 
 vfsd is a namespace server that owns no on-disk storage. Its
 [`NamespaceBackend`] implementation, [`VfsdRootBackend`], composes a
-synthetic system root from per-mount badged SEND caps captured at
-boot time and on each successful `MOUNT`. Clients holding the
-system-root cap walk into mounted filesystems through this
-composition; the cross-server reply hands them a cap on the owning
-filesystem driver directly, after which vfsd is out of the path.
+synthetic system root from per-mount driver namespace endpoints
+captured at boot time and on each successful `MOUNT`. Clients holding
+the system-root cap walk into mounted filesystems through this
+composition; the cross-server reply mints them a freshly-attenuated cap
+on the owning filesystem driver directly, after which vfsd is out of the
+path.
 
 ---
 
@@ -14,8 +15,8 @@ filesystem driver directly, after which vfsd is out of the path.
 
 This document is authoritative for vfsd's namespace-server behavior:
 the shape of the synthetic root, the mount-tree representation, the
-two-derive-not-`cap_copy` invariant, and fall-through delegation to
-the root mount.
+mount-crossing mint that attenuates rights across a terminal mount, and
+fall-through delegation to the root mount.
 
 The wire protocol is defined by
 [`shared/namespace-protocol/README.md`](../../../shared/namespace-protocol/README.md).
@@ -33,7 +34,7 @@ The cap-as-namespace model is defined by
 |---|---|
 | `name` / `name_len` | Path component captured at install time |
 | `parent` / `first_child` / `next_sibling` | Tree links |
-| `terminal_cap` | Badged SEND on the underlying driver's namespace endpoint, set on a node that is itself a mount point; zero on a synthetic intermediate |
+| `terminal_endpoint` | *Unbadged* SEND on the underlying driver's namespace endpoint, set on a node that is itself a mount point; zero on a synthetic intermediate. Each crossing `NS_LOOKUP` mints a fresh attenuated badged SEND from it |
 | `fallthrough_cap` | Badged SEND on the root mount's namespace endpoint addressing the directory at this node's path in the root filesystem; zero if no such fall-through is available |
 
 The synthetic root is `NodeId::ROOT` (pool index 0) and is always
@@ -44,12 +45,12 @@ when `MOUNT path="/"` succeeds. `MAX_TREE_NODES` is `32` and
 
 Multi-component mount paths install through the tree by walking
 components, creating synthetic intermediates on demand, and setting
-`terminal_cap` on the final node. After install the caller
+`terminal_endpoint` on the final node. After install the caller
 (`do_mount`) walks the root mount component-by-component via
 `NS_LOOKUP` to populate each new intermediate's `fallthrough_cap`.
-The in-tree mount set is two single-component mounts (`/`, `/esp`);
-the multi-component install path remains supported but is currently
-unexercised in production.
+The in-tree mount set is the root mount (`/`) plus the single-component
+`/esp` and `/data` auto-mounts; the multi-component install path
+remains supported but is currently unexercised in production.
 
 ---
 
@@ -60,14 +61,16 @@ endpoint dispatches in two stages, from `vfsd::namespace_loop`:
 
 1. **Local-child match.** [`VfsdRootBackend::lookup`] walks the
    parent node's child list. A match on a *terminal* child returns
-   an [`EntryTarget::External`] view; the namespace-protocol crate
-   replies with a `cap_derive`-d copy of the stored `terminal_cap`.
-   The reply cap belongs to the underlying filesystem driver's
-   namespace endpoint; subsequent walks bypass vfsd entirely. A
-   match on a *synthetic intermediate* child returns an
-   [`EntryTarget::Local`] view; the protocol crate mints a
-   `cap_derive_badge` on `namespace_ep` addressing the intermediate's
-   `NodeId`, so the next `NS_LOOKUP` lands back on vfsd.
+   an [`EntryTarget::External`] view carrying the driver's unbadged
+   endpoint and the peer root node; the namespace-protocol crate mints
+   a fresh `cap_derive_badge` on that endpoint carrying the composed
+   `parent_rights ∩ entry.max_rights ∩ caller_requested` rights. The
+   reply cap belongs to the underlying filesystem driver's namespace
+   endpoint; subsequent walks bypass vfsd entirely. A match on a
+   *synthetic intermediate* child returns an [`EntryTarget::Local`]
+   view; the protocol crate mints a `cap_derive_badge` on
+   `namespace_ep` addressing the intermediate's `NodeId`, so the next
+   `NS_LOOKUP` lands back on vfsd.
 
 2. **Fall-through.** If no local child matches and the parent has a
    `fallthrough_cap`, vfsd's dispatcher (`try_forward_lookup_fallthrough`
@@ -111,44 +114,42 @@ does not consult the fall-through.
 
 ---
 
-## Two derives, not cap_copy
+## Mount-crossing mint
 
-A successful `MOUNT` mints **two** badged SEND caps on the driver's
-namespace endpoint, both addressing the driver's root at full
-namespace rights:
+A successful terminal `MOUNT` mints **one** badged SEND on the driver's
+namespace endpoint at full rights — `caller_root_cap`, returned to the
+`MOUNT` caller (or dropped on the internal `auto_mount_role` path that
+handles the `/esp` and `/data` mounts without a synchronous caller). The
+backend then retains the driver's **unbadged** namespace endpoint
+(`driver_ep`) as the terminal node's `terminal_endpoint`.
 
-- `caller_root_cap` is returned to the `MOUNT` caller (or dropped on
-  the internal `auto_mount_role` path that handles the `/esp` and
-  `/data` mounts without a synchronous caller).
-- `synthetic_root_cap` is captured into [`VfsdRootBackend`] so the
-  composition above can `cap_derive` from it on every `NS_LOOKUP`.
-
-Two derives instead of one `cap_copy` because vfsd must be able to
-`cap_delete` either slot in isolation — e.g. an unmount drops the
-synthetic-root entry without forcing the `MOUNT` caller to drop its
-copy.
+Every `NS_LOOKUP` that crosses the mount mints a *fresh* badged SEND on
+that endpoint carrying the composed
+`parent_rights ∩ entry.max_rights ∩ caller_requested` rights (the
+[`EntryTarget::External`] arm of `handle_lookup`). Storing the unbadged
+endpoint — rather than a pre-badged root cap — is what carries
+attenuation across the mount boundary: a node cap's rights live in its
+badge, and the kernel forbids re-badging an already-badged cap
+(`SYS_CAP_DERIVE_BADGE` rejects a badged source), so a stored badged cap
+could only ever be `cap_derive`-copied at its original full rights,
+laundering authority. The root mount is the exception — its
+`fallthrough_cap` is a *badged* SEND on the root fs (see fall-through
+above), safe because the forwarder pre-composes the caller's rights into
+each forwarded request rather than minting a reply cap.
 
 ### Revocation
 
-Per-cap `cap_delete` is *not* revocation. Only the slot named goes
-away; descendants and sibling derivations remain valid. The
-namespace-model invariant is that the supported revocation primitive
-for a mount is **destroy the fs driver**: `cap_revoke` on the
-driver's namespace endpoint cascades through the kernel derivation
-graph and invalidates every cap ever derived from it (synthetic-root
-entry, `MOUNT` caller copies, every per-file cap previously walked).
-This is the `kill the server` shape documented in
+The supported revocation primitive for a mount is **destroy the fs
+driver**: `cap_revoke` on the driver's namespace endpoint cascades
+through the kernel derivation graph and invalidates every cap ever
+derived from it — the `terminal_endpoint`, every per-lookup reply cap,
+and the `MOUNT` caller's copy. This is the `kill the server` shape
+documented in
 [`docs/namespace-model.md`](../../../docs/namespace-model.md#revocation).
-
-Per-mount per-cap revocation (revoke the synthetic-root entry without
-affecting the caller's copy of the same node) is not supported by
-this scheme. Calling `cap_revoke` on `synthetic_root_cap` would
-behave like `cap_revoke` on any badged SEND derived from the
-endpoint and trigger the kernel's per-cap revocation, which on the
-namespace endpoint cascades to every sibling derivation — equivalent
-to the destroy-driver hammer for callers' purposes. The two-derive
-shape buys per-slot ownership for `cap_delete` ergonomics, not
-per-cap revocation.
+Retaining the unbadged endpoint in the backend (rather than leaking it,
+as the pre-attenuation design did) means vfsd now holds that revocation
+authority by name. Per-cap revocation — invalidating one issued node cap
+without affecting its siblings — is not supported by this scheme.
 
 ---
 
@@ -186,9 +187,10 @@ Wire-label numbers for both surfaces live in [`ipc::vfsd_labels`] and
 
 ## Lifetime
 
-A successful `install` retains the `synthetic_root_cap` (terminal
-nodes) and any walked `fallthrough_cap`s (synthetic intermediates)
-for the lifetime of the vfsd process. Unmount is not implemented;
+A successful `install` retains the `terminal_endpoint` (terminal
+nodes) and any walked `fallthrough_cap`s (synthetic intermediates, plus
+the root mount's badged fall-through cap) for the lifetime of the vfsd
+process. Unmount is not implemented;
 the mount-tree is permanent until vfsd exits. Deferred follow-ups:
 per-process `system_root_cap` distribution (different processes
 seeing different roots) and `cap_revoke`-driven unmount.

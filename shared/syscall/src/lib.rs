@@ -591,10 +591,11 @@ pub fn thread_exit() -> !
 /// Exit the whole process with the voluntary exit `code`. Never returns.
 ///
 /// The kernel records `syscall_abi::encode_exit_code(code)` as the exit reason
-/// and posts it to the calling thread's and the address space's death observers,
-/// so a waiting parent's `ExitStatus` carries the code. Unlike [`thread_exit`]
-/// (which ends only the calling thread), this signals process death on the
-/// address-space surface; sibling teardown is procmgr-driven via cap revocation.
+/// and posts it to the calling thread's death observers, so a waiting parent's
+/// `ExitStatus` carries the code. Like [`thread_exit`] this stops only the
+/// calling thread — it does not post to the address-space death surface, which
+/// is reserved for terminal faults. Whole-process teardown (reaping any sibling
+/// threads) is procmgr-driven via cap revocation once it observes the death.
 #[inline]
 pub fn process_exit(code: u32) -> !
 {

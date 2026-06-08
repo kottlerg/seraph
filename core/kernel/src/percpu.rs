@@ -439,58 +439,24 @@ mod tests
     use super::*;
     use core::mem::offset_of;
 
+    // ABI contract: the syscall entry/exit and context-switch assembly reads PerCpuData
+    // fields by these constant offsets (PERCPU_*_OFFSET). The struct layout and the
+    // constants MUST agree or the asm touches the wrong field. Size is pinned because the
+    // tagged-TLB counters are appended after the asm-referenced fields; a size change
+    // would mean something was inserted ahead of them.
     #[test]
-    fn percpu_cpu_id_offset_matches_constant()
+    fn percpu_offsets_match_asm_constants()
     {
         assert_eq!(offset_of!(PerCpuData, cpu_id), PERCPU_CPU_ID_OFFSET);
-    }
-
-    #[test]
-    fn percpu_kernel_rsp_offset_matches_constant()
-    {
         assert_eq!(offset_of!(PerCpuData, kernel_rsp), PERCPU_KERNEL_RSP_OFFSET);
-    }
-
-    #[test]
-    fn percpu_user_rsp_offset_matches_constant()
-    {
         assert_eq!(offset_of!(PerCpuData, user_rsp), PERCPU_USER_RSP_OFFSET);
-    }
-
-    #[test]
-    fn percpu_scratch_offset_matches_constant()
-    {
         assert_eq!(offset_of!(PerCpuData, scratch), PERCPU_SCRATCH_OFFSET);
-    }
-
-    #[test]
-    fn percpu_tss_ptr_offset_matches_constant()
-    {
         assert_eq!(offset_of!(PerCpuData, tss_ptr), PERCPU_TSS_PTR_OFFSET);
-    }
-
-    #[test]
-    fn percpu_size_is_72_bytes()
-    {
-        // cpu_id(4) + _pad0(4) + kernel_rsp(8) + user_rsp(8) + scratch(8) + tss_ptr(8)
-        // + preempt_count(4) + _pad1(4) + fpu_owner(8) + ctxsw_flush_elided(8)
-        // + ctxsw_flush_performed(8) = 72. The two tagged-TLB counters are
-        // appended after fpu_owner, so the asm-referenced offsets are unchanged.
-        assert_eq!(core::mem::size_of::<PerCpuData>(), 72);
-    }
-
-    #[test]
-    fn percpu_preempt_count_offset_matches_constant()
-    {
         assert_eq!(
             offset_of!(PerCpuData, preempt_count),
             PERCPU_PREEMPT_COUNT_OFFSET
         );
-    }
-
-    #[test]
-    fn percpu_fpu_owner_offset_matches_constant()
-    {
         assert_eq!(offset_of!(PerCpuData, fpu_owner), PERCPU_FPU_OWNER_OFFSET);
+        assert_eq!(core::mem::size_of::<PerCpuData>(), 72);
     }
 }

@@ -488,54 +488,28 @@ mod tests
     use super::*;
     use core::mem::size_of;
 
+    // Option<SlotId> MUST reuse SlotId's NonZeroU32 niche; losing it would grow every
+    // free-list slot. Relational so a benign field change does not trip a literal.
     #[test]
-    fn capability_slot_is_72_bytes()
+    fn slot_id_option_is_niche_optimized()
     {
-        assert_eq!(size_of::<CapabilitySlot>(), 72);
+        assert_eq!(size_of::<Option<SlotId>>(), size_of::<SlotId>());
     }
 
+    // Cross-boundary ABI contract: userspace receives capabilities tagged by
+    // `init_protocol::CapType`, whose discriminants MUST equal the kernel's `CapTag`.
+    // Anchored to the authoritative ABI enum (not a re-stated literal), so drift on
+    // either side trips here instead of mis-typing a cap in userspace.
     #[test]
-    fn slot_id_is_12_bytes()
+    fn cap_tag_discriminants_match_userspace_captype()
     {
-        assert_eq!(size_of::<SlotId>(), 12);
-    }
-
-    #[test]
-    fn option_slot_id_is_12_bytes()
-    {
-        // Verifies niche optimization via NonZeroU32 survives the epoch widen.
-        assert_eq!(size_of::<Option<SlotId>>(), 12);
-    }
-
-    #[test]
-    fn cap_tag_discriminants()
-    {
-        assert_eq!(CapTag::Null as u8, 0);
-        assert_eq!(CapTag::Memory as u8, 1);
-        assert_eq!(CapTag::SchedControl as u8, 12);
-    }
-
-    #[test]
-    fn rights_bitwise_or()
-    {
-        let r = Rights::MAP | Rights::WRITE;
-        assert_eq!(r.0, 0b011);
-    }
-
-    #[test]
-    fn rights_bitwise_and()
-    {
-        let r = (Rights::MAP | Rights::WRITE) & Rights::WRITE;
-        assert_eq!(r, Rights::WRITE);
-    }
-
-    #[test]
-    fn rights_bitor_assign()
-    {
-        let mut r = Rights::MAP;
-        r |= Rights::WRITE;
-        assert!(r.contains(Rights::MAP));
-        assert!(r.contains(Rights::WRITE));
+        use init_protocol::CapType;
+        assert_eq!(CapTag::Memory as u8, CapType::Memory as u8);
+        assert_eq!(CapTag::Interrupt as u8, CapType::Interrupt as u8);
+        assert_eq!(CapTag::Mmio as u8, CapType::Mmio as u8);
+        assert_eq!(CapTag::IoPort as u8, CapType::IoPort as u8);
+        assert_eq!(CapTag::SchedControl as u8, CapType::SchedControl as u8);
+        assert_eq!(CapTag::SbiControl as u8, CapType::SbiControl as u8);
     }
 
     #[test]
@@ -548,21 +522,27 @@ mod tests
         assert!(r.contains(Rights::MAP | Rights::WRITE));
     }
 
+    // Rights' bitwise operators are hand-written (impl BitOr/BitAnd/BitOrAssign); a
+    // transposed `&`/`|` would silently widen or drop capability authority. One
+    // behaviour: the operators compose and mask rights bits as expected.
     #[test]
-    fn violates_wx_both_set()
+    fn rights_operators_compose_bits()
+    {
+        let rw = Rights::MAP | Rights::WRITE;
+        assert!(rw.contains(Rights::MAP));
+        assert!(rw.contains(Rights::WRITE));
+        assert_eq!(rw & Rights::WRITE, Rights::WRITE);
+        let mut acc = Rights::MAP;
+        acc |= Rights::WRITE;
+        assert_eq!(acc, rw);
+    }
+
+    // W^X predicate: true only when WRITE and EXECUTE are both present.
+    #[test]
+    fn violates_wx_requires_write_and_execute()
     {
         assert!(violates_wx(Rights::WRITE | Rights::EXECUTE));
-    }
-
-    #[test]
-    fn violates_wx_only_write()
-    {
         assert!(!violates_wx(Rights::WRITE));
-    }
-
-    #[test]
-    fn violates_wx_only_execute()
-    {
         assert!(!violates_wx(Rights::EXECUTE));
     }
 

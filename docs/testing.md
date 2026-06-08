@@ -4,6 +4,11 @@ System-wide standard for the in-tree test harnesses, the per-program tester
 protocol, the sysroot layout for test binaries, and the gating mechanism
 that determines which harnesses run in a given boot.
 
+This document covers booted functional testing. Host-side `#[cfg(test)]` unit
+tests — their quality rules and the boundary between host-unit and booted
+testing — are governed by
+[coding-standards.md](coding-standards.md#d-testing-invariants).
+
 ---
 
 ## Harnesses

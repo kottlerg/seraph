@@ -267,9 +267,43 @@ let value = unsafe { ptr.read() };
 
 ## D. Testing Invariants
 
-For kernel testing strategy and how to run tests, see [build-system.md](build-system.md#testing).
+For how to run host tests and the build/test mechanism, see
+[build-system.md](build-system.md#testing). For the booted harnesses (`ktest`, `svctest`,
+`usertest`), see [testing.md](testing.md).
 
-### Unit Tests
+### Scope
+
+These invariants govern host-side `#[cfg(test)]` unit tests in every crate — kernel,
+services, programs, and runtime alike, not the kernel alone. Host unit tests cover **pure,
+host-reachable logic**: parsers, encoders, allocators, table walkers, state machines,
+arithmetic, and validation. Logic reachable only through a syscall, IPC, real hardware, or a
+booted runtime is exercised by the harnesses in [testing.md](testing.md), not by host unit
+tests. Mocking the kernel ABI to manufacture a host test is forbidden — such a test exercises
+the mock, not the system.
+
+Where a component's pure logic is non-trivial — a parser of external input, a codec, an
+allocator, a state machine — it SHOULD be factored so that logic is host-reachable: a
+`no_std` library crate, or a trait boundary that injects the platform, rather than logic
+entangled with IPC, syscall, or `std::os::seraph` calls. The goal is keeping the algorithmic
+core separable from mechanism, as the kernel already does for its allocators and capability
+tree; host-testability is the symptom of that separation, not the goal. This is a SHOULD that
+applies to non-trivial logic — it is not a mandate to extract trivial glue into crates.
+
+### Tests assert behaviour, not surface area
+
+Coverage is the set of behaviours and failure modes that can no longer regress silently. It
+is never the count of functions or fields that carry a test. Test count is not a quality
+metric. Removing a test that guards nothing, adding none in its place, is a valid and
+expected outcome of a test-touching change.
+
+A test MUST be able to fail for a real reason: at least one of its failure modes must
+correspond to a genuine defect in the code under test. A test whose only red path is a
+constant edited in two places, or the standard library, a `derive` macro, or the compiler's
+layout rules changing, guards nothing and MUST NOT exist. Before adding a test, state in one
+sentence the defect it would catch; if that sentence is "someone changed the literal," do not
+add it.
+
+### Form
 
 Unit tests live in a `#[cfg(test)]` module at the bottom of each source file:
 
@@ -288,28 +322,84 @@ mod tests
 }
 ```
 
-Rules:
-- Tests MUST have one logical assertion per test function.
-- Test names read as a sentence describing expected behaviour.
-- Tests MUST be independent and order-independent.
-- Tests MUST be deterministic — no randomness, no timing, no external state.
-- In test code, `assert!`, `assert_eq!`, `assert_ne!`, `unwrap()`, and `expect()` are
-  all permitted.
+- Each test MUST cover one logical behaviour — one invariant, one transition, or one round
+  trip. A behaviour whose correctness spans several fields or several assertions (a round
+  trip, a multi-field constructor, a state-machine step) is one test, not one test per field
+  or per assertion. Unrelated behaviours MUST NOT be bundled into one test.
+- Test names read as a sentence describing the behaviour, and stay accurate after
+  consolidation — name the behaviour, not the function.
+- Tests MUST be independent, order-independent, and deterministic — no randomness, no timing,
+  no external or shared mutable state.
+- In test code, `assert!`, `assert_eq!`, `assert_ne!`, `unwrap()`, and `expect()` are all
+  permitted.
 
 ### What Must Be Tested
 
-- Every public function MUST have at least one success-path test and at least one test
-  per failure mode.
-- Boundary conditions: empty input, maximum-size input, off-by-one cases.
-- Every `Result::Err` variant a function can return MUST be exercised.
-- Modules containing `unsafe` blocks MUST have tests confirming the safe wrapper upholds
-  its invariants under normal use.
+- Non-trivial logic: every function containing a branch, loop, arithmetic, or state
+  transition MUST have a success-path test for each materially distinct outcome.
+- Every `Result::Err` variant, or `None`-as-failure, a function can return MUST be exercised
+  by an input that provokes it.
+- Boundary conditions: empty input, maximum-size input, and off-by-one cases where behaviour
+  changes at the boundary.
+- Modules containing `unsafe` blocks MUST have tests confirming the safe wrapper upholds its
+  documented invariants under normal use.
+- Serialization and wire round trips (`to_bytes`/`from_bytes`, encode/decode, cross-boundary
+  marshalling) MUST have a round-trip test on a populated value.
 
-### What Should Not Be Tested
+A function with no branch and no failure mode — a plain constructor, a getter, a derived
+`Default` — does not require a dedicated test. Exercising it incidentally as setup for a
+behaviour test is sufficient.
 
-- Private implementation details not visible through the public interface.
-- Trivial getters and setters with no logic.
-- Code generated by `#[derive]`, unless custom logic is attached.
+### What Must Not Be Tested
+
+These cannot fail for a real reason. They MUST NOT be added, and existing instances are
+removed or consolidated:
+
+- Tautologies and constant mirrors: asserting a constant equals its own literal, or that one
+  constant bounds another by definition.
+- Language- or library-guaranteed behaviour: `derive` output, `bitflags!`-generated
+  operators, standard operator overloads, enum-discriminant values already pinned by
+  `#[repr]`, or the compiler-guaranteed layout of an internal struct.
+- Per-field fragmentation of a single behaviour.
+- Duplicate-input redundancy: several tests driving one code path with inputs that exercise
+  no new branch or boundary.
+- Private implementation details not visible through the public interface, and trivial getters
+  and setters with no logic.
+
+### Layout and ABI Assertions
+
+A `size_of`, `offset_of`, or alignment assertion is legitimate only when it guards an external
+stability contract — a layout some consumer outside the Rust struct definition depends on:
+
+- An ABI or wire format shared across the boot boundary or with userspace.
+- A layout read from assembly or via raw-pointer cast (a per-CPU field offset; a header
+  required at offset zero for a concrete-to-header pointer cast).
+- A hard size budget asserted elsewhere (a structure that must fit one page).
+
+Such an assertion is forbidden when the layout is purely internal and no external consumer
+depends on it; that is a constant mirror that breaks on any benign field reorder. When
+legitimate, layout assertions MUST be consolidated into one test per struct family or module,
+named for the contract, with a comment naming the consumer that depends on the layout:
+
+```rust
+// ABI contract: the bootloader writes these structures into the BootInfo page and the
+// kernel reads them back by offset; their sizes are part of BOOT_PROTOCOL_VERSION.
+#[test]
+fn boot_protocol_struct_sizes_are_stable()
+{
+    assert_eq!(size_of::<ReclaimRange>(), 16);
+    assert_eq!(size_of::<MmioAperture>(), 16);
+    assert!(size_of::<BootInfo>() <= 4096);
+}
+```
+
+The same rule extends to **enum-discriminant values that form a cross-boundary contract** — a
+kernel enum whose discriminants are mirrored by a userspace or ABI enum or constant. Such an
+assertion is legitimate, but it MUST be anchored to the authoritative ABI definition (assert the
+two sides agree), never a re-stated literal, so that drift on either side trips the test. A bare
+`assert_eq!(MyEnum::Variant as u8, 3)` that mirrors the enum's own definition is a constant
+mirror and is forbidden; `assert_eq!(KernelTag::X as u8, abi::Tag::X as u8)` is the legitimate
+form.
 
 ---
 
@@ -344,5 +434,5 @@ mandated lint groups and treats all warnings as errors. Invocation details are i
 
 ## Summarized By
 
-None
+[Build System](build-system.md)
 

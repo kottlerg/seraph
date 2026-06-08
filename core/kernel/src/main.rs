@@ -293,6 +293,9 @@ unsafe fn kernel_entry_post_rebase(
     unsafe {
         percpu::init_bsp();
     }
+    // `current_cpu()` (and thus the panic-context dump) is safe from here.
+    #[cfg(not(test))]
+    PANIC_DUMP_READY.store(true, core::sync::atomic::Ordering::Release);
     kprintln!("percpu ok");
     // Enable hardware address-space tags (x86-64 PCID / RISC-V ASID) where
     // available, seeding the tag pool sized to boot_cpu_count. Where the feature
@@ -1347,19 +1350,36 @@ unsafe extern "C" {
     static __text_end: u8;
 }
 
+/// Set once the BSP per-CPU subsystem is initialized (after `percpu::init_bsp`),
+/// gating [`panic_context_dump`]'s per-CPU reads. A panic before this point keeps
+/// the banner-only behaviour and cannot fault inside the handler.
+#[cfg(not(test))]
+static PANIC_DUMP_READY: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 /// Best-effort panic context: CPU, current thread, the in-flight syscall, and a
 /// kernel-text stack scan. The in-flight syscall is the load-bearing line for
 /// issue #316: a torn-context (#314) makes a syscall execute with garbage
 /// register args, which reach a stdlib precondition (`slice::get_unchecked`) and
 /// panic — this dump shows the syscall + args, pinning kernel-side corruption vs
 /// a deterministic kernel bug. Serial-only / lock-bypassing, mirroring the panic
-/// banner; every read is null-checked or stack-bounded so the dump cannot fault.
+/// banner. Skips entirely until the per-CPU subsystem is initialized
+/// (`PANIC_DUMP_READY`); after that every read is null-checked or stack-bounded,
+/// so the dump cannot fault.
 ///
 /// # Safety
 /// Called only from the panic handler.
 #[cfg(not(test))]
 unsafe fn panic_context_dump()
 {
+    // Bail before per-CPU GS-base/tp and the scheduler slabs exist: a pre-init
+    // panic would otherwise fault in `current_cpu()` / `current_tcb()` /
+    // `scheduler_for()` (the last re-entering this handler → unbounded recursion).
+    // The banner is already printed by the caller, so it is not lost.
+    if !PANIC_DUMP_READY.load(core::sync::atomic::Ordering::Acquire)
+    {
+        return;
+    }
     let cpu = arch::current::cpu::current_cpu();
     // SAFETY: current_tcb may be null very early in boot; checked before deref.
     let cur = unsafe { crate::syscall::current_tcb() };

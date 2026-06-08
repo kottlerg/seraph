@@ -1537,6 +1537,30 @@ unsafe fn dealloc_object_one(
                 // until here and is cleared on every enqueue_and_wake exit path.
                 if let Some((bound, bcpu)) = server_reply_wake
                 {
+                    // #317 predecessor-of-free null: clear the claimed client's
+                    // `blocked_on_object` (which still points at THIS dying server,
+                    // `tcb`) under the CLIENT's sched_lock, BEFORE enqueue_and_wake.
+                    // This is the strict predecessor of retype_free that the
+                    // cancel_ipc_block / dealloc(client) CLOSURE LEMMA relies on: a
+                    // withdrawer reading `blocked_on == server` under the client
+                    // sched_lock thereby proves the server is not yet freed. It MUST
+                    // run here, while `bound` is still pinned by wake_in_flight = 1
+                    // (set at the claim above): for an Exited `bound` (a concurrent
+                    // dealloc(client) won the reap) enqueue_and_wake takes its Exited
+                    // arm and does NOT null blocked_on, and clearing wake_in_flight
+                    // there would unblock that dealloc(client) to retype_free `bound`
+                    // — so the null must precede the wake. Only the client's
+                    // sched_lock is taken (the server's was released with the all-CPU
+                    // locks above), so there is no two-TCB-sched_lock nesting.
+                    // SAFETY: bound kept valid by wake_in_flight = 1 above.
+                    unsafe {
+                        let bs = (*bound).sched_lock.lock_raw();
+                        if core::ptr::eq((*bound).blocked_on_object, tcb.cast::<u8>())
+                        {
+                            (*bound).blocked_on_object = core::ptr::null_mut();
+                        }
+                        (*bound).sched_lock.unlock_raw(bs);
+                    }
                     // SAFETY: bound kept valid by wake_in_flight = 1 above.
                     unsafe { crate::sched::enqueue_and_wake(bound, bcpu) };
                 }
@@ -1622,60 +1646,73 @@ unsafe fn dealloc_object_one(
                             }
                             IpcThreadState::BlockedOnReply =>
                             {
-                                // blocked_obj is the server TCB. CAS-clear
-                                // the server's reply slot iff this dying
-                                // client is still bound — mirror
-                                // cancel_ipc_block.
+                                // blocked_obj is the server TCB. CAS-clear the
+                                // server's reply slot iff this dying client is still
+                                // bound. Same #317 hazard as cancel_ipc_block: a
+                                // concurrent dealloc(server) could free the server
+                                // under this deref. Guard it with THIS dying client's
+                                // sched_lock + a `blocked_on == server` re-read — the
+                                // CLOSURE LEMMA pins the server alive across the CAS
+                                // (dealloc(server) nulls a claimed client's
+                                // blocked_on under the same client sched_lock before
+                                // retype_free). Only this client's sched_lock is held;
+                                // the reply_tcb CAS on the server is wait-free.
                                 use core::sync::atomic::Ordering;
                                 let server =
                                     blocked_obj.cast::<crate::sched::thread::ThreadControlBlock>();
-                                // The Acquire-load of reply_tcb synchronises
-                                // with endpoint_call/recv's Release publication
-                                // of the binding, so the `wake_in_flight = 1`
-                                // they stored before it is visible here. If we
-                                // win the CAS we cancelled the reply wake — clear
-                                // the flag so the gate below does not wait for a
-                                // wake that will never fire. If we lose, a reply
-                                // is in flight and its enqueue_and_wake clears
-                                // the flag; the gate below waits for it (#160).
-                                let cancelled = (*server)
-                                    .reply_tcb
-                                    .compare_exchange(
-                                        tcb,
-                                        core::ptr::null_mut(),
-                                        Ordering::AcqRel,
-                                        Ordering::Acquire,
-                                    )
-                                    .is_ok();
-                                if cancelled
+                                let saved = (*tcb).sched_lock.lock_raw();
+                                if core::ptr::eq((*tcb).blocked_on_object, blocked_obj)
                                 {
-                                    (*tcb).wake_in_flight.store(0, Ordering::Release);
+                                    // Win ⇒ we cancelled the reply wake; clear
+                                    // wake_in_flight so the #160 gate below does not
+                                    // wait for a wake that will never fire. Lose ⇒ a
+                                    // reply is in flight and its enqueue_and_wake
+                                    // clears the flag; the gate waits for it.
+                                    let cancelled = (*server)
+                                        .reply_tcb
+                                        .compare_exchange(
+                                            tcb,
+                                            core::ptr::null_mut(),
+                                            Ordering::AcqRel,
+                                            Ordering::Acquire,
+                                        )
+                                        .is_ok();
+                                    if cancelled
+                                    {
+                                        (*tcb).wake_in_flight.store(0, Ordering::Release);
+                                    }
                                 }
+                                (*tcb).sched_lock.unlock_raw(saved);
                             }
                             IpcThreadState::BlockedOnFault =>
                             {
-                                // A dying fault-blocked thread: `blocked_obj` is
-                                // its handler (server) TCB. CAS-clear the
-                                // handler's reply slot so a later reply does not
-                                // target this freed faulter. Mirrors
-                                // BlockedOnReply; the faulter never resumes, so no
-                                // disposition is recorded.
+                                // A dying fault-blocked thread: `blocked_obj` is its
+                                // handler (server) TCB. CAS-clear the handler's reply
+                                // slot so a later reply does not target this freed
+                                // faulter. Mirrors the BlockedOnReply arm including
+                                // the #317 client-sched_lock guard; the faulter never
+                                // resumes, so no disposition is recorded.
                                 use core::sync::atomic::Ordering;
                                 let server =
                                     blocked_obj.cast::<crate::sched::thread::ThreadControlBlock>();
-                                let cancelled = (*server)
-                                    .reply_tcb
-                                    .compare_exchange(
-                                        tcb,
-                                        core::ptr::null_mut(),
-                                        Ordering::AcqRel,
-                                        Ordering::Acquire,
-                                    )
-                                    .is_ok();
-                                if cancelled
+                                let saved = (*tcb).sched_lock.lock_raw();
+                                if core::ptr::eq((*tcb).blocked_on_object, blocked_obj)
                                 {
-                                    (*tcb).wake_in_flight.store(0, Ordering::Release);
+                                    let cancelled = (*server)
+                                        .reply_tcb
+                                        .compare_exchange(
+                                            tcb,
+                                            core::ptr::null_mut(),
+                                            Ordering::AcqRel,
+                                            Ordering::Acquire,
+                                        )
+                                        .is_ok();
+                                    if cancelled
+                                    {
+                                        (*tcb).wake_in_flight.store(0, Ordering::Release);
+                                    }
                                 }
+                                (*tcb).sched_lock.unlock_raw(saved);
                             }
                             IpcThreadState::None =>
                             {}

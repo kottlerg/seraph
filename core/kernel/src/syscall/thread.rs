@@ -457,35 +457,52 @@ unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadControlBlock)
 
         IpcThreadState::BlockedOnReply =>
         {
-            // blocked_on is the server TCB. compare_exchange so we don't
-            // clobber a different client's binding (server may have moved on).
+            // blocked_on is the server TCB. The reply_tcb CAS dereferences the
+            // server, which a concurrent dealloc(server) could free (#317). Guard
+            // it: hold THIS client's sched_lock across a `blocked_on_object` re-read
+            // and the CAS. dealloc(server) nulls a claimed client's blocked_on under
+            // that same client sched_lock strictly before retype_free, so observing
+            // `blocked_on == server` under the lock proves the server is not yet
+            // freed (CLOSURE LEMMA — docs/scheduling-internals.md § Cross-CPU TCB
+            // Ownership). A Blocked client's blocked_on can only transition
+            // server→null (a waker), never server→server2, so the re-read suffices.
+            // Only this client's sched_lock is held; the reply_tcb CAS on the server
+            // is wait-free, so the "one TCB sched_lock at a time" rule holds.
             if !blocked_on.is_null()
             {
                 // cast_ptr_alignment: blocked_on_object stores type-erased pointer; original allocation guarantees alignment.
                 #[allow(clippy::cast_ptr_alignment)]
                 let server = blocked_on.cast::<crate::sched::thread::ThreadControlBlock>();
-                // SAFETY: server is a valid TCB pointer; reply_tcb is AtomicPtr.
+                // SAFETY: tcb valid; sched_lock paired with unlock below. server is
+                // pinned alive for the CAS by the blocked_on re-read under this lock.
                 unsafe {
-                    let cancelled = (*server)
-                        .reply_tcb
-                        .compare_exchange(
-                            tcb,
-                            core::ptr::null_mut(),
-                            core::sync::atomic::Ordering::AcqRel,
-                            core::sync::atomic::Ordering::Acquire,
-                        )
-                        .is_ok();
-                    // We cancelled the pending reply wake; release the
-                    // wake-in-flight claim endpoint_call/recv set when this
-                    // thread became BlockedOnReply, so a concurrent
-                    // dealloc_object(Thread) does not wait for a wake that will
-                    // never fire (#160).
-                    if cancelled
+                    let saved = (*tcb).sched_lock.lock_raw();
+                    if (*tcb).state == crate::sched::thread::ThreadState::Blocked
+                        && (*tcb).ipc_state == IpcThreadState::BlockedOnReply
+                        && core::ptr::eq((*tcb).blocked_on_object, blocked_on)
                     {
-                        (*tcb)
-                            .wake_in_flight
-                            .store(0, core::sync::atomic::Ordering::Release);
+                        let cancelled = (*server)
+                            .reply_tcb
+                            .compare_exchange(
+                                tcb,
+                                core::ptr::null_mut(),
+                                core::sync::atomic::Ordering::AcqRel,
+                                core::sync::atomic::Ordering::Acquire,
+                            )
+                            .is_ok();
+                        // We cancelled the pending reply wake; release the
+                        // wake-in-flight claim endpoint_call/recv set when this
+                        // thread became BlockedOnReply, so a concurrent
+                        // dealloc_object(Thread) does not wait for a wake that will
+                        // never fire (#160).
+                        if cancelled
+                        {
+                            (*tcb)
+                                .wake_in_flight
+                                .store(0, core::sync::atomic::Ordering::Release);
+                        }
                     }
+                    (*tcb).sched_lock.unlock_raw(saved);
                 }
             }
         }
@@ -504,27 +521,36 @@ unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadControlBlock)
                 // cast_ptr_alignment: blocked_on_object stores type-erased pointer; original allocation guarantees alignment.
                 #[allow(clippy::cast_ptr_alignment)]
                 let server = blocked_on.cast::<crate::sched::thread::ThreadControlBlock>();
-                // SAFETY: server is a valid TCB pointer; reply_tcb is AtomicPtr.
+                // SAFETY: tcb valid; sched_lock paired with unlock. server is pinned
+                // alive for the CAS by the blocked_on re-read under this lock (#317,
+                // CLOSURE LEMMA — mirrors the BlockedOnReply arm above).
                 unsafe {
-                    let cancelled = (*server)
-                        .reply_tcb
-                        .compare_exchange(
-                            tcb,
-                            core::ptr::null_mut(),
-                            core::sync::atomic::Ordering::AcqRel,
-                            core::sync::atomic::Ordering::Acquire,
-                        )
-                        .is_ok();
-                    if cancelled
+                    let saved = (*tcb).sched_lock.lock_raw();
+                    if (*tcb).state == crate::sched::thread::ThreadState::Blocked
+                        && (*tcb).ipc_state == IpcThreadState::BlockedOnFault
+                        && core::ptr::eq((*tcb).blocked_on_object, blocked_on)
                     {
-                        (*tcb).fault_outcome.store(
-                            crate::ipc::fault::FAULT_OUTCOME_KILL,
-                            core::sync::atomic::Ordering::Release,
-                        );
-                        (*tcb)
-                            .wake_in_flight
-                            .store(0, core::sync::atomic::Ordering::Release);
+                        let cancelled = (*server)
+                            .reply_tcb
+                            .compare_exchange(
+                                tcb,
+                                core::ptr::null_mut(),
+                                core::sync::atomic::Ordering::AcqRel,
+                                core::sync::atomic::Ordering::Acquire,
+                            )
+                            .is_ok();
+                        if cancelled
+                        {
+                            (*tcb).fault_outcome.store(
+                                crate::ipc::fault::FAULT_OUTCOME_KILL,
+                                core::sync::atomic::Ordering::Release,
+                            );
+                            (*tcb)
+                                .wake_in_flight
+                                .store(0, core::sync::atomic::Ordering::Release);
+                        }
                     }
+                    (*tcb).sched_lock.unlock_raw(saved);
                 }
             }
         }

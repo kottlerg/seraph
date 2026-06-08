@@ -36,36 +36,39 @@ In scope:
 The following ordering MUST be observed everywhere in the kernel. Acquiring locks in reverse, or skipping levels, risks deadlock.
 
 ```
-                    per-CPU scheduler.lock      (outer)
-                              │
-              ┌───────────────┼───────────────┐
-              │                               │
        source IPC lock                derivation tree lock
-   (sig.lock | ep.lock |             (cap revocation;
-    eq.lock | ws.lock)                see capability-internals.md)
-              │
-        SLEEP_LIST_LOCK                (leaf-only)
+   (sig.lock | ep.lock |    (outer)   (cap revocation;
+    eq.lock | ws.lock)                 see capability-internals.md)
+        │         │
+        │         └─────► SLEEP_LIST_LOCK   (leaf; held alone, or under a
+        │                                    source lock — source.lock →
+        │                                    SLEEP_LIST_LOCK is the only edge)
+        ▼
+   (*tcb).sched_lock                         (per-TCB Scheduling-group serializer)
+        │
+        ▼
+   per-CPU scheduler.lock                    (inner; run-queue list structure only)
 ```
 
 **Acquisition rules (MUST):**
 
-1. **scheduler.lock is outermost on the IPC-blocking path.** Every IPC syscall handler (`sys_endpoint_call`, `sys_notification_wait`, `sys_event_recv`, `sys_wait_set_wait`, etc.) acquires the calling CPU's `scheduler.lock` before entering the IPC primitive's code. The IPC primitive is then permitted to acquire its own source lock under that scheduler lock.
+1. **The source IPC lock is outermost on the IPC-blocking path; `(*tcb).sched_lock` sits beneath it and above the per-CPU scheduler.lock.** Every IPC syscall handler (`sys_endpoint_call`, `sys_notification_wait`, `sys_event_recv`, `sys_wait_set_wait`, etc.) acquires the relevant source lock (`sig.lock` | `ep.lock` | `eq.lock` | `ws.lock`) first; the park-commit then acquires the parking thread's `(*tcb).sched_lock` (via `commit_blocked_under_local_lock`), and the run-queue link acquires the per-CPU scheduler.lock under that. `(*tcb).sched_lock` is the single authoritative serializer of the TCB's Scheduling field group (`{state, ipc_state, queued_on, run_queue_next, preferred_cpu, blocked_on_object, wake_pending}`), keyed on the TCB pointer rather than on whichever CPU's queue currently links it. The per-CPU scheduler.lock no longer guards any TCB's `state`; it guards only that CPU's run-queue list structure (head/tail/`non_empty`/load). See § Cross-CPU TCB Ownership.
 
 2. **At most one source IPC lock at a time.** A code path holding `sig.lock` MUST NOT acquire `ep.lock`, `eq.lock`, or `ws.lock`. The single exception is `waitset_notify`, which is invoked from within a source lock (the source notifying the wait set) and acquires `ws.lock` as the inner lock — order `source.lock → ws.lock` only.
 
 3. **`SLEEP_LIST_LOCK` is leaf-only.** It MAY be acquired from inside any source IPC lock. It MUST NOT contain calls that re-enter IPC or scheduler code while held.
 
-4. **Cross-CPU scheduler-lock acquisition rule.** When a code path needs two CPU's `scheduler.lock`s simultaneously, the lower-numbered CPU's lock MUST be acquired first. Live production sites: `sched::migrate_ready_thread` (used by `sys_thread_set_affinity` active migration and the periodic load balancer), `dealloc_object(Thread)` (all-CPU walk in ascending order), `sched::set_state_under_all_locks` (lifecycle state writes), and `sys_thread_set_priority` (priority writes plus locate-and-relocate of the Ready TCB's queue entry — all-CPU walk in ascending order).
+4. **Per-TCB-then-cross-CPU acquisition rule.** A path mutating a TCB's Scheduling field group MUST acquire `(*tcb).sched_lock` FIRST (outermost among the scheduler locks), THEN any per-CPU scheduler.lock(s); when two or more per-CPU scheduler.locks are needed simultaneously, they MUST be taken in ascending-CPU order. Live production sites: `sched::migrate_ready_thread` (used by `sys_thread_set_affinity` active migration and the periodic load balancer; `(*tcb).sched_lock` then the two CPU locks ascending), `dealloc_object(Thread)` (`(*tcb).sched_lock` then the all-CPU walk in ascending order), `sched::set_state_under_all_locks` (lifecycle state writes; same shape), and `sys_thread_set_priority` (priority writes plus locate-and-relocate of the Ready TCB's queue entry; `(*tcb).sched_lock` then the all-CPU walk in ascending order). A path MUST NEVER hold two different TCBs' `sched_lock`s at once — `schedule()`'s outgoing-then-incoming flip releases `current.sched_lock` before acquiring `next.sched_lock`.
 
-5. **`enqueue_and_wake` MUST be invoked with no IPC source lock held.** A primitive that wakes a TCB (e.g. `notification_send`, `event_queue_post`, `waitset_notify`, `endpoint_call`'s server-wake branch, `endpoint_reply`) snapshots the wake parameters under its source lock, releases the source lock, then calls `enqueue_and_wake`. `enqueue_and_wake` acquires the *target CPU*'s scheduler.lock and dispatches an IPI; holding any source lock across that call would introduce a `source.lock → scheduler.lock` ordering that does not exist in the hierarchy. The same rule governs `dec_ref → dealloc_object` from a wait-set path: `wait_set_drop` releases its source/ws locks before reporting any zero-refcount source back to `dealloc_object_one`'s cascade worklist.
+5. **`enqueue_and_wake` / `enqueue_ready_thread` acquire `(*tcb).sched_lock` then the target CPU's scheduler.lock.** They MAY be called WITH the source IPC lock still held OR after releasing it, because `source → (*tcb).sched_lock → run-queue lock` is exactly the hierarchy — there is no `source.lock → scheduler.lock` edge to violate. The single-waiter wakers (`notification_send`, `event_queue_post`, `endpoint_call`'s server-wake branch, `endpoint_reply`, and the `event_queue_drop` / `notification_dealloc` single-waiter dealloc wakes) snapshot the payload and set `wake_in_flight` under the source lock, RELEASE the source lock, then call `enqueue_and_wake` — releasing first bounds source-lock hold-time. The `endpoint_dealloc` send/recv drain instead HOLDS `ep.lock` across the per-waiter `enqueue_and_wake` walk (a multi-waiter drain; sound precisely because the order is canonical, and `wake_in_flight = 1` per waiter blocks a racing `dealloc(waiter)` unlink from freeing a TCB mid-wake). `enqueue_and_wake` dispatches its wakeup IPI only after BOTH the run-queue lock and `(*tcb).sched_lock` are released (never IPI under `sched_lock`). `pull_unpinned_ready` is the one site that takes `(*tcb).sched_lock` via `try_lock_raw` while already holding a run-queue lock — the inverse of the canonical order; the `try` backs off on contention (a canonical holder makes it fail), so it is deadlock-free, and the source CPU's run-queue lock pins the candidate so the pointer cannot be freed under it. The wait-set cascade rule is unchanged in spirit: `wait_set_drop` releases its source/ws locks before reporting any zero-refcount source back to `dealloc_object_one`'s cascade worklist, so the source's own dealloc runs after every IPC source/ws lock has been released.
 
 6. **Derivation tree lock is ordered after IPC object locks.** `SYS_CAP_REVOKE` MUST NOT acquire IPC object locks while holding the derivation tree write lock — see [capability-internals.md](capability-internals.md) for the deferred-cleanup pattern.
 
-7. **`cancel_ipc_block` MUST acquire the source lock matching `tcb.ipc_state`.** Every read or write of `source.waiter` (or the equivalent intrusive-queue field) requires the source lock; reads from non-owning CPUs without the source lock are races. The dealloc paths in `core/kernel/src/cap/object.rs` (Endpoint, Notification, EventQueue, WaitSet, and Thread arms) follow the same rule.
+7. **`cancel_ipc_block` MUST acquire the source lock matching `tcb.ipc_state`.** It first snapshots `(state, ipc_state, blocked_on_object)` under `(*tcb).sched_lock` (the authoritative serializer; a bare read would race `enqueue_and_wake` / `commit_blocked` and observe a torn binding) and returns early if the thread is no longer `Blocked` — a concurrent waker won, so there is nothing to cancel. `sched_lock` is released BEFORE the source lock is taken (lock order is source IPC → `sched_lock`, so the two are never nested). Every read or write of `source.waiter` (or the equivalent intrusive-queue field, including the server's `reply_tcb` for `BlockedOnReply`/`BlockedOnFault`) then requires the matching source lock; reads from non-owning CPUs without it are races. The dealloc paths in `core/kernel/src/cap/object.rs` (Endpoint, Notification, EventQueue, WaitSet, and Thread arms) follow the same source-lock rule.
 
-8. **Blocking commit MUST go through `commit_blocked_under_local_lock`.** A primitive that parks the calling thread (`notification_wait`, `event_queue_recv`, `endpoint_call`, `endpoint_recv`, `waitset_wait`) MUST commit the `Running → Blocked` transition via `crate::sched::commit_blocked_under_local_lock(tcb, ipc_state, blocked_on)`. The helper acquires the *current CPU*'s scheduler.lock, reads `state`, and only writes `Blocked` if `state ∈ {Running, Ready}`. On a `false` return (a concurrent `set_state_under_all_locks(Stopped)` has already won) the caller MUST roll back the source-side waiter registration before releasing the source IPC lock. Direct writes to `(*tcb).state = Blocked` from outside the local sched.lock are forbidden — they race the all-locks `Stopped` write in `sys_thread_stop` and silently clobber it. Lock order: source IPC lock (outer, held by the IPC primitive) → current CPU's scheduler.lock (inner, acquired by `commit_blocked_under_local_lock`).
+8. **Blocking commit MUST go through `commit_blocked_under_local_lock`.** A primitive that parks the calling thread (`notification_wait`, `event_queue_recv`, `endpoint_call`, `waitset_wait`) MUST commit the `Running → Blocked` transition via `crate::sched::commit_blocked_under_local_lock(tcb, ipc_state, blocked_on)`. The helper acquires `(*tcb).sched_lock` (NOT the CPU lock), reads `state`, and writes `Blocked` only if `state ∈ {Running, Ready}` AND `wake_pending` is clear. It returns `false` — refusing to park — in two cases the caller handles identically: a concurrent `set_state_under_all_locks(Stopped|Exited)` already won (then `schedule()` drains the thread), or `wake_pending` is set (a waker raced ahead, found the thread still live, coalesced its link, and recorded the wake under `sched_lock`; the helper consumes the flag and leaves the thread `Running`, and `schedule()` requeues the runnable thread so it resumes and consumes the already-deposited payload). On `false` the caller MUST roll back the source-side waiter registration AND MUST NOT clobber any deposited `wakeup_value`/`ipc_msg`. `commit_reply_rebind_under_local_lock` is the sibling for `endpoint_recv`'s `BlockedOnSend → BlockedOnReply`/`BlockedOnFault` rebind of an already-`Blocked` send-queue-dequeued caller: it writes `ipc_state`/`blocked_on_object` under `(*tcb).sched_lock` (serialising the reply-binding publication with dealloc's `Exited` mark), returning `false` if a stop/exit already won, in which case `endpoint_recv` tears the binding down. Direct writes to `(*tcb).state = Blocked` from outside `sched_lock` are forbidden — they race the all-locks `Stopped` write in `sys_thread_stop` and silently clobber it. Lock order: source IPC lock (outer, held by the IPC primitive) → `(*tcb).sched_lock` (inner, acquired by the commit helper).
 
-9. **Wake commit MUST go through `enqueue_and_wake`.** Wake primitives MUST NOT write `(*tcb).state = Ready`, `ipc_state = None`, or `blocked_on_object = null` themselves under the source IPC lock; they MUST snapshot the wakeup payload (`wakeup_value`, `timed_out`) under the source lock and delegate the state writes to `enqueue_and_wake`, which performs them under the target CPU's scheduler.lock. The function reads `state` first; if `Stopped` or `Exited` the enqueue is *skipped* entirely (preventing UAF when a concurrent `dealloc_object(Thread)` is racing the wake). This rule applies equally to dealloc-time wake walks (`endpoint_dealloc` send/recv heads, `notification_dealloc` waiter, `event_queue_drop`, `wait_set_drop`).
+9. **Wake commit MUST go through `enqueue_and_wake`.** Wake primitives MUST NOT write `(*tcb).state = Ready`, `ipc_state = None`, or `blocked_on_object = null` themselves under the source IPC lock; they snapshot the wakeup payload (`wakeup_value`, `timed_out`) under the source lock and delegate the state writes to `enqueue_and_wake`, which performs them under `(*tcb).sched_lock` → the target CPU's run-queue lock. The function reads `state` under `sched_lock` first and classifies: a `Blocked`/`Created` target is linked (`state=Ready`/`ipc_state=None`/`blocked_on_object=null` written, then enqueued); a `Running`/`Ready`/`Stopped`/`Exited` target is *coalesced* (not linked). `Running` additionally records `wake_pending` (the wake-before-park net rule 8 consumes); `Ready` is an already-linked same-event duplicate; `Stopped`/`Exited` mean a concurrent `dealloc_object(Thread)` or stop already won (preventing UAF / a re-introduced run-queue entry over a being-freed TCB). Every exit path clears the target's `wake_in_flight` so a waiting `dealloc_object(Thread)` can proceed. This rule applies equally to dealloc-time wake walks (`endpoint_dealloc` send/recv heads, `notification_dealloc` waiter, `event_queue_drop`, `wait_set_drop`). The DELIBERATE-placement sibling `enqueue_ready_thread` does NOT classify `state` — it unconditionally forces `→Ready` and links; it is used only where the caller owns the `→Ready` transition and has established the thread is not live on any CPU (`sys_thread_start` first-start/resume), since routing those through the gated `enqueue_and_wake` would coalesce their `Ready` target and strand it.
 
 **Lock primitive.** All locks above are `crate::sync::Spinlock` (IRQ-disabling). Hold-time MUST be bounded (target ~10 µs on x86_64); no page-table walks, buddy allocations, IPC syscalls, or other long-latency operations under any spinlock.
 
@@ -80,24 +83,24 @@ The transition table below pins every ThreadState write to a syscall/event, the 
 | From | To | Trigger | Performing CPU | Locks / canonical helper |
 |---|---|---|---|---|
 | (uninit) | `Created` | `sys_cap_create_thread` | calling CPU | none (TCB not yet visible) |
-| `Created` | `Ready` | `sys_thread_start` (first start) | calling CPU | `set_state_under_all_locks(Ready)` then `enqueue_and_wake(target_cpu)` |
-| `Stopped` | `Ready` | `sys_thread_start` (resume from stop) | calling CPU | `set_state_under_all_locks(Ready)` then `enqueue_and_wake(target_cpu)` |
-| `Ready` | `Running` | `schedule()` selecting next | running CPU | running CPU's scheduler.lock |
-| `Running` | `Ready` | `schedule(requeue_current=true)` (yield, preempt) | running CPU | running CPU's scheduler.lock; if `cpu_affinity` excludes the running CPU the requeue is routed cross-CPU via `enqueue_and_wake(target_cpu)` after dropping the local lock |
-| `Ready` (on CPU A) | `Ready` (on CPU B) | `sys_thread_set_affinity` (active migration) or periodic load balancer | calling CPU | `migrate_ready_thread(tcb, A, B)`; both scheduler.locks held in ascending-CPU order |
-| `Running` | `Blocked` | IPC blocking entry (`endpoint_call/recv`, `notification_wait`, `event_queue_recv`, `waitset_wait`) | running CPU | `commit_blocked_under_local_lock(tcb, ipc, blocked_on)`; on `false` the IPC primitive rolls back its waiter registration |
+| `Created` | `Ready` | `sys_thread_start` (first start) | calling CPU | `set_state_under_all_locks(Ready)` then `enqueue_ready_thread(target_cpu)` (deliberate placer — NOT the gated `enqueue_and_wake`, which would coalesce a `Ready` target) |
+| `Stopped` | `Ready` | `sys_thread_start` (resume from stop) | calling CPU | `set_state_under_all_locks(Ready)` then `enqueue_ready_thread(target_cpu)` |
+| `Ready` | `Running` | `schedule()` selecting next | running CPU | `next.sched_lock` (the incoming dispatch flip; serialises with a concurrent `enqueue_and_wake(next)` which then coalesces) |
+| `Running` | `Ready` | `schedule(requeue_current=true)` (yield, preempt) | running CPU | `current.sched_lock` (outer) → running CPU's scheduler.lock (inner); if `cpu_affinity` excludes the running CPU the requeue is linked directly on the target CPU under `current.sched_lock` + the target run-queue lock after dropping the local lock (inlined, not via `enqueue_and_wake`, to avoid re-acquiring `current.sched_lock`) |
+| `Ready` (on CPU A) | `Ready` (on CPU B) | `sys_thread_set_affinity` (active migration) or periodic load balancer | calling CPU | `migrate_ready_thread(tcb, A, B)`; `(*tcb).sched_lock` (outer) then both scheduler.locks in ascending-CPU order (inner) |
+| `Running` | `Blocked` | IPC blocking entry (`endpoint_call`, `notification_wait`, `event_queue_recv`, `waitset_wait`) | running CPU | `commit_blocked_under_local_lock(tcb, ipc, blocked_on)` (acquires `(*tcb).sched_lock`); on `false` (a stop/exit won, or `wake_pending` forced a refuse-to-park) the IPC primitive rolls back its waiter registration without clobbering the deposited payload. `endpoint_recv`'s dequeued sender rebinds via `commit_reply_rebind_under_local_lock` instead |
 | `Blocked` | `Ready` | IPC wake (`notification_send`, `event_queue_post`, `endpoint_reply`, `endpoint_call` server-wake, `waitset_notify`) | wake-issuing CPU | source IPC lock to snapshot wakeup payload, *released*, then `enqueue_and_wake(target_cpu)` |
 | `Blocked` | `Ready` | timeout from sleep list | timer-firing CPU | `SLEEP_LIST_LOCK` to drain expired entries (released first), then source IPC lock to arbitrate `(*src).waiter == tcb` and write the wake payload, then `enqueue_and_wake(target_cpu)` |
-| `Blocked` | `Ready` | `cancel_ipc_block` (called from `sys_thread_stop` on a blocked target) | calling CPU | scheduler.lock (already held by caller) + source IPC lock matching `tcb.ipc_state` |
+| `Blocked` | `Ready` | `cancel_ipc_block` (called from `sys_thread_stop` on a blocked target) | calling CPU | `(*tcb).sched_lock` to snapshot `(state, ipc_state, blocked_on_object)` and re-verify `Blocked` (released first), then the source IPC lock matching `tcb.ipc_state` to clear the binding |
 | `Running` | `Blocked` (`BlockedOnFault`) | fault redirection — `ipc::fault::fault_dispatch` delivering a kernel-unresolvable fault to the thread's bound handler endpoint | running CPU (arch fault handler) | `commit_blocked_under_local_lock(tcb, BlockedOnFault, handler)`; kernel-synthesized, the faulter takes the caller role in the endpoint call/reply machinery |
 | `Blocked` (`BlockedOnFault`) | `Ready` | fault reply (`sys_ipc_reply`) or cancellation (handler death via `server_reply_wake`, `cancel_ipc_block`, `dealloc_object(Thread)` unlink, endpoint-dealloc send-drain) | wake-issuing CPU | the wake-claim winner records `fault_outcome` (`Resume`/`Kill`) then `enqueue_and_wake(target_cpu)`; the faulter resumes inside `fault_dispatch` (re-executing its faulting instruction or running the kill path) rather than returning a syscall value |
 | `Running` | `Stopped` | `sys_thread_stop` on running target | calling CPU | `set_state_under_all_locks(Stopped)`; if running on a remote CPU, `prod_remote_cpu(run_cpu)` and spin until `sched_remote.current != tcb` |
 | `Ready` | `Stopped` | `sys_thread_stop` on a Ready target | calling CPU | `set_state_under_all_locks(Stopped)`; the helper also walks every CPU's run queue and calls `remove_from_queue` inside the all-locks region. See § *Stopped/Exited drain* below. |
 | `Blocked` | `Stopped` | `sys_thread_stop` on blocked target | calling CPU | `cancel_ipc_block` first (acquires the source IPC lock and unlinks the waiter), then `set_state_under_all_locks(Stopped)` |
 | `*` | `Exited` | `sys_thread_exit` (self) or fault handler | running CPU | `set_state_under_all_locks(Exited)` (on the dying CPU), then `schedule(false)` |
-| `*` | `Exited` | `dealloc_object(Thread)` (refcount → 0) | calling CPU | acquires every CPU's scheduler.lock in ascending order, writes `Exited`, walks `remove_from_queue` for every CPU, releases all; then waits unconditionally for `sched.current != tcb` on *every* CPU *and* `tcb.context_saved == 1` (see Cross-CPU TCB Ownership) before freeing |
+| `*` | `Exited` | `dealloc_object(Thread)` (refcount → 0) | calling CPU | acquires `(*tcb).sched_lock` (outer), then every CPU's scheduler.lock in ascending order, writes `Exited`, walks `remove_from_queue` for every CPU, releases all; then waits unconditionally for `sched.current != tcb` on *every* CPU *and* `tcb.context_saved == 1` (see Cross-CPU TCB Ownership) before freeing |
 
-All `Running→Blocked` parks MUST route through `commit_blocked_under_local_lock`; all `Blocked→Ready` wakes MUST route through `enqueue_and_wake`. Direct `(*tcb).state` writes from an IPC primitive — under the source lock or otherwise — are forbidden; they race `set_state_under_all_locks(Stopped)` and silently clobber Stopped.
+All `Running→Blocked` parks MUST route through `commit_blocked_under_local_lock` (or `commit_reply_rebind_under_local_lock` for `endpoint_recv`'s rebind); all `Blocked→Ready` *wakes* MUST route through `enqueue_and_wake`. The deliberate `→Ready` *placements* that the caller owns (the thread is provably not live) route through `enqueue_ready_thread` instead — currently only `sys_thread_start`. Direct `(*tcb).state` writes from an IPC primitive — under the source lock or otherwise — are forbidden; they race `set_state_under_all_locks(Stopped)` and silently clobber Stopped.
 
 **Sleep-list coordination (issue #117).** When a wake source (`notification_send`,
 `event_queue_post`, `cancel_ipc_block`) wakes a waiter that was registered with
@@ -115,65 +118,70 @@ MUST also walk every CPU's run queue and call `remove_from_queue(tcb, priority)`
 inside the all-locks region — leaving the stale `Ready` entry for the
 dispatch-side skip loop to drain (the previous design) is unsound: a subsequent
 Stopped→Ready transition followed by `enqueue_and_wake` could race the drain
-and produce two list entries for the same TCB. The skip loop at
-`sched/mod.rs:1967-1976` remains as defence-in-depth and as the drain mechanism for
-legitimate paths that bypass `set_state_under_all_locks` (none currently). The
-priority snapshot uses `(*tcb).priority` read under all-CPU locks; this is
+and produce two list entries for the same TCB. The skip loop in `schedule()`
+(`sched/mod.rs`, the `dequeue_highest` Stopped/Exited skip) remains as
+defence-in-depth and as the drain mechanism for legitimate paths that bypass
+`set_state_under_all_locks` (none currently). The priority snapshot uses
+`(*tcb).priority` read under `(*tcb).sched_lock` + all-CPU locks; this is
 consistent with the matching reads in `dealloc_object(Thread)` and
 `sys_thread_set_priority`, which all read/write the Scheduling field group
-under the same all-CPU-locks discipline.
+under the same `(*tcb).sched_lock`-outer / all-CPU-locks discipline.
 
 **Priority change of a Ready TCB (issue #122).** `sys_thread_set_priority`
-writes `(*tcb).priority` and, when the target is `Ready`, relocates its
-queue entry under every CPU's `scheduler.lock` acquired in ascending order.
-Identifying the home CPU is itself a read of the Scheduling field group, so
-the syscall scans each scheduler with `remove_from_queue(tcb, old_prio)`
-and re-enqueues on the same scheduler at the new priority via
-`PerCpuScheduler::enqueue`. The all-locks region serialises this against
+acquires `(*tcb).sched_lock` (outer), then writes `(*tcb).priority` and, when the
+target is `Ready`, relocates its queue entry under every CPU's `scheduler.lock`
+acquired in ascending order (inner). `sched_lock` is what makes the `state` read
+race-free against `enqueue_and_wake` / `commit_blocked` / `schedule` — those all
+write the Scheduling group under the same per-TCB lock. Identifying the home CPU
+is itself a read of the Scheduling field group, so the syscall scans each
+scheduler with `remove_from_queue(tcb, old_prio)` and re-enqueues on the same
+scheduler at the new priority via `PerCpuScheduler::enqueue`. The
+`sched_lock`-outer / all-locks region serialises this against
 `migrate_ready_thread`, `dealloc_object(Thread)`, and
 `set_state_under_all_locks`.
 
 The "Ready ⇒ linked on exactly one queue" invariant has a transient
 exception during any window where a caller publishes `state = Ready` on
-a TCB but the matching `enqueue_and_wake` has not yet acquired the
+a TCB but the matching link primitive has not yet acquired the
 destination scheduler's lock. The known sites are:
 
 - `schedule()`'s cross-CPU outgoing branch
   (`core/kernel/src/sched/mod.rs`), which writes `state = Ready` under
-  the local sched.lock, releases that lock, and only then calls
-  `enqueue_and_wake` on the destination CPU's lock.
+  `current.sched_lock`, releases the local run-queue lock, and only then
+  links `current` directly on the destination CPU's queue (under the
+  still-held `current.sched_lock` + the destination run-queue lock).
 - `sys_thread_start` (`core/kernel/src/syscall/thread.rs`), which calls
   `set_state_under_all_locks(target, Ready)` to commit the state
-  transition and then a separate `enqueue_and_wake(target_cpu)` to
+  transition and then a separate `enqueue_ready_thread(target_cpu)` to
   commit the queue link.
-- `dealloc_object(Thread)`'s server-side reply wake
-  (`core/kernel/src/cap/object.rs`), which writes `state = Ready` on
-  the bound client under all-CPU locks and defers the matching
-  `enqueue_and_wake(bound)` until after the all-locks region releases
-  (the enqueue itself acquires a sched.lock, so it cannot run under
-  the outer all-locks region — see Lock Hierarchy rule 5).
+
+(`dealloc_object(Thread)`'s server-side reply wake is no longer such a
+site: it leaves the bound client `Blocked` and routes the deferred wake
+through the gated `enqueue_and_wake`, which writes the client's
+Scheduling-group fields under the *client's* own `sched_lock` and aborts
+the link if a concurrent `dealloc(client)` already marked it `Exited` —
+so no `Ready`-with-no-link window is published for that path.)
 
 In each window the TCB is observably `Ready` with no queue link. A
-racing `sys_thread_set_priority` taking the all-CPU-locks region sees
-no scheduler claim the TCB in its locate scan; it writes the new
-priority and falls through without relocating. The pending
-`enqueue_and_wake` then reads `(*tcb).priority` under the destination
-lock — `enqueue_and_wake` takes no caller-supplied priority — and links
-the TCB at whichever value was last committed under lock. No desync
+racing `sys_thread_set_priority` taking the `sched_lock`-outer / all-CPU-locks
+region sees no scheduler claim the TCB in its locate scan; it writes the new
+priority and falls through without relocating. The pending link then reads
+`(*tcb).priority` under the destination run-queue lock — neither
+`enqueue_and_wake` nor `enqueue_ready_thread` takes a caller-supplied priority —
+and links the TCB at whichever value was last committed under lock. No desync
 results.
 
 `migrate_ready_thread` (`core/kernel/src/sched/mod.rs`) is the other
-known consumer of this transient. Under both source and destination
-scheduler locks it re-reads `state` and `preferred_cpu` and proceeds
-only if `state == Ready && preferred_cpu == src_cpu`; the cross-CPU
-outgoing branch updates `preferred_cpu` inside the pending
-`enqueue_and_wake` (under the destination's lock), so during the
-transient the function still observes the stale `preferred_cpu`
-naming `src_cpu` and walks `src_cpu`'s priority queue. The walk finds
-nothing (the TCB is unlinked). `migrate_ready_thread` returns `false`
-and leaves the pending `enqueue_and_wake` to place the TCB; the next
-caller of `migrate_ready_thread` (or the load balancer) re-runs the
-migration if still warranted.
+known consumer of this transient. It acquires `(*tcb).sched_lock` (outer)
+then both run-queue locks (ascending), reads `state` authoritatively under
+`sched_lock`, and proceeds only if `state == Ready` AND
+`remove_from_queue(src_cpu)` succeeds — the on-`src` remove is the sole
+"located on src" arbiter (the earlier `preferred_cpu == src_cpu` heuristic
+was dropped). During the transient, `tcb` is Ready-but-unlinked, so the
+`remove_from_queue` returns `false`; `migrate_ready_thread` returns `false`
+and leaves the pending link to place the TCB. The next caller of
+`migrate_ready_thread` (or the load balancer) re-runs the migration if still
+warranted.
 
 `PerCpuScheduler::enqueue` (not `change_priority`) is the correct primitive
 for the syscall's re-enqueue half: `change_priority`'s enqueue is
@@ -226,14 +234,16 @@ The TCB is owned in pieces. Different field groups have different lock disciplin
 
 | Field group | Fields | Owning lock | Cross-CPU access rule |
 |---|---|---|---|
-| **Scheduling** | `state`, `priority`, `slice_remaining`, `cpu_affinity`, `preferred_cpu`, `run_queue_next` | The scheduler.lock of whichever CPU's run queue currently links the TCB. For threads not on any run queue (blocked or running), the *home* CPU's scheduler.lock — the one that would re-enqueue on wake. | Cross-CPU writers MUST acquire the home CPU's scheduler.lock. |
-| **IPC blocking** | `ipc_state`, `blocked_on_object`, `ipc_msg`, `ipc_wait_next`, `wakeup_value`, `timed_out` | The source IPC lock matching `ipc_state` (or `None` if not blocked). | Cross-CPU writers MUST acquire the matching source lock; reads from another CPU MUST do the same. |
-| **Reply slot** | `reply_tcb` | `AtomicPtr<ThreadControlBlock>`; lock-free with `Acquire`/`Release` ordering, and `compare_exchange` for cancel. | Endpoint paths set/clear it under `ep.lock`; cancel/dealloc paths on a remote CPU use `compare_exchange(client, null)` so they never clobber a different client's binding. `reply_tcb` is the one TCB field with no single owning lock — multiple lock domains write it (the various `endpoint_*` paths under `ep.lock`, plus `cancel_ipc_block`, the `dealloc_object(Thread)` reply-bound waker, and the fault-redirection reply/cancel paths, from outside any lock), which is why it is atomic. The fault redirection (`BlockedOnFault`) reuses this slot identically: `fault_dispatch` parks the faulter exactly as a caller, so every CAS claimant arbitrates over the same slot. **The binding must be published consistently with the `(ipc_state, blocked_on_object)` pair `dealloc_object(Thread)` uses to find and clear it (#289):** `endpoint_call` commits that pair under the scheduler lock via `commit_blocked_under_local_lock`; the `BlockedOnSend → BlockedOnReply` rebind in `endpoint_recv` does the same via `commit_reply_rebind_under_local_lock`, serialising with dealloc's all-CPU-locks `Exited` mark. If the caller died concurrently the commit fails and `endpoint_recv` tears the binding down (CAS `reply_tcb` back to null, clear `wake_in_flight`) before skipping the dead sender — without this, dealloc reads a stale `BlockedOnSend` state, takes the wrong unlink arm, and leaves a dangling `reply_tcb` that fires against the freed/reused slot (#289 use-after-free / double-enqueue; #284 TCB-field corruption). |
+| **Scheduling** | `state`, `ipc_state`, `queued_on`, `run_queue_next`, `preferred_cpu`, `blocked_on_object`, `wake_pending` (plus `priority`, `slice_remaining`, `cpu_affinity`) | `(*tcb).sched_lock` — the single authoritative serializer, keyed on the TCB pointer (NOT positional). The same lock owns the group regardless of which CPU's run queue currently links the TCB, or whether it is linked at all. | Cross-CPU writers MUST acquire `(*tcb).sched_lock`. The per-CPU `scheduler.lock` is held *under* `sched_lock` only for the run-queue list structure (the intrusive `run_queue_next` link, `queued_on` tag, head/tail/`non_empty`/load); it no longer owns `state`. `wake_pending` is part of this group and is a plain `bool` accessed only under `sched_lock` (the lock-serialized wake-before-park refuse-to-park flag). |
+| **IPC blocking** | `ipc_state`, `blocked_on_object` (committed under `sched_lock`; arbitrated under the source lock), `ipc_msg`, `ipc_wait_next`, `wakeup_value`, `timed_out` | For the `(ipc_state, blocked_on_object)` pair, both `(*tcb).sched_lock` (the commit / clear in `commit_blocked_under_local_lock` / `commit_reply_rebind_under_local_lock` / `enqueue_and_wake` / `cancel_ipc_block`'s snapshot) AND the source IPC lock matching `ipc_state` (the waiter-slot arbitration). The remaining fields (`ipc_msg`, `ipc_wait_next`, `wakeup_value`, `timed_out`) are owned by the source IPC lock alone. | A cross-CPU writer of the `(ipc_state, blocked_on_object)` pair MUST hold `sched_lock`; a writer of `source.waiter`/`ipc_wait_next` or the wakeup payload MUST hold the matching source lock; reads from another CPU MUST do the same. The two locks are never nested (order is source → `sched_lock`, but each commit/clear takes them disjointly). |
+| **Reply slot** | `reply_tcb` | `AtomicPtr<ThreadControlBlock>`; lock-free with `Acquire`/`Release` ordering, and `compare_exchange` for cancel. | Endpoint paths set/clear it under `ep.lock`; cancel/dealloc paths on a remote CPU use `compare_exchange(client, null)` so they never clobber a different client's binding. `reply_tcb` is the one TCB field with no single owning lock — multiple lock domains write it (the various `endpoint_*` paths under `ep.lock`, plus `cancel_ipc_block`, the `dealloc_object(Thread)` reply-bound waker, and the fault-redirection reply/cancel paths, from outside any lock), which is why it is atomic. The fault redirection (`BlockedOnFault`) reuses this slot identically: `fault_dispatch` parks the faulter exactly as a caller, so every CAS claimant arbitrates over the same slot. **The binding must be published consistently with the `(ipc_state, blocked_on_object)` pair `dealloc_object(Thread)` uses to find and clear it (#289):** `endpoint_call` commits that pair under `(*tcb).sched_lock` via `commit_blocked_under_local_lock`; the `BlockedOnSend → BlockedOnReply` rebind in `endpoint_recv` does the same via `commit_reply_rebind_under_local_lock`, serialising with dealloc's `Exited` mark on the shared per-TCB `sched_lock` (dealloc takes `sched_lock` outer before its all-CPU locks). If the caller died concurrently the commit fails and `endpoint_recv` tears the binding down (CAS `reply_tcb` back to null, clear `wake_in_flight`) before skipping the dead sender — without this, dealloc reads a stale `BlockedOnSend` state, takes the wrong unlink arm, and leaves a dangling `reply_tcb` that fires against the freed/reused slot (#289 use-after-free / double-enqueue; #284 TCB-field corruption). |
 | **Context save/restore** | `saved_state`, `kernel_stack_top`, `trap_frame`, `context_saved` | Owning-CPU's scheduler.lock for read; the running CPU writes `saved_state` during `context::switch` (no lock; write is serialised with the next reader by `context_saved` Acquire/Release). | A remote CPU dequeueing this TCB MUST spin-wait on `context_saved` (Acquire load) before reading any other context field. |
 | **Address-space / capability** | `address_space`, `cspace`, `iopb` | Set once at create-time / configure-time; treated as read-only after `sys_thread_start`. | No cross-CPU write is permitted; reads need no lock. |
 | **Identity** | `thread_id`, `magic` | Immutable after construction. | Read freely. |
 | **IPC buffer** | `ipc_buffer` | Set by `SYS_IPC_BUFFER_SET`; logically owned by the thread itself. | The thread reads it under no lock from its own kernel-mode syscall path; other CPUs MUST NOT read it. |
 | **Death observers** | `death_observers`, `death_observer_count`, `sleep_deadline` | Owning-CPU's scheduler.lock for `death_observers`/`death_observer_count`; for `sleep_deadline`, the source IPC lock that initiated the timed wait + `SLEEP_LIST_LOCK`. | Cross-CPU writes follow the per-field rule above. |
+
+**`sched_lock` (`core/kernel/src/sched/thread.rs`).** A per-TCB IRQ-disabling ticket `Spinlock` (the same `crate::sync::Spinlock` as every other lock here), keyed on the TCB pointer. It is not an atomic, but it is the serializer the entire Scheduling field group depends on; the per-TCB keying is what collapses the positional-ownership race class — two CPUs can no longer select two different locks for one TCB. Lock order: source IPC lock → `(*tcb).sched_lock` → per-CPU `scheduler.lock`. A path MUST NEVER hold two different TCBs' `sched_lock`s simultaneously.
 
 **Magic-cookie discipline.** `magic == TCB_MAGIC` MUST be read on every dereference of a TCB pointer that crossed a CPU boundary or came from an intrusive list (run queue, IPC wait queue, sleep list, death observer). `core/kernel/src/sched/run_queue.rs:223,272` already does this for run-queue ops; the same pattern applies anywhere a stale pointer might be observed.
 
@@ -241,9 +251,9 @@ The TCB is owned in pieces. Different field groups have different lock disciplin
 
 - `select_target_cpu` + `enqueue_and_wake` (`core/kernel/src/sched/mod.rs`) honour `cpu_affinity` on every placement.
 - `migrate_ready_thread` is the active-relocation primitive.
-- `schedule()`'s outgoing-thread re-enqueue branch (`core/kernel/src/sched/mod.rs:1918-1953`) routes the requeue cross-CPU when the *outgoing* thread's affinity no longer permits the current CPU.
+- `schedule()`'s outgoing-thread re-enqueue branch (`core/kernel/src/sched/mod.rs`, the `cross_cpu` arm) routes the requeue cross-CPU when the *outgoing* thread's affinity no longer permits the current CPU.
 
-The dispatch-side skip loop in `schedule()` (`core/kernel/src/sched/mod.rs:1967-1976`) only filters `Stopped` / `Exited` — it does **NOT** consult `cpu_affinity` on the *incoming* dequeued thread. A `cpu_affinity` write that lands between an `enqueue_and_wake` and the matching `migrate_ready_thread` is therefore a window in which `schedule()` on the source CPU can still dispatch the target locally in violation of the new affinity. Syscalls that mutate `cpu_affinity` and then dispatch on an unlocked state read (`sys_thread_set_affinity`) MUST bracket the read-and-act sequence with `percpu::preempt_disable` / `preempt_enable` so a local timer-driven `schedule()` cannot dispatch the target on the source CPU during the in-flight migration. See issue #116.
+The dispatch-side skip loop in `schedule()` (`core/kernel/src/sched/mod.rs`, the `dequeue_highest` Stopped/Exited skip) only filters `Stopped` / `Exited` — it does **NOT** consult `cpu_affinity` on the *incoming* dequeued thread. A `cpu_affinity` write that lands between an `enqueue_and_wake` and the matching `migrate_ready_thread` is therefore a window in which `schedule()` on the source CPU can still dispatch the target locally in violation of the new affinity. Syscalls that mutate `cpu_affinity` and then dispatch on an unlocked state read (`sys_thread_set_affinity`) MUST bracket the read-and-act sequence with `percpu::preempt_disable` / `preempt_enable` so a local timer-driven `schedule()` cannot dispatch the target on the source CPU during the in-flight migration. See issue #116.
 
 Userspace that pins a thread to one CPU then re-pins it to another (the `affinity_migrate_ready_queued` ktest pattern) has an analogous *inter-syscall* race window that no kernel guard closes: the target is legitimately Ready and on the source CPU's queue with a matching `cpu_affinity` for that CPU, so a timer-driven `schedule()` between the two syscalls correctly dispatches it locally. Tests that publish state derived from the running CPU MUST encode that state in a non-zero form (e.g. `1u64 << cpu` rather than `cpu`) so wake primitives never reject the wake on a stale-CPU run; otherwise a stale dispatch silently swallows the wake and the parent's wait parks indefinitely. See issue #116.
 
@@ -291,23 +301,35 @@ Per-arch step ordering: both arches follow the textbook sequence above literally
 Producer side (`enqueue_and_wake`, `core/kernel/src/sched/mod.rs`):
 
 ```
-1. Acquire target scheduler.lock.
-2. Read tcb.state. If Stopped or Exited, release the lock and RETURN — the
-   wake is silently dropped (a concurrent set_state_under_all_locks(Stopped)
-   or dealloc has already won; enqueueing now would re-introduce a freed or
-   stop-pending TCB into the run queue).
-3. Set tcb.state = Ready, ipc_state = None, blocked_on_object = null.
-4. Enqueue tcb in target's priority queue.
-   (Inside enqueue: non_empty.fetch_or(1 << prio, Release).)
-5. Update tcb.preferred_cpu = target_cpu (so dealloc_object targets the
-   correct scheduler).
+1. Acquire (*tcb).sched_lock (the Scheduling-group serializer; outer).
+2. Read tcb.state under sched_lock and classify:
+   - Running  → set wake_pending = true; clear wake_in_flight; release
+                sched_lock; RETURN (coalesce; the wake-before-park net —
+                commit_blocked refuses to park and the resume path delivers
+                the already-deposited payload).
+   - Ready    → clear wake_in_flight; release sched_lock; RETURN (coalesce;
+                already linked, a same-event duplicate — do NOT set
+                wake_pending).
+   - Stopped/Exited → clear wake_in_flight; release sched_lock; RETURN
+                (a concurrent stop / dealloc won; linking would re-introduce a
+                freed or stop-pending TCB).
+   - Blocked/Created → fall through to the link path.
+3. Acquire target scheduler.lock UNDER sched_lock (inner).
+4. Set tcb.state = Ready, ipc_state = None, blocked_on_object = null,
+   wake_pending = false, preferred_cpu = target_cpu; read priority under the
+   run-queue lock (so a concurrent sys_thread_set_priority's all-CPU region
+   serialises against the link).
+5. Enqueue tcb in target's priority queue.
+   (Inside enqueue: non_empty.fetch_or(1 << prio, Release); queued_on = prio.)
 6. set_reschedule_pending_for(target_cpu).
    (RESCHEDULE_PENDING.set_cpu(target_cpu, Release).)
-7. Release target scheduler.lock.
-8. wake_idle_cpu(target_cpu)  →  sends IPI (always; see below).
+7. Clear wake_in_flight (so a waiting dealloc_object(Thread) may proceed).
+8. Release target scheduler.lock (inner), then (*tcb).sched_lock (outer).
+9. wake_idle_cpu(target_cpu)  →  sends IPI (always; see below). NEVER under
+   sched_lock.
 ```
 
-The producer-side `state`/`ipc_state`/`blocked_on_object` writes belong to `enqueue_and_wake` — wake primitives MUST NOT do them under the source IPC lock. See Lock Hierarchy rule 9.
+The producer-side `state`/`ipc_state`/`blocked_on_object` writes belong to `enqueue_and_wake` (performed under `sched_lock` → run-queue lock) — wake primitives MUST NOT do them under the source IPC lock. The live/not-live classification at step 2 is the "enqueue requires not-live" gate; it is mutually exclusive with `schedule()`'s `Ready→Running` dispatch flip and `commit_blocked`'s `Running→Blocked` commit because all three contend for the same per-TCB `sched_lock`. See Lock Hierarchy rules 8 and 9.
 
 ### Target CPU selection (`select_target_cpu`)
 
@@ -327,7 +349,7 @@ cache-warmth alignment with the documented soft-affinity intent in
 to be unrelated (`CSpaceId` namespace exhaustion, see commits on
 that issue).
 
-Consumer side (`idle_thread_entry`, `core/kernel/src/sched/mod.rs:444+`):
+Consumer side (`idle_thread_entry`, `core/kernel/src/sched/mod.rs`):
 
 ```
 1. Mask interrupts.
@@ -457,10 +479,12 @@ Pairing table for every load-bearing atomic in the scheduling and IPC paths. "Lo
 |---|---|---|---|---|
 | `RESCHEDULE_PENDING` (`AtomicCpuMask`) | `sched/mod.rs:189` (decl), `:196–207` (ops) | Release on `set_reschedule_pending_for` (`set_cpu`) | AcqRel on `take_reschedule_pending` (`take_cpu`) | Release publishes the producer's prior enqueue; AcqRel ensures the consumer sees the enqueue and synchronises both directions of the bit clear. |
 | `non_empty` (per PerCpuScheduler) | `sched/run_queue.rs` (decl in `PerCpuScheduler`; writes in `enqueue`, `dequeue_highest`, `remove_from_queue`; read in `has_runnable`) | Release on `enqueue.fetch_or`, `dequeue_highest.fetch_and`, `remove_from_queue.fetch_and` | Acquire on `has_runnable.load` | Release publishes the queue-mutation stores; the lockless idle-loop Acquire is the only synchronisation edge with cross-CPU enqueues on RVWMO. |
-| `queued_on` (per TCB) | `sched/thread.rs` (decl); writes in `PerCpuScheduler::enqueue` (set to priority), `dequeue_highest` / `remove_from_queue` (set to `-1`); read in the `PerCpuScheduler::enqueue` double-link guard | Relaxed `store` | Relaxed `load` | The global single-link tag (#244/#289). Every access — set, clear, and the guard read — is performed under the owning `scheduler.lock`, which supplies all required ordering; the atomic type exists only so a cross-CPU `enqueue_and_wake` guard read of a TCB linked on *another* CPU is well-defined, not for lock-free synchronisation. A `>= 0` value means linked at that priority on the CPU that set it. |
+| `queued_on` (per TCB, `AtomicI16`) | `sched/thread.rs:249` (decl); writes in `PerCpuScheduler::enqueue` (set to priority), `dequeue_highest` / `remove_from_queue` (set to `-1`); read in the `PerCpuScheduler::enqueue` double-link guard and `schedule()`'s `already_queued` requeue guard | Relaxed `store` | Relaxed `load` | The global single-link tag (#244/#289). Every access — set, clear, and the guard reads — is performed under the owning `scheduler.lock` (the `schedule()` guard read under the current CPU's run-queue lock), which supplies all required ordering; the atomic type exists only so a cross-CPU `enqueue_and_wake` guard read of a TCB linked on *another* CPU is well-defined, not for lock-free synchronisation. A `>= 0` value means linked at that priority on the CPU that set it. |
 | `context_saved` (per TCB) | `sched/thread.rs:254` (decl) | Release after `context::switch` returns on the outgoing CPU | Acquire on the remote-dequeue spin-loop | Closes the partial-`SavedState`-visibility race on RVWMO; see [Cross-CPU TCB Ownership](#cross-cpu-tcb-ownership) for the full sequence. |
 | `bits` (Notification) | `ipc/notification.rs:39` (decl), `:109,130,237` (ops) | Relaxed `fetch_or` in `notification_send` (`:109`), Relaxed `swap` in `notification_wait` (`:237`) and `notification_send` slow path (`:130`) | (same — paired with the SeqCst fences below) | The Dekker fence pair below provides the cross-side ordering; the bits ops themselves are Relaxed because no other field needs to be synchronised relative to them. |
 | `has_observer` (Notification) + `bits` Dekker pair | `ipc/notification.rs:54` (decl) | Relaxed store on `:231` (notification_wait), Relaxed load on `:118` (notification_send) | (same) | Paired SeqCst fences in `notification_send` (`:115`, between `bits.fetch_or` and `has_observer.load`) and `notification_wait` (`:234`, between `has_observer.store` and `bits.swap`) form the Dekker pattern: either `notification_send` observes `has_observer == 1` and falls through to the slow path lock acquisition, or `notification_wait`'s swap observes the OR'd bits and returns without parking. The fences are the only ordering edge; weakening to plain `Acquire`/`Release` is **insufficient** because the read-and-write sites span two distinct atomics. |
+| `send_nonempty` (per Endpoint, `AtomicU32`) | `ipc/endpoint.rs:51` (decl); Release `store` in `EndpointState::refresh_send_ready` (called under `ep.lock` at every `send_head` mutation); Acquire `load` in `wait_set::source_is_ready` | Release `store` under `ep.lock` | Acquire `load` (lockless) | Atomic shadow of send-queue non-emptiness. The wait-set level-readiness self-heal reads it *without* `ep.lock` (taking `ep.lock` there would invert the `ep.lock → ws.lock` order `waitset_notify` uses and deadlock). The Release pairs with the lockless Acquire so a queued sender whose enqueue fired no edge notify is never missed on RVWMO (the wait-set self-heal that publishes the queue level to the lockless reader; #285-adjacent). |
+| `count` (per EventQueue, `AtomicU32`) | `ipc/event_queue.rs:53` (decl); Release `fetch_add` in `event_queue_post` (`:189`) and Release `fetch_sub` in `event_queue_recv` (`:231`), both under `eq.lock`; Acquire `load` in `wait_set::source_is_ready` | Release `fetch_add`/`fetch_sub` under `eq.lock` | Acquire `load` (lockless) | Current ring occupancy. Same discipline and rationale as `send_nonempty`: the wait-set self-heal Acquire-loads it without `eq.lock` (which it cannot take — it would invert `eq.lock → ws.lock`), and the Release stores publish the level so a non-empty queue is never missed by the lockless `source_is_ready` reader on RVWMO. Mirrors `NotificationState::bits`. (In-`lock` occupancy checks in `event_queue_post`/`recv` read it Relaxed — the lock orders those.) |
 | `RESCHEDULE_PENDING` bit (per CPU) | (same as first row) | (same) | (same) | (single entry, listed once.) |
 | `BOOT_TRANSIENT_ACTIVE` | `sched/mod.rs` (decl) | Release on `init_storage` (set true) and `sched::enter` (set false) | Acquire on every `timer_tick` entry | Single-writer (BSP). The Release/Acquire pair gates `timer_tick` against firing during Phase 4–9 when the run queue and scheduler state have not yet stabilised. |
 | `CPU_LOAD[cpu]` | `sched/run_queue.rs:35` (decl) | Relaxed on `increment_load`, `decrement_load` | Relaxed on `current_load` | Advisory: `select_target_cpu` and the periodic load balancer consult this; transient inconsistency does not violate correctness. The counter MUST track queue occupancy: every `enqueue` increments, every `dequeue_highest` / `remove_from_queue` decrements. |
@@ -473,6 +497,7 @@ Pairing table for every load-bearing atomic in the scheduling and IPC paths. "Lo
 | `SCHEDULERS_PTR`, `IDLE_TCBS_PTR`, `AP_TSS_PTR`, `AP_GDT_PTR`, `AP_IST_STACKS_PTR` | per-`AtomicPtr` declaration sites | Release on `store` in `init_storage` and per-arch initialisers | Acquire on `load` in `scheduler_ptr`, `idle_tcb_ptr`, AP startup helpers | Publishes the zeroed and constructed slab to every CPU; the Acquire establishes happens-before with the storage construction. |
 
 **Rules:**
+- The per-TCB `sched_lock` (a `crate::sync::Spinlock`, not an atomic; see § Cross-CPU TCB Ownership) is the serializer the Scheduling-group fields above rely on: `state`/`ipc_state`/`blocked_on_object`/`preferred_cpu`/`wake_pending` are plain (non-atomic) fields written under it, and `queued_on`'s atomicity exists only for a well-defined cross-CPU guard read — not for lock-free synchronisation. It is listed here for cross-reference only.
 - Any new atomic in the scheduling or IPC path MUST be added to this table with its pairing rationale before merge.
 - Any change from Release/Acquire to Relaxed (or the inverse) MUST be justified against this table; "looks fine on x86" is not justification — the riscv64 build is RVWMO and is the binding test.
 - SeqCst is permitted only where a Dekker-style fence pair is the proven pattern; new SeqCst uses MUST cite the proof.

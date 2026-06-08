@@ -2508,7 +2508,7 @@ pub unsafe fn schedule(requeue_current: bool)
                     // Leaving it stale lets a preferred_cpu-keyed path (wake
                     // routing, migrate) dispatch this thread on another CPU while
                     // it is still linked here — the residual cross-CPU
-                    // double-dispatch (docs/sched-ipc-redesign.md §8).
+                    // double-dispatch (docs/sched-ipc-redesign.md §3).
                     (*current).preferred_cpu = cpu as u32;
                     sched.enqueue(current, prio);
                 }
@@ -2561,7 +2561,7 @@ pub unsafe fn schedule(requeue_current: bool)
                 (*current).state = ThreadState::Running;
                 // Still running on THIS CPU: keep preferred_cpu authoritative
                 // (the re-mark, like the local requeue above, must not leave it
-                // stale — docs/sched-ipc-redesign.md §8).
+                // stale — docs/sched-ipc-redesign.md §3).
                 (*current).preferred_cpu = cpu as u32;
                 // A running thread carries no pending park-wake (see the
                 // dispatch flip below).

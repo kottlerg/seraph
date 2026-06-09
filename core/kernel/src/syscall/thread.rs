@@ -1051,7 +1051,7 @@ pub fn sys_sched_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // SAFETY: caller_cspace validated non-null; cspace_id is its id; both
     // children are freshly-allocated SEED-backed SchedControlObjects (refcount 1);
     // orig_obj_ptr is the live original from lookup_cap.
-    unsafe {
+    let (handle1, handle2) = unsafe {
         install_split_children(
             caller_cspace,
             cspace_id,
@@ -1062,7 +1062,11 @@ pub fn sys_sched_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             child1_ptr,
             child2_ptr,
         )
-    }
+    }?;
+    // Deliver both child handles: first in the primary return register, second
+    // in the secondary (rdx / a1). Never packed into one word (#349).
+    tf.set_ipc_return(u64::from(handle1), u64::from(handle2));
+    Ok(u64::from(handle1))
 }
 
 /// `SYS_THREAD_SET_AFFINITY` (38): set a thread's CPU affinity.

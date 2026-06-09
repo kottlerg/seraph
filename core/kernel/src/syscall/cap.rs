@@ -26,6 +26,49 @@ use syscall::SyscallError;
 #[cfg(not(test))]
 use super::current_tcb;
 
+/// Resolve a user-supplied source-cap handle for `cap_copy` / `cap_derive` /
+/// `cap_derive_badge` / `cap_move`: verify the slot is non-null and that the
+/// handle's generation matches the slot's, rejecting a stale handle to a
+/// recycled slot (#349). The index is decoded from the handle. Returns the
+/// `(tag, rights, object, badge)` a copy/derive/move needs.
+///
+/// # Safety
+/// `cspace` must be a valid `CSpace` pointer.
+#[cfg(not(test))]
+unsafe fn resolve_src_cap(
+    cspace: *mut crate::cap::cspace::CSpace,
+    handle: u32,
+) -> Result<
+    (
+        crate::cap::slot::CapTag,
+        crate::cap::slot::Rights,
+        core::ptr::NonNull<crate::cap::object::KernelObjectHeader>,
+        u64,
+    ),
+    SyscallError,
+>
+{
+    // SAFETY: cspace is a valid CSpace pointer (caller contract).
+    let cs = unsafe { &*cspace };
+    let slot = cs
+        .slot(syscall::cap_handle_index(handle))
+        .ok_or(SyscallError::InvalidCapability)?;
+    if slot.tag == crate::cap::slot::CapTag::Null
+    {
+        return Err(SyscallError::InvalidCapability);
+    }
+    if slot.generation() != syscall::cap_handle_gen(handle)
+    {
+        return Err(SyscallError::InvalidCapability);
+    }
+    Ok((
+        slot.tag,
+        slot.rights,
+        slot.object.ok_or(SyscallError::InvalidCapability)?,
+        slot.badge,
+    ))
+}
+
 /// `SYS_CAP_CREATE_ENDPOINT` (7): retype a Memory cap into a new Endpoint.
 ///
 /// arg0 = Memory-cap slot index in the caller's `CSpace`. The Memory cap
@@ -123,7 +166,7 @@ pub fn sys_cap_create_endpoint(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // SAFETY: cspace validated non-null above; lock_raw/unlock_raw paired.
     let idx_res = unsafe {
         let saved = (*cspace).lock.lock_raw();
-        let r = (*cspace).insert_cap(
+        let r = (*cspace).insert_cap_handle(
             CapTag::Endpoint,
             Rights::SEND | Rights::RECEIVE | Rights::GRANT,
             nonnull,
@@ -134,7 +177,7 @@ pub fn sys_cap_create_endpoint(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     if let Ok(idx) = idx_res
     {
-        Ok(u64::from(idx.get()))
+        Ok(u64::from(idx))
     }
     else
     {
@@ -236,14 +279,18 @@ pub fn sys_cap_create_notification(tf: &mut TrapFrame) -> Result<u64, SyscallErr
     // SAFETY: cspace validated non-null; lock_raw/unlock_raw paired.
     let idx_res = unsafe {
         let saved = (*cspace).lock.lock_raw();
-        let r = (*cspace).insert_cap(CapTag::Notification, Rights::NOTIFY | Rights::WAIT, nonnull);
+        let r = (*cspace).insert_cap_handle(
+            CapTag::Notification,
+            Rights::NOTIFY | Rights::WAIT,
+            nonnull,
+        );
         (*cspace).lock.unlock_raw(saved);
         r
     };
 
     if let Ok(idx) = idx_res
     {
-        Ok(u64::from(idx.get()))
+        Ok(u64::from(idx))
     }
     else
     {
@@ -473,7 +520,7 @@ pub fn sys_cap_create_aspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // SAFETY: cspace validated non-null above; lock_raw/unlock_raw paired.
     let idx = unsafe {
         let saved = (*cspace).lock.lock_raw();
-        let r = (*cspace).insert_cap(
+        let r = (*cspace).insert_cap_handle(
             CapTag::AddressSpace,
             Rights::MAP | Rights::READ | Rights::CONTROL,
             nonnull,
@@ -483,7 +530,7 @@ pub fn sys_cap_create_aspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     }
     .map_err(|_| SyscallError::OutOfMemory)?;
 
-    Ok(u64::from(idx.get()))
+    Ok(u64::from(idx))
 }
 
 /// `SYS_CAP_CREATE_CSPACE` (12): retype a Memory cap into a new `CSpace`,
@@ -713,7 +760,7 @@ pub fn sys_cap_create_cspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // SAFETY: cspace validated non-null above; lock_raw/unlock_raw paired.
     let insert_res = unsafe {
         let saved = (*cspace).lock.lock_raw();
-        let r = (*cspace).insert_cap(
+        let r = (*cspace).insert_cap_handle(
             CapTag::CSpace,
             Rights::INSERT | Rights::DELETE | Rights::DERIVE,
             nonnull,
@@ -745,7 +792,7 @@ pub fn sys_cap_create_cspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         return Err(SyscallError::OutOfMemory);
     };
 
-    Ok(u64::from(idx.get()))
+    Ok(u64::from(idx))
 }
 
 /// `SYS_CAP_CREATE_THREAD` (10): create a new Thread object.
@@ -957,8 +1004,11 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // SAFETY: caller_cspace validated non-null above; lock_raw/unlock_raw paired.
     let idx_res = unsafe {
         let saved = (*caller_cspace).lock.lock_raw();
-        let r =
-            (*caller_cspace).insert_cap(CapTag::Thread, Rights::CONTROL | Rights::OBSERVE, nonnull);
+        let r = (*caller_cspace).insert_cap_handle(
+            CapTag::Thread,
+            Rights::CONTROL | Rights::OBSERVE,
+            nonnull,
+        );
         (*caller_cspace).lock.unlock_raw(saved);
         r
     };
@@ -966,7 +1016,7 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     if let Ok(idx) = idx_res
     {
         let _ = kstack_virt;
-        Ok(u64::from(idx.get()))
+        Ok(u64::from(idx))
     }
     else
     {
@@ -1010,9 +1060,12 @@ pub fn sys_cap_copy(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     use crate::cap::object::CSpaceKernelObject;
     use crate::cap::slot::Rights;
 
-    let src_idx = tf.arg(0) as u32;
+    let src_handle = tf.arg(0) as u32;
+    let src_idx = syscall::cap_handle_index(src_handle);
     let dest_cs_idx = tf.arg(1) as u32;
-    let dest_slot_idx = tf.arg(2) as u32;
+    // Destination is a placement index (slot may be empty), not a live handle:
+    // decode the index, but do not generation-check it.
+    let dest_slot_idx = syscall::cap_handle_index(tf.arg(2) as u32);
     let rights_mask = Rights(tf.arg(3) as u32);
 
     // SAFETY: syscall entry ensures current_tcb() returns active thread's TCB.
@@ -1031,21 +1084,10 @@ pub fn sys_cap_copy(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     let caller_cspace_id = unsafe { (*caller_cspace).id() };
 
     // Resolve source slot (any non-null tag, any rights — just non-null).
-    let (src_tag, src_rights, src_object, src_badge) = {
-        // SAFETY: caller_cspace validated non-null above.
-        let cs = unsafe { &*caller_cspace };
-        let slot = cs.slot(src_idx).ok_or(SyscallError::InvalidCapability)?;
-        if slot.tag == crate::cap::slot::CapTag::Null
-        {
-            return Err(SyscallError::InvalidCapability);
-        }
-        (
-            slot.tag,
-            slot.rights,
-            slot.object.ok_or(SyscallError::InvalidCapability)?,
-            slot.badge,
-        )
-    };
+    // SAFETY: caller_cspace validated non-null above. Decodes + generation-
+    // checks the source handle, rejecting a stale handle to a recycled slot.
+    let (src_tag, src_rights, src_object, src_badge) =
+        unsafe { resolve_src_cap(caller_cspace, src_handle)? };
 
     // Convert src_idx to NonZeroU32 before any state mutation. The non-null
     // tag check above excludes slot 0 (which is permanently Null), so this
@@ -1141,7 +1183,16 @@ pub fn sys_cap_copy(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     }
     crate::cap::DERIVATION_LOCK.write_unlock();
 
-    Ok(u64::from(new_idx))
+    // Encode the destination slot's generation into the returned handle (#349).
+    // Re-lock the destination CSpace to read the generation soundly.
+    // SAFETY: dest_cs_ptr validated above.
+    let new_handle = unsafe {
+        let saved = (*dest_cs_ptr).lock.lock_raw();
+        let h = (*dest_cs_ptr).cap_handle(new_idx_nz);
+        (*dest_cs_ptr).lock.unlock_raw(saved);
+        h
+    };
+    Ok(u64::from(new_handle))
 }
 
 /// `SYS_CAP_DERIVE` (14): attenuate a capability within the caller's own `CSpace.`
@@ -1159,7 +1210,8 @@ pub fn sys_cap_derive(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::slot::Rights;
 
-    let src_idx = tf.arg(0) as u32;
+    let src_handle = tf.arg(0) as u32;
+    let src_idx = syscall::cap_handle_index(src_handle);
     let rights_mask = Rights(tf.arg(1) as u32);
 
     // SAFETY: syscall entry ensures current_tcb() returns active thread's TCB.
@@ -1178,21 +1230,10 @@ pub fn sys_cap_derive(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     let cspace_id = unsafe { (*caller_cspace).id() };
 
     // Resolve source slot.
-    let (src_tag, src_rights, src_object, src_badge) = {
-        // SAFETY: caller_cspace validated non-null above.
-        let cs = unsafe { &*caller_cspace };
-        let slot = cs.slot(src_idx).ok_or(SyscallError::InvalidCapability)?;
-        if slot.tag == crate::cap::slot::CapTag::Null
-        {
-            return Err(SyscallError::InvalidCapability);
-        }
-        (
-            slot.tag,
-            slot.rights,
-            slot.object.ok_or(SyscallError::InvalidCapability)?,
-            slot.badge,
-        )
-    };
+    // SAFETY: caller_cspace validated non-null above. Decodes + generation-
+    // checks the source handle, rejecting a stale handle to a recycled slot.
+    let (src_tag, src_rights, src_object, src_badge) =
+        unsafe { resolve_src_cap(caller_cspace, src_handle)? };
 
     let effective_rights = rights_mask & src_rights;
 
@@ -1230,8 +1271,6 @@ pub fn sys_cap_derive(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             _ => SyscallError::OutOfMemory,
         }
     })?;
-    let new_idx = new_idx_nz.get();
-
     // Wire derivation link.
     let src_idx_nz = core::num::NonZeroU32::new(src_idx).ok_or(SyscallError::InvalidCapability)?;
     let parent = crate::cap::slot::SlotId::current(cspace_id, src_idx_nz);
@@ -1243,7 +1282,17 @@ pub fn sys_cap_derive(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     }
     crate::cap::DERIVATION_LOCK.write_unlock();
 
-    Ok(u64::from(new_idx))
+    // Encode the new slot's generation into the returned handle (#349). Re-lock
+    // to read the generation soundly; the slot is occupied (no handle returned
+    // yet) so the value is stable.
+    // SAFETY: caller_cspace validated non-null above.
+    let new_handle = unsafe {
+        let saved = (*caller_cspace).lock.lock_raw();
+        let h = (*caller_cspace).cap_handle(new_idx_nz);
+        (*caller_cspace).lock.unlock_raw(saved);
+        h
+    };
+    Ok(u64::from(new_handle))
 }
 
 /// `SYS_CAP_DERIVE_BADGE` (48): derive a capability with a badge attached.
@@ -1263,7 +1312,8 @@ pub fn sys_cap_derive_badge(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::slot::Rights;
 
-    let src_idx = tf.arg(0) as u32;
+    let src_handle = tf.arg(0) as u32;
+    let src_idx = syscall::cap_handle_index(src_handle);
     let rights_mask = Rights(tf.arg(1) as u32);
     let badge_value = tf.arg(2);
 
@@ -1288,21 +1338,10 @@ pub fn sys_cap_derive_badge(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     let cspace_id = unsafe { (*caller_cspace).id() };
 
     // Resolve source slot.
-    let (src_tag, src_rights, src_object, src_badge) = {
-        // SAFETY: caller_cspace validated non-null above.
-        let cs = unsafe { &*caller_cspace };
-        let slot = cs.slot(src_idx).ok_or(SyscallError::InvalidCapability)?;
-        if slot.tag == crate::cap::slot::CapTag::Null
-        {
-            return Err(SyscallError::InvalidCapability);
-        }
-        (
-            slot.tag,
-            slot.rights,
-            slot.object.ok_or(SyscallError::InvalidCapability)?,
-            slot.badge,
-        )
-    };
+    // SAFETY: caller_cspace validated non-null above. Decodes + generation-
+    // checks the source handle, rejecting a stale handle to a recycled slot.
+    let (src_tag, src_rights, src_object, src_badge) =
+        unsafe { resolve_src_cap(caller_cspace, src_handle)? };
 
     // Cannot re-badge a capability that already has a badge.
     if src_badge != 0
@@ -1344,8 +1383,6 @@ pub fn sys_cap_derive_badge(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             _ => SyscallError::OutOfMemory,
         }
     })?;
-    let new_idx = new_idx_nz.get();
-
     // Wire derivation link.
     let src_idx_nz = core::num::NonZeroU32::new(src_idx).ok_or(SyscallError::InvalidCapability)?;
     let parent = crate::cap::slot::SlotId::current(cspace_id, src_idx_nz);
@@ -1357,7 +1394,17 @@ pub fn sys_cap_derive_badge(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     }
     crate::cap::DERIVATION_LOCK.write_unlock();
 
-    Ok(u64::from(new_idx))
+    // Encode the new slot's generation into the returned handle (#349). Re-lock
+    // to read the generation soundly; the slot is occupied (no handle returned
+    // yet) so the value is stable.
+    // SAFETY: caller_cspace validated non-null above.
+    let new_handle = unsafe {
+        let saved = (*caller_cspace).lock.lock_raw();
+        let h = (*caller_cspace).cap_handle(new_idx_nz);
+        (*caller_cspace).lock.unlock_raw(saved);
+        h
+    };
+    Ok(u64::from(new_handle))
 }
 
 /// One-shot guard for [`log_self_cap_delete_refused`].
@@ -1406,7 +1453,8 @@ fn log_self_cap_delete_refused(tcb: *mut crate::sched::thread::ThreadControlBloc
 #[cfg(not(test))]
 pub fn sys_cap_delete(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
-    let slot_idx = tf.arg(0) as u32;
+    let slot_handle = tf.arg(0) as u32;
+    let slot_idx = syscall::cap_handle_index(slot_handle);
 
     // SAFETY: syscall entry ensures current_tcb() returns active thread's TCB.
     let tcb = unsafe { current_tcb() };
@@ -1438,6 +1486,14 @@ pub fn sys_cap_delete(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     {
         Some(slot) if slot.tag != crate::cap::slot::CapTag::Null =>
         {
+            // Reject a stale handle to a recycled slot (#349). Must not fall to
+            // the idempotent Null arm below — that would silently succeed
+            // against the unrelated live cap now occupying the index.
+            if slot.generation() != syscall::cap_handle_gen(slot_handle)
+            {
+                crate::cap::DERIVATION_LOCK.write_unlock();
+                return Err(SyscallError::InvalidCapability);
+            }
             let Some(obj) = slot.object
             else
             {
@@ -1527,7 +1583,8 @@ pub fn sys_cap_delete(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 #[cfg(not(test))]
 pub fn sys_cap_revoke(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
-    let slot_idx = tf.arg(0) as u32;
+    let slot_handle = tf.arg(0) as u32;
+    let slot_idx = syscall::cap_handle_index(slot_handle);
 
     // SAFETY: syscall entry ensures current_tcb() returns active thread's TCB.
     let tcb = unsafe { current_tcb() };
@@ -1544,12 +1601,17 @@ pub fn sys_cap_revoke(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // SAFETY: caller_cspace validated non-null above.
     let cspace_id = unsafe { (*caller_cspace).id() };
 
-    // Validate slot is non-null.
+    // Validate slot is non-null and the handle's generation is current.
     {
         // SAFETY: caller_cspace validated non-null above.
         let cs = unsafe { &*caller_cspace };
         let slot = cs.slot(slot_idx).ok_or(SyscallError::InvalidCapability)?;
         if slot.tag == crate::cap::slot::CapTag::Null
+        {
+            return Err(SyscallError::InvalidCapability);
+        }
+        // Reject a stale handle to a recycled slot (#349).
+        if slot.generation() != syscall::cap_handle_gen(slot_handle)
         {
             return Err(SyscallError::InvalidCapability);
         }
@@ -1616,9 +1678,12 @@ pub fn sys_cap_move(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     use crate::cap::object::CSpaceKernelObject;
     use crate::cap::slot::{Rights, SlotId};
 
-    let src_idx = tf.arg(0) as u32;
+    let src_handle = tf.arg(0) as u32;
+    let src_idx = syscall::cap_handle_index(src_handle);
     let dest_cs_idx = tf.arg(1) as u32;
-    let dest_idx = tf.arg(2) as u32; // 0 = auto-allocate
+    // Destination is a placement index (slot may be empty), not a live handle:
+    // decode the index, but do not generation-check it. 0 = auto-allocate.
+    let dest_idx = syscall::cap_handle_index(tf.arg(2) as u32);
 
     // SAFETY: syscall entry ensures current_tcb() returns active thread's TCB.
     let tcb = unsafe { current_tcb() };
@@ -1651,6 +1716,20 @@ pub fn sys_cap_move(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         let cs_obj = unsafe { &*(obj.as_ptr().cast::<CSpaceKernelObject>()) };
         cs_obj.cspace
     };
+
+    // Generation-check the source handle before the move. `move_cap_between_cspaces`
+    // takes a pre-decoded, pre-validated bare index (the IPC transfer path feeds
+    // it a generation-stripped index), so the source check lives in the caller (#349).
+    {
+        // SAFETY: caller_cspace validated non-null above.
+        let cs = unsafe { &*caller_cspace };
+        let slot = cs.slot(src_idx).ok_or(SyscallError::InvalidCapability)?;
+        if slot.tag == crate::cap::slot::CapTag::Null
+            || slot.generation() != syscall::cap_handle_gen(src_handle)
+        {
+            return Err(SyscallError::InvalidCapability);
+        }
+    }
 
     if dest_idx == 0
     {
@@ -1719,21 +1798,10 @@ pub fn sys_cap_move(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     let dest_cspace_id = unsafe { (*dest_cs_ptr).id() };
 
     // Read source slot contents.
-    let (src_tag, src_rights, src_object, src_badge) = {
-        // SAFETY: caller_cspace validated non-null above.
-        let cs = unsafe { &*caller_cspace };
-        let slot = cs.slot(src_idx).ok_or(SyscallError::InvalidCapability)?;
-        if slot.tag == crate::cap::slot::CapTag::Null
-        {
-            return Err(SyscallError::InvalidCapability);
-        }
-        (
-            slot.tag,
-            slot.rights,
-            slot.object.ok_or(SyscallError::InvalidCapability)?,
-            slot.badge,
-        )
-    };
+    // SAFETY: caller_cspace validated non-null above. Decodes + generation-
+    // checks the source handle, rejecting a stale handle to a recycled slot.
+    let (src_tag, src_rights, src_object, src_badge) =
+        unsafe { resolve_src_cap(caller_cspace, src_handle)? };
 
     // Pre-convert indices before locking so failure cannot leak locks.
     // src_idx cleared the non-null tag check (slot 0 is permanently Null);
@@ -1920,7 +1988,15 @@ pub fn sys_cap_move(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     crate::cap::DERIVATION_LOCK.write_unlock();
 
-    Ok(u64::from(dest_idx))
+    // Encode the destination slot's generation into the returned handle (#349).
+    // SAFETY: dest_cs_ptr validated above; slot occupied so the read is stable.
+    let dest_handle = unsafe {
+        let saved = (*dest_cs_ptr).lock.lock_raw();
+        let h = (*dest_cs_ptr).cap_handle(dest_idx_nz);
+        (*dest_cs_ptr).lock.unlock_raw(saved);
+        h
+    };
+    Ok(u64::from(dest_handle))
 }
 
 /// `SYS_CAP_CREATE_EVENT_Q` (9): create a new `EventQueue` object.
@@ -2014,14 +2090,15 @@ pub fn sys_cap_create_event_queue(tf: &mut TrapFrame) -> Result<u64, SyscallErro
     // SAFETY: cspace validated non-null above; lock_raw/unlock_raw paired.
     let idx_res = unsafe {
         let saved = (*cspace).lock.lock_raw();
-        let r = (*cspace).insert_cap(CapTag::EventQueue, Rights::POST | Rights::RECV, nonnull);
+        let r =
+            (*cspace).insert_cap_handle(CapTag::EventQueue, Rights::POST | Rights::RECV, nonnull);
         (*cspace).lock.unlock_raw(saved);
         r
     };
 
     if let Ok(idx) = idx_res
     {
-        Ok(u64::from(idx.get()))
+        Ok(u64::from(idx))
     }
     else
     {
@@ -2114,14 +2191,15 @@ pub fn sys_cap_create_wait_set(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // SAFETY: cspace validated non-null above; lock_raw/unlock_raw paired.
     let idx_res = unsafe {
         let saved = (*cspace).lock.lock_raw();
-        let r = (*cspace).insert_cap(CapTag::WaitSet, Rights::MODIFY | Rights::WAIT, nonnull);
+        let r =
+            (*cspace).insert_cap_handle(CapTag::WaitSet, Rights::MODIFY | Rights::WAIT, nonnull);
         (*cspace).lock.unlock_raw(saved);
         r
     };
 
     if let Ok(idx) = idx_res
     {
-        Ok(u64::from(idx.get()))
+        Ok(u64::from(idx))
     }
     else
     {
@@ -2183,7 +2261,8 @@ pub fn sys_cap_info(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     use crate::cap::slot::{CapTag, Rights};
     use crate::sched::thread::ThreadState;
 
-    let slot_idx = tf.arg(0) as u32;
+    let slot_handle = tf.arg(0) as u32;
+    let slot_idx = syscall::cap_handle_index(slot_handle);
     let field = tf.arg(1);
 
     // Resolve the caller's CSpace via its TCB.
@@ -2207,6 +2286,11 @@ pub fn sys_cap_info(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     let cs = unsafe { &*caller_cspace };
     let slot = cs.slot(slot_idx).ok_or(SyscallError::InvalidCapability)?;
     if slot.tag == CapTag::Null
+    {
+        return Err(SyscallError::InvalidCapability);
+    }
+    // Reject a stale handle to a recycled slot (#349).
+    if slot.generation() != syscall::cap_handle_gen(slot_handle)
     {
         return Err(SyscallError::InvalidCapability);
     }

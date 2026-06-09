@@ -143,6 +143,32 @@ boundaries without holding per-CSpace locks longer than necessary, and lets
 recycled — a stale `SlotId` stamped with the pre-recycle epoch cannot
 mis-target the new tenant. See #137 for the recycling allocator design.
 
+### Per-Slot Generation
+
+Each slot carries an 8-bit **generation** counter (in the spare `pad[1]` byte,
+keeping the slot at 72 bytes). `CSpace::free_slot` increments it every time the
+slot is recycled. The generation is encoded into the capability handle userspace
+receives — `handle = (generation << CAP_INDEX_BITS) | index` (see
+[capability-model.md](../../../docs/capability-model.md) § Capability Handle
+Format) — and `lookup_cap`, together with the raw-resolution handlers in
+`cap.rs` / `mem.rs` / `ipc.rs`, rejects a handle whose generation no longer
+matches the slot's, returning `InvalidCapability`. This is the #349 fix: a stale
+handle that reaches a recycled slot — including a slot a cross-`CSpace` revoke
+freed out from under its holder — fails closed instead of aliasing the new
+occupant. A never-recycled slot has generation 0, so its handle equals the bare
+index — the backward-compatibility hinge that lets long-lived boot caps keep
+their historical handle values.
+
+The generation is distinct from `SlotId.epoch` (the per-`CSpace`-registry
+counter) and from the `pad[0]` free-list marker. It must survive the
+free→reallocate transition: `free_slot` bumps it *before* threading the slot onto
+the free list, `set_next_free` preserves `pad[1]`, and `allocate_slot` clears the
+slot with `clear_keep_generation` (which keeps `pad[1]`). The 8-bit counter wraps
+after 256 recycles of one index — a bounded ABA window: on wrap a replayed handle
+is no better protected than under the pre-generation scheme, and no worse. The
+generation byte `pad[1]` plus the spare `pad[2]` leave a one-step widening to a
+16-bit generation if churn ever makes 256 marginal.
+
 ### Capability Tags
 
 ```rust
@@ -359,18 +385,51 @@ own access:
 1. Hold capability C (the original).
 2. Derive C1 from C — you retain C1 as an intermediary.
 3. Derive C2 from C1 — C2 is the delegated capability.
-4. Transfer C2 to the child process via SYS_CAP_COPY or IPC capability slots.
+4. Copy C2 into the child's CSpace with SYS_CAP_COPY.
 5. To revoke: call SYS_CAP_REVOKE on your slot holding C1.
-   This destroys C1 and C2 (all descendants of C1).
+   This destroys C1 and C2 (all descendants of C1), including C2 in the child.
    You still hold C with its full rights intact.
 ```
 
-This pattern works because revocation is subtree-local. Revoking C1 removes C1 and
-all descendants but leaves C and any siblings of C1 untouched.
+This pattern works because revocation is subtree-local: revoking C1 removes C1 and
+all descendants but leaves C and any siblings of C1 untouched. Delegation uses
+`SYS_CAP_COPY` so you keep your own access to C2 while the child holds a revocable
+copy. **IPC transfer** and `SYS_CAP_MOVE` instead hand the slot away — the sender's
+slot is freed — but the moved cap keeps its position in the derivation tree (see
+[Derivation Across Processes](#derivation-across-processes)), so it stays a
+descendant of C1 and a `SYS_CAP_REVOKE` on C1 still reaches it across the `CSpace`
+boundary. Revoking C1 frees the child's C2 slot in the child's own `CSpace`;
+per-slot generation handles ensure the child's now-stale C2 handle then fails with
+`InvalidCapability` instead of aliasing a recycled slot (#349).
 
 ### Derivation Across Processes
 
-`SlotId` encodes `(ProcessId, slot_index)`. Resolving a remote slot requires:
+The hazard a cross-`CSpace` derivation edge creates (#349): `revoke_subtree` walks
+derivation edges and `free_slot`s each descendant in its own `CSpace`. If an edge
+crosses a `CSpace` boundary, revoking a source's subtree frees a slot in a foreign
+`CSpace` that the recipient still legitimately holds — and because cap handles
+recycle slot indices, that freed index would then alias an unrelated live object.
+
+Per-slot generation handles make cross-`CSpace` capability sharing safe. Both forms
+of cross-`CSpace` sharing keep a derivation edge across the boundary:
+
+- **IPC capability transfer / `SYS_CAP_MOVE`** hand the cap to the recipient and
+  free the sender's slot, but the moved cap keeps its position in the derivation
+  tree — it stays a descendant of whatever it was derived from, so an ancestor's
+  `cap_revoke` reaches it across the boundary. (Same-`CSpace` moves likewise keep
+  the source's position.)
+- **`SYS_CAP_COPY`** keeps the new cap a derivation **child** of the source (the
+  "Derive Twice" pattern above), so the source can revoke the delegated copy.
+
+In both cases a `cap_revoke` can `free_slot` the recipient's slot in its own
+`CSpace`. The handle the recipient holds carries the slot's **generation**
+(`handle = (generation << CAP_INDEX_BITS) | index`); `free_slot` bumps the
+generation, so the recipient's now-stale handle fails with `InvalidCapability`
+rather than aliasing whatever later occupies the recycled index. See the per-slot
+generation discussion under [Capability Slot](#capability-slot-capslotrs).
+
+`SlotId` encodes `(cspace_id, epoch, slot_index)`. The derivation tree is resolved
+by:
 
 ```
 resolve(slot_id):
@@ -378,8 +437,8 @@ resolve(slot_id):
     return cspace.slot(slot_id.index)         // O(1) two-level lookup
 ```
 
-Neither operation requires holding a lock on the target process's CSpace — the
-derivation tree write lock is sufficient to prevent concurrent modification.
+Resolution does not require holding a lock on the target `CSpace` — the derivation
+tree write lock is sufficient to prevent concurrent modification.
 
 ---
 
@@ -423,18 +482,26 @@ transfer_cap(sender, sender_slot_idx, receiver, receiver_slot_idx):
     src_slot = sender.cspace.slot(sender_slot_idx)
     dst_slot = receiver.cspace.slot(receiver_slot_idx)
     // dst_slot must be null (verified before IPC delivery begins)
-    *dst_slot = *src_slot  // copy the entire slot structure
-    // Update derivation tree: dst_slot takes src_slot's position
-    relink_derivation_pointers(src_slot_id, dst_slot_id)
-    // Clear the sender's slot
-    src_slot.tag = CapTag::Null
+    dst_slot.{tag, rights, badge, object} = src_slot.{...}  // copy the cap
+    // The moved cap takes the source's position in the derivation tree: its
+    // parent, children, and siblings are repointed onto dst_slot, including
+    // across the CSpace boundary. That cross-boundary edge is what lets an
+    // ancestor's cap_revoke reach the moved cap; per-slot generation (#349)
+    // makes the receiver's handle fail closed if such a revoke frees this slot.
+    repoint_derivation_links(src_slot_id -> dst_slot_id)
+    src_slot.tag = CapTag::Null                    // clear the sender's slot
     src_slot.object = None
     // Note: ref_count does not change (same number of slots reference the object)
     release derivation tree write lock
 ```
 
-The derivation write lock is held for the duration of the transfer. This ensures
-no revocation can run concurrently with a transfer, preventing torn state.
+IPC capability transfer is always cross-`CSpace` (sender and receiver are distinct
+processes). The transferred cap keeps its position in the derivation tree, so it
+remains reachable by a `cap_revoke` on one of its ancestors; per-slot generation
+handles make the receiver's handle fail closed if such a revoke frees the
+receiver's slot (#349). The derivation write lock is held for the duration of the
+transfer, so no revocation can run concurrently with a transfer, preventing torn
+state.
 
 Reply capabilities are not part of the derivation tree — they are single-use,
 cannot be derived, and are not tracked for revocation. A reply capability is not

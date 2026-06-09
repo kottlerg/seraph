@@ -458,18 +458,19 @@ impl Command {
 
         // The death observer now lives on the child's Thread object (its TCB),
         // not on the cap, so the parent's `thread_cap` is dead weight after the
-        // bind. Delete it NOW (#341 root fix): retaining it until Process::drop
-        // leaves a cross-CSpace derivation CHILD of procmgr's `child_thread` in
-        // this process's CSpace (the cap was `cap_derive`'d by procmgr then
-        // IPC-MOVED here, which preserves the derivation edge). At child reap,
-        // procmgr's `cap_revoke(child_thread)` walks that edge and `free_slot`s
-        // THIS still-live slot; a later thread spawn reuses the freed index, and
-        // Process::drop's `cap_delete(self.thread_cap)` then tears down an
-        // unrelated live thread -> self-teardown / all-idle hang. Severing the
-        // edge here, before reap, removes the hazard while procmgr still reaps
-        // the child Thread normally (its `cap_revoke` is load-bearing for the
-        // thread-before-aspace teardown order). The kernel-side refuse-self-
-        // delete guard remains as defense-in-depth.
+        // bind. Delete it now: this frees the slot promptly and unlinks this
+        // process's copy from procmgr's `child_thread` derivation subtree (procmgr
+        // `cap_derive`'d the cap then IPC-MOVED it here, preserving the derivation
+        // edge), so procmgr's reap-time `cap_revoke(child_thread)` need not reach
+        // across the CSpace boundary into this process. Retaining it would be safe
+        // regardless: were the reap-revoke to free this slot and a later spawn
+        // reuse the index, `Process::drop`'s `cap_delete(self.thread_cap)` would
+        // replay a stale handle, which per-slot generation handles (#349) reject
+        // with `InvalidCapability` instead of tearing down the unrelated new
+        // occupant (the #341 self-teardown / all-idle hang). The early delete is
+        // thus hygiene and defense-in-depth; procmgr's `cap_revoke` stays
+        // load-bearing for the thread-before-aspace teardown order, and the
+        // kernel-side refuse-self-delete guard remains as further defense.
         let _ = syscall::cap_delete(thread_cap);
         let thread_cap = 0u32;
 

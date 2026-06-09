@@ -30,6 +30,8 @@
 //! - `priority_preemption.rs`    — higher-priority runnable thread preempts a busy lower-priority one
 //! - `shared_memory_two_aspaces.rs` — one Memory cap mapped into two `AddressSpace` caps; phys round-trip
 //! - `cap_move_into_fresh_cspace_then_ipc.rs` — `cap_move` an endpoint into a child cspace; child IPC-calls through it
+//! - `cross_cspace_revoke_no_alias.rs` — after a cross-CSpace `cap_revoke` frees a recipient's reply-delivered cap, the recipient's stale handle fails closed, not aliases the recycled slot (#349)
+//! - `cap_generation_stale_handle.rs` — a same-CSpace stale cap handle fails closed after the slot is recycled (#349)
 //! - `fpu_survives_ipc_call.rs` — FP register file survives a raw `SYS_IPC_CALL` round-trip across CPU migration
 //! - `fault_kills_thread.rs`     — a genuine userspace page fault terminates the thread with the right exit reason
 //! - `fault_pager_roundtrip.rs`  — a bound userspace pager maps a frame on fault and resumes the thread
@@ -44,8 +46,10 @@
 
 pub mod aspace_fault_notification_late_bind;
 pub mod cap_delegation_chain;
+pub mod cap_generation_stale_handle;
 pub mod cap_move_into_fresh_cspace_then_ipc;
 pub mod cap_transfer;
+pub mod cross_cspace_revoke_no_alias;
 pub mod death_notification_late_bind;
 pub mod fault_exception_no_handler_kills;
 pub mod fault_exception_redirect;
@@ -114,6 +118,14 @@ pub fn run_all(ctx: &TestContext)
     run_integration_test!(
         "integration::cap_move_into_fresh_cspace_then_ipc",
         cap_move_into_fresh_cspace_then_ipc::run(ctx)
+    );
+    run_integration_test!(
+        "integration::cross_cspace_revoke_no_alias",
+        cross_cspace_revoke_no_alias::run(ctx)
+    );
+    run_integration_test!(
+        "integration::cap_generation_stale_handle",
+        cap_generation_stale_handle::run(ctx)
     );
     run_integration_test!(
         "integration::fpu_survives_ipc_call",

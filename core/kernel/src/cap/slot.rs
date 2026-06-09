@@ -349,7 +349,8 @@ pub struct CapabilitySlot
     /// Explicit padding: aligns `rights` to offset 4 and `badge` to offset 8.
     /// `pad[0]` doubles as the intrusive free-list membership marker
     /// ([`FREE_LIST_MARKER`] when the Null slot is linked on a `CSpace` free
-    /// list); `pad[1..]` are always zero.
+    /// list); `pad[1]` holds the per-slot generation counter (see
+    /// [`CapabilitySlot::generation`]); `pad[2]` is always zero.
     pad: [u8; 3],
     /// Rights bitmask (type-specific).
     pub rights: Rights,
@@ -377,6 +378,11 @@ pub struct CapabilitySlot
 unsafe impl Send for CapabilitySlot {}
 // SAFETY: CapabilitySlot is accessed only under CSpace lock; no Sync violation.
 unsafe impl Sync for CapabilitySlot {}
+
+// The 72-byte layout is a cross-boundary contract and is what makes 56 slots
+// fit a 4 KiB CSpacePage. The per-slot generation lives in the spare `pad[1]`
+// and must not grow the slot.
+const _: () = assert!(core::mem::size_of::<CapabilitySlot>() == 72);
 
 /// Value stamped into `CapabilitySlot::pad[0]` while a Null slot is linked on a
 /// `CSpace` intrusive free list. A free-list **tail** slot has `deriv_parent ==
@@ -415,6 +421,44 @@ impl CapabilitySlot
         *self = Self::null();
     }
 
+    /// Reset the slot to null but preserve the per-slot generation in `pad[1]`.
+    ///
+    /// Used on the allocation path: `CSpace::allocate_slot` pops a free slot and
+    /// must hand out the generation the previous `free_slot` left behind, so the
+    /// minted cap handle's generation matches the slot the recipient resolves.
+    /// Contrast [`clear`](Self::clear), which fully zeroes the slot (including the
+    /// generation) and is correct only when the slot is not being recycled into a
+    /// live cap.
+    pub fn clear_keep_generation(&mut self)
+    {
+        let generation = self.pad[1];
+        *self = Self::null();
+        self.pad[1] = generation;
+    }
+
+    /// Read this slot's per-slot generation counter (stored in `pad[1]`).
+    ///
+    /// `CSpace::free_slot` bumps the generation each time the slot is recycled.
+    /// It is encoded into the cap handle ([`syscall::cap_handle_encode`]), so a
+    /// stale handle to a recycled slot fails `lookup_cap` with `InvalidCapability`
+    /// instead of aliasing the new occupant (#349). Distinct from
+    /// [`SlotId::epoch`], which is the `CSpace`-registry generation.
+    pub fn generation(&self) -> u8
+    {
+        self.pad[1]
+    }
+
+    /// Increment the per-slot generation, wrapping at 256.
+    ///
+    /// Called by `CSpace::free_slot` when a slot is recycled, so every handle to
+    /// the prior occupant becomes stale. Wraparound is a bounded ABA window
+    /// (256 reuses of the same index); acceptable for a fail-closed backstop
+    /// (#349). See [`generation`](Self::generation).
+    pub fn bump_generation(&mut self)
+    {
+        self.pad[1] = self.pad[1].wrapping_add(1);
+    }
+
     // ── Intrusive free-list helpers ───────────────────────────────────────────
 
     /// Encode the next-free-list successor index in `deriv_parent`.
@@ -433,13 +477,19 @@ impl CapabilitySlot
     ///
     /// Stamps the [`FREE_LIST_MARKER`] into `pad[0]` so [`is_on_free_list`]
     /// can recognise this slot as a free-list member regardless of whether it
-    /// is the list tail.
+    /// is the list tail. Leaves `pad[1]` (the per-slot generation) untouched —
+    /// `CSpace::free_slot` bumps it immediately before this call and the next
+    /// allocation must observe the incremented value.
     ///
     /// [`is_on_free_list`]: Self::is_on_free_list
     pub fn set_next_free(&mut self, next: Option<NonZeroU32>)
     {
         self.tag = CapTag::Null;
-        self.pad = [FREE_LIST_MARKER, 0, 0];
+        self.pad[0] = FREE_LIST_MARKER;
+        self.pad[2] = 0;
+        // pad[1] holds the per-slot generation, bumped by `CSpace::free_slot`
+        // just before this call. Preserve it across the free so the next
+        // `allocate_slot` hands out the incremented generation.
         self.rights = Rights::NONE;
         self.badge = 0;
         self.object = None;
@@ -593,6 +643,81 @@ mod tests
         // clear() (the allocate-on-pop path) drops the marker.
         s.clear();
         assert!(!s.is_on_free_list());
+    }
+
+    // The per-slot generation (#349) must survive both the free-list encoding
+    // and the allocate-on-pop clear, or a recycled index would hand out a stale
+    // generation and the backstop would never fire. Mirrors the CSpace
+    // free_slot (bump then set_next_free) / allocate_slot (clear_keep_generation)
+    // sequence; a missing edit on any of the three sites fails here.
+    #[test]
+    fn generation_survives_free_then_alloc_cycle()
+    {
+        let mut s = CapabilitySlot::null();
+        assert_eq!(s.generation(), 0);
+        s.bump_generation();
+        s.set_next_free(None);
+        assert!(s.is_on_free_list());
+        assert_eq!(
+            s.generation(),
+            1,
+            "set_next_free must preserve the generation"
+        );
+        s.clear_keep_generation();
+        assert!(!s.is_on_free_list());
+        assert_eq!(
+            s.generation(),
+            1,
+            "the allocate path must keep the bumped generation"
+        );
+    }
+
+    // clear() fully zeroes (including the generation); clear_keep_generation does
+    // not. The distinction is what makes the recycle backstop work.
+    #[test]
+    fn clear_variants_differ_on_generation()
+    {
+        let mut s = CapabilitySlot::null();
+        s.bump_generation();
+        s.bump_generation();
+        s.clear_keep_generation();
+        assert_eq!(s.generation(), 2);
+        s.clear();
+        assert_eq!(s.generation(), 0, "clear() must zero the generation");
+    }
+
+    // 8-bit generation wraps after 256 recycles — bounded ABA, documented (#349).
+    #[test]
+    fn bump_generation_wraps_at_256()
+    {
+        let mut s = CapabilitySlot::null();
+        for _ in 0..256
+        {
+            s.bump_generation();
+        }
+        assert_eq!(s.generation(), 0);
+    }
+
+    // Cap-handle encoding round-trips index and generation, and a gen-0 handle is
+    // numerically identical to the bare index (the backward-compat hinge, #349).
+    #[test]
+    fn cap_handle_round_trip_and_gen_zero_identity()
+    {
+        use syscall::{cap_handle_encode, cap_handle_gen, cap_handle_index};
+        for &index in &[1u32, 2, 42, 14_335, syscall::CAP_INDEX_MASK]
+        {
+            for &generation in &[0u8, 1, 127, 128, 255]
+            {
+                let h = cap_handle_encode(index, generation);
+                assert_eq!(cap_handle_index(h), index);
+                assert_eq!(cap_handle_gen(h), generation);
+            }
+        }
+        assert_eq!(
+            cap_handle_encode(7, 0),
+            7,
+            "gen-0 handle equals the bare index"
+        );
     }
 
     #[test]

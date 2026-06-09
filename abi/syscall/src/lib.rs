@@ -54,6 +54,58 @@ use core::prelude::rust_2024::*;
 /// RV64GC under Sv48) use 4 KiB base pages.
 pub const PAGE_SIZE: u64 = 0x1000;
 
+// ── Capability handle encoding ────────────────────────────────────────────────
+
+/// Number of low bits in a capability handle that hold the `CSpace` slot index.
+///
+/// The remaining high bits hold a per-slot generation counter (see
+/// [`cap_handle_gen`]). 24 index bits cover the maximum `CSpace` capacity with
+/// generous headroom; the kernel static-asserts that its slot capacity fits.
+pub const CAP_INDEX_BITS: u32 = 24;
+
+/// Mask selecting the slot-index bits of a capability handle.
+pub const CAP_INDEX_MASK: u32 = (1u32 << CAP_INDEX_BITS) - 1;
+
+// Generation (8 bits) plus index (`CAP_INDEX_BITS`) must fit in the u32 handle.
+// The handle is returned to userspace in a u64 register and reinterpreted as
+// i64 by the dispatcher; a u32 zero-extends with bit 63 clear, so a single-cap
+// return is never misread as a negative error code.
+const _: () = assert!(CAP_INDEX_BITS + 8 <= 32);
+
+/// Build a capability handle from a slot `index` and per-slot `generation`.
+///
+/// The handle userspace receives and passes back is
+/// `(generation << CAP_INDEX_BITS) | index`. A `generation` of `0` makes the
+/// handle numerically equal to the bare index, so a long-lived cap minted once
+/// and never recycled keeps its historical handle value under this encoding
+/// (the backward-compatibility hinge).
+#[inline]
+#[must_use]
+// `u32::from` is not const-stable; the `u8 -> u32` widening cast is exact.
+#[allow(clippy::cast_lossless)]
+pub const fn cap_handle_encode(index: u32, generation: u8) -> u32
+{
+    ((generation as u32) << CAP_INDEX_BITS) | (index & CAP_INDEX_MASK)
+}
+
+/// Extract the slot index from a capability handle.
+#[inline]
+#[must_use]
+pub const fn cap_handle_index(handle: u32) -> u32
+{
+    handle & CAP_INDEX_MASK
+}
+
+/// Extract the per-slot generation from a capability handle.
+#[inline]
+#[must_use]
+// `>> CAP_INDEX_BITS` leaves at most 8 significant bits, so the `as u8` is exact.
+#[allow(clippy::cast_possible_truncation)]
+pub const fn cap_handle_gen(handle: u32) -> u8
+{
+    (handle >> CAP_INDEX_BITS) as u8
+}
+
 // ── Syscall numbers ───────────────────────────────────────────────────────────
 
 /// IPC: synchronous call (send + block waiting for reply).
@@ -722,14 +774,17 @@ pub const FAULT_CLASS_ALL: u64 = !0u64;
 /// patch = version & 0xFFFF
 /// ```
 ///
-/// The version is `0.0.2` during initial kernel development. Major will remain
+/// The version is `0.0.3` during initial kernel development. Major will remain
 /// `0` until the kernel reaches a meaningful level of completeness; during this
 /// phase all ABI changes are considered fully fluid regardless of minor/patch.
+/// `0.0.3` introduced the generation-tagged capability handle format (#349):
+/// a handle is `(generation << CAP_INDEX_BITS) | index`; a stale handle to a
+/// recycled slot fails with `InvalidCapability`.
 // Encode as (major << 32) | (minor << 16) | patch. The zero shifts are retained
 // to preserve the positional structure; they will carry non-zero values when
 // the ABI stabilises.
 #[allow(clippy::identity_op, clippy::eq_op)]
-pub const KERNEL_VERSION: u64 = (0u64 << 32) | (0u64 << 16) | 2u64; // 0.0.2
+pub const KERNEL_VERSION: u64 = (0u64 << 32) | (0u64 << 16) | 3u64; // 0.0.3
 
 /// Discriminant for `SYS_SYSTEM_INFO` queries.
 ///

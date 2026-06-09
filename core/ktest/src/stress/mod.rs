@@ -11,8 +11,10 @@
 //! > class ⇒ new file.**
 //!
 //! These tests exercise race conditions, resource exhaustion, deep capability
-//! trees, and concurrent operations. They are **not** run by default; enable
-//! them with `ktest.filter=stress` in the kernel command line.
+//! trees, and concurrent operations. They run on every ktest boot — the
+//! compile-time `KtestConfig::DEFAULT` sets `run_stress = true` and the boot
+//! protocol carries no command line, so the tier set is fixed at build time.
+//! SMP-dependent cells self-skip below their required CPU count.
 //!
 //! Each stress test uses [`run_integration_test!`](crate::run_integration_test)
 //! for logging and PASS/FAIL counting.
@@ -32,6 +34,7 @@ mod idle_wake_race;
 mod priority_dealloc_race;
 mod retype_concurrent;
 mod stop_reply_race;
+mod stop_resume_race;
 mod thread_churn;
 
 use crate::{ChildStack, TestContext, run_integration_test};
@@ -69,6 +72,7 @@ pub fn run_all(ctx: &TestContext)
         priority_dealloc_race::run(ctx)
     );
     run_integration_test!("stress::stop_reply_race", stop_reply_race::run(ctx));
+    run_integration_test!("stress::stop_resume_race", stop_resume_race::run(ctx));
     run_integration_test!(
         "stress::double_enqueue_storm",
         double_enqueue_storm::run(ctx)

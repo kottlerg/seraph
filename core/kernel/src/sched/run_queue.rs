@@ -232,6 +232,15 @@ pub struct PerCpuScheduler
     /// it needs no atomicity. Off-stack per the per-CPU-field idiom of
     /// docs/scheduling-internals.md § Off-Stack Scratch for Ceiling-Sized Arrays.
     pub saved_lock_flags: u64,
+
+    /// Head of this CPU's deferred self-teardown reclaim stack (#341). Holds
+    /// `Thread` objects whose owner deleted the last capability to itself: the
+    /// inline `dealloc_object` drain gate cannot run for the running thread on
+    /// its own CPU, so the object is queued here and freed off-CPU by
+    /// `crate::cap::object::drain_deferred_reclaim`. Typed opaquely (`*mut u8`,
+    /// really `*mut cap::object::ThreadObject`) to avoid a sched→cap layering
+    /// edge; the object module owns the cast and the intrusive link field.
+    pub deferred_reclaim_head: core::sync::atomic::AtomicPtr<u8>,
 }
 
 // SAFETY: scheduler is protected by `lock` (Phase 9+) and only accessed
@@ -265,6 +274,7 @@ impl PerCpuScheduler
             lock: crate::sync::Spinlock::new(),
             load: AtomicU32::new(0),
             saved_lock_flags: 0,
+            deferred_reclaim_head: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
         }
     }
 

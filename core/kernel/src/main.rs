@@ -1096,6 +1096,7 @@ unsafe fn kernel_entry_post_rebase(
                             cap::seed_header_nn(),
                         ),
                         tcb: tcb_ptr,
+                        deferred_next: core::ptr::null_mut(),
                     },
                 );
             }

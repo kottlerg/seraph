@@ -919,6 +919,14 @@ fn idle_thread_entry(_cpu_id: u64) -> !
         {
             let cpu = crate::arch::current::cpu::current_cpu() as usize;
 
+            // Reclaim any threads that self-deleted on this CPU (#341). The
+            // self-teardown path marks the dead thread Exited and queues its
+            // object for off-CPU reclaim; the idle thread is a safe context
+            // (never one of the queued dead threads). Done with interrupts
+            // enabled, before the halt-decision masking below.
+            // SAFETY: idle context on a valid kernel stack.
+            unsafe { crate::cap::object::drain_deferred_reclaim(cpu) };
+
             // Step 1: disable interrupts. The check below and the halt must
             // be on the same side of the interrupt-masking boundary so a
             // concurrent producer-notification races into a pending interrupt

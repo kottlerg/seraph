@@ -525,7 +525,8 @@ pub fn sys_memory_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     use crate::mm::PAGE_SIZE;
     use crate::syscall::current_tcb;
 
-    let memory_idx = tf.arg(0) as u32;
+    let memory_handle = tf.arg(0) as u32;
+    let memory_idx = syscall::cap_handle_index(memory_handle);
     let split_offset = tf.arg(1);
     // arg2 is reserved; ignore.
 
@@ -557,7 +558,7 @@ pub fn sys_memory_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
     let parent_slot =
-        unsafe { super::lookup_cap(caller_cspace, memory_idx, CapTag::Memory, Rights::MAP) }?;
+        unsafe { super::lookup_cap(caller_cspace, memory_handle, CapTag::Memory, Rights::MAP) }?;
     let parent_obj_nn = parent_slot.object.ok_or(SyscallError::InvalidCapability)?;
     // cast_ptr_alignment: MemoryObject (8-byte) behind KernelObjectHeader header.
     // SAFETY: tag confirmed Memory; pointer is valid MemoryObject.
@@ -669,7 +670,6 @@ pub fn sys_memory_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         DERIVATION_LOCK.write_unlock();
         return Err(SyscallError::OutOfMemory);
     };
-    let tail_slot = tail_slot_nz.get();
     let tail_id = SlotId::current(cspace_id, tail_slot_nz);
 
     // ── Wire derivation: tail becomes a sibling of parent under parent's parent ──
@@ -715,7 +715,15 @@ pub fn sys_memory_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     parent_ref.write_unlock();
     DERIVATION_LOCK.write_unlock();
 
-    Ok(u64::from(tail_slot))
+    // Encode the tail slot's generation into the returned handle (#349).
+    // SAFETY: caller_cspace valid; slot occupied so the read is stable.
+    let tail_handle = unsafe {
+        let saved = (*caller_cspace).lock.lock_raw();
+        let h = (*caller_cspace).cap_handle(tail_slot_nz);
+        (*caller_cspace).lock.unlock_raw(saved);
+        h
+    };
+    Ok(u64::from(tail_handle))
 }
 
 // Test stub.
@@ -758,8 +766,10 @@ pub fn sys_memory_merge(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     use crate::cap::slot::{CapTag, Rights, SlotId};
     use crate::syscall::current_tcb;
 
-    let parent_idx = tf.arg(0) as u32;
-    let tail_idx = tf.arg(1) as u32;
+    let parent_handle = tf.arg(0) as u32;
+    let tail_handle = tf.arg(1) as u32;
+    let parent_idx = syscall::cap_handle_index(parent_handle);
+    let tail_idx = syscall::cap_handle_index(tail_handle);
     // arg2 reserved.
 
     if parent_idx == tail_idx
@@ -784,11 +794,11 @@ pub fn sys_memory_merge(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
     let parent_slot =
-        unsafe { super::lookup_cap(caller_cspace, parent_idx, CapTag::Memory, Rights::MAP) }?;
+        unsafe { super::lookup_cap(caller_cspace, parent_handle, CapTag::Memory, Rights::MAP) }?;
     let parent_obj_nn = parent_slot.object.ok_or(SyscallError::InvalidCapability)?;
     // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
     let tail_slot =
-        unsafe { super::lookup_cap(caller_cspace, tail_idx, CapTag::Memory, Rights::MAP) }?;
+        unsafe { super::lookup_cap(caller_cspace, tail_handle, CapTag::Memory, Rights::MAP) }?;
     let tail_obj_nn = tail_slot.object.ok_or(SyscallError::InvalidCapability)?;
 
     if parent_obj_nn == tail_obj_nn

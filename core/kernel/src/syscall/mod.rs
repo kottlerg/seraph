@@ -617,16 +617,24 @@ pub(crate) unsafe fn current_tcb() -> *mut crate::sched::thread::ThreadControlBl
     unsafe { crate::sched::scheduler_for(cpu).current }
 }
 
-/// Look up a capability slot in a `CSpace` by index.
+/// Look up a capability slot in a `CSpace` by user handle.
+///
+/// `handle` is the encoded value userspace passes: slot index in the low
+/// [`syscall::CAP_INDEX_BITS`] bits, per-slot generation in the high bits. This
+/// is the single chokepoint for resolving a user-supplied handle; raw-index
+/// resolvers in `cap.rs` (`cap_copy`/`derive`/`delete`/`revoke`/`move`/`info`)
+/// must decode and generation-check themselves.
 ///
 /// Returns a reference to the slot, or an appropriate [`SyscallError`]:
 /// - Null cspace pointer or missing slot → [`SyscallError::InvalidCapability`].
 /// - Tag mismatch → [`SyscallError::InvalidCapability`].
+/// - Generation mismatch (stale handle to a recycled slot) →
+///   [`SyscallError::InvalidCapability`] (#349).
 /// - Insufficient rights → [`SyscallError::InsufficientRights`].
 #[cfg(not(test))]
 pub(crate) unsafe fn lookup_cap(
     cspace: *mut crate::cap::cspace::CSpace,
-    index: u32,
+    handle: u32,
     expected_tag: crate::cap::slot::CapTag,
     required_rights: crate::cap::slot::Rights,
 ) -> Result<&'static crate::cap::slot::CapabilitySlot, SyscallError>
@@ -637,8 +645,16 @@ pub(crate) unsafe fn lookup_cap(
     }
     // SAFETY: cspace is a valid CSpace pointer from the current thread's TCB.
     let cs = unsafe { &*cspace };
+    let index = syscall::cap_handle_index(handle);
     let slot = cs.slot(index).ok_or(SyscallError::InvalidCapability)?;
     if slot.tag != expected_tag
+    {
+        return Err(SyscallError::InvalidCapability);
+    }
+    // Reject a stale handle whose generation no longer matches the slot — the
+    // slot was freed and recycled since the handle was minted (#349). Checked
+    // after the tag so a handle to a now-null slot reports InvalidCapability.
+    if slot.generation() != syscall::cap_handle_gen(handle)
     {
         return Err(SyscallError::InvalidCapability);
     }

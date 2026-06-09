@@ -76,7 +76,13 @@
 ///     (previously both 0). `Rights::ELEVATE` is removed: holding a
 ///     `SchedControl` cap plus its range is the authority. Field layout
 ///     unchanged; semantic change to the `SchedControl` descriptor only.
-pub const INIT_PROTOCOL_VERSION: u32 = 12;
+/// v13: Capability handles are generation-tagged (#349). Each [`CapDescriptor`]
+///     slot is now a `(generation << CAP_INDEX_BITS) | index` handle, not a bare
+///     slot index. Field layout is unchanged and every handover cap is a
+///     never-recycled generation-0 slot, so the delivered values are
+///     byte-identical; the semantic change is that the handle's high bits are
+///     now meaningful and the kernel validates them on every use.
+pub const INIT_PROTOCOL_VERSION: u32 = 13;
 
 /// Length of [`InitModuleName::name`], matching
 /// [`boot_protocol::BOOT_MODULE_NAME_LEN`] so the kernel copies the bundle

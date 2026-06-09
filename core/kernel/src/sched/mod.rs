@@ -253,19 +253,16 @@ pub const SPIN_SITE_DEALLOC_CONTEXT_SAVED: u32 = 2;
 /// `dealloc_object(Thread)` wake-in-flight gate: spinning until a waker's
 /// claimed-but-not-yet-committed `enqueue_and_wake` clears `wake_in_flight`.
 pub const SPIN_SITE_DEALLOC_WAKE_IN_FLIGHT: u32 = 3;
-/// `schedule()` cross-CPU dispatch: spinning on the next thread's
-/// `context_saved` Acquire barrier.
-pub const SPIN_SITE_SCHEDULE_CONTEXT_SAVED: u32 = 4;
-/// `sys_thread_stop` cross-CPU drain: spinning until the target leaves
-/// `current` on its owning CPU.
-pub const SPIN_SITE_THREAD_STOP_DRAIN: u32 = 5;
 
 /// Per-CPU breadcrumb naming the bounded protocol-spin a CPU is currently
 /// executing, for the softlockup watchdog. A wedged CPU (no non-idle dispatch
-/// for the threshold) that is stuck in a `dealloc_object(Thread)` gate shows
-/// the gate here, turning an opaque `current = Exited` dump into a named site
-/// (#351). Set on gate entry, cleared on exit; [`SPIN_SITE_NONE`] when not
-/// spinning. Diagnostic-only — never gates control flow.
+/// for the threshold) stuck in a `dealloc_object(Thread)` gate shows the gate
+/// here, turning an opaque `current = Exited` dump into a named site (#351).
+/// Set on gate entry, cleared on exit; [`SPIN_SITE_NONE`] when not spinning.
+/// Only the three `dealloc_object(Thread)` gates report here — they are the
+/// bounded spins that lack an overlong-duration warning of their own (the
+/// `schedule()` context-saved spin and the `sys_thread_stop` drain carry their
+/// own). Diagnostic-only — never gates control flow.
 #[cfg(not(test))]
 static SPIN_SITE: [core::sync::atomic::AtomicU32; MAX_CPUS] =
     [const { core::sync::atomic::AtomicU32::new(SPIN_SITE_NONE) }; MAX_CPUS];
@@ -303,8 +300,6 @@ fn spin_site_name(site: u32) -> &'static str
         SPIN_SITE_DEALLOC_NOT_CURRENT => "dealloc:not-current",
         SPIN_SITE_DEALLOC_CONTEXT_SAVED => "dealloc:context-saved",
         SPIN_SITE_DEALLOC_WAKE_IN_FLIGHT => "dealloc:wake-in-flight",
-        SPIN_SITE_SCHEDULE_CONTEXT_SAVED => "schedule:context-saved",
-        SPIN_SITE_THREAD_STOP_DRAIN => "thread-stop:drain",
         _ => "none",
     }
 }
@@ -2062,11 +2057,11 @@ pub unsafe fn migrate_ready_thread(
     let saved_hi = unsafe { hi_sched.lock.lock_raw() };
 
     // The candidate is the caller-named `tcb`, located on `src` by
-    // `relocate_ready_thread`'s own `remove_from_queue(src)`. Read its priority
-    // under sched_lock + both run-queue locks: `sys_thread_set_priority` writes
-    // priority under the same all-CPU-locks discipline (it holds every CPU's
-    // run-queue lock), so this read cannot race it.
-    // SAFETY: tcb valid; priority read under sched_lock + run-queue locks.
+    // `relocate_ready_thread`'s `remove_from_queue(src)`. Read its priority under
+    // the held `(*tcb).sched_lock` — the authoritative serializer that
+    // `sys_thread_set_priority` also takes (outer) around its priority write — so
+    // this read cannot race a concurrent priority change.
+    // SAFETY: tcb valid; priority read under the held sched_lock.
     let priority = unsafe { (*tcb).priority };
 
     // Validate (Ready && context_saved==1 && affinity permits dst) and move

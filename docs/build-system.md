@@ -229,7 +229,11 @@ The `esp/` and root-partition trees are populated from two sources:
   binaries and per-program testers).
 - Static files in [`rootfs/`](../rootfs/) are mirrored directly into
   the sysroot — every file's path under `rootfs/` is its path under
-  `sysroot/` (see [`rootfs/README.md`](../rootfs/README.md)).
+  `sysroot/`. The mirror is authoritative over the subtrees it owns
+  (`config/`, `data/`): files deleted from `rootfs/` are pruned from the
+  sysroot on the next build, while the installed binaries above and the
+  synthesised `data/svctest/` fixtures are left untouched (see
+  [`rootfs/README.md`](../rootfs/README.md)).
 
 The disk image is assembled by xtask after the sysroot is populated. Cargo's
 own `target/` directory contains intermediate compilation artifacts and is

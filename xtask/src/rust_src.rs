@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-//! rust_src.rs
+//! `rust_src.rs`
 //!
 //! Assembles an in-project sysroot under `target/seraph-toolchain/` so
 //! `-Z build-std` can compile `std` with our `std::sys::seraph` overlay,
@@ -84,7 +84,7 @@ const VERSION_STAMP: &str = ".seraph-toolchain-stamp";
 // ── Public entry point ────────────────────────────────────────────────────────
 
 /// Paths and shim config callers route their cargo invocations
-/// through for StdUser builds.
+/// through for `StdUser` builds.
 ///
 /// `rustc` and `ws_clippy` point at the installed shim under
 /// `target/seraph-toolchain/bin/` (the same binary, installed under
@@ -103,7 +103,7 @@ pub struct SeraphToolchain
 
 impl SeraphToolchain
 {
-    /// Set every env var the shim and cargo need to route a StdUser
+    /// Set every env var the shim and cargo need to route a `StdUser`
     /// build through the seraph toolchain mirror: `RUSTC` and
     /// `RUSTC_WORKSPACE_WRAPPER` (mirror entry points), the three
     /// `SERAPH_SHIM_*` config vars (so the shim knows what to exec),
@@ -592,8 +592,7 @@ fn materialise_bin_dir(bin_dir: &Path) -> Result<()>
 {
     let is_symlink = bin_dir
         .symlink_metadata()
-        .map(|m| m.file_type().is_symlink())
-        .unwrap_or(false);
+        .is_ok_and(|m| m.file_type().is_symlink());
     if !is_symlink
     {
         return Ok(());
@@ -922,7 +921,7 @@ fn apply_random_overlay(rust_src: &Path) -> Result<()>
 }
 
 /// Route `std::sys::args` through a seraph module that reads argv from
-/// the read-only ProcessInfo page. See
+/// the read-only `ProcessInfo` page. See
 /// `runtime/ruststd/src/sys/args/seraph.rs` for the backing.
 fn apply_args_overlay(rust_src: &Path, overlay_root: &Path) -> Result<()>
 {

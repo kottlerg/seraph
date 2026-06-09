@@ -5,16 +5,18 @@
 //!
 //! Mkdisk command: re-mirror `rootfs/` into `sysroot/`, re-synthesise
 //! test fixtures, and regenerate `disk.img` without invoking cargo.
-//! Used to refresh the boot image after `rootfs/` or sysroot files
-//! were edited outside the cargo flow (notably: staging a test recipe
-//! by copying it from `sysroot/config/svcmgr/tests/` into
-//! `sysroot/config/svcmgr/services/`).
+//! Used to refresh the boot image after `rootfs/` or sysroot files were
+//! edited outside the cargo flow. Hand-staging a test recipe (copying it
+//! from `sysroot/config/svcmgr/tests/` into `sysroot/config/svcmgr/services/`)
+//! requires `--repack-only`, since a normal re-mirror is authoritative and
+//! would prune the hand-added file.
 //!
 //! `--repack-only` skips the `rootfs/` re-mirror and packs the sysroot as it
-//! stands. The mirror is additive (it copies rootfs files over the sysroot but
-//! never deletes), so a default recipe removed from the staged sysroot would be
-//! restored by a normal repack; `--repack-only` lets a test boot compose an
-//! exact service set by removing such a recipe and packing without the restore.
+//! stands. A normal re-mirror is authoritative over the rootfs-managed subtrees
+//! (`config/`, `data/`): it restores recipes that exist in `rootfs/` and removes
+//! sysroot ones that do not. `--repack-only` lets a test boot compose a service
+//! set that diverges from `rootfs/` — e.g. a default recipe removed, or a test
+//! recipe hand-staged — by packing the staged sysroot without that pass.
 
 use anyhow::Result;
 

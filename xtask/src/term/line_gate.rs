@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-//! term/line_gate.rs
+//! `term/line_gate.rs`
 //!
 //! Line-level marker gate for QEMU output.
 //!
@@ -62,7 +62,7 @@ impl<W: Write> LineGate<W>
     /// builds.
     pub fn new(inner: W, marker: &[u8]) -> Self
     {
-        debug_assert!(!marker.is_empty(), "LineGate marker must be non-empty",);
+        debug_assert!(!marker.is_empty(), "LineGate marker must be non-empty");
         debug_assert!(
             marker.iter().all(|&b| b.is_ascii() && b != 0x1b),
             "LineGate marker must be plain ASCII with no ESC byte",

@@ -71,7 +71,7 @@ pub fn run(ctx: &BuildContext, args: &RunArgs) -> Result<()>
         gdb: args.gdb,
         qmp_socket: None,
     };
-    let qemu_args = build_qemu_argv(&spec);
+    let qemu_args = build_qemu_argv(&spec)?;
 
     let desc = match args.arch
     {

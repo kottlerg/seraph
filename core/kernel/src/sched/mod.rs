@@ -19,6 +19,8 @@
 
 pub mod run_queue;
 pub mod thread;
+#[cfg(not(test))]
+pub mod thread_registry;
 
 #[cfg(not(test))]
 use core::mem::MaybeUninit;
@@ -238,6 +240,78 @@ static WATCHDOG_TICK_COUNTER: core::sync::atomic::AtomicU64 = core::sync::atomic
 
 static WATCHDOG_FIRED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+// ── Per-CPU spin-site breadcrumb ──────────────────────────────────────────────
+
+/// Spin-site code: this CPU is not in any bounded protocol-spin.
+pub const SPIN_SITE_NONE: u32 = 0;
+/// `dealloc_object(Thread)` UAF gate, step 1: spinning until the dying TCB is
+/// no longer `current` on any CPU.
+pub const SPIN_SITE_DEALLOC_NOT_CURRENT: u32 = 1;
+/// `dealloc_object(Thread)` UAF gate, step 2: spinning until the dying TCB's
+/// in-flight register save has published (`context_saved == 1`).
+pub const SPIN_SITE_DEALLOC_CONTEXT_SAVED: u32 = 2;
+/// `dealloc_object(Thread)` wake-in-flight gate: spinning until a waker's
+/// claimed-but-not-yet-committed `enqueue_and_wake` clears `wake_in_flight`.
+pub const SPIN_SITE_DEALLOC_WAKE_IN_FLIGHT: u32 = 3;
+
+/// Per-CPU breadcrumb naming the bounded protocol-spin a CPU is currently
+/// executing, for the softlockup watchdog. A wedged CPU (no non-idle dispatch
+/// for the threshold) stuck in a `dealloc_object(Thread)` gate shows the gate
+/// here, turning an opaque `current = Exited` dump into a named site (#351).
+/// Set on gate entry, cleared on exit; [`SPIN_SITE_NONE`] when not spinning.
+/// Only the three `dealloc_object(Thread)` gates report here — they are the
+/// bounded spins that lack an overlong-duration warning of their own (the
+/// `schedule()` context-saved spin and the `sys_thread_stop` drain carry their
+/// own). Diagnostic-only — never gates control flow.
+#[cfg(not(test))]
+static SPIN_SITE: [core::sync::atomic::AtomicU32; MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU32::new(SPIN_SITE_NONE) }; MAX_CPUS];
+
+/// Record that the current CPU has entered bounded protocol-spin `site`. The
+/// gates that call this run preempt-disabled, so the CPU index is stable across
+/// the spin.
+#[cfg(not(test))]
+pub fn spin_site_enter(site: u32)
+{
+    let cpu = crate::arch::current::cpu::current_cpu() as usize;
+    if cpu < MAX_CPUS
+    {
+        SPIN_SITE[cpu].store(site, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Clear the current CPU's spin-site breadcrumb on gate exit.
+#[cfg(not(test))]
+pub fn spin_site_exit()
+{
+    let cpu = crate::arch::current::cpu::current_cpu() as usize;
+    if cpu < MAX_CPUS
+    {
+        SPIN_SITE[cpu].store(SPIN_SITE_NONE, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Human-readable name for a spin-site code, for the watchdog dump.
+#[cfg(not(test))]
+fn spin_site_name(site: u32) -> &'static str
+{
+    match site
+    {
+        SPIN_SITE_DEALLOC_NOT_CURRENT => "dealloc:not-current",
+        SPIN_SITE_DEALLOC_CONTEXT_SAVED => "dealloc:context-saved",
+        SPIN_SITE_DEALLOC_WAKE_IN_FLIGHT => "dealloc:wake-in-flight",
+        _ => "none",
+    }
+}
+
+/// Test stub: spin-site breadcrumbs are diagnostic-only and compiled out under
+/// host `cfg(test)`.
+#[cfg(test)]
+pub fn spin_site_enter(_site: u32) {}
+/// Test stub; see [`spin_site_enter`].
+#[cfg(test)]
+pub fn spin_site_exit() {}
+
 /// Mark `cpu` as having dispatched a non-idle thread at the current tick.
 pub fn watchdog_mark_non_idle(cpu: usize)
 {
@@ -361,6 +435,14 @@ fn watchdog_tick_and_check()
             now.saturating_sub(last_tick),
             mask
         );
+        // Name the bounded protocol-spin this CPU is wedged in, if any. A CPU
+        // whose `current` is `Exited` but which never returned to the scheduler
+        // is stuck in one of these gates (#351) — the breadcrumb says which.
+        let spin = SPIN_SITE[cpu].load(core::sync::atomic::Ordering::Relaxed);
+        if spin != SPIN_SITE_NONE
+        {
+            crate::kprintln!("    spinning in {}", spin_site_name(spin));
+        }
         // Dump the user-mode trap frame if present: tells us where in
         // userspace the thread entered its currently-stuck syscall.
         // SAFETY: trap_frame is set by every userspace-syscall entry and
@@ -427,7 +509,204 @@ fn watchdog_tick_and_check()
             dl
         );
     }
+    // Enumerate non-running registered threads via the live-thread registry.
+    // The per-CPU `current` dump above shows only each CPU's running/idle
+    // thread. The #351 victim is invisible there: it is either a `Blocked`
+    // waiter parked on an IPC object, or a `Ready` thread stranded in a run
+    // queue that a wedged CPU never dispatched (the `mask` bit is set but no
+    // dispatch happens). For `Blocked` threads the `blocked_on` decode says
+    // whether the blocking object still names the waiter (no wake issued) or
+    // holds data with a cleared slot (a wake deposited but never linked); for
+    // `Ready`/`Stopped` threads the scheduling fields say why a runnable thread
+    // is neither dispatched locally nor stolen (`context_saved`/`queued_on`/
+    // affinity / save-window pin).
+    crate::kprintln!("  NON-RUNNING REGISTERED THREADS:");
+    // Defined outside the `try_for_each` call so the `kprintln!` expansions are
+    // not lexically inside the `unsafe` wrapping that call (which would flag
+    // their macro-internal `unsafe` as redundant). Each raw deref is its own
+    // tight `unsafe`; the field reads race benignly by the stalled contract.
+    let dump_thread = |t: *mut ThreadControlBlock| {
+        // SAFETY: t is a registry-walked TCB held stable by the registry lock.
+        let state = unsafe { (*t).state };
+        match state
+        {
+            thread::ThreadState::Blocked =>
+            {
+                // SAFETY: same contract; reads only plain scalar fields.
+                let (tid, ipc, blocked_on, prio, pref, wake_pending, wake_in_flight, dl) = unsafe {
+                    (
+                        (*t).thread_id,
+                        (*t).ipc_state,
+                        (*t).blocked_on_object,
+                        (*t).priority,
+                        (*t).preferred_cpu,
+                        (*t).wake_pending,
+                        (*t).wake_in_flight
+                            .load(core::sync::atomic::Ordering::Relaxed),
+                        (*t).sleep_deadline,
+                    )
+                };
+                crate::kprintln!(
+                    "    tid{} Blocked ipc={:?} blocked_on={:p} prio={} pref={} \
+                     wake_pending={} wake_in_flight={} dl={}",
+                    tid,
+                    ipc,
+                    blocked_on,
+                    prio,
+                    pref,
+                    wake_pending,
+                    wake_in_flight,
+                    dl
+                );
+                // SAFETY: same contract; watchdog_decode_blocked_on only reads.
+                unsafe { watchdog_decode_blocked_on(t) };
+            }
+            thread::ThreadState::Ready
+            | thread::ThreadState::Stopped
+            | thread::ThreadState::Created =>
+            {
+                // SAFETY: same contract; reads only plain scalar fields.
+                let (tid, prio, pref, aff, queued_on, cs, wif, wp) = unsafe {
+                    (
+                        (*t).thread_id,
+                        (*t).priority,
+                        (*t).preferred_cpu,
+                        (*t).cpu_affinity,
+                        (*t).queued_on.load(core::sync::atomic::Ordering::Relaxed),
+                        (*t).context_saved
+                            .load(core::sync::atomic::Ordering::Relaxed),
+                        (*t).wake_in_flight
+                            .load(core::sync::atomic::Ordering::Relaxed),
+                        (*t).wake_pending,
+                    )
+                };
+                crate::kprintln!(
+                    "    tid{} {:?} prio={} pref={} affinity=0x{:x} queued_on={} \
+                     context_saved={} wake_in_flight={} wake_pending={}",
+                    tid,
+                    state,
+                    prio,
+                    pref,
+                    aff,
+                    queued_on,
+                    cs,
+                    wif,
+                    wp
+                );
+            }
+            // Running threads are each a CPU's `current`, already dumped above.
+            thread::ThreadState::Running | thread::ThreadState::Exited =>
+            {}
+        }
+    };
+    // SAFETY: best-effort read-only walk under the registry lock; the closure
+    // only reads through each TCB pointer (no register/unregister).
+    let walked = unsafe { thread_registry::try_for_each(dump_thread) };
+    if !walked
+    {
+        crate::kprintln!("    (registry lock contended; skipped)");
+    }
     crate::kprintln!("=== END WATCHDOG ===");
+}
+
+/// Decode and print the IPC object a `Blocked` thread is parked on, for the
+/// softlockup watchdog dump. The telling field is whether the object still
+/// names `t` as its waiter (the wake was never issued) or has been cleared /
+/// carries data while `t` is still `Blocked` (the wake was lost between the
+/// waker's deposit and the run-queue link) — the #351 lost-wakeup signature.
+///
+/// # Safety
+/// `t` is a registry-walked TCB pointer held stable by the registry lock. All
+/// reads are benign-racy by the watchdog's already-stalled contract; the
+/// blocking object is read without its lock (the kernel is wedged).
+#[cfg(not(test))]
+// cast_ptr_alignment: blocked_on_object is stored as *mut u8 but always points
+// at a properly-aligned IPC object whose concrete type is named by ipc_state;
+// the same allow covers the parallel casts in dealloc_object's unlink arm.
+#[allow(clippy::cast_ptr_alignment)]
+unsafe fn watchdog_decode_blocked_on(t: *mut ThreadControlBlock)
+{
+    use core::sync::atomic::Ordering;
+    // SAFETY: caller contract; reads ipc_state + blocked_on scalars.
+    let (ipc, blocked_on) = unsafe { ((*t).ipc_state, (*t).blocked_on_object) };
+    if blocked_on.is_null()
+    {
+        return;
+    }
+    // Each arm reads object fields into locals under a tight `unsafe`, then
+    // prints outside it so the `kprintln!` macro's own `unsafe` is not redundant.
+    match ipc
+    {
+        IpcThreadState::BlockedOnEventQueue =>
+        {
+            let eq = blocked_on.cast::<crate::ipc::event_queue::EventQueueState>();
+            // SAFETY: ipc_state classifies blocked_on as an EventQueueState.
+            let (waiter_is_self, count, capacity) = unsafe {
+                (
+                    core::ptr::eq((*eq).waiter, t),
+                    (*eq).count.load(Ordering::Relaxed),
+                    (*eq).capacity,
+                )
+            };
+            crate::kprintln!(
+                "      eq: waiter_is_self={} count={} capacity={}",
+                waiter_is_self,
+                count,
+                capacity
+            );
+        }
+        IpcThreadState::BlockedOnNotification =>
+        {
+            let sig = blocked_on.cast::<crate::ipc::notification::NotificationState>();
+            // SAFETY: ipc_state classifies blocked_on as a NotificationState.
+            let (waiter_is_self, bits) = unsafe {
+                (
+                    core::ptr::eq((*sig).waiter, t),
+                    (*sig).bits.load(Ordering::Relaxed),
+                )
+            };
+            crate::kprintln!(
+                "      notif: waiter_is_self={} bits=0x{:x}",
+                waiter_is_self,
+                bits
+            );
+        }
+        IpcThreadState::BlockedOnReply | IpcThreadState::BlockedOnFault =>
+        {
+            let server = blocked_on.cast::<ThreadControlBlock>();
+            // SAFETY: for a reply/fault block, blocked_on is the server TCB.
+            let (server_tid, reply_is_self, rt) = unsafe {
+                let rt = (*server).reply_tcb.load(Ordering::Relaxed);
+                ((*server).thread_id, core::ptr::eq(rt, t), rt)
+            };
+            crate::kprintln!(
+                "      server tid{} reply_is_self={} reply_tcb={:p}",
+                server_tid,
+                reply_is_self,
+                rt
+            );
+        }
+        IpcThreadState::BlockedOnSend | IpcThreadState::BlockedOnRecv =>
+        {
+            let ep = blocked_on.cast::<crate::ipc::endpoint::EndpointState>();
+            // SAFETY: ipc_state classifies blocked_on as an EndpointState.
+            let (send_head, recv_head) = unsafe { ((*ep).send_head, (*ep).recv_head) };
+            crate::kprintln!(
+                "      ep: send_head={:p} recv_head={:p}",
+                send_head,
+                recv_head
+            );
+        }
+        IpcThreadState::BlockedOnWaitSet =>
+        {
+            let ws = blocked_on.cast::<crate::ipc::wait_set::WaitSetState>();
+            // SAFETY: ipc_state classifies blocked_on as a WaitSetState.
+            let waiter_is_self = unsafe { core::ptr::eq((*ws).waiter, t) };
+            crate::kprintln!("      waitset: waiter_is_self={}", waiter_is_self);
+        }
+        IpcThreadState::None =>
+        {}
+    }
 }
 
 // ── BSP boot transient ────────────────────────────────────────────────────────
@@ -1063,6 +1342,11 @@ pub fn init(cpu_count: u32) -> u32
                     exit_reason: 0,
                     sleep_deadline: 0,
                     extended: thread::ExtendedState::empty(),
+                    // Idle TCBs are never deallocated and never `Blocked`, and
+                    // are already shown by the watchdog's per-CPU `current` dump,
+                    // so they are not threaded onto the diagnostic registry.
+                    registry_next: core::ptr::null_mut(),
+                    registry_prev: core::ptr::null_mut(),
                     magic: thread::TCB_MAGIC,
                 },
             );
@@ -1772,64 +2056,19 @@ pub unsafe fn migrate_ready_thread(
     // SAFETY: lo lock held; acquiring hi second satisfies ascending-CPU order.
     let saved_hi = unsafe { hi_sched.lock.lock_raw() };
 
-    // Authoritative read under sched_lock: only a Ready thread that has FULLY
-    // saved its context (`context_saved == 1`) is migratable. A Ready-but-
-    // `cs == 0` thread is mid-handoff — woken (e.g. a fast IPC reply) while still
-    // `current`/live on its source CPU and not yet switched away; relocating it
-    // cross-CPU would dispatch it on two CPUs at once (#314/#293). `cs == 1`
-    // proves it has switched out and is not `current` anywhere. A skipped
-    // mid-handoff thread keeps its (already-written) affinity and is placed
-    // correctly by its source CPU's `schedule()` cross-affinity arm.
-    // `remove_from_queue(src)` below is the authoritative "located on src" check —
-    // it fails (and we bail) if the thread is Ready on a different CPU's queue or
-    // in the benign Ready-but-unlinked publication window — so no separate
-    // preferred_cpu heuristic is needed.
-    // SAFETY: tcb valid; state/cs/priority read under sched_lock + run-queue locks.
-    let (state, cs, priority) = unsafe {
-        (
-            (*tcb).state,
-            (*tcb).context_saved.load(Ordering::Acquire),
-            (*tcb).priority,
-        )
-    };
+    // The candidate is the caller-named `tcb`, located on `src` by
+    // `relocate_ready_thread`'s `remove_from_queue(src)`. Read its priority under
+    // the held `(*tcb).sched_lock` — the authoritative serializer that
+    // `sys_thread_set_priority` also takes (outer) around its priority write — so
+    // this read cannot race a concurrent priority change.
+    // SAFETY: tcb valid; priority read under the held sched_lock.
+    let priority = unsafe { (*tcb).priority };
 
-    if state != thread::ThreadState::Ready || cs != 1
-    {
-        // SAFETY: paired above; release inner (hi, lo) then outer (sched_lock).
-        unsafe {
-            hi_sched.lock.unlock_raw(saved_hi);
-            lo_sched.lock.unlock_raw(saved_lo);
-            (*tcb).sched_lock.unlock_raw(tcb_sched_saved);
-        }
-        return false;
-    }
-
-    // SAFETY: src and dst schedulers initialised; tcb is Ready; both run-queue
-    // locks held so neither queue's structure can change underneath us.
-    let removed = unsafe { scheduler_for(src_cpu).remove_from_queue(tcb, priority) };
-    if !removed
-    {
-        // Ready but not linked on src — either the benign Ready-but-unlinked
-        // publication window (a pending enqueue_and_wake will place it), or it is
-        // Ready on a different CPU's queue. Either way nothing to do here; that
-        // CPU's schedule()/enqueue honours the new affinity.
-        // SAFETY: paired above; release inner (hi, lo) then outer (sched_lock).
-        unsafe {
-            hi_sched.lock.unlock_raw(saved_hi);
-            lo_sched.lock.unlock_raw(saved_lo);
-            (*tcb).sched_lock.unlock_raw(tcb_sched_saved);
-        }
-        return false;
-    }
-
-    // SAFETY: dst scheduler initialised; tcb is no longer on src's queue.
-    unsafe { scheduler_for(dst_cpu).enqueue(tcb, priority) };
-    // SAFETY: tcb valid; sched_lock + both run-queue locks held.
-    unsafe { (*tcb).preferred_cpu = dst_cpu as u32 };
-
-    // Publish reschedule-pending before the unlock so the dst CPU's idle
-    // loop / schedule() sees it via the Release on unlock.
-    set_reschedule_pending_for(dst_cpu);
+    // Validate (Ready && context_saved==1 && affinity permits dst) and move
+    // src→dst, all under the held locks. Here the caller (sys_thread_set_affinity)
+    // has just set cpu_affinity = dst_cpu, so the affinity gate passes.
+    // SAFETY: sched_lock + both run-queue locks held (ascending CPU order).
+    let moved = unsafe { relocate_ready_thread(tcb, src_cpu, dst_cpu, priority) };
 
     // SAFETY: paired above; release inner (hi, lo) then outer (sched_lock).
     unsafe {
@@ -1838,10 +2077,103 @@ pub unsafe fn migrate_ready_thread(
         (*tcb).sched_lock.unlock_raw(tcb_sched_saved);
     }
 
-    // Always-IPI per the wake-protocol invariant.
-    // SAFETY: dst_cpu validated < cpu_count above.
-    unsafe { wake_idle_cpu(dst_cpu) };
+    if moved
+    {
+        // Always-IPI per the wake-protocol invariant.
+        // SAFETY: dst_cpu validated < cpu_count above.
+        unsafe { wake_idle_cpu(dst_cpu) };
+    }
 
+    moved
+}
+
+/// Relocate a Ready candidate from `src_cpu` to `dst_cpu`: the single
+/// validate-then-move core shared by [`migrate_ready_thread`] (canonical
+/// `sched_lock` → run-queue lock order) and [`pull_unpinned_ready`] (inverse,
+/// `try_lock`'d order). One place takes a Ready TCB off one queue and puts it on
+/// another, mirroring `PerCpuScheduler::enqueue` as the single insertion
+/// chokepoint.
+///
+/// Validates, under the caller-held `sched_lock` (the authoritative serializer):
+/// - `state == Ready` AND `context_saved == 1` — a `cs == 0` Ready thread is
+///   mid-handoff (woken while still `current`/live on its source CPU, not yet
+///   switched away); relocating it would dispatch it on two CPUs at once
+///   (#314/#293). `cs == 1` proves it switched out and is `current` nowhere.
+/// - hard `cpu_affinity` permits `dst_cpu`. This gate closes the load-balancer
+///   affinity violation: `pull_unpinned_ready`'s `find_runnable` predicate reads
+///   `cpu_affinity` *advisorily* under the run-queue lock, so a concurrent
+///   `sys_thread_set_affinity` can pin the thread away from `dst_cpu` between the
+///   predicate and here. Re-reading affinity under `sched_lock` honours the pin.
+///
+/// `remove_from_queue(src, priority)` is the authoritative "located on src at
+/// `priority`" check; it fails (benign no-op) if the thread moved or is in the
+/// Ready-but-unlinked publication window. A declined relocation leaves the
+/// candidate on `src`, corrected by the next `schedule()` cross-affinity arm or
+/// balance tick — eventual consistency, not instant re-homing (#116).
+///
+/// Returns `true` iff the thread was relocated.
+///
+/// # Safety
+/// Caller MUST hold `(*tcb).sched_lock` AND both `src`/`dst` run-queue locks
+/// (acquired in ascending CPU order). `priority` MUST be the level the candidate
+/// is linked at on `src_cpu` — the value the caller located it by — NOT a
+/// re-read of `(*tcb).priority` inside a context where a concurrent
+/// `sys_thread_set_priority` could have desynced them. Takes/releases NO lock and
+/// sends NO IPI: the caller owns the lock lifecycle and the `wake_idle_cpu(dst)`
+/// that follows a `true` return.
+#[cfg(not(test))]
+unsafe fn relocate_ready_thread(
+    tcb: *mut thread::ThreadControlBlock,
+    src_cpu: usize,
+    dst_cpu: usize,
+    priority: u8,
+) -> bool
+{
+    use core::sync::atomic::Ordering;
+    // SAFETY: tcb valid by caller contract; magic readable.
+    debug_assert!(unsafe { (*tcb).magic == thread::TCB_MAGIC });
+
+    // SAFETY: state/cs/affinity read under the caller-held sched_lock.
+    let (state, cs, affinity) = unsafe {
+        (
+            (*tcb).state,
+            (*tcb).context_saved.load(Ordering::Acquire),
+            (*tcb).cpu_affinity,
+        )
+    };
+
+    if state != thread::ThreadState::Ready || cs != 1
+    {
+        return false;
+    }
+    if affinity != AFFINITY_ANY && affinity as usize != dst_cpu
+    {
+        return false;
+    }
+
+    // G3: the relocation only proceeds for a Ready candidate.
+    debug_assert!(state == thread::ThreadState::Ready);
+    // SAFETY: both run-queue locks held; tcb pinned by them. `remove_from_queue`
+    // is the authoritative located-on-src check at `priority`.
+    if !unsafe { scheduler_for(src_cpu).remove_from_queue(tcb, priority) }
+    {
+        return false;
+    }
+    // SAFETY: tcb no longer on src; dst scheduler valid; both locks held.
+    unsafe { scheduler_for(dst_cpu).enqueue(tcb, priority) };
+    // SAFETY: tcb valid; sched_lock + both run-queue locks held.
+    unsafe { (*tcb).preferred_cpu = dst_cpu as u32 };
+    // G4: the relocated thread is linked on dst at exactly `priority` (a stale
+    // tag here would mean a double-relocate left an inconsistent link).
+    // SAFETY: tcb valid; queued_on read under the held run-queue locks.
+    let linked_at = unsafe { (*tcb).queued_on.load(Ordering::Relaxed) };
+    debug_assert!(
+        linked_at == i16::from(priority),
+        "relocate_ready_thread: queued_on != priority after enqueue",
+    );
+    // Publish reschedule-pending before the caller's unlock so the dst CPU's
+    // idle loop / schedule() observes it via the Release on unlock.
+    set_reschedule_pending_for(dst_cpu);
     true
 }
 
@@ -2061,26 +2393,16 @@ unsafe fn pull_unpinned_ready(src_cpu: usize, dst_cpu: usize)
         return;
     };
 
-    // SAFETY: tcb is currently linked in src_cpu's run queue at `priority`.
-    let removed = unsafe { scheduler_for(src_cpu).remove_from_queue(tcb, priority) };
-    if !removed
-    {
-        // SAFETY: paired above; release the candidate's sched_lock and hi, then
-        // lo last (lo captured the caller's interrupt flags).
-        unsafe {
-            (*tcb).sched_lock.unlock_raw(tcb_sched_saved);
-            hi_sched.lock.unlock_raw(saved_hi);
-            lo_sched.lock.unlock_raw(saved_lo);
-        }
-        return;
-    }
-
-    // SAFETY: tcb is no longer on src; dst_cpu scheduler is valid.
-    unsafe { scheduler_for(dst_cpu).enqueue(tcb, priority) };
-    // SAFETY: tcb valid; sched_lock + both run-queue locks held.
-    unsafe { (*tcb).preferred_cpu = dst_cpu as u32 };
-
-    set_reschedule_pending_for(dst_cpu);
+    // Validate (Ready && context_saved==1 && affinity permits dst) under the
+    // candidate's sched_lock and move src→dst, with the `priority` that
+    // `find_runnable` located it at (NOT a re-read of (*tcb).priority): that is
+    // the level `remove_from_queue` needs, and the src run-queue lock held since
+    // the predicate pins it against a concurrent `sys_thread_set_priority`. The
+    // affinity gate inside `relocate_ready_thread` closes the load-balancer
+    // affinity violation the advisory `find_runnable` predicate cannot — a
+    // `sys_thread_set_affinity` racing between the predicate and here.
+    // SAFETY: sched_lock + both run-queue locks held.
+    let moved = unsafe { relocate_ready_thread(tcb, src_cpu, dst_cpu, priority) };
 
     // SAFETY: paired above; release the candidate's sched_lock and hi, then lo
     // last (lo captured the caller's interrupt flags).
@@ -2090,8 +2412,11 @@ unsafe fn pull_unpinned_ready(src_cpu: usize, dst_cpu: usize)
         lo_sched.lock.unlock_raw(saved_lo);
     }
 
-    // SAFETY: dst_cpu validated < cpu_count.
-    unsafe { wake_idle_cpu(dst_cpu) };
+    if moved
+    {
+        // SAFETY: dst_cpu validated < cpu_count.
+        unsafe { wake_idle_cpu(dst_cpu) };
+    }
 }
 
 /// Test stub.
@@ -2351,22 +2676,57 @@ pub unsafe fn enqueue_ready_thread(_tcb: *mut ThreadControlBlock, _target_cpu: u
 #[cfg(not(test))]
 pub unsafe fn select_target_cpu(tcb: *mut ThreadControlBlock) -> usize
 {
+    // SAFETY: caller guarantees tcb is valid.
+    unsafe { select_target_cpu_excluding(tcb, None) }
+}
+
+/// Like [`select_target_cpu`], but treat `exclude` (when `Some`) as ineligible
+/// for the save-window-pin, sticky, and min-load branches — UNLESS hard
+/// `cpu_affinity` names it (affinity is a correctness constraint that overrides
+/// the placement hint) or it is the only CPU.
+///
+/// `dealloc_object(Thread)`'s deferred reply-wake passes `exclude =
+/// Some(dealloc_cpu)`. That CPU is wedged in a preempt-disabled UAF gate, NOT in
+/// `schedule()`, so the save-window pin's deadlock-avoidance rationale does not
+/// apply to it: pinning a `context_saved == 0` woken client there would strand
+/// it on a CPU that cannot re-enter the scheduler until the dealloc returns —
+/// which it cannot do while that client is the only runnable thread (#351). When
+/// the pin / sticky / min-load choice would land on `exclude`, fall back to the
+/// least-loaded non-excluded CPU. A peer dispatches the `cs == 0` client safely:
+/// `schedule()` waits on the publication barrier (`context_saved` Acquire spin)
+/// before the register switch, so a peer never loads a not-yet-saved register
+/// file.
+///
+/// # Safety
+/// `tcb` must be a valid pointer to an initialized [`ThreadControlBlock`].
+// needless_range_loop: the scheduler slab is reached via scheduler_ptr(cpu);
+// indexed bounds checking is clearer than iter/enumerate pointer plumbing.
+#[allow(clippy::needless_range_loop)]
+#[cfg(not(test))]
+pub unsafe fn select_target_cpu_excluding(
+    tcb: *mut ThreadControlBlock,
+    exclude: Option<usize>,
+) -> usize
+{
     // SAFETY: caller guarantees tcb is valid; cpu_affinity field is always valid.
     let affinity = unsafe { (*tcb).cpu_affinity };
 
-    // Hard affinity: use specified CPU.
+    // Hard affinity wins, even when it names the excluded CPU: affinity is a
+    // correctness constraint, not a placement hint.
     if affinity != AFFINITY_ANY
     {
         return affinity as usize;
     }
 
     let cpu_count = CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
+    let eligible = |c: usize| -> bool { c < cpu_count && Some(c) != exclude };
 
     // Save-window pinning: while `context_saved == 0` the source CPU is
-    // mid-switch into `tcb.saved_state`. Migrating the wake to a different
-    // CPU would force its `schedule()` to spin on the publication barrier;
-    // two such migrations on different CPUs can cross-deadlock. Pinning
-    // to `preferred_cpu` (the CPU performing the save) avoids both.
+    // mid-switch into `tcb.saved_state`. Pinning to `preferred_cpu` (the saving
+    // CPU) lets that CPU's own `schedule()` complete the save before re-running
+    // the thread, avoiding a cross-CPU publication-barrier spin. Honoured only
+    // when `preferred_cpu` is eligible; otherwise fall through so a `cs == 0`
+    // client is never pinned to the excluded (wedged) CPU.
     // SAFETY: tcb valid; context_saved is AtomicU32; preferred_cpu always set.
     let saved = unsafe {
         (*tcb)
@@ -2375,23 +2735,26 @@ pub unsafe fn select_target_cpu(tcb: *mut ThreadControlBlock) -> usize
     };
     if saved == 0
     {
-        // SAFETY: preferred_cpu is set by every prior enqueue_and_wake;
-        // bounded by CPU_COUNT at the source.
+        // SAFETY: preferred_cpu is set by every prior enqueue_and_wake.
         let pref = unsafe { (*tcb).preferred_cpu } as usize;
-        if pref < cpu_count
+        if eligible(pref)
         {
             return pref;
         }
     }
 
-    // Scan all CPUs for min load. Used both as the fallback selection and as
-    // the reference value for the sticky-preferred-CPU comparison below.
+    // Scan ELIGIBLE CPUs for min load. `usize::MAX` marks "no eligible CPU"
+    // (degenerate: cpu_count == 1 and that CPU excluded).
     let mut min_load = u32::MAX;
-    let mut min_cpu = 0;
+    let mut min_cpu = usize::MAX;
     // SAFETY: scheduler slab covers cpu_count slots, all initialised by sched::init.
     for cpu in 0..cpu_count
     {
-        // SAFETY: cpu < cpu_count; scheduler slab initialised for all CPUs by sched::init.
+        if !eligible(cpu)
+        {
+            continue;
+        }
+        // SAFETY: cpu < cpu_count; scheduler slab initialised for all CPUs.
         let load = unsafe { (*scheduler_ptr(cpu)).current_load() };
         if load < min_load
         {
@@ -2400,13 +2763,12 @@ pub unsafe fn select_target_cpu(tcb: *mut ThreadControlBlock) -> usize
         }
     }
 
-    // Sticky preferred CPU: stay if within the pull-balancer's imbalance
-    // threshold of the global minimum. See doc comment above.
-    // SAFETY: preferred_cpu is set by every prior enqueue_and_wake; bounded
-    // by CPU_COUNT at the source. The `< cpu_count` guard makes a stale or
-    // never-initialised value fall through to the min-load path.
+    // Sticky preferred CPU (eligible only): stay if within the pull-balancer's
+    // imbalance threshold of the global minimum (cache-warmth bias, #128).
+    // SAFETY: preferred_cpu is set by every prior enqueue_and_wake; the
+    // eligibility guard makes a stale value fall through to the min-load path.
     let pref = unsafe { (*tcb).preferred_cpu } as usize;
-    if pref < cpu_count
+    if eligible(pref)
     {
         // SAFETY: pref < cpu_count; slab initialised.
         let pref_load = unsafe { (*scheduler_ptr(pref)).current_load() };
@@ -2416,6 +2778,21 @@ pub unsafe fn select_target_cpu(tcb: *mut ThreadControlBlock) -> usize
         }
     }
 
+    // Degenerate: no eligible CPU (cpu_count == 1, or every non-excluded queue
+    // filtered). Returning the excluded CPU is correct — on a single CPU the
+    // dealloc caller returns to schedule() via the syscall epilogue and
+    // dispatches the client itself; the strand requires an idle peer.
+    if min_cpu == usize::MAX
+    {
+        return exclude.unwrap_or(0);
+    }
+
+    // G2: the exclusion holds for the load-scan result (affinity / single-CPU
+    // overrides returned earlier).
+    debug_assert!(
+        Some(min_cpu) != exclude,
+        "select_target_cpu_excluding: load scan returned excluded cpu {min_cpu}",
+    );
     min_cpu
 }
 

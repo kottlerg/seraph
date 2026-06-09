@@ -1516,11 +1516,11 @@ unsafe fn dealloc_object_one(
                 // § dealloc_object(Thread) Drain Protocol: lock every CPU
                 // (preferred_cpu is racy with concurrent enqueue_and_wake),
                 // commit Exited, drain queues, snapshot any reply-bound
-                // client for wake outside the all-locks region.
-                let server_reply_wake: Option<(
-                    *mut crate::sched::thread::ThreadControlBlock,
-                    usize,
-                )>;
+                // client for wake outside the all-locks region. The wake's
+                // target CPU is NOT snapshotted here: it is recomputed at the
+                // deferred wake site below, under the client's up-to-date state
+                // and excluding this (dealloc) CPU (#351).
+                let server_reply_wake: Option<*mut crate::sched::thread::ThreadControlBlock>;
                 // needless_range_loop: explicit indexing reads clearer for the
                 // parallel scheduler_for(cpu) accesses across all CPUs.
                 #[allow(clippy::needless_range_loop)]
@@ -1628,8 +1628,7 @@ unsafe fn dealloc_object_one(
                                         .set_return(syscall::SyscallError::Interrupted as i64);
                                 }
                             }
-                            let bcpu = crate::sched::select_target_cpu(bound);
-                            Some((bound, bcpu))
+                            Some(bound)
                         }
                         else
                         {
@@ -1683,6 +1682,7 @@ unsafe fn dealloc_object_one(
                     // until it switches away, then re-scan; once a full scan is
                     // clean, no CPU can re-install `tcb` (it is `Exited` and
                     // unlinked from every run queue under the all-locks region).
+                    crate::sched::spin_site_enter(crate::sched::SPIN_SITE_DEALLOC_NOT_CURRENT);
                     loop
                     {
                         let run_cpu = 'scan: {
@@ -1717,6 +1717,7 @@ unsafe fn dealloc_object_one(
                     }
 
                     // Step 2: register save published.
+                    crate::sched::spin_site_enter(crate::sched::SPIN_SITE_DEALLOC_CONTEXT_SAVED);
                     while (*tcb)
                         .context_saved
                         .load(core::sync::atomic::Ordering::Acquire)
@@ -1724,6 +1725,7 @@ unsafe fn dealloc_object_one(
                     {
                         core::hint::spin_loop();
                     }
+                    crate::sched::spin_site_exit();
 
                     // Restore the caller's interrupt state and preemption.
                     // SAFETY: saved_int from save_and_disable_interrupts above.
@@ -1746,7 +1748,7 @@ unsafe fn dealloc_object_one(
                 // gate observes Exited and aborts the link instead of resurrecting
                 // a freed TCB. wake_in_flight (set above) kept the client alive
                 // until here and is cleared on every enqueue_and_wake exit path.
-                if let Some((bound, bcpu)) = server_reply_wake
+                if let Some(bound) = server_reply_wake
                 {
                     // #317 predecessor-of-free null: clear the claimed client's
                     // `blocked_on_object` (which still points at THIS dying server,
@@ -1772,6 +1774,34 @@ unsafe fn dealloc_object_one(
                         }
                         (*bound).sched_lock.unlock_raw(bs);
                     }
+                    // Recompute the wake target HERE (post-gates), under the
+                    // client's current state, EXCLUDING this dealloc CPU. This
+                    // CPU is wedged in the preempt-disabled UAF gates above, not
+                    // in schedule(), so it cannot dispatch a client linked onto
+                    // it — the save-window pin would strand a `context_saved==0`
+                    // client here (#351). A peer dispatches it safely via the
+                    // schedule() publication-barrier spin. Recomputing at wake
+                    // time (rather than snapshotting under the all-CPU locks
+                    // above) also closes the double-enqueue straddle: the target
+                    // reflects the state at link time, not two unbounded spins
+                    // earlier (#289).
+                    let this_cpu = crate::arch::current::cpu::current_cpu() as usize;
+                    // SAFETY: bound kept valid by wake_in_flight = 1 above;
+                    // select_target_cpu_excluding is lock-free.
+                    let bcpu =
+                        unsafe { crate::sched::select_target_cpu_excluding(bound, Some(this_cpu)) };
+                    // G1: the reply-wake is never self-pinned to the wedged
+                    // dealloc CPU unless hard affinity names it or it is the only
+                    // CPU.
+                    debug_assert!(
+                        bcpu != this_cpu
+                            || crate::sched::CPU_COUNT
+                                .load(core::sync::atomic::Ordering::Relaxed)
+                                == 1
+                            // SAFETY: bound valid (pinned by wake_in_flight).
+                            || unsafe { (*bound).cpu_affinity } != crate::sched::AFFINITY_ANY,
+                        "dealloc reply-wake self-pinned to dealloc cpu {this_cpu}",
+                    );
                     // SAFETY: bound kept valid by wake_in_flight = 1 above.
                     unsafe { crate::sched::enqueue_and_wake(bound, bcpu) };
                 }
@@ -1989,6 +2019,7 @@ unsafe fn dealloc_object_one(
                     unsafe { crate::arch::current::cpu::save_and_disable_interrupts() };
                 // SAFETY: ring 0; IDT loaded; preempt disabled.
                 unsafe { crate::arch::current::interrupts::enable() };
+                crate::sched::spin_site_enter(crate::sched::SPIN_SITE_DEALLOC_WAKE_IN_FLIGHT);
                 // SAFETY: tcb is valid (not yet freed); wake_in_flight is always
                 // valid on an initialized TCB.
                 while unsafe {
@@ -1999,6 +2030,7 @@ unsafe fn dealloc_object_one(
                 {
                     core::hint::spin_loop();
                 }
+                crate::sched::spin_site_exit();
                 // SAFETY: wake_saved_int from save_and_disable_interrupts above.
                 unsafe { crate::arch::current::cpu::restore_interrupts(wake_saved_int) };
                 crate::percpu::preempt_enable();
@@ -2025,6 +2057,16 @@ unsafe fn dealloc_object_one(
                 // Thread retype slot (see sys_cap_create_thread layout); it
                 // is reclaimed wholesale by `retype_free` below as part of
                 // the same slot release, so no separate free is needed.
+
+                // Remove the TCB from the diagnostic live-thread registry
+                // before poisoning/freeing it. The registry walk
+                // (`thread_registry::try_for_each`) holds the registry lock
+                // across every dereference, so unlinking strictly before the
+                // free guarantees the watchdog never observes a dangling node.
+                // A no-op for a TCB that was never registered (e.g. a
+                // never-started thread torn down before its cap was inserted).
+                // SAFETY: tcb valid (not yet freed); leaf lock, nothing else held.
+                unsafe { crate::sched::thread_registry::unregister(tcb) };
 
                 // Poison the TCB so any use-after-free reads garbage
                 // instead of plausible values.

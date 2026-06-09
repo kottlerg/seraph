@@ -328,10 +328,19 @@ impl PerCpuScheduler
             unsafe {
                 let tid = (*tcb).thread_id;
                 let prior = (*tcb).last_enqueue;
+                // Surface the state/cs/affinity of the doubly-linked TCB and the
+                // current link CPU: a residual #289/#351 double-link is driven
+                // by a Blocked-while-linked or self-pinned (cs==0) condition, not
+                // just the bare queued_on tag (G5).
+                let state = (*tcb).state;
+                let cs = (*tcb).context_saved.load(Ordering::Relaxed);
+                let aff = (*tcb).cpu_affinity;
+                let link_cpu = crate::arch::current::cpu::current_cpu();
                 panic!(
                     "PerCpuScheduler::enqueue: tcb {tcb:p} tid={tid} already \
-                     linked at queued_on={prior_link} (re-enqueue at prio={p}) \
-                     — global double-enqueue; prior={prior:?}",
+                     linked at queued_on={prior_link} (re-enqueue at prio={p} on \
+                     cpu={link_cpu}) — global double-enqueue; state={state:?} \
+                     cs={cs} affinity=0x{aff:x}; prior={prior:?}",
                 );
             }
             #[cfg(not(debug_assertions))]

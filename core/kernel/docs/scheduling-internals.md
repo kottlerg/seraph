@@ -43,6 +43,10 @@ The following ordering MUST be observed everywhere in the kernel. Acquiring lock
         │         └─────► SLEEP_LIST_LOCK   (leaf; held alone, or under a
         │                                    source lock — source.lock →
         │                                    SLEEP_LIST_LOCK is the only edge)
+        │
+        │                 THREAD_REGISTRY_LOCK (leaf; held strictly alone — never
+        │                                    under any other lock. Diagnostic-only
+        │                                    live-thread list; see § Thread Registry)
         ▼
    (*tcb).sched_lock                         (per-TCB Scheduling-group serializer)
         │
@@ -57,6 +61,8 @@ The following ordering MUST be observed everywhere in the kernel. Acquiring lock
 2. **At most one source IPC lock at a time.** A code path holding `sig.lock` MUST NOT acquire `ep.lock`, `eq.lock`, or `ws.lock`. The single exception is `waitset_notify`, which is invoked from within a source lock (the source notifying the wait set) and acquires `ws.lock` as the inner lock — order `source.lock → ws.lock` only.
 
 3. **`SLEEP_LIST_LOCK` is leaf-only.** It MAY be acquired from inside any source IPC lock. It MUST NOT contain calls that re-enter IPC or scheduler code while held.
+
+3a. **`THREAD_REGISTRY_LOCK` is strict-leaf-only.** The diagnostic live-thread registry (`core/kernel/src/sched/thread_registry.rs`) is linked at thread construction and unlinked at dealloc, both with `THREAD_REGISTRY_LOCK` held strictly alone — never nested under a source IPC lock, `(*tcb).sched_lock`, or a run-queue lock — so it adds no lock-order edge. The softlockup watchdog walks it via `try_for_each` (a non-blocking `try_lock`, so a contended or CPU-died lock degrades to a skipped section rather than a hang). See § Thread Registry.
 
 4. **Per-TCB-then-cross-CPU acquisition rule.** A path mutating a TCB's Scheduling field group MUST acquire `(*tcb).sched_lock` FIRST (outermost among the scheduler locks), THEN any per-CPU scheduler.lock(s); when two or more per-CPU scheduler.locks are needed simultaneously, they MUST be taken in ascending-CPU order. Live production sites: `sched::migrate_ready_thread` (used by `sys_thread_set_affinity` active migration and the periodic load balancer; `(*tcb).sched_lock` then the two CPU locks ascending), `dealloc_object(Thread)` (`(*tcb).sched_lock` then the all-CPU walk in ascending order), `sched::set_state_under_all_locks` (lifecycle state writes; same shape), and `sys_thread_set_priority` (priority writes plus locate-and-relocate of the Ready TCB's queue entry; `(*tcb).sched_lock` then the all-CPU walk in ascending order). A path MUST NEVER hold two different TCBs' `sched_lock`s at once — `schedule()`'s outgoing-then-incoming flip releases `current.sched_lock` before acquiring `next.sched_lock`.
 
@@ -184,6 +190,23 @@ was dropped). During the transient, `tcb` is Ready-but-unlinked, so the
 and leaves the pending link to place the TCB. The next caller of
 `migrate_ready_thread` (or the load balancer) re-runs the migration if still
 warranted.
+
+`migrate_ready_thread` and the load balancer's `pull_unpinned_ready` both
+funnel their validate-then-move through one primitive, `relocate_ready_thread`,
+which reads `(state == Ready && context_saved == 1 && cpu_affinity permits
+dst_cpu)` entirely under the caller-held `(*tcb).sched_lock` (the caller owns the
+four-lock lifecycle and the post-move IPI). The affinity gate closes a
+load-balancer affinity violation: `pull_unpinned_ready`'s `find_runnable`
+predicate reads `cpu_affinity` *advisorily* under the run-queue lock, so a
+concurrent `sys_thread_set_affinity` pinning the candidate away from `dst_cpu`
+between the predicate and the move was previously honoured nowhere — the puller
+would relocate a freshly-pinned thread to a forbidden CPU. Re-reading affinity
+under `sched_lock` (the owning serializer) makes the puller decline; the
+candidate is then placed correctly by the next `schedule()` cross-affinity arm
+or balance tick (eventual consistency, not instant re-homing — #116). The
+primitive takes the caller-located `priority` (the level `find_runnable` /
+`migrate` found the candidate at), never re-reading `(*tcb).priority`, which a
+concurrent `sys_thread_set_priority` could desync from the linked level.
 
 `PerCpuScheduler::enqueue` (not `change_priority`) is the correct primitive
 for the syscall's re-enqueue half: `change_priority`'s enqueue is
@@ -359,6 +382,22 @@ cache-warmth alignment with the documented soft-affinity intent in
 `scheduler.md` § Soft Affinity; #128's actual root cause turned out
 to be unrelated (`CSpaceId` namespace exhaustion, see commits on
 that issue).
+
+`select_target_cpu_excluding(tcb, exclude)` is the same policy with one CPU
+removed from the save-window-pin / sticky / min-load branches (hard affinity
+still wins, and the excluded CPU is returned only as a single-CPU fallback).
+`dealloc_object(Thread)`'s deferred reply-wake calls it with
+`exclude = Some(dealloc_cpu)`: the dealloc CPU is wedged in a preempt-disabled
+UAF gate, **not** in `schedule()`, so the save-window pin's deadlock-avoidance
+rationale does not apply to it — pinning a `context_saved == 0` woken client
+there strands it on a CPU that cannot re-enter the scheduler until the dealloc
+returns, which it cannot do while that client is the only runnable thread
+(#351). The target is also recomputed at the *wake* site rather than snapshotted
+inside the all-CPU-locks region: snapshotting two unbounded gate-spins before
+the link let the client's state drift, widening the double-enqueue straddle
+(#289). A peer dispatches the `cs == 0` client safely because the consumer-side
+`schedule()` waits on the `context_saved` Acquire publication barrier before the
+register switch.
 
 Consumer side (`idle_thread_entry`, `core/kernel/src/sched/mod.rs`):
 
@@ -579,6 +618,30 @@ priority, preferred_cpu, idle age, non-empty mask) plus the head of
 `WATCHDOG_THRESHOLD_TICKS` (~3 s at the observed ~1 ms tick). Single-shot
 via `WATCHDOG_FIRED`.
 
+Each per-CPU line also carries a **spin-site breadcrumb**: a wedged CPU whose
+`current` is `Exited` but which never returned to the scheduler is stuck in a
+bounded protocol-spin, and the breadcrumb (`spin_site_enter`/`spin_site_exit`,
+set around each gate) names which one — `dealloc:not-current`,
+`dealloc:context-saved`, or `dealloc:wake-in-flight`. The `dealloc_object(Thread)`
+gates carried no overlong-duration warning of their own (unlike the `schedule()`
+context-saved spin and the `sys_thread_stop` drain), so a wedge there showed only
+an opaque `current = Exited` in `SYS_CAP_DELETE` (#351); the breadcrumb makes it
+explicit.
+
+The dump then walks the live-thread registry (§ Thread Registry) and prints
+every non-running registered thread. For a `Blocked` thread it shows the
+`wake_pending`/`wake_in_flight` flags and a decode of `blocked_on_object`:
+whether the blocking object still names the thread as its waiter
+(`waiter_is_self` / `reply_is_self`) or holds data with a cleared waiter slot
+(`count > 0`) — distinguishing a wake that was never issued from one deposited
+but never linked. For a `Ready`/`Stopped` thread it shows
+`context_saved`/`queued_on`/affinity/`preferred_cpu` — why a runnable thread is
+neither dispatched by its wedged owner CPU nor stolen by an idle one (e.g. the
+save-window pin holds a `context_saved == 0` thread on its owner). The per-CPU
+`current` dump shows only each CPU's running/idle thread, so both victim shapes
+— a `Blocked` waiter on an IPC object, or a `Ready` thread stranded in a wedged
+CPU's run queue — were invisible before this enumeration (#351).
+
 **Cost:** one Relaxed counter increment per BSP timer tick, one Relaxed
 store per non-idle context switch, an O(MAX_CPUS) early-exit loop per tick.
 Zero overhead when healthy.
@@ -610,6 +673,32 @@ scheduler state without taking a lock that the stalled CPUs themselves hold.
 `sys_thread_stop`) carry single-shot overlong-duration warnings. These are
 not the watchdog; they fire only when the spin overruns and identify the
 stuck participants. Zero overhead in healthy paths.
+
+## Thread Registry
+
+`core/kernel/src/sched/thread_registry.rs` is a diagnostic-only intrusive
+doubly-linked list of every live TCB, threaded through `registry_next` /
+`registry_prev` and guarded by the strict-leaf `THREAD_REGISTRY_LOCK` (Lock
+Hierarchy rule 3a). It exists solely so the softlockup watchdog can enumerate
+`Blocked` waiters that the per-CPU `current` dump cannot reach.
+
+**Membership.** `register` splices a TCB onto the head; `unregister` removes it.
+A thread is registered on the success path of `sys_cap_create_thread` (after its
+cap is inserted — the rollback arm frees the TCB via `retype_free` without ever
+registering it, so register-on-success keeps the two symmetric) and on
+init's bootstrap thread. It is unregistered in the `dealloc_object(Thread)` arm
+strictly before the TCB is poisoned/freed: the walk holds `THREAD_REGISTRY_LOCK`
+across every dereference, so unlinking before the free guarantees the watchdog
+never observes a dangling node. Idle TCBs are deliberately not registered — they
+are never `Blocked` and are already shown by the per-CPU `current` dump.
+
+**Walk.** `try_for_each` takes the lock with a non-blocking `try_lock`: if it is
+contended (a register/unregister in flight) or a CPU died holding it, the walk is
+skipped rather than spun on — the watchdog must never block. A `MAX_WALK` bound
+caps a corrupted-into-a-cycle list so the already-fatal dump still terminates.
+
+**Not a scheduling structure.** The registry is never read on any hot path; it
+adds one leaf-lock acquire at thread create/destroy and nothing elsewhere.
 
 ---
 

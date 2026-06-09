@@ -128,9 +128,16 @@ The teardown sequence binds the following ordered steps. Each step's preconditio
 3. Write tcb.state = Exited.
 4. For each CPU in 0..cpu_count: scheduler_for(cpu).remove_from_queue(tcb, prio).
 5. Server-side BlockedOnReply check: if (*tcb).reply_tcb is non-null,
-   compare_exchange(bound, null, AcqRel, Acquire) to claim the binding,
-   then prepare the bound client for wake (set state = Ready, ipc_state = None,
-   blocked_on = null, trap_frame.return = Interrupted). The actual
+   compare_exchange(bound, null, AcqRel, Acquire) to claim the binding, then
+   DEPOSIT only the resume disposition (trap_frame.return = Interrupted for a
+   syscall caller, or fault_outcome = Kill for a fault-blocked client) and leave
+   the client BLOCKED. The client's Scheduling-group fields (state/ipc_state/
+   blocked_on) are NOT written here — they are written only by the gated
+   enqueue_and_wake (step 8) under the CLIENT's own sched_lock, never under the
+   server's locks (pre-setting state = Ready here was the #284 residual: a
+   concurrent dealloc(client) marking the client Exited under its sched_lock
+   raced the unsynchronised Ready write). The wake's target CPU is NOT computed
+   here either; it is recomputed at the wake site (step 8). The actual
    enqueue_and_wake happens AFTER step 7 because it would deadlock against
    the held scheduler.locks.
 6. No in-region `current` snapshot is required: the post-release gate (step 9)
@@ -138,7 +145,13 @@ The teardown sequence binds the following ordered steps. Each step's preconditio
    all-locks `running_on` reading (which names at most one CPU and can be stale
    the instant the locks drop).
 7. Release every scheduler.lock in descending order.
-8. If a server_reply_wake was prepared in step 5, enqueue_and_wake(bound, ...).
+8. If a server_reply_wake was prepared in step 5, recompute the target CPU now
+   via select_target_cpu_excluding(bound, Some(this_cpu)) — excluding THIS
+   dealloc CPU, which is wedged in the gates below (steps 9/12) and so cannot
+   dispatch a client linked onto it (#351) — then enqueue_and_wake(bound,
+   target). Recomputing here rather than snapshotting in step 5 also closes the
+   double-enqueue straddle: the placement reflects the client's state at link
+   time, not two unbounded gate-spins earlier (#289).
 9. `current`-anywhere gate (UNCONDITIONAL): scan every CPU, each under its own
    scheduler.lock; if some CPU has `scheduler_for(cpu).current == tcb`, spin on
    that CPU's lock until it switches away, then re-scan. Proceed only when a

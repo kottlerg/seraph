@@ -1085,6 +1085,8 @@ unsafe fn kernel_entry_post_rebase(
                         exit_reason: 0,
                         sleep_deadline: 0,
                         extended: sched::thread::ExtendedState::from_raw(init_extended_area),
+                        registry_next: core::ptr::null_mut(),
+                        registry_prev: core::ptr::null_mut(),
                         magic: sched::thread::TCB_MAGIC,
                     },
                 );
@@ -1099,6 +1101,11 @@ unsafe fn kernel_entry_post_rebase(
                         deferred_next: core::ptr::null_mut(),
                     },
                 );
+                // Diagnostic registry: thread the init TCB onto the live-thread
+                // list so the softlockup watchdog can enumerate it as a Blocked
+                // waiter (#351). Removed by `dealloc_object(Thread)` if init's
+                // Thread cap is ever deleted/revoked.
+                sched::thread_registry::register(tcb_ptr);
             }
             seed.header.inc_ref();
 

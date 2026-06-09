@@ -2311,10 +2311,18 @@ fn nonnull_from_box<T>(b: Box<T>) -> NonNull<KernelObjectHeader>
 
 /// Move a capability between `CSpaces`, rewriting derivation tree pointers in place.
 ///
-/// The moved slot takes the **same position** in the derivation tree as the source:
-/// parent, children, and siblings all have their pointers updated to the new
-/// `(dst_cspace_id, new_idx)` location. No ref-count change occurs — this is a
-/// move, not a copy.
+/// The destination slot takes the source's exact position in the derivation
+/// tree: parent, children, and siblings are repointed to the new
+/// `(dst_cspace_id, new_idx)` location. A cross-CSpace move preserves the
+/// derivation edge across the boundary, so a `revoke_subtree` rooted in the
+/// source `CSpace` can reach and free the moved slot in the destination.
+///
+/// That cross-CSpace free is safe against stale-handle aliasing (#349) because
+/// cap handles carry a per-slot generation: freeing a slot bumps its
+/// generation, so a recipient that still holds the old handle fails with
+/// `InvalidCapability` instead of aliasing whatever later reuses the index.
+///
+/// No ref-count change occurs — this is a move, not a copy.
 ///
 /// # Contract
 /// - **Caller must hold [`DERIVATION_LOCK`]`.write_lock()`** for the duration.
@@ -2325,8 +2333,12 @@ fn nonnull_from_box<T>(b: Box<T>) -> NonNull<KernelObjectHeader>
 /// - Source slot must be non-null.
 /// - `dst_cspace` must have at least one free slot (call `pre_allocate` first).
 ///
-/// Returns the new slot index in `dst_cspace`, or an error if the source slot
-/// is null/invalid or the destination `CSpace` is full.
+/// Returns the encoded cap handle (generation + index) for the new slot in
+/// `dst_cspace`, or an error if the source slot is null/invalid or the
+/// destination `CSpace` is full. `src_idx` must be a decoded (bare) index. The
+/// `sys_cap_move` caller decodes and generation-validates the source handle
+/// first; the IPC transfer path supplies a generation-stripped index and does
+/// not (the send-path residual, #349).
 ///
 /// # Safety
 /// `src_cspace` and `dst_cspace` must be valid, live `CSpace` pointers.
@@ -2375,7 +2387,9 @@ pub unsafe fn move_cap_between_cspaces(
     let src_slot_id = SlotId::current(src_cspace_id, src_idx_nz);
     let dst_slot_id = SlotId::current(dst_cspace_id, new_idx_nz);
 
-    // Read derivation links from the source slot.
+    // The destination takes the source's exact position in the derivation tree:
+    // parent, children, and siblings are repointed to the new slot, including
+    // across a CSpace boundary. Read derivation links from the source slot.
     let (src_parent, src_first_child, src_prev, src_next) = {
         // SAFETY: src_cspace is a valid CSpace pointer; guaranteed by caller contract.
         let cs = unsafe { &*src_cspace };
@@ -2468,7 +2482,9 @@ pub unsafe fn move_cap_between_cspaces(
         (*src_cspace).free_slot(src_idx);
     }
 
-    Ok(new_idx)
+    // Return the encoded destination handle (generation + index, #349).
+    // SAFETY: dst_cspace valid and locked by the caller; slot just inserted.
+    Ok(unsafe { (*dst_cspace).cap_handle(new_idx_nz) })
 }
 
 /// Insert a capability, calling [`crate::fatal`] on error.

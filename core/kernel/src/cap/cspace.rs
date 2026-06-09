@@ -48,6 +48,12 @@ pub const L2_SIZE: usize = 56;
 /// Directory entries per `CSpace` (max 256 × 56 = 14336 slots).
 pub const L1_SIZE: usize = 256;
 
+// Every slot index must fit in the cap handle's index field; the rest of the
+// handle carries the per-slot generation. If the maximum CSpace capacity ever
+// exceeds the index field, the encoding would truncate indices — trip at
+// compile time instead.
+const _: () = assert!(L1_SIZE * L2_SIZE <= (1usize << syscall::CAP_INDEX_BITS));
+
 // ── Error type ────────────────────────────────────────────────────────────────
 
 /// Errors returned by `CSpace` operations.
@@ -215,9 +221,11 @@ impl CSpace
         };
 
         self.free_head = next;
-        // Clear the slot (removes free-list encoding).
+        // Clear the slot (removes free-list encoding) but keep the per-slot
+        // generation that `free_slot` left, so the minted cap handle's
+        // generation matches the slot the recipient will resolve (#349).
         let slot = self.slot_mut(idx.get()).ok_or(CapError::InvalidIndex)?;
-        slot.clear();
+        slot.clear_keep_generation();
         self.free_count -= 1;
         Ok(idx)
     }
@@ -381,6 +389,11 @@ impl CSpace
             );
             return;
         }
+        // Bump the per-slot generation before returning the slot to the free
+        // list (the legitimate-free path only — the double-free guard above
+        // returns without bumping). Every outstanding handle to the prior
+        // occupant now carries a stale generation and fails lookup_cap (#349).
+        slot.bump_generation();
         slot.set_next_free(old_head);
         self.free_head = Some(nz_index);
         self.free_count += 1;
@@ -411,6 +424,38 @@ impl CSpace
         slot.deriv_prev_sibling = None;
 
         Ok(index)
+    }
+
+    /// Encode the cap handle (per-slot generation + slot index) for `index`.
+    ///
+    /// Call right after inserting a cap at `index`, under the `CSpace` lock, to
+    /// build the handle returned to userspace. Reads the slot's current
+    /// generation and packs it with the index per [`syscall::cap_handle_encode`];
+    /// a never-recycled slot has generation 0, so the handle equals the bare
+    /// index. Returns the bare index if the slot is somehow absent.
+    pub fn cap_handle(&self, index: NonZeroU32) -> u32
+    {
+        let generation = self
+            .slot(index.get())
+            .map_or(0, super::slot::CapabilitySlot::generation);
+        syscall::cap_handle_encode(index.get(), generation)
+    }
+
+    /// Allocate a slot, populate it, and return the encoded cap handle.
+    ///
+    /// Convenience over [`insert_cap`](Self::insert_cap) +
+    /// [`cap_handle`](Self::cap_handle) for the common mint path: the
+    /// generation read happens under the same `&mut self` the caller already
+    /// holds the `CSpace` lock for, so no separate locked read is needed.
+    pub fn insert_cap_handle(
+        &mut self,
+        tag: CapTag,
+        rights: Rights,
+        object: NonNull<KernelObjectHeader>,
+    ) -> Result<u32, CapError>
+    {
+        let index = self.insert_cap(tag, rights, object)?;
+        Ok(self.cap_handle(index))
     }
 
     /// Grow the `CSpace` until at least `min_free` slots are available without
@@ -446,10 +491,12 @@ impl CSpace
             self.free_head = next;
             self.free_count -= 1;
             // Drop the free-list marker so the unlinked slot is canonical
-            // off-list (same state as an `allocate_slot` pop).
+            // off-list (same state as an `allocate_slot` pop). Keep the
+            // generation so a cap later placed here via insert_cap_at carries
+            // the recycled slot's generation (#349).
             if let Some(slot) = self.slot_mut(target)
             {
-                slot.clear();
+                slot.clear_keep_generation();
             }
             return true;
         }
@@ -481,10 +528,11 @@ impl CSpace
                 };
                 cur_slot.set_next_free(after);
                 self.free_count -= 1;
-                // Drop the free-list marker on the spliced-out slot.
+                // Drop the free-list marker on the spliced-out slot; keep the
+                // generation (see the head case above).
                 if let Some(slot) = self.slot_mut(target)
                 {
-                    slot.clear();
+                    slot.clear_keep_generation();
                 }
                 return true;
             }

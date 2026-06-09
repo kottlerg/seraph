@@ -533,6 +533,19 @@ unsafe fn syscall6(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64
 /// Each index occupies 16 bits (sufficient for max `CSpace` size of 14336 slots).
 /// Indices beyond `MSG_CAP_SLOTS_MAX` are silently ignored.
 ///
+/// The 16-bit field carries only the slot **index**; a capability handle's
+/// generation (its high bits, see `cap_handle_encode`) is stripped here and is
+/// not transmitted on the IPC send path. The kernel re-derives the destination
+/// handle's generation from the freshly inserted slot, so the recipient's
+/// delivered handle is generation-correct. It cannot, however, generation-
+/// validate the sender's named index (the generation is gone by the time the
+/// kernel resolves it): a sender naming a stale, recycled handle transmits the
+/// slot's current occupant rather than failing closed. This is the one cap
+/// resolution path the per-slot generation backstop does not cover (#349) — no
+/// worse than the pre-generation behaviour, and tightenable by widening the pack
+/// to carry the generation. A caller may pass either a bare index or a full
+/// handle; both pack to the same 16-bit index.
+///
 /// Pass the result as arg4 of `SYS_IPC_CALL` or arg3 of `SYS_IPC_REPLY`.
 #[must_use]
 pub fn pack_cap_slots(slots: &[u32]) -> u64
@@ -540,6 +553,8 @@ pub fn pack_cap_slots(slots: &[u32]) -> u64
     let mut packed: u64 = 0;
     for (i, &idx) in slots.iter().take(MSG_CAP_SLOTS_MAX).enumerate()
     {
+        // Mask to the index field; any generation high bits are intentionally
+        // dropped (the index fits in 16 bits; generation is re-derived kernel-side).
         packed |= (u64::from(idx) & 0xFFFF) << (i * 16);
     }
     packed
@@ -1140,17 +1155,18 @@ pub fn memory_merge(parent_cap: u32, tail_cap: u32) -> Result<(), i64>
 #[inline]
 pub fn mmio_split(mmio_cap: u32, split_offset: u64) -> Result<(u32, u32), i64>
 {
-    // SAFETY: syscall3 issues raw syscall instruction; mmio_cap is cap index as u64, split_offset
-    // is byte offset; kernel validates cap and offset, returns packed slot indices.
-    let ret = unsafe { syscall3(SYS_MMIO_SPLIT, u64::from(mmio_cap), split_offset, 0) };
+    // SAFETY: syscall5_ret2 issues raw syscall instruction; mmio_cap is cap index as
+    // u64, split_offset is byte offset; kernel validates cap and offset and returns
+    // the first child handle in the primary register, the second in the secondary.
+    let (ret, handle2) =
+        unsafe { syscall5_ret2(SYS_MMIO_SPLIT, u64::from(mmio_cap), split_offset, 0, 0, 0) };
     if ret < 0
     {
         Err(ret)
     }
     else
     {
-        let v = ret as u64;
-        Ok(((v & 0xFFFF_FFFF) as u32, (v >> 32) as u32))
+        Ok((ret as u32, handle2 as u32))
     }
 }
 
@@ -1170,16 +1186,25 @@ pub fn mmio_split(mmio_cap: u32, split_offset: u64) -> Result<(u32, u32), i64>
 #[inline]
 pub fn irq_split(irq_cap: u32, split_at: u32) -> Result<(u32, u32), i64>
 {
-    // SAFETY: syscall3 issues raw syscall instruction; kernel validates cap and split point.
-    let ret = unsafe { syscall3(SYS_IRQ_SPLIT, u64::from(irq_cap), u64::from(split_at), 0) };
+    // SAFETY: syscall5_ret2 issues raw syscall instruction; kernel validates cap and
+    // split point, returning the two child handles in the primary/secondary registers.
+    let (ret, handle2) = unsafe {
+        syscall5_ret2(
+            SYS_IRQ_SPLIT,
+            u64::from(irq_cap),
+            u64::from(split_at),
+            0,
+            0,
+            0,
+        )
+    };
     if ret < 0
     {
         Err(ret)
     }
     else
     {
-        let v = ret as u64;
-        Ok(((v & 0xFFFF_FFFF) as u32, (v >> 32) as u32))
+        Ok((ret as u32, handle2 as u32))
     }
 }
 
@@ -1205,12 +1230,15 @@ pub fn irq_split(irq_cap: u32, split_at: u32) -> Result<(u32, u32), i64>
 #[inline]
 pub fn ioport_split(ioport_cap: u32, split_at: u16) -> Result<(u32, u32), i64>
 {
-    // SAFETY: syscall3 issues raw syscall instruction; kernel validates cap and split point.
-    let ret = unsafe {
-        syscall3(
+    // SAFETY: syscall5_ret2 issues raw syscall instruction; kernel validates cap and
+    // split point, returning the two child handles in the primary/secondary registers.
+    let (ret, handle2) = unsafe {
+        syscall5_ret2(
             SYS_IOPORT_SPLIT,
             u64::from(ioport_cap),
             u64::from(split_at),
+            0,
+            0,
             0,
         )
     };
@@ -1220,8 +1248,7 @@ pub fn ioport_split(ioport_cap: u32, split_at: u16) -> Result<(u32, u32), i64>
     }
     else
     {
-        let v = ret as u64;
-        Ok(((v & 0xFFFF_FFFF) as u32, (v >> 32) as u32))
+        Ok((ret as u32, handle2 as u32))
     }
 }
 
@@ -1242,12 +1269,15 @@ pub fn ioport_split(ioport_cap: u32, split_at: u16) -> Result<(u32, u32), i64>
 #[inline]
 pub fn sched_split(sched_cap: u32, split_at: u8) -> Result<(u32, u32), i64>
 {
-    // SAFETY: syscall3 issues raw syscall instruction; kernel validates cap and split point.
-    let ret = unsafe {
-        syscall3(
+    // SAFETY: syscall5_ret2 issues raw syscall instruction; kernel validates cap and
+    // split point, returning the two child handles in the primary/secondary registers.
+    let (ret, handle2) = unsafe {
+        syscall5_ret2(
             SYS_SCHED_SPLIT,
             u64::from(sched_cap),
             u64::from(split_at),
+            0,
+            0,
             0,
         )
     };
@@ -1257,8 +1287,7 @@ pub fn sched_split(sched_cap: u32, split_at: u8) -> Result<(u32, u32), i64>
     }
     else
     {
-        let v = ret as u64;
-        Ok(((v & 0xFFFF_FFFF) as u32, (v >> 32) as u32))
+        Ok((ret as u32, handle2 as u32))
     }
 }
 

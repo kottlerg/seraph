@@ -145,7 +145,14 @@ unsafe fn write_cap_results(buf: u64, cap_count: usize, indices: &[u32; MSG_CAP_
 
 /// Unpack `count` slot indices from a packed u64 (4 × u16).
 ///
-/// Matches the encoding in `shared/syscall::pack_cap_slots`.
+/// Matches the encoding in `shared/syscall::pack_cap_slots`. Each value is a slot
+/// **index** only — the sender's handle generation was stripped by the 16-bit
+/// packing and is not transmitted. The kernel re-derives the destination handle's
+/// generation from the freshly inserted slot (so the recipient's handle is
+/// generation-correct), but it cannot generation-validate the sender's named
+/// index: a sender naming a stale, recycled handle transmits the slot's current
+/// occupant rather than failing closed. This is the one cap resolution path the
+/// per-slot generation backstop does not cover (#349).
 #[cfg(not(test))]
 fn unpack_cap_slots(packed: u64, count: usize) -> [u32; MSG_CAP_SLOTS_MAX]
 {
@@ -191,7 +198,10 @@ unsafe fn transfer_caps(
         return Ok(0);
     }
 
-    // Pre-validate: all source slots must be non-null.
+    // Pre-validate: all source slots must be non-null. The index is bare (the
+    // send pack stripped the generation), so this cannot reject a sender's stale,
+    // recycled handle — the send-path residual documented on `unpack_cap_slots`
+    // (#349).
     {
         // SAFETY: src_cspace validated by caller.
         let cs = unsafe { &*src_cspace };
@@ -1357,7 +1367,8 @@ pub fn sys_wait_set_add(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     let ws_idx = tf.arg(0) as u32;
     // cast_possible_truncation: kernel runs on 64-bit only; value is bounded by kernel policy.
     #[allow(clippy::cast_possible_truncation)]
-    let src_idx = tf.arg(1) as u32;
+    let src_handle = tf.arg(1) as u32;
+    let src_idx = syscall::cap_handle_index(src_handle);
     let badge = tf.arg(2);
 
     // SAFETY: syscall entry ensures current_tcb() returns active thread's TCB.
@@ -1398,6 +1409,11 @@ pub fn sys_wait_set_add(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     let (source_ptr, source_tag, source_header) = unsafe {
         let cs = &*cspace_ptr;
         let src_slot = cs.slot(src_idx).ok_or(SyscallError::InvalidCapability)?;
+        // Reject a stale handle to a recycled slot (#349).
+        if src_slot.generation() != syscall::cap_handle_gen(src_handle)
+        {
+            return Err(SyscallError::InvalidCapability);
+        }
         match src_slot.tag
         {
             CapTag::Endpoint =>
@@ -1582,7 +1598,8 @@ pub fn sys_wait_set_remove(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     let ws_idx = tf.arg(0) as u32;
     // cast_possible_truncation: kernel runs on 64-bit only; value is bounded by kernel policy.
     #[allow(clippy::cast_possible_truncation)]
-    let src_idx = tf.arg(1) as u32;
+    let src_handle = tf.arg(1) as u32;
+    let src_idx = syscall::cap_handle_index(src_handle);
 
     // SAFETY: syscall entry ensures current_tcb() returns active thread's TCB.
     let tcb = unsafe { current_tcb() };
@@ -1617,6 +1634,11 @@ pub fn sys_wait_set_remove(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     let (source_ptr, source_tag, source_header) = unsafe {
         let cs = &*cspace_ptr;
         let src_slot = cs.slot(src_idx).ok_or(SyscallError::InvalidCapability)?;
+        // Reject a stale handle to a recycled slot (#349).
+        if src_slot.generation() != syscall::cap_handle_gen(src_handle)
+        {
+            return Err(SyscallError::InvalidCapability);
+        }
         match src_slot.tag
         {
             CapTag::Endpoint =>

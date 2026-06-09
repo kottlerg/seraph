@@ -32,6 +32,43 @@ capability".
 
 ---
 
+## Capability Handle Format
+
+A capability handle — the value userspace passes to and receives from the kernel —
+packs a per-slot **generation** with the slot index:
+
+```
+handle = (generation << CAP_INDEX_BITS) | index      // CAP_INDEX_BITS = 24
+```
+
+The low 24 bits are the slot index; the high 8 bits are the slot's generation
+counter, which the kernel increments each time the slot is freed and recycled. On
+every operation the kernel checks the handle's generation against the slot's
+current generation and returns `InvalidCapability` on mismatch. This closes the
+stale-slot alias class (#349): a handle held across a free/reallocate of its slot
+fails closed instead of silently operating on whatever unrelated capability now
+occupies the index.
+
+A never-recycled slot has generation 0, so its handle is numerically identical to
+the bare slot index. Long-lived capabilities minted once at boot or process spawn
+(the `ProcessInfo`/`InitInfo`/`CapDescriptor` handover caps) therefore keep their
+historical handle values, and the `handle == 0` "no capability" sentinel still
+holds (a live cap always has index ≥ 1 in the low bits).
+
+The handle is `u32`-wide and travels in the low half of a 64-bit syscall register.
+Capabilities transferred over IPC, and the second child of a range split, are
+delivered with their generation intact (the split delivers its two children in the
+two return registers rather than packing them into one). The handle's generation
+is **not** carried on the IPC *send* path (the packed send slots are index-only):
+a cap named for transfer is identified by index alone, so a sender naming a stale,
+recycled handle transmits the slot's current occupant rather than failing closed —
+the one resolution path the generation check does not cover (#349), no worse than
+the pre-generation behaviour and tightenable by widening the send pack. The cap the
+recipient *receives* is generation-correct: the kernel re-derives it from the
+freshly inserted destination slot.
+
+---
+
 ## Capability Types
 
 Each capability type represents a distinct kind of kernel object. The rights attached
@@ -351,10 +388,20 @@ dispatch crate are in
 
 ## Transfer
 
-A capability may be transferred via IPC (see [ipc-design.md](ipc-design.md)). Transfer
-moves the capability from the sender's CSpace to the receiver's CSpace — the sender's
-slot becomes null. This is not derivation; no new entry appears in the derivation tree.
-The receiver inherits the sender's position in the existing tree.
+A capability may be transferred via IPC (see [ipc-design.md](ipc-design.md)) or moved
+with `SYS_CAP_MOVE`. Transfer moves the capability from the source CSpace to the
+destination CSpace — the source slot becomes null. This is not derivation; no new
+entry appears in the derivation tree — the existing node is restamped onto the
+destination slot.
+
+Because the cap keeps its derivation position, a move transfers ownership of the
+slot but not revocation authority over the lineage: the mover, having nulled its own
+slot, no longer holds the cap, yet a `cap_revoke` on one of the cap's ancestors
+still reaches it — even across a CSpace boundary. Such a revoke frees the recipient's
+slot in the recipient's own CSpace; per-slot generation handles make the recipient's
+now-stale handle fail closed rather than alias a recycled slot (#349). (A move within
+the same CSpace likewise keeps the source's position.) To delegate a capability while
+keeping your own copy, use `SYS_CAP_COPY` instead (see [Revocation](#revocation)).
 
 
 ---
@@ -369,6 +416,14 @@ Any process may revoke a capability it has derived. Revocation:
 After revocation, any process that held a derived capability can no longer use it.
 The underlying kernel object is not destroyed — only the authority to access it is
 withdrawn. If the revoker still holds the parent capability, it retains access.
+
+A descendant delivered to another CSpace — by **IPC transfer**, `SYS_CAP_MOVE`, or
+`SYS_CAP_COPY` — keeps its position in the derivation tree (see
+[Transfer](#transfer)), so the revoke reaches it across the boundary and frees the
+recipient's slot in the recipient's own CSpace. Per-slot generation handles ensure
+the recipient's now-stale handle then fails with `InvalidCapability` rather than
+aliasing a recycled slot index — the cross-CSpace stale-slot alias that was the #349
+hazard.
 
 
 ---

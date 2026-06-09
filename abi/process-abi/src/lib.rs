@@ -50,7 +50,13 @@ use core::prelude::rust_2024::*;
 ///      / [`ProcessInfo::pager_badge`] are nonzero for default-spawned processes
 ///      and zero only for pinned ones (`procmgr_labels::CREATE_PINNED`, e.g. DMA
 ///      drivers) and the pre-pager bootstrap (init/memmgr/procmgr).
-pub const PROCESS_ABI_VERSION: u32 = 19;
+/// v20: Capability handles are generation-tagged (#349). Each `ProcessInfo` cap
+///      field is now a `(generation << CAP_INDEX_BITS) | index` handle, not a
+///      bare slot index. Layout is unchanged and every handover cap is a
+///      never-recycled generation-0 slot, so the delivered values are
+///      byte-identical; the semantic change is that the handle's high bits are
+///      now meaningful and the kernel validates them on every use.
+pub const PROCESS_ABI_VERSION: u32 = 20;
 
 // ── Address space constants ──────────────────────────────────────────────────
 

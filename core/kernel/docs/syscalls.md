@@ -396,6 +396,23 @@ suffices because `notification_send` rejects zero-bit sends.
 
 ---
 
+## Capability Handles
+
+A capability handle — the value passed in and returned through the cap-index
+argument and return registers — packs a per-slot generation with the slot index:
+`handle = (generation << 24) | index`. The low 24 bits are the `CSpace` slot
+index; the high 8 bits are the slot's generation, which the kernel bumps each
+time the slot is freed and recycled. Every cap-bearing syscall checks the
+handle's generation against the slot's current generation and returns
+`InvalidCapability` on mismatch — a handle held across a free/reallocate of its
+slot fails closed rather than aliasing the unrelated capability now at that index
+(#349). A never-recycled slot has generation 0, so its handle equals the bare
+index; long-lived boot/spawn caps keep their historical values, and a `0` handle
+still means "no capability". Range-split syscalls return their two child handles
+in the primary and secondary return registers (never packed into one word). See
+[capability-model.md](../../../docs/capability-model.md) § Capability Handle
+Format.
+
 ## Capability Syscalls
 
 ### `SYS_CAP_CREATE_ENDPOINT` (7)

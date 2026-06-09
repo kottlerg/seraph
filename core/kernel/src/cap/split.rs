@@ -27,7 +27,10 @@ use syscall::SyscallError;
 ///      both new caps to that parent;
 ///   3. frees the original slot and drops its object reference.
 ///
-/// Returns the packed `slot1 | (slot2 << 32)`.
+/// Returns the two encoded child handles `(handle1, handle2)` (generation +
+/// index each). The caller delivers `handle1` in the primary return register
+/// and `handle2` in the secondary — never packed into one word, so a high
+/// generation cannot set the sign bit of an `i64` return (#349).
 ///
 /// # Safety
 /// `caller_cspace` must be a valid non-null `CSpace` pointer for the calling
@@ -49,7 +52,7 @@ pub(crate) unsafe fn install_split_children(
     orig_obj_ptr: NonNull<KernelObjectHeader>,
     child1_ptr: NonNull<KernelObjectHeader>,
     child2_ptr: NonNull<KernelObjectHeader>,
-) -> Result<u64, SyscallError>
+) -> Result<(u32, u32), SyscallError>
 {
     // Insert both children into the caller's CSpace under cspace.lock so the
     // freelist mutation cannot tear against a concurrent SYS_CAP_CREATE_*.
@@ -95,8 +98,6 @@ pub(crate) unsafe fn install_split_children(
         }
         SyscallError::OutOfMemory
     })?;
-    let slot2 = slot2_nz.get();
-
     // ── Wire derivation tree ──────────────────────────────────────────────────
 
     let orig_idx_nz = NonZeroU32::new(orig_idx).ok_or(SyscallError::InvalidCapability)?;
@@ -142,5 +143,17 @@ pub(crate) unsafe fn install_split_children(
         unsafe { dealloc_object(orig_obj_ptr) };
     }
 
-    Ok(u64::from(slot1) | (u64::from(slot2) << 32))
+    // Encode both child handles (generation + index, #349). Returned separately
+    // so the caller can deliver them in two registers.
+    // SAFETY: caller_cspace validated; both slots occupied so the reads are stable.
+    let handles = unsafe {
+        let saved = (*caller_cspace).lock.lock_raw();
+        let h = (
+            (*caller_cspace).cap_handle(slot1_nz),
+            (*caller_cspace).cap_handle(slot2_nz),
+        );
+        (*caller_cspace).lock.unlock_raw(saved);
+        h
+    };
+    Ok(handles)
 }

@@ -318,8 +318,16 @@ pub fn sys_thread_stop(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 while {
                     let s = sched_remote.lock.lock_raw();
                     let still_current = sched_remote.current == target_tcb;
+                    // A concurrent sys_thread_start may resume the target out of
+                    // Stopped (last-writer-wins). The bounded-spin invariant
+                    // assumes the target stays in schedule()'s requeue denylist
+                    // (Stopped); once it is no longer Stopped the stop was
+                    // overtaken and the re-dispatched target may never
+                    // deschedule. Read state under the same lock
+                    // set_state_under_all_locks holds, then bail.
+                    let still_stopped = (*target_tcb).state == ThreadState::Stopped;
                     sched_remote.lock.unlock_raw(s);
-                    still_current
+                    still_current && still_stopped
                 }
                 {
                     // Single-shot diagnostic at >100 ms.

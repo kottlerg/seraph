@@ -47,6 +47,14 @@ enum Status
     Fail,
     Hang,
     Err(i32),
+    /// QEMU itself was killed by a crash signal (SIGSEGV/SIGABRT) with no
+    /// guest-side pass/fail marker — a *host-emulator* crash, not a guest
+    /// failure. The recurring instance is the QEMU 8.2.x multi-threaded-TCG
+    /// segfault (issue #350 / QEMU gitlab #2220), which is TCG-only and fixed
+    /// in newer QEMU. Tallied and preserved, but does NOT fail the run-parallel
+    /// gate (it is infrastructure flake, not a regression in the OS under test).
+    /// The `i32` is the `128 + signum` code.
+    QemuCrash(i32),
 }
 
 impl Status
@@ -60,6 +68,7 @@ impl Status
             Status::Fail => "FAIL".into(),
             Status::Hang => "HANG".into(),
             Status::Err(rc) => format!("ERR rc={rc}"),
+            Status::QemuCrash(rc) => format!("QEMU-CRASH rc={rc}"),
         }
     }
 
@@ -77,6 +86,7 @@ impl Status
             Status::Fail => Some("FAIL"),
             Status::Hang => Some("HANG"),
             Status::Err(_) => Some("ERR"),
+            Status::QemuCrash(_) => Some("QEMU-CRASH"),
         }
     }
 }
@@ -277,16 +287,22 @@ pub fn run(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
 
     let summary = print_summary(args, &workdir, &outcomes);
     print_failing_tails(&workdir, &outcomes);
-    if summary.pass != args.runs
+    // A QEMU host-emulator crash (Status::QemuCrash) is infrastructure flake,
+    // not a regression in the OS under test, so it does NOT fail the gate (it
+    // is still tallied and reported by print_summary). Everything else that is
+    // not a clean PASS does fail.
+    let real_failures = summary.ok + summary.fail + summary.hang + summary.err;
+    if real_failures > 0
     {
         bail!(
-            "run-parallel: {}/{} runs passed (ok={} fail={} hang={} err={})",
+            "run-parallel: {}/{} runs passed (ok={} fail={} hang={} err={} qemu_crash={})",
             summary.pass,
             args.runs,
             summary.ok,
             summary.fail,
             summary.hang,
             summary.err,
+            summary.qemu_crash,
         );
     }
     Ok(())
@@ -299,6 +315,7 @@ struct Summary
     fail: u32,
     hang: u32,
     err: u32,
+    qemu_crash: u32,
 }
 
 fn validate_args(args: &RunParallelArgs) -> Result<()>
@@ -358,7 +375,8 @@ fn purge_prior_logs(workdir: &Path)
             && (name.starts_with("log-")
                 || name.starts_with("FAIL-")
                 || name.starts_with("HANG-")
-                || name.starts_with("ERR-"));
+                || name.starts_with("ERR-")
+                || name.starts_with("QEMU-CRASH-"));
         if is_log
         {
             let _ = std::fs::remove_file(&path);
@@ -435,7 +453,7 @@ fn wait_with_timeout(
         // cleanly within the grace window must report its real exit code.
         if let Some(status) = child.try_wait().context("polling child")?
         {
-            return Ok((status.code().unwrap_or(-1), false));
+            return Ok((exit_status_rc(status), false));
         }
         // Arm the grace window on the first --fail match in the live log.
         if grace_deadline.is_none() && fail_marker_present(log_path, &mut last_log_len, fail_re)
@@ -489,6 +507,40 @@ fn read_log(path: &Path) -> Result<String>
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
+/// Normalised exit code for the child: its exit code, or — when terminated by
+/// a signal — `128 + signum` (shell convention), so a signal death is legible
+/// (e.g. `139` = SIGSEGV, `134` = SIGABRT, `137` = SIGKILL) instead of
+/// collapsing to `-1`. Legibility is separate from tolerance: only SIGSEGV /
+/// SIGABRT are later classified as a (non-gating) host-emulator crash
+/// (`classify` via `RC_SIGSEGV`/`RC_SIGABRT`); SIGKILL is reported but still
+/// gates (it is our own timeout kill, or an OOM — never a tolerated flake).
+/// This distinguishes a host-emulator crash (the QEMU 8.2.x mttcg segfault —
+/// issue #350 / QEMU gitlab #2220) from a guest fault, which is otherwise
+/// indistinguishable in a `rc=-1` report.
+fn exit_status_rc(status: std::process::ExitStatus) -> i32
+{
+    if let Some(code) = status.code()
+    {
+        return code;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(sig) = status.signal()
+        {
+            return 128 + sig;
+        }
+    }
+    -1
+}
+
+/// `128 + signum` codes for the host-emulator crash signals. Only SIGSEGV and
+/// SIGABRT are treated as QEMU crashes; SIGKILL (137) is deliberately excluded
+/// (it is our own timeout kill, or an OOM — neither should be silently
+/// tolerated as a known QEMU flake).
+const RC_SIGSEGV: i32 = 128 + 11;
+const RC_SIGABRT: i32 = 128 + 6;
+
 fn classify(
     exit_rc: i32,
     hung: bool,
@@ -525,6 +577,20 @@ fn classify(
     if exit_rc == 0
     {
         return (Status::Ok, None);
+    }
+    // QEMU killed by a crash signal with neither pass nor fail marker: the
+    // host emulator died, not the guest. A guest fault prints a marker (→ Fail
+    // above) and a guest hang trips our timeout (→ Hang above), so neither can
+    // reach here. The last guest line is captured for the report (it pinpoints
+    // where the guest was when QEMU crashed — e.g. PCI ECAM enumeration, #350).
+    if !hung && (exit_rc == RC_SIGSEGV || exit_rc == RC_SIGABRT)
+    {
+        let last = log
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .map(ToString::to_string);
+        return (Status::QemuCrash(exit_rc), last);
     }
     (Status::Err(exit_rc), None)
 }
@@ -591,6 +657,7 @@ fn print_summary(args: &RunParallelArgs, workdir: &Path, outcomes: &[RunOutcome]
         fail: 0,
         hang: 0,
         err: 0,
+        qemu_crash: 0,
     };
     let mut non_hang_us: Vec<u128> = Vec::with_capacity(outcomes.len());
     for o in outcomes
@@ -602,6 +669,7 @@ fn print_summary(args: &RunParallelArgs, workdir: &Path, outcomes: &[RunOutcome]
             Status::Fail => summary.fail += 1,
             Status::Hang => summary.hang += 1,
             Status::Err(_) => summary.err += 1,
+            Status::QemuCrash(_) => summary.qemu_crash += 1,
         }
         if !matches!(o.status, Status::Hang)
         {
@@ -616,9 +684,22 @@ fn print_summary(args: &RunParallelArgs, workdir: &Path, outcomes: &[RunOutcome]
         args.arch, args.parallel, args.runs, args.timeout
     );
     println!(
-        "pass={}  ok={}  fail={}  hang={}  err={}",
-        summary.pass, summary.ok, summary.fail, summary.hang, summary.err,
+        "pass={}  ok={}  fail={}  hang={}  err={}  qemu_crash={}",
+        summary.pass, summary.ok, summary.fail, summary.hang, summary.err, summary.qemu_crash,
     );
+    if summary.qemu_crash > 0
+    {
+        // Visible, never silent: the rate stays trackable even though it does
+        // not gate the run. This is the QEMU 8.2.x mttcg host-emulator crash
+        // (issue #350 / QEMU gitlab #2220), TCG-only and fixed in newer QEMU —
+        // a host flake, not a regression in the OS under test.
+        println!(
+            "note: {} run(s) crashed the QEMU emulator (SIGSEGV/SIGABRT) with no guest \
+             marker — host-emulator flake (#350 / QEMU gitlab #2220), not a guest failure; \
+             tolerated (does not fail the gate). Use a QEMU build newer than 8.2.x to avoid it.",
+            summary.qemu_crash,
+        );
+    }
     if let (Some(&min_us), Some(&max_us)) = (non_hang_us.first(), non_hang_us.last())
     {
         let median_us = non_hang_us[non_hang_us.len() / 2];
@@ -810,5 +891,44 @@ mod tests
         assert!(fail_marker_present(&path, &mut last_len, &re));
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    // The #350 signature: QEMU killed by SIGSEGV (rc=139) with the guest log
+    // ending at the devmgr ECAM line and no pass/fail marker → QemuCrash, and
+    // the last guest line is captured for the report.
+    #[test]
+    fn qemu_sigsegv_no_marker_classifies_qemu_crash()
+    {
+        let (pass, fail) = default_regexes();
+        let log = "[0.12] [init] requesting procmgr to create vfsd (with caps)\n\
+                   [0.13] [devmgr] devmgr: ECAM phys=0xe0000000 size=0x10000000 buses 0..=255\n";
+        let (status, matched) = classify(RC_SIGSEGV, false, log, &pass, &fail);
+        assert!(matches!(status, Status::QemuCrash(c) if c == RC_SIGSEGV));
+        assert!(matched.unwrap().contains("ECAM phys="));
+    }
+
+    // A guest fault that prints a marker is FAIL even if QEMU is then signalled
+    // — a real regression must never be masked as a host crash.
+    #[test]
+    fn signal_with_fail_marker_classifies_fail()
+    {
+        let (pass, fail) = default_regexes();
+        let log = "[1.0] kernel: KERNEL EXCEPTION: cpu=0 cause=#PF page fault (vec=14 err=0x10)\n";
+        assert!(matches!(
+            classify(RC_SIGSEGV, false, log, &pass, &fail).0,
+            Status::Fail
+        ));
+    }
+
+    // SIGKILL (our own timeout kill, or OOM) is NOT a tolerated QEMU crash.
+    #[test]
+    fn sigkill_is_not_qemu_crash()
+    {
+        let (pass, fail) = default_regexes();
+        let log = "[0.13] [devmgr] devmgr: ECAM phys=0xe0000000 size=0x10000000 buses 0..=255\n";
+        assert!(matches!(
+            classify(128 + 9, false, log, &pass, &fail).0,
+            Status::Err(c) if c == 128 + 9
+        ));
     }
 }

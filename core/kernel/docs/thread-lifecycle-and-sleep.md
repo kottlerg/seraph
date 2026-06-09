@@ -105,7 +105,8 @@ This table is the authoritative per-transition rule set for the lifecycle syscal
 | `sys_thread_write_regs` | `Stopped` | `Stopped` | calling CPU | none beyond the source-state check. Validates user `TrapFrame` then writes; target is not running (state == Stopped). |
 | `sys_exit` (self) | `*` | `Exited` | running CPU = current CPU | `set_state_under_all_locks(self, Exited)`, then `post_death_notification`, then `schedule(false)`. The all-locks write ensures any peer-CPU `schedule()` reading `state` under its own sched.lock sees `Exited` and refuses to re-enqueue. |
 | arch fault handler (page fault, GP fault, etc.) | `*` | `Exited` | trapping CPU = current CPU | Same as `sys_exit`. |
-| `dealloc_object(Thread)` | `*` | `Exited` | calling CPU (refcount → 0) | Acquires every CPU's scheduler.lock in ascending order, writes `state = Exited`, walks `remove_from_queue` for every CPU, releases all. After release: unconditionally scans every CPU until none has `sched.current == tcb`, then unconditionally on `tcb.context_saved == 1`, then proceeds to source-IPC unlink + free. See Drain Protocol below. |
+| `dealloc_object(Thread)` (caller ≠ tcb) | `*` | `Exited` | calling CPU (refcount → 0) | Acquires every CPU's scheduler.lock in ascending order, writes `state = Exited`, walks `remove_from_queue` for every CPU, releases all. After release: unconditionally scans every CPU until none has `sched.current == tcb`, then unconditionally on `tcb.context_saved == 1`, then proceeds to source-IPC unlink + free. See Drain Protocol below. |
+| `dealloc_object(Thread)` (caller == tcb, self-teardown) | `Running` | `Exited` | calling CPU = running CPU | A thread deleting the last capability to its own `Thread` object cannot run the post-release scan (its CPU's `current == tcb` never clears from within the spin). Marks Exited + drains run queues only, queues the object on this CPU's deferred-reclaim stack, and returns; the syscall epilogue reschedules and the free completes off-CPU. See [Self-teardown](#self-teardown-the-caller-is-the-freed-thread) below. |
 
 **Why the all-CPU lock acquire in `dealloc_object(Thread)`:**
 
@@ -182,13 +183,46 @@ The teardown sequence binds the following ordered steps. Each step's preconditio
     dealloc_object; step 13's orphaned endpoint, if any, is processed here).
 ```
 
+### Self-teardown (the caller is the freed thread)
+
+Steps 9-10 assume the dealloc caller is a *different* thread than `tcb`: the
+`current`-anywhere scan waits for whichever CPU runs `tcb` to switch away. When
+the caller **is** `tcb` — a thread that deletes the last capability to its own
+`Thread` object via `SYS_CAP_DELETE` or `SYS_CAP_REVOKE` — the running CPU's
+`current == tcb` can never clear from within the scan (the spin holds preemption
+disabled, so the thread never reschedules). Running steps 9-17 inline would wedge
+that CPU (#341).
+
+`dealloc_object_one` detects this case
+(`tcb == scheduler_for(this_cpu).current`) and splits the protocol:
+
+- **Inline, on the dying thread:** steps 1-4 only, via
+  `set_state_under_all_locks(tcb, Exited)` (mark Exited + drain every run queue).
+  The object header is then pushed onto this CPU's deferred-reclaim stack
+  (`PerCpuScheduler::deferred_reclaim_head`) and `dealloc_object` returns without
+  touching the UAF gate or `retype_free`.
+- **Reschedule:** the syscall epilogue (`syscall::dispatch`) observes the
+  `Exited` state and calls `schedule(false)` + `halt_loop()`, so the dead thread
+  never returns to user-mode. `schedule()` refuses to re-enqueue an `Exited`
+  thread (invariant 2), and the switch publishes `tcb.context_saved = 1`.
+- **Off-CPU completion:** `drain_deferred_reclaim` — called from the syscall
+  epilogue of the *next* live thread on this CPU, and from the idle loop — pops
+  the object and re-enters `dealloc_object`. The thread is now off-CPU, so the
+  self check is false and steps 5-17 run normally: step 9's scan finds no CPU
+  running `tcb` on the first pass and step 10's `context_saved` gate is already
+  satisfied. Any server-side reply-bound client (steps 5/8/11) is woken here.
+
+The drain runs only from contexts that are provably not one of the queued dead
+threads (a live thread's syscall return, or the idle thread), so it can never
+re-enter the wedge it exists to avoid.
+
 **Invariants the drain protocol MUST hold:**
 
 1. **Ascending-order lock acquire** prevents ABBA against any peer drain (the canonical cross-CPU scheduler-lock acquisition order, [scheduling-internals.md § Lock Hierarchy](scheduling-internals.md#lock-hierarchy) rule 4).
 
 2. **Step 3 (state = Exited) commits under all locks.** No `schedule()` on any CPU can subsequently observe this TCB as `Ready` or `Running` for purposes of re-enqueue — the protection in `schedule()` reads `state` while holding its CPU's scheduler.lock and refuses to re-enqueue if `state ∈ {Exited, Stopped}`. `enqueue_and_wake` performs the same check before enqueueing (see [scheduling-internals.md § Lock Hierarchy](scheduling-internals.md#lock-hierarchy) rule 9).
 
-3. **Step 9's `current`-anywhere scan is bounded.** A TCB is `current` on at most one CPU at a time. That CPU is mid-`schedule()`; once it sets `current = next_tcb` (which happens *before* the arch switch on both arches — `release_lock_only` runs in Rust before `switch()`), the inner spin exits. After it switches away no CPU can re-install tcb (it is `Exited` and unlinked from every run queue), so the next full scan is clean and the loop terminates. The scan does not rely on the all-locks `running_on` snapshot, which names at most one CPU and may be stale once the locks drop.
+3. **Step 9's `current`-anywhere scan is bounded.** A TCB is `current` on at most one CPU at a time. That CPU is mid-`schedule()`; once it sets `current = next_tcb` (which happens *before* the arch switch on both arches — `release_lock_only` runs in Rust before `switch()`), the inner spin exits. After it switches away no CPU can re-install tcb (it is `Exited` and unlinked from every run queue), so the next full scan is clean and the loop terminates. The scan does not rely on the all-locks `running_on` snapshot, which names at most one CPU and may be stale once the locks drop. This bound holds only when the dealloc caller is a *different* thread than `tcb`: the running CPU reaches `schedule()` and switches away. When the caller *is* `tcb` (self-teardown), it never reaches `schedule()` from within the spin, so steps 9-17 are skipped inline and deferred off-CPU instead — see [Self-teardown](#self-teardown-the-caller-is-the-freed-thread).
 
 4a. **No `fpu_owner` sweep is needed after eager save (#108).** The `#NM` handler only ever installs the currently Running thread on its CPU as `fpu_owner`. `switch_out_save` clears the slot on switch-out before the thread re-enters the Ready / Blocked / Stopped / Exited states. By the time steps 9 and 10 above have completed — the thread has switched out on every CPU and `context_saved == 1` — no CPU's owner slot can name this TCB. Steps 9-10's interrupt-enabled-while-spinning discipline is still required to prevent the spin from deadlocking against a peer CPU's TLB-shootdown IPI; without it, two CPUs in mutual TLB shootdown would deadlock.
 

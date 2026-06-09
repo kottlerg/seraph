@@ -585,7 +585,14 @@ Delete a single capability from the caller's CSpace. Does not affect derived cap
 
 If this is the last reference to the underlying object, the object is freed.
 
-**Errors:** `InvalidCapability`.
+Refused for one case: a thread may not delete the last capability to its **own
+running** `Thread` object. Such a delete is always an aliased/stale-cap bug (it
+would tear the calling thread down mid-syscall); it returns `InvalidState` and
+leaves the capability in place — the object is reclaimed normally when a
+different thread later releases it.
+
+**Errors:** `InvalidCapability`; `InvalidState` (caller's own running `Thread`
+cap, per above).
 
 ---
 

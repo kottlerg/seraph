@@ -38,7 +38,7 @@
 //! | IoPortObject   | 24 B  |
 //! | SchedControlObject  | 24 B  |
 //! | SbiControlObject    | 16 B  |
-//! | ThreadObject        | 24 B  |
+//! | ThreadObject        | 32 B  |
 //! | AddressSpaceObject  | 432 B |
 //! | CSpaceKernelObject  | 432 B |
 //! | EndpointObject      | 24 B  |
@@ -457,6 +457,12 @@ pub struct ThreadObject
     /// backed threads it points inside the same five-page retype slot that
     /// holds the kstack and this wrapper. Discriminated by `header.ancestor`.
     pub tcb: *mut crate::sched::thread::ThreadControlBlock,
+    /// Intrusive link for the per-CPU deferred self-teardown reclaim stack
+    /// ([`drain_deferred_reclaim`]). Non-null only while this object sits on
+    /// that stack — between a thread deleting the last capability to its own
+    /// `Thread` object and the off-CPU completion of that free. Null otherwise.
+    /// Written only by the owning CPU.
+    pub deferred_next: *mut ThreadObject,
 }
 
 // SAFETY: ThreadObject is accessed only under the scheduler lock.
@@ -991,6 +997,126 @@ unsafe impl Sync for WaitSetObject {}
 
 // ── Object deallocation ───────────────────────────────────────────────────────
 
+/// One-shot guard for [`log_self_teardown`].
+#[cfg(not(test))]
+static SELF_TEARDOWN_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// One-shot diagnostic for the self-teardown path (#341). The first time a
+/// thread deletes the last capability to its own `Thread` object, log its id,
+/// the in-flight userspace instruction pointer, and the syscall number, so the
+/// triggering userspace call site can be symbolised from a burn-in log. Bounded
+/// to a single line so it never floods the boot log under thread churn.
+#[cfg(not(test))]
+fn log_self_teardown(tcb: *mut crate::sched::thread::ThreadControlBlock)
+{
+    if SELF_TEARDOWN_LOGGED
+        .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    // SAFETY: tcb is valid here — about to be marked Exited, not yet freed.
+    let (tid, tf) = unsafe { ((*tcb).thread_id, (*tcb).trap_frame) };
+    if tf.is_null()
+    {
+        crate::kprintln!("sched: self-teardown deferred reclaim: tid={tid} (no trap frame)");
+        return;
+    }
+    // SAFETY: tf non-null; it is the caller's saved userspace frame.
+    let (rip, nr) = unsafe { ((*tf).instruction_pointer(), (*tf).syscall_nr()) };
+    crate::kprintln!(
+        "sched: self-teardown deferred reclaim: tid={tid} user_rip=0x{rip:x} syscall_nr={nr}"
+    );
+}
+
+/// Push a self-deleted `Thread` object onto its CPU's deferred-reclaim stack.
+///
+/// `dealloc_object`'s drain gate spins until the target TCB is no longer
+/// `current` on any CPU; for a thread freeing its own object on its own CPU
+/// that never holds (preemption is disabled across the spin), so the inline
+/// path would wedge the CPU (#341). The Thread arm of [`dealloc_object_one`]
+/// instead marks the thread `Exited`, drains its run-queue links, and pushes
+/// the object here; the syscall epilogue then `schedule()`s away.
+/// [`drain_deferred_reclaim`] completes the free from a context that is provably
+/// not the dead thread.
+///
+/// # Safety
+/// `ptr` is an exclusively-owned `ThreadObject` (refcount 0) whose TCB is
+/// already `Exited` and unlinked from every run queue. `cpu` is the local CPU
+/// index (`< MAX_CPUS`) and its scheduler is initialised.
+// cast_ptr_alignment: the `*mut u8` head only ever holds a `*mut ThreadObject`
+// stored by this same function, so it carries ThreadObject's 8-byte alignment.
+#[allow(clippy::cast_ptr_alignment)]
+#[cfg(not(test))]
+unsafe fn push_deferred_reclaim(cpu: usize, ptr: NonNull<KernelObjectHeader>)
+{
+    let node = ptr.as_ptr().cast::<ThreadObject>();
+    // SAFETY: cpu < MAX_CPUS; scheduler initialised by sched::init.
+    let sched = unsafe { crate::sched::scheduler_for(cpu) };
+    let slot = &sched.deferred_reclaim_head;
+    loop
+    {
+        let head = slot.load(Ordering::Acquire);
+        // SAFETY: node is exclusively owned (refcount 0); the link field is ours.
+        unsafe { (*node).deferred_next = head.cast::<ThreadObject>() };
+        if slot
+            .compare_exchange(head, node.cast::<u8>(), Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            break;
+        }
+    }
+}
+
+/// Drain this CPU's deferred self-teardown reclaim stack, completing the free
+/// of each queued `Thread` object (TCB, kstack, retype slot, ancestor cascade).
+///
+/// Called from the syscall epilogue (when the returning thread is alive) and
+/// the idle loop — both contexts that are NOT one of the queued dead threads,
+/// so re-entering `dealloc_object` runs the normal Thread arm whose
+/// `current`-anywhere scan and `context_saved` gate pass on the first iteration.
+///
+/// # Safety
+/// Must not run on a thread whose own object is queued here; the producer
+/// contract guarantees this — a self-deleting thread reaches the Exited arm of
+/// the syscall epilogue and `schedule()`s away, never the drain arm.
+// cast_ptr_alignment: the `*mut u8` head only ever holds a `*mut ThreadObject`
+// (see push_deferred_reclaim), so it carries ThreadObject's 8-byte alignment.
+#[allow(clippy::cast_ptr_alignment)]
+#[cfg(not(test))]
+pub unsafe fn drain_deferred_reclaim(cpu: usize)
+{
+    if cpu >= crate::sched::MAX_CPUS
+    {
+        return;
+    }
+    // SAFETY: cpu < MAX_CPUS; scheduler initialised by sched::init.
+    let sched = unsafe { crate::sched::scheduler_for(cpu) };
+    // Fast path: the stack is empty on virtually every call (self-teardown is
+    // rare), so avoid the swap's RMW. Acquire pairs with the push's release CAS.
+    if sched
+        .deferred_reclaim_head
+        .load(Ordering::Acquire)
+        .is_null()
+    {
+        return;
+    }
+    let mut node = sched
+        .deferred_reclaim_head
+        .swap(core::ptr::null_mut(), Ordering::AcqRel)
+        .cast::<ThreadObject>();
+    while !node.is_null()
+    {
+        // SAFETY: node is an exclusively-owned, Exited, off-CPU ThreadObject
+        // pushed by push_deferred_reclaim; the link field is stable until freed.
+        let next = unsafe { (*node).deferred_next };
+        // SAFETY: refcount 0, exclusive ownership; re-enters the Thread arm with
+        // is_self false (the thread is off-CPU), running the full free path.
+        unsafe { dealloc_object(NonNull::new_unchecked(node.cast::<KernelObjectHeader>())) };
+        node = next;
+    }
+}
+
 /// Free a kernel object whose reference count has just reached zero.
 ///
 /// Dispatches on `obj_type` to reconstruct the original `Box<ConcreteObject>`
@@ -1325,6 +1451,51 @@ unsafe fn dealloc_object_one(
             // SAFETY: ptr points to a ThreadObject; header at offset 0.
             let obj = unsafe { &*(ptr.as_ptr().cast::<ThreadObject>()) };
             let tcb = obj.tcb;
+
+            // Self-teardown guard (#341): a thread that deletes the last
+            // capability to its OWN Thread object reaches here as the running
+            // thread on this CPU. The drain gate below spins until `tcb` is no
+            // longer `current` on any CPU — impossible for the running thread on
+            // its own CPU (the spin runs with preemption disabled, so it never
+            // reschedules), which wedges the CPU. Instead mark `Exited` + drain
+            // the run queues (no free), queue the object for off-CPU reclaim,
+            // and return: the syscall epilogue observes the `Exited` state and
+            // `schedule()`s away, and `drain_deferred_reclaim` re-enters this arm
+            // with the thread off-CPU, where the gate passes immediately.
+            if !tcb.is_null()
+            {
+                let this_cpu = crate::arch::current::cpu::current_cpu() as usize;
+                // SAFETY: this_cpu < MAX_CPUS; scheduler initialised. Reading our
+                // own CPU's `current` needs no lock — only this CPU writes it at
+                // dispatch, and we are that running thread.
+                let is_self = core::ptr::eq(tcb, unsafe {
+                    crate::sched::scheduler_for(this_cpu).current
+                });
+                if is_self
+                {
+                    log_self_teardown(tcb);
+                    // Defensive net. For SYS_CAP_DELETE this is unreachable —
+                    // sys_cap_delete refuses a self thread-cap delete before the
+                    // dec-ref. It still guards any OTHER dealloc of the running
+                    // thread (e.g. a self-targeting cap_revoke): mark Exited +
+                    // drain run queues (no free), queue the object for off-CPU
+                    // reclaim, and return. The syscall epilogue observes Exited
+                    // and schedule()s away; drain_deferred_reclaim completes the
+                    // free off-CPU, where the existing gate passes immediately.
+                    // SAFETY: tcb valid; marks Exited + drains every run queue
+                    // under the all-CPU-locks discipline (mirrors sys_thread_exit).
+                    unsafe {
+                        crate::sched::set_state_under_all_locks(
+                            tcb,
+                            crate::sched::thread::ThreadState::Exited,
+                        );
+                    }
+                    // SAFETY: object exclusively owned (refcount 0), now Exited
+                    // and drained; queue it for off-CPU reclaim on this CPU.
+                    unsafe { push_deferred_reclaim(this_cpu, ptr) };
+                    return;
+                }
+            }
 
             if !tcb.is_null()
             {
@@ -2814,7 +2985,7 @@ mod tests
         // SchedControlObject: 16 header + 1 min + 1 max + 6 pad = 24 (8-align).
         assert_eq!(size_of::<SchedControlObject>(), 24);
         assert_eq!(size_of::<SbiControlObject>(), 16);
-        assert_eq!(size_of::<ThreadObject>(), 24);
+        assert_eq!(size_of::<ThreadObject>(), 32);
         assert_eq!(size_of::<EndpointObject>(), 24);
         assert_eq!(size_of::<NotificationObject>(), 24);
         assert_eq!(size_of::<EventQueueObject>(), 24);

@@ -30,7 +30,7 @@ const PFLASH_SIZE: u64 = 32 * 1024 * 1024;
 
 /// Specification for one QEMU launch.
 ///
-/// `firmware_code_path` is the readonly pflash (OVMF on x86, RISCV_VIRT_CODE
+/// `firmware_code_path` is the readonly pflash (OVMF on x86, `RISCV_VIRT_CODE`
 /// on riscv64). `firmware_vars_path` is the writable pflash and is only used
 /// on riscv64 — x86 runs with volatile NVRAM and leaves the field `None`.
 pub struct QemuLaunchSpec<'a>
@@ -52,7 +52,7 @@ pub struct QemuLaunchSpec<'a>
 ///
 /// Pairs with `Arch::qemu_binary()` for the binary name. The returned vector
 /// is suitable for `Command::new(binary).args(&argv)`.
-pub fn build_qemu_argv(spec: &QemuLaunchSpec) -> Vec<String>
+pub fn build_qemu_argv(spec: &QemuLaunchSpec) -> Result<Vec<String>>
 {
     let mut args: Vec<String> = vec![
         "-m".into(),
@@ -98,10 +98,10 @@ pub fn build_qemu_argv(spec: &QemuLaunchSpec) -> Vec<String>
     match spec.arch
     {
         Arch::X86_64 => extend_x86(&mut args, spec, accel),
-        Arch::Riscv64 => extend_riscv(&mut args, spec),
+        Arch::Riscv64 => extend_riscv(&mut args, spec)?,
     }
 
-    args
+    Ok(args)
 }
 
 fn extend_x86(args: &mut Vec<String>, spec: &QemuLaunchSpec, accel: Accel)
@@ -176,11 +176,11 @@ fn extend_x86(args: &mut Vec<String>, spec: &QemuLaunchSpec, accel: Accel)
     }
 }
 
-fn extend_riscv(args: &mut Vec<String>, spec: &QemuLaunchSpec)
+fn extend_riscv(args: &mut Vec<String>, spec: &QemuLaunchSpec) -> Result<()>
 {
     let vars_path = spec
         .firmware_vars_path
-        .expect("riscv64 launch requires firmware_vars_path");
+        .context("riscv64 launch requires firmware_vars_path")?;
 
     args.extend(["-machine".into(), "virt".into()]);
     // Pin the CPU model to a baseline that advertises the RVA23U64 features
@@ -229,6 +229,8 @@ fn extend_riscv(args: &mut Vec<String>, spec: &QemuLaunchSpec)
             ]);
         }
     }
+
+    Ok(())
 }
 
 /// Resolve and cache riscv64 firmware.
@@ -353,10 +355,10 @@ fn preferred_display_backend(qemu_binary: &str) -> Option<String>
 /// Returns true if `cached` is missing, wrong-sized, or older than `source`.
 fn pflash_cache_stale(cached: &Path, source: &Path, target_size: u64) -> Result<bool>
 {
-    let cached_md = match std::fs::metadata(cached)
+    let Ok(cached_md) = std::fs::metadata(cached)
+    else
     {
-        Ok(m) => m,
-        Err(_) => return Ok(true),
+        return Ok(true);
     };
     if cached_md.len() != target_size
     {
@@ -384,7 +386,11 @@ fn pad_file_to(path: &Path, target_size: u64) -> Result<()>
         .with_context(|| format!("seeking {}", path.display()))?;
     if current < target_size
     {
-        let padding = vec![0u8; (target_size - current) as usize];
+        let padding = vec![
+            0u8;
+            usize::try_from(target_size - current)
+                .context("firmware padding size exceeds usize")?
+        ];
         file.write_all(&padding)
             .with_context(|| format!("padding {}", path.display()))?;
     }

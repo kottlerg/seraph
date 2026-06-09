@@ -92,8 +92,8 @@ pub fn install_rootfs(ctx: &BuildContext) -> Result<()>
         // Skip documentation files that are not part of the sysroot image.
         let rel = src
             .strip_prefix(&src_root)
-            .expect("src must be under src_root");
-        if rel.file_name().map(|n| n == "README.md").unwrap_or(false)
+            .context("src must be under src_root")?;
+        if rel.file_name().is_some_and(|n| n == "README.md")
         {
             continue;
         }
@@ -128,7 +128,7 @@ const SVCTEST_LARGE_BIN_PAGE_SIZE: usize = 4096;
 /// consumed by `svctest`'s `fs_release_on_close_phase`. Each 4 KiB page
 /// is filled with the ASCII tag `PAGE_NN_` repeated, where `NN` is the
 /// page index. The phase asserts the first 8 bytes equal `PAGE_00_` to
-/// confirm content integrity across the FS_READ_FRAME / mem_map /
+/// confirm content integrity across the `FS_READ_FRAME` / `mem_map` /
 /// release sequence. Treated as a build artifact (synthesised here, not
 /// shipped in `rootfs/`). Returns the destination path so `install_rootfs`
 /// keeps it through the prune pass.
@@ -165,7 +165,7 @@ fn synthesise_svctest_large_bin(ctx: &BuildContext) -> Result<PathBuf>
 const SVCTEST_BENCH_BIN_SIZE: usize = 65536;
 
 /// Emit `/data/svctest/bench.bin`, a 64 KiB deterministic fixture
-/// consumed by `fsbench` (the FS_READ vs FS_READ_FRAME crossover
+/// consumed by `fsbench` (the `FS_READ` vs `FS_READ_FRAME` crossover
 /// benchmark). Filled with a byte-position-derived pattern so any
 /// read-path corruption shows up as a content mismatch at the byte
 /// level. Treated as a build artifact, same pattern as `large.bin`.

@@ -7,6 +7,8 @@
 
 use std::path::PathBuf;
 
+use anyhow::{Context as _, Result};
+
 /// Resolved project paths used by every command.
 pub struct Context
 {
@@ -27,20 +29,20 @@ impl Context
     ///
     /// `CARGO_MANIFEST_DIR` is set by Cargo to the xtask crate root at compile
     /// time; its parent is the workspace root.
-    pub fn from_manifest_dir() -> Self
+    pub fn from_manifest_dir() -> Result<Self>
     {
         let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let root = manifest_dir
             .parent()
-            .expect("xtask manifest dir has no parent — check workspace layout")
+            .context("xtask manifest dir has no parent — check workspace layout")?
             .to_path_buf();
         let sysroot = root.join("sysroot");
         let target_dir = root.join("target");
-        Context {
+        Ok(Context {
             root,
             sysroot,
             target_dir,
-        }
+        })
     }
 
     /// Path to `sysroot/esp/` — ESP partition staging area.

@@ -29,10 +29,10 @@ pub fn run_cmd(cmd: &mut Command) -> Result<()>
 {
     let status = cmd
         .status()
-        .with_context(|| format!("failed to launch {:?}", cmd.get_program()))?;
+        .with_context(|| format!("failed to launch {}", cmd.get_program().display()))?;
     if !status.success()
     {
-        bail!("{:?} exited with {}", cmd.get_program(), status);
+        bail!("{} exited with {}", cmd.get_program().display(), status);
     }
     Ok(())
 }
@@ -44,10 +44,14 @@ pub fn run_cmd_capture(cmd: &mut Command) -> Result<String>
 {
     let output = cmd
         .output()
-        .with_context(|| format!("failed to launch {:?}", cmd.get_program()))?;
+        .with_context(|| format!("failed to launch {}", cmd.get_program().display()))?;
     if !output.status.success()
     {
-        bail!("{:?} exited with {}", cmd.get_program(), output.status);
+        bail!(
+            "{} exited with {}",
+            cmd.get_program().display(),
+            output.status
+        );
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
@@ -59,7 +63,7 @@ pub fn run_cmd_capture(cmd: &mut Command) -> Result<String>
 /// tools that aren't part of xtask's own dependency chain (qemu,
 /// llvm-objcopy from rustup, etc.) so a missing tool produces an
 /// actionable message instead of the OS's opaque "No such file or
-/// directory" from Command::spawn.
+/// directory" from `Command::spawn`.
 pub fn require_tool(name: &str) -> Result<PathBuf>
 {
     which::which(name).map_err(|err| {

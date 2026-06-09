@@ -311,7 +311,7 @@ pub struct RunParallelArgs
     pub fail: String,
 
     /// Grace window, in seconds, after the first `--fail` match before the
-    /// run is SIGKILLed. A kernel fault dump is multi-line and may be
+    /// run is `SIGKILLed`. A kernel fault dump is multi-line and may be
     /// followed by secondary-CPU faults; killing on the first matching byte
     /// truncates the diagnostics. The run is killed at whichever is first:
     /// this window, or the `--timeout` deadline. 0 kills on the next poll

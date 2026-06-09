@@ -366,6 +366,22 @@ cache-warmth alignment with the documented soft-affinity intent in
 to be unrelated (`CSpaceId` namespace exhaustion, see commits on
 that issue).
 
+`select_target_cpu_excluding(tcb, exclude)` is the same policy with one CPU
+removed from the save-window-pin / sticky / min-load branches (hard affinity
+still wins, and the excluded CPU is returned only as a single-CPU fallback).
+`dealloc_object(Thread)`'s deferred reply-wake calls it with
+`exclude = Some(dealloc_cpu)`: the dealloc CPU is wedged in a preempt-disabled
+UAF gate, **not** in `schedule()`, so the save-window pin's deadlock-avoidance
+rationale does not apply to it — pinning a `context_saved == 0` woken client
+there strands it on a CPU that cannot re-enter the scheduler until the dealloc
+returns, which it cannot do while that client is the only runnable thread
+(#351). The target is also recomputed at the *wake* site rather than snapshotted
+inside the all-CPU-locks region: snapshotting two unbounded gate-spins before
+the link let the client's state drift, widening the double-enqueue straddle
+(#289). A peer dispatches the `cs == 0` client safely because the consumer-side
+`schedule()` waits on the `context_saved` Acquire publication barrier before the
+register switch.
+
 Consumer side (`idle_thread_entry`, `core/kernel/src/sched/mod.rs`):
 
 ```

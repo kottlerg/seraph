@@ -2640,22 +2640,57 @@ pub unsafe fn enqueue_ready_thread(_tcb: *mut ThreadControlBlock, _target_cpu: u
 #[cfg(not(test))]
 pub unsafe fn select_target_cpu(tcb: *mut ThreadControlBlock) -> usize
 {
+    // SAFETY: caller guarantees tcb is valid.
+    unsafe { select_target_cpu_excluding(tcb, None) }
+}
+
+/// Like [`select_target_cpu`], but treat `exclude` (when `Some`) as ineligible
+/// for the save-window-pin, sticky, and min-load branches — UNLESS hard
+/// `cpu_affinity` names it (affinity is a correctness constraint that overrides
+/// the placement hint) or it is the only CPU.
+///
+/// `dealloc_object(Thread)`'s deferred reply-wake passes `exclude =
+/// Some(dealloc_cpu)`. That CPU is wedged in a preempt-disabled UAF gate, NOT in
+/// `schedule()`, so the save-window pin's deadlock-avoidance rationale does not
+/// apply to it: pinning a `context_saved == 0` woken client there would strand
+/// it on a CPU that cannot re-enter the scheduler until the dealloc returns —
+/// which it cannot do while that client is the only runnable thread (#351). When
+/// the pin / sticky / min-load choice would land on `exclude`, fall back to the
+/// least-loaded non-excluded CPU. A peer dispatches the `cs == 0` client safely:
+/// `schedule()` waits on the publication barrier (`context_saved` Acquire spin)
+/// before the register switch, so a peer never loads a not-yet-saved register
+/// file.
+///
+/// # Safety
+/// `tcb` must be a valid pointer to an initialized [`ThreadControlBlock`].
+// needless_range_loop: the scheduler slab is reached via scheduler_ptr(cpu);
+// indexed bounds checking is clearer than iter/enumerate pointer plumbing.
+#[allow(clippy::needless_range_loop)]
+#[cfg(not(test))]
+pub unsafe fn select_target_cpu_excluding(
+    tcb: *mut ThreadControlBlock,
+    exclude: Option<usize>,
+) -> usize
+{
     // SAFETY: caller guarantees tcb is valid; cpu_affinity field is always valid.
     let affinity = unsafe { (*tcb).cpu_affinity };
 
-    // Hard affinity: use specified CPU.
+    // Hard affinity wins, even when it names the excluded CPU: affinity is a
+    // correctness constraint, not a placement hint.
     if affinity != AFFINITY_ANY
     {
         return affinity as usize;
     }
 
     let cpu_count = CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
+    let eligible = |c: usize| -> bool { c < cpu_count && Some(c) != exclude };
 
     // Save-window pinning: while `context_saved == 0` the source CPU is
-    // mid-switch into `tcb.saved_state`. Migrating the wake to a different
-    // CPU would force its `schedule()` to spin on the publication barrier;
-    // two such migrations on different CPUs can cross-deadlock. Pinning
-    // to `preferred_cpu` (the CPU performing the save) avoids both.
+    // mid-switch into `tcb.saved_state`. Pinning to `preferred_cpu` (the saving
+    // CPU) lets that CPU's own `schedule()` complete the save before re-running
+    // the thread, avoiding a cross-CPU publication-barrier spin. Honoured only
+    // when `preferred_cpu` is eligible; otherwise fall through so a `cs == 0`
+    // client is never pinned to the excluded (wedged) CPU.
     // SAFETY: tcb valid; context_saved is AtomicU32; preferred_cpu always set.
     let saved = unsafe {
         (*tcb)
@@ -2664,23 +2699,26 @@ pub unsafe fn select_target_cpu(tcb: *mut ThreadControlBlock) -> usize
     };
     if saved == 0
     {
-        // SAFETY: preferred_cpu is set by every prior enqueue_and_wake;
-        // bounded by CPU_COUNT at the source.
+        // SAFETY: preferred_cpu is set by every prior enqueue_and_wake.
         let pref = unsafe { (*tcb).preferred_cpu } as usize;
-        if pref < cpu_count
+        if eligible(pref)
         {
             return pref;
         }
     }
 
-    // Scan all CPUs for min load. Used both as the fallback selection and as
-    // the reference value for the sticky-preferred-CPU comparison below.
+    // Scan ELIGIBLE CPUs for min load. `usize::MAX` marks "no eligible CPU"
+    // (degenerate: cpu_count == 1 and that CPU excluded).
     let mut min_load = u32::MAX;
-    let mut min_cpu = 0;
+    let mut min_cpu = usize::MAX;
     // SAFETY: scheduler slab covers cpu_count slots, all initialised by sched::init.
     for cpu in 0..cpu_count
     {
-        // SAFETY: cpu < cpu_count; scheduler slab initialised for all CPUs by sched::init.
+        if !eligible(cpu)
+        {
+            continue;
+        }
+        // SAFETY: cpu < cpu_count; scheduler slab initialised for all CPUs.
         let load = unsafe { (*scheduler_ptr(cpu)).current_load() };
         if load < min_load
         {
@@ -2689,13 +2727,12 @@ pub unsafe fn select_target_cpu(tcb: *mut ThreadControlBlock) -> usize
         }
     }
 
-    // Sticky preferred CPU: stay if within the pull-balancer's imbalance
-    // threshold of the global minimum. See doc comment above.
-    // SAFETY: preferred_cpu is set by every prior enqueue_and_wake; bounded
-    // by CPU_COUNT at the source. The `< cpu_count` guard makes a stale or
-    // never-initialised value fall through to the min-load path.
+    // Sticky preferred CPU (eligible only): stay if within the pull-balancer's
+    // imbalance threshold of the global minimum (cache-warmth bias, #128).
+    // SAFETY: preferred_cpu is set by every prior enqueue_and_wake; the
+    // eligibility guard makes a stale value fall through to the min-load path.
     let pref = unsafe { (*tcb).preferred_cpu } as usize;
-    if pref < cpu_count
+    if eligible(pref)
     {
         // SAFETY: pref < cpu_count; slab initialised.
         let pref_load = unsafe { (*scheduler_ptr(pref)).current_load() };
@@ -2705,6 +2742,21 @@ pub unsafe fn select_target_cpu(tcb: *mut ThreadControlBlock) -> usize
         }
     }
 
+    // Degenerate: no eligible CPU (cpu_count == 1, or every non-excluded queue
+    // filtered). Returning the excluded CPU is correct — on a single CPU the
+    // dealloc caller returns to schedule() via the syscall epilogue and
+    // dispatches the client itself; the strand requires an idle peer.
+    if min_cpu == usize::MAX
+    {
+        return exclude.unwrap_or(0);
+    }
+
+    // G2: the exclusion holds for the load-scan result (affinity / single-CPU
+    // overrides returned earlier).
+    debug_assert!(
+        Some(min_cpu) != exclude,
+        "select_target_cpu_excluding: load scan returned excluded cpu {min_cpu}",
+    );
     min_cpu
 }
 

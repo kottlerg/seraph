@@ -31,6 +31,7 @@ mod double_enqueue_storm;
 mod event_queue_fill_drain;
 mod fpu_migration_churn;
 mod idle_wake_race;
+mod load_balance_handoff_steal;
 mod priority_dealloc_race;
 mod retype_concurrent;
 mod stop_reply_race;
@@ -76,6 +77,10 @@ pub fn run_all(ctx: &TestContext)
     run_integration_test!(
         "stress::double_enqueue_storm",
         double_enqueue_storm::run(ctx)
+    );
+    run_integration_test!(
+        "stress::load_balance_handoff_steal",
+        load_balance_handoff_steal::run(ctx)
     );
     run_integration_test!(
         "stress::concurrent_notification",

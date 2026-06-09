@@ -585,16 +585,29 @@ priority, preferred_cpu, idle age, non-empty mask) plus the head of
 `WATCHDOG_THRESHOLD_TICKS` (~3 s at the observed ~1 ms tick). Single-shot
 via `WATCHDOG_FIRED`.
 
+Each per-CPU line also carries a **spin-site breadcrumb**: a wedged CPU whose
+`current` is `Exited` but which never returned to the scheduler is stuck in a
+bounded protocol-spin, and the breadcrumb (`spin_site_enter`/`spin_site_exit`,
+set around each gate) names which one — `dealloc:not-current`,
+`dealloc:context-saved`, or `dealloc:wake-in-flight`. The `dealloc_object(Thread)`
+gates carried no overlong-duration warning of their own (unlike the `schedule()`
+context-saved spin and the `sys_thread_stop` drain), so a wedge there showed only
+an opaque `current = Exited` in `SYS_CAP_DELETE` (#351); the breadcrumb makes it
+explicit.
+
 The dump then walks the live-thread registry (§ Thread Registry) and prints
-every `Blocked` thread with its `wake_pending`/`wake_in_flight` flags and a
-decode of its `blocked_on_object`: whether the blocking object still names the
-thread as its waiter (`waiter_is_self` / `reply_is_self`) or holds data with a
-cleared waiter slot (`count > 0`). The per-CPU `current` dump shows only each
-CPU's running/idle thread, so a lost-wakeup victim — a `Blocked` thread parked
-on an IPC object, reachable from nothing the `current` dump sees — was invisible
-before this enumeration (#351). The decode distinguishes the two failure shapes:
-a wake that was never issued (object still owns the waiter) versus one deposited
-but never linked to a run queue (waiter cleared / `wake_in_flight` still set).
+every non-running registered thread. For a `Blocked` thread it shows the
+`wake_pending`/`wake_in_flight` flags and a decode of `blocked_on_object`:
+whether the blocking object still names the thread as its waiter
+(`waiter_is_self` / `reply_is_self`) or holds data with a cleared waiter slot
+(`count > 0`) — distinguishing a wake that was never issued from one deposited
+but never linked. For a `Ready`/`Stopped` thread it shows
+`context_saved`/`queued_on`/affinity/`preferred_cpu` — why a runnable thread is
+neither dispatched by its wedged owner CPU nor stolen by an idle one (e.g. the
+save-window pin holds a `context_saved == 0` thread on its owner). The per-CPU
+`current` dump shows only each CPU's running/idle thread, so both victim shapes
+— a `Blocked` waiter on an IPC object, or a `Ready` thread stranded in a wedged
+CPU's run queue — were invisible before this enumeration (#351).
 
 **Cost:** one Relaxed counter increment per BSP timer tick, one Relaxed
 store per non-idle context switch, an O(MAX_CPUS) early-exit loop per tick.

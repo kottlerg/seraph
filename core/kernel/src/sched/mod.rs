@@ -240,6 +240,83 @@ static WATCHDOG_TICK_COUNTER: core::sync::atomic::AtomicU64 = core::sync::atomic
 
 static WATCHDOG_FIRED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+// ── Per-CPU spin-site breadcrumb ──────────────────────────────────────────────
+
+/// Spin-site code: this CPU is not in any bounded protocol-spin.
+pub const SPIN_SITE_NONE: u32 = 0;
+/// `dealloc_object(Thread)` UAF gate, step 1: spinning until the dying TCB is
+/// no longer `current` on any CPU.
+pub const SPIN_SITE_DEALLOC_NOT_CURRENT: u32 = 1;
+/// `dealloc_object(Thread)` UAF gate, step 2: spinning until the dying TCB's
+/// in-flight register save has published (`context_saved == 1`).
+pub const SPIN_SITE_DEALLOC_CONTEXT_SAVED: u32 = 2;
+/// `dealloc_object(Thread)` wake-in-flight gate: spinning until a waker's
+/// claimed-but-not-yet-committed `enqueue_and_wake` clears `wake_in_flight`.
+pub const SPIN_SITE_DEALLOC_WAKE_IN_FLIGHT: u32 = 3;
+/// `schedule()` cross-CPU dispatch: spinning on the next thread's
+/// `context_saved` Acquire barrier.
+pub const SPIN_SITE_SCHEDULE_CONTEXT_SAVED: u32 = 4;
+/// `sys_thread_stop` cross-CPU drain: spinning until the target leaves
+/// `current` on its owning CPU.
+pub const SPIN_SITE_THREAD_STOP_DRAIN: u32 = 5;
+
+/// Per-CPU breadcrumb naming the bounded protocol-spin a CPU is currently
+/// executing, for the softlockup watchdog. A wedged CPU (no non-idle dispatch
+/// for the threshold) that is stuck in a `dealloc_object(Thread)` gate shows
+/// the gate here, turning an opaque `current = Exited` dump into a named site
+/// (#351). Set on gate entry, cleared on exit; [`SPIN_SITE_NONE`] when not
+/// spinning. Diagnostic-only — never gates control flow.
+#[cfg(not(test))]
+static SPIN_SITE: [core::sync::atomic::AtomicU32; MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU32::new(SPIN_SITE_NONE) }; MAX_CPUS];
+
+/// Record that the current CPU has entered bounded protocol-spin `site`. The
+/// gates that call this run preempt-disabled, so the CPU index is stable across
+/// the spin.
+#[cfg(not(test))]
+pub fn spin_site_enter(site: u32)
+{
+    let cpu = crate::arch::current::cpu::current_cpu() as usize;
+    if cpu < MAX_CPUS
+    {
+        SPIN_SITE[cpu].store(site, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Clear the current CPU's spin-site breadcrumb on gate exit.
+#[cfg(not(test))]
+pub fn spin_site_exit()
+{
+    let cpu = crate::arch::current::cpu::current_cpu() as usize;
+    if cpu < MAX_CPUS
+    {
+        SPIN_SITE[cpu].store(SPIN_SITE_NONE, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Human-readable name for a spin-site code, for the watchdog dump.
+#[cfg(not(test))]
+fn spin_site_name(site: u32) -> &'static str
+{
+    match site
+    {
+        SPIN_SITE_DEALLOC_NOT_CURRENT => "dealloc:not-current",
+        SPIN_SITE_DEALLOC_CONTEXT_SAVED => "dealloc:context-saved",
+        SPIN_SITE_DEALLOC_WAKE_IN_FLIGHT => "dealloc:wake-in-flight",
+        SPIN_SITE_SCHEDULE_CONTEXT_SAVED => "schedule:context-saved",
+        SPIN_SITE_THREAD_STOP_DRAIN => "thread-stop:drain",
+        _ => "none",
+    }
+}
+
+/// Test stub: spin-site breadcrumbs are diagnostic-only and compiled out under
+/// host `cfg(test)`.
+#[cfg(test)]
+pub fn spin_site_enter(_site: u32) {}
+/// Test stub; see [`spin_site_enter`].
+#[cfg(test)]
+pub fn spin_site_exit() {}
+
 /// Mark `cpu` as having dispatched a non-idle thread at the current tick.
 pub fn watchdog_mark_non_idle(cpu: usize)
 {
@@ -363,6 +440,14 @@ fn watchdog_tick_and_check()
             now.saturating_sub(last_tick),
             mask
         );
+        // Name the bounded protocol-spin this CPU is wedged in, if any. A CPU
+        // whose `current` is `Exited` but which never returned to the scheduler
+        // is stuck in one of these gates (#351) — the breadcrumb says which.
+        let spin = SPIN_SITE[cpu].load(core::sync::atomic::Ordering::Relaxed);
+        if spin != SPIN_SITE_NONE
+        {
+            crate::kprintln!("    spinning in {}", spin_site_name(spin));
+        }
         // Dump the user-mode trap frame if present: tells us where in
         // userspace the thread entered its currently-stuck syscall.
         // SAFETY: trap_frame is set by every userspace-syscall entry and
@@ -429,57 +514,99 @@ fn watchdog_tick_and_check()
             dl
         );
     }
-    // Enumerate Blocked waiters via the live-thread registry. The per-CPU
-    // `current` dump above shows only each CPU's running/idle thread; the
-    // lost-wakeup victim (#351) is a Blocked thread parked on an IPC object,
-    // reachable only through the registry. The decode below is the decisive
-    // signal: whether the blocking object still names this waiter (no wake was
-    // ever issued) versus holds data / a cleared waiter slot (a wake was
-    // deposited but the link to the run queue was lost).
-    crate::kprintln!("  BLOCKED THREADS:");
+    // Enumerate non-running registered threads via the live-thread registry.
+    // The per-CPU `current` dump above shows only each CPU's running/idle
+    // thread. The #351 victim is invisible there: it is either a `Blocked`
+    // waiter parked on an IPC object, or a `Ready` thread stranded in a run
+    // queue that a wedged CPU never dispatched (the `mask` bit is set but no
+    // dispatch happens). For `Blocked` threads the `blocked_on` decode says
+    // whether the blocking object still names the waiter (no wake issued) or
+    // holds data with a cleared slot (a wake deposited but never linked); for
+    // `Ready`/`Stopped` threads the scheduling fields say why a runnable thread
+    // is neither dispatched locally nor stolen (`context_saved`/`queued_on`/
+    // affinity / save-window pin).
+    crate::kprintln!("  NON-RUNNING REGISTERED THREADS:");
     // Defined outside the `try_for_each` call so the `kprintln!` expansions are
     // not lexically inside the `unsafe` wrapping that call (which would flag
     // their macro-internal `unsafe` as redundant). Each raw deref is its own
     // tight `unsafe`; the field reads race benignly by the stalled contract.
-    let dump_blocked = |t: *mut ThreadControlBlock| {
+    let dump_thread = |t: *mut ThreadControlBlock| {
         // SAFETY: t is a registry-walked TCB held stable by the registry lock.
-        let is_blocked = unsafe { (*t).state == thread::ThreadState::Blocked };
-        if !is_blocked
+        let state = unsafe { (*t).state };
+        match state
         {
-            return;
+            thread::ThreadState::Blocked =>
+            {
+                // SAFETY: same contract; reads only plain scalar fields.
+                let (tid, ipc, blocked_on, prio, pref, wake_pending, wake_in_flight, dl) = unsafe {
+                    (
+                        (*t).thread_id,
+                        (*t).ipc_state,
+                        (*t).blocked_on_object,
+                        (*t).priority,
+                        (*t).preferred_cpu,
+                        (*t).wake_pending,
+                        (*t).wake_in_flight
+                            .load(core::sync::atomic::Ordering::Relaxed),
+                        (*t).sleep_deadline,
+                    )
+                };
+                crate::kprintln!(
+                    "    tid{} Blocked ipc={:?} blocked_on={:p} prio={} pref={} \
+                     wake_pending={} wake_in_flight={} dl={}",
+                    tid,
+                    ipc,
+                    blocked_on,
+                    prio,
+                    pref,
+                    wake_pending,
+                    wake_in_flight,
+                    dl
+                );
+                // SAFETY: same contract; watchdog_decode_blocked_on only reads.
+                unsafe { watchdog_decode_blocked_on(t) };
+            }
+            thread::ThreadState::Ready
+            | thread::ThreadState::Stopped
+            | thread::ThreadState::Created =>
+            {
+                // SAFETY: same contract; reads only plain scalar fields.
+                let (tid, prio, pref, aff, queued_on, cs, wif, wp) = unsafe {
+                    (
+                        (*t).thread_id,
+                        (*t).priority,
+                        (*t).preferred_cpu,
+                        (*t).cpu_affinity,
+                        (*t).queued_on.load(core::sync::atomic::Ordering::Relaxed),
+                        (*t).context_saved
+                            .load(core::sync::atomic::Ordering::Relaxed),
+                        (*t).wake_in_flight
+                            .load(core::sync::atomic::Ordering::Relaxed),
+                        (*t).wake_pending,
+                    )
+                };
+                crate::kprintln!(
+                    "    tid{} {:?} prio={} pref={} affinity=0x{:x} queued_on={} \
+                     context_saved={} wake_in_flight={} wake_pending={}",
+                    tid,
+                    state,
+                    prio,
+                    pref,
+                    aff,
+                    queued_on,
+                    cs,
+                    wif,
+                    wp
+                );
+            }
+            // Running threads are each a CPU's `current`, already dumped above.
+            thread::ThreadState::Running | thread::ThreadState::Exited =>
+            {}
         }
-        // SAFETY: same contract; reads only plain scalar fields.
-        let (tid, ipc, blocked_on, prio, pref, wake_pending, wake_in_flight, dl) = unsafe {
-            (
-                (*t).thread_id,
-                (*t).ipc_state,
-                (*t).blocked_on_object,
-                (*t).priority,
-                (*t).preferred_cpu,
-                (*t).wake_pending,
-                (*t).wake_in_flight
-                    .load(core::sync::atomic::Ordering::Relaxed),
-                (*t).sleep_deadline,
-            )
-        };
-        crate::kprintln!(
-            "    tid{} ipc={:?} blocked_on={:p} prio={} pref={} \
-             wake_pending={} wake_in_flight={} dl={}",
-            tid,
-            ipc,
-            blocked_on,
-            prio,
-            pref,
-            wake_pending,
-            wake_in_flight,
-            dl
-        );
-        // SAFETY: same contract; watchdog_decode_blocked_on only reads.
-        unsafe { watchdog_decode_blocked_on(t) };
     };
     // SAFETY: best-effort read-only walk under the registry lock; the closure
     // only reads through each TCB pointer (no register/unregister).
-    let walked = unsafe { thread_registry::try_for_each(dump_blocked) };
+    let walked = unsafe { thread_registry::try_for_each(dump_thread) };
     if !walked
     {
         crate::kprintln!("    (registry lock contended; skipped)");

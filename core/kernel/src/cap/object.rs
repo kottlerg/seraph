@@ -1683,6 +1683,7 @@ unsafe fn dealloc_object_one(
                     // until it switches away, then re-scan; once a full scan is
                     // clean, no CPU can re-install `tcb` (it is `Exited` and
                     // unlinked from every run queue under the all-locks region).
+                    crate::sched::spin_site_enter(crate::sched::SPIN_SITE_DEALLOC_NOT_CURRENT);
                     loop
                     {
                         let run_cpu = 'scan: {
@@ -1717,6 +1718,7 @@ unsafe fn dealloc_object_one(
                     }
 
                     // Step 2: register save published.
+                    crate::sched::spin_site_enter(crate::sched::SPIN_SITE_DEALLOC_CONTEXT_SAVED);
                     while (*tcb)
                         .context_saved
                         .load(core::sync::atomic::Ordering::Acquire)
@@ -1724,6 +1726,7 @@ unsafe fn dealloc_object_one(
                     {
                         core::hint::spin_loop();
                     }
+                    crate::sched::spin_site_exit();
 
                     // Restore the caller's interrupt state and preemption.
                     // SAFETY: saved_int from save_and_disable_interrupts above.
@@ -1989,6 +1992,7 @@ unsafe fn dealloc_object_one(
                     unsafe { crate::arch::current::cpu::save_and_disable_interrupts() };
                 // SAFETY: ring 0; IDT loaded; preempt disabled.
                 unsafe { crate::arch::current::interrupts::enable() };
+                crate::sched::spin_site_enter(crate::sched::SPIN_SITE_DEALLOC_WAKE_IN_FLIGHT);
                 // SAFETY: tcb is valid (not yet freed); wake_in_flight is always
                 // valid on an initialized TCB.
                 while unsafe {
@@ -1999,6 +2003,7 @@ unsafe fn dealloc_object_one(
                 {
                     core::hint::spin_loop();
                 }
+                crate::sched::spin_site_exit();
                 // SAFETY: wake_saved_int from save_and_disable_interrupts above.
                 unsafe { crate::arch::current::cpu::restore_interrupts(wake_saved_int) };
                 crate::percpu::preempt_enable();

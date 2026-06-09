@@ -191,6 +191,23 @@ and leaves the pending link to place the TCB. The next caller of
 `migrate_ready_thread` (or the load balancer) re-runs the migration if still
 warranted.
 
+`migrate_ready_thread` and the load balancer's `pull_unpinned_ready` both
+funnel their validate-then-move through one primitive, `relocate_ready_thread`,
+which reads `(state == Ready && context_saved == 1 && cpu_affinity permits
+dst_cpu)` entirely under the caller-held `(*tcb).sched_lock` (the caller owns the
+four-lock lifecycle and the post-move IPI). The affinity gate closes a
+load-balancer affinity violation: `pull_unpinned_ready`'s `find_runnable`
+predicate reads `cpu_affinity` *advisorily* under the run-queue lock, so a
+concurrent `sys_thread_set_affinity` pinning the candidate away from `dst_cpu`
+between the predicate and the move was previously honoured nowhere — the puller
+would relocate a freshly-pinned thread to a forbidden CPU. Re-reading affinity
+under `sched_lock` (the owning serializer) makes the puller decline; the
+candidate is then placed correctly by the next `schedule()` cross-affinity arm
+or balance tick (eventual consistency, not instant re-homing — #116). The
+primitive takes the caller-located `priority` (the level `find_runnable` /
+`migrate` found the candidate at), never re-reading `(*tcb).priority`, which a
+concurrent `sys_thread_set_priority` could desync from the linked level.
+
 `PerCpuScheduler::enqueue` (not `change_priority`) is the correct primitive
 for the syscall's re-enqueue half: `change_priority`'s enqueue is
 unconditional, so calling it on a scheduler whose `remove_from_queue`

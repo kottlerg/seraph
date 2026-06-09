@@ -2061,64 +2061,19 @@ pub unsafe fn migrate_ready_thread(
     // SAFETY: lo lock held; acquiring hi second satisfies ascending-CPU order.
     let saved_hi = unsafe { hi_sched.lock.lock_raw() };
 
-    // Authoritative read under sched_lock: only a Ready thread that has FULLY
-    // saved its context (`context_saved == 1`) is migratable. A Ready-but-
-    // `cs == 0` thread is mid-handoff — woken (e.g. a fast IPC reply) while still
-    // `current`/live on its source CPU and not yet switched away; relocating it
-    // cross-CPU would dispatch it on two CPUs at once (#314/#293). `cs == 1`
-    // proves it has switched out and is not `current` anywhere. A skipped
-    // mid-handoff thread keeps its (already-written) affinity and is placed
-    // correctly by its source CPU's `schedule()` cross-affinity arm.
-    // `remove_from_queue(src)` below is the authoritative "located on src" check —
-    // it fails (and we bail) if the thread is Ready on a different CPU's queue or
-    // in the benign Ready-but-unlinked publication window — so no separate
-    // preferred_cpu heuristic is needed.
-    // SAFETY: tcb valid; state/cs/priority read under sched_lock + run-queue locks.
-    let (state, cs, priority) = unsafe {
-        (
-            (*tcb).state,
-            (*tcb).context_saved.load(Ordering::Acquire),
-            (*tcb).priority,
-        )
-    };
+    // The candidate is the caller-named `tcb`, located on `src` by
+    // `relocate_ready_thread`'s own `remove_from_queue(src)`. Read its priority
+    // under sched_lock + both run-queue locks: `sys_thread_set_priority` writes
+    // priority under the same all-CPU-locks discipline (it holds every CPU's
+    // run-queue lock), so this read cannot race it.
+    // SAFETY: tcb valid; priority read under sched_lock + run-queue locks.
+    let priority = unsafe { (*tcb).priority };
 
-    if state != thread::ThreadState::Ready || cs != 1
-    {
-        // SAFETY: paired above; release inner (hi, lo) then outer (sched_lock).
-        unsafe {
-            hi_sched.lock.unlock_raw(saved_hi);
-            lo_sched.lock.unlock_raw(saved_lo);
-            (*tcb).sched_lock.unlock_raw(tcb_sched_saved);
-        }
-        return false;
-    }
-
-    // SAFETY: src and dst schedulers initialised; tcb is Ready; both run-queue
-    // locks held so neither queue's structure can change underneath us.
-    let removed = unsafe { scheduler_for(src_cpu).remove_from_queue(tcb, priority) };
-    if !removed
-    {
-        // Ready but not linked on src — either the benign Ready-but-unlinked
-        // publication window (a pending enqueue_and_wake will place it), or it is
-        // Ready on a different CPU's queue. Either way nothing to do here; that
-        // CPU's schedule()/enqueue honours the new affinity.
-        // SAFETY: paired above; release inner (hi, lo) then outer (sched_lock).
-        unsafe {
-            hi_sched.lock.unlock_raw(saved_hi);
-            lo_sched.lock.unlock_raw(saved_lo);
-            (*tcb).sched_lock.unlock_raw(tcb_sched_saved);
-        }
-        return false;
-    }
-
-    // SAFETY: dst scheduler initialised; tcb is no longer on src's queue.
-    unsafe { scheduler_for(dst_cpu).enqueue(tcb, priority) };
-    // SAFETY: tcb valid; sched_lock + both run-queue locks held.
-    unsafe { (*tcb).preferred_cpu = dst_cpu as u32 };
-
-    // Publish reschedule-pending before the unlock so the dst CPU's idle
-    // loop / schedule() sees it via the Release on unlock.
-    set_reschedule_pending_for(dst_cpu);
+    // Validate (Ready && context_saved==1 && affinity permits dst) and move
+    // src→dst, all under the held locks. Here the caller (sys_thread_set_affinity)
+    // has just set cpu_affinity = dst_cpu, so the affinity gate passes.
+    // SAFETY: sched_lock + both run-queue locks held (ascending CPU order).
+    let moved = unsafe { relocate_ready_thread(tcb, src_cpu, dst_cpu, priority) };
 
     // SAFETY: paired above; release inner (hi, lo) then outer (sched_lock).
     unsafe {
@@ -2127,10 +2082,103 @@ pub unsafe fn migrate_ready_thread(
         (*tcb).sched_lock.unlock_raw(tcb_sched_saved);
     }
 
-    // Always-IPI per the wake-protocol invariant.
-    // SAFETY: dst_cpu validated < cpu_count above.
-    unsafe { wake_idle_cpu(dst_cpu) };
+    if moved
+    {
+        // Always-IPI per the wake-protocol invariant.
+        // SAFETY: dst_cpu validated < cpu_count above.
+        unsafe { wake_idle_cpu(dst_cpu) };
+    }
 
+    moved
+}
+
+/// Relocate a Ready candidate from `src_cpu` to `dst_cpu`: the single
+/// validate-then-move core shared by [`migrate_ready_thread`] (canonical
+/// `sched_lock` → run-queue lock order) and [`pull_unpinned_ready`] (inverse,
+/// `try_lock`'d order). One place takes a Ready TCB off one queue and puts it on
+/// another, mirroring `PerCpuScheduler::enqueue` as the single insertion
+/// chokepoint.
+///
+/// Validates, under the caller-held `sched_lock` (the authoritative serializer):
+/// - `state == Ready` AND `context_saved == 1` — a `cs == 0` Ready thread is
+///   mid-handoff (woken while still `current`/live on its source CPU, not yet
+///   switched away); relocating it would dispatch it on two CPUs at once
+///   (#314/#293). `cs == 1` proves it switched out and is `current` nowhere.
+/// - hard `cpu_affinity` permits `dst_cpu`. This gate closes the load-balancer
+///   affinity violation: `pull_unpinned_ready`'s `find_runnable` predicate reads
+///   `cpu_affinity` *advisorily* under the run-queue lock, so a concurrent
+///   `sys_thread_set_affinity` can pin the thread away from `dst_cpu` between the
+///   predicate and here. Re-reading affinity under `sched_lock` honours the pin.
+///
+/// `remove_from_queue(src, priority)` is the authoritative "located on src at
+/// `priority`" check; it fails (benign no-op) if the thread moved or is in the
+/// Ready-but-unlinked publication window. A declined relocation leaves the
+/// candidate on `src`, corrected by the next `schedule()` cross-affinity arm or
+/// balance tick — eventual consistency, not instant re-homing (#116).
+///
+/// Returns `true` iff the thread was relocated.
+///
+/// # Safety
+/// Caller MUST hold `(*tcb).sched_lock` AND both `src`/`dst` run-queue locks
+/// (acquired in ascending CPU order). `priority` MUST be the level the candidate
+/// is linked at on `src_cpu` — the value the caller located it by — NOT a
+/// re-read of `(*tcb).priority` inside a context where a concurrent
+/// `sys_thread_set_priority` could have desynced them. Takes/releases NO lock and
+/// sends NO IPI: the caller owns the lock lifecycle and the `wake_idle_cpu(dst)`
+/// that follows a `true` return.
+#[cfg(not(test))]
+unsafe fn relocate_ready_thread(
+    tcb: *mut thread::ThreadControlBlock,
+    src_cpu: usize,
+    dst_cpu: usize,
+    priority: u8,
+) -> bool
+{
+    use core::sync::atomic::Ordering;
+    // SAFETY: tcb valid by caller contract; magic readable.
+    debug_assert!(unsafe { (*tcb).magic == thread::TCB_MAGIC });
+
+    // SAFETY: state/cs/affinity read under the caller-held sched_lock.
+    let (state, cs, affinity) = unsafe {
+        (
+            (*tcb).state,
+            (*tcb).context_saved.load(Ordering::Acquire),
+            (*tcb).cpu_affinity,
+        )
+    };
+
+    if state != thread::ThreadState::Ready || cs != 1
+    {
+        return false;
+    }
+    if affinity != AFFINITY_ANY && affinity as usize != dst_cpu
+    {
+        return false;
+    }
+
+    // G3: the relocation only proceeds for a Ready candidate.
+    debug_assert!(state == thread::ThreadState::Ready);
+    // SAFETY: both run-queue locks held; tcb pinned by them. `remove_from_queue`
+    // is the authoritative located-on-src check at `priority`.
+    if !unsafe { scheduler_for(src_cpu).remove_from_queue(tcb, priority) }
+    {
+        return false;
+    }
+    // SAFETY: tcb no longer on src; dst scheduler valid; both locks held.
+    unsafe { scheduler_for(dst_cpu).enqueue(tcb, priority) };
+    // SAFETY: tcb valid; sched_lock + both run-queue locks held.
+    unsafe { (*tcb).preferred_cpu = dst_cpu as u32 };
+    // G4: the relocated thread is linked on dst at exactly `priority` (a stale
+    // tag here would mean a double-relocate left an inconsistent link).
+    // SAFETY: tcb valid; queued_on read under the held run-queue locks.
+    let linked_at = unsafe { (*tcb).queued_on.load(Ordering::Relaxed) };
+    debug_assert!(
+        linked_at == i16::from(priority),
+        "relocate_ready_thread: queued_on != priority after enqueue",
+    );
+    // Publish reschedule-pending before the caller's unlock so the dst CPU's
+    // idle loop / schedule() observes it via the Release on unlock.
+    set_reschedule_pending_for(dst_cpu);
     true
 }
 
@@ -2350,26 +2398,16 @@ unsafe fn pull_unpinned_ready(src_cpu: usize, dst_cpu: usize)
         return;
     };
 
-    // SAFETY: tcb is currently linked in src_cpu's run queue at `priority`.
-    let removed = unsafe { scheduler_for(src_cpu).remove_from_queue(tcb, priority) };
-    if !removed
-    {
-        // SAFETY: paired above; release the candidate's sched_lock and hi, then
-        // lo last (lo captured the caller's interrupt flags).
-        unsafe {
-            (*tcb).sched_lock.unlock_raw(tcb_sched_saved);
-            hi_sched.lock.unlock_raw(saved_hi);
-            lo_sched.lock.unlock_raw(saved_lo);
-        }
-        return;
-    }
-
-    // SAFETY: tcb is no longer on src; dst_cpu scheduler is valid.
-    unsafe { scheduler_for(dst_cpu).enqueue(tcb, priority) };
-    // SAFETY: tcb valid; sched_lock + both run-queue locks held.
-    unsafe { (*tcb).preferred_cpu = dst_cpu as u32 };
-
-    set_reschedule_pending_for(dst_cpu);
+    // Validate (Ready && context_saved==1 && affinity permits dst) under the
+    // candidate's sched_lock and move src→dst, with the `priority` that
+    // `find_runnable` located it at (NOT a re-read of (*tcb).priority): that is
+    // the level `remove_from_queue` needs, and the src run-queue lock held since
+    // the predicate pins it against a concurrent `sys_thread_set_priority`. The
+    // affinity gate inside `relocate_ready_thread` closes the load-balancer
+    // affinity violation the advisory `find_runnable` predicate cannot — a
+    // `sys_thread_set_affinity` racing between the predicate and here.
+    // SAFETY: sched_lock + both run-queue locks held.
+    let moved = unsafe { relocate_ready_thread(tcb, src_cpu, dst_cpu, priority) };
 
     // SAFETY: paired above; release the candidate's sched_lock and hi, then lo
     // last (lo captured the caller's interrupt flags).
@@ -2379,8 +2417,11 @@ unsafe fn pull_unpinned_ready(src_cpu: usize, dst_cpu: usize)
         lo_sched.lock.unlock_raw(saved_lo);
     }
 
-    // SAFETY: dst_cpu validated < cpu_count.
-    unsafe { wake_idle_cpu(dst_cpu) };
+    if moved
+    {
+        // SAFETY: dst_cpu validated < cpu_count.
+        unsafe { wake_idle_cpu(dst_cpu) };
+    }
 }
 
 /// Test stub.

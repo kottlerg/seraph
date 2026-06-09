@@ -48,10 +48,10 @@ pub enum CliCommand
     RunParallel(RunParallelArgs),
 
     /// Mirror `rootfs/` into the sysroot, re-synthesise test fixtures,
-    /// and regenerate `disk.img` without invoking cargo. Used to refresh
-    /// the boot image after `rootfs/` or sysroot files were edited
-    /// outside the cargo flow (e.g. staging a test recipe). Requires an
-    /// arch-tagged sysroot from a prior `cargo xtask build`.
+    /// and regenerate `disk.img` without invoking cargo. The mirror is
+    /// authoritative over `config/`+`data/` (deletions in `rootfs/` are
+    /// pruned); use `--repack-only` to pack a hand-staged sysroot verbatim.
+    /// Requires an arch-tagged sysroot from a prior `cargo xtask build`.
     Mkdisk(MkdiskArgs),
 
     /// Compose `sysroot/esp/EFI/seraph/bootstrap.bundle` from
@@ -190,8 +190,9 @@ pub struct MkdiskArgs
 
     /// Repack `disk.img` from the sysroot exactly as it is, skipping the
     /// `rootfs/` re-mirror. Use after editing the staged sysroot directly
-    /// (e.g. adding a test recipe and removing a default one) when the
-    /// additive re-mirror would otherwise restore the removed file.
+    /// (e.g. adding a test recipe or removing a default one): a normal
+    /// re-mirror is authoritative and would restore `rootfs/`-present recipes
+    /// and prune `rootfs/`-absent ones, undoing the manual staging.
     #[arg(long)]
     pub repack_only: bool,
 }
@@ -310,7 +311,7 @@ pub struct RunParallelArgs
     pub fail: String,
 
     /// Grace window, in seconds, after the first `--fail` match before the
-    /// run is SIGKILLed. A kernel fault dump is multi-line and may be
+    /// run is `SIGKILLed`. A kernel fault dump is multi-line and may be
     /// followed by secondary-CPU faults; killing on the first matching byte
     /// truncates the diagnostics. The run is killed at whichever is first:
     /// this window, or the `--timeout` deadline. 0 kills on the next poll

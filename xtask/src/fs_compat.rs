@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-//! fs_compat.rs
+//! `fs_compat.rs`
 //!
 //! Portable file-materialisation helpers.
 //!

@@ -84,7 +84,7 @@ impl Read for PartitionSlice
         {
             return Ok(0);
         }
-        let remaining = (self.offset + self.length - pos) as usize;
+        let remaining = usize::try_from(self.offset + self.length - pos).unwrap_or(usize::MAX);
         let limit = buf.len().min(remaining);
         self.file.read(&mut buf[..limit])
     }
@@ -99,7 +99,7 @@ impl Write for PartitionSlice
         {
             return Ok(0);
         }
-        let remaining = (self.offset + self.length - pos) as usize;
+        let remaining = usize::try_from(self.offset + self.length - pos).unwrap_or(usize::MAX);
         let limit = buf.len().min(remaining);
         self.file.write(&buf[..limit])
     }
@@ -122,11 +122,11 @@ impl Seek for PartitionSlice
                 let end = self.offset + self.length;
                 if p >= 0
                 {
-                    end + p as u64
+                    end + p.cast_unsigned()
                 }
                 else
                 {
-                    end.checked_sub((-p) as u64).ok_or_else(|| {
+                    end.checked_sub((-p).cast_unsigned()).ok_or_else(|| {
                         io::Error::new(
                             io::ErrorKind::InvalidInput,
                             "seek before start of partition",
@@ -139,11 +139,11 @@ impl Seek for PartitionSlice
                 let cur = self.file.stream_position()?;
                 if p >= 0
                 {
-                    cur + p as u64
+                    cur + p.cast_unsigned()
                 }
                 else
                 {
-                    cur.checked_sub((-p) as u64).ok_or_else(|| {
+                    cur.checked_sub((-p).cast_unsigned()).ok_or_else(|| {
                         io::Error::new(
                             io::ErrorKind::InvalidInput,
                             "seek before start of partition",
@@ -322,9 +322,13 @@ fn write_gpt(image_path: &Path, arch: Arch) -> Result<()>
     .context("failed to add DATA partition")?;
 
     // Set deterministic per-partition unique GUIDs for reproducible builds.
-    let esp_uuid: uuid::Uuid = ESP_UNIQUE_UUID.parse().expect("invalid ESP_UNIQUE_UUID");
-    let root_uuid: uuid::Uuid = ROOT_UNIQUE_UUID.parse().expect("invalid ROOT_UNIQUE_UUID");
-    let data_uuid: uuid::Uuid = DATA_UNIQUE_UUID.parse().expect("invalid DATA_UNIQUE_UUID");
+    let esp_uuid: uuid::Uuid = ESP_UNIQUE_UUID.parse().context("invalid ESP_UNIQUE_UUID")?;
+    let root_uuid: uuid::Uuid = ROOT_UNIQUE_UUID
+        .parse()
+        .context("invalid ROOT_UNIQUE_UUID")?;
+    let data_uuid: uuid::Uuid = DATA_UNIQUE_UUID
+        .parse()
+        .context("invalid DATA_UNIQUE_UUID")?;
 
     let mut parts = disk.take_partitions();
     if let Some(p) = parts.get_mut(&1)
@@ -409,7 +413,7 @@ fn populate_dir<T: Read + Write + Seek>(
     let mut entries: Vec<_> = fs::read_dir(host_dir)
         .with_context(|| format!("failed to read {}", host_dir.display()))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    entries.sort_by_key(|e| e.file_name());
+    entries.sort_by_key(std::fs::DirEntry::file_name);
 
     for entry in entries
     {
@@ -440,10 +444,10 @@ fn populate_dir<T: Read + Write + Seek>(
         {
             fat_dir
                 .create_dir(&name_str)
-                .with_context(|| format!("failed to create dir in image: {}", name_str))?;
+                .with_context(|| format!("failed to create dir in image: {name_str}"))?;
             let sub = fat_dir
                 .open_dir(&name_str)
-                .with_context(|| format!("failed to open dir in image: {}", name_str))?;
+                .with_context(|| format!("failed to open dir in image: {name_str}"))?;
             populate_dir(&sub, &path, sysroot_root)?;
         }
         else if ft.is_file()
@@ -452,7 +456,7 @@ fn populate_dir<T: Read + Write + Seek>(
                 File::open(&path).with_context(|| format!("failed to open {}", path.display()))?;
             let mut dst = fat_dir
                 .create_file(&name_str)
-                .with_context(|| format!("failed to create file in image: {}", name_str))?;
+                .with_context(|| format!("failed to create file in image: {name_str}"))?;
             io::copy(&mut src, &mut dst)
                 .with_context(|| format!("failed to copy {} into image", path.display()))?;
         }

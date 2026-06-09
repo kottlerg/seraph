@@ -123,7 +123,7 @@ fn capture_unix() -> Option<UnixSaved>
     let mut termios: libc::termios = unsafe { std::mem::zeroed() };
     // SAFETY: fd is a valid open file descriptor for the terminal;
     // termios points at a writable termios struct.
-    let r = unsafe { libc::tcgetattr(fd, &mut termios) };
+    let r = unsafe { libc::tcgetattr(fd, &raw mut termios) };
     if r != 0
     {
         return None;
@@ -158,7 +158,7 @@ fn restore_unix(saved: &UnixSaved)
     // SAFETY: fd is valid (held open by `saved.tty`); termios was
     // captured by tcgetattr on the same fd. Failures are ignored —
     // best-effort restore on shutdown.
-    let _ = unsafe { libc::tcsetattr(fd, libc::TCSANOW, &saved.termios) };
+    let _ = unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw const saved.termios) };
 
     if let Some(ws) = saved.winsize.as_ref()
     {

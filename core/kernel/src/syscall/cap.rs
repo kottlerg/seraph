@@ -942,6 +942,7 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             ThreadObject {
                 header: KernelObjectHeader::with_ancestor(ObjectType::Thread, ancestor),
                 tcb: tcb_ptr,
+                deferred_next: core::ptr::null_mut(),
             },
         );
     }
@@ -1359,6 +1360,40 @@ pub fn sys_cap_derive_badge(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     Ok(u64::from(new_idx))
 }
 
+/// One-shot guard for [`log_self_cap_delete_refused`].
+#[cfg(not(test))]
+static SELF_CAP_DELETE_REFUSED_LOGGED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// One-shot diagnostic (#341): the first time a thread is refused deletion of
+/// its own running Thread cap, log its tid, the cap slot, and the userspace rip
+/// so the triggering call site can be symbolised from a burn-in log.
+#[cfg(not(test))]
+fn log_self_cap_delete_refused(tcb: *mut crate::sched::thread::ThreadControlBlock, slot: u32)
+{
+    use core::sync::atomic::Ordering;
+    if SELF_CAP_DELETE_REFUSED_LOGGED
+        .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    // SAFETY: tcb is the live caller; trap_frame is its in-flight syscall frame.
+    let (tid, tf) = unsafe { ((*tcb).thread_id, (*tcb).trap_frame) };
+    if tf.is_null()
+    {
+        crate::kprintln!(
+            "cap: refused self thread-cap delete: tid={tid} slot={slot} (no trap frame)"
+        );
+        return;
+    }
+    // SAFETY: tf non-null; it is the caller's saved userspace frame.
+    let rip = unsafe { (*tf).instruction_pointer() };
+    crate::kprintln!(
+        "cap: refused self thread-cap delete: tid={tid} slot={slot} user_rip=0x{rip:x}"
+    );
+}
+
 /// `SYS_CAP_DELETE` (31): delete a capability slot.
 ///
 /// arg0 = slot index in the caller's `CSpace.`
@@ -1424,6 +1459,29 @@ pub fn sys_cap_delete(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             return Err(SyscallError::InvalidCapability);
         }
     };
+
+    // #341: refuse to delete the last capability to the RUNNING thread's own
+    // Thread object. This is always an aliased/stale-cap bug — std's
+    // `Process::drop` deletes a child's `thread_cap` whose slot was reused for
+    // the running (waiter) thread after the child was reaped. Completing the
+    // delete tears the running thread down mid-syscall and orphans whatever it
+    // was driving (the shell hangs). Refuse here, before the dec-ref/dealloc:
+    // the cap stays and is reclaimed normally when a DIFFERENT thread later
+    // joins/reaps this one. Logged once so the userspace site is symbolisable.
+    // SAFETY: obj_ptr is a live KernelObjectHeader (slot confirmed live above);
+    // tcb is the validated caller.
+    if unsafe {
+        (*obj_ptr.as_ptr()).obj_type == crate::cap::object::ObjectType::Thread
+            && core::ptr::eq(
+                (*obj_ptr.as_ptr().cast::<crate::cap::object::ThreadObject>()).tcb,
+                tcb,
+            )
+    }
+    {
+        log_self_cap_delete_refused(tcb, slot_idx);
+        crate::cap::DERIVATION_LOCK.write_unlock();
+        return Err(SyscallError::InvalidState);
+    }
 
     // SAFETY: DERIVATION_LOCK held; node and parent are valid SlotIds.
     unsafe {

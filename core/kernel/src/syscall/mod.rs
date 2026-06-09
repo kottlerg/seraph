@@ -139,6 +139,26 @@ pub unsafe fn dispatch(tf: *mut TrapFrame)
     };
 
     tf.set_return(ret_val);
+
+    // Self-teardown epilogue (#341). A handler may have deleted the last
+    // capability to the running thread's own Thread object (SYS_CAP_DELETE /
+    // SYS_CAP_REVOKE), marking it `Exited` in place; such a thread must never
+    // return to userspace. Reschedule away — its object is then reclaimed
+    // off-CPU by `drain_deferred_reclaim`. Otherwise drain any threads that
+    // self-deleted earlier on this CPU, from this (live) thread's context where
+    // the dead thread is provably off-CPU.
+    // SAFETY: syscall context on the caller's kernel stack; current_tcb() is set.
+    unsafe {
+        let cur = current_tcb();
+        if !cur.is_null() && (*cur).state == crate::sched::thread::ThreadState::Exited
+        {
+            crate::sched::schedule(false);
+            crate::arch::current::cpu::halt_loop();
+        }
+        crate::cap::object::drain_deferred_reclaim(
+            crate::arch::current::cpu::current_cpu() as usize
+        );
+    }
 }
 
 // ── Thread syscall handlers ───────────────────────────────────────────────────

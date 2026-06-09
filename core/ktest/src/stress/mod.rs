@@ -19,6 +19,7 @@
 //! Each stress test uses [`run_integration_test!`](crate::run_integration_test)
 //! for logging and PASS/FAIL counting.
 
+mod cap_delete_reply_wake;
 mod cap_delete_running;
 mod cap_revoke_under_use;
 mod cap_tree_deep;
@@ -67,6 +68,10 @@ pub fn run_all(ctx: &TestContext)
     run_integration_test!("stress::idle_wake_race", idle_wake_race::run(ctx));
     run_integration_test!("stress::thread_churn", thread_churn::run(ctx));
     run_integration_test!("stress::cap_delete_running", cap_delete_running::run(ctx));
+    run_integration_test!(
+        "stress::cap_delete_reply_wake",
+        cap_delete_reply_wake::run(ctx)
+    );
     run_integration_test!(
         "stress::priority_dealloc_race",
         priority_dealloc_race::run(ctx)

@@ -456,6 +456,23 @@ impl Command {
             return Err(io::Error::other("thread_bind_notification for child failed"));
         }
 
+        // The death observer now lives on the child's Thread object (its TCB),
+        // not on the cap, so the parent's `thread_cap` is dead weight after the
+        // bind. Delete it NOW (#341 root fix): retaining it until Process::drop
+        // leaves a cross-CSpace derivation CHILD of procmgr's `child_thread` in
+        // this process's CSpace (the cap was `cap_derive`'d by procmgr then
+        // IPC-MOVED here, which preserves the derivation edge). At child reap,
+        // procmgr's `cap_revoke(child_thread)` walks that edge and `free_slot`s
+        // THIS still-live slot; a later thread spawn reuses the freed index, and
+        // Process::drop's `cap_delete(self.thread_cap)` then tears down an
+        // unrelated live thread -> self-teardown / all-idle hang. Severing the
+        // edge here, before reap, removes the hazard while procmgr still reaps
+        // the child Thread normally (its `cap_revoke` is load-bearing for the
+        // thread-before-aspace teardown order). The kernel-side refuse-self-
+        // delete guard remains as defense-in-depth.
+        let _ = syscall::cap_delete(thread_cap);
+        let thread_cap = 0u32;
+
         // For each piped direction, allocate a parent-side `Pipe` end
         // (memory cap + 2 notification caps) and install the corresponding triple
         // into the child's CSpace via `CONFIGURE_PIPE`. Per-direction

@@ -262,8 +262,8 @@ cargo xtask run-parallel --arch x86_64 --parallel 4 --runs 100 \
 
 **Output**: one line per completed run, plus a summary block. Logs for
 non-passing runs are preserved under `target/xtask/run-parallel/` as
-`FAIL-<run>.log`, `HANG-<run>.log`, or `ERR-<run>.log`. PASS logs are
-discarded.
+`FAIL-<run>.log`, `HANG-<run>.log`, `ERR-<run>.log`, or `QEMU-CRASH-<run>.log`.
+PASS logs are discarded.
 
 **Outcome precedence**:
 1. `--fail` regex matches → `FAIL` (a live match also triggers early abort
@@ -272,7 +272,14 @@ discarded.
    which is the normal case for kernels that idle after success)
 3. Watchdog timeout → `HANG`
 4. Exit code 0 with no marker → `OK`
-5. Other exit code → `ERR rc=<n>`
+5. Killed by SIGSEGV/SIGABRT with no marker → `QEMU-CRASH` — the host emulator
+   crashed, not the guest. Tallied in the summary and preserved as
+   `QEMU-CRASH-<run>.log`, but does **not** fail the run (infrastructure flake,
+   not a regression in the OS under test; the recurring case is the QEMU 8.2.x
+   multi-threaded-TCG segfault, [QEMU gitlab #2220](https://gitlab.com/qemu-project/qemu/-/issues/2220)).
+   SIGKILL is excluded (the `--timeout` kill, or an OOM).
+6. Other exit code → `ERR rc=<n>` (a signal death is reported as `128 + signum`,
+   e.g. `139` for SIGSEGV)
 
 ---
 

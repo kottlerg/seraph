@@ -2026,6 +2026,16 @@ unsafe fn dealloc_object_one(
                 // is reclaimed wholesale by `retype_free` below as part of
                 // the same slot release, so no separate free is needed.
 
+                // Remove the TCB from the diagnostic live-thread registry
+                // before poisoning/freeing it. The registry walk
+                // (`thread_registry::try_for_each`) holds the registry lock
+                // across every dereference, so unlinking strictly before the
+                // free guarantees the watchdog never observes a dangling node.
+                // A no-op for a TCB that was never registered (e.g. a
+                // never-started thread torn down before its cap was inserted).
+                // SAFETY: tcb valid (not yet freed); leaf lock, nothing else held.
+                unsafe { crate::sched::thread_registry::unregister(tcb) };
+
                 // Poison the TCB so any use-after-free reads garbage
                 // instead of plausible values.
                 // SAFETY: tcb is valid; we are about to free it.

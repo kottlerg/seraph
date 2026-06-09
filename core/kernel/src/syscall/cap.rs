@@ -934,6 +934,8 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 exit_reason: 0,
                 sleep_deadline: 0,
                 extended: crate::sched::thread::ExtendedState::from_raw(extended_area),
+                registry_next: core::ptr::null_mut(),
+                registry_prev: core::ptr::null_mut(),
                 magic: crate::sched::thread::TCB_MAGIC,
             },
         );
@@ -965,6 +967,15 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     if let Ok(idx) = idx_res
     {
+        // Thread the new TCB onto the diagnostic live-thread registry now that
+        // its cap is visible and the construction has committed. Registering
+        // only on the success path keeps it symmetric with the unregister in
+        // `dealloc_object(Thread)`: the rollback arm below frees the TCB via
+        // `retype_free` without ever registering it. The thread is still
+        // `Created` (not startable until SYS_THREAD_START), so it cannot become
+        // a Blocked watchdog victim before this point.
+        // SAFETY: tcb_ptr is the just-constructed, not-yet-registered TCB.
+        unsafe { crate::sched::thread_registry::register(tcb_ptr) };
         let _ = kstack_virt;
         Ok(u64::from(idx.get()))
     }

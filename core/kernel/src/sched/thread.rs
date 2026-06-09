@@ -471,6 +471,19 @@ pub struct ThreadControlBlock
     /// lazy-restore discipline (see [`ExtendedState`]).
     pub extended: ExtendedState,
 
+    // === Diagnostic thread registry ===
+    /// Intrusive forward link in the global live-thread registry
+    /// (`sched::thread_registry`). `null` when this TCB is not threaded onto
+    /// the registry. Spliced in at construction and removed at dealloc, both
+    /// under `THREAD_REGISTRY_LOCK`. Diagnostic-only: the softlockup watchdog
+    /// walks the registry to enumerate `Blocked` waiters that the per-CPU
+    /// `current` dump cannot reach — a lost-wakeup victim is parked on an IPC
+    /// object and referenced by nothing the `current` dump can see (#351).
+    /// Never read on any scheduling hot path.
+    pub registry_next: *mut ThreadControlBlock,
+    /// Intrusive backward link; see [`registry_next`](Self::registry_next).
+    pub registry_prev: *mut ThreadControlBlock,
+
     // === Use-after-free detection ===
     /// Magic cookie for use-after-free detection. Must be `TCB_MAGIC` when valid.
     pub magic: u64,

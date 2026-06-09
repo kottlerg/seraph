@@ -19,6 +19,8 @@
 
 pub mod run_queue;
 pub mod thread;
+#[cfg(not(test))]
+pub mod thread_registry;
 
 #[cfg(not(test))]
 use core::mem::MaybeUninit;
@@ -427,7 +429,162 @@ fn watchdog_tick_and_check()
             dl
         );
     }
+    // Enumerate Blocked waiters via the live-thread registry. The per-CPU
+    // `current` dump above shows only each CPU's running/idle thread; the
+    // lost-wakeup victim (#351) is a Blocked thread parked on an IPC object,
+    // reachable only through the registry. The decode below is the decisive
+    // signal: whether the blocking object still names this waiter (no wake was
+    // ever issued) versus holds data / a cleared waiter slot (a wake was
+    // deposited but the link to the run queue was lost).
+    crate::kprintln!("  BLOCKED THREADS:");
+    // Defined outside the `try_for_each` call so the `kprintln!` expansions are
+    // not lexically inside the `unsafe` wrapping that call (which would flag
+    // their macro-internal `unsafe` as redundant). Each raw deref is its own
+    // tight `unsafe`; the field reads race benignly by the stalled contract.
+    let dump_blocked = |t: *mut ThreadControlBlock| {
+        // SAFETY: t is a registry-walked TCB held stable by the registry lock.
+        let is_blocked = unsafe { (*t).state == thread::ThreadState::Blocked };
+        if !is_blocked
+        {
+            return;
+        }
+        // SAFETY: same contract; reads only plain scalar fields.
+        let (tid, ipc, blocked_on, prio, pref, wake_pending, wake_in_flight, dl) = unsafe {
+            (
+                (*t).thread_id,
+                (*t).ipc_state,
+                (*t).blocked_on_object,
+                (*t).priority,
+                (*t).preferred_cpu,
+                (*t).wake_pending,
+                (*t).wake_in_flight
+                    .load(core::sync::atomic::Ordering::Relaxed),
+                (*t).sleep_deadline,
+            )
+        };
+        crate::kprintln!(
+            "    tid{} ipc={:?} blocked_on={:p} prio={} pref={} \
+             wake_pending={} wake_in_flight={} dl={}",
+            tid,
+            ipc,
+            blocked_on,
+            prio,
+            pref,
+            wake_pending,
+            wake_in_flight,
+            dl
+        );
+        // SAFETY: same contract; watchdog_decode_blocked_on only reads.
+        unsafe { watchdog_decode_blocked_on(t) };
+    };
+    // SAFETY: best-effort read-only walk under the registry lock; the closure
+    // only reads through each TCB pointer (no register/unregister).
+    let walked = unsafe { thread_registry::try_for_each(dump_blocked) };
+    if !walked
+    {
+        crate::kprintln!("    (registry lock contended; skipped)");
+    }
     crate::kprintln!("=== END WATCHDOG ===");
+}
+
+/// Decode and print the IPC object a `Blocked` thread is parked on, for the
+/// softlockup watchdog dump. The telling field is whether the object still
+/// names `t` as its waiter (the wake was never issued) or has been cleared /
+/// carries data while `t` is still `Blocked` (the wake was lost between the
+/// waker's deposit and the run-queue link) — the #351 lost-wakeup signature.
+///
+/// # Safety
+/// `t` is a registry-walked TCB pointer held stable by the registry lock. All
+/// reads are benign-racy by the watchdog's already-stalled contract; the
+/// blocking object is read without its lock (the kernel is wedged).
+#[cfg(not(test))]
+// cast_ptr_alignment: blocked_on_object is stored as *mut u8 but always points
+// at a properly-aligned IPC object whose concrete type is named by ipc_state;
+// the same allow covers the parallel casts in dealloc_object's unlink arm.
+#[allow(clippy::cast_ptr_alignment)]
+unsafe fn watchdog_decode_blocked_on(t: *mut ThreadControlBlock)
+{
+    use core::sync::atomic::Ordering;
+    // SAFETY: caller contract; reads ipc_state + blocked_on scalars.
+    let (ipc, blocked_on) = unsafe { ((*t).ipc_state, (*t).blocked_on_object) };
+    if blocked_on.is_null()
+    {
+        return;
+    }
+    // Each arm reads object fields into locals under a tight `unsafe`, then
+    // prints outside it so the `kprintln!` macro's own `unsafe` is not redundant.
+    match ipc
+    {
+        IpcThreadState::BlockedOnEventQueue =>
+        {
+            let eq = blocked_on.cast::<crate::ipc::event_queue::EventQueueState>();
+            // SAFETY: ipc_state classifies blocked_on as an EventQueueState.
+            let (waiter_is_self, count, capacity) = unsafe {
+                (
+                    core::ptr::eq((*eq).waiter, t),
+                    (*eq).count.load(Ordering::Relaxed),
+                    (*eq).capacity,
+                )
+            };
+            crate::kprintln!(
+                "      eq: waiter_is_self={} count={} capacity={}",
+                waiter_is_self,
+                count,
+                capacity
+            );
+        }
+        IpcThreadState::BlockedOnNotification =>
+        {
+            let sig = blocked_on.cast::<crate::ipc::notification::NotificationState>();
+            // SAFETY: ipc_state classifies blocked_on as a NotificationState.
+            let (waiter_is_self, bits) = unsafe {
+                (
+                    core::ptr::eq((*sig).waiter, t),
+                    (*sig).bits.load(Ordering::Relaxed),
+                )
+            };
+            crate::kprintln!(
+                "      notif: waiter_is_self={} bits=0x{:x}",
+                waiter_is_self,
+                bits
+            );
+        }
+        IpcThreadState::BlockedOnReply | IpcThreadState::BlockedOnFault =>
+        {
+            let server = blocked_on.cast::<ThreadControlBlock>();
+            // SAFETY: for a reply/fault block, blocked_on is the server TCB.
+            let (server_tid, reply_is_self, rt) = unsafe {
+                let rt = (*server).reply_tcb.load(Ordering::Relaxed);
+                ((*server).thread_id, core::ptr::eq(rt, t), rt)
+            };
+            crate::kprintln!(
+                "      server tid{} reply_is_self={} reply_tcb={:p}",
+                server_tid,
+                reply_is_self,
+                rt
+            );
+        }
+        IpcThreadState::BlockedOnSend | IpcThreadState::BlockedOnRecv =>
+        {
+            let ep = blocked_on.cast::<crate::ipc::endpoint::EndpointState>();
+            // SAFETY: ipc_state classifies blocked_on as an EndpointState.
+            let (send_head, recv_head) = unsafe { ((*ep).send_head, (*ep).recv_head) };
+            crate::kprintln!(
+                "      ep: send_head={:p} recv_head={:p}",
+                send_head,
+                recv_head
+            );
+        }
+        IpcThreadState::BlockedOnWaitSet =>
+        {
+            let ws = blocked_on.cast::<crate::ipc::wait_set::WaitSetState>();
+            // SAFETY: ipc_state classifies blocked_on as a WaitSetState.
+            let waiter_is_self = unsafe { core::ptr::eq((*ws).waiter, t) };
+            crate::kprintln!("      waitset: waiter_is_self={}", waiter_is_self);
+        }
+        IpcThreadState::None =>
+        {}
+    }
 }
 
 // ── BSP boot transient ────────────────────────────────────────────────────────
@@ -1063,6 +1220,11 @@ pub fn init(cpu_count: u32) -> u32
                     exit_reason: 0,
                     sleep_deadline: 0,
                     extended: thread::ExtendedState::empty(),
+                    // Idle TCBs are never deallocated and never `Blocked`, and
+                    // are already shown by the watchdog's per-CPU `current` dump,
+                    // so they are not threaded onto the diagnostic registry.
+                    registry_next: core::ptr::null_mut(),
+                    registry_prev: core::ptr::null_mut(),
                     magic: thread::TCB_MAGIC,
                 },
             );

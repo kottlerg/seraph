@@ -350,11 +350,19 @@ Producer side (`enqueue_and_wake`, `core/kernel/src/sched/mod.rs`):
    - Blocked/Created → fall through to the link path.
 3. Acquire target scheduler.lock UNDER sched_lock (inner).
 4. Set tcb.state = Ready, ipc_state = None, blocked_on_object = null,
-   wake_pending = false, preferred_cpu = target_cpu; read priority under the
-   run-queue lock (so a concurrent sys_thread_set_priority's all-CPU region
-   serialises against the link).
-5. Enqueue tcb in target's priority queue.
+   wake_pending = false; read priority under the run-queue lock (so a
+   concurrent sys_thread_set_priority's all-CPU region serialises against
+   the link).
+5. Enqueue tcb in target's priority queue; the enqueue reports whether it
+   created the link (false = the release-mode single-link skip).
    (Inside enqueue: non_empty.fetch_or(1 << prio, Release); queued_on = prio.)
+5a. iff the link was created: preferred_cpu = target_cpu. preferred_cpu is
+   retargeted only by the writer that actually created the link, under the
+   same sched_lock → run-queue lock pair, so on a release skip the field
+   keeps naming the surviving link's CPU (#359) and the preferred_cpu-keyed
+   consumers (select_target_cpu's save-window pinning and sticky routing,
+   the load balancer) stay coherent with the queue that actually holds the
+   thread.
 6. set_reschedule_pending_for(target_cpu).
    (RESCHEDULE_PENDING.set_cpu(target_cpu, Release).)
 7. Clear wake_in_flight (so a waiting dealloc_object(Thread) may proceed).

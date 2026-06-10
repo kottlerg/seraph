@@ -928,7 +928,13 @@ pub fn sys_thread_set_priority(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 let sched = crate::sched::scheduler_for(cpu);
                 if sched.remove_from_queue(target_tcb, old_prio)
                 {
-                    sched.enqueue(target_tcb, priority);
+                    // Skip impossible: the remove above just cleared queued_on
+                    // under the all-CPU locks (#359).
+                    let linked = sched.enqueue(target_tcb, priority);
+                    debug_assert!(
+                        linked,
+                        "set_priority: re-enqueue skipped after successful remove"
+                    );
                     break;
                 }
             }

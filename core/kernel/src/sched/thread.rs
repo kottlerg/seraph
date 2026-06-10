@@ -199,7 +199,9 @@ pub struct EnqueueBreadcrumb
     pub cpu: u32,
     /// `ipc_state` observed at the prior enqueue.
     pub ipc_state: IpcThreadState,
-    /// `preferred_cpu` observed at the prior enqueue.
+    /// `preferred_cpu` observed at the prior enqueue, captured before that
+    /// link's post-link retarget — i.e. the thread's home as of the link
+    /// *before* the prior one, pinning where a double-linked TCB came from.
     pub preferred_cpu: u32,
 }
 

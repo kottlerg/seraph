@@ -1196,7 +1196,8 @@ unsafe fn kernel_entry_post_rebase(
         // BSP scheduler (index 0) exclusively accessed by boot thread.
         unsafe {
             let sched = sched::scheduler_for(0);
-            sched.enqueue(init_tcb, sched::INIT_PRIORITY);
+            let linked = sched.enqueue(init_tcb, sched::INIT_PRIORITY);
+            debug_assert!(linked, "boot: init enqueue skipped");
         }
 
         kprintln!(

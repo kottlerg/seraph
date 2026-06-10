@@ -561,6 +561,7 @@ impl Command {
                         *slot = Some(PipeBridgeNotifications {
                             data_notification: p.data_notification_cap(),
                             space_notification: p.space_notification_cap(),
+                            ring_release: p.arm_ring_release(),
                         });
                     }
                 }
@@ -1027,6 +1028,10 @@ impl Drop for Process {
 //   * `notification_send` on each piped direction's data and space notifications,
 //     so any reader/writer currently parked in `notification_wait` wakes
 //     and re-checks the flag.
+//   * `RingRelease::on_peer_death` per piped direction — returns the
+//     direction's ring-page grant to memmgr when the parent end is
+//     already dropped; otherwise the parent's later `Pipe::Drop` sends
+//     the release. Exactly-once by the shared state machine.
 //   * `exit_reason.store(reason)` + `notification_send(completion_notification)`
 //     — the rendezvous point `Process::wait` blocks on.
 //
@@ -1037,12 +1042,19 @@ impl Drop for Process {
 //
 // The bridge also recognises `BRIDGE_SENTINEL_DROP` posted by
 // `Process::Drop` and exits without firing any wakes — the spawner
-// is discarding the child anyway.
+// is discarding the child anyway. A discarded child's ring grants are
+// never released by the bridge (the child may still be running and
+// writing); they stay accounted to the spawner until it exits, the
+// same bound that applied to every pipe before grants were returned
+// at all.
 
-#[derive(Clone, Copy)]
 struct PipeBridgeNotifications {
     data_notification: u32,
     space_notification: u32,
+    /// Shared ring-grant release state for this direction's parent end;
+    /// the bridge reports the child's death and sends the release when
+    /// the parent end is already dropped.
+    ring_release: Option<Arc<crate::sys::pipe::seraph::RingRelease>>,
 }
 
 struct BridgeHandles {
@@ -1072,6 +1084,17 @@ fn bridge_main(h: BridgeHandles) {
         // writer re-checks `peer_dead` on its next loop turn.
         let _ = syscall::notification_send(sig.data_notification, 1);
         let _ = syscall::notification_send(sig.space_notification, 1);
+    }
+    // Report the child's death to each direction's ring-grant release
+    // state; send the release for ends the parent already dropped.
+    // Kicks first: waking blocked readers/writers must not wait on the
+    // memmgr round-trips below.
+    for sig in h.pipe_notifications.iter().flatten() {
+        if let Some(rr) = &sig.ring_release {
+            if rr.on_peer_death() {
+                crate::sys::alloc::seraph::slab_release_fresh(rr.phys());
+            }
+        }
     }
     // Raise the rendezvous notification last so a `wait` that wakes
     // observes `exit_reason` already published.

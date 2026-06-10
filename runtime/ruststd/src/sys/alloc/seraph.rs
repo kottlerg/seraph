@@ -577,8 +577,10 @@ fn slab_round_to_class(bytes: u64) -> u64 {
 /// Returns `Some((slot, pages, phys))` on success, `None` on IPC failure or
 /// empty reply. `phys` is the chosen cap's physical base, which memmgr reports
 /// at `data[1 + returned + i]`; the caller passes it to [`slab_release_fresh`]
-/// to return the run to memmgr's pool mid-life.
-fn slab_request_pages(memmgr_ep: u32, min_pages: u64) -> Option<(u32, u64, u64)> {
+/// to return the run to memmgr's pool mid-life. Also used by the pipe
+/// machinery (`sys::pipe`) for ring pages, which need the phys base so the
+/// grant can be returned when the pipe ends its life.
+pub fn slab_request_pages(memmgr_ep: u32, min_pages: u64) -> Option<(u32, u64, u64)> {
     let ipc_buf = current_ipc_buf();
     if ipc_buf.is_null() {
         return None;

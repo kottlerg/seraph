@@ -14,11 +14,10 @@
 //! The user-visible capacity is the value passed to `SYS_CAP_CREATE_EVENT_Q`.
 //!
 //! # Thread safety
-//! All operations must be called with the scheduler lock held.
+//! All operations serialise internally on `eq.lock`; callers must not hold it.
 //!
 //! # Adding features
 //! - Multiple receivers: replace `waiter` with an intrusive TCB queue.
-//! - Non-blocking recv: return `Err(WouldBlock)` when empty instead of blocking.
 
 use crate::sched::thread::{IpcThreadState, ThreadControlBlock};
 
@@ -66,9 +65,12 @@ pub struct EventQueueState
     pub lock: crate::sync::Spinlock,
 }
 
-// SAFETY: EventQueueState is accessed only under the scheduler lock.
+// SAFETY: every field except `count` is read and written only under `eq.lock`;
+// `count` is additionally Acquire-read locklessly by `wait_set::source_is_ready`
+// against the Release stores below (see the `count` field doc).
 unsafe impl Send for EventQueueState {}
-// SAFETY: EventQueueState is accessed only under the scheduler lock; no Sync violation.
+// SAFETY: same `eq.lock` / atomic-`count` discipline as `Send`; no unsynchronised
+// shared access exists.
 unsafe impl Sync for EventQueueState {}
 
 // `cap::retype::EVENT_QUEUE_STATE_BYTES` must match the actual size of
@@ -117,8 +119,18 @@ impl EventQueueState
 /// - If the queue is full, returns `Err(())`.
 ///   Syscall handler maps this to `SyscallError::QueueFull`.
 ///
+/// Between this function's waiter claim (slot cleared, payload deposited,
+/// `wake_in_flight = 1`) and the caller's post-unlock `enqueue_and_wake`, the
+/// wake is half-complete and owned exclusively by the in-flight waker. Code
+/// executing *as the claimed thread* in that window (it is still live,
+/// mid-park) has exactly one legal continuation: fall through to `schedule()`.
+/// Consuming the deposited payload and returning to user mode is forbidden —
+/// it strands the waker's run-queue link (#352). See
+/// docs/scheduling-internals.md § Lock Hierarchy rule 5.
+///
 /// # Safety
-/// Must be called with the scheduler lock held. `eq` must be a valid pointer.
+/// `eq` must be a valid pointer; acquires `eq.lock` internally — the caller
+/// must not hold it.
 #[cfg(not(test))]
 pub unsafe fn event_queue_post(
     eq: *mut EventQueueState,
@@ -200,6 +212,50 @@ pub unsafe fn event_queue_post(
     Ok(None)
 }
 
+/// Pop the ring head, or `None` if empty. Caller MUST hold `eq.lock`.
+#[cfg(not(test))]
+fn pop_entry_locked(eq: &mut EventQueueState) -> Option<u64>
+{
+    // Relaxed suffices for the occupancy read: `eq.lock` orders it.
+    if eq.count.load(core::sync::atomic::Ordering::Relaxed) == 0
+    {
+        return None;
+    }
+    let ring_len = eq.capacity + 1;
+    // SAFETY: read_idx < ring_len (invariant maintained by the modulo
+    // arithmetic below); ring is a valid allocation of ring_len u64 slots.
+    let payload = unsafe { *eq.ring.add(eq.read_idx as usize) };
+    eq.read_idx = (eq.read_idx + 1) % ring_len;
+    // Release: publishes the drained level (possibly →0) to the lockless
+    // `source_is_ready` reader so it cannot see a stale non-empty.
+    eq.count.fetch_sub(1, core::sync::atomic::Ordering::Release);
+    Some(payload)
+}
+
+/// Dequeue the next entry without blocking — the non-blocking recv mode
+/// behind `SYS_EVENT_RECV`'s `u64::MAX` try-once sentinel.
+///
+/// Returns `Some(payload)`, or `None` if the ring is empty. Takes NO TCB:
+/// this path is type-incapable of registering a waiter, setting
+/// `wake_in_flight`, or committing `Blocked` — a non-blocking poll must
+/// never make the caller wakeable (#352).
+///
+/// # Safety
+/// `eq` must be a valid pointer; acquires `eq.lock` internally — the caller
+/// must not hold it.
+#[cfg(not(test))]
+pub unsafe fn event_queue_try_recv(eq: *mut EventQueueState) -> Option<u64>
+{
+    // SAFETY: caller guarantees eq is valid.
+    let eq = unsafe { &mut *eq };
+    // SAFETY: lock serialises post/recv; paired with unlock_raw below.
+    let saved = unsafe { eq.lock.lock_raw() };
+    let res = pop_entry_locked(eq);
+    // SAFETY: paired with lock_raw above.
+    unsafe { eq.lock.unlock_raw(saved) };
+    res
+}
+
 /// Dequeue the next entry from the event queue.
 ///
 /// - If an entry is available, returns `Ok(payload)`.
@@ -207,7 +263,8 @@ pub unsafe fn event_queue_post(
 ///   Syscall handler must call `schedule()` then read `wakeup_value`.
 ///
 /// # Safety
-/// Must be called with the scheduler lock held. `eq` and `caller` must be valid.
+/// `eq` and `caller` must be valid pointers; acquires `eq.lock` internally —
+/// the caller must not hold it.
 #[cfg(not(test))]
 pub unsafe fn event_queue_recv(
     eq: *mut EventQueueState,
@@ -220,15 +277,8 @@ pub unsafe fn event_queue_recv(
     // SAFETY: lock serialises post/recv; paired with unlock_raw below.
     let saved = unsafe { eq.lock.lock_raw() };
 
-    if eq.count.load(core::sync::atomic::Ordering::Relaxed) > 0
+    if let Some(payload) = pop_entry_locked(eq)
     {
-        let ring_len = eq.capacity + 1;
-        // SAFETY: read_idx < ring_len (invariant); ring is valid.
-        let payload = unsafe { *eq.ring.add(eq.read_idx as usize) };
-        eq.read_idx = (eq.read_idx + 1) % ring_len;
-        // Release: publishes the drained level (possibly →0) to the lockless
-        // `source_is_ready` reader so it cannot see a stale non-empty.
-        eq.count.fetch_sub(1, core::sync::atomic::Ordering::Release);
         // SAFETY: paired with lock_raw above.
         unsafe { eq.lock.unlock_raw(saved) };
         return Ok(payload);

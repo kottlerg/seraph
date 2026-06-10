@@ -30,6 +30,7 @@ mod concurrent_notification;
 mod cspace_recycle;
 mod double_enqueue_storm;
 mod event_queue_fill_drain;
+mod event_try_recv_post_race;
 mod fpu_migration_churn;
 mod idle_wake_race;
 mod load_balance_handoff_steal;
@@ -82,6 +83,10 @@ pub fn run_all(ctx: &TestContext)
     run_integration_test!(
         "stress::double_enqueue_storm",
         double_enqueue_storm::run(ctx)
+    );
+    run_integration_test!(
+        "stress::event_try_recv_post_race",
+        event_try_recv_post_race::run(ctx)
     );
     run_integration_test!(
         "stress::load_balance_handoff_steal",

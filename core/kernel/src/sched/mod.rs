@@ -1694,7 +1694,15 @@ pub unsafe fn set_state_under_all_locks(
 ///
 /// On `false` the caller MUST roll back its source-side waiter registration and
 /// MUST NOT clobber any deposited `wakeup_value`/`ipc_msg`.
-/// See docs/scheduling-internals.md § Lock Hierarchy.
+///
+/// After this function returns `true`, a caller whose source-side registration
+/// stands MUST reach `schedule()` before returning to user mode or attempting
+/// another commit — the wake deposited against the park is consumed only by a
+/// run-queue dequeue inside `schedule()`; any other exit leaks the waker's
+/// link (#352). The only sanctioned exception is a parker that un-commits
+/// under `sched_lock` while provably untargetable by any waker —
+/// `sys_thread_sleep`'s sleep-list-capacity rollback, which registered with no
+/// wake source. See docs/scheduling-internals.md § Lock Hierarchy.
 ///
 /// # Safety
 /// `tcb` must point to the current CPU's running thread.
@@ -1727,6 +1735,28 @@ pub unsafe fn commit_blocked_under_local_lock(
                 }
                 else
                 {
+                    // A parking thread must be unlinked: every run-queue link
+                    // placed against a park is consumed only by a dequeue
+                    // inside schedule(). queued_on >= 0 here means a committed
+                    // park's wake link leaked past schedule() (#352 class) or
+                    // an enqueue_ready_thread caller violated its
+                    // not-live-and-unlinked contract. Relaxed read is sound
+                    // under the held sched_lock — every -1 → >=0 writer is
+                    // excluded by classification or by holding this same lock
+                    // (see scheduling-internals.md § Atomics, queued_on row).
+                    #[cfg(debug_assertions)]
+                    {
+                        let linked_at =
+                            (*tcb).queued_on.load(core::sync::atomic::Ordering::Relaxed);
+                        debug_assert!(
+                            linked_at == -1,
+                            "commit_blocked: tid={} parking while linked (queued_on={}) — \
+                             leaked wake link (#352 class) or enqueue_ready_thread \
+                             contract violation",
+                            (*tcb).thread_id,
+                            linked_at,
+                        );
+                    }
                     (*tcb).state = thread::ThreadState::Blocked;
                     (*tcb).ipc_state = ipc;
                     (*tcb).blocked_on_object = blocked_on;

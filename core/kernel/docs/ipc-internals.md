@@ -292,48 +292,51 @@ the wrapper on `dealloc_object(EventQueue)`.
 `SYS_EVENT_POST`:
 
 ```
-1. Acquire lock
-2. used = (write_idx - read_idx + capacity) % capacity
-   (modulo arithmetic; wraps correctly; capacity is the allocated N+1 size)
-3. if used == capacity - 1:
-   // Ring is full (N usable slots exhausted); reject
-   Release lock; return QueueFull
-4. ring[write_idx % capacity] = payload
-5. write_idx = (write_idx + 1) % capacity
-6. if waiter is Some(tcb):
-   a. waiter = None
-   b. Release lock
-   c. Mark tcb as Ready; enqueue
-7. else:
-   Release lock
+1. Acquire eq.lock
+2. if waiter is Some(tcb):
+   // Deliver directly, bypassing the ring
+   a. waiter = None; tcb.wakeup_value = payload; tcb.wake_in_flight = 1
+   b. if tcb.sleep_deadline != 0: sleep_list_remove(tcb); clear deadline
+   c. Release eq.lock
+   d. Syscall handler: select_target_cpu + enqueue_and_wake(tcb)
+3. if count >= capacity:
+   Release eq.lock; return QueueFull
+4. ring[write_idx] = payload; write_idx = (write_idx + 1) % (capacity + 1)
+5. count += 1 (Release); on the 0 -> 1 transition, waitset_notify
+6. Release eq.lock
 ```
 
-The ring buffer uses a one-slot gap between `write_idx` and `read_idx` to distinguish
-full from empty. The kernel allocates N+1 entries internally so the user observes
-exactly N usable slots as requested.
+The ring has `capacity + 1` slots internally (one-slot-gap full detection);
+the user observes exactly N usable slots as requested. `count` tracks
+occupancy and doubles as the lockless wait-set level-readiness witness.
 
 ### Recv Path
 
-`SYS_EVENT_RECV`:
+`SYS_EVENT_RECV` branches on arg1 (`timeout_ms`) before anything can park:
 
 ```
-1. Acquire lock
-2. if write_idx != read_idx:
-   // Entry available
-   a. payload = ring[read_idx % capacity]
-   b. read_idx = (read_idx + 1) % capacity
-   c. Release lock; return payload
-3. else:
-   // Queue empty; park the caller as eq.waiter
-   a. waiter = current_tcb
-   b. Release lock
-   c. Branch on arg1 (`timeout_ms`):
-      - `u64::MAX`     -> roll back the park; return WouldBlock
-      - `0`            -> schedule(); resume reads payload from wakeup_value
-      - 1..=MAX-1      -> set sleep_deadline = now + ms*tps/1000;
-                          sleep_list_add(tcb); schedule(); on resume,
-                          if tcb.timed_out -> return WouldBlock,
-                          else             -> return payload from wakeup_value
+1. if timeout_ms == u64::MAX:
+   // Non-blocking try-once: a pure peek (event_queue_try_recv).
+   // Acquire eq.lock; pop the ring head if count > 0, else release and
+   // return WouldBlock. Never registers eq.waiter; the caller is never
+   // wakeable and never enters the scheduler.
+2. Acquire eq.lock (event_queue_recv)
+3. if count > 0:
+   a. payload = ring[read_idx]; read_idx = (read_idx + 1) % (capacity + 1)
+   b. count -= 1 (Release)
+   c. Release eq.lock; return payload
+4. else, still under eq.lock:
+   // Park the caller as eq.waiter
+   a. context_saved = 0; waiter = current_tcb
+   b. commit_blocked_under_local_lock(tcb, BlockedOnEventQueue)
+      (eq.lock outer -> sched_lock inner; a refusal rolls the waiter back)
+   c. Release eq.lock
+5. if timeout_ms in 1..=MAX-1:
+   re-acquire eq.lock; if still eq.waiter, set sleep_deadline and
+   sleep_list_add(tcb); release eq.lock
+6. schedule(); on resume:
+   if tcb.timed_out -> return WouldBlock,
+   else             -> return payload from wakeup_value
 ```
 
 The `tcb.timed_out` flag is the out-of-band timeout marker — required

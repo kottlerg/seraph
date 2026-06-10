@@ -1060,6 +1060,13 @@ unsafe fn kernel_entry_post_rebase(
                         ipc_state: sched::thread::IpcThreadState::None,
                         ipc_msg: ipc::message::Message::default(),
                         reply_tcb: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
+                        reply_disposition: core::sync::atomic::AtomicU8::new(
+                            sched::thread::REPLY_DISPOSITION_NONE,
+                        ),
+                        #[cfg(debug_assertions)]
+                        park_episode: core::sync::atomic::AtomicU32::new(0),
+                        #[cfg(debug_assertions)]
+                        deposit_episode: core::sync::atomic::AtomicU32::new(0),
                         ipc_wait_next: None,
                         fault_handler: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
                         fault_badge: core::sync::atomic::AtomicU64::new(0),

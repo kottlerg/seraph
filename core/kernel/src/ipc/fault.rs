@@ -110,6 +110,12 @@ pub unsafe fn fault_dispatch(tcb: *mut ThreadControlBlock, info: &FaultInfo) -> 
             .fault_outcome
             .store(FAULT_OUTCOME_PENDING, Ordering::Release);
         (*tcb).in_fault_delivery = true;
+        // Open the park episode (the fault protocol's disposition stays in
+        // fault_outcome; the episode counter is the shared debug
+        // spurious-resume tripwire — see ipc-internals.md § Reply Disposition
+        // and Park Episodes).
+        #[cfg(debug_assertions)]
+        (*tcb).park_episode.fetch_add(1, Ordering::Relaxed);
     }
 
     let mut msg = crate::ipc::message::Message::new(syscall::FAULT_LABEL);
@@ -152,6 +158,22 @@ pub unsafe fn fault_dispatch(tcb: *mut ThreadControlBlock, info: &FaultInfo) -> 
     // covers a spurious wake leaving the outcome at `Pending`.
     // SAFETY: tcb still valid after resume.
     let outcome = unsafe { (*tcb).fault_outcome.load(Ordering::Acquire) };
+    // Spurious-resume tripwire: every legitimate fault wake stamps the
+    // episode at its claim site; a mismatch means this resume was produced by
+    // nothing that owed it (the #352-class leaked wake). The Kill fallback
+    // above keeps release behavior fail-closed.
+    #[cfg(debug_assertions)]
+    // SAFETY: tcb still valid after resume.
+    unsafe {
+        let park = (*tcb).park_episode.load(Ordering::Relaxed);
+        let deposit = (*tcb).deposit_episode.load(Ordering::Relaxed);
+        debug_assert!(
+            deposit == park,
+            "fault_dispatch: spurious resume tid={} park_episode={park} \
+             deposit_episode={deposit} outcome={outcome}",
+            (*tcb).thread_id,
+        );
+    }
     // SAFETY: tcb still valid; clear the in-flight marker now the delivery is done.
     unsafe {
         (*tcb).in_fault_delivery = false;

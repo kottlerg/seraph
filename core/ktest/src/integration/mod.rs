@@ -43,6 +43,7 @@
 //! - `tlb_widen_retry.rs`        — a permission-widen elides its shootdown; a remote stale-TLB write still completes via spurious-fault retry
 //! - `death_notification_late_bind.rs` — a death observer bound after the thread already died still receives the retained exit reason
 //! - `aspace_fault_notification_late_bind.rs` — an aspace terminal-fault observer bound after the space already faulted still receives the retained reason
+//! - `ipc_call_interrupted_stop_start.rs` — a client stopped while parked in `ipc_call` (send-queued and awaiting-reply) restarts to `Interrupted`, never a stale reply (#361)
 
 pub mod aspace_fault_notification_late_bind;
 pub mod cap_delegation_chain;
@@ -58,6 +59,7 @@ pub mod fault_kills_thread;
 pub mod fault_pager_roundtrip;
 pub mod fault_resume_modifies_pc;
 pub mod fpu_survives_ipc_call;
+pub mod ipc_call_interrupted_stop_start;
 pub mod irq_preserves_user_regs;
 pub mod memory_lifecycle;
 pub mod multi_caller_ipc_fifo;
@@ -95,6 +97,10 @@ pub fn run_all(ctx: &TestContext)
     run_integration_test!(
         "integration::multi_caller_ipc_fifo",
         multi_caller_ipc_fifo::run(ctx)
+    );
+    run_integration_test!(
+        "integration::ipc_call_interrupted_stop_start",
+        ipc_call_interrupted_stop_start::run(ctx)
     );
     run_integration_test!(
         "integration::cap_delegation_chain",

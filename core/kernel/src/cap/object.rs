@@ -1618,9 +1618,21 @@ unsafe fn dealloc_object_one(
                                     crate::ipc::fault::FAULT_OUTCOME_KILL,
                                     Ordering::Release,
                                 );
+                                // CAS win = episode claim; fault disposition is
+                                // the KILL above.
+                                crate::sched::thread::stamp_deposit_episode(bound);
                             }
                             else
                             {
+                                // The reply_tcb CAS win is the episode claim:
+                                // the orphaned caller's resume returns
+                                // Interrupted via the disposition (the
+                                // trap-frame poke below covers non-ipc_call
+                                // blocking syscalls).
+                                crate::sched::thread::stamp_reply_deposit(
+                                    bound,
+                                    crate::sched::thread::REPLY_DISPOSITION_INTERRUPTED,
+                                );
                                 let trap_frame = (*bound).trap_frame;
                                 if !trap_frame.is_null()
                                 {

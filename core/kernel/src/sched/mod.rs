@@ -1075,8 +1075,14 @@ pub fn sleep_check_wakeups()
                 {
                     // SAFETY: tcb still valid; see above. State/ipc_state/
                     // blocked_on_object are committed by enqueue_and_wake
-                    // under sched.lock.
+                    // under sched.lock. The CAS win is the episode claim: a
+                    // timed-out call is a cancellation, so the caller's resume
+                    // takes the Interrupted path, not a stale ipc_msg read.
                     unsafe {
+                        crate::sched::thread::stamp_reply_deposit(
+                            tcb,
+                            crate::sched::thread::REPLY_DISPOSITION_INTERRUPTED,
+                        );
                         (*tcb).wakeup_value = 0;
                         (*tcb).timed_out = true;
                         (*tcb).sleep_deadline = 0;
@@ -1114,12 +1120,14 @@ pub fn sleep_check_wakeups()
                 if we_win
                 {
                     // SAFETY: tcb still valid; fault_outcome / sleep_deadline
-                    // always valid. State committed by enqueue_and_wake.
+                    // always valid. State committed by enqueue_and_wake. CAS
+                    // win = episode claim; the fault disposition is the KILL.
                     unsafe {
                         (*tcb).fault_outcome.store(
                             crate::ipc::fault::FAULT_OUTCOME_KILL,
                             core::sync::atomic::Ordering::Release,
                         );
+                        crate::sched::thread::stamp_deposit_episode(tcb);
                         (*tcb).sleep_deadline = 0;
                     }
                 }
@@ -1318,6 +1326,13 @@ pub fn init(cpu_count: u32) -> u32
                     ipc_state: IpcThreadState::None,
                     ipc_msg: crate::ipc::message::Message::default(),
                     reply_tcb: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
+                    reply_disposition: core::sync::atomic::AtomicU8::new(
+                        thread::REPLY_DISPOSITION_NONE,
+                    ),
+                    #[cfg(debug_assertions)]
+                    park_episode: core::sync::atomic::AtomicU32::new(0),
+                    #[cfg(debug_assertions)]
+                    deposit_episode: core::sync::atomic::AtomicU32::new(0),
                     ipc_wait_next: None,
                     fault_handler: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
                     fault_badge: core::sync::atomic::AtomicU64::new(0),

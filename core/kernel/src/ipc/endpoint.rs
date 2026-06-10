@@ -170,6 +170,52 @@ unsafe fn dequeue(
 
 // ── Endpoint operations ───────────────────────────────────────────────────────
 
+/// Tear down a rendezvous reply linkage whose park commit lost to a
+/// concurrent stop: CAS the server's `reply_tcb` back to null (the caller's
+/// own dealloc may have beaten us; if so it owns the teardown). On the CAS
+/// win — the episode claim — stamp the cancelled disposition so the stopped
+/// caller's restart resumes via the error path, and release the
+/// wake-in-flight claim so its dealloc can proceed (#160); on a loss another
+/// claimant owns the wake and will clear it. Either way republish
+/// `context_saved` (the park never happened).
+///
+/// # Safety
+/// `server` and `caller` must be valid TCBs; the lock of the endpoint that
+/// published the linkage must be held.
+#[cfg(not(test))]
+unsafe fn rollback_uncommitted_call(
+    server: *mut ThreadControlBlock,
+    caller: *mut ThreadControlBlock,
+    parked_state: IpcThreadState,
+)
+{
+    // SAFETY: server / caller valid per caller contract.
+    unsafe {
+        let cleared = (*server)
+            .reply_tcb
+            .compare_exchange(
+                caller,
+                core::ptr::null_mut(),
+                core::sync::atomic::Ordering::AcqRel,
+                core::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok();
+        if cleared
+        {
+            crate::sched::thread::stamp_cancelled_deposit(
+                caller,
+                parked_state == IpcThreadState::BlockedOnFault,
+            );
+            (*caller)
+                .wake_in_flight
+                .store(0, core::sync::atomic::Ordering::Release);
+        }
+        (*caller)
+            .context_saved
+            .store(1, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Attempt an IPC call on `ep` from `caller` with `msg`.
 ///
 /// Returns `Ok(woken_server)` if a receiver was waiting and was woken (caller
@@ -262,31 +308,8 @@ pub unsafe fn endpoint_call(
         if !committed
         {
             // Concurrent stop won; tear down the reply linkage.
-            // SAFETY: caller / server validated.
-            unsafe {
-                let cleared = (*server)
-                    .reply_tcb
-                    .compare_exchange(
-                        caller,
-                        core::ptr::null_mut(),
-                        core::sync::atomic::Ordering::AcqRel,
-                        core::sync::atomic::Ordering::Acquire,
-                    )
-                    .is_ok();
-                // If we tore down the reply binding, the reply wake will never
-                // fire, so release the wake-in-flight claim set above (#160).
-                // If the CAS failed, another claimant owns the wake and will
-                // clear it.
-                if cleared
-                {
-                    (*caller)
-                        .wake_in_flight
-                        .store(0, core::sync::atomic::Ordering::Release);
-                }
-                (*caller)
-                    .context_saved
-                    .store(1, core::sync::atomic::Ordering::Relaxed);
-            }
+            // SAFETY: caller / server validated; ep.lock held.
+            unsafe { rollback_uncommitted_call(server, caller, parked_state) };
         }
         // SAFETY: paired with lock_raw above.
         unsafe { ep.lock.unlock_raw(saved) };
@@ -325,8 +348,12 @@ pub unsafe fn endpoint_call(
         // Concurrent stop won; unlink from the send queue.
         // SAFETY: ep.lock held.
         unsafe {
-            unlink_from_wait_queue(caller, &mut ep.send_head, &mut ep.send_tail);
+            let _ = unlink_from_wait_queue(caller, &mut ep.send_head, &mut ep.send_tail);
             ep.refresh_send_ready();
+            // ep.lock has been held continuously since the enqueue above, so
+            // this teardown is the episode's sole owner: stamp so the stopped
+            // caller's restart resumes via the disposition.
+            crate::sched::thread::stamp_cancelled_deposit(caller, (*caller).in_fault_delivery);
             (*caller)
                 .context_saved
                 .store(1, core::sync::atomic::Ordering::Relaxed);
@@ -426,10 +453,10 @@ pub unsafe fn endpoint_recv(
             unsafe { ep.lock.unlock_raw(saved) };
             return Ok((caller, msg));
         }
-        // Rollback: the caller is dying. CAS the reply binding back to null
-        // (the caller's own dealloc may have beaten us; if so it owns the
-        // teardown) and release the wake-in-flight claim so its dealloc can
-        // proceed past the #160 gate. Then skip this dead sender.
+        // Rollback: the caller is dying or stopped. CAS the reply binding back
+        // to null (the caller's own dealloc may have beaten us; if so it owns
+        // the teardown) and release the wake-in-flight claim so its dealloc
+        // can proceed past the #160 gate. Then skip this dead sender.
         // SAFETY: server / caller validated.
         unsafe {
             let cleared = (*server)
@@ -443,6 +470,16 @@ pub unsafe fn endpoint_recv(
                 .is_ok();
             if cleared
             {
+                // Teardown CAS win = episode claim. The send-queue dequeue
+                // above is also why a concurrent cancel_ipc_block's unlink
+                // lost and did not stamp: a STOPPED caller resumes on restart
+                // via this disposition. Stamp before releasing the
+                // wake-in-flight gate — after the release a dying caller's
+                // dealloc may free the TCB.
+                crate::sched::thread::stamp_cancelled_deposit(
+                    caller,
+                    parked == IpcThreadState::BlockedOnFault,
+                );
                 (*caller)
                     .wake_in_flight
                     .store(0, core::sync::atomic::Ordering::Release);

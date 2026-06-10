@@ -421,6 +421,7 @@ unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadControlBlock)
     {
         IpcThreadState::BlockedOnSend =>
         {
+            let mut unlinked = false;
             if !blocked_on.is_null()
             {
                 // cast_ptr_alignment: blocked_on_object stores type-erased pointer; original allocation guarantees alignment.
@@ -429,7 +430,8 @@ unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadControlBlock)
                 // SAFETY: blocked_on is a valid EndpointState ptr.
                 unsafe {
                     let saved = (*ep).lock.lock_raw();
-                    unlink_from_wait_queue(tcb, &mut (*ep).send_head, &mut (*ep).send_tail);
+                    unlinked =
+                        unlink_from_wait_queue(tcb, &mut (*ep).send_head, &mut (*ep).send_tail);
                     // Republish send-queue level after the unlink (#285-adjacent).
                     (*ep).refresh_send_ready();
                     (*ep).lock.unlock_raw(saved);
@@ -447,6 +449,28 @@ unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadControlBlock)
                     (*tcb).fault_outcome.store(
                         crate::ipc::fault::FAULT_OUTCOME_KILL,
                         core::sync::atomic::Ordering::Release,
+                    );
+                    // Episode stamp only on the unlink win: a lost unlink means
+                    // a racing endpoint_recv dequeued us and its rebind chain
+                    // owns the episode (commit or teardown both stamp).
+                    if unlinked
+                    {
+                        crate::sched::thread::stamp_deposit_episode(tcb);
+                    }
+                }
+            }
+            else if unlinked
+            {
+                // Claim = the send-queue unlink under ep.lock (recv dequeues
+                // under the same lock, so winning it makes this the episode's
+                // sole depositor). A stopped sys_ipc_call caller resumes via
+                // the disposition; a lost unlink hands the episode to the
+                // racing rebind chain.
+                // SAFETY: tcb valid; claim won per the comment above.
+                unsafe {
+                    crate::sched::thread::stamp_reply_deposit(
+                        tcb,
+                        crate::sched::thread::REPLY_DISPOSITION_INTERRUPTED,
                     );
                 }
             }
@@ -507,9 +531,15 @@ unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadControlBlock)
                         // wake-in-flight claim endpoint_call/recv set when this
                         // thread became BlockedOnReply, so a concurrent
                         // dealloc_object(Thread) does not wait for a wake that will
-                        // never fire (#160).
+                        // never fire (#160). The CAS win is the episode claim:
+                        // stamp Interrupted so the stopped caller's resume takes
+                        // the error path instead of reading a stale ipc_msg.
                         if cancelled
                         {
+                            crate::sched::thread::stamp_reply_deposit(
+                                tcb,
+                                crate::sched::thread::REPLY_DISPOSITION_INTERRUPTED,
+                            );
                             (*tcb)
                                 .wake_in_flight
                                 .store(0, core::sync::atomic::Ordering::Release);
@@ -558,6 +588,9 @@ unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadControlBlock)
                                 crate::ipc::fault::FAULT_OUTCOME_KILL,
                                 core::sync::atomic::Ordering::Release,
                             );
+                            // CAS win = episode claim (fault disposition lives
+                            // in fault_outcome; stamp the episode only).
+                            crate::sched::thread::stamp_deposit_episode(tcb);
                             (*tcb)
                                 .wake_in_flight
                                 .store(0, core::sync::atomic::Ordering::Release);
@@ -664,9 +697,12 @@ unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadControlBlock)
         (*tcb).sched_lock.unlock_raw(saved);
     }
 
-    // Write Interrupted into the stopped thread's trap-frame return slot so
-    // when the thread eventually resumes its original blocking syscall returns
-    // this error code.
+    // Write Interrupted into the stopped thread's trap-frame return slot for
+    // the non-reply blocking syscalls, whose resume continuations do not yet
+    // consume a deposited disposition. A `sys_ipc_call` caller ignores this
+    // slot: its resume re-writes the trap frame from the reply-disposition
+    // deposit stamped above (the continuation otherwise clobbers this poke —
+    // the #361 surface).
     // SAFETY: trap_frame is set for all user threads that have been configured.
     unsafe {
         let trap_frame = (*tcb).trap_frame;

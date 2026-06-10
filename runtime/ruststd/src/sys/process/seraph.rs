@@ -588,6 +588,17 @@ impl Command {
             match bridge_setup {
                 Ok(b) => Some(b),
                 Err(e) => {
+                    // No bridge thread exists (its spawn is the last
+                    // fallible step), but the releases may already be
+                    // armed; mark the peer dead so the pipe drops below
+                    // return the ring grants. Safe in any state: before
+                    // arming the mark is a no-op and Drop releases via
+                    // the no-peer path.
+                    mark_spawn_failure_pipes(
+                        child_stdin_pipe.as_deref(),
+                        child_stdout_pipe.as_deref(),
+                        child_stderr_pipe.as_deref(),
+                    );
                     let _ = syscall::cap_delete(death_eq);
                     let _ = syscall::cap_delete(thread_cap);
                     // SAFETY: ipc_ptr is the kernel-registered IPC buffer.

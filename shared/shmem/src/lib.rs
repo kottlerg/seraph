@@ -83,9 +83,6 @@ pub enum ShmemError
     /// `sys_mem_map` failed partway through — pages already mapped are
     /// unmapped before the error surfaces.
     MapFailed,
-    /// `sys_cap_delete` failed while releasing a Memory cap we obtained
-    /// from procmgr. Returned only when cleaning up an error path.
-    CapDeleteFailed,
 }
 
 /// A contiguous, page-aligned region of shared memory mapped into the

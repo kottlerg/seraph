@@ -52,6 +52,8 @@ members = [
     "programs/hello",
     "programs/hello/tester",
     "programs/pipefault",
+    "programs/pipestress",
+    "programs/pipestress/tester",
     "programs/shell",
     "programs/shell/path",
     "programs/shell/tester",

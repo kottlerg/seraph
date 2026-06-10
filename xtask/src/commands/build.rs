@@ -378,6 +378,20 @@ const SPECS: &[Spec] = &[
         arch_only: None,
     },
     Spec {
+        name: "pipestress",
+        install_name: None,
+        profile: BuildProfile::StdUser,
+        dest: InstallDest::Programs,
+        arch_only: None,
+    },
+    Spec {
+        name: "pipestress-tester",
+        install_name: Some("pipestress"),
+        profile: BuildProfile::StdUser,
+        dest: InstallDest::TestsPrograms,
+        arch_only: None,
+    },
+    Spec {
         name: "threadchurn",
         install_name: None,
         profile: BuildProfile::StdUser,
@@ -433,6 +447,8 @@ fn spec_for(component: BuildComponent) -> Option<&'static Spec>
         BuildComponent::ThreadstackTester => "threadstack-tester",
         BuildComponent::Threadchurn => "threadchurn",
         BuildComponent::ThreadchurnTester => "threadchurn-tester",
+        BuildComponent::Pipestress => "pipestress",
+        BuildComponent::PipestressTester => "pipestress-tester",
     };
     SPECS.iter().find(|s| s.name == name)
 }

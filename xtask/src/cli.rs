@@ -142,6 +142,8 @@ pub enum BuildComponent
     ThreadstackTester,
     Threadchurn,
     ThreadchurnTester,
+    Pipestress,
+    PipestressTester,
     All,
 }
 

@@ -714,6 +714,14 @@ name = "pipefault"
 version = "0.1.0"
 
 [[package]]
+name = "pipestress"
+version = "0.1.0"
+
+[[package]]
+name = "pipestress-tester"
+version = "0.1.0"
+
+[[package]]
 name = "prettyplease"
 version = "0.2.37"
 source = "registry+https://github.com/rust-lang/crates.io-index"

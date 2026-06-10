@@ -670,6 +670,11 @@ impl Command {
                     }
                     let _ = syscall::cap_delete(b.completion_notification);
                 }
+                mark_spawn_failure_pipes(
+                    child_stdin_pipe.as_deref(),
+                    child_stdout_pipe.as_deref(),
+                    child_stderr_pipe.as_deref(),
+                );
                 let _ = syscall::cap_delete(death_eq);
                 let _ = syscall::cap_delete(thread_cap);
                 // SAFETY: `ipc_ptr` is the kernel-registered IPC buffer page.
@@ -709,6 +714,11 @@ impl Command {
                         }
                         let _ = syscall::cap_delete(b.completion_notification);
                     }
+                    mark_spawn_failure_pipes(
+                        child_stdin_pipe.as_deref(),
+                        child_stdout_pipe.as_deref(),
+                        child_stderr_pipe.as_deref(),
+                    );
                     let _ = syscall::cap_delete(death_eq);
                     let _ = syscall::cap_delete(thread_cap);
                     // SAFETY: `ipc_ptr` is the kernel-registered IPC buffer page.
@@ -724,6 +734,11 @@ impl Command {
                         }
                         let _ = syscall::cap_delete(b.completion_notification);
                     }
+                    mark_spawn_failure_pipes(
+                        child_stdin_pipe.as_deref(),
+                        child_stdout_pipe.as_deref(),
+                        child_stderr_pipe.as_deref(),
+                    );
                     let _ = syscall::cap_delete(death_eq);
                     let _ = syscall::cap_delete(thread_cap);
                     // SAFETY: `ipc_ptr` is the kernel-registered IPC buffer page.
@@ -737,9 +752,13 @@ impl Command {
         // Kick the child off.
         let start_msg = ipc::IpcMessage::new(procmgr_labels::START_PROCESS);
         // SAFETY: `ipc_ptr` is the kernel-registered IPC buffer page.
-        let start_reply = unsafe { ipc::ipc_call(process_handle, &start_msg, ipc_ptr) }
-            .map_err(|_| io::Error::other("START_PROCESS syscall failed"))?;
-        if start_reply.label != procmgr_errors::SUCCESS {
+        let start_result = unsafe { ipc::ipc_call(process_handle, &start_msg, ipc_ptr) };
+        let start_error = match &start_result {
+            Ok(reply) if reply.label == procmgr_errors::SUCCESS => None,
+            Ok(reply) => Some(map_procmgr_error(reply.label)),
+            Err(_) => Some(io::Error::other("START_PROCESS syscall failed")),
+        };
+        if let Some(e) = start_error {
             // If a bridge is running, wake it with the sentinel so it
             // joins cleanly before we delete the caps it holds.
             if let Some(b) = bridge {
@@ -749,12 +768,17 @@ impl Command {
                 }
                 let _ = syscall::cap_delete(b.completion_notification);
             }
+            mark_spawn_failure_pipes(
+                child_stdin_pipe.as_deref(),
+                child_stdout_pipe.as_deref(),
+                child_stderr_pipe.as_deref(),
+            );
             let _ = syscall::cap_delete(death_eq);
             let _ = syscall::cap_delete(thread_cap);
             // SAFETY: `ipc_ptr` is the kernel-registered IPC buffer page.
             let _ = unsafe { ipc::ipc_call(process_handle, &destroy_msg, ipc_ptr) };
             let _ = syscall::cap_delete(process_handle);
-            return Err(map_procmgr_error(start_reply.label));
+            return Err(e);
         }
 
         Ok((
@@ -771,6 +795,21 @@ impl Command {
                 stderr: child_stderr_pipe,
             },
         ))
+    }
+}
+
+/// Mark every parent-side pipe end's ring grant releasable on a
+/// spawn-failure path. The child is destroyed without ever running, but
+/// the releases were already armed for a bridge that exits via the drop
+/// sentinel without reporting a death; without this call the grants
+/// would strand in memmgr until the spawner exits.
+fn mark_spawn_failure_pipes(
+    stdin: Option<&crate::sys::pipe::seraph::Pipe>,
+    stdout: Option<&crate::sys::pipe::seraph::Pipe>,
+    stderr: Option<&crate::sys::pipe::seraph::Pipe>,
+) {
+    for p in [stdin, stdout, stderr].into_iter().flatten() {
+        p.mark_peer_never_ran();
     }
 }
 

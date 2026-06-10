@@ -100,12 +100,14 @@ const RING_RELEASED: u8 = 4;
 /// a few hundred spawns by one long-lived process exhaust memmgr's
 /// CSpace and wedge every memmgr client system-wide.
 ///
-/// Returning the page is safe only once neither side can touch it: the
-/// parent end must be dropped (unmapped, caps deleted) AND the child
-/// must be dead (its threads stopped at death-post time) or never wired.
-/// `Pipe::Drop` and the spawn's death-bridge thread each report their
-/// side's completion here; whichever observes the other side already
-/// done gets `true` back and sends the release.
+/// Returning the page is safe only once neither side can write through
+/// it: the parent end must be dropped (unmapped, caps deleted) AND the
+/// child must be dead (its threads are stopped by death-post time; the
+/// child's mapping may outlive that until procmgr's teardown, which
+/// memmgr's release contract tolerates) or never wired. `Pipe::Drop`
+/// and the spawn's death-bridge thread each report their side's
+/// completion here; whichever observes the other side already done
+/// gets `true` back and sends the release.
 pub struct RingRelease {
     phys: u64,
     state: AtomicU8,
@@ -476,6 +478,19 @@ impl Pipe {
             rr.arm();
             rr.clone()
         })
+    }
+
+    /// Spawn-failure path: the child is being destroyed without ever
+    /// having run, but the release was already armed for the bridge,
+    /// which will exit via the drop sentinel without reporting a death.
+    /// Report the peer dead here instead so this end's eventual `Drop`
+    /// returns the ring grant.
+    pub fn mark_peer_never_ran(&self) {
+        if let Some(rr) = &self.ring_release {
+            if rr.on_peer_death() {
+                crate::sys::alloc::seraph::slab_release_fresh(rr.phys());
+            }
+        }
     }
 
     /// Parent-side `data_notification` cap slot. Exposed for the death-bridge

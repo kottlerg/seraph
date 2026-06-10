@@ -17,7 +17,10 @@
 // are mapped/copied into both processes' CSpaces); read/write logic drives
 // the appropriate notification direction. EOF/BrokenPipe is notified via
 // the header's `closed` flag, set on Drop with one final notification kick
-// so the surviving peer wakes and observes the flag.
+// so the surviving peer wakes and observes the flag. A reader returns EOF
+// only after a drain performed AFTER observing `closed` (or the bridge's
+// `peer_dead`) comes back empty — the flags are Release-stored after the
+// writer's last ring write, so flag-then-drain ordering cannot lose bytes.
 //
 // `pipe()` itself returns `Unsupported`: the symmetric upstream
 // constructor doesn't fit our two-process model. `Command::spawn` and
@@ -100,8 +103,9 @@ pub struct PipeCaps {
 /// block (via `notification_wait`) only when the ring is empty (reader) or
 /// full (writer). EOF / BrokenPipe is observed via the ring header's
 /// `closed` flag, set by the peer's `Drop`, OR via the parent-side
-/// `peer_dead` flag set by the spawner's death-bridge thread when the
-/// peer process exits without running `Drop` (fault, abort).
+/// `peer_dead` flag set by the spawner's death-bridge thread on every
+/// child death (clean exit or fault). Readers drain the ring once more
+/// after observing either flag before reporting EOF.
 pub struct Pipe {
     memory_cap: u32,
     ring_vaddr: u64,
@@ -113,13 +117,15 @@ pub struct Pipe {
     /// (`alloc_parent_va`). Child-side ends map at fixed per-direction
     /// VAs and clear this bit so Drop does not free a parent slot.
     owns_parent_slot: bool,
-    /// Spawner-side abnormal-exit flag, shared with the per-spawn
+    /// Spawner-side peer-exit flag, shared with the per-spawn
     /// death-bridge thread. `None` for child-side ends and for
     /// parent-side ends not yet attached to a spawn (the bridge sets
-    /// it after the child is constructed). When set, `read` returns
-    /// EOF and `write` returns `BrokenPipe` regardless of the ring
-    /// header's `closed` flag — covering the abnormal-exit case where
-    /// the peer never ran `Pipe::Drop` to mark the ring closed.
+    /// it after the child is constructed). The bridge flips it on
+    /// every child death — clean exit included — covering the case
+    /// where the peer never ran `Pipe::Drop` to mark the ring closed.
+    /// `read` treats it exactly like `closed`: EOF only once a drain
+    /// performed after observing the flag comes back empty. `write`
+    /// returns `BrokenPipe` on observing it.
     peer_dead: Option<Arc<AtomicBool>>,
 }
 
@@ -380,6 +386,14 @@ impl Pipe {
             return Ok(0);
         }
         loop {
+            // Order matters: observe the EOF flags BEFORE draining the ring.
+            // Each flag is Release-stored after the writer's last ring write
+            // (`closed`: peer `Drop`; `peer_dead`: child death -> kernel
+            // death post -> bridge), so an empty drain performed after
+            // observing a set flag proves the ring is final-empty. The
+            // reverse order loses bytes the peer writes between the drain
+            // and the flag load.
+            let eof = self.header().is_closed() || self.peer_dead();
             let mut reader = self.reader();
             let n = reader.read(buf);
             if n > 0 {
@@ -387,23 +401,7 @@ impl Pipe {
                 let _ = syscall::notification_send(self.space_notification, 1);
                 return Ok(n);
             }
-            if self.header().is_closed() {
-                // Drain race: peer may have written then marked closed.
-                // Re-check ring once after observing closed; if still
-                // empty, EOF.
-                let mut reader = self.reader();
-                let n2 = reader.read(buf);
-                if n2 > 0 {
-                    let _ = syscall::notification_send(self.space_notification, 1);
-                    return Ok(n2);
-                }
-                return Ok(0);
-            }
-            if self.peer_dead() {
-                // Peer process exited without running `Drop` (fault,
-                // abort). Bridge has flipped the flag and kicked our
-                // notification; ring may still hold buffered bytes the peer
-                // wrote before faulting, but we already drained above.
+            if eof {
                 return Ok(0);
             }
             if self.data_notification == 0 {
@@ -412,8 +410,12 @@ impl Pipe {
                 return Ok(0);
             }
             // Block until writer kicks the data notification, peer closes,
-            // or the death bridge fires.
-            let _ = syscall::notification_wait(self.data_notification);
+            // or the death bridge fires. A wait error means the notification
+            // cap itself is gone (teardown raced us); surface EOF rather
+            // than spin on a dead cap.
+            if syscall::notification_wait(self.data_notification).is_err() {
+                return Ok(0);
+            }
         }
     }
 
@@ -490,8 +492,15 @@ impl Pipe {
                 return Ok(buf.len());
             }
             // Block until reader kicks the space notification, peer closes,
-            // or the death bridge fires.
-            let _ = syscall::notification_wait(self.space_notification);
+            // or the death bridge fires. A wait error means the notification
+            // cap itself is gone; report the pipe as broken rather than
+            // spin on a dead cap.
+            if syscall::notification_wait(self.space_notification).is_err() {
+                return Err(io::const_error!(
+                    io::ErrorKind::BrokenPipe,
+                    "seraph pipe: space notification unavailable",
+                ));
+            }
         }
     }
 

@@ -1018,11 +1018,12 @@ impl Drop for Process {
 // non-piped children benefit from the `completion_notification` rendezvous,
 // and the per-pipe arrays are simply empty). Receives the kernel's
 // death notification on `death_eq` and translates it into:
-//   * `peer_dead.store(true)` — every parent-side `Pipe` checks this
-//     atom before each `notification_wait`, so the next read/write observes
-//     EOF / `BrokenPipe` regardless of the ring header's `closed`
-//     flag (which the child may not have set if it exited
-//     abnormally).
+//   * `peer_dead.store(true)` — fired on every child death, clean exit
+//     included. Every parent-side `Pipe` checks this atom before each
+//     ring drain; a reader reports EOF only when a drain performed after
+//     observing the flag comes back empty, and a writer reports
+//     `BrokenPipe`. This covers the abnormal-exit case where the child
+//     never ran `Pipe::Drop` to mark the ring header `closed`.
 //   * `notification_send` on each piped direction's data and space notifications,
 //     so any reader/writer currently parked in `notification_wait` wakes
 //     and re-checks the flag.

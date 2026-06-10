@@ -88,9 +88,10 @@ const CYCLES: u32 = 1024;
 /// `POST_SEQ` samples; 64 polls comfortably span the poster's post syscall.
 const ATTEMPTS: u32 = 64;
 
-/// Notification signal right (bit 7) and wait right (bit 8).
+/// Notification signal right (bit 7) and wait right (bit 8). Each cap copy
+/// carries only the right its one-directional use needs.
 const RIGHTS_SIGNAL: u64 = 1 << 7;
-const RIGHTS_NOTIFY_WAIT: u64 = (1 << 7) | (1 << 8);
+const RIGHTS_WAIT: u64 = 1 << 8;
 
 /// Event-queue post right (bit 9) and recv right (bit 10).
 const RIGHTS_EQ_POST: u64 = 1 << 9;
@@ -208,12 +209,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     let poller = start_pinned_child(
         ctx,
         [eq, gate, ack, done],
-        [
-            RIGHTS_EQ_RECV,
-            RIGHTS_NOTIFY_WAIT,
-            RIGHTS_SIGNAL,
-            RIGHTS_SIGNAL,
-        ],
+        [RIGHTS_EQ_RECV, RIGHTS_WAIT, RIGHTS_SIGNAL, RIGHTS_SIGNAL],
         poller_entry,
         0,
         0,
@@ -221,12 +217,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     let poster = start_pinned_child(
         ctx,
         [eq, gate, ack, done],
-        [
-            RIGHTS_EQ_POST,
-            RIGHTS_SIGNAL,
-            RIGHTS_NOTIFY_WAIT,
-            RIGHTS_SIGNAL,
-        ],
+        [RIGHTS_EQ_POST, RIGHTS_SIGNAL, RIGHTS_WAIT, RIGHTS_SIGNAL],
         poster_entry,
         1,
         1,
@@ -468,6 +459,14 @@ fn poster_entry(arg: u64) -> !
         }
     }
 
+    // On a failure exit the poller may be blocked in its gate wait (a failed
+    // post/gate-send never signals it); release it so it observes FAILURE and
+    // terminates with the stored code instead of hanging to the watchdog. Its
+    // subsequent assert no-ops (fail() keeps the first code).
+    if FAILURE.load(Ordering::Acquire) != 0
+    {
+        notification_send(gate, 1).ok();
+    }
     notification_send(done, BIT_POSTER_DONE).ok();
     thread_exit()
 }

@@ -359,9 +359,10 @@ impl Command {
         // threads (not just the main thread) posts the fault class to this
         // queue and `wait()` returns.
         let destroy_msg = ipc::IpcMessage::new(procmgr_labels::DESTROY_PROCESS);
-        let death_eq = crate::sys::alloc::seraph::object_slab_acquire(88)
-            .and_then(|slab| syscall::event_queue_create(slab, 4).ok())
-            .ok_or_else(|| {
+        let death_eq = crate::sys::alloc::seraph::object_slab_retype(88, |slab| {
+            syscall::event_queue_create(slab, 4).ok()
+        })
+        .ok_or_else(|| {
                 // The child does not exist yet; just drop the file cap we
                 // would otherwise transfer to procmgr.
                 let _ = syscall::cap_delete(file_cap);
@@ -543,10 +544,13 @@ impl Command {
             || child_stderr_pipe.is_some();
         let bridge = if any_pipe {
             let bridge_setup = (|| -> io::Result<Bridge> {
-                let completion_slab = crate::sys::alloc::seraph::object_slab_acquire(120)
-                    .ok_or_else(|| io::Error::other("object_slab_acquire (completion) failed"))?;
-                let completion_notification = syscall::cap_create_notification(completion_slab)
-                    .map_err(|_| io::Error::other("cap_create_notification for completion failed"))?;
+                let completion_notification =
+                    crate::sys::alloc::seraph::object_slab_retype(120, |slab| {
+                        syscall::cap_create_notification(slab).ok()
+                    })
+                    .ok_or_else(|| {
+                        io::Error::other("cap_create_notification for completion failed")
+                    })?;
                 let exit_reason = Arc::new(AtomicU64::new(0));
                 let peer_dead = Arc::new(AtomicBool::new(false));
 

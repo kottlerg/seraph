@@ -228,9 +228,9 @@ impl Thread {
             }
         };
 
-        let done_notification = match crate::sys::alloc::seraph::object_slab_acquire(120)
-            .and_then(|slab| syscall::cap_create_notification(slab).ok())
-        {
+        let done_notification = match crate::sys::alloc::seraph::object_slab_retype(120, |slab| {
+            syscall::cap_create_notification(slab).ok()
+        }) {
             Some(cap) => cap,
             None => {
                 // SAFETY: heap allocations owned by this function.
@@ -585,22 +585,9 @@ mod reaper {
         // EventQueue retype size = 80 + (capacity + 1) * 8 bytes; over-request a
         // little so the slab definitely covers it (fresh dedicated cap path).
         let want = (u64::from(EQ_CAPACITY) + 1) * 8 + 256;
-        let made = match crate::sys::alloc::seraph::object_slab_acquire(want) {
-            Some(slab) => match syscall::event_queue_create(slab, EQ_CAPACITY) {
-                // The EventQueue holds its own ancestor ref on the slab's
-                // MemoryObject, so the slab cap slot is now dead weight.
-                Ok(eq) => {
-                    let _ = syscall::cap_delete(slab);
-                    Some(eq)
-                }
-                // create failed without consuming the slab — reclaim its slot.
-                Err(_) => {
-                    let _ = syscall::cap_delete(slab);
-                    None
-                }
-            },
-            None => None,
-        };
+        let made = crate::sys::alloc::seraph::object_slab_retype(want, |slab| {
+            syscall::event_queue_create(slab, EQ_CAPACITY).ok()
+        });
         let Some(eq) = made else {
             return 0;
         };

@@ -377,20 +377,17 @@ impl Heap {
         }
         // Augment: request 1 page from memmgr, feed to cap_create_aspace
         // in augment mode (target = self_aspace). Single page covers
-        // ~511 new PT-entries' worth of mappable VA.
-        let Some(aug) = slab_acquire_fresh(PAGE_SIZE, 2) else {
-            return false;
-        };
-        let aug_memory = aug.cap;
-        if syscall::cap_create_aspace(aug_memory, self.self_aspace, 1).is_err() {
-            // Augment-mode returns 0 on success; treat any error as fatal
-            // for this grow. Drop the unused (virgin) Memory cap and return its
-            // run to memmgr's pool.
-            let _ = syscall::cap_delete(aug_memory);
-            slab_release_fresh(aug.phys);
+        // ~511 new PT-entries' worth of mappable VA. The AS's PT chunk
+        // holds its own ref on the augment's MemoryObject (`add_chunk` in
+        // `sys_cap_create_aspace`), so the slab machinery reclaims the
+        // source cap slot.
+        if object_slab_retype(PAGE_SIZE, |aug| {
+            syscall::cap_create_aspace(aug, self.self_aspace, 1).ok()
+        })
+        .is_none()
+        {
             return false;
         }
-        // The augment cap is consumed by cap_create_aspace; do not delete.
         syscall::mem_map(memory_cap, self.self_aspace, va, 0, pages, MAP_WRITABLE).is_ok()
     }
 }
@@ -656,6 +653,54 @@ fn slab_acquire_pooled(pool: &ObjectSlab, need: u64, want_pages: u64) -> Option<
     res
 }
 
+/// Retype under `pool`'s lock via `retype`, refilling from memmgr if
+/// exhausted. `need` is the rounded class size; `want_pages` is the request
+/// size used on refill. The local ledger is debited only when `retype`
+/// returns `Some`; see [`object_slab_retype`] for the closure contract.
+fn slab_retype_pooled<T>(
+    pool: &ObjectSlab,
+    need: u64,
+    want_pages: u64,
+    retype: impl FnOnce(u32) -> Option<T>,
+) -> Option<T> {
+    pool.lock.lock();
+    let res = (|| -> Option<T> {
+        // Fast path: existing slab still has room.
+        let cur = pool.cap.load(Ordering::Acquire);
+        let avail = pool.local_avail.load(Ordering::Relaxed);
+        if cur != 0 && avail >= need {
+            let out = retype(cur)?;
+            pool.local_avail.store(avail - need, Ordering::Relaxed);
+            return Some(out);
+        }
+        // Refill: request a fresh cap from memmgr. One attempt — propagate
+        // failure rather than loop on best-effort partial replies.
+        let ep = SLAB_MEMMGR_EP.load(Ordering::Acquire);
+        if ep == 0 {
+            return None;
+        }
+        let (new_cap, cap_pages, _phys) = slab_request_pages(ep, want_pages)?;
+        const ALLOCATOR_METADATA_RESERVE: u64 = 64;
+        let total = cap_pages.saturating_mul(PAGE_SIZE);
+        let usable = total.saturating_sub(ALLOCATOR_METADATA_RESERVE);
+        if usable < need {
+            // memmgr returned a cap too small for this request. Drop it
+            // (the caller will see None and decide what to do); don't
+            // install it as the slab — a smaller cap would just block the
+            // next bigger request the same way.
+            let _ = syscall::cap_delete(new_cap);
+            return None;
+        }
+        pool.cap.store(new_cap, Ordering::Release);
+        pool.local_avail.store(usable, Ordering::Relaxed);
+        let out = retype(new_cap)?;
+        pool.local_avail.store(usable - need, Ordering::Relaxed);
+        Some(out)
+    })();
+    pool.lock.unlock();
+    res
+}
+
 /// A freshly-acquired dedicated Memory cap plus the identity memmgr needs to
 /// reclaim its backing run mid-life. `phys` is the physical base memmgr
 /// reported in the grant reply; pass it to [`slab_release_fresh`] once every
@@ -740,6 +785,61 @@ pub fn object_slab_acquire(min_bytes: u64) -> Option<u32> {
     }
 }
 
+/// Retype one kernel object out of the slab machinery.
+///
+/// `min_bytes` is the raw byte cost of the upcoming retype (e.g. 88 for
+/// `Endpoint`, 120 for `Notification`); it is rounded up to the kernel's
+/// size class. `retype` is called at most once with a Memory-cap slot whose
+/// `available_bytes` covers the class and must perform exactly one
+/// `cap_create_*` syscall against that slot, returning `Some` on success.
+///
+/// # Closure contract
+///
+/// Sub-page classes run `retype` under the pool spinlock: exactly one
+/// retype syscall and nothing else — no allocation, no blocking, no
+/// panicking, no re-entry into the slab APIs — and the slot must not
+/// escape the closure.
+///
+/// Sub-page classes serve from a shared cached pool page, debiting the
+/// pool ledger only when `retype` returns `Some`. Page-aligned classes
+/// draw a fresh dedicated grant: on success the source cap slot is
+/// deleted (the retyped object holds its own ancestor reference on the
+/// grant's MemoryObject, `cap_create_aspace` augment mode included); on
+/// failure the virgin grant is deleted and its run returned to memmgr's
+/// pool.
+///
+/// Returns `None` if memmgr is unreachable, refuses the request, returns
+/// a cap too small for the class, or `retype` itself fails.
+pub fn object_slab_retype<T>(min_bytes: u64, retype: impl FnOnce(u32) -> Option<T>) -> Option<T> {
+    let need = slab_round_to_class(min_bytes);
+    // Pages we need to safely contain `need` plus the kernel's per-cap
+    // allocator metadata. One extra page covers metadata for sub-page
+    // requests; page-aligned requests need their own pages plus one.
+    let want_pages = need.div_ceil(PAGE_SIZE).max(1) + 1;
+    if need <= 128 {
+        slab_retype_pooled(&SLAB_BIN_128, need, want_pages, retype)
+    } else if need <= 512 {
+        slab_retype_pooled(&SLAB_BIN_512, need, want_pages, retype)
+    } else {
+        let grant = slab_acquire_fresh(need, want_pages)?;
+        match retype(grant.cap) {
+            Some(out) => {
+                // The retyped object holds its own ancestor ref on the
+                // grant's MemoryObject; the source slot is dead weight.
+                let _ = syscall::cap_delete(grant.cap);
+                Some(out)
+            }
+            None => {
+                // Retype failed without consuming the grant — the slab is
+                // virgin; reclaim the slot and return the run to memmgr.
+                let _ = syscall::cap_delete(grant.cap);
+                slab_release_fresh(grant.phys);
+                None
+            }
+        }
+    }
+}
+
 /// Like [`object_slab_acquire`] but always takes a fresh, dedicated cap and
 /// returns the [`SlabGrant`] identity, so the caller can return the run to
 /// memmgr's pool mid-life via [`slab_release_fresh`] once every object retyped
@@ -809,20 +909,10 @@ pub fn fund_aspace_pt_budget(self_aspace: u32, region_pages: u64) -> bool {
     }
     let shortfall_pages = (need_bytes - have).div_ceil(PAGE_SIZE).max(1);
 
-    let Some(frame) = object_slab_acquire(shortfall_pages * PAGE_SIZE) else {
-        return false;
-    };
-    if syscall::cap_create_aspace(frame, self_aspace, shortfall_pages).is_err() {
-        let _ = syscall::cap_delete(frame);
-        return false;
-    }
-    // The augment bumped the source MemoryObject's refcount into the AS's PT
-    // chunk (`add_chunk` in `sys_cap_create_aspace`), so the chunk keeps the
-    // backing alive on its own — the `frame` cap slot is now dead weight.
-    // Delete it to reclaim the slot; the bytes are reclaimed with the AS at
-    // process death.
-    let _ = syscall::cap_delete(frame);
-    true
+    object_slab_retype(shortfall_pages * PAGE_SIZE, |frame| {
+        syscall::cap_create_aspace(frame, self_aspace, shortfall_pages).ok()
+    })
+    .is_some()
 }
 
 /// Abort the calling thread via `SYS_THREAD_EXIT`. Used as the allocation-

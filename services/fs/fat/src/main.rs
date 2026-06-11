@@ -197,21 +197,6 @@ fn validate_bpb(caps: &FatCaps, state: &mut FatState, cache: &PageCache, ipc_buf
 
 // ── Service loop ───────────────────────────────────────────────────────────
 
-/// Main FAT service loop.
-///
-/// Three request shapes share one endpoint:
-/// - `FS_MOUNT` — unbadged (badge == 0); vfsd's BPB-validation probe.
-/// - `NS_LOOKUP` / `NS_STAT` / `NS_READDIR` — namespace dispatch via
-///   the protocol crate.
-/// - Per-node `FS_READ` / `FS_READ_MEMORY` / `FS_RELEASE_MEMORY` /
-///   `FS_CLOSE` — badge packs `(NodeId, NamespaceRights)`; the slot is
-///   resolved through `NodeTable` and the lazily-allocated `OpenFile`.
-///
-/// The open-file table is shared with the eviction worker via a
-/// `Mutex`; main acquires the lock once per request and holds it for
-/// the entire dispatch. The hot path is single-client and
-/// short-lived; lock contention with the worker is only material
-/// during cache-pressure releases.
 /// `RecvGuard` diagnostic hook: one line at the start of a failure streak,
 /// one more before the fatal exit.
 fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
@@ -229,6 +214,21 @@ fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
     }
 }
 
+/// Main FAT service loop.
+///
+/// Three request shapes share one endpoint:
+/// - `FS_MOUNT` — unbadged (badge == 0); vfsd's BPB-validation probe.
+/// - `NS_LOOKUP` / `NS_STAT` / `NS_READDIR` — namespace dispatch via
+///   the protocol crate.
+/// - Per-node `FS_READ` / `FS_READ_MEMORY` / `FS_RELEASE_MEMORY` /
+///   `FS_CLOSE` — badge packs `(NodeId, NamespaceRights)`; the slot is
+///   resolved through `NodeTable` and the lazily-allocated `OpenFile`.
+///
+/// The open-file table is shared with the eviction worker via a
+/// `Mutex`; main acquires the lock once per request and holds it for
+/// the entire dispatch. The hot path is single-client and
+/// short-lived; lock contention with the worker is only material
+/// during cache-pressure releases.
 #[allow(clippy::too_many_lines)]
 fn service_loop(
     caps: &FatCaps,

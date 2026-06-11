@@ -329,14 +329,6 @@ pub struct VfsdRuntime
 
 // ── Service loop ───────────────────────────────────────────────────────────
 
-/// Service-handler entry. One copy of this loop runs per
-/// [`SERVICE_THREAD_COUNT`] thread; all share the [`VfsdRuntime`].
-/// Multi-threaded recv on the service endpoint is required so that a
-/// handler blocked on a worker pool order (notably `CREATE_FROM_FILE`
-/// for a fatfs respawn, which triggers procmgr → vfsd namespace
-/// re-entry via `FS_READ` while loading a driver from the now-mounted
-/// root) does not deadlock.
-///
 /// `RecvGuard` diagnostic hook: one line at the start of a failure streak,
 /// one more before the fatal exit. Shared by the service, namespace, and
 /// bootstrap-worker receive loops.
@@ -355,6 +347,14 @@ pub(crate) fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
     }
 }
 
+/// Service-handler entry. One copy of this loop runs per
+/// [`SERVICE_THREAD_COUNT`] thread; all share the [`VfsdRuntime`].
+/// Multi-threaded recv on the service endpoint is required so that a
+/// handler blocked on a worker pool order (notably `CREATE_FROM_FILE`
+/// for a fatfs respawn, which triggers procmgr → vfsd namespace
+/// re-entry via `FS_READ` while loading a driver from the now-mounted
+/// root) does not deadlock.
+///
 /// Concurrency invariants. `MOUNT` routes into `do_mount` (and
 /// `do_mount` calls itself recursively for the ESP auto-mount), which
 /// mutates shared runtime state under the `VfsdRuntime` mutexes:

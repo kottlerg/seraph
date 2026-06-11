@@ -41,6 +41,7 @@ use crate::{TestContext, TestResult};
 
 const TEST_VA_BASE: u64 = 0x0000_0000_4000_0000;
 const SYS_OUT_OF_MEMORY: i64 = -8;
+const SYS_QUOTA_EXCEEDED: i64 = -17;
 
 /// Augment-mode on `cap_create_aspace` increases the target AS's PT
 /// growth budget without creating a new AS.
@@ -313,8 +314,8 @@ pub fn cspace_grow_consumes_pool(ctx: &TestContext) -> TestResult
 {
     let memory = ctx.memory_base;
 
-    // 3 slot pages = ~192 slots (depending on slot size). max_slots set
-    // generously so insertion isn't capped by max_slots.
+    // init_pages = 3 → wrapper page + 2 pool pages = 111 usable slots.
+    // max_slots set generously so insertion isn't capped by max_slots.
     let cspace = cap_create_cspace(memory, 0, 3, 4096)
         .map_err(|_| "retype::cspace_grow: cap_create_cspace failed")?;
     let used_before = cap_info(cspace, CAP_INFO_CSPACE_USED)
@@ -349,6 +350,81 @@ pub fn cspace_grow_consumes_pool(ctx: &TestContext) -> TestResult
     if budget_after >= budget_before
     {
         return Err("retype::cspace_grow: budget did not decrease as pool was consumed");
+    }
+    Ok(())
+}
+
+/// Pool exhaustion and the `max_slots` quota are distinct failures (#366):
+/// an under-seeded pool fails the insert with the refillable `OutOfMemory`
+/// (augment-mode then allows further inserts), while reaching `max_slots`
+/// fails with the hard `QuotaExceeded`.
+pub fn cspace_pool_exhaust_augment_then_quota(ctx: &TestContext) -> TestResult
+{
+    let memory = ctx.memory_base;
+
+    // init_pages = 2 → 1 pool page → 55 usable slots; max_slots = 120
+    // deliberately exceeds the seeded capacity to expose both bounds.
+    let cspace = cap_create_cspace(memory, 0, 2, 120)
+        .map_err(|_| "retype::pool_vs_quota: cap_create_cspace failed")?;
+    let Ok(probe) = cap_create_endpoint(memory)
+    else
+    {
+        cap_delete(cspace).ok();
+        return Err("retype::pool_vs_quota: cap_create_endpoint failed");
+    };
+
+    // Copy until the first failure: the seeded pool backs 55 slots, so 55
+    // copies succeed and the 56th hits pool exhaustion.
+    let mut ok_before = 0u32;
+    let mut err_at_pool = 0i64;
+    for _ in 0..=55
+    {
+        match cap_copy(probe, cspace, 1)
+        {
+            Ok(_) => ok_before += 1,
+            Err(e) =>
+            {
+                err_at_pool = e;
+                break;
+            }
+        }
+    }
+
+    // Refill the pool (2 more slot pages = 112 slots, ample for the
+    // remaining quota), then copy up to `max_slots`.
+    let augment_ok = cap_create_cspace(memory, cspace, 2, 0).is_ok();
+    let mut ok_after = 0u32;
+    let mut err_at_quota = 0i64;
+    for _ in 0..=65
+    {
+        match cap_copy(probe, cspace, 1)
+        {
+            Ok(_) => ok_after += 1,
+            Err(e) =>
+            {
+                err_at_quota = e;
+                break;
+            }
+        }
+    }
+
+    // Deleting the CSpace cap reclaims the copies wholesale.
+    cap_delete(probe).ok();
+    cap_delete(cspace).ok();
+
+    if ok_before != 55 || err_at_pool != SYS_OUT_OF_MEMORY
+    {
+        return Err(
+            "retype::pool_vs_quota: pool exhaustion did not surface OutOfMemory after 55 slots",
+        );
+    }
+    if !augment_ok
+    {
+        return Err("retype::pool_vs_quota: augment-mode refill failed");
+    }
+    if ok_after != 65 || err_at_quota != SYS_QUOTA_EXCEEDED
+    {
+        return Err("retype::pool_vs_quota: quota did not surface QuotaExceeded at max_slots");
     }
     Ok(())
 }

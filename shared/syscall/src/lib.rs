@@ -883,19 +883,22 @@ pub fn cap_create_aspace(memory_cap: u32, augment_target: u32, init_pages: u64)
 /// slot-page growth budget.
 ///
 /// `memory_cap` must carry `Rights::RETYPE` and have at least
-/// `init_pages * PAGE_SIZE` of `available_bytes`. All `init_pages`
-/// become the initial slot-page pool (the first `CSpace::grow` consumes
-/// one). `init_pages` must be `>= 1`.
+/// `init_pages * PAGE_SIZE` of `available_bytes`. In create mode the
+/// slab's page 0 is the kernel wrapper page; pages `1..init_pages` seed
+/// the slot-page pool (each backs 56 slots). `init_pages` must be `>= 1`.
 ///
 /// `augment_target`:
-/// - `0` → create new with `max_slots` (clamped to `[1, 14336]`); returns
-///   the new cap slot index.
+/// - `0` → create new with `max_slots` (clamped to `[1, 14336]`; `0`
+///   defaults to the capacity the seeded pool backs,
+///   `(init_pages - 1) * 56 - 1`); returns the new cap slot index.
 /// - non-zero → augment that `CSpace`'s growth pool; returns `0`. The
 ///   `max_slots` argument is ignored in augment mode.
 ///
 /// # Errors
-/// Returns a negative `i64` error code on insufficient memory budget,
-/// invalid cap, or a full `CSpace`.
+/// Returns a negative `i64` error code on insufficient memory budget or
+/// invalid cap. A later cap insert into the `CSpace` fails with
+/// `OutOfMemory` (-8) when the seeded pool is exhausted (refill via
+/// augment mode) and `QuotaExceeded` (-17) when `max_slots` is reached.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 #[inline]
 pub fn cap_create_cspace(
@@ -2122,7 +2125,7 @@ pub fn thread_sleep(ms: u64) -> Result<(), i64>
 /// the bare exit reason (low 32 bits): the pre-multi-bind behaviour.
 ///
 /// Multiple observers can be registered on the same thread — up to the
-/// kernel's per-TCB cap. Returns `SyscallError::OutOfMemory` (-3) if the
+/// kernel's per-TCB cap. Returns `SyscallError::OutOfMemory` (-8) if the
 /// target thread's observer array is full.
 ///
 /// `correlator` is opaque to the kernel. Its meaning is scoped to one

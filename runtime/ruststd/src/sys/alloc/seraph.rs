@@ -673,6 +673,11 @@ const ALLOCATOR_METADATA_RESERVE: u64 = 64;
 /// size; `want_pages` is the request size used on refill. The local ledger
 /// is debited only when `retype` returns `Some`; see [`object_slab_retype`]
 /// for the closure contract.
+///
+/// One function over the 100-line guideline by design: every step is one
+/// state machine over pool state whose invariants hold only while the pool
+/// lock is held, and splitting it would spread that lock-held contract
+/// across function boundaries.
 fn slab_retype_pooled<T>(
     pool: &ObjectSlab,
     need: u64,
@@ -712,7 +717,8 @@ fn slab_retype_pooled<T>(
         // Shelf scan: release fully-drained retired pages back to memmgr and
         // pick the first entry with room as a promotion candidate (a drained
         // candidate is reused rather than released — strictly cheaper than
-        // releasing it and requesting a fresh grant).
+        // releasing it and requesting a fresh grant). A failed probe reads
+        // as 0: the entry defers (kept, not promoted, never mis-freed).
         let mut avails = [0u64; SLAB_SHELF_SIZE];
         for (i, slot) in avails.iter_mut().enumerate().take(pages.shelf_len) {
             *slot = syscall::cap_info(pages.shelf[i].cap, syscall_abi::CAP_INFO_MEMORY_AVAILABLE)

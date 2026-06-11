@@ -180,6 +180,10 @@ pub struct RunArgs
     /// Number of vCPUs to expose to the guest (QEMU -smp).
     #[arg(long, default_value = "4")]
     pub cpus: u32,
+
+    /// Guest memory size in MiB (QEMU -m).
+    #[arg(long, default_value = "512")]
+    pub mem: u32,
 }
 
 // ── Mkdisk ────────────────────────────────────────────────────────────────────
@@ -212,6 +216,10 @@ pub struct TestTerminalArgs
     /// Number of vCPUs to expose to the guest (QEMU -smp).
     #[arg(long, default_value = "4")]
     pub cpus: u32,
+
+    /// Guest memory size in MiB (QEMU -m).
+    #[arg(long, default_value = "512")]
+    pub mem: u32,
 }
 
 // ── ComposeBundle ────────────────────────────────────────────────────────────
@@ -291,6 +299,10 @@ pub struct RunParallelArgs
     /// Number of vCPUs to expose to each guest (QEMU -smp).
     #[arg(long, default_value = "4")]
     pub cpus: u32,
+
+    /// Guest memory size in MiB (QEMU -m).
+    #[arg(long, default_value = "512")]
+    pub mem: u32,
 
     /// Regex marking a successful run. On match the log is discarded and
     /// the run is classified PASS. The default matches the cross-harness

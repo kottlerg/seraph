@@ -33,7 +33,7 @@ Run `cargo xtask build` first; `run` errors fast if the sysroot is empty
 or stamped for a different architecture.
 
 ```
-cargo xtask run [--arch x86_64|riscv64] [--gdb] [--headless] [--verbose] [--cpus N]
+cargo xtask run [--arch x86_64|riscv64] [--gdb] [--headless] [--verbose] [--cpus N] [--mem MIB]
 ```
 
 | Option | Description |
@@ -42,7 +42,8 @@ cargo xtask run [--arch x86_64|riscv64] [--gdb] [--headless] [--verbose] [--cpus
 | `--gdb` | Start QEMU with a GDB server on localhost:1234; QEMU pauses at startup |
 | `--headless` | Run without a display window (`-display none`) |
 | `--verbose` | Show all serial output; by default output is filtered until `[--------] boot:` appears |
-| `--cpus` | Number of vCPUs to expose to the guest (default: `4`) |
+| `--cpus` | Number of vCPUs to expose to the guest (default: `4`; bounded by `1..=512`, the boot-protocol `MAX_CPUS` the kernel sizes its per-CPU structures from) |
+| `--mem` | Guest memory size in MiB (default: `512`) |
 
 **x86-64** selects an acceleration backend per host: KVM on Linux,
 HVF on macOS, WHPX on Windows, NVMM on NetBSD, or TCG everywhere else
@@ -230,6 +231,7 @@ cargo xtask run-parallel \
     --runs M \
     [--timeout SECONDS] \
     [--cpus N] \
+    [--mem MIB] \
     [--pass REGEX] \
     [--fail REGEX] \
     [--fail-grace-secs SECONDS]
@@ -241,7 +243,8 @@ cargo xtask run-parallel \
 | `--parallel` | (required) | Concurrency: QEMU instances in flight at once |
 | `--runs` | (required) | Total runs, dispatched in waves of `--parallel` |
 | `--timeout` | `30` | Per-run timeout in seconds; expired runs are SIGKILLed and classified `HANG` (unless a pass marker matched first) |
-| `--cpus` | `4` | vCPUs per guest |
+| `--cpus` | `4` | vCPUs per guest (bounded by `1..=512`, the boot-protocol `MAX_CPUS`) |
+| `--mem` | `512` | Guest memory size in MiB |
 | `--pass` | `ALL TESTS PASSED` | Regex marking a successful run. The default matches the cross-harness terminal marker `[<harness>] ALL TESTS PASSED` standardised in [docs/testing.md](../docs/testing.md). On match the log is discarded and the run is classified `PASS` |
 | `--fail` | `SOME TESTS FAILED\|KERNEL EXCEPTION\|FATAL:\|PANIC( at \|: )` | Regex marking a failed run; the **first** match wins. Matches the cross-harness terminal marker `[<harness>] SOME TESTS FAILED` ([docs/testing.md](../docs/testing.md)) plus the kernel's own death markers (`KERNEL EXCEPTION` + `FATAL:` for a hardware trap, `PANIC at`/`PANIC:` for a Rust `panic!`) so a crash classifies `FAIL` rather than `HANG`. The benign `USERSPACE FAULT` path matches none of these. On match the log is preserved as `FAIL-<run>.log`. Failure takes precedence over success. Override with a never-matching pattern (e.g. `'$.^'`) to disable |
 | `--fail-grace-secs` | `10` | After the first `--fail` match, wait this many seconds (bounded by `--timeout`) before SIGKILL, so the trailing fault dump still lands in the log. A crashed run thus aborts ~grace seconds after the first match instead of idling to `--timeout` |
@@ -302,7 +305,7 @@ boot set, so the terminal autostarts; just build and repack:
 ```sh
 cargo xtask build
 cargo xtask mkdisk
-cargo xtask test-terminal [--arch x86_64|riscv64] [--cpus N]
+cargo xtask test-terminal [--arch x86_64|riscv64] [--cpus N] [--mem MIB]
 ```
 
 See [docs/testing.md](../docs/testing.md) for the harness model.

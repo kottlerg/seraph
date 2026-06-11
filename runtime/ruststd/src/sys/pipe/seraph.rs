@@ -17,7 +17,10 @@
 // are mapped/copied into both processes' CSpaces); read/write logic drives
 // the appropriate notification direction. EOF/BrokenPipe is notified via
 // the header's `closed` flag, set on Drop with one final notification kick
-// so the surviving peer wakes and observes the flag.
+// so the surviving peer wakes and observes the flag. A reader returns EOF
+// only after a drain performed AFTER observing `closed` (or the bridge's
+// `peer_dead`) comes back empty — the flags are Release-stored after the
+// writer's last ring write, so flag-then-drain ordering cannot lose bytes.
 //
 // `pipe()` itself returns `Unsupported`: the symmetric upstream
 // constructor doesn't fit our two-process model. `Command::spawn` and
@@ -79,6 +82,102 @@ pub enum Role {
     Writer,
 }
 
+/// [`RingRelease`] states. Linear lifecycle: `NO_PEER` until the spawn
+/// wires a death bridge (`ARMED`), then whichever of parent-drop /
+/// peer-death happens second performs the release (`RELEASED`).
+const RING_NO_PEER: u8 = 0;
+const RING_ARMED: u8 = 1;
+const RING_PARENT_DROPPED: u8 = 2;
+const RING_PEER_DEAD: u8 = 3;
+const RING_RELEASED: u8 = 4;
+
+/// Exactly-once return of a pipe ring page's memmgr grant.
+///
+/// The ring page is granted to the spawner via `REQUEST_MEMORY_CAPS` and
+/// stays in memmgr's per-process accounting until returned with
+/// `RELEASE_MEMORY_CAPS` (named by phys base) or until the spawner dies.
+/// Without the return, every piped spawn strands one grant in memmgr;
+/// a few hundred spawns by one long-lived process exhaust memmgr's
+/// CSpace and wedge every memmgr client system-wide.
+///
+/// Returning the page is safe only once neither side can write through
+/// it: the parent end must be dropped (unmapped, caps deleted) AND the
+/// child must be dead (its threads are stopped by death-post time; the
+/// child's mapping may outlive that until procmgr's teardown, which
+/// memmgr's release contract tolerates) or never wired. `Pipe::Drop`
+/// and the spawn's death-bridge thread each report their side's
+/// completion here; whichever observes the other side already done
+/// gets `true` back and sends the release.
+pub struct RingRelease {
+    phys: u64,
+    state: AtomicU8,
+}
+
+impl RingRelease {
+    fn new(phys: u64) -> Self {
+        Self {
+            phys,
+            state: AtomicU8::new(RING_NO_PEER),
+        }
+    }
+
+    /// Ring page physical base, for the `RELEASE_MEMORY_CAPS` sender.
+    pub fn phys(&self) -> u64 {
+        self.phys
+    }
+
+    /// A live child observer now exists; defer release to the two-party
+    /// protocol. Called once by `Command::spawn` when wiring the bridge.
+    fn arm(&self) {
+        let _ = self.state.compare_exchange(
+            RING_NO_PEER,
+            RING_ARMED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    /// Parent end dropped. Returns `true` when the caller must send the
+    /// release now (child already dead, or no child was ever wired).
+    fn on_parent_drop(&self) -> bool {
+        match self.state.compare_exchange(
+            RING_ARMED,
+            RING_PARENT_DROPPED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            // Bridge releases when the death event arrives.
+            Ok(_) => false,
+            // Never armed (spawn failed before bridge wiring) or the
+            // child is already dead: this side is last out.
+            Err(RING_NO_PEER) | Err(RING_PEER_DEAD) => {
+                self.state.store(RING_RELEASED, Ordering::Release);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Child died (death bridge). Returns `true` when the caller must
+    /// send the release now (parent end already dropped).
+    pub fn on_peer_death(&self) -> bool {
+        match self.state.compare_exchange(
+            RING_ARMED,
+            RING_PEER_DEAD,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            // Parent's Drop releases.
+            Ok(_) => false,
+            Err(RING_PARENT_DROPPED) => {
+                self.state.store(RING_RELEASED, Ordering::Release);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
+
 /// Cap triple for cross-process pipe handoff. Returned by
 /// `create_for_child`. Each field is a *derived handoff slot* in the
 /// caller's `CSpace` — distinct from the originals the parent-side
@@ -100,8 +199,9 @@ pub struct PipeCaps {
 /// block (via `notification_wait`) only when the ring is empty (reader) or
 /// full (writer). EOF / BrokenPipe is observed via the ring header's
 /// `closed` flag, set by the peer's `Drop`, OR via the parent-side
-/// `peer_dead` flag set by the spawner's death-bridge thread when the
-/// peer process exits without running `Drop` (fault, abort).
+/// `peer_dead` flag set by the spawner's death-bridge thread on every
+/// child death (clean exit or fault). Readers drain the ring once more
+/// after observing either flag before reporting EOF.
 pub struct Pipe {
     memory_cap: u32,
     ring_vaddr: u64,
@@ -113,14 +213,21 @@ pub struct Pipe {
     /// (`alloc_parent_va`). Child-side ends map at fixed per-direction
     /// VAs and clear this bit so Drop does not free a parent slot.
     owns_parent_slot: bool,
-    /// Spawner-side abnormal-exit flag, shared with the per-spawn
+    /// Spawner-side peer-exit flag, shared with the per-spawn
     /// death-bridge thread. `None` for child-side ends and for
     /// parent-side ends not yet attached to a spawn (the bridge sets
-    /// it after the child is constructed). When set, `read` returns
-    /// EOF and `write` returns `BrokenPipe` regardless of the ring
-    /// header's `closed` flag — covering the abnormal-exit case where
-    /// the peer never ran `Pipe::Drop` to mark the ring closed.
+    /// it after the child is constructed). The bridge flips it on
+    /// every child death — clean exit included — covering the case
+    /// where the peer never ran `Pipe::Drop` to mark the ring closed.
+    /// `read` treats it exactly like `closed`: EOF only once a drain
+    /// performed after observing the flag comes back empty. `write`
+    /// returns `BrokenPipe` on observing it.
     peer_dead: Option<Arc<AtomicBool>>,
+    /// Exactly-once return of the ring page's memmgr grant, shared with
+    /// the spawn's death-bridge thread. `Some` only on the end that
+    /// requested the grant (`create_for_child`); child-side ends map a
+    /// page they do not own.
+    ring_release: Option<Arc<RingRelease>>,
 }
 
 // SAFETY: Pipe holds raw cap-slot indices and a process-local VA; no
@@ -182,13 +289,33 @@ impl Pipe {
         let parent_va = alloc_parent_va()
             .ok_or_else(|| io::Error::other("seraph pipe: parent VA pool exhausted"))?;
 
-        // Allocate one shmem page mapped at parent_va in this process.
-        let (sb, memory_caps) = SharedBuffer::create(memmgr_ep, aspace, parent_va, 1, ipc_buf)
-            .map_err(|_| {
-                free_parent_va(parent_va);
-                io::Error::other("seraph pipe: SharedBuffer::create failed")
-            })?;
-        let memory_cap = memory_caps[0];
+        // Request one page from memmgr, keeping the phys base so the grant
+        // can be returned via RELEASE_MEMORY_CAPS when the pipe ends its
+        // life (see `RingRelease`). want_pages=1 returns exactly one cap
+        // covering one page.
+        let Some((memory_cap, _pages, ring_phys)) =
+            crate::sys::alloc::seraph::slab_request_pages(memmgr_ep, 1)
+        else {
+            free_parent_va(parent_va);
+            return Err(io::Error::other(
+                "seraph pipe: ring page request failed",
+            ));
+        };
+
+        // Map the page read-write at parent_va via a derived mapping cap;
+        // the original stays clean for the child handoff derivations.
+        let map_result = syscall::cap_derive(memory_cap, syscall::RIGHTS_MAP_RW)
+            .and_then(|rw| {
+                let r = syscall::mem_map(rw, aspace, parent_va, 0, 1, syscall::MAP_WRITABLE);
+                let _ = syscall::cap_delete(rw);
+                r
+            });
+        if map_result.is_err() {
+            let _ = syscall::cap_delete(memory_cap);
+            crate::sys::alloc::seraph::slab_release_fresh(ring_phys);
+            free_parent_va(parent_va);
+            return Err(io::Error::other("seraph pipe: ring page map failed"));
+        }
 
         // Initialise the ring header in shared memory before either end
         // touches it. SAFETY: parent_va is mapped writable for one page;
@@ -208,8 +335,9 @@ impl Pipe {
         }) {
             Ok(s) => s,
             Err(e) => {
-                drop(sb);
+                let _ = syscall::mem_unmap(aspace, parent_va, 1);
                 let _ = syscall::cap_delete(memory_cap);
+                crate::sys::alloc::seraph::slab_release_fresh(ring_phys);
                 free_parent_va(parent_va);
                 return Err(e);
             }
@@ -224,17 +352,13 @@ impl Pipe {
             Ok(s) => s,
             Err(e) => {
                 let _ = syscall::cap_delete(data_notification);
-                drop(sb);
+                let _ = syscall::mem_unmap(aspace, parent_va, 1);
                 let _ = syscall::cap_delete(memory_cap);
+                crate::sys::alloc::seraph::slab_release_fresh(ring_phys);
                 free_parent_va(parent_va);
                 return Err(e);
             }
         };
-
-        // SharedBuffer's Drop unmaps; we own the mapping for the
-        // lifetime of the parent-side Pipe and want to forget the SB so
-        // its Drop does not run. The Pipe's own Drop unmaps explicitly.
-        core::mem::forget(sb);
 
         // Derive handoff copies for the child. The parent's Pipe holds
         // the originals; the kernel transfers the derived slots into
@@ -248,6 +372,7 @@ impl Pipe {
                 let _ = syscall::cap_delete(data_notification);
                 let _ = syscall::mem_unmap(aspace, parent_va, 1);
                 let _ = syscall::cap_delete(memory_cap);
+                crate::sys::alloc::seraph::slab_release_fresh(ring_phys);
                 free_parent_va(parent_va);
                 return Err(io::Error::other(
                     "seraph pipe: cap_derive (memory handoff) failed",
@@ -262,6 +387,7 @@ impl Pipe {
                 let _ = syscall::cap_delete(data_notification);
                 let _ = syscall::mem_unmap(aspace, parent_va, 1);
                 let _ = syscall::cap_delete(memory_cap);
+                crate::sys::alloc::seraph::slab_release_fresh(ring_phys);
                 free_parent_va(parent_va);
                 return Err(io::Error::other(
                     "seraph pipe: cap_derive (data handoff) failed",
@@ -277,6 +403,7 @@ impl Pipe {
                 let _ = syscall::cap_delete(data_notification);
                 let _ = syscall::mem_unmap(aspace, parent_va, 1);
                 let _ = syscall::cap_delete(memory_cap);
+                crate::sys::alloc::seraph::slab_release_fresh(ring_phys);
                 free_parent_va(parent_va);
                 return Err(io::Error::other(
                     "seraph pipe: cap_derive (space handoff) failed",
@@ -294,6 +421,7 @@ impl Pipe {
                 aspace,
                 owns_parent_slot: true,
                 peer_dead: None,
+                ring_release: Some(Arc::new(RingRelease::new(ring_phys))),
             },
             PipeCaps {
                 memory: memory_handoff,
@@ -330,6 +458,7 @@ impl Pipe {
             aspace,
             owns_parent_slot: false,
             peer_dead: None,
+            ring_release: None,
         })
     }
 
@@ -339,6 +468,29 @@ impl Pipe {
     /// and have the next `read` / `write` see EOF / `BrokenPipe`.
     pub fn set_peer_dead(&mut self, flag: Arc<AtomicBool>) {
         self.peer_dead = Some(flag);
+    }
+
+    /// Arm the ring-grant release for the two-party protocol and hand the
+    /// shared state to the death bridge. Called by `Command::spawn` when
+    /// wiring the bridge, alongside [`set_peer_dead`][Self::set_peer_dead].
+    pub fn arm_ring_release(&self) -> Option<Arc<RingRelease>> {
+        self.ring_release.as_ref().map(|rr| {
+            rr.arm();
+            rr.clone()
+        })
+    }
+
+    /// Spawn-failure path: the child is being destroyed without ever
+    /// having run, but the release was already armed for the bridge,
+    /// which will exit via the drop sentinel without reporting a death.
+    /// Report the peer dead here instead so this end's eventual `Drop`
+    /// returns the ring grant.
+    pub fn mark_peer_never_ran(&self) {
+        if let Some(rr) = &self.ring_release {
+            if rr.on_peer_death() {
+                crate::sys::alloc::seraph::slab_release_fresh(rr.phys());
+            }
+        }
     }
 
     /// Parent-side `data_notification` cap slot. Exposed for the death-bridge
@@ -380,6 +532,14 @@ impl Pipe {
             return Ok(0);
         }
         loop {
+            // Order matters: observe the EOF flags BEFORE draining the ring.
+            // Each flag is Release-stored after the writer's last ring write
+            // (`closed`: peer `Drop`; `peer_dead`: child death -> kernel
+            // death post -> bridge), so an empty drain performed after
+            // observing a set flag proves the ring is final-empty. The
+            // reverse order loses bytes the peer writes between the drain
+            // and the flag load.
+            let eof = self.header().is_closed() || self.peer_dead();
             let mut reader = self.reader();
             let n = reader.read(buf);
             if n > 0 {
@@ -387,23 +547,7 @@ impl Pipe {
                 let _ = syscall::notification_send(self.space_notification, 1);
                 return Ok(n);
             }
-            if self.header().is_closed() {
-                // Drain race: peer may have written then marked closed.
-                // Re-check ring once after observing closed; if still
-                // empty, EOF.
-                let mut reader = self.reader();
-                let n2 = reader.read(buf);
-                if n2 > 0 {
-                    let _ = syscall::notification_send(self.space_notification, 1);
-                    return Ok(n2);
-                }
-                return Ok(0);
-            }
-            if self.peer_dead() {
-                // Peer process exited without running `Drop` (fault,
-                // abort). Bridge has flipped the flag and kicked our
-                // notification; ring may still hold buffered bytes the peer
-                // wrote before faulting, but we already drained above.
+            if eof {
                 return Ok(0);
             }
             if self.data_notification == 0 {
@@ -412,8 +556,12 @@ impl Pipe {
                 return Ok(0);
             }
             // Block until writer kicks the data notification, peer closes,
-            // or the death bridge fires.
-            let _ = syscall::notification_wait(self.data_notification);
+            // or the death bridge fires. A wait error means the notification
+            // cap itself is gone (teardown raced us); surface EOF rather
+            // than spin on a dead cap.
+            if syscall::notification_wait(self.data_notification).is_err() {
+                return Ok(0);
+            }
         }
     }
 
@@ -490,8 +638,15 @@ impl Pipe {
                 return Ok(buf.len());
             }
             // Block until reader kicks the space notification, peer closes,
-            // or the death bridge fires.
-            let _ = syscall::notification_wait(self.space_notification);
+            // or the death bridge fires. A wait error means the notification
+            // cap itself is gone; report the pipe as broken rather than
+            // spin on a dead cap.
+            if syscall::notification_wait(self.space_notification).is_err() {
+                return Err(io::const_error!(
+                    io::ErrorKind::BrokenPipe,
+                    "seraph pipe: space notification unavailable",
+                ));
+            }
         }
     }
 
@@ -554,6 +709,14 @@ impl Drop for Pipe {
         }
         if self.owns_parent_slot {
             free_parent_va(self.ring_vaddr);
+        }
+        // Return the ring page's memmgr grant once the child can no
+        // longer touch it. With the mapping and caps above already gone,
+        // this side is done; release now if the child is too.
+        if let Some(rr) = &self.ring_release {
+            if rr.on_parent_drop() {
+                crate::sys::alloc::seraph::slab_release_fresh(rr.phys());
+            }
         }
     }
 }

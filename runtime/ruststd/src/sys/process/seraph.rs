@@ -561,6 +561,7 @@ impl Command {
                         *slot = Some(PipeBridgeNotifications {
                             data_notification: p.data_notification_cap(),
                             space_notification: p.space_notification_cap(),
+                            ring_release: p.arm_ring_release(),
                         });
                     }
                 }
@@ -587,6 +588,17 @@ impl Command {
             match bridge_setup {
                 Ok(b) => Some(b),
                 Err(e) => {
+                    // No bridge thread exists (its spawn is the last
+                    // fallible step), but the releases may already be
+                    // armed; mark the peer dead so the pipe drops below
+                    // return the ring grants. Safe in any state: before
+                    // arming the mark is a no-op and Drop releases via
+                    // the no-peer path.
+                    mark_spawn_failure_pipes(
+                        child_stdin_pipe.as_deref(),
+                        child_stdout_pipe.as_deref(),
+                        child_stderr_pipe.as_deref(),
+                    );
                     let _ = syscall::cap_delete(death_eq);
                     let _ = syscall::cap_delete(thread_cap);
                     // SAFETY: ipc_ptr is the kernel-registered IPC buffer.
@@ -669,6 +681,11 @@ impl Command {
                     }
                     let _ = syscall::cap_delete(b.completion_notification);
                 }
+                mark_spawn_failure_pipes(
+                    child_stdin_pipe.as_deref(),
+                    child_stdout_pipe.as_deref(),
+                    child_stderr_pipe.as_deref(),
+                );
                 let _ = syscall::cap_delete(death_eq);
                 let _ = syscall::cap_delete(thread_cap);
                 // SAFETY: `ipc_ptr` is the kernel-registered IPC buffer page.
@@ -708,6 +725,11 @@ impl Command {
                         }
                         let _ = syscall::cap_delete(b.completion_notification);
                     }
+                    mark_spawn_failure_pipes(
+                        child_stdin_pipe.as_deref(),
+                        child_stdout_pipe.as_deref(),
+                        child_stderr_pipe.as_deref(),
+                    );
                     let _ = syscall::cap_delete(death_eq);
                     let _ = syscall::cap_delete(thread_cap);
                     // SAFETY: `ipc_ptr` is the kernel-registered IPC buffer page.
@@ -723,6 +745,11 @@ impl Command {
                         }
                         let _ = syscall::cap_delete(b.completion_notification);
                     }
+                    mark_spawn_failure_pipes(
+                        child_stdin_pipe.as_deref(),
+                        child_stdout_pipe.as_deref(),
+                        child_stderr_pipe.as_deref(),
+                    );
                     let _ = syscall::cap_delete(death_eq);
                     let _ = syscall::cap_delete(thread_cap);
                     // SAFETY: `ipc_ptr` is the kernel-registered IPC buffer page.
@@ -736,9 +763,13 @@ impl Command {
         // Kick the child off.
         let start_msg = ipc::IpcMessage::new(procmgr_labels::START_PROCESS);
         // SAFETY: `ipc_ptr` is the kernel-registered IPC buffer page.
-        let start_reply = unsafe { ipc::ipc_call(process_handle, &start_msg, ipc_ptr) }
-            .map_err(|_| io::Error::other("START_PROCESS syscall failed"))?;
-        if start_reply.label != procmgr_errors::SUCCESS {
+        let start_result = unsafe { ipc::ipc_call(process_handle, &start_msg, ipc_ptr) };
+        let start_error = match &start_result {
+            Ok(reply) if reply.label == procmgr_errors::SUCCESS => None,
+            Ok(reply) => Some(map_procmgr_error(reply.label)),
+            Err(_) => Some(io::Error::other("START_PROCESS syscall failed")),
+        };
+        if let Some(e) = start_error {
             // If a bridge is running, wake it with the sentinel so it
             // joins cleanly before we delete the caps it holds.
             if let Some(b) = bridge {
@@ -748,12 +779,17 @@ impl Command {
                 }
                 let _ = syscall::cap_delete(b.completion_notification);
             }
+            mark_spawn_failure_pipes(
+                child_stdin_pipe.as_deref(),
+                child_stdout_pipe.as_deref(),
+                child_stderr_pipe.as_deref(),
+            );
             let _ = syscall::cap_delete(death_eq);
             let _ = syscall::cap_delete(thread_cap);
             // SAFETY: `ipc_ptr` is the kernel-registered IPC buffer page.
             let _ = unsafe { ipc::ipc_call(process_handle, &destroy_msg, ipc_ptr) };
             let _ = syscall::cap_delete(process_handle);
-            return Err(map_procmgr_error(start_reply.label));
+            return Err(e);
         }
 
         Ok((
@@ -770,6 +806,21 @@ impl Command {
                 stderr: child_stderr_pipe,
             },
         ))
+    }
+}
+
+/// Mark every parent-side pipe end's ring grant releasable on a
+/// spawn-failure path. The child is destroyed without ever running, but
+/// the releases were already armed for a bridge that exits via the drop
+/// sentinel without reporting a death; without this call the grants
+/// would strand in memmgr until the spawner exits.
+fn mark_spawn_failure_pipes(
+    stdin: Option<&crate::sys::pipe::seraph::Pipe>,
+    stdout: Option<&crate::sys::pipe::seraph::Pipe>,
+    stderr: Option<&crate::sys::pipe::seraph::Pipe>,
+) {
+    for p in [stdin, stdout, stderr].into_iter().flatten() {
+        p.mark_peer_never_ran();
     }
 }
 
@@ -1018,14 +1069,19 @@ impl Drop for Process {
 // non-piped children benefit from the `completion_notification` rendezvous,
 // and the per-pipe arrays are simply empty). Receives the kernel's
 // death notification on `death_eq` and translates it into:
-//   * `peer_dead.store(true)` — every parent-side `Pipe` checks this
-//     atom before each `notification_wait`, so the next read/write observes
-//     EOF / `BrokenPipe` regardless of the ring header's `closed`
-//     flag (which the child may not have set if it exited
-//     abnormally).
+//   * `peer_dead.store(true)` — fired on every child death, clean exit
+//     included. Every parent-side `Pipe` checks this atom before each
+//     ring drain; a reader reports EOF only when a drain performed after
+//     observing the flag comes back empty, and a writer reports
+//     `BrokenPipe`. This covers the abnormal-exit case where the child
+//     never ran `Pipe::Drop` to mark the ring header `closed`.
 //   * `notification_send` on each piped direction's data and space notifications,
 //     so any reader/writer currently parked in `notification_wait` wakes
 //     and re-checks the flag.
+//   * `RingRelease::on_peer_death` per piped direction — returns the
+//     direction's ring-page grant to memmgr when the parent end is
+//     already dropped; otherwise the parent's later `Pipe::Drop` sends
+//     the release. Exactly-once by the shared state machine.
 //   * `exit_reason.store(reason)` + `notification_send(completion_notification)`
 //     — the rendezvous point `Process::wait` blocks on.
 //
@@ -1036,12 +1092,19 @@ impl Drop for Process {
 //
 // The bridge also recognises `BRIDGE_SENTINEL_DROP` posted by
 // `Process::Drop` and exits without firing any wakes — the spawner
-// is discarding the child anyway.
+// is discarding the child anyway. A discarded child's ring grants are
+// never released by the bridge (the child may still be running and
+// writing); they stay accounted to the spawner until it exits, the
+// same bound that applied to every pipe before grants were returned
+// at all.
 
-#[derive(Clone, Copy)]
 struct PipeBridgeNotifications {
     data_notification: u32,
     space_notification: u32,
+    /// Shared ring-grant release state for this direction's parent end;
+    /// the bridge reports the child's death and sends the release when
+    /// the parent end is already dropped.
+    ring_release: Option<Arc<crate::sys::pipe::seraph::RingRelease>>,
 }
 
 struct BridgeHandles {
@@ -1071,6 +1134,17 @@ fn bridge_main(h: BridgeHandles) {
         // writer re-checks `peer_dead` on its next loop turn.
         let _ = syscall::notification_send(sig.data_notification, 1);
         let _ = syscall::notification_send(sig.space_notification, 1);
+    }
+    // Report the child's death to each direction's ring-grant release
+    // state; send the release for ends the parent already dropped.
+    // Kicks first: waking blocked readers/writers must not wait on the
+    // memmgr round-trips below.
+    for sig in h.pipe_notifications.iter().flatten() {
+        if let Some(rr) = &sig.ring_release {
+            if rr.on_peer_death() {
+                crate::sys::alloc::seraph::slab_release_fresh(rr.phys());
+            }
+        }
     }
     // Raise the rendezvous notification last so a `wait` that wakes
     // observes `exit_reason` already published.

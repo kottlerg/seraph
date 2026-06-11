@@ -714,6 +714,14 @@ name = "pipefault"
 version = "0.1.0"
 
 [[package]]
+name = "pipestress"
+version = "0.1.0"
+
+[[package]]
+name = "pipestress-tester"
+version = "0.1.0"
+
+[[package]]
 name = "prettyplease"
 version = "0.2.37"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -928,7 +936,6 @@ checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 name = "shmem"
 version = "0.1.0"
 dependencies = [
- "ipc",
  "rustc-std-workspace-core",
  "syscall",
  "syscall-abi",

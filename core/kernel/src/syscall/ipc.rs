@@ -618,6 +618,46 @@ pub fn sys_ipc_call(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     Ok(0) // primary return; set_ipc_call_return already wrote all three values
 }
 
+/// Occurrence counter for [`log_recv_preallocate_failure`].
+#[cfg(not(test))]
+static RECV_PREALLOC_FAIL_COUNT: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+/// Rate-limited diagnostic (#365): a receiver whose `CSpace` cannot provide
+/// `MSG_CAP_SLOTS_MAX` slot headroom fails `SYS_IPC_RECV` before parking, so
+/// an unguarded recv loop retries at syscall rate — and the wedged process
+/// may have no log channel of its own (memmgr). Log occurrences at powers of
+/// two: flood-proof against an unguarded spinner, while later wedges still
+/// surface and the occurrence count itself conveys the spin rate. The cause
+/// is reported before `CapError` collapses to `SyscallError::OutOfMemory`,
+/// distinguishing a `max_slots` ceiling from retype-pool depletion.
+#[cfg(not(test))]
+fn log_recv_preallocate_failure(
+    tcb: *mut crate::sched::thread::ThreadControlBlock,
+    err: &crate::cap::CapError,
+)
+{
+    use core::sync::atomic::Ordering;
+    let n = RECV_PREALLOC_FAIL_COUNT
+        .fetch_add(1, Ordering::Relaxed)
+        .wrapping_add(1);
+    if !n.is_power_of_two()
+    {
+        return;
+    }
+    let cause = match err
+    {
+        crate::cap::CapError::OutOfSlots => "cspace-slots-exhausted",
+        crate::cap::CapError::OutOfMemory => "retype-pool-exhausted",
+        crate::cap::CapError::InvalidIndex | crate::cap::CapError::WxViolation => "unexpected",
+    };
+    // SAFETY: tcb is the live caller's TCB, validated by the syscall entry.
+    let tid = unsafe { (*tcb).thread_id };
+    crate::kprintln!(
+        "ipc: recv cap-slot pre-allocate failed: tid={tid} cause={cause} occurrence={n}"
+    );
+}
+
 /// `SYS_IPC_RECV` (2): receive the next message on an endpoint.
 ///
 /// arg0 = endpoint cap index.
@@ -669,7 +709,10 @@ pub fn sys_ipc_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         (*cspace_ptr).lock.unlock_raw(saved);
         r
     }
-    .map_err(|_| SyscallError::OutOfMemory)?;
+    .map_err(|e| {
+        log_recv_preallocate_failure(tcb, &e);
+        SyscallError::OutOfMemory
+    })?;
 
     // Open the park episode before the recv-queue link can publish.
     // SAFETY: tcb is the running caller, not yet claimable.

@@ -423,6 +423,24 @@ fn history_push(slot: &SenderSlot)
 /// `HANDOVER_PULL` data drain and its terminal `HANDOVER_RELEASE`; the
 /// latter sets `HANDOVER_COMPLETE`, and the next loop iteration
 /// self-terminates the thread.
+/// `RecvGuard` diagnostic hook. Init's serial sink is direct, so emit
+/// synthetic logd lines; the error code is dropped (the kernel's recv
+/// diagnostic carries the cause).
+fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, _err: i64)
+{
+    match stage
+    {
+        ipc::recv_guard::RecvFailureStage::First =>
+        {
+            flush_synthetic_logd_line(b"log recv loop failing; backing off");
+        }
+        ipc::recv_guard::RecvFailureStage::Fatal =>
+        {
+            flush_synthetic_logd_line(b"log recv loop wedged; exiting");
+        }
+    }
+}
+
 fn log_receive_loop(log_ep: u32, ipc_buf_raw: *mut u64) -> !
 {
     let mut slots: [SenderSlot; MAX_SENDERS] = [SenderSlot::empty(); MAX_SENDERS];
@@ -433,6 +451,7 @@ fn log_receive_loop(log_ep: u32, ipc_buf_raw: *mut u64) -> !
     // Cursor into the slot table for staged HANDOVER_PULL replies.
     let mut handover_slot_idx: usize = 0;
 
+    let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);
     loop
     {
         if HANDOVER_COMPLETE.load(core::sync::atomic::Ordering::Acquire)
@@ -442,11 +461,16 @@ fn log_receive_loop(log_ep: u32, ipc_buf_raw: *mut u64) -> !
         }
 
         // SAFETY: ipc_buf_raw is the log thread's registered IPC buffer page.
-        let Ok(recv) = (unsafe { ipc::ipc_recv(log_ep, ipc_buf_raw) })
-        else
+        let recv = match unsafe { ipc::ipc_recv(log_ep, ipc_buf_raw) }
         {
-            continue;
+            Ok(recv) => recv,
+            Err(e) =>
+            {
+                guard.on_failure(e);
+                continue;
+            }
         };
+        guard.on_success();
 
         let label_id = recv.label & 0xFFFF;
         let byte_len = ((recv.label >> 16) & 0xFFFF) as usize;

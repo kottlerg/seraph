@@ -306,12 +306,20 @@ fn event_loop(
     table: &mut SlotTable,
 ) -> !
 {
+    // One guard covers both spin shapes: a failing wait_set_wait, and a
+    // level-triggered wait set that keeps reporting ready while the recv in
+    // dispatch_log keeps failing. Only a successful recv counts as progress.
+    let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);
     loop
     {
-        let Ok(badge) = syscall::wait_set_wait(ws_cap)
-        else
+        let badge = match syscall::wait_set_wait(ws_cap)
         {
-            continue;
+            Ok(badge) => badge,
+            Err(e) =>
+            {
+                guard.on_failure(e);
+                continue;
+            }
         };
         drain_deaths(death_eq, table);
         // Only WS_BADGE_LOG warrants service action; deaths were
@@ -319,9 +327,28 @@ fn event_loop(
         // fall through silently.
         if badge == WS_BADGE_LOG
         {
-            dispatch_log(log_ep_recv, ipc_buf, table);
+            dispatch_log(log_ep_recv, ipc_buf, table, &mut guard);
         }
     }
+}
+
+/// `RecvGuard` diagnostic hook. logd cannot log through its own IPC
+/// endpoint, so this writes via the serial self-log path.
+fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
+{
+    let mut buf = SerialFmt::new();
+    let _ = match stage
+    {
+        ipc::recv_guard::RecvFailureStage::First =>
+        {
+            write!(buf, "recv loop failing (err={err}); backing off")
+        }
+        ipc::recv_guard::RecvFailureStage::Fatal =>
+        {
+            write!(buf, "recv loop wedged (err={err}); exiting")
+        }
+    };
+    buf.flush_self_log();
 }
 
 /// Non-blocking drain of the death event queue. Each payload encodes
@@ -359,14 +386,24 @@ fn drain_deaths(death_eq: u32, table: &mut SlotTable)
     }
 }
 
-fn dispatch_log(log_ep_recv: u32, ipc_buf: *mut u64, table: &mut SlotTable)
+fn dispatch_log(
+    log_ep_recv: u32,
+    ipc_buf: *mut u64,
+    table: &mut SlotTable,
+    guard: &mut ipc::recv_guard::RecvGuard,
+)
 {
     // SAFETY: ipc_buf is the registered IPC buffer page.
-    let Ok(recv) = (unsafe { ipc::ipc_recv(log_ep_recv, ipc_buf) })
-    else
+    let recv = match unsafe { ipc::ipc_recv(log_ep_recv, ipc_buf) }
     {
-        return;
+        Ok(recv) => recv,
+        Err(e) =>
+        {
+            guard.on_failure(e);
+            return;
+        }
     };
+    guard.on_success();
     let label_id = recv.label & 0xFFFF;
     let byte_len = ((recv.label >> 16) & 0xFFFF) as usize;
     if label_id == STREAM_BYTES

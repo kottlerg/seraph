@@ -47,6 +47,7 @@ members = [
     "shared/shmem",
     "shared/text",
     "programs/demandpaged",
+    "programs/capexhaust",
     "programs/fb-charset",
     "programs/fsbench",
     "programs/hello",

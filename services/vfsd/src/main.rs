@@ -337,6 +337,24 @@ pub struct VfsdRuntime
 /// re-entry via `FS_READ` while loading a driver from the now-mounted
 /// root) does not deadlock.
 ///
+/// `RecvGuard` diagnostic hook: one line at the start of a failure streak,
+/// one more before the fatal exit. Shared by the service, namespace, and
+/// bootstrap-worker receive loops.
+pub(crate) fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
+{
+    match stage
+    {
+        ipc::recv_guard::RecvFailureStage::First =>
+        {
+            std::os::seraph::log!("ipc_recv failing (err={err}); backing off");
+        }
+        ipc::recv_guard::RecvFailureStage::Fatal =>
+        {
+            std::os::seraph::log!("ipc_recv wedged (err={err}); exiting");
+        }
+    }
+}
+
 /// Concurrency invariants. `MOUNT` routes into `do_mount` (and
 /// `do_mount` calls itself recursively for the ESP auto-mount), which
 /// mutates shared runtime state under the `VfsdRuntime` mutexes:
@@ -357,15 +375,20 @@ fn service_loop(rt: &'static VfsdRuntime) -> !
         syscall::thread_exit();
     }
 
+    let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);
     loop
     {
         // SAFETY: ipc_buf is the thread-registered IPC buffer page.
-        let Ok(recv) = (unsafe { ipc::ipc_recv(rt.caps.service_ep, ipc_buf) })
-        else
+        let recv = match unsafe { ipc::ipc_recv(rt.caps.service_ep, ipc_buf) }
         {
-            std::os::seraph::log!("ipc_recv failed, retrying");
-            continue;
+            Ok(recv) => recv,
+            Err(e) =>
+            {
+                guard.on_failure(e);
+                continue;
+            }
         };
+        guard.on_success();
 
         let label = recv.label;
         let opcode = label & 0xFFFF;
@@ -442,14 +465,20 @@ fn namespace_loop(rt: &'static VfsdRuntime) -> !
         syscall::thread_exit();
     }
 
+    let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);
     loop
     {
         // SAFETY: ipc_buf is the thread-registered IPC buffer page.
-        let Ok(recv) = (unsafe { ipc::ipc_recv(rt.namespace_ep, ipc_buf) })
-        else
+        let recv = match unsafe { ipc::ipc_recv(rt.namespace_ep, ipc_buf) }
         {
-            continue;
+            Ok(recv) => recv,
+            Err(e) =>
+            {
+                guard.on_failure(e);
+                continue;
+            }
         };
+        guard.on_success();
 
         // Fall-through delegation: an `NS_LOOKUP` on any synthetic
         // tree node (the synthetic root or a multi-component

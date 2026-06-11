@@ -407,20 +407,44 @@ fn event_loop(
         devmgr_registry: caps.devmgr_registry,
     };
 
+    // One guard covers both spin shapes: a failing wait_set_wait, and a
+    // level-triggered wait set that keeps reporting ready while the recv in
+    // dispatch_ipc keeps failing. Only a successful recv counts as progress.
+    let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);
     loop
     {
-        let Ok(badge) = syscall::wait_set_wait(ws_cap)
-        else
+        let badge = match syscall::wait_set_wait(ws_cap)
         {
-            std::os::seraph::log!("wait_set_wait failed");
-            continue;
+            Ok(badge) => badge,
+            Err(e) =>
+            {
+                guard.on_failure(e);
+                continue;
+            }
         };
 
         match badge
         {
-            WS_BADGE_SERVICE => dispatch_ipc(caps.service_ep, state, &restart_ctx),
+            WS_BADGE_SERVICE => dispatch_ipc(caps.service_ep, state, &restart_ctx, &mut guard),
             WS_BADGE_DEATHS => dispatch_deaths(deaths_eq, state, &restart_ctx),
             _ => std::os::seraph::log!("unexpected wait-set badge"),
+        }
+    }
+}
+
+/// `RecvGuard` diagnostic hook: one line at the start of a failure streak,
+/// one more before the fatal exit.
+fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
+{
+    match stage
+    {
+        ipc::recv_guard::RecvFailureStage::First =>
+        {
+            std::os::seraph::log!("recv loop failing (err={err}); backing off");
+        }
+        ipc::recv_guard::RecvFailureStage::Fatal =>
+        {
+            std::os::seraph::log!("recv loop wedged (err={err}); exiting");
         }
     }
 }
@@ -429,15 +453,25 @@ fn event_loop(
 /// or discovery-registry publish/query). `ctx` carries the procmgr /
 /// bootstrap / deaths-EQ state the `HANDOVER_COMPLETE` →
 /// `reconcile_and_launch` path needs to spawn `.svc`-defined services.
-fn dispatch_ipc(service_ep: u32, state: &mut SvcmgrState, ctx: &restart::RestartCtx)
+fn dispatch_ipc(
+    service_ep: u32,
+    state: &mut SvcmgrState,
+    ctx: &restart::RestartCtx,
+    guard: &mut ipc::recv_guard::RecvGuard,
+)
 {
     let ipc_buf = ctx.ipc_buf;
     // SAFETY: ipc_buf is the registered IPC buffer.
-    let Ok(msg) = (unsafe { ipc::ipc_recv(service_ep, ipc_buf) })
-    else
+    let msg = match unsafe { ipc::ipc_recv(service_ep, ipc_buf) }
     {
-        return;
+        Ok(msg) => msg,
+        Err(e) =>
+        {
+            guard.on_failure(e);
+            return;
+        }
     };
+    guard.on_success();
 
     let opcode = msg.label & 0xFFFF;
     match opcode

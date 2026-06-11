@@ -212,6 +212,23 @@ fn validate_bpb(caps: &FatCaps, state: &mut FatState, cache: &PageCache, ipc_buf
 /// the entire dispatch. The hot path is single-client and
 /// short-lived; lock contention with the worker is only material
 /// during cache-pressure releases.
+/// `RecvGuard` diagnostic hook: one line at the start of a failure streak,
+/// one more before the fatal exit.
+fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
+{
+    match stage
+    {
+        ipc::recv_guard::RecvFailureStage::First =>
+        {
+            std::os::seraph::log!("ipc_recv failing (err={err}); backing off");
+        }
+        ipc::recv_guard::RecvFailureStage::Fatal =>
+        {
+            std::os::seraph::log!("ipc_recv wedged (err={err}); exiting");
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn service_loop(
     caps: &FatCaps,
@@ -223,14 +240,20 @@ fn service_loop(
     eviction: &EvictionState,
 ) -> !
 {
+    let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);
     loop
     {
         // SAFETY: ipc_buf is the registered IPC buffer page.
-        let Ok(msg) = (unsafe { ipc::ipc_recv(caps.service, ipc_buf) })
-        else
+        let msg = match unsafe { ipc::ipc_recv(caps.service, ipc_buf) }
         {
-            continue;
+            Ok(msg) => msg,
+            Err(e) =>
+            {
+                guard.on_failure(e);
+                continue;
+            }
         };
+        guard.on_success();
 
         let opcode = msg.label & 0xFFFF;
 

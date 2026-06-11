@@ -152,12 +152,20 @@ fn main() -> !
     };
     let service_ep = boot.service_ep;
 
+    // One guard covers both spin shapes: a failing wait_set_wait, and a
+    // level-triggered wait set that keeps reporting ready while the recv in
+    // dispatch_ipc keeps failing. Only a successful recv counts as progress.
+    let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);
     loop
     {
-        let Ok(badge) = syscall::wait_set_wait(ws_cap)
-        else
+        let badge = match syscall::wait_set_wait(ws_cap)
         {
-            continue;
+            Ok(badge) => badge,
+            Err(e) =>
+            {
+                guard.on_failure(e);
+                continue;
+            }
         };
 
         // Drain any pending deaths before servicing a SERVICE request.
@@ -180,7 +188,9 @@ fn main() -> !
         {
             WS_BADGE_SERVICE =>
             {
-                dispatch_ipc(service_ep, ipc_buf, &mut ctx, &mut table, &recent);
+                dispatch_ipc(
+                    service_ep, ipc_buf, &mut ctx, &mut table, &recent, &mut guard,
+                );
             }
             WS_BADGE_DEATH =>
             {
@@ -366,6 +376,23 @@ pub fn memmgr_alloc_pages_contig(memmgr_send: u32, pages: u64, ipc_buf: *mut u64
     }
 }
 
+/// `RecvGuard` diagnostic hook: one line at the start of a failure streak,
+/// one more before the fatal exit.
+fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
+{
+    match stage
+    {
+        ipc::recv_guard::RecvFailureStage::First =>
+        {
+            std::os::seraph::log!("recv loop failing (err={err}); backing off");
+        }
+        ipc::recv_guard::RecvFailureStage::Fatal =>
+        {
+            std::os::seraph::log!("recv loop wedged (err={err}); exiting");
+        }
+    }
+}
+
 /// Service-endpoint dispatch. Called when the wait-set wakes for the
 /// service endpoint; the sender is already queued so `ipc_recv` returns
 /// without blocking.
@@ -375,14 +402,20 @@ fn dispatch_ipc(
     ctx: &mut ProcmgrCtx,
     table: &mut process::ProcessTable,
     recent: &process::RecentExits,
+    guard: &mut ipc::recv_guard::RecvGuard,
 )
 {
     // SAFETY: ipc_buf is the registered IPC buffer page.
-    let Ok(req) = (unsafe { ipc::ipc_recv(service_ep, ipc_buf) })
-    else
+    let req = match unsafe { ipc::ipc_recv(service_ep, ipc_buf) }
     {
-        return;
+        Ok(req) => req,
+        Err(e) =>
+        {
+            guard.on_failure(e);
+            return;
+        }
     };
+    guard.on_success();
     let label = req.label;
     let badge = req.badge;
 

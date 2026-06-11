@@ -1875,14 +1875,23 @@ fn main(startup: &StartupInfo) -> !
     }
     ingest_in_use(&boot);
 
+    // memmgr has no log channel; on persistent recv failure its signals are
+    // the kernel's rate-limited pre-allocate diagnostic and the loud
+    // EXIT_RECV_WEDGE death itself.
+    let mut guard = ipc::recv_guard::RecvGuard::new(|_, _| {});
     loop
     {
         // SAFETY: ipc_buf is the registered IPC buffer page.
-        let Ok(req) = (unsafe { ipc::ipc_recv(boot.service_ep, ipc_buf) })
-        else
+        let req = match unsafe { ipc::ipc_recv(boot.service_ep, ipc_buf) }
         {
-            continue;
+            Ok(req) => req,
+            Err(e) =>
+            {
+                guard.on_failure(e);
+                continue;
+            }
         };
+        guard.on_success();
         dispatch(&req, ipc_buf, &boot);
     }
 }

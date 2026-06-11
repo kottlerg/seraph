@@ -92,17 +92,40 @@ fn handle_request(msg: &IpcMessage, ipc_buf: *mut u64, base_va: u64)
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
 }
 
+/// `RecvGuard` diagnostic hook: one line at the start of a failure streak,
+/// one more before the fatal exit.
+fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
+{
+    match stage
+    {
+        ipc::recv_guard::RecvFailureStage::First =>
+        {
+            std::os::seraph::log!("ipc_recv failing (err={err}); backing off");
+        }
+        ipc::recv_guard::RecvFailureStage::Fatal =>
+        {
+            std::os::seraph::log!("ipc_recv wedged (err={err}); exiting");
+        }
+    }
+}
+
 fn service_loop(service_ep: u32, ipc_buf: *mut u64, base_va: u64) -> !
 {
     std::os::seraph::log!("ready");
+    let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);
     loop
     {
         // SAFETY: ipc_buf is the registered IPC buffer page.
-        let Ok(msg) = (unsafe { ipc::ipc_recv(service_ep, ipc_buf) })
-        else
+        let msg = match unsafe { ipc::ipc_recv(service_ep, ipc_buf) }
         {
-            continue;
+            Ok(msg) => msg,
+            Err(e) =>
+            {
+                guard.on_failure(e);
+                continue;
+            }
         };
+        guard.on_success();
         handle_request(&msg, ipc_buf, base_va);
     }
 }

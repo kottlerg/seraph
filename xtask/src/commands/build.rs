@@ -336,6 +336,13 @@ const SPECS: &[Spec] = &[
         arch_only: None,
     },
     Spec {
+        name: "capexhaust",
+        install_name: None,
+        profile: BuildProfile::StdUser,
+        dest: InstallDest::Programs,
+        arch_only: None,
+    },
+    Spec {
         name: "pipefault",
         install_name: None,
         profile: BuildProfile::StdUser,
@@ -439,6 +446,7 @@ fn spec_for(component: BuildComponent) -> Option<&'static Spec>
         BuildComponent::Shell => "shell",
         BuildComponent::ShellTester => "shell-tester",
         BuildComponent::Stackoverflow => "stackoverflow",
+        BuildComponent::Capexhaust => "capexhaust",
         BuildComponent::Pipefault => "pipefault",
         BuildComponent::Demandpaged => "demandpaged",
         BuildComponent::Stdiotest => "stdiotest",

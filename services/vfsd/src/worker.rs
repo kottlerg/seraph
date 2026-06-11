@@ -35,14 +35,20 @@ pub fn bootstrap_loop(bootstrap_ep: u32, state: &Mutex<BootstrapState>) -> !
         syscall::thread_exit();
     }
 
+    let mut guard = ipc::recv_guard::RecvGuard::new(crate::recv_diag);
     loop
     {
         // SAFETY: ipc_buf is the thread-registered IPC buffer page.
-        let Ok(recv) = (unsafe { ipc::ipc_recv(bootstrap_ep, ipc_buf) })
-        else
+        let recv = match unsafe { ipc::ipc_recv(bootstrap_ep, ipc_buf) }
         {
-            continue;
+            Ok(recv) => recv,
+            Err(e) =>
+            {
+                guard.on_failure(e);
+                continue;
+            }
         };
+        guard.on_success();
         let label = recv.label;
         let badge = recv.badge;
 

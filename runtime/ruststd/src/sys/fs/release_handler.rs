@@ -216,6 +216,20 @@ pub(super) fn release_one_local(entry: &FileEntry, aspace: u32, cookie: u64)
     pal_reserve::unreserve_pages(m.range);
 }
 
+/// `RecvGuard` diagnostic hook: one line at the start of a failure streak,
+/// one more before the fatal exit. A wedged release endpoint blocks every
+/// remote `FS_RELEASE_MEMORY` caller, so the process dies loudly like any
+/// other unrecoverable receive loop.
+fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
+{
+    let msg = match stage
+    {
+        ipc::recv_guard::RecvFailureStage::First => "failing; backing off",
+        ipc::recv_guard::RecvFailureStage::Fatal => "wedged; exiting",
+    };
+    crate::os::seraph::log::__emit(core::format_args!("fs-release recv loop {msg} (err={err})"));
+}
+
 fn handler_main()
 {
     let state = match STATE.get()
@@ -235,6 +249,7 @@ fn handler_main()
         }
     }
 
+    let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);
     loop
     {
         // SAFETY: `ipc_buf` is the registered IPC buffer for this
@@ -242,8 +257,13 @@ fn handler_main()
         let msg = match unsafe { ipc::ipc_recv(state.release_ep, ipc_buf) }
         {
             Ok(m) => m,
-            Err(_) => continue,
+            Err(e) =>
+            {
+                guard.on_failure(e);
+                continue;
+            }
         };
+        guard.on_success();
 
         if msg.label != fs_labels::FS_RELEASE_MEMORY
         {

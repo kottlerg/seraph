@@ -152,6 +152,37 @@ role and the handler services it with the ordinary receive/reply cycle. See
 
 ---
 
+## Receive-Failure Policy
+
+`SYS_IPC_RECV` pre-allocates worst-case capability-slot headroom (`MSG_CAP_SLOTS_MAX`) in the
+receiver's CSpace before parking, so capability transfer on the immediate-delivery path cannot
+fail mid-handshake. The consequence: a receiver whose CSpace cannot provide that headroom fails
+the receive *before* blocking. The condition is structural, not transient — an unguarded
+`loop { ipc_recv }` retries at syscall rate, indefinitely.
+
+Two mechanisms make the condition diagnosable:
+
+- **Kernel diagnostic.** The kernel emits a rate-limited console line (logged at power-of-two
+  occurrence counts) naming the receiving thread and the cause — the `max_slots` quota versus
+  refillable slot-page-pool depletion, mirroring the `QuotaExceeded` / `OutOfMemory` error
+  split in [capability-model.md](capability-model.md). This is the only signal a process with
+  no log channel (memmgr) can produce before it dies.
+- **Userspace policy.** Blocking receive loops MUST route every receive outcome through
+  `ipc::recv_guard::RecvGuard`: bounded exponential backoff between failed receives, a
+  diagnostic hook at the first failure of a streak, and voluntary process death with
+  `EXIT_RECV_WEDGE` once a streak of identical failures proves the condition persistent.
+  `Interrupted` receives are exempt — expected during thread stop/start, they neither extend
+  nor reset the streak. Non-blocking drain loops (`event_try_recv`) do not use the guard.
+
+A wedged service supervised by svcmgr under `restart = always` is relaunched with a fresh
+CSpace — bounded self-recovery. Unsupervised processes die loudly instead of spinning.
+
+The voluntary exit-code space is flat and has no central registry: ruststd reserves
+`0x0F01..=0x0F02` for startup-infrastructure failures; `EXIT_RECV_WEDGE` (`0x0F10`) starts the
+shared/ipc policy block.
+
+---
+
 ## Kernel Role
 
 The kernel delivers messages, manages endpoint queuing, and transfers capability
@@ -171,4 +202,5 @@ The kernel does not provide:
 [Architecture Overview](architecture.md),
 [devmgr/README.md](../services/devmgr/README.md),
 [logd/README.md](../services/logd/README.md),
+[shared/README.md](../shared/README.md),
 [vfsd/README.md](../services/vfsd/README.md)

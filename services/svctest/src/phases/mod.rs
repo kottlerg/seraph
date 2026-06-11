@@ -43,6 +43,7 @@ pub mod pipes;
 pub mod process_faults;
 pub mod procmgr;
 pub mod pwrmgr;
+pub mod recv_guard;
 pub mod shmem;
 pub mod startup;
 pub mod threading;
@@ -59,6 +60,7 @@ pub fn all() -> Vec<Phase>
     out.extend_from_slice(procmgr::spawn_only());
     out.extend_from_slice(process_faults::phases());
     out.extend_from_slice(exit_code::phases());
+    out.extend_from_slice(recv_guard::phases());
     out.extend_from_slice(devmgr::phases());
     out.extend_from_slice(pager::phases());
     out.extend_from_slice(shmem::phases());

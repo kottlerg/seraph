@@ -72,14 +72,20 @@ fn main() -> !
 
     let self_thread = info.self_thread;
 
+    let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);
     loop
     {
         // SAFETY: ipc_buf is the registered IPC buffer.
-        let Ok(msg) = (unsafe { ipc::ipc_recv(bootstrap.service_ep, ipc_buf) })
-        else
+        let msg = match unsafe { ipc::ipc_recv(bootstrap.service_ep, ipc_buf) }
         {
-            continue;
+            Ok(msg) => msg,
+            Err(e) =>
+            {
+                guard.on_failure(e);
+                continue;
+            }
         };
+        guard.on_success();
 
         let authorized = msg.badge & pwrmgr_labels::SHUTDOWN_AUTHORITY != 0;
         match msg.label
@@ -115,6 +121,23 @@ fn main() -> !
                 reject(pwrmgr_errors::INVALID_REQUEST, ipc_buf);
             }
             _ => reject(pwrmgr_errors::UNKNOWN_OPCODE, ipc_buf),
+        }
+    }
+}
+
+/// `RecvGuard` diagnostic hook: one line at the start of a failure streak,
+/// one more before the fatal exit.
+fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
+{
+    match stage
+    {
+        ipc::recv_guard::RecvFailureStage::First =>
+        {
+            std::os::seraph::log!("ipc_recv failing (err={err}); backing off");
+        }
+        ipc::recv_guard::RecvFailureStage::Fatal =>
+        {
+            std::os::seraph::log!("ipc_recv wedged (err={err}); exiting");
         }
     }
 }

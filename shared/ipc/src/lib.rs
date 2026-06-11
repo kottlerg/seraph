@@ -1820,6 +1820,8 @@ pub mod log_labels
 
 pub mod bootstrap;
 
+pub mod recv_guard;
+
 /// Bootstrap-protocol error reply codes (creator → child).
 pub mod bootstrap_errors
 {

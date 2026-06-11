@@ -78,9 +78,16 @@ fn main() -> !
     // Block forever without exiting. Nothing sends on `service_ep`, so this
     // never returns; the process is reaped only when devmgr's #176 teardown
     // sends `DESTROY_PROCESS`. `reserved` is held live for the whole wait.
+    // The guard only changes the already-broken case: a persistent recv
+    // failure inside the teardown window dies loudly instead of spinning.
+    let mut guard = ipc::recv_guard::RecvGuard::new(|_, _| {});
     loop
     {
         // SAFETY: ipc_buf is the registered IPC buffer page.
-        let _ = unsafe { ipc::ipc_recv(service_ep, ipc_buf) };
+        match unsafe { ipc::ipc_recv(service_ep, ipc_buf) }
+        {
+            Ok(_) => guard.on_success(),
+            Err(e) => guard.on_failure(e),
+        }
     }
 }

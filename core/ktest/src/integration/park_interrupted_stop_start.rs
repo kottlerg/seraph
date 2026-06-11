@@ -89,6 +89,10 @@ const PARK_FOREVER_MS: u64 = 600_000;
 /// the watchdog, so generous slack is cheap insurance.
 const SETTLE_YIELDS: usize = 32;
 
+/// Wall-clock settle after the yields (see `drive`): on TCG hosts the yield
+/// loop can complete before the child's vCPU runs at all.
+const SETTLE_SLEEP_MS: u64 = 20;
+
 static mut CHILD_STACK: ChildStack = ChildStack::ZERO;
 
 /// A page-aligned 4 KiB IPC buffer page for the `ipc_recv` phase's child.
@@ -278,6 +282,10 @@ fn drive(
     {
         let _ = thread_yield();
     }
+    // Yields alone prove nothing under TCG, where the child's vCPU thread can
+    // be host-descheduled for milliseconds while this CPU spins through its
+    // yield loop; give the child wall-clock time to reach its park.
+    let _ = thread_sleep(SETTLE_SLEEP_MS);
     thread_stop(th).map_err(|_| "integration::park_interrupted_stop_start: thread_stop failed")?;
     thread_start(th)
         .map_err(|_| "integration::park_interrupted_stop_start: thread_start failed")?;

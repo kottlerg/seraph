@@ -717,18 +717,20 @@ unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadControlBlock)
     unsafe {
         if (*tcb).sleep_deadline != 0
         {
-            let removed = crate::sched::sleep_list_remove(tcb);
+            crate::sched::sleep_list_remove(tcb);
             (*tcb).sleep_deadline = 0;
-            // For a plain sleeper (no IPC source), the list entry is the only
-            // wake claim — removing it under SLEEP_LIST_LOCK is exclusive
-            // against the timer's pop, so the win makes this the episode's
-            // sole depositor. Timed IPC parks already stamped at their
-            // waiter-slot claim above; their entry removal is bookkeeping
-            // only. A cancel landing in sys_thread_sleep's commit→add window
-            // finds no entry and stamps nothing (the restart then reports the
-            // truncated sleep as success — pre-existing window, see the
-            // stop-vs-sleep-arming issue).
-            if removed && matches!(ipc_state, IpcThreadState::None)
+            // A plain sleeper (no IPC source) has no competing depositor at
+            // all — the timer's claim deposits nothing — so the Blocked
+            // snapshot above is claim enough: stamp unconditionally rather
+            // than gating on the remove win. This covers the commit→add
+            // window (the entry may not exist yet for sleep_list_remove to
+            // win; the sleeper's restart must still see the cancellation,
+            // not a fabricated Ok). A timer claim racing this cancel
+            // resolves to Interrupted — honest for a sleep whose deadline
+            // elapsed concurrently with a stop. Timed IPC parks already
+            // stamped at their waiter-slot claim above; their entry removal
+            // here is bookkeeping only.
+            if matches!(ipc_state, IpcThreadState::None)
             {
                 crate::sched::thread::stamp_park_deposit(
                     tcb,

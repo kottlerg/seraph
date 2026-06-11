@@ -246,6 +246,68 @@ computes the verdict host-side and kills QEMU itself.
 
 ---
 
+## Coverage tiers
+
+The matrix CI exercises is exhaustive in three dimensions and fixed in the
+rest. Coverage is tiered so the fixed dimensions still get exercised — just
+not on every push.
+
+**Dimension inventory.** Exhaustive per CI run: architecture (x86_64,
+riscv64) × profile (debug, release) × harness (ktest, svctest, usertest).
+Fixed per CI run: vCPU count (4), guest memory (512 MiB), device set
+(virtio-blk + virtio-keyboard + serial + framebuffer), filesystem (FAT).
+A device or filesystem joining the default boot set joins the canonical
+cells automatically; variants belong to the tiers below.
+
+| Tier | Where | When | Coverage |
+|---|---|---|---|
+| Canonical | `build-test.yml` | every push / PR | full arch × profile × harness at the fixed defaults |
+| Burn-in | `burnin.yml` | tag push; manual dispatch on any ref | canonical cells × 20 iterations, 2-way parallel |
+| Local host runs | developer host, commands below | REQUIRED for PRs touching SMP, per-CPU, IPI, scheduler-wakeup, boot, or memory-init paths | CPU-count and memory variations CI runners cannot reach |
+
+**Why local-only.** Hosted CI runners are ~4-vCPU TCG-only machines; a
+65-vCPU guest is a ~16× thread oversubscription and a 512-vCPU guest is
+infeasible there. High `-smp` coverage is local by design, not an
+oversight. The runs below are procedurally REQUIRED for PRs touching the
+listed paths — binding the same way the pre-merge audit agents are, with
+no CI surface.
+
+```sh
+# Boundary CPU counts, riscv64 (~70 s per passing run on a 16-core host;
+# the 600 s budget is for HANG classification):
+cargo xtask build --arch riscv64
+cargo xtask compose-bundle --harness ktest --arch riscv64
+cargo xtask run-parallel --arch riscv64 --cpus 64 --parallel 1 --runs 3 --timeout 600
+cargo xtask run-parallel --arch riscv64 --cpus 65 --parallel 1 --runs 3 --timeout 600
+
+# Boundary CPU counts, x86_64 (KVM hosts boot in seconds):
+cargo xtask build
+cargo xtask compose-bundle --harness ktest
+cargo xtask run-parallel --arch x86_64 --cpus 256 --parallel 1 --runs 3 --timeout 300
+
+# Memory variation (either arch):
+cargo xtask run-parallel --arch <arch> --cpus 4 --mem 1024 --parallel 1 --runs 1 --timeout 300
+```
+
+**Known boundaries**, established empirically (QEMU 11.0.1; tracked in the
+Issue backlog — update this list as they move):
+
+- x86_64 > 256 CPUs: kernel Phase-4 `FATAL` — the per-CPU slabs
+  (`AP_IST_STACKS`, `AP_TSS`) exceed the buddy allocator's `MAX_ORDER`
+  single-allocation cap. Independent of guest memory size; QEMU itself
+  accepts `-smp 257..512` under both KVM and TCG with the stock argv.
+- riscv64 ≥ 128 harts: boot dies in UEFI (`ConvertPages: Incompatible
+  memory types`) while loading the kernel ELF; independent of guest
+  memory size. At 256 harts under TCG the firmware produces no serial
+  output within 20 minutes.
+- Both arches, high CPU counts: intermittent silent wedge in
+  `thread::load_balancer_skips_pinned` (~1/3 of runs at 64-65 harts
+  riscv64; observed once at 256 vCPUs x86_64/KVM). A HANG at that marker
+  reproduces on master and is not evidence against the change under
+  test — re-run, and attribute to the tracking Issue.
+
+---
+
 ## Cross-harness conventions
 
 - **Completion behavior.** A harness MUST request `pwrmgr` shutdown when

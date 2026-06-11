@@ -49,13 +49,8 @@ fn main()
     let ipc_buf = info.ipc_buffer.cast::<u64>();
 
     // Endpoint kernel object costs 88 B of retype slab.
-    let Some(slab) = std::os::seraph::object_slab_acquire(88)
-    else
-    {
-        std::os::seraph::log!("no retype slab from memmgr");
-        std::process::exit(1);
-    };
-    let Ok(ep) = syscall::cap_create_endpoint(slab)
+    let Some(ep) =
+        std::os::seraph::object_slab_retype(88, |slab| syscall::cap_create_endpoint(slab).ok())
     else
     {
         std::os::seraph::log!("cap_create_endpoint failed");

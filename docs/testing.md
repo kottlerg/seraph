@@ -289,22 +289,25 @@ cargo xtask run-parallel --arch x86_64 --cpus 256 --parallel 1 --runs 3 --timeou
 cargo xtask run-parallel --arch <arch> --cpus 4 --mem 1024 --parallel 1 --runs 1 --timeout 300
 ```
 
-**Known boundaries**, established empirically (QEMU 11.0.1; tracked in the
-Issue backlog — update this list as they move):
+**Known boundaries**, established empirically (QEMU 11.0.1; update this
+list as the tracking Issues move):
 
-- x86_64 > 256 CPUs: kernel Phase-4 `FATAL` — the per-CPU slabs
-  (`AP_IST_STACKS`, `AP_TSS`) exceed the buddy allocator's `MAX_ORDER`
-  single-allocation cap. Independent of guest memory size; QEMU itself
-  accepts `-smp 257..512` under both KVM and TCG with the stock argv.
-- riscv64 ≥ 128 harts: boot dies in UEFI (`ConvertPages: Incompatible
-  memory types`) while loading the kernel ELF; independent of guest
-  memory size. At 256 harts under TCG the firmware produces no serial
-  output within 20 minutes.
-- Both arches, high CPU counts: intermittent silent wedge in
-  `thread::load_balancer_skips_pinned` (~1/3 of runs at 64-65 harts
-  riscv64; observed once at 256 vCPUs x86_64/KVM). A HANG at that marker
-  reproduces on master and is not evidence against the change under
-  test — re-run, and attribute to the tracking Issue.
+- x86_64 > 256 CPUs ([#376](https://github.com/kottlerg/seraph/issues/376)):
+  kernel Phase-4 `FATAL` — the per-CPU slabs (`AP_IST_STACKS`, `AP_TSS`)
+  exceed the buddy allocator's `MAX_ORDER` single-allocation cap.
+  Independent of guest memory size; QEMU itself accepts `-smp 257..512`
+  under both KVM and TCG with the stock argv.
+- riscv64 ≥ 128 harts ([#377](https://github.com/kottlerg/seraph/issues/377)):
+  boot dies in UEFI (`ConvertPages: Incompatible memory types`) while
+  loading the kernel ELF; independent of guest memory size. At 256 and
+  512 harts under TCG the firmware produces no serial output within 20
+  and 30 minutes respectively.
+- Both arches, high CPU counts ([#375](https://github.com/kottlerg/seraph/issues/375)):
+  intermittent silent wedge in `thread::load_balancer_skips_pinned`
+  (~1/3 of runs at 64-65 harts riscv64; observed once at 256 vCPUs
+  x86_64/KVM). A HANG at that marker reproduces on master and is not
+  evidence against the change under test — re-run, and attribute to
+  #375.
 
 ---
 

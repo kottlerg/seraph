@@ -175,9 +175,23 @@ equivalents are the `cargo xtask` commands documented there.
 
 ## Release Production
 
-See [docs/releases/README.md](releases/README.md) for per-tag release notes discipline. Each `Y` bump tag MUST have a corresponding `docs/releases/<tag>.md` file present at the tagged commit; `release.yml` aborts the publish step if the file is missing.
+See [docs/releases/README.md](releases/README.md) for per-tag release notes discipline.
 
-The maintainer publishes the draft Release manually after verifying the `burnin.yml` run for the same tag completed successfully.
+Producing a release for tag `v<X>.<Y>.<Z>`:
+
+1. Bump `[workspace.package] version` in the root `Cargo.toml` to `<X>.<Y>.<Z>`.
+2. Copy `docs/releases/TEMPLATE.md` to `docs/releases/v<X>.<Y>.<Z>.md` and fill
+   every section.
+3. Land both changes on `master` through the normal PR workflow. The tag MUST
+   point at a commit that contains them.
+4. Tag that commit and push the tag:
+   `git tag v<X>.<Y>.<Z> && git push origin v<X>.<Y>.<Z>`.
+5. The tag push triggers `release.yml` and `burnin.yml`. The `preflight` job in
+   `release.yml` aborts the run before any image is built if the workspace
+   version does not match the tag or the notes file is missing or does not
+   follow `TEMPLATE.md`'s structure.
+6. The maintainer publishes the draft Release manually after verifying the
+   `burnin.yml` run for the same tag completed successfully.
 
 ---
 

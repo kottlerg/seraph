@@ -3,6 +3,9 @@ name: burn-in
 on:
   push:
     tags: ['v*.*.*']
+  # Intentionally unguarded for branch refs (unlike release.yml): a manual
+  # dispatch stress-tests whatever ref it targets and mints no version-named
+  # artifacts. Release certification reads the tag-push run only.
   workflow_dispatch:
 
 concurrency:

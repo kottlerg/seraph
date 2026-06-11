@@ -1181,8 +1181,12 @@ unsafe fn sbi_send_ipi_to(target_hart_id: u32)
     let (hart_mask, hart_mask_base) = sbi_hart_mask(target_hart_id);
     // SAFETY: SBI call with EID=sPI, FID=0; caller guarantees the target hart
     // is online.
-    unsafe {
-        sbi_call_2(0x0073_5049, 0, hart_mask, hart_mask_base);
+    let err = unsafe { sbi_call_2(0x0073_5049, 0, hart_mask, hart_mask_base) };
+    if err != 0
+    {
+        // A refused IPI is a silent lost wakeup; dying loudly here beats a
+        // wedged hart. SEND_IPI errors are parameter-class, not transient.
+        crate::fatal("sbi_send_ipi_to: SBI SEND_IPI returned an error");
     }
 }
 

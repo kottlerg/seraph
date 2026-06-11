@@ -191,8 +191,11 @@ memmgr serves frame requests over IPC. The contract:
   pool mid-life, named by the `phys_base` memmgr reported at grant (the caller
   need not still hold the cap — it may have retyped the region and dropped its
   copy). This keeps a per-unit-of-work retype loop (e.g. ruststd's Thread
-  slab per spawn) at a bounded pool footprint. Process death triggers automatic
-  reclamation via procmgr's `PROCESS_DIED` notification to memmgr.
+  slab per spawn) at a bounded pool footprint; ruststd's pooled object-slab
+  pages likewise recycle auto-reclaimed bytes in place and release a retired
+  page's grant once every object retyped from it has died. Process death
+  triggers automatic reclamation via procmgr's `PROCESS_DIED` notification to
+  memmgr.
 
 Authoritative wire shape lives in
 [`services/memmgr/docs/ipc-interface.md`](../services/memmgr/docs/ipc-interface.md).

@@ -115,10 +115,9 @@ fn ensure_notification(slot: &AtomicU32) -> u32 {
     if existing != 0 {
         return existing;
     }
-    let Some(slab) = crate::sys::alloc::seraph::object_slab_acquire(120) else {
-        return 0;
-    };
-    let Ok(fresh) = syscall::cap_create_notification(slab) else {
+    let Some(fresh) = crate::sys::alloc::seraph::object_slab_retype(120, |slab| {
+        syscall::cap_create_notification(slab).ok()
+    }) else {
         return 0;
     };
     match slot.compare_exchange(0, fresh, AcqRel, Acquire) {

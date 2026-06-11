@@ -217,13 +217,8 @@ fn main() -> !
     // `GET_SYSTEM_ROOT_CAP`; the namespace endpoint is separated so
     // a single dispatcher thread can serve every walk without
     // contending with mount-table mutations.
-    let Some(namespace_slab) = std::os::seraph::object_slab_acquire(88)
-    else
-    {
-        std::os::seraph::log!("FATAL: cannot acquire namespace endpoint slab");
-        idle_loop();
-    };
-    let Ok(namespace_ep) = syscall::cap_create_endpoint(namespace_slab)
+    let Some(namespace_ep) =
+        std::os::seraph::object_slab_retype(88, |slab| syscall::cap_create_endpoint(slab).ok())
     else
     {
         std::os::seraph::log!("FATAL: cannot create namespace endpoint");

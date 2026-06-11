@@ -324,15 +324,13 @@ impl Pipe {
             SpscHeader::init(parent_va as *mut SpscHeader, RING_CAPACITY);
         }
 
-        let data_slab = crate::sys::alloc::seraph::object_slab_acquire(120).ok_or_else(|| {
-            // Tear down what we have so far before reporting.
-            // Allocator failure here is rare (memmgr unreachable / OOM).
-            io::Error::other("seraph pipe: object_slab_acquire (data) failed")
-        });
-        let data_notification = match data_slab.and_then(|slab| {
-            syscall::cap_create_notification(slab)
-                .map_err(|_| io::Error::other("seraph pipe: cap_create_notification (data) failed"))
-        }) {
+        // Allocator failure here is rare (memmgr unreachable / OOM); tear
+        // down what we have so far before reporting.
+        let data_notification = match crate::sys::alloc::seraph::object_slab_retype(120, |slab| {
+            syscall::cap_create_notification(slab).ok()
+        })
+        .ok_or_else(|| io::Error::other("seraph pipe: cap_create_notification (data) failed"))
+        {
             Ok(s) => s,
             Err(e) => {
                 let _ = syscall::mem_unmap(aspace, parent_va, 1);
@@ -342,13 +340,11 @@ impl Pipe {
                 return Err(e);
             }
         };
-        let space_slab = crate::sys::alloc::seraph::object_slab_acquire(120).ok_or_else(|| {
-            io::Error::other("seraph pipe: object_slab_acquire (space) failed")
-        });
-        let space_notification = match space_slab.and_then(|slab| {
-            syscall::cap_create_notification(slab)
-                .map_err(|_| io::Error::other("seraph pipe: cap_create_notification (space) failed"))
-        }) {
+        let space_notification = match crate::sys::alloc::seraph::object_slab_retype(120, |slab| {
+            syscall::cap_create_notification(slab).ok()
+        })
+        .ok_or_else(|| io::Error::other("seraph pipe: cap_create_notification (space) failed"))
+        {
             Ok(s) => s,
             Err(e) => {
                 let _ = syscall::cap_delete(data_notification);

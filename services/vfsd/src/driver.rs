@@ -64,8 +64,8 @@ pub fn spawn_fatfs_driver(
     // this; vfsd holds a SEND_GRANT copy for the FS_MOUNT BPB-validation
     // probe and for `cap_derive_badge`-ing the synthetic-root and
     // caller-root caps in `do_mount`.
-    let slab = std::os::seraph::object_slab_acquire(88)?;
-    let driver_ep = syscall::cap_create_endpoint(slab).ok()?;
+    let driver_ep =
+        std::os::seraph::object_slab_retype(88, |slab| syscall::cap_create_endpoint(slab).ok())?;
     let driver_ep_for_child = syscall::cap_derive(driver_ep, syscall::RIGHTS_ALL).ok()?;
     let driver_send = syscall::cap_derive(driver_ep, syscall::RIGHTS_SEND_GRANT).ok()?;
 

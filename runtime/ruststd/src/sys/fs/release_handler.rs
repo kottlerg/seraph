@@ -85,19 +85,10 @@ pub(super) fn ensure_started() -> io::Result<&'static ReleaseState>
     })?;
     let aspace = info.self_aspace;
 
-    let slab = crate::sys::alloc::seraph::object_slab_acquire(88).ok_or_else(|| {
-        io::Error::other("seraph fs: object_slab_acquire (release ep) failed")
-    })?;
-    let release_ep = match syscall::cap_create_endpoint(slab)
-    {
-        Ok(c) => c,
-        Err(_) =>
-        {
-            return Err(io::Error::other(
-                "seraph fs: cap_create_endpoint (release) failed",
-            ));
-        }
-    };
+    let release_ep = crate::sys::alloc::seraph::object_slab_retype(88, |slab| {
+        syscall::cap_create_endpoint(slab).ok()
+    })
+    .ok_or_else(|| io::Error::other("seraph fs: cap_create_endpoint (release) failed"))?;
 
     // get_or_init runs the closure under a mutex, so only one
     // initialiser publishes to STATE. If we lose the race, our endpoint

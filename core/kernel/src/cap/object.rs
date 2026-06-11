@@ -1626,19 +1626,13 @@ unsafe fn dealloc_object_one(
                             {
                                 // The reply_tcb CAS win is the episode claim:
                                 // the orphaned caller's resume returns
-                                // Interrupted via the disposition (the
-                                // trap-frame poke below covers non-ipc_call
-                                // blocking syscalls).
+                                // Interrupted via the disposition. Only
+                                // sys_ipc_call parks are reply-bound, so the
+                                // disposition is the whole mechanism.
                                 crate::sched::thread::stamp_park_deposit(
                                     bound,
                                     crate::sched::thread::PARK_DISPOSITION_INTERRUPTED,
                                 );
-                                let trap_frame = (*bound).trap_frame;
-                                if !trap_frame.is_null()
-                                {
-                                    (*trap_frame)
-                                        .set_return(syscall::SyscallError::Interrupted as i64);
-                                }
                             }
                             Some(bound)
                         }
@@ -2430,18 +2424,19 @@ unsafe fn dealloc_object_one(
                     {
                         let next = (*tcb).ipc_wait_next;
                         (*tcb).ipc_wait_next = None;
-                        // A queued fault sender (its handler never received) must
-                        // kill, not resume, when woken: its resume runs the fault
-                        // helper, which reads this disposition. Covers the
-                        // unbind-drops-last-ref liveness case (fault-handling.md
-                        // § Liveness rule 3).
-                        if (*tcb).in_fault_delivery
-                        {
-                            (*tcb).fault_outcome.store(
-                                crate::ipc::fault::FAULT_OUTCOME_KILL,
-                                core::sync::atomic::Ordering::Release,
-                            );
-                        }
+                        // The whole-queue detach under ep.lock is the episode
+                        // claim. A queued fault sender (its handler never
+                        // received) must kill, not resume, when woken: its
+                        // resume runs the fault helper, which reads
+                        // `fault_outcome`. A normal caller gets INTERRUPTED so
+                        // its `sys_ipc_call` resume takes the error path
+                        // instead of failing the no-deposit episode tripwire.
+                        // Covers the unbind-drops-last-ref liveness case
+                        // (fault-handling.md § Liveness rule 3).
+                        crate::sched::thread::stamp_cancelled_deposit(
+                            tcb,
+                            (*tcb).in_fault_delivery,
+                        );
                         // Claim for wake under ep.lock (#160). Cleared by
                         // enqueue_and_wake.
                         (*tcb)
@@ -2462,6 +2457,14 @@ unsafe fn dealloc_object_one(
                     {
                         let next = (*tcb).ipc_wait_next;
                         (*tcb).ipc_wait_next = None;
+                        // The queue detach under ep.lock is the episode claim:
+                        // stamp INTERRUPTED so the woken server's recv resume
+                        // returns the error instead of publishing a stale
+                        // ipc_msg into its userspace buffer as a success.
+                        crate::sched::thread::stamp_park_deposit(
+                            tcb,
+                            crate::sched::thread::PARK_DISPOSITION_INTERRUPTED,
+                        );
                         // Claim for wake under ep.lock (#160). Cleared by
                         // enqueue_and_wake.
                         (*tcb)
@@ -2593,6 +2596,16 @@ unsafe fn dealloc_object_one(
                         (*waiter)
                             .wake_in_flight
                             .store(1, core::sync::atomic::Ordering::Release);
+                        // A timed waiter is also on the sleep list; drop the
+                        // entry under sig.lock (the #117 remove-before-clear
+                        // order) so the timer can neither double-wake it nor
+                        // hijack a later unrelated park via the stale entry.
+                        // Mirrors notification_send's claim.
+                        if (*waiter).sleep_deadline != 0
+                        {
+                            crate::sched::sleep_list_remove(waiter);
+                            (*waiter).sleep_deadline = 0;
+                        }
                     }
                     sig.lock.unlock_raw(saved);
                     if !waiter.is_null()

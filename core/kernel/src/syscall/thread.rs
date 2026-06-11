@@ -269,7 +269,8 @@ pub fn sys_thread_stop(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             ThreadState::Blocked =>
             {
                 // Cancel the IPC block: unlink the thread from whatever it is
-                // blocked on and set its trap-frame return to Interrupted.
+                // blocked on and stamp the park episode Interrupted so the
+                // restarted thread's resume takes the error path.
                 cancel_ipc_block(target_tcb);
             }
 
@@ -370,8 +371,13 @@ pub fn sys_thread_stop(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
 /// Cancel the IPC block on a thread that is in `Blocked` state.
 ///
-/// Unlinks the thread from the relevant IPC queue and sets its trap-frame
-/// return value to `Interrupted` so the halted syscall returns that error.
+/// Unlinks the thread from the relevant IPC queue and, on each arm's exclusive
+/// wake-claim win, stamps the park episode [`PARK_DISPOSITION_INTERRUPTED`]
+/// (fault episodes get `FAULT_OUTCOME_KILL`) so the restarted thread's resume
+/// consumes the cancellation instead of a stale wake deposit. A lost claim
+/// means a genuine waker owns the episode; its deposit stands untouched.
+///
+/// [`PARK_DISPOSITION_INTERRUPTED`]: crate::sched::thread::PARK_DISPOSITION_INTERRUPTED
 ///
 /// # Safety
 /// `tcb` must be a valid TCB. The caller MUST NOT hold the target's `sched_lock`
@@ -389,14 +395,13 @@ unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadControlBlock)
     use crate::ipc::notification::NotificationState;
     use crate::ipc::wait_set::WaitSetState;
     use crate::sched::thread::IpcThreadState;
-    use syscall::SyscallError;
 
     // Snapshot (state, ipc_state, blocked_on_object) under the per-TCB sched_lock
     // — the authoritative serializer for the Scheduling field group. Reading the
     // pair without it would race enqueue_and_wake / commit_blocked (which write
     // these under sched_lock) and could observe a torn binding. If a concurrent
     // waker already moved the thread off Blocked, its wake stands: there is
-    // nothing to cancel, so return without touching the source or the trap frame.
+    // nothing to cancel, so return without touching the source or the episode.
     // sched_lock is released before any per-source IPC lock is taken below (lock
     // order is source IPC → sched_lock, so the two are never held together).
     // SAFETY: tcb validated by caller; fields read/written under sched_lock.
@@ -486,7 +491,18 @@ unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadControlBlock)
                 // SAFETY: blocked_on is a valid EndpointState ptr.
                 unsafe {
                     let saved = (*ep).lock.lock_raw();
-                    unlink_from_wait_queue(tcb, &mut (*ep).recv_head, &mut (*ep).recv_tail);
+                    // Claim = the recv-queue unlink under ep.lock (endpoint_call
+                    // dequeues receivers under the same lock, so winning it makes
+                    // this the episode's sole depositor). A lost unlink means a
+                    // caller already deposited into ipc_msg; that delivery stands
+                    // and the resume publishes it (fail-open).
+                    if unlink_from_wait_queue(tcb, &mut (*ep).recv_head, &mut (*ep).recv_tail)
+                    {
+                        crate::sched::thread::stamp_park_deposit(
+                            tcb,
+                            crate::sched::thread::PARK_DISPOSITION_INTERRUPTED,
+                        );
+                    }
                     (*ep).lock.unlock_raw(saved);
                 }
             }
@@ -611,9 +627,23 @@ unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadControlBlock)
                 // SAFETY: blocked_on is a valid NotificationState ptr.
                 unsafe {
                     let saved = (*sig).lock.lock_raw();
+                    // Claim = the waiter-slot clear under sig.lock (every genuine
+                    // waker claims under the same lock). A lost race means the
+                    // waker's deposit stands; the resume delivers it (fail-open).
                     if core::ptr::eq((*sig).waiter, tcb)
                     {
                         (*sig).waiter = core::ptr::null_mut();
+                        // Re-derive the observer flag like every other
+                        // waiter-clear site; leaving it set would pin all
+                        // future sends onto the slow path.
+                        (*sig).has_observer.store(
+                            u8::from(!(*sig).wait_set.is_null()),
+                            core::sync::atomic::Ordering::Relaxed,
+                        );
+                        crate::sched::thread::stamp_park_deposit(
+                            tcb,
+                            crate::sched::thread::PARK_DISPOSITION_INTERRUPTED,
+                        );
                     }
                     (*sig).lock.unlock_raw(saved);
                 }
@@ -630,9 +660,15 @@ unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadControlBlock)
                 // SAFETY: blocked_on is a valid EventQueueState ptr.
                 unsafe {
                     let saved = (*eq).lock.lock_raw();
+                    // Claim = the waiter-slot clear under eq.lock; a lost race
+                    // means a genuine wake's deposit stands (fail-open).
                     if core::ptr::eq((*eq).waiter, tcb)
                     {
                         (*eq).waiter = core::ptr::null_mut();
+                        crate::sched::thread::stamp_park_deposit(
+                            tcb,
+                            crate::sched::thread::PARK_DISPOSITION_INTERRUPTED,
+                        );
                     }
                     (*eq).lock.unlock_raw(saved);
                 }
@@ -649,9 +685,15 @@ unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadControlBlock)
                 // SAFETY: blocked_on is a valid WaitSetState ptr.
                 unsafe {
                     let saved = (*ws).lock.lock_raw();
+                    // Claim = the waiter-slot clear under ws.lock; a lost race
+                    // means a genuine wake's deposit stands (fail-open).
                     if core::ptr::eq((*ws).waiter, tcb)
                     {
                         (*ws).waiter = core::ptr::null_mut();
+                        crate::sched::thread::stamp_park_deposit(
+                            tcb,
+                            crate::sched::thread::PARK_DISPOSITION_INTERRUPTED,
+                        );
                     }
                     (*ws).lock.unlock_raw(saved);
                 }
@@ -675,8 +717,24 @@ unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadControlBlock)
     unsafe {
         if (*tcb).sleep_deadline != 0
         {
-            crate::sched::sleep_list_remove(tcb);
+            let removed = crate::sched::sleep_list_remove(tcb);
             (*tcb).sleep_deadline = 0;
+            // For a plain sleeper (no IPC source), the list entry is the only
+            // wake claim — removing it under SLEEP_LIST_LOCK is exclusive
+            // against the timer's pop, so the win makes this the episode's
+            // sole depositor. Timed IPC parks already stamped at their
+            // waiter-slot claim above; their entry removal is bookkeeping
+            // only. A cancel landing in sys_thread_sleep's commit→add window
+            // finds no entry and stamps nothing (the restart then reports the
+            // truncated sleep as success — pre-existing window, see the
+            // stop-vs-sleep-arming issue).
+            if removed && matches!(ipc_state, IpcThreadState::None)
+            {
+                crate::sched::thread::stamp_park_deposit(
+                    tcb,
+                    crate::sched::thread::PARK_DISPOSITION_INTERRUPTED,
+                );
+            }
         }
     }
 
@@ -695,21 +753,6 @@ unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadControlBlock)
             (*tcb).blocked_on_object = core::ptr::null_mut();
         }
         (*tcb).sched_lock.unlock_raw(saved);
-    }
-
-    // Write Interrupted into the stopped thread's trap-frame return slot for
-    // the non-reply blocking syscalls, whose resume continuations do not yet
-    // consume a deposited disposition. A `sys_ipc_call` caller ignores this
-    // slot: its resume re-writes the trap frame from the reply-disposition
-    // deposit stamped above (the continuation otherwise clobbers this poke —
-    // the #361 surface).
-    // SAFETY: trap_frame is set for all user threads that have been configured.
-    unsafe {
-        let trap_frame = (*tcb).trap_frame;
-        if !trap_frame.is_null()
-        {
-            (*trap_frame).set_return(SyscallError::Interrupted as i64);
-        }
     }
 }
 

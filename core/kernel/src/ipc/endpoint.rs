@@ -305,9 +305,10 @@ pub unsafe fn endpoint_call(
         let committed = unsafe {
             crate::sched::commit_blocked_under_local_lock(caller, parked_state, server.cast::<u8>())
         };
-        if !committed
+        if committed != crate::sched::ParkCommit::Committed
         {
-            // Concurrent stop won; tear down the reply linkage.
+            // Refused park (stop won, or a stray coalesced wake); tear down
+            // the reply linkage. Either refusal cancels the call.
             // SAFETY: caller / server validated; ep.lock held.
             unsafe { rollback_uncommitted_call(server, caller, parked_state) };
         }
@@ -343,9 +344,10 @@ pub unsafe fn endpoint_call(
             blocked_on,
         )
     };
-    if !committed
+    if committed != crate::sched::ParkCommit::Committed
     {
-        // Concurrent stop won; unlink from the send queue.
+        // Refused park (stop won, or a stray coalesced wake — either cancels
+        // the call); unlink from the send queue.
         // SAFETY: ep.lock held.
         unsafe {
             let _ = unlink_from_wait_queue(caller, &mut ep.send_head, &mut ep.send_tail);
@@ -359,7 +361,7 @@ pub unsafe fn endpoint_call(
                 .store(1, core::sync::atomic::Ordering::Relaxed);
         }
     }
-    if was_empty && committed && !ep.wait_set.is_null()
+    if was_empty && committed == crate::sched::ParkCommit::Committed && !ep.wait_set.is_null()
     {
         // SAFETY: wait_set validated non-null.
         unsafe { crate::ipc::wait_set::waitset_notify(ep.wait_set, ep.wait_set_member_idx) };
@@ -510,12 +512,23 @@ pub unsafe fn endpoint_recv(
             blocked_on,
         )
     };
-    if !committed
+    if committed != crate::sched::ParkCommit::Committed
     {
-        // Concurrent stop won; unlink from the recv queue.
+        // Refused park; unlink from the recv queue. ep.lock has been held
+        // across enqueue/commit/rollback, so the rollback owns the episode.
+        // A stop-won refusal stamps INTERRUPTED so the restarted server's
+        // resume reports the cancellation instead of publishing a stale
+        // ipc_msg; a coalesced-wake refusal leaves the deposit standing.
         // SAFETY: ep.lock held.
         unsafe {
             unlink_from_wait_queue(server, &mut ep.recv_head, &mut ep.recv_tail);
+            if committed == crate::sched::ParkCommit::RefusedStop
+            {
+                crate::sched::thread::stamp_park_deposit(
+                    server,
+                    crate::sched::thread::PARK_DISPOSITION_INTERRUPTED,
+                );
+            }
             (*server)
                 .context_saved
                 .store(1, core::sync::atomic::Ordering::Relaxed);

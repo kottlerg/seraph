@@ -44,6 +44,7 @@
 //! - `death_notification_late_bind.rs` — a death observer bound after the thread already died still receives the retained exit reason
 //! - `aspace_fault_notification_late_bind.rs` — an aspace terminal-fault observer bound after the space already faulted still receives the retained reason
 //! - `ipc_call_interrupted_stop_start.rs` — a client stopped while parked in `ipc_call` (send-queued and awaiting-reply) restarts to `Interrupted`, never a stale reply (#361)
+//! - `park_interrupted_stop_start.rs` — a thread stopped while parked in any non-call blocking syscall (notification/event/recv/wait-set/sleep) restarts to `Interrupted`, never a stale deposit (#363)
 
 pub mod aspace_fault_notification_late_bind;
 pub mod cap_delegation_chain;
@@ -63,6 +64,7 @@ pub mod ipc_call_interrupted_stop_start;
 pub mod irq_preserves_user_regs;
 pub mod memory_lifecycle;
 pub mod multi_caller_ipc_fifo;
+pub mod park_interrupted_stop_start;
 pub mod priority_preemption;
 pub mod retype_reclaim;
 pub mod retype_subpage_clobber;
@@ -101,6 +103,10 @@ pub fn run_all(ctx: &TestContext)
     run_integration_test!(
         "integration::ipc_call_interrupted_stop_start",
         ipc_call_interrupted_stop_start::run(ctx)
+    );
+    run_integration_test!(
+        "integration::park_interrupted_stop_start",
+        park_interrupted_stop_start::run(ctx)
     );
     run_integration_test!(
         "integration::cap_delegation_chain",

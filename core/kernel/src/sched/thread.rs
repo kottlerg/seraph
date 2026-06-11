@@ -300,6 +300,61 @@ pub unsafe fn stamp_cancelled_deposit(tcb: *mut ThreadControlBlock, is_fault: bo
     }
 }
 
+/// Open a non-call park episode: reset the disposition so a stale
+/// `INTERRUPTED` from an earlier cancelled park cannot poison this one.
+/// Must run while the thread still owns its wake fields — claimability
+/// begins only when the source-side waiter registration is published.
+///
+/// Unlike `open_call_episode`, this does NOT advance the debug episode
+/// counter: the open/stamp tripwire pairing holds only for call/fault
+/// episodes, whose every legitimate wake stamps. The non-call surfaces'
+/// genuine wakers deliberately leave the disposition `NONE` (fail-open) —
+/// only cancellation claims stamp. See core/kernel/docs/ipc-internals.md
+/// § Reply Disposition and Park Episodes.
+///
+/// # Safety
+/// `tcb` must be the current thread's valid TCB, about to register as a
+/// source waiter / sleeper.
+#[inline]
+pub unsafe fn open_park_episode(tcb: *mut ThreadControlBlock)
+{
+    // SAFETY: tcb is the running caller; the field is unclaimable until the
+    // source-side registration publishes.
+    unsafe {
+        (*tcb)
+            .park_disposition
+            .store(PARK_DISPOSITION_NONE, core::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Consume a non-call park episode's disposition on resume: `true` means a
+/// cancellation claim stamped `INTERRUPTED` and the caller must return
+/// `Interrupted` without touching the (stale) wake deposit. `NONE` means a
+/// genuine wake (or a refused park whose coalesced deposit stands) — the
+/// caller proceeds on its normal deposit-read path (fail-open). The Acquire
+/// pairs with the stamp's Release.
+///
+/// # Safety
+/// `tcb` must be the current thread's valid TCB, resuming from a non-call
+/// park.
+#[inline]
+pub unsafe fn consume_park_interrupted(tcb: *mut ThreadControlBlock) -> bool
+{
+    // SAFETY: tcb valid per caller contract.
+    let disposition = unsafe {
+        (*tcb)
+            .park_disposition
+            .load(core::sync::atomic::Ordering::Acquire)
+    };
+    // REPLY is stamped only by reply-bound (sys_ipc_call) claim sites, which
+    // are unreachable from a non-call park episode.
+    debug_assert!(
+        disposition != PARK_DISPOSITION_REPLY,
+        "non-call park resume with REPLY disposition",
+    );
+    disposition == PARK_DISPOSITION_INTERRUPTED
+}
+
 // ── ThreadControlBlock ────────────────────────────────────────────────────────
 
 /// Per-thread kernel state.

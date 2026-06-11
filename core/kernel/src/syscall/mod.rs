@@ -308,6 +308,10 @@ fn sys_thread_sleep(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         return Err(SyscallError::InvalidCapability);
     }
 
+    // Open the park episode before the thread can become Blocked-claimable.
+    // SAFETY: tcb is the running caller, not yet claimable.
+    unsafe { crate::sched::thread::open_park_episode(tcb) };
+
     // SAFETY: tcb validated non-null; sleep_deadline read by the timer path only
     // after sleep_list_add below.
     unsafe {
@@ -316,8 +320,8 @@ fn sys_thread_sleep(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // Commit Running→Blocked under the per-TCB sched_lock (the authoritative
     // serializer for the Scheduling field group). A sleep has no IPC source, so
-    // ipc_state stays None. A false return means a concurrent stop/exit won or a
-    // wake was deposited (refuse-to-park): abandon the sleep and stay runnable.
+    // ipc_state stays None. A refusal means a concurrent stop/exit won or a
+    // wake was deposited (refuse-to-park): abandon the sleep.
     // SAFETY: tcb is this CPU's current (running) thread.
     let committed = unsafe {
         crate::sched::commit_blocked_under_local_lock(
@@ -326,13 +330,34 @@ fn sys_thread_sleep(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             core::ptr::null_mut(),
         )
     };
-    if !committed
+    match committed
     {
-        // SAFETY: tcb valid; no sleep-list entry was added.
-        unsafe {
-            (*tcb).sleep_deadline = 0;
+        crate::sched::ParkCommit::Committed =>
+        {}
+        crate::sched::ParkCommit::RefusedWake =>
+        {
+            // Stray coalesced wake; no sleep-list entry was added and the
+            // thread stays runnable — report the (zero-length) sleep done.
+            // SAFETY: tcb valid.
+            unsafe {
+                (*tcb).sleep_deadline = 0;
+            }
+            return Ok(0);
         }
-        return Ok(0);
+        crate::sched::ParkCommit::RefusedStop =>
+        {
+            // A stop won against the park. Deschedule in place (the requeue
+            // denylist drops a Stopped thread); on restart the continuation
+            // completes and nothing rewrites the trap frame afterwards, so
+            // the direct error return survives to userspace.
+            // SAFETY: tcb valid; no sleep-list entry was added. schedule is
+            // called from syscall context on a valid kernel stack.
+            unsafe {
+                (*tcb).sleep_deadline = 0;
+                crate::sched::schedule(false);
+            }
+            return Err(SyscallError::Interrupted);
+        }
     }
 
     if crate::sched::sleep_list_add(tcb).is_err()
@@ -367,7 +392,14 @@ fn sys_thread_sleep(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         crate::sched::schedule(false);
     }
 
-    // Woken up by timer_tick — return success.
+    // On resume, either timer_tick's sleep-list claim woke us (success) or a
+    // cancellation claim (`cancel_ipc_block`'s sleep-list-remove win) stamped
+    // the park INTERRUPTED.
+    // SAFETY: tcb still valid after resume.
+    if unsafe { crate::sched::thread::consume_park_interrupted(tcb) }
+    {
+        return Err(SyscallError::Interrupted);
+    }
     Ok(0)
 }
 

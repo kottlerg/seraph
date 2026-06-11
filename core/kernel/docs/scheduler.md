@@ -316,8 +316,9 @@ Migration uses the shared `sched::migrate_ready_thread`-style helper
 
 ```
 pull_unpinned_ready(src, dst):
-    lock(min(src, dst).scheduler.lock)        // ascending-CPU order
-    lock(max(src, dst).scheduler.lock)
+    if !try_lock(min(src, dst).scheduler.lock): return   // ascending-CPU order
+    if !try_lock(max(src, dst).scheduler.lock):
+        unlock(min); return
     tcb = src.find_runnable(|t| t.cpu_affinity == AFFINITY_ANY)
     if tcb is None: unlock both; return
     src.remove_from_queue(tcb, tcb.priority)  // decrements CPU_LOAD[src]
@@ -329,13 +330,19 @@ pull_unpinned_ready(src, dst):
 ```
 
 Lock order follows scheduling-internals.md § Lock Hierarchy rule 4
-(ascending CPU id). Pinned threads (`cpu_affinity != AFFINITY_ANY`) are
-invisible to the `find_runnable` predicate and are never migrated.
+(ascending CPU id), and both acquisitions are **try-locks**: the pull runs
+from every CPU's timer tick with interrupts disabled, and under a
+pinned-heavy imbalance every idle CPU converges on the same victim every
+tick. Queuing there forms a FIFO ticket convoy of interrupts-off spinners
+that silences ticks, IPIs, and serial output system-wide and livelocks the
+guest under host vCPU oversubscription (#375). A contended pull is simply
+deferred to a later tick. Pinned threads (`cpu_affinity != AFFINITY_ANY`)
+are invisible to the `find_runnable` predicate and are never migrated.
 
 Hot-path cost per CPU per tick:
 - Idle CPU: one Relaxed load per remote CPU to find the heaviest victim.
 - Loaded CPU: one Relaxed increment + one Relaxed load for the victim.
-- Scheduler locks are taken only when an imbalance above
+- Scheduler locks are try-acquired, and only when an imbalance above
   `IMBALANCE_THRESHOLD` is observed.
 
 ---

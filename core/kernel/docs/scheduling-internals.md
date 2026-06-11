@@ -66,7 +66,7 @@ The following ordering MUST be observed everywhere in the kernel. Acquiring lock
 
 4. **Per-TCB-then-cross-CPU acquisition rule.** A path mutating a TCB's Scheduling field group MUST acquire `(*tcb).sched_lock` FIRST (outermost among the scheduler locks), THEN any per-CPU scheduler.lock(s); when two or more per-CPU scheduler.locks are needed simultaneously, they MUST be taken in ascending-CPU order. Live production sites: `sched::migrate_ready_thread` (used by `sys_thread_set_affinity` active migration and the periodic load balancer; `(*tcb).sched_lock` then the two CPU locks ascending), `dealloc_object(Thread)` (`(*tcb).sched_lock` then the all-CPU walk in ascending order), `sched::set_state_under_all_locks` (lifecycle state writes; same shape), and `sys_thread_set_priority` (priority writes plus locate-and-relocate of the Ready TCB's queue entry; `(*tcb).sched_lock` then the all-CPU walk in ascending order). A path MUST NEVER hold two different TCBs' `sched_lock`s at once — `schedule()`'s outgoing-then-incoming flip releases `current.sched_lock` before acquiring `next.sched_lock`.
 
-5. **`enqueue_and_wake` / `enqueue_ready_thread` acquire `(*tcb).sched_lock` then the target CPU's scheduler.lock.** They MAY be called WITH the source IPC lock still held OR after releasing it, because `source → (*tcb).sched_lock → run-queue lock` is exactly the hierarchy — there is no `source.lock → scheduler.lock` edge to violate. The single-waiter wakers (`notification_send`, `event_queue_post`, `endpoint_call`'s server-wake branch, `endpoint_reply`, and the `event_queue_drop` / `notification_dealloc` single-waiter dealloc wakes) snapshot the payload and set `wake_in_flight` under the source lock, RELEASE the source lock, then call `enqueue_and_wake` — releasing first bounds source-lock hold-time. Between that source-lock claim (waiter slot cleared, payload deposited, `wake_in_flight = 1`) and the waker's post-unlock `enqueue_and_wake`, the wake is half-complete and owned exclusively by the in-flight waker: code executing *as the claimed thread* in that window (it is still live, mid-park) has exactly one legal continuation — fall through to `schedule()`. Consuming the deposited payload and returning to user mode is forbidden; it strands the waker's run-queue link (#352). The `still_waiter` rechecks (the sleep-list arming in `sys_event_recv` / `sys_notification_wait`) respect this: they only add a timer on the not-claimed branch and fall through to `schedule()` on both branches. The `endpoint_dealloc` send/recv drain instead HOLDS `ep.lock` across the per-waiter `enqueue_and_wake` walk (a multi-waiter drain; sound precisely because the order is canonical, and `wake_in_flight = 1` per waiter blocks a racing `dealloc(waiter)` unlink from freeing a TCB mid-wake). `enqueue_and_wake` dispatches its wakeup IPI only after BOTH the run-queue lock and `(*tcb).sched_lock` are released (never IPI under `sched_lock`). `pull_unpinned_ready` is the one site that takes `(*tcb).sched_lock` via `try_lock_raw` while already holding a run-queue lock — the inverse of the canonical order; the `try` backs off on contention (a canonical holder makes it fail), so it is deadlock-free, and the source CPU's run-queue lock pins the candidate so the pointer cannot be freed under it. The wait-set cascade rule is unchanged in spirit: `wait_set_drop` releases its source/ws locks before reporting any zero-refcount source back to `dealloc_object_one`'s cascade worklist, so the source's own dealloc runs after every IPC source/ws lock has been released.
+5. **`enqueue_and_wake` / `enqueue_ready_thread` acquire `(*tcb).sched_lock` then the target CPU's scheduler.lock.** They MAY be called WITH the source IPC lock still held OR after releasing it, because `source → (*tcb).sched_lock → run-queue lock` is exactly the hierarchy — there is no `source.lock → scheduler.lock` edge to violate. The single-waiter wakers (`notification_send`, `event_queue_post`, `endpoint_call`'s server-wake branch, `endpoint_reply`, and the `event_queue_drop` / `notification_dealloc` single-waiter dealloc wakes) snapshot the payload and set `wake_in_flight` under the source lock, RELEASE the source lock, then call `enqueue_and_wake` — releasing first bounds source-lock hold-time. Between that source-lock claim (waiter slot cleared, payload deposited, `wake_in_flight = 1`) and the waker's post-unlock `enqueue_and_wake`, the wake is half-complete and owned exclusively by the in-flight waker: code executing *as the claimed thread* in that window (it is still live, mid-park) has exactly one legal continuation — fall through to `schedule()`. Consuming the deposited payload and returning to user mode is forbidden; it strands the waker's run-queue link (#352). The `still_waiter` rechecks (the sleep-list arming in `sys_event_recv` / `sys_notification_wait`) respect this: they only add a timer on the not-claimed branch and fall through to `schedule()` on both branches. The `endpoint_dealloc` send/recv drain instead HOLDS `ep.lock` across the per-waiter `enqueue_and_wake` walk (a multi-waiter drain; sound precisely because the order is canonical, and `wake_in_flight = 1` per waiter blocks a racing `dealloc(waiter)` unlink from freeing a TCB mid-wake). `enqueue_and_wake` dispatches its wakeup IPI only after BOTH the run-queue lock and `(*tcb).sched_lock` are released (never IPI under `sched_lock`). `pull_unpinned_ready` is the one site that takes `(*tcb).sched_lock` via `try_lock_raw` while already holding a run-queue lock — the inverse of the canonical order; the `try` backs off on contention (a canonical holder makes it fail), so it is deadlock-free, and the source CPU's run-queue lock pins the candidate so the pointer cannot be freed under it. Its two run-queue locks are themselves `try_lock_raw` (ascending order retained): the pull runs from every CPU's tick with interrupts disabled, and blocking there lets every idle CPU queue on one victim's lock — the FIFO ticket convoy that livelocked the guest system-wide under vCPU oversubscription (#375). The wait-set cascade rule is unchanged in spirit: `wait_set_drop` releases its source/ws locks before reporting any zero-refcount source back to `dealloc_object_one`'s cascade worklist, so the source's own dealloc runs after every IPC source/ws lock has been released.
 
 6. **Derivation tree lock is ordered after IPC object locks.** `SYS_CAP_REVOKE` MUST NOT acquire IPC object locks while holding the derivation tree write lock — see [capability-internals.md](capability-internals.md) for the deferred-cleanup pattern.
 
@@ -613,28 +613,74 @@ CPU-set state at the ceiling is carried as bitvectors
 
 ## Softlockup Watchdog
 
-Permanent kernel feature. Detects "every CPU stalled in kernel mode" — the
-failure class userspace cannot observe, because no userspace runs when every
-CPU is wedged.
+Permanent kernel feature: a suite of wedge detectors sharing one
+once-per-boot dump latch (`WATCHDOG_FIRED`, claimed via
+`watchdog_claim_dump`) and one dump body (`watchdog_dump(reason)`). The
+first detector to trip wins; one dump per boot keeps the serial log
+readable, prevents a dump storm when many CPUs observe the same stall, and
+the first dump is the uncontaminated evidence. The dump is callable from
+any CPU in interrupt context: shared structures are read benign-racily or
+via try-lock (`SLEEP_LIST_LOCK`, the registry walk) so a wedged lock holder
+cannot deadlock the dump itself.
 
-**Mechanism (`core/kernel/src/sched/mod.rs`):** `schedule()` updates a per-CPU
+Three detectors feed the latch:
+
+**1. All-idle softlockup (BSP, every tick).** Detects "every CPU stalled in
+kernel mode" — the failure class userspace cannot observe, because no
+userspace runs when every CPU is wedged. `schedule()` updates a per-CPU
 `LAST_NON_IDLE_TICK` whenever it dispatches a non-idle thread; the BSP
-`timer_tick` increments a global tick counter and, once per stall, dumps
-per-CPU TCB state (`current`, `state`, `ipc_state`, `blocked_on_object`,
-priority, preferred_cpu, idle age, non-empty mask) plus the head of
-`SLEEP_LIST` if every CPU's last dispatch is older than
-`WATCHDOG_THRESHOLD_TICKS` (~3 s at the observed ~1 ms tick). Single-shot
-via `WATCHDOG_FIRED`.
+`timer_tick` increments a global tick counter and fires if every CPU's last
+dispatch is older than `WATCHDOG_THRESHOLD_TICKS` (~3 s at the observed
+~1 ms tick).
 
-Each per-CPU line also carries a **spin-site breadcrumb**: a wedged CPU whose
-`current` is `Exited` but which never returned to the scheduler is stuck in a
-bounded protocol-spin, and the breadcrumb (`spin_site_enter`/`spin_site_exit`,
-set around each gate) names which one — `dealloc:not-current`,
-`dealloc:context-saved`, or `dealloc:wake-in-flight`. The `dealloc_object(Thread)`
-gates carried no overlong-duration warning of their own (unlike the `schedule()`
-context-saved spin and the `sys_thread_stop` drain), so a wedge there showed only
-an opaque `current = Exited` in `SYS_CAP_DELETE` (#351); the breadcrumb makes it
-explicit.
+**2. Owed-wake detector (BSP, every `DETECTOR_SCAN_INTERVAL_TICKS` ≈
+0.5 s).** Detects a single `Blocked` thread whose wake is provably owed but
+never arrived — the lost-wakeup wedge signature (#375), invisible to the
+all-idle check whenever any other thread keeps any CPU busy. Walks the
+live-thread registry reading only plain TCB scalars (no IPC-object
+dereference: unlike the dump's `blocked_on` decode, this runs on a LIVE
+system where a blocking object can be freed concurrently). Three rules:
+expired `sleep_deadline` past a 2 s grace window (a healthy sleeper is
+claimed, and its deadline cleared, within one BSP tick); `wake_in_flight`
+stuck set (a waker claimed the thread but its `enqueue_and_wake` never
+completed — normally microseconds); and `wake_pending` observed while
+`Blocked` (a coalesced wake survived the park commit that must consume it).
+The deadline rule is debounced by its grace window; the other two must
+persist across two consecutive scans (`OWED_WAKE_LAST`) so a legitimately
+mid-wake observation cannot false-positive. Indefinite waits (endpoint recv
+loops) match no rule. Each park commit stamps `park_started_tick` for the
+age checks.
+
+**3. Timer-heartbeat cross-checks.** Every CPU stamps `TICK_HEARTBEAT[cpu]`
+with `timer::current_tick()` on each `timer_tick` entry (`current_tick`
+derives from a globally consistent counter on both arches — TSC / `time`
+CSR — so cross-CPU age comparison is sound). Each AP compares the BSP's
+stamp against its own (`bsp_stall_check`): a BSP wedged interrupts-off
+kills the sleep-list waker and every BSP-hosted detector at once — total
+silence — so the AP-side check is the only detector that can name that
+state (#375). Symmetrically the BSP scans AP stamps
+(`ap_silence_check`) and fires on an AP silent past the grace window.
+Both defer to an in-flight TLB shootdown, as below.
+
+Tripwires outside the latch: the two `wake_pending` clears in `schedule()`
+(the same-thread re-mark and the dispatch flip) print a single-shot line
+(`WAKE_PENDING_CLEAR_TRIPPED`) if the flag was live when cleared — the only
+sanctioned consumer of a coalesced wake is `commit_blocked_under_local_lock`
+(§ Wake Protocol Invariants), so a live clear at either site is a lost wake
+named at its exact destruction point.
+
+Each per-CPU dump line carries a **spin-site breadcrumb**: a wedged CPU that
+never returned to the scheduler is stuck in a protocol-spin, and the
+breadcrumb (`spin_site_enter`/`spin_site_exit`, set around each gate) names
+which one — `dealloc:not-current`, `dealloc:context-saved`,
+`dealloc:wake-in-flight`, or `schedule:context-saved`. The
+`dealloc_object(Thread)` gates carried no overlong-duration warning of their
+own, so a wedge there showed only an opaque `current = Exited` in
+`SYS_CAP_DELETE` (#351); the breadcrumb makes it explicit. The `schedule()`
+context-saved dispatch barrier reports both ways: the breadcrumb names it in
+cross-CPU dumps, and its own single-shot warning fires after 100 ms of
+spinning (`CS_SPIN_WARN_US`, time-based so it is meaningful under TCG's
+variable instruction rate).
 
 The dump then walks the live-thread registry (§ Thread Registry) and prints
 every non-running registered thread. For a `Blocked` thread it shows the
@@ -650,37 +696,47 @@ save-window pin holds a `context_saved == 0` thread on its owner). The per-CPU
 — a `Blocked` waiter on an IPC object, or a `Ready` thread stranded in a wedged
 CPU's run queue — were invisible before this enumeration (#351).
 
-**Cost:** one Relaxed counter increment per BSP timer tick, one Relaxed
-store per non-idle context switch, an O(MAX_CPUS) early-exit loop per tick.
-Zero overhead when healthy.
+**Cost:** per tick per CPU, one `current_tick()` read plus one Relaxed
+heartbeat store (APs add one Relaxed load + compare for the BSP check); one
+Relaxed counter increment per BSP tick and an O(`cpu_count`) early-exit
+loop; the registry scan and AP-stamp sweep run only on the 0.5 s cadence;
+one plain stamp store per park commit. Zero dump overhead when healthy.
 
 **Catches:** all-CPUs-idle with work queued (lost-wake bugs); cross-CPU
-`context_saved` deadlock; every TCB incorrectly `Blocked`.
+`context_saved` deadlock; every TCB incorrectly `Blocked`; a single thread
+wedged `Blocked` while the system stays busy (owed-wake rules); a BSP or AP
+wedged interrupts-off while at least one other CPU still ticks (heartbeat
+cross-checks).
 
-**Does NOT catch:** a single CPU spinning IRQ-disabled while peers make
-progress (no all-CPUs notification); BSP hardlockup (BSP timer stops, counter
-stops, detector can't fire). A future hardlockup detector (NMI / always-on
-S-mode timer) would close the latter gap; tracked as issue #33.
+**Does NOT catch:** every CPU wedged interrupts-off simultaneously (no
+heartbeat check runs anywhere — the all-idle detector is also dead because
+its counter stops). Only an NMI / always-on S-mode timer hardlockup
+detector closes that; tracked as issue #33. A `Blocked` thread whose waker
+genuinely never claimed it (no deadline, no `wake_in_flight`, no
+`wake_pending`) is indistinguishable from a legitimate indefinite wait by
+TCB scalars alone and is also not flagged.
 
 **Defers to an in-flight TLB shootdown:** a synchronous shootdown holds every
 participating CPU (initiator preempt-disabled in `wait_for_ack`; peers spinning
 in `pt_lock` or their own shootdown) until all remote CPUs ack. Under heavy
 oversubscription that round-trip can exceed the threshold while still making
-progress, so the detector skips firing while `tlb_shootdown::any_pending()`
-reports any per-CPU request slot with CPUs still to ack. The shootdown's own
-escalation ladder (NMI backtrace at 0.75 s, panic at 5 s in arch
-`wait_for_ack`) is the authoritative detector for a genuinely stuck IPI; a
-non-shootdown stall re-checks on the next tick once the pending slots drain.
+progress, so the all-idle detector and both heartbeat cross-checks skip firing
+while `tlb_shootdown::any_pending()` reports any per-CPU request slot with
+CPUs still to ack. The shootdown's own escalation ladder (NMI backtrace at
+0.75 s, panic at 5 s in arch `wait_for_ack`) is the authoritative detector
+for a genuinely stuck IPI; a non-shootdown stall re-checks on the next tick
+once the pending slots drain.
 
 **Why kernel-side:** when every CPU is in kernel mode, no userspace monitor
 gets dispatched. The dump is also the only path that reads per-CPU
 scheduler state without taking a lock that the stalled CPUs themselves hold.
 
 **Bounded-spin diagnostics elsewhere:** two protocol-required spins (the
-`context_saved` Acquire spin in `schedule()`; the cross-CPU drain spin in
-`sys_thread_stop`) carry single-shot overlong-duration warnings. These are
-not the watchdog; they fire only when the spin overruns and identify the
-stuck participants. Zero overhead in healthy paths.
+`context_saved` Acquire spin in `schedule()`, which also reports a spin-site
+breadcrumb as above; the cross-CPU drain spin in `sys_thread_stop`) carry
+single-shot overlong-duration warnings. These are not the watchdog; they
+fire only when the spin overruns and identify the stuck participants. Zero
+overhead in healthy paths.
 
 ## Thread Registry
 

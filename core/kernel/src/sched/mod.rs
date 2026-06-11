@@ -1483,7 +1483,12 @@ pub fn sleep_check_wakeups()
             // enqueue_and_wake reads state under sched_lock and either links a
             // still-Blocked thread or, if dealloc already marked it Exited, aborts
             // the link — both clear wake_in_flight, releasing that gate.
-            let cpu = unsafe { (*tcb).preferred_cpu as usize };
+            //
+            // select_target_cpu, like every other wake path: it honours a hard
+            // affinity changed mid-sleep (raw preferred_cpu would not) and
+            // applies the save-window pin for a cs == 0 waker race.
+            // SAFETY: tcb valid (wake-in-flight gated).
+            let cpu = unsafe { select_target_cpu(tcb) };
             // SAFETY: tcb valid (wake-in-flight gated); enqueue_and_wake commits
             // the transition by state.
             unsafe { enqueue_and_wake(tcb, cpu) };
@@ -2611,8 +2616,10 @@ const LOAD_BALANCE_IMBALANCE_THRESHOLD: u32 = 2;
 /// Hot path cost: 1 Relaxed atomic load (own `current_load`) plus either
 /// (idle CPU) one Relaxed load per remote CPU to find the heaviest, or
 /// (loaded CPU) 1 Relaxed atomic increment (tick counter) + 1 Relaxed
-/// load (random victim). Scheduler locks are acquired only when the
-/// observed imbalance exceeds `LOAD_BALANCE_IMBALANCE_THRESHOLD`.
+/// load (random victim). Scheduler locks are attempted only when the
+/// observed imbalance exceeds `LOAD_BALANCE_IMBALANCE_THRESHOLD`, and only
+/// via try-lock — the pull path never queues on a contended lock (see
+/// `pull_unpinned_ready`, #375).
 ///
 /// Pull-based, victim-selection mode depends on local load:
 /// - **Loaded CPUs (`my_load > 0`)** sample a pseudo-random victim. This
@@ -2702,7 +2709,8 @@ unsafe fn try_pull_balance(this_cpu: usize)
 unsafe fn try_pull_balance(_this_cpu: usize) {}
 
 /// Locate the first unpinned Ready thread on `src_cpu`'s run queues and
-/// migrate it to `dst_cpu` under both scheduler locks (ascending order).
+/// migrate it to `dst_cpu` under both scheduler locks (ascending order,
+/// try-acquired — a contended pull backs off to the next balance tick).
 ///
 /// Pinned threads are invisible to this pull. Caller MUST NOT hold either
 /// scheduler lock.
@@ -2738,10 +2746,31 @@ unsafe fn pull_unpinned_ready(src_cpu: usize, dst_cpu: usize)
     // SAFETY: as above.
     let hi_sched = unsafe { scheduler_for(hi) };
 
-    // SAFETY: paired with unlock_raw below in reverse order.
-    let saved_lo = unsafe { lo_sched.lock.lock_raw() };
-    // SAFETY: ascending-CPU order satisfies lock-hierarchy rule 4.
-    let saved_hi = unsafe { hi_sched.lock.lock_raw() };
+    // Try-lock, never queue: this path runs from every CPU's timer tick with
+    // interrupts disabled, and under a pinned-heavy imbalance every idle CPU
+    // converges on the same victim every tick. A blocking acquisition here
+    // forms a FIFO ticket convoy of interrupts-off spinners — with the lock
+    // held ~always by the queue itself, ticks, IPIs, and serial output stop
+    // system-wide, and under host vCPU oversubscription the handoff latency
+    // exceeds the refill rate and the guest livelocks (#375; captured with
+    // ~55/64 harts queued on one run-queue lock). A balancer pull is optional
+    // work: on contention, back off and retry on a later tick.
+    // SAFETY: paired with unlock_raw below.
+    let Some(saved_lo) = (unsafe { lo_sched.lock.try_lock_raw() })
+    else
+    {
+        return;
+    };
+    // Ascending-CPU order (lock-hierarchy rule 4) is retained; try keeps the
+    // acquisition non-queuing.
+    // SAFETY: paired with unlock_raw below.
+    let Some(saved_hi) = (unsafe { hi_sched.lock.try_lock_raw() })
+    else
+    {
+        // SAFETY: paired with try_lock_raw above.
+        unsafe { lo_sched.lock.unlock_raw(saved_lo) };
+        return;
+    };
 
     // No skip-owner predicate is needed: after eager switch_out_save, a
     // Ready thread can never be any CPU's `fpu_owner`. Ownership is

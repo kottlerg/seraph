@@ -209,16 +209,16 @@ pub struct EnqueueBreadcrumb
 
 /// No deposit yet for the current park episode. A `sys_ipc_call` resume
 /// observing this was woken by nothing that owed it a wake (spurious).
-pub const REPLY_DISPOSITION_NONE: u8 = 0;
+pub const PARK_DISPOSITION_NONE: u8 = 0;
 
 /// A reply message was deposited into `ipc_msg` (`sys_ipc_reply`'s normal arm
 /// or `fail_reply_and_wake_caller`'s synthetic failure reply).
-pub const REPLY_DISPOSITION_REPLY: u8 = 1;
+pub const PARK_DISPOSITION_REPLY: u8 = 1;
 
 /// The call was cancelled (thread stop, server dealloc, or a stop that won
 /// against the park commit); the resume returns `Interrupted` and must not
 /// read `ipc_msg`.
-pub const REPLY_DISPOSITION_INTERRUPTED: u8 = 2;
+pub const PARK_DISPOSITION_INTERRUPTED: u8 = 2;
 
 /// Stamp `tcb`'s current park episode with `disposition`.
 ///
@@ -232,7 +232,7 @@ pub const REPLY_DISPOSITION_INTERRUPTED: u8 = 2;
 /// exclusively won (`reply_tcb` CAS/swap, send-queue unlink under `ep.lock`,
 /// or a failed park commit's binding teardown). Exactly one stamp per episode.
 #[inline]
-pub unsafe fn stamp_reply_deposit(tcb: *mut ThreadControlBlock, disposition: u8)
+pub unsafe fn stamp_park_deposit(tcb: *mut ThreadControlBlock, disposition: u8)
 {
     // SAFETY: tcb valid per caller contract; the exclusive claim makes these
     // the episode's only deposit-side writes.
@@ -245,16 +245,16 @@ pub unsafe fn stamp_reply_deposit(tcb: *mut ThreadControlBlock, disposition: u8)
             core::sync::atomic::Ordering::Relaxed,
         );
         (*tcb)
-            .reply_disposition
+            .park_disposition
             .store(disposition, core::sync::atomic::Ordering::Release);
     }
 }
 
-/// Stamp `tcb`'s current park episode without touching `reply_disposition` —
+/// Stamp `tcb`'s current park episode without touching `park_disposition` —
 /// the fault-protocol arms, whose disposition lives in `fault_outcome`.
 ///
 /// # Safety
-/// Same exclusive-claim contract as [`stamp_reply_deposit`].
+/// Same exclusive-claim contract as [`stamp_park_deposit`].
 #[inline]
 pub unsafe fn stamp_deposit_episode(tcb: *mut ThreadControlBlock)
 {
@@ -275,11 +275,11 @@ pub unsafe fn stamp_deposit_episode(tcb: *mut ThreadControlBlock)
 /// Stamp a cancelled (torn-down) park episode: a fault episode gets an
 /// explicit `FAULT_OUTCOME_KILL` plus the episode stamp (its disposition
 /// lives in `fault_outcome`); a call episode gets
-/// [`REPLY_DISPOSITION_INTERRUPTED`] so the stopped caller's restart resumes
+/// [`PARK_DISPOSITION_INTERRUPTED`] so the stopped caller's restart resumes
 /// via the error path.
 ///
 /// # Safety
-/// Same exclusive-claim contract as [`stamp_reply_deposit`].
+/// Same exclusive-claim contract as [`stamp_park_deposit`].
 #[inline]
 pub unsafe fn stamp_cancelled_deposit(tcb: *mut ThreadControlBlock, is_fault: bool)
 {
@@ -295,7 +295,7 @@ pub unsafe fn stamp_cancelled_deposit(tcb: *mut ThreadControlBlock, is_fault: bo
         }
         else
         {
-            stamp_reply_deposit(tcb, REPLY_DISPOSITION_INTERRUPTED);
+            stamp_park_deposit(tcb, PARK_DISPOSITION_INTERRUPTED);
         }
     }
 }
@@ -386,14 +386,14 @@ pub struct ThreadControlBlock
     pub reply_tcb: core::sync::atomic::AtomicPtr<ThreadControlBlock>,
 
     /// What the current `sys_ipc_call` park episode's wake deposited — one of
-    /// the `REPLY_DISPOSITION_*` values. Reset to `NONE` by `sys_ipc_call`
+    /// the `PARK_DISPOSITION_*` values. Reset to `NONE` by `sys_ipc_call`
     /// before the thread becomes claimable; stamped exactly once per episode
     /// by the wake's claim winner (`reply_tcb` CAS/swap, send-queue unlink
     /// under `ep.lock`, or a failed park commit's binding teardown); consumed
     /// by `sys_ipc_call`'s resume to pick the reply-read vs `Interrupted`
     /// return path. See core/kernel/docs/ipc-internals.md § Reply Disposition
     /// and Park Episodes.
-    pub reply_disposition: core::sync::atomic::AtomicU8,
+    pub park_disposition: core::sync::atomic::AtomicU8,
 
     /// Park-episode counter for the reply protocol's spurious-resume tripwire:
     /// incremented by `sys_ipc_call` / `fault_dispatch` at episode start.

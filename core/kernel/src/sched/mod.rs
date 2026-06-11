@@ -1079,9 +1079,9 @@ pub fn sleep_check_wakeups()
                     // timed-out call is a cancellation, so the caller's resume
                     // takes the Interrupted path, not a stale ipc_msg read.
                     unsafe {
-                        crate::sched::thread::stamp_reply_deposit(
+                        crate::sched::thread::stamp_park_deposit(
                             tcb,
-                            crate::sched::thread::REPLY_DISPOSITION_INTERRUPTED,
+                            crate::sched::thread::PARK_DISPOSITION_INTERRUPTED,
                         );
                         (*tcb).wakeup_value = 0;
                         (*tcb).timed_out = true;
@@ -1326,8 +1326,8 @@ pub fn init(cpu_count: u32) -> u32
                     ipc_state: IpcThreadState::None,
                     ipc_msg: crate::ipc::message::Message::default(),
                     reply_tcb: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
-                    reply_disposition: core::sync::atomic::AtomicU8::new(
-                        thread::REPLY_DISPOSITION_NONE,
+                    park_disposition: core::sync::atomic::AtomicU8::new(
+                        thread::PARK_DISPOSITION_NONE,
                     ),
                     #[cfg(debug_assertions)]
                     park_episode: core::sync::atomic::AtomicU32::new(0),

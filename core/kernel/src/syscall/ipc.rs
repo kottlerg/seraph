@@ -373,8 +373,8 @@ unsafe fn open_call_episode(tcb: *mut crate::sched::thread::ThreadControlBlock)
     // SAFETY: tcb is the running caller; fields are unclaimable until
     // endpoint_call publishes them.
     unsafe {
-        (*tcb).reply_disposition.store(
-            crate::sched::thread::REPLY_DISPOSITION_NONE,
+        (*tcb).park_disposition.store(
+            crate::sched::thread::PARK_DISPOSITION_NONE,
             core::sync::atomic::Ordering::Release,
         );
         #[cfg(debug_assertions)]
@@ -398,14 +398,14 @@ unsafe fn open_call_episode(tcb: *mut crate::sched::thread::ThreadControlBlock)
 /// `tcb` must be the current thread's valid TCB, resuming from a
 /// `sys_ipc_call` park episode.
 #[cfg(not(test))]
-unsafe fn consume_reply_disposition(
+unsafe fn consume_call_disposition(
     tcb: *mut crate::sched::thread::ThreadControlBlock,
 ) -> Result<(), SyscallError>
 {
     // SAFETY: tcb valid per caller contract.
     let disposition = unsafe {
         (*tcb)
-            .reply_disposition
+            .park_disposition
             .load(core::sync::atomic::Ordering::Acquire)
     };
     // Spurious-resume tripwire (#361): every legitimate wake stamps the
@@ -427,7 +427,7 @@ unsafe fn consume_reply_disposition(
             (*tcb).thread_id,
         );
     }
-    if disposition == crate::sched::thread::REPLY_DISPOSITION_REPLY
+    if disposition == crate::sched::thread::PARK_DISPOSITION_REPLY
     {
         return Ok(());
     }
@@ -435,7 +435,7 @@ unsafe fn consume_reply_disposition(
     // tripwire above has already named it). Fail closed: Interrupted is
     // strictly better than surfacing stale ipc_msg bytes as a success.
     debug_assert!(
-        disposition == crate::sched::thread::REPLY_DISPOSITION_INTERRUPTED,
+        disposition == crate::sched::thread::PARK_DISPOSITION_INTERRUPTED,
         "sys_ipc_call: resume with disposition={disposition} (no deposit)",
     );
     Err(SyscallError::Interrupted)
@@ -584,7 +584,7 @@ pub fn sys_ipc_call(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // On resume: consume the disposition the episode's wake-claim winner
     // stamped; only a REPLY deposit makes ipc_msg readable.
     // SAFETY: tcb still valid after resume.
-    unsafe { consume_reply_disposition(tcb) }?;
+    unsafe { consume_call_disposition(tcb) }?;
 
     // Write reply data and cap results to our IPC buffer. We are now running
     // in the caller's address space, so the VA is valid. Data words and cap
@@ -805,9 +805,9 @@ unsafe fn fail_reply_and_wake_caller(
     // synthetic failure reply is a real REPLY deposit the resume must consume.
     // SAFETY: caller is a valid parked TCB; enqueue_and_wake transitions to Ready.
     unsafe {
-        crate::sched::thread::stamp_reply_deposit(
+        crate::sched::thread::stamp_park_deposit(
             caller,
-            crate::sched::thread::REPLY_DISPOSITION_REPLY,
+            crate::sched::thread::PARK_DISPOSITION_REPLY,
         );
         let target_cpu = crate::sched::select_target_cpu(caller);
         crate::sched::enqueue_and_wake(caller, target_cpu);
@@ -1031,9 +1031,9 @@ pub fn sys_ipc_reply(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             // orders the ipc_msg writes before the resume's reads.
             // SAFETY: caller returned by endpoint_reply; is valid TCB.
             unsafe {
-                crate::sched::thread::stamp_reply_deposit(
+                crate::sched::thread::stamp_park_deposit(
                     caller,
-                    crate::sched::thread::REPLY_DISPOSITION_REPLY,
+                    crate::sched::thread::PARK_DISPOSITION_REPLY,
                 );
                 debug_assert!((*caller).magic == crate::sched::thread::TCB_MAGIC);
                 let target_cpu = crate::sched::select_target_cpu(caller);

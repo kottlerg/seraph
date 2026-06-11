@@ -468,9 +468,9 @@ unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadControlBlock)
                 // racing rebind chain.
                 // SAFETY: tcb valid; claim won per the comment above.
                 unsafe {
-                    crate::sched::thread::stamp_reply_deposit(
+                    crate::sched::thread::stamp_park_deposit(
                         tcb,
-                        crate::sched::thread::REPLY_DISPOSITION_INTERRUPTED,
+                        crate::sched::thread::PARK_DISPOSITION_INTERRUPTED,
                     );
                 }
             }
@@ -536,9 +536,9 @@ unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadControlBlock)
                         // the error path instead of reading a stale ipc_msg.
                         if cancelled
                         {
-                            crate::sched::thread::stamp_reply_deposit(
+                            crate::sched::thread::stamp_park_deposit(
                                 tcb,
-                                crate::sched::thread::REPLY_DISPOSITION_INTERRUPTED,
+                                crate::sched::thread::PARK_DISPOSITION_INTERRUPTED,
                             );
                             (*tcb)
                                 .wake_in_flight

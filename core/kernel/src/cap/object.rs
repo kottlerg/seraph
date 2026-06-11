@@ -1629,9 +1629,9 @@ unsafe fn dealloc_object_one(
                                 // Interrupted via the disposition (the
                                 // trap-frame poke below covers non-ipc_call
                                 // blocking syscalls).
-                                crate::sched::thread::stamp_reply_deposit(
+                                crate::sched::thread::stamp_park_deposit(
                                     bound,
-                                    crate::sched::thread::REPLY_DISPOSITION_INTERRUPTED,
+                                    crate::sched::thread::PARK_DISPOSITION_INTERRUPTED,
                                 );
                                 let trap_frame = (*bound).trap_frame;
                                 if !trap_frame.is_null()

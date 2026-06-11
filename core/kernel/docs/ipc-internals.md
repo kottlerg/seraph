@@ -152,11 +152,11 @@ size.
 ### Reply Disposition and Park Episodes
 
 Every `sys_ipc_call` park is an **episode** with exactly one deposit. The TCB
-carries `reply_disposition` (`NONE`/`REPLY`/`INTERRUPTED`); debug builds add
+carries `park_disposition` (`NONE`/`REPLY`/`INTERRUPTED`); debug builds add
 `park_episode`/`deposit_episode` counters.
 
 **Episode start (ownership window).** `sys_ipc_call` resets
-`reply_disposition = NONE` (and bumps `park_episode`) *before* `endpoint_call`
+`park_disposition = NONE` (and bumps `park_episode`) *before* `endpoint_call`
 publishes any claimable state (`reply_tcb`, or the send-queue link). Until
 that publication the parking thread exclusively owns its wake fields, so the
 reset cannot race a deposit. `fault_dispatch` bumps the episode the same way

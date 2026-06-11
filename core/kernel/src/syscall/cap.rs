@@ -956,8 +956,8 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 ipc_state: IpcThreadState::None,
                 ipc_msg: Message::default(),
                 reply_tcb: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
-                reply_disposition: core::sync::atomic::AtomicU8::new(
-                    crate::sched::thread::REPLY_DISPOSITION_NONE,
+                park_disposition: core::sync::atomic::AtomicU8::new(
+                    crate::sched::thread::PARK_DISPOSITION_NONE,
                 ),
                 #[cfg(debug_assertions)]
                 park_episode: core::sync::atomic::AtomicU32::new(0),

@@ -255,7 +255,8 @@ not on every push.
 **Dimension inventory.** Exhaustive per CI run: architecture (x86_64,
 riscv64) × profile (debug, release) × harness (ktest, svctest, usertest).
 Fixed per CI run: vCPU count (4), guest memory (512 MiB), device set
-(virtio-blk + virtio-keyboard + serial + framebuffer), filesystem (FAT).
+(virtio-blk + virtio-keyboard + serial; CI boots headless, so no
+framebuffer), filesystem (FAT).
 A device or filesystem joining the default boot set joins the canonical
 cells automatically; variants belong to the tiers below.
 

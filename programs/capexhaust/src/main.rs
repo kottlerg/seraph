@@ -15,6 +15,10 @@
 //! Termination of the derive loop is architectural: a `CSpace` holds at most
 //! 14336 slots, and each successful derive consumes one.
 //!
+//! While exhausted, the fixture also validates memmgr's failed-grant
+//! rollback: a `REQUEST_MEMORY_CAPS` whose cap-bearing reply cannot land in
+//! this `CSpace` must leave memmgr's pool `free_bytes` unchanged.
+//!
 //! Driven by `services/svctest`'s `recv_wedge` phase, which spawns this
 //! binary, waits for exit, and asserts the exit code.
 
@@ -63,7 +67,48 @@ fn main()
     {
         derived += 1;
     }
-    std::os::seraph::log!("cspace exhausted after {derived} derives; entering recv loop");
+    std::os::seraph::log!("cspace exhausted after {derived} derives");
+
+    // A cap-bearing grant into the exhausted CSpace fails at the kernel's
+    // reply-side pre-allocate: memmgr's ipc_reply errors and the caller is
+    // woken with a synthetic IPC_REPLY_TRANSFER_FAILED reply. memmgr must
+    // roll the grant back — pool free_bytes is identical before and after,
+    // or the frames stay accounted to this process and the derived caps
+    // stranded in memmgr.
+    let Some(free_before) = std::os::seraph::memmgr_pool_free_bytes()
+    else
+    {
+        std::os::seraph::log!("QUERY_POOL_STATUS failed before grant attempts");
+        std::process::exit(1);
+    };
+    for _ in 0..8
+    {
+        let msg = ipc::IpcMessage::builder(ipc::memmgr_labels::REQUEST_MEMORY_CAPS)
+            .word(0, 1)
+            .build();
+        // SAFETY: ipc_buf is the registered IPC buffer page.
+        if let Ok(reply) = unsafe { ipc::ipc_call(info.memmgr_endpoint, &msg, ipc_buf) }
+        {
+            assert_eq!(
+                reply.label,
+                syscall::IPC_REPLY_TRANSFER_FAILED,
+                "cap-bearing grant into an exhausted CSpace must fail"
+            );
+        }
+    }
+    let Some(free_after) = std::os::seraph::memmgr_pool_free_bytes()
+    else
+    {
+        std::os::seraph::log!("QUERY_POOL_STATUS failed after grant attempts");
+        std::process::exit(1);
+    };
+    assert_eq!(
+        free_before, free_after,
+        "memmgr must roll back grants whose reply failed"
+    );
+    std::os::seraph::log!(
+        "failed-grant rollback verified (free_bytes unchanged); entering recv loop"
+    );
 
     let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);
     loop

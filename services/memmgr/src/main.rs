@@ -1124,6 +1124,13 @@ fn handle_request_memory_caps(req: &IpcMessage, ipc_buf: *mut u64)
             .push_frame(outer, pages, phys, FRAME_VA_UNMAPPED, pool)
             .is_err()
         {
+            // Entries before `i` already have frame nodes on the record;
+            // their outers go back to the pool below, so the nodes must come
+            // off too or process-death reclaim would double-push the caps.
+            for _ in 0..i
+            {
+                record.pop_frame();
+            }
             rollback_selection(pool, &granted, granted_count, &inner, i);
             reply_label(ipc_buf, memmgr_errors::QUOTA);
             return;
@@ -1131,9 +1138,12 @@ fn handle_request_memory_caps(req: &IpcMessage, ipc_buf: *mut u64)
         let Some(d) = derive_for_caller(outer)
         else
         {
+            // Entries 0..=i have frame nodes pushed (this one included).
+            for _ in 0..=i
+            {
+                record.pop_frame();
+            }
             rollback_selection(pool, &granted, granted_count, &inner, i);
-            // Drop the just-pushed frame node too.
-            record.pop_frame();
             reply_label(ipc_buf, memmgr_errors::OUT_OF_MEMORY_BEST_EFFORT);
             return;
         };
@@ -1157,7 +1167,20 @@ fn handle_request_memory_caps(req: &IpcMessage, ipc_buf: *mut u64)
     }
     let reply = builder.build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
-    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+    if unsafe { ipc::ipc_reply(&reply, ipc_buf) }.is_err()
+    {
+        // The reply did not reach the caller (caller gone, or its CSpace
+        // could not accept the cap transfer — the kernel woke it with a
+        // synthetic failure instead). The inner derivations were not moved
+        // and the grant never landed: undo it entirely, or the inners stay
+        // stranded in memmgr's CSpace and the frames stay accounted to a
+        // caller that never received them.
+        for _ in 0..granted_count
+        {
+            record.pop_frame();
+        }
+        rollback_selection(pool, &granted, granted_count, &inner, granted_count);
+    }
 }
 
 fn handle_release_memory_caps(req: &IpcMessage, ipc_buf: *mut u64)

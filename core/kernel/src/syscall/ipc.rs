@@ -362,7 +362,7 @@ unsafe fn deliver_call_caps(
 /// still owns its wake fields — claimability begins only when
 /// `endpoint_call` publishes `reply_tcb` or links the caller on the send
 /// queue, so no deposit site can race these stores. See
-/// core/kernel/docs/ipc-internals.md § Reply Disposition and Park Episodes.
+/// core/kernel/docs/ipc-internals.md § Park Dispositions and Episodes.
 ///
 /// # Safety
 /// `tcb` must be the current thread's valid TCB, about to enter

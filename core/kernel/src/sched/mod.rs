@@ -1079,9 +1079,9 @@ pub fn sleep_check_wakeups()
                     // timed-out call is a cancellation, so the caller's resume
                     // takes the Interrupted path, not a stale ipc_msg read.
                     unsafe {
-                        crate::sched::thread::stamp_reply_deposit(
+                        crate::sched::thread::stamp_park_deposit(
                             tcb,
-                            crate::sched::thread::REPLY_DISPOSITION_INTERRUPTED,
+                            crate::sched::thread::PARK_DISPOSITION_INTERRUPTED,
                         );
                         (*tcb).wakeup_value = 0;
                         (*tcb).timed_out = true;
@@ -1326,8 +1326,8 @@ pub fn init(cpu_count: u32) -> u32
                     ipc_state: IpcThreadState::None,
                     ipc_msg: crate::ipc::message::Message::default(),
                     reply_tcb: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
-                    reply_disposition: core::sync::atomic::AtomicU8::new(
-                        thread::REPLY_DISPOSITION_NONE,
+                    park_disposition: core::sync::atomic::AtomicU8::new(
+                        thread::PARK_DISPOSITION_NONE,
                     ),
                     #[cfg(debug_assertions)]
                     park_episode: core::sync::atomic::AtomicU32::new(0),
@@ -1693,31 +1693,51 @@ pub unsafe fn set_state_under_all_locks(
     None
 }
 
+/// Outcome of [`commit_blocked_under_local_lock`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ParkCommit
+{
+    /// The thread is now `Blocked`; the caller must reach `schedule()`.
+    Committed,
+    /// A waker raced ahead and coalesced its wake (`wake_pending`); the park
+    /// is refused and the deposited payload must reach the resume path
+    /// untouched.
+    RefusedWake,
+    /// A concurrent stop/exit already moved the thread off `Running`/`Ready`;
+    /// the park is refused and the caller's rollback owns the episode (no
+    /// waker ever saw the registration).
+    RefusedStop,
+}
+
 /// Commit `Running|Ready → Blocked` under the TCB's `sched_lock` (the
 /// authoritative serializer for its Scheduling field group).
 ///
-/// Returns `false` in two cases, both handled identically by the caller's
-/// rollback because the post-`schedule()` outcome is state-driven (one path
-/// serves both — see docs/sched-ipc-redesign.md §2.1):
-/// - a concurrent stop/exit already won (`state` is `Stopped`/`Exited`/…); the
-///   thread is then drained by `schedule()`;
-/// - `wake_pending` is set: a waker raced ahead, found this thread still live,
-///   coalesced its link, and recorded the wake under `sched_lock`. Parking now
-///   would lose it, so we REFUSE to park (consume the flag, leave the thread
-///   `Running`); `schedule()` requeues the runnable thread, and on resume the
-///   syscall consumes the payload the waker already deposited.
+/// Refuses to park in two cases, distinguished so a rollback can stamp the
+/// cancelled episode without clobbering a genuine deposit (the
+/// post-`schedule()` outcome remains state-driven — see
+/// docs/sched-ipc-redesign.md §2.1):
+/// - [`ParkCommit::RefusedStop`]: a concurrent stop/exit already won (`state`
+///   is `Stopped`/`Exited`/…); the thread is then drained by `schedule()`.
+/// - [`ParkCommit::RefusedWake`]: `wake_pending` is set — a waker raced ahead,
+///   found this thread still live, coalesced its link, and recorded the wake
+///   under `sched_lock`. Parking now would lose it, so we REFUSE to park
+///   (consume the flag, leave the thread `Running`); `schedule()` requeues the
+///   runnable thread, and on resume the syscall consumes the payload the waker
+///   already deposited.
 ///
-/// On `false` the caller MUST roll back its source-side waiter registration and
-/// MUST NOT clobber any deposited `wakeup_value`/`ipc_msg`.
+/// On either refusal the caller MUST roll back its source-side waiter
+/// registration; on `RefusedWake` it MUST NOT clobber any deposited
+/// `wakeup_value`/`ipc_msg`.
 ///
-/// After this function returns `true`, a caller whose source-side registration
-/// stands MUST reach `schedule()` before returning to user mode or attempting
-/// another commit — the wake deposited against the park is consumed only by a
-/// run-queue dequeue inside `schedule()`; any other exit leaks the waker's
-/// link (#352). The only sanctioned exception is a parker that un-commits
-/// under `sched_lock` while provably untargetable by any waker —
-/// `sys_thread_sleep`'s sleep-list-capacity rollback, which registered with no
-/// wake source. See docs/scheduling-internals.md § Lock Hierarchy.
+/// After this function returns [`ParkCommit::Committed`], a caller whose
+/// source-side registration stands MUST reach `schedule()` before returning
+/// to user mode or attempting another commit — the wake deposited against the
+/// park is consumed only by a run-queue dequeue inside `schedule()`; any other
+/// exit leaks the waker's link (#352). The only sanctioned exception is a
+/// parker that un-commits under `sched_lock` while provably untargetable by
+/// any waker — `sys_thread_sleep`'s sleep-list-capacity rollback, which
+/// registered with no wake source. See docs/scheduling-internals.md § Lock
+/// Hierarchy.
 ///
 /// # Safety
 /// `tcb` must point to the current CPU's running thread.
@@ -1726,7 +1746,7 @@ pub unsafe fn commit_blocked_under_local_lock(
     tcb: *mut ThreadControlBlock,
     ipc: thread::IpcThreadState,
     blocked_on: *mut u8,
-) -> bool
+) -> ParkCommit
 {
     // SAFETY: tcb validated by caller; `sched_lock` is the authoritative
     // serializer for the Scheduling field group. lock_raw paired below.
@@ -1746,7 +1766,7 @@ pub unsafe fn commit_blocked_under_local_lock(
                     // consume it so the resume path delivers the deposited
                     // payload (resume model is DEPOSIT — see sched-ipc-redesign.md §2.1).
                     (*tcb).wake_pending = false;
-                    false
+                    ParkCommit::RefusedWake
                 }
                 else
                 {
@@ -1788,14 +1808,14 @@ pub unsafe fn commit_blocked_under_local_lock(
                     (*tcb)
                         .context_saved
                         .store(0, core::sync::atomic::Ordering::Relaxed);
-                    true
+                    ParkCommit::Committed
                 }
             }
         }
         thread::ThreadState::Stopped
         | thread::ThreadState::Exited
         | thread::ThreadState::Created
-        | thread::ThreadState::Blocked => false,
+        | thread::ThreadState::Blocked => ParkCommit::RefusedStop,
     };
 
     // SAFETY: paired with lock_raw above.
@@ -1810,9 +1830,9 @@ pub unsafe fn commit_blocked_under_local_lock(
     _tcb: *mut ThreadControlBlock,
     _ipc: thread::IpcThreadState,
     _blocked_on: *mut u8,
-) -> bool
+) -> ParkCommit
 {
-    true
+    ParkCommit::Committed
 }
 
 /// Commit a `BlockedOnSend → BlockedOnReply`/`BlockedOnFault` reply rebind for a

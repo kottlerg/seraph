@@ -362,7 +362,7 @@ unsafe fn deliver_call_caps(
 /// still owns its wake fields — claimability begins only when
 /// `endpoint_call` publishes `reply_tcb` or links the caller on the send
 /// queue, so no deposit site can race these stores. See
-/// core/kernel/docs/ipc-internals.md § Reply Disposition and Park Episodes.
+/// core/kernel/docs/ipc-internals.md § Park Dispositions and Episodes.
 ///
 /// # Safety
 /// `tcb` must be the current thread's valid TCB, about to enter
@@ -373,10 +373,7 @@ unsafe fn open_call_episode(tcb: *mut crate::sched::thread::ThreadControlBlock)
     // SAFETY: tcb is the running caller; fields are unclaimable until
     // endpoint_call publishes them.
     unsafe {
-        (*tcb).reply_disposition.store(
-            crate::sched::thread::REPLY_DISPOSITION_NONE,
-            core::sync::atomic::Ordering::Release,
-        );
+        crate::sched::thread::open_park_episode(tcb);
         #[cfg(debug_assertions)]
         (*tcb)
             .park_episode
@@ -398,14 +395,14 @@ unsafe fn open_call_episode(tcb: *mut crate::sched::thread::ThreadControlBlock)
 /// `tcb` must be the current thread's valid TCB, resuming from a
 /// `sys_ipc_call` park episode.
 #[cfg(not(test))]
-unsafe fn consume_reply_disposition(
+unsafe fn consume_call_disposition(
     tcb: *mut crate::sched::thread::ThreadControlBlock,
 ) -> Result<(), SyscallError>
 {
     // SAFETY: tcb valid per caller contract.
     let disposition = unsafe {
         (*tcb)
-            .reply_disposition
+            .park_disposition
             .load(core::sync::atomic::Ordering::Acquire)
     };
     // Spurious-resume tripwire (#361): every legitimate wake stamps the
@@ -427,7 +424,7 @@ unsafe fn consume_reply_disposition(
             (*tcb).thread_id,
         );
     }
-    if disposition == crate::sched::thread::REPLY_DISPOSITION_REPLY
+    if disposition == crate::sched::thread::PARK_DISPOSITION_REPLY
     {
         return Ok(());
     }
@@ -435,7 +432,7 @@ unsafe fn consume_reply_disposition(
     // tripwire above has already named it). Fail closed: Interrupted is
     // strictly better than surfacing stale ipc_msg bytes as a success.
     debug_assert!(
-        disposition == crate::sched::thread::REPLY_DISPOSITION_INTERRUPTED,
+        disposition == crate::sched::thread::PARK_DISPOSITION_INTERRUPTED,
         "sys_ipc_call: resume with disposition={disposition} (no deposit)",
     );
     Err(SyscallError::Interrupted)
@@ -584,7 +581,7 @@ pub fn sys_ipc_call(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // On resume: consume the disposition the episode's wake-claim winner
     // stamped; only a REPLY deposit makes ipc_msg readable.
     // SAFETY: tcb still valid after resume.
-    unsafe { consume_reply_disposition(tcb) }?;
+    unsafe { consume_call_disposition(tcb) }?;
 
     // Write reply data and cap results to our IPC buffer. We are now running
     // in the caller's address space, so the VA is valid. Data words and cap
@@ -674,6 +671,10 @@ pub fn sys_ipc_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     }
     .map_err(|_| SyscallError::OutOfMemory)?;
 
+    // Open the park episode before the recv-queue link can publish.
+    // SAFETY: tcb is the running caller, not yet claimable.
+    unsafe { crate::sched::thread::open_park_episode(tcb) };
+
     // SAFETY: ep_state extracted from validated Endpoint object; scheduler lock not held.
     let result = unsafe { crate::ipc::endpoint::endpoint_recv(ep_state, tcb) };
 
@@ -732,6 +733,17 @@ pub fn sys_ipc_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // SAFETY: scheduler initialized; called from syscall context.
     unsafe {
         crate::sched::schedule(false);
+    }
+
+    // A cancellation claim (stop while parked, endpoint dealloc's recv-queue
+    // drain, or a stop that won against the park commit) stamped the episode
+    // INTERRUPTED; consume it before the ipc_msg read — publishing the stale
+    // message into the server's userspace buffer as a success was the #363
+    // recv surface.
+    // SAFETY: tcb still valid after resume.
+    if unsafe { crate::sched::thread::consume_park_interrupted(tcb) }
+    {
+        return Err(SyscallError::Interrupted);
     }
 
     // On resume, deliver the message the waking caller copied into ipc_msg.
@@ -805,9 +817,9 @@ unsafe fn fail_reply_and_wake_caller(
     // synthetic failure reply is a real REPLY deposit the resume must consume.
     // SAFETY: caller is a valid parked TCB; enqueue_and_wake transitions to Ready.
     unsafe {
-        crate::sched::thread::stamp_reply_deposit(
+        crate::sched::thread::stamp_park_deposit(
             caller,
-            crate::sched::thread::REPLY_DISPOSITION_REPLY,
+            crate::sched::thread::PARK_DISPOSITION_REPLY,
         );
         let target_cpu = crate::sched::select_target_cpu(caller);
         crate::sched::enqueue_and_wake(caller, target_cpu);
@@ -1031,9 +1043,9 @@ pub fn sys_ipc_reply(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             // orders the ipc_msg writes before the resume's reads.
             // SAFETY: caller returned by endpoint_reply; is valid TCB.
             unsafe {
-                crate::sched::thread::stamp_reply_deposit(
+                crate::sched::thread::stamp_park_deposit(
                     caller,
-                    crate::sched::thread::REPLY_DISPOSITION_REPLY,
+                    crate::sched::thread::PARK_DISPOSITION_REPLY,
                 );
                 debug_assert!((*caller).magic == crate::sched::thread::TCB_MAGIC);
                 let target_cpu = crate::sched::select_target_cpu(caller);
@@ -1147,6 +1159,10 @@ pub fn sys_notification_wait(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         (*sig_obj).state
     };
 
+    // Open the park episode before the waiter slot can publish.
+    // SAFETY: tcb is the running caller, not yet claimable.
+    unsafe { crate::sched::thread::open_park_episode(tcb) };
+
     // SAFETY: sig_state extracted from validated Notification object.
     let result = unsafe { crate::ipc::notification::notification_wait(sig_state, tcb) };
 
@@ -1200,6 +1216,19 @@ pub fn sys_notification_wait(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // SAFETY: scheduler initialized; called from syscall context.
     unsafe {
         crate::sched::schedule(false);
+    }
+
+    // A cancellation claim (stop while parked, or a stop that won against the
+    // park commit) stamped the episode INTERRUPTED; consume it before reading
+    // the deposit — the resume otherwise surfaces a stale 0-bits success.
+    // SAFETY: tcb still valid after resume.
+    if unsafe { crate::sched::thread::consume_park_interrupted(tcb) }
+    {
+        // SAFETY: tcb validated above.
+        unsafe {
+            (*tcb).wakeup_value = 0;
+        }
+        return Err(SyscallError::Interrupted);
     }
 
     // On resume, either `notification_send` stored delivered bits in wakeup_value,
@@ -1341,6 +1370,10 @@ pub fn sys_event_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         };
     }
 
+    // Open the park episode before the waiter slot can publish.
+    // SAFETY: tcb is the running caller, not yet claimable.
+    unsafe { crate::sched::thread::open_park_episode(tcb) };
+
     // SAFETY: eq_state extracted from validated EventQueue object.
     let result = unsafe { crate::ipc::event_queue::event_queue_recv(eq_state, tcb) };
 
@@ -1395,6 +1428,20 @@ pub fn sys_event_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // SAFETY: scheduler initialized; called from syscall context.
     unsafe {
         crate::sched::schedule(false);
+    }
+
+    // A cancellation claim stamped the episode INTERRUPTED; consume it before
+    // the deposit read so a cancelled timed wait returns Interrupted, never a
+    // stale payload or a fabricated WouldBlock.
+    // SAFETY: tcb still valid after resume.
+    if unsafe { crate::sched::thread::consume_park_interrupted(tcb) }
+    {
+        // SAFETY: tcb validated above.
+        unsafe {
+            (*tcb).wakeup_value = 0;
+            (*tcb).timed_out = false;
+        }
+        return Err(SyscallError::Interrupted);
     }
 
     // On resume, exactly one of two outcomes: `event_queue_post` stored a
@@ -1890,6 +1937,10 @@ pub fn sys_wait_set_wait(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         (*ws_obj).state
     };
 
+    // Open the park episode before the waiter slot can publish.
+    // SAFETY: tcb is the running caller, not yet claimable.
+    unsafe { crate::sched::thread::open_park_episode(tcb) };
+
     // SAFETY: ws_state valid; scheduler lock not held.
     let result = unsafe { crate::ipc::wait_set::waitset_wait(ws_state, tcb) };
 
@@ -1904,6 +1955,18 @@ pub fn sys_wait_set_wait(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // SAFETY: scheduler initialized; called from syscall context.
     unsafe {
         crate::sched::schedule(false);
+    }
+
+    // A cancellation claim stamped the episode INTERRUPTED; consume it before
+    // the deposit read so a cancelled wait cannot surface a stale badge.
+    // SAFETY: tcb still valid after resume.
+    if unsafe { crate::sched::thread::consume_park_interrupted(tcb) }
+    {
+        // SAFETY: tcb validated above.
+        unsafe {
+            (*tcb).wakeup_value = 0;
+        }
+        return Err(SyscallError::Interrupted);
     }
 
     // On resume, waitset_notify stored the badge in wakeup_value.

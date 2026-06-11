@@ -329,7 +329,11 @@ mod tests
         // Source rootfs/: one default recipe and one data file.
         let rootfs_services = root.join("rootfs/config/svcmgr/services");
         fs::create_dir_all(&rootfs_services).unwrap();
-        fs::write(rootfs_services.join("procmgr.svc"), b"binary = /services/procmgr\n").unwrap();
+        fs::write(
+            rootfs_services.join("procmgr.svc"),
+            b"binary = /services/procmgr\n",
+        )
+        .unwrap();
         fs::create_dir_all(root.join("rootfs/data")).unwrap();
         fs::write(root.join("rootfs/data/test.txt"), b"marker").unwrap();
 
@@ -337,7 +341,11 @@ mod tests
         // source) and a build-owned binary outside the managed roots.
         let sys_services = sysroot.join("config/svcmgr/services");
         fs::create_dir_all(&sys_services).unwrap();
-        fs::write(sys_services.join("stale.svc"), b"binary = /services/stale\n").unwrap();
+        fs::write(
+            sys_services.join("stale.svc"),
+            b"binary = /services/stale\n",
+        )
+        .unwrap();
         let bin_dir = sysroot.join("services");
         fs::create_dir_all(&bin_dir).unwrap();
         fs::write(bin_dir.join("procmgr"), b"\x7fELF").unwrap();
@@ -349,12 +357,30 @@ mod tests
         };
         install_rootfs(&ctx).unwrap();
 
-        assert!(sys_services.join("procmgr.svc").exists(), "rootfs recipe mirrored");
-        assert!(sysroot.join("data/test.txt").exists(), "rootfs data file mirrored");
-        assert!(sysroot.join("data/svctest/large.bin").exists(), "large fixture kept");
-        assert!(sysroot.join("data/svctest/bench.bin").exists(), "bench fixture kept");
-        assert!(!sys_services.join("stale.svc").exists(), "stale recipe pruned");
-        assert!(bin_dir.join("procmgr").exists(), "build-owned binary untouched");
+        assert!(
+            sys_services.join("procmgr.svc").exists(),
+            "rootfs recipe mirrored"
+        );
+        assert!(
+            sysroot.join("data/test.txt").exists(),
+            "rootfs data file mirrored"
+        );
+        assert!(
+            sysroot.join("data/svctest/large.bin").exists(),
+            "large fixture kept"
+        );
+        assert!(
+            sysroot.join("data/svctest/bench.bin").exists(),
+            "bench fixture kept"
+        );
+        assert!(
+            !sys_services.join("stale.svc").exists(),
+            "stale recipe pruned"
+        );
+        assert!(
+            bin_dir.join("procmgr").exists(),
+            "build-owned binary untouched"
+        );
 
         fs::remove_dir_all(&base).unwrap();
     }

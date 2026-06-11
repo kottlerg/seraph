@@ -205,20 +205,23 @@ pub struct EnqueueBreadcrumb
     pub preferred_cpu: u32,
 }
 
-// ── Reply disposition ─────────────────────────────────────────────────────────
+// ── Park disposition ──────────────────────────────────────────────────────────
 
 /// No deposit yet for the current park episode. A `sys_ipc_call` resume
-/// observing this was woken by nothing that owed it a wake (spurious).
-pub const REPLY_DISPOSITION_NONE: u8 = 0;
+/// observing this was woken by nothing that owed it a wake (spurious,
+/// fail-closed); a non-call park resume observing this took a genuine wake
+/// whose deposit it reads normally (fail-open).
+pub const PARK_DISPOSITION_NONE: u8 = 0;
 
 /// A reply message was deposited into `ipc_msg` (`sys_ipc_reply`'s normal arm
-/// or `fail_reply_and_wake_caller`'s synthetic failure reply).
-pub const REPLY_DISPOSITION_REPLY: u8 = 1;
+/// or `fail_reply_and_wake_caller`'s synthetic failure reply). Stamped only
+/// for reply-bound (`sys_ipc_call`) episodes.
+pub const PARK_DISPOSITION_REPLY: u8 = 1;
 
-/// The call was cancelled (thread stop, server dealloc, or a stop that won
-/// against the park commit); the resume returns `Interrupted` and must not
-/// read `ipc_msg`.
-pub const REPLY_DISPOSITION_INTERRUPTED: u8 = 2;
+/// The park was cancelled (thread stop, source/server dealloc, or a stop that
+/// won against the park commit); the resume returns `Interrupted` and must
+/// not read the wake deposit (`ipc_msg`/`wakeup_value`/`timed_out`).
+pub const PARK_DISPOSITION_INTERRUPTED: u8 = 2;
 
 /// Stamp `tcb`'s current park episode with `disposition`.
 ///
@@ -229,10 +232,12 @@ pub const REPLY_DISPOSITION_INTERRUPTED: u8 = 2;
 ///
 /// # Safety
 /// `tcb` must be a valid TCB whose park-episode wake claim the caller has
-/// exclusively won (`reply_tcb` CAS/swap, send-queue unlink under `ep.lock`,
-/// or a failed park commit's binding teardown). Exactly one stamp per episode.
+/// exclusively won (`reply_tcb` CAS/swap, a wait-queue unlink or waiter-slot
+/// clear under the source lock, a plain sleeper's sleep-list-remove win, or a
+/// failed park commit's binding teardown under the continuously-held source
+/// lock). Exactly one stamp per episode.
 #[inline]
-pub unsafe fn stamp_reply_deposit(tcb: *mut ThreadControlBlock, disposition: u8)
+pub unsafe fn stamp_park_deposit(tcb: *mut ThreadControlBlock, disposition: u8)
 {
     // SAFETY: tcb valid per caller contract; the exclusive claim makes these
     // the episode's only deposit-side writes.
@@ -245,16 +250,16 @@ pub unsafe fn stamp_reply_deposit(tcb: *mut ThreadControlBlock, disposition: u8)
             core::sync::atomic::Ordering::Relaxed,
         );
         (*tcb)
-            .reply_disposition
+            .park_disposition
             .store(disposition, core::sync::atomic::Ordering::Release);
     }
 }
 
-/// Stamp `tcb`'s current park episode without touching `reply_disposition` —
+/// Stamp `tcb`'s current park episode without touching `park_disposition` —
 /// the fault-protocol arms, whose disposition lives in `fault_outcome`.
 ///
 /// # Safety
-/// Same exclusive-claim contract as [`stamp_reply_deposit`].
+/// Same exclusive-claim contract as [`stamp_park_deposit`].
 #[inline]
 pub unsafe fn stamp_deposit_episode(tcb: *mut ThreadControlBlock)
 {
@@ -275,11 +280,11 @@ pub unsafe fn stamp_deposit_episode(tcb: *mut ThreadControlBlock)
 /// Stamp a cancelled (torn-down) park episode: a fault episode gets an
 /// explicit `FAULT_OUTCOME_KILL` plus the episode stamp (its disposition
 /// lives in `fault_outcome`); a call episode gets
-/// [`REPLY_DISPOSITION_INTERRUPTED`] so the stopped caller's restart resumes
+/// [`PARK_DISPOSITION_INTERRUPTED`] so the stopped caller's restart resumes
 /// via the error path.
 ///
 /// # Safety
-/// Same exclusive-claim contract as [`stamp_reply_deposit`].
+/// Same exclusive-claim contract as [`stamp_park_deposit`].
 #[inline]
 pub unsafe fn stamp_cancelled_deposit(tcb: *mut ThreadControlBlock, is_fault: bool)
 {
@@ -295,9 +300,64 @@ pub unsafe fn stamp_cancelled_deposit(tcb: *mut ThreadControlBlock, is_fault: bo
         }
         else
         {
-            stamp_reply_deposit(tcb, REPLY_DISPOSITION_INTERRUPTED);
+            stamp_park_deposit(tcb, PARK_DISPOSITION_INTERRUPTED);
         }
     }
+}
+
+/// Open a non-call park episode: reset the disposition so a stale
+/// `INTERRUPTED` from an earlier cancelled park cannot poison this one.
+/// Must run while the thread still owns its wake fields — claimability
+/// begins only when the source-side waiter registration is published.
+///
+/// Unlike `open_call_episode`, this does NOT advance the debug episode
+/// counter: the open/stamp tripwire pairing holds only for call/fault
+/// episodes, whose every legitimate wake stamps. The non-call surfaces'
+/// genuine wakers deliberately leave the disposition `NONE` (fail-open) —
+/// only cancellation claims stamp. See core/kernel/docs/ipc-internals.md
+/// § Park Dispositions and Episodes.
+///
+/// # Safety
+/// `tcb` must be the current thread's valid TCB, about to register as a
+/// source waiter / sleeper.
+#[inline]
+pub unsafe fn open_park_episode(tcb: *mut ThreadControlBlock)
+{
+    // SAFETY: tcb is the running caller; the field is unclaimable until the
+    // source-side registration publishes.
+    unsafe {
+        (*tcb)
+            .park_disposition
+            .store(PARK_DISPOSITION_NONE, core::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Consume a non-call park episode's disposition on resume: `true` means a
+/// cancellation claim stamped `INTERRUPTED` and the caller must return
+/// `Interrupted` without touching the (stale) wake deposit. `NONE` means a
+/// genuine wake (or a refused park whose coalesced deposit stands) — the
+/// caller proceeds on its normal deposit-read path (fail-open). The Acquire
+/// pairs with the stamp's Release.
+///
+/// # Safety
+/// `tcb` must be the current thread's valid TCB, resuming from a non-call
+/// park.
+#[inline]
+pub unsafe fn consume_park_interrupted(tcb: *mut ThreadControlBlock) -> bool
+{
+    // SAFETY: tcb valid per caller contract.
+    let disposition = unsafe {
+        (*tcb)
+            .park_disposition
+            .load(core::sync::atomic::Ordering::Acquire)
+    };
+    // REPLY is stamped only by reply-bound (sys_ipc_call) claim sites, which
+    // are unreachable from a non-call park episode.
+    debug_assert!(
+        disposition != PARK_DISPOSITION_REPLY,
+        "non-call park resume with REPLY disposition",
+    );
+    disposition == PARK_DISPOSITION_INTERRUPTED
 }
 
 // ── ThreadControlBlock ────────────────────────────────────────────────────────
@@ -385,15 +445,17 @@ pub struct ThreadControlBlock
     /// `ep.lock`; see docs/scheduling-internals.md § Cross-CPU TCB Ownership.
     pub reply_tcb: core::sync::atomic::AtomicPtr<ThreadControlBlock>,
 
-    /// What the current `sys_ipc_call` park episode's wake deposited — one of
-    /// the `REPLY_DISPOSITION_*` values. Reset to `NONE` by `sys_ipc_call`
-    /// before the thread becomes claimable; stamped exactly once per episode
-    /// by the wake's claim winner (`reply_tcb` CAS/swap, send-queue unlink
-    /// under `ep.lock`, or a failed park commit's binding teardown); consumed
-    /// by `sys_ipc_call`'s resume to pick the reply-read vs `Interrupted`
-    /// return path. See core/kernel/docs/ipc-internals.md § Reply Disposition
-    /// and Park Episodes.
-    pub reply_disposition: core::sync::atomic::AtomicU8,
+    /// What the current park episode's wake deposited — one of the
+    /// `PARK_DISPOSITION_*` values. Reset to `NONE` by every parking syscall
+    /// before the thread becomes claimable. For `sys_ipc_call` episodes the
+    /// wake's claim winner stamps exactly once (`reply_tcb` CAS/swap,
+    /// send-queue unlink under `ep.lock`, or a failed park commit's binding
+    /// teardown) and the resume fails closed on `NONE`. For the non-call
+    /// parking surfaces only cancellation claims stamp (`INTERRUPTED`); their
+    /// genuine wakers leave `NONE` and the resume proceeds on its deposit
+    /// read (fail-open). See core/kernel/docs/ipc-internals.md § Park
+    /// Dispositions and Episodes.
+    pub park_disposition: core::sync::atomic::AtomicU8,
 
     /// Park-episode counter for the reply protocol's spurious-resume tripwire:
     /// incremented by `sys_ipc_call` / `fault_dispatch` at episode start.

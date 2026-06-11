@@ -304,10 +304,23 @@ pub unsafe fn event_queue_recv(
             blocked_on,
         )
     };
-    if !committed
+    if committed != crate::sched::ParkCommit::Committed
     {
-        // Concurrent stop won; roll back the waiter slot.
+        // Refused park; roll back the waiter slot. eq.lock has been held
+        // across publish/commit/rollback, so the rollback owns the episode.
+        // A stop-won refusal stamps INTERRUPTED; a coalesced-wake refusal
+        // leaves the deposit for the resume to deliver.
         eq.waiter = core::ptr::null_mut();
+        if committed == crate::sched::ParkCommit::RefusedStop
+        {
+            // SAFETY: caller is a valid TCB; episode owned per the above.
+            unsafe {
+                crate::sched::thread::stamp_park_deposit(
+                    caller,
+                    crate::sched::thread::PARK_DISPOSITION_INTERRUPTED,
+                );
+            }
+        }
         // SAFETY: caller is a valid TCB; context_saved is AtomicU32.
         unsafe {
             (*caller)
@@ -353,6 +366,15 @@ pub unsafe fn event_queue_drop(eq: *mut EventQueueState)
             (*waiter)
                 .wake_in_flight
                 .store(1, core::sync::atomic::Ordering::Release);
+            // A timed waiter is also on the sleep list; drop the entry under
+            // eq.lock (the #117 remove-before-clear order) so the timer can
+            // neither double-wake it nor hijack a later unrelated park via
+            // the stale entry. Mirrors event_queue_post's claim.
+            if (*waiter).sleep_deadline != 0
+            {
+                crate::sched::sleep_list_remove(waiter);
+                (*waiter).sleep_deadline = 0;
+            }
         }
     }
     // SAFETY: paired with lock_raw above.

@@ -292,12 +292,27 @@ pub unsafe fn notification_wait(
             blocked_on,
         )
     };
-    if !committed
+    if committed != crate::sched::ParkCommit::Committed
     {
-        // Concurrent stop won; roll back the waiter slot.
+        // Refused park; roll back the waiter slot. sig.lock has been held
+        // across publish/commit/rollback, so no waker ever saw the slot — the
+        // rollback owns the episode. A stop-won refusal stamps it INTERRUPTED
+        // so the restarted thread's resume reports the cancellation instead
+        // of a fabricated 0-bits success; a coalesced-wake refusal leaves the
+        // deposit for the resume to deliver.
         sig.waiter = core::ptr::null_mut();
         sig.has_observer
             .store(u8::from(!sig.wait_set.is_null()), Ordering::Relaxed);
+        if committed == crate::sched::ParkCommit::RefusedStop
+        {
+            // SAFETY: caller TCB is valid; episode owned per the above.
+            unsafe {
+                crate::sched::thread::stamp_park_deposit(
+                    caller,
+                    crate::sched::thread::PARK_DISPOSITION_INTERRUPTED,
+                );
+            }
+        }
         // SAFETY: caller TCB is valid; context_saved is AtomicU32.
         unsafe {
             (*caller)

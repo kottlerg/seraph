@@ -80,7 +80,7 @@ The sleep list is a single global fixed-capacity array of TCB pointers. A TCB is
    
    The `(*eq).waiter == tcb` arbitration under `eq.lock` ensures exactly one of these paths fires per park. The reader can then trust that `timed_out == true` ⇔ "no payload" and `timed_out == false` ⇔ "wakeup_value is the payload" (which may legitimately be zero).
 
-4. **No third writer.** `cancel_ipc_block` MUST NOT touch `timed_out`. A cancelled wait returns `Interrupted`, not "timed out"; the next time the cancelled thread is started by `sys_thread_start`, its trap-frame return slot already carries `Interrupted` (set by `cancel_ipc_block`) and the syscall layer never re-reads `timed_out` for that resume. Additional writers would race the reader and break the mutual-exclusion invariant.
+4. **No third writer.** `cancel_ipc_block` MUST NOT touch `timed_out`. A cancelled wait returns `Interrupted`, not "timed out": the cancel stamps the park episode `INTERRUPTED` at its waiter-slot claim, and the resuming syscall consumes that disposition *before* the `timed_out`/`wakeup_value` read (clearing both in the interrupted branch — see [ipc-internals.md § Park Dispositions and Episodes](ipc-internals.md#park-dispositions-and-episodes)). Additional writers would race the reader and break the mutual-exclusion invariant.
 
 ---
 
@@ -129,7 +129,7 @@ The teardown sequence binds the following ordered steps. Each step's preconditio
 4. For each CPU in 0..cpu_count: scheduler_for(cpu).remove_from_queue(tcb, prio).
 5. Server-side BlockedOnReply check: if (*tcb).reply_tcb is non-null,
    compare_exchange(bound, null, AcqRel, Acquire) to claim the binding, then
-   DEPOSIT only the resume disposition (trap_frame.return = Interrupted for a
+   DEPOSIT only the resume disposition (park_disposition = INTERRUPTED for a
    syscall caller, or fault_outcome = Kill for a fault-blocked client) and leave
    the client BLOCKED. The client's Scheduling-group fields (state/ipc_state/
    blocked_on) are NOT written here — they are written only by the gated
@@ -260,7 +260,7 @@ The `BlockedOnReply` state is structurally different from the other `BlockedOn*`
 3. **Server in `endpoint_reply`** — loads `reply_tcb` (Acquire), stores `null` (Release) under `ep.lock`.
 4. **Client cancel via `cancel_ipc_block`** — `compare_exchange(this_client, null, AcqRel, Acquire)` from the client's CPU's scheduler.lock, NOT under `ep.lock`.
 5. **Client dealloc via `dealloc_object(Thread)`** — `compare_exchange(this_client, null, AcqRel, Acquire)` in the BlockedOnReply branch of the source-IPC unlink walk. Mirrors `cancel_ipc_block`'s discipline.
-6. **Server dealloc via `dealloc_object(Thread)`** — under all-CPU scheduler.locks, reads `(*server).reply_tcb`; if non-null, `compare_exchange(bound, null, AcqRel, Acquire)` to claim the binding, then prepares the bound client for wake and schedules an `enqueue_and_wake` for after the all-locks region releases. For a `BlockedOnReply` client it writes `trap_frame.return = Interrupted`; for a `BlockedOnFault` client (handler-thread death) it instead records `fault_outcome = Kill` (read on entry to the branch, before `ipc_state` is cleared) so the faulter runs its kill path on resume. Without this, a client blocked on a dying server/handler would remain blocked indefinitely with a dangling `blocked_on_object` pointer to freed memory.
+6. **Server dealloc via `dealloc_object(Thread)`** — under all-CPU scheduler.locks, reads `(*server).reply_tcb`; if non-null, `compare_exchange(bound, null, AcqRel, Acquire)` to claim the binding, then prepares the bound client for wake and schedules an `enqueue_and_wake` for after the all-locks region releases. For a `BlockedOnReply` client it stamps the park episode `INTERRUPTED`; for a `BlockedOnFault` client (handler-thread death) it instead records `fault_outcome = Kill` (read on entry to the branch, before `ipc_state` is cleared) so the faulter runs its kill path on resume. Without this, a client blocked on a dying server/handler would remain blocked indefinitely with a dangling `blocked_on_object` pointer to freed memory.
 7. **Timer defensive arm in `sleep_check_wakeups`** — for `BlockedOnReply` / `BlockedOnFault` entries (never on the sleep list today; see Sleep List Invariant 6), `compare_exchange(this_client, null, AcqRel, Acquire)`; on a `BlockedOnFault` win it records `fault_outcome = Kill`. Defensive only — forecloses a future timeout surface racing a reply/cancel.
 
 **Symmetry rule:** every actor that may invalidate a client's place in the reply slot MUST use `compare_exchange(this_client, null, ...)` (never an unconditional store) so concurrent actors can determine whether they got there first. The single `fault_outcome` writer is whichever actor wins this CAS, so a fault's resume-vs-kill disposition is never decided by two racing actors. Stores to `null` are only safe inside `ep.lock` because that lock ensures no other actor is concurrently setting a *different* non-null caller.
@@ -298,14 +298,15 @@ This section lists ordering invariants specific to the sleep-list + lifecycle su
 3. sleep_list_add(tcb).
 4. schedule(false).
 5. On resume: (*tcb).state has been set to Ready by sleep_check_wakeups's
-   "_ => { plain sleep }" arm, sleep_deadline cleared; syscall returns Ok(0).
+   "_ => { plain sleep }" arm, sleep_deadline cleared; the syscall consumes
+   the park disposition (Ok(0) on a timer wake, Interrupted on a cancel).
 ```
 
 **Invariants:**
 
 1. `ipc_state == None` is the discriminator that selects the plain-sleep arm in `sleep_check_wakeups`. The plain arm claims unconditionally because no IPC source is competing.
-2. The plain sleep does not need a source-lock arbitration. The timer is the sole waker.
-3. There is no cancel path for `sys_thread_sleep` today; if `sys_thread_stop` is called on a sleeper, `cancel_ipc_block`'s default arm (`IpcThreadState::None`) does no source-lock work, and the function then clears `sleep_deadline` and removes the TCB from the sleep list. This is correct.
+2. The plain sleep does not need a source-lock arbitration. The timer and `cancel_ipc_block` arbitrate via the sleep-list entry itself: both remove it under `SLEEP_LIST_LOCK`, so exactly one claims the wake.
+3. The cancel path: `sys_thread_stop` on a sleeper runs `cancel_ipc_block`, whose `IpcThreadState::None` arm does no source-lock work; the function then removes the TCB from the sleep list (before clearing `sleep_deadline` — the #117 order) and stamps the park episode `INTERRUPTED` so the restarted sleeper returns `Interrupted` instead of reporting the truncated sleep as success. The stamp is NOT gated on the remove win: a plain sleeper has no competing depositor (the timer's claim deposits nothing), and a cancel landing between the commit and `sleep_list_add` finds no entry to remove yet must still cancel the park — that window is reachable in practice under TCG host-descheduling. A timer claim racing the cancel resolves to `Interrupted` (honest for a sleep whose deadline elapsed concurrently with a stop). A stop that instead wins against the park commit (`ParkCommit::RefusedStop`) makes `sys_thread_sleep` deschedule in place and return `Interrupted` directly.
 
 ---
 
@@ -316,7 +317,7 @@ This section lists ordering invariants specific to the sleep-list + lifecycle su
 **Protocol (`core/kernel/src/syscall/thread.rs::sys_thread_stop`):**
 
 1. Resolve the target Thread cap; reject `Created`, `Exited`, `Stopped` with `InvalidState`.
-2. If `state == Blocked`, call `cancel_ipc_block(target)` — acquires the source IPC lock matching `tcb.ipc_state` and unlinks the waiter.
+2. If `state == Blocked`, call `cancel_ipc_block(target)` — acquires the source IPC lock matching `tcb.ipc_state`, unlinks the waiter, and on the claim win stamps the park episode `INTERRUPTED` (fault episodes: `fault_outcome = Kill`) so the restarted thread's resume reports the cancellation.
 3. `set_state_under_all_locks(target, Stopped)` — acquires every CPU's scheduler.lock in ascending order, writes `state = Stopped`, snapshots `running_on` (the CPU whose `sched.current == target_tcb`, if any), releases all locks. Returns `Option<run_cpu>`.
 4. **Self-stop fast path.** If the target is the calling thread, call `schedule(false)` immediately. The skip-loop in `schedule()` never re-enqueues a `Stopped` TCB.
 5. **Cross-CPU drain.** If `running_on = Some(run_cpu)` and `run_cpu != current_cpu`:

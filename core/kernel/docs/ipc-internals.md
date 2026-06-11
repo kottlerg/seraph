@@ -149,15 +149,23 @@ size.
 8. If caller_tcb.priority > current_tcb.priority: direct switch
 ```
 
-### Reply Disposition and Park Episodes
+### Park Dispositions and Episodes
 
-Every `sys_ipc_call` park is an **episode** with exactly one deposit. The TCB
-carries `reply_disposition` (`NONE`/`REPLY`/`INTERRUPTED`); debug builds add
-`park_episode`/`deposit_episode` counters.
+Every park is an **episode**. The TCB carries `park_disposition`
+(`NONE`/`REPLY`/`INTERRUPTED`); debug builds add
+`park_episode`/`deposit_episode` counters for the call/fault protocol's
+tripwire. A `sys_ipc_call` episode has exactly one deposit (fail-closed,
+below); the non-call parking surfaces (`sys_notification_wait`,
+`sys_event_recv`, `sys_ipc_recv`, `sys_wait_set_wait`, `sys_thread_sleep`)
+use the disposition only as a cancellation channel (fail-open, below).
 
-**Episode start (ownership window).** `sys_ipc_call` resets
-`reply_disposition = NONE` (and bumps `park_episode`) *before* `endpoint_call`
-publishes any claimable state (`reply_tcb`, or the send-queue link). Until
+**Episode start (ownership window).** Every parking syscall resets
+`park_disposition = NONE` *before* its source-side registration publishes any
+claimable state (`reply_tcb`, a wait-queue link, a waiter slot, or the
+Blocked commit for a plain sleep) — `sys_ipc_call` via `open_call_episode`
+(which also bumps `park_episode`), the non-call surfaces via
+`open_park_episode` (no bump: their genuine wakers deliberately do not stamp,
+so the open/stamp counter pairing holds only for call/fault episodes). Until
 that publication the parking thread exclusively owns its wake fields, so the
 reset cannot race a deposit. `fault_dispatch` bumps the episode the same way
 next to its `fault_outcome = Pending` reset.
@@ -185,15 +193,36 @@ same `(*tcb).sched_lock`, which carries it to the refusing parker.
 | `endpoint_call` send-queue commit-fail teardown | `ep.lock` held continuously from link to unlink | episode + INTERRUPTED / KILL |
 | `endpoint_recv` rebind-fail teardown | teardown `reply_tcb` CAS win (stamped before the wake-in-flight release — a dying caller's dealloc may free the TCB after it) | episode + INTERRUPTED / KILL |
 | `dealloc_object(Thread)` dying-client detach arms | `reply_tcb` CAS | **no stamp** — the claimed thread is the one being freed; it never resumes |
+| `cancel_ipc_block` BlockedOnRecv arm | recv-queue unlink win under `ep.lock` (a lost unlink means a caller already deposited into `ipc_msg`; that delivery stands) | INTERRUPTED |
+| `cancel_ipc_block` BlockedOnNotification / EventQueue / WaitSet arms | waiter-slot clear under the source lock (every genuine waker claims under the same lock) | INTERRUPTED |
+| `cancel_ipc_block` plain-sleep cleanup | the Blocked + `ipc_state == None` snapshot itself — a plain sleeper has no competing depositor (the timer's claim deposits nothing), and gating on the `sleep_list_remove` win would miss the commit→add window | INTERRUPTED |
+| `dealloc_object(Endpoint)` send-queue drain | whole-queue detach under `ep.lock` | episode + INTERRUPTED (faulter: episode + KILL) |
+| `dealloc_object(Endpoint)` recv-queue drain | whole-queue detach under `ep.lock` | INTERRUPTED |
+| park-helper refused-commit rollbacks (`notification_wait`, `event_queue_recv`, `waitset_wait`, `endpoint_recv`) | source lock held continuously from publish to rollback — no waker ever saw the slot | INTERRUPTED on `ParkCommit::RefusedStop` only; a `RefusedWake` rollback must leave the coalesced deposit deliverable |
 
-**Resume.** `sys_ipc_call` consumes the disposition: REPLY reads `ipc_msg`;
-INTERRUPTED returns `Interrupted` without touching `ipc_msg` (the trap-frame
-`Interrupted` pokes in cancel/dealloc remain only for the non-reply blocking
-syscalls, whose continuations would otherwise clobber them — the #361
-surface); NONE is a protocol violation: debug builds assert (naming
+**Resume (call/fault episodes — fail-closed).** `sys_ipc_call` consumes the
+disposition: REPLY reads `ipc_msg`; INTERRUPTED returns `Interrupted` without
+touching `ipc_msg`; NONE is a protocol violation: debug builds assert (naming
 tid/park-episode/deposit-episode — the #352-class spurious-resume tripwire,
 also checked in `fault_dispatch`'s resume), release builds fail closed with
 `Interrupted` rather than surfacing stale `ipc_msg` bytes as a success.
+
+**Resume (non-call parks — fail-open).** Each non-call parking syscall
+consumes the disposition via `consume_park_interrupted` before reading its
+wake deposit: INTERRUPTED returns `Interrupted` without touching
+`wakeup_value`/`timed_out`/`ipc_msg` (clearing the per-surface leftovers);
+NONE proceeds on the normal deposit-read path. Fail-open is required, not a
+convenience: genuine wakers for these surfaces do not stamp, because a
+coalesced wake-before-park deposit (`ParkCommit::RefusedWake`) has no
+claimable episode to stamp, and a recv whose cancel lost the unlink race to a
+concurrent `endpoint_call` must still publish the already-deposited message —
+its caller is parked `BlockedOnReply` on it and would otherwise be stranded.
+A fail-closed consume here would turn every unstamped genuine wake into a
+lost wakeup. The cancellation claims are exclusive against all genuine wakers
+(same source lock / `SLEEP_LIST_LOCK`), so INTERRUPTED-stamped episodes are
+exactly the cancelled ones. The pre-#363 trap-frame `Interrupted` pokes are
+gone: every resume rewrites the return registers, so a poke never survived —
+the disposition is the only cancellation channel.
 
 ### Direct Thread Switch (Fast Path Optimization)
 

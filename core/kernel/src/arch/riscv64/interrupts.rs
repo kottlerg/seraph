@@ -1139,14 +1139,8 @@ pub fn acknowledge(irq: u32)
 #[allow(dead_code)]
 pub unsafe fn send_tlb_shootdown_ipi(target_hart_id: u32)
 {
-    // SBI IPI extension (EID=0x735049 'sPI'), function SEND_IPI (fid=0).
-    let hart_mask = 1u64 << target_hart_id;
-    let hart_mask_base = 0u64;
-
     // SAFETY: SBI call sends a supervisor software interrupt to the target hart.
-    unsafe {
-        sbi_call_2(0x0073_5049, 0, hart_mask, hart_mask_base);
-    }
+    unsafe { sbi_send_ipi_to(target_hart_id) };
 }
 
 /// Send a wakeup IPI to a target hart.
@@ -1160,13 +1154,33 @@ pub unsafe fn send_tlb_shootdown_ipi(target_hart_id: u32)
 #[cfg(not(test))]
 pub unsafe fn send_wakeup_ipi(target_hart_id: u32)
 {
-    // SBI IPI extension (EID=0x735049 'sPI'), function SEND_IPI (fid=0).
-    // Argument: hart_mask (bitmask of target harts).
-    let hart_mask = 1u64 << target_hart_id;
-    let hart_mask_base = 0u64; // hart_mask represents harts [0..63]
+    // SAFETY: SBI call sends a supervisor software interrupt to the target hart,
+    // waking it from wfi.
+    unsafe { sbi_send_ipi_to(target_hart_id) };
+}
 
-    // SAFETY: SBI call with EID=sPI, FID=0, sends an IPI to the target hart.
-    // The target will receive a supervisor software interrupt, waking it from wfi.
+/// Split a hart ID into the SBI `(hart_mask, hart_mask_base)` pair.
+///
+/// The SBI hart-mask convention addresses a 64-hart window: `hart_mask_base`
+/// is the first hart ID of the window and `hart_mask` is a bitmask relative
+/// to that base, so any hart ID up to the platform limit is reachable.
+fn sbi_hart_mask(target_hart_id: u32) -> (u64, u64)
+{
+    let base = u64::from(target_hart_id) & !63;
+    let mask = 1u64 << (u64::from(target_hart_id) & 63);
+    (mask, base)
+}
+
+/// Send a supervisor software interrupt to `target_hart_id` via the SBI IPI
+/// extension (EID=0x735049 'sPI', FID=0 `SEND_IPI`).
+///
+/// # Safety
+/// `target_hart_id` must be a valid hart ID of an online hart.
+unsafe fn sbi_send_ipi_to(target_hart_id: u32)
+{
+    let (hart_mask, hart_mask_base) = sbi_hart_mask(target_hart_id);
+    // SAFETY: SBI call with EID=sPI, FID=0; caller guarantees the target hart
+    // is online.
     unsafe {
         sbi_call_2(0x0073_5049, 0, hart_mask, hart_mask_base);
     }
@@ -1402,5 +1416,17 @@ mod tests
     fn plic_claim_complete_offset()
     {
         assert_eq!(plic_claim_complete_offset(), 0x0020_1004);
+    }
+
+    #[test]
+    fn sbi_hart_mask_windows()
+    {
+        assert_eq!(sbi_hart_mask(0), (1, 0));
+        assert_eq!(sbi_hart_mask(63), (1 << 63, 0));
+        assert_eq!(sbi_hart_mask(64), (1, 64));
+        assert_eq!(sbi_hart_mask(65), (1 << 1, 64));
+        assert_eq!(sbi_hart_mask(127), (1 << 63, 64));
+        assert_eq!(sbi_hart_mask(128), (1, 128));
+        assert_eq!(sbi_hart_mask(511), (1 << 63, 448));
     }
 }

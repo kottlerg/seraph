@@ -131,13 +131,8 @@ fn main() -> !
         halt_loop();
     }
 
-    let Some(ws_slab) = std::os::seraph::object_slab_acquire(512)
-    else
-    {
-        std::os::seraph::log!("failed to acquire memory cap for wait set");
-        halt_loop();
-    };
-    let Ok(ws_cap) = syscall::wait_set_create(ws_slab)
+    let Some(ws_cap) =
+        std::os::seraph::object_slab_retype(512, |slab| syscall::wait_set_create(slab).ok())
     else
     {
         std::os::seraph::log!("failed to create wait set");
@@ -150,26 +145,12 @@ fn main() -> !
     // `cap::retype::event_queue_raw_bytes`: 24 wrapper + 56 state +
     // (capacity + 1) * 8 ring.
     let deaths_eq_slab_bytes: u64 = 24 + 56 + ((MAX_SERVICES as u64 * 2) + 1) * 8;
-    let Some(eq_slab) = std::os::seraph::object_slab_acquire(deaths_eq_slab_bytes)
-    else
-    {
-        std::os::seraph::log!("failed to acquire memory cap for deaths event queue");
-        halt_loop();
-    };
-    let Ok(deaths_eq) = syscall::event_queue_create(eq_slab, (MAX_SERVICES as u32) * 2)
+    let Some(deaths_eq) = std::os::seraph::object_slab_retype(deaths_eq_slab_bytes, |slab| {
+        syscall::event_queue_create(slab, (MAX_SERVICES as u32) * 2).ok()
+    })
     else
     {
         std::os::seraph::log!("failed to create deaths event queue");
-        halt_loop();
-    };
-
-    // Memory-cap slab svcmgr retypes provider service endpoints from. One page
-    // backs every `provides = ...` service (each `cap_create_endpoint`
-    // carves an endpoint object from it); the provider set is small.
-    let Some(endpoint_slab) = std::os::seraph::object_slab_acquire(syscall_abi::PAGE_SIZE)
-    else
-    {
-        std::os::seraph::log!("failed to acquire memory cap for provider endpoint slab");
         halt_loop();
     };
 
@@ -193,15 +174,7 @@ fn main() -> !
 
     std::os::seraph::log!("endowed; waiting for handover");
 
-    event_loop(
-        info,
-        &caps,
-        ws_cap,
-        deaths_eq,
-        endpoint_slab,
-        ipc_buf,
-        &mut state,
-    );
+    event_loop(info, &caps, ws_cap, deaths_eq, ipc_buf, &mut state);
 }
 
 /// Publish the well-known names svcmgr owns into its own discovery
@@ -391,7 +364,6 @@ fn event_loop(
     caps: &service::SvcmgrCaps,
     ws_cap: u32,
     deaths_eq: u32,
-    endpoint_slab: u32,
     ipc_buf: *mut u64,
     state: &mut SvcmgrState,
 ) -> !
@@ -401,7 +373,6 @@ fn event_loop(
         bootstrap_ep: caps.bootstrap_ep,
         ipc_buf,
         deaths_eq,
-        endpoint_slab,
         master_log_source: caps.master_log_source,
         procmgr_death_auth_source: caps.procmgr_death_auth_source,
         devmgr_registry: caps.devmgr_registry,

@@ -224,7 +224,8 @@ fn assemble_provided_boot_caps(
     }
     else
     {
-        let Ok(ep) = syscall::cap_create_endpoint(ctx.endpoint_slab)
+        let Some(ep) =
+            std::os::seraph::object_slab_retype(88, |slab| syscall::cap_create_endpoint(slab).ok())
         else
         {
             std::os::seraph::log!("launch {}: provider endpoint create failed", def.name);

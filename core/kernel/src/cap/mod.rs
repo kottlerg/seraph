@@ -472,8 +472,17 @@ const ROOT_CSPACE_MAX_SLOTS: usize = 14336;
 /// peak boot slot count means `pre_allocate`'s grow loop hits an
 /// exhausted pool, the syscall errors out, and the userspace caller
 /// either retries indefinitely (e.g. `request_round` in a child) or
-/// surfaces an unexpected `OutOfMemory`. After memmgr is alive, further
-/// growth is bounded only by `ROOT_CSPACE_MAX_SLOTS`.
+/// surfaces an unexpected `OutOfMemory`.
+///
+/// This is the one creation site deliberately seeded below its
+/// `max_slots` quota (see docs/capability-model.md, growth budgets):
+/// backing all `ROOT_CSPACE_MAX_SLOTS` would cost 257 SEED pages
+/// (~1 MiB) for a `CSpace` whose occupancy peaks at boot and is bounded
+/// in steady state. Growth past the seeded pool returns the refillable
+/// `OutOfMemory`; init owns the shortfall and can refill via
+/// augment-mode `cap_create_cspace` against its own `CSpace` cap
+/// (`ProcessInfo.cspace_cap`). The `ROOT_CSPACE_MAX_SLOTS` quota only
+/// binds after such a refill.
 #[cfg(not(test))]
 const ROOT_CSPACE_INIT_SLOT_CAPACITY: u64 = 1536;
 
@@ -2380,7 +2389,7 @@ pub unsafe fn move_cap_between_cspaces(
     // Insert into destination (auto-allocate free slot).
     // SAFETY: dst_cspace is a valid CSpace pointer; guaranteed by caller contract.
     let new_idx_nz = unsafe { (*dst_cspace).insert_cap(src_tag, src_rights, src_object) }
-        .map_err(|_| SyscallError::OutOfMemory)?;
+        .map_err(SyscallError::from)?;
     let new_idx = new_idx_nz.get();
 
     let src_idx_nz = core::num::NonZeroU32::new(src_idx).ok_or(SyscallError::InvalidCapability)?;

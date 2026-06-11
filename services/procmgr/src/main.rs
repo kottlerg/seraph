@@ -111,22 +111,15 @@ fn main() -> !
     // `MAX_PROCESSES * 2` to absorb a simultaneous-crash burst without
     // dropping notifications between drain calls.
     let death_eq_slab_bytes: u64 = 24 + 56 + ((process::MAX_PROCESSES as u64 * 2) + 1) * 8;
-    let Some(eq_slab) = std::os::seraph::object_slab_acquire(death_eq_slab_bytes)
+    let Some(death_eq) = std::os::seraph::object_slab_retype(death_eq_slab_bytes, |slab| {
+        syscall::event_queue_create(slab, (process::MAX_PROCESSES as u32) * 2).ok()
+    })
     else
     {
         syscall::thread_exit();
     };
-    let Ok(death_eq) = syscall::event_queue_create(eq_slab, (process::MAX_PROCESSES as u32) * 2)
-    else
-    {
-        syscall::thread_exit();
-    };
-    let Some(ws_slab) = std::os::seraph::object_slab_acquire(4096)
-    else
-    {
-        syscall::thread_exit();
-    };
-    let Ok(ws_cap) = syscall::wait_set_create(ws_slab)
+    let Some(ws_cap) =
+        std::os::seraph::object_slab_retype(4096, |slab| syscall::wait_set_create(slab).ok())
     else
     {
         syscall::thread_exit();
@@ -229,10 +222,14 @@ pub(crate) const ASPACE_RETYPE_PAGES: u64 = 33;
 /// Pages requested from memmgr for the child's `CSpace` retype slab.
 /// Each slot page holds `L2_SIZE` capability slots (currently 56 slots
 /// × 72 B = 4032 B/page); the +1 covers the per-memory-cap allocator
-/// metadata footprint. Larger `CSpace`s refill via augment-mode
-/// `cap_create_cspace`. Five pages → 4 slot pages → ~224 slots covers a
-/// small driver's lifetime.
-pub(crate) const CSPACE_RETYPE_PAGES: u64 = 5;
+/// metadata footprint, and the kernel reserves the slab's page 0 as the
+/// wrapper page.
+///
+/// Seed-to-cover policy (#366): the seeded pool MUST back the child's
+/// full `max_slots = 256` quota so a cap insert can never fail on pool
+/// exhaustion below quota. 7 pages → 6 to the kernel → 5 pool pages →
+/// 5 × 56 − 1 = 279 usable slots ≥ 256.
+pub(crate) const CSPACE_RETYPE_PAGES: u64 = 7;
 
 /// Register a new child with memmgr. On success returns
 /// `(memmgr_send_cap_slot, memmgr_badge)`. On any failure (memmgr

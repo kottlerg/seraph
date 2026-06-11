@@ -53,16 +53,18 @@ pub(crate) const ASPACE_RETYPE_PAGES: u64 = 33;
 
 /// Pages init carves for memmgr/procmgr's `CSpace`. Each slot page holds
 /// `L2_SIZE` capability slots (currently 56 slots × 72 B = 4032 B/page);
-/// the +1 covers per-MemoryObject allocator metadata. Mirrors procmgr's
+/// the +1 covers per-MemoryObject allocator metadata, and the kernel
+/// reserves the slab's page 0 as the wrapper page. Mirrors procmgr's
 /// constant.
 ///
-/// Sized for the long-lived service's full lifetime: procmgr accumulates
-/// per-child caps (aspace, cspace, thread, memory-cap slabs, derived rights
-/// caps) while children are alive. 33 pages → 32 slot pages → ~1792
-/// slots = ~28 children (aspace/cspace/thread/4 memory caps each) plus
-/// working caps. Larger workloads refill via augment-mode
-/// `cap_create_cspace`.
-pub(crate) const CSPACE_RETYPE_PAGES: u64 = 33;
+/// Seed-to-cover policy (#366): both tier-1 services are immortal and
+/// accumulate caps for the system's whole lifetime (memmgr: per-allocation
+/// Memory caps; procmgr: per-child aspace/cspace/thread/slab caps), so
+/// the seeded pool MUST back the full `max_slots = 8192` quota — an
+/// under-seeded pool wedges the service on pool exhaustion long before
+/// quota, with no one positioned to augment it. 149 pages → 148 to the
+/// kernel → 147 pool pages → 147 × 56 − 1 = 8231 usable slots ≥ 8192.
+pub(crate) const CSPACE_RETYPE_PAGES: u64 = 149;
 
 /// Base for init's scratch mappings (`ProcessInfo` memory caps, ELF pages).
 pub(crate) const TEMP_MAP_BASE: u64 = 0x0000_0001_0000_0000;

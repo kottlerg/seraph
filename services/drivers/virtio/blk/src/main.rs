@@ -1057,8 +1057,9 @@ fn main() -> !
         std::os::seraph::log!("no IRQ cap, cannot operate");
         syscall::thread_exit();
     }
-    let Some(irq_notification) = std::os::seraph::object_slab_acquire(120)
-        .and_then(|slab| syscall::cap_create_notification(slab).ok())
+    let Some(irq_notification) = std::os::seraph::object_slab_retype(120, |slab| {
+        syscall::cap_create_notification(slab).ok()
+    })
     else
     {
         std::os::seraph::log!("failed to create IRQ notification");

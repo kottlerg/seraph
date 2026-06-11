@@ -92,8 +92,9 @@ pub fn serial_loop(serial_cap: u32, tx: &Sender<Msg>)
     // Notification the driver kicks on receive-data-ready. Keep `notif` to wait
     // on; send a derived copy to the driver — IPC moves caps, so sending the
     // original would forfeit our wait handle.
-    let Some(notif) = std::os::seraph::object_slab_acquire(120)
-        .and_then(|slab| syscall::cap_create_notification(slab).ok())
+    let Some(notif) = std::os::seraph::object_slab_retype(120, |slab| {
+        syscall::cap_create_notification(slab).ok()
+    })
     else
     {
         std::os::seraph::log!("terminal: serial RX notification create failed");

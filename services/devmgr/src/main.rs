@@ -112,9 +112,9 @@ fn main() -> !
     unreserve_pages(ecam_range);
 
     // Create block device service endpoint for the driver to receive on.
-    let blk_ep = std::os::seraph::object_slab_acquire(88)
-        .and_then(|slab| syscall::cap_create_endpoint(slab).ok())
-        .unwrap_or(0);
+    let blk_ep =
+        std::os::seraph::object_slab_retype(88, |slab| syscall::cap_create_endpoint(slab).ok())
+            .unwrap_or(0);
     if blk_ep == 0
     {
         std::os::seraph::log!("failed to create block device endpoint");
@@ -1599,9 +1599,9 @@ fn spawn_virtio_input_from_disk(
         return None;
     };
 
-    let input_ep = std::os::seraph::object_slab_acquire(88)
-        .and_then(|slab| syscall::cap_create_endpoint(slab).ok())
-        .unwrap_or(0);
+    let input_ep =
+        std::os::seraph::object_slab_retype(88, |slab| syscall::cap_create_endpoint(slab).ok())
+            .unwrap_or(0);
     if input_ep == 0
     {
         std::os::seraph::log!("virtio-input: failed to create service endpoint");
@@ -1666,9 +1666,9 @@ fn spawn_serial(caps: &mut caps::DevmgrCaps, uart_irq: u32, ipc_buf: *mut u64) -
 
     // devmgr-owned service endpoint: the driver receives on a RIGHTS_ALL
     // copy; devmgr keeps the original to mint client SEND caps on query.
-    let serial_ep = std::os::seraph::object_slab_acquire(88)
-        .and_then(|slab| syscall::cap_create_endpoint(slab).ok())
-        .unwrap_or(0);
+    let serial_ep =
+        std::os::seraph::object_slab_retype(88, |slab| syscall::cap_create_endpoint(slab).ok())
+            .unwrap_or(0);
     if serial_ep == 0
     {
         std::os::seraph::log!("serial: failed to create service endpoint");
@@ -1748,9 +1748,9 @@ fn spawn_framebuffer(
     let end_aligned = (span + 0xFFF) & !0xFFF;
     let mmio_size = end_aligned - base_aligned;
 
-    let fb_ep = std::os::seraph::object_slab_acquire(88)
-        .and_then(|slab| syscall::cap_create_endpoint(slab).ok())
-        .unwrap_or(0);
+    let fb_ep =
+        std::os::seraph::object_slab_retype(88, |slab| syscall::cap_create_endpoint(slab).ok())
+            .unwrap_or(0);
     if fb_ep == 0
     {
         std::os::seraph::log!("framebuffer: failed to create service endpoint");
@@ -1873,9 +1873,9 @@ fn spawn_rtc_from_disk(
         return None;
     };
 
-    let rtc_ep = std::os::seraph::object_slab_acquire(88)
-        .and_then(|slab| syscall::cap_create_endpoint(slab).ok())
-        .unwrap_or(0);
+    let rtc_ep =
+        std::os::seraph::object_slab_retype(88, |slab| syscall::cap_create_endpoint(slab).ok())
+            .unwrap_or(0);
     if rtc_ep == 0
     {
         std::os::seraph::log!("rtc: failed to create service endpoint");
@@ -1945,12 +1945,12 @@ fn test_spawn_orphan(
     // Throwaway service + hw endpoints handed to the child in round 1. Ownership
     // of `hw_cap` transfers to `spawn_simple_device` (moved into the child or
     // deleted on failure); `service_ep` is retained here and released below.
-    let service_ep = std::os::seraph::object_slab_acquire(88)
-        .and_then(|slab| syscall::cap_create_endpoint(slab).ok())
-        .unwrap_or(0);
-    let hw_cap = std::os::seraph::object_slab_acquire(88)
-        .and_then(|slab| syscall::cap_create_endpoint(slab).ok())
-        .unwrap_or(0);
+    let service_ep =
+        std::os::seraph::object_slab_retype(88, |slab| syscall::cap_create_endpoint(slab).ok())
+            .unwrap_or(0);
+    let hw_cap =
+        std::os::seraph::object_slab_retype(88, |slab| syscall::cap_create_endpoint(slab).ok())
+            .unwrap_or(0);
     // Non-zero query endpoint forces the two-round protocol so round 2 is reached.
     let query_ep =
         syscall::cap_derive_badge(caps.registry_ep, syscall::RIGHTS_SEND, QUERY_BADGE).unwrap_or(0);

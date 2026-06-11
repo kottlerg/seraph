@@ -206,25 +206,23 @@ fn create_death_eq() -> Option<u32>
     const MAX_DEATHS_PER_BURST: u32 = 64;
     // Bytes: 24 wrapper + 56 state + (capacity + 1) * 8 ring.
     let slab_bytes: u64 = 24 + 56 + (u64::from(MAX_DEATHS_PER_BURST) + 1) * 8;
-    let slab = std::os::seraph::object_slab_acquire(slab_bytes)?;
-    syscall::event_queue_create(slab, MAX_DEATHS_PER_BURST).ok()
+    std::os::seraph::object_slab_retype(slab_bytes, |slab| {
+        syscall::event_queue_create(slab, MAX_DEATHS_PER_BURST).ok()
+    })
 }
 
 /// Build a 2-member wait set: the log endpoint (`WS_BADGE_LOG`) and
 /// the death event queue (`WS_BADGE_DEATH`).
 fn create_wait_set(log_ep_recv: u32, death_eq: u32) -> Option<u32>
 {
-    let slab = std::os::seraph::object_slab_acquire(4096)?;
-    let ws = match syscall::wait_set_create(slab)
+    let Some(ws) =
+        std::os::seraph::object_slab_retype(4096, |slab| syscall::wait_set_create(slab).ok())
+    else
     {
-        Ok(c) => c,
-        Err(e) =>
-        {
-            let mut buf = SerialFmt::new();
-            let _ = write!(buf, "wait_set_create err={e} slab={slab}");
-            buf.flush_self_log();
-            return None;
-        }
+        let mut buf = SerialFmt::new();
+        let _ = write!(buf, "wait_set_create failed");
+        buf.flush_self_log();
+        return None;
     };
     if let Err(e) = syscall::wait_set_add(ws, log_ep_recv, WS_BADGE_LOG)
     {

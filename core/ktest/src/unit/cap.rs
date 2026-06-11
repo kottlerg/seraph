@@ -344,7 +344,7 @@ pub fn insert_out_of_bounds_err(ctx: &TestContext) -> TestResult
 {
     let sig = cap_create_notification(ctx.memory_base)
         .map_err(|_| "create_notification for insert_oob test failed")?;
-    // CSpace capacity is clamped to [256, 14336]; create the smallest possible.
+    // max_slots is clamped to [1, 14336]; create a small CSpace.
     let dest_cs = cap_create_cspace(ctx.memory_base, 0, 4, 16)
         .map_err(|_| "create_cspace for insert_oob test failed")?;
 

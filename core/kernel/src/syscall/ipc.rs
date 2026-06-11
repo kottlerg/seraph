@@ -225,7 +225,7 @@ unsafe fn transfer_caps(
         (*dst_cspace).lock.unlock_raw(saved);
         r
     }
-    .map_err(|_| SyscallError::OutOfMemory)?;
+    .map_err(SyscallError::from)?;
 
     // Acquire derivation lock for the batch move.
     crate::cap::DERIVATION_LOCK.write_lock();
@@ -629,8 +629,8 @@ static RECV_PREALLOC_FAIL_COUNT: core::sync::atomic::AtomicU32 =
 /// may have no log channel of its own (memmgr). Log occurrences at powers of
 /// two: flood-proof against an unguarded spinner, while later wedges still
 /// surface and the occurrence count itself conveys the spin rate. The cause
-/// is reported before `CapError` collapses to `SyscallError::OutOfMemory`,
-/// distinguishing a `max_slots` ceiling from retype-pool depletion.
+/// mirrors the `CapError` distinction (#366): `max_slots` quota versus
+/// refillable slot-page-pool depletion.
 #[cfg(not(test))]
 fn log_recv_preallocate_failure(
     tcb: *mut crate::sched::thread::ThreadControlBlock,
@@ -647,8 +647,8 @@ fn log_recv_preallocate_failure(
     }
     let cause = match err
     {
-        crate::cap::CapError::OutOfSlots => "cspace-slots-exhausted",
-        crate::cap::CapError::OutOfMemory => "retype-pool-exhausted",
+        crate::cap::CapError::OutOfSlots => "slot-quota-reached",
+        crate::cap::CapError::PoolExhausted => "slot-page-pool-exhausted",
         crate::cap::CapError::InvalidIndex | crate::cap::CapError::WxViolation => "unexpected",
     };
     // SAFETY: tcb is the live caller's TCB, validated by the syscall entry.
@@ -711,7 +711,7 @@ pub fn sys_ipc_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     }
     .map_err(|e| {
         log_recv_preallocate_failure(tcb, &e);
-        SyscallError::OutOfMemory
+        SyscallError::from(e)
     })?;
 
     // Open the park episode before the recv-queue link can publish.
@@ -993,13 +993,14 @@ pub fn sys_ipc_reply(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 (*caller_cspace).lock.unlock_raw(saved);
                 r
             };
-            if pre_res.is_err()
+            if let Err(e) = pre_res
             {
                 // Caller's CSpace cannot accept reply caps. Wake the caller with
                 // a synthetic failure reply so it un-parks and surfaces the error
-                // rather than dead-locking; bubble OOM to the server.
+                // rather than dead-locking; bubble the pool/quota distinction
+                // to the server.
                 // SAFETY: tcb validated above.
-                return Err(unsafe { fail_reply_and_wake_caller(tcb, SyscallError::OutOfMemory) });
+                return Err(unsafe { fail_reply_and_wake_caller(tcb, e.into()) });
             }
         }
     }

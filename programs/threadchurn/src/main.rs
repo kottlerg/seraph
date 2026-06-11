@@ -49,8 +49,13 @@ const REAP_CHURN: u64 = 50;
 const DETACH_BATCH: u64 = 48;
 /// Allowed slot growth between the baseline and the final sample. Absorbs
 /// lazily-created one-time caps (the reaper death `EventQueue`, pooled object
-/// slabs) that may not have settled at the baseline. Steady-state growth is 0.
-const SLACK: u64 = 12;
+/// slabs and their shelf entries) that may not have settled at the baseline.
+/// Steady-state growth is 0: the pooled object slab recycles auto-reclaimed
+/// done-notification bytes in place (#364), so the ~700 spawn-churned
+/// `BIN_128` chunks in this run trigger no steady-state refills. A pool that
+/// never recycles leaks one pool-cap slot per ~63-chunk refill (~11 over this
+/// run), which this bound trips.
+const SLACK: u64 = 4;
 /// Allowed memmgr free-pool drop across the churn (#274). With mid-life slab
 /// reclaim the steady-state footprint stays flat (a passing run stays far under
 /// this bound); a per-spawn slab RAM leak would drop free memory by

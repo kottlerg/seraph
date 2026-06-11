@@ -47,7 +47,7 @@ pub const EXIT_RECV_WEDGE: u32 = 0x0F10;
 /// Consecutive identical receive failures before the guard escalates to
 /// [`syscall::process_exit`]. Combined with the backoff schedule this puts
 /// death roughly 3 s after the first failure: long enough that a transient
-/// retype-pool dip cannot kill a healthy service, short enough that a wedged
+/// slot-page-pool dip cannot kill a healthy service, short enough that a wedged
 /// one dies before its clients' timeouts cascade.
 pub const RECV_FAILURE_FATAL_STREAK: u32 = 32;
 

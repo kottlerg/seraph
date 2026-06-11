@@ -270,6 +270,23 @@ pub fn tag_mismatch_invalid_arg(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
+/// `max_slots = 0` on create-mode `cap_create_cspace` defaults the quota
+/// to what the seeded pool backs — `(init_pages - 1) * 56 - 1` usable
+/// slots — never an unbacked 14336 ceiling (#366).
+pub fn cspace_default_max_slots_is_pool_backed(ctx: &TestContext) -> TestResult
+{
+    let cs = cap_create_cspace(ctx.memory_base, 0, 4, 0)
+        .map_err(|_| "cap_create_cspace(init_pages=4, max_slots=0) failed")?;
+    let capacity = cap_info(cs, CAP_INFO_CSPACE_CAPACITY);
+    cap_delete(cs).map_err(|_| "cap_delete(cspace) failed")?;
+    let capacity = capacity.map_err(|_| "cap_info(CSPACE_CAPACITY) failed")?;
+    if capacity != 3 * 56 - 1
+    {
+        return Err("default max_slots != pool-backed capacity (3 pool pages)");
+    }
+    Ok(())
+}
+
 /// Unknown selector returns `InvalidArgument`.
 pub fn unknown_field_invalid_arg(ctx: &TestContext) -> TestResult
 {

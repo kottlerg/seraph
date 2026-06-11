@@ -163,9 +163,10 @@ the receive *before* blocking. The condition is structural, not transient — an
 Two mechanisms make the condition diagnosable:
 
 - **Kernel diagnostic.** The kernel emits a rate-limited console line (logged at power-of-two
-  occurrence counts) naming the receiving thread and the cause — CSpace slot ceiling versus
-  retype-pool depletion. This is the only signal a process with no log channel (memmgr) can
-  produce before it dies.
+  occurrence counts) naming the receiving thread and the cause — the `max_slots` quota versus
+  refillable slot-page-pool depletion, mirroring the `QuotaExceeded` / `OutOfMemory` error
+  split in [capability-model.md](capability-model.md). This is the only signal a process with
+  no log channel (memmgr) can produce before it dies.
 - **Userspace policy.** Blocking receive loops MUST route every receive outcome through
   `ipc::recv_guard::RecvGuard`: bounded exponential backoff between failed receives, a
   diagnostic hook at the first failure of a streak, and voluntary process death with

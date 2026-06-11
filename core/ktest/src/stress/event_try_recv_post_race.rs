@@ -23,16 +23,20 @@
 //! ## How this exercises it
 //!
 //! POLLER (pinned CPU 0) and POSTER (pinned CPU 1) run `CYCLES` lockstep
-//! rounds. Each round the poster stores an odd `POST_SEQ`, posts one payload,
-//! stores the even `POST_SEQ`, and signals a `gate` notification; the poller
-//! meanwhile spins `event_try_recv` up to `ATTEMPTS` times, bracketing each
-//! poll with `POST_SEQ` samples — a poll whose bracket is odd-or-changed
-//! provably overlapped the poster's bracket and counts the round as ARMED.
-//! (The bracket opens in userspace around the post syscall, so ARMED is an
-//! OUTER bound on true kernel-window overlap — read it as "overlap candidate",
-//! not proven in-kernel overlap.) The poller then parks for real on the gate
+//! rounds. Each round the poller samples `POST_SEQ`, publishes `POLLING`,
+//! and hammers `event_try_recv` until the payload lands; the poster waits
+//! for `POLLING`, then stores an odd `POST_SEQ`, posts one payload, stores
+//! the even `POST_SEQ`, and signals a `gate` notification. Each poll's exit
+//! `POST_SEQ` sample is the next poll's entry sample, so the witness
+//! brackets tile the loop gaplessly: the poster's bracket — gated on
+//! `POLLING`, hence opened strictly after the poller's first sample, and
+//! closed before the consuming poll's exit sample — must land odd-or-changed
+//! inside one of them, counting the round as ARMED. (The bracket opens in
+//! userspace around the post syscall, so ARMED is an OUTER bound on true
+//! kernel-window overlap — read it as "overlap candidate", not proven
+//! in-kernel overlap.) The poller then parks for real on the gate
 //! (`notification_wait`) — the second park that detonates a leaked link —
-//! drains any payload its polls missed, and asserts the queue is empty.
+//! and asserts the queue is empty.
 //!
 //! ## Expected pre-fix failure modes (any one is the FAIL signal)
 //!
@@ -50,19 +54,18 @@
 //! consume the stale entry via that same next==current re-mark and silently
 //! self-heal a round, so not every armed round detonates; with hundreds of
 //! armed rounds per boot the old kernel still fails with near certainty. A
-//! marginal detonation result means raise `ATTEMPTS`/`CYCLES`, not vacuity.
+//! marginal detonation result means raise `CYCLES`, not vacuity.
 //!
 //! ## Anti-vacuous guards
 //!
-//! - `ARMED >= CYCLES / 4`: at least a quarter of the rounds must show a
-//!   poll/post overlap candidate. The deviation from the house
-//!   `armed_cycles == CYCLES` equality is deliberate: those witnesses are
-//!   deterministic barrier signals, this one is true racing overlap
-//!   (probabilistic — preemption can slip a round). If the floor proves
-//!   flaky-low on an arch, raise `ATTEMPTS` (more polls per overlap window);
-//!   never lower the floor.
-//! - `CONSUMED == CYCLES`: every round's payload consumed exactly once (poll
-//!   hit or post-park drain) — conservation across both consumption points.
+//! - `ARMED >= CYCLES / 4`: the `POLLING` handshake plus gapless brackets
+//!   make arming structural — every completed round should arm regardless of
+//!   how the host serialises the two vCPUs (TCG timeslicing cannot slide the
+//!   post between brackets). The floor stays at a quarter as defence against
+//!   an unforeseen witness gap; a breach means the handshake is broken, not
+//!   that the floor should be lowered.
+//! - `CONSUMED == CYCLES`: every round's payload consumed exactly once —
+//!   conservation across the poll loop.
 //!
 //! ## Pass criterion
 //!
@@ -84,10 +87,6 @@ use crate::{ChildStack, TestContext, TestResult, spawn};
 /// timing jitter while keeping the cell inside the suite's time budget.
 const CYCLES: u32 = 1024;
 
-/// Polls per round. Each poll is one `event_try_recv` syscall bracketed by
-/// `POST_SEQ` samples; 64 polls comfortably span the poster's post syscall.
-const ATTEMPTS: u32 = 64;
-
 /// Notification signal right (bit 7) and wait right (bit 8). Each cap copy
 /// carries only the right its one-directional use needs.
 const RIGHTS_SIGNAL: u64 = 1 << 7;
@@ -105,6 +104,12 @@ const BIT_POSTER_DONE: u64 = 1 << 1;
 /// appears. `u32::MAX` = no round published yet.
 static GO: AtomicU32 = AtomicU32::new(u32::MAX);
 
+/// Poll-loop handshake: the poller publishes the round number after taking
+/// its first `POST_SEQ` sample; the poster opens its post bracket only after
+/// observing it. Guarantees the bracket lands inside the poller's gapless
+/// witness window on any host interleaving. `u32::MAX` = not polling yet.
+static POLLING: AtomicU32 = AtomicU32::new(u32::MAX);
+
 /// Post-syscall overlap witness: odd while the poster is inside its
 /// `event_post` bracket for the current round, even otherwise.
 static POST_SEQ: AtomicU32 = AtomicU32::new(0);
@@ -112,10 +117,7 @@ static POST_SEQ: AtomicU32 = AtomicU32::new(0);
 /// Rounds whose poll bracket provably overlapped the poster's bracket.
 static ARMED: AtomicU32 = AtomicU32::new(0);
 
-/// Rounds whose payload was consumed by the post-park drain (poll missed).
-static RACED_PAST: AtomicU32 = AtomicU32::new(0);
-
-/// Payloads consumed across both consumption points. Must equal CYCLES.
+/// Payloads consumed by the poll loop. Must equal CYCLES.
 static CONSUMED: AtomicU32 = AtomicU32::new(0);
 
 /// First failure code observed by either child (0 = none). See
@@ -138,7 +140,6 @@ fn failure_message(code: u32) -> &'static str
             "stress::event_try_recv_post_race: gate wait returned zero/wrong bits \
               (premature park resume — #352 variant B)"
         }
-        4 => "stress::event_try_recv_post_race: post-park drain found no payload (lost wake)",
         5 => "stress::event_try_recv_post_race: queue not empty after consume (duplicated wake)",
         6 => "stress::event_try_recv_post_race: poster event_post failed",
         7 => "stress::event_try_recv_post_race: poster gate send failed",
@@ -189,9 +190,9 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     // Reset shared state: ktest cells run sequentially, but make reruns clean.
     GO.store(u32::MAX, Ordering::Relaxed);
+    POLLING.store(u32::MAX, Ordering::Relaxed);
     POST_SEQ.store(0, Ordering::Relaxed);
     ARMED.store(0, Ordering::Relaxed);
-    RACED_PAST.store(0, Ordering::Relaxed);
     CONSUMED.store(0, Ordering::Relaxed);
     FAILURE.store(0, Ordering::Relaxed);
 
@@ -255,15 +256,10 @@ pub fn run(ctx: &TestContext) -> TestResult
     }
 
     let armed = ARMED.load(Ordering::Acquire);
-    let raced_past = RACED_PAST.load(Ordering::Acquire);
     let consumed = CONSUMED.load(Ordering::Acquire);
     crate::log_u64(
         "ktest: stress::event_try_recv_post_race armed=",
         u64::from(armed),
-    );
-    crate::log_u64(
-        "ktest: stress::event_try_recv_post_race raced_past=",
-        u64::from(raced_past),
     );
 
     if consumed != CYCLES
@@ -277,7 +273,8 @@ pub fn run(ctx: &TestContext) -> TestResult
     {
         return Err(
             "stress::event_try_recv_post_race: under-armed (< CYCLES/4 overlap \
-                    candidates) — raise ATTEMPTS, do not lower the floor",
+                    candidates) — the POLLING handshake is broken; do not lower \
+                    the floor",
         );
     }
 
@@ -299,10 +296,11 @@ fn decode(arg: u64) -> (u32, u32, u32, u32)
     )
 }
 
-/// POLLER: per round, spin until the ticket appears, hammer `event_try_recv`
-/// with `POST_SEQ` overlap brackets, then park on the gate notification (the
-/// second park that detonates a leaked link), drain any missed payload, and
-/// assert the queue is empty before acking the round.
+/// POLLER: per round, spin until the ticket appears, publish the `POLLING`
+/// handshake, hammer `event_try_recv` under gapless `POST_SEQ` witness
+/// brackets until the payload lands, then park on the gate notification (the
+/// second park that detonates a leaked link) and assert the queue is empty
+/// before acking the round.
 fn poller_entry(arg: u64) -> !
 {
     let (eq, gate, ack, done) = decode(arg);
@@ -321,17 +319,24 @@ fn poller_entry(arg: u64) -> !
             core::hint::spin_loop();
         }
 
-        let mut hit = false;
+        // First witness sample, then the poll-loop handshake: the poster's
+        // bracket opens strictly after this sample (Release/Acquire on
+        // POLLING), and each poll's exit sample seeds the next poll's entry
+        // sample, so the brackets tile gaplessly until the consuming poll —
+        // the bracket must land odd-or-changed inside one of them.
+        let mut s_prev = POST_SEQ.load(Ordering::Acquire);
+        POLLING.store(c, Ordering::Release);
+
         let mut overlap = false;
-        for _ in 0..ATTEMPTS
+        loop
         {
-            let s0 = POST_SEQ.load(Ordering::Acquire);
             let r = event_try_recv(eq);
-            let s1 = POST_SEQ.load(Ordering::Acquire);
-            if s0 % 2 == 1 || s0 != s1
+            let s_now = POST_SEQ.load(Ordering::Acquire);
+            if s_prev % 2 == 1 || s_prev != s_now
             {
                 overlap = true;
             }
+            s_prev = s_now;
             match r
             {
                 Ok(payload) =>
@@ -342,11 +347,18 @@ fn poller_entry(arg: u64) -> !
                         break 'rounds;
                     }
                     CONSUMED.fetch_add(1, Ordering::AcqRel);
-                    hit = true;
                     break;
                 }
                 Err(e) if e == wouldblock =>
-                {}
+                {
+                    // The handshaked poster owes this round's payload; every
+                    // miss is one more try-once racing the post. A poster-side
+                    // failure means it will never land — bail.
+                    if FAILURE.load(Ordering::Acquire) != 0
+                    {
+                        break 'rounds;
+                    }
+                }
                 Err(_) =>
                 {
                     fail(1);
@@ -371,25 +383,6 @@ fn poller_entry(arg: u64) -> !
             {
                 fail(3);
                 break 'rounds;
-            }
-        }
-
-        if !hit
-        {
-            // The poster's post preceded its gate send, so the payload is in
-            // the ring by the time the wait returns.
-            match event_try_recv(eq)
-            {
-                Ok(payload) if payload == u64::from(c) =>
-                {
-                    CONSUMED.fetch_add(1, Ordering::AcqRel);
-                    RACED_PAST.fetch_add(1, Ordering::AcqRel);
-                }
-                _ =>
-                {
-                    fail(4);
-                    break 'rounds;
-                }
             }
         }
 
@@ -419,7 +412,8 @@ fn poller_entry(arg: u64) -> !
 }
 
 /// POSTER: per round, wait for the poller's previous-round ack, publish the
-/// ticket, post the payload inside the `POST_SEQ` bracket, and signal the gate.
+/// ticket, wait for the poller's `POLLING` handshake, post the payload inside
+/// the `POST_SEQ` bracket, and signal the gate.
 fn poster_entry(arg: u64) -> !
 {
     let (eq, gate, ack, done) = decode(arg);
@@ -443,6 +437,19 @@ fn poster_entry(arg: u64) -> !
         }
 
         GO.store(c, Ordering::Release);
+
+        // Open the bracket only once the poller is provably inside its
+        // witness window (first sample taken, handshake published) — arming
+        // is structural, not a timing bet. A poller-side failure means the
+        // handshake never appears; bail instead of spinning forever.
+        while POLLING.load(Ordering::Acquire) != c
+        {
+            if FAILURE.load(Ordering::Acquire) != 0
+            {
+                break 'rounds;
+            }
+            core::hint::spin_loop();
+        }
 
         POST_SEQ.store(2 * c + 1, Ordering::Release);
         if event_post(eq, u64::from(c)).is_err()

@@ -1075,8 +1075,14 @@ pub fn sleep_check_wakeups()
                 {
                     // SAFETY: tcb still valid; see above. State/ipc_state/
                     // blocked_on_object are committed by enqueue_and_wake
-                    // under sched.lock.
+                    // under sched.lock. The CAS win is the episode claim: a
+                    // timed-out call is a cancellation, so the caller's resume
+                    // takes the Interrupted path, not a stale ipc_msg read.
                     unsafe {
+                        crate::sched::thread::stamp_reply_deposit(
+                            tcb,
+                            crate::sched::thread::REPLY_DISPOSITION_INTERRUPTED,
+                        );
                         (*tcb).wakeup_value = 0;
                         (*tcb).timed_out = true;
                         (*tcb).sleep_deadline = 0;
@@ -1114,12 +1120,14 @@ pub fn sleep_check_wakeups()
                 if we_win
                 {
                     // SAFETY: tcb still valid; fault_outcome / sleep_deadline
-                    // always valid. State committed by enqueue_and_wake.
+                    // always valid. State committed by enqueue_and_wake. CAS
+                    // win = episode claim; the fault disposition is the KILL.
                     unsafe {
                         (*tcb).fault_outcome.store(
                             crate::ipc::fault::FAULT_OUTCOME_KILL,
                             core::sync::atomic::Ordering::Release,
                         );
+                        crate::sched::thread::stamp_deposit_episode(tcb);
                         (*tcb).sleep_deadline = 0;
                     }
                 }
@@ -1318,6 +1326,13 @@ pub fn init(cpu_count: u32) -> u32
                     ipc_state: IpcThreadState::None,
                     ipc_msg: crate::ipc::message::Message::default(),
                     reply_tcb: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
+                    reply_disposition: core::sync::atomic::AtomicU8::new(
+                        thread::REPLY_DISPOSITION_NONE,
+                    ),
+                    #[cfg(debug_assertions)]
+                    park_episode: core::sync::atomic::AtomicU32::new(0),
+                    #[cfg(debug_assertions)]
+                    deposit_episode: core::sync::atomic::AtomicU32::new(0),
                     ipc_wait_next: None,
                     fault_handler: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
                     fault_badge: core::sync::atomic::AtomicU64::new(0),
@@ -2189,10 +2204,20 @@ unsafe fn relocate_ready_thread(
     {
         return false;
     }
+    // Skip is impossible: remove_from_queue just cleared queued_on under both
+    // held run-queue locks. Assert it; retarget preferred_cpu only on the
+    // created link (#359).
     // SAFETY: tcb no longer on src; dst scheduler valid; both locks held.
-    unsafe { scheduler_for(dst_cpu).enqueue(tcb, priority) };
-    // SAFETY: tcb valid; sched_lock + both run-queue locks held.
-    unsafe { (*tcb).preferred_cpu = dst_cpu as u32 };
+    let linked = unsafe { scheduler_for(dst_cpu).enqueue(tcb, priority) };
+    debug_assert!(
+        linked,
+        "relocate_ready_thread: enqueue skipped after successful remove"
+    );
+    if linked
+    {
+        // SAFETY: tcb valid; sched_lock + both run-queue locks held.
+        unsafe { (*tcb).preferred_cpu = dst_cpu as u32 };
+    }
     // G4: the relocated thread is linked on dst at exactly `priority` (a stale
     // tag here would mean a double-relocate left an inconsistent link).
     // SAFETY: tcb valid; queued_on read under the held run-queue locks.
@@ -2559,19 +2584,29 @@ pub unsafe fn enqueue_and_wake(tcb: *mut ThreadControlBlock, target_cpu: usize)
 
     // SAFETY: both locks held; tcb valid. Read priority under the run-queue lock
     // so the enqueue links at whatever value sys_thread_set_priority's all-CPU
-    // region last published. preferred_cpu is updated so dealloc_object targets
-    // the correct scheduler; wake_pending cleared defensively.
+    // region last published. These writes stay ungated on the link result: for
+    // an already-linked (skip) TCB they are idempotent or consistency-improving
+    // (a linked thread must be Ready with no block binding). wake_pending
+    // cleared defensively.
     let priority = unsafe {
         (*tcb).state = thread::ThreadState::Ready;
         (*tcb).ipc_state = thread::IpcThreadState::None;
         (*tcb).blocked_on_object = core::ptr::null_mut();
         (*tcb).wake_pending = false;
-        (*tcb).preferred_cpu = target_cpu as u32;
         (*tcb).priority
     };
 
     // SAFETY: both locks held; tcb is valid.
-    sched.enqueue(tcb, priority);
+    let linked = sched.enqueue(tcb, priority);
+    if linked
+    {
+        // Retarget preferred_cpu only when this call created the link, so the
+        // field always names the surviving link's CPU (#359). Its consumers —
+        // select_target_cpu's save-window pinning and sticky routing, the load
+        // balancer — route wakes and migrations by it.
+        // SAFETY: both locks held; tcb valid.
+        unsafe { (*tcb).preferred_cpu = target_cpu as u32 };
+    }
 
     // Release-ordered: the unlock publishes the enqueue + flag to any CPU
     // observing the bit. See docs/scheduling-internals.md § Wake Protocol.
@@ -2642,12 +2677,20 @@ pub unsafe fn enqueue_ready_thread(tcb: *mut ThreadControlBlock, target_cpu: usi
         (*tcb).ipc_state = thread::IpcThreadState::None;
         (*tcb).blocked_on_object = core::ptr::null_mut();
         (*tcb).wake_pending = false;
-        (*tcb).preferred_cpu = target_cpu as u32;
         (*tcb).priority
     };
 
     // SAFETY: both locks held; tcb valid.
-    sched.enqueue(tcb, priority);
+    let linked = sched.enqueue(tcb, priority);
+    if linked
+    {
+        // Retarget preferred_cpu only on a created link (#359): on a release
+        // skip the field keeps naming the surviving link's CPU. The caller's
+        // not-linked precondition makes a skip a contract violation, caught by
+        // the debug panic arm in enqueue.
+        // SAFETY: both locks held; tcb valid.
+        unsafe { (*tcb).preferred_cpu = target_cpu as u32 };
+    }
 
     set_reschedule_pending_for(target_cpu);
 
@@ -3065,8 +3108,20 @@ pub unsafe fn schedule(requeue_current: bool)
                     // matching the local-requeue arm below.
                     let aff_sched = scheduler_for(aff as usize);
                     let aff_saved = aff_sched.lock.lock_raw();
-                    (*current).preferred_cpu = aff;
-                    aff_sched.enqueue(current, prio);
+                    // Skip is unreachable here: `!already_queued` was read under
+                    // current.sched_lock, held continuously since, and every
+                    // linker takes that lock. Assert it; retarget preferred_cpu
+                    // only on the created link (#359).
+                    let linked = aff_sched.enqueue(current, prio);
+                    debug_assert!(
+                        linked,
+                        "schedule cross-CPU requeue: enqueue skipped despite \
+                         !already_queued under held sched_lock"
+                    );
+                    if linked
+                    {
+                        (*current).preferred_cpu = aff;
+                    }
                     set_reschedule_pending_for(aff as usize);
                     aff_sched.lock.unlock_raw(aff_saved);
                     wake_idle_cpu(aff as usize);
@@ -3080,9 +3135,19 @@ pub unsafe fn schedule(requeue_current: bool)
                     // Leaving it stale lets a preferred_cpu-keyed path (wake
                     // routing, migrate) dispatch this thread on another CPU while
                     // it is still linked here — the residual cross-CPU
-                    // double-dispatch (docs/sched-ipc-redesign.md §3).
-                    (*current).preferred_cpu = cpu as u32;
-                    sched.enqueue(current, prio);
+                    // double-dispatch (docs/sched-ipc-redesign.md §3). Written
+                    // only on the created link (#359); a skip is unreachable
+                    // here (`!already_queued` read under the held sched_lock).
+                    let linked = sched.enqueue(current, prio);
+                    debug_assert!(
+                        linked,
+                        "schedule local requeue: enqueue skipped despite \
+                         !already_queued under held sched_lock"
+                    );
+                    if linked
+                    {
+                        (*current).preferred_cpu = cpu as u32;
+                    }
                 }
             }
         }

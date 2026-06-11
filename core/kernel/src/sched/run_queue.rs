@@ -287,8 +287,18 @@ impl PerCpuScheduler
     /// double-link that would self-cycle the intrusive list. Debug builds panic
     /// (the `RunQueue::enqueue` tripwire); release builds skip the redundant
     /// link. See the guard below.
+    ///
+    /// Returns `true` iff this call created the link. A `false` return is the
+    /// release-mode skip: `tcb` survives linked wherever its prior enqueue
+    /// placed it. Callers that retarget `preferred_cpu` for this link MUST
+    /// gate that write on a `true` return so the field keeps naming the
+    /// surviving link's CPU (#359); callers for which a skip is structurally
+    /// impossible (link preceded by a successful `remove_from_queue`, or the
+    /// `!already_queued` denylist read under the TCB's held `sched_lock`)
+    /// assert the result instead.
+    #[must_use]
     #[track_caller]
-    pub fn enqueue(&mut self, tcb: *mut ThreadControlBlock, priority: u8)
+    pub fn enqueue(&mut self, tcb: *mut ThreadControlBlock, priority: u8) -> bool
     {
         let p = priority as usize;
         // Debug: detect use-after-free via magic cookie.
@@ -316,8 +326,10 @@ impl PerCpuScheduler
         // exactly the case #289 reproduced. In debug, panic naming the prior
         // link's breadcrumb; in release, skip the redundant link losslessly
         // (`tcb` is already Ready and queued, so it is dispatched from where it
-        // sits — no wake is lost). Checked before `increment_load` so a skipped
-        // link leaves the load counter exact.
+        // sits — no wake is lost, and the `false` return keeps the caller from
+        // retargeting `preferred_cpu` away from that surviving link). Checked
+        // before `increment_load` so a skipped link leaves the load counter
+        // exact.
         // SAFETY: tcb is valid; the caller holds this scheduler's lock, so
         // queued_on is stable for this read.
         let prior_link = unsafe { (*tcb).queued_on.load(Ordering::Relaxed) };
@@ -344,7 +356,7 @@ impl PerCpuScheduler
                 );
             }
             #[cfg(not(debug_assertions))]
-            return;
+            return false;
         }
 
         self.increment_load();
@@ -375,6 +387,7 @@ impl PerCpuScheduler
         // loop relies on this: it is lockless, so the Acquire load of
         // `non_empty` is the only synchronisation edge with cross-CPU enqueues.
         self.non_empty.fetch_or(1 << p, Ordering::Release);
+        true
     }
 
     /// Dequeue the highest-priority ready TCB, or return `idle` if all queues
@@ -619,9 +632,9 @@ mod tests
         let pb = &mut *b as *mut _;
         let pc = &mut *c as *mut _;
 
-        sched.enqueue(pa, 0);
-        sched.enqueue(pb, 0);
-        sched.enqueue(pc, 0);
+        assert!(sched.enqueue(pa, 0));
+        assert!(sched.enqueue(pb, 0));
+        assert!(sched.enqueue(pc, 0));
 
         // idle must be set so dequeue_highest doesn't read a null pointer.
         sched.set_idle(pa);
@@ -651,7 +664,7 @@ mod tests
         let pa = &mut *a as *mut _;
 
         assert!(!sched.has_runnable());
-        sched.enqueue(pa, 5);
+        assert!(sched.enqueue(pa, 5));
         assert!(sched.has_runnable());
         sched.set_idle(pa);
         sched.dequeue_highest();
@@ -670,9 +683,9 @@ mod tests
         let pb = &mut *b as *mut _;
 
         assert_eq!(sched.non_empty.load(Ordering::Relaxed), 0);
-        sched.enqueue(pa, 7);
+        assert!(sched.enqueue(pa, 7));
         assert_eq!(sched.non_empty.load(Ordering::Relaxed), 1 << 7);
-        sched.enqueue(pb, 15);
+        assert!(sched.enqueue(pb, 15));
         assert_eq!(
             sched.non_empty.load(Ordering::Relaxed),
             (1 << 7) | (1 << 15)
@@ -691,9 +704,9 @@ mod tests
         let pc = &mut *c as *mut _;
 
         // Enqueue at priorities 0, 5, 15 — expect 15 first, then 5, then 0.
-        sched.enqueue(pa, 0);
-        sched.enqueue(pb, 5);
-        sched.enqueue(pc, 15);
+        assert!(sched.enqueue(pa, 0));
+        assert!(sched.enqueue(pb, 5));
+        assert!(sched.enqueue(pc, 15));
         sched.set_idle(pa);
 
         assert_eq!(sched.dequeue_highest(), pc);
@@ -708,7 +721,7 @@ mod tests
         let mut a = make_tcb();
         let pa = &mut *a as *mut _;
 
-        sched.enqueue(pa, 3);
+        assert!(sched.enqueue(pa, 3));
         assert_ne!(sched.non_empty.load(Ordering::Relaxed) & (1 << 3), 0);
         sched.set_idle(pa);
         sched.dequeue_highest();
@@ -723,7 +736,7 @@ mod tests
         let mut a = make_tcb();
         let pa = &mut *a as *mut _;
 
-        sched.enqueue(pa, 10);
+        assert!(sched.enqueue(pa, 10));
         assert_ne!(sched.non_empty.load(Ordering::Relaxed) & (1 << 10), 0);
         sched.remove_from_queue(pa, 10);
         assert_eq!(sched.non_empty.load(Ordering::Relaxed) & (1 << 10), 0);
@@ -751,9 +764,9 @@ mod tests
         let pb = &mut *b as *mut _;
         let pc = &mut *c as *mut _;
 
-        sched.enqueue(pa, 1);
-        sched.enqueue(pb, 1);
-        sched.enqueue(pc, 1);
+        assert!(sched.enqueue(pa, 1));
+        assert!(sched.enqueue(pb, 1));
+        assert!(sched.enqueue(pc, 1));
         sched.set_idle(pa);
 
         // Remove the middle element; A and C should remain in order.
@@ -773,7 +786,7 @@ mod tests
 
         for &p in &ptrs
         {
-            sched.enqueue(p, 7);
+            assert!(sched.enqueue(p, 7));
         }
         sched.set_idle(ptrs[0]);
 
@@ -800,10 +813,10 @@ mod tests
         let pc = &mut *c as *mut _;
         let pd = &mut *d as *mut _;
 
-        sched.enqueue(pa, 5);
-        sched.enqueue(pb, 10);
-        sched.enqueue(pc, 5);
-        sched.enqueue(pd, 10);
+        assert!(sched.enqueue(pa, 5));
+        assert!(sched.enqueue(pb, 10));
+        assert!(sched.enqueue(pc, 5));
+        assert!(sched.enqueue(pd, 10));
         sched.set_idle(pa);
 
         // P=10 threads come out first (FIFO within their priority).
@@ -812,5 +825,26 @@ mod tests
         // Then P=5 threads in original enqueue order.
         assert_eq!(sched.dequeue_highest(), pa);
         assert_eq!(sched.dequeue_highest(), pc);
+    }
+
+    // The debug double-enqueue panic arm is not host-testable: the workspace
+    // builds with `panic = "abort"`, so `#[should_panic]` cannot observe it.
+    // The release skip arm (`false` return) is equally unobservable here (host
+    // tests compile with debug_assertions). Both arms are covered by the
+    // two-arch ktest stress suite.
+
+    #[test]
+    fn remove_then_enqueue_returns_true()
+    {
+        // The set_priority / relocate shape: a successful remove clears
+        // queued_on, so the follow-up enqueue must create the link.
+        let mut sched = PerCpuScheduler::new();
+        let mut a = make_tcb();
+        let pa = &mut *a as *mut _;
+
+        assert!(sched.enqueue(pa, 4));
+        assert!(sched.remove_from_queue(pa, 4));
+        assert!(sched.enqueue(pa, 9));
+        assert_ne!(sched.non_empty.load(Ordering::Relaxed) & (1 << 9), 0);
     }
 }

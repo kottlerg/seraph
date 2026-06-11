@@ -61,7 +61,7 @@ use syscall::{
     cap_copy, cap_create_endpoint, cap_create_notification, cap_delete, ipc_buffer_set,
     notification_send, notification_wait, thread_exit, thread_yield,
 };
-use syscall_abi::{RIGHTS_RECEIVE, RIGHTS_SEND_GRANT, SystemInfoType};
+use syscall_abi::{RIGHTS_RECEIVE, RIGHTS_SEND_GRANT, SyscallError, SystemInfoType};
 
 use crate::{ChildStack, TestContext, TestResult, spawn};
 
@@ -76,9 +76,16 @@ const RIGHTS_SIGNAL: u64 = 1 << 7;
 /// once the client is `BlockedOnReply` and the reply-wake is armed.
 const BIT_SERVER_ARMED: u64 = 1 << 0;
 
-/// `done` bit the client raises when its `ipc_call` returns — the wake the
-/// server's dealloc owed it. **Required** every cycle; a lost wake never sends it.
+/// `done` bit the client raises when its `ipc_call` returns `Interrupted` —
+/// the wake AND disposition the server's dealloc owed it. **Required** every
+/// cycle; a lost wake never sends it.
 const BIT_CLIENT_WOKE: u64 = 1 << 1;
+
+/// `done` bit the client raises when its `ipc_call` returns anything OTHER
+/// than `Interrupted`: the dealloc wake delivered a wrong disposition (e.g.
+/// stale `ipc_msg` bytes surfaced as a successful reply — the #361 clobber).
+/// Immediate FAIL with a named error instead of a watchdog hang.
+const BIT_CLIENT_BAD: u64 = 1 << 2;
 
 /// Bound on the server's post-recv busy-spin, keeping the server TCB live for a
 /// short window after it signals armed so the `cap_delete` lands while the
@@ -205,12 +212,21 @@ pub fn run(ctx: &TestContext) -> TestResult
         // BIT_CLIENT_WOKE, so this `notification_wait` blocks, every CPU goes
         // idle, and the softlockup watchdog fires — the FAIL signal, raised by
         // the kernel (its registry walk names the stranded BlockedOnReply
-        // client), not by a test assertion.
-        while acc & BIT_CLIENT_WOKE == 0
+        // client), not by a test assertion. DISPOSITION GATE: a wake that
+        // surfaces anything but `Interrupted` raises BIT_CLIENT_BAD instead —
+        // fail fast with a named error.
+        while acc & (BIT_CLIENT_WOKE | BIT_CLIENT_BAD) == 0
         {
             let bits = notification_wait(done)
                 .map_err(|_| "stress::cap_delete_reply_wake: notification_wait(woke) failed")?;
             acc |= bits;
+        }
+        if acc & BIT_CLIENT_BAD != 0
+        {
+            return Err(
+                "stress::cap_delete_reply_wake: dealloc wake returned a non-Interrupted \
+                 result (garbage reply — #361 disposition clobber)",
+            );
         }
         woke_cycles += 1;
 
@@ -289,8 +305,9 @@ fn server_entry(arg: u64) -> !
 }
 
 /// Client: call the endpoint (blocking `BlockedOnReply` on the server TCB). The
-/// call returns when the server's dealloc wakes it with `Interrupted`; it then
-/// raises the woke bit the controller gates on.
+/// call returns when the server's dealloc wakes it; the deposited disposition
+/// MUST be `Interrupted` (the #361 contract) — anything else raises the bad
+/// bit the controller fails fast on.
 fn client_entry(arg: u64) -> !
 {
     let (ep_slot, done_slot) = decode(arg);
@@ -304,7 +321,11 @@ fn client_entry(arg: u64) -> !
     }
 
     // SAFETY: `buf` was registered as this thread's IPC buffer above.
-    let _ = unsafe { ipc::ipc_call(ep_slot, &IpcMessage::new(0), buf) };
-    notification_send(done_slot, BIT_CLIENT_WOKE).ok();
+    let bit = match unsafe { ipc::ipc_call(ep_slot, &IpcMessage::new(0), buf) }
+    {
+        Err(e) if e == SyscallError::Interrupted as i64 => BIT_CLIENT_WOKE,
+        _ => BIT_CLIENT_BAD,
+    };
+    notification_send(done_slot, bit).ok();
     thread_exit()
 }

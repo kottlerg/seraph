@@ -149,6 +149,52 @@ size.
 8. If caller_tcb.priority > current_tcb.priority: direct switch
 ```
 
+### Reply Disposition and Park Episodes
+
+Every `sys_ipc_call` park is an **episode** with exactly one deposit. The TCB
+carries `reply_disposition` (`NONE`/`REPLY`/`INTERRUPTED`); debug builds add
+`park_episode`/`deposit_episode` counters.
+
+**Episode start (ownership window).** `sys_ipc_call` resets
+`reply_disposition = NONE` (and bumps `park_episode`) *before* `endpoint_call`
+publishes any claimable state (`reply_tcb`, or the send-queue link). Until
+that publication the parking thread exclusively owns its wake fields, so the
+reset cannot race a deposit. `fault_dispatch` bumps the episode the same way
+next to its `fault_outcome = Pending` reset.
+
+**Claim-then-stamp rule.** A site may stamp the episode only after winning
+the episode's exclusive wake claim. Per the DEPOSIT model (rule 8 /
+sched-ipc-redesign.md §2.1) every deposit now carries a disposition; the
+resume remains deposit-read, never re-check. Stamps are Release-ordered after
+the payload write; the resume's Acquire load orders the payload reads after
+it. The wake chain (stamp → `enqueue_and_wake`'s `sched_lock`/run-queue
+Release → dispatch Acquire → resume) carries the stamp; for the
+wake-before-park refusal, `wake_pending` is written and consumed under the
+same `(*tcb).sched_lock`, which carries it to the refusing parker.
+
+| Deposit site | Exclusive claim | Stamp |
+|---|---|---|
+| `sys_ipc_reply` normal arm | `reply_tcb` CAS won in `endpoint_reply` | episode + REPLY (after cap-result writes) |
+| `sys_ipc_reply` fault-RESUME arm | same CAS | episode only (`fault_outcome` carries RESUME/KILL) |
+| `fail_reply_and_wake_caller` | `reply_tcb.swap(null)` non-null | episode + REPLY (synthetic failure reply) |
+| `cancel_ipc_block` BlockedOnReply / BlockedOnFault arms | `reply_tcb` CAS | episode + INTERRUPTED / episode + KILL |
+| `cancel_ipc_block` BlockedOnSend arm | send-queue unlink win under `ep.lock` (a lost unlink hands the episode to the racing rebind chain) | episode + INTERRUPTED (faulter: episode + KILL) |
+| `dealloc_object(Thread)` reply-bound wake | `reply_tcb` CAS under all-CPU locks | episode + INTERRUPTED (faulter: episode + KILL) |
+| sleep-list timer BlockedOnReply / BlockedOnFault arms (defensive, unreachable today) | `reply_tcb` CAS | episode + INTERRUPTED / episode + KILL |
+| `endpoint_call` rendezvous commit-fail teardown | teardown `reply_tcb` CAS win | episode + INTERRUPTED / KILL — without it a legitimate stop→start resume has no deposit |
+| `endpoint_call` send-queue commit-fail teardown | `ep.lock` held continuously from link to unlink | episode + INTERRUPTED / KILL |
+| `endpoint_recv` rebind-fail teardown | teardown `reply_tcb` CAS win (stamped before the wake-in-flight release — a dying caller's dealloc may free the TCB after it) | episode + INTERRUPTED / KILL |
+| `dealloc_object(Thread)` dying-client detach arms | `reply_tcb` CAS | **no stamp** — the claimed thread is the one being freed; it never resumes |
+
+**Resume.** `sys_ipc_call` consumes the disposition: REPLY reads `ipc_msg`;
+INTERRUPTED returns `Interrupted` without touching `ipc_msg` (the trap-frame
+`Interrupted` pokes in cancel/dealloc remain only for the non-reply blocking
+syscalls, whose continuations would otherwise clobber them — the #361
+surface); NONE is a protocol violation: debug builds assert (naming
+tid/park-episode/deposit-episode — the #352-class spurious-resume tripwire,
+also checked in `fault_dispatch`'s resume), release builds fail closed with
+`Interrupted` rather than surfacing stale `ipc_msg` bytes as a success.
+
 ### Direct Thread Switch (Fast Path Optimization)
 
 When a synchronous IPC completes and the recipient has higher priority than the

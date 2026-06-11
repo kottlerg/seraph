@@ -715,19 +715,29 @@ pub fn namespace_lookup_dir(
     Ok(walked.dir_cap)
 }
 
-/// Return a Memory-cap slot suitable as the source for a `cap_create_*`
-/// retype, with at least `min_bytes` of `available_bytes`.
+/// Retype one kernel object out of the runtime's object-slab machinery.
 ///
 /// `min_bytes` is the raw byte cost of the kernel object the caller is
-/// about to create (e.g. 88 for `Endpoint`); the runtime rounds up to the
-/// kernel's size-class granularity and debits a per-process local ledger.
-/// The returned slot is reused across calls until exhausted, at which
-/// point a fresh slab page is fetched from memmgr.
+/// about to create (e.g. 88 for `Endpoint`, 120 for `Notification`); the
+/// runtime rounds up to the kernel's size-class granularity. `retype` is
+/// called at most once with a Memory-cap slot whose `available_bytes`
+/// covers that class and must perform exactly one `cap_create_*` syscall
+/// against the slot, returning `Some` on success.
 ///
-/// Returns `None` if memmgr is unreachable or refuses the request.
+/// # Closure contract
+///
+/// Sub-page classes run `retype` under the slab pool's spinlock: exactly
+/// one retype syscall and nothing else — no allocation, no blocking, no
+/// panicking, no re-entry into the slab APIs — and the slot must not
+/// escape the closure. Page-aligned classes draw a fresh dedicated grant
+/// whose cap slot the runtime reclaims afterwards (the retyped object
+/// keeps its own ancestor reference on the backing memory).
+///
+/// Returns `None` if memmgr is unreachable, refuses the request, or
+/// `retype` itself fails.
 #[stable(feature = "seraph_ext", since = "1.0.0")]
-pub fn object_slab_acquire(min_bytes: u64) -> Option<u32> {
-    pal_alloc::object_slab_acquire(min_bytes)
+pub fn object_slab_retype<T>(min_bytes: u64, retype: impl FnOnce(u32) -> Option<T>) -> Option<T> {
+    pal_alloc::object_slab_retype(min_bytes, retype)
 }
 
 /// memmgr's current free-pool size in bytes, or `None` if memmgr is

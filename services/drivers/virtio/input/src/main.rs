@@ -525,8 +525,9 @@ fn main() -> !
     // the read path polls the eventq regardless. When an IRQ cap is present, bind
     // the notification to it for low-latency wakeups; otherwise the bounded wait
     // degrades to timed polling.
-    let Some(irq_notification) = std::os::seraph::object_slab_acquire(120)
-        .and_then(|slab| syscall::cap_create_notification(slab).ok())
+    let Some(irq_notification) = std::os::seraph::object_slab_retype(120, |slab| {
+        syscall::cap_create_notification(slab).ok()
+    })
     else
     {
         std::os::seraph::log!("failed to create notification");

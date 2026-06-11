@@ -202,10 +202,6 @@ pub struct RestartCtx
     /// the routing in `dispatch_deaths` continues to land on the
     /// correct `ServiceEntry`.
     pub deaths_eq: u32,
-    /// Memory-cap slab svcmgr retypes provider service endpoints from
-    /// (`cap_create_endpoint`). One slab backs every `provides = ...`
-    /// service's endpoint; sized for the handful of provider services.
-    pub endpoint_slab: u32,
     /// Reserved master-log endpoint source. svcmgr mints real-logd's RECV (and
     /// the first-launch `HANDOVER_PULL` SEND) from it on every (re)launch.
     pub master_log_source: u32,

@@ -111,22 +111,15 @@ fn main() -> !
     // `MAX_PROCESSES * 2` to absorb a simultaneous-crash burst without
     // dropping notifications between drain calls.
     let death_eq_slab_bytes: u64 = 24 + 56 + ((process::MAX_PROCESSES as u64 * 2) + 1) * 8;
-    let Some(eq_slab) = std::os::seraph::object_slab_acquire(death_eq_slab_bytes)
+    let Some(death_eq) = std::os::seraph::object_slab_retype(death_eq_slab_bytes, |slab| {
+        syscall::event_queue_create(slab, (process::MAX_PROCESSES as u32) * 2).ok()
+    })
     else
     {
         syscall::thread_exit();
     };
-    let Ok(death_eq) = syscall::event_queue_create(eq_slab, (process::MAX_PROCESSES as u32) * 2)
-    else
-    {
-        syscall::thread_exit();
-    };
-    let Some(ws_slab) = std::os::seraph::object_slab_acquire(4096)
-    else
-    {
-        syscall::thread_exit();
-    };
-    let Ok(ws_cap) = syscall::wait_set_create(ws_slab)
+    let Some(ws_cap) =
+        std::os::seraph::object_slab_retype(4096, |slab| syscall::wait_set_create(slab).ok())
     else
     {
         syscall::thread_exit();

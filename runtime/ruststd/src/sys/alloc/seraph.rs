@@ -614,45 +614,6 @@ pub fn slab_request_pages(memmgr_ep: u32, min_pages: u64) -> Option<(u32, u64, u
 /// follow-up sub-page request reuses the remaining ~4 KiB on the same cap.
 const SLAB_REFILL_PAGES: u64 = 2;
 
-/// Acquire from `pool`, refilling from memmgr if exhausted. `need` is the
-/// rounded class size; `pool` is the matching cached slab; `want_pages`
-/// is the request size used on refill.
-fn slab_acquire_pooled(pool: &ObjectSlab, need: u64, want_pages: u64) -> Option<u32> {
-    pool.lock.lock();
-    let res = (|| -> Option<u32> {
-        // Fast path: existing slab still has room.
-        let cur = pool.cap.load(Ordering::Acquire);
-        let avail = pool.local_avail.load(Ordering::Relaxed);
-        if cur != 0 && avail >= need {
-            pool.local_avail.store(avail - need, Ordering::Relaxed);
-            return Some(cur);
-        }
-        // Refill: request a fresh cap from memmgr. One attempt — propagate
-        // failure rather than loop on best-effort partial replies.
-        let ep = SLAB_MEMMGR_EP.load(Ordering::Acquire);
-        if ep == 0 {
-            return None;
-        }
-        let (new_cap, cap_pages, _phys) = slab_request_pages(ep, want_pages)?;
-        const ALLOCATOR_METADATA_RESERVE: u64 = 64;
-        let total = cap_pages.saturating_mul(PAGE_SIZE);
-        let usable = total.saturating_sub(ALLOCATOR_METADATA_RESERVE);
-        if usable < need {
-            // memmgr returned a cap too small for this request. Drop it
-            // (the caller will see None and decide what to do); don't
-            // install it as the slab — a smaller cap would just block the
-            // next bigger request the same way.
-            let _ = syscall::cap_delete(new_cap);
-            return None;
-        }
-        pool.cap.store(new_cap, Ordering::Release);
-        pool.local_avail.store(usable - need, Ordering::Relaxed);
-        Some(new_cap)
-    })();
-    pool.lock.unlock();
-    res
-}
-
 /// Retype under `pool`'s lock via `retype`, refilling from memmgr if
 /// exhausted. `need` is the rounded class size; `want_pages` is the request
 /// size used on refill. The local ledger is debited only when `retype`
@@ -758,33 +719,6 @@ pub fn slab_release_fresh(phys: u64) {
     let _ = unsafe { ipc::ipc_call(ep, &msg, ipc_buf) };
 }
 
-/// Return a Memory-cap slot with at least `min_bytes` of `available_bytes`
-/// for retype.
-///
-/// Caller passes the raw byte cost of the upcoming retype (e.g. 88 for
-/// `Endpoint`); the function rounds up to the matching size class and
-/// dispatches to a per-class cached slab (sub-page) or a fresh dedicated
-/// cap (page-aligned). The returned slot index is fed directly to
-/// `cap_create_*`.
-///
-/// Returns `None` if memmgr is unreachable, refuses the request, or
-/// returns a cap too small to satisfy the request after refill (memmgr's
-/// best-effort policy may shrink the reply when the pool is fragmented).
-pub fn object_slab_acquire(min_bytes: u64) -> Option<u32> {
-    let need = slab_round_to_class(min_bytes);
-    // Pages we need to safely contain `need` plus the kernel's per-cap
-    // allocator metadata. One extra page covers metadata for sub-page
-    // requests; page-aligned requests need their own pages plus one.
-    let want_pages = need.div_ceil(PAGE_SIZE).max(1) + 1;
-    if need <= 128 {
-        slab_acquire_pooled(&SLAB_BIN_128, need, want_pages)
-    } else if need <= 512 {
-        slab_acquire_pooled(&SLAB_BIN_512, need, want_pages)
-    } else {
-        slab_acquire_fresh(need, want_pages).map(|g| g.cap)
-    }
-}
-
 /// Retype one kernel object out of the slab machinery.
 ///
 /// `min_bytes` is the raw byte cost of the upcoming retype (e.g. 88 for
@@ -840,12 +774,13 @@ pub fn object_slab_retype<T>(min_bytes: u64, retype: impl FnOnce(u32) -> Option<
     }
 }
 
-/// Like [`object_slab_acquire`] but always takes a fresh, dedicated cap and
-/// returns the [`SlabGrant`] identity, so the caller can return the run to
-/// memmgr's pool mid-life via [`slab_release_fresh`] once every object retyped
-/// from the slab is deleted. For a per-unit-of-work retype (e.g. one Thread
-/// slab per spawn) this keeps the process's memmgr-pool footprint bounded
-/// instead of leaking a run per iteration until process death.
+/// Acquire a fresh, dedicated Memory cap sized for `min_bytes` and return
+/// the [`SlabGrant`] identity, so the caller can manage the retype itself
+/// and return the run to memmgr's pool mid-life via [`slab_release_fresh`]
+/// once every object retyped from the slab is deleted. For a
+/// per-unit-of-work retype (e.g. one Thread slab per spawn) this keeps the
+/// process's memmgr-pool footprint bounded instead of leaking a run per
+/// iteration until process death.
 pub fn object_slab_acquire_fresh(min_bytes: u64) -> Option<SlabGrant> {
     let need = slab_round_to_class(min_bytes);
     let want_pages = need.div_ceil(PAGE_SIZE).max(1) + 1;

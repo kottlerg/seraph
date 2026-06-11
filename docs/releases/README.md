@@ -71,4 +71,5 @@ are immutable; the title, body, and asset list are mutable.
 
 ## Summarized By
 
-[README.md](../../README.md), [conventions.md](../conventions.md)
+[README.md](../../README.md), [conventions.md](../conventions.md),
+[build-system.md](../build-system.md)

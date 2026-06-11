@@ -498,9 +498,28 @@ during normal operation as a process maps memory or accumulates caps.
 Each `AddressSpace` and `CSpace` capability carries its own growth
 budget — a pool of pages donated at creation time from a Retype-bearing
 Memory cap — from which `mem_map` and `cap_insert` allocate. Exhausting
-the budget returns `NoMemory`; the budget refills via *augment mode* on
-the same create syscall (passing the existing AS/CS slot as the augment
-target merges a new slab of pages into its growth budget).
+the budget returns `OutOfMemory` (-8); the budget refills via *augment
+mode* on the same create syscall (passing the existing AS/CS slot as the
+augment target merges a new slab of pages into its growth budget).
+
+A `CSpace` has two independent growth bounds, distinguishable by error
+code at the failure site:
+
+- **Pool exhaustion** — the seeded slot-page pool is empty. Returns
+  `OutOfMemory` (-8); refillable via augment mode. The kernel also logs
+  the CSpace id, allocated count, and quota.
+- **Quota reached** — `max_slots` (or the directory limit) is hit.
+  Returns `QuotaExceeded` (-17); a hard policy ceiling that no memory
+  donation can lift.
+
+Seeding policy: every CSpace creation site MUST either seed the pool to
+cover its full `max_slots` quota (`pool_pages × 56 − 1 ≥ max_slots`,
+the default for all userspace creation sites), or document the shortfall
+at the site and name the owner responsible for augment-mode refill. The
+kernel-created root CSpace is the one documented under-seeded site (init
+owns the refill; see `ROOT_CSPACE_INIT_SLOT_CAPACITY` in the kernel).
+Passing `max_slots = 0` to create-mode `cap_create_cspace` defaults the
+quota to exactly what the seeded pool backs, never an unbacked ceiling.
 
 An `AddressSpace`'s intermediate page tables are also returned to its
 growth budget mid-life when a region is torn down: `SYS_MEM_UNMAP` with

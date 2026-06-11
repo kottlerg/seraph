@@ -143,6 +143,10 @@ pub fn run_all(ctx: &TestContext)
         "cap_info::unknown_field_invalid_arg",
         cap_info::unknown_field_invalid_arg(ctx)
     );
+    run_test!(
+        "cap_info::cspace_default_max_slots_is_pool_backed",
+        cap_info::cspace_default_max_slots_is_pool_backed(ctx)
+    );
 
     // ── Retype primitive (augment, budget exhaustion, deep PT walk) ──────────
     run_test!(
@@ -172,6 +176,10 @@ pub fn run_all(ctx: &TestContext)
     run_test!(
         "retype::cspace_grow_consumes_pool",
         retype::cspace_grow_consumes_pool(ctx)
+    );
+    run_test!(
+        "retype::cspace_pool_exhaust_augment_then_quota",
+        retype::cspace_pool_exhaust_augment_then_quota(ctx)
     );
 
     // ── Memory management syscalls ────────────────────────────────────────────

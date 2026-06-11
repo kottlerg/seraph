@@ -219,10 +219,14 @@ pub(crate) const ASPACE_RETYPE_PAGES: u64 = 33;
 /// Pages requested from memmgr for the child's `CSpace` retype slab.
 /// Each slot page holds `L2_SIZE` capability slots (currently 56 slots
 /// × 72 B = 4032 B/page); the +1 covers the per-memory-cap allocator
-/// metadata footprint. Larger `CSpace`s refill via augment-mode
-/// `cap_create_cspace`. Five pages → 4 slot pages → ~224 slots covers a
-/// small driver's lifetime.
-pub(crate) const CSPACE_RETYPE_PAGES: u64 = 5;
+/// metadata footprint, and the kernel reserves the slab's page 0 as the
+/// wrapper page.
+///
+/// Seed-to-cover policy (#366): the seeded pool MUST back the child's
+/// full `max_slots = 256` quota so a cap insert can never fail on pool
+/// exhaustion below quota. 7 pages → 6 to the kernel → 5 pool pages →
+/// 5 × 56 − 1 = 279 usable slots ≥ 256.
+pub(crate) const CSPACE_RETYPE_PAGES: u64 = 7;
 
 /// Register a new child with memmgr. On success returns
 /// `(memmgr_send_cap_slot, memmgr_badge)`. On any failure (memmgr

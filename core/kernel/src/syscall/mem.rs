@@ -661,14 +661,18 @@ pub fn sys_memory_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         (*caller_cspace).lock.unlock_raw(saved);
         r
     };
-    let Ok(tail_slot_nz) = insert_res
-    else
+    let tail_slot_nz = match insert_res
     {
-        // SAFETY: tail_ptr just allocated; refcount is 1 with no other holders.
-        unsafe { crate::cap::object::dealloc_object(tail_ptr) };
-        parent_ref.write_unlock();
-        DERIVATION_LOCK.write_unlock();
-        return Err(SyscallError::OutOfMemory);
+        Ok(idx) => idx,
+        Err(e) =>
+        {
+            // SAFETY: tail_ptr just allocated; refcount is 1 with no other
+            // holders.
+            unsafe { crate::cap::object::dealloc_object(tail_ptr) };
+            parent_ref.write_unlock();
+            DERIVATION_LOCK.write_unlock();
+            return Err(e.into());
+        }
     };
     let tail_id = SlotId::current(cspace_id, tail_slot_nz);
 

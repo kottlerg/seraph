@@ -63,14 +63,14 @@ pub(crate) unsafe fn install_split_children(
         (*caller_cspace).lock.unlock_raw(saved);
         r
     }
-    .map_err(|_| {
+    .map_err(|e| {
         // SAFETY: child1_ptr and child2_ptr were freshly allocated with
         // refcount 1; neither has been inserted into any CSpace.
         unsafe {
             dealloc_object(child1_ptr);
             dealloc_object(child2_ptr);
         }
-        SyscallError::OutOfMemory
+        SyscallError::from(e)
     })?;
     let slot1 = slot1_nz.get();
 
@@ -81,7 +81,7 @@ pub(crate) unsafe fn install_split_children(
         (*caller_cspace).lock.unlock_raw(saved);
         r
     }
-    .map_err(|_| {
+    .map_err(|e| {
         // Undo slot1: child1_ptr was inserted (reachable only via slot1, which
         // we free here); child2_ptr was passed to the failing insert_cap and
         // never stored.
@@ -96,7 +96,7 @@ pub(crate) unsafe fn install_split_children(
             dealloc_object(child1_ptr);
             dealloc_object(child2_ptr);
         }
-        SyscallError::OutOfMemory
+        SyscallError::from(e)
     })?;
     // ── Wire derivation tree ──────────────────────────────────────────────────
 

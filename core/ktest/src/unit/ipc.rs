@@ -752,10 +752,12 @@ pub fn reply_oom_wakes_caller_with_transfer_failed(ctx: &TestContext) -> TestRes
         .map_err(|_| "cap_create_notification(xfer) for reply_oom test failed")?;
 
     // Small child CSpace: the child consumes its remaining headroom by
-    // creating notifications until full so that pre_allocate(1) on the reply path
-    // returns OutOfMemory. The 8-slot shape is part of the test contract,
-    // so this site bypasses `spawn::new_child` (which mints 16 slots) per
-    // the convention documented in `spawn.rs`.
+    // creating notifications until full so that pre_allocate(1) on the
+    // reply path fails. The 8-slot max_slots quota binds (the seeded pool
+    // backs far more), so the failure surfaces as QuotaExceeded. The
+    // 8-slot shape is part of the test contract, so this site bypasses
+    // `spawn::new_child` (which mints 16 slots) per the convention
+    // documented in `spawn.rs`.
     let child_cs = cap_create_cspace(ctx.memory_base, 0, 4, 8)
         .map_err(|_| "cap_create_cspace for reply_oom test failed")?;
     let child_ep = cap_copy(ep, child_cs, RIGHTS_SEND_GRANT)
@@ -802,16 +804,16 @@ pub fn reply_oom_wakes_caller_with_transfer_failed(ctx: &TestContext) -> TestRes
         return Err("reply_oom: ipc_recv returned wrong label");
     }
 
-    // Cap-bearing reply: child's CSpace is full, so the kernel's
-    // pre_allocate on the caller side fails. The kernel returns
-    // OutOfMemory to the server *and* wakes the caller with the synthetic
-    // IPC_REPLY_TRANSFER_FAILED label.
+    // Cap-bearing reply: child's CSpace is at its max_slots quota, so the
+    // kernel's pre_allocate on the caller side fails. The kernel returns
+    // QuotaExceeded to the server *and* wakes the caller with the
+    // synthetic IPC_REPLY_TRANSFER_FAILED label.
     let cap_reply = IpcMessage::builder(0xBEEF).cap(xfer).build();
     // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
     let attempt = unsafe { ipc::ipc_reply(&cap_reply, ctx.ipc_buf) };
     match attempt
     {
-        Err(code) if code == syscall_abi::SyscallError::OutOfMemory as i64 =>
+        Err(code) if code == syscall_abi::SyscallError::QuotaExceeded as i64 =>
         {}
         Err(_) => return Err("reply_oom: cap-bearing reply returned wrong error code"),
         Ok(()) => return Err("reply_oom: cap-bearing reply succeeded unexpectedly"),
@@ -899,15 +901,16 @@ fn reply_oom_caller_entry(arg: u64) -> !
 // ── sys_ipc_recv cap-transfer OOM regression ─────────────────────────────────
 
 /// `sys_ipc_recv` on a thread whose `CSpace` cannot absorb
-/// `MSG_CAP_SLOTS_MAX` more caps must return `OutOfMemory` cleanly without
-/// blocking on the recv queue, so the recv-side cap-transfer OOM cannot
-/// wedge any IPC participant.
+/// `MSG_CAP_SLOTS_MAX` more caps must fail cleanly without blocking on
+/// the recv queue, so the recv-side cap-transfer failure cannot wedge any
+/// IPC participant. The victim's 8-slot `max_slots` quota is the binding
+/// limit here, so the error is `QuotaExceeded`.
 ///
 /// Verifies the symmetric pre-allocation hoisted to the top of
 /// `sys_ipc_recv`. The victim thread fills its own `CSpace`, then issues
-/// `ipc_recv`. With the fix the syscall returns `OutOfMemory` immediately;
-/// without the fix the victim would either block on the recv queue or hit
-/// the bug only when caps actually arrive.
+/// `ipc_recv`. With the fix the syscall fails immediately; without the
+/// fix the victim would either block on the recv queue or hit the bug
+/// only when caps actually arrive.
 pub fn recv_oom_returns_cleanly(ctx: &TestContext) -> TestResult
 {
     let ep = cap_create_endpoint(ctx.memory_base)
@@ -945,7 +948,7 @@ pub fn recv_oom_returns_cleanly(ctx: &TestContext) -> TestResult
         notification_wait(done).map_err(|_| "notification_wait(done) for recv_oom failed")?;
     if bits != 0xDEAD
     {
-        return Err("recv_oom: victim did not see OutOfMemory from ipc_recv");
+        return Err("recv_oom: victim did not see QuotaExceeded from ipc_recv");
     }
 
     cap_delete(victim_th).ok();
@@ -956,7 +959,7 @@ pub fn recv_oom_returns_cleanly(ctx: &TestContext) -> TestResult
 }
 
 /// Victim for `recv_oom_returns_cleanly`: fills its `CSpace` then issues
-/// `ipc_recv`. Reports `0xDEAD` if the syscall returns `OutOfMemory`
+/// `ipc_recv`. Reports `0xDEAD` if the syscall returns `QuotaExceeded`
 /// (post-fix behavior), `0xBAD` otherwise.
 fn recv_oom_victim_entry(arg: u64) -> !
 {
@@ -988,7 +991,7 @@ fn recv_oom_victim_entry(arg: u64) -> !
     let result = unsafe { ipc::ipc_recv(ep_slot, buf_addr as *mut u64) };
     let bits = match result
     {
-        Err(code) if code == syscall_abi::SyscallError::OutOfMemory as i64 => 0xDEAD,
+        Err(code) if code == syscall_abi::SyscallError::QuotaExceeded as i64 => 0xDEAD,
         _ => 0xBAD,
     };
     notification_send(done_slot, bits).ok();

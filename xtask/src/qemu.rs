@@ -40,6 +40,8 @@ pub struct QemuLaunchSpec<'a>
     pub firmware_code_path: &'a Path,
     pub firmware_vars_path: Option<&'a Path>,
     pub cpus: u32,
+    /// Guest memory size in MiB.
+    pub mem_mib: u32,
     pub headless: bool,
     pub gdb: bool,
     /// When set, expose a QMP control socket at this path
@@ -54,9 +56,25 @@ pub struct QemuLaunchSpec<'a>
 /// is suitable for `Command::new(binary).args(&argv)`.
 pub fn build_qemu_argv(spec: &QemuLaunchSpec) -> Result<Vec<String>>
 {
+    // The kernel sizes its per-CPU structures from boot-protocol MAX_CPUS;
+    // a guest with more vCPUs than that cannot be represented.
+    let max_cpus = boot_protocol::MAX_CPUS;
+    if spec.cpus == 0 || usize::try_from(spec.cpus).map_or(true, |c| c > max_cpus)
+    {
+        bail!(
+            "--cpus {} out of range: must be 1..={} (boot-protocol MAX_CPUS)",
+            spec.cpus,
+            max_cpus
+        );
+    }
+    if spec.mem_mib == 0
+    {
+        bail!("--mem 0 is not a bootable guest memory size");
+    }
+
     let mut args: Vec<String> = vec![
         "-m".into(),
-        "512M".into(),
+        format!("{}M", spec.mem_mib),
         "-smp".into(),
         spec.cpus.to_string(),
         "-drive".into(),
@@ -395,4 +413,56 @@ fn pad_file_to(path: &Path, target_size: u64) -> Result<()>
             .with_context(|| format!("padding {}", path.display()))?;
     }
     Ok(())
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+
+    fn riscv_spec(cpus: u32, mem_mib: u32) -> QemuLaunchSpec<'static>
+    {
+        QemuLaunchSpec {
+            arch: Arch::Riscv64,
+            disk_path: Path::new("disk.img"),
+            firmware_code_path: Path::new("code.fd"),
+            firmware_vars_path: Some(Path::new("vars.fd")),
+            cpus,
+            mem_mib,
+            headless: true,
+            gdb: false,
+            qmp_socket: None,
+        }
+    }
+
+    #[test]
+    fn argv_reflects_cpus_and_mem()
+    {
+        let argv = build_qemu_argv(&riscv_spec(4, 512)).unwrap();
+        let m = argv.iter().position(|a| a == "-m").unwrap();
+        assert_eq!(argv[m + 1], "512M");
+        let smp = argv.iter().position(|a| a == "-smp").unwrap();
+        assert_eq!(argv[smp + 1], "4");
+
+        let argv = build_qemu_argv(&riscv_spec(512, 2048)).unwrap();
+        let m = argv.iter().position(|a| a == "-m").unwrap();
+        assert_eq!(argv[m + 1], "2048M");
+        let smp = argv.iter().position(|a| a == "-smp").unwrap();
+        assert_eq!(argv[smp + 1], "512");
+    }
+
+    #[test]
+    fn cpus_out_of_range_rejected()
+    {
+        assert!(build_qemu_argv(&riscv_spec(0, 512)).is_err());
+        assert!(build_qemu_argv(&riscv_spec(513, 512)).is_err());
+    }
+
+    #[test]
+    fn mem_zero_rejected()
+    {
+        assert!(build_qemu_argv(&riscv_spec(4, 0)).is_err());
+    }
 }

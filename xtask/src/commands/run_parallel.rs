@@ -170,6 +170,7 @@ pub fn run(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
             let firmware_vars_template = firmware.vars_template.clone();
             let arch = args.arch;
             let cpus = args.cpus;
+            let mem_mib = args.mem;
             let timeout = Duration::from_secs(args.timeout);
             let fail_grace = Duration::from_secs(args.fail_grace_secs);
             let pass_re = pass_re.clone();
@@ -212,6 +213,7 @@ pub fn run(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
                     firmware_code_path: &firmware_code,
                     firmware_vars_path: vars_path_for_qemu.as_deref(),
                     cpus,
+                    mem_mib,
                     headless: true,
                     gdb: false,
                     qmp_socket: None,

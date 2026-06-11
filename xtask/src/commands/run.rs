@@ -67,6 +67,7 @@ pub fn run(ctx: &BuildContext, args: &RunArgs) -> Result<()>
         firmware_code_path: &firmware_code,
         firmware_vars_path: firmware_vars.as_deref(),
         cpus: args.cpus,
+        mem_mib: args.mem,
         headless: args.headless,
         gdb: args.gdb,
         qmp_socket: None,

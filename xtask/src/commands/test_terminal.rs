@@ -126,6 +126,7 @@ pub fn run(ctx: &Context, args: &TestTerminalArgs) -> Result<()>
         firmware_code_path: &firmware_code,
         firmware_vars_path: firmware_vars.as_deref(),
         cpus: args.cpus,
+        mem_mib: args.mem,
         headless: true,
         gdb: false,
         qmp_socket: Some(&sock_path),

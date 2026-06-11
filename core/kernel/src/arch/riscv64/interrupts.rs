@@ -1123,7 +1123,7 @@ pub fn acknowledge(irq: u32)
 /// Send a TLB shootdown IPI to a target hart via SBI IPI.
 ///
 /// Sends a supervisor software interrupt to the target hart. The
-/// The software-interrupt handler (scause=1) on the target services any
+/// software-interrupt handler (scause=1) on the target services any
 /// shootdown request naming it: executes sfence.vma, clears its pending
 /// bit, and clears SSIP.
 ///
@@ -1139,7 +1139,8 @@ pub fn acknowledge(irq: u32)
 #[allow(dead_code)]
 pub unsafe fn send_tlb_shootdown_ipi(target_hart_id: u32)
 {
-    // SAFETY: SBI call sends a supervisor software interrupt to the target hart.
+    // SAFETY: caller guarantees the target hart is online (this function's
+    // safety contract), satisfying sbi_send_ipi_to's contract.
     unsafe { sbi_send_ipi_to(target_hart_id) };
 }
 
@@ -1154,8 +1155,8 @@ pub unsafe fn send_tlb_shootdown_ipi(target_hart_id: u32)
 #[cfg(not(test))]
 pub unsafe fn send_wakeup_ipi(target_hart_id: u32)
 {
-    // SAFETY: SBI call sends a supervisor software interrupt to the target hart,
-    // waking it from wfi.
+    // SAFETY: caller guarantees the target hart is online (this function's
+    // safety contract), satisfying sbi_send_ipi_to's contract.
     unsafe { sbi_send_ipi_to(target_hart_id) };
 }
 

@@ -9,5 +9,9 @@ name = "pipestress-tester"
 path = "src/main.rs"
 test = false
 
+[dependencies]
+syscall = { path = "../../../shared/syscall" }
+syscall-abi = { path = "../../../abi/syscall" }
+
 [lints]
 workspace = true

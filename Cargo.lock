@@ -720,6 +720,10 @@ version = "0.1.0"
 [[package]]
 name = "pipestress-tester"
 version = "0.1.0"
+dependencies = [
+ "syscall",
+ "syscall-abi",
+]
 
 [[package]]
 name = "prettyplease"

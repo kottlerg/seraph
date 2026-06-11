@@ -38,7 +38,7 @@ use crate::cli::TestTerminalArgs;
 use crate::context::Context;
 use crate::firmware::find_ovmf_code;
 use crate::qemu::{
-    QemuLaunchSpec, build_qemu_argv, prepare_riscv_firmware, validate_sysroot_for_launch,
+    GdbMode, QemuLaunchSpec, build_qemu_argv, prepare_riscv_firmware, validate_sysroot_for_launch,
 };
 use crate::qmp;
 use crate::util::{require_tool, step};
@@ -128,7 +128,7 @@ pub fn run(ctx: &Context, args: &TestTerminalArgs) -> Result<()>
         cpus: args.cpus,
         mem_mib: args.mem,
         headless: true,
-        gdb: false,
+        gdb: GdbMode::Off,
         qmp_socket: Some(&sock_path),
     };
     let qemu_args = build_qemu_argv(&spec)?;

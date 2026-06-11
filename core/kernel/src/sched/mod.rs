@@ -240,6 +240,88 @@ static WATCHDOG_TICK_COUNTER: core::sync::atomic::AtomicU64 = core::sync::atomic
 
 static WATCHDOG_FIRED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// Claim the global once-only watchdog dump latch. The first detector to trip
+/// — all-idle softlockup, owed-wake, or a heartbeat check on any CPU — wins.
+/// One dump per boot keeps the serial log readable, prevents a dump storm when
+/// many CPUs detect the same stall, and the first dump is the uncontaminated
+/// evidence.
+#[cfg(not(test))]
+fn watchdog_claim_dump() -> bool
+{
+    WATCHDOG_FIRED
+        .compare_exchange(
+            false,
+            true,
+            core::sync::atomic::Ordering::Relaxed,
+            core::sync::atomic::Ordering::Relaxed,
+        )
+        .is_ok()
+}
+
+/// Cadence of the owed-wake and AP-silence detector scans, in BSP ticks
+/// (~0.5 s at the observed ~1 ms tick).
+#[cfg(not(test))]
+const DETECTOR_SCAN_INTERVAL_TICKS: u64 = 512;
+
+/// Grace period before a `Blocked` thread's owed wake is considered lost and
+/// before a silent timer heartbeat is considered stalled.
+#[cfg(not(test))]
+const WEDGE_GRACE_SECONDS: u64 = 2;
+
+/// Owed-wake rule: `sleep_deadline` expired past the grace window while the
+/// thread is still `Blocked` — its timer wake was claimed and then lost, or
+/// the sleep machinery never ran.
+#[cfg(not(test))]
+const OWED_RULE_EXPIRED_DEADLINE: u8 = 1;
+/// Owed-wake rule: `wake_in_flight == 1` persisting — a waker claimed the
+/// thread but its `enqueue_and_wake` never completed.
+#[cfg(not(test))]
+const OWED_RULE_WAKE_IN_FLIGHT: u8 = 2;
+/// Owed-wake rule: `wake_pending` observed on a `Blocked` thread — a coalesced
+/// wake survived past a park commit that should have consumed it.
+#[cfg(not(test))]
+const OWED_RULE_WAKE_PENDING: u8 = 3;
+
+/// Suspect capacity per owed-wake scan; a wedge involves a handful of threads.
+#[cfg(not(test))]
+const OWED_WAKE_MAX: usize = 8;
+
+/// `schedule()` context-saved spin: single-shot warning threshold (µs).
+#[cfg(not(test))]
+const CS_SPIN_WARN_US: u64 = 100_000;
+
+/// One-shot latch for the `wake_pending` clear tripwires in `schedule()`. The
+/// re-mark and dispatch-flip arms clear a flag whose only sanctioned consumer
+/// is `commit_blocked_under_local_lock`; a live coalesced wake destroyed at
+/// either site is the #375 lost-wake signature, and the tripwire names it
+/// once.
+#[cfg(not(test))]
+static WAKE_PENDING_CLEAR_TRIPPED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Owed-wake suspects `(thread_id, rule)` recorded by the previous scan, for
+/// the two-scan persistence requirement of the `wake_in_flight` /
+/// `wake_pending` rules. BSP-only access from `owed_wake_scan` (CPU0 timer
+/// context behind an interrupt gate, non-reentrant) — the same single-writer
+/// CPU0-static idiom as `EXPIRED_SCRATCH`.
+#[cfg(not(test))]
+static mut OWED_WAKE_LAST: [(u32, u8); OWED_WAKE_MAX] = [(0, 0); OWED_WAKE_MAX];
+/// Number of live entries in [`OWED_WAKE_LAST`].
+#[cfg(not(test))]
+static mut OWED_WAKE_LAST_COUNT: usize = 0;
+
+/// Per-CPU `timer::current_tick()` stamp of the most recent `timer_tick`
+/// entry. Written by the owning CPU only (one Relaxed store per tick); read
+/// by the cross-CPU heartbeat detectors. Slot 0 (the BSP) hosts the
+/// sleep-list waker and every watchdog scan, so each AP cross-checks it in
+/// `bsp_stall_check`; the BSP symmetrically scans AP slots in
+/// `ap_silence_check`. `current_tick()` derives from a globally consistent
+/// counter on both arches (TSC / `time` CSR), so cross-CPU age comparisons
+/// are sound.
+#[cfg(not(test))]
+static TICK_HEARTBEAT: [core::sync::atomic::AtomicU64; MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; MAX_CPUS];
+
 // ── Per-CPU spin-site breadcrumb ──────────────────────────────────────────────
 
 /// Spin-site code: this CPU is not in any bounded protocol-spin.
@@ -253,16 +335,19 @@ pub const SPIN_SITE_DEALLOC_CONTEXT_SAVED: u32 = 2;
 /// `dealloc_object(Thread)` wake-in-flight gate: spinning until a waker's
 /// claimed-but-not-yet-committed `enqueue_and_wake` clears `wake_in_flight`.
 pub const SPIN_SITE_DEALLOC_WAKE_IN_FLIGHT: u32 = 3;
+/// `schedule()` dispatch barrier: spinning until the next thread's previous
+/// CPU publishes its register save (`context_saved == 1`).
+pub const SPIN_SITE_SCHED_CONTEXT_SAVED: u32 = 4;
 
 /// Per-CPU breadcrumb naming the bounded protocol-spin a CPU is currently
 /// executing, for the softlockup watchdog. A wedged CPU (no non-idle dispatch
 /// for the threshold) stuck in a `dealloc_object(Thread)` gate shows the gate
 /// here, turning an opaque `current = Exited` dump into a named site (#351).
 /// Set on gate entry, cleared on exit; [`SPIN_SITE_NONE`] when not spinning.
-/// Only the three `dealloc_object(Thread)` gates report here — they are the
-/// bounded spins that lack an overlong-duration warning of their own (the
-/// `schedule()` context-saved spin and the `sys_thread_stop` drain carry their
-/// own). Diagnostic-only — never gates control flow.
+/// The reporting sites are the three `dealloc_object(Thread)` gates and the
+/// `schedule()` context-saved dispatch barrier — the protocol spins that can
+/// wedge a CPU silently (the `sys_thread_stop` drain carries its own
+/// overlong-duration warning). Diagnostic-only — never gates control flow.
 #[cfg(not(test))]
 static SPIN_SITE: [core::sync::atomic::AtomicU32; MAX_CPUS] =
     [const { core::sync::atomic::AtomicU32::new(SPIN_SITE_NONE) }; MAX_CPUS];
@@ -300,6 +385,7 @@ fn spin_site_name(site: u32) -> &'static str
         SPIN_SITE_DEALLOC_NOT_CURRENT => "dealloc:not-current",
         SPIN_SITE_DEALLOC_CONTEXT_SAVED => "dealloc:context-saved",
         SPIN_SITE_DEALLOC_WAKE_IN_FLIGHT => "dealloc:wake-in-flight",
+        SPIN_SITE_SCHED_CONTEXT_SAVED => "schedule:context-saved",
         _ => "none",
     }
 }
@@ -319,10 +405,11 @@ pub fn watchdog_mark_non_idle(cpu: usize)
     last_non_idle_tick(cpu).store(now, core::sync::atomic::Ordering::Relaxed);
 }
 
-/// BSP-only: tick the global counter; if every CPU's last non-idle
-/// dispatch exceeds the threshold, dump per-CPU TCB state once.
+/// BSP-only: tick the global counter and run the wedge detectors — the
+/// owed-wake registry scan and AP-heartbeat silence check on a coarse
+/// cadence, and the all-idle softlockup check every tick. The first
+/// detector to trip claims the global dump latch (`watchdog_claim_dump`).
 #[cfg(not(test))]
-#[allow(clippy::too_many_lines)]
 fn watchdog_tick_and_check()
 {
     let cpu_count = CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
@@ -332,6 +419,17 @@ fn watchdog_tick_and_check()
     if WATCHDOG_FIRED.load(core::sync::atomic::Ordering::Relaxed)
     {
         return;
+    }
+
+    // Coarse-cadence detectors first; each claims the shared latch itself.
+    if now.is_multiple_of(DETECTOR_SCAN_INTERVAL_TICKS)
+    {
+        owed_wake_scan();
+        ap_silence_check(cpu_count);
+        if WATCHDOG_FIRED.load(core::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
     }
 
     // All CPUs must have last_dispatch older than threshold.
@@ -360,20 +458,226 @@ fn watchdog_tick_and_check()
         return;
     }
 
-    if WATCHDOG_FIRED
-        .compare_exchange(
-            false,
-            true,
-            core::sync::atomic::Ordering::Relaxed,
-            core::sync::atomic::Ordering::Relaxed,
-        )
-        .is_err()
+    if !watchdog_claim_dump()
     {
         return;
     }
 
-    // Stall detected. Dump per-CPU state.
-    crate::kprintln!("=== WATCHDOG: no non-idle dispatch on any CPU for >3s ===");
+    watchdog_dump("no non-idle dispatch on any CPU for >3s");
+}
+
+/// Owed-wake detector: walk the thread registry for `Blocked` threads whose
+/// wake is provably owed but never arrived — the lost-wakeup wedge signature
+/// (#375). Three rules, each on plain TCB scalar reads only (no IPC-object
+/// dereference: unlike the dump's `blocked_on` decode, this runs on a LIVE
+/// system where a blocking object can be freed concurrently):
+///
+/// 1. expired deadline — `sleep_deadline != 0` and past the grace window;
+///    legitimate sleepers are claimed (deadline cleared) within one BSP tick.
+/// 2. `wake_in_flight` stuck — a waker claimed the thread but its
+///    `enqueue_and_wake` never completed. Normally clears in microseconds.
+/// 3. `wake_pending` while `Blocked` — a coalesced wake survived a park
+///    commit that should have consumed it.
+///
+/// Rule 1 is debounced by its grace window; rules 2 and 3 must additionally
+/// persist across two consecutive scans (~0.5 s apart) so a legitimately
+/// mid-wake observation cannot false-positive. Indefinite waits (endpoint
+/// recv loops) match no rule and never fire.
+#[cfg(not(test))]
+fn owed_wake_scan()
+{
+    let now_tick = crate::arch::current::timer::current_tick();
+    let tps = crate::arch::current::timer::ticks_per_second();
+    if now_tick == 0 || tps == 0
+    {
+        return;
+    }
+    let grace = WEDGE_GRACE_SECONDS.saturating_mul(tps);
+
+    let mut suspects = [(0u32, 0u8); OWED_WAKE_MAX];
+    let mut count = 0usize;
+    let collect = |t: *mut ThreadControlBlock| {
+        if count >= OWED_WAKE_MAX
+        {
+            return;
+        }
+        // SAFETY: t is a registry-walked TCB held stable by the registry
+        // lock; plain scalar reads. Torn observations are absorbed by the
+        // grace window (rule 1) and the two-scan persistence (rules 2, 3).
+        let (state, tid, dl, wif, wp, started) = unsafe {
+            (
+                (*t).state,
+                (*t).thread_id,
+                (*t).sleep_deadline,
+                (*t).wake_in_flight
+                    .load(core::sync::atomic::Ordering::Relaxed),
+                (*t).wake_pending,
+                (*t).park_started_tick,
+            )
+        };
+        if state != thread::ThreadState::Blocked
+        {
+            return;
+        }
+        let aged = now_tick > started.saturating_add(grace);
+        let rule = if dl != 0 && now_tick > dl.saturating_add(grace)
+        {
+            OWED_RULE_EXPIRED_DEADLINE
+        }
+        else if wif == 1 && aged
+        {
+            OWED_RULE_WAKE_IN_FLIGHT
+        }
+        else if wp && aged
+        {
+            OWED_RULE_WAKE_PENDING
+        }
+        else
+        {
+            return;
+        };
+        suspects[count] = (tid, rule);
+        count += 1;
+    };
+    // SAFETY: read-only walk; the closure only reads TCB scalars.
+    if !unsafe { thread_registry::try_for_each(collect) }
+    {
+        // Registry contended; keep the previous scan's suspects and retry on
+        // the next cadence.
+        return;
+    }
+
+    let mut fire: Option<(u32, u8)> = None;
+    for &(tid, rule) in suspects.iter().take(count)
+    {
+        // SAFETY: CPU0-static idiom — single writer/reader (this function, on
+        // the BSP, behind an interrupt gate).
+        let persistent = rule == OWED_RULE_EXPIRED_DEADLINE
+            || unsafe { OWED_WAKE_LAST[..OWED_WAKE_LAST_COUNT].contains(&(tid, rule)) };
+        if persistent
+        {
+            fire = Some((tid, rule));
+            break;
+        }
+    }
+
+    // SAFETY: CPU0-static idiom as above.
+    unsafe {
+        OWED_WAKE_LAST[..count].copy_from_slice(&suspects[..count]);
+        OWED_WAKE_LAST_COUNT = count;
+    }
+
+    if let Some((tid, rule)) = fire
+        && watchdog_claim_dump()
+    {
+        let rule_name = match rule
+        {
+            OWED_RULE_EXPIRED_DEADLINE => "sleep deadline expired, never woken",
+            OWED_RULE_WAKE_IN_FLIGHT => "wake claimed (wake_in_flight) but never linked",
+            _ => "wake_pending persisting while Blocked",
+        };
+        crate::kprintln!("watchdog: owed wake lost on tid{}: {}", tid, rule_name);
+        watchdog_dump("Blocked thread whose owed wake never arrived");
+    }
+}
+
+/// BSP side of the heartbeat cross-check: report an AP whose `timer_tick`
+/// heartbeat has gone silent past the grace window. An AP wedged with
+/// interrupts off cannot run its own detectors; this names it from the BSP.
+#[cfg(not(test))]
+fn ap_silence_check(cpu_count: usize)
+{
+    let now_tick = crate::arch::current::timer::current_tick();
+    let tps = crate::arch::current::timer::ticks_per_second();
+    if now_tick == 0 || tps == 0
+    {
+        return;
+    }
+    // A synchronous TLB shootdown can legitimately hold CPUs past the grace
+    // window; its own watchdog ladder (resend / warn / panic) is the
+    // authoritative detector there.
+    if crate::mm::tlb_shootdown::any_pending()
+    {
+        return;
+    }
+    let stall = WEDGE_GRACE_SECONDS.saturating_mul(tps);
+    for (cpu, slot) in TICK_HEARTBEAT
+        .iter()
+        .enumerate()
+        .take(cpu_count.min(MAX_CPUS))
+        .skip(1)
+    {
+        let hb = slot.load(core::sync::atomic::Ordering::Relaxed);
+        if hb != 0 && now_tick > hb.saturating_add(stall) && watchdog_claim_dump()
+        {
+            crate::kprintln!(
+                "watchdog: cpu{} timer heartbeat stalled (last={} now={})",
+                cpu,
+                hb,
+                now_tick
+            );
+            watchdog_dump("AP timer heartbeat stalled");
+            return;
+        }
+    }
+}
+
+/// AP side of the heartbeat cross-check, called from `timer_tick` on every
+/// non-BSP CPU: if the BSP's heartbeat is silent past the grace window, dump
+/// from here. A wedged BSP kills both the sleep-list waker and every
+/// BSP-hosted detector at once — total silence — so this is the only
+/// detector that can name that state (#375).
+#[cfg(not(test))]
+fn bsp_stall_check(own_heartbeat: u64)
+{
+    if WATCHDOG_FIRED.load(core::sync::atomic::Ordering::Relaxed)
+    {
+        return;
+    }
+    let tps = crate::arch::current::timer::ticks_per_second();
+    if own_heartbeat == 0 || tps == 0
+    {
+        return;
+    }
+    let hb0 = TICK_HEARTBEAT[0].load(core::sync::atomic::Ordering::Relaxed);
+    if hb0 == 0 || own_heartbeat <= hb0.saturating_add(WEDGE_GRACE_SECONDS.saturating_mul(tps))
+    {
+        return;
+    }
+    // Defer to the shootdown ladder, as in `ap_silence_check`.
+    if crate::mm::tlb_shootdown::any_pending()
+    {
+        return;
+    }
+    if watchdog_claim_dump()
+    {
+        let cpu = crate::arch::current::cpu::current_cpu();
+        crate::kprintln!(
+            "watchdog: cpu{} observes BSP heartbeat stalled (bsp={} now={})",
+            cpu,
+            hb0,
+            own_heartbeat
+        );
+        watchdog_dump("BSP timer heartbeat stalled — sleep wakeups and BSP detectors dead");
+    }
+}
+
+/// Dump scheduler state for a detected wedge: per-CPU current threads, the
+/// sleep list, and all non-running registered threads. Callable from any CPU
+/// in interrupt context; shared structures are read benign-racily or via
+/// try-lock so a wedged lock holder cannot deadlock the dump.
+#[cfg(not(test))]
+#[allow(clippy::too_many_lines)]
+fn watchdog_dump(reason: &str)
+{
+    let cpu_count = CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
+    let now = WATCHDOG_TICK_COUNTER.load(core::sync::atomic::Ordering::Relaxed);
+    crate::kprintln!("=== WATCHDOG: {} ===", reason);
+    crate::kprintln!(
+        "  bsp_tick={} timer_tick={}",
+        now,
+        crate::arch::current::timer::current_tick()
+    );
     // needless_range_loop: parallel scheduler_for(cpu) accesses below.
     #[allow(clippy::needless_range_loop)]
     for cpu in 0..cpu_count
@@ -422,9 +726,17 @@ fn watchdog_tick_and_check()
             );
             continue;
         }
+        let heartbeat = if cpu < MAX_CPUS
+        {
+            TICK_HEARTBEAT[cpu].load(core::sync::atomic::Ordering::Relaxed)
+        }
+        else
+        {
+            0
+        };
         crate::kprintln!(
             "  cpu{} tid{} state={:?} ipc={:?} blocked_on={:p} prio={} pref={} \
-             idle_age={} mask=0x{:x}",
+             idle_age={} heartbeat={} mask=0x{:x}",
             cpu,
             tid,
             state,
@@ -433,6 +745,7 @@ fn watchdog_tick_and_check()
             prio,
             pref,
             now.saturating_sub(last_tick),
+            heartbeat,
             mask
         );
         // Name the bounded protocol-spin this CPU is wedged in, if any. A CPU
@@ -473,13 +786,24 @@ fn watchdog_tick_and_check()
             crate::kprintln!("    user_pc=0x{:x} syscall_nr={}", tf_ip, tf_syscall_nr);
         }
     }
-    // Dump sleep list.
-    // SAFETY: read-only; SLEEP_LIST_LOCK protects writers.
-    let n = unsafe {
-        let saved = SLEEP_LIST_LOCK.lock_raw();
-        let count = SLEEP_COUNT;
-        SLEEP_LIST_LOCK.unlock_raw(saved);
+    // Dump sleep list. Try-lock: a wedged CPU may hold SLEEP_LIST_LOCK, and
+    // the dump must not deadlock on it.
+    // SAFETY: read-only; paired unlock inside the map closure.
+    let locked_count = unsafe {
+        SLEEP_LIST_LOCK.try_lock_raw().map(|saved| {
+            let count = SLEEP_COUNT;
+            SLEEP_LIST_LOCK.unlock_raw(saved);
+            count
+        })
+    };
+    let n = if let Some(count) = locked_count
+    {
         count
+    }
+    else
+    {
+        crate::kprintln!("  SLEEP_LIST (lock contended; skipped)");
+        0
     };
     crate::kprintln!("  SLEEP_LIST count={}", n);
     // needless_range_loop: SLEEP_LIST is a static; iter().enumerate() obscures.
@@ -533,7 +857,7 @@ fn watchdog_tick_and_check()
             thread::ThreadState::Blocked =>
             {
                 // SAFETY: same contract; reads only plain scalar fields.
-                let (tid, ipc, blocked_on, prio, pref, wake_pending, wake_in_flight, dl) = unsafe {
+                let (tid, ipc, blocked_on, prio, pref, wake_pending, wake_in_flight, dl, started) = unsafe {
                     (
                         (*t).thread_id,
                         (*t).ipc_state,
@@ -544,11 +868,12 @@ fn watchdog_tick_and_check()
                         (*t).wake_in_flight
                             .load(core::sync::atomic::Ordering::Relaxed),
                         (*t).sleep_deadline,
+                        (*t).park_started_tick,
                     )
                 };
                 crate::kprintln!(
                     "    tid{} Blocked ipc={:?} blocked_on={:p} prio={} pref={} \
-                     wake_pending={} wake_in_flight={} dl={}",
+                     wake_pending={} wake_in_flight={} dl={} parked_at={}",
                     tid,
                     ipc,
                     blocked_on,
@@ -556,7 +881,8 @@ fn watchdog_tick_and_check()
                     pref,
                     wake_pending,
                     wake_in_flight,
-                    dl
+                    dl,
+                    started
                 );
                 // SAFETY: same contract; watchdog_decode_blocked_on only reads.
                 unsafe { watchdog_decode_blocked_on(t) };
@@ -719,10 +1045,10 @@ pub static BOOT_TRANSIENT_ACTIVE: core::sync::atomic::AtomicBool =
 
 // ── Sleep list ───────────────────────────────────────────────────────────────
 
-/// Maximum number of concurrently sleeping threads. Bounds the realistic
-/// envelope at `MAX_CPUS = 64` with a few timed waiters per CPU plus
-/// headroom; `sleep_list_add` returns `Err` past this cap rather than
-/// dropping silently.
+/// Maximum number of concurrently sleeping threads the fixed sleep list (and
+/// its expiry scratch buffer) can hold. `sleep_list_add` returns `Err` past
+/// this cap rather than dropping silently; the caller rolls back the park
+/// and the sleep degrades to an immediate return.
 pub const MAX_SLEEPING: usize = 128;
 
 /// Global list of sleeping threads. Protected by its own spinlock.
@@ -1323,6 +1649,7 @@ pub fn init(cpu_count: u32) -> u32
                     last_enqueue: None,
                     sched_lock: crate::sync::Spinlock::new(),
                     wake_pending: false,
+                    park_started_tick: 0,
                     ipc_state: IpcThreadState::None,
                     ipc_msg: crate::ipc::message::Message::default(),
                     reply_tcb: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
@@ -1795,6 +2122,9 @@ pub unsafe fn commit_blocked_under_local_lock(
                     (*tcb).state = thread::ThreadState::Blocked;
                     (*tcb).ipc_state = ipc;
                     (*tcb).blocked_on_object = blocked_on;
+                    // Diagnostic stamp for the owed-wake detector; written
+                    // under sched_lock like the rest of the Scheduling group.
+                    (*tcb).park_started_tick = crate::arch::current::timer::current_tick();
                     // Clear the publication barrier as part of the park commit so
                     // EVERY parker carries context_saved = 0 while Blocked: a
                     // cross-CPU waker's dispatch then spins on the cs barrier
@@ -3214,7 +3544,7 @@ pub unsafe fn schedule(requeue_current: bool)
         if !current.is_null()
         {
             // SAFETY: current is a valid TCB; state written under its sched_lock.
-            unsafe {
+            let (cleared_live_wake, tid) = unsafe {
                 (*current).state = ThreadState::Running;
                 // Still running on THIS CPU: keep preferred_cpu authoritative
                 // (the re-mark, like the local requeue above, must not leave it
@@ -3222,7 +3552,19 @@ pub unsafe fn schedule(requeue_current: bool)
                 (*current).preferred_cpu = cpu as u32;
                 // A running thread carries no pending park-wake (see the
                 // dispatch flip below).
+                let was_pending = (*current).wake_pending;
                 (*current).wake_pending = false;
+                (was_pending, (*current).thread_id)
+            };
+            if cleared_live_wake
+                && !WAKE_PENDING_CLEAR_TRIPPED.swap(true, core::sync::atomic::Ordering::Relaxed)
+            {
+                crate::kprintln!(
+                    "schedule: cpu{} re-mark cleared a live coalesced wake \
+                     on tid{} (#375 tripwire)",
+                    cpu,
+                    tid
+                );
             }
         }
         // Watchdog: count this as a non-idle dispatch so the softlockup
@@ -3319,7 +3661,7 @@ pub unsafe fn schedule(requeue_current: bool)
         if dispatchable
         {
             // SAFETY: under next.sched_lock.
-            unsafe {
+            let (cleared_live_wake, tid) = unsafe {
                 (*next).state = ThreadState::Running;
                 (*next).preferred_cpu = cpu as u32;
                 // A running thread has no outstanding park-wake to honour; clear
@@ -3327,7 +3669,19 @@ pub unsafe fn schedule(requeue_current: bool)
                 // unrelated commit_blocked (defensive — the `Running` coalesce
                 // that sets it is currently unreachable; see
                 // docs/sched-ipc-redesign.md §2.1).
+                let was_pending = (*next).wake_pending;
                 (*next).wake_pending = false;
+                (was_pending, (*next).thread_id)
+            };
+            if cleared_live_wake
+                && !WAKE_PENDING_CLEAR_TRIPPED.swap(true, core::sync::atomic::Ordering::Relaxed)
+            {
+                crate::kprintln!(
+                    "schedule: cpu{} dispatch-flip cleared a live coalesced \
+                     wake on tid{} (#375 tripwire)",
+                    cpu,
+                    tid
+                );
             }
         }
         // SAFETY: paired with lock_raw above.
@@ -3508,8 +3862,19 @@ pub unsafe fn schedule(requeue_current: bool)
     // previous CPU's switch(). On RISC-V RVWMO, without this Acquire the
     // loads in the restore phase could see stale register values. The spin
     // runs lockless (see #144).
-    if !core::ptr::eq(next, sched.idle) && !next.is_null()
+    let cs_unpublished = !core::ptr::eq(next, sched.idle)
+        && !next.is_null()
+        // SAFETY: next is a valid TCB; context_saved field always valid.
+        && unsafe {
+            (*next)
+                .context_saved
+                .load(core::sync::atomic::Ordering::Acquire)
+        } == 0;
+    if cs_unpublished
     {
+        spin_site_enter(SPIN_SITE_SCHED_CONTEXT_SAVED);
+        let start_us = crate::arch::current::timer::elapsed_us();
+        let mut warned = false;
         let mut spins: u64 = 0;
         // SAFETY: next is a valid TCB; context_saved field always valid.
         while unsafe {
@@ -3521,21 +3886,31 @@ pub unsafe fn schedule(requeue_current: bool)
             core::hint::spin_loop();
             spins += 1;
             // Single-shot diagnostic when the publication barrier stalls;
-            // healthy is <100 iter, 100M is ~tens of ms even under TCG.
-            if spins == 100_000_000
+            // healthy is <100 iterations. The time check is throttled so the
+            // spin body stays a cache-local load.
+            if !warned && spins.is_multiple_of(1024)
             {
-                // SAFETY: next is a valid TCB; thread_id is always valid.
-                let tid = unsafe { (*next).thread_id };
-                // SAFETY: next is a valid TCB; preferred_cpu is always valid.
-                let pref = unsafe { (*next).preferred_cpu };
-                crate::kprintln!(
-                    "schedule: cpu{} stuck spinning context_saved on next=tid{} pref={}",
-                    cpu,
-                    tid,
-                    pref
-                );
+                let overdue = match (start_us, crate::arch::current::timer::elapsed_us())
+                {
+                    (Some(start), Some(now_us)) => now_us.saturating_sub(start) > CS_SPIN_WARN_US,
+                    _ => false,
+                };
+                if overdue
+                {
+                    warned = true;
+                    // SAFETY: next is a valid TCB; the fields are always valid.
+                    let (tid, pref) = unsafe { ((*next).thread_id, (*next).preferred_cpu) };
+                    crate::kprintln!(
+                        "schedule: cpu{} stuck >100ms spinning context_saved on \
+                         next=tid{} pref={}",
+                        cpu,
+                        tid,
+                        pref
+                    );
+                }
             }
         }
+        spin_site_exit();
     }
 
     if !current_state.is_null()
@@ -3718,6 +4093,19 @@ pub unsafe fn timer_tick()
     let cpu = crate::arch::current::cpu::current_cpu() as usize;
     let cpu_count = CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
     debug_assert!(cpu < cpu_count, "timer_tick: cpu={cpu} out of range");
+
+    // Cross-CPU liveness heartbeat (one Relaxed store), plus the BSP
+    // cross-check on APs. See [`TICK_HEARTBEAT`].
+    if cpu < MAX_CPUS
+    {
+        let heartbeat = crate::arch::current::timer::current_tick();
+        TICK_HEARTBEAT[cpu].store(heartbeat, core::sync::atomic::Ordering::Relaxed);
+        if cpu != 0
+        {
+            bsp_stall_check(heartbeat);
+        }
+    }
+
     // SAFETY: cpu < cpu_count; scheduler slab initialised by init().
     let sched = unsafe { &mut *scheduler_ptr(cpu) };
 

@@ -62,8 +62,11 @@ pub static FAIL_COUNT: AtomicUsize = AtomicUsize::new(0);
 /// `$name` must be a string literal (used with `concat!` for zero-cost
 /// log messages). `$body` is an expression evaluating to [`TestResult`].
 ///
-/// Prints one line per test: `ktest: PASS <name>` or `ktest: FAIL <name>`
-/// followed by the failure reason. Tests always continue past failures.
+/// Prints `ktest: RUN <name>` before the body, then one line per test:
+/// `ktest: PASS <name>` or `ktest: FAIL <name>` followed by the failure
+/// reason. Tests always continue past failures. The RUN line means a test
+/// that hangs identifies itself in the serial log instead of leaving only
+/// the previous test's PASS line as the last output.
 ///
 /// To add a new unit test: write a function returning `TestResult`, then
 /// call `run_test!("subsystem::test_name", fn_name(ctx))` in the relevant
@@ -71,6 +74,7 @@ pub static FAIL_COUNT: AtomicUsize = AtomicUsize::new(0);
 #[macro_export]
 macro_rules! run_test {
     ($name:literal, $body:expr) => {{
+        $crate::log(concat!("ktest: RUN ", $name));
         let result: $crate::TestResult = { $body };
         match result
         {

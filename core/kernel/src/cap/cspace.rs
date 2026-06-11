@@ -60,14 +60,35 @@ const _: () = assert!(L1_SIZE * L2_SIZE <= (1usize << syscall::CAP_INDEX_BITS));
 #[derive(Debug, PartialEq, Eq)]
 pub enum CapError
 {
-    /// No free slots remain and the `CSpace` is at `max_slots`.
+    /// No free slots remain and the `CSpace` is at `max_slots` (or the
+    /// directory is full). A hard quota: donating memory cannot satisfy it.
     OutOfSlots,
-    /// Heap allocation failed while growing the `CSpace`.
-    OutOfMemory,
+    /// The slot-page pool was exhausted while growing. Refillable: donate
+    /// pages via augment-mode `cap_create_cspace`. (Host-test heap path:
+    /// heap allocation failed.)
+    PoolExhausted,
     /// The provided slot index is out of range or unmapped.
     InvalidIndex,
     /// Mapping request violates the W^X constraint (both writable and executable).
     WxViolation,
+}
+
+/// The one canonical `CapError` → `SyscallError` mapping. Every syscall-path
+/// consumer routes through this so the pool-exhausted (refillable,
+/// `OutOfMemory`) vs quota-reached (hard, `QuotaExceeded`) distinction
+/// reaches userspace uniformly (#366).
+impl From<CapError> for syscall::SyscallError
+{
+    fn from(e: CapError) -> Self
+    {
+        match e
+        {
+            CapError::OutOfSlots => Self::QuotaExceeded,
+            CapError::PoolExhausted => Self::OutOfMemory,
+            CapError::InvalidIndex => Self::InvalidArgument,
+            CapError::WxViolation => Self::WxViolation,
+        }
+    }
 }
 
 // ── CSpacePage ────────────────────────────────────────────────────────────────
@@ -193,7 +214,8 @@ impl CSpace
 
     /// Allocate a free slot index, growing the `CSpace` if needed.
     ///
-    /// Returns an error if `max_slots` is reached or heap allocation fails.
+    /// Returns [`CapError::OutOfSlots`] if `max_slots` is reached, or
+    /// [`CapError::PoolExhausted`] if the slot-page pool has no page left.
     /// The returned slot is cleared to null; callers must populate it.
     ///
     /// The returned index is always non-zero (slot 0 is reserved).
@@ -270,7 +292,17 @@ impl CSpace
             );
             // SAFETY: kobj_ptr is the wrapper that owns this CSpace; its
             // pool was seeded at retype time.
-            let phys = unsafe { (*kobj_ptr).alloc_slot_page() }.ok_or(CapError::OutOfMemory)?;
+            let Some(phys) = (unsafe { (*kobj_ptr).alloc_slot_page() })
+            else
+            {
+                crate::kprintln!(
+                    "cspace {}: slot-page pool exhausted (allocated={}, max={})",
+                    self.id,
+                    self.allocated_slots,
+                    self.max_slots
+                );
+                return Err(CapError::PoolExhausted);
+            };
             let virt = crate::mm::paging::phys_to_virt(phys);
             // SAFETY: pool returns page-aligned, freshly-zeroed pages mapped
             // in the kernel direct map.
@@ -287,7 +319,7 @@ impl CSpace
         }
         else
         {
-            return Err(CapError::OutOfMemory);
+            return Err(CapError::PoolExhausted);
         };
 
         // SAFETY: page_nn points at an exclusively-owned, zeroed CSpacePage.
@@ -549,7 +581,7 @@ impl CSpace
     /// # Errors
     ///
     /// - [`CapError::InvalidIndex`] — index is 0, out of range, or occupied.
-    /// - [`CapError::OutOfMemory`] — backing page allocation failed during grow.
+    /// - [`CapError::PoolExhausted`] — slot-page pool empty during grow.
     pub fn insert_cap_at(
         &mut self,
         index: u32,
@@ -793,6 +825,19 @@ mod tests
         }
         let err = cs.allocate_slot().unwrap_err();
         assert_eq!(err, CapError::OutOfSlots);
+    }
+
+    #[test]
+    fn pool_exhaustion_is_distinct()
+    {
+        // A retype-backed CSpace (non-null kobj) with no pool page left
+        // fails grow with PoolExhausted, not the OutOfSlots quota error.
+        // The test-mode grow path returns before dereferencing the kobj
+        // pointer, so a dangling marker stands in for a real wrapper.
+        let mut cs = CSpace::new(0, 16384);
+        cs.set_kobj(NonNull::dangling().as_ptr());
+        let err = cs.allocate_slot().unwrap_err();
+        assert_eq!(err, CapError::PoolExhausted);
     }
 
     #[test]

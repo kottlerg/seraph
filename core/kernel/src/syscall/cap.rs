@@ -175,24 +175,24 @@ pub fn sys_cap_create_endpoint(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         r
     };
 
-    if let Ok(idx) = idx_res
+    match idx_res
     {
-        Ok(u64::from(idx))
-    }
-    else
-    {
-        // CSpace is full; roll back the allocation. Drop in place, return
-        // the bytes, drop the lease.
-        // SAFETY: we just constructed both objects in place above; nothing
-        // else has observed them yet.
-        unsafe {
-            core::ptr::drop_in_place(ep_obj_ptr);
-            core::ptr::drop_in_place(ep_state_ptr);
+        Ok(idx) => Ok(u64::from(idx)),
+        Err(e) =>
+        {
+            // CSpace slot allocation failed; roll back. Drop in place,
+            // return the bytes, drop the lease.
+            // SAFETY: we just constructed both objects in place above;
+            // nothing else has observed them yet.
+            unsafe {
+                core::ptr::drop_in_place(ep_obj_ptr);
+                core::ptr::drop_in_place(ep_state_ptr);
+            }
+            retype_free(memory, offset, entry.raw_bytes);
+            // SAFETY: matches the inc_ref above.
+            unsafe { ancestor.as_ref().dec_ref() };
+            Err(e.into())
         }
-        retype_free(memory, offset, entry.raw_bytes);
-        // SAFETY: matches the inc_ref above.
-        unsafe { ancestor.as_ref().dec_ref() };
-        Err(SyscallError::OutOfMemory)
     }
 }
 
@@ -288,22 +288,23 @@ pub fn sys_cap_create_notification(tf: &mut TrapFrame) -> Result<u64, SyscallErr
         r
     };
 
-    if let Ok(idx) = idx_res
+    match idx_res
     {
-        Ok(u64::from(idx))
-    }
-    else
-    {
-        // CSpace full: roll back the in-place construction.
-        // SAFETY: nothing else has observed these constructed objects.
-        unsafe {
-            core::ptr::drop_in_place(sig_obj_ptr);
-            core::ptr::drop_in_place(sig_state_ptr);
+        Ok(idx) => Ok(u64::from(idx)),
+        Err(e) =>
+        {
+            // CSpace slot allocation failed: roll back the in-place
+            // construction.
+            // SAFETY: nothing else has observed these constructed objects.
+            unsafe {
+                core::ptr::drop_in_place(sig_obj_ptr);
+                core::ptr::drop_in_place(sig_state_ptr);
+            }
+            retype_free(memory, offset, entry.raw_bytes);
+            // SAFETY: matches the inc_ref above.
+            unsafe { ancestor.as_ref().dec_ref() };
+            Err(e.into())
         }
-        retype_free(memory, offset, entry.raw_bytes);
-        // SAFETY: matches the inc_ref above.
-        unsafe { ancestor.as_ref().dec_ref() };
-        Err(SyscallError::OutOfMemory)
     }
 }
 
@@ -518,7 +519,7 @@ pub fn sys_cap_create_aspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     let nonnull = unsafe { NonNull::new_unchecked(aso_ptr.cast::<KernelObjectHeader>()) };
 
     // SAFETY: cspace validated non-null above; lock_raw/unlock_raw paired.
-    let idx = unsafe {
+    let idx_res = unsafe {
         let saved = (*cspace).lock.lock_raw();
         let r = (*cspace).insert_cap_handle(
             CapTag::AddressSpace,
@@ -527,8 +528,26 @@ pub fn sys_cap_create_aspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         );
         (*cspace).lock.unlock_raw(saved);
         r
-    }
-    .map_err(|_| SyscallError::OutOfMemory)?;
+    };
+    let idx = match idx_res
+    {
+        Ok(idx) => idx,
+        Err(e) =>
+        {
+            // The cap never reached visibility; mirror the add_chunk
+            // rollback above (the chunk record lives inside the wrapper
+            // page being freed, so no external bookkeeping survives).
+            // SAFETY: aso/aspace not observed externally yet.
+            unsafe {
+                core::ptr::drop_in_place(aso_ptr);
+                core::ptr::drop_in_place(aspace_ptr);
+            }
+            retype_free(memory, offset, entry.raw_bytes);
+            // SAFETY: matches inc_ref above.
+            unsafe { memory_obj_nn.as_ref().dec_ref() };
+            return Err(e.into());
+        }
+    };
 
     Ok(u64::from(idx))
 }
@@ -544,7 +563,10 @@ pub fn sys_cap_create_aspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 ///        empty pool that requires immediate augment-mode refill before any
 ///        cap can be inserted). Augment-mode accepts `init_pages >= 1`.
 /// arg3 = `max_slots` (create-mode only): hard cap on usable slots
-///        (clamped to `[1, 14336]`). Ignored in augment mode.
+///        (clamped to `[1, 14336]`). `0` defaults to the capacity the
+///        seeded pool actually backs: `(init_pages - 1) * 56 - 1` usable
+///        slots (minimum 1) — never an unbacked quota. Ignored in augment
+///        mode.
 ///
 /// Create-mode slab layout:
 /// - page 0 — wrapper page: [`CSpaceKernelObject`] at offset 0, immediately
@@ -653,7 +675,12 @@ pub fn sys_cap_create_cspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // slot-page pool; CSpace::grow pops one when the directory needs a leaf.
     let max_slots = if requested_max_slots == 0
     {
-        MAX_SLOTS
+        // Default to what the seeded pool actually backs: `init_pages - 1`
+        // pool pages × L2_SIZE slots, minus reserved slot 0. Defaulting to
+        // MAX_SLOTS would advertise a quota the pool cannot honour (#366).
+        ((init_pages as usize - 1) * crate::cap::cspace::L2_SIZE)
+            .saturating_sub(1)
+            .clamp(1, MAX_SLOTS)
     }
     else
     {
@@ -768,28 +795,31 @@ pub fn sys_cap_create_cspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         (*cspace).lock.unlock_raw(saved);
         r
     };
-    let Ok(idx) = insert_res
-    else
+    let idx = match insert_res
     {
-        // Roll back the registry slot, the memory inc_ref, the in-place
-        // wrapper/CSpace constructions, and the retype carve. Without
-        // this rollback, a failed `insert_cap` would leak a live CSpace
-        // registry entry, leave `memory_obj_nn`'s refcount permanently
-        // incremented, and surrender the carved offset back to the
-        // retype allocator only when the source memory itself was
-        // dec_ref'd to zero.
-        crate::cap::unregister_cspace(id);
-        // SAFETY: wrapper/cs not observed externally (no slot in any
-        // CSpace points at `nonnull`, and we just removed the registry
-        // entry).
-        unsafe {
-            core::ptr::drop_in_place(cs_kobj_ptr);
-            core::ptr::drop_in_place(cs_ptr);
+        Ok(idx) => idx,
+        Err(e) =>
+        {
+            // Roll back the registry slot, the memory inc_ref, the in-place
+            // wrapper/CSpace constructions, and the retype carve. Without
+            // this rollback, a failed `insert_cap` would leak a live CSpace
+            // registry entry, leave `memory_obj_nn`'s refcount permanently
+            // incremented, and surrender the carved offset back to the
+            // retype allocator only when the source memory itself was
+            // dec_ref'd to zero.
+            crate::cap::unregister_cspace(id);
+            // SAFETY: wrapper/cs not observed externally (no slot in any
+            // CSpace points at `nonnull`, and we just removed the registry
+            // entry).
+            unsafe {
+                core::ptr::drop_in_place(cs_kobj_ptr);
+                core::ptr::drop_in_place(cs_ptr);
+            }
+            retype_free(memory, offset, entry.raw_bytes);
+            // SAFETY: matches the `memory_obj_nn.as_ref().inc_ref()` above.
+            unsafe { memory_obj_nn.as_ref().dec_ref() };
+            return Err(e.into());
         }
-        retype_free(memory, offset, entry.raw_bytes);
-        // SAFETY: matches the `memory_obj_nn.as_ref().inc_ref()` above.
-        unsafe { memory_obj_nn.as_ref().dec_ref() };
-        return Err(SyscallError::OutOfMemory);
     };
 
     Ok(u64::from(idx))
@@ -1022,36 +1052,40 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         r
     };
 
-    if let Ok(idx) = idx_res
+    match idx_res
     {
-        // Thread the new TCB onto the diagnostic live-thread registry now that
-        // its cap is visible and the construction has committed. Registering
-        // only on the success path keeps it symmetric with the unregister in
-        // `dealloc_object(Thread)`: the rollback arm below frees the TCB via
-        // `retype_free` without ever registering it. The thread is still
-        // `Created` (not startable until SYS_THREAD_START), so it cannot become
-        // a Blocked watchdog victim before this point.
-        // SAFETY: tcb_ptr is the just-constructed, not-yet-registered TCB.
-        unsafe { crate::sched::thread_registry::register(tcb_ptr) };
-        let _ = kstack_virt;
-        Ok(u64::from(idx))
-    }
-    else
-    {
-        // The cap never reached visibility, so no scheduler queue can hold
-        // this TCB and no IPC object has a back-pointer to it. Drop both
-        // in-place objects, return the slot bytes (all 5 pages) to the
-        // ancestor cap, and undo the lease bump.
-        // SAFETY: tcb and wrapper were just constructed in place above and
-        // have not been observed by any other thread.
-        unsafe {
-            core::ptr::drop_in_place(tcb_ptr);
-            core::ptr::drop_in_place(thread_obj_ptr);
+        Ok(idx) =>
+        {
+            // Thread the new TCB onto the diagnostic live-thread registry now
+            // that its cap is visible and the construction has committed.
+            // Registering only on the success path keeps it symmetric with the
+            // unregister in `dealloc_object(Thread)`: the rollback arm below
+            // frees the TCB via `retype_free` without ever registering it. The
+            // thread is still `Created` (not startable until
+            // SYS_THREAD_START), so it cannot become a Blocked watchdog victim
+            // before this point.
+            // SAFETY: tcb_ptr is the just-constructed, not-yet-registered TCB.
+            unsafe { crate::sched::thread_registry::register(tcb_ptr) };
+            let _ = kstack_virt;
+            Ok(u64::from(idx))
         }
-        retype_free(memory, offset, entry.raw_bytes);
-        // SAFETY: matches the inc_ref above.
-        unsafe { ancestor.as_ref().dec_ref() };
-        Err(SyscallError::OutOfMemory)
+        Err(e) =>
+        {
+            // The cap never reached visibility, so no scheduler queue can hold
+            // this TCB and no IPC object has a back-pointer to it. Drop both
+            // in-place objects, return the slot bytes (all 5 pages) to the
+            // ancestor cap, and undo the lease bump.
+            // SAFETY: tcb and wrapper were just constructed in place above and
+            // have not been observed by any other thread.
+            unsafe {
+                core::ptr::drop_in_place(tcb_ptr);
+                core::ptr::drop_in_place(thread_obj_ptr);
+            }
+            retype_free(memory, offset, entry.raw_bytes);
+            // SAFETY: matches the inc_ref above.
+            unsafe { ancestor.as_ref().dec_ref() };
+            Err(e.into())
+        }
     }
 }
 
@@ -1180,12 +1214,7 @@ pub fn sys_cap_copy(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         unsafe {
             (*src_object.as_ptr()).dec_ref();
         }
-        match e
-        {
-            crate::cap::cspace::CapError::WxViolation => SyscallError::WxViolation,
-            crate::cap::cspace::CapError::InvalidIndex => SyscallError::InvalidArgument,
-            _ => SyscallError::OutOfMemory,
-        }
+        SyscallError::from(e)
     })?;
     // new_idx is non-zero: auto-allocation returns a non-zero slot and the
     // explicit path used a non-zero dest_slot_idx.
@@ -1283,11 +1312,7 @@ pub fn sys_cap_derive(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         unsafe {
             (*src_object.as_ptr()).dec_ref();
         }
-        match e
-        {
-            crate::cap::cspace::CapError::WxViolation => SyscallError::WxViolation,
-            _ => SyscallError::OutOfMemory,
-        }
+        SyscallError::from(e)
     })?;
     // Wire derivation link.
     let src_idx_nz = core::num::NonZeroU32::new(src_idx).ok_or(SyscallError::InvalidCapability)?;
@@ -1395,11 +1420,7 @@ pub fn sys_cap_derive_badge(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         unsafe {
             (*src_object.as_ptr()).dec_ref();
         }
-        match e
-        {
-            crate::cap::cspace::CapError::WxViolation => SyscallError::WxViolation,
-            _ => SyscallError::OutOfMemory,
-        }
+        SyscallError::from(e)
     })?;
     // Wire derivation link.
     let src_idx_nz = core::num::NonZeroU32::new(src_idx).ok_or(SyscallError::InvalidCapability)?;
@@ -1861,7 +1882,7 @@ pub fn sys_cap_move(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // SAFETY: dest_cs_ptr validated above; DERIVATION_LOCK and both CSpace locks held.
     let insert_result =
         unsafe { (*dest_cs_ptr).insert_cap_at(dest_idx, src_tag, src_rights, src_object) };
-    if insert_result.is_err()
+    if let Err(e) = insert_result
     {
         // Unlock before returning error.
         // SAFETY: saved1 and saved2 came from lock_raw calls above.
@@ -1886,7 +1907,7 @@ pub fn sys_cap_move(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             }
         }
         crate::cap::DERIVATION_LOCK.write_unlock();
-        return Err(SyscallError::InvalidArgument);
+        return Err(e.into());
     }
 
     let src_slot_id = SlotId::current(src_cspace_id, src_idx_nz);
@@ -2114,26 +2135,26 @@ pub fn sys_cap_create_event_queue(tf: &mut TrapFrame) -> Result<u64, SyscallErro
         r
     };
 
-    if let Ok(idx) = idx_res
+    match idx_res
     {
-        Ok(u64::from(idx))
-    }
-    else
-    {
-        // The cap never reached visibility, so no waiter or `wait_set`
-        // back-pointer can exist. Drop the in-place state and wrapper,
-        // return the slot bytes (which include the inline ring) to the
-        // ancestor cap, and undo the lease bump.
-        // SAFETY: state and wrapper were just constructed in place above
-        // and have not been observed by any other thread.
-        unsafe {
-            core::ptr::drop_in_place(eq_state_ptr);
-            core::ptr::drop_in_place(eq_obj_ptr);
+        Ok(idx) => Ok(u64::from(idx)),
+        Err(e) =>
+        {
+            // The cap never reached visibility, so no waiter or `wait_set`
+            // back-pointer can exist. Drop the in-place state and wrapper,
+            // return the slot bytes (which include the inline ring) to the
+            // ancestor cap, and undo the lease bump.
+            // SAFETY: state and wrapper were just constructed in place above
+            // and have not been observed by any other thread.
+            unsafe {
+                core::ptr::drop_in_place(eq_state_ptr);
+                core::ptr::drop_in_place(eq_obj_ptr);
+            }
+            retype_free(memory, offset, entry.raw_bytes);
+            // SAFETY: matches the inc_ref above.
+            unsafe { ancestor.as_ref().dec_ref() };
+            Err(e.into())
         }
-        retype_free(memory, offset, entry.raw_bytes);
-        // SAFETY: matches the inc_ref above.
-        unsafe { ancestor.as_ref().dec_ref() };
-        Err(SyscallError::OutOfMemory)
     }
 }
 
@@ -2215,22 +2236,22 @@ pub fn sys_cap_create_wait_set(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         r
     };
 
-    if let Ok(idx) = idx_res
+    match idx_res
     {
-        Ok(u64::from(idx))
-    }
-    else
-    {
-        // Roll back: nothing else has observed these constructed objects.
-        // SAFETY: pointers are unique-ownership for this caller.
-        unsafe {
-            core::ptr::drop_in_place(ws_obj_ptr);
-            core::ptr::drop_in_place(ws_state_ptr);
+        Ok(idx) => Ok(u64::from(idx)),
+        Err(e) =>
+        {
+            // Roll back: nothing else has observed these constructed objects.
+            // SAFETY: pointers are unique-ownership for this caller.
+            unsafe {
+                core::ptr::drop_in_place(ws_obj_ptr);
+                core::ptr::drop_in_place(ws_state_ptr);
+            }
+            retype_free(memory, offset, entry.raw_bytes);
+            // SAFETY: matches the inc_ref above.
+            unsafe { ancestor.as_ref().dec_ref() };
+            Err(e.into())
         }
-        retype_free(memory, offset, entry.raw_bytes);
-        // SAFETY: matches the inc_ref above.
-        unsafe { ancestor.as_ref().dec_ref() };
-        Err(SyscallError::OutOfMemory)
     }
 }
 

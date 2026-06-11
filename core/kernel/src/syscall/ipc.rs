@@ -225,7 +225,7 @@ unsafe fn transfer_caps(
         (*dst_cspace).lock.unlock_raw(saved);
         r
     }
-    .map_err(|_| SyscallError::OutOfMemory)?;
+    .map_err(SyscallError::from)?;
 
     // Acquire derivation lock for the batch move.
     crate::cap::DERIVATION_LOCK.write_lock();
@@ -669,7 +669,7 @@ pub fn sys_ipc_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         (*cspace_ptr).lock.unlock_raw(saved);
         r
     }
-    .map_err(|_| SyscallError::OutOfMemory)?;
+    .map_err(SyscallError::from)?;
 
     // Open the park episode before the recv-queue link can publish.
     // SAFETY: tcb is the running caller, not yet claimable.
@@ -950,13 +950,14 @@ pub fn sys_ipc_reply(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 (*caller_cspace).lock.unlock_raw(saved);
                 r
             };
-            if pre_res.is_err()
+            if let Err(e) = pre_res
             {
                 // Caller's CSpace cannot accept reply caps. Wake the caller with
                 // a synthetic failure reply so it un-parks and surfaces the error
-                // rather than dead-locking; bubble OOM to the server.
+                // rather than dead-locking; bubble the pool/quota distinction
+                // to the server.
                 // SAFETY: tcb validated above.
-                return Err(unsafe { fail_reply_and_wake_caller(tcb, SyscallError::OutOfMemory) });
+                return Err(unsafe { fail_reply_and_wake_caller(tcb, e.into()) });
             }
         }
     }

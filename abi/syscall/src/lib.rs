@@ -437,12 +437,17 @@ pub enum SyscallError
     Deadlock = -12,
     /// Event queue is full; post would be lost.
     QueueFull = -13,
+    // -14 retired (`DmaUnsafe`, removed with `SYS_DMA_GRANT`); never reuse.
     /// The target object is not in the required state for this operation
     /// (e.g. thread not `Stopped` for `read_regs`/`write_regs`).
     InvalidState = -15,
     /// A blocking operation was cancelled because the thread was stopped.
     /// The stopped thread sees this as the return value of its blocked syscall.
     Interrupted = -16,
+    /// A per-object quota was reached (e.g. a `CSpace`'s `max_slots`).
+    /// Unlike `OutOfMemory`, donating memory (augment mode) cannot satisfy
+    /// the request.
+    QuotaExceeded = -17,
 }
 
 // ── Scheduling constants ──────────────────────────────────────────────────────

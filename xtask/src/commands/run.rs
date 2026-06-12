@@ -21,7 +21,7 @@ use crate::cli::RunArgs;
 use crate::context::Context as BuildContext;
 use crate::firmware::find_ovmf_code;
 use crate::qemu::{
-    QemuLaunchSpec, build_qemu_argv, prepare_riscv_firmware, validate_sysroot_for_launch,
+    GdbMode, QemuLaunchSpec, build_qemu_argv, prepare_riscv_firmware, validate_sysroot_for_launch,
 };
 use crate::term::filter::FilterWriter;
 use crate::term::guard::TerminalGuard;
@@ -69,7 +69,14 @@ pub fn run(ctx: &BuildContext, args: &RunArgs) -> Result<()>
         cpus: args.cpus,
         mem_mib: args.mem,
         headless: args.headless,
-        gdb: args.gdb,
+        gdb: if args.gdb
+        {
+            GdbMode::Freeze
+        }
+        else
+        {
+            GdbMode::Off
+        },
         qmp_socket: None,
     };
     let qemu_args = build_qemu_argv(&spec)?;

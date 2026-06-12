@@ -433,6 +433,14 @@ pub struct ThreadControlBlock
     /// accessed under `sched_lock`.
     pub wake_pending: bool,
 
+    /// `timer::current_tick()` stamp of this thread's most recent park commit,
+    /// written under [`sched_lock`](Self::sched_lock) by
+    /// `commit_blocked_under_local_lock`. Diagnostic-only: the owed-wake
+    /// detector ages `Blocked` threads against it (see
+    /// docs/scheduling-internals.md § Softlockup Watchdog); never gates
+    /// control flow.
+    pub park_started_tick: u64,
+
     // === IPC state ===
     /// Current IPC blocking reason (None when not blocked on IPC).
     pub ipc_state: IpcThreadState,

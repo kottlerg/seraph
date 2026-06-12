@@ -281,10 +281,12 @@ cargo xtask compose-bundle --harness ktest --arch riscv64
 cargo xtask run-parallel --arch riscv64 --cpus 64 --parallel 1 --runs 3 --timeout 600
 cargo xtask run-parallel --arch riscv64 --cpus 65 --parallel 1 --runs 3 --timeout 600
 
-# Boundary CPU counts, x86_64 (KVM hosts boot in seconds):
+# Boundary CPU counts, x86_64 (~330 s per passing run on a 16-core KVM
+# host — boot is seconds, but the stress tier runs at 16x vCPU
+# oversubscription; the 900 s budget is for HANG classification):
 cargo xtask build
 cargo xtask compose-bundle --harness ktest
-cargo xtask run-parallel --arch x86_64 --cpus 256 --parallel 1 --runs 3 --timeout 300
+cargo xtask run-parallel --arch x86_64 --cpus 256 --parallel 1 --runs 3 --timeout 900
 
 # Memory variation (either arch):
 cargo xtask run-parallel --arch <arch> --cpus 4 --mem 1024 --parallel 1 --runs 1 --timeout 300
@@ -303,12 +305,14 @@ list as the tracking Issues move):
   loading the kernel ELF; independent of guest memory size. At 256 and
   512 harts under TCG the firmware produces no serial output within 20
   and 30 minutes respectively.
-- Both arches, high CPU counts ([#375](https://github.com/kottlerg/seraph/issues/375)):
-  intermittent silent wedge in `thread::load_balancer_skips_pinned`
-  (~1/3 of runs at 64-65 harts riscv64; observed once at 256 vCPUs
-  x86_64/KVM). A HANG at that marker reproduces on master and is not
-  evidence against the change under test — re-run, and attribute to
-  #375.
+- Both arches, high CPU counts ([#375](https://github.com/kottlerg/seraph/issues/375),
+  fixed): the intermittent silent wedge around the `thread::load_balancer`
+  and `stress::double_enqueue_storm` tests was a load-balancer ticket-lock
+  convoy — every idle CPU queuing interrupts-off on one victim's run-queue
+  lock every tick; the pull path now try-locks and backs off. A new silent
+  high-CPU HANG should instead produce a `=== WATCHDOG` dump (owed-wake /
+  heartbeat detectors) naming the wedged state; file it with the preserved
+  log rather than attributing it to #375.
 
 ---
 

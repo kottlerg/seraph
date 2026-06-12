@@ -28,6 +28,19 @@ use crate::sysroot;
 /// QEMU virt machine requires pflash images to be exactly 32 MiB.
 const PFLASH_SIZE: u64 = 32 * 1024 * 1024;
 
+/// GDB stub exposure for a QEMU launch.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum GdbMode
+{
+    /// No gdbstub.
+    Off,
+    /// Expose the gdbstub (`-s`, `tcp::1234`) without pausing the guest, so a
+    /// host debugger can attach after a hang is observed.
+    Listen,
+    /// Expose the gdbstub and freeze at the first instruction (`-s -S`).
+    Freeze,
+}
+
 /// Specification for one QEMU launch.
 ///
 /// `firmware_code_path` is the readonly pflash (OVMF on x86, `RISCV_VIRT_CODE`
@@ -43,7 +56,7 @@ pub struct QemuLaunchSpec<'a>
     /// Guest memory size in MiB.
     pub mem_mib: u32,
     pub headless: bool,
-    pub gdb: bool,
+    pub gdb: GdbMode,
     /// When set, expose a QMP control socket at this path
     /// (`-qmp unix:<path>,server,nowait`) so a host harness can drive the
     /// guest — the interactive-input test injects keys this way.
@@ -107,9 +120,12 @@ pub fn build_qemu_argv(spec: &QemuLaunchSpec) -> Result<Vec<String>>
         ]);
     }
 
-    if spec.gdb
+    match spec.gdb
     {
-        args.extend(["-s".into(), "-S".into()]);
+        GdbMode::Off =>
+        {}
+        GdbMode::Listen => args.push("-s".into()),
+        GdbMode::Freeze => args.extend(["-s".into(), "-S".into()]),
     }
 
     let accel = accel::detect_for_arch(spec.arch);
@@ -432,7 +448,7 @@ mod tests
             cpus,
             mem_mib,
             headless: true,
-            gdb: false,
+            gdb: GdbMode::Off,
             qmp_socket: None,
         }
     }

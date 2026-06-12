@@ -30,7 +30,7 @@ use crate::cli::RunParallelArgs;
 use crate::context::Context as BuildContext;
 use crate::firmware::find_ovmf_code;
 use crate::qemu::{
-    QemuLaunchSpec, build_qemu_argv, prepare_riscv_firmware, validate_sysroot_for_launch,
+    GdbMode, QemuLaunchSpec, build_qemu_argv, prepare_riscv_firmware, validate_sysroot_for_launch,
 };
 use crate::term::filter::FilterWriter;
 use crate::util::{require_tool, step};
@@ -171,6 +171,8 @@ pub fn run(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
             let arch = args.arch;
             let cpus = args.cpus;
             let mem_mib = args.mem;
+            let debug_listen = args.debug_listen;
+            let hold_on_hang = args.hold_on_hang;
             let timeout = Duration::from_secs(args.timeout);
             let fail_grace = Duration::from_secs(args.fail_grace_secs);
             let pass_re = pass_re.clone();
@@ -215,7 +217,14 @@ pub fn run(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
                     cpus,
                     mem_mib,
                     headless: true,
-                    gdb: false,
+                    gdb: if debug_listen
+                    {
+                        GdbMode::Listen
+                    }
+                    else
+                    {
+                        GdbMode::Off
+                    },
                     qmp_socket: None,
                 };
                 let qemu_args = build_qemu_argv(&spec)?;
@@ -250,8 +259,14 @@ pub fn run(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
                     .context("QEMU stdout was piped but unavailable")?;
                 let forwarder = spawn_stdout_forwarder(qemu_stdout, log_file, slot)?;
 
-                let (exit_rc, hung) =
-                    wait_with_timeout(&mut child, timeout, &log_path, &fail_re, fail_grace)?;
+                let (exit_rc, hung) = wait_with_timeout(
+                    &mut child,
+                    timeout,
+                    &log_path,
+                    &fail_re,
+                    fail_grace,
+                    hold_on_hang,
+                )?;
                 // Drain the forwarder before reading the log so classify()
                 // sees the complete byte stream even when the watchdog
                 // killed QEMU mid-write.
@@ -333,6 +348,10 @@ fn validate_args(args: &RunParallelArgs) -> Result<()>
     if args.timeout == 0
     {
         bail!("--timeout must be >= 1");
+    }
+    if (args.debug_listen || args.hold_on_hang) && args.parallel != 1
+    {
+        bail!("--debug-listen / --hold-on-hang require --parallel 1 (one gdbstub port)");
     }
     Ok(())
 }
@@ -438,12 +457,19 @@ fn join_forwarder(handle: JoinHandle<Result<()>>, run_id: u32)
 /// `was_hung` marks any watchdog kill (hard timeout or grace). `classify`
 /// disambiguates — a grace kill carries the `--fail` marker in the final
 /// log read, so it resolves to `FAIL`, not `HANG`.
+///
+/// With `hold_on_hang`, a hard-timeout expiry (no `--fail` marker seen)
+/// does not kill the instance: the attach instructions are printed and the
+/// call blocks until QEMU is terminated externally, preserving the wedged
+/// guest for a debugger. Grace-window kills (a crash already diagnosed in
+/// the log) are unaffected.
 fn wait_with_timeout(
     child: &mut Child,
     timeout: Duration,
     log_path: &Path,
     fail_re: &Regex,
     fail_grace: Duration,
+    hold_on_hang: bool,
 ) -> Result<(i32, bool)>
 {
     let deadline = Instant::now() + timeout;
@@ -465,6 +491,20 @@ fn wait_with_timeout(
         let effective = grace_deadline.map_or(deadline, |g| g.min(deadline));
         if Instant::now() >= effective
         {
+            if hold_on_hang && grace_deadline.is_none()
+            {
+                eprintln!(
+                    "run-parallel: HANG at timeout; holding QEMU (pid {}) for inspection.\n\
+                     run-parallel:   log: {}\n\
+                     run-parallel:   attach: gdb -ex 'target remote :1234' (with --debug-listen)\n\
+                     run-parallel:   resume the harness by terminating QEMU (kill {})",
+                    child.id(),
+                    log_path.display(),
+                    child.id()
+                );
+                let status = child.wait().context("waiting on held child")?;
+                return Ok((exit_status_rc(status), true));
+            }
             let _ = child.kill();
             let status = child.wait().context("reaping killed child")?;
             return Ok((status.code().unwrap_or(137), true));

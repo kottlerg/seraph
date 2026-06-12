@@ -274,7 +274,8 @@ pub enum TestComponent
 /// classified FAIL rather than HANG. `KERNEL EXCEPTION` + `FATAL:` cover the
 /// hardware-trap path; `PANIC( at |: )` covers the Rust `#[panic_handler]`.
 /// The benign `USERSPACE FAULT` path matches none of these.
-pub const DEFAULT_FAIL_REGEX: &str = r"SOME TESTS FAILED|KERNEL EXCEPTION|FATAL:|PANIC( at |: )";
+pub const DEFAULT_FAIL_REGEX: &str =
+    r"SOME TESTS FAILED|KERNEL EXCEPTION|FATAL:|PANIC( at |: )|=== WATCHDOG";
 
 #[derive(Parser)]
 pub struct RunParallelArgs
@@ -318,12 +319,29 @@ pub struct RunParallelArgs
     /// `[<harness>] SOME TESTS FAILED` ([`docs/testing.md`](../../docs/testing.md)) plus the kernel's
     /// own death markers, so a crash classifies as FAIL rather than HANG: a
     /// hardware trap prints `KERNEL EXCEPTION` then `FATAL:`
-    /// (`core/kernel/src/main.rs` `fatal()`), and a Rust `panic!` prints
-    /// `PANIC at`/`PANIC:` (the `#[panic_handler]`). The benign userspace
-    /// fault path prints `USERSPACE FAULT`, which none of these match.
-    /// Override with a never-matching pattern (e.g. `'$.^'`) to disable.
+    /// (`core/kernel/src/main.rs` `fatal()`), a Rust `panic!` prints
+    /// `PANIC at`/`PANIC:` (the `#[panic_handler]`), and the scheduler's
+    /// wedge detectors print a dump headed `=== WATCHDOG` (a kernel that
+    /// detected its own stall is a failure, not a hang). The benign
+    /// userspace fault path prints `USERSPACE FAULT`, which none of these
+    /// match. Override with a never-matching pattern (e.g. `'$.^'`) to
+    /// disable.
     #[arg(long, default_value = DEFAULT_FAIL_REGEX)]
     pub fail: String,
+
+    /// Expose each guest's gdbstub without pausing it (QEMU `-s`,
+    /// `tcp::1234`), so a wedged guest can be attached to post-hoc:
+    /// `gdb -ex 'target remote :1234'`. Requires `--parallel 1` (one
+    /// gdbstub port).
+    #[arg(long)]
+    pub debug_listen: bool,
+
+    /// On a hard-timeout HANG, do not kill the QEMU instance: print the
+    /// attach instructions and block until it is terminated externally,
+    /// preserving the wedged guest for inspection (pair with
+    /// `--debug-listen`). Requires `--parallel 1`.
+    #[arg(long)]
+    pub hold_on_hang: bool,
 
     /// Grace window, in seconds, after the first `--fail` match before the
     /// run is `SIGKILLed`. A kernel fault dump is multi-line and may be

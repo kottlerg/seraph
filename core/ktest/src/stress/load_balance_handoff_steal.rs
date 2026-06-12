@@ -71,6 +71,14 @@
 //! is a smoke check. Reverting the `context_saved == 1` load-balancer gate
 //! reintroduces the steal, surfaced by a kernel guard the harness reports as
 //! FAIL.
+//!
+//! The migration assertion applies only at `cpus <= MIGRATION_GUARD_MAX_CPUS`:
+//! above that the one-hot `u32` CPU witness aliases indices mod 32, and the
+//! oversubscription premise (`2 * NUM_PAIRS ≫ cpus`) is inverted — run-queue
+//! depths rarely exceed the balancer's imbalance threshold, so the steal path
+//! legitimately may never arm and the guard becomes a coin flip. The kernel
+//! guards above remain the regression signal at every CPU count; the witness
+//! values are still logged.
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -103,6 +111,12 @@ const SAMPLE_EVERY: usize = 64;
 
 /// Controller warmup yields so servers reach `ipc_recv` before clients call.
 const SETTLE_YIELDS: usize = 8;
+
+/// Widest guest for which the `migrations >= 1` guard is asserted: the bound of
+/// the one-hot `u32` CPU witness (`sample_cpu_bit` masks indices mod 32), and
+/// comfortably inside the oversubscription envelope the guard was tuned for
+/// (see the module doc's Pass criterion).
+const MIGRATION_GUARD_MAX_CPUS: u64 = 32;
 
 /// Notification signal right (bit 7) — what a client needs to `notification_send`.
 const RIGHTS_SIGNAL: u64 = 1 << 7;
@@ -275,7 +289,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     {
         return Err("stress::load_balance_handoff_steal: not all round-trips completed");
     }
-    if migrations == 0
+    if migrations == 0 && cpus <= MIGRATION_GUARD_MAX_CPUS
     {
         return Err(
             "stress::load_balance_handoff_steal: no client observed on 2+ CPUs (steal path unarmed)",

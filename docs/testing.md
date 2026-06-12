@@ -281,10 +281,12 @@ cargo xtask compose-bundle --harness ktest --arch riscv64
 cargo xtask run-parallel --arch riscv64 --cpus 64 --parallel 1 --runs 3 --timeout 600
 cargo xtask run-parallel --arch riscv64 --cpus 65 --parallel 1 --runs 3 --timeout 600
 
-# Boundary CPU counts, x86_64 (KVM hosts boot in seconds):
+# Boundary CPU counts, x86_64 (~330 s per passing run on a 16-core KVM
+# host — boot is seconds, but the stress tier runs at 16x vCPU
+# oversubscription; the 900 s budget is for HANG classification):
 cargo xtask build
 cargo xtask compose-bundle --harness ktest
-cargo xtask run-parallel --arch x86_64 --cpus 256 --parallel 1 --runs 3 --timeout 300
+cargo xtask run-parallel --arch x86_64 --cpus 256 --parallel 1 --runs 3 --timeout 900
 
 # Memory variation (either arch):
 cargo xtask run-parallel --arch <arch> --cpus 4 --mem 1024 --parallel 1 --runs 1 --timeout 300

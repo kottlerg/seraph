@@ -663,8 +663,9 @@ state (#375). Symmetrically the BSP scans AP stamps
 Both defer to an in-flight TLB shootdown, as below.
 
 The heartbeat checks measure staleness in wall time, so their grace scales
-with CPU count (`heartbeat_stall_ticks`: ≤128 CPUs → 8 s, 256 → 16 s,
-512 → 32 s). The 8 s base is sized above the slowest legitimate
+with CPU count (`heartbeat_stall_ticks`, stepping at multiples of 128 CPUs:
+<256 CPUs → 8 s, 256..384 → 16 s, 512 → 32 s). The 8 s base is sized above
+the slowest legitimate
 single-syscall CPU occupancy observed (a debug-build aperture-mapping
 syscall held the BSP just past 2 s on a slow TCG CI runner), and the
 CPU-count scaling covers oversubscribed wide guests, where vCPUs

@@ -285,9 +285,10 @@ const WEDGE_GRACE_SECONDS: u64 = 8;
 /// single vCPU — BSP included — legitimately goes seconds without a timer
 /// interrupt (the #376 512-vCPU runs observed a healthy BSP 2 s stale, with
 /// ~7% aggregate tick delivery). Scale the base grace with CPU count so the
-/// false-positive rate stays low across the envelope: ≤128 CPUs → 8 s,
-/// 256 → 16 s, 512 → 32 s. A genuinely wedged CPU exceeds any finite
-/// threshold, so the scaling costs only detection latency on wide guests.
+/// false-positive rate stays low across the envelope, stepping at multiples
+/// of 128 CPUs: <256 CPUs → 8 s, 256..384 → 16 s, 512 → 32 s. A genuinely
+/// wedged CPU exceeds any finite threshold, so the scaling costs only
+/// detection latency on wide guests.
 #[cfg(not(test))]
 fn heartbeat_stall_ticks(tps: u64) -> u64
 {

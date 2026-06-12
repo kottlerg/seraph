@@ -663,12 +663,14 @@ state (#375). Symmetrically the BSP scans AP stamps
 Both defer to an in-flight TLB shootdown, as below.
 
 The heartbeat checks measure staleness in wall time, so their grace scales
-with CPU count (`heartbeat_stall_ticks`: ≤128 CPUs → 2 s, 256 → 4 s,
-512 → 8 s). On an oversubscribed host a wide guest legitimately starves
-individual vCPUs of timer service for seconds (the #376 512-vCPU runs saw a
-healthy BSP 2 s stale at ~7% aggregate tick delivery); a fixed 2 s grace
-false-positives there, while a real wedge exceeds any finite threshold —
-the scaling costs only detection latency on wide guests. The owed-wake
+with CPU count (`heartbeat_stall_ticks`: ≤128 CPUs → 8 s, 256 → 16 s,
+512 → 32 s). The 8 s base is sized above the slowest legitimate
+single-syscall CPU occupancy observed (a debug-build aperture-mapping
+syscall held the BSP just past 2 s on a slow TCG CI runner), and the
+CPU-count scaling covers oversubscribed wide guests, where vCPUs
+legitimately starve of timer service for seconds (the #376 512-vCPU runs
+saw a healthy BSP 2 s stale at ~7% aggregate tick delivery). A real wedge
+exceeds any finite threshold — the grace costs only detection latency. The owed-wake
 rules deliberately do not scale: rule 1's pop-before-scan ordering and
 rules 2–3's two-scan persistence ride the BSP's own cadence, which
 self-stretches under starvation.

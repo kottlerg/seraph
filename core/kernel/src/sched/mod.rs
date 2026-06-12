@@ -268,8 +268,14 @@ const DETECTOR_SCAN_INTERVAL_TICKS: u64 = 512;
 /// checks scale this with CPU count ([`heartbeat_stall_ticks`]); the
 /// owed-wake rules use it as-is (they ride the BSP's own scan cadence, which
 /// self-stretches under host starvation).
+///
+/// Sized above the slowest legitimate single-syscall CPU occupancy observed:
+/// on a slow TCG CI runner a debug-build aperture-mapping syscall held the
+/// BSP just past 2 s with interrupts off (#376 CI), so 2 s false-positived.
+/// A real wedge persists indefinitely — the grace costs only detection
+/// latency. Linux's softlockup default is 10 s for the same reason.
 #[cfg(not(test))]
-const WEDGE_GRACE_SECONDS: u64 = 2;
+const WEDGE_GRACE_SECONDS: u64 = 8;
 
 /// Staleness threshold for the cross-CPU heartbeat checks, in timer ticks.
 ///
@@ -279,8 +285,8 @@ const WEDGE_GRACE_SECONDS: u64 = 2;
 /// single vCPU — BSP included — legitimately goes seconds without a timer
 /// interrupt (the #376 512-vCPU runs observed a healthy BSP 2 s stale, with
 /// ~7% aggregate tick delivery). Scale the base grace with CPU count so the
-/// false-positive rate stays low across the envelope: ≤128 CPUs → 2 s,
-/// 256 → 4 s, 512 → 8 s. A genuinely wedged CPU exceeds any finite
+/// false-positive rate stays low across the envelope: ≤128 CPUs → 8 s,
+/// 256 → 16 s, 512 → 32 s. A genuinely wedged CPU exceeds any finite
 /// threshold, so the scaling costs only detection latency on wide guests.
 #[cfg(not(test))]
 fn heartbeat_stall_ticks(tps: u64) -> u64

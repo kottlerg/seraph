@@ -78,7 +78,9 @@ This is not fatal — a headless system is valid.
    d. Frames containing the bootloader's page tables (if identifiable)
 4. Determine buddy allocator order range:
    - Minimum order: 0 (one 4 KiB page)
-   - Maximum order: implementation constant, e.g. 10 (1024 pages = 4 MiB)
+   - Maximum order: implementation constant `MAX_ORDER` = 11 (2048 pages =
+     8 MiB), sized so the largest per-CPU boot slab at `MAX_CPUS` fits one
+     block (see memory-internals.md)
 5. Call mm::buddy::BuddyAllocator::new(max_order) — this is a static or
    early-heap allocation using only the bootloader-provided stack
 6. For each candidate range, call BuddyAllocator::add_region(phys_start, phys_end)

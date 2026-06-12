@@ -394,6 +394,13 @@ unsafe fn apic_send_icr(dest: u32, cmd: u32)
         unsafe { cpu::write_msr(IA32_X2APIC_ICR, (u64::from(dest) << 32) | u64::from(cmd)) };
         return;
     }
+    // xAPIC destinations are 8-bit; a wider ID would truncate and deliver the
+    // IPI (possibly INIT/SIPI) to the wrong CPU. IDs > 255 only exist on
+    // x2APIC systems, so reaching here means a mode-selection bug.
+    if dest > 0xFF
+    {
+        crate::fatal("apic_send_icr: APIC ID > 255 requires x2APIC");
+    }
     // SAFETY: APIC MMIO is valid; ICR_HIGH takes the destination in bits [31:24].
     unsafe {
         apic_write(APIC_ICR_HIGH, dest << 24);

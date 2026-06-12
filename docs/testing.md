@@ -292,14 +292,31 @@ cargo xtask run-parallel --arch x86_64 --cpus 256 --parallel 1 --runs 3 --timeou
 cargo xtask run-parallel --arch <arch> --cpus 4 --mem 1024 --parallel 1 --runs 1 --timeout 300
 ```
 
+PRs touching the surfaces that only matter above 256 CPUs — `core/kernel/src/mm/`,
+x86_64 AP bringup (`arch/x86_64/ap_trampoline.rs`, `arch/x86_64/gdt.rs`, the
+APIC/IPI paths in `arch/x86_64/interrupts.rs`), or per-CPU slab sizing
+(`sched::alloc_zeroed_slab` and its call sites) — MUST additionally run the
+full-width x86_64 boundary below. This trigger list is deliberately narrow;
+other SMP PRs stay on the 256-vCPU mandate above.
+
+```sh
+# MAX_CPUS boundary, x86_64 (~75 min per passing run: at 32x vCPU
+# oversubscription the stress tier's O(cpus) priority-walk syscalls dominate —
+# see #380, which will shrink this budget when it lands):
+cargo xtask run-parallel --arch x86_64 --cpus 512 --parallel 1 --runs 1 --timeout 10800
+```
+
 **Known boundaries**, established empirically (QEMU 11.0.1; update this
 list as the tracking Issues move):
 
-- x86_64 > 256 CPUs ([#376](https://github.com/kottlerg/seraph/issues/376)):
-  kernel Phase-4 `FATAL` — the per-CPU slabs (`AP_IST_STACKS`, `AP_TSS`)
-  exceed the buddy allocator's `MAX_ORDER` single-allocation cap.
-  Independent of guest memory size; QEMU itself accepts `-smp 257..512`
-  under both KVM and TCG with the stock argv.
+- x86_64 > 256 CPUs ([#376](https://github.com/kottlerg/seraph/issues/376),
+  fixed): the per-CPU boot slabs (`AP_IST_STACKS`, `AP_TSS`) exceeded the
+  buddy allocator's old `MAX_ORDER = 10` single-allocation cap (4 MiB) at
+  257+ CPUs, failing Phase 4 regardless of guest memory size. `MAX_ORDER`
+  is now 11 (8 MiB — exactly `AP_IST_STACKS` at `MAX_CPUS = 512`), with
+  compile-time asserts at the slab consumer sites so the envelope breaks
+  the build, not the boot. The full 512-vCPU width is exercised by the
+  MAX_CPUS boundary run above.
 - riscv64 ≥ 128 harts ([#377](https://github.com/kottlerg/seraph/issues/377)):
   boot dies in UEFI (`ConvertPages: Incompatible memory types`) while
   loading the kernel ELF; independent of guest memory size. At 256 and

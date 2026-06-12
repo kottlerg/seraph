@@ -195,9 +195,11 @@ Properties:
 - Bounded external fragmentation
 - Internal fragmentation bounded at 50%
 
-The allocator is organised into zones if the hardware requires it (e.g. DMA-accessible
-memory below a certain physical address). The common case is a single zone covering
-all usable RAM.
+The allocator manages a single zone covering all usable RAM. Physical-address-range
+constraints (e.g. DMA-accessible memory below a certain physical address) are not a
+kernel concern: DMA isolation and placement are handled in userspace by devmgr and
+the memory authority (see [architecture.md](architecture.md) and
+[device-management.md](device-management.md)).
 
 ### Frame Allocation is Fallible
 

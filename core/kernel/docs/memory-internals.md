@@ -23,40 +23,47 @@ The buddy allocator manages physical memory as a set of power-of-two-sized block
 The implementation supports orders 0 through `MAX_ORDER` (inclusive), where an
 order-`n` block contains 2^n contiguous 4 KiB pages.
 
+Free-block metadata lives in fixed-size static arrays inside the allocator
+struct, not in the free pages themselves: the bootloader identity-maps only
+specific regions (`BootInfo`, modules, stack, memory map buffer), so free RAM
+is not generally writable when the allocator initialises in Phase 2.
+
 ```rust
 pub struct BuddyAllocator
 {
-    /// One free list per order. Each list is a singly-linked list of free
-    /// block headers embedded in the first page of each free block.
-    free_lists: [FreeListHead; MAX_ORDER + 1],
-
-    /// Total number of free pages currently available across all orders.
-    free_pages: usize,
-
-    /// Physical base address of the region this allocator manages.
-    /// Used to compute buddy addresses from block addresses.
-    phys_base: PhysAddr,
-}
-
-/// A node in a free list. Stored in the first bytes of the free block itself —
-/// no external metadata allocation required.
-struct FreeBlock
-{
-    next: Option<PhysAddr>,
+    /// Physical block address stored at each pool slot (slot 0 unused).
+    addrs: [u64; POOL_SIZE + 1],
+    /// Next slot index in the same list for each pool slot (0 = NONE).
+    nexts: [u16; POOL_SIZE + 1],
+    /// Head slot index for each order's free list (0 = empty list).
+    free_lists: [u16; MAX_ORDER + 1],
+    /// Head of the unused-slot pool chain.
+    pool_head: u16,
+    // ... counters and the Phase-7 seal flag
 }
 ```
 
-`MAX_ORDER` is an implementation constant chosen so the maximum single allocation
-is large enough for any kernel use while keeping the free-list array small.
-The exact value is established at implementation time.
+Each order's free list is a singly-linked list of pool slot indices; nodes are
+recycled through a free-node chain. `POOL_SIZE` (4096) bounds the number of
+simultaneously tracked free blocks across all orders — ~32 GiB of RAM when
+blocks sit at `MAX_ORDER`. The struct is all-zero-constructible and lives in
+BSS.
+
+`MAX_ORDER` is 11 (largest single allocation: 2048 pages = 8 MiB). It is sized
+so the largest per-CPU boot slab at `boot_protocol::MAX_CPUS` — `AP_IST_STACKS`,
+512 × 16 KiB = 8 MiB — fits one block, since `alloc_zeroed_slab` rounds every
+slab to a single power-of-two block. Compile-time asserts at the consumer sites
+(`arch/x86_64/ap_trampoline.rs`, `arch/x86_64/gdt.rs`) enforce that envelope:
+growing `MAX_CPUS` or a per-CPU slab element past it fails the build rather
+than the boot.
 
 ### Zone Management
 
-The allocator supports a single zone in the common case (all usable RAM). Where
-hardware requires DMA-accessible memory below a physical address limit, a second
-zone is added at init time. Zone selection is the caller's responsibility — the
-allocator does not automatically prefer one zone. Zone boundaries are tracked as
-`(phys_base, phys_end)` pairs; each zone has its own `BuddyAllocator` instance.
+The allocator manages a single zone: one `BuddyAllocator` instance covering all
+usable RAM. It has no zone concept; physical-address-range constraints (e.g.
+DMA reachability) are handled by the userspace memory authority after the
+Phase-7 handoff, per
+[docs/device-management.md](../../../docs/device-management.md).
 
 ### Allocation and Deallocation Properties
 

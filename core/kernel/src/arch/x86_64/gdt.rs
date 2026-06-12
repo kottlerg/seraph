@@ -103,6 +103,14 @@ pub struct TssWithIopb
     pub terminator: u8,
 }
 
+// The AP_TSS slab is one buddy block (`alloc_zeroed_slab` rounds to a power
+// of two), so it must fit the largest block even at the MAX_CPUS ceiling.
+const _: () = assert!(
+    crate::sched::MAX_CPUS * core::mem::size_of::<TssWithIopb>()
+        <= (1 << crate::mm::buddy::MAX_ORDER) * crate::mm::PAGE_SIZE,
+    "AP_TSS at MAX_CPUS exceeds the largest buddy block; raise MAX_ORDER"
+);
+
 /// The extended TSS + IOPB, in BSS so it is zero-initialised.
 ///
 /// The IOPB starts zero (all ports permitted!) until `init()` fills it with

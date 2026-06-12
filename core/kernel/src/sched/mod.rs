@@ -264,9 +264,40 @@ fn watchdog_claim_dump() -> bool
 const DETECTOR_SCAN_INTERVAL_TICKS: u64 = 512;
 
 /// Grace period before a `Blocked` thread's owed wake is considered lost and
-/// before a silent timer heartbeat is considered stalled.
+/// before a silent timer heartbeat is considered stalled. The heartbeat
+/// checks scale this with CPU count ([`heartbeat_stall_ticks`]); the
+/// owed-wake rules use it as-is (they ride the BSP's own scan cadence, which
+/// self-stretches under host starvation).
+///
+/// Sized above the slowest legitimate single-syscall CPU occupancy observed:
+/// on a slow TCG CI runner a debug-build aperture-mapping syscall held the
+/// BSP just past 2 s with interrupts off (#376 CI), so 2 s false-positived.
+/// A real wedge persists indefinitely — the grace costs only detection
+/// latency. Linux's softlockup default is 10 s for the same reason.
 #[cfg(not(test))]
-const WEDGE_GRACE_SECONDS: u64 = 2;
+const WEDGE_GRACE_SECONDS: u64 = 8;
+
+/// Staleness threshold for the cross-CPU heartbeat checks, in timer ticks.
+///
+/// Heartbeats are stamped in wall time (`current_tick`), but a vCPU's tick
+/// service rate degrades with guest width when the host is oversubscribed:
+/// the validation envelope runs 512 vCPUs on a 16-core host (32×), where any
+/// single vCPU — BSP included — legitimately goes seconds without a timer
+/// interrupt (the #376 512-vCPU runs observed a healthy BSP 2 s stale, with
+/// ~7% aggregate tick delivery). Scale the base grace with CPU count so the
+/// false-positive rate stays low across the envelope, stepping at multiples
+/// of 128 CPUs: <256 CPUs → 8 s, 256..384 → 16 s, 512 → 32 s. A genuinely
+/// wedged CPU exceeds any finite threshold, so the scaling costs only
+/// detection latency on wide guests.
+#[cfg(not(test))]
+fn heartbeat_stall_ticks(tps: u64) -> u64
+{
+    let cpus = u64::from(CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed));
+    let scale = (cpus / 128).max(1);
+    WEDGE_GRACE_SECONDS
+        .saturating_mul(scale)
+        .saturating_mul(tps)
+}
 
 /// Owed-wake rule: `sleep_deadline` expired past the grace window while the
 /// thread is still `Blocked` — its timer wake was claimed and then lost, or
@@ -600,7 +631,7 @@ fn ap_silence_check(cpu_count: usize)
     {
         return;
     }
-    let stall = WEDGE_GRACE_SECONDS.saturating_mul(tps);
+    let stall = heartbeat_stall_ticks(tps);
     for (cpu, slot) in TICK_HEARTBEAT
         .iter()
         .enumerate()
@@ -640,7 +671,7 @@ fn bsp_stall_check(own_heartbeat: u64)
         return;
     }
     let hb0 = TICK_HEARTBEAT[0].load(core::sync::atomic::Ordering::Relaxed);
-    if hb0 == 0 || own_heartbeat <= hb0.saturating_add(WEDGE_GRACE_SECONDS.saturating_mul(tps))
+    if hb0 == 0 || own_heartbeat <= hb0.saturating_add(heartbeat_stall_ticks(tps))
     {
         return;
     }
@@ -1821,6 +1852,17 @@ pub(crate) fn alloc_zeroed_slab<T>(
         }
         o
     };
+    // Distinguish an over-cap request from genuine exhaustion: `alloc` returns
+    // `None` for both, and "out of memory" misdirects the diagnosis (#376).
+    if order > crate::mm::buddy::MAX_ORDER
+    {
+        crate::kprintln!(
+            "alloc_zeroed_slab: {label} needs {bytes} bytes (order {order}), \
+             but MAX_ORDER is {}",
+            crate::mm::buddy::MAX_ORDER
+        );
+        crate::fatal("alloc_zeroed_slab: slab exceeds the largest buddy block");
+    }
     let phys = allocator.alloc(order).unwrap_or_else(|| {
         crate::kprintln!("alloc_zeroed_slab: out of memory for {label}");
         crate::fatal("alloc_zeroed_slab: buddy exhausted")

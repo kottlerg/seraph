@@ -27,7 +27,7 @@
 //! # Capacity
 //!
 //! `POOL_SIZE` is the maximum number of simultaneously tracked free blocks
-//! across all orders. The current value handles ~16 GiB of RAM. Increase it
+//! across all orders. The current value handles ~32 GiB of RAM. Increase it
 //! (or transition to in-page node storage after Phase 3 establishes page
 //! tables) for larger systems.
 //!
@@ -49,14 +49,20 @@
 /// Size of a single physical page in bytes.
 pub const PAGE_SIZE: usize = 4096;
 
-/// Maximum allocation order. Order N spans 2^N pages (4 KiB..4 MiB).
-pub const MAX_ORDER: usize = 10;
+/// Maximum allocation order. Order N spans 2^N pages (4 KiB..8 MiB).
+///
+/// Sized so the largest per-CPU boot slab at `boot_protocol::MAX_CPUS`
+/// (`AP_IST_STACKS`, 512 × 16 KiB = 8 MiB) fits one block — `alloc_zeroed_slab`
+/// rounds every slab to a single power-of-two block. Compile-time asserts at
+/// the consumer sites ([`crate::arch::x86_64::ap_trampoline`],
+/// [`crate::arch::x86_64::gdt`]) enforce the envelope.
+pub const MAX_ORDER: usize = 11;
 
 /// Number of order levels (0 through `MAX_ORDER` inclusive).
 const ORDER_COUNT: usize = MAX_ORDER + 1;
 
 /// Maximum simultaneously tracked free blocks across all orders.
-/// 4096 entries ≈ 16 GiB at order 10 (4 MiB per block).
+/// 4096 entries ≈ 32 GiB at order 11 (8 MiB per block).
 const POOL_SIZE: usize = 4096;
 
 /// Sentinel slot index meaning "end of list" or "empty".
@@ -612,6 +618,24 @@ mod tests
     {
         let mut alloc = BuddyAllocator::new();
         assert_eq!(alloc.alloc(MAX_ORDER + 1), None);
+    }
+
+    #[test]
+    fn add_region_packs_single_max_order_block()
+    {
+        // A naturally-aligned MAX_ORDER-sized region must insert as one block,
+        // allocatable in a single MAX_ORDER request (the per-CPU boot slabs
+        // depend on this at MAX_CPUS; see #376).
+        let (_buf, start, end) = aligned_buf(1 << MAX_ORDER);
+        let mut alloc = BuddyAllocator::new();
+        // SAFETY: _buf is alive and [start, end) is valid, page-aligned,
+        // writable memory not aliased by anything else.
+        unsafe { alloc.add_region(start, end) };
+        assert_eq!(alloc.free_page_count(), 1 << MAX_ORDER);
+
+        let block = alloc.alloc(MAX_ORDER).expect("MAX_ORDER alloc");
+        assert_eq!(block, start);
+        assert_eq!(alloc.free_page_count(), 0);
     }
 
     #[test]

@@ -111,13 +111,21 @@ const GDT_DATA: u64 = 0x00CF_9200_0000_FFFF;
 /// IST stack pair size: 8 KiB IST1 + 8 KiB IST2 = 16 KiB per AP.
 const AP_IST_PAIR_SIZE: usize = 16384;
 
-/// Per-AP IST stacks, in BSS. Slot `cpu_idx` holds the 16 KiB pair (IST1 +
-/// IST2) for AP with that id; slot 0 is unused (BSP has its own
+// The slab is one buddy block (`alloc_zeroed_slab` rounds to a power of two),
+// so it must fit the largest block even at the MAX_CPUS ceiling.
+const _: () = assert!(
+    crate::sched::MAX_CPUS * AP_IST_PAIR_SIZE
+        <= (1 << crate::mm::buddy::MAX_ORDER) * crate::mm::PAGE_SIZE,
+    "AP_IST_STACKS at MAX_CPUS exceeds the largest buddy block; raise MAX_ORDER"
+);
+
+/// Per-AP IST stacks. Slot `cpu_idx` holds the 16 KiB pair (IST1 + IST2) for
+/// the AP with that id; slot 0 is unused (BSP has its own
 /// [`crate::arch::x86_64::interrupts`] `BSP_IST_STACKS` static).
 ///
 /// Allocated at boot from the buddy by [`init_ap_ist_storage`], sized to
-/// `boot_cpu_count` rather than `MAX_CPUS`. On a 4-CPU host this saves
-/// ~960 KiB versus the prior `MAX_CPUS=64` BSS array.
+/// `boot_cpu_count` rather than `MAX_CPUS` so small hosts pay only for the
+/// CPUs they have.
 #[cfg(not(test))]
 static AP_IST_STACKS_PTR: core::sync::atomic::AtomicPtr<[u8; AP_IST_PAIR_SIZE]> =
     core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());

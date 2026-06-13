@@ -10,8 +10,10 @@
 //!
 //! - Allocate physical pages via UEFI for each `PT_LOAD` segment, copy
 //!   file data in, and zero the BSS tail.
-//! - For the kernel: place segments at their ELF-declared `p_paddr` via
-//!   `AllocatePages(AllocateAddress, …)`.
+//! - For the kernel: allocate one contiguous span at any available physical
+//!   base via `AllocatePages(AllocateAnyPages, …)` and place each segment at
+//!   its ELF-relative offset within the span, so kernel placement tolerates
+//!   any firmware memory layout.
 //! - For init: place segments at any available physical address while
 //!   preserving the in-page byte offset of `p_vaddr`, so the kernel can
 //!   identity-map a page without a second copy.
@@ -77,21 +79,125 @@ pub struct KernelInfo
 
 // ── Kernel loading ────────────────────────────────────────────────────────────
 
+/// Physical span and link-time bases of a kernel image, derived from its
+/// `PT_LOAD` segments by [`validate_kernel_layout`].
+///
+/// The loader allocates one contiguous region of `span_bytes` at any free
+/// physical base and places each segment at `span_base + (p_paddr -
+/// link_phys)`, preserving the ELF's relative layout.
+struct KernelSpan
+{
+    /// Lowest `p_paddr` across all segments — the ELF's link-time physical origin.
+    link_phys: u64,
+    /// Lowest `p_vaddr` across all segments — the kernel's link-time virtual base.
+    link_virt: u64,
+    /// Span from `link_phys` to the end of the highest segment (`p_paddr + p_memsz`).
+    span_bytes: u64,
+}
+
+/// Validate the kernel `PT_LOAD` layout and compute its physical span.
+///
+/// The kernel image is placed as a single contiguous span at a dynamically
+/// chosen physical base (issue #377: a fixed `p_paddr` collides with
+/// hart-scaled firmware allocations). That relocation is sound only if the
+/// segments form one linearly-offset, page-aligned, non-overlapping block: the
+/// kernel maps every page at `pa = va - link_virt + span_base`
+/// (`map_kernel_image`), and the per-segment copy below places each segment by
+/// the same offset. These checks guarantee both hold.
+///
+/// # Errors
+///
+/// Returns [`BootError::InvalidElf`] if `segs` is empty, any segment has
+/// `p_memsz < p_filesz`, any `p_vaddr`/`p_paddr` is not 4 KiB-aligned, the
+/// segments do not share a single `p_vaddr → p_paddr` offset, any two segments'
+/// physical ranges overlap, or `entry` lies outside every segment.
+fn validate_kernel_layout(segs: &[elf::LoadSegment], entry: u64) -> Result<KernelSpan, BootError>
+{
+    if segs.is_empty()
+    {
+        return Err(BootError::InvalidElf("kernel ELF has no PT_LOAD segments"));
+    }
+
+    let link_phys = segs.iter().map(|s| s.paddr).fold(u64::MAX, u64::min);
+    let link_virt = segs.iter().map(|s| s.vaddr).fold(u64::MAX, u64::min);
+
+    for s in segs
+    {
+        if s.memsz < s.filesz
+        {
+            return Err(BootError::InvalidElf("LOAD segment: p_memsz < p_filesz"));
+        }
+        if s.vaddr % 4096 != 0 || s.paddr % 4096 != 0
+        {
+            return Err(BootError::InvalidElf(
+                "LOAD segment: p_vaddr or p_paddr not 4 KiB-aligned",
+            ));
+        }
+        // A single linear offset is what lets span placement and the kernel's
+        // `pa = va - link_virt + span_base` mapping agree.
+        if s.paddr.wrapping_sub(link_phys) != s.vaddr.wrapping_sub(link_virt)
+        {
+            return Err(BootError::InvalidElf(
+                "LOAD segments do not share one p_vaddr->p_paddr offset",
+            ));
+        }
+    }
+
+    // Pairwise physical non-overlap (≤ 8 segments; O(n²) is trivial).
+    // Overlapping segments would corrupt the copy into the single span.
+    for (i, a) in segs.iter().enumerate()
+    {
+        let a_end = a.paddr.saturating_add(a.memsz);
+        for b in &segs[i + 1..]
+        {
+            let b_end = b.paddr.saturating_add(b.memsz);
+            if a.paddr < b_end && b.paddr < a_end
+            {
+                return Err(BootError::InvalidElf(
+                    "LOAD segments overlap in physical memory",
+                ));
+            }
+        }
+    }
+
+    if !segs
+        .iter()
+        .any(|s| entry >= s.vaddr && entry < s.vaddr.saturating_add(s.memsz))
+    {
+        return Err(BootError::InvalidElf(
+            "entry point not within any LOAD segment",
+        ));
+    }
+
+    let phys_end = segs
+        .iter()
+        .map(|s| s.paddr.saturating_add(s.memsz))
+        .fold(0u64, u64::max);
+
+    Ok(KernelSpan {
+        link_phys,
+        link_virt,
+        span_bytes: phys_end.saturating_sub(link_phys),
+    })
+}
+
 /// Load the kernel ELF from `data` into physical memory allocated via UEFI.
 ///
-/// For each `PT_LOAD` segment: allocates physical pages at `p_paddr` via
-/// `AllocateAddress`, copies `p_filesz` bytes of file data into the region,
-/// and zeroes the BSS tail (`p_memsz - p_filesz` bytes).
+/// The image is placed as a single contiguous span allocated at any free
+/// physical base via `AllocateAnyPages`; each `PT_LOAD` segment is copied to
+/// `span_base + (p_paddr - link_phys)`, preserving the ELF's relative offsets,
+/// and its BSS tail (`p_memsz - p_filesz` bytes) is zeroed. Dynamic placement
+/// tolerates any firmware memory layout (issue #377); the kernel learns the
+/// chosen base through `BootInfo.kernel_physical_base`.
 ///
 /// Up to 8 `PT_LOAD` segments are supported; an ELF with more returns
 /// `InvalidElf`.
 ///
 /// # Errors
 ///
-/// - `BootError::InvalidElf` — header or segment constraint check failed
-///   (bridged from `elf::ElfError`).
-/// - `BootError::OutOfMemory` — `AllocatePages(AllocateAddress)` returned
-///   failure (typically because the requested physical range is occupied).
+/// - `BootError::InvalidElf` — header check failed (bridged from
+///   `elf::ElfError`), or the segment layout failed [`validate_kernel_layout`].
+/// - `BootError::OutOfMemory` — no free contiguous span of the required size.
 ///
 /// # Safety
 ///
@@ -106,14 +212,17 @@ pub unsafe fn load_kernel(
 {
     let ehdr = elf::validate(data, expected_machine)?;
 
-    let mut segments: [LoadedSegment; MAX_LOAD_SEGMENTS] =
-        core::array::from_fn(|_| LoadedSegment {
-            phys_base: 0,
-            virt_base: 0,
-            size: 0,
-            writable: false,
-            executable: false,
-        });
+    // Collect the PT_LOAD segments (skipping pure-padding entries) before any
+    // allocation, so the whole layout can be validated as a unit.
+    let mut raw = [elf::LoadSegment {
+        vaddr: 0,
+        paddr: 0,
+        offset: 0,
+        filesz: 0,
+        memsz: 0,
+        writable: false,
+        executable: false,
+    }; MAX_LOAD_SEGMENTS];
     let mut segment_count: usize = 0;
 
     for seg in elf::load_segments(ehdr, data)
@@ -123,24 +232,41 @@ pub unsafe fn load_kernel(
         {
             continue;
         }
-        if seg.memsz < seg.filesz
-        {
-            return Err(BootError::InvalidElf("LOAD segment: p_memsz < p_filesz"));
-        }
         if segment_count >= MAX_LOAD_SEGMENTS
         {
             return Err(BootError::InvalidElf("ELF has more than 8 LOAD segments"));
         }
+        raw[segment_count] = seg;
+        segment_count += 1;
+    }
 
-        // p_memsz → usize: 64-bit on all supported UEFI targets; cast is exact.
-        #[allow(clippy::cast_possible_truncation)]
-        let page_count = (seg.memsz as usize).div_ceil(4096);
-        // SAFETY: `bs` is valid boot services per the function's safety contract.
-        // `seg.paddr` is the ELF-specified physical base; UEFI fails if the
-        // range is already occupied, which we surface as `OutOfMemory`.
-        unsafe { crate::uefi::allocate_address(bs, seg.paddr, page_count)? };
+    let span = validate_kernel_layout(&raw[..segment_count], elf::entry_point(ehdr))?;
 
-        // Copy file data (filesz bytes) into the allocated physical region.
+    // One contiguous allocation for the whole image, placed wherever the
+    // firmware has free RAM.
+    // span_bytes → usize: 64-bit on all supported UEFI targets; cast is exact.
+    #[allow(clippy::cast_possible_truncation)]
+    let page_count = (span.span_bytes as usize).div_ceil(4096);
+    // SAFETY: `bs` is valid boot services per the function's safety contract.
+    let span_base = unsafe { crate::uefi::allocate_pages(bs, page_count)? };
+
+    let mut segments: [LoadedSegment; MAX_LOAD_SEGMENTS] =
+        core::array::from_fn(|_| LoadedSegment {
+            phys_base: 0,
+            virt_base: 0,
+            size: 0,
+            writable: false,
+            executable: false,
+        });
+
+    for (i, seg) in raw[..segment_count].iter().enumerate()
+    {
+        // Destination preserves the ELF's relative physical offset. Page-aligned
+        // because `span_base` and `(paddr - link_phys)` are both 4 KiB multiples
+        // (the latter validated).
+        let dst_phys = span_base + (seg.paddr - span.link_phys);
+
+        // Copy file data (filesz bytes) into the placed region.
         // p_offset / p_filesz → usize: 64-bit targets only; cast is exact.
         #[allow(clippy::cast_possible_truncation)]
         let file_off = seg.offset as usize;
@@ -149,13 +275,13 @@ pub unsafe fn load_kernel(
         if file_sz > 0
         {
             let src = data[file_off..].as_ptr();
-            let dst = seg.paddr as *mut u8;
+            let dst = dst_phys as *mut u8;
             // SAFETY: `src` points into `data`; `elf::load_segments` already
             // validated that `[file_off, file_off + file_sz)` is in bounds
-            // (yields SegmentOverflow otherwise). `dst` is a freshly UEFI-
-            // allocated region of `page_count * 4096 ≥ memsz ≥ filesz` bytes,
-            // identity-mapped in the bootloader address space and disjoint
-            // from the temporary read buffer.
+            // (yields SegmentOverflow otherwise). `dst` lies within the single
+            // span allocation (`page_count * 4096 ≥ span_bytes ≥ (paddr -
+            // link_phys) + memsz ≥ … + filesz`), identity-mapped in the
+            // bootloader address space and disjoint from the read buffer.
             unsafe { core::ptr::copy_nonoverlapping(src, dst, file_sz) };
         }
 
@@ -165,54 +291,26 @@ pub unsafe fn load_kernel(
         let bss_sz = (seg.memsz - seg.filesz) as usize;
         if bss_sz > 0
         {
-            let bss_ptr = (seg.paddr + seg.filesz) as *mut u8;
-            // SAFETY: `bss_ptr` is `filesz` bytes past the segment's physical
-            // base, which is within the allocated region (`memsz` bytes total).
-            // `bss_sz = memsz - filesz` bytes remain. UEFI does not guarantee
-            // pages are zeroed; we must zero BSS here.
+            let bss_ptr = (dst_phys + seg.filesz) as *mut u8;
+            // SAFETY: `bss_ptr` is `filesz` bytes into the segment's placed
+            // region, which spans `memsz` bytes within the span allocation.
+            // UEFI does not guarantee zeroed pages; we must zero BSS here.
             unsafe { core::ptr::write_bytes(bss_ptr, 0, bss_sz) };
         }
 
-        segments[segment_count] = LoadedSegment {
-            phys_base: seg.paddr,
+        segments[i] = LoadedSegment {
+            phys_base: dst_phys,
             virt_base: seg.vaddr,
             size: seg.memsz,
             writable: seg.writable,
             executable: seg.executable,
         };
-        segment_count += 1;
     }
-
-    if segment_count == 0
-    {
-        return Err(BootError::InvalidElf(
-            "ELF has no PT_LOAD segments with non-zero p_memsz",
-        ));
-    }
-
-    let init_segs = &segments[..segment_count];
-
-    let physical_base = init_segs
-        .iter()
-        .map(|s| s.phys_base)
-        .fold(u64::MAX, u64::min);
-
-    let virtual_base = init_segs
-        .iter()
-        .map(|s| s.virt_base)
-        .fold(u64::MAX, u64::min);
-
-    let phys_end = init_segs
-        .iter()
-        .map(|s| s.phys_base.saturating_add(s.size))
-        .fold(0u64, u64::max);
-
-    let size = phys_end.saturating_sub(physical_base);
 
     Ok(KernelInfo {
-        physical_base,
-        virtual_base,
-        size,
+        physical_base: span_base,
+        virtual_base: span.link_virt,
+        size: span.span_bytes,
         entry_virtual: elf::entry_point(ehdr),
         segments,
         segment_count,
@@ -361,3 +459,111 @@ pub unsafe fn load_init(
 // Boot modules are exposed in place by referencing the single bundle UEFI
 // allocation in `BootModule.physical_base`; only the `init` entry is ELF-
 // loaded (via [`load_init`]). See `main.rs::step4_parse_bundle`.
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+
+    // A realistic kernel link layout: one linear vaddr→paddr offset, 4 KiB-aligned.
+    const VBASE: u64 = 0xFFFF_FFFF_8000_0000;
+    const PBASE: u64 = 0x8020_0000;
+
+    fn seg(vaddr: u64, paddr: u64, filesz: u64, memsz: u64) -> elf::LoadSegment
+    {
+        elf::LoadSegment {
+            vaddr,
+            paddr,
+            offset: 0,
+            filesz,
+            memsz,
+            writable: false,
+            executable: false,
+        }
+    }
+
+    // text / rodata / data / bss, page-contiguous, BSS tail extends past a page.
+    fn contiguous_layout() -> [elf::LoadSegment; 4]
+    {
+        [
+            seg(VBASE, PBASE, 0x1000, 0x1000),
+            seg(VBASE + 0x1000, PBASE + 0x1000, 0x1000, 0x1000),
+            seg(VBASE + 0x2000, PBASE + 0x2000, 0x1000, 0x1000),
+            seg(VBASE + 0x3000, PBASE + 0x3000, 0x800, 0x1800),
+        ]
+    }
+
+    #[test]
+    fn valid_layout_yields_link_bases_and_span()
+    {
+        let span = validate_kernel_layout(&contiguous_layout(), VBASE).expect("valid layout");
+        assert_eq!(span.link_phys, PBASE);
+        assert_eq!(span.link_virt, VBASE);
+        // phys_end = PBASE + 0x3000 + 0x1800; span = 0x4800.
+        assert_eq!(span.span_bytes, 0x4800);
+    }
+
+    #[test]
+    fn span_covers_unaligned_final_segment_end()
+    {
+        // Last segment ends at a non-page boundary; span must still reach it.
+        let segs = [seg(VBASE, PBASE, 0x10, 0x10)];
+        let span = validate_kernel_layout(&segs, VBASE).expect("valid layout");
+        assert_eq!(span.span_bytes, 0x10);
+    }
+
+    #[test]
+    fn empty_segment_slice_is_rejected()
+    {
+        assert!(validate_kernel_layout(&[], VBASE).is_err());
+    }
+
+    #[test]
+    fn memsz_less_than_filesz_is_rejected()
+    {
+        let segs = [seg(VBASE, PBASE, 0x2000, 0x1000)];
+        assert!(validate_kernel_layout(&segs, VBASE).is_err());
+    }
+
+    #[test]
+    fn unaligned_vaddr_is_rejected()
+    {
+        let segs = [seg(VBASE + 0x100, PBASE, 0x1000, 0x1000)];
+        assert!(validate_kernel_layout(&segs, VBASE + 0x100).is_err());
+    }
+
+    #[test]
+    fn unaligned_paddr_is_rejected()
+    {
+        let segs = [seg(VBASE, PBASE + 0x100, 0x1000, 0x1000)];
+        assert!(validate_kernel_layout(&segs, VBASE).is_err());
+    }
+
+    #[test]
+    fn inconsistent_linear_offset_is_rejected()
+    {
+        // Second segment's paddr offset (0x2000) differs from its vaddr offset (0x1000).
+        let segs = [
+            seg(VBASE, PBASE, 0x1000, 0x1000),
+            seg(VBASE + 0x1000, PBASE + 0x2000, 0x1000, 0x1000),
+        ];
+        assert!(validate_kernel_layout(&segs, VBASE).is_err());
+    }
+
+    #[test]
+    fn overlapping_physical_ranges_are_rejected()
+    {
+        // Consistent linear offset, but segment 0's memsz overruns into segment 1.
+        let segs = [
+            seg(VBASE, PBASE, 0x800, 0x2000),
+            seg(VBASE + 0x1000, PBASE + 0x1000, 0x800, 0x1000),
+        ];
+        assert!(validate_kernel_layout(&segs, VBASE).is_err());
+    }
+
+    #[test]
+    fn entry_outside_all_segments_is_rejected()
+    {
+        assert!(validate_kernel_layout(&contiguous_layout(), VBASE + 0x10000).is_err());
+    }
+}

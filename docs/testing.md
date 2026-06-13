@@ -306,6 +306,23 @@ other SMP PRs stay on the 256-vCPU mandate above.
 cargo xtask run-parallel --arch x86_64 --cpus 512 --parallel 1 --runs 1 --timeout 10800
 ```
 
+PRs touching the bootloader's kernel-placement path — `core/boot/src/elf.rs`
+(kernel ELF span allocation), `core/boot/src/uefi.rs` (UEFI page allocation),
+or the boot page-table builders (`core/boot/src/paging.rs`,
+`core/boot/src/arch/*/paging.rs`) — MUST additionally run the riscv64 128-hart
+boundary below. It is the riscv64 analogue of the full-width x86_64 run: the
+hart count at which hart-scaled firmware allocations once collided with the
+kernel image's load address ([#377](https://github.com/kottlerg/seraph/issues/377)).
+This trigger list is deliberately narrow; other SMP PRs stay on the 64/65-hart
+mandate above.
+
+```sh
+# Kernel-placement boundary, riscv64 (~475 s per passing run measured at 8x hart
+# oversubscription on a 16-core host; the 1800 s budget is for HANG
+# classification):
+cargo xtask run-parallel --arch riscv64 --cpus 128 --parallel 1 --runs 1 --timeout 1800
+```
+
 **Known boundaries**, established empirically (QEMU 11.0.1; update this
 list as the tracking Issues move):
 
@@ -317,11 +334,22 @@ list as the tracking Issues move):
   compile-time asserts at the slab consumer sites so the envelope breaks
   the build, not the boot. The full 512-vCPU width is exercised by the
   MAX_CPUS boundary run above.
-- riscv64 ≥ 128 harts ([#377](https://github.com/kottlerg/seraph/issues/377)):
-  boot dies in UEFI (`ConvertPages: Incompatible memory types`) while
-  loading the kernel ELF; independent of guest memory size. At 256 and
-  512 harts under TCG the firmware produces no serial output within 20
-  and 30 minutes respectively.
+- riscv64 ≥ 128 harts ([#377](https://github.com/kottlerg/seraph/issues/377),
+  fixed): boot died in UEFI (`ConvertPages: Incompatible memory types`) while
+  loading the kernel ELF, because the bootloader requested the image at a fixed
+  `p_paddr` (`0x80200000`) that hart-scaled firmware allocations had already
+  claimed — independent of guest memory size. The kernel image is now placed as
+  one contiguous span allocated anywhere (`AllocateAnyPages`), so loading
+  tolerates any firmware layout; `validate_kernel_layout` enforces the
+  relocation invariants (single offset, alignment, non-overlap, entry-in-image)
+  at load time. 128 harts now boots clean (3×, ~475 s/run at 8× hart
+  oversubscription on a 16-core host). The residual ceiling is upstream and
+  pre-bootloader: at 192, 256, and 512 harts under TCG the edk2 firmware emits
+  no serial output at all (192: nothing in 60 min; 256/512: nothing in 20/30
+  min) — an MP-init crawl that runs before Seraph's bootloader and cannot be
+  addressed in-tree. High-hart cross-architecture parity is therefore
+  theoretical, with real testing on hold pending faster firmware, KVM-capable
+  RISC-V emulation, or real hardware.
 - Both arches, high CPU counts ([#375](https://github.com/kottlerg/seraph/issues/375),
   fixed): the intermittent silent wedge around the `thread::load_balancer`
   and `stress::double_enqueue_storm` tests was a load-balancer ticket-lock

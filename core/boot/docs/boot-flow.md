@@ -50,9 +50,10 @@ Detail: [uefi-environment.md](uefi-environment.md)
 ### Step 3: Load Kernel ELF
 
 The kernel ELF is loaded from the hardcoded path `\EFI\seraph\kernel`.
-The ELF header is validated, LOAD segments are mapped into physical
-memory allocated via `AllocatePages`, and the kernel virtual addresses
-and entry point are recorded.
+The ELF header is validated, the LOAD segments are placed in a single
+contiguous span allocated at any free physical base (so loading tolerates
+any firmware memory layout), and the kernel virtual addresses, entry point,
+and chosen physical base (`BootInfo.kernel_physical_base`) are recorded.
 
 W^X is enforced during loading: any ELF segment requesting both writable
 and executable permissions is a fatal error.

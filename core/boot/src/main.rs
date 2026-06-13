@@ -434,7 +434,12 @@ unsafe fn step3_load_kernel(ctx: &UefiContext) -> Result<KernelLoad, BootError>
     // PE .reloc section is currently empty, so the firmware does not patch
     // vtable entries when relocating the image and core::fmt's fat-pointer
     // write_str faults.
-    bprint!("[--------] boot: kernel entry=");
+    bprint!("[--------] boot: kernel base=");
+    // SAFETY: console initialized.
+    unsafe {
+        crate::console::console_write_hex64(info.physical_base);
+    }
+    bprint!("  entry=");
     // SAFETY: console initialized.
     unsafe {
         crate::console::console_write_hex64(info.entry_virtual);

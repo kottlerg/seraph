@@ -8,10 +8,12 @@
  * at 0xFFFFFFFF80000000; the physical direct map is established at runtime
  * at 0xFFFF800000000000.
  *
- * AT() clauses set p_paddr for each section to a low physical address
- * (KERNEL_PBASE), while p_vaddr remains at KERNEL_VBASE. The bootloader
- * allocates physical frames at p_paddr via AllocateAddress and maps them
- * at p_vaddr in the initial page tables.
+ * AT() clauses set each section's p_paddr relative to KERNEL_PBASE, defining
+ * the image's relative physical layout; p_vaddr stays at KERNEL_VBASE. The
+ * bootloader allocates one contiguous span at any free physical address,
+ * places the sections at their relative offsets, and maps them at p_vaddr in
+ * the initial page tables. KERNEL_PBASE is the link-time origin only, not a
+ * runtime placement contract.
  */
 
 KERNEL_VBASE = 0xFFFFFFFF80000000;

@@ -952,36 +952,23 @@ pub fn sys_thread_set_priority(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         return Err(SyscallError::InvalidCapability);
     }
 
-    // `priority`, `state`, and `queued_on` are in the Scheduling field group,
-    // whose authoritative serializer is the per-TCB `sched_lock`
-    // (docs/scheduling-internals.md § Cross-CPU TCB Ownership). Acquire it FIRST
-    // (outermost), then every CPU's run-queue lock in ascending order — the same
-    // shape as `dealloc_object(Thread)` and `set_state_under_all_locks`. Without
-    // `sched_lock` this `state` read and the `remove_from_queue` / `enqueue`
-    // below race `enqueue_and_wake` / `commit_blocked` / `schedule`, which write
-    // those fields under `sched_lock` — an unserialized Scheduling-group writer
-    // the per-TCB-lock redesign (STEP 5) converted everywhere else but here.
+    // `priority`, `state`, and the run-queue link are in the Scheduling field
+    // group, whose authoritative serializer is the per-TCB `sched_lock`
+    // (docs/scheduling-internals.md § Cross-CPU TCB Ownership). Hold it across
+    // the `state` read, the `priority` write, and the relocate so they cannot
+    // race `enqueue_and_wake` / `commit_blocked` / `schedule`, which write the
+    // same fields under the same lock. `sched_lock` — not the run-queue locks —
+    // is the serializer for the scalar fields; the run-queue lock is needed only
+    // to relink the queue entry, which `relocate_ready_priority` acquires (one
+    // CPU on a `preferred_cpu` hint hit, the ascending all-CPU walk on a miss).
     let cpu_count = crate::sched::CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
 
     // SAFETY: target_tcb validated non-null; lock_raw paired with the unlock_raw
-    // after the all-CPU-locks release below (released last, restoring caller IF).
+    // below (released last, restoring the caller's interrupt state).
     let tcb_sched_saved = unsafe { (*target_tcb).sched_lock.lock_raw() };
 
-    // Ascending order matches the lock hierarchy rule. Each CPU's saved
-    // interrupt-flag word is stashed in its own scheduler (under that lock).
-    for cpu in 0..cpu_count
-    {
-        // SAFETY: cpu < cpu_count; scheduler slab initialised by `sched::init`.
-        unsafe {
-            let s = crate::sched::scheduler_for(cpu);
-            s.saved_lock_flags = s.lock.lock_raw();
-        }
-    }
-
-    // SAFETY: target_tcb validated non-null. `sched_lock` (held, outermost)
-    // serializes the `state` read and the `queued_on` mutation against every
-    // other Scheduling-group writer; the all-CPU run-queue locks (held) cover
-    // the intrusive remove/enqueue list structure.
+    // SAFETY: target_tcb validated non-null. `sched_lock` (held) serializes these
+    // Scheduling-group accesses against every other writer.
     unsafe {
         let old_prio = (*target_tcb).priority;
         let state = (*target_tcb).state;
@@ -989,50 +976,26 @@ pub fn sys_thread_set_priority(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
         if state == ThreadState::Ready && old_prio != priority
         {
-            // A Ready TCB is normally linked on exactly one CPU's run queue.
-            // Locate that scheduler by trying `remove_from_queue` on each
-            // one; the succeeding remove identifies the home, and we
-            // re-enqueue there at the new priority. If no scheduler reports
-            // `true` the TCB is in the transient Ready-and-unlinked window
-            // of `schedule()`'s cross-CPU outgoing branch
-            // (`sched/mod.rs` cross_cpu re-enqueue): `state` was set to
-            // `Ready` under the local sched.lock, that lock was released,
-            // and the in-flight `enqueue_and_wake` on the destination
-            // scheduler has not yet acquired its target lock. That
-            // `enqueue_and_wake` re-reads `(*tcb).priority` under the
-            // target lock, so the write we just committed is picked up
-            // there and the queue link lands at the new priority. No
-            // action is needed in that case.
-            #[allow(clippy::needless_range_loop)]
-            for cpu in 0..cpu_count
-            {
-                let sched = crate::sched::scheduler_for(cpu);
-                if sched.remove_from_queue(target_tcb, old_prio)
-                {
-                    // Skip impossible: the remove above just cleared queued_on
-                    // under the all-CPU locks (#359).
-                    let linked = sched.enqueue(target_tcb, priority);
-                    debug_assert!(
-                        linked,
-                        "set_priority: re-enqueue skipped after successful remove"
-                    );
-                    break;
-                }
-            }
+            // A Ready TCB is normally linked on exactly one CPU's run queue, the
+            // one named by `preferred_cpu` (#359). Clamp the hint — a corrupt
+            // value is treated as cpu 0 and corrected by the walk fallback — and
+            // relocate the queue entry to the new priority. `relocate_ready_priority`
+            // returns `None` when the TCB is found on no queue: the transient
+            // Ready-but-unlinked window of `schedule()`'s cross-CPU outgoing
+            // branch / `sys_thread_start`. The new priority is already committed
+            // above, and the pending link re-reads `(*tcb).priority` under the
+            // destination run-queue lock, so the link lands at the new priority.
+            let hint = {
+                let p = (*target_tcb).preferred_cpu as usize;
+                if p < cpu_count { p } else { 0 }
+            };
+            let _ = crate::sched::relocate_ready_priority(
+                target_tcb, old_prio, priority, hint, cpu_count,
+            );
         }
     }
 
-    for cpu in (0..cpu_count).rev()
-    {
-        // SAFETY: `lock_raw` above paired with this unlock; same CPU index.
-        unsafe {
-            let s = crate::sched::scheduler_for(cpu);
-            s.lock.unlock_raw(s.saved_lock_flags);
-        }
-    }
-
-    // Release `sched_lock` LAST (first-acquired → last-released), restoring the
-    // caller's interrupt state.
+    // Release `sched_lock`, restoring the caller's interrupt state.
     // SAFETY: tcb_sched_saved from the lock_raw above.
     unsafe {
         (*target_tcb).sched_lock.unlock_raw(tcb_sched_saved);
@@ -1245,10 +1208,10 @@ pub fn sys_thread_set_affinity(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         // cross-CPU re-enqueue branch (`core/kernel/src/sched/mod.rs`), where
         // the inter-lock window IS visible to interrupts.
         //
-        // `sys_thread_set_priority` above takes every CPU's scheduler.lock
-        // in ascending order around its Scheduling-group writes, so it
-        // serialises with `migrate_ready_thread` directly and does not need
-        // a preempt bracket.
+        // `sys_thread_set_priority` above holds the per-TCB `sched_lock`
+        // (outer) across its `state` read and `priority` write, the same lock
+        // `migrate_ready_thread` acquires, so the two serialise directly and it
+        // does not need a preempt bracket.
         //
         // See issue #116.
         crate::percpu::preempt_disable();

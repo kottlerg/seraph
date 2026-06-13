@@ -64,7 +64,7 @@ The following ordering MUST be observed everywhere in the kernel. Acquiring lock
 
 3a. **`THREAD_REGISTRY_LOCK` is strict-leaf-only.** The diagnostic live-thread registry (`core/kernel/src/sched/thread_registry.rs`) is linked at thread construction and unlinked at dealloc, both with `THREAD_REGISTRY_LOCK` held strictly alone — never nested under a source IPC lock, `(*tcb).sched_lock`, or a run-queue lock — so it adds no lock-order edge. The softlockup watchdog walks it via `try_for_each` (a non-blocking `try_lock`, so a contended or CPU-died lock degrades to a skipped section rather than a hang). See § Thread Registry.
 
-4. **Per-TCB-then-cross-CPU acquisition rule.** A path mutating a TCB's Scheduling field group MUST acquire `(*tcb).sched_lock` FIRST (outermost among the scheduler locks), THEN any per-CPU scheduler.lock(s); when two or more per-CPU scheduler.locks are needed simultaneously, they MUST be taken in ascending-CPU order. Live production sites: `sched::migrate_ready_thread` (used by `sys_thread_set_affinity` active migration and the periodic load balancer; `(*tcb).sched_lock` then the two CPU locks ascending), `dealloc_object(Thread)` (`(*tcb).sched_lock` then the all-CPU walk in ascending order), `sched::set_state_under_all_locks` (lifecycle state writes; same shape), and `sys_thread_set_priority` (priority writes plus locate-and-relocate of the Ready TCB's queue entry; `(*tcb).sched_lock` then the all-CPU walk in ascending order). A path MUST NEVER hold two different TCBs' `sched_lock`s at once — `schedule()`'s outgoing-then-incoming flip releases `current.sched_lock` before acquiring `next.sched_lock`.
+4. **Per-TCB-then-cross-CPU acquisition rule.** A path mutating a TCB's Scheduling field group MUST acquire `(*tcb).sched_lock` FIRST (outermost among the scheduler locks), THEN any per-CPU scheduler.lock(s); when two or more per-CPU scheduler.locks are needed simultaneously, they MUST be taken in ascending-CPU order. Live production sites: `sched::migrate_ready_thread` (used by `sys_thread_set_affinity` active migration and the periodic load balancer; `(*tcb).sched_lock` then the two CPU locks ascending), `dealloc_object(Thread)` (`(*tcb).sched_lock` then the all-CPU walk in ascending order), `sched::set_state_under_all_locks` (lifecycle state writes; same shape), and `sys_thread_set_priority` (priority write under `(*tcb).sched_lock`, then locate-and-relocate of the Ready TCB's queue entry via `sched::relocate_ready_priority`, which locks the single `preferred_cpu`-hinted CPU's run-queue on a hint hit and only on a miss falls back to the all-CPU walk in ascending order). A path MUST NEVER hold two different TCBs' `sched_lock`s at once — `schedule()`'s outgoing-then-incoming flip releases `current.sched_lock` before acquiring `next.sched_lock`.
 
 5. **`enqueue_and_wake` / `enqueue_ready_thread` acquire `(*tcb).sched_lock` then the target CPU's scheduler.lock.** They MAY be called WITH the source IPC lock still held OR after releasing it, because `source → (*tcb).sched_lock → run-queue lock` is exactly the hierarchy — there is no `source.lock → scheduler.lock` edge to violate. The single-waiter wakers (`notification_send`, `event_queue_post`, `endpoint_call`'s server-wake branch, `endpoint_reply`, and the `event_queue_drop` / `notification_dealloc` single-waiter dealloc wakes) snapshot the payload and set `wake_in_flight` under the source lock, RELEASE the source lock, then call `enqueue_and_wake` — releasing first bounds source-lock hold-time. Between that source-lock claim (waiter slot cleared, payload deposited, `wake_in_flight = 1`) and the waker's post-unlock `enqueue_and_wake`, the wake is half-complete and owned exclusively by the in-flight waker: code executing *as the claimed thread* in that window (it is still live, mid-park) has exactly one legal continuation — fall through to `schedule()`. Consuming the deposited payload and returning to user mode is forbidden; it strands the waker's run-queue link (#352). The `still_waiter` rechecks (the sleep-list arming in `sys_event_recv` / `sys_notification_wait`) respect this: they only add a timer on the not-claimed branch and fall through to `schedule()` on both branches. The `endpoint_dealloc` send/recv drain instead HOLDS `ep.lock` across the per-waiter `enqueue_and_wake` walk (a multi-waiter drain; sound precisely because the order is canonical, and `wake_in_flight = 1` per waiter blocks a racing `dealloc(waiter)` unlink from freeing a TCB mid-wake). `enqueue_and_wake` dispatches its wakeup IPI only after BOTH the run-queue lock and `(*tcb).sched_lock` are released (never IPI under `sched_lock`). `pull_unpinned_ready` is the one site that takes `(*tcb).sched_lock` via `try_lock_raw` while already holding a run-queue lock — the inverse of the canonical order; the `try` backs off on contention (a canonical holder makes it fail), so it is deadlock-free, and the source CPU's run-queue lock pins the candidate so the pointer cannot be freed under it. Its two run-queue locks are themselves `try_lock_raw` (ascending order retained): the pull runs from every CPU's tick with interrupts disabled, and blocking there lets every idle CPU queue on one victim's lock — the FIFO ticket convoy that livelocked the guest system-wide under vCPU oversubscription (#375). The wait-set cascade rule is unchanged in spirit: `wait_set_drop` releases its source/ws locks before reporting any zero-refcount source back to `dealloc_object_one`'s cascade worklist, so the source's own dealloc runs after every IPC source/ws lock has been released.
 
@@ -129,24 +129,40 @@ Stopped→Ready transition followed by `enqueue_and_wake` could race the drain
 and produce two list entries for the same TCB. The skip loop in `schedule()`
 (`sched/mod.rs`, the `dequeue_highest` Stopped/Exited skip) remains as
 defence-in-depth and as the drain mechanism for legitimate paths that bypass
-`set_state_under_all_locks` (none currently). The priority snapshot uses
-`(*tcb).priority` read under `(*tcb).sched_lock` + all-CPU locks; this is
-consistent with the matching reads in `dealloc_object(Thread)` and
-`sys_thread_set_priority`, which all read/write the Scheduling field group
-under the same `(*tcb).sched_lock`-outer / all-CPU-locks discipline.
+`set_state_under_all_locks` (none currently). The priority snapshot reads
+`(*tcb).priority` under `(*tcb).sched_lock` + all-CPU locks; `(*tcb).sched_lock`
+is the serializer, so this is consistent with `dealloc_object(Thread)` (same
+all-locks read) and `sys_thread_set_priority` (which writes `(*tcb).priority`
+under `(*tcb).sched_lock` alone) — every reader and writer of the Scheduling
+field group holds that per-TCB lock.
 
 **Priority change of a Ready TCB (issue #122).** `sys_thread_set_priority`
-acquires `(*tcb).sched_lock` (outer), then writes `(*tcb).priority` and, when the
-target is `Ready`, relocates its queue entry under every CPU's `scheduler.lock`
-acquired in ascending order (inner). `sched_lock` is what makes the `state` read
-race-free against `enqueue_and_wake` / `commit_blocked` / `schedule` — those all
-write the Scheduling group under the same per-TCB lock. Identifying the home CPU
-is itself a read of the Scheduling field group, so the syscall scans each
-scheduler with `remove_from_queue(tcb, old_prio)` and re-enqueues on the same
-scheduler at the new priority via `PerCpuScheduler::enqueue`. The
-`sched_lock`-outer / all-locks region serialises this against
+acquires `(*tcb).sched_lock` (outer) and holds it across the `state` read and the
+`(*tcb).priority` write — that lock is what makes those race-free against
+`enqueue_and_wake` / `commit_blocked` / `schedule`, which write the Scheduling
+group under the same per-TCB lock. The run-queue locks are NOT needed for the
+scalar fields, only to relink the queue entry, so when the target is `Ready` the
+relocate runs through `sched::relocate_ready_priority`:
+
+- **Hint hit (common, O(1) locks):** `preferred_cpu` names the CPU whose run
+  queue links a stable `Ready` thread (every link-creating path retargets it on
+  the created link — #359). The relocate locks only that one CPU's `scheduler.lock`
+  and verifies membership with `remove_from_queue(tcb, old_prio)`; on success it
+  re-enqueues at the new priority on the same scheduler via
+  `PerCpuScheduler::enqueue`. A single inner lock under the held `sched_lock`
+  needs no ascending-order coordination.
+- **Hint miss (fallback):** the thread migrated between the `preferred_cpu` read
+  and the lock, or sits in the transient `Ready`-but-unlinked window (below). The
+  hint lock is released and the relocate falls back to the original #122 walk:
+  every CPU's `scheduler.lock` acquired in ascending order, `remove_from_queue`
+  tried on each, re-enqueue on the scheduler that reports `true` (and
+  `preferred_cpu` refreshed to it so the stale hint self-heals). `remove_from_queue`'s
+  boolean is the authoritative home-CPU identification on both paths.
+
+The held `(*tcb).sched_lock` serialises the whole operation against
 `migrate_ready_thread`, `dealloc_object(Thread)`, and
-`set_state_under_all_locks`.
+`set_state_under_all_locks` (all take the same per-TCB lock); the run-queue
+lock(s) cover the intrusive list surgery.
 
 The "Ready ⇒ linked on exactly one queue" invariant has a transient
 exception during any window where a caller publishes `state = Ready` on
@@ -171,9 +187,10 @@ the link if a concurrent `dealloc(client)` already marked it `Exited` —
 so no `Ready`-with-no-link window is published for that path.)
 
 In each window the TCB is observably `Ready` with no queue link. A
-racing `sys_thread_set_priority` taking the `sched_lock`-outer / all-CPU-locks
-region sees no scheduler claim the TCB in its locate scan; it writes the new
-priority and falls through without relocating. The pending link then reads
+racing `sys_thread_set_priority` (holding `(*tcb).sched_lock`) finds no scheduler
+claims the TCB: `relocate_ready_priority` misses on the `preferred_cpu` hint and
+the all-CPU walk fallback finds it nowhere, so it writes the new priority and
+falls through without relocating, returning `None`. The pending link then reads
 `(*tcb).priority` under the destination run-queue lock — neither
 `enqueue_and_wake` nor `enqueue_ready_thread` takes a caller-supplied priority —
 and links the TCB at whichever value was last committed under lock. No desync
@@ -227,8 +244,9 @@ consistency window as for any other `enqueue_and_wake` racing
 
 **Enqueue-chokepoint enforcement (issues #244, #289).** Every run-queue
 insertion — `enqueue_and_wake`, `schedule()`'s outgoing requeue,
-`sys_thread_set_priority`'s re-enqueue, and `migrate_ready_thread`'s destination
-link — funnels through `PerCpuScheduler::enqueue`. That chokepoint refuses a
+`relocate_ready_priority`'s re-enqueue (`sys_thread_set_priority`), and
+`migrate_ready_thread`'s destination link — funnels through
+`PerCpuScheduler::enqueue`. That chokepoint refuses a
 double-link via the per-TCB `queued_on` tag: the priority level the TCB is
 currently linked at, or `-1` when unlinked, written only under the owning
 `scheduler.lock` (set on link, cleared in `dequeue_highest` /
@@ -350,9 +368,9 @@ Producer side (`enqueue_and_wake`, `core/kernel/src/sched/mod.rs`):
    - Blocked/Created → fall through to the link path.
 3. Acquire target scheduler.lock UNDER sched_lock (inner).
 4. Set tcb.state = Ready, ipc_state = None, blocked_on_object = null,
-   wake_pending = false; read priority under the run-queue lock (so a
-   concurrent sys_thread_set_priority's all-CPU region serialises against
-   the link).
+   wake_pending = false; read priority under the held sched_lock (so a
+   concurrent sys_thread_set_priority's priority write — taken under the same
+   per-TCB sched_lock — serialises against the link).
 5. Enqueue tcb in target's priority queue; the enqueue reports whether it
    created the link (false = the release-mode single-link skip).
    (Inside enqueue: non_empty.fetch_or(1 << prio, Release); queued_on = prio.)
@@ -537,7 +555,7 @@ Pairing table for every load-bearing atomic in the scheduling and IPC paths. "Lo
 |---|---|---|---|---|
 | `RESCHEDULE_PENDING` (`AtomicCpuMask`) | `sched/mod.rs` (decl; ops `set_reschedule_pending_for` / `take_reschedule_pending`) | Release on `set_reschedule_pending_for` (`set_cpu`) | AcqRel on `take_reschedule_pending` (`take_cpu`) | Release publishes the producer's prior enqueue; AcqRel ensures the consumer sees the enqueue and synchronises both directions of the bit clear. |
 | `non_empty` (per PerCpuScheduler) | `sched/run_queue.rs` (decl in `PerCpuScheduler`; writes in `enqueue`, `dequeue_highest`, `remove_from_queue`; read in `has_runnable`) | Release on `enqueue.fetch_or`, `dequeue_highest.fetch_and`, `remove_from_queue.fetch_and` | Acquire on `has_runnable.load` | Release publishes the queue-mutation stores; the lockless idle-loop Acquire is the only synchronisation edge with cross-CPU enqueues on RVWMO. |
-| `queued_on` (per TCB, `AtomicI16`) | `sched/thread.rs` (decl); writes in `PerCpuScheduler::enqueue` (set to priority), `dequeue_highest` / `remove_from_queue` (set to `-1`); read in the `PerCpuScheduler::enqueue` double-link guard, `schedule()`'s `already_queued` requeue guard, and the `commit_blocked_under_local_lock` debug tripwire | Relaxed `store` | Relaxed `load` | The global single-link tag (#244/#289). Every load-bearing access — set, clear, and the guard reads — is performed under the owning `scheduler.lock` (the `schedule()` guard read under the current CPU's run-queue lock), which supplies all required ordering; the atomic type exists only so a cross-CPU `enqueue_and_wake` guard read of a TCB linked on *another* CPU is well-defined, not for lock-free synchronisation. A `>= 0` value means linked at that priority on the CPU that set it. The `commit_blocked` tripwire reads it Relaxed under `(*tcb).sched_lock` with no run-queue lock — sound because every `-1 → >= 0` writer either classifies the target not-live under that same `sched_lock` (`enqueue_and_wake`, `enqueue_ready_thread` via its not-live caller contract) or runs as / while holding the same lock as the parking thread itself (`schedule()`'s requeue arms, `relocate_ready_thread`, `sys_thread_set_priority`), all excluded while the thread executes its own park commit. (The lock-free softlockup-watchdog dump also reads the field; diagnostic-only, not load-bearing.) |
+| `queued_on` (per TCB, `AtomicI16`) | `sched/thread.rs` (decl); writes in `PerCpuScheduler::enqueue` (set to priority), `dequeue_highest` / `remove_from_queue` (set to `-1`); read in the `PerCpuScheduler::enqueue` double-link guard, `schedule()`'s `already_queued` requeue guard, and the `commit_blocked_under_local_lock` debug tripwire | Relaxed `store` | Relaxed `load` | The global single-link tag (#244/#289). Every load-bearing access — set, clear, and the guard reads — is performed under the owning `scheduler.lock` (the `schedule()` guard read under the current CPU's run-queue lock), which supplies all required ordering; the atomic type exists only so a cross-CPU `enqueue_and_wake` guard read of a TCB linked on *another* CPU is well-defined, not for lock-free synchronisation. A `>= 0` value means linked at that priority on the CPU that set it. The `commit_blocked` tripwire reads it Relaxed under `(*tcb).sched_lock` with no run-queue lock — sound because every `-1 → >= 0` writer either classifies the target not-live under that same `sched_lock` (`enqueue_and_wake`, `enqueue_ready_thread` via its not-live caller contract) or runs as / while holding the same lock as the parking thread itself (`schedule()`'s requeue arms, `relocate_ready_thread`, `relocate_ready_priority`), all excluded while the thread executes its own park commit. (The lock-free softlockup-watchdog dump also reads the field; diagnostic-only, not load-bearing.) |
 | `context_saved` (per TCB) | `sched/thread.rs` (decl) | Release after `context::switch` returns on the outgoing CPU; **Relaxed clears to `0`** at the park commits (`commit_blocked_under_local_lock` and the IPC pre-clears) and `schedule()`'s switch-away / cross-affinity arms, each performed while the thread is `current` on the storing CPU | Acquire on the remote-dequeue spin-loop; **also Acquire** in the load-balancer liveness gate (`pull_unpinned_ready` / `migrate_ready_thread`, step 11) and `await_descheduled` | Closes the partial-`SavedState`-visibility race on RVWMO, and (step 11) gates cross-CPU relocation/resume on a committed save — `cs == 1` ⇒ switched out and `current` nowhere; see [Cross-CPU TCB Ownership](#cross-cpu-tcb-ownership) (steps 5/6/9/11) for the full sequence. The Relaxed `0`-clears are sufficient: every consumer reaches the cleared value transitively through a lock release/acquire chain (the waker/relocator hold `sched_lock` and the run-queue lock), the same argument the pre-existing IPC pre-clears rely on. |
 | `bits` (Notification) | `ipc/notification.rs` (decl; ops in `notification_send` / `notification_wait`) | Relaxed `fetch_or` in `notification_send`, Relaxed `swap` in `notification_wait` and `notification_send` slow path | (same — paired with the SeqCst fences below) | The Dekker fence pair below provides the cross-side ordering; the bits ops themselves are Relaxed because no other field needs to be synchronised relative to them. |
 | `has_observer` (Notification) + `bits` Dekker pair | `ipc/notification.rs` (decl) | Relaxed store in `notification_wait`, Relaxed load in `notification_send` | (same) | Paired SeqCst fences in `notification_send` (between `bits.fetch_or` and `has_observer.load`) and `notification_wait` (between `has_observer.store` and `bits.swap`) form the Dekker pattern: either `notification_send` observes `has_observer == 1` and falls through to the slow path lock acquisition, or `notification_wait`'s swap observes the OR'd bits and returns without parking. The fences are the only ordering edge; weakening to plain `Acquire`/`Release` is **insufficient** because the read-and-write sites span two distinct atomics. |
@@ -590,10 +608,10 @@ below. It MUST live off-stack via one of the two idioms in the table.
   stack of whatever thread the tick interrupted. A `[_; MAX_SLEEPING]` frame
   there overruns that borrowed stack.
 - **All-CPU-locks lifecycle paths.** `set_state_under_all_locks`,
-  `sys_thread_set_priority`, and `dealloc_object(Thread)` each save one
-  interrupt-flag word per CPU across the all-CPU-locks region (Lock Hierarchy
-  rule 4). A `[u64; MAX_CPUS]` frame on the caller's syscall stack scales with
-  the CPU ceiling — 4 KiB at `MAX_CPUS = 512`.
+  `relocate_ready_priority`'s walk fallback (`sys_thread_set_priority`), and
+  `dealloc_object(Thread)` each save one interrupt-flag word per CPU across the
+  all-CPU-locks region (Lock Hierarchy rule 4). A `[u64; MAX_CPUS]` frame on the
+  caller's syscall stack scales with the CPU ceiling — 4 KiB at `MAX_CPUS = 512`.
 
 The failure mode is silent and not size-checked by the compiler: the oversized
 frame clobbers a saved return-address chain and the next `ret` faults with

@@ -227,8 +227,9 @@ pub struct PerCpuScheduler
 
     /// Interrupt-flag word saved by `lock_raw` while this CPU's lock is held
     /// as part of an all-CPU-locks operation (`set_state_under_all_locks`,
-    /// `sys_thread_set_priority`, `dealloc_object(Thread)`); read back at the
-    /// matching `unlock_raw`. Written only under this scheduler's own lock, so
+    /// `relocate_ready_priority`'s walk fallback, `dealloc_object(Thread)`);
+    /// read back at the matching `unlock_raw`. Written only under this
+    /// scheduler's own lock, so
     /// it needs no atomicity. Off-stack per the per-CPU-field idiom of
     /// docs/scheduling-internals.md § Off-Stack Scratch for Ceiling-Sized Arrays.
     pub saved_lock_flags: u64,
@@ -479,11 +480,12 @@ impl PerCpuScheduler
 
     /// Remove `tcb` from its priority queue. No-op if not found.
     ///
-    /// Used by `dealloc_object(Thread)`, `sys_thread_set_priority`, and
+    /// Used by `dealloc_object(Thread)`, `relocate_ready_priority`, and
     /// `migrate_ready_thread` to relocate or destroy a queued thread. The
-    /// boolean return identifies the home scheduler when called inside an
-    /// all-CPU-locks walk (e.g. `sys_thread_set_priority` re-enqueues at the
-    /// new priority on the same scheduler that reported `true`).
+    /// boolean return is the authoritative "located here" check: it identifies
+    /// the home scheduler for a `preferred_cpu` hint hit (one lock) and, on a
+    /// miss, inside the all-CPU-locks walk (`relocate_ready_priority` re-enqueues
+    /// at the new priority on the scheduler that reported `true`).
     ///
     /// Decrements the load counter iff the remove succeeded — the load
     /// counter MUST match the actual queue contents. Callers that pair this
@@ -846,5 +848,104 @@ mod tests
         assert!(sched.remove_from_queue(pa, 4));
         assert!(sched.enqueue(pa, 9));
         assert_ne!(sched.non_empty.load(Ordering::Relaxed) & (1 << 9), 0);
+    }
+
+    // ── Locate-and-relocate (relocate_ready_priority) ────────────────────────
+    //
+    // These exercise the hint-first / ascending-walk-fallback locate logic that
+    // `crate::sched::relocate_ready_priority` orchestrates for
+    // `sys_thread_set_priority`. The production function layers the per-CPU
+    // run-queue locking (one lock on a `preferred_cpu` hint hit; all locks
+    // ascending on a miss) on top of this same `remove_from_queue` / `enqueue`
+    // sequence. That locking is host-untestable (the syscall is
+    // `#[cfg(not(test))]` and `scheduler_for` reads global per-CPU state) and is
+    // covered by the two-arch ktest stress suite (`double_enqueue_storm`,
+    // `priority_dealloc_race`). Here we validate that `remove_from_queue`'s
+    // boolean drives the relink to the correct scheduler at the new priority on
+    // both the hit and miss paths.
+
+    /// Mirror of `relocate_ready_priority`'s locate logic over a scheduler slice,
+    /// minus the run-queue locking: try `hint` first, else walk ascending; on the
+    /// located CPU re-link at `new` and (when located off the hint) refresh
+    /// `preferred_cpu`. Returns the CPU it relocated on, or `None` if unlinked.
+    fn locate_relocate(
+        scheds: &mut [PerCpuScheduler],
+        tcb: *mut ThreadControlBlock,
+        old: u8,
+        new: u8,
+        hint: usize,
+    ) -> Option<usize>
+    {
+        if scheds[hint].remove_from_queue(tcb, old)
+        {
+            assert!(scheds[hint].enqueue(tcb, new));
+            return Some(hint);
+        }
+        for cpu in 0..scheds.len()
+        {
+            if scheds[cpu].remove_from_queue(tcb, old)
+            {
+                assert!(scheds[cpu].enqueue(tcb, new));
+                // SAFETY: tcb valid for the test's lifetime.
+                unsafe { (*tcb).preferred_cpu = cpu as u32 };
+                return Some(cpu);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn relocate_hint_hit_relinks_at_new_priority()
+    {
+        let mut scheds = [PerCpuScheduler::new(), PerCpuScheduler::new()];
+        let mut t = make_tcb();
+        let pt = &mut *t as *mut _;
+
+        // Linked on cpu 1 at prio 4; the hint names cpu 1 (the common case).
+        assert!(scheds[1].enqueue(pt, 4));
+        assert_eq!(locate_relocate(&mut scheds, pt, 4, 9, 1), Some(1));
+        // Re-linked at the new priority on the same scheduler; cpu 0 untouched.
+        assert_eq!(scheds[0].non_empty.load(Ordering::Relaxed), 0);
+        assert_eq!(scheds[1].non_empty.load(Ordering::Relaxed), 1 << 9);
+        // SAFETY: pt valid.
+        assert_eq!(unsafe { (*pt).queued_on.load(Ordering::Relaxed) }, 9);
+    }
+
+    #[test]
+    fn relocate_hint_miss_walk_locates_home_and_refreshes_hint()
+    {
+        let mut scheds = [
+            PerCpuScheduler::new(),
+            PerCpuScheduler::new(),
+            PerCpuScheduler::new(),
+        ];
+        let mut t = make_tcb();
+        let pt = &mut *t as *mut _;
+
+        // Linked on cpu 2, but the (stale) hint names cpu 0: the hint remove
+        // misses and the ascending walk must locate it on cpu 2.
+        assert!(scheds[2].enqueue(pt, 6));
+        assert_eq!(locate_relocate(&mut scheds, pt, 6, 3, 0), Some(2));
+        // Relinked at new prio on cpu 2; cpus 0 and 1 untouched.
+        assert_eq!(scheds[0].non_empty.load(Ordering::Relaxed), 0);
+        assert_eq!(scheds[1].non_empty.load(Ordering::Relaxed), 0);
+        assert_eq!(scheds[2].non_empty.load(Ordering::Relaxed), 1 << 3);
+        // Stale hint self-healed to the located CPU.
+        // SAFETY: pt valid.
+        assert_eq!(unsafe { (*pt).preferred_cpu }, 2);
+    }
+
+    #[test]
+    fn relocate_unlinked_is_noop()
+    {
+        // The transient Ready-but-unlinked window: the thread is on no queue, so
+        // both the hint and the walk miss and the relocate is a no-op.
+        let mut scheds = [PerCpuScheduler::new(), PerCpuScheduler::new()];
+        let mut t = make_tcb();
+        let pt = &mut *t as *mut _;
+
+        assert_eq!(locate_relocate(&mut scheds, pt, 6, 3, 0), None);
+        assert_eq!(scheds[0].non_empty.load(Ordering::Relaxed), 0);
+        assert_eq!(scheds[1].non_empty.load(Ordering::Relaxed), 0);
     }
 }

@@ -3721,19 +3721,20 @@ pub unsafe fn schedule(requeue_current: bool)
         next = sched.dequeue_highest();
     }
 
-    // Validate the selected thread.
+    // Validate the selected thread. Only `magic` is checked here: it is fixed at
+    // construction and never mutated under any scheduler lock, so this read is
+    // race-free without `next.sched_lock` (not held at this point). `priority` is
+    // deliberately NOT read here — it is written under `(*tcb).sched_lock` alone
+    // (sys_thread_set_priority), which is not held for `next`, so a debug-only
+    // range check would race that write; `dequeue_highest` already selected
+    // `next` by a valid queue index, so the level is in range by construction.
     if !core::ptr::eq(next, sched.idle) && !next.is_null()
     {
-        // SAFETY: next is from the run queue; all fields readable.
+        // SAFETY: next is from the run queue; `magic` readable on any valid TCB.
         unsafe {
             debug_assert!(
                 (*next).magic == thread::TCB_MAGIC,
                 "schedule: next TCB magic corrupt on cpu {cpu}"
-            );
-            debug_assert!(
-                ((*next).priority as usize) < NUM_PRIORITY_LEVELS,
-                "schedule: next priority {} out of range on cpu {cpu}",
-                (*next).priority
             );
         }
     }

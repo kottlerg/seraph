@@ -68,7 +68,7 @@ therefore surfaces as `MemoryType::Loaded`. The kernel treats `Loaded`
 regions as in-use until it explicitly reclaims them in Phase 3 (kernel
 page-table replacement). Specifically:
 
-- Kernel image LOAD segments, placed at ELF `p_paddr`.
+- Kernel image LOAD segments, placed in a bootloader-chosen contiguous span.
 - Init image LOAD segments, placed at any free physical address.
 - Boot-module file buffers, placed at any free physical address.
 - `BootInfo` structure page.

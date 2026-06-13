@@ -37,8 +37,6 @@ pub const ALLOCATE_ANY_PAGES: u32 = 0;
 /// SIPI trampoline. Public because the x86-64 helper in
 /// `arch::current::allocate_ap_trampoline` lives in a different module.
 pub const ALLOCATE_MAX_ADDRESS: u32 = 1;
-/// Allocate pages at a specified physical address.
-pub const ALLOCATE_ADDRESS: u32 = 2;
 
 /// Memory type used for all bootloader allocations.
 ///
@@ -648,35 +646,6 @@ pub unsafe fn allocate_pages(bs: *mut EfiBootServices, count: usize) -> Result<u
         return Err(BootError::OutOfMemory);
     }
     Ok(addr)
-}
-
-/// Allocate `count` pages at the specified physical address.
-///
-/// Fails if the address range is already in use. Uses `EfiLoaderData`.
-///
-/// # Safety
-/// `bs` must be valid boot services. `addr` must be page-aligned.
-pub unsafe fn allocate_address(
-    bs: *mut EfiBootServices,
-    addr: u64,
-    count: usize,
-) -> Result<(), BootError>
-{
-    let mut out_addr = addr;
-    // SAFETY: bs is valid; out_addr is an in-out parameter (ALLOCATE_ADDRESS mode).
-    let status = unsafe {
-        ((*bs).allocate_pages)(
-            ALLOCATE_ADDRESS,
-            EFI_LOADER_DATA,
-            count,
-            core::ptr::addr_of_mut!(out_addr),
-        )
-    };
-    if status != EFI_SUCCESS
-    {
-        return Err(BootError::OutOfMemory);
-    }
-    Ok(())
 }
 
 /// Allocate `count` pages at or below `max_phys` physical address.

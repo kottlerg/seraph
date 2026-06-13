@@ -146,8 +146,9 @@ pub struct Elf64Phdr
     /// Physical address of the segment.
     ///
     /// Userspace loaders ignore this field (they place segments at any
-    /// available physical address). The bootloader honours it for the
-    /// kernel image, where the ELF dictates a fixed physical placement.
+    /// available physical address). For the kernel image it defines the
+    /// segment's offset within the image; the bootloader places the image at
+    /// a dynamically chosen base and preserves those relative offsets.
     pub p_paddr: u64,
     /// Number of bytes in the file image of the segment.
     pub p_filesz: u64,
@@ -171,8 +172,9 @@ pub struct LoadSegment
     /// Physical address declared by the ELF (`p_paddr`).
     ///
     /// Userspace loaders ignore this and pick any available physical
-    /// address. The bootloader honours it for the kernel image, which
-    /// requires fixed placement.
+    /// address. For the kernel image it defines each segment's relative
+    /// offset; the bootloader places the image at a dynamically chosen base
+    /// and preserves those offsets. No consumer requires fixed placement.
     pub paddr: u64,
     /// Byte offset within the ELF file where segment data starts.
     pub offset: u64,

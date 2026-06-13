@@ -7,7 +7,8 @@ Partition: kernel ELF, init ELF, and boot modules.
 
 ## Categories
 
-- **Kernel ELF** — fully validated and loaded at ELF-specified physical addresses.
+- **Kernel ELF** — fully validated and loaded as a single contiguous span at a
+  bootloader-chosen physical base, preserving the ELF's relative segment offsets.
 - **Init ELF** — fully validated and ELF-parsed; segments allocated at any available
   physical address. Result is an `InitImage` passed to the kernel in `BootInfo.init_image`.
 - **Boot modules** — opaque flat binaries loaded verbatim into physical memory and
@@ -45,12 +46,20 @@ change.
 
 ## ELF Validation
 
-ELF-header and program-header validation is performed by the shared ELF crate; the
-ruleset (magic, class, data encoding, version, type, machine, program-header
-geometry, entry-point-in-LOAD) is owned by
+ELF-header and program-header *format* validation is performed by the shared ELF crate;
+the ruleset (magic, class, data encoding, version, type, machine, program-header
+geometry) is owned by
 [`shared/elf/README.md`](../../../shared/elf/README.md). Any
 `elf::ElfError` returned by the shared crate is surfaced by the bootloader as
 [`BootError::InvalidElf`](../src/error.rs).
+
+The kernel image carries an additional *placement* ruleset enforced by the bootloader
+(`validate_kernel_layout` in [`boot/src/elf.rs`](../src/elf.rs)), because the image is
+relocated to a dynamically chosen base and the relocation is sound only if it holds:
+every `PT_LOAD` segment is 4 KiB-aligned in both `p_vaddr` and `p_paddr`, all segments
+share one `p_vaddr → p_paddr` offset, no two segments' physical ranges overlap, and the
+entry point lies within a `PT_LOAD` segment. A violation is surfaced as
+`BootError::InvalidElf`.
 
 The same validation applies to the kernel ELF and the init ELF. Boot modules (the
 `BootInfo.modules` slice) are not ELF-validated by the bootloader — they are loaded
@@ -67,11 +76,13 @@ on each segment:
 1. Enforce W^X: a segment with both `PF_W` and `PF_X` is rejected when its
    first page is mapped and surfaced as [`BootError::WxViolation`](../src/error.rs).
 2. Allocate physical frames via `AllocatePages`, classified `EfiLoaderData`:
-   - **Kernel ELF** — `AllocateAddress` at `p_paddr` (the kernel chooses its
-     own load address).
-   - **Init ELF** — `AllocateAnyPages`, preserving the in-page byte offset
-     of `p_vaddr` so the kernel can identity-map each segment without a
-     second copy.
+   - **Kernel ELF** — one `AllocateAnyPages` span covering the whole image at
+     any free physical base; each segment is copied to
+     `span_base + (p_paddr - link_phys)`, preserving the ELF's relative
+     offsets. The chosen base is recorded in `BootInfo.kernel_physical_base`.
+   - **Init ELF** — `AllocateAnyPages` per segment, preserving the in-page
+     byte offset of `p_vaddr` so the kernel can identity-map each segment
+     without a second copy.
 3. Copy `p_filesz` bytes from the file into the allocated region.
 4. Zero the BSS tail (`p_memsz - p_filesz` bytes).
 
@@ -92,33 +103,24 @@ the entire allocation is produced by step 4.
 
 ---
 
-## Entry Point Extraction
+## Entry Point
 
-The kernel entry point is `e_entry` from the ELF header. This is a virtual address.
-The corresponding physical address (needed for the initial jump before paging is
-active) is computed by finding the LOAD segment whose virtual range contains `e_entry`
-and applying the `p_vaddr → p_paddr` offset for that segment:
-
-```
-physical_entry = e_entry - segment.p_vaddr + segment.p_paddr
-```
-
-Both the virtual and physical entry point addresses are recorded. The bootloader jumps
-to the physical address if paging is not yet enabled; it jumps to the virtual address
-after page tables are installed.
-
-In practice, the page tables are installed in the bootloader before the jump
-([page-tables.md](page-tables.md)), so the jump target is the ELF virtual address.
+The kernel entry point is `e_entry` from the ELF header — a virtual address recorded as
+[`KernelInfo.entry_virtual`](../src/elf.rs). The bootloader installs the kernel's initial
+page tables ([page-tables.md](page-tables.md)) before transferring control, so the jump
+target is always this virtual address; no physical entry address is computed or used.
+`validate_kernel_layout` confirms `e_entry` falls within a `PT_LOAD` segment.
 
 ---
 
 ## Init ELF Loading
 
-Init is loaded and pre-parsed into an `InitImage` for the kernel. The procedure
-differs from kernel loading in one key respect: init is a userspace ELF whose
-`p_paddr` values are in low memory already occupied by UEFI firmware, so segments
-are allocated at any available physical address via `AllocateAnyPages` rather than
-`AllocateAddress`.
+Init is loaded and pre-parsed into an `InitImage` for the kernel. Like the kernel
+image, init segments are allocated via `AllocateAnyPages` (init is a userspace ELF
+whose `p_paddr` values fall in low memory already occupied by UEFI firmware). Unlike
+the kernel — placed as one contiguous span — each init segment is allocated
+independently and the in-page byte offset of `p_vaddr` is preserved, so the kernel
+can identity-map each segment without a second copy.
 
 ```
 For each PT_LOAD segment:

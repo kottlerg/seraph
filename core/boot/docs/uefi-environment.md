@@ -70,13 +70,17 @@ bundle format itself is specified in
 All allocation before `ExitBootServices` goes through `AllocatePages`. Two allocation
 modes are used:
 
-**`AllocateAnyPages`** — used for data whose physical address does not matter:
-`BootInfo` structure, `MmioAperture` array, memory map buffer, `MemoryMapEntry`
-array. The firmware selects a free physical page range.
+**`AllocateAnyPages`** — the firmware selects a free physical page range. Used for
+everything whose absolute address does not matter: the kernel image span, init image
+segments, boot-module buffers, page-table frames, the `BootInfo` structure, the
+`MmioAperture` array, the memory map buffer, and the `MemoryMapEntry` array. The kernel
+image is placed as one contiguous span and its base recorded in
+`BootInfo.kernel_physical_base`, so kernel placement tolerates any firmware memory
+layout.
 
-**`AllocateAddress`** — used for ELF LOAD segments that specify a physical address
-in their `p_paddr` field. If the requested address range is already in use,
-allocation fails fatally. Page table frames use `AllocateAnyPages`.
+**`AllocateMaxAddress`** — the firmware selects a free range with a physical base at or
+below a bound. Used only by the x86-64 AP-startup trampoline, whose SIPI vector must
+reside below 1 MiB.
 
 All allocation uses memory type `EfiLoaderData`. UEFI memory map entries for
 `EfiLoaderData` regions translate to `MemoryType::Loaded` in the boot protocol,

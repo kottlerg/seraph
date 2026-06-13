@@ -300,10 +300,12 @@ full-width x86_64 boundary below. This trigger list is deliberately narrow;
 other SMP PRs stay on the 256-vCPU mandate above.
 
 ```sh
-# MAX_CPUS boundary, x86_64 (~105 min per passing run measured: at 32x vCPU
-# oversubscription the stress tier's O(cpus) priority-walk syscalls dominate —
-# see #380, which will shrink this budget when it lands):
-cargo xtask run-parallel --arch x86_64 --cpus 512 --parallel 1 --runs 1 --timeout 10800
+# MAX_CPUS boundary, x86_64 (~16 min per passing run measured on a 16-core KVM
+# host at 32x vCPU oversubscription, down from ~105 min before #380 made
+# thread_set_priority's locate-and-relocate O(1) in the common case; the
+# residual is dominated by 512-vCPU AP bringup and the broadcast/IPI stress
+# tests, not the priority walk. The 3600 s budget is for HANG classification):
+cargo xtask run-parallel --arch x86_64 --cpus 512 --parallel 1 --runs 1 --timeout 3600
 ```
 
 PRs touching the bootloader's kernel-placement path — `core/boot/src/elf.rs`

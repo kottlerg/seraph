@@ -1550,10 +1550,11 @@ unsafe fn dealloc_object_one(
                         s.saved_lock_flags = s.lock.lock_raw();
                     }
 
-                    // Read priority inside the all-locks region.
-                    // `sys_thread_set_priority`, `set_state_under_all_locks`,
-                    // and this dealloc all observe the same all-CPU-locks
-                    // discipline for the Scheduling field group.
+                    // Read priority inside the all-locks region. This dealloc and
+                    // `set_state_under_all_locks` read it under their all-CPU-locks
+                    // region; `sys_thread_set_priority` writes it under the per-TCB
+                    // `sched_lock` this dealloc also holds (outer), so the read is
+                    // serialised against that writer.
                     let prio = (*tcb).priority;
 
                     // Mark Exited under all locks — no schedule() on any CPU

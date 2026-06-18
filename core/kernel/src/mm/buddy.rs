@@ -141,6 +141,15 @@ impl BuddyAllocator
         );
         debug_assert!(end.is_multiple_of(PAGE_SIZE as u64), "end not page-aligned");
 
+        // Reserve physical frame 0. The PT- and CSpace-pool intrusive free
+        // lists ([`AddressSpaceObject`]/[`CSpaceKernelObject`]) use a physical
+        // address of 0 as the "list empty" sentinel, so a pool frame at phys 0
+        // is indistinguishable from an empty pool. Firmware can legitimately
+        // mark `[0, PAGE_SIZE)` usable; admitting it lets a pool chunk that
+        // happens to cover frame 0 silently zero its own list head. Excluding
+        // the zero page (one frame) keeps it out of every pool.
+        let start = start.max(PAGE_SIZE as u64);
+
         if start >= end
         {
             return;
@@ -563,6 +572,35 @@ mod tests
         let mut alloc = BuddyAllocator::new();
         unsafe { alloc.add_region(start, end) };
         assert_eq!(alloc.free_page_count(), 16);
+    }
+
+    #[test]
+    fn add_region_based_at_zero_excludes_frame_zero()
+    {
+        // A region starting below PAGE_SIZE loses its zero page: the buddy
+        // reserves frame 0 so phys 0 (the PT/CSpace pool empty-sentinel) is
+        // never a real pool frame. add_region records block addresses in its
+        // own free lists and never dereferences [start, end), so a synthetic
+        // base of 0 is sound here.
+        let mut alloc = BuddyAllocator::new();
+        // SAFETY: add_region only records addresses; it never reads or writes
+        // the [start, end) range, so a non-backed synthetic base is valid.
+        unsafe { alloc.add_region(0, (PAGE_SIZE * 8) as u64) };
+        // 8 pages offered, frame 0 excluded → 7 manageable pages.
+        assert_eq!(alloc.free_page_count(), 7);
+        assert_eq!(alloc.total_page_count(), 7);
+    }
+
+    #[test]
+    fn add_region_single_zero_page_adds_nothing()
+    {
+        // The only page is frame 0; after the clamp start == end, so the
+        // region collapses to empty rather than admitting phys 0.
+        let mut alloc = BuddyAllocator::new();
+        // SAFETY: as above — add_region never accesses [start, end).
+        unsafe { alloc.add_region(0, PAGE_SIZE as u64) };
+        assert_eq!(alloc.free_page_count(), 0);
+        assert_eq!(alloc.total_page_count(), 0);
     }
 
     #[test]

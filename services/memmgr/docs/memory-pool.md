@@ -11,9 +11,9 @@ runs to sustain contiguous-allocation success.
 
 memmgr receives the userspace RAM memory-cap pool from init at boot. The
 kernel populates init's CSpace with one Memory capability per contiguous
-usable physical-RAM extent (it coalesces physically-adjacent drained buddy
+usable physical-RAM extent: it coalesces physically-adjacent drained buddy
 blocks before minting, so the cap count tracks memory-map fragmentation, not
-total RAM) (see
+total RAM (see
 [`docs/capability-model.md`](../../../docs/capability-model.md) §"Initial
 Capability Distribution"). Memory cap sizes vary — they reflect the firmware
 memory map and may span many MiB each. Init copies the entire RAM

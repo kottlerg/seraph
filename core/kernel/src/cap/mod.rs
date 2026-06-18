@@ -868,17 +868,100 @@ pub(crate) unsafe fn drain_and_install_seed(out: &mut [RamBlock]) -> usize
         };
     }
 
+    // Coalesce physically-adjacent drained blocks into the fewest contiguous
+    // extents so the per-block Memory-cap / CapDescriptor fan-out tracks
+    // memory-map fragmentation, not total RAM. Without this the Phase-9
+    // InitInfo descriptor array overflows INIT_INFO_MAX_PAGES at large guest
+    // RAM — one descriptor per order-11 buddy block.
+    let coalesced = coalesce_ram_blocks(&mut out[..block_count]);
+
     crate::kprintln!(
-        "Phase 7: drained {} pages across {} blocks; seed reserve {} KiB",
+        "Phase 7: drained {} pages across {} blocks, coalesced to {} contiguous \
+         regions; seed reserve {} KiB",
         drained_pages,
         block_count,
+        coalesced,
         SEED_RESERVE_BYTES / 1024,
     );
 
     let pool_remaining = crate::mm::kernel_pt_pool::remaining_pages();
     crate::kprintln!("kernel_pt_pool: {pool_remaining} pages installed");
 
-    block_count
+    coalesced
+}
+
+/// Merge physically-adjacent drained RAM blocks into the fewest contiguous
+/// extents and promote the largest extent to index 0; returns the reduced
+/// count.
+///
+/// Drained blocks are pairwise disjoint (each is a distinct popped buddy block;
+/// the seed tail is a sub-range of one block with its front pinned out), so
+/// after sorting by base, block `i` is contiguous with `i + 1` iff
+/// `base[i] + size[i] == base[i + 1]`. All bases and sizes are `PAGE_SIZE`
+/// multiples (buddy blocks are page-aligned; `SEED_RESERVE_BYTES` is a whole
+/// page count), so merged extents stay page-aligned and a [`MemoryObject`]
+/// tolerates the larger size (the seed-tail cap is already non-power-of-two).
+///
+/// The seed-tail entry's base sits above its pinned `SEED_RESERVE_BYTES`
+/// reserve, leaving a hole below it, so nothing merges *into* it from below —
+/// only upward.
+///
+/// The largest extent is then moved to index 0 so `populate_cspace` assigns it
+/// to `memory_base`. Sorting by base would otherwise make `memory_base` the
+/// lowest-address (possibly small) fragment; the pre-coalesce drain emitted the
+/// highest-order block first, and ktest (`frame_pool`, `fund_boot_aspace_pt`,
+/// and the retype-heavy stress tests) bump-allocates every kernel object it
+/// creates from `memory_base`, so it must stay the large cap. Consumers that
+/// take the whole range (init, memmgr) read each cap's size/base individually
+/// and do not depend on the order.
+fn coalesce_ram_blocks(blocks: &mut [RamBlock]) -> usize
+{
+    if blocks.len() <= 1
+    {
+        return blocks.len();
+    }
+
+    // The drain pops order-by-order (high→low), so `blocks` is not
+    // address-sorted; sort before the single linear merge pass.
+    blocks.sort_unstable_by_key(|&(base, _)| base);
+
+    // `w` is the write cursor (last kept run); `r` scans the remainder.
+    let mut w = 0usize;
+    for r in 1..blocks.len()
+    {
+        let (cur_base, cur_size) = blocks[w];
+        let (next_base, next_size) = blocks[r];
+        debug_assert!(
+            cur_base + cur_size <= next_base,
+            "drained blocks must be disjoint and sorted"
+        );
+        if cur_base + cur_size == next_base
+        {
+            blocks[w].1 = cur_size + next_size;
+        }
+        else
+        {
+            w += 1;
+            blocks[w] = (next_base, next_size);
+        }
+    }
+
+    let count = w + 1;
+
+    // Promote the largest contiguous extent to index 0 → `memory_base`. Strict
+    // `>` keeps the earliest extent on ties, so the address-sorted order is
+    // preserved unless a strictly larger extent exists.
+    let mut largest = 0usize;
+    for i in 1..count
+    {
+        if blocks[i].1 > blocks[largest].1
+        {
+            largest = i;
+        }
+    }
+    blocks.swap(0, largest);
+
+    count
 }
 
 /// Boot-time helper: retype an `init_pages`-page slab from `seed` and
@@ -2513,5 +2596,99 @@ fn insert_or_fatal(
         // In test mode, panic with the message instead of halting the CPU.
         #[cfg(test)]
         Err(e) => panic!("{}: {:?}", msg, e),
+    }
+}
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+
+    /// Coalesce a fixed array and return `(count, kept_runs)`.
+    fn coalesce(mut blocks: Vec<RamBlock>) -> (usize, Vec<RamBlock>)
+    {
+        let count = coalesce_ram_blocks(&mut blocks);
+        blocks.truncate(count);
+        (count, blocks)
+    }
+
+    #[test]
+    fn empty_yields_zero()
+    {
+        assert_eq!(coalesce(vec![]), (0, vec![]));
+    }
+
+    #[test]
+    fn single_block_unchanged()
+    {
+        assert_eq!(
+            coalesce(vec![(0x1000, 0x1000)]),
+            (1, vec![(0x1000, 0x1000)])
+        );
+    }
+
+    #[test]
+    fn adjacent_blocks_merge()
+    {
+        assert_eq!(
+            coalesce(vec![(0x1000, 0x1000), (0x2000, 0x1000)]),
+            (1, vec![(0x1000, 0x2000)])
+        );
+    }
+
+    #[test]
+    fn gap_keeps_blocks_separate()
+    {
+        // 0x1000..0x2000 then a hole, 0x3000..0x4000.
+        assert_eq!(
+            coalesce(vec![(0x1000, 0x1000), (0x3000, 0x1000)]),
+            (2, vec![(0x1000, 0x1000), (0x3000, 0x1000)])
+        );
+    }
+
+    #[test]
+    fn unsorted_input_is_sorted_then_merged()
+    {
+        // Three adjacent extents supplied out of address order, as the
+        // order-by-order drain emits them.
+        assert_eq!(
+            coalesce(vec![(0x3000, 0x1000), (0x1000, 0x1000), (0x2000, 0x1000)]),
+            (1, vec![(0x1000, 0x3000)])
+        );
+    }
+
+    #[test]
+    fn seed_tail_hole_blocks_downward_merge_allows_upward()
+    {
+        // Models the seed block: its front SEED_RESERVE_BYTES is pinned out,
+        // so the seed-tail base sits a reserve above a block that ends at the
+        // seed block's true base — that hole must prevent a downward merge,
+        // while a block starting at the seed-tail's end merges upward.
+        let reserve = 0x1000u64;
+        let seed_block_base = 0x2000u64;
+        let block_below = (0x0u64, 0x2000u64); // ends exactly at seed_block_base
+        let seed_tail = (seed_block_base + reserve, 0x1000u64); // 0x3000..0x4000
+        let block_above = (0x4000u64, 0x1000u64); // starts at seed-tail end
+        assert_eq!(
+            coalesce(vec![block_above, block_below, seed_tail]),
+            (2, vec![(0x0, 0x2000), (0x3000, 0x2000)])
+        );
+    }
+
+    #[test]
+    fn largest_extent_promoted_to_front()
+    {
+        // A strictly larger extent (formed by merging 0x8000..0xb000) must land
+        // at index 0 so it becomes `memory_base`, even though a smaller
+        // lower-address fragment sorts ahead of it.
+        assert_eq!(
+            coalesce(vec![
+                (0x1000, 0x1000),
+                (0x8000, 0x1000),
+                (0x9000, 0x1000),
+                (0xa000, 0x1000),
+            ]),
+            (2, vec![(0x8000, 0x3000), (0x1000, 0x1000)])
+        );
     }
 }

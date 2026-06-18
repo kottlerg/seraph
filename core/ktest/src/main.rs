@@ -249,8 +249,9 @@ pub extern "C" fn _start(info_ptr: u64) -> !
 /// footprint; ktest additionally maps the framebuffer and serial MMIO and runs
 /// the `mem_map` suite against this AS, so it needs a modest top-up. Source the
 /// slabs from spare RAM caps — every inherited RAM cap except `memory_base`,
-/// which `frame_pool` and the retype-heavy tests draw from. The drain leaves one
-/// large cap plus many smaller fragments, so accumulate across several augments.
+/// which `frame_pool` and the retype-heavy tests draw from. The kernel coalesces
+/// drained RAM and places the largest extent at `memory_base`, leaving the
+/// smaller extents as spares, so accumulate across several augments.
 /// Best-effort: a partial top-up still helps; failures surface in the tests.
 fn fund_boot_aspace_pt(info: &init_protocol::InitInfo)
 {

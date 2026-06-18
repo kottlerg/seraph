@@ -695,6 +695,14 @@ unsafe fn kernel_entry_post_rebase(
             // backing the slice.
             if info_pages > init_protocol::INIT_INFO_MAX_PAGES
             {
+                kprintln!(
+                    "Phase 9: InitInfo region needs {} pages ({} descriptors, {} bytes) \
+                     but INIT_INFO_MAX_PAGES = {}",
+                    info_pages,
+                    desc_count,
+                    total_bytes,
+                    init_protocol::INIT_INFO_MAX_PAGES,
+                );
                 fatal("Phase 9: InitInfo region too large");
             }
             // Round to next power of two for buddy allocation; for

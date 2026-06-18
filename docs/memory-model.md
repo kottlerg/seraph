@@ -201,6 +201,12 @@ kernel concern: DMA isolation and placement are handled in userspace by devmgr a
 the memory authority (see [architecture.md](architecture.md) and
 [device-management.md](device-management.md)).
 
+Physical frame 0 (the zero page) is excluded from the allocator. The page-table and
+CSpace growth pools use a physical address of 0 as their free-list "empty" sentinel,
+so admitting frame 0 as a pool page would make an occupied list indistinguishable from
+an empty one. Excluding it (one frame) keeps the sentinel unambiguous regardless of
+how firmware classifies `[0, PAGE_SIZE)`.
+
 ### Frame Allocation is Fallible
 
 Frame allocation can fail. Every call site must handle `None` or an error result

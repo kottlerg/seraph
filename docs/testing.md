@@ -360,6 +360,21 @@ list as the tracking Issues move):
   high-CPU HANG should instead produce a `=== WATCHDOG` dump (owed-wake /
   heartbeat detectors) naming the wedged state; file it with the preserved
   log rather than attributing it to #375.
+- Both arches, guest RAM ≥ ~4 GiB ([#383](https://github.com/kottlerg/seraph/issues/383),
+  fixed): boot died at Phase 9 (`FATAL: Phase 9: InitInfo region too large`)
+  because the kernel minted one userspace Memory cap — and one `CapDescriptor`
+  — per drained buddy block, and the buddy's largest block is order-11 (8 MiB),
+  so the descriptor array grew ~linearly with RAM (≈64 descriptors at 512 MiB,
+  ≈512 at 4 GiB) and overflowed the `INIT_INFO_MAX_PAGES = 4` (16 KiB) Phase-9
+  InitInfo region — independent of where the kernel image is placed.
+  `drain_and_install_seed` now coalesces physically-adjacent drained blocks
+  into the fewest contiguous Memory caps before minting, so the descriptor
+  count tracks memory-map fragmentation (a small fixed number of usable extents
+  plus reservation holes), not total RAM. The Phase-9 size check now logs the
+  descriptor count, page need, and `INIT_INFO_MAX_PAGES` before fatal-ing, so
+  any residual overflow on a pathologically fragmented map is diagnosable rather
+  than bare. Verified booting clean to the ktest pass marker on both arches at
+  `--mem 4096`.
 
 ---
 

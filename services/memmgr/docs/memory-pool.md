@@ -10,11 +10,13 @@ runs to sustain contiguous-allocation success.
 ## Pool Ingest
 
 memmgr receives the userspace RAM memory-cap pool from init at boot. The
-kernel populates init's CSpace with one Memory capability per usable
-physical-RAM region in `BootInfo` (see
+kernel populates init's CSpace with one Memory capability per contiguous
+usable physical-RAM extent (it coalesces physically-adjacent drained buddy
+blocks before minting, so the cap count tracks memory-map fragmentation, not
+total RAM) (see
 [`docs/capability-model.md`](../../../docs/capability-model.md) §"Initial
 Capability Distribution"). Memory cap sizes vary — they reflect the firmware
-memory map and may be multiple MiB each. Init copies the entire RAM
+memory map and may span many MiB each. Init copies the entire RAM
 range into memmgr's CSpace via the derive-twice pattern, then transfers
 the slot range `(memory_base, memory_count)` to memmgr in a
 single bootstrap IPC round.

@@ -39,7 +39,10 @@ not delegate further to anyone.
 The handoff is total. At Phase 7 the kernel reserves its fixed
 contributors (PT-pool seed, idle-thread stacks, the `InitInfo` block,
 init's user stack, the SEED arena) from the pristine buddy, then drains
-**every** remaining page into userspace Memory caps and *seals* the buddy.
+**every** remaining page into userspace Memory caps — coalescing
+physically-adjacent drained blocks into the fewest contiguous caps so the
+cap count tracks memory-map fragmentation, not total RAM — and *seals* the
+buddy.
 After the seal the buddy is an inert boot artifact: it holds no free
 pages, allocates nothing, and must receive no frees. Every page of RAM is
 therefore either a bounded fixed kernel reserve or owned by memmgr's pool

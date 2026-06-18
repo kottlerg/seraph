@@ -21,7 +21,9 @@
 //!     notification; the controller storms `notification_send` (the wake that
 //!     drives `enqueue_and_wake` while the hosting CPU is in the idle path)
 //!     interleaved with `thread_set_priority` (the #122 remove-and-re-enqueue
-//!     under all-CPU locks) and periodic `thread_set_affinity` flips (the
+//!     of the Ready TCB's queue entry: a `preferred_cpu`-hinted single
+//!     run-queue lock, or the all-CPU walk on a hint miss — #380) and periodic
+//!     `thread_set_affinity` flips (the
 //!     `migrate_ready_thread` / cross-CPU `schedule()` outgoing-branch
 //!     re-enqueue). The wake lands while the queue entry is being relocated.
 //!   * **Phase 2 — wake racing dealloc.** For each worker the controller
@@ -102,7 +104,9 @@ pub fn run(ctx: &TestContext) -> TestResult
     // ── Phase 1: wake + priority churn ± affinity flips. ─────────────────────
     //
     // Each cycle wakes every worker (enqueue_and_wake) and rewrites its
-    // priority (remove-and-re-enqueue under all-CPU locks). Affinity flips
+    // priority (remove-and-re-enqueue of the queue entry: a preferred_cpu-hinted
+    // single run-queue lock, or the all-CPU walk on a hint miss — #380). Affinity
+    // flips
     // every 4 cycles relocate the queue entry across CPUs via
     // migrate_ready_thread / the cross-CPU outgoing branch — so a wake can land
     // on a TCB mid-relocation, the transient window the #244 class lives in.

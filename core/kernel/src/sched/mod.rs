@@ -1999,9 +1999,9 @@ pub unsafe fn set_state_under_all_locks(
 
     // Write the state and snapshot priority under all locks so the queue
     // drain below sees a value coherent with the state we just published.
-    // `sys_thread_set_priority` observes the same all-CPU-locks discipline
-    // for Scheduling-group writes (`core/kernel/src/syscall/thread.rs`), so
-    // the priority read here is serialised against every other writer.
+    // `sys_thread_set_priority` writes `priority` under the per-TCB `sched_lock`
+    // (`core/kernel/src/syscall/thread.rs`), which this path also holds (outer),
+    // so the priority read here is serialised against that writer.
     // SAFETY: tcb validated by caller; state/priority fields always valid.
     let priority = unsafe {
         (*tcb).state = new_state;
@@ -2641,6 +2641,137 @@ pub unsafe fn migrate_ready_thread(
     false
 }
 
+/// Re-link a `Ready` `tcb` from its `old_prio` run queue to `new_prio`, applying
+/// the priority change [`crate::syscall::sys_thread_set_priority`] has already
+/// committed to `(*tcb).priority` under the caller-held `sched_lock`.
+///
+/// Tries `hint_cpu`'s run queue first. `preferred_cpu` names the CPU whose run
+/// queue links a stable `Ready` thread — every link-creating path retargets it on
+/// the created link (#359) — so this single run-queue-lock attempt hits in the
+/// common case: O(1) lock acquisitions instead of the all-CPU walk. On a miss
+/// (the thread migrated between the caller's `preferred_cpu` read and this lock,
+/// or is in the transient `Ready`-but-unlinked publication window) it falls back
+/// to the ascending all-CPU-locks walk — the #122 correctness path — taking every
+/// run-queue lock in ascending-CPU order and trying `remove_from_queue` on each.
+///
+/// `remove_from_queue`'s boolean is the authoritative "located here at `old_prio`"
+/// check on both paths, mirroring [`relocate_ready_thread`]. A thread linked
+/// nowhere is left for its pending link to place at the already-committed
+/// priority (returns `None`). On a walk hit the thread's `preferred_cpu` is
+/// refreshed to the located CPU so a stale hint self-heals.
+///
+/// Returns the CPU the thread was relocated on, or `None` if unlinked anywhere.
+///
+/// # Safety
+/// Caller MUST hold `(*tcb).sched_lock` (outer) and MUST NOT hold any per-CPU
+/// run-queue lock. `tcb` must be a valid [`ThreadControlBlock`] pointer.
+/// `hint_cpu < cpu_count` and `cpu_count <= CPU_COUNT` must hold.
+#[cfg(not(test))]
+pub unsafe fn relocate_ready_priority(
+    tcb: *mut thread::ThreadControlBlock,
+    old_prio: u8,
+    new_prio: u8,
+    hint_cpu: usize,
+    cpu_count: usize,
+) -> Option<usize>
+{
+    // Fast path: lock only the hint CPU's run queue and verify membership. The
+    // ascending-CPU order rule (Lock Hierarchy rule 4) governs only
+    // simultaneously held run-queue locks; one inner lock under the held
+    // `sched_lock` is ordered trivially. The saved flag word lives on the stack
+    // (single lock), unlike the all-locks walk below which uses `saved_lock_flags`.
+    // SAFETY: hint_cpu < cpu_count; scheduler slab initialised by init().
+    let hint_sched = unsafe { scheduler_for(hint_cpu) };
+    // SAFETY: lock_raw paired with the unlock_raw below.
+    let saved = unsafe { hint_sched.lock.lock_raw() };
+    // `remove_from_queue` is the authoritative located-on-hint check at
+    // `old_prio`; the held hint run-queue lock pins the list.
+    let hit = hint_sched.remove_from_queue(tcb, old_prio);
+    if hit
+    {
+        // Skip impossible: `remove_from_queue` just cleared `queued_on` under
+        // this lock. Re-link at `new_prio` on the same CPU; `preferred_cpu`
+        // already names `hint_cpu`, so no retarget is needed.
+        let linked = hint_sched.enqueue(tcb, new_prio);
+        debug_assert!(
+            linked,
+            "relocate_ready_priority: re-enqueue skipped after hint hit"
+        );
+    }
+    // SAFETY: paired with the lock_raw above.
+    unsafe { hint_sched.lock.unlock_raw(saved) };
+    if hit
+    {
+        return Some(hint_cpu);
+    }
+
+    // Miss: the thread is not on `hint_cpu`. Fall back to the ascending
+    // all-CPU-locks walk (#122). The hint lock was released above, so every lock
+    // below is acquired fresh in ascending-CPU order — no double-acquire, and no
+    // ABBA against another walker (all share the held per-TCB `sched_lock`).
+    for cpu in 0..cpu_count
+    {
+        // SAFETY: cpu < cpu_count; scheduler slab initialised by init().
+        unsafe {
+            let s = scheduler_for(cpu);
+            s.saved_lock_flags = s.lock.lock_raw();
+        }
+    }
+
+    let mut located: Option<usize> = None;
+    #[allow(clippy::needless_range_loop)]
+    for cpu in 0..cpu_count
+    {
+        // SAFETY: cpu < cpu_count; scheduler slab initialised by init().
+        let sched = unsafe { scheduler_for(cpu) };
+        // All run-queue locks held; `remove_from_queue` is the authoritative
+        // located-on-cpu check at `old_prio`.
+        if sched.remove_from_queue(tcb, old_prio)
+        {
+            let linked = sched.enqueue(tcb, new_prio);
+            debug_assert!(
+                linked,
+                "relocate_ready_priority: re-enqueue skipped after walk hit"
+            );
+            if linked
+            {
+                // Found on `cpu`, not `hint_cpu`: the hint was stale (a migration
+                // raced the read). Refresh it so the next priority/affinity
+                // change hits. Gated on the created link (#359).
+                // SAFETY: tcb valid; all run-queue locks + sched_lock held.
+                unsafe { (*tcb).preferred_cpu = cpu as u32 };
+            }
+            located = Some(cpu);
+            break;
+        }
+    }
+
+    for cpu in (0..cpu_count).rev()
+    {
+        // SAFETY: lock_raw above paired with this unlock.
+        unsafe {
+            let s = scheduler_for(cpu);
+            s.lock.unlock_raw(s.saved_lock_flags);
+        }
+    }
+
+    located
+}
+
+/// Test stub.
+#[cfg(test)]
+#[allow(unused_variables)]
+pub unsafe fn relocate_ready_priority(
+    _tcb: *mut thread::ThreadControlBlock,
+    _old_prio: u8,
+    _new_prio: u8,
+    _hint_cpu: usize,
+    _cpu_count: usize,
+) -> Option<usize>
+{
+    None
+}
+
 // ── Periodic cross-CPU load balancer ─────────────────────────────────────────
 
 /// Tick counter feeding the pseudo-random victim selection. Relaxed
@@ -3003,9 +3134,10 @@ pub unsafe fn enqueue_and_wake(tcb: *mut ThreadControlBlock, target_cpu: usize)
     // SAFETY: lock_raw paired with unlock_raw below.
     let saved = unsafe { sched.lock.lock_raw() };
 
-    // SAFETY: both locks held; tcb valid. Read priority under the run-queue lock
-    // so the enqueue links at whatever value sys_thread_set_priority's all-CPU
-    // region last published. These writes stay ungated on the link result: for
+    // SAFETY: both locks held; tcb valid. Read priority under the held sched_lock
+    // (and target run-queue lock) so the enqueue links at whatever value
+    // sys_thread_set_priority last published under that same per-TCB sched_lock.
+    // These writes stay ungated on the link result: for
     // an already-linked (skip) TCB they are idempotent or consistency-improving
     // (a linked thread must be Ready with no block binding). wake_pending
     // cleared defensively.
@@ -3091,8 +3223,8 @@ pub unsafe fn enqueue_ready_thread(tcb: *mut ThreadControlBlock, target_cpu: usi
     let saved = unsafe { sched.lock.lock_raw() };
 
     // SAFETY: both locks held; tcb valid. Force Ready and read priority under
-    // the run-queue lock (serialises against sys_thread_set_priority's all-CPU
-    // region).
+    // the held sched_lock (serialises against sys_thread_set_priority's priority
+    // write, which takes the same per-TCB sched_lock outer).
     let priority = unsafe {
         (*tcb).state = thread::ThreadState::Ready;
         (*tcb).ipc_state = thread::IpcThreadState::None;
@@ -3589,19 +3721,20 @@ pub unsafe fn schedule(requeue_current: bool)
         next = sched.dequeue_highest();
     }
 
-    // Validate the selected thread.
+    // Validate the selected thread. Only `magic` is checked here: it is fixed at
+    // construction and never mutated under any scheduler lock, so this read is
+    // race-free without `next.sched_lock` (not held at this point). `priority` is
+    // deliberately NOT read here — it is written under `(*tcb).sched_lock` alone
+    // (sys_thread_set_priority), which is not held for `next`, so a debug-only
+    // range check would race that write; `dequeue_highest` already selected
+    // `next` by a valid queue index, so the level is in range by construction.
     if !core::ptr::eq(next, sched.idle) && !next.is_null()
     {
-        // SAFETY: next is from the run queue; all fields readable.
+        // SAFETY: next is from the run queue; `magic` readable on any valid TCB.
         unsafe {
             debug_assert!(
                 (*next).magic == thread::TCB_MAGIC,
                 "schedule: next TCB magic corrupt on cpu {cpu}"
-            );
-            debug_assert!(
-                ((*next).priority as usize) < NUM_PRIORITY_LEVELS,
-                "schedule: next priority {} out of range on cpu {cpu}",
-                (*next).priority
             );
         }
     }

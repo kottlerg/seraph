@@ -138,7 +138,7 @@ mod imp
             }
             else
             {
-                crate::kprintln!("entropy: hardware RNG unhealthy; using jitter only");
+                crate::kprintln!("entropy: hardware RNG not trusted; using jitter only");
             }
         }
         else

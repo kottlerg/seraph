@@ -1370,9 +1370,8 @@ pub extern "C" fn kernel_entry_ap(cpu_id: u32, ist1_top: u64, ist2_top: u64) -> 
 
     kprintln!("smp: AP {} online", cpu_id);
 
-    // Capture this AP's entropy self-test sample (debug builds). The AP's
-    // generator seeds lazily from the pool (already seeded in Phase 5) on this
-    // first draw.
+    // Capture this AP's entropy self-test sample. The AP's generator seeds
+    // lazily from the pool (already seeded in Phase 5) on this first draw.
     entropy::init_ap();
 
     // 6. Notification BSP that this AP is ready.

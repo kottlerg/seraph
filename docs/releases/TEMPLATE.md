@@ -11,13 +11,12 @@
 
 ## Components Shipped
 
-Summarize notable changes grouped by area (kernel mechanisms, core services, drivers,
-storage, runtime, userspace programs). Describe what changed per area; do not enumerate
+Summarize notable changes as short descriptive paragraphs grouped by area (kernel
+mechanisms, core services, drivers, storage, runtime, userspace programs) — one paragraph
+per area, led by the area name in bold. Describe what changed per area; do not enumerate
 every crate. For the initial release, describe each area's initial state rather than a delta.
 
-| Area / component | Change since previous release |
-|---|---|
-| <area or component> | <what changed; "initial" for the first release> |
+**<Area>** — <what changed in this area; its initial state for the first release.>
 
 ## ABI and Protocol Versions
 

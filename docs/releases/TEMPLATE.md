@@ -1,5 +1,3 @@
-# Seraph v<X>.<Y>.<Z>
-
 <One-sentence summary of the milestone or patch.>
 
 ---

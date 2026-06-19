@@ -47,10 +47,6 @@ jobs:
           fi
           # -qxF: fixed-string whole-line matches, so a body bullet merely
           # quoting a heading cannot satisfy the structure check.
-          if ! grep -qxF "# Seraph ${TAG}" "${NOTES}"; then
-            echo "::error::${NOTES}: title must be '# Seraph ${TAG}' per TEMPLATE.md" >&2
-            exit 1
-          fi
           for h in "## Highlights" "## Components Shipped" "## ABI and Protocol Versions" \
                    "## Breaking Changes" "## Known Issues" "## Verification"; do
             if ! grep -qxF "$h" "${NOTES}"; then

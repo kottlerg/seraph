@@ -199,7 +199,19 @@ mod imp
             crate::arch::current::cpu::restore_interrupts(saved);
         }
     }
+
+    /// Whether the pool has been seeded and the draw API is open.
+    ///
+    /// The pool is seeded in Phase 5, before any userspace process exists
+    /// (Phase 9), so this is always true on the userspace draw path. The
+    /// `SYS_GETRANDOM` handler checks it so the "draw before seeded" invariant
+    /// (a debug-assert in [`fill_bytes`], compiled out in release) becomes an
+    /// enforced error on the userspace entry point rather than an unchecked draw.
+    pub fn is_seeded() -> bool
+    {
+        pool::is_seeded()
+    }
 }
 
 #[cfg(not(test))]
-pub use imp::{fill_bytes, init, init_ap, init_storage};
+pub use imp::{fill_bytes, init, init_ap, init_storage, is_seeded};

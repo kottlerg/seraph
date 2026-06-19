@@ -84,9 +84,12 @@ mod imp
 
     /// Seed the pool from all available sources and open the draw API. Phase 5,
     /// BSP, after the cycle counter is available. Called exactly once.
-    pub fn init()
+    ///
+    /// `boot_seed` is the conditioned early-boot seed the bootloader drew from
+    /// UEFI `EFI_RNG_PROTOCOL` (empty when the firmware exposed no RNG).
+    pub fn init(boot_seed: &[u8])
     {
-        seed_pool_from_sources();
+        seed_pool_from_sources(boot_seed);
         pool::mark_seeded();
         super::selftest::capture(crate::arch::current::cpu::current_cpu() as usize);
     }
@@ -100,14 +103,32 @@ mod imp
 
     /// Mix every available entropy source into the pool.
     ///
-    /// The hardware RNG (where present) is health-gated before any of its
-    /// output is trusted; it is mixed *with* jitter, never trusted alone. On
-    /// platforms without a hardware RNG this degrades to jitter only.
-    fn seed_pool_from_sources()
+    /// The firmware boot seed (a conditioned `EFI_RNG_PROTOCOL` draw, where the
+    /// bootloader supplied one) and the hardware RNG (where present,
+    /// health-gated) are mixed *with* boot-time jitter — never trusted alone.
+    /// With neither a firmware seed nor a hardware RNG this degrades to jitter
+    /// only.
+    fn seed_pool_from_sources(boot_seed: &[u8])
     {
         use crate::arch::current::entropy as hw;
 
-        if hw::hw_rng_available()
+        let mut seeded = false;
+
+        // Firmware-provided boot seed: already conditioned (a DRBG output), so
+        // absorb it directly rather than through the raw-source health gate
+        // (which expects raw samples and a 1024-byte startup run).
+        if !boot_seed.is_empty()
+        {
+            pool::absorb(boot_seed);
+            seeded = true;
+            crate::kprintln!(
+                "entropy: seeded from firmware RNG (boot seed, {} bytes)",
+                boot_seed.len()
+            );
+        }
+
+        let hw_available = hw::hw_rng_available();
+        if hw_available
         {
             let mut health = super::health::Health::new();
             let mut words = 0u32;
@@ -135,6 +156,7 @@ mod imp
             }
             if health.trusted()
             {
+                seeded = true;
                 crate::kprintln!("entropy: seeded from hardware RNG ({words} words)");
             }
             else
@@ -142,9 +164,10 @@ mod imp
                 crate::kprintln!("entropy: hardware RNG not trusted; using jitter only");
             }
         }
-        else
+
+        if !seeded && !hw_available
         {
-            crate::kprintln!("entropy: no hardware RNG; using jitter (graceful degradation)");
+            crate::kprintln!("entropy: no seeded source; using jitter (graceful degradation)");
         }
 
         boot_jitter_scrape();

@@ -105,6 +105,8 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
     let boot_cpu_ids = info.cpu_ids;
     let trampoline_pa = info.ap_trampoline_page;
     let init_image = info.init_image; // InitImage is Copy
+    let boot_entropy_seed = info.boot_entropy_seed;
+    let boot_entropy_len = info.boot_entropy_len;
 
     // ── Phase 1: early console ──────────────────────────────────────────────
     // SAFETY: called exactly once, from the single kernel boot thread, after
@@ -185,6 +187,8 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
             boot_cpu_ids,
             trampoline_pa,
             init_image,
+            boot_entropy_seed,
+            boot_entropy_len,
             fb_phys,
             allocator,
         )
@@ -223,6 +227,8 @@ unsafe fn kernel_entry_post_rebase(
     boot_cpu_ids: [u32; boot_protocol::MAX_CPUS],
     trampoline_pa: u64,
     init_image: boot_protocol::InitImage,
+    boot_entropy_seed: [u8; 32],
+    boot_entropy_len: u32,
     fb_phys: u64,
     allocator: &'static mut mm::buddy::BuddyAllocator,
 ) -> !
@@ -333,11 +339,17 @@ unsafe fn kernel_entry_post_rebase(
     }
     kprintln!("timer ok");
 
-    // Seed the entropy pool from hardware RNG (where present, health-gated) and
-    // boot-time jitter, then open the kernel draw API. After timer::init so the
-    // cycle counter is live for jitter samples.
+    // Seed the entropy pool from the firmware boot seed (where the bootloader
+    // supplied one), hardware RNG (where present, health-gated), and boot-time
+    // jitter, then open the kernel draw API. After timer::init so the cycle
+    // counter is live for jitter samples.
     #[cfg(not(test))]
-    entropy::init();
+    {
+        // Clamp defensively: the Phase-0 validator checks only the protocol
+        // version, not this length field.
+        let n = (boot_entropy_len as usize).min(boot_entropy_seed.len());
+        entropy::init(&boot_entropy_seed[..n]);
+    }
 
     // Initialize the CPU-to-APIC-ID mapping for wakeup IPIs.
     #[cfg(not(test))]

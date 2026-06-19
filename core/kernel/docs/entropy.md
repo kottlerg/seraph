@@ -26,21 +26,30 @@ mixed with timing jitter before any byte is drawn.
 
 ## Sources and graceful degradation
 
-Two source classes are mixed into the pool:
+Three source classes are mixed into the pool:
 
+- **Firmware boot seed** — a conditioned random draw the bootloader obtains from
+  UEFI `EFI_RNG_PROTOCOL` while boot services are live and passes to the kernel
+  in `BootInfo` (`boot_entropy_seed` / `boot_entropy_len`, boot protocol v9).
+  Arch-neutral mechanism; already conditioned (a DRBG output), so it is absorbed
+  directly rather than health-gated. Present only where the firmware implements
+  the protocol — x86-64 OVMF does (RDRAND-backed); the current riscv64 EDK2 does
+  not, so `boot_entropy_len == 0` there and riscv64 falls back to jitter (see
+  "Boot-time entropy").
 - **Hardware RNG** — drawn through the `arch::current::entropy` contract
   (`hw_rng_available`, `hw_rng_u64`). On x86-64 this is RDSEED (a conditioned,
   seed-grade source, preferred) with an RDRAND fallback, CPUID-gated, each with
   bounded retry on the transient not-ready condition the ISA permits. Hardware
-  output is health-gated (below) before it is trusted.
+  output is health-gated (below) before it is trusted. riscv64 has no S-mode
+  hardware RNG — the `Zkr` `seed` CSR is M-mode-owned (`mseccfg.SSEED`) — so
+  `hw_rng_available` is false there.
 - **Timing jitter** — cycle-counter samples (`read_cycle_counter`: TSC on
   x86-64; the `time` CSR on riscv64) taken at distinct interrupt event classes.
   This is the always-available source.
 
-On a platform without a hardware RNG — riscv64 under default firmware, where
-`hw_rng_available` is false — the subsystem degrades gracefully to **jitter
-only**. The pool and per-CPU generators are otherwise identical; only the seed
-material differs.
+With neither a firmware seed nor a hardware RNG the subsystem degrades
+gracefully to **jitter only**. The pool and per-CPU generators are otherwise
+identical; only the seed material differs.
 
 ## Keccak duplex construction
 
@@ -95,24 +104,35 @@ Reseed policy:
 Forward secrecy *across* draws is provided by the sponge's per-fill erasure;
 reseeding additionally bounds the blast radius of any single seed.
 
-## Boot-time entropy and the riscv64 jitter-only path
+## Boot-time entropy
 
 At boot, runtime jitter has not yet accumulated. `seed_pool_from_sources` mixes:
 
-1. The hardware RNG where present, drawn under a fresh health monitor up to a
+1. The firmware boot seed where the bootloader supplied one, absorbed directly
+   (it is already conditioned).
+2. The hardware RNG where present, drawn under a fresh health monitor up to a
    bounded number of words (margin for RDSEED retries), absorbed only while the
    source has not failed.
-2. A boot jitter scrape: cycle-counter samples taken across intervening pool
+3. A boot jitter scrape: cycle-counter samples taken across intervening pool
    work, whose microarchitectural timing perturbs successive reads.
 
-This is the **documented boot-entropy hole**: on a jitter-only platform the
-initial seed is weaker than at steady state. It is narrowed continuously at
-runtime by the timer-tick jitter hook, which feeds a fresh sample into each
-CPU's accumulator on every tick (and per device IRQ).
+The **boot-entropy hole** is the residual weakness when the only source is
+jitter: the initial seed is then weaker than at steady state. The firmware boot
+seed closes it wherever UEFI `EFI_RNG_PROTOCOL` is available: x86-64 OVMF
+implements it today. The current riscv64 EDK2 does **not** expose it, so riscv64
+still falls back to jitter only — narrowed continuously at runtime by the
+timer-tick jitter hook, which feeds a fresh sample into each CPU's accumulator
+on every tick (and per device IRQ). Closing the riscv64 boot hole therefore
+needs the firmware/boot environment to provide a seed (RNG protocol or DT
+`rng-seed`); that firmware provisioning is tracked separately.
+
+The riscv64 *runtime* hardware-RNG path — a virtio-rng/hwrng device owned by a
+userspace driver, the mechanism the RISC-V design intends for lower privilege
+levels to obtain entropy — is also future work, tracked separately.
 
 TODO: persist a saved seed across boots (read at `init_storage`, rewritten at
-shutdown) to close the boot-entropy hole on jitter-only platforms; deferred —
-it requires a storage-stack dependency the kernel does not have at Phase 4.
+shutdown) as a second mitigation for jitter-only platforms; deferred — it
+requires a storage-stack dependency the kernel does not have at Phase 4.
 
 ## Health tests (hardware RNG gating)
 
@@ -131,6 +151,10 @@ On any failure the source is permanently distrusted (`failed`) and the
 subsystem proceeds on jitter alone. Because the hardware RNG is never the sole
 input, a source that passes startup but later degrades still cannot by itself
 determine pool output.
+
+These tests gate the *raw* hardware RNG only. The firmware boot seed is a
+pre-conditioned DRBG output (`EFI_RNG_PROTOCOL`), so it is absorbed directly and
+is not subject to the raw-source tests.
 
 ## Draw API and consumers
 
@@ -174,7 +198,9 @@ exerciser and continuous validator.
   aggregate bit balance is sane. The result prints as `entropy: SELFTEST PASS`
   or `entropy: SELFTEST FAIL`; the FAIL marker is matched by the run-parallel
   fail-regex, turning a QEMU run red on either architecture. Validated on
-  x86_64 (hardware-seeded) and riscv64 (jitter-only).
+  x86_64 (firmware-seeded — `entropy: seeded from firmware RNG` — since OVMF
+  implements `EFI_RNG_PROTOCOL`) and riscv64 (jitter-only — its current EDK2
+  exposes no RNG protocol).
 
 ---
 

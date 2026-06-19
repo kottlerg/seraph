@@ -18,13 +18,16 @@ The top-level identifier. Workspace-inherited Cargo crate version and git tag at
 
 The workspace root `Cargo.toml` carries `[workspace.package] version = "X.Y.Z"`. Every workspace member declares `version.workspace = true` and inherits the project version.
 
-A workspace member MAY declare its own independent `version = "..."` only when **all** of the following hold:
+A workspace member MAY declare its own independent `version = "..."` only when **both** of the following hold:
 
-- The member has distinct identity as a user-facing program that would be recognized as a separate thing (shell, editor, network tool, package manager).
-- The member evolves on its own cadence independent of the kernel-and-service cohort.
-- The member would plausibly be packaged or shipped separately.
+- The member has distinct identity as a user-facing program that would be recognized as a separate thing (shell, terminal, editor, network tool, package manager) — not a demo, benchmark, or test fixture.
+- The member is not core to the OS: the system boots and runs without it. It is the kind of component that could plausibly be optional, swapped for an alternative, or distributed separately — now or in the far future — even if today it is tightly interconnected with the rest of the tree and still primitive.
 
-OS-internal services, kernel, bootloader, ABI crates, shared utility crates, `xtask`, and runtime shims do not qualify and MUST stay workspace-inherited. The opt-out is a one-time decision per member, recorded with a comment in that member's `Cargo.toml` naming the criterion that justifies it.
+OS-internal services, kernel, bootloader, ABI crates, shared utility crates, `xtask`, runtime shims, and the demo/benchmark/test programs do not qualify and MUST stay workspace-inherited. The opt-out is a one-time decision per member, recorded with a comment in that member's `Cargo.toml` naming the criterion that justifies it.
+
+An opted-out member's version is independent of the project version and MAY sit below it — a still-primitive `terminal` and `shell` at `0.0.1` while the project is at `0.1.0` is expected, not an error.
+
+The opt-out covers the program's whole subtree: any internal library extracted from the program (for testability or structure) and the program's own test harness carry the **same** explicit version as the program and bump in lockstep with it. They are not independent version axes. Cargo cannot enforce this lockstep across separate manifests, so it is maintained by hand and noted in each child's `Cargo.toml`.
 
 ### ABI / wire-protocol versions
 

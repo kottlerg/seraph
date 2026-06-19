@@ -25,4 +25,5 @@ pub fn dispatch(role: &str)
     phases::namespace::reentry_main(role);
     phases::procmgr::reentry_main(role);
     phases::exit_code::reentry_main(role);
+    phases::random::reentry_main(role);
 }

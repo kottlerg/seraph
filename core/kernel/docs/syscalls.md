@@ -1386,9 +1386,9 @@ pub enum SystemInfoType
 {
     /// Kernel version packed as `(major as u64) << 32 | (minor as u64) << 16 | patch`.
     ///
-    /// Semver semantics: major=breaking ABI change, minor=new syscalls added,
-    /// patch=bug fix. Major is 0 while the kernel ABI is pre-stable and
-    /// may change freely between any releases.
+    /// Equals the Seraph project version (the workspace `version`), parsed from
+    /// `CARGO_PKG_VERSION` at build time; see `docs/conventions.md` for its
+    /// semantics. It does not gate syscall-ABI compatibility.
     ///
     /// Userspace extracts components with:
     ///   major = version >> 32

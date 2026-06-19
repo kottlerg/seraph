@@ -2691,4 +2691,73 @@ mod tests
             (2, vec![(0x8000, 0x3000), (0x1000, 0x1000)])
         );
     }
+
+    /// `CSpaceId` reserved for the recycle test below. No other host
+    /// `#[test]` populates `CSPACE_REGISTRY` — every other
+    /// `register_cspace`/`unregister_cspace` call site is `#[cfg(not(test))]`
+    /// (boot, syscall, dealloc) — so there is no shared-static race; a high
+    /// id is used purely for clarity.
+    const RECYCLE_TEST_ID: CSpaceId = (MAX_CSPACES as u32) - 1;
+
+    /// A `SlotId` stamped before a `CSpace` id is recycled must fail
+    /// `lookup_cspace` (epoch mismatch) even after the id is reused by a new
+    /// tenant, while a freshly stamped `SlotId` resolves. Couples the real
+    /// stamp (`SlotId::current` → `registry_epoch`) and validation
+    /// (`lookup_cspace`) paths; only the epoch bump is simulated, because
+    /// `free_cspace_id` and the free list are `#[cfg(not(test))]`.
+    #[test]
+    fn cspace_recycle_invalidates_stale_slotid()
+    {
+        use core::num::NonZeroU32;
+
+        let id = RECYCLE_TEST_ID;
+        let idx = NonZeroU32::new(1).unwrap();
+        // Sentinel backing pointers; `lookup_cspace` only null-checks them
+        // and never dereferences. Two distinct addresses model two tenants.
+        let tenant_a = NonNull::<CSpace>::dangling().as_ptr();
+        let tenant_b = tenant_a.wrapping_byte_add(0x1000);
+
+        // Tenant A live; stamp a SlotId the way derivation write sites do.
+        let epoch_a = register_cspace(id, tenant_a).expect("register tenant A");
+        let stale = SlotId::current(id, idx);
+        assert_eq!(
+            stale.epoch, epoch_a,
+            "SlotId::current must stamp the live epoch"
+        );
+        assert!(
+            lookup_cspace(stale.cspace_id, stale.epoch).is_some(),
+            "fresh SlotId must resolve against the live tenant"
+        );
+
+        // Destroy A and recycle the id. `free_cspace_id` is
+        // `#[cfg(not(test))]` (touches the host-absent free list); replicate
+        // its one registry mutation — the epoch bump — directly.
+        // `unregister_cspace` clears the ptr. #248 will randomize this bump;
+        // the assertions below check the property (epoch changed ⇒ stale
+        // fails), not the arithmetic, so only this line tracks #248.
+        unregister_cspace(id);
+        CSPACE_REGISTRY[id as usize]
+            .epoch
+            .fetch_add(1, Ordering::AcqRel);
+
+        // Tenant B reuses the id at the bumped epoch.
+        let epoch_b = register_cspace(id, tenant_b).expect("register tenant B");
+        assert_ne!(epoch_b, epoch_a, "recycle must advance the epoch");
+        let fresh = SlotId::current(id, idx);
+        assert_eq!(fresh.epoch, epoch_b);
+
+        // The property #174 asks for: the stale SlotId fails fast even though
+        // the id is live again, while the fresh SlotId resolves (proving the
+        // None is epoch mismatch, not entry absence).
+        assert!(
+            lookup_cspace(stale.cspace_id, stale.epoch).is_none(),
+            "stale epoch must not resolve against the recycled tenant"
+        );
+        assert!(
+            lookup_cspace(fresh.cspace_id, fresh.epoch).is_some(),
+            "current epoch must resolve"
+        );
+
+        unregister_cspace(id); // leave the shared registry slot clean
+    }
 }

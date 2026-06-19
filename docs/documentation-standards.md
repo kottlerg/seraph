@@ -73,8 +73,11 @@ None
 (`<tag>.md`) and the `docs/releases/TEMPLATE.md` skeleton they are copied from are
 release records, not authoritative documents: they sit outside the hierarchy above,
 carry no content another document summarizes, and (for `<tag>.md`) are frozen at their
-tag. They MUST NOT carry a `## Summarized By` section. `docs/releases/README.md`, which
-governs release-notes discipline, is an ordinary authoritative document and keeps its own.
+tag. Their structure is defined by `TEMPLATE.md` and validated by the release workflow,
+not by the Required Structure rules below: they carry neither a `# Title` heading (the
+GitHub Release name supplies the title) nor a `## Summarized By` section.
+`docs/releases/README.md`, which governs release-notes discipline, is an ordinary
+authoritative document and follows the standard structure.
 
 ### Change propagation procedure
 

@@ -400,6 +400,23 @@ pub const SYS_SCHED_SPLIT: u64 = 52;
 pub const SYS_ASPACE_BIND_NOTIFICATION: u64 = 53;
 /// Exit the whole process with a caller-chosen exit code.
 pub const SYS_PROCESS_EXIT: u64 = 54;
+/// Fill a user buffer with CSPRNG-quality bytes from the kernel entropy pool.
+///
+/// Ambient (requires no capability), like `SYS_SYSTEM_INFO`. arg0 = user buffer
+/// VA, arg1 = length in bytes (`<= MAX_GETRANDOM_LEN`). Returns the number of
+/// bytes written (always equal to the requested length on success — the kernel
+/// never blocks for entropy once the pool is seeded, which happens before any
+/// userspace process runs). See `core/kernel/docs/entropy.md`.
+pub const SYS_GETRANDOM: u64 = 55;
+
+// ── getrandom constants ───────────────────────────────────────────────────────
+
+/// Maximum bytes a single `SYS_GETRANDOM` call may request.
+///
+/// Bounds the interrupt-off window of the per-call kernel draw (the handler
+/// draws under disabled interrupts); userspace loops for larger buffers. The
+/// value mirrors the BSD `getentropy(2)` cap.
+pub const MAX_GETRANDOM_LEN: usize = 256;
 
 // ── Error codes ───────────────────────────────────────────────────────────────
 

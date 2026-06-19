@@ -105,11 +105,9 @@ On `ECALL` from U-mode:
 **Authoritative source:** `abi/syscall/src/lib.rs` — the constants defined there
 are the single source of truth. This table must match that file exactly.
 
-Syscall numbers are stable ABI. A new syscall takes the next free number; while
-the ABI is pre-1.0 (unstable), a *vacated* number may be reclaimed for a new
-syscall (slot 36 was reclaimed for `SYS_CAP_INFO` after `SYS_DMA_GRANT`'s
-removal; slot 32 for `SYS_THREAD_SET_FAULT_HANDLER` after `SYS_CAP_INSERT`'s),
-but a number in active use is never reassigned.
+Syscall numbers are stable ABI. A new syscall takes the next free number. While
+the ABI is pre-1.0 (unstable), a number left vacant by a removed syscall may be
+reclaimed for a new one, but a number in active use is never reassigned.
 
 ```
  0  SYS_IPC_CALL                 26  SYS_WAIT_SET_ADD
@@ -141,12 +139,10 @@ but a number in active use is never reassigned.
                                  52  SYS_SCHED_SPLIT
                                  53  SYS_ASPACE_BIND_NOTIFICATION
                                  54  SYS_PROCESS_EXIT
+                                 55  SYS_GETRANDOM
 ```
 
-**Implementation status.** Every number 0–54 has a handler. (Slot 32 formerly
-held `SYS_CAP_INSERT`, whose caller-chosen-slot behaviour is now reached through
-`SYS_CAP_COPY`'s destination-slot argument — a value of `0` auto-allocates; the
-number was reclaimed for `SYS_THREAD_SET_FAULT_HANDLER`.) Unallocated numbers
+**Implementation status.** Every number 0–55 has a handler; unallocated numbers
 return `UnknownSyscall`.
 
 ---
@@ -1419,6 +1415,34 @@ pub enum SystemInfoType
     CurrentCpu          = 7,
 }
 ```
+
+### `SYS_GETRANDOM` (55)
+
+Fill a user buffer with CSPRNG-quality random bytes drawn from the kernel
+entropy pool (see `docs/entropy.md`). Each call draws fresh from the kernel's
+per-CPU forward-secure generator; userspace holds no generator state.
+
+**Arguments:**
+
+| # | Name | Description |
+|---|---|---|
+| 0 | `buf` | Destination buffer VA (must lie wholly in the user half) |
+| 1 | `len` | Bytes to write (`1..=MAX_GETRANDOM_LEN`; `0` is a no-op) |
+
+**Return:** `rax`/`a0`: the number of bytes written (always `len` on success —
+the kernel never blocks for entropy once the pool is seeded, which happens
+before any userspace process runs); negative `SyscallError` on failure.
+
+**Capability requirement:** None (ambient, like `SYS_SYSTEM_INFO`). Random bytes
+name no object and confer no authority; the call is draw-only and injects no
+entropy.
+
+**Errors:** `InvalidArgument` (`len > MAX_GETRANDOM_LEN`); `InvalidAddress`
+(null buffer, or a span not wholly within the user half); `WouldBlock` (pool not
+yet seeded — unreachable in practice).
+
+Larger buffers are filled by looping in `MAX_GETRANDOM_LEN`-byte chunks, which
+bounds the per-call interrupt-off window of the kernel draw.
 
 ---
 

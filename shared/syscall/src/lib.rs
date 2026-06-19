@@ -44,9 +44,9 @@ use syscall_abi::{
     SYS_CAP_CREATE_ENDPOINT, SYS_CAP_CREATE_EVENT_Q, SYS_CAP_CREATE_NOTIFICATION,
     SYS_CAP_CREATE_THREAD, SYS_CAP_CREATE_WAIT_SET, SYS_CAP_DELETE, SYS_CAP_DERIVE,
     SYS_CAP_DERIVE_BADGE, SYS_CAP_INFO, SYS_CAP_MOVE, SYS_CAP_REVOKE, SYS_EVENT_POST,
-    SYS_EVENT_RECV, SYS_IOPORT_BIND, SYS_IOPORT_SPLIT, SYS_IPC_BUFFER_SET, SYS_IPC_CALL,
-    SYS_IPC_RECV, SYS_IPC_REPLY, SYS_IRQ_ACK, SYS_IRQ_REGISTER, SYS_IRQ_SPLIT, SYS_MEM_MAP,
-    SYS_MEM_PROTECT, SYS_MEM_UNMAP, SYS_MEMORY_MERGE, SYS_MEMORY_SPLIT, SYS_MMIO_MAP,
+    SYS_EVENT_RECV, SYS_GETRANDOM, SYS_IOPORT_BIND, SYS_IOPORT_SPLIT, SYS_IPC_BUFFER_SET,
+    SYS_IPC_CALL, SYS_IPC_RECV, SYS_IPC_REPLY, SYS_IRQ_ACK, SYS_IRQ_REGISTER, SYS_IRQ_SPLIT,
+    SYS_MEM_MAP, SYS_MEM_PROTECT, SYS_MEM_UNMAP, SYS_MEMORY_MERGE, SYS_MEMORY_SPLIT, SYS_MMIO_MAP,
     SYS_MMIO_SPLIT, SYS_NOTIFICATION_SEND, SYS_NOTIFICATION_WAIT, SYS_PROCESS_EXIT, SYS_SBI_CALL,
     SYS_SCHED_SPLIT, SYS_SYSTEM_INFO, SYS_THREAD_BIND_NOTIFICATION, SYS_THREAD_CONFIGURE,
     SYS_THREAD_EXIT, SYS_THREAD_READ_REGS, SYS_THREAD_SET_AFFINITY, SYS_THREAD_SET_FAULT_HANDLER,
@@ -60,10 +60,10 @@ pub use syscall_abi::{
     CAP_INFO_CSPACE_USED, CAP_INFO_MEMORY_AVAILABLE, CAP_INFO_MEMORY_HAS_RETYPE,
     CAP_INFO_MEMORY_PHYS_BASE, CAP_INFO_MEMORY_SIZE, CAP_INFO_TAG_RIGHTS, CAP_TAG_MEMORY,
     EXIT_FAULT_BASE, EXIT_KILLED, EXIT_VOLUNTARY, IPC_REPLY_TRANSFER_FAILED, MAP_EXECUTABLE,
-    MAP_READ, MAP_READONLY, MAP_WRITABLE, RIGHTS_ALL, RIGHTS_CONTROL, RIGHTS_CSPACE,
-    RIGHTS_MAP_READ, RIGHTS_MAP_RW, RIGHTS_MAP_RX, RIGHTS_POST, RIGHTS_RECEIVE, RIGHTS_RETYPE,
-    RIGHTS_SBI_BASE, RIGHTS_SBI_CPPC, RIGHTS_SBI_DBCN, RIGHTS_SBI_PMU, RIGHTS_SBI_RESET,
-    RIGHTS_SBI_SUSPEND, RIGHTS_SEND, RIGHTS_SEND_GRANT, RIGHTS_THREAD,
+    MAP_READ, MAP_READONLY, MAP_WRITABLE, MAX_GETRANDOM_LEN, RIGHTS_ALL, RIGHTS_CONTROL,
+    RIGHTS_CSPACE, RIGHTS_MAP_READ, RIGHTS_MAP_RW, RIGHTS_MAP_RX, RIGHTS_POST, RIGHTS_RECEIVE,
+    RIGHTS_RETYPE, RIGHTS_SBI_BASE, RIGHTS_SBI_CPPC, RIGHTS_SBI_DBCN, RIGHTS_SBI_PMU,
+    RIGHTS_SBI_RESET, RIGHTS_SBI_SUSPEND, RIGHTS_SEND, RIGHTS_SEND_GRANT, RIGHTS_THREAD,
 };
 
 // ── Raw syscall entry ─────────────────────────────────────────────────────────
@@ -2051,6 +2051,35 @@ pub fn thread_write_regs(thread_cap: u32, buf: *const u8, buf_size: usize) -> Re
         )
     };
     if ret < 0 { Err(ret) } else { Ok(()) }
+}
+
+// ── Randomness ─────────────────────────────────────────────────────────────────
+
+/// Fill `buf` with `len` cryptographically-secure random bytes from the kernel
+/// entropy pool (`SYS_GETRANDOM`).
+///
+/// `len` must be `<= MAX_GETRANDOM_LEN`; callers fill larger buffers by looping.
+/// On success the entire `len` bytes are written — the kernel never blocks for
+/// entropy (the pool is seeded before any userspace process runs) — and the
+/// byte count is returned. Each call draws fresh from the kernel's per-CPU
+/// CSPRNG; userspace holds no generator state.
+///
+/// # Safety
+/// `buf` must be valid for `len` bytes of writes.
+///
+/// # Errors
+/// Returns a negative `i64` error code: `InvalidArgument` if `len >
+/// MAX_GETRANDOM_LEN`, or `InvalidAddress` if `buf`/the span is not a valid
+/// user buffer.
+// cast_sign_loss: ret is proven non-negative in the Ok branch; it is a byte count.
+#[allow(clippy::cast_sign_loss)]
+#[inline]
+pub fn getrandom(buf: *mut u8, len: usize) -> Result<u64, i64>
+{
+    // SAFETY: syscall2 issues the raw syscall; buf cast to u64 for the ABI; the
+    // kernel validates the span and writes only within [buf, buf+len).
+    let ret = unsafe { syscall2(SYS_GETRANDOM, buf as u64, len as u64) };
+    if ret < 0 { Err(ret) } else { Ok(ret as u64) }
 }
 
 // ── SBI ──────────────────────────────────────────────────────────────────────

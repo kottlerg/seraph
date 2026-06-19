@@ -640,7 +640,7 @@ fn apply_all_overlays(mirror: &Path, overlay_root: &Path) -> Result<()>
     apply_alloc_overlay(&rust_src, overlay_root).context("alloc overlay")?;
     apply_reserve_overlay(&rust_src, overlay_root).context("reserve overlay")?;
     apply_io_error_overlay(&rust_src).context("io/error overlay")?;
-    apply_random_overlay(&rust_src).context("random overlay")?;
+    apply_random_overlay(&rust_src, overlay_root).context("random overlay")?;
     apply_thread_local_overlay(&rust_src).context("thread_local overlay")?;
     apply_stdio_overlay(&rust_src, overlay_root).context("stdio overlay")?;
     apply_exit_overlay(&rust_src).context("exit overlay")?;
@@ -888,9 +888,15 @@ fn apply_io_error_overlay(rust_src: &Path) -> Result<()>
     )
 }
 
-fn apply_random_overlay(rust_src: &Path) -> Result<()>
+fn apply_random_overlay(rust_src: &Path, overlay_root: &Path) -> Result<()>
 {
-    let mod_rs = rust_src.join("library/std/src/sys/random/mod.rs");
+    let random_dir = rust_src.join("library/std/src/sys/random");
+    let mod_rs = random_dir.join("mod.rs");
+    let seraph_rs_dst = random_dir.join("seraph.rs");
+    let seraph_rs_src = overlay_root.join("sys/random/seraph.rs");
+
+    write_if_changed(&seraph_rs_src, &seraph_rs_dst, "sys/random/seraph.rs")?;
+
     let orig =
         fs::read_to_string(&mod_rs).with_context(|| format!("reading {}", mod_rs.display()))?;
     if orig.contains(MARKER)
@@ -900,9 +906,9 @@ fn apply_random_overlay(rust_src: &Path) -> Result<()>
 
     let a1 = "    target_os = \"zkvm\" => {\n        mod zkvm;\n        pub use zkvm::fill_bytes;\n    }\n";
     let a1r = "    target_os = \"zkvm\" => {\n        mod zkvm;\n        pub use zkvm::fill_bytes;\n    }\n    \
-               // seraph-overlay: seraph random via unsupported\n    \
-               target_os = \"seraph\" => {\n        mod unsupported;\n        \
-               pub use unsupported::{fill_bytes, hashmap_random_keys};\n    }\n";
+               // seraph-overlay: seraph random via SYS_GETRANDOM (see sys/random/seraph.rs)\n    \
+               target_os = \"seraph\" => {\n        mod seraph;\n        \
+               pub use seraph::{fill_bytes, hashmap_random_keys};\n    }\n";
 
     let a2 = "    target_os = \"vexos\",\n)))]\npub fn hashmap_random_keys()";
     let a2r = "    target_os = \"vexos\",\n    target_os = \"seraph\",\n)))]\npub fn hashmap_random_keys()";

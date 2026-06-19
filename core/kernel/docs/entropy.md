@@ -8,17 +8,36 @@ and a boot-time power-on self-test.
 
 ## Scope and threat model
 
-This subsystem is the kernel's sole internal source of randomness. It is
-**kernel-internal only**: it adds no syscall and exposes nothing to userspace.
-Userspace randomness is a separate concern obtained through language runtimes
-and userspace services; the two surfaces share no state.
+This subsystem is the kernel's sole source of randomness, for both
+kernel-internal consumers and the userspace `SYS_GETRANDOM` syscall (see
+`docs/syscalls.md`). Kernel consumers call `fill_bytes` directly; userspace
+draws through the syscall, which fills the caller's buffer from the same
+per-CPU generators. Userspace holds **no** generator state of its own — every
+draw advances the kernel generator — so the two surfaces share the per-CPU
+generators but no userspace-resident secret.
+
+This shared sourcing is safe by construction. The sponge's per-fill fast key
+erasure (below) makes returned bytes unrecoverable from post-fill state and
+makes successive fills independent, so a userspace observer of `getrandom`
+output learns nothing about prior or subsequent kernel draws (ASLR offsets,
+nonces, keys): forward secrecy holds across the kernel/userspace boundary, not
+only within the kernel. The userspace path adds no authority-bearing surface —
+`SYS_GETRANDOM` is ambient and draw-only; it injects no entropy — and per-call
+length is capped (`MAX_GETRANDOM_LEN`) so a draw never holds interrupts off for
+an unbounded window. Because userspace keeps no RNG state, two processes (or a
+forked/cloned address space) cannot share or duplicate a seed: each diverges
+from its first draw by independently advancing the generator. Whole-VM-snapshot
+reuse — a resumed snapshot replaying pool state — is a pool-level concern that
+applies equally to kernel consumers and is tracked as a separate hardening
+follow-up.
 
 The subsystem must yield values an attacker cannot predict or reconstruct even
 after a later full-state compromise (forward secrecy), and must remain
 functional — degraded, not absent — on platforms with no hardware RNG. It is
-not a general-purpose KDF or a userspace `getrandom`; consumers are kernel
-hardening primitives (address-space layout randomization, handle/identifier
-randomization, key/nonce generation).
+not a general-purpose KDF; kernel consumers are hardening primitives
+(address-space layout randomization, handle/identifier randomization, key/nonce
+generation), and userspace consumers draw raw CSPRNG bytes through
+`SYS_GETRANDOM`.
 
 The hardware RNG is treated as untrusted until it passes startup health tests
 and is **never the sole input** regardless of those tests: its output is always

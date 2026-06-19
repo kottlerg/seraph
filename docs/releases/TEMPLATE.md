@@ -36,7 +36,12 @@ project version (the tag) and is not listed here.
 
 ## Known Issues
 
-- <Specific failure mode or limitation with a link to the tracking Issue.>
+Defects and regressions present in the shipped build of this release only: behaviour that
+is broken, degraded, or unreliable in the tagged artifacts. Missing or planned functionality
+is NOT a known issue and MUST NOT be listed here — absent features belong in the issue
+tracker, not in release notes. Use `None` when the release ships no known defects.
+
+- <Defect or regression in this release, with a link to its tracking Issue.>
 
 ## Verification
 
@@ -46,14 +51,3 @@ Disk images:
 - `seraph-v<X>.<Y>.<Z>-riscv64.img.zst`
 
 Verify with `sha256sum -c SHA256SUMS` against the attached `SHA256SUMS` file.
-
-## Validation
-
-- Burn-in workflow (`burnin.yml`) on this tag: <run URL>
-- Build-test workflow (`build-test.yml`) on the tagged commit: <run URL>
-
----
-
-## Summarized By
-
-None

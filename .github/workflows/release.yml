@@ -52,7 +52,7 @@ jobs:
             exit 1
           fi
           for h in "## Highlights" "## Components Shipped" "## ABI and Protocol Versions" \
-                   "## Breaking Changes" "## Known Issues" "## Verification" "## Validation"; do
+                   "## Breaking Changes" "## Known Issues" "## Verification"; do
             if ! grep -qxF "$h" "${NOTES}"; then
               echo "::error::${NOTES} missing TEMPLATE.md section: $h" >&2
               exit 1

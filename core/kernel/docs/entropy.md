@@ -108,7 +108,7 @@ At boot, runtime jitter has not yet accumulated. `seed_pool_from_sources` mixes:
 This is the **documented boot-entropy hole**: on a jitter-only platform the
 initial seed is weaker than at steady state. It is narrowed continuously at
 runtime by the timer-tick jitter hook, which feeds a fresh sample into each
-CPU's accumulator on every tick (and per device IRQ). 
+CPU's accumulator on every tick (and per device IRQ).
 
 TODO: persist a saved seed across boots (read at `init_storage`, rewritten at
 shutdown) to close the boot-entropy hole on jitter-only platforms; deferred —

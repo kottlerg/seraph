@@ -111,8 +111,9 @@ mod imp
         {
             let mut health = super::health::Health::new();
             let mut words = 0u32;
-            // Bounded draw: startup needs 1024 bytes (128 words); the margin
-            // tolerates RDSEED retries without spinning forever on a bad source.
+            // Bounded draw: startup needs 1024 bytes (128 words); the 512 cap
+            // bounds the loop (each hw_rng_u64 retries internally), and a None
+            // means the source gave up — stop and fall through to jitter.
             for _ in 0..512
             {
                 let Some(w) = hw::hw_rng_u64()

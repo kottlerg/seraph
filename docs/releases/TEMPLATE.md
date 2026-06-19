@@ -11,13 +11,12 @@
 
 ## Components Shipped
 
-Summarize notable changes grouped by area (kernel mechanisms, core services, drivers,
-storage, runtime, userspace programs). Describe what changed per area; do not enumerate
+Summarize notable changes as short descriptive paragraphs grouped by area (kernel
+mechanisms, core services, drivers, storage, runtime, userspace programs) — one paragraph
+per area, led by the area name in bold. Describe what changed per area; do not enumerate
 every crate. For the initial release, describe each area's initial state rather than a delta.
 
-| Area / component | Change since previous release |
-|---|---|
-| <area or component> | <what changed; "initial" for the first release> |
+**<Area>** — <what changed in this area; its initial state for the first release.>
 
 ## ABI and Protocol Versions
 
@@ -36,7 +35,12 @@ project version (the tag) and is not listed here.
 
 ## Known Issues
 
-- <Specific failure mode or limitation with a link to the tracking Issue.>
+Defects and regressions present in the shipped build of this release only: behaviour that
+is broken, degraded, or unreliable in the tagged artifacts. Missing or planned functionality
+is NOT a known issue and MUST NOT be listed here — absent features belong in the issue
+tracker, not in release notes. Use `None` when the release ships no known defects.
+
+- <Defect or regression in this release, with a link to its tracking Issue.>
 
 ## Verification
 
@@ -46,14 +50,3 @@ Disk images:
 - `seraph-v<X>.<Y>.<Z>-riscv64.img.zst`
 
 Verify with `sha256sum -c SHA256SUMS` against the attached `SHA256SUMS` file.
-
-## Validation
-
-- Burn-in workflow (`burnin.yml`) on this tag: <run URL>
-- Build-test workflow (`build-test.yml`) on the tagged commit: <run URL>
-
----
-
-## Summarized By
-
-None

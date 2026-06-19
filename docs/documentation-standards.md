@@ -69,6 +69,13 @@ If no non-structural document summarizes this document:
 None
 ```
 
+**Exception — release notes.** The per-tag release notes under `docs/releases/`
+(`<tag>.md`) and the `docs/releases/TEMPLATE.md` skeleton they are copied from are
+release records, not authoritative documents: they sit outside the hierarchy above,
+carry no content another document summarizes, and (for `<tag>.md`) are frozen at their
+tag. They MUST NOT carry a `## Summarized By` section. `docs/releases/README.md`, which
+governs release-notes discipline, is an ordinary authoritative document and keeps its own.
+
 ### Change propagation procedure
 
 When implementation changes invalidate documentation:

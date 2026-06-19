@@ -17,8 +17,8 @@ use crate::{TestContext, TestResult};
 
 /// `system_info(KernelVersion)` returns the expected version constant.
 ///
-/// The kernel version is `0.0.3` (packed as `3`). See `KERNEL_VERSION` in
-/// `abi/syscall/src/lib.rs` for the encoding details.
+/// The kernel version tracks the Seraph project version. See `KERNEL_VERSION`
+/// in `abi/syscall/src/lib.rs` for the encoding and source.
 pub fn kernel_version(_ctx: &TestContext) -> TestResult
 {
     let ver = system_info(SystemInfoType::KernelVersion as u64)

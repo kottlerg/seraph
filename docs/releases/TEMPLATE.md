@@ -11,28 +11,24 @@
 
 ## Components Shipped
 
-| Component | State |
+Summarize notable changes grouped by area (kernel mechanisms, core services, drivers,
+storage, runtime, userspace programs). Describe what changed per area; do not enumerate
+every crate. For the initial release, describe each area's initial state rather than a delta.
+
+| Area / component | Change since previous release |
 |---|---|
-| kernel | <delta vs previous release; "no change" if applicable> |
-| bootloader | <delta vs previous release> |
-| init | <delta vs previous release> |
-| procmgr | <delta vs previous release> |
-| memmgr | <delta vs previous release> |
-| vfsd | <delta vs previous release> |
-| svcmgr | <delta vs previous release> |
-| devmgr | <delta vs previous release> |
-| drivers/virtio-blk | <delta vs previous release> |
-| fs/fat | <delta vs previous release> |
-| runtime/ruststd | <delta vs previous release> |
+| <area or component> | <what changed; "initial" for the first release> |
 
 ## ABI and Protocol Versions
 
+List each ABI/protocol version constant whose value changed this release; omit constants
+that did not change. For the initial release, list the constants that define the shipped
+ABI surface with their initial values, marked `initial`. The kernel version equals the
+project version (the tag) and is not listed here.
+
 | Constant | Value | Bumped this release? |
 |---|---|---|
-| `BOOT_PROTOCOL_VERSION` | <n> | <yes/no> |
-| `PROCESS_ABI_VERSION` | <n> | <yes/no> |
-| `INIT_PROTOCOL_VERSION` | <n> | <yes/no> |
-| `<NAMESPACE>_LABELS_VERSION` | <n> | <yes/no> |
+| `<CONSTANT>` | <n> | <yes / no / initial> |
 
 ## Breaking Changes
 

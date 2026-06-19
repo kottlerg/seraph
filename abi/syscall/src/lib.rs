@@ -759,19 +759,33 @@ pub const FAULT_CLASS_ALL: u64 = !0u64;
 
 // ── System info ───────────────────────────────────────────────────────────────
 
+/// Pack a dotted `X.Y.Z` version string into the [`KERNEL_VERSION`] layout.
+///
+/// Reads the three leading numeric components, stopping at the first byte that
+/// is neither a digit nor a `.`, so any semver pre-release/build suffix is
+/// ignored. `const` so the value is fixed at compile time.
+const fn pack_project_version(s: &str) -> u64
+{
+    let b = s.as_bytes();
+    let mut parts = [0u64; 3]; // major, minor, patch
+    let mut i = 0;
+    let mut part = 0;
+    while i < b.len() && part < 3
+    {
+        match b[i]
+        {
+            d @ b'0'..=b'9' => parts[part] = parts[part] * 10 + (d - b'0') as u64,
+            b'.' => part += 1,
+            _ => break,
+        }
+        i += 1;
+    }
+    (parts[0] << 32) | (parts[1] << 16) | parts[2]
+}
+
 /// Kernel version packed as a single `u64`.
 ///
-/// Layout: `(major as u64) << 32 | (minor as u64) << 16 | (patch as u64)`
-///
-/// Versioning semantics (semver-style):
-/// - **major** — incremented on breaking syscall ABI changes (syscall removed,
-///   argument layout changed, error code semantics changed). Once the kernel
-///   ABI stabilises this will be `>= 1`; while major is `0` the ABI is
-///   explicitly unstable and may change freely between any releases.
-/// - **minor** — incremented when new syscalls are added without breaking
-///   existing ones.
-/// - **patch** — incremented for bug fixes that do not affect the ABI.
-///
+/// Layout: `(major as u64) << 32 | (minor as u64) << 16 | (patch as u64)`.
 /// Userspace extracts components with:
 /// ```text
 /// major = version >> 32
@@ -779,17 +793,13 @@ pub const FAULT_CLASS_ALL: u64 = !0u64;
 /// patch = version & 0xFFFF
 /// ```
 ///
-/// The version is `0.0.3` during initial kernel development. Major will remain
-/// `0` until the kernel reaches a meaningful level of completeness; during this
-/// phase all ABI changes are considered fully fluid regardless of minor/patch.
-/// `0.0.3` introduced the generation-tagged capability handle format (#349):
-/// a handle is `(generation << CAP_INDEX_BITS) | index`; a stale handle to a
-/// recycled slot fails with `InvalidCapability`.
-// Encode as (major << 32) | (minor << 16) | patch. The zero shifts are retained
-// to preserve the positional structure; they will carry non-zero values when
-// the ABI stabilises.
-#[allow(clippy::identity_op, clippy::eq_op)]
-pub const KERNEL_VERSION: u64 = (0u64 << 32) | (0u64 << 16) | 3u64; // 0.0.3
+/// The value is the Seraph project version, parsed from `CARGO_PKG_VERSION`
+/// (the workspace `version`) at compile time: kernel version and project
+/// version are one number, governed by the project-version semantics in
+/// `docs/conventions.md`. Syscall-ABI compatibility is not expressed here; it
+/// is tracked per protocol by the dedicated `*_VERSION` constants in the
+/// `abi/` crates.
+pub const KERNEL_VERSION: u64 = pack_project_version(env!("CARGO_PKG_VERSION"));
 
 /// Discriminant for `SYS_SYSTEM_INFO` queries.
 ///

@@ -31,9 +31,9 @@ use crate::error::BootError;
 use crate::firmware::{FirmwareInfo, discover_firmware};
 use crate::paging::{PageTableBuilder, build_initial_tables};
 use crate::uefi::{
-    EfiBootServices, EfiFileProtocol, EfiHandle, EfiSystemTable, allocate_pages,
-    connect_all_controllers, exit_boot_services, file_read, file_size, get_loaded_image,
-    get_memory_map, open_esp_volume, open_file, query_gop,
+    EFI_RNG_PROTOCOL_GUID, EFI_SUCCESS, EfiBootServices, EfiFileProtocol, EfiGuid, EfiHandle,
+    EfiRngProtocol, EfiSystemTable, allocate_pages, connect_all_controllers, exit_boot_services,
+    file_read, file_size, get_loaded_image, get_memory_map, open_esp_volume, open_file, query_gop,
 };
 use boot_protocol::{
     BOOT_MODULE_NAME_LEN, BOOT_PROTOCOL_VERSION, BootInfo, BootModule, FramebufferInfo, InitImage,
@@ -158,6 +158,19 @@ struct CpuTopology
     cpu_ids: [u32; MAX_CPUS],
 }
 
+/// Conditioned early-boot entropy seed drawn from UEFI `EFI_RNG_PROTOCOL`.
+///
+/// `len` is `0` when the firmware exposes no RNG; the kernel then degrades to
+/// timing jitter alone. Produced by [`step5c_fetch_boot_entropy`] while boot
+/// services are live and written into [`BootInfo`] by step 9.
+struct BootEntropy
+{
+    /// Random bytes; only the first `len` are valid, the remainder zero.
+    seed: [u8; 32],
+    /// Number of valid leading bytes in `seed` (`0` or `32`).
+    len: u32,
+}
+
 /// All pre-`ExitBootServices` physical allocations the boot sequence
 /// produces, gathered by [`step6_allocate_boot_structures`].
 struct BootAllocations
@@ -238,6 +251,9 @@ unsafe fn boot_sequence(image: EfiHandle, st: *mut EfiSystemTable) -> Result<!, 
     let cpus = unsafe { step5_discover_cpu_topology(&ctx, &firm) };
     // SAFETY: ctx.bs valid pre-exit.
     let ap_trampoline_phys = unsafe { step5b_alloc_ap_trampoline(&ctx) };
+    // SAFETY: ctx.bs valid pre-exit; draws the boot entropy seed while boot
+    // services (and thus EFI_RNG_PROTOCOL) are still available.
+    let boot_entropy = unsafe { step5c_fetch_boot_entropy(&ctx) };
     // SAFETY: all prior unsafe outputs remain valid; step 6 allocates via bs.
     let (allocs, mut page_table) = unsafe {
         step6_allocate_and_build_page_tables(
@@ -266,6 +282,7 @@ unsafe fn boot_sequence(image: EfiHandle, st: *mut EfiSystemTable) -> Result<!, 
             &mods,
             &firm,
             &cpus,
+            &boot_entropy,
             &ctx.framebuffer,
             &allocs,
             &uefi_map,
@@ -718,6 +735,62 @@ unsafe fn step5b_alloc_ap_trampoline(ctx: &UefiContext) -> u64
     }
 }
 
+// ── Step 5c: boot entropy seed ───────────────────────────────────────────────
+
+/// Draw a conditioned early-boot entropy seed from UEFI `EFI_RNG_PROTOCOL`.
+///
+/// The seed narrows the kernel's boot-time entropy hole before any early
+/// consumer (KASLR/ASLR) draws randomness. Returns `len == 0` when the firmware
+/// exposes no RNG — the protocol is absent or `GetRNG` fails — in which case the
+/// kernel degrades to timing jitter alone (no regression).
+///
+/// Silent by design: the kernel reports the resolved entropy source
+/// (`entropy: seeded from firmware RNG …` / `… using jitter`) after handoff, so
+/// the bootloader adds no console output here.
+///
+/// # Safety
+/// `ctx.bs` must be valid UEFI boot services (before `ExitBootServices`).
+unsafe fn step5c_fetch_boot_entropy(ctx: &UefiContext) -> BootEntropy
+{
+    let mut seed = [0u8; 32];
+    let mut iface: *mut core::ffi::c_void = core::ptr::null_mut();
+    // SAFETY: ctx.bs is valid; locate_protocol fills iface on success.
+    let status = unsafe {
+        ((*ctx.bs).locate_protocol)(
+            core::ptr::addr_of!(EFI_RNG_PROTOCOL_GUID),
+            core::ptr::null_mut(),
+            core::ptr::addr_of_mut!(iface),
+        )
+    };
+    if status != EFI_SUCCESS || iface.is_null()
+    {
+        return BootEntropy { seed, len: 0 };
+    }
+
+    let proto = iface.cast::<EfiRngProtocol>();
+    // SAFETY: proto is a valid protocol pointer from LocateProtocol; a null
+    // algorithm selects the implementation default; seed has room for 32 bytes.
+    // GetRNG returns EFI_SUCCESS only after writing all requested bytes.
+    let s = unsafe {
+        ((*proto).get_rng)(
+            proto,
+            core::ptr::null::<EfiGuid>(),
+            seed.len(),
+            seed.as_mut_ptr(),
+        )
+    };
+    if s == EFI_SUCCESS
+    {
+        BootEntropy { seed, len: 32 }
+    }
+    else
+    {
+        // Discard any partial output rather than hand the kernel a short draw.
+        seed = [0u8; 32];
+        BootEntropy { seed, len: 0 }
+    }
+}
+
 // ── Step 6: Allocate boot structures and build page tables ──────────────────
 
 /// Allocate the fixed pre-exit scratch pages (`BootInfo` page, modules
@@ -953,6 +1026,7 @@ unsafe fn step9_populate_boot_info(
     mods: &ModulesLoad,
     firm: &FirmwareInfo,
     cpus: &CpuTopology,
+    boot_entropy: &BootEntropy,
     framebuffer: &FramebufferInfo,
     allocs: &BootAllocations,
     uefi_map: &uefi::MemoryMapResult,
@@ -1202,6 +1276,8 @@ unsafe fn step9_populate_boot_info(
                     entries: allocs.reclaim_array_phys as *const ReclaimRange,
                     count: reclaim_len as u64,
                 },
+                boot_entropy_seed: boot_entropy.seed,
+                boot_entropy_len: boot_entropy.len,
             },
         );
     }

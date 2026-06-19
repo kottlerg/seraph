@@ -883,6 +883,13 @@ mod tests
     }
 
     #[test]
+    fn entropy_selftest_fail_classifies_fail()
+    {
+        let log = "[0.42] kernel: entropy: SELFTEST FAIL: cpus 0 and 1 match\n";
+        assert!(matches!(classify_log(log), Status::Fail));
+    }
+
+    #[test]
     fn userspace_fault_with_pass_marker_classifies_pass()
     {
         // crasher's deliberate userspace fault (co-staged with svctest) must

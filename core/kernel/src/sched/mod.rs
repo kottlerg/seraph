@@ -4298,6 +4298,14 @@ pub unsafe fn timer_tick()
     let cpu_count = CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
     debug_assert!(cpu < cpu_count, "timer_tick: cpu={cpu} out of range");
 
+    // Fold a per-tick jitter sample into this CPU's entropy accumulator
+    // (allocation-free, lock-free; no-op until the entropy slab is allocated).
+    crate::entropy::jitter::sample(
+        cpu,
+        crate::entropy::jitter::Source::Tick,
+        crate::arch::current::entropy::read_cycle_counter(),
+    );
+
     // Cross-CPU liveness heartbeat (one Relaxed store), plus the BSP
     // cross-check on APs. See [`TICK_HEARTBEAT`].
     if cpu < MAX_CPUS

@@ -50,6 +50,7 @@ mod arch;
 mod cap;
 mod console;
 mod cpu_mask;
+mod entropy;
 mod framebuffer;
 mod ipc;
 pub mod irq;
@@ -275,6 +276,13 @@ unsafe fn kernel_entry_post_rebase(
     // tables with dynamically sized allocations.
     sched::init_storage(boot_cpu_count, allocator);
 
+    // Allocate entropy subsystem per-CPU storage (CSPRNGs, jitter accumulators)
+    // and the central pool from the buddy allocator, alongside the scheduler
+    // slabs and for the same reason: before the Phase-7 user-cap drain, while
+    // the buddy still holds large contiguous blocks.
+    #[cfg(not(test))]
+    entropy::init_storage(boot_cpu_count, allocator);
+
     // ── Phase 5: architecture hardware initialization ─────────────────────────
     kprintln!("Phase 5: Architecture Hardware Initialisation");
     // SAFETY: single-threaded boot phase; heap and direct map active; called
@@ -324,6 +332,12 @@ unsafe fn kernel_entry_post_rebase(
         arch::current::timer::init(1_000);
     }
     kprintln!("timer ok");
+
+    // Seed the entropy pool from hardware RNG (where present, health-gated) and
+    // boot-time jitter, then open the kernel draw API. After timer::init so the
+    // cycle counter is live for jitter samples.
+    #[cfg(not(test))]
+    entropy::init();
 
     // Initialize the CPU-to-APIC-ID mapping for wakeup IPIs.
     #[cfg(not(test))]
@@ -433,6 +447,12 @@ unsafe fn kernel_entry_post_rebase(
             }
         }
     }
+
+    // Validate the entropy subsystem now that every CPU's generator is live:
+    // per-CPU independence + sanity (a power-on self-test). The PASS/FAIL marker
+    // is scraped by the run-parallel fail-regex.
+    #[cfg(not(test))]
+    entropy::selftest::run(cpu_count as usize);
 
     // With every AP executing at kernel virtual addresses, the low-VA
     // identity-RWX mapping at `trampoline_pa` (installed in Phase 3 on
@@ -1349,6 +1369,11 @@ pub extern "C" fn kernel_entry_ap(cpu_id: u32, ist1_top: u64, ist2_top: u64) -> 
     }
 
     kprintln!("smp: AP {} online", cpu_id);
+
+    // Capture this AP's entropy self-test sample (debug builds). The AP's
+    // generator seeds lazily from the pool (already seeded in Phase 5) on this
+    // first draw.
+    entropy::init_ap();
 
     // 6. Notification BSP that this AP is ready.
     APS_READY.fetch_add(1, Ordering::Release);

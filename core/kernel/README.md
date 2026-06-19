@@ -30,7 +30,8 @@ kernel/
 │   │   │   ├── timer.rs        # APIC timer for preemption
 │   │   │   ├── syscall.rs      # SYSCALL/SYSRET entry glue
 │   │   │   ├── cpu.rs          # CPUID, topology, per-CPU state (GDT/TSS)
-│   │   │   └── console.rs      # Early framebuffer/serial output
+│   │   │   ├── console.rs      # Early framebuffer/serial output
+│   │   │   └── entropy.rs      # Hardware RNG (RDSEED/RDRAND) + cycle counter
 │   │   └── riscv64/            # RISC-V implementation
 │   │       ├── mod.rs
 │   │       ├── paging.rs       # Page table management (Sv48)
@@ -39,7 +40,8 @@ kernel/
 │   │       ├── timer.rs        # SBI timer for preemption
 │   │       ├── syscall.rs      # ECALL entry glue
 │   │       ├── cpu.rs          # Hart ID, topology, per-hart state
-│   │       └── console.rs      # Early SBI console / framebuffer output
+│   │       ├── console.rs      # Early SBI console / framebuffer output
+│   │       └── entropy.rs      # Hardware RNG (none; jitter-only) + cycle counter
 │   ├── mm/                     # Memory management subsystem
 │   │   ├── mod.rs
 │   │   ├── buddy.rs            # Physical frame allocator (buddy algorithm)
@@ -53,6 +55,15 @@ kernel/
 │   │   ├── cspace.rs           # CSpace: slot storage, lookup, growth
 │   │   ├── slot.rs             # Capability slot representation and rights
 │   │   └── derivation.rs       # Derivation tree, revocation algorithm
+│   ├── entropy/                # Entropy subsystem and per-CPU CSPRNG
+│   │   ├── mod.rs              # Storage alloc, seeding, draw API (fill_bytes)
+│   │   ├── keccak.rs           # Keccak-f[1600] permutation (FIPS 202)
+│   │   ├── sponge.rs           # Forward-secure duplex PRNG
+│   │   ├── pool.rs             # Central multi-source entropy pool
+│   │   ├── cpurng.rs           # Per-CPU CSPRNG + reseed policy
+│   │   ├── jitter.rs           # Per-CPU interrupt-time jitter accumulator
+│   │   ├── health.rs           # NIST SP 800-90B health tests (RCT/APT)
+│   │   └── selftest.rs         # Boot-time power-on self-test
 │   ├── ipc/                    # IPC subsystem
 │   │   ├── mod.rs
 │   │   ├── endpoint.rs         # Endpoint object: wait queues, state machine
@@ -76,6 +87,7 @@ kernel/
     ├── syscalls.md             # Syscall ABI and complete syscall table
     ├── memory-internals.md     # Memory subsystem implementation details
     ├── capability-internals.md # Capability subsystem implementation details
+    ├── entropy.md              # Entropy subsystem, CSPRNG, health tests, draw API
     ├── ipc-internals.md        # IPC subsystem implementation details
     ├── scheduler.md                  # Scheduler internals and algorithms
     ├── scheduling-internals.md       # SMP locking, wake protocol, IPI taxonomy, BSP boot transient
@@ -107,6 +119,13 @@ The capability subsystem. `cspace.rs` implements per-process capability spaces.
 `slot.rs` defines the in-memory representation of a capability slot and its rights
 bitmask. `derivation.rs` maintains the global derivation tree used for revocation.
 See [`docs/capability-internals.md`](docs/capability-internals.md).
+
+### `entropy/`
+
+The kernel entropy subsystem: a multi-source pool feeding per-CPU forward-secure
+CSPRNGs, with hardware-source health gating, an interrupt-time jitter source, a
+kernel-internal draw API, and a boot-time power-on self-test. Kernel-internal
+only — no syscall surface. See [`docs/entropy.md`](docs/entropy.md).
 
 ### `ipc/`
 

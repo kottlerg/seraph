@@ -159,6 +159,10 @@ Emit "fatal: cannot build kernel page tables (OOM)" and halt.
 3. Install the kernel allocator (implements the `GlobalAlloc` trait via the
    size-class path; used by any `alloc::*` usage in the kernel)
 4. Emit: "kernel heap active"
+5. Allocate per-CPU subsystem storage from the buddy allocator while it still
+   holds large contiguous blocks (before the Phase-7 user-cap drain): scheduler
+   per-CPU state and idle stacks, and the entropy subsystem's per-CPU CSPRNGs,
+   central pool, and jitter accumulators (see entropy.md)
 ```
 
 After this phase, `Box`, `Vec`, and other heap types work in kernel code.
@@ -216,6 +220,11 @@ Architecture-specific hardware initialization; x86-64 and RISC-V diverge here.
 5. Set SBI timer for initial tick (timer interrupt enable)
 6. Enable interrupts (set sstatus.SIE)
 ```
+
+After the architecture hardware path, the BSP seeds the entropy pool from the
+hardware RNG (health-gated where present) and boot-time jitter and opens the
+kernel draw API; without a hardware RNG (RISC-V under default firmware) this
+degrades to jitter only. See [entropy.md](entropy.md).
 
 **Failure mode:** Hardware initialisation failures (e.g. CPUID indicates a required
 feature is absent) halt with a descriptive message. The specific required features
@@ -337,6 +346,9 @@ are excluded because `mint_module_memory_caps` already covers them).
    cap::mint_late_reclaim_memory_caps; the descriptor lands in
    cspace_layout so init sees the cap through the standard CSpace
    handoff in Phase 9.
+7. Run the entropy power-on self-test across all online CPUs: each CPU captured
+   a sample from its generator during bringup, and the BSP now checks per-CPU
+   independence and basic sanity, printing PASS/FAIL (see entropy.md).
 ```
 
 The AP SIPI trampoline page is flagged `RECLAIM_FLAG_LATE` in
@@ -465,10 +477,10 @@ that CPU only; the BSP and other CPUs continue.
 | 2 | Buddy allocator from memory map | Halt: no usable RAM |
 | 3 | Kernel page tables + direct map | Halt: OOM during PT construction |
 | 4 | Slab allocator + kernel heap | Halt: cannot init heap |
-| 5 | CPU hardware (IDT/GDT/TSS/stvec) | Halt: missing required feature |
+| 5 | CPU hardware (IDT/GDT/TSS/stvec); seed entropy pool | Halt: missing required feature |
 | 6 | Platform resource validation | Halt if entries pointer is null with non-zero count; bad entries skipped |
 | 7 | Capability system + root CSpace | Halt: OOM |
-| 8 | Scheduler + idle threads, SMP bringup, AP trampoline reclaim | Halt: OOM (idle stack/TCB); start_ap failure per CPU is logged and skipped |
+| 8 | Scheduler + idle threads, SMP bringup, AP trampoline reclaim, entropy self-test | Halt: OOM (idle stack/TCB); start_ap failure per CPU is logged and skipped |
 | 9 | Init creation + scheduler entry (user mode) | Halt: invalid InitImage or OOM |
 
 ---

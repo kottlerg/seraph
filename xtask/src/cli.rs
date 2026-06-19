@@ -272,10 +272,11 @@ pub enum TestComponent
 /// Default `--fail` regex for `run-parallel`. Matches the cross-harness
 /// `SOME TESTS FAILED` marker plus the kernel's death markers so a crash is
 /// classified FAIL rather than HANG. `KERNEL EXCEPTION` + `FATAL:` cover the
-/// hardware-trap path; `PANIC( at |: )` covers the Rust `#[panic_handler]`.
+/// hardware-trap path; `PANIC( at |: )` covers the Rust `#[panic_handler]`;
+/// `entropy: SELFTEST FAIL` covers the kernel entropy self-test.
 /// The benign `USERSPACE FAULT` path matches none of these.
 pub const DEFAULT_FAIL_REGEX: &str =
-    r"SOME TESTS FAILED|KERNEL EXCEPTION|FATAL:|PANIC( at |: )|=== WATCHDOG";
+    r"SOME TESTS FAILED|KERNEL EXCEPTION|FATAL:|PANIC( at |: )|=== WATCHDOG|entropy: SELFTEST FAIL";
 
 #[derive(Parser)]
 pub struct RunParallelArgs
@@ -322,10 +323,11 @@ pub struct RunParallelArgs
     /// (`core/kernel/src/main.rs` `fatal()`), a Rust `panic!` prints
     /// `PANIC at`/`PANIC:` (the `#[panic_handler]`), and the scheduler's
     /// wedge detectors print a dump headed `=== WATCHDOG` (a kernel that
-    /// detected its own stall is a failure, not a hang). The benign
+    /// detected its own stall is a failure, not a hang), and the entropy
+    /// subsystem's boot self-test prints `entropy: SELFTEST FAIL`. The benign
     /// userspace fault path prints `USERSPACE FAULT`, which none of these
-    /// match. Override with a never-matching pattern (e.g. `'$.^'`) to
-    /// disable.
+    /// match. Override with a never-matching pattern (e.g.
+    /// `'$.^'`) to disable.
     #[arg(long, default_value = DEFAULT_FAIL_REGEX)]
     pub fail: String,
 

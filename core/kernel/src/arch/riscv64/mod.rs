@@ -9,6 +9,8 @@ pub mod ap_trampoline;
 pub mod console;
 pub mod context;
 pub mod cpu;
+#[cfg(not(test))]
+pub mod entropy;
 pub mod fpu;
 pub mod gdt;
 pub mod idt;

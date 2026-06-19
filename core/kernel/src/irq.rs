@@ -152,6 +152,15 @@ pub unsafe fn dispatch_device_irq(irq: u32)
         return;
     }
 
+    // Fold an IRQ-arrival jitter sample (a distinct event class from timer
+    // ticks) into this CPU's entropy accumulator. Allocation-free, lock-free.
+    let jitter_cpu = crate::arch::current::cpu::current_cpu() as usize;
+    crate::entropy::jitter::sample(
+        jitter_cpu,
+        crate::entropy::jitter::Source::Irq,
+        crate::arch::current::entropy::read_cycle_counter(),
+    );
+
     // SAFETY: index is bounds-checked; Acquire ordering ensures we see the
     // latest pointer stored by register/unregister on any CPU.
     let sig_ptr = IRQ_TABLE[irq as usize].notification.load(Ordering::Acquire);

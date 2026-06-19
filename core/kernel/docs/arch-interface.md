@@ -35,13 +35,13 @@ kernel/src/arch/
 │   ├── paging.rs   ├── context.rs  ├── interrupts.rs ├── timer.rs
 │   ├── syscall.rs  ├── cpu.rs      ├── console.rs    ├── trap_frame.rs
 │   ├── gdt.rs      ├── idt.rs      ├── ioapic.rs     ├── fpu.rs
-│   ├── platform.rs └── ap_trampoline.rs
+│   ├── platform.rs ├── ap_trampoline.rs └── entropy.rs
 └── riscv64/
     ├── mod.rs
     ├── paging.rs   ├── context.rs  ├── interrupts.rs ├── timer.rs
     ├── syscall.rs  ├── cpu.rs      ├── console.rs    ├── trap_frame.rs
     ├── gdt.rs      ├── idt.rs      ├── sbi.rs        ├── fpu.rs
-    ├── platform.rs └── ap_trampoline.rs
+    ├── platform.rs ├── ap_trampoline.rs └── entropy.rs
 ```
 
 `arch/mod.rs` performs the conditional compilation:
@@ -389,6 +389,31 @@ pub unsafe fn rebase_serial(new_base: u64);
 
 ---
 
+## `entropy` — `arch::current::entropy`
+
+Hardware entropy primitives consumed by the kernel entropy subsystem
+(`crate::entropy`; see [`entropy.md`](entropy.md)). The hardware RNG is optional —
+neutral code gates every draw on `hw_rng_available` and always mixes the result
+with timing jitter — so an architecture without one (RISC-V under default
+firmware) satisfies the contract by reporting no source.
+
+```rust
+/// Whether the CPU exposes a hardware RNG instruction. x86-64 reports RDRAND or
+/// RDSEED via CPUID; RISC-V returns false (no source under default firmware).
+pub fn hw_rng_available() -> bool;
+
+/// Draw one 64-bit hardware-RNG word, or `None` if no source succeeded. x86-64
+/// prefers RDSEED (seed-grade) with an RDRAND fallback, each with bounded retry;
+/// RISC-V returns `None`.
+pub fn hw_rng_u64() -> Option<u64>;
+
+/// Read a free-running cycle counter for jitter sampling; use deltas only
+/// (x86-64 TSC via `rdtsc`; RISC-V the `time` CSR).
+pub fn read_cycle_counter() -> u64;
+```
+
+---
+
 ## `trap_frame` — `arch::current::trap_frame`
 
 The full user-mode register snapshot saved on the kernel stack at every privilege transition.
@@ -503,6 +528,7 @@ pub fn platform::console_mmio() -> Option<(u64, u64)>;
 - SMEP/SMAP enforcement (x86-64); SUM bit management (RISC-V)
 - Syscall instruction handling (`SYSCALL`/`SYSRET` vs `ECALL`)
 - CPU feature detection (CPUID / ISA extensions)
+- Hardware RNG and cycle-counter access (RDSEED/RDRAND/TSC vs the `time` CSR)
 - SMP bringup (INIT/SIPI on x86-64; SBI HSM on RISC-V)
 
 **Architecture-neutral** (lives in `mm/`, `cap/`, `ipc/`, `sched/`, `syscall/`):

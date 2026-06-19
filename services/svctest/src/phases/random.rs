@@ -8,8 +8,8 @@
 //! cross-process divergence: a respawned child's per-process hash seed must
 //! differ from the parent's, proving the seed is drawn per process rather than
 //! being a constant. (The former `unsupported` stub derived keys from stack and
-//! heap addresses, which are identical across two runs of the same binary under
-//! seraph's deterministic VA layout — so it would collide here, where the real
+//! heap addresses, identical across two runs of the same binary under seraph's
+//! deterministic VA layout — so it would collide here, where the real
 //! per-process kernel draw diverges.)
 
 use std::collections::hash_map::RandomState;
@@ -22,7 +22,7 @@ use crate::runner::Phase;
 /// it differs from the parent fingerprint passed as `argv[2]`.
 const ROLE_DIVERGE: &str = "random-diverge-child";
 
-/// Fixed hasher input; the resulting hash depends only on the process's
+/// Fixed hasher input; the resulting hash depends only on the sampling thread's
 /// `RandomState` `SipHash` keys (drawn via `hashmap_random_keys` → `SYS_GETRANDOM`).
 const FINGERPRINT_INPUT: u64 = 0x5365_7261_7068_2121; // "Seraph!!"
 
@@ -43,11 +43,18 @@ fn draw_u64() -> u64
     u64::from_ne_bytes(buf)
 }
 
-/// Per-process fingerprint: a fixed value hashed under a fresh `RandomState`,
-/// so the result is determined by this process's randomly-seeded `SipHash` keys.
-fn fingerprint() -> u64
+/// Hash of a fixed value under a freshly-seeded `RandomState`, sampled in a new
+/// thread so its thread-local `SipHash` keys come straight from this process's
+/// `hashmap_random_keys()` at increment 0 — not from `RandomState`'s per-call
+/// key bump. Sampling in a fresh thread on both sides keeps the parent and the
+/// freshly-spawned child at the same increment, so the comparison reflects the
+/// per-process kernel seed itself: a constant or non-per-process seed collides;
+/// a real draw diverges.
+fn base_fingerprint() -> u64
 {
-    RandomState::new().hash_one(FINGERPRINT_INPUT)
+    std::thread::spawn(|| RandomState::new().hash_one(FINGERPRINT_INPUT))
+        .join()
+        .expect("fingerprint thread panicked")
 }
 
 /// Child-mode dispatch (see `reentry::dispatch`).
@@ -60,7 +67,7 @@ pub fn reentry_main(role: &str)
             .and_then(|s| u64::from_str_radix(&s, 16).ok())
             .expect("random-diverge-child: missing/invalid parent fingerprint");
         // exit 0 = diverged (expected); 1 = collision (seed not per-process).
-        std::process::exit(i32::from(fingerprint() == parent));
+        std::process::exit(i32::from(base_fingerprint() == parent));
     }
 }
 
@@ -72,16 +79,17 @@ pub fn random_phase(_: &Caps)
     assert_ne!(a, b, "two SYS_GETRANDOM draws returned identical bytes");
     assert!(a != 0 && b != 0, "SYS_GETRANDOM returned all-zero bytes");
 
-    // std HashMap seeding is live (no longer the panicking `unsupported` stub):
-    // distinct RandomState instances yield distinct fingerprints in-process.
-    let (f1, f2) = (fingerprint(), fingerprint());
+    // HashMap seeding is live and random: two independently-seeded RandomState
+    // keys (each sampled at increment 0) differ. A constant seed would collide.
+    let p1 = base_fingerprint();
+    let p2 = base_fingerprint();
     assert_ne!(
-        f1, f2,
-        "RandomState produced identical fingerprints (HashMap seeding inert)"
+        p1, p2,
+        "RandomState seeds collided in-process (HashMap seed not random)"
     );
 
     // Gating property: a respawned child's per-process seed must differ from ours.
-    let mine = fingerprint();
+    let mine = base_fingerprint();
     let status = std::process::Command::new("/tests/svctest")
         .arg(ROLE_DIVERGE)
         .arg(format!("{mine:x}"))

@@ -925,18 +925,18 @@ dependencies = [
 
 [[package]]
 name = "shell"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "shell-path",
 ]
 
 [[package]]
 name = "shell-path"
-version = "0.1.0"
+version = "0.0.1"
 
 [[package]]
 name = "shell-tester"
-version = "0.1.0"
+version = "0.0.1"
 
 [[package]]
 name = "shlex"
@@ -1032,7 +1032,7 @@ dependencies = [
 
 [[package]]
 name = "terminal"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "ansi",
  "ipc",

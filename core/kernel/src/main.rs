@@ -227,7 +227,7 @@ unsafe fn kernel_entry_post_rebase(
     boot_cpu_ids: [u32; boot_protocol::MAX_CPUS],
     trampoline_pa: u64,
     init_image: boot_protocol::InitImage,
-    boot_entropy_seed: [u8; 32],
+    mut boot_entropy_seed: [u8; 32],
     boot_entropy_len: u32,
     fb_phys: u64,
     allocator: &'static mut mm::buddy::BuddyAllocator,
@@ -349,6 +349,25 @@ unsafe fn kernel_entry_post_rebase(
         // version, not this length field.
         let n = (boot_entropy_len as usize).min(boot_entropy_seed.len());
         entropy::init(&boot_entropy_seed[..n]);
+
+        // Scrub the conditioned seed once it is absorbed. The BootInfo page is
+        // a reclaim range donated to userspace at Phase 7 (memmgr re-hands its
+        // frames without zeroing), so the seed must not survive there; the
+        // local copy is wiped too. The pool retains the entropy — the seed
+        // itself is secret (it feeds KASLR and key/nonce generation).
+        boot_entropy_seed.fill(0);
+        // SAFETY: the direct map covers all RAM since Phase 3; boot_info_phys
+        // was validated in Phase 0. Single-threaded boot, and no live BootInfo
+        // reference aliases the page at this point.
+        unsafe {
+            let bi = mm::paging::phys_to_virt(boot_info_phys) as *mut BootInfo;
+            core::ptr::write_bytes(
+                core::ptr::addr_of_mut!((*bi).boot_entropy_seed).cast::<u8>(),
+                0,
+                32,
+            );
+            (*bi).boot_entropy_len = 0;
+        }
     }
 
     // Initialize the CPU-to-APIC-ID mapping for wakeup IPIs.

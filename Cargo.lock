@@ -261,6 +261,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "217698eaf96b4a3f0bc4f3662aaa55bdf913cd54d7204591faa790070c6d0853"
 
 [[package]]
+name = "crypto"
+version = "0.1.0"
+
+[[package]]
 name = "ctrlc"
 version = "3.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -572,6 +576,7 @@ dependencies = [
 name = "ktest"
 version = "0.1.0"
 dependencies = [
+ "crypto",
  "font",
  "init-protocol",
  "ipc",

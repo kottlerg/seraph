@@ -34,6 +34,7 @@ members = [
     "abi/process-abi",
     "abi/syscall",
     "shared/ansi",
+    "shared/crypto",
     "shared/elf",
     "shared/font",
     "shared/mmio",

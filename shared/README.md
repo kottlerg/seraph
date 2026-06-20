@@ -5,6 +5,7 @@ Internal utility crates with no cross-boundary stability obligation. See
 
 | Crate | Purpose |
 |---|---|
+| `crypto/` | In-OS crypto primitives — SHA-512 hashing and Ed25519 signature verification, `no_std`, zero-dependency |
 | `elf/` | ELF64 parser — header validation, segment enumeration |
 | `font/` | Embedded 9×20 bitmap font for early console output |
 | `ipc/` | IPC helpers — `IpcMessage` snapshot type, `ipc_call`/`recv`/`reply` wrappers, bootstrap protocol, and the `RecvGuard` receive-failure policy for blocking recv loops (see [docs/ipc-design.md](../docs/ipc-design.md)) |

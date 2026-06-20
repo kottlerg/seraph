@@ -11,7 +11,6 @@
 //! requests on init's bootstrap endpoint to deliver their per-service
 //! capability set.
 
-use crate::bootstrap::NEXT_BOOTSTRAP_BADGE;
 use crate::idle_loop;
 use crate::logging::log;
 use crate::walk;
@@ -41,7 +40,7 @@ pub struct ServiceThreadCaps
 
 fn derive_badged_creator(bootstrap_ep: u32) -> Option<(u32, u64)>
 {
-    let badge = NEXT_BOOTSTRAP_BADGE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let badge = crate::bootstrap::mint_bootstrap_badge()?;
     let badged = syscall::cap_derive_badge(bootstrap_ep, syscall::RIGHTS_SEND, badge).ok()?;
     Some((badged, badge))
 }

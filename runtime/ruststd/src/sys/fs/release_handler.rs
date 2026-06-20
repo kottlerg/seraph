@@ -23,7 +23,6 @@
 
 use crate::collections::BTreeMap;
 use crate::io;
-use crate::sync::atomic::{AtomicU64, Ordering};
 use crate::sync::{Arc, Mutex, OnceLock, PoisonError};
 use crate::thread;
 use crate::vec::Vec;
@@ -62,7 +61,6 @@ pub(super) struct ReleaseState
     /// tear down every fs-side derived child atomically.
     release_ep: u32,
     registry: Mutex<BTreeMap<u64, Arc<FileEntry>>>,
-    next_badge: AtomicU64,
     /// Process aspace cap, captured at init for the handler's
     /// `mem_unmap` calls. Equal to `StartupInfo::self_aspace`.
     aspace: u32,
@@ -99,7 +97,6 @@ pub(super) fn ensure_started() -> io::Result<&'static ReleaseState>
         ReleaseState {
             release_ep,
             registry: Mutex::new(BTreeMap::new()),
-            next_badge: AtomicU64::new(1),
             aspace,
         }
     });
@@ -135,15 +132,23 @@ pub(super) fn release_endpoint(state: &ReleaseState) -> u32
     state.release_ep
 }
 
-/// Allocate a fresh non-zero per-`File` badge.
-pub(super) fn allocate_badge(state: &ReleaseState) -> u64
+/// Allocate a fresh non-zero per-`File` release-endpoint badge: a random `u64`
+/// from the kernel entropy pool, redrawn off the reserved `0` value (an
+/// unbadged SEND carries badge 0). Random rather than monotonic so the
+/// file-open count it would otherwise leak to the fs driver — which receives
+/// the badged SEND and echoes the badge in `FS_RELEASE_MEMORY` — stays
+/// unguessable; the handler keys its registry by badge value, not index.
+/// Returns `None` if the entropy draw fails (a kernel-contract violation).
+pub(super) fn allocate_badge() -> Option<u64>
 {
-    let mut t = state.next_badge.fetch_add(1, Ordering::Relaxed);
-    while t == 0
+    loop
     {
-        t = state.next_badge.fetch_add(1, Ordering::Relaxed);
+        let t = syscall::random_u64().ok()?;
+        if t != 0
+        {
+            return Some(t);
+        }
     }
-    t
 }
 
 /// Register a `File` with the handler, returning its `FileEntry`.

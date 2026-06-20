@@ -40,13 +40,6 @@ pub enum DeathOutcome
     Unrecoverable,
 }
 
-/// Monotonic counter for child bootstrap badges. Shared between the
-/// restart path and the post-handover launch path: every child that
-/// receives its bootstrap round on svcmgr's `bootstrap_ep` gets a
-/// distinct badge so svcmgr can correlate the round to the right
-/// service entry.
-static NEXT_BOOTSTRAP_BADGE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
-
 /// Result of a successful `CREATE_FROM_FILE` reply, shared by the
 /// restart path and the post-handover launch path.
 pub struct CreatedProcess
@@ -56,11 +49,21 @@ pub struct CreatedProcess
     pub child_badge: u64,
 }
 
-/// Allocate a fresh bootstrap badge and mint a badged SEND on
-/// `bootstrap_ep` for a soon-to-spawn child.
+/// Allocate a fresh bootstrap badge — a random `u64` from the kernel entropy
+/// pool, redrawn off the reserved `0` value (an unbadged SEND carries badge 0)
+/// — and mint a badged SEND on `bootstrap_ep` for a soon-to-spawn child. Every
+/// child that receives its bootstrap round on svcmgr's `bootstrap_ep` gets a
+/// distinct badge so svcmgr can correlate the round to the right service entry.
+/// Random rather than monotonic so the service-spawn count it would otherwise
+/// leak stays unguessable; svcmgr matches the round by exact badge value, never
+/// by index. Returns `None` if the entropy draw or cap derivation fails.
 pub fn mint_child_creator(bootstrap_ep: u32) -> Option<(u64, u32)>
 {
-    let badge = NEXT_BOOTSTRAP_BADGE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let mut badge = syscall::random_u64().ok()?;
+    while badge == 0
+    {
+        badge = syscall::random_u64().ok()?;
+    }
     let badged = syscall::cap_derive_badge(bootstrap_ep, syscall::RIGHTS_SEND, badge).ok()?;
     Some((badge, badged))
 }

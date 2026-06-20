@@ -58,7 +58,15 @@ use ipc::{IpcMessage, fs_labels, ns_labels};
 use namespace_protocol::{GateError, NamespaceRights, NodeId, NodeKind, gate, pack as pack_badge};
 use syscall_abi::{PAGE_SIZE, RIGHTS_MAP_READ};
 
-/// Monotonic counter for badge allocation. Starts at 1 (0 = unbadged).
+/// Monotonic counter for open-file slot identity. Starts at 1 (0 = unbadged).
+///
+/// Deliberately kept monotonic (not randomized like the cross-boundary
+/// service badges): this value is fat-internal — the eviction worker addresses
+/// a slot through `find_by_badge`, but the slot is reached on the cap-native
+/// path via `FatNode.open_slot`, so the badge never crosses an IPC boundary
+/// (see `file::OpenFile::badge`). With no external observer there is nothing to
+/// enumerate, so randomization would add an entropy syscall per open for no
+/// anti-enumeration benefit.
 static NEXT_BADGE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
 
 // ── Bootstrap ──────────────────────────────────────────────────────────────

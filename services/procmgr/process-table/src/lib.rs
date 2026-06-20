@@ -265,21 +265,28 @@ impl Default for ProcessTable
 
 /// Whether a candidate badge may be handed out as a process badge.
 ///
-/// A badge is rejected when its low 32 bits equal `reserved_low32` — the
-/// reserved death-EQ correlator (currently `INIT_REAP_CORRELATOR`). The
-/// death-EQ binding API takes a `u32` correlator while process badges are
-/// `u64`; without this guard the truncated correlator could match the
-/// reserved value at u32 wrap (~4.3B spawns) and the matching child's death
-/// would be silently absorbed by the init-reap branch in `dispatch_death`.
+/// The low 32 bits of a process badge serve double duty — the death-EQ
+/// correlator (the binding API takes a `u32`) and the logd source badge — so
+/// they must clear every reserved low-word value:
+/// - **below `min_low`** — the reserved log-badge range. `log_badges` reserves
+///   `0..LOG_BADGE_FIRST_CHILD` for system specials: the kernel's `0`
+///   "no correlator" death sentinel, init (`1`), procmgr (`2`), and `3..16`.
+///   A badge whose low word lands here would bind an unroutable death
+///   correlator or evict/contaminate a reserved logd slot — logd evicts every
+///   slot whose low word matches a death correlator.
+/// - **equal to `reserved_low32`** — the init-reap correlator
+///   (`INIT_REAP_CORRELATOR`), which `dispatch_death` routes to init teardown.
+///
+/// All are reachable under random badge minting; the old monotonic counter
+/// started at `LOG_BADGE_FIRST_CHILD` and so upheld the floor structurally.
 #[must_use]
-pub fn badge_is_acceptable(badge: u64, reserved_low32: u32) -> bool
+pub fn badge_is_acceptable(badge: u64, min_low: u64, reserved_low32: u32) -> bool
 {
     // The low-32 extraction is intentional: only the truncated u32 reaches
-    // the correlator-bearing death-EQ API, so only the low word can collide.
+    // the correlator-bearing death-EQ API and the logd badge.
     #[allow(clippy::cast_possible_truncation)]
-    {
-        (badge as u32) != reserved_low32
-    }
+    let low = badge as u32;
+    u64::from(low) >= min_low && low != reserved_low32
 }
 
 #[cfg(test)]
@@ -311,17 +318,30 @@ mod tests
     {
         // A bare match and a high-bits-set u64 whose low word equals the
         // sentinel must both be rejected — proving the `as u32` narrowing
-        // rather than a full-u64 compare.
-        assert!(!badge_is_acceptable(u64::from(u32::MAX), u32::MAX));
-        assert!(!badge_is_acceptable(0x0000_0005_FFFF_FFFF, u32::MAX));
+        // rather than a full-u64 compare. (Floor 16 = LOG_BADGE_FIRST_CHILD.)
+        assert!(!badge_is_acceptable(u64::from(u32::MAX), 16, u32::MAX));
+        assert!(!badge_is_acceptable(0x0000_0005_FFFF_FFFF, 16, u32::MAX));
     }
 
     #[test]
-    fn badge_is_accepted_when_low_32_bits_differ_from_reserved_correlator()
+    fn badge_is_rejected_when_low_word_below_floor()
     {
-        assert!(badge_is_acceptable(16, u32::MAX));
-        // High bits set, low word clear of the sentinel: still acceptable.
-        assert!(badge_is_acceptable(0x0000_0001_0000_0010, u32::MAX));
+        // The reserved log-badge / no-correlator range (low word 0..16) is
+        // rejected regardless of the high word, so every minted badge carries
+        // a routable correlator and never aliases a reserved logd slot.
+        assert!(!badge_is_acceptable(0, 16, u32::MAX));
+        assert!(!badge_is_acceptable(1, 16, u32::MAX));
+        assert!(!badge_is_acceptable(2, 16, u32::MAX));
+        assert!(!badge_is_acceptable(15, 16, u32::MAX));
+        assert!(!badge_is_acceptable(0x0000_0007_0000_000F, 16, u32::MAX));
+    }
+
+    #[test]
+    fn badge_is_accepted_when_low_word_clears_floor_and_correlator()
+    {
+        assert!(badge_is_acceptable(16, 16, u32::MAX));
+        // High bits set, low word clears the floor and the sentinel: accepted.
+        assert!(badge_is_acceptable(0x0000_0001_0000_0010, 16, u32::MAX));
     }
 
     #[test]

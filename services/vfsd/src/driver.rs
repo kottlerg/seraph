@@ -30,15 +30,10 @@
 //! fatfs is never handed the whole-disk cap and cannot escape the partition
 //! regardless of what sector number it computes.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-
 use ipc::{FS_LABELS_VERSION, IpcMessage, fs_labels, procmgr_labels};
 
 use crate::VfsdCaps;
 use crate::worker_pool::{BootstrapOrder, CreateFromFileOrder, WorkOrder, WorkerPool};
-
-/// Monotonic counter for fatfs-child bootstrap badges.
-static NEXT_BOOTSTRAP_BADGE: AtomicU64 = AtomicU64::new(1);
 
 /// Spawn a fatfs driver instance for a partition and return its `SEND_GRANT`
 /// service endpoint. `module_cap` is non-zero only for the root mount; pass
@@ -69,11 +64,17 @@ pub fn spawn_fatfs_driver(
     let driver_ep_for_child = syscall::cap_derive(driver_ep, syscall::RIGHTS_ALL).ok()?;
     let driver_send = syscall::cap_derive(driver_ep, syscall::RIGHTS_SEND_GRANT).ok()?;
 
-    // Allocate a bootstrap badge and a badged SEND on the worker-owned
-    // bootstrap endpoint. The child receives the badged cap as its
-    // `creator_endpoint` and uses it to fetch its caps via the bootstrap
-    // protocol; the bootstrap worker matches by badge.
-    let badge = NEXT_BOOTSTRAP_BADGE.fetch_add(1, Ordering::Relaxed);
+    // Allocate a bootstrap badge — a random `u64` from the kernel entropy pool,
+    // redrawn off the reserved `0` value (an unbadged SEND carries badge 0) — and
+    // a badged SEND on the worker-owned bootstrap endpoint. The child receives the
+    // badged cap as its `creator_endpoint` and uses it to fetch its caps via the
+    // bootstrap protocol; the bootstrap worker matches by badge value, not index,
+    // so a random badge keeps the fatfs-spawn count unguessable.
+    let mut badge = syscall::random_u64().ok()?;
+    while badge == 0
+    {
+        badge = syscall::random_u64().ok()?;
+    }
     let badged_creator =
         syscall::cap_derive_badge(caps.bootstrap_ep, syscall::RIGHTS_SEND, badge).ok()?;
     let bootstrap = BootstrapOrder {

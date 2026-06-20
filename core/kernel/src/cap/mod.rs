@@ -371,10 +371,12 @@ pub fn free_cspace_id(id: CSpaceId)
         entry.ptr.load(Ordering::Acquire).is_null(),
         "free_cspace_id called before unregister_cspace for id {id}"
     );
-    // Single logical writer to this entry's epoch in the free window — the id
-    // is on neither the free list nor a live registration — so a load-then-
-    // store needs no RMW. `lookup_cspace`'s Acquire double-load still rejects
-    // a concurrent reader because the stored value differs from the old one.
+    // Single logical writer to this entry's epoch in the free window: the
+    // caller (`dealloc_object` for `CSpaceObj`) has already run
+    // `unregister_cspace` and not yet returned the id to the free list, so the
+    // id is neither live nor recyclable elsewhere. A load-then-store therefore
+    // needs no RMW. `lookup_cspace`'s Acquire double-load still rejects a
+    // concurrent reader because the stored value differs from the old one.
     let cur = entry.epoch.load(Ordering::Acquire);
     let mut next = crate::entropy::next_u32();
     while next == 0 || next == cur

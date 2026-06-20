@@ -1,0 +1,16 @@
+[package]
+name = "crypto"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# no_std: vetted hash (SHA-512) and Ed25519 signature verification for the
+# boot/loader and service integrity paths. Pure core, no external deps.
+[lib]
+test = true
+doctest = false
+
+[dependencies]
+
+[lints]
+workspace = true

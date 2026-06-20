@@ -32,9 +32,13 @@
 //! - `fpu.rs`      — FPU / SIMD / V extended-state isolation across preemption and cross-CPU migration
 //! - `hw.rs`       — MMIO, IRQ, I/O ports, SBI
 //! - `sysinfo.rs`  — system info queries and debug log
+//! - `crypto.rs`   — shared `crypto` crate KATs (SHA-512, Ed25519 verify),
+//!   run on-target so the primitives are validated on both arches (not a
+//!   kernel syscall surface, but ktest is the only both-arch on-target harness)
 
 pub mod cap;
 pub mod cap_info;
+pub mod crypto;
 pub mod event;
 pub mod fpu;
 pub mod hw;
@@ -505,4 +509,8 @@ pub fn run_all(ctx: &TestContext)
     run_test!("sysinfo::elapsed_us", sysinfo::elapsed_us(ctx));
     run_test!("sysinfo::current_cpu", sysinfo::current_cpu(ctx));
     run_test!("sysinfo::cpu_count_smp", sysinfo::cpu_count_smp(ctx));
+
+    // ── Shared crypto primitives ──────────────────────────────────────────────
+    run_test!("crypto::sha512_kats", crypto::sha512_kats(ctx));
+    run_test!("crypto::ed25519_kats", crypto::ed25519_kats(ctx));
 }

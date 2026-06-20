@@ -133,52 +133,95 @@ pub unsafe fn write_msr(msr: u32, val: u64)
     }
 }
 
-// ── SMAP user-access bracket ──────────────────────────────────────────────────
+// ── User-copy primitive (fault-recoverable) ───────────────────────────────────
 
-/// Allow supervisor-mode access to user pages (sets AC flag via `stac`).
-///
-/// Must be paired with a matching `user_access_end` call. Nesting is not
-/// supported. Call immediately before reading/writing user memory, and call
-/// `user_access_end` immediately after.
-///
-/// # Safety
-/// Must execute at ring 0. Leaves AC set until `user_access_end` is called,
-/// so any faulting user-pointer dereference between the two calls will not
-/// produce a SMAP fault (but may still fault for other reasons).
-///
-/// # Compiler barrier
-/// `nomem` is intentionally absent so the compiler treats this as a memory
-/// operation. This prevents the compiler from reordering user-memory accesses
-/// (loads OR stores) to before the stac at opt-level ≥ 1. Mirrors Linux's
-/// `stac()` which uses an asm "memory" clobber for the same reason.
+// `copy_user` is the sole sanctioned path for kernel access to user memory. It
+// owns the SMAP access window (`stac`/`clac`) and is covered by the page-fault
+// handler's user-copy fixup: a fault on an unmapped or read-only user span
+// inside the copy redirects to `__copy_user_fixup` (which executes `clac` and
+// returns a non-zero sentinel) instead of panicking. See `crate::uaccess` for
+// the typed `copy_to_user`/`copy_from_user` wrappers and `idt::page_fault_handler`
+// for the fixup hook. The DF=0 ABI invariant makes `rep movsb` copy forward.
 #[cfg(not(test))]
-#[inline]
-pub unsafe fn user_access_begin()
-{
-    // SAFETY: stac sets AC in RFLAGS; safe at ring 0 when SMAP is enabled.
-    // nostack: stac does not modify RSP.
-    // (no nomem): acts as a compiler memory barrier — prevents the optimizer
-    // from hoisting user-memory accesses above this instruction.
-    unsafe {
-        core::arch::asm!("stac", options(nostack));
-    }
+core::arch::global_asm!(
+    ".section .text.copy_user, \"ax\"",
+    ".global __copy_user",
+    ".global __copy_user_fault_start",
+    ".global __copy_user_fault_end",
+    ".global __copy_user_fixup",
+    // fn __copy_user(dst: rdi, src: rsi, len: rdx) -> rax (0 = ok, 1 = faulted)
+    "__copy_user:",
+    "    stac",
+    "    mov rcx, rdx",
+    "__copy_user_fault_start:",
+    "    rep movsb",
+    "__copy_user_fault_end:",
+    "    clac",
+    "    xor eax, eax",
+    "    ret",
+    "__copy_user_fixup:",
+    "    clac",
+    "    mov eax, 1",
+    "    ret",
+);
+
+#[cfg(not(test))]
+unsafe extern "C" {
+    /// Raw user-copy routine (`dst=rdi, src=rsi, len=rdx`); returns 0 on success
+    /// or 1 if a fault on the user span was recovered.
+    fn __copy_user(dst: *mut u8, src: *const u8, len: usize) -> usize;
+    /// First byte of the faultable copy instruction.
+    static __copy_user_fault_start: u8;
+    /// First byte past the faultable copy instruction.
+    static __copy_user_fault_end: u8;
+    /// Recovery landing pad: closes the SMAP window and returns the fault sentinel.
+    static __copy_user_fixup: u8;
 }
 
-/// Revoke supervisor-mode access to user pages (clears AC flag via `clac`).
+/// Copy `len` bytes from `src` to `dst` across the SMAP window with fault
+/// recovery. Returns 0 on success, non-zero if a user-span fault was recovered.
 ///
 /// # Safety
-/// Must be called after a matching `user_access_begin`.
-///
-/// # Compiler barrier
-/// Like `user_access_begin`, `nomem` is absent to prevent the compiler from
-/// sinking user-memory accesses to after the clac.
+/// Must execute at ring 0 with SMAP enabled. The operands must be arranged so the
+/// user pointer is the only one that may fault; the non-user side must be valid
+/// for `len` bytes.
 #[cfg(not(test))]
 #[inline]
-pub unsafe fn user_access_end()
+pub unsafe fn copy_user(dst: *mut u8, src: *const u8, len: usize) -> usize
 {
-    // SAFETY: clac clears AC in RFLAGS; restores SMAP protection.
+    // SAFETY: forwarded to the asm routine; a fault on the user span is recovered
+    // by the page-fault handler via __copy_user_fixup.
+    unsafe { __copy_user(dst, src, len) }
+}
+
+/// Host-test stub: `stac`/`clac` are privileged and the test pointers never
+/// fault, so perform a plain copy and report success.
+#[cfg(test)]
+pub unsafe fn copy_user(dst: *mut u8, src: *const u8, len: usize) -> usize
+{
+    // SAFETY: caller guarantees src/dst valid for len bytes.
     unsafe {
-        core::arch::asm!("clac", options(nostack));
+        core::ptr::copy_nonoverlapping(src, dst, len);
+    }
+    0
+}
+
+/// If `pc` lies within `copy_user`'s faultable region, return the address of the
+/// recovery fixup; otherwise `None`. Consulted by the page-fault handler on a
+/// kernel-mode fault to convert an unmapped/read-only user access into an error
+/// return instead of a panic.
+#[cfg(not(test))]
+pub fn user_copy_fixup(pc: u64) -> Option<u64>
+{
+    let lo = core::ptr::addr_of!(__copy_user_fault_start) as u64;
+    let hi = core::ptr::addr_of!(__copy_user_fault_end) as u64;
+    if pc >= lo && pc < hi
+    {
+        Some(core::ptr::addr_of!(__copy_user_fixup) as u64)
+    }
+    else
+    {
+        None
     }
 }
 

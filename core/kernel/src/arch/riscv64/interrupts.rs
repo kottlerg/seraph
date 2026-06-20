@@ -628,6 +628,18 @@ extern "C" fn trap_dispatch(frame: &mut TrapFrame)
         }
         else
         {
+            // In-kernel user-copy fault recovery: an S-mode page fault (load=13,
+            // store=15, instruction=12) whose sepc lies in the `copy_user` faultable
+            // region is an unmapped or read-only user buffer. Redirect to the fixup
+            // — which clears SUM and returns an error sentinel — instead of
+            // panicking.
+            if matches!(cause_code, 12 | 13 | 15)
+                && let Some(fixup) = super::cpu::user_copy_fixup(frame.sepc)
+            {
+                frame.sepc = fixup;
+                return;
+            }
+
             crate::kprintln!(
                 "KERNEL EXCEPTION: cpu={} cause={} (scause={:#x})",
                 cpu,

@@ -24,6 +24,9 @@
 //! - `cap_info.rs` — read-only capability state inspection (`SYS_CAP_INFO`)
 //! - `retype.rs`   — retype primitive: aspace/cspace augment, PT budget, kernel PT pool
 //! - `mm.rs`       — memory map/unmap/protect, memory split, address space query
+//! - `entropy.rs`  — userspace randomness (`SYS_GETRANDOM`), incl. the user-copy
+//!   fault-recovery regression (unmapped or read-only buffer ⇒ `InvalidAddress`,
+//!   not panic)
 //! - `notification.rs`   — notification send and wait (blocking and timeout)
 //! - `event.rs`    — event queue post and receive (blocking, try, timeout)
 //! - `wait_set.rs` — wait set add, remove, wait
@@ -39,6 +42,7 @@
 pub mod cap;
 pub mod cap_info;
 pub mod crypto;
+pub mod entropy;
 pub mod event;
 pub mod fpu;
 pub mod hw;
@@ -509,6 +513,24 @@ pub fn run_all(ctx: &TestContext)
     run_test!("sysinfo::elapsed_us", sysinfo::elapsed_us(ctx));
     run_test!("sysinfo::current_cpu", sysinfo::current_cpu(ctx));
     run_test!("sysinfo::cpu_count_smp", sysinfo::cpu_count_smp(ctx));
+
+    // ── Entropy syscalls ──────────────────────────────────────────────────────
+    run_test!(
+        "entropy::getrandom_fills_buffer",
+        entropy::getrandom_fills_buffer(ctx)
+    );
+    run_test!(
+        "entropy::getrandom_unmapped_ptr_invalid_address",
+        entropy::getrandom_unmapped_ptr_invalid_address(ctx)
+    );
+    run_test!(
+        "entropy::getrandom_readonly_ptr_invalid_address",
+        entropy::getrandom_readonly_ptr_invalid_address(ctx)
+    );
+    run_test!(
+        "entropy::getrandom_over_max_len_invalid_arg",
+        entropy::getrandom_over_max_len_invalid_arg(ctx)
+    );
 
     // ── Shared crypto primitives ──────────────────────────────────────────────
     run_test!("crypto::sha512_kats", crypto::sha512_kats(ctx));

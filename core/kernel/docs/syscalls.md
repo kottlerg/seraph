@@ -152,32 +152,54 @@ return `UnknownSyscall`.
 All syscalls return one of these error codes on failure. The value is negative in
 `rax`/`a0`. Zero and positive values are success.
 
+**Authoritative source:** `abi/syscall/src/lib.rs` — the `SyscallError` enum there
+is the single source of truth. This block must match it exactly.
+
 ```rust
+/// Syscall error codes returned in `rax` / `a0` as negative `i64` values.
+///
+/// On success the return value is `>= 0`. On error it is one of these
+/// negative values. Userspace wrappers check `rax < 0` to detect errors.
 #[repr(i64)]
 pub enum SyscallError
 {
-    /// Capability descriptor does not refer to a valid capability.
-    InvalidCapability  = -1,
-    /// The capability does not have the required rights for this operation.
-    AccessDenied       = -2,
-    /// An argument value is out of range or otherwise invalid.
-    InvalidArgument    = -3,
-    /// A required memory allocation failed.
-    OutOfMemory        = -4,
-    /// The target endpoint has no receiver waiting (non-blocking variant only).
-    WouldBlock         = -5,
-    /// The event queue is full; the post was rejected.
-    QueueFull          = -13,
-    /// The referenced object is in a state that does not permit this operation.
-    InvalidState       = -7,
-    /// The syscall number is not recognised.
-    UnknownSyscall     = -8,
-    /// The operation was interrupted (e.g. thread stopped while blocked).
-    Interrupted        = -9,
-    /// A physical address or virtual address argument is not aligned or canonical.
-    AlignmentError     = -10,
-    /// The requested mapping would exceed the address space's limit.
-    AddressSpaceFull   = -11,
+    /// Syscall number is not valid.
+    UnknownSyscall = -1,
+    /// Capability slot index is out of range or slot is null.
+    InvalidCapability = -2,
+    /// Caller does not hold sufficient rights for this operation.
+    InsufficientRights = -3,
+    /// A pointer argument does not satisfy alignment or range requirements.
+    InvalidAddress = -4,
+    /// An integer argument is out of the valid range for this call.
+    InvalidArgument = -5,
+    /// The operation would block but the caller requested non-blocking mode.
+    WouldBlock = -6,
+    /// The target thread or object has already exited / been destroyed.
+    ObjectGone = -7,
+    /// No memory available to satisfy the request.
+    OutOfMemory = -8,
+    /// The operation is not supported on this object type.
+    NotSupported = -9,
+    /// The capability rights bitmask violates the W^X constraint.
+    WxViolation = -10,
+    /// The message is too large for the destination.
+    MsgTooLarge = -11,
+    /// Deadlock would occur (IPC cycle detected).
+    Deadlock = -12,
+    /// Event queue is full; post would be lost.
+    QueueFull = -13,
+    // -14 retired (`DmaUnsafe`, removed with `SYS_DMA_GRANT`); never reuse.
+    /// The target object is not in the required state for this operation
+    /// (e.g. thread not `Stopped` for `read_regs`/`write_regs`).
+    InvalidState = -15,
+    /// A blocking operation was cancelled because the thread was stopped.
+    /// The stopped thread sees this as the return value of its blocked syscall.
+    Interrupted = -16,
+    /// A per-object quota was reached (e.g. a `CSpace`'s `max_slots`).
+    /// Unlike `OutOfMemory`, donating memory (augment mode) cannot satisfy
+    /// the request.
+    QuotaExceeded = -17,
 }
 ```
 
@@ -220,7 +242,7 @@ IPC buffer page after the server replies.
 
 **Capability requirement:** `endpoint_cap` must have Send rights.
 
-**Errors:** `InvalidCapability`, `AccessDenied`, `InvalidArgument` (bad count,
+**Errors:** `InvalidCapability`, `InsufficientRights`, `InvalidArgument` (bad count,
 or extended payload requested but IPC buffer page not registered or unmapped),
 `Interrupted`.
 
@@ -253,7 +275,9 @@ written to the original caller's IPC buffer page.
 
 **Capability requirement:** Implicit reply capability from `current_tcb.reply_cap_slot`.
 
-**Errors:** `InvalidCapability` (no pending reply), `InvalidArgument`, `Interrupted`.
+**Errors:** `InvalidCapability` (no pending reply), `InvalidArgument`, `QuotaExceeded`
+(caller's CSpace at slot quota for reply cap transfer), `OutOfMemory` (slot-page pool
+exhausted), `Interrupted`.
 
 ---
 
@@ -283,7 +307,9 @@ The badge is the value attached to the sender's endpoint capability via
 
 **Capability requirement:** `endpoint_cap` must have Receive rights.
 
-**Errors:** `InvalidCapability`, `AccessDenied`, `Interrupted`.
+**Errors:** `InvalidCapability`, `InsufficientRights`, `QuotaExceeded` (server's CSpace
+at slot quota for an incoming cap transfer), `OutOfMemory` (slot-page pool exhausted),
+`Interrupted`.
 
 ---
 
@@ -302,7 +328,7 @@ OR bits into a notification object. Non-blocking; wakes the waiter if one is pre
 
 **Capability requirement:** `notification_cap` must have Notification rights.
 
-**Errors:** `InvalidCapability`, `AccessDenied`, `InvalidArgument` (bits == 0).
+**Errors:** `InvalidCapability`, `InsufficientRights`, `InvalidArgument` (bits == 0).
 
 ---
 
@@ -332,7 +358,7 @@ full 64-bit bitmask range is usable.
 
 **Capability requirement:** `notification_cap` must have Wait rights.
 
-**Errors:** `InvalidCapability`, `AccessDenied`, `Interrupted`.
+**Errors:** `InvalidCapability`, `InsufficientRights`, `Interrupted`.
 
 ---
 
@@ -351,7 +377,7 @@ Append one entry to an event queue. Non-blocking; returns `QueueFull` if at capa
 
 **Capability requirement:** `queue_cap` must have Post rights.
 
-**Errors:** `InvalidCapability`, `AccessDenied`, `QueueFull`.
+**Errors:** `InvalidCapability`, `InsufficientRights`, `QueueFull`.
 
 ---
 
@@ -381,7 +407,7 @@ Dequeue the next entry from an event queue with optional bounded wait.
 
 **Capability requirement:** `queue_cap` must have Recv rights.
 
-**Errors:** `InvalidCapability`, `AccessDenied`, `WouldBlock`, `Interrupted`.
+**Errors:** `InvalidCapability`, `InsufficientRights`, `WouldBlock`, `Interrupted`.
 
 `WouldBlock` covers both the try-once-empty case and the timer-fired case;
 the caller already knows which mode it asked for. The kernel uses an
@@ -413,101 +439,151 @@ Format.
 
 ### `SYS_CAP_CREATE_ENDPOINT` (7)
 
-Create a new IPC endpoint. Returns a capability with Send + Receive + Grant rights.
+Retype a Memory capability into a new IPC endpoint. Returns a capability with
+Send + Receive + Grant rights.
 
-**Arguments:** None (no arguments required).
+**Arguments:**
+
+| # | Name | Description |
+|---|---|---|
+| 0 | `memory_cap` | Memory capability (Retype rights) the endpoint object is carved from |
 
 **Return:**
 
 - `rax`/`a0`: new capability descriptor on success (positive); `SyscallError` on failure
 
-**Errors:** `OutOfMemory` (cannot allocate endpoint object or CSpace slot).
+**Capability requirement:** `memory_cap` must have Retype rights.
+
+**Errors:** `InvalidCapability`, `InsufficientRights` (source Memory cap lacks Retype),
+`OutOfMemory` (Memory cap region or slot-page pool exhausted), `QuotaExceeded`
+(caller's CSpace at slot quota).
 
 ---
 
 ### `SYS_CAP_CREATE_NOTIFICATION` (8)
 
-Create a new notification object. Returns a capability with Notification + Wait rights.
+Retype a Memory capability into a new notification object. Returns a capability with
+Notification + Wait rights.
 
-**Arguments:** None.
+**Arguments:**
+
+| # | Name | Description |
+|---|---|---|
+| 0 | `memory_cap` | Memory capability (Retype rights) the notification object is carved from |
 
 **Return:** `rax`/`a0`: new capability descriptor on success; `SyscallError` on failure.
 
-**Errors:** `OutOfMemory`.
+**Capability requirement:** `memory_cap` must have Retype rights.
+
+**Errors:** `InvalidCapability`, `InsufficientRights` (source Memory cap lacks Retype),
+`OutOfMemory` (Memory cap region or slot-page pool exhausted), `QuotaExceeded`
+(caller's CSpace at slot quota).
 
 ---
 
 ### `SYS_CAP_CREATE_EVENT_QUEUE` (9)
 
-Create a new event queue with a fixed capacity.
+Retype a Memory capability into a new event queue with a fixed capacity.
 
 **Arguments:**
 
 | # | Name | Description |
 |---|---|---|
-| 0 | `capacity` | Ring buffer capacity in entries (1–EVENT_QUEUE_MAX_CAPACITY) |
+| 0 | `memory_cap` | Memory capability (Retype rights) the event queue is carved from |
+| 1 | `capacity` | Ring buffer capacity in entries (1–EVENT_QUEUE_MAX_CAPACITY) |
 
 **Return:** `rax`/`a0`: new capability descriptor (Post + Recv rights) on success;
 `SyscallError` on failure.
 
-**Errors:** `OutOfMemory`, `InvalidArgument` (capacity 0 or exceeds maximum).
+**Capability requirement:** `memory_cap` must have Retype rights.
+
+**Errors:** `InvalidArgument` (capacity 0 or exceeds maximum), `InvalidCapability`,
+`InsufficientRights` (source Memory cap lacks Retype), `OutOfMemory` (Memory cap region
+or slot-page pool exhausted), `QuotaExceeded` (caller's CSpace at slot quota).
 
 ---
 
 ### `SYS_CAP_CREATE_THREAD` (10)
 
-Create a new thread in an existing address space.
+Retype a Memory capability into a new thread bound to an existing address space and
+CSpace.
 
 **Arguments:**
 
 | # | Name | Description |
 |---|---|---|
-| 0 | `aspace_cap` | Address space capability (Map rights) for the new thread |
-| 1 | `entry` | Virtual address of the thread entry point |
-| 2 | `stack_top` | Initial stack pointer |
-| 3 | `arg` | Value passed in first argument register |
+| 0 | `memory_cap` | Memory capability (Retype rights); supplies the thread's kernel stack, TCB, and FPU save area |
+| 1 | `aspace_cap` | Address space capability (Map rights) the thread executes in |
+| 2 | `cspace_cap` | CSpace capability (Insert rights) the thread is bound to |
 
-**Return:** `rax`/`a0`: new thread capability (Control rights) on success;
+**Return:** `rax`/`a0`: new thread capability (Control + Observe rights) on success;
 `SyscallError` on failure.
 
 The thread is created in the `Created` state; it does not begin execution until
-`SYS_THREAD_START` is called. Creation takes no priority argument — the thread
-starts at the default priority (`INIT_PRIORITY`) and is re-prioritised, if
-needed, via `SYS_THREAD_SET_PRIORITY` (which requires a `SchedControl` cap).
+`SYS_THREAD_START` is called. The entry point, stack pointer, argument register, and
+TLS base are not set here — they are supplied by `SYS_THREAD_CONFIGURE` before start.
+Creation takes no priority argument — the thread starts at the default priority
+(`INIT_PRIORITY`) and is re-prioritised, if needed, via `SYS_THREAD_SET_PRIORITY`
+(which requires a `SchedControl` cap).
 
-**Capability requirement:** `aspace_cap` must have Map rights. Map is intentionally
-reused here: a process that can modify an address space's mappings is inherently
-trusted to create threads that execute within it.
+**Capability requirements:** `memory_cap` (Retype), `aspace_cap` (Map), `cspace_cap`
+(Insert). Map is intentionally reused for `aspace_cap`: a process that can modify an
+address space's mappings is inherently trusted to create threads that execute within it.
 
-**Errors:** `InvalidCapability`, `AccessDenied`, `InvalidArgument` (bad entry, stack,
-or priority), `OutOfMemory`.
+**Errors:** `InvalidCapability`, `InsufficientRights` (a source cap lacks Retype/Map/Insert
+respectively), `OutOfMemory` (Memory cap region or slot-page pool exhausted),
+`QuotaExceeded` (caller's CSpace at slot quota).
 
 ---
 
 ### `SYS_CAP_CREATE_ADDRESS_SPACE` (11)
 
-Create a new, empty address space. The kernel's higher-half mapping is shared into
-the new address space automatically.
+Retype a Memory capability into a new, empty address space (create-mode), or donate
+carved pages to an existing address space's page-table growth pool (augment-mode). The
+kernel's higher-half mapping is shared into a newly created address space automatically.
 
-**Arguments:** None.
+**Arguments:**
 
-**Return:** `rax`/`a0`: new address space capability (Map + Read rights) on success;
-`SyscallError` on failure.
+| # | Name | Description |
+|---|---|---|
+| 0 | `memory_cap` | Memory capability (Retype rights) the address space slab is carved from |
+| 1 | `augment_cap` | `0` for create-mode; otherwise an AddressSpace cap (Map rights) whose PT growth pool receives the carved pages |
+| 2 | `init_pages` | Pages to carve (create-mode requires `>= 2`: wrapper + root PT, remainder seed the PT growth pool) |
 
-**Errors:** `OutOfMemory`.
+**Return:** `rax`/`a0`: create-mode — new address space capability (Map + Read + Control
+rights); augment-mode — `0`. `SyscallError` on failure.
+
+`Control` lets the creator register terminal-fault death observers via
+`SYS_ASPACE_BIND_NOTIFICATION`; copies handed to other components drop it via the
+`SYS_CAP_DERIVE` rights mask.
+
+**Capability requirements:** `memory_cap` (Retype); in augment-mode, `augment_cap` (Map).
+
+**Errors:** `InvalidArgument` (`init_pages` 0, overflow, or create-mode `init_pages < 2`),
+`InvalidCapability`, `InsufficientRights` (source Memory cap lacks Retype, or augment
+target lacks Map), `OutOfMemory` (Memory cap region or slot-page pool exhausted),
+`QuotaExceeded` (caller's CSpace at slot quota).
 
 ---
 
 ### `SYS_CAP_CREATE_WAIT_SET` (13)
 
-Create a new wait set.
+Retype a Memory capability into a new wait set.
 
-**Arguments:** None.
+**Arguments:**
+
+| # | Name | Description |
+|---|---|---|
+| 0 | `memory_cap` | Memory capability (Retype rights) the wait set is carved from |
 
 **Return:** `rax`/`a0`: new wait set capability (Modify + Wait rights) on success;
 `SyscallError` on failure.
 
-**Errors:** `OutOfMemory`.
+**Capability requirement:** `memory_cap` must have Retype rights.
+
+**Errors:** `InvalidCapability`, `InsufficientRights` (source Memory cap lacks Retype),
+`OutOfMemory` (Memory cap region or slot-page pool exhausted), `QuotaExceeded`
+(caller's CSpace at slot quota).
 
 ---
 
@@ -520,15 +596,17 @@ Derive a new capability from an existing one, with equal or fewer rights.
 | # | Name | Description |
 |---|---|---|
 | 0 | `source_cap` | Source capability descriptor |
-| 1 | `rights_mask` | Rights bitmask for the derived capability (subset of source) |
+| 1 | `rights_mask` | Rights bitmask for the derived capability |
 
 **Return:** `rax`/`a0`: new capability descriptor on success; `SyscallError` on failure.
 
-The derived capability references the same kernel object. The derivation is recorded
-in the global derivation tree for revocation tracking.
+The derived capability references the same kernel object. The effective rights are
+`rights_mask & source_rights` — bits requested beyond what the source holds are
+silently masked off rather than rejected, so derivation can only attenuate. The
+derivation is recorded in the global derivation tree for revocation tracking.
 
-**Errors:** `InvalidCapability` (source invalid or null), `AccessDenied` (requested
-rights exceed those held in source), `OutOfMemory` (no free CSpace slot).
+**Errors:** `InvalidCapability` (source invalid or null), `OutOfMemory` (slot-page pool
+exhausted), `QuotaExceeded` (caller's CSpace at slot quota).
 
 If the source capability has a non-zero badge, the derived capability inherits it.
 
@@ -560,8 +638,9 @@ The source capability must have `badge == 0`. Re-badging (setting a new badge
 on an already-badged cap) returns `InvalidArgument`. Derivation via
 `SYS_CAP_DERIVE` inherits the source's badge.
 
-**Errors:** `InvalidCapability`, `InvalidArgument` (badge is zero or source
-already badged), `OutOfMemory`.
+**Errors:** `InvalidArgument` (badge is zero or source already badged),
+`InvalidCapability`, `OutOfMemory` (slot-page pool exhausted), `QuotaExceeded`
+(caller's CSpace at slot quota).
 
 ---
 
@@ -609,6 +688,30 @@ cap, per above).
 
 ---
 
+### `SYS_CAP_INFO` (36)
+
+Read a single scalar field of a capability (or a system-wide diagnostic counter),
+selected by a field code. Read-only inquiry.
+
+**Arguments:**
+
+| # | Name | Description |
+|---|---|---|
+| 0 | `cap` | Capability handle to inspect |
+| 1 | `field` | Field selector (`CAP_INFO_*` constant) |
+
+**Return:** `rax`/`a0`: the requested field value on success; `SyscallError` on failure.
+Some fields pack two values into the word — e.g. `TAG_RIGHTS` returns `(tag << 32) |
+rights`, and `THREAD_STATE` returns `(state << 32) | (exit_reason & 0xFFFFFFFF)`.
+
+**Capability requirement:** None — `cap_info` reads the slot without a rights check.
+
+**Errors:** `InvalidCapability` (null/stale handle, empty slot, or a referenced target
+object is gone), `InvalidArgument` (field requires a different capability type, or the
+selector is unknown).
+
+---
+
 ## Memory Syscalls
 
 ### `SYS_MEM_MAP` (16)
@@ -638,10 +741,11 @@ This fails with `WxViolation` if the memory cap has both WRITE and EXECUTE right
 
 **Capability requirements:** `memory_cap` (Map), `aspace_cap` (Map).
 
-**Errors:** `InvalidCapability`, `InsufficientRights` (requested prot exceeds cap
-rights), `WxViolation` (both WRITE and EXECUTE requested), `InvalidArgument`
-(unaligned `virt`, non-canonical address, zero page count, or offset beyond frame),
-`OutOfMemory` (page table allocation failure).
+**Errors:** `InvalidAddress` (unaligned `virt`, non-canonical address, or mapping
+range leaves the user half), `InvalidArgument` (zero page count, size/offset overflow,
+or offset beyond frame), `InvalidCapability`, `InsufficientRights` (requested prot
+exceeds cap rights), `WxViolation` (both WRITE and EXECUTE requested), `OutOfMemory`
+(page table allocation failure).
 
 ---
 
@@ -654,7 +758,9 @@ Remove a mapping from an address space.
 | # | Name | Description |
 |---|---|---|
 | 0 | `aspace_cap` | Address space capability (Map rights) |
-| 1 | `virt` | Virtual address to unmap (page-aligned) |
+| 1 | `virt` | Virtual address to unmap (page-aligned, user range) |
+| 2 | `page_count` | Number of pages to unmap (nonzero) |
+| 3 | `flags` | Bit `MEM_UNMAP_RECLAIM_PTS`: tear down the whole span and reclaim now-empty intermediate page tables with a single coarse shootdown |
 
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
 
@@ -664,33 +770,39 @@ threads in `aspace_cap`.
 
 **Capability requirement:** `aspace_cap` must have Map rights.
 
-**Errors:** `InvalidCapability`, `AccessDenied`, `InvalidArgument` (address not
-mapped or unaligned).
+**Errors:** `InvalidAddress` (unaligned `virt`, or range leaves the user half),
+`InvalidArgument` (zero page count or size/range overflow), `InvalidCapability`,
+`InsufficientRights` (cap lacks Map).
 
 ---
 
 ### `SYS_MEM_PROTECT` (18)
 
-Change the permission flags on an existing mapping without altering the physical address.
+Change the permission flags on an existing range of mappings without altering the
+physical addresses.
 
 **Arguments:**
 
 | # | Name | Description |
 |---|---|---|
-| 0 | `aspace_cap` | Address space capability (Map rights) |
-| 1 | `virt` | Virtual address of the mapping (page-aligned) |
-| 2 | `flags` | New permission flags |
+| 0 | `memory_cap` | Memory capability (Map rights) authorising the requested permission level |
+| 1 | `aspace_cap` | Address space capability (Map rights) |
+| 2 | `virt` | Virtual address of the mapping (page-aligned, user range) |
+| 3 | `page_count` | Number of pages to reprotect (nonzero) |
+| 4 | `prot_bits` | New protection bits: bit 1 = WRITE, bit 2 = EXECUTE |
 
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
 
-W^X is enforced on the new flags. The caller cannot grant rights beyond what the
-memory capability allows (but the memory capability is not re-checked here — the kernel
-records the maximum rights at map time).
+W^X is enforced on the new flags. The requested permissions must be a subset of the
+`memory_cap`'s rights, which are re-checked here.
 
-**Capability requirement:** `aspace_cap` must have Map rights.
+**Capability requirements:** `memory_cap` (Map), `aspace_cap` (Map).
 
-**Errors:** `InvalidCapability`, `AccessDenied` (W^X violation or rights exceed
-initial mapping rights), `InvalidArgument` (address not mapped).
+**Errors:** `InvalidAddress` (unaligned `virt`, range leaves the user half, or a page
+in the range is not mapped), `InvalidArgument` (zero page count, size/range overflow,
+or no free frame during the page-table walk), `WxViolation` (both WRITE and EXECUTE
+requested), `InvalidCapability`, `InsufficientRights` (requested perms exceed
+`memory_cap` rights).
 
 ---
 
@@ -720,8 +832,9 @@ original's position.
 
 `offset_pages` MUST be in the range [1, frame_size_pages − 1].
 
-**Errors:** `InvalidCapability`, `InvalidArgument` (offset out of range or frame
-is already a single page), `OutOfMemory` (no free CSpace slot for second cap).
+**Errors:** `InvalidArgument` (offset out of range or frame is already a single page),
+`InvalidCapability`, `InsufficientRights` (cap lacks Map), `OutOfMemory` (child
+allocation or slot-page pool exhausted), `QuotaExceeded` (caller's CSpace at slot quota).
 
 ---
 
@@ -747,9 +860,68 @@ regardless of the flags value; callers MUST NOT set both writable and executable
 
 **Capability requirements:** `aspace_cap` (Map), `mmio_cap` (Map).
 
-**Errors:** `InvalidCapability`, `AccessDenied`, `InvalidArgument` (unaligned
-`virt`, W^X violation, or non-canonical address), `AlignmentError`,
-`AddressSpaceFull`.
+**Errors:** `InvalidAddress` (unaligned or non-canonical `virt`, or range leaves the
+user half), `InvalidCapability`, `InsufficientRights` (a cap lacks Map), `InvalidArgument`
+(MMIO region size zero or not page-aligned, or size overflow), `OutOfMemory` (page table
+allocation failure).
+
+---
+
+### `SYS_MMIO_SPLIT` (45)
+
+Split an MMIO region capability into two non-overlapping child capabilities at a
+page-aligned byte offset. The original capability is consumed.
+
+**Arguments:**
+
+| # | Name | Description |
+|---|---|---|
+| 0 | `mmio_cap` | MMIO region capability to split (Map rights) |
+| 1 | `split_offset` | Page-aligned byte offset to split at; `0 < split_offset < size`, with at least one page on each side |
+
+**Return:**
+
+- `rax`/`a0`: capability descriptor for the lower region `[base, base+split_offset)` on
+  success; `SyscallError` on failure
+- `rdx`/`a1`: capability descriptor for the upper region `[base+split_offset, end)` on
+  success
+
+Both children inherit the original's rights and flags and are reparented to the
+original's derivation parent. The original `mmio_cap` is consumed.
+
+**Capability requirement:** `mmio_cap` must have Map rights.
+
+**Errors:** `InvalidArgument` (`split_offset` not page-aligned, zero, `>= size`, or
+fewer than one page on the upper side), `InvalidCapability`, `InsufficientRights` (cap
+lacks Map), `OutOfMemory` (child allocation or slot-page pool exhausted), `QuotaExceeded`
+(caller's CSpace at slot quota).
+
+---
+
+### `SYS_MEMORY_MERGE` (50)
+
+Absorb a virgin, physically-adjacent tail Memory capability back into its parent — the
+inverse of `SYS_MEMORY_SPLIT`. The parent's size grows to cover both ranges; the tail
+capability is consumed and its slot freed.
+
+**Arguments:**
+
+| # | Name | Description |
+|---|---|---|
+| 0 | `parent_cap` | Parent (physically-lower) Memory capability (Map rights); remains valid with grown size |
+| 1 | `tail_cap` | Tail (physically-upper) Memory capability (Map rights); consumed |
+
+**Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
+
+The two capabilities must be derivation siblings with identical rights, be physically
+contiguous (`parent.base + parent.size == tail.base`), and the tail must be virgin
+(never retyped or sub-allocated). Neither may have derivation children.
+
+**Capability requirements:** `parent_cap` (Map), `tail_cap` (Map); rights must match.
+
+**Errors:** `InvalidArgument` (same slot/object, rights mismatch, not contiguous, tail
+not virgin, not siblings, or either has children), `InvalidCapability`,
+`InsufficientRights` (either cap lacks Map).
 
 ---
 
@@ -769,8 +941,8 @@ Transition a thread from `Created` state to `Ready` and enqueue it for schedulin
 
 **Capability requirement:** `thread_cap` must have Control rights.
 
-**Errors:** `InvalidCapability`, `AccessDenied`, `InvalidState` (thread not in
-Created state).
+**Errors:** `InvalidCapability`, `InsufficientRights` (cap lacks Control),
+`InvalidArgument` (thread not in Created/Stopped state, or not yet configured).
 
 ---
 
@@ -792,8 +964,8 @@ inter-processor interrupt is sent to force it out of userspace.
 
 **Capability requirement:** `thread_cap` must have Control rights.
 
-**Errors:** `InvalidCapability`, `AccessDenied`, `InvalidState` (thread already stopped
-or exited).
+**Errors:** `InvalidCapability`, `InsufficientRights` (cap lacks Control),
+`InvalidState` (thread already stopped or exited).
 
 ---
 
@@ -807,6 +979,8 @@ Voluntarily yield the remainder of the current thread's time slice.
 
 The calling thread remains `Ready` and is re-enqueued at its current priority. No
 capability is required — this syscall acts on the calling thread implicitly.
+
+**Errors:** None (this syscall cannot fail).
 
 ---
 
@@ -897,8 +1071,10 @@ bands. Mirrors the range-split shape of `SYS_IRQ_SPLIT` / `SYS_MMIO_SPLIT` /
 | 0 | `sched_cap` | `SchedControl` capability to split |
 | 1 | `split_at` | Lowest priority level of the upper child; must satisfy `min < split_at <= max` on the cap being split |
 
-**Return:** `rax`/`a0`: packed `lower_slot | (upper_slot << 32)` on success;
-`SyscallError` on failure.
+**Return:**
+
+- `rax`/`a0`: lower-child capability descriptor on success; `SyscallError` on failure
+- `rdx`/`a1`: upper-child capability descriptor on success
 
 The lower child covers `[min, split_at - 1]`, the upper child `[split_at, max]`.
 The original cap is consumed; both children are reparented to the original's
@@ -909,8 +1085,8 @@ narrow a band — `SYS_CAP_DERIVE` attenuates rights and cannot shrink a range.
 no rights bit).
 
 **Errors:** `InvalidCapability` (not a `SchedControl`), `InvalidArgument`
-(`split_at` outside `(min, max]`), `OutOfMemory` (child allocation or slot
-insertion failed).
+(`split_at` outside `(min, max]`), `OutOfMemory` (child allocation or slot-page pool
+exhausted), `QuotaExceeded` (caller's CSpace at slot quota).
 
 ---
 
@@ -944,8 +1120,8 @@ If `cpu_id` names an offline CPU, the call fails with `InvalidArgument`.
 
 **Capability requirement:** `thread_cap` MUST have Control rights.
 
-**Errors:** `InvalidCapability`, `AccessDenied`, `InvalidArgument` (CPU offline or
-out of range).
+**Errors:** `InvalidCapability`, `InsufficientRights` (cap lacks Control),
+`InvalidArgument` (CPU offline or out of range).
 
 ---
 
@@ -972,8 +1148,9 @@ size, the call fails with `InvalidArgument`.
 
 **Capability requirement:** `thread_cap` MUST have Observe rights.
 
-**Errors:** `InvalidCapability`, `AccessDenied`, `InvalidState` (thread neither
-stopped nor fault-blocked), `InvalidArgument` (buffer too small or invalid pointer).
+**Errors:** `InvalidCapability`, `InsufficientRights` (cap lacks Observe), `InvalidState`
+(thread neither stopped nor fault-blocked), `InvalidArgument` (buffer too small or
+invalid pointer).
 
 ---
 
@@ -1000,9 +1177,9 @@ range; privilege bits cannot be set).
 
 **Capability requirement:** `thread_cap` MUST have Control rights.
 
-**Errors:** `InvalidCapability`, `AccessDenied`, `InvalidState` (thread neither
-stopped nor fault-blocked), `InvalidArgument` (buffer wrong size, invalid pointer,
-or illegal register values).
+**Errors:** `InvalidCapability`, `InsufficientRights` (cap lacks Control), `InvalidState`
+(thread neither stopped nor fault-blocked), `InvalidArgument` (buffer wrong size, invalid
+pointer, or illegal register values).
 
 ---
 
@@ -1046,6 +1223,48 @@ fault-handling design doc's implementation-status note.
 
 ---
 
+### `SYS_THREAD_SLEEP` (46)
+
+Block the calling thread for a bounded duration. The timer wakes it at the deadline.
+
+**Arguments:**
+
+| # | Name | Description |
+|---|---|---|
+| 0 | `ms` | Sleep duration in milliseconds; `0` returns immediately |
+
+**Return:** `rax`/`a0`: 0 on wake; `SyscallError` on failure.
+
+No capability is required — this syscall acts on the calling thread implicitly.
+
+**Errors:** `InvalidCapability` (no current thread), `OutOfMemory` (kernel sleep list at
+capacity), `Interrupted` (the thread was stopped before or during the sleep).
+
+---
+
+### `SYS_THREAD_BIND_NOTIFICATION` (47)
+
+Register a death observer on a thread. When the target exits or faults terminally, the
+kernel posts `(correlator << 32) | (exit_reason & 0xFFFFFFFF)` to the bound event queue.
+
+**Arguments:**
+
+| # | Name | Description |
+|---|---|---|
+| 0 | `thread_cap` | Thread capability (Control rights) to observe |
+| 1 | `eventq_cap` | Event queue capability (Post rights) the death notification is posted to |
+| 2 | `correlator` | Caller-chosen `u32` routing tag (`0` makes the payload equal the exit reason) |
+
+**Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure. If the target has
+already exited, the retained reason is delivered immediately and the call still returns 0.
+
+**Capability requirements:** `thread_cap` (Control), `eventq_cap` (Post).
+
+**Errors:** `InvalidCapability`, `InsufficientRights` (thread lacks Control or event
+queue lacks Post), `OutOfMemory` (target's observer array is full).
+
+---
+
 ## Wait Set Syscalls
 
 ### `SYS_WAIT_SET_ADD` (26)
@@ -1068,7 +1287,8 @@ The `badge` is chosen by the caller to identify the source in a subsequent
 **Capability requirements:** `wait_set_cap` (Modify), `source_cap` (at least one of
 Receive/Wait/Recv rights on the source).
 
-**Errors:** `InvalidCapability`, `AccessDenied`, `OutOfMemory`.
+**Errors:** `InvalidCapability`, `InsufficientRights` (wait set lacks Modify, or source
+lacks Receive/Wait/Recv), `InvalidArgument` (wait set full, or source already in a wait set).
 
 ---
 
@@ -1087,8 +1307,8 @@ Remove a previously added source from a wait set.
 
 **Capability requirements:** `wait_set_cap` (Modify).
 
-**Errors:** `InvalidCapability`, `AccessDenied`, `InvalidArgument` (source not in
-this wait set).
+**Errors:** `InvalidCapability` (bad cap, or source not in this wait set),
+`InsufficientRights` (wait set lacks Modify).
 
 ---
 
@@ -1112,7 +1332,7 @@ are ready simultaneously, subsequent calls return them without blocking.
 
 **Capability requirement:** `wait_set_cap` must have Wait rights.
 
-**Errors:** `InvalidCapability`, `AccessDenied`, `Interrupted`.
+**Errors:** `InvalidCapability`, `InsufficientRights` (cap lacks Wait), `Interrupted`.
 
 ---
 
@@ -1139,7 +1359,8 @@ prior interrupt delivery has no effect.
 **Capability requirement:** `irq_cap` MUST be a valid interrupt capability for the
 specific line.
 
-**Errors:** `InvalidCapability`, `AccessDenied`.
+**Errors:** `InvalidCapability`, `InsufficientRights` (cap lacks Notify),
+`InvalidArgument` (cap covers more than one line).
 
 ---
 
@@ -1165,7 +1386,8 @@ delivering the notification; the driver MUST call `SYS_IRQ_ACK` to re-enable it.
 **Capability requirements:** `irq_cap` (valid interrupt capability), `notification_cap`
 (Notification rights).
 
-**Errors:** `InvalidCapability`, `AccessDenied`.
+**Errors:** `InvalidCapability`, `InsufficientRights` (a cap lacks Notify),
+`InvalidArgument` (IRQ cap covers more than one line).
 
 ---
 
@@ -1192,7 +1414,71 @@ been bound to; access is always revocable.
 
 **Capability requirements:** `thread_cap` (Control rights), `ioport_cap` (Use rights).
 
-**Errors:** `InvalidCapability`, `AccessDenied`, `UnknownSyscall` (RISC-V).
+**Errors:** `NotSupported` (RISC-V — no I/O ports), `InvalidCapability`,
+`InsufficientRights` (a cap lacks Control/Use), `OutOfMemory` (IOPB allocation from SEED).
+
+---
+
+### `SYS_IRQ_SPLIT` (49)
+
+Split an interrupt range capability into two non-overlapping child capabilities at an
+IRQ id. The original capability is consumed.
+
+**Arguments:**
+
+| # | Name | Description |
+|---|---|---|
+| 0 | `irq_cap` | Interrupt range capability to split (Notify rights) |
+| 1 | `split_at` | IRQ id to split at; `start < split_at < start + count` |
+
+**Return:**
+
+- `rax`/`a0`: capability descriptor for the lower range `[start, split_at)` on success;
+  `SyscallError` on failure
+- `rdx`/`a1`: capability descriptor for the upper range `[split_at, start+count)` on
+  success
+
+Both children inherit the original's rights and are reparented to the original's
+derivation parent. The original `irq_cap` is consumed.
+
+**Capability requirement:** `irq_cap` must have Notify rights.
+
+**Errors:** `InvalidArgument` (`split_at` outside `(start, start+count)`),
+`InvalidCapability`, `InsufficientRights` (cap lacks Notify), `OutOfMemory` (child
+allocation or slot-page pool exhausted), `QuotaExceeded` (caller's CSpace at slot quota).
+
+---
+
+### `SYS_IOPORT_SPLIT` (51)
+
+Split an IoPort capability into two non-overlapping child capabilities at a port number.
+The original capability is consumed.
+
+**x86-64 only.** On RISC-V this syscall returns `NotSupported`.
+
+**Arguments:**
+
+| # | Name | Description |
+|---|---|---|
+| 0 | `ioport_cap` | IoPort capability to split (Use rights) |
+| 1 | `split_at` | Port number to split at; `1 <= split_at <= 0xFFFF` and `base < split_at < base + size` |
+
+**Return:**
+
+- `rax`/`a0`: capability descriptor for the lower range `[base, split_at)` on success;
+  `SyscallError` on failure
+- `rdx`/`a1`: capability descriptor for the upper range `[split_at, base+size)` on
+  success
+
+Both children inherit the original's rights and are reparented to the original's
+derivation parent. The original `ioport_cap` is consumed.
+
+**Capability requirement:** `ioport_cap` must have Use rights.
+
+**Errors:** `NotSupported` (RISC-V — no I/O ports), `InvalidArgument` (`split_at` 0,
+`> 0xFFFF`, or outside `(base, base+size)`), `InvalidCapability`, `InsufficientRights`
+(cap lacks Use), `OutOfMemory` (child allocation or slot-page pool exhausted),
+`QuotaExceeded` (caller's CSpace at slot quota).
 
 ---
 
@@ -1200,45 +1486,56 @@ been bound to; access is always revocable.
 
 ### `SYS_THREAD_CONFIGURE` (23)
 
-Bind a thread to an AddressSpace, CSpace, and IPC buffer. Must be called before
-`SYS_THREAD_START`. Replaces the previous bindings if called on a stopped thread.
+Set the entry point, initial stack pointer, first-argument register, and TLS base for
+a thread in the `Created` state. Must be called after `SYS_CAP_CREATE_THREAD` (which
+binds the thread's address space and CSpace) and before `SYS_THREAD_START`.
 
 **Arguments:**
 
 | # | Name | Description |
 |---|---|---|
 | 0 | `thread_cap` | Thread capability (Control rights) |
-| 1 | `aspace_cap` | AddressSpace capability (Map rights) to bind |
-| 2 | `cspace_cap` | CSpace capability (Insert + Delete rights) to bind |
-| 3 | `ipc_buf_vaddr` | Virtual address of the IPC buffer page in the thread's address space (0 to clear) |
+| 1 | `entry` | Virtual address of the thread entry point |
+| 2 | `stack_top` | Initial stack pointer (rounded to the entry ABI's stack alignment) |
+| 3 | `arg` | Value passed in the first argument register |
+| 4 | `tls_base` | Initial TLS base (`fs_base` on x86-64; `tp` on RISC-V) |
 
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
 
-All three bindings are updated atomically. The thread must be in the Stopped or
-Created state; calling on a Running or Blocked thread returns `InvalidState`.
+The thread must be in the `Created` state; calling on a thread in any other state
+returns `InvalidArgument`. The initial trap frame is built on the thread's kernel
+stack so the first scheduler switch enters user mode at `entry`.
 
-**Capability requirements:** `thread_cap` (Control), `aspace_cap` (Map),
-`cspace_cap` (Insert + Delete).
+**Capability requirement:** `thread_cap` must have Control rights.
 
-**Errors:** `InvalidCapability`, `AccessDenied`, `InvalidState` (thread not stopped),
-`InvalidArgument` (ipc_buf_vaddr not page-aligned).
+**Errors:** `InvalidCapability`, `InsufficientRights` (cap lacks Control),
+`InvalidArgument` (thread not in the Created state).
 
 ---
 
 ### `SYS_CAP_CREATE_CSPACE` (12)
 
-Create a new, empty CSpace.
+Retype a Memory capability into a new, empty CSpace (create-mode), or donate carved
+pages to an existing CSpace's slot-page pool (augment-mode).
 
 **Arguments:**
 
 | # | Name | Description |
 |---|---|---|
-| 0 | `max_slots` | Maximum number of capability slots (ceiling; 0 means system default) |
+| 0 | `memory_cap` | Memory capability (Retype rights) the CSpace slab is carved from |
+| 1 | `augment_cap` | `0` for create-mode; otherwise a CSpace cap (Insert rights) whose slot-page pool receives the carved pages |
+| 2 | `init_pages` | Pages to carve (page 0 is the wrapper; pages `1..init_pages` seed the slot-page pool) |
+| 3 | `max_slots` | Create-mode only: hard cap on usable slots, clamped to `[1, 14336]`; `0` defaults to what the seeded pool backs. Ignored in augment-mode |
 
-**Return:** `rax`/`a0`: new CSpace capability (Insert + Delete + Derive + Revoke rights)
-on success; `SyscallError` on failure.
+**Return:** `rax`/`a0`: create-mode — new CSpace capability (Insert + Delete + Derive
+rights); augment-mode — `0`. `SyscallError` on failure.
 
-**Errors:** `InvalidArgument` (max_slots exceeds system maximum), `OutOfMemory`.
+**Capability requirements:** `memory_cap` (Retype); in augment-mode, `augment_cap` (Insert).
+
+**Errors:** `InvalidArgument` (`init_pages` 0 or overflow), `InvalidCapability`,
+`InsufficientRights` (source Memory cap lacks Retype, or augment target lacks Insert),
+`OutOfMemory` (Memory cap region or slot-page pool exhausted), `QuotaExceeded`
+(caller's CSpace at slot quota).
 
 ---
 
@@ -1270,8 +1567,9 @@ absorbed the former `SYS_CAP_INSERT` (slot 32, now reserved).
 
 **Capability requirements:** `src_cap` (at least one right), `dst_cspace_cap` (Insert).
 
-**Errors:** `InvalidCapability`, `AccessDenied`, `InvalidArgument` (dst_slot occupied
-or out of range), `OutOfMemory`.
+**Errors:** `InvalidCapability`, `InsufficientRights` (dst CSpace lacks Insert),
+`InvalidArgument` (dst_slot occupied or out of range), `OutOfMemory` (slot-page pool
+exhausted), `QuotaExceeded` (dst CSpace at slot quota).
 
 ---
 
@@ -1292,12 +1590,13 @@ the source slot is cleared; the destination inherits the source's derivation pos
 
 **Capability requirements:** `src_cap` (any), `dst_cspace_cap` (Insert).
 
-**Errors:** `InvalidCapability`, `AccessDenied`, `InvalidArgument` (dst_slot occupied
-or out of range).
+**Errors:** `InvalidCapability`, `InsufficientRights` (dst CSpace lacks Insert),
+`InvalidArgument` (dst_slot occupied or out of range), `OutOfMemory` (slot-page pool
+exhausted), `QuotaExceeded` (dst CSpace at slot quota).
 
 ---
 
-## Address Space Syscall
+## Address Space Syscalls
 
 ### `SYS_ASPACE_QUERY` (41)
 
@@ -1320,6 +1619,32 @@ Translate a user virtual address to its mapped physical address.
   (`>= 0x0000_8000_0000_0000`), or not currently mapped.
 - `InvalidCapability` — cap slot is null, wrong type, or the object is gone.
 - `InsufficientRights` — cap does not have the `READ` right.
+
+---
+
+### `SYS_ASPACE_BIND_NOTIFICATION` (53)
+
+Bind a terminal-fault death observer to an address space. When any thread in the space
+faults terminally (no handler bound, or the handler replied KILL), the kernel posts the
+fault reason to the bound event queue. Voluntary `SYS_THREAD_EXIT` does not fire these
+observers.
+
+**Arguments:**
+
+| # | Name | Description |
+|---|---|---|
+| 0 | `aspace_cap` | AddressSpace capability (Control rights) to observe |
+| 1 | `eventq_cap` | Event queue capability (Post rights) the fault notification is posted to |
+| 2 | `correlator` | Caller-chosen `u32` routing tag |
+
+**Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure. If the space has
+already terminal-faulted, the retained reason is delivered immediately and the call
+still returns 0.
+
+**Capability requirements:** `aspace_cap` (Control), `eventq_cap` (Post).
+
+**Errors:** `InvalidCapability`, `InsufficientRights` (address space lacks Control or
+event queue lacks Post), `OutOfMemory` (the address space's observer array is full).
 
 ---
 
@@ -1350,8 +1675,8 @@ deregisters the IPC buffer page (extended payloads will fail with `InvalidArgume
 
 **Capability requirement:** None — acts on the calling thread implicitly.
 
-**Errors:** `AlignmentError` (virt not page-aligned), `InvalidArgument` (page not
-mapped or not writable; checked at registration time).
+**Errors:** `InvalidAddress` (non-zero `virt` not page-aligned, or outside the user
+half), `InvalidCapability` (no current thread).
 
 ---
 
@@ -1415,6 +1740,39 @@ pub enum SystemInfoType
     CurrentCpu          = 7,
 }
 ```
+
+### `SYS_SBI_CALL` (44)
+
+Forward a sanctioned SBI firmware call to M-mode on RISC-V, gated by a per-extension
+`SbiControl` capability right.
+
+**RISC-V only.** On x86-64 this syscall returns `NotSupported`.
+
+**Arguments:**
+
+| # | Name | Description |
+|---|---|---|
+| 0 | `sbi_cap` | `SbiControl` capability carrying the extension's required right |
+| 1 | `extension` | SBI extension ID |
+| 2 | `function` | SBI function ID |
+| 3 | `arg_a0` | SBI call argument `a0` |
+| 4 | `arg_a1` | SBI call argument `a1` |
+| 5 | `arg_a2` | SBI call argument `a2` |
+
+**Return:** `rax`/`a0`: the SBI call's return value on success; `SyscallError` on
+failure. A nonzero SBI firmware error collapses to `NotSupported`.
+
+Only a fixed set of extensions is forwardable (e.g. SRST, SUSP, CPPC, BASE, DBCN, PMU);
+each maps to a distinct `SbiControl` right. Extensions outside that set are rejected.
+
+**Capability requirement:** `sbi_cap` must be an `SbiControl` cap holding the right that
+`extension` maps to.
+
+**Errors:** `NotSupported` (x86-64, or firmware returned an error), `InvalidArgument`
+(extension not in the sanctioned set), `InvalidCapability`, `InsufficientRights`
+(`SbiControl` cap lacks the extension's required right).
+
+---
 
 ### `SYS_GETRANDOM` (55)
 

@@ -39,25 +39,60 @@ SECTIONS
         KEEP(*(.text.trampoline))
         KEEP(*(.text.trampoline.*))
         *(.text .text.*)
-    }
-
-    .rodata : ALIGN(8) {
-        *(.rodata .rodata.*)
+        /* PLT/iplt stubs: expected empty under plt-by-default:no + -Bsymbolic;
+         * captured here (RX) so they never land as an orphan section. */
+        *(.plt)
+        *(.plt.*)
+        *(.iplt)
     }
 
     /* Advance the location counter to a page boundary and record it as
-     * _etext. This is where the PE .text section (RX) ends and the PE
-     * .data section (RW) begins. Using ". = ALIGN" (not "symbol = ALIGN")
+     * _etext. This is where the PE .text section (RX, code only) ends and the
+     * PE .data section (RW) begins. Using ". = ALIGN" (not "symbol = ALIGN")
      * is required to actually advance the LMA/VMA before the next section. */
     . = ALIGN(0x1000);
     _etext = .;
 
+    /* Everything from here lives in the RW PE .data section. The static-PIE
+     * R_RISCV_RELATIVE relocations target absolute data pointers held in
+     * .rodata / .data.rel.ro / .got; the self-relocation loop in header.S
+     * WRITES those targets at entry, so they must be in a writable region.
+     * EDK2 maps the RX .text PE section read-only, so .rodata cannot stay
+     * there. W^X is preserved: code is RX (above), this data region is RW+NX. */
+    .rodata : ALIGN(8) {
+        *(.rodata .rodata.*)
+        *(.srodata .srodata.*)
+        *(.data.rel.ro .data.rel.ro.*)
+    }
+
+    /* Relocation metadata. The self-relocation loop only reads these, but they
+     * share this RW .data PE region with the targets below (no separate RO
+     * mapping). Bounded by __rela_dyn_start/__rela_dyn_end. */
+    .dynamic : ALIGN(8) {
+        __dynamic_start = .;
+        *(.dynamic)
+        __dynamic_end = .;
+    }
+
+    .rela.dyn : ALIGN(8) {
+        __rela_dyn_start = .;
+        *(.rela .rela.*)
+        __rela_dyn_end = .;
+    }
+
     .data : ALIGN(8) {
+        /* GOT entries are written by the self-relocation loop (each holds an
+         * R_RISCV_RELATIVE address). Under -z notext + plt-by-default:no it is
+         * usually empty; placed here defensively. */
+        *(.got)
+        *(.got.plt)
         *(.data .data.*)
+        *(.sdata .sdata.*)
     }
 
     .bss : ALIGN(8) {
         *(.bss .bss.*)
+        *(.sbss .sbss.*)
         *(COMMON)
     }
 
@@ -77,10 +112,21 @@ SECTIONS
     /* _image_end: total image size in memory, aligned to SectionAlignment. */
     _image_end = ALIGN(0x1000);
 
+    /* Dynamic-linking metadata that a static-PIE never consults at runtime.
+     * Discarding these keeps them from becoming ALLOC sections placed outside
+     * [_start, _ebss) (which UEFI would not map). Safe only while .rela.dyn is
+     * RELATIVE-only (no symbolic entries reference .dynsym/.dynstr); verified
+     * post-build via `llvm-readobj --dyn-relocations`. */
     /DISCARD/ : {
         *(.eh_frame)
         *(.note.*)
         *(.comment)
         *(.riscv.attributes)
+        *(.interp)
+        *(.hash)
+        *(.gnu.hash)
+        *(.dynsym)
+        *(.dynstr)
+        *(.gnu.version*)
     }
 }

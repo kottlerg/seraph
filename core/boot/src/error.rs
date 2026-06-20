@@ -9,10 +9,11 @@
 //! Every error is fatal; the top-level handler in `main.rs` prints the message
 //! and halts. There is no recovery path.
 
+use crate::bprintln;
+
 /// All error conditions that can occur during the boot sequence.
 ///
 /// String payloads are `&'static str` because the bootloader has no allocator.
-/// The console printing path accepts only `&'static str` and ASCII literals.
 #[derive(Debug)]
 pub enum BootError
 {
@@ -107,6 +108,23 @@ impl BootError
     }
 }
 
+impl core::fmt::Display for BootError
+{
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+    {
+        f.write_str(self.message())?;
+        if let Some(detail) = self.detail()
+        {
+            write!(f, ": {detail}")?;
+        }
+        if let BootError::UefiError(code) = self
+        {
+            write!(f, ": status={code:#018x}")?;
+        }
+        Ok(())
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -191,30 +209,10 @@ mod tests
 
 /// Print a fatal boot error message via the console and halt.
 ///
-/// Uses `console_write_str` / `console_write_hex64` directly to avoid
-/// vtable dispatch. On RISC-V the PE `.reloc` section is currently empty,
-/// so vtable-based formatting (`bprintln!("{}", err)`) would fault;
-/// direct writes are safe on both architectures.
-///
 /// Never returns.
 pub fn fatal_error(err: &BootError) -> !
 {
-    // SAFETY: console is initialized by init_serial() at bootloader entry.
-    unsafe {
-        crate::console::console_write_str("SERAPH BOOT FATAL: ");
-        crate::console::console_write_str(err.message());
-        if let Some(detail) = err.detail()
-        {
-            crate::console::console_write_str(": ");
-            crate::console::console_write_str(detail);
-        }
-        if let BootError::UefiError(code) = err
-        {
-            crate::console::console_write_str(": status=");
-            crate::console::console_write_hex64(*code as u64);
-        }
-        crate::console::console_write_str("\r\n");
-    }
+    bprintln!("SERAPH BOOT FATAL: {err}");
     loop
     {
         core::hint::spin_loop(); // halt; no recovery from fatal boot error
@@ -228,22 +226,11 @@ use core::panic::PanicInfo;
 #[panic_handler]
 fn panic(info: &PanicInfo) -> !
 {
-    // Print location if available. The panic message is a core::fmt::Arguments
-    // value, which requires vtable dispatch to print — omit it to avoid faulting
-    // on RISC-V where PE relocations are not yet generated. The file:line is
-    // sufficient to locate the panic in source.
-    // SAFETY: console is initialized by init_serial() at bootloader entry.
-    unsafe {
-        crate::console::console_write_str("SERAPH BOOT PANIC");
-        if let Some(loc) = info.location()
-        {
-            crate::console::console_write_str(": ");
-            crate::console::console_write_str(loc.file());
-            crate::console::console_write_str(":");
-            crate::console::console_write_dec32(loc.line());
-        }
-        crate::console::console_write_str("\r\n");
-    }
+    // The bootloader is a static-PIE with relocations applied at entry, so
+    // core::fmt now works; print the full PanicInfo (location + message). The
+    // message was previously omitted because the unrelocated fmt pointer tables
+    // would fault.
+    bprintln!("SERAPH BOOT PANIC: {info}");
     loop
     {
         core::hint::spin_loop(); // halt; panics are unrecoverable in the bootloader

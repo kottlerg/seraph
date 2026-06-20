@@ -5,10 +5,10 @@
 
 //! Boot console: dual serial + framebuffer output.
 //!
-//! Provides `init_serial()`, `init_framebuffer()`, and `console_write_str()`
-//! used by the `bprint!`/`bprintln!` macros. Output goes to both the serial
-//! port and the framebuffer (when available). All state is static; the
-//! bootloader is single-threaded and never runs concurrent code.
+//! Provides `init_serial()`, `init_framebuffer()`, and `console_write_fmt()` /
+//! `console_write_str()` used by the `bprint!`/`bprintln!` macros. Output goes
+//! to both the serial port and the framebuffer (when available). All state is
+//! static; the bootloader is single-threaded and never runs concurrent code.
 
 use crate::arch::current::serial::{serial_init, serial_write_byte};
 use crate::framebuffer::FramebufferWriter;
@@ -105,98 +105,63 @@ pub unsafe fn console_write_str(s: &str)
     }
 }
 
-/// Write a u64 as a 0x-prefixed 16-digit lowercase hex string.
+/// `core::fmt::Write` sink over the dual serial + framebuffer console.
 ///
-/// All 16 hex digits are always emitted (zero-padded). No vtable dispatch;
-/// bytes are written directly through `console_write_str`.
-///
-/// # Safety
-/// Serial backend must be initialized before calling.
-pub unsafe fn console_write_hex64(n: u64)
-{
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut buf = [0u8; 18]; // "0x" + 16 hex digits
-    buf[0] = b'0';
-    buf[1] = b'x';
-    for i in 0..16usize
-    {
-        buf[2 + i] = HEX[((n >> (60 - i * 4)) & 0xF) as usize];
-    }
-    // SAFETY: buf contains only ASCII hex characters; valid UTF-8.
-    let s = unsafe { core::str::from_utf8_unchecked(&buf) };
-    // SAFETY: caller ensures serial initialized.
-    unsafe {
-        console_write_str(s);
-    }
-}
+/// Zero-sized; each write forwards to `console_write_str`, which performs the
+/// `\n` → `\r\n` serial translation. Backs the `bprint!` / `bprintln!` macros.
+struct ConsoleWriter;
 
-/// Write a u32 as a decimal string with no padding or prefix.
-///
-/// Writes "0" for zero. No vtable dispatch.
-///
-/// # Safety
-/// Serial backend must be initialized before calling.
-pub unsafe fn console_write_dec32(n: u32)
+impl core::fmt::Write for ConsoleWriter
 {
-    if n == 0
+    fn write_str(&mut self, s: &str) -> core::fmt::Result
     {
-        // SAFETY: caller ensures serial initialized.
+        // SAFETY: single-threaded bootloader; output before init is dropped.
         unsafe {
-            console_write_str("0");
+            console_write_str(s);
         }
-        return;
-    }
-    let mut buf = [0u8; 10]; // max 10 decimal digits for u32
-    let mut pos = 10usize;
-    let mut v = n;
-    while v > 0
-    {
-        pos -= 1;
-        buf[pos] = b'0' + (v % 10) as u8;
-        v /= 10;
-    }
-    // SAFETY: buf[pos..] contains only ASCII digit characters; valid UTF-8.
-    let s = unsafe { core::str::from_utf8_unchecked(&buf[pos..]) };
-    // SAFETY: caller ensures serial initialized.
-    unsafe {
-        console_write_str(s);
+        Ok(())
     }
 }
 
-/// Print a literal string to the boot console.
+/// Render `core::fmt` arguments to both console backends.
 ///
-/// Accepts a single `&str` expression (including `concat!(...)` for compile-time
-/// string concatenation). Never uses `core::fmt::Write` or creates trait objects,
-/// so no vtable entries are emitted — required for RISC-V UEFI where the PE
-/// `.reloc` section is empty and absolute addresses are never patched.
+/// Backs the `bprint!`/`bprintln!` macros. The bootloader is a static-PIE whose
+/// absolute pointers are fixed up at entry, so `core::fmt` formatting (which
+/// dispatches through vtables and fn-pointer tables) is safe here. Output before
+/// `init_serial`/`init_framebuffer` is silently dropped, so this function is
+/// safe to call at any point.
+pub fn console_write_fmt(args: core::fmt::Arguments)
+{
+    use core::fmt::Write;
+    // ConsoleWriter::write_str is infallible, so the Result is always Ok.
+    let _ = ConsoleWriter.write_fmt(args);
+}
+
+/// Print formatted output to the boot console.
 ///
-/// To add: extend with another `bprint!("...")` call immediately after.
+/// Accepts `core::fmt` formatting syntax (`bprint!("base={:#x}", addr)`), a
+/// bare string literal, or `concat!(...)`. Output is rendered through
+/// `core::fmt` into the dual serial + framebuffer sink.
 #[macro_export]
 macro_rules! bprint {
-    ($s:expr) => {{
-        let s: &str = $s;
-        // SAFETY: console is initialized before any macro usage.
-        unsafe {
-            $crate::console::console_write_str(s);
-        }
-    }};
+    ($($arg:tt)*) => {
+        $crate::console::console_write_fmt(::core::format_args!($($arg)*))
+    };
 }
 
-/// Print a literal string followed by `\r\n` to the boot console.
+/// Print formatted output followed by `\r\n` to the boot console.
 ///
-/// Accepts a single `&str` expression or no argument (bare newline). Never
-/// uses `core::fmt::Write`; see `bprint!` for the rationale.
+/// Accepts `core::fmt` formatting syntax or no argument (bare newline).
 #[macro_export]
 macro_rules! bprintln {
-    ($s:expr) => {{
-        let s: &str = $s;
+    () => {{
         // SAFETY: console is initialized before any macro usage.
         unsafe {
-            $crate::console::console_write_str(s);
             $crate::console::console_write_str("\r\n");
         }
     }};
-    () => {{
+    ($($arg:tt)*) => {{
+        $crate::console::console_write_fmt(::core::format_args!($($arg)*));
         // SAFETY: console is initialized before any macro usage.
         unsafe {
             $crate::console::console_write_str("\r\n");

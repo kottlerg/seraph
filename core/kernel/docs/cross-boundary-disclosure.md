@@ -62,6 +62,7 @@ is in [docs/syscalls.md](syscalls.md).
 | Exit / death reason encoding + death payload `(correlator << 32) \| reason` | `syscall::encode_exit_code`, `EXIT_*` constants, `sched::post_one_death_event` | c/d |
 | Thread ID (random CSPRNG correlator; no `tid → TCB` table; never returned as data) | `sched::alloc_thread_id` | c |
 | `CSpaceId` (registry index, never returned to userspace); capability badges (caller-chosen) | `cap::alloc_cspace_id`, `cap::slot::CapabilitySlot::badge` | c |
+| Boot-time `InitInfo` handover — kernel writes a read-only struct into init's mapped region | `init_protocol::InitInfo`, `init_protocol::CapDescriptor` | b/c/d/e |
 
 Notes on the non-obvious entries:
 
@@ -79,10 +80,18 @@ Notes on the non-obvious entries:
 - **`SYS_SBI_CALL`** forwards caller-supplied arguments to M-mode firmware and
   returns the firmware result; neither the arguments the kernel forwards nor the
   value it returns is kernel-derived.
+- **`InitInfo` handover** is the boot-time kernel→init struct written into a
+  read-only region the kernel maps at the fixed *user* VA `INIT_INFO_VADDR`
+  (class **b** — a userspace address by ABI contract). Its `*_cap` / `*_base`
+  fields are CSpace slot indices (**c**); versions, counts, and byte-size
+  accounting facts including `kernel_reserved_bytes` are quantities, not
+  addresses (**d**); the only addresses it carries are physical — each
+  `CapDescriptor::aux0` for a Memory/Mmio cap and `InitFramebufferInfo::physical_base`
+  (**e**, see "Physical-address surfaces"). No field is a kernel VA.
 
 ## Physical-address surfaces
 
-Two surfaces return real addresses. Both are **physical**, not kernel virtual:
+Three surfaces emit real addresses. All are **physical**, not kernel virtual:
 
 - `SYS_ASPACE_QUERY` (`sysinfo::sys_aspace_query`) returns the leaf physical address
   backing a *user* page, gated on an `AddressSpace` capability with the `READ` right.
@@ -90,6 +99,10 @@ Two surfaces return real addresses. Both are **physical**, not kernel virtual:
 - `CAP_INFO_MEMORY_PHYS_BASE` (`cap::sys_cap_info`) returns `MemoryObject::base`, the
   physical base of a Memory object the caller holds a capability to. memmgr depends
   on it to track region contiguity.
+- The `InitInfo` handover publishes physical bases for the resources it hands init:
+  `CapDescriptor::aux0` (Memory / Mmio physical base) and
+  `InitFramebufferInfo::physical_base`. Each describes a resource init receives a
+  capability to.
 
 A physical address does not reveal the kernel's randomized virtual base, and each is
 gated behind a capability the caller already holds, so neither defeats KASLR. They

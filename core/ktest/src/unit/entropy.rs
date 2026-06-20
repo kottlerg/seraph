@@ -11,6 +11,10 @@ use syscall_abi::SyscallError;
 /// A canonical user-half virtual address that ktest never maps.
 const UNMAPPED_USER_VA: u64 = 0x6000_0000_0000;
 
+/// Safe test VA (1 GiB), well above ktest's load address and stack. Mapped and
+/// unmapped within a single test, so it is free between tests.
+const RO_TEST_VA: u64 = 0x4000_0000;
+
 /// `getrandom` into a valid buffer fills the whole span with non-zero entropy.
 pub fn getrandom_fills_buffer(_ctx: &TestContext) -> TestResult
 {
@@ -45,6 +49,33 @@ pub fn getrandom_unmapped_ptr_invalid_address(_ctx: &TestContext) -> TestResult
     {
         Err("getrandom on an unmapped user buffer must return InvalidAddress, not panic/succeed")
     }
+}
+
+/// `getrandom` into a read-only buffer returns `InvalidAddress` instead of
+/// panicking the kernel (#398, the read-only arm). The page is mapped, so it
+/// passes the user-half range check, but it is read-only: the kernel's copy
+/// store faults at CPL 0 / SPP=1 (write-protection is enforced independently of
+/// SMAP/SUM) and must be recovered by the same user-copy fixup.
+pub fn getrandom_readonly_ptr_invalid_address(ctx: &TestContext) -> TestResult
+{
+    let mut frame = crate::frame_pool::FrameGuard::new(ctx.aspace_cap)
+        .ok_or("getrandom RO: frame pool exhausted")?;
+    frame
+        .map(RO_TEST_VA)
+        .map_err(|_| "getrandom RO: mem_map failed")?;
+    // prot = 0: read-only (no WRITE/EXECUTE). Drops the W bit on the live PTE.
+    syscall::mem_protect(frame.cap(), ctx.aspace_cap, RO_TEST_VA, 1, 0)
+        .map_err(|_| "getrandom RO: mem_protect to read-only failed")?;
+
+    let r = syscall::getrandom(RO_TEST_VA as *mut u8, 16);
+    if r != Err(SyscallError::InvalidAddress as i64)
+    {
+        return Err(
+            "getrandom into a read-only buffer must return InvalidAddress, not panic/succeed",
+        );
+    }
+    // FrameGuard drop unmaps RO_TEST_VA and returns the frame to the pool.
+    Ok(())
 }
 
 /// `getrandom` with `len > MAX_GETRANDOM_LEN` returns `InvalidArgument`.

@@ -25,7 +25,8 @@
 //! - `retype.rs`   — retype primitive: aspace/cspace augment, PT budget, kernel PT pool
 //! - `mm.rs`       — memory map/unmap/protect, memory split, address space query
 //! - `entropy.rs`  — userspace randomness (`SYS_GETRANDOM`), incl. the user-copy
-//!   fault-recovery regression (unmapped buffer ⇒ `InvalidAddress`, not panic)
+//!   fault-recovery regression (unmapped or read-only buffer ⇒ `InvalidAddress`,
+//!   not panic)
 //! - `notification.rs`   — notification send and wait (blocking and timeout)
 //! - `event.rs`    — event queue post and receive (blocking, try, timeout)
 //! - `wait_set.rs` — wait set add, remove, wait
@@ -521,6 +522,10 @@ pub fn run_all(ctx: &TestContext)
     run_test!(
         "entropy::getrandom_unmapped_ptr_invalid_address",
         entropy::getrandom_unmapped_ptr_invalid_address(ctx)
+    );
+    run_test!(
+        "entropy::getrandom_readonly_ptr_invalid_address",
+        entropy::getrandom_readonly_ptr_invalid_address(ctx)
     );
     run_test!(
         "entropy::getrandom_over_max_len_invalid_arg",

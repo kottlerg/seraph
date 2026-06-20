@@ -60,6 +60,7 @@ mod platform;
 mod sched;
 mod sync;
 mod syscall;
+mod uaccess;
 mod validate;
 
 /// Kernel entry point.

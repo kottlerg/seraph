@@ -18,6 +18,10 @@
 use crate::arch::current::trap_frame::TrapFrame;
 use syscall::SyscallError;
 
+/// User-half ceiling: virtual addresses at or above this are kernel/non-canonical.
+#[cfg(not(test))]
+const USER_HALF_TOP: u64 = 0x0000_8000_0000_0000;
+
 /// `SYS_THREAD_CONFIGURE` (23): set entry point, stack, argument, and TLS base
 /// for a thread.
 ///
@@ -1346,16 +1350,23 @@ pub fn sys_thread_read_regs(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     {
         return Err(SyscallError::InvalidArgument);
     }
+    // The destination must lie wholly in the user half: SMAP/SUM gate only
+    // accesses to user pages, so without this a kernel-half buf_ptr would let the
+    // copy write the target's register frame into kernel memory at an
+    // attacker-chosen VA. (`buf_ptr >= USER_HALF_TOP` short-circuits before the
+    // sum, so `buf_ptr + copy_size` cannot overflow.)
+    if buf_ptr >= USER_HALF_TOP || buf_ptr + copy_size as u64 > USER_HALF_TOP
+    {
+        return Err(SyscallError::InvalidAddress);
+    }
 
-    // Copy TrapFrame to user buffer under SMAP/SUM bracket.
-    // SAFETY: trap_frame validated non-null; buf_ptr user VA; copy_size bounded;
-    //         user_access_begin/end bracket enables SMAP bypass.
+    // Copy the target's TrapFrame to the user buffer with fault recovery: an
+    // unmapped or read-only buffer returns InvalidAddress instead of faulting.
+    // SAFETY: trap_frame validated non-null; src is valid for copy_size reads;
+    //         buf_ptr is the validated user destination span.
     unsafe {
         let src = (*target_tcb).trap_frame as *const u8;
-        let dst = buf_ptr as *mut u8;
-        crate::arch::current::cpu::user_access_begin();
-        core::ptr::copy_nonoverlapping(src, dst, copy_size);
-        crate::arch::current::cpu::user_access_end();
+        crate::uaccess::copy_to_user(buf_ptr, src, copy_size)?;
     }
 
     Ok(copy_size as u64)
@@ -1435,22 +1446,26 @@ pub fn sys_thread_write_regs(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     {
         return Err(SyscallError::InvalidArgument);
     }
-
-    // Copy from user into a stack-local TrapFrame, then validate.
-    // Never write directly to the target's trap_frame before validation.
-    let mut tmp: MaybeUninit<ArchTF> = MaybeUninit::zeroed();
-    // SAFETY: buf_ptr is a non-null user VA; copy_size matches the struct.
-    unsafe {
-        crate::arch::current::cpu::user_access_begin();
-        core::ptr::copy_nonoverlapping(
-            buf_ptr as *const u8,
-            tmp.as_mut_ptr().cast::<u8>(),
-            copy_size,
-        );
-        crate::arch::current::cpu::user_access_end();
+    // The source must lie wholly in the user half: SMAP/SUM gate only accesses to
+    // user pages, so without this a kernel-half buf_ptr would let the copy read
+    // kernel memory at an attacker-chosen VA into the register frame.
+    if buf_ptr >= USER_HALF_TOP || buf_ptr + copy_size as u64 > USER_HALF_TOP
+    {
+        return Err(SyscallError::InvalidAddress);
     }
 
-    // SAFETY: all bytes just written by copy_nonoverlapping above.
+    // Copy from user into a stack-local TrapFrame, then validate. Never write
+    // directly to the target's trap_frame before validation. The copy is
+    // fault-recovered: an unmapped or read-only source returns InvalidAddress.
+    let mut tmp: MaybeUninit<ArchTF> = MaybeUninit::zeroed();
+    // SAFETY: tmp is valid for copy_size writes; buf_ptr is the validated user
+    //         source span.
+    unsafe {
+        crate::uaccess::copy_from_user(tmp.as_mut_ptr().cast::<u8>(), buf_ptr, copy_size)?;
+    }
+
+    // SAFETY: tmp was zero-initialized, so every byte is a valid bit pattern for
+    // ArchTF regardless of how much copy_from_user wrote before any fault.
     let mut regs = unsafe { tmp.assume_init() };
 
     // Architecture-specific register safety validation.

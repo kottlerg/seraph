@@ -15,8 +15,6 @@
 // cast_possible_truncation: targets 64-bit only; u64/usize conversions lossless.
 #![allow(clippy::cast_possible_truncation)]
 
-use core::sync::atomic::{AtomicU64, Ordering};
-
 use free_pool::{DemandRegion, FreePool, FreeRun, chunk_for, region_contains, regions_overlap};
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels};
 use process_abi::{
@@ -695,9 +693,25 @@ impl ProcessTable
     }
 }
 
-/// Badge counter for memmgr-minted process identities. Each
-/// `REGISTER_PROCESS` call consumes one.
-static NEXT_BADGE: AtomicU64 = AtomicU64::new(1);
+/// Mint a fresh memmgr-minted process-identity badge: a random `u64` from the
+/// kernel entropy pool, redrawn off the reserved values a live record must
+/// never alias — `0` (the free-slot marker; see `ProcessTable`) and the
+/// well-known reserved records `MEMMGR_SELF_BADGE` / `INIT_SELF_BADGE`. Random
+/// rather than monotonic so the process-registration count it would otherwise
+/// leak across the `REGISTER_PROCESS` boundary stays unguessable; the badge is
+/// matched by equality scan, never used as an array index. Returns `None` if
+/// the entropy draw fails (a kernel-contract violation).
+fn mint_process_badge() -> Option<u64>
+{
+    loop
+    {
+        let b = syscall::random_u64().ok()?;
+        if b != 0 && b != MEMMGR_SELF_BADGE && b != INIT_SELF_BADGE
+        {
+            return Some(b);
+        }
+    }
+}
 
 // Per-process tracking and the free pool live in statics so the bookkeeping
 // never lands on a syscall stack frame. memmgr is single-threaded — its only
@@ -739,14 +753,14 @@ fn table_mut() -> &'static mut ProcessTable
 const BOOTSTRAP_MAX_MEMORY_CAPS: usize = ipc::memmgr_bootstrap::MAX_MEMORY_CAPS;
 
 /// Reserved process-table badge for memmgr's own bootstrap-backing record.
-/// Out of range of every minted badge (memmgr's `NEXT_BADGE` and init's
-/// bootstrap badges both start at 1), so no real caller can match it.
+/// `mint_process_badge` explicitly excludes this value, so no
+/// `REGISTER_PROCESS` caller can ever be assigned it.
 const MEMMGR_SELF_BADGE: u64 = u64::MAX;
 
 /// Reserved process-table badge for init's orphaned bootstrap-backing record.
 /// init exits at reap, so no live process owns its arena; its pages stay
-/// parked and accounted here. Like `MEMMGR_SELF_BADGE`, far out of minted-badge
-/// range, so no real caller can match it.
+/// parked and accounted here. Like `MEMMGR_SELF_BADGE`, excluded from
+/// `mint_process_badge`, so no minted badge can collide.
 const INIT_SELF_BADGE: u64 = u64::MAX - 1;
 
 /// Scratch VA in memmgr's address space for mapping the bootstrap
@@ -1236,7 +1250,14 @@ fn handle_register_process(req: &IpcMessage, ipc_buf: *mut u64, service_ep: u32,
     }
 
     let table = table_mut();
-    let new_badge = NEXT_BADGE.fetch_add(1, Ordering::Relaxed);
+    let Some(new_badge) = mint_process_badge()
+    else
+    {
+        // Unreachable: the entropy pool is seeded before any userspace runs.
+        // Surface it as a registration failure (procmgr fails the spawn).
+        reply_label(ipc_buf, memmgr_errors::TOO_MANY_PROCESSES);
+        return;
+    };
 
     if table.insert(new_badge).is_none()
     {

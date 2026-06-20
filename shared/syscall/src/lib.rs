@@ -52,7 +52,7 @@ use syscall_abi::{
     SYS_THREAD_EXIT, SYS_THREAD_READ_REGS, SYS_THREAD_SET_AFFINITY, SYS_THREAD_SET_FAULT_HANDLER,
     SYS_THREAD_SET_PRIORITY, SYS_THREAD_SLEEP, SYS_THREAD_START, SYS_THREAD_STOP,
     SYS_THREAD_WRITE_REGS, SYS_THREAD_YIELD, SYS_WAIT_SET_ADD, SYS_WAIT_SET_REMOVE,
-    SYS_WAIT_SET_WAIT,
+    SYS_WAIT_SET_WAIT, SyscallError,
 };
 
 pub use syscall_abi::{
@@ -2080,6 +2080,38 @@ pub fn getrandom(buf: *mut u8, len: usize) -> Result<u64, i64>
     // kernel validates the span and writes only within [buf, buf+len).
     let ret = unsafe { syscall2(SYS_GETRANDOM, buf as u64, len as u64) };
     if ret < 0 { Err(ret) } else { Ok(ret as u64) }
+}
+
+/// Draw a single cryptographically-secure random `u64` from the kernel
+/// entropy pool.
+///
+/// Convenience over [`getrandom`] for the common "I need one random integer"
+/// case (badge/correlator minting): fills a fixed 8-byte buffer and assembles
+/// it native-endian. The value is raw — callers apply their own non-zero or
+/// reserved-value filters.
+///
+/// # Errors
+/// Returns the same negative `i64` codes as [`getrandom`]. For this fixed
+/// 8-byte in-bounds draw the only reachable failure is a kernel-contract
+/// violation (the pool is seeded before any userspace runs and the length is
+/// well under `MAX_GETRANDOM_LEN`); it is surfaced as `Err` rather than
+/// panicking so callers handle it on their own fallible path.
+#[inline]
+pub fn random_u64() -> Result<u64, i64>
+{
+    let mut b = [0u8; 8];
+    let n = getrandom(b.as_mut_ptr(), b.len())?;
+    if n == b.len() as u64
+    {
+        Ok(u64::from_ne_bytes(b))
+    }
+    else
+    {
+        // Unreachable: the kernel fills a valid in-bounds buffer completely or
+        // errors (it never returns a short count). Surface the contract
+        // violation as `Err` rather than panic.
+        Err(SyscallError::InvalidState as i64)
+    }
 }
 
 // ── SBI ──────────────────────────────────────────────────────────────────────

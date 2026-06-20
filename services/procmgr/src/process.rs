@@ -26,39 +26,31 @@ const CHILD_IPC_BUF_VA: u64 = 0x0000_7FFF_FFFE_0000;
 /// Max file data bytes per VFS read IPC. Word 0 = `bytes_read`, words 1..63 = data.
 const VFS_CHUNK_SIZE: u64 = 63 * 8; // 504 bytes
 
-/// Next badge value (monotonically increasing, never zero). Starts at
-/// `LOG_BADGE_FIRST_CHILD` so per-child log badges never collide with
-/// the reserved system-special badges (init=1, procmgr=2, 3..15
-/// reserved). The same value is procmgr's process badge, memmgr's
-/// per-process ledger key, the badged SEND-cap badge on the log
-/// endpoint, and procmgr's death-EQ correlator — one u64, four roles.
-static NEXT_BADGE: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(ipc::log_badges::LOG_BADGE_FIRST_CHILD);
-
-/// Reserve the next process badge. Single allocation point so the
-/// value can be threaded to `populate_child_info` (writes it into
-/// `pi.log_send_cap`'s badged SEND derivation) AND `finalize_creation`
-/// (uses it as the table key, death-EQ correlator, and process-handle
-/// badge).
+/// Mint a fresh process badge: a random `u64` drawn from the kernel entropy
+/// pool ([`syscall::random_u64`]). The same value is procmgr's process-table
+/// key, the badged SEND-cap badge on the log endpoint (logd keys slots by the
+/// full `u64`), and procmgr's death-EQ correlator (low 32 bits). Drawing it at
+/// random — rather than the former monotonic counter — keeps the per-process
+/// identifier and the spawn rate it would otherwise leak unguessable; the
+/// capability is still the sole authority, so this is defense-in-depth.
 ///
-/// Skips badges whose lower 32 bits would collide with reserved
-/// death-EQ correlators (currently `INIT_REAP_CORRELATOR = u32::MAX`).
-/// The death-EQ binding API takes a `u32` correlator while process
-/// badges are `u64`; without this guard the truncated correlator
-/// could match the reserved value at u32 wrap (~4.3B spawns) and
-/// the matching child's death would be silently absorbed by the
-/// init-reap branch in `dispatch_death`.
-fn next_process_badge() -> u64
+/// Single allocation point so the value threads to `populate_child_info`
+/// (writes the badged SEND derivation into `pi.log_send_cap`) AND
+/// `finalize_creation` (table key, death-EQ correlator, process-handle badge).
+///
+/// Redraws on the rare value whose low 32 bits hit a reserved death-EQ
+/// correlator (`0` or `INIT_REAP_CORRELATOR`); see [`badge_is_acceptable`].
+/// Returns `None` if the entropy draw fails (a kernel-contract violation),
+/// failing the spawn rather than minting a weak badge.
+fn next_process_badge() -> Option<u64>
 {
     loop
     {
-        let t = NEXT_BADGE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let t = syscall::random_u64().ok()?;
         if badge_is_acceptable(t, ipc::procmgr_labels::INIT_REAP_CORRELATOR)
         {
-            return t;
+            return Some(t);
         }
-        // Skip the reserved correlator and try again. (Unreachable in
-        // v0.1.0 fleet sizes; cheap guard against a real-life wrap.)
     }
 }
 
@@ -1255,7 +1247,7 @@ fn create_process_from_bytes(
         MainTls::default()
     };
 
-    let process_badge = next_process_badge();
+    let process_badge = next_process_badge()?;
     let pi_memory_cap = populate_child_info(
         self_aspace,
         child_aspace,
@@ -1338,18 +1330,22 @@ pub fn create_process(
     result
 }
 
-/// Monotonic cookie counter for `FS_READ_MEMORY`. Skips zero — fatfs
-/// rejects cookie 0 as the `OutstandingPage::None` sentinel.
-static NEXT_MEMORY_COOKIE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-
-fn next_memory_cookie() -> u64
+/// Per-request correlation cookie for `FS_READ_MEMORY`: a random `u64` from
+/// the kernel entropy pool, redrawn off the reserved `0` value (fatfs rejects
+/// cookie 0 as the `OutstandingPage::None` sentinel). Random rather than
+/// monotonic so the read-memory request count/rate it would otherwise leak to
+/// the fs stays unguessable; the cookie is opaque and never indexes a table.
+/// Returns `None` if the entropy draw fails (a kernel-contract violation).
+fn next_memory_cookie() -> Option<u64>
 {
-    let mut c = NEXT_MEMORY_COOKIE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    while c == 0
+    loop
     {
-        c = NEXT_MEMORY_COOKIE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let c = syscall::random_u64().ok()?;
+        if c != 0
+        {
+            return Some(c);
+        }
     }
-    c
 }
 
 /// Issue `FS_READ_MEMORY` at byte `offset`.
@@ -1370,7 +1366,7 @@ fn vfs_read_memory(
     offset: u64,
 ) -> Option<(u32, usize, usize, u64)>
 {
-    let cookie = next_memory_cookie();
+    let cookie = next_memory_cookie()?;
     let msg = IpcMessage::builder(ipc::fs_labels::FS_READ_MEMORY)
         .word(0, offset)
         .word(1, cookie)
@@ -2026,7 +2022,7 @@ pub fn create_process_from_file(
         demand_paged,
         self_memmgr_ep: ctx.memmgr_ep,
     };
-    let process_badge = next_process_badge();
+    let process_badge = next_process_badge().ok_or(procmgr_errors::OUT_OF_MEMORY)?;
     let pi_memory_cap = populate_child_info(
         self_aspace,
         child_objs.aspace(),

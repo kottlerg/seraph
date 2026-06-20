@@ -142,8 +142,22 @@ impl Drop for ChildGuard
     }
 }
 
-/// Monotonic counter for driver-child bootstrap badges.
-static NEXT_BOOTSTRAP_BADGE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+/// Draw a fresh non-zero driver-child bootstrap badge: a random `u64` from the
+/// kernel entropy pool, redrawn off the reserved `0` value (an unbadged SEND
+/// carries badge 0). Random rather than monotonic so the driver-spawn count it
+/// would otherwise leak stays unguessable; both spawn paths match the bootstrap
+/// round by badge value, not index. Returns `None` if the entropy draw fails.
+fn mint_bootstrap_badge() -> Option<u64>
+{
+    loop
+    {
+        let b = syscall::random_u64().ok()?;
+        if b != 0
+        {
+            return Some(b);
+        }
+    }
+}
 
 /// Per-device BAR capability set delivered to a driver. `bases` and `sizes`
 /// parallel `caps` and are retained for future multi-BAR drivers; only the
@@ -222,7 +236,12 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64) -> bool
     let device_badge = config.device_badge;
 
     // Allocate a bootstrap badge for the child.
-    let child_badge = NEXT_BOOTSTRAP_BADGE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let Some(child_badge) = mint_bootstrap_badge()
+    else
+    {
+        std::os::seraph::log!("driver spawn: entropy draw failed");
+        return false;
+    };
     let Ok(badged_creator) =
         syscall::cap_derive_badge(bootstrap_ep, syscall::RIGHTS_SEND, child_badge)
     else
@@ -500,7 +519,13 @@ pub fn spawn_simple_device(
         return false;
     }
 
-    let child_badge = NEXT_BOOTSTRAP_BADGE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let Some(child_badge) = mint_bootstrap_badge()
+    else
+    {
+        std::os::seraph::log!("simple-device spawn: entropy draw failed");
+        cleanup_on_fail(hw_cap, devmgr_query_ep, source_cap_to_clean);
+        return false;
+    };
     let Ok(badged_creator) =
         syscall::cap_derive_badge(bootstrap_ep, syscall::RIGHTS_SEND, child_badge)
     else

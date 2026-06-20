@@ -1199,7 +1199,12 @@ impl File
                 return Err(e);
             }
         };
-        let badge = release_handler::allocate_badge(state);
+        let Some(badge) = release_handler::allocate_badge()
+        else
+        {
+            let _ = syscall::cap_delete(file_cap);
+            return Err(io::Error::other("seraph fs: release-badge entropy draw failed"));
+        };
         let entry = release_handler::register(state, badge);
 
         let release_ep = release_handler::release_endpoint(state);
@@ -1349,7 +1354,11 @@ impl File
     fn read_frame(&self, buf: &mut [u8], pos: u64) -> io::Result<usize>
     {
         let ipc_buf = crate::os::seraph::current_ipc_buf();
-        let cookie = next_cookie();
+        let Some(cookie) = next_cookie()
+        else
+        {
+            return Err(io::Error::other("seraph fs: read cookie entropy draw failed"));
+        };
         // First FS_READ_MEMORY for this File carries the per-process
         // release-endpoint SEND in caps[0]; the driver records it on
         // the OpenFile slot's first allocation so the eviction worker
@@ -1631,15 +1640,22 @@ impl Drop for File
     }
 }
 
-fn next_cookie() -> u64
+/// Per-request correlation cookie for `FS_READ_MEMORY`: a random `u64` from the
+/// kernel entropy pool, redrawn off the reserved `0` value (the driver rejects
+/// cookie 0 as its outstanding-page `None` sentinel). Random rather than
+/// monotonic so the read-memory request count it would otherwise leak to the fs
+/// driver stays unguessable; the cookie is opaque and matched by value, never an
+/// index. Returns `None` if the entropy draw fails (a kernel-contract violation).
+fn next_cookie() -> Option<u64>
 {
-    static NEXT: AtomicU64 = AtomicU64::new(1);
-    let mut c = NEXT.fetch_add(1, Ordering::Relaxed);
-    while c == 0
+    loop
     {
-        c = NEXT.fetch_add(1, Ordering::Relaxed);
+        let c = syscall::random_u64().ok()?;
+        if c != 0
+        {
+            return Some(c);
+        }
     }
-    c
 }
 
 /// Map a [`NsError`] reply label to an `io::Error` per the error

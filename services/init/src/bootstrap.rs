@@ -587,7 +587,7 @@ pub fn bootstrap_memmgr(
     // Badged creator endpoint for memmgr (init serves the bootstrap round
     // for memmgr, so memmgr's `request_round` lands on init's bootstrap ep
     // tagged with this badge).
-    let memmgr_badge = NEXT_BOOTSTRAP_BADGE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let memmgr_badge = mint_bootstrap_badge()?;
     let badged_creator =
         syscall::cap_derive_badge(init_bootstrap_ep, syscall::RIGHTS_SEND, memmgr_badge).ok()?;
     let mm_creator_slot =
@@ -606,8 +606,7 @@ pub fn bootstrap_memmgr(
     // Mint procmgr's badged SEND cap on memmgr's endpoint. Memmgr will
     // recognise calls bearing this badge as authorised for the
     // procmgr-only labels.
-    let procmgr_badge_on_mm =
-        NEXT_BOOTSTRAP_BADGE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let procmgr_badge_on_mm = mint_bootstrap_badge()?;
     let procmgr_send_cap = syscall::cap_derive_badge(
         mm_service_ep,
         syscall::RIGHTS_SEND_GRANT,
@@ -1116,9 +1115,23 @@ pub struct ProcmgrBootstrap
     pub arena_cap: u32,
 }
 
-/// Monotonic counter for init-side bootstrap badges.
-pub static NEXT_BOOTSTRAP_BADGE: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(1);
+/// Mint a fresh init-side bootstrap badge: a random `u64` from the kernel
+/// entropy pool, redrawn off the reserved `0` value (an unbadged SEND carries
+/// badge 0). Random rather than monotonic so the service-bringup count it would
+/// otherwise leak stays unguessable; each child matches its bootstrap round by
+/// badge value, not index. Returns `None` if the entropy draw fails (a
+/// kernel-contract violation), aborting the affected bringup step.
+pub fn mint_bootstrap_badge() -> Option<u64>
+{
+    loop
+    {
+        let b = syscall::random_u64().ok()?;
+        if b != 0
+        {
+            return Some(b);
+        }
+    }
+}
 
 /// Create and start procmgr from its boot module ELF image.
 ///
@@ -1219,7 +1232,7 @@ pub fn bootstrap_procmgr(
     log("loaded procmgr ELF");
 
     // Derive badged creator endpoint for procmgr.
-    let procmgr_badge = NEXT_BOOTSTRAP_BADGE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let procmgr_badge = mint_bootstrap_badge()?;
     let badged_creator =
         syscall::cap_derive_badge(init_bootstrap_ep, syscall::RIGHTS_SEND, procmgr_badge).ok()?;
     let pm_creator_slot =

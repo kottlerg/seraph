@@ -1380,6 +1380,11 @@ fn spawn_virtio_blk(
             }
             *catalog.count += 1;
         }
+        // Deliberately index-derived (not randomized like the cross-boundary
+        // service badges, #249): this badge names a specific device-catalog
+        // slot — the driver enforces its own badge per registered device — so
+        // it is a semantically-meaningful identity, not an enumerable
+        // correlator.
         let device_badge = (dev_idx as u64) + 1;
 
         let bar_info = find_virtio_bar_cap(pci_dev, caps);

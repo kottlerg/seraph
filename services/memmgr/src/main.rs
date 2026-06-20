@@ -17,9 +17,7 @@
 
 use free_pool::{DemandRegion, FreePool, FreeRun, chunk_for, region_contains, regions_overlap};
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels};
-use process_abi::{
-    PROCESS_ABI_VERSION, PROCESS_INFO_VADDR, ProcessInfo, StartupInfo, process_info_ref,
-};
+use process_abi::{PROCESS_ABI_VERSION, ProcessInfo, StartupInfo, process_info_ref};
 use syscall_abi::{MAP_EXECUTABLE, MAP_READ, MAP_WRITABLE, PAGE_SIZE};
 
 // memmgr's bootstrap parser carries page-count buffers on stack and
@@ -34,12 +32,12 @@ process_abi::stack_pages!(12);
 // that call. The bespoke `_start` here runs on `core` + raw syscalls only.
 
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(_info_ptr: u64) -> !
+pub extern "C" fn _start(info_ptr: u64) -> !
 {
-    // SAFETY: init's loader maps a valid ProcessInfo page at
-    // PROCESS_INFO_VADDR before starting this thread; the page remains
-    // mapped for the process's lifetime.
-    let info: &ProcessInfo = unsafe { process_info_ref(PROCESS_INFO_VADDR) };
+    // SAFETY: init's loader maps a valid ProcessInfo page and delivers its VA
+    // in `info_ptr` before starting this thread; the page remains mapped for the
+    // process's lifetime.
+    let info: &ProcessInfo = unsafe { process_info_ref(info_ptr) };
 
     if info.version != PROCESS_ABI_VERSION
     {
@@ -78,6 +76,7 @@ pub extern "C" fn _start(_info_ptr: u64) -> !
         stack_pages: info.stack_pages,
         pager_endpoint_cap: info.pager_endpoint_cap,
         pager_badge: info.pager_badge,
+        main_tls_vaddr: info.main_tls_vaddr,
     };
 
     main(&startup)

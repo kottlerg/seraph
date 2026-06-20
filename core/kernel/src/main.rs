@@ -535,6 +535,11 @@ unsafe fn kernel_entry_post_rebase(
             init_image.entry_point
         );
 
+        // Choose init's bootstrap VA layout once; threaded through the InitInfo
+        // mapping, the stack mapping, and the entry-register arg below so all
+        // three agree even when ASLR (#39) makes the choice per-boot random.
+        let init_layout = mm::address_space::choose_init_layout();
+
         // Create init's user address space via the typed-memory boot path:
         // a slab is retyped from `SEED_FRAME` (page 0 = wrapper page holding
         // `AddressSpaceObject` + inlined `AddressSpace`; page 1 = root PT;
@@ -670,7 +675,7 @@ unsafe fn kernel_entry_post_rebase(
         // ── Populate InitInfo region ─────────────────────────────────────────
         // Allocate enough physical pages for InitInfo + CapDescriptor array +
         // command line, fill them via the direct map, then map read-only into
-        // init's address space starting at INIT_INFO_VADDR. Each backing page
+        // init's address space starting at the chosen InitInfo VA. Each backing page
         // also gets a reclaimable Memory cap minted into init's CSpace so the
         // pages flow into memmgr's pool through init's reap-handoff donate
         // path (see `services/init/src/service.rs` end-of-phase-3).
@@ -678,8 +683,7 @@ unsafe fn kernel_entry_post_rebase(
             use cap::object::{KernelObjectHeader, MemoryObject, ObjectType};
             use cap::slot::{CapTag, Rights};
             use init_protocol::{
-                INIT_INFO_VADDR, INIT_PROTOCOL_VERSION, InitFramebufferInfo, InitInfo,
-                InitPixelFormat,
+                INIT_PROTOCOL_VERSION, InitFramebufferInfo, InitInfo, InitPixelFormat,
             };
 
             // Re-read `BootInfo.framebuffer` via the direct physical map so
@@ -778,7 +782,7 @@ unsafe fn kernel_entry_post_rebase(
                 let phys = block_phys + (pg as u64) * mm::PAGE_SIZE as u64;
                 // SAFETY: pg < block_pages by construction (info_pages <= block_pages).
                 let virt = unsafe { block_virt.add(pg * mm::PAGE_SIZE) };
-                let map_va = INIT_INFO_VADDR + (pg as u64) * mm::PAGE_SIZE as u64;
+                let map_va = init_layout.init_info_va + (pg as u64) * mm::PAGE_SIZE as u64;
                 // SAFETY: init_as_ptr valid; phys is part of the contiguous extent.
                 unsafe { (*init_as_ptr).map_page(map_va, phys, flags) }
                     .unwrap_or_else(|()| fatal("Phase 9: failed to map InitInfo page"));
@@ -912,7 +916,7 @@ unsafe fn kernel_entry_post_rebase(
 
             kprintln!(
                 "init: info at {:#x} ({} cap descriptors, {} pages)",
-                INIT_INFO_VADDR,
+                init_layout.init_info_va,
                 desc_count,
                 info_pages,
             );
@@ -920,8 +924,8 @@ unsafe fn kernel_entry_post_rebase(
             info_base
         };
 
-        // Map init's user stack (INIT_STACK_PAGES pages below INIT_STACK_TOP)
-        // and mint a reclaimable Memory cap for each backing page. Inlined
+        // Map init's user stack (INIT_STACK_PAGES pages below the chosen stack
+        // top) and mint a reclaimable Memory cap for each backing page. Inlined
         // (rather than calling `map_stack`) so we capture each phys address
         // for cap minting; `register_owned_range` accounts for the pages in
         // the buddy's `total_pages` ledger. The caps route to memmgr via reap;
@@ -932,7 +936,7 @@ unsafe fn kernel_entry_post_rebase(
             use cap::slot::{CapTag, Rights};
 
             const STACK_PAGES: usize = mm::address_space::INIT_STACK_PAGES;
-            let stack_top = mm::address_space::INIT_STACK_TOP;
+            let stack_top = init_layout.init_stack_top;
             let rw_flags = mm::paging::PageFlags {
                 readable: true,
                 writable: true,
@@ -1092,7 +1096,7 @@ unsafe fn kernel_entry_post_rebase(
             let init_saved = arch::current::context::new_state(
                 init_image.entry_point,
                 kstack_top,
-                init_protocol::INIT_INFO_VADDR, // forwarded to init's a0/rdi on first entry
+                init_layout.init_info_va, // forwarded to init's a0/rdi on first entry
                 true,
             );
 

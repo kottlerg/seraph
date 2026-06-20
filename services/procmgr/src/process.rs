@@ -12,16 +12,11 @@
 use crate::loader::{self, ScratchMapping};
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels, procmgr_errors};
 use process_abi::{
-    DEFAULT_PROCESS_STACK_PAGES, MAX_PROCESS_STACK_PAGES, PROCESS_ABI_VERSION, PROCESS_INFO_VADDR,
-    PROCESS_MAIN_TLS_MAX_PAGES, PROCESS_MAIN_TLS_VADDR, PROCESS_STACK_TOP,
+    DEFAULT_PROCESS_STACK_PAGES, MAX_PROCESS_STACK_PAGES, PROCESS_ABI_VERSION,
+    PROCESS_MAIN_TLS_MAX_PAGES,
 };
+use process_layout::{ProcessLayout, choose_process_layout};
 use syscall_abi::{FAULT_CLASS_ALL, PAGE_SIZE};
-
-// Bootstrap-cross-boundary VA: procmgr picks the per-child main-thread
-// IPC-buffer VA and writes it into `ProcessInfo.ipc_buffer_vaddr`. The
-// child's `_start` reads it back. Disjoint from the page-reservation
-// arena (above 0x1_0000_0000) and from the heap zone (0x4000_0000..0x8000_0000).
-const CHILD_IPC_BUF_VA: u64 = 0x0000_7FFF_FFFE_0000;
 
 /// Max file data bytes per VFS read IPC. Word 0 = `bytes_read`, words 1..63 = data.
 const VFS_CHUNK_SIZE: u64 = 63 * 8; // 504 bytes
@@ -478,6 +473,7 @@ fn populate_child_info(
     ipc_buf: *mut u64,
     stack_pages: u32,
     process_badge: u64,
+    layout: &ProcessLayout,
 ) -> Option<u32>
 {
     let pi_memory = crate::memmgr_alloc_page(universals.memmgr_endpoint, ipc_buf)?;
@@ -617,7 +613,7 @@ fn populate_child_info(
     pi.self_aspace_cap = child_aspace_in_child;
     pi.self_cspace_cap = child_cspace_in_child;
     pi.sched_control_cap = sched_in_child;
-    pi.ipc_buffer_vaddr = CHILD_IPC_BUF_VA;
+    pi.ipc_buffer_vaddr = layout.ipc_buffer_va;
     pi.creator_endpoint_cap = creator_ep_in_child;
     pi.procmgr_endpoint_cap = procmgr_ep_in_child;
     pi.memmgr_endpoint_cap = if universals.memmgr_endpoint != 0
@@ -671,8 +667,11 @@ fn populate_child_info(
     pi.tls_template_filesz = tls.filesz;
     pi.tls_template_memsz = tls.memsz;
     pi.tls_template_align = tls.align;
-    pi.stack_top_vaddr = PROCESS_STACK_TOP;
+    pi.stack_top_vaddr = layout.stack_top;
     pi.stack_pages = stack_pages;
+    // TLS block base, or zero when the binary has no PT_TLS (mirrors
+    // `tls_template_memsz == 0`); the block is mapped only in the TLS case.
+    pi.main_tls_vaddr = if tls.memsz != 0 { layout.tls_base } else { 0 };
     // Advertise the demand-paging pager so the runtime can inherit it onto
     // spawned threads. The child's badged memmgr endpoint is the pager
     // endpoint; the fault badge equals the child's memmgr badge so the
@@ -748,7 +747,7 @@ fn populate_child_info(
     drop(scratch);
 
     let pi_ro = syscall::cap_derive(pi_memory, syscall::RIGHTS_MAP_READ).ok()?;
-    syscall::mem_map(pi_ro, child_aspace, PROCESS_INFO_VADDR, 0, 1, 0).ok()?;
+    syscall::mem_map(pi_ro, child_aspace, layout.process_info_va, 0, 1, 0).ok()?;
     // pi_memory stays in procmgr's CSpace as the teardown handle (revoke
     // cascades to any descendants); the mapping doesn't need pi_ro to
     // outlive this call.
@@ -766,6 +765,9 @@ struct MainTlsAlloc
     memory_cap: u32,
     tls_base_offset: u64,
     tls_base_va: u64,
+    /// Mapped base VA of the TLS block (the chosen `layout.tls_base`); the block
+    /// is mapped here and `tls_base_va = tls_block_base + tls_base_offset`.
+    tls_block_base: u64,
     scratch: ScratchMapping,
 }
 
@@ -790,6 +792,7 @@ fn alloc_main_tls_memory(
     tls: &ChildTlsTemplate,
     child_memmgr_send: u32,
     ipc_buf: *mut u64,
+    layout: &ProcessLayout,
 ) -> Option<MainTlsAlloc>
 {
     let (block_size, block_align, tls_base_offset) =
@@ -813,14 +816,15 @@ fn alloc_main_tls_memory(
     Some(MainTlsAlloc {
         memory_cap: tls_memory,
         tls_base_offset,
-        tls_base_va: PROCESS_MAIN_TLS_VADDR + tls_base_offset,
+        tls_base_va: layout.tls_base + tls_base_offset,
+        tls_block_base: layout.tls_base,
         scratch,
     })
 }
 
 /// Install the TCB self-pointer at `scratch_va + tls_base_offset`, drop
 /// the scratch mapping from procmgr's aspace, derive an RW cap, and map
-/// the block into the child at [`PROCESS_MAIN_TLS_VADDR`].
+/// the block into the child at the chosen TLS block base.
 fn finalize_main_tls(alloc: MainTlsAlloc, _self_aspace: u32, child_aspace: u32) -> Option<MainTls>
 {
     // SAFETY: scratch_va is mapped writable for one page; the block fits.
@@ -835,7 +839,7 @@ fn finalize_main_tls(alloc: MainTlsAlloc, _self_aspace: u32, child_aspace: u32) 
     drop(alloc.scratch);
 
     let tls_rw = syscall::cap_derive(alloc.memory_cap, syscall::RIGHTS_MAP_RW).ok()?;
-    syscall::mem_map(tls_rw, child_aspace, PROCESS_MAIN_TLS_VADDR, 0, 1, 0).ok()?;
+    syscall::mem_map(tls_rw, child_aspace, alloc.tls_block_base, 0, 1, 0).ok()?;
     // alloc.memory_cap stays as the teardown handle; tls_rw is transient.
     let _ = syscall::cap_delete(tls_rw);
 
@@ -855,6 +859,7 @@ fn prepare_main_tls_from_bytes(
     template_bytes: &[u8],
     child_memmgr_send: u32,
     ipc_buf: *mut u64,
+    layout: &ProcessLayout,
 ) -> Option<MainTls>
 {
     if tls.memsz == 0
@@ -865,7 +870,7 @@ fn prepare_main_tls_from_bytes(
     {
         return None;
     }
-    let alloc = alloc_main_tls_memory(self_aspace, tls, child_memmgr_send, ipc_buf)?;
+    let alloc = alloc_main_tls_memory(self_aspace, tls, child_memmgr_send, ipc_buf, layout)?;
     let scratch_va = alloc.scratch_va();
     // SAFETY: scratch_va is mapped writable; length was bounded above.
     unsafe {
@@ -880,6 +885,9 @@ fn prepare_main_tls_from_bytes(
 
 /// Allocate, populate by streaming `.tdata` from an open VFS file handle,
 /// and map the main thread's TLS block.
+// too_many_arguments: each is a distinct creation input (caps, file handle,
+// IPC scratch, chosen layout); grouping them would not reduce coupling.
+#[allow(clippy::too_many_arguments)]
 fn prepare_main_tls_from_vfs(
     self_aspace: u32,
     child_aspace: u32,
@@ -888,13 +896,14 @@ fn prepare_main_tls_from_vfs(
     file_cap: u32,
     child_memmgr_send: u32,
     ipc_buf: *mut u64,
+    layout: &ProcessLayout,
 ) -> Option<MainTls>
 {
     if tls.memsz == 0
     {
         return Some(MainTls::default());
     }
-    let alloc = alloc_main_tls_memory(self_aspace, tls, child_memmgr_send, ipc_buf)?;
+    let alloc = alloc_main_tls_memory(self_aspace, tls, child_memmgr_send, ipc_buf, layout)?;
     let scratch_va = alloc.scratch_va();
 
     let mut read_pos: u64 = 0;
@@ -932,19 +941,19 @@ fn prepare_main_tls_from_vfs(
 /// Map stack and IPC buffer pages into a child address space.
 ///
 /// No explicit guard-page map. The page immediately below the stack
-/// (`PROCESS_STACK_TOP - PROCESS_STACK_PAGES * PAGE_SIZE - PAGE_SIZE`)
-/// stays unmapped by construction — `process-abi` lays out the stack and
-/// `ProcessInfo` page so the gap is always present. Stack overflow
-/// faults on the guard VA instead of silently writing into adjacent
-/// mappings.
+/// (`layout.stack_top - stack_pages * PAGE_SIZE - PAGE_SIZE`) stays unmapped by
+/// construction — `process-layout` chooses disjoint VAs for the stack and the
+/// other bootstrap surfaces so the gap is always present. Stack overflow faults
+/// on the guard VA instead of silently writing into adjacent mappings.
 fn map_child_stack_and_ipc(
     child_aspace: u32,
     child_memmgr_send: u32,
     ipc_buf: *mut u64,
     stack_pages: u32,
+    layout: &ProcessLayout,
 ) -> Option<()>
 {
-    let stack_base = PROCESS_STACK_TOP - u64::from(stack_pages) * PAGE_SIZE;
+    let stack_base = layout.stack_top - u64::from(stack_pages) * PAGE_SIZE;
     for i in 0..stack_pages
     {
         let memory_cap = crate::memmgr_alloc_page(child_memmgr_send, ipc_buf)?;
@@ -966,7 +975,7 @@ fn map_child_stack_and_ipc(
 
     let ipc_memory = crate::memmgr_alloc_page(child_memmgr_send, ipc_buf)?;
     let ipc_rw = syscall::cap_derive(ipc_memory, syscall::RIGHTS_MAP_RW).ok()?;
-    syscall::mem_map(ipc_rw, child_aspace, CHILD_IPC_BUF_VA, 0, 1, 0).ok()?;
+    syscall::mem_map(ipc_rw, child_aspace, layout.ipc_buffer_va, 0, 1, 0).ok()?;
     let _ = syscall::cap_delete(ipc_rw);
     let _ = syscall::cap_delete(ipc_memory);
 
@@ -1012,6 +1021,7 @@ fn finalize_creation(
     self_memmgr_ep: u32,
     parent_relay_cap: u32,
     ipc_buf: *mut u64,
+    layout: &ProcessLayout,
 ) -> Option<CreateResult>
 {
     let badge = process_badge;
@@ -1077,6 +1087,8 @@ fn finalize_creation(
         cwd_override: 0,
         entry_point,
         tls_base_va: main_tls.base_va,
+        stack_top_vaddr: layout.stack_top,
+        process_info_va: layout.process_info_va,
         started: false,
     })
     {
@@ -1167,6 +1179,7 @@ fn create_process_from_bytes(
     let stack_pages = elf::parse_stack_note(ehdr, module_bytes)
         .unwrap_or(DEFAULT_PROCESS_STACK_PAGES)
         .clamp(1, MAX_PROCESS_STACK_PAGES);
+    let layout = choose_process_layout();
 
     let aspace_slab = crate::memmgr_alloc_pages_contig(
         universals.memmgr_endpoint,
@@ -1250,6 +1263,7 @@ fn create_process_from_bytes(
             &module_bytes[start..end],
             child_memmgr_send,
             ipc_buf,
+            &layout,
         )?
     }
     else
@@ -1271,8 +1285,15 @@ fn create_process_from_bytes(
         ipc_buf,
         stack_pages,
         process_badge,
+        &layout,
     )?;
-    map_child_stack_and_ipc(child_aspace, child_memmgr_send, ipc_buf, stack_pages)?;
+    map_child_stack_and_ipc(
+        child_aspace,
+        child_memmgr_send,
+        ipc_buf,
+        stack_pages,
+        &layout,
+    )?;
 
     finalize_creation(
         child_aspace,
@@ -1293,6 +1314,7 @@ fn create_process_from_bytes(
         // relay terminal faults to; only CREATE_FROM_FILE carries a relay.
         0,
         ipc_buf,
+        &layout,
     )
 }
 
@@ -1903,6 +1925,7 @@ pub fn create_process_from_file(
     })
     .unwrap_or(DEFAULT_PROCESS_STACK_PAGES)
     .clamp(1, MAX_PROCESS_STACK_PAGES);
+    let layout = choose_process_layout();
 
     let aspace_slab =
         crate::memmgr_alloc_pages_contig(mms.cap(), crate::ASPACE_RETYPE_PAGES, ipc_buf)
@@ -2007,6 +2030,7 @@ pub fn create_process_from_file(
             file_cap.cap(),
             mms.cap(),
             ipc_buf,
+            &layout,
         )
         .ok_or(procmgr_errors::OUT_OF_MEMORY)?
     }
@@ -2046,12 +2070,19 @@ pub fn create_process_from_file(
         ipc_buf,
         stack_pages,
         process_badge,
+        &layout,
     )
     .ok_or(procmgr_errors::OUT_OF_MEMORY)?;
     let pi_memory_guard = CapGuard::new(pi_memory_cap);
 
-    map_child_stack_and_ipc(child_objs.aspace(), mms.cap(), ipc_buf, stack_pages)
-        .ok_or(procmgr_errors::OUT_OF_MEMORY)?;
+    map_child_stack_and_ipc(
+        child_objs.aspace(),
+        mms.cap(),
+        ipc_buf,
+        stack_pages,
+        &layout,
+    )
+    .ok_or(procmgr_errors::OUT_OF_MEMORY)?;
 
     // Commit point: hand the accumulated cap values to `finalize_creation`,
     // which records them in the process table on success. The guards stay
@@ -2081,6 +2112,7 @@ pub fn create_process_from_file(
         universals.self_memmgr_ep,
         parent_relay_cap,
         ipc_buf,
+        &layout,
     )
     .ok_or(procmgr_errors::OUT_OF_MEMORY);
     if result.is_ok()
@@ -2269,8 +2301,8 @@ pub fn start_process(badge: u64, table: &mut ProcessTable, self_aspace: u32) -> 
     syscall::thread_configure_with_tls(
         entry.thread_cap,
         entry.entry_point,
-        PROCESS_STACK_TOP,
-        PROCESS_INFO_VADDR,
+        entry.stack_top_vaddr,
+        entry.process_info_va,
         entry.tls_base_va,
     )
     .map_err(|_| 3u64)?;

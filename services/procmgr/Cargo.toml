@@ -13,6 +13,7 @@ test = false
 # Pure process-table + badge logic, extracted so it is host-testable.
 process_table = { path = "process-table", package = "procmgr-process-table" }
 process-abi = { path = "../../abi/process-abi" }
+process-layout = { path = "../../shared/process-layout" }
 elf = { path = "../../shared/elf" }
 ipc = { path = "../../shared/ipc" }
 namespace-protocol = { path = "../../shared/namespace-protocol" }

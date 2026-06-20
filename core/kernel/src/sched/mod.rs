@@ -4471,7 +4471,6 @@ pub(crate) unsafe extern "C" fn user_thread_trampoline() -> !
 pub fn enter() -> !
 {
     use crate::arch::current::trap_frame::TrapFrame;
-    use crate::mm::address_space::INIT_STACK_TOP;
 
     // Dequeue the highest-priority ready thread (init, at INIT_PRIORITY=15).
     // SAFETY: single-threaded boot; BSP scheduler slot exclusively owned; tcb is
@@ -4527,7 +4526,10 @@ pub fn enter() -> !
     // init_tcb is a valid TCB; saved_state and TrapFrame methods ensure correct field access.
     unsafe {
         core::ptr::write_bytes(tf_ptr.cast::<u8>(), 0, tf_size as usize);
-        (*tf_ptr).init_user(entry_point, INIT_STACK_TOP);
+        // init's user stack top comes from the same per-boot layout the Phase 9
+        // mapping used, so the SP matches the mapped stack even under ASLR (#39).
+        let init_stack_top = crate::mm::address_space::choose_init_layout().init_stack_top;
+        (*tf_ptr).init_user(entry_point, init_stack_top);
         // Forward the initial user argument (cap slot, etc.) stored in
         // saved_state at TCB creation via new_state(…, arg, …).
         let user_arg = init_tcb.saved_state.user_arg();

@@ -31,7 +31,7 @@ use crate::sys::alloc::seraph as pal_alloc;
 use crate::sys::reserve as pal_reserve;
 use crate::sys::stdio::seraph as pal_stdio;
 
-use process_abi::{PROCESS_ABI_VERSION, PROCESS_INFO_VADDR, process_info_ref};
+use process_abi::{PROCESS_ABI_VERSION, process_info_ref};
 
 /// Re-export of [`process_abi::StackNote`]. Lets the [`stack_pages!`]
 /// macro emit a typed static through `std::os::seraph::StackNote`,
@@ -189,6 +189,10 @@ pub struct StartupInfo {
     /// when not demand-paged.
     #[stable(feature = "seraph_ext", since = "1.0.0")]
     pub pager_badge: u64,
+    /// Mapped base virtual address of the main thread's TLS block, or zero when
+    /// the process has no TLS. See `process_abi::ProcessInfo::main_tls_vaddr`.
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    pub main_tls_vaddr: u64,
 }
 
 // SAFETY: `ipc_buffer` points at a process-global page mapped for the life of
@@ -309,27 +313,28 @@ const STARTUP_FAIL_HEAP: u32 = 0x0F02;
 /// Process entry point. Exported with the conventional ELF entry symbol name
 /// so the linker sets `e_entry` here and procmgr jumps directly in.
 ///
-/// Reads the read-only `ProcessInfo` page procmgr placed at
-/// [`PROCESS_INFO_VADDR`], registers the pre-mapped IPC buffer, stashes the
-/// derived [`StartupInfo`] in process-global storage, then hands off to the
-/// rustc-synthesised `extern "C" fn main` which in turn drives
-/// `std::rt::lang_start` and the user's `fn main`. When `main` returns, this
-/// function exits the process via `process_exit`, forwarding `main`'s `i32`
-/// return (the `ExitCode`/`lang_start` value) so the parent's `ExitStatus`
-/// carries it; the process never re-enters kernel entry code.
+/// `info_ptr` is the virtual address of the read-only `ProcessInfo` page,
+/// delivered by procmgr in the entry register (`rdi`/`a0`). Reads the page,
+/// registers the pre-mapped IPC buffer, stashes the derived [`StartupInfo`] in
+/// process-global storage, then hands off to the rustc-synthesised
+/// `extern "C" fn main` which in turn drives `std::rt::lang_start` and the
+/// user's `fn main`. When `main` returns, this function exits the process via
+/// `process_exit`, forwarding `main`'s `i32` return (the `ExitCode`/`lang_start`
+/// value) so the parent's `ExitStatus` carries it; the process never re-enters
+/// kernel entry code.
 ///
 /// # Safety
 ///
-/// Called by the kernel with a valid `ProcessInfo` page mapped at
-/// [`PROCESS_INFO_VADDR`] and a pre-mapped IPC buffer at the VA it records.
-/// The function itself is safe to export.
+/// Called by the kernel with `info_ptr` pointing at a valid `ProcessInfo` page
+/// and a pre-mapped IPC buffer at the VA it records. The function itself is safe
+/// to export.
 #[unsafe(no_mangle)]
 #[stable(feature = "seraph_ext", since = "1.0.0")]
-pub extern "C" fn _start() -> ! {
-    // SAFETY: procmgr maps a valid `ProcessInfo` page at `PROCESS_INFO_VADDR`
-    // before starting the first thread, and the page remains mapped for the
-    // process's lifetime.
-    let info = unsafe { process_info_ref(PROCESS_INFO_VADDR) };
+pub extern "C" fn _start(info_ptr: u64) -> ! {
+    // SAFETY: procmgr maps a valid `ProcessInfo` page and delivers its VA in
+    // `info_ptr` before starting the first thread; the page remains mapped for
+    // the process's lifetime.
+    let info = unsafe { process_info_ref(info_ptr) };
 
     if info.version != PROCESS_ABI_VERSION {
         syscall::process_exit(STARTUP_FAIL_BAD_ABI);
@@ -350,7 +355,7 @@ pub extern "C" fn _start() -> ! {
         && (info.args_offset as u64) < 4096
         && (info.args_offset as u64) + (info.args_bytes as u64) <= 4096
     {
-        let base = PROCESS_INFO_VADDR + info.args_offset as u64;
+        let base = info_ptr + info.args_offset as u64;
         // SAFETY: the ProcessInfo page is mapped read-only for the
         // process's lifetime and the bounds check above confines the
         // slice to the same page. Bytes are plain data.
@@ -366,7 +371,7 @@ pub extern "C" fn _start() -> ! {
         && (info.env_offset as u64) < 4096
         && (info.env_offset as u64) + (info.env_bytes as u64) <= 4096
     {
-        let base = PROCESS_INFO_VADDR + info.env_offset as u64;
+        let base = info_ptr + info.env_offset as u64;
         // SAFETY: ProcessInfo page is mapped read-only for the process's
         // lifetime; bounds check above confines the slice to the same page.
         unsafe { core::slice::from_raw_parts(base as *const u8, info.env_bytes as usize) }
@@ -408,6 +413,7 @@ pub extern "C" fn _start() -> ! {
         stack_pages: info.stack_pages,
         pager_endpoint_cap: info.pager_endpoint_cap,
         pager_badge: info.pager_badge,
+        main_tls_vaddr: info.main_tls_vaddr,
     };
 
     // SAFETY: single writer; we are the only code running at this point.
@@ -513,7 +519,7 @@ pub extern "C" fn _start() -> ! {
 // reference into `.data` and guarantees retention.
 #[used]
 #[cfg_attr(target_os = "seraph", unsafe(link_section = ".data.rel.ro"))]
-static _START_REF: unsafe extern "C" fn() -> ! = _start;
+static _START_REF: unsafe extern "C" fn(u64) -> ! = _start;
 
 // ── Public helpers surfaced on std::os::seraph ──────────────────────────────
 

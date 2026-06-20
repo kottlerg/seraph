@@ -56,19 +56,18 @@ use core::prelude::rust_2024::*;
 ///      never-recycled generation-0 slot, so the delivered values are
 ///      byte-identical; the semantic change is that the handle's high bits are
 ///      now meaningful and the kernel validates them on every use.
-pub const PROCESS_ABI_VERSION: u32 = 20;
+/// v21: Layout-defining handover VAs are creator-chosen runtime values, not ABI
+///      constants (#250). The `PROCESS_INFO_VADDR` / `PROCESS_STACK_TOP` /
+///      `PROCESS_MAIN_TLS_VADDR` constants are removed; the creator picks them
+///      per-process via `shared/process-layout`. The `ProcessInfo` page address
+///      is delivered in the entry register (`rdi`/`a0`) — `_start` takes it as
+///      its argument rather than reading a fixed address. Added
+///      [`ProcessInfo::main_tls_vaddr`], the chosen main-thread TLS block base
+///      (the stack top and IPC buffer already had runtime fields). The IPC
+///      buffer VA is also creator-chosen (it was already a runtime field).
+pub const PROCESS_ABI_VERSION: u32 = 21;
 
 // ── Address space constants ──────────────────────────────────────────────────
-
-/// Virtual address where procmgr maps the read-only [`ProcessInfo`] page in
-/// every new process's address space.
-pub const PROCESS_INFO_VADDR: u64 = 0x0000_7FFF_FFFF_0000;
-
-/// Virtual address of the top of a normal process's user stack.
-///
-/// `ProcessInfo.stack_pages` pages are mapped immediately below this
-/// address. One additional guard page (unmapped) sits below the stack.
-pub const PROCESS_STACK_TOP: u64 = 0x0000_7FFF_FFFF_E000;
 
 /// Default main-thread stack size in 4 KiB pages (32 KiB total).
 ///
@@ -182,14 +181,6 @@ macro_rules! stack_pages {
     };
 }
 
-/// Virtual address of the main thread's TLS block in a normal process.
-///
-/// Procmgr allocates and populates the block at creation time. For processes
-/// without a `PT_TLS` segment this region remains unmapped. Placed below
-/// [`CHILD_IPC_BUF_VADDR`] so it does not collide with the stack or the
-/// `ProcessInfo` page.
-pub const PROCESS_MAIN_TLS_VADDR: u64 = 0x0000_7FFF_FFFD_0000;
-
 /// Maximum number of 4 KiB pages reserved for the main thread's TLS block.
 ///
 /// Procmgr rejects binaries whose TLS block exceeds this size. Spawned
@@ -201,8 +192,11 @@ pub const PROCESS_MAIN_TLS_MAX_PAGES: u64 = 4;
 
 /// Creator-to-process handover structure.
 ///
-/// Placed at [`PROCESS_INFO_VADDR`] (one 4 KiB page, read-only) before the
-/// new process begins execution.
+/// One 4 KiB page, read-only, mapped before the new process begins execution.
+/// The creator chooses the page's virtual address per-process (via
+/// `process-layout`) and delivers it in the entry register (`rdi`/`a0`); the
+/// process receives it as the argument to `_start` rather than reading a fixed
+/// address.
 ///
 /// All slot indices refer to the process's own `CSpace`. Beyond the kernel-
 /// object self-caps, the creator endpoint, the procmgr endpoint, and the
@@ -499,6 +493,14 @@ pub struct ProcessInfo
     /// identifying this process to the pager. Zero when the process is pinned
     /// (no pager).
     pub pager_badge: u64,
+
+    /// Mapped base virtual address of the main thread's TLS block — the value
+    /// the creator placed the block at and from which the thread pointer is
+    /// derived. Zero when the process has no `PT_TLS` segment (mirrors
+    /// `tls_template_memsz == 0`). The creator chooses this per-process via
+    /// `process-layout`; the kernel installs the thread pointer, so `_start`
+    /// reads this only for introspection.
+    pub main_tls_vaddr: u64,
 }
 
 // ── StartupInfo ──────────────────────────────────────────────────────────────
@@ -619,6 +621,10 @@ pub struct StartupInfo
     /// Fault-message badge bound with [`Self::pager_endpoint_cap`]. Zero
     /// when not demand-paged.
     pub pager_badge: u64,
+
+    /// Mapped base virtual address of the main thread's TLS block, or zero when
+    /// the process has no TLS. See `ProcessInfo::main_tls_vaddr`.
+    pub main_tls_vaddr: u64,
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────

@@ -32,10 +32,11 @@ including init and ktest — share the same `main()` signature.
 
 ## ProcessInfo
 
-The procmgr-to-process handover struct. Placed by procmgr at
-`PROCESS_INFO_VADDR` (a fixed virtual address in every new process's address
-space) in a single read-only page, analogous to how the kernel places `InitInfo`
-for init at `INIT_INFO_VADDR`.
+The procmgr-to-process handover struct. Placed by procmgr in a single read-only
+page at a virtual address procmgr chooses per-process (via `process-layout`) and
+delivers in the entry register (`rdi`/`a0`), analogous to how the kernel places
+`InitInfo` for init. The address is not a fixed ABI constant — the process reads
+it as the argument to `_start`.
 
 The struct MUST be `#[repr(C)]` with stable layout. The process MUST check
 `version == PROCESS_ABI_VERSION` before accessing any other field.
@@ -43,11 +44,12 @@ The struct MUST be `#[repr(C)]` with stable layout. The process MUST check
 The authoritative field list, with per-field doc comments and exact order, is
 [`src/lib.rs`](src/lib.rs) (`struct ProcessInfo`). This README summarises the
 field groups rather than mirroring every field, so the two cannot drift. As of
-`PROCESS_ABI_VERSION` 19 the groups are:
+`PROCESS_ABI_VERSION` 21 the groups are:
 
 - **Process identity** — `version`, `self_thread_cap`, `self_aspace_cap`,
   `self_cspace_cap`, `sched_control_cap`.
-- **IPC / bootstrap** — `ipc_buffer_vaddr`, `creator_endpoint_cap`.
+- **IPC / bootstrap** — `ipc_buffer_vaddr` (creator-chosen per-process),
+  `creator_endpoint_cap`.
 - **Universal service endpoints** — `procmgr_endpoint_cap`, `memmgr_endpoint_cap`,
   `service_registry_cap` (the single system-wide service-discovery handle).
 - **Stdio rings** — `stdin_memory_cap`, `stdout_memory_cap`, `stderr_memory_cap`
@@ -59,7 +61,10 @@ field groups rather than mirroring every field, so the two cannot drift. As of
   after the fixed struct, bounded by the page remainder).
 - **Namespace** — `system_root_cap`, `current_dir_cap`.
 - **Logging** — `log_send_cap` (deprecated; migrating to `service_registry_cap`).
-- **Main-thread stack envelope** — `stack_top_vaddr`, `stack_pages`.
+- **Main-thread layout** — `stack_top_vaddr`, `stack_pages`, `main_tls_vaddr`
+  (TLS block base, zero when the process has no `PT_TLS`). The creator chooses
+  these VAs per-process (via `process-layout`), so they are runtime fields, not
+  ABI constants.
 - **Demand-paging pager** (v18, #34; default-on v19, #225) — `pager_endpoint_cap`,
   `pager_badge`. The `Endpoint` cap + badge of the process's pager (memmgr).
   Demand paging is the system-wide default, so these are nonzero for ordinary
@@ -104,8 +109,9 @@ The authoritative definition is [`src/lib.rs`](src/lib.rs) (`struct StartupInfo`
 the std overlay carries a `#[stable]`-attributed mirror at
 `runtime/ruststd/src/os/seraph.rs`. It exposes the same groups as `ProcessInfo`
 (identity, service endpoints, stdio rings + notifications, TLS template,
-argv/env as resolved `&[u8]` slices, namespace, stack envelope, and the v18
-`pager_endpoint_cap` / `pager_badge`), with cap slots delivered as `u32` values
+argv/env as resolved `&[u8]` slices, namespace, main-thread layout including
+`main_tls_vaddr`, and the v18 `pager_endpoint_cap` / `pager_badge`), with cap
+slots delivered as `u32` values
 and `args_blob` / `env_blob` resolved from the handover page into slices.
 
 Values are copied out of the handover page verbatim, so the struct does
@@ -130,7 +136,8 @@ safety net.
 `_start()` is provided by three distinct runtimes, chosen by build profile:
 
 - **std-built services** — `std::os::seraph::_start` (shipped via the
-  `ruststd/` overlay) reads `ProcessInfo`, registers the IPC buffer,
+  `ruststd/` overlay) takes the `ProcessInfo` page address as its argument
+  (entry register), reads `ProcessInfo`, registers the IPC buffer,
   bootstraps the heap against the `memmgr_endpoint` delivered in
   `ProcessInfo`, then jumps to `lang_start` → user `fn main`. procmgr
   is itself a std-built service and follows this path.
@@ -139,8 +146,10 @@ safety net.
   uses no `alloc` collections. It is the only std-less process spawned
   by init via raw syscalls besides init itself.
 - **init / ktest** — bespoke `_start` entries that consume `InitInfo`
-  from `INIT_INFO_VADDR` (defined in `abi/init-protocol`) rather than
-  `ProcessInfo`, because the kernel — not procmgr — is their producer.
+  (defined in `abi/init-protocol`) rather than `ProcessInfo`, because the
+  kernel — not procmgr — is their producer. The kernel chooses the
+  `InitInfo` page address and delivers it in the entry register, as procmgr
+  does for `ProcessInfo`.
 
 All variants produce the same `StartupInfo` shape and invoke `main()`,
 then call `sys_thread_exit` if `main()` returns (defensive — should not
@@ -155,7 +164,7 @@ happen).
 | Producer | Kernel (Phase 9) | procmgr |
 | Consumer | init, ktest | All other processes |
 | Handover struct | `InitInfo` | `ProcessInfo` |
-| Placed at | `INIT_INFO_VADDR` | `PROCESS_INFO_VADDR` |
+| Page address | Kernel-chosen, delivered in entry register | Creator-chosen, delivered in entry register |
 | Contains platform-global state | Yes (all memory caps, all HW caps, firmware tables) | No |
 | Contains parent endpoint | No (init has no parent) | Yes |
 | `main()` signature | Same (`&StartupInfo`) | Same (`&StartupInfo`) |

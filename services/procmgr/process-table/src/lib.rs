@@ -76,6 +76,14 @@ pub struct ProcessEntry
     pub cwd_override: u32,
     pub entry_point: u64,
     pub tls_base_va: u64,
+    /// Top of the main-thread stack (SP at entry) the loader chose and mapped
+    /// for this child. Passed to `thread_configure_with_tls` at start so the
+    /// process is launched at the same VA its stack was mapped to.
+    pub stack_top_vaddr: u64,
+    /// VA of the read-only `ProcessInfo` page the loader mapped into the child.
+    /// Delivered to the child in its entry register at start, so the child reads
+    /// its handover struct from the address the loader chose.
+    pub process_info_va: u64,
     pub started: bool,
 }
 
@@ -309,6 +317,8 @@ mod tests
             cwd_override: 0,
             entry_point: 0,
             tls_base_va: 0,
+            stack_top_vaddr: 0,
+            process_info_va: 0,
             started: false,
         }
     }

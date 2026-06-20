@@ -2,9 +2,11 @@
 
 Binary handover contract between the kernel and the init process.
 
-Defines [`InitInfo`] and all associated types placed in a read-only page at
-`INIT_INFO_VADDR` before init runs. Includes `INIT_PROTOCOL_VERSION`; init
-MUST check the version field before accessing any other fields.
+Defines [`InitInfo`] and all associated types placed in a read-only page before
+init runs. The kernel chooses the page's virtual address per-boot and delivers
+it to init in the entry register (`rdi`/`a0`), so the address is not an ABI
+constant. Includes `INIT_PROTOCOL_VERSION`; init MUST check the version field
+before accessing any other fields.
 
 **Constraints:** `no_std`, `#[repr(C)]` for all types, no dependencies outside
 `core`. Changes that alter `InitInfo` layout or CSpace population order MUST

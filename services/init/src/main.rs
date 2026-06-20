@@ -31,9 +31,8 @@ pub(crate) mod walk;
 //
 // init runs no_std with no `std::os::seraph::reserve_pages` allocator; its
 // scratch and IPC-buffer VAs are picked here as private constants. They
-// only need to be disjoint from each other and from the InitInfo page
-// (`INIT_INFO_VADDR` in `abi/init-protocol`) and the kernel-supplied
-// stack range — both of which live high in the lower-canonical half.
+// only need to be disjoint from each other and from the kernel-chosen InitInfo
+// page and stack range — both of which live high in the lower-canonical half.
 
 pub(crate) use syscall_abi::PAGE_SIZE;
 
@@ -100,20 +99,18 @@ pub(crate) fn descriptors(info: &InitInfo) -> &[CapDescriptor]
         return &[];
     }
 
-    // The kernel maps `INIT_INFO_MAX_PAGES` pages contiguously at
-    // `INIT_INFO_VADDR`; the InitInfo header lives at the start, and
-    // `cap_descriptors_offset` indexes into the same region. Construct
-    // the descriptor pointer from the integer address using
-    // `with_exposed_provenance` so the slice is not bounded by the
-    // narrower `&InitInfo` provenance — descriptors may span pages
-    // beyond the first one, and a pointer derived from `info`'s
-    // 112-byte allocation would let the optimiser assume out-of-bounds
-    // reads.
-    let base_addr = init_protocol::INIT_INFO_VADDR as usize + offset;
+    // The kernel maps the `InitInfo` region contiguously; the header lives at
+    // the start and `cap_descriptors_offset` indexes into the same region.
+    // Take the page address as a bare integer via `.addr()` (no provenance) and
+    // rebuild the pointer with `with_exposed_provenance` so the slice is not
+    // bounded by the narrower `&InitInfo` provenance — descriptors may span
+    // pages beyond the first one, and a pointer derived from `info`'s
+    // 112-byte allocation would let the optimiser assume out-of-bounds reads.
+    let base_addr = core::ptr::from_ref::<InitInfo>(info).addr() + offset;
     let ptr = core::ptr::with_exposed_provenance::<CapDescriptor>(base_addr);
-    // SAFETY: kernel has mapped `count * desc_size` valid CapDescriptor
-    // bytes starting at INIT_INFO_VADDR + offset. The exposed-provenance
-    // pointer carries provenance broad enough to cover that span.
+    // SAFETY: kernel has mapped `count * desc_size` valid CapDescriptor bytes
+    // starting at the InitInfo page + offset. The exposed-provenance pointer
+    // carries provenance broad enough to cover that span.
     unsafe { core::slice::from_raw_parts(ptr, count) }
 }
 
@@ -359,8 +356,8 @@ pub(crate) const BASELINE_PRIORITY_MAX: u8 = 20;
 #[allow(clippy::too_many_lines)]
 fn run(info_ptr: u64) -> !
 {
-    // SAFETY: kernel maps InitInfo at info_ptr (= INIT_INFO_VADDR).
-    // cast_ptr_alignment: INIT_INFO_VADDR is page-aligned.
+    // SAFETY: the kernel maps InitInfo at the kernel-chosen VA delivered in
+    // info_ptr. cast_ptr_alignment: that VA is page-aligned.
     #[allow(clippy::cast_ptr_alignment)]
     let info: &InitInfo = unsafe { &*(info_ptr as *const InitInfo) };
 

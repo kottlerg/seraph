@@ -646,9 +646,10 @@ impl ProcessRecord
     }
 }
 
-/// Process tracking table: dense array of records, indexed by an internal
-/// monotonically-incremented badge (held externally as the procmgr-minted
-/// process identity).
+/// Process tracking table: dense array of records keyed by a random
+/// per-process ledger badge (memmgr-minted in `REGISTER_PROCESS`, returned to
+/// the registrant and threaded back as its memmgr / fault badge). Records are
+/// found by equality scan, not array index.
 struct ProcessTable
 {
     /// Slots are stored inline; a slot is free iff `badge == 0` (every minted

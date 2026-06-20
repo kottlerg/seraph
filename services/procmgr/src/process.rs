@@ -38,16 +38,26 @@ const VFS_CHUNK_SIZE: u64 = 63 * 8; // 504 bytes
 /// (writes the badged SEND derivation into `pi.log_send_cap`) AND
 /// `finalize_creation` (table key, death-EQ correlator, process-handle badge).
 ///
-/// Redraws on the rare value whose low 32 bits hit a reserved death-EQ
-/// correlator (`0` or `INIT_REAP_CORRELATOR`); see [`badge_is_acceptable`].
-/// Returns `None` if the entropy draw fails (a kernel-contract violation),
-/// failing the spawn rather than minting a weak badge.
+/// Redraws until the low 32 bits clear `LOG_BADGE_FIRST_CHILD` — keeping the
+/// badge out of the reserved log-badge / no-correlator range that the old
+/// monotonic counter held structurally by starting at 16 — and avoid the
+/// reserved init-reap correlator; see [`badge_is_acceptable`]. Because the
+/// death-EQ correlator is only the low 32 bits, two *live* processes can collide
+/// there at ~2⁻³² (≤`MAX_PROCESSES` live), which `take_by_correlator` resolves
+/// to the first match: an accepted, vanishingly-rare narrowing of the former
+/// monotonic uniqueness. Returns `None` if the entropy draw fails (a
+/// kernel-contract violation), failing the spawn rather than minting a weak
+/// badge.
 fn next_process_badge() -> Option<u64>
 {
     loop
     {
         let t = syscall::random_u64().ok()?;
-        if badge_is_acceptable(t, ipc::procmgr_labels::INIT_REAP_CORRELATOR)
+        if badge_is_acceptable(
+            t,
+            ipc::log_badges::LOG_BADGE_FIRST_CHILD,
+            ipc::procmgr_labels::INIT_REAP_CORRELATOR,
+        )
         {
             return Some(t);
         }

@@ -265,25 +265,28 @@ impl Default for ProcessTable
 
 /// Whether a candidate badge may be handed out as a process badge.
 ///
-/// The low 32 bits of the badge become the death-EQ correlator (the binding
-/// API takes a `u32`). A badge is rejected when those low bits equal a
-/// reserved correlator value:
-/// - `0` — the kernel's "no correlator" sentinel (a death observer bound with
-///   correlator `0` posts the bare exit reason with no high-word tag, which
-///   `dispatch_death` cannot route to a table entry).
-/// - `reserved_low32` — the init-reap correlator (`INIT_REAP_CORRELATOR`),
-///   which `dispatch_death` routes to the init teardown branch.
+/// The low 32 bits of a process badge serve double duty — the death-EQ
+/// correlator (the binding API takes a `u32`) and the logd source badge — so
+/// they must clear every reserved low-word value:
+/// - **below `min_low`** — the reserved log-badge range. `log_badges` reserves
+///   `0..LOG_BADGE_FIRST_CHILD` for system specials: the kernel's `0`
+///   "no correlator" death sentinel, init (`1`), procmgr (`2`), and `3..16`.
+///   A badge whose low word lands here would bind an unroutable death
+///   correlator or evict/contaminate a reserved logd slot — logd evicts every
+///   slot whose low word matches a death correlator.
+/// - **equal to `reserved_low32`** — the init-reap correlator
+///   (`INIT_REAP_CORRELATOR`), which `dispatch_death` routes to init teardown.
 ///
-/// Both are reachable under random badge minting (each ~2⁻³² per draw),
-/// unlike the old monotonic counter which only hit them at u32 wrap.
+/// All are reachable under random badge minting; the old monotonic counter
+/// started at `LOG_BADGE_FIRST_CHILD` and so upheld the floor structurally.
 #[must_use]
-pub fn badge_is_acceptable(badge: u64, reserved_low32: u32) -> bool
+pub fn badge_is_acceptable(badge: u64, min_low: u64, reserved_low32: u32) -> bool
 {
     // The low-32 extraction is intentional: only the truncated u32 reaches
-    // the correlator-bearing death-EQ API, so only the low word can collide.
+    // the correlator-bearing death-EQ API and the logd badge.
     #[allow(clippy::cast_possible_truncation)]
     let low = badge as u32;
-    low != 0 && low != reserved_low32
+    u64::from(low) >= min_low && low != reserved_low32
 }
 
 #[cfg(test)]
@@ -315,27 +318,30 @@ mod tests
     {
         // A bare match and a high-bits-set u64 whose low word equals the
         // sentinel must both be rejected — proving the `as u32` narrowing
-        // rather than a full-u64 compare.
-        assert!(!badge_is_acceptable(u64::from(u32::MAX), u32::MAX));
-        assert!(!badge_is_acceptable(0x0000_0005_FFFF_FFFF, u32::MAX));
+        // rather than a full-u64 compare. (Floor 16 = LOG_BADGE_FIRST_CHILD.)
+        assert!(!badge_is_acceptable(u64::from(u32::MAX), 16, u32::MAX));
+        assert!(!badge_is_acceptable(0x0000_0005_FFFF_FFFF, 16, u32::MAX));
     }
 
     #[test]
-    fn badge_is_rejected_when_low_32_bits_are_zero()
+    fn badge_is_rejected_when_low_word_below_floor()
     {
-        // Low word zero is the kernel's "no correlator" sentinel; reject it
-        // regardless of the high word so every minted badge carries a routable
-        // correlator.
-        assert!(!badge_is_acceptable(0, u32::MAX));
-        assert!(!badge_is_acceptable(0x0000_0007_0000_0000, u32::MAX));
+        // The reserved log-badge / no-correlator range (low word 0..16) is
+        // rejected regardless of the high word, so every minted badge carries
+        // a routable correlator and never aliases a reserved logd slot.
+        assert!(!badge_is_acceptable(0, 16, u32::MAX));
+        assert!(!badge_is_acceptable(1, 16, u32::MAX));
+        assert!(!badge_is_acceptable(2, 16, u32::MAX));
+        assert!(!badge_is_acceptable(15, 16, u32::MAX));
+        assert!(!badge_is_acceptable(0x0000_0007_0000_000F, 16, u32::MAX));
     }
 
     #[test]
-    fn badge_is_accepted_when_low_32_bits_differ_from_reserved_correlator()
+    fn badge_is_accepted_when_low_word_clears_floor_and_correlator()
     {
-        assert!(badge_is_acceptable(16, u32::MAX));
-        // High bits set, low word clear of the sentinel: still acceptable.
-        assert!(badge_is_acceptable(0x0000_0001_0000_0010, u32::MAX));
+        assert!(badge_is_acceptable(16, 16, u32::MAX));
+        // High bits set, low word clears the floor and the sentinel: accepted.
+        assert!(badge_is_acceptable(0x0000_0001_0000_0010, 16, u32::MAX));
     }
 
     #[test]

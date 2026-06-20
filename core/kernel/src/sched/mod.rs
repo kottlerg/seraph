@@ -155,11 +155,6 @@ const fn idle_stack_order() -> usize
     o
 }
 
-// ── Thread ID counter ─────────────────────────────────────────────────────────
-
-/// Atomic counter for assigning unique thread IDs.
-static NEXT_THREAD_ID: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-
 /// Number of CPUs initialised by `sched::init`.
 ///
 /// Written once during boot by `init`, then read by `SYS_SYSTEM_INFO(CpuCount)`.
@@ -1527,14 +1522,22 @@ pub fn sleep_check_wakeups()
     }
 }
 
-/// Allocate a unique thread ID.
+/// Allocate a thread ID.
 ///
-/// Called during idle thread creation, init TCB creation, and
-/// `SYS_CAP_CREATE_THREAD`. IDs are monotonically increasing and never reused.
+/// Called during idle thread creation and `SYS_CAP_CREATE_THREAD` (init's TCB
+/// hardcodes `thread_id: 1`). The value is a random correlator drawn from the
+/// kernel CSPRNG, not a monotonic counter — a monotonic id would leak thread
+/// creation counts/rates wherever it is logged. It is a pure diagnostic
+/// correlator: no `tid → TCB` table exists and it never crosses to userspace
+/// as data, so `u32` collisions (and the one non-log consumer, the owed-wake
+/// watchdog's two-scan suspect match) are tolerated; widening to `u64` is #177.
+///
+/// All call sites run after the entropy pool is seeded (Phase 5) and never in
+/// interrupt context, satisfying [`crate::entropy::next_u32`]'s contract.
 #[cfg(not(test))]
 pub fn alloc_thread_id() -> u32
 {
-    NEXT_THREAD_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+    crate::entropy::next_u32()
 }
 
 // ── Idle thread entry ─────────────────────────────────────────────────────────

@@ -154,14 +154,17 @@ determine pool output.
 ## Draw API and consumers
 
 The kernel-internal draw API is `entropy::fill_bytes(out: &mut [u8])`: it fills
-`out` with CSPRNG bytes from the **calling CPU's** generator. Interrupts are
-disabled for the draw to pin the CPU and bar ISR reentry, giving exclusive,
-migration-free access to that generator. It MUST NOT be called from interrupt
-context (it takes non-reentrant per-CPU state) or before the pool is seeded.
+`out` with CSPRNG bytes from the **calling CPU's** generator. `entropy::next_u32`
+is a convenience wrapper returning a random `u32`. Interrupts are disabled for the
+draw to pin the CPU and bar ISR reentry, giving exclusive, migration-free access
+to that generator. It MUST NOT be called from interrupt context (it takes
+non-reentrant per-CPU state) or before the pool is seeded.
 
-There is no production consumer in the kernel today; the API is foundational for
-the hardening primitives named under Scope. The boot self-test is its current
-exerciser and continuous validator.
+Kernel-internal production consumers are the structural-unguessability hardening
+(#248): the CSpace recycling epoch (`cap::free_cspace_id`) and thread-id
+correlators (`sched::alloc_thread_id`) draw via `next_u32`. Both run after Phase 5
+seeding and never in interrupt context. The boot self-test is the API's continuous
+validator.
 
 ## Boot wiring and lifecycle
 

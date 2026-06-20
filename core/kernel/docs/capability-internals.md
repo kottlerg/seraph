@@ -135,13 +135,17 @@ The slot is 72 bytes (`#[repr(C)]`). 56 slots per CSpace page = 4032 bytes, fitt
 in a 4096-byte slab bin with 64 B of tail slack.
 
 `SlotId` is a global identifier combining a CSpace ID, an epoch generation
-counter, and a slot index: `{cspace_id: u32, epoch: u32, index: NonZeroU32}`
+tag, and a slot index: `{cspace_id: u32, epoch: u32, index: NonZeroU32}`
 (12 bytes; `Option<SlotId>` niche-optimises to the same size via the
 `NonZeroU32` index). This allows derivation tree traversal across CSpace
 boundaries without holding per-CSpace locks longer than necessary, and lets
 `lookup_cspace(id, expected_epoch)` fail fast when a CSpace's id has been
 recycled — a stale `SlotId` stamped with the pre-recycle epoch cannot
-mis-target the new tenant. See #137 for the recycling allocator design.
+mis-target the new tenant. As of #248 the epoch is a random non-zero value
+redrawn on each recycle (not a monotonic counter); the equality check is
+unaffected, and the random redraw excludes the prior value so an
+immediately-recycled `SlotId` always fails fast. See #137 for the recycling
+allocator design.
 
 ### Per-Slot Generation
 

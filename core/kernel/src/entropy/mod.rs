@@ -200,6 +200,18 @@ mod imp
         }
     }
 
+    /// Draw a uniformly-random `u32` from the calling CPU's generator.
+    ///
+    /// Convenience over [`fill_bytes`]; shares its contract — kernel-internal,
+    /// MUST NOT be called from interrupt context, valid only after the pool is
+    /// seeded (Phase 5).
+    pub fn next_u32() -> u32
+    {
+        let mut b = [0u8; 4];
+        fill_bytes(&mut b);
+        u32::from_le_bytes(b)
+    }
+
     /// Whether the pool has been seeded and the draw API is open.
     ///
     /// The pool is seeded in Phase 5, before any userspace process exists
@@ -214,4 +226,4 @@ mod imp
 }
 
 #[cfg(not(test))]
-pub use imp::{fill_bytes, init, init_ap, init_storage, is_seeded};
+pub use imp::{fill_bytes, init, init_ap, init_storage, is_seeded, next_u32};

@@ -222,6 +222,34 @@ let value = unsafe { ptr.read() };
 
 ---
 
+### Cross-Boundary Data Hygiene
+
+Kernel virtual addresses, kernel pointers, and any value derived from one — a
+pointer cast to an integer, a fixed kernel VA, a kernel return address, a saved
+kernel stack pointer — MUST NOT cross into userspace. This covers every
+cross-boundary output: syscall return registers, IPC label/badge/data/cap-slot
+fields, fault and exception messages, exit and death reasons, and `SYS_CAP_INFO` /
+`SYS_SYSTEM_INFO` / `SYS_ASPACE_QUERY` selectors.
+
+- Kernel-minted identifiers observed across the boundary MUST be opaque and
+  unguessable — drawn from the entropy root (`entropy::next_u32` /
+  `entropy::fill_bytes`), never a monotonic counter that leaks creation counts or
+  rates.
+- A value that must cross and cannot be made opaque MUST be fixed by ABI contract
+  (an enum discriminant, a constant, or a count) and documented as such.
+- A physical address MAY cross only where an ABI contract requires it and the caller
+  already holds the capability the address describes; the kernel virtual mapping of
+  that physical address MUST NOT be exposed.
+- Kernel-pointer values MAY appear only in kernel-owned console diagnostics
+  (`kprint!` / `kprintln!`), which the console-model contract keeps off any
+  userspace-readable channel. They MUST NOT reach a userspace IPC or log channel.
+
+New or changed cross-boundary outputs MUST be classified in the kernel
+cross-boundary disclosure inventory (`core/kernel/docs/cross-boundary-disclosure.md`)
+in the same change.
+
+---
+
 ### Documentation
 
 - All public APIs MUST have rustdoc comments covering behaviour, arguments, return value,

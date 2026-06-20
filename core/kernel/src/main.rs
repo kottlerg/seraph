@@ -1140,7 +1140,11 @@ unsafe fn kernel_entry_post_rebase(
                         iopb: core::ptr::null_mut(),
                         blocked_on_object: core::ptr::null_mut(),
                         cspace: core::ptr::null_mut(),
-                        thread_id: 1, // 0 = idle BSP, 1 = init
+                        // Init's tid is the one intentionally-stable thread
+                        // correlator (kept for early-boot log triage); idle
+                        // threads and all dynamically-created threads draw a
+                        // random tid via `alloc_thread_id`.
+                        thread_id: 1,
                         context_saved: core::sync::atomic::AtomicU32::new(1),
                         wake_in_flight: core::sync::atomic::AtomicU32::new(0),
                         death_observers: [sched::thread::DeathObserver::empty();

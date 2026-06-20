@@ -2360,7 +2360,7 @@ unsafe fn dealloc_object_one(
             }
 
             // Recycle the id last, after all of the dying CSpace's storage
-            // is reclaimed and DERIVATION_LOCK is released. Bumping the
+            // is reclaimed and DERIVATION_LOCK is released. Randomizing the
             // epoch now invalidates any surviving SlotId stamped with the
             // pre-recycle value — subsequent `lookup_cspace` returns None.
             if needs_free_id

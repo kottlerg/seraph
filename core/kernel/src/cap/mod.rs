@@ -134,8 +134,8 @@ pub unsafe fn root_cspace_mut() -> Option<&'static mut CSpace>
 ///
 /// IDs are recycled via the [`CSPACE_FREE_LIST`] free list once
 /// [`free_cspace_id`] runs at the end of a `CSpace`'s `dealloc_object` pass,
-/// so this is a live-count bound, not a cumulative-ever bound. Per-id
-/// generation counters in [`CSPACE_REGISTRY`] make any stale `SlotId`
+/// so this is a live-count bound, not a cumulative-ever bound. Per-id epochs
+/// in [`CSPACE_REGISTRY`], randomized on recycle, make any stale `SlotId`
 /// resolution fail fast on epoch mismatch, so recycling cannot mis-target a
 /// recycled tenant. The pre-unregister derivation drain (`dealloc_object`
 /// for `CSpaceObj`) additionally scrubs the back-links in steady state.
@@ -155,7 +155,7 @@ static HIGH_WATER_CSPACE_ID: AtomicU32 = AtomicU32::new(0);
 /// One slot of the global `CSpace` registry.
 ///
 /// `ptr` is the live `CSpace` pointer or null when the slot is vacant.
-/// `epoch` is a generation counter incremented each time an id is freed
+/// `epoch` is a generation tag randomized each time an id is freed
 /// (see [`free_cspace_id`]); a `SlotId` stamped with a stale epoch fails
 /// resolution at [`lookup_cspace`] so a recycled id cannot alias a foreign
 /// derivation link into the new tenant.
@@ -190,7 +190,7 @@ impl CSpaceRegistryEntry
 ///
 /// Populated by [`register_cspace`] when a `CSpace` is created. Cleared by
 /// [`unregister_cspace`] when the backing object is freed. The epoch is
-/// bumped by [`free_cspace_id`] at the end of `dealloc_object` so any
+/// randomized by [`free_cspace_id`] at the end of `dealloc_object` so any
 /// stale `SlotId` carrying the old epoch fails fast on subsequent
 /// resolution.
 ///
@@ -198,7 +198,7 @@ impl CSpaceRegistryEntry
 /// A non-null `ptr` is valid as long as the corresponding `CSpaceKernelObject`
 /// refcount is > 0. After `dec_ref` reaches 0 and `dealloc_object` runs,
 /// `unregister_cspace` clears `ptr` before the memory is freed, and
-/// `free_cspace_id` bumps `epoch` before the id returns to the free list.
+/// `free_cspace_id` randomizes `epoch` before the id returns to the free list.
 static CSPACE_REGISTRY: [CSpaceRegistryEntry; MAX_CSPACES] =
     [const { CSpaceRegistryEntry::empty() }; MAX_CSPACES];
 
@@ -329,7 +329,7 @@ pub fn register_cspace(id: CSpaceId, ptr: *mut CSpace) -> Result<u32, ()>
 ///
 /// Called from `dealloc_object` for `ObjectType::CSpaceObj` *before* freeing
 /// the backing allocation, so no dangling pointer is observable. The
-/// generation bump that retires this id is deferred to [`free_cspace_id`]
+/// epoch randomization that retires this id is deferred to [`free_cspace_id`]
 /// so the pre-unregister derivation drain can still resolve foreign
 /// back-links into this `CSpace`'s live (now-quiescent) registry entry.
 pub fn unregister_cspace(id: CSpaceId)
@@ -342,16 +342,21 @@ pub fn unregister_cspace(id: CSpaceId)
     }
 }
 
-/// Bump the registry epoch for `id` and return it to the free list.
+/// Randomize the registry epoch for `id` and return it to the free list.
 ///
 /// Pre-condition: `unregister_cspace(id)` has run (registry `ptr` is null).
-/// Bumping the epoch invalidates any surviving `SlotId` stamped with the
-/// old value — subsequent `lookup_cspace(id, old_epoch)` returns `None`.
+/// The new epoch is drawn from the kernel CSPRNG, excluding the sentinel `0`
+/// and the current value, so any surviving `SlotId` stamped with the old
+/// value fails resolution at [`lookup_cspace`], and the epoch carries no
+/// monotonic information that would leak recycle counts or rates.
 ///
-/// If the epoch would overflow `u32`, the id is permanently retired: not
-/// pushed back to the free list. The eventually-leaked-id rate is bounded
-/// by `u32::MAX` recycles per id, which is unreachable in any realistic
-/// system lifetime (≥13 years at 10k recycles/sec/id).
+/// Excluding the current value guarantees an immediately-recycled `SlotId`
+/// always fails fast (ties to #174). A `SlotId` stale across *multiple*
+/// recycles can alias a later random epoch with probability ~2⁻³² per
+/// recycle — an accepted defense-in-depth trade for the eliminated
+/// enumeration leak (the capability, not the `SlotId`, is the authority).
+/// Unlike the former monotonic scheme there is no wrap point, so ids recycle
+/// indefinitely with no leak.
 ///
 /// Asserts `id != 0`: the root `CSpace`'s id is reserved for kernel
 /// lifetime; the `HDR_FLAG_IS_ROOT` clamp in `dec_ref` should already make
@@ -366,15 +371,19 @@ pub fn free_cspace_id(id: CSpaceId)
         entry.ptr.load(Ordering::Acquire).is_null(),
         "free_cspace_id called before unregister_cspace for id {id}"
     );
-    let prev = entry.epoch.fetch_add(1, Ordering::AcqRel);
-    if prev == u32::MAX
+    // Single logical writer to this entry's epoch in the free window: the
+    // caller (`dealloc_object` for `CSpaceObj`) has already run
+    // `unregister_cspace` and not yet returned the id to the free list, so the
+    // id is neither live nor recyclable elsewhere. A load-then-store therefore
+    // needs no RMW. `lookup_cspace`'s Acquire double-load still rejects a
+    // concurrent reader because the stored value differs from the old one.
+    let cur = entry.epoch.load(Ordering::Acquire);
+    let mut next = crate::entropy::next_u32();
+    while next == 0 || next == cur
     {
-        // Retired: the next fetch_add would wrap to 0, which the registry
-        // initialiser treats as "no entry"/free-list sentinel. Leak the id
-        // rather than risk aliasing.
-        crate::kprintln!("cspace: id {id} retired (epoch wraparound)");
-        return;
+        next = crate::entropy::next_u32();
     }
+    entry.epoch.store(next, Ordering::Release);
     push_free(id);
 }
 
@@ -2730,19 +2739,21 @@ mod tests
         );
 
         // Destroy A and recycle the id. `free_cspace_id` is
-        // `#[cfg(not(test))]` (touches the host-absent free list); replicate
-        // its one registry mutation — the epoch bump — directly.
-        // `unregister_cspace` clears the ptr. #248 will randomize this bump;
-        // the assertions below check the property (epoch changed ⇒ stale
-        // fails), not the arithmetic, so only this line tracks #248.
+        // `#[cfg(not(test))]` (touches the host-absent free list and the
+        // kernel CSPRNG); replicate its one registry mutation — the epoch
+        // change — directly. `unregister_cspace` clears the ptr. #248
+        // randomized this in production; the test stores a fixed distinct
+        // non-zero epoch to stay deterministic (coding-standards: no
+        // randomness in tests). The assertions check the property (epoch
+        // changed ⇒ stale fails), not the arithmetic.
         unregister_cspace(id);
         CSPACE_REGISTRY[id as usize]
             .epoch
-            .fetch_add(1, Ordering::AcqRel);
+            .store(epoch_a ^ 0x5EED_0001, Ordering::Release);
 
-        // Tenant B reuses the id at the bumped epoch.
+        // Tenant B reuses the id at the new epoch.
         let epoch_b = register_cspace(id, tenant_b).expect("register tenant B");
-        assert_ne!(epoch_b, epoch_a, "recycle must advance the epoch");
+        assert_ne!(epoch_b, epoch_a, "recycle must change the epoch");
         let fresh = SlotId::current(id, idx);
         assert_eq!(fresh.epoch, epoch_b);
 

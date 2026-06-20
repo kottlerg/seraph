@@ -343,15 +343,11 @@ unsafe fn step1_locate_uefi_protocols(
     }
     if framebuffer.physical_base != 0
     {
-        // SAFETY: the serial console backend is initialized before this step,
-        // so direct console writes are valid here.
-        unsafe {
-            crate::console::console_write_str("[--------] boot: GOP: present ");
-            crate::console::console_write_dec32(framebuffer.width);
-            crate::console::console_write_str("x");
-            crate::console::console_write_dec32(framebuffer.height);
-            crate::console::console_write_str("\r\n");
-        }
+        bprintln!(
+            "[--------] boot: GOP: present {}x{}",
+            framebuffer.width,
+            framebuffer.height
+        );
     }
     else
     {
@@ -404,12 +400,7 @@ unsafe fn step2_load_bundle(ctx: &UefiContext) -> Result<BundleLoad, BootError>
     // SAFETY: file is open at position 0; buf is the correct size.
     unsafe { file_read(file, buf)? };
 
-    bprint!("[--------] boot: bundle size=");
-    // SAFETY: console initialized.
-    unsafe {
-        crate::console::console_write_hex64(len as u64);
-    }
-    bprintln!(" bytes");
+    bprintln!("[--------] boot: bundle size={:#018x} bytes", len as u64);
 
     Ok(BundleLoad {
         phys,
@@ -447,26 +438,12 @@ unsafe fn step3_load_kernel(ctx: &UefiContext) -> Result<KernelLoad, BootError>
     // SAFETY: bs is valid; kernel_buf is the complete ELF file.
     let info = unsafe { load_kernel(ctx.bs, kernel_buf, arch::current::EXPECTED_ELF_MACHINE)? };
 
-    // Direct-write helpers avoid format-arg vtable dispatch — on RISC-V the
-    // PE .reloc section is currently empty, so the firmware does not patch
-    // vtable entries when relocating the image and core::fmt's fat-pointer
-    // write_str faults.
-    bprint!("[--------] boot: kernel base=");
-    // SAFETY: console initialized.
-    unsafe {
-        crate::console::console_write_hex64(info.physical_base);
-    }
-    bprint!("  entry=");
-    // SAFETY: console initialized.
-    unsafe {
-        crate::console::console_write_hex64(info.entry_virtual);
-    }
-    bprint!("  size=");
-    // SAFETY: console initialized.
-    unsafe {
-        crate::console::console_write_hex64(info.size);
-    }
-    bprintln!(" bytes");
+    bprintln!(
+        "[--------] boot: kernel base={:#018x}  entry={:#018x}  size={:#018x} bytes",
+        info.physical_base,
+        info.entry_virtual,
+        info.size
+    );
 
     Ok(KernelLoad {
         info,
@@ -560,17 +537,11 @@ unsafe fn step4_parse_bundle(
             // SAFETY: bs is valid; body is the complete ELF file slice.
             let image = unsafe { load_init(ctx.bs, body, arch::current::EXPECTED_ELF_MACHINE)? };
             init_image = Some(image);
-            bprint!("[--------] boot: init entry=");
-            // SAFETY: console initialized.
-            unsafe {
-                crate::console::console_write_hex64(image.entry_point);
-            }
-            bprint!("  size=");
-            // SAFETY: console initialized.
-            unsafe {
-                crate::console::console_write_hex64(entry.size);
-            }
-            bprintln!(" bytes");
+            bprintln!(
+                "[--------] boot: init entry={:#018x}  size={:#018x} bytes",
+                image.entry_point,
+                entry.size
+            );
         }
         else
         {
@@ -645,10 +616,7 @@ unsafe fn step5_discover_cpu_topology(ctx: &UefiContext, firm: &FirmwareInfo) ->
     {
         // SAFETY: acpi_rsdp is identity-mapped; parse_cpu_topology validates the table.
         let (count, _, cpu_ids) = unsafe { acpi::parse_cpu_topology(firm.acpi_rsdp, bsp_id) };
-        bprint!("[--------] boot: ACPI: ");
-        // SAFETY: console initialized.
-        unsafe { crate::console::console_write_dec32(count) };
-        bprintln!(" CPU(s) found via MADT");
+        bprintln!("[--------] boot: ACPI: {count} CPU(s) found via MADT");
         CpuTopology {
             boot_hart_id,
             bsp_id,
@@ -662,10 +630,7 @@ unsafe fn step5_discover_cpu_topology(ctx: &UefiContext, firm: &FirmwareInfo) ->
         let (count, hart_ids) = unsafe { dtb::parse_cpu_count(firm.device_tree) };
         if count > 0
         {
-            bprint!("[--------] boot: DTB: ");
-            // SAFETY: console initialized.
-            unsafe { crate::console::console_write_dec32(count) };
-            bprintln!(" hart(s) found");
+            bprintln!("[--------] boot: DTB: {count} hart(s) found");
             let mut cpu_ids = [0u32; MAX_CPUS];
             cpu_ids[0] = bsp_id;
             let mut ap_idx = 1usize;
@@ -722,10 +687,7 @@ unsafe fn step5b_alloc_ap_trampoline(ctx: &UefiContext) -> u64
     // SAFETY: ctx.bs is valid.
     if let Some(phys) = unsafe { arch::current::allocate_ap_trampoline(ctx.bs) }
     {
-        bprint!("[--------] boot: AP trampoline page: ");
-        // SAFETY: console initialized.
-        unsafe { crate::console::console_write_hex64(phys) };
-        bprintln!("");
+        bprintln!("[--------] boot: AP trampoline page: {phys:#018x}");
         phys
     }
     else
@@ -1106,13 +1068,7 @@ unsafe fn step9_populate_boot_info(
     let aperture_count = unsafe {
         memory_map::derive_mmio_apertures(uefi_map, &aperture_seed[..seed_count], apertures_buf)
     };
-    bprint!("[--------] boot: MMIO apertures: ");
-    #[allow(clippy::cast_possible_truncation)]
-    // SAFETY: console initialized.
-    unsafe {
-        crate::console::console_write_dec32(aperture_count as u32);
-    }
-    bprintln!(" derived");
+    bprintln!("[--------] boot: MMIO apertures: {aperture_count} derived");
 
     // Build the reclaim-after-Phase-7 array in the dedicated 4 KiB page at
     // `allocs.reclaim_array_phys`. AP trampoline is handled by kernel-side
@@ -1219,13 +1175,7 @@ unsafe fn step9_populate_boot_info(
     // The reclaim-array page itself is reclaim-safe once the kernel has
     // walked it — record it last so the kernel processes it in order.
     push_reclaim(allocs.reclaim_array_phys, 1, 0);
-    bprint!("[--------] boot: reclaim_ranges: ");
-    #[allow(clippy::cast_possible_truncation)]
-    // SAFETY: console initialized.
-    unsafe {
-        crate::console::console_write_dec32(reclaim_len as u32);
-    }
-    bprintln!(" entries recorded");
+    bprintln!("[--------] boot: reclaim_ranges: {reclaim_len} entries recorded");
 
     // Write the populated BootInfo.
     // SAFETY: boot_info_phys is a valid 4 KiB allocation; BootInfo fits in one page.

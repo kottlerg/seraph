@@ -19,12 +19,13 @@
 //   0x040: PE signature (4 bytes)
 //   0x044: COFF file header (20 bytes)
 //   0x058: PE32+ optional header (240 bytes)
-//   0x148: .text  section header (40 bytes) — code + rodata, RX
-//   0x170: .data  section header (40 bytes) — data + bss,   RW
+//   0x148: .text  section header (40 bytes) — code only, RX
+//   0x170: .data  section header (40 bytes) — rodata + relocs + data + bss, RW
 //   0x198: .reloc section header (40 bytes) — base relocs,  discardable
 //   0x1C0: padding to 0x1000 (page boundary)
-//   0x1000: .text section — entry trampoline, then Rust code, then .rodata
-//   _etext: .data section — initialised data (_edata), then BSS (virtual only)
+//   0x1000: .text section — entry trampoline, then Rust code (RX, code only)
+//   _etext: .data section — .rodata/.data.rel.ro, .dynamic/.rela.dyn, .got,
+//           initialised data, then BSS (RW; reloc targets, written at entry)
 //   _ebss:  .reloc section — minimal base-relocation block
 //
 // References:
@@ -70,8 +71,8 @@ opt_hdr:
     .short  0x020B                                  // Magic: PE32+
     .byte   0                                       // MajorLinkerVersion
     .byte   0                                       // MinorLinkerVersion
-    .long   _etext - _start                         // SizeOfCode (code + rodata only)
-    .long   _ebss  - _etext                         // SizeOfInitializedData (data + bss, in file)
+    .long   _etext - _start                         // SizeOfCode (code only)
+    .long   _ebss  - _etext                         // SizeOfInitializedData (rodata + relocs + data + bss, in file)
     .long   0                                       // SizeOfUninitializedData (bss zero-fill included above)
     .long   _start - pecoff_header_start            // AddressOfEntryPoint (RVA)
     .long   _start - pecoff_header_start            // BaseOfCode (RVA)
@@ -124,9 +125,9 @@ opt_hdr_end:
 
 // ── Section headers (3 × 40 bytes) ────────────────────────────────────────────
 
-    // .text section header — code + .rodata, read+execute only.
+    // .text section header — code only, read+execute only.
     .ascii  ".text\0\0\0"                           // Name (8 bytes, zero-padded)
-    .long   _etext - _start                         // VirtualSize (code + rodata)
+    .long   _etext - _start                         // VirtualSize (code only)
     .long   _start - pecoff_header_start            // VirtualAddress (RVA)
     .long   _etext - _start                         // SizeOfRawData (all present in file)
     .long   _start - pecoff_header_start            // PointerToRawData (file offset)
@@ -140,7 +141,8 @@ opt_hdr_end:
     //   IMAGE_SCN_MEM_READ                0x40000000
     .long   0x60000020
 
-    // .data section header — .data + .bss, read+write.
+    // .data section header — .rodata/.data.rel.ro, reloc metadata, .got, .data,
+    // .bss; read+write so the entry self-relocation loop can write reloc targets.
     // llvm-objcopy -O binary zero-fills ALLOC/NOBITS regions (.bss), so the
     // flat binary contains bytes for the entire [_etext, _ebss) range.
     // Using SizeOfRawData = _ebss - _etext (page-aligned, always non-zero) avoids
@@ -196,6 +198,46 @@ opt_hdr_end:
     .section ".text.entry", "ax"
     .global _start
 _start:
+    // ── Static-PIE self-relocation ────────────────────────────────────────────
+    //
+    // UEFI loads this flat image at an arbitrary base. The bootloader is linked
+    // as a position-independent executable, so absolute data pointers (slice
+    // data pointers, &str, fn-ptr/vtable tables, GOT slots) are recorded as
+    // R_RISCV_RELATIVE entries in .rela.dyn with addends relative to image base
+    // 0. Apply them here, before any Rust code runs, using only PC-relative
+    // addressing so this loop itself needs no relocation.
+    //
+    // a0 = image_handle, a1 = system_table — preserved for efi_main (only the
+    // t0..t5 temporaries are used).
+    //
+    // Elf64_Rela is 24 bytes: r_offset (+0), r_info (+8), r_addend (+16).
+    // R_RISCV_RELATIVE == 3 (low 32 bits of r_info; symbol index 0). Fixup:
+    //   *(u64 *)(bias + r_offset) = bias + r_addend
+    //
+    // pecoff_header_start is linked at 0, so its runtime address == the load
+    // bias.
+    lla     t0, pecoff_header_start     // t0 = load bias
+    lla     t1, __rela_dyn_start        // t1 = cursor
+    lla     t2, __rela_dyn_end          // t2 = end
+1:
+    bgeu    t1, t2, 2f                  // while (cursor < end)
+    ld      t3, 8(t1)                   // t3 = r_info
+    slli    t4, t3, 32
+    srli    t4, t4, 32                  // t4 = r_info & 0xffffffff = r_type
+    li      t5, 3                       // R_RISCV_RELATIVE
+    bne     t4, t5, 3f                  // skip non-RELATIVE entries defensively
+    ld      t3, 0(t1)                   // t3 = r_offset
+    ld      t4, 16(t1)                  // t4 = r_addend
+    add     t3, t3, t0                  // t3 = bias + r_offset (target address)
+    add     t4, t4, t0                  // t4 = bias + r_addend (relocated value)
+    sd      t4, 0(t3)                   // store fixup
+3:
+    addi    t1, t1, 24                  // cursor += sizeof(Elf64_Rela)
+    j       1b
+2:
+    // Only .rodata/.data/.got were patched (data, never instruction-fetched),
+    // so no fence.i is required before transferring control.
+    //
     // Tail-call into the Rust UEFI entry point.
     // `tail` is a PC-relative far jump using t1; does not save ra.
     tail    efi_main
@@ -203,9 +245,10 @@ _start:
 // ── Minimal base-relocation block ─────────────────────────────────────────────
 //
 // The EFI loader checks for a .reloc section to confirm the image is
-// relocatable. Since the bootloader uses static relocation-model with PC-relative
-// addressing (medany/medium code model, no GOT, no absolute addresses), the
-// block is empty (SizeOfBlock = 8 = header only, zero relocation entries).
+// relocatable and to permit loading at a non-preferred base. Firmware does not
+// understand RISC-V R_RISCV_RELATIVE entries, so this PE base-relocation table
+// is left empty (SizeOfBlock = 8 = header only, zero entries); the actual
+// fixups are applied by the self-relocation loop in _start from .rela.dyn.
 //
 // BaseRelocationBlock layout:
 //   uint32_t VirtualAddress   -- page RVA covered by this block

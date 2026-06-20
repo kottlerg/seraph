@@ -12,11 +12,23 @@
     "panic-strategy": "abort",
     "features": "+m,+a,+c",
     "code-model": "medium",
-    "relocation-model": "static",
+    "relocation-model": "pic",
+    "position-independent-executables": true,
+    "static-position-independent-executables": true,
+    "plt-by-default": false,
     "llvm-abiname": "lp64",
     "max-atomic-width": 64,
     "pre-link-args": {
-        "ld.lld": ["--gc-sections"]
+        "ld.lld": [
+            "--gc-sections",
+            "-pie",
+            "--no-dynamic-linker",
+            "-z",
+            "notext",
+            "-z",
+            "norelro",
+            "-Bsymbolic"
+        ]
     },
     "emit-debug-gdb-scripts": false
 }

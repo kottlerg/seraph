@@ -36,7 +36,7 @@ Offset   Size   Content
 0x040     4     PE signature = "PE\0\0"
 0x044    20     COFF file header
                   Machine          = 0x5064 (IMAGE_FILE_MACHINE_RISCV64)
-                  NumberOfSections = 2 (.text, .reloc)
+                  NumberOfSections = 3 (.text, .data, .reloc)
                   TimeDateStamp    = 0 (reproducible builds)
                   SizeOfOptionalHeader = sizeof(optional header)
                   Characteristics  = 0x020E
@@ -56,14 +56,23 @@ Offset   Size   Content
                   SizeOfRawData    = _etext - _start
                   PointerToRawData = offset of _start in flat binary
                   Characteristics  = 0x60000020 (code, executable, readable)
-0x170    40     .reloc section header
+0x170    40     .data section header
+                  Name             = ".data\0\0\0"
+                  VirtualAddress   = RVA of _etext
+                  SizeOfRawData    = _ebss - _etext
+                  Characteristics  = 0xC0000040 (initialised data, readable, writable)
+0x198    40     .reloc section header
                   Name             = ".reloc\0\0"
                   VirtualAddress   = RVA of _reloc_start
                   SizeOfRawData    = 8 (one empty block, header only)
                   Characteristics  = 0x42000040 (initialised data, discardable, readable)
-0x198   ~1640   Padding to 0x1000 (page boundary)
-0x1000   —      .text section: entry trampoline (_start) followed by compiled Rust code
-  ...    —      .reloc section: minimal base-relocation block (8 bytes)
+0x1C0   ~1600   Padding to 0x1000 (page boundary)
+0x1000   —      .text section: entry trampoline (_start) + compiled Rust code
+                  only (RX); ends at the _etext page boundary
+  ...    —      .data section: .rodata / .data.rel.ro, the .dynamic / .rela.dyn
+                  relocation metadata, .got, initialised data, .bss zero-fill
+                  (RW — the self-relocation loop writes the reloc targets here)
+  ...    —      .reloc section: empty PE base-relocation block (8 bytes)
 ```
 
 The `Characteristics` field in the COFF file header is `0x020E`:
@@ -90,18 +99,39 @@ asm.
 
 ---
 
-## Minimal Base-Relocation Block
+## Relocation: static-PIE self-relocation
 
-UEFI checks that the loaded image has a `.reloc` section before loading
-it. The section must contain at least one base-relocation block. The
-bootloader is compiled as a PIC ELF (no absolute addresses), so there
-are no actual relocations to apply — the `.reloc` section holds a single
-empty block (8 bytes: `VirtualAddress = 0`, `SizeOfBlock = 8`, zero
-relocation entries). An empty block is valid per the PE/COFF
-specification; its presence satisfies the UEFI loader's requirement for
-a `.reloc` section without altering the image's runtime behaviour. See
-[`boot/src/arch/riscv64/header.S`](../src/arch/riscv64/header.S) for the
-asm.
+The bootloader is linked as a position-independent executable (`-pie`).
+Position-independence makes *code* references PC-relative, but absolute
+*data* pointers — slice data pointers, `&str`, fn-pointer / vtable tables,
+`core::fmt` infrastructure, and any GOT slots — are recorded as
+`R_RISCV_RELATIVE` dynamic relocations in `.rela.dyn`, each with an addend
+relative to image base 0. They must be fixed up by adding the runtime load
+bias, or dereferencing them faults at a low link-time address (the failure
+mode that motivated this design; see issue #399).
+
+UEFI firmware does not understand RISC-V `R_RISCV_RELATIVE` entries, so the
+bootloader applies them itself. The entry trampoline at `_start` runs a
+PC-relative-only assembly loop *before any Rust code executes*: it computes
+the load bias from `lla pecoff_header_start` (linked at 0, so its runtime
+address is the bias), walks the `Elf64_Rela` array between
+`__rela_dyn_start` and `__rela_dyn_end`, and for each `R_RISCV_RELATIVE`
+entry writes `*(bias + r_offset) = bias + r_addend`. The loop touches only
+data (`.rodata`/`.data.rel.ro`/`.got`), never instructions, so no `fence.i`
+is needed. The relocation *targets* live in `.rodata` / `.data.rel.ro` /
+`.got`, which the linker script places in the **writable** PE `.data`
+section range (`[_etext, _ebss)`); EDK2 maps the RX `.text` section
+read-only, so the loop could not store fixups if those targets stayed
+there. `.rela.dyn` and `.dynamic` share that `.data` range, so UEFI maps
+them without a dedicated PE section header.
+
+The PE `.reloc` section is retained but left as a single empty block
+(8 bytes: `VirtualAddress = 0`, `SizeOfBlock = 8`, zero entries). UEFI
+checks for a `.reloc` section before loading an image at a non-preferred
+base; an empty block satisfies that check (valid per the PE/COFF
+specification) while the real fixups are applied by the self-relocation
+loop. See [`boot/src/arch/riscv64/header.S`](../src/arch/riscv64/header.S)
+for the asm.
 
 ---
 
@@ -110,11 +140,17 @@ asm.
 [`boot/linker/riscv64-uefi.ld`](../linker/riscv64-uefi.ld) controls the
 layout of the flat binary. It places `.pecoff_header` at output offset
 `0x0`, pins `.text` at `0x1000` (aligned to the PE32+ section
-granularity) with `_start` as the first symbol, follows with the
-standard `.rodata` / `.data` / `.bss` tails, emits a `.reloc` section
-for UEFI to find, and discards `.eh_frame`, `.note.*`, `.comment`, and
-`.gnu.*` sections that would otherwise inflate the flat binary.
-`ENTRY(_start)` selects the entry symbol. The script is the
+granularity) with `_start` as the first symbol and **code only**, then
+sets `_etext` at the next page boundary (end of the RX `.text` PE
+section). Everything after `_etext` is in the **writable** `.data` PE
+section: `.rodata` / `.data.rel.ro` (relocation targets), the `.dynamic`
+/ `.rela.dyn` metadata, `.got`, then the `.data` / `.bss` tails. They are
+placed after `_etext` precisely so EDK2 maps them RW and the
+self-relocation loop can write the fixups. The script emits the empty
+`.reloc` section for UEFI to find, and discards `.eh_frame`, `.note.*`,
+`.comment`, and the dynamic-linking metadata (`.interp` / `.dynsym` /
+`.dynstr` / hash tables) that a self-relocating static-PIE never consults
+at runtime. `ENTRY(_start)` selects the entry symbol. The script is the
 authoritative layout description — do not duplicate it here.
 
 The key symbols exported by the linker script for use in `header.S`:
@@ -123,10 +159,11 @@ The key symbols exported by the linker script for use in `header.S`:
 |---|---|
 | `_start` | First byte of the entry trampoline; also `AddressOfEntryPoint` RVA |
 | `_etext` | End of the `.text` section; used to compute `SizeOfCode` |
+| `__rela_dyn_start` / `__rela_dyn_end` | Bound the `.rela.dyn` array walked by the self-relocation loop |
 | `_reloc_start` | Start of the `.reloc` section; base-relocation VirtualAddress |
 | `_reloc_end` | End of the `.reloc` section |
 | `_image_end` | End of the entire image; used for `SizeOfImage` |
-| `pecoff_header_start` | Byte 0 of the image; all RVAs are relative to this symbol |
+| `pecoff_header_start` | Byte 0 of the image; runtime address equals the load bias |
 
 ---
 
@@ -148,10 +185,15 @@ The RISC-V bootloader uses a custom Cargo target specification,
 | `linker-flavor` | `"ld.lld"` | `"ld.lld"` |
 | `pre-link-args` | custom linker script | custom linker script |
 
-The `relocation-model: "pic"` setting is critical — it instructs LLVM to emit PIC
-code (PC-relative addressing, no absolute symbols). This is required because UEFI
-loads the image at an arbitrary address chosen at runtime; the assembled flat binary
-must be position-independent.
+The `relocation-model: "pic"` setting (with `-pie`,
+`position-independent-executables`, and `static-position-independent-executables`)
+is critical. It makes code PC-relative and, crucially, causes absolute *data*
+pointers to be emitted as `R_RISCV_RELATIVE` entries in `.rela.dyn` rather than
+baked-in link-time constants. This is required because UEFI loads the image at an
+arbitrary address chosen at runtime; the self-relocation loop in `header.S` then
+applies those relocations at entry (see "Relocation: static-PIE self-relocation").
+`-Bsymbolic` and `--no-dynamic-linker` keep `.rela.dyn` free of symbolic entries
+so every relocation is a base-relative `R_RISCV_RELATIVE`.
 
 ---
 

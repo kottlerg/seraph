@@ -85,6 +85,7 @@ kernel/
     ├── arch-interface.md       # Architecture abstraction layer and dispatch surface
     ├── initialization.md       # Boot-to-init sequence, phase by phase
     ├── syscalls.md             # Syscall ABI and complete syscall table
+    ├── cross-boundary-disclosure.md # Kernel-pointer leak audit of cross-boundary outputs (KASLR prerequisite)
     ├── memory-internals.md     # Memory subsystem implementation details
     ├── capability-internals.md # Capability subsystem implementation details
     ├── entropy.md              # Entropy subsystem, CSPRNG, health tests, draw API
@@ -148,7 +149,9 @@ protocol.
 
 The syscall dispatch layer. Architecture-specific entry glue (in `arch/*/syscall.rs`)
 calls into this module's dispatch table, which routes to the appropriate subsystem
-implementation. See [`docs/syscalls.md`](docs/syscalls.md).
+implementation. See [`docs/syscalls.md`](docs/syscalls.md). The audit confirming no
+cross-boundary output (syscall, IPC, fault, exit) leaks a kernel virtual address is
+in [`docs/cross-boundary-disclosure.md`](docs/cross-boundary-disclosure.md).
 
 ---
 

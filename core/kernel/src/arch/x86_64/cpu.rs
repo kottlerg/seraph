@@ -18,31 +18,17 @@
 
 // ── CPUID ─────────────────────────────────────────────────────────────────────
 
-/// Execute CPUID with leaf `leaf`. Returns `(eax, ebx, ecx, edx)`.
+/// Execute CPUID with leaf `leaf` (sub-leaf 0). Returns `(eax, ebx, ecx, edx)`.
 ///
-/// `rbx` is callee-saved and also used internally by LLVM, so it is
-/// preserved via a push/pop around the `cpuid` instruction.
+/// `rbx` is callee-saved and reserved by LLVM, so the EBX result must be
+/// shuttled out without leaving it in `rbx`. The `core` intrinsic does this
+/// correctly; a hand-rolled `push rbx` / `mov out, ebx` / `pop rbx` sequence is
+/// fragile because the chosen output register may itself alias `rbx`, in which
+/// case the `pop` clobbers the result.
 pub fn cpuid(leaf: u32) -> (u32, u32, u32, u32)
 {
-    let eax: u32;
-    let ebx: u32;
-    let ecx: u32;
-    let edx: u32;
-    // SAFETY: CPUID is a valid unprivileged instruction on all x86-64 CPUs; rbx preserved.
-    unsafe {
-        core::arch::asm!(
-            "push rbx",
-            "cpuid",
-            "mov {ebx_out:e}, ebx",
-            "pop rbx",
-            inout("eax") leaf => eax,
-            ebx_out = lateout(reg) ebx,
-            inout("ecx") 0u32 => ecx,
-            lateout("edx") edx,
-            // nostack omitted: push/pop modifies the stack pointer.
-        );
-    }
-    (eax, ebx, ecx, edx)
+    let r = core::arch::x86_64::__cpuid_count(leaf, 0);
+    (r.eax, r.ebx, r.ecx, r.edx)
 }
 
 // ── Stack pointer ───────────────────────────────────────────────────────────────
@@ -274,6 +260,146 @@ pub unsafe fn enable_pcid() -> bool
     }
     true
 }
+
+// ── Baseline feature gate ─────────────────────────────────────────────────────
+
+/// Verify the x86-64 platform baseline and refuse unsupported hardware.
+///
+/// Checks the required CPUID-detectable features that every supported run
+/// environment provides (see
+/// [platform-requirements.md](../../../../docs/platform-requirements.md)) and
+/// halts via [`crate::fatal`] naming the first missing feature, rather than
+/// faulting obscurely later. A few required features are deliberately excluded
+/// — see the note on the check table below. Also sets `CR0.WP`, without which
+/// ring-0 writes would bypass read-only page permissions and the kernel's own
+/// W^X would be unenforced on this CPU (UEFI may hand the BSP off with `CR0.WP`
+/// clear; the AP trampoline already sets it).
+///
+/// # Safety
+/// Must execute at ring 0 during early boot, after the console is live so the
+/// diagnostic is visible, and before any subsystem that assumes the baseline.
+// too_many_lines: a flat, exhaustive feature-check table; splitting it would
+// only obscure the one-line-per-required-feature structure.
+#[cfg(not(test))]
+#[allow(clippy::too_many_lines)]
+pub unsafe fn verify_baseline()
+{
+    /// `CR0.WP` (supervisor write-protect).
+    const CR0_WP: u64 = 1 << 16;
+
+    let max_leaf = cpuid(0).0;
+    let basic = cpuid(1).2; // leaf 1, ECX
+    let structured = cpuid(7).1; // leaf 7 sub-leaf 0, EBX
+    let ext = cpuid(0x8000_0001); // ext.2 = ECX, ext.3 = EDX
+
+    // (feature present, diagnostic). The kernel halts naming the first absent one.
+    //
+    // Some required platform features (see docs/platform-requirements.md) are
+    // deliberately not gated here because the emulator used for CI/dev (QEMU
+    // TCG) cannot provide them, and the kernel already degrades correctly:
+    // invariant TSC (a frequency-stability guarantee; the kernel calibrates the
+    // TSC against the PIT), PCID/INVPCID tagged TLBs (the kernel keeps a
+    // full-flush fallback), and the vendor-specific in-silicon mitigations.
+    let checks: [(bool, &str); 19] = [
+        // x86-64-v3 instruction baseline.
+        (
+            basic & (1 << 28) != 0,
+            "AVX not supported by CPU — required (x86-64-v3)",
+        ),
+        (
+            structured & (1 << 5) != 0,
+            "AVX2 not supported by CPU — required (x86-64-v3)",
+        ),
+        (
+            basic & (1 << 12) != 0,
+            "FMA not supported by CPU — required (x86-64-v3)",
+        ),
+        (
+            structured & (1 << 3) != 0,
+            "BMI1 not supported by CPU — required (x86-64-v3)",
+        ),
+        (
+            structured & (1 << 8) != 0,
+            "BMI2 not supported by CPU — required (x86-64-v3)",
+        ),
+        (
+            basic & (1 << 22) != 0,
+            "MOVBE not supported by CPU — required (x86-64-v3)",
+        ),
+        (
+            basic & (1 << 29) != 0,
+            "F16C not supported by CPU — required (x86-64-v3)",
+        ),
+        (
+            basic & (1 << 23) != 0,
+            "POPCNT not supported by CPU — required (x86-64-v3)",
+        ),
+        (
+            basic & (1 << 13) != 0,
+            "CMPXCHG16B not supported by CPU — required (x86-64-v3)",
+        ),
+        (
+            ext.2 & (1 << 5) != 0,
+            "LZCNT not supported by CPU — required (x86-64-v3)",
+        ),
+        (
+            basic & (1 << 26) != 0,
+            "XSAVE not supported by CPU — required (x86-64-v3)",
+        ),
+        // Privilege and W^X substrate.
+        (
+            ext.3 & (1 << 29) != 0,
+            "long mode not supported by CPU — required",
+        ),
+        (
+            ext.3 & (1 << 11) != 0,
+            "SYSCALL not supported by CPU — required",
+        ),
+        (ext.3 & (1 << 20) != 0, "NX not supported by CPU — required"),
+        // Supervisor isolation.
+        (
+            structured & (1 << 7) != 0,
+            "SMEP not supported by CPU — required",
+        ),
+        (
+            structured & (1 << 20) != 0,
+            "SMAP not supported by CPU — required",
+        ),
+        // Topology enumeration.
+        (
+            max_leaf >= 0x0B,
+            "CPUID topology leaf 0x0B not supported by CPU — required",
+        ),
+        // Hardware entropy sources.
+        (
+            basic & (1 << 30) != 0,
+            "RDRAND not supported by CPU — required",
+        ),
+        (
+            structured & (1 << 18) != 0,
+            "RDSEED not supported by CPU — required",
+        ),
+    ];
+    for (present, feature) in checks
+    {
+        if !present
+        {
+            crate::fatal(feature);
+        }
+    }
+
+    // SAFETY: ring 0 per the caller contract; setting WP only tightens
+    // supervisor write checks. Kernel code paths are WP-safe — the APs run with
+    // WP set from the trampoline through all of init.
+    unsafe {
+        super::fpu::write_cr0(super::fpu::read_cr0() | CR0_WP);
+    }
+}
+
+/// Test-build stub: the baseline gate performs privileged operations and is a
+/// no-op in host unit tests.
+#[cfg(test)]
+pub unsafe fn verify_baseline() {}
 
 // ── Misc ──────────────────────────────────────────────────────────────────────
 

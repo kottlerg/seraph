@@ -165,11 +165,14 @@ pub unsafe fn flush_page_tagged(virt: u64, tag: u16);
 /// switched-away space accrued unmaps.
 pub unsafe fn flush_tag(tag: u16);
 
-/// Per-CPU enable of tagged TLBs; returns the number of hardware tags available
-/// (`0` when unsupported). x86-64 sets `CR4.PCIDE` and returns 4096; RISC-V
-/// probes the `satp` ASID width and returns `1 << width`. Called on the BSP
-/// (whose return seeds the tag pool) and on every AP (which must set its own
-/// `CR4.PCIDE` before any tagged CR3 load).
+/// Per-CPU enable of tagged TLBs; returns the number of hardware tags available.
+/// x86-64 sets `CR4.PCIDE` and returns 4096, or `0` where PCID/INVPCID are absent
+/// (the kernel keeps a full-flush fallback — see
+/// [platform-requirements.md](../../../docs/platform-requirements.md)). RISC-V
+/// probes the `satp` ASID width and returns `1 << width`; a hart with no ASID
+/// support is refused, since tagged TLBs are gated as required on RISC-V. Called
+/// on the BSP (whose return seeds the tag pool) and on every AP (which must set
+/// its own `CR4.PCIDE` before any tagged CR3 load).
 pub unsafe fn enable_tagged_tlb() -> usize;
 
 /// Classify a user page fault as spurious (the live PTE already permits the
@@ -342,6 +345,14 @@ pub fn current_cpu() -> u32;
 /// Read the current stack pointer (`rsp` / `sp`). Used by the panic-path
 /// backtrace scanner to bound the kernel-stack walk.
 pub fn current_stack_pointer() -> u64;
+
+/// Verify the platform hardware baseline and refuse unsupported hardware with a
+/// clear diagnostic. Run once in early boot after the console is live. x86-64
+/// checks the CPUID-detectable required features and sets `CR0.WP`; RISC-V probes
+/// the SBI substrate. The required/opportunistic/unsupported classification and
+/// what each arch gates are in
+/// [platform-requirements.md](../../../docs/platform-requirements.md).
+pub unsafe fn verify_baseline();
 
 /// Install the current CPU's per-CPU data block at `addr`. Call once per CPU
 /// before any per-CPU access.

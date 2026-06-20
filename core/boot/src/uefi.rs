@@ -100,6 +100,15 @@ pub static EFI_FILE_INFO_ID: EfiGuid = EfiGuid {
     data4: [0x8E, 0x39, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B],
 };
 
+/// `EFI_RNG_PROTOCOL_GUID`
+/// `{3152BCA5-EADE-433D-862E-C01CDC291F44}`
+pub static EFI_RNG_PROTOCOL_GUID: EfiGuid = EfiGuid {
+    data1: 0x3152_BCA5,
+    data2: 0xEADE,
+    data3: 0x433D,
+    data4: [0x86, 0x2E, 0xC0, 0x1C, 0xDC, 0x29, 0x1F, 0x44],
+};
+
 // ── Structs ────────────────────────────────────────────────────────────────────
 
 /// A 128-bit UEFI GUID.
@@ -307,6 +316,26 @@ pub struct EfiBootServices
         protocol: *const EfiGuid,
         registration: *mut core::ffi::c_void,
         interface: *mut *mut core::ffi::c_void,
+    ) -> EfiStatus,
+}
+
+/// `EFI_RNG_PROTOCOL` — UEFI random number generator (UEFI specification).
+///
+/// Located via `LocateProtocol` using [`EFI_RNG_PROTOCOL_GUID`]. Only `GetRNG`
+/// is used; `GetInfo` (the first member) is an unused slot kept as padding to
+/// preserve the C member offsets.
+#[repr(C)]
+pub struct EfiRngProtocol
+{
+    /// `GetInfo` — unused here; kept as padding to preserve `get_rng`'s offset.
+    pub get_info: usize,
+    /// `GetRNG`: draw `value_len` random bytes into `value`. `algorithm` is
+    /// optional; a null pointer selects the implementation's default algorithm.
+    pub get_rng: unsafe extern "efiapi" fn(
+        this: *mut EfiRngProtocol,
+        algorithm: *const EfiGuid,
+        value_len: usize,
+        value: *mut u8,
     ) -> EfiStatus,
 }
 

@@ -68,7 +68,14 @@ pub mod role_guids;
 ///     in `BootModule.name`. The entry named `"init"` is special-cased by
 ///     the bootloader and pre-parsed as an ELF into [`BootInfo::init_image`];
 ///     every other entry is exposed verbatim through `BootInfo::modules`.
-pub const BOOT_PROTOCOL_VERSION: u32 = 8;
+/// v9: Added `boot_entropy_seed: [u8; 32]` and `boot_entropy_len: u32` so the
+///     bootloader can hand the kernel a conditioned early-boot entropy seed
+///     obtained from UEFI `EFI_RNG_PROTOCOL` while boot services are live. The
+///     kernel absorbs it into the entropy pool at Phase 5, narrowing the
+///     boot-time entropy hole before any early consumer (KASLR/ASLR) draws
+///     randomness. `boot_entropy_len` is `0` when no source was available, in
+///     which case the kernel degrades to timing jitter alone.
+pub const BOOT_PROTOCOL_VERSION: u32 = 9;
 
 // ── Memory map ───────────────────────────────────────────────────────────────
 
@@ -744,6 +751,23 @@ pub struct BootInfo
     /// system has been initialised is undefined behaviour from the
     /// kernel's perspective.
     pub reclaim_ranges: ReclaimSlice,
+
+    // ── Boot entropy seed (added in protocol version 9) ───────────────────────
+    /// Conditioned early-boot entropy seed obtained by the bootloader from UEFI
+    /// `EFI_RNG_PROTOCOL`. Valid only for the first `boot_entropy_len` bytes;
+    /// the remainder is zero. The kernel absorbs it into the entropy pool at
+    /// Phase 5, then **scrubs it from this page** (`boot_entropy_seed`/`_len`
+    /// zeroed) before Phase 7 — this page is a reclaim range donated to
+    /// userspace, so the secret seed must not outlive boot.
+    ///
+    /// This is already a conditioned (DRBG) output, not a raw source, so the
+    /// kernel absorbs it directly without the raw-source health gating.
+    pub boot_entropy_seed: [u8; 32],
+
+    /// Number of valid leading bytes in `boot_entropy_seed`. `0` means the
+    /// bootloader found no entropy source; the kernel then degrades to timing
+    /// jitter alone (no regression).
+    pub boot_entropy_len: u32,
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

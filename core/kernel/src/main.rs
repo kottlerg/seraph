@@ -105,6 +105,8 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
     let boot_cpu_ids = info.cpu_ids;
     let trampoline_pa = info.ap_trampoline_page;
     let init_image = info.init_image; // InitImage is Copy
+    let boot_entropy_seed = info.boot_entropy_seed;
+    let boot_entropy_len = info.boot_entropy_len;
 
     // ── Phase 1: early console ──────────────────────────────────────────────
     // SAFETY: called exactly once, from the single kernel boot thread, after
@@ -185,6 +187,8 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
             boot_cpu_ids,
             trampoline_pa,
             init_image,
+            boot_entropy_seed,
+            boot_entropy_len,
             fb_phys,
             allocator,
         )
@@ -223,6 +227,8 @@ unsafe fn kernel_entry_post_rebase(
     boot_cpu_ids: [u32; boot_protocol::MAX_CPUS],
     trampoline_pa: u64,
     init_image: boot_protocol::InitImage,
+    mut boot_entropy_seed: [u8; 32],
+    boot_entropy_len: u32,
     fb_phys: u64,
     allocator: &'static mut mm::buddy::BuddyAllocator,
 ) -> !
@@ -333,11 +339,33 @@ unsafe fn kernel_entry_post_rebase(
     }
     kprintln!("timer ok");
 
-    // Seed the entropy pool from hardware RNG (where present, health-gated) and
-    // boot-time jitter, then open the kernel draw API. After timer::init so the
-    // cycle counter is live for jitter samples.
+    // Seed the entropy pool from the firmware boot seed (where the bootloader
+    // supplied one), hardware RNG (where present, health-gated), and boot-time
+    // jitter, then open the kernel draw API. After timer::init so the cycle
+    // counter is live for jitter samples.
     #[cfg(not(test))]
-    entropy::init();
+    {
+        // Clamp defensively: the Phase-0 validator checks only the protocol
+        // version, not this length field.
+        let n = (boot_entropy_len as usize).min(boot_entropy_seed.len());
+        entropy::init(&boot_entropy_seed[..n]);
+
+        // Scrub the conditioned seed once it is absorbed. The BootInfo page is
+        // a reclaim range donated to userspace at Phase 7 (memmgr re-hands its
+        // frames without zeroing), so the seed must not survive there; the
+        // local copy is wiped too. The pool retains the entropy — the seed
+        // itself is secret (it feeds KASLR and key/nonce generation).
+        boot_entropy_seed.fill(0);
+        // SAFETY: the direct map covers all RAM since Phase 3; boot_info_phys
+        // was validated in Phase 0. Single-threaded boot, and no live BootInfo
+        // reference aliases the page at this point. Volatile stores so the
+        // scrub of this donated page cannot be elided as a dead store.
+        unsafe {
+            let bi = mm::paging::phys_to_virt(boot_info_phys) as *mut BootInfo;
+            core::ptr::write_volatile(core::ptr::addr_of_mut!((*bi).boot_entropy_seed), [0u8; 32]);
+            core::ptr::write_volatile(core::ptr::addr_of_mut!((*bi).boot_entropy_len), 0u32);
+        }
+    }
 
     // Initialize the CPU-to-APIC-ID mapping for wakeup IPIs.
     #[cfg(not(test))]

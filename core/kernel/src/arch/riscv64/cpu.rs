@@ -75,6 +75,45 @@ pub fn current_id() -> u32
     0
 }
 
+// ── Baseline feature gate ─────────────────────────────────────────────────────
+
+/// Verify the RISC-V platform baseline and refuse unsupported hardware.
+///
+/// This runs in early boot, where supervisor-mode detection is limited (`misa`
+/// is not S-mode-readable and `satp` cannot be safely probed before the kernel
+/// page tables are active). It probes the SBI HSM extension, which is required to
+/// start secondary harts (`sbi_get_spec_version` is unsuitable as a presence
+/// check — a compliant SBI always returns success, and a truly absent SBI traps
+/// on the `ecall`). The remaining required features are asserted where each is
+/// safely detectable: the Vector extension at `fpu::cache_vlenb`, and the
+/// ASID-tagged TLB at `paging::enable_tagged_tlb`. See
+/// [platform-requirements.md](../../../../docs/platform-requirements.md).
+///
+/// # Safety
+/// Must execute in supervisor mode during early boot, after the console is live
+/// so the diagnostic is visible.
+#[cfg(not(test))]
+pub unsafe fn verify_baseline()
+{
+    /// SBI Base extension ID.
+    const SBI_EXT_BASE: u64 = 0x10;
+    /// `sbi_probe_extension` function ID.
+    const SBI_PROBE_EXTENSION: u64 = 3;
+    /// HSM (Hart State Management) extension ID — ASCII "HSM".
+    const SBI_EXT_HSM: u64 = 0x0048_534D;
+
+    let probe = super::sbi::sbi_call(SBI_EXT_BASE, SBI_PROBE_EXTENSION, SBI_EXT_HSM, 0, 0);
+    if probe.error != 0 || probe.value == 0
+    {
+        crate::fatal("SBI HSM extension not present — required to start secondary harts");
+    }
+}
+
+/// Test-build stub: the baseline gate issues an SBI ecall and is a no-op in
+/// host unit tests.
+#[cfg(test)]
+pub unsafe fn verify_baseline() {}
+
 // ── ASID width probe ──────────────────────────────────────────────────────────
 
 /// Probe the number of implemented ASID bits in `satp[59:44]`.

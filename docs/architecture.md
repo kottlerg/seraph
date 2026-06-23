@@ -237,9 +237,22 @@ Embedded or non-standard configurations are not targeted.
 
 Per-arch kernel and userspace target specifications (soft-float / FP
 profile, psABI feature floor, microarchitecture pins) are in
-[`build-system.md`](build-system.md#custom-targets). Architectural code
+[`build-system.md`](build-system.md#custom-targets). The
+required / opportunistic / unsupported CPU and platform feature
+classification per architecture, and the boot-time feature-gate that
+enforces it, are in
+[platform-requirements.md](platform-requirements.md). Architectural code
 isolation rules are in
 [coding-standards.md#c-architecture-invariants](coding-standards.md#c-architecture-invariants).
+
+---
+
+## Platform Requirements (summary — [platform-requirements.md](platform-requirements.md))
+
+Each architecture pins a two-layer floor — an instruction baseline (x86-64-v3 / RVA23U64) and a
+platform/silicon-era floor — and classifies every CPU and platform feature as required,
+opportunistic, or unsupported. A boot-time feature-gate refuses hardware missing a required feature
+with a clear diagnostic. The IOMMU is opportunistic with a degraded DMA-unconfined mode.
 
 ---
 

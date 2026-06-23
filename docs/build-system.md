@@ -82,6 +82,11 @@ floor for userspace SIMD / Vector codegen:
   ratified 2024-10-21): IMAFDCV plus the Zba/Zbb/Zbs bitmanip set,
   hard-float LP64D ABI.
 
+These JSONs pin the *instruction baseline* (the psABI feature level the toolchain emits). The
+*runtime platform / silicon-era contract* — which CPU and platform features the kernel requires,
+uses opportunistically, or does not support, and the boot-time feature-gate that enforces it — is in
+[platform-requirements.md](platform-requirements.md).
+
 Userspace correctness under preemption is provided by eager FP/SIMD/V save
 on switch-out and lazy restore on first FP/V use after switch-in (`#NM`
 trap on x86-64, illegal-instruction trap on RISC-V). See

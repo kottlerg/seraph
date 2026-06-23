@@ -35,12 +35,13 @@ use syscall::{MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
 
 /// Read up to `count` data words from the thread's IPC buffer into `dst`.
 ///
-/// Returns `Err(InvalidArgument)` if the buffer is not registered.
+/// Returns `Err(InvalidArgument)` if the buffer is not registered, or
+/// `Err(InvalidAddress)` if the buffer is unmapped at copy time.
 ///
 /// # Safety
-/// `buf` must be a valid user-mode IPC buffer VA or 0. Brackets the access
-/// with `user_access_begin`/`user_access_end` to satisfy SMAP (x86-64) /
-/// SUM (RISC-V).
+/// `buf` must be a user-mode IPC buffer VA or 0. The read goes through
+/// `copy_from_user`, so an unmapped span is recovered as `InvalidAddress`
+/// rather than faulting the kernel.
 #[cfg(not(test))]
 unsafe fn read_ipc_buf(
     buf: u64,
@@ -52,30 +53,33 @@ unsafe fn read_ipc_buf(
     {
         return Err(SyscallError::InvalidArgument);
     }
-    // cast_possible_truncation: Seraph targets 64-bit only; usize == u64 on all supported targets.
-    #[allow(clippy::cast_possible_truncation)]
-    let ptr = buf as *const u64;
-    // SAFETY: buf validated non-zero and user-mapped by caller; SMAP/SUM enabled.
+    let n = count.min(MSG_DATA_WORDS_MAX);
+    // Read the first `n` words from the user IPC buffer with fault recovery: a
+    // buffer unmapped after SYS_IPC_BUFFER_SET returns InvalidAddress instead of
+    // faulting the kernel.
+    // SAFETY: dst holds MSG_DATA_WORDS_MAX words, so it is valid for n*8 bytes; buf
+    //         is the user source span (validated non-zero / page-aligned at
+    //         registration).
     unsafe {
-        crate::arch::current::cpu::user_access_begin();
-        for (i, item) in dst.iter_mut().enumerate().take(count)
-        {
-            // SAFETY: buf is page-aligned and user-mapped; count <= MSG_DATA_WORDS_MAX.
-            *item = core::ptr::read_volatile(ptr.add(i));
-        }
-        // SAFETY: paired with user_access_begin above; clears AC flag.
-        crate::arch::current::cpu::user_access_end();
+        crate::uaccess::copy_from_user(
+            dst.as_mut_ptr().cast::<u8>(),
+            buf,
+            n * core::mem::size_of::<u64>(),
+        )?;
     }
     Ok(())
 }
 
 /// Write up to `count` data words from `src` to the thread's IPC buffer.
 ///
-/// Silently skips if buffer is not registered (caller may not want data).
+/// Silently skips if the buffer is not registered (caller may not want data) and
+/// silently tolerates a faulting (unmapped) buffer — see the body for why a fault
+/// here is swallowed rather than propagated.
 ///
 /// # Safety
-/// `buf` must be a valid user-mode IPC buffer VA or 0. Brackets the access
-/// with `user_access_begin`/`user_access_end` to satisfy SMAP / SUM.
+/// `buf` must be a user-mode IPC buffer VA or 0. The write goes through
+/// `copy_to_user`, so an unmapped span is recovered rather than faulting the
+/// kernel.
 #[cfg(not(test))]
 unsafe fn write_ipc_buf(buf: u64, count: usize, src: &[u64; MSG_DATA_WORDS_MAX])
 {
@@ -83,19 +87,20 @@ unsafe fn write_ipc_buf(buf: u64, count: usize, src: &[u64; MSG_DATA_WORDS_MAX])
     {
         return;
     }
-    // cast_possible_truncation: Seraph targets 64-bit only; usize == u64 on all supported targets.
-    #[allow(clippy::cast_possible_truncation)]
-    let ptr = buf as *mut u64;
-    // SAFETY: buf validated non-zero and user-mapped by caller; SMAP/SUM enabled.
+    let n = count.min(MSG_DATA_WORDS_MAX);
+    // Write the first `n` words to the user IPC buffer with fault recovery. A fault
+    // (the owner unmapped its own buffer) is swallowed rather than propagated: this
+    // runs during reply delivery in the owner's address space where the IPC has
+    // already committed, so the only consequence is that the owner reads stale
+    // words from a buffer it broke — never a kernel panic.
+    // SAFETY: src holds MSG_DATA_WORDS_MAX words, valid for n*8 bytes; buf is the
+    //         user destination span.
     unsafe {
-        crate::arch::current::cpu::user_access_begin();
-        for (i, item) in src.iter().enumerate().take(count)
-        {
-            // SAFETY: buf is page-aligned and user-mapped; count <= MSG_DATA_WORDS_MAX.
-            core::ptr::write_volatile(ptr.add(i), *item);
-        }
-        // SAFETY: paired with user_access_begin above; clears AC flag.
-        crate::arch::current::cpu::user_access_end();
+        let _ = crate::uaccess::copy_to_user(
+            buf,
+            src.as_ptr().cast::<u8>(),
+            n * core::mem::size_of::<u64>(),
+        );
     }
 }
 
@@ -124,20 +129,26 @@ unsafe fn write_cap_results(buf: u64, cap_count: usize, indices: &[u32; MSG_CAP_
     // Always write the cap_count word, even when 0: stale values from a prior
     // IPC round would otherwise be read by `read_recv_caps` and mismatch the
     // declared cap count, tripping `debug_assert_eq!` on the caller side.
-    // cast_possible_truncation: Seraph targets 64-bit only; usize == u64 on all supported targets.
-    #[allow(clippy::cast_possible_truncation)]
-    let ptr = buf as *mut u64;
-    // SAFETY: IPC buffer is at least 4 KiB; MSG_DATA_WORDS_MAX + 1 + MSG_CAP_SLOTS_MAX
-    // words = at most 11 words = 88 bytes, well within the page. Brackets the
-    // access with user_access_begin/end to satisfy SMAP (x86-64) / SUM (RISC-V).
+    let n = cap_count.min(MSG_CAP_SLOTS_MAX);
+    // Assemble the result block [cap_count, idx0, idx1, ...] (indices widened
+    // u32 -> u64) in a kernel buffer, then copy it to the user IPC buffer at word
+    // offset MSG_DATA_WORDS_MAX.
+    let mut block = [0u64; MSG_CAP_SLOTS_MAX + 1];
+    block[0] = cap_count as u64;
+    for (slot, &idx) in block[1..].iter_mut().zip(indices.iter()).take(n)
+    {
+        *slot = u64::from(idx);
+    }
+    let dst = buf + (MSG_DATA_WORDS_MAX * core::mem::size_of::<u64>()) as u64;
+    // SAFETY: block is valid for (n+1)*8 bytes; the IPC buffer is page-sized, far
+    //         larger than MSG_DATA_WORDS_MAX + 1 + MSG_CAP_SLOTS_MAX words. A fault
+    //         is swallowed (see write_ipc_buf) rather than panicking.
     unsafe {
-        crate::arch::current::cpu::user_access_begin();
-        core::ptr::write_volatile(ptr.add(MSG_DATA_WORDS_MAX), cap_count as u64);
-        for (i, &idx) in indices.iter().enumerate().take(cap_count)
-        {
-            core::ptr::write_volatile(ptr.add(MSG_DATA_WORDS_MAX + 1 + i), u64::from(idx));
-        }
-        crate::arch::current::cpu::user_access_end();
+        let _ = crate::uaccess::copy_to_user(
+            dst,
+            block.as_ptr().cast::<u8>(),
+            (n + 1) * core::mem::size_of::<u64>(),
+        );
     }
 }
 

@@ -373,9 +373,17 @@ pub unsafe fn disable_interrupts();
 pub fn halt_until_interrupt();
 pub fn halt_loop() -> !;
 
-/// Bracket a copy to/from user memory (SMAP/SUM toggle).
-pub unsafe fn user_access_begin();
-pub unsafe fn user_access_end();
+/// Copy `len` bytes between kernel and user memory across the SMAP/SUM access
+/// window with in-kernel fault recovery: a fault on an unmapped or read-only
+/// user span returns a non-zero sentinel (recovered by the page-fault handler's
+/// user-copy fixup) instead of panicking. The sole sanctioned path for kernel
+/// access to user pointers; the typed `crate::uaccess::copy_to_user` /
+/// `copy_from_user` wrappers turn the sentinel into `SyscallError::InvalidAddress`.
+pub unsafe fn copy_user(dst: *mut u8, src: *const u8, len: usize) -> usize;
+
+/// Map a faulting PC to the `copy_user` recovery fixup, or `None`. Consulted by
+/// the page-fault handler on a kernel-mode fault to redirect into the fixup.
+pub fn user_copy_fixup(pc: u64) -> Option<u64>;
 ```
 
 Arch-private CPU helpers (CPUID/MSR/CR access on x86-64, SMEP/SMAP/SUM enablement) are not

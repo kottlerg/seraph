@@ -67,20 +67,18 @@ pub fn sys_getrandom(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         return Err(SyscallError::WouldBlock);
     }
 
-    // Draw into a kernel buffer *before* opening the user-access window: the
-    // draw disables/re-enables interrupts internally, which must not happen
-    // inside the SMAP/SUM (AC/SUM) bracket. The bracket then wraps only the
-    // plain copy, mirroring `sys_thread_read_regs`.
+    // Draw into a kernel buffer *before* the user copy: the draw disables/
+    // re-enables interrupts internally, which must not happen inside the SMAP/SUM
+    // access window that `copy_to_user` opens. Mirrors `sys_thread_read_regs`.
     let mut scratch = [0u8; MAX_GETRANDOM_LEN];
     crate::entropy::fill_bytes(&mut scratch[..len]);
 
-    // SAFETY: the span was validated to lie wholly in the user half above;
-    // user_access_begin/end bracket the copy to permit the user-memory write.
+    // The span was range-validated above; the copy is additionally fault-recovered,
+    // so an in-range-but-unmapped/read-only buffer returns InvalidAddress rather
+    // than faulting the kernel.
+    // SAFETY: scratch is valid for `len` reads; buf_ptr is the validated user span.
     unsafe {
-        let dst = buf_ptr as *mut u8;
-        crate::arch::current::cpu::user_access_begin();
-        core::ptr::copy_nonoverlapping(scratch.as_ptr(), dst, len);
-        crate::arch::current::cpu::user_access_end();
+        crate::uaccess::copy_to_user(buf_ptr, scratch.as_ptr(), len)?;
     }
 
     Ok(len as u64)

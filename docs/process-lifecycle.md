@@ -434,4 +434,5 @@ flow above.
 [logd/README.md](../services/logd/README.md),
 [memmgr/README.md](../services/memmgr/README.md),
 [procmgr/README.md](../services/procmgr/README.md),
-[svcmgr/README.md](../services/svcmgr/README.md)
+[svcmgr/README.md](../services/svcmgr/README.md),
+[process-layout/README.md](../shared/process-layout/README.md)

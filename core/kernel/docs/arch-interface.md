@@ -165,11 +165,14 @@ pub unsafe fn flush_page_tagged(virt: u64, tag: u16);
 /// switched-away space accrued unmaps.
 pub unsafe fn flush_tag(tag: u16);
 
-/// Per-CPU enable of tagged TLBs; returns the number of hardware tags available
-/// (`0` when unsupported). x86-64 sets `CR4.PCIDE` and returns 4096; RISC-V
-/// probes the `satp` ASID width and returns `1 << width`. Called on the BSP
-/// (whose return seeds the tag pool) and on every AP (which must set its own
-/// `CR4.PCIDE` before any tagged CR3 load).
+/// Per-CPU enable of tagged TLBs; returns the number of hardware tags available.
+/// x86-64 sets `CR4.PCIDE` and returns 4096, or `0` where PCID/INVPCID are absent
+/// (the kernel keeps a full-flush fallback — see
+/// [platform-requirements.md](../../../docs/platform-requirements.md)). RISC-V
+/// probes the `satp` ASID width and returns `1 << width`; a hart with no ASID
+/// support is refused, since tagged TLBs are gated as required on RISC-V. Called
+/// on the BSP (whose return seeds the tag pool) and on every AP (which must set
+/// its own `CR4.PCIDE` before any tagged CR3 load).
 pub unsafe fn enable_tagged_tlb() -> usize;
 
 /// Classify a user page fault as spurious (the live PTE already permits the
@@ -343,6 +346,14 @@ pub fn current_cpu() -> u32;
 /// backtrace scanner to bound the kernel-stack walk.
 pub fn current_stack_pointer() -> u64;
 
+/// Verify the platform hardware baseline and refuse unsupported hardware with a
+/// clear diagnostic. Run once in early boot after the console is live. x86-64
+/// checks the CPUID-detectable required features and sets `CR0.WP`; RISC-V probes
+/// the SBI substrate. The required/opportunistic/unsupported classification and
+/// what each arch gates are in
+/// [platform-requirements.md](../../../docs/platform-requirements.md).
+pub unsafe fn verify_baseline();
+
 /// Install the current CPU's per-CPU data block at `addr`. Call once per CPU
 /// before any per-CPU access.
 pub unsafe fn install_percpu(addr: u64);
@@ -362,9 +373,17 @@ pub unsafe fn disable_interrupts();
 pub fn halt_until_interrupt();
 pub fn halt_loop() -> !;
 
-/// Bracket a copy to/from user memory (SMAP/SUM toggle).
-pub unsafe fn user_access_begin();
-pub unsafe fn user_access_end();
+/// Copy `len` bytes between kernel and user memory across the SMAP/SUM access
+/// window with in-kernel fault recovery: a fault on an unmapped or read-only
+/// user span returns a non-zero sentinel (recovered by the page-fault handler's
+/// user-copy fixup) instead of panicking. The sole sanctioned path for kernel
+/// access to user pointers; the typed `crate::uaccess::copy_to_user` /
+/// `copy_from_user` wrappers turn the sentinel into `SyscallError::InvalidAddress`.
+pub unsafe fn copy_user(dst: *mut u8, src: *const u8, len: usize) -> usize;
+
+/// Map a faulting PC to the `copy_user` recovery fixup, or `None`. Consulted by
+/// the page-fault handler on a kernel-mode fault to redirect into the fixup.
+pub fn user_copy_fixup(pc: u64) -> Option<u64>;
 ```
 
 Arch-private CPU helpers (CPUID/MSR/CR access on x86-64, SMEP/SMAP/SUM enablement) are not

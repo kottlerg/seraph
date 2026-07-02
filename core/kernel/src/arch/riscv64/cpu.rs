@@ -75,6 +75,45 @@ pub fn current_id() -> u32
     0
 }
 
+// ── Baseline feature gate ─────────────────────────────────────────────────────
+
+/// Verify the RISC-V platform baseline and refuse unsupported hardware.
+///
+/// This runs in early boot, where supervisor-mode detection is limited (`misa`
+/// is not S-mode-readable and `satp` cannot be safely probed before the kernel
+/// page tables are active). It probes the SBI HSM extension, which is required to
+/// start secondary harts (`sbi_get_spec_version` is unsuitable as a presence
+/// check — a compliant SBI always returns success, and a truly absent SBI traps
+/// on the `ecall`). The remaining required features are asserted where each is
+/// safely detectable: the Vector extension at `fpu::cache_vlenb`, and the
+/// ASID-tagged TLB at `paging::enable_tagged_tlb`. See
+/// [platform-requirements.md](../../../../docs/platform-requirements.md).
+///
+/// # Safety
+/// Must execute in supervisor mode during early boot, after the console is live
+/// so the diagnostic is visible.
+#[cfg(not(test))]
+pub unsafe fn verify_baseline()
+{
+    /// SBI Base extension ID.
+    const SBI_EXT_BASE: u64 = 0x10;
+    /// `sbi_probe_extension` function ID.
+    const SBI_PROBE_EXTENSION: u64 = 3;
+    /// HSM (Hart State Management) extension ID — ASCII "HSM".
+    const SBI_EXT_HSM: u64 = 0x0048_534D;
+
+    let probe = super::sbi::sbi_call(SBI_EXT_BASE, SBI_PROBE_EXTENSION, SBI_EXT_HSM, 0, 0);
+    if probe.error != 0 || probe.value == 0
+    {
+        crate::fatal("SBI HSM extension not present — required to start secondary harts");
+    }
+}
+
+/// Test-build stub: the baseline gate issues an SBI ecall and is a no-op in
+/// host unit tests.
+#[cfg(test)]
+pub unsafe fn verify_baseline() {}
+
 // ── ASID width probe ──────────────────────────────────────────────────────────
 
 /// Probe the number of implemented ASID bits in `satp[59:44]`.
@@ -212,57 +251,104 @@ pub unsafe fn set_kernel_trap_stack(stack_top: u64)
     }
 }
 
-// ── SUM user-access bracket ───────────────────────────────────────────────────
+// ── User-copy primitive (fault-recoverable) ───────────────────────────────────
 
-/// Allow supervisor-mode access to user pages (sets sstatus.SUM, bit 18).
-///
-/// Must be paired with a matching `user_access_end` call.
-///
-/// # Safety
-/// Must execute in supervisor mode. Leaves SUM set until `user_access_end`.
-///
-/// # Compiler barrier
-/// `nomem` is intentionally absent so the compiler treats this CSR write as a
-/// memory operation. This prevents the compiler from reordering user-memory
-/// loads to before the csrrs at opt-level ≥ 1, matching Linux's "memory"
-/// clobber on equivalent operations.
+// `copy_user` is the sole sanctioned path for kernel access to user memory. It
+// owns the SUM access window (sstatus.SUM, bit 18) and is covered by the trap
+// dispatcher's user-copy fixup: a fault on an unmapped or read-only user span
+// inside the copy redirects to `__copy_user_fixup` (which clears SUM and returns
+// a non-zero sentinel) instead of panicking. See `crate::uaccess` for the typed
+// `copy_to_user`/`copy_from_user` wrappers and `interrupts::trap_dispatch` for
+// the fixup hook.
 #[cfg(not(test))]
-#[inline]
-pub unsafe fn user_access_begin()
-{
-    // SAFETY: csrrs sets bit 18 (SUM) in sstatus; safe in supervisor mode.
-    // csrsi/csrci only accept 5-bit immediates (0-31); bit 18 must use a register.
-    // nostack: CSR write does not modify sp.
-    // (no nomem): compiler memory barrier — prevents hoisting user-memory loads
-    // above this instruction at opt-level ≥ 1.
-    unsafe {
-        core::arch::asm!(
-            "csrrs zero, sstatus, {sum}",
-            sum = in(reg) (1u64 << 18),
-            options(nostack),
-        );
-    }
+core::arch::global_asm!(
+    ".section .text.copy_user, \"ax\"",
+    ".global __copy_user",
+    ".global __copy_user_fault_start",
+    ".global __copy_user_fault_end",
+    ".global __copy_user_fixup",
+    // fn __copy_user(dst: a0, src: a1, len: a2) -> a0 (0 = ok, 1 = faulted)
+    "__copy_user:",
+    "    li    t0, 0x40000",       // SUM = bit 18
+    "    csrrs zero, sstatus, t0", // open the access window
+    "1:",
+    "    beqz  a2, 2f",
+    "__copy_user_fault_start:",
+    "    lb    t1, 0(a1)", // load from src (user side may fault)
+    "    sb    t1, 0(a0)", // store to dst (user side may fault)
+    "__copy_user_fault_end:",
+    "    addi  a0, a0, 1",
+    "    addi  a1, a1, 1",
+    "    addi  a2, a2, -1",
+    "    j     1b",
+    "2:",
+    "    csrrc zero, sstatus, t0", // close the access window
+    "    li    a0, 0",
+    "    ret",
+    "__copy_user_fixup:",
+    "    li    t0, 0x40000",
+    "    csrrc zero, sstatus, t0", // close the access window (recovery path)
+    "    li    a0, 1",
+    "    ret",
+);
+
+#[cfg(not(test))]
+unsafe extern "C" {
+    /// Raw user-copy routine (`dst=a0, src=a1, len=a2`); returns 0 on success or
+    /// 1 if a fault on the user span was recovered.
+    fn __copy_user(dst: *mut u8, src: *const u8, len: usize) -> usize;
+    /// First byte of the faultable copy region (the `lb`/`sb` pair).
+    static __copy_user_fault_start: u8;
+    /// First byte past the faultable copy region.
+    static __copy_user_fault_end: u8;
+    /// Recovery landing pad: closes the SUM window and returns the fault sentinel.
+    static __copy_user_fixup: u8;
 }
 
-/// Revoke supervisor-mode access to user pages (clears sstatus.SUM, bit 18).
+/// Copy `len` bytes from `src` to `dst` across the SUM window with fault
+/// recovery. Returns 0 on success, non-zero if a user-span fault was recovered.
 ///
 /// # Safety
-/// Must be called after a matching `user_access_begin`.
-///
-/// # Compiler barrier
-/// Like `user_access_begin`, `nomem` is absent to prevent the compiler from
-/// sinking user-memory stores to after the csrrc.
+/// Must execute in supervisor mode. The operands must be arranged so the user
+/// pointer is the only one that may fault; the non-user side must be valid for
+/// `len` bytes.
 #[cfg(not(test))]
 #[inline]
-pub unsafe fn user_access_end()
+pub unsafe fn copy_user(dst: *mut u8, src: *const u8, len: usize) -> usize
 {
-    // SAFETY: csrrc clears bit 18 (SUM) in sstatus; restores user-page isolation.
+    // SAFETY: forwarded to the asm routine; a fault on the user span is recovered
+    // by the trap dispatcher via __copy_user_fixup.
+    unsafe { __copy_user(dst, src, len) }
+}
+
+/// Host-test stub: the SUM CSR write is privileged and the test pointers never
+/// fault, so perform a plain copy and report success.
+#[cfg(test)]
+pub unsafe fn copy_user(dst: *mut u8, src: *const u8, len: usize) -> usize
+{
+    // SAFETY: caller guarantees src/dst valid for len bytes.
     unsafe {
-        core::arch::asm!(
-            "csrrc zero, sstatus, {sum}",
-            sum = in(reg) (1u64 << 18),
-            options(nostack),
-        );
+        core::ptr::copy_nonoverlapping(src, dst, len);
+    }
+    0
+}
+
+/// If `pc` lies within `copy_user`'s faultable region, return the address of the
+/// recovery fixup; otherwise `None`. Consulted by the trap dispatcher on an
+/// S-mode page fault to convert an unmapped/read-only user access into an error
+/// return instead of a panic.
+#[cfg(not(test))]
+pub fn user_copy_fixup(pc: u64) -> Option<u64>
+{
+    let lo = core::ptr::addr_of!(__copy_user_fault_start) as u64;
+    let hi = core::ptr::addr_of!(__copy_user_fault_end) as u64;
+    if pc >= lo && pc < hi
+    {
+        Some(core::ptr::addr_of!(__copy_user_fixup) as u64)
+    }
+    else
+    {
+        None
     }
 }
 

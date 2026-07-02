@@ -86,6 +86,8 @@ Overall project design documents live in [`docs/`](docs/):
   GPT role-GUID discovery; mount lifecycle
 - [Device Management](docs/device-management.md) — platform enumeration, devmgr,
   driver binding, DMA safety
+- [Platform Requirements](docs/platform-requirements.md) — per-arch required/opportunistic/unsupported
+  CPU and platform feature baseline; boot-time feature-gate
 - [Console Model](docs/console-model.md) — serial/console output ownership across boot;
   serial-driver-mediated userspace output
 - [Build System](docs/build-system.md) — toolchain, workspace layout, sysroot, xtask commands

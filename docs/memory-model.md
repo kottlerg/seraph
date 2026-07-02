@@ -115,14 +115,19 @@ level using the NX bit (x86-64) and the equivalent execute permission control on
 RISC-V. The kernel image itself follows W^X: text is executable but not writable;
 data and heap are writable but not executable.
 
+On x86-64, kernel-side W^X additionally depends on `CR0.WP` (supervisor write-protect);
+without it a ring-0 write would bypass a read-only page permission. `CR0.WP` is required by
+the platform baseline ([platform-requirements.md](platform-requirements.md)) and set on every CPU.
+
 ### TLB Management
 
-Where the hardware provides address-space tags (x86-64 PCID, RISC-V ASID), the kernel
-assigns a tag per address space so a context switch loads the outgoing space's page-table
-root **without** flushing the TLB — cached translations survive across switches. Support is
-detected at boot; where it is unavailable the kernel falls back to a full flush on every
-switch (writing CR3 with `CR4.PCIDE` clear, or `satp` with ASID 0 followed by `sfence.vma`).
-A switch between threads that share an address space requires no TLB operation either way.
+Address-space tags (x86-64 PCID, RISC-V ASID) are required by the platform baseline
+([platform-requirements.md](platform-requirements.md)). The kernel assigns a tag per address space
+so a context switch loads the outgoing space's page-table root **without** flushing the TLB —
+cached translations survive across switches. A switch between threads that share an address space
+requires no TLB operation either way. On RISC-V a hart without ASID support is refused at boot; on
+x86-64 the kernel retains a full-flush fallback for emulated environments that do not implement
+PCID.
 
 Eliding the per-switch flush requires keeping tagged entries coherent without it. Two
 generation counters do this:
@@ -152,8 +157,9 @@ emulation-independent measure of the optimization.
 ### Kernel Isolation — SMEP and SMAP
 
 On x86-64, SMEP (Supervisor Mode Execution Prevention) and SMAP (Supervisor Mode
-Access Prevention) are enabled unconditionally where available. SMEP prevents the
-kernel from executing userspace pages; SMAP prevents the kernel from reading or
+Access Prevention) are required by the platform baseline
+([platform-requirements.md](platform-requirements.md)) and enabled unconditionally. SMEP
+prevents the kernel from executing userspace pages; SMAP prevents the kernel from reading or
 writing userspace memory except through designated safe copy routines. Together these
 mitigate a class of privilege escalation exploits.
 

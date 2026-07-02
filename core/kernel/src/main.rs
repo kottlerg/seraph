@@ -60,6 +60,7 @@ mod platform;
 mod sched;
 mod sync;
 mod syscall;
+mod uaccess;
 mod validate;
 
 /// Kernel entry point.
@@ -129,6 +130,15 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
     );
     kprintln!("Phase 1: Early Console");
     kprintln!("boot protocol v{}", info.version);
+
+    // Platform feature-gate: refuse hardware missing a required baseline
+    // feature with a clear diagnostic, before any subsystem that assumes the
+    // baseline runs. See docs/platform-requirements.md.
+    // SAFETY: ring 0 / S-mode early-boot phase; console is live; called once.
+    unsafe {
+        arch::current::cpu::verify_baseline();
+    }
+    kprintln!("baseline ok");
 
     // ── Phase 2: physical memory ────────────────────────────────────────────
     // Parse the memory map, subtract reserved regions, populate the buddy

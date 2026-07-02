@@ -1034,6 +1034,22 @@ extern "C" fn page_fault_handler(tf: *mut TrapFrame, error_code: u64)
         }
     }
 
+    // In-kernel user-copy fault recovery: a fault taken at CPL 0 whose RIP lies in
+    // the `copy_user` faultable region is an unmapped or read-only user buffer.
+    // Redirect to the fixup — which closes the SMAP window and returns an error
+    // sentinel — instead of panicking. Genuine userspace faults already returned
+    // above; their RIP is never inside the kernel copy region, so this is a no-op
+    // for them.
+    // SAFETY: tf is valid; rip is read-only here.
+    if let Some(fixup) = super::cpu::user_copy_fixup(unsafe { (*tf).rip })
+    {
+        // SAFETY: tf is the live frame; rewriting rip redirects iretq to the fixup.
+        unsafe {
+            (*tf).rip = fixup;
+        }
+        return;
+    }
+
     // Not a recoverable spurious fault and not resumed by a handler — kill
     // (userspace) or fatal (kernel).
     // SAFETY: tf is valid; common_exception_handler never returns.

@@ -31,8 +31,12 @@ use crate::os::seraph::current_ipc_buf;
 
 // ── Child-side ring VAs ────────────────────────────────────────────────────
 //
-// One fixed VA per direction. Above PROCESS_MAIN_TLS_VADDR + max TLS pages
-// (0x7FFF_FFFD_4000) and below PROCMGR_IPC_BUF_VA (0x7FFF_FFFE_0000).
+// One fixed VA per direction, in the gap the default bootstrap layout leaves
+// between the main-thread TLS block and the IPC buffer: above
+// `process_layout::DEFAULT_MAIN_TLS_VA` + `PROCESS_MAIN_TLS_MAX_PAGES`
+// (0x7FFF_FFFD_4000) and below `process_layout::DEFAULT_IPC_BUFFER_VA`
+// (0x7FFF_FFFE_0000). These are the std runtime's own mapping choices, not
+// handover VAs; full per-process randomisation of them belongs to ASLR (#39).
 
 const STDIN_RING_VA: u64 = 0x0000_7FFF_FFFD_5000;
 const STDOUT_RING_VA: u64 = 0x0000_7FFF_FFFD_6000;

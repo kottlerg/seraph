@@ -39,6 +39,7 @@ members = [
     "shared/font",
     "shared/mmio",
     "shared/namespace-protocol",
+    "shared/process-layout",
     "shared/syscall",
     "shared/ipc",
     "shared/log",

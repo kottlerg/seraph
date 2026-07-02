@@ -519,6 +519,7 @@ dependencies = [
  "namespace-protocol",
  "ns-client",
  "process-abi",
+ "process-layout",
  "syscall",
  "syscall-abi",
 ]
@@ -765,6 +766,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "process-layout"
+version = "0.1.1"
+
+[[package]]
 name = "procmgr"
 version = "0.1.1"
 dependencies = [
@@ -772,6 +777,7 @@ dependencies = [
  "ipc",
  "namespace-protocol",
  "process-abi",
+ "process-layout",
  "procmgr-process-table",
  "syscall",
  "syscall-abi",
@@ -1005,6 +1011,7 @@ version = "0.1.1"
 dependencies = [
  "ipc",
  "namespace-protocol",
+ "process-layout",
  "shmem",
  "syscall",
 ]

@@ -16,23 +16,18 @@
 use crate::logging::log;
 use crate::{MemoryAlloc, PAGE_SIZE, TEMP_MAP_BASE, arch};
 use init_protocol::{CapDescriptor, InitInfo};
-use process_abi::{
-    DEFAULT_PROCESS_STACK_PAGES, MAX_PROCESS_STACK_PAGES, PROCESS_ABI_VERSION, PROCESS_INFO_VADDR,
-    PROCESS_STACK_TOP,
-};
+use process_abi::{DEFAULT_PROCESS_STACK_PAGES, MAX_PROCESS_STACK_PAGES, PROCESS_ABI_VERSION};
+use process_layout::{ProcessLayout, choose_process_layout};
 
 // ── Constants ────────────────────────────────────────────────────────────────
 //
-// Both VAs are private to init's no_std bootstrap path. ELF_PAGE_TEMP_VA
-// sits inside init's TEMP_MAP_BASE scratch region (offset 256 MiB).
-// PROCMGR_IPC_BUF_VA is the IPC-buffer VA init writes into procmgr's
-// `ProcessInfo.ipc_buffer_vaddr` slot; procmgr reads it back at boot.
+// ELF_PAGE_TEMP_VA is private to init's no_std bootstrap path and sits inside
+// init's TEMP_MAP_BASE scratch region (offset 256 MiB). The per-child bootstrap
+// VAs (`ProcessInfo` page, stack top, TLS block, IPC buffer) are chosen via
+// `process-layout` rather than pinned here, mirroring procmgr.
 
 /// Per-page ELF write scratch during init's procmgr/memmgr bootstrap.
 const ELF_PAGE_TEMP_VA: u64 = TEMP_MAP_BASE + 0x1000_0000;
-
-/// procmgr's IPC buffer VA as seen from init while bootstrapping procmgr.
-const PROCMGR_IPC_BUF_VA: u64 = 0x0000_7FFF_FFFE_0000;
 
 // ── Bootstrap arena ────────────────────────────────────────────────────────────
 //
@@ -232,7 +227,7 @@ pub struct ChildTlsMeta
 
 /// Place the main thread's TLS block in `arena`: populate it from the
 /// in-memory `.tdata` template, install the TCB self-pointer, and map it
-/// read-write into `target_aspace` at `PROCESS_MAIN_TLS_VADDR`.
+/// read-write into `target_aspace` at the chosen `tls_base`.
 ///
 /// Returns `(tls_base_va, metadata)`. When the binary has no `PT_TLS`
 /// segment (or it is empty), returns `(0, ChildTlsMeta::default())` without
@@ -243,6 +238,7 @@ fn place_main_tls(
     ehdr: &elf::Elf64Ehdr,
     module_bytes: &[u8],
     target_aspace: u32,
+    tls_base: u64,
 ) -> Option<(u64, ChildTlsMeta)>
 {
     let Some(seg) = elf::tls_segment(ehdr, module_bytes).ok()?
@@ -278,10 +274,10 @@ fn place_main_tls(
         return None;
     }
 
-    let tls_base_va = process_abi::PROCESS_MAIN_TLS_VADDR + tls_base_offset;
+    let tls_base_va = tls_base + tls_base_offset;
     arena.place_page(
         target_aspace,
-        process_abi::PROCESS_MAIN_TLS_VADDR,
+        tls_base,
         syscall::MAP_WRITABLE,
         |scratch_va| {
             // SAFETY: scratch_va is mapped writable and zeroed; the copy
@@ -383,6 +379,12 @@ pub struct MemmgrBootstrap
     pub arena_cap: u32,
     /// Memmgr's ELF entry point.
     pub entry: u64,
+    /// Stack top init chose and mapped for memmgr; passed as the initial SP to
+    /// `thread_configure` in [`finalize_memmgr`].
+    pub stack_top_vaddr: u64,
+    /// VA of the `ProcessInfo` page init mapped for memmgr; delivered to memmgr
+    /// in its entry register by [`finalize_memmgr`].
+    pub process_info_va: u64,
 }
 
 /// One in-use bootstrap arena forwarded to memmgr for accounting. Its whole
@@ -455,6 +457,7 @@ fn populate_memmgr_info(
     target_aspace: u32,
     caps: &MemmgrCaps,
     stack_pages: u32,
+    layout: &ProcessLayout,
 ) -> Option<()>
 {
     let mm_thread_in_mm =
@@ -468,7 +471,7 @@ fn populate_memmgr_info(
 
     arena.place_page(
         target_aspace,
-        PROCESS_INFO_VADDR,
+        layout.process_info_va,
         syscall::MAP_READ,
         |scratch_va| {
             // SAFETY: scratch_va is mapped writable and zeroed, one page.
@@ -478,7 +481,7 @@ fn populate_memmgr_info(
             pi.self_aspace_cap = mm_aspace_in_mm;
             pi.self_cspace_cap = mm_cspace_in_mm;
             pi.sched_control_cap = mm_sched_in_mm;
-            pi.ipc_buffer_vaddr = PROCMGR_IPC_BUF_VA;
+            pi.ipc_buffer_vaddr = layout.ipc_buffer_va;
             pi.creator_endpoint_cap = caps.creator_endpoint_slot;
             pi.procmgr_endpoint_cap = 0;
             pi.memmgr_endpoint_cap = 0;
@@ -492,8 +495,10 @@ fn populate_memmgr_info(
             pi.stdout_space_notification_cap = 0;
             pi.stderr_data_notification_cap = 0;
             pi.stderr_space_notification_cap = 0;
-            pi.stack_top_vaddr = PROCESS_STACK_TOP;
+            pi.stack_top_vaddr = layout.stack_top;
             pi.stack_pages = stack_pages;
+            // memmgr's bespoke `_start` configures no TLS.
+            pi.main_tls_vaddr = 0;
             // Infrastructure is never demand-paged (would recurse on its own
             // faults); leave the pager unbound.
             pi.pager_endpoint_cap = 0;
@@ -564,6 +569,7 @@ pub fn bootstrap_memmgr(
     let stack_pages = elf::parse_stack_note(ehdr, module_bytes)
         .unwrap_or(DEFAULT_PROCESS_STACK_PAGES)
         .clamp(1, MAX_PROCESS_STACK_PAGES);
+    let layout = choose_process_layout();
 
     // memmgr's bespoke `_start` configures no TLS, so its arena reserves
     // only ELF segments + `ProcessInfo` + stack + IPC buffer.
@@ -600,8 +606,14 @@ pub fn bootstrap_memmgr(
         creator_endpoint_slot: mm_creator_slot,
         sched_baseline: baseline_sched,
     };
-    populate_memmgr_info(&mut arena, mm_aspace, &mm_caps, stack_pages)?;
-    place_stack_and_ipc(&mut arena, mm_aspace, PROCMGR_IPC_BUF_VA, stack_pages)?;
+    populate_memmgr_info(&mut arena, mm_aspace, &mm_caps, stack_pages, &layout)?;
+    place_stack_and_ipc(
+        &mut arena,
+        mm_aspace,
+        layout.ipc_buffer_va,
+        layout.stack_top,
+        stack_pages,
+    )?;
 
     // Mint procmgr's badged SEND cap on memmgr's endpoint. Memmgr will
     // recognise calls bearing this badge as authorised for the
@@ -622,6 +634,8 @@ pub fn bootstrap_memmgr(
         mm_thread,
         arena_cap: arena.cap,
         entry,
+        stack_top_vaddr: layout.stack_top,
+        process_info_va: layout.process_info_va,
     })
 }
 
@@ -881,8 +895,8 @@ pub fn finalize_memmgr(
     syscall::thread_configure(
         mm.mm_thread,
         mm.entry,
-        PROCESS_STACK_TOP,
-        PROCESS_INFO_VADDR,
+        mm.stack_top_vaddr,
+        mm.process_info_va,
     )
     .ok()?;
     syscall::thread_start(mm.mm_thread).ok()?;
@@ -993,6 +1007,7 @@ fn populate_procmgr_info(
     target_aspace: u32,
     caps: &ProcmgrCaps,
     stack_pages: u32,
+    layout: &ProcessLayout,
 ) -> Option<()>
 {
     let pm_thread_in_pm =
@@ -1007,7 +1022,7 @@ fn populate_procmgr_info(
 
     arena.place_page(
         target_aspace,
-        PROCESS_INFO_VADDR,
+        layout.process_info_va,
         syscall::MAP_READ,
         |scratch_va| {
             // SAFETY: scratch_va is mapped writable and zeroed, one page.
@@ -1017,7 +1032,7 @@ fn populate_procmgr_info(
             pi.self_aspace_cap = pm_aspace_in_pm;
             pi.self_cspace_cap = pm_cspace_in_pm;
             pi.sched_control_cap = pm_sched_in_pm;
-            pi.ipc_buffer_vaddr = PROCMGR_IPC_BUF_VA;
+            pi.ipc_buffer_vaddr = layout.ipc_buffer_va;
             pi.creator_endpoint_cap = caps.creator_endpoint_slot;
             // procmgr has no procmgr above it; leave zero.
             pi.procmgr_endpoint_cap = 0;
@@ -1042,8 +1057,17 @@ fn populate_procmgr_info(
             pi.tls_template_filesz = caps.tls.filesz;
             pi.tls_template_memsz = caps.tls.memsz;
             pi.tls_template_align = caps.tls.align;
-            pi.stack_top_vaddr = PROCESS_STACK_TOP;
+            pi.stack_top_vaddr = layout.stack_top;
             pi.stack_pages = stack_pages;
+            // TLS block base, or zero when procmgr's image carries no PT_TLS.
+            pi.main_tls_vaddr = if caps.tls.memsz != 0
+            {
+                layout.tls_base
+            }
+            else
+            {
+                0
+            };
             // Infrastructure is never demand-paged (would recurse on its own
             // faults); leave the pager unbound.
             pi.pager_endpoint_cap = 0;
@@ -1061,10 +1085,11 @@ fn place_stack_and_ipc(
     arena: &mut BootArena,
     target_aspace: u32,
     ipc_buf_va: u64,
+    stack_top: u64,
     stack_pages: u32,
 ) -> Option<()>
 {
-    let stack_base = PROCESS_STACK_TOP - u64::from(stack_pages) * PAGE_SIZE;
+    let stack_base = stack_top - u64::from(stack_pages) * PAGE_SIZE;
     for i in 0..stack_pages
     {
         arena.place_page(
@@ -1198,6 +1223,7 @@ pub fn bootstrap_procmgr(
     let stack_pages = elf::parse_stack_note(ehdr, module_bytes)
         .unwrap_or(DEFAULT_PROCESS_STACK_PAGES)
         .clamp(1, MAX_PROCESS_STACK_PAGES);
+    let layout = choose_process_layout();
 
     // procmgr is std-using: its arena reserves ELF segments + the main TLS
     // block + `ProcessInfo` + stack + IPC buffer.
@@ -1224,7 +1250,8 @@ pub fn bootstrap_procmgr(
     // std-using so the std runtime's `_start` accesses thread-local statics
     // (e.g. `IPC_BUF_TLS`) before user `main` runs; without a configured TLS
     // block, the first such access page-faults at NULL.
-    let (pm_tls_base_va, pm_tls_meta) = place_main_tls(&mut arena, ehdr, module_bytes, pm_aspace)?;
+    let (pm_tls_base_va, pm_tls_meta) =
+        place_main_tls(&mut arena, ehdr, module_bytes, pm_aspace, layout.tls_base)?;
 
     let _ = syscall::mem_unmap(init_aspace, TEMP_MAP_BASE, module_pages);
     let _ = syscall::cap_delete(module_ro);
@@ -1319,15 +1346,21 @@ pub fn bootstrap_procmgr(
         tls: pm_tls_meta,
         sched_baseline: baseline_sched,
     };
-    populate_procmgr_info(&mut arena, pm_aspace, &pm_caps, stack_pages)?;
+    populate_procmgr_info(&mut arena, pm_aspace, &pm_caps, stack_pages, &layout)?;
 
-    place_stack_and_ipc(&mut arena, pm_aspace, PROCMGR_IPC_BUF_VA, stack_pages)?;
+    place_stack_and_ipc(
+        &mut arena,
+        pm_aspace,
+        layout.ipc_buffer_va,
+        layout.stack_top,
+        stack_pages,
+    )?;
 
     syscall::thread_configure_with_tls(
         pm_thread,
         entry,
-        PROCESS_STACK_TOP,
-        PROCESS_INFO_VADDR,
+        layout.stack_top,
+        layout.process_info_va,
         pm_tls_base_va,
     )
     .ok()?;

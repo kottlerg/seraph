@@ -134,8 +134,9 @@ pub fn stack_envelope_phase(_: &Caps)
         info.stack_pages
     );
     assert_eq!(
-        info.stack_top_vaddr, 0x0000_7FFF_FFFF_E000,
-        "stack_top_vaddr {:#x} does not match PROCESS_STACK_TOP",
+        info.stack_top_vaddr,
+        process_layout::DEFAULT_STACK_TOP,
+        "stack_top_vaddr {:#x} does not match the default process layout",
         info.stack_top_vaddr
     );
 
@@ -158,6 +159,22 @@ pub fn stack_envelope_phase(_: &Caps)
 
 pub fn tls_main_phase(_: &Caps)
 {
+    // svctest is a std binary with thread-locals, so the loader maps a main TLS
+    // block and reports its base. It must be nonzero and below the stack.
+    let info = startup_info();
+    assert_eq!(
+        info.main_tls_vaddr,
+        process_layout::DEFAULT_MAIN_TLS_VA,
+        "main_tls_vaddr {:#x} does not match the default process layout",
+        info.main_tls_vaddr
+    );
+    assert!(
+        info.main_tls_vaddr < info.stack_top_vaddr,
+        "main_tls_vaddr {:#x} must lie below the stack top {:#x}",
+        info.main_tls_vaddr,
+        info.stack_top_vaddr
+    );
+
     let init = TLS_INIT;
     let bss = TLS_BSS;
     std::os::seraph::log!("TLS_INIT ={init:#018x}");

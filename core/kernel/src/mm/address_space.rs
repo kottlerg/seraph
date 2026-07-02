@@ -9,8 +9,10 @@
 //! on RISC-V). Intermediate page table frames are allocated from the buddy
 //! allocator on demand.
 //!
-//! Init stack constants (`INIT_STACK_TOP`, `INIT_STACK_PAGES`) are defined in
-//! the `init-protocol` ABI crate and re-exported here for kernel use.
+//! `INIT_STACK_PAGES` is defined in the `init-protocol` ABI crate and
+//! re-exported here. Init's bootstrap virtual addresses (the `InitInfo` page and
+//! stack top) are the kernel's per-boot choice via [`choose_init_layout`], not
+//! ABI constants.
 //!
 //! ## Kernel mapping inheritance
 //! `new_user` copies kernel PML4 entries [256..512] from the currently active
@@ -73,8 +75,72 @@ use crate::cpu_mask::{AtomicCpuMask, CpuMask};
 use crate::mm::paging::phys_to_virt;
 use crate::mm::{BuddyAllocator, PAGE_SIZE};
 
-// Init stack constants are defined in the init protocol ABI crate.
-pub use init_protocol::{INIT_STACK_PAGES, INIT_STACK_TOP};
+// Init stack page count is part of the init protocol ABI; the init VA layout
+// (info page + stack top) is the kernel's per-boot choice, not an ABI constant.
+pub use init_protocol::INIT_STACK_PAGES;
+
+/// Default base of the read-only `InitInfo` region mapped into init.
+///
+/// The region spans up to `INIT_INFO_MAX_PAGES` contiguous pages from this
+/// address; with the default stack top it occupies
+/// `[0x7FFF_FFFF_5000, 0x7FFF_FFFF_9000)`, a guard sits at `0x7FFF_FFFF_9000`,
+/// and init's stack runs `[0x7FFF_FFFF_A000, DEFAULT_INIT_STACK_TOP)`.
+pub const DEFAULT_INIT_INFO_VA: u64 = 0x7FFF_FFFF_5000;
+
+/// Default top of init's user stack. `INIT_STACK_PAGES` pages map immediately
+/// below, with one unmapped guard page beneath them.
+pub const DEFAULT_INIT_STACK_TOP: u64 = 0x7FFF_FFFF_E000;
+
+/// Bootstrap virtual addresses the kernel chooses for the init process.
+///
+/// The `InitInfo` page address is delivered to init in its entry register; the
+/// stack top becomes init's initial stack pointer. Neither is an ABI constant,
+/// so the kernel may vary them per-boot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InitLayout
+{
+    /// Base VA of the read-only `InitInfo` region.
+    pub init_info_va: u64,
+    /// Top of init's user stack.
+    pub init_stack_top: u64,
+}
+
+/// Cached init layout for this boot. `init_info_va == 0` means not yet chosen
+/// (a real `InitInfo` VA is never 0). Init is a singleton, and two boot phases
+/// read its layout — the `InitInfo` mapping in Phase 9 and the user trap-frame
+/// build in `sched::enter` — so the choice is made once and cached to keep both
+/// readers in agreement once ASLR (#39) makes it random.
+static INIT_LAYOUT_INFO_VA: AtomicU64 = AtomicU64::new(0);
+static INIT_LAYOUT_STACK_TOP: AtomicU64 = AtomicU64::new(0);
+
+/// Return the init process's bootstrap VA layout for this boot, choosing it on
+/// the first call and returning the cached value thereafter.
+///
+/// Deterministic today: returns the `DEFAULT_INIT_*` addresses above. The first
+/// call is the single seam ASLR (#39) replaces with a per-boot entropy draw
+/// (`crate::entropy::fill_bytes`); the analogue of `process-layout`'s
+/// `choose_process_layout` for the kernel→init handover. Safe to call from the
+/// single boot thread across boot phases; not intended for concurrent use.
+#[must_use]
+pub fn choose_init_layout() -> InitLayout
+{
+    let cached = INIT_LAYOUT_INFO_VA.load(Ordering::Relaxed);
+    if cached != 0
+    {
+        return InitLayout {
+            init_info_va: cached,
+            init_stack_top: INIT_LAYOUT_STACK_TOP.load(Ordering::Relaxed),
+        };
+    }
+
+    let layout = InitLayout {
+        init_info_va: DEFAULT_INIT_INFO_VA,
+        init_stack_top: DEFAULT_INIT_STACK_TOP,
+    };
+    INIT_LAYOUT_STACK_TOP.store(layout.init_stack_top, Ordering::Relaxed);
+    INIT_LAYOUT_INFO_VA.store(layout.init_info_va, Ordering::Relaxed);
+    layout
+}
 
 // ── AddressSpace ──────────────────────────────────────────────────────────────
 

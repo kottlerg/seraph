@@ -7,9 +7,9 @@
 //!
 //! This crate defines the binary interface between the kernel (Phase 7/9) and
 //! the init process. The kernel populates an [`InitInfo`] structure in a
-//! read-only page mapped into init's address space at [`INIT_INFO_VADDR`] and
-//! passes that address as init's sole entry argument (`rdi` on x86-64, `a0`
-//! on RISC-V).
+//! read-only page mapped into init's address space at a kernel-chosen virtual
+//! address (`choose_init_layout` in the kernel) and passes that address as
+//! init's sole entry argument (`rdi` on x86-64, `a0` on RISC-V).
 //!
 //! # Versioning
 //!
@@ -98,26 +98,12 @@ pub const INIT_MODULE_NAME_LEN: usize = 32;
 pub const INIT_MAX_NAMED_MODULES: usize = 12;
 
 // ── Address space constants ──────────────────────────────────────────────────
-
-/// Virtual address where the kernel maps the read-only [`InitInfo`] region.
-///
-/// The region spans one or more contiguous pages — enough for the header
-/// (which now includes the boot-module name table) followed by the
-/// variable-length [`CapDescriptor`] array. Sized so the full
-/// [`INIT_INFO_MAX_PAGES`] fit between this address and the init stack's guard
-/// page (`0x7FFF_FFFF_9000`): the
-/// region occupies `[0x7FFF_FFFF_5000, 0x7FFF_FFFF_9000)`, the guard sits at
-/// `0x7FFF_FFFF_9000`, and the stack runs `[0x7FFF_FFFF_A000, INIT_STACK_TOP)`.
-/// A larger array (3+ pages) must not collide with the stack — that silently
-/// remaps descriptor pages onto stack frames and drops the trailing caps.
-pub const INIT_INFO_VADDR: u64 = 0x7FFF_FFFF_5000;
-
-/// Virtual address of the top of init's user stack.
-///
-/// `INIT_STACK_PAGES` pages are mapped immediately below this address.
-/// One additional guard page (unmapped) sits below the stack, and the
-/// [`InitInfo`] region (up to [`INIT_INFO_MAX_PAGES`]) sits below that.
-pub const INIT_STACK_TOP: u64 = 0x7FFF_FFFF_E000;
+//
+// The `InitInfo` region and init stack virtual addresses are not ABI constants:
+// the kernel chooses them per-boot (see `choose_init_layout` in the kernel) and
+// delivers the `InitInfo` page address to init in the entry register, exactly as
+// procmgr does for `ProcessInfo` (#250). Only the page-count bounds below — which
+// both the kernel and init must agree on — remain part of the protocol.
 
 /// Number of 4 KiB pages in init's user stack (16 KiB total).
 pub const INIT_STACK_PAGES: usize = 4;
@@ -135,10 +121,10 @@ pub const INIT_INFO_MAX_PAGES: usize = 4;
 
 /// Kernel-to-init handover structure.
 ///
-/// Placed at [`INIT_INFO_VADDR`] (one or more pages, read-only). The fixed-size
-/// header is followed by a variable-length [`CapDescriptor`] array; the array
-/// starts at byte offset [`InitInfo::cap_descriptors_offset`] from the start
-/// of this struct.
+/// Placed in one or more read-only pages at a kernel-chosen virtual address,
+/// delivered to init in its entry register. The fixed-size header is followed by
+/// a variable-length [`CapDescriptor`] array; the array starts at byte offset
+/// [`InitInfo::cap_descriptors_offset`] from the start of this struct.
 ///
 /// All slot indices refer to init's root `CSpace` (`CSpace` ID 0).
 #[repr(C)]

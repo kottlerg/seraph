@@ -12,6 +12,7 @@ test = false
 [dependencies]
 init-protocol = { path = "../../abi/init-protocol" }
 process-abi = { path = "../../abi/process-abi" }
+process-layout = { path = "../../shared/process-layout" }
 elf = { path = "../../shared/elf" }
 ipc = { path = "../../shared/ipc" }
 namespace-protocol = { path = "../../shared/namespace-protocol" }

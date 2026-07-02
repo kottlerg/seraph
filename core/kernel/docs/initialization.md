@@ -406,21 +406,24 @@ calls `sched::enter()`.
       one at a time so each phys address is captured for the reclaim
       Memory cap minted alongside it
    b. Zero each frame
-   c. Map below INIT_STACK_TOP (0x7FFF_FFFF_E000) with read/write permissions
+   c. Map below the chosen init stack top (`choose_init_layout().init_stack_top`,
+      default 0x7FFF_FFFF_E000) with read/write permissions
    d. Mint a reclaimable Memory cap per stack page into the root CSpace
       so init can donate the pages to memmgr on reap
    e. Guard page (unmapped) sits immediately below the stack; stack overflows fault
 5. Create init's TCB:
    a. Allocate a kernel stack for init (KERNEL_STACK_PAGES = 4 pages = 16 KiB)
-   b. new_state(entry=init_image.entry_point, stack_top=kstack_top, arg=0, is_user=true)
-      stores entry_point in saved_state.rip (x86-64) or .ra (RISC-V)
+   b. new_state(entry=init_image.entry_point, stack_top=kstack_top,
+      arg=choose_init_layout().init_info_va, is_user=true) stores entry_point in
+      saved_state.rip (x86-64) or .ra (RISC-V) and the InitInfo VA as the arg
+      forwarded to init's a0/rdi on first entry
    c. Priority: INIT_PRIORITY (15)
    d. cspace: set to ROOT_CSPACE raw pointer (handed off at `sched::enter()` start)
 6. Enqueue the init TCB on the BSP's run queue at INIT_PRIORITY
 7. Call sched::enter() — does not return:
    a. Dequeue the highest-priority ready thread (init)
    b. Build an initial user-mode TrapFrame on init's kernel stack:
-      rip/sepc=entry_point, rsp/sp=INIT_STACK_TOP, cs=USER_CS, ss=USER_DS,
+      rip/sepc=entry_point, rsp/sp=chosen init stack top, cs=USER_CS, ss=USER_DS,
       rflags=0x202 (IF=1)
    c. x86-64: call switch_and_enter_user(root_phys, tf_ptr) — atomically
       switches RSP to init's kernel stack, writes CR3, builds iretq frame, iretq

@@ -134,21 +134,27 @@ private VA constants for whatever scratch regions they need.
 The handover pages (`ProcessInfo`, `InitInfo`), the main-thread stack,
 the main-thread IPC buffer, and the main-thread TLS block must be
 mapped into the new process's address space *before* the process runs
-its first instruction. The creator picks the VAs and writes them where
-the child's `_start` will find them.
+its first instruction. The creator chooses every one of these virtual
+addresses per-process — none is a fixed ABI constant — and communicates
+them either through the handover struct or, for the handover page itself,
+through the entry register. Procmgr and init choose process layouts via
+[`shared/process-layout`](../shared/process-layout/)
+(`choose_process_layout`); the kernel chooses init's layout via its own
+`choose_init_layout`. Both are deterministic today and are the single
+seam ASLR ([#39](https://github.com/kottlerg/seraph/issues/39)) replaces
+with a per-process entropy draw.
 
-- **`ProcessInfo` page.** Procmgr maps a read-only page at
-  `PROCESS_INFO_VADDR` (today an ABI constant in
-  [`abi/process-abi`](../abi/process-abi/)) and writes the
-  `ProcessInfo` struct into it. The child's `_start` reads the
-  struct from this VA.
-- **`InitInfo` page.** The kernel maps a read-only page at
-  `INIT_INFO_VADDR` (today an ABI constant in
-  [`abi/init-protocol`](../abi/init-protocol/)) for init only.
+- **`ProcessInfo` page.** Procmgr maps a read-only page at the chosen
+  `process_info_va`, writes the `ProcessInfo` struct into it, and delivers
+  that address to the child in its entry register (`rdi`/`a0`). The
+  child's `_start` takes the address as its argument — it cannot read the
+  address from the struct, since the address is what locates the struct.
+- **`InitInfo` page.** The kernel maps a read-only page at its chosen
+  `init_info_va` for init only, and delivers the address in init's entry
+  register the same way.
 - **Main-thread stack.** The loader (procmgr or, for memmgr/procmgr,
-  init) maps `ProcessInfo.stack_pages` pages ending at
-  `ProcessInfo.stack_top_vaddr` (today equal to the
-  `PROCESS_STACK_TOP` ABI constant) with a guard page below. The page
+  init) maps `ProcessInfo.stack_pages` pages ending at the chosen
+  `ProcessInfo.stack_top_vaddr` with a guard page below. The page
   count comes from the binary's optional `.note.seraph.stack` ELF note
   (declared via the `process_abi::stack_pages!` / `seraph::stack_pages!`
   macro); binaries that omit the note inherit
@@ -156,18 +162,23 @@ the child's `_start` will find them.
   `MAX_PROCESS_STACK_PAGES`; the pool's available RAM is the remaining
   gate on the resulting `REQUEST_MEMORY_CAPS` calls (memmgr tracks
   per-process frames in a RAM-bound arena, not a fixed quota).
-- **Main-thread IPC buffer.** Procmgr picks a per-process VA and writes
-  it into `ProcessInfo.ipc_buffer_vaddr` — this is already a runtime
-  field, not an ABI constant.
-- **Main-thread TLS block.** Procmgr maps the block at
-  `PROCESS_MAIN_TLS_VADDR` (today an ABI constant); spawned threads
+- **Main-thread IPC buffer.** The creator picks a per-process VA and
+  writes it into `ProcessInfo.ipc_buffer_vaddr`.
+- **Main-thread TLS block.** The creator maps the block at the chosen
+  base and records it in `ProcessInfo.main_tls_vaddr` (zero when the
+  binary has no `PT_TLS`); the kernel installs the thread pointer, so
+  `_start` reads the field only for introspection. Spawned threads
   allocate their TLS blocks from the heap.
 
-The page locations are split between **runtime fields**
-(`ipc_buffer_vaddr`) and **ABI constants** (`PROCESS_INFO_VADDR`,
-`PROCESS_STACK_TOP`, `PROCESS_MAIN_TLS_VADDR`, `INIT_INFO_VADDR`).
-Each ABI constant is declared in its respective ABI crate
-(`abi/process-abi`, `abi/init-protocol`).
+These VAs are **runtime values**, not ABI constants: the handover-page
+addresses ride the entry register, and the stack/TLS/IPC VAs are
+`ProcessInfo` fields (`stack_top_vaddr`, `main_tls_vaddr`,
+`ipc_buffer_vaddr`). The only handover constants the ABI crates still
+declare are policy bounds — `DEFAULT_PROCESS_STACK_PAGES`,
+`MAX_PROCESS_STACK_PAGES`, `PROCESS_MAIN_TLS_MAX_PAGES`,
+`INIT_STACK_PAGES`, `INIT_INFO_MAX_PAGES` — not layout addresses. The
+default addresses the deterministic choosers return live in
+`shared/process-layout` (and the kernel's `choose_init_layout`).
 
 See [`process-lifecycle.md`](process-lifecycle.md) for the full
 handover discipline.
@@ -238,4 +249,4 @@ yet implemented), not a kernel feature.
 
 ## Summarized By
 
-[README.md](../README.md), [Memory Model](memory-model.md), [Architecture Overview](architecture.md), [memmgr/README.md](../services/memmgr/README.md), [procmgr/README.md](../services/procmgr/README.md), [ruststd/README.md](../runtime/ruststd/README.md)
+[README.md](../README.md), [Memory Model](memory-model.md), [Architecture Overview](architecture.md), [memmgr/README.md](../services/memmgr/README.md), [procmgr/README.md](../services/procmgr/README.md), [ruststd/README.md](../runtime/ruststd/README.md), [process-layout/README.md](../shared/process-layout/README.md)

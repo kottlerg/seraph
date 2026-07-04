@@ -12,6 +12,7 @@ test = false
 [dependencies]
 ipc = { path = "../../shared/ipc" }
 namespace-protocol = { path = "../../shared/namespace-protocol" }
+process-abi = { workspace = true }
 process-layout = { path = "../../shared/process-layout" }
 syscall = { path = "../../shared/syscall" }
 shmem = { path = "../../shared/shmem" }

@@ -179,6 +179,11 @@ pub struct TestContext
     /// pass it (or a `sched_split` child) as the `SchedControl` argument to
     /// `SYS_THREAD_SET_PRIORITY`.
     pub sched_control_cap: u32,
+
+    /// VA of the read-only `InitInfo` page, as delivered in the entry
+    /// register — the kernel's per-boot `choose_init_layout` draw (ASLR,
+    /// #39). Layout tests assert window membership on it.
+    pub init_info_va: u64,
 }
 
 /// 16 KiB stack for a child thread, aligned per the System V ABI.
@@ -349,6 +354,7 @@ fn run(info_ptr: u64) -> !
         memory_base: info.memory_base,
         sbi_control_cap: info.sbi_control_cap,
         sched_control_cap: info.sched_control_cap,
+        init_info_va: info_ptr,
     };
 
     let config = cmdline::KtestConfig::DEFAULT;

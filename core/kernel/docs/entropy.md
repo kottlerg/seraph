@@ -185,10 +185,16 @@ to that generator. It MUST NOT be called from interrupt context (it takes
 non-reentrant per-CPU state) or before the pool is seeded.
 
 Kernel-internal production consumers are the structural-unguessability hardening
-(#248): the CSpace recycling epoch (`cap::free_cspace_id`) and thread-id
-correlators (`sched::alloc_thread_id`) draw via `next_u32`. Both run after Phase 5
-seeding and never in interrupt context. The boot self-test is the API's continuous
-validator.
+(#248) — the CSpace recycling epoch (`cap::free_cspace_id`) and thread-id
+correlators (`sched::alloc_thread_id`) draw via `next_u32` — and init-layout ASLR
+(#39): `mm::address_space::choose_init_layout` draws init's `InitInfo` VA and
+stack placement via `fill_bytes` on its first call (Phase 9, boot thread). All
+run after Phase 5 seeding and never in interrupt context. Userspace ASLR (the
+per-process bootstrap-layout, heap-base, and reservation-arena draws in
+procmgr/init/`std::sys::seraph`) consumes the same generators through
+`SYS_GETRANDOM`. On riscv64 the pool currently seeds from timing jitter alone
+(#393), so those draws carry the boot-entropy-hole caveat above until a hardware
+source lands. The boot self-test is the API's continuous validator.
 
 ## Boot wiring and lifecycle
 

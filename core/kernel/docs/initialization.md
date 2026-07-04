@@ -407,7 +407,9 @@ calls `sched::enter()`.
       Memory cap minted alongside it
    b. Zero each frame
    c. Map below the chosen init stack top (`choose_init_layout().init_stack_top`,
-      default 0x7FFF_FFFF_E000) with read/write permissions
+      drawn per boot from the init-stack-guard window in `process-layout`;
+      deterministic default only if entropy is unavailable) with read/write
+      permissions
    d. Mint a reclaimable Memory cap per stack page into the root CSpace
       so init can donate the pages to memmgr on reap
    e. Guard page (unmapped) sits immediately below the stack; stack overflows fault

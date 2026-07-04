@@ -215,9 +215,13 @@ pub(crate) const THREAD_RETYPE_PAGES: u64 = 6;
 /// Sized to cover the typical small-process mapping pattern: 3-6 LOAD
 /// segments + stack + IPC buffer + TLS + `ProcessInfo` memory cap. Each
 /// distinct user VA region whose PT entry isn't already populated
-/// consumes up to 3 intermediate PT pages (PDPT/PD/PT on x86-64).
-/// Larger processes refill via augment-mode `cap_create_aspace`.
-pub(crate) const ASPACE_RETYPE_PAGES: u64 = 33;
+/// consumes up to 3 intermediate PT pages (PDPT/PD/PT on x86-64), and
+/// ASLR (#39) spreads the four bootstrap surfaces across distinct 64 GiB
+/// window strides — one shared PDPT plus up to 3 pages per surface (~13
+/// pooled pages) where the pre-ASLR clustered layout shared one
+/// PDPT/PD/PT triple. Larger processes refill via augment-mode
+/// `cap_create_aspace`.
+pub(crate) const ASPACE_RETYPE_PAGES: u64 = 48;
 
 /// Pages requested from memmgr for the child's `CSpace` retype slab.
 /// Each slot page holds `L2_SIZE` capability slots (currently 56 slots

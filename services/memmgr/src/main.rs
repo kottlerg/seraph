@@ -164,10 +164,16 @@ struct Slot
     next: u32,
 }
 
-/// Base VA of the metadata arena in memmgr's own address space. Sits in the
-/// free scratch band above [`PHYS_TABLE_TEMP_VA`] and below the high-canonical
-/// stack / `ProcessInfo` / IPC-buffer region, giving a 16 TiB window.
-const META_ARENA_BASE: u64 = 0x0000_6000_0000_0000;
+/// Degraded-fallback base VA of the metadata arena in memmgr's own address
+/// space, and the base of its per-boot draw window (ASLR, #39). The whole
+/// arena zone sits in the free scratch band above [`PHYS_TABLE_TEMP_VA`]'s
+/// window and below the high-canonical stack / `ProcessInfo` / IPC-buffer
+/// region.
+const META_ARENA_BASE_DEFAULT: u64 = 0x0000_6000_0000_0000;
+
+/// Log2 of the number of page-aligned arena-base slots (= bits of base
+/// entropy): the drawn base lies in a 64 GiB window above the default.
+const META_ARENA_SLOTS_LOG2: u32 = 24;
 
 /// Bytes per arena slot.
 const NODE_SIZE: usize = core::mem::size_of::<Slot>();
@@ -182,13 +188,24 @@ const NODES_PER_PAGE: usize = PAGE_SIZE as usize / NODE_SIZE;
 static mut ARENA_FREE_HEAD: u32 = NODE_NULL;
 static mut ARENA_PAGES: u32 = 0;
 static mut ARENA_SELF_ASPACE: u32 = 0;
+static mut ARENA_BASE_VA: u64 = META_ARENA_BASE_DEFAULT;
 
-/// Record memmgr's own `AddressSpace` cap for arena page mapping. Called once at
-/// boot, before any node allocation.
+/// Record memmgr's own `AddressSpace` cap for arena page mapping and draw the
+/// arena base (ASLR, #39). Called once at boot, before any node allocation. A
+/// failed draw — a kernel-contract violation once the pool is seeded —
+/// degrades to the deterministic default base.
 fn arena_init(self_aspace: u32)
 {
+    let base = match syscall::random_u64()
+    {
+        Ok(r) => META_ARENA_BASE_DEFAULT + ((r & ((1 << META_ARENA_SLOTS_LOG2) - 1)) << 12),
+        Err(_) => META_ARENA_BASE_DEFAULT,
+    };
     // SAFETY: single-threaded; called once before the dispatch loop.
-    unsafe { ARENA_SELF_ASPACE = self_aspace };
+    unsafe {
+        ARENA_SELF_ASPACE = self_aspace;
+        ARENA_BASE_VA = base;
+    }
 }
 
 /// Raw pointer to slot `idx`. The slot's page is mapped for any index ever
@@ -197,7 +214,9 @@ fn slot_ptr(idx: u32) -> *mut Slot
 {
     let page = idx as usize / NODES_PER_PAGE;
     let slot = idx as usize % NODES_PER_PAGE;
-    (META_ARENA_BASE as usize + page * PAGE_SIZE as usize + slot * NODE_SIZE) as *mut Slot
+    // SAFETY: single-threaded; set once in `arena_init` before any allocation.
+    let base = unsafe { ARENA_BASE_VA };
+    (base as usize + page * PAGE_SIZE as usize + slot * NODE_SIZE) as *mut Slot
 }
 
 /// Map one pool frame as the next arena page and thread its slots onto the free
@@ -212,8 +231,9 @@ fn arena_grow(pool: &mut FreePool) -> bool
     };
     let (outer, _pages, phys) = granted[0];
     // SAFETY: single-threaded; set at boot / tracked here.
-    let (self_aspace, page_idx) = unsafe { (ARENA_SELF_ASPACE, ARENA_PAGES) };
-    let va = META_ARENA_BASE + u64::from(page_idx) * PAGE_SIZE;
+    let (self_aspace, page_idx, arena_base) =
+        unsafe { (ARENA_SELF_ASPACE, ARENA_PAGES, ARENA_BASE_VA) };
+    let va = arena_base + u64::from(page_idx) * PAGE_SIZE;
     if syscall::mem_map(outer, self_aspace, va, 0, 1, MAP_READ | MAP_WRITABLE).is_err()
     {
         // Return the unusable frame to the pool; it stays owned and counted.
@@ -763,10 +783,15 @@ const MEMMGR_SELF_BADGE: u64 = u64::MAX;
 /// `mint_process_badge`, so no minted badge can collide.
 const INIT_SELF_BADGE: u64 = u64::MAX - 1;
 
-/// Scratch VA in memmgr's address space for mapping the bootstrap
-/// phys-table memory cap. One page; mapped RO during `bootstrap_from_init`,
+/// Degraded-fallback scratch VA in memmgr's address space for mapping the
+/// bootstrap phys-table memory cap, and the base of its per-boot draw
+/// window (ASLR, #39). One page; mapped RO during `bootstrap_from_init`,
 /// unmapped before the dispatch loop entry.
 const PHYS_TABLE_TEMP_VA: u64 = 0x0000_5000_0000_0000;
+
+/// Log2 of the number of page-aligned phys-table scratch slots (= bits of
+/// base entropy): the drawn VA lies in a 64 GiB window above the default.
+const PHYS_TABLE_TEMP_SLOTS_LOG2: u32 = 24;
 
 /// One in-use bootstrap arena delivered by init: a Memory cap covering a
 /// tier-1 service's whole backing (retype slabs + offset-mapped pages),
@@ -835,18 +860,25 @@ fn bootstrap_from_init(
         }
     }
 
-    // Map the phys-table memory cap and copy out memory_count u64 entries.
+    // Map the phys-table memory cap at a per-boot drawn scratch VA (ASLR,
+    // #39; degrades to the deterministic default on a failed draw) and copy
+    // out memory_count u64 entries.
+    let phys_table_va = match syscall::random_u64()
+    {
+        Ok(r) => PHYS_TABLE_TEMP_VA + ((r & ((1 << PHYS_TABLE_TEMP_SLOTS_LOG2) - 1)) << 12),
+        Err(_) => PHYS_TABLE_TEMP_VA,
+    };
     let phys_table_cap = round.caps[1];
     let mut phys_bases = [0u64; BOOTSTRAP_MAX_MEMORY_CAPS];
-    if syscall::mem_map(phys_table_cap, self_aspace, PHYS_TABLE_TEMP_VA, 0, 1, 0).is_err()
+    if syscall::mem_map(phys_table_cap, self_aspace, phys_table_va, 0, 1, 0).is_err()
     {
         return None;
     }
-    // SAFETY: PHYS_TABLE_TEMP_VA is mapped RO, one page. Init wrote the
+    // SAFETY: phys_table_va is mapped RO, one page. Init wrote the
     // first `memory_count` u64 entries; the rest is zero. The pointer is
     // page-aligned (4 KiB) so u64 alignment is satisfied.
     #[allow(clippy::cast_ptr_alignment)]
-    let phys_ptr = PHYS_TABLE_TEMP_VA as *const u64;
+    let phys_ptr = phys_table_va as *const u64;
     for (i, slot) in phys_bases
         .iter_mut()
         .enumerate()
@@ -896,7 +928,7 @@ fn bootstrap_from_init(
         )
     };
 
-    let _ = syscall::mem_unmap(self_aspace, PHYS_TABLE_TEMP_VA, 1);
+    let _ = syscall::mem_unmap(self_aspace, phys_table_va, 1);
     let _ = syscall::cap_delete(phys_table_cap);
 
     Some(InitBootstrap {

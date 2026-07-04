@@ -40,6 +40,10 @@ fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
     }
 }
 
+/// Bounded retries of the rollback sample window; see the comment at the
+/// use site.
+const ROLLBACK_WINDOW_TRIES: u32 = 8;
+
 fn main()
 {
     std::os::seraph::log::register_name(b"capexhaust");
@@ -70,36 +74,56 @@ fn main()
     // roll the grant back — pool free_bytes is identical before and after,
     // or the frames stay accounted to this process and the derived caps
     // stranded in memmgr.
-    let Some(free_before) = std::os::seraph::memmgr_pool_free_bytes()
-    else
+    //
+    // free_bytes is a system-global figure, so an unrelated process
+    // allocating or dying inside the sample window (crasher shares this
+    // boot) moves it without any rollback defect. The window is retried on
+    // inequality: transient churn is bounded and a quiet window follows,
+    // while a genuine rollback leak shifts every window and keeps failing.
+    let mut verified = false;
+    for attempt in 0..ROLLBACK_WINDOW_TRIES
     {
-        std::os::seraph::log!("QUERY_POOL_STATUS failed before grant attempts");
-        std::process::exit(1);
-    };
-    for _ in 0..8
-    {
-        let msg = ipc::IpcMessage::builder(ipc::memmgr_labels::REQUEST_MEMORY_CAPS)
-            .word(0, 1)
-            .build();
-        // SAFETY: ipc_buf is the registered IPC buffer page.
-        if let Ok(reply) = unsafe { ipc::ipc_call(info.memmgr_endpoint, &msg, ipc_buf) }
+        let Some(free_before) = std::os::seraph::memmgr_pool_free_bytes()
+        else
         {
-            assert_eq!(
-                reply.label,
-                syscall::IPC_REPLY_TRANSFER_FAILED,
-                "cap-bearing grant into an exhausted CSpace must fail"
-            );
+            std::os::seraph::log!("QUERY_POOL_STATUS failed before grant attempts");
+            std::process::exit(1);
+        };
+        for _ in 0..8
+        {
+            let msg = ipc::IpcMessage::builder(ipc::memmgr_labels::REQUEST_MEMORY_CAPS)
+                .word(0, 1)
+                .build();
+            // SAFETY: ipc_buf is the registered IPC buffer page.
+            if let Ok(reply) = unsafe { ipc::ipc_call(info.memmgr_endpoint, &msg, ipc_buf) }
+            {
+                assert_eq!(
+                    reply.label,
+                    syscall::IPC_REPLY_TRANSFER_FAILED,
+                    "cap-bearing grant into an exhausted CSpace must fail"
+                );
+            }
         }
+        let Some(free_after) = std::os::seraph::memmgr_pool_free_bytes()
+        else
+        {
+            std::os::seraph::log!("QUERY_POOL_STATUS failed after grant attempts");
+            std::process::exit(1);
+        };
+        if free_before == free_after
+        {
+            verified = true;
+            break;
+        }
+        std::os::seraph::log!(
+            "pool churned during rollback window (attempt {attempt}: \
+             {free_before} -> {free_after}); retrying"
+        );
     }
-    let Some(free_after) = std::os::seraph::memmgr_pool_free_bytes()
-    else
-    {
-        std::os::seraph::log!("QUERY_POOL_STATUS failed after grant attempts");
-        std::process::exit(1);
-    };
-    assert_eq!(
-        free_before, free_after,
-        "memmgr must roll back grants whose reply failed"
+    assert!(
+        verified,
+        "memmgr must roll back grants whose reply failed \
+         (free_bytes never stabilised across {ROLLBACK_WINDOW_TRIES} windows)"
     );
     std::os::seraph::log!(
         "failed-grant rollback verified (free_bytes unchanged); entering recv loop"

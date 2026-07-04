@@ -5,8 +5,10 @@ edition.workspace = true
 publish.workspace = true
 
 [lib]
-test = false
 doctest = false
+
+[dependencies]
+process-abi = { workspace = true }
 
 [lints]
 workspace = true

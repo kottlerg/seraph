@@ -31,16 +31,11 @@ use crate::os::seraph::current_ipc_buf;
 
 // ── Child-side ring VAs ────────────────────────────────────────────────────
 //
-// One fixed VA per direction, in the gap the default bootstrap layout leaves
-// between the main-thread TLS block and the IPC buffer: above
-// `process_layout::DEFAULT_MAIN_TLS_VA` + `PROCESS_MAIN_TLS_MAX_PAGES`
-// (0x7FFF_FFFD_4000) and below `process_layout::DEFAULT_IPC_BUFFER_VA`
-// (0x7FFF_FFFE_0000). These are the std runtime's own mapping choices, not
-// handover VAs; full per-process randomisation of them belongs to ASLR (#39).
-
-const STDIN_RING_VA: u64 = 0x0000_7FFF_FFFD_5000;
-const STDOUT_RING_VA: u64 = 0x0000_7FFF_FFFD_6000;
-const STDERR_RING_VA: u64 = 0x0000_7FFF_FFFD_7000;
+// One page per attached direction, drawn from the process's page-reservation
+// arena (`sys::reserve::seraph`) so the rings inherit the arena's
+// per-process randomised base (ASLR, #39). Reserving is pure VA bookkeeping
+// (no syscall beyond the arena's one-time base draw), so it is safe this
+// early in `_start`, before the heap exists.
 
 // Process-global stdio Pipe ends. UnsafeCell behind a one-shot guard
 // flag — `_start` is the unique writer; subsequent reads happen only
@@ -71,20 +66,21 @@ fn pipe_for(idx: usize) -> Option<&'static Pipe> {
     slots.get(idx).and_then(|s| s.as_ref())
 }
 
-/// Install one direction's pipe if a memory cap was provided. Helper
-/// for `stdio_init`.
+/// Install one direction's pipe if a memory cap was provided, reserving
+/// its ring VA from the arena. Helper for `stdio_init`.
 fn try_attach(
     memory: u32,
     data_notification: u32,
     space_notification: u32,
     role: Role,
     aspace: u32,
-    child_va: u64,
 ) -> Option<Pipe> {
     if memory == 0 {
         return None;
     }
-    Pipe::attach_from_caps(memory, data_notification, space_notification, role, aspace, child_va).ok()
+    let reserved = crate::sys::reserve::reserve_pages(1).ok()?;
+    Pipe::attach_from_caps(memory, data_notification, space_notification, role, aspace, reserved)
+        .ok()
 }
 
 /// Install the stdio pipe ends from `ProcessInfo` cap triples. Called
@@ -114,7 +110,6 @@ pub fn stdio_init(
             stdin_space_sig,
             Role::Reader,
             aspace,
-            STDIN_RING_VA,
         );
         slots[IDX_STDOUT] = try_attach(
             stdout_memory,
@@ -122,7 +117,6 @@ pub fn stdio_init(
             stdout_space_sig,
             Role::Writer,
             aspace,
-            STDOUT_RING_VA,
         );
         slots[IDX_STDERR] = try_attach(
             stderr_memory,
@@ -130,7 +124,6 @@ pub fn stdio_init(
             stderr_space_sig,
             Role::Writer,
             aspace,
-            STDERR_RING_VA,
         );
     }
     STDIO_READY.store(true, Ordering::Release);

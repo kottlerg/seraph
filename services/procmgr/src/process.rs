@@ -59,6 +59,29 @@ fn next_process_badge() -> Option<u64>
     }
 }
 
+/// Draw the entropy one bootstrap-layout choice consumes (ASLR, #39).
+///
+/// `None` means the draw failed — a kernel-contract violation once the pool
+/// is seeded, which it is before any userspace runs.
+fn draw_layout_entropy() -> Option<[u8; process_layout::LAYOUT_ENTROPY_BYTES]>
+{
+    let mut entropy = [0_u8; process_layout::LAYOUT_ENTROPY_BYTES];
+    let n = syscall::getrandom(entropy.as_mut_ptr(), entropy.len()).ok()?;
+    (n == entropy.len() as u64).then_some(entropy)
+}
+
+/// Choose a child's bootstrap layout from fresh entropy, degrading to the
+/// deterministic default layout (with a log line) if the draw fails.
+fn choose_child_layout() -> ProcessLayout
+{
+    let entropy = draw_layout_entropy();
+    if entropy.is_none()
+    {
+        std::os::seraph::log!("procmgr: layout entropy draw failed; using default layout");
+    }
+    choose_process_layout(entropy.as_ref())
+}
+
 /// Logd's death-notification `EventQueue` cap, registered via
 /// `procmgr_labels::REGISTER_DEATH_EQ` once real-logd is up. Zero
 /// until then. Read in `finalize_creation` to bind logd as a second
@@ -1179,7 +1202,7 @@ fn create_process_from_bytes(
     let stack_pages = elf::parse_stack_note(ehdr, module_bytes)
         .unwrap_or(DEFAULT_PROCESS_STACK_PAGES)
         .clamp(1, MAX_PROCESS_STACK_PAGES);
-    let layout = choose_process_layout();
+    let layout = choose_child_layout();
 
     let aspace_slab = crate::memmgr_alloc_pages_contig(
         universals.memmgr_endpoint,
@@ -1925,7 +1948,7 @@ pub fn create_process_from_file(
     })
     .unwrap_or(DEFAULT_PROCESS_STACK_PAGES)
     .clamp(1, MAX_PROCESS_STACK_PAGES);
-    let layout = choose_process_layout();
+    let layout = choose_child_layout();
 
     let aspace_slab =
         crate::memmgr_alloc_pages_contig(mms.cap(), crate::ASPACE_RETYPE_PAGES, ipc_buf)

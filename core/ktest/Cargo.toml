@@ -11,13 +11,14 @@ path = "src/main.rs"
 test = false
 
 [dependencies]
-crypto        = { path = "../../shared/crypto" }
-font          = { workspace = true }
-init-protocol = { path = "../../abi/init-protocol" }
-ipc           = { path = "../../shared/ipc" }
-syscall       = { path = "../../shared/syscall" }
-syscall-abi   = { path = "../../abi/syscall" }
-text          = { workspace = true }
+crypto         = { path = "../../shared/crypto" }
+font           = { workspace = true }
+init-protocol  = { path = "../../abi/init-protocol" }
+ipc            = { path = "../../shared/ipc" }
+process-layout = { workspace = true }
+syscall        = { path = "../../shared/syscall" }
+syscall-abi    = { path = "../../abi/syscall" }
+text           = { workspace = true }
 
 [lints]
 workspace = true

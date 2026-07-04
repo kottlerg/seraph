@@ -19,12 +19,18 @@ use crate::sync::atomic::{AtomicBool, Ordering};
 
 use syscall_abi::PAGE_SIZE;
 
-/// Base of the per-process page-reservation arena. Deterministic for the
-/// first cut; structured so a one-line change switches to an RNG draw
-/// once the kernel RNG lands. Sits above the heap zone (`HEAP_MAX =
-/// 0x8000_0000`) and below the bootstrap-cross-boundary VAs at the top
-/// of the lower-canonical half.
-const RESERVE_ARENA_BASE: u64 = 0x0000_0001_0000_0000;
+/// Degraded-fallback base of the per-process page-reservation arena, used
+/// when the entropy draw fails. Also the base of the draw window. The whole
+/// arena zone `[64 GiB, ~128.25 GiB)` sits above the heap zone (< 4 GiB,
+/// `alloc/seraph.rs`) and below the image window and the
+/// bootstrap-cross-boundary VAs at the top of the lower-canonical half; the
+/// zone bound is mirrored in `shared/process-layout` for the cross-zone
+/// const-asserts.
+const RESERVE_ARENA_BASE_DEFAULT: u64 = 0x0000_0010_0000_0000;
+
+/// Log2 of the number of page-aligned arena-base slots (= bits of base
+/// entropy, ASLR #39). The drawn base lies in `[64 GiB, 128 GiB)`.
+const RESERVE_ARENA_SLOTS_LOG2: u32 = 24;
 
 /// Arena length in 4 KiB pages. 256 MiB total — sized to cover the
 /// worst-case sum of MMIO + DMA + zero-copy-VFS + ELF-load reservations
@@ -102,8 +108,21 @@ impl Arena {
         if self.initialized {
             return;
         }
+        // ASLR (#39): draw the arena base on first use. The draw is one
+        // bounded, non-allocating, non-reentrant getrandom syscall taken
+        // under the arena spin-lock — it cannot IPC, allocate, or re-enter
+        // the arena, so holding the lock across it is safe. A failed draw
+        // degrades to the deterministic default base.
+        let mut entropy = [0u8; 8];
+        let base = match syscall::getrandom(entropy.as_mut_ptr(), entropy.len()) {
+            Ok(n) if n == entropy.len() as u64 => {
+                RESERVE_ARENA_BASE_DEFAULT
+                    + ((u64::from_le_bytes(entropy) & ((1 << RESERVE_ARENA_SLOTS_LOG2) - 1)) << 12)
+            }
+            _ => RESERVE_ARENA_BASE_DEFAULT,
+        };
         self.runs[0] = Some(Run {
-            va_start: RESERVE_ARENA_BASE,
+            va_start: base,
             page_count: RESERVE_ARENA_PAGES,
         });
         self.initialized = true;

@@ -88,10 +88,14 @@ maps segments as directed by the binary format. The general convention is:
   0x0000000000400000 ┘  Program image (text, rodata, data, bss)
 ```
 
-Concrete VA management surfaces, the frame-allocation contract, and ownership
-boundaries between the kernel, memmgr, procmgr, and `std::sys::seraph` are
-documented in [userspace-memory-model.md](userspace-memory-model.md). The
-userspace boot order and the process-creation/death flow are in
+The diagram shows the ordering convention only: each region's base is
+randomised per process within a fixed window (ASLR,
+[#39](https://github.com/kottlerg/seraph/issues/39)). Concrete VA management
+surfaces, the per-region randomisation windows, the frame-allocation
+contract, and ownership boundaries between the kernel, memmgr, procmgr, and
+`std::sys::seraph` are documented in
+[userspace-memory-model.md](userspace-memory-model.md). The userspace boot
+order and the process-creation/death flow are in
 [process-lifecycle.md](process-lifecycle.md).
 
 ---

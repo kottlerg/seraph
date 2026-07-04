@@ -133,11 +133,21 @@ pub fn stack_envelope_phase(_: &Caps)
         "svctest declares no stack note; expected default of 8 pages, got {}",
         info.stack_pages
     );
-    assert_eq!(
-        info.stack_top_vaddr,
-        process_layout::DEFAULT_STACK_TOP,
-        "stack_top_vaddr {:#x} does not match the default process layout",
+    // ASLR (#39): the creator draws the stack placement from the stack-guard
+    // window; the guard page sits MAX_PROCESS_STACK_PAGES + 1 pages below the
+    // top. Strict by design — a degraded-entropy boot (defaults outside the
+    // window) fails here loudly.
+    assert!(
+        info.stack_top_vaddr.is_multiple_of(4096),
+        "stack_top_vaddr {:#x} is not page-aligned",
         info.stack_top_vaddr
+    );
+    let stack_guard =
+        info.stack_top_vaddr - (1 + u64::from(process_abi::MAX_PROCESS_STACK_PAGES)) * 4096;
+    assert!(
+        process_layout::STACK_GUARD_WINDOW.contains(stack_guard),
+        "stack guard {stack_guard:#x} (top {top:#x}) outside the stack-guard window",
+        top = info.stack_top_vaddr
     );
 
     let sp_probe = 0u64;
@@ -148,6 +158,12 @@ pub fn stack_envelope_phase(_: &Caps)
         "SP {sp:#x} outside reported stack range \
          [{stack_base:#x}, {top:#x})",
         top = info.stack_top_vaddr
+    );
+
+    let ipc_buffer = info.ipc_buffer as u64;
+    assert!(
+        process_layout::IPC_BUFFER_WINDOW.contains(ipc_buffer),
+        "ipc_buffer {ipc_buffer:#x} outside the IPC-buffer window"
     );
 
     std::os::seraph::log!(
@@ -162,10 +178,11 @@ pub fn tls_main_phase(_: &Caps)
     // svctest is a std binary with thread-locals, so the loader maps a main TLS
     // block and reports its base. It must be nonzero and below the stack.
     let info = startup_info();
-    assert_eq!(
-        info.main_tls_vaddr,
-        process_layout::DEFAULT_MAIN_TLS_VA,
-        "main_tls_vaddr {:#x} does not match the default process layout",
+    // ASLR (#39): the TLS base is drawn from its window; window ordering
+    // guarantees it lies below the stack top for every draw.
+    assert!(
+        process_layout::MAIN_TLS_WINDOW.contains(info.main_tls_vaddr),
+        "main_tls_vaddr {:#x} outside the main-TLS window",
         info.main_tls_vaddr
     );
     assert!(

@@ -95,8 +95,11 @@ communicates them via `ProcessInfo` / `InitInfo`.
   many single-page IPCs into a single round.
 - **Bootstrap.** `std::os::seraph::_start` calls `REQUEST_MEMORY_CAPS`
   before `fn main()` runs and maps the returned caps at the process's
-  initial heap base. The size of the initial bootstrap heap is a
-  `std::sys::seraph` implementation detail.
+  initial heap base, drawn per process from a fixed window above
+  `0x4000_0000` (19 bits of entropy; ASLR,
+  [#39](https://github.com/kottlerg/seraph/issues/39)) via one raw
+  non-allocating `SYS_GETRANDOM` call. The size of the initial
+  bootstrap heap is a `std::sys::seraph` implementation detail.
 - **Out-of-memory.** `GlobalAlloc::alloc` returns null; the `alloc`
   crate panics; the std panic handler exits the thread. svcmgr observes
   the death via its event queue and applies restart policy. No kernel
@@ -120,14 +123,21 @@ the process via the page-reservation allocator inside `std::sys::seraph`.
   caps into the reservation with `mem_map`. The caller is responsible
   for `mem_unmap` before `unreserve_pages`.
 - **Arena.** Each process carves a fixed-size arena out of its own
-  address space at `_start` time. The arena base is a deterministic
-  constant.
+  address space on first use. The arena base is drawn per process from a
+  fixed 64 GiB window above `0x10_0000_0000` (24 bits of entropy; ASLR,
+  [#39](https://github.com/kottlerg/seraph/issues/39)), degrading to the
+  window base when the entropy draw fails. Everything placed through the
+  arena — thread stacks, MMIO, shmem, stdio/pipe rings, ELF scratch —
+  inherits the randomised base.
 - **Concurrency.** Reservations are independent across threads; the
   allocator serialises on a spinlock as needed.
 
 The page-reservation allocator is a `std::sys::seraph` concern and is
 not exposed to non-std runtimes. `init` and `memmgr` carry small
-private VA constants for whatever scratch regions they need.
+private VA choices for whatever scratch regions they need; memmgr draws
+its metadata-arena and phys-table scratch bases per boot from fixed
+windows of its own, while init's short-lived bootstrap scratch stays
+deterministic (init exits at reap and serves no untrusted input).
 
 ### Bootstrap Cross-Boundary VAs
 
@@ -137,12 +147,30 @@ mapped into the new process's address space *before* the process runs
 its first instruction. The creator chooses every one of these virtual
 addresses per-process — none is a fixed ABI constant — and communicates
 them either through the handover struct or, for the handover page itself,
-through the entry register. Procmgr and init choose process layouts via
+through the entry register. Procmgr and init draw process layouts via
 [`shared/process-layout`](../shared/process-layout/)
-(`choose_process_layout`); the kernel chooses init's layout via its own
-`choose_init_layout`. Both are deterministic today and are the single
-seam ASLR ([#39](https://github.com/kottlerg/seraph/issues/39)) replaces
-with a per-process entropy draw.
+(`choose_process_layout`, fed `SYS_GETRANDOM` entropy); the kernel draws
+init's layout per boot via its own `choose_init_layout` over the same
+window constants (`crate::entropy::fill_bytes`).
+
+Every bootstrap surface is randomised independently (ASLR,
+[#39](https://github.com/kottlerg/seraph/issues/39)): each is a
+page-aligned draw from a fixed per-region window of 2²³ slots (23 bits
+of entropy per surface) on 64 GiB strides inside the top
+PML4/Sv48-root slot — TLS at `0x7F80_0000_0000`, IPC buffer at
+`0x7F90_0000_0000`, `ProcessInfo` at `0x7FA0_0000_0000`, stack guard at
+`0x7FB0_0000_0000`, and, kernel-drawn for init, `InitInfo` at
+`0x7FC0_0000_0000` and the init stack guard at `0x7FD0_0000_0000`. The
+stride spacing makes region ordering, pairwise disjointness, and the
+unmapped guard page below every stack hold for all possible draws, so
+no collision checking or redraw is ever needed. A creator whose entropy
+draw fails (a kernel-contract violation once the pool is seeded) logs
+and degrades to the deterministic `DEFAULT_*` addresses, which lie
+outside the windows — the test harnesses' window assertions then fail
+loudly by design. On riscv64 the boot entropy is currently jitter-only
+([#393](https://github.com/kottlerg/seraph/issues/393)); see
+[`core/kernel/docs/entropy.md`](../core/kernel/docs/entropy.md) for the
+quality caveat.
 
 - **`ProcessInfo` page.** Procmgr maps a read-only page at the chosen
   `process_info_va`, writes the `ProcessInfo` struct into it, and delivers
@@ -177,8 +205,8 @@ addresses ride the entry register, and the stack/TLS/IPC VAs are
 declare are policy bounds — `DEFAULT_PROCESS_STACK_PAGES`,
 `MAX_PROCESS_STACK_PAGES`, `PROCESS_MAIN_TLS_MAX_PAGES`,
 `INIT_STACK_PAGES`, `INIT_INFO_MAX_PAGES` — not layout addresses. The
-default addresses the deterministic choosers return live in
-`shared/process-layout` (and the kernel's `choose_init_layout`).
+draw windows and the degraded-fallback `DEFAULT_*` addresses live in
+`shared/process-layout` (shared by the kernel's `choose_init_layout`).
 
 See [`process-lifecycle.md`](process-lifecycle.md) for the full
 handover discipline.

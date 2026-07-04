@@ -5,14 +5,18 @@
 
 //! Shared ELF64 parsing crate for Seraph userspace components.
 //!
-//! Provides validation, header parsing, and `PT_LOAD` segment enumeration for
-//! ELF64 static executables. Used by init (to load procmgr from a boot module)
-//! and by procmgr (to load all subsequent processes).
+//! Provides validation, header parsing, `PT_LOAD` segment enumeration, and
+//! `.rela.dyn` relocation-table extraction for ELF64 executables — both
+//! fixed-address `ET_EXEC` images and position-independent `ET_DYN` images
+//! (loaded at a caller-chosen bias with `RELATIVE` relocations applied).
+//! Used by init (to load memmgr and procmgr from boot modules) and by
+//! procmgr (to load all subsequent processes).
 //!
 //! This crate is `no_std` and performs no allocation or I/O. All functions
-//! operate on a byte slice representing the raw ELF image.
+//! operate on a byte slice representing the raw ELF image (or, for the
+//! `*_metadata` variants, its header page plus a caller-supplied reader).
 
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 // cast_possible_truncation: this crate targets 64-bit only (x86-64, riscv64);
 // ELF64 u64 fields fit in usize on these platforms.
 #![allow(clippy::cast_possible_truncation)]
@@ -35,6 +39,8 @@ const EV_CURRENT: u8 = 1;
 
 /// ELF type: static executable.
 const ET_EXEC: u16 = 2;
+/// ELF type: shared object / position-independent executable.
+const ET_DYN: u16 = 3;
 
 /// Machine type: x86-64.
 pub const EM_X86_64: u16 = 0x3E;
@@ -46,6 +52,9 @@ pub const EM_RISCV: u16 = 0xF3;
 /// Program header type: loadable segment.
 const PT_LOAD: u32 = 1;
 
+/// Program header type: dynamic linking information.
+const PT_DYNAMIC: u32 = 2;
+
 /// Program header type: thread-local storage template.
 const PT_TLS: u32 = 7;
 
@@ -53,6 +62,48 @@ const PT_TLS: u32 = 7;
 const PF_X: u32 = 1;
 /// Segment flag: write permission.
 const PF_W: u32 = 2;
+
+// ── Dynamic section constants ────────────────────────────────────────────────
+
+/// Dynamic tag: end of the dynamic array.
+const DT_NULL: i64 = 0;
+/// Dynamic tag: total byte size of the PLT relocation entries.
+const DT_PLTRELSZ: i64 = 2;
+/// Dynamic tag: link VA of the `Elf64_Rela` relocation table.
+const DT_RELA: i64 = 7;
+/// Dynamic tag: total byte size of the `Elf64_Rela` table.
+const DT_RELASZ: i64 = 8;
+/// Dynamic tag: byte size of one `Elf64_Rela` entry.
+const DT_RELAENT: i64 = 9;
+/// Dynamic tag: link VA of an `Elf64_Rel` (implicit-addend) table.
+const DT_REL: i64 = 17;
+/// Dynamic tag: link VA of the PLT relocation entries.
+const DT_JMPREL: i64 = 23;
+/// Dynamic tag: total byte size of a packed `Relr` table.
+const DT_RELRSZ: i64 = 35;
+/// Dynamic tag: link VA of a packed `Relr` table.
+const DT_RELR: i64 = 36;
+
+/// Relocation type `R_X86_64_RELATIVE`: word64 at `offset` := bias + addend.
+pub const R_X86_64_RELATIVE: u32 = 8;
+/// Relocation type `R_RISCV_RELATIVE`: word64 at `offset` := bias + addend.
+pub const R_RISCV_RELATIVE: u32 = 3;
+
+/// Size in bytes of one `Elf64_Rela` record.
+pub const RELA_ENTRY_SIZE: usize = 24;
+
+/// Size in bytes of one `Elf64_Dyn` entry.
+const DYN_ENTRY_SIZE: usize = 16;
+
+/// Upper bound on an accepted `.rela.dyn` table (≈175k relocations).
+/// Tier-1/2 binaries carry a few thousand; the cap bounds loader work on a
+/// malformed or hostile image.
+pub const MAX_RELA_TABLE_SIZE: u64 = 4 * 1024 * 1024;
+
+/// Upper bound on the `PT_DYNAMIC` segment size accepted by the streaming
+/// parser (256 entries). lld emits well under 32 entries for `-Bsymbolic`
+/// PIE with no dynamic linking; the cap keeps the on-stack buffer fixed.
+pub const MAX_STREAMING_DYNAMIC: usize = 4096;
 
 // ── e_ident index constants ──────────────────────────────────────────────────
 
@@ -88,6 +139,16 @@ pub enum ElfError
     PhdrTableOverflow,
     /// A `PT_LOAD` segment references data beyond the file.
     SegmentOverflow,
+    /// The `PT_DYNAMIC` segment or the relocation table it describes is
+    /// malformed: bad bounds or entry size, size cap exceeded, table not
+    /// backed by a `PT_LOAD` segment's file data, or a streaming read of
+    /// either failed.
+    MalformedDynamic,
+    /// The image carries a relocation table format or relocation type other
+    /// than the architecture's `RELATIVE` type.
+    UnsupportedRelocation,
+    /// A relocation target falls outside the loaded image's segments.
+    RelocOutOfBounds,
 }
 
 // ── Raw ELF types ────────────────────────────────────────────────────────────
@@ -213,16 +274,70 @@ pub struct TlsSegment
 
 // ── Validation ───────────────────────────────────────────────────────────────
 
+/// The object-file type of a validated executable image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ElfKind
+{
+    /// Fixed-address static executable (`ET_EXEC`): loaded at its link VAs
+    /// with bias 0, no relocations.
+    Exec,
+    /// Position-independent executable (`ET_DYN`): the loader chooses a load
+    /// bias and applies the image's `RELATIVE` relocations.
+    Dyn,
+}
+
 /// Validate an ELF64 header and return a typed reference.
 ///
 /// Checks: minimum size, magic, class (64-bit), data encoding (little-endian),
 /// version, type (`ET_EXEC`), machine, program header entry size, and program
-/// header count.
+/// header count. Kernel-image loading is `ET_EXEC`-only and uses this;
+/// userspace loaders use [`validate_executable`], which also accepts
+/// `ET_DYN`.
 ///
 /// # Errors
 ///
 /// Returns an [`ElfError`] variant for each failed check.
 pub fn validate(data: &[u8], expected_machine: u16) -> Result<&Elf64Ehdr, ElfError>
+{
+    let ehdr = validate_ident(data)?;
+    if ehdr.e_type != ET_EXEC
+    {
+        return Err(ElfError::NotExecutable);
+    }
+    validate_tail(ehdr, data, expected_machine)?;
+    Ok(ehdr)
+}
+
+/// Validate an ELF64 executable header, accepting both `ET_EXEC` and
+/// `ET_DYN`, and return a typed reference plus the detected [`ElfKind`].
+///
+/// Same checks as [`validate`] apart from the type check. Loader callers
+/// branch on the kind: `Exec` images load at their link VAs with bias 0;
+/// `Dyn` images load at a caller-chosen bias with relocations applied.
+///
+/// # Errors
+///
+/// Returns an [`ElfError`] variant for each failed check.
+pub fn validate_executable(
+    data: &[u8],
+    expected_machine: u16,
+) -> Result<(&Elf64Ehdr, ElfKind), ElfError>
+{
+    let ehdr = validate_ident(data)?;
+    let kind = match ehdr.e_type
+    {
+        ET_EXEC => ElfKind::Exec,
+        ET_DYN => ElfKind::Dyn,
+        _ => return Err(ElfError::NotExecutable),
+    };
+    validate_tail(ehdr, data, expected_machine)?;
+    Ok((ehdr, kind))
+}
+
+/// Size, magic, class, data-encoding, and version checks shared by
+/// [`validate`] and [`validate_executable`]; the caller checks `e_type`
+/// next, then [`validate_tail`].
+fn validate_ident(data: &[u8]) -> Result<&Elf64Ehdr, ElfError>
 {
     if data.len() < size_of::<Elf64Ehdr>()
     {
@@ -254,10 +369,13 @@ pub fn validate(data: &[u8], expected_machine: u16) -> Result<&Elf64Ehdr, ElfErr
     {
         return Err(ElfError::BadVersion);
     }
-    if ehdr.e_type != ET_EXEC
-    {
-        return Err(ElfError::NotExecutable);
-    }
+    Ok(ehdr)
+}
+
+/// Machine, program-header entry size/count, and program-header table
+/// bounds checks shared by [`validate`] and [`validate_executable`].
+fn validate_tail(ehdr: &Elf64Ehdr, data: &[u8], expected_machine: u16) -> Result<(), ElfError>
+{
     if ehdr.e_machine != expected_machine
     {
         return Err(ElfError::WrongMachine);
@@ -280,7 +398,7 @@ pub fn validate(data: &[u8], expected_machine: u16) -> Result<&Elf64Ehdr, ElfErr
         return Err(ElfError::PhdrTableOverflow);
     }
 
-    Ok(ehdr)
+    Ok(())
 }
 
 /// Return the entry point virtual address from a validated ELF header.
@@ -866,4 +984,903 @@ pub fn tls_segment_metadata(
     }
 
     Ok(None)
+}
+
+// ── Load span ────────────────────────────────────────────────────────────────
+
+/// Compute the link-VA span of all `PT_LOAD` segments: the pair
+/// `(min_vaddr, max_vaddr_end)` where `max_vaddr_end` is the largest
+/// `p_vaddr + p_memsz`.
+///
+/// Needs only the program header table, which [`validate`] /
+/// [`validate_executable`] confirmed lies within `data` — so the ELF header
+/// page suffices; full file data is not required. Zero-`memsz` segments are
+/// ignored. For `ET_DYN` images the span is bias-relative: callers add the
+/// load bias and validate placement (e.g. via
+/// `process_layout::validate_image_placement`).
+///
+/// # Errors
+///
+/// - [`ElfError::NoSegments`] if the image has no `PT_LOAD` segment.
+/// - [`ElfError::SegmentOverflow`] if a segment's `p_vaddr + p_memsz`
+///   overflows.
+pub fn load_span(ehdr: &Elf64Ehdr, data: &[u8]) -> Result<(u64, u64), ElfError>
+{
+    let mut min_vaddr = u64::MAX;
+    let mut max_end = 0u64;
+    let mut found = false;
+    for i in 0..ehdr.e_phnum as usize
+    {
+        let phdr = read_phdr(data, ehdr, i);
+        if phdr.p_type != PT_LOAD || phdr.p_memsz == 0
+        {
+            continue;
+        }
+        let end = phdr
+            .p_vaddr
+            .checked_add(phdr.p_memsz)
+            .ok_or(ElfError::SegmentOverflow)?;
+        min_vaddr = min_vaddr.min(phdr.p_vaddr);
+        max_end = max_end.max(end);
+        found = true;
+    }
+    if !found
+    {
+        return Err(ElfError::NoSegments);
+    }
+    Ok((min_vaddr, max_end))
+}
+
+// ── PT_DYNAMIC / RELATIVE relocations ────────────────────────────────────────
+
+/// Location of an image's `.rela.dyn` relocation table.
+///
+/// Returned by [`rela_table`] / [`rela_table_metadata`]. The caller reads
+/// `size` bytes at `file_offset` (whole or in chunks that are multiples of
+/// [`RELA_ENTRY_SIZE`]) and feeds them to [`relative_relocs`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RelaTable
+{
+    /// Link VA of the first `Elf64_Rela` record (`DT_RELA`).
+    pub vaddr: u64,
+    /// File offset of the table bytes within the ELF image, resolved through
+    /// the `PT_LOAD` segment whose file data contains the table.
+    pub file_offset: u64,
+    /// Table size in bytes (`DT_RELASZ`); a multiple of [`RELA_ENTRY_SIZE`],
+    /// at most [`MAX_RELA_TABLE_SIZE`].
+    pub size: u64,
+}
+
+/// One decoded `Elf64_Rela` record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rela
+{
+    /// Link VA of the 8-byte relocation target (`r_offset`); for `ET_DYN`
+    /// images the loader adds the load bias to locate the target.
+    pub offset: u64,
+    /// Relocation type (low 32 bits of `r_info`).
+    pub rtype: u32,
+    /// Constant addend (`r_addend`); a `RELATIVE` relocation writes
+    /// `bias + addend`.
+    pub addend: i64,
+}
+
+/// Map an ELF machine to its `RELATIVE` relocation type, or `None` for
+/// machines this crate does not support.
+#[must_use]
+pub const fn relative_reloc_type(machine: u16) -> Option<u32>
+{
+    match machine
+    {
+        EM_X86_64 => Some(R_X86_64_RELATIVE),
+        EM_RISCV => Some(R_RISCV_RELATIVE),
+        _ => None,
+    }
+}
+
+/// Decode one `Elf64_Rela` record from its 24 raw bytes.
+#[must_use]
+pub fn decode_rela(bytes: &[u8; RELA_ENTRY_SIZE]) -> Rela
+{
+    Rela {
+        offset: u64_le(&bytes[0..8]),
+        rtype: u32_le(&bytes[8..12]),
+        addend: i64_le(&bytes[16..24]),
+    }
+}
+
+/// Tags gathered from one walk of a `PT_DYNAMIC` segment.
+#[derive(Default)]
+struct DynamicSummary
+{
+    rela: Option<u64>,
+    relasz: Option<u64>,
+    relaent: Option<u64>,
+    pltrelsz: u64,
+    jmprel: bool,
+    rel: bool,
+    relr: bool,
+}
+
+/// Walk `Elf64_Dyn` entries until `DT_NULL` or the end of the segment.
+fn parse_dynamic(dyn_bytes: &[u8]) -> DynamicSummary
+{
+    let mut summary = DynamicSummary::default();
+    let mut off = 0;
+    while off + DYN_ENTRY_SIZE <= dyn_bytes.len()
+    {
+        let tag = i64_le(&dyn_bytes[off..off + 8]);
+        let val = u64_le(&dyn_bytes[off + 8..off + 16]);
+        off += DYN_ENTRY_SIZE;
+        match tag
+        {
+            DT_NULL => break,
+            DT_RELA => summary.rela = Some(val),
+            DT_RELASZ => summary.relasz = Some(val),
+            DT_RELAENT => summary.relaent = Some(val),
+            DT_PLTRELSZ => summary.pltrelsz = val,
+            DT_JMPREL => summary.jmprel = true,
+            DT_REL => summary.rel = true,
+            DT_RELR | DT_RELRSZ => summary.relr = true,
+            _ =>
+            {}
+        }
+    }
+    summary
+}
+
+/// Validate the gathered dynamic tags and resolve the table's file offset
+/// through the containing `PT_LOAD` segment.
+fn resolve_rela_table(
+    summary: &DynamicSummary,
+    ehdr: &Elf64Ehdr,
+    phdr_data: &[u8],
+    file_size: u64,
+) -> Result<Option<RelaTable>, ElfError>
+{
+    // A table format the loaders cannot apply must reject the image, not be
+    // silently skipped: an unrelocated PIE is corrupt, not degraded.
+    if summary.rel || summary.relr || (summary.jmprel && summary.pltrelsz != 0)
+    {
+        return Err(ElfError::UnsupportedRelocation);
+    }
+    let (vaddr, size) = match (summary.rela, summary.relasz)
+    {
+        (None, None | Some(0)) | (Some(_), Some(0)) => return Ok(None),
+        (Some(vaddr), Some(size)) => (vaddr, size),
+        (None, Some(_)) | (Some(_), None) => return Err(ElfError::MalformedDynamic),
+    };
+    if summary.relaent != Some(RELA_ENTRY_SIZE as u64)
+        || !size.is_multiple_of(RELA_ENTRY_SIZE as u64)
+        || size > MAX_RELA_TABLE_SIZE
+    {
+        return Err(ElfError::MalformedDynamic);
+    }
+    let table_end = vaddr.checked_add(size).ok_or(ElfError::MalformedDynamic)?;
+
+    for i in 0..ehdr.e_phnum as usize
+    {
+        let phdr = read_phdr(phdr_data, ehdr, i);
+        if phdr.p_type != PT_LOAD
+        {
+            continue;
+        }
+        let seg_file_end = phdr
+            .p_vaddr
+            .checked_add(phdr.p_filesz)
+            .ok_or(ElfError::MalformedDynamic)?;
+        if vaddr >= phdr.p_vaddr && table_end <= seg_file_end
+        {
+            let file_offset = phdr.p_offset + (vaddr - phdr.p_vaddr);
+            let file_end = file_offset
+                .checked_add(size)
+                .ok_or(ElfError::MalformedDynamic)?;
+            if file_end > file_size
+            {
+                return Err(ElfError::MalformedDynamic);
+            }
+            return Ok(Some(RelaTable {
+                vaddr,
+                file_offset,
+                size,
+            }));
+        }
+    }
+    Err(ElfError::MalformedDynamic)
+}
+
+/// Locate the `PT_DYNAMIC` program header; returns `(p_offset, p_filesz)`.
+fn find_dynamic_phdr(ehdr: &Elf64Ehdr, phdr_data: &[u8]) -> Option<(u64, u64)>
+{
+    for i in 0..ehdr.e_phnum as usize
+    {
+        let phdr = read_phdr(phdr_data, ehdr, i);
+        if phdr.p_type == PT_DYNAMIC
+        {
+            return Some((phdr.p_offset, phdr.p_filesz));
+        }
+    }
+    None
+}
+
+/// Locate the `.rela.dyn` table of a fully-mapped, validated ELF image.
+///
+/// Walks the `PT_DYNAMIC` segment for `DT_RELA`/`DT_RELASZ`/`DT_RELAENT`
+/// and resolves the table's file offset through the `PT_LOAD` segment
+/// containing it. Returns `Ok(None)` when the image has no `PT_DYNAMIC`
+/// segment or an empty relocation table (an `ET_EXEC` image, or a PIE with
+/// no relocations).
+///
+/// # Errors
+///
+/// - [`ElfError::UnsupportedRelocation`] if the dynamic section describes
+///   `DT_REL`, `DT_RELR`, or active `DT_JMPREL` relocations — formats the
+///   loaders do not apply.
+/// - [`ElfError::MalformedDynamic`] for structural failures: `PT_DYNAMIC`
+///   out of file bounds, a missing counterpart tag, `DT_RELAENT` ≠
+///   [`RELA_ENTRY_SIZE`], `DT_RELASZ` not a multiple of it or above
+///   [`MAX_RELA_TABLE_SIZE`], or a table not fully backed by one `PT_LOAD`
+///   segment's file data.
+pub fn rela_table(ehdr: &Elf64Ehdr, data: &[u8]) -> Result<Option<RelaTable>, ElfError>
+{
+    let Some((offset, filesz)) = find_dynamic_phdr(ehdr, data)
+    else
+    {
+        return Ok(None);
+    };
+    let end = offset
+        .checked_add(filesz)
+        .ok_or(ElfError::MalformedDynamic)?;
+    if end > data.len() as u64
+    {
+        return Err(ElfError::MalformedDynamic);
+    }
+    let summary = parse_dynamic(&data[offset as usize..end as usize]);
+    resolve_rela_table(&summary, ehdr, data, data.len() as u64)
+}
+
+/// Locate the `.rela.dyn` table when only the ELF header page is in memory.
+///
+/// Mirror of [`rela_table`] for the streaming-from-VFS loader path.
+/// `read_at` fetches `dst.len()` bytes from a file offset and returns the
+/// number of bytes copied (or `None` on I/O error). The `PT_DYNAMIC`
+/// content is fetched through `read_at` into a fixed on-stack buffer;
+/// segments larger than [`MAX_STREAMING_DYNAMIC`] are rejected.
+///
+/// # Errors
+///
+/// As [`rela_table`]; a failed or short `read_at`, or an oversized
+/// `PT_DYNAMIC` segment, is [`ElfError::MalformedDynamic`].
+pub fn rela_table_metadata<F>(
+    ehdr: &Elf64Ehdr,
+    header_data: &[u8],
+    file_size: u64,
+    mut read_at: F,
+) -> Result<Option<RelaTable>, ElfError>
+where
+    F: FnMut(u64, &mut [u8]) -> Option<usize>,
+{
+    let Some((offset, filesz)) = find_dynamic_phdr(ehdr, header_data)
+    else
+    {
+        return Ok(None);
+    };
+    if filesz > MAX_STREAMING_DYNAMIC as u64
+        || offset.checked_add(filesz).is_none_or(|end| end > file_size)
+    {
+        return Err(ElfError::MalformedDynamic);
+    }
+    let mut buf = [0u8; MAX_STREAMING_DYNAMIC];
+    let want = filesz as usize;
+    let got = read_at(offset, &mut buf[..want]).ok_or(ElfError::MalformedDynamic)?;
+    if got < want
+    {
+        return Err(ElfError::MalformedDynamic);
+    }
+    let summary = parse_dynamic(&buf[..want]);
+    resolve_rela_table(&summary, ehdr, header_data, file_size)
+}
+
+/// Iterator over the `RELATIVE` relocations of a raw `.rela.dyn` table.
+///
+/// Created by [`relative_relocs`]. Yields one [`Rela`] per record; a record
+/// of any other relocation type (or with a nonzero symbol index) yields
+/// `Err(`[`ElfError::UnsupportedRelocation`]`)`.
+pub struct RelativeRelocIter<'a>
+{
+    table: &'a [u8],
+    expected_rtype: u32,
+    off: usize,
+}
+
+impl Iterator for RelativeRelocIter<'_>
+{
+    type Item = Result<Rela, ElfError>;
+
+    fn next(&mut self) -> Option<Self::Item>
+    {
+        if self.off + RELA_ENTRY_SIZE > self.table.len()
+        {
+            return None;
+        }
+        let bytes: &[u8; RELA_ENTRY_SIZE] = self.table[self.off..self.off + RELA_ENTRY_SIZE]
+            .try_into()
+            .ok()?;
+        self.off += RELA_ENTRY_SIZE;
+        let rela = decode_rela(bytes);
+        // r_info's high half is the symbol index; RELATIVE records must not
+        // reference a symbol.
+        let sym = u32_le(&bytes[12..16]);
+        if rela.rtype != self.expected_rtype || sym != 0
+        {
+            return Some(Err(ElfError::UnsupportedRelocation));
+        }
+        Some(Ok(rela))
+    }
+}
+
+/// Iterate the `RELATIVE` relocations in a raw relocation table.
+///
+/// `table` holds `.rela.dyn` bytes located by [`rela_table`] /
+/// [`rela_table_metadata`] — the whole table, or one chunk at a time as
+/// long as chunk boundaries are multiples of [`RELA_ENTRY_SIZE`].
+///
+/// # Errors
+///
+/// - [`ElfError::UnsupportedRelocation`] if `machine` has no `RELATIVE`
+///   mapping ([`relative_reloc_type`]).
+/// - [`ElfError::MalformedDynamic`] if `table` is not a whole number of
+///   records.
+pub fn relative_relocs(table: &[u8], machine: u16) -> Result<RelativeRelocIter<'_>, ElfError>
+{
+    let expected_rtype = relative_reloc_type(machine).ok_or(ElfError::UnsupportedRelocation)?;
+    if !table.len().is_multiple_of(RELA_ENTRY_SIZE)
+    {
+        return Err(ElfError::MalformedDynamic);
+    }
+    Ok(RelativeRelocIter {
+        table,
+        expected_rtype,
+        off: 0,
+    })
+}
+
+/// Decode program header `idx` from a validated ELF image or header page.
+/// Byte decoding avoids any alignment requirement on `data`; bounds were
+/// established by [`validate`] / [`validate_executable`].
+fn read_phdr(data: &[u8], ehdr: &Elf64Ehdr, idx: usize) -> Elf64Phdr
+{
+    let offset = ehdr.e_phoff as usize + idx * size_of::<Elf64Phdr>();
+    let b = &data[offset..offset + size_of::<Elf64Phdr>()];
+    Elf64Phdr {
+        p_type: u32_le(&b[0..4]),
+        p_flags: u32_le(&b[4..8]),
+        p_offset: u64_le(&b[8..16]),
+        p_vaddr: u64_le(&b[16..24]),
+        p_paddr: u64_le(&b[24..32]),
+        p_filesz: u64_le(&b[32..40]),
+        p_memsz: u64_le(&b[40..48]),
+        p_align: u64_le(&b[48..56]),
+    }
+}
+
+fn i64_le(b: &[u8]) -> i64
+{
+    i64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
+}
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+
+    const MACHINE: u16 = EM_X86_64;
+    /// Segment flag: read permission (tests only; the parser ignores it).
+    const PF_R: u32 = 4;
+
+    // Canonical hand-assembled image (all file offsets equal link VAs):
+    //   0x000  ELF header (phoff = 64, phnum = 3)
+    //   0x040  program headers (3 × 56 bytes)
+    //   0x200  .rela.dyn (2 × 24 bytes)
+    //   0x300  PT_DYNAMIC content
+    //   0x400  end of file
+    // LOAD0 R·X covers [0x000, 0x200); LOAD1 RW covers [0x200, 0x400) in the
+    // file and extends to memsz 0x300 (0x100 of BSS).
+    const RELA_OFF: u64 = 0x200;
+    const DYN_OFF: u64 = 0x300;
+    const FILE_SIZE: usize = 0x400;
+
+    fn put(img: &mut [u8], off: usize, bytes: &[u8])
+    {
+        img[off..off + bytes.len()].copy_from_slice(bytes);
+    }
+
+    fn ehdr_bytes(e_type: u16, phnum: u16) -> [u8; 64]
+    {
+        let mut b = [0u8; 64];
+        b[0] = ELFMAG0;
+        b[1] = ELFMAG1;
+        b[2] = ELFMAG2;
+        b[3] = ELFMAG3;
+        b[EI_CLASS] = ELFCLASS64;
+        b[EI_DATA] = ELFDATA2LSB;
+        b[EI_VERSION] = EV_CURRENT;
+        put(&mut b, 16, &e_type.to_le_bytes());
+        put(&mut b, 18, &MACHINE.to_le_bytes());
+        put(&mut b, 20, &1u32.to_le_bytes()); // e_version
+        put(&mut b, 24, &0x1000u64.to_le_bytes()); // e_entry
+        put(&mut b, 32, &64u64.to_le_bytes()); // e_phoff
+        put(&mut b, 52, &64u16.to_le_bytes()); // e_ehsize
+        put(&mut b, 54, &56u16.to_le_bytes()); // e_phentsize
+        put(&mut b, 56, &phnum.to_le_bytes()); // e_phnum
+        b
+    }
+
+    fn phdr_bytes(
+        p_type: u32,
+        flags: u32,
+        offset: u64,
+        vaddr: u64,
+        filesz: u64,
+        memsz: u64,
+    ) -> [u8; 56]
+    {
+        let mut b = [0u8; 56];
+        put(&mut b, 0, &p_type.to_le_bytes());
+        put(&mut b, 4, &flags.to_le_bytes());
+        put(&mut b, 8, &offset.to_le_bytes());
+        put(&mut b, 16, &vaddr.to_le_bytes());
+        put(&mut b, 24, &vaddr.to_le_bytes()); // p_paddr mirrors p_vaddr
+        put(&mut b, 32, &filesz.to_le_bytes());
+        put(&mut b, 40, &memsz.to_le_bytes());
+        put(&mut b, 48, &0x1000u64.to_le_bytes()); // p_align
+        b
+    }
+
+    fn dyn_entry(tag: i64, val: u64) -> [u8; 16]
+    {
+        let mut b = [0u8; 16];
+        put(&mut b, 0, &tag.to_le_bytes());
+        put(&mut b, 8, &val.to_le_bytes());
+        b
+    }
+
+    fn rela_record(offset: u64, rtype: u32, sym: u32, addend: i64) -> [u8; 24]
+    {
+        let mut b = [0u8; 24];
+        put(&mut b, 0, &offset.to_le_bytes());
+        put(&mut b, 8, &rtype.to_le_bytes());
+        put(&mut b, 12, &sym.to_le_bytes());
+        put(&mut b, 16, &addend.to_le_bytes());
+        b
+    }
+
+    /// Assemble the canonical image with the given type and dynamic entries.
+    fn build_image(e_type: u16, dyn_entries: &[[u8; 16]]) -> Vec<u8>
+    {
+        let mut img = vec![0u8; FILE_SIZE];
+        put(&mut img, 0, &ehdr_bytes(e_type, 3));
+        put(
+            &mut img,
+            64,
+            &phdr_bytes(PT_LOAD, PF_R | PF_X, 0, 0, 0x200, 0x200),
+        );
+        put(
+            &mut img,
+            64 + 56,
+            &phdr_bytes(PT_LOAD, PF_R | PF_W, 0x200, 0x200, 0x200, 0x300),
+        );
+        let dyn_size = (dyn_entries.len() * DYN_ENTRY_SIZE) as u64;
+        put(
+            &mut img,
+            64 + 112,
+            &phdr_bytes(
+                PT_DYNAMIC,
+                PF_R | PF_W,
+                DYN_OFF,
+                DYN_OFF,
+                dyn_size,
+                dyn_size,
+            ),
+        );
+        put(
+            &mut img,
+            RELA_OFF as usize,
+            &rela_record(0x250, R_X86_64_RELATIVE, 0, 0x180),
+        );
+        put(
+            &mut img,
+            RELA_OFF as usize + RELA_ENTRY_SIZE,
+            &rela_record(0x260, R_X86_64_RELATIVE, 0, 0x1000),
+        );
+        for (i, entry) in dyn_entries.iter().enumerate()
+        {
+            put(&mut img, DYN_OFF as usize + i * DYN_ENTRY_SIZE, entry);
+        }
+        img
+    }
+
+    fn std_dynamic() -> Vec<[u8; 16]>
+    {
+        vec![
+            dyn_entry(DT_RELA, RELA_OFF),
+            dyn_entry(DT_RELASZ, 48),
+            dyn_entry(DT_RELAENT, 24),
+            dyn_entry(DT_NULL, 0),
+        ]
+    }
+
+    fn valid_executable(img: &[u8]) -> (&Elf64Ehdr, ElfKind)
+    {
+        match validate_executable(img, MACHINE)
+        {
+            Ok(v) => v,
+            Err(e) => panic!("validate_executable failed: {e:?}"),
+        }
+    }
+
+    fn rela_of(img: &[u8]) -> Result<Option<RelaTable>, ElfError>
+    {
+        let (ehdr, _) = valid_executable(img);
+        rela_table(ehdr, img)
+    }
+
+    #[test]
+    fn detects_exec_kind()
+    {
+        let img = build_image(ET_EXEC, &std_dynamic());
+        let (_, kind) = valid_executable(&img);
+        assert_eq!(kind, ElfKind::Exec);
+        assert!(
+            validate(&img, MACHINE).is_ok(),
+            "ET_EXEC must pass validate"
+        );
+    }
+
+    #[test]
+    fn detects_dyn_kind()
+    {
+        let img = build_image(ET_DYN, &std_dynamic());
+        let (_, kind) = valid_executable(&img);
+        assert_eq!(kind, ElfKind::Dyn);
+        // The kernel-image path stays ET_EXEC-only.
+        assert_eq!(
+            validate(&img, MACHINE).map(|_| ()),
+            Err(ElfError::NotExecutable)
+        );
+    }
+
+    #[test]
+    fn rejects_other_types()
+    {
+        let img = build_image(1, &std_dynamic()); // ET_REL
+        assert_eq!(
+            validate_executable(&img, MACHINE).map(|(_, kind)| kind),
+            Err(ElfError::NotExecutable)
+        );
+    }
+
+    #[test]
+    fn header_checks_apply()
+    {
+        let mut img = build_image(ET_DYN, &std_dynamic());
+        img[1] = b'X';
+        assert_eq!(
+            validate_executable(&img, MACHINE).map(|(_, kind)| kind),
+            Err(ElfError::BadMagic)
+        );
+    }
+
+    #[test]
+    fn finds_rela_table()
+    {
+        let img = build_image(ET_DYN, &std_dynamic());
+        assert_eq!(
+            rela_of(&img),
+            Ok(Some(RelaTable {
+                vaddr: RELA_OFF,
+                file_offset: RELA_OFF,
+                size: 48,
+            }))
+        );
+    }
+
+    #[test]
+    fn no_dynamic_is_none()
+    {
+        let mut img = build_image(ET_DYN, &std_dynamic());
+        // Truncate the phdr table to the two PT_LOADs.
+        put(&mut img, 0, &ehdr_bytes(ET_DYN, 2));
+        assert_eq!(rela_of(&img), Ok(None));
+    }
+
+    #[test]
+    fn dynamic_without_rela_is_none()
+    {
+        let img = build_image(ET_DYN, &[dyn_entry(DT_NULL, 0)]);
+        assert_eq!(rela_of(&img), Ok(None));
+    }
+
+    #[test]
+    fn zero_relasz_is_none()
+    {
+        let img = build_image(
+            ET_DYN,
+            &[
+                dyn_entry(DT_RELA, RELA_OFF),
+                dyn_entry(DT_RELASZ, 0),
+                dyn_entry(DT_NULL, 0),
+            ],
+        );
+        assert_eq!(rela_of(&img), Ok(None));
+    }
+
+    #[test]
+    fn rejects_bad_relaent()
+    {
+        let img = build_image(
+            ET_DYN,
+            &[
+                dyn_entry(DT_RELA, RELA_OFF),
+                dyn_entry(DT_RELASZ, 48),
+                dyn_entry(DT_RELAENT, 16),
+                dyn_entry(DT_NULL, 0),
+            ],
+        );
+        assert_eq!(rela_of(&img), Err(ElfError::MalformedDynamic));
+    }
+
+    #[test]
+    fn rejects_ragged_relasz()
+    {
+        let img = build_image(
+            ET_DYN,
+            &[
+                dyn_entry(DT_RELA, RELA_OFF),
+                dyn_entry(DT_RELASZ, 47),
+                dyn_entry(DT_RELAENT, 24),
+                dyn_entry(DT_NULL, 0),
+            ],
+        );
+        assert_eq!(rela_of(&img), Err(ElfError::MalformedDynamic));
+    }
+
+    #[test]
+    fn rejects_oversized_table()
+    {
+        // A multiple of 24 above the cap, so only the cap check can fire.
+        let img = build_image(
+            ET_DYN,
+            &[
+                dyn_entry(DT_RELA, RELA_OFF),
+                dyn_entry(DT_RELASZ, 24 * 200_000),
+                dyn_entry(DT_RELAENT, 24),
+                dyn_entry(DT_NULL, 0),
+            ],
+        );
+        assert_eq!(rela_of(&img), Err(ElfError::MalformedDynamic));
+    }
+
+    #[test]
+    fn rejects_rela_missing_relasz()
+    {
+        let img = build_image(
+            ET_DYN,
+            &[dyn_entry(DT_RELA, RELA_OFF), dyn_entry(DT_NULL, 0)],
+        );
+        assert_eq!(rela_of(&img), Err(ElfError::MalformedDynamic));
+    }
+
+    #[test]
+    fn rejects_table_outside_load_file_data()
+    {
+        // 0x480 lies within LOAD1's memsz (BSS) but beyond its filesz.
+        let img = build_image(
+            ET_DYN,
+            &[
+                dyn_entry(DT_RELA, 0x480),
+                dyn_entry(DT_RELASZ, 48),
+                dyn_entry(DT_RELAENT, 24),
+                dyn_entry(DT_NULL, 0),
+            ],
+        );
+        assert_eq!(rela_of(&img), Err(ElfError::MalformedDynamic));
+    }
+
+    #[test]
+    fn rejects_rel_table()
+    {
+        let mut entries = std_dynamic();
+        entries.insert(0, dyn_entry(DT_REL, RELA_OFF));
+        let img = build_image(ET_DYN, &entries);
+        assert_eq!(rela_of(&img), Err(ElfError::UnsupportedRelocation));
+    }
+
+    #[test]
+    fn rejects_relr_table()
+    {
+        let mut entries = std_dynamic();
+        entries.insert(0, dyn_entry(DT_RELR, RELA_OFF));
+        let img = build_image(ET_DYN, &entries);
+        assert_eq!(rela_of(&img), Err(ElfError::UnsupportedRelocation));
+    }
+
+    #[test]
+    fn rejects_active_jmprel()
+    {
+        let mut entries = std_dynamic();
+        entries.insert(0, dyn_entry(DT_JMPREL, RELA_OFF));
+        entries.insert(1, dyn_entry(DT_PLTRELSZ, 24));
+        let img = build_image(ET_DYN, &entries);
+        assert_eq!(rela_of(&img), Err(ElfError::UnsupportedRelocation));
+    }
+
+    #[test]
+    fn accepts_inactive_jmprel()
+    {
+        let mut entries = std_dynamic();
+        entries.insert(0, dyn_entry(DT_JMPREL, RELA_OFF));
+        let img = build_image(ET_DYN, &entries);
+        assert!(matches!(rela_of(&img), Ok(Some(_))));
+    }
+
+    #[test]
+    fn decodes_relative_relocs()
+    {
+        let img = build_image(ET_DYN, &std_dynamic());
+        let table = &img[RELA_OFF as usize..RELA_OFF as usize + 48];
+        let relocs: Vec<Rela> = match relative_relocs(table, MACHINE)
+        {
+            Ok(iter) => match iter.collect()
+            {
+                Ok(v) => v,
+                Err(e) => panic!("record decode failed: {e:?}"),
+            },
+            Err(e) => panic!("relative_relocs failed: {e:?}"),
+        };
+        assert_eq!(
+            relocs,
+            vec![
+                Rela {
+                    offset: 0x250,
+                    rtype: R_X86_64_RELATIVE,
+                    addend: 0x180,
+                },
+                Rela {
+                    offset: 0x260,
+                    rtype: R_X86_64_RELATIVE,
+                    addend: 0x1000,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_foreign_reloc_type()
+    {
+        // R_X86_64_64 (type 1) is not RELATIVE.
+        let record = rela_record(0x250, 1, 0, 0);
+        let items: Vec<Result<Rela, ElfError>> = match relative_relocs(&record, MACHINE)
+        {
+            Ok(iter) => iter.collect(),
+            Err(e) => panic!("relative_relocs failed: {e:?}"),
+        };
+        assert_eq!(items, vec![Err(ElfError::UnsupportedRelocation)]);
+
+        // An x86-64 RELATIVE record read with RISC-V expectations must also
+        // reject (the numeric types differ: 8 vs 3).
+        let record = rela_record(0x250, R_X86_64_RELATIVE, 0, 0);
+        let items: Vec<Result<Rela, ElfError>> = match relative_relocs(&record, EM_RISCV)
+        {
+            Ok(iter) => iter.collect(),
+            Err(e) => panic!("relative_relocs failed: {e:?}"),
+        };
+        assert_eq!(items, vec![Err(ElfError::UnsupportedRelocation)]);
+    }
+
+    #[test]
+    fn rejects_nonzero_symbol()
+    {
+        let record = rela_record(0x250, R_X86_64_RELATIVE, 5, 0);
+        let items: Vec<Result<Rela, ElfError>> = match relative_relocs(&record, MACHINE)
+        {
+            Ok(iter) => iter.collect(),
+            Err(e) => panic!("relative_relocs failed: {e:?}"),
+        };
+        assert_eq!(items, vec![Err(ElfError::UnsupportedRelocation)]);
+    }
+
+    #[test]
+    fn rejects_ragged_table_slice()
+    {
+        let record = rela_record(0x250, R_X86_64_RELATIVE, 0, 0);
+        assert!(matches!(
+            relative_relocs(&record[..20], MACHINE),
+            Err(ElfError::MalformedDynamic)
+        ));
+    }
+
+    #[test]
+    fn rejects_unknown_machine()
+    {
+        let record = rela_record(0x250, R_X86_64_RELATIVE, 0, 0);
+        assert!(matches!(
+            relative_relocs(&record, 0x1234),
+            Err(ElfError::UnsupportedRelocation)
+        ));
+        assert_eq!(relative_reloc_type(EM_RISCV), Some(R_RISCV_RELATIVE));
+        assert_eq!(relative_reloc_type(EM_X86_64), Some(R_X86_64_RELATIVE));
+    }
+
+    #[test]
+    fn computes_load_span()
+    {
+        let img = build_image(ET_DYN, &std_dynamic());
+        let (ehdr, _) = valid_executable(&img);
+        assert_eq!(load_span(ehdr, &img), Ok((0, 0x500)));
+    }
+
+    #[test]
+    fn load_span_requires_load_segment()
+    {
+        let mut img = build_image(ET_DYN, &std_dynamic());
+        // Rewrite both PT_LOADs as PT_NULL, keeping PT_DYNAMIC.
+        put(&mut img, 64, &phdr_bytes(0, 0, 0, 0, 0, 0));
+        put(&mut img, 64 + 56, &phdr_bytes(0, 0, 0, 0, 0, 0));
+        let (ehdr, _) = valid_executable(&img);
+        assert_eq!(load_span(ehdr, &img), Err(ElfError::NoSegments));
+    }
+
+    #[test]
+    fn streaming_matches_in_memory()
+    {
+        let img = build_image(ET_DYN, &std_dynamic());
+        let (ehdr, _) = valid_executable(&img);
+        let header_page = &img[..0x100];
+        let streamed = rela_table_metadata(ehdr, header_page, img.len() as u64, |off, dst| {
+            let off = off as usize;
+            img.get(off..off + dst.len()).map(|src| {
+                dst.copy_from_slice(src);
+                dst.len()
+            })
+        });
+        assert_eq!(streamed, rela_table(ehdr, &img));
+    }
+
+    #[test]
+    fn streaming_rejects_failed_read()
+    {
+        let img = build_image(ET_DYN, &std_dynamic());
+        let (ehdr, _) = valid_executable(&img);
+        let failed = rela_table_metadata(ehdr, &img[..0x100], img.len() as u64, |_, _| None);
+        assert_eq!(failed, Err(ElfError::MalformedDynamic));
+    }
+
+    #[test]
+    fn streaming_rejects_oversized_dynamic()
+    {
+        let mut img = build_image(ET_DYN, &std_dynamic());
+        let oversized = (MAX_STREAMING_DYNAMIC + DYN_ENTRY_SIZE) as u64;
+        put(
+            &mut img,
+            64 + 112,
+            &phdr_bytes(
+                PT_DYNAMIC,
+                PF_R | PF_W,
+                DYN_OFF,
+                DYN_OFF,
+                oversized,
+                oversized,
+            ),
+        );
+        let (ehdr, _) = valid_executable(&img);
+        let streamed = rela_table_metadata(ehdr, &img[..0x100], 1 << 20, |off, dst| {
+            let off = off as usize;
+            img.get(off..off + dst.len()).map(|src| {
+                dst.copy_from_slice(src);
+                dst.len()
+            })
+        });
+        assert_eq!(streamed, Err(ElfError::MalformedDynamic));
+    }
 }

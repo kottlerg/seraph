@@ -1345,6 +1345,99 @@ pub fn relative_relocs(table: &[u8], machine: u16) -> Result<RelativeRelocIter<'
     })
 }
 
+/// Whether a relocation's whole 8-byte target lies inside the link-VA span
+/// `[span_min, span_end)`.
+#[must_use]
+pub fn reloc_target_in_span(rela: &Rela, span_min: u64, span_end: u64) -> bool
+{
+    rela.offset >= span_min
+        && rela
+            .offset
+            .checked_add(8)
+            .is_some_and(|end| end <= span_end)
+}
+
+/// Validate a whole in-memory `.rela.dyn` table: every record must decode as
+/// the machine's `RELATIVE` type and target 8 bytes inside the image's
+/// link-VA load span. Returns the record count for the caller's
+/// applied-count invariant.
+///
+/// # Errors
+///
+/// - [`ElfError::UnsupportedRelocation`] / [`ElfError::MalformedDynamic`]
+///   as [`relative_relocs`].
+/// - [`ElfError::RelocOutOfBounds`] if a target lies outside
+///   `[span_min, span_end)`.
+pub fn validate_relative_relocs(
+    table: &[u8],
+    machine: u16,
+    span_min: u64,
+    span_end: u64,
+) -> Result<u64, ElfError>
+{
+    let mut count = 0u64;
+    for record in relative_relocs(table, machine)?
+    {
+        let rela = record?;
+        if !reloc_target_in_span(&rela, span_min, span_end)
+        {
+            return Err(ElfError::RelocOutOfBounds);
+        }
+        count += 1;
+    }
+    Ok(count)
+}
+
+/// Apply one `RELATIVE` relocation to a copied span starting at link VA
+/// `span_vaddr`: writes `bias + addend` little-endian at the target if the
+/// whole 8-byte target lies inside the span. Returns the number applied
+/// (0 or 1) for the caller's applied-count invariant.
+pub fn apply_reloc_in_span(rela: &Rela, bias: u64, span_vaddr: u64, span: &mut [u8]) -> u64
+{
+    let span_end = span_vaddr + span.len() as u64;
+    let Some(target_end) = rela.offset.checked_add(8)
+    else
+    {
+        return 0;
+    };
+    if rela.offset < span_vaddr || target_end > span_end
+    {
+        return 0;
+    }
+    let pos = (rela.offset - span_vaddr) as usize;
+    let value = bias.wrapping_add(rela.addend.cast_unsigned());
+    span[pos..pos + 8].copy_from_slice(&value.to_le_bytes());
+    1
+}
+
+/// Apply every `RELATIVE` relocation in an in-memory table whose 8-byte
+/// target lies within `[span_vaddr, span_vaddr + span.len())`; records
+/// outside the span are skipped. Returns the number applied.
+///
+/// Records should have been pre-validated by [`validate_relative_relocs`];
+/// a decode error stops the walk early, and the caller's applied-count
+/// check (sum over all spans == validated count) then rejects the image.
+pub fn apply_relative_relocs(
+    table: &[u8],
+    machine: u16,
+    bias: u64,
+    span_vaddr: u64,
+    span: &mut [u8],
+) -> u64
+{
+    let Ok(iter) = relative_relocs(table, machine)
+    else
+    {
+        return 0;
+    };
+    let mut applied = 0u64;
+    for rela in iter.flatten()
+    {
+        applied += apply_reloc_in_span(&rela, bias, span_vaddr, span);
+    }
+    applied
+}
+
 /// Decode program header `idx` from a validated ELF image or header page.
 /// Byte decoding avoids any alignment requirement on `data`; bounds were
 /// established by [`validate`] / [`validate_executable`].
@@ -1854,6 +1947,37 @@ mod tests
         let (ehdr, _) = valid_executable(&img);
         let failed = rela_table_metadata(ehdr, &img[..0x100], img.len() as u64, |_, _| None);
         assert_eq!(failed, Err(ElfError::MalformedDynamic));
+    }
+
+    #[test]
+    fn validates_and_applies_relocs()
+    {
+        let img = build_image(ET_DYN, &std_dynamic());
+        let table = &img[RELA_OFF as usize..RELA_OFF as usize + 48];
+
+        // Both records (targets 0x250, 0x260) lie inside the load span.
+        assert_eq!(validate_relative_relocs(table, MACHINE, 0, 0x500), Ok(2));
+        // A span that excludes the second target rejects the table.
+        assert_eq!(
+            validate_relative_relocs(table, MACHINE, 0, 0x260),
+            Err(ElfError::RelocOutOfBounds)
+        );
+
+        // Apply to a span covering [0x200, 0x500) at bias 0x1000_0000.
+        let mut span = vec![0u8; 0x300];
+        let applied = apply_relative_relocs(table, MACHINE, 0x1000_0000, 0x200, &mut span);
+        assert_eq!(applied, 2);
+        let word = |off: usize| u64_le(&span[off..off + 8]);
+        assert_eq!(word(0x50), 0x1000_0000 + 0x180); // target 0x250, addend 0x180
+        assert_eq!(word(0x60), 0x1000_0000 + 0x1000); // target 0x260, addend 0x1000
+
+        // A span not covering the targets applies nothing and stays zero.
+        let mut other = vec![0u8; 0x40];
+        assert_eq!(
+            apply_relative_relocs(table, MACHINE, 0x1000_0000, 0x600, &mut other),
+            0
+        );
+        assert!(other.iter().all(|&b| b == 0));
     }
 
     #[test]

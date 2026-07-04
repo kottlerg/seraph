@@ -1059,86 +1059,14 @@ fn segment_prot(seg: &elf::LoadSegment) -> u64
 }
 
 // ── RELATIVE relocation application (ET_DYN, #39) ────────────────────────────
+//
+// Span validation and application live in `shared/elf`
+// (`validate_relative_relocs` / `apply_relative_relocs` /
+// `apply_reloc_in_span`); this section adds only the VFS-streaming walk the
+// create-from-file path needs.
 
 /// Number of `Elf64_Rela` records fetched per streaming chunk.
 const RELA_CHUNK_RECORDS: usize = 128;
-
-/// Whether a relocation's whole 8-byte target lies inside the image's
-/// link-VA load span.
-fn reloc_target_in_span(rela: &elf::Rela, span_min: u64, span_end: u64) -> bool
-{
-    rela.offset >= span_min
-        && rela
-            .offset
-            .checked_add(8)
-            .is_some_and(|end| end <= span_end)
-}
-
-/// Apply one `RELATIVE` relocation to a copied span starting at link VA
-/// `span_vaddr`: writes `bias + addend` at the target if the whole 8-byte
-/// target lies inside the span. Returns the number applied (0 or 1).
-fn apply_reloc_in_span(rela: &elf::Rela, bias: u64, span_vaddr: u64, span: &mut [u8]) -> u64
-{
-    let span_end = span_vaddr + span.len() as u64;
-    let Some(target_end) = rela.offset.checked_add(8)
-    else
-    {
-        return 0;
-    };
-    if rela.offset < span_vaddr || target_end > span_end
-    {
-        return 0;
-    }
-    let pos = (rela.offset - span_vaddr) as usize;
-    let value = bias.wrapping_add(rela.addend.cast_unsigned());
-    span[pos..pos + 8].copy_from_slice(&value.to_le_bytes());
-    1
-}
-
-/// Pre-validate an in-memory rela table: every record must decode as a
-/// `RELATIVE` relocation whose 8-byte target lies inside the image span.
-/// Returns the record count.
-fn validate_relocs_slice(table: &[u8], machine: u16, span_min: u64, span_end: u64) -> Option<u64>
-{
-    let iter = elf::relative_relocs(table, machine).ok()?;
-    let mut count = 0u64;
-    for record in iter
-    {
-        let rela = record.ok()?;
-        if !reloc_target_in_span(&rela, span_min, span_end)
-        {
-            return None;
-        }
-        count += 1;
-    }
-    Some(count)
-}
-
-/// Apply every `RELATIVE` relocation in an in-memory table whose target lies
-/// in `[span_vaddr, span_vaddr + span.len())`; returns the number applied.
-/// Records were pre-validated by [`validate_relocs_slice`]; a decode error
-/// stops the walk, and the caller's applied-count check then rejects the
-/// image.
-fn apply_relocs_in_slice_table(
-    table: &[u8],
-    machine: u16,
-    bias: u64,
-    span_vaddr: u64,
-    span: &mut [u8],
-) -> u64
-{
-    let Ok(iter) = elf::relative_relocs(table, machine)
-    else
-    {
-        return 0;
-    };
-    let mut applied = 0u64;
-    for rela in iter.flatten()
-    {
-        applied += apply_reloc_in_span(&rela, bias, span_vaddr, span);
-    }
-    applied
-}
 
 /// Stream a rela table in bounded chunks, invoking `f` on every decoded
 /// record. Returns the record count; `None` on a failed/short read or a
@@ -1420,7 +1348,7 @@ fn create_process_from_bytes(
         {
             let table =
                 module_bytes.get(t.file_offset as usize..(t.file_offset + t.size) as usize)?;
-            validate_relocs_slice(table, machine, span_min, span_end)?
+            elf::validate_relative_relocs(table, machine, span_min, span_end).ok()?
         }
         None => 0,
     };
@@ -1490,7 +1418,7 @@ fn create_process_from_bytes(
                         &module_bytes[t.file_offset as usize..(t.file_offset + t.size) as usize];
                     let span = &mut buf[dest_offset..dest_offset + seg.memsz as usize];
                     applied_relocs +=
-                        apply_relocs_in_slice_table(table, machine, bias, seg.vaddr, span);
+                        elf::apply_relative_relocs(table, machine, bias, seg.vaddr, span);
                 }
             },
         )
@@ -1541,7 +1469,7 @@ fn create_process_from_bytes(
                 {
                     let table =
                         &module_bytes[t.file_offset as usize..(t.file_offset + t.size) as usize];
-                    let _ = apply_relocs_in_slice_table(table, machine, bias, seg.vaddr, template);
+                    let _ = elf::apply_relative_relocs(table, machine, bias, seg.vaddr, template);
                 }
             },
         )?
@@ -2178,7 +2106,7 @@ pub fn create_process_from_file(
                 t,
                 machine,
                 |off, dst| vfs_read_exact(file_cap.cap(), ipc_buf, off, dst),
-                |r| in_span &= reloc_target_in_span(r, span_min, span_end),
+                |r| in_span &= elf::reloc_target_in_span(r, span_min, span_end),
             )
             .ok_or(procmgr_errors::INVALID_ELF)?;
             if !in_span
@@ -2289,7 +2217,7 @@ pub fn create_process_from_file(
                         t,
                         machine,
                         |off, dst| vfs_read_exact(load_ctx.file_cap, load_ctx.ipc_buf, off, dst),
-                        |r| applied_relocs += apply_reloc_in_span(r, bias, seg.vaddr, span),
+                        |r| applied_relocs += elf::apply_reloc_in_span(r, bias, seg.vaddr, span),
                     );
                 }
             },
@@ -2345,7 +2273,7 @@ pub fn create_process_from_file(
                         machine,
                         |off, dst| vfs_read_exact(file_cap.cap(), ipc_buf, off, dst),
                         |r| {
-                            let _ = apply_reloc_in_span(r, bias, seg.vaddr, template);
+                            let _ = elf::apply_reloc_in_span(r, bias, seg.vaddr, template);
                         },
                     );
                 }

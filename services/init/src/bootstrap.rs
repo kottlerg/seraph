@@ -53,6 +53,53 @@ fn choose_child_layout() -> ProcessLayout
     choose_process_layout(entropy.as_ref())
 }
 
+/// Draw an `ET_DYN` image load bias (ASLR, #39), degrading to the window
+/// base (never bias 0 — the image still relocates through the single PIE
+/// path) with a log line if the entropy draw fails.
+fn choose_image_bias_or_default() -> u64
+{
+    if let Ok(r) = syscall::random_u64()
+    {
+        return process_layout::choose_image_bias(r);
+    }
+    log("init: image-bias entropy draw failed; using window base");
+    process_layout::IMAGE_WINDOW.base
+}
+
+/// Log `prefix` followed by a lowercase hex value (init's `log` takes only
+/// plain `&str`; no `core::fmt` in the `no_std` bootstrap path).
+fn log_hex(prefix: &str, value: u64)
+{
+    let mut buf = [0u8; 96];
+    let prefix_len = prefix.len().min(buf.len() - 18);
+    buf[..prefix_len].copy_from_slice(&prefix.as_bytes()[..prefix_len]);
+    buf[prefix_len] = b'0';
+    buf[prefix_len + 1] = b'x';
+    let mut pos = prefix_len + 2;
+    let mut started = false;
+    for shift in (0..16).rev()
+    {
+        let digit = ((value >> (shift * 4)) & 0xF) as u8;
+        if digit != 0 || started || shift == 0
+        {
+            buf[pos] = if digit < 10
+            {
+                b'0' + digit
+            }
+            else
+            {
+                b'a' + digit - 10
+            };
+            pos += 1;
+            started = true;
+        }
+    }
+    if let Ok(s) = core::str::from_utf8(&buf[..pos])
+    {
+        log(s);
+    }
+}
+
 // ── Bootstrap arena ────────────────────────────────────────────────────────────
 //
 // Each tier-1 service (memmgr, procmgr) is backed by one contiguous arena
@@ -172,6 +219,52 @@ impl BootArena
         self.cursor += 1;
         Some(())
     }
+
+    /// Map the arena's next `num_pages` backing pages writable into init at
+    /// [`ELF_PAGE_TEMP_VA`], zero the span, run `populate` over the whole
+    /// span, unmap it from init, then map the same offset run into
+    /// `target_aspace` at `target_va` with `prot`. Advances the cursor by
+    /// `num_pages`.
+    ///
+    /// Segment granularity (rather than [`Self::place_page`]) lets
+    /// `populate` write values that straddle a page boundary — an 8-byte
+    /// `RELATIVE` relocation target may span two pages. The arena is one
+    /// contiguous Memory cap, so the segment's backing pages form one
+    /// contiguous offset run.
+    pub(crate) fn place_segment(
+        &mut self,
+        target_aspace: u32,
+        target_va: u64,
+        num_pages: u64,
+        prot: u64,
+        populate: impl FnOnce(&mut [u8]),
+    ) -> Option<()>
+    {
+        if num_pages == 0
+        {
+            return Some(());
+        }
+        let offset = self.cursor;
+        syscall::mem_map(
+            self.cap,
+            self.init_aspace,
+            ELF_PAGE_TEMP_VA,
+            offset,
+            num_pages,
+            syscall::MAP_WRITABLE,
+        )
+        .ok()?;
+        let len = (num_pages * PAGE_SIZE) as usize;
+        // SAFETY: the span at ELF_PAGE_TEMP_VA was just mapped writable for
+        // `num_pages` pages.
+        let span = unsafe { core::slice::from_raw_parts_mut(ELF_PAGE_TEMP_VA as *mut u8, len) };
+        span.fill(0);
+        populate(span);
+        let _ = syscall::mem_unmap(self.init_aspace, ELF_PAGE_TEMP_VA, num_pages);
+        syscall::mem_map(self.cap, target_aspace, target_va, offset, num_pages, prot).ok()?;
+        self.cursor += num_pages;
+        Some(())
+    }
 }
 
 /// Sum of `PT_LOAD` page spans for `ehdr` — the backing pages an arena must
@@ -205,37 +298,6 @@ fn tls_backing_pages(ehdr: &elf::Elf64Ehdr, module_bytes: &[u8]) -> u64
     }
 }
 
-/// Copy one ELF segment page's file data into the page mapped at
-/// `scratch_va` (already zeroed). Handles the partial first/last page via
-/// `seg_vaddr` alignment so the loaded image matches the segment's byte
-/// layout; the bytes beyond `filesz` stay zero (BSS).
-fn copy_segment_into(scratch_va: u64, page_vaddr: u64, seg_vaddr: u64, file_data: &[u8])
-{
-    let dest_offset = if page_vaddr < seg_vaddr
-    {
-        (seg_vaddr - page_vaddr) as usize
-    }
-    else
-    {
-        0
-    };
-    let seg_offset = page_vaddr.saturating_sub(seg_vaddr) as usize;
-    let avail_in_page = PAGE_SIZE as usize - dest_offset;
-    let copy_len = avail_in_page.min(file_data.len().saturating_sub(seg_offset));
-    if copy_len > 0
-    {
-        let src = &file_data[seg_offset..seg_offset + copy_len];
-        // SAFETY: scratch_va is mapped writable; the copy stays within one page.
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                src.as_ptr(),
-                (scratch_va as *mut u8).add(dest_offset),
-                src.len(),
-            );
-        }
-    }
-}
-
 /// `PT_TLS` template metadata, written into the child's
 /// `ProcessInfo.tls_template_*` fields. When the binary has no `PT_TLS`
 /// segment, [`place_main_tls`] returns `(0, ChildTlsMeta::default())` and
@@ -250,12 +312,16 @@ pub struct ChildTlsMeta
 }
 
 /// Place the main thread's TLS block in `arena`: populate it from the
-/// in-memory `.tdata` template, install the TCB self-pointer, and map it
-/// read-write into `target_aspace` at the chosen `tls_base`.
+/// in-memory `.tdata` template, re-apply the template's `RELATIVE`
+/// relocations to this independent copy (the image copy is relocated —
+/// and counted — during segment loading), install the TCB self-pointer,
+/// and map it read-write into `target_aspace` at the chosen `tls_base`.
 ///
-/// Returns `(tls_base_va, metadata)`. When the binary has no `PT_TLS`
-/// segment (or it is empty), returns `(0, ChildTlsMeta::default())` without
-/// consuming a backing page — matching [`tls_backing_pages`].
+/// Returns `(tls_base_va, metadata)` with the template `vaddr` biased —
+/// `ProcessInfo.tls_template_vaddr` must point at the loaded (runtime)
+/// template. When the binary has no `PT_TLS` segment (or it is empty),
+/// returns `(0, ChildTlsMeta::default())` without consuming a backing
+/// page — matching [`tls_backing_pages`].
 #[allow(clippy::similar_names)]
 fn place_main_tls(
     arena: &mut BootArena,
@@ -263,6 +329,8 @@ fn place_main_tls(
     module_bytes: &[u8],
     target_aspace: u32,
     tls_base: u64,
+    bias: u64,
+    rela: Option<elf::RelaTable>,
 ) -> Option<(u64, ChildTlsMeta)>
 {
     let Some(seg) = elf::tls_segment(ehdr, module_bytes).ok()?
@@ -275,7 +343,7 @@ fn place_main_tls(
         return Some((0, ChildTlsMeta::default()));
     }
     let meta = ChildTlsMeta {
-        vaddr: seg.vaddr,
+        vaddr: seg.vaddr + bias,
         filesz: seg.filesz,
         memsz: seg.memsz,
         align: seg.align,
@@ -313,6 +381,23 @@ fn place_main_tls(
                     seg.filesz as usize,
                 );
             }
+            if let Some(t) = rela
+            {
+                let table =
+                    &module_bytes[t.file_offset as usize..(t.file_offset + t.size) as usize];
+                // SAFETY: the template region [0, filesz) was just populated
+                // and stays mapped writable for the rest of this closure.
+                let template = unsafe {
+                    core::slice::from_raw_parts_mut(scratch_va as *mut u8, seg.filesz as usize)
+                };
+                let _ = elf::apply_relative_relocs(
+                    table,
+                    arch::current::EXPECTED_ELF_MACHINE,
+                    bias,
+                    seg.vaddr,
+                    template,
+                );
+            }
             // SAFETY: scratch_va is mapped writable; the block fits one page.
             unsafe {
                 process_abi::tls_install_tcb(scratch_va as *mut u8, tls_base_offset, tls_base_va);
@@ -323,17 +408,27 @@ fn place_main_tls(
     Some((tls_base_va, meta))
 }
 
-/// Load an ELF image's `PT_LOAD` segments into `arena`, offset-mapped into
-/// `target_aspace` at each segment's virtual address with explicit W^X
-/// protection (executable → RX, writable → RW, else RO). Consumes exactly
-/// [`elf_backing_pages`] backing pages.
+/// Load an ELF image's `PT_LOAD` segments into `arena` at `bias`-shifted
+/// VAs, offset-mapped into `target_aspace` with explicit W^X protection
+/// (executable → RX, writable → RW, else RO). `rela` is the image's
+/// `RELATIVE` relocation table (`ET_DYN`; `None` for `ET_EXEC`): each segment's
+/// in-span records are applied after the file bytes are copied in.
+///
+/// Consumes exactly [`elf_backing_pages`] backing pages (the bias is
+/// page-aligned, so the page counts are bias-invariant). Returns the number
+/// of relocations applied; the caller checks it equals the validated table
+/// count.
 fn load_elf_into_arena(
     arena: &mut BootArena,
     ehdr: &elf::Elf64Ehdr,
     module_bytes: &[u8],
     target_aspace: u32,
-) -> Option<()>
+    bias: u64,
+    rela: Option<elf::RelaTable>,
+) -> Option<u64>
 {
+    let machine = arch::current::EXPECTED_ELF_MACHINE;
+    let mut applied = 0u64;
     for seg_result in elf::load_segments(ehdr, module_bytes)
     {
         let seg = seg_result.ok()?;
@@ -355,22 +450,27 @@ fn load_elf_into_arena(
             syscall::MAP_READ
         };
 
-        let first_page = seg.vaddr & !0xFFF;
-        let last_page_end = (seg.vaddr + seg.memsz + 0xFFF) & !0xFFF;
+        let seg_vaddr = seg.vaddr + bias;
+        let first_page = seg_vaddr & !0xFFF;
+        let last_page_end = (seg_vaddr + seg.memsz + 0xFFF) & !0xFFF;
         let num_pages = (last_page_end - first_page) / PAGE_SIZE;
-
         let file_data = &module_bytes[seg.offset as usize..(seg.offset + seg.filesz) as usize];
+        let dest_offset = (seg_vaddr - first_page) as usize;
 
-        for page_idx in 0..num_pages
-        {
-            let page_vaddr = first_page + page_idx * PAGE_SIZE;
-            arena.place_page(target_aspace, page_vaddr, prot, |scratch_va| {
-                copy_segment_into(scratch_va, page_vaddr, seg.vaddr, file_data);
-            })?;
-        }
+        arena.place_segment(target_aspace, first_page, num_pages, prot, |span| {
+            let copy_len = file_data.len().min(seg.memsz as usize);
+            span[dest_offset..dest_offset + copy_len].copy_from_slice(&file_data[..copy_len]);
+            if let Some(t) = rela
+            {
+                let table =
+                    &module_bytes[t.file_offset as usize..(t.file_offset + t.size) as usize];
+                let seg_span = &mut span[dest_offset..dest_offset + seg.memsz as usize];
+                applied += elf::apply_relative_relocs(table, machine, bias, seg.vaddr, seg_span);
+            }
+        })?;
     }
 
-    Some(())
+    Some(applied)
 }
 
 // ── Memmgr bootstrap ────────────────────────────────────────────────────────
@@ -588,8 +688,42 @@ pub fn bootstrap_memmgr(
     let module_bytes =
         unsafe { core::slice::from_raw_parts(TEMP_MAP_BASE as *const u8, module_size as usize) };
 
-    let ehdr = elf::validate(module_bytes, arch::current::EXPECTED_ELF_MACHINE).ok()?;
-    let entry = elf::entry_point(ehdr);
+    let machine = arch::current::EXPECTED_ELF_MACHINE;
+    let (ehdr, kind) = elf::validate_executable(module_bytes, machine).ok()?;
+    let bias = match kind
+    {
+        elf::ElfKind::Exec => 0,
+        elf::ElfKind::Dyn => choose_image_bias_or_default(),
+    };
+    let (span_min, span_end) = elf::load_span(ehdr, module_bytes).ok()?;
+    if kind == elf::ElfKind::Dyn
+    {
+        if !process_layout::validate_image_placement(bias, span_min, span_end)
+        {
+            return None;
+        }
+        // Load-bias observability: debugging correlates through this line.
+        log_hex("init: memmgr image bias=", bias);
+    }
+    let entry = elf::entry_point(ehdr).checked_add(bias)?;
+    let rela = if kind == elf::ElfKind::Dyn
+    {
+        elf::rela_table(ehdr, module_bytes).ok()?
+    }
+    else
+    {
+        None
+    };
+    let total_relocs = match rela
+    {
+        Some(t) =>
+        {
+            let table =
+                module_bytes.get(t.file_offset as usize..(t.file_offset + t.size) as usize)?;
+            elf::validate_relative_relocs(table, machine, span_min, span_end).ok()?
+        }
+        None => 0,
+    };
     let stack_pages = elf::parse_stack_note(ehdr, module_bytes)
         .unwrap_or(DEFAULT_PROCESS_STACK_PAGES)
         .clamp(1, MAX_PROCESS_STACK_PAGES);
@@ -609,7 +743,13 @@ pub fn bootstrap_memmgr(
     log("created memmgr kernel objects");
     log("loading memmgr ELF segments");
 
-    load_elf_into_arena(&mut arena, ehdr, module_bytes, mm_aspace)?;
+    let applied_relocs =
+        load_elf_into_arena(&mut arena, ehdr, module_bytes, mm_aspace, bias, rela)?;
+    if applied_relocs != total_relocs
+    {
+        log("init: memmgr reloc application mismatch");
+        return None;
+    }
     let _ = syscall::mem_unmap(init_aspace, TEMP_MAP_BASE, module_pages);
     let _ = syscall::cap_delete(module_ro);
     log("loaded memmgr ELF");
@@ -1242,8 +1382,42 @@ pub fn bootstrap_procmgr(
     let module_bytes =
         unsafe { core::slice::from_raw_parts(TEMP_MAP_BASE as *const u8, module_size as usize) };
 
-    let ehdr = elf::validate(module_bytes, arch::current::EXPECTED_ELF_MACHINE).ok()?;
-    let entry = elf::entry_point(ehdr);
+    let machine = arch::current::EXPECTED_ELF_MACHINE;
+    let (ehdr, kind) = elf::validate_executable(module_bytes, machine).ok()?;
+    let bias = match kind
+    {
+        elf::ElfKind::Exec => 0,
+        elf::ElfKind::Dyn => choose_image_bias_or_default(),
+    };
+    let (span_min, span_end) = elf::load_span(ehdr, module_bytes).ok()?;
+    if kind == elf::ElfKind::Dyn
+    {
+        if !process_layout::validate_image_placement(bias, span_min, span_end)
+        {
+            return None;
+        }
+        // Load-bias observability: debugging correlates through this line.
+        log_hex("init: procmgr image bias=", bias);
+    }
+    let entry = elf::entry_point(ehdr).checked_add(bias)?;
+    let rela = if kind == elf::ElfKind::Dyn
+    {
+        elf::rela_table(ehdr, module_bytes).ok()?
+    }
+    else
+    {
+        None
+    };
+    let total_relocs = match rela
+    {
+        Some(t) =>
+        {
+            let table =
+                module_bytes.get(t.file_offset as usize..(t.file_offset + t.size) as usize)?;
+            elf::validate_relative_relocs(table, machine, span_min, span_end).ok()?
+        }
+        None => 0,
+    };
     let stack_pages = elf::parse_stack_note(ehdr, module_bytes)
         .unwrap_or(DEFAULT_PROCESS_STACK_PAGES)
         .clamp(1, MAX_PROCESS_STACK_PAGES);
@@ -1267,15 +1441,28 @@ pub fn bootstrap_procmgr(
     log("created procmgr kernel objects");
     log("loading procmgr ELF segments");
 
-    load_elf_into_arena(&mut arena, ehdr, module_bytes, pm_aspace)?;
+    let applied_relocs =
+        load_elf_into_arena(&mut arena, ehdr, module_bytes, pm_aspace, bias, rela)?;
+    if applied_relocs != total_relocs
+    {
+        log("init: procmgr reloc application mismatch");
+        return None;
+    }
 
     // Place the main thread's TLS block while the module is still mapped —
     // `place_main_tls` reads the `PT_TLS` template from it. Procmgr is
     // std-using so the std runtime's `_start` accesses thread-local statics
     // (e.g. `IPC_BUF_TLS`) before user `main` runs; without a configured TLS
     // block, the first such access page-faults at NULL.
-    let (pm_tls_base_va, pm_tls_meta) =
-        place_main_tls(&mut arena, ehdr, module_bytes, pm_aspace, layout.tls_base)?;
+    let (pm_tls_base_va, pm_tls_meta) = place_main_tls(
+        &mut arena,
+        ehdr,
+        module_bytes,
+        pm_aspace,
+        layout.tls_base,
+        bias,
+        rela,
+    )?;
 
     let _ = syscall::mem_unmap(init_aspace, TEMP_MAP_BASE, module_pages);
     let _ = syscall::cap_delete(module_ro);

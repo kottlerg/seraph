@@ -12,6 +12,7 @@
 
 use init_protocol::INIT_STACK_PAGES;
 use process_layout::{INIT_INFO_WINDOW, INIT_STACK_GUARD_WINDOW};
+use syscall_abi::PAGE_SIZE;
 
 use crate::{TestContext, TestResult};
 
@@ -21,7 +22,7 @@ use crate::{TestContext, TestResult};
 /// the mapping and the register delivery agree.
 pub fn init_info_va_in_window(ctx: &TestContext) -> TestResult
 {
-    if !ctx.init_info_va.is_multiple_of(4096)
+    if !ctx.init_info_va.is_multiple_of(PAGE_SIZE)
     {
         return Err("InitInfo VA is not page-aligned");
     }
@@ -34,16 +35,17 @@ pub fn init_info_va_in_window(ctx: &TestContext) -> TestResult
 
 /// The stack pointer of a live stack frame lies inside the span reachable
 /// from the init-stack-guard window: above the lowest possible mapped stack
-/// byte and below the highest possible stack top. Proves `sched::enter`'s
-/// cached stack top matches the Phase 9 stack mapping.
+/// byte and below the highest possible stack top (the maximum guard draw
+/// plus `INIT_STACK_PAGES` mapped pages). Proves `sched::enter`'s cached
+/// stack top matches the Phase 9 stack mapping.
 pub fn sp_in_init_stack_window(_ctx: &TestContext) -> TestResult
 {
     let probe = 0u64;
     let sp = core::ptr::addr_of!(probe) as u64;
-    let lowest = INIT_STACK_GUARD_WINDOW.base + 4096;
+    let lowest = INIT_STACK_GUARD_WINDOW.base + PAGE_SIZE;
     let highest = INIT_STACK_GUARD_WINDOW.base
         + INIT_STACK_GUARD_WINDOW.span()
-        + (1 + INIT_STACK_PAGES as u64) * 4096;
+        + INIT_STACK_PAGES as u64 * PAGE_SIZE;
     if sp < lowest || sp >= highest
     {
         return Err("SP outside the init-stack window span");

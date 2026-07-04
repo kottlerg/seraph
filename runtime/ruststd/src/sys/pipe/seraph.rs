@@ -33,47 +33,18 @@ use crate::os::seraph::{current_ipc_buf, try_startup_info};
 use crate::sync::Arc;
 use crate::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
+use crate::sys::reserve::{ReservedRange, reserve_pages, unreserve_pages};
 use shmem::{SharedBuffer, SpscHeader, SpscReader, SpscWriter};
 
 /// Ring data byte capacity. One 4 KiB page = 16-byte header + 4080 bytes
 /// data area; largest power of two ≤ 4080 is 2048.
 pub const RING_CAPACITY: u32 = 2048;
 
-const PAGE_SIZE: u64 = 0x1000;
-
-// Parent-side ring VA pool. 64 slots × 1 page = 256 KiB. A spawner that
-// holds more than 64 outstanding piped children at once must wait for
-// some to drop before allocating more — surfaces as `OutOfMemory` from
-// `Pipe::create_for_child`. Region picked above the heap (HEAP_MAX =
-// 0x8000_0000) and well below the read-only `ProcessInfo` page.
-const PARENT_PIPE_REGION_BASE: u64 = 0x0000_7FFF_C000_0000;
-const MAX_PIPE_SLOTS: usize = 64;
-
-static PIPE_SLOTS: [AtomicU8; MAX_PIPE_SLOTS] =
-    [const { AtomicU8::new(0) }; MAX_PIPE_SLOTS];
-
-fn alloc_parent_va() -> Option<u64> {
-    for (i, slot) in PIPE_SLOTS.iter().enumerate() {
-        if slot
-            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
-            .is_ok()
-        {
-            return Some(PARENT_PIPE_REGION_BASE + (i as u64) * PAGE_SIZE);
-        }
-    }
-    None
-}
-
-fn free_parent_va(va: u64) {
-    if va < PARENT_PIPE_REGION_BASE {
-        return;
-    }
-    let off = va - PARENT_PIPE_REGION_BASE;
-    let i = (off / PAGE_SIZE) as usize;
-    if i < MAX_PIPE_SLOTS {
-        PIPE_SLOTS[i].store(0, Ordering::Release);
-    }
-}
+// Ring VAs come from the process's page-reservation arena
+// (`sys::reserve::seraph`), so they inherit the arena's per-process
+// randomised base (ASLR, #39). The count of outstanding pipe rings is
+// bounded only by arena capacity; exhaustion surfaces as `OutOfMemory`
+// from `Pipe::create_for_child`.
 
 /// Role of a `Pipe` end.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -209,10 +180,11 @@ pub struct Pipe {
     space_notification: u32,
     role: Role,
     aspace: u32,
-    /// True when this end allocated its VA from the parent slot pool
-    /// (`alloc_parent_va`). Child-side ends map at fixed per-direction
-    /// VAs and clear this bit so Drop does not free a parent slot.
-    owns_parent_slot: bool,
+    /// Reservation-arena range backing `ring_vaddr`, for ends that drew
+    /// their ring VA from this process's arena (both `create_for_child`
+    /// and `attach_from_caps` ends). Drop unmaps the ring page first,
+    /// then returns the range to the arena.
+    reserved_va: Option<ReservedRange>,
     /// Spawner-side peer-exit flag, shared with the per-spawn
     /// death-bridge thread. `None` for child-side ends and for
     /// parent-side ends not yet attached to a spawn (the bridge sets
@@ -286,8 +258,9 @@ impl Pipe {
             ));
         }
 
-        let parent_va = alloc_parent_va()
-            .ok_or_else(|| io::Error::other("seraph pipe: parent VA pool exhausted"))?;
+        let reserved = reserve_pages(1)
+            .map_err(|_| io::Error::other("seraph pipe: parent ring VA reservation failed"))?;
+        let parent_va = reserved.va_start();
 
         // Request one page from memmgr, keeping the phys base so the grant
         // can be returned via RELEASE_MEMORY_CAPS when the pipe ends its
@@ -296,7 +269,7 @@ impl Pipe {
         let Some((memory_cap, _pages, ring_phys)) =
             crate::sys::alloc::seraph::slab_request_pages(memmgr_ep, 1)
         else {
-            free_parent_va(parent_va);
+            unreserve_pages(reserved);
             return Err(io::Error::other(
                 "seraph pipe: ring page request failed",
             ));
@@ -313,7 +286,7 @@ impl Pipe {
         if map_result.is_err() {
             let _ = syscall::cap_delete(memory_cap);
             crate::sys::alloc::seraph::slab_release_fresh(ring_phys);
-            free_parent_va(parent_va);
+            unreserve_pages(reserved);
             return Err(io::Error::other("seraph pipe: ring page map failed"));
         }
 
@@ -336,7 +309,7 @@ impl Pipe {
                 let _ = syscall::mem_unmap(aspace, parent_va, 1);
                 let _ = syscall::cap_delete(memory_cap);
                 crate::sys::alloc::seraph::slab_release_fresh(ring_phys);
-                free_parent_va(parent_va);
+                unreserve_pages(reserved);
                 return Err(e);
             }
         };
@@ -351,7 +324,7 @@ impl Pipe {
                 let _ = syscall::mem_unmap(aspace, parent_va, 1);
                 let _ = syscall::cap_delete(memory_cap);
                 crate::sys::alloc::seraph::slab_release_fresh(ring_phys);
-                free_parent_va(parent_va);
+                unreserve_pages(reserved);
                 return Err(e);
             }
         };
@@ -369,7 +342,7 @@ impl Pipe {
                 let _ = syscall::mem_unmap(aspace, parent_va, 1);
                 let _ = syscall::cap_delete(memory_cap);
                 crate::sys::alloc::seraph::slab_release_fresh(ring_phys);
-                free_parent_va(parent_va);
+                unreserve_pages(reserved);
                 return Err(io::Error::other(
                     "seraph pipe: cap_derive (memory handoff) failed",
                 ));
@@ -384,7 +357,7 @@ impl Pipe {
                 let _ = syscall::mem_unmap(aspace, parent_va, 1);
                 let _ = syscall::cap_delete(memory_cap);
                 crate::sys::alloc::seraph::slab_release_fresh(ring_phys);
-                free_parent_va(parent_va);
+                unreserve_pages(reserved);
                 return Err(io::Error::other(
                     "seraph pipe: cap_derive (data handoff) failed",
                 ));
@@ -400,7 +373,7 @@ impl Pipe {
                 let _ = syscall::mem_unmap(aspace, parent_va, 1);
                 let _ = syscall::cap_delete(memory_cap);
                 crate::sys::alloc::seraph::slab_release_fresh(ring_phys);
-                free_parent_va(parent_va);
+                unreserve_pages(reserved);
                 return Err(io::Error::other(
                     "seraph pipe: cap_derive (space handoff) failed",
                 ));
@@ -415,7 +388,7 @@ impl Pipe {
                 space_notification,
                 role: parent_role,
                 aspace,
-                owns_parent_slot: true,
+                reserved_va: Some(reserved),
                 peer_dead: None,
                 ring_release: Some(Arc::new(RingRelease::new(ring_phys))),
             },
@@ -427,24 +400,29 @@ impl Pipe {
         ))
     }
 
-    /// Child-side attach. Maps the page received from the parent at
-    /// `child_va` in `aspace`; assumes the header is already
-    /// initialised by the parent. Used by `stdio::stdio_init` once per
-    /// piped direction.
+    /// Child-side attach. Maps the page received from the parent at the
+    /// caller-reserved `reserved` range in `aspace`; assumes the header is
+    /// already initialised by the parent. Used by `stdio::stdio_init` once
+    /// per piped direction. On failure the reservation is returned to the
+    /// arena; on success the `Pipe` owns it and Drop returns it.
     pub fn attach_from_caps(
         memory_cap: u32,
         data_notification: u32,
         space_notification: u32,
         role: Role,
         aspace: u32,
-        child_va: u64,
+        reserved: ReservedRange,
     ) -> io::Result<Pipe> {
+        let child_va = reserved.va_start();
         let memory_caps = [memory_cap, 0, 0, 0];
-        let sb = SharedBuffer::attach(&memory_caps, 1, aspace, child_va).map_err(|_| {
-            io::Error::other("seraph pipe: SharedBuffer::attach failed")
-        })?;
-        // Same forget-the-SharedBuffer trick: Pipe's Drop unmaps.
-        core::mem::forget(sb);
+        match SharedBuffer::attach(&memory_caps, 1, aspace, child_va) {
+            // Same forget-the-SharedBuffer trick: Pipe's Drop unmaps.
+            Ok(sb) => core::mem::forget(sb),
+            Err(_) => {
+                unreserve_pages(reserved);
+                return Err(io::Error::other("seraph pipe: SharedBuffer::attach failed"));
+            }
+        }
         Ok(Pipe {
             memory_cap,
             ring_vaddr: child_va,
@@ -452,7 +430,7 @@ impl Pipe {
             space_notification,
             role,
             aspace,
-            owns_parent_slot: false,
+            reserved_va: Some(reserved),
             peer_dead: None,
             ring_release: None,
         })
@@ -703,8 +681,8 @@ impl Drop for Pipe {
         if self.space_notification != 0 {
             let _ = syscall::cap_delete(self.space_notification);
         }
-        if self.owns_parent_slot {
-            free_parent_va(self.ring_vaddr);
+        if let Some(reserved) = self.reserved_va.take() {
+            unreserve_pages(reserved);
         }
         // Return the ring page's memmgr grant once the child can no
         // longer touch it. With the mapping and caps above already gone,

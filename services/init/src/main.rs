@@ -47,8 +47,10 @@ pub(crate) const THREAD_RETYPE_PAGES: u64 = 6;
 
 /// Pages init carves for memmgr/procmgr's `AddressSpace`. Page 0 becomes
 /// the root PT; pages 1..N-1 form the initial PT growth pool; the +1
-/// covers per-MemoryObject allocator metadata. Mirrors procmgr's constant.
-pub(crate) const ASPACE_RETYPE_PAGES: u64 = 33;
+/// covers per-MemoryObject allocator metadata. Mirrors procmgr's constant,
+/// including the ASLR (#39) headroom for bootstrap surfaces spread across
+/// distinct 64 GiB window strides (~13 pooled pages vs ~3 clustered).
+pub(crate) const ASPACE_RETYPE_PAGES: u64 = 48;
 
 /// Pages init carves for memmgr/procmgr's `CSpace`. Each slot page holds
 /// `L2_SIZE` capability slots (currently 56 slots × 72 B = 4032 B/page);

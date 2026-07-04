@@ -36,17 +36,23 @@ use crate::sync::atomic::{AtomicBool, Ordering};
 use ipc::memmgr_labels::{QUERY_POOL_STATUS, RELEASE_MEMORY_CAPS, REQUEST_MEMORY_CAPS};
 use syscall_abi::{MAP_WRITABLE, PAGE_SIZE};
 
-// Heap-zone VAs are private to the std-overlay allocator. They sit
-// well below the page-reservation arena (`RESERVE_ARENA_BASE = 0x1_0000_0000`)
-// and are ASLR-pending: a one-line change here switches each constant
-// to a per-process RNG draw once the kernel RNG lands.
+// Heap-zone VAs are private to the std-overlay allocator. The base is drawn
+// per process at bootstrap (ASLR, #39) from a fixed window that keeps the
+// whole heap zone `[1 GiB, 4 GiB)` well below the page-reservation arena
+// (`reserve/seraph.rs`); the zone bound is mirrored in
+// `shared/process-layout` for the cross-zone const-asserts.
 
-/// Heap base (inclusive).
-const HEAP_BASE: u64 = 0x0000_0000_4000_0000;
+/// Degraded-fallback heap base (inclusive), used when the entropy draw fails.
+/// Also the base of the draw window.
+const HEAP_BASE_DEFAULT: u64 = 0x0000_0000_4000_0000;
 
-/// Heap zone upper bound (exclusive). Maximum heap size = `HEAP_MAX -
-/// HEAP_BASE` = 1 GiB. Growth beyond this surfaces OOM.
-const HEAP_MAX: u64 = 0x0000_0000_8000_0000;
+/// Log2 of the number of page-aligned heap-base slots (= bits of base
+/// entropy). The drawn base lies in `[1 GiB, 3 GiB)`.
+const HEAP_BASE_SLOTS_LOG2: u32 = 19;
+
+/// Maximum heap size from the drawn base. Growth beyond `base + HEAP_SPAN`
+/// surfaces OOM.
+const HEAP_SPAN: u64 = 0x0000_0000_4000_0000;
 
 /// Initial heap size at `_start`, in 4 KiB pages. Sized to cover stdio's
 /// lazy line-buffer, two worker-thread stacks plus their per-thread IPC
@@ -116,8 +122,11 @@ fn align_up(addr: usize, align: usize) -> usize {
 struct Heap {
     head: Option<NonNull<FreeNode>>,
     /// First VA above the currently mapped heap region. Grows upward toward
-    /// `HEAP_MAX` as `grow` maps fresh pages. Zero before bootstrap.
+    /// `max` as `grow` maps fresh pages. Zero before bootstrap.
     mapped_end: usize,
+    /// Heap zone upper bound (exclusive): the per-process drawn base plus
+    /// `HEAP_SPAN`. Zero before bootstrap.
+    max: usize,
     /// Cached memmgr endpoint cap used by `grow` to request additional
     /// pages. Zero before bootstrap; `grow` returns false in that state.
     memmgr_ep: u32,
@@ -130,6 +139,7 @@ impl Heap {
         Self {
             head: None,
             mapped_end: 0,
+            max: 0,
             memmgr_ep: 0,
             self_aspace: 0,
         }
@@ -249,7 +259,7 @@ impl Heap {
     ///
     /// Returns `true` if the heap grew by enough pages to cover
     /// `want_bytes`, `false` on any IPC / map failure or when the heap
-    /// has reached `HEAP_MAX`. A partial failure (some pages mapped,
+    /// has reached its zone bound. A partial failure (some pages mapped,
     /// then a later batch fails) leaves the successfully-mapped pages
     /// outside the free list — effectively leaked address space until
     /// a future successful grow. This keeps the failure path simple and
@@ -265,7 +275,8 @@ impl Heap {
             return false;
         }
         let start_va = self.mapped_end as u64;
-        if start_va >= HEAP_MAX {
+        let heap_max = self.max as u64;
+        if start_va >= heap_max {
             return false;
         }
 
@@ -273,8 +284,8 @@ impl Heap {
         let pages_needed = want_bytes.div_ceil(page_size_usize) as u64;
         let pages_wanted = core::cmp::max(pages_needed, GROW_MIN_PAGES).min(GROW_MAX_PAGES);
 
-        // Clamp to what fits in the remaining [mapped_end, HEAP_MAX) window.
-        let remaining_pages = (HEAP_MAX - start_va) / PAGE_SIZE;
+        // Clamp to what fits in the remaining [mapped_end, max) window.
+        let remaining_pages = (heap_max - start_va) / PAGE_SIZE;
         let pages = pages_wanted.min(remaining_pages);
         if pages == 0 {
             return false;
@@ -412,7 +423,8 @@ static INITIALIZED: AtomicBool = AtomicBool::new(false);
 // ── Bootstrap ───────────────────────────────────────────────────────────────
 
 /// Initialise the heap by requesting pages from memmgr and mapping them
-/// at `HEAP_BASE`. Idempotent — only the first call performs real work.
+/// at a per-process drawn base (ASLR, #39). Idempotent — only the first
+/// call performs real work.
 ///
 /// The IPC buffer used for the bootstrap round is taken from the calling
 /// thread's TLS slot ([`crate::os::seraph::current_ipc_buf`]). `_start`
@@ -430,6 +442,19 @@ pub fn heap_bootstrap(memmgr_ep: u32, self_aspace: u32) -> bool {
     if memmgr_ep == 0 {
         return false;
     }
+
+    // The base draw happens before the allocator exists: the raw getrandom
+    // wrapper is a registers-only syscall and must stay non-allocating, like
+    // the IPC wrappers below. A failed draw degrades to the deterministic
+    // default base (no log surface exists this early).
+    let mut entropy = [0u8; 8];
+    let heap_base = match syscall::getrandom(entropy.as_mut_ptr(), entropy.len()) {
+        Ok(n) if n == entropy.len() as u64 => {
+            HEAP_BASE_DEFAULT
+                + ((u64::from_le_bytes(entropy) & ((1 << HEAP_BASE_SLOTS_LOG2) - 1)) << 12)
+        }
+        _ => HEAP_BASE_DEFAULT,
+    };
 
     let ipc_buf_u64 = current_ipc_buf();
     if ipc_buf_u64.is_null() {
@@ -470,7 +495,7 @@ pub fn heap_bootstrap(memmgr_ep: u32, self_aspace: u32) -> bool {
             if pages_in_cap == 0 {
                 return false;
             }
-            let va = HEAP_BASE + mapped * PAGE_SIZE;
+            let va = heap_base + mapped * PAGE_SIZE;
             if syscall::mem_map(cap_slot, self_aspace, va, 0, pages_in_cap, MAP_WRITABLE).is_err()
             {
                 return false;
@@ -479,7 +504,7 @@ pub fn heap_bootstrap(memmgr_ep: u32, self_aspace: u32) -> bool {
         }
     }
 
-    let base = HEAP_BASE as usize;
+    let base = heap_base as usize;
     let size = (HEAP_INITIAL_PAGES as usize) * (PAGE_SIZE as usize);
     HEAP.lock.lock();
     // SAFETY: freshly-mapped, exclusively-owned region; lock held.
@@ -487,6 +512,7 @@ pub fn heap_bootstrap(memmgr_ep: u32, self_aspace: u32) -> bool {
         let heap = &mut *HEAP.inner.get();
         heap.init(base, size);
         heap.mapped_end = base + size;
+        heap.max = base + HEAP_SPAN as usize;
         heap.memmgr_ep = memmgr_ep;
         heap.self_aspace = self_aspace;
     }

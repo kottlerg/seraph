@@ -88,11 +88,11 @@ acquires a memmgr-backed RETYPE Memory cap and augments the AS's PT pool via
 `cap_create_aspace`. It MUST be called after reserving VA and before
 `mem_map`/`mmio_map`, or the map fails with `OutOfMemory`.
 
-The arena is carved out of the process's address space at `_start` time at
-a deterministic constant base; the implementation is structured so a
-one-line change switches to RNG-driven randomisation when the kernel RNG is
-available. The caller owns `mem_map`/`mem_unmap`; the allocator only
-manages VA space.
+The arena is carved out of the process's address space on first use, at a
+base drawn per process from a fixed 64 GiB window via `SYS_GETRANDOM`
+(ASLR, [#39](https://github.com/kottlerg/seraph/issues/39); deterministic
+default only if the draw fails). The caller owns `mem_map`/`mem_unmap`;
+the allocator only manages VA space.
 
 ### Bootstrap-cross-boundary VAs
 

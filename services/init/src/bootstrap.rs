@@ -23,11 +23,35 @@ use process_layout::{ProcessLayout, choose_process_layout};
 //
 // ELF_PAGE_TEMP_VA is private to init's no_std bootstrap path and sits inside
 // init's TEMP_MAP_BASE scratch region (offset 256 MiB). The per-child bootstrap
-// VAs (`ProcessInfo` page, stack top, TLS block, IPC buffer) are chosen via
-// `process-layout` rather than pinned here, mirroring procmgr.
+// VAs (`ProcessInfo` page, stack top, TLS block, IPC buffer) are drawn per
+// process via `process-layout` (ASLR, #39) rather than pinned here, mirroring
+// procmgr.
 
 /// Per-page ELF write scratch during init's procmgr/memmgr bootstrap.
 const ELF_PAGE_TEMP_VA: u64 = TEMP_MAP_BASE + 0x1000_0000;
+
+/// Draw the entropy one bootstrap-layout choice consumes (ASLR, #39).
+///
+/// `None` means the draw failed — a kernel-contract violation once the pool
+/// is seeded, which it is before init runs.
+fn draw_layout_entropy() -> Option<[u8; process_layout::LAYOUT_ENTROPY_BYTES]>
+{
+    let mut entropy = [0_u8; process_layout::LAYOUT_ENTROPY_BYTES];
+    let n = syscall::getrandom(entropy.as_mut_ptr(), entropy.len()).ok()?;
+    (n == entropy.len() as u64).then_some(entropy)
+}
+
+/// Choose a child's bootstrap layout from fresh entropy, degrading to the
+/// deterministic default layout (with a log line) if the draw fails.
+fn choose_child_layout() -> ProcessLayout
+{
+    let entropy = draw_layout_entropy();
+    if entropy.is_none()
+    {
+        log("init: layout entropy draw failed; using default layout");
+    }
+    choose_process_layout(entropy.as_ref())
+}
 
 // ── Bootstrap arena ────────────────────────────────────────────────────────────
 //
@@ -569,7 +593,7 @@ pub fn bootstrap_memmgr(
     let stack_pages = elf::parse_stack_note(ehdr, module_bytes)
         .unwrap_or(DEFAULT_PROCESS_STACK_PAGES)
         .clamp(1, MAX_PROCESS_STACK_PAGES);
-    let layout = choose_process_layout();
+    let layout = choose_child_layout();
 
     // memmgr's bespoke `_start` configures no TLS, so its arena reserves
     // only ELF segments + `ProcessInfo` + stack + IPC buffer.
@@ -1223,7 +1247,7 @@ pub fn bootstrap_procmgr(
     let stack_pages = elf::parse_stack_note(ehdr, module_bytes)
         .unwrap_or(DEFAULT_PROCESS_STACK_PAGES)
         .clamp(1, MAX_PROCESS_STACK_PAGES);
-    let layout = choose_process_layout();
+    let layout = choose_child_layout();
 
     // procmgr is std-using: its arena reserves ELF segments + the main TLS
     // block + `ProcessInfo` + stack + IPC buffer.

@@ -7,6 +7,7 @@ publish.workspace = true
 [dependencies]
 boot-protocol = { workspace = true }
 init-protocol = { workspace = true }
+process-layout = { workspace = true }
 font = { workspace = true }
 mmio = { workspace = true }
 syscall = { workspace = true }

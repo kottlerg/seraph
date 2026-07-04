@@ -1,19 +1,19 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-//! Userspace randomness surface (#246).
+//! Userspace randomness surface (#246) and ASLR layout divergence (#39).
 //!
 //! Exercises `SYS_GETRANDOM` directly and the std `RandomState`/`HashMap`
 //! seeding it backs (`hashmap_random_keys`). The gating property is
-//! cross-process divergence: a respawned child's per-process hash seed must
-//! differ from the parent's, proving the seed is drawn per process rather than
-//! being a constant. (The former `unsupported` stub derived keys from stack and
-//! heap addresses, identical across two runs of the same binary under seraph's
-//! deterministic VA layout — so it would collide here, where the real
-//! per-process kernel draw diverges.)
+//! cross-process divergence, checked twice: a respawned child's per-process
+//! hash seed must differ from the parent's (proving the seed is a real
+//! per-process kernel draw, not a constant), and the child's bootstrap
+//! layout tuple must differ from the parent's (proving the creator draws
+//! each process's layout independently).
 
 use std::collections::hash_map::RandomState;
 use std::hash::BuildHasher;
+use std::os::seraph::startup_info;
 
 use crate::bootstrap::Caps;
 use crate::runner::Phase;
@@ -22,16 +22,37 @@ use crate::runner::Phase;
 /// it differs from the parent fingerprint passed as `argv[2]`.
 const ROLE_DIVERGE: &str = "random-diverge-child";
 
+/// argv role: the child compares its bootstrap-layout tuple against the
+/// parent tuple passed as `argv[2]` and exits `0` iff they differ.
+const ROLE_LAYOUT_DIVERGE: &str = "aslr-layout-diverge-child";
+
 /// Fixed hasher input; the resulting hash depends only on the sampling thread's
 /// `RandomState` `SipHash` keys (drawn via `hashmap_random_keys` → `SYS_GETRANDOM`).
 const FINGERPRINT_INPUT: u64 = 0x5365_7261_7068_2121; // "Seraph!!"
 
 pub fn phases() -> &'static [Phase]
 {
-    &[Phase {
-        name: "random",
-        run: random_phase,
-    }]
+    &[
+        Phase {
+            name: "random",
+            run: random_phase,
+        },
+        Phase {
+            name: "aslr-layout",
+            run: aslr_layout_phase,
+        },
+    ]
+}
+
+/// The parent-visible bootstrap-layout tuple: stack top, main-TLS base, IPC
+/// buffer. Every component is an independent per-process window draw.
+fn layout_fingerprint() -> String
+{
+    let info = startup_info();
+    format!(
+        "{:x}-{:x}-{:x}",
+        info.stack_top_vaddr, info.main_tls_vaddr, info.ipc_buffer as u64
+    )
 }
 
 /// Draw 8 random bytes from `SYS_GETRANDOM` as a `u64`.
@@ -69,6 +90,14 @@ pub fn reentry_main(role: &str)
         // exit 0 = diverged (expected); 1 = collision (seed not per-process).
         std::process::exit(i32::from(base_fingerprint() == parent));
     }
+    if role == ROLE_LAYOUT_DIVERGE
+    {
+        let parent = std::env::args()
+            .nth(2)
+            .expect("aslr-layout-diverge-child: missing parent layout tuple");
+        // exit 0 = diverged (expected); 1 = collision (layout not per-process).
+        std::process::exit(i32::from(layout_fingerprint() == parent));
+    }
 }
 
 pub fn random_phase(_: &Caps)
@@ -101,4 +130,24 @@ pub fn random_phase(_: &Caps)
     );
 
     std::os::seraph::log!("random phase passed");
+}
+
+pub fn aslr_layout_phase(_: &Caps)
+{
+    // Cross-process ASLR divergence (#39): a respawned child's bootstrap
+    // layout tuple must differ from the parent's. Each component carries
+    // 23 bits of independent entropy, so a false failure (all three draws
+    // colliding at once) is ~2⁻⁶⁹ per run — negligible even under burn-in.
+    let mine = layout_fingerprint();
+    let status = std::process::Command::new("/tests/svctest")
+        .arg(ROLE_LAYOUT_DIVERGE)
+        .arg(&mine)
+        .status()
+        .expect("spawn /tests/svctest aslr-layout-diverge-child failed");
+    assert!(
+        status.success(),
+        "child bootstrap layout matched parent — ASLR not divergent: {status}"
+    );
+
+    std::os::seraph::log!("aslr layout divergence phase passed");
 }

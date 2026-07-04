@@ -259,11 +259,13 @@ at creation time. Examples:
 
 The handover page itself (`ProcessInfo`, or `InitInfo` for init) cannot
 record its own address — that address is what locates the page. The
-creator chooses it per-process (procmgr/init via `shared/process-layout`;
-the kernel via `choose_init_layout` for init) and delivers it to the
-child in the entry register (`rdi`/`a0`); the child's `_start` takes it as
-its argument. The stack, TLS, and IPC-buffer VAs are likewise
-creator-chosen but travel as the runtime `ProcessInfo` fields above. No
+creator draws it per-process from a fixed randomisation window (ASLR,
+[#39](https://github.com/kottlerg/seraph/issues/39); procmgr/init via
+`shared/process-layout`, the kernel via `choose_init_layout` for init)
+and delivers it to the child in the entry register (`rdi`/`a0`); the
+child's `_start` takes it as its argument. The stack, TLS, and
+IPC-buffer VAs are likewise creator-drawn but travel as the runtime
+`ProcessInfo` fields above. No
 handover *address* is an ABI constant; the ABI crates declare only policy
 bounds (`DEFAULT_PROCESS_STACK_PAGES`, `MAX_PROCESS_STACK_PAGES`,
 `PROCESS_MAIN_TLS_MAX_PAGES`, `INIT_STACK_PAGES`, `INIT_INFO_MAX_PAGES`).

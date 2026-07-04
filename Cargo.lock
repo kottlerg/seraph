@@ -569,6 +569,7 @@ dependencies = [
  "font",
  "init-protocol",
  "mmio",
+ "process-layout",
  "syscall-abi",
  "text",
 ]
@@ -581,6 +582,7 @@ dependencies = [
  "font",
  "init-protocol",
  "ipc",
+ "process-layout",
  "syscall",
  "syscall-abi",
  "text",
@@ -768,6 +770,9 @@ dependencies = [
 [[package]]
 name = "process-layout"
 version = "0.1.1"
+dependencies = [
+ "process-abi",
+]
 
 [[package]]
 name = "procmgr"
@@ -1011,6 +1016,7 @@ version = "0.1.1"
 dependencies = [
  "ipc",
  "namespace-protocol",
+ "process-abi",
  "process-layout",
  "shmem",
  "syscall",

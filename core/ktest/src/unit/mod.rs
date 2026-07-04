@@ -38,6 +38,8 @@
 //! - `crypto.rs`   — shared `crypto` crate KATs (SHA-512, Ed25519 verify),
 //!   run on-target so the primitives are validated on both arches (not a
 //!   kernel syscall surface, but ktest is the only both-arch on-target harness)
+//! - `init_layout.rs` — kernel `choose_init_layout` ASLR draw (#39): `InitInfo`
+//!   VA and init stack window membership, asserted on ktest's own layout
 
 pub mod cap;
 pub mod cap_info;
@@ -46,6 +48,7 @@ pub mod entropy;
 pub mod event;
 pub mod fpu;
 pub mod hw;
+pub mod init_layout;
 pub mod ipc;
 pub mod mm;
 pub mod notification;
@@ -530,6 +533,16 @@ pub fn run_all(ctx: &TestContext)
     run_test!(
         "entropy::getrandom_over_max_len_invalid_arg",
         entropy::getrandom_over_max_len_invalid_arg(ctx)
+    );
+
+    // ── Init bootstrap layout (ASLR, #39) ─────────────────────────────────────
+    run_test!(
+        "init_layout::init_info_va_in_window",
+        init_layout::init_info_va_in_window(ctx)
+    );
+    run_test!(
+        "init_layout::sp_in_init_stack_window",
+        init_layout::sp_in_init_stack_window(ctx)
     );
 
     // ── Shared crypto primitives ──────────────────────────────────────────────

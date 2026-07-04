@@ -78,17 +78,15 @@ use crate::mm::{BuddyAllocator, PAGE_SIZE};
 // Init stack page count is part of the init protocol ABI; the init VA layout
 // (info page + stack top) is the kernel's per-boot choice, not an ABI constant.
 pub use init_protocol::INIT_STACK_PAGES;
+use process_layout::{INIT_INFO_WINDOW, INIT_STACK_GUARD_WINDOW};
 
-/// Default base of the read-only `InitInfo` region mapped into init.
-///
-/// The region spans up to `INIT_INFO_MAX_PAGES` contiguous pages from this
-/// address; with the default stack top it occupies
-/// `[0x7FFF_FFFF_5000, 0x7FFF_FFFF_9000)`, a guard sits at `0x7FFF_FFFF_9000`,
-/// and init's stack runs `[0x7FFF_FFFF_A000, DEFAULT_INIT_STACK_TOP)`.
+/// Degraded-fallback base of the read-only `InitInfo` region mapped into init,
+/// used only when the entropy pool is unavailable at the layout draw. The
+/// region spans up to `INIT_INFO_MAX_PAGES` contiguous pages from this address.
 pub const DEFAULT_INIT_INFO_VA: u64 = 0x7FFF_FFFF_5000;
 
-/// Default top of init's user stack. `INIT_STACK_PAGES` pages map immediately
-/// below, with one unmapped guard page beneath them.
+/// Degraded-fallback top of init's user stack. `INIT_STACK_PAGES` pages map
+/// immediately below, with one unmapped guard page beneath them.
 pub const DEFAULT_INIT_STACK_TOP: u64 = 0x7FFF_FFFF_E000;
 
 /// Bootstrap virtual addresses the kernel chooses for the init process.
@@ -105,22 +103,69 @@ pub struct InitLayout
     pub init_stack_top: u64,
 }
 
-/// Cached init layout for this boot. `init_info_va == 0` means not yet chosen
+/// Cached init layout for this boot. `init_info_va == 0` means not yet drawn
 /// (a real `InitInfo` VA is never 0). Init is a singleton, and two boot phases
 /// read its layout — the `InitInfo` mapping in Phase 9 and the user trap-frame
-/// build in `sched::enter` — so the choice is made once and cached to keep both
-/// readers in agreement once ASLR (#39) makes it random.
+/// build in `sched::enter` — so the random draw is made once and cached to
+/// keep both readers in agreement.
 static INIT_LAYOUT_INFO_VA: AtomicU64 = AtomicU64::new(0);
 static INIT_LAYOUT_STACK_TOP: AtomicU64 = AtomicU64::new(0);
 
-/// Return the init process's bootstrap VA layout for this boot, choosing it on
+/// Build init's layout from 16 bytes of entropy: the LE `u64` at `[0..8]`
+/// draws the `InitInfo` base from `INIT_INFO_WINDOW`, the one at `[8..16]`
+/// draws the stack guard page from `INIT_STACK_GUARD_WINDOW`, and the stack
+/// top sits `INIT_STACK_PAGES` mapped pages above the guard (the guard page
+/// itself stays unmapped below the stack base).
+fn init_layout_from_entropy(entropy: [u8; 16]) -> InitLayout
+{
+    let mut word = [0_u8; 8];
+    word.copy_from_slice(&entropy[0..8]);
+    let init_info_va = INIT_INFO_WINDOW.pick(u64::from_le_bytes(word));
+    word.copy_from_slice(&entropy[8..16]);
+    let guard = INIT_STACK_GUARD_WINDOW.pick(u64::from_le_bytes(word));
+    InitLayout {
+        init_info_va,
+        init_stack_top: guard + (1 + INIT_STACK_PAGES as u64) * PAGE_SIZE as u64,
+    }
+}
+
+/// Draw init's layout for this boot (ASLR, #39).
+///
+/// Requires the entropy pool (seeded in Phase 5, before the first caller in
+/// Phase 9); if it is somehow unavailable the layout degrades to the
+/// deterministic `DEFAULT_INIT_*` addresses with a console warning, matching
+/// the entropy subsystem's graceful-degradation stance.
+#[cfg(not(test))]
+fn draw_init_layout() -> InitLayout
+{
+    if crate::entropy::is_seeded()
+    {
+        let mut entropy = [0_u8; 16];
+        crate::entropy::fill_bytes(&mut entropy);
+        return init_layout_from_entropy(entropy);
+    }
+    crate::kprintln!("[mm] entropy unavailable; init layout falls back to defaults");
+    InitLayout {
+        init_info_va: DEFAULT_INIT_INFO_VA,
+        init_stack_top: DEFAULT_INIT_STACK_TOP,
+    }
+}
+
+/// Host-test stand-in: the real draw path needs the `cfg(not(test))` entropy
+/// subsystem. A fixed pattern keeps the cache logic testable.
+#[cfg(test)]
+fn draw_init_layout() -> InitLayout
+{
+    init_layout_from_entropy([0xA5; 16])
+}
+
+/// Return the init process's bootstrap VA layout for this boot, drawing it on
 /// the first call and returning the cached value thereafter.
 ///
-/// Deterministic today: returns the `DEFAULT_INIT_*` addresses above. The first
-/// call is the single seam ASLR (#39) replaces with a per-boot entropy draw
-/// (`crate::entropy::fill_bytes`); the analogue of `process-layout`'s
-/// `choose_process_layout` for the kernel→init handover. Safe to call from the
-/// single boot thread across boot phases; not intended for concurrent use.
+/// The analogue of `process-layout`'s `choose_process_layout` for the
+/// kernel→init handover. The drawing call must remain the Phase 9 boot-thread
+/// call — the entropy draw is not interrupt-safe. Safe to call from the single
+/// boot thread across boot phases; not intended for concurrent use.
 #[must_use]
 pub fn choose_init_layout() -> InitLayout
 {
@@ -133,10 +178,7 @@ pub fn choose_init_layout() -> InitLayout
         };
     }
 
-    let layout = InitLayout {
-        init_info_va: DEFAULT_INIT_INFO_VA,
-        init_stack_top: DEFAULT_INIT_STACK_TOP,
-    };
+    let layout = draw_init_layout();
     INIT_LAYOUT_STACK_TOP.store(layout.init_stack_top, Ordering::Relaxed);
     INIT_LAYOUT_INFO_VA.store(layout.init_info_va, Ordering::Relaxed);
     layout
@@ -1088,5 +1130,42 @@ impl AddressSpace
         // SAFETY: Acquire ordering ensures we see all mark_active calls from
         // other CPUs. The snapshot is per-word atomic; no data race on the mask.
         self.active_cpus.snapshot(Ordering::Acquire)
+    }
+}
+
+#[cfg(test)]
+mod init_layout_tests
+{
+    use process_layout::{INIT_INFO_WINDOW, INIT_STACK_GUARD_WINDOW, USER_HALF_TOP};
+
+    use super::*;
+
+    #[test]
+    fn entropy_draw_is_aligned_in_window_and_disjoint()
+    {
+        for pattern in [[0x00_u8; 16], [0xFF; 16], [0xA5; 16], [0x5A; 16]]
+        {
+            let layout = init_layout_from_entropy(pattern);
+            let page = PAGE_SIZE as u64;
+
+            assert!(INIT_INFO_WINDOW.contains(layout.init_info_va));
+            assert_eq!(layout.init_stack_top % page, 0);
+            let stack_reserve = (1 + INIT_STACK_PAGES as u64) * page;
+            let guard = layout.init_stack_top - stack_reserve;
+            assert!(INIT_STACK_GUARD_WINDOW.contains(guard));
+            assert!(layout.init_stack_top < USER_HALF_TOP);
+
+            // InitInfo region (INIT_INFO_MAX_PAGES) vs stack reservation
+            // (guard + INIT_STACK_PAGES): disjoint for every draw.
+            let info_end = layout.init_info_va + init_protocol::INIT_INFO_MAX_PAGES as u64 * page;
+            assert!(info_end <= guard);
+        }
+    }
+
+    #[test]
+    fn choose_init_layout_caches_first_draw()
+    {
+        let first = choose_init_layout();
+        assert_eq!(choose_init_layout(), first);
     }
 }

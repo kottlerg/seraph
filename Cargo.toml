@@ -98,6 +98,7 @@ ansi = { path = "shared/ansi" }
 boot-protocol = { path = "abi/boot-protocol" }
 init-protocol = { path = "abi/init-protocol" }
 process-abi = { path = "abi/process-abi" }
+process-layout = { path = "shared/process-layout" }
 font = { path = "shared/font" }
 mmio = { path = "shared/mmio" }
 text = { path = "shared/text" }

@@ -82,6 +82,19 @@ fn choose_child_layout() -> ProcessLayout
     choose_process_layout(entropy.as_ref())
 }
 
+/// Draw an `ET_DYN` image load bias (ASLR, #39), degrading to the window base
+/// (never bias 0 — the image still relocates through the single PIE path)
+/// with a log line if the entropy draw fails.
+fn choose_image_bias_or_default() -> u64
+{
+    if let Ok(r) = syscall::random_u64()
+    {
+        return process_layout::choose_image_bias(r);
+    }
+    std::os::seraph::log!("procmgr: image-bias entropy draw failed; using window base");
+    process_layout::IMAGE_WINDOW.base
+}
+
 /// Logd's death-notification `EventQueue` cap, registered via
 /// `procmgr_labels::REGISTER_DEATH_EQ` once real-logd is up. Zero
 /// until then. Read in `finalize_creation` to bind logd as a second
@@ -875,6 +888,14 @@ fn finalize_main_tls(alloc: MainTlsAlloc, _self_aspace: u32, child_aspace: u32) 
 /// Allocate, populate from an in-memory `.tdata` slice, and map the main
 /// thread's TLS block. Wraps the two-phase helpers above for the
 /// create-from-bytes path.
+///
+/// `relocate` runs over the populated template copy before the block is
+/// finalized; PIE spawns re-apply the `.tdata`-targeting `RELATIVE`
+/// relocations there (the in-image template copy is relocated separately
+/// during segment loading).
+// too_many_arguments: each is a distinct creation input; see
+// prepare_main_tls_from_vfs.
+#[allow(clippy::too_many_arguments)]
 fn prepare_main_tls_from_bytes(
     self_aspace: u32,
     child_aspace: u32,
@@ -883,6 +904,7 @@ fn prepare_main_tls_from_bytes(
     child_memmgr_send: u32,
     ipc_buf: *mut u64,
     layout: &ProcessLayout,
+    relocate: impl FnOnce(&mut [u8]),
 ) -> Option<MainTls>
 {
     if tls.memsz == 0
@@ -903,11 +925,19 @@ fn prepare_main_tls_from_bytes(
             template_bytes.len(),
         );
     }
+    // SAFETY: the template region [0, len) was just populated and stays
+    // mapped writable until finalize drops the scratch mapping.
+    let template =
+        unsafe { core::slice::from_raw_parts_mut(scratch_va as *mut u8, template_bytes.len()) };
+    relocate(template);
     finalize_main_tls(alloc, self_aspace, child_aspace)
 }
 
 /// Allocate, populate by streaming `.tdata` from an open VFS file handle,
 /// and map the main thread's TLS block.
+///
+/// `relocate` runs over the streamed template copy before the block is
+/// finalized; see [`prepare_main_tls_from_bytes`].
 // too_many_arguments: each is a distinct creation input (caps, file handle,
 // IPC scratch, chosen layout); grouping them would not reduce coupling.
 #[allow(clippy::too_many_arguments)]
@@ -920,6 +950,7 @@ fn prepare_main_tls_from_vfs(
     child_memmgr_send: u32,
     ipc_buf: *mut u64,
     layout: &ProcessLayout,
+    relocate: impl FnOnce(&mut [u8]),
 ) -> Option<MainTls>
 {
     if tls.memsz == 0
@@ -958,6 +989,11 @@ fn prepare_main_tls_from_vfs(
         read_pos += safe_len as u64;
     }
 
+    // SAFETY: the template region [0, filesz) was just streamed in and stays
+    // mapped writable until finalize drops the scratch mapping.
+    let template =
+        unsafe { core::slice::from_raw_parts_mut(scratch_va as *mut u8, tls.filesz as usize) };
+    relocate(template);
     finalize_main_tls(alloc, self_aspace, child_aspace)
 }
 
@@ -1020,6 +1056,156 @@ fn segment_prot(seg: &elf::LoadSegment) -> u64
     {
         syscall::MAP_READONLY
     }
+}
+
+// ── RELATIVE relocation application (ET_DYN, #39) ────────────────────────────
+
+/// Number of `Elf64_Rela` records fetched per streaming chunk.
+const RELA_CHUNK_RECORDS: usize = 128;
+
+/// Whether a relocation's whole 8-byte target lies inside the image's
+/// link-VA load span.
+fn reloc_target_in_span(rela: &elf::Rela, span_min: u64, span_end: u64) -> bool
+{
+    rela.offset >= span_min
+        && rela
+            .offset
+            .checked_add(8)
+            .is_some_and(|end| end <= span_end)
+}
+
+/// Apply one `RELATIVE` relocation to a copied span starting at link VA
+/// `span_vaddr`: writes `bias + addend` at the target if the whole 8-byte
+/// target lies inside the span. Returns the number applied (0 or 1).
+fn apply_reloc_in_span(rela: &elf::Rela, bias: u64, span_vaddr: u64, span: &mut [u8]) -> u64
+{
+    let span_end = span_vaddr + span.len() as u64;
+    let Some(target_end) = rela.offset.checked_add(8)
+    else
+    {
+        return 0;
+    };
+    if rela.offset < span_vaddr || target_end > span_end
+    {
+        return 0;
+    }
+    let pos = (rela.offset - span_vaddr) as usize;
+    let value = bias.wrapping_add(rela.addend.cast_unsigned());
+    span[pos..pos + 8].copy_from_slice(&value.to_le_bytes());
+    1
+}
+
+/// Pre-validate an in-memory rela table: every record must decode as a
+/// `RELATIVE` relocation whose 8-byte target lies inside the image span.
+/// Returns the record count.
+fn validate_relocs_slice(table: &[u8], machine: u16, span_min: u64, span_end: u64) -> Option<u64>
+{
+    let iter = elf::relative_relocs(table, machine).ok()?;
+    let mut count = 0u64;
+    for record in iter
+    {
+        let rela = record.ok()?;
+        if !reloc_target_in_span(&rela, span_min, span_end)
+        {
+            return None;
+        }
+        count += 1;
+    }
+    Some(count)
+}
+
+/// Apply every `RELATIVE` relocation in an in-memory table whose target lies
+/// in `[span_vaddr, span_vaddr + span.len())`; returns the number applied.
+/// Records were pre-validated by [`validate_relocs_slice`]; a decode error
+/// stops the walk, and the caller's applied-count check then rejects the
+/// image.
+fn apply_relocs_in_slice_table(
+    table: &[u8],
+    machine: u16,
+    bias: u64,
+    span_vaddr: u64,
+    span: &mut [u8],
+) -> u64
+{
+    let Ok(iter) = elf::relative_relocs(table, machine)
+    else
+    {
+        return 0;
+    };
+    let mut applied = 0u64;
+    for rela in iter.flatten()
+    {
+        applied += apply_reloc_in_span(&rela, bias, span_vaddr, span);
+    }
+    applied
+}
+
+/// Stream a rela table in bounded chunks, invoking `f` on every decoded
+/// record. Returns the record count; `None` on a failed/short read or a
+/// record that is not a well-formed `RELATIVE` relocation.
+///
+/// Chunks stay record-aligned: the buffer size and `DT_RELASZ` are both
+/// multiples of [`elf::RELA_ENTRY_SIZE`].
+fn walk_relocs_streaming<R, F>(
+    table: &elf::RelaTable,
+    machine: u16,
+    mut read_at: R,
+    mut f: F,
+) -> Option<u64>
+where
+    R: FnMut(u64, &mut [u8]) -> Option<usize>,
+    F: FnMut(&elf::Rela),
+{
+    let mut buf = [0u8; elf::RELA_ENTRY_SIZE * RELA_CHUNK_RECORDS];
+    let mut done: u64 = 0;
+    let mut count = 0u64;
+    while done < table.size
+    {
+        let chunk = (table.size - done).min(buf.len() as u64) as usize;
+        let got = read_at(table.file_offset + done, &mut buf[..chunk])?;
+        if got < chunk
+        {
+            return None;
+        }
+        for record in elf::relative_relocs(&buf[..chunk], machine).ok()?
+        {
+            f(&record.ok()?);
+            count += 1;
+        }
+        done += chunk as u64;
+    }
+    Some(count)
+}
+
+/// Fill `dst` from file offset `off` via bounded `FS_READ` chunks. Returns
+/// the number of bytes copied (short only at EOF or on a short fs read).
+fn vfs_read_exact(file_cap: u32, ipc_buf: *mut u64, off: u64, dst: &mut [u8]) -> Option<usize>
+{
+    let mut tmp = [0u8; VFS_CHUNK_SIZE as usize];
+    let mut total = 0usize;
+    while total < dst.len()
+    {
+        let want = (dst.len() - total).min(VFS_CHUNK_SIZE as usize);
+        let bytes_read = vfs_read(
+            file_cap,
+            ipc_buf,
+            off + total as u64,
+            want as u64,
+            &mut tmp[..want],
+        )?;
+        if bytes_read == 0
+        {
+            break;
+        }
+        let copy_len = bytes_read.min(want);
+        dst[total..total + copy_len].copy_from_slice(&tmp[..copy_len]);
+        total += copy_len;
+        if bytes_read < want
+        {
+            break;
+        }
+    }
+    Some(total)
 }
 
 /// Derive caller-facing caps and record the process in the table.
@@ -1197,8 +1383,48 @@ fn create_process_from_bytes(
     ipc_buf: *mut u64,
 ) -> Option<CreateResult>
 {
-    let ehdr = elf::validate(module_bytes, crate::arch::current::EXPECTED_ELF_MACHINE).ok()?;
-    let entry = elf::entry_point(ehdr);
+    let machine = crate::arch::current::EXPECTED_ELF_MACHINE;
+    let (ehdr, kind) = elf::validate_executable(module_bytes, machine).ok()?;
+    let bias = match kind
+    {
+        elf::ElfKind::Exec => 0,
+        elf::ElfKind::Dyn => choose_image_bias_or_default(),
+    };
+    let (span_min, span_end) = elf::load_span(ehdr, module_bytes).ok()?;
+    if kind == elf::ElfKind::Dyn
+    {
+        if !process_layout::validate_image_placement(bias, span_min, span_end)
+        {
+            return None;
+        }
+        // Load-bias observability: no ProcessInfo field carries the bias;
+        // debugging correlates through this line (in-process code uses
+        // __ehdr_start).
+        std::os::seraph::log!("procmgr: spawn image bias=0x{bias:x}");
+    }
+    let entry = elf::entry_point(ehdr).checked_add(bias)?;
+
+    // Locate and pre-validate the RELATIVE relocation table (ET_DYN only; an
+    // ET_EXEC image is fully linked and any vestigial table is ignored).
+    let rela = if kind == elf::ElfKind::Dyn
+    {
+        elf::rela_table(ehdr, module_bytes).ok()?
+    }
+    else
+    {
+        None
+    };
+    let total_relocs = match rela
+    {
+        Some(t) =>
+        {
+            let table =
+                module_bytes.get(t.file_offset as usize..(t.file_offset + t.size) as usize)?;
+            validate_relocs_slice(table, machine, span_min, span_end)?
+        }
+        None => 0,
+    };
+
     let stack_pages = elf::parse_stack_note(ehdr, module_bytes)
         .unwrap_or(DEFAULT_PROCESS_STACK_PAGES)
         .clamp(1, MAX_PROCESS_STACK_PAGES);
@@ -1230,6 +1456,7 @@ fn create_process_from_bytes(
 
     let child_memmgr_send = universals.memmgr_endpoint;
 
+    let mut applied_relocs = 0u64;
     for seg_result in elf::load_segments(ehdr, module_bytes)
     {
         let seg = seg_result.ok()?;
@@ -1239,31 +1466,50 @@ fn create_process_from_bytes(
         }
 
         let prot = segment_prot(&seg);
-        let first_page = seg.vaddr & !0xFFF;
-        let last_page_end = (seg.vaddr + seg.memsz + 0xFFF) & !0xFFF;
-        let num_pages = ((last_page_end - first_page) / PAGE_SIZE) as usize;
+        let seg_vaddr = seg.vaddr + bias;
+        let first_page = seg_vaddr & !0xFFF;
+        let last_page_end = (seg_vaddr + seg.memsz + 0xFFF) & !0xFFF;
+        let num_pages = (last_page_end - first_page) / PAGE_SIZE;
         let file_data = &module_bytes[seg.offset as usize..(seg.offset + seg.filesz) as usize];
+        let dest_offset = (seg_vaddr - first_page) as usize;
 
-        for page_idx in 0..num_pages
-        {
-            let page_vaddr = first_page + (page_idx as u64) * PAGE_SIZE;
-            loader::load_elf_page(
-                page_vaddr,
-                seg.vaddr,
-                file_data,
-                prot,
-                self_aspace,
-                child_aspace,
-                child_memmgr_send,
-                ipc_buf,
-            )?;
-        }
+        loader::load_elf_segment_into_child(
+            first_page,
+            num_pages,
+            prot,
+            self_aspace,
+            child_aspace,
+            child_memmgr_send,
+            ipc_buf,
+            |buf| {
+                let copy_len = file_data.len().min(seg.memsz as usize);
+                buf[dest_offset..dest_offset + copy_len].copy_from_slice(&file_data[..copy_len]);
+                if let Some(t) = rela
+                {
+                    let table =
+                        &module_bytes[t.file_offset as usize..(t.file_offset + t.size) as usize];
+                    let span = &mut buf[dest_offset..dest_offset + seg.memsz as usize];
+                    applied_relocs +=
+                        apply_relocs_in_slice_table(table, machine, bias, seg.vaddr, span);
+                }
+            },
+        )
+        .ok()?;
+    }
+    // Every pre-validated record must have landed in exactly one segment;
+    // a shortfall means a target in a gap between segments.
+    if applied_relocs != total_relocs
+    {
+        std::os::seraph::log!(
+            "procmgr: reloc application mismatch applied={applied_relocs} expected={total_relocs}"
+        );
+        return None;
     }
 
     let tls_seg = elf::tls_segment(ehdr, module_bytes).ok()?;
     let tls_template = tls_seg
         .map(|s| ChildTlsTemplate {
-            vaddr: s.vaddr,
+            vaddr: s.vaddr + bias,
             filesz: s.filesz,
             memsz: s.memsz,
             align: s.align,
@@ -1287,6 +1533,17 @@ fn create_process_from_bytes(
             child_memmgr_send,
             ipc_buf,
             &layout,
+            |template| {
+                // Re-apply the .tdata-targeting relocations to this
+                // independent copy; the image copy was relocated (and
+                // counted) during segment loading.
+                if let Some(t) = rela
+                {
+                    let table =
+                        &module_bytes[t.file_offset as usize..(t.file_offset + t.size) as usize];
+                    let _ = apply_relocs_in_slice_table(table, machine, bias, seg.vaddr, template);
+                }
+            },
         )?
     }
     else
@@ -1688,73 +1945,42 @@ impl Drop for CapGuard
 
 // ── VFS-based ELF loading ──────────────────────────────────────────────────
 
-/// Everything `load_elf_page_streaming` needs beyond the per-page arguments:
-/// the VFS file handle, IPC buffer, parent/child address spaces, and the
-/// child's badged SEND on memmgr (so memory caps are billed to the child).
+/// Everything `stream_segment_bytes` needs beyond the per-segment arguments:
+/// the VFS file handle, IPC buffer, and procmgr's own address space (for the
+/// transient cache-page scratch mappings).
 pub struct ElfLoadCtx
 {
     pub file_cap: u32,
     pub ipc_buf: *mut u64,
     pub self_aspace: u32,
-    pub child_aspace: u32,
-    pub child_memmgr_send: u32,
 }
 
-/// Load one ELF segment page by streaming file data from VFS.
+/// Stream segment file data from VFS into the segment's scratch span.
 ///
-/// Thin wrapper over [`loader::load_elf_page_into_child`] supplying the VFS
-/// stream fill. On failure returns the core's `procmgr_errors::*` code
-/// distinguishing allocation, mapping, and rights-derivation failures.
-fn load_elf_page_streaming(
-    page_vaddr: u64,
-    seg: &elf::LoadSegment,
-    prot: u64,
-    ctx: &ElfLoadCtx,
-) -> Result<(), u64>
-{
-    loader::load_elf_page_into_child(
-        page_vaddr,
-        prot,
-        ctx.self_aspace,
-        ctx.child_aspace,
-        ctx.child_memmgr_send,
-        ctx.ipc_buf,
-        |scratch_va| stream_segment_to_memory(scratch_va, page_vaddr, seg, ctx),
-    )
-}
-
-/// Stream segment file data from VFS into the memory cap mapped at `scratch_va`.
+/// `dest_offset` is the segment's byte offset within `buf` (its in-page
+/// offset on the first page of the span). Issues `FS_READ_MEMORY` requests
+/// at the current file offset, mapping the returned cache-page Memory cap
+/// read-only into a scratch VA, then memcpys the valid slice into the span.
+/// The memory cap is the caller's grandchild of fs's cache slot —
+/// `cap_delete` (via the `ScratchMapping` `owns_cap` slot) drops the
+/// caller's reference. fs holds the underlying cache-slot refcount until
+/// `FS_CLOSE` (pre-Phase-9) or until cooperative `FS_RELEASE_MEMORY` lands.
 ///
-/// Issues `FS_READ_MEMORY` requests at the current file offset, mapping
-/// the returned cache-page Memory cap read-only into a scratch VA, then memcpys
-/// the requested slice into the child's destination page. The memory cap is
-/// the caller's grandchild of fs's cache slot — `cap_delete` (via the
-/// `ScratchMapping` `owns_cap` slot) drops the caller's reference. fs
-/// holds the underlying cache-slot refcount until `FS_CLOSE` (pre-Phase-9)
-/// or until cooperative `FS_RELEASE_MEMORY` lands.
-fn stream_segment_to_memory(
-    scratch_va: u64,
-    page_vaddr: u64,
+/// Infallible by contract with the loader's `fill`: a failed read leaves the
+/// tail zeroed (the child then rejects at the applied-count check or crashes
+/// in a diagnosable way, matching the previous per-page behaviour).
+fn stream_segment_bytes(
+    buf: &mut [u8],
+    dest_offset: usize,
     seg: &elf::LoadSegment,
     ctx: &ElfLoadCtx,
 )
 {
-    let copy_start_va = page_vaddr.max(seg.vaddr);
-    let copy_end_va = (page_vaddr + PAGE_SIZE).min(seg.vaddr + seg.filesz);
-
-    if copy_start_va >= copy_end_va
-    {
-        return;
-    }
-
-    let dest_offset = (copy_start_va - page_vaddr) as usize;
-    let file_offset = seg.offset + (copy_start_va - seg.vaddr);
-    let bytes_to_read = (copy_end_va - copy_start_va) as usize;
-
+    let total = (seg.filesz.min(seg.memsz)) as usize;
     let mut copied = 0usize;
-    while copied < bytes_to_read
+    while copied < total
     {
-        let cur = file_offset + copied as u64;
+        let cur = seg.offset + copied as u64;
 
         let Some((memory_cap, bytes_valid, memory_data_offset, cookie)) =
             vfs_read_memory(ctx.file_cap, ctx.ipc_buf, cur)
@@ -1773,23 +1999,18 @@ fn stream_segment_to_memory(
         };
         mapping.set_owns_cap(memory_cap);
 
-        let chunk_len = bytes_valid.min(bytes_to_read - copied);
+        let chunk_len = bytes_valid.min(total - copied);
 
-        // SAFETY:
-        // - `mapping.va()` covers PAGE_SIZE bytes mapped read-only.
-        // - `memory_data_offset + chunk_len ≤ PAGE_SIZE` because
-        //   `memory_data_offset + bytes_valid ≤ PAGE_SIZE` is a fatfs
-        //   invariant and `chunk_len ≤ bytes_valid`.
-        // - `dest_offset + copied + chunk_len ≤ PAGE_SIZE` because
-        //   `dest_offset + bytes_to_read ≤ PAGE_SIZE` is enforced by the
-        //   `copy_start_va`/`copy_end_va` clamp to `[page_vaddr, page_vaddr + PAGE_SIZE)`.
-        unsafe {
-            core::ptr::copy_nonoverlapping(
+        // SAFETY: `mapping.va()` covers PAGE_SIZE bytes mapped read-only;
+        // `memory_data_offset + bytes_valid ≤ PAGE_SIZE` is a fatfs invariant
+        // and `chunk_len ≤ bytes_valid`.
+        let src = unsafe {
+            core::slice::from_raw_parts(
                 (mapping.va() as *const u8).add(memory_data_offset),
-                (scratch_va as *mut u8).add(dest_offset + copied),
                 chunk_len,
-            );
-        }
+            )
+        };
+        buf[dest_offset + copied..dest_offset + copied + chunk_len].copy_from_slice(src);
         drop(mapping);
         vfs_release_memory(ctx.file_cap, ctx.ipc_buf, cookie);
         copied += chunk_len;
@@ -1910,41 +2131,71 @@ pub fn create_process_from_file(
     // Parse ELF headers from the header page.
     // SAFETY: hdr_va is mapped and contains `offset` bytes of file data.
     let header_data = unsafe { core::slice::from_raw_parts(hdr_va as *const u8, offset as usize) };
-    let ehdr = elf::validate(header_data, crate::arch::current::EXPECTED_ELF_MACHINE)
-        .map_err(|_| procmgr_errors::INVALID_ELF)?;
-    let entry = elf::entry_point(ehdr);
+    let machine = crate::arch::current::EXPECTED_ELF_MACHINE;
+    let (ehdr, kind) =
+        elf::validate_executable(header_data, machine).map_err(|_| procmgr_errors::INVALID_ELF)?;
+    let bias = match kind
+    {
+        elf::ElfKind::Exec => 0,
+        elf::ElfKind::Dyn => choose_image_bias_or_default(),
+    };
+    let (span_min, span_end) =
+        elf::load_span(ehdr, header_data).map_err(|_| procmgr_errors::INVALID_ELF)?;
+    if kind == elf::ElfKind::Dyn
+    {
+        if !process_layout::validate_image_placement(bias, span_min, span_end)
+        {
+            return Err(procmgr_errors::INVALID_ELF);
+        }
+        // Load-bias observability: no ProcessInfo field carries the bias;
+        // debugging correlates through this line (in-process code uses
+        // __ehdr_start).
+        std::os::seraph::log!("procmgr: spawn image bias=0x{bias:x}");
+    }
+    let entry = elf::entry_point(ehdr)
+        .checked_add(bias)
+        .ok_or(procmgr_errors::INVALID_ELF)?;
+
+    // Locate and pre-validate the RELATIVE relocation table (ET_DYN only; an
+    // ET_EXEC image is fully linked and any vestigial table is ignored).
+    let rela = if kind == elf::ElfKind::Dyn
+    {
+        elf::rela_table_metadata(ehdr, header_data, file_size, |off, dst| {
+            vfs_read_exact(file_cap.cap(), ipc_buf, off, dst)
+        })
+        .map_err(|_| procmgr_errors::INVALID_ELF)?
+    }
+    else
+    {
+        None
+    };
+    let total_relocs = match &rela
+    {
+        Some(t) =>
+        {
+            let mut in_span = true;
+            let count = walk_relocs_streaming(
+                t,
+                machine,
+                |off, dst| vfs_read_exact(file_cap.cap(), ipc_buf, off, dst),
+                |r| in_span &= reloc_target_in_span(r, span_min, span_end),
+            )
+            .ok_or(procmgr_errors::INVALID_ELF)?;
+            if !in_span
+            {
+                return Err(procmgr_errors::INVALID_ELF);
+            }
+            count
+        }
+        None => 0,
+    };
 
     // Parse the optional stack-size note. Section headers and the note
     // section are fetched on demand via `vfs_read`; the helper hands a
     // closure that drives the same primitive used to stream `PT_LOAD`
     // pages, so no extra IPC machinery is involved.
     let stack_pages = elf::parse_stack_note_streaming(ehdr, file_size, |off, dst| {
-        // SAFETY: dst is a caller-supplied mutable byte buffer.
-        let mut tmp = [0u8; VFS_CHUNK_SIZE as usize];
-        let mut total = 0usize;
-        while total < dst.len()
-        {
-            let want = (dst.len() - total).min(VFS_CHUNK_SIZE as usize);
-            let bytes_read = vfs_read(
-                file_cap.cap(),
-                ipc_buf,
-                off + total as u64,
-                want as u64,
-                &mut tmp[..want],
-            )?;
-            if bytes_read == 0
-            {
-                break;
-            }
-            let copy_len = bytes_read.min(want);
-            dst[total..total + copy_len].copy_from_slice(&tmp[..copy_len]);
-            total += copy_len;
-            if bytes_read < want
-            {
-                break;
-            }
-        }
-        Some(total)
+        vfs_read_exact(file_cap.cap(), ipc_buf, off, dst)
     })
     .unwrap_or(DEFAULT_PROCESS_STACK_PAGES)
     .clamp(1, MAX_PROCESS_STACK_PAGES);
@@ -1997,7 +2248,8 @@ pub fn create_process_from_file(
     // its own refcount on the underlying retyped region.
     let child_objs = ChildKernelObjects::new(child_aspace, child_cspace, child_thread);
 
-    // Stream each LOAD segment page-by-page from VFS.
+    // Stream each LOAD segment from VFS at segment granularity.
+    let mut applied_relocs = 0u64;
     for seg_result in elf::load_segments_metadata(ehdr, header_data, file_size)
     {
         let seg = seg_result.map_err(|_| procmgr_errors::INVALID_ELF)?;
@@ -2007,22 +2259,50 @@ pub fn create_process_from_file(
         }
 
         let prot = segment_prot(&seg);
-        let first_page = seg.vaddr & !0xFFF;
-        let last_page_end = (seg.vaddr + seg.memsz + 0xFFF) & !0xFFF;
-        let num_pages = ((last_page_end - first_page) / PAGE_SIZE) as usize;
+        let seg_vaddr = seg.vaddr + bias;
+        let first_page = seg_vaddr & !0xFFF;
+        let last_page_end = (seg_vaddr + seg.memsz + 0xFFF) & !0xFFF;
+        let num_pages = (last_page_end - first_page) / PAGE_SIZE;
+        let dest_offset = (seg_vaddr - first_page) as usize;
+        let load_ctx = ElfLoadCtx {
+            file_cap: file_cap.cap(),
+            ipc_buf,
+            self_aspace,
+        };
 
-        for page_idx in 0..num_pages
-        {
-            let page_vaddr = first_page + (page_idx as u64) * PAGE_SIZE;
-            let load_ctx = ElfLoadCtx {
-                file_cap: file_cap.cap(),
-                ipc_buf,
-                self_aspace,
-                child_aspace: child_objs.aspace(),
-                child_memmgr_send: mms.cap(),
-            };
-            load_elf_page_streaming(page_vaddr, &seg, prot, &load_ctx)?;
-        }
+        loader::load_elf_segment_into_child(
+            first_page,
+            num_pages,
+            prot,
+            self_aspace,
+            child_objs.aspace(),
+            mms.cap(),
+            ipc_buf,
+            |buf| {
+                stream_segment_bytes(buf, dest_offset, &seg, &load_ctx);
+                if let Some(t) = &rela
+                {
+                    let span = &mut buf[dest_offset..dest_offset + seg.memsz as usize];
+                    // A read failure mid-walk leaves records unapplied; the
+                    // applied-count check below then rejects the spawn.
+                    let _ = walk_relocs_streaming(
+                        t,
+                        machine,
+                        |off, dst| vfs_read_exact(load_ctx.file_cap, load_ctx.ipc_buf, off, dst),
+                        |r| applied_relocs += apply_reloc_in_span(r, bias, seg.vaddr, span),
+                    );
+                }
+            },
+        )?;
+    }
+    // Every pre-validated record must have landed in exactly one segment;
+    // a shortfall means a target in a gap between segments or a lost read.
+    if applied_relocs != total_relocs
+    {
+        std::os::seraph::log!(
+            "procmgr: reloc application mismatch applied={applied_relocs} expected={total_relocs}"
+        );
+        return Err(procmgr_errors::INVALID_ELF);
     }
 
     // Extract PT_TLS metadata before closing the file — we may need another
@@ -2031,7 +2311,7 @@ pub fn create_process_from_file(
         .map_err(|_| procmgr_errors::INVALID_ELF)?;
     let tls_template = tls_seg
         .map(|s| ChildTlsTemplate {
-            vaddr: s.vaddr,
+            vaddr: s.vaddr + bias,
             filesz: s.filesz,
             memsz: s.memsz,
             align: s.align,
@@ -2054,6 +2334,22 @@ pub fn create_process_from_file(
             mms.cap(),
             ipc_buf,
             &layout,
+            |template| {
+                // Re-apply the .tdata-targeting relocations to this
+                // independent copy; the image copy was relocated (and
+                // counted) during segment loading.
+                if let Some(t) = &rela
+                {
+                    let _ = walk_relocs_streaming(
+                        t,
+                        machine,
+                        |off, dst| vfs_read_exact(file_cap.cap(), ipc_buf, off, dst),
+                        |r| {
+                            let _ = apply_reloc_in_span(r, bias, seg.vaddr, template);
+                        },
+                    );
+                }
+            },
         )
         .ok_or(procmgr_errors::OUT_OF_MEMORY)?
     }

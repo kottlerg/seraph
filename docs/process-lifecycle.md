@@ -286,8 +286,11 @@ After bootstrap, every process is created by procmgr. The flow:
 1. **Caller IPC.** A service (init, svcmgr, devmgr, vfsd) sends
    `CREATE_PROCESS` (or `CREATE_PROCESS_FROM_VFS`) to procmgr.
 2. **Procmgr ELF load.** Procmgr maps the ELF source, parses headers,
-   and computes the segment layout. ELF-load scratch frames come from
-   procmgr's own heap (backed by memmgr).
+   draws the image load bias, and computes the segment layout, applying
+   the image's relocations while segments are staged (PIE; see
+   [userspace-memory-model.md](userspace-memory-model.md) "Image
+   Placement"). ELF-load scratch frames come from procmgr's own heap
+   (backed by memmgr).
 3. **Procmgr → memmgr.** Procmgr calls `memmgr.REGISTER_PROCESS` and
    receives a badged SEND cap identifying the new process.
 4. **Procmgr kernel-object allocation.** Procmgr creates the new

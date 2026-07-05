@@ -211,6 +211,33 @@ draw windows and the degraded-fallback `DEFAULT_*` addresses live in
 See [`process-lifecycle.md`](process-lifecycle.md) for the full
 handover discipline.
 
+### Image Placement
+
+Userspace binaries are position-independent executables (`ET_DYN`; the
+kernel image alone stays static — KASLR is
+[#252](https://github.com/kottlerg/seraph/issues/252)). The creator
+draws a load bias per spawn from a fixed window of 2²³ page-aligned
+slots above `0x30_0000_0000` (23 bits of entropy; ASLR,
+[#39](https://github.com/kottlerg/seraph/issues/39)) — procmgr for its
+children, init for memmgr and procmgr, the kernel for init itself — and
+applies the image's `RELATIVE` relocations while the segments are
+staged, before the process exists. Placement is validated before
+loading: the biased span must fit the window's 1 GiB image budget and
+stay below the user half. A failed entropy draw degrades to the window
+base (never bias 0), keeping the single relocation path; loaders reject
+any relocation format other than the architecture's `RELATIVE` type,
+and every table record must land in exactly one loaded segment.
+
+`ET_EXEC` images remain accepted and load at their link VAs with bias
+0 and no relocations — loader compatibility, not a build target.
+
+The bias is deliberately not a `ProcessInfo` field. A process that
+needs its own base reads the lld-synthesized `__ehdr_start` symbol's
+address; debugging correlates through the creator's spawn log line
+(procmgr: `spawn image bias=0x…`; init: `init: <svc> image bias=0x…`;
+kernel Phase 9: `init: PIE bias=0x…`) and loads symbols with
+`add-symbol-file <binary> -o <bias>` in GDB.
+
 ---
 
 ## Memory Allocation Contract

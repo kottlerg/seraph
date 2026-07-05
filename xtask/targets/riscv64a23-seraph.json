@@ -13,12 +13,23 @@
     "panic-strategy": "abort",
     "features": "+m,+a,+f,+d,+c,+v,+zba,+zbb,+zbs",
     "code-model": "medium",
-    "relocation-model": "static",
+    "relocation-model": "pic",
     "llvm-abiname": "lp64d",
     "max-atomic-width": 64,
     "has-thread-local": true,
+    "tls-model": "local-exec",
+    "position-independent-executables": true,
+    "static-position-independent-executables": true,
+    "plt-by-default": false,
     "pre-link-args": {
-        "ld.lld": ["--gc-sections"]
+        "ld.lld": [
+            "--gc-sections",
+            "-pie",
+            "--no-dynamic-linker",
+            "-z", "norelro",
+            "-Bsymbolic",
+            "-z", "max-page-size=4096"
+        ]
     },
     "emit-debug-gdb-scripts": false
 }

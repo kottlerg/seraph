@@ -17,10 +17,18 @@
     "static-position-independent-executables": true,
     "plt-by-default": false,
     "has-thread-local": true,
-    "code-model": "kernel",
-    "relocation-model": "static",
+    "tls-model": "local-exec",
+    "code-model": "small",
+    "relocation-model": "pic",
     "pre-link-args": {
-        "ld.lld": ["--gc-sections"]
+        "ld.lld": [
+            "--gc-sections",
+            "-pie",
+            "--no-dynamic-linker",
+            "-z", "norelro",
+            "-Bsymbolic",
+            "-z", "max-page-size=4096"
+        ]
     },
     "emit-debug-gdb-scripts": false
 }

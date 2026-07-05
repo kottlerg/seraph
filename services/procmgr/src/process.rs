@@ -1106,7 +1106,11 @@ where
 }
 
 /// Fill `dst` from file offset `off` via bounded `FS_READ` chunks. Returns
-/// the number of bytes copied (short only at EOF or on a short fs read).
+/// the number of bytes copied (short only at EOF).
+///
+/// A single `FS_READ` may return fewer bytes than asked — fatfs stops at
+/// sector boundaries — so short reads continue the loop; only a zero read
+/// (end of file) stops it.
 fn vfs_read_exact(file_cap: u32, ipc_buf: *mut u64, off: u64, dst: &mut [u8]) -> Option<usize>
 {
     let mut tmp = [0u8; VFS_CHUNK_SIZE as usize];
@@ -1128,10 +1132,6 @@ fn vfs_read_exact(file_cap: u32, ipc_buf: *mut u64, off: u64, dst: &mut [u8]) ->
         let copy_len = bytes_read.min(want);
         dst[total..total + copy_len].copy_from_slice(&tmp[..copy_len]);
         total += copy_len;
-        if bytes_read < want
-        {
-            break;
-        }
     }
     Some(total)
 }

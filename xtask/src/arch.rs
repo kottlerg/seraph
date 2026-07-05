@@ -27,11 +27,10 @@ pub enum Arch
 
 impl Arch
 {
-    /// Rust target triple for the kernel and low-level userspace binaries.
+    /// Rust target triple for the kernel.
     ///
-    /// Used by the kernel itself and for userspace components that bootstrap
-    /// std (init, procmgr) or that deliberately stay on core+alloc (ktest).
-    /// `"os": "none"` on this triple — std is not available.
+    /// `"os": "none"`, `relocation-model: static` — the kernel is the one
+    /// image that stays fixed-address (KASLR is #252).
     pub fn kernel_target_triple(self) -> &'static str
     {
         match self
@@ -41,9 +40,24 @@ impl Arch
         }
     }
 
+    /// Rust target triple for low-level (no-std) userspace binaries: init,
+    /// ktest, memmgr.
+    ///
+    /// A PIE copy of `kernel_target_triple`'s spec (`relocation-model: pic`,
+    /// `ET_DYN` output) so these images load at a randomized base (#39)
+    /// while the kernel target itself stays static.
+    pub fn lowlevel_user_target_triple(self) -> &'static str
+    {
+        match self
+        {
+            Arch::X86_64 => "x86_64-seraph-lowuser",
+            Arch::Riscv64 => "riscv64imac-seraph-lowuser",
+        }
+    }
+
     /// Rust target triple for std-enabled userspace binaries.
     ///
-    /// Distinct from `kernel_target_triple` because `"os": "seraph"` enables
+    /// Distinct from the no-std triples because `"os": "seraph"` enables
     /// `std::sys::seraph` via `-Z build-std`. Services compiled against this
     /// triple depend on the patched rust-src tree materialised by xtask.
     pub fn user_target_triple(self) -> &'static str

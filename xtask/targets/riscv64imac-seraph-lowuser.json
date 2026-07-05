@@ -1,0 +1,32 @@
+{
+    "llvm-target": "riscv64-unknown-none-elf",
+    "data-layout": "e-m:e-p:64:64-i64:64-i128:128-n32:64-S128",
+    "arch": "riscv64",
+    "target-endian": "little",
+    "target-pointer-width": 64,
+    "target-c-int-width": 32,
+    "os": "none",
+    "executables": true,
+    "linker-flavor": "ld.lld",
+    "linker": "rust-lld",
+    "panic-strategy": "abort",
+    "features": "+m,+a,+c",
+    "code-model": "medium",
+    "relocation-model": "pic",
+    "llvm-abiname": "lp64",
+    "max-atomic-width": 64,
+    "position-independent-executables": true,
+    "static-position-independent-executables": true,
+    "plt-by-default": false,
+    "pre-link-args": {
+        "ld.lld": [
+            "--gc-sections",
+            "-pie",
+            "--no-dynamic-linker",
+            "-z", "norelro",
+            "-Bsymbolic",
+            "-z", "max-page-size=4096"
+        ]
+    },
+    "emit-debug-gdb-scripts": false
+}

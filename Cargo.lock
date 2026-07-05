@@ -566,6 +566,7 @@ name = "kernel"
 version = "0.1.1"
 dependencies = [
  "boot-protocol",
+ "elf",
  "font",
  "init-protocol",
  "mmio",
@@ -858,6 +859,10 @@ dependencies = [
  "syscall",
  "syscall-abi",
 ]
+
+[[package]]
+name = "relrofault"
+version = "0.1.1"
 
 [[package]]
 name = "rustc-std-workspace-core"

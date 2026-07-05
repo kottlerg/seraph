@@ -61,6 +61,7 @@ members = [
     "programs/shell/path",
     "programs/shell/tester",
     "programs/stackoverflow",
+    "programs/relrofault",
     "programs/stdiotest",
     "programs/stdiotest/tester",
     "programs/terminal",
@@ -96,6 +97,7 @@ expect_used                      = "deny"
 [workspace.dependencies]
 ansi = { path = "shared/ansi" }
 boot-protocol = { path = "abi/boot-protocol" }
+elf = { path = "shared/elf" }
 init-protocol = { path = "abi/init-protocol" }
 process-abi = { path = "abi/process-abi" }
 process-layout = { path = "shared/process-layout" }

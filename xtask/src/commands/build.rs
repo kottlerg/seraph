@@ -336,6 +336,13 @@ const SPECS: &[Spec] = &[
         arch_only: None,
     },
     Spec {
+        name: "relrofault",
+        install_name: None,
+        profile: BuildProfile::StdUser,
+        dest: InstallDest::Programs,
+        arch_only: None,
+    },
+    Spec {
         name: "capexhaust",
         install_name: None,
         profile: BuildProfile::StdUser,
@@ -446,6 +453,7 @@ fn spec_for(component: BuildComponent) -> Option<&'static Spec>
         BuildComponent::Shell => "shell",
         BuildComponent::ShellTester => "shell-tester",
         BuildComponent::Stackoverflow => "stackoverflow",
+        BuildComponent::Relrofault => "relrofault",
         BuildComponent::Capexhaust => "capexhaust",
         BuildComponent::Pipefault => "pipefault",
         BuildComponent::Demandpaged => "demandpaged",
@@ -827,8 +835,13 @@ fn profile_params(arch: Arch, profile: BuildProfile) -> (&'static str, &'static 
 {
     match profile
     {
-        BuildProfile::Kernel | BuildProfile::LowLevelUser => (
+        BuildProfile::Kernel => (
             arch.kernel_target_triple(),
+            "core,alloc,compiler_builtins",
+            false,
+        ),
+        BuildProfile::LowLevelUser => (
+            arch.lowlevel_user_target_triple(),
             "core,alloc,compiler_builtins",
             false,
         ),

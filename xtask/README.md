@@ -39,7 +39,7 @@ cargo xtask run [--arch x86_64|riscv64] [--gdb] [--headless] [--verbose] [--cpus
 | Option | Description |
 |---|---|
 | `--arch` | Target architecture (default: `x86_64`) |
-| `--gdb` | Start QEMU with a GDB server on localhost:1234; QEMU pauses at startup |
+| `--gdb` | Start QEMU with a GDB server on localhost:1234; QEMU pauses at startup. Userspace binaries are PIE with a per-spawn randomized base (ASLR, #39): take the bias from the creator's log line (procmgr `spawn image bias=0x…`, init `init: <svc> image bias=0x…`, kernel `init: PIE bias=0x…`) and load symbols with `add-symbol-file <binary> -o <bias>` |
 | `--headless` | Run without a display window (`-display none`) |
 | `--verbose` | Show all serial output; by default output is filtered until `[--------] boot:` appears |
 | `--cpus` | Number of vCPUs to expose to the guest (default: `4`; bounded by `1..=512`, the boot-protocol `MAX_CPUS` the kernel sizes its per-CPU structures from) |

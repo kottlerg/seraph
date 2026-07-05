@@ -13,6 +13,7 @@
 pub mod address_space;
 pub mod buddy;
 pub mod init;
+pub mod init_reloc;
 pub mod kernel_pt_pool;
 pub mod paging;
 pub mod tag_allocator;

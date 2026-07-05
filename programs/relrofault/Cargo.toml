@@ -1,14 +1,13 @@
 [package]
-name = "elf"
+name = "relrofault"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
-[lib]
-doctest = false
-
-[dependencies]
-process-abi = { path = "../../abi/process-abi" }
+[[bin]]
+name = "relrofault"
+path = "src/main.rs"
+test = false
 
 [lints]
 workspace = true

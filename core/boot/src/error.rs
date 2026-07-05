@@ -68,6 +68,9 @@ impl From<elf::ElfError> for BootError
             elf::ElfError::NoSegments => "ELF has no program headers",
             elf::ElfError::PhdrTableOverflow => "program header table extends beyond end of file",
             elf::ElfError::SegmentOverflow => "LOAD segment file data extends beyond end of file",
+            elf::ElfError::MalformedDynamic => "PT_DYNAMIC or .rela.dyn table is malformed",
+            elf::ElfError::UnsupportedRelocation => "image carries relocations other than RELATIVE",
+            elf::ElfError::RelocOutOfBounds => "relocation target outside loaded segments",
         };
         BootError::InvalidElf(s)
     }

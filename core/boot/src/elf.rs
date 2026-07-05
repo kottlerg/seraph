@@ -333,6 +333,11 @@ pub unsafe fn load_kernel(
 ///   `InitSegment.phys_addr = phys_base + (p_vaddr & 0xFFF)`
 ///   `InitSegment.virt_addr = p_vaddr`
 ///
+/// Both `ET_EXEC` and `ET_DYN` init images are accepted. For `ET_DYN` the
+/// image is flagged PIE and its `.rela.dyn` table is pre-located
+/// (`rela_phys`/`rela_size`); segment `virt_addr`s stay unbiased link VAs —
+/// the kernel draws the load bias and applies the relocations (#39).
+///
 /// # Errors
 ///
 /// - `BootError::OutOfMemory` if any segment's physical allocation fails.
@@ -343,6 +348,10 @@ pub unsafe fn load_kernel(
 ///
 /// `bs` must be a valid pointer to UEFI boot services and boot services must
 /// not yet have been exited.
+// too_many_lines: one linear pre-parse pass (validate, per-segment
+// allocate/copy/zero, PIE table + RELRO location); splitting would thread
+// the segment array and UEFI handle through every helper.
+#[allow(clippy::too_many_lines)]
 pub unsafe fn load_init(
     bs: *mut crate::uefi::EfiBootServices,
     data: &[u8],
@@ -351,7 +360,7 @@ pub unsafe fn load_init(
 {
     use boot_protocol::{INIT_MAX_SEGMENTS, InitImage, InitSegment, SegmentFlags};
 
-    let ehdr = elf::validate(data, expected_machine)?;
+    let (ehdr, kind) = elf::validate_executable(data, expected_machine)?;
 
     let mut segments = [InitSegment {
         phys_addr: 0,
@@ -447,13 +456,64 @@ pub unsafe fn load_init(
         return Err(BootError::InvalidElf("init ELF has no PT_LOAD segments"));
     }
 
+    // PIE init (#39): pre-locate the `.rela.dyn` table and resolve its
+    // physical address through the loaded segment bytes, so the kernel can
+    // apply the relocations without an ELF parser. The bias itself is the
+    // kernel's choice — the bootloader has no entropy source on riscv64.
+    // The `PT_GNU_RELRO` span rides along (unbiased link VAs) so the kernel
+    // can map the covered pages read-only after relocation.
+    let (flags, rela_phys, rela_size, relro_vaddr, relro_size) = match kind
+    {
+        elf::ElfKind::Exec => (0, 0, 0, 0, 0),
+        elf::ElfKind::Dyn =>
+        {
+            let (rela_phys, rela_size) = match elf::rela_table(ehdr, data)?
+            {
+                Some(table) =>
+                {
+                    let phys = rela_phys_for(&segments[..count], &table).ok_or(
+                        BootError::InvalidElf(".rela.dyn not covered by a loaded segment"),
+                    )?;
+                    (phys, table.size)
+                }
+                None => (0, 0),
+            };
+            let (relro_vaddr, relro_size) = elf::relro_span(ehdr, data).unwrap_or((0, 0));
+            (
+                boot_protocol::INIT_IMAGE_FLAG_PIE,
+                rela_phys,
+                rela_size,
+                relro_vaddr,
+                relro_size,
+            )
+        }
+    };
+
     // count ≤ INIT_MAX_SEGMENTS (≤ 8), well within u32 range.
     #[allow(clippy::cast_possible_truncation)]
     Ok(InitImage {
         entry_point: elf::entry_point(ehdr),
         segments,
         segment_count: count as u32,
+        flags,
+        rela_phys,
+        rela_size,
+        relro_vaddr,
+        relro_size,
     })
+}
+
+/// Resolve the physical address of the `.rela.dyn` table through the loaded
+/// segment containing it. `load_init` preserves each segment's in-page
+/// offset (`phys_addr & 0xFFF == virt_addr & 0xFFF`) and copies file bytes
+/// at `phys_addr`, so the table bytes live at the same linear displacement.
+fn rela_phys_for(segments: &[boot_protocol::InitSegment], table: &elf::RelaTable) -> Option<u64>
+{
+    let end = table.vaddr.checked_add(table.size)?;
+    segments
+        .iter()
+        .find(|seg| table.vaddr >= seg.virt_addr && end <= seg.virt_addr + seg.size)
+        .map(|seg| seg.phys_addr + (table.vaddr - seg.virt_addr))
 }
 
 // Boot modules are exposed in place by referencing the single bundle UEFI
@@ -565,5 +625,52 @@ mod tests
     fn entry_outside_all_segments_is_rejected()
     {
         assert!(validate_kernel_layout(&contiguous_layout(), VBASE + 0x10000).is_err());
+    }
+
+    // ── rela_phys_for ────────────────────────────────────────────────────────
+
+    fn init_seg(virt: u64, phys: u64, size: u64) -> boot_protocol::InitSegment
+    {
+        boot_protocol::InitSegment {
+            phys_addr: phys,
+            virt_addr: virt,
+            size,
+            flags: boot_protocol::SegmentFlags::ReadWrite,
+        }
+    }
+
+    #[test]
+    fn rela_phys_resolves_through_containing_segment()
+    {
+        let segs = [
+            init_seg(0x0, 0x10_0000, 0x2000),
+            init_seg(0x2000, 0x20_0000, 0x2000),
+        ];
+        let table = elf::RelaTable {
+            vaddr: 0x2400,
+            file_offset: 0x2400,
+            size: 0x120,
+        };
+        assert_eq!(rela_phys_for(&segs, &table), Some(0x20_0400));
+    }
+
+    #[test]
+    fn rela_phys_requires_full_containment()
+    {
+        let segs = [init_seg(0x2000, 0x20_0000, 0x2000)];
+        // Table straddles the segment end.
+        let table = elf::RelaTable {
+            vaddr: 0x3F00,
+            file_offset: 0x3F00,
+            size: 0x200,
+        };
+        assert_eq!(rela_phys_for(&segs, &table), None);
+        // Table entirely outside every segment.
+        let table = elf::RelaTable {
+            vaddr: 0x8000,
+            file_offset: 0x8000,
+            size: 0x30,
+        };
+        assert_eq!(rela_phys_for(&segs, &table), None);
     }
 }

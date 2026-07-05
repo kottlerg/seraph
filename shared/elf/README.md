@@ -2,11 +2,21 @@
 
 ELF64 parser for Seraph userspace components.
 
-`no_std`, no external dependencies. Provides header validation, segment
-enumeration, and permission mapping. Does not allocate or perform I/O.
+`no_std`, no external dependencies. Provides header validation (`ET_EXEC` and
+`ET_DYN` via `validate_executable`/`ElfKind`; `ET_EXEC`-only `validate` for
+the kernel-image path), `PT_LOAD` segment enumeration, `PT_TLS` and
+stack-note extraction, load-span computation, and `.rela.dyn` relocation
+support for position-independent executables: `rela_table` /
+`rela_table_metadata` locate the table through `PT_DYNAMIC`, and
+`relative_relocs` decodes its `RELATIVE` records for a loader to apply at a
+chosen load bias. Non-`RELATIVE` relocation formats are rejected, never
+skipped. Does not allocate or perform I/O; `*_metadata` variants stream via
+a caller-supplied reader holding only the ELF header page.
 
-Used by `init` (minimal ELF loader for procmgr) and `procmgr` (loads all other
-processes). No stability obligation; internal code reuse only.
+Used by `init` (loads memmgr and procmgr from boot modules), `procmgr`
+(loads all other processes), and the kernel (Phase 9 `RELATIVE` relocation
+of a PIE init via `mm/init_reloc`). No stability obligation; internal code
+reuse only.
 
 ---
 

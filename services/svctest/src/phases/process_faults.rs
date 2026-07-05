@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-//! Kernel process-fault surfaces (stack guard, future notification paths).
+//! Kernel process-fault surfaces (stack guard, RELRO seal, future
+//! notification paths).
 
 use std::os::seraph::startup_info;
 
@@ -10,10 +11,16 @@ use crate::runner::Phase;
 
 pub fn phases() -> &'static [Phase]
 {
-    &[Phase {
-        name: "stack_overflow",
-        run: stack_overflow_phase,
-    }]
+    &[
+        Phase {
+            name: "stack_overflow",
+            run: stack_overflow_phase,
+        },
+        Phase {
+            name: "relro_write",
+            run: relro_write_phase,
+        },
+    ]
 }
 
 // cast_sign_loss: ExitStatus::code() returns i32; exit_reason is always
@@ -72,4 +79,36 @@ pub fn stack_overflow_phase(_: &Caps)
     }
 
     std::os::seraph::log!("stack_overflow phase passed (exit_reason={raw:#x})");
+}
+
+/// `PT_GNU_RELRO` enforcement (#39): a write into `.data.rel.ro` must fault.
+/// The fixture writes through a pointer to a relocated static; a clean exit
+/// means the loader left the RELRO pages writable.
+// cast_sign_loss: see stack_overflow_phase.
+#[allow(clippy::cast_sign_loss)]
+pub fn relro_write_phase(_: &Caps)
+{
+    use std::process::Command;
+    use syscall::{EXIT_FAULT_BASE, EXIT_KILLED};
+
+    let mut child = Command::new("/programs/relrofault")
+        .spawn()
+        .expect("spawn /programs/relrofault failed");
+
+    let status = child.wait().expect("relrofault wait failed");
+    std::os::seraph::log!("relrofault exited: {status}");
+
+    assert!(
+        !status.success(),
+        "relrofault child exited cleanly — RELRO pages are writable: {status}"
+    );
+    let raw = status
+        .code()
+        .expect("relrofault ExitStatus must carry a code") as u64;
+    assert!(
+        (EXIT_FAULT_BASE..EXIT_KILLED).contains(&raw),
+        "expected fault exit_reason in 0x1000..0x2000, got {raw:#x}"
+    );
+
+    std::os::seraph::log!("relro_write phase passed (exit_reason={raw:#x})");
 }

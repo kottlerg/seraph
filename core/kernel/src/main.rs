@@ -539,6 +539,11 @@ unsafe fn kernel_entry_post_rebase(
             fatal("Phase 9: init image missing or has no entry point");
         }
 
+        // PIE init (#39): draw the load bias, relocate the image in place
+        // through the direct map, and bias the segment VAs and entry point.
+        // ET_EXEC images pass through untouched.
+        let init_image = pie_rebase_init_image(init_image);
+
         kprintln!(
             "init: {} segments entry={:#x}",
             init_image.segment_count,
@@ -1435,6 +1440,72 @@ pub(crate) fn fatal(msg: &str) -> !
 {
     kprintln!("FATAL: {}", msg);
     arch::current::cpu::halt_loop();
+}
+
+/// PIE init support (#39): when the bootloader flags init as `ET_DYN`, draw
+/// a load bias from the entropy pool (window-base fallback when unseeded —
+/// unreachable in practice, the pool seeds in Phase 5), validate the biased
+/// placement, apply the image's `RELATIVE` relocations through the direct
+/// map, and return the image with biased segment VAs and entry point.
+/// `ET_EXEC` images pass through untouched. Any relocation failure is
+/// fatal: an unrelocated init is corrupt, not degraded.
+#[cfg(not(test))]
+fn pie_rebase_init_image(mut image: boot_protocol::InitImage) -> boot_protocol::InitImage
+{
+    if image.flags & boot_protocol::INIT_IMAGE_FLAG_PIE == 0
+    {
+        return image;
+    }
+
+    let bias = if entropy::is_seeded()
+    {
+        let mut bytes = [0u8; 8];
+        entropy::fill_bytes(&mut bytes);
+        process_layout::choose_image_bias(u64::from_le_bytes(bytes))
+    }
+    else
+    {
+        kprintln!("init: entropy unseeded; image bias degraded to window base");
+        process_layout::IMAGE_WINDOW.base
+    };
+
+    let segments = &image.segments[..image.segment_count as usize];
+    let mut span_min = u64::MAX;
+    let mut span_end = 0u64;
+    for seg in segments
+    {
+        span_min = span_min.min(seg.virt_addr);
+        span_end = span_end.max(seg.virt_addr + seg.size);
+    }
+    if !process_layout::validate_image_placement(bias, span_min, span_end)
+    {
+        fatal("Phase 9: PIE init image placement invalid");
+    }
+
+    match mm::init_reloc::apply(segments, bias, image.rela_phys, image.rela_size)
+    {
+        Ok(count) => kprintln!("init: PIE bias={:#x} ({} relocations)", bias, count),
+        Err(msg) => fatal(msg),
+    }
+
+    for seg in &mut image.segments[..image.segment_count as usize]
+    {
+        seg.virt_addr += bias;
+    }
+    image.entry_point += bias;
+
+    // PT_GNU_RELRO: seal the relocated GOT / .data.rel.ro pages read-only.
+    if let Err(msg) = mm::init_reloc::apply_relro(
+        &mut image.segments,
+        &mut image.segment_count,
+        bias,
+        image.relro_vaddr,
+        image.relro_size,
+    )
+    {
+        fatal(msg);
+    }
+    image
 }
 
 // Kernel `.text` bounds (linker-provided) for the panic backtrace scan.

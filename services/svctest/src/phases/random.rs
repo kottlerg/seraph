@@ -8,8 +8,9 @@
 //! cross-process divergence, checked twice: a respawned child's per-process
 //! hash seed must differ from the parent's (proving the seed is a real
 //! per-process kernel draw, not a constant), and the child's bootstrap
-//! layout tuple must differ from the parent's (proving the creator draws
-//! each process's layout independently).
+//! layout tuple — stack, TLS, IPC buffer, and PIE image base — must differ
+//! from the parent's (proving the creator draws each process's layout and
+//! load bias independently).
 
 use std::collections::hash_map::RandomState;
 use std::hash::BuildHasher;
@@ -44,14 +45,30 @@ pub fn phases() -> &'static [Phase]
     ]
 }
 
+// lld-synthesized symbol at the ELF header — the image load base.
+unsafe extern "C" {
+    static __ehdr_start: u8;
+}
+
+/// This process's image load base (the creator's per-spawn bias draw).
+fn image_base() -> u64
+{
+    // Only the linker-synthesized symbol's address is taken, never its value.
+    core::ptr::addr_of!(__ehdr_start) as u64
+}
+
 /// The parent-visible bootstrap-layout tuple: stack top, main-TLS base, IPC
-/// buffer. Every component is an independent per-process window draw.
+/// buffer, image base. Every component is an independent per-process window
+/// draw.
 fn layout_fingerprint() -> String
 {
     let info = startup_info();
     format!(
-        "{:x}-{:x}-{:x}",
-        info.stack_top_vaddr, info.main_tls_vaddr, info.ipc_buffer as u64
+        "{:x}-{:x}-{:x}-{:x}",
+        info.stack_top_vaddr,
+        info.main_tls_vaddr,
+        info.ipc_buffer as u64,
+        image_base()
     )
 }
 
@@ -134,10 +151,23 @@ pub fn random_phase(_: &Caps)
 
 pub fn aslr_layout_phase(_: &Caps)
 {
+    // Own image base (#39, PIE): a draw from the image window, not the
+    // legacy fixed ET_EXEC base. Strict by design — a degraded-entropy
+    // spawn (window base) still passes; a non-PIE binary fails loudly.
+    let base = image_base();
+    assert_ne!(
+        base, 0x20_0000,
+        "image base is the legacy fixed ET_EXEC base"
+    );
+    assert!(
+        process_layout::IMAGE_WINDOW.contains(base),
+        "image base {base:#x} outside the image window"
+    );
+
     // Cross-process ASLR divergence (#39): a respawned child's bootstrap
     // layout tuple must differ from the parent's. Each component carries
-    // 23 bits of independent entropy, so a false failure (all three draws
-    // colliding at once) is ~2⁻⁶⁹ per run — negligible even under burn-in.
+    // 23 bits of independent entropy, so a false failure (all four draws
+    // colliding at once) is ~2⁻⁹² per run — negligible even under burn-in.
     let mine = layout_fingerprint();
     let status = std::process::Command::new("/tests/svctest")
         .arg(ROLE_LAYOUT_DIVERGE)

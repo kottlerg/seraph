@@ -388,6 +388,16 @@ calls `sched::enter()`.
 1. Validate boot_info.init_image:
    a. Verify segment_count > 0
    b. Verify entry_point != 0
+   c. PIE rebase (INIT_IMAGE_FLAG_PIE set — every init image since the
+      #39 target flip): draw the load bias from the entropy pool
+      (process_layout::choose_image_bias; window base if unseeded),
+      validate the biased span (validate_image_placement), apply the
+      .rela.dyn RELATIVE relocations through the direct map
+      (mm/init_reloc.rs; targets must fall in writable segments, anything
+      unresolvable is fatal), bias every segment virt_addr and the
+      entry point, then seal PT_GNU_RELRO: writable segments covered by
+      the relro range flip to Read (splitting at the range end if it
+      lands mid-segment). Logged as "init: PIE bias=0x… (N relocations)".
 2. Create the init address space (AddressSpace::new_user):
    a. Allocate a new root page table frame from the buddy allocator
    b. Zero the frame

@@ -75,7 +75,14 @@ pub mod role_guids;
 ///     boot-time entropy hole before any early consumer (KASLR/ASLR) draws
 ///     randomness. `boot_entropy_len` is `0` when no source was available, in
 ///     which case the kernel degrades to timing jitter alone.
-pub const BOOT_PROTOCOL_VERSION: u32 = 9;
+/// v10: [`InitImage`] gained `flags: u32` (bit 0 = [`INIT_IMAGE_FLAG_PIE`]:
+///     init is `ET_DYN`; the kernel chooses a load bias and applies the
+///     image's `RELATIVE` relocations before mapping), plus `rela_phys: u64`
+///     and `rela_size: u64` — the physical address and byte size of the
+///     pre-located `.rela.dyn` table (both zero when the image carries no
+///     relocations). `ET_EXEC` init images carry `flags = 0` and zeroed
+///     relocation fields and load exactly as before.
+pub const BOOT_PROTOCOL_VERSION: u32 = 10;
 
 // ── Memory map ───────────────────────────────────────────────────────────────
 
@@ -264,6 +271,13 @@ pub const INIT_MAX_SEGMENTS: usize = 8;
 /// `cpu_count <= MAX_CPUS` and `cpu_ids[cpu_count..]` is zero.
 pub const MAX_CPUS: usize = 512;
 
+/// [`InitImage::flags`] bit 0: init is a position-independent executable
+/// (`ET_DYN`). The kernel chooses a load bias, applies the image's
+/// `RELATIVE` relocations (located by [`InitImage::rela_phys`] /
+/// [`InitImage::rela_size`]), and biases every segment VA and the entry
+/// point before mapping.
+pub const INIT_IMAGE_FLAG_PIE: u32 = 1 << 0;
+
 /// Pre-parsed init ELF information provided by the bootloader.
 ///
 /// The bootloader fully parses init's ELF and populates this structure so the
@@ -273,12 +287,23 @@ pub const MAX_CPUS: usize = 512;
 #[derive(Clone, Copy, Debug)]
 pub struct InitImage
 {
-    /// Virtual entry point of init (`e_entry` from the ELF header).
+    /// Virtual entry point of init (`e_entry` from the ELF header). For a
+    /// PIE image this is the unbiased link-VA entry; the kernel adds its
+    /// chosen load bias.
     pub entry_point: u64,
     /// Pre-parsed LOAD segments. Valid entries occupy `[0..segment_count]`.
+    /// For a PIE image the `virt_addr` fields are unbiased link VAs.
     pub segments: [InitSegment; INIT_MAX_SEGMENTS],
     /// Number of valid entries in `segments`.
     pub segment_count: u32,
+    /// Image flags; see [`INIT_IMAGE_FLAG_PIE`]. All other bits are
+    /// reserved (producers MUST write zero).
+    pub flags: u32,
+    /// Physical address of the image's `.rela.dyn` table within the loaded
+    /// segment bytes; zero when the image carries no relocations.
+    pub rela_phys: u64,
+    /// Byte size of the `.rela.dyn` table; zero when absent.
+    pub rela_size: u64,
 }
 
 // ── Framebuffer ──────────────────────────────────────────────────────────────

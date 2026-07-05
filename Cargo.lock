@@ -861,6 +861,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "relrofault"
+version = "0.1.1"
+
+[[package]]
 name = "rustc-std-workspace-core"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -155,6 +155,12 @@ pub fn derive_memory_for_prot(memory_cap: u32, prot: u64) -> Option<u32>
 /// `fill` receives the zeroed writable span and writes the segment bytes and
 /// relocation values in (in-memory slice copy or VFS stream); it is
 /// infallible — a short read leaves the tail zeroed.
+///
+/// `ro_range` is the image's read-only-after-relocation page range
+/// (`PT_GNU_RELRO`, biased and page-aligned): pages of this segment fully
+/// inside it are mapped read-only instead of `prot`, sealing the GOT and
+/// `.data.rel.ro` after the relocation values were written via the scratch
+/// span.
 // too_many_lines: one transaction owning the scratch span, the per-page cap
 // set, and the child mappings; splitting would thread the guard state through
 // helpers that all need the same aspace + cap context.
@@ -163,6 +169,7 @@ pub(crate) fn load_elf_segment_into_child(
     first_page_vaddr: u64,
     num_pages: u64,
     prot: u64,
+    ro_range: Option<(u64, u64)>,
     self_aspace: u32,
     child_aspace: u32,
     child_memmgr_send: u32,
@@ -272,13 +279,22 @@ pub(crate) fn load_elf_segment_into_child(
     for (i, &memory_cap) in scratch.caps.iter().enumerate()
     {
         let page_vaddr = first_page_vaddr + i as u64 * PAGE_SIZE;
-        let Some(derived) = derive_memory_for_prot(memory_cap, prot)
+        let page_prot = match ro_range
+        {
+            Some((ro_start, ro_end))
+                if page_vaddr >= ro_start && page_vaddr + PAGE_SIZE <= ro_end =>
+            {
+                syscall::MAP_READONLY
+            }
+            _ => prot,
+        };
+        let Some(derived) = derive_memory_for_prot(memory_cap, page_prot)
         else
         {
             std::os::seraph::log!(
                 "procmgr: load_elf_segment: derive None vaddr=0x{:x} prot=0x{:x}",
                 page_vaddr,
-                prot
+                page_prot
             );
             return Err(procmgr_errors::INSUFFICIENT_RIGHTS);
         };

@@ -15,7 +15,8 @@ target triples against this directory via `RUST_TARGET_PATH` (set in
 | `riscv64imac-seraph-uefi.json` | RV64IMAC, soft-float, lp64 | Bootloader |
 
 Userspace targets emit position-independent executables (`ET_DYN`,
-`RELATIVE`-only relocations, `tls-model: local-exec` where TLS exists) so
+`RELATIVE`-only relocations, `tls-model: local-exec` where TLS exists,
+`PT_GNU_RELRO` sealed read-only by the loaders after relocation) so
 loaders can randomize each image's base (ASLR, #39); the kernel targets stay
 `relocation-model: static` (KASLR is #252). `x86_64-unknown-uefi` is a
 built-in Rust target and has no JSON here.

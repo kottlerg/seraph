@@ -1493,6 +1493,18 @@ fn pie_rebase_init_image(mut image: boot_protocol::InitImage) -> boot_protocol::
         seg.virt_addr += bias;
     }
     image.entry_point += bias;
+
+    // PT_GNU_RELRO: seal the relocated GOT / .data.rel.ro pages read-only.
+    if let Err(msg) = mm::init_reloc::apply_relro(
+        &mut image.segments,
+        &mut image.segment_count,
+        bias,
+        image.relro_vaddr,
+        image.relro_size,
+    )
+    {
+        fatal(msg);
+    }
     image
 }
 

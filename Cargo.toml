@@ -61,6 +61,7 @@ members = [
     "programs/shell/path",
     "programs/shell/tester",
     "programs/stackoverflow",
+    "programs/relrofault",
     "programs/stdiotest",
     "programs/stdiotest/tester",
     "programs/terminal",

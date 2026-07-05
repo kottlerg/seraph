@@ -1353,6 +1353,11 @@ fn create_process_from_bytes(
         None => 0,
     };
 
+    // PT_GNU_RELRO (biased, page-rounded): fully-covered pages of writable
+    // segments are mapped read-only after relocation.
+    let ro_range = elf::relro_span(ehdr, module_bytes)
+        .map(|(va, sz)| ((va + bias) & !0xFFF, (va + bias + sz + 0xFFF) & !0xFFF));
+
     let stack_pages = elf::parse_stack_note(ehdr, module_bytes)
         .unwrap_or(DEFAULT_PROCESS_STACK_PAGES)
         .clamp(1, MAX_PROCESS_STACK_PAGES);
@@ -1405,6 +1410,7 @@ fn create_process_from_bytes(
             first_page,
             num_pages,
             prot,
+            if seg.writable { ro_range } else { None },
             self_aspace,
             child_aspace,
             child_memmgr_send,
@@ -2122,6 +2128,11 @@ pub fn create_process_from_file(
         None => 0,
     };
 
+    // PT_GNU_RELRO (biased, page-rounded): fully-covered pages of writable
+    // segments are mapped read-only after relocation.
+    let ro_range = elf::relro_span(ehdr, header_data)
+        .map(|(va, sz)| ((va + bias) & !0xFFF, (va + bias + sz + 0xFFF) & !0xFFF));
+
     // Parse the optional stack-size note. Section headers and the note
     // section are fetched on demand via `vfs_read`; the helper hands a
     // closure that drives the same primitive used to stream `PT_LOAD`
@@ -2206,6 +2217,7 @@ pub fn create_process_from_file(
             first_page,
             num_pages,
             prot,
+            if seg.writable { ro_range } else { None },
             self_aspace,
             child_objs.aspace(),
             mms.cap(),

@@ -135,6 +135,7 @@ pub enum BuildComponent
     Shell,
     ShellTester,
     Stackoverflow,
+    Relrofault,
     Capexhaust,
     Demandpaged,
     Stdiotest,

@@ -79,9 +79,11 @@ pub mod role_guids;
 ///     init is `ET_DYN`; the kernel chooses a load bias and applies the
 ///     image's `RELATIVE` relocations before mapping), plus `rela_phys: u64`
 ///     and `rela_size: u64` — the physical address and byte size of the
-///     pre-located `.rela.dyn` table (both zero when the image carries no
-///     relocations). `ET_EXEC` init images carry `flags = 0` and zeroed
-///     relocation fields and load exactly as before.
+///     pre-located `.rela.dyn` table — and `relro_vaddr: u64` /
+///     `relro_size: u64` — the `PT_GNU_RELRO` span (unbiased link VAs) the
+///     kernel maps read-only once relocations are applied. All four are
+///     zero when absent. `ET_EXEC` init images carry `flags = 0` and zeroed
+///     relocation/RELRO fields and load exactly as before.
 pub const BOOT_PROTOCOL_VERSION: u32 = 10;
 
 // ── Memory map ───────────────────────────────────────────────────────────────
@@ -304,6 +306,12 @@ pub struct InitImage
     pub rela_phys: u64,
     /// Byte size of the `.rela.dyn` table; zero when absent.
     pub rela_size: u64,
+    /// Link VA of the `PT_GNU_RELRO` region (unbiased); zero when absent.
+    /// The kernel maps the covered pages read-only after applying
+    /// relocations.
+    pub relro_vaddr: u64,
+    /// Byte size of the `PT_GNU_RELRO` region; zero when absent.
+    pub relro_size: u64,
 }
 
 // ── Framebuffer ──────────────────────────────────────────────────────────────

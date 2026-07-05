@@ -76,9 +76,10 @@ The low-level-userspace triples (`x86_64-seraph-lowuser.json`,
 `riscv64imac-seraph-lowuser.json` — init, ktest, memmgr) keep the
 kernel triples' feature floor but emit position-independent executables:
 `relocation-model: pic` (small code model on x86-64), `-pie
---no-dynamic-linker -z norelro -Bsymbolic -z max-page-size=4096` link
-args, producing `ET_DYN` images with `RELATIVE`-only relocations that
-loaders place at a randomized base (ASLR, #39).
+--no-dynamic-linker -Bsymbolic -z max-page-size=4096` link args,
+producing `ET_DYN` images with `RELATIVE`-only relocations that loaders
+place at a randomized base and whose `PT_GNU_RELRO` region they seal
+read-only after relocation (ASLR, #39).
 
 The std-userspace triples (`x86_64-seraph.json`, `riscv64a23-seraph.json`)
 carry the same PIE treatment (plus `tls-model: local-exec`, keeping TLS

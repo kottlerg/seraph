@@ -13,7 +13,71 @@
 //! non-`RELATIVE` record, a target outside every writable segment — is a
 //! fatal boot error: an unrelocated init is corrupt, not degraded.
 
-use boot_protocol::{InitSegment, SegmentFlags};
+use boot_protocol::{INIT_MAX_SEGMENTS, InitSegment, SegmentFlags};
+
+/// Apply `PT_GNU_RELRO` to the (already biased) segment table: writable
+/// segments fully covered by the biased, page-rounded RELRO range become
+/// read-only; a segment the range ends inside is split at the range end
+/// into a read-only head and a writable tail. RELRO is a prefix of the
+/// writable image region by link order, so a range starting mid-segment is
+/// skipped (no enforcement) rather than misapplied.
+///
+/// # Errors
+///
+/// A static description when a split would exceed `INIT_MAX_SEGMENTS`.
+pub fn apply_relro(
+    segments: &mut [InitSegment; INIT_MAX_SEGMENTS],
+    count: &mut u32,
+    bias: u64,
+    relro_vaddr: u64,
+    relro_size: u64,
+) -> Result<(), &'static str>
+{
+    if relro_size == 0
+    {
+        return Ok(());
+    }
+    let ro_start = (relro_vaddr + bias) & !0xFFF;
+    let ro_end = (relro_vaddr + bias + relro_size + 0xFFF) & !0xFFF;
+    let n = *count as usize;
+    for i in 0..n
+    {
+        let seg = segments[i];
+        if !matches!(seg.flags, SegmentFlags::ReadWrite)
+        {
+            continue;
+        }
+        let seg_end = seg.virt_addr + seg.size;
+        if ro_start > seg.virt_addr || seg.virt_addr >= ro_end
+        {
+            continue;
+        }
+        if seg_end <= ro_end
+        {
+            segments[i].flags = SegmentFlags::Read;
+        }
+        else
+        {
+            if *count as usize >= INIT_MAX_SEGMENTS
+            {
+                return Err("Phase 9: RELRO split exceeds INIT_MAX_SEGMENTS");
+            }
+            // Split at the page-aligned range end: in-page offsets stay
+            // preserved because head_size shifts phys and virt equally.
+            let head_size = ro_end - seg.virt_addr;
+            segments[i].size = head_size;
+            segments[i].flags = SegmentFlags::Read;
+            segments[*count as usize] = InitSegment {
+                phys_addr: seg.phys_addr + head_size,
+                virt_addr: ro_end,
+                size: seg.size - head_size,
+                flags: SegmentFlags::ReadWrite,
+            };
+            *count += 1;
+        }
+    }
+    Ok(())
+}
 
 /// Resolve a relocation target (unbiased link VA) to its physical address
 /// through the loaded segments. The whole 8-byte target must lie inside a
@@ -142,5 +206,64 @@ mod tests
             seg(0x4000, 0x20_0000, 0x1000, SegmentFlags::ReadWrite),
         ];
         assert_eq!(resolve_target(&segs, 0x2800), None);
+    }
+
+    // ── apply_relro ──────────────────────────────────────────────────────────
+
+    fn seg_table(entries: &[InitSegment]) -> ([InitSegment; INIT_MAX_SEGMENTS], u32)
+    {
+        let mut table = [seg(0, 0, 0, SegmentFlags::Read); INIT_MAX_SEGMENTS];
+        table[..entries.len()].copy_from_slice(entries);
+        // entries.len() ≤ INIT_MAX_SEGMENTS = 8 in every test below.
+        #[allow(clippy::cast_possible_truncation)]
+        let count = entries.len() as u32;
+        (table, count)
+    }
+
+    #[test]
+    fn relro_flips_fully_covered_segment()
+    {
+        // Biased layout mirroring lld output: RX, RW-relro (page-aligned
+        // end), RW. Bias 0x1000; relro link span [0x20c8, 0x3000).
+        let (mut segs, mut count) = seg_table(&[
+            seg(0x1000, 0x10_0000, 0x1000, SegmentFlags::ReadExecute),
+            seg(0x30c8, 0x20_00c8, 0xf38, SegmentFlags::ReadWrite),
+            seg(0x4c20, 0x30_0c20, 0x9c0, SegmentFlags::ReadWrite),
+        ]);
+        assert!(apply_relro(&mut segs, &mut count, 0x1000, 0x20c8, 0xf38).is_ok());
+        assert_eq!(count, 3);
+        assert!(matches!(segs[1].flags, SegmentFlags::Read));
+        assert!(matches!(segs[2].flags, SegmentFlags::ReadWrite));
+        assert!(matches!(segs[0].flags, SegmentFlags::ReadExecute));
+    }
+
+    #[test]
+    fn relro_splits_segment_at_range_end()
+    {
+        // One RW segment [0x3000, 0x6000); relro covers its first page only.
+        let (mut segs, mut count) =
+            seg_table(&[seg(0x3000, 0x20_0000, 0x3000, SegmentFlags::ReadWrite)]);
+        assert!(apply_relro(&mut segs, &mut count, 0, 0x3000, 0x800).is_ok());
+        assert_eq!(count, 2);
+        assert!(matches!(segs[0].flags, SegmentFlags::Read));
+        assert_eq!(segs[0].virt_addr, 0x3000);
+        assert_eq!(segs[0].size, 0x1000);
+        assert!(matches!(segs[1].flags, SegmentFlags::ReadWrite));
+        assert_eq!(segs[1].virt_addr, 0x4000);
+        assert_eq!(segs[1].phys_addr, 0x20_1000);
+        assert_eq!(segs[1].size, 0x2000);
+    }
+
+    #[test]
+    fn relro_absent_and_non_prefix_are_no_ops()
+    {
+        let (mut segs, mut count) =
+            seg_table(&[seg(0x3000, 0x20_0000, 0x2000, SegmentFlags::ReadWrite)]);
+        assert!(apply_relro(&mut segs, &mut count, 0, 0, 0).is_ok());
+        assert!(matches!(segs[0].flags, SegmentFlags::ReadWrite));
+        // Range starting mid-segment (not a prefix) is skipped.
+        assert!(apply_relro(&mut segs, &mut count, 0, 0x4000, 0x1000).is_ok());
+        assert!(matches!(segs[0].flags, SegmentFlags::ReadWrite));
+        assert_eq!(count, 1);
     }
 }

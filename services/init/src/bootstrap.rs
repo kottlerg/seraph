@@ -231,12 +231,17 @@ impl BootArena
     /// `RELATIVE` relocation target may span two pages. The arena is one
     /// contiguous Memory cap, so the segment's backing pages form one
     /// contiguous offset run.
+    ///
+    /// `ro_head_pages` maps that many leading pages read-only instead of
+    /// `prot` (`PT_GNU_RELRO` enforcement: the read-only-after-relocation
+    /// region is a prefix of the writable image region by link order).
     pub(crate) fn place_segment(
         &mut self,
         target_aspace: u32,
         target_va: u64,
         num_pages: u64,
         prot: u64,
+        ro_head_pages: u64,
         populate: impl FnOnce(&mut [u8]),
     ) -> Option<()>
     {
@@ -261,7 +266,31 @@ impl BootArena
         span.fill(0);
         populate(span);
         let _ = syscall::mem_unmap(self.init_aspace, ELF_PAGE_TEMP_VA, num_pages);
-        syscall::mem_map(self.cap, target_aspace, target_va, offset, num_pages, prot).ok()?;
+        let ro = ro_head_pages.min(num_pages);
+        if ro > 0
+        {
+            syscall::mem_map(
+                self.cap,
+                target_aspace,
+                target_va,
+                offset,
+                ro,
+                syscall::MAP_READ,
+            )
+            .ok()?;
+        }
+        if ro < num_pages
+        {
+            syscall::mem_map(
+                self.cap,
+                target_aspace,
+                target_va + ro * PAGE_SIZE,
+                offset + ro,
+                num_pages - ro,
+                prot,
+            )
+            .ok()?;
+        }
         self.cursor += num_pages;
         Some(())
     }
@@ -428,6 +457,10 @@ fn load_elf_into_arena(
 ) -> Option<u64>
 {
     let machine = arch::current::EXPECTED_ELF_MACHINE;
+    // PT_GNU_RELRO (biased, page-rounded): fully-covered pages of writable
+    // segments are mapped read-only after relocation.
+    let ro_range = elf::relro_span(ehdr, module_bytes)
+        .map(|(va, sz)| ((va + bias) & !0xFFF, (va + bias + sz + 0xFFF) & !0xFFF));
     let mut applied = 0u64;
     for seg_result in elf::load_segments(ehdr, module_bytes)
     {
@@ -457,21 +490,41 @@ fn load_elf_into_arena(
         let file_data = &module_bytes[seg.offset as usize..(seg.offset + seg.filesz) as usize];
         let dest_offset = (seg_vaddr - first_page) as usize;
 
-        arena.place_segment(target_aspace, first_page, num_pages, prot, |span| {
-            let copy_len = file_data.len().min(seg.memsz as usize);
-            span[dest_offset..dest_offset + copy_len].copy_from_slice(&file_data[..copy_len]);
-            // Writable segments only, matching the kernel's init applier: a
-            // target in text/rodata goes unapplied and the caller's
-            // applied-count check rejects the image.
-            if seg.writable
-                && let Some(t) = rela
+        // RELRO is a prefix of the writable region by link order; pages of
+        // this segment fully inside the range map read-only.
+        let ro_head_pages = match ro_range
+        {
+            Some((ro_start, ro_end))
+                if seg.writable && ro_start <= first_page && ro_end > first_page =>
             {
-                let table =
-                    &module_bytes[t.file_offset as usize..(t.file_offset + t.size) as usize];
-                let seg_span = &mut span[dest_offset..dest_offset + seg.memsz as usize];
-                applied += elf::apply_relative_relocs(table, machine, bias, seg.vaddr, seg_span);
+                (ro_end.min(last_page_end) - first_page) / PAGE_SIZE
             }
-        })?;
+            _ => 0,
+        };
+
+        arena.place_segment(
+            target_aspace,
+            first_page,
+            num_pages,
+            prot,
+            ro_head_pages,
+            |span| {
+                let copy_len = file_data.len().min(seg.memsz as usize);
+                span[dest_offset..dest_offset + copy_len].copy_from_slice(&file_data[..copy_len]);
+                // Writable segments only, matching the kernel's init applier: a
+                // target in text/rodata goes unapplied and the caller's
+                // applied-count check rejects the image.
+                if seg.writable
+                    && let Some(t) = rela
+                {
+                    let table =
+                        &module_bytes[t.file_offset as usize..(t.file_offset + t.size) as usize];
+                    let seg_span = &mut span[dest_offset..dest_offset + seg.memsz as usize];
+                    applied +=
+                        elf::apply_relative_relocs(table, machine, bias, seg.vaddr, seg_span);
+                }
+            },
+        )?;
     }
 
     Some(applied)

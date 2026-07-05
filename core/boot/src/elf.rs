@@ -348,6 +348,10 @@ pub unsafe fn load_kernel(
 ///
 /// `bs` must be a valid pointer to UEFI boot services and boot services must
 /// not yet have been exited.
+// too_many_lines: one linear pre-parse pass (validate, per-segment
+// allocate/copy/zero, PIE table + RELRO location); splitting would thread
+// the segment array and UEFI handle through every helper.
+#[allow(clippy::too_many_lines)]
 pub unsafe fn load_init(
     bs: *mut crate::uefi::EfiBootServices,
     data: &[u8],
@@ -456,9 +460,11 @@ pub unsafe fn load_init(
     // physical address through the loaded segment bytes, so the kernel can
     // apply the relocations without an ELF parser. The bias itself is the
     // kernel's choice — the bootloader has no entropy source on riscv64.
-    let (flags, rela_phys, rela_size) = match kind
+    // The `PT_GNU_RELRO` span rides along (unbiased link VAs) so the kernel
+    // can map the covered pages read-only after relocation.
+    let (flags, rela_phys, rela_size, relro_vaddr, relro_size) = match kind
     {
-        elf::ElfKind::Exec => (0, 0, 0),
+        elf::ElfKind::Exec => (0, 0, 0, 0, 0),
         elf::ElfKind::Dyn =>
         {
             let (rela_phys, rela_size) = match elf::rela_table(ehdr, data)?
@@ -472,7 +478,14 @@ pub unsafe fn load_init(
                 }
                 None => (0, 0),
             };
-            (boot_protocol::INIT_IMAGE_FLAG_PIE, rela_phys, rela_size)
+            let (relro_vaddr, relro_size) = elf::relro_span(ehdr, data).unwrap_or((0, 0));
+            (
+                boot_protocol::INIT_IMAGE_FLAG_PIE,
+                rela_phys,
+                rela_size,
+                relro_vaddr,
+                relro_size,
+            )
         }
     };
 
@@ -485,6 +498,8 @@ pub unsafe fn load_init(
         flags,
         rela_phys,
         rela_size,
+        relro_vaddr,
+        relro_size,
     })
 }
 

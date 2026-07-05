@@ -228,7 +228,10 @@ base (never bias 0), keeping the single relocation path; loaders reject
 any relocation format other than the architecture's `RELATIVE` type,
 and every table record must land in exactly one loaded *writable*
 segment (`RELATIVE` targets live in data; a text or rodata target means
-a malformed or hostile image).
+a malformed or hostile image). Once relocations are applied, the pages
+covered by the image's `PT_GNU_RELRO` region — the GOT, `.data.rel.ro`,
+and the in-image TLS template — are mapped read-only (svctest's
+`relro_write` phase asserts a write there faults).
 
 `ET_EXEC` images remain accepted and load at their link VAs with bias
 0 and no relocations — loader compatibility, not a build target.

@@ -141,10 +141,12 @@ Both `ET_EXEC` and `ET_DYN` init images are accepted
 `INIT_IMAGE_FLAG_PIE` and the image's `.rela.dyn` table is pre-located
 through the segment containing it: `rela_phys = seg.phys_addr +
 (table_vaddr − seg.virt_addr)` (in-page offsets preserved), `rela_size =
-DT_RELASZ`. Segment `virt_addr`s and the entry point stay unbiased link
-VAs — the kernel draws the load bias and applies the `RELATIVE`
-relocations itself (the bootloader has no entropy source on riscv64; see
-`kernel/src/mm/init_reloc.rs` and ASLR
+DT_RELASZ`. The `PT_GNU_RELRO` span rides along unbiased
+(`relro_vaddr`/`relro_size`) so the kernel can seal the covered pages
+read-only after relocation. Segment `virt_addr`s and the entry point
+stay unbiased link VAs — the kernel draws the load bias and applies the
+`RELATIVE` relocations itself (the bootloader has no entropy source on
+riscv64; see `kernel/src/mm/init_reloc.rs` and ASLR
 [#39](https://github.com/kottlerg/seraph/issues/39)). An `ET_DYN` image
 whose dynamic section describes any other relocation format
 (`DT_REL`/`DT_RELR`/active `DT_JMPREL`) is rejected as invalid.

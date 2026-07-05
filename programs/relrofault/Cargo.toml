@@ -1,0 +1,13 @@
+[package]
+name = "relrofault"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "relrofault"
+path = "src/main.rs"
+test = false
+
+[lints]
+workspace = true

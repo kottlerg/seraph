@@ -23,7 +23,6 @@
             "--gc-sections",
             "-pie",
             "--no-dynamic-linker",
-            "-z", "norelro",
             "-Bsymbolic",
             "-z", "max-page-size=4096"
         ]

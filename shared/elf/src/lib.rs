@@ -59,6 +59,9 @@ const PT_DYNAMIC: u32 = 2;
 /// Program header type: thread-local storage template.
 const PT_TLS: u32 = 7;
 
+/// Program header type: read-only-after-relocation region (`PT_GNU_RELRO`).
+const PT_GNU_RELRO: u32 = 0x6474_E552;
+
 /// Segment flag: execute permission.
 const PF_X: u32 = 1;
 /// Segment flag: write permission.
@@ -1032,6 +1035,28 @@ pub fn load_span(ehdr: &Elf64Ehdr, data: &[u8]) -> Result<(u64, u64), ElfError>
     Ok((min_vaddr, max_end))
 }
 
+/// Return the `PT_GNU_RELRO` span `(vaddr, memsz)`, or `None` when the image
+/// has no RELRO region.
+///
+/// The span marks data that must become read-only once relocations are
+/// applied (GOT, `.data.rel.ro`, the in-image TLS template). Loaders map the
+/// fully-covered pages of a writable segment read-only; link VAs — `ET_DYN`
+/// callers add the load bias. Needs only the program header table, so the
+/// ELF header page suffices (like [`load_span`]).
+#[must_use]
+pub fn relro_span(ehdr: &Elf64Ehdr, data: &[u8]) -> Option<(u64, u64)>
+{
+    for i in 0..ehdr.e_phnum as usize
+    {
+        let phdr = read_phdr(data, ehdr, i);
+        if phdr.p_type == PT_GNU_RELRO && phdr.p_memsz > 0
+        {
+            return Some((phdr.p_vaddr, phdr.p_memsz));
+        }
+    }
+    None
+}
+
 // ── PT_DYNAMIC / RELATIVE relocations ────────────────────────────────────────
 
 /// Location of an image's `.rela.dyn` relocation table.
@@ -1916,6 +1941,22 @@ mod tests
         let img = build_image(ET_DYN, &std_dynamic());
         let (ehdr, _) = valid_executable(&img);
         assert_eq!(load_span(ehdr, &img), Ok((0, 0x500)));
+    }
+
+    #[test]
+    fn finds_relro_span()
+    {
+        let mut img = build_image(ET_DYN, &std_dynamic());
+        let (ehdr, _) = valid_executable(&img);
+        assert_eq!(relro_span(ehdr, &img), None);
+        // Rewrite the PT_DYNAMIC header as PT_GNU_RELRO covering [0x200, 0x300).
+        put(
+            &mut img,
+            64 + 112,
+            &phdr_bytes(PT_GNU_RELRO, PF_R, 0x200, 0x200, 0x100, 0x100),
+        );
+        let (ehdr, _) = valid_executable(&img);
+        assert_eq!(relro_span(ehdr, &img), Some((0x200, 0x100)));
     }
 
     #[test]

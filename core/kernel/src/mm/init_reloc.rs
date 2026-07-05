@@ -3,7 +3,8 @@
 
 // kernel/src/mm/init_reloc.rs
 
-//! `RELATIVE` relocation application for a PIE init image (#39).
+//! PIE init image fix-ups (#39): `RELATIVE` relocation application and
+//! `PT_GNU_RELRO` sealing.
 //!
 //! The bootloader pre-locates init's `.rela.dyn` table
 //! (`InitImage.rela_phys` / `rela_size`); Phase 9 draws the load bias and
@@ -12,6 +13,9 @@
 //! through the direct physical map. Anything unresolvable — a
 //! non-`RELATIVE` record, a target outside every writable segment — is a
 //! fatal boot error: an unrelocated init is corrupt, not degraded.
+//! [`apply_relro`] then flips the relro-covered writable segments to
+//! read-only so the relocated GOT / `.data.rel.ro` pages are sealed before
+//! init runs.
 
 use boot_protocol::{INIT_MAX_SEGMENTS, InitSegment, SegmentFlags};
 
@@ -37,8 +41,14 @@ pub fn apply_relro(
     {
         return Ok(());
     }
-    let ro_start = (relro_vaddr + bias) & !0xFFF;
-    let ro_end = (relro_vaddr + bias + relro_size + 0xFFF) & !0xFFF;
+    let overflow = "Phase 9: RELRO range overflow";
+    let ro_start = relro_vaddr.checked_add(bias).ok_or(overflow)? & !0xFFF;
+    let ro_end = relro_vaddr
+        .checked_add(bias)
+        .and_then(|v| v.checked_add(relro_size))
+        .and_then(|v| v.checked_add(0xFFF))
+        .ok_or(overflow)?
+        & !0xFFF;
     let n = *count as usize;
     for i in 0..n
     {
@@ -47,7 +57,7 @@ pub fn apply_relro(
         {
             continue;
         }
-        let seg_end = seg.virt_addr + seg.size;
+        let seg_end = seg.virt_addr.checked_add(seg.size).ok_or(overflow)?;
         if ro_start > seg.virt_addr || seg.virt_addr >= ro_end
         {
             continue;
@@ -64,11 +74,12 @@ pub fn apply_relro(
             }
             // Split at the page-aligned range end: in-page offsets stay
             // preserved because head_size shifts phys and virt equally.
+            // ro_end > seg.virt_addr held above, so head_size is in range.
             let head_size = ro_end - seg.virt_addr;
             segments[i].size = head_size;
             segments[i].flags = SegmentFlags::Read;
             segments[*count as usize] = InitSegment {
-                phys_addr: seg.phys_addr + head_size,
+                phys_addr: seg.phys_addr.checked_add(head_size).ok_or(overflow)?,
                 virt_addr: ro_end,
                 size: seg.size - head_size,
                 flags: SegmentFlags::ReadWrite,

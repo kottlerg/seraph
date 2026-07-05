@@ -25,6 +25,9 @@ pub mod trap_frame;
 /// Architecture name string for use in diagnostic output.
 pub const ARCH_NAME: &str = "x86_64";
 
+/// ELF machine type of userspace images this kernel loads (init/ktest).
+pub const EXPECTED_ELF_MACHINE: u16 = elf::EM_X86_64;
+
 /// Maximum valid GSI (Global System Interrupt) number on x86-64.
 /// I/O APIC delivers GSIs 0–255.
 ///

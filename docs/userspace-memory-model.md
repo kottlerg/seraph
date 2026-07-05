@@ -226,7 +226,9 @@ loading: the biased span must fit the window's 1 GiB image budget and
 stay below the user half. A failed entropy draw degrades to the window
 base (never bias 0), keeping the single relocation path; loaders reject
 any relocation format other than the architecture's `RELATIVE` type,
-and every table record must land in exactly one loaded segment.
+and every table record must land in exactly one loaded *writable*
+segment (`RELATIVE` targets live in data; a text or rodata target means
+a malformed or hostile image).
 
 `ET_EXEC` images remain accepted and load at their link VAs with bias
 0 and no relocations — loader compatibility, not a build target.

@@ -13,9 +13,10 @@ chosen load bias. Non-`RELATIVE` relocation formats are rejected, never
 skipped. Does not allocate or perform I/O; `*_metadata` variants stream via
 a caller-supplied reader holding only the ELF header page.
 
-Used by `init` (loads memmgr and procmgr from boot modules) and `procmgr`
-(loads all other processes). No stability obligation; internal code reuse
-only.
+Used by `init` (loads memmgr and procmgr from boot modules), `procmgr`
+(loads all other processes), and the kernel (Phase 9 `RELATIVE` relocation
+of a PIE init via `mm/init_reloc`). No stability obligation; internal code
+reuse only.
 
 ---
 

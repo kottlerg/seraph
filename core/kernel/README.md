@@ -48,6 +48,7 @@ kernel/
 │   │   ├── slab.rs             # Slab allocator for fixed-size kernel objects
 │   │   ├── size_class.rs       # General size-class allocator (heap)
 │   │   ├── address_space.rs    # Virtual address space objects and lifecycle
+│   │   ├── init_reloc.rs       # Phase 9 RELATIVE relocation of a PIE init image
 │   │   ├── kernel_pt_pool.rs   # Cap-backed pool for intermediate PT frames
 │   │   └── tlb_shootdown.rs    # Cross-CPU TLB shootdown protocol (per-CPU request slots)
 │   ├── cap/                    # Capability subsystem

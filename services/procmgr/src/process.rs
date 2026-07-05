@@ -1412,7 +1412,11 @@ fn create_process_from_bytes(
             |buf| {
                 let copy_len = file_data.len().min(seg.memsz as usize);
                 buf[dest_offset..dest_offset + copy_len].copy_from_slice(&file_data[..copy_len]);
-                if let Some(t) = rela
+                // Writable segments only, matching the kernel's init
+                // applier: a target in text/rodata goes unapplied and the
+                // applied-count check below rejects the image.
+                if seg.writable
+                    && let Some(t) = rela
                 {
                     let table =
                         &module_bytes[t.file_offset as usize..(t.file_offset + t.size) as usize];
@@ -2208,7 +2212,11 @@ pub fn create_process_from_file(
             ipc_buf,
             |buf| {
                 stream_segment_bytes(buf, dest_offset, &seg, &load_ctx);
-                if let Some(t) = &rela
+                // Writable segments only, matching the kernel's init
+                // applier: a target in text/rodata goes unapplied and the
+                // applied-count check below rejects the image.
+                if seg.writable
+                    && let Some(t) = &rela
                 {
                     let span = &mut buf[dest_offset..dest_offset + seg.memsz as usize];
                     // A read failure mid-walk leaves records unapplied; the

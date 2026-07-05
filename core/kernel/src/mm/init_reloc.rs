@@ -15,11 +15,6 @@
 
 use boot_protocol::{InitSegment, SegmentFlags};
 
-#[cfg(target_arch = "x86_64")]
-const MACHINE: u16 = elf::EM_X86_64;
-#[cfg(target_arch = "riscv64")]
-const MACHINE: u16 = elf::EM_RISCV;
-
 /// Resolve a relocation target (unbiased link VA) to its physical address
 /// through the loaded segments. The whole 8-byte target must lie inside a
 /// `ReadWrite` segment — `RELATIVE` targets live in data; a text or rodata
@@ -72,7 +67,7 @@ pub fn apply(
             table_len,
         )
     };
-    let iter = elf::relative_relocs(table, MACHINE)
+    let iter = elf::relative_relocs(table, crate::arch::current::EXPECTED_ELF_MACHINE)
         .map_err(|_| "Phase 9: init .rela.dyn table malformed")?;
     let mut applied = 0u64;
     for record in iter

@@ -460,7 +460,11 @@ fn load_elf_into_arena(
         arena.place_segment(target_aspace, first_page, num_pages, prot, |span| {
             let copy_len = file_data.len().min(seg.memsz as usize);
             span[dest_offset..dest_offset + copy_len].copy_from_slice(&file_data[..copy_len]);
-            if let Some(t) = rela
+            // Writable segments only, matching the kernel's init applier: a
+            // target in text/rodata goes unapplied and the caller's
+            // applied-count check rejects the image.
+            if seg.writable
+                && let Some(t) = rela
             {
                 let table =
                     &module_bytes[t.file_offset as usize..(t.file_offset + t.size) as usize];

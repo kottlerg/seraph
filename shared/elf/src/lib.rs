@@ -9,8 +9,9 @@
 //! `.rela.dyn` relocation-table extraction for ELF64 executables — both
 //! fixed-address `ET_EXEC` images and position-independent `ET_DYN` images
 //! (loaded at a caller-chosen bias with `RELATIVE` relocations applied).
-//! Used by init (to load memmgr and procmgr from boot modules) and by
-//! procmgr (to load all subsequent processes).
+//! Used by init (to load memmgr and procmgr from boot modules), by procmgr
+//! (to load all subsequent processes), and by the kernel (Phase 9 relocation
+//! of a PIE init via `mm/init_reloc`).
 //!
 //! This crate is `no_std` and performs no allocation or I/O. All functions
 //! operate on a byte slice representing the raw ELF image (or, for the
@@ -1394,7 +1395,11 @@ pub fn validate_relative_relocs(
 /// (0 or 1) for the caller's applied-count invariant.
 pub fn apply_reloc_in_span(rela: &Rela, bias: u64, span_vaddr: u64, span: &mut [u8]) -> u64
 {
-    let span_end = span_vaddr + span.len() as u64;
+    let Some(span_end) = span_vaddr.checked_add(span.len() as u64)
+    else
+    {
+        return 0;
+    };
     let Some(target_end) = rela.offset.checked_add(8)
     else
     {

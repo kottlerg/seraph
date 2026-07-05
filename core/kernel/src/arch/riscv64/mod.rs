@@ -25,6 +25,9 @@ pub mod trap_frame;
 /// Architecture name string for use in diagnostic output.
 pub const ARCH_NAME: &str = "riscv64";
 
+/// ELF machine type of userspace images this kernel loads (init/ktest).
+pub const EXPECTED_ELF_MACHINE: u16 = elf::EM_RISCV;
+
 /// Maximum PLIC source number the kernel programs. Sources 1–`MAX_IRQ_ID`
 /// are usable; source 0 is reserved by the PLIC spec.
 ///

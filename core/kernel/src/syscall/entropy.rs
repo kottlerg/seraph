@@ -16,9 +16,6 @@
 use crate::arch::current::trap_frame::TrapFrame;
 use syscall::{MAX_GETRANDOM_LEN, SyscallError};
 
-/// User-half ceiling: virtual addresses at or above this are kernel/non-canonical.
-const USER_HALF_TOP: u64 = 0x0000_8000_0000_0000;
-
 /// `SYS_GETRANDOM` (55): fill `[buf, buf+len)` with CSPRNG bytes.
 ///
 /// arg0 = destination buffer VA (user half), arg1 = length in bytes.
@@ -54,8 +51,9 @@ pub fn sys_getrandom(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     }
     // The whole span must be non-null and lie within the user half (no wrap
     // into kernel/non-canonical territory). `len <= MAX_GETRANDOM_LEN` and
-    // `USER_HALF_TOP < u64::MAX`, so `buf_ptr + len` cannot overflow u64.
-    if buf_ptr == 0 || buf_ptr >= USER_HALF_TOP || buf_ptr + len as u64 > USER_HALF_TOP
+    // `user_va_top() <= 1 << 56`, so `buf_ptr + len` cannot overflow u64.
+    let user_va_top = crate::mm::user_va_top();
+    if buf_ptr == 0 || buf_ptr >= user_va_top || buf_ptr + len as u64 > user_va_top
     {
         return Err(SyscallError::InvalidAddress);
     }

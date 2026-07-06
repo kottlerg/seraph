@@ -40,9 +40,9 @@
 #![allow(clippy::cast_possible_truncation, clippy::cast_lossless)]
 
 #[cfg(not(test))]
-use super::{cpu, fpu, gdt, idt};
+use super::paging::DIRECT_MAP_BASE;
 #[cfg(not(test))]
-use crate::mm::paging::DIRECT_MAP_BASE;
+use super::{cpu, fpu, gdt, idt};
 
 // ── xAPIC constants ───────────────────────────────────────────────────────────
 

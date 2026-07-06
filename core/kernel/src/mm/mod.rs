@@ -24,6 +24,26 @@ pub use buddy::{BuddyAllocator, PAGE_SIZE};
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
+/// Exclusive upper bound of user-half virtual addresses.
+///
+/// The single kernel-wide gate for "is this VA in the user half": constant
+/// `1 << 47` on x86-64; on riscv64 the active paging mode's half boundary
+/// (`1 << 38` / `1 << 47` / `1 << 56`), published at kernel entry.
+#[cfg(not(test))]
+#[inline]
+pub fn user_va_top() -> u64
+{
+    crate::arch::current::paging::user_va_top()
+}
+
+/// Test stub: the x86-64 / Sv48 boundary, matching the host-test default mode.
+#[cfg(test)]
+#[inline]
+pub fn user_va_top() -> u64
+{
+    0x0000_8000_0000_0000
+}
+
 /// Physical frame allocator, populated during Phase 2.
 ///
 /// Stored as a crate-level static to avoid placing a ~41 KiB struct on the

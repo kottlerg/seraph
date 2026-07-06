@@ -260,6 +260,25 @@ fn walk_or_alloc(entry: &mut PageTableEntry, pool: &mut PoolState) -> Result<u64
 /// Cross-arch hook for RISC-V, where the bootloader negotiates Sv39/Sv48/Sv57.
 pub fn init_paging_mode() {}
 
+/// Base virtual address of the direct physical map (PML4 entry 256).
+/// Constant on x86-64; the cross-arch accessor is [`direct_map_base`].
+pub const DIRECT_MAP_BASE: u64 = 0xFFFF_8000_0000_0000;
+
+/// Base virtual address of the direct physical map.
+#[inline]
+pub const fn direct_map_base() -> u64
+{
+    DIRECT_MAP_BASE
+}
+
+/// Exclusive upper bound of user-half virtual addresses (48-bit VAs,
+/// canonical lower half).
+#[inline]
+pub const fn user_va_top() -> u64
+{
+    1 << 47
+}
+
 /// Write CR3 without an explicit TLB flush.
 ///
 /// On x86-64 without PCID, writing CR3 implicitly flushes the TLB, so this
@@ -1332,8 +1351,8 @@ pub unsafe fn flush_tlb_all()
 #[cfg(test)]
 mod tests
 {
+    use super::DIRECT_MAP_BASE;
     use super::*;
-    use crate::mm::paging::DIRECT_MAP_BASE;
 
     // ── PTE construction ──────────────────────────────────────────────────────
 

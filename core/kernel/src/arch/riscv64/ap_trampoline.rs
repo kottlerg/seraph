@@ -52,7 +52,7 @@
 //! - a2 = opaque value (passed to AP in a1)
 
 #[cfg(not(test))]
-use crate::mm::paging::DIRECT_MAP_BASE;
+use crate::mm::paging::phys_to_virt;
 
 // ── Trampoline page offsets ───────────────────────────────────────────────────
 
@@ -121,7 +121,7 @@ core::arch::global_asm!(
     "    ld   t1,  8(a1)",   // kernel_entry_ap VA
     "    ld   t2, 16(a1)",   // kernel stack top
     "    ld   a0, 24(a1)",   // cpu_id (overwrite hart_id)
-    "    csrw satp, t0",     // enable Sv48 paging
+    "    csrw satp, t0",     // enable paging (mode baked into the value)
     "    sfence.vma x0, x0", // flush all TLB entries
     "    mv   sp, t2",       // switch to kernel stack
     "    jr   t1",           // jump to kernel_entry_ap
@@ -142,7 +142,7 @@ unsafe extern "C" {
 /// Must be called once before any [`sbi_hart_start`] call. Copies the
 /// trampoline machine code from its link-time location into the physical page
 /// at `trampoline_pa`, accessible via the direct map at
-/// `DIRECT_MAP_BASE + trampoline_pa`.
+/// `phys_to_virt(trampoline_pa)`.
 ///
 /// # Safety
 /// - Direct map must be active (Phase 3 complete).
@@ -159,7 +159,7 @@ pub unsafe fn setup_trampoline(trampoline_pa: u64)
     let code_len = code_end - code_start;
 
     // SAFETY: direct map active; dst is valid writable memory for the page.
-    let dst = (DIRECT_MAP_BASE + trampoline_pa) as *mut u8;
+    let dst = phys_to_virt(trampoline_pa) as *mut u8;
     // SAFETY: code_start is valid linker symbol; dst is direct-mapped trampoline page; len fits.
     unsafe {
         core::ptr::copy_nonoverlapping(code_start as *const u8, dst, code_len);
@@ -242,7 +242,7 @@ pub unsafe fn setup_ap_params(
 )
 {
     let slot_off = PARAMS_OFFSET + (cpu_idx as usize - 1) * PARAM_SLOT_SIZE;
-    let base = (DIRECT_MAP_BASE + trampoline_pa + slot_off as u64) as *mut u64;
+    let base = (phys_to_virt(trampoline_pa) + slot_off as u64) as *mut u64;
     // SAFETY: direct map active; 4 × u64 stay within the 4 KiB page (slot_off ≤ 0x7E0).
     unsafe {
         base.add(PARAM_SATP / 8).write_volatile(satp);

@@ -34,7 +34,7 @@
 //!   context register offsets (context = hart*2 + 1 for S-mode).
 
 use super::trap_frame::TrapFrame;
-use crate::mm::paging::DIRECT_MAP_BASE;
+use crate::mm::paging::phys_to_virt;
 
 // ── PLIC constants ────────────────────────────────────────────────────────────
 
@@ -95,7 +95,7 @@ const PLIC_NUM_SOURCES: u32 = 127;
 
 fn plic_read(offset: u64) -> u32
 {
-    let vaddr = DIRECT_MAP_BASE + super::platform::plic_base() + offset;
+    let vaddr = phys_to_virt(super::platform::plic_base() + offset);
     // SAFETY: PLIC base mapped via direct map; offset within PLIC MMIO range;
     // volatile read ensures ordering and prevents compiler reordering.
     unsafe { core::ptr::read_volatile(vaddr as *const u32) }
@@ -103,7 +103,7 @@ fn plic_read(offset: u64) -> u32
 
 unsafe fn plic_write(offset: u64, val: u32)
 {
-    let vaddr = DIRECT_MAP_BASE + super::platform::plic_base() + offset;
+    let vaddr = phys_to_virt(super::platform::plic_base() + offset);
     // SAFETY: PLIC base mapped via direct map; offset within PLIC MMIO range;
     // volatile write ensures the access is not elided or reordered by the
     // compiler.
@@ -657,7 +657,9 @@ extern "C" fn trap_dispatch(frame: &mut TrapFrame)
     // post-dispatch sepc (ecall_pc + 4) must be in user range. A kernel
     // address here means the TrapFrame was corrupted — sret would jump
     // to kernel text in U-mode and immediately instruction-page-fault.
-    if frame.scause == 8 && frame.sepc >= 0xFFFF_8000_0000_0000
+    // Bit-63 test: the kernel half has bit 63 set in every paging mode,
+    // and no user sepc can (user_va_top <= 1 << 56).
+    if frame.scause == 8 && frame.sepc >> 63 != 0
     {
         crate::kprintln!(
             "BUG: ecall return sepc={:#x} in kernel range on cpu {}",

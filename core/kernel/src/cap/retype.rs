@@ -801,9 +801,9 @@ pub fn free_seed_scratch(ptr: *mut u8, bytes: u64)
     let virt = ptr as u64;
 
     // A valid lease is `phys_to_virt(seed.base + offset)`, always
-    // >= DIRECT_MAP_BASE. A virt below it is a corrupt/garbage iopb pointer
+    // >= the direct-map base. A virt below it is a corrupt/garbage iopb pointer
     // (e.g. a clobbered userspace address); `virt_to_phys` would underflow.
-    let Some(phys) = virt.checked_sub(crate::mm::paging::DIRECT_MAP_BASE)
+    let Some(phys) = virt.checked_sub(crate::mm::paging::direct_map_base())
     else
     {
         crate::kprintln!(

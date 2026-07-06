@@ -48,7 +48,7 @@
 
 use boot_protocol::{IoApicEntry, MAX_IOAPICS};
 
-use crate::mm::paging::DIRECT_MAP_BASE;
+use super::paging::DIRECT_MAP_BASE;
 
 // ── Hardware constants ────────────────────────────────────────────────────────
 

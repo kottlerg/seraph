@@ -6,9 +6,9 @@
 //! Kernel page table initialization (Phase 3).
 //!
 //! Establishes two permanent kernel mappings:
-//! - **Direct physical map** at [`DIRECT_MAP_BASE`]: every 2 MiB chunk of RAM
+//! - **Direct physical map** at [`direct_map_base`]: every 2 MiB chunk of RAM
 //!   is mapped R/W- via 2 MiB large pages, so any physical address is
-//!   accessible as `DIRECT_MAP_BASE + phys`.
+//!   accessible as `direct_map_base() + phys`.
 //! - **Kernel image** at `0xFFFF_FFFF_8000_0000+`: `.text` as R-X, `.rodata`
 //!   as R--, `.data`+`.bss` as RW- (W^X enforced per section).
 //!
@@ -78,9 +78,24 @@ pub fn kernel_pml4_pa() -> u64
 
 /// Base virtual address of the direct physical map.
 ///
-/// Every physical address `phys` is accessible at `DIRECT_MAP_BASE + phys`
-/// after Phase 3 completes. The region occupies the upper half at PML4[256].
-pub const DIRECT_MAP_BASE: u64 = 0xFFFF_8000_0000_0000;
+/// Every physical address `phys` is accessible at `direct_map_base() + phys`
+/// after Phase 3 completes. The region starts at root entry 256 (the kernel
+/// half). Constant on x86-64; on riscv64 it is the active paging mode's
+/// kernel-half base, published at kernel entry — a single relaxed load.
+#[cfg(not(test))]
+#[inline(always)]
+pub fn direct_map_base() -> u64
+{
+    arch_paging::direct_map_base()
+}
+
+/// Test stub: the x86-64 / Sv48 base, matching the host-test default mode.
+#[cfg(test)]
+#[inline(always)]
+pub fn direct_map_base() -> u64
+{
+    0xFFFF_8000_0000_0000
+}
 
 /// Size of a 2 MiB large page (used for the direct physical map).
 pub const LARGE_PAGE_SIZE: u64 = 2 * 1024 * 1024;
@@ -89,14 +104,14 @@ pub const LARGE_PAGE_SIZE: u64 = 2 * 1024 * 1024;
 #[inline(always)]
 pub fn phys_to_virt(phys: u64) -> u64
 {
-    DIRECT_MAP_BASE + phys
+    direct_map_base() + phys
 }
 
 /// Convert a direct-map virtual address back to a physical address.
 #[inline(always)]
 pub fn virt_to_phys(virt: u64) -> u64
 {
-    virt - DIRECT_MAP_BASE
+    virt - direct_map_base()
 }
 
 // ── Error and flags types ─────────────────────────────────────────────────────
@@ -370,7 +385,7 @@ unsafe extern "C" {
 /// Initialize the kernel's own page tables and activate them (Phase 3).
 ///
 /// After this function returns:
-/// - Any physical address is accessible via `DIRECT_MAP_BASE + phys`.
+/// - Any physical address is accessible via `direct_map_base() + phys`.
 /// - Kernel sections are mapped with W^X permissions.
 /// - The boot stack remains accessible at its current virtual address.
 ///
@@ -422,9 +437,20 @@ pub fn init_kernel_page_tables(
     let max_phys = compute_max_physical_address(info);
     let max_phys_rounded = (max_phys + LARGE_PAGE_SIZE - 1) & !(LARGE_PAGE_SIZE - 1);
 
+    let dm_base = direct_map_base();
+    // The direct map must end below the kernel image's top-2-GiB window. The
+    // gap is mode-dependent — under Sv39 the kernel half is 256 GiB total,
+    // capping direct-mappable RAM at 254 GiB — so fail with a diagnostic
+    // rather than silently overlapping the image mapping.
+    if max_phys_rounded > info.kernel_virtual_base - dm_base
+    {
+        crate::fatal("Phase 3: RAM exceeds the active paging mode's direct-map capacity");
+    }
+
     // ── Direct physical map ───────────────────────────────────────────────────
-    // Map [0, max_phys_rounded) at DIRECT_MAP_BASE using 2 MiB large pages.
-    // The framebuffer MMIO (if above max_phys) is handled separately below.
+    // Map [0, max_phys_rounded) at the direct-map base using 2 MiB large
+    // pages. The framebuffer MMIO (if above max_phys) is handled separately
+    // below.
     let rw = PageFlags {
         readable: true,
         writable: true,
@@ -434,7 +460,7 @@ pub fn init_kernel_page_tables(
     let mut phys: u64 = 0;
     while phys < max_phys_rounded
     {
-        arch_paging::map_large_page(root_va, DIRECT_MAP_BASE + phys, phys, rw, &mut pool)?;
+        arch_paging::map_large_page(root_va, dm_base + phys, phys, rw, &mut pool)?;
         phys += LARGE_PAGE_SIZE;
     }
 
@@ -475,7 +501,7 @@ pub fn init_kernel_page_tables(
         let mut phys = start;
         while phys < end
         {
-            arch_paging::map_page(root_va, DIRECT_MAP_BASE + phys, phys, rw, &mut pool)?;
+            arch_paging::map_page(root_va, dm_base + phys, phys, rw, &mut pool)?;
             phys += PAGE_SIZE as u64;
         }
     }
@@ -491,7 +517,7 @@ pub fn init_kernel_page_tables(
     // `kernel_entry_ap`'s kernel virtual address.
     //
     // The kernel's other mappings are at high virtual addresses
-    // (DIRECT_MAP_BASE, kernel image), so the low-VA identity mapping does
+    // (direct map, kernel image), so the low-VA identity mapping does
     // not conflict. Once SMP bringup completes,
     // `mm::paging::unmap_identity_page` (called in Phase 8) retires the
     // mapping so the page can be reclaimed as a Memory cap.
@@ -678,7 +704,7 @@ fn map_framebuffer_if_needed(
     let mut phys = start;
     while phys < end
     {
-        arch_paging::map_page(root_va, DIRECT_MAP_BASE + phys, phys, rw, pool)?;
+        arch_paging::map_page(root_va, direct_map_base() + phys, phys, rw, pool)?;
         phys += PAGE_SIZE as u64;
     }
 
@@ -698,13 +724,13 @@ mod tests
     #[test]
     fn phys_to_virt_zero_equals_direct_map_base()
     {
-        assert_eq!(phys_to_virt(0), DIRECT_MAP_BASE);
+        assert_eq!(phys_to_virt(0), direct_map_base());
     }
 
     #[test]
     fn phys_to_virt_nonzero()
     {
-        assert_eq!(phys_to_virt(0x1000), DIRECT_MAP_BASE + 0x1000);
+        assert_eq!(phys_to_virt(0x1000), direct_map_base() + 0x1000);
     }
 
     #[test]

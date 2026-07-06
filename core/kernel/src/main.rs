@@ -171,7 +171,7 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
     }
 
     // Rebase the boot stack pointer from identity-mapped (VA == PA) to the
-    // direct physical map (VA == DIRECT_MAP_BASE + PA). The identity mapping
+    // direct physical map (VA == direct_map_base() + PA). The identity mapping
     // covers only 64 KiB around SP and can be exhausted by later phases;
     // the direct map covers all physical RAM with no size limit.
     //
@@ -187,10 +187,10 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
     // stval=0x9ddc0f58 from a stale `add s7, sp, 0x19E0`).
     //
     // SAFETY: new page tables active with direct map covering all RAM.
-    // Adding DIRECT_MAP_BASE to RSP/RBP switches to the same physical
+    // Adding the direct-map base to RSP/RBP switches to the same physical
     // frames through the direct map virtual range.
     unsafe {
-        arch::current::paging::rebase_boot_stack(mm::paging::DIRECT_MAP_BASE);
+        arch::current::paging::rebase_boot_stack(mm::paging::direct_map_base());
     }
 
     #[cfg(not(test))]
@@ -264,7 +264,7 @@ unsafe fn kernel_entry_post_rebase(
     kprintln!("Phase 3: Kernel Page Tables");
     kprintln!(
         "page tables active (direct map {:#x})",
-        mm::paging::DIRECT_MAP_BASE
+        mm::paging::direct_map_base()
     );
 
     // ── Phase 4: typed-memory cap surface ────────────────────────────────────

@@ -22,7 +22,7 @@
 //! Non-leaf: V=1, R=0, W=0, X=0. Leaf: V=1, at least one of R/W/X set.
 //! A megapage (2 MiB) is a leaf installed at level 1 in every mode.
 
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 pub use boot_protocol::riscv_paging::PagingMode;
 use boot_protocol::riscv_paging::{next_level_boundary, vpn_index};
@@ -39,6 +39,13 @@ use crate::mm::paging::{PageFlags, PagingError, PoolState};
 /// everywhere after. The Sv48 default keeps host unit tests on today's
 /// behaviour without an init call.
 static PAGING_MODE: AtomicU8 = AtomicU8::new(PagingMode::Sv48 as u8);
+
+/// The active mode's kernel-half base, resolved once at [`init_paging_mode`]
+/// so the hot `phys_to_virt` path is a single relaxed load plus add.
+static DIRECT_MAP_BASE_VAL: AtomicU64 = AtomicU64::new(0xFFFF_8000_0000_0000);
+
+/// The active mode's exclusive user-half top, resolved with the base above.
+static USER_VA_TOP_VAL: AtomicU64 = AtomicU64::new(0x0000_8000_0000_0000);
 
 /// Publish the active paging mode from the `satp` CSR.
 ///
@@ -60,6 +67,8 @@ pub fn init_paging_mode()
         super::cpu::halt_loop();
     };
     PAGING_MODE.store(mode as u8, Ordering::Relaxed);
+    DIRECT_MAP_BASE_VAL.store(mode.kernel_va_base(), Ordering::Relaxed);
+    USER_VA_TOP_VAL.store(mode.user_va_top(), Ordering::Relaxed);
 }
 
 /// Test-build stub: host unit tests run with the [`PAGING_MODE`] default.
@@ -82,6 +91,21 @@ pub fn paging_mode() -> PagingMode
 pub(super) fn make_kernel_satp(root_pa: u64) -> u64
 {
     paging_mode().make_satp(root_pa, 0)
+}
+
+/// Base virtual address of the direct physical map: the active mode's
+/// kernel-half base (root entry 256 in every mode).
+#[inline]
+pub fn direct_map_base() -> u64
+{
+    DIRECT_MAP_BASE_VAL.load(Ordering::Relaxed)
+}
+
+/// Exclusive upper bound of user-half virtual addresses under the active mode.
+#[inline]
+pub fn user_va_top() -> u64
+{
+    USER_VA_TOP_VAL.load(Ordering::Relaxed)
 }
 
 // ── PTE bit constants ─────────────────────────────────────────────────────────
@@ -1190,7 +1214,6 @@ pub unsafe fn flush_tlb_all()
 mod tests
 {
     use super::*;
-    use crate::mm::paging::DIRECT_MAP_BASE;
 
     // ── PTE construction ──────────────────────────────────────────────────────
 
@@ -1265,8 +1288,9 @@ mod tests
                 assert_eq!(vpn_index(level, mode.kernel_va_base()), 0);
             }
         }
-        // The direct map sits at the Sv48 kernel-half base.
-        assert_eq!(vpn_index(3, DIRECT_MAP_BASE), 256);
+        // The direct map sits at the active mode's kernel-half base
+        // (host-test default: Sv48).
+        assert_eq!(vpn_index(3, crate::mm::paging::direct_map_base()), 256);
     }
 
     #[test]

@@ -194,9 +194,10 @@ impl TrapFrame
     /// to `SyscallError::InvalidArgument`.
     pub fn sanitize_for_user_resume(&mut self) -> Result<(), ()>
     {
-        // sepc must be a valid user address. On RV64, virtual addresses in the
-        // supervisor range start at 0xFFFF_FFC0_0000_0000 (sv39). Any address
-        // >= 0x8000_0000_0000_0000 is non-user.
+        // sepc must be a valid user address. In every paging mode the user
+        // half tops out at or below 1 << 56, so any address with bit 63 set
+        // (or anywhere >= 1 << 63) is non-user; addresses in the
+        // non-canonical gap fault on their own at sret.
         const USER_ADDR_LIMIT: u64 = 0x8000_0000_0000_0000;
         if self.sepc >= USER_ADDR_LIMIT
         {

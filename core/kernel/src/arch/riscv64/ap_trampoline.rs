@@ -20,7 +20,7 @@
 //! 0x020  Zero padding
 //! 0x040  Per-AP param slots: (cpu_count - 1) × PARAM_SLOT_SIZE (32) bytes
 //!        Slot for cpu_idx N (1-based):  trampoline_pa + PARAMS_OFFSET + (N-1)*PARAM_SLOT_SIZE
-//!          +0   satp:       u64   — Sv48 SATP value ((9<<60)|(root_pa>>12))
+//!          +0   satp:       u64   — SATP value under the active paging mode
 //!          +8   entry_virt: u64   — virtual address of kernel_entry_ap
 //!          +16  stack_top:  u64   — kernel idle-thread stack top (loaded into sp)
 //!          +24  cpu_id:     u64   — logical CPU index (overwrites hart_id in a0)
@@ -37,7 +37,7 @@
 //!     ld   t1,  8(a1)    // kernel_entry_ap VA
 //!     ld   t2, 16(a1)    // kernel stack top
 //!     ld   a0, 24(a1)    // cpu_id (overwrites hart_id)
-//!     csrw satp, t0      // enable Sv48 paging
+//!     csrw satp, t0      // enable paging (mode baked into the value)
 //!     sfence.vma x0, x0  // flush all TLB entries
 //!     mv   sp, t2        // switch to kernel stack
 //!     jr   t1            // jump to kernel_entry_ap
@@ -63,7 +63,7 @@ pub const PARAMS_OFFSET: usize = 0x40;
 pub const PARAM_SLOT_SIZE: usize = 32;
 
 // Sub-offsets within each param slot (byte offsets, u64-aligned).
-const PARAM_SATP: usize = 0; // u64: Sv48 SATP value
+const PARAM_SATP: usize = 0; // u64: SATP value under the active paging mode
 const PARAM_ENTRY: usize = 8; // u64: kernel_entry_ap virtual address
 const PARAM_STACK: usize = 16; // u64: kernel idle stack top
 const PARAM_CPU_ID: usize = 24; // u64: logical CPU index
@@ -168,9 +168,10 @@ pub unsafe fn setup_trampoline(trampoline_pa: u64)
 
 /// Start one AP via SBI HSM `hart_start`.
 ///
-/// Sets up per-AP params, constructs the Sv48 SATP value from the kernel root
-/// page table, and calls `sbi_hart_start`. Returns `false` if SBI rejected the
-/// request (e.g. invalid hart ID or implementation error).
+/// Sets up per-AP params, constructs the SATP value from the kernel root page
+/// table under the active paging mode, and calls `sbi_hart_start`. Returns
+/// `false` if SBI rejected the request (e.g. invalid hart ID or
+/// implementation error).
 ///
 /// # Parameters
 /// - `trampoline_pa`: physical address of the trampoline page.
@@ -192,9 +193,8 @@ pub unsafe fn start_ap(
     stack_top: u64,
 ) -> bool
 {
-    // Sv48 SATP: mode=9 (bits[63:60]), ASID=0, PPN = root_pa >> 12.
     let root_pa = crate::mm::paging::kernel_pml4_pa();
-    let satp = (9u64 << 60) | (root_pa >> 12);
+    let satp = super::paging::make_kernel_satp(root_pa);
 
     // SAFETY: setup_trampoline called; direct map active.
     unsafe {

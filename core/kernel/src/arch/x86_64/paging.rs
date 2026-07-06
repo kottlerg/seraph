@@ -255,6 +255,11 @@ fn walk_or_alloc(entry: &mut PageTableEntry, pool: &mut PoolState) -> Result<u64
 // test builds (they compile fine on x86-64 hosts but must never be called
 // from user-space tests; the cfg gate prevents accidental invocation).
 
+/// Publish the active paging mode at kernel entry: no-op — x86-64 runs
+/// unconditionally under 4-level paging, so there is no mode to record.
+/// Cross-arch hook for RISC-V, where the bootloader negotiates Sv39/Sv48/Sv57.
+pub fn init_paging_mode() {}
+
 /// Write CR3 without an explicit TLB flush.
 ///
 /// On x86-64 without PCID, writing CR3 implicitly flushes the TLB, so this

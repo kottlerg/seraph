@@ -20,7 +20,66 @@
 //! Non-leaf: V=1, R=0, W=0, X=0. Leaf: V=1, at least one of R/W/X set.
 //! A megapage (2 MiB) is a leaf installed at level 1 (VPN\[1\]).
 
+use core::sync::atomic::{AtomicU8, Ordering};
+
+pub use boot_protocol::riscv_paging::PagingMode;
+
 use crate::mm::paging::{PageFlags, PagingError, PoolState};
+
+// ── Active paging mode ────────────────────────────────────────────────────────
+
+/// The paging mode this hart booted under, as a raw `satp.MODE` value.
+///
+/// Written once by [`init_paging_mode`] at kernel entry, before any consumer
+/// runs and before APs start (SBI `hart_start` plus the trampoline param
+/// block provide the happens-before for secondary harts); read lock-free
+/// everywhere after. The Sv48 default keeps host unit tests on today's
+/// behaviour without an init call.
+static PAGING_MODE: AtomicU8 = AtomicU8::new(PagingMode::Sv48 as u8);
+
+/// Publish the active paging mode from the `satp` CSR.
+///
+/// The bootloader hands the kernel a running translation regime; `satp.MODE`
+/// is therefore the authoritative record of the negotiated mode and needs no
+/// boot-protocol field. Halts the hart on an unrecognizable MODE — this runs
+/// pre-console, matching the silent-halt policy of `BootInfo` validation.
+#[cfg(not(test))]
+pub fn init_paging_mode()
+{
+    let satp: u64;
+    // SAFETY: reads the satp CSR only; always valid in S-mode.
+    unsafe {
+        core::arch::asm!("csrr {}, satp", out(reg) satp, options(nomem, nostack, preserves_flags));
+    }
+    let Some(mode) = PagingMode::from_satp_mode(satp >> 60)
+    else
+    {
+        super::cpu::halt_loop();
+    };
+    PAGING_MODE.store(mode as u8, Ordering::Relaxed);
+}
+
+/// Test-build stub: host unit tests run with the [`PAGING_MODE`] default.
+#[cfg(test)]
+pub fn init_paging_mode() {}
+
+/// The active paging mode published at kernel entry.
+pub fn paging_mode() -> PagingMode
+{
+    // The store site only writes values produced by `PagingMode::from_satp_mode`,
+    // so the decode cannot fail.
+    match PagingMode::from_satp_mode(u64::from(PAGING_MODE.load(Ordering::Relaxed)))
+    {
+        Some(mode) => mode,
+        None => unreachable!(),
+    }
+}
+
+/// Construct a `satp` value for `root_pa` under the active mode, ASID 0.
+pub(super) fn make_kernel_satp(root_pa: u64) -> u64
+{
+    paging_mode().make_satp(root_pa, 0)
+}
 
 // ── PTE bit constants ─────────────────────────────────────────────────────────
 
@@ -248,14 +307,6 @@ fn walk_or_alloc(entry: &mut PageTableEntry, pool: &mut PoolState) -> Result<u64
 
 // ── Hardware operations ───────────────────────────────────────────────────────
 
-/// Activate Sv48 paging by writing `satp` and issuing `sfence.vma`.
-///
-/// `satp` encoding: mode 9 (Sv48) in bits \[63:60\], ASID 0, root PPN in
-/// bits \[43:0\].
-///
-/// # Safety
-/// The tables must map the currently executing code and active stack.
-#[cfg(not(test))]
 /// Write `satp` to point at `root_phys` without executing `sfence.vma`.
 ///
 /// Used when transitioning to idle where stale user TLB entries are harmless
@@ -268,7 +319,7 @@ fn walk_or_alloc(entry: &mut PageTableEntry, pool: &mut PoolState) -> Result<u64
 #[cfg(not(test))]
 pub unsafe fn write_satp_no_fence(root_phys: u64)
 {
-    let satp = (9u64 << 60) | (root_phys >> 12);
+    let satp = make_kernel_satp(root_phys);
     // SAFETY: satp CSR write is safe in S-mode; root_phys is valid.
     unsafe {
         core::arch::asm!(
@@ -287,8 +338,8 @@ pub unsafe fn write_satp_no_fence(root_phys: u64)
 #[cfg(not(test))]
 pub unsafe fn activate(root_phys: u64)
 {
-    let satp = (9u64 << 60) | (root_phys >> 12);
-    // SAFETY: satp write switches active Sv48 page table; root_phys is a valid root frame;
+    let satp = make_kernel_satp(root_phys);
+    // SAFETY: satp write switches the active page table; root_phys is a valid root frame;
     // caller guarantees tables map current code, stack, and direct map. sfence.vma flushes
     // TLB. RISC-V S-mode architecture primitive.
     unsafe {
@@ -301,7 +352,7 @@ pub unsafe fn activate(root_phys: u64)
     }
 }
 
-/// Activate the Sv48 tables rooted at `root_phys` under ASID `tag` **without**
+/// Activate the tables rooted at `root_phys` under ASID `tag` **without**
 /// issuing `sfence.vma`.
 ///
 /// Encodes `tag` into `satp[59:44]` and the root PPN into `satp[43:0]`; cached
@@ -311,13 +362,13 @@ pub unsafe fn activate(root_phys: u64)
 ///
 /// # Safety
 /// Must execute in S-mode on a hart with a non-zero implemented ASID width.
-/// `root_phys` must be a valid Sv48 root mapping the currently executing code,
+/// `root_phys` must be a valid root mapping the currently executing code,
 /// the active stack, and the direct map.
 #[cfg(not(test))]
 pub unsafe fn activate_tagged(root_phys: u64, tag: u16)
 {
-    let satp = (9u64 << 60) | (u64::from(tag) << 44) | (root_phys >> 12);
-    // SAFETY: satp write switches the active Sv48 root and ASID; the deliberate
+    let satp = paging_mode().make_satp(root_phys, tag);
+    // SAFETY: satp write switches the active root and ASID; the deliberate
     // absence of sfence.vma retains cached translations; caller guarantees the
     // tables map current code, stack, and the direct map.
     unsafe {

@@ -96,6 +96,11 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
         arch::current::cpu::halt_loop();
     }
 
+    // Publish the paging mode the bootloader activated (recovered from the
+    // translation registers, not BootInfo) before any consumer of the
+    // mode-derived VA layout runs. No-op on architectures with a single mode.
+    arch::current::paging::init_paging_mode();
+
     // SAFETY: validate_boot_info confirmed non-null, aligned, and readable.
     let info = unsafe { &*boot_info };
 

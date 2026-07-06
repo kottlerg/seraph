@@ -20,6 +20,7 @@
 #![no_std]
 
 pub mod bundle;
+pub mod riscv_paging;
 pub mod role_guids;
 
 /// Current boot protocol version. Increment when `BootInfo` layout or the

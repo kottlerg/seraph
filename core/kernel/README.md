@@ -27,7 +27,7 @@ kernel/
 │   │   │   ├── paging.rs       # Page table management (PML4/PML3/PML2/PML1)
 │   │   │   ├── context.rs      # Thread context save/restore, context switch
 │   │   │   ├── interrupts.rs   # IDT, exception handlers, APIC
-│   │   │   ├── timer.rs        # APIC timer for preemption
+│   │   │   ├── timer.rs        # TSC-deadline / periodic-APIC timer for preemption
 │   │   │   ├── syscall.rs      # SYSCALL/SYSRET entry glue
 │   │   │   ├── cpu.rs          # CPUID, topology, per-CPU state (GDT/TSS)
 │   │   │   ├── console.rs      # Early framebuffer/serial output

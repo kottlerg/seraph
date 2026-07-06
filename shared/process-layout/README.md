@@ -14,9 +14,11 @@ process, and writes the result into the handover surface and the entry register;
 the created process reads the addresses back rather than assuming fixed values.
 
 Each surface is drawn independently inside a fixed per-region `VaWindow`
-(ASLR, [#39](https://github.com/kottlerg/seraph/issues/39)): 2^23 page-aligned
-slots on 64 GiB strides in the top PML4/Sv48-root slot, so disjointness, region
-ordering, and the stack guard gap hold for every possible draw. The crate is
+(ASLR, [#39](https://github.com/kottlerg/seraph/issues/39)): 2^21 page-aligned
+slots on 9 GiB strides, the whole map below `LAYOUT_VA_CEILING` (2^38, the
+smallest supported user half — riscv64 Sv39) so one static layout is canonical
+under every paging mode on both architectures, with disjointness, region
+ordering, and the stack guard gap holding for every possible draw. The crate is
 pure: entropy is injected as pre-drawn bytes, and a creator whose entropy draw
 failed passes `None` to fall back to the deterministic `DEFAULT_*` addresses.
 The kernel reuses the `INIT_*` windows for init's per-boot layout, and the
@@ -36,7 +38,7 @@ The kernel reuses the `INIT_*` windows for init's per-boot layout, and the
 | `IMAGE_WINDOW`, `IMAGE_MAX_SPAN`, `choose_image_bias`, `validate_image_placement` | ET_DYN load-bias window and placement validation. |
 | `LAYOUT_ENTROPY_BYTES` | Entropy bytes one layout draw consumes. |
 | `DEFAULT_PROCESS_INFO_VA`, `DEFAULT_STACK_TOP`, `DEFAULT_MAIN_TLS_VA`, `DEFAULT_IPC_BUFFER_VA` | Degraded-fallback addresses (outside the draw windows by design). |
-| `USER_HALF_TOP` | Exclusive top of the canonical user half on both architectures. |
+| `LAYOUT_VA_CEILING` | Exclusive ceiling for every layout zone: the smallest supported user half (Sv39, 2^38). |
 
 Page counts are not part of the layout: stack size comes from the binary's
 `.note.seraph.stack` ELF note and TLS size from its `PT_TLS` segment, both

@@ -83,11 +83,11 @@ use process_layout::{INIT_INFO_WINDOW, INIT_STACK_GUARD_WINDOW};
 /// Degraded-fallback base of the read-only `InitInfo` region mapped into init,
 /// used only when the entropy pool is unavailable at the layout draw. The
 /// region spans up to `INIT_INFO_MAX_PAGES` contiguous pages from this address.
-pub const DEFAULT_INIT_INFO_VA: u64 = 0x7FFF_FFFF_5000;
+pub const DEFAULT_INIT_INFO_VA: u64 = 0x3F_FFFF_5000;
 
 /// Degraded-fallback top of init's user stack. `INIT_STACK_PAGES` pages map
 /// immediately below, with one unmapped guard page beneath them.
-pub const DEFAULT_INIT_STACK_TOP: u64 = 0x7FFF_FFFF_E000;
+pub const DEFAULT_INIT_STACK_TOP: u64 = 0x3F_FFFF_E000;
 
 /// Bootstrap virtual addresses the kernel chooses for the init process.
 ///
@@ -1136,7 +1136,7 @@ impl AddressSpace
 #[cfg(test)]
 mod init_layout_tests
 {
-    use process_layout::{INIT_INFO_WINDOW, INIT_STACK_GUARD_WINDOW, USER_HALF_TOP};
+    use process_layout::{INIT_INFO_WINDOW, INIT_STACK_GUARD_WINDOW, LAYOUT_VA_CEILING};
 
     use super::*;
 
@@ -1153,7 +1153,7 @@ mod init_layout_tests
             let stack_reserve = (1 + INIT_STACK_PAGES as u64) * page;
             let guard = layout.init_stack_top - stack_reserve;
             assert!(INIT_STACK_GUARD_WINDOW.contains(guard));
-            assert!(layout.init_stack_top < USER_HALF_TOP);
+            assert!(layout.init_stack_top < LAYOUT_VA_CEILING);
 
             // InitInfo region (INIT_INFO_MAX_PAGES) vs stack reservation
             // (guard + INIT_STACK_PAGES): disjoint for every draw.

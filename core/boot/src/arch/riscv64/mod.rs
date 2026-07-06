@@ -100,6 +100,14 @@ pub unsafe fn populate_kernel_mmio(firmware: &FirmwareInfo, km: &mut KernelMmio)
         // SAFETY: caller guarantees device_tree is valid when non-zero.
         unsafe { dtb_kernel_mmio::parse_kernel_mmio(firmware.device_tree, km) };
     }
+
+    // The kernel timer refuses to boot without these; log what the firmware
+    // tables actually provided so a refusal is diagnosable from the boot log.
+    crate::bprintln!(
+        "[--------] boot: timer caps: timebase-frequency={} Hz, sstc={}",
+        km.timebase_freq,
+        km.hart_caps & boot_protocol::HART_CAP_SSTC != 0
+    );
 }
 
 /// Query `EFI_RISCV_BOOT_PROTOCOL` for the boot hart ID.

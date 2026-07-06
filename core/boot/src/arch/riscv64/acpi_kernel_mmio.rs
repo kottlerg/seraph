@@ -6,23 +6,22 @@
 //! RISC-V `kernel_mmio` extraction from ACPI.
 //!
 //! Walks RSDP → XSDT → MADT for the PLIC entry (type 0x1B) to populate
-//! [`KernelMmio::plic_base`] and `plic_size`, and uses the shared SPCR
-//! walker to populate [`KernelMmio::uart_base`] and `uart_size`. Fields
+//! [`KernelMmio::plic_base`] and `plic_size`, uses the shared SPCR
+//! walker to populate [`KernelMmio::uart_base`] and `uart_size`, and
+//! uses the shared RHCT walker to populate the non-MMIO hart facts
+//! [`KernelMmio::timebase_freq`] and [`KernelMmio::hart_caps`]. Fields
 //! already non-zero are left untouched so a caller that has run an
 //! earlier pass (currently: none; reserved for future higher-authority
-//! sources) wins.
+//! sources) wins; `hart_caps` bits are only ever set, never cleared.
 //!
 //! The generic ACPI primitives (RSDP/XSDT validation, byte readers,
-//! SPCR walker) live in [`crate::acpi`]; only the RISC-V-specific
-//! interpretation of MADT entries and the UART size convention live
-//! here.
+//! SPCR and RHCT walkers) live in [`crate::acpi`]; only the
+//! RISC-V-specific interpretation of MADT entries and the UART size
+//! convention live here.
 
 use super::acpi_spcr::find_spcr_base;
-use crate::acpi::{
-    MADT_ENTRIES_OFF, MADT_TYPE_PLIC, RSDP_OFF_REVISION, RSDP_OFF_XSDT, RSDP_SIG, SDT_HDR_LEN,
-    SDT_OFF_LENGTH, SDT_OFF_SIGNATURE, phys_slice, read_u8, read_u32, read_u64,
-};
-use boot_protocol::KernelMmio;
+use crate::acpi::{MADT_ENTRIES_OFF, MADT_TYPE_PLIC, find_acpi_table, read_u8, read_u32, read_u64};
+use boot_protocol::{HART_CAP_SSTC, KernelMmio};
 
 /// Conventional ns16550a register-file size. SPCR does not specify a
 /// region size; DTB (if subsequently run) does and overrides this.
@@ -38,6 +37,8 @@ const NS16550A_MMIO_SIZE: u64 = 0x100;
 ///   Generic Address Structure's `address` field; `km.uart_size` is set
 ///   to the ns16550a conventional [`NS16550A_MMIO_SIZE`] (0x100) since
 ///   SPCR does not carry a size field.
+/// - RHCT (via the shared walker) → `km.timebase_freq` and, when every
+///   hart's ISA string names Sstc, `km.hart_caps |= HART_CAP_SSTC`.
 ///
 /// Fields the caller left non-zero are preserved; fields left zero are
 /// populated when the corresponding table is present.
@@ -53,7 +54,10 @@ pub unsafe fn parse_kernel_mmio(rsdp_addr: u64, km: &mut KernelMmio)
     }
 
     // SAFETY: caller guarantees rsdp_addr is valid and identity-mapped.
-    unsafe { extract_madt_plic(rsdp_addr, km) };
+    if let Some(madt) = unsafe { find_acpi_table(rsdp_addr, *b"APIC") }
+    {
+        scan_madt_for_plic(madt, km);
+    }
 
     if km.uart_base == 0
     {
@@ -64,64 +68,16 @@ pub unsafe fn parse_kernel_mmio(rsdp_addr: u64, km: &mut KernelMmio)
             km.uart_size = NS16550A_MMIO_SIZE;
         }
     }
-}
 
-/// Walk RSDP → XSDT → MADT on the RISC-V arch and populate the PLIC fields.
-///
-/// # Safety
-/// `rsdp_addr` must be a valid, identity-mapped ACPI RSDP.
-unsafe fn extract_madt_plic(rsdp_addr: u64, km: &mut KernelMmio)
-{
-    // SAFETY: caller guarantees rsdp_addr is valid.
-    let rsdp = unsafe { phys_slice(rsdp_addr, 36) };
-    if &rsdp[..8] != RSDP_SIG || read_u8(rsdp, RSDP_OFF_REVISION) < 2
+    // SAFETY: rsdp_addr validity propagates.
+    let (timebase_freq, sstc) = unsafe { crate::acpi::parse_timer_caps(rsdp_addr) };
+    if km.timebase_freq == 0
     {
-        return;
+        km.timebase_freq = timebase_freq;
     }
-    let xsdt_addr = read_u64(rsdp, RSDP_OFF_XSDT);
-    if xsdt_addr == 0
+    if sstc
     {
-        return;
-    }
-
-    // SAFETY: xsdt_addr from validated RSDP.
-    let xsdt_hdr = unsafe { phys_slice(xsdt_addr, SDT_HDR_LEN) };
-    if &xsdt_hdr[SDT_OFF_SIGNATURE..SDT_OFF_SIGNATURE + 4] != b"XSDT"
-    {
-        return;
-    }
-    let xsdt_len = read_u32(xsdt_hdr, SDT_OFF_LENGTH) as usize;
-    if xsdt_len < SDT_HDR_LEN
-    {
-        return;
-    }
-    // SAFETY: length validated above.
-    let xsdt = unsafe { phys_slice(xsdt_addr, xsdt_len) };
-    let entries_bytes = &xsdt[SDT_HDR_LEN..];
-    let entry_count = entries_bytes.len() / 8;
-
-    for i in 0..entry_count
-    {
-        let table_addr = read_u64(entries_bytes, i * 8);
-        if table_addr == 0
-        {
-            continue;
-        }
-        // SAFETY: table_addr read from validated XSDT.
-        let hdr = unsafe { phys_slice(table_addr, SDT_HDR_LEN) };
-        if &hdr[SDT_OFF_SIGNATURE..SDT_OFF_SIGNATURE + 4] != b"APIC"
-        {
-            continue;
-        }
-        let table_len = read_u32(hdr, SDT_OFF_LENGTH) as usize;
-        if table_len < SDT_HDR_LEN
-        {
-            continue;
-        }
-        // SAFETY: length validated above.
-        let table = unsafe { phys_slice(table_addr, table_len) };
-        scan_madt_for_plic(table, km);
-        return;
+        km.hart_caps |= HART_CAP_SSTC;
     }
 }
 

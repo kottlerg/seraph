@@ -12,9 +12,8 @@
 //! lives here.
 
 use crate::acpi::{
-    MADT_ENTRIES_OFF, MADT_TYPE_IOAPIC, MADT_TYPE_LAPIC_OVERRIDE, RSDP_OFF_REVISION, RSDP_OFF_XSDT,
-    RSDP_SIG, SDT_HDR_LEN, SDT_OFF_LENGTH, SDT_OFF_SIGNATURE, phys_slice, read_u8, read_u32,
-    read_u64,
+    MADT_ENTRIES_OFF, MADT_TYPE_IOAPIC, MADT_TYPE_LAPIC_OVERRIDE, SDT_HDR_LEN, find_acpi_table,
+    read_u8, read_u32, read_u64,
 };
 use crate::bprintln;
 use boot_protocol::{IoApicEntry, KernelMmio, MAX_IOAPICS};
@@ -32,58 +31,10 @@ use boot_protocol::{IoApicEntry, KernelMmio, MAX_IOAPICS};
 /// ACPI RSDP.
 pub unsafe fn parse_kernel_mmio(rsdp_addr: u64, km: &mut KernelMmio)
 {
-    if rsdp_addr == 0
-    {
-        return;
-    }
     // SAFETY: caller guarantees rsdp_addr is a valid, identity-mapped RSDP.
-    let rsdp = unsafe { phys_slice(rsdp_addr, 36) };
-    if &rsdp[..8] != RSDP_SIG || read_u8(rsdp, RSDP_OFF_REVISION) < 2
+    if let Some(madt) = unsafe { find_acpi_table(rsdp_addr, *b"APIC") }
     {
-        return;
-    }
-    let xsdt_addr = read_u64(rsdp, RSDP_OFF_XSDT);
-    if xsdt_addr == 0
-    {
-        return;
-    }
-
-    // SAFETY: xsdt_addr comes from a validated RSDP.
-    let xsdt_hdr = unsafe { phys_slice(xsdt_addr, SDT_HDR_LEN) };
-    if &xsdt_hdr[SDT_OFF_SIGNATURE..SDT_OFF_SIGNATURE + 4] != b"XSDT"
-    {
-        return;
-    }
-    let xsdt_len = read_u32(xsdt_hdr, SDT_OFF_LENGTH) as usize;
-    if xsdt_len < SDT_HDR_LEN
-    {
-        return;
-    }
-    // SAFETY: length validated above.
-    let xsdt = unsafe { phys_slice(xsdt_addr, xsdt_len) };
-    let entries_bytes = &xsdt[SDT_HDR_LEN..];
-    let entry_count = entries_bytes.len() / 8;
-
-    for i in 0..entry_count
-    {
-        let table_addr = read_u64(entries_bytes, i * 8);
-        if table_addr == 0
-        {
-            continue;
-        }
-        // SAFETY: table_addr read from validated XSDT.
-        let hdr = unsafe { phys_slice(table_addr, SDT_HDR_LEN) };
-        if &hdr[SDT_OFF_SIGNATURE..SDT_OFF_SIGNATURE + 4] == b"APIC"
-        {
-            let table_len = read_u32(hdr, SDT_OFF_LENGTH) as usize;
-            if table_len >= SDT_HDR_LEN
-            {
-                // SAFETY: length validated.
-                let table = unsafe { phys_slice(table_addr, table_len) };
-                extract_madt_kernel_mmio(table, km);
-                return;
-            }
-        }
+        extract_madt_kernel_mmio(madt, km);
     }
 }
 

@@ -12,6 +12,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::arch::Arch;
 use crate::bundle::Harness;
+use crate::qemu::RiscvMmu;
 
 /// Top-level CLI entry point.
 #[derive(Parser)]
@@ -185,6 +186,12 @@ pub struct RunArgs
     /// Guest memory size in MiB (QEMU -m).
     #[arg(long, default_value = "512")]
     pub mem: u32,
+
+    /// Guest RISC-V paging-mode ceiling (riscv64 only; ignored on `x86_64`).
+    /// The kernel negotiates the highest advertised mode at boot, so this
+    /// selects the mode a run exercises.
+    #[arg(long, default_value = "sv48")]
+    pub riscv_mmu: RiscvMmu,
 }
 
 // ── Mkdisk ────────────────────────────────────────────────────────────────────
@@ -306,6 +313,12 @@ pub struct RunParallelArgs
     /// Guest memory size in MiB (QEMU -m).
     #[arg(long, default_value = "512")]
     pub mem: u32,
+
+    /// Guest RISC-V paging-mode ceiling (riscv64 only; ignored on `x86_64`).
+    /// The kernel negotiates the highest advertised mode at boot, so this
+    /// selects the mode every run in the batch exercises.
+    #[arg(long, default_value = "sv48")]
+    pub riscv_mmu: RiscvMmu,
 
     /// Regex marking a successful run. On match the log is discarded and
     /// the run is classified PASS. The default matches the cross-harness

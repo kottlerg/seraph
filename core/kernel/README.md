@@ -37,7 +37,7 @@ kernel/
 │   │       ├── paging.rs       # Page table management (Sv48)
 │   │       ├── context.rs      # Thread context save/restore, context switch
 │   │       ├── interrupts.rs   # stvec, trap handler, PLIC
-│   │       ├── timer.rs        # SBI timer for preemption
+│   │       ├── timer.rs        # Sstc (stimecmp) timer for preemption
 │   │       ├── syscall.rs      # ECALL entry glue
 │   │       ├── cpu.rs          # Hart ID, topology, per-hart state
 │   │       ├── console.rs      # Early SBI console / framebuffer output

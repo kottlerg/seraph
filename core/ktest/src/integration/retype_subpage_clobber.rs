@@ -30,13 +30,13 @@ use syscall::{MAP_WRITABLE, cap_create_endpoint, cap_delete, mem_map, mem_unmap}
 use crate::{TestContext, TestResult};
 
 /// Clobber-mapping VA — distinct from other integration tests
-/// (`tlb_coherency` uses `0x5000_0000`).
-const CLOBBER_VA: u64 = 0x5400_0000;
+/// (`tlb_coherency` uses `0x1_5000_0000`).
+const CLOBBER_VA: u64 = 0x1_5400_0000;
 
 /// Bogus link value written into the freed slot's link cell: a user-range,
 /// page-misaligned pointer far outside any Memory cap's `size`. Mirrors the
 /// real-world corruption (a spawned process's stack pointer).
-const POISON: u64 = 0x7FFF_FFFF_D048;
+const POISON: u64 = 0x3F_FFFF_D048;
 
 pub fn run(ctx: &TestContext) -> TestResult
 {

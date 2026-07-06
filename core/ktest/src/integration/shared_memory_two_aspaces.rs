@@ -22,8 +22,8 @@ use crate::{TestContext, TestResult};
 
 /// Distinct VAs so the mappings don't alias each other within the same
 /// aspace (we map at `VA_A` in ktest's aspace and `VA_B` in the second aspace).
-const VA_A: u64 = 0x5800_0000;
-const VA_B: u64 = 0x5900_0000;
+const VA_A: u64 = 0x1_5800_0000;
+const VA_B: u64 = 0x1_5900_0000;
 
 pub fn run(ctx: &TestContext) -> TestResult
 {

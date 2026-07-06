@@ -7,7 +7,7 @@ use super::{cycles_now, log_bench_header};
 
 pub(super) fn bench_mem_map_unmap(ctx: &crate::TestContext, iters: u32)
 {
-    const BENCH_VA: u64 = 0x6000_0000;
+    const BENCH_VA: u64 = 0x1_6000_0000;
 
     let n = u64::from(iters);
     let Some(memory_cap) = crate::frame_pool::alloc()
@@ -66,7 +66,7 @@ pub(super) fn bench_mem_map_unmap(ctx: &crate::TestContext, iters: u32)
 /// flip — relevant for any future mmap-like userspace API.
 pub(super) fn bench_mem_protect(ctx: &crate::TestContext, iters: u32)
 {
-    const BENCH_VA: u64 = 0x6100_0000;
+    const BENCH_VA: u64 = 0x1_6100_0000;
 
     let n = u64::from(iters);
     let Some(memory_cap) = crate::frame_pool::alloc()

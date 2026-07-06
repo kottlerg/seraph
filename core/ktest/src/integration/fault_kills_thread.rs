@@ -27,9 +27,9 @@ use syscall_abi::{CAP_INFO_THREAD_STATE, EXIT_FAULT_BASE, THREAD_STATE_EXITED};
 
 use crate::{ChildStack, TestContext, TestResult};
 
-/// A user-half virtual address that no test maps (96 TiB, canonical, well clear
-/// of every other test's mappings).
-const WILD_VA: u64 = 0x6000_0000_0000;
+/// A user VA that no test maps — canonical in every paging mode (below the
+/// 2^38 Sv39 user half), well clear of every other test's mappings.
+const WILD_VA: u64 = 0x3E_0000_0000;
 
 /// Fault vector recorded in `exit_reason` for a not-present store.
 #[cfg(target_arch = "x86_64")]

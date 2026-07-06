@@ -26,11 +26,12 @@ use syscall_abi::{CAP_INFO_THREAD_STATE, EXIT_FAULT_BASE, SyscallError, THREAD_S
 
 use crate::{TestContext, TestResult};
 
-/// Unmapped canonical user-half VA used as the doomed thread's entry PC; the
-/// first instruction fetch faults. Distinct from the other fault tests' VAs.
-const UNMAPPED_ENTRY: u64 = 0x7000_0000_0000;
+/// Unmapped user VA used as the doomed thread's entry PC; the first
+/// instruction fetch faults. Canonical in every paging mode (below the 2^38
+/// Sv39 user half) and distinct from the other fault tests' VAs.
+const UNMAPPED_ENTRY: u64 = 0x3E_2000_0000;
 /// Unmapped stack pointer — never reached (the entry fetch faults first).
-const UNMAPPED_STACK: u64 = 0x7000_0000_8000;
+const UNMAPPED_STACK: u64 = 0x3E_2000_8000;
 
 /// Distinct, non-zero correlator so a dropped/misrouted event surfaces as a
 /// wrong high word rather than a coincidental zero.

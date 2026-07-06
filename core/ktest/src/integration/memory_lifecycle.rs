@@ -20,7 +20,7 @@ use syscall::{aspace_query, mem_protect, mem_unmap};
 
 use crate::{TestContext, TestResult};
 
-const TEST_VA: u64 = 0x4800_0000; // 1.125 GiB — distinct from unit/mm.rs TEST_VA.
+const TEST_VA: u64 = 0x1_4800_0000; // Distinct from unit/mm.rs TEST_VA.
 
 pub fn run(ctx: &TestContext) -> TestResult
 {

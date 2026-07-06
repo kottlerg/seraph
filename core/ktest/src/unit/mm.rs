@@ -33,7 +33,7 @@ use crate::{TestContext, TestResult};
 
 /// Safe test virtual address: 1 GiB. Well above ktest's load address and stack.
 /// Used consistently across mm tests to avoid mapping conflicts.
-const TEST_VA: u64 = 0x4000_0000;
+const TEST_VA: u64 = 0x1_4000_0000;
 
 // ── SYS_MEMORY_SPLIT / SYS_MEMORY_MERGE ─────────────────────────────────────────
 
@@ -206,8 +206,9 @@ pub fn aspace_query_mapped(ctx: &TestContext) -> TestResult
 /// `aspace_query` on an unmapped virtual address must return an error.
 pub fn aspace_query_unmapped_err(ctx: &TestContext) -> TestResult
 {
-    // 0x7000_0000_0000 is never mapped in ktest's address space.
-    let err = aspace_query(ctx.aspace_cap, 0x7000_0000_0000u64);
+    // Never mapped by ktest, and a canonical user VA in every paging mode
+    // (below the 2^38 Sv39 user half), above every layout zone.
+    let err = aspace_query(ctx.aspace_cap, 0x3F_0000_0000u64);
     if err.is_ok()
     {
         return Err("aspace_query on unmapped VA should fail");
@@ -236,12 +237,13 @@ pub fn mem_map_unaligned_vaddr_err(ctx: &TestContext) -> TestResult
 
 /// `mem_map` targeting the kernel virtual address half must return an error.
 ///
-/// On both x86-64 and RISC-V Sv48, `0xFFFF_8000_0000_0000` is in the kernel half.
+/// The kernel image's top-2-GiB base is in the kernel half and canonical in
+/// every paging mode on both architectures.
 pub fn mem_map_kernel_half_err(ctx: &TestContext) -> TestResult
 {
     let memory_cap =
         crate::frame_pool::alloc().ok_or("mem_map_kernel_half_err: frame pool exhausted")?;
-    let kernel_va: u64 = 0xFFFF_8000_0000_0000;
+    let kernel_va: u64 = 0xFFFF_FFFF_8000_0000;
     let err = mem_map(memory_cap, ctx.aspace_cap, kernel_va, 0, 1, MAP_WRITABLE);
 
     // SAFETY: memory_cap was allocated from pool and never successfully mapped.
@@ -285,8 +287,8 @@ pub fn memory_split_at_zero_err(_ctx: &TestContext) -> TestResult
 /// segment cap can no longer serve as the no-WRITE surface.
 pub fn mem_protect_exceeds_cap_rights_err(ctx: &TestContext) -> TestResult
 {
-    // Use a VA distinct from TEST_VA=0x4000_0000 to avoid conflicts.
-    const PROTECT_TEST_VA: u64 = 0x4100_0000;
+    // Use a VA distinct from TEST_VA to avoid conflicts.
+    const PROTECT_TEST_VA: u64 = 0x1_4100_0000;
 
     let mut frame = crate::frame_pool::FrameGuard::new(ctx.aspace_cap)
         .ok_or("mem_protect_exceeds_cap_rights_err: frame pool exhausted")?;
@@ -322,7 +324,7 @@ pub fn mem_protect_exceeds_cap_rights_err(ctx: &TestContext) -> TestResult
 /// accessible via `aspace_query`.
 pub fn mem_map_multi_page(ctx: &TestContext) -> TestResult
 {
-    const MULTI_VA: u64 = 0x4200_0000;
+    const MULTI_VA: u64 = 0x1_4200_0000;
 
     let memory_a = crate::frame_pool::alloc().ok_or("mem_map_multi_page: memory_a exhausted")?;
     let memory_b = crate::frame_pool::alloc().ok_or("mem_map_multi_page: memory_b exhausted")?;
@@ -423,7 +425,7 @@ pub fn mem_unmap_unaligned_err(ctx: &TestContext) -> TestResult
 /// `mem_protect` with both WRITE (bit 1) and EXECUTE (bit 2) set must fail.
 pub fn mem_protect_wx_err(ctx: &TestContext) -> TestResult
 {
-    const WX_TEST_VA: u64 = 0x4300_0000;
+    const WX_TEST_VA: u64 = 0x1_4300_0000;
 
     let mut memory_cap = crate::frame_pool::FrameGuard::new(ctx.aspace_cap)
         .ok_or("mem_protect_wx_err: frame pool exhausted")?;
@@ -456,7 +458,7 @@ pub fn mem_map_wx_prot_err(ctx: &TestContext) -> TestResult
     let err = mem_map(
         memory_cap.cap(),
         ctx.aspace_cap,
-        0x4400_0000,
+        0x1_4400_0000,
         0,
         1,
         MAP_WRITABLE | syscall::MAP_EXECUTABLE,
@@ -510,7 +512,7 @@ pub fn memory_split_at_end_err(_ctx: &TestContext) -> TestResult
 /// `page PA not 4 KiB-aligned` panic during the first mapping below.
 pub fn init_segment_caps_aligned(ctx: &TestContext) -> TestResult
 {
-    const SEG_PROBE_VA: u64 = 0x4300_0000;
+    const SEG_PROBE_VA: u64 = 0x1_4300_0000;
     // Phase 9 mints exactly three segments per init binary: TEXT, RODATA,
     // BSS/DATA. The cap slots sit contiguously starting at `aspace_cap + 1`.
     const SEG_COUNT: u32 = 3;

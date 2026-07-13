@@ -162,8 +162,12 @@ Tag 0 is reserved for the kernel/idle context and the full-flush fallback and is
 assigned to a user space. Single-address invalidation after a mapping change uses `invlpg`
 (x86-64) or `sfence.vma <va>` (RISC-V) on the current space; cross-CPU shootdown uses the
 tag-targeted forms (`invpcid` / `sfence.vma <va>, <asid>`) so a CPU that has since switched
-spaces still invalidates the right translation. Cross-CPU invalidation uses the SMP
-shootdown protocol described in the kernel memory-internals document.
+spaces still invalidates the right translation. Multi-page range invalidation batches
+per-address invalidations: on RISC-V the Svinval sequence (`sfence.w.inval`, a `sinval.vma`
+per page, `sfence.inval.ir`) pays the fence cost once per batch; on x86-64 the same surface
+degenerates to an `invlpg` loop. Spans larger than a small ceiling fall back to a full
+flush, which is cheaper than per-page invalidation at that size. Cross-CPU invalidation
+uses the SMP shootdown protocol described in the kernel memory-internals document.
 
 The `CAP_INFO_TLB_ELIDED` / `CAP_INFO_TLB_PERFORMED` `cap_info` selectors expose system-wide
 counts of context switches that elided versus performed the flush — the

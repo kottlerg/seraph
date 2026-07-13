@@ -855,6 +855,89 @@ pub unsafe fn flush_tag(tag: u16)
     }
 }
 
+// ── Batched invalidation (Svinval) ────────────────────────────────────────────
+// The Svinval sequence `sfence.w.inval; sinval.vma …; sfence.inval.ir` is
+// architecturally equivalent to issuing `sfence.vma` for each address at the
+// bracket's position, but lets many per-VA invalidations share the two fence
+// ends. The single-VA primitives above deliberately stay `sfence.vma` — for
+// one address a bracket is three instructions instead of one. Svinval is
+// asserted at boot by `verify_paging_extensions`.
+
+/// Open a batched-invalidation window: order this hart's prior stores
+/// (the PTE rewrites) before the `sinval.vma` invalidations that follow.
+///
+/// # Safety
+/// Must execute in S-mode. Every `inval_page` / `inval_page_tagged` issued
+/// after this call must be followed by [`inval_batch_end`] before the
+/// invalidation is relied upon.
+#[cfg(not(test))]
+pub unsafe fn inval_batch_begin()
+{
+    // SAFETY: sfence.w.inval is an S-mode Svinval fence; no registers
+    // clobbered, no memory operands.
+    unsafe {
+        core::arch::asm!("sfence.w.inval", options(nostack, preserves_flags));
+    }
+}
+
+/// Invalidate `virt` across all ASIDs inside an open batch window
+/// (`sinval.vma virt, zero`).
+///
+/// # Safety
+/// Must execute in S-mode, between [`inval_batch_begin`] and
+/// [`inval_batch_end`]. `virt` need not be mapped.
+#[cfg(not(test))]
+pub unsafe fn inval_page(virt: u64)
+{
+    // SAFETY: sinval.vma mirrors sfence.vma operand semantics (VA in rs1,
+    // x0 rs2 = all ASIDs) but only queues the invalidation; the caller's
+    // bracket fences complete it. Safe for any VA in S-mode.
+    unsafe {
+        core::arch::asm!(
+            "sinval.vma {va}, zero",
+            va = in(reg) virt,
+            options(nostack),
+        );
+    }
+}
+
+/// Invalidate `virt` within ASID `tag` inside an open batch window
+/// (`sinval.vma virt, asid`).
+///
+/// # Safety
+/// Must execute in S-mode, between [`inval_batch_begin`] and
+/// [`inval_batch_end`]. A non-zero `tag` requires tagging enabled.
+#[cfg(not(test))]
+pub unsafe fn inval_page_tagged(virt: u64, tag: u16)
+{
+    // SAFETY: sinval.vma with VA and non-zero ASID queues invalidation of
+    // that leaf within that ASID; bracketed by the caller's fences.
+    unsafe {
+        core::arch::asm!(
+            "sinval.vma {va}, {asid}",
+            va = in(reg) virt,
+            asid = in(reg) u64::from(tag),
+            options(nostack),
+        );
+    }
+}
+
+/// Close a batched-invalidation window: order the queued `sinval.vma`
+/// invalidations before this hart's subsequent implicit references. The
+/// batch's invalidations are architecturally complete when this returns.
+///
+/// # Safety
+/// Must execute in S-mode, paired with a preceding [`inval_batch_begin`].
+#[cfg(not(test))]
+pub unsafe fn inval_batch_end()
+{
+    // SAFETY: sfence.inval.ir is an S-mode Svinval fence; no registers
+    // clobbered, no memory operands.
+    unsafe {
+        core::arch::asm!("sfence.inval.ir", options(nostack, preserves_flags));
+    }
+}
+
 /// Remove a single user-space mapping at `virt` from the page table rooted
 /// at `root_virt`.
 ///

@@ -68,6 +68,14 @@ impl CpuMask
         m
     }
 
+    /// Add `cpu` to the set.
+    #[inline]
+    pub fn set(&mut self, cpu: usize)
+    {
+        let (w, b) = word_bit(cpu);
+        self.words[w] |= b;
+    }
+
     /// Remove `cpu` from the set.
     #[inline]
     pub fn clear(&mut self, cpu: usize)

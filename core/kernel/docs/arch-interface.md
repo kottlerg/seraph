@@ -181,6 +181,23 @@ pub unsafe fn flush_page_tagged(virt: u64, tag: u16);
 /// switched-away space accrued unmaps.
 pub unsafe fn flush_tag(tag: u16);
 
+/// Open a batched-invalidation window (RISC-V `sfence.w.inval`; x86-64 no-op).
+/// The single-VA primitives above intentionally remain plain `sfence.vma` —
+/// a bracket only pays for itself across multiple addresses.
+pub unsafe fn inval_batch_begin();
+
+/// Invalidate `virt` across all tags inside an open window (RISC-V
+/// `sinval.vma virt, zero`; x86-64 `invlpg`).
+pub unsafe fn inval_page(virt: u64);
+
+/// Invalidate `virt` within `tag` inside an open window (RISC-V
+/// `sinval.vma virt, asid`; x86-64 INVPCID type 0).
+pub unsafe fn inval_page_tagged(virt: u64, tag: u16);
+
+/// Close the window (RISC-V `sfence.inval.ir`; x86-64 no-op). The queued
+/// invalidations are architecturally complete when this returns.
+pub unsafe fn inval_batch_end();
+
 /// Per-CPU enable of tagged TLBs; returns the number of hardware tags available.
 /// x86-64 sets `CR4.PCIDE` and returns 4096, or `0` where PCID/INVPCID are absent
 /// (the kernel keeps a full-flush fallback — see

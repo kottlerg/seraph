@@ -841,6 +841,50 @@ pub unsafe fn flush_tag(tag: u16)
     }
 }
 
+// ── Batched invalidation ──────────────────────────────────────────────────────
+// x86-64 has no deferred-invalidation instructions: `invlpg` and INVPCID are
+// individually complete, so the batch brackets are no-ops and the per-VA
+// calls delegate to the single-VA primitives. The surface exists for the
+// riscv64 Svinval sequence (`sfence.w.inval; sinval.vma …; sfence.inval.ir`).
+
+/// Open a batched-invalidation window. No-op on x86-64.
+///
+/// # Safety
+/// Must execute at ring 0 (for symmetry with the riscv64 contract).
+#[cfg(not(test))]
+pub unsafe fn inval_batch_begin() {}
+
+/// Invalidate `virt` inside an open batch window — `invlpg`, identical to
+/// [`flush_page`].
+///
+/// # Safety
+/// As [`flush_page`].
+#[cfg(not(test))]
+pub unsafe fn inval_page(virt: u64)
+{
+    // SAFETY: caller contract matches flush_page.
+    unsafe { flush_page(virt) }
+}
+
+/// Invalidate `virt` within PCID `tag` inside an open batch window —
+/// INVPCID type 0, identical to [`flush_page_tagged`].
+///
+/// # Safety
+/// As [`flush_page_tagged`].
+#[cfg(not(test))]
+pub unsafe fn inval_page_tagged(virt: u64, tag: u16)
+{
+    // SAFETY: caller contract matches flush_page_tagged.
+    unsafe { flush_page_tagged(virt, tag) }
+}
+
+/// Close a batched-invalidation window. No-op on x86-64.
+///
+/// # Safety
+/// Must execute at ring 0, paired with a preceding [`inval_batch_begin`].
+#[cfg(not(test))]
+pub unsafe fn inval_batch_end() {}
+
 /// Remove a single user-space mapping at `virt` from the page table rooted at
 /// `root_virt`.
 ///

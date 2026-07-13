@@ -884,33 +884,80 @@ impl AddressSpace
         // that for any CPU caching this space, either it is in the snapshot
         // below (gets the IPI) or it observes the bumped tlb_gen on its next
         // reactivation (flushes the tag then). Snapshotting first would leave a
-        // CPU that activates concurrently in neither cover.
+        // CPU that activates concurrently in neither cover. The same argument
+        // covers both invalidation shapes below: spans at or under
+        // RANGE_FLUSH_CEILING_PAGES issue an untagged per-page range flush
+        // (batched: riscv64 Svinval bracket), larger spans a full flush. The
+        // untagged range is as correct as the untagged full flush — a remote
+        // target still has this space's tag loaded, and per-VA invalidation
+        // covers the paging-structure caches for the freed intermediate frames
+        // on both architectures (invlpg / sfence-family VA forms invalidate
+        // non-leaf entries for that VA too).
         if crate::mm::tag_allocator::tagging_enabled()
         {
             self.tlb_gen.fetch_add(1, Ordering::Release);
             core::sync::atomic::fence(Ordering::SeqCst);
         }
         let current = crate::arch::current::cpu::current_cpu() as usize;
+        let ranged = page_count <= crate::mm::tlb_shootdown::RANGE_FLUSH_CEILING_PAGES;
         // Only CPUs that run this AS cache its translations — the kernel edits
         // these page tables through the direct map, never by loading this root.
         // The caller is normally memmgr, which does not run the target AS, so
         // the local flush is usually skipped.
         if self.active_cpus.test_cpu(current, Ordering::Acquire)
         {
-            // SAFETY: ring 0 / S-mode; full flush clears TLB + PS-caches.
-            unsafe { flush_tlb_all() };
+            if ranged
+            {
+                use crate::arch::current::paging::{
+                    inval_batch_begin, inval_batch_end, inval_page,
+                };
+                // SAFETY: ring 0 / S-mode; per-VA invalidations bracketed by
+                // the batch window; clears TLB + PS-cache entries for every
+                // VA in the span.
+                unsafe {
+                    inval_batch_begin();
+                    for i in 0..page_count
+                    {
+                        inval_page(virt_base + (i * crate::mm::PAGE_SIZE) as u64);
+                    }
+                    inval_batch_end();
+                }
+            }
+            else
+            {
+                // SAFETY: ring 0 / S-mode; full flush clears TLB + PS-caches.
+                unsafe { flush_tlb_all() };
+            }
         }
         let mut remote = self.active_cpu_mask();
         remote.clear(current);
         if !remote.is_empty()
         {
-            // virt = u64::MAX routes the remote handler to flush_tlb_all()
-            // (ignores tag) — correct even cross-AS where this AS's tag is not
-            // stable on the current CPU.
-            // SAFETY: root_phys is a valid root; remote excludes current; preempt
-            // is held and pt_lock no-pop invariant holds; tag unused on this path.
-            unsafe {
-                crate::mm::tlb_shootdown::shootdown(self.root_phys, &remote, u64::MAX, 0);
+            if ranged
+            {
+                // SAFETY: root_phys is a valid root; remote excludes current;
+                // preempt is held and pt_lock no-pop invariant holds; tag 0 is
+                // the untagged path (see the INV-3 block above for why that is
+                // sufficient here).
+                unsafe {
+                    crate::mm::tlb_shootdown::shootdown_range(
+                        self.root_phys,
+                        &remote,
+                        virt_base,
+                        page_count as u64,
+                        0,
+                    );
+                }
+            }
+            else
+            {
+                // virt = u64::MAX routes the remote handler to flush_tlb_all()
+                // (ignores tag) — correct even cross-AS where this AS's tag is
+                // not stable on the current CPU.
+                // SAFETY: as the range branch; tag unused on this path.
+                unsafe {
+                    crate::mm::tlb_shootdown::shootdown(self.root_phys, &remote, u64::MAX, 0);
+                }
             }
         }
 

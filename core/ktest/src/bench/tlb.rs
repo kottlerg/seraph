@@ -81,7 +81,7 @@ fn shootdown_spinner_entry(arg: u64) -> !
 #[allow(clippy::too_many_lines)] // setup + measure loop + cooperative teardown.
 pub(super) fn bench_tlb_shootdown(ctx: &crate::TestContext, iters: u32)
 {
-    const BENCH_VA: u64 = 0x6200_0000;
+    const BENCH_VA: u64 = 0x1_6200_0000;
 
     // Print the header up front so failures in the spawn / notification_wait /
     // measure loop are bisectable on the boot log instead of looking
@@ -287,7 +287,7 @@ fn teardown(
 // could migrate mid-unmap and read two unsynchronized cycle counters.
 
 /// Distinct VA base for the concurrent bench (clear of `BENCH_VA`).
-const CONC_VA_BASE: u64 = 0x6400_0000;
+const CONC_VA_BASE: u64 = 0x1_6400_0000;
 /// Per-worker VA stride (16-page spacing; matches the stress test).
 const CONC_VA_STRIDE: u64 = 0x1_0000;
 

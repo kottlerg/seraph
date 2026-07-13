@@ -39,7 +39,7 @@ use syscall_abi::{
 
 use crate::{TestContext, TestResult};
 
-const TEST_VA_BASE: u64 = 0x0000_0000_4000_0000;
+const TEST_VA_BASE: u64 = 0x0000_0001_4000_0000;
 const SYS_OUT_OF_MEMORY: i64 = -8;
 const SYS_QUOTA_EXCEEDED: i64 = -17;
 
@@ -117,8 +117,8 @@ pub fn pt_budget_exhaustion_returns_oom(ctx: &TestContext) -> TestResult
         .map_err(|_| "retype::pt_budget: cap_create_aspace failed")?;
 
     // Map further pages spaced by 1 GiB so each new mapping forces a
-    // fresh intermediate PT page (PML2 / sv48 intermediate). After ≤ 3
-    // mappings the pool is exhausted.
+    // fresh intermediate PT page (a distinct level-2 slot on x86-64 and in
+    // every riscv64 paging mode). After ≤ 3 mappings the pool is exhausted.
     let mut got_oom = false;
     for i in 0..16u64
     {
@@ -152,14 +152,14 @@ pub fn deep_pt_walk_consumes_pool(ctx: &TestContext) -> TestResult
 {
     let memory = ctx.memory_base;
 
-    // 32 pool pages covers ≥ 4 mappings spread across distinct PML2 /
-    // intermediate PT regions on x86-64 / sv48 (each fresh region needs
-    // 2-3 intermediate PT pages depending on arch + sharing).
+    // 32 pool pages covers ≥ 4 mappings spread across distinct
+    // intermediate PT regions (each fresh region needs 2-4 intermediate PT
+    // pages depending on arch, paging mode, and sharing).
     let aspace = cap_create_aspace(memory, 0, 32)
         .map_err(|_| "retype::deep_pt: cap_create_aspace failed")?;
 
     let mappings = 4usize;
-    let stride: u64 = 0x4000_0000; // 1 GiB stride forces fresh PML2 entries.
+    let stride: u64 = 0x4000_0000; // 1 GiB stride forces fresh level-2 entries.
     for i in 0..mappings
     {
         let va = TEST_VA_BASE + i as u64 * stride;
@@ -184,9 +184,10 @@ pub fn deep_pt_walk_consumes_pool(ctx: &TestContext) -> TestResult
 /// `mem_unmap_reclaim` (the `MEM_UNMAP_RECLAIM_PTS` path) returns the
 /// intermediate page tables a freed span empties back to the per-AS pool,
 /// crediting `pt_growth_budget_bytes`. A fresh single-page mapping at a clean
-/// VA allocates three intermediate tables (PDPT+PD+PT on x86-64, L2+L1+L0 on
-/// Sv48); tearing the region down reclaims all three (the budget round-trips to
-/// its pre-map value), and the same VA then remaps from the returned pool pages.
+/// VA allocates one intermediate table per non-root level (three on x86-64;
+/// two to four on riscv64 depending on the negotiated paging mode); tearing
+/// the region down reclaims them all (the budget round-trips to its pre-map
+/// value), and the same VA then remaps from the returned pool pages.
 pub fn region_unmap_reclaims_pt_budget(ctx: &TestContext) -> TestResult
 {
     let memory = ctx.memory_base;
@@ -256,7 +257,7 @@ pub fn region_unmap_reclaims_pt_budget(ctx: &TestContext) -> TestResult
 pub fn concurrent_regions_release_pt_budget_on_unmap(ctx: &TestContext) -> TestResult
 {
     const N: u64 = 6;
-    const STRIDE: u64 = 0x4000_0000; // 1 GiB — distinct PDPT slot per region.
+    const STRIDE: u64 = 0x4000_0000; // 1 GiB — distinct level-2 slot per region.
 
     let memory = ctx.memory_base;
 

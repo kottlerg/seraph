@@ -45,8 +45,6 @@ pub fn sys_mem_map(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     use crate::mm::paging::PageFlags;
     use crate::syscall::current_tcb;
 
-    const USER_HALF_TOP: u64 = 0x0000_8000_0000_0000;
-
     let memory_idx = tf.arg(0) as u32;
     let aspace_idx = tf.arg(1) as u32;
     let virt_base = tf.arg(2);
@@ -63,7 +61,7 @@ pub fn sys_mem_map(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     }
 
     // Virtual address must be in the user half (< canonical kernel boundary).
-    if virt_base >= USER_HALF_TOP
+    if virt_base >= crate::mm::user_va_top()
     {
         return Err(SyscallError::InvalidAddress);
     }
@@ -81,7 +79,7 @@ pub fn sys_mem_map(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     let virt_end = virt_base
         .checked_add(mapping_size as u64)
         .ok_or(SyscallError::InvalidArgument)?;
-    if virt_end > USER_HALF_TOP
+    if virt_end > crate::mm::user_va_top()
     {
         return Err(SyscallError::InvalidAddress);
     }
@@ -256,7 +254,6 @@ pub fn sys_mem_unmap(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::object::AddressSpaceObject;
     use crate::cap::slot::{CapTag, Rights};
-    const USER_HALF_TOP: u64 = 0x0000_8000_0000_0000;
     use crate::mm::PAGE_SIZE;
     use crate::syscall::current_tcb;
     use syscall::MEM_UNMAP_RECLAIM_PTS;
@@ -272,7 +269,7 @@ pub fn sys_mem_unmap(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     {
         return Err(SyscallError::InvalidAddress);
     }
-    if virt_base >= USER_HALF_TOP
+    if virt_base >= crate::mm::user_va_top()
     {
         return Err(SyscallError::InvalidAddress);
     }
@@ -286,7 +283,7 @@ pub fn sys_mem_unmap(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     let virt_end = virt_base
         .checked_add(mapping_size as u64)
         .ok_or(SyscallError::InvalidArgument)?;
-    if virt_end > USER_HALF_TOP
+    if virt_end > crate::mm::user_va_top()
     {
         return Err(SyscallError::InvalidAddress);
     }
@@ -372,7 +369,6 @@ pub fn sys_mem_protect(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     use crate::mm::PAGE_SIZE;
     use crate::mm::paging::{PageFlags, PagingError};
     use crate::syscall::current_tcb;
-    const USER_HALF_TOP: u64 = 0x0000_8000_0000_0000;
 
     let memory_idx = tf.arg(0) as u32;
     let aspace_idx = tf.arg(1) as u32;
@@ -386,7 +382,7 @@ pub fn sys_mem_protect(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     {
         return Err(SyscallError::InvalidAddress);
     }
-    if virt_base >= USER_HALF_TOP
+    if virt_base >= crate::mm::user_va_top()
     {
         return Err(SyscallError::InvalidAddress);
     }
@@ -400,7 +396,7 @@ pub fn sys_mem_protect(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     let virt_end = virt_base
         .checked_add(mapping_size as u64)
         .ok_or(SyscallError::InvalidArgument)?;
-    if virt_end > USER_HALF_TOP
+    if virt_end > crate::mm::user_va_top()
     {
         return Err(SyscallError::InvalidAddress);
     }

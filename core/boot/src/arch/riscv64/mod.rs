@@ -23,7 +23,7 @@ pub mod handoff;
 pub mod paging;
 pub mod serial;
 pub use handoff::{perform_handoff, trampoline_page_range};
-pub use paging::BootPageTable;
+pub use paging::{BootPageTable, negotiate_paging};
 
 use crate::elf::EM_RISCV;
 use crate::firmware::FirmwareInfo;

@@ -26,8 +26,9 @@ use syscall_abi::{
 
 use crate::{ChildStack, TestContext, TestResult};
 
-/// Unmapped, canonical user-half VA the child touches. Distinct from other tests.
-const RESERVED_VA: u64 = 0x6300_0000_0000;
+/// Unmapped user VA the child touches; canonical in every paging mode
+/// (below the 2^38 Sv39 user half). Distinct from other tests.
+const RESERVED_VA: u64 = 0x3E_5000_0000;
 
 /// Badge bound with the handler and delivered in the fault message.
 const FAULT_BADGE: u64 = 0xC0FF_EE03;

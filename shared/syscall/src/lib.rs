@@ -956,7 +956,9 @@ pub fn cap_create_thread(memory_cap: u32, aspace_cap: u32, cspace_cap: u32) -> R
 ///
 /// - `memory_cap`: cap index of the source Memory cap.
 /// - `aspace_cap`: cap index of the target `AddressSpace`.
-/// - `virt`: virtual address to map at (page-aligned, < `0x0000_8000_0000_0000`).
+/// - `virt`: virtual address to map at (page-aligned, below the kernel's
+///   per-mode user VA ceiling: `2^47` on x86-64 and riscv64 Sv48, `2^38` on
+///   Sv39, `2^56` on Sv57).
 /// - `offset_pages`: first page within the memory region to map.
 /// - `page_count`: number of pages to map.
 /// - `prot_bits`: explicit permission bits (bit 1 = WRITE, bit 2 = EXECUTE).

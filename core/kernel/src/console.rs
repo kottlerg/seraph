@@ -122,7 +122,7 @@ pub unsafe fn init(boot_info: &BootInfo)
 /// Repoint the framebuffer to its direct-map virtual address.
 ///
 /// Called after Phase 3 activates the kernel's page tables. Converts
-/// `fb_phys` to `DIRECT_MAP_BASE + fb_phys` and calls `FramebufferWriter::rebase`
+/// `fb_phys` to `phys_to_virt(fb_phys)` and calls `FramebufferWriter::rebase`
 /// so subsequent output writes to the correct virtual address.
 ///
 /// Does nothing if no framebuffer is present (`fb_phys == 0`).

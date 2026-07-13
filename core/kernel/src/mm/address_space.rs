@@ -5,7 +5,8 @@
 
 //! User-mode address space management (Phase 9).
 //!
-//! An [`AddressSpace`] owns one root page table (PML4 on x86-64, Sv48 root
+//! An [`AddressSpace`] owns one root page table (PML4 on x86-64, the
+//! negotiated-mode root
 //! on RISC-V). Intermediate page table frames are allocated from the buddy
 //! allocator on demand.
 //!
@@ -19,7 +20,9 @@
 //! page table root into the new user PML4, so kernel memory is reachable from
 //! user address spaces without per-process kernel mapping maintenance.
 //!
-//! On RISC-V the equivalent root entries are VPN[3] entries 256–511.
+//! On RISC-V the equivalent root entries are 256–511 of the negotiated
+//! mode's root table — the kernel half starts at root entry 256 in every
+//! mode.
 //!
 //! ## Concurrency
 //!
@@ -83,11 +86,11 @@ use process_layout::{INIT_INFO_WINDOW, INIT_STACK_GUARD_WINDOW};
 /// Degraded-fallback base of the read-only `InitInfo` region mapped into init,
 /// used only when the entropy pool is unavailable at the layout draw. The
 /// region spans up to `INIT_INFO_MAX_PAGES` contiguous pages from this address.
-pub const DEFAULT_INIT_INFO_VA: u64 = 0x7FFF_FFFF_5000;
+pub const DEFAULT_INIT_INFO_VA: u64 = 0x3F_FFFF_5000;
 
 /// Degraded-fallback top of init's user stack. `INIT_STACK_PAGES` pages map
 /// immediately below, with one unmapped guard page beneath them.
-pub const DEFAULT_INIT_STACK_TOP: u64 = 0x7FFF_FFFF_E000;
+pub const DEFAULT_INIT_STACK_TOP: u64 = 0x3F_FFFF_E000;
 
 /// Bootstrap virtual addresses the kernel chooses for the init process.
 ///
@@ -195,7 +198,7 @@ pub fn choose_init_layout() -> InitLayout
 /// at address-space death.
 pub struct AddressSpace
 {
-    /// Physical address of the root page table frame (PML4 / Sv48 root).
+    /// Physical address of the root page table frame (PML4 / RISC-V root).
     pub root_phys: u64,
     /// Virtual address of the root frame (via the direct physical map).
     pub root_virt: u64,
@@ -400,7 +403,7 @@ impl AddressSpace
     ///
     /// # Safety
     /// Must be called after Phase 3 (page tables active) and Phase 4 (heap active).
-    /// The current CPU's page table root must be the kernel's PML4/Sv48 root.
+    /// The current CPU's page table root must be the kernel's root table.
     #[cfg(not(test))]
     pub unsafe fn new_user(allocator: &mut BuddyAllocator) -> Self
     {
@@ -418,11 +421,12 @@ impl AddressSpace
             core::ptr::write_bytes(root_virt as *mut u8, 0, PAGE_SIZE);
         }
 
-        // Copy kernel-half PML4/Sv48 entries (indices 256–511) from the current
+        // Copy kernel-half root entries (indices 256–511, the kernel half in
+        // every paging mode) from the current
         // active page table root so the kernel stays accessible from user mode.
         //
         // On x86-64: read CR3 for the current PML4 physical address.
-        // On RISC-V: read satp for the current Sv48 root physical address.
+        // On RISC-V: read satp for the current root physical address.
         // SAFETY: root_virt is valid and page-aligned; copy_kernel_entries
         // reads the current root and copies 256 u64 entries within bounds.
         unsafe {
@@ -1136,7 +1140,7 @@ impl AddressSpace
 #[cfg(test)]
 mod init_layout_tests
 {
-    use process_layout::{INIT_INFO_WINDOW, INIT_STACK_GUARD_WINDOW, USER_HALF_TOP};
+    use process_layout::{INIT_INFO_WINDOW, INIT_STACK_GUARD_WINDOW, LAYOUT_VA_CEILING};
 
     use super::*;
 
@@ -1153,7 +1157,7 @@ mod init_layout_tests
             let stack_reserve = (1 + INIT_STACK_PAGES as u64) * page;
             let guard = layout.init_stack_top - stack_reserve;
             assert!(INIT_STACK_GUARD_WINDOW.contains(guard));
-            assert!(layout.init_stack_top < USER_HALF_TOP);
+            assert!(layout.init_stack_top < LAYOUT_VA_CEILING);
 
             // InitInfo region (INIT_INFO_MAX_PAGES) vs stack reservation
             // (guard + INIT_STACK_PAGES): disjoint for every draw.

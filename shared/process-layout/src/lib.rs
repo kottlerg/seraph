@@ -26,10 +26,14 @@
 //! [`VaWindow`]: a power-of-two count of page-aligned slots starting at a
 //! constant base. A draw is `base + ((r & (2^slots_log2 - 1)) << 12)` —
 //! page-aligned and free of modulo bias by construction. The windows sit on
-//! 64 GiB strides inside the top PML4/Sv48-root slot, so pairwise
-//! disjointness, the `tls < ipc < info < stack_top` ordering, and the
-//! unmapped guard page below every stack hold for **all** possible draws; no
-//! rejection or collision checking is needed (const-asserted below).
+//! 9 GiB strides between the reservation-arena zone and the image window,
+//! so pairwise disjointness, the `tls < ipc < info < stack_top` ordering,
+//! and the unmapped guard page below every stack hold for **all** possible
+//! draws; no rejection or collision checking is needed (const-asserted
+//! below). Every zone ends below [`LAYOUT_VA_CEILING`] = 2^38, the smallest
+//! user half among the supported paging modes (riscv64 Sv39), so one static
+//! map is canonical under Sv39/Sv48/Sv57 and x86-64 alike — at the cost of
+//! 21 rather than 23 entropy bits per bootstrap surface.
 //!
 //! The per-process VA zone map (creator-chosen and process-private zones):
 //!
@@ -38,13 +42,13 @@
 //! | `ET_EXEC` image (bias 0) | ~`0x20_0000` | — | linker |
 //! | Byte heap | `0x4000_0000` | 19 | `std::sys` (`alloc/seraph.rs`) |
 //! | Reservation arena | `0x10_0000_0000` | 24 | `std::sys` (`reserve/seraph.rs`) |
+//! | Main TLS | `0x21_0000_0000` | 21 | creator ([`MAIN_TLS_WINDOW`]) |
+//! | IPC buffer | `0x23_4000_0000` | 21 | creator ([`IPC_BUFFER_WINDOW`]) |
+//! | `ProcessInfo` | `0x25_8000_0000` | 21 | creator ([`PROCESS_INFO_WINDOW`]) |
+//! | Stack guard | `0x27_C000_0000` | 21 | creator ([`STACK_GUARD_WINDOW`]) |
+//! | `InitInfo` | `0x2A_0000_0000` | 21 | kernel ([`INIT_INFO_WINDOW`]) |
+//! | Init stack guard | `0x2C_4000_0000` | 21 | kernel ([`INIT_STACK_GUARD_WINDOW`]) |
 //! | PIE image bias | `0x30_0000_0000` | 23 | creator ([`IMAGE_WINDOW`]) |
-//! | Main TLS | `0x7F80_0000_0000` | 23 | creator ([`MAIN_TLS_WINDOW`]) |
-//! | IPC buffer | `0x7F90_0000_0000` | 23 | creator ([`IPC_BUFFER_WINDOW`]) |
-//! | `ProcessInfo` | `0x7FA0_0000_0000` | 23 | creator ([`PROCESS_INFO_WINDOW`]) |
-//! | Stack guard | `0x7FB0_0000_0000` | 23 | creator ([`STACK_GUARD_WINDOW`]) |
-//! | `InitInfo` | `0x7FC0_0000_0000` | 23 | kernel ([`INIT_INFO_WINDOW`]) |
-//! | Init stack guard | `0x7FD0_0000_0000` | 23 | kernel ([`INIT_STACK_GUARD_WINDOW`]) |
 //!
 //! The heap and reservation-arena bases are drawn by the process itself in
 //! `runtime/ruststd/src/sys/{alloc,reserve}/seraph.rs`; their zone bounds are
@@ -63,26 +67,27 @@ use process_abi::MAX_PROCESS_STACK_PAGES;
 /// Page size shared by every layout computation in this crate.
 const PAGE_SIZE: u64 = 4096;
 
-/// Exclusive top of the canonical user half on both supported architectures
-/// (x86-64 4-level paging and riscv64 Sv48 both give userspace a 47-bit low
-/// half).
-pub const USER_HALF_TOP: u64 = 0x0000_8000_0000_0000;
+/// Exclusive ceiling for every layout zone: the smallest user half among the
+/// supported paging modes (riscv64 Sv39's 2^38). The architecture's actual
+/// user half may be larger (2^47 on x86-64/Sv48, 2^56 on Sv57); keeping the
+/// whole map below this bound makes one static layout canonical everywhere.
+pub const LAYOUT_VA_CEILING: u64 = 1 << 38;
 
 /// Default `ProcessInfo` handover-page virtual address (degraded fallback).
-pub const DEFAULT_PROCESS_INFO_VA: u64 = 0x0000_7FFF_FFFF_0000;
+pub const DEFAULT_PROCESS_INFO_VA: u64 = 0x0000_003F_FFFF_0000;
 
 /// Default top of the main-thread user stack (degraded fallback).
 /// `stack_pages` pages are mapped immediately below this, with one unmapped
 /// guard page beneath them.
-pub const DEFAULT_STACK_TOP: u64 = 0x0000_7FFF_FFFF_E000;
+pub const DEFAULT_STACK_TOP: u64 = 0x0000_003F_FFFF_E000;
 
 /// Default base (region start) of the main-thread IPC buffer (degraded
 /// fallback).
-pub const DEFAULT_IPC_BUFFER_VA: u64 = 0x0000_7FFF_FFFE_0000;
+pub const DEFAULT_IPC_BUFFER_VA: u64 = 0x0000_003F_FFFE_0000;
 
 /// Default base (region start) of the main-thread TLS block (degraded
 /// fallback).
-pub const DEFAULT_MAIN_TLS_VA: u64 = 0x0000_7FFF_FFFD_0000;
+pub const DEFAULT_MAIN_TLS_VA: u64 = 0x0000_003F_FFFD_0000;
 
 /// A fixed randomisation window: `2^slots_log2` page-aligned candidate
 /// addresses starting at `base`.
@@ -129,20 +134,20 @@ impl VaWindow
 
 /// Window for the main-thread TLS block base.
 pub const MAIN_TLS_WINDOW: VaWindow = VaWindow {
-    base: 0x0000_7F80_0000_0000,
-    slots_log2: 23,
+    base: 0x0000_0021_0000_0000,
+    slots_log2: 21,
 };
 
 /// Window for the main-thread IPC buffer.
 pub const IPC_BUFFER_WINDOW: VaWindow = VaWindow {
-    base: 0x0000_7F90_0000_0000,
-    slots_log2: 23,
+    base: 0x0000_0023_4000_0000,
+    slots_log2: 21,
 };
 
 /// Window for the `ProcessInfo` handover page.
 pub const PROCESS_INFO_WINDOW: VaWindow = VaWindow {
-    base: 0x0000_7FA0_0000_0000,
-    slots_log2: 23,
+    base: 0x0000_0025_8000_0000,
+    slots_log2: 21,
 };
 
 /// Window for the main-thread stack **guard page**. The drawn address is the
@@ -151,21 +156,21 @@ pub const PROCESS_INFO_WINDOW: VaWindow = VaWindow {
 /// fits between the guard and the top with the guard page unmapped below the
 /// stack base.
 pub const STACK_GUARD_WINDOW: VaWindow = VaWindow {
-    base: 0x0000_7FB0_0000_0000,
-    slots_log2: 23,
+    base: 0x0000_0027_C000_0000,
+    slots_log2: 21,
 };
 
 /// Window for the `InitInfo` handover page (kernel-chosen, per boot).
 pub const INIT_INFO_WINDOW: VaWindow = VaWindow {
-    base: 0x0000_7FC0_0000_0000,
-    slots_log2: 23,
+    base: 0x0000_002A_0000_0000,
+    slots_log2: 21,
 };
 
 /// Window for init's stack guard page (kernel-chosen, per boot). Same draw
 /// semantics as [`STACK_GUARD_WINDOW`], with `INIT_STACK_PAGES` mapped pages.
 pub const INIT_STACK_GUARD_WINDOW: VaWindow = VaWindow {
-    base: 0x0000_7FD0_0000_0000,
-    slots_log2: 23,
+    base: 0x0000_002C_4000_0000,
+    slots_log2: 21,
 };
 
 /// Window for the `ET_DYN` image load bias (creator-chosen, per process; kernel
@@ -202,11 +207,11 @@ const fn window_zone_end(w: VaWindow) -> u64
 
 // Zone-map invariants: every window's worst-case zone (draw span + region
 // tail) ends before the next zone begins, and everything stays inside the
-// user half. Region ordering and stack-guard gaps then hold for all draws.
+// layout ceiling. Region ordering and stack-guard gaps then hold for all
+// draws.
 const _: () = {
     assert!(HEAP_ZONE_END <= 0x0000_0010_0000_0000); // heap below arena zone
-    assert!(RESERVE_ARENA_ZONE_END <= IMAGE_WINDOW.base);
-    assert!(window_zone_end(IMAGE_WINDOW) + IMAGE_MAX_SPAN <= MAIN_TLS_WINDOW.base);
+    assert!(RESERVE_ARENA_ZONE_END <= MAIN_TLS_WINDOW.base);
     // Stride chain in address order; `tls < ipc < info < stack_top` for all
     // draws follows from it.
     assert!(window_zone_end(MAIN_TLS_WINDOW) <= IPC_BUFFER_WINDOW.base);
@@ -214,7 +219,11 @@ const _: () = {
     assert!(window_zone_end(PROCESS_INFO_WINDOW) <= STACK_GUARD_WINDOW.base);
     assert!(window_zone_end(STACK_GUARD_WINDOW) <= INIT_INFO_WINDOW.base);
     assert!(window_zone_end(INIT_INFO_WINDOW) <= INIT_STACK_GUARD_WINDOW.base);
-    assert!(window_zone_end(INIT_STACK_GUARD_WINDOW) <= USER_HALF_TOP);
+    assert!(window_zone_end(INIT_STACK_GUARD_WINDOW) <= IMAGE_WINDOW.base);
+    assert!(window_zone_end(IMAGE_WINDOW) + IMAGE_MAX_SPAN <= LAYOUT_VA_CEILING);
+    // Degraded-fallback defaults lie above every zone, below the ceiling.
+    assert!(DEFAULT_MAIN_TLS_VA >= window_zone_end(IMAGE_WINDOW) + IMAGE_MAX_SPAN);
+    assert!(DEFAULT_STACK_TOP < LAYOUT_VA_CEILING);
 };
 
 /// Number of entropy bytes [`choose_process_layout`] consumes: one
@@ -292,8 +301,8 @@ pub const fn choose_image_bias(r: u64) -> u64
 /// `[min_vaddr, max_vaddr_end)` may be placed at `bias`.
 ///
 /// Requires the bias to be a window slot, the span to be non-empty and at
-/// most [`IMAGE_MAX_SPAN`], and the biased image to stay below the user half
-/// (all arithmetic checked).
+/// most [`IMAGE_MAX_SPAN`], and the biased image to stay below
+/// [`LAYOUT_VA_CEILING`] (all arithmetic checked).
 #[must_use]
 pub fn validate_image_placement(bias: u64, min_vaddr: u64, max_vaddr_end: u64) -> bool
 {
@@ -307,7 +316,7 @@ pub fn validate_image_placement(bias: u64, min_vaddr: u64, max_vaddr_end: u64) -
     }
     match bias.checked_add(max_vaddr_end)
     {
-        Some(end) => end < USER_HALF_TOP,
+        Some(end) => end < LAYOUT_VA_CEILING,
         None => false,
     }
 }
@@ -369,7 +378,7 @@ mod tests
             assert!(layout.tls_base < layout.ipc_buffer_va);
             assert!(layout.ipc_buffer_va < layout.process_info_va);
             assert!(layout.process_info_va < layout.stack_top);
-            assert!(layout.stack_top < USER_HALF_TOP);
+            assert!(layout.stack_top < LAYOUT_VA_CEILING);
 
             let regions = regions(&layout);
             for (i, &(base_a, len_a)) in regions.iter().enumerate()
@@ -390,7 +399,7 @@ mod tests
     {
         let max = [0xFF_u8; LAYOUT_ENTROPY_BYTES];
         let layout = choose_process_layout(Some(&max));
-        assert!(layout.stack_top <= STACK_GUARD_WINDOW.base + 0x0010_0000_0000);
+        assert!(layout.stack_top <= STACK_GUARD_WINDOW.base + 0x0002_4000_0000);
         assert!(
             layout.tls_base + process_abi::PROCESS_MAIN_TLS_MAX_PAGES * PAGE_SIZE
                 <= IPC_BUFFER_WINDOW.base

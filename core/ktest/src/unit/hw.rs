@@ -24,7 +24,7 @@ use syscall_abi::SyscallError;
 use crate::{TestContext, TestResult};
 
 /// Test virtual address for MMIO mapping. 1.25 GiB — above ktest's load address.
-const MMIO_TEST_VA: u64 = 0x5000_0000;
+const MMIO_TEST_VA: u64 = 0x1_5000_0000;
 
 /// Kernel pin: every `CSpace` is clamped to at most `L1_SIZE * L2_SIZE`
 /// (256 * 56 = 14336) slots. Used as a fallback if `cap_info` ever

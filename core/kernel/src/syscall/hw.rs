@@ -210,13 +210,13 @@ pub fn sys_mmio_map(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     use crate::syscall::current_tcb;
 
     // Virtual address must be page-aligned and in user half.
-    const USER_HALF_TOP: u64 = 0x0000_8000_0000_0000;
+    let user_va_top = crate::mm::user_va_top();
     let aspace_idx = tf.arg(0) as u32;
     let mmio_idx = tf.arg(1) as u32;
 
     let virt_base = tf.arg(2);
     let flags = tf.arg(3);
-    if virt_base & 0xFFF != 0 || virt_base >= USER_HALF_TOP
+    if virt_base & 0xFFF != 0 || virt_base >= user_va_top
     {
         return Err(SyscallError::InvalidAddress);
     }
@@ -252,7 +252,7 @@ pub fn sys_mmio_map(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     let virt_end = virt_base
         .checked_add(mmio_size)
         .ok_or(SyscallError::InvalidArgument)?;
-    if virt_end > USER_HALF_TOP
+    if virt_end > user_va_top
     {
         return Err(SyscallError::InvalidAddress);
     }

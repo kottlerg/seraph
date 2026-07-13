@@ -101,6 +101,22 @@ pub unsafe fn write_satp_no_fence(root_phys: u64);
 /// bits masked; `satp` PPN on RISC-V).
 pub unsafe fn read_root_phys() -> u64;
 
+/// Publish the active paging mode at kernel entry, before any consumer of the
+/// mode-derived VA layout runs. RISC-V decodes `satp.MODE` (the bootloader
+/// hands over a running translation regime under the negotiated Sv39/Sv48/Sv57
+/// mode); x86-64 is unconditionally 4-level and provides a no-op.
+pub fn init_paging_mode();
+
+/// Base virtual address of the direct physical map: constant on x86-64; the
+/// active mode's kernel-half base on RISC-V. Wrapped by
+/// `mm::paging::direct_map_base()` for architecture-neutral consumers.
+pub fn direct_map_base() -> u64;
+
+/// Exclusive upper bound of user-half virtual addresses: constant `1 << 47` on
+/// x86-64; the active mode's half boundary on RISC-V. Wrapped by
+/// `mm::user_va_top()` — the single kernel-wide user-VA gate.
+pub fn user_va_top() -> u64;
+
 /// Map `phys` at `virt` in the user region of the address space rooted at
 /// `root_virt`. Returns how the rewrite changed any prior mapping
 /// (`MapOutcome`), which the caller uses to decide whether a remote TLB
@@ -187,7 +203,7 @@ pub unsafe fn rebase_boot_stack(direct_map_base: u64);
 `PageFlags` (`mm::paging`) is an architecture-neutral bitfield with fields `readable`,
 `writable`, `executable`, and `uncacheable`. `readable` is meaningful only on RISC-V (x86-64
 has no read-disable bit); `uncacheable` sets PCD|PWT on x86-64 and is a documentation marker
-under Sv48-without-Svpbmt on RISC-V. W^X is enforced at the memory syscall layer
+without Svpbmt on RISC-V. W^X is enforced at the memory syscall layer
 (`syscall::mem` map/protect reject a writable-and-executable request with
 `SyscallError::WxViolation`); the arch mapping primitives require the caller to have already
 validated W^X.

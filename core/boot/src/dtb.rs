@@ -16,6 +16,8 @@
 //! - [`parse_cpu_count`]: enumerate RISC-V hart IDs from the `/cpus` node.
 //! - [`parse_timer_caps`]: extract the `/cpus` `timebase-frequency` and
 //!   whether every enabled hart advertises the Sstc extension.
+//! - [`parse_boot_cpu_mmu_type`]: read the boot hart's `mmu-type` paging
+//!   claim for mode negotiation.
 //! - [`parse_aperture_seed`]: collect MMIO extents (PLIC, CLINT, UART, PCI
 //!   ECAM + ranges, `virtio,mmio` transports) as seeds for
 //!   [`super::memory_map::derive_mmio_apertures`].
@@ -25,6 +27,7 @@
 //! consumes the [`Fdt`] surface exposed here.
 
 use crate::bprintln;
+use boot_protocol::riscv_paging::PagingMode;
 use boot_protocol::{MAX_CPUS, MmioAperture};
 
 // ── FDT constants ─────────────────────────────────────────────────────────────
@@ -405,7 +408,7 @@ impl Fdt
     #[allow(clippy::too_many_lines)]
     pub fn walk_cpu_nodes<F>(&self, mut callback: F)
     where
-        F: FnMut(u32, bool) -> bool,
+        F: FnMut(u32, bool, Option<PagingMode>) -> bool,
     {
         // Node state for one open node during traversal. Four independent
         // property observations; enum-ifying them would obscure the walk.
@@ -418,6 +421,7 @@ impl Fdt
             has_reg: bool,
             disabled: bool,
             has_sstc: bool,
+            mmu: Option<PagingMode>,
         }
 
         let mut states = [CpuNodeState {
@@ -426,6 +430,7 @@ impl Fdt
             has_reg: false,
             disabled: false,
             has_sstc: false,
+            mmu: None,
         }; MAX_DEPTH];
 
         let mut depth: usize = 0;
@@ -447,6 +452,7 @@ impl Fdt
                             has_reg: false,
                             disabled: false,
                             has_sstc: false,
+                            mmu: None,
                         };
                     }
                     depth += 1;
@@ -465,7 +471,7 @@ impl Fdt
                         if s.is_riscv_cpu
                             && s.has_reg
                             && !s.disabled
-                            && !callback(s.reg_u32, s.has_sstc)
+                            && !callback(s.reg_u32, s.has_sstc, s.mmu)
                         {
                             break;
                         }
@@ -542,6 +548,37 @@ impl Fdt
                         {
                             state.has_sstc = true;
                         }
+                    }
+                    else if name == b"mmu-type"
+                    {
+                        // Per the devicetree binding, the value names the
+                        // widest translation mode the hart implements
+                        // ("riscv,sv39" / "riscv,sv48" / "riscv,sv57");
+                        // "riscv,none" and the hypervisor "riscv,svNNx4"
+                        // forms carry no S-mode paging claim.
+                        let data = self.struct_slice(data_off, prop_len);
+                        state.mmu = if data.starts_with(b"riscv,sv39x")
+                            || data.starts_with(b"riscv,sv48x")
+                            || data.starts_with(b"riscv,sv57x")
+                        {
+                            None
+                        }
+                        else if data.starts_with(b"riscv,sv57")
+                        {
+                            Some(PagingMode::Sv57)
+                        }
+                        else if data.starts_with(b"riscv,sv48")
+                        {
+                            Some(PagingMode::Sv48)
+                        }
+                        else if data.starts_with(b"riscv,sv39")
+                        {
+                            Some(PagingMode::Sv39)
+                        }
+                        else
+                        {
+                            None
+                        };
                     }
                 }
                 FDT_NOP =>
@@ -737,7 +774,7 @@ pub unsafe fn parse_cpu_count(dtb_addr: u64) -> (u32, [u32; MAX_CPUS])
     // MAX_CPUS fits in u32.
     #[allow(clippy::cast_possible_truncation)]
     let max_cpus_u32 = MAX_CPUS as u32;
-    fdt.walk_cpu_nodes(|reg_u32, _has_sstc| {
+    fdt.walk_cpu_nodes(|reg_u32, _has_sstc, _mmu| {
         if count < max_cpus_u32
         {
             hart_ids[count as usize] = reg_u32;
@@ -787,13 +824,52 @@ pub unsafe fn parse_timer_caps(dtb_addr: u64) -> (u64, bool)
 
     let mut seen_any = false;
     let mut all_sstc = true;
-    fdt.walk_cpu_nodes(|_hart_id, has_sstc| {
+    fdt.walk_cpu_nodes(|_hart_id, has_sstc, _mmu| {
         seen_any = true;
         all_sstc &= has_sstc;
         true // continue
     });
 
     (timebase_freq, seen_any && all_sstc)
+}
+
+/// Read the paging mode the DTB advertises for the boot hart.
+///
+/// Returns the boot hart's `mmu-type` when its CPU node carries one;
+/// otherwise the widest mode advertised across enabled CPU nodes (the RISC-V
+/// Privileged ISA requires an implementation supporting a wider mode to also
+/// support every narrower one, so "widest" is safe as a probe candidate).
+/// `None` when no CPU node advertises a recognized S-mode translation mode —
+/// the caller then probes from its own maximum downward.
+///
+/// Only called from `arch/riscv64`; on x86-64 the DTB parser is still
+/// compiled but no caller exists.
+///
+/// # Safety
+/// `dtb_addr` must be the physical address of a valid, identity-mapped FDT.
+#[allow(dead_code)]
+pub unsafe fn parse_boot_cpu_mmu_type(dtb_addr: u64, boot_hart_id: u64) -> Option<PagingMode>
+{
+    // SAFETY: caller guarantees dtb_addr is identity-mapped DTB.
+    let fdt = unsafe { Fdt::from_raw(dtb_addr) }?;
+
+    let mut boot_hart_mode: Option<PagingMode> = None;
+    let mut widest: Option<PagingMode> = None;
+    fdt.walk_cpu_nodes(|reg_u32, _has_sstc, mmu| {
+        if u64::from(reg_u32) == boot_hart_id && mmu.is_some()
+        {
+            boot_hart_mode = mmu;
+            return false; // the boot hart's own claim is authoritative
+        }
+        if let Some(mode) = mmu
+            && widest.is_none_or(|w| mode.levels() > w.levels())
+        {
+            widest = Some(mode);
+        }
+        true
+    });
+
+    boot_hart_mode.or(widest)
 }
 
 // ── Aperture seeder (protocol v6) ────────────────────────────────────────────

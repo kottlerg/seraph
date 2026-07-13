@@ -275,7 +275,7 @@ Each process virtual address space is represented by an `AddressSpace` object:
 ```rust
 pub struct AddressSpace
 {
-    /// Physical address of the root page table frame (PML4 / Sv48 root).
+    /// Physical address of the root page table frame (PML4 / RISC-V root).
     root_phys: u64,
 
     /// Virtual address of the root frame (via the direct physical map).
@@ -444,7 +444,9 @@ in `SYS_CAP_CREATE_THREAD` for user-created threads.
 
 ## Page Table Node Tracking
 
-Intermediate page table nodes (PML3/PML2/PML1 on x86-64; levels 2/1/0 on RISC-V Sv48)
+Intermediate page table nodes (PML3/PML2/PML1 on x86-64; every level below
+the root on RISC-V — two to four of them depending on the negotiated paging
+mode)
 are allocated from the buddy allocator at order 0 (one 4 KiB page each). The kernel
 must track these to free them when an address space is destroyed.
 

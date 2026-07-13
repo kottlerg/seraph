@@ -256,7 +256,9 @@ not on every push.
 riscv64) × profile (debug, release) × harness (ktest, svctest, usertest).
 Fixed per CI run: vCPU count (4), guest memory (512 MiB), device set
 (virtio-blk + virtio-keyboard + serial; CI boots headless, so no
-framebuffer), filesystem (FAT).
+framebuffer), filesystem (FAT), riscv64 paging mode (sv48 — per-mode runs
+via `cargo xtask run --riscv-mmu sv39|sv57` are manual, same posture as
+CPU-count variations).
 A device or filesystem joining the default boot set joins the canonical
 cells automatically; variants belong to the tiers below.
 

@@ -403,7 +403,8 @@ calls `sched::enter()`.
 2. Create the init address space (AddressSpace::new_user):
    a. Allocate a new root page table frame from the buddy allocator
    b. Zero the frame
-   c. Copy kernel PML4/Sv48 entries 256–511 from the active root so the kernel
+   c. Copy kernel root entries 256–511 (the kernel half in every paging
+      mode) from the active root so the kernel
       remains reachable from init's address space
 3. Map init segments into the init address space:
    a. For each InitSegment in init_image.segments[0..segment_count]:

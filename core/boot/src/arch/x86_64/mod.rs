@@ -44,6 +44,24 @@ pub unsafe fn allocate_ap_trampoline(bs: *mut EfiBootServices) -> Option<u64>
 /// `_st` is unused; the function is safe to call at any point.
 pub unsafe fn pre_serial_init(_st: *mut EfiSystemTable) {}
 
+/// No-op on x86-64: 4-level paging is the only supported mode, so there is
+/// nothing to negotiate. Cross-arch hook for RISC-V, where the bootloader
+/// selects Sv39/Sv48/Sv57 from the DTB `mmu-type` plus a `satp` write-probe.
+///
+/// # Safety
+/// Safe to call at any point; the arguments are unused.
+// unnecessary_wraps: Result signature is the cross-arch contract with the
+// riscv64 hook, whose probe can genuinely fail.
+#[allow(clippy::unnecessary_wraps)]
+pub unsafe fn negotiate_paging(
+    _bs: *mut EfiBootServices,
+    _dtb_addr: u64,
+    _boot_hart_id: u64,
+) -> Result<(), crate::error::BootError>
+{
+    Ok(())
+}
+
 /// Populate `km` from firmware tables for x86-64.
 ///
 /// The only firmware source on UEFI x86-64 is ACPI; DTB is not published

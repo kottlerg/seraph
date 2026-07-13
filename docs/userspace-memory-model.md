@@ -155,15 +155,18 @@ window constants (`crate::entropy::fill_bytes`).
 
 Every bootstrap surface is randomised independently (ASLR,
 [#39](https://github.com/kottlerg/seraph/issues/39)): each is a
-page-aligned draw from a fixed per-region window of 2²³ slots (23 bits
-of entropy per surface) on 64 GiB strides inside the top
-PML4/Sv48-root slot — TLS at `0x7F80_0000_0000`, IPC buffer at
-`0x7F90_0000_0000`, `ProcessInfo` at `0x7FA0_0000_0000`, stack guard at
-`0x7FB0_0000_0000`, and, kernel-drawn for init, `InitInfo` at
-`0x7FC0_0000_0000` and the init stack guard at `0x7FD0_0000_0000`. The
+page-aligned draw from a fixed per-region window of 2²¹ slots (21 bits
+of entropy per surface) on 9 GiB strides between the reservation-arena
+zone and the image window — TLS at `0x21_0000_0000`, IPC buffer at
+`0x23_4000_0000`, `ProcessInfo` at `0x25_8000_0000`, stack guard at
+`0x27_C000_0000`, and, kernel-drawn for init, `InitInfo` at
+`0x2A_0000_0000` and the init stack guard at `0x2C_4000_0000`. The
 stride spacing makes region ordering, pairwise disjointness, and the
 unmapped guard page below every stack hold for all possible draws, so
-no collision checking or redraw is ever needed. A creator whose entropy
+no collision checking or redraw is ever needed. The whole zone map ends
+below 2³⁸ — the smallest user half among the supported paging modes
+(riscv64 Sv39) — so one static layout is canonical under every mode on
+both architectures; that ceiling is what caps these windows at 21 bits. A creator whose entropy
 draw fails (a kernel-contract violation once the pool is seeded) logs
 and degrades to the deterministic `DEFAULT_*` addresses, which lie
 outside the windows — the test harnesses' window assertions then fail

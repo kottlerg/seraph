@@ -9,11 +9,11 @@ use crate::{TestContext, TestResult};
 use syscall_abi::SyscallError;
 
 /// A canonical user-half virtual address that ktest never maps.
-const UNMAPPED_USER_VA: u64 = 0x6000_0000_0000;
+const UNMAPPED_USER_VA: u64 = 0x3E_3000_0000;
 
 /// Safe test VA (1 GiB), well above ktest's load address and stack. Mapped and
 /// unmapped within a single test, so it is free between tests.
-const RO_TEST_VA: u64 = 0x4000_0000;
+const RO_TEST_VA: u64 = 0x1_4000_0000;
 
 /// `getrandom` into a valid buffer fills the whole span with non-zero entropy.
 pub fn getrandom_fills_buffer(_ctx: &TestContext) -> TestResult

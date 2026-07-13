@@ -26,7 +26,7 @@ const SLP_EN: u16 = 1 << 13;
 const PM1A_CNT_PORTS: u16 = 2;
 
 /// Virtual address base for mapping ACPI tables.
-const ACPI_MAP_BASE: u64 = 0x4000_0000;
+const ACPI_MAP_BASE: u64 = 0x1_4000_0000;
 
 /// FADT field offsets (ACPI 6.x section 5.2.9).
 const FADT_OFF_DSDT: usize = 40;

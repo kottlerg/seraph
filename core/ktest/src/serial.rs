@@ -167,8 +167,8 @@ mod arch
 
     /// Virtual address where the UART MMIO page is mapped.
     ///
-    /// Chosen to avoid conflict with `TEST_VA` (`0x4000_0000`) and
-    /// `MMIO_TEST_VA` (`0x5000_0000`) used by ktest's mm and hw tests.
+    /// Below the randomized heap zone (which starts at `0x4000_0000`) and
+    /// distinct from every other ktest fixed VA.
     const SERIAL_VA: u64 = 0x3000_0000;
 
     /// Current UART virtual base (set after `mmio_map`).

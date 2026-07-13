@@ -157,25 +157,41 @@ asm and the full SAFETY justification.
 
 ---
 
-## RISC-V: Sv48 Paging
+## RISC-V: Negotiated Paging Mode
+
+### Mode negotiation
+
+The paging mode is selected at boot, before the tables are built. The boot
+CPU's DTB `mmu-type` property names the candidate (`riscv,sv39` /
+`riscv,sv48` / `riscv,sv57`; the widest advertised across enabled CPU nodes
+is used when the boot hart's node is silent, and Sv57 — the widest supported
+mode — when no DTB is published). A `satp` write-probe confirms the
+candidate: the RISC-V Privileged ISA specifies that a `satp` write selecting
+an unimplemented MODE has no effect, so a readback that retains the prior
+value falls the candidate back to the next-narrower mode. Probe failure
+below Sv39 is fatal — Sv39 is the platform minimum
+([platform-requirements.md](../../../docs/platform-requirements.md)). The
+probe runs under a one-frame identity table with S-mode interrupts masked
+and restores the live `satp` (UEFI may run with its own translation active).
 
 ### Hierarchy
 
-RISC-V with Sv48 uses a four-level hierarchy (root, level-2, level-1, level-0):
+The negotiated mode fixes the hierarchy depth: three levels under Sv39,
+four under Sv48, five under Sv57. Every level indexes 512 eight-byte PTEs
+with 9 VA bits above the 12-bit page offset:
 
 ```
-Virtual address bits (Sv48):
-  [47:39] → Root table index (512 entries)
-  [38:30] → Level-2 table index (512 entries)
-  [29:21] → Level-1 table index (512 entries)
-  [20:12] → Level-0 table index (512 entries)
-  [11:0]  → Byte offset within the 4 KiB page
+Virtual address bits:
+  [top:top-8] → Root table index (512 entries; top = 38 / 47 / 56)
+  ...          → one 9-bit index per intermediate level
+  [20:12]     → Level-0 table index (512 entries)
+  [11:0]      → Byte offset within the 4 KiB page
 ```
 
 Each table is 4 KiB and holds 512 eight-byte PTEs. The root table physical address
 is right-shifted by 12 bits to produce the PPN for the `satp` register.
 
-### PTE Format (RISC-V Sv48)
+### PTE Format (identical in every mode)
 
 ```
 Bit 0    (V):   Valid
@@ -212,11 +228,11 @@ PTE has V=0 and is invalid, which is the correct initial state.
 
 ### Activation
 
-Activation constructs `satp` from `MODE = 9` (Sv48), `ASID = 0`, and
-`PPN = root_phys >> 12`, writes it via `csrw satp`, then issues
-`sfence.vma` to flush stale TLB entries before the new translation
-takes effect. All mappings required for continued execution are present
-before `satp` is written. See
+Activation constructs `satp` from the negotiated mode's MODE value (8 =
+Sv39, 9 = Sv48, 10 = Sv57), `ASID = 0`, and `PPN = root_phys >> 12`, writes
+it via `csrw satp`, then issues `sfence.vma` to flush stale TLB entries
+before the new translation takes effect. All mappings required for
+continued execution are present before `satp` is written. See
 [`boot/src/arch/riscv64/paging.rs`](../src/arch/riscv64/paging.rs) for
 the asm and the full SAFETY justification.
 

@@ -44,7 +44,7 @@ boot/
         │   └── serial.rs       # 16550 serial output for early debug
         └── riscv64/
             ├── mod.rs          # RISC-V arch re-exports
-            ├── paging.rs       # RISC-V Sv48 page table implementation
+            ├── paging.rs       # RISC-V page tables + paging-mode negotiation
             ├── handoff.rs      # satp write + sfence + kernel jump
             ├── serial.rs       # UART serial output for early debug
             └── header.S        # Hand-crafted PE32+ header and entry trampoline

@@ -156,7 +156,10 @@ Each feature is classified per architecture as one of:
 - **Ssstateen / Smstateen** — state-enable CSRs, required for the hardening posture.
 - **Zkr seed CSR** — the supervisor-accessible hardware entropy source.
 - **`time` CSR (Zicntr)** — the timestamp source.
-- **Address translation: Sv48** is the kernel operating mode. Sv39 is the RVA23 mandatory minimum.
+- **Address translation**: one of Sv39/Sv48/Sv57, negotiated at boot (DTB
+  `mmu-type` plus a `satp` write-probe; the widest confirmed mode wins). Sv39
+  is the RVA23 mandatory minimum and the refusal floor; Sv48 is the standing
+  default in CI and development.
 - **UEFI firmware over an SBI (M-mode) implementation; a device tree or ACPI** — the boot and
   discovery path. SBI HSM is required to start secondary harts.
 - **MMIO ns16550a UART** — the boot/console serial device (base discovered via firmware tables,
@@ -165,7 +168,8 @@ Each feature is classified per architecture as one of:
 ### Opportunistic
 
 - **Svadu** — hardware A/D-bit updates (Svade is the required baseline).
-- **Sv57** — a larger-VA expansion above the Sv48 operating mode.
+- **Sv57** — a larger-VA expansion above the Sv48 default; used when the
+  platform advertises and the probe confirms it.
 - **Zvk vector crypto** — crypto acceleration.
 - **EFI_RNG_PROTOCOL, GOP framebuffer, PCIe ECAM** — as on x86-64.
 

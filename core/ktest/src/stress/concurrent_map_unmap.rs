@@ -24,7 +24,7 @@ const MAP_ITERATIONS: usize = 1000;
 const _: () = assert!(NUM_CHILDREN <= 16);
 
 /// Base VA for stress mappings, well above normal test VAs.
-const STRESS_MAP_BASE: u64 = 0x5000_0000;
+const STRESS_MAP_BASE: u64 = 0x1_5000_0000;
 /// Spacing between each child's VA (16-page stride).
 const VA_STRIDE: u64 = 0x1_0000;
 

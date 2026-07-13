@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{Context as _, Result, bail};
+use clap::ValueEnum;
 
 use crate::accel::{self, Accel};
 use crate::arch::Arch;
@@ -41,6 +42,38 @@ pub enum GdbMode
     Freeze,
 }
 
+/// Guest RISC-V paging mode ceiling for a QEMU launch.
+///
+/// Selects which `svNN` satp modes the guest CPU advertises (DTB `mmu-type`
+/// plus the satp write-probe both follow it); the kernel negotiates the
+/// highest advertised mode it supports at boot. QEMU >= 8.0 defaults the
+/// rv64 CPU to sv57, so the sv48 default here pins the guest to the
+/// project's standing Sv48 baseline rather than QEMU's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum RiscvMmu
+{
+    /// Cap the guest at Sv39 (`sv57=off,sv48=off`).
+    Sv39,
+    /// Cap the guest at Sv48 (`sv57=off`) — the default.
+    Sv48,
+    /// Enable Sv57 (`sv57=on`, explicit against QEMU default drift).
+    Sv57,
+}
+
+impl RiscvMmu
+{
+    /// `-cpu` property suffix that pins the guest's satp-mode ceiling.
+    fn cpu_satp_props(self) -> &'static str
+    {
+        match self
+        {
+            Self::Sv39 => ",sv57=off,sv48=off",
+            Self::Sv48 => ",sv57=off",
+            Self::Sv57 => ",sv57=on",
+        }
+    }
+}
+
 /// Specification for one QEMU launch.
 ///
 /// `firmware_code_path` is the readonly pflash (OVMF on x86, `RISCV_VIRT_CODE`
@@ -61,6 +94,8 @@ pub struct QemuLaunchSpec<'a>
     /// (`-qmp unix:<path>,server,nowait`) so a host harness can drive the
     /// guest — the interactive-input test injects keys this way.
     pub qmp_socket: Option<&'a Path>,
+    /// Guest paging-mode ceiling; riscv64 only, ignored on `x86_64`.
+    pub riscv_mmu: RiscvMmu,
 }
 
 /// Construct the full QEMU argv for a launch spec.
@@ -223,9 +258,15 @@ fn extend_riscv(args: &mut Vec<String>, spec: &QemuLaunchSpec) -> Result<()>
     // Zvfhmin, Zvbb, Zvkt, Zkt — those land as QEMU coverage broadens. A
     // future bump should switch to `-cpu rva23s64` once the floor QEMU
     // version on CI hosts is >= 9.1.
+    //
+    // The trailing satp-mode properties (`RiscvMmu::cpu_satp_props`) pin the
+    // paging-mode ceiling the guest advertises via DTB `mmu-type`.
     args.extend([
         "-cpu".into(),
-        "rv64,v=true,zba=true,zbb=true,zbs=true".into(),
+        format!(
+            "rv64,v=true,zba=true,zbb=true,zbs=true{}",
+            spec.riscv_mmu.cpu_satp_props()
+        ),
     ]);
     // Explicit multi-threaded TCG: `-smp 4` without this falls back to the
     // per-arch default, which can be single-threaded round-robin. SMP
@@ -450,7 +491,30 @@ mod tests
             headless: true,
             gdb: GdbMode::Off,
             qmp_socket: None,
+            riscv_mmu: RiscvMmu::Sv48,
         }
+    }
+
+    fn cpu_arg(argv: &[String]) -> &str
+    {
+        let cpu = argv.iter().position(|a| a == "-cpu").unwrap();
+        &argv[cpu + 1]
+    }
+
+    #[test]
+    fn argv_reflects_riscv_mmu()
+    {
+        let argv = build_qemu_argv(&riscv_spec(1, 512)).unwrap();
+        assert!(cpu_arg(&argv).ends_with(",sv57=off"));
+
+        let mut spec = riscv_spec(1, 512);
+        spec.riscv_mmu = RiscvMmu::Sv39;
+        let argv = build_qemu_argv(&spec).unwrap();
+        assert!(cpu_arg(&argv).ends_with(",sv57=off,sv48=off"));
+
+        spec.riscv_mmu = RiscvMmu::Sv57;
+        let argv = build_qemu_argv(&spec).unwrap();
+        assert!(cpu_arg(&argv).ends_with(",sv57=on"));
     }
 
     #[test]

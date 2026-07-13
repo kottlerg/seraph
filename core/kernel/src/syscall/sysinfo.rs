@@ -97,7 +97,7 @@ pub fn sys_aspace_query(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     }
 
     // Virtual address must be in the user half.
-    if virt >= 0x0000_8000_0000_0000
+    if virt >= crate::mm::user_va_top()
     {
         return Err(SyscallError::InvalidAddress);
     }

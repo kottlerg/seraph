@@ -18,10 +18,6 @@
 use crate::arch::current::trap_frame::TrapFrame;
 use syscall::SyscallError;
 
-/// User-half ceiling: virtual addresses at or above this are kernel/non-canonical.
-#[cfg(not(test))]
-const USER_HALF_TOP: u64 = 0x0000_8000_0000_0000;
-
 /// `SYS_THREAD_CONFIGURE` (23): set entry point, stack, argument, and TLS base
 /// for a thread.
 ///
@@ -1353,9 +1349,10 @@ pub fn sys_thread_read_regs(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // The destination must lie wholly in the user half: SMAP/SUM gate only
     // accesses to user pages, so without this a kernel-half buf_ptr would let the
     // copy write the target's register frame into kernel memory at an
-    // attacker-chosen VA. (`buf_ptr >= USER_HALF_TOP` short-circuits before the
+    // attacker-chosen VA. (`buf_ptr >= user_va_top` short-circuits before the
     // sum, so `buf_ptr + copy_size` cannot overflow.)
-    if buf_ptr >= USER_HALF_TOP || buf_ptr + copy_size as u64 > USER_HALF_TOP
+    let user_va_top = crate::mm::user_va_top();
+    if buf_ptr >= user_va_top || buf_ptr + copy_size as u64 > user_va_top
     {
         return Err(SyscallError::InvalidAddress);
     }
@@ -1449,7 +1446,8 @@ pub fn sys_thread_write_regs(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // The source must lie wholly in the user half: SMAP/SUM gate only accesses to
     // user pages, so without this a kernel-half buf_ptr would let the copy read
     // kernel memory at an attacker-chosen VA into the register frame.
-    if buf_ptr >= USER_HALF_TOP || buf_ptr + copy_size as u64 > USER_HALF_TOP
+    let user_va_top = crate::mm::user_va_top();
+    if buf_ptr >= user_va_top || buf_ptr + copy_size as u64 > user_va_top
     {
         return Err(SyscallError::InvalidAddress);
     }

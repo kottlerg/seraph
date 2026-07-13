@@ -6,7 +6,8 @@
 //! Kernel handoff for RISC-V 64-bit.
 //!
 //! Provides the trampoline stub and `perform_handoff`, which installs the
-//! initial Sv48 page table and transfers control to the kernel entry point.
+//! initial page table under the negotiated paging mode and transfers control
+//! to the kernel entry point.
 
 core::arch::global_asm!(
     ".section .text.trampoline, \"ax\"",
@@ -29,19 +30,22 @@ unsafe extern "C" {
 
 /// Transfer control to the kernel on RISC-V (RV64IMAC, soft-float).
 ///
-/// Constructs the Sv48 SATP value from `page_table_root`, resolves the
-/// handoff trampoline address, and transfers control. The trampoline
-/// installs the new page table via `satp`, flushes the TLB, sets the
-/// stack pointer, and jumps to the kernel entry point. Does not return.
+/// Constructs the SATP value from `page_table_root` under the negotiated
+/// paging mode, resolves the handoff trampoline address, and transfers
+/// control. The trampoline installs the new page table via `satp`, flushes
+/// the TLB, sets the stack pointer, and jumps to the kernel entry point.
+/// Does not return.
 ///
 /// `boot_hart_id` is passed to the kernel in `a1` (SBI boot hart convention).
 /// It should come from [`crate::arch::current::discover_boot_hart_id`].
 ///
 /// # Safety
 /// - `page_table_root` must be the physical address (4 KiB-aligned) of a
-///   complete Sv48 root page table covering all addresses the kernel will
-///   access at entry, including an RX identity mapping of the trampoline page.
-/// - `entry` must be the kernel's virtual entry point address, canonical in Sv48.
+///   complete root page table, built for the negotiated paging mode, covering
+///   all addresses the kernel will access at entry, including an RX identity
+///   mapping of the trampoline page.
+/// - `entry` must be the kernel's virtual entry point address, canonical in
+///   the negotiated mode.
 /// - `boot_info` must be the physical address of a valid, populated `BootInfo`,
 ///   identity-mapped readable in the new page tables.
 /// - `stack_top` must be a valid stack pointer, identity-mapped writable.
@@ -55,8 +59,7 @@ pub unsafe fn perform_handoff(
     boot_hart_id: u64,
 ) -> !
 {
-    // Sv48 SATP: mode=9 (bits [63:60]), ASID=0, PPN = root >> 12.
-    let satp = (9u64 << 60) | (page_table_root >> 12);
+    let satp = super::paging::negotiated_mode().make_satp(page_table_root, 0);
 
     let trampoline = core::ptr::addr_of!(_handoff_trampoline) as u64;
 

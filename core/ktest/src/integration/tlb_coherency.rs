@@ -38,7 +38,7 @@ use syscall_abi::SystemInfoType;
 
 use crate::{ChildStack, TestContext, TestResult};
 
-const TEST_VA: u64 = 0x5000_0000; // 1.25 GiB — distinct from other integration tests.
+const TEST_VA: u64 = 0x1_5000_0000; // Distinct from other integration tests.
 const RIGHTS_NOTIFY_WAIT: u64 = (1 << 7) | (1 << 8);
 const CYCLES: usize = 100;
 /// Value the parent writes into the mapped frame each cycle; the child reads it

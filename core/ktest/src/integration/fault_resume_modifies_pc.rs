@@ -31,7 +31,7 @@ use syscall_abi::{FAULT_CLASS_ALL, FAULT_KIND_VM, FAULT_LABEL, FAULT_REPLY_RESUM
 use crate::{ChildStack, TestContext, TestResult};
 
 /// Unmapped, canonical user-half VA the child touches. Distinct from other tests.
-const RESERVED_VA: u64 = 0x6200_0000_0000;
+const RESERVED_VA: u64 = 0x3E_1000_0000;
 
 /// Badge bound with the handler and delivered in the fault message.
 const FAULT_BADGE: u64 = 0xC0FF_EE02;

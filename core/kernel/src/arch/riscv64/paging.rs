@@ -3,24 +3,110 @@
 
 // kernel/src/arch/riscv64/paging.rs
 
-//! RISC-V Sv48 four-level page table operations.
+//! RISC-V page table operations, parameterized over the active paging mode.
 //!
 //! Mirrors the x86-64 interface. All page table frames come from the
 //! BSS-resident pool supplied via [`PoolState`].
 //!
-//! # Sv48 index layout (48-bit VA, 4 levels)
-//! - Bits \[47:39\] → VPN\[3\] — root level (512 entries × 512 GiB each)
-//! - Bits \[38:30\] → VPN\[2\] — level 2     (512 entries × 1 GiB each)
-//! - Bits \[29:21\] → VPN\[1\] — level 1     (512 entries × 2 MiB each)
-//! - Bits \[20:12\] → VPN\[0\] — leaf level  (512 entries × 4 KiB each)
+//! # Index layout
+//! The mode negotiated at boot ([`PagingMode`]: Sv39, Sv48, or Sv57) fixes
+//! the level count (3, 4, or 5). Every level indexes 512 entries with 9 VA
+//! bits above the 12-bit page offset; level 0 is the 4 KiB leaf tier and the
+//! root sits at `levels - 1`. Walkers load the mode once per entry point and
+//! loop from the root down ([`boot_protocol::riscv_paging::vpn_index`] is the
+//! per-level index).
 //!
-//! # PTE layout
+//! # PTE layout (identical in every mode)
 //! Bits \[53:10\]: PPN (physical page number, 44 bits).
 //! Bit 0: V (Valid). Bit 1: R (Read). Bit 2: W (Write). Bit 3: X (Execute).
 //! Non-leaf: V=1, R=0, W=0, X=0. Leaf: V=1, at least one of R/W/X set.
-//! A megapage (2 MiB) is a leaf installed at level 1 (VPN\[1\]).
+//! A megapage (2 MiB) is a leaf installed at level 1 in every mode.
+
+use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+
+pub use boot_protocol::riscv_paging::PagingMode;
+use boot_protocol::riscv_paging::{next_level_boundary, vpn_index};
 
 use crate::mm::paging::{PageFlags, PagingError, PoolState};
+
+// ── Active paging mode ────────────────────────────────────────────────────────
+
+/// The paging mode this hart booted under, as a raw `satp.MODE` value.
+///
+/// Written once by [`init_paging_mode`] at kernel entry, before any consumer
+/// runs and before APs start (SBI `hart_start` plus the trampoline param
+/// block provide the happens-before for secondary harts); read lock-free
+/// everywhere after. The Sv48 default keeps host unit tests on today's
+/// behaviour without an init call.
+static PAGING_MODE: AtomicU8 = AtomicU8::new(PagingMode::Sv48 as u8);
+
+/// The active mode's kernel-half base, resolved once at [`init_paging_mode`]
+/// so the hot `phys_to_virt` path is a single relaxed load plus add.
+static DIRECT_MAP_BASE_VAL: AtomicU64 = AtomicU64::new(0xFFFF_8000_0000_0000);
+
+/// The active mode's exclusive user-half top, resolved with the base above.
+static USER_VA_TOP_VAL: AtomicU64 = AtomicU64::new(0x0000_8000_0000_0000);
+
+/// Publish the active paging mode from the `satp` CSR.
+///
+/// The bootloader hands the kernel a running translation regime; `satp.MODE`
+/// is therefore the authoritative record of the negotiated mode and needs no
+/// boot-protocol field. Halts the hart on an unrecognizable MODE — this runs
+/// pre-console, matching the silent-halt policy of `BootInfo` validation.
+#[cfg(not(test))]
+pub fn init_paging_mode()
+{
+    let satp: u64;
+    // SAFETY: reads the satp CSR only; always valid in S-mode.
+    unsafe {
+        core::arch::asm!("csrr {}, satp", out(reg) satp, options(nomem, nostack, preserves_flags));
+    }
+    let Some(mode) = PagingMode::from_satp_mode(satp >> 60)
+    else
+    {
+        super::cpu::halt_loop();
+    };
+    PAGING_MODE.store(mode as u8, Ordering::Relaxed);
+    DIRECT_MAP_BASE_VAL.store(mode.kernel_va_base(), Ordering::Relaxed);
+    USER_VA_TOP_VAL.store(mode.user_va_top(), Ordering::Relaxed);
+}
+
+/// Test-build stub: host unit tests run with the [`PAGING_MODE`] default.
+#[cfg(test)]
+pub fn init_paging_mode() {}
+
+/// The active paging mode published at kernel entry.
+pub fn paging_mode() -> PagingMode
+{
+    // The store site only writes values produced by `PagingMode::from_satp_mode`,
+    // so the decode cannot fail.
+    match PagingMode::from_satp_mode(u64::from(PAGING_MODE.load(Ordering::Relaxed)))
+    {
+        Some(mode) => mode,
+        None => unreachable!(),
+    }
+}
+
+/// Construct a `satp` value for `root_pa` under the active mode, ASID 0.
+pub(super) fn make_kernel_satp(root_pa: u64) -> u64
+{
+    paging_mode().make_satp(root_pa, 0)
+}
+
+/// Base virtual address of the direct physical map: the active mode's
+/// kernel-half base (root entry 256 in every mode).
+#[inline]
+pub fn direct_map_base() -> u64
+{
+    DIRECT_MAP_BASE_VAL.load(Ordering::Relaxed)
+}
+
+/// Exclusive upper bound of user-half virtual addresses under the active mode.
+#[inline]
+pub fn user_va_top() -> u64
+{
+    USER_VA_TOP_VAL.load(Ordering::Relaxed)
+}
 
 // ── PTE bit constants ─────────────────────────────────────────────────────────
 
@@ -43,10 +129,12 @@ const ACCESSED: u64 = 1 << 6;
 const DIRTY: u64 = 1 << 7;
 /// PPN field mask: bits \[53:10\], representing `(phys >> 12) << 10`.
 const PPN_MASK: u64 = 0x003F_FFFF_FFFF_FC00;
+/// A leaf at any level sets at least one of R/W/X; a table pointer has none.
+const LEAF_BITS: u64 = READ | WRITE | EXECUTE;
 
 // ── PageTableEntry ────────────────────────────────────────────────────────────
 
-/// A 64-bit RISC-V Sv48 page table entry (PTE).
+/// A 64-bit RISC-V page table entry (PTE).
 #[derive(Clone, Copy, Default)]
 #[repr(transparent)]
 pub struct PageTableEntry(pub u64);
@@ -70,7 +158,7 @@ impl PageTableEntry
     ///
     /// `phys` must be 4 KiB-aligned.
     ///
-    /// Note: `flags.uncacheable` has no effect under Sv48 without Svpbmt —
+    /// Note: `flags.uncacheable` has no effect without Svpbmt —
     /// MMIO physical addresses are inherently device-ordered by the platform
     /// memory map. No PTE bits need to be set for correct behavior.
     // TODO: With Svpbmt, set PTE bits [62:61] = 01 (NC) when
@@ -123,32 +211,6 @@ impl PageTableEntry
     }
 }
 
-// ── VA index extraction ───────────────────────────────────────────────────────
-
-/// VPN\[3\] (root) index from a VA (bits \[47:39\]).
-pub fn vpn3_index(va: u64) -> usize
-{
-    ((va >> 39) & 0x1FF) as usize
-}
-
-/// VPN\[2\] index from a VA (bits \[38:30\]).
-pub fn vpn2_index(va: u64) -> usize
-{
-    ((va >> 30) & 0x1FF) as usize
-}
-
-/// VPN\[1\] index from a VA (bits \[29:21\]).
-pub fn vpn1_index(va: u64) -> usize
-{
-    ((va >> 21) & 0x1FF) as usize
-}
-
-/// VPN\[0\] (leaf) index from a VA (bits \[20:12\]).
-pub fn vpn0_index(va: u64) -> usize
-{
-    ((va >> 12) & 0x1FF) as usize
-}
-
 // ── Table frame access ────────────────────────────────────────────────────────
 
 /// Reinterpret a 4 KiB pool frame as an array of 512 PTEs.
@@ -161,6 +223,69 @@ unsafe fn table_at(frame_va: u64) -> &'static mut [PageTableEntry; 512]
     // SAFETY: frame_va is a valid direct-map VA; caller guarantees page table frame
     // is allocated, writable, 4 KiB-aligned, and exclusively owned.
     unsafe { &mut *(frame_va as *mut [PageTableEntry; 512]) }
+}
+
+// ── Level descent ─────────────────────────────────────────────────────────────
+
+/// Descend from the table at `root_va` to the table at level `stop`,
+/// resolving-or-allocating a child at each level in `(stop, top]` via
+/// `ensure`. `ensure` returns the child table's *virtual* address, so each
+/// caller supplies its own PA→VA translation alongside its allocator.
+///
+/// # Safety
+/// `root_va` must be the VA of a valid, exclusively-owned table frame at
+/// level `top`, and `ensure` must return the VA of a valid, exclusively-owned
+/// table frame for every entry it is handed.
+unsafe fn descend_alloc<E>(
+    root_va: u64,
+    virt: u64,
+    top: usize,
+    stop: usize,
+    mut ensure: impl FnMut(&mut PageTableEntry) -> Result<u64, E>,
+) -> Result<&'static mut [PageTableEntry; 512], E>
+{
+    // SAFETY: root_va is a valid exclusively-owned table frame (caller contract).
+    let mut table = unsafe { table_at(root_va) };
+    for level in (stop + 1..=top).rev()
+    {
+        let child_va = ensure(&mut table[vpn_index(level, virt)])?;
+        // SAFETY: ensure returned the VA of a valid exclusively-owned table frame.
+        table = unsafe { table_at(child_va) };
+    }
+    Ok(table)
+}
+
+/// Walk existing tables from `root_va` down to level `stop`, translating
+/// child physical addresses through `to_virt`. Returns `None` when any entry
+/// on the path is absent or is a large leaf (R/W/X set above `stop`) — a
+/// leaf's PPN points at data, not a child table, and must not be descended.
+///
+/// # Safety
+/// `root_va` must be the VA of a valid table frame at level `top` whose
+/// reachable child frames are all live; `to_virt` must map their physical
+/// addresses to valid VAs.
+#[cfg(not(test))]
+unsafe fn descend_existing(
+    root_va: u64,
+    virt: u64,
+    top: usize,
+    stop: usize,
+    to_virt: impl Fn(u64) -> u64,
+) -> Option<&'static mut [PageTableEntry; 512]>
+{
+    // SAFETY: root_va is a valid table frame (caller contract).
+    let mut table = unsafe { table_at(root_va) };
+    for level in (stop + 1..=top).rev()
+    {
+        let e = table[vpn_index(level, virt)];
+        if !e.is_present() || e.0 & LEAF_BITS != 0
+        {
+            return None;
+        }
+        // SAFETY: present non-leaf entry points at a live child table frame.
+        table = unsafe { table_at(to_virt(e.phys_addr())) };
+    }
+    Some(table)
 }
 
 // ── Mapping functions ─────────────────────────────────────────────────────────
@@ -177,27 +302,21 @@ pub fn map_page(
     pool: &mut PoolState,
 ) -> Result<(), PagingError>
 {
-    // SAFETY: root_va is the direct-map VA of a valid Sv48 root frame allocated from pool.
-    let root = unsafe { table_at(root_va) };
-    let l2_pa = walk_or_alloc(&mut root[vpn3_index(virt)], pool)?;
-
-    // SAFETY: l2_pa returned by walk_or_alloc is valid; phys_to_virt yields direct-map VA.
-    let l2 = unsafe { table_at(pool.phys_to_virt(l2_pa)) };
-    let l1_pa = walk_or_alloc(&mut l2[vpn2_index(virt)], pool)?;
-
-    // SAFETY: l1_pa returned by walk_or_alloc is valid; phys_to_virt yields direct-map VA.
-    let l1 = unsafe { table_at(pool.phys_to_virt(l1_pa)) };
-    let l0_pa = walk_or_alloc(&mut l1[vpn1_index(virt)], pool)?;
-
-    // SAFETY: l0_pa returned by walk_or_alloc is valid; phys_to_virt yields direct-map VA.
-    let l0 = unsafe { table_at(pool.phys_to_virt(l0_pa)) };
-    l0[vpn0_index(virt)] = PageTableEntry::new_page(phys, flags);
+    let top = paging_mode().levels() - 1;
+    // SAFETY: root_va is the VA of a valid root frame allocated from pool;
+    // walk_or_alloc yields pool frames whose VAs pool.phys_to_virt resolves.
+    let l0 = unsafe {
+        descend_alloc(root_va, virt, top, 0, |e| {
+            walk_or_alloc(e, pool).map(|pa| pool.phys_to_virt(pa))
+        })?
+    };
+    l0[vpn_index(0, virt)] = PageTableEntry::new_page(phys, flags);
     Ok(())
 }
 
 /// Map VA `virt` → PA `phys` as a 2 MiB megapage with `flags`.
 ///
-/// Installs a leaf entry at the VPN\[1\] level; no VPN\[0\] table is allocated.
+/// Installs a leaf entry at level 1; no leaf-level table is allocated.
 ///
 /// # Errors
 /// `PagingError::OutOfFrames` if the pool cannot supply an intermediate frame.
@@ -209,17 +328,15 @@ pub fn map_large_page(
     pool: &mut PoolState,
 ) -> Result<(), PagingError>
 {
-    // SAFETY: root_va is the direct-map VA of a valid Sv48 root frame allocated from pool.
-    let root = unsafe { table_at(root_va) };
-    let l2_pa = walk_or_alloc(&mut root[vpn3_index(virt)], pool)?;
-
-    // SAFETY: l2_pa returned by walk_or_alloc is valid; phys_to_virt yields direct-map VA.
-    let l2 = unsafe { table_at(pool.phys_to_virt(l2_pa)) };
-    let l1_pa = walk_or_alloc(&mut l2[vpn2_index(virt)], pool)?;
-
-    // SAFETY: l1_pa returned by walk_or_alloc is valid; phys_to_virt yields direct-map VA.
-    let l1 = unsafe { table_at(pool.phys_to_virt(l1_pa)) };
-    l1[vpn1_index(virt)] = PageTableEntry::new_large_page(phys, flags);
+    let top = paging_mode().levels() - 1;
+    // SAFETY: root_va is the VA of a valid root frame allocated from pool;
+    // walk_or_alloc yields pool frames whose VAs pool.phys_to_virt resolves.
+    let l1 = unsafe {
+        descend_alloc(root_va, virt, top, 1, |e| {
+            walk_or_alloc(e, pool).map(|pa| pool.phys_to_virt(pa))
+        })?
+    };
+    l1[vpn_index(1, virt)] = PageTableEntry::new_large_page(phys, flags);
     Ok(())
 }
 
@@ -248,14 +365,6 @@ fn walk_or_alloc(entry: &mut PageTableEntry, pool: &mut PoolState) -> Result<u64
 
 // ── Hardware operations ───────────────────────────────────────────────────────
 
-/// Activate Sv48 paging by writing `satp` and issuing `sfence.vma`.
-///
-/// `satp` encoding: mode 9 (Sv48) in bits \[63:60\], ASID 0, root PPN in
-/// bits \[43:0\].
-///
-/// # Safety
-/// The tables must map the currently executing code and active stack.
-#[cfg(not(test))]
 /// Write `satp` to point at `root_phys` without executing `sfence.vma`.
 ///
 /// Used when transitioning to idle where stale user TLB entries are harmless
@@ -268,7 +377,7 @@ fn walk_or_alloc(entry: &mut PageTableEntry, pool: &mut PoolState) -> Result<u64
 #[cfg(not(test))]
 pub unsafe fn write_satp_no_fence(root_phys: u64)
 {
-    let satp = (9u64 << 60) | (root_phys >> 12);
+    let satp = make_kernel_satp(root_phys);
     // SAFETY: satp CSR write is safe in S-mode; root_phys is valid.
     unsafe {
         core::arch::asm!(
@@ -287,8 +396,8 @@ pub unsafe fn write_satp_no_fence(root_phys: u64)
 #[cfg(not(test))]
 pub unsafe fn activate(root_phys: u64)
 {
-    let satp = (9u64 << 60) | (root_phys >> 12);
-    // SAFETY: satp write switches active Sv48 page table; root_phys is a valid root frame;
+    let satp = make_kernel_satp(root_phys);
+    // SAFETY: satp write switches the active page table; root_phys is a valid root frame;
     // caller guarantees tables map current code, stack, and direct map. sfence.vma flushes
     // TLB. RISC-V S-mode architecture primitive.
     unsafe {
@@ -301,7 +410,7 @@ pub unsafe fn activate(root_phys: u64)
     }
 }
 
-/// Activate the Sv48 tables rooted at `root_phys` under ASID `tag` **without**
+/// Activate the tables rooted at `root_phys` under ASID `tag` **without**
 /// issuing `sfence.vma`.
 ///
 /// Encodes `tag` into `satp[59:44]` and the root PPN into `satp[43:0]`; cached
@@ -311,13 +420,13 @@ pub unsafe fn activate(root_phys: u64)
 ///
 /// # Safety
 /// Must execute in S-mode on a hart with a non-zero implemented ASID width.
-/// `root_phys` must be a valid Sv48 root mapping the currently executing code,
+/// `root_phys` must be a valid root mapping the currently executing code,
 /// the active stack, and the direct map.
 #[cfg(not(test))]
 pub unsafe fn activate_tagged(root_phys: u64, tag: u16)
 {
-    let satp = (9u64 << 60) | (u64::from(tag) << 44) | (root_phys >> 12);
-    // SAFETY: satp write switches the active Sv48 root and ASID; the deliberate
+    let satp = paging_mode().make_satp(root_phys, tag);
+    // SAFETY: satp write switches the active root and ASID; the deliberate
     // absence of sfence.vma retains cached translations; caller guarantees the
     // tables map current code, stack, and the direct map.
     unsafe {
@@ -438,16 +547,17 @@ pub unsafe fn read_root_phys() -> u64
     (satp & 0x0000_0FFF_FFFF_FFFF) << 12
 }
 
-/// Map a single 4 KiB user page `virt` → `phys` in the Sv48 page table
-/// rooted at `root_virt`, allocating missing intermediate frames from `allocator`.
+/// Map a single 4 KiB user page `virt` → `phys` in the page table rooted at
+/// `root_virt`, allocating missing intermediate frames from the kernel PT
+/// pool.
 ///
 /// Sets U (user) bit so userspace can access the mapping.
 ///
 /// # Errors
-/// Returns `Err(())` if the buddy allocator is exhausted.
+/// Returns `Err(())` if the pool is exhausted.
 ///
 /// # Safety
-/// `root_virt` must be the direct-map virtual address of a valid 4 KiB Sv48
+/// `root_virt` must be the direct-map virtual address of a valid 4 KiB user
 /// root frame. `virt` must be in the lower (user) half. `phys` must be 4 KiB-aligned.
 #[cfg(not(test))]
 pub unsafe fn map_user_page(
@@ -461,29 +571,28 @@ pub unsafe fn map_user_page(
     // U bit (bit 4) allows user-mode access.
     const USER: u64 = 1 << 4;
 
-    // SAFETY: root_virt is direct-map VA of valid user Sv48 root PT; caller contract.
-    let root = unsafe { table_at(root_virt) };
-
-    let l2_pa = rv_walk_or_alloc(&mut root[vpn3_index(virt)])?;
-    // SAFETY: l2_pa from rv_walk_or_alloc is valid; phys_to_virt yields direct-map VA.
-    let l2 = unsafe { table_at(phys_to_virt(l2_pa)) };
-
-    let l1_pa = rv_walk_or_alloc(&mut l2[vpn2_index(virt)])?;
-    // SAFETY: l1_pa from rv_walk_or_alloc is valid; phys_to_virt yields direct-map VA.
-    let l1 = unsafe { table_at(phys_to_virt(l1_pa)) };
-
-    let l0_pa = rv_walk_or_alloc(&mut l1[vpn1_index(virt)])?;
-    // SAFETY: l0_pa from rv_walk_or_alloc is valid; phys_to_virt yields direct-map VA.
-    let l0 = unsafe { table_at(phys_to_virt(l0_pa)) };
+    let top = paging_mode().levels() - 1;
+    // The user_va_top gate in the syscall layer keeps user VAs out of the
+    // kernel half; a root index >= 256 here would clobber shared kernel-half
+    // entries.
+    debug_assert!(vpn_index(top, virt) < 256);
+    // SAFETY: root_virt is the direct-map VA of a valid user root PT (caller
+    // contract); rv_walk_or_alloc yields live PT frames resolvable via
+    // phys_to_virt.
+    let l0 = unsafe {
+        descend_alloc(root_virt, virt, top, 0, |e| {
+            rv_walk_or_alloc(e).map(phys_to_virt)
+        })?
+    };
     let mut pte = PageTableEntry::new_page(phys, flags);
     pte.0 |= USER;
-    let prior = l0[vpn0_index(virt)].0;
-    l0[vpn0_index(virt)] = pte;
+    let prior = l0[vpn_index(0, virt)].0;
+    l0[vpn_index(0, virt)] = pte;
 
     Ok(classify_user_map(prior, pte.0))
 }
 
-/// Walk an existing Sv48 page table entry or allocate a new child frame
+/// Walk an existing page table entry or allocate a new child frame
 /// from the kernel PT pool (`crate::mm::kernel_pt_pool`).
 #[cfg(not(test))]
 fn rv_walk_or_alloc(entry: &mut PageTableEntry) -> Result<u64, ()>
@@ -518,25 +627,22 @@ pub unsafe fn map_user_page_pooled(
     use crate::mm::paging::phys_to_virt;
     const USER: u64 = 1 << 4;
 
-    // SAFETY: root_virt is direct-map VA of valid user Sv48 root PT.
-    let root = unsafe { table_at(root_virt) };
-
-    let l2_pa = rv_walk_or_alloc_pooled(&mut root[vpn3_index(virt)], aso)?;
-    // SAFETY: l2_pa is a valid PT frame phys addr.
-    let l2 = unsafe { table_at(phys_to_virt(l2_pa)) };
-
-    let l1_pa = rv_walk_or_alloc_pooled(&mut l2[vpn2_index(virt)], aso)?;
-    // SAFETY: l1_pa is a valid PT frame phys addr.
-    let l1 = unsafe { table_at(phys_to_virt(l1_pa)) };
-
-    let l0_pa = rv_walk_or_alloc_pooled(&mut l1[vpn1_index(virt)], aso)?;
-    // SAFETY: l0_pa is a valid PT frame phys addr.
-    let l0 = unsafe { table_at(phys_to_virt(l0_pa)) };
+    let top = paging_mode().levels() - 1;
+    // Same kernel-half guard as map_user_page.
+    debug_assert!(vpn_index(top, virt) < 256);
+    // SAFETY: root_virt is the direct-map VA of a valid user root PT (caller
+    // contract); rv_walk_or_alloc_pooled yields live PT frames resolvable via
+    // phys_to_virt.
+    let l0 = unsafe {
+        descend_alloc(root_virt, virt, top, 0, |e| {
+            rv_walk_or_alloc_pooled(e, aso).map(phys_to_virt)
+        })?
+    };
 
     let mut pte = PageTableEntry::new_page(phys, flags);
     pte.0 |= USER;
-    let prior = l0[vpn0_index(virt)].0;
-    l0[vpn0_index(virt)] = pte;
+    let prior = l0[vpn_index(0, virt)].0;
+    l0[vpn_index(0, virt)] = pte;
 
     Ok(classify_user_map(prior, pte.0))
 }
@@ -559,87 +665,71 @@ fn rv_walk_or_alloc_pooled(
     Ok(frame_pa)
 }
 
-/// Walk the user half of the Sv48 page table rooted at `root_virt` and free
-/// every intermediate table frame (VPN\[2\], VPN\[1\], VPN\[0\]) back to
-/// `allocator`.
+/// Walk the user half of the page table rooted at `root_virt` and free every
+/// intermediate table frame back to the kernel PT pool.
 ///
 /// Leaf PTEs (R/W/X any set) point at physical memory owned by Memory
 /// capabilities; those frames are freed through `MemoryObject` teardown when
 /// the owning `CSpace` is destroyed, not here. This function only reclaims
 /// the *page-table* pages the aspace allocated via `rv_walk_or_alloc`. The
-/// root VPN\[3\] frame itself is not freed here; the caller in
+/// root frame itself is not freed here; the caller in
 /// `dealloc_object(AddressSpace)` frees it after this walk completes.
 ///
-/// Only entries in VPN\[3\] indices 0..256 (user half) are examined. Entries
-/// 256..512 are copies of the global kernel root; freeing any of their
-/// descendants would corrupt every other address space.
+/// Only root entries 0..256 (the user half in every mode) are examined.
+/// Entries 256..512 are copies of the global kernel root; freeing any of
+/// their descendants would corrupt every other address space.
 ///
 /// # Safety
-/// `root_virt` must be the direct-map VA of a valid 4 KiB Sv48 root frame.
+/// `root_virt` must be the direct-map VA of a valid 4 KiB root frame.
 /// No CPU may still be using this address space (the caller verifies
 /// `active_cpu_mask().is_empty()` before invocation).
 #[cfg(not(test))]
 #[allow(dead_code)]
 pub unsafe fn free_user_page_tables(root_virt: u64)
 {
-    use crate::mm::paging::phys_to_virt;
-
-    // Sv48 leaf detection: R/W/X bits; non-leaves are V=1 with R=W=X=0.
-    const LEAF_BITS: u64 = READ | WRITE | EXECUTE;
-    let is_leaf = |e: PageTableEntry| e.0 & LEAF_BITS != 0;
-
-    // SAFETY: root_virt is direct-map VA of a valid Sv48 root; caller's contract.
+    let top = paging_mode().levels() - 1;
+    // SAFETY: root_virt is direct-map VA of a valid root; caller's contract.
     let root = unsafe { table_at(root_virt) };
     for root_e in root.iter().take(256)
     {
-        if !root_e.is_present()
+        // Root-level leaves aren't produced by the mapping path; guard
+        // against them regardless — a leaf has no child tables to free.
+        if !root_e.is_present() || root_e.0 & LEAF_BITS != 0
         {
             continue;
         }
-        // VPN[3] leaves (512 GiB pages) aren't produced by the mapping path;
-        // guard against them regardless.
-        if is_leaf(*root_e)
-        {
-            continue;
-        }
-        let l2_pa = root_e.phys_addr();
-        // SAFETY: l2_pa from a present VPN[3] entry points at a live L2 frame.
-        let l2 = unsafe { table_at(phys_to_virt(l2_pa)) };
-        for l2_e in l2.iter()
-        {
-            if !l2_e.is_present()
-            {
-                continue;
-            }
-            // VPN[2] leaf = 1 GiB gigapage — no L1 to free under it.
-            if is_leaf(*l2_e)
-            {
-                continue;
-            }
-            let l1_pa = l2_e.phys_addr();
-            // SAFETY: l1_pa from a present VPN[2] entry points at a live L1 frame.
-            let l1 = unsafe { table_at(phys_to_virt(l1_pa)) };
-            for l1_e in l1.iter()
-            {
-                if !l1_e.is_present()
-                {
-                    continue;
-                }
-                // VPN[1] leaf = 2 MiB megapage — no L0 to free under it.
-                if is_leaf(*l1_e)
-                {
-                    continue;
-                }
-                let l0_pa = l1_e.phys_addr();
-                // L0 frame originated from `kernel_pt_pool::alloc_pt_page`.
-                crate::mm::kernel_pt_pool::free_pt_page(l0_pa);
-            }
-            // L1 frame likewise originated from the pool.
-            crate::mm::kernel_pt_pool::free_pt_page(l1_pa);
-        }
-        // L2 frame likewise originated from the pool.
-        crate::mm::kernel_pt_pool::free_pt_page(l2_pa);
+        // SAFETY: present non-leaf root entry points at a live child table
+        // one level below the root; caller guarantees exclusive access.
+        unsafe { free_subtree(root_e.phys_addr(), top - 1) };
     }
+}
+
+/// Free the kernel-PT-pool frame holding the level-`level` table at
+/// `table_pa`, after recursively freeing every descendant table frame.
+/// Large leaves (R/W/X set) are skipped — their PPN is data, not a table.
+/// Bounded recursion: `level < levels - 1 <= 4`.
+///
+/// # Safety
+/// `table_pa` must be a live PT-pool frame holding a table at `level` whose
+/// present non-leaf entries all point at live PT-pool frames; no CPU may be
+/// using the containing address space.
+#[cfg(not(test))]
+unsafe fn free_subtree(table_pa: u64, level: usize)
+{
+    if level > 0
+    {
+        // SAFETY: table_pa is a live PT frame (caller contract).
+        let table = unsafe { table_at(crate::mm::paging::phys_to_virt(table_pa)) };
+        for e in table.iter()
+        {
+            if e.is_present() && e.0 & LEAF_BITS == 0
+            {
+                // SAFETY: present non-leaf entry points at a live child table.
+                unsafe { free_subtree(e.phys_addr(), level - 1) };
+            }
+        }
+    }
+    crate::mm::kernel_pt_pool::free_pt_page(table_pa);
 }
 
 /// Flush the TLB entry for a single virtual address using `sfence.vma addr`.
@@ -706,48 +796,31 @@ pub unsafe fn flush_tag(tag: u16)
     }
 }
 
-/// Remove a single user-space mapping at `virt` from the Sv48 page table
-/// rooted at `root_virt`.
+/// Remove a single user-space mapping at `virt` from the page table rooted
+/// at `root_virt`.
 ///
-/// Walks VPN[3] → VPN[2] → VPN[1] → VPN[0]. If any intermediate level is
-/// not present, returns immediately (nothing to unmap). On reaching the leaf,
-/// zeros the PTE and calls `flush_page`.
+/// Walks from the root to the leaf level. If any intermediate level is not
+/// present (or is a mega/gigapage leaf, which the user path never installs),
+/// returns immediately (nothing to unmap). On reaching the leaf, zeros the
+/// PTE and calls `flush_page`.
 ///
 /// # Safety
-/// `root_virt` must be the direct-map virtual address of a valid 4 KiB Sv48
+/// `root_virt` must be the direct-map virtual address of a valid 4 KiB user
 /// root frame. Does not allocate.
 #[cfg(not(test))]
 pub unsafe fn unmap_user_page(root_virt: u64, virt: u64)
 {
     use crate::mm::paging::phys_to_virt;
 
-    // SAFETY: root_virt is direct-map VA of valid user Sv48 root PT; caller contract.
-    let root = unsafe { table_at(root_virt) };
-    let e = root[vpn3_index(virt)];
-    if !e.is_present()
+    let top = paging_mode().levels() - 1;
+    // SAFETY: root_virt is direct-map VA of a valid user root PT (caller
+    // contract); its reachable child frames are live PT-pool frames.
+    let Some(l0) = (unsafe { descend_existing(root_virt, virt, top, 0, phys_to_virt) })
+    else
     {
         return;
-    }
-
-    // SAFETY: e.phys_addr() extracted from present PTE; phys_to_virt yields direct-map VA.
-    let l2 = unsafe { table_at(phys_to_virt(e.phys_addr())) };
-    let e = l2[vpn2_index(virt)];
-    if !e.is_present()
-    {
-        return;
-    }
-
-    // SAFETY: e.phys_addr() extracted from present PTE; phys_to_virt yields direct-map VA.
-    let l1 = unsafe { table_at(phys_to_virt(e.phys_addr())) };
-    let e = l1[vpn1_index(virt)];
-    if !e.is_present()
-    {
-        return;
-    }
-
-    // SAFETY: e.phys_addr() extracted from present PTE; phys_to_virt yields direct-map VA.
-    let l0 = unsafe { table_at(phys_to_virt(e.phys_addr())) };
-    l0[vpn0_index(virt)] = PageTableEntry(0);
+    };
+    l0[vpn_index(0, virt)] = PageTableEntry(0);
 
     // SAFETY: virt may now be unmapped; flush_page is safe for any VA.
     unsafe { flush_page(virt) };
@@ -764,7 +837,7 @@ fn table_is_empty(table: &[PageTableEntry; 512]) -> bool
 /// reclaim each intermediate table the cleared span leaves empty back to
 /// `aso`'s page-table growth pool. Returns the number of L0/L1/L2 frames freed.
 ///
-/// Walks VPN[3] → VPN[2] → VPN[1] → VPN[0] over the span, clearing in-range
+/// Walks from the root to the leaf level over the span, clearing in-range
 /// leaf PTEs. A table is freed only when it is fully empty afterwards **and**
 /// `aso` owns the frame
 /// ([`owns_phys`](crate::cap::object::AddressSpaceObject::owns_phys)) —
@@ -781,7 +854,7 @@ fn table_is_empty(table: &[PageTableEntry; 512]) -> bool
 /// popped and reused before every hart is coherent.
 ///
 /// # Safety
-/// `root_virt` must be the direct-map VA of a valid 4 KiB Sv48 root frame, `aso`
+/// `root_virt` must be the direct-map VA of a valid 4 KiB root frame, `aso`
 /// must wrap that page table, and the caller must hold the address space's
 /// `pt_lock`. `[virt_base, virt_base + page_count*4 KiB)` must lie in the user
 /// half.
@@ -794,100 +867,90 @@ pub unsafe fn unmap_user_region_pooled(
 ) -> usize
 {
     use crate::mm::PAGE_SIZE;
-    use crate::mm::paging::phys_to_virt;
 
-    // A leaf at any level sets at least one of R/W/X; a table pointer has none.
-    const LEAF_BITS: u64 = READ | WRITE | EXECUTE;
-    let p = PAGE_SIZE as u64;
-    let virt_end = virt_base + page_count as u64 * p;
+    let top = paging_mode().levels() - 1;
+    let virt_end = virt_base + page_count as u64 * PAGE_SIZE as u64;
     let mut freed = 0usize;
 
-    // SAFETY: root_virt is the direct-map VA of a valid Sv48 root (caller's contract).
+    // SAFETY: root_virt is the direct-map VA of a valid root (caller's
+    // contract); unmap_span's contract is met by the same guarantees.
     let root = unsafe { table_at(root_virt) };
-    let mut va = virt_base;
-    while va < virt_end
+    // SAFETY: root is a live table at the root level; aso wraps this page
+    // table and the caller holds its pt_lock (caller's contract).
+    unsafe { unmap_span(root, top, virt_base, virt_end, aso, &mut freed) };
+    freed
+}
+
+/// Clear every in-range leaf PTE of `[lo, hi)` under `table` (a table at
+/// `level`), then free each child table the clear left empty — gated on
+/// emptiness and `aso` ownership as documented on
+/// [`unmap_user_region_pooled`]. The frame holding `table` itself is left to
+/// the caller (the root call's frame is never freed). Bounded recursion:
+/// `level <= 4`.
+///
+/// # Safety
+/// `table` must be a live table at `level` whose reachable child frames are
+/// live; `aso` must wrap the containing page table; the caller must hold its
+/// `pt_lock`.
+#[cfg(not(test))]
+unsafe fn unmap_span(
+    table: &mut [PageTableEntry; 512],
+    level: usize,
+    lo: u64,
+    hi: u64,
+    aso: &crate::cap::object::AddressSpaceObject,
+    freed: &mut usize,
+)
+{
+    use crate::mm::PAGE_SIZE;
+    use crate::mm::paging::phys_to_virt;
+
+    if level == 0
     {
-        let i3 = vpn3_index(va);
-        let e3_end = virt_end.min(((va >> 39) + 1) << 39);
-        let r3 = root[i3];
-        // Skip 512 GiB gigapage leaves (not produced by the user path).
-        if r3.is_present() && r3.0 & LEAF_BITS == 0
+        let mut va = lo;
+        while va < hi
         {
-            let l2_pa = r3.phys_addr();
-            // SAFETY: present non-leaf VPN[3] entry points at a live L2 frame.
-            let l2 = unsafe { table_at(phys_to_virt(l2_pa)) };
-            let mut va2 = va;
-            while va2 < e3_end
-            {
-                let i2 = vpn2_index(va2);
-                let e2_end = e3_end.min(((va2 >> 30) + 1) << 30);
-                let r2 = l2[i2];
-                // Skip 1 GiB gigapage leaves.
-                if r2.is_present() && r2.0 & LEAF_BITS == 0
-                {
-                    let l1_pa = r2.phys_addr();
-                    // SAFETY: present non-leaf VPN[2] entry points at a live L1 frame.
-                    let l1 = unsafe { table_at(phys_to_virt(l1_pa)) };
-                    let mut va1 = va2;
-                    while va1 < e2_end
-                    {
-                        let i1 = vpn1_index(va1);
-                        let e1_end = e2_end.min(((va1 >> 21) + 1) << 21);
-                        let r1 = l1[i1];
-                        // Skip 2 MiB megapage leaves.
-                        if r1.is_present() && r1.0 & LEAF_BITS == 0
-                        {
-                            let l0_pa = r1.phys_addr();
-                            // SAFETY: present non-leaf VPN[1] entry points at a live L0 frame.
-                            let l0 = unsafe { table_at(phys_to_virt(l0_pa)) };
-                            let mut va0 = va1;
-                            while va0 < e1_end
-                            {
-                                l0[vpn0_index(va0)] = PageTableEntry(0);
-                                va0 += p;
-                            }
-                            if table_is_empty(l0) && aso.owns_phys(l0_pa)
-                            {
-                                l1[i1] = PageTableEntry(0);
-                                // SAFETY: L0 is empty and unlinked above; frame
-                                // came from this aso's pool (owns_phys).
-                                unsafe { aso.free_pt_page(l0_pa) };
-                                freed += 1;
-                            }
-                        }
-                        va1 = e1_end;
-                    }
-                    if table_is_empty(l1) && aso.owns_phys(l1_pa)
-                    {
-                        l2[i2] = PageTableEntry(0);
-                        // SAFETY: L1 is empty and unlinked above; aso-owned.
-                        unsafe { aso.free_pt_page(l1_pa) };
-                        freed += 1;
-                    }
-                }
-                va2 = e2_end;
-            }
-            if table_is_empty(l2) && aso.owns_phys(l2_pa)
-            {
-                root[i3] = PageTableEntry(0);
-                // SAFETY: L2 is empty and unlinked above; aso-owned.
-                unsafe { aso.free_pt_page(l2_pa) };
-                freed += 1;
-            }
+            table[vpn_index(0, va)] = PageTableEntry(0);
+            va += PAGE_SIZE as u64;
         }
-        va = e3_end;
+        return;
     }
 
-    freed
+    let mut va = lo;
+    while va < hi
+    {
+        let entry_end = hi.min(next_level_boundary(level, va));
+        let idx = vpn_index(level, va);
+        let e = table[idx];
+        // Skip mega/gigapage leaves (not produced by the user path).
+        if e.is_present() && e.0 & LEAF_BITS == 0
+        {
+            let child_pa = e.phys_addr();
+            // SAFETY: present non-leaf entry points at a live child table.
+            let child = unsafe { table_at(phys_to_virt(child_pa)) };
+            // SAFETY: child is a live table at level - 1; same aso/pt_lock
+            // guarantees as this call.
+            unsafe { unmap_span(child, level - 1, va, entry_end, aso, freed) };
+            if table_is_empty(child) && aso.owns_phys(child_pa)
+            {
+                table[idx] = PageTableEntry(0);
+                // SAFETY: child is empty and unlinked above; frame came from
+                // this aso's pool (owns_phys).
+                unsafe { aso.free_pt_page(child_pa) };
+                *freed += 1;
+            }
+        }
+        va = entry_end;
+    }
 }
 
 /// RISC-V counterpart to [`crate::mm::paging::unmap_identity_page`].
 ///
-/// Walks the kernel Sv48 root from `phys_to_virt(kernel_pml4_pa())` down
-/// to the VPN\[0\] leaf covering `pa` and clears the leaf entry. Bails
-/// silently if any intermediate level is absent. Issues a local
-/// `sfence.vma pa, x0`, then broadcasts a TLB shootdown to every other
-/// online hart.
+/// Walks the kernel root from `phys_to_virt(kernel_pml4_pa())` down to the
+/// leaf covering `pa` and clears the leaf entry. Bails silently if any
+/// intermediate level is absent or is a large leaf (clearing inside one
+/// would corrupt unrelated memory). Issues a local `sfence.vma pa, x0`,
+/// then broadcasts a TLB shootdown to every other online hart.
 ///
 /// The kernel installs this identity mapping in Phase 3 (arch-neutral
 /// `mm/paging.rs`) so the AP trampoline page can execute the four
@@ -906,10 +969,6 @@ pub unsafe fn unmap_identity_page(pa: u64)
 {
     use crate::mm::paging::{kernel_pml4_pa, phys_to_virt};
 
-    // Sv48 leaf detection: any of R/W/X set on a present PTE.
-    const LEAF_BITS: u64 = READ | WRITE | EXECUTE;
-    let is_leaf = |e: PageTableEntry| e.0 & LEAF_BITS != 0;
-
     let root_pa = kernel_pml4_pa();
     if root_pa == 0
     {
@@ -917,49 +976,16 @@ pub unsafe fn unmap_identity_page(pa: u64)
     }
     let root_va = phys_to_virt(root_pa);
     let virt = pa; // identity: VA == PA
+    let top = paging_mode().levels() - 1;
 
-    // SAFETY: root_va is the direct-map VA of the kernel Sv48 root
-    // installed in Phase 3; table walk is read-only until the leaf
-    // clear at the bottom.
-    let root = unsafe { table_at(root_va) };
-    let e = root[vpn3_index(virt)];
-    if !e.is_present()
+    // SAFETY: root_va is the direct-map VA of the kernel root installed in
+    // Phase 3; table walk is read-only until the leaf clear at the bottom.
+    let Some(l0) = (unsafe { descend_existing(root_va, virt, top, 0, phys_to_virt) })
+    else
     {
         return;
-    }
-    // Refuse to mis-clear inside a 512 GiB leaf at VPN[3]; the caller
-    // would corrupt unrelated memory if we treated it as a child table.
-    if is_leaf(e)
-    {
-        return;
-    }
-    // SAFETY: e.phys_addr() extracted from present PTE; phys_to_virt yields direct-map VA.
-    let l2 = unsafe { table_at(phys_to_virt(e.phys_addr())) };
-    let e = l2[vpn2_index(virt)];
-    if !e.is_present()
-    {
-        return;
-    }
-    // Same guard for a 1 GiB gigapage leaf at VPN[2].
-    if is_leaf(e)
-    {
-        return;
-    }
-    // SAFETY: e.phys_addr() extracted from present PTE; phys_to_virt yields direct-map VA.
-    let l1 = unsafe { table_at(phys_to_virt(e.phys_addr())) };
-    let e = l1[vpn1_index(virt)];
-    if !e.is_present()
-    {
-        return;
-    }
-    // Same guard for a 2 MiB megapage leaf at VPN[1].
-    if is_leaf(e)
-    {
-        return;
-    }
-    // SAFETY: e.phys_addr() extracted from present PTE; phys_to_virt yields direct-map VA.
-    let l0 = unsafe { table_at(phys_to_virt(e.phys_addr())) };
-    l0[vpn0_index(virt)] = PageTableEntry(0);
+    };
+    l0[vpn_index(0, virt)] = PageTableEntry(0);
 
     // Local invalidate, then broadcast to every other online hart. The
     // shootdown routine requires preemption disabled and handles the
@@ -975,7 +1001,7 @@ pub unsafe fn unmap_identity_page(pa: u64)
     if !remote.is_empty()
     {
         crate::percpu::preempt_disable();
-        // SAFETY: root_pa is the active kernel Sv48 root; remote covers
+        // SAFETY: root_pa is the active kernel root; remote covers
         // only online harts; preemption disabled around the shootdown. Tag 0:
         // this is a kernel identity mapping torn down at boot, not a tagged
         // user space.
@@ -993,7 +1019,7 @@ pub unsafe fn unmap_identity_page(pa: u64)
 /// (a same-frame rewrite, so never `Fresh`).
 ///
 /// # Safety
-/// `root_virt` must be the direct-map virtual address of a valid 4 KiB Sv48
+/// `root_virt` must be the direct-map virtual address of a valid 4 KiB
 /// root frame. Caller must have validated W^X and rights before calling.
 #[cfg(not(test))]
 pub unsafe fn protect_user_page(
@@ -1006,33 +1032,12 @@ pub unsafe fn protect_user_page(
     // Set USER (U) bit (bit 4) to preserve user accessibility.
     const USER: u64 = 1 << 4;
 
-    // SAFETY: root_virt is direct-map VA of valid user Sv48 root PT; caller contract.
-    let root = unsafe { table_at(root_virt) };
-    let e = root[vpn3_index(virt)];
-    if !e.is_present()
-    {
-        return Err(PagingError::NotMapped);
-    }
-
-    // SAFETY: e.phys_addr() extracted from present PTE; phys_to_virt yields direct-map VA.
-    let l2 = unsafe { table_at(phys_to_virt(e.phys_addr())) };
-    let e = l2[vpn2_index(virt)];
-    if !e.is_present()
-    {
-        return Err(PagingError::NotMapped);
-    }
-
-    // SAFETY: e.phys_addr() extracted from present PTE; phys_to_virt yields direct-map VA.
-    let l1 = unsafe { table_at(phys_to_virt(e.phys_addr())) };
-    let e = l1[vpn1_index(virt)];
-    if !e.is_present()
-    {
-        return Err(PagingError::NotMapped);
-    }
-
-    // SAFETY: e.phys_addr() extracted from present PTE; phys_to_virt yields direct-map VA.
-    let l0 = unsafe { table_at(phys_to_virt(e.phys_addr())) };
-    let leaf = &mut l0[vpn0_index(virt)];
+    let top = paging_mode().levels() - 1;
+    // SAFETY: root_virt is direct-map VA of a valid user root PT (caller
+    // contract); its reachable child frames are live PT-pool frames.
+    let l0 = unsafe { descend_existing(root_virt, virt, top, 0, phys_to_virt) }
+        .ok_or(PagingError::NotMapped)?;
+    let leaf = &mut l0[vpn_index(0, virt)];
     if !leaf.is_present()
     {
         return Err(PagingError::NotMapped);
@@ -1051,51 +1056,29 @@ pub unsafe fn protect_user_page(
 
 /// Translate a user virtual address to its mapped physical address and raw PTE.
 ///
-/// Walks L3 → L2 → L1 → L0 (Sv48) without modifying any entry or flushing the
-/// TLB. Returns `Some((phys_addr, raw_pte_bits))` if the page is present at
-/// every level, or `None` if any level is not present.
+/// Walks from the root to the leaf level without modifying any entry or
+/// flushing the TLB. Returns `Some((phys_addr, raw_pte_bits))` if the page is
+/// present at every level, or `None` if any level is not present.
 ///
-/// Assumes 4 KiB user leaves: it descends to the L0 level and does not treat a
-/// present R/W/X entry at an intermediate level as a mega/gigapage leaf. The
-/// user mapping path never installs a large leaf, so this holds for every user
+/// Assumes 4 KiB user leaves: a present R/W/X entry at an intermediate level
+/// (a mega/gigapage leaf) yields `None` rather than a translation. The user
+/// mapping path never installs a large leaf, so this holds for every user
 /// VA — the spurious-fault classifier relies on it. A caller that introduces
 /// user large pages must add a large-leaf branch here.
 ///
 /// # Safety
-/// `root_virt` must be the direct-map virtual address of a valid 4 KiB L3
-/// page table frame.
+/// `root_virt` must be the direct-map virtual address of a valid 4 KiB user
+/// root page table frame.
 #[cfg(not(test))]
 pub unsafe fn translate_user_page(root_virt: u64, virt: u64) -> Option<(u64, u64)>
 {
     use crate::mm::paging::phys_to_virt;
 
-    // SAFETY: root_virt is direct-map VA of valid user Sv48 root PT; caller contract.
-    let root = unsafe { table_at(root_virt) };
-    let e = root[vpn3_index(virt)];
-    if !e.is_present()
-    {
-        return None;
-    }
-
-    // SAFETY: e.phys_addr() extracted from present PTE; phys_to_virt yields direct-map VA.
-    let l2 = unsafe { table_at(phys_to_virt(e.phys_addr())) };
-    let e = l2[vpn2_index(virt)];
-    if !e.is_present()
-    {
-        return None;
-    }
-
-    // SAFETY: e.phys_addr() extracted from present PTE; phys_to_virt yields direct-map VA.
-    let l1 = unsafe { table_at(phys_to_virt(e.phys_addr())) };
-    let e = l1[vpn1_index(virt)];
-    if !e.is_present()
-    {
-        return None;
-    }
-
-    // SAFETY: e.phys_addr() extracted from present PTE; phys_to_virt yields direct-map VA.
-    let l0 = unsafe { table_at(phys_to_virt(e.phys_addr())) };
-    let leaf = l0[vpn0_index(virt)];
+    let top = paging_mode().levels() - 1;
+    // SAFETY: root_virt is direct-map VA of a valid user root PT (caller
+    // contract); its reachable child frames are live PT-pool frames.
+    let l0 = unsafe { descend_existing(root_virt, virt, top, 0, phys_to_virt) }?;
+    let leaf = l0[vpn_index(0, virt)];
     if !leaf.is_present()
     {
         return None;
@@ -1109,7 +1092,7 @@ pub unsafe fn translate_user_page(root_virt: u64, virt: u64) -> Option<(u64, u64
 /// Classify a leaf-PTE rewrite (`prior` → `new`) into a
 /// [`MapOutcome`](crate::mm::paging::MapOutcome) for shootdown elision.
 ///
-/// `prior`/`new` are raw Sv48 leaf PTE bits (`new` is presumed valid). A not-
+/// `prior`/`new` are raw leaf PTE bits (`new` is presumed valid). A not-
 /// valid `prior` is a fresh map; a same-frame rights *widening* needs only the
 /// spurious-fault retry; any frame change or rights *narrowing* strands a
 /// dangerous stale entry and must shoot down. See [`MapOutcome`] for the full
@@ -1133,7 +1116,7 @@ fn classify_user_map(prior: u64, new: u64) -> crate::mm::paging::MapOutcome
     }
 }
 
-/// Whether `new` grants every user access `prior` granted (Sv48 leaf bits).
+/// Whether `new` grants every user access `prior` granted (leaf R/W/X bits).
 ///
 /// Each access class checks its own bit: R (load), W (store), X (fetch).
 fn map_rights_superset(new: u64, prior: u64) -> bool
@@ -1152,7 +1135,7 @@ fn map_rights_superset(new: u64, prior: u64) -> bool
 /// fetch (a plain load has both false). A user page fault is *spurious* (stale
 /// TLB) only when the live PTE is valid, user-accessible (U), and already
 /// grants the access: a load needs `READ`, a store needs `WRITE`, a fetch
-/// needs `EXECUTE`. Sv48 does not make execute-only pages readable (MXR is
+/// needs `EXECUTE`. The kernel does not make execute-only pages readable (MXR is
 /// kept clear), so each access class checks exactly its own bit.
 fn pte_permits_user_access(pte: u64, write: bool, instr: bool) -> bool
 {
@@ -1198,7 +1181,7 @@ pub unsafe fn user_fault_is_spurious(va: u64, write: bool, instr: bool) -> bool
     // SAFETY: S-mode; reads satp to recover the active page-table root.
     let root_phys = unsafe { read_root_phys() };
     let root_virt = crate::mm::paging::phys_to_virt(root_phys);
-    // SAFETY: root_virt is the direct-map VA of the active Sv48 root.
+    // SAFETY: root_virt is the direct-map VA of the active root.
     match unsafe { translate_user_page(root_virt, va) }
     {
         Some((_pa, pte)) => pte_permits_user_access(pte, write, instr),
@@ -1231,7 +1214,6 @@ pub unsafe fn flush_tlb_all()
 mod tests
 {
     use super::*;
-    use crate::mm::paging::DIRECT_MAP_BASE;
 
     // ── PTE construction ──────────────────────────────────────────────────────
 
@@ -1292,26 +1274,40 @@ mod tests
 
     // ── VA index extraction ───────────────────────────────────────────────────
 
+    const ALL_MODES: [PagingMode; 3] = [PagingMode::Sv39, PagingMode::Sv48, PagingMode::Sv57];
+
     #[test]
-    fn direct_map_base_vpn3_index_is_256()
+    fn kernel_half_base_root_index_is_256_in_every_mode()
     {
-        assert_eq!(vpn3_index(DIRECT_MAP_BASE), 256);
+        for mode in ALL_MODES
+        {
+            let top = mode.levels() - 1;
+            assert_eq!(vpn_index(top, mode.kernel_va_base()), 256);
+            for level in 0..top
+            {
+                assert_eq!(vpn_index(level, mode.kernel_va_base()), 0);
+            }
+        }
+        // The direct map sits at the active mode's kernel-half base
+        // (host-test default: Sv48).
+        assert_eq!(vpn_index(3, crate::mm::paging::direct_map_base()), 256);
     }
 
     #[test]
-    fn direct_map_base_lower_indices_are_zero()
+    fn kernel_image_base_root_index_per_mode()
     {
-        assert_eq!(vpn2_index(DIRECT_MAP_BASE), 0);
-        assert_eq!(vpn1_index(DIRECT_MAP_BASE), 0);
-    }
-
-    #[test]
-    fn kernel_vbase_vpn3_is_511_vpn2_is_510()
-    {
+        // The kernel links at the top-2-GiB VA, canonical in every mode.
         let kv: u64 = 0xFFFF_FFFF_8000_0000;
-        assert_eq!(vpn3_index(kv), 511);
-        assert_eq!(vpn2_index(kv), 510);
-        assert_eq!(vpn1_index(kv), 0);
+        assert_eq!(vpn_index(PagingMode::Sv39.levels() - 1, kv), 510);
+        assert_eq!(vpn_index(PagingMode::Sv48.levels() - 1, kv), 511);
+        assert_eq!(vpn_index(PagingMode::Sv57.levels() - 1, kv), 511);
+        assert_eq!(vpn_index(1, kv), 0);
+    }
+
+    #[test]
+    fn test_default_mode_is_sv48()
+    {
+        assert_eq!(paging_mode(), PagingMode::Sv48);
     }
 
     // ── Spurious-fault classification ──────────────────────────────────────────
@@ -1363,7 +1359,7 @@ mod tests
     const FRAME_A: u64 = 0x10_000;
     const FRAME_B: u64 = 0x20_000;
 
-    /// Raw Sv48 leaf PTE bits: valid user page on `frame` with the given rights.
+    /// Raw leaf PTE bits: valid user page on `frame` with the given rights.
     fn leaf(frame: u64, r: bool, w: bool, x: bool) -> u64
     {
         let mut pte = VALID | USER_BIT | ((frame >> 12) << 10);

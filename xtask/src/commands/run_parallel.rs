@@ -171,6 +171,7 @@ pub fn run(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
             let arch = args.arch;
             let cpus = args.cpus;
             let mem_mib = args.mem;
+            let riscv_mmu = args.riscv_mmu;
             let debug_listen = args.debug_listen;
             let hold_on_hang = args.hold_on_hang;
             let timeout = Duration::from_secs(args.timeout);
@@ -226,6 +227,7 @@ pub fn run(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
                         GdbMode::Off
                     },
                     qmp_socket: None,
+                    riscv_mmu,
                 };
                 let qemu_args = build_qemu_argv(&spec)?;
 

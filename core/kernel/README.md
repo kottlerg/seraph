@@ -34,7 +34,7 @@ kernel/
 │   │   │   └── entropy.rs      # Hardware RNG (RDSEED/RDRAND) + cycle counter
 │   │   └── riscv64/            # RISC-V implementation
 │   │       ├── mod.rs
-│   │       ├── paging.rs       # Page table management (Sv48)
+│   │       ├── paging.rs       # Page table management (mode-parameterized)
 │   │       ├── context.rs      # Thread context save/restore, context switch
 │   │       ├── interrupts.rs   # stvec, trap handler, PLIC
 │   │       ├── timer.rs        # Sstc (stimecmp) timer for preemption

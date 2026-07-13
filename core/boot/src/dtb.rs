@@ -14,6 +14,8 @@
 //!
 //! # Surface
 //! - [`parse_cpu_count`]: enumerate RISC-V hart IDs from the `/cpus` node.
+//! - [`parse_timer_caps`]: extract the `/cpus` `timebase-frequency` and
+//!   whether every enabled hart advertises the Sstc extension.
 //! - [`parse_aperture_seed`]: collect MMIO extents (PLIC, CLINT, UART, PCI
 //!   ECAM + ranges, `virtio,mmio` transports) as seeds for
 //!   [`super::memory_map::derive_mmio_apertures`].
@@ -387,9 +389,12 @@ impl Fdt
         });
     }
 
-    /// Walk CPU nodes (compatible = "riscv") and call `callback(hart_id)` for
-    /// each enabled CPU. CPU nodes use `#address-cells=1, #size-cells=0`, so
-    /// `reg` is a single big-endian u32 hart ID.
+    /// Walk CPU nodes (compatible = "riscv") and call
+    /// `callback(hart_id, has_sstc)` for each enabled CPU. CPU nodes use
+    /// `#address-cells=1, #size-cells=0`, so `reg` is a single big-endian
+    /// u32 hart ID. `has_sstc` is true when the node advertises the Sstc
+    /// extension via `riscv,isa-extensions` (stringlist) or the legacy
+    /// `riscv,isa` string.
     ///
     /// `callback` returns `true` to continue or `false` to stop early.
     ///
@@ -400,9 +405,11 @@ impl Fdt
     #[allow(clippy::too_many_lines)]
     pub fn walk_cpu_nodes<F>(&self, mut callback: F)
     where
-        F: FnMut(u32) -> bool,
+        F: FnMut(u32, bool) -> bool,
     {
-        // Node state for one open node during traversal.
+        // Node state for one open node during traversal. Four independent
+        // property observations; enum-ifying them would obscure the walk.
+        #[allow(clippy::struct_excessive_bools)]
         #[derive(Clone, Copy)]
         struct CpuNodeState
         {
@@ -410,6 +417,7 @@ impl Fdt
             reg_u32: u32,
             has_reg: bool,
             disabled: bool,
+            has_sstc: bool,
         }
 
         let mut states = [CpuNodeState {
@@ -417,6 +425,7 @@ impl Fdt
             reg_u32: 0,
             has_reg: false,
             disabled: false,
+            has_sstc: false,
         }; MAX_DEPTH];
 
         let mut depth: usize = 0;
@@ -437,6 +446,7 @@ impl Fdt
                             reg_u32: 0,
                             has_reg: false,
                             disabled: false,
+                            has_sstc: false,
                         };
                     }
                     depth += 1;
@@ -452,7 +462,10 @@ impl Fdt
                     if depth < MAX_DEPTH
                     {
                         let s = &states[depth];
-                        if s.is_riscv_cpu && s.has_reg && !s.disabled && !callback(s.reg_u32)
+                        if s.is_riscv_cpu
+                            && s.has_reg
+                            && !s.disabled
+                            && !callback(s.reg_u32, s.has_sstc)
                         {
                             break;
                         }
@@ -512,6 +525,24 @@ impl Fdt
                             state.disabled = true;
                         }
                     }
+                    else if name == b"riscv,isa-extensions"
+                    {
+                        // Null-separated stringlist of extension names.
+                        let data = self.struct_slice(data_off, prop_len);
+                        if prop_contains(data, b"sstc")
+                        {
+                            state.has_sstc = true;
+                        }
+                    }
+                    else if name == b"riscv,isa"
+                    {
+                        // Legacy single ISA string: "rv64imafdc_…_sstc_…\0".
+                        let data = self.struct_slice(data_off, prop_len);
+                        if isa_string_has_ext(data, b"sstc")
+                        {
+                            state.has_sstc = true;
+                        }
+                    }
                 }
                 FDT_NOP =>
                 {}
@@ -519,6 +550,73 @@ impl Fdt
                 _ => break,
             }
         }
+    }
+
+    /// Return the first `timebase-frequency` property value in the tree, or
+    /// zero when absent.
+    ///
+    /// The property lives on the `/cpus` container node (per-cpu duplicates,
+    /// where present, carry the same value), so a flat property scan without
+    /// node tracking suffices. Accepts the spec's u32 cell and, defensively,
+    /// a u64 encoding.
+    ///
+    /// Only called via [`parse_timer_caps`] from `arch/riscv64`; on x86-64
+    /// the DTB parser is still compiled but no caller exists.
+    #[allow(dead_code)]
+    pub fn timebase_frequency(&self) -> u64
+    {
+        let mut off: u32 = 0;
+
+        while let Some(token) = self.read_struct_u32(off)
+        {
+            off += 4;
+
+            match token
+            {
+                FDT_BEGIN_NODE =>
+                {
+                    off = skip_node_name(self, off);
+                }
+                FDT_END_NODE | FDT_NOP =>
+                {}
+                FDT_PROP =>
+                {
+                    let Some(prop_len) = self.read_struct_u32(off)
+                    else
+                    {
+                        break;
+                    };
+                    off += 4;
+                    let Some(nameoff) = self.read_struct_u32(off)
+                    else
+                    {
+                        break;
+                    };
+                    off += 4;
+                    let data_off = off;
+                    off += (prop_len + 3) & !3;
+
+                    if self.string_at(nameoff) == b"timebase-frequency"
+                    {
+                        let data = self.struct_slice(data_off, prop_len);
+                        let value = match prop_len
+                        {
+                            4 => u64::from(read_be32(data)),
+                            8 => read_be64(data),
+                            _ => 0,
+                        };
+                        if value != 0
+                        {
+                            return value;
+                        }
+                    }
+                }
+                // FDT_END = end of struct block; any other token = malformed/unknown.
+                _ => break,
+            }
+        }
+
+        0
     }
 }
 
@@ -560,6 +658,24 @@ fn prop_contains(data: &[u8], target: &[u8]) -> bool
         }
     }
     false
+}
+
+/// Check whether a RISC-V ISA string (`"rv64imafdc_zicsr_…_sstc_…"`,
+/// optionally null-terminated) names `ext` as an underscore-separated
+/// multi-letter extension.
+///
+/// The leading base segment (`rv64imafdc…`) can never equal a multi-letter
+/// extension name, so no special-casing is needed. Shared by the DTB
+/// `riscv,isa` fallback here and the ACPI RHCT ISA-string node parser in
+/// [`crate::arch::riscv64`].
+pub(crate) fn isa_string_has_ext(data: &[u8], ext: &[u8]) -> bool
+{
+    let isa = match data.iter().position(|&b| b == 0)
+    {
+        Some(nul) => &data[..nul],
+        None => data,
+    };
+    isa.split(|&b| b == b'_').any(|seg| seg == ext)
 }
 
 /// Read a big-endian u32 from the first 4 bytes of `buf`.
@@ -621,7 +737,7 @@ pub unsafe fn parse_cpu_count(dtb_addr: u64) -> (u32, [u32; MAX_CPUS])
     // MAX_CPUS fits in u32.
     #[allow(clippy::cast_possible_truncation)]
     let max_cpus_u32 = MAX_CPUS as u32;
-    fdt.walk_cpu_nodes(|reg_u32| {
+    fdt.walk_cpu_nodes(|reg_u32, _has_sstc| {
         if count < max_cpus_u32
         {
             hart_ids[count as usize] = reg_u32;
@@ -640,6 +756,44 @@ pub unsafe fn parse_cpu_count(dtb_addr: u64) -> (u32, [u32; MAX_CPUS])
     }
 
     (count, hart_ids)
+}
+
+/// Parse the DTB timer capabilities: the `/cpus` `timebase-frequency` and
+/// whether every enabled hart advertises the Sstc extension.
+///
+/// Returns `(timebase_freq, sstc)`. `timebase_freq` is zero when the
+/// property is absent. `sstc` is true only when at least one enabled CPU
+/// node was seen and all of them advertise Sstc — a conservative AND, since
+/// the kernel arms `stimecmp` on every hart.
+///
+/// Returns `(0, false)` if the DTB is invalid.
+///
+/// Only called from `arch/riscv64`; on x86-64 the DTB parser is still
+/// compiled but no caller exists.
+///
+/// # Safety
+/// `dtb_addr` must be the physical address of a valid, identity-mapped FDT.
+#[allow(dead_code)]
+pub unsafe fn parse_timer_caps(dtb_addr: u64) -> (u64, bool)
+{
+    // SAFETY: caller guarantees dtb_addr is identity-mapped DTB.
+    let Some(fdt) = (unsafe { Fdt::from_raw(dtb_addr) })
+    else
+    {
+        return (0, false);
+    };
+
+    let timebase_freq = fdt.timebase_frequency();
+
+    let mut seen_any = false;
+    let mut all_sstc = true;
+    fdt.walk_cpu_nodes(|_hart_id, has_sstc| {
+        seen_any = true;
+        all_sstc &= has_sstc;
+        true // continue
+    });
+
+    (timebase_freq, seen_any && all_sstc)
 }
 
 // ── Aperture seeder (protocol v6) ────────────────────────────────────────────
@@ -736,4 +890,242 @@ pub unsafe fn parse_aperture_seed(dtb_addr: u64, out: &mut [MmioAperture]) -> us
     });
 
     n
+}
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+
+    /// Minimal FDT blob builder: header + struct block + strings block, all
+    /// big-endian, matching the subset of the spec the walkers consume.
+    struct FdtBuilder
+    {
+        structs: Vec<u8>,
+        strings: Vec<u8>,
+    }
+
+    impl FdtBuilder
+    {
+        fn new() -> Self
+        {
+            FdtBuilder {
+                structs: Vec::new(),
+                strings: Vec::new(),
+            }
+        }
+
+        fn token(&mut self, t: u32)
+        {
+            self.structs.extend_from_slice(&t.to_be_bytes());
+        }
+
+        fn pad4(&mut self)
+        {
+            while self.structs.len() % 4 != 0
+            {
+                self.structs.push(0);
+            }
+        }
+
+        fn begin_node(&mut self, name: &[u8])
+        {
+            self.token(FDT_BEGIN_NODE);
+            self.structs.extend_from_slice(name);
+            self.structs.push(0);
+            self.pad4();
+        }
+
+        fn end_node(&mut self)
+        {
+            self.token(FDT_END_NODE);
+        }
+
+        fn string_off(&mut self, name: &[u8]) -> u32
+        {
+            let off = self.strings.len() as u32;
+            self.strings.extend_from_slice(name);
+            self.strings.push(0);
+            off
+        }
+
+        fn prop(&mut self, name: &[u8], data: &[u8])
+        {
+            let nameoff = self.string_off(name);
+            self.token(FDT_PROP);
+            self.token(data.len() as u32);
+            self.token(nameoff);
+            self.structs.extend_from_slice(data);
+            self.pad4();
+        }
+
+        fn finish(mut self) -> Vec<u8>
+        {
+            self.token(FDT_END);
+            let off_struct: u32 = 40;
+            let size_struct = self.structs.len() as u32;
+            let off_strings = off_struct + size_struct;
+            let size_strings = self.strings.len() as u32;
+            let total = off_strings + size_strings;
+
+            let mut blob = Vec::with_capacity(total as usize);
+            for field in [
+                FDT_MAGIC,
+                total,
+                off_struct,
+                off_strings,
+                0, // off_mem_rsvmap (unused by the walkers)
+                17,
+                16,
+                0,
+                size_strings,
+                size_struct,
+            ]
+            {
+                blob.extend_from_slice(&field.to_be_bytes());
+            }
+            blob.extend_from_slice(&self.structs);
+            blob.extend_from_slice(&self.strings);
+            blob
+        }
+    }
+
+    /// A cpu node: `compatible = "riscv"`, `reg = <hart_id>`, plus the given
+    /// extra properties.
+    fn cpu_node(b: &mut FdtBuilder, name: &[u8], hart_id: u32, extra: &[(&[u8], &[u8])])
+    {
+        b.begin_node(name);
+        b.prop(b"compatible", b"riscv\0");
+        b.prop(b"reg", &hart_id.to_be_bytes());
+        for (pname, pdata) in extra
+        {
+            b.prop(pname, pdata);
+        }
+        b.end_node();
+    }
+
+    fn tree(timebase: Option<&[u8]>, cpus: impl FnOnce(&mut FdtBuilder)) -> Vec<u8>
+    {
+        let mut b = FdtBuilder::new();
+        b.begin_node(b"");
+        b.begin_node(b"cpus");
+        if let Some(tb) = timebase
+        {
+            b.prop(b"timebase-frequency", tb);
+        }
+        cpus(&mut b);
+        b.end_node();
+        b.end_node();
+        b.finish()
+    }
+
+    fn timer_caps(blob: &[u8]) -> (u64, bool)
+    {
+        // SAFETY: blob is a valid in-memory FDT built by FdtBuilder.
+        unsafe { parse_timer_caps(blob.as_ptr() as u64) }
+    }
+
+    #[test]
+    fn timebase_frequency_u32_cell()
+    {
+        let blob = tree(Some(&10_000_000u32.to_be_bytes()), |_| {});
+        let (freq, _) = timer_caps(&blob);
+        assert_eq!(freq, 10_000_000);
+    }
+
+    #[test]
+    fn timebase_frequency_u64_cell()
+    {
+        let blob = tree(Some(&24_000_000u64.to_be_bytes()), |_| {});
+        let (freq, _) = timer_caps(&blob);
+        assert_eq!(freq, 24_000_000);
+    }
+
+    #[test]
+    fn timebase_frequency_absent_is_zero()
+    {
+        let blob = tree(None, |b| cpu_node(b, b"cpu@0", 0, &[]));
+        let (freq, _) = timer_caps(&blob);
+        assert_eq!(freq, 0);
+    }
+
+    #[test]
+    fn sstc_via_isa_extensions_stringlist()
+    {
+        let blob = tree(None, |b| {
+            let exts: &[(&[u8], &[u8])] = &[(b"riscv,isa-extensions", b"i\0m\0sstc\0svadu\0")];
+            cpu_node(b, b"cpu@0", 0, exts);
+            cpu_node(b, b"cpu@1", 1, exts);
+        });
+        assert!(timer_caps(&blob).1);
+    }
+
+    #[test]
+    fn sstc_via_legacy_isa_string()
+    {
+        let blob = tree(None, |b| {
+            cpu_node(
+                b,
+                b"cpu@0",
+                0,
+                &[(b"riscv,isa", b"rv64imafdc_zicsr_sstc_svadu\0")],
+            );
+        });
+        assert!(timer_caps(&blob).1);
+    }
+
+    #[test]
+    fn sstc_denied_when_one_hart_lacks_it()
+    {
+        let blob = tree(None, |b| {
+            cpu_node(b, b"cpu@0", 0, &[(b"riscv,isa-extensions", b"i\0sstc\0")]);
+            cpu_node(b, b"cpu@1", 1, &[(b"riscv,isa-extensions", b"i\0")]);
+        });
+        assert!(!timer_caps(&blob).1);
+    }
+
+    #[test]
+    fn sstc_ignores_disabled_hart()
+    {
+        let blob = tree(None, |b| {
+            cpu_node(b, b"cpu@0", 0, &[(b"riscv,isa-extensions", b"i\0sstc\0")]);
+            let disabled: &[(&[u8], &[u8])] = &[
+                (b"riscv,isa-extensions", b"i\0"),
+                (b"status", b"disabled\0"),
+            ];
+            cpu_node(b, b"cpu@1", 1, disabled);
+        });
+        assert!(timer_caps(&blob).1);
+    }
+
+    #[test]
+    fn sstc_false_without_cpu_nodes()
+    {
+        let blob = tree(Some(&10_000_000u32.to_be_bytes()), |_| {});
+        assert!(!timer_caps(&blob).1);
+    }
+
+    #[test]
+    fn isa_string_matches_whole_segments_only()
+    {
+        assert!(isa_string_has_ext(b"rv64imafdc_sstc", b"sstc"));
+        assert!(isa_string_has_ext(b"rv64imafdc_sstc_svadu\0", b"sstc"));
+        assert!(!isa_string_has_ext(b"rv64imafdc", b"sstc"));
+        assert!(!isa_string_has_ext(b"rv64imafdc_ssaia", b"sstc"));
+        assert!(!isa_string_has_ext(b"rv64imafdc_sstcfoo", b"sstc"));
+        assert!(!isa_string_has_ext(b"", b"sstc"));
+    }
+
+    #[test]
+    fn cpu_walk_still_reports_hart_ids()
+    {
+        let blob = tree(None, |b| {
+            cpu_node(b, b"cpu@0", 7, &[]);
+            cpu_node(b, b"cpu@1", 9, &[]);
+        });
+        // SAFETY: blob is a valid in-memory FDT built by FdtBuilder.
+        let (count, ids) = unsafe { parse_cpu_count(blob.as_ptr() as u64) };
+        assert_eq!(count, 2);
+        assert_eq!(&ids[..2], &[7, 9]);
+    }
 }

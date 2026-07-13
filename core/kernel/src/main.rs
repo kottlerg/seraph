@@ -1397,7 +1397,7 @@ pub extern "C" fn kernel_entry_ap(cpu_id: u32, ist1_top: u64, ist2_top: u64) -> 
 
     // 6. Start the per-CPU preemption timer (1 ms, matching BSP).
     //    x86-64: programs the local APIC timer using the BSP's calibrated rate.
-    //    RISC-V: arms the SBI timer using the BSP's stored tick period.
+    //    RISC-V: arms this hart's `stimecmp` using the BSP's stored tick period.
     // SAFETY: local APIC/interrupt delivery initialized above; timer IRQ
     // handler registered (Phase 5, BSP); per-CPU timer configuration.
     unsafe {

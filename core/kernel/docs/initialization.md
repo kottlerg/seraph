@@ -203,7 +203,8 @@ Architecture-specific hardware initialization; x86-64 and RISC-V diverge here.
    - Write segment selectors to STAR MSR
    - Write SFMASK to clear IF on entry
 6. Initialise the local APIC on the BSP
-7. Configure the APIC timer for preemption (period from scheduler policy)
+7. Configure the preemption timer (period from scheduler policy):
+   TSC-deadline mode where CPUID advertises it, periodic APIC timer otherwise
 8. Enable interrupts (STI)
 ```
 
@@ -217,7 +218,8 @@ Architecture-specific hardware initialization; x86-64 and RISC-V diverge here.
    - Clear SUM (no supervisor access to user pages)
 3. Enable SEIP, STIP in sie (external and timer interrupt enables)
 4. Initialise PLIC for this hart: configure priorities and enables
-5. Set SBI timer for initial tick (timer interrupt enable)
+5. Arm stimecmp (Sstc) for the initial tick, using the bootloader-discovered
+   timebase; halts if Sstc or the timebase was not discovered
 6. Enable interrupts (set sstatus.SIE)
 ```
 

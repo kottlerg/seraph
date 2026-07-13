@@ -101,7 +101,8 @@ Each feature is classified per architecture as one of:
 - **PCID and INVPCID** — address-space-tagged TLBs. The kernel assigns a tag per address space and
   elides the per-switch flush; see [memory-model.md](memory-model.md).
 - **Invariant TSC** — a constant-rate timestamp counter, the basis of timekeeping.
-- **8254 PIT** — used to calibrate the local-APIC timer and the TSC at boot.
+- **8254 PIT** — used once at boot to calibrate the TSC (and the local-APIC timer for the
+  periodic-fallback tick path).
 - **Local APIC and an I/O APIC** — interrupt delivery and routing.
 - **CPUID extended-topology leaf 0x0B** — SMT/topology enumeration.
 - **`RDRAND` and `RDSEED`** — hardware entropy sources seeded into the kernel CSPRNG.
@@ -120,7 +121,8 @@ Each feature is classified per architecture as one of:
   falls back to xAPIC MMIO.
 - **AES-NI and SHA-NI** — crypto acceleration.
 - **CET (shadow stack / IBT)** — control-flow integrity, when enabled.
-- **TSC-deadline timer mode** — an alternative to the periodic APIC timer.
+- **TSC-deadline timer mode** — drives the preemption tick when present; the periodic APIC
+  timer is the fallback.
 - **EFI_RNG_PROTOCOL** — an additional boot entropy seed.
 - **GOP framebuffer** — graphical console; a headless serial-only boot is valid.
 - **PCIe ECAM (MCFG)** — discovered when firmware publishes it; not required by the kernel.
@@ -209,7 +211,9 @@ feature it halts with a message naming the specific feature, rather than failing
   SBI presence at the gate, and the Vector extension and the ASID-tagged TLB at their initialization
   sites (a hart lacking either is refused; emulated RISC-V provides ASID, so unlike x86-64 PCID this
   is gated). Extension requirements introduced by a subsystem (the interrupt controller, the timer,
-  the paging extensions) are asserted by that subsystem at its own initialization.
+  the paging extensions) are asserted by that subsystem at its own initialization — the timer, for
+  example, refuses to boot unless the bootloader confirmed Sstc (and a timebase frequency) for every
+  hart from the firmware tables (ACPI RHCT, or the DTB `/cpus` nodes).
 
 Platform features that are not CPU-detectable (the PIT, UEFI, ACPI/DTB, the UART) are not probed by
 the gate; their absence manifests as a boot failure on the discovery path they feed.

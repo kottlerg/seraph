@@ -1015,8 +1015,9 @@ unsafe fn step9_populate_boot_info(
     // SAFETY: elements [0..entry_count] were written by the call above.
     unsafe { memory_map::insertion_sort_memory_map(entry_out, entry_count) };
 
-    // kernel_mmio: arch-dispatched extractor. Fields left zero cause the kernel
-    // to fall back to its compiled-in constants.
+    // kernel_mmio: arch-dispatched extractor. Per-field docs on `KernelMmio`
+    // state whether a zero field falls back to a kernel compiled-in constant
+    // or is fatal at the consuming subsystem's initialization.
     let mut kernel_mmio = KernelMmio::zero();
     // SAFETY: firmware addresses are identity-mapped; each arch validates.
     unsafe { arch::current::populate_kernel_mmio(firm, &mut kernel_mmio) };

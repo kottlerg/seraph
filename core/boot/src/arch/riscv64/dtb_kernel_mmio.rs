@@ -7,21 +7,26 @@
 //!
 //! Walks an FDT blob for compatible matches and writes first-match
 //! values into [`KernelMmio::plic_base`] / `plic_size` and
-//! [`KernelMmio::uart_base`] / `uart_size`. Runs only for fields the
-//! caller left zero, so an earlier ACPI pass's values take precedence.
+//! [`KernelMmio::uart_base`] / `uart_size`, and fills the non-MMIO hart
+//! facts [`KernelMmio::timebase_freq`] and [`KernelMmio::hart_caps`]
+//! from the `/cpus` nodes. Runs only for fields the caller left zero
+//! (`hart_caps` bits are only ever set), so an earlier ACPI pass's
+//! values take precedence.
 //!
 //! The FDT walker itself lives in [`crate::dtb`]; this module consumes
 //! the [`Fdt`] surface and applies the RISC-V-specific compatible
 //! mapping.
 
 use crate::dtb::Fdt;
-use boot_protocol::KernelMmio;
+use boot_protocol::{HART_CAP_SSTC, KernelMmio};
 
 /// Populate the arch-specific `kernel_mmio` fields for RISC-V from the DTB.
 ///
 /// Walks the device tree for compatible matches:
 /// - `sifive,plic-1.0.0` / `riscv,plic0` → `plic_base`, `plic_size`.
 /// - `ns16550a` → `uart_base`, `uart_size`.
+/// - `/cpus` nodes → `timebase_freq` and, when every enabled hart
+///   advertises Sstc, `hart_caps |= HART_CAP_SSTC`.
 ///
 /// First match wins (real boards have one PLIC and one primary UART).
 /// A field already populated by a prior pass is left untouched; the
@@ -77,5 +82,16 @@ pub unsafe fn parse_kernel_mmio(dtb_addr: u64, km: &mut KernelMmio)
             }
             km.uart_base == 0
         });
+    }
+
+    // SAFETY: caller guarantees dtb_addr is a valid, identity-mapped DTB.
+    let (timebase_freq, sstc) = unsafe { crate::dtb::parse_timer_caps(dtb_addr) };
+    if km.timebase_freq == 0
+    {
+        km.timebase_freq = timebase_freq;
+    }
+    if sstc
+    {
+        km.hart_caps |= HART_CAP_SSTC;
     }
 }

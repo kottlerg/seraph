@@ -3,7 +3,16 @@
 
 // kernel/src/arch/x86_64/timer.rs
 
-//! x86-64 preemption timer using the local APIC timer (xAPIC).
+//! x86-64 preemption timer: TSC-deadline mode where the CPU advertises it
+//! (CPUID.01H:ECX[24]), otherwise the periodic local APIC timer.
+//!
+//! The mode is decided once on the BSP during [`init`] and mirrored by every
+//! AP. TSC-deadline is classified Opportunistic by
+//! [platform-requirements.md](../../../../docs/platform-requirements.md):
+//! the periodic fallback stays because the QEMU TCG emulator used for
+//! continuous integration does not expose the CPUID bit. Neither mode
+//! requires x2APIC — the LVT mode bits exist in both xAPIC and x2APIC
+//! register layouts, and the shared `apic_write` accessor abstracts them.
 //!
 //! # Calibration
 //! The APIC timer frequency is CPU-specific and unknown at compile time.
@@ -14,19 +23,22 @@
 //! 3. Spinning until the PIT expires.
 //! 4. Reading the remaining APIC count to derive ticks per 10 ms.
 //!
-//! The PIT output is readable on port 0x61 (bit 5: channel 2 output).
+//! The PIT output is readable on port 0x61 (bit 5: channel 2 output). The
+//! same window also calibrates the TSC (`TSC_PER_US`), which both
+//! `elapsed_us()` and TSC-deadline arming consume — so the PIT is used
+//! exactly once, at boot, in either mode.
 //!
 //! # Timer ISR
-//! The ISR sends EOI and invokes the scheduler tick for preemption. The
-//! monotonic tick counter is derived from the TSC (see [`current_tick`]) so
-//! that sleep deadlines stay phase-locked with userspace `Instant::now()`
-//! across host preemption windows.
+//! The ISR re-arms the deadline (TSC-deadline mode only; periodic mode
+//! reloads in hardware), sends EOI, and invokes the scheduler tick for
+//! preemption. The monotonic tick counter is derived from the TSC (see
+//! [`current_tick`]) so that sleep deadlines stay phase-locked with
+//! userspace `Instant::now()` across host preemption windows.
 //!
 //! # Modification notes
 //! - To change the tick period: pass a different `period_us` to `init()`.
-//! - To get higher resolution: reduce divide ratio and recalculate.
-//! - To use TSC deadline mode: replace periodic mode programming; requires
-//!   CPUID feature check and x2APIC.
+//! - To get higher resolution (periodic mode): reduce divide ratio and
+//!   recalculate.
 
 // cast_possible_truncation: APIC timer counts fit in u32; TIMER_VECTOR fits in u32.
 // cast_lossless: u32→u64 conversions in TSC math are lossless.
@@ -37,8 +49,10 @@
     clippy::inline_always
 )]
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+#[cfg(not(test))]
+use super::cpu;
 #[cfg(not(test))]
 use super::interrupts;
 #[cfg(not(test))]
@@ -57,8 +71,15 @@ const APIC_TIMER_INITIAL: usize = 0x380;
 const APIC_TIMER_CURRENT: usize = 0x390;
 const APIC_TIMER_DIVIDE: usize = 0x3E0;
 
-/// LVT timer mode: periodic (bit 17 set).
+/// LVT timer mode: periodic (bits 18:17 = 0b01).
 const LVT_TIMER_PERIODIC: u32 = 1 << 17;
+
+/// LVT timer mode: TSC-deadline (bits 18:17 = 0b10, SDM Vol. 3A §11.5.4.1).
+const LVT_TIMER_TSC_DEADLINE: u32 = 0b10 << 17;
+
+/// `IA32_TSC_DEADLINE` MSR: writing an absolute TSC value arms a one-shot
+/// interrupt for when the TSC reaches it; writing 0 disarms.
+const IA32_TSC_DEADLINE: u32 = 0x6E0;
 
 /// Divide-by-16 configuration for the APIC timer divide register.
 const DIVIDE_BY_16: u32 = 0x3;
@@ -80,6 +101,16 @@ static APIC_TICKS_PER_SEC: AtomicU64 = AtomicU64::new(0);
 /// Timer interrupt rate (interrupts per second) returned by
 /// [`ticks_per_second`]. Set to `1_000_000 / period_us` during init.
 static INTERRUPT_RATE: AtomicU64 = AtomicU64::new(0);
+
+/// True when the tick uses TSC-deadline mode. Decided once on the BSP in
+/// [`init`] (CPUID probe) and mirrored by every AP in [`init_ap`] — the
+/// same BSP-decides pattern as `interrupts::X2APIC_ENABLED`.
+static TSC_DEADLINE_MODE: AtomicBool = AtomicBool::new(false);
+
+/// Tick period in TSC ticks (TSC-deadline mode). Computed on the BSP from
+/// the PIT-calibrated `TSC_PER_US`; valid on every core because the
+/// platform floor requires an invariant, uniform-rate TSC.
+static PERIOD_TSC_TICKS: AtomicU64 = AtomicU64::new(0);
 
 // ── High-resolution time state ────────────────────────────────────────────────
 
@@ -114,6 +145,29 @@ fn read_tsc() -> u64
         );
     }
     (hi as u64) << 32 | lo as u64
+}
+
+/// True when CPUID.01H:ECX[24] advertises the TSC-deadline timer mode.
+#[cfg(not(test))]
+fn tsc_deadline_supported() -> bool
+{
+    cpu::cpuid(1).2 & (1 << 24) != 0
+}
+
+/// Serialize an LVT-timer mode change ahead of the first deadline write.
+///
+/// SDM Vol. 3A §11.5.4.1: xAPIC LVT writes are MMIO stores and are not
+/// serializing, so a deadline MSR write could otherwise be processed while
+/// the timer is still in its previous mode. Harmless (but unneeded) when
+/// the LVT write went through the x2APIC MSR interface.
+#[cfg(not(test))]
+fn mfence()
+{
+    // SAFETY: mfence orders memory accesses only; no registers or memory
+    // are modified beyond the ordering effect.
+    unsafe {
+        core::arch::asm!("mfence", options(nostack, preserves_flags));
+    }
 }
 
 // ── Port I/O helpers ──────────────────────────────────────────────────────────
@@ -233,10 +287,13 @@ unsafe fn calibrate_apic_timer() -> u64
 
 // ── Public interface ──────────────────────────────────────────────────────────
 
-/// Initialise the APIC timer for periodic preemption at `period_us` microseconds.
+/// Initialise the preemption timer at `period_us` microseconds and
+/// **enable interrupts** (`sti`).
 ///
-/// Calibrates the APIC timer frequency against the PIT, configures the timer
-/// for periodic mode at vector `TIMER_VECTOR`, and **enables interrupts** (`sti`).
+/// Calibrates the TSC and the APIC timer against the PIT (one calibration
+/// window serves both), then arms the tick: TSC-deadline mode when CPUID
+/// advertises it, periodic APIC timer otherwise. The decision is stored
+/// for [`init_ap`] to mirror.
 ///
 /// Must be called after `interrupts::init()`.
 ///
@@ -245,23 +302,50 @@ unsafe fn calibrate_apic_timer() -> u64
 #[cfg(not(test))]
 pub unsafe fn init(period_us: u64)
 {
-    // Calibrate: measure APIC ticks per second.
+    // Calibrate: measure APIC ticks per second (and TSC_PER_US/BOOT_TSC,
+    // which elapsed_us() and the deadline path consume).
     // SAFETY: ring 0, single-threaded; PIT and APIC hardware are accessible.
     let tps = unsafe { calibrate_apic_timer() };
     APIC_TICKS_PER_SEC.store(tps, Ordering::Relaxed);
     INTERRUPT_RATE.store(1_000_000 / period_us.max(1), Ordering::Relaxed);
 
-    // Compute initial count for the requested period.
-    // Formula: initial_count = tps * period_us / 1_000_000 / divide_ratio.
-    // divide_ratio = 16 (DIVIDE_BY_16).
-    let initial_count = (tps * period_us / 1_000_000).max(1);
+    if tsc_deadline_supported()
+    {
+        let period_tsc = TSC_PER_US
+            .load(Ordering::Relaxed)
+            .saturating_mul(period_us)
+            .max(1);
+        PERIOD_TSC_TICKS.store(period_tsc, Ordering::Relaxed);
+        TSC_DEADLINE_MODE.store(true, Ordering::Relaxed);
 
-    // Configure APIC timer: periodic mode, vector TIMER_VECTOR.
-    // SAFETY: APIC MMIO registers are valid; single-threaded init context.
-    unsafe {
-        apic_write(APIC_TIMER_DIVIDE, DIVIDE_BY_16);
-        apic_write(APIC_LVT_TIMER, LVT_TIMER_PERIODIC | TIMER_VECTOR as u32);
-        apic_write(APIC_TIMER_INITIAL, initial_count as u32);
+        // Configure the LVT for TSC-deadline mode, then arm the first
+        // deadline. The divide and initial-count registers are meaningless
+        // in this mode and are left untouched.
+        // SAFETY: APIC registers are valid; single-threaded init context;
+        // wrmsr to IA32_TSC_DEADLINE is valid once the LVT mode change is
+        // serialized by the mfence.
+        unsafe {
+            apic_write(APIC_LVT_TIMER, LVT_TIMER_TSC_DEADLINE | TIMER_VECTOR as u32);
+            mfence();
+            cpu::write_msr(IA32_TSC_DEADLINE, read_tsc().wrapping_add(period_tsc));
+        }
+        crate::kprintln!("timer: mode = TSC-deadline");
+    }
+    else
+    {
+        // Compute initial count for the requested period.
+        // Formula: initial_count = tps * period_us / 1_000_000 / divide_ratio.
+        // divide_ratio = 16 (DIVIDE_BY_16).
+        let initial_count = (tps * period_us / 1_000_000).max(1);
+
+        // Configure APIC timer: periodic mode, vector TIMER_VECTOR.
+        // SAFETY: APIC registers are valid; single-threaded init context.
+        unsafe {
+            apic_write(APIC_TIMER_DIVIDE, DIVIDE_BY_16);
+            apic_write(APIC_LVT_TIMER, LVT_TIMER_PERIODIC | TIMER_VECTOR as u32);
+            apic_write(APIC_TIMER_INITIAL, initial_count as u32);
+        }
+        crate::kprintln!("timer: mode = periodic APIC (TSC-deadline unavailable)");
     }
 
     // Enable interrupts — the timer will now fire.
@@ -275,17 +359,35 @@ pub unsafe fn init(period_us: u64)
 #[cfg(test)]
 pub unsafe fn init(_period_us: u64) {}
 
-/// Initialise the APIC timer on an AP using the BSP's calibrated tick rate.
+/// Initialise the preemption timer on an AP, mirroring the BSP's mode.
 ///
-/// The BSP must have called [`init`] first to populate [`APIC_TICKS_PER_SEC`].
-/// Configures periodic timer at `period_us` on this AP's local APIC.
-/// Enables interrupts (`sti`) after programming the timer.
+/// The BSP must have called [`init`] first: it decides the mode and
+/// populates the calibration statics. In TSC-deadline mode the deadline is
+/// armed from this AP's own TSC (the deadline MSR is per-core); in periodic
+/// mode this AP's local APIC timer is programmed with the BSP's calibrated
+/// rate. Enables interrupts (`sti`) after programming the timer.
 ///
 /// # Safety
 /// Ring 0. LAPIC must be software-enabled ([`interrupts::init_ap`]) before calling.
 #[cfg(not(test))]
 pub unsafe fn init_ap(period_us: u64)
 {
+    if TSC_DEADLINE_MODE.load(Ordering::Relaxed)
+    {
+        let period_tsc = PERIOD_TSC_TICKS.load(Ordering::Relaxed);
+        // SAFETY: this AP's APIC registers are valid; IDT and timer ISR are
+        // initialized; the mfence serializes the LVT mode change before the
+        // per-core deadline MSR write. Enabling interrupts is safe as the
+        // timer handler is registered.
+        unsafe {
+            apic_write(APIC_LVT_TIMER, LVT_TIMER_TSC_DEADLINE | TIMER_VECTOR as u32);
+            mfence();
+            cpu::write_msr(IA32_TSC_DEADLINE, read_tsc().wrapping_add(period_tsc));
+            interrupts::enable();
+        }
+        return;
+    }
+
     let tps = APIC_TICKS_PER_SEC.load(Ordering::Relaxed);
     if tps == 0
     {
@@ -343,11 +445,27 @@ pub fn delay_us(_us: u64) {}
 
 /// Timer ISR body — called from the naked stub in `idt.rs`.
 ///
-/// Sends EOI to the local APIC, then calls the scheduler tick which may
-/// preempt the current thread. Must not allocate or block.
+/// In TSC-deadline mode, re-arms the (one-shot) deadline first; periodic
+/// mode reloads in hardware. Then sends EOI and calls the scheduler tick,
+/// which may preempt the current thread. Both the re-arm and the EOI must
+/// precede `timer_tick()` because it may context-switch away and not
+/// return promptly. Must not allocate or block.
 #[cfg(not(test))]
 pub extern "C" fn timer_isr()
 {
+    if TSC_DEADLINE_MODE.load(Ordering::Relaxed)
+    {
+        // No fence needed: the LVT mode is unchanged since init; this is a
+        // plain per-core deadline MSR write.
+        // SAFETY: wrmsr to IA32_TSC_DEADLINE with a future TSC value; the
+        // mode was established by init()/init_ap() on this core.
+        unsafe {
+            cpu::write_msr(
+                IA32_TSC_DEADLINE,
+                read_tsc().wrapping_add(PERIOD_TSC_TICKS.load(Ordering::Relaxed)),
+            );
+        }
+    }
     // EOI must be sent before calling schedule() to avoid masking the APIC.
     interrupts::acknowledge(TIMER_VECTOR as u32);
     // SAFETY: called from interrupt handler on a valid kernel stack.
@@ -464,5 +582,30 @@ mod tests
     fn lvt_timer_periodic_bit()
     {
         assert_eq!(LVT_TIMER_PERIODIC, 1 << 17);
+    }
+
+    #[test]
+    fn lvt_timer_tsc_deadline_bits()
+    {
+        // Mode field bits 18:17 = 0b10.
+        assert_eq!(LVT_TIMER_TSC_DEADLINE, 1 << 18);
+        // The two mode encodings must not overlap bit-wise, or a mode
+        // switch could leave a stale mode bit set.
+        assert_eq!(LVT_TIMER_TSC_DEADLINE & LVT_TIMER_PERIODIC, 0);
+    }
+
+    #[test]
+    fn tsc_deadline_msr_number()
+    {
+        assert_eq!(IA32_TSC_DEADLINE, 0x6E0);
+    }
+
+    #[test]
+    fn deadline_period_math_1ms()
+    {
+        // At 1000 TSC ticks/µs (1 GHz), a 1 ms period is 1_000_000 ticks.
+        let tsc_per_us: u64 = 1_000;
+        let period_us: u64 = 1_000;
+        assert_eq!(tsc_per_us.saturating_mul(period_us).max(1), 1_000_000);
     }
 }

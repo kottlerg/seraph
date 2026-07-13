@@ -28,17 +28,15 @@ use crate::mm::{PAGE_SIZE, paging::phys_to_virt};
 
 /// Module-local cache of `BootInfo.kernel_mmio`.
 ///
-/// Populated once during Phase 6 via [`capture_kernel_mmio`] and read later
-/// by arch code that wants bootloader-provided MMIO bases. Today the arch
-/// code still uses compiled-in constants; this cache makes the values
-/// available for the next round of work without forcing an immediate
-/// refactor.
+/// Populated once, before Phase 5 arch hardware init, via
+/// [`capture_kernel_mmio`], and read by arch code for bootloader-discovered
+/// platform values (interrupt-controller and UART bases, the riscv64
+/// timebase and hart capabilities).
 ///
 /// # Safety
-/// Written exactly once, single-threaded, from Phase 6. Subsequent reads
-/// happen after SMP is active but only from code paths that have not yet
-/// been migrated; concurrent readers are always observing a fully-written
-/// value because the write precedes SMP bring-up.
+/// Written exactly once, single-threaded, before Phase 5. Concurrent
+/// readers are always observing a fully-written value because the write
+/// precedes SMP bring-up.
 struct KernelMmioCell(UnsafeCell<KernelMmio>);
 
 // SAFETY: See `KernelMmioCell` docs — writes are single-threaded pre-SMP,
@@ -49,9 +47,9 @@ static KERNEL_MMIO_CELL: KernelMmioCell = KernelMmioCell(UnsafeCell::new(KernelM
 
 /// Current cached `kernel_mmio` snapshot.
 ///
-/// Valid once [`capture_kernel_mmio`] has been called (Phase 6). Before
-/// then, fields read as zero (the default produced by [`KernelMmio::zero`]).
-#[allow(dead_code)] // The getter is the public surface; no current arch-code reader.
+/// Valid once [`capture_kernel_mmio`] has been called (before Phase 5 arch
+/// hardware init). Before then, fields read as zero (the default produced
+/// by [`KernelMmio::zero`]).
 #[must_use]
 pub fn kernel_mmio() -> KernelMmio
 {
@@ -62,8 +60,8 @@ pub fn kernel_mmio() -> KernelMmio
 /// Capture `BootInfo.kernel_mmio` into [`KERNEL_MMIO_CELL`].
 ///
 /// # Safety
-/// Must be called exactly once during Phase 6, single-threaded, after
-/// Phase 3 (direct map active).
+/// Must be called exactly once, single-threaded, after Phase 3 (direct map
+/// active) and before Phase 5 arch hardware init reads the cache.
 pub unsafe fn capture_kernel_mmio(boot_info_phys: u64)
 {
     // SAFETY: boot_info_phys was validated in Phase 0; direct map active

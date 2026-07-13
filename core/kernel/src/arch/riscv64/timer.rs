@@ -3,24 +3,20 @@
 
 // kernel/src/arch/riscv64/timer.rs
 
-//! RISC-V supervisor-mode timer using the SBI timer extension.
+//! RISC-V supervisor-mode timer using the Sstc extension (`stimecmp` CSR).
 //!
-//! The RISC-V time-compare mechanism works by scheduling a deadline:
-//! when `time` CSR ≥ `timecmp`, a supervisor timer interrupt fires.
+//! The RISC-V time-compare mechanism works by scheduling a deadline: the
+//! supervisor timer interrupt is pending exactly while `time` CSR ≥
+//! `stimecmp`, so writing a future deadline both re-arms the timer and
+//! clears the pending condition — no firmware round-trip per tick.
 //!
-//! The timebase frequency is hardcoded to 10 MHz, which matches the reference
-//! platform and every test target the kernel runs on. The boot protocol does
-//! not yet carry this value; on hardware whose timebase differs the kernel
-//! would still boot but its time-derived deadlines would be miscalibrated.
-//!
-//! # SBI timer extension
-//! Extension ID `0x54494D45` ("TIME"), function ID 0.
-//! - a7 = extension ID
-//! - a6 = function ID (0 = `sbi_set_timer`)
-//! - a0 = timer value (next deadline)
-//!
-//! # Modification notes
-//! - To use the `sstc` extension instead of SBI: write `stimecmp` CSR directly.
+//! The timebase frequency is discovered by the bootloader (ACPI RHCT or the
+//! DTB `/cpus` `timebase-frequency` property) and carried in
+//! `KernelMmio::timebase_freq`. Sstc support, likewise discovered per hart,
+//! is carried in `KernelMmio::hart_caps`. [`init`] refuses to boot when
+//! either is missing: Sstc is RVA23-mandated and classified Required by
+//! [platform-requirements.md](../../../../docs/platform-requirements.md),
+//! and there is no compiled-in timebase fallback.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -28,12 +24,11 @@ use super::interrupts;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-/// Default RISC-V `time` CSR tick rate (10 MHz). Matches the reference
-/// platform; bootloader handoff for the discovered value is not yet wired.
-const TIMEBASE_FREQ: u64 = 10_000_000;
-
-/// SBI TIME extension ID: ASCII "TIME" = 0x54494D45.
-const SBI_EXT_TIME: u64 = 0x5449_4D45;
+/// `stimecmp` CSR number (Sstc extension). Written by CSR number because the
+/// kernel's target feature set (`+m,+a,+c`) does not enable the Sstc
+/// mnemonics in the assembler.
+#[cfg(not(test))]
+const CSR_STIMECMP: u16 = 0x14D;
 
 // ── Tick state ────────────────────────────────────────────────────────────────
 
@@ -49,27 +44,28 @@ static TIMER_PERIOD_TICKS: AtomicU64 = AtomicU64::new(0);
 /// Zero means not yet initialised.
 static BOOT_TIME_TICKS: AtomicU64 = AtomicU64::new(0);
 
-/// `time` CSR ticks per microsecond. At 10 MHz: 10 ticks/µs.
-const TIME_TICKS_PER_US: u64 = TIMEBASE_FREQ / 1_000_000;
+/// Discovered `time` CSR frequency in Hz. Written once by [`init`] (which
+/// validates it as non-zero and ≤ `u32::MAX`); zero before that.
+static TIMEBASE_FREQ_HZ: AtomicU64 = AtomicU64::new(0);
 
-// ── SBI helper ────────────────────────────────────────────────────────────────
+// ── CSR helpers ───────────────────────────────────────────────────────────────
 
-/// Call the SBI timer extension to set the next timer deadline.
+/// Write the Sstc supervisor timer compare CSR with the next deadline.
 ///
 /// `val` is the absolute `time` CSR value at which the next interrupt fires.
-fn sbi_set_timer(val: u64)
+/// The supervisor timer pending bit (`sip.STIP`) is a hardware comparison
+/// (`time` ≥ `stimecmp`), so a future deadline also clears a pending tick.
+#[cfg(not(test))]
+fn write_stimecmp(val: u64)
 {
-    // SAFETY: SBI ecall is always available in RISC-V supervisor mode.
+    // SAFETY: S-mode CSR write, no memory access. Requires the Sstc
+    // extension and M-mode delegation (`menvcfg.STCE`), both established
+    // by the boot firmware on hardware that passes init()'s Sstc gate.
     unsafe {
         core::arch::asm!(
-            "ecall",
-            inout("a0") val => _,
-            // a1 unused (high 32 bits for RV32; zero for RV64).
-            inout("a1") 0u64 => _,
-            // a6 = function ID 0 (sbi_set_timer).
-            inout("a6") 0u64 => _,
-            // a7 = extension ID.
-            inout("a7") SBI_EXT_TIME => _,
+            "csrw {csr}, {val}",
+            csr = const CSR_STIMECMP,
+            val = in(reg) val,
             options(nostack, nomem),
         );
     }
@@ -87,31 +83,85 @@ fn read_time() -> u64
     t
 }
 
+// ── Tick math (pure, host-testable) ───────────────────────────────────────────
+
+/// Ticks of a `freq` Hz counter in a period of `period_us` microseconds.
+// The product is computed in u128 so arbitrary discovered frequencies cannot
+// overflow; the quotient fits u64 for every freq ≤ u32::MAX (enforced by
+// `init`) and sane period.
+#[allow(clippy::cast_possible_truncation)]
+fn ticks_for_period(freq: u64, period_us: u64) -> u64
+{
+    (u128::from(freq) * u128::from(period_us) / 1_000_000) as u64
+}
+
+/// Convert `ticks` of a `freq` Hz counter to whole microseconds.
+///
+/// Exact for arbitrary frequencies via a div/mod split: the remainder
+/// product `(ticks % freq) * 1_000_000` cannot overflow because `init`
+/// bounds `freq` to `u32::MAX` (< 2^32 · 2^20 = 2^52). Returns 0 when
+/// `freq` is zero (timer not initialised).
+fn ticks_to_us(ticks: u64, freq: u64) -> u64
+{
+    if freq == 0
+    {
+        return 0;
+    }
+    (ticks / freq) * 1_000_000 + (ticks % freq) * 1_000_000 / freq
+}
+
 // ── Public interface ──────────────────────────────────────────────────────────
 
 /// Initialise the supervisor timer for periodic preemption at `period_us` µs.
 ///
-/// Sets the first SBI timer deadline, stores the period, and enables
-/// supervisor interrupts (`sstatus.SIE`).
+/// Verifies the bootloader-discovered hart capabilities (Sstc) and timebase,
+/// arms the first `stimecmp` deadline, stores the period, and enables
+/// supervisor interrupts (`sstatus.SIE`). Refuses to boot — with a
+/// diagnostic — on hardware without Sstc or without a discovered timebase,
+/// per the subsystem-gate policy in
+/// [platform-requirements.md](../../../../docs/platform-requirements.md).
 ///
-/// Must be called after `interrupts::init()`.
+/// Must be called after `interrupts::init()` and after
+/// `platform::capture_kernel_mmio()`.
 ///
 /// # Safety
 /// Must execute in supervisor mode from a single-threaded context.
 #[cfg(not(test))]
 pub unsafe fn init(period_us: u64)
 {
-    let period_ticks = TIMEBASE_FREQ * period_us / 1_000_000;
+    let km = crate::platform::kernel_mmio();
+
+    if km.hart_caps & boot_protocol::HART_CAP_SSTC == 0
+    {
+        crate::fatal(
+            "Sstc (stimecmp) not advertised for every hart — required (RVA23); \
+             the SBI-timer path was removed. Check firmware tables (ACPI RHCT / \
+             DTB) or the QEMU -cpu selection.",
+        );
+    }
+    if km.timebase_freq == 0 || km.timebase_freq > u64::from(u32::MAX)
+    {
+        crate::fatal(
+            "timebase-frequency undiscovered or out of range — the bootloader \
+             must provide it (ACPI RHCT / DTB); there is no compiled-in default.",
+        );
+    }
+
+    let freq = km.timebase_freq;
+    TIMEBASE_FREQ_HZ.store(freq, Ordering::Relaxed);
+
+    let period_ticks = ticks_for_period(freq, period_us).max(1);
     TIMER_PERIOD_TICKS.store(period_ticks, Ordering::Relaxed);
     TICKS_PER_SEC.store(1_000_000 / period_us, Ordering::Relaxed);
 
     let now = read_time();
-    let deadline = now + period_ticks;
-    sbi_set_timer(deadline);
+    write_stimecmp(now + period_ticks);
 
     // Record the high-resolution boot reference: the `time` CSR value at the
     // moment the timer is armed. Used by elapsed_us() for timestamps.
     BOOT_TIME_TICKS.store(now, Ordering::Relaxed);
+
+    crate::kprintln!("timer: Sstc stimecmp, timebase {} Hz", freq);
 
     // Enable supervisor interrupts — the timer will now fire.
     // SAFETY: stvec is installed.
@@ -122,8 +172,10 @@ pub unsafe fn init(period_us: u64)
 
 /// Initialise the supervisor timer on an AP hart using the BSP's stored tick rate.
 ///
-/// The BSP must have called [`init`] first to populate [`TIMER_PERIOD_TICKS`].
-/// Sets the first SBI timer deadline and enables supervisor interrupts.
+/// The BSP must have called [`init`] first: it populates the timebase and
+/// period and gates Sstc for every hart (the bootloader confirms the
+/// capability across all enabled harts, so no per-AP probe is needed).
+/// Arms the first `stimecmp` deadline and enables supervisor interrupts.
 ///
 /// # Safety
 /// Must execute in supervisor mode on the AP being initialised.
@@ -132,18 +184,19 @@ pub unsafe fn init(period_us: u64)
 #[cfg(not(test))]
 pub unsafe fn init_ap(period_us: u64)
 {
-    let period_ticks = TIMER_PERIOD_TICKS.load(Ordering::Relaxed);
+    let freq = TIMEBASE_FREQ_HZ.load(Ordering::Relaxed);
+    if freq == 0
+    {
+        crate::fatal("timer: init_ap before BSP timer::init");
+    }
+    let mut period_ticks = TIMER_PERIOD_TICKS.load(Ordering::Relaxed);
     if period_ticks == 0
     {
-        // BSP calibration not yet done — fall back to computing from period_us.
-        // This path should not occur in practice since APs start after Phase 5.
-        let fallback = TIMEBASE_FREQ * period_us / 1_000_000;
-        sbi_set_timer(read_time() + fallback);
+        // Defensive: recompute from the stored timebase. This path should
+        // not occur in practice since APs start after Phase 5.
+        period_ticks = ticks_for_period(freq, period_us).max(1);
     }
-    else
-    {
-        sbi_set_timer(read_time() + period_ticks);
-    }
+    write_stimecmp(read_time() + period_ticks);
     // Enable supervisor interrupts — the timer will now fire.
     // SAFETY: stvec is installed (interrupts::init_ap called first).
     unsafe {
@@ -166,9 +219,12 @@ pub unsafe fn init_ap(_period_us: u64) {}
 pub fn handle_tick()
 {
     let period = TIMER_PERIOD_TICKS.load(Ordering::Relaxed);
-    // Rearm timer before calling schedule() so the next tick is not missed.
+    // Rearm before calling schedule() so the next tick is not missed; the
+    // stimecmp write also clears the pending STIP condition.
     #[cfg(not(test))]
-    sbi_set_timer(read_time() + period);
+    write_stimecmp(read_time() + period);
+    #[cfg(test)]
+    let _ = period;
     // SAFETY: called from interrupt handler on a valid kernel stack.
     #[cfg(not(test))]
     unsafe {
@@ -215,8 +271,8 @@ pub fn ticks_per_second() -> u64
 /// Return microseconds elapsed since timer initialisation, or `None` if
 /// `init()` has not yet been called (pre-Phase 5).
 ///
-/// Uses the `time` CSR directly — no interrupt dependency. At 10 MHz the
-/// resolution is 100 ns (0.1 µs); returned value is truncated to whole µs.
+/// Uses the `time` CSR directly — no interrupt dependency. Resolution is
+/// one timebase tick (100 ns at 10 MHz); the value is truncated to whole µs.
 #[cfg(not(test))]
 pub fn elapsed_us() -> Option<u64>
 {
@@ -225,8 +281,31 @@ pub fn elapsed_us() -> Option<u64>
     {
         return None;
     }
-    Some((read_time().saturating_sub(boot)) / TIME_TICKS_PER_US)
+    let freq = TIMEBASE_FREQ_HZ.load(Ordering::Relaxed);
+    Some(ticks_to_us(read_time().saturating_sub(boot), freq))
 }
+
+/// Busy-wait for approximately `us` microseconds using the `time` CSR.
+///
+/// Requires [`init`] to have run (the discovered timebase converts µs to
+/// ticks); there is no pre-init fallback because no pre-init caller exists.
+#[allow(dead_code)] // Required by arch interface: kernel/docs/arch-interface.md
+#[cfg(not(test))]
+pub fn delay_us(us: u64)
+{
+    let freq = TIMEBASE_FREQ_HZ.load(Ordering::Relaxed);
+    debug_assert!(freq != 0, "timer::delay_us before timer::init");
+    let deadline = read_time().saturating_add(ticks_for_period(freq, us));
+    while read_time() < deadline
+    {
+        core::hint::spin_loop();
+    }
+}
+
+/// No-op test stub.
+#[allow(dead_code)] // Required by arch interface: kernel/docs/arch-interface.md
+#[cfg(test)]
+pub fn delay_us(_us: u64) {}
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
@@ -236,30 +315,53 @@ mod tests
     use super::*;
 
     #[test]
-    fn default_timebase_freq_is_10_mhz()
-    {
-        assert_eq!(TIMEBASE_FREQ, 10_000_000);
-    }
-
-    #[test]
-    fn period_ticks_for_10ms()
+    fn period_ticks_for_10ms_at_10_mhz()
     {
         // 10 ms = 10_000 µs → 10_000_000 * 10_000 / 1_000_000 = 100_000 ticks.
-        let ticks = TIMEBASE_FREQ * 10_000 / 1_000_000;
-        assert_eq!(ticks, 100_000);
+        assert_eq!(ticks_for_period(10_000_000, 10_000), 100_000);
     }
 
     #[test]
-    fn period_ticks_for_1ms()
+    fn period_ticks_for_1ms_at_10_mhz()
     {
-        let ticks = TIMEBASE_FREQ * 1_000 / 1_000_000;
-        assert_eq!(ticks, 10_000);
+        assert_eq!(ticks_for_period(10_000_000, 1_000), 10_000);
     }
 
     #[test]
-    fn sbi_ext_time_constant()
+    fn period_ticks_for_1ms_at_non_mhz_multiple()
     {
-        // ASCII "TIME" = 0x54494D45.
-        assert_eq!(SBI_EXT_TIME, 0x5449_4D45);
+        // 1_193_182 Hz (a frequency with no whole ticks-per-µs ratio):
+        // 1 ms = 1_193.182 ticks, truncated.
+        assert_eq!(ticks_for_period(1_193_182, 1_000), 1_193);
+    }
+
+    #[test]
+    fn ticks_to_us_exact_at_10_mhz()
+    {
+        assert_eq!(ticks_to_us(12_345, 10_000_000), 1_234);
+        assert_eq!(ticks_to_us(10_000_000, 10_000_000), 1_000_000);
+    }
+
+    #[test]
+    fn ticks_to_us_exact_at_arbitrary_frequencies()
+    {
+        for freq in [1_193_182u64, 24_000_000, 3, u64::from(u32::MAX)]
+        {
+            for ticks in [0u64, 1, freq - 1, freq, freq + 1, 1 << 40, 1 << 60]
+            {
+                let expected = (u128::from(ticks) * 1_000_000 / u128::from(freq)) as u64;
+                assert_eq!(
+                    ticks_to_us(ticks, freq),
+                    expected,
+                    "ticks={ticks} freq={freq}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ticks_to_us_zero_frequency_is_zero()
+    {
+        assert_eq!(ticks_to_us(12_345, 0), 0);
     }
 }

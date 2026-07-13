@@ -84,7 +84,14 @@ pub mod role_guids;
 ///     kernel maps read-only once relocations are applied. All four are
 ///     zero when absent. `ET_EXEC` init images carry `flags = 0` and zeroed
 ///     relocation/RELRO fields and load exactly as before.
-pub const BOOT_PROTOCOL_VERSION: u32 = 10;
+/// v11: The riscv64 [`KernelMmio`] variant gained `timebase_freq: u64` (the
+///     `time` CSR frequency in Hz, from ACPI RHCT or the DTB `/cpus`
+///     `timebase-frequency` property; zero when undiscovered) and
+///     `hart_caps: u64` (ISA-capability bits the bootloader positively
+///     confirmed on every enabled hart; bit 0 = [`HART_CAP_SSTC`]). The
+///     kernel timer refuses to boot without Sstc and a discovered
+///     timebase; there is no compiled-in frequency fallback.
+pub const BOOT_PROTOCOL_VERSION: u32 = 11;
 
 // ── Memory map ───────────────────────────────────────────────────────────────
 
@@ -426,15 +433,14 @@ pub const FRAMEBUFFER_INFO_VERSION: u32 = 1;
 
 // ── Kernel MMIO (arch-specific) ──────────────────────────────────────────────
 //
-// `KernelMmio` carries the small set of MMIO bases the kernel itself reads
-// during its own operation (interrupts, timer). It is **not** a capability
-// surface — the kernel consumes it directly and does not mint caps from it.
-// The `mmio_apertures` slice below is the capability-minting surface.
+// `KernelMmio` carries the small set of platform facts the kernel itself
+// reads during its own operation (interrupts, timer). It is **not** a
+// capability surface — the kernel consumes it directly and does not mint
+// caps from it. The `mmio_apertures` slice below is the capability-minting
+// surface.
 //
-// Shape is arch-specific: each arch's fields are the bases that arch's
-// kernel actually uses. Today these values are hardcoded in kernel code;
-// the field is forward-looking preparation for replacing those hardcodes
-// with bootloader-provided values.
+// Shape is arch-specific: each arch's fields are the values that arch's
+// kernel actually uses.
 
 /// One I/O APIC instance description (x86-64).
 ///
@@ -503,11 +509,13 @@ impl KernelMmio
     }
 }
 
-/// Kernel-facing MMIO bases on RISC-V 64.
+/// Kernel-facing platform description on RISC-V 64: the MMIO bases plus the
+/// two non-MMIO hart facts (`timebase_freq`, `hart_caps`) the kernel's own
+/// initialization consumes before any userspace exists.
 ///
 /// Fields are what `kernel/src/arch/riscv64/` needs today. CLINT is not
-/// included because the kernel uses SBI `sbi_set_timer` rather than CLINT
-/// MMIO.
+/// included because S-mode arms the timer through the Sstc `stimecmp` CSR,
+/// not CLINT MMIO.
 #[cfg(target_arch = "riscv64")]
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -521,14 +529,29 @@ pub struct KernelMmio
     pub uart_base: u64,
     /// Size of the UART register window in bytes.
     pub uart_size: u64,
+    /// Frequency of the `time` CSR in Hz, from the ACPI RHCT
+    /// `TimeBaseFrequency` field or the DTB `/cpus` `timebase-frequency`
+    /// property. Zero when neither source provided it; the kernel timer
+    /// treats an undiscovered timebase as fatal (no compiled-in default).
+    pub timebase_freq: u64,
+    /// ISA-capability bits the bootloader positively confirmed on every
+    /// enabled hart (bit 0 = [`HART_CAP_SSTC`]). Each firmware source ORs
+    /// in the bits it can confirm; zero means undiscovered or absent.
+    pub hart_caps: u64,
 }
+
+/// [`KernelMmio::hart_caps`] bit 0: every enabled hart implements Sstc
+/// (the `stimecmp` supervisor timer CSR).
+#[cfg(target_arch = "riscv64")]
+pub const HART_CAP_SSTC: u64 = 1 << 0;
 
 #[cfg(target_arch = "riscv64")]
 impl KernelMmio
 {
     /// Zeroed `KernelMmio` for bootloaders that cannot populate it. The
     /// kernel falls back to its hardcoded constants when the corresponding
-    /// field is zero.
+    /// MMIO field is zero; a zero `timebase_freq` or `hart_caps` is fatal
+    /// at timer initialization instead.
     #[must_use]
     pub const fn zero() -> Self
     {
@@ -537,6 +560,8 @@ impl KernelMmio
             plic_size: 0,
             uart_base: 0,
             uart_size: 0,
+            timebase_freq: 0,
+            hart_caps: 0,
         }
     }
 }
@@ -712,12 +737,13 @@ pub struct BootInfo
     /// not parse the Device Tree.
     pub device_tree: u64,
 
-    /// Arch-specific MMIO bases the kernel itself consumes.
+    /// Arch-specific platform facts the kernel itself consumes.
     ///
     /// Not a capability surface. The kernel reads these values directly
     /// during its own initialisation (interrupt controller, timer). Fields
-    /// not populated by the bootloader are zero; the kernel falls back to
-    /// its compiled-in defaults in that case.
+    /// not populated by the bootloader are zero; per-field docs on
+    /// [`KernelMmio`] state whether the kernel falls back to a compiled-in
+    /// default or refuses to boot.
     pub kernel_mmio: KernelMmio,
 
     /// Coarse-grained MMIO apertures from which the kernel mints

@@ -18,6 +18,8 @@
 //!   `BootInfo.cpu_ids`.
 //! - [`parse_aperture_seed`]: MADT + MCFG walk producing MMIO aperture
 //!   seeds fed into [`super::memory_map::derive_mmio_apertures`].
+//! - [`parse_timer_caps`]: RHCT walk (RISC-V, ACPI 6.5+) producing the
+//!   `time` CSR frequency and whether every hart advertises Sstc.
 //!
 //! Arch-specific `kernel_mmio` extractors (LAPIC+IOAPIC on x86-64;
 //! PLIC+UART on RISC-V) consume the byte helpers and layout constants
@@ -63,6 +65,21 @@ const MCFG_ENTRY_SIZE: usize = 16;
 
 // ── Byte-level read helpers ───────────────────────────────────────────────────
 
+/// Read a little-endian u16 at byte `off` within `buf`. Returns 0 on short read.
+///
+/// Only the RHCT walker below consumes u16 fields; on x86-64 that walker
+/// has no caller, so this helper is dead there (the module is compiled on
+/// every architecture).
+#[allow(dead_code)]
+pub(crate) fn read_u16(buf: &[u8], off: usize) -> u16
+{
+    if off + 2 > buf.len()
+    {
+        return 0;
+    }
+    u16::from_le_bytes([buf[off], buf[off + 1]])
+}
+
 /// Read a little-endian u32 at byte `off` within `buf`. Returns 0 on short read.
 pub(crate) fn read_u32(buf: &[u8], off: usize) -> u32
 {
@@ -107,6 +124,161 @@ pub(crate) unsafe fn phys_slice<'a>(phys: u64, len: usize) -> &'a [u8]
 {
     // SAFETY: caller guarantees phys is valid identity-mapped address with ≥len bytes.
     unsafe { core::slice::from_raw_parts(phys as *const u8, len) }
+}
+
+/// Walk RSDP → XSDT and return the first table whose SDT signature is `sig`,
+/// as a length-validated byte slice covering the whole table.
+///
+/// Returns `None` when the RSDP/XSDT is absent or malformed, or no table
+/// matches.
+///
+/// # Safety
+/// `rsdp_addr` must be zero or the physical address of a valid,
+/// identity-mapped ACPI RSDP whose referenced tables are identity-mapped.
+pub(crate) unsafe fn find_acpi_table<'a>(rsdp_addr: u64, sig: [u8; 4]) -> Option<&'a [u8]>
+{
+    if rsdp_addr == 0
+    {
+        return None;
+    }
+    // SAFETY: caller guarantees rsdp_addr is valid and identity-mapped.
+    let rsdp = unsafe { phys_slice(rsdp_addr, 36) };
+    if &rsdp[..8] != RSDP_SIG || read_u8(rsdp, RSDP_OFF_REVISION) < 2
+    {
+        return None;
+    }
+    let xsdt_addr = read_u64(rsdp, RSDP_OFF_XSDT);
+    if xsdt_addr == 0
+    {
+        return None;
+    }
+
+    // SAFETY: xsdt_addr from validated RSDP; firmware guarantees mapping.
+    let xsdt_hdr = unsafe { phys_slice(xsdt_addr, SDT_HDR_LEN) };
+    if &xsdt_hdr[SDT_OFF_SIGNATURE..SDT_OFF_SIGNATURE + 4] != b"XSDT"
+    {
+        return None;
+    }
+    let xsdt_len = read_u32(xsdt_hdr, SDT_OFF_LENGTH) as usize;
+    if xsdt_len < SDT_HDR_LEN
+    {
+        return None;
+    }
+    // SAFETY: length validated above; firmware guarantees mapping.
+    let xsdt = unsafe { phys_slice(xsdt_addr, xsdt_len) };
+    let entries_bytes = &xsdt[SDT_HDR_LEN..];
+
+    for i in 0..(entries_bytes.len() / 8)
+    {
+        let table_addr = read_u64(entries_bytes, i * 8);
+        if table_addr == 0
+        {
+            continue;
+        }
+        // SAFETY: table_addr read from validated XSDT; firmware guarantees mapping.
+        let hdr = unsafe { phys_slice(table_addr, SDT_HDR_LEN) };
+        if hdr[SDT_OFF_SIGNATURE..SDT_OFF_SIGNATURE + 4] != sig
+        {
+            continue;
+        }
+        let table_len = read_u32(hdr, SDT_OFF_LENGTH) as usize;
+        if table_len < SDT_HDR_LEN
+        {
+            continue;
+        }
+        // SAFETY: length validated above; firmware guarantees mapping.
+        return Some(unsafe { phys_slice(table_addr, table_len) });
+    }
+
+    None
+}
+
+// ── RHCT (RISC-V Hart Capabilities Table, ACPI 6.5+) ─────────────────────────
+//
+// Only the riscv64 arch extractor calls this walker; the module is compiled
+// on every architecture (arch dispatch happens at the caller), so the whole
+// section is dead code on x86-64 — hence the per-item allows.
+
+// RHCT layout after the 36-byte SDT header:
+//  36: flags(u32)  40: time_base_frequency(u64)
+//  48: node_count(u32)  52: node_offset(u32, from table start)
+// Node array: each node is {type(u16), length(u16), revision(u16), payload}.
+//  Type 0 (ISA string node): {isa_len(u16), isa[isa_len] (null-terminated)}.
+//  Type 0xFFFF (hart info node): per-hart offsets into the shared nodes.
+#[allow(dead_code)]
+const RHCT_OFF_TIMEBASE: usize = 40;
+#[allow(dead_code)]
+const RHCT_OFF_NODE_COUNT: usize = 48;
+#[allow(dead_code)]
+const RHCT_OFF_NODE_OFFSET: usize = 52;
+#[allow(dead_code)]
+const RHCT_NODE_HDR_LEN: usize = 6;
+#[allow(dead_code)]
+const RHCT_NODE_TYPE_ISA_STRING: u16 = 0;
+
+/// Parse an RHCT table body: return `(time_base_frequency, sstc)`.
+///
+/// `sstc` is true only when at least one ISA-string node exists and every
+/// ISA-string node names the `sstc` extension. Firmware deduplicates
+/// identical ISA strings into shared nodes referenced by the per-hart
+/// hart-info nodes; requiring `sstc` in every ISA-string node is the
+/// conservative reading and avoids the hart-info offset indirection.
+#[allow(dead_code)] // riscv64-only caller; module compiled on every arch.
+fn parse_rhct(table: &[u8]) -> (u64, bool)
+{
+    let timebase = read_u64(table, RHCT_OFF_TIMEBASE);
+    let node_count = read_u32(table, RHCT_OFF_NODE_COUNT) as usize;
+    let mut off = read_u32(table, RHCT_OFF_NODE_OFFSET) as usize;
+
+    let mut isa_nodes: usize = 0;
+    let mut all_sstc = true;
+
+    for _ in 0..node_count
+    {
+        if off + RHCT_NODE_HDR_LEN > table.len()
+        {
+            break;
+        }
+        let node_type = read_u16(table, off);
+        let node_len = read_u16(table, off + 2) as usize;
+        if node_len < RHCT_NODE_HDR_LEN || off + node_len > table.len()
+        {
+            break;
+        }
+
+        if node_type == RHCT_NODE_TYPE_ISA_STRING && node_len >= RHCT_NODE_HDR_LEN + 2
+        {
+            let isa_len = read_u16(table, off + RHCT_NODE_HDR_LEN) as usize;
+            let isa_off = off + RHCT_NODE_HDR_LEN + 2;
+            let isa_end = isa_off.saturating_add(isa_len).min(off + node_len);
+            let isa = &table[isa_off.min(isa_end)..isa_end];
+            isa_nodes += 1;
+            all_sstc &= crate::dtb::isa_string_has_ext(isa, b"sstc");
+        }
+
+        off += node_len;
+    }
+
+    (timebase, isa_nodes > 0 && all_sstc)
+}
+
+/// Parse the ACPI timer capabilities from the RHCT: the `time` CSR frequency
+/// and whether every hart advertises the Sstc extension.
+///
+/// Returns `(0, false)` when no ACPI or no RHCT is present.
+///
+/// # Safety
+/// `rsdp_addr` must be zero or the physical address of a valid,
+/// identity-mapped ACPI RSDP whose referenced tables are identity-mapped.
+#[allow(dead_code)] // riscv64-only caller; module compiled on every arch.
+pub unsafe fn parse_timer_caps(rsdp_addr: u64) -> (u64, bool)
+{
+    // SAFETY: caller contract.
+    match unsafe { find_acpi_table(rsdp_addr, *b"RHCT") }
+    {
+        Some(table) => parse_rhct(table),
+        None => (0, false),
+    }
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -550,4 +722,109 @@ pub unsafe fn parse_aperture_seed(rsdp_addr: u64, out: &mut [MmioAperture]) -> u
     }
 
     n
+}
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+
+    /// Build a synthetic RHCT: SDT header + flags/timebase/node-count/offset
+    /// header, followed by the given nodes as `(type, payload)` pairs.
+    fn rhct(timebase: u64, nodes: &[(u16, &[u8])]) -> Vec<u8>
+    {
+        let mut t = vec![0u8; 56];
+        t[SDT_OFF_SIGNATURE..SDT_OFF_SIGNATURE + 4].copy_from_slice(b"RHCT");
+        t[RHCT_OFF_TIMEBASE..RHCT_OFF_TIMEBASE + 8].copy_from_slice(&timebase.to_le_bytes());
+        t[RHCT_OFF_NODE_COUNT..RHCT_OFF_NODE_COUNT + 4]
+            .copy_from_slice(&(nodes.len() as u32).to_le_bytes());
+        t[RHCT_OFF_NODE_OFFSET..RHCT_OFF_NODE_OFFSET + 4].copy_from_slice(&56u32.to_le_bytes());
+
+        for &(node_type, payload) in nodes
+        {
+            let node_len = (RHCT_NODE_HDR_LEN + payload.len()) as u16;
+            t.extend_from_slice(&node_type.to_le_bytes());
+            t.extend_from_slice(&node_len.to_le_bytes());
+            t.extend_from_slice(&1u16.to_le_bytes()); // revision
+            t.extend_from_slice(payload);
+        }
+
+        let len = t.len() as u32;
+        t[SDT_OFF_LENGTH..SDT_OFF_LENGTH + 4].copy_from_slice(&len.to_le_bytes());
+        t
+    }
+
+    /// ISA-string node payload: `{isa_len(u16), isa bytes incl. NUL}`.
+    fn isa_payload(isa: &[u8]) -> Vec<u8>
+    {
+        let mut p = Vec::new();
+        p.extend_from_slice(&((isa.len() + 1) as u16).to_le_bytes());
+        p.extend_from_slice(isa);
+        p.push(0);
+        p
+    }
+
+    #[test]
+    fn rhct_timebase_and_sstc()
+    {
+        let isa = isa_payload(b"rv64imafdcvh_zicsr_sstc_svadu");
+        let table = rhct(10_000_000, &[(RHCT_NODE_TYPE_ISA_STRING, &isa)]);
+        assert_eq!(parse_rhct(&table), (10_000_000, true));
+    }
+
+    #[test]
+    fn rhct_sstc_absent_from_isa_string()
+    {
+        let isa = isa_payload(b"rv64imafdc_zicsr");
+        let table = rhct(10_000_000, &[(RHCT_NODE_TYPE_ISA_STRING, &isa)]);
+        assert_eq!(parse_rhct(&table), (10_000_000, false));
+    }
+
+    #[test]
+    fn rhct_sstc_denied_when_one_isa_node_lacks_it()
+    {
+        let with = isa_payload(b"rv64imafdc_sstc");
+        let without = isa_payload(b"rv64imafdc");
+        let table = rhct(
+            10_000_000,
+            &[
+                (RHCT_NODE_TYPE_ISA_STRING, &with),
+                (RHCT_NODE_TYPE_ISA_STRING, &without),
+            ],
+        );
+        assert!(!parse_rhct(&table).1);
+    }
+
+    #[test]
+    fn rhct_skips_non_isa_nodes()
+    {
+        let isa = isa_payload(b"rv64imafdc_sstc");
+        // Hart-info node (type 0xFFFF): num_offsets=1, uid=0, one offset.
+        let hart_info: &[u8] = &[1, 0, 0, 0, 0, 0, 56, 0, 0, 0];
+        let table = rhct(
+            10_000_000,
+            &[(RHCT_NODE_TYPE_ISA_STRING, &isa), (0xFFFF, hart_info)],
+        );
+        assert_eq!(parse_rhct(&table), (10_000_000, true));
+    }
+
+    #[test]
+    fn rhct_no_isa_nodes_means_no_sstc()
+    {
+        let table = rhct(10_000_000, &[]);
+        assert_eq!(parse_rhct(&table), (10_000_000, false));
+    }
+
+    #[test]
+    fn rhct_truncated_node_is_rejected_safely()
+    {
+        let isa = isa_payload(b"rv64imafdc_sstc");
+        let mut table = rhct(10_000_000, &[(RHCT_NODE_TYPE_ISA_STRING, &isa)]);
+        // Truncate mid-node: the walker must stop without panicking, and
+        // without having confirmed sstc from a complete node.
+        table.truncate(60);
+        let (freq, sstc) = parse_rhct(&table);
+        assert_eq!(freq, 10_000_000);
+        assert!(!sstc);
+    }
 }

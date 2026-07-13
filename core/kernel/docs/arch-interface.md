@@ -299,6 +299,12 @@ module-level surface function (a no-op on RISC-V), not a `cfg(target_arch)`-gate
 
 Periodic preemption timer; the scheduler uses its tick counter to enforce time slices.
 
+The tick mechanism is arch-internal: x86-64 uses TSC-deadline mode where CPUID advertises
+it and falls back to the periodic local-APIC timer; riscv64 arms the Sstc `stimecmp` CSR
+using the bootloader-discovered timebase (`init` refuses to boot without Sstc or a
+discovered timebase, per
+[platform-requirements.md](../../../docs/platform-requirements.md)).
+
 ```rust
 /// Initialise the per-CPU preemption timer with a `period_us` microsecond
 /// period (BSP), or the per-AP equivalent. Call after `interrupts::init`.

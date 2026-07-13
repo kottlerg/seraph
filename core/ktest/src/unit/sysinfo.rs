@@ -60,14 +60,16 @@ pub fn page_size(_ctx: &TestContext) -> TestResult
     Ok(())
 }
 
-/// `system_info(BootProtocolVersion)` must return the current protocol version (11).
+/// `system_info(BootProtocolVersion)` must return the protocol version the
+/// running kernel was compiled against ([`boot_protocol::BOOT_PROTOCOL_VERSION`]
+/// — ktest builds from the same tree, so the shared constant is the oracle).
 pub fn boot_protocol_version(_ctx: &TestContext) -> TestResult
 {
     let bpv = system_info(SystemInfoType::BootProtocolVersion as u64)
         .map_err(|_| "system_info(BootProtocolVersion) failed")?;
-    if bpv != 11
+    if bpv != u64::from(boot_protocol::BOOT_PROTOCOL_VERSION)
     {
-        return Err("system_info(BootProtocolVersion) did not return 11");
+        return Err("system_info(BootProtocolVersion) mismatches BOOT_PROTOCOL_VERSION");
     }
     Ok(())
 }

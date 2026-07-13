@@ -14,8 +14,8 @@
 //!
 //! # Surface
 //! - [`parse_cpu_count`]: enumerate RISC-V hart IDs from the `/cpus` node.
-//! - [`parse_timer_caps`]: extract the `/cpus` `timebase-frequency` and
-//!   whether every enabled hart advertises the Sstc extension.
+//! - [`parse_hart_caps`]: extract the `/cpus` `timebase-frequency` and
+//!   the `HART_CAP_*` bits every enabled hart advertises.
 //! - [`parse_boot_cpu_mmu_type`]: read the boot hart's `mmu-type` paging
 //!   claim for mode negotiation.
 //! - [`parse_aperture_seed`]: collect MMIO extents (PLIC, CLINT, UART, PCI
@@ -28,7 +28,19 @@
 
 use crate::bprintln;
 use boot_protocol::riscv_paging::PagingMode;
-use boot_protocol::{MAX_CPUS, MmioAperture};
+use boot_protocol::{
+    HART_CAP_SSTC, HART_CAP_SVINVAL, HART_CAP_SVNAPOT, HART_CAP_SVPBMT, MAX_CPUS, MmioAperture,
+};
+
+/// ISA-extension names the CPU-node walker recognizes, with the
+/// `hart_caps` bit each one confirms. Shared by the DTB stringlist /
+/// legacy-ISA branches here and the ACPI RHCT ISA-string parser.
+pub(crate) const HART_CAP_NAMES: [(&[u8], u64); 4] = [
+    (b"sstc", HART_CAP_SSTC),
+    (b"svpbmt", HART_CAP_SVPBMT),
+    (b"svinval", HART_CAP_SVINVAL),
+    (b"svnapot", HART_CAP_SVNAPOT),
+];
 
 // ── FDT constants ─────────────────────────────────────────────────────────────
 
@@ -393,11 +405,12 @@ impl Fdt
     }
 
     /// Walk CPU nodes (compatible = "riscv") and call
-    /// `callback(hart_id, has_sstc)` for each enabled CPU. CPU nodes use
+    /// `callback(hart_id, caps, mmu)` for each enabled CPU. CPU nodes use
     /// `#address-cells=1, #size-cells=0`, so `reg` is a single big-endian
-    /// u32 hart ID. `has_sstc` is true when the node advertises the Sstc
-    /// extension via `riscv,isa-extensions` (stringlist) or the legacy
-    /// `riscv,isa` string.
+    /// u32 hart ID. `caps` carries the `HART_CAP_*` bits for every
+    /// [`HART_CAP_NAMES`] extension the node advertises via
+    /// `riscv,isa-extensions` (stringlist) or the legacy `riscv,isa`
+    /// string.
     ///
     /// `callback` returns `true` to continue or `false` to stop early.
     ///
@@ -408,11 +421,10 @@ impl Fdt
     #[allow(clippy::too_many_lines)]
     pub fn walk_cpu_nodes<F>(&self, mut callback: F)
     where
-        F: FnMut(u32, bool, Option<PagingMode>) -> bool,
+        F: FnMut(u32, u64, Option<PagingMode>) -> bool,
     {
-        // Node state for one open node during traversal. Four independent
+        // Node state for one open node during traversal. Independent
         // property observations; enum-ifying them would obscure the walk.
-        #[allow(clippy::struct_excessive_bools)]
         #[derive(Clone, Copy)]
         struct CpuNodeState
         {
@@ -420,7 +432,7 @@ impl Fdt
             reg_u32: u32,
             has_reg: bool,
             disabled: bool,
-            has_sstc: bool,
+            caps: u64,
             mmu: Option<PagingMode>,
         }
 
@@ -429,7 +441,7 @@ impl Fdt
             reg_u32: 0,
             has_reg: false,
             disabled: false,
-            has_sstc: false,
+            caps: 0,
             mmu: None,
         }; MAX_DEPTH];
 
@@ -451,7 +463,7 @@ impl Fdt
                             reg_u32: 0,
                             has_reg: false,
                             disabled: false,
-                            has_sstc: false,
+                            caps: 0,
                             mmu: None,
                         };
                     }
@@ -471,7 +483,7 @@ impl Fdt
                         if s.is_riscv_cpu
                             && s.has_reg
                             && !s.disabled
-                            && !callback(s.reg_u32, s.has_sstc, s.mmu)
+                            && !callback(s.reg_u32, s.caps, s.mmu)
                         {
                             break;
                         }
@@ -535,18 +547,24 @@ impl Fdt
                     {
                         // Null-separated stringlist of extension names.
                         let data = self.struct_slice(data_off, prop_len);
-                        if prop_contains(data, b"sstc")
+                        for (ext, bit) in HART_CAP_NAMES
                         {
-                            state.has_sstc = true;
+                            if prop_contains(data, ext)
+                            {
+                                state.caps |= bit;
+                            }
                         }
                     }
                     else if name == b"riscv,isa"
                     {
                         // Legacy single ISA string: "rv64imafdc_…_sstc_…\0".
                         let data = self.struct_slice(data_off, prop_len);
-                        if isa_string_has_ext(data, b"sstc")
+                        for (ext, bit) in HART_CAP_NAMES
                         {
-                            state.has_sstc = true;
+                            if isa_string_has_ext(data, ext)
+                            {
+                                state.caps |= bit;
+                            }
                         }
                     }
                     else if name == b"mmu-type"
@@ -597,7 +615,7 @@ impl Fdt
     /// node tracking suffices. Accepts the spec's u32 cell and, defensively,
     /// a u64 encoding.
     ///
-    /// Only called via [`parse_timer_caps`] from `arch/riscv64`; on x86-64
+    /// Only called via [`parse_hart_caps`] from `arch/riscv64`; on x86-64
     /// the DTB parser is still compiled but no caller exists.
     #[allow(dead_code)]
     pub fn timebase_frequency(&self) -> u64
@@ -774,7 +792,7 @@ pub unsafe fn parse_cpu_count(dtb_addr: u64) -> (u32, [u32; MAX_CPUS])
     // MAX_CPUS fits in u32.
     #[allow(clippy::cast_possible_truncation)]
     let max_cpus_u32 = MAX_CPUS as u32;
-    fdt.walk_cpu_nodes(|reg_u32, _has_sstc, _mmu| {
+    fdt.walk_cpu_nodes(|reg_u32, _caps, _mmu| {
         if count < max_cpus_u32
         {
             hart_ids[count as usize] = reg_u32;
@@ -795,15 +813,16 @@ pub unsafe fn parse_cpu_count(dtb_addr: u64) -> (u32, [u32; MAX_CPUS])
     (count, hart_ids)
 }
 
-/// Parse the DTB timer capabilities: the `/cpus` `timebase-frequency` and
-/// whether every enabled hart advertises the Sstc extension.
+/// Parse the DTB hart capabilities: the `/cpus` `timebase-frequency` and
+/// the `HART_CAP_*` bits every enabled hart advertises.
 ///
-/// Returns `(timebase_freq, sstc)`. `timebase_freq` is zero when the
-/// property is absent. `sstc` is true only when at least one enabled CPU
-/// node was seen and all of them advertise Sstc — a conservative AND, since
-/// the kernel arms `stimecmp` on every hart.
+/// Returns `(timebase_freq, hart_caps)`. `timebase_freq` is zero when the
+/// property is absent. Each `hart_caps` bit is set only when at least one
+/// enabled CPU node was seen and all of them advertise the corresponding
+/// extension — a conservative per-bit AND, since the kernel relies on each
+/// capability on every hart.
 ///
-/// Returns `(0, false)` if the DTB is invalid.
+/// Returns `(0, 0)` if the DTB is invalid.
 ///
 /// Only called from `arch/riscv64`; on x86-64 the DTB parser is still
 /// compiled but no caller exists.
@@ -811,26 +830,26 @@ pub unsafe fn parse_cpu_count(dtb_addr: u64) -> (u32, [u32; MAX_CPUS])
 /// # Safety
 /// `dtb_addr` must be the physical address of a valid, identity-mapped FDT.
 #[allow(dead_code)]
-pub unsafe fn parse_timer_caps(dtb_addr: u64) -> (u64, bool)
+pub unsafe fn parse_hart_caps(dtb_addr: u64) -> (u64, u64)
 {
     // SAFETY: caller guarantees dtb_addr is identity-mapped DTB.
     let Some(fdt) = (unsafe { Fdt::from_raw(dtb_addr) })
     else
     {
-        return (0, false);
+        return (0, 0);
     };
 
     let timebase_freq = fdt.timebase_frequency();
 
     let mut seen_any = false;
-    let mut all_sstc = true;
-    fdt.walk_cpu_nodes(|_hart_id, has_sstc, _mmu| {
+    let mut all_caps = u64::MAX;
+    fdt.walk_cpu_nodes(|_hart_id, caps, _mmu| {
         seen_any = true;
-        all_sstc &= has_sstc;
+        all_caps &= caps;
         true // continue
     });
 
-    (timebase_freq, seen_any && all_sstc)
+    (timebase_freq, if seen_any { all_caps } else { 0 })
 }
 
 /// Read the paging mode the DTB advertises for the boot hart.
@@ -855,7 +874,7 @@ pub unsafe fn parse_boot_cpu_mmu_type(dtb_addr: u64, boot_hart_id: u64) -> Optio
 
     let mut boot_hart_mode: Option<PagingMode> = None;
     let mut widest: Option<PagingMode> = None;
-    fdt.walk_cpu_nodes(|reg_u32, _has_sstc, mmu| {
+    fdt.walk_cpu_nodes(|reg_u32, _caps, mmu| {
         if u64::from(reg_u32) == boot_hart_id && mmu.is_some()
         {
             boot_hart_mode = mmu;
@@ -1095,17 +1114,17 @@ mod tests
         b.finish()
     }
 
-    fn timer_caps(blob: &[u8]) -> (u64, bool)
+    fn hart_caps(blob: &[u8]) -> (u64, u64)
     {
         // SAFETY: blob is a valid in-memory FDT built by FdtBuilder.
-        unsafe { parse_timer_caps(blob.as_ptr() as u64) }
+        unsafe { parse_hart_caps(blob.as_ptr() as u64) }
     }
 
     #[test]
     fn timebase_frequency_u32_cell()
     {
         let blob = tree(Some(&10_000_000u32.to_be_bytes()), |_| {});
-        let (freq, _) = timer_caps(&blob);
+        let (freq, _) = hart_caps(&blob);
         assert_eq!(freq, 10_000_000);
     }
 
@@ -1113,7 +1132,7 @@ mod tests
     fn timebase_frequency_u64_cell()
     {
         let blob = tree(Some(&24_000_000u64.to_be_bytes()), |_| {});
-        let (freq, _) = timer_caps(&blob);
+        let (freq, _) = hart_caps(&blob);
         assert_eq!(freq, 24_000_000);
     }
 
@@ -1121,47 +1140,74 @@ mod tests
     fn timebase_frequency_absent_is_zero()
     {
         let blob = tree(None, |b| cpu_node(b, b"cpu@0", 0, &[]));
-        let (freq, _) = timer_caps(&blob);
+        let (freq, _) = hart_caps(&blob);
         assert_eq!(freq, 0);
     }
 
     #[test]
-    fn sstc_via_isa_extensions_stringlist()
+    fn caps_via_isa_extensions_stringlist()
     {
         let blob = tree(None, |b| {
-            let exts: &[(&[u8], &[u8])] = &[(b"riscv,isa-extensions", b"i\0m\0sstc\0svadu\0")];
+            let exts: &[(&[u8], &[u8])] = &[(
+                b"riscv,isa-extensions",
+                b"i\0m\0sstc\0svpbmt\0svinval\0svnapot\0svadu\0",
+            )];
             cpu_node(b, b"cpu@0", 0, exts);
             cpu_node(b, b"cpu@1", 1, exts);
         });
-        assert!(timer_caps(&blob).1);
+        let (_, caps) = hart_caps(&blob);
+        assert_eq!(
+            caps,
+            HART_CAP_SSTC | HART_CAP_SVPBMT | HART_CAP_SVINVAL | HART_CAP_SVNAPOT
+        );
     }
 
     #[test]
-    fn sstc_via_legacy_isa_string()
+    fn caps_via_legacy_isa_string()
     {
         let blob = tree(None, |b| {
             cpu_node(
                 b,
                 b"cpu@0",
                 0,
-                &[(b"riscv,isa", b"rv64imafdc_zicsr_sstc_svadu\0")],
+                &[(
+                    b"riscv,isa",
+                    b"rv64imafdc_zicsr_sstc_svinval_svnapot_svpbmt\0",
+                )],
             );
         });
-        assert!(timer_caps(&blob).1);
+        let (_, caps) = hart_caps(&blob);
+        assert_eq!(
+            caps,
+            HART_CAP_SSTC | HART_CAP_SVPBMT | HART_CAP_SVINVAL | HART_CAP_SVNAPOT
+        );
     }
 
     #[test]
-    fn sstc_denied_when_one_hart_lacks_it()
+    fn cap_denied_only_for_the_bit_a_hart_lacks()
     {
+        // Per-bit AND: hart 1 advertises svinval but not sstc/svpbmt, so
+        // only svinval survives across the pair.
         let blob = tree(None, |b| {
-            cpu_node(b, b"cpu@0", 0, &[(b"riscv,isa-extensions", b"i\0sstc\0")]);
-            cpu_node(b, b"cpu@1", 1, &[(b"riscv,isa-extensions", b"i\0")]);
+            cpu_node(
+                b,
+                b"cpu@0",
+                0,
+                &[(b"riscv,isa-extensions", b"i\0sstc\0svpbmt\0svinval\0")],
+            );
+            cpu_node(
+                b,
+                b"cpu@1",
+                1,
+                &[(b"riscv,isa-extensions", b"i\0svinval\0")],
+            );
         });
-        assert!(!timer_caps(&blob).1);
+        let (_, caps) = hart_caps(&blob);
+        assert_eq!(caps, HART_CAP_SVINVAL);
     }
 
     #[test]
-    fn sstc_ignores_disabled_hart()
+    fn caps_ignore_disabled_hart()
     {
         let blob = tree(None, |b| {
             cpu_node(b, b"cpu@0", 0, &[(b"riscv,isa-extensions", b"i\0sstc\0")]);
@@ -1171,14 +1217,15 @@ mod tests
             ];
             cpu_node(b, b"cpu@1", 1, disabled);
         });
-        assert!(timer_caps(&blob).1);
+        let (_, caps) = hart_caps(&blob);
+        assert_eq!(caps, HART_CAP_SSTC);
     }
 
     #[test]
-    fn sstc_false_without_cpu_nodes()
+    fn caps_zero_without_cpu_nodes()
     {
         let blob = tree(Some(&10_000_000u32.to_be_bytes()), |_| {});
-        assert!(!timer_caps(&blob).1);
+        assert_eq!(hart_caps(&blob).1, 0);
     }
 
     #[test]

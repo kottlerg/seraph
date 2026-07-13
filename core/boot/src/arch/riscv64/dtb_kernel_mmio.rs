@@ -18,15 +18,15 @@
 //! mapping.
 
 use crate::dtb::Fdt;
-use boot_protocol::{HART_CAP_SSTC, KernelMmio};
+use boot_protocol::KernelMmio;
 
 /// Populate the arch-specific `kernel_mmio` fields for RISC-V from the DTB.
 ///
 /// Walks the device tree for compatible matches:
 /// - `sifive,plic-1.0.0` / `riscv,plic0` → `plic_base`, `plic_size`.
 /// - `ns16550a` → `uart_base`, `uart_size`.
-/// - `/cpus` nodes → `timebase_freq` and, when every enabled hart
-///   advertises Sstc, `hart_caps |= HART_CAP_SSTC`.
+/// - `/cpus` nodes → `timebase_freq` and the `HART_CAP_*` bits every
+///   enabled hart advertises (Sstc, Svpbmt, Svinval, Svnapot).
 ///
 /// First match wins (real boards have one PLIC and one primary UART).
 /// A field already populated by a prior pass is left untouched; the
@@ -85,13 +85,10 @@ pub unsafe fn parse_kernel_mmio(dtb_addr: u64, km: &mut KernelMmio)
     }
 
     // SAFETY: caller guarantees dtb_addr is a valid, identity-mapped DTB.
-    let (timebase_freq, sstc) = unsafe { crate::dtb::parse_timer_caps(dtb_addr) };
+    let (timebase_freq, caps) = unsafe { crate::dtb::parse_hart_caps(dtb_addr) };
     if km.timebase_freq == 0
     {
         km.timebase_freq = timebase_freq;
     }
-    if sstc
-    {
-        km.hart_caps |= HART_CAP_SSTC;
-    }
+    km.hart_caps |= caps;
 }

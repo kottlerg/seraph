@@ -92,7 +92,11 @@ pub mod role_guids;
 ///     confirmed on every enabled hart; bit 0 = [`HART_CAP_SSTC`]). The
 ///     kernel timer refuses to boot without Sstc and a discovered
 ///     timebase; there is no compiled-in frequency fallback.
-pub const BOOT_PROTOCOL_VERSION: u32 = 11;
+/// v12: `hart_caps` gained bits 1–3 ([`HART_CAP_SVPBMT`],
+///     [`HART_CAP_SVINVAL`], [`HART_CAP_SVNAPOT`] — the RVA23 supervisor
+///     paging extensions). No layout change. The kernel's riscv64 paging
+///     initialization refuses to boot unless all three are confirmed.
+pub const BOOT_PROTOCOL_VERSION: u32 = 12;
 
 // ── Memory map ───────────────────────────────────────────────────────────────
 
@@ -536,15 +540,35 @@ pub struct KernelMmio
     /// treats an undiscovered timebase as fatal (no compiled-in default).
     pub timebase_freq: u64,
     /// ISA-capability bits the bootloader positively confirmed on every
-    /// enabled hart (bit 0 = [`HART_CAP_SSTC`]). Each firmware source ORs
-    /// in the bits it can confirm; zero means undiscovered or absent.
+    /// enabled hart (bit 0 = [`HART_CAP_SSTC`], bit 1 = [`HART_CAP_SVPBMT`],
+    /// bit 2 = [`HART_CAP_SVINVAL`], bit 3 = [`HART_CAP_SVNAPOT`]). Each
+    /// firmware source ORs in the bits it can confirm; zero means
+    /// undiscovered or absent.
     pub hart_caps: u64,
 }
 
-/// [`KernelMmio::hart_caps`] bit 0: every enabled hart implements Sstc
+// The `HART_CAP_*` constants are deliberately not gated on
+// `target_arch = "riscv64"`: the DTB/ACPI hart-capability parsers that
+// produce them live in arch-neutral bootloader modules that are compiled
+// (though never called) on x86-64 builds. Only the riscv64 `KernelMmio`
+// struct that carries the bits stays arch-gated.
+
+/// riscv64 `hart_caps` bit 0: every enabled hart implements Sstc
 /// (the `stimecmp` supervisor timer CSR).
-#[cfg(target_arch = "riscv64")]
 pub const HART_CAP_SSTC: u64 = 1 << 0;
+
+/// riscv64 `hart_caps` bit 1: every enabled hart implements Svpbmt
+/// (page-based memory types, PTE bits \[62:61\]).
+pub const HART_CAP_SVPBMT: u64 = 1 << 1;
+
+/// riscv64 `hart_caps` bit 2: every enabled hart implements Svinval
+/// (fine-grained address-translation cache invalidation: `sinval.vma`
+/// bracketed by `sfence.w.inval` / `sfence.inval.ir`).
+pub const HART_CAP_SVINVAL: u64 = 1 << 2;
+
+/// riscv64 `hart_caps` bit 3: every enabled hart implements Svnapot
+/// (naturally-aligned power-of-two contiguous translations, PTE bit 63).
+pub const HART_CAP_SVNAPOT: u64 = 1 << 3;
 
 #[cfg(target_arch = "riscv64")]
 impl KernelMmio
@@ -552,7 +576,7 @@ impl KernelMmio
     /// Zeroed `KernelMmio` for bootloaders that cannot populate it. The
     /// kernel falls back to its hardcoded constants when the corresponding
     /// MMIO field is zero; a zero `timebase_freq` or `hart_caps` is fatal
-    /// at timer initialization instead.
+    /// at timer / paging initialization instead.
     #[must_use]
     pub const fn zero() -> Self
     {

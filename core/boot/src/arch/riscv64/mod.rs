@@ -101,12 +101,16 @@ pub unsafe fn populate_kernel_mmio(firmware: &FirmwareInfo, km: &mut KernelMmio)
         unsafe { dtb_kernel_mmio::parse_kernel_mmio(firmware.device_tree, km) };
     }
 
-    // The kernel timer refuses to boot without these; log what the firmware
-    // tables actually provided so a refusal is diagnosable from the boot log.
+    // The kernel timer and paging init refuse to boot without these; log
+    // what the firmware tables actually provided so a refusal is
+    // diagnosable from the boot log.
     crate::bprintln!(
-        "[--------] boot: timer caps: timebase-frequency={} Hz, sstc={}",
+        "[--------] boot: hart caps: timebase-frequency={} Hz, sstc={}, svpbmt={}, svinval={}, svnapot={}",
         km.timebase_freq,
-        km.hart_caps & boot_protocol::HART_CAP_SSTC != 0
+        km.hart_caps & boot_protocol::HART_CAP_SSTC != 0,
+        km.hart_caps & boot_protocol::HART_CAP_SVPBMT != 0,
+        km.hart_caps & boot_protocol::HART_CAP_SVINVAL != 0,
+        km.hart_caps & boot_protocol::HART_CAP_SVNAPOT != 0
     );
 }
 

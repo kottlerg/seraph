@@ -74,7 +74,7 @@ rather than proceed with a mismatched structure.
 |---|---|
 | Privilege level | Supervisor mode |
 | Interrupts | Disabled (`sstatus.SIE` = 0) |
-| MMU | Enabled (Sv48); kernel mapped at intended virtual addresses |
+| MMU | Enabled under the negotiated paging mode (Sv39/Sv48/Sv57, recoverable from `satp.MODE`); kernel mapped at intended virtual addresses |
 | Stack | Valid; at least 64 KiB available |
 | `a0` | Physical address of `BootInfo` structure |
 | `a1` | Hart ID of the booting hart (obtained via `EFI_RISCV_BOOT_PROTOCOL`) |

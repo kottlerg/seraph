@@ -249,6 +249,11 @@ unsafe fn boot_sequence(image: EfiHandle, st: *mut EfiSystemTable) -> Result<!, 
     let firm = unsafe { step5_discover_firmware(&ctx) };
     // SAFETY: ctx.st is valid; firmware addresses are identity-mapped by UEFI.
     let cpus = unsafe { step5_discover_cpu_topology(&ctx, &firm) };
+    // Negotiate the paging mode before step 6 fixes the table hierarchy depth
+    // and step 10 installs it. No-op on x86-64.
+    // SAFETY: ctx.bs valid pre-exit; firm.device_tree is zero or an
+    // identity-mapped FDT; the probe masks SIE and restores the live satp.
+    unsafe { arch::current::negotiate_paging(ctx.bs, firm.device_tree, cpus.boot_hart_id)? };
     // SAFETY: ctx.bs valid pre-exit.
     let ap_trampoline_phys = unsafe { step5b_alloc_ap_trampoline(&ctx) };
     // SAFETY: ctx.bs valid pre-exit; draws the boot entropy seed while boot

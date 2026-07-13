@@ -46,6 +46,11 @@ pub enum BootError
     ///
     /// The `&'static str` payload describes the specific bundle error.
     InvalidBundle(&'static str),
+
+    /// No RISC-V paging mode the kernel supports passed the satp write-probe.
+    /// Sv39 is the platform minimum (docs/platform-requirements.md), so this
+    /// only fires on hardware below the RVA23 baseline.
+    PagingModeUnsupported,
 }
 
 impl From<elf::ElfError> for BootError
@@ -107,6 +112,10 @@ impl BootError
             BootError::OutOfMemory => "physical memory allocation failed",
             BootError::ExitBootServicesFailed => "ExitBootServices failed after retries",
             BootError::InvalidBundle(_) => "bootstrap.bundle is malformed or missing",
+            BootError::PagingModeUnsupported =>
+            {
+                "no supported RISC-V paging mode (Sv39 is the platform minimum)"
+            }
         }
     }
 }
@@ -150,6 +159,7 @@ mod tests
             BootError::OutOfMemory,
             BootError::ExitBootServicesFailed,
             BootError::InvalidBundle("b"),
+            BootError::PagingModeUnsupported,
         ];
         for v in variants
         {

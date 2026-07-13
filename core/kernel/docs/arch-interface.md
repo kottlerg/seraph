@@ -149,7 +149,9 @@ pub unsafe fn protect_user_page(
 pub unsafe fn unmap_user_page(root_virt: u64, virt: u64);
 
 /// Walk the user tables and return `(phys, flags_word)` mapped at `virt`, or
-/// None if unmapped.
+/// None if unmapped. RISC-V decodes Svnapot 64 KiB group members internally,
+/// so `phys` is always the exact per-page frame; the raw flags word may carry
+/// the N bit.
 pub unsafe fn translate_user_page(root_virt: u64, virt: u64) -> Option<(u64, u64)>;
 
 /// Free all user page-table frames for the address space rooted at `root_virt`.

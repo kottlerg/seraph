@@ -121,7 +121,10 @@ and large contiguous device mappings. Huge pages (1 GiB) may be used for the dir
 map on systems with sufficient RAM.
 
 Userspace mappings use 4 KiB pages by default. Large page support for userspace is
-a future optimisation.
+a future optimisation. On RISC-V, uncacheable (MMIO) user mappings additionally use
+the Svnapot 64 KiB contiguity hint where a mapping produces an eligible aligned,
+physically-contiguous group of 4 KiB leaves — a TLB-reach optimisation that keeps
+4 KiB granularity at the API (see the kernel memory-internals document).
 
 ### W^X Enforcement
 

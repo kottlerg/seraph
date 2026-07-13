@@ -340,6 +340,32 @@ one. Region teardown (`unmap_region_pooled`) uses the window for spans up to
 `RANGE_FLUSH_CEILING_PAGES` (32) and the coarse full flush above that, where one working-set
 refill is cheaper than per-page walks.
 
+### NAPOT Contiguity (RISC-V)
+
+Uncacheable (PBMT=IO) user mappings are opportunistically coalesced into Svnapot 64 KiB
+groups: when a leaf install completes an index-aligned run of 16 identically-attributed,
+physically-contiguous 4 KiB leaves on a 64 KiB-aligned base, the arch layer rewrites the
+group as one NAPOT translation (N bit set, `ppn[3:0]` carrying the size encoding), letting
+hardware cache one TLB entry for the window. Only the MMIO map path produces eligible
+runs, so eligibility is gated on PBMT=IO.
+
+Two invariants keep the hint transparent:
+
+- **Promotion and demotion need no flush of their own.** Both encodings translate every
+  VA in the group identically, so a cached pre-rewrite entry is benignly stale; each slot
+  rewrite is one aligned u64 store, so the lock-free spurious-fault walk sees a correct
+  view mid-rewrite either way.
+- **Writers demote before divergence.** Any unmap, permission change, or remap touching a
+  NAPOT member first restores the 16 per-page PTEs, then modifies its slot — partially
+  rewriting a live group would leave siblings whose cached 64 KiB entry still translates
+  the modified VA. The writer's ordinary per-VA (or span-wide) invalidation then also
+  kills any cached group entry, since an `sfence.vma`/`sinval.vma` naming any address
+  inside a NAPOT range must invalidate a covering cached translation.
+
+Readers decode both shapes: `translate_user_page` reconstructs a NAPOT member's PA bits
+\[15:12\] from the VA; the fault classifier and teardown walks are N-agnostic (a NAPOT
+member carries the same V/U/R/W/X bits, and leaf-vs-table discrimination is by R/W/X).
+
 ### Context Switch TLB Handling
 
 When tagging is enabled, a switch to a different address space calls

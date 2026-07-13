@@ -52,24 +52,36 @@ page. Large pages (2 MiB) are used where alignment allows.
 Exact region boundaries are an implementation detail and will be fixed at the time
 the kernel memory layout is initialised. They are not ABI.
 
-### RISC-V (Sv48)
+### RISC-V (Sv39 / Sv48 / Sv57)
 
-RISC-V with the Sv48 paging mode mirrors the x86-64 layout: 48-bit virtual addresses,
-the same canonical split, and 4-level page tables. The kernel is placed in the upper
-half at the same logical positions as on x86-64, enabling shared reasoning about the
-memory layout across architectures.
+RISC-V supports three address-translation modes on this port, negotiated at
+boot: the bootloader reads the DTB `mmu-type` claim, confirms it with a
+`satp` write-probe (falling back mode by mode), and the kernel recovers the
+active mode from `satp` at entry. Sv39 is the RVA23 platform minimum, Sv48
+the standing default (aligning with x86-64's address-space size), Sv57 a
+wider expansion ([platform-requirements.md](platform-requirements.md)). One
+kernel binary supports all three; every VA-layout constant that varies with
+the mode is derived from it at runtime.
+
+Each mode mirrors the x86-64 structure — a canonical split with userspace in
+the lower half and the kernel in the upper half, whose base is root page-table
+entry 256 in every mode:
 
 ```
-  0xFFFFFFFFFFFFFFFF ┐
-                     │  Kernel space (128 TiB)
-  0xFFFF800000000000 ┘
-  ~~~~~~~~~~~~~~~~~~~~  (Sv48 upper/lower split)
-  0x00007FFFFFFFFFFF ┐
-                     │  Userspace (128 TiB)
-  0x0000000000000000 ┘
+  Mode   Levels  VA bits  Userspace (lower half)      Kernel space (upper half)
+  Sv39   3       39       [0, 0x0000004000000000)     [0xFFFFFFC000000000, top]
+  Sv48   4       48       [0, 0x0000800000000000)     [0xFFFF800000000000, top]
+  Sv57   5       57       [0, 0x0100000000000000)     [0xFF00000000000000, top]
+  ~~~~~~~~~~~~~~~~~~~~ (non-canonical gap between the halves — hardware enforced)
 ```
 
-Sv48 is chosen to align with x86-64's address space size.
+The physical direct map starts at the active mode's kernel-half base; the
+kernel image stays at the top 2 GiB, canonical in every mode. Under Sv39 the
+kernel half is 256 GiB total, capping direct-mappable RAM at 254 GiB — the
+kernel refuses to boot beyond that rather than overlap the image mapping.
+All fixed userspace-layout zones sit below 2^38, the smallest user half, so
+one static userspace layout is canonical in every mode
+([userspace-memory-model.md](userspace-memory-model.md)).
 
 ### Userspace Layout
 
@@ -77,15 +89,14 @@ Each process address space begins empty. The program loader (running in userspac
 maps segments as directed by the binary format. The general convention is:
 
 ```
-  0x00007FFFFFFFFFFF ┐
+  (user VA ceiling)  ┐
                      │  Stack (grows downward)
                      │  (guard page below stack)
                      │
                      │  Shared mappings / mmap region
                      │
                      │  Heap (grows upward)
-                     │
-  0x0000000000400000 ┘  Program image (text, rodata, data, bss)
+  (low VA)           ┘  Program image (text, rodata, data, bss)
 ```
 
 The diagram shows the ordering convention only: each region's base is
@@ -105,7 +116,7 @@ order and the process-creation/death flow are in
 ### Page Sizes
 
 The base page size is 4 KiB on both architectures. Large pages (2 MiB on x86-64,
-megapages on RISC-V Sv48) are used where beneficial — primarily the kernel direct map
+megapages on RISC-V) are used where beneficial — primarily the kernel direct map
 and large contiguous device mappings. Huge pages (1 GiB) may be used for the direct
 map on systems with sufficient RAM.
 

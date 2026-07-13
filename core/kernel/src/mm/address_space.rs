@@ -5,7 +5,8 @@
 
 //! User-mode address space management (Phase 9).
 //!
-//! An [`AddressSpace`] owns one root page table (PML4 on x86-64, Sv48 root
+//! An [`AddressSpace`] owns one root page table (PML4 on x86-64, the
+//! negotiated-mode root
 //! on RISC-V). Intermediate page table frames are allocated from the buddy
 //! allocator on demand.
 //!
@@ -19,7 +20,9 @@
 //! page table root into the new user PML4, so kernel memory is reachable from
 //! user address spaces without per-process kernel mapping maintenance.
 //!
-//! On RISC-V the equivalent root entries are VPN[3] entries 256–511.
+//! On RISC-V the equivalent root entries are 256–511 of the negotiated
+//! mode's root table — the kernel half starts at root entry 256 in every
+//! mode.
 //!
 //! ## Concurrency
 //!
@@ -195,7 +198,7 @@ pub fn choose_init_layout() -> InitLayout
 /// at address-space death.
 pub struct AddressSpace
 {
-    /// Physical address of the root page table frame (PML4 / Sv48 root).
+    /// Physical address of the root page table frame (PML4 / RISC-V root).
     pub root_phys: u64,
     /// Virtual address of the root frame (via the direct physical map).
     pub root_virt: u64,
@@ -400,7 +403,7 @@ impl AddressSpace
     ///
     /// # Safety
     /// Must be called after Phase 3 (page tables active) and Phase 4 (heap active).
-    /// The current CPU's page table root must be the kernel's PML4/Sv48 root.
+    /// The current CPU's page table root must be the kernel's root table.
     #[cfg(not(test))]
     pub unsafe fn new_user(allocator: &mut BuddyAllocator) -> Self
     {
@@ -418,11 +421,12 @@ impl AddressSpace
             core::ptr::write_bytes(root_virt as *mut u8, 0, PAGE_SIZE);
         }
 
-        // Copy kernel-half PML4/Sv48 entries (indices 256–511) from the current
+        // Copy kernel-half root entries (indices 256–511, the kernel half in
+        // every paging mode) from the current
         // active page table root so the kernel stays accessible from user mode.
         //
         // On x86-64: read CR3 for the current PML4 physical address.
-        // On RISC-V: read satp for the current Sv48 root physical address.
+        // On RISC-V: read satp for the current root physical address.
         // SAFETY: root_virt is valid and page-aligned; copy_kernel_entries
         // reads the current root and copies 256 u64 entries within bounds.
         unsafe {

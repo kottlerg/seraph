@@ -51,7 +51,8 @@ use crate::arch::current::paging as arch_paging;
 
 // ── Kernel PML4 physical address ──────────────────────────────────────────────
 
-/// Physical address of the kernel's root page table (PML4 on x86-64, Sv48 root on RISC-V).
+/// Physical address of the kernel's root page table (PML4 on x86-64, the
+/// negotiated-mode root on RISC-V).
 ///
 /// Set once during Phase 3 by `init_kernel_page_tables`. APs load this into CR3
 /// (x86-64) or `satp` (RISC-V) during the SMP startup sequence.
@@ -132,7 +133,7 @@ pub enum PagingError
 /// Page permission flags for a mapping.
 ///
 /// On x86-64, `readable` has no effect (all present pages are readable);
-/// it is included for cross-architecture symmetry with RISC-V Sv48 which
+/// it is included for cross-architecture symmetry with RISC-V which
 /// has an explicit R bit.
 // more_than_3_bools: PageFlags is a cross-arch PTE flag set; each bool is a distinct
 // architectural attribute. A bitfield enum would need extra decode logic at every call site.
@@ -151,7 +152,7 @@ pub struct PageFlags
     /// Force device/uncacheable memory type.
     ///
     /// On x86-64: sets PCD|PWT in the PTE (strong uncacheable).
-    /// On RISC-V: under Sv48 without Svpbmt, MMIO regions are device-ordered
+    /// On RISC-V: without Svpbmt, MMIO regions are device-ordered
     /// by physical address and this field is a documentation marker only.
     ///
     // TODO: With Svpbmt, set PTE bits [62:61] = 01 (NC) when

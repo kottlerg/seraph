@@ -184,8 +184,8 @@ pub fn deep_pt_walk_consumes_pool(ctx: &TestContext) -> TestResult
 /// `mem_unmap_reclaim` (the `MEM_UNMAP_RECLAIM_PTS` path) returns the
 /// intermediate page tables a freed span empties back to the per-AS pool,
 /// crediting `pt_growth_budget_bytes`. A fresh single-page mapping at a clean
-/// VA allocates one intermediate table per non-root level (three on x86-64
-/// and riscv64 Sv48; the count varies with the riscv64 paging mode); tearing
+/// VA allocates one intermediate table per non-root level (three on x86-64;
+/// two to four on riscv64 depending on the negotiated paging mode); tearing
 /// the region down reclaims them all (the budget round-trips to its pre-map
 /// value), and the same VA then remaps from the returned pool pages.
 pub fn region_unmap_reclaims_pt_budget(ctx: &TestContext) -> TestResult

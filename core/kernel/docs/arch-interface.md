@@ -187,7 +187,7 @@ pub unsafe fn rebase_boot_stack(direct_map_base: u64);
 `PageFlags` (`mm::paging`) is an architecture-neutral bitfield with fields `readable`,
 `writable`, `executable`, and `uncacheable`. `readable` is meaningful only on RISC-V (x86-64
 has no read-disable bit); `uncacheable` sets PCD|PWT on x86-64 and is a documentation marker
-under Sv48-without-Svpbmt on RISC-V. W^X is enforced at the memory syscall layer
+without Svpbmt on RISC-V. W^X is enforced at the memory syscall layer
 (`syscall::mem` map/protect reject a writable-and-executable request with
 `SyscallError::WxViolation`); the arch mapping primitives require the caller to have already
 validated W^X.

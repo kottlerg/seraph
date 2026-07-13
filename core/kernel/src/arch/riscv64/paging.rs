@@ -596,8 +596,9 @@ pub unsafe fn enable_nx() {}
 ///
 /// Called once on the BSP. The capability bits are the conservative
 /// per-bit `AND` across all enabled harts, computed by the bootloader's
-/// firmware-table parse, so a BSP-only check covers the machine. After this gate the paging code uses the
-/// three extensions unconditionally, per the subsystem-gate policy in
+/// firmware-table parse, so a BSP-only check covers the machine. After
+/// this gate the paging code uses the three extensions unconditionally,
+/// per the subsystem-gate policy in
 /// [platform-requirements.md](../../../../docs/platform-requirements.md).
 ///
 /// Must be called after `platform::capture_kernel_mmio()` and before the

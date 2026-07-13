@@ -862,6 +862,11 @@ impl AddressSpace
     {
         use crate::arch::current::paging::{flush_tlb_all, unmap_user_region_pooled};
 
+        if page_count == 0
+        {
+            return 0;
+        }
+
         crate::percpu::preempt_disable();
         self.pt_lock();
 

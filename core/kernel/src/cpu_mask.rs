@@ -274,6 +274,17 @@ mod tests
     }
 
     #[test]
+    fn set_adds_bit()
+    {
+        let mut m = CpuMask::empty();
+        m.set(2);
+        m.set(65);
+        let mut buf = [0usize; 128];
+        let n = drain(m.iter(), &mut buf);
+        assert_eq!(&buf[..n], &[2, 65]);
+    }
+
+    #[test]
     fn clear_removes_bit()
     {
         let mut m = CpuMask::range(4);

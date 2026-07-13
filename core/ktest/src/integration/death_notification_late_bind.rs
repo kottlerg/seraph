@@ -36,9 +36,10 @@ use syscall_abi::{
 
 use crate::{ChildStack, TestContext, TestResult};
 
-/// A user-half VA no test maps (104 TiB, canonical), distinct from
-/// `fault_kills_thread`'s `WILD_VA` so the two never share a mapping.
-const WILD_VA: u64 = 0x6800_0000_0000;
+/// A user VA no test maps — canonical in every paging mode (below the 2^38
+/// Sv39 user half), distinct from `fault_kills_thread`'s `WILD_VA` so the
+/// two never share a mapping.
+const WILD_VA: u64 = 0x3E_6000_0000;
 
 /// Fault vector recorded in `exit_reason` for a not-present store.
 #[cfg(target_arch = "x86_64")]

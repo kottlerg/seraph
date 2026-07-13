@@ -32,9 +32,10 @@ use syscall_abi::{
 
 use crate::{ChildStack, TestContext, TestResult};
 
-/// Unmapped, canonical user-half VA the child touches; page-aligned so the
-/// faulting address equals it exactly. Distinct from other tests' VAs.
-const RESERVED_VA: u64 = 0x6100_0000_0000;
+/// Unmapped user VA the child touches; page-aligned so the faulting address
+/// equals it exactly. Canonical in every paging mode (below the 2^38 Sv39
+/// user half) and distinct from other tests' VAs.
+const RESERVED_VA: u64 = 0x3E_4000_0000;
 
 /// Caller-chosen badge bound with the handler; the kernel delivers it in the
 /// fault message so the pager can correlate the faulting thread.

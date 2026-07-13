@@ -297,11 +297,14 @@ resolve to TCG. The user-facing command reference plus the full env-var
 table lives in [`xtask/README.md`](../xtask/README.md#environment-variables).
 
 **Minimum QEMU version:** QEMU ≥ 8.0 (V extension support) is required;
-`xtask/src/qemu.rs` passes `-cpu rv64,v=true,zba=true,zbb=true,zbs=true`
+`xtask/src/qemu.rs` passes
+`-cpu rv64,v=true,zba=true,zbb=true,zbs=true,svpbmt=on,svinval=on,svnapot=on`
 for RISC-V and `-cpu max,migratable=no` on x86-64 TCG. The explicit
-feature string is the source of truth. The named `-cpu rva23s64`
-single-flag equivalent (QEMU ≥ 9.1, 2024-09) is a documented
-configuration alternative when the CI runner floor supports it.
+feature string is the source of truth; the supervisor paging extensions
+(Svpbmt, Svinval, Svnapot) are required by the kernel's boot-time
+feature-gate, which refuses CPUs that lack them. The named
+`-cpu rva23s64` single-flag equivalent (QEMU ≥ 9.1, 2024-09) is a
+documented configuration alternative when the CI runner floor supports it.
 
 ---
 

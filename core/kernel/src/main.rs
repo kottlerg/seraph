@@ -326,6 +326,15 @@ unsafe fn kernel_entry_post_rebase(
     #[cfg(not(test))]
     PANIC_DUMP_READY.store(true, core::sync::atomic::Ordering::Release);
     kprintln!("percpu ok");
+    // Assert the boot-gated paging extensions (riscv64: Svpbmt / Svinval /
+    // Svnapot from the bootloader-confirmed hart caps; x86-64: no-op). The
+    // paging code uses them unconditionally from here on.
+    #[cfg(not(test))]
+    // SAFETY: BSP, single-threaded boot; capture_kernel_mmio ran in Phase 4.
+    unsafe {
+        arch::current::paging::verify_paging_extensions();
+    }
+    kprintln!("paging-ext ok");
     // Enable hardware address-space tags (x86-64 PCID / RISC-V ASID) where
     // available, seeding the tag pool sized to boot_cpu_count. Where the feature
     // is absent this is a no-op and the kernel keeps the full-flush

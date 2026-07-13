@@ -1850,7 +1850,8 @@ pub fn irq_ack(irq_cap: u32) -> Result<(), i64>
 ///
 /// - `virt` must be page-aligned and in the user address range.
 /// - `flags` bit 1 (`0x2`) makes the mapping writable; executable is always denied.
-/// - All pages are mapped uncacheable (PCD|PWT on `x86_64`).
+/// - All pages are mapped uncacheable (PCD|PWT on `x86_64`, Svpbmt
+///   PBMT=IO on `riscv64`).
 ///
 /// # Errors
 /// Returns a negative `i64` error code if either cap is invalid, `virt` is

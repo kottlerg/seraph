@@ -152,11 +152,9 @@ pub struct PageFlags
     /// Force device/uncacheable memory type.
     ///
     /// On x86-64: sets PCD|PWT in the PTE (strong uncacheable).
-    /// On RISC-V: without Svpbmt, MMIO regions are device-ordered
-    /// by physical address and this field is a documentation marker only.
-    ///
-    // TODO: With Svpbmt, set PTE bits [62:61] = 01 (NC) when
-    // this is true. Pick up when adding Svpbmt support.
+    /// On RISC-V: sets the Svpbmt IO memory type (PTE bits \[62:61\] = 10 —
+    /// non-cacheable, non-idempotent, strongly ordered), making MMIO
+    /// attributes explicit rather than dependent on platform PMAs.
     pub uncacheable: bool,
 }
 

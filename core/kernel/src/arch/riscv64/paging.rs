@@ -19,8 +19,14 @@
 //! # PTE layout (identical in every mode)
 //! Bits \[53:10\]: PPN (physical page number, 44 bits).
 //! Bit 0: V (Valid). Bit 1: R (Read). Bit 2: W (Write). Bit 3: X (Execute).
+//! Bits \[62:61\]: PBMT (Svpbmt page-based memory type; 00=PMA, 01=NC,
+//! 10=IO). Bit 63: N (Svnapot naturally-aligned power-of-two contiguity).
 //! Non-leaf: V=1, R=0, W=0, X=0. Leaf: V=1, at least one of R/W/X set.
 //! A megapage (2 MiB) is a leaf installed at level 1 in every mode.
+//!
+//! Svpbmt, Svinval, and Svnapot are RVA23-required and asserted by
+//! [`verify_paging_extensions`] at boot; the code paths below use them
+//! unconditionally.
 
 use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
@@ -131,6 +137,18 @@ const DIRTY: u64 = 1 << 7;
 const PPN_MASK: u64 = 0x003F_FFFF_FFFF_FC00;
 /// A leaf at any level sets at least one of R/W/X; a table pointer has none.
 const LEAF_BITS: u64 = READ | WRITE | EXECUTE;
+/// Svpbmt PBMT field, bits \[62:61\]: 00=PMA (defer to platform memory
+/// attributes), 01=NC (non-cacheable idempotent main memory), 10=IO.
+// dead_code: consumed by the PTE unit tests; non-test code writes the field
+// wholesale via PBMT_IO.
+#[allow(dead_code)]
+const PBMT_MASK: u64 = 0b11 << 61;
+/// PBMT=IO: non-cacheable, non-idempotent, strongly-ordered (channel 0) —
+/// the device-MMIO memory type, the analogue of x86-64 PCD|PWT (strong UC).
+/// NC (01) is deliberately unused: `PageFlags` carries a single
+/// `uncacheable` bool today, and device correctness under the
+/// `shared/mmio` I/O fences requires the IO type.
+const PBMT_IO: u64 = 0b10 << 61;
 
 // ── PageTableEntry ────────────────────────────────────────────────────────────
 
@@ -158,11 +176,9 @@ impl PageTableEntry
     ///
     /// `phys` must be 4 KiB-aligned.
     ///
-    /// Note: `flags.uncacheable` has no effect without Svpbmt —
-    /// MMIO physical addresses are inherently device-ordered by the platform
-    /// memory map. No PTE bits need to be set for correct behavior.
-    // TODO: With Svpbmt, set PTE bits [62:61] = 01 (NC) when
-    // flags.uncacheable is true. Pick up when adding Svpbmt support.
+    /// `flags.uncacheable` selects the Svpbmt IO memory type (see
+    /// [`PBMT_IO`]); a clear flag leaves PBMT=PMA, deferring to the
+    /// platform's physical memory attributes.
     pub fn new_page(phys: u64, flags: PageFlags) -> Self
     {
         debug_assert!(phys & 0xFFF == 0, "page PA not 4 KiB-aligned");
@@ -180,6 +196,10 @@ impl PageTableEntry
         if flags.executable
         {
             bits |= EXECUTE;
+        }
+        if flags.uncacheable
+        {
+            bits |= PBMT_IO;
         }
         Self(bits)
     }
@@ -468,6 +488,45 @@ pub unsafe fn enable_tagged_tlb() -> usize
 /// No-op on RISC-V: the XN/NX mechanism is always available via PTE X bit.
 #[cfg(not(test))]
 pub unsafe fn enable_nx() {}
+
+/// Refuse to boot unless the bootloader confirmed the RVA23-required
+/// supervisor paging extensions — Svpbmt, Svinval, Svnapot — on every
+/// enabled hart.
+///
+/// Called once on the BSP. The capability bits are the conservative
+/// per-bit `AND` across all enabled harts, computed by the bootloader's
+/// firmware-table parse, so a BSP-only check covers the machine. After this gate the paging code uses the
+/// three extensions unconditionally, per the subsystem-gate policy in
+/// [platform-requirements.md](../../../../docs/platform-requirements.md).
+///
+/// Must be called after `platform::capture_kernel_mmio()` and before the
+/// first userspace mapping or TLB shootdown.
+///
+/// # Safety
+/// Must execute in supervisor mode from a single-threaded boot context.
+#[cfg(not(test))]
+pub unsafe fn verify_paging_extensions()
+{
+    let km = crate::platform::kernel_mmio();
+    let required = [
+        (boot_protocol::HART_CAP_SVPBMT, "Svpbmt"),
+        (boot_protocol::HART_CAP_SVINVAL, "Svinval"),
+        (boot_protocol::HART_CAP_SVNAPOT, "Svnapot"),
+    ];
+    for (bit, name) in required
+    {
+        if km.hart_caps & bit == 0
+        {
+            crate::kprintln!("paging: {name} not advertised for every hart");
+            crate::fatal(
+                "RVA23 supervisor paging extensions (Svpbmt, Svinval, Svnapot) \
+                 not advertised for every hart — required; there is no fallback \
+                 path. Check firmware tables (ACPI RHCT / DTB) or the QEMU -cpu \
+                 selection (svpbmt=on,svinval=on,svnapot=on).",
+            );
+        }
+    }
+}
 
 /// Read the current stack pointer (sp register).
 pub fn read_stack_pointer() -> u64
@@ -1256,6 +1315,34 @@ mod tests
         assert!(pte.0 & READ != 0);
         assert_eq!(pte.0 & WRITE, 0);
         assert!(pte.0 & EXECUTE != 0);
+    }
+
+    #[test]
+    fn new_page_uncacheable_sets_pbmt_io()
+    {
+        let flags = PageFlags {
+            readable: true,
+            writable: true,
+            executable: false,
+            uncacheable: true,
+        };
+        let pte = PageTableEntry::new_page(0x4000, flags);
+        assert_eq!(pte.0 & PBMT_MASK, PBMT_IO);
+        // The PBMT field must not disturb the PPN.
+        assert_eq!(pte.phys_addr(), 0x4000);
+    }
+
+    #[test]
+    fn new_page_cacheable_leaves_pbmt_pma()
+    {
+        let flags = PageFlags {
+            readable: true,
+            writable: true,
+            executable: false,
+            uncacheable: false,
+        };
+        let pte = PageTableEntry::new_page(0x5000, flags);
+        assert_eq!(pte.0 & PBMT_MASK, 0);
     }
 
     #[test]

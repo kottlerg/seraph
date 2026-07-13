@@ -191,6 +191,14 @@ pub unsafe fn flush_tag(tag: u16);
 /// its own `CR4.PCIDE` before any tagged CR3 load).
 pub unsafe fn enable_tagged_tlb() -> usize;
 
+/// BSP-only boot gate for paging extensions the kernel uses unconditionally.
+/// RISC-V refuses to boot unless the bootloader confirmed Svpbmt, Svinval, and
+/// Svnapot on every enabled hart (`KernelMmio::hart_caps`); x86-64 provides a
+/// no-op (its paging baseline is asserted by `cpu::verify_baseline` and
+/// `enable_nx`). Runs after `platform::capture_kernel_mmio`, before the first
+/// userspace mapping or TLB shootdown.
+pub unsafe fn verify_paging_extensions();
+
 /// Classify a user page fault as spurious (the live PTE already permits the
 /// access — a stale entry the handler resolves by retrying) versus a real fault.
 pub unsafe fn user_fault_is_spurious(va: u64, write: bool, instr: bool) -> bool;
@@ -202,8 +210,9 @@ pub unsafe fn rebase_boot_stack(direct_map_base: u64);
 
 `PageFlags` (`mm::paging`) is an architecture-neutral bitfield with fields `readable`,
 `writable`, `executable`, and `uncacheable`. `readable` is meaningful only on RISC-V (x86-64
-has no read-disable bit); `uncacheable` sets PCD|PWT on x86-64 and is a documentation marker
-without Svpbmt on RISC-V. W^X is enforced at the memory syscall layer
+has no read-disable bit); `uncacheable` selects the device memory type explicitly on both
+architectures — PCD|PWT (strong UC) on x86-64, Svpbmt PBMT=IO on RISC-V — so MMIO
+attributes do not depend on platform PMAs. W^X is enforced at the memory syscall layer
 (`syscall::mem` map/protect reject a writable-and-executable request with
 `SyscallError::WxViolation`); the arch mapping primitives require the caller to have already
 validated W^X.

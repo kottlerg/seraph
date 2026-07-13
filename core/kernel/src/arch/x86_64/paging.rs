@@ -388,6 +388,13 @@ pub unsafe fn enable_tagged_tlb() -> usize
     }
 }
 
+/// No-op on x86-64: this arch has no boot-gated paging extensions beyond
+/// the baseline already asserted by `cpu::verify_baseline` and
+/// [`enable_nx`]. The riscv64 implementation refuses hardware lacking
+/// Svpbmt/Svinval/Svnapot here.
+#[cfg(not(test))]
+pub unsafe fn verify_paging_extensions() {}
+
 /// Enable No-Execute by setting `IA32_EFER.NXE` (bit 11) via RDMSR/WRMSR.
 ///
 /// Must be called before activating page tables that use the NX bit,

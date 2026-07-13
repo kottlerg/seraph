@@ -554,16 +554,18 @@ impl Fdt
                         // Per the devicetree binding, the value names the
                         // widest translation mode the hart implements
                         // ("riscv,sv39" / "riscv,sv48" / "riscv,sv57");
-                        // "riscv,none" and the hypervisor "riscv,sv48x4"
+                        // "riscv,none" and the hypervisor "riscv,svNNx4"
                         // forms carry no S-mode paging claim.
                         let data = self.struct_slice(data_off, prop_len);
-                        state.mmu = if data.starts_with(b"riscv,sv57")
-                        {
-                            Some(PagingMode::Sv57)
-                        }
-                        else if data.starts_with(b"riscv,sv48x")
+                        state.mmu = if data.starts_with(b"riscv,sv39x")
+                            || data.starts_with(b"riscv,sv48x")
+                            || data.starts_with(b"riscv,sv57x")
                         {
                             None
+                        }
+                        else if data.starts_with(b"riscv,sv57")
+                        {
+                            Some(PagingMode::Sv57)
                         }
                         else if data.starts_with(b"riscv,sv48")
                         {

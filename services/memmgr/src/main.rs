@@ -176,6 +176,23 @@ const META_ARENA_BASE_DEFAULT: u64 = 0x0000_0004_4000_0000;
 /// entropy): the drawn base lies in an 8 GiB window above the default.
 const META_ARENA_SLOTS_LOG2: u32 = 21;
 
+/// Exclusive ceiling for arena growth: the base of the std reservation-arena
+/// zone (`process-layout`'s zone map), the next zone above memmgr's scratch
+/// band. `arena_grow` refuses to map past it, bounding the arena to >= 39 GiB
+/// of headroom above any base draw — hundreds of millions of nodes.
+const META_ARENA_CEILING: u64 = 0x0000_0010_0000_0000;
+
+// Zone-map invariants for memmgr's private windows, mirroring the
+// const-asserted discipline in `shared/process-layout`: the phys-table
+// scratch window ends below the arena window, and the arena's worst-case
+// base draw stays under the growth ceiling.
+const _: () = {
+    assert!(
+        PHYS_TABLE_TEMP_VA + (1 << (PHYS_TABLE_TEMP_SLOTS_LOG2 + 12)) <= META_ARENA_BASE_DEFAULT
+    );
+    assert!(META_ARENA_BASE_DEFAULT + (1 << (META_ARENA_SLOTS_LOG2 + 12)) < META_ARENA_CEILING);
+};
+
 /// Bytes per arena slot.
 const NODE_SIZE: usize = core::mem::size_of::<Slot>();
 
@@ -235,7 +252,8 @@ fn arena_grow(pool: &mut FreePool) -> bool
     let (self_aspace, page_idx, arena_base) =
         unsafe { (ARENA_SELF_ASPACE, ARENA_PAGES, ARENA_BASE_VA) };
     let va = arena_base + u64::from(page_idx) * PAGE_SIZE;
-    if syscall::mem_map(outer, self_aspace, va, 0, 1, MAP_READ | MAP_WRITABLE).is_err()
+    if va >= META_ARENA_CEILING
+        || syscall::mem_map(outer, self_aspace, va, 0, 1, MAP_READ | MAP_WRITABLE).is_err()
     {
         // Return the unusable frame to the pool; it stays owned and counted.
         let _ = pool.push(FreeRun {

@@ -444,7 +444,9 @@ in `SYS_CAP_CREATE_THREAD` for user-created threads.
 
 ## Page Table Node Tracking
 
-Intermediate page table nodes (PML3/PML2/PML1 on x86-64; every level below the root on RISC-V — two to four of them depending on the negotiated paging mode)
+Intermediate page table nodes (PML3/PML2/PML1 on x86-64; every level below
+the root on RISC-V — two to four of them depending on the negotiated paging
+mode)
 are allocated from the buddy allocator at order 0 (one 4 KiB page each). The kernel
 must track these to free them when an address space is destroyed.
 

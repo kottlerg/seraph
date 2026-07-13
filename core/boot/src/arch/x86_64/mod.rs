@@ -50,6 +50,9 @@ pub unsafe fn pre_serial_init(_st: *mut EfiSystemTable) {}
 ///
 /// # Safety
 /// Safe to call at any point; the arguments are unused.
+// unnecessary_wraps: Result signature is the cross-arch contract with the
+// riscv64 hook, whose probe can genuinely fail.
+#[allow(clippy::unnecessary_wraps)]
 pub unsafe fn negotiate_paging(
     _bs: *mut EfiBootServices,
     _dtb_addr: u64,

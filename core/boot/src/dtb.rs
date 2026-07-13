@@ -840,8 +840,12 @@ pub unsafe fn parse_timer_caps(dtb_addr: u64) -> (u64, bool)
 /// `None` when no CPU node advertises a recognized S-mode translation mode —
 /// the caller then probes from its own maximum downward.
 ///
+/// Only called from `arch/riscv64`; on x86-64 the DTB parser is still
+/// compiled but no caller exists.
+///
 /// # Safety
 /// `dtb_addr` must be the physical address of a valid, identity-mapped FDT.
+#[allow(dead_code)]
 pub unsafe fn parse_boot_cpu_mmu_type(dtb_addr: u64, boot_hart_id: u64) -> Option<PagingMode>
 {
     // SAFETY: caller guarantees dtb_addr is identity-mapped DTB.

@@ -330,6 +330,42 @@ loaded. Cross-CPU invalidation is the shootdown protocol in `mm/tlb_shootdown.rs
 allocator and per-address-space tag state live in `mm/tag_allocator.rs`; see
 [docs/memory-model.md](../../../docs/memory-model.md) for the model.
 
+Multi-page ranges use the batched-invalidation window (`inval_batch_begin`, per-page
+`inval_page` / `inval_page_tagged`, `inval_batch_end`): on RISC-V the window is the Svinval
+bracket (`sfence.w.inval` … `sinval.vma` per page … `sfence.inval.ir`), architecturally
+equivalent to an `sfence.vma` per page but paying the fence cost once; on x86-64 the
+brackets are no-ops and the per-page calls are `invlpg` / INVPCID. The single-VA
+primitives stay `sfence.vma` — for one address a bracket is three instructions instead of
+one. Region teardown (`unmap_region_pooled`) uses the window for spans up to
+`RANGE_FLUSH_CEILING_PAGES` (32) and the coarse full flush above that, where one working-set
+refill is cheaper than per-page walks.
+
+### NAPOT Contiguity (RISC-V)
+
+Uncacheable (PBMT=IO) user mappings are opportunistically coalesced into Svnapot 64 KiB
+groups: when a leaf install completes an index-aligned run of 16 identically-attributed,
+physically-contiguous 4 KiB leaves on a 64 KiB-aligned base, the arch layer rewrites the
+group as one NAPOT translation (N bit set, `ppn[3:0]` carrying the size encoding), letting
+hardware cache one TLB entry for the window. Only the MMIO map path produces eligible
+runs, so eligibility is gated on PBMT=IO.
+
+Two invariants keep the hint transparent:
+
+- **Promotion and demotion need no flush of their own.** Both encodings translate every
+  VA in the group identically, so a cached pre-rewrite entry is benignly stale; each slot
+  rewrite is one aligned u64 store, so the lock-free spurious-fault walk sees a correct
+  view mid-rewrite either way.
+- **Writers demote before divergence.** Any unmap, permission change, or remap touching a
+  NAPOT member first restores the 16 per-page PTEs, then modifies its slot — partially
+  rewriting a live group would leave siblings whose cached 64 KiB entry still translates
+  the modified VA. The writer's ordinary per-VA (or span-wide) invalidation then also
+  kills any cached group entry, since an `sfence.vma`/`sinval.vma` naming any address
+  inside a NAPOT range must invalidate a covering cached translation.
+
+Readers decode both shapes: `translate_user_page` reconstructs a NAPOT member's PA bits
+\[15:12\] from the VA; the fault classifier and teardown walks are N-agnostic (a NAPOT
+member carries the same V/U/R/W/X bits, and leaf-vs-table discrimination is by R/W/X).
+
 ### Context Switch TLB Handling
 
 When tagging is enabled, a switch to a different address space calls
@@ -359,21 +395,29 @@ work: holding it across the IPI ack-wait would serialize every concurrent map/un
 on the address space behind cross-CPU latency.
 
 The shootdown itself is lock-free — there is no global shootdown lock and no IPI
-payload. Each CPU owns a request slot. The initiator publishes `(root, virt, tag)` into
-its own slot, sets the pending bit of each target CPU, then sends the IPI:
+payload. Each CPU owns a request slot. The initiator publishes `(root, virt, pages, tag)`
+into its own slot, sets the pending bit of each target CPU, then sends the IPI:
 
 ```
 1. Edit the leaf PTE under pt_lock; release pt_lock.
 2. Bump the space's tlb_gen and fence (so a switched-away CPU flushes on
    reactivation); read active_cpus; exclude the current CPU.
-3. Publish (root, virt, tag) into this CPU's request slot and set each target's
-   pending bit (the bit doubles as the per-target liveness/ack badge).
+3. Publish (root, virt, pages, tag) into this CPU's request slot and set each
+   target's pending bit (the bit doubles as the per-target liveness/ack badge).
 4. Send the shootdown IPI to the targets and wait for every pending bit to clear.
 ```
 
 A target services the slot only once it observes its own pending bit set, so it never
-reads a half-published request; it invalidates the named VA for `tag` (so a CPU that has
-since switched to another space still flushes the right translation) and clears its bit.
+reads a half-published request; it invalidates the named VA — or, for a range request
+(`pages > 1`), each page of the span inside one batched-invalidation window — for `tag`
+(so a CPU that has since switched to another space still flushes the right translation)
+and clears its bit. Range flushes from every slot matched in one service pass share a
+single window, and **every acknowledgement is deferred until the window closes**: a queued
+`sinval.vma` is architecturally complete only when the closing `sfence.inval.ir` retires,
+so acking earlier would let the initiator proceed against a translation the target can
+still use. A full-flush or single-page slot serviced after the window opens executes its
+`sfence.vma`-family instruction inside the open window — architecturally legal (the
+closing fence still completes the queued `sinval.vma`s), just not part of the batch.
 Preemption stays disabled across the whole edit-then-shootdown sequence.
 
 The shootdown is **not** issued unconditionally. Each rewrite is classified as it

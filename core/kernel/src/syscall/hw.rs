@@ -190,7 +190,7 @@ pub fn sys_irq_register(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// arg3 = flags (bit 1 = WRITE; executable mappings are always rejected).
 ///
 /// All pages are mapped with `uncacheable = true` (PCD|PWT on `x86_64`,
-/// no-op on RISC-V under the current MMU mode — see [`PageFlags`] comment).
+/// Svpbmt PBMT=IO on RISC-V — see [`PageFlags`]).
 ///
 /// Intermediate page-table pages are drawn from the target AS's own
 /// retype-backed PT growth pool when it has one (every userspace driver's

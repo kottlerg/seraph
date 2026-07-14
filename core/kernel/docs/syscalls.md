@@ -841,8 +841,8 @@ allocation or slot-page pool exhausted), `QuotaExceeded` (caller's CSpace at slo
 ### `SYS_MMIO_MAP` (34)
 
 Map an MMIO region capability into an address space. MMIO mappings use uncacheable
-page attributes (`PAT` write-combine or uncacheable on x86-64; device-ordered on
-RISC-V) rather than the default writeback caching.
+page attributes (PCD|PWT strong-uncacheable on x86-64; Svpbmt PBMT=IO on RISC-V)
+rather than the default writeback caching.
 
 **Arguments:**
 

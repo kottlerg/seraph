@@ -252,19 +252,21 @@ fn extend_riscv(args: &mut Vec<String>, spec: &QemuLaunchSpec) -> Result<()>
         .context("riscv64 launch requires firmware_vars_path")?;
 
     args.extend(["-machine".into(), "virt".into()]);
-    // Pin the CPU model to a baseline that advertises the RVA23U64 features
-    // userspace targets: V (Vector) plus the Zba/Zbb/Zbs bitmanip set.
-    // RVA23 also mandates Zfa, Zfhmin, Zihintntl, Zicond, Zimop, Zcmop, Zcb,
-    // Zvfhmin, Zvbb, Zvkt, Zkt — those land as QEMU coverage broadens. A
-    // future bump should switch to `-cpu rva23s64` once the floor QEMU
-    // version on CI hosts is >= 9.1.
+    // Pin the CPU model to a baseline that advertises the RVA23 features the
+    // system requires: V (Vector) plus the Zba/Zbb/Zbs bitmanip set for
+    // userspace, and the supervisor paging extensions Svpbmt/Svinval/Svnapot
+    // that the kernel's boot gate refuses to run without (explicit `=on`
+    // pins against QEMU default drift). RVA23 also mandates Zfa, Zfhmin,
+    // Zihintntl, Zicond, Zimop, Zcmop, Zcb, Zvfhmin, Zvbb, Zvkt, Zkt — those
+    // land as QEMU coverage broadens. A future bump should switch to
+    // `-cpu rva23s64` once the floor QEMU version on CI hosts is >= 9.1.
     //
     // The trailing satp-mode properties (`RiscvMmu::cpu_satp_props`) pin the
     // paging-mode ceiling the guest advertises via DTB `mmu-type`.
     args.extend([
         "-cpu".into(),
         format!(
-            "rv64,v=true,zba=true,zbb=true,zbs=true{}",
+            "rv64,v=true,zba=true,zbb=true,zbs=true,svpbmt=on,svinval=on,svnapot=on{}",
             spec.riscv_mmu.cpu_satp_props()
         ),
     ]);
@@ -515,6 +517,18 @@ mod tests
         spec.riscv_mmu = RiscvMmu::Sv57;
         let argv = build_qemu_argv(&spec).unwrap();
         assert!(cpu_arg(&argv).ends_with(",sv57=on"));
+    }
+
+    #[test]
+    fn riscv_cpu_advertises_required_paging_extensions()
+    {
+        // The kernel's boot gate refuses to run without these; losing them
+        // from the -cpu string would kill every riscv64 QEMU run at boot.
+        let argv = build_qemu_argv(&riscv_spec(1, 512)).unwrap();
+        let cpu = cpu_arg(&argv);
+        assert!(cpu.contains(",svpbmt=on"));
+        assert!(cpu.contains(",svinval=on"));
+        assert!(cpu.contains(",svnapot=on"));
     }
 
     #[test]

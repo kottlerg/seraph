@@ -68,6 +68,14 @@ impl CpuMask
         m
     }
 
+    /// Add `cpu` to the set.
+    #[inline]
+    pub fn set(&mut self, cpu: usize)
+    {
+        let (w, b) = word_bit(cpu);
+        self.words[w] |= b;
+    }
+
     /// Remove `cpu` from the set.
     #[inline]
     pub fn clear(&mut self, cpu: usize)
@@ -263,6 +271,17 @@ mod tests
         assert_eq!(n, 70);
         assert_eq!(buf[0], 0);
         assert_eq!(buf[n - 1], 69);
+    }
+
+    #[test]
+    fn set_adds_bit()
+    {
+        let mut m = CpuMask::empty();
+        m.set(2);
+        m.set(65);
+        let mut buf = [0usize; 128];
+        let n = drain(m.iter(), &mut buf);
+        assert_eq!(&buf[..n], &[2, 65]);
     }
 
     #[test]

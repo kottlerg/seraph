@@ -149,7 +149,9 @@ pub unsafe fn protect_user_page(
 pub unsafe fn unmap_user_page(root_virt: u64, virt: u64);
 
 /// Walk the user tables and return `(phys, flags_word)` mapped at `virt`, or
-/// None if unmapped.
+/// None if unmapped. RISC-V decodes Svnapot 64 KiB group members internally,
+/// so `phys` is always the exact per-page frame; the raw flags word may carry
+/// the N bit.
 pub unsafe fn translate_user_page(root_virt: u64, virt: u64) -> Option<(u64, u64)>;
 
 /// Free all user page-table frames for the address space rooted at `root_virt`.
@@ -181,6 +183,23 @@ pub unsafe fn flush_page_tagged(virt: u64, tag: u16);
 /// switched-away space accrued unmaps.
 pub unsafe fn flush_tag(tag: u16);
 
+/// Open a batched-invalidation window (RISC-V `sfence.w.inval`; x86-64 no-op).
+/// The single-VA primitives above intentionally remain plain `sfence.vma` —
+/// a bracket only pays for itself across multiple addresses.
+pub unsafe fn inval_batch_begin();
+
+/// Invalidate `virt` across all tags inside an open window (RISC-V
+/// `sinval.vma virt, zero`; x86-64 `invlpg`).
+pub unsafe fn inval_page(virt: u64);
+
+/// Invalidate `virt` within `tag` inside an open window (RISC-V
+/// `sinval.vma virt, asid`; x86-64 INVPCID type 0).
+pub unsafe fn inval_page_tagged(virt: u64, tag: u16);
+
+/// Close the window (RISC-V `sfence.inval.ir`; x86-64 no-op). The queued
+/// invalidations are architecturally complete when this returns.
+pub unsafe fn inval_batch_end();
+
 /// Per-CPU enable of tagged TLBs; returns the number of hardware tags available.
 /// x86-64 sets `CR4.PCIDE` and returns 4096, or `0` where PCID/INVPCID are absent
 /// (the kernel keeps a full-flush fallback — see
@@ -190,6 +209,14 @@ pub unsafe fn flush_tag(tag: u16);
 /// on the BSP (whose return seeds the tag pool) and on every AP (which must set
 /// its own `CR4.PCIDE` before any tagged CR3 load).
 pub unsafe fn enable_tagged_tlb() -> usize;
+
+/// BSP-only boot gate for paging extensions the kernel uses unconditionally.
+/// RISC-V refuses to boot unless the bootloader confirmed Svpbmt, Svinval, and
+/// Svnapot on every enabled hart (`KernelMmio::hart_caps`); x86-64 provides a
+/// no-op (its paging baseline is asserted by `cpu::verify_baseline` and
+/// `enable_nx`). Runs after `platform::capture_kernel_mmio`, before the first
+/// userspace mapping or TLB shootdown.
+pub unsafe fn verify_paging_extensions();
 
 /// Classify a user page fault as spurious (the live PTE already permits the
 /// access — a stale entry the handler resolves by retrying) versus a real fault.
@@ -202,8 +229,9 @@ pub unsafe fn rebase_boot_stack(direct_map_base: u64);
 
 `PageFlags` (`mm::paging`) is an architecture-neutral bitfield with fields `readable`,
 `writable`, `executable`, and `uncacheable`. `readable` is meaningful only on RISC-V (x86-64
-has no read-disable bit); `uncacheable` sets PCD|PWT on x86-64 and is a documentation marker
-without Svpbmt on RISC-V. W^X is enforced at the memory syscall layer
+has no read-disable bit); `uncacheable` selects the device memory type explicitly on both
+architectures — PCD|PWT (strong UC) on x86-64, Svpbmt PBMT=IO on RISC-V — so MMIO
+attributes do not depend on platform PMAs. W^X is enforced at the memory syscall layer
 (`syscall::mem` map/protect reject a writable-and-executable request with
 `SyscallError::WxViolation`); the arch mapping primitives require the caller to have already
 validated W^X.

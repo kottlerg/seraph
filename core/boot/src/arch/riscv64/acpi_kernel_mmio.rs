@@ -21,7 +21,7 @@
 
 use super::acpi_spcr::find_spcr_base;
 use crate::acpi::{MADT_ENTRIES_OFF, MADT_TYPE_PLIC, find_acpi_table, read_u8, read_u32, read_u64};
-use boot_protocol::{HART_CAP_SSTC, KernelMmio};
+use boot_protocol::KernelMmio;
 
 /// Conventional ns16550a register-file size. SPCR does not specify a
 /// region size; DTB (if subsequently run) does and overrides this.
@@ -37,8 +37,9 @@ const NS16550A_MMIO_SIZE: u64 = 0x100;
 ///   Generic Address Structure's `address` field; `km.uart_size` is set
 ///   to the ns16550a conventional [`NS16550A_MMIO_SIZE`] (0x100) since
 ///   SPCR does not carry a size field.
-/// - RHCT (via the shared walker) → `km.timebase_freq` and, when every
-///   hart's ISA string names Sstc, `km.hart_caps |= HART_CAP_SSTC`.
+/// - RHCT (via the shared walker) → `km.timebase_freq` and the
+///   `HART_CAP_*` bits every hart's ISA string names (Sstc, Svpbmt,
+///   Svinval, Svnapot).
 ///
 /// Fields the caller left non-zero are preserved; fields left zero are
 /// populated when the corresponding table is present.
@@ -70,15 +71,12 @@ pub unsafe fn parse_kernel_mmio(rsdp_addr: u64, km: &mut KernelMmio)
     }
 
     // SAFETY: rsdp_addr validity propagates.
-    let (timebase_freq, sstc) = unsafe { crate::acpi::parse_timer_caps(rsdp_addr) };
+    let (timebase_freq, caps) = unsafe { crate::acpi::parse_hart_caps(rsdp_addr) };
     if km.timebase_freq == 0
     {
         km.timebase_freq = timebase_freq;
     }
-    if sstc
-    {
-        km.hart_caps |= HART_CAP_SSTC;
-    }
+    km.hart_caps |= caps;
 }
 
 /// Iterate MADT entries; write the first type-0x1B entry into `km`.

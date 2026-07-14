@@ -18,8 +18,8 @@
 //!   `BootInfo.cpu_ids`.
 //! - [`parse_aperture_seed`]: MADT + MCFG walk producing MMIO aperture
 //!   seeds fed into [`super::memory_map::derive_mmio_apertures`].
-//! - [`parse_timer_caps`]: RHCT walk (RISC-V, ACPI 6.5+) producing the
-//!   `time` CSR frequency and whether every hart advertises Sstc.
+//! - [`parse_hart_caps`]: RHCT walk (RISC-V, ACPI 6.5+) producing the
+//!   `time` CSR frequency and the `HART_CAP_*` bits every hart advertises.
 //!
 //! Arch-specific `kernel_mmio` extractors (LAPIC+IOAPIC on x86-64;
 //! PLIC+UART on RISC-V) consume the byte helpers and layout constants
@@ -216,22 +216,23 @@ const RHCT_NODE_HDR_LEN: usize = 6;
 #[allow(dead_code)]
 const RHCT_NODE_TYPE_ISA_STRING: u16 = 0;
 
-/// Parse an RHCT table body: return `(time_base_frequency, sstc)`.
+/// Parse an RHCT table body: return `(time_base_frequency, hart_caps)`.
 ///
-/// `sstc` is true only when at least one ISA-string node exists and every
-/// ISA-string node names the `sstc` extension. Firmware deduplicates
-/// identical ISA strings into shared nodes referenced by the per-hart
-/// hart-info nodes; requiring `sstc` in every ISA-string node is the
-/// conservative reading and avoids the hart-info offset indirection.
+/// Each `HART_CAP_*` bit is set only when at least one ISA-string node
+/// exists and every ISA-string node names the corresponding extension —
+/// a conservative per-bit AND. Firmware deduplicates identical ISA
+/// strings into shared nodes referenced by the per-hart hart-info nodes;
+/// requiring each extension in every ISA-string node is the conservative
+/// reading and avoids the hart-info offset indirection.
 #[allow(dead_code)] // riscv64-only caller; module compiled on every arch.
-fn parse_rhct(table: &[u8]) -> (u64, bool)
+fn parse_rhct(table: &[u8]) -> (u64, u64)
 {
     let timebase = read_u64(table, RHCT_OFF_TIMEBASE);
     let node_count = read_u32(table, RHCT_OFF_NODE_COUNT) as usize;
     let mut off = read_u32(table, RHCT_OFF_NODE_OFFSET) as usize;
 
     let mut isa_nodes: usize = 0;
-    let mut all_sstc = true;
+    let mut all_caps = u64::MAX;
 
     for _ in 0..node_count
     {
@@ -253,31 +254,39 @@ fn parse_rhct(table: &[u8]) -> (u64, bool)
             let isa_end = isa_off.saturating_add(isa_len).min(off + node_len);
             let isa = &table[isa_off.min(isa_end)..isa_end];
             isa_nodes += 1;
-            all_sstc &= crate::dtb::isa_string_has_ext(isa, b"sstc");
+            let mut node_caps = 0u64;
+            for (ext, bit) in crate::dtb::HART_CAP_NAMES
+            {
+                if crate::dtb::isa_string_has_ext(isa, ext)
+                {
+                    node_caps |= bit;
+                }
+            }
+            all_caps &= node_caps;
         }
 
         off += node_len;
     }
 
-    (timebase, isa_nodes > 0 && all_sstc)
+    (timebase, if isa_nodes > 0 { all_caps } else { 0 })
 }
 
-/// Parse the ACPI timer capabilities from the RHCT: the `time` CSR frequency
-/// and whether every hart advertises the Sstc extension.
+/// Parse the ACPI hart capabilities from the RHCT: the `time` CSR frequency
+/// and the `HART_CAP_*` bits every hart advertises.
 ///
-/// Returns `(0, false)` when no ACPI or no RHCT is present.
+/// Returns `(0, 0)` when no ACPI or no RHCT is present.
 ///
 /// # Safety
 /// `rsdp_addr` must be zero or the physical address of a valid,
 /// identity-mapped ACPI RSDP whose referenced tables are identity-mapped.
 #[allow(dead_code)] // riscv64-only caller; module compiled on every arch.
-pub unsafe fn parse_timer_caps(rsdp_addr: u64) -> (u64, bool)
+pub unsafe fn parse_hart_caps(rsdp_addr: u64) -> (u64, u64)
 {
     // SAFETY: caller contract.
     match unsafe { find_acpi_table(rsdp_addr, *b"RHCT") }
     {
         Some(table) => parse_rhct(table),
-        None => (0, false),
+        None => (0, 0),
     }
 }
 
@@ -765,26 +774,35 @@ mod tests
     }
 
     #[test]
-    fn rhct_timebase_and_sstc()
+    fn rhct_timebase_and_caps()
     {
-        let isa = isa_payload(b"rv64imafdcvh_zicsr_sstc_svadu");
+        use boot_protocol::{HART_CAP_SSTC, HART_CAP_SVINVAL, HART_CAP_SVNAPOT, HART_CAP_SVPBMT};
+        let isa = isa_payload(b"rv64imafdcvh_zicsr_sstc_svpbmt_svinval_svnapot_svadu");
         let table = rhct(10_000_000, &[(RHCT_NODE_TYPE_ISA_STRING, &isa)]);
-        assert_eq!(parse_rhct(&table), (10_000_000, true));
+        assert_eq!(
+            parse_rhct(&table),
+            (
+                10_000_000,
+                HART_CAP_SSTC | HART_CAP_SVPBMT | HART_CAP_SVINVAL | HART_CAP_SVNAPOT
+            )
+        );
     }
 
     #[test]
-    fn rhct_sstc_absent_from_isa_string()
+    fn rhct_caps_absent_from_isa_string()
     {
         let isa = isa_payload(b"rv64imafdc_zicsr");
         let table = rhct(10_000_000, &[(RHCT_NODE_TYPE_ISA_STRING, &isa)]);
-        assert_eq!(parse_rhct(&table), (10_000_000, false));
+        assert_eq!(parse_rhct(&table), (10_000_000, 0));
     }
 
     #[test]
-    fn rhct_sstc_denied_when_one_isa_node_lacks_it()
+    fn rhct_cap_denied_only_for_the_bit_a_node_lacks()
     {
-        let with = isa_payload(b"rv64imafdc_sstc");
-        let without = isa_payload(b"rv64imafdc");
+        use boot_protocol::HART_CAP_SVINVAL;
+        // Per-bit AND: the second node advertises only svinval.
+        let with = isa_payload(b"rv64imafdc_sstc_svinval");
+        let without = isa_payload(b"rv64imafdc_svinval");
         let table = rhct(
             10_000_000,
             &[
@@ -792,12 +810,13 @@ mod tests
                 (RHCT_NODE_TYPE_ISA_STRING, &without),
             ],
         );
-        assert!(!parse_rhct(&table).1);
+        assert_eq!(parse_rhct(&table).1, HART_CAP_SVINVAL);
     }
 
     #[test]
     fn rhct_skips_non_isa_nodes()
     {
+        use boot_protocol::HART_CAP_SSTC;
         let isa = isa_payload(b"rv64imafdc_sstc");
         // Hart-info node (type 0xFFFF): num_offsets=1, uid=0, one offset.
         let hart_info: &[u8] = &[1, 0, 0, 0, 0, 0, 56, 0, 0, 0];
@@ -805,14 +824,14 @@ mod tests
             10_000_000,
             &[(RHCT_NODE_TYPE_ISA_STRING, &isa), (0xFFFF, hart_info)],
         );
-        assert_eq!(parse_rhct(&table), (10_000_000, true));
+        assert_eq!(parse_rhct(&table), (10_000_000, HART_CAP_SSTC));
     }
 
     #[test]
-    fn rhct_no_isa_nodes_means_no_sstc()
+    fn rhct_no_isa_nodes_means_no_caps()
     {
         let table = rhct(10_000_000, &[]);
-        assert_eq!(parse_rhct(&table), (10_000_000, false));
+        assert_eq!(parse_rhct(&table), (10_000_000, 0));
     }
 
     #[test]
@@ -821,10 +840,10 @@ mod tests
         let isa = isa_payload(b"rv64imafdc_sstc");
         let mut table = rhct(10_000_000, &[(RHCT_NODE_TYPE_ISA_STRING, &isa)]);
         // Truncate mid-node: the walker must stop without panicking, and
-        // without having confirmed sstc from a complete node.
+        // without having confirmed any capability from a complete node.
         table.truncate(60);
-        let (freq, sstc) = parse_rhct(&table);
+        let (freq, caps) = parse_rhct(&table);
         assert_eq!(freq, 10_000_000);
-        assert!(!sstc);
+        assert_eq!(caps, 0);
     }
 }

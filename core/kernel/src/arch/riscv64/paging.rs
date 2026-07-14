@@ -19,8 +19,14 @@
 //! # PTE layout (identical in every mode)
 //! Bits \[53:10\]: PPN (physical page number, 44 bits).
 //! Bit 0: V (Valid). Bit 1: R (Read). Bit 2: W (Write). Bit 3: X (Execute).
+//! Bits \[62:61\]: PBMT (Svpbmt page-based memory type; 00=PMA, 01=NC,
+//! 10=IO). Bit 63: N (Svnapot naturally-aligned power-of-two contiguity).
 //! Non-leaf: V=1, R=0, W=0, X=0. Leaf: V=1, at least one of R/W/X set.
 //! A megapage (2 MiB) is a leaf installed at level 1 in every mode.
+//!
+//! Svpbmt, Svinval, and Svnapot are RVA23-required and asserted by
+//! [`verify_paging_extensions`] at boot; the code paths below use them
+//! unconditionally.
 
 use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
@@ -131,6 +137,15 @@ const DIRTY: u64 = 1 << 7;
 const PPN_MASK: u64 = 0x003F_FFFF_FFFF_FC00;
 /// A leaf at any level sets at least one of R/W/X; a table pointer has none.
 const LEAF_BITS: u64 = READ | WRITE | EXECUTE;
+/// Svpbmt PBMT field, bits \[62:61\]: 00=PMA (defer to platform memory
+/// attributes), 01=NC (non-cacheable idempotent main memory), 10=IO.
+const PBMT_MASK: u64 = 0b11 << 61;
+/// PBMT=IO: non-cacheable, non-idempotent, strongly-ordered (channel 0) —
+/// the device-MMIO memory type, the analogue of x86-64 PCD|PWT (strong UC).
+/// NC (01) is deliberately unused: `PageFlags` carries a single
+/// `uncacheable` bool today, and device correctness under the
+/// `shared/mmio` I/O fences requires the IO type.
+const PBMT_IO: u64 = 0b10 << 61;
 
 // ── PageTableEntry ────────────────────────────────────────────────────────────
 
@@ -158,11 +173,9 @@ impl PageTableEntry
     ///
     /// `phys` must be 4 KiB-aligned.
     ///
-    /// Note: `flags.uncacheable` has no effect without Svpbmt —
-    /// MMIO physical addresses are inherently device-ordered by the platform
-    /// memory map. No PTE bits need to be set for correct behavior.
-    // TODO: With Svpbmt, set PTE bits [62:61] = 01 (NC) when
-    // flags.uncacheable is true. Pick up when adding Svpbmt support.
+    /// `flags.uncacheable` selects the Svpbmt IO memory type (see
+    /// [`PBMT_IO`]); a clear flag leaves PBMT=PMA, deferring to the
+    /// platform's physical memory attributes.
     pub fn new_page(phys: u64, flags: PageFlags) -> Self
     {
         debug_assert!(phys & 0xFFF == 0, "page PA not 4 KiB-aligned");
@@ -180,6 +193,10 @@ impl PageTableEntry
         if flags.executable
         {
             bits |= EXECUTE;
+        }
+        if flags.uncacheable
+        {
+            bits |= PBMT_IO;
         }
         Self(bits)
     }
@@ -208,6 +225,110 @@ impl PageTableEntry
     pub fn is_present(self) -> bool
     {
         self.0 & VALID != 0
+    }
+}
+
+// ── NAPOT contiguity (Svnapot) ────────────────────────────────────────────────
+// A 64 KiB NAPOT translation is 16 consecutive, identically-attributed 4 KiB
+// leaves whose PPNs are contiguous from a 64 KiB-aligned base: each of the 16
+// PTEs carries N=1 and the size encoding ppn[3:0]=0b1000, and hardware may
+// cache the whole group as one TLB entry. Promotion is applied only to
+// uncacheable (PBMT=IO) user mappings — the MMIO map path is the one producer
+// of eligible phys-contiguous runs — and is a pure hint: every reader below
+// decodes both shapes. A 16-slot group is index-aligned, so it never crosses
+// an L0 table.
+
+/// Svnapot N bit: this leaf is one member of a NAPOT group.
+const NAPOT: u64 = 1 << 63;
+/// Pages per 64 KiB NAPOT group (the only size RVA23 mandates).
+const NAPOT_64K_PAGES: usize = 16;
+/// The 64 KiB size encoding, `ppn[3:0] = 0b1000`, in PTE bit position.
+const NAPOT_64K_PPN: u64 = 0b1000 << 10;
+
+/// Physical address this leaf maps for `virt`, NAPOT-aware: a NAPOT member
+/// repurposes `ppn[3:0]` as the size encoding, so PA bits \[15:12\] come
+/// from the VA instead.
+fn leaf_phys(pte: PageTableEntry, virt: u64) -> u64
+{
+    if pte.0 & NAPOT != 0
+    {
+        (pte.phys_addr() & !0xF000) | (virt & 0xF000)
+    }
+    else
+    {
+        pte.phys_addr()
+    }
+}
+
+/// Rewrite the aligned 16-slot group containing `virt` as one 64 KiB NAPOT
+/// translation iff every slot is a valid PBMT=IO leaf with identical
+/// non-PPN bits and PPNs contiguous from a 64 KiB-aligned base. Otherwise
+/// leaves the table untouched.
+///
+/// Needs no TLB flush: the NAPOT encoding translates every VA in the group
+/// identically to the 16 per-page PTEs it replaces, so a cached
+/// pre-promotion entry is benignly stale. Each slot rewrite is a single
+/// aligned u64 store, so a concurrent lock-free reader (the spurious-fault
+/// walk) sees either shape — both translate its VA identically.
+fn try_promote_napot_64k(l0: &mut [PageTableEntry; 512], virt: u64)
+{
+    let start = vpn_index(0, virt) & !(NAPOT_64K_PAGES - 1);
+    let base = l0[start];
+    // Eligible only for valid, uncacheable (PBMT=IO) leaves not already
+    // promoted, on a 64 KiB-aligned physical base.
+    if base.0 & VALID == 0
+        || base.0 & LEAF_BITS == 0
+        || base.0 & PBMT_MASK != PBMT_IO
+        || base.0 & NAPOT != 0
+    {
+        return;
+    }
+    let base_pa = base.phys_addr();
+    if base_pa & 0xFFFF != 0
+    {
+        return;
+    }
+    let attrs = base.0 & !PPN_MASK;
+    for (i, e) in l0[start..start + NAPOT_64K_PAGES].iter().enumerate()
+    {
+        if e.0 & !PPN_MASK != attrs || e.phys_addr() != base_pa + i as u64 * 4096
+        {
+            return;
+        }
+    }
+    let napot = PageTableEntry(attrs | NAPOT | ((base_pa >> 2) & PPN_MASK) | NAPOT_64K_PPN);
+    for e in &mut l0[start..start + NAPOT_64K_PAGES]
+    {
+        *e = napot;
+    }
+}
+
+/// Restore the 16 per-page PTEs of the NAPOT group containing `virt`
+/// (clear N, rewrite each slot's true `ppn[3:0]`). No-op when the slot is
+/// not a NAPOT member.
+///
+/// Demotion itself needs no flush — every intermediate state translates
+/// identically (same single-store argument as promotion). The caller's
+/// subsequent invalidation of the VA it is about to modify also kills any
+/// cached 64 KiB entry: an `sfence.vma`/`sinval.vma` naming any address
+/// inside a NAPOT range must invalidate a cached translation covering it.
+/// Writers MUST demote before making any slot of a group diverge —
+/// partially zeroing or narrowing inside a live NAPOT group would leave
+/// siblings whose cached group entry still translates the modified VA.
+fn demote_napot_64k(l0: &mut [PageTableEntry; 512], virt: u64)
+{
+    let start = vpn_index(0, virt) & !(NAPOT_64K_PAGES - 1);
+    let member = l0[start];
+    if member.0 & NAPOT == 0
+    {
+        return;
+    }
+    let attrs = member.0 & !PPN_MASK & !NAPOT;
+    let base_pa = member.phys_addr() & !0xF000;
+    for (i, e) in l0[start..start + NAPOT_64K_PAGES].iter_mut().enumerate()
+    {
+        let pa = base_pa + i as u64 * 4096;
+        *e = PageTableEntry(attrs | ((pa >> 2) & PPN_MASK));
     }
 }
 
@@ -469,6 +590,46 @@ pub unsafe fn enable_tagged_tlb() -> usize
 #[cfg(not(test))]
 pub unsafe fn enable_nx() {}
 
+/// Refuse to boot unless the bootloader confirmed the RVA23-required
+/// supervisor paging extensions — Svpbmt, Svinval, Svnapot — on every
+/// enabled hart.
+///
+/// Called once on the BSP. The capability bits are the conservative
+/// per-bit `AND` across all enabled harts, computed by the bootloader's
+/// firmware-table parse, so a BSP-only check covers the machine. After
+/// this gate the paging code uses the three extensions unconditionally,
+/// per the subsystem-gate policy in
+/// [platform-requirements.md](../../../../docs/platform-requirements.md).
+///
+/// Must be called after `platform::capture_kernel_mmio()` and before the
+/// first userspace mapping or TLB shootdown.
+///
+/// # Safety
+/// Must execute in supervisor mode from a single-threaded boot context.
+#[cfg(not(test))]
+pub unsafe fn verify_paging_extensions()
+{
+    let km = crate::platform::kernel_mmio();
+    let required = [
+        (boot_protocol::HART_CAP_SVPBMT, "Svpbmt"),
+        (boot_protocol::HART_CAP_SVINVAL, "Svinval"),
+        (boot_protocol::HART_CAP_SVNAPOT, "Svnapot"),
+    ];
+    for (bit, name) in required
+    {
+        if km.hart_caps & bit == 0
+        {
+            crate::kprintln!("paging: {name} not advertised for every hart");
+            crate::fatal(
+                "RVA23 supervisor paging extensions (Svpbmt, Svinval, Svnapot) \
+                 not advertised for every hart — required; there is no fallback \
+                 path. Check firmware tables (ACPI RHCT / DTB) or the QEMU -cpu \
+                 selection (svpbmt=on,svinval=on,svnapot=on).",
+            );
+        }
+    }
+}
+
 /// Read the current stack pointer (sp register).
 pub fn read_stack_pointer() -> u64
 {
@@ -568,8 +729,6 @@ pub unsafe fn map_user_page(
 ) -> Result<crate::mm::paging::MapOutcome, ()>
 {
     use crate::mm::paging::phys_to_virt;
-    // U bit (bit 4) allows user-mode access.
-    const USER: u64 = 1 << 4;
 
     let top = paging_mode().levels() - 1;
     // The user_va_top gate in the syscall layer keeps user VAs out of the
@@ -584,12 +743,39 @@ pub unsafe fn map_user_page(
             rv_walk_or_alloc(e).map(phys_to_virt)
         })?
     };
+    Ok(install_user_leaf(l0, virt, phys, flags))
+}
+
+/// Shared leaf-install tail of [`map_user_page`] / [`map_user_page_pooled`]:
+/// demote any NAPOT group the slot belongs to (so the prior PTE read for
+/// classification is always a plain per-page leaf), install the new leaf
+/// with the U bit, classify the rewrite, and opportunistically promote the
+/// containing group when the new mapping is uncacheable.
+#[cfg(not(test))]
+fn install_user_leaf(
+    l0: &mut [PageTableEntry; 512],
+    virt: u64,
+    phys: u64,
+    flags: crate::mm::paging::PageFlags,
+) -> crate::mm::paging::MapOutcome
+{
+    // U bit (bit 4) allows user-mode access.
+    const USER: u64 = 1 << 4;
+
+    if l0[vpn_index(0, virt)].0 & NAPOT != 0
+    {
+        demote_napot_64k(l0, virt);
+    }
     let mut pte = PageTableEntry::new_page(phys, flags);
     pte.0 |= USER;
     let prior = l0[vpn_index(0, virt)].0;
     l0[vpn_index(0, virt)] = pte;
-
-    Ok(classify_user_map(prior, pte.0))
+    let outcome = classify_user_map(prior, pte.0);
+    if flags.uncacheable
+    {
+        try_promote_napot_64k(l0, virt);
+    }
+    outcome
 }
 
 /// Walk an existing page table entry or allocate a new child frame
@@ -625,7 +811,6 @@ pub unsafe fn map_user_page_pooled(
 ) -> Result<crate::mm::paging::MapOutcome, ()>
 {
     use crate::mm::paging::phys_to_virt;
-    const USER: u64 = 1 << 4;
 
     let top = paging_mode().levels() - 1;
     // Same kernel-half guard as map_user_page.
@@ -639,12 +824,7 @@ pub unsafe fn map_user_page_pooled(
         })?
     };
 
-    let mut pte = PageTableEntry::new_page(phys, flags);
-    pte.0 |= USER;
-    let prior = l0[vpn_index(0, virt)].0;
-    l0[vpn_index(0, virt)] = pte;
-
-    Ok(classify_user_map(prior, pte.0))
+    Ok(install_user_leaf(l0, virt, phys, flags))
 }
 
 /// Pooled equivalent of [`rv_walk_or_alloc`]: pulls a freshly-zeroed PT
@@ -796,6 +976,89 @@ pub unsafe fn flush_tag(tag: u16)
     }
 }
 
+// ── Batched invalidation (Svinval) ────────────────────────────────────────────
+// The Svinval sequence `sfence.w.inval; sinval.vma …; sfence.inval.ir` is
+// architecturally equivalent to issuing `sfence.vma` for each address at the
+// bracket's position, but lets many per-VA invalidations share the two fence
+// ends. The single-VA primitives above deliberately stay `sfence.vma` — for
+// one address a bracket is three instructions instead of one. Svinval is
+// asserted at boot by `verify_paging_extensions`.
+
+/// Open a batched-invalidation window: order this hart's prior stores
+/// (the PTE rewrites) before the `sinval.vma` invalidations that follow.
+///
+/// # Safety
+/// Must execute in S-mode. Every `inval_page` / `inval_page_tagged` issued
+/// after this call must be followed by [`inval_batch_end`] before the
+/// invalidation is relied upon.
+#[cfg(not(test))]
+pub unsafe fn inval_batch_begin()
+{
+    // SAFETY: sfence.w.inval is an S-mode Svinval fence; no registers
+    // clobbered, no memory operands.
+    unsafe {
+        core::arch::asm!("sfence.w.inval", options(nostack, preserves_flags));
+    }
+}
+
+/// Invalidate `virt` across all ASIDs inside an open batch window
+/// (`sinval.vma virt, zero`).
+///
+/// # Safety
+/// Must execute in S-mode, between [`inval_batch_begin`] and
+/// [`inval_batch_end`]. `virt` need not be mapped.
+#[cfg(not(test))]
+pub unsafe fn inval_page(virt: u64)
+{
+    // SAFETY: sinval.vma mirrors sfence.vma operand semantics (VA in rs1,
+    // x0 rs2 = all ASIDs) but only queues the invalidation; the caller's
+    // bracket fences complete it. Safe for any VA in S-mode.
+    unsafe {
+        core::arch::asm!(
+            "sinval.vma {va}, zero",
+            va = in(reg) virt,
+            options(nostack),
+        );
+    }
+}
+
+/// Invalidate `virt` within ASID `tag` inside an open batch window
+/// (`sinval.vma virt, asid`).
+///
+/// # Safety
+/// Must execute in S-mode, between [`inval_batch_begin`] and
+/// [`inval_batch_end`]. A non-zero `tag` requires tagging enabled.
+#[cfg(not(test))]
+pub unsafe fn inval_page_tagged(virt: u64, tag: u16)
+{
+    // SAFETY: sinval.vma with VA and non-zero ASID queues invalidation of
+    // that leaf within that ASID; bracketed by the caller's fences.
+    unsafe {
+        core::arch::asm!(
+            "sinval.vma {va}, {asid}",
+            va = in(reg) virt,
+            asid = in(reg) u64::from(tag),
+            options(nostack),
+        );
+    }
+}
+
+/// Close a batched-invalidation window: order the queued `sinval.vma`
+/// invalidations before this hart's subsequent implicit references. The
+/// batch's invalidations are architecturally complete when this returns.
+///
+/// # Safety
+/// Must execute in S-mode, paired with a preceding [`inval_batch_begin`].
+#[cfg(not(test))]
+pub unsafe fn inval_batch_end()
+{
+    // SAFETY: sfence.inval.ir is an S-mode Svinval fence; no registers
+    // clobbered, no memory operands.
+    unsafe {
+        core::arch::asm!("sfence.inval.ir", options(nostack, preserves_flags));
+    }
+}
+
 /// Remove a single user-space mapping at `virt` from the page table rooted
 /// at `root_virt`.
 ///
@@ -820,9 +1083,16 @@ pub unsafe fn unmap_user_page(root_virt: u64, virt: u64)
     {
         return;
     };
+    // Demote-first: zeroing one slot of a live NAPOT group would leave
+    // siblings whose cached group entry still translates this VA.
+    if l0[vpn_index(0, virt)].0 & NAPOT != 0
+    {
+        demote_napot_64k(l0, virt);
+    }
     l0[vpn_index(0, virt)] = PageTableEntry(0);
 
-    // SAFETY: virt may now be unmapped; flush_page is safe for any VA.
+    // SAFETY: virt may now be unmapped; flush_page is safe for any VA (and
+    // kills any cached 64 KiB entry covering it).
     unsafe { flush_page(virt) };
 }
 
@@ -910,6 +1180,15 @@ unsafe fn unmap_span(
         let mut va = lo;
         while va < hi
         {
+            // Demote-first: a span edge can cut through a NAPOT group;
+            // zeroing only the in-span members of a live group would leave
+            // out-of-span siblings whose cached 64 KiB entry still
+            // translates the zeroed VAs. The caller's span-wide flush
+            // covers the demoted members it modifies.
+            if table[vpn_index(0, va)].0 & NAPOT != 0
+            {
+                demote_napot_64k(table, va);
+            }
             table[vpn_index(0, va)] = PageTableEntry(0);
             va += PAGE_SIZE as u64;
         }
@@ -1037,6 +1316,14 @@ pub unsafe fn protect_user_page(
     // contract); its reachable child frames are live PT-pool frames.
     let l0 = unsafe { descend_existing(root_virt, virt, top, 0, phys_to_virt) }
         .ok_or(PagingError::NotMapped)?;
+    // Demote-first: a rights change on one slot of a NAPOT group must not
+    // leave the other 15 members claiming a group that no longer exists.
+    // The demoted per-page PTE carries the same rights and PA, so the
+    // classification below is unaffected.
+    if l0[vpn_index(0, virt)].0 & NAPOT != 0
+    {
+        demote_napot_64k(l0, virt);
+    }
     let leaf = &mut l0[vpn_index(0, virt)];
     if !leaf.is_present()
     {
@@ -1049,7 +1336,8 @@ pub unsafe fn protect_user_page(
     new_pte.0 |= USER;
     *leaf = new_pte;
 
-    // SAFETY: virt is mapped; flush_page is safe for any VA.
+    // SAFETY: virt is mapped; flush_page is safe for any VA (and kills any
+    // cached 64 KiB entry covering it).
     unsafe { flush_page(virt) };
     Ok(classify_user_map(prior, new_pte.0))
 }
@@ -1064,7 +1352,9 @@ pub unsafe fn protect_user_page(
 /// (a mega/gigapage leaf) yields `None` rather than a translation. The user
 /// mapping path never installs a large leaf, so this holds for every user
 /// VA — the spurious-fault classifier relies on it. A caller that introduces
-/// user large pages must add a large-leaf branch here.
+/// user large pages must add a large-leaf branch here. NAPOT members are
+/// still level-0 leaves: the returned physical address is decoded per page
+/// ([`leaf_phys`]); the raw PTE bits carry N and the size encoding.
 ///
 /// # Safety
 /// `root_virt` must be the direct-map virtual address of a valid 4 KiB user
@@ -1084,7 +1374,7 @@ pub unsafe fn translate_user_page(root_virt: u64, virt: u64) -> Option<(u64, u64
         return None;
     }
 
-    Some((leaf.phys_addr(), leaf.0))
+    Some((leaf_phys(leaf, virt), leaf.0))
 }
 
 // ── Shootdown-elision classification ──────────────────────────────────────────
@@ -1100,6 +1390,10 @@ pub unsafe fn translate_user_page(root_virt: u64, virt: u64) -> Option<(u64, u64
 fn classify_user_map(prior: u64, new: u64) -> crate::mm::paging::MapOutcome
 {
     use crate::mm::paging::MapOutcome;
+
+    // Writers demote a NAPOT group before rewriting any member, so the
+    // prior PTE is always a plain per-page leaf whose PPN is the true PA.
+    debug_assert!(prior & NAPOT == 0, "classify_user_map on a NAPOT member");
 
     if prior & VALID == 0
     {
@@ -1136,7 +1430,9 @@ fn map_rights_superset(new: u64, prior: u64) -> bool
 /// TLB) only when the live PTE is valid, user-accessible (U), and already
 /// grants the access: a load needs `READ`, a store needs `WRITE`, a fetch
 /// needs `EXECUTE`. The kernel does not make execute-only pages readable (MXR is
-/// kept clear), so each access class checks exactly its own bit.
+/// kept clear), so each access class checks exactly its own bit. The NAPOT N
+/// bit does not participate: a NAPOT member carries the same V/U/R/W/X bits
+/// as the per-page leaf it stands for.
 fn pte_permits_user_access(pte: u64, write: bool, instr: bool) -> bool
 {
     /// U bit — the page is reachable from U-mode.
@@ -1256,6 +1552,170 @@ mod tests
         assert!(pte.0 & READ != 0);
         assert_eq!(pte.0 & WRITE, 0);
         assert!(pte.0 & EXECUTE != 0);
+    }
+
+    #[test]
+    fn new_page_uncacheable_sets_pbmt_io()
+    {
+        let flags = PageFlags {
+            readable: true,
+            writable: true,
+            executable: false,
+            uncacheable: true,
+        };
+        let pte = PageTableEntry::new_page(0x4000, flags);
+        assert_eq!(pte.0 & PBMT_MASK, PBMT_IO);
+        // The PBMT field must not disturb the PPN.
+        assert_eq!(pte.phys_addr(), 0x4000);
+    }
+
+    #[test]
+    fn new_page_cacheable_leaves_pbmt_pma()
+    {
+        let flags = PageFlags {
+            readable: true,
+            writable: true,
+            executable: false,
+            uncacheable: false,
+        };
+        let pte = PageTableEntry::new_page(0x5000, flags);
+        assert_eq!(pte.0 & PBMT_MASK, 0);
+    }
+
+    // ── NAPOT promotion / demotion ────────────────────────────────────────────
+
+    const MMIO_FLAGS: PageFlags = PageFlags {
+        readable: true,
+        writable: true,
+        executable: false,
+        uncacheable: true,
+    };
+
+    /// A level-0 table with `n` consecutive leaves at `start` mapping
+    /// `base_pa + i*4096` with `flags`.
+    fn table_with_run(
+        start: usize,
+        n: usize,
+        base_pa: u64,
+        flags: PageFlags,
+    ) -> [PageTableEntry; 512]
+    {
+        let mut t = [PageTableEntry(0); 512];
+        for i in 0..n
+        {
+            t[start + i] = PageTableEntry::new_page(base_pa + i as u64 * 4096, flags);
+        }
+        t
+    }
+
+    /// VA whose `vpn[0]` is `idx` (level-0 index ↔ VA bits [20:12]).
+    fn va_at(idx: usize) -> u64
+    {
+        (idx as u64) << 12
+    }
+
+    #[test]
+    fn napot_promotion_encodes_group()
+    {
+        let mut t = table_with_run(16, 16, 0x1_0000, MMIO_FLAGS);
+        try_promote_napot_64k(&mut t, va_at(20));
+        let first = t[16];
+        assert_ne!(first.0 & NAPOT, 0);
+        // ppn[3:0] must carry the 64 KiB size encoding.
+        assert_eq!(first.0 & (0xF << 10), NAPOT_64K_PPN);
+        // Every member is bit-identical.
+        for i in 16..32
+        {
+            assert_eq!(t[i].0, first.0);
+        }
+        // Untouched outside the group.
+        assert_eq!(t[15].0, 0);
+        assert_eq!(t[32].0, 0);
+    }
+
+    #[test]
+    fn napot_leaf_phys_reconstructs_all_offsets()
+    {
+        let mut t = table_with_run(0, 16, 0x1_0000, MMIO_FLAGS);
+        try_promote_napot_64k(&mut t, va_at(0));
+        for i in 0..16
+        {
+            assert_eq!(leaf_phys(t[i], va_at(i)), 0x1_0000 + i as u64 * 4096);
+        }
+    }
+
+    #[test]
+    fn napot_demotion_round_trips()
+    {
+        let original = table_with_run(48, 16, 0x3_0000, MMIO_FLAGS);
+        let mut t = original;
+        try_promote_napot_64k(&mut t, va_at(48));
+        assert_ne!(t[48].0 & NAPOT, 0);
+        demote_napot_64k(&mut t, va_at(50));
+        for i in 0..512
+        {
+            assert_eq!(t[i].0, original[i].0);
+        }
+    }
+
+    #[test]
+    fn napot_promotion_refused_for_cacheable_run()
+    {
+        let mut t = table_with_run(
+            16,
+            16,
+            0x1_0000,
+            PageFlags {
+                uncacheable: false,
+                ..MMIO_FLAGS
+            },
+        );
+        let before = t[16].0;
+        try_promote_napot_64k(&mut t, va_at(16));
+        assert_eq!(t[16].0, before);
+    }
+
+    #[test]
+    fn napot_promotion_refused_for_noncontiguous_phys()
+    {
+        let mut t = table_with_run(16, 16, 0x1_0000, MMIO_FLAGS);
+        t[20] = PageTableEntry::new_page(0x9_0000, MMIO_FLAGS);
+        let before = t[16].0;
+        try_promote_napot_64k(&mut t, va_at(16));
+        assert_eq!(t[16].0, before);
+        assert_eq!(t[16].0 & NAPOT, 0);
+    }
+
+    #[test]
+    fn napot_promotion_refused_for_partial_group()
+    {
+        let mut t = table_with_run(16, 15, 0x1_0000, MMIO_FLAGS);
+        try_promote_napot_64k(&mut t, va_at(16));
+        assert_eq!(t[16].0 & NAPOT, 0);
+    }
+
+    #[test]
+    fn napot_promotion_refused_for_unaligned_phys_base()
+    {
+        // Contiguous but starting at a non-64 KiB-aligned PA.
+        let mut t = table_with_run(16, 16, 0x1_1000, MMIO_FLAGS);
+        try_promote_napot_64k(&mut t, va_at(16));
+        assert_eq!(t[16].0 & NAPOT, 0);
+    }
+
+    #[test]
+    fn napot_promotion_refused_for_mixed_rights()
+    {
+        let mut t = table_with_run(16, 16, 0x1_0000, MMIO_FLAGS);
+        t[21] = PageTableEntry::new_page(
+            0x1_0000 + 5 * 4096,
+            PageFlags {
+                writable: false,
+                ..MMIO_FLAGS
+            },
+        );
+        try_promote_napot_64k(&mut t, va_at(16));
+        assert_eq!(t[16].0 & NAPOT, 0);
     }
 
     #[test]

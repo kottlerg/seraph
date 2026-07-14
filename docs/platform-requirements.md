@@ -152,7 +152,8 @@ Each feature is classified per architecture as one of:
 - **AIA — Ssaia, with APLIC and IMSIC** — the interrupt controller. PLIC is unsupported.
 - **Sstc — `stimecmp`** — the supervisor timer.
 - **Svpbmt, Svinval, Svnapot** — page-based memory types, fine-grained fence invalidation, and
-  NAPOT page encodings. Svade is the baseline A/D-bit model.
+  NAPOT page encodings; asserted at paging initialization from the bootloader-confirmed hart
+  capabilities. Svade is the baseline A/D-bit model.
 - **Ssstateen / Smstateen** — state-enable CSRs, required for the hardening posture.
 - **Zkr seed CSR** — the supervisor-accessible hardware entropy source.
 - **`time` CSR (Zicntr)** — the timestamp source.
@@ -179,7 +180,8 @@ Each feature is classified per architecture as one of:
 - **Legacy / embedded RISC-V profiles** — outside the RVA23 floor.
 - **Port-mapped I/O** — RISC-V has no port I/O; all device access is MMIO.
 - **Cache-block-management instructions (Zicbom/Zicboz/Zicbop)** — not used; the kernel assumes
-  cache-coherent DMA.
+  cache-coherent DMA. (Distinct from Svpbmt: the PBMT memory type governs how a hart's own
+  accesses to a mapping behave, not DMA cache coherence.)
 - **Secure Boot, TPM, RTC** — not boot dependencies.
 
 ---

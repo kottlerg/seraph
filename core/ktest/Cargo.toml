@@ -11,6 +11,7 @@ path = "src/main.rs"
 test = false
 
 [dependencies]
+boot-protocol  = { path = "../../abi/boot-protocol" }
 crypto         = { path = "../../shared/crypto" }
 font           = { workspace = true }
 init-protocol  = { path = "../../abi/init-protocol" }

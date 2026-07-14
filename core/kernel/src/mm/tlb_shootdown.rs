@@ -22,12 +22,15 @@
 //! outstanding request — the slot is never shared between concurrent shootdowns
 //! and needs no lock.
 //!
-//! 1. The initiating CPU writes the target root, the virtual address, and the
-//!    set of CPUs that must acknowledge into *its own* slot.
+//! 1. The initiating CPU writes the target root, the virtual address (and
+//!    page count, for range requests), and the set of CPUs that must
+//!    acknowledge into *its own* slot.
 //! 2. It sends TLB shootdown IPIs to those CPUs.
 //! 3. Each target CPU ([`service_shootdowns`]) scans every slot; for any slot
 //!    whose `pending_cpus` still contains its bit, it flushes the requested VA
-//!    and clears its bit.
+//!    or range and clears its bit. Range flushes from all matched slots share
+//!    one arch batched-invalidation window (riscv64 Svinval), and every ack is
+//!    deferred until that window closes.
 //! 4. The initiator spins until its own slot's `pending_cpus` becomes empty.
 //!
 //! There is no global serialization: initiators on different CPUs touch
@@ -69,6 +72,13 @@ use core::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use crate::cpu_mask::{AtomicCpuMask, CpuMask};
 use crate::sched::MAX_CPUS;
 
+/// Largest span (in 4 KiB pages) invalidated per-page rather than by full
+/// flush. Each per-VA invalidation walks the TLB's tags, while a full flush
+/// costs one refill of the CPU's working set — above a few dozen pages the
+/// refill is cheaper (Linux's x86 `tlb_single_page_flush_ceiling` analogue
+/// is 33). Callers with larger spans use the full-flush sentinel.
+pub const RANGE_FLUSH_CEILING_PAGES: usize = 32;
+
 /// Per-CPU TLB shootdown request slot.
 ///
 /// Written only by its owning CPU (the initiator); other CPUs only clear their
@@ -80,6 +90,12 @@ struct TlbShootdownRequest
 
     /// Virtual address to invalidate. `u64::MAX` means full flush.
     flush_va: AtomicU64,
+
+    /// Number of consecutive 4 KiB pages to invalidate starting at
+    /// `flush_va` (ignored on the full-flush sentinel path). A count above
+    /// 1 makes the handler use the arch batched-invalidation window
+    /// (riscv64 Svinval; a plain `invlpg` loop on x86-64).
+    page_count: AtomicU64,
 
     /// Hardware address-space tag (PCID / ASID) the invalidation targets, or `0`
     /// for the untagged path. When non-zero the target CPU invalidates the
@@ -101,6 +117,7 @@ impl TlbShootdownRequest
         Self {
             root_phys: AtomicU64::new(0),
             flush_va: AtomicU64::new(u64::MAX),
+            page_count: AtomicU64::new(1),
             tag: AtomicU16::new(0),
             pending_cpus: AtomicCpuMask::new(),
         }
@@ -133,9 +150,22 @@ pub fn any_pending() -> bool
 /// Service every shootdown request that names this CPU.
 ///
 /// Called from each arch's TLB-shootdown IPI handler. Scans all live slots and,
-/// for each whose `pending_cpus` contains `my_cpu`, flushes the requested VA
-/// (or the whole TLB) and clears this CPU's bit. Idempotent: a re-sent or stray
-/// IPI that finds no matching bit does nothing.
+/// for each whose `pending_cpus` contains `my_cpu`, flushes the requested VA,
+/// VA range, or the whole TLB, then clears this CPU's bit. Idempotent: a
+/// re-sent or stray IPI that finds no matching bit does nothing.
+///
+/// Range requests (`page_count > 1`) from every matched slot share one arch
+/// batched-invalidation window (riscv64 Svinval bracket), so a service pass
+/// that finds several queued ranges pays the two window fences once.
+///
+/// Acknowledgement bits are cleared only after the batch window closes: a
+/// queued `sinval.vma` is not architecturally complete until
+/// `inval_batch_end`'s `sfence.inval.ir` retires, so acking earlier would let
+/// the initiator proceed against a translation this CPU can still use.
+/// Full-flush and single-page acks are deferred to the same point — a pure
+/// (bounded) delay that keeps one ack path. A pending bit set in an
+/// already-scanned slot after the scan is handled by the initiator's resend
+/// ladder, exactly as before.
 ///
 /// # Safety
 /// Must run in IPI-handler context on the CPU identified by `my_cpu`
@@ -143,7 +173,11 @@ pub fn any_pending() -> bool
 pub unsafe fn service_shootdowns(my_cpu: usize)
 {
     let n = (crate::sched::CPU_COUNT.load(Ordering::Relaxed) as usize).min(MAX_CPUS);
-    for req in TLB_REQUESTS.iter().take(n)
+    // Slot indexes serviced this pass (slots are per-CPU, so a CpuMask
+    // indexes them; 64 bytes of stack, independent of request sizes).
+    let mut serviced = CpuMask::empty();
+    let mut batch_open = false;
+    for (slot, req) in TLB_REQUESTS.iter().enumerate().take(n)
     {
         // Acquire: pairs with the initiator's Release store of pending_cpus, so
         // seeing our bit also makes the matching root/va visible below.
@@ -154,36 +188,85 @@ pub unsafe fn service_shootdowns(my_cpu: usize)
         let va = req.flush_va.load(Ordering::Acquire);
         let root = req.root_phys.load(Ordering::Acquire);
         let tag = req.tag.load(Ordering::Acquire);
+        let pages = req.page_count.load(Ordering::Acquire);
         // Both `flush_va == u64::MAX` and `root_phys == 0` are full-flush
-        // sentinels per shootdown()'s contract; either alone selects flush_tlb_all.
-        // A non-zero `tag` targets that PCID/ASID specifically (the initiating
-        // space may no longer be the tag loaded on this CPU); `tag == 0` is the
-        // untagged path. A non-zero tag only exists when tagging is enabled, so
-        // the tagged primitive's precondition holds.
-        // SAFETY: caller guarantees IPI-handler context; the flush primitives are
-        // valid at ring 0 / S-mode. A per-VA flush preserves global kernel
+        // sentinels per shootdown_range()'s contract; either alone selects
+        // flush_tlb_all. A non-zero `tag` targets that PCID/ASID specifically
+        // (the initiating space may no longer be the tag loaded on this CPU);
+        // `tag == 0` is the untagged path. A non-zero tag only exists when
+        // tagging is enabled, so the tagged primitives' precondition holds.
+        // SAFETY: caller guarantees IPI-handler context; the flush primitives
+        // are valid at ring 0 / S-mode. A per-VA flush preserves global kernel
         // entries that a full flush would discard.
         unsafe {
             if va == u64::MAX || root == 0
             {
                 crate::arch::current::paging::flush_tlb_all();
             }
-            else if tag != 0
+            else if pages <= 1
             {
-                crate::arch::current::paging::flush_page_tagged(va, tag);
+                if tag != 0
+                {
+                    crate::arch::current::paging::flush_page_tagged(va, tag);
+                }
+                else
+                {
+                    crate::arch::current::paging::flush_page(va);
+                }
             }
             else
             {
-                crate::arch::current::paging::flush_page(va);
+                if !batch_open
+                {
+                    crate::arch::current::paging::inval_batch_begin();
+                    batch_open = true;
+                }
+                for p in 0..pages
+                {
+                    let pva = va + p * crate::mm::PAGE_SIZE as u64;
+                    if tag != 0
+                    {
+                        crate::arch::current::paging::inval_page_tagged(pva, tag);
+                    }
+                    else
+                    {
+                        crate::arch::current::paging::inval_page(pva);
+                    }
+                }
             }
         }
-        // Release: the flush above is visible before the initiator observes the
-        // acknowledgement.
-        req.pending_cpus.clear_cpu(my_cpu, Ordering::Release);
+        serviced.set(slot);
+    }
+    if batch_open
+    {
+        // SAFETY: paired with the inval_batch_begin above; IPI-handler context.
+        unsafe { crate::arch::current::paging::inval_batch_end() };
+    }
+    // Release: every flush above — including the just-closed batch window — is
+    // visible before any initiator observes its acknowledgement.
+    for slot in serviced.iter()
+    {
+        TLB_REQUESTS[slot]
+            .pending_cpus
+            .clear_cpu(my_cpu, Ordering::Release);
     }
 }
 
-/// Initiate a TLB shootdown for an address space on target CPUs.
+/// Initiate a single-address TLB shootdown for an address space on target
+/// CPUs. Delegates to [`shootdown_range`] with a one-page range.
+///
+/// # Contract / Safety
+/// As [`shootdown_range`].
+// Used by AddressSpace::map_page, unmap_page, protect_page.
+#[allow(dead_code)]
+pub unsafe fn shootdown(root_phys: u64, cpus: &CpuMask, virt: u64, tag: u16)
+{
+    // SAFETY: contract propagates verbatim.
+    unsafe { shootdown_range(root_phys, cpus, virt, 1, tag) };
+}
+
+/// Initiate a TLB shootdown of `pages` consecutive 4 KiB pages starting at
+/// `virt` for an address space on target CPUs.
 ///
 /// Spins until all target CPUs acknowledge by clearing their bit in this CPU's
 /// request slot.
@@ -191,15 +274,18 @@ pub unsafe fn service_shootdowns(my_cpu: usize)
 /// # Contract
 /// - Caller must have called `preempt_disable()` before this function.
 /// - `root_phys` must be a valid page table root physical address or 0 for full flush.
+/// - `virt == u64::MAX` (or `root_phys == 0`) requests a full flush; `pages`
+///   is ignored on that path.
+/// - `pages` must be at least 1 and small enough that the per-page handler
+///   loop stays cheap — callers cap ranges at
+///   [`RANGE_FLUSH_CEILING_PAGES`] and use the full-flush sentinel above it.
 /// - `cpus` must contain only online CPU indices and exclude the current CPU.
 /// - `tag` is the hardware address-space tag (PCID / ASID) to invalidate, or `0`
 ///   for the untagged path. A non-zero `tag` must imply tagging is enabled.
 ///
 /// # Safety
 /// Caller must ensure `root_phys` and `cpus` are valid as described above.
-// Used by AddressSpace::map_page, unmap_page, protect_page.
-#[allow(dead_code)]
-pub unsafe fn shootdown(root_phys: u64, cpus: &CpuMask, virt: u64, tag: u16)
+pub unsafe fn shootdown_range(root_phys: u64, cpus: &CpuMask, virt: u64, pages: u64, tag: u16)
 {
     if cpus.is_empty()
     {
@@ -236,6 +322,7 @@ pub unsafe fn shootdown(root_phys: u64, cpus: &CpuMask, virt: u64, tag: u16)
     // visible before the IPI.
     req.root_phys.store(root_phys, Ordering::Release);
     req.flush_va.store(virt, Ordering::Release);
+    req.page_count.store(pages.max(1), Ordering::Release);
     req.tag.store(tag, Ordering::Release);
     req.pending_cpus.store(cpus, Ordering::Release);
 

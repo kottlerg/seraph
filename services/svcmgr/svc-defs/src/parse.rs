@@ -334,7 +334,7 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
     // The service's own band must cover its starting level, so it can
     // always restore its initial priority. procmgr enforces the same
     // invariant on the wire; rejecting here surfaces the recipe error at
-    // parse time with a line-level diagnostic instead of a spawn failure.
+    // parse time instead of as a spawn failure.
     if let (Some(p), Some(m)) = (priority, sched_max)
         && m < p
     {

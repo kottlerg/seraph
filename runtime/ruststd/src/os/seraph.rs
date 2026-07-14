@@ -1124,7 +1124,8 @@ pub mod process {
         /// reverts to procmgr's policy default, clamped to the child's
         /// band. A level above the spawner's own band ceiling — or above
         /// the child's band — makes procmgr reject the spawn with
-        /// `InvalidInput`.
+        /// `InvalidInput`; a level that does not fit the 5-bit label field
+        /// (> 31) is rejected by `spawn` itself with `InvalidInput`.
         #[stable(feature = "seraph_ext", since = "1.0.0")]
         fn priority(&mut self, level: u8) -> &mut Self;
 
@@ -1132,7 +1133,9 @@ pub mod process {
         /// the child (the `CREATE_BAND_MAX` label field; the child's band
         /// is `[1, level]`). `0` (the default) delegates a copy of the
         /// spawner's own band. A bound above the spawner's ceiling makes
-        /// procmgr reject the spawn with `InvalidInput`.
+        /// procmgr reject the spawn with `InvalidInput`; a bound that does
+        /// not fit the 5-bit label field (> 31) is rejected by `spawn`
+        /// itself with `InvalidInput`.
         #[stable(feature = "seraph_ext", since = "1.0.0")]
         fn sched_max(&mut self, level: u8) -> &mut Self;
     }

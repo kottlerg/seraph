@@ -44,10 +44,12 @@ The struct MUST be `#[repr(C)]` with stable layout. The process MUST check
 The authoritative field list, with per-field doc comments and exact order, is
 [`src/lib.rs`](src/lib.rs) (`struct ProcessInfo`). This README summarises the
 field groups rather than mirroring every field, so the two cannot drift. As of
-`PROCESS_ABI_VERSION` 21 the groups are:
+`PROCESS_ABI_VERSION` 22 the groups are:
 
 - **Process identity** — `version`, `self_thread_cap`, `self_aspace_cap`,
-  `self_cspace_cap`, `sched_control_cap`.
+  `self_cspace_cap`, `sched_control_cap`, `initial_priority` (the level the
+  creator placed the initial thread at; the runtime spawns further threads
+  at the same level).
 - **IPC / bootstrap** — `ipc_buffer_vaddr` (creator-chosen per-process),
   `creator_endpoint_cap`.
 - **Universal service endpoints** — `procmgr_endpoint_cap`, `memmgr_endpoint_cap`,
@@ -89,7 +91,7 @@ protocol on `creator_endpoint_cap`, not through `ProcessInfo`.
 | `self_thread_cap` | Thread capability (Control) |
 | `self_aspace_cap` | AddressSpace capability |
 | `self_cspace_cap` | CSpace capability |
-| `sched_control_cap` | Baseline `SchedControl` cap, band `[1, 20]` (if nonzero) |
+| `sched_control_cap` | Baseline `SchedControl` cap, band `[1, band_max]` chosen by the creator (default a copy of the creator's band; if nonzero) |
 | `creator_endpoint_cap` | Badged send cap back to the creator's bootstrap endpoint (if nonzero) |
 | `memmgr_endpoint_cap` | Badged SEND cap on memmgr's service endpoint (if nonzero) |
 | `procmgr_endpoint_cap` | Badged SEND cap on procmgr's service endpoint (if nonzero) |

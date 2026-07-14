@@ -280,6 +280,20 @@ impl Command {
             ));
         }
 
+        // Reject scheduling values that do not fit the 5-bit wire fields
+        // before anything is acquired: `create_sched_bits` masks to the
+        // field width, so an oversize value would otherwise wrap silently
+        // (e.g. 32 -> 0 = "unspecified") instead of being rejected.
+        // In-range-but-invalid levels (e.g. above the spawner's band) are
+        // procmgr's call and come back as InvalidInput from the reply.
+        let sched_field_max = ipc::procmgr_labels::CREATE_SCHED_FIELD_MASK as u8;
+        if self.priority > sched_field_max || self.sched_max > sched_field_max {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Command priority/sched_max exceeds the create-label field range",
+            ));
+        }
+
         let path_bytes = self.program.as_encoded_bytes();
         if path_bytes.is_empty() {
             return Err(io::Error::from(io::ErrorKind::InvalidFilename));

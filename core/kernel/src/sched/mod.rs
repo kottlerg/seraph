@@ -504,13 +504,19 @@ fn watchdog_tick_and_check()
 ///    legitimate sleepers are claimed (deadline cleared) within one BSP tick.
 /// 2. `wake_in_flight` stuck — a waker claimed the thread but its
 ///    `enqueue_and_wake` never completed. Normally clears in microseconds.
+///    `BlockedOnReply`/`BlockedOnFault` are exempt: those states hold
+///    `wake_in_flight = 1` from block entry to reply as the dealloc gate
+///    (#160), so the flag is steady-state there, not an in-flight wake — a
+///    client parked in a long blocking RPC (e.g. a console read held by its
+///    server until input arrives) would otherwise fire this rule after the
+///    grace window on every idle boot.
 /// 3. `wake_pending` while `Blocked` — a coalesced wake survived a park
 ///    commit that should have consumed it.
 ///
 /// Rule 1 is debounced by its grace window; rules 2 and 3 must additionally
 /// persist across two consecutive scans (~0.5 s apart) so a legitimately
 /// mid-wake observation cannot false-positive. Indefinite waits (endpoint
-/// recv loops) match no rule and never fire.
+/// recv loops, reply waits) match no rule and never fire.
 #[cfg(not(test))]
 fn owed_wake_scan()
 {
@@ -532,9 +538,10 @@ fn owed_wake_scan()
         // SAFETY: t is a registry-walked TCB held stable by the registry
         // lock; plain scalar reads. Torn observations are absorbed by the
         // grace window (rule 1) and the two-scan persistence (rules 2, 3).
-        let (state, tid, dl, wif, wp, started) = unsafe {
+        let (state, ipc, tid, dl, wif, wp, started) = unsafe {
             (
                 (*t).state,
+                (*t).ipc_state,
                 (*t).thread_id,
                 (*t).sleep_deadline,
                 (*t).wake_in_flight
@@ -547,12 +554,19 @@ fn owed_wake_scan()
         {
             return;
         }
+        // Reply/fault waits hold wake_in_flight = 1 for their whole
+        // (possibly indefinite) park as the dealloc gate; rule 2 does not
+        // apply to them.
+        let wif_gated_state = matches!(
+            ipc,
+            thread::IpcThreadState::BlockedOnReply | thread::IpcThreadState::BlockedOnFault
+        );
         let aged = now_tick > started.saturating_add(grace);
         let rule = if dl != 0 && now_tick > dl.saturating_add(grace)
         {
             OWED_RULE_EXPIRED_DEADLINE
         }
-        else if wif == 1 && aged
+        else if wif == 1 && aged && !wif_gated_state
         {
             OWED_RULE_WAKE_IN_FLIGHT
         }

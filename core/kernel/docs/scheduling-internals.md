@@ -663,11 +663,15 @@ claimed, and its deadline cleared, within one BSP tick); `wake_in_flight`
 stuck set (a waker claimed the thread but its `enqueue_and_wake` never
 completed — normally microseconds); and `wake_pending` observed while
 `Blocked` (a coalesced wake survived the park commit that must consume it).
-The deadline rule is debounced by its grace window; the other two must
-persist across two consecutive scans (`OWED_WAKE_LAST`) so a legitimately
-mid-wake observation cannot false-positive. Indefinite waits (endpoint recv
-loops) match no rule. Each park commit stamps `park_started_tick` for the
-age checks.
+The `wake_in_flight` rule exempts `BlockedOnReply` and `BlockedOnFault`:
+those states hold the flag from block entry until the reply as the dealloc
+gate (#160), so it is steady-state there rather than an in-flight wake — a
+client parked in a long blocking RPC (a console read held by its server
+until input arrives) must not fire the rule. The deadline rule is debounced
+by its grace window; the other two must persist across two consecutive
+scans (`OWED_WAKE_LAST`) so a legitimately mid-wake observation cannot
+false-positive. Indefinite waits (endpoint recv loops, reply waits) match
+no rule. Each park commit stamps `park_started_tick` for the age checks.
 
 **3. Timer-heartbeat cross-checks.** Every CPU stamps `TICK_HEARTBEAT[cpu]`
 with `timer::current_tick()` on each `timer_tick` entry (`current_tick`

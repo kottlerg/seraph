@@ -390,6 +390,69 @@ pub fn sched_split_enforces_bands(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
+/// `SYS_CAP_CREATE_THREAD` priority arguments: floor creation needs no
+/// `SchedControl`; every above-floor placement is band-gated at creation.
+///
+/// Rejections: nonzero priority without a `SchedControl` cap; a
+/// non-`SchedControl` cap in the sched slot; the reserved level 31; an
+/// in-band cap asked for an out-of-band level. Accepted: an explicit
+/// in-band level, a band-floor request (`priority = 0` with a cap), and
+/// the unauthorised floor `(0, 0)`.
+pub fn create_priority_args(ctx: &TestContext) -> TestResult
+{
+    use syscall::{cap_create_cspace, cap_create_thread};
+
+    let cs = cap_create_cspace(ctx.memory_base, 0, 4, 16)
+        .map_err(|_| "thread::create_priority_args: cap_create_cspace failed")?;
+
+    if cap_create_thread(ctx.memory_base, ctx.aspace_cap, cs, 0, 5).is_ok()
+    {
+        return Err("create with (sched=0, priority=5) must be rejected");
+    }
+    if cap_create_thread(ctx.memory_base, ctx.aspace_cap, cs, ctx.memory_base, 5).is_ok()
+    {
+        return Err("create with a non-SchedControl sched cap must be rejected");
+    }
+    if cap_create_thread(
+        ctx.memory_base,
+        ctx.aspace_cap,
+        cs,
+        ctx.sched_control_cap,
+        31,
+    )
+    .is_ok()
+    {
+        return Err("create at reserved priority 31 must be rejected");
+    }
+
+    // Derive a full-range copy so the split consumes the copy, not ktest's
+    // shared root cap (same pattern as sched_split_enforces_bands).
+    let root_copy = cap_derive(ctx.sched_control_cap, RIGHTS_ALL)
+        .map_err(|_| "thread::create_priority_args: cap_derive(root) failed")?;
+    let (lower, upper) = sched_split(root_copy, 21)
+        .map_err(|_| "thread::create_priority_args: sched_split failed")?;
+
+    if cap_create_thread(ctx.memory_base, ctx.aspace_cap, cs, upper, 5).is_ok()
+    {
+        return Err("upper band [21,30] must reject creation at 5");
+    }
+
+    let th_explicit = cap_create_thread(ctx.memory_base, ctx.aspace_cap, cs, upper, 25)
+        .map_err(|_| "create at 25 under [21,30] failed")?;
+    let th_band_floor = cap_create_thread(ctx.memory_base, ctx.aspace_cap, cs, lower, 0)
+        .map_err(|_| "create at the [1,20] band floor failed")?;
+    let th_plain_floor = cap_create_thread(ctx.memory_base, ctx.aspace_cap, cs, 0, 0)
+        .map_err(|_| "create at the unauthorised floor failed")?;
+
+    cap_delete(th_explicit).map_err(|_| "cap_delete th_explicit failed")?;
+    cap_delete(th_band_floor).map_err(|_| "cap_delete th_band_floor failed")?;
+    cap_delete(th_plain_floor).map_err(|_| "cap_delete th_plain_floor failed")?;
+    cap_delete(lower).map_err(|_| "cap_delete lower band failed")?;
+    cap_delete(upper).map_err(|_| "cap_delete upper band failed")?;
+    cap_delete(cs).map_err(|_| "cap_delete cs failed")?;
+    Ok(())
+}
+
 // ── SYS_THREAD_SET_AFFINITY ───────────────────────────────────────────────────
 
 /// `thread_set_affinity` with a valid CPU ID succeeds.

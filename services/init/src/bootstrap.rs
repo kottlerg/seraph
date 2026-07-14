@@ -795,7 +795,7 @@ pub fn bootstrap_memmgr(
         syscall::cap_create_aspace(arena.cap, 0, crate::ASPACE_RETYPE_PAGES - 1).ok()?;
     let mm_cspace =
         syscall::cap_create_cspace(arena.cap, 0, crate::CSPACE_RETYPE_PAGES - 1, 8192).ok()?;
-    let mm_thread = syscall::cap_create_thread(arena.cap, mm_aspace, mm_cspace).ok()?;
+    let mm_thread = syscall::cap_create_thread(arena.cap, mm_aspace, mm_cspace, 0, 0).ok()?;
 
     log("created memmgr kernel objects");
     log("loading memmgr ELF segments");
@@ -1493,7 +1493,7 @@ pub fn bootstrap_procmgr(
         syscall::cap_create_aspace(arena.cap, 0, crate::ASPACE_RETYPE_PAGES - 1).ok()?;
     let pm_cspace =
         syscall::cap_create_cspace(arena.cap, 0, crate::CSPACE_RETYPE_PAGES - 1, 8192).ok()?;
-    let pm_thread = syscall::cap_create_thread(arena.cap, pm_aspace, pm_cspace).ok()?;
+    let pm_thread = syscall::cap_create_thread(arena.cap, pm_aspace, pm_cspace, 0, 0).ok()?;
 
     log("created procmgr kernel objects");
     log("loading procmgr ELF segments");

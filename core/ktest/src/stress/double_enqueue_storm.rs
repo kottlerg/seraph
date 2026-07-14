@@ -38,11 +38,12 @@
 //! racing call sites named via the `last_enqueue` breadcrumb.
 //!
 //! Requires ≥ 2 CPUs for the cross-CPU windows; on UP it still exercises the
-//! local wake + churn + dealloc paths.
+//! local wake + churn + dealloc paths (workers run only during the
+//! controller's periodic sleeps — they sit strictly below its priority).
 
 use syscall::{
     cap_copy, cap_create_notification, cap_delete, notification_send, thread_set_affinity,
-    thread_set_priority, thread_yield,
+    thread_set_priority, thread_sleep,
 };
 use syscall_abi::SystemInfoType;
 
@@ -95,11 +96,10 @@ pub fn run(ctx: &TestContext) -> TestResult
     }
 
     // Let every worker reach its `notification_wait` park before the storm —
-    // a wake only drives `enqueue_and_wake` once the target is Blocked.
-    for _ in 0..(NUM_WORKERS * 2)
-    {
-        let _ = thread_yield();
-    }
+    // a wake only drives `enqueue_and_wake` once the target is Blocked. The
+    // controller must block for that: the workers run strictly below its
+    // `INIT_PRIORITY`.
+    let _ = thread_sleep(2);
 
     // ── Phase 1: wake + priority churn ± affinity flips. ─────────────────────
     //
@@ -127,11 +127,12 @@ pub fn run(ctx: &TestContext) -> TestResult
                 let _ = thread_set_affinity(threads[i], target_cpu);
             }
         }
-        // Periodically yield so workers actually run and re-park, keeping the
-        // wake path hot instead of saturating each notification's pending mask.
+        // Periodically sleep so workers actually run and re-park (on the
+        // controller's CPU too), keeping the wake path hot instead of
+        // saturating each notification's pending mask.
         if cycle % 8 == 0
         {
-            let _ = thread_yield();
+            let _ = thread_sleep(1);
         }
     }
 

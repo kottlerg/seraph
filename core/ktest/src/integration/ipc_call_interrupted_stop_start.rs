@@ -28,7 +28,7 @@
 use ipc::IpcMessage;
 use syscall::{
     cap_copy, cap_create_endpoint, cap_create_notification, cap_delete, ipc_buffer_set,
-    notification_send, notification_wait, thread_exit, thread_start, thread_stop, thread_yield,
+    notification_send, notification_wait, thread_exit, thread_sleep, thread_start, thread_stop,
 };
 use syscall_abi::{RIGHTS_RECEIVE, RIGHTS_SEND_GRANT, SyscallError};
 
@@ -49,11 +49,11 @@ const BIT_P2_ARMED: u64 = 1 << 3;
 const BIT_P2_OK: u64 = 1 << 4;
 const BIT_P2_BAD: u64 = 1 << 5;
 
-/// Bounded yields after a client's READY signal so it provably reaches its
-/// park before the stop lands. A stop that lands pre-park stops a Running
-/// thread instead — the restart would then park with no canceller and hang to
-/// the watchdog, so generous slack is cheap insurance.
-const SETTLE_YIELDS: usize = 32;
+/// Wall-clock settle after a client's READY signal so it provably reaches
+/// its park before the stop lands. A stop that lands pre-park stops a
+/// Running thread instead — the restart would then park with no canceller
+/// and hang to the watchdog, so generous slack is cheap insurance.
+const SETTLE_SLEEP_MS: u64 = 20;
 
 static mut CLIENT_STACK: ChildStack = ChildStack::ZERO;
 static mut SERVER_STACK: ChildStack = ChildStack::ZERO;
@@ -91,10 +91,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         .map_err(|_| "integration::ipc_call_interrupted_stop_start: start p1 client failed")?;
 
     wait_for(done, &mut acc, BIT_P1_READY)?;
-    for _ in 0..SETTLE_YIELDS
-    {
-        let _ = thread_yield();
-    }
+    let _ = thread_sleep(SETTLE_SLEEP_MS);
     thread_stop(client.th)
         .map_err(|_| "integration::ipc_call_interrupted_stop_start: p1 thread_stop failed")?;
     thread_start(client.th)

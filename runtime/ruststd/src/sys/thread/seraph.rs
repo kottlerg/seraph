@@ -274,7 +274,7 @@ impl Thread {
                 }
             };
         let thread_cap =
-            match syscall::cap_create_thread(thread_slab, info.self_aspace, info.self_cspace) {
+            match syscall::cap_create_thread(thread_slab, info.self_aspace, info.self_cspace, 0, 0) {
                 Ok(cap) => cap,
                 Err(_) => {
                     let _ = syscall::cap_delete(thread_slab);

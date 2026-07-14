@@ -255,7 +255,9 @@ that budget (per-type rights) is tracked separately.
 A capability granting authority to assign thread priorities within a bounded
 band. Like `Interrupt`/`Mmio`/`IoPort`, it is a **range authority**: the object
 carries a `[min, max]` priority band, and holding the cap authorises setting any
-priority in that band via `SYS_THREAD_SET_PRIORITY`. It carries **no rights bit** —
+priority in that band via `SYS_THREAD_SET_PRIORITY`, or placing a new thread at
+it via `SYS_CAP_CREATE_THREAD`'s priority arguments (creation at the floor,
+`PRIORITY_MIN`, needs no `SchedControl` at all). It carries **no rights bit** —
 presence of the cap plus its band *is* the authority (a band-less or right-less
 `SchedControl` would be inert, so there is nothing to gate). Narrow a band into
 two disjoint children with `SYS_SCHED_SPLIT`; `cap_derive` cannot shrink a band

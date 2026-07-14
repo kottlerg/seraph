@@ -380,9 +380,9 @@ pub fn preempt_isolation(ctx: &TestContext) -> TestResult
     let child_sig_b = cap_copy(sig_b, cs_b, RIGHTS_NOTIFY)
         .map_err(|_| "cap_copy sig_b for fpu::preempt_isolation failed")?;
 
-    let th_a = cap_create_thread(ctx.memory_base, ctx.aspace_cap, cs_a)
+    let th_a = cap_create_thread(ctx.memory_base, ctx.aspace_cap, cs_a, 0, 0)
         .map_err(|_| "cap_create_thread a for fpu::preempt_isolation failed")?;
-    let th_b = cap_create_thread(ctx.memory_base, ctx.aspace_cap, cs_b)
+    let th_b = cap_create_thread(ctx.memory_base, ctx.aspace_cap, cs_b, 0, 0)
         .map_err(|_| "cap_create_thread b for fpu::preempt_isolation failed")?;
 
     let stack_a = ChildStack::top(core::ptr::addr_of!(STACK_A));
@@ -748,7 +748,7 @@ pub fn preempt_isolation_cross_cpu(ctx: &TestContext) -> TestResult
         CROSS_SIG_RESUME.store(child_resume, Ordering::Release);
         CROSS_SIG_DONE.store(child_done, Ordering::Release);
 
-        let th = cap_create_thread(ctx.memory_base, ctx.aspace_cap, cs)
+        let th = cap_create_thread(ctx.memory_base, ctx.aspace_cap, cs, 0, 0)
             .map_err(|_| "cap_create_thread for preempt_isolation_cross_cpu failed")?;
 
         // Pin to CPU 0 initially: child must run and become CPU 0's

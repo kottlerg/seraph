@@ -21,7 +21,7 @@
 use ipc::IpcMessage;
 use syscall::{
     cap_copy, cap_create_endpoint, cap_create_notification, cap_delete, notification_send,
-    notification_wait, thread_exit, thread_yield,
+    notification_wait, thread_exit, thread_sleep,
 };
 
 use crate::{ChildStack, TestContext, TestResult, spawn};
@@ -52,11 +52,12 @@ pub fn run(ctx: &TestContext) -> TestResult
     // arg: ep_slot | (done_slot << 16) | (label << 32)
     let arg_a = u64::from(ep_a) | (u64::from(done_a) << 16) | (1u64 << 32);
     let stack_a = ChildStack::top(core::ptr::addr_of!(STACK_A));
-    // Pin to CPU 0 so yield-based FIFO ordering is reliable under SMP.
+    // Pin to CPU 0 so sleep-based FIFO ordering is reliable under SMP.
     spawn::configure_and_start_pinned(&child_a, caller_entry, stack_a, arg_a, 0)
         .map_err(|_| "multi_caller_ipc_fifo: start A failed")?;
-    // Yield so A runs and blocks on ipc_call before B is started.
-    thread_yield().map_err(|_| "multi_caller_ipc_fifo: yield after A failed")?;
+    // Sleep so A (floor priority, strictly below this thread) runs and
+    // blocks on ipc_call before B is started.
+    thread_sleep(1).map_err(|_| "multi_caller_ipc_fifo: sleep after A failed")?;
 
     // ── Build and start caller B ──────────────────────────────────────────────
     let child_b = spawn::new_child(ctx).map_err(|_| "multi_caller_ipc_fifo: new_child B failed")?;
@@ -68,7 +69,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     let stack_b = ChildStack::top(core::ptr::addr_of!(STACK_B));
     spawn::configure_and_start_pinned(&child_b, caller_entry, stack_b, arg_b, 0)
         .map_err(|_| "multi_caller_ipc_fifo: start B failed")?;
-    thread_yield().map_err(|_| "multi_caller_ipc_fifo: yield after B failed")?;
+    thread_sleep(1).map_err(|_| "multi_caller_ipc_fifo: sleep after B failed")?;
 
     // ── Build and start caller C ──────────────────────────────────────────────
     let child_c = spawn::new_child(ctx).map_err(|_| "multi_caller_ipc_fifo: new_child C failed")?;
@@ -80,7 +81,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     let stack_c = ChildStack::top(core::ptr::addr_of!(STACK_C));
     spawn::configure_and_start_pinned(&child_c, caller_entry, stack_c, arg_c, 0)
         .map_err(|_| "multi_caller_ipc_fifo: start C failed")?;
-    thread_yield().map_err(|_| "multi_caller_ipc_fifo: yield after C failed")?;
+    thread_sleep(1).map_err(|_| "multi_caller_ipc_fifo: sleep after C failed")?;
 
     // ── Drain send queue in FIFO order ────────────────────────────────────────
     let reply = IpcMessage::new(0);

@@ -60,9 +60,11 @@ pub const AFFINITY_ANY: u32 = 0xFFFF_FFFF;
 
 /// Priority assigned to the init process.
 ///
-/// Higher than all idle threads (0) and general userspace (1–14); below the
-/// reserved high-priority level (31).
-pub const INIT_PRIORITY: u8 = 15;
+/// The top settable level (`PRIORITY_MAX`): init is the root of all userspace
+/// authority and nothing may preempt it. Every other thread's level is
+/// assigned by userspace policy through `SchedControl` bands; only the
+/// reserved level (31) sits above.
+pub const INIT_PRIORITY: u8 = 30;
 
 // ── Per-CPU dynamic storage ───────────────────────────────────────────────────
 
@@ -4472,7 +4474,7 @@ pub fn enter() -> !
 {
     use crate::arch::current::trap_frame::TrapFrame;
 
-    // Dequeue the highest-priority ready thread (init, at INIT_PRIORITY=15).
+    // Dequeue the highest-priority ready thread (init, at INIT_PRIORITY).
     // SAFETY: single-threaded boot; BSP scheduler slot exclusively owned; tcb is
     // validated non-null before dereference; state field is always valid.
     let init_tcb = unsafe {

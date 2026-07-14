@@ -59,7 +59,7 @@
 use ipc::IpcMessage;
 use syscall::{
     cap_copy, cap_create_endpoint, cap_create_notification, cap_delete, ipc_buffer_set,
-    notification_send, notification_wait, thread_exit, thread_yield,
+    notification_send, notification_wait, thread_exit, thread_sleep,
 };
 use syscall_abi::{RIGHTS_RECEIVE, RIGHTS_SEND_GRANT, SyscallError, SystemInfoType};
 
@@ -91,10 +91,6 @@ const BIT_CLIENT_BAD: u64 = 1 << 2;
 /// short window after it signals armed so the `cap_delete` lands while the
 /// reply binding is on a still-running server (the harder interleaving).
 const SERVER_SPIN: u32 = 200;
-
-/// Bound on controller yields used to let the client reach `ipc_call` and park
-/// on the endpoint send queue before the server receives it.
-const SETTLE_YIELDS: usize = 8;
 
 /// A page-aligned 4 KiB IPC buffer page. The server and client run concurrently
 /// on different CPUs and each issues IPC, so they must not share one buffer page
@@ -165,11 +161,9 @@ pub fn run(ctx: &TestContext) -> TestResult
         .map_err(|_| "stress::cap_delete_reply_wake: start client failed")?;
 
         // Let the client reach `ipc_call` and park on the endpoint send queue
-        // before the server receives it.
-        for _ in 0..SETTLE_YIELDS
-        {
-            let _ = thread_yield();
-        }
+        // before the server receives it (the children run strictly below
+        // this thread's priority, so it must block).
+        let _ = thread_sleep(1);
 
         // ── Server child: RECEIVE on ep, signal on done. ────────────────────
         let server = spawn::new_child(ctx)

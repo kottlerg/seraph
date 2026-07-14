@@ -24,7 +24,7 @@
 //! double-link, stale-link UAF, or magic-cookie corruption surfaces as a
 //! kernel debug-assert / panic that the harness reports as FAIL.
 
-use syscall::{cap_delete, thread_set_affinity, thread_set_priority, thread_yield};
+use syscall::{cap_delete, thread_set_affinity, thread_set_priority, thread_sleep};
 use syscall_abi::SystemInfoType;
 
 use crate::{ChildStack, TestContext, TestResult, spawn};
@@ -54,12 +54,10 @@ pub fn run(ctx: &TestContext) -> TestResult
         cspaces[i] = child.cs;
     }
 
-    // Yield so workers reach Ready / Running before the contention phase —
-    // priority placement only matters once they have been on a queue.
-    for _ in 0..(NUM_WORKERS * 2)
-    {
-        let _ = thread_yield();
-    }
+    // Sleep so workers (created at the floor, strictly below this thread)
+    // reach Ready / Running before the contention phase — priority placement
+    // only matters once they have been on a queue.
+    let _ = thread_sleep(2);
 
     // ── Phase 1: priority churn ± affinity flips. ────────────────────────
     //
@@ -85,10 +83,12 @@ pub fn run(ctx: &TestContext) -> TestResult
                 let target_cpu = (i_u32 + cycle_u32) % cpu_mod;
                 let _ = thread_set_affinity(th, target_cpu);
             }
-            if cycle % 8 == 0
-            {
-                let _ = thread_yield();
-            }
+        }
+        // Periodically sleep so workers actually run between churn rounds
+        // (they sit strictly below the controller's priority).
+        if cycle % 8 == 0
+        {
+            let _ = thread_sleep(1);
         }
     }
 
@@ -112,12 +112,10 @@ pub fn run(ctx: &TestContext) -> TestResult
         let i_u32 = u32::try_from(i).unwrap_or(0);
         let target_cpu = (i_u32 + 1) % cpu_mod;
         let _ = thread_set_affinity(threads[i], target_cpu);
-        // Yield so the pinned worker migrates to and starts running on the
-        // remote CPU before we churn its priority and delete it.
-        for _ in 0..4
-        {
-            let _ = thread_yield();
-        }
+        // Sleep so the pinned worker migrates to and starts running on the
+        // remote CPU before we churn its priority and delete it (the remote
+        // CPU dispatches it on its own; the sleep supplies wall time).
+        let _ = thread_sleep(1);
         let _ = thread_set_priority(threads[i], 5, ctx.sched_control_cap);
         let _ = thread_set_priority(threads[i], 11, ctx.sched_control_cap);
         cap_delete(threads[i])

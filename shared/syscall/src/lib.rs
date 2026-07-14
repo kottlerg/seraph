@@ -924,29 +924,43 @@ pub fn cap_create_cspace(
 /// Retype a Memory cap into a new Thread bound to `aspace_cap` and
 /// `cspace_cap`. Returns the `CSpace` slot index of the new Thread cap.
 ///
-/// `memory_cap` must carry `Rights::RETYPE` and have at least 5 pages of
-/// `available_bytes` (4 kstack pages plus 1 page for the wrapper and
-/// TCB; see `cap::retype::dispatch_for(Thread)`).
+/// `memory_cap` must carry `Rights::RETYPE` and have at least 6 pages of
+/// `available_bytes` (4 kstack pages, 1 page for the wrapper and TCB,
+/// 1 FPU/SIMD save-area page; see `cap::retype::dispatch_for(Thread)`).
+///
+/// Creation priority: with `sched_cap == 0`, `priority` must also be 0 and
+/// the thread is created at `PRIORITY_MIN` (floor-only creation needs no
+/// scheduling authority). With a `SchedControl` cap, `priority == 0` selects
+/// the cap's band floor; a nonzero `priority` must lie within the cap's
+/// `[min, max]` band.
 ///
 /// # Errors
 /// Returns a negative `i64` error code if any cap is invalid, the Memory
-/// cap lacks `RETYPE` or sufficient `available_bytes`, or the caller's
-/// `CSpace` is full.
+/// cap lacks `RETYPE` or sufficient `available_bytes`, the priority is
+/// outside the `SchedControl` band (or nonzero without one), or the
+/// caller's `CSpace` is full.
 // cast_possible_truncation, cast_sign_loss: ret is a non-negative CSpace slot index
 // guaranteed to fit in u32 (max CSpace size is 14336).
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 #[inline]
-pub fn cap_create_thread(memory_cap: u32, aspace_cap: u32, cspace_cap: u32) -> Result<u32, i64>
+pub fn cap_create_thread(
+    memory_cap: u32,
+    aspace_cap: u32,
+    cspace_cap: u32,
+    sched_cap: u32,
+    priority: u8,
+) -> Result<u32, i64>
 {
-    // SAFETY: syscall3 issues raw syscall instruction; memory_cap, aspace_cap, and
-    // cspace_cap are cap indices passed as u64; kernel validates caps, retypes,
-    // returns slot index.
+    // SAFETY: syscall5 issues a raw syscall instruction; all arguments are
+    // scalar cap indices / a priority level; the kernel validates them.
     let ret = unsafe {
-        syscall3(
+        syscall5(
             SYS_CAP_CREATE_THREAD,
             u64::from(memory_cap),
             u64::from(aspace_cap),
             u64::from(cspace_cap),
+            u64::from(sched_cap),
+            u64::from(priority),
         )
     };
     if ret < 0 { Err(ret) } else { Ok(ret as u32) }

@@ -515,6 +515,8 @@ CSpace.
 | 0 | `memory_cap` | Memory capability (Retype rights); supplies the thread's kernel stack, TCB, and FPU save area |
 | 1 | `aspace_cap` | Address space capability (Map rights) the thread executes in |
 | 2 | `cspace_cap` | CSpace capability (Insert rights) the thread is bound to |
+| 3 | `sched_cap` | `SchedControl` capability governing the creation priority, or 0 |
+| 4 | `priority` | Initial priority, or 0 |
 
 **Return:** `rax`/`a0`: new thread capability (Control + Observe rights) on success;
 `SyscallError` on failure.
@@ -522,17 +524,22 @@ CSpace.
 The thread is created in the `Created` state; it does not begin execution until
 `SYS_THREAD_START` is called. The entry point, stack pointer, argument register, and
 TLS base are not set here — they are supplied by `SYS_THREAD_CONFIGURE` before start.
-Creation takes no priority argument — the thread starts at the default priority
-(`INIT_PRIORITY`) and is re-prioritised, if needed, via `SYS_THREAD_SET_PRIORITY`
-(which requires a `SchedControl` cap).
+The creation priority is stated at creation: with `sched_cap` = 0, `priority` must
+also be 0 and the thread is created at the floor (`PRIORITY_MIN`) — floor-only
+creation needs no scheduling authority. With a `SchedControl` cap, `priority` = 0
+selects the cap's band floor (`min`), and a nonzero `priority` must lie within the
+cap's `[min, max]` band. Later changes go through `SYS_THREAD_SET_PRIORITY`.
 
 **Capability requirements:** `memory_cap` (Retype), `aspace_cap` (Map), `cspace_cap`
-(Insert). Map is intentionally reused for `aspace_cap`: a process that can modify an
+(Insert), and — only to create above the floor — `sched_cap` (presence, band covering
+`priority`). Map is intentionally reused for `aspace_cap`: a process that can modify an
 address space's mappings is inherently trusted to create threads that execute within it.
 
 **Errors:** `InvalidCapability`, `InsufficientRights` (a source cap lacks Retype/Map/Insert
-respectively), `OutOfMemory` (Memory cap region or slot-page pool exhausted),
-`QuotaExceeded` (caller's CSpace at slot quota).
+respectively, or `priority` is outside `sched_cap`'s band), `InvalidArgument` (nonzero
+`priority` without a `SchedControl` cap, or `priority` > `PRIORITY_MAX`), `OutOfMemory`
+(Memory cap region or slot-page pool exhausted), `QuotaExceeded` (caller's CSpace at slot
+quota).
 
 ---
 

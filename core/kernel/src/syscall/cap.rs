@@ -827,8 +827,17 @@ pub fn sys_cap_create_cspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
 /// `SYS_CAP_CREATE_THREAD` (10): create a new Thread object.
 ///
-/// arg0 = `AddressSpace` cap index (must have MAP).
-/// arg1 = `CSpace` cap index (must have INSERT).
+/// arg0 = Memory cap index (must have RETYPE); supplies the 6-page Thread slot.
+/// arg1 = `AddressSpace` cap index (must have MAP).
+/// arg2 = `CSpace` cap index (must have INSERT).
+/// arg3 = `SchedControl` cap index, or 0.
+/// arg4 = initial priority, or 0.
+///
+/// Creation priority: with arg3 = 0, arg4 must also be 0 and the thread is
+/// created at `PRIORITY_MIN` — floor-only creation needs no scheduling
+/// authority. With a `SchedControl` cap, arg4 = 0 selects the cap's band
+/// floor (`min`); a nonzero arg4 must lie within the cap's `[min, max]`
+/// band. There is no ambient priority authority above the floor.
 ///
 /// Allocates a kernel stack and a TCB in `Created` state, bound to the
 /// provided address space and `CSpace`. Inserts a cap with `CONTROL | OBSERVE`
@@ -838,7 +847,9 @@ pub fn sys_cap_create_cspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
     use crate::arch::current::trap_frame::TrapFrame as ArchTF;
-    use crate::cap::object::{KernelObjectHeader, MemoryObject, ObjectType, ThreadObject};
+    use crate::cap::object::{
+        KernelObjectHeader, MemoryObject, ObjectType, SchedControlObject, ThreadObject,
+    };
     use crate::cap::retype::{dispatch_for, retype_allocate, retype_free};
     use crate::cap::slot::{CapTag, Rights};
     use crate::ipc::message::Message;
@@ -846,8 +857,9 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     use crate::mm::paging::phys_to_virt;
     use crate::sched::alloc_thread_id;
     use crate::sched::thread::{IpcThreadState, ThreadControlBlock, ThreadState};
-    use crate::sched::{AFFINITY_ANY, INIT_PRIORITY, KERNEL_STACK_PAGES, TIME_SLICE_TICKS};
+    use crate::sched::{AFFINITY_ANY, KERNEL_STACK_PAGES, TIME_SLICE_TICKS};
     use core::ptr::NonNull;
+    use syscall::{PRIORITY_MAX, PRIORITY_MIN};
 
     // TRAMPOLINE_FRAME_SIZE: reserved gap between trampoline's starting RSP and the
     // TrapFrame base. 512 bytes is sufficient for the minimal C frame.
@@ -862,6 +874,12 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     #[allow(clippy::cast_possible_truncation)]
     // cast_possible_truncation: Seraph targets 64-bit only; cap slot indices fit in u32.
     let cs_idx = tf.arg(2) as u32;
+    #[allow(clippy::cast_possible_truncation)]
+    // cast_possible_truncation: Seraph targets 64-bit only; cap slot indices fit in u32.
+    let sched_idx = tf.arg(3) as u32;
+    // Kept as u64 until range-checked: an `as u8` here would wrap 256 to 0
+    // and silently select the band floor.
+    let priority_arg = tf.arg(4);
 
     // SAFETY: syscall entry ensures current_tcb() returns active thread's TCB.
     let tcb = unsafe { current_tcb() };
@@ -876,8 +894,8 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         return Err(SyscallError::InvalidCapability);
     }
 
-    // Resolve the source Memory cap; consumes 5 retype-pages (4 kstack +
-    // 1 wrapper/TCB).
+    // Resolve the source Memory cap; consumes 6 retype-pages (4 kstack +
+    // 1 wrapper/TCB + 1 FPU/SIMD save area).
     // SAFETY: caller_cspace validated non-null above.
     let memory_slot_ref =
         unsafe { super::lookup_cap(caller_cspace, memory_idx, CapTag::Memory, Rights::RETYPE)? };
@@ -911,6 +929,49 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         #[allow(clippy::cast_ptr_alignment)]
         let cs_obj = unsafe { &*(obj.as_ptr().cast::<CSpaceKernelObject>()) };
         cs_obj.cspace
+    };
+
+    // Resolve the creation priority (validated before any allocation).
+    let creation_priority = if sched_idx == 0
+    {
+        if priority_arg != 0
+        {
+            return Err(SyscallError::InvalidArgument);
+        }
+        PRIORITY_MIN
+    }
+    else
+    {
+        // Presence-only cap — no rights bit to check.
+        // SAFETY: caller_cspace validated non-null above.
+        let sched_slot = unsafe {
+            super::lookup_cap(caller_cspace, sched_idx, CapTag::SchedControl, Rights::NONE)
+        }?;
+        let sched_obj = sched_slot.object.ok_or(SyscallError::InvalidCapability)?;
+        // cast_ptr_alignment: header at offset 0 of SchedControlObject; allocator
+        // guarantees alignment.
+        // SAFETY: tag confirmed SchedControl; pointer is a valid SchedControlObject.
+        #[allow(clippy::cast_ptr_alignment)]
+        let sched = unsafe { &*(sched_obj.as_ptr().cast::<SchedControlObject>()) };
+        if priority_arg == 0
+        {
+            sched.min
+        }
+        else
+        {
+            if priority_arg > u64::from(PRIORITY_MAX)
+            {
+                return Err(SyscallError::InvalidArgument);
+            }
+            #[allow(clippy::cast_possible_truncation)]
+            // cast_possible_truncation: bounded by PRIORITY_MAX above.
+            let priority = priority_arg as u8;
+            if priority < sched.min || priority > sched.max
+            {
+                return Err(SyscallError::InsufficientRights);
+            }
+            priority
+        }
     };
 
     // Reserve the 6-page slot from the source Memory cap. Layout:
@@ -973,7 +1034,7 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             tcb_ptr,
             ThreadControlBlock {
                 state: ThreadState::Created,
-                priority: INIT_PRIORITY,
+                priority: creation_priority,
                 slice_remaining: TIME_SLICE_TICKS,
                 cpu_affinity: AFFINITY_ANY,
                 preferred_cpu: 0,

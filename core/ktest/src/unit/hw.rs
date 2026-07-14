@@ -149,7 +149,7 @@ pub fn ioport_bind(ctx: &TestContext) -> TestResult
     {
         let cs = cap_create_cspace(ctx.memory_base, 0, 4, 8)
             .map_err(|_| "create_cspace for ioport_bind test failed")?;
-        let th = cap_create_thread(ctx.memory_base, ctx.aspace_cap, cs)
+        let th = cap_create_thread(ctx.memory_base, ctx.aspace_cap, cs, 0, 0)
             .map_err(|_| "cap_create_thread for ioport_bind test failed")?;
 
         let max_slots = if let Ok(n) =

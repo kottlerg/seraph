@@ -60,7 +60,7 @@
 use ipc::IpcMessage;
 use syscall::{
     cap_copy, cap_create_endpoint, cap_create_notification, cap_delete, ipc_buffer_set,
-    notification_send, notification_wait, thread_exit, thread_stop, thread_yield,
+    notification_send, notification_wait, thread_exit, thread_sleep, thread_stop,
 };
 use syscall_abi::{RIGHTS_RECEIVE, RIGHTS_SEND_GRANT, SystemInfoType};
 
@@ -85,10 +85,6 @@ const BIT_CLIENT_WOKE: u64 = 1 << 1;
 /// short window after it signals armed so the controller's race lands while the
 /// TCB still exists.
 const SERVER_SPIN: u32 = 200;
-
-/// Bound on controller yields used to let a freshly started child reach its
-/// blocking point before the next step.
-const SETTLE_YIELDS: usize = 8;
 
 /// A page-aligned 4 KiB IPC buffer page (`MSG_DATA_WORDS_MAX`-wide, like
 /// ktest's own `IPC_BUF`). One per concurrent child.
@@ -162,11 +158,9 @@ pub fn run(ctx: &TestContext) -> TestResult
         .map_err(|_| "stress::stop_reply_race: start client failed")?;
 
         // Let the client reach `ipc_call` and park on the endpoint send queue
-        // before the server receives it.
-        for _ in 0..SETTLE_YIELDS
-        {
-            let _ = thread_yield();
-        }
+        // before the server receives it (the children run strictly below
+        // this thread's priority, so it must block).
+        let _ = thread_sleep(1);
 
         // ── Server child: RECEIVE on ep, signal on done. ────────────────────
         let server = spawn::new_child(ctx)
@@ -202,10 +196,9 @@ pub fn run(ctx: &TestContext) -> TestResult
         }
         armed_cycles += 1;
 
-        // A couple more yields so the server is at/just-past recv and into its
-        // short busy-spin (TCB still live) when the race fires.
-        let _ = thread_yield();
-        let _ = thread_yield();
+        // A little more wall time so the server is at/just-past recv and into
+        // its short busy-spin (TCB still live) when the race fires.
+        let _ = thread_sleep(1);
 
         // ── The race. ───────────────────────────────────────────────────────
         //

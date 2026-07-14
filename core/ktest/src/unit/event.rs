@@ -13,7 +13,7 @@
 use syscall::{
     cap_copy, cap_create_notification, cap_delete, event_post, event_queue_create, event_recv,
     event_recv_timeout, event_try_recv, notification_send, notification_wait, system_info,
-    thread_exit, thread_sleep, thread_yield,
+    thread_exit, thread_sleep,
 };
 use syscall_abi::{SyscallError, SystemInfoType};
 
@@ -115,8 +115,10 @@ pub fn recv_blocks_until_post(ctx: &TestContext) -> TestResult
     crate::spawn::configure_and_start(&child, recv_and_report_entry, stack_top, child_arg)
         .map_err(|_| "configure_and_start failed")?;
 
-    // Yield to let the child run and block on event_recv (queue is empty).
-    thread_yield().map_err(|_| "thread_yield failed")?;
+    // Sleep so the child (created at the floor priority, strictly below
+    // this thread's INIT_PRIORITY) runs and blocks on event_recv (queue is
+    // empty).
+    thread_sleep(1).map_err(|_| "thread_sleep failed")?;
 
     // Post a value — the blocked child wakes and receives it.
     event_post(eq, 0x42).map_err(|_| "event_post failed")?;

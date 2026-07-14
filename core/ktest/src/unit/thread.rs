@@ -390,6 +390,69 @@ pub fn sched_split_enforces_bands(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
+/// `SYS_CAP_CREATE_THREAD` priority arguments: floor creation needs no
+/// `SchedControl`; every above-floor placement is band-gated at creation.
+///
+/// Rejections: nonzero priority without a `SchedControl` cap; a
+/// non-`SchedControl` cap in the sched slot; the reserved level 31; an
+/// in-band cap asked for an out-of-band level. Accepted: an explicit
+/// in-band level, a band-floor request (`priority = 0` with a cap), and
+/// the unauthorised floor `(0, 0)`.
+pub fn create_priority_args(ctx: &TestContext) -> TestResult
+{
+    use syscall::{cap_create_cspace, cap_create_thread};
+
+    let cs = cap_create_cspace(ctx.memory_base, 0, 4, 16)
+        .map_err(|_| "thread::create_priority_args: cap_create_cspace failed")?;
+
+    if cap_create_thread(ctx.memory_base, ctx.aspace_cap, cs, 0, 5).is_ok()
+    {
+        return Err("create with (sched=0, priority=5) must be rejected");
+    }
+    if cap_create_thread(ctx.memory_base, ctx.aspace_cap, cs, ctx.memory_base, 5).is_ok()
+    {
+        return Err("create with a non-SchedControl sched cap must be rejected");
+    }
+    if cap_create_thread(
+        ctx.memory_base,
+        ctx.aspace_cap,
+        cs,
+        ctx.sched_control_cap,
+        31,
+    )
+    .is_ok()
+    {
+        return Err("create at reserved priority 31 must be rejected");
+    }
+
+    // Derive a full-range copy so the split consumes the copy, not ktest's
+    // shared root cap (same pattern as sched_split_enforces_bands).
+    let root_copy = cap_derive(ctx.sched_control_cap, RIGHTS_ALL)
+        .map_err(|_| "thread::create_priority_args: cap_derive(root) failed")?;
+    let (lower, upper) = sched_split(root_copy, 21)
+        .map_err(|_| "thread::create_priority_args: sched_split failed")?;
+
+    if cap_create_thread(ctx.memory_base, ctx.aspace_cap, cs, upper, 5).is_ok()
+    {
+        return Err("upper band [21,30] must reject creation at 5");
+    }
+
+    let th_explicit = cap_create_thread(ctx.memory_base, ctx.aspace_cap, cs, upper, 25)
+        .map_err(|_| "create at 25 under [21,30] failed")?;
+    let th_band_floor = cap_create_thread(ctx.memory_base, ctx.aspace_cap, cs, lower, 0)
+        .map_err(|_| "create at the [1,20] band floor failed")?;
+    let th_plain_floor = cap_create_thread(ctx.memory_base, ctx.aspace_cap, cs, 0, 0)
+        .map_err(|_| "create at the unauthorised floor failed")?;
+
+    cap_delete(th_explicit).map_err(|_| "cap_delete th_explicit failed")?;
+    cap_delete(th_band_floor).map_err(|_| "cap_delete th_band_floor failed")?;
+    cap_delete(th_plain_floor).map_err(|_| "cap_delete th_plain_floor failed")?;
+    cap_delete(lower).map_err(|_| "cap_delete lower band failed")?;
+    cap_delete(upper).map_err(|_| "cap_delete upper band failed")?;
+    cap_delete(cs).map_err(|_| "cap_delete cs failed")?;
+    Ok(())
+}
+
 // ── SYS_THREAD_SET_AFFINITY ───────────────────────────────────────────────────
 
 /// `thread_set_affinity` with a valid CPU ID succeeds.
@@ -574,12 +637,13 @@ pub fn affinity_bind_cpu1(ctx: &TestContext) -> TestResult
 ///    this, CPU 0 may be idle when `thread_start(T)` enqueues T, and the
 ///    wake-IPI lets CPU 0 dispatch T (the only Ready thread there) before
 ///    the active-migration call.
-/// 2. **T at priority 1 (below the parent's `INIT_PRIORITY` of 15).**
-///    Both the harness and any thread minted via `cap_create_thread`
-///    default to `INIT_PRIORITY`. Without this step, same-priority FIFO
-///    would let a timer-driven `schedule()` re-enqueue parent at the tail
-///    and dispatch T at the head. Strict-lower priority guarantees CPU 0's
-///    `dequeue_highest` always returns parent, leaving T queued.
+/// 2. **T at priority 1 (below the parent's `INIT_PRIORITY` of 30).**
+///    `cap_create_thread` creates at the floor (`PRIORITY_MIN` = 1) unless
+///    a `SchedControl`-validated level is passed, while the harness runs at
+///    `INIT_PRIORITY`; the explicit set below keeps the invariant stated
+///    rather than inherited from the creation default. Strict-lower
+///    priority guarantees CPU 0's `dequeue_highest` always returns parent,
+///    leaving T queued.
 ///
 /// Together these make `sys_thread_set_affinity` deterministically observe
 /// `state == Ready` for T on CPU 0, exercising `migrate_ready_thread`. When
@@ -628,11 +692,11 @@ fn affinity_migrate_ready_queued_body(ctx: &TestContext) -> TestResult
     let child_sig = cap_copy(sig, child.cs, RIGHTS_NOTIFY)
         .map_err(|_| "cap_copy for affinity_migrate_ready_queued failed")?;
 
-    // Priority 1 (strict-lower than the parent's INIT_PRIORITY of 15) so
+    // Priority 1 (strict-lower than the parent's INIT_PRIORITY of 30) so
     // CPU 0's `dequeue_highest` always selects the parent over T while
-    // both are Ready/Running there. Setting any priority needs a SchedControl
-    // cap covering the level; ktest's root band [1, PRIORITY_MAX] covers 1.
-    // Must be set before `thread_start`.
+    // both are Ready/Running there. Creation already lands at the floor;
+    // the explicit set keeps the invariant stated. Must precede
+    // `thread_start`.
     thread_set_priority(child.th, 1, ctx.sched_control_cap)
         .map_err(|_| "thread_set_priority(1) for affinity_migrate_ready_queued failed")?;
 
@@ -648,7 +712,7 @@ fn affinity_migrate_ready_queued_body(ctx: &TestContext) -> TestResult
     .map_err(|_| "thread::affinity_migrate_ready_queued: configure_and_start_pinned failed")?;
 
     // T is Ready, queued on CPU 0 at priority 1; the parent is Running on
-    // CPU 0 at INIT_PRIORITY=15 (pinned by the outer wrapper), so no
+    // CPU 0 at INIT_PRIORITY (pinned by the outer wrapper), so no
     // scheduling event can dispatch T here. Switch T's affinity to CPU 1
     // — the active-migration path must dequeue T from CPU 0 and re-enqueue
     // it on CPU 1.
@@ -724,13 +788,16 @@ pub fn affinity_migrate_running(ctx: &TestContext) -> TestResult
     )
     .map_err(|_| "thread::affinity_migrate_running: configure_and_start_pinned failed")?;
 
-    // Wait until T has been scheduled on CPU 1 and reported its CPU.
-    let mut spins: u32 = 0;
+    // Wait until T has been scheduled on CPU 1 and reported its CPU. Sleep
+    // between polls: T runs strictly below this thread's priority, so after
+    // the migration below it can only run on a CPU this thread has vacated —
+    // a yield would never cede to it.
+    let mut polls: u32 = 0;
     while MIGRATE_OBSERVED_CPU.load(Ordering::Relaxed) != 1
     {
-        syscall::thread_yield().ok();
-        spins = spins.saturating_add(1);
-        if spins > 200_000
+        syscall::thread_sleep(1).ok();
+        polls = polls.saturating_add(1);
+        if polls > 2_000
         {
             MIGRATE_SHOULD_EXIT.store(1, Ordering::Relaxed);
             return Err("T never observed on CPU 1 before migration");
@@ -740,13 +807,14 @@ pub fn affinity_migrate_running(ctx: &TestContext) -> TestResult
     // Trigger migration of a Running thread.
     thread_set_affinity(child.th, 0).map_err(|_| "migration thread_set_affinity(0) failed")?;
 
-    // Wait up to a generous bound (≫ 1 timer tick) for the migration to land.
-    spins = 0;
+    // Wait up to a generous wall-clock bound (seconds, ≫ 1 timer tick) for
+    // the migration to land.
+    polls = 0;
     while MIGRATE_OBSERVED_CPU.load(Ordering::Relaxed) != 0
     {
-        syscall::thread_yield().ok();
-        spins = spins.saturating_add(1);
-        if spins > 200_000
+        syscall::thread_sleep(1).ok();
+        polls = polls.saturating_add(1);
+        if polls > 2_000
         {
             MIGRATE_SHOULD_EXIT.store(1, Ordering::Relaxed);
             return Err("Running-thread migration did not land on CPU 0");

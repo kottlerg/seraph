@@ -17,7 +17,7 @@
 //! Without that handling the TCB would be freed while a CPU still held it
 //! in `sched.current`, causing a use-after-free on the next context switch.
 
-use syscall::{cap_delete, thread_yield};
+use syscall::{cap_delete, thread_sleep};
 
 use crate::{ChildStack, TestContext, TestResult, spawn};
 
@@ -42,14 +42,12 @@ pub fn run(ctx: &TestContext) -> TestResult
         cspaces[i] = child.cs;
     }
 
-    // Yield a few times so the children actually get on a CPU before we
-    // start deleting them. Without this the parent could win the race and
-    // delete every Thread cap before the scheduler ever picks them up,
-    // exercising only the "queue, never ran" branch.
-    for _ in 0..(NUM_CHILDREN * 2)
-    {
-        let _ = thread_yield();
-    }
+    // Sleep so the children (strictly below this thread's priority)
+    // actually get on a CPU before we start deleting them. Without this the
+    // parent could win the race and delete every Thread cap before the
+    // scheduler ever picks them up, exercising only the "queue, never ran"
+    // branch.
+    let _ = thread_sleep(2);
 
     // Delete each Thread cap while its child is mid-spin. The kernel's
     // dealloc path is the system under test.

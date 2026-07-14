@@ -1384,7 +1384,8 @@ fn create_process_from_bytes(
         crate::THREAD_RETYPE_PAGES,
         ipc_buf,
     )?;
-    let child_thread = syscall::cap_create_thread(thread_slab, child_aspace, child_cspace).ok()?;
+    let child_thread =
+        syscall::cap_create_thread(thread_slab, child_aspace, child_cspace, 0, 0).ok()?;
     let _ = syscall::cap_delete(thread_slab);
 
     let child_memmgr_send = universals.memmgr_endpoint;
@@ -2175,7 +2176,7 @@ pub fn create_process_from_file(
                 let _ = syscall::cap_delete(child_aspace);
                 procmgr_errors::OUT_OF_MEMORY
             })?;
-    let child_thread = syscall::cap_create_thread(thread_slab, child_aspace, child_cspace)
+    let child_thread = syscall::cap_create_thread(thread_slab, child_aspace, child_cspace, 0, 0)
         .map_err(|_| {
             let _ = syscall::cap_delete(thread_slab);
             let _ = syscall::cap_delete(child_cspace);

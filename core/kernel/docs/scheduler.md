@@ -24,10 +24,17 @@ There are `NUM_PRIORITY_LEVELS` = 32 priority levels, numbered 0 (lowest) throug
 - **Priorities 1–30** — available to userspace. `PRIORITY_MAX` = 30.
 - **Priority 31** — reserved; cannot be requested by userspace.
 
-Threads are created at a fixed default priority (`INIT_PRIORITY` = 15);
-`SYS_CAP_CREATE_THREAD` takes no priority argument. Priority is changed only via
-`SYS_THREAD_SET_PRIORITY`. The kernel does not implement dynamic priority
-adjustment or aging.
+Threads are created at an explicit priority stated at `SYS_CAP_CREATE_THREAD`
+time through its `SchedControl`-cap and priority arguments: with no
+`SchedControl` (both arguments zero) the thread is created at the floor
+(`PRIORITY_MIN` = 1); with a `SchedControl` cap, priority 0 selects the cap's
+band floor and a nonzero priority must lie within the cap's `[min, max]` band.
+Priority is changed afterwards via `SYS_THREAD_SET_PRIORITY`. The kernel does
+not implement dynamic priority adjustment or aging.
+
+The one kernel-assigned exception is init's boot thread, created at
+`INIT_PRIORITY` (= 30, the top settable level): init is the root of all
+userspace authority and nothing may preempt it.
 
 ### Priority Authority
 
@@ -35,7 +42,9 @@ Assigning a priority is capability-gated. `SYS_THREAD_SET_PRIORITY` takes two
 caps: a Thread cap with the Control right (selecting *which* thread) and a
 `SchedControl` cap (governing *which level*). A `SchedControl` carries a
 `[min, max]` priority band; the call succeeds only if the requested level lies
-within that band. There is no ambient authority — a process holding no
+within that band. `SYS_CAP_CREATE_THREAD` applies the same rule at creation:
+placing a new thread above the floor requires a `SchedControl` cap whose band
+covers the level. There is no ambient authority — a process holding no
 `SchedControl` (or one whose band excludes the level) cannot set that priority.
 Lowering is not special-cased; every assignment is checked against the band.
 

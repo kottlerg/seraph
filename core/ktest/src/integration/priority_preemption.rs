@@ -7,10 +7,11 @@
 //! Setup:
 //!
 //! - Both children pinned to CPU 0 so the test measures preemption, not
-//!   parallelism.
-//! - Child A (normal priority): tight spin loop, posts a "finished" bit only
+//!   parallelism. Both are created at explicit levels via the
+//!   `SYS_CAP_CREATE_THREAD` priority args.
+//! - Child A (low priority, 5): tight spin loop, posts a "finished" bit only
 //!   at the end.
-//! - Child B (elevated priority): signals "ran" immediately and exits.
+//! - Child B (elevated priority, 20): signals "ran" immediately and exits.
 //!
 //! Verification: the parent unblocks on B's "ran" notification well before A's
 //! spinner finishes. Slack: B should arrive within ~5 timer ticks worth
@@ -19,7 +20,7 @@
 
 use syscall::{
     cap_copy, cap_create_notification, cap_delete, notification_send, notification_wait_timeout,
-    system_info, thread_exit, thread_set_priority, thread_yield,
+    system_info, thread_exit, thread_sleep,
 };
 use syscall_abi::SystemInfoType;
 
@@ -90,9 +91,9 @@ pub fn run(ctx: &TestContext) -> TestResult
     let done = cap_create_notification(ctx.memory_base)
         .map_err(|_| "priority_preemption: cap_create_notification (done) failed")?;
 
-    // ── Hog: spawn, pin to CPU 0, default priority. ──────────────────────────
-    let hog = crate::spawn::new_child(ctx)
-        .map_err(|_| "priority_preemption: spawn::new_child (hog) failed")?;
+    // ── Hog: spawn at low priority (5), pin to CPU 0. ─────────────────────────
+    let hog = crate::spawn::new_child_at(ctx, sched_cap, 5)
+        .map_err(|_| "priority_preemption: spawn::new_child_at (hog) failed")?;
     let hog_done = cap_copy(done, hog.cs, RIGHTS_NOTIFY)
         .map_err(|_| "priority_preemption: cap_copy hog_done failed")?;
     let hog_arg = u64::from(hog_done) | (0x1u64 << 32);
@@ -100,16 +101,15 @@ pub fn run(ctx: &TestContext) -> TestResult
     crate::spawn::configure_and_start_pinned(&hog, hog_entry, hog_stack, hog_arg, 0)
         .map_err(|_| "priority_preemption: hog configure_and_start_pinned failed")?;
 
-    // Yield so the hog gets on CPU 0 and starts spinning.
-    thread_yield().map_err(|_| "priority_preemption: yield after hog failed")?;
+    // Sleep so the hog (strictly below this thread's INIT_PRIORITY) gets
+    // CPU 0 and is mid-spin before the elevated child exists.
+    thread_sleep(20).map_err(|_| "priority_preemption: sleep after hog failed")?;
 
-    // ── Elevated: spawn, pin to CPU 0, elevated priority. ────────────────────
-    let elevated = crate::spawn::new_child(ctx)
-        .map_err(|_| "priority_preemption: spawn::new_child (elevated) failed")?;
+    // ── Elevated: spawn at elevated priority (20), pin to CPU 0. ─────────────
+    let elevated = crate::spawn::new_child_at(ctx, sched_cap, 20)
+        .map_err(|_| "priority_preemption: spawn::new_child_at (elevated) failed")?;
     let elevated_done = cap_copy(done, elevated.cs, RIGHTS_NOTIFY)
         .map_err(|_| "priority_preemption: cap_copy elevated_done failed")?;
-    thread_set_priority(elevated.th, 20, sched_cap)
-        .map_err(|_| "priority_preemption: thread_set_priority (elevated) failed")?;
     let elevated_arg = u64::from(elevated_done) | (0x2u64 << 32);
     let elevated_stack = ChildStack::top(core::ptr::addr_of!(ELEVATED_STACK));
 

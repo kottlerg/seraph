@@ -85,7 +85,7 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use ipc::IpcMessage;
 use syscall::{
     cap_copy, cap_create_endpoint, cap_create_notification, cap_delete, ipc_buffer_set,
-    notification_send, notification_wait, system_info, thread_exit, thread_yield,
+    notification_send, notification_wait, system_info, thread_exit, thread_sleep,
 };
 use syscall_abi::{RIGHTS_RECEIVE, RIGHTS_SEND_GRANT, SystemInfoType};
 
@@ -108,9 +108,6 @@ const ITERS: usize = 16000;
 /// Sample `CurrentCpu` every this many round-trips (bounds the witness syscall
 /// overhead while still catching migrations across the run).
 const SAMPLE_EVERY: usize = 64;
-
-/// Controller warmup yields so servers reach `ipc_recv` before clients call.
-const SETTLE_YIELDS: usize = 8;
 
 /// Widest guest for which the `migrations >= 1` guard is asserted: the bound of
 /// the one-hot `u32` CPU witness (`sample_cpu_bit` masks indices mod 32), and
@@ -202,10 +199,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         server_cs[j] = server.cs;
     }
 
-    for _ in 0..SETTLE_YIELDS
-    {
-        let _ = thread_yield();
-    }
+    let _ = thread_sleep(2);
 
     // ── Clients: UNPINNED (AFFINITY_ANY) so the balancer may steal them. ─────
     for i in 0..NUM_PAIRS

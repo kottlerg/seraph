@@ -432,7 +432,7 @@ calls `sched::enter()`.
       arg=choose_init_layout().init_info_va, is_user=true) stores entry_point in
       saved_state.rip (x86-64) or .ra (RISC-V) and the InitInfo VA as the arg
       forwarded to init's a0/rdi on first entry
-   c. Priority: INIT_PRIORITY (15)
+   c. Priority: INIT_PRIORITY (30)
    d. cspace: set to ROOT_CSPACE raw pointer (handed off at `sched::enter()` start)
 6. Enqueue the init TCB on the BSP's run queue at INIT_PRIORITY
 7. Call sched::enter() — does not return:

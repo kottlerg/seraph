@@ -75,7 +75,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     let child_arg =
         u64::from(child_ep) | (u64::from(child_test_sig) << 16) | (u64::from(child_sync_sig) << 32);
 
-    let th = cap_create_thread(ctx.memory_base, ctx.aspace_cap, cs)
+    let th = cap_create_thread(ctx.memory_base, ctx.aspace_cap, cs, 0, 0)
         .map_err(|_| "integration::cap_transfer: cap_create_thread failed")?;
     crate::log("cap_transfer: child thread created");
 

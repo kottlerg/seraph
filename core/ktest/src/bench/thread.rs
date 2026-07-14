@@ -115,11 +115,22 @@ fn ctxswitch_child_entry(done_slot: u64) -> !
 /// ping-pong, both threads pinned to CPU 0 so the test measures real
 /// context-switch cost (not just yield-and-return-to-same-thread).
 ///
+/// The yield ping-pong requires the child at the parent's own level
+/// (`INIT_PRIORITY`) — yield only round-robins within a priority level — so
+/// the child is created at that level via the root `SchedControl` band.
+/// Skipped when the initial cap set has no `SchedControl` cap.
+///
 /// Cost-per-switch = total wall cycles / (2 * N) — each iteration is two
 /// switches (parent → child, child → parent).
 pub(super) fn bench_context_switch(ctx: &crate::TestContext, iters: u32)
 {
     use crate::spawn;
+
+    if ctx.sched_control_cap == 0
+    {
+        crate::log("ktest: bench context_switch SKIP (no SchedControl cap)");
+        return;
+    }
 
     let n = u64::from(iters);
     BENCH_CTXSWITCH_ITERS.store(n, core::sync::atomic::Ordering::Release);
@@ -129,7 +140,8 @@ pub(super) fn bench_context_switch(ctx: &crate::TestContext, iters: u32)
     {
         return;
     };
-    let Ok(child) = spawn::new_child(ctx)
+    // PRIORITY_MAX == INIT_PRIORITY: the level this (init-loaded) thread runs at.
+    let Ok(child) = spawn::new_child_at(ctx, ctx.sched_control_cap, syscall_abi::PRIORITY_MAX)
     else
     {
         return;

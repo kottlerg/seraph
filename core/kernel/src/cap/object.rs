@@ -423,8 +423,10 @@ pub struct IoPortObject
 /// Kernel object for scheduling control authority (`SchedControl` capability).
 ///
 /// Carries the priority band `[min, max]` the cap authorises. Holding a
-/// `SchedControl` cap whose band covers a level is the authority to assign that
-/// level via `SYS_THREAD_SET_PRIORITY`. The root cap (spanning the full
+/// `SchedControl` cap whose band covers a level is the authority to assign
+/// that level via `SYS_THREAD_SET_PRIORITY`, or to create a thread at it via
+/// `SYS_CAP_CREATE_THREAD`'s priority arguments (creation at the floor,
+/// `PRIORITY_MIN`, needs no `SchedControl`). The root cap (spanning the full
 /// userspace range) is minted at boot; narrower bands are produced by
 /// `SYS_SCHED_SPLIT`.
 #[repr(C)]

@@ -646,10 +646,15 @@ Three detectors feed the latch:
 **1. All-idle softlockup (BSP, every tick).** Detects "every CPU stalled in
 kernel mode" — the failure class userspace cannot observe, because no
 userspace runs when every CPU is wedged. `schedule()` updates a per-CPU
-`LAST_NON_IDLE_TICK` whenever it dispatches a non-idle thread; the BSP
-`timer_tick` increments a global tick counter and fires if every CPU's last
-dispatch is older than `WATCHDOG_THRESHOLD_TICKS` (~3 s at the observed
-~1 ms tick).
+`LAST_NON_IDLE_TICK` whenever it dispatches a non-idle thread; `timer_tick`
+additionally stamps it when a slice expiry finds preemption disabled and
+must suppress the dispatch — a non-idle `current` taking timer ticks inside
+a shootdown ack-wait is live, and without this stamp a map/unmap storm
+whose ack-waits cover every CPU's slice expiries starves all stamps and
+false-fires the detector (the dump's serial output then stalls the acks it
+misdiagnosed). The BSP `timer_tick` increments a global tick counter and
+fires if every CPU's last dispatch is older than
+`WATCHDOG_THRESHOLD_TICKS` (~3 s at the observed ~1 ms tick).
 
 **2. Owed-wake detector (BSP, every `DETECTOR_SCAN_INTERVAL_TICKS` ≈
 0.5 s).** Detects a single `Blocked` thread whose wake is provably owed but
@@ -663,11 +668,15 @@ claimed, and its deadline cleared, within one BSP tick); `wake_in_flight`
 stuck set (a waker claimed the thread but its `enqueue_and_wake` never
 completed — normally microseconds); and `wake_pending` observed while
 `Blocked` (a coalesced wake survived the park commit that must consume it).
-The deadline rule is debounced by its grace window; the other two must
-persist across two consecutive scans (`OWED_WAKE_LAST`) so a legitimately
-mid-wake observation cannot false-positive. Indefinite waits (endpoint recv
-loops) match no rule. Each park commit stamps `park_started_tick` for the
-age checks.
+The `wake_in_flight` rule exempts `BlockedOnReply` and `BlockedOnFault`:
+those states hold the flag from block entry until the reply as the dealloc
+gate (#160), so it is steady-state there rather than an in-flight wake — a
+client parked in a long blocking RPC (a console read held by its server
+until input arrives) must not fire the rule. The deadline rule is debounced
+by its grace window; the other two must persist across two consecutive
+scans (`OWED_WAKE_LAST`) so a legitimately mid-wake observation cannot
+false-positive. Indefinite waits (endpoint recv loops, reply waits) match
+no rule. Each park commit stamps `park_started_tick` for the age checks.
 
 **3. Timer-heartbeat cross-checks.** Every CPU stamps `TICK_HEARTBEAT[cpu]`
 with `timer::current_tick()` on each `timer_tick` entry (`current_tick`

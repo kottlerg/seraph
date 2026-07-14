@@ -411,6 +411,10 @@ pub fn run_all(ctx: &TestContext)
         thread::sched_split_enforces_bands(ctx)
     );
     run_test!(
+        "thread::create_priority_args",
+        thread::create_priority_args(ctx)
+    );
+    run_test!(
         "thread::set_affinity_valid",
         thread::set_affinity_valid(ctx)
     );

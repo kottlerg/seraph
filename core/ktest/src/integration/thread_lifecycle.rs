@@ -119,7 +119,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     // to test these without depending on child exit timing.
     let cs2 = cap_create_cspace(ctx.memory_base, 0, 4, 8)
         .map_err(|_| "integration::thread_lifecycle: cap_create_cspace (step 8) failed")?;
-    let th2 = cap_create_thread(ctx.memory_base, ctx.aspace_cap, cs2)
+    let th2 = cap_create_thread(ctx.memory_base, ctx.aspace_cap, cs2, 0, 0)
         .map_err(|_| "integration::thread_lifecycle: cap_create_thread (step 8) failed")?;
 
     thread_set_priority(th2, 5, ctx.sched_control_cap)

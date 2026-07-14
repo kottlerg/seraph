@@ -21,7 +21,7 @@ use ipc::IpcMessage;
 use syscall::{
     cap_copy, cap_create_cspace, cap_create_endpoint, cap_create_notification, cap_create_thread,
     cap_delete, cap_derive, ipc_buffer_set, notification_send, notification_wait, thread_configure,
-    thread_exit, thread_start, thread_yield,
+    thread_exit, thread_sleep, thread_start,
 };
 
 use crate::{ChildStack, TestContext, TestResult};
@@ -130,8 +130,10 @@ pub fn recv_finds_queued_caller(ctx: &TestContext) -> TestResult
     crate::spawn::configure_and_start(&child, queued_caller_entry, stack_top, child_arg)
         .map_err(|_| "ipc::recv_finds_queued_caller: configure_and_start failed")?;
 
-    // Yield CPU once so the child runs and blocks on ipc_call (no server yet).
-    thread_yield().map_err(|_| "thread_yield for recv_finds_queued_caller failed")?;
+    // Sleep so the child (created at the floor priority, strictly below
+    // this thread's INIT_PRIORITY) runs and blocks on ipc_call (no server
+    // yet).
+    thread_sleep(1).map_err(|_| "thread_sleep for recv_finds_queued_caller failed")?;
 
     // Now call ipc_recv — the child should be on the send queue.
     // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
@@ -774,7 +776,7 @@ pub fn reply_oom_wakes_caller_with_transfer_failed(ctx: &TestContext) -> TestRes
         | (u64::from(child_done) << 32)
         | (u64::from(child_memory) << 48);
 
-    let child_th = cap_create_thread(ctx.memory_base, ctx.aspace_cap, child_cs)
+    let child_th = cap_create_thread(ctx.memory_base, ctx.aspace_cap, child_cs, 0, 0)
         .map_err(|_| "cap_create_thread for reply_oom test failed")?;
     let stack_top = ChildStack::top(core::ptr::addr_of!(REPLY_OOM_STACK));
     thread_configure(
@@ -932,7 +934,7 @@ pub fn recv_oom_returns_cleanly(ctx: &TestContext) -> TestResult
     let victim_arg =
         u64::from(victim_ep) | (u64::from(victim_done) << 16) | (u64::from(victim_memory) << 32);
 
-    let victim_th = cap_create_thread(ctx.memory_base, ctx.aspace_cap, victim_cs)
+    let victim_th = cap_create_thread(ctx.memory_base, ctx.aspace_cap, victim_cs, 0, 0)
         .map_err(|_| "cap_create_thread for recv_oom test failed")?;
     let stack_top = ChildStack::top(core::ptr::addr_of!(RECV_OOM_STACK));
     thread_configure(

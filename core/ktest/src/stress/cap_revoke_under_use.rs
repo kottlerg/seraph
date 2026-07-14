@@ -9,7 +9,7 @@
 
 use syscall::{
     cap_copy, cap_create_notification, cap_delete, cap_derive, cap_revoke, notification_send,
-    notification_wait, thread_exit, thread_yield,
+    notification_wait, thread_exit, thread_sleep,
 };
 
 use crate::{ChildStack, TestContext, TestResult, spawn};
@@ -57,11 +57,9 @@ pub fn run(ctx: &TestContext) -> TestResult
         cspaces[i] = child.cs;
     }
 
-    // Let children run for a while before revoking.
-    for _ in 0..10
-    {
-        let _ = thread_yield();
-    }
+    // Let the children (strictly below this thread's priority) run for a
+    // while before revoking.
+    let _ = thread_sleep(2);
 
     // Revoke root — all derived caps become invalid. Children will start
     // getting errors on their sends and exit.

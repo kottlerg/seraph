@@ -67,7 +67,7 @@ pub fn run(ctx: &TestContext) -> TestResult
             .map_err(|_| "stress::retype_concurrent: cap_copy memory failed")?;
         let child_done = cap_copy(done, cs, 1 << 7)
             .map_err(|_| "stress::retype_concurrent: cap_copy done failed")?;
-        let th = cap_create_thread(memory, ctx.aspace_cap, cs)
+        let th = cap_create_thread(memory, ctx.aspace_cap, cs, 0, 0)
             .map_err(|_| "stress::retype_concurrent: create_thread failed")?;
 
         let arg = u64::from(child_memory) | (u64::from(child_done) << 16) | ((i as u64) << 32);

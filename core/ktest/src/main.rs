@@ -630,14 +630,16 @@ pub fn log_version(prefix: &str, ver: u64)
 
 /// Wait for `secs` seconds using the kernel timer via `system_info(ElapsedUs)`.
 ///
-/// Yields the CPU between polls so the scheduler can run other threads.
+/// Sleeps between polls so the scheduler can run other threads.
 fn wait_seconds(secs: u32)
 {
     wait_us(u64::from(secs) * 1_000_000);
 }
 
-/// Spin until `target_us` microseconds of `ElapsedUs` have passed since
-/// the call. Yields each iteration so other threads make progress.
+/// Block until `target_us` microseconds of `ElapsedUs` have passed since
+/// the call. Sleeps between polls so lower-priority threads make progress
+/// (the harness runs at `INIT_PRIORITY`; a yield would not cede the CPU
+/// to them).
 fn wait_us(target_us: u64)
 {
     let start = syscall::system_info(6).unwrap_or(0); // ElapsedUs = 6
@@ -648,7 +650,7 @@ fn wait_us(target_us: u64)
         {
             break;
         }
-        let _ = syscall::thread_yield();
+        let _ = syscall::thread_sleep(1);
     }
 }
 

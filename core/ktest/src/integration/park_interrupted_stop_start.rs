@@ -33,8 +33,8 @@
 use syscall::{
     RIGHTS_ALL, cap_copy, cap_create_endpoint, cap_create_notification, cap_delete,
     event_queue_create, event_recv, ipc_buffer_set, notification_send, notification_wait,
-    notification_wait_timeout, thread_exit, thread_sleep, thread_start, thread_stop, thread_yield,
-    wait_set_add, wait_set_create, wait_set_wait,
+    notification_wait_timeout, thread_exit, thread_sleep, thread_start, thread_stop, wait_set_add,
+    wait_set_create, wait_set_wait,
 };
 use syscall_abi::{RIGHTS_RECEIVE, SyscallError};
 
@@ -83,14 +83,10 @@ const SANITY_BITS: u64 = 0x55;
 /// Parks that must never elapse on their own (the stop is the only exit).
 const PARK_FOREVER_MS: u64 = 600_000;
 
-/// Bounded yields after a child's READY signal so it provably reaches its
-/// park before the stop lands. A stop that lands pre-park stops a Running
-/// thread instead — the restart would then park with no canceller and hang to
-/// the watchdog, so generous slack is cheap insurance.
-const SETTLE_YIELDS: usize = 32;
-
-/// Wall-clock settle after the yields (see `drive`): on TCG hosts the yield
-/// loop can complete before the child's vCPU runs at all.
+/// Wall-clock settle after a child's READY signal so it provably reaches
+/// its park before the stop lands (see `drive`). A stop that lands pre-park
+/// stops a Running thread instead — the restart would then park with no
+/// canceller and hang to the watchdog, so generous slack is cheap insurance.
 const SETTLE_SLEEP_MS: u64 = 20;
 
 static mut CHILD_STACK: ChildStack = ChildStack::ZERO;
@@ -278,13 +274,9 @@ fn drive(
 ) -> Result<(), &'static str>
 {
     wait_for(done, acc, ready)?;
-    for _ in 0..SETTLE_YIELDS
-    {
-        let _ = thread_yield();
-    }
-    // Yields alone prove nothing under TCG, where the child's vCPU thread can
-    // be host-descheduled for milliseconds while this CPU spins through its
-    // yield loop; give the child wall-clock time to reach its park.
+    // Give the child wall-clock time to reach its park: a yield would not
+    // cede the CPU to a lower-priority child, and under TCG the child's
+    // vCPU thread can be host-descheduled for milliseconds regardless.
     let _ = thread_sleep(SETTLE_SLEEP_MS);
     thread_stop(th).map_err(|_| "integration::park_interrupted_stop_start: thread_stop failed")?;
     thread_start(th)

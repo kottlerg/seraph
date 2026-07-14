@@ -48,7 +48,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         .map_err(|_| "aspace_fault_notification_late_bind: cap_create_aspace failed")?;
     let cspace = cap_create_cspace(ctx.memory_base, 0, 4, 16)
         .map_err(|_| "aspace_fault_notification_late_bind: cap_create_cspace failed")?;
-    let thread = cap_create_thread(ctx.memory_base, aspace, cspace)
+    let thread = cap_create_thread(ctx.memory_base, aspace, cspace, 0, 0)
         .map_err(|_| "aspace_fault_notification_late_bind: cap_create_thread failed")?;
 
     // Entry PC is unmapped: the thread terminal-faults on its first instruction

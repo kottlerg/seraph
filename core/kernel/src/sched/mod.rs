@@ -4412,7 +4412,22 @@ pub unsafe fn timer_tick()
         // If preemption is disabled (e.g., during TLB shootdown spin-wait
         // with interrupts temporarily enabled), skip the context switch.
         // The thread will be rescheduled normally on its next timer expiry.
-        if !crate::percpu::preemption_disabled()
+        if crate::percpu::preemption_disabled()
+        {
+            // The suppressed dispatch means schedule() cannot stamp this CPU
+            // non-idle, yet `current` is provably non-idle here (idle threads
+            // hold slice_remaining = 0 and returned above) and taking timer
+            // ticks — live, not stalled. Without the stamp, a sustained
+            // map/unmap storm whose shootdown ack-waits keep every CPU
+            // preemption-disabled across its slice expiries starves all
+            // stamps and false-fires the all-idle detector; the dump's
+            // serial output then stalls shootdown acks and cascades into
+            // the NMI escalation. A genuinely wedged preemption-disabled
+            // spin remains covered by the shootdown's own bounded
+            // escalation (see wait_for_ack).
+            watchdog_mark_non_idle(cpu);
+        }
+        else
         {
             // SAFETY: schedule() re-acquires the lock and performs a context switch.
             // requeue=true: thread was preempted and should go back in queue.

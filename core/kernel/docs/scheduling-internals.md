@@ -646,10 +646,15 @@ Three detectors feed the latch:
 **1. All-idle softlockup (BSP, every tick).** Detects "every CPU stalled in
 kernel mode" — the failure class userspace cannot observe, because no
 userspace runs when every CPU is wedged. `schedule()` updates a per-CPU
-`LAST_NON_IDLE_TICK` whenever it dispatches a non-idle thread; the BSP
-`timer_tick` increments a global tick counter and fires if every CPU's last
-dispatch is older than `WATCHDOG_THRESHOLD_TICKS` (~3 s at the observed
-~1 ms tick).
+`LAST_NON_IDLE_TICK` whenever it dispatches a non-idle thread; `timer_tick`
+additionally stamps it when a slice expiry finds preemption disabled and
+must suppress the dispatch — a non-idle `current` taking timer ticks inside
+a shootdown ack-wait is live, and without this stamp a map/unmap storm
+whose ack-waits cover every CPU's slice expiries starves all stamps and
+false-fires the detector (the dump's serial output then stalls the acks it
+misdiagnosed). The BSP `timer_tick` increments a global tick counter and
+fires if every CPU's last dispatch is older than
+`WATCHDOG_THRESHOLD_TICKS` (~3 s at the observed ~1 ms tick).
 
 **2. Owed-wake detector (BSP, every `DETECTOR_SCAN_INTERVAL_TICKS` ≈
 0.5 s).** Detects a single `Blocked` thread whose wake is provably owed but

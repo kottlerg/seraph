@@ -66,10 +66,18 @@ pub struct StartupInfo {
     pub self_cspace: u32,
     /// Cap slot of a baseline `SchedControl` cap, or zero. Pass it as the
     /// `sched_cap` argument to [`crate::os::seraph::syscall`]-level
-    /// `thread_set_priority` to set a thread's priority within the cap's band
-    /// (default `[1, 20]`). Zero means no scheduling authority was delegated.
+    /// `thread_set_priority` / `cap_create_thread` to set or assign a
+    /// thread's priority within the cap's band (`[1, band_max]`, chosen by
+    /// the spawner — see `CommandExt::sched_max`). Zero means no
+    /// scheduling authority was delegated.
     #[stable(feature = "seraph_ext", since = "1.0.0")]
     pub sched_control_cap: u32,
+    /// Priority level the spawner placed this process's initial thread at.
+    /// Always within the band of [`Self::sched_control_cap`] when that cap
+    /// is present; `std::thread::spawn` creates further threads at this
+    /// level. Zero only for pre-policy bootstrap processes.
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    pub initial_priority: u8,
     /// Cap slot of a badged SEND cap on procmgr. Zero if procmgr is not
     /// reachable (the process is procmgr itself, or runs before procmgr
     /// exists). Used for process-lifecycle queries.
@@ -386,6 +394,7 @@ pub extern "C" fn _start(info_ptr: u64) -> ! {
         self_aspace: info.self_aspace_cap,
         self_cspace: info.self_cspace_cap,
         sched_control_cap: info.sched_control_cap,
+        initial_priority: info.initial_priority,
         procmgr_endpoint: info.procmgr_endpoint_cap,
         memmgr_endpoint: info.memmgr_endpoint_cap,
         service_registry_cap: info.service_registry_cap,
@@ -1109,6 +1118,23 @@ pub mod process {
         /// Defaults to off.
         #[stable(feature = "seraph_ext", since = "1.0.0")]
         fn pinned(&mut self, on: bool) -> &mut Self;
+
+        /// Request the priority level the child's initial thread is created
+        /// at (the `CREATE_PRIORITY` label field). `0` (the default)
+        /// reverts to procmgr's policy default, clamped to the child's
+        /// band. A level above the spawner's own band ceiling — or above
+        /// the child's band — makes procmgr reject the spawn with
+        /// `InvalidInput`.
+        #[stable(feature = "seraph_ext", since = "1.0.0")]
+        fn priority(&mut self, level: u8) -> &mut Self;
+
+        /// Request the upper bound of the `SchedControl` band delegated to
+        /// the child (the `CREATE_BAND_MAX` label field; the child's band
+        /// is `[1, level]`). `0` (the default) delegates a copy of the
+        /// spawner's own band. A bound above the spawner's ceiling makes
+        /// procmgr reject the spawn with `InvalidInput`.
+        #[stable(feature = "seraph_ext", since = "1.0.0")]
+        fn sched_max(&mut self, level: u8) -> &mut Self;
     }
 
     #[stable(feature = "seraph_ext", since = "1.0.0")]
@@ -1125,6 +1151,16 @@ pub mod process {
 
         fn pinned(&mut self, on: bool) -> &mut Command {
             self.as_inner_mut().set_pinned(on);
+            self
+        }
+
+        fn priority(&mut self, level: u8) -> &mut Command {
+            self.as_inner_mut().set_priority(level);
+            self
+        }
+
+        fn sched_max(&mut self, level: u8) -> &mut Command {
+            self.as_inner_mut().set_sched_max(level);
             self
         }
     }

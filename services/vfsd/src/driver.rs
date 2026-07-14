@@ -141,10 +141,18 @@ fn spawn_via_module(
         return false;
     };
 
-    let create_msg = IpcMessage::builder(procmgr_labels::CREATE_PROCESS)
-        .cap(module_copy)
-        .cap(badged_creator)
-        .build();
+    // Same placement as the on-disk fs-driver spawn path (worker.rs): an
+    // fs driver runs at vfsd's own level with a matching band ceiling.
+    let create_msg = IpcMessage::builder(
+        procmgr_labels::CREATE_PROCESS
+            | procmgr_labels::create_sched_bits(
+                ipc::sched_policy::FS_DRIVER_PRIORITY,
+                ipc::sched_policy::FS_DRIVER_PRIORITY,
+            ),
+    )
+    .cap(module_copy)
+    .cap(badged_creator)
+    .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let Ok(create_reply) = (unsafe { ipc::ipc_call(caps.procmgr_ep, &create_msg, ipc_buf) })
     else

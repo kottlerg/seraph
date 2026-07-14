@@ -74,6 +74,12 @@ pub struct ProcessEntry
     /// relative paths return `Unsupported` until installed). Same lifetime
     /// rules as `namespace_override`.
     pub cwd_override: u32,
+    /// Upper bound of the baseline `SchedControl` band minted into this
+    /// child (`[1, band_max]`). This is the child's spawn ceiling: when it
+    /// calls `CREATE_PROCESS` / `CREATE_FROM_FILE`, procmgr resolves the
+    /// request's scheduling fields against this value (see
+    /// [`resolve_spawn_sched`]).
+    pub band_max: u8,
     pub entry_point: u64,
     pub tls_base_va: u64,
     /// Top of the main-thread stack (SP at entry) the loader chose and mapped
@@ -259,6 +265,19 @@ impl ProcessTable
             .find(|e| e.badge == badge)
             .map(|e| (e.started, e.thread_cap))
     }
+
+    /// Band ceiling of the live entry whose badge matches, for
+    /// creator-band resolution on nested spawns. `None` if the badge is
+    /// unknown (already reaped, or a badge minted outside the table).
+    #[must_use]
+    pub fn band_max_by_badge(&self, badge: u64) -> Option<u8>
+    {
+        self.entries
+            .iter()
+            .filter_map(|s| s.as_ref())
+            .find(|e| e.badge == badge)
+            .map(|e| e.band_max)
+    }
 }
 
 impl Default for ProcessTable
@@ -267,6 +286,62 @@ impl Default for ProcessTable
     {
         Self::new()
     }
+}
+
+// ── Spawn scheduling resolution ──────────────────────────────────────────────
+
+/// Resolve the scheduling fields of a `CREATE_PROCESS` /
+/// `CREATE_FROM_FILE` request against the creator's band ceiling.
+///
+/// `requested_priority` and `requested_band_max` are the raw 5-bit label
+/// fields (`0` = unspecified). `creator_band_max` is the caller's spawn
+/// ceiling (its own minted band; init's is the baseline ceiling) and must
+/// be at least 1. `default_priority` is the policy default applied when no
+/// priority is requested, clamped to the resolved band.
+///
+/// Returns the resolved `(priority, band_max)` for the child, or `None`
+/// when the request exceeds the creator's authority or is internally
+/// inconsistent:
+/// - `band_max > creator_band_max` — band escalation.
+/// - `priority > band_max` — the child's own band must cover its initial
+///   level, so it can always restore its starting priority.
+#[must_use]
+pub fn resolve_spawn_sched(
+    requested_priority: u8,
+    requested_band_max: u8,
+    creator_band_max: u8,
+    default_priority: u8,
+) -> Option<(u8, u8)>
+{
+    if creator_band_max == 0
+    {
+        return None;
+    }
+    let band_max = if requested_band_max == 0
+    {
+        creator_band_max
+    }
+    else
+    {
+        requested_band_max
+    };
+    if band_max > creator_band_max
+    {
+        return None;
+    }
+    let priority = if requested_priority == 0
+    {
+        default_priority.min(band_max)
+    }
+    else
+    {
+        requested_priority
+    };
+    if priority > band_max
+    {
+        return None;
+    }
+    Some((priority, band_max))
 }
 
 // ── Badge acceptance ─────────────────────────────────────────────────────────
@@ -315,6 +390,7 @@ mod tests
             memmgr_badge: 0,
             namespace_override: 0,
             cwd_override: 0,
+            band_max: 0,
             entry_point: 0,
             tls_base_va: 0,
             stack_top_vaddr: 0,
@@ -439,6 +515,56 @@ mod tests
         recent.record(16, 42);
         assert_eq!(recent.find(16), Some(42));
         assert_eq!(recent.find(17), None);
+    }
+
+    #[test]
+    fn band_max_by_badge_reports_ceiling_and_absence()
+    {
+        let mut table = ProcessTable::new();
+        let mut entry = entry_with_badge(16);
+        entry.band_max = 21;
+        assert!(table.insert(entry));
+        assert_eq!(table.band_max_by_badge(16), Some(21));
+        assert_eq!(table.band_max_by_badge(99), None);
+    }
+
+    #[test]
+    fn resolve_spawn_sched_defaults_to_creator_band_and_clamped_priority()
+    {
+        // Both fields unspecified: band = creator's, priority = policy
+        // default clamped to the band.
+        assert_eq!(resolve_spawn_sched(0, 0, 28, 10), Some((10, 28)));
+        // Narrow creator band clamps the default below it.
+        assert_eq!(resolve_spawn_sched(0, 0, 5, 10), Some((5, 5)));
+        // Explicit narrow band clamps the default even under a wide creator.
+        assert_eq!(resolve_spawn_sched(0, 5, 28, 10), Some((5, 5)));
+    }
+
+    #[test]
+    fn resolve_spawn_sched_accepts_explicit_fields_within_creator_band()
+    {
+        // Priority below its own band (devmgr shape: starts at 24, may
+        // place children up to 26).
+        assert_eq!(resolve_spawn_sched(24, 26, 28, 10), Some((24, 26)));
+        // Priority equal to band and creator ceiling.
+        assert_eq!(resolve_spawn_sched(28, 28, 28, 10), Some((28, 28)));
+        // Explicit priority with unspecified band inherits the creator band.
+        assert_eq!(resolve_spawn_sched(18, 0, 21, 10), Some((18, 21)));
+    }
+
+    #[test]
+    fn resolve_spawn_sched_rejects_escalation_and_inconsistency()
+    {
+        // Band above the creator's ceiling is an escalation.
+        assert_eq!(resolve_spawn_sched(10, 29, 28, 10), None);
+        // Priority above the resolved band (explicit band).
+        assert_eq!(resolve_spawn_sched(27, 26, 28, 10), None);
+        // Priority above the inherited creator band.
+        assert_eq!(resolve_spawn_sched(22, 0, 21, 10), None);
+        // 5-bit maximum (31) cannot pass any in-tree ceiling.
+        assert_eq!(resolve_spawn_sched(31, 31, 28, 10), None);
+        // Degenerate zero creator band rejects everything.
+        assert_eq!(resolve_spawn_sched(0, 0, 0, 10), None);
     }
 
     #[test]

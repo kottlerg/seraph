@@ -278,9 +278,17 @@ pub fn spawn_log_thread(info: &InitInfo, arena: &mut BootArena, log_ep: u32, iop
 
     // Create the log thread by retyping from the arena front, bound to init's
     // own address space and CSpace. The retype holds an ancestor reference on
-    // the arena's MemoryObject, pinning it for the thread's life.
-    let Ok(thread_cap) =
-        syscall::cap_create_thread(arena.cap, info.aspace_cap, info.cspace_cap, 0, 0)
+    // the arena's MemoryObject, pinning it for the thread's life. Placed at
+    // the init-logd level via the still-unsplit root SchedControl —
+    // `spawn_log_thread` runs before init's baseline split consumes that
+    // slot in `run()`.
+    let Ok(thread_cap) = syscall::cap_create_thread(
+        arena.cap,
+        info.aspace_cap,
+        info.cspace_cap,
+        info.sched_control_cap,
+        ipc::sched_policy::INIT_LOGD_PRIORITY,
+    )
     else
     {
         log("init: FATAL: cannot create log thread");

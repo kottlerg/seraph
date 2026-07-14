@@ -267,11 +267,16 @@ There is no ambient priority authority: a process holding no `SchedControl`
 cannot set *any* thread priority. The kernel does not define a normal/elevated
 boundary — that partition is userspace policy expressed through cap
 distribution. The root cap spans the full userspace range `[1, PRIORITY_MAX]`
-and is created at boot. Init splits it into a baseline band (`[1, 20]` by
-default) and an elevated remainder (`[21, PRIORITY_MAX]`); every spawned process
-receives a baseline copy via `ProcessInfo.sched_control_cap` (procmgr fans it out
-at `CREATE_PROCESS`), and services needing elevated scheduling receive an
-explicit grant from the remainder. For priority levels, ranges, and constants,
+and is created at boot. Init splits it into the baseline band
+(`[1, sched_policy::BASELINE_PRIORITY_MAX]`, i.e. `[1, 28]`) and an elevated
+remainder (`[29, PRIORITY_MAX]`) that never leaves init and dies at its reap.
+Every spawned process receives a band via `ProcessInfo.sched_control_cap`:
+procmgr fans its baseline out per child at create time — a plain `cap_copy`
+for a full-width band, or copy-then-`SYS_SCHED_SPLIT` to mint a narrowed
+`[1, band_max]` when the spawner requested one (the create label's
+`CREATE_BAND_MAX` field, validated against the spawner's own band). The
+per-service level assignments live in `shared/ipc`'s `sched_policy` module
+and the svcmgr `.svc` recipes. For priority levels, ranges, and constants,
 see [core/kernel/docs/scheduler.md § Priority Levels](../core/kernel/docs/scheduler.md#priority-levels).
 
 ---

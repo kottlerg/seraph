@@ -16,6 +16,7 @@
 # permanently-down logd leaves the system blind, so graceful shutdown is the
 # right terminal escape once the restart budget is spent.
 binary    = /services/logd
+priority  = 18
 restart   = on_failure
 critical  = yes
 namespace = none

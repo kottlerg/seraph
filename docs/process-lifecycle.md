@@ -247,11 +247,18 @@ at creation time. Examples:
   which also equals the death-EQ correlator procmgr posts to
   logd. Identity is reconciled across the three views without
   any auxiliary mapping.
-- `ProcessInfo.sched_control_cap` — baseline `SchedControl` cap (default
-  band `[1, 20]`) so the child can set its own threads' priorities. procmgr
-  `cap_copy`s its own baseline (delivered by init) into every child; a child
-  with a zero slot holds no scheduling authority and cannot set any priority.
-  Added in `PROCESS_ABI_VERSION` 17 (#185).
+- `ProcessInfo.sched_control_cap` — baseline `SchedControl` cap covering the
+  band the spawner assigned (`[1, band_max]`, from the create label's
+  `CREATE_BAND_MAX` field; default is a copy of the creator's own band).
+  procmgr mints it from its baseline (delivered by init) — a plain `cap_copy`
+  for a full-width band, copy-then-`SYS_SCHED_SPLIT` for a narrowed one. A
+  child with a zero slot holds no scheduling authority and cannot set any
+  priority.
+- `ProcessInfo.initial_priority` — the level the creator placed the child's
+  initial thread at (the create label's `CREATE_PRIORITY` field, defaulted
+  and validated by procmgr against the creator's band). Always within the
+  child's own band, so the runtime can create further threads at the same
+  level via `SYS_CAP_CREATE_THREAD`'s scheduling arguments.
 - `InitInfo.memory_base`, `InitInfo.memory_count` — chosen
   by the kernel per init invocation.
 

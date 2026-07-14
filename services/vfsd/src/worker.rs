@@ -150,11 +150,19 @@ fn handle_create_from_file(
         return false;
     };
 
-    let create_msg = IpcMessage::builder(procmgr_labels::CREATE_FROM_FILE)
-        .word(0, file_size)
-        .cap(file_cap)
-        .cap(badged_creator)
-        .build();
+    // An fs driver is the blocking dependency of every vfsd read, so it
+    // runs at vfsd's own level; band ceiling equals the level.
+    let create_msg = IpcMessage::builder(
+        procmgr_labels::CREATE_FROM_FILE
+            | procmgr_labels::create_sched_bits(
+                ipc::sched_policy::FS_DRIVER_PRIORITY,
+                ipc::sched_policy::FS_DRIVER_PRIORITY,
+            ),
+    )
+    .word(0, file_size)
+    .cap(file_cap)
+    .cap(badged_creator)
+    .build();
 
     // SAFETY: ipc_buf is the thread-registered IPC buffer page.
     // file_cap and badged_creator ownership transfer via the IPC.

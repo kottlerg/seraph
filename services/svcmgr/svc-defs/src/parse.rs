@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// svcmgr/src/definitions/parse.rs
+// svcmgr/svc-defs/src/parse.rs
 
 //! Bespoke `key = value` parser for `.svc` service-definition files.
 //!
@@ -55,9 +55,32 @@ pub enum ParseError
     BadRights(usize, String),
 }
 
+/// Parse a `priority = ` / `sched_max = ` value: a decimal priority level
+/// within the kernel's assignable userspace range
+/// `[PRIORITY_MIN, PRIORITY_MAX]`.
+fn parse_priority_value(lineno: usize, value: &str, key: &'static str) -> Result<u8, ParseError>
+{
+    let level: u8 = value
+        .parse()
+        .map_err(|_| ParseError::InvalidValue(lineno, key))?;
+    if !(syscall_abi::PRIORITY_MIN..=syscall_abi::PRIORITY_MAX).contains(&level)
+    {
+        return Err(ParseError::InvalidValue(lineno, key));
+    }
+    Ok(level)
+}
+
 /// Parse the contents of a single `.svc` file. `name` is the filename
 /// without the `.svc` suffix; it becomes the `Definition::name` value
 /// and the key under which the service registers with svcmgr.
+///
+/// # Errors
+///
+/// Returns a [`ParseError`] naming the offending line when the contents
+/// violate the grammar or a semantic rule: a missing `=`, an unknown or
+/// duplicated key, a missing mandatory key, a malformed value, or an
+/// inconsistent combination (`cwd` with `namespace = none`, `log_sink`
+/// with `seed`/`provides`, `sched_max` below `priority`).
 #[allow(clippy::too_many_lines)]
 pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
 {
@@ -71,6 +94,8 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
     let mut seed: Vec<String> = Vec::new();
     let mut provides: Vec<ProvidedName> = Vec::new();
     let mut log_sink: Option<bool> = None;
+    let mut priority: Option<u8> = None;
+    let mut sched_max: Option<u8> = None;
 
     let mut seen_argv = false;
     let mut seen_env = false;
@@ -253,6 +278,30 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
                     }
                 });
             }
+            "priority" =>
+            {
+                if priority.is_some()
+                {
+                    return Err(ParseError::DuplicateKey(lineno, "priority"));
+                }
+                priority = Some(parse_priority_value(
+                    lineno,
+                    value,
+                    "priority must be a level in [1, 30]",
+                )?);
+            }
+            "sched_max" =>
+            {
+                if sched_max.is_some()
+                {
+                    return Err(ParseError::DuplicateKey(lineno, "sched_max"));
+                }
+                sched_max = Some(parse_priority_value(
+                    lineno,
+                    value,
+                    "sched_max must be a level in [1, 30]",
+                )?);
+            }
             other => return Err(ParseError::UnknownKey(lineno, other.to_owned())),
         }
     }
@@ -282,6 +331,16 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
         ));
     }
 
+    // The service's own band must cover its starting level, so it can
+    // always restore its initial priority. procmgr enforces the same
+    // invariant on the wire; rejecting here surfaces the recipe error at
+    // parse time with a line-level diagnostic instead of a spawn failure.
+    if let (Some(p), Some(m)) = (priority, sched_max)
+        && m < p
+    {
+        return Err(ParseError::InvalidValue(0, "sched_max must be >= priority"));
+    }
+
     Ok(Definition {
         name: name.to_owned(),
         binary,
@@ -294,6 +353,8 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
         seed,
         provides,
         log_sink,
+        priority,
+        sched_max,
     })
 }
 
@@ -387,5 +448,135 @@ impl core::fmt::Display for ParseError
             }
             Self::BadRights(l, v) => write!(f, "line {l}: bad rights `{v}`"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+
+    /// Minimal valid recipe body; tests append the lines under test.
+    const BASE: &str = "binary = /services/x\nrestart = never\ncritical = no\nnamespace = none\n";
+
+    fn parse_with(extra: &str) -> Result<Definition, ParseError>
+    {
+        let mut contents = String::from(BASE);
+        contents.push_str(extra);
+        parse("x", &contents)
+    }
+
+    #[test]
+    fn full_recipe_parses_every_surface()
+    {
+        let contents = "\
+# comment\n\
+binary    = /programs/terminal\n\
+argv      = terminal /programs/shell\n\
+env       = KEY=VAL\n\
+restart   = on_failure\n\
+critical  = yes\n\
+namespace = subtree:/tests:LOOKUP+READ\n\
+cwd       = /tests\n\
+seed      = devmgr.registry\n\
+priority  = 10\n\
+sched_max = 12\n";
+        let def = parse("terminal", contents).expect("valid recipe");
+        assert_eq!(def.binary, "/programs/terminal");
+        assert_eq!(def.argv, ["terminal", "/programs/shell"]);
+        assert_eq!(def.restart, RestartPolicy::OnFailure);
+        assert!(def.system_critical);
+        assert!(matches!(def.namespace, NamespaceShape::Subtree { .. }));
+        assert_eq!(def.cwd.as_deref(), Some("/tests"));
+        assert_eq!(def.seed, ["devmgr.registry"]);
+        assert_eq!(def.priority, Some(10));
+        assert_eq!(def.sched_max, Some(12));
+    }
+
+    #[test]
+    fn scheduling_keys_default_to_unspecified()
+    {
+        let def = parse_with("").expect("valid recipe");
+        assert_eq!(def.priority, None);
+        assert_eq!(def.sched_max, None);
+    }
+
+    #[test]
+    fn priority_accepts_the_kernel_range_bounds()
+    {
+        assert_eq!(
+            parse_with("priority = 1\n").expect("floor").priority,
+            Some(1)
+        );
+        assert_eq!(
+            parse_with("priority = 30\nsched_max = 30\n")
+                .expect("ceiling")
+                .priority,
+            Some(30)
+        );
+    }
+
+    #[test]
+    fn priority_rejects_out_of_range_and_non_numeric_values()
+    {
+        assert!(matches!(
+            parse_with("priority = 0\n"),
+            Err(ParseError::InvalidValue(_, _))
+        ));
+        assert!(matches!(
+            parse_with("priority = 31\n"),
+            Err(ParseError::InvalidValue(_, _))
+        ));
+        assert!(matches!(
+            parse_with("priority = high\n"),
+            Err(ParseError::InvalidValue(_, _))
+        ));
+        assert!(matches!(
+            parse_with("sched_max = 256\n"),
+            Err(ParseError::InvalidValue(_, _))
+        ));
+    }
+
+    #[test]
+    fn sched_max_below_priority_is_rejected()
+    {
+        assert!(matches!(
+            parse_with("priority = 10\nsched_max = 5\n"),
+            Err(ParseError::InvalidValue(_, _))
+        ));
+        // Equal is the boundary case and must pass.
+        let def = parse_with("priority = 5\nsched_max = 5\n").expect("equal band");
+        assert_eq!((def.priority, def.sched_max), (Some(5), Some(5)));
+    }
+
+    #[test]
+    fn sched_max_alone_is_accepted()
+    {
+        // Band without a starting level: procmgr clamps its default into
+        // the band, so the combination is meaningful and must parse.
+        let def = parse_with("sched_max = 5\n").expect("band only");
+        assert_eq!((def.priority, def.sched_max), (None, Some(5)));
+    }
+
+    #[test]
+    fn duplicate_scheduling_keys_are_rejected()
+    {
+        assert!(matches!(
+            parse_with("priority = 5\npriority = 6\n"),
+            Err(ParseError::DuplicateKey(_, "priority"))
+        ));
+        assert!(matches!(
+            parse_with("sched_max = 5\nsched_max = 6\n"),
+            Err(ParseError::DuplicateKey(_, "sched_max"))
+        ));
+    }
+
+    #[test]
+    fn unknown_key_remains_a_hard_error()
+    {
+        assert!(matches!(
+            parse_with("priorty = 5\n"),
+            Err(ParseError::UnknownKey(_, _))
+        ));
     }
 }

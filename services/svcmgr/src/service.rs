@@ -165,6 +165,13 @@ pub struct RestartRecipe
     /// reserved log-sink sources (with no `HANDOVER_PULL` SEND), not from
     /// `seed`/provider caps. See `definitions::launch::mint_logd_boot_caps`.
     pub log_sink: bool,
+    /// Recipe `priority = ...` value; `0` = unspecified (procmgr default).
+    /// Replayed on every restart so a respawned child lands at the same
+    /// level it got on first launch.
+    pub priority: u8,
+    /// Recipe `sched_max = ...` value; `0` = unspecified (child inherits a
+    /// copy of svcmgr's band). Replayed like [`Self::priority`].
+    pub sched_max: u8,
 }
 
 // ── Bootstrap (init → svcmgr handover endowment) ────────────────────────────

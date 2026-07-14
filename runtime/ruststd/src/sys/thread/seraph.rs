@@ -273,8 +273,22 @@ impl Thread {
                     return Err(io::Error::other("seraph: thread retype slab alloc failed"));
                 }
             };
+        // Place the new thread at the process's assigned level under its
+        // own baseline band. A process with no scheduling authority passes
+        // (0, 0) and its workers land at the floor.
+        let (spawn_sched_cap, spawn_priority) = if info.sched_control_cap != 0 {
+            (info.sched_control_cap, info.initial_priority)
+        } else {
+            (0, 0)
+        };
         let thread_cap =
-            match syscall::cap_create_thread(thread_slab, info.self_aspace, info.self_cspace, 0, 0) {
+            match syscall::cap_create_thread(
+                thread_slab,
+                info.self_aspace,
+                info.self_cspace,
+                spawn_sched_cap,
+                spawn_priority,
+            ) {
                 Ok(cap) => cap,
                 Err(_) => {
                     let _ = syscall::cap_delete(thread_slab);

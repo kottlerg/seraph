@@ -21,6 +21,7 @@
 # graceful-shutdown-via-pwrmgr path would be circular; the honest terminal
 # state is logged-and-continue, matching timed.
 binary    = /services/pwrmgr
+priority  = 16
 restart   = on_failure
 critical  = no
 namespace = none

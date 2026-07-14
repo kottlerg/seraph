@@ -333,6 +333,8 @@ fn recipe_from(def: &Definition) -> RestartRecipe
         cwd: def.cwd.clone(),
         seed: def.seed.clone(),
         log_sink: def.log_sink,
+        priority: def.priority.unwrap_or(0),
+        sched_max: def.sched_max.unwrap_or(0),
     }
 }
 

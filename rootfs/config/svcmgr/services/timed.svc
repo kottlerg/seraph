@@ -18,6 +18,7 @@
 # UNIX_EPOCH but does not break the system; logged and left inactive once
 # the restart budget is spent.
 binary    = /services/timed
+priority  = 16
 restart   = on_failure
 critical  = no
 namespace = none

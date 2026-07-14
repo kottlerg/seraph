@@ -1012,7 +1012,17 @@ dependencies = [
  "ipc",
  "namespace-protocol",
  "registry",
+ "svcmgr-defs",
  "syscall",
+ "syscall-abi",
+]
+
+[[package]]
+name = "svcmgr-defs"
+version = "0.1.1"
+dependencies = [
+ "namespace-protocol",
+ "registry",
  "syscall-abi",
 ]
 

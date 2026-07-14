@@ -142,6 +142,14 @@ pub struct Command {
     /// no system pager. Set via `CommandExt::pinned`. Defaults to off — the
     /// child is demand-paged by the system default.
     pinned: bool,
+    /// `CREATE_PRIORITY` label field for the next spawn. `0` (default) =
+    /// procmgr's policy default, clamped to the child's band. Set via
+    /// `CommandExt::priority`.
+    priority: u8,
+    /// `CREATE_BAND_MAX` label field for the next spawn. `0` (default) =
+    /// the child inherits a copy of the spawner's band. Set via
+    /// `CommandExt::sched_max`.
+    sched_max: u8,
 }
 
 impl Command {
@@ -157,6 +165,8 @@ impl Command {
             namespace_cap: 0,
             cwd_dir_cap: 0,
             pinned: false,
+            priority: 0,
+            sched_max: 0,
         }
     }
 
@@ -178,6 +188,18 @@ impl Command {
     /// `CommandExt::pinned`.
     pub fn set_pinned(&mut self, on: bool) {
         self.pinned = on;
+    }
+
+    /// Request the child's creation priority level. Called by
+    /// `CommandExt::priority`; `0` reverts to procmgr's default.
+    pub fn set_priority(&mut self, level: u8) {
+        self.priority = level;
+    }
+
+    /// Request the child's `SchedControl` band ceiling. Called by
+    /// `CommandExt::sched_max`; `0` reverts to a copy of the spawner's band.
+    pub fn set_sched_max(&mut self, level: u8) {
+        self.sched_max = level;
     }
 
     pub fn arg(&mut self, arg: &OsStr) {
@@ -397,6 +419,7 @@ impl Command {
         let builder = ipc::IpcMessage::builder(procmgr_labels::CREATE_FROM_FILE
             | pinned_flag
             | procmgr_labels::CREATE_DEATH_RELAY
+            | procmgr_labels::create_sched_bits(self.priority, self.sched_max)
             | ((args_blob.len() as u64) << 32)
             | ((u64::from(args_count)) << 48)
             | ((u64::from(env_count)) << 56))

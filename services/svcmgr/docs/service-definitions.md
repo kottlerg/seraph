@@ -35,6 +35,8 @@ service.
 ```
 # /tests/svctest — services-surface test harness.
 binary    = /tests/svctest
+priority  = 10
+sched_max = 10
 argv      = svctest run
 env       = SERAPH_TEST=1 SERAPH_MODE=boot
 restart   = never
@@ -58,6 +60,8 @@ seed      = rootfs.root pwrmgr.shutdown pwrmgr.deny
 | `seed` | no | Space-separated discovery-registry names, resolved positionally (cap[i] = i-th name). |
 | `provides` | no | Space-separated `name[:auth\|:deny]` entries. svcmgr creates this service's endpoint, serves its RECV as bootstrap `cap[0]`, and publishes one badged SEND per entry into the discovery registry. See [`provides`](#provides). |
 | `log_sink` | no | `yes` or `no` (default `no`). Marks the service as the system log sink (real-logd); svcmgr mints its bootstrap round from the reserved log-sink sources init endows. Mutually exclusive with `seed` and `provides`. See [`log_sink`](#log_sink). |
+| `priority` | no | Priority level (`1..=30`) the service's initial thread is created at. Unset: procmgr's default (`sched_policy::DEFAULT_SPAWN_PRIORITY`, clamped to the band). See [`priority` / `sched_max`](#priority--sched_max). |
+| `sched_max` | no | Band ceiling (`1..=30`): the service's `SchedControl` covers `[1, sched_max]`. Must be ≥ `priority` when both are set. Unset: the service inherits a copy of svcmgr's own band. |
 
 There is deliberately no paging key. Demand paging is procmgr's system-wide default
 (see [Fault Handling](../../../docs/fault-handling.md#default-system-pager)); every
@@ -135,6 +139,28 @@ parser error.
 is recorded via `std::env::set_current_dir`; the cap and the
 path-string surface are independent. See svctest's
 `env_cwd_unset_phase` for the assertion.
+
+## `priority` / `sched_max`
+
+The service's scheduling placement, forwarded as the `CREATE_PRIORITY` /
+`CREATE_BAND_MAX` fields of svcmgr's `CREATE_FROM_FILE` label (see
+[procmgr's IPC interface](../../procmgr/docs/ipc-interface.md)) and
+replayed byte-for-byte on every restart:
+
+* `priority` — the level the service's initial thread is created at; the
+  runtime spawns its further threads at the same level. Unset: procmgr's
+  default, `sched_policy::DEFAULT_SPAWN_PRIORITY` clamped to the band.
+* `sched_max` — the ceiling of the `SchedControl` band the service
+  receives (`[1, sched_max]`), which is also its own spawn ceiling for
+  `std::process::Command` children. Unset: a copy of svcmgr's band.
+
+Both values are validated by procmgr against svcmgr's own band ceiling
+(`sched_policy::SVCMGR_PRIORITY`, currently 21) — a recipe requesting more
+than svcmgr holds fails the spawn with `INVALID_ARGUMENT`. The parser
+rejects values outside `1..=30` and `sched_max < priority` (a service's
+band must cover its own starting level). The system-wide level map lives
+in `shared/ipc`'s `sched_policy` module; recipes carry only the levels of
+svcmgr-launched services.
 
 ## `seed`
 

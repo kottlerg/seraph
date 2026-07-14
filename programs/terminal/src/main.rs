@@ -28,6 +28,7 @@ mod input;
 mod output;
 
 use std::io::Write;
+use std::os::seraph::process::CommandExt;
 use std::process::{ChildStdin, Command, Stdio};
 use std::sync::mpsc::{Receiver, Sender, channel};
 
@@ -120,10 +121,16 @@ fn run(child_path: &str, rx: &Receiver<Msg>, tx: &Sender<Msg>, sink: &mut Sink) 
         // default (the common first-spawn case).
         sink.write(b"\x1b[0m");
 
+        // The child session (shell) is the least-trusted process in the
+        // system: place it at level 5 with a matching band ceiling so
+        // neither it nor anything it spawns can climb above 5 — the
+        // terminal itself (level 10) always preempts it.
         let mut child = match Command::new(child_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .priority(5)
+            .sched_max(5)
             .spawn()
         {
             Ok(child) => child,

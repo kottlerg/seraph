@@ -1403,6 +1403,8 @@ fn spawn_virtio_blk(
             service_ep: blk_ep,
             registry_ep: caps.registry_ep,
             device_badge,
+            // Boot-critical: the root-disk path.
+            priority: ipc::sched_policy::BOOT_DRIVER_PRIORITY,
         };
         // `spawn_driver` owns the module cap's lifecycle from here (guarded
         // internally: consumed by CREATE_PROCESS, or released on failure).
@@ -1633,6 +1635,7 @@ fn spawn_virtio_input_from_disk(
         service_ep: input_ep,
         registry_ep: caps.registry_ep,
         device_badge: pending.device_badge,
+        priority: ipc::sched_policy::AUX_DRIVER_PRIORITY,
     };
 
     // `spawn_driver` owns the file cap's lifecycle from here (consumed by
@@ -1696,6 +1699,7 @@ fn spawn_serial(caps: &mut caps::DevmgrCaps, uart_irq: u32, ipc_buf: *mut u64) -
         hw_cap,
         uart_irq, // UART interrupt; 0 falls back to client-side RX polling
         0,        // no devmgr_query_ep: serial driver needs no runtime platform metadata
+        ipc::sched_policy::BOOT_DRIVER_PRIORITY, // boot-critical: the console path
         ipc_buf,
     );
     (spawned, serial_ep)
@@ -1829,6 +1833,7 @@ fn spawn_framebuffer(
         hw_cap,
         0, // no UART IRQ: framebuffer has no interrupt-driven path
         devmgr_query_ep,
+        ipc::sched_policy::AUX_DRIVER_PRIORITY,
         ipc_buf,
     );
     (spawned, fb_ep)
@@ -1908,6 +1913,7 @@ fn spawn_rtc_from_disk(
         hw_cap,
         0, // no UART IRQ: RTC is polled
         0, // no devmgr_query_ep: RTC driver needs no runtime platform metadata
+        ipc::sched_policy::AUX_DRIVER_PRIORITY,
         ipc_buf,
     );
     if spawned
@@ -1989,6 +1995,7 @@ fn test_spawn_orphan(
         hw_cap,
         0, // no UART IRQ: this device has no interrupt-driven path
         query_ep,
+        0, // scheduling unspecified: procmgr defaults; the child is torn down anyway
         ipc_buf,
     );
 

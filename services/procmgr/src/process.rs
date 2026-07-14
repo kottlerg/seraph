@@ -165,6 +165,7 @@ pub fn install_logd_death_eq(table: &mut ProcessTable, logd_eq: u32) -> bool
 // `main.rs` already uses keep resolving unchanged.
 pub use process_table::{
     MAX_PROCESSES, ProcessEntry, ProcessTable, RecentExits, badge_is_acceptable,
+    resolve_spawn_sched,
 };
 
 // ── Process table (impure operations) ─────────────────────────────────────────
@@ -352,6 +353,20 @@ pub struct CreateResult
     pub thread_for_caller: u32,
 }
 
+/// Resolved scheduling placement for a child, produced by
+/// `crate::resolve_create_sched` from the create-label fields and the
+/// creator's ceiling. Invariant: `1 <= priority <= band_max <=`
+/// [`ipc::sched_policy::BASELINE_PRIORITY_MAX`].
+#[derive(Clone, Copy)]
+pub struct ChildSched
+{
+    /// Priority level the child's initial thread is created at.
+    pub priority: u8,
+    /// Upper bound of the baseline `SchedControl` band minted into the
+    /// child (`[1, band_max]`).
+    pub band_max: u8,
+}
+
 // ── Child setup helpers ─────────────────────────────────────────────────────
 
 /// Universal bootstrap caps procmgr threads through into every child.
@@ -406,11 +421,15 @@ pub struct UniversalCaps
     /// `pi.service_registry_cap` and `registry_client::lookup` no-ops.
     pub registry_send_source: u32,
     /// Baseline `SchedControl` cap in procmgr's `CSpace` (procmgr's own
-    /// `ProcessInfo.sched_control_cap`, default band `[1, 20]`). `cap_copy`d
-    /// into every child's `CSpace` and recorded in the child's
-    /// `ProcessInfo.sched_control_cap` so the child can set its own threads'
-    /// priorities within the band. Zero when procmgr was given no baseline;
-    /// children then receive zero and cannot set any priority.
+    /// `ProcessInfo.sched_control_cap`, band
+    /// `[1, sched_policy::BASELINE_PRIORITY_MAX]`). Source of every child's
+    /// band: copied whole when the child's `band_max` equals the baseline
+    /// ceiling, or copy-then-split narrowed to `[1, band_max]` otherwise;
+    /// the result is recorded in the child's
+    /// `ProcessInfo.sched_control_cap`. Also the authority procmgr invokes
+    /// to create child threads at their assigned level. Zero when procmgr
+    /// was given no baseline; children then receive zero, are created at
+    /// the floor, and cannot set any priority.
     pub sched_baseline: u32,
     /// Whether the child is demand-paged. Demand paging is the default; this
     /// is false only when the caller set `procmgr_labels::CREATE_PINNED` (a
@@ -509,6 +528,7 @@ fn populate_child_info(
     ipc_buf: *mut u64,
     stack_pages: u32,
     process_badge: u64,
+    sched: ChildSched,
     layout: &ProcessLayout,
 ) -> Option<u32>
 {
@@ -631,11 +651,34 @@ fn populate_child_info(
     // see all-zero stdio memory-cap/notification slots, which std maps to silent
     // println! / EOF on stdin.
 
-    // Baseline SchedControl: a copy of procmgr's band into the child so it can
-    // set its own threads' priorities within the band. Presence-only authority.
+    // Baseline SchedControl: the child's band `[1, sched.band_max]`.
+    // Full-width bands are a plain copy of procmgr's baseline. Narrower
+    // bands are minted copy-then-split: derive a private copy, split it at
+    // `band_max + 1` (the split consumes only the invoked copy — procmgr's
+    // baseline slot is untouched), hand the low child across, and drop
+    // both procmgr-side pieces (the child's `cap_copy` holds its own
+    // reference; the discarded high child never leaves procmgr).
     let sched_in_child = if universals.sched_baseline != 0
     {
-        syscall::cap_copy(universals.sched_baseline, child_cspace, syscall::RIGHTS_ALL).ok()?
+        if sched.band_max >= ipc::sched_policy::BASELINE_PRIORITY_MAX
+        {
+            syscall::cap_copy(universals.sched_baseline, child_cspace, syscall::RIGHTS_ALL).ok()?
+        }
+        else
+        {
+            let own_copy =
+                syscall::cap_derive(universals.sched_baseline, syscall::RIGHTS_ALL).ok()?;
+            let Ok((low, high)) = syscall::sched_split(own_copy, sched.band_max + 1)
+            else
+            {
+                let _ = syscall::cap_delete(own_copy);
+                return None;
+            };
+            let child_slot = syscall::cap_copy(low, child_cspace, syscall::RIGHTS_ALL);
+            let _ = syscall::cap_delete(low);
+            let _ = syscall::cap_delete(high);
+            child_slot.ok()?
+        }
     }
     else
     {
@@ -649,6 +692,7 @@ fn populate_child_info(
     pi.self_aspace_cap = child_aspace_in_child;
     pi.self_cspace_cap = child_cspace_in_child;
     pi.sched_control_cap = sched_in_child;
+    pi.initial_priority = sched.priority;
     pi.ipc_buffer_vaddr = layout.ipc_buffer_va;
     pi.creator_endpoint_cap = creator_ep_in_child;
     pi.procmgr_endpoint_cap = procmgr_ep_in_child;
@@ -1157,6 +1201,7 @@ fn finalize_creation(
     demand_paged: bool,
     self_memmgr_ep: u32,
     parent_relay_cap: u32,
+    band_max: u8,
     ipc_buf: *mut u64,
     layout: &ProcessLayout,
 ) -> Option<CreateResult>
@@ -1222,6 +1267,7 @@ fn finalize_creation(
         memmgr_badge,
         namespace_override: 0,
         cwd_override: 0,
+        band_max,
         entry_point,
         tls_base_va: main_tls.base_va,
         stack_top_vaddr: layout.stack_top,
@@ -1308,6 +1354,7 @@ fn create_process_from_bytes(
     args: &ChildArgs<'_>,
     env: &ChildEnv<'_>,
     death_eq: u32,
+    sched: ChildSched,
     ipc_buf: *mut u64,
 ) -> Option<CreateResult>
 {
@@ -1384,8 +1431,24 @@ fn create_process_from_bytes(
         crate::THREAD_RETYPE_PAGES,
         ipc_buf,
     )?;
-    let child_thread =
-        syscall::cap_create_thread(thread_slab, child_aspace, child_cspace, 0, 0).ok()?;
+    // Create the initial thread at its assigned level, under procmgr's own
+    // baseline authority. Without a baseline the child lands at the floor.
+    let (create_sched_cap, create_priority) = if universals.sched_baseline != 0
+    {
+        (universals.sched_baseline, sched.priority)
+    }
+    else
+    {
+        (0, 0)
+    };
+    let child_thread = syscall::cap_create_thread(
+        thread_slab,
+        child_aspace,
+        child_cspace,
+        create_sched_cap,
+        create_priority,
+    )
+    .ok()?;
     let _ = syscall::cap_delete(thread_slab);
 
     let child_memmgr_send = universals.memmgr_endpoint;
@@ -1504,6 +1567,7 @@ fn create_process_from_bytes(
         ipc_buf,
         stack_pages,
         process_badge,
+        sched,
         &layout,
     )?;
     map_child_stack_and_ipc(
@@ -1532,6 +1596,7 @@ fn create_process_from_bytes(
         // Boot-module spawns (CREATE_PROCESS) have no parent death queue to
         // relay terminal faults to; only CREATE_FROM_FILE carries a relay.
         0,
+        sched.band_max,
         ipc_buf,
         &layout,
     )
@@ -1553,6 +1618,7 @@ pub fn create_process(
     args: &ChildArgs<'_>,
     env: &ChildEnv<'_>,
     death_eq: u32,
+    sched: ChildSched,
 ) -> Option<CreateResult>
 {
     let (module_scratch, module_pages) = loader::map_module(module_memory_cap, self_aspace)?;
@@ -1573,6 +1639,7 @@ pub fn create_process(
         args,
         env,
         death_eq,
+        sched,
         ipc_buf,
     );
 
@@ -1679,7 +1746,9 @@ fn vfs_read(
 }
 
 /// Close an open file via its per-file capability and delete the cap.
-fn vfs_close(file_cap: u32, ipc_buf: *mut u64)
+/// `pub(crate)` so `main.rs` request handlers can release a transferred
+/// file cap on pre-create validation failures.
+pub(crate) fn vfs_close(file_cap: u32, ipc_buf: *mut u64)
 {
     let msg = IpcMessage::new(ipc::fs_labels::FS_CLOSE);
     // SAFETY: ipc_buf is the registered IPC buffer page.
@@ -1995,6 +2064,7 @@ pub fn create_process_from_file(
     death_eq: u32,
     demand_paged: bool,
     parent_relay_cap: u32,
+    sched: ChildSched,
 ) -> Result<CreateResult, u64>
 {
     let self_aspace = ctx.self_aspace;
@@ -2176,13 +2246,29 @@ pub fn create_process_from_file(
                 let _ = syscall::cap_delete(child_aspace);
                 procmgr_errors::OUT_OF_MEMORY
             })?;
-    let child_thread = syscall::cap_create_thread(thread_slab, child_aspace, child_cspace, 0, 0)
-        .map_err(|_| {
-            let _ = syscall::cap_delete(thread_slab);
-            let _ = syscall::cap_delete(child_cspace);
-            let _ = syscall::cap_delete(child_aspace);
-            procmgr_errors::OUT_OF_MEMORY
-        })?;
+    // Create the initial thread at its assigned level, under procmgr's own
+    // baseline authority. Without a baseline the child lands at the floor.
+    let (create_sched_cap, create_priority) = if ctx.sched_baseline != 0
+    {
+        (ctx.sched_baseline, sched.priority)
+    }
+    else
+    {
+        (0, 0)
+    };
+    let child_thread = syscall::cap_create_thread(
+        thread_slab,
+        child_aspace,
+        child_cspace,
+        create_sched_cap,
+        create_priority,
+    )
+    .map_err(|_| {
+        let _ = syscall::cap_delete(thread_slab);
+        let _ = syscall::cap_delete(child_cspace);
+        let _ = syscall::cap_delete(child_aspace);
+        procmgr_errors::OUT_OF_MEMORY
+    })?;
     let _ = syscall::cap_delete(thread_slab);
 
     // All three child kernel-object caps are live; group them under a
@@ -2338,6 +2424,7 @@ pub fn create_process_from_file(
         ipc_buf,
         stack_pages,
         process_badge,
+        sched,
         &layout,
     )
     .ok_or(procmgr_errors::OUT_OF_MEMORY)?;
@@ -2379,6 +2466,7 @@ pub fn create_process_from_file(
         universals.demand_paged,
         universals.self_memmgr_ep,
         parent_relay_cap,
+        sched.band_max,
         ipc_buf,
         &layout,
     )

@@ -662,6 +662,7 @@ fn populate_memmgr_info(
             pi.self_aspace_cap = mm_aspace_in_mm;
             pi.self_cspace_cap = mm_cspace_in_mm;
             pi.sched_control_cap = mm_sched_in_mm;
+            pi.initial_priority = ipc::sched_policy::MEMMGR_PRIORITY;
             pi.ipc_buffer_vaddr = layout.ipc_buffer_va;
             pi.creator_endpoint_cap = caps.creator_endpoint_slot;
             pi.procmgr_endpoint_cap = 0;
@@ -795,7 +796,16 @@ pub fn bootstrap_memmgr(
         syscall::cap_create_aspace(arena.cap, 0, crate::ASPACE_RETYPE_PAGES - 1).ok()?;
     let mm_cspace =
         syscall::cap_create_cspace(arena.cap, 0, crate::CSPACE_RETYPE_PAGES - 1, 8192).ok()?;
-    let mm_thread = syscall::cap_create_thread(arena.cap, mm_aspace, mm_cspace, 0, 0).ok()?;
+    // memmgr is the system pager: create its thread at the top of the
+    // baseline band so nothing it serves can preempt it.
+    let mm_thread = syscall::cap_create_thread(
+        arena.cap,
+        mm_aspace,
+        mm_cspace,
+        baseline_sched,
+        ipc::sched_policy::MEMMGR_PRIORITY,
+    )
+    .ok()?;
 
     log("created memmgr kernel objects");
     log("loading memmgr ELF segments");
@@ -1253,6 +1263,7 @@ fn populate_procmgr_info(
             pi.self_aspace_cap = pm_aspace_in_pm;
             pi.self_cspace_cap = pm_cspace_in_pm;
             pi.sched_control_cap = pm_sched_in_pm;
+            pi.initial_priority = ipc::sched_policy::PROCMGR_PRIORITY;
             pi.ipc_buffer_vaddr = layout.ipc_buffer_va;
             pi.creator_endpoint_cap = caps.creator_endpoint_slot;
             // procmgr has no procmgr above it; leave zero.
@@ -1493,7 +1504,16 @@ pub fn bootstrap_procmgr(
         syscall::cap_create_aspace(arena.cap, 0, crate::ASPACE_RETYPE_PAGES - 1).ok()?;
     let pm_cspace =
         syscall::cap_create_cspace(arena.cap, 0, crate::CSPACE_RETYPE_PAGES - 1, 8192).ok()?;
-    let pm_thread = syscall::cap_create_thread(arena.cap, pm_aspace, pm_cspace, 0, 0).ok()?;
+    // procmgr sits directly below memmgr: above every process it manages,
+    // preemptible only by its own pager.
+    let pm_thread = syscall::cap_create_thread(
+        arena.cap,
+        pm_aspace,
+        pm_cspace,
+        baseline_sched,
+        ipc::sched_policy::PROCMGR_PRIORITY,
+    )
+    .ok()?;
 
     log("created procmgr kernel objects");
     log("loading procmgr ELF segments");

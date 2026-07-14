@@ -109,7 +109,7 @@ how devmgr uses them.
 | IoPort (x86-64, root) | Use / carve | Carve narrow per-driver port caps (CMOS, COM1) and pwrmgr's PM1a + 8042 reset ports |
 | SbiControl (RISC-V, Reset + Suspend) | Reset / Suspend | Steady-state holder of the platform power-state SBI authority (init is reaped); broker a Reset-only copy to pwrmgr for SBI SRST shutdown / reboot. Suspend held for a future power path |
 | Memory (firmware tables) | Map (read-only) | Parse ACPI RSDP / Device Tree blob (incl. IOMMU topology: DMAR on x86-64, `iommu` / `iommu-map` on RISC-V); broker read-only ACPI tables to pwrmgr via `QUERY_ACPI_TABLE` |
-| SchedControl (baseline, via `ProcessInfo`) | band `[1, 20]` | Set driver/thread priorities within the baseline band. Like every process, devmgr receives this from procmgr (`ProcessInfo.sched_control_cap`), not the init bootstrap rounds; elevated bands for latency-sensitive drivers require an explicit init grant (not currently wired) |
+| SchedControl (baseline, via `ProcessInfo`) | band `[1, 26]` (`sched_policy::DEVMGR_BAND_MAX`) | Place spawned drivers at their assigned levels (serial/virtio-blk at 26, framebuffer/RTC/virtio-input at 25 — the `CREATE_PRIORITY` field of each driver spawn) and set devmgr's own threads' priorities. Like every process, devmgr receives this from procmgr (`ProcessInfo.sched_control_cap`); init requests the deliberately-elevated ceiling (above devmgr's own level 24) via the create label's `CREATE_BAND_MAX` field |
 
 IOMMU register regions are not pre-minted as distinct capabilities.
 `devmgr` discovers IOMMU units from the firmware passthrough (DMAR or

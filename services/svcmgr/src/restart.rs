@@ -96,9 +96,17 @@ pub struct StartupBlobs<'a>
 /// the recipe: launch from the parsed `Definition`, restart from the
 /// stored [`RestartRecipe`]. A caller with no recipe (defensive) passes
 /// [`StartupBlobs::default`] for empty surfaces.
+///
+/// `priority` / `sched_max` are the recipe's scheduling fields (`0` =
+/// unspecified — procmgr applies its defaults against svcmgr's band).
+/// They ride the create label's `CREATE_PRIORITY` / `CREATE_BAND_MAX`
+/// fields; a value above svcmgr's own band ceiling makes procmgr reject
+/// the create with `INVALID_ARGUMENT`.
 pub fn walk_and_create_from_file(
     path: &str,
     blobs: StartupBlobs<'_>,
+    priority: u8,
+    sched_max: u8,
     procmgr_ep: u32,
     bootstrap_ep: u32,
     ipc_buf: *mut u64,
@@ -130,6 +138,7 @@ pub fn walk_and_create_from_file(
     let env_words = env_bytes.div_ceil(8);
 
     let label = procmgr_labels::CREATE_FROM_FILE
+        | procmgr_labels::create_sched_bits(priority, sched_max)
         | ((argv_bytes as u64) << 32)
         | (u64::from(blobs.argv_count) << 48)
         | (u64::from(blobs.env_count) << 56);
@@ -502,6 +511,8 @@ fn create_process(
     let created = walk_and_create_from_file(
         path_str,
         blobs,
+        recipe.map_or(0, |r| r.priority),
+        recipe.map_or(0, |r| r.sched_max),
         ctx.procmgr_ep,
         ctx.bootstrap_ep,
         ctx.ipc_buf,

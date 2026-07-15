@@ -353,10 +353,18 @@ pub fn create_devmgr_with_caps(
 
     // caps: [module, creator]. No stdio pipes — devmgr reaches the
     // system log via the discovery cap procmgr installs in ProcessInfo.
-    let create_msg = IpcMessage::builder(procmgr_labels::CREATE_PROCESS)
-        .cap(devmgr_module_copy)
-        .cap(badged_creator)
-        .build();
+    // Band ceiling deliberately above devmgr's own level so it can place
+    // the drivers it spawns at the boot/aux driver levels.
+    let create_msg = IpcMessage::builder(
+        procmgr_labels::CREATE_PROCESS
+            | procmgr_labels::create_sched_bits(
+                ipc::sched_policy::DEVMGR_PRIORITY,
+                ipc::sched_policy::DEVMGR_BAND_MAX,
+            ),
+    )
+    .cap(devmgr_module_copy)
+    .cap(badged_creator)
+    .build();
     // SAFETY: ipc_buf is the registered IPC buffer.
     let Ok(reply) = (unsafe { ipc::ipc_call(procmgr_ep, &create_msg, ipc_buf) })
     else
@@ -755,10 +763,16 @@ pub fn create_vfsd_with_caps(
 
     let (badged_creator, child_badge) = derive_badged_creator(bootstrap_ep)?;
 
-    let create_msg = IpcMessage::builder(procmgr_labels::CREATE_PROCESS)
-        .cap(vfsd_module_copy)
-        .cap(badged_creator)
-        .build();
+    let create_msg = IpcMessage::builder(
+        procmgr_labels::CREATE_PROCESS
+            | procmgr_labels::create_sched_bits(
+                ipc::sched_policy::VFSD_PRIORITY,
+                ipc::sched_policy::VFSD_PRIORITY,
+            ),
+    )
+    .cap(vfsd_module_copy)
+    .cap(badged_creator)
+    .build();
     // SAFETY: ipc_buf is the registered IPC buffer.
     let Ok(reply) = (unsafe { ipc::ipc_call(procmgr_ep, &create_msg, ipc_buf) })
     else
@@ -863,11 +877,17 @@ pub fn create_svcmgr_from_file(
 
     let (badged_creator, child_badge) = derive_badged_creator(bootstrap_ep)?;
 
-    let msg = IpcMessage::builder(procmgr_labels::CREATE_FROM_FILE)
-        .word(0, walked.size)
-        .cap(walked.file_cap)
-        .cap(badged_creator)
-        .build();
+    let msg = IpcMessage::builder(
+        procmgr_labels::CREATE_FROM_FILE
+            | procmgr_labels::create_sched_bits(
+                ipc::sched_policy::SVCMGR_PRIORITY,
+                ipc::sched_policy::SVCMGR_PRIORITY,
+            ),
+    )
+    .word(0, walked.size)
+    .cap(walked.file_cap)
+    .cap(badged_creator)
+    .build();
 
     // SAFETY: ipc_buf is the registered IPC buffer.
     let Ok(reply) = (unsafe { ipc::ipc_call(procmgr_ep, &msg, ipc_buf) })

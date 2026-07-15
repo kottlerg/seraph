@@ -54,13 +54,19 @@ space is uniform; any partition into tiers is userspace policy, expressed by how
 
 - The root `SchedControl` spans `[1, PRIORITY_MAX]`, is created at boot, and is
   held by init.
-- Init narrows it with `SYS_SCHED_SPLIT` into a baseline band — `[1, 20]` by
-  default — and an elevated remainder `[21, PRIORITY_MAX]`.
-- Every spawned process receives a baseline copy through
-  `ProcessInfo.sched_control_cap` (procmgr fans it out at `CREATE_PROCESS`), so a
-  service self-schedules within the baseline without further grants.
-- Services needing real-time-ish scheduling (audio servers, device managers,
-  high-priority drivers) receive an explicit cap carved from the remainder.
+- Init narrows it with `SYS_SCHED_SPLIT` into the baseline band `[1, 28]`
+  (`sched_policy::BASELINE_PRIORITY_MAX` in `shared/ipc`) and an elevated
+  remainder `[29, PRIORITY_MAX]` that never leaves init and dies at its reap —
+  init's own boot thread (kernel-placed at `INIT_PRIORITY` = 30) is the only
+  occupant above the baseline.
+- Every spawned process receives a band through
+  `ProcessInfo.sched_control_cap`: procmgr mints it from its baseline copy at
+  create time, whole or `SYS_SCHED_SPLIT`-narrowed to the `[1, band_max]` the
+  spawner requested, and creates the child's initial thread at the requested
+  level under its own baseline authority. The per-service level map is pure
+  userspace policy — `shared/ipc`'s `sched_policy` module for the
+  init/procmgr/devmgr/vfsd-assigned levels, svcmgr `.svc` recipes
+  (`priority = ...` / `sched_max = ...`) for supervised services.
 
 `SchedControl` is the sole authority; see
 [capability-model.md § SchedControl](../../../docs/capability-model.md) for the

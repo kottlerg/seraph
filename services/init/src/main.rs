@@ -348,13 +348,6 @@ pub extern "C" fn _start(info_ptr: u64) -> !
 // already factored through service::create_*_with_caps /
 // service::phase3_svcmgr_handover for the subsystem-specific work; what
 // remains is the fixed orchestration sequence.
-/// Highest priority level in the default baseline `SchedControl` band that
-/// init delegates to every spawned process. Init splits its full-range root
-/// cap into this baseline (`[PRIORITY_MIN, BASELINE_PRIORITY_MAX]`) and the
-/// elevated remainder it retains. This partition is init policy, not a kernel
-/// invariant — the kernel no longer defines a normal/elevated boundary (#185).
-pub(crate) const BASELINE_PRIORITY_MAX: u8 = 20;
-
 #[allow(clippy::too_many_lines)]
 fn run(info_ptr: u64) -> !
 {
@@ -499,13 +492,18 @@ fn run(info_ptr: u64) -> !
     logging::set_ipc_logging(init_log_send, ipc_buf);
     logging::register_name(b"init");
 
-    // Split init's full-range root SchedControl into the baseline band every
-    // spawned process receives ([PRIORITY_MIN, BASELINE_PRIORITY_MAX]) and the
-    // elevated remainder init retains for explicit grants. `_elevated` stays in
-    // init's CSpace. Both memmgr and procmgr get a baseline copy; procmgr also
-    // uses it as the fan-out source for every process it creates. (#185)
-    let Ok((baseline_sched, _elevated)) =
-        syscall::sched_split(info.sched_control_cap, BASELINE_PRIORITY_MAX + 1)
+    // Split init's full-range root SchedControl into the baseline band the
+    // spawn chain distributes ([PRIORITY_MIN, sched_policy::BASELINE_PRIORITY_MAX])
+    // and the elevated remainder [29, 30], which stays in init's CSpace and
+    // dies at init's reap — no spawned process can ever reach it. Both memmgr
+    // and procmgr get a baseline copy; procmgr also uses it as the fan-out
+    // source for every process it creates. (#185) Runs after
+    // `spawn_log_thread`, which places init-logd from the still-unsplit root
+    // cap — the split consumes `info.sched_control_cap`'s slot.
+    let Ok((baseline_sched, _elevated)) = syscall::sched_split(
+        info.sched_control_cap,
+        ipc::sched_policy::BASELINE_PRIORITY_MAX + 1,
+    )
     else
     {
         logging::log("init: FATAL: SchedControl baseline split failed");

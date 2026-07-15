@@ -72,7 +72,7 @@ use syscall_abi::{MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
 //     TIMED_LABELS_VERSION
 //     SERIAL_LABELS_VERSION
 
-pub const PROCMGR_LABELS_VERSION: u32 = 2;
+pub const PROCMGR_LABELS_VERSION: u32 = 3;
 /// IPC labels for the process manager (`procmgr`).
 pub mod procmgr_labels
 {
@@ -95,7 +95,10 @@ pub mod procmgr_labels
     ///
     /// Label layout:
     /// * bits `[0..16]` — opcode (`CREATE_FROM_FILE`)
-    /// * bits `[16..32]` — reserved (zero)
+    /// * bits `[16..18]` — flags ([`CREATE_PINNED`], [`CREATE_DEATH_RELAY`])
+    /// * bits `[18..23]` — `CREATE_PRIORITY` (see [`CREATE_PRIORITY_SHIFT`])
+    /// * bits `[23..28]` — `CREATE_BAND_MAX` (see [`CREATE_BAND_MAX_SHIFT`])
+    /// * bits `[28..32]` — reserved (zero; see [`CREATE_RESERVED_MASK`])
     /// * bits `[32..48]` — `args_bytes` (total byte length of the argv blob; u16)
     /// * bits `[48..56]` — `args_count` (number of NUL-terminated argv strings; u8)
     /// * bits `[56..64]` — `env_count` (number of NUL-terminated `KEY=VALUE` strings; u8)
@@ -140,6 +143,43 @@ pub mod procmgr_labels
     /// `EventQueue` state at bind time). Occupies bit 17 of the reserved
     /// `[16..32]` label window.
     pub const CREATE_DEATH_RELAY: u64 = 1 << 17;
+    /// Bit offset of the `CREATE_PRIORITY` field (bits `[18..23]`) in a
+    /// [`CREATE_PROCESS`] / [`CREATE_FROM_FILE`] label: the priority level
+    /// the child's initial thread is created at. `0` = unspecified —
+    /// procmgr places the child at
+    /// [`crate::sched_policy::DEFAULT_SPAWN_PRIORITY`] clamped to the
+    /// child's band. A nonzero value must satisfy
+    /// `1 <= priority <= band_max <= creator's band ceiling`; violations
+    /// reply `INVALID_ARGUMENT`. Occupies bits 18–22 of the reserved
+    /// `[16..32]` label window.
+    pub const CREATE_PRIORITY_SHIFT: u32 = 18;
+    /// Bit offset of the `CREATE_BAND_MAX` field (bits `[23..28]`): the
+    /// upper bound of the baseline `SchedControl` band procmgr mints into
+    /// the child (`[1, band_max]`, delivered via
+    /// `ProcessInfo.sched_control_cap`). `0` = unspecified — the child
+    /// receives a copy of its creator's band. A nonzero value must not
+    /// exceed the creator's band ceiling. Occupies bits 23–27 of the
+    /// reserved `[16..32]` label window.
+    pub const CREATE_BAND_MAX_SHIFT: u32 = 23;
+    /// Width mask of each 5-bit scheduling field in the create label.
+    pub const CREATE_SCHED_FIELD_MASK: u64 = 0x1F;
+    /// Still-reserved bits `[28..32]` of the create-label window. Procmgr
+    /// rejects labels with any of these set (`INVALID_ARGUMENT`), so a
+    /// future field addition is provably additive: existing senders are
+    /// known to send zeros.
+    pub const CREATE_RESERVED_MASK: u64 = 0xF << 28;
+
+    /// Pack the scheduling fields of a [`CREATE_PROCESS`] /
+    /// [`CREATE_FROM_FILE`] label. `0` in either field means
+    /// "unspecified" (procmgr applies its defaults; see
+    /// [`CREATE_PRIORITY_SHIFT`] / [`CREATE_BAND_MAX_SHIFT`]).
+    #[must_use]
+    pub const fn create_sched_bits(priority: u8, band_max: u8) -> u64
+    {
+        ((priority as u64) & CREATE_SCHED_FIELD_MASK) << CREATE_PRIORITY_SHIFT
+            | ((band_max as u64) & CREATE_SCHED_FIELD_MASK) << CREATE_BAND_MAX_SHIFT
+    }
+
     /// Destroy a process: `cap_delete` its kernel objects (thread, aspace,
     /// cspace, `ProcessInfo` Memory cap), dec-refing any pages the child
     /// still holds so they recycle back into the kernel buddy allocator. The
@@ -301,6 +341,83 @@ pub mod procmgr_labels
     /// `log_badges::LOG_BADGE_FIRST_CHILD = 16`; reserving the top of
     /// the u32 range avoids collision.
     pub const INIT_REAP_CORRELATOR: u32 = u32::MAX;
+}
+
+/// System-wide scheduling-policy constants: the per-service priority level
+/// map. Pure userspace policy — the kernel defines only the level space
+/// (`[PRIORITY_MIN, PRIORITY_MAX]`, level 31 reserved) and the
+/// `SchedControl` band mechanism; every number here is a placement choice
+/// and can change without touching the kernel.
+///
+/// Level map (30 = init, kernel-assigned; 31 reserved):
+///
+/// | Level | Occupant |
+/// |---|---|
+/// | 30 | init (kernel-assigned `INIT_PRIORITY`) |
+/// | 28 | memmgr |
+/// | 27 | procmgr |
+/// | 26 | init-logd, serial, virtio-blk |
+/// | 25 | framebuffer, rtc, virtio-input |
+/// | 24 | devmgr |
+/// | 23 | vfsd, fs drivers (fatfs) |
+/// | 21 | svcmgr |
+/// | ≤21 | svcmgr-launched services, per `.svc` recipe (logd 18, timed/pwrmgr 16, terminal 10, shell/crasher 5) |
+///
+/// Levels for svcmgr-launched services live in their `.svc` recipes
+/// (`priority = ...` / `sched_max = ...`), not here — this module carries
+/// only the levels assigned by init, procmgr, devmgr, and vfsd directly.
+pub mod sched_policy
+{
+    /// Upper bound of the baseline `SchedControl` band init delegates to
+    /// the spawn chain: init splits its root `[1, 30]` cap at
+    /// `BASELINE_PRIORITY_MAX + 1`, keeps the elevated remainder
+    /// (`[29, 30]`, which dies at init's reap), and hands the baseline
+    /// `[1, 28]` to memmgr and procmgr. Every band procmgr mints for a
+    /// child is a (possibly narrowed) descendant of this baseline, so no
+    /// spawned process can ever reach `[29, 30]`.
+    pub const BASELINE_PRIORITY_MAX: u8 = 28;
+
+    /// Priority procmgr assigns when a `CREATE_PROCESS` /
+    /// `CREATE_FROM_FILE` label carries no `CREATE_PRIORITY` field,
+    /// clamped to the child's band.
+    pub const DEFAULT_SPAWN_PRIORITY: u8 = 10;
+
+    /// memmgr — the system pager and frame-pool owner. Everything below
+    /// it can fault into it, so it outranks all of them.
+    pub const MEMMGR_PRIORITY: u8 = 28;
+
+    /// procmgr — process lifecycle authority.
+    pub const PROCMGR_PRIORITY: u8 = 27;
+
+    /// init's log-mediator thread (init-logd). Above every log producer
+    /// it serves during bootstrap; matches the boot-critical drivers.
+    pub const INIT_LOGD_PRIORITY: u8 = 26;
+
+    /// Boot-critical device drivers: serial (console path) and
+    /// virtio-blk (root-disk path).
+    pub const BOOT_DRIVER_PRIORITY: u8 = 26;
+
+    /// Non-boot-critical device drivers: framebuffer, RTC, virtio-input.
+    pub const AUX_DRIVER_PRIORITY: u8 = 25;
+
+    /// devmgr — device enumeration and driver supervision.
+    pub const DEVMGR_PRIORITY: u8 = 24;
+
+    /// devmgr's band ceiling. Deliberately above its own level so it can
+    /// place the drivers it spawns at [`BOOT_DRIVER_PRIORITY`] /
+    /// [`AUX_DRIVER_PRIORITY`].
+    pub const DEVMGR_BAND_MAX: u8 = 26;
+
+    /// vfsd — the namespace/VFS authority.
+    pub const VFSD_PRIORITY: u8 = 23;
+
+    /// Filesystem drivers (fatfs), spawned by vfsd at its own level: an
+    /// fs driver is the blocking dependency of every vfsd read.
+    pub const FS_DRIVER_PRIORITY: u8 = 23;
+
+    /// svcmgr — service supervisor and discovery registry. Above every
+    /// service it launches (recipes are validated against its band).
+    pub const SVCMGR_PRIORITY: u8 = 21;
 }
 
 pub const MEMMGR_LABELS_VERSION: u32 = 5;

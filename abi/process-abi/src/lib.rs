@@ -65,7 +65,13 @@ use core::prelude::rust_2024::*;
 ///      [`ProcessInfo::main_tls_vaddr`], the chosen main-thread TLS block base
 ///      (the stack top and IPC buffer already had runtime fields). The IPC
 ///      buffer VA is also creator-chosen (it was already a runtime field).
-pub const PROCESS_ABI_VERSION: u32 = 21;
+/// v22: Added [`ProcessInfo::initial_priority`] — the priority level the
+///      creator placed the process's initial thread at, so the runtime can
+///      spawn further threads at the same level via
+///      `SYS_CAP_CREATE_THREAD`'s scheduling arguments. Occupies former
+///      padding after [`ProcessInfo::sched_control_cap`]; all other field
+///      offsets are unchanged.
+pub const PROCESS_ABI_VERSION: u32 = 22;
 
 // ── Address space constants ──────────────────────────────────────────────────
 
@@ -221,12 +227,25 @@ pub struct ProcessInfo
 
     /// `CSpace` slot of a baseline `SchedControl` capability, or zero.
     ///
-    /// Authorises `SYS_THREAD_SET_PRIORITY` for the priority band the cap
-    /// spans (default `[1, 20]`, delegated by procmgr per process). Pass this
-    /// slot as the `SchedControl` argument when setting a thread's priority.
-    /// Zero when no scheduling authority is delegated (the process then cannot
-    /// set any priority). See [capability-model.md](../../docs/capability-model.md).
+    /// Authorises `SYS_THREAD_SET_PRIORITY` and creation-time thread
+    /// placement (`SYS_CAP_CREATE_THREAD`) for the priority band the cap
+    /// spans — `[1, band_max]`, where `band_max` is chosen by the creator
+    /// (the `CREATE_BAND_MAX` label field; defaults to a copy of the
+    /// creator's own band). Pass this slot as the `SchedControl` argument
+    /// when setting a thread's priority. Zero when no scheduling authority
+    /// is delegated (the process then cannot set any priority). See
+    /// [capability-model.md](../../docs/capability-model.md).
     pub sched_control_cap: u32,
+
+    /// Priority level the creator placed this process's initial thread at.
+    ///
+    /// Always within the band of [`Self::sched_control_cap`] when that cap
+    /// is present. The runtime passes `(sched_control_cap,
+    /// initial_priority)` to `SYS_CAP_CREATE_THREAD` so spawned threads
+    /// land at the same level as the main thread. Zero only for pre-policy
+    /// bootstrap processes; consumers must then fall back to floor
+    /// creation (`(0, 0)` when no `SchedControl` is delegated).
+    pub initial_priority: u8,
 
     /// Virtual address of the pre-mapped IPC buffer page.
     ///

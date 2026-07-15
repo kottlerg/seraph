@@ -306,6 +306,8 @@ pub fn launch(
     let created = walk_and_create_from_file(
         &def.binary,
         blobs,
+        def.priority.unwrap_or(0),
+        def.sched_max.unwrap_or(0),
         ctx.procmgr_ep,
         ctx.bootstrap_ep,
         ctx.ipc_buf,

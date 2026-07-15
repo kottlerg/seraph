@@ -725,6 +725,125 @@ fn handle_configure_namespace(
     reply_empty(ipc_buf, code);
 }
 
+/// Argv/env blobs extracted from a create request's label fields and data
+/// words, owning the staging buffers so both create handlers share one
+/// extraction path.
+struct CreateBlobs
+{
+    args_buf: [u8; ipc::ARGS_BLOB_MAX],
+    args_len: usize,
+    args_count: u32,
+    env_buf: [u8; ipc::ARGS_BLOB_MAX],
+    env_len: usize,
+    env_count: u32,
+}
+
+impl CreateBlobs
+{
+    /// Extract the blobs from `req`. `first_word` is the data-word offset
+    /// of the argv blob: 0 for `CREATE_PROCESS`, 1 for `CREATE_FROM_FILE`
+    /// (which carries `file_size` in word 0). Oversized or absent blobs
+    /// degrade to empty, matching the wire contract.
+    fn extract(req: &IpcMessage, first_word: usize) -> Self
+    {
+        let label = req.label;
+        let args_bytes = ((label >> 32) & 0xFFFF) as usize;
+        let mut blobs = Self {
+            args_buf: [0u8; ipc::ARGS_BLOB_MAX],
+            args_len: 0,
+            args_count: ((label >> 48) & 0xFF) as u32,
+            env_buf: [0u8; ipc::ARGS_BLOB_MAX],
+            env_len: 0,
+            env_count: ((label >> 56) & 0xFF) as u32,
+        };
+        if args_bytes > 0 && args_bytes <= ipc::ARGS_BLOB_MAX
+        {
+            copy_bytes_from_msg(req, first_word, args_bytes, &mut blobs.args_buf);
+            blobs.args_len = args_bytes;
+        }
+        // Env blob (when present) sits after the argv words: 1 header word
+        // carrying env_bytes, then the blob itself. Bounds: same
+        // ARGS_BLOB_MAX as argv — env must also fit in the ProcessInfo
+        // page tail.
+        let argv_words = args_bytes.div_ceil(8);
+        if blobs.env_count > 0
+        {
+            let env_bytes = (req.word(first_word + argv_words) & 0xFFFF) as usize;
+            if env_bytes > 0 && env_bytes <= ipc::ARGS_BLOB_MAX
+            {
+                copy_bytes_from_msg(
+                    req,
+                    first_word + argv_words + 1,
+                    env_bytes,
+                    &mut blobs.env_buf,
+                );
+                blobs.env_len = env_bytes;
+            }
+        }
+        blobs
+    }
+
+    fn args(&self) -> process::ChildArgs<'_>
+    {
+        process::ChildArgs {
+            blob: &self.args_buf[..self.args_len],
+            count: self.args_count,
+        }
+    }
+
+    fn env(&self) -> process::ChildEnv<'_>
+    {
+        process::ChildEnv {
+            blob: &self.env_buf[..self.env_len],
+            count: self.env_count,
+        }
+    }
+}
+
+/// Resolve the scheduling fields of a create label against the caller's
+/// spawn ceiling. `None` means the request must be rejected with
+/// `INVALID_ARGUMENT`: still-reserved label bits are set, the requested
+/// band exceeds the creator's, or the requested priority falls outside the
+/// resolved band.
+///
+/// Creator ceiling: badge `0` is init (the unbadged service-endpoint
+/// holder) with the full baseline ceiling. A nonzero badge is a
+/// procmgr-spawned process whose ceiling is its own minted band; a badge
+/// procmgr never minted (e.g. the `DEATH_EQ_AUTHORITY` verb badge) falls
+/// back to a conservative default ceiling.
+fn resolve_create_sched(
+    label: u64,
+    badge: u64,
+    table: &process::ProcessTable,
+) -> Option<process::ChildSched>
+{
+    if label & procmgr_labels::CREATE_RESERVED_MASK != 0
+    {
+        return None;
+    }
+    let requested_priority = ((label >> procmgr_labels::CREATE_PRIORITY_SHIFT)
+        & procmgr_labels::CREATE_SCHED_FIELD_MASK) as u8;
+    let requested_band = ((label >> procmgr_labels::CREATE_BAND_MAX_SHIFT)
+        & procmgr_labels::CREATE_SCHED_FIELD_MASK) as u8;
+    let creator_band_max = if badge == 0
+    {
+        ipc::sched_policy::BASELINE_PRIORITY_MAX
+    }
+    else
+    {
+        table
+            .band_max_by_badge(badge)
+            .unwrap_or(ipc::sched_policy::DEFAULT_SPAWN_PRIORITY)
+    };
+    let (priority, band_max) = process::resolve_spawn_sched(
+        requested_priority,
+        requested_band,
+        creator_band_max,
+        ipc::sched_policy::DEFAULT_SPAWN_PRIORITY,
+    )?;
+    Some(process::ChildSched { priority, band_max })
+}
+
 /// Reply with a successful process creation result.
 ///
 /// Reply caps: `[process_handle, thread]`.
@@ -743,7 +862,10 @@ fn reply_create_result(result: &process::CreateResult, ipc_buf: *mut u64)
 /// Label layout:
 ///   bits [0..16]  = opcode (`CREATE_PROCESS`)
 ///   bit  16       = `CREATE_PINNED` (opt out of the default system pager)
-///   bits [17..32] = reserved (bit 17 = `CREATE_DEATH_RELAY` on `CREATE_FROM_FILE`)
+///   bit  17       = `CREATE_DEATH_RELAY` (on `CREATE_FROM_FILE` only)
+///   bits [18..23] = `CREATE_PRIORITY` (0 = default; see `resolve_create_sched`)
+///   bits [23..28] = `CREATE_BAND_MAX` (0 = copy of the creator's band)
+///   bits [28..32] = reserved (must be zero)
 ///   bits [32..48] = `args_bytes` (total byte length of the argv blob; u16)
 ///   bits [48..56] = `args_count` (number of NUL-terminated strings; u8)
 ///   bits [56..64] = `env_count` (number of NUL-terminated `KEY=VALUE`
@@ -781,52 +903,21 @@ fn handle_create(
     let module_cap = caps[0];
     let creator_ep = if caps.len() >= 2 { caps[1] } else { 0 };
 
-    let args_bytes = ((label >> 32) & 0xFFFF) as usize;
-    let args_count = ((label >> 48) & 0xFF) as u32;
-    let env_count = ((label >> 56) & 0xFF) as u32;
-
-    let mut args_buf = [0u8; ipc::ARGS_BLOB_MAX];
-    let args_blob: &[u8] = if args_bytes > 0 && args_bytes <= ipc::ARGS_BLOB_MAX
-    {
-        copy_bytes_from_msg(req, 0, args_bytes, &mut args_buf);
-        &args_buf[..args_bytes]
-    }
+    // Resolve the scheduling fields before any resource acquisition. The
+    // transferred caps are procmgr's to release on the reject path.
+    let Some(sched) = resolve_create_sched(label, req.badge, table)
     else
     {
-        &[]
+        let _ = syscall::cap_delete(module_cap);
+        if creator_ep != 0
+        {
+            let _ = syscall::cap_delete(creator_ep);
+        }
+        reply_empty(ipc_buf, procmgr_errors::INVALID_ARGUMENT);
+        return;
     };
 
-    // Env blob (when present) sits after the argv words: 1 header word
-    // carrying env_bytes, then the blob itself. Bounds: same ARGS_BLOB_MAX
-    // as argv — env must also fit in the ProcessInfo page tail.
-    let argv_words = args_bytes.div_ceil(8);
-    let mut env_buf = [0u8; ipc::ARGS_BLOB_MAX];
-    let env_blob: &[u8] = if env_count > 0
-    {
-        let env_bytes = (req.word(argv_words) & 0xFFFF) as usize;
-        if env_bytes > 0 && env_bytes <= ipc::ARGS_BLOB_MAX
-        {
-            copy_bytes_from_msg(req, argv_words + 1, env_bytes, &mut env_buf);
-            &env_buf[..env_bytes]
-        }
-        else
-        {
-            &[]
-        }
-    }
-    else
-    {
-        &[]
-    };
-
-    let args = process::ChildArgs {
-        blob: args_blob,
-        count: args_count,
-    };
-    let env = process::ChildEnv {
-        blob: env_blob,
-        count: env_count,
-    };
+    let blobs = CreateBlobs::extract(req, 0);
 
     // Register this child with memmgr. memmgr replies with a badged SEND
     // cap on its endpoint plus the memmgr-side process badge. Procmgr:
@@ -858,9 +949,10 @@ fn handle_create(
         ctx.self_endpoint,
         creator_ep,
         &universals,
-        &args,
-        &env,
+        &blobs.args(),
+        &blobs.env(),
         ctx.death_eq,
+        sched,
     );
 
     // Procmgr's parent-side copy of the badged cap stays in procmgr's
@@ -890,12 +982,28 @@ fn handle_create(
 
     match result
     {
-        Some(result) => reply_create_result(&result, ipc_buf),
+        Some(result) =>
+        {
+            log_spawn_sched(sched);
+            reply_create_result(&result, ipc_buf);
+        }
         None =>
         {
             reply_empty(ipc_buf, procmgr_errors::OUT_OF_MEMORY);
         }
     }
+}
+
+/// One line per successful spawn recording the resolved scheduling
+/// placement, so the boot log evidences every process's level and band
+/// (there is no priority-readback syscall to query after the fact).
+fn log_spawn_sched(sched: process::ChildSched)
+{
+    std::os::seraph::log!(
+        "procmgr: spawn priority={} band=[1,{}]",
+        sched.priority,
+        sched.band_max
+    );
 }
 
 /// Long-lived procmgr state used by all request handlers. All fields are
@@ -937,9 +1045,12 @@ pub struct ProcmgrCtx
     /// (`WS_BADGE_DEATH`). Fixed two members.
     pub ws_cap: u32,
     /// Procmgr's baseline `SchedControl` cap, delivered via its own
-    /// `ProcessInfo.sched_control_cap` (default band `[1, 20]`). `cap_copy`d
-    /// into every child as the child's `ProcessInfo.sched_control_cap`. Zero if
-    /// init delegated none; children then cannot set any priority.
+    /// `ProcessInfo.sched_control_cap` (band
+    /// `[1, sched_policy::BASELINE_PRIORITY_MAX]`). The fan-out source for
+    /// every child band (copied whole or copy-then-split narrowed) and the
+    /// authority behind creating child threads at their assigned level.
+    /// Zero if init delegated none; children are then created at the floor
+    /// and cannot set any priority.
     pub sched_baseline: u32,
 }
 
@@ -984,51 +1095,29 @@ fn handle_create_from_file(
         _ => 0,
     };
 
+    // Resolve the scheduling fields before any resource acquisition. The
+    // transferred caps are procmgr's to release on the reject path — the
+    // file cap needs a real FS_CLOSE so the fs driver drops its open-file
+    // state, not just a slot delete.
+    let Some(sched) = resolve_create_sched(label, req.badge, table)
+    else
+    {
+        process::vfs_close(file_cap, ipc_buf);
+        if creator_ep != 0
+        {
+            let _ = syscall::cap_delete(creator_ep);
+        }
+        if parent_relay_cap != 0
+        {
+            let _ = syscall::cap_delete(parent_relay_cap);
+        }
+        reply_empty(ipc_buf, procmgr_errors::INVALID_ARGUMENT);
+        return;
+    };
+
     let file_size = req.word(0);
 
-    let args_bytes = ((label >> 32) & 0xFFFF) as usize;
-    let args_count = ((label >> 48) & 0xFF) as u32;
-    let env_count = ((label >> 56) & 0xFF) as u32;
-
-    let mut args_buf = [0u8; ipc::ARGS_BLOB_MAX];
-    let args_blob: &[u8] = if args_bytes > 0 && args_bytes <= ipc::ARGS_BLOB_MAX
-    {
-        copy_bytes_from_msg(req, 1, args_bytes, &mut args_buf);
-        &args_buf[..args_bytes]
-    }
-    else
-    {
-        &[]
-    };
-
-    let argv_words = args_bytes.div_ceil(8);
-    let mut env_buf = [0u8; ipc::ARGS_BLOB_MAX];
-    let env_blob: &[u8] = if env_count > 0
-    {
-        let env_bytes = (req.word(1 + argv_words) & 0xFFFF) as usize;
-        if env_bytes > 0 && env_bytes <= ipc::ARGS_BLOB_MAX
-        {
-            copy_bytes_from_msg(req, 1 + argv_words + 1, env_bytes, &mut env_buf);
-            &env_buf[..env_bytes]
-        }
-        else
-        {
-            &[]
-        }
-    }
-    else
-    {
-        &[]
-    };
-
-    let args = process::ChildArgs {
-        blob: args_blob,
-        count: args_count,
-    };
-    let env = process::ChildEnv {
-        blob: env_blob,
-        count: env_count,
-    };
+    let blobs = CreateBlobs::extract(req, 1);
 
     let result = process::create_process_from_file(
         ctx,
@@ -1037,16 +1126,21 @@ fn handle_create_from_file(
         table,
         ipc_buf,
         creator_ep,
-        &args,
-        &env,
+        &blobs.args(),
+        &blobs.env(),
         ctx.death_eq,
         label & procmgr_labels::CREATE_PINNED == 0,
         parent_relay_cap,
+        sched,
     );
 
     match result
     {
-        Ok(result) => reply_create_result(&result, ipc_buf),
+        Ok(result) =>
+        {
+            log_spawn_sched(sched);
+            reply_create_result(&result, ipc_buf);
+        }
         Err(code) =>
         {
             // The relay cap is consumed (bound + deleted) only on the

@@ -136,9 +136,13 @@ seed      = rootfs.root pwrmgr.shutdown pwrmgr.deny
 
 Recognised keys: `binary` (required), `argv`, `env`, `restart`
 (required), `critical` (required), `namespace` (required), `cwd`,
-`seed`. Unknown keys are hard errors. Restart values:
-`never | on_failure | always`. Critical values: `yes | no`.
-Namespace forms: `none | universal | subtree:<path>:<rights>`.
+`seed`, `provides`, `log_sink`, `priority`, `sched_max`. Unknown keys
+are hard errors. Restart values: `never | on_failure | always`.
+Critical values: `yes | no`. Namespace forms:
+`none | universal | subtree:<path>:<rights>`. `priority` / `sched_max`
+are the service's scheduling placement (level and `SchedControl` band
+ceiling, validated against svcmgr's own band); the parser and types live
+in the host-tested `svc-defs` crate.
 
 ---
 

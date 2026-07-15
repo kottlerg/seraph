@@ -14,6 +14,8 @@
 # is the REGISTRY_QUERY_AUTHORITY SEND used for QUERY_INPUT_DEVICE /
 # QUERY_FRAMEBUFFER_DEVICE / QUERY_SERIAL_DEVICE.
 binary    = /programs/terminal
+priority  = 10
+sched_max = 10
 argv      = terminal /programs/shell
 restart   = never
 critical  = no

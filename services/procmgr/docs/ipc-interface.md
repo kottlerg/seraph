@@ -81,13 +81,35 @@ child's main thread fault handler to memmgr (the system pager) via
 `pager_badge` so the runtime inherits the handler onto spawned threads. The
 child then backs reserved regions lazily via
 `std::os::seraph::register_demand_paged`. The label's bit 16 (`CREATE_PINNED`,
-in the reserved `[16..32]` window shared with `CREATE_FROM_FILE`) opts out: the
+in the `[16..32]` window shared with `CREATE_FROM_FILE`) opts out: the
 child is left eager-mapped with no pager. Set it only for a process that cannot
 depend on the fault path — a DMA driver. init, memmgr, and procmgr are pre-pager
 and never routed through this path, so they are pinned by construction. See
 [docs/fault-handling.md](../../../docs/fault-handling.md). The binding is
 best-effort: a failure degrades to "no pager" (faults kill), never blocking
 creation.
+
+**Scheduling fields.** Bits `[18..23]` (`CREATE_PRIORITY`) and `[23..28]`
+(`CREATE_BAND_MAX`) of the label window — shared by `CREATE_PROCESS` and
+`CREATE_FROM_FILE` — carry the child's scheduling placement; bits `[28..32]`
+remain reserved and MUST be zero (`InvalidArgument` otherwise, which keeps a
+future field addition provably additive). Resolution, against the **creator's
+band ceiling** (badge 0 = init, ceiling `sched_policy::BASELINE_PRIORITY_MAX`;
+a badged caller's ceiling is its own minted `band_max`; an unknown badge falls
+back to `sched_policy::DEFAULT_SPAWN_PRIORITY`):
+
+| Field | 0 (unspecified) | Nonzero |
+|---|---|---|
+| `CREATE_BAND_MAX` | copy of the creator's band | `[1, band_max]`; must be ≤ the creator's ceiling |
+| `CREATE_PRIORITY` | `DEFAULT_SPAWN_PRIORITY` clamped to the band | must be ≤ the resolved `band_max` (so the child's own band always covers its starting level) |
+
+Violations reply `InvalidArgument` before any resource is acquired. On
+success procmgr creates the child's initial thread at the resolved priority
+(via its own baseline `SchedControl`), mints the child's band — a plain
+`cap_copy` of the baseline for a full-width band, copy-then-`SYS_SCHED_SPLIT`
+for a narrowed one — into `ProcessInfo.sched_control_cap`, and records the
+resolved priority in `ProcessInfo.initial_priority` so the runtime spawns
+further threads at the same level.
 
 ### Label 2: `START_PROCESS`
 

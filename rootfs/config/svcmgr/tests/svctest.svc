@@ -12,6 +12,8 @@
 # /config/svcmgr/services/ between `cargo xtask build` and
 # `cargo xtask run`. See docs/testing.md.
 binary    = /tests/svctest
+priority  = 10
+sched_max = 10
 argv      = svctest run
 env       = SERAPH_TEST=1 SERAPH_MODE=boot
 restart   = never

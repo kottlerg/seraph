@@ -187,6 +187,12 @@ pub struct DriverSpawnConfig<'a>
     pub service_ep: u32,
     pub registry_ep: u32,
     pub device_badge: u64,
+    /// Priority level the driver is created at; its band ceiling equals
+    /// its level (a driver never spawns further processes). Rides the
+    /// create label's scheduling fields; must not exceed devmgr's own band
+    /// ceiling (`sched_policy::DEVMGR_BAND_MAX`) or procmgr rejects the
+    /// spawn.
+    pub priority: u8,
 }
 
 /// Spawn a driver process with per-device capabilities.
@@ -260,23 +266,22 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64) -> bool
     // eager-mapped, not demand-paged. Applies to both the boot-module and the
     // on-disk (`CREATE_FROM_FILE`) source. #165 replaces the spawn-path keying
     // with an explicit per-driver DMA attribute.
+    let sched_bits = procmgr_labels::create_sched_bits(config.priority, config.priority);
     let create_msg = match config.source
     {
-        CreateSource::Module(module_cap) =>
-        {
-            IpcMessage::builder(procmgr_labels::CREATE_PROCESS | procmgr_labels::CREATE_PINNED)
-                .cap(module_cap)
-                .cap(badged_creator)
-                .build()
-        }
-        CreateSource::File { file_cap, size } =>
-        {
-            IpcMessage::builder(procmgr_labels::CREATE_FROM_FILE | procmgr_labels::CREATE_PINNED)
-                .word(0, size)
-                .cap(file_cap)
-                .cap(badged_creator)
-                .build()
-        }
+        CreateSource::Module(module_cap) => IpcMessage::builder(
+            procmgr_labels::CREATE_PROCESS | procmgr_labels::CREATE_PINNED | sched_bits,
+        )
+        .cap(module_cap)
+        .cap(badged_creator)
+        .build(),
+        CreateSource::File { file_cap, size } => IpcMessage::builder(
+            procmgr_labels::CREATE_FROM_FILE | procmgr_labels::CREATE_PINNED | sched_bits,
+        )
+        .word(0, size)
+        .cap(file_cap)
+        .cap(badged_creator)
+        .build(),
     };
     // SAFETY: ipc_buf is the registered IPC buffer.
     let Ok(reply) = (unsafe { ipc::ipc_call(procmgr_ep, &create_msg, ipc_buf) })
@@ -476,6 +481,7 @@ pub fn spawn_simple_device(
     hw_cap: u32,
     irq_cap: u32,
     devmgr_query_ep: u32,
+    priority: u8,
     ipc_buf: *mut u64,
 ) -> bool
 {
@@ -535,15 +541,21 @@ pub fn spawn_simple_device(
         return false;
     };
 
+    // Band ceiling equals the driver's level; `0` = procmgr's defaults
+    // (used only by the test-orphan shim).
+    let sched_bits = procmgr_labels::create_sched_bits(priority, priority);
     let create_msg = match source
     {
-        CreateSource::Module(module_cap) => IpcMessage::builder(procmgr_labels::CREATE_PROCESS)
-            .cap(module_cap)
-            .cap(badged_creator)
-            .build(),
+        CreateSource::Module(module_cap) =>
+        {
+            IpcMessage::builder(procmgr_labels::CREATE_PROCESS | sched_bits)
+                .cap(module_cap)
+                .cap(badged_creator)
+                .build()
+        }
         CreateSource::File { file_cap, size } =>
         {
-            IpcMessage::builder(procmgr_labels::CREATE_FROM_FILE)
+            IpcMessage::builder(procmgr_labels::CREATE_FROM_FILE | sched_bits)
                 .word(0, size)
                 .cap(file_cap)
                 .cap(badged_creator)

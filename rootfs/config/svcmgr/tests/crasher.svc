@@ -14,6 +14,8 @@
 # fails the run. Confined to a read-only `/tests` subtree to model the
 # min-privilege shape future real services use.
 binary    = /tests/crasher
+priority  = 5
+sched_max = 5
 argv      = crasher selftest
 env       = CRASHER_MARKER=107
 namespace = subtree:/tests:LOOKUP+READDIR+STAT+READ

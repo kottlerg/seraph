@@ -149,6 +149,14 @@ jobs:
             rm -f sysroot/config/svcmgr/services/usertest.svc
             cargo xtask mkdisk --arch ${{ matrix.arch }}
             cargo xtask test-terminal --arch ${{ matrix.arch }}
+            if [ "${{ matrix.arch }}" = "x86_64" ]; then
+              # Third boot pair: the VMGENID snapshot-resume test (#395).
+              # x86_64 only (QEMU's riscv64 virt machine has no VMGENID);
+              # host-side QMP migrate/restore, so it cannot ride
+              # run-parallel. Reuses the default interactive boot the
+              # test-terminal repack just restored.
+              cargo xtask test-vmgenid
+            fi
           fi
 
       - name: Upload run-parallel logs

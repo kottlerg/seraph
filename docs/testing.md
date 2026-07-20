@@ -216,6 +216,30 @@ CI it runs as a second boot inside the `usertest` cell (after usertest's own
 run), rather than as a separate matrix dimension that would multiply with each
 arch.
 
+### Snapshot resume (`test-vmgenid`)
+
+Whole-VM-snapshot reseed (#395) cannot be exercised by an in-guest recipe: the
+generation change only happens when the hypervisor restores saved state, and
+QEMU deliberately exposes no QMP/HMP way to change the GUID at runtime.
+`cargo xtask test-vmgenid` (x86_64 only — QEMU's riscv64 `virt` machine has no
+VMGENID) drives QEMU's save/restore recipe host-side:
+
+1. Boot with a fixed generation GUID; wait for the kernel's
+   `entropy: vmgenid armed` marker (bootloader VGIA discovery + kernel
+   consumer wired) and the terminal's READY marker.
+2. Save the guest via QMP `migrate` to a state file; `quit` the source
+   (releasing the raw disk image's write lock).
+3. Boot again with a different GUID and `-incoming exec:cat <state>`; assert
+   the kernel's `entropy: VM generation change detected` marker — the same
+   GUID compare every draw performs before producing output.
+4. Inject the terminal `help` sequence over QMP and assert the shell's output:
+   the resumed guest still draws randomness and schedules normally after the
+   forced reseed.
+
+Same boot requirements as `test-terminal` (default boot set, terminal
+autostarted); the host computes the verdict and kills QEMU. In CI it runs as
+an additional boot inside the x86_64 `usertest` cell, after `test-terminal`.
+
 ### One shutdown-invoking harness per boot
 
 `svctest` and `usertest` invoke `pwrmgr` shutdown on completion. Two such
@@ -255,10 +279,10 @@ not on every push.
 **Dimension inventory.** Exhaustive per CI run: architecture (x86_64,
 riscv64) × profile (debug, release) × harness (ktest, svctest, usertest).
 Fixed per CI run: vCPU count (4), guest memory (512 MiB), device set
-(virtio-blk + virtio-keyboard + serial; CI boots headless, so no
-framebuffer), filesystem (FAT), riscv64 paging mode (sv48 — per-mode runs
-via `cargo xtask run --riscv-mmu sv39|sv57` are manual, same posture as
-CPU-count variations).
+(virtio-blk + virtio-keyboard + serial, plus `vmgenid,guid=auto` on x86_64;
+CI boots headless, so no framebuffer), filesystem (FAT), riscv64 paging mode
+(sv48 — per-mode runs via `cargo xtask run --riscv-mmu sv39|sv57` are manual,
+same posture as CPU-count variations).
 A device or filesystem joining the default boot set joins the canonical
 cells automatically; variants belong to the tiers below.
 

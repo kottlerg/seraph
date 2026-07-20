@@ -113,6 +113,18 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
     let init_image = info.init_image; // InitImage is Copy
     let boot_entropy_seed = info.boot_entropy_seed;
     let boot_entropy_len = info.boot_entropy_len;
+    // VMGENID GUID address: accept only when the 16-byte read stays inside
+    // the physical span the direct map will cover (the Phase-0 validator
+    // checks the protocol version, not this field).
+    let vmgenid_paddr = match info.vmgenid_paddr.checked_add(16)
+    {
+        Some(end)
+            if info.vmgenid_paddr != 0 && end <= mm::paging::compute_max_physical_address(info) =>
+        {
+            info.vmgenid_paddr
+        }
+        _ => 0,
+    };
 
     // ── Phase 1: early console ──────────────────────────────────────────────
     // SAFETY: called exactly once, from the single kernel boot thread, after
@@ -204,6 +216,7 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
             init_image,
             boot_entropy_seed,
             boot_entropy_len,
+            vmgenid_paddr,
             fb_phys,
             allocator,
         )
@@ -244,6 +257,7 @@ unsafe fn kernel_entry_post_rebase(
     init_image: boot_protocol::InitImage,
     mut boot_entropy_seed: [u8; 32],
     boot_entropy_len: u32,
+    vmgenid_paddr: u64,
     fb_phys: u64,
     allocator: &'static mut mm::buddy::BuddyAllocator,
 ) -> !
@@ -372,7 +386,7 @@ unsafe fn kernel_entry_post_rebase(
         // Clamp defensively: the Phase-0 validator checks only the protocol
         // version, not this length field.
         let n = (boot_entropy_len as usize).min(boot_entropy_seed.len());
-        entropy::init(&boot_entropy_seed[..n]);
+        entropy::init(&boot_entropy_seed[..n], vmgenid_paddr);
 
         // Scrub the conditioned seed once it is absorbed. The BootInfo page is
         // a reclaim range donated to userspace at Phase 7 (memmgr re-hands its

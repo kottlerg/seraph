@@ -49,6 +49,31 @@ pub fn absorb(data: &[u8])
     }
 }
 
+/// Absorb `data` into the pool without spinning on the pool lock.
+///
+/// Returns `false` when the lock is contended (nothing absorbed); the caller
+/// defers its contribution. Keeps [`absorb`]'s no-op-before-[`install`]
+/// semantics (returns `true`: there is nothing to defer to).
+pub fn try_absorb(data: &[u8]) -> bool
+{
+    let ptr = POOL_PTR.load(Ordering::Acquire);
+    if ptr.is_null()
+    {
+        return true;
+    }
+    // SAFETY: as in `absorb`; the lock serialises all pool access.
+    unsafe {
+        let Some(saved) = POOL_LOCK.try_lock_raw()
+        else
+        {
+            return false;
+        };
+        (*ptr).absorb(data);
+        POOL_LOCK.unlock_raw(saved);
+    }
+    true
+}
+
 /// Draw seed material from the pool into `out`.
 ///
 /// # Panics
@@ -64,6 +89,30 @@ pub fn draw_seed(out: &mut [u8])
         (*ptr).fill(out);
         POOL_LOCK.unlock_raw(saved);
     }
+}
+
+/// Draw seed material without spinning on the pool lock.
+///
+/// Returns `false` when the lock is contended; `out` is untouched and the
+/// caller defers its reseed.
+///
+/// # Panics
+/// Debug-asserts the pool was installed, as in [`draw_seed`].
+pub fn try_draw_seed(out: &mut [u8]) -> bool
+{
+    let ptr = POOL_PTR.load(Ordering::Acquire);
+    debug_assert!(!ptr.is_null(), "entropy pool drawn before install");
+    // SAFETY: as in `absorb`; the lock serialises all pool access.
+    unsafe {
+        let Some(saved) = POOL_LOCK.try_lock_raw()
+        else
+        {
+            return false;
+        };
+        (*ptr).fill(out);
+        POOL_LOCK.unlock_raw(saved);
+    }
+    true
 }
 
 /// Mark the pool seeded (initial entropy absorbed).

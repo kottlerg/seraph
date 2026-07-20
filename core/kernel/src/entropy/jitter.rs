@@ -87,16 +87,14 @@ pub fn sample(cpu: usize, source: Source, cycle: u64)
     acc.words[idx].fetch_xor(mixed, Ordering::Relaxed);
 }
 
-/// Fold CPU `cpu`'s accumulated jitter into the central pool. Off the
-/// interrupt path (takes the pool lock).
-pub fn contribute_to_pool(cpu: usize)
+/// Serialise CPU `cpu`'s accumulator — staging words, sample count, and the
+/// instantaneous cycle counter (so every contribution carries fresh timing
+/// even when no interrupt-time samples accrued since the last fold). Returns
+/// `None` before `init_storage`.
+fn collect(cpu: usize) -> Option<[u8; (ACC_WORDS + 2) * 8]>
 {
-    let Some(acc) = acc_for(cpu)
-    else
-    {
-        return;
-    };
-    let mut buf = [0u8; (ACC_WORDS + 1) * 8];
+    let acc = acc_for(cpu)?;
+    let mut buf = [0u8; (ACC_WORDS + 2) * 8];
     for i in 0..ACC_WORDS
     {
         let w = acc.words[i].load(Ordering::Relaxed);
@@ -104,5 +102,28 @@ pub fn contribute_to_pool(cpu: usize)
     }
     let count = acc.count.load(Ordering::Relaxed);
     buf[ACC_WORDS * 8..][..8].copy_from_slice(&count.to_le_bytes());
-    pool::absorb(&buf);
+    let cycle = crate::arch::current::entropy::read_cycle_counter();
+    buf[(ACC_WORDS + 1) * 8..][..8].copy_from_slice(&cycle.to_le_bytes());
+    Some(buf)
+}
+
+/// Fold CPU `cpu`'s accumulated jitter into the central pool. Off the
+/// interrupt path (takes the pool lock).
+pub fn contribute_to_pool(cpu: usize)
+{
+    if let Some(buf) = collect(cpu)
+    {
+        pool::absorb(&buf);
+    }
+}
+
+/// Fold CPU `cpu`'s accumulated jitter without spinning on the pool lock.
+/// Returns `false` when the pool lock is contended (nothing folded).
+pub fn try_contribute_to_pool(cpu: usize) -> bool
+{
+    match collect(cpu)
+    {
+        Some(buf) => pool::try_absorb(&buf),
+        None => true,
+    }
 }

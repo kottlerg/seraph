@@ -539,6 +539,10 @@ pub fn run_all(ctx: &TestContext)
         "entropy::getrandom_over_max_len_invalid_arg",
         entropy::getrandom_over_max_len_invalid_arg(ctx)
     );
+    run_test!(
+        "entropy::getrandom_reseed_interval_stream",
+        entropy::getrandom_reseed_interval_stream(ctx)
+    );
 
     // ── Init bootstrap layout (ASLR, #39) ─────────────────────────────────────
     run_test!(

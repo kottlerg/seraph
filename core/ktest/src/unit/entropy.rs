@@ -92,3 +92,33 @@ pub fn getrandom_over_max_len_invalid_arg(_ctx: &TestContext) -> TestResult
         Err("getrandom with len > MAX_GETRANDOM_LEN must return InvalidArgument")
     }
 }
+
+/// 300 sequential draws stay non-zero and pairwise-distinct across the
+/// generator's 256-draw reseed interval (#395). When the calling thread stays
+/// on one CPU this crosses that CPU's opportunistic reseed; the assertion
+/// holds regardless of placement (a forward-secure CSPRNG never repeats an
+/// 8-byte draw back-to-back except with probability 2⁻⁶⁴).
+pub fn getrandom_reseed_interval_stream(_ctx: &TestContext) -> TestResult
+{
+    let mut prev = [0u8; 8];
+    for i in 0..300
+    {
+        let mut buf = [0u8; 8];
+        let n = syscall::getrandom(buf.as_mut_ptr(), buf.len())
+            .map_err(|_| "getrandom failed mid-stream")?;
+        if n != buf.len() as u64
+        {
+            return Err("getrandom returned a short count mid-stream");
+        }
+        if buf == [0u8; 8]
+        {
+            return Err("getrandom produced an all-zero draw mid-stream");
+        }
+        if i > 0 && buf == prev
+        {
+            return Err("getrandom repeated the previous draw across the reseed interval");
+        }
+        prev = buf;
+    }
+    Ok(())
+}

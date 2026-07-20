@@ -1183,6 +1183,15 @@ unsafe fn step9_populate_boot_info(
     push_reclaim(allocs.reclaim_array_phys, 1, 0);
     bprintln!("[--------] boot: reclaim_ranges: {reclaim_len} entries recorded");
 
+    // VMGENID GUID address: QEMU-specific SSDT scan (no AML evaluation).
+    // Zero when absent; the kernel then has no snapshot-detection channel.
+    // SAFETY: acpi_rsdp is zero or identity-mapped; the parser validates.
+    let vmgenid_paddr = unsafe { acpi::parse_vmgenid_paddr(firm.acpi_rsdp) };
+    if vmgenid_paddr != 0
+    {
+        bprintln!("[--------] boot: vmgenid guid at {vmgenid_paddr:#x}");
+    }
+
     // Write the populated BootInfo.
     // SAFETY: boot_info_phys is a valid 4 KiB allocation; BootInfo fits in one page.
     unsafe {
@@ -1234,6 +1243,7 @@ unsafe fn step9_populate_boot_info(
                 },
                 boot_entropy_seed: boot_entropy.seed,
                 boot_entropy_len: boot_entropy.len,
+                vmgenid_paddr,
             },
         );
     }

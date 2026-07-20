@@ -94,6 +94,15 @@ pub struct QemuLaunchSpec<'a>
     /// (`-qmp unix:<path>,server,nowait`) so a host harness can drive the
     /// guest — the interactive-input test injects keys this way.
     pub qmp_socket: Option<&'a Path>,
+    /// VMGENID device GUID (`-device vmgenid,guid=<value>`; `"auto"` =
+    /// host-random). `x86_64` only — the `riscv64` `virt` machine has no
+    /// VMGENID ACPI support in QEMU — and launch sites pass `Some("auto")` by
+    /// default so every `x86_64` boot exercises the kernel's snapshot-reseed
+    /// consumer.
+    pub vmgenid_guid: Option<&'a str>,
+    /// Inbound migration URI (`-incoming <uri>`); the snapshot-resume test
+    /// restores a migrate-to-file state through this.
+    pub incoming: Option<&'a str>,
     /// Guest paging-mode ceiling; riscv64 only, ignored on `x86_64`.
     pub riscv_mmu: RiscvMmu,
 }
@@ -155,6 +164,11 @@ pub fn build_qemu_argv(spec: &QemuLaunchSpec) -> Result<Vec<String>>
         ]);
     }
 
+    if let Some(uri) = spec.incoming
+    {
+        args.extend(["-incoming".into(), uri.into()]);
+    }
+
     match spec.gdb
     {
         GdbMode::Off =>
@@ -176,6 +190,11 @@ pub fn build_qemu_argv(spec: &QemuLaunchSpec) -> Result<Vec<String>>
 fn extend_x86(args: &mut Vec<String>, spec: &QemuLaunchSpec, accel: Accel)
 {
     args.extend(["-machine".into(), "q35".into()]);
+
+    if let Some(guid) = spec.vmgenid_guid
+    {
+        args.extend(["-device".into(), format!("vmgenid,guid={guid}")]);
+    }
 
     match accel
     {
@@ -493,6 +512,8 @@ mod tests
             headless: true,
             gdb: GdbMode::Off,
             qmp_socket: None,
+            vmgenid_guid: None,
+            incoming: None,
             riscv_mmu: RiscvMmu::Sv48,
         }
     }
@@ -558,5 +579,39 @@ mod tests
     fn mem_zero_rejected()
     {
         assert!(build_qemu_argv(&riscv_spec(4, 0)).is_err());
+    }
+
+    #[test]
+    fn x86_vmgenid_and_incoming_reach_argv()
+    {
+        let spec = QemuLaunchSpec {
+            arch: Arch::X86_64,
+            disk_path: Path::new("disk.img"),
+            firmware_code_path: Path::new("code.fd"),
+            firmware_vars_path: None,
+            cpus: 4,
+            mem_mib: 512,
+            headless: true,
+            gdb: GdbMode::Off,
+            qmp_socket: None,
+            vmgenid_guid: Some("auto"),
+            incoming: Some("exec:cat state.bin"),
+            riscv_mmu: RiscvMmu::Sv48,
+        };
+        let argv = build_qemu_argv(&spec).unwrap();
+        assert!(argv.iter().any(|a| a == "vmgenid,guid=auto"));
+        let inc = argv.iter().position(|a| a == "-incoming").unwrap();
+        assert_eq!(argv[inc + 1], "exec:cat state.bin");
+    }
+
+    #[test]
+    fn riscv_ignores_vmgenid()
+    {
+        // The riscv64 virt machine has no VMGENID ACPI support in QEMU; a
+        // vmgenid device in its argv would fail to realize at launch.
+        let mut spec = riscv_spec(1, 512);
+        spec.vmgenid_guid = Some("auto");
+        let argv = build_qemu_argv(&spec).unwrap();
+        assert!(!argv.iter().any(|a| a.starts_with("vmgenid")));
     }
 }

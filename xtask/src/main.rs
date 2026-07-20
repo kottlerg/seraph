@@ -72,6 +72,7 @@ fn main()
         CliCommand::Mkdisk(args) => commands::mkdisk::run(&ctx, args),
         CliCommand::ComposeBundle(args) => commands::compose_bundle::run(&ctx, args),
         CliCommand::TestTerminal(args) => commands::test_terminal::run(&ctx, args),
+        CliCommand::TestVmgenid(args) => commands::test_vmgenid::run(&ctx, args),
     };
 
     if let Err(err) = result

@@ -319,6 +319,31 @@ See [docs/testing.md](../docs/testing.md) for the harness model.
 
 ---
 
+### `cargo xtask test-vmgenid`
+
+Boot the VMGENID snapshot-resume test (#395), x86_64 only — QEMU's riscv64
+`virt` machine has no VMGENID. Boots headless with a fixed generation GUID,
+waits for the kernel's `entropy: vmgenid armed` and the terminal's READY
+markers, saves the guest via QMP `migrate` to a state file, quits the source,
+then boots a second QEMU with a different GUID and `-incoming` restoring the
+state. Asserts — host-side — the kernel's `entropy: VM generation change
+detected` marker and a post-resume interactive liveness round (`help` over
+QMP → `shell built-ins:` on serial). Exits non-zero on a QMP error, a failed
+migration, or a per-phase 180 s timeout.
+
+A pure runner with the same boot requirements as `test-terminal`:
+
+```sh
+cargo xtask build
+cargo xtask mkdisk
+cargo xtask test-vmgenid [--cpus N] [--mem MIB]
+```
+
+See [docs/testing.md](../docs/testing.md) for the harness model and
+`core/kernel/docs/entropy.md` for the snapshot-detection design.
+
+---
+
 ## Sub-crates
 
 | Sub-crate | Purpose |

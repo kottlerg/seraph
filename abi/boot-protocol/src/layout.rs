@@ -27,6 +27,88 @@ pub const KERNEL_LINK_BASE: u64 = 0xFFFF_FFFF_8000_0000;
 /// Required alignment of the KASLR image slide.
 pub const IMAGE_SLIDE_ALIGN: u64 = DIRECT_MAP_ALIGN;
 
+/// Size of the kernel image window: the top 2 GiB of the virtual address
+/// space, `[KERNEL_LINK_BASE, 2^64)`. Both `code-model=small`+PIC (x86-64)
+/// and `medany` (riscv64) reach any target within it from any point in it,
+/// so the whole image can slide freely inside the window.
+pub const IMAGE_WINDOW_SIZE: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Guard left at the top of the image window so a slid image never abuts
+/// the `2^64` wrap.
+pub const IMAGE_WINDOW_GUARD: u64 = DIRECT_MAP_ALIGN;
+
+/// Alignment of the randomized direct-map base: 1 GiB preserves 2 MiB
+/// VA≡PA congruence for the large-page direct map, keeps PD/PDPT boundary
+/// geometry identical to the zero-based layout, and is the natural granule
+/// for a future 1 GiB gigapage direct map.
+pub const DIRECT_MAP_BASE_ALIGN: u64 = 1024 * 1024 * 1024;
+
+/// Guard left between the top of the direct map and the kernel image base.
+pub const DIRECT_MAP_GUARD: u64 = DIRECT_MAP_BASE_ALIGN;
+
+/// Choose a 2 MiB-aligned KASLR image slide from a raw entropy word.
+///
+/// The image occupies `[KERNEL_LINK_BASE + slide, + slide + span]` inside
+/// the top-2 GiB window, leaving [`IMAGE_WINDOW_GUARD`] at the top. Returns
+/// 0 when the image plus guard would not fit (never for a real kernel).
+#[must_use]
+pub fn image_slide(rand: u64, span_bytes: u64) -> u64
+{
+    let span = align_up_2m(span_bytes);
+    let Some(max_slide) = IMAGE_WINDOW_SIZE.checked_sub(span + IMAGE_WINDOW_GUARD)
+    else
+    {
+        return 0;
+    };
+    let slots = max_slide / IMAGE_SLIDE_ALIGN + 1;
+    (rand % slots) * IMAGE_SLIDE_ALIGN
+}
+
+/// Number of 1 GiB-aligned direct-map base slots in
+/// `[floor, image_base - DIRECT_MAP_GUARD - ceiling]`.
+///
+/// `floor` is the paging mode's kernel-half base (1 GiB-aligned); `ceiling`
+/// is [`direct_map_ceiling`]; `image_base` is the (possibly slid) kernel
+/// image base. Returns 0 when the window does not fit.
+#[must_use]
+pub fn direct_map_slots(floor: u64, image_base: u64, ceiling: u64) -> u64
+{
+    let Some(reserved) = ceiling.checked_add(DIRECT_MAP_GUARD)
+    else
+    {
+        return 0;
+    };
+    let Some(max_base) = image_base.checked_sub(reserved)
+    else
+    {
+        return 0;
+    };
+    if max_base < floor
+    {
+        return 0;
+    }
+    (max_base - floor) / DIRECT_MAP_BASE_ALIGN + 1
+}
+
+/// Choose a 1 GiB-aligned direct-map base from a raw entropy word.
+///
+/// Returns `(base, limited)`: `limited` is true when the window had fewer
+/// than two slots, in which case `base` is `floor` (the deterministic
+/// fallback, flagged [`crate::KASLR_DM_WINDOW_LIMITED`]).
+#[must_use]
+pub fn direct_map_base(rand: u64, floor: u64, image_base: u64, ceiling: u64) -> (u64, bool)
+{
+    let slots = direct_map_slots(floor, image_base, ceiling);
+    if slots < 2
+    {
+        (floor, true)
+    }
+    else
+    {
+        (floor + (rand % slots) * DIRECT_MAP_BASE_ALIGN, false)
+    }
+}
+
 /// Round `value` up to the next [`DIRECT_MAP_ALIGN`] boundary.
 #[must_use]
 pub const fn align_up_2m(value: u64) -> u64
@@ -247,5 +329,57 @@ mod tests
         let km = KernelMmio::zero();
         let ceiling = direct_map_ceiling(&entries, &fb, &km);
         assert!(ceiling >= align_up_2m(0x8_0000_0000 + 4096 * 768));
+    }
+
+    #[test]
+    fn image_slide_is_2m_aligned_and_bounded()
+    {
+        let span = 8 * 1024 * 1024;
+        for rand in [0u64, 1, 7, 1023, 0xDEAD_BEEF, u64::MAX]
+        {
+            let slide = image_slide(rand, span);
+            assert_eq!(slide % IMAGE_SLIDE_ALIGN, 0);
+            assert!(slide + align_up_2m(span) + IMAGE_WINDOW_GUARD <= IMAGE_WINDOW_SIZE);
+        }
+    }
+
+    #[test]
+    fn image_slide_has_many_slots()
+    {
+        // A ~2 MiB kernel gives ~1022 slots (~10 bits). Distinct rands
+        // should land on distinct slides.
+        let span = 2 * 1024 * 1024;
+        assert_ne!(image_slide(0, span), image_slide(1, span));
+        assert_eq!(image_slide(1, span), IMAGE_SLIDE_ALIGN);
+    }
+
+    #[test]
+    fn direct_map_base_is_1g_aligned_and_below_image()
+    {
+        // x86-64 / Sv48 floor, ~512 MiB RAM (ceiling dominated by APICs
+        // near 4 GiB), image at the link base.
+        let floor = 0xFFFF_8000_0000_0000;
+        let image = KERNEL_LINK_BASE;
+        let ceiling = 0x1_0000_0000; // 4 GiB
+        for rand in [0u64, 1, 5, 12345, u64::MAX]
+        {
+            let (base, limited) = direct_map_base(rand, floor, image, ceiling);
+            assert_eq!(base % DIRECT_MAP_BASE_ALIGN, 0);
+            assert!(base >= floor);
+            assert!(base + ceiling + DIRECT_MAP_GUARD <= image);
+            assert!(!limited);
+        }
+    }
+
+    #[test]
+    fn direct_map_window_limited_falls_back_to_floor()
+    {
+        // Sv39: 256 GiB kernel half, huge RAM leaves < 2 slots.
+        let floor = 0xFFFF_FFC0_0000_0000;
+        let image = KERNEL_LINK_BASE;
+        let ceiling = image - floor - DIRECT_MAP_GUARD; // exactly one slot region
+        let (base, limited) = direct_map_base(0xABCD, floor, image, ceiling);
+        assert_eq!(base, floor);
+        assert!(limited);
     }
 }

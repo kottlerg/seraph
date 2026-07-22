@@ -57,6 +57,17 @@ static KERNEL_PATH: [u16; 19] = [
     b'n' as u16, b'e' as u16, b'l' as u16, 0u16,
 ];
 
+/// `\EFI\seraph\nokaslr` as a NUL-terminated UTF-16 path — the presence of
+/// this file disables KASLR for deterministic debugging (staged by
+/// `cargo xtask mkdisk --no-kaslr`).
+#[rustfmt::skip]
+static NOKASLR_PATH: [u16; 20] = [
+    b'\\' as u16, b'E' as u16, b'F' as u16, b'I' as u16, b'\\' as u16,
+    b's' as u16, b'e' as u16, b'r' as u16, b'a' as u16, b'p' as u16,
+    b'h' as u16, b'\\' as u16, b'n' as u16, b'o' as u16, b'k' as u16,
+    b'a' as u16, b's' as u16, b'l' as u16, b'r' as u16, 0u16,
+];
+
 /// `\EFI\seraph\bootstrap.bundle` as a NUL-terminated UTF-16 path.
 #[rustfmt::skip]
 static BUNDLE_PATH: [u16; 29] = [
@@ -158,17 +169,42 @@ struct CpuTopology
     cpu_ids: [u32; MAX_CPUS],
 }
 
-/// Conditioned early-boot entropy seed drawn from UEFI `EFI_RNG_PROTOCOL`.
+/// Conditioned early-boot entropy drawn from UEFI `EFI_RNG_PROTOCOL`.
 ///
 /// `len` is `0` when the firmware exposes no RNG; the kernel then degrades to
 /// timing jitter alone. Produced by [`step5c_fetch_boot_entropy`] while boot
-/// services are live and written into [`BootInfo`] by step 9.
+/// services are live and written into [`BootInfo`] by step 9. The `kaslr`
+/// words are a separate draw feeding the KASLR slide / direct-map base
+/// (#252); `kaslr_available` is false when no RNG source produced them.
 struct BootEntropy
 {
-    /// Random bytes; only the first `len` are valid, the remainder zero.
+    /// Random bytes for the entropy pool; only the first `len` are valid.
     seed: [u8; 32],
     /// Number of valid leading bytes in `seed` (`0` or `32`).
     len: u32,
+    /// Two 64-bit KASLR entropy words: `[0]` picks the image slide, `[1]`
+    /// the direct-map base. Valid only when `kaslr_available`.
+    kaslr: [u64; 2],
+    /// Whether `kaslr` carries a real random draw.
+    kaslr_available: bool,
+    /// KASLR flag identifying the entropy source (0, or a `KASLR_ENTROPY_*`
+    /// bit); merged into `BootInfo::kaslr_flags`.
+    kaslr_source_flag: u32,
+}
+
+/// The KASLR layout the bootloader chose, threaded from
+/// [`step5d_apply_kaslr_slide`] (which biases the kernel image) to
+/// [`step9_populate_boot_info`] (which selects the direct-map base and
+/// writes both into [`BootInfo`]).
+struct KaslrDecision
+{
+    /// Entropy word reserved for the direct-map base selection in step 9.
+    dm_rand: u64,
+    /// Whether step 9 should attempt to randomize the direct-map base.
+    randomize_dm: bool,
+    /// Flags accumulated so far (image + source + knob bits); step 9 ORs in
+    /// the direct-map bits.
+    flags: u32,
 }
 
 /// All pre-`ExitBootServices` physical allocations the boot sequence
@@ -258,12 +294,13 @@ unsafe fn boot_sequence(image: EfiHandle, st: *mut EfiSystemTable) -> Result<!, 
     let ap_trampoline_phys = unsafe { step5b_alloc_ap_trampoline(&ctx) };
     // SAFETY: ctx.bs valid pre-exit; draws the boot entropy seed while boot
     // services (and thus EFI_RNG_PROTOCOL) are still available.
-    let boot_entropy = unsafe { step5c_fetch_boot_entropy(&ctx) };
+    let mut boot_entropy = unsafe { step5c_fetch_boot_entropy(&ctx) };
     // Apply the KASLR slide before step 6 maps the segments at their
     // (biased) virtual addresses.
     // SAFETY: kernel.info comes from load_kernel with its span allocation
-    // live and identity-mapped; virtual addresses are still unbiased link VAs.
-    unsafe { step5d_apply_kaslr_slide(&mut kernel.info)? };
+    // live and identity-mapped; virtual addresses are still unbiased link VAs;
+    // ctx.esp_root is valid until ExitBootServices.
+    let kaslr = unsafe { step5d_apply_kaslr_slide(&ctx, &mut kernel.info, &boot_entropy)? };
     // SAFETY: all prior unsafe outputs remain valid; step 6 allocates via bs.
     let (allocs, mut page_table) = unsafe {
         step6_allocate_and_build_page_tables(
@@ -293,11 +330,21 @@ unsafe fn boot_sequence(image: EfiHandle, st: *mut EfiSystemTable) -> Result<!, 
             &firm,
             &cpus,
             &boot_entropy,
+            &kaslr,
             &ctx.framebuffer,
             &allocs,
             &uefi_map,
             &page_table,
         );
+    }
+    // Scrub the KASLR entropy words from the bootloader's copy: the slide is
+    // applied and the direct-map base chosen, so these must not linger in
+    // BootServicesData that is later reclaimed to userspace. The pool seed is
+    // already in BootInfo (the kernel scrubs it there after absorbing it).
+    // SAFETY: boot_entropy is a live local; volatile so the store is not
+    // elided as dead ahead of the value going out of scope.
+    unsafe {
+        core::ptr::write_volatile(core::ptr::addr_of_mut!(boot_entropy.kaslr), [0u64; 2]);
     }
     // SAFETY: page_table root frames are valid; kernel_info.entry_virtual is
     // within the loaded kernel image; BootInfo at allocs.boot_info_phys is
@@ -736,7 +783,13 @@ unsafe fn step5c_fetch_boot_entropy(ctx: &UefiContext) -> BootEntropy
     };
     if status != EFI_SUCCESS || iface.is_null()
     {
-        return BootEntropy { seed, len: 0 };
+        return BootEntropy {
+            seed,
+            len: 0,
+            kaslr: [0; 2],
+            kaslr_available: false,
+            kaslr_source_flag: 0,
+        };
     }
 
     let proto = iface.cast::<EfiRngProtocol>();
@@ -751,34 +804,140 @@ unsafe fn step5c_fetch_boot_entropy(ctx: &UefiContext) -> BootEntropy
             seed.as_mut_ptr(),
         )
     };
-    if s == EFI_SUCCESS
-    {
-        BootEntropy { seed, len: 32 }
-    }
-    else
+    if s != EFI_SUCCESS
     {
         // Discard any partial output rather than hand the kernel a short draw.
         seed = [0u8; 32];
-        BootEntropy { seed, len: 0 }
+        return BootEntropy {
+            seed,
+            len: 0,
+            kaslr: [0; 2],
+            kaslr_available: false,
+            kaslr_source_flag: 0,
+        };
+    }
+
+    // Independent 16-byte draw for the KASLR slide / direct-map base, kept
+    // separate from the pool seed so neither reveals the other.
+    let mut kaslr_bytes = [0u8; 16];
+    // SAFETY: proto valid; null algorithm selects the default; 16-byte buffer.
+    let ks = unsafe {
+        ((*proto).get_rng)(
+            proto,
+            core::ptr::null::<EfiGuid>(),
+            kaslr_bytes.len(),
+            kaslr_bytes.as_mut_ptr(),
+        )
+    };
+    let (kaslr, kaslr_available, kaslr_source_flag) = if ks == EFI_SUCCESS
+    {
+        let mut w = [0u64; 2];
+        for (i, word) in w.iter_mut().enumerate()
+        {
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&kaslr_bytes[i * 8..i * 8 + 8]);
+            *word = u64::from_le_bytes(b);
+        }
+        kaslr_bytes.fill(0);
+        (w, true, boot_protocol::KASLR_ENTROPY_FW_RNG)
+    }
+    else
+    {
+        ([0u64; 2], false, 0)
+    };
+
+    BootEntropy {
+        seed,
+        len: 32,
+        kaslr,
+        kaslr_available,
+        kaslr_source_flag,
     }
 }
 
 // ── Step 5d: KASLR slide ─────────────────────────────────────────────────────
 
-/// Apply the kernel's KASLR slide: relocate the loaded image and bias its
-/// virtual addresses before step 6 maps the segments.
+/// Choose and apply the kernel's KASLR image slide, biasing the loaded image
+/// before step 6 maps its segments; return the [`KaslrDecision`] step 9 needs
+/// to pick the matching direct-map base.
 ///
-/// The slide is currently always 0 — the image is relocated in place at its
-/// link base. The randomized draw lands with the KASLR window selection
-/// (issue #252).
+/// The slide comes from the bootloader's KASLR entropy draw. It is forced to
+/// 0 — the deterministic layout — when no entropy was available or when the
+/// `\EFI\seraph\nokaslr` override knob is present. Relocations are applied
+/// even at slide 0, so the mapped image never depends on lld having
+/// pre-filled the RELATIVE targets. The KASLR entropy word is scrubbed before
+/// return.
 ///
 /// # Safety
-/// `info` must come from `load_kernel` with its span allocation live and
-/// identity-mapped, and must not have been relocated already.
-unsafe fn step5d_apply_kaslr_slide(info: &mut KernelInfo) -> Result<(), BootError>
+/// `ctx.esp_root` must be valid; `info` must come from `load_kernel` with its
+/// span allocation live and identity-mapped, and must not have been relocated
+/// already.
+unsafe fn step5d_apply_kaslr_slide(
+    ctx: &UefiContext,
+    info: &mut KernelInfo,
+    entropy: &BootEntropy,
+) -> Result<KaslrDecision, BootError>
 {
-    // SAFETY: forwarded from the caller's contract.
-    unsafe { elf::relocate_kernel(info, 0, arch::current::EXPECTED_ELF_MACHINE) }
+    // SAFETY: ctx.esp_root is a valid ESP root directory handle per the
+    // caller's contract.
+    let knob = unsafe { nokaslr_knob_present(ctx) };
+
+    let (slide, dm_rand, randomize_dm, flags) = if knob
+    {
+        (0u64, 0u64, false, boot_protocol::KASLR_DISABLED_BY_KNOB)
+    }
+    else if entropy.kaslr_available
+    {
+        let slide = boot_protocol::layout::image_slide(entropy.kaslr[0], info.size);
+        let mut f = entropy.kaslr_source_flag;
+        if slide != 0
+        {
+            f |= boot_protocol::KASLR_IMAGE_RANDOMIZED;
+        }
+        (slide, entropy.kaslr[1], true, f)
+    }
+    else
+    {
+        // No boot entropy: the defined fallback — deterministic layout.
+        (0u64, 0u64, false, 0)
+    };
+
+    // SAFETY: forwarded from the caller's contract; slide is a valid 2 MiB
+    // multiple within the image window.
+    unsafe { elf::relocate_kernel(info, slide, arch::current::EXPECTED_ELF_MACHINE)? };
+
+    Ok(KaslrDecision {
+        dm_rand,
+        randomize_dm,
+        flags,
+    })
+}
+
+/// Whether the `\EFI\seraph\nokaslr` override knob file exists on the ESP.
+///
+/// # Safety
+/// `ctx.esp_root` must be a valid ESP root directory handle.
+unsafe fn nokaslr_knob_present(ctx: &UefiContext) -> bool
+{
+    // SAFETY: esp_root is a valid directory handle; path is NUL-terminated UTF-16.
+    match unsafe {
+        open_file(
+            ctx.esp_root,
+            NOKASLR_PATH.as_ptr(),
+            "\\EFI\\seraph\\nokaslr",
+        )
+    }
+    {
+        Ok(file) =>
+        {
+            // SAFETY: file is a valid open handle from open_file.
+            unsafe {
+                ((*file).close)(file);
+            }
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 // ── Step 6: Allocate boot structures and build page tables ──────────────────
@@ -1017,6 +1176,7 @@ unsafe fn step9_populate_boot_info(
     firm: &FirmwareInfo,
     cpus: &CpuTopology,
     boot_entropy: &BootEntropy,
+    kaslr: &KaslrDecision,
     framebuffer: &FramebufferInfo,
     allocs: &BootAllocations,
     uefi_map: &uefi::MemoryMapResult,
@@ -1215,6 +1375,39 @@ unsafe fn step9_populate_boot_info(
         bprintln!("[--------] boot: vmgenid guid at {vmgenid_paddr:#x}");
     }
 
+    // Direct-map base (KASLR): the paging mode's kernel-half floor, or a
+    // 1 GiB-aligned random base below the (already-biased) kernel image when
+    // step 5d had entropy. Uses the same shared ceiling the kernel's Phase-3
+    // guard and Phase-0 validator use, over the translated map produced above.
+    let floor = arch::current::default_direct_map_base();
+    let image_base = kernel.info.virtual_base;
+    let (direct_map_base, kaslr_flags) = if kaslr.randomize_dm
+    {
+        // SAFETY: entry_out[..entry_count] were written and sorted above.
+        let entries = unsafe { core::slice::from_raw_parts(entry_out, entry_count) };
+        let ceiling = boot_protocol::direct_map_ceiling(entries, framebuffer, &kernel_mmio);
+        let (base, limited) =
+            boot_protocol::layout::direct_map_base(kaslr.dm_rand, floor, image_base, ceiling);
+        let f = if limited
+        {
+            kaslr.flags | boot_protocol::KASLR_DM_WINDOW_LIMITED
+        }
+        else
+        {
+            kaslr.flags | boot_protocol::KASLR_DM_RANDOMIZED
+        };
+        (base, f)
+    }
+    else
+    {
+        (floor, kaslr.flags)
+    };
+    // Only the flags are printed here — the console mirrors to the
+    // framebuffer, which is handed to userspace, so the slide / base values
+    // (KASLR secrets) never go through it. The kernel prints them over the
+    // serial-only path.
+    bprintln!("[--------] boot: kaslr flags={kaslr_flags:#x}");
+
     // Write the populated BootInfo.
     // SAFETY: boot_info_phys is a valid 4 KiB allocation; BootInfo fits in one page.
     unsafe {
@@ -1267,10 +1460,8 @@ unsafe fn step9_populate_boot_info(
                 boot_entropy_seed: boot_entropy.seed,
                 boot_entropy_len: boot_entropy.len,
                 vmgenid_paddr,
-                // Deterministic layout until the KASLR window selection
-                // lands (#252): mode-default direct map, no randomization.
-                direct_map_base: arch::current::default_direct_map_base(),
-                kaslr_flags: 0,
+                direct_map_base,
+                kaslr_flags,
             },
         );
     }

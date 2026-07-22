@@ -217,6 +217,12 @@ pub struct MkdiskArgs
     /// and prune `rootfs/`-absent ones, undoing the manual staging.
     #[arg(long)]
     pub repack_only: bool,
+
+    /// Stage the `\EFI\seraph\nokaslr` override knob so the bootloader boots
+    /// the kernel at its deterministic (un-randomized) layout — for GDB /
+    /// symbolization workflows. Omit to remove the knob and re-enable KASLR.
+    #[arg(long)]
+    pub no_kaslr: bool,
 }
 
 // ── TestTerminal ──────────────────────────────────────────────────────────────

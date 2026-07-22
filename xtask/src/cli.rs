@@ -75,6 +75,13 @@ pub enum CliCommand
     /// generation-change detection plus post-resume liveness. Requires the
     /// same populated sysroot as `test-terminal`.
     TestVmgenid(TestVmgenidArgs),
+
+    /// Boot the KASLR randomization test: boot twice, scrape the kernel's
+    /// serial-only `kaslr:` line, and assert the image slide and direct-map
+    /// base differ between boots; then boot once with the `--no-kaslr` knob
+    /// staged and assert the deterministic layout. Requires a populated
+    /// sysroot with the ktest bundle composed (see xtask/README.md).
+    TestKaslr(TestKaslrArgs),
 }
 
 // ── Build ─────────────────────────────────────────────────────────────────────
@@ -255,6 +262,28 @@ pub struct TestVmgenidArgs
     /// Guest memory size in MiB (QEMU -m).
     #[arg(long, default_value = "512")]
     pub mem: u32,
+}
+
+// ── TestKaslr ─────────────────────────────────────────────────────────────────
+
+#[derive(Parser)]
+pub struct TestKaslrArgs
+{
+    /// Target architecture.
+    #[arg(long, default_value = "x86_64")]
+    pub arch: Arch,
+
+    /// Number of vCPUs to expose to the guest (QEMU -smp).
+    #[arg(long, default_value = "4")]
+    pub cpus: u32,
+
+    /// Guest memory size in MiB (QEMU -m).
+    #[arg(long, default_value = "512")]
+    pub mem: u32,
+
+    /// riscv64 paging mode to negotiate (ignored on x86-64).
+    #[arg(long, default_value = "sv48")]
+    pub riscv_mmu: RiscvMmu,
 }
 
 // ── ComposeBundle ────────────────────────────────────────────────────────────

@@ -126,9 +126,27 @@ fn report_kaslr(flags: u32, image_base: u64, dm_base: u64)
 
     // Serial-only: the actual secrets, for the debug/symbolization workflow.
     let link_base = boot_protocol::layout::KERNEL_LINK_BASE;
-    kprintln_serial!(
-        "kaslr: slide={:#x} image_base={image_base:#x} dm_base={dm_base:#x}",
-        image_base.wrapping_sub(link_base)
+    let slide = image_base.wrapping_sub(link_base);
+    kprintln_serial!("kaslr: slide={slide:#x} image_base={image_base:#x} dm_base={dm_base:#x}");
+
+    // Invariants (checked on every debug boot): the IMAGE_RANDOMIZED flag
+    // agrees with a nonzero slide, the slide is 2 MiB-aligned, and the
+    // direct-map base is 1 GiB-aligned. Production placement is enforced by
+    // validate_boot_info / init_paging_mode; these catch a flag/layout drift.
+    debug_assert_eq!(
+        flags & KASLR_IMAGE_RANDOMIZED != 0,
+        slide != 0,
+        "KASLR_IMAGE_RANDOMIZED flag disagrees with the applied slide"
+    );
+    debug_assert_eq!(
+        slide % (2 * 1024 * 1024),
+        0,
+        "image slide not 2 MiB-aligned"
+    );
+    debug_assert_eq!(
+        dm_base % (1024 * 1024 * 1024),
+        0,
+        "direct-map base not 1 GiB-aligned"
     );
 }
 

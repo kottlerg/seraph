@@ -48,8 +48,9 @@ const KASLR_MARKER: &str = "kaslr: slide=";
 /// firmware / TCG startup.
 const TIMEOUT: Duration = Duration::from_mins(2);
 
-/// The kernel's link-time image base (`KERNEL_VBASE`) and the per-mode
-/// direct-map floors, mirrored from `boot_protocol` for the knob assertion.
+/// The kernel's link-time image base (`KERNEL_VBASE`), mirrored from
+/// `boot_protocol::layout` for the knob assertion (the per-mode direct-map
+/// floors are in [`mode_floor`]).
 const KERNEL_LINK_BASE: u64 = 0xFFFF_FFFF_8000_0000;
 
 /// Parsed KASLR layout from one boot's serial line.
@@ -241,10 +242,13 @@ pub fn run(ctx: &Context, args: &TestKaslrArgs) -> Result<()>
     stage_nokaslr_knob(ctx, true).context("staging nokaslr knob")?;
     crate::disk::create_disk_image(ctx, args.arch).context("repacking disk with knob")?;
     let knob_result = scrape("boot C (--no-kaslr)");
-    let restore = stage_nokaslr_knob(ctx, false)
-        .and_then(|()| crate::disk::create_disk_image(ctx, args.arch));
+    // Always restore first and surface its failure ahead of the boot-C result:
+    // leaving the knob staged would silently disable KASLR for later runs, so a
+    // failed restore is the more urgent error to report.
+    stage_nokaslr_knob(ctx, false)
+        .and_then(|()| crate::disk::create_disk_image(ctx, args.arch))
+        .context("restoring KASLR-enabled disk")?;
     let c = knob_result?;
-    restore.context("restoring KASLR-enabled disk")?;
 
     if c.slide != 0 || c.image_base != KERNEL_LINK_BASE
     {

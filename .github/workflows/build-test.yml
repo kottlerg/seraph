@@ -138,6 +138,15 @@ jobs:
           cargo xtask run-parallel \
             --arch ${{ matrix.arch }} \
             --parallel 1 --runs 1 --timeout 180
+          if [ "${{ matrix.tester }}" = "ktest" ]; then
+            # Extra boots: the KASLR randomization test (#252). Boots the
+            # ktest bundle already composed above twice and asserts the
+            # image slide and direct-map base differ, then asserts the
+            # --no-kaslr knob yields the deterministic layout. Host-side
+            # (it must observe the layout differing across separate boots),
+            # so it cannot ride run-parallel; both arches.
+            cargo xtask test-kaslr --arch ${{ matrix.arch }}
+          fi
           if [ "${{ matrix.tester }}" = "usertest" ]; then
             # Second boot: the terminal interactive test (keyboard input
             # through the terminal). It needs the QMP `test-terminal` runner

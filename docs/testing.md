@@ -257,7 +257,9 @@ arches) drives this host-side against the ktest bundle:
 
 Requires a populated sysroot with the ktest bundle composed
 (`cargo xtask compose-bundle --harness ktest`). The `kaslr:` line is serial-only
-(never framebuffer), so the values it carries never reach userspace.
+(never framebuffer), so the values it carries never reach userspace. In CI it runs
+as extra boots inside each `ktest` cell (both arches, both profiles), after the
+`ktest` run-parallel boot.
 
 ### One shutdown-invoking harness per boot
 

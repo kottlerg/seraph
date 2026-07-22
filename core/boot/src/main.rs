@@ -301,7 +301,7 @@ unsafe fn boot_sequence(image: EfiHandle, st: *mut EfiSystemTable) -> Result<!, 
     // SAFETY: kernel.info comes from load_kernel with its span allocation
     // live and identity-mapped; virtual addresses are still unbiased link VAs;
     // ctx.esp_root is valid until ExitBootServices.
-    let kaslr = unsafe { step5d_apply_kaslr_slide(&ctx, &mut kernel.info, &boot_entropy)? };
+    let mut kaslr = unsafe { step5d_apply_kaslr_slide(&ctx, &mut kernel.info, &boot_entropy)? };
     // SAFETY: all prior unsafe outputs remain valid; step 6 allocates via bs.
     let (allocs, mut page_table) = unsafe {
         step6_allocate_and_build_page_tables(
@@ -338,14 +338,19 @@ unsafe fn boot_sequence(image: EfiHandle, st: *mut EfiSystemTable) -> Result<!, 
             &page_table,
         );
     }
-    // Scrub the KASLR entropy words from the bootloader's copy: the slide is
-    // applied and the direct-map base chosen, so these must not linger in
-    // BootServicesData that is later reclaimed to userspace. The pool seed is
-    // already in BootInfo (the kernel scrubs it there after absorbing it).
-    // SAFETY: boot_entropy is a live local; volatile so the store is not
-    // elided as dead ahead of the value going out of scope.
+    // Scrub every bootloader-held copy of the KASLR entropy words: the slide is
+    // applied and the direct-map base chosen, so neither the source draw
+    // (`boot_entropy.kaslr`) nor the `dm_rand` copy that step 9 consumed
+    // (`kaslr.dm_rand`) may linger in BootServicesData that is later reclaimed
+    // to userspace. The pool seed is already in BootInfo, which the kernel
+    // scrubs after absorbing it; the bootloader's own stack copy of that seed
+    // shares the general remanence of UEFI-reclaimed pages and is not
+    // separately scrubbed here.
+    // SAFETY: both are live locals; volatile so the stores are not elided as
+    // dead ahead of the values going out of scope.
     unsafe {
         core::ptr::write_volatile(core::ptr::addr_of_mut!(boot_entropy.kaslr), [0u64; 2]);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!(kaslr.dm_rand), 0u64);
     }
     // SAFETY: page_table root frames are valid; kernel_info.entry_virtual is
     // within the loaded kernel image; BootInfo at allocs.boot_info_phys is

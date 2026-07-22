@@ -205,13 +205,26 @@ At boot, runtime jitter has not yet accumulated. `seed_pool_from_sources` mixes:
 
 The **boot-entropy hole** is the residual weakness when the only source is
 jitter: the initial seed is then weaker than at steady state. The firmware boot
-seed closes it wherever UEFI `EFI_RNG_PROTOCOL` is available: x86-64 OVMF
-implements it today. The current riscv64 EDK2 does **not** expose it, so riscv64
-still falls back to jitter only — narrowed continuously at runtime by the
-timer-tick jitter hook, which feeds a fresh sample into each CPU's accumulator
-on every tick (and per device IRQ). Closing the riscv64 boot hole therefore
-needs the firmware/boot environment to provide a seed (RNG protocol or DT
-`rng-seed`); that firmware provisioning is tracked separately.
+seed closes it wherever UEFI `EFI_RNG_PROTOCOL` is available. On x86-64 OVMF
+implements it (RDRAND-backed). On riscv64 the EDK2 firmware exposes no RNG on its
+own — and it hands the bootloader ACPI, not a DTB, so the QEMU-authored DTB
+`/chosen/rng-seed` never reaches the bootloader either — but the firmware's
+`VirtioRngDxe` driver binds a `virtio-rng` device and exposes `EFI_RNG_PROTOCOL`
+through it. The default QEMU boot set therefore includes `virtio-rng-pci` on both
+arches (added for KASLR, [#252](https://github.com/kottlerg/seraph/issues/252)),
+which closes the riscv64 boot-entropy hole: the boot log shows
+`entropy: seeded from firmware RNG (boot seed, N bytes)` on riscv64. Where no such
+device is present, riscv64 falls back to jitter only — narrowed continuously at
+runtime by the timer-tick jitter hook, which feeds a fresh sample into each CPU's
+accumulator on every tick (and per device IRQ). The bootloader also keeps a DTB
+`/chosen/rng-seed` reader as a secondary fallback for firmware that *does* deliver
+a DTB (extracted, split first-16-bytes-to-KASLR / rest-to-pool, and scrubbed from
+the userspace-visible blob); it is inactive under QEMU+EDK2.
+
+The KASLR draw is kept **separate** from the pool seed: the bootloader draws an
+independent 16-byte `EFI_RNG_PROTOCOL` word for the image slide / direct-map base,
+so the pool seed never reveals the KASLR layout and vice versa (a DTB fallback
+splits its single seed non-overlapping for the same reason).
 
 The first *consumer* draw is decoupled from the boot scrape: the Phase 5/8
 self-test capture is each generator's first draw and necessarily seeds from

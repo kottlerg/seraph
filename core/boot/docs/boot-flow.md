@@ -54,6 +54,10 @@ The ELF header is validated, the LOAD segments are placed in a single
 contiguous span allocated at any free physical base (so loading tolerates
 any firmware memory layout), and the kernel virtual addresses, entry point,
 and chosen physical base (`BootInfo.kernel_physical_base`) are recorded.
+The kernel is a static-PIE (`ET_DYN`) image; its `.rela.dyn` table is
+pre-located and validated here (`RELATIVE`-only, every target inside the
+load span) so a later step can apply it. (An `ET_EXEC` kernel is still
+accepted and pinned to slide 0.)
 
 W^X is enforced during loading: any ELF segment requesting both writable
 and executable permissions is a fatal error.
@@ -117,23 +121,38 @@ capabilities. The seed covers LAPIC / IOAPIC / PLIC / ECAM / BAR
 windows / `virtio,mmio` transports from the firmware tables and is
 merged with the UEFI memory map's `MemoryMappedIO` regions in step 8.
 
-The bootloader also draws a **conditioned early-boot entropy seed** from UEFI
-`EFI_RNG_PROTOCOL` (`GetRNG`, default algorithm) while boot services are live,
-recording it in `BootInfo.boot_entropy_seed` / `boot_entropy_len`. It narrows
-the kernel's boot-time entropy hole before any early consumer (KASLR/ASLR) draws
-randomness. The fetch is silent and only effective where the firmware implements
-the protocol — x86-64 OVMF does; the current riscv64 EDK2 does not. When no RNG
-is exposed the length is zero and the kernel degrades to timing jitter. See
-`core/kernel/docs/entropy.md`.
+The bootloader also draws **conditioned early-boot entropy** from UEFI
+`EFI_RNG_PROTOCOL` (`GetRNG`, default algorithm) while boot services are live: a
+32-byte pool seed recorded in `BootInfo.boot_entropy_seed` / `boot_entropy_len`,
+and an independent 16-byte KASLR word (kept separate so neither reveals the other)
+for the image slide and direct-map base. It narrows the kernel's boot-time entropy
+hole before any early consumer draws randomness. The protocol is backed by RDRAND
+on x86-64 OVMF and by the firmware's `VirtioRngDxe` driver binding the
+`virtio-rng-pci` device on both arches (the mechanism that gives riscv64 a boot
+seed at all, since its EDK2 exposes no RNG on its own and hands the bootloader ACPI
+rather than a DTB). When no RNG is exposed the length is zero, the KASLR entropy is
+absent, and the kernel degrades to timing jitter and the deterministic layout. A DTB
+`/chosen/rng-seed` reader is a secondary fallback for firmware that delivers a DTB.
+See `core/kernel/docs/entropy.md`.
 
 Detail: [firmware-parsing.md](firmware-parsing.md)
+
+### Step 5d: Apply the KASLR Slide
+
+Before the page tables are built, the bootloader chooses a 2 MiB-aligned kernel
+image slide within the top-2 GiB window from the KASLR entropy (0 when no entropy,
+or when the `\EFI\seraph\nokaslr` override knob is present), applies the kernel's
+`RELATIVE` relocations through the loaded span, and biases the recorded kernel
+virtual base and entry point. The matching 1 GiB-aligned direct-map base is chosen
+in step 9 once the final memory map is known. The chosen layout and its entropy
+source are recorded in `BootInfo.kaslr_flags` (KASLR, #252).
 
 ### Step 6: Allocate and Build Page Tables
 
 Initial page tables are constructed for the kernel. All page table frames are
 allocated from UEFI before `ExitBootServices`. The tables map:
 
-- The kernel ELF segments at their ELF virtual addresses, with segment permissions
+- The kernel ELF segments at their (KASLR-biased) virtual addresses, with segment permissions
 - An identity map of the `BootInfo` structure, all boot modules, and the bootloader's
   own stack, so the kernel can read them before replacing the page tables
 
@@ -165,16 +184,17 @@ Detail: [uefi-environment.md](uefi-environment.md)
 ### Step 9: Populate BootInfo
 
 `BootInfo` is populated in-place in a physical memory region allocated before step 8.
-All pointer and address fields hold physical addresses; no virtual addresses appear in
-`BootInfo`. The `version` field is set to `BOOT_PROTOCOL_VERSION` (currently `8`).
-Fields are populated as follows:
+Pointer and resource-address fields hold physical addresses; the only virtual addresses
+are the KASLR-biased `kernel_virtual_base` and `direct_map_base`, which the kernel
+scrubs from this donated page after consuming them. The `version` field is set to
+`BOOT_PROTOCOL_VERSION` (currently `14`). Fields are populated as follows:
 
 | Field | Source |
 |---|---|
 | `version` | `BOOT_PROTOCOL_VERSION` constant from `boot-protocol` crate |
 | `memory_map` | Translated UEFI memory map from step 7 |
 | `kernel_physical_base` | Physical address of kernel LOAD segments from step 3 |
-| `kernel_virtual_base` | ELF virtual base address from step 3 |
+| `kernel_virtual_base` | KASLR-biased kernel image virtual base (link base + slide from step 5d) |
 | `kernel_size` | Total span of kernel ELF LOAD segments from step 3 |
 | `init_image` | Pre-parsed init ELF segments and entry point from step 4 |
 | `modules` | Physical base and size of each additional boot module from step 4; empty if none configured |
@@ -188,8 +208,11 @@ Fields are populated as follows:
 | `cpu_ids` | Per-CPU hardware identifiers; `cpu_ids[0] == bsp_id`; entries beyond `cpu_count` are zero |
 | `ap_trampoline_page` | 4 KiB physical frame for AP startup code. x86-64: below 1 MiB (SIPI vector constraint). RISC-V: any 4 KiB page (SBI HSM has no placement constraint). Zero if allocation failed (SMP disabled). |
 | `reclaim_ranges` | `ReclaimSlice` over a dedicated 4 KiB scratch page recording bootloader pages the kernel reclaims into the cap surface. Populated from `BootAllocations` (`BootInfo` page, module descriptor array, memory-map entry array, MMIO aperture array, the reclaim-array page itself, the AP trampoline page), `page_table.allocated_frames()` (the bootloader's transient page-table frames), and per-gap carve-outs over the bundle allocation — the header + entry table + leading pad, the init ELF source body (no longer needed after `load_init` copied segments out), and any inter-module or trailing slack pages. Module bodies are skipped here because `cap::mint_module_memory_caps` already mints Memory caps over them; pushing them again would double-register pages in the buddy ledger. Each `ReclaimRange` carries a `flags: u32`; bit 0 (`RECLAIM_FLAG_LATE`) marks the AP trampoline entry so the kernel defers minting it until the post-SMP-bringup late-reclaim pass. All other entries are minted by `cap::mint_reclaim_memory_caps` inside `populate_cspace`. |
-| `boot_entropy_seed` | 32-byte conditioned entropy seed drawn from UEFI `EFI_RNG_PROTOCOL` in step 5; valid for `boot_entropy_len` bytes, remainder zero. Absorbed into the kernel entropy pool at Phase 5. |
-| `boot_entropy_len` | Valid leading byte count of `boot_entropy_seed` (`0` or `32`); zero when the firmware exposes no RNG, in which case the kernel degrades to timing jitter. |
+| `boot_entropy_seed` | Conditioned entropy seed for the pool, drawn from `EFI_RNG_PROTOCOL` (or a DTB `/chosen/rng-seed` fallback) in step 5; valid for `boot_entropy_len` bytes, remainder zero. Absorbed into the kernel entropy pool at Phase 5. The separate KASLR entropy word never appears in `BootInfo`. |
+| `boot_entropy_len` | Valid leading byte count of `boot_entropy_seed`; zero when no RNG source is present, in which case the kernel degrades to timing jitter. |
+| `vmgenid_paddr` | Physical address of the 16-byte ACPI VMGENID GUID (x86-64 QEMU SSDT scan in step 9); zero when absent. |
+| `direct_map_base` | KASLR-chosen direct-map virtual base — a 1 GiB-aligned base at or above the paging mode's kernel-half floor, chosen in step 9 from the KASLR entropy and the final memory map. A KASLR secret; the kernel scrubs it after Phase 3. |
+| `kaslr_flags` | `KASLR_*` status bits: which layout dimensions were randomized, the entropy source, and any skip reason (knob / window-limited). Zero means an entirely un-randomized layout. |
 
 All arrays pointed to by `BootInfo` fields reside in physical memory that the UEFI
 memory map marks as `Loaded` or `Usable`, ensuring they survive until the kernel

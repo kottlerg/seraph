@@ -39,18 +39,23 @@ Kernel space is divided into regions:
 
 ```
   0xFFFFFFFFFFFFFFFF ┐
-                     │  Kernel heap (slab + size-class allocator)
+                     │  Kernel image (text, rodata, data, bss) — top 2 GiB window,
+                     │    base randomized per boot (KASLR)
                      │
-                     │  Kernel image (text, rodata, data, bss)
-                     │
-  0xFFFF800000000000 ┘  Physical memory direct map (all RAM, read/write)
+                     │  Physical memory direct map (all RAM, read/write),
+  0xFFFF800000000000 ┘    base randomized per boot at or above this floor (KASLR)
 ```
 
 The physical memory direct map gives the kernel a virtual address for every physical
 page. Large pages (2 MiB) are used where alignment allows.
 
-Exact region boundaries are an implementation detail and will be fixed at the time
-the kernel memory layout is initialised. They are not ABI.
+Both the kernel image base and the direct-map base are randomized at boot behind
+the boot-entropy source (KASLR,
+[#252](https://github.com/kottlerg/seraph/issues/252)): the image slides within
+the top 2 GiB at 2 MiB granularity, and the direct map is placed at a 1 GiB-aligned
+base at or above the kernel-half floor, below the image. With no boot entropy the
+layout falls back to the fixed defaults shown above. Exact region boundaries are an
+implementation detail, not ABI.
 
 ### RISC-V (Sv39 / Sv48 / Sv57)
 
@@ -75,10 +80,13 @@ entry 256 in every mode:
   ~~~~~~~~~~~~~~~~~~~~ (non-canonical gap between the halves — hardware enforced)
 ```
 
-The physical direct map starts at the active mode's kernel-half base; the
-kernel image stays at the top 2 GiB, canonical in every mode. Under Sv39 the
-kernel half is 256 GiB total, capping direct-mappable RAM at 254 GiB — the
-kernel refuses to boot beyond that rather than overlap the image mapping.
+The physical direct map is placed at a 1 GiB-aligned base at or above the active
+mode's kernel-half base (randomized per boot, KASLR); the kernel image slides
+within the top 2 GiB, canonical in every mode. Under Sv39 the kernel half is
+256 GiB total, capping direct-mappable RAM at 254 GiB — the kernel refuses to boot
+beyond that rather than overlap the image mapping, and a near-full Sv39 half narrows
+the direct-map randomization window (falling back to the kernel-half floor when
+fewer than two 1 GiB slots remain).
 All fixed userspace-layout zones sit below 2^38, the smallest user half, so
 one static userspace layout is canonical in every mode
 ([userspace-memory-model.md](userspace-memory-model.md)).
@@ -115,10 +123,11 @@ order and the process-creation/death flow are in
 
 ### Page Sizes
 
-The base page size is 4 KiB on both architectures. Large pages (2 MiB on x86-64,
-megapages on RISC-V) are used where beneficial — primarily the kernel direct map
-and large contiguous device mappings. Huge pages (1 GiB) may be used for the direct
-map on systems with sufficient RAM.
+The base page size is 4 KiB on both architectures. The kernel direct map is built
+from 2 MiB large pages (x86-64) / megapages (RISC-V); the randomized direct-map base
+is 1 GiB-aligned, which preserves the 2 MiB VA≡PA congruence these leaves require and
+reserves the natural granule for a future 1 GiB gigapage direct map (not used today).
+Large pages are also used for large contiguous device mappings.
 
 Userspace mappings use 4 KiB pages by default. Large page support for userspace is
 a future optimisation. On RISC-V, uncacheable (MMIO) user mappings additionally use

@@ -240,6 +240,25 @@ Same boot requirements as `test-terminal` (default boot set, terminal
 autostarted); the host computes the verdict and kills QEMU. In CI it runs as
 an additional boot inside the x86_64 `usertest` cell, after `test-terminal`.
 
+### KASLR randomization (`test-kaslr`)
+
+KASLR (#252) cannot be verified from inside the guest: it must observe that the
+layout *differs* across separate boots. `cargo xtask test-kaslr [--arch]` (both
+arches) drives this host-side against the ktest bundle:
+
+1. Boot twice with KASLR enabled; scrape the kernel's serial-only
+   `kaslr: slide=… image_base=… dm_base=…` line (emitted in Phase 1) and assert
+   the joint `(slide, dm_base)` differs between the two boots. A single-dimension
+   collision is ~1/1000, so the compare is joint and retries boot B once — a
+   false failure is ~1e-8.
+2. Stage the `\EFI\seraph\nokaslr` override knob, repack `disk.img`, boot once,
+   and assert the deterministic layout (slide 0, image at its link base, direct
+   map at the mode floor); the KASLR-enabled image is always restored afterward.
+
+Requires a populated sysroot with the ktest bundle composed
+(`cargo xtask compose-bundle --harness ktest`). The `kaslr:` line is serial-only
+(never framebuffer), so the values it carries never reach userspace.
+
 ### One shutdown-invoking harness per boot
 
 `svctest` and `usertest` invoke `pwrmgr` shutdown on completion. Two such
@@ -279,10 +298,13 @@ not on every push.
 **Dimension inventory.** Exhaustive per CI run: architecture (x86_64,
 riscv64) × profile (debug, release) × harness (ktest, svctest, usertest).
 Fixed per CI run: vCPU count (4), guest memory (512 MiB), device set
-(virtio-blk + virtio-keyboard + serial, plus `vmgenid,guid=auto` on x86_64;
-CI boots headless, so no framebuffer), filesystem (FAT), riscv64 paging mode
-(sv48 — per-mode runs via `cargo xtask run --riscv-mmu sv39|sv57` are manual,
-same posture as CPU-count variations).
+(virtio-blk + virtio-keyboard + virtio-rng + serial, plus `vmgenid,guid=auto`
+on x86_64; CI boots headless, so no framebuffer), filesystem (FAT), riscv64
+paging mode (sv48 — per-mode runs via `cargo xtask run --riscv-mmu sv39|sv57`
+are manual, same posture as CPU-count variations). The `virtio-rng` device is
+the KASLR boot-entropy source: the firmware's RNG driver binds it and exposes
+`EFI_RNG_PROTOCOL`, which the bootloader draws from (on riscv64 it is the only
+such source).
 A device or filesystem joining the default boot set joins the canonical
 cells automatically; variants belong to the tiers below.
 

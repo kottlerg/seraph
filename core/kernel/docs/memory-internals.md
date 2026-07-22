@@ -450,22 +450,28 @@ usable physical memory. The kernel uses `phys_to_virt` and `virt_to_phys` helper
 /// The physical address must be within usable physical RAM.
 pub fn phys_to_virt(phys: PhysAddr) -> VirtAddr
 {
-    // SAFETY: PHYSMAP_BASE + phys is within the direct physical map region,
+    // direct_map_base() + phys is within the direct physical map region,
     // which is mapped for all usable RAM during Phase 3 initialization.
-    VirtAddr(PHYSMAP_BASE + phys.0)
+    VirtAddr(direct_map_base() + phys.0)
 }
 
 /// Convert a kernel virtual address in the direct map to its physical address.
 /// The virtual address must be within the direct physical map region.
 pub fn virt_to_phys(virt: VirtAddr) -> PhysAddr
 {
-    debug_assert!(virt.0 >= PHYSMAP_BASE);
-    PhysAddr(virt.0 - PHYSMAP_BASE)
+    debug_assert!(virt.0 >= direct_map_base());
+    PhysAddr(virt.0 - direct_map_base())
 }
 ```
 
-These are the only valid paths for physical-to-virtual conversion. Arbitrary physical
-addresses must not be accessed by computing offsets from kernel image addresses.
+`direct_map_base()` is a runtime value, not a compile-time constant: the bootloader
+randomizes the direct-map base per boot (KASLR) and the kernel publishes it once at
+entry (`init_paging_mode`), after which the accessor is a single relaxed atomic load.
+The Phase-3 builder guards the layout with the shared `boot_protocol::direct_map_ceiling`
+(RAM plus any framebuffer / kernel MMIO above the RAM ceiling), which must end at or
+below the kernel image base. These are the only valid paths for physical-to-virtual
+conversion. Arbitrary physical addresses must not be accessed by computing offsets from
+kernel image addresses.
 
 ---
 

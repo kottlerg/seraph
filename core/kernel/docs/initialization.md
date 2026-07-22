@@ -111,11 +111,16 @@ heap exists yet.
    - Data/BSS segment: readable, writable, not executable
    (Segment addresses from ELF headers, sizes from BootInfo)
 4. Map the direct physical map:
-   - For each usable physical range: map at PHYSMAP_BASE + phys_addr
-   - Use 2 MiB large pages where alignment permits
-   - Use 1 GiB huge pages where alignment permits and range is large enough
+   - For each usable physical range: map at direct_map_base() + phys_addr
+   - Use 2 MiB large pages (megapages on RISC-V); 1 GiB gigapages are not used
    - Permissions: readable, writable, not executable
-   PHYSMAP_BASE = 0xFFFF800000000000 (both architectures)
+   direct_map_base() is the runtime KASLR-chosen base from BootInfo — a
+   1 GiB-aligned base at or above the paging mode's kernel-half floor
+   (0xFFFF800000000000 on x86-64 / Sv48), published by init_paging_mode
+   at kernel entry after validation. Before mapping, a guard re-checks that
+   the whole direct map (RAM plus any framebuffer / kernel MMIO above the RAM
+   ceiling — the shared boot_protocol::direct_map_ceiling) ends at or below
+   the kernel image base; overlap is fatal.
 5. Map the BootInfo structure and boot modules (needed until they are consumed)
 6. Install the new page table:
    arch::current::paging::activate(root_phys)
@@ -128,10 +133,12 @@ heap exists yet.
    (header + entry table + 4 KiB pad, init ELF source body, and any
    inter-module or trailing slack — module bodies are excluded because
    `mint_module_memory_caps` already covers them).
-8. Emit: "page tables established, physmap at 0xFFFF800000000000"
+8. Emit: "page tables active" (the direct-map base is a KASLR secret and is
+   reported only on the serial-only path at Phase 1, never via the
+   framebuffer-mirrored console)
 ```
 
-After this phase, the kernel can access any physical frame at `PHYSMAP_BASE + phys`.
+After this phase, the kernel can access any physical frame at `direct_map_base() + phys`.
 All kernel pointers derived from physical addresses use this translation.
 
 **Failure mode:** Frame allocation failure during page table construction is fatal.

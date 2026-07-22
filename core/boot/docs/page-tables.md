@@ -14,9 +14,11 @@ no page table allocation occurs after the firmware exits.
 The state the **kernel may assume** at entry — distinct from what the
 bootloader *builds*, described in later sections — is:
 
-- The kernel image is mapped at its ELF-specified virtual addresses
-  (text, rodata, data, bss), with page permissions matching each
-  segment's ELF flags (W^X enforced).
+- The kernel image is mapped at its KASLR-biased virtual addresses
+  (text, rodata, data, bss; ELF virtual base + slide), with page
+  permissions matching each segment's ELF flags (W^X enforced). The
+  bootloader has already applied the image's `RELATIVE` relocations for
+  the chosen slide, so the mapped image is internally consistent.
 - An identity map covers the physical memory region containing the
   `BootInfo` structure and every physical region it references
   (memory-map buffer, `MmioAperture` array, `InitImage` segments,
@@ -39,9 +41,9 @@ first-argument register — is specified in
 The initial page tables contain exactly three categories of mappings. Nothing else is
 mapped; an access outside these ranges faults.
 
-**Kernel ELF segments** — each LOAD segment is mapped at its ELF virtual address with
-permissions derived from the ELF segment flags. This allows the kernel to execute from
-the first instruction.
+**Kernel ELF segments** — each LOAD segment is mapped at its KASLR-biased virtual
+address (ELF virtual base + slide) with permissions derived from the ELF segment flags.
+This allows the kernel to execute from the first instruction.
 
 **Identity map of the boot region** — the `BootInfo` structure, the `MmioAperture`
 array, the memory map buffer, and all boot modules are identity-mapped (virtual address

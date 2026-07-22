@@ -29,6 +29,17 @@ earlier ones, which remain as fallbacks.
    as the panic console. The kernel never becomes a client of the userspace
    serial or framebuffer driver.
 
+   A **serial-only class** of kernel output (`kprintln_serial!` /
+   `console::serial_write_fmt`) writes the UART but skips the framebuffer. It
+   exists because `kprintln!` *mirrors* to the framebuffer, and although the
+   kernel writes that framebuffer directly rather than as a driver client, the
+   framebuffer memory is later handed to the userspace framebuffer driver — so
+   anything `kprintln!` draws can be read back by userspace. Secrets that must
+   not cross that boundary — the KASLR image base, direct-map base, and slide
+   ([#252](https://github.com/kottlerg/seraph/issues/252)) — go through the
+   serial-only class only. See
+   [`core/kernel/docs/cross-boundary-disclosure.md`](../core/kernel/docs/cross-boundary-disclosure.md).
+
 3. **init-logd direct-UART fallback** — during early userspace boot, the
    init-logd thread (a second thread of the init process,
    `services/init/src/logging.rs`) drains the master log endpoint and writes

@@ -67,19 +67,21 @@ triple each one defines.
 Key properties shared by the kernel-triple JSONs
 (`x86_64-seraph-none.json`, `riscv64imac-seraph-none.json`):
 
-- x86-64: red zone off, SSE/AVX/MMX off, soft-float, kernel code model.
+- x86-64: red zone off, SSE/AVX/MMX off, soft-float, small code model.
 - RISC-V: RV64IMAC feature set, soft-float, medium code model, lp64 ABI.
-- Both: `panic-strategy: abort`, `relocation-model: static` (the kernel
-  is the one fixed-address image; KASLR is #252), link with `rust-lld`.
+- Both: `panic-strategy: abort`, `relocation-model: pic`, `-pie
+  --no-dynamic-linker -Bsymbolic -z max-page-size=4096` link args, link
+  with `rust-lld`. The kernel is a static-PIE (`ET_DYN`) image; the
+  bootloader chooses its load bias (KASLR, #252) and applies its
+  `RELATIVE` relocations before handoff.
 
 The low-level-userspace triples (`x86_64-seraph-lowuser.json`,
-`riscv64imac-seraph-lowuser.json` — init, ktest, memmgr) keep the
-kernel triples' feature floor but emit position-independent executables:
-`relocation-model: pic` (small code model on x86-64), `-pie
---no-dynamic-linker -Bsymbolic -z max-page-size=4096` link args,
-producing `ET_DYN` images with `RELATIVE`-only relocations that loaders
-place at a randomized base and whose `PT_GNU_RELRO` region they seal
-read-only after relocation (ASLR, #39).
+`riscv64imac-seraph-lowuser.json` — init, ktest, memmgr) share the same
+PIE treatment as the kernel triples (the kernel dropped x86-64's kernel
+code model to `small` when it went PIE): `relocation-model: pic`, the
+same `-pie …` link args, producing `ET_DYN` images with `RELATIVE`-only
+relocations that loaders place at a randomized base and whose
+`PT_GNU_RELRO` region they seal read-only after relocation (ASLR, #39).
 
 The std-userspace triples (`x86_64-seraph.json`, `riscv64a23-seraph.json`)
 carry the same PIE treatment (plus `tls-model: local-exec`, keeping TLS

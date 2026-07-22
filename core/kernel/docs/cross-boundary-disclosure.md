@@ -108,10 +108,16 @@ A physical address does not reveal the kernel's randomized virtual base, and eac
 gated behind a capability the caller already holds, so neither defeats KASLR. They
 are fixed-by-contract disclosures, not leaks.
 
-**Forward caveat for the KASLR work:** if KASLR is implemented such that the
-direct-map virtual offset becomes recoverable from a physical address (for example a
-fixed or low-entropy phys→virt relationship), these two surfaces must be re-reviewed,
-because a physical address would then be convertible to a kernel VA.
+**Resolved for the KASLR work ([#252](https://github.com/kottlerg/seraph/issues/252)):**
+KASLR draws the direct-map base from the boot-entropy source at 1 GiB granularity
+(≈17–26 bits on x86-64 / Sv48 / Sv57, ≈8 bits on a near-full Sv39 half), independently
+of any physical address. A leaked physical address therefore does **not** reveal the
+phys→virt offset — recovering the direct-map base from a physical address would require
+also knowing that page's virtual address, which these surfaces do not disclose. So
+`SYS_ASPACE_QUERY` and `CAP_INFO_MEMORY_PHYS_BASE` remain fixed-by-contract disclosures,
+not KASLR leaks. (`kernel_physical_base` is likewise a physical value and unaffected;
+the kernel scrubs the *virtual* KASLR bases — `kernel_virtual_base`, `direct_map_base` —
+from the donated `BootInfo` page after consuming them.)
 
 ## Kernel console diagnostics
 
@@ -125,6 +131,18 @@ always-on `USERSPACE FAULT` serial dumps print the faulting thread's *own* user
 registers, not kernel addresses. Kernel-pointer console output is therefore an
 operator-console diagnostic outside the KASLR threat model; it must not be routed to
 any userspace-reachable IPC or log channel.
+
+**KASLR values are serial-only.** The randomized kernel image base, direct-map base,
+and slide are secrets whose disclosure defeats KASLR, and they are subject to a
+tighter rule than other kernel-pointer diagnostics. `kprintln!` mirrors to the
+framebuffer, and although the kernel writes that framebuffer directly (not as a driver
+client), the framebuffer *memory* is later handed to the userspace framebuffer driver,
+which can read the pixels back — so a KASLR value printed via `kprintln!` becomes
+userspace-recoverable. These values must be emitted **only** via the serial-only path
+(`kprintln_serial!` / `console::serial_write_fmt`), never `kprintln!`, and never
+through any IPC or log channel. The Phase-1 KASLR report prints an address-free status
+line via `kprintln!` and the slide/bases only via `kprintln_serial!`; the bootloader's
+console (which also mirrors to the framebuffer) prints only the opaque `kaslr_flags`.
 
 ## Maintaining this inventory
 

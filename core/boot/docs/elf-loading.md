@@ -55,11 +55,22 @@ geometry) is owned by
 
 The kernel image carries an additional *placement* ruleset enforced by the bootloader
 (`validate_kernel_layout` in [`boot/src/elf.rs`](../src/elf.rs)), because the image is
-relocated to a dynamically chosen base and the relocation is sound only if it holds:
-every `PT_LOAD` segment is 4 KiB-aligned in both `p_vaddr` and `p_paddr`, all segments
-share one `p_vaddr → p_paddr` offset, no two segments' physical ranges overlap, and the
-entry point lies within a `PT_LOAD` segment. A violation is surfaced as
+relocated to a dynamically chosen physical base and the relocation is sound only if it
+holds: every `PT_LOAD` segment is 4 KiB-aligned in both `p_vaddr` and `p_paddr`, all
+segments share one `p_vaddr → p_paddr` offset, no two segments' physical ranges overlap,
+and the entry point lies within a `PT_LOAD` segment. A violation is surfaced as
 `BootError::InvalidElf`.
+
+The kernel is a **static-PIE** (`ET_DYN`) image (an `ET_EXEC` kernel is still accepted
+and pinned to zero slide). Its `.rela.dyn` table is pre-located and validated during
+load — `RELATIVE`-only, every target inside the load span — and `relocate_kernel`
+applies it (`*target = slide + addend`) through the copied span before the page tables
+are built, then biases `KernelInfo`'s virtual base and entry by the KASLR slide. The
+slide is 2 MiB-aligned within the top-2 GiB window (0 when there is no boot entropy or
+the `nokaslr` knob is present). The dynamic-linking sections lld emits under `-pie`
+(`.rela.dyn`, `.dynamic`, `.got`, …) are placed inside the image's read-only region by
+the kernel linker scripts, so they keep the single-linear-offset invariant above and
+Phase 3 maps them read-only.
 
 The same validation applies to the kernel ELF and the init ELF. Boot modules (the
 `BootInfo.modules` slice) are not ELF-validated by the bootloader — they are loaded
@@ -105,11 +116,12 @@ the entire allocation is produced by step 4.
 
 ## Entry Point
 
-The kernel entry point is `e_entry` from the ELF header — a virtual address recorded as
-[`KernelInfo.entry_virtual`](../src/elf.rs). The bootloader installs the kernel's initial
-page tables ([page-tables.md](page-tables.md)) before transferring control, so the jump
-target is always this virtual address; no physical entry address is computed or used.
-`validate_kernel_layout` confirms `e_entry` falls within a `PT_LOAD` segment.
+The kernel entry point is `e_entry` from the ELF header, biased by the KASLR slide and
+recorded as [`KernelInfo.entry_virtual`](../src/elf.rs). The bootloader installs the
+kernel's initial page tables ([page-tables.md](page-tables.md)) before transferring
+control, so the jump target is always this (biased) virtual address; no physical entry
+address is computed or used. `validate_kernel_layout` confirms `e_entry` falls within a
+`PT_LOAD` segment (checked on the unbiased link addresses, before the slide is applied).
 
 ---
 

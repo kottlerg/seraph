@@ -96,13 +96,14 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
         arch::current::cpu::halt_loop();
     }
 
-    // Publish the paging mode the bootloader activated (recovered from the
-    // translation registers, not BootInfo) before any consumer of the
-    // mode-derived VA layout runs. No-op on architectures with a single mode.
-    arch::current::paging::init_paging_mode();
-
     // SAFETY: validate_boot_info confirmed non-null, aligned, and readable.
     let info = unsafe { &*boot_info };
+
+    // Publish the paging mode the bootloader activated (recovered from the
+    // translation registers, not BootInfo) and the KASLR-chosen direct-map
+    // base before any consumer of the VA layout runs. Halts on a base
+    // outside the active mode's kernel half.
+    arch::current::paging::init_paging_mode(info);
 
     // Copy all fields needed beyond Phase 3 out of BootInfo now, while the
     // identity mapping is still live. After Phase 3 activates the kernel page
@@ -388,11 +389,14 @@ unsafe fn kernel_entry_post_rebase(
         let n = (boot_entropy_len as usize).min(boot_entropy_seed.len());
         entropy::init(&boot_entropy_seed[..n], vmgenid_paddr);
 
-        // Scrub the conditioned seed once it is absorbed. The BootInfo page is
+        // Scrub the KASLR/entropy secrets once consumed. The BootInfo page is
         // a reclaim range donated to userspace at Phase 7 (memmgr re-hands its
-        // frames without zeroing), so the seed must not survive there; the
-        // local copy is wiped too. The pool retains the entropy — the seed
-        // itself is secret (it feeds KASLR and key/nonce generation).
+        // frames without zeroing), so none of them may survive there; the
+        // local seed copy is wiped too. The pool retains the entropy — the
+        // seed itself is secret (it feeds key/nonce generation), and the
+        // randomized kernel image and direct-map bases defeat KASLR if
+        // disclosed. All Phase-3 consumers of the two bases have run; later
+        // phases read only layout-free BootInfo fields.
         boot_entropy_seed.fill(0);
         // SAFETY: the direct map covers all RAM since Phase 3; boot_info_phys
         // was validated in Phase 0. Single-threaded boot, and no live BootInfo
@@ -402,6 +406,8 @@ unsafe fn kernel_entry_post_rebase(
             let bi = mm::paging::phys_to_virt(boot_info_phys) as *mut BootInfo;
             core::ptr::write_volatile(core::ptr::addr_of_mut!((*bi).boot_entropy_seed), [0u8; 32]);
             core::ptr::write_volatile(core::ptr::addr_of_mut!((*bi).boot_entropy_len), 0u32);
+            core::ptr::write_volatile(core::ptr::addr_of_mut!((*bi).kernel_virtual_base), 0u64);
+            core::ptr::write_volatile(core::ptr::addr_of_mut!((*bi).direct_map_base), 0u64);
         }
     }
 

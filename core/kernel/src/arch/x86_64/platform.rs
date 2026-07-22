@@ -14,20 +14,14 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
+// The direct-map region derivation is shared with the bootloader's KASLR
+// window selection through `boot_protocol::layout`, so both sides agree on
+// what Phase 3 maps above the RAM ceiling.
+#[cfg(test)]
+use boot_protocol::layout::MMIO_REGION_SIZE;
+pub use boot_protocol::layout::collect_mmio_direct_map_regions;
+use boot_protocol::layout::{DEFAULT_IOAPIC_BASE, DEFAULT_LAPIC_BASE};
 use boot_protocol::{IoApicEntry, KernelMmio};
-
-/// Default xAPIC local APIC physical base. Architectural reset value defined
-/// by Intel SDM Vol. 3A §10.4.1; firmware may relocate via the
-/// `IA32_APIC_BASE` MSR but must report the new value through ACPI MADT.
-const DEFAULT_LAPIC_BASE: u64 = 0xFEE0_0000;
-
-/// Default I/O APIC physical base used when the bootloader did not discover
-/// any. Standard PC/AT and modern xAPIC layouts place the first I/O APIC at
-/// this address.
-const DEFAULT_IOAPIC_BASE: u64 = 0xFEC0_0000;
-
-/// Standard MMIO window size for both LAPIC and a single I/O APIC (4 KiB).
-pub const MMIO_REGION_SIZE: u64 = 0x1000;
 
 static CACHED_LAPIC_BASE: AtomicU64 = AtomicU64::new(0);
 
@@ -102,54 +96,6 @@ pub fn uart_base_for_boot_info(_km: &KernelMmio) -> u64
 pub fn console_mmio() -> Option<(u64, u64)>
 {
     None
-}
-
-/// Fill `out` with all kernel-internal MMIO regions that must be direct-mapped
-/// during Phase 3 page-table setup. Returns the number of populated entries.
-///
-/// Reads `km` directly rather than the cache because Phase 3 runs before the
-/// cache is populated.
-pub fn collect_mmio_direct_map_regions(km: &KernelMmio, out: &mut [(u64, u64)]) -> usize
-{
-    let mut n = 0;
-
-    let lapic = if km.lapic_base != 0
-    {
-        km.lapic_base
-    }
-    else
-    {
-        DEFAULT_LAPIC_BASE
-    };
-    if n < out.len()
-    {
-        out[n] = (lapic, MMIO_REGION_SIZE);
-        n += 1;
-    }
-
-    if km.ioapic_count == 0
-    {
-        if n < out.len()
-        {
-            out[n] = (DEFAULT_IOAPIC_BASE, MMIO_REGION_SIZE);
-            n += 1;
-        }
-    }
-    else
-    {
-        let count = (km.ioapic_count as usize).min(km.ioapics.len());
-        for entry in &km.ioapics[..count]
-        {
-            if n >= out.len()
-            {
-                break;
-            }
-            out[n] = (entry.phys_base, MMIO_REGION_SIZE);
-            n += 1;
-        }
-    }
-
-    n
 }
 
 #[cfg(test)]

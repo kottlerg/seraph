@@ -1267,6 +1267,10 @@ unsafe fn step9_populate_boot_info(
                 boot_entropy_seed: boot_entropy.seed,
                 boot_entropy_len: boot_entropy.len,
                 vmgenid_paddr,
+                // Deterministic layout until the KASLR window selection
+                // lands (#252): mode-default direct map, no randomization.
+                direct_map_base: arch::current::default_direct_map_base(),
+                kaslr_flags: 0,
             },
         );
     }

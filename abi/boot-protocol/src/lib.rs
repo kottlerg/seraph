@@ -20,8 +20,11 @@
 #![no_std]
 
 pub mod bundle;
+pub mod layout;
 pub mod riscv_paging;
 pub mod role_guids;
+
+pub use layout::{collect_mmio_direct_map_regions, direct_map_ceiling, max_ram_address};
 
 /// Current boot protocol version. Increment when `BootInfo` layout or the
 /// CPU entry contract changes in a non-backwards-compatible way.
@@ -104,7 +107,17 @@ pub mod role_guids;
 ///     absent. The kernel's entropy subsystem polls the GUID and forces a
 ///     pre-output reseed of every per-CPU generator on a generation change
 ///     (whole-VM-snapshot resume).
-pub const BOOT_PROTOCOL_VERSION: u32 = 13;
+/// v14: Added `direct_map_base: u64` and `kaslr_flags: u32` (KASLR, #252).
+///     The bootloader chooses the direct-map virtual base (the paging
+///     mode's kernel-half base, randomized when boot entropy is available)
+///     and records which layout dimensions were randomized and from which
+///     entropy source in `kaslr_flags`. `kernel_virtual_base` /
+///     `init_image.entry_point` semantics are unchanged but may now carry
+///     a KASLR-biased kernel image base. The shared layout helpers
+///     ([`max_ram_address`], [`direct_map_ceiling`],
+///     [`collect_mmio_direct_map_regions`]) keep the bootloader's window
+///     selection and the kernel's Phase-3 guard on identical arithmetic.
+pub const BOOT_PROTOCOL_VERSION: u32 = 14;
 
 // ── Memory map ───────────────────────────────────────────────────────────────
 
@@ -874,7 +887,52 @@ pub struct BootInfo
     /// kernel's entropy subsystem treats a changed GUID as a mandatory
     /// reseed trigger for every per-CPU generator.
     pub vmgenid_paddr: u64,
+
+    // ── KASLR layout (added in protocol version 14) ───────────────────────────
+    /// Virtual base of the physical direct map, chosen by the bootloader.
+    ///
+    /// Always populated: the active paging mode's kernel-half base by
+    /// default, or a 1 GiB-aligned randomized base within
+    /// `[mode kernel-half base, kernel_virtual_base - guard -
+    /// direct-map ceiling]` when boot entropy is available
+    /// ([`KASLR_DM_RANDOMIZED`]). The kernel validates the value against
+    /// the active mode and [`direct_map_ceiling`] before publishing it;
+    /// like `kernel_virtual_base` it is a KASLR secret, scrubbed from this
+    /// donated page once the kernel has consumed it (Phase 5).
+    pub direct_map_base: u64,
+
+    /// KASLR status flags (`KASLR_*` bits): which layout dimensions were
+    /// randomized, which entropy source fed the draw, and why
+    /// randomization was skipped when it was. Zero means an entirely
+    /// un-randomized layout (no boot entropy and no override knob).
+    pub kaslr_flags: u32,
 }
+
+// ── KASLR flags (protocol version 14) ────────────────────────────────────────
+
+/// `kaslr_flags` bit 0: the kernel image base carries a nonzero random slide.
+pub const KASLR_IMAGE_RANDOMIZED: u32 = 1 << 0;
+
+/// `kaslr_flags` bit 1: the direct-map base was randomly drawn (it may
+/// still equal the mode floor by chance only when the window is one slot;
+/// see [`KASLR_DM_WINDOW_LIMITED`]).
+pub const KASLR_DM_RANDOMIZED: u32 = 1 << 1;
+
+/// `kaslr_flags` bit 2: the KASLR draws came from UEFI `EFI_RNG_PROTOCOL`.
+pub const KASLR_ENTROPY_FW_RNG: u32 = 1 << 2;
+
+/// `kaslr_flags` bit 3: the KASLR draws came from the DTB
+/// `/chosen/rng-seed` property.
+pub const KASLR_ENTROPY_DTB_SEED: u32 = 1 << 3;
+
+/// `kaslr_flags` bit 4: randomization disabled by the `\EFI\seraph\nokaslr`
+/// override knob (debug aid); the layout is the deterministic default.
+pub const KASLR_DISABLED_BY_KNOB: u32 = 1 << 4;
+
+/// `kaslr_flags` bit 5: the direct-map window had fewer than two 1 GiB
+/// slots (huge RAM under a narrow paging mode); the base fell back to the
+/// mode floor.
+pub const KASLR_DM_WINDOW_LIMITED: u32 = 1 << 5;
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 

@@ -339,27 +339,13 @@ impl PoolState
 /// Returns 0 if the map contains no RAM entries.
 pub fn compute_max_physical_address(info: &BootInfo) -> u64
 {
-    use boot_protocol::MemoryType;
-
     // SAFETY: Phase 0 validated that memory_map.entries is non-null and
-    // count > 0; the region is identity-mapped by the bootloader.
+    // count > 0; the region is identity-mapped by the bootloader (pre-Phase
+    // 3) or covered by the direct map (from Phase 3 on).
     let entries = unsafe {
         core::slice::from_raw_parts(info.memory_map.entries, info.memory_map.count as usize)
     };
-    entries
-        .iter()
-        .filter(|e| {
-            matches!(
-                e.memory_type,
-                MemoryType::Usable
-                    | MemoryType::Loaded
-                    | MemoryType::AcpiReclaimable
-                    | MemoryType::Persistent
-            )
-        })
-        .map(|e| e.physical_base + e.size)
-        .max()
-        .unwrap_or(0)
+    boot_protocol::max_ram_address(entries)
 }
 
 // ── Page table initialization ─────────────────────────────────────────────────
@@ -437,13 +423,27 @@ pub fn init_kernel_page_tables(
     let max_phys_rounded = (max_phys + LARGE_PAGE_SIZE - 1) & !(LARGE_PAGE_SIZE - 1);
 
     let dm_base = direct_map_base();
-    // The direct map must end below the kernel image's top-2-GiB window. The
-    // gap is mode-dependent — under Sv39 the kernel half is 256 GiB total,
-    // capping direct-mappable RAM at 254 GiB — so fail with a diagnostic
-    // rather than silently overlapping the image mapping.
-    if max_phys_rounded > info.kernel_virtual_base - dm_base
+    // Everything this function maps at `dm_base + phys` — RAM, a high
+    // framebuffer, the kernel MMIO windows — must end at or below the
+    // kernel image base. The shared ceiling keeps this guard on the same
+    // arithmetic the bootloader's KASLR window selection and the Phase-0
+    // validator use; the margin is mode-dependent — under Sv39 the kernel
+    // half is 256 GiB total — so fail with a diagnostic rather than
+    // silently overlapping the image mapping.
     {
-        crate::fatal("Phase 3: RAM exceeds the active paging mode's direct-map capacity");
+        // SAFETY: Phase 0 validated the memory map; identity-mapped at this
+        // point (pre-activate).
+        let entries = unsafe {
+            core::slice::from_raw_parts(info.memory_map.entries, info.memory_map.count as usize)
+        };
+        let ceiling =
+            boot_protocol::direct_map_ceiling(entries, &info.framebuffer, &info.kernel_mmio);
+        if dm_base
+            .checked_add(ceiling)
+            .is_none_or(|end| end > info.kernel_virtual_base)
+        {
+            crate::fatal("Phase 3: direct map would overlap the kernel image window");
+        }
     }
 
     // ── Direct physical map ───────────────────────────────────────────────────

@@ -46,21 +46,27 @@ use crate::mm::paging::{PageFlags, PagingError, PoolState};
 /// behaviour without an init call.
 static PAGING_MODE: AtomicU8 = AtomicU8::new(PagingMode::Sv48 as u8);
 
-/// The active mode's kernel-half base, resolved once at [`init_paging_mode`]
-/// so the hot `phys_to_virt` path is a single relaxed load plus add.
+/// Virtual base of the direct physical map, published once by
+/// [`init_paging_mode`] from the bootloader's (possibly KASLR-randomized)
+/// `BootInfo.direct_map_base` so the hot `phys_to_virt` path is a single
+/// relaxed load plus add. The default is the Sv48 kernel-half base, keeping
+/// host unit tests deterministic without an init call.
 static DIRECT_MAP_BASE_VAL: AtomicU64 = AtomicU64::new(0xFFFF_8000_0000_0000);
 
-/// The active mode's exclusive user-half top, resolved with the base above.
+/// The active mode's exclusive user-half top, resolved at [`init_paging_mode`].
 static USER_VA_TOP_VAL: AtomicU64 = AtomicU64::new(0x0000_8000_0000_0000);
 
-/// Publish the active paging mode from the `satp` CSR.
+/// Publish the active paging mode and the direct-map base at kernel entry.
 ///
 /// The bootloader hands the kernel a running translation regime; `satp.MODE`
-/// is therefore the authoritative record of the negotiated mode and needs no
-/// boot-protocol field. Halts the hart on an unrecognizable MODE — this runs
-/// pre-console, matching the silent-halt policy of `BootInfo` validation.
+/// is therefore the authoritative record of the negotiated mode. The
+/// direct-map base comes from `BootInfo`: the mode's kernel-half base, or a
+/// randomized base above it (KASLR). Halts the hart on an unrecognizable
+/// MODE, a base below the mode's kernel half, or a misaligned base — this
+/// runs pre-console, matching the silent-halt policy of `BootInfo`
+/// validation.
 #[cfg(not(test))]
-pub fn init_paging_mode()
+pub fn init_paging_mode(info: &boot_protocol::BootInfo)
 {
     let satp: u64;
     // SAFETY: reads the satp CSR only; always valid in S-mode.
@@ -72,14 +78,19 @@ pub fn init_paging_mode()
     {
         super::cpu::halt_loop();
     };
+    let base = info.direct_map_base;
+    if base < mode.kernel_va_base() || !base.is_multiple_of(1 << 30)
+    {
+        super::cpu::halt_loop();
+    }
     PAGING_MODE.store(mode as u8, Ordering::Relaxed);
-    DIRECT_MAP_BASE_VAL.store(mode.kernel_va_base(), Ordering::Relaxed);
+    DIRECT_MAP_BASE_VAL.store(base, Ordering::Relaxed);
     USER_VA_TOP_VAL.store(mode.user_va_top(), Ordering::Relaxed);
 }
 
 /// Test-build stub: host unit tests run with the [`PAGING_MODE`] default.
 #[cfg(test)]
-pub fn init_paging_mode() {}
+pub fn init_paging_mode(_info: &boot_protocol::BootInfo) {}
 
 /// The active paging mode published at kernel entry.
 pub fn paging_mode() -> PagingMode
@@ -99,8 +110,8 @@ pub(super) fn make_kernel_satp(root_pa: u64) -> u64
     paging_mode().make_satp(root_pa, 0)
 }
 
-/// Base virtual address of the direct physical map: the active mode's
-/// kernel-half base (root entry 256 in every mode).
+/// Base virtual address of the direct physical map: at or above the active
+/// mode's kernel-half base, as published from `BootInfo` (KASLR).
 #[inline]
 pub fn direct_map_base() -> u64
 {

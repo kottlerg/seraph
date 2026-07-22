@@ -48,8 +48,6 @@
 
 use boot_protocol::{IoApicEntry, MAX_IOAPICS};
 
-use super::paging::DIRECT_MAP_BASE;
-
 // ── Hardware constants ────────────────────────────────────────────────────────
 
 /// Register select offset (write GSI index here).
@@ -127,7 +125,7 @@ fn lookup_ioapic_for_gsi(gsi: u32) -> Option<(u64, u32)>
 /// physical base.
 unsafe fn ioapic_write(phys_base: u64, reg: u32, val: u32)
 {
-    let base = (DIRECT_MAP_BASE + phys_base) as usize;
+    let base = (super::paging::direct_map_base() + phys_base) as usize;
     // SAFETY: phys_base is a valid IOAPIC MMIO base mapped through the direct
     // map; IOREGSEL/IOWIN offsets are within IOAPIC register range; volatile
     // ensures proper ordering of register select and data writes.
@@ -143,7 +141,7 @@ unsafe fn ioapic_write(phys_base: u64, reg: u32, val: u32)
 /// Same as [`ioapic_write`].
 unsafe fn ioapic_read(phys_base: u64, reg: u32) -> u32
 {
-    let base = (DIRECT_MAP_BASE + phys_base) as usize;
+    let base = (super::paging::direct_map_base() + phys_base) as usize;
     // SAFETY: see ioapic_write.
     unsafe {
         core::ptr::write_volatile((base + IOREGSEL) as *mut u32, reg);

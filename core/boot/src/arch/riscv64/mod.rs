@@ -77,6 +77,13 @@ pub fn uart_mmio_region() -> u64
     serial::uart_base() as u64
 }
 
+/// Deterministic direct-map base: the negotiated paging mode's kernel-half
+/// base. Valid only after [`negotiate_paging`] has run.
+pub fn default_direct_map_base() -> u64
+{
+    paging::negotiated_mode().kernel_va_base()
+}
+
 /// Populate `km` from firmware tables for RISC-V.
 ///
 /// ACPI is consulted first; DTB then fills any field ACPI left zero.

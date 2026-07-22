@@ -255,20 +255,45 @@ fn walk_or_alloc(entry: &mut PageTableEntry, pool: &mut PoolState) -> Result<u64
 // test builds (they compile fine on x86-64 hosts but must never be called
 // from user-space tests; the cfg gate prevents accidental invocation).
 
-/// Publish the active paging mode at kernel entry: no-op — x86-64 runs
-/// unconditionally under 4-level paging, so there is no mode to record.
-/// Cross-arch hook for RISC-V, where the bootloader negotiates Sv39/Sv48/Sv57.
-pub fn init_paging_mode() {}
+/// Kernel-half floor: PML4 entry 256, the direct map's lowest legal base
+/// and its deterministic default when the bootloader does not randomize.
+const KERNEL_HALF_BASE: u64 = 0xFFFF_8000_0000_0000;
 
-/// Base virtual address of the direct physical map (PML4 entry 256).
-/// Constant on x86-64; the cross-arch accessor is [`direct_map_base`].
-pub const DIRECT_MAP_BASE: u64 = 0xFFFF_8000_0000_0000;
+/// Virtual base of the direct physical map, published once by
+/// [`init_paging_mode`] from the bootloader's (possibly KASLR-randomized)
+/// `BootInfo.direct_map_base` before any consumer runs and before APs
+/// start (INIT/SIPI provides the happens-before for secondary CPUs). The
+/// default keeps host unit tests on the deterministic base without an
+/// init call.
+static DIRECT_MAP_BASE_VAL: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(KERNEL_HALF_BASE);
+
+/// Publish the direct-map base at kernel entry.
+///
+/// x86-64 has a single paging mode, so unlike riscv64 there is no mode to
+/// record — only the KASLR-chosen base to validate and publish. Halts on a
+/// base below the kernel half or not 1 GiB-aligned; this runs pre-console,
+/// matching the silent-halt policy of `BootInfo` validation.
+#[cfg(not(test))]
+pub fn init_paging_mode(info: &boot_protocol::BootInfo)
+{
+    let base = info.direct_map_base;
+    if base < KERNEL_HALF_BASE || !base.is_multiple_of(1 << 30)
+    {
+        super::cpu::halt_loop();
+    }
+    DIRECT_MAP_BASE_VAL.store(base, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Test-build stub: host unit tests run with the deterministic default base.
+#[cfg(test)]
+pub fn init_paging_mode(_info: &boot_protocol::BootInfo) {}
 
 /// Base virtual address of the direct physical map.
 #[inline]
-pub const fn direct_map_base() -> u64
+pub fn direct_map_base() -> u64
 {
-    DIRECT_MAP_BASE
+    DIRECT_MAP_BASE_VAL.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 /// Exclusive upper bound of user-half virtual addresses (48-bit VAs,
@@ -1402,7 +1427,7 @@ pub unsafe fn flush_tlb_all()
 #[cfg(test)]
 mod tests
 {
-    use super::DIRECT_MAP_BASE;
+    use super::KERNEL_HALF_BASE;
     use super::*;
 
     // ── PTE construction ──────────────────────────────────────────────────────
@@ -1512,14 +1537,14 @@ mod tests
     #[test]
     fn direct_map_base_pml4_index_is_256()
     {
-        assert_eq!(pml4_index(DIRECT_MAP_BASE), 256);
+        assert_eq!(pml4_index(KERNEL_HALF_BASE), 256);
     }
 
     #[test]
     fn direct_map_base_pdpt_and_pd_index_are_zero()
     {
-        assert_eq!(pdpt_index(DIRECT_MAP_BASE), 0);
-        assert_eq!(pd_index(DIRECT_MAP_BASE), 0);
+        assert_eq!(pdpt_index(KERNEL_HALF_BASE), 0);
+        assert_eq!(pd_index(KERNEL_HALF_BASE), 0);
     }
 
     #[test]

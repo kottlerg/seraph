@@ -4337,6 +4337,14 @@ pub unsafe fn timer_tick()
         }
     }
 
+    // VMGENID observability poll (BSP only): two loads and a 16-byte compare
+    // per tick; logs once per generation change. The snapshot-reseed
+    // guarantee lives on the draw path, not here.
+    if cpu == 0
+    {
+        crate::entropy::vmgenid::poll_log();
+    }
+
     // SAFETY: cpu < cpu_count; scheduler slab initialised by init().
     let sched = unsafe { &mut *scheduler_ptr(cpu) };
 

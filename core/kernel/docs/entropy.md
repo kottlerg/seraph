@@ -27,9 +27,11 @@ length is capped (`MAX_GETRANDOM_LEN`) so a draw never holds interrupts off for
 an unbounded window. Because userspace keeps no RNG state, two processes (or a
 forked/cloned address space) cannot share or duplicate a seed: each diverges
 from its first draw by independently advancing the generator. Whole-VM-snapshot
-reuse — a resumed snapshot replaying pool state — is a pool-level concern that
-applies equally to kernel consumers and is tracked as a separate hardening
-follow-up.
+reuse — a resumed snapshot replaying pool and per-CPU generator state, so two
+clones would emit identical streams — is a pool-level concern that applies
+equally to kernel consumers; it is handled by VMGENID generation-change
+detection on x86-64 and bounded by the reseed time budget on riscv64 (see
+"Whole-VM-snapshot detection").
 
 The subsystem must yield values an attacker cannot predict or reconstruct even
 after a later full-state compromise (forward secrecy), and must remain
@@ -66,6 +68,12 @@ Three source classes are mixed into the pool:
   x86-64; the `time` CSR on riscv64) taken at distinct interrupt event classes.
   This is the always-available source.
 
+Where a VMGENID device is present (x86-64 under QEMU), the initial 16-byte
+generation GUID is additionally absorbed at Phase 5 — with `guid=auto` a free
+128-bit host-random boot contribution — and each generation *change* is
+absorbed before any post-resume output (below). The GUID is a detection
+channel first and a source second; it is never counted on as secret.
+
 With neither a firmware seed nor a hardware RNG the subsystem degrades
 gracefully to **jitter only**. The pool and per-CPU generators are otherwise
 identical; only the seed material differs.
@@ -100,6 +108,12 @@ answer; the permutation against the FIPS-202 zero-state vector (see Testing).
 - The raw pool is never exposed. Callers either `absorb` into it or `draw_seed`
   from it; consumer-facing output comes only from the per-CPU generators.
 - A `SEEDED` flag gates draws: `draw_seed` is valid only after `mark_seeded`.
+- Both operations exist in blocking and non-spinning forms (`try_absorb`,
+  `try_draw_seed`, built on `Spinlock::try_lock_raw`). Mandatory reseeds use
+  the blocking forms (short, bounded critical sections); the frequent
+  interval/budget reseeds use the try-forms and defer one draw on contention,
+  so a tight-loop `getrandom` caller cannot amplify cross-CPU interrupts-off
+  tail latency on the pool leaf lock.
 
 Pool storage is a buddy-allocated slab published through an `AtomicPtr`
 (`install`); `absorb` is a no-op before installation, so early callers are safe.
@@ -110,18 +124,72 @@ Pool storage is a buddy-allocated slab published through an `AtomicPtr`
 per-CPU slab. Each instance is touched only by its owning CPU under
 interrupt-disabled exclusivity, so it carries **no lock**.
 
-Reseed policy:
+The reseed policy is a pure, host-tested decision function
+(`entropy::reseed_policy::decide`), evaluated on every fill:
 
-- A generator reseeds **on first use** and then **every `RESEED_DRAW_INTERVAL`
-  (256) draws**.
+| Trigger | Action |
+|---|---|
+| Never seeded (first use, or marked stale) | **Mandatory** — blocking reseed before any output |
+| VMGENID GUID differs from the one last reseeded under | **Mandatory** |
+| Time budget ≥ 2× overdue (`RESEED_TIME_BUDGET_US` × `RESEED_OVERDUE_FACTOR`) | **Mandatory** |
+| `RESEED_DRAW_INTERVAL` (256) draws since last reseed | **Opportunistic** — try-lock reseed; defer one draw on contention |
+| Time budget (`RESEED_TIME_BUDGET_US`, 1 s) elapsed | **Opportunistic** |
+| Otherwise | Draw from current state |
+
 - Each reseed folds that CPU's accumulated jitter into the pool
-  (`jitter::contribute_to_pool`), draws `RESEED_BYTES` (32 — a 256-bit reseed)
-  of fresh seed material, and absorbs it; the seed buffer is then zeroed.
-- The interval bounds how much output depends on any single seed without making
-  the reseed cost (a pool lock plus permutations) a per-draw expense.
+  (`jitter::collect` — the staging words, the sample count, and the
+  instantaneous cycle counter, so every contribution carries fresh timing),
+  draws `RESEED_BYTES` (32 — a 256-bit reseed) of fresh seed material, and
+  absorbs it; the seed buffer is then zeroed. A mandatory reseed triggered by
+  a GUID change additionally absorbs the new GUID into the pool first.
+- The draw interval bounds how much output depends on any single seed without
+  making the reseed cost (a pool lock plus permutations) a per-draw expense;
+  the time budget bounds it in wall-clock terms and is the riscv64
+  snapshot-resume bound (below). The 2× escalation keeps the budget a hard
+  bound even under sustained pool-lock contention.
+- The uncalibrated-timer case (`elapsed_us` not yet available) disables only
+  the time-budget triggers; first-use and draw-interval policy still apply.
 
 Forward secrecy *across* draws is provided by the sponge's per-fill erasure;
 reseeding additionally bounds the blast radius of any single seed.
+
+## Whole-VM-snapshot detection (VMGENID)
+
+A resumed VM snapshot replays the entire kernel state — pool and per-CPU
+generators included — so two clones resumed from one snapshot would emit
+identical streams until something distinguishes them. The VM Generation ID is
+the hypervisor's detection channel: a 16-byte GUID in guest RAM, rewritten
+(with the vCPUs paused, before any of them runs again) whenever the VM's
+execution history forks.
+
+- **Discovery** is bootloader-side and QEMU-specific: the VMGENID SSDT's
+  `VGIA` named DWORD holds the linker-patched `etc/vmgenid_guid` blob base;
+  the GUID sits 40 bytes in. There is no AML interpreter anywhere in the tree,
+  so the generic (AML `ADDR`-evaluating) discovery path is out of scope. The
+  address reaches the kernel as `BootInfo.vmgenid_paddr` (boot protocol v13;
+  zero = absent).
+- **Detection** is per-draw and per-CPU (`entropy::vmgenid`): each generator
+  records the GUID it last reseeded under, and every fill volatile-reads the
+  live GUID through the direct map and compares. Because the hypervisor
+  rewrites the GUID before any vCPU resumes, every post-resume draw on every
+  CPU sees the change *before producing output* and performs a mandatory
+  reseed that absorbs the new GUID — so clone streams diverge, even under
+  identical post-resume jitter. The one exception is a draw snapshotted
+  mid-fill, after its GUID compare: that single in-flight draw completes
+  from replayed state and can repeat across clones; the next draw on that
+  CPU re-reads the GUID and reseeds. There is no cross-CPU detection state:
+  the GUID in guest RAM is the shared authority.
+- **Observability**: the BSP timer tick polls the same GUID and prints
+  `entropy: VM generation change detected` once per change. The reseed
+  guarantee never depends on this poll.
+- **riscv64 residual**: QEMU's riscv64 `virt` machine has no VMGENID, so
+  detection stays disarmed there and the reseed **time budget** is the bound:
+  a resumed clone can emit from replayed generator state for at most
+  `RESEED_TIME_BUDGET_US` (opportunistic) to 2× that (hard) of guest time per
+  CPU, and post-window divergence relies on accrued timing jitter differing
+  across clones — two clones resumed simultaneously may collide within that
+  window. No firmware detection channel exists on riscv64 QEMU/EDK2 today;
+  this residual is accepted and bounded, not hidden.
 
 ## Boot-time entropy
 
@@ -144,6 +212,14 @@ timer-tick jitter hook, which feeds a fresh sample into each CPU's accumulator
 on every tick (and per device IRQ). Closing the riscv64 boot hole therefore
 needs the firmware/boot environment to provide a seed (RNG protocol or DT
 `rng-seed`); that firmware provisioning is tracked separately.
+
+The first *consumer* draw is decoupled from the boot scrape: the Phase 5/8
+self-test capture is each generator's first draw and necessarily seeds from
+the boot-time pool (scrape-dominated on riscv64), so the capture is followed
+by marking the generator stale (`CpuRng::mark_stale`). The first real
+consumer draw — Phase 9 ASLR on the BSP, typically seconds later — then
+performs a mandatory reseed carrying the tick/IRQ jitter accrued in between,
+rather than riding the 64-sample scrape.
 
 The riscv64 *runtime* hardware-RNG path — a virtio-rng/hwrng device owned by a
 userspace driver, the mechanism the RISC-V design intends for lower privilege
@@ -203,14 +279,18 @@ source lands. The boot self-test is the API's continuous validator.
   per-CPU jitter accumulators, and the self-test sample slab from the buddy
   allocator — alongside the scheduler slabs and for the same reason: before the
   user-capability drain, while the buddy still holds large contiguous blocks.
-- **Phase 5** (`init`, BSP): seed the pool from all sources, mark it seeded
-  (opening the draw API), and capture the BSP's self-test sample.
-- **Phase 8** (`init_ap`, each AP): capture that AP's self-test sample; the AP's
-  generator seeds lazily from the already-seeded pool on its first draw.
+- **Phase 5** (`init`, BSP): seed the pool from all sources, arm VMGENID
+  detection (`vmgenid::init`, absorbing the initial GUID) before the pool is
+  marked seeded — so no draw ever precedes snapshot detection — capture the
+  BSP's self-test sample, and mark its generator stale.
+- **Phase 8** (`init_ap`, each AP): capture that AP's self-test sample (the
+  AP's generator seeds lazily from the already-seeded pool on that first
+  draw), then mark it stale.
 - **Post-SMP** (`selftest::run`, BSP): run the power-on self-test across all
   CPUs.
 - **Runtime**: the scheduler timer tick and device-IRQ dispatch feed jitter
-  samples into the per-CPU accumulators.
+  samples into the per-CPU accumulators; the BSP tick additionally runs the
+  VMGENID observability poll.
 
 ## Testing
 
@@ -218,9 +298,11 @@ source lands. The boot self-test is the API's continuous validator.
   Keccak-f[1600] zero-state vector; the NIST `SHAKE256("")` FIPS-202 vector and
   a multi-block squeeze; sponge determinism, seed-sensitivity, fill advancement,
   and forward-secrecy erasure; health-test cutoffs and stuck/biased-source
-  trips. The permutation and sponge are pure and host-testable; the pool,
-  per-CPU generators, jitter, and draw API are hardware-coupled and built only
-  for the kernel target.
+  trips; the full reseed-policy decision matrix (boundaries included); and the
+  bootloader's VGIA scanner. The permutation, sponge, and reseed policy are
+  pure and host-testable; the pool, per-CPU generators, jitter, VMGENID
+  consumer, and draw API are hardware-coupled and built only for the kernel
+  target.
 - **In-kernel power-on self-test**: each CPU captures a sample from its own
   generator as it comes online; after SMP bringup the BSP asserts every sample
   is non-trivial, samples are pairwise distinct (per-CPU independence), and the
@@ -230,6 +312,16 @@ source lands. The boot self-test is the API's continuous validator.
   x86_64 (firmware-seeded — `entropy: seeded from firmware RNG` — since OVMF
   implements `EFI_RNG_PROTOCOL`) and riscv64 (jitter-only — its current EDK2
   exposes no RNG protocol).
+- **Guest reseed coverage**: ktest's
+  `entropy::getrandom_reseed_interval_stream` streams 300 draws across the
+  256-draw interval on both architectures; svctest's `random-contention`
+  phase drives four concurrent draw threads through repeated interval
+  reseeds, exercising the non-spinning defer path under SMP.
+- **Snapshot-resume test** (`cargo xtask test-vmgenid`, x86_64): boots with a
+  fixed generation GUID, saves the guest via QMP migrate-to-file, restores it
+  under a different GUID with `-incoming`, and asserts the kernel's
+  `entropy: VM generation change detected` line plus a post-resume
+  interactive liveness round. See `docs/testing.md`.
 
 ---
 

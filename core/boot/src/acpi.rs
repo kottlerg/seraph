@@ -47,6 +47,8 @@ pub(crate) const RSDP_OFF_XSDT: usize = 24;
 pub(crate) const SDT_HDR_LEN: usize = 36;
 pub(crate) const SDT_OFF_SIGNATURE: usize = 0;
 pub(crate) const SDT_OFF_LENGTH: usize = 4;
+const SDT_OFF_OEM_TABLE_ID: usize = 16;
+const SDT_OEM_TABLE_ID_LEN: usize = 8;
 
 // MADT entries start at offset 44 (after the SDT header + 4-byte
 // `LocalApicAddress` + 4-byte flags).
@@ -126,16 +128,14 @@ pub(crate) unsafe fn phys_slice<'a>(phys: u64, len: usize) -> &'a [u8]
     unsafe { core::slice::from_raw_parts(phys as *const u8, len) }
 }
 
-/// Walk RSDP → XSDT and return the first table whose SDT signature is `sig`,
-/// as a length-validated byte slice covering the whole table.
-///
-/// Returns `None` when the RSDP/XSDT is absent or malformed, or no table
-/// matches.
+/// Walk RSDP → XSDT and return the XSDT entry array (the 8-byte table
+/// pointers after the XSDT's own SDT header), or `None` when the RSDP/XSDT
+/// is absent or malformed.
 ///
 /// # Safety
 /// `rsdp_addr` must be zero or the physical address of a valid,
 /// identity-mapped ACPI RSDP whose referenced tables are identity-mapped.
-pub(crate) unsafe fn find_acpi_table<'a>(rsdp_addr: u64, sig: [u8; 4]) -> Option<&'a [u8]>
+unsafe fn xsdt_entries<'a>(rsdp_addr: u64) -> Option<&'a [u8]>
 {
     if rsdp_addr == 0
     {
@@ -166,31 +166,149 @@ pub(crate) unsafe fn find_acpi_table<'a>(rsdp_addr: u64, sig: [u8; 4]) -> Option
     }
     // SAFETY: length validated above; firmware guarantees mapping.
     let xsdt = unsafe { phys_slice(xsdt_addr, xsdt_len) };
-    let entries_bytes = &xsdt[SDT_HDR_LEN..];
+    Some(&xsdt[SDT_HDR_LEN..])
+}
 
+/// Return the length-validated table at XSDT entry index `i` if its SDT
+/// signature is `sig`.
+///
+/// # Safety
+/// `entries_bytes` must come from [`xsdt_entries`]; every referenced table
+/// must be identity-mapped.
+unsafe fn table_at<'a>(entries_bytes: &[u8], i: usize, sig: [u8; 4]) -> Option<&'a [u8]>
+{
+    let table_addr = read_u64(entries_bytes, i * 8);
+    if table_addr == 0
+    {
+        return None;
+    }
+    // SAFETY: table_addr read from validated XSDT; firmware guarantees mapping.
+    let hdr = unsafe { phys_slice(table_addr, SDT_HDR_LEN) };
+    if hdr[SDT_OFF_SIGNATURE..SDT_OFF_SIGNATURE + 4] != sig
+    {
+        return None;
+    }
+    let table_len = read_u32(hdr, SDT_OFF_LENGTH) as usize;
+    if table_len < SDT_HDR_LEN
+    {
+        return None;
+    }
+    // SAFETY: length validated above; firmware guarantees mapping.
+    Some(unsafe { phys_slice(table_addr, table_len) })
+}
+
+/// Walk RSDP → XSDT and return the first table whose SDT signature is `sig`,
+/// as a length-validated byte slice covering the whole table.
+///
+/// Returns `None` when the RSDP/XSDT is absent or malformed, or no table
+/// matches.
+///
+/// # Safety
+/// `rsdp_addr` must be zero or the physical address of a valid,
+/// identity-mapped ACPI RSDP whose referenced tables are identity-mapped.
+pub(crate) unsafe fn find_acpi_table<'a>(rsdp_addr: u64, sig: [u8; 4]) -> Option<&'a [u8]>
+{
+    // SAFETY: forwarded caller contract.
+    let entries_bytes = unsafe { xsdt_entries(rsdp_addr)? };
     for i in 0..(entries_bytes.len() / 8)
     {
-        let table_addr = read_u64(entries_bytes, i * 8);
-        if table_addr == 0
+        // SAFETY: entries from xsdt_entries; forwarded caller contract.
+        if let Some(table) = unsafe { table_at(entries_bytes, i, sig) }
         {
-            continue;
+            return Some(table);
         }
-        // SAFETY: table_addr read from validated XSDT; firmware guarantees mapping.
-        let hdr = unsafe { phys_slice(table_addr, SDT_HDR_LEN) };
-        if hdr[SDT_OFF_SIGNATURE..SDT_OFF_SIGNATURE + 4] != sig
-        {
-            continue;
-        }
-        let table_len = read_u32(hdr, SDT_OFF_LENGTH) as usize;
-        if table_len < SDT_HDR_LEN
-        {
-            continue;
-        }
-        // SAFETY: length validated above; firmware guarantees mapping.
-        return Some(unsafe { phys_slice(table_addr, table_len) });
     }
-
     None
+}
+
+// ── VMGENID (VM Generation ID, QEMU SSDT) ────────────────────────────────────
+//
+// QEMU publishes the VM Generation ID as an ACPI device in an SSDT whose AML
+// contains a named DWORD `VGIA`, patched by the firmware's bios-linker-loader
+// with the guest address of the `etc/vmgenid_guid` fw_cfg blob (4 KiB-aligned,
+// below 4 GiB). The 16-byte GUID lives at offset 40 into that blob; the AML
+// `ADDR` method adds the offset at evaluation time, so a no-AML consumer must
+// add it itself. Discovery here is QEMU-specific by design: the
+// Microsoft-spec generic path requires evaluating `ADDR`, and the bootloader
+// has no AML interpreter (see the `_CRS` note in `parse_aperture_seed`).
+
+/// AML byte pattern for QEMU's VGIA named object: `NameOp`, bare `NameSeg`
+/// `"VGIA"`, `DWordPrefix`. The patched u32 (little-endian) follows.
+const VGIA_PATTERN: [u8; 6] = [0x08, b'V', b'G', b'I', b'A', 0x0C];
+
+/// Offset of the GUID within the `etc/vmgenid_guid` blob (QEMU
+/// `VMGENID_GUID_OFFSET`).
+const VMGENID_GUID_OFFSET: u64 = 40;
+
+/// Scan an SSDT for the `VGIA` named DWORD and return the patched blob base.
+///
+/// Returns `None` when the pattern is absent, the trailing u32 is truncated,
+/// or the value is implausible (zero, or not 4 KiB-aligned — the
+/// linker-loader allocates the blob page-aligned).
+fn find_vgia(table: &[u8]) -> Option<u32>
+{
+    let body = table.get(SDT_HDR_LEN..)?;
+    let pos = body
+        .windows(VGIA_PATTERN.len())
+        .position(|w| w == VGIA_PATTERN)?;
+    let val_off = pos + VGIA_PATTERN.len();
+    if val_off + 4 > body.len()
+    {
+        return None;
+    }
+    let base = read_u32(body, val_off);
+    if base == 0 || !base.is_multiple_of(4096)
+    {
+        return None;
+    }
+    Some(base)
+}
+
+/// Walk RSDP → XSDT over every SSDT and return the physical address of the
+/// 16-byte VMGENID GUID (blob base + [`VMGENID_GUID_OFFSET`]), or `0` when
+/// absent.
+///
+/// SSDTs whose OEM table ID starts with `VMGENID` (QEMU's marker) are
+/// preferred; any other SSDT carrying the `VGIA` pattern is accepted as a
+/// fallback.
+///
+/// # Safety
+/// Same contract as [`find_acpi_table`].
+pub(crate) unsafe fn parse_vmgenid_paddr(rsdp_addr: u64) -> u64
+{
+    // SAFETY: forwarded caller contract.
+    let Some(entries_bytes) = (unsafe { xsdt_entries(rsdp_addr) })
+    else
+    {
+        return 0;
+    };
+
+    let mut fallback: u64 = 0;
+    for i in 0..(entries_bytes.len() / 8)
+    {
+        // SAFETY: entries from xsdt_entries; forwarded caller contract.
+        let Some(table) = (unsafe { table_at(entries_bytes, i, *b"SSDT") })
+        else
+        {
+            continue;
+        };
+        let Some(base) = find_vgia(table)
+        else
+        {
+            continue;
+        };
+        let guid_paddr = u64::from(base) + VMGENID_GUID_OFFSET;
+        let oem_id = &table[SDT_OFF_OEM_TABLE_ID..SDT_OFF_OEM_TABLE_ID + SDT_OEM_TABLE_ID_LEN];
+        if oem_id.starts_with(b"VMGENID")
+        {
+            return guid_paddr;
+        }
+        if fallback == 0
+        {
+            fallback = guid_paddr;
+        }
+    }
+    fallback
 }
 
 // ── RHCT (RISC-V Hart Capabilities Table, ACPI 6.5+) ─────────────────────────
@@ -845,5 +963,69 @@ mod tests
         let (freq, caps) = parse_rhct(&table);
         assert_eq!(freq, 10_000_000);
         assert_eq!(caps, 0);
+    }
+
+    /// Build a synthetic SSDT: SDT header + the given AML body bytes.
+    fn ssdt(body: &[u8]) -> Vec<u8>
+    {
+        let mut t = vec![0u8; SDT_HDR_LEN];
+        t[SDT_OFF_SIGNATURE..SDT_OFF_SIGNATURE + 4].copy_from_slice(b"SSDT");
+        t.extend_from_slice(body);
+        let len = t.len() as u32;
+        t[SDT_OFF_LENGTH..SDT_OFF_LENGTH + 4].copy_from_slice(&len.to_le_bytes());
+        t
+    }
+
+    /// `Name(VGIA, DWordConst)` AML fragment with the given patched value.
+    fn vgia_fragment(value: u32) -> Vec<u8>
+    {
+        let mut f = VGIA_PATTERN.to_vec();
+        f.extend_from_slice(&value.to_le_bytes());
+        f
+    }
+
+    #[test]
+    fn vgia_found_amid_surrounding_aml()
+    {
+        let mut body = vec![0x10, 0x2A, 0x5C, 0x00]; // arbitrary leading AML bytes
+        body.extend_from_slice(&vgia_fragment(0x7FDE_1000));
+        body.extend_from_slice(&[0xA4, 0x00]); // trailing bytes
+        assert_eq!(find_vgia(&ssdt(&body)), Some(0x7FDE_1000));
+    }
+
+    #[test]
+    fn vgia_absent_pattern_yields_none()
+    {
+        assert_eq!(find_vgia(&ssdt(&[0x10, 0x2A, 0x5C, 0x00])), None);
+    }
+
+    #[test]
+    fn vgia_truncated_after_prefix_yields_none()
+    {
+        let mut body = VGIA_PATTERN.to_vec();
+        body.extend_from_slice(&[0x00, 0x10]); // only 2 of 4 value bytes
+        assert_eq!(find_vgia(&ssdt(&body)), None);
+    }
+
+    #[test]
+    fn vgia_zero_value_yields_none()
+    {
+        assert_eq!(find_vgia(&ssdt(&vgia_fragment(0))), None);
+    }
+
+    #[test]
+    fn vgia_unaligned_value_yields_none()
+    {
+        assert_eq!(find_vgia(&ssdt(&vgia_fragment(0x7FDE_1004))), None);
+    }
+
+    #[test]
+    fn vgia_pattern_in_header_is_ignored()
+    {
+        // The scan starts after the SDT header; a coincidental pattern in the
+        // OEM table ID bytes must not match.
+        let mut t = ssdt(&[0x00; 16]);
+        t[SDT_OFF_OEM_TABLE_ID..SDT_OFF_OEM_TABLE_ID + 6].copy_from_slice(&VGIA_PATTERN);
+        assert_eq!(find_vgia(&t), None);
     }
 }

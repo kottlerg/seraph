@@ -68,6 +68,13 @@ pub enum CliCommand
     /// populated sysroot with `terminal.svc` staged (the default boot set
     /// already includes it) and `disk.img` repacked — see xtask/README.md.
     TestTerminal(TestTerminalArgs),
+
+    /// Boot the VMGENID snapshot-resume test (`x86_64` only): boot with a fixed
+    /// generation GUID, save the guest via QMP migrate-to-file, restore it
+    /// under a different GUID with `-incoming`, and assert the kernel's
+    /// generation-change detection plus post-resume liveness. Requires the
+    /// same populated sysroot as `test-terminal`.
+    TestVmgenid(TestVmgenidArgs),
 }
 
 // ── Build ─────────────────────────────────────────────────────────────────────
@@ -221,6 +228,20 @@ pub struct TestTerminalArgs
     #[arg(long, default_value = "x86_64")]
     pub arch: Arch,
 
+    /// Number of vCPUs to expose to the guest (QEMU -smp).
+    #[arg(long, default_value = "4")]
+    pub cpus: u32,
+
+    /// Guest memory size in MiB (QEMU -m).
+    #[arg(long, default_value = "512")]
+    pub mem: u32,
+}
+
+// ── TestVmgenid ───────────────────────────────────────────────────────────────
+
+#[derive(Parser)]
+pub struct TestVmgenidArgs
+{
     /// Number of vCPUs to expose to the guest (QEMU -smp).
     #[arg(long, default_value = "4")]
     pub cpus: u32,

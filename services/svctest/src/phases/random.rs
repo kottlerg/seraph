@@ -39,6 +39,10 @@ pub fn phases() -> &'static [Phase]
             run: random_phase,
         },
         Phase {
+            name: "random-contention",
+            run: random_contention_phase,
+        },
+        Phase {
             name: "aslr-layout",
             run: aslr_layout_phase,
         },
@@ -147,6 +151,57 @@ pub fn random_phase(_: &Caps)
     );
 
     std::os::seraph::log!("random phase passed");
+}
+
+/// Concurrent `SYS_GETRANDOM` under reseed pressure (#395). Four threads each
+/// draw 2048 × 32 bytes — every thread's stream crosses the per-CPU 256-draw
+/// reseed interval many times, and under SMP the concurrent interval reseeds
+/// contend on the pool lock, driving the non-spinning defer-one-draw path.
+/// Output must stay sane throughout: no failed or short draw, no all-zero
+/// draw, and the four threads' first draws pairwise distinct (identical
+/// streams would mean per-CPU generators sharing state).
+pub fn random_contention_phase(_: &Caps)
+{
+    const THREADS: usize = 4;
+    const DRAWS: usize = 2048;
+
+    let handles: Vec<_> = (0..THREADS)
+        .map(|t| {
+            std::thread::spawn(move || {
+                let mut first = [0u8; 32];
+                for i in 0..DRAWS
+                {
+                    let mut buf = [0u8; 32];
+                    let n = syscall::getrandom(buf.as_mut_ptr(), buf.len())
+                        .unwrap_or_else(|e| panic!("thread {t}: SYS_GETRANDOM failed: {e}"));
+                    assert_eq!(n, buf.len() as u64, "thread {t}: short draw at {i}");
+                    assert_ne!(buf, [0u8; 32], "thread {t}: all-zero draw at {i}");
+                    if i == 0
+                    {
+                        first = buf;
+                    }
+                }
+                first
+            })
+        })
+        .collect();
+
+    let firsts: Vec<[u8; 32]> = handles
+        .into_iter()
+        .map(|h| h.join().expect("contention thread panicked"))
+        .collect();
+    for a in 0..firsts.len()
+    {
+        for b in (a + 1)..firsts.len()
+        {
+            assert_ne!(
+                firsts[a], firsts[b],
+                "threads {a} and {b} drew identical first blocks"
+            );
+        }
+    }
+
+    std::os::seraph::log!("random contention phase passed");
 }
 
 pub fn aslr_layout_phase(_: &Caps)

@@ -131,6 +131,8 @@ pub fn run(ctx: &Context, args: &TestTerminalArgs) -> Result<()>
         headless: true,
         gdb: GdbMode::Off,
         qmp_socket: Some(&sock_path),
+        vmgenid_guid: Some("auto"),
+        incoming: None,
         riscv_mmu: RiscvMmu::Sv48,
     };
     let qemu_args = build_qemu_argv(&spec)?;

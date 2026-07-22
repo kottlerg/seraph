@@ -17,14 +17,17 @@
 //! - [`sponge`] — forward-secure duplex PRNG over the permutation.
 //! - [`pool`] — central multi-source entropy pool (seed authority).
 //! - [`cpurng`] — per-CPU generators reseeded from the pool.
+//! - [`reseed_policy`] — pure reseed decision function.
 //! - [`jitter`] — per-CPU interrupt-time jitter accumulator.
+//! - [`vmgenid`] — VM Generation ID snapshot-resume detector.
 //!
-//! The permutation and sponge are pure and host-testable; the pool, per-CPU
-//! generators, jitter source, and draw API are hardware-coupled and compiled
-//! only for the kernel target.
+//! The permutation, sponge, and reseed policy are pure and host-testable; the
+//! pool, per-CPU generators, jitter source, VMGENID detector, and draw API
+//! are hardware-coupled and compiled only for the kernel target.
 
 pub mod health;
 pub mod keccak;
+pub mod reseed_policy;
 pub mod sponge;
 
 #[cfg(not(test))]
@@ -35,6 +38,8 @@ pub mod jitter;
 pub mod pool;
 #[cfg(not(test))]
 pub mod selftest;
+#[cfg(not(test))]
+pub mod vmgenid;
 
 #[cfg(not(test))]
 mod imp
@@ -87,11 +92,16 @@ mod imp
     ///
     /// `boot_seed` is the conditioned early-boot seed the bootloader drew from
     /// UEFI `EFI_RNG_PROTOCOL` (empty when the firmware exposed no RNG).
-    pub fn init(boot_seed: &[u8])
+    /// `vmgenid_paddr` is the VMGENID GUID physical address (zero when absent);
+    /// arming it before `mark_seeded` guarantees no draw precedes snapshot
+    /// detection.
+    pub fn init(boot_seed: &[u8], vmgenid_paddr: u64)
     {
         seed_pool_from_sources(boot_seed);
+        super::vmgenid::init(vmgenid_paddr);
         pool::mark_seeded();
         super::selftest::capture(crate::arch::current::cpu::current_cpu() as usize);
+        mark_stale_current_cpu();
     }
 
     /// Per-AP entry hook (Phase 8). The AP's generator seeds lazily on its
@@ -99,6 +109,28 @@ mod imp
     pub fn init_ap()
     {
         super::selftest::capture(crate::arch::current::cpu::current_cpu() as usize);
+        mark_stale_current_cpu();
+    }
+
+    /// Mark the calling CPU's generator stale so its next fill performs a
+    /// mandatory reseed. The self-test capture above is that generator's
+    /// first draw, so it seeds from the scrape-dominated boot-time pool;
+    /// staleness makes the first *consumer* draw reseed with the runtime
+    /// jitter accrued in between.
+    fn mark_stale_current_cpu()
+    {
+        // SAFETY: as in `fill_bytes` — disabling interrupts pins this CPU and
+        // bars ISR reentry, giving exclusive access to its generator.
+        let saved = unsafe { crate::arch::current::cpu::save_and_disable_interrupts() };
+        let cpu = crate::arch::current::cpu::current_cpu() as usize;
+        // SAFETY: cpu < CPU_COUNT; exclusivity established above.
+        unsafe {
+            cpu_rng(cpu).mark_stale();
+        }
+        // SAFETY: `saved` came from the matching disable above.
+        unsafe {
+            crate::arch::current::cpu::restore_interrupts(saved);
+        }
     }
 
     /// Mix every available entropy source into the pool.

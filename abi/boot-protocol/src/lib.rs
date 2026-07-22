@@ -96,7 +96,15 @@ pub mod role_guids;
 ///     [`HART_CAP_SVINVAL`], [`HART_CAP_SVNAPOT`] — the RVA23 supervisor
 ///     paging extensions). No layout change. The kernel's riscv64 paging
 ///     initialization refuses to boot unless all three are confirmed.
-pub const BOOT_PROTOCOL_VERSION: u32 = 12;
+/// v13: Added `vmgenid_paddr: u64` — physical address of the 16-byte ACPI
+///     VMGENID (VM Generation ID) GUID buffer, discovered by the bootloader
+///     from the QEMU VMGENID SSDT (`VGIA` named DWORD, patched with the
+///     `etc/vmgenid_guid` blob base; the GUID lives at offset 40 into that
+///     blob and `vmgenid_paddr` already includes the offset). Zero when
+///     absent. The kernel's entropy subsystem polls the GUID and forces a
+///     pre-output reseed of every per-CPU generator on a generation change
+///     (whole-VM-snapshot resume).
+pub const BOOT_PROTOCOL_VERSION: u32 = 13;
 
 // ── Memory map ───────────────────────────────────────────────────────────────
 
@@ -852,6 +860,20 @@ pub struct BootInfo
     /// bootloader found no entropy source; the kernel then degrades to timing
     /// jitter alone (no regression).
     pub boot_entropy_len: u32,
+
+    // ── VM Generation ID (added in protocol version 13) ───────────────────────
+    /// Physical address of the 16-byte VM Generation ID (VMGENID) GUID
+    /// buffer, or zero when absent (no ACPI, no vmgenid device, or an
+    /// unrecognized SSDT layout).
+    ///
+    /// Discovered by the bootloader from the QEMU VMGENID SSDT without AML
+    /// evaluation: the `VGIA` named DWORD holds the guest-allocated
+    /// `etc/vmgenid_guid` blob base, and the GUID sits 40 bytes into the
+    /// blob; this field already includes that offset. The hypervisor
+    /// rewrites the GUID in place on snapshot resume / migration, so the
+    /// kernel's entropy subsystem treats a changed GUID as a mandatory
+    /// reseed trigger for every per-CPU generator.
+    pub vmgenid_paddr: u64,
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

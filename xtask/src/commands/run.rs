@@ -78,6 +78,8 @@ pub fn run(ctx: &BuildContext, args: &RunArgs) -> Result<()>
             GdbMode::Off
         },
         qmp_socket: None,
+        vmgenid_guid: Some("auto"),
+        incoming: None,
         riscv_mmu: args.riscv_mmu,
     };
     let qemu_args = build_qemu_argv(&spec)?;

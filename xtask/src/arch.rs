@@ -29,8 +29,9 @@ impl Arch
 {
     /// Rust target triple for the kernel.
     ///
-    /// `"os": "none"`, `relocation-model: static` — the kernel is the one
-    /// image that stays fixed-address (KASLR is #252).
+    /// `"os": "none"`, `relocation-model: pic`, `ET_DYN` output — the kernel
+    /// is a static-PIE image; the bootloader chooses its load bias (KASLR,
+    /// #252) and applies the `RELATIVE` relocations before handoff.
     pub fn kernel_target_triple(self) -> &'static str
     {
         match self
@@ -44,8 +45,7 @@ impl Arch
     /// ktest, memmgr.
     ///
     /// A PIE copy of `kernel_target_triple`'s spec (`relocation-model: pic`,
-    /// `ET_DYN` output) so these images load at a randomized base (#39)
-    /// while the kernel target itself stays static.
+    /// `ET_DYN` output) so these images load at a randomized base (#39).
     pub fn lowlevel_user_target_triple(self) -> &'static str
     {
         match self

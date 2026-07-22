@@ -242,7 +242,7 @@ unsafe fn boot_sequence(image: EfiHandle, st: *mut EfiSystemTable) -> Result<!, 
     // SAFETY: ctx.esp_root is a valid FAT directory handle.
     let bundle_load = unsafe { step2_load_bundle(&ctx)? };
     // SAFETY: ctx.bs / esp_root are valid until ExitBootServices.
-    let kernel = unsafe { step3_load_kernel(&ctx)? };
+    let mut kernel = unsafe { step3_load_kernel(&ctx)? };
     // SAFETY: bundle_load.phys/len name a valid identity-mapped UEFI allocation.
     let (init, mods) = unsafe { step4_parse_bundle(&ctx, &bundle_load)? };
     // SAFETY: ctx.st is a valid UEFI system table.
@@ -259,6 +259,11 @@ unsafe fn boot_sequence(image: EfiHandle, st: *mut EfiSystemTable) -> Result<!, 
     // SAFETY: ctx.bs valid pre-exit; draws the boot entropy seed while boot
     // services (and thus EFI_RNG_PROTOCOL) are still available.
     let boot_entropy = unsafe { step5c_fetch_boot_entropy(&ctx) };
+    // Apply the KASLR slide before step 6 maps the segments at their
+    // (biased) virtual addresses.
+    // SAFETY: kernel.info comes from load_kernel with its span allocation
+    // live and identity-mapped; virtual addresses are still unbiased link VAs.
+    unsafe { step5d_apply_kaslr_slide(&mut kernel.info)? };
     // SAFETY: all prior unsafe outputs remain valid; step 6 allocates via bs.
     let (allocs, mut page_table) = unsafe {
         step6_allocate_and_build_page_tables(
@@ -756,6 +761,24 @@ unsafe fn step5c_fetch_boot_entropy(ctx: &UefiContext) -> BootEntropy
         seed = [0u8; 32];
         BootEntropy { seed, len: 0 }
     }
+}
+
+// ── Step 5d: KASLR slide ─────────────────────────────────────────────────────
+
+/// Apply the kernel's KASLR slide: relocate the loaded image and bias its
+/// virtual addresses before step 6 maps the segments.
+///
+/// The slide is currently always 0 — the image is relocated in place at its
+/// link base. The randomized draw lands with the KASLR window selection
+/// (issue #252).
+///
+/// # Safety
+/// `info` must come from `load_kernel` with its span allocation live and
+/// identity-mapped, and must not have been relocated already.
+unsafe fn step5d_apply_kaslr_slide(info: &mut KernelInfo) -> Result<(), BootError>
+{
+    // SAFETY: forwarded from the caller's contract.
+    unsafe { elf::relocate_kernel(info, 0, arch::current::EXPECTED_ELF_MACHINE) }
 }
 
 // ── Step 6: Allocate boot structures and build page tables ──────────────────

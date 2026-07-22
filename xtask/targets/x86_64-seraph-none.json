@@ -16,10 +16,17 @@
     "position-independent-executables": true,
     "static-position-independent-executables": true,
     "plt-by-default": false,
-    "code-model": "kernel",
-    "relocation-model": "static",
+    "code-model": "small",
+    "relocation-model": "pic",
     "pre-link-args": {
-        "ld.lld": ["--gc-sections"]
+        "ld.lld": [
+            "--gc-sections",
+            "-pie",
+            "--no-dynamic-linker",
+            "-Bsymbolic",
+            "-z",
+            "max-page-size=4096"
+        ]
     },
     "emit-debug-gdb-scripts": false
 }

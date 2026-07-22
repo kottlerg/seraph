@@ -61,8 +61,10 @@ kernel/
 │   │   ├── keccak.rs           # Keccak-f[1600] permutation (FIPS 202)
 │   │   ├── sponge.rs           # Forward-secure duplex PRNG
 │   │   ├── pool.rs             # Central multi-source entropy pool
-│   │   ├── cpurng.rs           # Per-CPU CSPRNG + reseed policy
+│   │   ├── cpurng.rs           # Per-CPU CSPRNG (acts on the reseed policy)
+│   │   ├── reseed_policy.rs    # Pure reseed decision function (host-tested)
 │   │   ├── jitter.rs           # Per-CPU interrupt-time jitter accumulator
+│   │   ├── vmgenid.rs          # VM Generation ID snapshot-resume detector
 │   │   ├── health.rs           # NIST SP 800-90B health tests (RCT/APT)
 │   │   └── selftest.rs         # Boot-time power-on self-test
 │   ├── ipc/                    # IPC subsystem

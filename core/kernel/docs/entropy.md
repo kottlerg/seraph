@@ -173,9 +173,12 @@ execution history forks.
   live GUID through the direct map and compares. Because the hypervisor
   rewrites the GUID before any vCPU resumes, every post-resume draw on every
   CPU sees the change *before producing output* and performs a mandatory
-  reseed that absorbs the new GUID — so clone streams diverge by construction,
-  even under identical post-resume jitter. There is no cross-CPU detection
-  state: the GUID in guest RAM is the shared authority.
+  reseed that absorbs the new GUID — so clone streams diverge, even under
+  identical post-resume jitter. The one exception is a draw snapshotted
+  mid-fill, after its GUID compare: that single in-flight draw completes
+  from replayed state and can repeat across clones; the next draw on that
+  CPU re-reads the GUID and reseeds. There is no cross-CPU detection state:
+  the GUID in guest RAM is the shared authority.
 - **Observability**: the BSP timer tick polls the same GUID and prints
   `entropy: VM generation change detected` once per change. The reseed
   guarantee never depends on this poll.

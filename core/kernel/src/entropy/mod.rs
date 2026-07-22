@@ -17,11 +17,13 @@
 //! - [`sponge`] — forward-secure duplex PRNG over the permutation.
 //! - [`pool`] — central multi-source entropy pool (seed authority).
 //! - [`cpurng`] — per-CPU generators reseeded from the pool.
+//! - [`reseed_policy`] — pure reseed decision function.
 //! - [`jitter`] — per-CPU interrupt-time jitter accumulator.
+//! - [`vmgenid`] — VM Generation ID snapshot-resume detector.
 //!
-//! The permutation and sponge are pure and host-testable; the pool, per-CPU
-//! generators, jitter source, and draw API are hardware-coupled and compiled
-//! only for the kernel target.
+//! The permutation, sponge, and reseed policy are pure and host-testable; the
+//! pool, per-CPU generators, jitter source, VMGENID detector, and draw API
+//! are hardware-coupled and compiled only for the kernel target.
 
 pub mod health;
 pub mod keccak;

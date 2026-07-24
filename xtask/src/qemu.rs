@@ -146,6 +146,14 @@ pub fn build_qemu_argv(spec: &QemuLaunchSpec) -> Result<Vec<String>>
         // `id=kbd0` lets the QMP interactive-test harness target it.
         "-device".into(),
         "virtio-keyboard-pci,disable-legacy=on,id=kbd0".into(),
+        // Boot-entropy source (KASLR, #252). The firmware's RNG driver binds
+        // this device and exposes EFI_RNG_PROTOCOL, which the bootloader draws
+        // from for the KASLR slide / direct-map base and the pool seed. On
+        // riscv64 it is the only such source (EDK2 hands the bootloader ACPI,
+        // not a DTB, so /chosen/rng-seed never reaches it); on x86-64 it backs
+        // OVMF's EFI_RNG_PROTOCOL alongside RDRAND.
+        "-device".into(),
+        "virtio-rng-pci".into(),
         "-serial".into(),
         "stdio".into(),
         "-no-reboot".into(),

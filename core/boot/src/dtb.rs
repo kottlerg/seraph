@@ -673,6 +673,51 @@ impl Fdt
 
         0
     }
+
+    /// Locate a property by name with a flat scan (no node tracking),
+    /// returning its `(data_offset, length)` within the struct block, or
+    /// `None` when absent. Suitable only for property names that are unique
+    /// in the tree — `rng-seed` lives solely under `/chosen`.
+    fn find_prop_flat(&self, name: &[u8]) -> Option<(u32, u32)>
+    {
+        let mut off: u32 = 0;
+        while let Some(token) = self.read_struct_u32(off)
+        {
+            off += 4;
+            match token
+            {
+                FDT_BEGIN_NODE => off = skip_node_name(self, off),
+                FDT_END_NODE | FDT_NOP =>
+                {}
+                FDT_PROP =>
+                {
+                    let prop_len = self.read_struct_u32(off)?;
+                    off += 4;
+                    let nameoff = self.read_struct_u32(off)?;
+                    off += 4;
+                    let data_off = off;
+                    off += (prop_len + 3) & !3;
+                    if self.string_at(nameoff) == name
+                    {
+                        return Some((data_off, prop_len));
+                    }
+                }
+                _ => break,
+            }
+        }
+        None
+    }
+
+    /// Physical address of `len` bytes of property data at struct-block
+    /// offset `data_off`, or `None` if out of bounds.
+    fn prop_data_addr(&self, data_off: u32, len: u32) -> Option<u64>
+    {
+        if data_off.checked_add(len)? > self.size_struct
+        {
+            return None;
+        }
+        Some(self.base + u64::from(self.off_struct) + u64::from(data_off))
+    }
 }
 
 // ── Private helpers ───────────────────────────────────────────────────────────
@@ -987,6 +1032,61 @@ pub unsafe fn parse_aperture_seed(dtb_addr: u64, out: &mut [MmioAperture]) -> us
     n
 }
 
+/// Extract the `/chosen/rng-seed` property into `out`, scrub it from the
+/// blob, and return the number of bytes copied (0 when absent).
+///
+/// QEMU's `virt` machine populates `rng-seed` with host-random bytes and
+/// the EDK2 `RiscVVirtQemu` firmware passes the FDT through unmodified, so
+/// on riscv64 — where no `EFI_RNG_PROTOCOL` exists — this is the bootloader's
+/// only entropy source (KASLR draws and the pool seed). The property bytes
+/// are zeroed in place because the same blob is later handed to userspace
+/// via `BootInfo.device_tree`; the seed must not outlive its consumption.
+///
+/// # Safety
+/// `dtb_addr` must be 0 or the physical address of a valid, identity-mapped
+/// (writable, pre-`ExitBootServices`) FDT blob.
+pub unsafe fn parse_rng_seed(dtb_addr: u64, out: &mut [u8; 32]) -> usize
+{
+    if dtb_addr == 0
+    {
+        return 0;
+    }
+    // SAFETY: caller contract.
+    let Some(fdt) = (unsafe { Fdt::from_raw(dtb_addr) })
+    else
+    {
+        return 0;
+    };
+    let Some((data_off, prop_len)) = fdt.find_prop_flat(b"rng-seed")
+    else
+    {
+        return 0;
+    };
+    let Some(addr) = fdt.prop_data_addr(data_off, prop_len)
+    else
+    {
+        return 0;
+    };
+
+    // prop_len is a struct-block length (u32), safe as usize on 64-bit.
+    let len = (prop_len as usize).min(out.len());
+    let src = addr as *const u8;
+    for (i, slot) in out.iter_mut().take(len).enumerate()
+    {
+        // SAFETY: [addr, addr+prop_len) validated within the struct block.
+        *slot = unsafe { core::ptr::read(src.add(i)) };
+    }
+    // Scrub the full property in place (the whole seed, not just the copied
+    // prefix), so nothing leaks through the userspace-visible DTB.
+    let dst = addr as *mut u8;
+    for i in 0..prop_len as usize
+    {
+        // SAFETY: same validated range; the DTB is writable pre-ExitBootServices.
+        unsafe { core::ptr::write_volatile(dst.add(i), 0u8) };
+    }
+    len
+}
+
 #[cfg(test)]
 mod tests
 {
@@ -1250,5 +1350,56 @@ mod tests
         let (count, ids) = unsafe { parse_cpu_count(blob.as_ptr() as u64) };
         assert_eq!(count, 2);
         assert_eq!(&ids[..2], &[7, 9]);
+    }
+
+    /// Build an FDT with a `/chosen` node carrying `rng-seed = seed`.
+    fn tree_with_rng_seed(seed: &[u8]) -> Vec<u8>
+    {
+        let mut b = FdtBuilder::new();
+        b.begin_node(b"");
+        b.begin_node(b"chosen");
+        b.prop(b"rng-seed", seed);
+        b.end_node();
+        b.end_node();
+        b.finish()
+    }
+
+    #[test]
+    fn rng_seed_extracted_and_scrubbed()
+    {
+        let seed: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_add(1));
+        let mut blob = tree_with_rng_seed(&seed);
+        let mut out = [0u8; 32];
+        // SAFETY: blob is a valid, writable in-memory FDT.
+        let n = unsafe { parse_rng_seed(blob.as_mut_ptr() as u64, &mut out) };
+        assert_eq!(n, 32);
+        assert_eq!(out, seed);
+        // The property bytes must be zeroed in the blob after extraction.
+        assert!(blob.windows(32).all(|w| w != seed));
+    }
+
+    #[test]
+    fn rng_seed_absent_returns_zero()
+    {
+        let blob = tree(None, |b| cpu_node(b, b"cpu@0", 0, &[]));
+        let mut out = [0u8; 32];
+        // SAFETY: blob is a valid in-memory FDT with no rng-seed property.
+        let n = unsafe { parse_rng_seed(blob.as_ptr() as u64, &mut out) };
+        assert_eq!(n, 0);
+        assert_eq!(out, [0u8; 32]);
+    }
+
+    #[test]
+    fn rng_seed_longer_than_out_is_truncated()
+    {
+        let seed = [0xABu8; 48];
+        let mut blob = tree_with_rng_seed(&seed);
+        let mut out = [0u8; 32];
+        // SAFETY: blob is a valid, writable in-memory FDT.
+        let n = unsafe { parse_rng_seed(blob.as_mut_ptr() as u64, &mut out) };
+        assert_eq!(n, 32);
+        assert_eq!(out, [0xABu8; 32]);
+        // The whole 48-byte property is scrubbed, not just the copied prefix.
+        assert!(blob.windows(48).all(|w| w != seed));
     }
 }

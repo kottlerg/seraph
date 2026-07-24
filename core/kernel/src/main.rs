@@ -69,6 +69,91 @@ mod validate;
 /// `boot_info` is the physical address of a populated [`BootInfo`] structure,
 /// accessible before the kernel's own page tables are established because the
 /// bootloader identity-maps the `BootInfo` region.
+/// Report the KASLR layout at Phase 1.
+///
+/// A framebuffer-safe summary line (no addresses — the console mirrors to the
+/// framebuffer, which is handed to userspace) plus, on the serial-only path,
+/// the slide and bases the operator needs for `add-symbol-file` / `addr2line`
+/// against a slid kernel. Per `core/kernel/docs/cross-boundary-disclosure.md`,
+/// serial TX is host-only and outside the KASLR threat model, so the bases go
+/// there and never through `kprintln!`.
+#[cfg(not(test))]
+fn report_kaslr(flags: u32, image_base: u64, dm_base: u64)
+{
+    use boot_protocol::{
+        KASLR_DISABLED_BY_KNOB, KASLR_DM_RANDOMIZED, KASLR_DM_WINDOW_LIMITED,
+        KASLR_ENTROPY_DTB_SEED, KASLR_ENTROPY_FW_RNG, KASLR_IMAGE_RANDOMIZED,
+    };
+
+    let source = if flags & KASLR_ENTROPY_FW_RNG != 0
+    {
+        "fw-rng"
+    }
+    else if flags & KASLR_ENTROPY_DTB_SEED != 0
+    {
+        "dtb-seed"
+    }
+    else
+    {
+        "none"
+    };
+
+    if flags & KASLR_DISABLED_BY_KNOB != 0
+    {
+        kprintln!("kaslr: disabled by knob");
+    }
+    else if flags & KASLR_IMAGE_RANDOMIZED != 0
+    {
+        kprintln!("kaslr: image randomized ({source})");
+    }
+    else
+    {
+        kprintln!("kaslr: image at link base (no boot entropy)");
+    }
+
+    if flags & KASLR_DM_RANDOMIZED != 0
+    {
+        kprintln!("kaslr: direct map randomized");
+    }
+    else if flags & KASLR_DM_WINDOW_LIMITED != 0
+    {
+        kprintln!("kaslr: direct map at mode base (window limited)");
+    }
+    else
+    {
+        kprintln!("kaslr: direct map at mode base");
+    }
+
+    // Serial-only: the actual secrets, for the debug/symbolization workflow.
+    let link_base = boot_protocol::layout::KERNEL_LINK_BASE;
+    let slide = image_base.wrapping_sub(link_base);
+    kprintln_serial!("kaslr: slide={slide:#x} image_base={image_base:#x} dm_base={dm_base:#x}");
+
+    // Invariants (checked on every debug boot): the IMAGE_RANDOMIZED flag
+    // agrees with a nonzero slide, the slide is 2 MiB-aligned, and the
+    // direct-map base is 1 GiB-aligned. Production placement is enforced by
+    // validate_boot_info / init_paging_mode; these catch a flag/layout drift.
+    debug_assert_eq!(
+        flags & KASLR_IMAGE_RANDOMIZED != 0,
+        slide != 0,
+        "KASLR_IMAGE_RANDOMIZED flag disagrees with the applied slide"
+    );
+    debug_assert_eq!(
+        slide % (2 * 1024 * 1024),
+        0,
+        "image slide not 2 MiB-aligned"
+    );
+    debug_assert_eq!(
+        dm_base % (1024 * 1024 * 1024),
+        0,
+        "direct-map base not 1 GiB-aligned"
+    );
+}
+
+/// Test-build stub.
+#[cfg(test)]
+fn report_kaslr(_flags: u32, _image_base: u64, _dm_base: u64) {}
+
 // too_many_lines: kernel_entry is the single-entry boot sequence; splitting it would
 // obscure the sequential phase structure without reducing actual complexity.
 // not_unsafe_ptr_arg_deref: boot_info is validated (null + alignment) before deref;
@@ -96,13 +181,14 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
         arch::current::cpu::halt_loop();
     }
 
-    // Publish the paging mode the bootloader activated (recovered from the
-    // translation registers, not BootInfo) before any consumer of the
-    // mode-derived VA layout runs. No-op on architectures with a single mode.
-    arch::current::paging::init_paging_mode();
-
     // SAFETY: validate_boot_info confirmed non-null, aligned, and readable.
     let info = unsafe { &*boot_info };
+
+    // Publish the paging mode the bootloader activated (recovered from the
+    // translation registers, not BootInfo) and the KASLR-chosen direct-map
+    // base before any consumer of the VA layout runs. Halts on a base
+    // outside the active mode's kernel half.
+    arch::current::paging::init_paging_mode(info);
 
     // Copy all fields needed beyond Phase 3 out of BootInfo now, while the
     // identity mapping is still live. After Phase 3 activates the kernel page
@@ -113,6 +199,12 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
     let init_image = info.init_image; // InitImage is Copy
     let boot_entropy_seed = info.boot_entropy_seed;
     let boot_entropy_len = info.boot_entropy_len;
+    // KASLR: copy the status flags and the slid/randomized bases out of the
+    // donated BootInfo page before Phase 5 scrubs the two base fields. The
+    // bases are secrets, so they only ever reach the serial-only console.
+    let kaslr_flags = info.kaslr_flags;
+    let kaslr_image_base = info.kernel_virtual_base;
+    let kaslr_dm_base = info.direct_map_base;
     // VMGENID GUID address: accept only when the 16-byte read stays inside
     // the physical span the direct map will cover (the Phase-0 validator
     // checks the protocol version, not this field).
@@ -147,6 +239,7 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
     );
     kprintln!("Phase 1: Early Console");
     kprintln!("boot protocol v{}", info.version);
+    report_kaslr(kaslr_flags, kaslr_image_base, kaslr_dm_base);
 
     // Platform feature-gate: refuse hardware missing a required baseline
     // feature with a clear diagnostic, before any subsystem that assumes the
@@ -276,10 +369,10 @@ unsafe fn kernel_entry_post_rebase(
         console::rebase_framebuffer(fb_phys);
     }
     kprintln!("Phase 3: Kernel Page Tables");
-    kprintln!(
-        "page tables active (direct map {:#x})",
-        mm::paging::direct_map_base()
-    );
+    // The direct-map base is a KASLR secret and the console mirrors to the
+    // userspace-visible framebuffer; report_kaslr already logged it on the
+    // serial-only path at Phase 1.
+    kprintln!("page tables active");
 
     // ── Phase 4: typed-memory cap surface ────────────────────────────────────
     // The kernel does not run a `GlobalAlloc`; every kernel-object body is
@@ -388,11 +481,14 @@ unsafe fn kernel_entry_post_rebase(
         let n = (boot_entropy_len as usize).min(boot_entropy_seed.len());
         entropy::init(&boot_entropy_seed[..n], vmgenid_paddr);
 
-        // Scrub the conditioned seed once it is absorbed. The BootInfo page is
+        // Scrub the KASLR/entropy secrets once consumed. The BootInfo page is
         // a reclaim range donated to userspace at Phase 7 (memmgr re-hands its
-        // frames without zeroing), so the seed must not survive there; the
-        // local copy is wiped too. The pool retains the entropy — the seed
-        // itself is secret (it feeds KASLR and key/nonce generation).
+        // frames without zeroing), so none of them may survive there; the
+        // local seed copy is wiped too. The pool retains the entropy — the
+        // seed itself is secret (it feeds key/nonce generation), and the
+        // randomized kernel image and direct-map bases defeat KASLR if
+        // disclosed. All Phase-3 consumers of the two bases have run; later
+        // phases read only layout-free BootInfo fields.
         boot_entropy_seed.fill(0);
         // SAFETY: the direct map covers all RAM since Phase 3; boot_info_phys
         // was validated in Phase 0. Single-threaded boot, and no live BootInfo
@@ -402,6 +498,8 @@ unsafe fn kernel_entry_post_rebase(
             let bi = mm::paging::phys_to_virt(boot_info_phys) as *mut BootInfo;
             core::ptr::write_volatile(core::ptr::addr_of_mut!((*bi).boot_entropy_seed), [0u8; 32]);
             core::ptr::write_volatile(core::ptr::addr_of_mut!((*bi).boot_entropy_len), 0u32);
+            core::ptr::write_volatile(core::ptr::addr_of_mut!((*bi).kernel_virtual_base), 0u64);
+            core::ptr::write_volatile(core::ptr::addr_of_mut!((*bi).direct_map_base), 0u64);
         }
     }
 

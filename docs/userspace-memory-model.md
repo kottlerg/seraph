@@ -217,7 +217,8 @@ handover discipline.
 ### Image Placement
 
 Userspace binaries are position-independent executables (`ET_DYN`; the
-kernel image alone stays static — KASLR is
+kernel image is now static-PIE too, with the bootloader biasing its base
+per boot — KASLR,
 [#252](https://github.com/kottlerg/seraph/issues/252)). The creator
 draws a load bias per spawn from a fixed window of 2²³ page-aligned
 slots above `0x30_0000_0000` (23 bits of entropy; ASLR,

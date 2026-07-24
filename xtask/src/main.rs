@@ -73,6 +73,7 @@ fn main()
         CliCommand::ComposeBundle(args) => commands::compose_bundle::run(&ctx, args),
         CliCommand::TestTerminal(args) => commands::test_terminal::run(&ctx, args),
         CliCommand::TestVmgenid(args) => commands::test_vmgenid::run(&ctx, args),
+        CliCommand::TestKaslr(args) => commands::test_kaslr::run(&ctx, args),
     };
 
     if let Err(err) = result

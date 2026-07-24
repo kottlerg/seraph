@@ -123,13 +123,14 @@ uses the partition.) This applies to `build`, `mkdisk`, and
 `compose-bundle` alike.
 
 ```
-cargo xtask mkdisk [--arch x86_64|riscv64] [--repack-only]
+cargo xtask mkdisk [--arch x86_64|riscv64] [--repack-only] [--no-kaslr]
 ```
 
 | Option | Default | Description |
 |---|---|---|
 | `--arch` | `x86_64` | Target architecture — must match the existing sysroot's arch tag |
 | `--repack-only` | `false` | Skip the `rootfs/` re-mirror and pack the sysroot as it stands — preserves a hand-staged service set the authoritative mirror would otherwise reconcile |
+| `--no-kaslr` | `false` | Stage the `\EFI\seraph\nokaslr` override knob so the bootloader boots the kernel at its deterministic (un-randomized) layout, for GDB / symbolization; omit to remove the knob and re-enable KASLR |
 
 Example — stage `svctest` and run it (`--repack-only` keeps the hand-added
 recipe; a plain repack would prune it):
@@ -341,6 +342,29 @@ cargo xtask test-vmgenid [--cpus N] [--mem MIB]
 
 See [docs/testing.md](../docs/testing.md) for the harness model and
 `core/kernel/docs/entropy.md` for the snapshot-detection design.
+
+---
+
+### `cargo xtask test-kaslr`
+
+Verify KASLR (#252) on either arch. Boots the ktest bundle headless twice with
+KASLR enabled, scrapes the kernel's serial-only
+`kaslr: slide=… image_base=… dm_base=…` line, and asserts the joint
+`(slide, dm_base)` differs between boots (joint compare + one retry bounds a
+false failure at ~1e-8). Then stages the `nokaslr` knob, repacks `disk.img`,
+boots once, and asserts the deterministic layout (slide 0, image at link base,
+direct map at the mode floor) — always restoring the KASLR-enabled image.
+
+A pure runner; requires the ktest bundle composed:
+
+```sh
+cargo xtask build [--arch x86_64|riscv64]
+cargo xtask compose-bundle --harness ktest [--arch x86_64|riscv64]
+cargo xtask test-kaslr [--arch x86_64|riscv64] [--cpus N] [--mem MIB] [--riscv-mmu sv39|sv48|sv57]
+```
+
+See [docs/testing.md](../docs/testing.md) for the harness model and
+`docs/memory-model.md` for the randomized layout.
 
 ---
 

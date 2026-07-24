@@ -59,8 +59,10 @@ pub struct LoadedSegment
 
 /// Result of loading the kernel ELF into physical memory.
 ///
-/// Produced by [`load_kernel`] and consumed by the page table builder and by
-/// the `BootInfo` population step.
+/// Produced by [`load_kernel`] and consumed by [`relocate_kernel`], the page
+/// table builder, and the `BootInfo` population step. Virtual addresses are
+/// link VAs until [`relocate_kernel`] applies the KASLR slide, after which
+/// they are the biased runtime VAs.
 pub struct KernelInfo
 {
     /// Lowest physical address across all `PT_LOAD` segments.
@@ -75,6 +77,13 @@ pub struct KernelInfo
     pub segments: [LoadedSegment; MAX_LOAD_SEGMENTS],
     /// Number of valid entries in `segments`.
     pub segment_count: usize,
+    /// Image is `ET_DYN` (static-PIE) and accepts a nonzero KASLR slide.
+    pub is_pie: bool,
+    /// Physical address of the `.rela.dyn` table within the copied span;
+    /// 0 when the image has no relocation table.
+    pub rela_phys: u64,
+    /// Size of the `.rela.dyn` table in bytes.
+    pub rela_size: u64,
 }
 
 // ── Kernel loading ────────────────────────────────────────────────────────────
@@ -190,13 +199,22 @@ fn validate_kernel_layout(segs: &[elf::LoadSegment], entry: u64) -> Result<Kerne
 /// tolerates any firmware memory layout (issue #377); the kernel learns the
 /// chosen base through `BootInfo.kernel_physical_base`.
 ///
+/// Both `ET_EXEC` and `ET_DYN` (static-PIE) kernels are accepted. For
+/// `ET_DYN` the `.rela.dyn` table is pre-located and fully validated here
+/// (every record `RELATIVE`, every target inside the load span) while the
+/// file bytes are in hand; [`relocate_kernel`] later applies the records
+/// through the copied span. An `ET_EXEC` kernel loads at its link VAs and
+/// forbids a nonzero slide.
+///
 /// Up to 8 `PT_LOAD` segments are supported; an ELF with more returns
 /// `InvalidElf`.
 ///
 /// # Errors
 ///
 /// - `BootError::InvalidElf` — header check failed (bridged from
-///   `elf::ElfError`), or the segment layout failed [`validate_kernel_layout`].
+///   `elf::ElfError`), the segment layout failed [`validate_kernel_layout`],
+///   or the relocation table is malformed, non-`RELATIVE`, or targets bytes
+///   outside the load span.
 /// - `BootError::OutOfMemory` — no free contiguous span of the required size.
 ///
 /// # Safety
@@ -210,7 +228,7 @@ pub unsafe fn load_kernel(
     expected_machine: u16,
 ) -> Result<KernelInfo, BootError>
 {
-    let ehdr = elf::validate(data, expected_machine)?;
+    let (ehdr, kind) = elf::validate_executable(data, expected_machine)?;
 
     // Collect the PT_LOAD segments (skipping pure-padding entries) before any
     // allocation, so the whole layout can be validated as a unit.
@@ -307,6 +325,32 @@ pub unsafe fn load_kernel(
         };
     }
 
+    // Pre-locate and validate the relocation table while the file bytes are
+    // in hand; the table's physical address inside the copied span follows
+    // from the single linear offset `validate_kernel_layout` guarantees.
+    let (rela_phys, rela_size) = match kind
+    {
+        elf::ElfKind::Exec => (0, 0),
+        elf::ElfKind::Dyn => match elf::rela_table(ehdr, data)?
+        {
+            Some(table) =>
+            {
+                // rela_table guarantees the table bytes are inside `data`.
+                #[allow(clippy::cast_possible_truncation)]
+                let bytes =
+                    &data[table.file_offset as usize..(table.file_offset + table.size) as usize];
+                elf::validate_relative_relocs(
+                    bytes,
+                    expected_machine,
+                    span.link_virt,
+                    span.link_virt + span.span_bytes,
+                )?;
+                (span_base + (table.vaddr - span.link_virt), table.size)
+            }
+            None => (0, 0),
+        },
+    };
+
     Ok(KernelInfo {
         physical_base: span_base,
         virtual_base: span.link_virt,
@@ -314,7 +358,83 @@ pub unsafe fn load_kernel(
         entry_virtual: elf::entry_point(ehdr),
         segments,
         segment_count,
+        is_pie: matches!(kind, elf::ElfKind::Dyn),
+        rela_phys,
+        rela_size,
     })
+}
+
+/// Apply the KASLR slide to a loaded kernel: write each `RELATIVE`
+/// relocation's `slide + addend` through the copied physical span, then bias
+/// every virtual address in `info` (`virtual_base`, `entry_virtual`, each
+/// segment's `virt_base`) by `slide`.
+///
+/// Relocations are applied even at slide 0 so the mapped image never depends
+/// on lld having pre-filled relocation targets in the file. The records were
+/// fully validated by [`load_kernel`]; the span bounds are re-checked here
+/// before each write because the targets are raw physical memory.
+///
+/// # Errors
+///
+/// - `BootError::InvalidElf` — nonzero slide on an `ET_EXEC` kernel, a
+///   malformed record, or a target outside the span.
+///
+/// # Safety
+///
+/// `info` must come from [`load_kernel`] with its span allocation still
+/// live and identity-mapped, and no virtual address in `info` may have been
+/// biased already (call this exactly once).
+pub unsafe fn relocate_kernel(
+    info: &mut KernelInfo,
+    slide: u64,
+    expected_machine: u16,
+) -> Result<(), BootError>
+{
+    if !info.is_pie
+    {
+        if slide != 0
+        {
+            return Err(BootError::InvalidElf("cannot slide an ET_EXEC kernel"));
+        }
+        return Ok(());
+    }
+
+    let link_virt = info.virtual_base;
+    if info.rela_size > 0
+    {
+        // rela_size → usize: 64-bit targets only; bounded by MAX_RELA_TABLE_SIZE.
+        #[allow(clippy::cast_possible_truncation)]
+        // SAFETY: rela_phys/rela_size name table bytes inside the span
+        // allocation (resolved by load_kernel), identity-mapped and unaliased.
+        let table = unsafe {
+            core::slice::from_raw_parts(info.rela_phys as *const u8, info.rela_size as usize)
+        };
+        for record in elf::relative_relocs(table, expected_machine)?
+        {
+            let rela = record?;
+            if !elf::reloc_target_in_span(&rela, link_virt, link_virt + info.size)
+            {
+                return Err(BootError::InvalidElf(
+                    "relocation target outside kernel span",
+                ));
+            }
+            let target = (info.physical_base + (rela.offset - link_virt)) as *mut u64;
+            // SAFETY: target + 8 bytes lie inside the span allocation per the
+            // bounds check above; the span is identity-mapped RAM. Unaligned
+            // write because r_offset carries no alignment guarantee.
+            unsafe {
+                target.write_unaligned(slide.wrapping_add(rela.addend.cast_unsigned()));
+            }
+        }
+    }
+
+    info.virtual_base += slide;
+    info.entry_virtual += slide;
+    for seg in &mut info.segments[..info.segment_count]
+    {
+        seg.virt_base += slide;
+    }
+    Ok(())
 }
 
 // ── Init ELF loading ─────────────────────────────────────────────────────────

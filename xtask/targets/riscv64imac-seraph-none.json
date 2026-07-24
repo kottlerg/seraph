@@ -12,11 +12,21 @@
     "panic-strategy": "abort",
     "features": "+m,+a,+c,+svinval,+svpbmt,+svnapot",
     "code-model": "medium",
-    "relocation-model": "static",
+    "relocation-model": "pic",
+    "position-independent-executables": true,
+    "static-position-independent-executables": true,
+    "plt-by-default": false,
     "llvm-abiname": "lp64",
     "max-atomic-width": 64,
     "pre-link-args": {
-        "ld.lld": ["--gc-sections"]
+        "ld.lld": [
+            "--gc-sections",
+            "-pie",
+            "--no-dynamic-linker",
+            "-Bsymbolic",
+            "-z",
+            "max-page-size=4096"
+        ]
     },
     "emit-debug-gdb-scripts": false
 }

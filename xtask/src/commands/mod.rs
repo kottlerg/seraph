@@ -12,5 +12,6 @@ pub mod mkdisk;
 pub mod run;
 pub mod run_parallel;
 pub mod test;
+pub mod test_kaslr;
 pub mod test_terminal;
 pub mod test_vmgenid;

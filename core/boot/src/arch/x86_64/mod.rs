@@ -86,6 +86,13 @@ pub fn uart_mmio_region() -> u64
     0
 }
 
+/// Deterministic direct-map base: the kernel half's floor (PML4 entry 256);
+/// x86-64 has a single paging mode.
+pub fn default_direct_map_base() -> u64
+{
+    0xFFFF_8000_0000_0000
+}
+
 /// Returns 0: x86-64 has no boot hart ID concept.
 ///
 /// # Safety

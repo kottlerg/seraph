@@ -164,17 +164,10 @@ pub fn uart_base_for_boot_info(km: &KernelMmio) -> u64
     }
 }
 
-/// Fill `out` with all kernel-internal MMIO regions that must be direct-mapped
-/// during Phase 3 page-table setup. Returns the number of populated entries.
-///
-/// On RISC-V every device the kernel touches (PLIC + UART) lies inside the
-/// physical RAM range that the large-page direct map already covers, so this
-/// always returns 0. Present for symmetry with the x86 variant.
-#[allow(clippy::trivially_copy_pass_by_ref)] // Symmetry with x86_64 signature.
-pub fn collect_mmio_direct_map_regions(_km: &KernelMmio, _out: &mut [(u64, u64)]) -> usize
-{
-    0
-}
+// The direct-map region derivation is shared with the bootloader's KASLR
+// window selection through `boot_protocol::layout`; the riscv64 variant
+// always returns 0 (PLIC + UART lie inside the RAM direct map).
+pub use boot_protocol::layout::collect_mmio_direct_map_regions;
 
 #[cfg(test)]
 mod tests

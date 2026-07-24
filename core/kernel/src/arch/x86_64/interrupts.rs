@@ -40,7 +40,6 @@
 #![allow(clippy::cast_possible_truncation, clippy::cast_lossless)]
 
 #[cfg(not(test))]
-use super::paging::DIRECT_MAP_BASE;
 #[cfg(not(test))]
 use super::{cpu, fpu, gdt, idt};
 
@@ -155,7 +154,8 @@ pub(super) unsafe fn apic_write(offset: usize, val: u32)
         unsafe { cpu::write_msr(0x800 + (offset >> 4) as u32, u64::from(val)) };
         return;
     }
-    let vaddr = (DIRECT_MAP_BASE + super::platform::lapic_base()) as usize + offset;
+    let vaddr =
+        (super::paging::direct_map_base() + super::platform::lapic_base()) as usize + offset;
     // SAFETY: vaddr is within the direct-mapped APIC MMIO region.
     unsafe {
         core::ptr::write_volatile(vaddr as *mut u32, val);
@@ -172,7 +172,8 @@ pub(super) fn apic_read(offset: usize) -> u32
         // SAFETY: offset names a valid 16-byte-aligned APIC register; ring 0.
         return unsafe { cpu::read_msr(0x800 + (offset >> 4) as u32) as u32 };
     }
-    let vaddr = (DIRECT_MAP_BASE + super::platform::lapic_base()) as usize + offset;
+    let vaddr =
+        (super::paging::direct_map_base() + super::platform::lapic_base()) as usize + offset;
     // SAFETY: vaddr is within the direct-mapped APIC MMIO region.
     unsafe { core::ptr::read_volatile(vaddr as *const u32) }
 }

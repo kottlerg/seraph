@@ -44,9 +44,6 @@
 // cast_possible_truncation: u64→u32 trampoline vector shift; value < 256 by design.
 #![allow(clippy::cast_possible_truncation)]
 
-#[cfg(not(test))]
-use super::paging::DIRECT_MAP_BASE;
-
 // ── Trampoline byte offsets ───────────────────────────────────────────────────
 
 /// Offset of the 6-byte far-jmp target used by real-mode code to jump to PM32.
@@ -406,7 +403,7 @@ unsafe fn write_u64(tramp_virt: u64, offset: usize, val: u64)
 pub unsafe fn setup_trampoline(ap_trampoline_phys: u64)
 {
     let ap_page = ap_trampoline_phys;
-    let virt = DIRECT_MAP_BASE + ap_page;
+    let virt = super::paging::direct_map_base() + ap_page;
 
     // Copy the fixed template.
     // SAFETY: virt is within the direct map (Phase 3 active); 0x114 < 4096 bytes.
@@ -482,7 +479,7 @@ pub unsafe fn setup_ap_params(
     ist2_top: u64,
 )
 {
-    let virt = DIRECT_MAP_BASE + ap_trampoline_phys;
+    let virt = super::paging::direct_map_base() + ap_trampoline_phys;
     let base = virt + TRAMP_PARAMS as u64;
 
     // SAFETY: base is direct-map address; writes within parameter block bounds.

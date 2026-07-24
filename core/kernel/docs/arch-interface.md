@@ -101,14 +101,18 @@ pub unsafe fn write_satp_no_fence(root_phys: u64);
 /// bits masked; `satp` PPN on RISC-V).
 pub unsafe fn read_root_phys() -> u64;
 
-/// Publish the active paging mode at kernel entry, before any consumer of the
-/// mode-derived VA layout runs. RISC-V decodes `satp.MODE` (the bootloader
-/// hands over a running translation regime under the negotiated Sv39/Sv48/Sv57
-/// mode); x86-64 is unconditionally 4-level and provides a no-op.
-pub fn init_paging_mode();
+/// Publish the active paging mode and the KASLR-chosen direct-map base at
+/// kernel entry, before any consumer of the VA layout runs, from the validated
+/// `BootInfo`. RISC-V decodes `satp.MODE` (the bootloader hands over a running
+/// translation regime under the negotiated Sv39/Sv48/Sv57 mode); x86-64 is
+/// unconditionally 4-level and records only the direct-map base. Halts the CPU
+/// on a base outside the active mode's kernel half or not 1 GiB-aligned.
+pub fn init_paging_mode(info: &boot_protocol::BootInfo);
 
-/// Base virtual address of the direct physical map: constant on x86-64; the
-/// active mode's kernel-half base on RISC-V. Wrapped by
+/// Base virtual address of the direct physical map: the KASLR-chosen base from
+/// `BootInfo` — a 1 GiB-aligned base at or above the kernel-half floor
+/// (0xFFFF800000000000 on x86-64 / Sv48), published by `init_paging_mode`. A
+/// runtime `AtomicU64` on both arches (a single relaxed load); wrapped by
 /// `mm::paging::direct_map_base()` for architecture-neutral consumers.
 pub fn direct_map_base() -> u64;
 

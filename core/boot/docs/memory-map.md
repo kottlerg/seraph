@@ -97,6 +97,18 @@ firmware implementation.
 
 ---
 
+## Consumer: KASLR direct-map base
+
+Step 9 selects the KASLR direct-map base from this translated map: the highest
+RAM address (`boot_protocol::layout::max_ram_address` over the `Usable` /
+`Loaded` / `AcpiReclaimable` / `Persistent` entries) plus any framebuffer /
+kernel-MMIO regions above it form the direct-map ceiling
+(`boot_protocol::layout::direct_map_ceiling`), and the base is drawn
+1 GiB-aligned in the gap between the mode's kernel-half floor and the kernel
+image. The kernel re-derives the same ceiling from the same helper at Phase 3
+to guard the mapping, so bootloader and kernel cannot disagree. See
+[boot-flow.md](boot-flow.md) step 9 and `core/kernel/docs/initialization.md`.
+
 ## What Lives Elsewhere
 
 - The `ExitBootServices` retry protocol and its stale-key semantics

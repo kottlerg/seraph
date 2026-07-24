@@ -37,7 +37,26 @@ pub fn run(ctx: &BuildContext, args: &MkdiskArgs) -> Result<()>
     {
         sysroot::install_rootfs(ctx)?;
     }
+    stage_nokaslr_knob(ctx, args.no_kaslr)?;
     disk::create_disk_image(ctx, args.arch)?;
     step(&format!("mkdisk complete ({})", args.arch));
+    Ok(())
+}
+
+/// Stage or remove the `\EFI\seraph\nokaslr` override knob in the ESP tree so
+/// the next `disk.img` reflects the requested KASLR state. Idempotent: an
+/// absent file re-enables randomization, a present (empty) file disables it.
+pub fn stage_nokaslr_knob(ctx: &BuildContext, disable: bool) -> Result<()>
+{
+    let path = ctx.sysroot_efi_seraph().join("nokaslr");
+    if disable
+    {
+        std::fs::create_dir_all(ctx.sysroot_efi_seraph())?;
+        std::fs::write(&path, b"")?;
+    }
+    else if path.exists()
+    {
+        std::fs::remove_file(&path)?;
+    }
     Ok(())
 }

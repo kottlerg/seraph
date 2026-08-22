@@ -49,9 +49,9 @@ pub fn run(ctx: &TestContext) -> TestResult
         let child = spawn::new_child(ctx)
             .map_err(|_| "concurrent_notification: spawn::new_child failed")?;
         // Child needs NOTIFY right on target and done.
-        let child_target = cap_copy(target, child.cs, 1 << 7)
+        let child_target = cap_copy(target, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
             .map_err(|_| "concurrent_notification: cap_copy target failed")?;
-        let child_done = cap_copy(done, child.cs, 1 << 7)
+        let child_done = cap_copy(done, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
             .map_err(|_| "concurrent_notification: cap_copy done failed")?;
 
         // Pack: bits[15:0]=target_slot, bits[31:16]=done_slot, bits[47:32]=bit_index

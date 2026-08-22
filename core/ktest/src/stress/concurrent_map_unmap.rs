@@ -49,7 +49,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     {
         let child =
             spawn::new_child(ctx).map_err(|_| "concurrent_map_unmap: spawn::new_child failed")?;
-        let child_done = cap_copy(done, child.cs, 1 << 7)
+        let child_done = cap_copy(done, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
             .map_err(|_| "concurrent_map_unmap: cap_copy done failed")?;
         // Copy memory and aspace caps into child's CSpace with full rights.
         let child_memory = cap_copy(memory_caps[i], child.cs, syscall::RIGHTS_ALL)

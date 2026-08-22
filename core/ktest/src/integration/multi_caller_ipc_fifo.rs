@@ -27,7 +27,7 @@ use syscall::{
 use crate::{ChildStack, TestContext, TestResult, spawn};
 
 // SEND | GRANT rights (bits 4 and 6).
-const RIGHTS_SEND_GRANT: u64 = (1 << 4) | (1 << 6);
+use syscall_abi::RIGHTS_EP_SEND_GRANT;
 
 // One stack per caller to avoid aliasing.
 static mut STACK_A: ChildStack = ChildStack::ZERO;
@@ -45,10 +45,10 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     // ── Build and start caller A ──────────────────────────────────────────────
     let child_a = spawn::new_child(ctx).map_err(|_| "multi_caller_ipc_fifo: new_child A failed")?;
-    let ep_a = cap_copy(ep, child_a.cs, RIGHTS_SEND_GRANT)
+    let ep_a = cap_copy(ep, child_a.cs, RIGHTS_EP_SEND_GRANT)
         .map_err(|_| "multi_caller_ipc_fifo: ep_a failed")?;
-    let done_a =
-        cap_copy(done, child_a.cs, 1 << 7).map_err(|_| "multi_caller_ipc_fifo: done_a failed")?;
+    let done_a = cap_copy(done, child_a.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
+        .map_err(|_| "multi_caller_ipc_fifo: done_a failed")?;
     // arg: ep_slot | (done_slot << 16) | (label << 32)
     let arg_a = u64::from(ep_a) | (u64::from(done_a) << 16) | (1u64 << 32);
     let stack_a = ChildStack::top(core::ptr::addr_of!(STACK_A));
@@ -61,10 +61,10 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     // ── Build and start caller B ──────────────────────────────────────────────
     let child_b = spawn::new_child(ctx).map_err(|_| "multi_caller_ipc_fifo: new_child B failed")?;
-    let ep_b = cap_copy(ep, child_b.cs, RIGHTS_SEND_GRANT)
+    let ep_b = cap_copy(ep, child_b.cs, RIGHTS_EP_SEND_GRANT)
         .map_err(|_| "multi_caller_ipc_fifo: ep_b failed")?;
-    let done_b =
-        cap_copy(done, child_b.cs, 1 << 7).map_err(|_| "multi_caller_ipc_fifo: done_b failed")?;
+    let done_b = cap_copy(done, child_b.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
+        .map_err(|_| "multi_caller_ipc_fifo: done_b failed")?;
     let arg_b = u64::from(ep_b) | (u64::from(done_b) << 16) | (2u64 << 32);
     let stack_b = ChildStack::top(core::ptr::addr_of!(STACK_B));
     spawn::configure_and_start_pinned(&child_b, caller_entry, stack_b, arg_b, 0)
@@ -73,10 +73,10 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     // ── Build and start caller C ──────────────────────────────────────────────
     let child_c = spawn::new_child(ctx).map_err(|_| "multi_caller_ipc_fifo: new_child C failed")?;
-    let ep_c = cap_copy(ep, child_c.cs, RIGHTS_SEND_GRANT)
+    let ep_c = cap_copy(ep, child_c.cs, RIGHTS_EP_SEND_GRANT)
         .map_err(|_| "multi_caller_ipc_fifo: ep_c failed")?;
-    let done_c =
-        cap_copy(done, child_c.cs, 1 << 7).map_err(|_| "multi_caller_ipc_fifo: done_c failed")?;
+    let done_c = cap_copy(done, child_c.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
+        .map_err(|_| "multi_caller_ipc_fifo: done_c failed")?;
     let arg_c = u64::from(ep_c) | (u64::from(done_c) << 16) | (3u64 << 32);
     let stack_c = ChildStack::top(core::ptr::addr_of!(STACK_C));
     spawn::configure_and_start_pinned(&child_c, caller_entry, stack_c, arg_c, 0)

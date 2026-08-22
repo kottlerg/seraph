@@ -40,7 +40,7 @@ use syscall::SyscallError;
 pub fn sys_mem_map(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::object::{AddressSpaceObject, MemoryObject};
-    use crate::cap::slot::{CapTag, Rights};
+    use crate::cap::slot::{AsRights, MemRights};
     use crate::mm::PAGE_SIZE;
     use crate::mm::paging::PageFlags;
     use crate::syscall::current_tcb;
@@ -101,8 +101,7 @@ pub fn sys_mem_map(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // Resolve Memory cap.
     // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
-    let memory_slot =
-        unsafe { super::lookup_cap(caller_cspace, memory_idx, CapTag::Memory, Rights::MAP) }?;
+    let memory_slot = unsafe { super::lookup_cap(caller_cspace, memory_idx, MemRights::MAP) }?;
     let memory_obj_nn = memory_slot.object.ok_or(SyscallError::InvalidCapability)?;
     // cast_ptr_alignment: header at offset 0; allocator guarantees alignment.
     // SAFETY: tag confirmed Memory; pointer remains valid for the whole syscall
@@ -139,13 +138,13 @@ pub fn sys_mem_map(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // prot_bits) to avoid the W^X check below.
     let (writable, executable) = if prot_bits != 0
     {
-        let w = (prot_bits & 0x2) != 0;
-        let x = (prot_bits & 0x4) != 0;
-        if w && !memory_rights.contains(Rights::WRITE)
+        let w = (prot_bits & syscall::MAP_WRITABLE) != 0;
+        let x = (prot_bits & syscall::MAP_EXECUTABLE) != 0;
+        if w && !memory_rights.contains(MemRights::WRITE.erase())
         {
             return Err(SyscallError::InsufficientRights);
         }
-        if x && !memory_rights.contains(Rights::EXECUTE)
+        if x && !memory_rights.contains(MemRights::EXECUTE.erase())
         {
             return Err(SyscallError::InsufficientRights);
         }
@@ -154,8 +153,8 @@ pub fn sys_mem_map(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     else
     {
         (
-            memory_rights.contains(Rights::WRITE),
-            memory_rights.contains(Rights::EXECUTE),
+            memory_rights.contains(MemRights::WRITE.erase()),
+            memory_rights.contains(MemRights::EXECUTE.erase()),
         )
     };
     // W^X is enforced at mapping time: no page may be both writable and executable.
@@ -172,8 +171,7 @@ pub fn sys_mem_map(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // Resolve AddressSpace cap.
     // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
-    let aspace_slot =
-        unsafe { super::lookup_cap(caller_cspace, aspace_idx, CapTag::AddressSpace, Rights::MAP) }?;
+    let aspace_slot = unsafe { super::lookup_cap(caller_cspace, aspace_idx, AsRights::MAP) }?;
     let (as_ptr, aso_raw) = {
         let obj = aspace_slot.object.ok_or(SyscallError::InvalidCapability)?;
         // cast_ptr_alignment: header at offset 0; allocator guarantees alignment.
@@ -253,7 +251,7 @@ pub fn sys_mem_map(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 pub fn sys_mem_unmap(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::object::AddressSpaceObject;
-    use crate::cap::slot::{CapTag, Rights};
+    use crate::cap::slot::AsRights;
     use crate::mm::PAGE_SIZE;
     use crate::syscall::current_tcb;
     use syscall::MEM_UNMAP_RECLAIM_PTS;
@@ -304,8 +302,7 @@ pub fn sys_mem_unmap(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     }
 
     // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
-    let aspace_slot =
-        unsafe { super::lookup_cap(caller_cspace, aspace_idx, CapTag::AddressSpace, Rights::MAP) }?;
+    let aspace_slot = unsafe { super::lookup_cap(caller_cspace, aspace_idx, AsRights::MAP) }?;
     let (as_ptr, aso_raw) = {
         let obj = aspace_slot.object.ok_or(SyscallError::InvalidCapability)?;
         // cast_ptr_alignment: header at offset 0; allocator guarantees alignment.
@@ -365,7 +362,7 @@ pub fn sys_mem_unmap(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 pub fn sys_mem_protect(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::object::AddressSpaceObject;
-    use crate::cap::slot::{CapTag, Rights};
+    use crate::cap::slot::{AsRights, MemRights};
     use crate::mm::PAGE_SIZE;
     use crate::mm::paging::{PageFlags, PagingError};
     use crate::syscall::current_tcb;
@@ -401,9 +398,10 @@ pub fn sys_mem_protect(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         return Err(SyscallError::InvalidAddress);
     }
 
-    // Parse new protection bits (bit 1 = WRITE, bit 2 = EXECUTE per Rights layout).
-    let writable = (prot_bits & 0x2) != 0;
-    let executable = (prot_bits & 0x4) != 0;
+    // Parse new protection bits (MAP_WRITABLE / MAP_EXECUTABLE share the Memory
+    // rights bit positions; asserted in abi/syscall).
+    let writable = (prot_bits & syscall::MAP_WRITABLE) != 0;
+    let executable = (prot_bits & syscall::MAP_EXECUTABLE) != 0;
 
     // W^X check.
     if writable && executable
@@ -428,18 +426,17 @@ pub fn sys_mem_protect(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // Memory cap authorises the permission level.
     // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
-    let memory_slot =
-        unsafe { super::lookup_cap(caller_cspace, memory_idx, CapTag::Memory, Rights::MAP) }?;
+    let memory_slot = unsafe { super::lookup_cap(caller_cspace, memory_idx, MemRights::MAP) }?;
     // Verify object pointer is valid; rights are read from the slot directly.
     let _ = memory_slot.object.ok_or(SyscallError::InvalidCapability)?;
     let memory_rights = memory_slot.rights;
 
     // Requested permissions must be a subset of what the Memory cap allows.
-    if writable && !memory_rights.contains(Rights::WRITE)
+    if writable && !memory_rights.contains(MemRights::WRITE.erase())
     {
         return Err(SyscallError::InsufficientRights);
     }
-    if executable && !memory_rights.contains(Rights::EXECUTE)
+    if executable && !memory_rights.contains(MemRights::EXECUTE.erase())
     {
         return Err(SyscallError::InsufficientRights);
     }
@@ -452,8 +449,7 @@ pub fn sys_mem_protect(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     };
 
     // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
-    let aspace_slot =
-        unsafe { super::lookup_cap(caller_cspace, aspace_idx, CapTag::AddressSpace, Rights::MAP) }?;
+    let aspace_slot = unsafe { super::lookup_cap(caller_cspace, aspace_idx, AsRights::MAP) }?;
     let as_ptr = {
         let obj = aspace_slot.object.ok_or(SyscallError::InvalidCapability)?;
         // SAFETY: tag confirmed AddressSpace.
@@ -497,7 +493,7 @@ pub fn sys_mem_protect(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 ///
 /// The parent cap stays in its slot; its `size` shrinks to `split_offset`
 /// and its `available_bytes` debits by `(orig_size - split_offset)` (when
-/// the cap carries `Rights::RETYPE`). A new child cap covering
+/// the cap carries `MemRights::RETYPE`). A new child cap covering
 /// `[base + split_offset, base + orig_size)` is inserted in the caller's
 /// `CSpace` and linked as a derivation child of the parent's existing
 /// derivation parent — making it a co-equal sibling of the (now shrunken)
@@ -517,7 +513,7 @@ pub fn sys_memory_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     use crate::cap::object::{KernelObjectHeader, MemoryObject, ObjectType};
     use crate::cap::retype;
     use crate::cap::seed_header_nn;
-    use crate::cap::slot::{CapTag, Rights, SlotId};
+    use crate::cap::slot::{CapTag, MemRights, SlotId};
     use crate::mm::PAGE_SIZE;
     use crate::syscall::current_tcb;
 
@@ -553,15 +549,14 @@ pub fn sys_memory_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     }
 
     // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
-    let parent_slot =
-        unsafe { super::lookup_cap(caller_cspace, memory_handle, CapTag::Memory, Rights::MAP) }?;
+    let parent_slot = unsafe { super::lookup_cap(caller_cspace, memory_handle, MemRights::MAP) }?;
     let parent_obj_nn = parent_slot.object.ok_or(SyscallError::InvalidCapability)?;
     // cast_ptr_alignment: MemoryObject (8-byte) behind KernelObjectHeader header.
     // SAFETY: tag confirmed Memory; pointer is valid MemoryObject.
     #[allow(clippy::cast_ptr_alignment)]
     let parent_ref = unsafe { &*(parent_obj_nn.as_ptr().cast::<MemoryObject>()) };
     let parent_rights = parent_slot.rights;
-    let parent_retypable = parent_rights.contains(Rights::RETYPE);
+    let parent_retypable = parent_rights.contains(MemRights::RETYPE.erase());
     // SAFETY: caller_cspace validated non-null; id() reads discriminator.
     let cspace_id = unsafe { (*caller_cspace).id() };
 
@@ -763,7 +758,7 @@ pub fn sys_memory_merge(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::derivation::{DERIVATION_LOCK, unlink_node};
     use crate::cap::object::{MemoryObject, dealloc_object};
-    use crate::cap::slot::{CapTag, Rights, SlotId};
+    use crate::cap::slot::{MemRights, SlotId};
     use crate::syscall::current_tcb;
 
     let parent_handle = tf.arg(0) as u32;
@@ -793,12 +788,10 @@ pub fn sys_memory_merge(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     }
 
     // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
-    let parent_slot =
-        unsafe { super::lookup_cap(caller_cspace, parent_handle, CapTag::Memory, Rights::MAP) }?;
+    let parent_slot = unsafe { super::lookup_cap(caller_cspace, parent_handle, MemRights::MAP) }?;
     let parent_obj_nn = parent_slot.object.ok_or(SyscallError::InvalidCapability)?;
     // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
-    let tail_slot =
-        unsafe { super::lookup_cap(caller_cspace, tail_handle, CapTag::Memory, Rights::MAP) }?;
+    let tail_slot = unsafe { super::lookup_cap(caller_cspace, tail_handle, MemRights::MAP) }?;
     let tail_obj_nn = tail_slot.object.ok_or(SyscallError::InvalidCapability)?;
 
     if parent_obj_nn == tail_obj_nn
@@ -810,7 +803,7 @@ pub fn sys_memory_merge(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         return Err(SyscallError::InvalidArgument);
     }
     let merged_rights = parent_slot.rights;
-    let merged_retypable = merged_rights.contains(Rights::RETYPE);
+    let merged_retypable = merged_rights.contains(MemRights::RETYPE.erase());
 
     #[allow(clippy::cast_ptr_alignment)]
     // SAFETY: tag confirmed Memory; cap held by caller's CSpace, ref count > 0.

@@ -34,8 +34,10 @@ const TAG_ADDRESS_SPACE: u8 = 2;
 const TAG_SIGNAL: u8 = 4;
 const TAG_CSPACE: u8 = 9;
 
-// Rights bits (kernel/src/cap/slot.rs).
-const RIGHTS_RETYPE_BIT: u32 = 1 << 21;
+// Memory RETYPE bit, cast to the 32-bit rights half of the packed
+// CAP_INFO_TAG_RIGHTS value. The ABI guarantees every rights bit fits u32.
+#[allow(clippy::cast_possible_truncation)]
+const RIGHTS_RETYPE_BIT: u32 = syscall_abi::RIGHTS_MEM_RETYPE as u32;
 
 /// Decode a `CAP_INFO_TAG_RIGHTS` packed return: `(tag << 32) | rights`.
 fn unpack_tag_rights(value: u64) -> (u8, u32)
@@ -166,7 +168,7 @@ pub fn memory_fields(_ctx: &TestContext) -> TestResult
 /// RAM Memory caps minted by the kernel at boot carry the `RETYPE` right.
 ///
 /// Every usable-RAM Memory cap minted by the kernel at Phase 7
-/// (`core/kernel/src/cap/mod.rs`) carries `Rights::RETYPE`. The bit must
+/// (`core/kernel/src/cap/mod.rs`) carries `MemRights::RETYPE`. The bit must
 /// propagate through the cap-routing graph (kernel → init → memmgr →
 /// child via `REQUEST_FRAMES`) so memmgr's consumers can retype frames
 /// into kernel objects under the typed-memory contract.
@@ -207,6 +209,97 @@ pub fn memory_caps_carry_retype_right(ctx: &TestContext) -> TestResult
         return Err("memory_caps_carry_retype_right: MEMORY_HAS_RETYPE != 1");
     }
     Ok(())
+}
+
+/// Kernel creation-mint masks match the ABI's per-type rights numbering.
+///
+/// Creates one object of each userspace-creatable type, reads
+/// `CAP_INFO_TAG_RIGHTS`, and asserts the rights half equals the mask the
+/// kernel mints for that type, built from the named ABI constants. Rights are
+/// scoped per capability type, so a renumbering drift between the kernel's
+/// typed constants and the ABI on any one type fails here behaviourally
+/// rather than surfacing as a misgated syscall elsewhere.
+pub fn creation_masks_match_abi(ctx: &TestContext) -> TestResult
+{
+    // The ABI constants are u64 with all bits in the low 32 (asserted by the
+    // abi host tests); the rights half of the packed value is u32.
+    #[allow(clippy::cast_possible_truncation)]
+    fn mask32(mask: u64) -> u32
+    {
+        mask as u32
+    }
+
+    let check = |cap: u32, expected: u64, what: &'static str| -> TestResult {
+        let value = cap_info(cap, CAP_INFO_TAG_RIGHTS).map_err(|_| what)?;
+        let (_tag, rights) = unpack_tag_rights(value);
+        if rights != mask32(expected)
+        {
+            return Err(what);
+        }
+        Ok(())
+    };
+
+    let ep = syscall::cap_create_endpoint(ctx.memory_base)
+        .map_err(|_| "creation_masks: cap_create_endpoint failed")?;
+    let r = check(
+        ep,
+        syscall_abi::RIGHTS_EP_SEND | syscall_abi::RIGHTS_EP_RECEIVE | syscall_abi::RIGHTS_EP_GRANT,
+        "creation_masks: endpoint mint mask mismatch",
+    );
+    cap_delete(ep).map_err(|_| "creation_masks: cap_delete(endpoint) failed")?;
+    r?;
+
+    let sig = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "creation_masks: cap_create_notification failed")?;
+    let r = check(
+        sig,
+        syscall_abi::RIGHTS_NTF_NOTIFY | syscall_abi::RIGHTS_NTF_WAIT,
+        "creation_masks: notification mint mask mismatch",
+    );
+    cap_delete(sig).map_err(|_| "creation_masks: cap_delete(notification) failed")?;
+    r?;
+
+    let eq = syscall::event_queue_create(ctx.memory_base, 4)
+        .map_err(|_| "creation_masks: event_queue_create failed")?;
+    let r = check(
+        eq,
+        syscall_abi::RIGHTS_EQ_POST | syscall_abi::RIGHTS_EQ_RECV,
+        "creation_masks: event queue mint mask mismatch",
+    );
+    cap_delete(eq).map_err(|_| "creation_masks: cap_delete(event queue) failed")?;
+    r?;
+
+    let ws = syscall::wait_set_create(ctx.memory_base)
+        .map_err(|_| "creation_masks: wait_set_create failed")?;
+    let r = check(
+        ws,
+        syscall_abi::RIGHTS_WS_MODIFY | syscall_abi::RIGHTS_WS_WAIT,
+        "creation_masks: wait set mint mask mismatch",
+    );
+    cap_delete(ws).map_err(|_| "creation_masks: cap_delete(wait set) failed")?;
+    r?;
+
+    let aspace = syscall::cap_create_aspace(ctx.memory_base, 0, 4)
+        .map_err(|_| "creation_masks: cap_create_aspace failed")?;
+    let r = check(
+        aspace,
+        syscall_abi::RIGHTS_AS_MAP | syscall_abi::RIGHTS_AS_READ | syscall_abi::RIGHTS_AS_CONTROL,
+        "creation_masks: address space mint mask mismatch",
+    );
+    cap_delete(aspace).map_err(|_| "creation_masks: cap_delete(aspace) failed")?;
+    r?;
+
+    let cs = cap_create_cspace(ctx.memory_base, 0, 4, 64)
+        .map_err(|_| "creation_masks: cap_create_cspace failed")?;
+    let r = check(
+        cs,
+        syscall_abi::RIGHTS_CS_INSERT
+            | syscall_abi::RIGHTS_CS_DELETE
+            | syscall_abi::RIGHTS_CS_DERIVE,
+        "creation_masks: cspace mint mask mismatch",
+    );
+    cap_delete(cs).map_err(|_| "creation_masks: cap_delete(cspace) failed")?;
+    r
 }
 
 // ── CSpace-specific fields ───────────────────────────────────────────────────

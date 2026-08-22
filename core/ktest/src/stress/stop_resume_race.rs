@@ -74,7 +74,7 @@ use syscall::{
     cap_copy, cap_create_notification, cap_delete, notification_send, notification_wait,
     system_info, thread_exit, thread_start, thread_stop,
 };
-use syscall_abi::{RIGHTS_CONTROL, SystemInfoType};
+use syscall_abi::{RIGHTS_THREAD_CONTROL, SystemInfoType};
 
 use crate::{ChildStack, TestContext, TestResult, spawn};
 
@@ -83,7 +83,7 @@ use crate::{ChildStack, TestContext, TestResult, spawn};
 const CYCLES: usize = 256;
 
 /// Notification signal right (bit 7) — what a child needs to `notification_send`.
-const RIGHTS_SIGNAL: u64 = 1 << 7;
+const RIGHTS_SIGNAL: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
 
 /// Bounded barrier spin: a racer stops waiting after this many iterations even
 /// if [`RELEASE`] never flips (defense-in-depth against a lost release — the
@@ -166,7 +166,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         // ── STOPPER: CONTROL on victim + signal on done; pinned stop_cpu. ────
         let stopper =
             spawn::new_child(ctx).map_err(|_| "stress::stop_resume_race: spawn stopper failed")?;
-        let stopper_victim = cap_copy(victim.th, stopper.cs, RIGHTS_CONTROL)
+        let stopper_victim = cap_copy(victim.th, stopper.cs, RIGHTS_THREAD_CONTROL)
             .map_err(|_| "stress::stop_resume_race: cap_copy stopper victim failed")?;
         let stopper_done = cap_copy(done, stopper.cs, RIGHTS_SIGNAL)
             .map_err(|_| "stress::stop_resume_race: cap_copy stopper done failed")?;
@@ -187,7 +187,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         // ── STARTER: CONTROL on victim + signal on done; pinned start_cpu. ───
         let starter =
             spawn::new_child(ctx).map_err(|_| "stress::stop_resume_race: spawn starter failed")?;
-        let starter_victim = cap_copy(victim.th, starter.cs, RIGHTS_CONTROL)
+        let starter_victim = cap_copy(victim.th, starter.cs, RIGHTS_THREAD_CONTROL)
             .map_err(|_| "stress::stop_resume_race: cap_copy starter victim failed")?;
         let starter_done = cap_copy(done, starter.cs, RIGHTS_SIGNAL)
             .map_err(|_| "stress::stop_resume_race: cap_copy starter done failed")?;

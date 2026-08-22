@@ -33,9 +33,9 @@ use syscall_abi::SystemInfoType;
 use crate::{ChildStack, TestContext, TestResult, spawn};
 
 /// SEND | GRANT (bits 4 and 6) — the child needs SEND to issue `ipc_call`.
-const RIGHTS_SEND_GRANT: u64 = (1 << 4) | (1 << 6);
+use syscall_abi::RIGHTS_EP_SEND_GRANT;
 /// Notification right (bit 7) — covers both `notification_send` and `notification_wait`.
-const RIGHTS_NOTIFY: u64 = 1 << 7;
+const RIGHTS_NOTIFY: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
 
 /// 64-bit pattern loaded into every FP register before the call.
 const PATTERN: u64 = 0xA5A5_A5A5_A5A5_A5A5;
@@ -320,7 +320,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     let child =
         spawn::new_child(ctx).map_err(|_| "fpu_survives_ipc_call: spawn::new_child failed")?;
-    let child_ep = cap_copy(ep, child.cs, RIGHTS_SEND_GRANT)
+    let child_ep = cap_copy(ep, child.cs, RIGHTS_EP_SEND_GRANT)
         .map_err(|_| "fpu_survives_ipc_call: cap_copy ep failed")?;
     let child_done = cap_copy(done, child.cs, RIGHTS_NOTIFY)
         .map_err(|_| "fpu_survives_ipc_call: cap_copy done failed")?;

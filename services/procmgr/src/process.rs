@@ -202,7 +202,7 @@ impl TableExt for ProcessTable
     ///
     /// `direction` is one of `ipc::procmgr_labels::PIPE_DIR_STDIN`,
     /// `PIPE_DIR_STDOUT`, `PIPE_DIR_STDERR`. The three caps are
-    /// `cap_copy`'d into the child's `CSpace` with `RIGHTS_MAP_RW` for
+    /// `cap_copy`'d into the child's `CSpace` with `RIGHTS_MEM_MAP_RW` for
     /// the memory cap and `RIGHTS_ALL` for the two notifications (notification objects
     /// don't currently distinguish send/wait at the cap-rights level —
     /// each peer holds a full cap and uses send or wait as appropriate).
@@ -252,7 +252,7 @@ impl TableExt for ProcessTable
         // lives at offset 0 per the ABI.
         let pi = unsafe { process_abi::process_info_mut(scratch_va) };
 
-        let memory_slot = syscall::cap_copy(memory_cap, child_cspace, syscall::RIGHTS_MAP_RW)
+        let memory_slot = syscall::cap_copy(memory_cap, child_cspace, syscall::RIGHTS_MEM_MAP_RW)
             .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
         let data_slot = syscall::cap_copy(data_notification, child_cspace, syscall::RIGHTS_ALL)
             .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
@@ -551,7 +551,7 @@ fn populate_child_info(
         // creator_endpoint doubles as a recv endpoint, e.g. fatfs service ep);
         // fall back to SEND for badged send caps used by the bootstrap protocol.
         syscall::cap_copy(creator_endpoint, child_cspace, syscall::RIGHTS_ALL)
-            .or_else(|_| syscall::cap_copy(creator_endpoint, child_cspace, syscall::RIGHTS_SEND))
+            .or_else(|_| syscall::cap_copy(creator_endpoint, child_cspace, syscall::RIGHTS_EP_SEND))
             .ok()?
     }
     else
@@ -578,11 +578,12 @@ fn populate_child_info(
     {
         let badged = syscall::cap_derive_badge(
             universals.procmgr_endpoint,
-            syscall::RIGHTS_SEND_GRANT,
+            syscall::RIGHTS_EP_SEND_GRANT,
             process_badge,
         )
         .ok()?;
-        let in_child = syscall::cap_copy(badged, child_cspace, syscall::RIGHTS_SEND_GRANT).ok()?;
+        let in_child =
+            syscall::cap_copy(badged, child_cspace, syscall::RIGHTS_EP_SEND_GRANT).ok()?;
         let _ = syscall::cap_delete(badged);
         in_child
     }
@@ -603,11 +604,12 @@ fn populate_child_info(
     {
         let proc_side = syscall::cap_derive_badge(
             universals.log_send_source,
-            syscall::RIGHTS_SEND,
+            syscall::RIGHTS_EP_SEND,
             process_badge,
         )
         .ok()?;
-        let child_side = syscall::cap_copy(proc_side, child_cspace, syscall::RIGHTS_SEND).ok()?;
+        let child_side =
+            syscall::cap_copy(proc_side, child_cspace, syscall::RIGHTS_EP_SEND).ok()?;
         let _ = syscall::cap_delete(proc_side);
         child_side
     }
@@ -626,11 +628,11 @@ fn populate_child_info(
     {
         let proc_side = syscall::cap_derive_badge(
             universals.registry_send_source,
-            syscall::RIGHTS_SEND,
+            syscall::RIGHTS_EP_SEND,
             process_badge,
         )
         .ok()?;
-        let Ok(child_side) = syscall::cap_copy(proc_side, child_cspace, syscall::RIGHTS_SEND)
+        let Ok(child_side) = syscall::cap_copy(proc_side, child_cspace, syscall::RIGHTS_EP_SEND)
         else
         {
             let _ = syscall::cap_delete(proc_side);
@@ -718,7 +720,7 @@ fn populate_child_info(
         syscall::cap_copy(
             universals.memmgr_endpoint,
             child_cspace,
-            syscall::RIGHTS_SEND_GRANT,
+            syscall::RIGHTS_EP_SEND_GRANT,
         )
         .ok()?
     }
@@ -826,7 +828,7 @@ fn populate_child_info(
 
     drop(scratch);
 
-    let pi_ro = syscall::cap_derive(pi_memory, syscall::RIGHTS_MAP_READ).ok()?;
+    let pi_ro = syscall::cap_derive(pi_memory, syscall::RIGHTS_MEM_MAP_RO).ok()?;
     syscall::mem_map(pi_ro, child_aspace, layout.process_info_va, 0, 1, 0).ok()?;
     // pi_memory stays in procmgr's CSpace as the teardown handle (revoke
     // cascades to any descendants); the mapping doesn't need pi_ro to
@@ -918,7 +920,7 @@ fn finalize_main_tls(alloc: MainTlsAlloc, _self_aspace: u32, child_aspace: u32) 
 
     drop(alloc.scratch);
 
-    let tls_rw = syscall::cap_derive(alloc.memory_cap, syscall::RIGHTS_MAP_RW).ok()?;
+    let tls_rw = syscall::cap_derive(alloc.memory_cap, syscall::RIGHTS_MEM_MAP_RW).ok()?;
     syscall::mem_map(tls_rw, child_aspace, alloc.tls_block_base, 0, 1, 0).ok()?;
     // alloc.memory_cap stays as the teardown handle; tls_rw is transient.
     let _ = syscall::cap_delete(tls_rw);
@@ -1060,7 +1062,7 @@ fn map_child_stack_and_ipc(
     for i in 0..stack_pages
     {
         let memory_cap = crate::memmgr_alloc_page(child_memmgr_send, ipc_buf)?;
-        let rw = syscall::cap_derive(memory_cap, syscall::RIGHTS_MAP_RW).ok()?;
+        let rw = syscall::cap_derive(memory_cap, syscall::RIGHTS_MEM_MAP_RW).ok()?;
         syscall::mem_map(
             rw,
             child_aspace,
@@ -1077,7 +1079,7 @@ fn map_child_stack_and_ipc(
     }
 
     let ipc_memory = crate::memmgr_alloc_page(child_memmgr_send, ipc_buf)?;
-    let ipc_rw = syscall::cap_derive(ipc_memory, syscall::RIGHTS_MAP_RW).ok()?;
+    let ipc_rw = syscall::cap_derive(ipc_memory, syscall::RIGHTS_MEM_MAP_RW).ok()?;
     syscall::mem_map(ipc_rw, child_aspace, layout.ipc_buffer_va, 0, 1, 0).ok()?;
     let _ = syscall::cap_delete(ipc_rw);
     let _ = syscall::cap_delete(ipc_memory);
@@ -1248,7 +1250,7 @@ fn finalize_creation(
     // Derive a badged endpoint cap for the caller. The badge identifies this
     // process on subsequent START_PROCESS / REQUEST_MEMORY_CAPS calls.
     let process_handle =
-        syscall::cap_derive_badge(self_endpoint, syscall::RIGHTS_SEND_GRANT, badge).ok()?;
+        syscall::cap_derive_badge(self_endpoint, syscall::RIGHTS_EP_SEND_GRANT, badge).ok()?;
     let Ok(thread_for_caller) = syscall::cap_derive(child_thread, syscall::RIGHTS_THREAD)
     else
     {
@@ -1299,8 +1301,10 @@ fn finalize_creation(
         // Mask out CONTROL: memmgr only maps pages into the AS; the authority
         // to register terminal-fault death observers stays with procmgr (the
         // creator), which holds the CONTROL-bearing `child_aspace`.
-        if let Ok(as_copy) =
-            syscall::cap_derive(child_aspace, syscall::RIGHTS_ALL & !syscall::RIGHTS_CONTROL)
+        if let Ok(as_copy) = syscall::cap_derive(
+            child_aspace,
+            syscall::RIGHTS_ALL & !syscall::RIGHTS_AS_CONTROL,
+        )
         {
             let msg = IpcMessage::builder(memmgr_labels::DELEGATE_ASPACE)
                 .word(0, memmgr_badge)
@@ -2637,16 +2641,19 @@ pub fn start_process(badge: u64, table: &mut ProcessTable, self_aspace: u32) -> 
         let pi = unsafe { process_abi::process_info_mut(scratch_va) };
         if entry.namespace_override != 0
         {
-            let slot =
-                syscall::cap_copy(entry.namespace_override, child_cspace, syscall::RIGHTS_SEND)
-                    .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
+            let slot = syscall::cap_copy(
+                entry.namespace_override,
+                child_cspace,
+                syscall::RIGHTS_EP_SEND,
+            )
+            .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
             pi.system_root_cap = slot;
             let _ = syscall::cap_delete(entry.namespace_override);
             entry.namespace_override = 0;
         }
         if entry.cwd_override != 0
         {
-            let slot = syscall::cap_copy(entry.cwd_override, child_cspace, syscall::RIGHTS_SEND)
+            let slot = syscall::cap_copy(entry.cwd_override, child_cspace, syscall::RIGHTS_EP_SEND)
                 .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
             pi.current_dir_cap = slot;
             let _ = syscall::cap_delete(entry.cwd_override);

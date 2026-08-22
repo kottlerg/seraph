@@ -62,7 +62,7 @@ fn main()
     };
 
     let mut derived: u32 = 0;
-    while syscall::cap_derive(ep, syscall::RIGHTS_SEND).is_ok()
+    while syscall::cap_derive(ep, syscall::RIGHTS_EP_SEND).is_ok()
     {
         derived += 1;
     }

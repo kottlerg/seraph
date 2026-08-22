@@ -272,7 +272,7 @@ fn main() -> !
                     // response to a REGISTER_PARTITION call.
                     if let Ok(derived) = syscall::cap_derive_badge(
                         blk_ep,
-                        syscall::RIGHTS_SEND_GRANT,
+                        syscall::RIGHTS_EP_SEND_GRANT,
                         ipc::blk_labels::MOUNT_AUTHORITY,
                     )
                     {
@@ -323,7 +323,7 @@ fn main() -> !
                     // its RX-notify notification cap to the driver.
                     if let Ok(derived) = syscall::cap_derive_badge(
                         serial_ep,
-                        syscall::RIGHTS_SEND_GRANT,
+                        syscall::RIGHTS_EP_SEND_GRANT,
                         ipc::serial_labels::WRITE_AUTHORITY | ipc::serial_labels::READ_AUTHORITY,
                     )
                     {
@@ -369,7 +369,7 @@ fn main() -> !
                 {
                     if let Ok(derived) = syscall::cap_derive_badge(
                         fb_ep,
-                        syscall::RIGHTS_SEND_GRANT,
+                        syscall::RIGHTS_EP_SEND_GRANT,
                         ipc::fb_labels::WRITE_AUTHORITY,
                     )
                     {
@@ -515,7 +515,7 @@ fn main() -> !
                 {
                     if let Ok(derived) = syscall::cap_derive_badge(
                         rtc_ep,
-                        syscall::RIGHTS_SEND_GRANT,
+                        syscall::RIGHTS_EP_SEND_GRANT,
                         ipc::rtc_labels::READ_AUTHORITY,
                     )
                     {
@@ -566,7 +566,7 @@ fn main() -> !
                     // verb bit on the input driver's service endpoint.
                     if let Ok(derived) = syscall::cap_derive_badge(
                         input_ep,
-                        syscall::RIGHTS_SEND_GRANT,
+                        syscall::RIGHTS_EP_SEND_GRANT,
                         ipc::input_labels::READ_AUTHORITY,
                     )
                     {
@@ -1816,7 +1816,7 @@ fn spawn_framebuffer(
     // Badged devmgr-query endpoint so the driver can call
     // QUERY_DEVICE_INFO and retrieve its FramebufferInfo.
     let Ok(devmgr_query_ep) =
-        syscall::cap_derive_badge(caps.registry_ep, syscall::RIGHTS_SEND, device_badge)
+        syscall::cap_derive_badge(caps.registry_ep, syscall::RIGHTS_EP_SEND, device_badge)
     else
     {
         std::os::seraph::log!("framebuffer: failed to derive badged query ep");
@@ -1964,7 +1964,8 @@ fn test_spawn_orphan(
             .unwrap_or(0);
     // Non-zero query endpoint forces the two-round protocol so round 2 is reached.
     let query_ep =
-        syscall::cap_derive_badge(caps.registry_ep, syscall::RIGHTS_SEND, QUERY_BADGE).unwrap_or(0);
+        syscall::cap_derive_badge(caps.registry_ep, syscall::RIGHTS_EP_SEND, QUERY_BADGE)
+            .unwrap_or(0);
     if service_ep == 0 || hw_cap == 0 || query_ep == 0
     {
         std::os::seraph::log!("test-orphan: failed to mint shim caps");

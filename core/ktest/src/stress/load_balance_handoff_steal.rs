@@ -87,7 +87,7 @@ use syscall::{
     cap_copy, cap_create_endpoint, cap_create_notification, cap_delete, ipc_buffer_set,
     notification_send, notification_wait, system_info, thread_exit, thread_sleep,
 };
-use syscall_abi::{RIGHTS_RECEIVE, RIGHTS_SEND_GRANT, SystemInfoType};
+use syscall_abi::{RIGHTS_EP_RECEIVE, RIGHTS_EP_SEND_GRANT, SystemInfoType};
 
 use crate::{ChildStack, TestContext, TestResult, spawn};
 
@@ -116,7 +116,7 @@ const SAMPLE_EVERY: usize = 64;
 const MIGRATION_GUARD_MAX_CPUS: u64 = 32;
 
 /// Notification signal right (bit 7) — what a client needs to `notification_send`.
-const RIGHTS_SIGNAL: u64 = 1 << 7;
+const RIGHTS_SIGNAL: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
 
 /// A page-aligned 4 KiB IPC buffer page (`MSG_DATA_WORDS_MAX`-wide, like ktest's
 /// own `IPC_BUF`). One per concurrent child: clients and servers issue IPC
@@ -182,7 +182,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 
         let server = spawn::new_child(ctx)
             .map_err(|_| "stress::load_balance_handoff_steal: spawn server failed")?;
-        let server_ep = cap_copy(ep, server.cs, RIGHTS_RECEIVE)
+        let server_ep = cap_copy(ep, server.cs, RIGHTS_EP_RECEIVE)
             .map_err(|_| "stress::load_balance_handoff_steal: cap_copy server ep failed")?;
         // arg packs ep_slot[15:0] | buf_index[31:16]; servers use buffers
         // [NUM_PAIRS, 2*NUM_PAIRS).
@@ -206,7 +206,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     {
         let client = spawn::new_child(ctx)
             .map_err(|_| "stress::load_balance_handoff_steal: spawn client failed")?;
-        let client_ep = cap_copy(eps[i], client.cs, RIGHTS_SEND_GRANT)
+        let client_ep = cap_copy(eps[i], client.cs, RIGHTS_EP_SEND_GRANT)
             .map_err(|_| "stress::load_balance_handoff_steal: cap_copy client ep failed")?;
         let client_done = cap_copy(done, client.cs, RIGHTS_SIGNAL)
             .map_err(|_| "stress::load_balance_handoff_steal: cap_copy client done failed")?;

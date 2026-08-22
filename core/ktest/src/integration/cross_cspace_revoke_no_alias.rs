@@ -47,9 +47,9 @@ use syscall_abi::{SyscallError, cap_handle_gen, cap_handle_index};
 use crate::{ChildStack, TestContext, TestResult};
 
 // NOTIFY (bit 7) — send only; WAIT (bit 8) — wait only; SEND|GRANT (bits 4,6).
-const RIGHTS_NOTIFY: u64 = 1 << 7;
-const RIGHTS_WAIT: u64 = 1 << 8;
-const RIGHTS_SEND_GRANT: u64 = (1 << 4) | (1 << 6);
+const RIGHTS_NOTIFY: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
+const RIGHTS_WAIT: u64 = syscall_abi::RIGHTS_NTF_WAIT;
+use syscall_abi::RIGHTS_EP_SEND_GRANT;
 
 // Verdict codes the child reports on `report`. Distinct single bits so the
 // parent can name the exact failure. `0` is reserved for the wait-timeout path.
@@ -94,7 +94,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     // reply.
     let child = crate::spawn::new_child(ctx)
         .map_err(|_| "cross_cspace_revoke_no_alias: spawn::new_child failed")?;
-    let child_ep = cap_copy(ep, child.cs, RIGHTS_SEND_GRANT)
+    let child_ep = cap_copy(ep, child.cs, RIGHTS_EP_SEND_GRANT)
         .map_err(|_| "cross_cspace_revoke_no_alias: cap_copy (child_ep) failed")?;
     let child_go = cap_copy(go, child.cs, RIGHTS_WAIT)
         .map_err(|_| "cross_cspace_revoke_no_alias: cap_copy (child_go) failed")?;

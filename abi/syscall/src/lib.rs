@@ -509,10 +509,12 @@ pub const IPC_REPLY_TRANSFER_FAILED: u64 = u64::MAX;
 
 // ── Mapping protection bits ──────────────────────────────────────────────────
 
-/// Mapping protection: writable. Bit 1, matching the kernel `Rights::WRITE` layout.
+/// Mapping protection: writable. Bit 1, matching the Memory rights layout
+/// (`RIGHTS_MEM_WRITE`).
 pub const MAP_WRITABLE: u64 = 0x2;
 
-/// Mapping protection: executable. Bit 2, matching the kernel `Rights::EXECUTE` layout.
+/// Mapping protection: executable. Bit 2, matching the Memory rights layout
+/// (`RIGHTS_MEM_EXECUTE`).
 pub const MAP_EXECUTABLE: u64 = 0x4;
 
 /// Mapping protection: read-only (no WRITE, no EXECUTE).
@@ -520,8 +522,7 @@ pub const MAP_EXECUTABLE: u64 = 0x4;
 /// Passed as `prot_bits` to `SYS_MEM_MAP`; equivalent to 0 but more explicit.
 pub const MAP_READONLY: u64 = 0;
 
-/// Mapping protection: explicit read-only. Bit 0, matching the kernel
-/// `Rights::READ` layout.
+/// Mapping protection: explicit read-only. Bit 0.
 ///
 /// Unlike `MAP_READONLY` (= 0, which derives permissions from the Memory
 /// cap's rights), this nonzero value forces a read-only mapping regardless
@@ -548,75 +549,183 @@ pub const MEM_UNMAP_RECLAIM_PTS: u64 = 0x1;
 
 // ── Capability rights masks ─────────────────────────────────────────────────
 //
-// `u64` masks for `cap_derive` / `cap_copy` / `cap_insert` rights parameters.
-// Bit positions match the kernel `Rights` type (`kernel/src/cap/slot.rs`).
+// `u64` masks for `cap_derive` / `cap_copy` / `cap_insert` rights parameters
+// and the rights half of `CAP_INFO_TAG_RIGHTS`. Rights are scoped per
+// capability type: the kernel stores one 32-bit rights word per slot and
+// interprets it through the slot's type tag, so every type numbers its bits
+// from 0 in its own full-width space. These constants are the single source
+// of truth; the kernel's typed rights constants are derived from them.
+//
+// A mask is only meaningful for the capability type it is named for. Applying
+// another type's mask to a derive/copy attenuates whatever bits of the target
+// type happen to share those positions — always pick the constant named for
+// the cap being attenuated.
 
-/// All rights — pass through whatever the source cap has. Equivalent to `!0u64`.
+/// All rights — pass through whatever the source cap has. Equivalent to
+/// `!0u64`; valid for every capability type.
 pub const RIGHTS_ALL: u64 = !0u64;
 
-/// Send-only IPC endpoint: may call but not receive or grant caps.
-pub const RIGHTS_SEND: u64 = 1 << 4;
+// Memory ──
 
-/// Receive-only IPC endpoint: may accept calls but not call out or grant caps.
-pub const RIGHTS_RECEIVE: u64 = 1 << 5;
+/// Memory: may map this memory into an address space.
+pub const RIGHTS_MEM_MAP: u64 = 1 << 0;
 
-/// Send + grant: may call and include capabilities in messages.
-pub const RIGHTS_SEND_GRANT: u64 = (1 << 4) | (1 << 6);
+/// Memory: authority to create writable mappings from this memory.
+pub const RIGHTS_MEM_WRITE: u64 = 1 << 1;
+
+/// Memory: authority to create executable mappings from this memory.
+pub const RIGHTS_MEM_EXECUTE: u64 = 1 << 2;
+
+/// Memory: read-only firmware/boot-module region marker (map-only authority
+/// carried by firmware-table, boot-module, and init-segment Memory caps).
+pub const RIGHTS_MEM_READ: u64 = 1 << 3;
+
+/// Memory: authority to retype this region into kernel objects.
+///
+/// Held by RAM Memory caps minted from buddy at boot; never held by firmware-
+/// table / boot-module / init-segment Memory caps. Required by every retype-
+/// consuming syscall.
+pub const RIGHTS_MEM_RETYPE: u64 = 1 << 4;
 
 /// Memory: map read-only.
-pub const RIGHTS_MAP_READ: u64 = 1 << 0;
+pub const RIGHTS_MEM_MAP_RO: u64 = RIGHTS_MEM_MAP;
 
 /// Memory: map read-write.
-pub const RIGHTS_MAP_RW: u64 = (1 << 0) | (1 << 1);
+pub const RIGHTS_MEM_MAP_RW: u64 = RIGHTS_MEM_MAP | RIGHTS_MEM_WRITE;
 
 /// Memory: map read-execute.
-pub const RIGHTS_MAP_RX: u64 = (1 << 0) | (1 << 2);
+pub const RIGHTS_MEM_MAP_RX: u64 = RIGHTS_MEM_MAP | RIGHTS_MEM_EXECUTE;
 
-/// Thread: full control (start, stop, configure, observe).
-pub const RIGHTS_THREAD: u64 = (1 << 11) | (1 << 12);
+// AddressSpace ──
 
-/// `CSpace`: full management (insert, delete, derive, revoke).
-pub const RIGHTS_CSPACE: u64 = (1 << 13) | (1 << 14) | (1 << 15) | (1 << 16);
+/// `AddressSpace`: may map into this address space.
+pub const RIGHTS_AS_MAP: u64 = 1 << 0;
+
+/// `AddressSpace`: may read/inspect mappings (`SYS_ASPACE_QUERY`).
+pub const RIGHTS_AS_READ: u64 = 1 << 1;
+
+/// `AddressSpace`: control authority — permits registering terminal-fault
+/// death observers (`aspace_bind_notification`). Held by the object's
+/// creator; mask it out of derived copies handed to components that only
+/// need to map within the space.
+pub const RIGHTS_AS_CONTROL: u64 = 1 << 2;
+
+// Endpoint ──
+
+/// Endpoint: send-only — may call but not receive or grant caps.
+pub const RIGHTS_EP_SEND: u64 = 1 << 0;
+
+/// Endpoint: receive-only — may accept calls but not call out or grant caps.
+pub const RIGHTS_EP_RECEIVE: u64 = 1 << 1;
+
+/// Endpoint: may include capabilities in IPC messages.
+pub const RIGHTS_EP_GRANT: u64 = 1 << 2;
+
+/// Endpoint: send + grant — may call and include capabilities in messages.
+pub const RIGHTS_EP_SEND_GRANT: u64 = RIGHTS_EP_SEND | RIGHTS_EP_GRANT;
+
+// Notification ──
+
+/// Notification: may signal the notification object.
+pub const RIGHTS_NTF_NOTIFY: u64 = 1 << 0;
+
+/// Notification: may wait on the notification object.
+pub const RIGHTS_NTF_WAIT: u64 = 1 << 1;
+
+// EventQueue ──
 
 /// `EventQueue`: post-only. Permits `event_post` and binding as a
 /// notification observer (`thread_bind_notification` /
 /// `aspace_bind_notification`), but not draining (`RECV`). Derive a copy
 /// narrowed to this right to hand a queue to another component as a
 /// write-only sink while retaining `RECV` on the original.
-pub const RIGHTS_POST: u64 = 1 << 9;
+pub const RIGHTS_EQ_POST: u64 = 1 << 0;
 
-/// Control authority over a kernel object. On a `Thread` cap it permits
-/// start/stop/configure; on an `AddressSpace` cap it permits registering
-/// terminal-fault death observers (`aspace_bind_notification`). Held by
-/// the object's creator; mask it out of derived copies handed to
-/// components that only need to map or run within the object.
-pub const RIGHTS_CONTROL: u64 = 1 << 11;
+/// `EventQueue`: may receive (drain) entries from the queue.
+pub const RIGHTS_EQ_RECV: u64 = 1 << 1;
 
-/// Memory: authority to retype memory into kernel objects.
-///
-/// Held by RAM Memory caps minted from buddy at boot; never held by firmware-
-/// table / boot-module / init-segment Memory caps. Required by every retype-
-/// consuming syscall.
-pub const RIGHTS_RETYPE: u64 = 1 << 21;
+// Interrupt ──
+
+/// Interrupt: may register/acknowledge the line and receive its
+/// notifications.
+pub const RIGHTS_IRQ_NOTIFY: u64 = 1 << 0;
+
+// Mmio ──
+
+/// Mmio: may map the MMIO region into an address space.
+pub const RIGHTS_MMIO_MAP: u64 = 1 << 0;
+
+/// Mmio: may map the MMIO region writable.
+pub const RIGHTS_MMIO_WRITE: u64 = 1 << 1;
+
+// Thread ──
+
+/// Thread: may start, stop, and configure the thread.
+pub const RIGHTS_THREAD_CONTROL: u64 = 1 << 0;
+
+/// Thread: may read thread register state.
+pub const RIGHTS_THREAD_OBSERVE: u64 = 1 << 1;
+
+/// Thread: full control (start, stop, configure, observe).
+pub const RIGHTS_THREAD: u64 = RIGHTS_THREAD_CONTROL | RIGHTS_THREAD_OBSERVE;
+
+// CSpace ──
+
+/// `CSpace`: may insert a capability into a slot.
+pub const RIGHTS_CS_INSERT: u64 = 1 << 0;
+
+/// `CSpace`: may clear a slot.
+pub const RIGHTS_CS_DELETE: u64 = 1 << 1;
+
+/// `CSpace`: may derive a new capability from an existing slot.
+pub const RIGHTS_CS_DERIVE: u64 = 1 << 2;
+
+/// `CSpace`: may revoke a capability and all its descendants.
+pub const RIGHTS_CS_REVOKE: u64 = 1 << 3;
+
+/// `CSpace`: full management (insert, delete, derive, revoke).
+pub const RIGHTS_CSPACE: u64 =
+    RIGHTS_CS_INSERT | RIGHTS_CS_DELETE | RIGHTS_CS_DERIVE | RIGHTS_CS_REVOKE;
+
+// WaitSet ──
+
+/// Wait set: may add or remove members.
+pub const RIGHTS_WS_MODIFY: u64 = 1 << 0;
+
+/// Wait set: may poll/wait on the set.
+pub const RIGHTS_WS_WAIT: u64 = 1 << 1;
+
+// IoPort ──
+
+/// `IoPort`: may bind the port range to a thread for in/out access.
+pub const RIGHTS_IOPORT_USE: u64 = 1 << 0;
+
+// SbiControl (SchedControl carries no rights bits: presence + band is the
+// authority) ──
 
 /// `SbiControl`: may forward the SBI System Reset (SRST) extension (RISC-V only).
-pub const RIGHTS_SBI_RESET: u64 = 1 << 20;
+pub const RIGHTS_SBI_RESET: u64 = 1 << 0;
 
 /// `SbiControl`: may forward the SBI System Suspend (SUSP) extension (RISC-V only).
-pub const RIGHTS_SBI_SUSPEND: u64 = 1 << 22;
+pub const RIGHTS_SBI_SUSPEND: u64 = 1 << 1;
 
 /// `SbiControl`: may forward the SBI CPPC perf-control extension (RISC-V only).
-pub const RIGHTS_SBI_CPPC: u64 = 1 << 23;
+pub const RIGHTS_SBI_CPPC: u64 = 1 << 2;
 
 /// `SbiControl`: may forward the read-only SBI Base extension (RISC-V only).
-pub const RIGHTS_SBI_BASE: u64 = 1 << 24;
+pub const RIGHTS_SBI_BASE: u64 = 1 << 3;
 
 /// `SbiControl`: may forward the SBI Debug Console (DBCN) extension (RISC-V only).
-pub const RIGHTS_SBI_DBCN: u64 = 1 << 25;
+pub const RIGHTS_SBI_DBCN: u64 = 1 << 4;
 
 /// `SbiControl`: may forward the SBI Performance Monitoring Unit (PMU) extension
 /// (RISC-V only).
-pub const RIGHTS_SBI_PMU: u64 = 1 << 26;
+pub const RIGHTS_SBI_PMU: u64 = 1 << 5;
+
+// ABI contract: SYS_MEM_MAP / SYS_MEM_PROTECT prot bits share the Memory
+// rights bit positions; the kernel's prot decode depends on this identity.
+const _: () = assert!(MAP_WRITABLE == RIGHTS_MEM_WRITE);
+const _: () = assert!(MAP_EXECUTABLE == RIGHTS_MEM_EXECUTE);
 
 // ── Exit reason constants ─────────────────────────────────────────────────────
 //
@@ -845,4 +954,85 @@ pub enum SystemInfoType
     /// Useful for diagnostics and for verifying affinity / migration
     /// behaviour from userspace.
     CurrentCpu = 7,
+}
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+
+    // Defects guarded: a per-bit rights constant that overlaps another bit of
+    // the same capability type (attenuating one right would silently attenuate
+    // the other), and a bit at position >= 32 (silently truncated by the
+    // kernel's u64 -> u32 rights decode).
+    #[test]
+    fn per_type_rights_bits_are_single_disjoint_and_fit_u32()
+    {
+        let spaces: &[&[u64]] = &[
+            // Memory
+            &[
+                RIGHTS_MEM_MAP,
+                RIGHTS_MEM_WRITE,
+                RIGHTS_MEM_EXECUTE,
+                RIGHTS_MEM_READ,
+                RIGHTS_MEM_RETYPE,
+            ],
+            // AddressSpace
+            &[RIGHTS_AS_MAP, RIGHTS_AS_READ, RIGHTS_AS_CONTROL],
+            // Endpoint
+            &[RIGHTS_EP_SEND, RIGHTS_EP_RECEIVE, RIGHTS_EP_GRANT],
+            // Notification
+            &[RIGHTS_NTF_NOTIFY, RIGHTS_NTF_WAIT],
+            // EventQueue
+            &[RIGHTS_EQ_POST, RIGHTS_EQ_RECV],
+            // Interrupt
+            &[RIGHTS_IRQ_NOTIFY],
+            // Mmio
+            &[RIGHTS_MMIO_MAP, RIGHTS_MMIO_WRITE],
+            // Thread
+            &[RIGHTS_THREAD_CONTROL, RIGHTS_THREAD_OBSERVE],
+            // CSpace
+            &[
+                RIGHTS_CS_INSERT,
+                RIGHTS_CS_DELETE,
+                RIGHTS_CS_DERIVE,
+                RIGHTS_CS_REVOKE,
+            ],
+            // WaitSet
+            &[RIGHTS_WS_MODIFY, RIGHTS_WS_WAIT],
+            // IoPort
+            &[RIGHTS_IOPORT_USE],
+            // SbiControl
+            &[
+                RIGHTS_SBI_RESET,
+                RIGHTS_SBI_SUSPEND,
+                RIGHTS_SBI_CPPC,
+                RIGHTS_SBI_BASE,
+                RIGHTS_SBI_DBCN,
+                RIGHTS_SBI_PMU,
+            ],
+        ];
+
+        for bits in spaces
+        {
+            let mut seen: u64 = 0;
+            for &bit in *bits
+            {
+                assert!(
+                    bit.is_power_of_two(),
+                    "rights bit {bit:#x} is not a single bit"
+                );
+                assert!(
+                    bit < (1u64 << 32),
+                    "rights bit {bit:#x} exceeds the 32-bit slot word"
+                );
+                assert_eq!(
+                    seen & bit,
+                    0,
+                    "rights bit {bit:#x} overlaps another of its type"
+                );
+                seen |= bit;
+            }
+        }
+    }
 }

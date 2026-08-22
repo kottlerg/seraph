@@ -41,7 +41,7 @@ pub struct ServiceThreadCaps
 fn derive_badged_creator(bootstrap_ep: u32) -> Option<(u32, u64)>
 {
     let badge = crate::bootstrap::mint_bootstrap_badge()?;
-    let badged = syscall::cap_derive_badge(bootstrap_ep, syscall::RIGHTS_SEND, badge).ok()?;
+    let badged = syscall::cap_derive_badge(bootstrap_ep, syscall::RIGHTS_EP_SEND, badge).ok()?;
     Some((badged, badge))
 }
 
@@ -70,7 +70,7 @@ fn configure_child_namespace(
     ipc_buf: *mut u64,
 ) -> bool
 {
-    let Ok(ns_cap) = syscall::cap_copy(system_root_cap, init_self_cspace, syscall::RIGHTS_SEND)
+    let Ok(ns_cap) = syscall::cap_copy(system_root_cap, init_self_cspace, syscall::RIGHTS_EP_SEND)
     else
     {
         log("phase 3: cap_copy of system root for child failed");
@@ -664,12 +664,12 @@ pub fn create_devmgr_with_caps(
     }
     else
     {
-        // RIGHTS_SEND_GRANT (not bare SEND): PUBLISH_ENDPOINT carries the
+        // RIGHTS_EP_SEND_GRANT (not bare SEND): PUBLISH_ENDPOINT carries the
         // service's SEND cap in the message, and the IPC kernel requires the
         // GRANT bit on the caller's send-cap to transfer caps.
         syscall::cap_derive_badge(
             svcmgr_service_ep,
-            syscall::RIGHTS_SEND_GRANT,
+            syscall::RIGHTS_EP_SEND_GRANT,
             ipc::svcmgr_labels::PUBLISH_AUTHORITY,
         )
         .unwrap_or(0)
@@ -806,7 +806,7 @@ pub fn create_vfsd_with_caps(
     // receive a copy without the bit and are rejected at devmgr.
     let Ok(registry_copy) = syscall::cap_derive_badge(
         spawn.registry_ep,
-        syscall::RIGHTS_SEND,
+        syscall::RIGHTS_EP_SEND,
         ipc::devmgr_labels::REGISTRY_QUERY_AUTHORITY,
     )
     else
@@ -1032,7 +1032,7 @@ fn endow_svcmgr(
     // rootfs.root SEND — badge inherited from the root fs namespace cap.
     let rootfs_send = if endow.rootfs_root_cap != 0
     {
-        syscall::cap_derive(endow.rootfs_root_cap, syscall::RIGHTS_SEND).unwrap_or(0)
+        syscall::cap_derive(endow.rootfs_root_cap, syscall::RIGHTS_EP_SEND).unwrap_or(0)
     }
     else
     {
@@ -1043,7 +1043,7 @@ fn endow_svcmgr(
     // minimum — it withholds the RECV right on devmgr's registry endpoint.
     let devmgr_registry_src = if endow.devmgr_registry_ep != 0
     {
-        syscall::cap_derive(endow.devmgr_registry_ep, syscall::RIGHTS_SEND_GRANT).unwrap_or(0)
+        syscall::cap_derive(endow.devmgr_registry_ep, syscall::RIGHTS_EP_SEND_GRANT).unwrap_or(0)
     }
     else
     {
@@ -1195,7 +1195,7 @@ pub fn phase3_svcmgr_handover(
     // logd's `DEATH_EQ_AUTHORITY` SEND from it. `GRANT` because logd's
     // death-EQ registration transfers a cap, which the IPC kernel gates on it.
     let procmgr_death_auth_source =
-        syscall::cap_derive(procmgr_ep, syscall::RIGHTS_SEND_GRANT).unwrap_or(0);
+        syscall::cap_derive(procmgr_ep, syscall::RIGHTS_EP_SEND_GRANT).unwrap_or(0);
     let endowment = SvcmgrEndowment {
         svcmgr_service_ep,
         svcmgr_bootstrap_ep,

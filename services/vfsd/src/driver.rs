@@ -62,7 +62,7 @@ pub fn spawn_fatfs_driver(
     let driver_ep =
         std::os::seraph::object_slab_retype(88, |slab| syscall::cap_create_endpoint(slab).ok())?;
     let driver_ep_for_child = syscall::cap_derive(driver_ep, syscall::RIGHTS_ALL).ok()?;
-    let driver_send = syscall::cap_derive(driver_ep, syscall::RIGHTS_SEND_GRANT).ok()?;
+    let driver_send = syscall::cap_derive(driver_ep, syscall::RIGHTS_EP_SEND_GRANT).ok()?;
 
     // Allocate a bootstrap badge — a random `u64` from the kernel entropy pool,
     // redrawn off the reserved `0` value (an unbadged SEND carries badge 0) — and
@@ -76,7 +76,7 @@ pub fn spawn_fatfs_driver(
         badge = syscall::random_u64().ok()?;
     }
     let badged_creator =
-        syscall::cap_derive_badge(caps.bootstrap_ep, syscall::RIGHTS_SEND, badge).ok()?;
+        syscall::cap_derive_badge(caps.bootstrap_ep, syscall::RIGHTS_EP_SEND, badge).ok()?;
     let bootstrap = BootstrapOrder {
         badge,
         blk: partition_ep,

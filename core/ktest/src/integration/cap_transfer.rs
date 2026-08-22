@@ -28,10 +28,10 @@ use syscall::{
 
 use crate::{ChildStack, TestContext, TestResult};
 
-// SEND | GRANT rights (bits 4 and 6) for the endpoint copy in child's CSpace.
-const RIGHTS_SEND_GRANT: u64 = (1 << 4) | (1 << 6);
-// NOTIFY right only (bit 7) for the test notification copy in child's CSpace.
-const RIGHTS_NOTIFY: u64 = 1 << 7;
+// SEND | GRANT rights for the endpoint copy in child's CSpace.
+use syscall_abi::RIGHTS_EP_SEND_GRANT;
+// NOTIFY right only for the test notification copy in child's CSpace.
+const RIGHTS_NOTIFY: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
 
 static mut CHILD_STACK: ChildStack = ChildStack::ZERO;
 
@@ -61,7 +61,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         .map_err(|_| "integration::cap_transfer: cap_create_cspace failed")?;
     crate::log("cap_transfer: cspace created");
 
-    let child_ep = cap_copy(ep, cs, RIGHTS_SEND_GRANT)
+    let child_ep = cap_copy(ep, cs, RIGHTS_EP_SEND_GRANT)
         .map_err(|_| "integration::cap_transfer: cap_copy ep failed")?;
     crate::log("cap_transfer: child_ep copied");
     let child_test_sig = cap_copy(test_sig, cs, RIGHTS_NOTIFY)

@@ -251,7 +251,7 @@ pub struct MemoryObject
     pub size: u64,
     /// Bytes still available to retype into kernel objects, or to map.
     ///
-    /// Initialised to `size` for RAM caps minted at boot with `Rights::RETYPE`.
+    /// Initialised to `size` for RAM caps minted at boot with `MemRights::RETYPE`.
     /// Set to `0` for firmware-table / boot-module / init-segment Memory caps
     /// (those caps don't carry RETYPE rights and never participate in retype
     /// or auto-reclaim — their `available_bytes` is informational only).

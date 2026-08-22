@@ -32,9 +32,9 @@ use syscall_abi::SyscallError;
 use crate::{TestContext, TestResult};
 
 // NOTIFY right only (bit 7) — can send, cannot wait.
-const RIGHTS_NOTIFY: u64 = 1 << 7;
+const RIGHTS_NOTIFY: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
 // NOTIFY + WAIT rights (bits 7 and 8) — full notification capability.
-const RIGHTS_NOTIFY_WAIT: u64 = (1 << 7) | (1 << 8);
+const RIGHTS_NOTIFY_WAIT: u64 = syscall_abi::RIGHTS_NTF_NOTIFY | syscall_abi::RIGHTS_NTF_WAIT;
 
 pub fn run(ctx: &TestContext) -> TestResult
 {

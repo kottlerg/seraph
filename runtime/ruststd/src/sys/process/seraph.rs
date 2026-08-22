@@ -408,7 +408,7 @@ impl Command {
         // Derive a POST-only copy of the death queue to hand to procmgr.
         // `ipc_call` MOVES it into procmgr's CSpace, so the spawner keeps
         // `RECV` on `death_eq` for its own drain/bridge.
-        let death_relay = match syscall::cap_derive(death_eq, syscall::RIGHTS_POST) {
+        let death_relay = match syscall::cap_derive(death_eq, syscall::RIGHTS_EQ_POST) {
             Ok(slot) => slot,
             Err(_) => {
                 let _ = syscall::cap_delete(death_eq);
@@ -672,7 +672,7 @@ impl Command {
             self.namespace_cap = 0;
             cap
         } else {
-            match syscall::cap_copy(parent_root, info.self_cspace, syscall::RIGHTS_SEND) {
+            match syscall::cap_copy(parent_root, info.self_cspace, syscall::RIGHTS_EP_SEND) {
                 Ok(slot) => slot,
                 Err(_) => 0,
             }
@@ -700,7 +700,7 @@ impl Command {
             let parent_cwd = crate::os::seraph::current_dir_cap();
             if parent_cwd != 0 {
                 Ok(
-                    match syscall::cap_copy(parent_cwd, info.self_cspace, syscall::RIGHTS_SEND) {
+                    match syscall::cap_copy(parent_cwd, info.self_cspace, syscall::RIGHTS_EP_SEND) {
                         Ok(slot) => slot,
                         Err(_) => 0,
                     },

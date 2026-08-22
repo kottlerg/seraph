@@ -61,7 +61,7 @@ use syscall::{
     cap_copy, cap_create_endpoint, cap_create_notification, cap_delete, ipc_buffer_set,
     notification_send, notification_wait, thread_exit, thread_sleep,
 };
-use syscall_abi::{RIGHTS_RECEIVE, RIGHTS_SEND_GRANT, SyscallError, SystemInfoType};
+use syscall_abi::{RIGHTS_EP_RECEIVE, RIGHTS_EP_SEND_GRANT, SyscallError, SystemInfoType};
 
 use crate::{ChildStack, TestContext, TestResult, spawn};
 
@@ -70,7 +70,7 @@ use crate::{ChildStack, TestContext, TestResult, spawn};
 const CYCLES: usize = 2000;
 
 /// Notification signal right (bit 7) — what a child needs to `notification_send`.
-const RIGHTS_SIGNAL: u64 = 1 << 7;
+const RIGHTS_SIGNAL: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
 
 /// `done` bit the server raises once `ipc_recv` has dequeued the client, i.e.
 /// once the client is `BlockedOnReply` and the reply-wake is armed.
@@ -142,7 +142,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         // ── Client child: SEND|GRANT on ep, signal on done. ─────────────────
         let client = spawn::new_child(ctx)
             .map_err(|_| "stress::cap_delete_reply_wake: spawn::new_child client failed")?;
-        let client_ep = cap_copy(ep, client.cs, RIGHTS_SEND_GRANT)
+        let client_ep = cap_copy(ep, client.cs, RIGHTS_EP_SEND_GRANT)
             .map_err(|_| "stress::cap_delete_reply_wake: cap_copy client ep failed")?;
         let client_done = cap_copy(done, client.cs, RIGHTS_SIGNAL)
             .map_err(|_| "stress::cap_delete_reply_wake: cap_copy client done failed")?;
@@ -168,7 +168,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         // ── Server child: RECEIVE on ep, signal on done. ────────────────────
         let server = spawn::new_child(ctx)
             .map_err(|_| "stress::cap_delete_reply_wake: spawn::new_child server failed")?;
-        let server_ep = cap_copy(ep, server.cs, RIGHTS_RECEIVE)
+        let server_ep = cap_copy(ep, server.cs, RIGHTS_EP_RECEIVE)
             .map_err(|_| "stress::cap_delete_reply_wake: cap_copy server ep failed")?;
         let server_done = cap_copy(done, server.cs, RIGHTS_SIGNAL)
             .map_err(|_| "stress::cap_delete_reply_wake: cap_copy server done failed")?;

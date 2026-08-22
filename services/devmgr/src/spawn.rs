@@ -249,7 +249,7 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64) -> bool
         return false;
     };
     let Ok(badged_creator) =
-        syscall::cap_derive_badge(bootstrap_ep, syscall::RIGHTS_SEND, child_badge)
+        syscall::cap_derive_badge(bootstrap_ep, syscall::RIGHTS_EP_SEND, child_badge)
     else
     {
         std::os::seraph::log!("driver spawn: badged creator derivation failed");
@@ -348,7 +348,7 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64) -> bool
         0
     };
     let Ok(devmgr_copy) =
-        syscall::cap_derive_badge(registry_ep, syscall::RIGHTS_SEND, device_badge)
+        syscall::cap_derive_badge(registry_ep, syscall::RIGHTS_EP_SEND, device_badge)
     else
     {
         std::os::seraph::log!("driver devmgr query cap derivation failed");
@@ -533,7 +533,7 @@ pub fn spawn_simple_device(
         return false;
     };
     let Ok(badged_creator) =
-        syscall::cap_derive_badge(bootstrap_ep, syscall::RIGHTS_SEND, child_badge)
+        syscall::cap_derive_badge(bootstrap_ep, syscall::RIGHTS_EP_SEND, child_badge)
     else
     {
         std::os::seraph::log!("simple-device spawn: badged creator derivation failed");

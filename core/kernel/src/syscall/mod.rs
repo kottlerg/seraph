@@ -434,7 +434,7 @@ fn sys_thread_sleep(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 #[allow(clippy::cast_possible_truncation)]
 fn sys_thread_bind_notification(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
-    use crate::cap::slot::{CapTag, Rights};
+    use crate::cap::slot::{EqRights, ThreadRights};
     use crate::sched::thread::{DeathObserver, MAX_DEATH_OBSERVERS, ThreadState};
 
     let thread_cap_idx = tf.arg(0) as u32;
@@ -452,8 +452,7 @@ fn sys_thread_bind_notification(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // Look up the Thread cap (CONTROL right required).
     // SAFETY: cspace from current thread; lookup_cap validates index, tag, rights.
-    let thread_slot =
-        unsafe { lookup_cap(cspace, thread_cap_idx, CapTag::Thread, Rights::CONTROL) }?;
+    let thread_slot = unsafe { lookup_cap(cspace, thread_cap_idx, ThreadRights::CONTROL) }?;
 
     // Extract target TCB from the Thread cap.
     // SAFETY: slot validated as Thread cap; header at offset 0.
@@ -465,7 +464,7 @@ fn sys_thread_bind_notification(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // Look up the EventQueue cap (POST right required).
     // SAFETY: cspace from current thread; lookup_cap validates.
-    let eq_slot = unsafe { lookup_cap(cspace, eq_cap_idx, CapTag::EventQueue, Rights::POST) }?;
+    let eq_slot = unsafe { lookup_cap(cspace, eq_cap_idx, EqRights::POST) }?;
 
     let eq_obj = eq_slot.object.ok_or(SyscallError::InvalidCapability)?;
     // cast_ptr_alignment: header at offset 0 of EventQueueObject; allocator guarantees alignment.
@@ -554,7 +553,7 @@ fn sys_thread_bind_notification(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 #[allow(clippy::cast_possible_truncation)]
 fn sys_aspace_bind_notification(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
-    use crate::cap::slot::{CapTag, Rights};
+    use crate::cap::slot::{AsRights, EqRights};
 
     let aspace_cap_idx = tf.arg(0) as u32;
     let eq_cap_idx = tf.arg(1) as u32;
@@ -571,14 +570,7 @@ fn sys_aspace_bind_notification(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // Look up the AddressSpace cap (CONTROL right required).
     // SAFETY: cspace from current thread; lookup_cap validates index, tag, rights.
-    let aspace_slot = unsafe {
-        lookup_cap(
-            cspace,
-            aspace_cap_idx,
-            CapTag::AddressSpace,
-            Rights::CONTROL,
-        )
-    }?;
+    let aspace_slot = unsafe { lookup_cap(cspace, aspace_cap_idx, AsRights::CONTROL) }?;
 
     // Extract the inner AddressSpace from the AddressSpace cap.
     // SAFETY: slot validated as AddressSpace cap; header at offset 0.
@@ -600,7 +592,7 @@ fn sys_aspace_bind_notification(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // Look up the EventQueue cap (POST right required).
     // SAFETY: cspace from current thread; lookup_cap validates.
-    let eq_slot = unsafe { lookup_cap(cspace, eq_cap_idx, CapTag::EventQueue, Rights::POST) }?;
+    let eq_slot = unsafe { lookup_cap(cspace, eq_cap_idx, EqRights::POST) }?;
 
     let eq_obj = eq_slot.object.ok_or(SyscallError::InvalidCapability)?;
     // cast_ptr_alignment: header at offset 0 of EventQueueObject; allocator guarantees alignment.
@@ -659,6 +651,11 @@ pub(crate) unsafe fn current_tcb() -> *mut crate::sched::thread::ThreadControlBl
 /// resolvers in `cap.rs` (`cap_copy`/`derive`/`delete`/`revoke`/`move`/`info`)
 /// must decode and generation-check themselves.
 ///
+/// The expected slot tag is fixed by the required-rights argument's type:
+/// `required_rights: TypedRights<K>` selects `K::TAG`, so a rights constant of
+/// the wrong capability type cannot compile. Presence-only lookups pass the
+/// type's `NONE` (e.g. `SchedRights::NONE`).
+///
 /// Returns a reference to the slot, or an appropriate [`SyscallError`]:
 /// - Null cspace pointer or missing slot → [`SyscallError::InvalidCapability`].
 /// - Tag mismatch → [`SyscallError::InvalidCapability`].
@@ -666,11 +663,10 @@ pub(crate) unsafe fn current_tcb() -> *mut crate::sched::thread::ThreadControlBl
 ///   [`SyscallError::InvalidCapability`] (#349).
 /// - Insufficient rights → [`SyscallError::InsufficientRights`].
 #[cfg(not(test))]
-pub(crate) unsafe fn lookup_cap(
+pub(crate) unsafe fn lookup_cap<K: crate::cap::slot::CapKind>(
     cspace: *mut crate::cap::cspace::CSpace,
     handle: u32,
-    expected_tag: crate::cap::slot::CapTag,
-    required_rights: crate::cap::slot::Rights,
+    required_rights: crate::cap::slot::TypedRights<K>,
 ) -> Result<&'static crate::cap::slot::CapabilitySlot, SyscallError>
 {
     if cspace.is_null()
@@ -681,7 +677,7 @@ pub(crate) unsafe fn lookup_cap(
     let cs = unsafe { &*cspace };
     let index = syscall::cap_handle_index(handle);
     let slot = cs.slot(index).ok_or(SyscallError::InvalidCapability)?;
-    if slot.tag != expected_tag
+    if slot.tag != K::TAG
     {
         return Err(SyscallError::InvalidCapability);
     }
@@ -692,7 +688,7 @@ pub(crate) unsafe fn lookup_cap(
     {
         return Err(SyscallError::InvalidCapability);
     }
-    if !slot.rights.contains(required_rights)
+    if !slot.rights.contains(required_rights.erase())
     {
         return Err(SyscallError::InsufficientRights);
     }

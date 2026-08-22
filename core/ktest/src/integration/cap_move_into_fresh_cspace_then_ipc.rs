@@ -18,7 +18,7 @@ use syscall::{
 use crate::{ChildStack, TestContext, TestResult};
 
 /// SEND + GRANT rights — the child needs both to issue an `ipc_call`.
-const RIGHTS_SEND_GRANT: u64 = (1 << 4) | (1 << 6);
+use syscall_abi::RIGHTS_EP_SEND_GRANT;
 
 static mut CHILD_STACK: ChildStack = ChildStack::ZERO;
 
@@ -54,7 +54,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     // moved into the child cspace.
     let ep_parent = cap_create_endpoint(ctx.memory_base)
         .map_err(|_| "cap_move_into_fresh_cspace_then_ipc: cap_create_endpoint (parent) failed")?;
-    let ep_donor = cap_copy(ep_parent, ctx.cspace_cap, RIGHTS_SEND_GRANT)
+    let ep_donor = cap_copy(ep_parent, ctx.cspace_cap, RIGHTS_EP_SEND_GRANT)
         .map_err(|_| "cap_move_into_fresh_cspace_then_ipc: sibling cap_copy (donor) failed")?;
 
     let done = cap_create_notification(ctx.memory_base).map_err(
@@ -64,7 +64,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     let child = crate::spawn::new_child(ctx)
         .map_err(|_| "cap_move_into_fresh_cspace_then_ipc: spawn::new_child failed")?;
 
-    let child_done = cap_copy(done, child.cs, 1 << 7)
+    let child_done = cap_copy(done, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
         .map_err(|_| "cap_move_into_fresh_cspace_then_ipc: cap_copy (child_done) failed")?;
 
     // Move (not copy) the donor sibling into the child's cspace. After

@@ -233,7 +233,8 @@ fn main() -> !
         namespace_protocol::NodeId::ROOT,
         namespace_protocol::NamespaceRights::ALL,
     );
-    let Ok(system_root_cap) = syscall::cap_derive_badge(namespace_ep, syscall::RIGHTS_SEND, badge)
+    let Ok(system_root_cap) =
+        syscall::cap_derive_badge(namespace_ep, syscall::RIGHTS_EP_SEND, badge)
     else
     {
         std::os::seraph::log!("FATAL: vfsd internal system-root cap derive failed");
@@ -765,7 +766,7 @@ fn handle_get_system_root_cap(ipc_buf: *mut u64, rt: &VfsdRuntime)
         namespace_protocol::NamespaceRights::ALL,
     );
     let reply = if let Ok(cap) =
-        syscall::cap_derive_badge(rt.namespace_ep, syscall::RIGHTS_SEND, badge)
+        syscall::cap_derive_badge(rt.namespace_ep, syscall::RIGHTS_EP_SEND, badge)
     {
         IpcMessage::builder(ipc::vfsd_errors::SUCCESS)
             .cap(cap)
@@ -1106,7 +1107,7 @@ fn do_mount_internal(
         namespace_protocol::NamespaceRights::ALL,
     );
     let caller_root_cap =
-        syscall::cap_derive_badge(driver_ep, syscall::RIGHTS_SEND, root_badge).ok();
+        syscall::cap_derive_badge(driver_ep, syscall::RIGHTS_EP_SEND, root_badge).ok();
 
     // What the backend retains for this mount depends on its role:
     //   - Root mount (`/`): a *badged* full-rights SEND on the root fs,
@@ -1125,7 +1126,7 @@ fn do_mount_internal(
     //     could only ever be `cap_derive`-copied at full rights.
     let install_cap = if mount_path_is_root(path)
     {
-        let Ok(c) = syscall::cap_derive_badge(driver_ep, syscall::RIGHTS_SEND, root_badge)
+        let Ok(c) = syscall::cap_derive_badge(driver_ep, syscall::RIGHTS_EP_SEND, root_badge)
         else
         {
             std::os::seraph::log!("MOUNT: root fall-through cap derive failed");

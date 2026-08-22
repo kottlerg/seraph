@@ -732,7 +732,7 @@ pub fn bootstrap_memmgr(
     // where RETYPE lets memmgr re-derive. Derive a read-only child cap for the
     // load-time mapping so `mem_map`'s derive-from-cap path produces a strictly
     // read-only page (otherwise W+X cap rights trip W^X).
-    let module_ro = syscall::cap_derive(module_memory_cap, syscall::RIGHTS_MAP_READ).ok()?;
+    let module_ro = syscall::cap_derive(module_memory_cap, syscall::RIGHTS_MEM_MAP_RO).ok()?;
     syscall::mem_map(
         module_ro,
         init_aspace,
@@ -826,9 +826,9 @@ pub fn bootstrap_memmgr(
     // tagged with this badge).
     let memmgr_badge = mint_bootstrap_badge()?;
     let badged_creator =
-        syscall::cap_derive_badge(init_bootstrap_ep, syscall::RIGHTS_SEND, memmgr_badge).ok()?;
+        syscall::cap_derive_badge(init_bootstrap_ep, syscall::RIGHTS_EP_SEND, memmgr_badge).ok()?;
     let mm_creator_slot =
-        syscall::cap_copy(badged_creator, mm_cspace, syscall::RIGHTS_SEND).ok()?;
+        syscall::cap_copy(badged_creator, mm_cspace, syscall::RIGHTS_EP_SEND).ok()?;
 
     let mm_caps = MemmgrCaps {
         aspace: mm_aspace,
@@ -852,7 +852,7 @@ pub fn bootstrap_memmgr(
     let procmgr_badge_on_mm = mint_bootstrap_badge()?;
     let procmgr_send_cap = syscall::cap_derive_badge(
         mm_service_ep,
-        syscall::RIGHTS_SEND_GRANT,
+        syscall::RIGHTS_EP_SEND_GRANT,
         procmgr_badge_on_mm,
     )
     .ok()?;
@@ -1018,7 +1018,7 @@ pub fn finalize_memmgr(
         let bytes = desc.aux1;
         let phys_base = desc.aux0;
         // Every RAM Memory cap init forwards to memmgr MUST carry
-        // `Rights::RETYPE`. The kernel stamps RETYPE on usable RAM at
+        // `MemRights::RETYPE`. The kernel stamps RETYPE on usable RAM at
         // Phase-7 mint (`core/kernel/src/cap/mod.rs`); init holds these
         // caps unchanged. If this assertion ever fires, memmgr will be
         // unable to retype memory caps into kernel objects and the typed-memory
@@ -1030,11 +1030,11 @@ pub fn finalize_memmgr(
         {
             panic!("init: cap_info failed on RAM Memory cap before memmgr forward");
         };
-        // Packed value is `(tag << 32) | rights`; `RIGHTS_RETYPE` is a
+        // Packed value is `(tag << 32) | rights`; `RIGHTS_MEM_RETYPE` is a
         // low-bit-position right so the u64 mask is exact.
         assert!(
-            packed & syscall::RIGHTS_RETYPE != 0,
-            "init: RAM Memory cap missing RIGHTS_RETYPE before memmgr forward",
+            packed & syscall::RIGHTS_MEM_RETYPE != 0,
+            "init: RAM Memory cap missing RIGHTS_MEM_RETYPE before memmgr forward",
         );
         let Ok(intermediary) = syscall::cap_derive(src_slot, syscall::RIGHTS_ALL)
         else
@@ -1435,7 +1435,7 @@ pub fn bootstrap_procmgr(
     let module_pages = (module_size + 0xFFF) / PAGE_SIZE;
 
     // Derive a read-only child cap (see `bootstrap_memmgr` for rationale).
-    let module_ro = syscall::cap_derive(module_memory_cap, syscall::RIGHTS_MAP_READ).ok()?;
+    let module_ro = syscall::cap_derive(module_memory_cap, syscall::RIGHTS_MEM_MAP_RO).ok()?;
     syscall::mem_map(
         module_ro,
         init_aspace,
@@ -1549,9 +1549,10 @@ pub fn bootstrap_procmgr(
     // Derive badged creator endpoint for procmgr.
     let procmgr_badge = mint_bootstrap_badge()?;
     let badged_creator =
-        syscall::cap_derive_badge(init_bootstrap_ep, syscall::RIGHTS_SEND, procmgr_badge).ok()?;
+        syscall::cap_derive_badge(init_bootstrap_ep, syscall::RIGHTS_EP_SEND, procmgr_badge)
+            .ok()?;
     let pm_creator_slot =
-        syscall::cap_copy(badged_creator, pm_cspace, syscall::RIGHTS_SEND).ok()?;
+        syscall::cap_copy(badged_creator, pm_cspace, syscall::RIGHTS_EP_SEND).ok()?;
 
     // Procmgr maintains no memory-cap pool of its own; every per-child
     // allocation routes through memmgr. All remaining RAM memory caps get
@@ -1570,7 +1571,7 @@ pub fn bootstrap_procmgr(
     }
     else
     {
-        syscall::cap_derive(log_ep, syscall::RIGHTS_SEND).ok()?
+        syscall::cap_derive(log_ep, syscall::RIGHTS_EP_SEND).ok()?
     };
 
     // Derive an un-badged SEND cap on svcmgr's service endpoint for
@@ -1587,7 +1588,7 @@ pub fn bootstrap_procmgr(
     }
     else
     {
-        syscall::cap_derive(svcmgr_service_ep, syscall::RIGHTS_SEND).ok()?
+        syscall::cap_derive(svcmgr_service_ep, syscall::RIGHTS_EP_SEND).ok()?
     };
 
     // Copy the badged memmgr SEND cap into procmgr's CSpace. The slot it
@@ -1598,7 +1599,7 @@ pub fn bootstrap_procmgr(
     }
     else
     {
-        syscall::cap_copy(memmgr_send_cap, pm_cspace, syscall::RIGHTS_SEND_GRANT).ok()?
+        syscall::cap_copy(memmgr_send_cap, pm_cspace, syscall::RIGHTS_EP_SEND_GRANT).ok()?
     };
 
     // Derive procmgr's pre-installed badged SEND cap on the log
@@ -1615,11 +1616,11 @@ pub fn bootstrap_procmgr(
     {
         let init_side = syscall::cap_derive_badge(
             log_ep,
-            syscall::RIGHTS_SEND,
+            syscall::RIGHTS_EP_SEND,
             ipc::log_badges::LOG_BADGE_PROCMGR,
         )
         .ok()?;
-        let pm_side = syscall::cap_copy(init_side, pm_cspace, syscall::RIGHTS_SEND).ok()?;
+        let pm_side = syscall::cap_copy(init_side, pm_cspace, syscall::RIGHTS_EP_SEND).ok()?;
         let _ = syscall::cap_delete(init_side);
         pm_side
     };
@@ -1659,7 +1660,7 @@ pub fn bootstrap_procmgr(
 
     // Derive a send cap to procmgr's service endpoint for init's own use.
     let service_ep_for_init =
-        syscall::cap_derive(pm_service_ep, syscall::RIGHTS_SEND_GRANT).ok()?;
+        syscall::cap_derive(pm_service_ep, syscall::RIGHTS_EP_SEND_GRANT).ok()?;
 
     Some(ProcmgrBootstrap {
         service_ep: service_ep_for_init,

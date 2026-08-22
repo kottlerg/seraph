@@ -85,7 +85,7 @@ pub fn sys_system_info(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 pub fn sys_aspace_query(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::object::AddressSpaceObject;
-    use crate::cap::slot::{CapTag, Rights};
+    use crate::cap::slot::AsRights;
 
     let aspace_idx = tf.arg(0) as u32;
     let virt = tf.arg(1);
@@ -113,14 +113,7 @@ pub fn sys_aspace_query(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     let caller_cspace = unsafe { (*tcb).cspace };
 
     // SAFETY: caller_cspace is a valid CSpace pointer; lookup_cap validates slot bounds and rights.
-    let aspace_slot = unsafe {
-        super::lookup_cap(
-            caller_cspace,
-            aspace_idx,
-            CapTag::AddressSpace,
-            Rights::READ,
-        )
-    }?;
+    let aspace_slot = unsafe { super::lookup_cap(caller_cspace, aspace_idx, AsRights::READ) }?;
     let as_ptr = {
         let obj = aspace_slot.object.ok_or(SyscallError::InvalidCapability)?;
         // SAFETY: tag confirmed AddressSpace; pointer is valid.

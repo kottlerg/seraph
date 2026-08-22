@@ -60,10 +60,15 @@ pub use syscall_abi::{
     CAP_INFO_CSPACE_USED, CAP_INFO_MEMORY_AVAILABLE, CAP_INFO_MEMORY_HAS_RETYPE,
     CAP_INFO_MEMORY_PHYS_BASE, CAP_INFO_MEMORY_SIZE, CAP_INFO_TAG_RIGHTS, CAP_TAG_MEMORY,
     EXIT_FAULT_BASE, EXIT_KILLED, EXIT_VOLUNTARY, IPC_REPLY_TRANSFER_FAILED, MAP_EXECUTABLE,
-    MAP_READ, MAP_READONLY, MAP_WRITABLE, MAX_GETRANDOM_LEN, RIGHTS_ALL, RIGHTS_CONTROL,
-    RIGHTS_CSPACE, RIGHTS_MAP_READ, RIGHTS_MAP_RW, RIGHTS_MAP_RX, RIGHTS_POST, RIGHTS_RECEIVE,
-    RIGHTS_RETYPE, RIGHTS_SBI_BASE, RIGHTS_SBI_CPPC, RIGHTS_SBI_DBCN, RIGHTS_SBI_PMU,
-    RIGHTS_SBI_RESET, RIGHTS_SBI_SUSPEND, RIGHTS_SEND, RIGHTS_SEND_GRANT, RIGHTS_THREAD,
+    MAP_READ, MAP_READONLY, MAP_WRITABLE, MAX_GETRANDOM_LEN, RIGHTS_ALL, RIGHTS_AS_CONTROL,
+    RIGHTS_AS_MAP, RIGHTS_AS_READ, RIGHTS_CS_DELETE, RIGHTS_CS_DERIVE, RIGHTS_CS_INSERT,
+    RIGHTS_CS_REVOKE, RIGHTS_CSPACE, RIGHTS_EP_GRANT, RIGHTS_EP_RECEIVE, RIGHTS_EP_SEND,
+    RIGHTS_EP_SEND_GRANT, RIGHTS_EQ_POST, RIGHTS_EQ_RECV, RIGHTS_IOPORT_USE, RIGHTS_IRQ_NOTIFY,
+    RIGHTS_MEM_EXECUTE, RIGHTS_MEM_MAP, RIGHTS_MEM_MAP_RO, RIGHTS_MEM_MAP_RW, RIGHTS_MEM_MAP_RX,
+    RIGHTS_MEM_READ, RIGHTS_MEM_RETYPE, RIGHTS_MEM_WRITE, RIGHTS_MMIO_MAP, RIGHTS_MMIO_WRITE,
+    RIGHTS_NTF_NOTIFY, RIGHTS_NTF_WAIT, RIGHTS_SBI_BASE, RIGHTS_SBI_CPPC, RIGHTS_SBI_DBCN,
+    RIGHTS_SBI_PMU, RIGHTS_SBI_RESET, RIGHTS_SBI_SUSPEND, RIGHTS_THREAD, RIGHTS_THREAD_CONTROL,
+    RIGHTS_THREAD_OBSERVE, RIGHTS_WS_MODIFY, RIGHTS_WS_WAIT,
 };
 
 // ── Raw syscall entry ─────────────────────────────────────────────────────────
@@ -801,14 +806,14 @@ pub fn notification_wait_timeout(sig: u32, timeout_ms: u64) -> Result<u64, i64>
 
 /// Retype a Memory cap into a new Endpoint. Returns the `CSpace` slot index.
 ///
-/// `memory_cap` is the source Memory-cap slot; it MUST carry `RIGHTS_RETYPE`
+/// `memory_cap` is the source Memory-cap slot; it MUST carry `RIGHTS_MEM_RETYPE`
 /// and have at least 88 B of `available_bytes` (the Endpoint wrapper plus
 /// state). Bytes are debited from the Memory cap and credited back when the
 /// Endpoint is destroyed.
 ///
 /// # Errors
 /// Returns a negative `i64` error code if `memory_cap` is invalid, lacks
-/// `RIGHTS_RETYPE`, has insufficient `available_bytes`, or the caller's
+/// `RIGHTS_MEM_RETYPE`, has insufficient `available_bytes`, or the caller's
 /// `CSpace` is full.
 // cast_possible_truncation, cast_sign_loss: ret is a non-negative CSpace slot index
 // guaranteed to fit in u32 (max CSpace size is 14336).
@@ -824,13 +829,13 @@ pub fn cap_create_endpoint(memory_cap: u32) -> Result<u32, i64>
 
 /// Retype a Memory cap into a new Notification. Returns the `CSpace` slot index.
 ///
-/// `memory_cap` MUST carry `RIGHTS_RETYPE` and have at least 120 B of
+/// `memory_cap` MUST carry `RIGHTS_MEM_RETYPE` and have at least 120 B of
 /// `available_bytes`. Bytes are debited from the Memory cap and credited back
 /// when the Notification is destroyed.
 ///
 /// # Errors
 /// Returns a negative `i64` error code if `memory_cap` is invalid, lacks
-/// `RIGHTS_RETYPE`, has insufficient `available_bytes`, or the caller's
+/// `RIGHTS_MEM_RETYPE`, has insufficient `available_bytes`, or the caller's
 /// `CSpace` is full.
 // cast_possible_truncation, cast_sign_loss: ret is a non-negative CSpace slot index
 // guaranteed to fit in u32 (max CSpace size is 14336).
@@ -849,7 +854,7 @@ pub fn cap_create_notification(memory_cap: u32) -> Result<u32, i64>
 /// Retype a Memory cap into a new `AddressSpace`, or augment an existing
 /// one's PT growth budget.
 ///
-/// `memory_cap` must carry `Rights::RETYPE` and have at least
+/// `memory_cap` must carry `MemRights::RETYPE` and have at least
 /// `init_pages * PAGE_SIZE` of `available_bytes`. Page 0 of the slab
 /// becomes the root PT; pages 1..`init_pages` form the initial PT growth
 /// pool. `init_pages` must be `>= 1`.
@@ -882,7 +887,7 @@ pub fn cap_create_aspace(memory_cap: u32, augment_target: u32, init_pages: u64)
 /// Retype a Memory cap into a new `CSpace`, or augment an existing one's
 /// slot-page growth budget.
 ///
-/// `memory_cap` must carry `Rights::RETYPE` and have at least
+/// `memory_cap` must carry `MemRights::RETYPE` and have at least
 /// `init_pages * PAGE_SIZE` of `available_bytes`. In create mode the
 /// slab's page 0 is the kernel wrapper page; pages `1..init_pages` seed
 /// the slot-page pool (each backs 56 slots). `init_pages` must be `>= 1`.
@@ -924,7 +929,7 @@ pub fn cap_create_cspace(
 /// Retype a Memory cap into a new Thread bound to `aspace_cap` and
 /// `cspace_cap`. Returns the `CSpace` slot index of the new Thread cap.
 ///
-/// `memory_cap` must carry `Rights::RETYPE` and have at least 6 pages of
+/// `memory_cap` must carry `MemRights::RETYPE` and have at least 6 pages of
 /// `available_bytes` (4 kstack pages, 1 page for the wrapper and TCB,
 /// 1 FPU/SIMD save-area page; see `cap::retype::dispatch_for(Thread)`).
 ///
@@ -1639,14 +1644,14 @@ pub fn aspace_query(aspace_cap: u32, virt: u64) -> Result<u64, i64>
 
 /// Retype a Memory cap into a new `EventQueue` with the given capacity (1..=4096).
 ///
-/// `memory_cap` MUST carry `RIGHTS_RETYPE`; the wrapper, state, and ring
+/// `memory_cap` MUST carry `RIGHTS_MEM_RETYPE`; the wrapper, state, and ring
 /// buffer all live inline in the same retype slot. Sub-page in-place when
 /// the total fits in `BIN_512` (≈ capacity ≤ 54), page-aligned split for
 /// larger rings.
 ///
 /// # Errors
 /// Returns a negative `i64` error code if `memory_cap` is invalid, lacks
-/// `RIGHTS_RETYPE`, has insufficient `available_bytes`, `capacity` is out
+/// `RIGHTS_MEM_RETYPE`, has insufficient `available_bytes`, `capacity` is out
 /// of range, or the `CSpace` is full.
 // cast_possible_truncation, cast_sign_loss: ret is a non-negative CSpace slot index
 // guaranteed to fit in u32 (max CSpace size is 14336).
@@ -1737,12 +1742,12 @@ pub fn event_recv_timeout(queue_cap: u32, timeout_ms: u64) -> Result<u64, i64>
 
 /// Retype a Memory cap into a new `WaitSet` with `MODIFY | WAIT` rights.
 ///
-/// `memory_cap` MUST carry `RIGHTS_RETYPE` and have ≥ 512 bytes of
+/// `memory_cap` MUST carry `RIGHTS_MEM_RETYPE` and have ≥ 512 bytes of
 /// `available_bytes` (the `BIN_512` size class debited from the ledger).
 ///
 /// # Errors
 /// Returns a negative `i64` error code if `memory_cap` is invalid, lacks
-/// `RIGHTS_RETYPE`, or the `CSpace` is full.
+/// `RIGHTS_MEM_RETYPE`, or the `CSpace` is full.
 // cast_possible_truncation, cast_sign_loss: ret is a non-negative CSpace slot index
 // guaranteed to fit in u32 (max CSpace size is 14336).
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]

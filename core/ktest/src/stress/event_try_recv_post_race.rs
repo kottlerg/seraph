@@ -89,12 +89,12 @@ const CYCLES: u32 = 1024;
 
 /// Notification signal right (bit 7) and wait right (bit 8). Each cap copy
 /// carries only the right its one-directional use needs.
-const RIGHTS_SIGNAL: u64 = 1 << 7;
-const RIGHTS_WAIT: u64 = 1 << 8;
+const RIGHTS_SIGNAL: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
+const RIGHTS_WAIT: u64 = syscall_abi::RIGHTS_NTF_WAIT;
 
 /// Event-queue post right (bit 9) and recv right (bit 10).
-const RIGHTS_EQ_POST: u64 = 1 << 9;
-const RIGHTS_EQ_RECV: u64 = 1 << 10;
+use syscall_abi::RIGHTS_EQ_POST;
+use syscall_abi::RIGHTS_EQ_RECV;
 
 /// `done` bits raised by each child on completion (clean or failed).
 const BIT_POLLER_DONE: u64 = 1 << 0;

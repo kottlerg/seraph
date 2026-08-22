@@ -277,7 +277,7 @@ impl Pipe {
 
         // Map the page read-write at parent_va via a derived mapping cap;
         // the original stays clean for the child handoff derivations.
-        let map_result = syscall::cap_derive(memory_cap, syscall::RIGHTS_MAP_RW)
+        let map_result = syscall::cap_derive(memory_cap, syscall::RIGHTS_MEM_MAP_RW)
             .and_then(|rw| {
                 let r = syscall::mem_map(rw, aspace, parent_va, 0, 1, syscall::MAP_WRITABLE);
                 let _ = syscall::cap_delete(rw);
@@ -334,7 +334,7 @@ impl Pipe {
         // procmgr's CSpace when they appear in CONFIGURE_PIPE's
         // cap-list, leaving the originals intact. On any error here we
         // free the originals and the parent VA before returning.
-        let memory_handoff = match syscall::cap_derive(memory_cap, syscall::RIGHTS_MAP_RW) {
+        let memory_handoff = match syscall::cap_derive(memory_cap, syscall::RIGHTS_MEM_MAP_RW) {
             Ok(s) => s,
             Err(_) => {
                 let _ = syscall::cap_delete(space_notification);

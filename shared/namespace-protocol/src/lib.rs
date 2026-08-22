@@ -403,7 +403,7 @@ fn handle_lookup<B: NamespaceBackend>(
             // would force the kernel to reject any cap-bearing IPC.
             match syscall::cap_derive_badge(
                 namespace_endpoint,
-                syscall_abi::RIGHTS_SEND_GRANT,
+                syscall_abi::RIGHTS_EP_SEND_GRANT,
                 badge,
             )
             {
@@ -429,7 +429,7 @@ fn handle_lookup<B: NamespaceBackend>(
                 // composed rights means no access.
                 return ipc::IpcMessage::new(NsError::PermissionDenied.as_label());
             }
-            match syscall::cap_derive_badge(endpoint, syscall_abi::RIGHTS_SEND, badge)
+            match syscall::cap_derive_badge(endpoint, syscall_abi::RIGHTS_EP_SEND, badge)
             {
                 Ok(slot) => slot,
                 Err(_) => return ipc::IpcMessage::new(NsError::OutOfResources.as_label()),

@@ -25,7 +25,7 @@ use super::{current_tcb, lookup_cap};
 #[cfg(not(test))]
 use crate::cap::CSpace;
 #[cfg(not(test))]
-use crate::cap::slot::{CapTag, Rights};
+use crate::cap::slot::{CapTag, EpRights, EqRights, NtfRights, WsRights};
 #[cfg(not(test))]
 use crate::ipc::message::Message;
 #[cfg(not(test))]
@@ -454,7 +454,7 @@ unsafe fn consume_call_disposition(
 /// arg0 = endpoint cap index, arg1 = label, arg2 = `data_count`,
 /// arg3 = `cap_count` (0-4), arg4 = packed cap slot indices (4 × u16).
 ///
-/// If `cap_count` > 0, the endpoint cap must have `Rights::GRANT`. Capabilities
+/// If `cap_count` > 0, the endpoint cap must have `EpRights::GRANT`. Capabilities
 /// at the specified slots are moved from the caller's `CSpace` to the server's
 /// `CSpace` atomically with the message.
 ///
@@ -489,15 +489,15 @@ pub fn sys_ipc_call(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // Determine required rights: SEND always; GRANT additionally when sending caps.
     let required_rights = if cap_count > 0
     {
-        Rights::SEND | Rights::GRANT
+        EpRights::SEND | EpRights::GRANT
     }
     else
     {
-        Rights::SEND
+        EpRights::SEND
     };
 
     // SAFETY: cspace_ptr validated above.
-    let slot = unsafe { lookup_cap(cspace_ptr, ep_idx, CapTag::Endpoint, required_rights) }?;
+    let slot = unsafe { lookup_cap(cspace_ptr, ep_idx, required_rights) }?;
     let caller_badge = slot.badge;
 
     // Extract EndpointState pointer from the slot's object.
@@ -693,7 +693,7 @@ pub fn sys_ipc_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // SAFETY: tcb validated non-null above.
     let cspace_ptr = unsafe { (*tcb).cspace };
     // SAFETY: cspace_ptr validated above.
-    let slot = unsafe { lookup_cap(cspace_ptr, ep_idx, CapTag::Endpoint, Rights::RECEIVE) }?;
+    let slot = unsafe { lookup_cap(cspace_ptr, ep_idx, EpRights::RECEIVE) }?;
 
     // SAFETY: slot validated; object pointer is valid Endpoint.
     let ep_state = unsafe {
@@ -1138,7 +1138,7 @@ pub fn sys_notification_send(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // SAFETY: tcb validated non-null above.
     let cspace_ptr = unsafe { (*tcb).cspace };
     // SAFETY: cspace_ptr validated above.
-    let slot = unsafe { lookup_cap(cspace_ptr, sig_idx, CapTag::Notification, Rights::NOTIFY) }?;
+    let slot = unsafe { lookup_cap(cspace_ptr, sig_idx, NtfRights::NOTIFY) }?;
 
     // SAFETY: slot validated; object pointer is valid Notification.
     let sig_state = unsafe {
@@ -1203,7 +1203,7 @@ pub fn sys_notification_wait(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // SAFETY: tcb validated non-null above.
     let cspace_ptr = unsafe { (*tcb).cspace };
     // SAFETY: cspace_ptr validated above.
-    let slot = unsafe { lookup_cap(cspace_ptr, sig_idx, CapTag::Notification, Rights::WAIT) }?;
+    let slot = unsafe { lookup_cap(cspace_ptr, sig_idx, NtfRights::WAIT) }?;
 
     // SAFETY: slot validated; object pointer is valid Notification.
     let sig_state = unsafe {
@@ -1326,7 +1326,7 @@ pub fn sys_event_post(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // SAFETY: tcb validated non-null above.
     let cspace_ptr = unsafe { (*tcb).cspace };
     // SAFETY: cspace_ptr validated above.
-    let slot = unsafe { lookup_cap(cspace_ptr, eq_idx, CapTag::EventQueue, Rights::POST) }?;
+    let slot = unsafe { lookup_cap(cspace_ptr, eq_idx, EqRights::POST) }?;
 
     // SAFETY: slot validated; object pointer is valid EventQueue.
     let eq_state = unsafe {
@@ -1397,7 +1397,7 @@ pub fn sys_event_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // SAFETY: tcb validated non-null above.
     let cspace_ptr = unsafe { (*tcb).cspace };
     // SAFETY: cspace_ptr validated above.
-    let slot = unsafe { lookup_cap(cspace_ptr, eq_idx, CapTag::EventQueue, Rights::RECV) }?;
+    let slot = unsafe { lookup_cap(cspace_ptr, eq_idx, EqRights::RECV) }?;
 
     // SAFETY: slot validated; object pointer is valid EventQueue.
     let eq_state = unsafe {
@@ -1560,7 +1560,7 @@ pub fn sys_wait_set_add(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // Look up wait set cap.
     // SAFETY: cspace_ptr validated above.
-    let ws_slot = unsafe { lookup_cap(cspace_ptr, ws_idx, CapTag::WaitSet, Rights::MODIFY) }?;
+    let ws_slot = unsafe { lookup_cap(cspace_ptr, ws_idx, WsRights::MODIFY) }?;
     // SAFETY: ws_slot validated; object pointer is valid WaitSet.
     let ws_state = unsafe {
         let obj_ptr = ws_slot
@@ -1596,7 +1596,7 @@ pub fn sys_wait_set_add(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         {
             CapTag::Endpoint =>
             {
-                if !src_slot.rights.contains(Rights::RECEIVE)
+                if !src_slot.rights.contains(EpRights::RECEIVE.erase())
                 {
                     return Err(SyscallError::InsufficientRights);
                 }
@@ -1613,7 +1613,7 @@ pub fn sys_wait_set_add(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             }
             CapTag::Notification =>
             {
-                if !src_slot.rights.contains(Rights::WAIT)
+                if !src_slot.rights.contains(NtfRights::WAIT.erase())
                 {
                     return Err(SyscallError::InsufficientRights);
                 }
@@ -1630,7 +1630,7 @@ pub fn sys_wait_set_add(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             }
             CapTag::EventQueue =>
             {
-                if !src_slot.rights.contains(Rights::RECV)
+                if !src_slot.rights.contains(EqRights::RECV.erase())
                 {
                     return Err(SyscallError::InsufficientRights);
                 }
@@ -1790,7 +1790,7 @@ pub fn sys_wait_set_remove(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // Look up wait set.
     // SAFETY: cspace_ptr validated above.
-    let ws_slot = unsafe { lookup_cap(cspace_ptr, ws_idx, CapTag::WaitSet, Rights::MODIFY) }?;
+    let ws_slot = unsafe { lookup_cap(cspace_ptr, ws_idx, WsRights::MODIFY) }?;
     // SAFETY: ws_slot validated; object pointer is valid WaitSet.
     let ws_state = unsafe {
         let obj_ptr = ws_slot
@@ -1978,7 +1978,7 @@ pub fn sys_wait_set_wait(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // SAFETY: tcb validated non-null above.
     let cspace_ptr = unsafe { (*tcb).cspace };
     // SAFETY: cspace_ptr validated above.
-    let ws_slot = unsafe { lookup_cap(cspace_ptr, ws_idx, CapTag::WaitSet, Rights::WAIT) }?;
+    let ws_slot = unsafe { lookup_cap(cspace_ptr, ws_idx, WsRights::WAIT) }?;
 
     // SAFETY: ws_slot validated; object pointer is valid WaitSet.
     let ws_state = unsafe {

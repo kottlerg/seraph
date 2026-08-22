@@ -36,13 +36,13 @@ use syscall::{
     notification_wait_timeout, thread_exit, thread_sleep, thread_start, thread_stop, wait_set_add,
     wait_set_create, wait_set_wait,
 };
-use syscall_abi::{RIGHTS_RECEIVE, SyscallError};
+use syscall_abi::{RIGHTS_EP_RECEIVE, SyscallError};
 
 use crate::{ChildStack, TestContext, TestResult, spawn};
 
 /// Notification signal right (bit 7) and wait right (bit 8).
-const RIGHTS_SIGNAL: u64 = 1 << 7;
-const RIGHTS_WAIT: u64 = 1 << 8;
+const RIGHTS_SIGNAL: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
+const RIGHTS_WAIT: u64 = syscall_abi::RIGHTS_NTF_WAIT;
 
 /// Phase 1 (`notification_wait`) bits; OK2/BAD2 carry the post-restart sanity
 /// verdict (a genuine send after the cancelled wait still delivers).
@@ -173,7 +173,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     // ── Phase 4: ipc_recv (empty endpoint, no caller ever arrives). ─────────
     let ep = cap_create_endpoint(ctx.memory_base)
         .map_err(|_| "integration::park_interrupted_stop_start: create ep failed")?;
-    let child = spawn_phase(ctx, done, ep, RIGHTS_RECEIVE, recv_entry)?;
+    let child = spawn_phase(ctx, done, ep, RIGHTS_EP_RECEIVE, recv_entry)?;
     drive(
         child.th,
         done,

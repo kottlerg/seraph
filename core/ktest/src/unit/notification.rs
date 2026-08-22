@@ -16,9 +16,9 @@ use syscall_abi::{SyscallError, SystemInfoType};
 use crate::{ChildStack, TestContext, TestResult};
 
 // NOTIFY right only — no WAIT. Child threads only need to send.
-const RIGHTS_NOTIFY: u64 = 1 << 7;
+const RIGHTS_NOTIFY: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
 // WAIT right only — no NOTIFY. For testing insufficient rights on send.
-const RIGHTS_WAIT: u64 = 1 << 8;
+const RIGHTS_WAIT: u64 = syscall_abi::RIGHTS_NTF_WAIT;
 
 // Child stack for blocking-wait test.
 static mut CHILD_STACK: ChildStack = ChildStack::ZERO;

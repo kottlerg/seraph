@@ -63,9 +63,13 @@ pub fn run(ctx: &TestContext) -> TestResult
     {
         let cs = cap_create_cspace(memory, 0, 4, 64)
             .map_err(|_| "stress::retype_concurrent: create_cspace failed")?;
-        let child_memory = cap_copy(memory, cs, syscall::RIGHTS_RETYPE | syscall::RIGHTS_MAP_RW)
-            .map_err(|_| "stress::retype_concurrent: cap_copy memory failed")?;
-        let child_done = cap_copy(done, cs, 1 << 7)
+        let child_memory = cap_copy(
+            memory,
+            cs,
+            syscall::RIGHTS_MEM_RETYPE | syscall::RIGHTS_MEM_MAP_RW,
+        )
+        .map_err(|_| "stress::retype_concurrent: cap_copy memory failed")?;
+        let child_done = cap_copy(done, cs, syscall_abi::RIGHTS_NTF_NOTIFY)
             .map_err(|_| "stress::retype_concurrent: cap_copy done failed")?;
         let th = cap_create_thread(memory, ctx.aspace_cap, cs, 0, 0)
             .map_err(|_| "stress::retype_concurrent: create_thread failed")?;

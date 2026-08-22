@@ -6,7 +6,7 @@
 //! Retype primitive — turn Memory-cap-backed memory into kernel-object backings.
 //!
 //! The seven `SYS_CAP_CREATE_*` handlers consume a Memory cap with
-//! `Rights::RETYPE` and call [`retype_allocate`] to carve out a sub-region
+//! `MemRights::RETYPE` and call [`retype_allocate`] to carve out a sub-region
 //! of the cap's backing memory; the kernel object is constructed in place
 //! at the returned offset. On `dec_ref → 0`, the dealloc path looks at
 //! `KernelObjectHeader.ancestor` and calls [`retype_free`] to return the

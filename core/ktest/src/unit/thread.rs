@@ -36,8 +36,8 @@ use crate::{ChildStack, TestContext, TestResult};
 // the child NOTIFY on the readiness cap and WAIT on a *separate* blocking
 // cap, so the child cannot self-deliver its own readiness send before the
 // parent has registered as the waiter.
-const RIGHTS_NOTIFY: u64 = 1 << 7;
-const RIGHTS_WAIT: u64 = 1 << 8;
+const RIGHTS_NOTIFY: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
+const RIGHTS_WAIT: u64 = syscall_abi::RIGHTS_NTF_WAIT;
 
 // Expected TrapFrame size per architecture (kernel/src/arch/*/trap_frame.rs).
 #[cfg(target_arch = "x86_64")]

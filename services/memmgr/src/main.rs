@@ -95,17 +95,15 @@ const MAX_PROCESSES: usize = 64;
 
 /// Rights every pool frame MUST carry. A pool frame is general anonymous RAM:
 /// memmgr derives an R / RW / RX inner from it on demand (`cap_derive`, which
-/// only narrows), so the outer must hold WRITE (`1 << 1`) and EXECUTE
-/// (`1 << 2`) — the `cap::slot::Rights` bit positions mirrored by
-/// `RIGHTS_MAP_RW` / `RIGHTS_MAP_RX` — plus RETYPE so a consumer can still
-/// retype the frame. READ is omitted: the kernel grants read at every map
-/// (`sys_mem_map`) and the bulk usable-RAM caps are minted without it. Enforced
+/// only narrows), so the outer must hold `RIGHTS_MEM_WRITE` and
+/// `RIGHTS_MEM_EXECUTE`, plus RETYPE so a consumer can still retype the frame.
+/// MAP is omitted from the check: the kernel grants read at every map
+/// (`sys_mem_map`) and the bulk usable-RAM caps carry it anyway. Enforced
 /// at both pool entry points (`ingest_pool`, `handle_donate_memory_caps`) so a
 /// kernel mint-rights regression fails loudly instead of surfacing as an
 /// intermittent consumer fault.
-const POOL_FRAME_RIGHTS: u64 = ((syscall::RIGHTS_MAP_RW | syscall::RIGHTS_MAP_RX)
-    & !syscall::RIGHTS_MAP_READ)
-    | syscall::RIGHTS_RETYPE;
+const POOL_FRAME_RIGHTS: u64 =
+    syscall::RIGHTS_MEM_WRITE | syscall::RIGHTS_MEM_EXECUTE | syscall::RIGHTS_MEM_RETYPE;
 
 // ── Metadata arena ────────────────────────────────────────────────────────────
 //
@@ -1010,7 +1008,7 @@ fn take_exactly(pool: &mut FreePool, idx: usize, want: u32) -> Option<(u32, u64)
 ///
 /// `RIGHTS_ALL` is required so the caller can in turn derive RW/RX/R-only
 /// variants for distinct page mappings (procmgr's ELF loader covers all
-/// three). Restricting to `RIGHTS_MAP_RW` here would silently break
+/// three). Restricting to `RIGHTS_MEM_MAP_RW` here would silently break
 /// executable-segment maps, since `cap_derive` only narrows rights.
 fn derive_for_caller(outer_slot: u32) -> Option<u32>
 {
@@ -1317,7 +1315,8 @@ fn handle_register_process(req: &IpcMessage, ipc_buf: *mut u64, service_ep: u32,
         return;
     }
 
-    let Ok(send_cap) = syscall::cap_derive_badge(service_ep, syscall::RIGHTS_SEND_GRANT, new_badge)
+    let Ok(send_cap) =
+        syscall::cap_derive_badge(service_ep, syscall::RIGHTS_EP_SEND_GRANT, new_badge)
     else
     {
         // Roll back the table insertion.

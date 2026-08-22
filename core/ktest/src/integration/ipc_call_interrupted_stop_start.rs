@@ -30,13 +30,13 @@ use syscall::{
     cap_copy, cap_create_endpoint, cap_create_notification, cap_delete, ipc_buffer_set,
     notification_send, notification_wait, thread_exit, thread_sleep, thread_start, thread_stop,
 };
-use syscall_abi::{RIGHTS_RECEIVE, RIGHTS_SEND_GRANT, SyscallError};
+use syscall_abi::{RIGHTS_EP_RECEIVE, RIGHTS_EP_SEND_GRANT, SyscallError};
 
 use crate::{ChildStack, TestContext, TestResult, spawn};
 
 /// Notification signal right (bit 7) and wait right (bit 8).
-const RIGHTS_SIGNAL: u64 = 1 << 7;
-const RIGHTS_WAIT: u64 = 1 << 8;
+const RIGHTS_SIGNAL: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
+const RIGHTS_WAIT: u64 = syscall_abi::RIGHTS_NTF_WAIT;
 
 /// Phase 1 (`BlockedOnSend`) bits: client about to call / contract held / broken.
 const BIT_P1_READY: u64 = 1 << 0;
@@ -80,7 +80,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         .map_err(|_| "integration::ipc_call_interrupted_stop_start: create ep1 failed")?;
     let client = spawn::new_child(ctx)
         .map_err(|_| "integration::ipc_call_interrupted_stop_start: spawn p1 client failed")?;
-    let c_ep = cap_copy(ep1, client.cs, RIGHTS_SEND_GRANT)
+    let c_ep = cap_copy(ep1, client.cs, RIGHTS_EP_SEND_GRANT)
         .map_err(|_| "integration::ipc_call_interrupted_stop_start: cap_copy p1 ep failed")?;
     let c_done = cap_copy(done, client.cs, RIGHTS_SIGNAL)
         .map_err(|_| "integration::ipc_call_interrupted_stop_start: cap_copy p1 done failed")?;
@@ -118,7 +118,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     let server = spawn::new_child(ctx)
         .map_err(|_| "integration::ipc_call_interrupted_stop_start: spawn server failed")?;
-    let s_ep = cap_copy(ep2, server.cs, RIGHTS_RECEIVE)
+    let s_ep = cap_copy(ep2, server.cs, RIGHTS_EP_RECEIVE)
         .map_err(|_| "integration::ipc_call_interrupted_stop_start: cap_copy s ep failed")?;
     let s_done = cap_copy(done, server.cs, RIGHTS_SIGNAL)
         .map_err(|_| "integration::ipc_call_interrupted_stop_start: cap_copy s done failed")?;
@@ -132,7 +132,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     let client2 = spawn::new_child(ctx)
         .map_err(|_| "integration::ipc_call_interrupted_stop_start: spawn p2 client failed")?;
-    let p2c_ep = cap_copy(ep2, client2.cs, RIGHTS_SEND_GRANT)
+    let p2c_ep = cap_copy(ep2, client2.cs, RIGHTS_EP_SEND_GRANT)
         .map_err(|_| "integration::ipc_call_interrupted_stop_start: cap_copy p2 ep failed")?;
     let p2c_done = cap_copy(done, client2.cs, RIGHTS_SIGNAL)
         .map_err(|_| "integration::ipc_call_interrupted_stop_start: cap_copy p2 done failed")?;

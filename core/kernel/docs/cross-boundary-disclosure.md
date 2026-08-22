@@ -48,7 +48,7 @@ is in [docs/syscalls.md](syscalls.md).
 | Surface | Anchor (stable identifier) | Class |
 |---|---|---|
 | Syscall return convention; no raw-pointer return path | `syscall::dispatch`, `TrapFrame::set_return` | b/c/d |
-| `SYS_CAP_INFO` tag/rights, thread-state, TLB / cspace / memory counts | `cap::sys_cap_info` | c/d |
+| `SYS_CAP_INFO` tag/rights (rights half is type-scoped, interpreted via the tag in the high half), thread-state, TLB / cspace / memory counts | `cap::sys_cap_info` | c/d |
 | `CAP_INFO_MEMORY_PHYS_BASE` → `MemoryObject::base` | `cap::sys_cap_info`, `cap::object::MemoryObject` | **e** |
 | `SYS_SYSTEM_INFO` (version, cpu count, page size, elapsed µs, current cpu) | `sysinfo::sys_system_info` | c/d |
 | `SYS_ASPACE_QUERY` → leaf physical address of a user page | `sysinfo::sys_aspace_query`, `AddressSpace::query_page` | **e** |

@@ -246,9 +246,9 @@ power-management path but delegated to no one today.
 an EID set carried by `SbiControlObject`, because the extension set is small and
 non-numeric and only one actuating consumer exists (pwrmgr, SRST-only).
 `SbiControlObject` stays bare and the init descriptor is unchanged
-(`aux0 = aux1 = 0`), so `INIT_PROTOCOL_VERSION` is not bumped. The shared 32-bit
-`Rights` budget bounds how many extensions can be sanctioned this way; revisiting
-that budget (per-type rights) is tracked separately.
+(`aux0 = aux1 = 0`), so `INIT_PROTOCOL_VERSION` is not bumped. Rights are scoped
+per capability type, so `SbiControl` draws on its own full 32-bit space —
+sanctioning further extensions does not compete with any other type's rights.
 
 ### SchedControl
 
@@ -283,9 +283,21 @@ see [core/kernel/docs/scheduler.md § Priority Levels](../core/kernel/docs/sched
 
 ## Rights and Attenuation
 
-Rights are a bitmask attached to each capability slot. When deriving a capability,
-the derived copy may have equal or fewer rights than the source — rights can only
-be removed, never added. This is called **attenuation**.
+Rights are a bitmask attached to each capability slot. The bitmask is **scoped per
+capability type**: each slot stores one 32-bit rights word, and the slot's type tag
+selects which type's rights vocabulary interprets it. Every type numbers its bits
+from 0 in its own full-width space, so bit assignments never compete across types —
+adding a right to one capability type cannot exhaust another type's budget. The
+`u64` masks in `abi/syscall` are the single source of truth for bit values; the
+kernel's typed rights constants are derived from them, and a rights mask is only
+meaningful for the capability type it is named for. The all-ones mask (`RIGHTS_ALL`)
+is valid for every type.
+
+When deriving a capability, the derived copy may have equal or fewer rights than
+the source — rights can only be removed, never added. This is called
+**attenuation**. Attenuation is a bitwise AND against the source's rights word and
+is uniform across types; the per-type scoping changes only how the bits are named
+and numbered, not how they attenuate.
 
 A process cannot grant another process more authority than it holds itself. If a
 process holds a send-only endpoint capability, it can derive another send-only

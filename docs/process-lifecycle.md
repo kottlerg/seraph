@@ -242,7 +242,7 @@ at creation time. Examples:
   endpoint, for process-lifecycle queries.
 - `ProcessInfo.log_send_cap` — badged SEND cap on the master log
   endpoint, minted by procmgr per child via
-  `cap_derive_badge(log_send_source, RIGHTS_SEND, process_badge)`.
+  `cap_derive_badge(log_send_source, RIGHTS_EP_SEND, process_badge)`.
   The cap's kernel-attached badge equals procmgr's process badge,
   which also equals the death-EQ correlator procmgr posts to
   logd. Identity is reconciled across the three views without

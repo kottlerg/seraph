@@ -198,58 +198,31 @@ pub enum CapTag
 
 ### Rights Bitmask
 
-```rust
-bitflags! {
-    pub struct Rights: u32
-    {
-        // Memory / address space
-        const MAP        = 1 << 0;   // may map this memory into an address space
-        const WRITE      = 1 << 1;   // may create writable mappings
-        const EXECUTE    = 1 << 2;   // may create executable mappings
-        const READ       = 1 << 3;   // may read/inspect mappings (AddressSpace)
+Rights are scoped per capability type: each slot stores one 32-bit erased rights
+word (`Rights`), and the slot's `CapTag` selects which type's vocabulary
+interprets it. Every type numbers its bits from 0 in its own full-width space.
+The `u64` `RIGHTS_*` constants in `abi/syscall` are the single source of truth
+for bit values; the kernel defines a `TypedRights<K: CapKind>` newtype per type
+(`MemRights`, `EpRights`, `NtfRights`, ...) whose constants are derived from the
+ABI values, so a rights constant of the wrong capability type cannot be passed
+to a lookup at compile time.
 
-        // IPC endpoint
-        const SEND       = 1 << 4;
-        const RECEIVE    = 1 << 5;
-        const GRANT      = 1 << 6;   // may include capabilities in IPC messages
+Per-type vocabularies (bit positions within each type's own space):
 
-        // Notification / event queue
-        const NOTIFY     = 1 << 7;
-        const WAIT       = 1 << 8;   // notification or wait set
-        const POST       = 1 << 9;
-        const RECV       = 1 << 10;
-
-        // Thread
-        const CONTROL    = 1 << 11;  // start, stop, configure
-        const OBSERVE    = 1 << 12;  // read register state
-
-        // CSpace
-        const INSERT     = 1 << 13;
-        const DELETE     = 1 << 14;
-        const DERIVE     = 1 << 15;
-        const REVOKE     = 1 << 16;
-
-        // WaitSet
-        const MODIFY     = 1 << 17;  // add or remove members
-
-        // IoPort
-        const USE        = 1 << 18;  // bind port range to a thread
-
-        // SchedControl carries no rights bit — bit 19 is unused. A
-        // SchedControl's authority is its presence plus its [min, max] band.
-
-        // SbiControl — one right per sanctioned SBI extension (RISC-V only)
-        const SBI_RESET   = 1 << 20;  // forward SRST (system reset)
-        const SBI_SUSPEND = 1 << 22;  // forward SUSP (system suspend)
-        const SBI_CPPC    = 1 << 23;  // forward CPPC (perf control)
-        const SBI_BASE    = 1 << 24;  // forward Base (read-only version probe)
-        const SBI_DBCN    = 1 << 25;  // forward DBCN (debug console)
-        const SBI_PMU     = 1 << 26;  // forward PMU (perf monitoring)
-
-        // Memory retype
-        const RETYPE     = 1 << 21;  // retype a Memory cap's region into kernel objects
-    }
-}
+```text
+Memory        MAP=0  WRITE=1  EXECUTE=2  READ=3  RETYPE=4
+AddressSpace  MAP=0  READ=1   CONTROL=2
+Endpoint      SEND=0 RECEIVE=1 GRANT=2
+Notification  NOTIFY=0 WAIT=1
+EventQueue    POST=0 RECV=1
+Interrupt     NOTIFY=0
+Mmio          MAP=0  WRITE=1
+Thread        CONTROL=0 OBSERVE=1
+CSpace        INSERT=0 DELETE=1 DERIVE=2 REVOKE=3
+WaitSet       MODIFY=0 WAIT=1
+IoPort        USE=0
+SchedControl  (no rights bits: presence + [min, max] band is the authority)
+SbiControl    RESET=0 SUSPEND=1 CPPC=2 BASE=3 DBCN=4 PMU=5
 ```
 
 Rights are checked at every syscall that uses a capability. The check is a single
@@ -260,7 +233,7 @@ W^X enforcement at mapping time (`mem_map`, `mem_protect`):
 ```rust
 fn check_wx(rights: Rights) -> Result<(), SyscallError>
 {
-    if rights.contains(Rights::WRITE | Rights::EXECUTE)
+    if rights.contains((MemRights::WRITE | MemRights::EXECUTE).erase())
     {
         Err(SyscallError::WxViolation)
     } else

@@ -12,7 +12,7 @@ use crate::{TestContext, TestResult};
 
 const CHAIN_DEPTH: usize = 8;
 const PASSES: usize = 500;
-const RIGHTS_NOTIFY: u64 = 1 << 7;
+const RIGHTS_NOTIFY: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
 
 pub fn run(ctx: &TestContext) -> TestResult
 {

@@ -12,14 +12,12 @@ use syscall::{
     cap_copy, cap_create_endpoint, cap_create_notification, cap_delete, notification_send,
     notification_wait, thread_exit,
 };
+use syscall_abi::RIGHTS_EP_SEND_GRANT;
 
 use crate::{ChildStack, TestContext, TestResult, spawn};
 
 const NUM_CALLERS: usize = 64;
 const CYCLES: usize = 200;
-
-// SEND + GRANT rights.
-const RIGHTS_SEND_GRANT: u64 = (1 << 4) | (1 << 6);
 
 pub fn run(ctx: &TestContext) -> TestResult
 {
@@ -38,9 +36,9 @@ pub fn run(ctx: &TestContext) -> TestResult
         {
             let child =
                 spawn::new_child(ctx).map_err(|_| "concurrent_ipc: spawn::new_child failed")?;
-            let child_ep = cap_copy(ep, child.cs, RIGHTS_SEND_GRANT)
+            let child_ep = cap_copy(ep, child.cs, RIGHTS_EP_SEND_GRANT)
                 .map_err(|_| "concurrent_ipc: cap_copy ep failed")?;
-            let child_done = cap_copy(done, child.cs, 1 << 7)
+            let child_done = cap_copy(done, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
                 .map_err(|_| "concurrent_ipc: cap_copy done failed")?;
 
             // Pack: ep_slot[15:0], done_slot[31:16], label=i+1 (1-based)[47:32],

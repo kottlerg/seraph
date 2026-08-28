@@ -23,8 +23,8 @@ pub fn run(ctx: &TestContext) -> TestResult
     for _i in 0..ITERATIONS
     {
         let child = spawn::new_child(ctx).map_err(|_| "thread_churn: spawn::new_child failed")?;
-        let child_done =
-            cap_copy(done, child.cs, 1 << 7).map_err(|_| "thread_churn: cap_copy failed")?;
+        let child_done = cap_copy(done, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
+            .map_err(|_| "thread_churn: cap_copy failed")?;
 
         // SAFETY: Sequential execution; only one child uses STRESS_STACKS[0] at a time.
         let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[0]) });

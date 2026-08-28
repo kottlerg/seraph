@@ -42,8 +42,8 @@ fn notification_pong_entry(arg: u64) -> !
 #[allow(clippy::similar_names)]
 pub(super) fn bench_notification_roundtrip(ctx: &crate::TestContext, iters: u32)
 {
-    const RIGHTS_NOTIFY: u64 = 1 << 7;
-    const RIGHTS_WAIT: u64 = 1 << 8;
+    const RIGHTS_NOTIFY: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
+    const RIGHTS_WAIT: u64 = syscall_abi::RIGHTS_NTF_WAIT;
     let n = u64::from(iters);
 
     let Ok(ping) = cap_create_notification(ctx.memory_base)

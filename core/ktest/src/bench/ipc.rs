@@ -48,7 +48,7 @@ fn ipc_caller_entry(arg: u64) -> !
 
 pub(super) fn bench_ipc_round_trip(ctx: &crate::TestContext, iters: u32)
 {
-    const RIGHTS_SEND_GRANT: u64 = (1 << 4) | (1 << 6);
+    use syscall_abi::RIGHTS_EP_SEND_GRANT;
     let n = u64::from(iters);
 
     let Ok(ep) = cap_create_endpoint(ctx.memory_base)
@@ -67,12 +67,12 @@ pub(super) fn bench_ipc_round_trip(ctx: &crate::TestContext, iters: u32)
     {
         return;
     };
-    let Ok(child_ep) = cap_copy(ep, child.cs, RIGHTS_SEND_GRANT)
+    let Ok(child_ep) = cap_copy(ep, child.cs, RIGHTS_EP_SEND_GRANT)
     else
     {
         return;
     };
-    let Ok(child_done) = cap_copy(done, child.cs, 1 << 7)
+    let Ok(child_done) = cap_copy(done, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
     else
     {
         return;

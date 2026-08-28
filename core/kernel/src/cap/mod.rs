@@ -60,7 +60,11 @@ pub use object::{
     SchedControlObject, ThreadObject,
 };
 #[allow(unused_imports)]
-pub use slot::{CSpaceId, CapTag, CapabilitySlot, Rights, SlotId};
+pub use slot::{
+    AsRights, CSpaceId, CapKind, CapTag, CapabilitySlot, CsRights, EpRights, EqRights,
+    IoPortRights, IrqRights, MemRights, MmioRights, NtfRights, Rights, SbiRights, SchedRights,
+    SlotId, ThreadRights, TypedRights, WsRights,
+};
 
 use boot_protocol::{BootInfo, MemoryMapEntry, MemoryType, MmioAperture};
 use core::ptr::NonNull;
@@ -1552,8 +1556,7 @@ fn populate_cspace(
             });
             let slot = insert_or_fatal(
                 cspace,
-                CapTag::Memory,
-                Rights::MAP | Rights::WRITE | Rights::EXECUTE | Rights::RETYPE,
+                MemRights::MAP | MemRights::WRITE | MemRights::EXECUTE | MemRights::RETYPE,
                 ptr,
                 "Phase 7: cannot allocate Memory capability for usable memory",
             );
@@ -1610,8 +1613,7 @@ fn populate_cspace(
         let ptr = nonnull_from_box(obj);
         let slot = insert_or_fatal(
             cspace,
-            CapTag::Memory,
-            Rights::MAP | Rights::WRITE | Rights::EXECUTE | Rights::RETYPE,
+            MemRights::MAP | MemRights::WRITE | MemRights::EXECUTE | MemRights::RETYPE,
             ptr,
             "Phase 7: cannot allocate Memory capability for usable memory",
         );
@@ -1656,8 +1658,7 @@ fn populate_cspace(
         });
         let slot = insert_or_fatal(
             cspace,
-            CapTag::Mmio,
-            Rights::MAP | Rights::WRITE,
+            MmioRights::MAP | MmioRights::WRITE,
             ptr,
             "Phase 7: cannot allocate Mmio capability for console UART",
         );
@@ -1689,8 +1690,7 @@ fn populate_cspace(
         });
         let slot = insert_or_fatal(
             cspace,
-            CapTag::Mmio,
-            Rights::MAP | Rights::WRITE,
+            MmioRights::MAP | MmioRights::WRITE,
             ptr,
             "Phase 7: cannot allocate Mmio capability for aperture",
         );
@@ -1722,8 +1722,7 @@ fn populate_cspace(
     });
     let sched_control_slot = insert_or_fatal(
         cspace,
-        CapTag::SchedControl,
-        Rights::NONE,
+        SchedRights::NONE,
         ptr,
         "Phase 7: cannot allocate SchedControl capability",
     );
@@ -1753,8 +1752,7 @@ fn populate_cspace(
     });
     let irq_range_slot = insert_or_fatal(
         cspace,
-        CapTag::Interrupt,
-        Rights::NOTIFY,
+        IrqRights::NOTIFY,
         irq_ptr,
         "Phase 7: cannot allocate root Interrupt range capability",
     );
@@ -1810,8 +1808,7 @@ fn populate_cspace(
         });
         let slot = insert_or_fatal(
             cspace,
-            CapTag::Memory,
-            Rights::MAP | Rights::READ,
+            MemRights::MAP,
             ptr,
             "Phase 7: cannot allocate Memory capability for ACPI region",
         );
@@ -1854,8 +1851,7 @@ fn populate_cspace(
         });
         let slot = insert_or_fatal(
             cspace,
-            CapTag::Memory,
-            Rights::MAP | Rights::READ,
+            MemRights::MAP,
             ptr,
             "Phase 7: cannot allocate Memory capability for ACPI RSDP page",
         );
@@ -1897,8 +1893,7 @@ fn populate_cspace(
             });
             let slot = insert_or_fatal(
                 cspace,
-                CapTag::Memory,
-                Rights::MAP | Rights::READ,
+                MemRights::MAP,
                 ptr,
                 "Phase 7: cannot allocate Memory capability for DTB blob",
             );
@@ -1937,8 +1932,7 @@ fn populate_cspace(
         });
         let ioport_root_slot = insert_or_fatal(
             cspace,
-            CapTag::IoPort,
-            Rights::USE,
+            IoPortRights::USE,
             ptr,
             "Phase 7: cannot allocate root IoPort capability",
         );
@@ -1964,13 +1958,12 @@ fn populate_cspace(
         });
         let slot = insert_or_fatal(
             cspace,
-            CapTag::SbiControl,
-            Rights::SBI_RESET
-                | Rights::SBI_SUSPEND
-                | Rights::SBI_CPPC
-                | Rights::SBI_BASE
-                | Rights::SBI_DBCN
-                | Rights::SBI_PMU,
+            SbiRights::RESET
+                | SbiRights::SUSPEND
+                | SbiRights::CPPC
+                | SbiRights::BASE
+                | SbiRights::DBCN
+                | SbiRights::PMU,
             ptr,
             "Phase 7: cannot allocate SbiControl capability",
         );
@@ -2121,8 +2114,7 @@ fn mint_module_memory_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &m
         // cap allowing WRITE.
         let slot = insert_or_fatal(
             cspace,
-            CapTag::Memory,
-            Rights::MAP | Rights::READ | Rights::WRITE | Rights::EXECUTE | Rights::RETYPE,
+            MemRights::MAP | MemRights::WRITE | MemRights::EXECUTE | MemRights::RETYPE,
             ptr,
             "Phase 7: cannot allocate Memory capability for boot module",
         );
@@ -2353,8 +2345,7 @@ fn mint_reclaim_pass(
         });
         let slot = insert_or_fatal(
             cspace,
-            CapTag::Memory,
-            Rights::MAP | Rights::READ | Rights::WRITE | Rights::EXECUTE | Rights::RETYPE,
+            MemRights::MAP | MemRights::WRITE | MemRights::EXECUTE | MemRights::RETYPE,
             ptr,
             "Phase 7: cannot allocate Memory capability for reclaimed boot scratch",
         );
@@ -2589,15 +2580,17 @@ pub unsafe fn move_cap_between_cspaces(
 }
 
 /// Insert a capability, calling [`crate::fatal`] on error.
-fn insert_or_fatal(
+///
+/// The tag is derived from the typed rights argument, so a mint site cannot
+/// pair a tag with another type's rights.
+fn insert_or_fatal<K: slot::CapKind>(
     cspace: &mut CSpace,
-    tag: CapTag,
-    rights: Rights,
+    rights: slot::TypedRights<K>,
     object: NonNull<KernelObjectHeader>,
     msg: &'static str,
 ) -> u32
 {
-    match cspace.insert_cap(tag, rights, object)
+    match cspace.insert_cap_typed(rights, object)
     {
         Ok(idx) => idx.get(),
         #[cfg(not(test))]

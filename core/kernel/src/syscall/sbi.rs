@@ -63,20 +63,20 @@ const SBI_EXT_PMU: u64 = 0x0050_4D55;
 /// (TIME/IPI/RFENCE/HSM) and is never forwardable from userspace regardless of
 /// cap. Every other extension is sanctioned with a right; whether any consumer
 /// receives a cap bearing that right is userspace cap-distribution policy.
-/// Adding a sanctioned extension is one entry here plus one `Rights` bit in
-/// `cap::slot::Rights`.
+/// Adding a sanctioned extension is one entry here plus one `SbiRights` bit in
+/// `abi/syscall` / `cap::slot`.
 #[cfg(not(test))]
-fn sbi_required_right(extension: u64) -> Option<crate::cap::slot::Rights>
+fn sbi_required_right(extension: u64) -> Option<crate::cap::slot::SbiRights>
 {
-    use crate::cap::slot::Rights;
+    use crate::cap::slot::SbiRights;
     match extension
     {
-        SBI_EXT_SRST => Some(Rights::SBI_RESET),
-        SBI_EXT_SUSP => Some(Rights::SBI_SUSPEND),
-        SBI_EXT_CPPC => Some(Rights::SBI_CPPC),
-        SBI_EXT_BASE => Some(Rights::SBI_BASE),
-        SBI_EXT_DBCN => Some(Rights::SBI_DBCN),
-        SBI_EXT_PMU => Some(Rights::SBI_PMU),
+        SBI_EXT_SRST => Some(SbiRights::RESET),
+        SBI_EXT_SUSP => Some(SbiRights::SUSPEND),
+        SBI_EXT_CPPC => Some(SbiRights::CPPC),
+        SBI_EXT_BASE => Some(SbiRights::BASE),
+        SBI_EXT_DBCN => Some(SbiRights::DBCN),
+        SBI_EXT_PMU => Some(SbiRights::PMU),
         _ => None,
     }
 }
@@ -85,7 +85,6 @@ fn sbi_required_right(extension: u64) -> Option<crate::cap::slot::Rights>
 #[cfg(not(test))]
 pub fn sys_sbi_call(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
-    use crate::cap::slot::CapTag;
     use crate::syscall::current_tcb;
 
     // SBI is a RISC-V firmware interface; x86-64 has no equivalent.
@@ -117,7 +116,7 @@ pub fn sys_sbi_call(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // SAFETY: tcb validated non-null; cspace field always valid for initialized TCB.
     let cspace = unsafe { (*tcb).cspace };
     // SAFETY: cspace from current TCB; lookup_cap validates tag and rights.
-    let _slot = unsafe { super::lookup_cap(cspace, sbi_cap_idx, CapTag::SbiControl, required) }?;
+    let _slot = unsafe { super::lookup_cap(cspace, sbi_cap_idx, required) }?;
 
     // Forward the SBI call to firmware; SBI errors map to NotSupported.
     crate::arch::current::sbi_forward(extension, function, a0, a1, a2)

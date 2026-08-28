@@ -622,7 +622,7 @@ fn handle_read_block_into_memory(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut B
     };
     let tag = (tag_rights >> 32) as u8;
     let rights = tag_rights & 0xFFFF_FFFF;
-    let required = syscall::RIGHTS_MAP_RW;
+    let required = syscall::RIGHTS_MEM_MAP_RW;
     if u64::from(tag) != u64::from(syscall::CAP_TAG_MEMORY) || (rights & required) != required
     {
         reply_with(ipc::blk_errors::INVALID_MEMORY_CAP, ipc_buf);
@@ -762,7 +762,7 @@ fn handle_write_block_from_memory(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut 
     };
     let tag = (tag_rights >> 32) as u8;
     let rights = tag_rights & 0xFFFF_FFFF;
-    let required = syscall::RIGHTS_MAP_READ;
+    let required = syscall::RIGHTS_MEM_MAP;
     if u64::from(tag) != u64::from(syscall::CAP_TAG_MEMORY) || (rights & required) != required
     {
         reply_with(ipc::blk_errors::INVALID_MEMORY_CAP, ipc_buf);
@@ -957,7 +957,7 @@ fn handle_register_partition(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRu
     }
 
     let Ok(partition_cap) =
-        syscall::cap_derive_badge(rt.service_ep, syscall::RIGHTS_SEND_GRANT, new_badge)
+        syscall::cap_derive_badge(rt.service_ep, syscall::RIGHTS_EP_SEND_GRANT, new_badge)
     else
     {
         // Roll back the partition insert so the table doesn't grow a

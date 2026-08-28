@@ -490,6 +490,31 @@ impl CSpace
         Ok(self.cap_handle(index))
     }
 
+    /// [`insert_cap`](Self::insert_cap) with the tag derived from the typed
+    /// rights argument, so a mint site cannot pair a tag with another type's
+    /// rights. Use for static mints; dynamic restamp paths (copy/move/derive)
+    /// keep the untyped API.
+    pub fn insert_cap_typed<K: super::slot::CapKind>(
+        &mut self,
+        rights: super::slot::TypedRights<K>,
+        object: NonNull<KernelObjectHeader>,
+    ) -> Result<NonZeroU32, CapError>
+    {
+        self.insert_cap(K::TAG, rights.erase(), object)
+    }
+
+    /// [`insert_cap_handle`](Self::insert_cap_handle) with the tag derived
+    /// from the typed rights argument; see
+    /// [`insert_cap_typed`](Self::insert_cap_typed).
+    pub fn insert_cap_handle_typed<K: super::slot::CapKind>(
+        &mut self,
+        rights: super::slot::TypedRights<K>,
+        object: NonNull<KernelObjectHeader>,
+    ) -> Result<u32, CapError>
+    {
+        self.insert_cap_handle(K::TAG, rights.erase(), object)
+    }
+
     /// Grow the `CSpace` until at least `min_free` slots are available without
     /// a further grow. Used to pre-warm the free list before bulk insertions.
     pub fn pre_allocate(&mut self, min_free: usize) -> Result<(), CapError>
@@ -723,6 +748,7 @@ mod tests
 {
     use super::*;
     use crate::cap::object::{KernelObjectHeader, MemoryObject, ObjectType};
+    use crate::cap::slot::MemRights;
     use core::ptr::NonNull;
 
     /// Construct a dummy NonNull<KernelObjectHeader> backed by a leaked Box
@@ -775,12 +801,12 @@ mod tests
         let mut cs = CSpace::new(0, 16384);
         let obj = dummy_object();
         let idx = cs
-            .insert_cap(CapTag::Memory, Rights::MAP | Rights::WRITE, obj)
+            .insert_cap_typed(MemRights::MAP | MemRights::WRITE, obj)
             .unwrap();
         let slot = cs.slot(idx.get()).unwrap();
         assert_eq!(slot.tag, CapTag::Memory);
-        assert!(slot.rights.contains(Rights::MAP));
-        assert!(slot.rights.contains(Rights::WRITE));
+        assert!(slot.rights.contains(MemRights::MAP.erase()));
+        assert!(slot.rights.contains(MemRights::WRITE.erase()));
         assert_eq!(slot.object, Some(obj));
     }
 
@@ -846,10 +872,13 @@ mod tests
         let mut cs = CSpace::new(0, 16384);
         let obj = dummy_object();
         let slot = cs
-            .insert_cap(CapTag::Memory, Rights::WRITE | Rights::EXECUTE, obj)
+            .insert_cap_typed(MemRights::WRITE | MemRights::EXECUTE, obj)
             .expect("WRITE|EXECUTE cap should be allowed at cap level");
         let s = cs.slot(slot.get()).unwrap();
-        assert!(s.rights.contains(Rights::WRITE | Rights::EXECUTE));
+        assert!(
+            s.rights
+                .contains((MemRights::WRITE | MemRights::EXECUTE).erase())
+        );
     }
 
     #[test]
@@ -866,7 +895,7 @@ mod tests
         let mut cs = CSpace::new(0, 16384);
         assert_eq!(cs.populated_count(), 0);
         let obj = dummy_object();
-        cs.insert_cap(CapTag::Memory, Rights::MAP, obj).unwrap();
+        cs.insert_cap_typed(MemRights::MAP, obj).unwrap();
         assert_eq!(cs.populated_count(), 1);
     }
 
@@ -905,7 +934,7 @@ mod tests
 
         for expected in 1..=5usize
         {
-            cs.insert_cap(CapTag::Memory, Rights::MAP, obj).unwrap();
+            cs.insert_cap_typed(MemRights::MAP, obj).unwrap();
             assert_eq!(
                 cs.populated_count(),
                 expected,

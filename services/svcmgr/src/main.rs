@@ -206,7 +206,7 @@ fn publish_well_known(
     }
 
     // svcmgr — SEND on svcmgr's own service endpoint (crasher seeds it).
-    match syscall::cap_derive(caps.service_ep, syscall::RIGHTS_SEND)
+    match syscall::cap_derive(caps.service_ep, syscall::RIGHTS_EP_SEND)
     {
         Ok(send) =>
         {
@@ -228,7 +228,7 @@ fn publish_well_known(
     {
         match syscall::cap_derive_badge(
             caps.devmgr_registry,
-            syscall::RIGHTS_SEND,
+            syscall::RIGHTS_EP_SEND,
             ipc::devmgr_labels::REGISTRY_QUERY_AUTHORITY,
         )
         {
@@ -289,11 +289,11 @@ fn install_drivers_dir(caps: &service::SvcmgrCaps, ipc_buf: *mut u64)
             }
         };
 
-    // `RIGHTS_SEND_GRANT` (not bare SEND): SET_DRIVERS_DIR transfers the
+    // `RIGHTS_EP_SEND_GRANT` (not bare SEND): SET_DRIVERS_DIR transfers the
     // dir cap, and the IPC kernel requires the GRANT bit to move caps.
     let Ok(bind_ep) = syscall::cap_derive_badge(
         caps.devmgr_registry,
-        syscall::RIGHTS_SEND_GRANT,
+        syscall::RIGHTS_EP_SEND_GRANT,
         ipc::devmgr_labels::DRIVERS_DIR_AUTHORITY,
     )
     else
@@ -544,7 +544,7 @@ fn handle_publish_endpoint(
 }
 
 /// Look up `name` in the discovery registry and derive a fresh
-/// `RIGHTS_SEND` cap on the published endpoint. Evicts the entry on
+/// `RIGHTS_EP_SEND` cap on the published endpoint. Evicts the entry on
 /// `cap_derive` failure (publisher's endpoint is gone), so subsequent
 /// queries see `UNKNOWN_NAME` instead of looping on
 /// `INSUFFICIENT_CAPS`. Returns a `svcmgr_errors::*` code on miss or
@@ -563,7 +563,7 @@ pub(crate) fn registry_lookup_derived(
     {
         return Err(ipc::svcmgr_errors::UNKNOWN_NAME);
     };
-    let Ok(derived) = syscall::cap_derive(cap, syscall::RIGHTS_SEND)
+    let Ok(derived) = syscall::cap_derive(cap, syscall::RIGHTS_EP_SEND)
     else
     {
         let _ = registry.remove(name);

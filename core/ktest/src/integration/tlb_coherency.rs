@@ -39,7 +39,7 @@ use syscall_abi::SystemInfoType;
 use crate::{ChildStack, TestContext, TestResult};
 
 const TEST_VA: u64 = 0x1_5000_0000; // Distinct from other integration tests.
-const RIGHTS_NOTIFY_WAIT: u64 = (1 << 7) | (1 << 8);
+const RIGHTS_NOTIFY_WAIT: u64 = syscall_abi::RIGHTS_NTF_NOTIFY | syscall_abi::RIGHTS_NTF_WAIT;
 const CYCLES: usize = 100;
 /// Value the parent writes into the mapped frame each cycle; the child reads it
 /// back to confirm the translation resolves to the right frame.

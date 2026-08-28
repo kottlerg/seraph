@@ -38,7 +38,7 @@ pub fn sys_thread_configure(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
     use crate::arch::current::trap_frame::TrapFrame as ArchTrapFrame;
     use crate::cap::object::ThreadObject;
-    use crate::cap::slot::{CapTag, Rights};
+    use crate::cap::slot::ThreadRights;
     use crate::sched::thread::ThreadState;
     use crate::syscall::current_tcb;
     use core::mem::size_of;
@@ -62,7 +62,7 @@ pub fn sys_thread_configure(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
     let thread_slot =
-        unsafe { super::lookup_cap(caller_cspace, thread_idx, CapTag::Thread, Rights::CONTROL) }?;
+        unsafe { super::lookup_cap(caller_cspace, thread_idx, ThreadRights::CONTROL) }?;
 
     let target_tcb = {
         let obj = thread_slot.object.ok_or(SyscallError::InvalidCapability)?;
@@ -135,7 +135,7 @@ pub fn sys_thread_configure(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 pub fn sys_thread_start(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::object::ThreadObject;
-    use crate::cap::slot::{CapTag, Rights};
+    use crate::cap::slot::ThreadRights;
     use crate::sched::thread::ThreadState;
     use crate::syscall::current_tcb;
 
@@ -152,7 +152,7 @@ pub fn sys_thread_start(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
     let thread_slot =
-        unsafe { super::lookup_cap(caller_cspace, thread_idx, CapTag::Thread, Rights::CONTROL) }?;
+        unsafe { super::lookup_cap(caller_cspace, thread_idx, ThreadRights::CONTROL) }?;
 
     let target_tcb = {
         let obj = thread_slot.object.ok_or(SyscallError::InvalidCapability)?;
@@ -222,7 +222,7 @@ pub fn sys_thread_start(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 pub fn sys_thread_stop(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::object::ThreadObject;
-    use crate::cap::slot::{CapTag, Rights};
+    use crate::cap::slot::ThreadRights;
     use crate::sched::thread::ThreadState;
     use crate::syscall::current_tcb;
 
@@ -239,7 +239,7 @@ pub fn sys_thread_stop(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
     let thread_slot =
-        unsafe { super::lookup_cap(caller_cspace, thread_idx, CapTag::Thread, Rights::CONTROL) }?;
+        unsafe { super::lookup_cap(caller_cspace, thread_idx, ThreadRights::CONTROL) }?;
 
     let target_tcb = {
         let obj = thread_slot.object.ok_or(SyscallError::InvalidCapability)?;
@@ -777,7 +777,7 @@ unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadControlBlock)
 pub fn sys_thread_set_fault_handler(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::object::{EndpointObject, KernelObjectHeader, ThreadObject};
-    use crate::cap::slot::{CapTag, Rights};
+    use crate::cap::slot::{EpRights, ThreadRights};
     use crate::syscall::current_tcb;
     use core::sync::atomic::Ordering;
 
@@ -804,7 +804,7 @@ pub fn sys_thread_set_fault_handler(tf: &mut TrapFrame) -> Result<u64, SyscallEr
 
     // SAFETY: caller_cspace validated; CONTROL required to mutate the target.
     let thread_slot =
-        unsafe { super::lookup_cap(caller_cspace, thread_idx, CapTag::Thread, Rights::CONTROL) }?;
+        unsafe { super::lookup_cap(caller_cspace, thread_idx, ThreadRights::CONTROL) }?;
     let target_tcb = {
         let obj = thread_slot.object.ok_or(SyscallError::InvalidCapability)?;
         // cast_ptr_alignment: header at offset 0 of ThreadObject; allocator guarantees alignment.
@@ -826,9 +826,7 @@ pub fn sys_thread_set_fault_handler(tf: &mut TrapFrame) -> Result<u64, SyscallEr
     else
     {
         // SAFETY: caller_cspace validated; no specific endpoint right required.
-        let ep_slot = unsafe {
-            super::lookup_cap(caller_cspace, endpoint_idx, CapTag::Endpoint, Rights::NONE)
-        }?;
+        let ep_slot = unsafe { super::lookup_cap(caller_cspace, endpoint_idx, EpRights::NONE) }?;
         let obj = ep_slot.object.ok_or(SyscallError::InvalidCapability)?;
         // cast_ptr_alignment: header at offset 0 of EndpointObject; allocator guarantees alignment.
         #[allow(clippy::cast_ptr_alignment)]
@@ -895,7 +893,7 @@ pub fn sys_thread_set_fault_handler(tf: &mut TrapFrame) -> Result<u64, SyscallEr
 pub fn sys_thread_set_priority(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::object::{SchedControlObject, ThreadObject};
-    use crate::cap::slot::{CapTag, Rights};
+    use crate::cap::slot::{SchedRights, ThreadRights};
     use crate::sched::thread::ThreadState;
     use crate::syscall::current_tcb;
     use syscall::PRIORITY_MAX;
@@ -922,8 +920,7 @@ pub fn sys_thread_set_priority(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // Setting any priority requires a SchedControl cap whose band covers the
     // requested level. Presence-only — no rights bit to check.
     // SAFETY: caller_cspace validated; lookup_cap checks the tag.
-    let sched_slot =
-        unsafe { super::lookup_cap(caller_cspace, sched_idx, CapTag::SchedControl, Rights::NONE) }?;
+    let sched_slot = unsafe { super::lookup_cap(caller_cspace, sched_idx, SchedRights::NONE) }?;
     let sched_obj = sched_slot.object.ok_or(SyscallError::InvalidCapability)?;
     // cast_ptr_alignment: header at offset 0 of SchedControlObject; allocator guarantees alignment.
     // SAFETY: tag confirmed SchedControl; pointer is a valid SchedControlObject.
@@ -936,7 +933,7 @@ pub fn sys_thread_set_priority(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
     let thread_slot =
-        unsafe { super::lookup_cap(caller_cspace, thread_idx, CapTag::Thread, Rights::CONTROL) }?;
+        unsafe { super::lookup_cap(caller_cspace, thread_idx, ThreadRights::CONTROL) }?;
 
     let target_tcb = {
         let obj = thread_slot.object.ok_or(SyscallError::InvalidCapability)?;
@@ -1025,7 +1022,7 @@ pub fn sys_sched_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     use crate::cap::object::{KernelObjectHeader, ObjectType, SchedControlObject, dealloc_object};
     use crate::cap::retype::alloc_in_seed;
     use crate::cap::seed_header_nn;
-    use crate::cap::slot::{CapTag, Rights};
+    use crate::cap::slot::{CapTag, SchedRights};
     use crate::cap::split::install_split_children;
     use crate::syscall::current_tcb;
 
@@ -1050,9 +1047,7 @@ pub fn sys_sched_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     let (min, max, rights, cspace_id, orig_obj_ptr) = {
         // SAFETY: caller_cspace validated; lookup_cap checks the tag (presence-only).
-        let slot = unsafe {
-            super::lookup_cap(caller_cspace, sched_idx, CapTag::SchedControl, Rights::NONE)
-        }?;
+        let slot = unsafe { super::lookup_cap(caller_cspace, sched_idx, SchedRights::NONE) }?;
         let obj_ptr = slot.object.ok_or(SyscallError::InvalidCapability)?;
         // cast_ptr_alignment: header at offset 0; allocator guarantees alignment.
         // SAFETY: tag confirmed SchedControl; pointer is a valid SchedControlObject.
@@ -1143,7 +1138,7 @@ pub fn sys_sched_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 pub fn sys_thread_set_affinity(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::object::ThreadObject;
-    use crate::cap::slot::{CapTag, Rights};
+    use crate::cap::slot::ThreadRights;
     use crate::sched::AFFINITY_ANY;
     use crate::sched::thread::ThreadState;
     use crate::syscall::current_tcb;
@@ -1163,7 +1158,7 @@ pub fn sys_thread_set_affinity(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
     let thread_slot =
-        unsafe { super::lookup_cap(caller_cspace, thread_idx, CapTag::Thread, Rights::CONTROL) }?;
+        unsafe { super::lookup_cap(caller_cspace, thread_idx, ThreadRights::CONTROL) }?;
 
     let target_tcb = {
         let obj = thread_slot.object.ok_or(SyscallError::InvalidCapability)?;
@@ -1284,7 +1279,7 @@ pub fn sys_thread_read_regs(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
     use crate::arch::current::trap_frame::TrapFrame as ArchTF;
     use crate::cap::object::ThreadObject;
-    use crate::cap::slot::{CapTag, Rights};
+    use crate::cap::slot::ThreadRights;
     use crate::sched::thread::ThreadState;
     use crate::syscall::current_tcb;
     use core::mem::size_of;
@@ -1305,7 +1300,7 @@ pub fn sys_thread_read_regs(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // OBSERVE right is sufficient for reading registers.
     // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
     let thread_slot =
-        unsafe { super::lookup_cap(caller_cspace, thread_idx, CapTag::Thread, Rights::OBSERVE) }?;
+        unsafe { super::lookup_cap(caller_cspace, thread_idx, ThreadRights::OBSERVE) }?;
 
     let target_tcb = {
         let obj = thread_slot.object.ok_or(SyscallError::InvalidCapability)?;
@@ -1382,7 +1377,7 @@ pub fn sys_thread_write_regs(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
     use crate::arch::current::trap_frame::TrapFrame as ArchTF;
     use crate::cap::object::ThreadObject;
-    use crate::cap::slot::{CapTag, Rights};
+    use crate::cap::slot::ThreadRights;
     use crate::sched::thread::ThreadState;
     use crate::syscall::current_tcb;
     use core::mem::{MaybeUninit, size_of};
@@ -1402,7 +1397,7 @@ pub fn sys_thread_write_regs(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
     let thread_slot =
-        unsafe { super::lookup_cap(caller_cspace, thread_idx, CapTag::Thread, Rights::CONTROL) }?;
+        unsafe { super::lookup_cap(caller_cspace, thread_idx, ThreadRights::CONTROL) }?;
 
     let target_tcb = {
         let obj = thread_slot.object.ok_or(SyscallError::InvalidCapability)?;

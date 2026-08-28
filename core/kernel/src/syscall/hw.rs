@@ -44,7 +44,7 @@ use syscall::SyscallError;
 pub fn sys_irq_ack(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::object::InterruptObject;
-    use crate::cap::slot::{CapTag, Rights};
+    use crate::cap::slot::IrqRights;
     use crate::syscall::current_tcb;
 
     let irq_cap_idx = tf.arg(0) as u32;
@@ -59,8 +59,7 @@ pub fn sys_irq_ack(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     let cspace = unsafe { (*tcb).cspace };
 
     // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
-    let irq_slot =
-        unsafe { super::lookup_cap(cspace, irq_cap_idx, CapTag::Interrupt, Rights::NOTIFY) }?;
+    let irq_slot = unsafe { super::lookup_cap(cspace, irq_cap_idx, IrqRights::NOTIFY) }?;
     let irq_id = {
         let obj = irq_slot.object.ok_or(SyscallError::InvalidCapability)?;
         // SAFETY: tag confirmed Interrupt; object was allocated as Box<InterruptObject>.
@@ -106,7 +105,7 @@ pub fn sys_irq_ack(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 pub fn sys_irq_register(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::object::{InterruptObject, NotificationObject};
-    use crate::cap::slot::{CapTag, Rights};
+    use crate::cap::slot::{IrqRights, NtfRights};
     use crate::syscall::current_tcb;
 
     let irq_cap_idx = tf.arg(0) as u32;
@@ -123,8 +122,7 @@ pub fn sys_irq_register(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // Resolve Interrupt cap.
     // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
-    let irq_slot =
-        unsafe { super::lookup_cap(cspace, irq_cap_idx, CapTag::Interrupt, Rights::NOTIFY) }?;
+    let irq_slot = unsafe { super::lookup_cap(cspace, irq_cap_idx, IrqRights::NOTIFY) }?;
     let irq_id = {
         let obj = irq_slot.object.ok_or(SyscallError::InvalidCapability)?;
         // SAFETY: tag confirmed Interrupt; object was allocated as Box<InterruptObject>.
@@ -140,8 +138,7 @@ pub fn sys_irq_register(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // Resolve Notification cap.
     // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
-    let sig_slot =
-        unsafe { super::lookup_cap(cspace, sig_cap_idx, CapTag::Notification, Rights::NOTIFY) }?;
+    let sig_slot = unsafe { super::lookup_cap(cspace, sig_cap_idx, NtfRights::NOTIFY) }?;
     let sig_state = {
         let obj = sig_slot.object.ok_or(SyscallError::InvalidCapability)?;
         // SAFETY: tag confirmed Notification; object was allocated as Box<NotificationObject>.
@@ -204,7 +201,7 @@ pub fn sys_irq_register(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 pub fn sys_mmio_map(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::object::{AddressSpaceObject, MmioObject};
-    use crate::cap::slot::{CapTag, Rights};
+    use crate::cap::slot::{AsRights, MmioRights};
     use crate::mm::PAGE_SIZE;
     use crate::mm::paging::PageFlags;
     use crate::syscall::current_tcb;
@@ -232,7 +229,7 @@ pub fn sys_mmio_map(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // Resolve Mmio cap.
     // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
-    let mmio_slot = unsafe { super::lookup_cap(cspace, mmio_idx, CapTag::Mmio, Rights::MAP) }?;
+    let mmio_slot = unsafe { super::lookup_cap(cspace, mmio_idx, MmioRights::MAP) }?;
     let (mmio_phys, mmio_size) = {
         let obj = mmio_slot.object.ok_or(SyscallError::InvalidCapability)?;
         // SAFETY: tag confirmed Mmio; object was allocated as Box<MmioObject>.
@@ -259,8 +256,7 @@ pub fn sys_mmio_map(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // Resolve AddressSpace cap.
     // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
-    let as_slot =
-        unsafe { super::lookup_cap(cspace, aspace_idx, CapTag::AddressSpace, Rights::MAP) }?;
+    let as_slot = unsafe { super::lookup_cap(cspace, aspace_idx, AsRights::MAP) }?;
     let (as_ptr, aso_raw) = {
         let obj = as_slot.object.ok_or(SyscallError::InvalidCapability)?;
         // cast_ptr_alignment: header at offset 0; allocator guarantees alignment.
@@ -274,7 +270,7 @@ pub fn sys_mmio_map(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // MMIO mappings are never executable.
     // Writability is derived from the cap's WRITE right, not the flags arg.
     // The flags arg is reserved for future use (cache mode overrides, etc.).
-    let writable = mmio_slot.rights.contains(Rights::WRITE);
+    let writable = mmio_slot.rights.contains(MmioRights::WRITE.erase());
     let _ = flags; // reserved
     let page_flags = PageFlags {
         readable: true,
@@ -353,7 +349,7 @@ pub fn sys_ioport_bind(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     {
         use crate::arch::current::gdt;
         use crate::cap::object::{IoPortObject, ThreadObject};
-        use crate::cap::slot::{CapTag, Rights};
+        use crate::cap::slot::{IoPortRights, ThreadRights};
         use crate::syscall::current_tcb;
 
         let thread_idx = tf.arg(0) as u32;
@@ -370,8 +366,7 @@ pub fn sys_ioport_bind(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
         // Resolve Thread cap.
         // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
-        let th_slot =
-            unsafe { super::lookup_cap(cspace, thread_idx, CapTag::Thread, Rights::CONTROL) }?;
+        let th_slot = unsafe { super::lookup_cap(cspace, thread_idx, ThreadRights::CONTROL) }?;
         let target_tcb = {
             let obj = th_slot.object.ok_or(SyscallError::InvalidCapability)?;
             // SAFETY: tag confirmed Thread; object was allocated as Box<ThreadObject>.
@@ -387,8 +382,7 @@ pub fn sys_ioport_bind(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
         // Resolve IoPort cap.
         // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
-        let port_slot =
-            unsafe { super::lookup_cap(cspace, ioport_idx, CapTag::IoPort, Rights::USE) }?;
+        let port_slot = unsafe { super::lookup_cap(cspace, ioport_idx, IoPortRights::USE) }?;
         let (port_base, port_size) = {
             let obj = port_slot.object.ok_or(SyscallError::InvalidCapability)?;
             // SAFETY: tag confirmed IoPort; object was allocated as Box<IoPortObject>.
@@ -479,7 +473,7 @@ pub fn sys_mmio_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     use crate::cap::object::{KernelObjectHeader, MmioObject, ObjectType, dealloc_object};
     use crate::cap::retype::alloc_in_seed;
     use crate::cap::seed_header_nn;
-    use crate::cap::slot::{CapTag, Rights};
+    use crate::cap::slot::{CapTag, MmioRights};
     use crate::cap::split::install_split_children;
     use crate::mm::PAGE_SIZE;
     use crate::syscall::current_tcb;
@@ -516,8 +510,7 @@ pub fn sys_mmio_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     let (mmio_phys, mmio_size, mmio_flags, mmio_rights, cspace_id, orig_obj_ptr) = {
         // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
-        let slot =
-            unsafe { super::lookup_cap(caller_cspace, mmio_idx, CapTag::Mmio, Rights::MAP) }?;
+        let slot = unsafe { super::lookup_cap(caller_cspace, mmio_idx, MmioRights::MAP) }?;
         let obj_ptr = slot.object.ok_or(SyscallError::InvalidCapability)?;
         // SAFETY: tag confirmed Mmio; pointer is valid MmioObject.
         #[allow(clippy::cast_ptr_alignment)]
@@ -624,7 +617,7 @@ pub fn sys_irq_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     use crate::cap::object::{InterruptObject, KernelObjectHeader, ObjectType, dealloc_object};
     use crate::cap::retype::alloc_in_seed;
     use crate::cap::seed_header_nn;
-    use crate::cap::slot::{CapTag, Rights};
+    use crate::cap::slot::{CapTag, IrqRights};
     use crate::cap::split::install_split_children;
     use crate::syscall::current_tcb;
 
@@ -649,9 +642,7 @@ pub fn sys_irq_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     let (start, count, rights, cspace_id, orig_obj_ptr) = {
         // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
-        let slot = unsafe {
-            super::lookup_cap(caller_cspace, irq_idx, CapTag::Interrupt, Rights::NOTIFY)
-        }?;
+        let slot = unsafe { super::lookup_cap(caller_cspace, irq_idx, IrqRights::NOTIFY) }?;
         let obj_ptr = slot.object.ok_or(SyscallError::InvalidCapability)?;
         // SAFETY: tag confirmed Interrupt; pointer is valid InterruptObject.
         #[allow(clippy::cast_ptr_alignment)]
@@ -762,7 +753,7 @@ pub fn sys_ioport_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         use crate::cap::object::{IoPortObject, KernelObjectHeader, ObjectType, dealloc_object};
         use crate::cap::retype::alloc_in_seed;
         use crate::cap::seed_header_nn;
-        use crate::cap::slot::{CapTag, Rights};
+        use crate::cap::slot::{CapTag, IoPortRights};
         use crate::cap::split::install_split_children;
         use crate::syscall::current_tcb;
 
@@ -796,8 +787,7 @@ pub fn sys_ioport_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
         let (base, size_u16, rights, cspace_id, orig_obj_ptr) = {
             // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
-            let slot =
-                unsafe { super::lookup_cap(caller_cspace, port_idx, CapTag::IoPort, Rights::USE) }?;
+            let slot = unsafe { super::lookup_cap(caller_cspace, port_idx, IoPortRights::USE) }?;
             let obj_ptr = slot.object.ok_or(SyscallError::InvalidCapability)?;
             // SAFETY: tag confirmed IoPort; pointer is valid IoPortObject.
             #[allow(clippy::cast_ptr_alignment)]

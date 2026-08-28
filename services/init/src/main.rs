@@ -74,7 +74,7 @@ pub(crate) const TEMP_MAP_BASE: u64 = 0x0000_0001_0000_0000;
 /// thread also retypes from it directly).
 ///
 /// Set once early in `run()` to init's bootstrap arena cap; carries full
-/// rights (incl. `Rights::RETYPE`). Read by every `cap_create_endpoint`
+/// rights (incl. `MemRights::RETYPE`). Read by every `cap_create_endpoint`
 /// callsite — main.rs, service.rs. The arena's front reserve bounds the total
 /// retype bump; see `bootstrap::INIT_RETYPE_RESERVE_PAGES`.
 pub(crate) static ENDPOINT_SLAB: core::sync::atomic::AtomicU32 =
@@ -478,7 +478,7 @@ fn run(info_ptr: u64) -> !
     // for init in the log endpoint's badge space.
     let Ok(init_log_send) = syscall::cap_derive_badge(
         log_ep,
-        syscall::RIGHTS_SEND,
+        syscall::RIGHTS_EP_SEND,
         ipc::log_badges::LOG_BADGE_INIT,
     )
     else
@@ -590,7 +590,7 @@ fn run(info_ptr: u64) -> !
     // SAFETY: phys_dst points at the one mapped 4 KiB page.
     unsafe { bootstrap::write_memmgr_aux_memory(phys_dst, info, &mm_final) };
     let _ = syscall::mem_unmap(info.aspace_cap, TEMP_MAP_BASE, 1);
-    let Ok(phys_table_ro_cap) = syscall::cap_derive(phys_table_memory, syscall::RIGHTS_MAP_READ)
+    let Ok(phys_table_ro_cap) = syscall::cap_derive(phys_table_memory, syscall::RIGHTS_MEM_MAP)
     else
     {
         logging::log("FATAL: phys-table RO derive failed");
@@ -720,7 +720,7 @@ fn run(info_ptr: u64) -> !
     // uses the un-badged service cap.
     let Ok(vfsd_seed_cap) = syscall::cap_derive_badge(
         vfsd_service_ep,
-        syscall::RIGHTS_SEND,
+        syscall::RIGHTS_EP_SEND,
         ipc::vfsd_labels::SEED_AUTHORITY,
     )
     else

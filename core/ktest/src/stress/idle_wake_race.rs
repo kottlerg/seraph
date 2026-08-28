@@ -57,7 +57,7 @@ const OUTLIER_US: u64 = 5_000;
 const BIT_GO: u64 = 0x1;
 const BIT_ACK: u64 = 0x1;
 
-const RIGHTS_NOTIFY_WAIT: u64 = (1 << 7) | (1 << 8);
+const RIGHTS_NOTIFY_WAIT: u64 = syscall_abi::RIGHTS_NTF_NOTIFY | syscall_abi::RIGHTS_NTF_WAIT;
 
 static mut CHILD_STACK: ChildStack = ChildStack::ZERO;
 

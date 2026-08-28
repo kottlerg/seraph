@@ -25,6 +25,7 @@
 //! which provides a niche enabling the Option discriminant to be stored in
 //! the zero value — no extra bytes needed. Verified by the size tests below.
 
+use core::marker::PhantomData;
 use core::num::NonZeroU32;
 use core::ptr::NonNull;
 
@@ -158,13 +159,19 @@ pub enum CapTag
 
 // ── Rights ────────────────────────────────────────────────────────────────────
 
-/// Bitmask of rights attached to a capability slot.
+/// Erased per-slot rights word.
 ///
-/// Rights are type-specific; not every bit is meaningful for every capability
-/// type. Rights can only be attenuated (removed) during derivation, never added.
+/// Rights are scoped per capability type: this word stores the bits, and the
+/// slot's `CapTag` selects which type's rights space interprets them (every
+/// type numbers its bits from 0 in its own full-width space). `Rights` itself
+/// names no bits — typed constants live on the per-type [`TypedRights`]
+/// aliases ([`MemRights`], [`EpRights`], …). Rights can only be attenuated
+/// (removed) during derivation, never added; the AND-mask attenuation is
+/// bitwise-uniform and needs no type dispatch.
 ///
-/// To add a new right: add a `const` below and handle it in the relevant
-/// capability operation. Existing bit assignments must not be renumbered.
+/// To add a new right: define its `u64` constant in `abi/syscall` (the single
+/// source of truth for bit values) and list it in the owning type's
+/// `define_typed_rights!` table below.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rights(pub u32);
@@ -173,96 +180,6 @@ impl Rights
 {
     /// No rights.
     pub const NONE: Rights = Rights(0);
-
-    // ── Memory / address space ──────────────────────────────────────────────
-    /// May map this memory into an address space.
-    pub const MAP: Rights = Rights(1 << 0);
-    /// Authority to create writable mappings from this memory.
-    pub const WRITE: Rights = Rights(1 << 1);
-    /// Authority to create executable mappings from this memory.
-    pub const EXECUTE: Rights = Rights(1 << 2);
-    /// May read/inspect mappings (`AddressSpace`).
-    pub const READ: Rights = Rights(1 << 3);
-
-    // ── IPC endpoint ──────────────────────────────────────────────────────────
-    /// May call (send to) this endpoint.
-    pub const SEND: Rights = Rights(1 << 4);
-    /// May receive calls on this endpoint.
-    pub const RECEIVE: Rights = Rights(1 << 5);
-    /// May include capabilities in IPC messages.
-    pub const GRANT: Rights = Rights(1 << 6);
-
-    // ── Notification / event queue ──────────────────────────────────────────────────
-    /// May deliver a notification to a notification object.
-    pub const NOTIFY: Rights = Rights(1 << 7);
-    /// May wait on a notification or wait set.
-    pub const WAIT: Rights = Rights(1 << 8);
-    /// May post an entry to an event queue.
-    pub const POST: Rights = Rights(1 << 9);
-    /// May receive entries from an event queue.
-    pub const RECV: Rights = Rights(1 << 10);
-
-    // ── Thread ────────────────────────────────────────────────────────────────
-    /// May start, stop, and configure a thread.
-    pub const CONTROL: Rights = Rights(1 << 11);
-    /// May read thread register state.
-    pub const OBSERVE: Rights = Rights(1 << 12);
-
-    // ── CSpace ────────────────────────────────────────────────────────────────
-    /// May insert a capability into a slot.
-    pub const INSERT: Rights = Rights(1 << 13);
-    /// May clear a slot.
-    pub const DELETE: Rights = Rights(1 << 14);
-    /// May derive a new capability from an existing slot.
-    pub const DERIVE: Rights = Rights(1 << 15);
-    /// May revoke a capability and all its descendants.
-    pub const REVOKE: Rights = Rights(1 << 16);
-
-    // ── WaitSet ───────────────────────────────────────────────────────────────
-    /// May add or remove wait set members.
-    pub const MODIFY: Rights = Rights(1 << 17);
-
-    // ── IoPort ───────────────────────────────────────────────────────────
-    /// May bind port range to a thread for in/out access.
-    pub const USE: Rights = Rights(1 << 18);
-
-    // ── SchedControl ──────────────────────────────────────────────────────────
-    // No rights bit. A `SchedControl` cap's authority is its presence plus the
-    // `[min, max]` priority band it carries (see `SchedControlObject`); there is
-    // nothing to gate with a right. Bit 19 is unused.
-
-    // ── SbiControl ───────────────────────────────────────────────────────────
-    // One right per sanctioned SBI extension (RISC-V only). `sys_sbi_call` maps
-    // an extension ID to the right it requires; an extension with no right here
-    // is absent from the vocabulary and can never be forwarded, regardless of
-    // cap. Only the extensions the kernel manages internally (TIME/IPI/RFENCE/
-    // HSM) are deliberately omitted — forwarding them would break a kernel
-    // invariant (scheduling, TLB coherence, hart lifecycle). Extensions that are
-    // merely undesirable for our userspace (DBCN, PMU) are sanctioned here and
-    // withheld by cap distribution, not by the kernel. See
-    // `docs/capability-model.md`.
-    /// May forward the SBI System Reset (SRST) extension to firmware.
-    pub const SBI_RESET: Rights = Rights(1 << 20);
-    /// May forward the SBI System Suspend (SUSP) extension to firmware.
-    pub const SBI_SUSPEND: Rights = Rights(1 << 22);
-    /// May forward the SBI CPPC (processor performance control) extension to
-    /// firmware.
-    pub const SBI_CPPC: Rights = Rights(1 << 23);
-    /// May forward the read-only SBI Base extension (version / extension probe).
-    pub const SBI_BASE: Rights = Rights(1 << 24);
-    /// May forward the SBI Debug Console (DBCN) extension to firmware.
-    pub const SBI_DBCN: Rights = Rights(1 << 25);
-    /// May forward the SBI Performance Monitoring Unit (PMU) extension.
-    pub const SBI_PMU: Rights = Rights(1 << 26);
-
-    // ── Memory retype ──────────────────────────────────────────────────────────
-    /// Authority to retype this Memory cap's region into kernel objects.
-    ///
-    /// Stamped on RAM Memory caps minted from the buddy allocator at boot.
-    /// Firmware-table / boot-module / init-segment Memory caps never hold this
-    /// bit. Every retype-consuming syscall checks
-    /// `tag == Memory && rights.contains(RETYPE)`.
-    pub const RETYPE: Rights = Rights(1 << 21);
 
     /// Return `true` if all bits in `mask` are present in `self`.
     pub fn contains(self, mask: Rights) -> bool
@@ -299,6 +216,307 @@ impl core::ops::BitOrAssign for Rights
     }
 }
 
+// ── Typed rights ──────────────────────────────────────────────────────────────
+
+/// Marker pairing a per-type rights space with the `CapTag` it belongs to.
+///
+/// `lookup_cap` is generic over this trait: the required-rights argument's
+/// type fixes the expected slot tag, so a rights constant of the wrong
+/// capability type is a compile error instead of a silently aliased bit
+/// check.
+pub trait CapKind
+{
+    /// The slot tag whose rights space this marker names.
+    const TAG: CapTag;
+}
+
+/// A rights word statically scoped to one capability type.
+///
+/// Same 32-bit representation as the erased [`Rights`] stored in a slot; the
+/// type parameter exists purely at compile time to pair a rights constant
+/// with its `CapTag`.
+#[repr(transparent)]
+pub struct TypedRights<K: CapKind>(u32, PhantomData<K>);
+
+impl<K: CapKind> TypedRights<K>
+{
+    /// No rights. Also the full authority encoding for presence-only
+    /// capability types (`SchedControl`).
+    pub const NONE: Self = Self(0, PhantomData);
+
+    // Bridge from the ABI's u64 rights constants. The assert makes an ABI bit
+    // outside the 32-bit slot word a compile error, so the cast is exact.
+    #[allow(clippy::cast_possible_truncation)]
+    const fn from_abi(bits: u64) -> Self
+    {
+        assert!(bits <= u32::MAX as u64);
+        Self(bits as u32, PhantomData)
+    }
+
+    /// Erase the compile-time type scope, e.g. for storage in a
+    /// [`CapabilitySlot`] or comparison against a slot's rights word.
+    pub const fn erase(self) -> Rights
+    {
+        Rights(self.0)
+    }
+}
+
+impl<K: CapKind> Clone for TypedRights<K>
+{
+    fn clone(&self) -> Self
+    {
+        *self
+    }
+}
+
+impl<K: CapKind> Copy for TypedRights<K> {}
+
+impl<K: CapKind> PartialEq for TypedRights<K>
+{
+    fn eq(&self, other: &Self) -> bool
+    {
+        self.0 == other.0
+    }
+}
+
+impl<K: CapKind> Eq for TypedRights<K> {}
+
+impl<K: CapKind> core::fmt::Debug for TypedRights<K>
+{
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+    {
+        write!(f, "TypedRights({:#x})", self.0)
+    }
+}
+
+impl<K: CapKind> core::ops::BitOr for TypedRights<K>
+{
+    type Output = TypedRights<K>;
+
+    fn bitor(self, rhs: TypedRights<K>) -> TypedRights<K>
+    {
+        TypedRights(self.0 | rhs.0, PhantomData)
+    }
+}
+
+impl<K: CapKind> core::ops::BitOrAssign for TypedRights<K>
+{
+    fn bitor_assign(&mut self, rhs: TypedRights<K>)
+    {
+        self.0 |= rhs.0;
+    }
+}
+
+/// Define one capability type's rights space: the [`CapKind`] marker, the
+/// `TypedRights` alias, and its constants bridged from the ABI's `u64` bit
+/// values.
+macro_rules! define_typed_rights
+{
+    (
+        $(#[$kind_doc:meta])*
+        $kind:ident, $alias:ident, $tag:ident
+        { $( $(#[$doc:meta])* $name:ident = $abi:path; )* }
+    ) =>
+    {
+        $(#[$kind_doc])*
+        pub enum $kind {}
+
+        impl CapKind for $kind
+        {
+            const TAG: CapTag = CapTag::$tag;
+        }
+
+        #[doc = concat!("Rights word scoped to [`CapTag::", stringify!($tag), "`] capabilities.")]
+        pub type $alias = TypedRights<$kind>;
+
+        impl $alias
+        {
+            $(
+                $(#[$doc])*
+                pub const $name: $alias = $alias::from_abi($abi);
+            )*
+        }
+    };
+}
+
+define_typed_rights! {
+    /// Rights-space marker for `Memory` capabilities.
+    MemoryCap, MemRights, Memory
+    {
+        /// May map this memory into an address space.
+        MAP = syscall::RIGHTS_MEM_MAP;
+        /// Authority to create writable mappings from this memory.
+        WRITE = syscall::RIGHTS_MEM_WRITE;
+        /// Authority to create executable mappings from this memory.
+        EXECUTE = syscall::RIGHTS_MEM_EXECUTE;
+        /// Authority to retype this Memory cap's region into kernel objects.
+        ///
+        /// Stamped on RAM Memory caps minted from the buddy allocator at boot
+        /// and on boot-module / init-segment caps (donated into memmgr's pool
+        /// at init's reap). Firmware-table Memory caps never hold this bit.
+        /// Every retype-consuming syscall requires it.
+        RETYPE = syscall::RIGHTS_MEM_RETYPE;
+    }
+}
+
+define_typed_rights! {
+    /// Rights-space marker for `AddressSpace` capabilities.
+    AddressSpaceCap, AsRights, AddressSpace
+    {
+        /// May map into this address space.
+        MAP = syscall::RIGHTS_AS_MAP;
+        /// May read/inspect mappings (`SYS_ASPACE_QUERY`).
+        READ = syscall::RIGHTS_AS_READ;
+        /// May register terminal-fault death observers
+        /// (`aspace_bind_notification`).
+        CONTROL = syscall::RIGHTS_AS_CONTROL;
+    }
+}
+
+define_typed_rights! {
+    /// Rights-space marker for `Endpoint` capabilities.
+    EndpointCap, EpRights, Endpoint
+    {
+        /// May call (send to) this endpoint.
+        SEND = syscall::RIGHTS_EP_SEND;
+        /// May receive calls on this endpoint.
+        RECEIVE = syscall::RIGHTS_EP_RECEIVE;
+        /// May include capabilities in IPC messages.
+        GRANT = syscall::RIGHTS_EP_GRANT;
+    }
+}
+
+define_typed_rights! {
+    /// Rights-space marker for `Notification` capabilities.
+    NotificationCap, NtfRights, Notification
+    {
+        /// May deliver a notification to the notification object.
+        NOTIFY = syscall::RIGHTS_NTF_NOTIFY;
+        /// May wait on the notification object.
+        WAIT = syscall::RIGHTS_NTF_WAIT;
+    }
+}
+
+define_typed_rights! {
+    /// Rights-space marker for `EventQueue` capabilities.
+    EventQueueCap, EqRights, EventQueue
+    {
+        /// May post an entry to the event queue.
+        POST = syscall::RIGHTS_EQ_POST;
+        /// May receive entries from the event queue.
+        RECV = syscall::RIGHTS_EQ_RECV;
+    }
+}
+
+define_typed_rights! {
+    /// Rights-space marker for `Interrupt` capabilities.
+    InterruptCap, IrqRights, Interrupt
+    {
+        /// May register/acknowledge the line and receive its notifications.
+        NOTIFY = syscall::RIGHTS_IRQ_NOTIFY;
+    }
+}
+
+define_typed_rights! {
+    /// Rights-space marker for `Mmio` capabilities.
+    MmioCap, MmioRights, Mmio
+    {
+        /// May map the MMIO region into an address space.
+        MAP = syscall::RIGHTS_MMIO_MAP;
+        /// May map the MMIO region writable.
+        WRITE = syscall::RIGHTS_MMIO_WRITE;
+    }
+}
+
+define_typed_rights! {
+    /// Rights-space marker for `Thread` capabilities.
+    ThreadCap, ThreadRights, Thread
+    {
+        /// May start, stop, and configure the thread.
+        CONTROL = syscall::RIGHTS_THREAD_CONTROL;
+        /// May read thread register state.
+        OBSERVE = syscall::RIGHTS_THREAD_OBSERVE;
+    }
+}
+
+define_typed_rights! {
+    /// Rights-space marker for `CSpace` capabilities.
+    CSpaceCap, CsRights, CSpace
+    {
+        /// May insert a capability into a slot.
+        INSERT = syscall::RIGHTS_CS_INSERT;
+        /// May clear a slot.
+        DELETE = syscall::RIGHTS_CS_DELETE;
+        /// May derive a new capability from an existing slot.
+        DERIVE = syscall::RIGHTS_CS_DERIVE;
+        /// May revoke a capability and all its descendants.
+        REVOKE = syscall::RIGHTS_CS_REVOKE;
+    }
+}
+
+define_typed_rights! {
+    /// Rights-space marker for `WaitSet` capabilities.
+    WaitSetCap, WsRights, WaitSet
+    {
+        /// May add or remove wait set members.
+        MODIFY = syscall::RIGHTS_WS_MODIFY;
+        /// May poll/wait on the set.
+        WAIT = syscall::RIGHTS_WS_WAIT;
+    }
+}
+
+define_typed_rights! {
+    /// Rights-space marker for `IoPort` capabilities.
+    IoPortCap, IoPortRights, IoPort
+    {
+        /// May bind the port range to a thread for in/out access.
+        USE = syscall::RIGHTS_IOPORT_USE;
+    }
+}
+
+define_typed_rights! {
+    /// Rights-space marker for `SchedControl` capabilities.
+    ///
+    /// No rights bits: a `SchedControl` cap's authority is its presence plus
+    /// the `[min, max]` priority band it carries (see `SchedControlObject`);
+    /// there is nothing to gate with a right. Lookups use
+    /// `SchedRights::NONE`.
+    SchedControlCap, SchedRights, SchedControl
+    {
+    }
+}
+
+define_typed_rights! {
+    /// Rights-space marker for `SbiControl` capabilities.
+    ///
+    /// One right per sanctioned SBI extension (RISC-V only). `sys_sbi_call`
+    /// maps an extension ID to the right it requires; an extension with no
+    /// right here is absent from the vocabulary and can never be forwarded,
+    /// regardless of cap. Only the extensions the kernel manages internally
+    /// (TIME/IPI/RFENCE/HSM) are deliberately omitted — forwarding them would
+    /// break a kernel invariant (scheduling, TLB coherence, hart lifecycle).
+    /// Extensions that are merely undesirable for our userspace (DBCN, PMU)
+    /// are sanctioned here and withheld by cap distribution, not by the
+    /// kernel. See `docs/capability-model.md`.
+    SbiControlCap, SbiRights, SbiControl
+    {
+        /// May forward the SBI System Reset (SRST) extension to firmware.
+        RESET = syscall::RIGHTS_SBI_RESET;
+        /// May forward the SBI System Suspend (SUSP) extension to firmware.
+        SUSPEND = syscall::RIGHTS_SBI_SUSPEND;
+        /// May forward the SBI CPPC (processor performance control) extension
+        /// to firmware.
+        CPPC = syscall::RIGHTS_SBI_CPPC;
+        /// May forward the read-only SBI Base extension (version / extension
+        /// probe).
+        BASE = syscall::RIGHTS_SBI_BASE;
+        /// May forward the SBI Debug Console (DBCN) extension to firmware.
+        DBCN = syscall::RIGHTS_SBI_DBCN;
+        /// May forward the SBI Performance Monitoring Unit (PMU) extension.
+        PMU = syscall::RIGHTS_SBI_PMU;
+    }
+}
+
 /// Return `true` if `rights` has both `WRITE` and `EXECUTE` set.
 ///
 /// Used to enforce W^X at mapping time: no page may be simultaneously
@@ -308,7 +526,7 @@ impl core::ops::BitOrAssign for Rights
 #[cfg(test)]
 pub fn violates_wx(rights: Rights) -> bool
 {
-    rights.contains(Rights::WRITE | Rights::EXECUTE)
+    rights.contains((MemRights::WRITE | MemRights::EXECUTE).erase())
 }
 
 // ── CapabilitySlot ────────────────────────────────────────────────────────────
@@ -565,11 +783,11 @@ mod tests
     #[test]
     fn rights_contains()
     {
-        let r = Rights::MAP | Rights::WRITE;
-        assert!(r.contains(Rights::MAP));
-        assert!(r.contains(Rights::WRITE));
-        assert!(!r.contains(Rights::EXECUTE));
-        assert!(r.contains(Rights::MAP | Rights::WRITE));
+        let r = (MemRights::MAP | MemRights::WRITE).erase();
+        assert!(r.contains(MemRights::MAP.erase()));
+        assert!(r.contains(MemRights::WRITE.erase()));
+        assert!(!r.contains(MemRights::EXECUTE.erase()));
+        assert!(r.contains((MemRights::MAP | MemRights::WRITE).erase()));
     }
 
     // Rights' bitwise operators are hand-written (impl BitOr/BitAnd/BitOrAssign); a
@@ -578,22 +796,38 @@ mod tests
     #[test]
     fn rights_operators_compose_bits()
     {
-        let rw = Rights::MAP | Rights::WRITE;
-        assert!(rw.contains(Rights::MAP));
-        assert!(rw.contains(Rights::WRITE));
-        assert_eq!(rw & Rights::WRITE, Rights::WRITE);
-        let mut acc = Rights::MAP;
-        acc |= Rights::WRITE;
+        let rw = Rights(0b01) | Rights(0b10);
+        assert!(rw.contains(Rights(0b01)));
+        assert!(rw.contains(Rights(0b10)));
+        assert_eq!(rw & Rights(0b10), Rights(0b10));
+        let mut acc = Rights(0b01);
+        acc |= Rights(0b10);
         assert_eq!(acc, rw);
+    }
+
+    // TypedRights' operators and erase() are hand-written; a transposed bit op
+    // or a lossy erase would widen or drop authority at every typed call site.
+    #[test]
+    fn typed_rights_compose_and_erase()
+    {
+        let both = MemRights::MAP | MemRights::WRITE;
+        assert_eq!(
+            both.erase(),
+            MemRights::MAP.erase() | MemRights::WRITE.erase()
+        );
+        let mut acc = MemRights::MAP;
+        acc |= MemRights::WRITE;
+        assert_eq!(acc, both);
+        assert_eq!(MemRights::NONE.erase(), Rights::NONE);
     }
 
     // W^X predicate: true only when WRITE and EXECUTE are both present.
     #[test]
     fn violates_wx_requires_write_and_execute()
     {
-        assert!(violates_wx(Rights::WRITE | Rights::EXECUTE));
-        assert!(!violates_wx(Rights::WRITE));
-        assert!(!violates_wx(Rights::EXECUTE));
+        assert!(violates_wx((MemRights::WRITE | MemRights::EXECUTE).erase()));
+        assert!(!violates_wx(MemRights::WRITE.erase()));
+        assert!(!violates_wx(MemRights::EXECUTE.erase()));
     }
 
     #[test]
@@ -736,42 +970,5 @@ mod tests
         assert_eq!(id.cspace_id, 7);
         assert_eq!(id.epoch, 42);
         assert_eq!(id.index.get(), 3);
-    }
-
-    #[test]
-    fn rights_retype_bit_position()
-    {
-        // Bit 21 — must match `RIGHTS_RETYPE` in `abi/syscall/src/lib.rs`
-        // and remain disjoint from every other Rights bit. The SbiControl
-        // rights (SBI_RESET=20, SBI_SUSPEND=22, SBI_CPPC=23, SBI_BASE=24,
-        // SBI_DBCN=25, SBI_PMU=26) bracket bit 21 without colliding with it.
-        assert_eq!(Rights::RETYPE.0, 1 << 21);
-        // Disjoint from all other rights.
-        let combined = Rights::MAP
-            | Rights::WRITE
-            | Rights::EXECUTE
-            | Rights::READ
-            | Rights::SEND
-            | Rights::RECEIVE
-            | Rights::GRANT
-            | Rights::NOTIFY
-            | Rights::WAIT
-            | Rights::POST
-            | Rights::RECV
-            | Rights::CONTROL
-            | Rights::OBSERVE
-            | Rights::INSERT
-            | Rights::DELETE
-            | Rights::DERIVE
-            | Rights::REVOKE
-            | Rights::MODIFY
-            | Rights::USE
-            | Rights::SBI_RESET
-            | Rights::SBI_SUSPEND
-            | Rights::SBI_CPPC
-            | Rights::SBI_BASE
-            | Rights::SBI_DBCN
-            | Rights::SBI_PMU;
-        assert_eq!((combined & Rights::RETYPE).0, 0);
     }
 }

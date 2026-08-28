@@ -15,7 +15,7 @@ use syscall::{
 use crate::{ChildStack, TestContext, TestResult, spawn};
 
 const NUM_CHILDREN: usize = 64;
-const RIGHTS_NOTIFY: u64 = 1 << 7;
+const RIGHTS_NOTIFY: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
 
 pub fn run(ctx: &TestContext) -> TestResult
 {
@@ -41,7 +41,7 @@ pub fn run(ctx: &TestContext) -> TestResult
             spawn::new_child(ctx).map_err(|_| "cap_revoke_under_use: spawn::new_child failed")?;
         let child_sig = cap_copy(derived[i], child.cs, RIGHTS_NOTIFY)
             .map_err(|_| "cap_revoke_under_use: cap_copy sig failed")?;
-        let child_done = cap_copy(done, child.cs, 1 << 7)
+        let child_done = cap_copy(done, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
             .map_err(|_| "cap_revoke_under_use: cap_copy done failed")?;
 
         // Pack: sig_slot[15:0], done_slot[31:16], bit_index[47:32]. Encode

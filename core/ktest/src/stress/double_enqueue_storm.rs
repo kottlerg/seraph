@@ -64,7 +64,7 @@ const CYCLES: usize = 600;
 const BIT_GO: u64 = 0x1;
 
 /// Notify + wait rights, mirroring the other notification stress tests.
-const RIGHTS_NOTIFY_WAIT: u64 = (1 << 7) | (1 << 8);
+const RIGHTS_NOTIFY_WAIT: u64 = syscall_abi::RIGHTS_NTF_NOTIFY | syscall_abi::RIGHTS_NTF_WAIT;
 
 pub fn run(ctx: &TestContext) -> TestResult
 {

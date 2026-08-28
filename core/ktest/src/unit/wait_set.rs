@@ -21,7 +21,7 @@ use syscall::{
 use crate::{ChildStack, TestContext, TestResult};
 
 // Notification right only (no WAIT). Children only send on notifications.
-const RIGHTS_NOTIFY: u64 = 1 << 7;
+const RIGHTS_NOTIFY: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
 
 // Child stack for the blocking_wait test.
 static mut CHILD_STACK: ChildStack = ChildStack::ZERO;

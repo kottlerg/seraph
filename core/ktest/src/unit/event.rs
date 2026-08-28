@@ -108,7 +108,8 @@ pub fn recv_blocks_until_post(ctx: &TestContext) -> TestResult
     let child = crate::spawn::new_child(ctx).map_err(|_| "spawn::new_child failed")?;
     // Pass all rights for the queue; NOTIFY right for the sync notification.
     let child_eq = cap_copy(eq, child.cs, syscall::RIGHTS_ALL).map_err(|_| "cap_copy eq failed")?;
-    let child_sync = cap_copy(sync, child.cs, 1 << 7).map_err(|_| "cap_copy sync failed")?;
+    let child_sync = cap_copy(sync, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
+        .map_err(|_| "cap_copy sync failed")?;
     let child_arg = u64::from(child_eq) | (u64::from(child_sync) << 16);
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(RECV_BLOCKS_STACK));
@@ -145,9 +146,9 @@ pub fn post_insufficient_rights(ctx: &TestContext) -> TestResult
     let eq = event_queue_create(ctx.memory_base, 4)
         .map_err(|_| "event_queue_create for post_rights test failed")?;
 
-    // Derive with RECV right only (bit 10), no POST (bit 9).
-    let recv_only =
-        syscall::cap_derive(eq, 1 << 10).map_err(|_| "cap_derive for post_rights test failed")?;
+    // Derive with RECV right only, no POST.
+    let recv_only = syscall::cap_derive(eq, syscall_abi::RIGHTS_EQ_RECV)
+        .map_err(|_| "cap_derive for post_rights test failed")?;
 
     let err = event_post(recv_only, 0x42);
     if err != Err(SyscallError::InsufficientRights as i64)
@@ -173,9 +174,9 @@ pub fn recv_insufficient_rights(ctx: &TestContext) -> TestResult
     // Post a value first so the queue is non-empty.
     event_post(eq, 0x42).map_err(|_| "event_post for recv_rights test failed")?;
 
-    // Derive with POST right only (bit 9), no RECV (bit 10).
-    let post_only =
-        syscall::cap_derive(eq, 1 << 9).map_err(|_| "cap_derive for recv_rights test failed")?;
+    // Derive with POST right only, no RECV.
+    let post_only = syscall::cap_derive(eq, syscall_abi::RIGHTS_EQ_POST)
+        .map_err(|_| "cap_derive for recv_rights test failed")?;
 
     let err = event_recv(post_only);
     if err != Err(SyscallError::InsufficientRights as i64)

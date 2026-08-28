@@ -20,6 +20,7 @@ use syscall::{
 };
 
 use crate::{ChildStack, TestContext, TestResult, spawn};
+use syscall_abi::RIGHTS_EQ_POST;
 
 /// One producer per stress stack — capped at `MAX_STRESS_THREADS`.
 const NUM_PRODUCERS: usize = 4;
@@ -30,9 +31,7 @@ const MESSAGES_PER_PRODUCER: u32 = 64;
 const TOTAL_MESSAGES: u32 = NUM_PRODUCERS as u32 * MESSAGES_PER_PRODUCER;
 
 /// NOTIFY right (send) only.
-const RIGHTS_NOTIFY: u64 = 1 << 7;
-/// `EventQueue` POST right (bit 9 per the kernel).
-const RIGHTS_POST: u64 = 1 << 9;
+const RIGHTS_NOTIFY: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
 
 /// Producer: post `MESSAGES_PER_PRODUCER` messages each tagged with its
 /// producer id, then post done bit.
@@ -74,7 +73,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     {
         let child = spawn::new_child(ctx)
             .map_err(|_| "concurrent_event_producers: spawn::new_child failed")?;
-        let child_eq = cap_copy(eq, child.cs, RIGHTS_POST)
+        let child_eq = cap_copy(eq, child.cs, RIGHTS_EQ_POST)
             .map_err(|_| "concurrent_event_producers: cap_copy queue failed")?;
         let child_done = cap_copy(done, child.cs, RIGHTS_NOTIFY)
             .map_err(|_| "concurrent_event_producers: cap_copy done failed")?;

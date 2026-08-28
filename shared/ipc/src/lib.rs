@@ -444,7 +444,7 @@ pub mod memmgr_labels
     /// `data[1+i]` = `page_count_for_cap_i: u32`; `caps[0..count]` = Memory
     /// capabilities (MAP|WRITE rights). `sum(page_count_for_cap_i) ==
     /// want_pages` for both contiguous and best-effort replies. Each reply
-    /// cap MUST additionally carry `Rights::RETYPE` so the caller can
+    /// cap MUST additionally carry `MemRights::RETYPE` so the caller can
     /// retype the memory into kernel objects via the `SYS_CAP_CREATE_*`
     /// syscalls; memmgr derives reply caps with `RIGHTS_ALL`, which
     /// preserves the RETYPE bit stamped at boot by the kernel.
@@ -492,7 +492,7 @@ pub mod memmgr_labels
     /// pages derived from it.
     ///
     /// Wire format:
-    /// * `caps[0]` — the Memory cap to transfer (must carry `Rights::RETYPE`).
+    /// * `caps[0]` — the Memory cap to transfer (must carry `MemRights::RETYPE`).
     ///
     /// memmgr derives `phys_base` and `size` from the cap itself via
     /// `cap_info`, so no caller-side bookkeeping is required. Reply is
@@ -2483,7 +2483,7 @@ impl IpcMessageBuilder
 /// buffer is scratch — nested IPC (stdio, logging, any IPC-using helper)
 /// cannot clobber the returned message.
 ///
-/// The endpoint cap must have `Rights::GRANT` when `msg.caps()` is non-empty.
+/// The endpoint cap must have `EpRights::GRANT` when `msg.caps()` is non-empty.
 ///
 /// # Safety
 /// `ipc_buf` must point to the caller thread's 4 KiB-aligned IPC buffer

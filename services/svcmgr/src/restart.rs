@@ -64,7 +64,7 @@ pub fn mint_child_creator(bootstrap_ep: u32) -> Option<(u64, u32)>
     {
         badge = syscall::random_u64().ok()?;
     }
-    let badged = syscall::cap_derive_badge(bootstrap_ep, syscall::RIGHTS_SEND, badge).ok()?;
+    let badged = syscall::cap_derive_badge(bootstrap_ep, syscall::RIGHTS_EP_SEND, badge).ok()?;
     Some((badge, badged))
 }
 
@@ -412,7 +412,7 @@ fn restart_process(
                     {
                         continue;
                     }
-                    let Ok(c) = syscall::cap_derive(entry.cap, syscall::RIGHTS_SEND)
+                    let Ok(c) = syscall::cap_derive(entry.cap, syscall::RIGHTS_EP_SEND)
                     else
                     {
                         std::os::seraph::log!("cannot derive bundle cap for restart");
@@ -434,7 +434,7 @@ fn restart_process(
 
         let provided_recv = if svc.provided_endpoint != 0
         {
-            if let Ok(recv) = syscall::cap_derive(svc.provided_endpoint, syscall::RIGHTS_RECEIVE)
+            if let Ok(recv) = syscall::cap_derive(svc.provided_endpoint, syscall::RIGHTS_EP_RECEIVE)
             {
                 recv
             }
@@ -540,7 +540,7 @@ fn create_process(
 ///   `system_root_cap` stays zero (`Unsupported` on absolute-path
 ///   fs ops in std).
 /// * `NS_POLICY_UNIVERSAL` → `cap_copy` of svcmgr's own root with
-///   `RIGHTS_SEND`.
+///   `RIGHTS_EP_SEND`.
 /// * `NS_POLICY_SUBTREE` → walk svcmgr's root for the stored
 ///   subtree path with the stored rights mask, hand the resulting
 ///   directory cap to the child.
@@ -584,7 +584,7 @@ pub fn apply_namespace_policy(
     {
         ipc::svcmgr_labels::NS_POLICY_UNIVERSAL =>
         {
-            let Ok(c) = syscall::cap_copy(root_cap, info.self_cspace, syscall::RIGHTS_SEND)
+            let Ok(c) = syscall::cap_copy(root_cap, info.self_cspace, syscall::RIGHTS_EP_SEND)
             else
             {
                 std::os::seraph::log!("ns policy: cap_copy of root for child failed");

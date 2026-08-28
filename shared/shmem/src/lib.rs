@@ -115,7 +115,7 @@ impl SharedBuffer
         }
         for i in 0..pages
         {
-            let rw = match syscall::cap_derive(memory_caps[i as usize], syscall::RIGHTS_MAP_RW)
+            let rw = match syscall::cap_derive(memory_caps[i as usize], syscall::RIGHTS_MEM_MAP_RW)
             {
                 Ok(c) => c,
                 Err(_) =>

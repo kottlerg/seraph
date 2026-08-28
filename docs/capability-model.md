@@ -90,10 +90,13 @@ kernel rejects any `mem_map` or `mem_protect` call that would make a page
 simultaneously writable and executable.
 
 The kernel mints Memory caps for all usable RAM at boot with `Map | Write |
-Execute | Retype` and places them in init's CSpace. Memory caps minted for
-firmware tables (ACPI regions, RSDP, DTB), boot modules, and init's own
-ELF segments mint without `Retype` — they are mappable read-only references
-to fixed-purpose memory and cannot be consumed for kernel-object creation.
+Execute | Retype` and places them in init's CSpace. Boot-module and
+init-segment Memory caps carry the same full rights: the pages are mapped at
+their true protection before the caps exist, so the rights gate derivation
+only, and full rights let the caps donate into memmgr's pool as general RAM
+at init's reap. Only firmware-table Memory caps (ACPI regions, RSDP, DTB)
+mint without `Retype` — mappable references to fixed-purpose memory that
+cannot be consumed for kernel-object creation.
 
 Init transfers RAM Memory caps (via the derive-twice pattern) to memmgr, which
 thereafter owns userspace RAM frame allocation and answers `REQUEST_MEMORY_CAPS`
@@ -108,6 +111,9 @@ follow a separate flow through devmgr; see
 A capability to a process's virtual address space. Rights:
 - **Map** — may install and remove mappings in this address space
 - **Read** — may inspect current mappings
+- **Control** — may register terminal-fault death observers
+  (`aspace_bind_notification`); held by the space's creator and masked out of
+  copies handed to components that only map into the space
 
 The kernel holds implicit authority over all address spaces; this capability is
 what allows userspace memory managers to manage mappings on behalf of a process.
@@ -150,9 +156,13 @@ init, which delegates them to appropriate drivers.
 ### Mmio
 
 A capability to a specific physical address range (an MMIO aperture) used for
-memory-mapped I/O. Holding this capability allows mapping the region into an
-address space (with Map right). Without this capability a process cannot map
-physical addresses — it cannot name hardware it has not been granted access to.
+memory-mapped I/O. Rights:
+- **Map** — may map the region into an address space
+- **Write** — may map the region writable (`sys_mmio_map` gates mapping
+  writability on it; MMIO mappings are never executable)
+
+Without this capability a process cannot map physical addresses — it cannot
+name hardware it has not been granted access to.
 
 ### Thread
 
@@ -246,9 +256,9 @@ power-management path but delegated to no one today.
 an EID set carried by `SbiControlObject`, because the extension set is small and
 non-numeric and only one actuating consumer exists (pwrmgr, SRST-only).
 `SbiControlObject` stays bare and the init descriptor is unchanged
-(`aux0 = aux1 = 0`), so `INIT_PROTOCOL_VERSION` is not bumped. The shared 32-bit
-`Rights` budget bounds how many extensions can be sanctioned this way; revisiting
-that budget (per-type rights) is tracked separately.
+(`aux0 = aux1 = 0`), so `INIT_PROTOCOL_VERSION` is not bumped. Rights are scoped
+per capability type, so `SbiControl` draws on its own full 32-bit space —
+sanctioning further extensions does not compete with any other type's rights.
 
 ### SchedControl
 
@@ -283,9 +293,21 @@ see [core/kernel/docs/scheduler.md § Priority Levels](../core/kernel/docs/sched
 
 ## Rights and Attenuation
 
-Rights are a bitmask attached to each capability slot. When deriving a capability,
-the derived copy may have equal or fewer rights than the source — rights can only
-be removed, never added. This is called **attenuation**.
+Rights are a bitmask attached to each capability slot. The bitmask is **scoped per
+capability type**: each slot stores one 32-bit rights word, and the slot's type tag
+selects which type's rights vocabulary interprets it. Every type numbers its bits
+from 0 in its own full-width space, so bit assignments never compete across types —
+adding a right to one capability type cannot exhaust another type's budget. The
+`u64` masks in `abi/syscall` are the single source of truth for bit values; the
+kernel's typed rights constants are derived from them, and a rights mask is only
+meaningful for the capability type it is named for. The all-ones mask (`RIGHTS_ALL`)
+is valid for every type.
+
+When deriving a capability, the derived copy may have equal or fewer rights than
+the source — rights can only be removed, never added. This is called
+**attenuation**. Attenuation is a bitwise AND against the source's rights word and
+is uniform across types; the per-type scoping changes only how the bits are named
+and numbered, not how they attenuate.
 
 A process cannot grant another process more authority than it holds itself. If a
 process holds a send-only endpoint capability, it can derive another send-only
@@ -446,9 +468,9 @@ backing region, debiting bytes from the Memory's available-bytes ledger.
 create_endpoint(frame)             → endpoint_cap  (Send + Receive + Grant)
 create_notification(frame)               → notification_cap    (Notification + Wait)
 create_event_queue(frame, n)       → queue_cap     (Post + Recv)
-create_thread(frame, aspace, cs)   → thread_cap    (Control)
-create_address_space(frame, ...)   → aspace_cap    (Map)
-create_cspace(frame, ...)          → cspace_cap    (Insert + Delete + Derive + Revoke)
+create_thread(frame, aspace, cs)   → thread_cap    (Control + Observe)
+create_address_space(frame, ...)   → aspace_cap    (Map + Read + Control)
+create_cspace(frame, ...)          → cspace_cap    (Insert + Delete + Derive)
 create_wait_set(frame)             → wait_set_cap  (Modify + Wait)
 ```
 

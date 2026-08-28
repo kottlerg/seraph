@@ -26,7 +26,7 @@ use syscall::{
 
 use crate::{ChildStack, TestContext, TestResult};
 
-const RIGHTS_NOTIFY: u64 = 1 << 7; // NOTIFY right only.
+const RIGHTS_NOTIFY: u64 = syscall_abi::RIGHTS_NTF_NOTIFY; // NOTIFY right only.
 
 static mut CHILD_STACK: ChildStack = ChildStack::ZERO;
 

@@ -27,7 +27,7 @@ use syscall_abi::SystemInfoType;
 use crate::{ChildStack, TestContext, TestResult};
 
 /// NOTIFY right (send) only.
-const RIGHTS_NOTIFY: u64 = 1 << 7;
+const RIGHTS_NOTIFY: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
 
 /// Spin iterations for the low-priority hog. Large enough that, absent
 /// preemption, the hog dominates the CPU for tens of ms.

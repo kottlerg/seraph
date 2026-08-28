@@ -26,7 +26,7 @@ use syscall_abi::SystemInfoType;
 
 use crate::{ChildStack, TestContext, TestResult};
 
-const RIGHTS_NOTIFY: u64 = 1 << 7;
+const RIGHTS_NOTIFY: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
 
 /// Spin-loop length in the inline-asm hot path. Sized to give the timer
 /// many opportunities to preempt at the default tick rate while finishing

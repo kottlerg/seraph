@@ -858,12 +858,13 @@ rather than the default writeback caching.
 | 0 | `aspace_cap` | Address space capability (Map rights) |
 | 1 | `mmio_cap` | MMIO region capability (Map rights) |
 | 2 | `virt` | Virtual address to map at (page-aligned) |
-| 3 | `flags` | Mapping flags: readable, writable (not executable; MMIO is never XP) |
+| 3 | `flags` | Reserved (cache-mode overrides, etc.); ignored today |
 
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
 
-MMIO mappings are never executable. The kernel forces the uncacheable attribute
-regardless of the flags value; callers MUST NOT set both writable and executable.
+MMIO mappings are never executable, and mapping writability is derived from the
+`mmio_cap`'s Write right, not from `flags`. The kernel forces the uncacheable
+attribute unconditionally.
 
 **Capability requirements:** `aspace_cap` (Map), `mmio_cap` (Map).
 

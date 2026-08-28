@@ -48,7 +48,7 @@ pub(super) fn bench_thread_lifecycle(ctx: &crate::TestContext, iters: u32)
         {
             break;
         };
-        let Ok(child_done) = cap_copy(done, child.cs, 1 << 7)
+        let Ok(child_done) = cap_copy(done, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
         else
         {
             break;
@@ -146,7 +146,7 @@ pub(super) fn bench_context_switch(ctx: &crate::TestContext, iters: u32)
     {
         return;
     };
-    let Ok(child_done) = cap_copy(done, child.cs, 1 << 7)
+    let Ok(child_done) = cap_copy(done, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
     else
     {
         return;

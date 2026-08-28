@@ -165,7 +165,7 @@ svcmgr-launched services.
 ## `seed`
 
 Space-separated discovery-registry names. svcmgr resolves each name
-to a freshly-derived `RIGHTS_SEND` cap on the published endpoint and
+to a freshly-derived `RIGHTS_EP_SEND` cap on the published endpoint and
 injects them positionally into the child's bootstrap round:
 
 ```

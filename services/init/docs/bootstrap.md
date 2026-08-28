@@ -139,7 +139,7 @@ services, and talks to devmgr, all from the endowment.
     endpoint (svcmgr mints real-logd's master-log RECV from it on every
     (re)launch, plus the one-shot `HANDOVER_PULL` SEND on the first
     launch), and `procmgr_death_auth_source`, a badge-0
-    `RIGHTS_SEND_GRANT` derive of procmgr's service endpoint (svcmgr
+    `RIGHTS_EP_SEND_GRANT` derive of procmgr's service endpoint (svcmgr
     mints real-logd's `DEATH_EQ_AUTHORITY` SEND from it for per-sender
     death-EQ registration). Holding `master_log_source` keeps the log
     endpoint object alive across a logd crash, so log senders are

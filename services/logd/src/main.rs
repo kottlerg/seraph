@@ -60,6 +60,7 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use ipc::stream_labels::{STREAM_BYTES, STREAM_REGISTER_NAME};
 use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
 use std::os::seraph::startup_info;
+use syscall::RIGHTS_EQ_POST;
 
 use crate::slot::{LINE_BUF_SIZE, MAX_NAME_LEN, SlotTable};
 
@@ -241,11 +242,6 @@ fn create_wait_set(log_ep_recv: u32, death_eq: u32) -> Option<u32>
     Some(ws)
 }
 
-/// POST = bit 9 (matches `core::cap::slot::Rights::POST` =
-/// `1 << 9`). Construct directly; `shared/syscall` does not expose
-/// a `RIGHTS_POST` helper yet.
-const RIGHTS_POST: u64 = 1 << 9;
-
 /// Send `REGISTER_DEATH_EQ` to procmgr.
 ///
 /// `ipc_call` on a message carrying a cap MOVES the cap into the
@@ -262,7 +258,7 @@ fn register_with_procmgr(procmgr_send: u32, death_eq: u32, ipc_buf: *mut u64)
         self_log("REGISTER_DEATH_EQ skipped: no procmgr cap");
         return;
     }
-    let Ok(post_cap) = syscall::cap_derive(death_eq, RIGHTS_POST)
+    let Ok(post_cap) = syscall::cap_derive(death_eq, RIGHTS_EQ_POST)
     else
     {
         self_log("REGISTER_DEATH_EQ: cap_derive POST failed");

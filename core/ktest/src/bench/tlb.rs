@@ -123,14 +123,14 @@ pub(super) fn bench_tlb_shootdown(ctx: &crate::TestContext, iters: u32)
         {
             break;
         };
-        let Ok(child_ready) = syscall::cap_copy(ready, child.cs, 1 << 7)
+        let Ok(child_ready) = syscall::cap_copy(ready, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
         else
         {
             cap_delete(child.th).ok();
             cap_delete(child.cs).ok();
             break;
         };
-        let Ok(child_done) = syscall::cap_copy(done, child.cs, 1 << 7)
+        let Ok(child_done) = syscall::cap_copy(done, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
         else
         {
             cap_delete(child.th).ok();
@@ -470,14 +470,14 @@ pub(super) fn bench_tlb_shootdown_concurrent(ctx: &crate::TestContext, iters: u3
         {
             break;
         };
-        let Ok(child_ready) = syscall::cap_copy(ready, child.cs, 1 << 7)
+        let Ok(child_ready) = syscall::cap_copy(ready, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
         else
         {
             cap_delete(child.th).ok();
             cap_delete(child.cs).ok();
             break;
         };
-        let Ok(child_done) = syscall::cap_copy(done, child.cs, 1 << 7)
+        let Ok(child_done) = syscall::cap_copy(done, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
         else
         {
             cap_delete(child.th).ok();

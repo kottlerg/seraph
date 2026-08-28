@@ -1209,7 +1209,7 @@ impl File
 
         let release_ep = release_handler::release_endpoint(state);
         let release_send =
-            match syscall::cap_derive_badge(release_ep, syscall::RIGHTS_SEND, badge)
+            match syscall::cap_derive_badge(release_ep, syscall::RIGHTS_EP_SEND, badge)
             {
                 Ok(c) => c,
                 Err(_) =>

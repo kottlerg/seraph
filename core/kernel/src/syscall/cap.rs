@@ -72,7 +72,7 @@ unsafe fn resolve_src_cap(
 /// `SYS_CAP_CREATE_ENDPOINT` (7): retype a Memory cap into a new Endpoint.
 ///
 /// arg0 = Memory-cap slot index in the caller's `CSpace`. The Memory cap
-/// MUST carry `Rights::RETYPE` and have at least
+/// MUST carry `MemRights::RETYPE` and have at least
 /// `dispatch_for(Endpoint, 0).raw_bytes` (80 B = 24 wrapper + 56
 /// `EndpointState`) of `available_bytes`.
 ///
@@ -87,7 +87,7 @@ pub fn sys_cap_create_endpoint(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::object::{EndpointObject, KernelObjectHeader, MemoryObject, ObjectType};
     use crate::cap::retype::{dispatch_for, retype_allocate, retype_free};
-    use crate::cap::slot::{CapTag, Rights};
+    use crate::cap::slot::{EpRights, MemRights};
     use crate::ipc::endpoint::EndpointState;
     use core::ptr::NonNull;
 
@@ -106,10 +106,9 @@ pub fn sys_cap_create_endpoint(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         return Err(SyscallError::InvalidCapability);
     }
 
-    // Resolve the source Memory cap. Requires Rights::RETYPE.
+    // Resolve the source Memory cap. Requires MemRights::RETYPE.
     // SAFETY: cspace validated non-null above.
-    let memory_slot_ref =
-        unsafe { super::lookup_cap(cspace, memory_slot, CapTag::Memory, Rights::RETYPE)? };
+    let memory_slot_ref = unsafe { super::lookup_cap(cspace, memory_slot, MemRights::RETYPE)? };
     let memory_obj_nn = memory_slot_ref
         .object
         .ok_or(SyscallError::InvalidCapability)?;
@@ -166,9 +165,8 @@ pub fn sys_cap_create_endpoint(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // SAFETY: cspace validated non-null above; lock_raw/unlock_raw paired.
     let idx_res = unsafe {
         let saved = (*cspace).lock.lock_raw();
-        let r = (*cspace).insert_cap_handle(
-            CapTag::Endpoint,
-            Rights::SEND | Rights::RECEIVE | Rights::GRANT,
+        let r = (*cspace).insert_cap_handle_typed(
+            EpRights::SEND | EpRights::RECEIVE | EpRights::GRANT,
             nonnull,
         );
         (*cspace).lock.unlock_raw(saved);
@@ -199,7 +197,7 @@ pub fn sys_cap_create_endpoint(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// `SYS_CAP_CREATE_NOTIFICATION` (8): retype a Memory cap into a new Notification.
 ///
 /// arg0 = Memory-cap slot index in the caller's `CSpace`. The Memory cap MUST
-/// carry `Rights::RETYPE` and have at least `dispatch_for(Notification, 0).raw_bytes`
+/// carry `MemRights::RETYPE` and have at least `dispatch_for(Notification, 0).raw_bytes`
 /// of `available_bytes`.
 ///
 /// On success, the wrapper + `NotificationState` are constructed in place inside
@@ -213,7 +211,7 @@ pub fn sys_cap_create_notification(tf: &mut TrapFrame) -> Result<u64, SyscallErr
 {
     use crate::cap::object::{KernelObjectHeader, MemoryObject, NotificationObject, ObjectType};
     use crate::cap::retype::{dispatch_for, retype_allocate, retype_free};
-    use crate::cap::slot::{CapTag, Rights};
+    use crate::cap::slot::{MemRights, NtfRights};
     use crate::ipc::notification::NotificationState;
     use core::ptr::NonNull;
 
@@ -233,8 +231,7 @@ pub fn sys_cap_create_notification(tf: &mut TrapFrame) -> Result<u64, SyscallErr
     }
 
     // SAFETY: cspace validated; lookup_cap checks tag and rights.
-    let memory_slot_ref =
-        unsafe { super::lookup_cap(cspace, memory_slot, CapTag::Memory, Rights::RETYPE)? };
+    let memory_slot_ref = unsafe { super::lookup_cap(cspace, memory_slot, MemRights::RETYPE)? };
     let memory_obj_nn = memory_slot_ref
         .object
         .ok_or(SyscallError::InvalidCapability)?;
@@ -279,11 +276,7 @@ pub fn sys_cap_create_notification(tf: &mut TrapFrame) -> Result<u64, SyscallErr
     // SAFETY: cspace validated non-null; lock_raw/unlock_raw paired.
     let idx_res = unsafe {
         let saved = (*cspace).lock.lock_raw();
-        let r = (*cspace).insert_cap_handle(
-            CapTag::Notification,
-            Rights::NOTIFY | Rights::WAIT,
-            nonnull,
-        );
+        let r = (*cspace).insert_cap_handle_typed(NtfRights::NOTIFY | NtfRights::WAIT, nonnull);
         (*cspace).lock.unlock_raw(saved);
         r
     };
@@ -311,7 +304,7 @@ pub fn sys_cap_create_notification(tf: &mut TrapFrame) -> Result<u64, SyscallErr
 /// `SYS_CAP_CREATE_ASPACE` (11): create a new `AddressSpace` object, or
 /// augment an existing one's PT growth budget.
 ///
-/// arg0 = source Memory-cap slot (must carry `Rights::RETYPE`, with at least
+/// arg0 = source Memory-cap slot (must carry `MemRights::RETYPE`, with at least
 ///        `init_pages * PAGE_SIZE` available bytes).
 /// arg1 = augment-target `AddressSpace` cap slot, or `0` to create new.
 /// arg2 = `init_pages`: number of PT pages to carve from the Memory cap.
@@ -346,7 +339,7 @@ pub fn sys_cap_create_aspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         AddressSpaceObject, KernelObjectHeader, MemoryObject, ObjectType, vacant_chunk_slots,
     };
     use crate::cap::retype::{dispatch_for, retype_allocate, retype_free};
-    use crate::cap::slot::{CapTag, Rights};
+    use crate::cap::slot::{AsRights, MemRights};
     use crate::mm::PAGE_SIZE;
     use crate::mm::address_space::AddressSpace;
     use crate::mm::paging::phys_to_virt;
@@ -383,8 +376,7 @@ pub fn sys_cap_create_aspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // Resolve the source Memory cap (RETYPE-rights gated).
     // SAFETY: cspace validated non-null above.
-    let memory_slot_ref =
-        unsafe { super::lookup_cap(cspace, memory_idx, CapTag::Memory, Rights::RETYPE)? };
+    let memory_slot_ref = unsafe { super::lookup_cap(cspace, memory_idx, MemRights::RETYPE)? };
     let memory_obj_nn = memory_slot_ref
         .object
         .ok_or(SyscallError::InvalidCapability)?;
@@ -406,8 +398,7 @@ pub fn sys_cap_create_aspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     if augment_idx != 0
     {
         // SAFETY: cspace validated non-null above.
-        let target_slot =
-            unsafe { super::lookup_cap(cspace, augment_idx, CapTag::AddressSpace, Rights::MAP) }?;
+        let target_slot = unsafe { super::lookup_cap(cspace, augment_idx, AsRights::MAP) }?;
         let target_aso_nn = target_slot.object.ok_or(SyscallError::InvalidCapability)?;
         // SAFETY: tag confirmed AddressSpace.
         #[allow(clippy::cast_ptr_alignment)]
@@ -521,11 +512,8 @@ pub fn sys_cap_create_aspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // SAFETY: cspace validated non-null above; lock_raw/unlock_raw paired.
     let idx_res = unsafe {
         let saved = (*cspace).lock.lock_raw();
-        let r = (*cspace).insert_cap_handle(
-            CapTag::AddressSpace,
-            Rights::MAP | Rights::READ | Rights::CONTROL,
-            nonnull,
-        );
+        let r = (*cspace)
+            .insert_cap_handle_typed(AsRights::MAP | AsRights::READ | AsRights::CONTROL, nonnull);
         (*cspace).lock.unlock_raw(saved);
         r
     };
@@ -555,7 +543,7 @@ pub fn sys_cap_create_aspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// `SYS_CAP_CREATE_CSPACE` (12): retype a Memory cap into a new `CSpace`,
 /// or augment an existing one's slot-page growth budget.
 ///
-/// arg0 = source Memory-cap slot (must carry `Rights::RETYPE`).
+/// arg0 = source Memory-cap slot (must carry `MemRights::RETYPE`).
 /// arg1 = augment-target `CSpace` cap slot, or `0` to create new.
 /// arg2 = `init_pages`: number of pages to carve from the Memory cap.
 ///        Create-mode requires `init_pages >= 1` (one wrapper page; the
@@ -587,7 +575,7 @@ pub fn sys_cap_create_cspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         CSpaceKernelObject, KernelObjectHeader, MemoryObject, ObjectType, vacant_chunk_slots,
     };
     use crate::cap::retype::{dispatch_for, retype_allocate, retype_free};
-    use crate::cap::slot::{CapTag, Rights};
+    use crate::cap::slot::{CsRights, MemRights};
     use crate::mm::PAGE_SIZE;
     use crate::mm::paging::phys_to_virt;
     use core::ptr::NonNull;
@@ -625,8 +613,7 @@ pub fn sys_cap_create_cspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // Resolve the source Memory cap.
     // SAFETY: cspace validated non-null above.
-    let memory_slot_ref =
-        unsafe { super::lookup_cap(cspace, memory_idx, CapTag::Memory, Rights::RETYPE)? };
+    let memory_slot_ref = unsafe { super::lookup_cap(cspace, memory_idx, MemRights::RETYPE)? };
     let memory_obj_nn = memory_slot_ref
         .object
         .ok_or(SyscallError::InvalidCapability)?;
@@ -645,8 +632,7 @@ pub fn sys_cap_create_cspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     if augment_idx != 0
     {
         // SAFETY: cspace validated non-null above.
-        let target_slot =
-            unsafe { super::lookup_cap(cspace, augment_idx, CapTag::CSpace, Rights::INSERT) }?;
+        let target_slot = unsafe { super::lookup_cap(cspace, augment_idx, CsRights::INSERT) }?;
         let target_kobj_nn = target_slot.object.ok_or(SyscallError::InvalidCapability)?;
         // SAFETY: tag confirmed CSpace.
         #[allow(clippy::cast_ptr_alignment)]
@@ -787,9 +773,8 @@ pub fn sys_cap_create_cspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // SAFETY: cspace validated non-null above; lock_raw/unlock_raw paired.
     let insert_res = unsafe {
         let saved = (*cspace).lock.lock_raw();
-        let r = (*cspace).insert_cap_handle(
-            CapTag::CSpace,
-            Rights::INSERT | Rights::DELETE | Rights::DERIVE,
+        let r = (*cspace).insert_cap_handle_typed(
+            CsRights::INSERT | CsRights::DELETE | CsRights::DERIVE,
             nonnull,
         );
         (*cspace).lock.unlock_raw(saved);
@@ -851,7 +836,7 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         KernelObjectHeader, MemoryObject, ObjectType, SchedControlObject, ThreadObject,
     };
     use crate::cap::retype::{dispatch_for, retype_allocate, retype_free};
-    use crate::cap::slot::{CapTag, Rights};
+    use crate::cap::slot::{AsRights, CsRights, MemRights, SchedRights, ThreadRights};
     use crate::ipc::message::Message;
     use crate::mm::PAGE_SIZE;
     use crate::mm::paging::phys_to_virt;
@@ -898,7 +883,7 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // 1 wrapper/TCB + 1 FPU/SIMD save area).
     // SAFETY: caller_cspace validated non-null above.
     let memory_slot_ref =
-        unsafe { super::lookup_cap(caller_cspace, memory_idx, CapTag::Memory, Rights::RETYPE)? };
+        unsafe { super::lookup_cap(caller_cspace, memory_idx, MemRights::RETYPE)? };
     let memory_obj_nn = memory_slot_ref
         .object
         .ok_or(SyscallError::InvalidCapability)?;
@@ -907,8 +892,7 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // Resolve AddressSpace cap.
     // SAFETY: caller_cspace validated non-null above.
-    let as_slot =
-        unsafe { super::lookup_cap(caller_cspace, as_idx, CapTag::AddressSpace, Rights::MAP) }?;
+    let as_slot = unsafe { super::lookup_cap(caller_cspace, as_idx, AsRights::MAP) }?;
     let as_ptr = {
         use crate::cap::object::AddressSpaceObject;
         let obj = as_slot.object.ok_or(SyscallError::InvalidCapability)?;
@@ -920,8 +904,7 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // Resolve CSpace cap.
     // SAFETY: caller_cspace validated non-null above.
-    let cs_slot =
-        unsafe { super::lookup_cap(caller_cspace, cs_idx, CapTag::CSpace, Rights::INSERT) }?;
+    let cs_slot = unsafe { super::lookup_cap(caller_cspace, cs_idx, CsRights::INSERT) }?;
     let new_cs_ptr = {
         use crate::cap::object::CSpaceKernelObject;
         let obj = cs_slot.object.ok_or(SyscallError::InvalidCapability)?;
@@ -944,9 +927,7 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     {
         // Presence-only cap — no rights bit to check.
         // SAFETY: caller_cspace validated non-null above.
-        let sched_slot = unsafe {
-            super::lookup_cap(caller_cspace, sched_idx, CapTag::SchedControl, Rights::NONE)
-        }?;
+        let sched_slot = unsafe { super::lookup_cap(caller_cspace, sched_idx, SchedRights::NONE) }?;
         let sched_obj = sched_slot.object.ok_or(SyscallError::InvalidCapability)?;
         // cast_ptr_alignment: header at offset 0 of SchedControlObject; allocator
         // guarantees alignment.
@@ -1105,11 +1086,8 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // SAFETY: caller_cspace validated non-null above; lock_raw/unlock_raw paired.
     let idx_res = unsafe {
         let saved = (*caller_cspace).lock.lock_raw();
-        let r = (*caller_cspace).insert_cap_handle(
-            CapTag::Thread,
-            Rights::CONTROL | Rights::OBSERVE,
-            nonnull,
-        );
+        let r = (*caller_cspace)
+            .insert_cap_handle_typed(ThreadRights::CONTROL | ThreadRights::OBSERVE, nonnull);
         (*caller_cspace).lock.unlock_raw(saved);
         r
     };
@@ -1219,8 +1197,7 @@ pub fn sys_cap_copy(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         super::lookup_cap(
             caller_cspace,
             dest_cs_idx,
-            crate::cap::slot::CapTag::CSpace,
-            Rights::INSERT,
+            crate::cap::slot::CsRights::INSERT,
         )
     }?;
     let dest_cs_ptr = {
@@ -1777,7 +1754,7 @@ pub fn sys_cap_revoke(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 pub fn sys_cap_move(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::object::CSpaceKernelObject;
-    use crate::cap::slot::{Rights, SlotId};
+    use crate::cap::slot::SlotId;
 
     let src_handle = tf.arg(0) as u32;
     let src_idx = syscall::cap_handle_index(src_handle);
@@ -1805,8 +1782,7 @@ pub fn sys_cap_move(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         super::lookup_cap(
             caller_cspace,
             dest_cs_idx,
-            crate::cap::slot::CapTag::CSpace,
-            Rights::INSERT,
+            crate::cap::slot::CsRights::INSERT,
         )
     }?;
     let dest_cs_ptr = {
@@ -2112,7 +2088,7 @@ pub fn sys_cap_create_event_queue(tf: &mut TrapFrame) -> Result<u64, SyscallErro
 {
     use crate::cap::object::{EventQueueObject, KernelObjectHeader, MemoryObject, ObjectType};
     use crate::cap::retype::{EVENT_QUEUE_RING_OFFSET, dispatch_for, retype_allocate, retype_free};
-    use crate::cap::slot::{CapTag, Rights};
+    use crate::cap::slot::{EqRights, MemRights};
     use crate::ipc::event_queue::EventQueueState;
     use core::ptr::NonNull;
     use syscall::EVENT_QUEUE_MAX_CAPACITY;
@@ -2138,8 +2114,7 @@ pub fn sys_cap_create_event_queue(tf: &mut TrapFrame) -> Result<u64, SyscallErro
     }
 
     // SAFETY: cspace validated; lookup_cap checks tag and rights.
-    let memory_slot_ref =
-        unsafe { super::lookup_cap(cspace, memory_slot, CapTag::Memory, Rights::RETYPE)? };
+    let memory_slot_ref = unsafe { super::lookup_cap(cspace, memory_slot, MemRights::RETYPE)? };
     let memory_obj_nn = memory_slot_ref
         .object
         .ok_or(SyscallError::InvalidCapability)?;
@@ -2191,8 +2166,7 @@ pub fn sys_cap_create_event_queue(tf: &mut TrapFrame) -> Result<u64, SyscallErro
     // SAFETY: cspace validated non-null above; lock_raw/unlock_raw paired.
     let idx_res = unsafe {
         let saved = (*cspace).lock.lock_raw();
-        let r =
-            (*cspace).insert_cap_handle(CapTag::EventQueue, Rights::POST | Rights::RECV, nonnull);
+        let r = (*cspace).insert_cap_handle_typed(EqRights::POST | EqRights::RECV, nonnull);
         (*cspace).lock.unlock_raw(saved);
         r
     };
@@ -2222,14 +2196,14 @@ pub fn sys_cap_create_event_queue(tf: &mut TrapFrame) -> Result<u64, SyscallErro
 
 /// `SYS_CAP_CREATE_WAIT_SET` (13): retype a Memory cap into a new `WaitSet`.
 ///
-/// arg0 = Memory-cap slot. The Memory cap MUST carry `Rights::RETYPE` and have
+/// arg0 = Memory-cap slot. The Memory cap MUST carry `MemRights::RETYPE` and have
 /// at least `dispatch_for(WaitSet, 0).raw_bytes` (504) of `available_bytes`.
 #[cfg(not(test))]
 pub fn sys_cap_create_wait_set(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::object::{KernelObjectHeader, MemoryObject, ObjectType, WaitSetObject};
     use crate::cap::retype::{dispatch_for, retype_allocate, retype_free};
-    use crate::cap::slot::{CapTag, Rights};
+    use crate::cap::slot::{MemRights, WsRights};
     use crate::ipc::wait_set::WaitSetState;
     use core::ptr::NonNull;
 
@@ -2249,8 +2223,7 @@ pub fn sys_cap_create_wait_set(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     }
 
     // SAFETY: cspace validated; lookup_cap checks tag and rights.
-    let memory_slot_ref =
-        unsafe { super::lookup_cap(cspace, memory_slot, CapTag::Memory, Rights::RETYPE)? };
+    let memory_slot_ref = unsafe { super::lookup_cap(cspace, memory_slot, MemRights::RETYPE)? };
     let memory_obj_nn = memory_slot_ref
         .object
         .ok_or(SyscallError::InvalidCapability)?;
@@ -2292,8 +2265,7 @@ pub fn sys_cap_create_wait_set(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // SAFETY: cspace validated non-null above; lock_raw/unlock_raw paired.
     let idx_res = unsafe {
         let saved = (*cspace).lock.lock_raw();
-        let r =
-            (*cspace).insert_cap_handle(CapTag::WaitSet, Rights::MODIFY | Rights::WAIT, nonnull);
+        let r = (*cspace).insert_cap_handle_typed(WsRights::MODIFY | WsRights::WAIT, nonnull);
         (*cspace).lock.unlock_raw(saved);
         r
     };
@@ -2359,7 +2331,7 @@ pub fn sys_cap_info(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     };
 
     use crate::cap::object::{AddressSpaceObject, CSpaceKernelObject, MemoryObject, ThreadObject};
-    use crate::cap::slot::{CapTag, Rights};
+    use crate::cap::slot::{CapTag, MemRights};
     use crate::sched::thread::ThreadState;
 
     let slot_handle = tf.arg(0) as u32;
@@ -2444,7 +2416,7 @@ pub fn sys_cap_info(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             {
                 return Err(SyscallError::InvalidArgument);
             }
-            Ok(u64::from(rights.contains(Rights::RETYPE)))
+            Ok(u64::from(rights.contains(MemRights::RETYPE.erase())))
         }
         CAP_INFO_MEMORY_PHYS_BASE =>
         {

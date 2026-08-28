@@ -115,7 +115,7 @@ pub(crate) fn mint_logd_boot_caps(ctx: &RestartCtx, first_launch: bool) -> Vec<u
 {
     let recv = if ctx.master_log_source != 0
     {
-        syscall::cap_derive(ctx.master_log_source, syscall::RIGHTS_RECEIVE).unwrap_or(0)
+        syscall::cap_derive(ctx.master_log_source, syscall::RIGHTS_EP_RECEIVE).unwrap_or(0)
     }
     else
     {
@@ -123,7 +123,7 @@ pub(crate) fn mint_logd_boot_caps(ctx: &RestartCtx, first_launch: bool) -> Vec<u
     };
     let handover_send = if first_launch && ctx.master_log_source != 0
     {
-        syscall::cap_derive(ctx.master_log_source, syscall::RIGHTS_SEND).unwrap_or(0)
+        syscall::cap_derive(ctx.master_log_source, syscall::RIGHTS_EP_SEND).unwrap_or(0)
     }
     else
     {
@@ -133,7 +133,7 @@ pub(crate) fn mint_logd_boot_caps(ctx: &RestartCtx, first_launch: bool) -> Vec<u
     {
         syscall::cap_derive_badge(
             ctx.procmgr_death_auth_source,
-            syscall::RIGHTS_SEND_GRANT,
+            syscall::RIGHTS_EP_SEND_GRANT,
             procmgr_labels::DEATH_EQ_AUTHORITY,
         )
         .unwrap_or(0)
@@ -146,7 +146,7 @@ pub(crate) fn mint_logd_boot_caps(ctx: &RestartCtx, first_launch: bool) -> Vec<u
     {
         syscall::cap_derive_badge(
             ctx.devmgr_registry,
-            syscall::RIGHTS_SEND,
+            syscall::RIGHTS_EP_SEND,
             devmgr_labels::REGISTRY_QUERY_AUTHORITY,
         )
         .unwrap_or(0)
@@ -181,11 +181,11 @@ fn publish_provided(
     {
         let derived = if p.badge == 0
         {
-            syscall::cap_derive(provided_endpoint, syscall::RIGHTS_SEND)
+            syscall::cap_derive(provided_endpoint, syscall::RIGHTS_EP_SEND)
         }
         else
         {
-            syscall::cap_derive_badge(provided_endpoint, syscall::RIGHTS_SEND, p.badge)
+            syscall::cap_derive_badge(provided_endpoint, syscall::RIGHTS_EP_SEND, p.badge)
         };
         let Ok(send) = derived
         else
@@ -244,7 +244,7 @@ fn assemble_provided_boot_caps(
     // child down cleanly.
     let provided_recv = if provided_endpoint != 0
     {
-        let Ok(recv) = syscall::cap_derive(provided_endpoint, syscall::RIGHTS_RECEIVE)
+        let Ok(recv) = syscall::cap_derive(provided_endpoint, syscall::RIGHTS_EP_RECEIVE)
         else
         {
             std::os::seraph::log!("launch {}: provider RECV derive failed", def.name);
@@ -383,7 +383,7 @@ pub fn launch(
     })
 }
 
-/// Resolve each `seed = ...` name to a derived `RIGHTS_SEND` cap on
+/// Resolve each `seed = ...` name to a derived `RIGHTS_EP_SEND` cap on
 /// the published endpoint. Unresolved names become `0` in their slot
 /// so positional ordering is preserved. Truncated to
 /// `MSG_CAP_SLOTS_MAX` (the bootstrap round's cap limit).
@@ -462,7 +462,7 @@ fn configure_namespace(def: &Definition, created: &CreatedProcess, ctx: &Restart
         NamespaceShape::None => unreachable!("guarded above"),
         NamespaceShape::Universal =>
         {
-            let Ok(c) = syscall::cap_copy(root_cap, info.self_cspace, syscall::RIGHTS_SEND)
+            let Ok(c) = syscall::cap_copy(root_cap, info.self_cspace, syscall::RIGHTS_EP_SEND)
             else
             {
                 std::os::seraph::log!("launch {}: cap_copy of root failed", def.name);

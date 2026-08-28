@@ -23,13 +23,12 @@ use syscall::{
     cap_delete, cap_derive, ipc_buffer_set, notification_send, notification_wait, thread_configure,
     thread_exit, thread_sleep, thread_start,
 };
+use syscall_abi::RIGHTS_EP_SEND_GRANT;
 
 use crate::{ChildStack, TestContext, TestResult};
 
-// SEND + GRANT rights (bits 4 and 6).
-const RIGHTS_SEND_GRANT: u64 = (1 << 4) | (1 << 6);
-// RECV right only (bit 4 for SEND is not set).
-const RIGHTS_RECV_ONLY: u64 = 1 << 10;
+// Endpoint RECEIVE right only (no SEND).
+const RIGHTS_RECV_ONLY: u64 = syscall_abi::RIGHTS_EP_RECEIVE;
 
 // Child stacks — one per test that spawns a child.
 static mut CHILD_STACK: ChildStack = ChildStack::ZERO;
@@ -62,9 +61,9 @@ pub fn call_reply_recv(ctx: &TestContext) -> TestResult
     // Build child CSpace: endpoint (SEND | GRANT) + notify notification (NOTIFY only).
     let child = crate::spawn::new_child(ctx)
         .map_err(|_| "ipc::call_reply_recv: spawn::new_child failed")?;
-    let child_ep = cap_copy(ep, child.cs, RIGHTS_SEND_GRANT)
+    let child_ep = cap_copy(ep, child.cs, RIGHTS_EP_SEND_GRANT)
         .map_err(|_| "cap_copy ep into child CSpace failed")?;
-    let child_notify = cap_copy(notify, child.cs, 1 << 7)
+    let child_notify = cap_copy(notify, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
         .map_err(|_| "cap_copy notify into child CSpace failed")?;
 
     // Pack child ep and notify slots into the arg u64.
@@ -120,9 +119,9 @@ pub fn recv_finds_queued_caller(ctx: &TestContext) -> TestResult
 
     let child = crate::spawn::new_child(ctx)
         .map_err(|_| "ipc::recv_finds_queued_caller: spawn::new_child failed")?;
-    let child_ep = cap_copy(ep, child.cs, RIGHTS_SEND_GRANT)
+    let child_ep = cap_copy(ep, child.cs, RIGHTS_EP_SEND_GRANT)
         .map_err(|_| "cap_copy ep for recv_finds_queued_caller failed")?;
-    let child_done = cap_copy(done, child.cs, 1 << 7)
+    let child_done = cap_copy(done, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
         .map_err(|_| "cap_copy done for recv_finds_queued_caller failed")?;
     let child_arg = u64::from(child_ep) | (u64::from(child_done) << 16);
 
@@ -186,7 +185,7 @@ pub fn send_insufficient_rights_err(ctx: &TestContext) -> TestResult
     let ep = cap_create_endpoint(ctx.memory_base)
         .map_err(|_| "cap_create_endpoint for send_rights test failed")?;
 
-    // Derive with RECV right only (bit 10), no SEND (bit 4).
+    // Derive with RECEIVE right only, no SEND.
     let recv_only =
         cap_derive(ep, RIGHTS_RECV_ONLY).map_err(|_| "cap_derive for send_rights test failed")?;
 
@@ -218,10 +217,10 @@ pub fn call_with_data_words(ctx: &TestContext) -> TestResult
 
     let child = crate::spawn::new_child(ctx)
         .map_err(|_| "ipc::call_with_data_words: spawn::new_child failed")?;
-    let child_ep = cap_copy(ep, child.cs, RIGHTS_SEND_GRANT)
+    let child_ep = cap_copy(ep, child.cs, RIGHTS_EP_SEND_GRANT)
         .map_err(|_| "cap_copy ep for data_words test failed")?;
-    let child_done =
-        cap_copy(done, child.cs, 1 << 7).map_err(|_| "cap_copy done for data_words test failed")?;
+    let child_done = cap_copy(done, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
+        .map_err(|_| "cap_copy done for data_words test failed")?;
     let child_arg = u64::from(child_ep) | (u64::from(child_done) << 16);
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(DATA_WORDS_STACK));
@@ -282,10 +281,10 @@ pub fn call_with_cap_transfer(ctx: &TestContext) -> TestResult
 
     let child = crate::spawn::new_child(ctx)
         .map_err(|_| "ipc::call_with_cap_transfer: spawn::new_child failed")?;
-    let child_ep = cap_copy(ep, child.cs, RIGHTS_SEND_GRANT)
+    let child_ep = cap_copy(ep, child.cs, RIGHTS_EP_SEND_GRANT)
         .map_err(|_| "cap_copy ep for cap_xfer test failed")?;
-    let child_done =
-        cap_copy(done, child.cs, 1 << 7).map_err(|_| "cap_copy done for cap_xfer test failed")?;
+    let child_done = cap_copy(done, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
+        .map_err(|_| "cap_copy done for cap_xfer test failed")?;
     let child_memory = cap_copy(ctx.memory_base, child.cs, syscall::RIGHTS_ALL)
         .map_err(|_| "cap_copy memory for cap_xfer test failed")?;
     let child_arg =
@@ -348,14 +347,14 @@ pub fn recv_delivers_badge(ctx: &TestContext) -> TestResult
         .map_err(|_| "cap_create_notification for recv_delivers_badge failed")?;
 
     // Derive a badged send+grant cap.
-    let badged_ep = syscall::cap_derive_badge(ep, RIGHTS_SEND_GRANT, 0x1234)
+    let badged_ep = syscall::cap_derive_badge(ep, RIGHTS_EP_SEND_GRANT, 0x1234)
         .map_err(|_| "cap_derive_badge for recv_delivers_badge failed")?;
 
     let child = crate::spawn::new_child(ctx)
         .map_err(|_| "ipc::recv_delivers_badge: spawn::new_child failed")?;
     let child_ep = cap_copy(badged_ep, child.cs, syscall::RIGHTS_ALL)
         .map_err(|_| "cap_copy badged ep for recv_delivers_badge failed")?;
-    let child_done = cap_copy(done, child.cs, 1 << 7)
+    let child_done = cap_copy(done, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
         .map_err(|_| "cap_copy done for recv_delivers_badge failed")?;
     let child_arg = u64::from(child_ep) | (u64::from(child_done) << 16);
 
@@ -403,10 +402,10 @@ pub fn recv_unbadged_returns_zero(ctx: &TestContext) -> TestResult
     // Give child an unbadged send+grant cap (regular derive, no badge).
     let child = crate::spawn::new_child(ctx)
         .map_err(|_| "ipc::recv_unbadged_returns_zero: spawn::new_child failed")?;
-    let child_ep = cap_copy(ep, child.cs, RIGHTS_SEND_GRANT)
+    let child_ep = cap_copy(ep, child.cs, RIGHTS_EP_SEND_GRANT)
         .map_err(|_| "cap_copy ep for recv_unbadged failed")?;
-    let child_done =
-        cap_copy(done, child.cs, 1 << 7).map_err(|_| "cap_copy done for recv_unbadged failed")?;
+    let child_done = cap_copy(done, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
+        .map_err(|_| "cap_copy done for recv_unbadged failed")?;
     let child_arg = u64::from(child_ep) | (u64::from(child_done) << 16);
 
     // Reuse the caller_entry (sends 0xCAFE, expects reply 0xBEEF).
@@ -636,10 +635,10 @@ pub fn recv_snapshot_survives_buffer_clobber(ctx: &TestContext) -> TestResult
 
     let child = crate::spawn::new_child(ctx)
         .map_err(|_| "ipc::recv_snapshot_survives_buffer_clobber: spawn::new_child failed")?;
-    let child_ep = cap_copy(ep, child.cs, RIGHTS_SEND_GRANT)
+    let child_ep = cap_copy(ep, child.cs, RIGHTS_EP_SEND_GRANT)
         .map_err(|_| "cap_copy ep for snapshot test failed")?;
-    let child_done =
-        cap_copy(done, child.cs, 1 << 7).map_err(|_| "cap_copy done for snapshot test failed")?;
+    let child_done = cap_copy(done, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
+        .map_err(|_| "cap_copy done for snapshot test failed")?;
     let child_arg = u64::from(child_ep) | (u64::from(child_done) << 16);
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(SNAPSHOT_STACK));
@@ -762,12 +761,12 @@ pub fn reply_oom_wakes_caller_with_transfer_failed(ctx: &TestContext) -> TestRes
     // documented in `spawn.rs`.
     let child_cs = cap_create_cspace(ctx.memory_base, 0, 4, 8)
         .map_err(|_| "cap_create_cspace for reply_oom test failed")?;
-    let child_ep = cap_copy(ep, child_cs, RIGHTS_SEND_GRANT)
+    let child_ep = cap_copy(ep, child_cs, RIGHTS_EP_SEND_GRANT)
         .map_err(|_| "cap_copy ep for reply_oom test failed")?;
-    let child_ready = cap_copy(ready, child_cs, 1 << 7)
+    let child_ready = cap_copy(ready, child_cs, syscall_abi::RIGHTS_NTF_NOTIFY)
         .map_err(|_| "cap_copy ready for reply_oom test failed")?;
-    let child_done =
-        cap_copy(done, child_cs, 1 << 7).map_err(|_| "cap_copy done for reply_oom test failed")?;
+    let child_done = cap_copy(done, child_cs, syscall_abi::RIGHTS_NTF_NOTIFY)
+        .map_err(|_| "cap_copy done for reply_oom test failed")?;
     let child_memory = cap_copy(ctx.memory_base, child_cs, syscall::RIGHTS_ALL)
         .map_err(|_| "cap_copy memory for reply_oom test failed")?;
 
@@ -925,10 +924,10 @@ pub fn recv_oom_returns_cleanly(ctx: &TestContext) -> TestResult
     // (16-slot default) per the convention documented in `spawn.rs`.
     let victim_cs = cap_create_cspace(ctx.memory_base, 0, 4, 8)
         .map_err(|_| "cap_create_cspace for recv_oom test failed")?;
-    let victim_ep = cap_copy(ep, victim_cs, syscall_abi::RIGHTS_RECEIVE)
+    let victim_ep = cap_copy(ep, victim_cs, syscall_abi::RIGHTS_EP_RECEIVE)
         .map_err(|_| "cap_copy ep for recv_oom test failed")?;
-    let victim_done =
-        cap_copy(done, victim_cs, 1 << 7).map_err(|_| "cap_copy done for recv_oom test failed")?;
+    let victim_done = cap_copy(done, victim_cs, syscall_abi::RIGHTS_NTF_NOTIFY)
+        .map_err(|_| "cap_copy done for recv_oom test failed")?;
     let victim_memory = cap_copy(ctx.memory_base, victim_cs, syscall::RIGHTS_ALL)
         .map_err(|_| "cap_copy memory for recv_oom test failed")?;
     let victim_arg =

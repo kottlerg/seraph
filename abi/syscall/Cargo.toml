@@ -8,7 +8,6 @@ publish.workspace = true
 # kernel (no_std) and userspace contexts.
 [lib]
 name = "syscall_abi"
-test = false
 doctest = false
 
 # When std lists this crate as a dep (library/std/Cargo.toml, target_os =

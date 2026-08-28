@@ -7,7 +7,7 @@
 //!
 //! Namespace rights are packed into the high bits of a node-cap badge
 //! (see [`crate::badge`]). They are distinct from kernel capability
-//! rights (`RIGHTS_SEND`, `RIGHTS_MAP`, …): a node cap is always a SEND
+//! rights (`RIGHTS_EP_SEND`, `RIGHTS_MEM_MAP`, …): a node cap is always a SEND
 //! cap from the kernel's perspective, and the namespace rights live
 //! entirely in the cap's badge bits, inspected only by the server.
 //!

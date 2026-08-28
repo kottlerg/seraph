@@ -32,8 +32,8 @@ use syscall::{
 
 use crate::{ChildStack, TestContext, TestResult};
 
-const RIGHTS_NOTIFY: u64 = 1 << 7;
-const RIGHTS_WAIT: u64 = 1 << 8;
+const RIGHTS_NOTIFY: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
+const RIGHTS_WAIT: u64 = syscall_abi::RIGHTS_NTF_WAIT;
 
 #[cfg(target_arch = "x86_64")]
 const IP_OFFSET: usize = 120;

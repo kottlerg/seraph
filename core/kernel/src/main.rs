@@ -723,7 +723,7 @@ unsafe fn kernel_entry_post_rebase(
         // its code pages into child processes once a process manager is available.
         let (init_aspace_cap_slot, segment_memory_base, segment_memory_count) = {
             use cap::object::{KernelObjectHeader, MemoryObject, ObjectType};
-            use cap::slot::{CapTag, Rights};
+            use cap::slot::{AsRights, MemRights};
 
             // SAFETY: ROOT_CSPACE initialized in Phase 7, still owned by kernel
             // (not yet transferred to init); single-threaded boot phase.
@@ -731,11 +731,7 @@ unsafe fn kernel_entry_post_rebase(
                 .unwrap_or_else(|| fatal("Phase 9: ROOT_CSPACE missing"));
 
             let aspace_slot = cs
-                .insert_cap(
-                    CapTag::AddressSpace,
-                    Rights::MAP | Rights::READ,
-                    init_as_obj_nn,
-                )
+                .insert_cap_typed(AsRights::MAP | AsRights::READ, init_as_obj_nn)
                 .unwrap_or_else(|_| fatal("Phase 9: cannot insert init AddressSpace cap"));
 
             // Memory caps for each init segment (phys base + size + permissions).
@@ -764,7 +760,7 @@ unsafe fn kernel_entry_post_rebase(
                 // fails downstream writable maps. Mirrors the boot-module and
                 // reclaim-scratch mints (`cap/mod.rs`).
                 let rights =
-                    Rights::MAP | Rights::READ | Rights::WRITE | Rights::EXECUTE | Rights::RETYPE;
+                    MemRights::MAP | MemRights::WRITE | MemRights::EXECUTE | MemRights::RETYPE;
                 // The bootloader encodes the ELF in-page offset into
                 // `phys_addr` so `map_segment` can preserve
                 // `phys & 0xFFF == virt & 0xFFF`. The Memory cap exposed
@@ -797,7 +793,7 @@ unsafe fn kernel_entry_post_rebase(
                     lock: core::sync::atomic::AtomicU32::new(0),
                 });
                 let slot = cs
-                    .insert_cap(CapTag::Memory, rights, fo_nn)
+                    .insert_cap_typed(rights, fo_nn)
                     .unwrap_or_else(|_| fatal("Phase 9: cannot insert init segment Memory cap"));
                 cap::note_owns_memory_minted(size_aligned);
                 if i == 0
@@ -822,7 +818,7 @@ unsafe fn kernel_entry_post_rebase(
         // path (see `services/init/src/service.rs` end-of-phase-3).
         let info_page_virt = {
             use cap::object::{KernelObjectHeader, MemoryObject, ObjectType};
-            use cap::slot::{CapTag, Rights};
+            use cap::slot::MemRights;
             use init_protocol::{
                 INIT_PROTOCOL_VERSION, InitFramebufferInfo, InitInfo, InitPixelFormat,
             };
@@ -1027,13 +1023,8 @@ unsafe fn kernel_entry_post_rebase(
                 // donates a frame that cannot satisfy a downstream RW/RX map and
                 // fails the consumer's fault.
                 let slot = cs
-                    .insert_cap(
-                        CapTag::Memory,
-                        Rights::MAP
-                            | Rights::READ
-                            | Rights::WRITE
-                            | Rights::EXECUTE
-                            | Rights::RETYPE,
+                    .insert_cap_typed(
+                        MemRights::MAP | MemRights::WRITE | MemRights::EXECUTE | MemRights::RETYPE,
                         fo_nn,
                     )
                     .unwrap_or_else(|_| fatal("Phase 9: cannot insert InitInfo Memory cap"));
@@ -1074,7 +1065,7 @@ unsafe fn kernel_entry_post_rebase(
         // is a tripwire, not an expected reclaim.
         let (init_stack_memory_base, init_stack_memory_count) = {
             use cap::object::{KernelObjectHeader, MemoryObject, ObjectType};
-            use cap::slot::{CapTag, Rights};
+            use cap::slot::MemRights;
 
             const STACK_PAGES: usize = mm::address_space::INIT_STACK_PAGES;
             let stack_top = init_layout.init_stack_top;
@@ -1136,13 +1127,8 @@ unsafe fn kernel_entry_post_rebase(
                 // stack executable. A narrower cap donates a frame that cannot
                 // satisfy a downstream RX map and fails the consumer's fault.
                 let slot = cs
-                    .insert_cap(
-                        CapTag::Memory,
-                        Rights::MAP
-                            | Rights::READ
-                            | Rights::WRITE
-                            | Rights::EXECUTE
-                            | Rights::RETYPE,
+                    .insert_cap_typed(
+                        MemRights::MAP | MemRights::WRITE | MemRights::EXECUTE | MemRights::RETYPE,
                         fo_nn,
                     )
                     .unwrap_or_else(|_| fatal("Phase 9: cannot insert init stack Memory cap"));
@@ -1332,12 +1318,12 @@ unsafe fn kernel_entry_post_rebase(
         // Mint a Thread cap for init's own thread (CONTROL right) into the root
         // CSpace. This must happen before take_root_cspace transfers ownership.
         let init_thread_cap_slot = {
-            use cap::slot::{CapTag, Rights};
+            use cap::slot::ThreadRights;
 
             // SAFETY: ROOT_CSPACE initialized in Phase 7; single-threaded boot.
             let cs = unsafe { cap::root_cspace_mut() }
                 .unwrap_or_else(|| fatal("Phase 9: ROOT_CSPACE missing for Thread cap"));
-            cs.insert_cap(CapTag::Thread, Rights::CONTROL, init_thread_obj_nn)
+            cs.insert_cap_typed(ThreadRights::CONTROL, init_thread_obj_nn)
                 .unwrap_or_else(|_| fatal("Phase 9: cannot insert init Thread cap"))
                 .get()
         };
@@ -1351,7 +1337,7 @@ unsafe fn kernel_entry_post_rebase(
         // via `CSpace::kobj`.
         let init_cspace_cap_slot = {
             use cap::object::{CSpaceKernelObject, KernelObjectHeader};
-            use cap::slot::{CapTag, Rights};
+            use cap::slot::CsRights;
             use core::ptr::NonNull;
 
             // SAFETY: ROOT_CSPACE initialized in Phase 7; single-threaded boot.
@@ -1370,9 +1356,8 @@ unsafe fn kernel_entry_post_rebase(
             // belt-and-suspenders defense if this accounting ever drifts.
             // SAFETY: header at offset 0 of cs_kobj_ptr; single-threaded boot.
             unsafe { cs_nn.as_ref().inc_ref() };
-            cs.insert_cap(
-                CapTag::CSpace,
-                Rights::INSERT | Rights::DELETE | Rights::DERIVE,
+            cs.insert_cap_typed(
+                CsRights::INSERT | CsRights::DELETE | CsRights::DERIVE,
                 cs_nn,
             )
             .unwrap_or_else(|_| fatal("Phase 9: cannot insert init CSpace cap"))

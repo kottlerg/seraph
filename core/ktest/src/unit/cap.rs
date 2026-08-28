@@ -15,8 +15,8 @@
 
 use syscall::{
     cap_copy, cap_create_aspace, cap_create_cspace, cap_create_endpoint, cap_create_notification,
-    cap_delete, cap_derive, cap_derive_badge, cap_insert, cap_move, cap_revoke, event_queue_create,
-    notification_send, notification_wait,
+    cap_delete, cap_derive, cap_derive_badge, cap_info, cap_insert, cap_move, cap_revoke,
+    event_queue_create, notification_send, notification_wait,
 };
 use syscall_abi::SyscallError;
 
@@ -249,6 +249,77 @@ pub fn revoke_invalidates(ctx: &TestContext) -> TestResult
     }
 
     cap_delete(sig).map_err(|_| "cap_delete sig after revoke test failed")?;
+    Ok(())
+}
+
+/// `cap_revoke` clears subtrees larger than one revoke batch, in both wide
+/// and deep shapes, and the freed slots return to the `CSpace`.
+///
+/// The revoke batch bound (`MAX_REVOKE_NODES = 256` nodes per lock hold) must
+/// be invisible to callers: a 600-child fan-out and a 300-deep derive chain
+/// each exceed one batch, and the deep chain also exceeds what a
+/// fixed-depth work stack of that bound could hold. Two cycles verify the
+/// tree and freelist stay healthy across a batched revoke.
+pub fn revoke_large_subtree(ctx: &TestContext) -> TestResult
+{
+    const WIDE_CHILDREN: usize = 600;
+    const DEEP_CHAIN: usize = 300;
+
+    let used0 = cap_info(ctx.cspace_cap, syscall_abi::CAP_INFO_CSPACE_USED)
+        .map_err(|_| "cap_info(USED) baseline failed")?;
+
+    let sig = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "create_notification for revoke_large_subtree failed")?;
+
+    // Cycle 1: wide fan-out — 600 direct children of the root.
+    let mut first = 0u32;
+    let mut last = 0u32;
+    for i in 0..WIDE_CHILDREN
+    {
+        let child = cap_derive(sig, RIGHTS_NOTIFY).map_err(|_| "cap_derive (wide) failed")?;
+        if i == 0
+        {
+            first = child;
+        }
+        last = child;
+    }
+    cap_revoke(sig).map_err(|_| "cap_revoke (wide) failed")?;
+    if notification_send(first, 0x1).is_ok() || notification_send(last, 0x1).is_ok()
+    {
+        return Err("derived cap still usable after wide batched revoke");
+    }
+
+    // Cycle 2: deep chain — derive-of-derive to 300 levels under the root.
+    let mut cur = sig;
+    let mut mid = 0u32;
+    for i in 0..DEEP_CHAIN
+    {
+        cur = cap_derive(cur, RIGHTS_NOTIFY).map_err(|_| "cap_derive (deep) failed")?;
+        if i == DEEP_CHAIN / 2
+        {
+            mid = cur;
+        }
+    }
+    cap_revoke(sig).map_err(|_| "cap_revoke (deep) failed")?;
+    if notification_send(mid, 0x1).is_ok() || notification_send(cur, 0x1).is_ok()
+    {
+        return Err("derived cap still usable after deep batched revoke");
+    }
+
+    // Only the root remains; deleting it restores the slot-count baseline.
+    let used_before_delete = cap_info(ctx.cspace_cap, syscall_abi::CAP_INFO_CSPACE_USED)
+        .map_err(|_| "cap_info(USED) after revokes failed")?;
+    if used_before_delete != used0 + 1
+    {
+        return Err("slot count not restored after batched revokes");
+    }
+    cap_delete(sig).map_err(|_| "cap_delete root after revoke_large_subtree failed")?;
+    let used_end = cap_info(ctx.cspace_cap, syscall_abi::CAP_INFO_CSPACE_USED)
+        .map_err(|_| "cap_info(USED) final failed")?;
+    if used_end != used0
+    {
+        return Err("slot count not at baseline after root delete");
+    }
     Ok(())
 }
 

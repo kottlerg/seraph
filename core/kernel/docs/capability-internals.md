@@ -310,40 +310,56 @@ The global lock avoids deadlock from ordering multiple per-CSpace locks.
 
 ### Revocation Algorithm
 
-`SYS_CAP_REVOKE` performs a post-order traversal of the subtree rooted at the target
-slot, invalidating all descendants before the target itself:
+`SYS_CAP_REVOKE` clears the subtree rooted at the target slot in batches of at most
+`MAX_REVOKE_NODES` nodes (`revoke_subtree_batch`). Each batch runs under the
+derivation tree write lock and performs a stackless post-order walk over the tree's
+own links: descend `deriv_first_child` to a leaf, unlink and free it (its next
+sibling becomes the new head of the child list), then continue with that sibling
+or, when the list is exhausted, with the now-childless parent. Because the walk
+uses the links themselves rather than a work stack, no subtree size can overflow a
+fixed buffer; the batch bound caps lock hold time and the size of the dealloc
+output buffer, not the revocable subtree.
 
 ```
-revoke(slot_id):
-    acquire derivation tree write lock
-    post_order_revoke(slot_id)
-    release derivation tree write lock
+revoke(root_handle):
+    loop:
+        acquire derivation tree write lock
+        revalidate root (non-Null, handle generation current); stop if not
+        objects, more = revoke_subtree_batch(root)   // frees ≤ MAX_REVOKE_NODES slots
+        release derivation tree write lock
+        dec_ref / dealloc each collected object      // outside the lock
+        if not more: return
 
-post_order_revoke(slot_id):
-    slot = resolve(slot_id)  // look up slot across all CSpaces
-    child = slot.deriv_first_child
-    while child is not None:
-        next = resolve(child).deriv_next_sibling
-        post_order_revoke(child)
-        child = next
-    // All descendants now invalid; invalidate this slot
-    slot.tag = CapTag::Null
-    slot.object.map(|obj| obj.header.ref_count.fetch_sub(1, Ordering::Release))
-    // Remove from parent's child list
-    unlink_from_parent(slot_id)
-    // Free the CSpace slot to the free list
-    cspace_of(slot_id).free_slot(slot_id.index)
+revoke_subtree_batch(root):
+    walk to the deepest first-child leaf under root
+    repeat:
+        capture (parent, next_sibling); unlink_node(leaf)
+        free the leaf's CSpace slot (under that CSpace's lock); collect its object
+        continue with next_sibling (descending), else with the childless parent,
+        stopping at root; stop early after MAX_REVOKE_NODES nodes → more = true
 ```
 
-**Performance characteristics:** Revocation is O(N) in the number of descendants.
-For well-behaved systems, derivation trees are shallow (a server derives a capability
-for a client; the client rarely re-derives). Deep trees or large revocations are
-theoretically O(N) but do not appear on latency-sensitive paths.
+Between batches the lock is dropped so collected objects can be deallocated
+(`dealloc_object` may take other locks). Each batch re-descends from the root, so
+children derived concurrently between batches are still revoked, and the root is
+revalidated per batch so a root deleted or recycled mid-revoke stops the loop. Each
+batch frees at least one node, so the loop terminates against any fixed subtree;
+a concurrent deriver can extend the work only by spending its own slots and
+syscalls at least as fast as revocation reclaims them.
+
+**Performance characteristics:** Revocation is O(N) in the number of descendants
+(each tree edge is traversed a bounded number of times). For well-behaved systems,
+derivation trees are shallow (a server derives a capability for a client; the
+client rarely re-derives). Deep trees or large revocations do not appear on
+latency-sensitive paths.
 
 **Locking during revocation:** While the write lock is held, all other capability
 operations on the affected slots are blocked. This is safe because revocation is
 intentionally a strong operation — the revoker is asserting that no further access
-to the capability is valid.
+to the capability is valid. A revocation larger than one batch is not atomic
+against readers: between batches, unrevoked descendants remain usable until their
+batch frees them. The terminal state — the root childless — is guaranteed when the
+syscall returns.
 
 **Deferred IPC cleanup:** The derivation tree write lock is ordered after IPC object
 locks (see lock ordering in [ipc-internals.md](ipc-internals.md)). Therefore,
@@ -381,7 +397,7 @@ per-slot generation handles ensure the child's now-stale C2 handle then fails wi
 
 ### Derivation Across Processes
 
-The hazard a cross-`CSpace` derivation edge creates (#349): `revoke_subtree` walks
+The hazard a cross-`CSpace` derivation edge creates (#349): `revoke_subtree_batch` walks
 derivation edges and `free_slot`s each descendant in its own `CSpace`. If an edge
 crosses a `CSpace` boundary, revoking a source's subtree frees a slot in a foreign
 `CSpace` that the recipient still legitimately holds — and because cap handles

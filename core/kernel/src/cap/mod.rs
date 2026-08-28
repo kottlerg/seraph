@@ -2406,7 +2406,7 @@ fn nonnull_from_box<T>(b: Box<T>) -> NonNull<KernelObjectHeader>
 /// The destination slot takes the source's exact position in the derivation
 /// tree: parent, children, and siblings are repointed to the new
 /// `(dst_cspace_id, new_idx)` location. A cross-CSpace move preserves the
-/// derivation edge across the boundary, so a `revoke_subtree` rooted in the
+/// derivation edge across the boundary, so a `revoke_subtree_batch` rooted in the
 /// source `CSpace` can reach and free the moved slot in the destination.
 ///
 /// That cross-CSpace free is safe against stale-handle aliasing (#349) because

@@ -23,11 +23,9 @@ use syscall::{
     cap_copy, cap_create_endpoint, cap_create_notification, cap_delete, notification_send,
     notification_wait, thread_exit, thread_sleep,
 };
+use syscall_abi::RIGHTS_EP_SEND_GRANT;
 
 use crate::{ChildStack, TestContext, TestResult, spawn};
-
-// SEND | GRANT rights (bits 4 and 6).
-use syscall_abi::RIGHTS_EP_SEND_GRANT;
 
 // One stack per caller to avoid aliasing.
 static mut STACK_A: ChildStack = ChildStack::ZERO;

@@ -349,9 +349,6 @@ define_typed_rights! {
         WRITE = syscall::RIGHTS_MEM_WRITE;
         /// Authority to create executable mappings from this memory.
         EXECUTE = syscall::RIGHTS_MEM_EXECUTE;
-        /// Read-only region marker carried by firmware-table, boot-module, and
-        /// init-segment Memory caps.
-        READ = syscall::RIGHTS_MEM_READ;
         /// Authority to retype this Memory cap's region into kernel objects.
         ///
         /// Stamped on RAM Memory caps minted from the buddy allocator at boot.

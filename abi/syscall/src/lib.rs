@@ -560,6 +560,11 @@ pub const MEM_UNMAP_RECLAIM_PTS: u64 = 0x1;
 // another type's mask to a derive/copy attenuates whatever bits of the target
 // type happen to share those positions — always pick the constant named for
 // the cap being attenuated.
+//
+// Assigned bit values are ABI: they cross the user boundary via the
+// CAP_INFO_TAG_RIGHTS rights half and the derive/copy masks. Existing bits
+// MUST NOT be renumbered; a new right takes a fresh bit in its own type's
+// space.
 
 /// All rights — pass through whatever the source cap has. Equivalent to
 /// `!0u64`; valid for every capability type.
@@ -576,19 +581,12 @@ pub const RIGHTS_MEM_WRITE: u64 = 1 << 1;
 /// Memory: authority to create executable mappings from this memory.
 pub const RIGHTS_MEM_EXECUTE: u64 = 1 << 2;
 
-/// Memory: read-only firmware/boot-module region marker (map-only authority
-/// carried by firmware-table, boot-module, and init-segment Memory caps).
-pub const RIGHTS_MEM_READ: u64 = 1 << 3;
-
 /// Memory: authority to retype this region into kernel objects.
 ///
 /// Held by RAM Memory caps minted from buddy at boot; never held by firmware-
 /// table / boot-module / init-segment Memory caps. Required by every retype-
 /// consuming syscall.
-pub const RIGHTS_MEM_RETYPE: u64 = 1 << 4;
-
-/// Memory: map read-only.
-pub const RIGHTS_MEM_MAP_RO: u64 = RIGHTS_MEM_MAP;
+pub const RIGHTS_MEM_RETYPE: u64 = 1 << 3;
 
 /// Memory: map read-write.
 pub const RIGHTS_MEM_MAP_RW: u64 = RIGHTS_MEM_MAP | RIGHTS_MEM_WRITE;
@@ -684,7 +682,7 @@ pub const RIGHTS_CS_DERIVE: u64 = 1 << 2;
 pub const RIGHTS_CS_REVOKE: u64 = 1 << 3;
 
 /// `CSpace`: full management (insert, delete, derive, revoke).
-pub const RIGHTS_CSPACE: u64 =
+pub const RIGHTS_CS_ALL: u64 =
     RIGHTS_CS_INSERT | RIGHTS_CS_DELETE | RIGHTS_CS_DERIVE | RIGHTS_CS_REVOKE;
 
 // WaitSet ──
@@ -722,8 +720,10 @@ pub const RIGHTS_SBI_DBCN: u64 = 1 << 4;
 /// (RISC-V only).
 pub const RIGHTS_SBI_PMU: u64 = 1 << 5;
 
-// ABI contract: SYS_MEM_MAP / SYS_MEM_PROTECT prot bits share the Memory
-// rights bit positions; the kernel's prot decode depends on this identity.
+// ABI promise: the MAP_WRITABLE / MAP_EXECUTABLE rustdoc above states that
+// prot bits coincide with the Memory rights bit positions. Nothing decodes
+// positionally any more, but the stated identity is public ABI surface;
+// pinned so neither table can drift from the promise silently.
 const _: () = assert!(MAP_WRITABLE == RIGHTS_MEM_WRITE);
 const _: () = assert!(MAP_EXECUTABLE == RIGHTS_MEM_EXECUTE);
 
@@ -974,7 +974,6 @@ mod tests
                 RIGHTS_MEM_MAP,
                 RIGHTS_MEM_WRITE,
                 RIGHTS_MEM_EXECUTE,
-                RIGHTS_MEM_READ,
                 RIGHTS_MEM_RETYPE,
             ],
             // AddressSpace

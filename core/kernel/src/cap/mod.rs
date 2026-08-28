@@ -1808,7 +1808,7 @@ fn populate_cspace(
         });
         let slot = insert_or_fatal(
             cspace,
-            MemRights::MAP | MemRights::READ,
+            MemRights::MAP,
             ptr,
             "Phase 7: cannot allocate Memory capability for ACPI region",
         );
@@ -1851,7 +1851,7 @@ fn populate_cspace(
         });
         let slot = insert_or_fatal(
             cspace,
-            MemRights::MAP | MemRights::READ,
+            MemRights::MAP,
             ptr,
             "Phase 7: cannot allocate Memory capability for ACPI RSDP page",
         );
@@ -1893,7 +1893,7 @@ fn populate_cspace(
             });
             let slot = insert_or_fatal(
                 cspace,
-                MemRights::MAP | MemRights::READ,
+                MemRights::MAP,
                 ptr,
                 "Phase 7: cannot allocate Memory capability for DTB blob",
             );
@@ -2114,11 +2114,7 @@ fn mint_module_memory_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &m
         // cap allowing WRITE.
         let slot = insert_or_fatal(
             cspace,
-            MemRights::MAP
-                | MemRights::READ
-                | MemRights::WRITE
-                | MemRights::EXECUTE
-                | MemRights::RETYPE,
+            MemRights::MAP | MemRights::WRITE | MemRights::EXECUTE | MemRights::RETYPE,
             ptr,
             "Phase 7: cannot allocate Memory capability for boot module",
         );
@@ -2349,11 +2345,7 @@ fn mint_reclaim_pass(
         });
         let slot = insert_or_fatal(
             cspace,
-            MemRights::MAP
-                | MemRights::READ
-                | MemRights::WRITE
-                | MemRights::EXECUTE
-                | MemRights::RETYPE,
+            MemRights::MAP | MemRights::WRITE | MemRights::EXECUTE | MemRights::RETYPE,
             ptr,
             "Phase 7: cannot allocate Memory capability for reclaimed boot scratch",
         );

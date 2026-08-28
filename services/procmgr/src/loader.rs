@@ -102,7 +102,7 @@ impl Drop for ScratchMapping
 /// the returned [`ScratchMapping`] and dropped alongside the unmap.
 pub fn map_module(module_memory_cap: u32, self_aspace: u32) -> Option<(ScratchMapping, u64)>
 {
-    let module_ro = syscall::cap_derive(module_memory_cap, syscall::RIGHTS_MEM_MAP_RO).ok()?;
+    let module_ro = syscall::cap_derive(module_memory_cap, syscall::RIGHTS_MEM_MAP).ok()?;
     let mut pages: u64 = 128;
     while pages > 0
     {
@@ -131,7 +131,7 @@ pub fn derive_memory_for_prot(memory_cap: u32, prot: u64) -> Option<u32>
     }
     else
     {
-        syscall::cap_derive(memory_cap, syscall::RIGHTS_MEM_MAP_RO).ok()
+        syscall::cap_derive(memory_cap, syscall::RIGHTS_MEM_MAP).ok()
     }
 }
 

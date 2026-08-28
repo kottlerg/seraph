@@ -25,11 +25,10 @@ use syscall::{
     cap_copy, cap_create_cspace, cap_create_endpoint, cap_create_notification, cap_create_thread,
     cap_delete, notification_send, notification_wait, thread_configure, thread_exit, thread_start,
 };
+use syscall_abi::RIGHTS_EP_SEND_GRANT;
 
 use crate::{ChildStack, TestContext, TestResult};
 
-// SEND | GRANT rights for the endpoint copy in child's CSpace.
-use syscall_abi::RIGHTS_EP_SEND_GRANT;
 // NOTIFY right only for the test notification copy in child's CSpace.
 const RIGHTS_NOTIFY: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
 

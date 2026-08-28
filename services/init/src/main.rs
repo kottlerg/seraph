@@ -590,7 +590,7 @@ fn run(info_ptr: u64) -> !
     // SAFETY: phys_dst points at the one mapped 4 KiB page.
     unsafe { bootstrap::write_memmgr_aux_memory(phys_dst, info, &mm_final) };
     let _ = syscall::mem_unmap(info.aspace_cap, TEMP_MAP_BASE, 1);
-    let Ok(phys_table_ro_cap) = syscall::cap_derive(phys_table_memory, syscall::RIGHTS_MEM_MAP_RO)
+    let Ok(phys_table_ro_cap) = syscall::cap_derive(phys_table_memory, syscall::RIGHTS_MEM_MAP)
     else
     {
         logging::log("FATAL: phys-table RO derive failed");

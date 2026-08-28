@@ -40,7 +40,7 @@ use syscall_abi::{RIGHTS_EP_RECEIVE, SyscallError};
 
 use crate::{ChildStack, TestContext, TestResult, spawn};
 
-/// Notification signal right (bit 7) and wait right (bit 8).
+/// Notification NOTIFY and WAIT rights.
 const RIGHTS_SIGNAL: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
 const RIGHTS_WAIT: u64 = syscall_abi::RIGHTS_NTF_WAIT;
 

@@ -32,7 +32,7 @@ use syscall_abi::{SyscallError, SystemInfoType};
 
 use crate::{ChildStack, TestContext, TestResult};
 
-// NOTIFY = bit 7, WAIT = bit 8. Tests that pin a child in notification_wait give
+// Notification NOTIFY / WAIT rights. Tests that pin a child in notification_wait give
 // the child NOTIFY on the readiness cap and WAIT on a *separate* blocking
 // cap, so the child cannot self-deliver its own readiness send before the
 // parent has registered as the waiter.

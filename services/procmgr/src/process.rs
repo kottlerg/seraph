@@ -543,7 +543,7 @@ fn populate_child_info(
     let child_aspace_in_child =
         syscall::cap_copy(child_aspace, child_cspace, syscall::RIGHTS_ALL).ok()?;
     let child_cspace_in_child =
-        syscall::cap_copy(child_cspace, child_cspace, syscall::RIGHTS_CSPACE).ok()?;
+        syscall::cap_copy(child_cspace, child_cspace, syscall::RIGHTS_CS_ALL).ok()?;
 
     let creator_ep_in_child = if creator_endpoint != 0
     {
@@ -828,7 +828,7 @@ fn populate_child_info(
 
     drop(scratch);
 
-    let pi_ro = syscall::cap_derive(pi_memory, syscall::RIGHTS_MEM_MAP_RO).ok()?;
+    let pi_ro = syscall::cap_derive(pi_memory, syscall::RIGHTS_MEM_MAP).ok()?;
     syscall::mem_map(pi_ro, child_aspace, layout.process_info_va, 0, 1, 0).ok()?;
     // pi_memory stays in procmgr's CSpace as the teardown handle (revoke
     // cascades to any descendants); the mapping doesn't need pi_ro to

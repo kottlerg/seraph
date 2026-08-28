@@ -42,14 +42,13 @@ use syscall::{
     cap_copy, cap_create_endpoint, cap_create_notification, cap_delete, cap_derive, cap_revoke,
     ipc_buffer_set, notification_send, notification_wait, notification_wait_timeout, thread_exit,
 };
-use syscall_abi::{SyscallError, cap_handle_gen, cap_handle_index};
+use syscall_abi::{RIGHTS_EP_SEND_GRANT, SyscallError, cap_handle_gen, cap_handle_index};
 
 use crate::{ChildStack, TestContext, TestResult};
 
-// NOTIFY (bit 7) — send only; WAIT (bit 8) — wait only; SEND|GRANT (bits 4,6).
+// NOTIFY — send only; WAIT — wait only; SEND|GRANT for endpoint transfer.
 const RIGHTS_NOTIFY: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
 const RIGHTS_WAIT: u64 = syscall_abi::RIGHTS_NTF_WAIT;
-use syscall_abi::RIGHTS_EP_SEND_GRANT;
 
 // Verdict codes the child reports on `report`. Distinct single bits so the
 // parent can name the exact failure. `0` is reserved for the wait-timeout path.

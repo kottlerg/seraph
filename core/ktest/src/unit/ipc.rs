@@ -23,11 +23,10 @@ use syscall::{
     cap_delete, cap_derive, ipc_buffer_set, notification_send, notification_wait, thread_configure,
     thread_exit, thread_sleep, thread_start,
 };
+use syscall_abi::RIGHTS_EP_SEND_GRANT;
 
 use crate::{ChildStack, TestContext, TestResult};
 
-// Endpoint SEND + GRANT rights.
-use syscall_abi::RIGHTS_EP_SEND_GRANT;
 // Endpoint RECEIVE right only (no SEND).
 const RIGHTS_RECV_ONLY: u64 = syscall_abi::RIGHTS_EP_RECEIVE;
 

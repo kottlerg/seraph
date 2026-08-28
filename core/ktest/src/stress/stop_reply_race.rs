@@ -70,7 +70,7 @@ use crate::{ChildStack, TestContext, TestResult, spawn};
 /// window many chances to land on either side of the free.
 const CYCLES: usize = 300;
 
-/// Notification signal right (bit 7) — what a child needs to `notification_send`.
+/// Notification NOTIFY right — what a child needs to `notification_send`.
 const RIGHTS_SIGNAL: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
 
 /// `done` bit the server raises once `ipc_recv` has dequeued the client, i.e.

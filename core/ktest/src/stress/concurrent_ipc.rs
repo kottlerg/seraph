@@ -12,14 +12,12 @@ use syscall::{
     cap_copy, cap_create_endpoint, cap_create_notification, cap_delete, notification_send,
     notification_wait, thread_exit,
 };
+use syscall_abi::RIGHTS_EP_SEND_GRANT;
 
 use crate::{ChildStack, TestContext, TestResult, spawn};
 
 const NUM_CALLERS: usize = 64;
 const CYCLES: usize = 200;
-
-// SEND + GRANT rights.
-use syscall_abi::RIGHTS_EP_SEND_GRANT;
 
 pub fn run(ctx: &TestContext) -> TestResult
 {

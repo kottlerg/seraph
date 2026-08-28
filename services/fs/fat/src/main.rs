@@ -56,7 +56,7 @@ use fat::{next_cluster, read_file_data};
 use file::{MAX_OPEN_FILES, OpenFile, OutstandingPage};
 use ipc::{IpcMessage, fs_labels, ns_labels};
 use namespace_protocol::{GateError, NamespaceRights, NodeId, NodeKind, gate, pack as pack_badge};
-use syscall_abi::{PAGE_SIZE, RIGHTS_MEM_MAP_RO};
+use syscall_abi::{PAGE_SIZE, RIGHTS_MEM_MAP};
 
 /// Monotonic counter for open-file slot identity. Starts at 1 (0 = unbadged).
 ///
@@ -616,7 +616,7 @@ fn read_memory_at_slot(
         return;
     }
 
-    let Ok(ancestor) = syscall::cap_derive(slot_cap, RIGHTS_MEM_MAP_RO)
+    let Ok(ancestor) = syscall::cap_derive(slot_cap, RIGHTS_MEM_MAP)
     else
     {
         cache.release_slot(slot_idx);
@@ -625,7 +625,7 @@ fn read_memory_at_slot(
         let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
         return;
     };
-    let Ok(child) = syscall::cap_derive(ancestor, RIGHTS_MEM_MAP_RO)
+    let Ok(child) = syscall::cap_derive(ancestor, RIGHTS_MEM_MAP)
     else
     {
         let _ = syscall::cap_delete(ancestor);
@@ -1151,7 +1151,7 @@ fn handle_write_memory_node_cap(
     let tag = (tag_rights >> 32) as u8;
     let cap_rights = tag_rights & 0xFFFF_FFFF;
     if u64::from(tag) != u64::from(syscall::CAP_TAG_MEMORY)
-        || (cap_rights & RIGHTS_MEM_MAP_RO) != RIGHTS_MEM_MAP_RO
+        || (cap_rights & RIGHTS_MEM_MAP) != RIGHTS_MEM_MAP
     {
         reply_with(ipc::fs_errors::IO_ERROR, ipc_buf);
         return;
@@ -1173,7 +1173,7 @@ fn handle_write_memory_node_cap(
     // mem_map with MAP_READONLY (= 0) on such a cap derives both w and
     // x from the cap rights and trips the kernel's W^X check. Derive a
     // sub-cap restricted to MAP_READ first; delete it after the unmap.
-    let Ok(restricted_cap) = syscall::cap_derive(src_cap, RIGHTS_MEM_MAP_RO)
+    let Ok(restricted_cap) = syscall::cap_derive(src_cap, RIGHTS_MEM_MAP)
     else
     {
         reply_with(ipc::fs_errors::IO_ERROR, ipc_buf);

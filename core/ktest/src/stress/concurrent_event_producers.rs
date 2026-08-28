@@ -20,6 +20,7 @@ use syscall::{
 };
 
 use crate::{ChildStack, TestContext, TestResult, spawn};
+use syscall_abi::RIGHTS_EQ_POST;
 
 /// One producer per stress stack — capped at `MAX_STRESS_THREADS`.
 const NUM_PRODUCERS: usize = 4;
@@ -31,9 +32,6 @@ const TOTAL_MESSAGES: u32 = NUM_PRODUCERS as u32 * MESSAGES_PER_PRODUCER;
 
 /// NOTIFY right (send) only.
 const RIGHTS_NOTIFY: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
-/// `EventQueue` POST right (bit 9 per the kernel).
-use syscall_abi::RIGHTS_EQ_POST;
-
 /// Producer: post `MESSAGES_PER_PRODUCER` messages each tagged with its
 /// producer id, then post done bit.
 ///

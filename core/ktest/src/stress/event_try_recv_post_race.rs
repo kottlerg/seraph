@@ -79,7 +79,7 @@ use syscall::{
     cap_copy, cap_create_notification, cap_delete, event_post, event_queue_create, event_try_recv,
     notification_send, notification_wait, thread_exit,
 };
-use syscall_abi::{SyscallError, SystemInfoType};
+use syscall_abi::{RIGHTS_EQ_POST, RIGHTS_EQ_RECV, SyscallError, SystemInfoType};
 
 use crate::{ChildStack, TestContext, TestResult, spawn};
 
@@ -87,14 +87,10 @@ use crate::{ChildStack, TestContext, TestResult, spawn};
 /// timing jitter while keeping the cell inside the suite's time budget.
 const CYCLES: u32 = 1024;
 
-/// Notification signal right (bit 7) and wait right (bit 8). Each cap copy
+/// Notification NOTIFY and WAIT rights. Each cap copy
 /// carries only the right its one-directional use needs.
 const RIGHTS_SIGNAL: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
 const RIGHTS_WAIT: u64 = syscall_abi::RIGHTS_NTF_WAIT;
-
-/// Event-queue post right (bit 9) and recv right (bit 10).
-use syscall_abi::RIGHTS_EQ_POST;
-use syscall_abi::RIGHTS_EQ_RECV;
 
 /// `done` bits raised by each child on completion (clean or failed).
 const BIT_POLLER_DONE: u64 = 1 << 0;

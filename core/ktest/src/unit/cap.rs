@@ -23,7 +23,7 @@ use syscall_abi::SyscallError;
 use crate::{TestContext, TestResult};
 
 // Rights bit constants (from kernel/src/cap/slot.rs).
-// NOTIFY = bit 7 (send), WAIT = bit 8 (receive/block), SEND = bit 4, GRANT = bit 6.
+// Notification NOTIFY (send) / WAIT (receive-block); endpoint SEND / GRANT.
 const RIGHTS_NOTIFY: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
 
 // ── SYS_CAP_CREATE_NOTIFICATION ────────────────────────────────────────────────────

@@ -130,7 +130,7 @@ Insert a `name → cap` mapping into svcmgr's discovery registry.
 ### Label 4: `QUERY_ENDPOINT`
 
 Look up a name in the discovery registry; reply transfers a
-freshly-derived `RIGHTS_SEND` cap on the published endpoint.
+freshly-derived `RIGHTS_EP_SEND` cap on the published endpoint.
 
 **Request:**
 
@@ -163,8 +163,8 @@ distributed to every process via `ProcessInfo.service_registry_cap`
 carries a per-process badge *without* the bit, so it is accepted for
 `QUERY_ENDPOINT` only.
 
-Cap derivation for an external publish cap MUST use `RIGHTS_SEND_GRANT`,
-not `RIGHTS_SEND`: `PUBLISH_ENDPOINT` carries the value cap in the
+Cap derivation for an external publish cap MUST use `RIGHTS_EP_SEND_GRANT`,
+not `RIGHTS_EP_SEND`: `PUBLISH_ENDPOINT` carries the value cap in the
 message body, and the IPC kernel requires the GRANT bit on the
 caller's send-cap to transfer caps.
 

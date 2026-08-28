@@ -108,6 +108,9 @@ follow a separate flow through devmgr; see
 A capability to a process's virtual address space. Rights:
 - **Map** — may install and remove mappings in this address space
 - **Read** — may inspect current mappings
+- **Control** — may register terminal-fault death observers
+  (`aspace_bind_notification`); held by the space's creator and masked out of
+  copies handed to components that only map into the space
 
 The kernel holds implicit authority over all address spaces; this capability is
 what allows userspace memory managers to manage mappings on behalf of a process.
@@ -150,9 +153,13 @@ init, which delegates them to appropriate drivers.
 ### Mmio
 
 A capability to a specific physical address range (an MMIO aperture) used for
-memory-mapped I/O. Holding this capability allows mapping the region into an
-address space (with Map right). Without this capability a process cannot map
-physical addresses — it cannot name hardware it has not been granted access to.
+memory-mapped I/O. Rights:
+- **Map** — may map the region into an address space
+- **Write** — may map the region writable (`sys_mmio_map` gates mapping
+  writability on it; MMIO mappings are never executable)
+
+Without this capability a process cannot map physical addresses — it cannot
+name hardware it has not been granted access to.
 
 ### Thread
 
@@ -458,9 +465,9 @@ backing region, debiting bytes from the Memory's available-bytes ledger.
 create_endpoint(frame)             → endpoint_cap  (Send + Receive + Grant)
 create_notification(frame)               → notification_cap    (Notification + Wait)
 create_event_queue(frame, n)       → queue_cap     (Post + Recv)
-create_thread(frame, aspace, cs)   → thread_cap    (Control)
-create_address_space(frame, ...)   → aspace_cap    (Map)
-create_cspace(frame, ...)          → cspace_cap    (Insert + Delete + Derive + Revoke)
+create_thread(frame, aspace, cs)   → thread_cap    (Control + Observe)
+create_address_space(frame, ...)   → aspace_cap    (Map + Read + Control)
+create_cspace(frame, ...)          → cspace_cap    (Insert + Delete + Derive)
 create_wait_set(frame)             → wait_set_cap  (Modify + Wait)
 ```
 

@@ -60,6 +60,7 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use ipc::stream_labels::{STREAM_BYTES, STREAM_REGISTER_NAME};
 use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
 use std::os::seraph::startup_info;
+use syscall::RIGHTS_EQ_POST;
 
 use crate::slot::{LINE_BUF_SIZE, MAX_NAME_LEN, SlotTable};
 
@@ -240,8 +241,6 @@ fn create_wait_set(log_ep_recv: u32, death_eq: u32) -> Option<u32>
     }
     Some(ws)
 }
-
-use syscall::RIGHTS_EQ_POST;
 
 /// Send `REGISTER_DEATH_EQ` to procmgr.
 ///

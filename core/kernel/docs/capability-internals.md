@@ -210,7 +210,7 @@ to a lookup at compile time.
 Per-type vocabularies (bit positions within each type's own space):
 
 ```text
-Memory        MAP=0  WRITE=1  EXECUTE=2  READ=3  RETYPE=4
+Memory        MAP=0  WRITE=1  EXECUTE=2  RETYPE=3
 AddressSpace  MAP=0  READ=1   CONTROL=2
 Endpoint      SEND=0 RECEIVE=1 GRANT=2
 Notification  NOTIFY=0 WAIT=1

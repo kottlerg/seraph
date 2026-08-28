@@ -762,7 +762,7 @@ fn handle_write_block_from_memory(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut 
     };
     let tag = (tag_rights >> 32) as u8;
     let rights = tag_rights & 0xFFFF_FFFF;
-    let required = syscall::RIGHTS_MEM_MAP_RO;
+    let required = syscall::RIGHTS_MEM_MAP;
     if u64::from(tag) != u64::from(syscall::CAP_TAG_MEMORY) || (rights & required) != required
     {
         reply_with(ipc::blk_errors::INVALID_MEMORY_CAP, ipc_buf);

@@ -13,6 +13,8 @@
 //! Field coverage:
 //! - `CAP_INFO_TAG_RIGHTS` against several cap tags (`Memory`, `AddressSpace`,
 //!   `Notification`).
+//! - Creation-mint masks of every userspace-creatable type against the ABI's
+//!   per-type rights constants (`creation_masks_match_abi`).
 //! - `CAP_INFO_MEMORY_*` against a Memory cap.
 //! - `CAP_INFO_CSPACE_*` against a `CSpace` cap.
 //! - Negative paths: null slot index (`InvalidCapability`) and tag-mismatched
@@ -281,24 +283,35 @@ pub fn creation_masks_match_abi(ctx: &TestContext) -> TestResult
 
     let aspace = syscall::cap_create_aspace(ctx.memory_base, 0, 4)
         .map_err(|_| "creation_masks: cap_create_aspace failed")?;
-    let r = check(
+    check(
         aspace,
         syscall_abi::RIGHTS_AS_MAP | syscall_abi::RIGHTS_AS_READ | syscall_abi::RIGHTS_AS_CONTROL,
         "creation_masks: address space mint mask mismatch",
-    );
-    cap_delete(aspace).map_err(|_| "creation_masks: cap_delete(aspace) failed")?;
-    r?;
+    )?;
 
     let cs = cap_create_cspace(ctx.memory_base, 0, 4, 64)
         .map_err(|_| "creation_masks: cap_create_cspace failed")?;
-    let r = check(
+    check(
         cs,
         syscall_abi::RIGHTS_CS_INSERT
             | syscall_abi::RIGHTS_CS_DELETE
             | syscall_abi::RIGHTS_CS_DERIVE,
         "creation_masks: cspace mint mask mismatch",
+    )?;
+
+    // Thread bound to the aspace/cspace above; sched cap 0 + priority 0
+    // creates at the band floor with no SchedControl. Never started —
+    // deleted right after the mask read.
+    let thread = syscall::cap_create_thread(ctx.memory_base, aspace, cs, 0, 0)
+        .map_err(|_| "creation_masks: cap_create_thread failed")?;
+    let r = check(
+        thread,
+        syscall_abi::RIGHTS_THREAD_CONTROL | syscall_abi::RIGHTS_THREAD_OBSERVE,
+        "creation_masks: thread mint mask mismatch",
     );
+    cap_delete(thread).map_err(|_| "creation_masks: cap_delete(thread) failed")?;
     cap_delete(cs).map_err(|_| "creation_masks: cap_delete(cspace) failed")?;
+    cap_delete(aspace).map_err(|_| "creation_masks: cap_delete(aspace) failed")?;
     r
 }
 

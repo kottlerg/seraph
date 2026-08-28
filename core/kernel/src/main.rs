@@ -723,7 +723,7 @@ unsafe fn kernel_entry_post_rebase(
         // its code pages into child processes once a process manager is available.
         let (init_aspace_cap_slot, segment_memory_base, segment_memory_count) = {
             use cap::object::{KernelObjectHeader, MemoryObject, ObjectType};
-            use cap::slot::{AsRights, CapTag, MemRights};
+            use cap::slot::{AsRights, MemRights};
 
             // SAFETY: ROOT_CSPACE initialized in Phase 7, still owned by kernel
             // (not yet transferred to init); single-threaded boot phase.
@@ -759,12 +759,8 @@ unsafe fn kernel_entry_post_rebase(
                 // segment. A narrower cap donates a non-writable frame that
                 // fails downstream writable maps. Mirrors the boot-module and
                 // reclaim-scratch mints (`cap/mod.rs`).
-                let rights = (MemRights::MAP
-                    | MemRights::READ
-                    | MemRights::WRITE
-                    | MemRights::EXECUTE
-                    | MemRights::RETYPE)
-                    .erase();
+                let rights =
+                    MemRights::MAP | MemRights::WRITE | MemRights::EXECUTE | MemRights::RETYPE;
                 // The bootloader encodes the ELF in-page offset into
                 // `phys_addr` so `map_segment` can preserve
                 // `phys & 0xFFF == virt & 0xFFF`. The Memory cap exposed
@@ -797,7 +793,7 @@ unsafe fn kernel_entry_post_rebase(
                     lock: core::sync::atomic::AtomicU32::new(0),
                 });
                 let slot = cs
-                    .insert_cap(CapTag::Memory, rights, fo_nn)
+                    .insert_cap_typed(rights, fo_nn)
                     .unwrap_or_else(|_| fatal("Phase 9: cannot insert init segment Memory cap"));
                 cap::note_owns_memory_minted(size_aligned);
                 if i == 0
@@ -1028,11 +1024,7 @@ unsafe fn kernel_entry_post_rebase(
                 // fails the consumer's fault.
                 let slot = cs
                     .insert_cap_typed(
-                        MemRights::MAP
-                            | MemRights::READ
-                            | MemRights::WRITE
-                            | MemRights::EXECUTE
-                            | MemRights::RETYPE,
+                        MemRights::MAP | MemRights::WRITE | MemRights::EXECUTE | MemRights::RETYPE,
                         fo_nn,
                     )
                     .unwrap_or_else(|_| fatal("Phase 9: cannot insert InitInfo Memory cap"));
@@ -1136,11 +1128,7 @@ unsafe fn kernel_entry_post_rebase(
                 // satisfy a downstream RX map and fails the consumer's fault.
                 let slot = cs
                     .insert_cap_typed(
-                        MemRights::MAP
-                            | MemRights::READ
-                            | MemRights::WRITE
-                            | MemRights::EXECUTE
-                            | MemRights::RETYPE,
+                        MemRights::MAP | MemRights::WRITE | MemRights::EXECUTE | MemRights::RETYPE,
                         fo_nn,
                     )
                     .unwrap_or_else(|_| fatal("Phase 9: cannot insert init stack Memory cap"));

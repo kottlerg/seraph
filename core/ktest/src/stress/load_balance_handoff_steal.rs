@@ -115,7 +115,7 @@ const SAMPLE_EVERY: usize = 64;
 /// (see the module doc's Pass criterion).
 const MIGRATION_GUARD_MAX_CPUS: u64 = 32;
 
-/// Notification signal right (bit 7) — what a client needs to `notification_send`.
+/// Notification NOTIFY right — what a client needs to `notification_send`.
 const RIGHTS_SIGNAL: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
 
 /// A page-aligned 4 KiB IPC buffer page (`MSG_DATA_WORDS_MAX`-wide, like ktest's

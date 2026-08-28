@@ -31,10 +31,9 @@ use syscall::{
 use syscall_abi::SystemInfoType;
 
 use crate::{ChildStack, TestContext, TestResult, spawn};
-
-/// SEND | GRANT (bits 4 and 6) — the child needs SEND to issue `ipc_call`.
 use syscall_abi::RIGHTS_EP_SEND_GRANT;
-/// Notification right (bit 7) — covers both `notification_send` and `notification_wait`.
+
+/// Notification NOTIFY right — covers both `notification_send` and `notification_wait`.
 const RIGHTS_NOTIFY: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
 
 /// 64-bit pattern loaded into every FP register before the call.

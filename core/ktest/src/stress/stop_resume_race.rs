@@ -82,7 +82,7 @@ use crate::{ChildStack, TestContext, TestResult, spawn};
 /// across the CPU rotation while staying well under a second.
 const CYCLES: usize = 256;
 
-/// Notification signal right (bit 7) — what a child needs to `notification_send`.
+/// Notification NOTIFY right — what a child needs to `notification_send`.
 const RIGHTS_SIGNAL: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
 
 /// Bounded barrier spin: a racer stops waiting after this many iterations even

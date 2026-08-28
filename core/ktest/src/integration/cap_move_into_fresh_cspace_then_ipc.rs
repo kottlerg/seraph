@@ -14,11 +14,9 @@ use ipc::IpcMessage;
 use syscall::{
     cap_copy, cap_create_endpoint, cap_create_notification, cap_delete, notification_wait,
 };
+use syscall_abi::RIGHTS_EP_SEND_GRANT;
 
 use crate::{ChildStack, TestContext, TestResult};
-
-/// SEND + GRANT rights — the child needs both to issue an `ipc_call`.
-use syscall_abi::RIGHTS_EP_SEND_GRANT;
 
 static mut CHILD_STACK: ChildStack = ChildStack::ZERO;
 

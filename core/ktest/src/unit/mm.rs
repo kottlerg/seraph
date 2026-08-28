@@ -298,7 +298,7 @@ pub fn mem_protect_exceeds_cap_rights_err(ctx: &TestContext) -> TestResult
 
     // Attenuate to a no-WRITE cap (MAP only) over the same frame; mem_protect
     // checks the requested perms against this cap's rights, not the mapping cap.
-    let ro_cap = syscall::cap_derive(frame.cap(), syscall::RIGHTS_MEM_MAP_RO)
+    let ro_cap = syscall::cap_derive(frame.cap(), syscall::RIGHTS_MEM_MAP)
         .map_err(|_| "mem_protect_exceeds_cap_rights_err: cap_derive failed")?;
 
     // Read-only cap has no WRITE — requesting WRITE must fail.

@@ -645,7 +645,7 @@ fn populate_memmgr_info(
         syscall::cap_copy(caps.thread, caps.cspace, syscall::RIGHTS_THREAD).ok()?;
     let mm_aspace_in_mm = syscall::cap_copy(caps.aspace, caps.cspace, syscall::RIGHTS_ALL).ok()?;
     let mm_cspace_in_mm =
-        syscall::cap_copy(caps.cspace, caps.cspace, syscall::RIGHTS_CSPACE).ok()?;
+        syscall::cap_copy(caps.cspace, caps.cspace, syscall::RIGHTS_CS_ALL).ok()?;
     // Baseline SchedControl so memmgr can set its own threads' priorities.
     let mm_sched_in_mm =
         syscall::cap_copy(caps.sched_baseline, caps.cspace, syscall::RIGHTS_ALL).ok()?;
@@ -732,7 +732,7 @@ pub fn bootstrap_memmgr(
     // where RETYPE lets memmgr re-derive. Derive a read-only child cap for the
     // load-time mapping so `mem_map`'s derive-from-cap path produces a strictly
     // read-only page (otherwise W+X cap rights trip W^X).
-    let module_ro = syscall::cap_derive(module_memory_cap, syscall::RIGHTS_MEM_MAP_RO).ok()?;
+    let module_ro = syscall::cap_derive(module_memory_cap, syscall::RIGHTS_MEM_MAP).ok()?;
     syscall::mem_map(
         module_ro,
         init_aspace,
@@ -1245,7 +1245,7 @@ fn populate_procmgr_info(
         syscall::cap_copy(caps.thread, caps.cspace, syscall::RIGHTS_THREAD).ok()?;
     let pm_aspace_in_pm = syscall::cap_copy(caps.aspace, caps.cspace, syscall::RIGHTS_ALL).ok()?;
     let pm_cspace_in_pm =
-        syscall::cap_copy(caps.cspace, caps.cspace, syscall::RIGHTS_CSPACE).ok()?;
+        syscall::cap_copy(caps.cspace, caps.cspace, syscall::RIGHTS_CS_ALL).ok()?;
     // Baseline SchedControl: procmgr's own scheduling authority and the
     // fan-out source it cap_copies into every process it creates.
     let pm_sched_in_pm =
@@ -1435,7 +1435,7 @@ pub fn bootstrap_procmgr(
     let module_pages = (module_size + 0xFFF) / PAGE_SIZE;
 
     // Derive a read-only child cap (see `bootstrap_memmgr` for rationale).
-    let module_ro = syscall::cap_derive(module_memory_cap, syscall::RIGHTS_MEM_MAP_RO).ok()?;
+    let module_ro = syscall::cap_derive(module_memory_cap, syscall::RIGHTS_MEM_MAP).ok()?;
     syscall::mem_map(
         module_ro,
         init_aspace,

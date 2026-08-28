@@ -583,8 +583,9 @@ pub const RIGHTS_MEM_EXECUTE: u64 = 1 << 2;
 
 /// Memory: authority to retype this region into kernel objects.
 ///
-/// Held by RAM Memory caps minted from buddy at boot; never held by firmware-
-/// table / boot-module / init-segment Memory caps. Required by every retype-
+/// Held by RAM, boot-module, and init-segment Memory caps (the latter two
+/// donate into memmgr's pool as general RAM at init's reap); never held by
+/// firmware-table Memory caps (ACPI/RSDP/DTB). Required by every retype-
 /// consuming syscall.
 pub const RIGHTS_MEM_RETYPE: u64 = 1 << 3;
 

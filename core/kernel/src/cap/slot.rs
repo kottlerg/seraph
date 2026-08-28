@@ -351,9 +351,10 @@ define_typed_rights! {
         EXECUTE = syscall::RIGHTS_MEM_EXECUTE;
         /// Authority to retype this Memory cap's region into kernel objects.
         ///
-        /// Stamped on RAM Memory caps minted from the buddy allocator at boot.
-        /// Firmware-table / boot-module / init-segment Memory caps never hold
-        /// this bit. Every retype-consuming syscall requires it.
+        /// Stamped on RAM Memory caps minted from the buddy allocator at boot
+        /// and on boot-module / init-segment caps (donated into memmgr's pool
+        /// at init's reap). Firmware-table Memory caps never hold this bit.
+        /// Every retype-consuming syscall requires it.
         RETYPE = syscall::RIGHTS_MEM_RETYPE;
     }
 }

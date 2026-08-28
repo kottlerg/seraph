@@ -223,27 +223,9 @@ pub fn memory_caps_carry_retype_right(ctx: &TestContext) -> TestResult
 /// rather than surfacing as a misgated syscall elsewhere.
 pub fn creation_masks_match_abi(ctx: &TestContext) -> TestResult
 {
-    // The ABI constants are u64 with all bits in the low 32 (asserted by the
-    // abi host tests); the rights half of the packed value is u32.
-    #[allow(clippy::cast_possible_truncation)]
-    fn mask32(mask: u64) -> u32
-    {
-        mask as u32
-    }
-
-    let check = |cap: u32, expected: u64, what: &'static str| -> TestResult {
-        let value = cap_info(cap, CAP_INFO_TAG_RIGHTS).map_err(|_| what)?;
-        let (_tag, rights) = unpack_tag_rights(value);
-        if rights != mask32(expected)
-        {
-            return Err(what);
-        }
-        Ok(())
-    };
-
     let ep = syscall::cap_create_endpoint(ctx.memory_base)
         .map_err(|_| "creation_masks: cap_create_endpoint failed")?;
-    let r = check(
+    let r = check_mask(
         ep,
         syscall_abi::RIGHTS_EP_SEND | syscall_abi::RIGHTS_EP_RECEIVE | syscall_abi::RIGHTS_EP_GRANT,
         "creation_masks: endpoint mint mask mismatch",
@@ -253,7 +235,7 @@ pub fn creation_masks_match_abi(ctx: &TestContext) -> TestResult
 
     let sig = cap_create_notification(ctx.memory_base)
         .map_err(|_| "creation_masks: cap_create_notification failed")?;
-    let r = check(
+    let r = check_mask(
         sig,
         syscall_abi::RIGHTS_NTF_NOTIFY | syscall_abi::RIGHTS_NTF_WAIT,
         "creation_masks: notification mint mask mismatch",
@@ -263,7 +245,7 @@ pub fn creation_masks_match_abi(ctx: &TestContext) -> TestResult
 
     let eq = syscall::event_queue_create(ctx.memory_base, 4)
         .map_err(|_| "creation_masks: event_queue_create failed")?;
-    let r = check(
+    let r = check_mask(
         eq,
         syscall_abi::RIGHTS_EQ_POST | syscall_abi::RIGHTS_EQ_RECV,
         "creation_masks: event queue mint mask mismatch",
@@ -273,7 +255,7 @@ pub fn creation_masks_match_abi(ctx: &TestContext) -> TestResult
 
     let ws = syscall::wait_set_create(ctx.memory_base)
         .map_err(|_| "creation_masks: wait_set_create failed")?;
-    let r = check(
+    let r = check_mask(
         ws,
         syscall_abi::RIGHTS_WS_MODIFY | syscall_abi::RIGHTS_WS_WAIT,
         "creation_masks: wait set mint mask mismatch",
@@ -281,30 +263,77 @@ pub fn creation_masks_match_abi(ctx: &TestContext) -> TestResult
     cap_delete(ws).map_err(|_| "creation_masks: cap_delete(wait set) failed")?;
     r?;
 
+    bound_creation_masks(ctx)
+}
+
+/// Rights word of `cap` (via `CAP_INFO_TAG_RIGHTS`) equals `expected` exactly.
+fn check_mask(cap: u32, expected: u64, what: &'static str) -> TestResult
+{
+    // The ABI constants are u64 with all bits in the low 32 (asserted by the
+    // abi host tests); the rights half of the packed value is u32.
+    #[allow(clippy::cast_possible_truncation)]
+    let expected32 = expected as u32;
+    let value = cap_info(cap, CAP_INFO_TAG_RIGHTS).map_err(|_| what)?;
+    let (_tag, rights) = unpack_tag_rights(value);
+    if rights != expected32
+    {
+        return Err(what);
+    }
+    Ok(())
+}
+
+/// `creation_masks_match_abi` tail: the aspace/cspace/thread arms.
+///
+/// The aspace and cspace must outlive the thread bound to them, so their
+/// checks defer teardown to the shared delete sequence at the end
+/// (best-effort on the failure paths, mirroring the per-object arms in
+/// `creation_masks_match_abi`).
+fn bound_creation_masks(ctx: &TestContext) -> TestResult
+{
     let aspace = syscall::cap_create_aspace(ctx.memory_base, 0, 4)
         .map_err(|_| "creation_masks: cap_create_aspace failed")?;
-    check(
+    let r = check_mask(
         aspace,
         syscall_abi::RIGHTS_AS_MAP | syscall_abi::RIGHTS_AS_READ | syscall_abi::RIGHTS_AS_CONTROL,
         "creation_masks: address space mint mask mismatch",
-    )?;
+    );
+    if r.is_err()
+    {
+        cap_delete(aspace).ok();
+        return r;
+    }
 
-    let cs = cap_create_cspace(ctx.memory_base, 0, 4, 64)
-        .map_err(|_| "creation_masks: cap_create_cspace failed")?;
-    check(
+    let Ok(cs) = cap_create_cspace(ctx.memory_base, 0, 4, 64)
+    else
+    {
+        cap_delete(aspace).ok();
+        return Err("creation_masks: cap_create_cspace failed");
+    };
+    let r = check_mask(
         cs,
         syscall_abi::RIGHTS_CS_INSERT
             | syscall_abi::RIGHTS_CS_DELETE
             | syscall_abi::RIGHTS_CS_DERIVE,
         "creation_masks: cspace mint mask mismatch",
-    )?;
+    );
+    if r.is_err()
+    {
+        cap_delete(cs).ok();
+        cap_delete(aspace).ok();
+        return r;
+    }
 
     // Thread bound to the aspace/cspace above; sched cap 0 + priority 0
     // creates at the band floor with no SchedControl. Never started —
     // deleted right after the mask read.
-    let thread = syscall::cap_create_thread(ctx.memory_base, aspace, cs, 0, 0)
-        .map_err(|_| "creation_masks: cap_create_thread failed")?;
-    let r = check(
+    let Ok(thread) = syscall::cap_create_thread(ctx.memory_base, aspace, cs, 0, 0)
+    else
+    {
+        cap_delete(cs).ok();
+        cap_delete(aspace).ok();
+        return Err("creation_masks: cap_create_thread failed");
+    };
+    let r = check_mask(
         thread,
         syscall_abi::RIGHTS_THREAD_CONTROL | syscall_abi::RIGHTS_THREAD_OBSERVE,
         "creation_masks: thread mint mask mismatch",

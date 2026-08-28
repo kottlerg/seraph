@@ -90,10 +90,13 @@ kernel rejects any `mem_map` or `mem_protect` call that would make a page
 simultaneously writable and executable.
 
 The kernel mints Memory caps for all usable RAM at boot with `Map | Write |
-Execute | Retype` and places them in init's CSpace. Memory caps minted for
-firmware tables (ACPI regions, RSDP, DTB), boot modules, and init's own
-ELF segments mint without `Retype` — they are mappable read-only references
-to fixed-purpose memory and cannot be consumed for kernel-object creation.
+Execute | Retype` and places them in init's CSpace. Boot-module and
+init-segment Memory caps carry the same full rights: the pages are mapped at
+their true protection before the caps exist, so the rights gate derivation
+only, and full rights let the caps donate into memmgr's pool as general RAM
+at init's reap. Only firmware-table Memory caps (ACPI regions, RSDP, DTB)
+mint without `Retype` — mappable references to fixed-purpose memory that
+cannot be consumed for kernel-object creation.
 
 Init transfers RAM Memory caps (via the derive-twice pattern) to memmgr, which
 thereafter owns userspace RAM frame allocation and answers `REQUEST_MEMORY_CAPS`

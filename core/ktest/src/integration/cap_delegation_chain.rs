@@ -33,7 +33,7 @@ use crate::{TestContext, TestResult};
 
 // NOTIFY right only — can send, cannot wait.
 const RIGHTS_NOTIFY: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
-// NOTIFY + WAIT rights (bits 7 and 8) — full notification capability.
+// NOTIFY + WAIT rights — full notification capability.
 const RIGHTS_NOTIFY_WAIT: u64 = syscall_abi::RIGHTS_NTF_NOTIFY | syscall_abi::RIGHTS_NTF_WAIT;
 
 pub fn run(ctx: &TestContext) -> TestResult

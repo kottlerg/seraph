@@ -32,6 +32,7 @@ const TOTAL_MESSAGES: u32 = NUM_PRODUCERS as u32 * MESSAGES_PER_PRODUCER;
 
 /// NOTIFY right (send) only.
 const RIGHTS_NOTIFY: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
+
 /// Producer: post `MESSAGES_PER_PRODUCER` messages each tagged with its
 /// producer id, then post done bit.
 ///

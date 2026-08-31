@@ -252,18 +252,22 @@ pub fn revoke_invalidates(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
-/// `cap_revoke` clears subtrees larger than one revoke batch, in both wide
-/// and deep shapes, and the freed slots return to the `CSpace`.
+/// `cap_revoke` clears subtrees larger than one revoke batch — wide, deep,
+/// and bushy shapes — and the freed slots return to the `CSpace`.
 ///
-/// The revoke batch bound (`MAX_REVOKE_NODES = 256` nodes per lock hold) must
-/// be invisible to callers: a 600-child fan-out and a 300-deep derive chain
-/// each exceed one batch, and the deep chain also exceeds what a
-/// fixed-depth work stack of that bound could hold. Two cycles verify the
-/// tree and freelist stay healthy across a batched revoke.
+/// The revoke batch bound (see `MAX_REVOKE_NODES` in the kernel's
+/// capability-internals design doc) must be invisible to callers. Each of
+/// the three shapes exceeds one batch: a 600-child fan-out, a 300-deep
+/// derive chain, and a bushy 4×100 two-level tree whose second level
+/// straddles the batch boundary. Probes cover head, middle, and tail
+/// positions of the child lists. Three consecutive cycles on one root
+/// verify the tree and freelist stay healthy across batched revokes.
 pub fn revoke_large_subtree(ctx: &TestContext) -> TestResult
 {
     const WIDE_CHILDREN: usize = 600;
     const DEEP_CHAIN: usize = 300;
+    const BUSHY_CHILDREN: usize = 4;
+    const BUSHY_GRANDCHILDREN: usize = 100;
 
     let used0 = cap_info(ctx.cspace_cap, syscall_abi::CAP_INFO_CSPACE_USED)
         .map_err(|_| "cap_info(USED) baseline failed")?;
@@ -272,38 +276,71 @@ pub fn revoke_large_subtree(ctx: &TestContext) -> TestResult
         .map_err(|_| "create_notification for revoke_large_subtree failed")?;
 
     // Cycle 1: wide fan-out — 600 direct children of the root.
-    let mut first = 0u32;
-    let mut last = 0u32;
+    let mut probes: [Option<u32>; 3] = [None; 3];
     for i in 0..WIDE_CHILDREN
     {
         let child = cap_derive(sig, RIGHTS_NOTIFY).map_err(|_| "cap_derive (wide) failed")?;
-        if i == 0
+        if i == 0 || i == WIDE_CHILDREN / 2 || i == WIDE_CHILDREN - 1
         {
-            first = child;
+            let free = probes
+                .iter_mut()
+                .find(|p| p.is_none())
+                .ok_or("probe overflow")?;
+            *free = Some(child);
         }
-        last = child;
+    }
+    for probe in probes.iter().flatten()
+    {
+        notification_send(*probe, 0x1).map_err(|_| "wide probe unusable before revoke")?;
     }
     cap_revoke(sig).map_err(|_| "cap_revoke (wide) failed")?;
-    if notification_send(first, 0x1).is_ok() || notification_send(last, 0x1).is_ok()
+    for probe in probes.iter().flatten()
     {
-        return Err("derived cap still usable after wide batched revoke");
+        if notification_send(*probe, 0x1).is_ok()
+        {
+            return Err("derived cap still usable after wide batched revoke");
+        }
     }
 
     // Cycle 2: deep chain — derive-of-derive to 300 levels under the root.
     let mut cur = sig;
-    let mut mid = 0u32;
+    let mut mid = None;
     for i in 0..DEEP_CHAIN
     {
         cur = cap_derive(cur, RIGHTS_NOTIFY).map_err(|_| "cap_derive (deep) failed")?;
         if i == DEEP_CHAIN / 2
         {
-            mid = cur;
+            mid = Some(cur);
         }
     }
+    let mid = mid.ok_or("deep chain built no midpoint")?;
     cap_revoke(sig).map_err(|_| "cap_revoke (deep) failed")?;
     if notification_send(mid, 0x1).is_ok() || notification_send(cur, 0x1).is_ok()
     {
         return Err("derived cap still usable after deep batched revoke");
+    }
+
+    // Cycle 3: bushy — 4 children × 100 grandchildren (404 nodes), so the
+    // batch boundary lands mid-way through the grandchild population.
+    let mut bushy_probe = None;
+    for c in 0..BUSHY_CHILDREN
+    {
+        let child = cap_derive(sig, RIGHTS_NOTIFY).map_err(|_| "cap_derive (bushy) failed")?;
+        for g in 0..BUSHY_GRANDCHILDREN
+        {
+            let grandchild = cap_derive(child, RIGHTS_NOTIFY)
+                .map_err(|_| "cap_derive (bushy grandchild) failed")?;
+            if c == BUSHY_CHILDREN / 2 && g == BUSHY_GRANDCHILDREN / 2
+            {
+                bushy_probe = Some(grandchild);
+            }
+        }
+    }
+    let bushy_probe = bushy_probe.ok_or("bushy tree built no probe")?;
+    cap_revoke(sig).map_err(|_| "cap_revoke (bushy) failed")?;
+    if notification_send(bushy_probe, 0x1).is_ok()
+    {
+        return Err("grandchild cap still usable after bushy batched revoke");
     }
 
     // Only the root remains; deleting it restores the slot-count baseline.

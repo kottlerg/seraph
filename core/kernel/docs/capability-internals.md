@@ -311,55 +311,68 @@ The global lock avoids deadlock from ordering multiple per-CSpace locks.
 ### Revocation Algorithm
 
 `SYS_CAP_REVOKE` clears the subtree rooted at the target slot in batches of at most
-`MAX_REVOKE_NODES` nodes (`revoke_subtree_batch`). Each batch runs under the
-derivation tree write lock and performs a stackless post-order walk over the tree's
-own links: descend `deriv_first_child` to a leaf, unlink and free it (its next
-sibling becomes the new head of the child list), then continue with that sibling
-or, when the list is exhausted, with the now-childless parent. Because the walk
-uses the links themselves rather than a work stack, no subtree size can overflow a
-fixed buffer; the batch bound caps lock hold time and the size of the dealloc
-output buffer, not the revocable subtree.
+`MAX_REVOKE_NODES` constant-time tree edits (`revoke_subtree_batch`). Each batch
+runs under the derivation tree write lock and repeatedly edits the head `H` of the
+root's child list:
+
+- `H` has a child: unlink that child and re-link it directly under the root (a
+  *hoist* — it becomes the new list head, ahead of `H`).
+- `H` is childless: unlink it, free its slot in its owning `CSpace` (under that
+  `CSpace`'s lock), and collect its object for deallocation.
 
 ```
 revoke(root_handle):
     loop:
         acquire derivation tree write lock
         revalidate root (non-Null, handle generation current); stop if not
-        objects, more = revoke_subtree_batch(root)   // frees ≤ MAX_REVOKE_NODES slots
+        objects, more = revoke_subtree_batch(root)   // ≤ MAX_REVOKE_NODES edits
         release derivation tree write lock
         dec_ref / dealloc each collected object      // outside the lock
         if not more: return
 
 revoke_subtree_batch(root):
-    walk to the deepest first-child leaf under root
-    repeat:
-        capture (parent, next_sibling); unlink_node(leaf)
-        free the leaf's CSpace slot (under that CSpace's lock); collect its object
-        continue with next_sibling (descending), else with the childless parent,
-        stopping at root; stop early after MAX_REVOKE_NODES nodes → more = true
+    repeat up to MAX_REVOKE_NODES times:
+        H = root.first_child; done if None
+        if H has a first child G: unlink G; link G under root   (hoist)
+        else: unlink H; free H's slot; collect its object       (free)
 ```
 
-Between batches the lock is dropped so collected objects can be deallocated
-(`dealloc_object` may take other locks). Each batch re-descends from the root, so
-children derived concurrently between batches are still revoked, and the root is
-revalidated per batch so a root deleted or recycled mid-revoke stops the loop. Each
-batch frees at least one node, so the loop terminates against any fixed subtree;
-a concurrent deriver can extend the work only by spending its own slots and
-syscalls at least as fast as revocation reclaims them.
+Every edit is O(1), so a batch holds the write lock for at most
+`MAX_REVOKE_NODES` constant-time steps regardless of the subtree's shape or
+depth. Each node is hoisted at most once and freed exactly once, so clearing a
+subtree of N nodes costs at most 2N edits across all batches — O(N) total, with
+no per-batch re-traversal. Frees never exceed edits, so the same bound sizes the
+dealloc output buffer.
 
-**Performance characteristics:** Revocation is O(N) in the number of descendants
-(each tree edge is traversed a bounded number of times). For well-behaved systems,
-derivation trees are shallow (a server derives a capability for a client; the
-client rarely re-derives). Deep trees or large revocations do not appear on
-latency-sensitive paths.
+Between batches the lock is dropped so collected objects can be deallocated
+(`dealloc_object` may take other locks). The walk always operates on the root's
+current child list, so children derived concurrently between batches are still
+cleared, and the root is revalidated per batch so a root deleted or recycled
+mid-revoke stops the loop. Each batch performs at least one edit, so the loop
+terminates against any fixed subtree; a concurrent deriver can extend the work
+only by spending its own slots and syscalls.
+
+A link followed by the walk can legitimately fail to resolve: when a `CSpace`
+dies, the pre-unregister drain may leave a foreign parent's child-list head
+pointing at another dying slot (see `drain_foreign_back_links`), and epoch
+validation rejects that stale `SlotId` on lookup. Nodes chained behind such a
+link are unreachable by design — their linkage died with the `CSpace` — and the
+walk truncates exactly the chain hanging from the dead link and logs it.
+
+**Performance characteristics:** Revocation is O(N) in the number of descendants.
+For well-behaved systems, derivation trees are shallow (a server derives a
+capability for a client; the client rarely re-derives). Deep trees or large
+revocations do not appear on latency-sensitive paths.
 
 **Locking during revocation:** While the write lock is held, all other capability
 operations on the affected slots are blocked. This is safe because revocation is
 intentionally a strong operation — the revoker is asserting that no further access
 to the capability is valid. A revocation larger than one batch is not atomic
 against readers: between batches, unrevoked descendants remain usable until their
-batch frees them. The terminal state — the root childless — is guaranteed when the
-syscall returns.
+batch frees them, and hoisting is visible — surviving descendants may temporarily
+appear as direct children of the root (still descendants of it and of every
+ancestor above it, so ancestor revocation reach is preserved). When the syscall
+returns successfully with the root still live, the root is childless.
 
 **Deferred IPC cleanup:** The derivation tree write lock is ordered after IPC object
 locks (see lock ordering in [ipc-internals.md](ipc-internals.md)). Therefore,

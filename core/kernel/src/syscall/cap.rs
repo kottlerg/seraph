@@ -1554,7 +1554,7 @@ pub fn sys_cap_delete(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     let node = crate::cap::slot::SlotId::current(cspace_id, slot_idx_nz);
 
     // Resolve the slot, unlink, and clear under DERIVATION_LOCK so a concurrent
-    // revoke_subtree on a parent cap cannot race-clear this slot between the
+    // revoke_subtree_batch on a parent cap cannot race-clear this slot between the
     // tag-check and the dec_ref. Both paths must dec_ref the object exactly
     // once between them.
     crate::cap::DERIVATION_LOCK.write_lock();
@@ -1583,7 +1583,7 @@ pub fn sys_cap_delete(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         Some(_) =>
         {
             // Slot was Null on entry, or was cleared by a concurrent
-            // revoke_subtree before we acquired the lock. Idempotent.
+            // revoke_subtree_batch before we acquired the lock. Idempotent.
             crate::cap::DERIVATION_LOCK.write_unlock();
             return Ok(0);
         }
@@ -1706,8 +1706,12 @@ pub fn sys_cap_revoke(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         // case the remaining subtree now belongs to whatever reparenting the
         // concurrent operation performed, and this revoke must stop.
         let root_live = {
-            // SAFETY: caller_cspace validated non-null above; reads are
-            // stable under DERIVATION_LOCK (delete/recycle paths take it).
+            // SAFETY: caller_cspace validated non-null above. Free paths
+            // (delete/revoke) run under DERIVATION_LOCK, so a freed root is
+            // observed stably here; re-population of a recycled index runs
+            // under cspace.lock only and can race this read, but the
+            // generation bump on free makes a raced read fail closed (the
+            // handle's generation no longer matches).
             let cs = unsafe { &*caller_cspace };
             cs.slot(slot_idx).is_some_and(|slot| {
                 slot.tag != crate::cap::slot::CapTag::Null

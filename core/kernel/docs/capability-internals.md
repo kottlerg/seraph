@@ -353,7 +353,12 @@ current child list, so children derived concurrently between batches are still
 cleared, and the root is revalidated per batch so a root recycled mid-revoke
 stops the loop. Every batch that reports more work performed a full budget of
 edits, so the loop terminates against any fixed subtree; a concurrent deriver
-can extend the work only by spending its own slots and syscalls.
+can extend the work only by spending its own slots and syscalls. A liveness
+backstop (`MAX_REVOKE_BATCHES`) bounds the loop unconditionally: it covers more
+edits than any subtree plausibly-sized hardware can hold (every node costs its
+creator a slot plus a kernel object), so tripping it indicates sustained
+concurrent re-derivation and returns `Interrupted` — revoked nodes stay
+revoked, and a retry continues from the surviving subtree.
 
 Because hoisting destroys intermediate parent→child edges as the flattening
 proceeds, the root is pinned for the whole multi-batch operation with a

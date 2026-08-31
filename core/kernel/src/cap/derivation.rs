@@ -482,6 +482,13 @@ fn slot_exists(id: SlotId) -> bool
 /// Containment for a dead derivation link: log it and cut `owner`'s
 /// `deriv_first_child`, abandoning the unreachable chain behind `dead`.
 ///
+/// Cutting the whole chain is the tightest containment available: the dead
+/// node's sibling links lived in storage reclaimed with its `CSpace`, so
+/// the rest of the chain cannot be located to splice past it. Any live
+/// nodes chained behind the dead link are abandoned — which is why the
+/// caller reports [`BatchStatus::DeadLink`] and the syscall surfaces an
+/// error instead of claiming a clean revoke.
+///
 /// # Safety
 ///
 /// Caller must hold `DERIVATION_LOCK` write lock.
@@ -576,10 +583,15 @@ mod tests
     // ── revoke_subtree_batch (host harness) ──────────────────────────────
     //
     // Each test registers heap-backed CSpaces in the shared test registry
-    // under ids unique to that test (the registry is a process-wide static
-    // and `cargo test` runs tests concurrently). Leaked Boxes are
-    // acceptable — the process exits after the run. The global
-    // DERIVATION_LOCK is taken for fidelity with the production contract.
+    // under hard-coded ids unique to that test (the registry is a
+    // process-wide static and `cargo test` runs tests concurrently). The
+    // ids sit far above anything the test-stub `alloc_cspace_id` counter
+    // reaches in this suite and below the recycle test's reserved top id;
+    // nothing enforces that — a new direct-registration test must pick an
+    // unused id. Leaked Boxes are acceptable — the process exits after the
+    // run. The global DERIVATION_LOCK is taken for fidelity with the
+    // production contract; assertions run only after `write_unlock`, so a
+    // failing test unwinds without wedging the other tests on the lock.
 
     use crate::cap::cspace::CSpace;
     use crate::cap::slot::CapTag;
@@ -612,6 +624,20 @@ mod tests
         unsafe { (*cs).populated_count() }
     }
 
+    /// Build a derive chain of `len` nodes under `root` (each node the sole
+    /// child of the previous). Caller holds `DERIVATION_LOCK`.
+    fn build_chain(cs: *mut CSpace, id: crate::cap::slot::CSpaceId, root: SlotId, len: usize)
+    {
+        let mut parent = root;
+        for _ in 0..len
+        {
+            let child = occupy(cs, id);
+            // SAFETY: DERIVATION_LOCK held by caller; both slots live.
+            unsafe { link_child(parent, child) };
+            parent = child;
+        }
+    }
+
     #[test]
     fn revoke_batch_clears_mixed_tree_and_preserves_root()
     {
@@ -633,10 +659,11 @@ mod tests
         }
         // SAFETY: DERIVATION_LOCK held.
         let (objects, status) = unsafe { revoke_subtree_batch(root) };
-        assert_eq!(status, BatchStatus::Cleared);
-        assert_eq!(objects.len(), 15, "3 children + 12 grandchildren collected");
+        let collected = objects.len();
         DERIVATION_LOCK.write_unlock();
 
+        assert_eq!(status, BatchStatus::Cleared);
+        assert_eq!(collected, 15, "3 children + 12 grandchildren collected");
         assert_eq!(count_populated(cs), 1, "only the root survives");
         // SAFETY: test ownership.
         let root_slot = unsafe { (*cs).slot_mut(root.index.get()) }.expect("root slot");
@@ -645,37 +672,54 @@ mod tests
         crate::cap::unregister_cspace(ID);
     }
 
+    // A chain of N nodes needs 2N-1 edits (N-1 hoists + N frees), so
+    // N = 150 forces exactly one MoreWork boundary at 256 edits.
+    const BUDGET_CHAIN: usize = 150;
+
     #[test]
-    fn revoke_batch_edit_budget_and_hoist_visibility()
+    fn revoke_batch_stops_at_edit_budget_then_clears()
     {
         const ID: crate::cap::slot::CSpaceId = 3102;
-        // A chain of N nodes needs 2N-1 edits (N-1 hoists + N frees), so
-        // N = 150 forces exactly one MoreWork boundary at 256 edits.
-        const CHAIN: usize = 150;
         let cs = mk_registered_cspace(ID, 512);
         let root = occupy(cs, ID);
         DERIVATION_LOCK.write_lock();
-        let mut parent = root;
-        for _ in 0..CHAIN
-        {
-            let child = occupy(cs, ID);
-            // SAFETY: DERIVATION_LOCK held; both slots live.
-            unsafe { link_child(parent, child) };
-            parent = child;
-        }
+        build_chain(cs, ID, root, BUDGET_CHAIN);
 
         // SAFETY: DERIVATION_LOCK held.
         let (first_objects, first_status) = unsafe { revoke_subtree_batch(root) };
-        assert_eq!(first_status, BatchStatus::MoreWork);
         let first_freed = first_objects.len();
+        // SAFETY: DERIVATION_LOCK held.
+        let (second_objects, second_status) = unsafe { revoke_subtree_batch(root) };
+        let second_freed = second_objects.len();
+        DERIVATION_LOCK.write_unlock();
+
+        assert_eq!(first_status, BatchStatus::MoreWork);
         assert!(
-            first_freed < CHAIN,
+            first_freed < BUDGET_CHAIN,
             "budgeted batch must leave survivors ({first_freed} freed)"
         );
+        assert_eq!(second_status, BatchStatus::Cleared);
+        assert_eq!(first_freed + second_freed, BUDGET_CHAIN);
+        assert_eq!(count_populated(cs), 1, "only the root survives");
+        crate::cap::unregister_cspace(ID);
+    }
 
-        // Hoist visibility between batches: every survivor is now a direct
-        // child of the root.
+    #[test]
+    fn revoke_batch_hoists_survivors_under_root_between_batches()
+    {
+        const ID: crate::cap::slot::CSpaceId = 3105;
+        let cs = mk_registered_cspace(ID, 512);
+        let root = occupy(cs, ID);
+        DERIVATION_LOCK.write_lock();
+        build_chain(cs, ID, root, BUDGET_CHAIN);
+
+        // SAFETY: DERIVATION_LOCK held.
+        let (first_objects, first_status) = unsafe { revoke_subtree_batch(root) };
+        let first_freed = first_objects.len();
+
+        // Between batches, every survivor must be a direct child of root.
         let mut survivors = 0;
+        let mut all_hoisted = true;
         // SAFETY: DERIVATION_LOCK held.
         let mut cur = unsafe { resolve_slot_mut(root) }
             .expect("root")
@@ -684,19 +728,15 @@ mod tests
         {
             // SAFETY: DERIVATION_LOCK held.
             let slot = unsafe { resolve_slot_mut(node) }.expect("survivor resolves");
-            assert_eq!(slot.deriv_parent, Some(root), "survivor hoisted under root");
+            all_hoisted &= slot.deriv_parent == Some(root);
             survivors += 1;
             cur = slot.deriv_next_sibling;
         }
-        assert_eq!(survivors, CHAIN - first_freed);
-
-        // SAFETY: DERIVATION_LOCK held.
-        let (second_objects, second_status) = unsafe { revoke_subtree_batch(root) };
-        assert_eq!(second_status, BatchStatus::Cleared);
-        assert_eq!(first_freed + second_objects.len(), CHAIN);
         DERIVATION_LOCK.write_unlock();
 
-        assert_eq!(count_populated(cs), 1, "only the root survives");
+        assert_eq!(first_status, BatchStatus::MoreWork);
+        assert!(all_hoisted, "every survivor hoisted under root");
+        assert_eq!(survivors, BUDGET_CHAIN - first_freed);
         crate::cap::unregister_cspace(ID);
     }
 
@@ -719,13 +759,17 @@ mod tests
 
         // SAFETY: DERIVATION_LOCK held.
         let (objects, status) = unsafe { revoke_subtree_batch(root) };
-        assert_eq!(status, BatchStatus::DeadLink);
-        assert!(objects.is_empty(), "nothing collectable behind a dead link");
-        // Containment: the dangling chain is cut so a retry cannot spin.
+        let collected = objects.len();
         // SAFETY: DERIVATION_LOCK held.
-        let root_slot = unsafe { resolve_slot_mut(root) }.expect("root");
-        assert_eq!(root_slot.deriv_first_child, None);
+        let root_child = unsafe { resolve_slot_mut(root) }
+            .expect("root")
+            .deriv_first_child;
         DERIVATION_LOCK.write_unlock();
+
+        assert_eq!(status, BatchStatus::DeadLink);
+        assert_eq!(collected, 0, "nothing collectable behind a dead link");
+        // Containment: the dangling chain is cut so a retry cannot spin.
+        assert_eq!(root_child, None);
         crate::cap::unregister_cspace(ID_A);
     }
 }

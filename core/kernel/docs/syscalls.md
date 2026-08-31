@@ -671,7 +671,9 @@ and `SYS_CAP_MOVE` on the target slot (and IPC transfer of it) are refused with
 
 **Errors:** `InvalidCapability`; `InvalidState` (another revoke is already in
 flight on this slot, or a corrupted derivation link was found — the revoke is
-incomplete and the dangling chain was cut).
+incomplete and the dangling chain was cut); `Interrupted` (liveness backstop:
+sustained concurrent derivation kept extending the subtree — everything revoked
+so far stays revoked; retry to continue).
 
 ---
 

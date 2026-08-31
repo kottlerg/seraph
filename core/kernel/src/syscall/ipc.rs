@@ -180,8 +180,13 @@ fn unpack_cap_slots(packed: u64, count: usize) -> [u32; MSG_CAP_SLOTS_MAX]
 
 /// Move `src_slots[..cap_count]` from `src_cspace` to `dst_cspace`.
 ///
-/// All-or-nothing: if any slot is null/invalid or the destination is full
-/// (`pre_allocate` fails), returns an error and no caps are transferred.
+/// All-or-nothing: if any slot is null/invalid, carries an in-flight
+/// revoke (`CapabilitySlot::revoke_in_progress`), or the destination is
+/// full (`pre_allocate` fails), returns an error and no caps are
+/// transferred. Validation runs twice: an unlocked fast-path reject, then
+/// a locked re-validation immediately before the moves, so concurrent
+/// frees or revoke-marker changes cannot slip between validation and
+/// transfer.
 ///
 /// On success, writes the destination slot indices to `dst_indices_out` and
 /// returns the number of caps transferred. The caller is responsible for
@@ -193,8 +198,8 @@ fn unpack_cap_slots(packed: u64, count: usize) -> [u32; MSG_CAP_SLOTS_MAX]
 /// # To add rollback on mid-transfer failure
 /// Collect successfully-moved destination indices and call
 /// `move_cap_between_cspaces` in reverse on failure. Currently the
-/// pre-validation + pre-allocation pattern makes mid-transfer failure
-/// unreachable in practice.
+/// locked re-validation + pre-allocation pattern makes mid-transfer
+/// failure unreachable in practice.
 #[cfg(not(test))]
 unsafe fn transfer_caps(
     src_cspace: *mut CSpace,
@@ -270,24 +275,75 @@ unsafe fn transfer_caps(
         }
     };
 
+    // Re-validate under the locks: a source slot can be freed, or gain a
+    // revoke-in-progress marker, between the unlocked pre-validation and
+    // lock acquisition. Failing here preserves the all-or-nothing contract
+    // (nothing has moved yet) and keeps the per-move failure branch below
+    // genuinely unreachable — without this, a sender naming a sibling
+    // thread's mid-revoke root would trip that branch from userspace.
+    {
+        // SAFETY: src_cspace validated by caller; both locks held.
+        let cs = unsafe { &*src_cspace };
+        for &idx in &src_slots[..cap_count]
+        {
+            let err = match cs.slot(idx)
+            {
+                None => Some(SyscallError::InvalidCapability),
+                Some(slot) if slot.tag == CapTag::Null => Some(SyscallError::InvalidCapability),
+                Some(slot) if slot.revoke_in_progress() => Some(SyscallError::InvalidState),
+                Some(_) => None,
+            };
+            if let Some(e) = err
+            {
+                // SAFETY: saved1/saved2 from the lock_raw calls above.
+                unsafe { unlock_cspace_pair(src_cspace, dst_cspace, saved1, saved2) };
+                crate::cap::DERIVATION_LOCK.write_unlock();
+                return Err(e);
+            }
+        }
+    }
+
     for (i, &src_idx) in src_slots[..cap_count].iter().enumerate()
     {
         // SAFETY: DERIVATION_LOCK and both CSpace locks held; pointers valid.
         dst_indices_out[i] =
             unsafe { crate::cap::move_cap_between_cspaces(src_cspace, src_idx, dst_cspace) }
                 .unwrap_or_else(|_| {
-                    // Pre-validation passed and pre-allocation succeeded; this branch
-                    // is unreachable in correct operation. Panic in debug builds only.
+                    // The locked re-validation above passed and destination
+                    // slots are pre-allocated; this branch is unreachable in
+                    // correct operation. Panic in debug builds only.
                     debug_assert!(
                         false,
-                        "transfer_caps: unexpected move failure after pre-validation"
+                        "transfer_caps: unexpected move failure after locked re-validation"
                     );
                     0
                 });
     }
 
-    // Unlock in reverse order of acquisition.
-    // SAFETY: saved1 and saved2 came from lock_raw calls above.
+    // SAFETY: saved1 and saved2 came from the lock_raw calls above.
+    unsafe { unlock_cspace_pair(src_cspace, dst_cspace, saved1, saved2) };
+
+    crate::cap::DERIVATION_LOCK.write_unlock();
+
+    Ok(cap_count)
+}
+
+/// Release the pair of `CSpace` locks taken by [`transfer_caps`], in reverse
+/// order of acquisition (same-pointer pairs were locked once).
+///
+/// # Safety
+///
+/// `saved1`/`saved2` must come from the matching `lock_raw` acquisition in
+/// [`transfer_caps`]; each pair must be released exactly once.
+#[cfg(not(test))]
+unsafe fn unlock_cspace_pair(
+    src_cspace: *mut CSpace,
+    dst_cspace: *mut CSpace,
+    saved1: u64,
+    saved2: u64,
+)
+{
+    // SAFETY: caller contract.
     unsafe {
         use core::cmp::Ordering;
         match src_cspace.cmp(&dst_cspace)
@@ -308,10 +364,6 @@ unsafe fn transfer_caps(
             }
         }
     }
-
-    crate::cap::DERIVATION_LOCK.write_unlock();
-
-    Ok(cap_count)
 }
 
 // ── IPC syscall handlers ──────────────────────────────────────────────────────

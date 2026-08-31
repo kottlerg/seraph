@@ -6,6 +6,12 @@
 //! `NUM_CHILDREN` threads send on derived caps in a tight loop. The parent
 //! revokes the root cap mid-flight. Children detect errors and exit.
 //! Verifies no kernel panic or use-after-free occurs.
+//!
+//! `BALLAST_CHILDREN` extra derived caps pad the subtree past one revoke
+//! batch (`MAX_REVOKE_EDITS` in the kernel), so the revoke runs multi-batch
+//! with the root pinned by the revoke-in-progress marker while the sender
+//! threads are live. The cleanup `cap_delete(root)` doubles as the check
+//! that the marker was released when the revoke completed.
 
 use syscall::{
     cap_copy, cap_create_notification, cap_delete, cap_derive, cap_revoke, notification_send,
@@ -15,6 +21,7 @@ use syscall::{
 use crate::{ChildStack, TestContext, TestResult, spawn};
 
 const NUM_CHILDREN: usize = 64;
+const BALLAST_CHILDREN: usize = 200;
 const RIGHTS_NOTIFY: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
 
 pub fn run(ctx: &TestContext) -> TestResult
@@ -30,6 +37,15 @@ pub fn run(ctx: &TestContext) -> TestResult
     {
         *slot =
             cap_derive(root, RIGHTS_NOTIFY).map_err(|_| "cap_revoke_under_use: derive failed")?;
+    }
+
+    // Ballast: pad the subtree past one revoke batch so the revoke below is
+    // multi-batch while the sender threads are running.
+    let mut ballast_probe = 0u32;
+    for _ in 0..BALLAST_CHILDREN
+    {
+        ballast_probe = cap_derive(root, RIGHTS_NOTIFY)
+            .map_err(|_| "cap_revoke_under_use: ballast derive failed")?;
     }
 
     // Spawn NUM_CHILDREN threads, each sending on its derived cap.
@@ -81,9 +97,14 @@ pub fn run(ctx: &TestContext) -> TestResult
         done_bits |= notification_wait(done).unwrap_or(0);
     }
 
-    // Root must still be valid.
+    // Root must still be valid; every revoked descendant (ballast included)
+    // must not be.
     notification_send(root, 0x1).map_err(|_| "cap_revoke_under_use: root invalid after revoke")?;
     notification_wait(root).ok();
+    if notification_send(ballast_probe, 0x1).is_ok()
+    {
+        return Err("cap_revoke_under_use: ballast cap survived revoke");
+    }
 
     // Clean up.
     for i in 0..NUM_CHILDREN

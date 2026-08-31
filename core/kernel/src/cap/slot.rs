@@ -683,24 +683,31 @@ impl CapabilitySlot
     /// Return `true` if a multi-batch `SYS_CAP_REVOKE` is in flight on this
     /// slot (marker stored in `pad[2]`).
     ///
-    /// While set, `SYS_CAP_DELETE` and `SYS_CAP_MOVE` refuse to act on the
-    /// slot: deleting or moving a revoke root between batches would promote
-    /// its temporarily hoisted survivors and permanently sever intermediate
-    /// revocation edges (see the revocation algorithm in
-    /// `capability-internals.md`). Read and written only under
-    /// `DERIVATION_LOCK`; cleared by [`clear`](Self::clear) /
-    /// [`clear_keep_generation`](Self::clear_keep_generation) when the slot
-    /// is recycled.
+    /// While set, `SYS_CAP_DELETE`, `SYS_CAP_MOVE`, and IPC capability
+    /// transfer refuse to act on the slot: deleting or moving a revoke root
+    /// between batches would promote its temporarily hoisted survivors and
+    /// permanently sever intermediate revocation edges (see the revocation
+    /// algorithm in `capability-internals.md`). Read and written only under
+    /// `DERIVATION_LOCK`. A slot freed while marked sheds the marker on the
+    /// free path — [`set_next_free`](Self::set_next_free) zeroes `pad[2]`
+    /// when threading the slot onto the free list.
     pub fn revoke_in_progress(&self) -> bool
     {
         self.pad[2] != 0
     }
 
-    /// Set or clear the revoke-in-progress marker (see
+    /// Set the revoke-in-progress marker (see
     /// [`revoke_in_progress`](Self::revoke_in_progress)).
-    pub fn set_revoke_in_progress(&mut self, active: bool)
+    pub fn mark_revoke_in_progress(&mut self)
     {
-        self.pad[2] = u8::from(active);
+        self.pad[2] = 1;
+    }
+
+    /// Clear the revoke-in-progress marker (see
+    /// [`revoke_in_progress`](Self::revoke_in_progress)).
+    pub fn clear_revoke_in_progress(&mut self)
+    {
+        self.pad[2] = 0;
     }
 
     // ── Intrusive free-list helpers ───────────────────────────────────────────
@@ -723,7 +730,10 @@ impl CapabilitySlot
     /// can recognise this slot as a free-list member regardless of whether it
     /// is the list tail. Leaves `pad[1]` (the per-slot generation) untouched —
     /// `CSpace::free_slot` bumps it immediately before this call and the next
-    /// allocation must observe the incremented value.
+    /// allocation must observe the incremented value. Zeroes `pad[2]` — a
+    /// slot freed while a revoke had it pinned must not carry the
+    /// revoke-in-progress marker into its next occupant (see
+    /// [`revoke_in_progress`](Self::revoke_in_progress)).
     ///
     /// [`is_on_free_list`]: Self::is_on_free_list
     pub fn set_next_free(&mut self, next: Option<NonZeroU32>)

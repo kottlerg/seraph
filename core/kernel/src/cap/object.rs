@@ -2967,8 +2967,12 @@ unsafe fn first_live_forward(
 ) -> Option<crate::cap::slot::SlotId>
 {
     let mut cur = from;
-    while let Some(c) = cur
+    // A dying run cannot exceed the dying CSpace's slot count; the bound
+    // turns a (corrupt) sibling cycle into a truncation instead of a
+    // spin under DERIVATION_LOCK.
+    for _ in 0..=crate::cap::cspace::L1_SIZE * crate::cap::cspace::L2_SIZE
     {
+        let c = cur?;
         if c.cspace_id != dying_id
         {
             return Some(c);
@@ -2995,8 +2999,10 @@ unsafe fn first_live_backward(
 ) -> Option<crate::cap::slot::SlotId>
 {
     let mut cur = from;
-    while let Some(c) = cur
+    // Bounded as in first_live_forward.
+    for _ in 0..=crate::cap::cspace::L1_SIZE * crate::cap::cspace::L2_SIZE
     {
+        let c = cur?;
         if c.cspace_id != dying_id
         {
             return Some(c);

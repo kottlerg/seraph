@@ -12,8 +12,9 @@
 //! Data words (up to `MSG_DATA_WORDS_MAX`) are read from / written to the
 //! per-thread IPC buffer page registered via `SYS_IPC_BUFFER_SET`.
 //!
-//! Capability transfer: up to `MSG_CAP_SLOTS_MAX` capabilities can be moved
-//! atomically with each message. See `transfer_caps` for the protocol.
+//! Capability transfer: up to `MSG_CAP_SLOTS_MAX` capabilities move with a
+//! message, all-or-nothing; a refused transfer does not block delivery (see
+//! `transfer_caps` for the protocol and the degradation semantics).
 
 #[cfg(not(test))]
 use crate::arch::current::trap_frame::TrapFrame;
@@ -178,6 +179,35 @@ fn unpack_cap_slots(packed: u64, count: usize) -> [u32; MSG_CAP_SLOTS_MAX]
     out
 }
 
+/// Validate a set of transfer source slots: distinct, non-null, and not
+/// pinned by an in-flight revoke. The single authoritative predicate for
+/// every cap-transfer direction — `sys_ipc_call`'s fail-fast reject before
+/// blocking, and `transfer_caps`' unlocked fast path and locked
+/// re-validation. A refusal detected only after a caller has blocked
+/// degrades to zero-cap delivery without notifying the sender, which is
+/// why the call path must run this before parking.
+#[cfg(not(test))]
+fn prevalidate_transfer_slots(cs: &CSpace, slots: &[u32]) -> Result<(), SyscallError>
+{
+    for (i, &idx) in slots.iter().enumerate()
+    {
+        if slots[..i].contains(&idx)
+        {
+            return Err(SyscallError::InvalidArgument);
+        }
+        let slot = cs.slot(idx).ok_or(SyscallError::InvalidCapability)?;
+        if slot.tag == CapTag::Null
+        {
+            return Err(SyscallError::InvalidCapability);
+        }
+        if slot.revoke_in_progress()
+        {
+            return Err(SyscallError::InvalidState);
+        }
+    }
+    Ok(())
+}
+
 /// Move `src_slots[..cap_count]` from `src_cspace` to `dst_cspace`.
 ///
 /// All-or-nothing: if any slot is null/invalid, repeated within the same
@@ -253,7 +283,7 @@ unsafe fn transfer_caps(
     // SAFETY: src_cspace validated by caller; both locks held.
     if let Err(e) = prevalidate_transfer_slots(unsafe { &*src_cspace }, &src_slots[..cap_count])
     {
-        // SAFETY: saved1/saved2 from the lock_cspace_pair call above.
+        // SAFETY: saved1 and saved2 came from the lock_cspace_pair call above.
         unsafe { crate::cap::unlock_cspace_pair(src_cspace, dst_cspace, saved1, saved2) };
         crate::cap::DERIVATION_LOCK.write_unlock();
         return Err(e);
@@ -285,35 +315,6 @@ unsafe fn transfer_caps(
 }
 
 // ── IPC syscall handlers ──────────────────────────────────────────────────────
-
-/// Validate a set of transfer source slots: distinct, non-null, and not
-/// pinned by an in-flight revoke. The single authoritative predicate for
-/// every cap-transfer direction — `sys_ipc_call`'s fail-fast reject before
-/// blocking, and `transfer_caps`' unlocked fast path and locked
-/// re-validation. A refusal detected only after a caller has blocked
-/// degrades to zero-cap delivery without notifying the sender, which is
-/// why the call path must run this before parking.
-#[cfg(not(test))]
-fn prevalidate_transfer_slots(cs: &CSpace, slots: &[u32]) -> Result<(), SyscallError>
-{
-    for (i, &idx) in slots.iter().enumerate()
-    {
-        if slots[..i].contains(&idx)
-        {
-            return Err(SyscallError::InvalidArgument);
-        }
-        let slot = cs.slot(idx).ok_or(SyscallError::InvalidCapability)?;
-        if slot.tag == CapTag::Null
-        {
-            return Err(SyscallError::InvalidCapability);
-        }
-        if slot.revoke_in_progress()
-        {
-            return Err(SyscallError::InvalidState);
-        }
-    }
-    Ok(())
-}
 
 /// Move the caps carried by a `SYS_IPC_CALL` message from the running caller's
 /// `CSpace` into a server that was already blocked in recv, stashing the
@@ -970,27 +971,12 @@ pub fn sys_ipc_reply(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             // SAFETY: tcb validated above.
             let server_cspace = unsafe { (*tcb).cspace };
             let indices = unpack_cap_slots(cap_packed, cap_count);
+            // SAFETY: server_cspace extracted from validated TCB.
+            let server_cs = unsafe { &*server_cspace };
+            if let Err(e) = prevalidate_transfer_slots(server_cs, &indices[..cap_count])
             {
-                // SAFETY: server_cspace extracted from validated TCB.
-                let cs = unsafe { &*server_cspace };
-                for &idx in indices.iter().take(cap_count)
-                {
-                    let Some(slot) = cs.slot(idx)
-                    else
-                    {
-                        // SAFETY: tcb validated above.
-                        return Err(unsafe {
-                            fail_reply_and_wake_caller(tcb, SyscallError::InvalidCapability)
-                        });
-                    };
-                    if slot.tag == CapTag::Null
-                    {
-                        // SAFETY: tcb validated above.
-                        return Err(unsafe {
-                            fail_reply_and_wake_caller(tcb, SyscallError::InvalidCapability)
-                        });
-                    }
-                }
+                // SAFETY: tcb validated above.
+                return Err(unsafe { fail_reply_and_wake_caller(tcb, e) });
             }
             msg.cap_slots = indices;
             msg.cap_count = cap_count;

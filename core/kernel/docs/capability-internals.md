@@ -372,14 +372,14 @@ direction surfaces `InvalidState` to the server (the caller resumes with
 `IPC_REPLY_TRANSFER_FAILED`), the call direction rejects before blocking,
 and a refusal detected only post-commit delivers the message with zero
 caps (see [docs/ipc-design.md](../../../docs/ipc-design.md) § Message
-Format). Deleting or moving the root between batches
-would promote the temporarily hoisted survivors and permanently sever the
-intermediate holders' revocation authority. The marker is cleared under the
-lock on every syscall exit path — completion, dead-link error, and the
+Format). Deleting or moving the root between batches would promote the
+temporarily hoisted survivors and permanently sever the intermediate
+holders' revocation authority. The marker is cleared under the lock on
+every syscall exit path — completion, dead-link error, and the
 `Interrupted` backstop alike — so it cannot leak; a root freed by a
-concurrent ancestor
-revoke sheds the marker with the slot (that ancestor's revoke clears the
-hoisted survivors too, since they remain inside its subtree).
+concurrent ancestor revoke sheds the marker with the slot (that ancestor's
+revoke clears the hoisted survivors too, since they remain inside its
+subtree).
 
 Every derivation link reachable from a live slot resolves: `drain_dying_cspace`
 splices all foreign-facing links to surviving neighbours (walking through runs
@@ -509,7 +509,10 @@ on init's user stack before it begins execution.
 ## Capability Transfer in IPC
 
 IPC capability transfer (via `SYS_IPC_CALL` and `SYS_IPC_REPLY` capability slots)
-is implemented atomically as part of message delivery:
+moves all of a message's capabilities or none of them; a refused transfer does
+not block message delivery (see
+[docs/ipc-design.md](../../../docs/ipc-design.md) § Message Format). The
+per-capability move is:
 
 ```
 transfer_cap(sender, sender_slot_idx, receiver, receiver_slot_idx):

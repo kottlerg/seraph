@@ -2545,18 +2545,23 @@ pub unsafe fn ipc_recv(ep: u32, ipc_buf: *mut u64) -> Result<IpcMessage, i64>
 /// `SYS_IPC_REPLY` with `msg.word_count()` words and `msg.caps()` cap slots.
 /// Cap slots move from the server's `CSpace` to the caller's `CSpace`
 /// all-or-nothing with the reply. An `Err` return consumes the pending
-/// reply either way: the caller has already been woken — with the
-/// synthetic `IPC_REPLY_TRANSFER_FAILED` label when the refusal happened
-/// after it was claimed (a reply cap slot stale, repeated, revoke-pinned,
-/// or unacceptable to its `CSpace`) — so the reply must not be retried.
+/// reply either way: when a caller was claimed it has already been woken
+/// with the synthetic `IPC_REPLY_TRANSFER_FAILED` label (a reply cap slot
+/// stale, repeated, revoke-pinned, or unacceptable to its `CSpace`), and
+/// when none was pending there is nothing to wake — in both cases the
+/// reply must not be retried.
 ///
 /// # Safety
 /// `ipc_buf` must point to the caller thread's 4 KiB-aligned IPC buffer
 /// page as registered via `syscall::ipc_buffer_set`.
 ///
 /// # Errors
-/// Returns a negative `i64` error code if there is no pending reply target
-/// or the reply is otherwise invalid.
+/// Returns a negative `i64` error code: `InvalidCapability` (no pending
+/// reply target, or a reply cap slot is stale or Null), `InvalidArgument`
+/// (bad count, or a cap slot repeated in the reply), `InvalidState` (a
+/// reply cap slot is pinned by an in-flight `SYS_CAP_REVOKE`),
+/// `QuotaExceeded` / `OutOfMemory` (the caller's `CSpace` cannot accept
+/// the reply caps), or `Interrupted`.
 #[inline]
 pub unsafe fn ipc_reply(msg: &IpcMessage, ipc_buf: *mut u64) -> Result<(), i64>
 {

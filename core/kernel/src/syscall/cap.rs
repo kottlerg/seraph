@@ -1981,7 +1981,7 @@ pub fn sys_cap_move(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         // SAFETY: both CSpace pointers valid; DERIVATION_LOCK and both cspace locks held.
         let result =
             unsafe { crate::cap::move_cap_between_cspaces(caller_cspace, src_idx, dest_cs_ptr) };
-        // SAFETY: saved1/saved2 from the lock_cspace_pair call above.
+        // SAFETY: saved1 and saved2 came from the lock_cspace_pair call above.
         unsafe {
             crate::cap::unlock_cspace_pair(caller_cspace, dest_cs_ptr, saved1, saved2);
         }

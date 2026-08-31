@@ -255,7 +255,7 @@ pub fn revoke_invalidates(ctx: &TestContext) -> TestResult
 /// `cap_revoke` clears subtrees larger than one revoke batch — wide, deep,
 /// and bushy shapes — and the freed slots return to the `CSpace`.
 ///
-/// The revoke batch bound (see `MAX_REVOKE_NODES` in the kernel's
+/// The revoke batch bound (see `MAX_REVOKE_EDITS` in the kernel's
 /// capability-internals design doc) must be invisible to callers. Each of
 /// the three shapes exceeds one batch: a 600-child fan-out, a 300-deep
 /// derive chain, and a bushy 4×100 two-level tree whose second level
@@ -276,17 +276,22 @@ pub fn revoke_large_subtree(ctx: &TestContext) -> TestResult
         .map_err(|_| "create_notification for revoke_large_subtree failed")?;
 
     // Cycle 1: wide fan-out — 600 direct children of the root.
+    // Probes: head, middle, and tail of the child list.
     let mut probes: [Option<u32>; 3] = [None; 3];
     for i in 0..WIDE_CHILDREN
     {
         let child = cap_derive(sig, RIGHTS_NOTIFY).map_err(|_| "cap_derive (wide) failed")?;
-        if i == 0 || i == WIDE_CHILDREN / 2 || i == WIDE_CHILDREN - 1
+        if i == 0
         {
-            let free = probes
-                .iter_mut()
-                .find(|p| p.is_none())
-                .ok_or("probe overflow")?;
-            *free = Some(child);
+            probes[0] = Some(child);
+        }
+        else if i == WIDE_CHILDREN / 2
+        {
+            probes[1] = Some(child);
+        }
+        else if i == WIDE_CHILDREN - 1
+        {
+            probes[2] = Some(child);
         }
     }
     for probe in probes.iter().flatten()

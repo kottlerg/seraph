@@ -148,7 +148,6 @@ unsafe fn resolve_slot_mut(id: SlotId) -> Option<&'static mut super::slot::Capab
 ///
 /// Caller must hold `DERIVATION_LOCK` write lock. `parent` and `child` must
 /// be valid, live capability slots (not Null).
-#[cfg(not(test))]
 pub unsafe fn link_child(parent: SlotId, child: SlotId)
 {
     // Update child's parent pointer.
@@ -201,7 +200,6 @@ pub unsafe fn link_child(parent: SlotId, child: SlotId)
 /// # Safety
 ///
 /// Caller must hold `DERIVATION_LOCK` write lock.
-#[cfg(not(test))]
 pub unsafe fn unlink_node(node: SlotId)
 {
     // Read node's current pointers.
@@ -324,37 +322,51 @@ pub unsafe fn reparent_children(node: SlotId, new_parent: Option<SlotId>)
 /// [`revoke_subtree_batch`] call performs — the revoke batch size.
 ///
 /// Frees never exceed edits, so this also bounds the BSS dealloc-output
-/// buffer (`MAX_REVOKE_NODES` entries × 8 bytes = 2 KiB). The caller copies
+/// buffer (`MAX_REVOKE_EDITS` entries × 8 bytes = 2 KiB). The caller copies
 /// the output buffer to a stack-local array of the same bound (so the
 /// DERIVATION write lock can be released before the dealloc loop), so
-/// keeping `MAX_REVOKE_NODES` small enough to fit on a 16 KiB kernel stack
+/// keeping `MAX_REVOKE_EDITS` small enough to fit on a 16 KiB kernel stack
 /// with breathing room is the binding constraint. Subtrees larger than one
 /// batch are handled by calling [`revoke_subtree_batch`] repeatedly until
 /// it reports no more work; the batch size bounds lock hold time and stack
 /// cost per call, not the revocable subtree size.
-pub const MAX_REVOKE_NODES: usize = 256;
+pub const MAX_REVOKE_EDITS: usize = 256;
 
 /// Output buffer for [`revoke_subtree_batch`]. `static mut` because the
 /// surrounding `DERIVATION_LOCK` write lock guarantees a single in-flight
 /// caller across all CPUs.
-#[cfg(not(test))]
-static mut REVOKE_OBJECTS: [Option<NonNull<KernelObjectHeader>>; MAX_REVOKE_NODES] =
-    [None; MAX_REVOKE_NODES];
+static mut REVOKE_OBJECTS: [Option<NonNull<KernelObjectHeader>>; MAX_REVOKE_EDITS] =
+    [None; MAX_REVOKE_EDITS];
 
-/// Revoke descendants of `root` with at most [`MAX_REVOKE_NODES`] O(1) tree
+/// How a [`revoke_subtree_batch`] call ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BatchStatus
+{
+    /// The root has no children left; the subtree is fully cleared.
+    Cleared,
+    /// The edit budget ran out with work remaining; call again after
+    /// releasing the lock, deallocating the collected objects, and
+    /// revalidating the root.
+    MoreWork,
+    /// A derivation link failed to resolve — an invariant violation (the
+    /// pre-unregister drain guarantees no live slot references a dead
+    /// `CSpace`). The dangling chain was truncated for containment; the
+    /// caller must surface an error rather than report a clean revoke.
+    DeadLink,
+}
+
+/// Revoke descendants of `root` with at most [`MAX_REVOKE_EDITS`] O(1) tree
 /// edits, returning a slice of object pointers for the caller to
-/// `dec_ref`/deallocate outside the lock, and whether the subtree may still
-/// hold unprocessed nodes.
+/// `dec_ref`/deallocate outside the lock, and how the batch ended.
 ///
-/// The root slot itself is NOT touched. When the returned flag is `false`,
-/// the root has no children (the subtree is fully cleared). When it is
-/// `true`, the caller must call again (re-acquiring the lock and
-/// revalidating the root in between). Every call performs at least one
-/// edit, and clearing a subtree of N nodes needs at most 2N edits in total
-/// (each node is hoisted at most once and freed exactly once), so repeated
-/// calls terminate against any fixed subtree in O(N) total work. Nodes
-/// derived concurrently between batches are still cleared, because the walk
-/// only ever operates on root's current child list.
+/// The root slot itself is NOT touched. On [`BatchStatus::MoreWork`] the
+/// caller must call again (re-acquiring the lock and revalidating the root
+/// in between); such a call performed exactly [`MAX_REVOKE_EDITS`] edits,
+/// and clearing a subtree of N nodes needs at most 2N edits in total (each
+/// node is hoisted at most once and freed exactly once), so repeated calls
+/// terminate against any fixed subtree in O(N) total work. Nodes derived
+/// concurrently between batches are still cleared, because the walk only
+/// ever operates on root's current child list.
 ///
 /// Each edit acts on the head `H` of root's child list in O(1):
 ///
@@ -364,10 +376,13 @@ static mut REVOKE_OBJECTS: [Option<NonNull<KernelObjectHeader>>; MAX_REVOKE_NODE
 ///
 /// Hoisting flattens the subtree in place: while a multi-batch revoke is in
 /// flight, surviving descendants may temporarily appear as direct children
-/// of root. That preserves the property revocation relies on — they remain
-/// descendants of root and of every ancestor above it — and if the revoke
-/// is abandoned (root deleted between batches), they stay reachable by
-/// ancestor revokes.
+/// of root. They remain descendants of root and of every ancestor above it,
+/// so ancestor revocation reach is preserved; intermediate parent→child
+/// edges inside the subtree are destroyed as the flattening proceeds, which
+/// is why the syscall pins the root against delete/move for the whole
+/// multi-batch operation (see `CapabilitySlot::revoke_in_progress`) — an
+/// abandoned half-flattened subtree would otherwise permanently outlive the
+/// intermediate holders' revocation authority.
 ///
 /// The returned slice borrows from [`REVOKE_OBJECTS`]; the caller must
 /// finish consuming it before any other call. The `DERIVATION_LOCK` held
@@ -375,19 +390,15 @@ static mut REVOKE_OBJECTS: [Option<NonNull<KernelObjectHeader>>; MAX_REVOKE_NODE
 ///
 /// # Safety
 ///
-/// Caller must hold `DERIVATION_LOCK` write lock.
-///
-/// A followed link may legitimately fail to resolve: when a `CSpace` dies,
-/// the pre-unregister drain redirects a foreign parent's child-list head to
-/// the dying slot's next sibling, which may itself be dying (see
-/// `drain_foreign_back_links`) — epoch validation then rejects the stale
-/// `SlotId` on lookup. Nodes chained behind such a link are unreachable by
-/// design (their linkage died with the `CSpace`); the walk truncates
-/// exactly the chain hanging from the dead link, logs it, and continues.
-#[cfg(not(test))]
+/// Caller must hold `DERIVATION_LOCK` write lock. Every derivation link
+/// reachable from a live slot resolves — `drain_dying_cspace` splices all
+/// foreign-facing links to surviving neighbours before a `CSpace`
+/// unregisters. A link that fails to resolve anyway is corruption: the walk
+/// truncates the chain hanging from it (containment), logs it, and reports
+/// [`BatchStatus::DeadLink`].
 pub unsafe fn revoke_subtree_batch(
     root: SlotId,
-) -> (&'static [Option<NonNull<KernelObjectHeader>>], bool)
+) -> (&'static [Option<NonNull<KernelObjectHeader>>], BatchStatus)
 {
     // SAFETY: DERIVATION_LOCK held → single-threaded access to the static
     // output buffer. Entries are written before `out_count` advances and
@@ -395,10 +406,9 @@ pub unsafe fn revoke_subtree_batch(
     // length are never observed.
     let out = unsafe { &mut *core::ptr::addr_of_mut!(REVOKE_OBJECTS) };
     let mut out_count: usize = 0;
-    // Tree edits this batch (hoists + frees + truncations). Distinct from
-    // `out_count`: hoists and objectless slots produce no dealloc entry,
-    // and the batch bound caps lock hold time by edits performed, not
-    // objects collected.
+    // Tree edits this batch (hoists + frees). Distinct from `out_count`:
+    // hoists and objectless slots produce no dealloc entry, and the batch
+    // bound caps lock hold time by edits performed, not objects collected.
     let mut steps: usize = 0;
 
     loop
@@ -407,62 +417,36 @@ pub unsafe fn revoke_subtree_batch(
         let Some(head) = (unsafe { resolve_slot_mut(root) }).and_then(|s| s.deriv_first_child)
         else
         {
-            // Root gone (its CSpace died) or childless: subtree cleared.
-            return (&out[..out_count], false);
+            // Childless root: subtree cleared. (An unresolvable root lands
+            // here too; the caller's per-batch revalidation is what tells a
+            // vanished root apart from a cleared subtree.)
+            return (&out[..out_count], BatchStatus::Cleared);
         };
 
-        // SAFETY: DERIVATION_LOCK held.
-        let Some(head_slot) = (unsafe { resolve_slot_mut(head) })
-        else
+        if !slot_exists(head)
         {
-            // Dead link left by a CSpace death (see Safety); the chain
-            // behind it is unreachable by design. Truncate it.
-            crate::kprintln!(
-                "cap: revoke: dead derivation link (cspace {} slot {}); truncating chain",
-                head.cspace_id,
-                head.index.get()
-            );
-            // SAFETY: DERIVATION_LOCK held; root resolved above.
-            if let Some(root_slot) = unsafe { resolve_slot_mut(root) }
-            {
-                root_slot.deriv_first_child = None;
-            }
-            steps += 1;
-            if steps >= MAX_REVOKE_NODES
-            {
-                return (&out[..out_count], true);
-            }
-            continue;
-        };
-        let grandchild = head_slot.deriv_first_child;
+            // SAFETY: DERIVATION_LOCK held (see Safety: corruption path).
+            unsafe { truncate_dead_link(root, head, "root child list") };
+            return (&out[..out_count], BatchStatus::DeadLink);
+        }
+        // SAFETY: DERIVATION_LOCK held; existence checked above.
+        let grandchild =
+            (unsafe { resolve_slot_mut(head) }).and_then(|slot| slot.deriv_first_child);
 
         if let Some(g) = grandchild
         {
-            // SAFETY: DERIVATION_LOCK held.
-            if unsafe { resolve_slot_mut(g) }.is_some()
+            if !slot_exists(g)
             {
-                // Hoist: g leaves head's child list and becomes root's
-                // first child (head keeps its own list position).
-                // SAFETY: DERIVATION_LOCK held; g and root are live.
-                unsafe {
-                    unlink_node(g);
-                    link_child(root, g);
-                }
+                // SAFETY: DERIVATION_LOCK held (see Safety: corruption path).
+                unsafe { truncate_dead_link(head, g, "child chain") };
+                return (&out[..out_count], BatchStatus::DeadLink);
             }
-            else
-            {
-                // Dead link (see Safety): head's child chain is
-                // unreachable behind it. Truncate; head is freed next.
-                crate::kprintln!(
-                    "cap: revoke: dead derivation link (cspace {} slot {}); truncating chain",
-                    g.cspace_id,
-                    g.index.get()
-                );
-                // SAFETY: DERIVATION_LOCK held; head resolved above.
-                if let Some(head_slot) = unsafe { resolve_slot_mut(head) }
-                {
-                    head_slot.deriv_first_child = None;
-                }
+            // Hoist: g leaves head's child list and becomes root's first
+            // child (head keeps its own list position).
+            // SAFETY: DERIVATION_LOCK held; g and root are live.
+            unsafe {
+                unlink_node(g);
+                link_child(root, g);
             }
         }
         else
@@ -477,10 +461,45 @@ pub unsafe fn revoke_subtree_batch(
         }
 
         steps += 1;
-        if steps >= MAX_REVOKE_NODES
+        if steps >= MAX_REVOKE_EDITS
         {
-            return (&out[..out_count], true);
+            return (&out[..out_count], BatchStatus::MoreWork);
         }
+    }
+}
+
+/// Return `true` if `id` resolves to a slot (its `CSpace` is registered
+/// with a matching epoch and the index is in range).
+fn slot_exists(id: SlotId) -> bool
+{
+    crate::cap::lookup_cspace(id.cspace_id, id.epoch)
+        // SAFETY: registry pointer valid while the entry resolves; brief
+        // immutable read under DERIVATION_LOCK.
+        .and_then(|cs| unsafe { (*cs).slot(id.index.get()) })
+        .is_some()
+}
+
+/// Containment for a dead derivation link: log it and cut `owner`'s
+/// `deriv_first_child`, abandoning the unreachable chain behind `dead`.
+///
+/// # Safety
+///
+/// Caller must hold `DERIVATION_LOCK` write lock.
+unsafe fn truncate_dead_link(owner: SlotId, dead: SlotId, context: &str)
+{
+    #[cfg(not(test))]
+    crate::kprintln!(
+        "cap: revoke: dead derivation link (cspace {} slot {}) in {}; truncating",
+        dead.cspace_id,
+        dead.index.get(),
+        context
+    );
+    #[cfg(test)]
+    let _ = (dead, context);
+    // SAFETY: DERIVATION_LOCK held (caller contract).
+    if let Some(owner_slot) = unsafe { resolve_slot_mut(owner) }
+    {
+        owner_slot.deriv_first_child = None;
     }
 }
 
@@ -492,7 +511,6 @@ pub unsafe fn revoke_subtree_batch(
 ///
 /// Caller must hold `DERIVATION_LOCK` write lock. `id` must be childless —
 /// its subtree already cleared or hoisted away.
-#[cfg(not(test))]
 unsafe fn unlink_free_collect(id: SlotId) -> Option<NonNull<KernelObjectHeader>>
 {
     // SAFETY: DERIVATION_LOCK held (caller contract).
@@ -553,5 +571,161 @@ mod tests
         assert_eq!(lock.state.load(Ordering::Relaxed), WRITE_LOCKED);
         lock.write_unlock();
         assert_eq!(lock.state.load(Ordering::Relaxed), 0);
+    }
+
+    // ── revoke_subtree_batch (host harness) ──────────────────────────────
+    //
+    // Each test registers heap-backed CSpaces in the shared test registry
+    // under ids unique to that test (the registry is a process-wide static
+    // and `cargo test` runs tests concurrently). Leaked Boxes are
+    // acceptable — the process exits after the run. The global
+    // DERIVATION_LOCK is taken for fidelity with the production contract.
+
+    use crate::cap::cspace::CSpace;
+    use crate::cap::slot::CapTag;
+    use core::num::NonZeroU32;
+
+    fn mk_registered_cspace(id: crate::cap::slot::CSpaceId, max_slots: usize) -> *mut CSpace
+    {
+        let cs = Box::leak(Box::new(CSpace::new(id, max_slots)));
+        crate::cap::register_cspace(id, cs).expect("register test cspace");
+        core::ptr::from_mut(cs)
+    }
+
+    /// Populate one slot (Endpoint tag, dangling object pointer — the batch
+    /// only collects object pointers, never dereferences them) and return
+    /// its stamped `SlotId`.
+    fn occupy(cs: *mut CSpace, id: crate::cap::slot::CSpaceId) -> SlotId
+    {
+        // SAFETY: single-threaded test ownership of the leaked CSpace.
+        let idx = unsafe { (*cs).allocate_slot() }.expect("allocate slot");
+        // SAFETY: as above.
+        let slot = unsafe { (*cs).slot_mut(idx.get()) }.expect("slot_mut");
+        slot.tag = CapTag::Endpoint;
+        slot.object = Some(NonNull::dangling());
+        SlotId::current(id, idx)
+    }
+
+    fn count_populated(cs: *mut CSpace) -> usize
+    {
+        // SAFETY: single-threaded test ownership.
+        unsafe { (*cs).populated_count() }
+    }
+
+    #[test]
+    fn revoke_batch_clears_mixed_tree_and_preserves_root()
+    {
+        const ID: crate::cap::slot::CSpaceId = 3101;
+        let cs = mk_registered_cspace(ID, 512);
+        let root = occupy(cs, ID);
+        DERIVATION_LOCK.write_lock();
+        for _ in 0..3
+        {
+            let child = occupy(cs, ID);
+            // SAFETY: DERIVATION_LOCK held; both slots live.
+            unsafe { link_child(root, child) };
+            for _ in 0..4
+            {
+                let grandchild = occupy(cs, ID);
+                // SAFETY: as above.
+                unsafe { link_child(child, grandchild) };
+            }
+        }
+        // SAFETY: DERIVATION_LOCK held.
+        let (objects, status) = unsafe { revoke_subtree_batch(root) };
+        assert_eq!(status, BatchStatus::Cleared);
+        assert_eq!(objects.len(), 15, "3 children + 12 grandchildren collected");
+        DERIVATION_LOCK.write_unlock();
+
+        assert_eq!(count_populated(cs), 1, "only the root survives");
+        // SAFETY: test ownership.
+        let root_slot = unsafe { (*cs).slot_mut(root.index.get()) }.expect("root slot");
+        assert_eq!(root_slot.tag, CapTag::Endpoint, "root untouched");
+        assert_eq!(root_slot.deriv_first_child, None, "root childless");
+        crate::cap::unregister_cspace(ID);
+    }
+
+    #[test]
+    fn revoke_batch_edit_budget_and_hoist_visibility()
+    {
+        const ID: crate::cap::slot::CSpaceId = 3102;
+        // A chain of N nodes needs 2N-1 edits (N-1 hoists + N frees), so
+        // N = 150 forces exactly one MoreWork boundary at 256 edits.
+        const CHAIN: usize = 150;
+        let cs = mk_registered_cspace(ID, 512);
+        let root = occupy(cs, ID);
+        DERIVATION_LOCK.write_lock();
+        let mut parent = root;
+        for _ in 0..CHAIN
+        {
+            let child = occupy(cs, ID);
+            // SAFETY: DERIVATION_LOCK held; both slots live.
+            unsafe { link_child(parent, child) };
+            parent = child;
+        }
+
+        // SAFETY: DERIVATION_LOCK held.
+        let (first_objects, first_status) = unsafe { revoke_subtree_batch(root) };
+        assert_eq!(first_status, BatchStatus::MoreWork);
+        let first_freed = first_objects.len();
+        assert!(
+            first_freed < CHAIN,
+            "budgeted batch must leave survivors ({first_freed} freed)"
+        );
+
+        // Hoist visibility between batches: every survivor is now a direct
+        // child of the root.
+        let mut survivors = 0;
+        // SAFETY: DERIVATION_LOCK held.
+        let mut cur = unsafe { resolve_slot_mut(root) }
+            .expect("root")
+            .deriv_first_child;
+        while let Some(node) = cur
+        {
+            // SAFETY: DERIVATION_LOCK held.
+            let slot = unsafe { resolve_slot_mut(node) }.expect("survivor resolves");
+            assert_eq!(slot.deriv_parent, Some(root), "survivor hoisted under root");
+            survivors += 1;
+            cur = slot.deriv_next_sibling;
+        }
+        assert_eq!(survivors, CHAIN - first_freed);
+
+        // SAFETY: DERIVATION_LOCK held.
+        let (second_objects, second_status) = unsafe { revoke_subtree_batch(root) };
+        assert_eq!(second_status, BatchStatus::Cleared);
+        assert_eq!(first_freed + second_objects.len(), CHAIN);
+        DERIVATION_LOCK.write_unlock();
+
+        assert_eq!(count_populated(cs), 1, "only the root survives");
+        crate::cap::unregister_cspace(ID);
+    }
+
+    #[test]
+    fn revoke_batch_dead_link_truncates_and_reports()
+    {
+        const ID_A: crate::cap::slot::CSpaceId = 3103;
+        const ID_B: crate::cap::slot::CSpaceId = 3104;
+        let cs_a = mk_registered_cspace(ID_A, 64);
+        let cs_b = mk_registered_cspace(ID_B, 64);
+        let root = occupy(cs_a, ID_A);
+        DERIVATION_LOCK.write_lock();
+        let foreign_child = occupy(cs_b, ID_B);
+        // SAFETY: DERIVATION_LOCK held; both slots live.
+        unsafe { link_child(root, foreign_child) };
+
+        // Simulate the corruption the drain invariant forbids: the child's
+        // CSpace vanishes without its foreign back-links being spliced.
+        crate::cap::unregister_cspace(ID_B);
+
+        // SAFETY: DERIVATION_LOCK held.
+        let (objects, status) = unsafe { revoke_subtree_batch(root) };
+        assert_eq!(status, BatchStatus::DeadLink);
+        assert!(objects.is_empty(), "nothing collectable behind a dead link");
+        // Containment: the dangling chain is cut so a retry cannot spin.
+        // SAFETY: DERIVATION_LOCK held.
+        let root_slot = unsafe { resolve_slot_mut(root) }.expect("root");
+        assert_eq!(root_slot.deriv_first_child, None);
+        DERIVATION_LOCK.write_unlock();
+        crate::cap::unregister_cspace(ID_A);
     }
 }

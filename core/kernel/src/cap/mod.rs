@@ -2456,6 +2456,15 @@ pub unsafe fn move_cap_between_cspaces(
         {
             return Err(SyscallError::InvalidCapability);
         }
+        // A revoke is mid-flight on this slot (see
+        // `CapabilitySlot::revoke_in_progress`): moving the root between
+        // revoke batches would abandon its temporarily hoisted survivors
+        // and sever intermediate revocation edges. Transient — the move
+        // can be retried once the revoke completes.
+        if slot.revoke_in_progress()
+        {
+            return Err(SyscallError::InvalidState);
+        }
         (
             slot.tag,
             slot.rights,

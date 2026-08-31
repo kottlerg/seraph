@@ -568,7 +568,8 @@ pub struct CapabilitySlot
     /// `pad[0]` doubles as the intrusive free-list membership marker
     /// ([`FREE_LIST_MARKER`] when the Null slot is linked on a `CSpace` free
     /// list); `pad[1]` holds the per-slot generation counter (see
-    /// [`CapabilitySlot::generation`]); `pad[2]` is always zero.
+    /// [`CapabilitySlot::generation`]); `pad[2]` holds the revoke-in-progress
+    /// marker (see [`CapabilitySlot::revoke_in_progress`]).
     pad: [u8; 3],
     /// Rights bitmask (type-specific).
     pub rights: Rights,
@@ -675,6 +676,31 @@ impl CapabilitySlot
     pub fn bump_generation(&mut self)
     {
         self.pad[1] = self.pad[1].wrapping_add(1);
+    }
+
+    // ── Revoke-in-progress marker (`pad[2]`) ──────────────────────────────────
+
+    /// Return `true` if a multi-batch `SYS_CAP_REVOKE` is in flight on this
+    /// slot (marker stored in `pad[2]`).
+    ///
+    /// While set, `SYS_CAP_DELETE` and `SYS_CAP_MOVE` refuse to act on the
+    /// slot: deleting or moving a revoke root between batches would promote
+    /// its temporarily hoisted survivors and permanently sever intermediate
+    /// revocation edges (see the revocation algorithm in
+    /// `capability-internals.md`). Read and written only under
+    /// `DERIVATION_LOCK`; cleared by [`clear`](Self::clear) /
+    /// [`clear_keep_generation`](Self::clear_keep_generation) when the slot
+    /// is recycled.
+    pub fn revoke_in_progress(&self) -> bool
+    {
+        self.pad[2] != 0
+    }
+
+    /// Set or clear the revoke-in-progress marker (see
+    /// [`revoke_in_progress`](Self::revoke_in_progress)).
+    pub fn set_revoke_in_progress(&mut self, active: bool)
+    {
+        self.pad[2] = u8::from(active);
     }
 
     // ── Intrusive free-list helpers ───────────────────────────────────────────

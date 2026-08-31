@@ -1572,6 +1572,16 @@ pub fn sys_cap_delete(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 crate::cap::DERIVATION_LOCK.write_unlock();
                 return Err(SyscallError::InvalidCapability);
             }
+            // A revoke is mid-flight on this slot (see
+            // `CapabilitySlot::revoke_in_progress`): deleting the root
+            // between revoke batches would promote its temporarily hoisted
+            // survivors and sever intermediate revocation edges.
+            // Transient — retry after the revoke completes.
+            if slot.revoke_in_progress()
+            {
+                crate::cap::DERIVATION_LOCK.write_unlock();
+                return Err(SyscallError::InvalidState);
+            }
             let Some(obj) = slot.object
             else
             {
@@ -1683,17 +1693,24 @@ pub fn sys_cap_revoke(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         core::num::NonZeroU32::new(slot_idx).ok_or(SyscallError::InvalidCapability)?;
     let root = crate::cap::slot::SlotId::current(cspace_id, slot_idx_nz);
 
-    // Revoke the subtree in batches of up to MAX_REVOKE_NODES nodes. Per
-    // batch: revalidate the root and clear one batch under the lock, then
+    // Revoke the subtree in batches of up to MAX_REVOKE_EDITS constant-time
+    // tree edits (see the revocation algorithm in capability-internals.md).
+    // Per batch: revalidate the root and run one batch under the lock, then
     // snapshot the dealloc list to a stack-local array so the lock is
     // released before calling `dealloc_object` (which may acquire the frame
     // allocator and other inner locks — see the safety doc on
-    // `dealloc_object`). Re-descending from the root each batch also picks
-    // up children derived concurrently between batches, so the subtree is
-    // fully cleared at return regardless of size.
+    // `dealloc_object`).
+    //
+    // The root carries the revoke-in-progress marker for the whole
+    // multi-batch operation so SYS_CAP_DELETE / SYS_CAP_MOVE cannot act on
+    // it between batches — that would promote the temporarily hoisted
+    // survivors and permanently sever intermediate revocation edges. The
+    // marker is cleared under the lock on every exit path; the thread never
+    // leaves the kernel mid-loop, so the marker cannot leak. A root freed
+    // mid-revoke sheds the marker with the slot (clear_keep_generation).
     let mut snapshot: [Option<core::ptr::NonNull<crate::cap::object::KernelObjectHeader>>;
-        crate::cap::derivation::MAX_REVOKE_NODES] =
-        [None; crate::cap::derivation::MAX_REVOKE_NODES];
+        crate::cap::derivation::MAX_REVOKE_EDITS] =
+        [None; crate::cap::derivation::MAX_REVOKE_EDITS];
     let mut first_batch = true;
     loop
     {
@@ -1731,37 +1748,95 @@ pub fn sys_cap_revoke(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             };
         }
 
+        if first_batch
+        {
+            // A marker already set means another thread's revoke is in
+            // flight on this slot; refuse rather than interleave two
+            // marker lifetimes on one root.
+            // SAFETY: caller_cspace validated; marker accessed only under
+            // DERIVATION_LOCK.
+            let already = unsafe {
+                (*caller_cspace)
+                    .slot_mut(slot_idx)
+                    .is_none_or(|slot| slot.revoke_in_progress())
+            };
+            if already
+            {
+                crate::cap::DERIVATION_LOCK.write_unlock();
+                return Err(SyscallError::InvalidState);
+            }
+            // SAFETY: as above.
+            unsafe { set_revoke_marker(caller_cspace, slot_idx, true) };
+        }
+
         // SAFETY: DERIVATION_LOCK held; root is a valid SlotId.
-        let (objects, more) = unsafe { crate::cap::derivation::revoke_subtree_batch(root) };
+        let (objects, status) = unsafe { crate::cap::derivation::revoke_subtree_batch(root) };
         let snapshot_count = objects.len();
-        debug_assert!(snapshot_count <= crate::cap::derivation::MAX_REVOKE_NODES);
+        debug_assert!(snapshot_count <= crate::cap::derivation::MAX_REVOKE_EDITS);
         snapshot[..snapshot_count].copy_from_slice(objects);
+        if status != crate::cap::derivation::BatchStatus::MoreWork
+        {
+            // Final batch: release the root before dropping the lock.
+            // SAFETY: caller_cspace validated; marker accessed only under
+            // DERIVATION_LOCK.
+            unsafe { set_revoke_marker(caller_cspace, slot_idx, false) };
+        }
         crate::cap::DERIVATION_LOCK.write_unlock();
 
-        // Dec-ref and free objects outside the lock.
-        for entry in &snapshot[..snapshot_count]
-        {
-            let Some(obj_ptr) = *entry
-            else
-            {
-                continue;
-            };
-            // SAFETY: obj_ptr from revoke_subtree_batch; was a live capability object.
-            let remaining = unsafe { (*obj_ptr.as_ptr()).dec_ref() };
-            if remaining == 0
-            {
-                // SAFETY: refcount reached 0; no other references exist.
-                unsafe {
-                    crate::cap::object::dealloc_object(obj_ptr);
-                }
-            }
-        }
+        dealloc_revoked(&snapshot[..snapshot_count]);
 
-        if !more
+        match status
         {
-            return Ok(0);
+            crate::cap::derivation::BatchStatus::Cleared => return Ok(0),
+            crate::cap::derivation::BatchStatus::DeadLink =>
+            {
+                return Err(SyscallError::InvalidState);
+            }
+            crate::cap::derivation::BatchStatus::MoreWork =>
+            {}
         }
         first_batch = false;
+    }
+}
+
+/// Set or clear the revoke-in-progress marker on `slot_idx` of `cspace`.
+///
+/// # Safety
+///
+/// Caller must hold `DERIVATION_LOCK` (the marker's synchronisation domain)
+/// and `cspace` must be a valid `CSpace` pointer.
+#[cfg(not(test))]
+unsafe fn set_revoke_marker(cspace: *mut crate::cap::cspace::CSpace, slot_idx: u32, active: bool)
+{
+    // SAFETY: caller contract.
+    if let Some(slot) = unsafe { (*cspace).slot_mut(slot_idx) }
+    {
+        slot.set_revoke_in_progress(active);
+    }
+}
+
+/// Dec-ref each collected object and deallocate those that reach refcount
+/// zero. Must run outside `DERIVATION_LOCK` — `dealloc_object` may acquire
+/// the frame allocator and other inner locks.
+#[cfg(not(test))]
+fn dealloc_revoked(snapshot: &[Option<core::ptr::NonNull<crate::cap::object::KernelObjectHeader>>])
+{
+    for entry in snapshot
+    {
+        let Some(obj_ptr) = *entry
+        else
+        {
+            continue;
+        };
+        // SAFETY: obj_ptr from revoke_subtree_batch; was a live capability object.
+        let remaining = unsafe { (*obj_ptr.as_ptr()).dec_ref() };
+        if remaining == 0
+        {
+            // SAFETY: refcount reached 0; no other references exist.
+            unsafe {
+                crate::cap::object::dealloc_object(obj_ptr);
+            }
+        }
     }
 }
 

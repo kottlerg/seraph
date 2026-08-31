@@ -176,7 +176,8 @@ A capability to a capability space. Rights:
 - **Insert** — may place a new capability into a slot
 - **Delete** — may clear a slot
 - **Derive** — may derive a new capability from an existing slot
-- **Revoke** — may revoke a capability and all its descendants
+- **Revoke** — may revoke all descendants of a capability (the target slot
+  itself is preserved; see [Revocation](#revocation))
 
 CSpace capabilities are used when configuring a new thread (binding a CSpace to
 the thread) and when cross-CSpace capability operations are needed (e.g. init

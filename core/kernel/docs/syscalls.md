@@ -242,9 +242,13 @@ IPC buffer page after the server replies.
 
 **Capability requirement:** `endpoint_cap` must have Send rights.
 
-**Errors:** `InvalidCapability`, `InsufficientRights`, `InvalidArgument` (bad count,
-or extended payload requested but IPC buffer page not registered or unmapped),
-`Interrupted`.
+**Errors:** `InvalidCapability` (also: a cap slot is stale or Null),
+`InsufficientRights`, `InvalidArgument` (bad count, a cap slot repeated in one
+message, or extended payload requested but IPC buffer page not registered or
+unmapped), `InvalidState` (a cap slot is pinned by an in-flight
+`SYS_CAP_REVOKE`), `Interrupted`. Cap-slot problems are rejected before the
+caller blocks; a refusal that arises only afterwards degrades to delivery with
+zero caps (the caller keeps its capabilities).
 
 ---
 

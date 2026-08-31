@@ -38,6 +38,7 @@ static mut CAP_XFER_STACK: ChildStack = ChildStack::ZERO;
 static mut BADGE_STACK: ChildStack = ChildStack::ZERO;
 static mut SNAPSHOT_STACK: ChildStack = ChildStack::ZERO;
 static mut REPLY_OOM_STACK: ChildStack = ChildStack::ZERO;
+static mut DUP_REPLY_STACK: ChildStack = ChildStack::ZERO;
 static mut RECV_OOM_STACK: ChildStack = ChildStack::ZERO;
 
 // ── SYS_IPC_CALL / SYS_IPC_RECV / SYS_IPC_REPLY ─────────────────────────────
@@ -896,6 +897,125 @@ fn reply_oom_caller_entry(arg: u64) -> !
             notification_send(done_slot, 0xBAD).ok();
         }
     }
+    thread_exit()
+}
+
+// ── duplicate cap-slot rejection ─────────────────────────────────────────────
+
+/// `sys_ipc_call` rejects a message that packs the same cap slot twice,
+/// before the caller blocks.
+///
+/// A repeated index would make the transfer's second move observe the Null
+/// slot the first move freed; the kernel refuses the message up front with
+/// `InvalidArgument` and the caller keeps its capabilities.
+pub fn call_duplicate_cap_slot_rejected(ctx: &TestContext) -> TestResult
+{
+    let ep = cap_create_endpoint(ctx.memory_base)
+        .map_err(|_| "cap_create_endpoint for call_dup test failed")?;
+    let xfer = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "cap_create_notification for call_dup test failed")?;
+
+    let msg = IpcMessage::builder(0xD0D0).cap(xfer).cap(xfer).build();
+    // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
+    let attempt = unsafe { ipc::ipc_call(ep, &msg, ctx.ipc_buf) };
+    match attempt
+    {
+        Err(code) if code == syscall_abi::SyscallError::InvalidArgument as i64 =>
+        {}
+        Err(_) => return Err("call_dup: wrong error code for duplicate cap slot"),
+        Ok(_) => return Err("call_dup: duplicate-cap call succeeded unexpectedly"),
+    }
+    // The refused transfer left the cap untouched.
+    notification_send(xfer, 0x1).map_err(|_| "call_dup: cap lost after refused call")?;
+
+    cap_delete(xfer).ok();
+    cap_delete(ep).ok();
+    Ok(())
+}
+
+/// A reply that packs the same cap slot twice is refused with
+/// `InvalidArgument` at the server, and the waiting caller un-parks with
+/// the synthetic `IPC_REPLY_TRANSFER_FAILED` label instead of being
+/// stranded.
+pub fn reply_duplicate_cap_slot_rejected(ctx: &TestContext) -> TestResult
+{
+    let ep = cap_create_endpoint(ctx.memory_base)
+        .map_err(|_| "cap_create_endpoint for reply_dup test failed")?;
+    let done = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "cap_create_notification for reply_dup test failed")?;
+    let xfer = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "cap_create_notification(xfer) for reply_dup test failed")?;
+
+    let child = crate::spawn::new_child(ctx).map_err(|_| "reply_dup: spawn::new_child failed")?;
+    let child_ep = cap_copy(ep, child.cs, RIGHTS_EP_SEND_GRANT)
+        .map_err(|_| "cap_copy ep for reply_dup test failed")?;
+    let child_done = cap_copy(done, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
+        .map_err(|_| "cap_copy done for reply_dup test failed")?;
+    let child_arg = u64::from(child_ep) | (u64::from(child_done) << 16);
+    let stack_top = ChildStack::top(core::ptr::addr_of!(DUP_REPLY_STACK));
+    crate::spawn::configure_and_start(&child, dup_reply_caller_entry, stack_top, child_arg)
+        .map_err(|_| "reply_dup: configure_and_start failed")?;
+
+    // Receive the child's call, then reply with one slot repeated.
+    // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
+    let msg = unsafe { ipc::ipc_recv(ep, ctx.ipc_buf) }
+        .map_err(|_| "ipc_recv for reply_dup test failed")?;
+    if msg.label != 0xCAFE
+    {
+        return Err("reply_dup: ipc_recv returned wrong label");
+    }
+    let cap_reply = IpcMessage::builder(0xBEEF).cap(xfer).cap(xfer).build();
+    // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
+    let attempt = unsafe { ipc::ipc_reply(&cap_reply, ctx.ipc_buf) };
+    match attempt
+    {
+        Err(code) if code == syscall_abi::SyscallError::InvalidArgument as i64 =>
+        {}
+        Err(_) => return Err("reply_dup: wrong error code for duplicate cap slot"),
+        Ok(()) => return Err("reply_dup: duplicate-cap reply succeeded unexpectedly"),
+    }
+
+    // The child must have un-parked observing the synthetic label.
+    let done_bits =
+        notification_wait(done).map_err(|_| "notification_wait(done) for reply_dup failed")?;
+    if done_bits != 0xFA11
+    {
+        return Err("reply_dup: child did not observe IPC_REPLY_TRANSFER_FAILED");
+    }
+    // The refused transfer left the server's cap untouched.
+    notification_send(xfer, 0x1).map_err(|_| "reply_dup: cap lost after refused reply")?;
+
+    cap_delete(child.th).ok();
+    cap_delete(ep).ok();
+    cap_delete(done).ok();
+    cap_delete(xfer).ok();
+    cap_delete(child.cs).ok();
+    Ok(())
+}
+
+/// Child for `reply_duplicate_cap_slot_rejected`: registers its IPC buffer
+/// and issues an `ipc_call`; reports `0xFA11` if the kernel-synthesised
+/// `IPC_REPLY_TRANSFER_FAILED` label arrives, `0xBAD` otherwise.
+fn dup_reply_caller_entry(arg: u64) -> !
+{
+    let ep_slot = (arg & 0xFFFF) as u32;
+    let done_slot = ((arg >> 16) & 0xFFFF) as u32;
+
+    let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
+    if syscall::ipc_buffer_set(buf_addr).is_err()
+    {
+        notification_send(done_slot, 0xBAD).ok();
+        thread_exit()
+    }
+
+    // SAFETY: buf_addr was registered as this thread's IPC buffer above.
+    let reply = unsafe { ipc::ipc_call(ep_slot, &IpcMessage::new(0xCAFE), buf_addr as *mut u64) };
+    let bits = match reply
+    {
+        Ok(msg) if msg.label == syscall_abi::IPC_REPLY_TRANSFER_FAILED => 0xFA11,
+        _ => 0xBAD,
+    };
+    notification_send(done_slot, bits).ok();
     thread_exit()
 }
 

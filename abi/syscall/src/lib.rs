@@ -500,11 +500,15 @@ pub const MSG_CAP_SLOTS_MAX: usize = 4;
 pub const MSG_REGS_DATA_MAX: usize = 6;
 
 /// Synthetic reply label written to the caller's IPC message by the kernel
-/// when `SYS_IPC_REPLY` rejects the server's reply before delivery
-/// (caller's `CSpace` cannot accept reply caps, server cap-slot lookup
-/// failed, malformed IPC buffer, etc.). The caller un-parks with this
-/// label so it can surface a graceful failure instead of dead-locking.
-/// Reserved by the kernel; servers must not produce this label themselves.
+/// when `SYS_IPC_REPLY` cannot deliver the server's reply intact: rejected
+/// before delivery (caller's `CSpace` cannot accept reply caps, server
+/// cap-slot lookup failed, malformed IPC buffer), or the reply-cap transfer
+/// refused after the caller was claimed (a reply cap slot went stale, was
+/// repeated, or is pinned by an in-flight `SYS_CAP_REVOKE`) — in the latter
+/// case this label replaces the already-staged reply. The caller un-parks
+/// with this label so it can surface a graceful failure instead of
+/// dead-locking. Reserved by the kernel; servers must not produce this
+/// label themselves.
 pub const IPC_REPLY_TRANSFER_FAILED: u64 = u64::MAX;
 
 // ── Mapping protection bits ──────────────────────────────────────────────────

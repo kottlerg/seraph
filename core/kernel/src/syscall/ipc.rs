@@ -258,32 +258,9 @@ unsafe fn transfer_caps(
 
     // Lock both CSpaces in pointer address order to prevent deadlock when two
     // threads transfer caps between the same pair of CSpaces concurrently.
-    // SAFETY: Locking in deterministic order (lower address first) prevents
-    // ABBA deadlock. CSpace pointers validated by caller.
-    let (saved1, saved2) = unsafe {
-        use core::cmp::Ordering;
-        match src_cspace.cmp(&dst_cspace)
-        {
-            Ordering::Less =>
-            {
-                let s1 = (*src_cspace).lock.lock_raw();
-                let s2 = (*dst_cspace).lock.lock_raw();
-                (s1, s2)
-            }
-            Ordering::Greater =>
-            {
-                let s2 = (*dst_cspace).lock.lock_raw();
-                let s1 = (*src_cspace).lock.lock_raw();
-                (s1, s2)
-            }
-            Ordering::Equal =>
-            {
-                // src_cspace == dst_cspace: same-process IPC, lock once.
-                let s = (*src_cspace).lock.lock_raw();
-                (s, 0)
-            }
-        }
-    };
+    // SAFETY: both CSpace pointers validated above; released via
+    // unlock_cspace_pair with the same argument order.
+    let (saved1, saved2) = unsafe { crate::cap::lock_cspace_pair(src_cspace, dst_cspace) };
 
     // Re-validate under the locks: a source slot can be freed, or gain a
     // revoke-in-progress marker, between the unlocked pre-validation and
@@ -315,7 +292,7 @@ unsafe fn transfer_caps(
             };
             if let Some(e) = err
             {
-                // SAFETY: saved1/saved2 from the lock_raw calls above.
+                // SAFETY: saved1/saved2 from the lock_cspace_pair call above.
                 unsafe { crate::cap::unlock_cspace_pair(src_cspace, dst_cspace, saved1, saved2) };
                 crate::cap::DERIVATION_LOCK.write_unlock();
                 return Err(e);
@@ -349,6 +326,44 @@ unsafe fn transfer_caps(
 }
 
 // ── IPC syscall handlers ──────────────────────────────────────────────────────
+
+/// Fail-fast validation of a call's cap slots before the caller blocks:
+/// distinct, non-null, and not pinned by an in-flight revoke. Mirrors
+/// `transfer_caps`' authoritative locked checks — a refusal detected only
+/// after the caller has blocked degrades to zero-cap delivery without
+/// notifying the sender, so the sender must learn of a doomed transfer
+/// here.
+///
+/// # Safety
+///
+/// `cspace_ptr` must be a valid live `CSpace` pointer.
+#[cfg(not(test))]
+unsafe fn prevalidate_call_caps(
+    cspace_ptr: *mut CSpace,
+    indices: &[u32; MSG_CAP_SLOTS_MAX],
+    cap_count: usize,
+) -> Result<(), SyscallError>
+{
+    // SAFETY: caller contract.
+    let cs = unsafe { &*cspace_ptr };
+    for (i, &idx) in indices.iter().take(cap_count).enumerate()
+    {
+        if indices[..i].contains(&idx)
+        {
+            return Err(SyscallError::InvalidArgument);
+        }
+        let slot = cs.slot(idx).ok_or(SyscallError::InvalidCapability)?;
+        if slot.tag == CapTag::Null
+        {
+            return Err(SyscallError::InvalidCapability);
+        }
+        if slot.revoke_in_progress()
+        {
+            return Err(SyscallError::InvalidState);
+        }
+    }
+    Ok(())
+}
 
 /// Move the caps carried by a `SYS_IPC_CALL` message from the running caller's
 /// `CSpace` into a server that was already blocked in recv, stashing the
@@ -492,7 +507,10 @@ unsafe fn consume_call_disposition(
 ///
 /// If `cap_count` > 0, the endpoint cap must have `EpRights::GRANT`. Capabilities
 /// at the specified slots are moved from the caller's `CSpace` to the server's
-/// `CSpace` atomically with the message.
+/// `CSpace` all-or-nothing with the message: doomed transfers (duplicate,
+/// stale, or revoke-pinned slots) are rejected before blocking; a refusal that
+/// arises only after the caller has blocked degrades to delivery with zero
+/// caps (the caller keeps its capabilities).
 ///
 /// Blocks caller until a server replies. On return, label and data words are
 /// in the return registers and IPC buffer. Reply-direction cap indices are
@@ -563,19 +581,8 @@ pub fn sys_ipc_call(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     if cap_count > 0
     {
         let indices = unpack_cap_slots(cap_packed, cap_count);
-        // Pre-validate source slots before blocking (all-or-nothing).
-        {
-            // SAFETY: cspace_ptr validated above.
-            let cs = unsafe { &*cspace_ptr };
-            for &idx in indices.iter().take(cap_count)
-            {
-                let slot = cs.slot(idx).ok_or(SyscallError::InvalidCapability)?;
-                if slot.tag == CapTag::Null
-                {
-                    return Err(SyscallError::InvalidCapability);
-                }
-            }
-        }
+        // SAFETY: cspace_ptr validated above.
+        unsafe { prevalidate_call_caps(cspace_ptr, &indices, cap_count) }?;
         msg.cap_slots = indices;
         msg.cap_count = cap_count;
     }

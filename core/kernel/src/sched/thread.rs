@@ -214,7 +214,7 @@ pub struct EnqueueBreadcrumb
 pub const PARK_DISPOSITION_NONE: u8 = 0;
 
 /// A reply message was deposited into `ipc_msg` (`sys_ipc_reply`'s normal arm
-/// or `fail_reply_and_wake_caller`'s synthetic failure reply). Stamped only
+/// or `deposit_transfer_failed_reply`'s synthetic failure reply). Stamped only
 /// for reply-bound (`sys_ipc_call`) episodes.
 pub const PARK_DISPOSITION_REPLY: u8 = 1;
 

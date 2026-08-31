@@ -2401,6 +2401,44 @@ fn nonnull_from_box<T>(b: Box<T>) -> NonNull<KernelObjectHeader>
     unsafe { NonNull::new_unchecked(raw) }
 }
 
+/// Acquire a pair of `CSpace` locks in pointer-address order (lower address
+/// first, preventing ABBA deadlock between concurrent pairs; a same-pointer
+/// pair is locked once). Returns the saved interrupt states to hand back to
+/// [`unlock_cspace_pair`] with the same `(a, b)` argument order.
+///
+/// # Safety
+///
+/// `a` and `b` must be valid `CSpace` pointers; the acquisition must be
+/// released exactly once via [`unlock_cspace_pair`].
+#[cfg(not(test))]
+pub(crate) unsafe fn lock_cspace_pair(a: *mut CSpace, b: *mut CSpace) -> (u64, u64)
+{
+    // SAFETY: caller contract.
+    unsafe {
+        use core::cmp::Ordering;
+        match a.cmp(&b)
+        {
+            Ordering::Less =>
+            {
+                let sa = (*a).lock.lock_raw();
+                let sb = (*b).lock.lock_raw();
+                (sa, sb)
+            }
+            Ordering::Greater =>
+            {
+                let sb = (*b).lock.lock_raw();
+                let sa = (*a).lock.lock_raw();
+                (sa, sb)
+            }
+            Ordering::Equal =>
+            {
+                let sa = (*a).lock.lock_raw();
+                (sa, 0)
+            }
+        }
+    }
+}
+
 /// Release a pair of `CSpace` locks taken in pointer-address order, in
 /// reverse order of acquisition (same-pointer pairs were locked once).
 ///

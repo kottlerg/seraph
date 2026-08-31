@@ -639,6 +639,9 @@ mod tests
         }
     }
 
+    /// [`occupy`] `len` slots up front, before the caller takes
+    /// `DERIVATION_LOCK` — no fallible allocation may run under the global
+    /// lock (a panic there would wedge the whole suite).
     fn occupy_many(
         cs: *mut CSpace,
         id: crate::cap::slot::CSpaceId,
@@ -781,16 +784,14 @@ mod tests
         let collected = objects.len();
         // No panics while the global lock is held — capture, unlock, assert.
         // SAFETY: DERIVATION_LOCK held.
-        let root_resolved = unsafe { resolve_slot_mut(root) }.is_some();
-        // SAFETY: DERIVATION_LOCK held.
-        let root_child = unsafe { resolve_slot_mut(root) }.and_then(|s| s.deriv_first_child);
+        let root_state = unsafe { resolve_slot_mut(root) }.map(|s| s.deriv_first_child);
         DERIVATION_LOCK.write_unlock();
 
         assert_eq!(status, BatchStatus::DeadLink);
         assert_eq!(collected, 0, "nothing collectable behind a dead link");
-        assert!(root_resolved, "root must still resolve");
-        // Containment: the dangling chain is cut so a retry cannot spin.
-        assert_eq!(root_child, None);
+        // Containment: the dangling chain is cut so a retry cannot spin
+        // (root still resolves; its child list is empty).
+        assert_eq!(root_state, Some(None));
         crate::cap::unregister_cspace(ID_A);
     }
 }

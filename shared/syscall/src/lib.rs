@@ -1507,19 +1507,28 @@ pub fn cap_revoke(slot: u32) -> Result<(), i64>
 /// stops. The call sites that must fully clear a subtree before releasing
 /// its root (teardown/reclaim paths) use this form.
 ///
+/// Retries are bounded: each `Interrupted` round already represents ~10^8
+/// kernel-side edits, so exhausting the bound means an adversarial deriver
+/// is outpacing revocation indefinitely — the caller gets the final
+/// `Interrupted` back rather than this wrapper spinning forever.
+///
 /// # Errors
-/// As for [`cap_revoke`], minus `Interrupted`.
+/// As for [`cap_revoke`]; `Interrupted` only after the retry bound.
 pub fn cap_revoke_all(slot: u32) -> Result<(), i64>
 {
-    loop
+    const MAX_RETRIES: u32 = 4096;
+    let mut last = Ok(());
+    for _ in 0..MAX_RETRIES
     {
-        match cap_revoke(slot)
+        last = cap_revoke(slot);
+        match last
         {
             Err(e) if e == SyscallError::Interrupted as i64 =>
             {}
             other => return other,
         }
     }
+    last
 }
 
 /// Move a capability to another `CSpace` (`SYS_CAP_MOVE`).

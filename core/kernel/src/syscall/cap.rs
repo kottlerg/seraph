@@ -1716,10 +1716,10 @@ pub fn sys_cap_revoke(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // multi-batch operation so SYS_CAP_DELETE / SYS_CAP_MOVE / IPC transfer
     // cannot act on it between batches — that would promote the temporarily
     // hoisted survivors and permanently sever intermediate revocation
-    // edges. The marker is cleared under the lock on every exit path; the
-    // thread never leaves the kernel mid-loop, so the marker cannot leak. A
-    // root freed mid-revoke sheds the marker on the free path
-    // (`set_next_free` zeroes it).
+    // edges. The marker is cleared under the lock on every exit path —
+    // completion, dead-link error, and the Interrupted backstop alike — so
+    // it cannot leak. A root freed mid-revoke sheds the marker on the free
+    // path (`set_next_free` zeroes it).
     let mut snapshot: [Option<core::ptr::NonNull<crate::cap::object::KernelObjectHeader>>;
         crate::cap::derivation::MAX_REVOKE_EDITS] =
         [None; crate::cap::derivation::MAX_REVOKE_EDITS];
@@ -1976,29 +1976,9 @@ pub fn sys_cap_move(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         // DERIVATION_LOCK → cspace.lock(s) (matches transfer_caps).
         crate::cap::DERIVATION_LOCK.write_lock();
         // SAFETY: both CSpace pointers valid; address-ordered acquisition.
-        let (saved1, saved2) = unsafe {
-            use core::cmp::Ordering;
-            match caller_cspace.cmp(&dest_cs_ptr)
-            {
-                Ordering::Less =>
-                {
-                    let s1 = (*caller_cspace).lock.lock_raw();
-                    let s2 = (*dest_cs_ptr).lock.lock_raw();
-                    (s1, s2)
-                }
-                Ordering::Greater =>
-                {
-                    let s2 = (*dest_cs_ptr).lock.lock_raw();
-                    let s1 = (*caller_cspace).lock.lock_raw();
-                    (s1, s2)
-                }
-                Ordering::Equal =>
-                {
-                    let s = (*caller_cspace).lock.lock_raw();
-                    (s, 0)
-                }
-            }
-        };
+        // SAFETY: both CSpace pointers validated above; released via
+        // unlock_cspace_pair with the same argument order.
+        let (saved1, saved2) = unsafe { crate::cap::lock_cspace_pair(caller_cspace, dest_cs_ptr) };
         // SAFETY: both CSpace pointers valid; DERIVATION_LOCK and both cspace locks held.
         let result =
             unsafe { crate::cap::move_cap_between_cspaces(caller_cspace, src_idx, dest_cs_ptr) };
@@ -2032,32 +2012,9 @@ pub fn sys_cap_move(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     crate::cap::DERIVATION_LOCK.write_lock();
 
     // Lock both CSpaces in pointer address order to prevent deadlock.
-    // SAFETY: Locking in deterministic order (lower address first) prevents
-    // ABBA deadlock. CSpace pointers validated above.
-    let (saved1, saved2) = unsafe {
-        use core::cmp::Ordering;
-        match caller_cspace.cmp(&dest_cs_ptr)
-        {
-            Ordering::Less =>
-            {
-                let s1 = (*caller_cspace).lock.lock_raw();
-                let s2 = (*dest_cs_ptr).lock.lock_raw();
-                (s1, s2)
-            }
-            Ordering::Greater =>
-            {
-                let s2 = (*dest_cs_ptr).lock.lock_raw();
-                let s1 = (*caller_cspace).lock.lock_raw();
-                (s1, s2)
-            }
-            Ordering::Equal =>
-            {
-                // caller_cspace == dest_cs_ptr: same CSpace, lock once.
-                let s = (*caller_cspace).lock.lock_raw();
-                (s, 0)
-            }
-        }
-    };
+    // SAFETY: both CSpace pointers validated above; released via
+    // unlock_cspace_pair with the same argument order.
+    let (saved1, saved2) = unsafe { crate::cap::lock_cspace_pair(caller_cspace, dest_cs_ptr) };
 
     // Re-validate the source under the locks: it may have been freed,
     // recycled, or gained a revoke-in-progress marker since the unlocked
@@ -2080,7 +2037,7 @@ pub fn sys_cap_move(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         };
         if let Some(e) = err
         {
-            // SAFETY: saved1 and saved2 came from lock_raw calls above.
+            // SAFETY: saved1 and saved2 came from the lock_cspace_pair call above.
             unsafe {
                 crate::cap::unlock_cspace_pair(caller_cspace, dest_cs_ptr, saved1, saved2);
             }
@@ -2095,7 +2052,7 @@ pub fn sys_cap_move(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     if let Err(e) = insert_result
     {
         // Unlock before returning error.
-        // SAFETY: saved1 and saved2 came from lock_raw calls above.
+        // SAFETY: saved1 and saved2 came from the lock_cspace_pair call above.
         unsafe {
             crate::cap::unlock_cspace_pair(caller_cspace, dest_cs_ptr, saved1, saved2);
         }
@@ -2196,7 +2153,7 @@ pub fn sys_cap_move(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     }
 
     // Unlock CSpaces in reverse order of acquisition.
-    // SAFETY: saved1 and saved2 came from lock_raw calls above.
+    // SAFETY: saved1 and saved2 came from the lock_cspace_pair call above.
     unsafe {
         crate::cap::unlock_cspace_pair(caller_cspace, dest_cs_ptr, saved1, saved2);
     }

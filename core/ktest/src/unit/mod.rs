@@ -390,6 +390,14 @@ pub fn run_all(ctx: &TestContext)
         ipc::reply_oom_wakes_caller_with_transfer_failed(ctx)
     );
     run_test!(
+        "ipc::call_duplicate_cap_slot_rejected",
+        ipc::call_duplicate_cap_slot_rejected(ctx)
+    );
+    run_test!(
+        "ipc::reply_duplicate_cap_slot_rejected",
+        ipc::reply_duplicate_cap_slot_rejected(ctx)
+    );
+    run_test!(
         "ipc::recv_oom_returns_cleanly",
         ipc::recv_oom_returns_cleanly(ctx)
     );

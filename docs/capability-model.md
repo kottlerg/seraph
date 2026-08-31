@@ -176,7 +176,8 @@ A capability to a capability space. Rights:
 - **Insert** — may place a new capability into a slot
 - **Delete** — may clear a slot
 - **Derive** — may derive a new capability from an existing slot
-- **Revoke** — may revoke a capability and all its descendants
+- **Revoke** — may revoke all descendants of a capability (the target slot
+  itself is preserved; see [Revocation](#revocation))
 
 CSpace capabilities are used when configuring a new thread (binding a CSpace to
 the thread) and when cross-CSpace capability operations are needed (e.g. init
@@ -437,14 +438,14 @@ keeping your own copy, use `SYS_CAP_COPY` instead (see [Revocation](#revocation)
 
 ## Revocation
 
-Any process may revoke a capability it has derived. Revocation:
-
-1. Invalidates the target capability slot
-2. Recursively invalidates all capabilities derived from it, in all processes
+Any process may revoke a capability it has derived. Revocation recursively
+invalidates all capabilities derived from the target, in all processes. The target
+slot itself is preserved — the revoker keeps its own capability and only withdraws
+delegated authority.
 
 After revocation, any process that held a derived capability can no longer use it.
 The underlying kernel object is not destroyed — only the authority to access it is
-withdrawn. If the revoker still holds the parent capability, it retains access.
+withdrawn.
 
 A descendant delivered to another CSpace — by **IPC transfer**, `SYS_CAP_MOVE`, or
 `SYS_CAP_COPY` — keeps its position in the derivation tree (see

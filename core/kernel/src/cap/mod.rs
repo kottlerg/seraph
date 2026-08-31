@@ -2401,12 +2401,85 @@ fn nonnull_from_box<T>(b: Box<T>) -> NonNull<KernelObjectHeader>
     unsafe { NonNull::new_unchecked(raw) }
 }
 
+/// Acquire a pair of `CSpace` locks in pointer-address order (lower address
+/// first, preventing ABBA deadlock between concurrent pairs; a same-pointer
+/// pair is locked once). Returns the saved interrupt states to hand back to
+/// [`unlock_cspace_pair`] with the same `(a, b)` argument order.
+///
+/// # Safety
+///
+/// `a` and `b` must be valid `CSpace` pointers; the acquisition must be
+/// released exactly once via [`unlock_cspace_pair`].
+#[cfg(not(test))]
+pub(crate) unsafe fn lock_cspace_pair(a: *mut CSpace, b: *mut CSpace) -> (u64, u64)
+{
+    // SAFETY: caller contract.
+    unsafe {
+        use core::cmp::Ordering;
+        match a.cmp(&b)
+        {
+            Ordering::Less =>
+            {
+                let sa = (*a).lock.lock_raw();
+                let sb = (*b).lock.lock_raw();
+                (sa, sb)
+            }
+            Ordering::Greater =>
+            {
+                let sb = (*b).lock.lock_raw();
+                let sa = (*a).lock.lock_raw();
+                (sa, sb)
+            }
+            Ordering::Equal =>
+            {
+                let sa = (*a).lock.lock_raw();
+                (sa, 0)
+            }
+        }
+    }
+}
+
+/// Release a pair of `CSpace` locks taken in pointer-address order, in
+/// reverse order of acquisition (same-pointer pairs were locked once).
+///
+/// # Safety
+///
+/// `saved_a`/`saved_b` must come from the matching `lock_raw` acquisition
+/// over the same `(a, b)` pointer pair (lower address locked first, or a
+/// single acquisition when `a == b`); each pair must be released exactly
+/// once.
+#[cfg(not(test))]
+pub(crate) unsafe fn unlock_cspace_pair(a: *mut CSpace, b: *mut CSpace, saved_a: u64, saved_b: u64)
+{
+    // SAFETY: caller contract.
+    unsafe {
+        use core::cmp::Ordering;
+        match a.cmp(&b)
+        {
+            Ordering::Equal =>
+            {
+                (*a).lock.unlock_raw(saved_a);
+            }
+            Ordering::Less =>
+            {
+                (*b).lock.unlock_raw(saved_b);
+                (*a).lock.unlock_raw(saved_a);
+            }
+            Ordering::Greater =>
+            {
+                (*a).lock.unlock_raw(saved_a);
+                (*b).lock.unlock_raw(saved_b);
+            }
+        }
+    }
+}
+
 /// Move a capability between `CSpaces`, rewriting derivation tree pointers in place.
 ///
 /// The destination slot takes the source's exact position in the derivation
 /// tree: parent, children, and siblings are repointed to the new
 /// `(dst_cspace_id, new_idx)` location. A cross-CSpace move preserves the
-/// derivation edge across the boundary, so a `revoke_subtree` rooted in the
+/// derivation edge across the boundary, so a `revoke_subtree_batch` rooted in the
 /// source `CSpace` can reach and free the moved slot in the destination.
 ///
 /// That cross-CSpace free is safe against stale-handle aliasing (#349) because
@@ -2455,6 +2528,15 @@ pub unsafe fn move_cap_between_cspaces(
         if slot.tag == CapTag::Null
         {
             return Err(SyscallError::InvalidCapability);
+        }
+        // A revoke is mid-flight on this slot (see
+        // `CapabilitySlot::revoke_in_progress`): moving the root between
+        // revoke batches would abandon its temporarily hoisted survivors
+        // and sever intermediate revocation edges. Transient — the move
+        // can be retried once the revoke completes.
+        if slot.revoke_in_progress()
+        {
+            return Err(SyscallError::InvalidState);
         }
         (
             slot.tag,

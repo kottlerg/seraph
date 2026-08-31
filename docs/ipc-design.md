@@ -49,8 +49,15 @@ A message consists of:
   The kernel does not inspect or validate the label.
 - **Data words** — up to `MSG_DATA_WORDS_MAX` words carrying the message payload.
 - **Capability slots** — up to `MSG_CAP_SLOTS_MAX` capability references.
-  Capabilities in these slots are transferred from sender to receiver atomically
-  with the message. The sender loses access to transferred capabilities.
+  The transfer is all-or-nothing: either every capability moves from sender to
+  receiver atomically with the message (the sender loses access), or none does.
+  A refused transfer — a source slot gone stale, repeated within the message, or
+  pinned by an in-flight revocation — does not block delivery: the message
+  arrives with zero capabilities and the sender keeps its own. On the reply
+  direction the sender (the replying server) receives the error and the waiting
+  caller resumes with the `IPC_REPLY_TRANSFER_FAILED` label; on the call/receive
+  direction the sender is rejected before blocking where the refusal is
+  detectable up front, and otherwise proceeds without learning of the refusal.
 
 **Small messages (fast path):** When data fits within `MSG_REGS_DATA_MAX` words,
 the entire message passes through register state. No memory access or dynamic

@@ -61,8 +61,10 @@ node capability that server has ever issued. This is the
 "kill the server" hammer.
 
 `cap_revoke` on a single derived node capability invalidates only that
-capability. Already-derived descendants in the namespace tree remain
-valid until their holders close them or the server is killed.
+capability's derivation descendants; the target capability itself is
+preserved (see [docs/capability-model.md](capability-model.md)
+§Revocation). Node capabilities derived elsewhere in the namespace tree
+remain valid until their holders close them or the server is killed.
 
 Per-namespace-subtree revocation requires server-side bookkeeping
 (revocation epochs in the badge, or per-server revoked-subtree

@@ -157,7 +157,7 @@ pub fn worker_loop(
         // from fs's CSpace, drop the cache-slot refcount, and
         // clear the per-file outstanding-page entry so a later
         // close does not double-decrement.
-        let _ = syscall::cap_revoke(req.ancestor_cap);
+        let _ = syscall::cap_revoke_all(req.ancestor_cap);
         let _ = syscall::cap_delete(req.ancestor_cap);
         cache.release_slot(req.slot_idx);
         clear_outstanding(&files, req.file_badge, req.cookie);

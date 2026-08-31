@@ -82,6 +82,7 @@ pub fn run_all(ctx: &TestContext)
     run_test!("cap::move", cap::r#move(ctx));
     run_test!("cap::derive_attenuation", cap::derive_attenuation(ctx));
     run_test!("cap::revoke_invalidates", cap::revoke_invalidates(ctx));
+    run_test!("cap::revoke_large_subtree", cap::revoke_large_subtree(ctx));
     run_test!("cap::delete", cap::delete(ctx));
     run_test!(
         "cap::insert_to_occupied_slot_err",
@@ -387,6 +388,14 @@ pub fn run_all(ctx: &TestContext)
     run_test!(
         "ipc::reply_oom_wakes_caller_with_transfer_failed",
         ipc::reply_oom_wakes_caller_with_transfer_failed(ctx)
+    );
+    run_test!(
+        "ipc::call_duplicate_cap_slot_rejected",
+        ipc::call_duplicate_cap_slot_rejected(ctx)
+    );
+    run_test!(
+        "ipc::reply_duplicate_cap_slot_rejected",
+        ipc::reply_duplicate_cap_slot_rejected(ctx)
     );
     run_test!(
         "ipc::recv_oom_returns_cleanly",

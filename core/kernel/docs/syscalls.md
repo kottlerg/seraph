@@ -240,11 +240,16 @@ IPC buffer page after the server replies.
 - `rax`/`a0`: 0 on success; `SyscallError` on failure
 - `rdx`/`a1`: reply label (valid on success)
 
-**Capability requirement:** `endpoint_cap` must have Send rights.
+**Capability requirement:** `endpoint_cap` must have Send rights, plus Grant
+when the message carries capabilities.
 
-**Errors:** `InvalidCapability`, `InsufficientRights`, `InvalidArgument` (bad count,
-or extended payload requested but IPC buffer page not registered or unmapped),
-`Interrupted`.
+**Errors:** `InvalidCapability` (also: a cap slot is stale or Null),
+`InsufficientRights`, `InvalidArgument` (bad count, a cap slot repeated in one
+message, or extended payload requested but IPC buffer page not registered or
+unmapped), `InvalidState` (a cap slot is pinned by an in-flight
+`SYS_CAP_REVOKE`), `Interrupted`. Cap-slot problems are rejected before the
+caller blocks; a refusal that arises only afterwards degrades to delivery with
+zero caps (the caller keeps its capabilities).
 
 ---
 
@@ -275,9 +280,14 @@ written to the original caller's IPC buffer page.
 
 **Capability requirement:** Implicit reply capability from `current_tcb.reply_cap_slot`.
 
-**Errors:** `InvalidCapability` (no pending reply), `InvalidArgument`, `QuotaExceeded`
-(caller's CSpace at slot quota for reply cap transfer), `OutOfMemory` (slot-page pool
-exhausted), `Interrupted`.
+**Errors:** `InvalidCapability` (no pending reply, or a reply cap slot went
+stale), `InvalidArgument` (also: a cap slot repeated in one reply),
+`InvalidState` (a reply cap slot is pinned by an in-flight `SYS_CAP_REVOKE`),
+`QuotaExceeded` (caller's CSpace at slot quota for reply cap transfer),
+`OutOfMemory` (slot-page pool exhausted), `Interrupted`. When the reply cap
+transfer is refused after the caller was already claimed, the caller is still
+woken — it resumes with the `IPC_REPLY_TRANSFER_FAILED` label and zero caps —
+and the server receives the error.
 
 ---
 
@@ -309,7 +319,9 @@ The badge is the value attached to the sender's endpoint capability via
 
 **Errors:** `InvalidCapability`, `InsufficientRights`, `QuotaExceeded` (server's CSpace
 at slot quota for an incoming cap transfer), `OutOfMemory` (slot-page pool exhausted),
-`Interrupted`.
+`Interrupted`. If an already-queued sender's cap transfer is refused (a source
+slot went stale or is pinned by an in-flight `SYS_CAP_REVOKE`), the message is
+still delivered — with zero caps; the sender keeps its capabilities.
 
 ---
 
@@ -653,20 +665,27 @@ on an already-badged cap) returns `InvalidArgument`. Derivation via
 
 ### `SYS_CAP_REVOKE` (15)
 
-Revoke a capability and all capabilities derived from it, across all processes.
+Revoke all capabilities derived from a capability, across all processes.
 
 **Arguments:**
 
 | # | Name | Description |
 |---|---|---|
-| 0 | `cap` | Capability to revoke |
+| 0 | `cap` | Capability whose descendants to revoke |
 
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
 
-The capability itself is invalidated, as are all descendants in the derivation tree.
-The underlying kernel object is not freed unless this was the last reference to it.
+Every descendant in the derivation tree is invalidated; the target capability
+itself is preserved. Underlying kernel objects are not freed unless a revoked
+capability was the last reference. While the revoke is in flight, `SYS_CAP_DELETE`
+and `SYS_CAP_MOVE` on the target slot (and IPC transfer of it) are refused with
+`InvalidState`.
 
-**Errors:** `InvalidCapability`.
+**Errors:** `InvalidCapability`; `InvalidState` (another revoke is already in
+flight on this slot, or a corrupted derivation link was found — the revoke is
+incomplete and the dangling chain was cut); `Interrupted` (liveness backstop:
+sustained concurrent derivation kept extending the subtree — everything revoked
+so far stays revoked; retry to continue).
 
 ---
 
@@ -684,14 +703,14 @@ Delete a single capability from the caller's CSpace. Does not affect derived cap
 
 If this is the last reference to the underlying object, the object is freed.
 
-Refused for one case: a thread may not delete the last capability to its **own
-running** `Thread` object. Such a delete is always an aliased/stale-cap bug (it
-would tear the calling thread down mid-syscall); it returns `InvalidState` and
-leaves the capability in place — the object is reclaimed normally when a
-different thread later releases it.
+Refused for two cases, both returning `InvalidState` with the capability left in
+place: a thread may not delete the last capability to its **own running**
+`Thread` object (always an aliased/stale-cap bug — it would tear the calling
+thread down mid-syscall; the object is reclaimed normally when a different
+thread later releases it), and a slot with a `SYS_CAP_REVOKE` in flight may not
+be deleted until that revoke completes.
 
-**Errors:** `InvalidCapability`; `InvalidState` (caller's own running `Thread`
-cap, per above).
+**Errors:** `InvalidCapability`; `InvalidState` (per above).
 
 ---
 
@@ -1600,7 +1619,8 @@ the source slot is cleared; the destination inherits the source's derivation pos
 
 **Errors:** `InvalidCapability`, `InsufficientRights` (dst CSpace lacks Insert),
 `InvalidArgument` (dst_slot occupied or out of range), `OutOfMemory` (slot-page pool
-exhausted), `QuotaExceeded` (dst CSpace at slot quota).
+exhausted), `QuotaExceeded` (dst CSpace at slot quota), `InvalidState` (a
+`SYS_CAP_REVOKE` is in flight on the source slot).
 
 ---
 
@@ -1816,10 +1836,11 @@ bounds the per-call interrupt-off window of the kernel draw.
 
 ### `SYS_CAP_REVOKE` targets the caller's own CSpace
 
-`SYS_CAP_REVOKE` invalidates the capability in the caller's own CSpace slot and
-all capabilities derived from it, across all processes. It cannot target a
-capability in a remote process's CSpace directly — to revoke authority delegated to
-another process, revoke the intermediary capability held in the caller's own CSpace.
+`SYS_CAP_REVOKE` takes a capability in the caller's own CSpace and invalidates
+all capabilities derived from it, across all processes; the target slot itself is
+preserved. It cannot target a capability in a remote process's CSpace directly —
+to revoke authority delegated to another process, revoke the intermediary
+capability held in the caller's own CSpace.
 
 ### Delegating with the "derive twice" pattern
 
@@ -1830,12 +1851,13 @@ To delegate authority that can later be revoked without losing your own access:
 2. Derive C1 from C — you retain C1 as an intermediary
 3. Derive C2 from C1 — C2 is the delegated capability
 4. Transfer C2 to the child process via SYS_CAP_COPY or IPC
-5. To revoke: call SYS_CAP_REVOKE(C1) — destroys C1 and C2
-   You still hold C with full rights.
+5. To revoke: call SYS_CAP_REVOKE(C1) — destroys every descendant of C1,
+   including C2. You still hold C and C1, ready to re-delegate.
 ```
 
-This pattern works because revocation is subtree-local: revoking C1 removes C1 and
-all its descendants (including C2) but leaves C and any other children of C intact.
+This pattern works because revocation is subtree-local: revoking C1 removes C1's
+descendants (including C2) but leaves C1 itself, C, and any other children of C
+intact.
 
 ---
 
@@ -1844,9 +1866,12 @@ all its descendants (including C2) but leaves C and any other children of C inta
 - **IPC message delivery is atomic.** A message either fully transfers (including all
   capability slots) or does not transfer at all. There is no partial delivery.
 
-- **Capability operations are atomic.** Derivation, deletion, and revocation each
-  complete fully before the syscall returns. A revocation that affects capabilities
-  in other processes completes before `SYS_CAP_REVOKE` returns.
+- **Capability operations complete before returning.** Derivation, deletion, and
+  revocation each complete fully before the syscall returns. A revocation that
+  affects capabilities in other processes completes before `SYS_CAP_REVOKE`
+  returns; a large revocation proceeds in bounded batches, so other CPUs can
+  observe not-yet-revoked descendants (still usable) mid-syscall — the fully
+  revoked state is guaranteed only at return.
 
 - **Memory mapping operations are atomic with respect to the address space.** After
   `SYS_MEM_MAP` or `SYS_MEM_UNMAP` returns, every CPU observes the updated mapping on

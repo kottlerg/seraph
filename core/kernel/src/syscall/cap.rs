@@ -1554,7 +1554,7 @@ pub fn sys_cap_delete(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     let node = crate::cap::slot::SlotId::current(cspace_id, slot_idx_nz);
 
     // Resolve the slot, unlink, and clear under DERIVATION_LOCK so a concurrent
-    // revoke_subtree on a parent cap cannot race-clear this slot between the
+    // revoke_subtree_batch on a parent cap cannot race-clear this slot between the
     // tag-check and the dec_ref. Both paths must dec_ref the object exactly
     // once between them.
     crate::cap::DERIVATION_LOCK.write_lock();
@@ -1572,6 +1572,16 @@ pub fn sys_cap_delete(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 crate::cap::DERIVATION_LOCK.write_unlock();
                 return Err(SyscallError::InvalidCapability);
             }
+            // A revoke is mid-flight on this slot (see
+            // `CapabilitySlot::revoke_in_progress`): deleting the root
+            // between revoke batches would promote its temporarily hoisted
+            // survivors and sever intermediate revocation edges.
+            // Transient — retry after the revoke completes.
+            if slot.revoke_in_progress()
+            {
+                crate::cap::DERIVATION_LOCK.write_unlock();
+                return Err(SyscallError::InvalidState);
+            }
             let Some(obj) = slot.object
             else
             {
@@ -1583,7 +1593,7 @@ pub fn sys_cap_delete(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         Some(_) =>
         {
             // Slot was Null on entry, or was cleared by a concurrent
-            // revoke_subtree before we acquired the lock. Idempotent.
+            // revoke_subtree_batch before we acquired the lock. Idempotent.
             crate::cap::DERIVATION_LOCK.write_unlock();
             return Ok(0);
         }
@@ -1658,6 +1668,17 @@ pub fn sys_cap_delete(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// Walks and clears the entire descendant subtree of the target slot. The
 /// target slot itself is preserved. For each revoked capability, the kernel
 /// object's refcount is decremented; objects with zero refcount are freed.
+///
+/// # Errors
+///
+/// - `InvalidCapability` — the handle names no live slot, or its generation
+///   is stale.
+/// - `InvalidState` — another revoke is already in flight on this slot; or a
+///   corrupted derivation link was found (the dangling chain was truncated
+///   and the revoke is incomplete).
+/// - `Interrupted` — the liveness backstop tripped: sustained concurrent
+///   derivation kept extending the subtree past `MAX_REVOKE_BATCHES`
+///   batches. Everything revoked so far stays revoked; retry to continue.
 #[cfg(not(test))]
 pub fn sys_cap_revoke(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
@@ -1679,50 +1700,190 @@ pub fn sys_cap_revoke(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // SAFETY: caller_cspace validated non-null above.
     let cspace_id = unsafe { (*caller_cspace).id() };
 
-    // Validate slot is non-null and the handle's generation is current.
-    {
-        // SAFETY: caller_cspace validated non-null above.
-        let cs = unsafe { &*caller_cspace };
-        let slot = cs.slot(slot_idx).ok_or(SyscallError::InvalidCapability)?;
-        if slot.tag == crate::cap::slot::CapTag::Null
-        {
-            return Err(SyscallError::InvalidCapability);
-        }
-        // Reject a stale handle to a recycled slot (#349).
-        if slot.generation() != syscall::cap_handle_gen(slot_handle)
-        {
-            return Err(SyscallError::InvalidCapability);
-        }
-    }
-
     let slot_idx_nz =
         core::num::NonZeroU32::new(slot_idx).ok_or(SyscallError::InvalidCapability)?;
     let root = crate::cap::slot::SlotId::current(cspace_id, slot_idx_nz);
 
-    // Revoke the subtree under the lock; snapshot the dealloc list to a
-    // stack-local array so we can release the lock before calling
-    // `dealloc_object` (which may acquire the frame allocator and other
-    // inner locks — see the safety doc on `dealloc_object`).
+    // Revoke the subtree in batches of up to MAX_REVOKE_EDITS constant-time
+    // tree edits (see the revocation algorithm in capability-internals.md).
+    // Per batch: revalidate the root and run one batch under the lock, then
+    // snapshot the dealloc list to a stack-local array so the lock is
+    // released before calling `dealloc_object` (which may acquire the frame
+    // allocator and other inner locks — see the safety doc on
+    // `dealloc_object`).
+    //
+    // The root carries the revoke-in-progress marker for the whole
+    // multi-batch operation so SYS_CAP_DELETE / SYS_CAP_MOVE / IPC transfer
+    // cannot act on it between batches — that would promote the temporarily
+    // hoisted survivors and permanently sever intermediate revocation
+    // edges. The marker is cleared under the lock on every exit path —
+    // completion, dead-link error, and the Interrupted backstop alike — so
+    // it cannot leak. A root freed mid-revoke sheds the marker on the free
+    // path (`set_next_free` zeroes it).
     let mut snapshot: [Option<core::ptr::NonNull<crate::cap::object::KernelObjectHeader>>;
-        crate::cap::derivation::MAX_REVOKE_NODES] =
-        [None; crate::cap::derivation::MAX_REVOKE_NODES];
-    crate::cap::DERIVATION_LOCK.write_lock();
-    // SAFETY: DERIVATION_LOCK held; root is valid SlotId.
-    let objects = unsafe { crate::cap::derivation::revoke_subtree(root) };
-    let snapshot_count = objects.len();
-    debug_assert!(snapshot_count <= crate::cap::derivation::MAX_REVOKE_NODES);
-    snapshot[..snapshot_count].copy_from_slice(objects);
-    crate::cap::DERIVATION_LOCK.write_unlock();
+        crate::cap::derivation::MAX_REVOKE_EDITS] =
+        [None; crate::cap::derivation::MAX_REVOKE_EDITS];
+    let mut first_batch = true;
+    let mut batches: u32 = 0;
+    loop
+    {
+        crate::cap::DERIVATION_LOCK.write_lock();
 
-    // Dec-ref and free objects outside the lock.
-    for entry in &snapshot[..snapshot_count]
+        // Validate the root slot is non-null and the handle's generation is
+        // current — on entry (stale handles to recycled slots, #349), and
+        // again before every later batch: the root may be deleted or its
+        // slot recycled while the lock is dropped between batches, in which
+        // case the remaining subtree now belongs to whatever reparenting the
+        // concurrent operation performed, and this revoke must stop.
+        let root_live = {
+            // SAFETY: caller_cspace validated non-null above. Free paths
+            // (delete/revoke) run under DERIVATION_LOCK, so a freed root is
+            // observed stably here; re-population of a recycled index runs
+            // under cspace.lock only and can race this read, but the
+            // generation bump on free makes a raced read fail closed (the
+            // handle's generation no longer matches).
+            let cs = unsafe { &*caller_cspace };
+            cs.slot(slot_idx).is_some_and(|slot| {
+                slot.tag != crate::cap::slot::CapTag::Null
+                    && slot.generation() == syscall::cap_handle_gen(slot_handle)
+            })
+        };
+        if !root_live
+        {
+            crate::cap::DERIVATION_LOCK.write_unlock();
+            return if first_batch
+            {
+                Err(SyscallError::InvalidCapability)
+            }
+            else
+            {
+                Ok(0)
+            };
+        }
+
+        if first_batch
+        {
+            // A marker already set means another thread's revoke is in
+            // flight on this slot; refuse rather than interleave two
+            // marker lifetimes on one root.
+            // SAFETY: caller_cspace validated; marker accessed only under
+            // DERIVATION_LOCK.
+            let already = unsafe {
+                (*caller_cspace)
+                    .slot_mut(slot_idx)
+                    .is_none_or(|slot| slot.revoke_in_progress())
+            };
+            if already
+            {
+                crate::cap::DERIVATION_LOCK.write_unlock();
+                return Err(SyscallError::InvalidState);
+            }
+            // SAFETY: as above.
+            unsafe { pin_revoke_root(caller_cspace, slot_idx) };
+        }
+
+        // SAFETY: DERIVATION_LOCK held; root is a valid SlotId.
+        let (objects, status) = unsafe { crate::cap::derivation::revoke_subtree_batch(root) };
+        let snapshot_count = objects.len();
+        debug_assert!(snapshot_count <= crate::cap::derivation::MAX_REVOKE_EDITS);
+        snapshot[..snapshot_count].copy_from_slice(objects);
+
+        // Liveness backstop: MoreWork batches beyond this bound mean a
+        // concurrent deriver is extending the subtree at least as fast as
+        // revocation reclaims it. Give the CPU back instead of looping
+        // in-kernel forever; everything revoked so far stays revoked and a
+        // retry continues from the surviving subtree.
+        batches += 1;
+        let backstop = batches >= MAX_REVOKE_BATCHES
+            && status == crate::cap::derivation::BatchStatus::MoreWork;
+
+        if status != crate::cap::derivation::BatchStatus::MoreWork || backstop
+        {
+            // Final batch (or backstop): release the root before dropping
+            // the lock.
+            // SAFETY: caller_cspace validated; marker accessed only under
+            // DERIVATION_LOCK.
+            unsafe { unpin_revoke_root(caller_cspace, slot_idx) };
+        }
+        crate::cap::DERIVATION_LOCK.write_unlock();
+
+        dealloc_revoked(&snapshot[..snapshot_count]);
+
+        if backstop
+        {
+            return Err(SyscallError::Interrupted);
+        }
+        match status
+        {
+            crate::cap::derivation::BatchStatus::Cleared => return Ok(0),
+            crate::cap::derivation::BatchStatus::DeadLink =>
+            {
+                return Err(SyscallError::InvalidState);
+            }
+            crate::cap::derivation::BatchStatus::MoreWork =>
+            {}
+        }
+        first_batch = false;
+    }
+}
+
+/// Liveness backstop for `sys_cap_revoke`: the maximum number of batches one
+/// syscall runs before returning `Interrupted`. At `MAX_REVOKE_EDITS` edits
+/// per batch this covers ~2.7 × 10^8 edits (~1.3 × 10^8 revoked nodes) —
+/// beyond any derivation subtree plausibly-sized hardware can hold, since
+/// every node costs its creator a 72-byte slot plus a kernel object.
+/// Reaching it therefore indicates sustained concurrent re-derivation, not a
+/// large fixed subtree.
+#[cfg(not(test))]
+const MAX_REVOKE_BATCHES: u32 = 1 << 20;
+
+/// Set the revoke-in-progress marker on `slot_idx` of `cspace`, pinning it
+/// against delete/move/IPC-transfer for the duration of a multi-batch
+/// revoke.
+///
+/// # Safety
+///
+/// Caller must hold `DERIVATION_LOCK` (the marker's synchronisation domain)
+/// and `cspace` must be a valid `CSpace` pointer.
+#[cfg(not(test))]
+unsafe fn pin_revoke_root(cspace: *mut crate::cap::cspace::CSpace, slot_idx: u32)
+{
+    // SAFETY: caller contract.
+    if let Some(slot) = unsafe { (*cspace).slot_mut(slot_idx) }
+    {
+        slot.mark_revoke_in_progress();
+    }
+}
+
+/// Clear the revoke-in-progress marker set by [`pin_revoke_root`].
+///
+/// # Safety
+///
+/// As for [`pin_revoke_root`].
+#[cfg(not(test))]
+unsafe fn unpin_revoke_root(cspace: *mut crate::cap::cspace::CSpace, slot_idx: u32)
+{
+    // SAFETY: caller contract.
+    if let Some(slot) = unsafe { (*cspace).slot_mut(slot_idx) }
+    {
+        slot.clear_revoke_in_progress();
+    }
+}
+
+/// Dec-ref each collected object and deallocate those that reach refcount
+/// zero. Must run outside `DERIVATION_LOCK` — `dealloc_object` may acquire
+/// the frame allocator and other inner locks.
+#[cfg(not(test))]
+fn dealloc_revoked(snapshot: &[Option<core::ptr::NonNull<crate::cap::object::KernelObjectHeader>>])
+{
+    for entry in snapshot
     {
         let Some(obj_ptr) = *entry
         else
         {
             continue;
         };
-        // SAFETY: obj_ptr from revoke_subtree; was a live capability object.
+        // SAFETY: obj_ptr from revoke_subtree_batch; was a live capability object.
         let remaining = unsafe { (*obj_ptr.as_ptr()).dec_ref() };
         if remaining == 0
         {
@@ -1732,8 +1893,6 @@ pub fn sys_cap_revoke(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             }
         }
     }
-
-    Ok(0)
 }
 
 /// `SYS_CAP_MOVE` (25): atomically move a capability to another `CSpace.`
@@ -1816,53 +1975,15 @@ pub fn sys_cap_move(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         // against a concurrent SYS_CAP_CREATE_*. Lock order:
         // DERIVATION_LOCK → cspace.lock(s) (matches transfer_caps).
         crate::cap::DERIVATION_LOCK.write_lock();
-        // SAFETY: both CSpace pointers valid; address-ordered acquisition.
-        let (saved1, saved2) = unsafe {
-            use core::cmp::Ordering;
-            match caller_cspace.cmp(&dest_cs_ptr)
-            {
-                Ordering::Less =>
-                {
-                    let s1 = (*caller_cspace).lock.lock_raw();
-                    let s2 = (*dest_cs_ptr).lock.lock_raw();
-                    (s1, s2)
-                }
-                Ordering::Greater =>
-                {
-                    let s2 = (*dest_cs_ptr).lock.lock_raw();
-                    let s1 = (*caller_cspace).lock.lock_raw();
-                    (s1, s2)
-                }
-                Ordering::Equal =>
-                {
-                    let s = (*caller_cspace).lock.lock_raw();
-                    (s, 0)
-                }
-            }
-        };
+        // SAFETY: both CSpace pointers validated above; released via
+        // unlock_cspace_pair with the same argument order.
+        let (saved1, saved2) = unsafe { crate::cap::lock_cspace_pair(caller_cspace, dest_cs_ptr) };
         // SAFETY: both CSpace pointers valid; DERIVATION_LOCK and both cspace locks held.
         let result =
             unsafe { crate::cap::move_cap_between_cspaces(caller_cspace, src_idx, dest_cs_ptr) };
-        // SAFETY: saved1/saved2 from lock_raw above; release in reverse order.
+        // SAFETY: saved1 and saved2 came from the lock_cspace_pair call above.
         unsafe {
-            use core::cmp::Ordering;
-            match caller_cspace.cmp(&dest_cs_ptr)
-            {
-                Ordering::Equal =>
-                {
-                    (*caller_cspace).lock.unlock_raw(saved1);
-                }
-                Ordering::Less =>
-                {
-                    (*dest_cs_ptr).lock.unlock_raw(saved2);
-                    (*caller_cspace).lock.unlock_raw(saved1);
-                }
-                Ordering::Greater =>
-                {
-                    (*caller_cspace).lock.unlock_raw(saved1);
-                    (*dest_cs_ptr).lock.unlock_raw(saved2);
-                }
-            }
+            crate::cap::unlock_cspace_pair(caller_cspace, dest_cs_ptr, saved1, saved2);
         }
         crate::cap::DERIVATION_LOCK.write_unlock();
         return Ok(u64::from(result?));
@@ -1890,32 +2011,39 @@ pub fn sys_cap_move(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     crate::cap::DERIVATION_LOCK.write_lock();
 
     // Lock both CSpaces in pointer address order to prevent deadlock.
-    // SAFETY: Locking in deterministic order (lower address first) prevents
-    // ABBA deadlock. CSpace pointers validated above.
-    let (saved1, saved2) = unsafe {
-        use core::cmp::Ordering;
-        match caller_cspace.cmp(&dest_cs_ptr)
+    // SAFETY: both CSpace pointers validated above; released via
+    // unlock_cspace_pair with the same argument order.
+    let (saved1, saved2) = unsafe { crate::cap::lock_cspace_pair(caller_cspace, dest_cs_ptr) };
+
+    // Re-validate the source under the locks: it may have been freed,
+    // recycled, or gained a revoke-in-progress marker since the unlocked
+    // checks above (moving a mid-revoke root would abandon its temporarily
+    // hoisted survivors — see `CapabilitySlot::revoke_in_progress`).
+    {
+        // SAFETY: caller_cspace validated; DERIVATION_LOCK held.
+        let cs = unsafe { &*caller_cspace };
+        let err = match cs.slot(src_idx)
         {
-            Ordering::Less =>
+            None => Some(SyscallError::InvalidCapability),
+            Some(slot)
+                if slot.tag == crate::cap::slot::CapTag::Null
+                    || slot.generation() != syscall::cap_handle_gen(src_handle) =>
             {
-                let s1 = (*caller_cspace).lock.lock_raw();
-                let s2 = (*dest_cs_ptr).lock.lock_raw();
-                (s1, s2)
+                Some(SyscallError::InvalidCapability)
             }
-            Ordering::Greater =>
-            {
-                let s2 = (*dest_cs_ptr).lock.lock_raw();
-                let s1 = (*caller_cspace).lock.lock_raw();
-                (s1, s2)
+            Some(slot) if slot.revoke_in_progress() => Some(SyscallError::InvalidState),
+            Some(_) => None,
+        };
+        if let Some(e) = err
+        {
+            // SAFETY: saved1 and saved2 came from the lock_cspace_pair call above.
+            unsafe {
+                crate::cap::unlock_cspace_pair(caller_cspace, dest_cs_ptr, saved1, saved2);
             }
-            Ordering::Equal =>
-            {
-                // caller_cspace == dest_cs_ptr: same CSpace, lock once.
-                let s = (*caller_cspace).lock.lock_raw();
-                (s, 0)
-            }
+            crate::cap::DERIVATION_LOCK.write_unlock();
+            return Err(e);
         }
-    };
+    }
 
     // SAFETY: dest_cs_ptr validated above; DERIVATION_LOCK and both CSpace locks held.
     let insert_result =
@@ -1923,26 +2051,9 @@ pub fn sys_cap_move(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     if let Err(e) = insert_result
     {
         // Unlock before returning error.
-        // SAFETY: saved1 and saved2 came from lock_raw calls above.
+        // SAFETY: saved1 and saved2 came from the lock_cspace_pair call above.
         unsafe {
-            use core::cmp::Ordering;
-            match caller_cspace.cmp(&dest_cs_ptr)
-            {
-                Ordering::Equal =>
-                {
-                    (*caller_cspace).lock.unlock_raw(saved1);
-                }
-                Ordering::Less =>
-                {
-                    (*dest_cs_ptr).lock.unlock_raw(saved2);
-                    (*caller_cspace).lock.unlock_raw(saved1);
-                }
-                Ordering::Greater =>
-                {
-                    (*caller_cspace).lock.unlock_raw(saved1);
-                    (*dest_cs_ptr).lock.unlock_raw(saved2);
-                }
-            }
+            crate::cap::unlock_cspace_pair(caller_cspace, dest_cs_ptr, saved1, saved2);
         }
         crate::cap::DERIVATION_LOCK.write_unlock();
         return Err(e.into());
@@ -2041,26 +2152,9 @@ pub fn sys_cap_move(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     }
 
     // Unlock CSpaces in reverse order of acquisition.
-    // SAFETY: saved1 and saved2 came from lock_raw calls above.
+    // SAFETY: saved1 and saved2 came from the lock_cspace_pair call above.
     unsafe {
-        use core::cmp::Ordering;
-        match caller_cspace.cmp(&dest_cs_ptr)
-        {
-            Ordering::Equal =>
-            {
-                (*caller_cspace).lock.unlock_raw(saved1);
-            }
-            Ordering::Less =>
-            {
-                (*dest_cs_ptr).lock.unlock_raw(saved2);
-                (*caller_cspace).lock.unlock_raw(saved1);
-            }
-            Ordering::Greater =>
-            {
-                (*caller_cspace).lock.unlock_raw(saved1);
-                (*dest_cs_ptr).lock.unlock_raw(saved2);
-            }
-        }
+        crate::cap::unlock_cspace_pair(caller_cspace, dest_cs_ptr, saved1, saved2);
     }
 
     crate::cap::DERIVATION_LOCK.write_unlock();

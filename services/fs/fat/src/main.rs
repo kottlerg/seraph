@@ -806,7 +806,7 @@ fn handle_release_memory_node_cap(
             if let Some(entry) = slot
                 && entry.cookie == cookie
             {
-                let _ = syscall::cap_revoke(entry.ancestor_cap);
+                let _ = syscall::cap_revoke_all(entry.ancestor_cap);
                 let _ = syscall::cap_delete(entry.ancestor_cap);
                 cache.release_slot(entry.slot_idx);
                 *slot = None;
@@ -838,7 +838,7 @@ fn handle_close_node_cap(
         let idx = node.open_slot as usize;
         for entry in files[idx].outstanding.iter().flatten()
         {
-            let _ = syscall::cap_revoke(entry.ancestor_cap);
+            let _ = syscall::cap_revoke_all(entry.ancestor_cap);
             let _ = syscall::cap_delete(entry.ancestor_cap);
             cache.release_slot(entry.slot_idx);
         }

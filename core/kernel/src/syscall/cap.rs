@@ -1975,14 +1975,13 @@ pub fn sys_cap_move(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         // against a concurrent SYS_CAP_CREATE_*. Lock order:
         // DERIVATION_LOCK → cspace.lock(s) (matches transfer_caps).
         crate::cap::DERIVATION_LOCK.write_lock();
-        // SAFETY: both CSpace pointers valid; address-ordered acquisition.
         // SAFETY: both CSpace pointers validated above; released via
         // unlock_cspace_pair with the same argument order.
         let (saved1, saved2) = unsafe { crate::cap::lock_cspace_pair(caller_cspace, dest_cs_ptr) };
         // SAFETY: both CSpace pointers valid; DERIVATION_LOCK and both cspace locks held.
         let result =
             unsafe { crate::cap::move_cap_between_cspaces(caller_cspace, src_idx, dest_cs_ptr) };
-        // SAFETY: saved1/saved2 from lock_raw above; release in reverse order.
+        // SAFETY: saved1/saved2 from the lock_cspace_pair call above.
         unsafe {
             crate::cap::unlock_cspace_pair(caller_cspace, dest_cs_ptr, saved1, saved2);
         }

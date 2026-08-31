@@ -214,32 +214,13 @@ unsafe fn transfer_caps(
         return Ok(0);
     }
 
-    // Pre-validate: all source slots must be non-null, unpinned, and
-    // distinct. Purely a fast-path reject before the pre-allocation work —
-    // the locked re-validation below is the authoritative check. The index
-    // is bare (the send pack stripped the generation), so this cannot
-    // reject a sender's stale, recycled handle — the send-path residual
-    // documented on `unpack_cap_slots` (#349).
-    {
-        // SAFETY: src_cspace validated by caller.
-        let cs = unsafe { &*src_cspace };
-        for (i, &idx) in src_slots[..cap_count].iter().enumerate()
-        {
-            if src_slots[..i].contains(&idx)
-            {
-                return Err(SyscallError::InvalidArgument);
-            }
-            let slot = cs.slot(idx).ok_or(SyscallError::InvalidCapability)?;
-            if slot.tag == CapTag::Null
-            {
-                return Err(SyscallError::InvalidCapability);
-            }
-            if slot.revoke_in_progress()
-            {
-                return Err(SyscallError::InvalidState);
-            }
-        }
-    }
+    // Fast-path reject before the pre-allocation work — the locked
+    // re-validation below is the authoritative check. The index is bare
+    // (the send pack stripped the generation), so this cannot reject a
+    // sender's stale, recycled handle — the send-path residual documented
+    // on `unpack_cap_slots` (#349).
+    // SAFETY: src_cspace validated by caller.
+    prevalidate_transfer_slots(unsafe { &*src_cspace }, &src_slots[..cap_count])?;
 
     // Pre-allocate destination slots to avoid OOM mid-transfer. Take
     // cspace.lock so the freelist mutation cannot tear against a concurrent
@@ -264,40 +245,18 @@ unsafe fn transfer_caps(
 
     // Re-validate under the locks: a source slot can be freed, or gain a
     // revoke-in-progress marker, between the unlocked pre-validation and
-    // lock acquisition. Duplicate indices are rejected here too — the first
-    // move of a repeated index would free the slot the second move then
-    // reads as Null. Failing here preserves the all-or-nothing contract
+    // lock acquisition. Failing here preserves the all-or-nothing contract
     // (nothing has moved yet) and keeps the per-move failure branch below
     // genuinely unreachable — without this, a sender naming a sibling
-    // thread's mid-revoke root, or packing one index twice, would trip that
-    // branch from userspace.
+    // thread's mid-revoke root, or packing one index twice, would trip
+    // that branch from userspace.
+    // SAFETY: src_cspace validated by caller; both locks held.
+    if let Err(e) = prevalidate_transfer_slots(unsafe { &*src_cspace }, &src_slots[..cap_count])
     {
-        // SAFETY: src_cspace validated by caller; both locks held.
-        let cs = unsafe { &*src_cspace };
-        for (i, &idx) in src_slots[..cap_count].iter().enumerate()
-        {
-            let err = if src_slots[..i].contains(&idx)
-            {
-                Some(SyscallError::InvalidArgument)
-            }
-            else
-            {
-                match cs.slot(idx)
-                {
-                    None => Some(SyscallError::InvalidCapability),
-                    Some(slot) if slot.tag == CapTag::Null => Some(SyscallError::InvalidCapability),
-                    Some(slot) if slot.revoke_in_progress() => Some(SyscallError::InvalidState),
-                    Some(_) => None,
-                }
-            };
-            if let Some(e) = err
-            {
-                // SAFETY: saved1/saved2 from the lock_cspace_pair call above.
-                unsafe { crate::cap::unlock_cspace_pair(src_cspace, dst_cspace, saved1, saved2) };
-                crate::cap::DERIVATION_LOCK.write_unlock();
-                return Err(e);
-            }
-        }
+        // SAFETY: saved1/saved2 from the lock_cspace_pair call above.
+        unsafe { crate::cap::unlock_cspace_pair(src_cspace, dst_cspace, saved1, saved2) };
+        crate::cap::DERIVATION_LOCK.write_unlock();
+        return Err(e);
     }
 
     for (i, &src_idx) in src_slots[..cap_count].iter().enumerate()
@@ -317,7 +276,7 @@ unsafe fn transfer_caps(
                 });
     }
 
-    // SAFETY: saved1 and saved2 came from the lock_raw calls above.
+    // SAFETY: saved1 and saved2 came from the lock_cspace_pair call above.
     unsafe { crate::cap::unlock_cspace_pair(src_cspace, dst_cspace, saved1, saved2) };
 
     crate::cap::DERIVATION_LOCK.write_unlock();
@@ -327,28 +286,19 @@ unsafe fn transfer_caps(
 
 // ── IPC syscall handlers ──────────────────────────────────────────────────────
 
-/// Fail-fast validation of a call's cap slots before the caller blocks:
-/// distinct, non-null, and not pinned by an in-flight revoke. Mirrors
-/// `transfer_caps`' authoritative locked checks — a refusal detected only
-/// after the caller has blocked degrades to zero-cap delivery without
-/// notifying the sender, so the sender must learn of a doomed transfer
-/// here.
-///
-/// # Safety
-///
-/// `cspace_ptr` must be a valid live `CSpace` pointer.
+/// Validate a set of transfer source slots: distinct, non-null, and not
+/// pinned by an in-flight revoke. The single authoritative predicate for
+/// every cap-transfer direction — `sys_ipc_call`'s fail-fast reject before
+/// blocking, and `transfer_caps`' unlocked fast path and locked
+/// re-validation. A refusal detected only after a caller has blocked
+/// degrades to zero-cap delivery without notifying the sender, which is
+/// why the call path must run this before parking.
 #[cfg(not(test))]
-unsafe fn prevalidate_call_caps(
-    cspace_ptr: *mut CSpace,
-    indices: &[u32; MSG_CAP_SLOTS_MAX],
-    cap_count: usize,
-) -> Result<(), SyscallError>
+fn prevalidate_transfer_slots(cs: &CSpace, slots: &[u32]) -> Result<(), SyscallError>
 {
-    // SAFETY: caller contract.
-    let cs = unsafe { &*cspace_ptr };
-    for (i, &idx) in indices.iter().take(cap_count).enumerate()
+    for (i, &idx) in slots.iter().enumerate()
     {
-        if indices[..i].contains(&idx)
+        if slots[..i].contains(&idx)
         {
             return Err(SyscallError::InvalidArgument);
         }
@@ -581,8 +531,9 @@ pub fn sys_ipc_call(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     if cap_count > 0
     {
         let indices = unpack_cap_slots(cap_packed, cap_count);
+        // Fail-fast reject before blocking (see prevalidate_transfer_slots).
         // SAFETY: cspace_ptr validated above.
-        unsafe { prevalidate_call_caps(cspace_ptr, &indices, cap_count) }?;
+        prevalidate_transfer_slots(unsafe { &*cspace_ptr }, &indices[..cap_count])?;
         msg.cap_slots = indices;
         msg.cap_count = cap_count;
     }
@@ -952,9 +903,12 @@ unsafe fn deposit_transfer_failed_reply(caller: *mut crate::sched::thread::Threa
 /// arg0 = label, arg1 = `data_count`,
 /// arg2 = `cap_count` (0-4), arg3 = packed cap slot indices (4 × u16).
 ///
-/// Capabilities are moved from the server's `CSpace` to the caller's `CSpace`
-/// atomically with the reply. No GRANT right check: the server is trusted
-/// by virtue of holding RECEIVE on the endpoint.
+/// Capabilities move from the server's `CSpace` to the caller's `CSpace`
+/// all-or-nothing with the reply; a transfer refused after the caller was
+/// claimed (stale, repeated, or revoke-pinned reply slot) wakes the caller
+/// with the synthetic `IPC_REPLY_TRANSFER_FAILED` label and returns the
+/// error to the server. No GRANT right check: the server is trusted by
+/// virtue of holding RECEIVE on the endpoint.
 // too_many_lines: a single logical operation (validate + cap pre-alloc + reply
 // dispatch, with a fault-reply fast path); splitting would obscure the
 // all-or-nothing reply atomicity.

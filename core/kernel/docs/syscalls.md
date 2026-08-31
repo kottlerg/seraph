@@ -240,7 +240,8 @@ IPC buffer page after the server replies.
 - `rax`/`a0`: 0 on success; `SyscallError` on failure
 - `rdx`/`a1`: reply label (valid on success)
 
-**Capability requirement:** `endpoint_cap` must have Send rights.
+**Capability requirement:** `endpoint_cap` must have Send rights, plus Grant
+when the message carries capabilities.
 
 **Errors:** `InvalidCapability` (also: a cap slot is stale or Null),
 `InsufficientRights`, `InvalidArgument` (bad count, a cap slot repeated in one

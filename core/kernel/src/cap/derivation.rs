@@ -789,9 +789,9 @@ mod tests
 
         assert_eq!(status, BatchStatus::DeadLink);
         assert_eq!(collected, 0, "nothing collectable behind a dead link");
-        // Containment: the dangling chain is cut so a retry cannot spin
-        // (root still resolves; its child list is empty).
-        assert_eq!(root_state, Some(None));
+        // Containment: the dangling chain is cut so a retry cannot spin.
+        let root_child = root_state.expect("root must still resolve");
+        assert_eq!(root_child, None, "root's child list must be cut");
         crate::cap::unregister_cspace(ID_A);
     }
 }

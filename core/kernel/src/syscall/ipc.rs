@@ -635,8 +635,8 @@ static RECV_PREALLOC_FAIL_COUNT: core::sync::atomic::AtomicU32 =
 /// may have no log channel of its own (memmgr). Log occurrences at powers of
 /// two: flood-proof against an unguarded spinner, while later wedges still
 /// surface and the occurrence count itself conveys the spin rate. The cause
-/// mirrors the `CapError` distinction (#366): `max_slots` quota versus
-/// refillable slot-page-pool depletion.
+/// mirrors the `CapError` distinction (#366): the directory's structural
+/// ceiling versus refillable slot-page-pool depletion.
 #[cfg(not(test))]
 fn log_recv_preallocate_failure(
     tcb: *mut crate::sched::thread::ThreadControlBlock,
@@ -653,7 +653,7 @@ fn log_recv_preallocate_failure(
     }
     let cause = match err
     {
-        crate::cap::CapError::OutOfSlots => "slot-quota-reached",
+        crate::cap::CapError::OutOfSlots => "structural-ceiling",
         crate::cap::CapError::PoolExhausted => "slot-page-pool-exhausted",
         crate::cap::CapError::InvalidIndex | crate::cap::CapError::WxViolation => "unexpected",
     };

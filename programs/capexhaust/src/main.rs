@@ -12,8 +12,10 @@
 //! receive loop on the endpoint, exactly as services do; the guard's streak
 //! escalates and the process exits with `EXIT_RECV_WEDGE`.
 //!
-//! Termination of the derive loop is architectural: a `CSpace` holds at most
-//! 14336 slots, and each successful derive consumes one.
+//! Termination of the derive loop is architectural: the `CSpace`'s slot-page
+//! pool is the fixed slab procmgr seeded at spawn, this fixture never
+//! augments it, and each successful derive consumes one slot — the loop ends
+//! at pool exhaustion (`OutOfMemory`).
 //!
 //! While exhausted, the fixture also validates memmgr's failed-grant
 //! rollback: a `REQUEST_MEMORY_CAPS` whose cap-bearing reply cannot land in

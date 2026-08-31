@@ -179,8 +179,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     // ── CSpaceObj ────────────────────────────────────────────────────────────
     //
-    // 4 slot pages, max_slots 256 → fits in pool.
-    let cspace_cap = cap_create_cspace(memory, 0, 4, 256)
+    let cspace_cap = cap_create_cspace(memory, 0, 4)
         .map_err(|_| "integration::retype_reclaim: cap_create_cspace failed")?;
     let mid = read_available(memory)?;
     if mid >= baseline
@@ -202,7 +201,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     // just verify mint-then-delete reclaims correctly.
     let aspace_for_thread = cap_create_aspace(memory, 0, 8)
         .map_err(|_| "integration::retype_reclaim: cap_create_aspace (for thread) failed")?;
-    let cspace_for_thread = cap_create_cspace(memory, 0, 4, 16)
+    let cspace_for_thread = cap_create_cspace(memory, 0, 4)
         .map_err(|_| "integration::retype_reclaim: cap_create_cspace (for thread) failed")?;
     let thread_cap = cap_create_thread(memory, aspace_for_thread, cspace_for_thread, 0, 0)
         .map_err(|_| "integration::retype_reclaim: cap_create_thread failed")?;

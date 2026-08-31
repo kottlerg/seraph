@@ -893,26 +893,24 @@ pub fn cap_create_aspace(memory_cap: u32, augment_target: u32, init_pages: u64)
 /// the slot-page pool (each backs 56 slots). `init_pages` must be `>= 1`.
 ///
 /// `augment_target`:
-/// - `0` → create new with `max_slots` (clamped to `[1, 14336]`; `0`
-///   defaults to the capacity the seeded pool backs,
-///   `(init_pages - 1) * 56 - 1`); returns the new cap slot index.
-/// - non-zero → augment that `CSpace`'s growth pool; returns `0`. The
-///   `max_slots` argument is ignored in augment mode.
+/// - `0` → create new; returns the new cap slot index.
+/// - non-zero → augment that `CSpace`'s growth pool; returns `0`.
+///
+/// A `CSpace` has no slot quota: its capacity is whatever its slot-page
+/// pool backs (query via `CAP_INFO_CSPACE_CAPACITY`), bounded only by the
+/// directory's structural ceiling.
 ///
 /// # Errors
 /// Returns a negative `i64` error code on insufficient memory budget or
 /// invalid cap. A later cap insert into the `CSpace` fails with
 /// `OutOfMemory` (-8) when the seeded pool is exhausted (refill via
-/// augment mode) and `QuotaExceeded` (-17) when `max_slots` is reached.
+/// augment mode) and `QuotaExceeded` (-17) at the structural ceiling.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 #[inline]
-pub fn cap_create_cspace(
-    memory_cap: u32,
-    augment_target: u32,
-    init_pages: u64,
-    max_slots: u64,
-) -> Result<u32, i64>
+pub fn cap_create_cspace(memory_cap: u32, augment_target: u32, init_pages: u64)
+-> Result<u32, i64>
 {
+    // arg3 is reserved (the removed `max_slots` quota) and must be 0.
     // SAFETY: syscall4 issues a raw syscall; arguments are scalar.
     let ret = unsafe {
         syscall4(
@@ -920,7 +918,7 @@ pub fn cap_create_cspace(
             u64::from(memory_cap),
             u64::from(augment_target),
             init_pages,
-            max_slots,
+            0,
         )
     };
     if ret < 0 { Err(ret) } else { Ok(ret as u32) }

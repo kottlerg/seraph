@@ -46,7 +46,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     // is isolated from the test's own address space.
     let aspace = cap_create_aspace(ctx.memory_base, 0, 8)
         .map_err(|_| "aspace_fault_notification_late_bind: cap_create_aspace failed")?;
-    let cspace = cap_create_cspace(ctx.memory_base, 0, 4, 16)
+    let cspace = cap_create_cspace(ctx.memory_base, 0, 4)
         .map_err(|_| "aspace_fault_notification_late_bind: cap_create_cspace failed")?;
     let thread = cap_create_thread(ctx.memory_base, aspace, cspace, 0, 0)
         .map_err(|_| "aspace_fault_notification_late_bind: cap_create_thread failed")?;

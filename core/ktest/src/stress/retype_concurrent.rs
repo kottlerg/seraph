@@ -61,7 +61,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     for i in 0..NUM_WORKERS
     {
-        let cs = cap_create_cspace(memory, 0, 4, 64)
+        let cs = cap_create_cspace(memory, 0, 4)
             .map_err(|_| "stress::retype_concurrent: create_cspace failed")?;
         let child_memory = cap_copy(
             memory,

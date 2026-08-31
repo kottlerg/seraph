@@ -196,9 +196,9 @@ pub enum SyscallError
     /// A blocking operation was cancelled because the thread was stopped.
     /// The stopped thread sees this as the return value of its blocked syscall.
     Interrupted = -16,
-    /// A per-object quota was reached (e.g. a `CSpace`'s `max_slots`).
-    /// Unlike `OutOfMemory`, donating memory (augment mode) cannot satisfy
-    /// the request.
+    /// A structural per-object ceiling was reached (e.g. a `CSpace`'s
+    /// directory is full). Unlike `OutOfMemory`, donating memory (augment
+    /// mode) cannot satisfy the request.
     QuotaExceeded = -17,
 }
 ```
@@ -283,7 +283,7 @@ written to the original caller's IPC buffer page.
 **Errors:** `InvalidCapability` (no pending reply, or a reply cap slot went
 stale), `InvalidArgument` (also: a cap slot repeated in one reply),
 `InvalidState` (a reply cap slot is pinned by an in-flight `SYS_CAP_REVOKE`),
-`QuotaExceeded` (caller's CSpace at slot quota for reply cap transfer),
+`QuotaExceeded` (caller's CSpace directory structurally full for reply cap transfer),
 `OutOfMemory` (slot-page pool exhausted), `Interrupted`. When the reply cap
 transfer is refused after the caller was already claimed, the caller is still
 woken — it resumes with the `IPC_REPLY_TRANSFER_FAILED` label and zero caps —
@@ -318,7 +318,7 @@ The badge is the value attached to the sender's endpoint capability via
 **Capability requirement:** `endpoint_cap` must have Receive rights.
 
 **Errors:** `InvalidCapability`, `InsufficientRights`, `QuotaExceeded` (server's CSpace
-at slot quota for an incoming cap transfer), `OutOfMemory` (slot-page pool exhausted),
+directory structurally full for an incoming cap transfer), `OutOfMemory` (slot-page pool exhausted),
 `Interrupted`. If an already-queued sender's cap transfer is refused (a source
 slot went stale or is pinned by an in-flight `SYS_CAP_REVOKE`), the message is
 still delivered — with zero caps; the sender keeps its capabilities.
@@ -468,7 +468,7 @@ Send + Receive + Grant rights.
 
 **Errors:** `InvalidCapability`, `InsufficientRights` (source Memory cap lacks Retype),
 `OutOfMemory` (Memory cap region or slot-page pool exhausted), `QuotaExceeded`
-(caller's CSpace at slot quota).
+(caller's CSpace directory structurally full).
 
 ---
 
@@ -489,7 +489,7 @@ Notification + Wait rights.
 
 **Errors:** `InvalidCapability`, `InsufficientRights` (source Memory cap lacks Retype),
 `OutOfMemory` (Memory cap region or slot-page pool exhausted), `QuotaExceeded`
-(caller's CSpace at slot quota).
+(caller's CSpace directory structurally full).
 
 ---
 
@@ -511,7 +511,7 @@ Retype a Memory capability into a new event queue with a fixed capacity.
 
 **Errors:** `InvalidArgument` (capacity 0 or exceeds maximum), `InvalidCapability`,
 `InsufficientRights` (source Memory cap lacks Retype), `OutOfMemory` (Memory cap region
-or slot-page pool exhausted), `QuotaExceeded` (caller's CSpace at slot quota).
+or slot-page pool exhausted), `QuotaExceeded` (caller's CSpace directory structurally full).
 
 ---
 
@@ -550,8 +550,8 @@ address space's mappings is inherently trusted to create threads that execute wi
 **Errors:** `InvalidCapability`, `InsufficientRights` (a source cap lacks Retype/Map/Insert
 respectively, or `priority` is outside `sched_cap`'s band), `InvalidArgument` (nonzero
 `priority` without a `SchedControl` cap, or `priority` > `PRIORITY_MAX`), `OutOfMemory`
-(Memory cap region or slot-page pool exhausted), `QuotaExceeded` (caller's CSpace at slot
-quota).
+(Memory cap region or slot-page pool exhausted), `QuotaExceeded` (caller's CSpace
+directory structurally full).
 
 ---
 
@@ -581,7 +581,7 @@ rights); augment-mode — `0`. `SyscallError` on failure.
 **Errors:** `InvalidArgument` (`init_pages` 0, overflow, or create-mode `init_pages < 2`),
 `InvalidCapability`, `InsufficientRights` (source Memory cap lacks Retype, or augment
 target lacks Map), `OutOfMemory` (Memory cap region or slot-page pool exhausted),
-`QuotaExceeded` (caller's CSpace at slot quota).
+`QuotaExceeded` (caller's CSpace directory structurally full).
 
 ---
 
@@ -602,7 +602,7 @@ Retype a Memory capability into a new wait set.
 
 **Errors:** `InvalidCapability`, `InsufficientRights` (source Memory cap lacks Retype),
 `OutOfMemory` (Memory cap region or slot-page pool exhausted), `QuotaExceeded`
-(caller's CSpace at slot quota).
+(caller's CSpace directory structurally full).
 
 ---
 
@@ -625,7 +625,7 @@ silently masked off rather than rejected, so derivation can only attenuate. The
 derivation is recorded in the global derivation tree for revocation tracking.
 
 **Errors:** `InvalidCapability` (source invalid or null), `OutOfMemory` (slot-page pool
-exhausted), `QuotaExceeded` (caller's CSpace at slot quota).
+exhausted), `QuotaExceeded` (caller's CSpace directory structurally full).
 
 If the source capability has a non-zero badge, the derived capability inherits it.
 
@@ -659,7 +659,7 @@ on an already-badged cap) returns `InvalidArgument`. Derivation via
 
 **Errors:** `InvalidArgument` (badge is zero or source already badged),
 `InvalidCapability`, `OutOfMemory` (slot-page pool exhausted), `QuotaExceeded`
-(caller's CSpace at slot quota).
+(caller's CSpace directory structurally full).
 
 ---
 
@@ -860,7 +860,7 @@ original's position.
 
 **Errors:** `InvalidArgument` (offset out of range or frame is already a single page),
 `InvalidCapability`, `InsufficientRights` (cap lacks Map), `OutOfMemory` (child
-allocation or slot-page pool exhausted), `QuotaExceeded` (caller's CSpace at slot quota).
+allocation or slot-page pool exhausted), `QuotaExceeded` (caller's CSpace directory structurally full).
 
 ---
 
@@ -921,7 +921,7 @@ original's derivation parent. The original `mmio_cap` is consumed.
 **Errors:** `InvalidArgument` (`split_offset` not page-aligned, zero, `>= size`, or
 fewer than one page on the upper side), `InvalidCapability`, `InsufficientRights` (cap
 lacks Map), `OutOfMemory` (child allocation or slot-page pool exhausted), `QuotaExceeded`
-(caller's CSpace at slot quota).
+(caller's CSpace directory structurally full).
 
 ---
 
@@ -1113,7 +1113,7 @@ no rights bit).
 
 **Errors:** `InvalidCapability` (not a `SchedControl`), `InvalidArgument`
 (`split_at` outside `(min, max]`), `OutOfMemory` (child allocation or slot-page pool
-exhausted), `QuotaExceeded` (caller's CSpace at slot quota).
+exhausted), `QuotaExceeded` (caller's CSpace directory structurally full).
 
 ---
 
@@ -1472,7 +1472,7 @@ derivation parent. The original `irq_cap` is consumed.
 
 **Errors:** `InvalidArgument` (`split_at` outside `(start, start+count)`),
 `InvalidCapability`, `InsufficientRights` (cap lacks Notify), `OutOfMemory` (child
-allocation or slot-page pool exhausted), `QuotaExceeded` (caller's CSpace at slot quota).
+allocation or slot-page pool exhausted), `QuotaExceeded` (caller's CSpace directory structurally full).
 
 ---
 
@@ -1505,7 +1505,7 @@ derivation parent. The original `ioport_cap` is consumed.
 **Errors:** `NotSupported` (RISC-V — no I/O ports), `InvalidArgument` (`split_at` 0,
 `> 0xFFFF`, or outside `(base, base+size)`), `InvalidCapability`, `InsufficientRights`
 (cap lacks Use), `OutOfMemory` (child allocation or slot-page pool exhausted),
-`QuotaExceeded` (caller's CSpace at slot quota).
+`QuotaExceeded` (caller's CSpace directory structurally full).
 
 ---
 
@@ -1552,17 +1552,18 @@ pages to an existing CSpace's slot-page pool (augment-mode).
 | 0 | `memory_cap` | Memory capability (Retype rights) the CSpace slab is carved from |
 | 1 | `augment_cap` | `0` for create-mode; otherwise a CSpace cap (Insert rights) whose slot-page pool receives the carved pages |
 | 2 | `init_pages` | Pages to carve (page 0 is the wrapper; pages `1..init_pages` seed the slot-page pool) |
-| 3 | `max_slots` | Create-mode only: hard cap on usable slots, clamped to `[1, 14336]`; `0` defaults to what the seeded pool backs. Ignored in augment-mode |
+| 3 | — | Reserved (formerly `max_slots`); MUST be `0` in both modes, else `InvalidArgument` |
 
 **Return:** `rax`/`a0`: create-mode — new CSpace capability (Insert + Delete + Derive
 rights); augment-mode — `0`. `SyscallError` on failure.
 
 **Capability requirements:** `memory_cap` (Retype); in augment-mode, `augment_cap` (Insert).
 
-**Errors:** `InvalidArgument` (`init_pages` 0 or overflow), `InvalidCapability`,
+**Errors:** `InvalidArgument` (`init_pages` 0 or overflow, or arg 3 non-zero),
+`InvalidCapability`,
 `InsufficientRights` (source Memory cap lacks Retype, or augment target lacks Insert),
 `OutOfMemory` (Memory cap region or slot-page pool exhausted), `QuotaExceeded`
-(caller's CSpace at slot quota).
+(caller's CSpace directory structurally full).
 
 ---
 
@@ -1596,7 +1597,7 @@ absorbed the former `SYS_CAP_INSERT` (slot 32, now reserved).
 
 **Errors:** `InvalidCapability`, `InsufficientRights` (dst CSpace lacks Insert),
 `InvalidArgument` (dst_slot occupied or out of range), `OutOfMemory` (slot-page pool
-exhausted), `QuotaExceeded` (dst CSpace at slot quota).
+exhausted), `QuotaExceeded` (dst CSpace directory structurally full).
 
 ---
 
@@ -1619,7 +1620,7 @@ the source slot is cleared; the destination inherits the source's derivation pos
 
 **Errors:** `InvalidCapability`, `InsufficientRights` (dst CSpace lacks Insert),
 `InvalidArgument` (dst_slot occupied or out of range), `OutOfMemory` (slot-page pool
-exhausted), `QuotaExceeded` (dst CSpace at slot quota), `InvalidState` (a
+exhausted), `QuotaExceeded` (dst CSpace directory structurally full), `InvalidState` (a
 `SYS_CAP_REVOKE` is in flight on the source slot).
 
 ---

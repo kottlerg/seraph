@@ -371,9 +371,9 @@ pub fn preempt_isolation(ctx: &TestContext) -> TestResult
         .map_err(|_| "create_notification a for fpu::preempt_isolation failed")?;
     let sig_b = cap_create_notification(ctx.memory_base)
         .map_err(|_| "create_notification b for fpu::preempt_isolation failed")?;
-    let cs_a = cap_create_cspace(ctx.memory_base, 0, 4, 16)
+    let cs_a = cap_create_cspace(ctx.memory_base, 0, 4)
         .map_err(|_| "create_cspace a for fpu::preempt_isolation failed")?;
-    let cs_b = cap_create_cspace(ctx.memory_base, 0, 4, 16)
+    let cs_b = cap_create_cspace(ctx.memory_base, 0, 4)
         .map_err(|_| "create_cspace b for fpu::preempt_isolation failed")?;
     let child_sig_a = cap_copy(sig_a, cs_a, RIGHTS_NOTIFY)
         .map_err(|_| "cap_copy sig_a for fpu::preempt_isolation failed")?;
@@ -734,7 +734,7 @@ pub fn preempt_isolation_cross_cpu(ctx: &TestContext) -> TestResult
             .map_err(|_| "create_notification resume for preempt_isolation_cross_cpu failed")?;
         let sig_done = cap_create_notification(ctx.memory_base)
             .map_err(|_| "create_notification done for preempt_isolation_cross_cpu failed")?;
-        let cs = cap_create_cspace(ctx.memory_base, 0, 4, 16)
+        let cs = cap_create_cspace(ctx.memory_base, 0, 4)
             .map_err(|_| "create_cspace for preempt_isolation_cross_cpu failed")?;
 
         let child_ready = cap_copy(sig_ready, cs, RIGHTS_NOTIFY)

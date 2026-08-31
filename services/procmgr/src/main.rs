@@ -229,10 +229,11 @@ pub(crate) const ASPACE_RETYPE_PAGES: u64 = 48;
 /// metadata footprint, and the kernel reserves the slab's page 0 as the
 /// wrapper page.
 ///
-/// Seed-to-cover policy (#366): the seeded pool MUST back the child's
-/// full `max_slots = 256` quota so a cap insert can never fail on pool
-/// exhaustion below quota. 7 pages → 6 to the kernel → 5 pool pages →
-/// 5 × 56 − 1 = 279 usable slots ≥ 256.
+/// Seeded for the expected startup population of a spawned child
+/// (bootstrap caps plus working headroom); a child that outgrows the
+/// pool sees the refillable `OutOfMemory` and self-funds via
+/// augment-mode `cap_create_cspace`. 7 pages → 6 to the kernel →
+/// 5 pool pages → 5 × 56 − 1 = 279 usable slots.
 pub(crate) const CSPACE_RETYPE_PAGES: u64 = 7;
 
 /// Register a new child with memmgr. On success returns

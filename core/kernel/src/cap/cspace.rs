@@ -7,7 +7,9 @@
 //!
 //! A [`CSpace`] is a two-level directory of [`CapabilitySlot`]s. The directory
 //! has [`L1_SIZE`] entries; each points to a [`CSpacePage`] containing
-//! [`L2_SIZE`] slots. Maximum capacity: `L1_SIZE * L2_SIZE = 14336` slots.
+//! [`L2_SIZE`] slots. Capacity is bounded only by the pool pages the owner
+//! has donated (see Growth below) and the directory's structural ceiling of
+//! `L1_SIZE * L2_SIZE = 14336` slots.
 //!
 //! ## Free list
 //!
@@ -60,8 +62,9 @@ const _: () = assert!(L1_SIZE * L2_SIZE <= (1usize << syscall::CAP_INDEX_BITS));
 #[derive(Debug, PartialEq, Eq)]
 pub enum CapError
 {
-    /// No free slots remain and the `CSpace` is at `max_slots` (or the
-    /// directory is full). A hard quota: donating memory cannot satisfy it.
+    /// The directory is full: every `L1_SIZE` entry is populated and no
+    /// free slot remains. A structural ceiling derived from the directory
+    /// shape and the cap-handle index width; donating memory cannot lift it.
     OutOfSlots,
     /// The slot-page pool was exhausted while growing. Refillable: donate
     /// pages via augment-mode `cap_create_cspace`. (Host-test heap path:
@@ -75,7 +78,7 @@ pub enum CapError
 
 /// The one canonical `CapError` → `SyscallError` mapping. Every syscall-path
 /// consumer routes through this so the pool-exhausted (refillable,
-/// `OutOfMemory`) vs quota-reached (hard, `QuotaExceeded`) distinction
+/// `OutOfMemory`) vs structural-ceiling (hard, `QuotaExceeded`) distinction
 /// reaches userspace uniformly (#366).
 impl From<CapError> for syscall::SyscallError
 {
@@ -143,8 +146,6 @@ pub struct CSpace
     directory: [Option<NonNull<CSpacePage>>; L1_SIZE],
     /// Total usable slots allocated across all pages (excludes slot 0).
     allocated_slots: usize,
-    /// Maximum number of usable slots this `CSpace` may hold.
-    max_slots: usize,
     /// Head of the intrusive free list; None if no free slots.
     ///
     /// Slot 0 is permanently null and never placed on the free list, so the
@@ -172,13 +173,12 @@ impl CSpace
     /// Create an empty `CSpace`. No pages are allocated until the first slot
     /// is requested. The pool source defaults to null (heap path); call
     /// [`Self::set_kobj`] to switch to a retype pool.
-    pub fn new(id: CSpaceId, max_slots: usize) -> Self
+    pub fn new(id: CSpaceId) -> Self
     {
         Self {
             id,
             directory: core::array::from_fn(|_| None),
             allocated_slots: 0,
-            max_slots,
             free_head: None,
             free_count: 0,
             lock: crate::sync::Spinlock::new(),
@@ -214,9 +214,10 @@ impl CSpace
 
     /// Allocate a free slot index, growing the `CSpace` if needed.
     ///
-    /// Returns [`CapError::OutOfSlots`] if `max_slots` is reached, or
-    /// [`CapError::PoolExhausted`] if the slot-page pool has no page left.
-    /// The returned slot is cleared to null; callers must populate it.
+    /// Returns [`CapError::OutOfSlots`] if the directory is structurally
+    /// full, or [`CapError::PoolExhausted`] if the slot-page pool has no
+    /// page left. The returned slot is cleared to null; callers must
+    /// populate it.
     ///
     /// The returned index is always non-zero (slot 0 is reserved).
     pub fn allocate_slot(&mut self) -> Result<NonZeroU32, CapError>
@@ -269,15 +270,7 @@ impl CSpace
 
         let base = page_idx * L2_SIZE;
         let start_slot = usize::from(page_idx == 0);
-
-        let available = L2_SIZE - start_slot;
-        let remaining_quota = self.max_slots.saturating_sub(self.allocated_slots);
-        let new_free = available.min(remaining_quota);
-
-        if new_free == 0
-        {
-            return Err(CapError::OutOfSlots);
-        }
+        let new_free = L2_SIZE - start_slot;
 
         // Source the page from the retype-pool. Production CSpaces are
         // always retype-backed (root CSpace via `boot_retype_cspace`,
@@ -296,10 +289,9 @@ impl CSpace
             else
             {
                 crate::kprintln!(
-                    "cspace {}: slot-page pool exhausted (allocated={}, max={})",
+                    "cspace {}: slot-page pool exhausted (allocated={})",
                     self.id,
-                    self.allocated_slots,
-                    self.max_slots
+                    self.allocated_slots
                 );
                 return Err(CapError::PoolExhausted);
             };
@@ -620,8 +612,8 @@ impl CSpace
             return Err(CapError::InvalidIndex); // slot 0 is permanently null
         }
 
-        // Reject indices beyond the CSpace's maximum capacity.
-        if index as usize >= self.max_slots
+        // Reject indices beyond the directory's structural ceiling.
+        if index as usize >= L1_SIZE * L2_SIZE
         {
             return Err(CapError::InvalidIndex);
         }
@@ -667,15 +659,14 @@ impl CSpace
         self.allocated_slots - self.free_count
     }
 
-    /// Return the configured maximum number of usable slots.
+    /// Total usable slots allocated across all pages (excludes slot 0).
     ///
-    /// Set at construction via [`Self::new`]; immutable thereafter.
-    /// Used by `SYS_CAP_INFO`'s `CAP_INFO_CSPACE_CAPACITY` field to expose
-    /// the slot capacity to userspace inspection without granting any
-    /// mutation authority.
-    pub fn max_slots(&self) -> usize
+    /// Used by `SYS_CAP_INFO`'s `CAP_INFO_CSPACE_CAPACITY` handler, which
+    /// reports the currently-backed capacity: this count plus what the
+    /// remaining growth-budget pages would add.
+    pub fn allocated_slots(&self) -> usize
     {
-        self.max_slots
+        self.allocated_slots
     }
 
     /// Call `f` for each non-null slot's kernel object pointer.
@@ -772,7 +763,7 @@ mod tests
     #[test]
     fn new_cspace_is_empty()
     {
-        let cs = CSpace::new(0, 16384);
+        let cs = CSpace::new(0);
         assert_eq!(cs.populated_count(), 0);
         assert_eq!(cs.allocated_slots, 0);
     }
@@ -780,7 +771,7 @@ mod tests
     #[test]
     fn slot_zero_is_null()
     {
-        let mut cs = CSpace::new(0, 16384);
+        let mut cs = CSpace::new(0);
         // Force page 0 to be allocated by requesting slot 1.
         let _idx = cs.allocate_slot().unwrap();
         // Slot 0 must exist and be null.
@@ -791,14 +782,14 @@ mod tests
     #[test]
     fn allocate_returns_nonzero_index()
     {
-        let mut cs = CSpace::new(0, 16384);
+        let mut cs = CSpace::new(0);
         let _idx = cs.allocate_slot().unwrap();
     }
 
     #[test]
     fn allocate_and_lookup_round_trip()
     {
-        let mut cs = CSpace::new(0, 16384);
+        let mut cs = CSpace::new(0);
         let obj = dummy_object();
         let idx = cs
             .insert_cap_typed(MemRights::MAP | MemRights::WRITE, obj)
@@ -814,7 +805,7 @@ mod tests
     fn growth_across_l2_boundary()
     {
         // Allocate L2_SIZE - 1 slots (page 0 has 63 usable slots after skipping 0).
-        let mut cs = CSpace::new(0, 16384);
+        let mut cs = CSpace::new(0);
         let mut indices = Vec::new();
         for _ in 0..(L2_SIZE - 1)
         {
@@ -832,25 +823,12 @@ mod tests
     #[test]
     fn free_and_reallocate()
     {
-        let mut cs = CSpace::new(0, 16384);
+        let mut cs = CSpace::new(0);
         let idx1 = cs.allocate_slot().unwrap();
         cs.free_slot(idx1.get());
         // After freeing, the next allocate should return the same index.
         let idx2 = cs.allocate_slot().unwrap();
         assert_eq!(idx1, idx2, "freed slot should be reused");
-    }
-
-    #[test]
-    fn max_slots_enforced()
-    {
-        // max_slots = L2_SIZE - 1: exactly one page minus slot 0.
-        let mut cs = CSpace::new(0, L2_SIZE - 1);
-        for _ in 0..(L2_SIZE - 1)
-        {
-            cs.allocate_slot().unwrap();
-        }
-        let err = cs.allocate_slot().unwrap_err();
-        assert_eq!(err, CapError::OutOfSlots);
     }
 
     #[test]
@@ -860,7 +838,7 @@ mod tests
         // fails grow with PoolExhausted, not the OutOfSlots quota error.
         // The test-mode grow path returns before dereferencing the kobj
         // pointer, so a dangling marker stands in for a real wrapper.
-        let mut cs = CSpace::new(0, 16384);
+        let mut cs = CSpace::new(0);
         cs.set_kobj(NonNull::dangling().as_ptr());
         let err = cs.allocate_slot().unwrap_err();
         assert_eq!(err, CapError::PoolExhausted);
@@ -869,7 +847,7 @@ mod tests
     #[test]
     fn write_execute_cap_allowed()
     {
-        let mut cs = CSpace::new(0, 16384);
+        let mut cs = CSpace::new(0);
         let obj = dummy_object();
         let slot = cs
             .insert_cap_typed(MemRights::WRITE | MemRights::EXECUTE, obj)
@@ -884,7 +862,7 @@ mod tests
     #[test]
     fn pre_allocate_succeeds()
     {
-        let mut cs = CSpace::new(0, 16384);
+        let mut cs = CSpace::new(0);
         cs.pre_allocate(10).unwrap();
         assert!(cs.free_count >= 10);
     }
@@ -892,7 +870,7 @@ mod tests
     #[test]
     fn populated_count_tracks_inserts()
     {
-        let mut cs = CSpace::new(0, 16384);
+        let mut cs = CSpace::new(0);
         assert_eq!(cs.populated_count(), 0);
         let obj = dummy_object();
         cs.insert_cap_typed(MemRights::MAP, obj).unwrap();
@@ -904,7 +882,7 @@ mod tests
     {
         // Allocate 3 slots; free the first; verify next alloc reuses it rather
         // than consuming a brand-new slot beyond the current high-water mark.
-        let mut cs = CSpace::new(0, 16384);
+        let mut cs = CSpace::new(0);
         let s1 = cs.allocate_slot().unwrap();
         let s2 = cs.allocate_slot().unwrap();
         let s3 = cs.allocate_slot().unwrap();
@@ -929,7 +907,7 @@ mod tests
     fn populated_count_accurate_after_repeated_inserts()
     {
         // populated_count must increment by exactly 1 for each successful insert.
-        let mut cs = CSpace::new(0, 16384);
+        let mut cs = CSpace::new(0);
         let obj = dummy_object();
 
         for expected in 1..=5usize
@@ -948,9 +926,7 @@ mod tests
     #[test]
     fn double_free_non_head_does_not_corrupt_freelist()
     {
-        // Small CSpace so the entire free list fits in one page and the drain
-        // below is bounded.
-        let mut cs = CSpace::new(0, 5);
+        let mut cs = CSpace::new(0);
         let a = cs.allocate_slot().unwrap();
         let b = cs.allocate_slot().unwrap();
         let c = cs.allocate_slot().unwrap();
@@ -970,11 +946,13 @@ mod tests
             "non-head double-free must be rejected, not re-pushed"
         );
 
-        // Drain the whole free list. A cycle would hand out a duplicate index
-        // (and inflate the count); every popped index must be unique.
+        // Drain exactly the free list (stopping before allocate_slot would
+        // grow a fresh page). A cycle would hand out a duplicate index
+        // within these pops; every popped index must be unique.
         let mut seen = Vec::new();
-        while let Ok(idx) = cs.allocate_slot()
+        for _ in 0..free_before
         {
+            let idx = cs.allocate_slot().expect("free list drained early");
             assert!(
                 !seen.contains(&idx),
                 "allocate_slot returned duplicate index {} — free list corrupted",
@@ -982,10 +960,9 @@ mod tests
             );
             seen.push(idx);
         }
-        assert_eq!(
-            seen.len(),
-            free_before,
-            "drain must recover every free slot exactly once"
+        assert!(
+            cs.free_head.is_none(),
+            "free list must be empty after draining free_count entries"
         );
     }
 }

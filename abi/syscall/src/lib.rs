@@ -297,10 +297,14 @@ pub const CAP_INFO_MEMORY_HAS_RETYPE: u64 = 3;
 /// Calling on a non-`AddressSpace` slot returns [`SyscallError::InvalidArgument`].
 pub const CAP_INFO_ASPACE_PT_BUDGET: u64 = 4;
 
-/// `CSpace` only — total slot capacity (`max_slots`).
+/// `CSpace` only — currently-backed slot capacity.
 ///
-/// Returns the `CSpace`'s `max_slots` value. Calling on a non-`CSpace` slot
-/// returns [`SyscallError::InvalidArgument`].
+/// Returns the slots already threaded onto allocated pages plus the slots
+/// the remaining growth-budget pages would back. Grows with augment-mode
+/// `cap_create_cspace` donations. A mild over-estimate on a `CSpace` that
+/// has not yet allocated its first page (slot 0 is reserved); subtracting
+/// [`CAP_INFO_CSPACE_USED`] yields headroom, which tolerates that. Calling
+/// on a non-`CSpace` slot returns [`SyscallError::InvalidArgument`].
 pub const CAP_INFO_CSPACE_CAPACITY: u64 = 5;
 
 /// `CSpace` only — number of currently populated (non-null) slots.
@@ -461,9 +465,9 @@ pub enum SyscallError
     /// A blocking operation was cancelled because the thread was stopped.
     /// The stopped thread sees this as the return value of its blocked syscall.
     Interrupted = -16,
-    /// A per-object quota was reached (e.g. a `CSpace`'s `max_slots`).
-    /// Unlike `OutOfMemory`, donating memory (augment mode) cannot satisfy
-    /// the request.
+    /// A structural per-object ceiling was reached (e.g. a `CSpace`'s
+    /// directory is full). Unlike `OutOfMemory`, donating memory (augment
+    /// mode) cannot satisfy the request.
     QuotaExceeded = -17,
 }
 

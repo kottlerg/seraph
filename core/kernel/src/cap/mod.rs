@@ -466,9 +466,6 @@ pub fn sum_memory_available_bytes(cspace: &cspace::CSpace) -> u64
     sum
 }
 
-/// Maximum slots in the root `CSpace` (full two-level directory).
-const ROOT_CSPACE_MAX_SLOTS: usize = 14336;
-
 /// Target slot capacity for the root `CSpace`'s initial slot-page pool.
 ///
 /// `populate_cspace` plus [`mint_module_memory_caps`] mint ~150 caps into
@@ -487,15 +484,14 @@ const ROOT_CSPACE_MAX_SLOTS: usize = 14336;
 /// either retries indefinitely (e.g. `request_round` in a child) or
 /// surfaces an unexpected `OutOfMemory`.
 ///
-/// This is the one creation site deliberately seeded below its
-/// `max_slots` quota (see docs/capability-model.md, growth budgets):
-/// backing all `ROOT_CSPACE_MAX_SLOTS` would cost 257 SEED pages
-/// (~1 MiB) for a `CSpace` whose occupancy peaks at boot and is bounded
-/// in steady state. Growth past the seeded pool returns the refillable
+/// Sized for the expected startup population per the seeding policy in
+/// docs/capability-model.md (growth budgets): backing the directory's
+/// full structural ceiling would cost 257 SEED pages (~1 MiB) for a
+/// `CSpace` whose occupancy peaks at boot and is bounded in steady
+/// state. Growth past the seeded pool returns the refillable
 /// `OutOfMemory`; init owns the shortfall and can refill via
 /// augment-mode `cap_create_cspace` against its own `CSpace` cap
-/// (`ProcessInfo.cspace_cap`). The `ROOT_CSPACE_MAX_SLOTS` quota only
-/// binds after such a refill.
+/// (`ProcessInfo.cspace_cap`).
 #[cfg(not(test))]
 const ROOT_CSPACE_INIT_SLOT_CAPACITY: u64 = 1536;
 
@@ -1098,7 +1094,6 @@ pub(crate) unsafe fn boot_retype_aspace(
 pub(crate) unsafe fn boot_retype_cspace(
     seed: &object::MemoryObject,
     init_pages: u64,
-    max_slots: usize,
     id: CSpaceId,
 ) -> (NonNull<object::KernelObjectHeader>, *mut cspace::CSpace)
 {
@@ -1136,7 +1131,7 @@ pub(crate) unsafe fn boot_retype_cspace(
     let cs_ptr = unsafe { wrapper_virt.add(cs_offset) }.cast::<CSpace>();
 
     // SAFETY: cs_ptr lives in the wrapper page, exclusively owned.
-    unsafe { core::ptr::write(cs_ptr, CSpace::new(id, max_slots)) };
+    unsafe { core::ptr::write(cs_ptr, CSpace::new(id)) };
 
     // SAFETY: cs_kobj_ptr is page-aligned and exclusively owned.
     unsafe {
@@ -1427,14 +1422,8 @@ pub fn init_capability_system(mmio_apertures: &[MmioAperture], boot_info_phys: u
             "root CSpace must receive id 0 (free list empty at boot)"
         );
         // SAFETY: SEED installed above.
-        let (_cs_kobj_nn, cs_ptr) = unsafe {
-            boot_retype_cspace(
-                seed_memory_ref(),
-                ROOT_CSPACE_INIT_PAGES,
-                ROOT_CSPACE_MAX_SLOTS,
-                id,
-            )
-        };
+        let (_cs_kobj_nn, cs_ptr) =
+            unsafe { boot_retype_cspace(seed_memory_ref(), ROOT_CSPACE_INIT_PAGES, id) };
         // The root CSpace's epoch is fixed at 1 (initial registry value) and
         // never bumps — it's never recycled (asserted in `free_cspace_id`),
         // so we discard the returned value.
@@ -1462,7 +1451,7 @@ pub fn init_capability_system(mmio_apertures: &[MmioAperture], boot_info_phys: u
     #[cfg(test)]
     {
         let id = alloc_cspace_id().expect("root CSpace: alloc_cspace_id exhausted at boot");
-        let mut cspace = Box::new(CSpace::new(id, ROOT_CSPACE_MAX_SLOTS));
+        let mut cspace = Box::new(CSpace::new(id));
         let empty: [RamBlock; 0] = [];
         let mut layout = populate_cspace(&mut cspace, &empty, mmap, mmio_apertures, info);
         mint_module_memory_caps(&mut cspace, info, &mut layout);

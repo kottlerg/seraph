@@ -1428,7 +1428,7 @@ fn create_process_from_bytes(
         ipc_buf,
     )?;
     let child_cspace =
-        syscall::cap_create_cspace(cspace_slab, 0, crate::CSPACE_RETYPE_PAGES - 1, 256).ok()?;
+        syscall::cap_create_cspace(cspace_slab, 0, crate::CSPACE_RETYPE_PAGES - 1).ok()?;
     let _ = syscall::cap_delete(cspace_slab);
     let thread_slab = crate::memmgr_alloc_pages_contig(
         universals.memmgr_endpoint,
@@ -2234,14 +2234,12 @@ pub fn create_process_from_file(
                 let _ = syscall::cap_delete(child_aspace);
                 procmgr_errors::OUT_OF_MEMORY
             })?;
-    let child_cspace =
-        syscall::cap_create_cspace(cspace_slab, 0, crate::CSPACE_RETYPE_PAGES - 1, 256).map_err(
-            |_| {
-                let _ = syscall::cap_delete(cspace_slab);
-                let _ = syscall::cap_delete(child_aspace);
-                procmgr_errors::OUT_OF_MEMORY
-            },
-        )?;
+    let child_cspace = syscall::cap_create_cspace(cspace_slab, 0, crate::CSPACE_RETYPE_PAGES - 1)
+        .map_err(|_| {
+        let _ = syscall::cap_delete(cspace_slab);
+        let _ = syscall::cap_delete(child_aspace);
+        procmgr_errors::OUT_OF_MEMORY
+    })?;
     let _ = syscall::cap_delete(cspace_slab);
     let thread_slab =
         crate::memmgr_alloc_pages_contig(mms.cap(), crate::THREAD_RETYPE_PAGES, ipc_buf)

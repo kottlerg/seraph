@@ -180,13 +180,13 @@ fn unpack_cap_slots(packed: u64, count: usize) -> [u32; MSG_CAP_SLOTS_MAX]
 
 /// Move `src_slots[..cap_count]` from `src_cspace` to `dst_cspace`.
 ///
-/// All-or-nothing: if any slot is null/invalid, carries an in-flight
-/// revoke (`CapabilitySlot::revoke_in_progress`), or the destination is
-/// full (`pre_allocate` fails), returns an error and no caps are
-/// transferred. Validation runs twice: an unlocked fast-path reject, then
-/// a locked re-validation immediately before the moves, so concurrent
-/// frees or revoke-marker changes cannot slip between validation and
-/// transfer.
+/// All-or-nothing: if any slot is null/invalid, repeated within the same
+/// message, carries an in-flight revoke
+/// (`CapabilitySlot::revoke_in_progress`), or the destination is full
+/// (`pre_allocate` fails), returns an error and no caps are transferred.
+/// Validation runs twice: an unlocked fast-path reject, then a locked
+/// re-validation immediately before the moves, so concurrent frees or
+/// revoke-marker changes cannot slip between validation and transfer.
 ///
 /// On success, writes the destination slot indices to `dst_indices_out` and
 /// returns the number of caps transferred. The caller is responsible for
@@ -214,19 +214,29 @@ unsafe fn transfer_caps(
         return Ok(0);
     }
 
-    // Pre-validate: all source slots must be non-null. The index is bare (the
-    // send pack stripped the generation), so this cannot reject a sender's stale,
-    // recycled handle — the send-path residual documented on `unpack_cap_slots`
-    // (#349).
+    // Pre-validate: all source slots must be non-null, unpinned, and
+    // distinct. Purely a fast-path reject before the pre-allocation work —
+    // the locked re-validation below is the authoritative check. The index
+    // is bare (the send pack stripped the generation), so this cannot
+    // reject a sender's stale, recycled handle — the send-path residual
+    // documented on `unpack_cap_slots` (#349).
     {
         // SAFETY: src_cspace validated by caller.
         let cs = unsafe { &*src_cspace };
-        for &idx in &src_slots[..cap_count]
+        for (i, &idx) in src_slots[..cap_count].iter().enumerate()
         {
+            if src_slots[..i].contains(&idx)
+            {
+                return Err(SyscallError::InvalidArgument);
+            }
             let slot = cs.slot(idx).ok_or(SyscallError::InvalidCapability)?;
             if slot.tag == CapTag::Null
             {
                 return Err(SyscallError::InvalidCapability);
+            }
+            if slot.revoke_in_progress()
+            {
+                return Err(SyscallError::InvalidState);
             }
         }
     }
@@ -277,26 +287,36 @@ unsafe fn transfer_caps(
 
     // Re-validate under the locks: a source slot can be freed, or gain a
     // revoke-in-progress marker, between the unlocked pre-validation and
-    // lock acquisition. Failing here preserves the all-or-nothing contract
+    // lock acquisition. Duplicate indices are rejected here too — the first
+    // move of a repeated index would free the slot the second move then
+    // reads as Null. Failing here preserves the all-or-nothing contract
     // (nothing has moved yet) and keeps the per-move failure branch below
     // genuinely unreachable — without this, a sender naming a sibling
-    // thread's mid-revoke root would trip that branch from userspace.
+    // thread's mid-revoke root, or packing one index twice, would trip that
+    // branch from userspace.
     {
         // SAFETY: src_cspace validated by caller; both locks held.
         let cs = unsafe { &*src_cspace };
-        for &idx in &src_slots[..cap_count]
+        for (i, &idx) in src_slots[..cap_count].iter().enumerate()
         {
-            let err = match cs.slot(idx)
+            let err = if src_slots[..i].contains(&idx)
             {
-                None => Some(SyscallError::InvalidCapability),
-                Some(slot) if slot.tag == CapTag::Null => Some(SyscallError::InvalidCapability),
-                Some(slot) if slot.revoke_in_progress() => Some(SyscallError::InvalidState),
-                Some(_) => None,
+                Some(SyscallError::InvalidArgument)
+            }
+            else
+            {
+                match cs.slot(idx)
+                {
+                    None => Some(SyscallError::InvalidCapability),
+                    Some(slot) if slot.tag == CapTag::Null => Some(SyscallError::InvalidCapability),
+                    Some(slot) if slot.revoke_in_progress() => Some(SyscallError::InvalidState),
+                    Some(_) => None,
+                }
             };
             if let Some(e) = err
             {
                 // SAFETY: saved1/saved2 from the lock_raw calls above.
-                unsafe { unlock_cspace_pair(src_cspace, dst_cspace, saved1, saved2) };
+                unsafe { crate::cap::unlock_cspace_pair(src_cspace, dst_cspace, saved1, saved2) };
                 crate::cap::DERIVATION_LOCK.write_unlock();
                 return Err(e);
             }
@@ -321,49 +341,11 @@ unsafe fn transfer_caps(
     }
 
     // SAFETY: saved1 and saved2 came from the lock_raw calls above.
-    unsafe { unlock_cspace_pair(src_cspace, dst_cspace, saved1, saved2) };
+    unsafe { crate::cap::unlock_cspace_pair(src_cspace, dst_cspace, saved1, saved2) };
 
     crate::cap::DERIVATION_LOCK.write_unlock();
 
     Ok(cap_count)
-}
-
-/// Release the pair of `CSpace` locks taken by [`transfer_caps`], in reverse
-/// order of acquisition (same-pointer pairs were locked once).
-///
-/// # Safety
-///
-/// `saved1`/`saved2` must come from the matching `lock_raw` acquisition in
-/// [`transfer_caps`]; each pair must be released exactly once.
-#[cfg(not(test))]
-unsafe fn unlock_cspace_pair(
-    src_cspace: *mut CSpace,
-    dst_cspace: *mut CSpace,
-    saved1: u64,
-    saved2: u64,
-)
-{
-    // SAFETY: caller contract.
-    unsafe {
-        use core::cmp::Ordering;
-        match src_cspace.cmp(&dst_cspace)
-        {
-            Ordering::Equal =>
-            {
-                (*src_cspace).lock.unlock_raw(saved1);
-            }
-            Ordering::Less =>
-            {
-                (*dst_cspace).lock.unlock_raw(saved2);
-                (*src_cspace).lock.unlock_raw(saved1);
-            }
-            Ordering::Greater =>
-            {
-                (*src_cspace).lock.unlock_raw(saved1);
-                (*dst_cspace).lock.unlock_raw(saved2);
-            }
-        }
-    }
 }
 
 // ── IPC syscall handlers ──────────────────────────────────────────────────────
@@ -380,8 +362,10 @@ unsafe fn unlock_cspace_pair(
 /// hazardous path of re-deriving the caller from `reply_tcb`, which a concurrent
 /// `cancel_ipc_block` / `dealloc_object(Thread)` can clear to null or free. The
 /// server pre-allocated worst-case headroom before blocking, so the move cannot
-/// OOM; on the (practically unreachable) failure the message is delivered
-/// without caps rather than stranding the already-parked caller.
+/// OOM; on failure — reachable when a source cap goes stale or is pinned by an
+/// in-flight revoke between the send and this transfer — the message is
+/// delivered without caps (the sender keeps them; the transfer fails
+/// atomically) rather than stranding the already-parked caller.
 ///
 /// # Safety
 /// `caller_tcb` must be the running thread; `server_tcb` a valid TCB pinned by
@@ -791,9 +775,14 @@ pub fn sys_ipc_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         let server_buf = unsafe { (*tcb).ipc_buffer };
 
         // Transfer caps from caller to server (if any). The pre_allocate
-        // above guarantees the destination has the worst-case headroom; the
-        // `?` propagation here is now reachable only on the unlocked race
-        // window covered by the inner pre_allocate inside `transfer_caps`.
+        // above guarantees the destination has the worst-case headroom. A
+        // failure here (a source cap gone stale, or pinned by an in-flight
+        // revoke) is post-commit — endpoint_recv already dequeued the
+        // sender and rebound it BlockedOnReply — so the message MUST still
+        // be delivered: degrade to zero caps (the transfer fails
+        // atomically, so the sender keeps its caps) rather than losing the
+        // consumed message and stranding the sender, mirroring
+        // `deliver_call_caps`.
         let mut transferred: usize = 0;
         let mut dst_indices = [0u32; MSG_CAP_SLOTS_MAX];
         if msg.cap_count > 0
@@ -810,7 +799,8 @@ pub fn sys_ipc_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                     server_cspace,
                     &mut dst_indices,
                 )
-            }?;
+            }
+            .unwrap_or(0);
         }
         // Always write cap_count to the receiver's IPC buffer — including
         // the zero-cap case — so a prior IPC's cap metadata cannot be
@@ -911,17 +901,35 @@ unsafe fn fail_reply_and_wake_caller(
     {
         return err;
     }
-    // Compose a failure reply.
+    // The reply_tcb swap above (non-null observed) is the episode claim: the
+    // synthetic failure reply is a real REPLY deposit the resume must consume.
+    // SAFETY: caller is a valid parked TCB (episode claimed by the swap).
+    unsafe { deposit_transfer_failed_reply(caller) };
+    err
+}
+
+/// Deposit a synthetic `IPC_REPLY_TRANSFER_FAILED` reply into a parked
+/// caller and wake it. The caller resumes from its `ipc_call` with the
+/// sentinel label, zero data, and zero caps.
+///
+/// # Safety
+///
+/// `caller` must be a valid parked TCB whose reply episode the invoking
+/// path has exclusively claimed (a won `reply_tcb` CAS/swap), so this is
+/// the episode's only deposit.
+#[cfg(not(test))]
+unsafe fn deposit_transfer_failed_reply(caller: *mut crate::sched::thread::ThreadControlBlock)
+{
     let mut fail_msg = crate::ipc::message::Message::new(syscall::IPC_REPLY_TRANSFER_FAILED);
     fail_msg.data_count = 0;
     fail_msg.cap_count = 0;
-    // SAFETY: caller is the parked TCB; ipc_msg is owned while parked.
+    // SAFETY: caller is the parked TCB; ipc_msg is owned while parked
+    // (caller contract).
     unsafe {
         (*caller).ipc_msg = fail_msg;
     }
-    // The reply_tcb swap above (non-null observed) is the episode claim: the
-    // synthetic failure reply is a real REPLY deposit the resume must consume.
-    // SAFETY: caller is a valid parked TCB; enqueue_and_wake transitions to Ready.
+    // SAFETY: caller is a valid parked TCB; enqueue_and_wake transitions to
+    // Ready (caller contract).
     unsafe {
         crate::sched::thread::stamp_park_deposit(
             caller,
@@ -930,7 +938,6 @@ unsafe fn fail_reply_and_wake_caller(
         let target_cpu = crate::sched::select_target_cpu(caller);
         crate::sched::enqueue_and_wake(caller, target_cpu);
     }
-    err
 }
 
 /// `SYS_IPC_REPLY` (1): reply to a blocked caller.
@@ -1125,14 +1132,33 @@ pub fn sys_ipc_reply(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 let caller_cspace = unsafe { (*caller).cspace };
                 let mut dst_indices = [0u32; MSG_CAP_SLOTS_MAX];
                 // SAFETY: CSpace pointers extracted from valid TCBs.
-                let transferred = unsafe {
+                let transfer = unsafe {
                     transfer_caps(
                         server_cspace,
                         &msg.cap_slots[..cap_count],
                         caller_cspace,
                         &mut dst_indices,
                     )
-                }?;
+                };
+                let transferred = match transfer
+                {
+                    Ok(n) => n,
+                    Err(e) =>
+                    {
+                        // Post-commit failure: the reply_tcb CAS is already
+                        // won, so the caller MUST be woken — a bare error
+                        // return here would strand it BlockedOnReply with an
+                        // unclosed park episode. Reachable when a source cap
+                        // goes stale or gains a revoke-in-progress pin
+                        // between the server's send and this transfer.
+                        // Deposit the synthetic transfer-failed reply for
+                        // the caller and surface the error to the server.
+                        // SAFETY: caller is the parked TCB whose episode the
+                        // endpoint_reply CAS claimed.
+                        unsafe { deposit_transfer_failed_reply(caller) };
+                        return Err(e);
+                    }
+                };
                 // Store cap results in caller's TCB for deferred IPC buffer write.
                 // SAFETY: caller is valid TCB returned by endpoint_reply.
                 unsafe {

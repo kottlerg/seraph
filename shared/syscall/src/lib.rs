@@ -1485,13 +1485,41 @@ pub fn cap_delete(slot: u32) -> Result<(), i64>
 /// Clears the entire descendant subtree; the root slot is preserved.
 ///
 /// # Errors
-/// Returns a negative `i64` error code if the slot index is out of range.
+/// - `InvalidCapability` (-2) — the handle names no live slot, or its
+///   generation is stale.
+/// - `InvalidState` (-15) — another revoke is already in flight on this
+///   slot, or the kernel found a corrupted derivation link (the revoke is
+///   incomplete).
+/// - `Interrupted` (-16) — the kernel's liveness backstop tripped under
+///   sustained concurrent derivation; everything revoked so far stays
+///   revoked, and a retry continues (see [`cap_revoke_all`]).
 pub fn cap_revoke(slot: u32) -> Result<(), i64>
 {
     // SAFETY: syscall2 issues raw syscall instruction; slot is cap index as u64;
     // kernel validates slot and revokes entire descendant subtree.
     let ret = unsafe { syscall2(SYS_CAP_REVOKE, u64::from(slot), 0) };
     if ret < 0 { Err(ret) } else { Ok(()) }
+}
+
+/// [`cap_revoke`], retried while the kernel reports `Interrupted` (the
+/// multi-batch liveness backstop) — each retry continues clearing the
+/// surviving subtree, so the loop finishes once concurrent derivation
+/// stops. The call sites that must fully clear a subtree before releasing
+/// its root (teardown/reclaim paths) use this form.
+///
+/// # Errors
+/// As for [`cap_revoke`], minus `Interrupted`.
+pub fn cap_revoke_all(slot: u32) -> Result<(), i64>
+{
+    loop
+    {
+        match cap_revoke(slot)
+        {
+            Err(e) if e == SyscallError::Interrupted as i64 =>
+            {}
+            other => return other,
+        }
+    }
 }
 
 /// Move a capability to another `CSpace` (`SYS_CAP_MOVE`).

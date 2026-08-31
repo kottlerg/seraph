@@ -294,7 +294,7 @@ fn do_reap(state: InitReapState, memmgr_ep: u32, ipc_buf: *mut u64)
     //    over via IPC). `dealloc_object` for AddressSpace returns PT
     //    chunks via `retype_free`; user-page mappings disappear at
     //    the same moment.
-    let _ = syscall::cap_revoke(aspace);
+    let _ = syscall::cap_revoke_all(aspace);
     let _ = syscall::cap_delete(aspace);
 
     // 4. Donate every reclaim Memory cap to memmgr. Safe now that
@@ -309,7 +309,7 @@ fn do_reap(state: InitReapState, memmgr_ep: u32, ipc_buf: *mut u64)
     //    already forwarded to memmgr's pool, and every reclaimable
     //    Memory cap was donated in step 4, so no `owns_memory` cap reaches
     //    its last reference here: nothing frees to the sealed buddy.
-    let _ = syscall::cap_revoke(cspace);
+    let _ = syscall::cap_revoke_all(cspace);
     let _ = syscall::cap_delete(cspace);
 
     // 6. Summary line so the operator can confirm the reap actually ran.

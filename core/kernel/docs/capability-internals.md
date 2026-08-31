@@ -328,10 +328,12 @@ revoke(root_handle):
         first batch: refuse if the root is already marked revoke-in-progress,
                      else set the marker
         objects, status = revoke_subtree_batch(root) // ≤ MAX_REVOKE_EDITS edits
-        final batch (status ≠ MoreWork): clear the marker
+        final batch (status ≠ MoreWork, or MAX_REVOKE_BATCHES reached):
+            clear the marker
         release derivation tree write lock
         dec_ref / dealloc each collected object      // outside the lock
-        Cleared → return success; DeadLink → return error; MoreWork → loop
+        Cleared → return success; DeadLink → return error;
+        backstop reached → return Interrupted; MoreWork → loop
 
 revoke_subtree_batch(root):
     repeat up to MAX_REVOKE_EDITS times:
@@ -368,8 +370,9 @@ lock). `SYS_CAP_DELETE`, `SYS_CAP_MOVE`, and IPC capability transfer refuse a
 marked slot with `InvalidState`: deleting or moving the root between batches
 would promote the temporarily hoisted survivors and permanently sever the
 intermediate holders' revocation authority. The marker is cleared under the
-lock on every syscall exit path, and the revoking thread never leaves the
-kernel mid-loop, so it cannot leak; a root freed by a concurrent ancestor
+lock on every syscall exit path — completion, dead-link error, and the
+`Interrupted` backstop alike — and the revoking thread runs the whole loop
+in-kernel, so it cannot leak; a root freed by a concurrent ancestor
 revoke sheds the marker with the slot (that ancestor's revoke clears the
 hoisted survivors too, since they remain inside its subtree).
 

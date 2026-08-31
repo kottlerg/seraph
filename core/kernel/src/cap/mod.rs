@@ -2401,6 +2401,41 @@ fn nonnull_from_box<T>(b: Box<T>) -> NonNull<KernelObjectHeader>
     unsafe { NonNull::new_unchecked(raw) }
 }
 
+/// Release a pair of `CSpace` locks taken in pointer-address order, in
+/// reverse order of acquisition (same-pointer pairs were locked once).
+///
+/// # Safety
+///
+/// `saved_a`/`saved_b` must come from the matching `lock_raw` acquisition
+/// over the same `(a, b)` pointer pair (lower address locked first, or a
+/// single acquisition when `a == b`); each pair must be released exactly
+/// once.
+#[cfg(not(test))]
+pub(crate) unsafe fn unlock_cspace_pair(a: *mut CSpace, b: *mut CSpace, saved_a: u64, saved_b: u64)
+{
+    // SAFETY: caller contract.
+    unsafe {
+        use core::cmp::Ordering;
+        match a.cmp(&b)
+        {
+            Ordering::Equal =>
+            {
+                (*a).lock.unlock_raw(saved_a);
+            }
+            Ordering::Less =>
+            {
+                (*b).lock.unlock_raw(saved_b);
+                (*a).lock.unlock_raw(saved_a);
+            }
+            Ordering::Greater =>
+            {
+                (*a).lock.unlock_raw(saved_a);
+                (*b).lock.unlock_raw(saved_b);
+            }
+        }
+    }
+}
+
 /// Move a capability between `CSpaces`, rewriting derivation tree pointers in place.
 ///
 /// The destination slot takes the source's exact position in the derivation

@@ -2572,17 +2572,17 @@ pub fn teardown_entry(entry: ProcessEntry, memmgr_ep: u32, ipc_buf: *mut u64)
     // owns every cap the child held) before aspace (whose dealloc walks the
     // page tables). pi_memory last — it was a leaf resource the child used
     // read-only; no other object references it.
-    let _ = syscall::cap_revoke(entry.thread_cap);
+    let _ = syscall::cap_revoke_all(entry.thread_cap);
     let _ = syscall::cap_delete(entry.thread_cap);
-    let _ = syscall::cap_revoke(entry.cspace_cap);
+    let _ = syscall::cap_revoke_all(entry.cspace_cap);
     let _ = syscall::cap_delete(entry.cspace_cap);
-    let _ = syscall::cap_revoke(entry.aspace_cap);
+    let _ = syscall::cap_revoke_all(entry.aspace_cap);
     let _ = syscall::cap_delete(entry.aspace_cap);
-    let _ = syscall::cap_revoke(entry.pi_memory_cap);
+    let _ = syscall::cap_revoke_all(entry.pi_memory_cap);
     let _ = syscall::cap_delete(entry.pi_memory_cap);
     if entry.tls_memory_cap != 0
     {
-        let _ = syscall::cap_revoke(entry.tls_memory_cap);
+        let _ = syscall::cap_revoke_all(entry.tls_memory_cap);
         let _ = syscall::cap_delete(entry.tls_memory_cap);
     }
 

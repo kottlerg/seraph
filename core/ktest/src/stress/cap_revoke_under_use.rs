@@ -112,7 +112,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         cap_delete(threads[i]).ok();
         cap_delete(cspaces[i]).ok();
     }
-    cap_delete(root).ok();
+    cap_delete(root).map_err(|_| "cap_revoke_under_use: root delete failed (marker leak?)")?;
     cap_delete(done).ok();
     Ok(())
 }

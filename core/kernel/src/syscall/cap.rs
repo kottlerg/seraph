@@ -2004,24 +2004,7 @@ pub fn sys_cap_move(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             unsafe { crate::cap::move_cap_between_cspaces(caller_cspace, src_idx, dest_cs_ptr) };
         // SAFETY: saved1/saved2 from lock_raw above; release in reverse order.
         unsafe {
-            use core::cmp::Ordering;
-            match caller_cspace.cmp(&dest_cs_ptr)
-            {
-                Ordering::Equal =>
-                {
-                    (*caller_cspace).lock.unlock_raw(saved1);
-                }
-                Ordering::Less =>
-                {
-                    (*dest_cs_ptr).lock.unlock_raw(saved2);
-                    (*caller_cspace).lock.unlock_raw(saved1);
-                }
-                Ordering::Greater =>
-                {
-                    (*caller_cspace).lock.unlock_raw(saved1);
-                    (*dest_cs_ptr).lock.unlock_raw(saved2);
-                }
-            }
+            crate::cap::unlock_cspace_pair(caller_cspace, dest_cs_ptr, saved1, saved2);
         }
         crate::cap::DERIVATION_LOCK.write_unlock();
         return Ok(u64::from(result?));
@@ -2099,24 +2082,7 @@ pub fn sys_cap_move(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         {
             // SAFETY: saved1 and saved2 came from lock_raw calls above.
             unsafe {
-                use core::cmp::Ordering;
-                match caller_cspace.cmp(&dest_cs_ptr)
-                {
-                    Ordering::Equal =>
-                    {
-                        (*caller_cspace).lock.unlock_raw(saved1);
-                    }
-                    Ordering::Less =>
-                    {
-                        (*dest_cs_ptr).lock.unlock_raw(saved2);
-                        (*caller_cspace).lock.unlock_raw(saved1);
-                    }
-                    Ordering::Greater =>
-                    {
-                        (*caller_cspace).lock.unlock_raw(saved1);
-                        (*dest_cs_ptr).lock.unlock_raw(saved2);
-                    }
-                }
+                crate::cap::unlock_cspace_pair(caller_cspace, dest_cs_ptr, saved1, saved2);
             }
             crate::cap::DERIVATION_LOCK.write_unlock();
             return Err(e);
@@ -2131,24 +2097,7 @@ pub fn sys_cap_move(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         // Unlock before returning error.
         // SAFETY: saved1 and saved2 came from lock_raw calls above.
         unsafe {
-            use core::cmp::Ordering;
-            match caller_cspace.cmp(&dest_cs_ptr)
-            {
-                Ordering::Equal =>
-                {
-                    (*caller_cspace).lock.unlock_raw(saved1);
-                }
-                Ordering::Less =>
-                {
-                    (*dest_cs_ptr).lock.unlock_raw(saved2);
-                    (*caller_cspace).lock.unlock_raw(saved1);
-                }
-                Ordering::Greater =>
-                {
-                    (*caller_cspace).lock.unlock_raw(saved1);
-                    (*dest_cs_ptr).lock.unlock_raw(saved2);
-                }
-            }
+            crate::cap::unlock_cspace_pair(caller_cspace, dest_cs_ptr, saved1, saved2);
         }
         crate::cap::DERIVATION_LOCK.write_unlock();
         return Err(e.into());
@@ -2249,24 +2198,7 @@ pub fn sys_cap_move(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // Unlock CSpaces in reverse order of acquisition.
     // SAFETY: saved1 and saved2 came from lock_raw calls above.
     unsafe {
-        use core::cmp::Ordering;
-        match caller_cspace.cmp(&dest_cs_ptr)
-        {
-            Ordering::Equal =>
-            {
-                (*caller_cspace).lock.unlock_raw(saved1);
-            }
-            Ordering::Less =>
-            {
-                (*dest_cs_ptr).lock.unlock_raw(saved2);
-                (*caller_cspace).lock.unlock_raw(saved1);
-            }
-            Ordering::Greater =>
-            {
-                (*caller_cspace).lock.unlock_raw(saved1);
-                (*dest_cs_ptr).lock.unlock_raw(saved2);
-            }
-        }
+        crate::cap::unlock_cspace_pair(caller_cspace, dest_cs_ptr, saved1, saved2);
     }
 
     crate::cap::DERIVATION_LOCK.write_unlock();

@@ -624,18 +624,28 @@ mod tests
         unsafe { (*cs).populated_count() }
     }
 
-    /// Build a derive chain of `len` nodes under `root` (each node the sole
-    /// child of the previous). Caller holds `DERIVATION_LOCK`.
-    fn build_chain(cs: *mut CSpace, id: crate::cap::slot::CSpaceId, root: SlotId, len: usize)
+    /// Link pre-occupied `nodes` as a derive chain under `root` (each node
+    /// the sole child of the previous). Nodes are allocated by the caller
+    /// before locking so no fallible call runs while `DERIVATION_LOCK` is
+    /// held; the caller holds the lock across this call.
+    fn link_chain(root: SlotId, nodes: &[SlotId])
     {
         let mut parent = root;
-        for _ in 0..len
+        for &child in nodes
         {
-            let child = occupy(cs, id);
             // SAFETY: DERIVATION_LOCK held by caller; both slots live.
             unsafe { link_child(parent, child) };
             parent = child;
         }
+    }
+
+    fn occupy_many(
+        cs: *mut CSpace,
+        id: crate::cap::slot::CSpaceId,
+        len: usize,
+    ) -> std::vec::Vec<SlotId>
+    {
+        (0..len).map(|_| occupy(cs, id)).collect()
     }
 
     #[test]
@@ -644,17 +654,18 @@ mod tests
         const ID: crate::cap::slot::CSpaceId = 3101;
         let cs = mk_registered_cspace(ID, 512);
         let root = occupy(cs, ID);
+        // Allocate before locking — no fallible call under the global lock.
+        let children = occupy_many(cs, ID, 3);
+        let grandchildren = occupy_many(cs, ID, 12);
         DERIVATION_LOCK.write_lock();
-        for _ in 0..3
+        for (c, child) in children.iter().enumerate()
         {
-            let child = occupy(cs, ID);
             // SAFETY: DERIVATION_LOCK held; both slots live.
-            unsafe { link_child(root, child) };
-            for _ in 0..4
+            unsafe { link_child(root, *child) };
+            for grandchild in &grandchildren[c * 4..(c + 1) * 4]
             {
-                let grandchild = occupy(cs, ID);
                 // SAFETY: as above.
-                unsafe { link_child(child, grandchild) };
+                unsafe { link_child(*child, *grandchild) };
             }
         }
         // SAFETY: DERIVATION_LOCK held.
@@ -682,8 +693,9 @@ mod tests
         const ID: crate::cap::slot::CSpaceId = 3102;
         let cs = mk_registered_cspace(ID, 512);
         let root = occupy(cs, ID);
+        let nodes = occupy_many(cs, ID, BUDGET_CHAIN);
         DERIVATION_LOCK.write_lock();
-        build_chain(cs, ID, root, BUDGET_CHAIN);
+        link_chain(root, &nodes);
 
         // SAFETY: DERIVATION_LOCK held.
         let (first_objects, first_status) = unsafe { revoke_subtree_batch(root) };
@@ -710,24 +722,30 @@ mod tests
         const ID: crate::cap::slot::CSpaceId = 3105;
         let cs = mk_registered_cspace(ID, 512);
         let root = occupy(cs, ID);
+        let nodes = occupy_many(cs, ID, BUDGET_CHAIN);
         DERIVATION_LOCK.write_lock();
-        build_chain(cs, ID, root, BUDGET_CHAIN);
+        link_chain(root, &nodes);
 
         // SAFETY: DERIVATION_LOCK held.
         let (first_objects, first_status) = unsafe { revoke_subtree_batch(root) };
         let first_freed = first_objects.len();
 
         // Between batches, every survivor must be a direct child of root.
+        // No panics while the global lock is held — capture, unlock, assert.
         let mut survivors = 0;
         let mut all_hoisted = true;
         // SAFETY: DERIVATION_LOCK held.
-        let mut cur = unsafe { resolve_slot_mut(root) }
-            .expect("root")
-            .deriv_first_child;
+        let mut cur = unsafe { resolve_slot_mut(root) }.and_then(|s| s.deriv_first_child);
+        let mut all_resolved = true;
         while let Some(node) = cur
         {
             // SAFETY: DERIVATION_LOCK held.
-            let slot = unsafe { resolve_slot_mut(node) }.expect("survivor resolves");
+            let Some(slot) = (unsafe { resolve_slot_mut(node) })
+            else
+            {
+                all_resolved = false;
+                break;
+            };
             all_hoisted &= slot.deriv_parent == Some(root);
             survivors += 1;
             cur = slot.deriv_next_sibling;
@@ -735,6 +753,7 @@ mod tests
         DERIVATION_LOCK.write_unlock();
 
         assert_eq!(first_status, BatchStatus::MoreWork);
+        assert!(all_resolved, "every survivor must resolve");
         assert!(all_hoisted, "every survivor hoisted under root");
         assert_eq!(survivors, BUDGET_CHAIN - first_freed);
         crate::cap::unregister_cspace(ID);
@@ -748,8 +767,8 @@ mod tests
         let cs_a = mk_registered_cspace(ID_A, 64);
         let cs_b = mk_registered_cspace(ID_B, 64);
         let root = occupy(cs_a, ID_A);
-        DERIVATION_LOCK.write_lock();
         let foreign_child = occupy(cs_b, ID_B);
+        DERIVATION_LOCK.write_lock();
         // SAFETY: DERIVATION_LOCK held; both slots live.
         unsafe { link_child(root, foreign_child) };
 
@@ -760,14 +779,16 @@ mod tests
         // SAFETY: DERIVATION_LOCK held.
         let (objects, status) = unsafe { revoke_subtree_batch(root) };
         let collected = objects.len();
+        // No panics while the global lock is held — capture, unlock, assert.
         // SAFETY: DERIVATION_LOCK held.
-        let root_child = unsafe { resolve_slot_mut(root) }
-            .expect("root")
-            .deriv_first_child;
+        let root_resolved = unsafe { resolve_slot_mut(root) }.is_some();
+        // SAFETY: DERIVATION_LOCK held.
+        let root_child = unsafe { resolve_slot_mut(root) }.and_then(|s| s.deriv_first_child);
         DERIVATION_LOCK.write_unlock();
 
         assert_eq!(status, BatchStatus::DeadLink);
         assert_eq!(collected, 0, "nothing collectable behind a dead link");
+        assert!(root_resolved, "root must still resolve");
         // Containment: the dangling chain is cut so a retry cannot spin.
         assert_eq!(root_child, None);
         crate::cap::unregister_cspace(ID_A);

@@ -2948,6 +2948,13 @@ unsafe fn drain_dying_cspace(
     }
 }
 
+/// Iteration bound for the drain's sibling walks: a dying run cannot
+/// exceed the dying `CSpace`'s slot count, so exceeding this means a
+/// corrupt sibling cycle — the walk truncates (returns `None`) instead of
+/// spinning under `DERIVATION_LOCK`.
+#[cfg(not(test))]
+const DRAIN_WALK_BOUND: usize = crate::cap::cspace::L1_SIZE * crate::cap::cspace::L2_SIZE;
+
 /// Walk `deriv_next_sibling` links starting at `from`, skipping slots that
 /// live in the dying `CSpace`, and return the first surviving sibling
 /// (`None` if the rest of the chain is dying or the chain ends).
@@ -2967,10 +2974,7 @@ unsafe fn first_live_forward(
 ) -> Option<crate::cap::slot::SlotId>
 {
     let mut cur = from;
-    // A dying run cannot exceed the dying CSpace's slot count; the bound
-    // turns a (corrupt) sibling cycle into a truncation instead of a
-    // spin under DERIVATION_LOCK.
-    for _ in 0..=crate::cap::cspace::L1_SIZE * crate::cap::cspace::L2_SIZE
+    for _ in 0..=DRAIN_WALK_BOUND
     {
         let c = cur?;
         if c.cspace_id != dying_id
@@ -2999,8 +3003,7 @@ unsafe fn first_live_backward(
 ) -> Option<crate::cap::slot::SlotId>
 {
     let mut cur = from;
-    // Bounded as in first_live_forward.
-    for _ in 0..=crate::cap::cspace::L1_SIZE * crate::cap::cspace::L2_SIZE
+    for _ in 0..=DRAIN_WALK_BOUND
     {
         let c = cur?;
         if c.cspace_id != dying_id

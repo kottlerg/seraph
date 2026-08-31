@@ -275,9 +275,14 @@ written to the original caller's IPC buffer page.
 
 **Capability requirement:** Implicit reply capability from `current_tcb.reply_cap_slot`.
 
-**Errors:** `InvalidCapability` (no pending reply), `InvalidArgument`, `QuotaExceeded`
-(caller's CSpace at slot quota for reply cap transfer), `OutOfMemory` (slot-page pool
-exhausted), `Interrupted`.
+**Errors:** `InvalidCapability` (no pending reply, or a reply cap slot went
+stale), `InvalidArgument` (also: a cap slot repeated in one reply),
+`InvalidState` (a reply cap slot is pinned by an in-flight `SYS_CAP_REVOKE`),
+`QuotaExceeded` (caller's CSpace at slot quota for reply cap transfer),
+`OutOfMemory` (slot-page pool exhausted), `Interrupted`. When the reply cap
+transfer is refused after the caller was already claimed, the caller is still
+woken — it resumes with the `IPC_REPLY_TRANSFER_FAILED` label and zero caps —
+and the server receives the error.
 
 ---
 
@@ -309,7 +314,9 @@ The badge is the value attached to the sender's endpoint capability via
 
 **Errors:** `InvalidCapability`, `InsufficientRights`, `QuotaExceeded` (server's CSpace
 at slot quota for an incoming cap transfer), `OutOfMemory` (slot-page pool exhausted),
-`Interrupted`.
+`Interrupted`. If an already-queued sender's cap transfer is refused (a source
+slot went stale or is pinned by an in-flight `SYS_CAP_REVOKE`), the message is
+still delivered — with zero caps; the sender keeps its capabilities.
 
 ---
 

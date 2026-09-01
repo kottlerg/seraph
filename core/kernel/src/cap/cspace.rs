@@ -51,7 +51,8 @@ pub const L2_SIZE: usize = 56;
 pub const L1_SIZE: usize = 256;
 
 /// The directory's structural slot ceiling; see
-/// core/kernel/docs/capability-internals.md §Storage for the bound's role.
+/// core/kernel/docs/capability-internals.md § Storage: Two-Level Array
+/// for the bound's role.
 pub const MAX_SLOTS_STRUCTURAL: usize = L1_SIZE * L2_SIZE;
 
 // Every slot index must fit in the cap handle's index field; the rest of the
@@ -945,12 +946,12 @@ mod tests
         assert_eq!(slot.tag, CapTag::Memory);
         assert_eq!(slot.object, Some(obj));
         // Pages 0..=3 allocated: 55 + 3 * 56 usable slots.
-        assert_eq!(cs.allocated_slots, 55 + 3 * L2_SIZE);
+        assert_eq!(cs.allocated_slots, (L2_SIZE - 1) + 3 * L2_SIZE);
         assert_eq!(cs.populated_count(), 1);
     }
 
     #[test]
-    fn insert_cap_at_rejects_structural_ceiling()
+    fn insert_cap_at_rejects_out_of_range_indices()
     {
         let mut cs = CSpace::new(0);
         let obj = dummy_object();
@@ -968,6 +969,20 @@ mod tests
             .unwrap_err();
         assert_eq!(err, CapError::InvalidIndex);
         assert_eq!(cs.allocated_slots, 0, "rejected inserts must not grow");
+    }
+
+    #[test]
+    fn insert_cap_at_rejects_occupied_slot()
+    {
+        let mut cs = CSpace::new(0);
+        let obj = dummy_object();
+        cs.insert_cap_at(5, CapTag::Memory, MemRights::MAP.erase(), obj)
+            .expect("first insert at slot 5 failed");
+        let err = cs
+            .insert_cap_at(5, CapTag::Memory, MemRights::MAP.erase(), obj)
+            .unwrap_err();
+        assert_eq!(err, CapError::InvalidIndex, "occupied slot must reject");
+        assert_eq!(cs.populated_count(), 1, "the live cap must be untouched");
     }
 
     #[test]

@@ -2577,9 +2577,9 @@ pub fn sys_cap_info(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             // to the highest reachable count (the structural ceiling minus
             // the permanently-reserved slot 0). A mild over-estimate for a
             // CSpace that has not yet allocated page 0; headroom triggers
-            // tolerate that. The budget read is outside the CSpace lock —
-            // a grow between the two reads skews the sum by at most one
-            // page's worth, which the same triggers also tolerate.
+            // tolerate that. The budget read is outside the CSpace lock,
+            // so grows landing between the two reads skew the sum; the
+            // value is advisory and headroom triggers tolerate the skew.
             // SAFETY: cs_obj.cspace validated non-null; allocated_slots is
             // mutated only under the CSpace lock, taken here; lock_raw /
             // unlock_raw paired.

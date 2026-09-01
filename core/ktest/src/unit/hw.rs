@@ -49,7 +49,13 @@ pub fn mmio_map(ctx: &TestContext) -> TestResult
     // Probe each slot with a one-page split. `InvalidCapability` ⇒ wrong tag;
     // `InvalidArgument` ⇒ an `Mmio` smaller than two pages. Both leave
     // the cap intact, so the scan is non-destructive until a split succeeds.
-    for slot in 1..ctx.aspace_cap
+    // The scan bound is the cspace's backed capacity (queried at runtime)
+    // so the test stays robust against cap mint order.
+    let scan_bound = syscall::cap_info(ctx.cspace_cap, syscall_abi::CAP_INFO_CSPACE_CAPACITY)
+        .map_or(ctx.aspace_cap, |n| {
+            u32::try_from(n).unwrap_or(CSPACE_STRUCTURAL_CEILING)
+        });
+    for slot in 1..=scan_bound
     {
         let Ok((lo, _hi)) = mmio_split(slot, 0x1000)
         else
@@ -91,7 +97,13 @@ pub fn irq_register_ack(ctx: &TestContext) -> TestResult
     let irq_sig = cap_create_notification(ctx.memory_base)
         .map_err(|_| "cap_create_notification for IRQ test failed")?;
 
-    for slot in 1..ctx.aspace_cap
+    // The scan bound is the cspace's backed capacity (queried at runtime)
+    // so the test stays robust against cap mint order.
+    let scan_bound = syscall::cap_info(ctx.cspace_cap, syscall_abi::CAP_INFO_CSPACE_CAPACITY)
+        .map_or(ctx.aspace_cap, |n| {
+            u32::try_from(n).unwrap_or(CSPACE_STRUCTURAL_CEILING)
+        });
+    for slot in 1..=scan_bound
     {
         match irq_register(slot, irq_sig)
         {

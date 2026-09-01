@@ -107,13 +107,15 @@ fn child_entry(_arg: u64) -> !
             "pause",
             "dec {it}",
             "jnz 2b",
-            // SYS_IPC_CALL(ep, REQ_LABEL, data=0, caps=0, packed=0).
+            // SYS_IPC_CALL(ep, REQ_LABEL, data=0, caps=0,
+            // cap_handles_lo=0, cap_handles_hi=0).
             "xor rax, rax",
             "mov edi, {ep:e}",
             "mov rsi, {label}",
             "xor rdx, rdx",
             "xor r10, r10",
             "xor r8, r8",
+            "xor r9, r9",
             "syscall",
             // Resumed (possibly on CPU 1). The first FP op (the capture
             // `vmovdqu`) traps to `#NM` because `switch_in_restore` set
@@ -227,13 +229,15 @@ fn child_entry(_arg: u64) -> !
             "2:",
             "addi {it}, {it}, -1",
             "bnez {it}, 2b",
-            // SYS_IPC_CALL(ep, REQ_LABEL, data=0, caps=0, packed=0).
+            // SYS_IPC_CALL(ep, REQ_LABEL, data=0, caps=0,
+            // cap_handles_lo=0, cap_handles_hi=0).
             "li a7, 0",
             "mv a0, {ep}",
             "mv a1, {label}",
             "li a2, 0",
             "li a3, 0",
             "li a4, 0",
+            "li a5, 0",
             "ecall",
             // Resumed (possibly on CPU 1). The first FP op triggers an
             // illegal-instruction trap (FS=Off); `lazy_restore_fp_v`

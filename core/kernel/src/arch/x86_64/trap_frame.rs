@@ -154,7 +154,7 @@ impl TrapFrame
     }
 
     /// Write `SYS_IPC_CALL` return values: primary in rax, reply label in
-    /// rdx, reply data-word count in r9. Matches `shared/syscall::syscall5_ret3`.
+    /// rdx, reply data-word count in r9. Matches `shared/syscall::syscall6_ret3`.
     pub fn set_ipc_call_return(&mut self, primary: u64, reply_label: u64, reply_word_count: u64)
     {
         self.rax = primary;

@@ -2488,10 +2488,10 @@ pub(crate) unsafe fn unlock_cspace_pair(a: *mut CSpace, b: *mut CSpace, saved_a:
 ///
 /// Returns the encoded cap handle (generation + index) for the new slot in
 /// `dst_cspace`, or an error if the source slot is null/invalid or the
-/// destination `CSpace` is full. `src_idx` must be a decoded (bare) index. The
-/// `sys_cap_move` caller decodes and generation-validates the source handle
-/// first; the IPC transfer path supplies a generation-stripped index and does
-/// not (the send-path residual, #349).
+/// destination `CSpace` is full. `src_idx` must be a decoded (bare) index
+/// that the caller has already generation-validated: `sys_cap_move` checks
+/// the source handle itself, and the IPC transfer path checks every named
+/// handle in `prevalidate_transfer_slots` under the same locks (#349).
 ///
 /// # Safety
 /// `src_cspace` and `dst_cspace` must be valid, live `CSpace` pointers.

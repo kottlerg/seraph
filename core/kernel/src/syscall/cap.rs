@@ -1935,8 +1935,9 @@ pub fn sys_cap_move(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     };
 
     // Generation-check the source handle before the move. `move_cap_between_cspaces`
-    // takes a pre-decoded, pre-validated bare index (the IPC transfer path feeds
-    // it a generation-stripped index), so the source check lives in the caller (#349).
+    // takes a pre-decoded, pre-validated bare index — every caller checks its
+    // own source handle first (the IPC transfer path in
+    // `prevalidate_transfer_slots`, this path here) (#349).
     {
         // SAFETY: caller_cspace validated non-null above.
         let cs = unsafe { &*caller_cspace };

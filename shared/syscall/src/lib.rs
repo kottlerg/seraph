@@ -15,8 +15,12 @@
 //! # ABI
 //! - x86-64: syscall number in `rax`; args in `rdi/rsi/rdx/r10/r8/r9`;
 //!   return in `rax` (primary), `rdx` (secondary label for `ipc_call`/`ipc_recv`).
+//!   On `SYS_IPC_CALL`, `rdx` and `r9` are aliased: each carries an argument in
+//!   and a return value out (`r9` = sixth argument / tertiary return).
 //! - RISC-V: syscall number in `a7`; args in `a0–a5`;
-//!   return in `a0` (primary), `a1` (secondary label).
+//!   return in `a0` (primary), `a1` (secondary label). On `SYS_IPC_CALL`,
+//!   `a1`/`a2` are aliased the same way (`a2` = third argument / tertiary
+//!   return).
 
 // When pulled into std's dep graph via build-std (feature
 // `rustc-dep-of-std` on), `core` isn't yet a conventional crate — we
@@ -39,20 +43,19 @@ extern crate rustc_std_workspace_core as core;
 use core::prelude::rust_2024::*;
 
 use syscall_abi::{
-    MEM_UNMAP_RECLAIM_PTS, MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX, SYS_ASPACE_BIND_NOTIFICATION,
-    SYS_ASPACE_QUERY, SYS_CAP_COPY, SYS_CAP_CREATE_ASPACE, SYS_CAP_CREATE_CSPACE,
-    SYS_CAP_CREATE_ENDPOINT, SYS_CAP_CREATE_EVENT_Q, SYS_CAP_CREATE_NOTIFICATION,
-    SYS_CAP_CREATE_THREAD, SYS_CAP_CREATE_WAIT_SET, SYS_CAP_DELETE, SYS_CAP_DERIVE,
-    SYS_CAP_DERIVE_BADGE, SYS_CAP_INFO, SYS_CAP_MOVE, SYS_CAP_REVOKE, SYS_EVENT_POST,
-    SYS_EVENT_RECV, SYS_GETRANDOM, SYS_IOPORT_BIND, SYS_IOPORT_SPLIT, SYS_IPC_BUFFER_SET,
-    SYS_IPC_CALL, SYS_IPC_RECV, SYS_IPC_REPLY, SYS_IRQ_ACK, SYS_IRQ_REGISTER, SYS_IRQ_SPLIT,
-    SYS_MEM_MAP, SYS_MEM_PROTECT, SYS_MEM_UNMAP, SYS_MEMORY_MERGE, SYS_MEMORY_SPLIT, SYS_MMIO_MAP,
-    SYS_MMIO_SPLIT, SYS_NOTIFICATION_SEND, SYS_NOTIFICATION_WAIT, SYS_PROCESS_EXIT, SYS_SBI_CALL,
-    SYS_SCHED_SPLIT, SYS_SYSTEM_INFO, SYS_THREAD_BIND_NOTIFICATION, SYS_THREAD_CONFIGURE,
-    SYS_THREAD_EXIT, SYS_THREAD_READ_REGS, SYS_THREAD_SET_AFFINITY, SYS_THREAD_SET_FAULT_HANDLER,
-    SYS_THREAD_SET_PRIORITY, SYS_THREAD_SLEEP, SYS_THREAD_START, SYS_THREAD_STOP,
-    SYS_THREAD_WRITE_REGS, SYS_THREAD_YIELD, SYS_WAIT_SET_ADD, SYS_WAIT_SET_REMOVE,
-    SYS_WAIT_SET_WAIT, SyscallError,
+    MEM_UNMAP_RECLAIM_PTS, MSG_DATA_WORDS_MAX, SYS_ASPACE_BIND_NOTIFICATION, SYS_ASPACE_QUERY,
+    SYS_CAP_COPY, SYS_CAP_CREATE_ASPACE, SYS_CAP_CREATE_CSPACE, SYS_CAP_CREATE_ENDPOINT,
+    SYS_CAP_CREATE_EVENT_Q, SYS_CAP_CREATE_NOTIFICATION, SYS_CAP_CREATE_THREAD,
+    SYS_CAP_CREATE_WAIT_SET, SYS_CAP_DELETE, SYS_CAP_DERIVE, SYS_CAP_DERIVE_BADGE, SYS_CAP_INFO,
+    SYS_CAP_MOVE, SYS_CAP_REVOKE, SYS_EVENT_POST, SYS_EVENT_RECV, SYS_GETRANDOM, SYS_IOPORT_BIND,
+    SYS_IOPORT_SPLIT, SYS_IPC_BUFFER_SET, SYS_IPC_CALL, SYS_IPC_RECV, SYS_IPC_REPLY, SYS_IRQ_ACK,
+    SYS_IRQ_REGISTER, SYS_IRQ_SPLIT, SYS_MEM_MAP, SYS_MEM_PROTECT, SYS_MEM_UNMAP, SYS_MEMORY_MERGE,
+    SYS_MEMORY_SPLIT, SYS_MMIO_MAP, SYS_MMIO_SPLIT, SYS_NOTIFICATION_SEND, SYS_NOTIFICATION_WAIT,
+    SYS_PROCESS_EXIT, SYS_SBI_CALL, SYS_SCHED_SPLIT, SYS_SYSTEM_INFO, SYS_THREAD_BIND_NOTIFICATION,
+    SYS_THREAD_CONFIGURE, SYS_THREAD_EXIT, SYS_THREAD_READ_REGS, SYS_THREAD_SET_AFFINITY,
+    SYS_THREAD_SET_FAULT_HANDLER, SYS_THREAD_SET_PRIORITY, SYS_THREAD_SLEEP, SYS_THREAD_START,
+    SYS_THREAD_STOP, SYS_THREAD_WRITE_REGS, SYS_THREAD_YIELD, SYS_WAIT_SET_ADD,
+    SYS_WAIT_SET_REMOVE, SYS_WAIT_SET_WAIT, SyscallError,
 };
 
 pub use syscall_abi::{
@@ -549,30 +552,7 @@ unsafe fn syscall6(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64
 
 // ── IPC capability slot helpers ───────────────────────────────────────────────
 
-/// Pack up to `MSG_CAP_SLOTS_MAX` cap handles into two `u64` words.
-///
-/// Each 32-bit field carries a **full** cap handle — slot index plus the
-/// per-slot generation (see `cap_handle_encode`) — so the kernel can
-/// generation-validate the sender's named slots and fail a stale, recycled
-/// handle closed (#349). Handles 0/1 occupy the low word, 2/3 the high
-/// word. Handles beyond `MSG_CAP_SLOTS_MAX` are silently ignored. A bare
-/// index (generation 0) is itself a valid handle for a never-recycled
-/// slot.
-///
-/// Pass the words as arg4/arg5 of `SYS_IPC_CALL` or arg3/arg4 of
-/// `SYS_IPC_REPLY`.
-#[must_use]
-pub fn pack_cap_handles(handles: &[u32]) -> (u64, u64)
-{
-    let mut lo: u64 = 0;
-    let mut hi: u64 = 0;
-    for (i, &handle) in handles.iter().take(MSG_CAP_SLOTS_MAX).enumerate()
-    {
-        let word = if i < 2 { &mut lo } else { &mut hi };
-        *word |= u64::from(handle) << ((i % 2) * 32);
-    }
-    (lo, hi)
-}
+pub use syscall_abi::pack_cap_handles;
 
 // ── Public syscall wrappers ───────────────────────────────────────────────────
 
@@ -637,7 +617,7 @@ pub fn ipc_buffer_set(virt: u64) -> Result<(), i64>
     if ret < 0 { Err(ret) } else { Ok(()) }
 }
 
-/// Raw `SYS_IPC_CALL` issuing syscall5_ret3. Intended for `shared/ipc`'s
+/// Raw `SYS_IPC_CALL` issuing `syscall6_ret3`. Intended for `shared/ipc`'s
 /// `IpcMessage`-snapshot wrapper; other callers should use that higher-level
 /// entry point.
 ///

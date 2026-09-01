@@ -106,6 +106,48 @@ pub const fn cap_handle_gen(handle: u32) -> u8
     (handle >> CAP_INDEX_BITS) as u8
 }
 
+/// Pack up to [`MSG_CAP_SLOTS_MAX`] cap handles into the two IPC transfer
+/// words: two 32-bit **full** handles per word (handles 0/1 in the low
+/// word, 2/3 in the high word). Carrying the whole handle — index plus
+/// per-slot generation — lets the kernel generation-validate the sender's
+/// named slots and fail a stale, recycled handle closed. The inverse of
+/// [`unpack_cap_handles`]; both ends of the wire use this one encoding.
+/// Handles beyond [`MSG_CAP_SLOTS_MAX`] are silently ignored.
+#[must_use]
+pub fn pack_cap_handles(handles: &[u32]) -> (u64, u64)
+{
+    let mut lo: u64 = 0;
+    let mut hi: u64 = 0;
+    for (i, &handle) in handles.iter().take(MSG_CAP_SLOTS_MAX).enumerate()
+    {
+        let word = if i < 2 { &mut lo } else { &mut hi };
+        *word |= u64::from(handle) << ((i % 2) * 32);
+    }
+    (lo, hi)
+}
+
+/// Unpack `count` cap handles from the two IPC transfer words packed by
+/// [`pack_cap_handles`].
+#[must_use]
+pub fn unpack_cap_handles(lo: u64, hi: u64, count: usize) -> [u32; MSG_CAP_SLOTS_MAX]
+{
+    let mut out = [0u32; MSG_CAP_SLOTS_MAX];
+    for (i, item) in out
+        .iter_mut()
+        .enumerate()
+        .take(count.min(MSG_CAP_SLOTS_MAX))
+    {
+        let word = if i < 2 { lo } else { hi };
+        let shift = (i % 2) * 32;
+        // cast_possible_truncation: deliberate — each 32-bit field is one handle.
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            *item = (word >> shift) as u32;
+        }
+    }
+    out
+}
+
 // ── Syscall numbers ───────────────────────────────────────────────────────────
 
 /// IPC: synchronous call (send + block waiting for reply).
@@ -500,10 +542,6 @@ pub const MSG_DATA_WORDS_MAX: usize = 64;
 
 /// Maximum number of capability slots transferable in a single IPC message.
 pub const MSG_CAP_SLOTS_MAX: usize = 4;
-
-/// Maximum number of registers used for inline message data (x86-64: rdi–r9).
-/// Words beyond this limit require an IPC buffer in shared memory.
-pub const MSG_REGS_DATA_MAX: usize = 6;
 
 /// Synthetic reply label written to the caller's IPC message by the kernel
 /// when `SYS_IPC_REPLY` cannot deliver the server's reply intact: rejected
@@ -971,6 +1009,29 @@ pub enum SystemInfoType
 mod tests
 {
     use super::*;
+
+    #[test]
+    fn cap_handle_pack_round_trips_all_four_fields()
+    {
+        // Populated handles with distinct generations, including indices in
+        // both the low and high packed words — the lo/hi boundary is where
+        // the two ends of the wire could disagree.
+        let handles = [
+            cap_handle_encode(1, 0),
+            cap_handle_encode(0xFFFF, 3),
+            cap_handle_encode(70_000, 255),
+            cap_handle_encode(CAP_INDEX_MASK, 7),
+        ];
+        let (lo, hi) = pack_cap_handles(&handles);
+        assert_eq!(unpack_cap_handles(lo, hi, 4), handles);
+
+        // Partial counts leave the untransmitted tail zeroed.
+        let (lo, hi) = pack_cap_handles(&handles[..2]);
+        assert_eq!(hi, 0);
+        let out = unpack_cap_handles(lo, hi, 2);
+        assert_eq!(&out[..2], &handles[..2]);
+        assert_eq!(&out[2..], &[0, 0]);
+    }
 
     // Defects guarded: a per-bit rights constant that overlaps another bit of
     // the same capability type (attenuating one right would silently attenuate

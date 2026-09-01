@@ -402,6 +402,14 @@ pub fn run_all(ctx: &TestContext)
         ipc::reply_duplicate_cap_slot_rejected(ctx)
     );
     run_test!(
+        "ipc::reply_stale_cap_handle_rejected",
+        ipc::reply_stale_cap_handle_rejected(ctx)
+    );
+    run_test!(
+        "ipc::call_four_caps_transfer",
+        ipc::call_four_caps_transfer(ctx)
+    );
+    run_test!(
         "ipc::recv_oom_returns_cleanly",
         ipc::recv_oom_returns_cleanly(ctx)
     );

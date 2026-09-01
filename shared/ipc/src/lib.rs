@@ -2175,7 +2175,7 @@ pub const ARGS_BLOB_MAX: usize = 256;
 /// construction.
 ///
 /// Fixed-size inline payload (`MSG_DATA_WORDS_MAX` = 64 data words, 512 B)
-/// plus `MSG_CAP_SLOTS_MAX` cap indices. No allocation; `no_std`-clean;
+/// plus `MSG_CAP_SLOTS_MAX` cap handles. No allocation; `no_std`-clean;
 /// cheap to return by value.
 #[derive(Clone, Copy)]
 pub struct IpcMessage
@@ -2264,7 +2264,9 @@ impl IpcMessage
         }
     }
 
-    /// Slice view of the received / replied cap-slot indices.
+    /// Slice view of the message's cap handles: on a received message, the
+    /// delivered destination handles; on a message being built, the full
+    /// handles to transfer (see [`IpcMessageBuilder::cap`]).
     #[must_use]
     pub fn caps(&self) -> &[u32]
     {
@@ -2435,13 +2437,16 @@ impl IpcMessageBuilder
         self
     }
 
-    /// Append one cap slot. Debug-panics if the slot array is full.
+    /// Append one capability to transfer. `handle` must be the full cap
+    /// handle as returned by the cap syscalls (index + per-slot generation)
+    /// — the kernel generation-validates it and rejects a stale handle with
+    /// `InvalidCapability`. Debug-panics if the slot array is full.
     #[must_use]
-    pub fn cap(mut self, slot: u32) -> Self
+    pub fn cap(mut self, handle: u32) -> Self
     {
         debug_assert!((self.msg.cap_count as usize) < MSG_CAP_SLOTS_MAX);
         let i = self.msg.cap_count as usize;
-        self.msg.cap_slots[i] = slot;
+        self.msg.cap_slots[i] = handle;
         self.msg.cap_count += 1;
         self
     }

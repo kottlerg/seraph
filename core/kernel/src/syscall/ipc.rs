@@ -155,33 +155,6 @@ unsafe fn write_cap_results(buf: u64, cap_count: usize, indices: &[u32; MSG_CAP_
 
 // ── Capability transfer ───────────────────────────────────────────────────────
 
-/// Unpack `count` cap handles from the two packed argument words.
-///
-/// Matches the encoding in `shared/syscall::pack_cap_handles`: two `u64`
-/// words, each carrying two 32-bit **full cap handles** (index + per-slot
-/// generation, see `syscall::cap_handle_encode`) — handles 0/1 in the low
-/// word, 2/3 in the high word. Carrying the generation lets
-/// [`prevalidate_transfer_slots`] fail a stale, recycled sender handle
-/// closed instead of transmitting the slot's current occupant (#349).
-#[cfg(not(test))]
-fn unpack_cap_handles(lo: u64, hi: u64, count: usize) -> [u32; MSG_CAP_SLOTS_MAX]
-{
-    let mut out = [0u32; MSG_CAP_SLOTS_MAX];
-    for (i, item) in out
-        .iter_mut()
-        .enumerate()
-        .take(count.min(MSG_CAP_SLOTS_MAX))
-    {
-        let word = if i < 2 { lo } else { hi };
-        // cast_possible_truncation: deliberate — each 32-bit field is one handle.
-        #[allow(clippy::cast_possible_truncation)]
-        {
-            *item = (word >> ((i % 2) * 32)) as u32;
-        }
-    }
-    out
-}
-
 /// Validate a set of transfer source slots: distinct, non-null, and not
 /// pinned by an in-flight revoke. The single authoritative predicate for
 /// every cap-transfer direction — `sys_ipc_call`'s fail-fast reject before
@@ -223,7 +196,8 @@ fn prevalidate_transfer_slots(cs: &CSpace, handles: &[u32]) -> Result<(), Syscal
     Ok(())
 }
 
-/// Move `src_slots[..cap_count]` from `src_cspace` to `dst_cspace`.
+/// Move the caps named by `src_handles[..cap_count]` from `src_cspace` to
+/// `dst_cspace`.
 ///
 /// All-or-nothing: if any slot is null/invalid, repeated within the same
 /// message, carries an in-flight revoke
@@ -233,7 +207,7 @@ fn prevalidate_transfer_slots(cs: &CSpace, handles: &[u32]) -> Result<(), Syscal
 /// re-validation immediately before the moves, so concurrent frees or
 /// revoke-marker changes cannot slip between validation and transfer.
 ///
-/// On success, writes the destination slot indices to `dst_indices_out` and
+/// On success, writes the destination cap handles to `dst_indices_out` and
 /// returns the number of caps transferred. The caller is responsible for
 /// writing the results to the appropriate IPC buffer.
 ///
@@ -544,11 +518,11 @@ pub fn sys_ipc_call(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         unsafe { read_ipc_buf(buf, data_count, &mut msg.data) }?;
     }
 
-    // Populate cap_slots in the message (indices in caller's CSpace).
+    // Populate cap_slots in the message (the caller's full cap handles).
     // The actual cap move happens in sys_ipc_recv after delivery.
     if cap_count > 0
     {
-        let handles = unpack_cap_handles(cap_packed_lo, cap_packed_hi, cap_count);
+        let handles = syscall::unpack_cap_handles(cap_packed_lo, cap_packed_hi, cap_count);
         // Fail-fast reject before blocking (see prevalidate_transfer_slots).
         // SAFETY: cspace_ptr validated above.
         prevalidate_transfer_slots(unsafe { &*cspace_ptr }, &handles[..cap_count])?;
@@ -984,12 +958,12 @@ pub fn sys_ipc_reply(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             }
         }
 
-        // Populate cap_slots (indices in server's CSpace). Pre-validate before reply.
+        // Populate cap_slots (the server's full cap handles). Pre-validate before reply.
         if cap_count > 0
         {
             // SAFETY: tcb validated above.
             let server_cspace = unsafe { (*tcb).cspace };
-            let handles = unpack_cap_handles(cap_packed_lo, cap_packed_hi, cap_count);
+            let handles = syscall::unpack_cap_handles(cap_packed_lo, cap_packed_hi, cap_count);
             // SAFETY: server_cspace extracted from validated TCB.
             let server_cs = unsafe { &*server_cspace };
             if let Err(e) = prevalidate_transfer_slots(server_cs, &handles[..cap_count])

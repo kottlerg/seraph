@@ -65,9 +65,11 @@ The kernel reads from the sender's page and writes to the receiver's page
 directly — no arbitrary user pointer dereference, no heap allocation. A
 data-carrying IPC with no registered page fails with `InvalidArgument`; a page
 unmapped after registration surfaces the copy fault (`InvalidAddress`).
-Capability handles always travel in registers regardless of payload size — a
-message carrying only capabilities touches no IPC buffer. Message labels,
-counts, and badges likewise travel in registers.
+Capability handles always travel in registers on the send side, regardless
+of payload size; the delivered destination handles reach the receiver
+through the cap-transfer result block in its IPC buffer page, so a thread
+that receives capabilities needs a registered page. Message labels, counts,
+and badges travel in registers.
 
 For bulk data, pass a shared memory capability instead.
 

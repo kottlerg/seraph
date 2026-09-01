@@ -287,10 +287,12 @@ the original caller's IPC buffer page.
 **Capability requirement:** Implicit reply capability from `current_tcb.reply_cap_slot`.
 
 **Errors:** `InvalidCapability` (no pending reply, or a reply cap slot went
-stale), `InvalidArgument` (also: a cap slot repeated in one reply),
-`InvalidState` (a reply cap slot is pinned by an in-flight `SYS_CAP_REVOKE`),
-`QuotaExceeded` (caller's CSpace directory structurally full for reply cap transfer),
-`OutOfMemory` (slot-page pool exhausted), `Interrupted`. When the reply cap
+stale), `InvalidArgument` (also: a cap slot repeated in one reply, or
+`data_count` > 0 with no IPC buffer page registered), `InvalidAddress`
+(registered IPC buffer page unmapped), `InvalidState` (a reply cap slot is
+pinned by an in-flight `SYS_CAP_REVOKE`), `QuotaExceeded` (caller's CSpace
+directory structurally full for reply cap transfer), `OutOfMemory`
+(slot-page pool exhausted), `Interrupted`. When the reply cap
 transfer is refused after the caller was already claimed, the caller is still
 woken — it resumes with the `IPC_REPLY_TRANSFER_FAILED` label and zero caps —
 and the server receives the error.
@@ -1704,12 +1706,15 @@ whenever `data_count` > 0) and for the cap-transfer result block.
 
 The page at `virt` must already be mapped in the calling thread's address space with
 at least read+write permissions. The kernel records the address in the calling
-thread's TCB. The page must remain mapped for the duration of any IPC that uses it;
-if the page is unmapped when a data-carrying IPC is attempted, the IPC syscall
-returns `InvalidAddress` (the copy fault).
+thread's TCB. The page must remain mapped for the duration of any IPC that uses it.
+The error surface is read-side only: a *sending* data-carrying IPC fails with
+`InvalidArgument` when no page is registered and `InvalidAddress` when the
+registered page is unmapped, while delivery-side writes are best-effort — a
+receiver with no usable page silently misses the data words and cap results
+rather than failing the sender.
 
 Calling `SYS_IPC_BUFFER_SET` again replaces the previous registration. Passing 0
-deregisters the IPC buffer page (data-carrying IPC then fails with
+deregisters the IPC buffer page (sending data-carrying IPC then fails with
 `InvalidArgument`).
 
 **Capability requirement:** None — acts on the calling thread implicitly.

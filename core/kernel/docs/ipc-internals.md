@@ -75,8 +75,8 @@ TCB used only while the thread is blocked on an IPC object. No separate allocati
 4. if endpoint.state == RecvWait:
    // Fast path: receiver is already waiting
    a. recv_tcb = endpoint.recv_waiter
-   b. Copy message (label + data words) directly from sender's saved register state
-      into recv_tcb's trap frame / message buffer
+   b. Copy the message: label/counts/badge from the sender's saved register
+      state; data words from the sender's IPC buffer page into the receiver's
    c. Transfer capability slots (see capability-internals.md)
    d. Create reply capability in recv_tcb.reply_cap_slot
    e. Mark recv_tcb as Ready; set result to success
@@ -98,10 +98,14 @@ TCB used only while the thread is blocked on an IPC object. No separate allocati
 **Message copy:** The label, counts, badge, and packed cap handles travel in
 saved register state. Data words travel through the per-thread IPC buffer
 pages: when `data_count` > 0 the kernel reads the words from the sender's
-registered page and writes them into the receiver's registered page. A
-data-carrying IPC with no registered page fails with `InvalidArgument`; a
-registered page unmapped at copy time surfaces the copy fault
-(`InvalidAddress`). No heap allocation occurs on either path.
+registered page and writes them into the receiver's registered page; the
+delivered cap-transfer result block is likewise written into the receiver's
+page. The error surface is read-side only: a sender (or replier) with no
+registered page fails with `InvalidArgument`, and a sender page unmapped at
+copy time surfaces the copy fault (`InvalidAddress`), while delivery-side
+writes are best-effort — an unregistered or unmapped receiver page silently
+drops the data words and cap results rather than failing the sender's
+syscall. No heap allocation occurs.
 
 ### Receive Path (Server)
 
@@ -114,7 +118,8 @@ registered page unmapped at copy time surfaces the copy fault
    // Fast path: a sender is waiting
    a. sender_tcb = endpoint.send_queue.dequeue()
    b. if send_queue is now empty: endpoint.state = Idle
-   c. Copy message from sender_tcb.pending_send into server's trap frame
+   c. Copy message from sender_tcb.pending_send (registers + the sender's
+      buffered data words) into the server's trap frame and IPC buffer page
    d. Transfer capability slots
    e. Create reply capability in current_tcb.reply_cap_slot
    f. Mark sender_tcb as BlockedOnReply (was already enqueued as BlockedOnSend)
@@ -138,7 +143,8 @@ registered page unmapped at copy time surfaces the copy fault
    (the reply cap is not in the CSpace; it is in a dedicated per-thread field)
 2. Validate: reply_cap must be present and unconsumed
 3. caller_tcb = reply_cap.caller
-4. Copy reply message into caller_tcb's trap frame (return registers)
+4. Copy the reply: label/count into caller_tcb's trap frame (return
+   registers); data words into the caller's IPC buffer page
 5. Transfer reply capability slots
 6. Consume (clear) current_tcb.reply_cap_slot
 7. Mark caller_tcb as Ready; enqueue

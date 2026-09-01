@@ -552,7 +552,7 @@ unsafe fn syscall6(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64
 
 // ── IPC capability handle helpers ─────────────────────────────────────────────
 
-pub use syscall_abi::{pack_cap_handles, unpack_cap_handles};
+pub use syscall_abi::pack_cap_handles;
 
 // ── Public syscall wrappers ───────────────────────────────────────────────────
 

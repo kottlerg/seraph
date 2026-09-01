@@ -82,10 +82,11 @@ fn child_entry(_arg: u64) -> !
     // SAFETY: inline asm loads PATTERN into xmm0..xmm15, issues
     // SYS_IPC_CALL preserving the live FP register file across it, then
     // captures xmm0..xmm15 back to `buf`. Operand lifetimes match. rcx/r11
-    // are syscall-architecturally-clobbered. rdi/rsi/rdx/r10/r8/r9 carry
-    // the six arguments in; rdx and r9 then receive the secondary/tertiary
-    // returns (reply_label, reply_word_count) from `set_ipc_call_return`
-    // and are discarded.
+    // are syscall-architecturally-clobbered. rax carries the syscall number
+    // in and the primary return out; rdi/rsi/rdx/r10/r8/r9 carry the six
+    // arguments in; rdx and r9 then receive the secondary/tertiary returns
+    // (reply_label, reply_word_count) from `set_ipc_call_return`. All are
+    // declared clobbered and discarded.
     unsafe {
         core::arch::asm!(
             "vmovdqu xmm0,  [{p}]",

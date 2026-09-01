@@ -106,6 +106,11 @@ pub const fn cap_handle_gen(handle: u32) -> u8
     (handle >> CAP_INDEX_BITS) as u8
 }
 
+// The two-word transfer layout below (pack_cap_handles / unpack_cap_handles)
+// holds exactly four 32-bit fields; raising MSG_CAP_SLOTS_MAX past 4 would
+// silently alias fields. Trip at compile time instead.
+const _: () = assert!(MSG_CAP_SLOTS_MAX <= 4);
+
 /// Pack up to [`MSG_CAP_SLOTS_MAX`] cap handles into the two IPC transfer
 /// words: two 32-bit **full** handles per word (handles 0/1 in the low
 /// word, 2/3 in the high word). Carrying the whole handle — index plus
@@ -116,10 +121,6 @@ pub const fn cap_handle_gen(handle: u32) -> u8
 #[must_use]
 pub fn pack_cap_handles(handles: &[u32]) -> (u64, u64)
 {
-    // The two-word layout holds exactly four 32-bit fields; raising
-    // MSG_CAP_SLOTS_MAX past 4 would silently alias fields. Trip at
-    // compile time instead.
-    const _: () = assert!(MSG_CAP_SLOTS_MAX <= 4);
     let mut lo: u64 = 0;
     let mut hi: u64 = 0;
     for (i, &handle) in handles.iter().take(MSG_CAP_SLOTS_MAX).enumerate()

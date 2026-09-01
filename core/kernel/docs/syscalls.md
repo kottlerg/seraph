@@ -860,7 +860,8 @@ original's position.
 
 **Errors:** `InvalidArgument` (offset out of range or frame is already a single page),
 `InvalidCapability`, `InsufficientRights` (cap lacks Map), `OutOfMemory` (child
-allocation or slot-page pool exhausted), `QuotaExceeded` (caller's CSpace directory structurally full).
+allocation or slot-page pool exhausted), `QuotaExceeded` (caller's CSpace directory
+structurally full).
 
 ---
 
@@ -1472,7 +1473,8 @@ derivation parent. The original `irq_cap` is consumed.
 
 **Errors:** `InvalidArgument` (`split_at` outside `(start, start+count)`),
 `InvalidCapability`, `InsufficientRights` (cap lacks Notify), `OutOfMemory` (child
-allocation or slot-page pool exhausted), `QuotaExceeded` (caller's CSpace directory structurally full).
+allocation or slot-page pool exhausted), `QuotaExceeded` (caller's CSpace directory
+structurally full).
 
 ---
 
@@ -1560,10 +1562,9 @@ rights); augment-mode — `0`. `SyscallError` on failure.
 **Capability requirements:** `memory_cap` (Retype); in augment-mode, `augment_cap` (Insert).
 
 **Errors:** `InvalidArgument` (`init_pages` 0 or overflow, or arg 3 non-zero),
-`InvalidCapability`,
-`InsufficientRights` (source Memory cap lacks Retype, or augment target lacks Insert),
-`OutOfMemory` (Memory cap region or slot-page pool exhausted), `QuotaExceeded`
-(caller's CSpace directory structurally full).
+`InvalidCapability`, `InsufficientRights` (source Memory cap lacks Retype, or augment
+target lacks Insert), `OutOfMemory` (Memory cap region or slot-page pool exhausted),
+`QuotaExceeded` (caller's CSpace directory structurally full).
 
 ---
 

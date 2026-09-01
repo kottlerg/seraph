@@ -448,75 +448,15 @@ pub fn tag_mismatch_invalid_arg(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
-/// Raw 4-argument syscall, bypassing the `syscall` crate's wrappers.
-///
-/// The 3-arg `cap_create_cspace` wrapper always passes `arg3 = 0`, so
-/// exercising the kernel's reserved-argument rejection needs a raw issue.
-/// Mirrors the per-arch asm in `shared/syscall`.
-// inline_always/cast_possible_wrap: same rationale as the shared/syscall
-// wrappers this mirrors.
-#[allow(clippy::inline_always, clippy::cast_possible_wrap)]
-#[inline(always)]
-unsafe fn raw_syscall4(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64
-{
-    #[cfg(target_arch = "x86_64")]
-    {
-        let ret: i64;
-        let nr = nr as i64;
-        // SAFETY: syscall instruction per the x86-64 ABI; number in rax,
-        // args in rdi/rsi/rdx/r10; rcx/r11 clobbered as documented.
-        unsafe {
-            core::arch::asm!(
-                "syscall",
-                inout("rax") nr => ret,
-                in("rdi") a0,
-                in("rsi") a1,
-                in("rdx") a2,
-                in("r10") a3,
-                out("rcx") _,
-                out("r11") _,
-                options(nostack),
-            );
-        }
-        ret
-    }
-    #[cfg(target_arch = "riscv64")]
-    {
-        let ret: i64;
-        let a0 = a0 as i64;
-        // SAFETY: ecall per the RISC-V ABI; number in a7, args in a0-a3.
-        unsafe {
-            core::arch::asm!(
-                "ecall",
-                inout("a0") a0 => ret,
-                in("a1") a1,
-                in("a2") a2,
-                in("a3") a3,
-                in("a7") nr,
-                options(nostack),
-            );
-        }
-        ret
-    }
-}
-
 /// `SYS_CAP_CREATE_CSPACE` rejects a non-zero arg3 with `InvalidArgument`.
 ///
 /// arg3 carried the removed `max_slots` quota; it is reserved and must be
-/// zero in both create and augment modes.
+/// zero in both create and augment modes. The 3-arg `cap_create_cspace`
+/// wrapper always passes 0, so the probe issues the raw entry point.
 pub fn cspace_create_rejects_nonzero_arg3(ctx: &TestContext) -> TestResult
 {
     // Create-mode with arg3 = 1.
-    // SAFETY: raw syscall with scalar arguments only.
-    let ret = unsafe {
-        raw_syscall4(
-            syscall_abi::SYS_CAP_CREATE_CSPACE,
-            u64::from(ctx.memory_base),
-            0,
-            4,
-            1,
-        )
-    };
+    let ret = syscall::raw_cap_create_cspace(ctx.memory_base, 0, 4, 1);
     if ret != SyscallError::InvalidArgument as i64
     {
         return Err("create-mode arg3 != 0 was not rejected with InvalidArgument");
@@ -525,16 +465,7 @@ pub fn cspace_create_rejects_nonzero_arg3(ctx: &TestContext) -> TestResult
     // Augment-mode with arg3 = 1 against a valid target.
     let cs = cap_create_cspace(ctx.memory_base, 0, 2)
         .map_err(|_| "cap_create_cspace for augment-arg3 probe failed")?;
-    // SAFETY: raw syscall with scalar arguments only.
-    let ret = unsafe {
-        raw_syscall4(
-            syscall_abi::SYS_CAP_CREATE_CSPACE,
-            u64::from(ctx.memory_base),
-            u64::from(cs),
-            2,
-            1,
-        )
-    };
+    let ret = syscall::raw_cap_create_cspace(ctx.memory_base, cs, 2, 1);
     cap_delete(cs).map_err(|_| "cap_delete(cspace) failed")?;
     if ret != SyscallError::InvalidArgument as i64
     {

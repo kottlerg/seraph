@@ -59,11 +59,10 @@ pub fn create_event_q(ctx: &TestContext) -> TestResult
 
 // ── SYS_CAP_CREATE_CSPACE ────────────────────────────────────────────────────
 
-/// `cap_create_cspace` succeeds with a valid slot count.
+/// `cap_create_cspace` succeeds with a valid page count.
 pub fn create_cspace(ctx: &TestContext) -> TestResult
 {
-    let slot =
-        cap_create_cspace(ctx.memory_base, 0, 4).map_err(|_| "cap_create_cspace(32) failed")?;
+    let slot = cap_create_cspace(ctx.memory_base, 0, 4).map_err(|_| "cap_create_cspace failed")?;
     cap_delete(slot).map_err(|_| "cap_delete after create_cspace failed")?;
     Ok(())
 }

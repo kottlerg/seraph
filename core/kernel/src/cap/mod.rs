@@ -472,11 +472,12 @@ pub fn sum_memory_available_bytes(cspace: &cspace::CSpace) -> u64
 /// the root; userspace init then mints, copies, and derives ~700 more
 /// caps during memmgr / procmgr bootstrap (kernel-object inserts +
 /// per-RAM-Memory derive/copy chains in `finalize_memmgr`). Sized at
-/// 1536 slots: roughly 1.8× the observed ~850-cap pre-memmgr-handover
-/// peak. The headroom absorbs realistic per-RAM-block-count growth
-/// (more drained blocks ⇒ more init-time Memory-cap derivations) and
-/// per-service growth (more boot modules ⇒ more module-memory caps)
-/// without revisiting this knob.
+/// 1536 slots per the seeding policy in docs/capability-model.md
+/// (growth budgets): roughly 1.8× the observed ~850-cap
+/// pre-memmgr-handover peak. The headroom absorbs realistic
+/// per-RAM-block-count growth (more drained blocks ⇒ more init-time
+/// Memory-cap derivations) and per-service growth (more boot modules ⇒
+/// more module-memory caps) without revisiting this knob.
 ///
 /// MUST be kept in sync with the boot footprint: a target below the
 /// peak boot slot count means `pre_allocate`'s grow loop hits an
@@ -484,12 +485,10 @@ pub fn sum_memory_available_bytes(cspace: &cspace::CSpace) -> u64
 /// either retries indefinitely (e.g. `request_round` in a child) or
 /// surfaces an unexpected `OutOfMemory`.
 ///
-/// Sized for the expected startup population per the seeding policy in
-/// docs/capability-model.md (growth budgets): backing the directory's
-/// full structural ceiling would cost 257 SEED pages (~1 MiB) for a
-/// `CSpace` whose occupancy peaks at boot and is bounded in steady
-/// state. Growth past the seeded pool returns the refillable
-/// `OutOfMemory`; init owns the shortfall and can refill via
+/// Backing the directory's full structural ceiling would cost 257 SEED
+/// pages (~1 MiB) for a `CSpace` whose occupancy peaks at boot and is
+/// bounded in steady state. Growth past the seeded pool returns the
+/// refillable `OutOfMemory`; init owns the shortfall and can refill via
 /// augment-mode `cap_create_cspace` against its own `CSpace` cap
 /// (`ProcessInfo.cspace_cap`).
 #[cfg(not(test))]

@@ -2573,10 +2573,14 @@ pub fn sys_cap_info(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 return Err(SyscallError::InvalidCapability);
             }
             // Currently-backed capacity: slots already threaded onto pages
-            // plus what the remaining growth-budget pages would add. A mild
+            // plus what the remaining growth-budget pages would add, clamped
+            // to the directory's structural ceiling (a pool funded past 256
+            // pages cannot back more slots than the directory holds). A mild
             // over-estimate for a CSpace that has not yet allocated page 0
             // (slot 0 is reserved and never usable); headroom triggers
-            // tolerate that.
+            // tolerate that. The two loads are not one atomic snapshot — a
+            // concurrent grow between them skews the sum by at most one
+            // page's worth, which the same triggers also tolerate.
             // SAFETY: cs_obj.cspace validated non-null; allocated_slots is an
             // O(1) read of one usize field, and the kernel runs with the
             // scheduler lock effectively held during a syscall.
@@ -2584,7 +2588,7 @@ pub fn sys_cap_info(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             let budget = cs_obj.cspace_growth_budget_bytes.load(Ordering::Acquire);
             let backed = allocated
                 + (budget / crate::mm::PAGE_SIZE as u64) * crate::cap::cspace::L2_SIZE as u64;
-            Ok(backed)
+            Ok(backed.min(crate::cap::cspace::MAX_SLOTS_STRUCTURAL as u64))
         }
         CAP_INFO_CSPACE_USED =>
         {

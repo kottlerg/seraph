@@ -911,17 +911,37 @@ pub fn cap_create_cspace(memory_cap: u32, augment_target: u32, init_pages: u64)
 -> Result<u32, i64>
 {
     // arg3 is reserved (the removed `max_slots` quota) and must be 0.
+    let ret = raw_cap_create_cspace(memory_cap, augment_target, init_pages, 0);
+    if ret < 0 { Err(ret) } else { Ok(ret as u32) }
+}
+
+/// Raw `SYS_CAP_CREATE_CSPACE` with a caller-controlled reserved arg 3.
+/// Intended for test harnesses probing the kernel's reserved-argument
+/// rejection; other callers should use [`cap_create_cspace`], which
+/// always passes `0`.
+///
+/// Returns the kernel's raw `i64`: the new cap slot (create-mode) or `0`
+/// (augment-mode) on success, a negative `SyscallError` code on failure.
+#[doc(hidden)]
+#[must_use]
+#[inline]
+pub fn raw_cap_create_cspace(
+    memory_cap: u32,
+    augment_target: u32,
+    init_pages: u64,
+    reserved: u64,
+) -> i64
+{
     // SAFETY: syscall4 issues a raw syscall; arguments are scalar.
-    let ret = unsafe {
+    unsafe {
         syscall4(
             SYS_CAP_CREATE_CSPACE,
             u64::from(memory_cap),
             u64::from(augment_target),
             init_pages,
-            0,
+            reserved,
         )
-    };
-    if ret < 0 { Err(ret) } else { Ok(ret as u32) }
+    }
 }
 
 /// Retype a Memory cap into a new Thread bound to `aspace_cap` and

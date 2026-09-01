@@ -163,7 +163,7 @@ pub fn ioport_bind(ctx: &TestContext) -> TestResult
             syscall::cap_delete(cs).ok();
             return Err("cap_info(CAP_INFO_CSPACE_CAPACITY) failed");
         };
-        for slot in 1u32..scan_bound
+        for slot in 1u32..=scan_bound
         {
             match syscall::ioport_bind(th, slot)
             {
@@ -238,7 +238,7 @@ pub fn ioport_split(ctx: &TestContext) -> TestResult
                 Ok(n) => u32::try_from(n).unwrap_or(CSPACE_STRUCTURAL_CEILING),
                 Err(_) => return Err("cap_info(CAP_INFO_CSPACE_CAPACITY) failed"),
             };
-        for slot in 1u32..scan_bound
+        for slot in 1u32..=scan_bound
         {
             // Try splitting at 0x80. If the slot is not an IoPort we
             // get InvalidCapability and keep scanning. If it is an
@@ -302,7 +302,7 @@ pub fn mmio_split_carves(ctx: &TestContext) -> TestResult
     let scan_bound = syscall::cap_info(ctx.cspace_cap, syscall_abi::CAP_INFO_CSPACE_CAPACITY)
         .map_or(ctx.aspace_cap, |n| u32::try_from(n).unwrap_or(u32::MAX));
 
-    for slot in 1u32..scan_bound
+    for slot in 1u32..=scan_bound
     {
         // Probe: split at PAGE_SIZE. InvalidCapability ⇒ wrong tag.
         // InvalidArgument ⇒ Mmio exists but too small.
@@ -350,7 +350,7 @@ pub fn irq_split_carves(ctx: &TestContext) -> TestResult
     let scan_bound = syscall::cap_info(ctx.cspace_cap, syscall_abi::CAP_INFO_CSPACE_CAPACITY)
         .map_or(ctx.aspace_cap, |n| u32::try_from(n).unwrap_or(u32::MAX));
 
-    for slot in 1u32..scan_bound
+    for slot in 1u32..=scan_bound
     {
         // Probe: split at base+1. Wrong-tag and unsplittable-range responses
         // both leave the cap intact.

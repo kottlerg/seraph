@@ -50,11 +50,16 @@ pub const L2_SIZE: usize = 56;
 /// Directory entries per `CSpace` (max 256 × 56 = 14336 slots).
 pub const L1_SIZE: usize = 256;
 
+/// The directory's structural slot ceiling — the only slot bound a
+/// `CSpace` has. Capacity below it is whatever the owner-funded
+/// slot-page pool backs.
+pub const MAX_SLOTS_STRUCTURAL: usize = L1_SIZE * L2_SIZE;
+
 // Every slot index must fit in the cap handle's index field; the rest of the
 // handle carries the per-slot generation. If the maximum CSpace capacity ever
 // exceeds the index field, the encoding would truncate indices — trip at
 // compile time instead.
-const _: () = assert!(L1_SIZE * L2_SIZE <= (1usize << syscall::CAP_INDEX_BITS));
+const _: () = assert!(MAX_SLOTS_STRUCTURAL <= (1usize << syscall::CAP_INDEX_BITS));
 
 // ── Error type ────────────────────────────────────────────────────────────────
 
@@ -613,7 +618,13 @@ impl CSpace
         }
 
         // Reject indices beyond the directory's structural ceiling.
-        if index as usize >= L1_SIZE * L2_SIZE
+        //
+        // Below the ceiling, the grow loop that follows allocates every
+        // intermediate page up to the chosen index — bounded by the pool
+        // pages the caller has funded, which is the intended bound. A
+        // donor placing a cap at a high well-known index pays for the
+        // intervening pages.
+        if index as usize >= MAX_SLOTS_STRUCTURAL
         {
             return Err(CapError::InvalidIndex);
         }
@@ -835,7 +846,7 @@ mod tests
     fn pool_exhaustion_is_distinct()
     {
         // A retype-backed CSpace (non-null kobj) with no pool page left
-        // fails grow with PoolExhausted, not the OutOfSlots quota error.
+        // fails grow with PoolExhausted, not the structural OutOfSlots.
         // The test-mode grow path returns before dereferencing the kobj
         // pointer, so a dangling marker stands in for a real wrapper.
         let mut cs = CSpace::new(0);
@@ -921,6 +932,26 @@ mod tests
                 expected
             );
         }
+    }
+
+    #[test]
+    fn structural_ceiling_returns_out_of_slots()
+    {
+        // Fill every directory entry via the heap-backed grow path. The
+        // ceiling excludes only the permanently-reserved slot 0, so
+        // MAX_SLOTS_STRUCTURAL - 1 allocations must succeed and the next
+        // must fail with the structural OutOfSlots — not PoolExhausted.
+        let mut cs = CSpace::new(0);
+        for i in 0..(MAX_SLOTS_STRUCTURAL - 1)
+        {
+            assert!(
+                cs.allocate_slot().is_ok(),
+                "allocation {i} failed below the structural ceiling"
+            );
+        }
+        let err = cs.allocate_slot().unwrap_err();
+        assert_eq!(err, CapError::OutOfSlots);
+        assert_eq!(cs.allocated_slots, MAX_SLOTS_STRUCTURAL - 1);
     }
 
     #[test]

@@ -218,38 +218,41 @@ Send a message to an endpoint and block until a reply is received.
 | 0 | `endpoint_cap` | Send capability to an IPC endpoint |
 | 1 | `label` | Message label (opaque word; passed to server as-is) |
 | 2 | `data_count` | Number of data words (0–MSG_DATA_WORDS_MAX) |
-| 3 | `cap_slots` | Packed descriptor: up to MSG_CAP_SLOTS_MAX caps to transfer |
-| 4 | `flags` | Bit 0: extended payload in IPC buffer page (see below) |
+| 3 | `cap_count` | Number of capabilities to transfer (0–MSG_CAP_SLOTS_MAX) |
+| 4 | `cap_handles_lo` | Packed cap handles 0 and 1 (two 32-bit fields) |
+| 5 | `cap_handles_hi` | Packed cap handles 2 and 3 (two 32-bit fields) |
 
-`cap_slots` encodes up to `MSG_CAP_SLOTS_MAX` capability descriptors packed into one
-word (implementation constant; expected value 4, requiring 16 bits each in a 64-bit
-word for up to 4 caps).
+Each 32-bit field of the two packed words carries a **full** cap handle —
+slot index plus per-slot generation — so the kernel generation-validates the
+sender's named slots: a stale handle to a recycled slot is rejected
+(`InvalidCapability`) instead of transmitting the slot's current occupant.
+Capability handles always travel in these registers on the send side; the
+delivered destination handles are reported through the result block in the
+receiver's IPC buffer page.
 
-**Small messages (fast path):** When `data_count` ≤ `MSG_REGS_DATA_MAX` and
-`flags` bit 0 is clear, all data words pass in registers. No memory access occurs
-after argument validation.
-
-**Extended payload:** When `flags` bit 0 is set, data words beyond the register
-capacity are read from the caller's IPC buffer page (registered via
-`SYS_IPC_BUFFER_SET`). The kernel reads directly from that page; no arbitrary pointer
-dereference occurs. Reply data beyond register capacity is written to the caller's
-IPC buffer page after the server replies.
+**Data words:** When `data_count` > 0, the kernel reads the data words from
+the caller's registered IPC buffer page (`SYS_IPC_BUFFER_SET`); the syscall
+fails with `InvalidArgument` if none is registered. Reply data words are
+written back to the same page when the server replies. No arbitrary user
+pointer is dereferenced.
 
 **Return:**
 
 - `rax`/`a0`: 0 on success; `SyscallError` on failure
 - `rdx`/`a1`: reply label (valid on success)
+- `r9`/`a2`: reply data-word count
 
 **Capability requirement:** `endpoint_cap` must have Send rights, plus Grant
 when the message carries capabilities.
 
 **Errors:** `InvalidCapability` (also: a cap slot is stale or Null),
 `InsufficientRights`, `InvalidArgument` (bad count, a cap slot repeated in one
-message, or extended payload requested but IPC buffer page not registered or
-unmapped), `InvalidState` (a cap slot is pinned by an in-flight
-`SYS_CAP_REVOKE`), `Interrupted`. Cap-slot problems are rejected before the
-caller blocks; a refusal that arises only afterwards degrades to delivery with
-zero caps (the caller keeps its capabilities).
+message, or `data_count` > 0 with no IPC buffer page registered),
+`InvalidAddress` (registered IPC buffer page unmapped), `InvalidState` (a cap
+slot is pinned by an in-flight `SYS_CAP_REVOKE`), `Interrupted`. Cap-slot
+problems are rejected before the caller blocks; a refusal that arises only
+afterwards degrades to delivery with zero caps (the caller keeps its
+capabilities).
 
 ---
 
@@ -263,8 +266,12 @@ Send a reply to the caller that issued the most recent `SYS_IPC_RECV` on this th
 |---|---|---|
 | 0 | `label` | Reply label |
 | 1 | `data_count` | Number of data words (0–MSG_DATA_WORDS_MAX) |
-| 2 | `cap_slots` | Capabilities to transfer in the reply (packed descriptors) |
-| 3 | `flags` | Bit 0: extended payload in IPC buffer page |
+| 2 | `cap_count` | Number of capabilities to transfer (0–MSG_CAP_SLOTS_MAX) |
+| 3 | `cap_handles_lo` | Packed cap handles 0 and 1 (two 32-bit fields) |
+| 4 | `cap_handles_hi` | Packed cap handles 2 and 3 (two 32-bit fields) |
+
+The packed-handle encoding matches `SYS_IPC_CALL`: full 32-bit handles, so a
+stale reply slot is rejected rather than resolved to its current occupant.
 
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
 
@@ -274,20 +281,24 @@ time). It is consumed by this syscall whether it succeeds or fails. If no reply
 capability is present (i.e. this thread did not receive a call), the syscall
 returns `InvalidCapability`.
 
-Extended payload follows the same rules as `SYS_IPC_CALL`: when `flags` bit 0 is
-set, data beyond register capacity is read from this thread's IPC buffer page and
-written to the original caller's IPC buffer page.
+Data words follow the same rules as `SYS_IPC_CALL`: when `data_count` > 0
+they are read from this thread's registered IPC buffer page and written to
+the original caller's IPC buffer page.
 
 **Capability requirement:** Implicit reply capability from `current_tcb.reply_cap_slot`.
 
 **Errors:** `InvalidCapability` (no pending reply, or a reply cap slot went
-stale), `InvalidArgument` (also: a cap slot repeated in one reply),
-`InvalidState` (a reply cap slot is pinned by an in-flight `SYS_CAP_REVOKE`),
-`QuotaExceeded` (caller's CSpace directory structurally full for reply cap transfer),
-`OutOfMemory` (slot-page pool exhausted), `Interrupted`. When the reply cap
-transfer is refused after the caller was already claimed, the caller is still
-woken — it resumes with the `IPC_REPLY_TRANSFER_FAILED` label and zero caps —
-and the server receives the error.
+stale), `InvalidArgument` (also: a cap slot repeated in one reply, or
+`data_count` > 0 with no IPC buffer page registered), `InvalidAddress`
+(registered IPC buffer page unmapped), `InvalidState` (a reply cap slot is
+pinned by an in-flight `SYS_CAP_REVOKE`), `QuotaExceeded` (caller's CSpace
+directory structurally full for reply cap transfer), `OutOfMemory`
+(slot-page pool exhausted), `Interrupted`. Every payload or cap failure while
+a caller is pending — the data-path errors above included — consumes the
+pending reply and wakes the caller with the `IPC_REPLY_TRANSFER_FAILED` label
+and zero caps while the server receives the error. A fault reply skips
+payload and cap processing entirely: the label alone carries the disposition
+(see [fault-handling.md](../../docs/fault-handling.md)).
 
 ---
 
@@ -306,9 +317,11 @@ Wait for a call on an endpoint. Blocks until a caller arrives.
 - `rax`/`a0`: 0 on success; `SyscallError` on failure
 - `rdx`/`a1`: label from the incoming message
 - `rsi`/`a2`: badge from the sender's endpoint capability (0 if unbadged)
+- `r8`/`a3`: data-word count of the delivered message
 
-Data words up to `MSG_REGS_DATA_MAX` are returned in registers. Extended payload
-(when the sender set `flags` bit 0) is written to the receiver's IPC buffer page.
+The message's data words are written to the receiver's registered IPC buffer
+page, followed by the cap-transfer result block (count, then the delivered
+destination handles) at word offset `MSG_DATA_WORDS_MAX`.
 The kernel places a reply capability into a per-thread slot (`reply_cap_slot`);
 this capability is retrieved implicitly by `SYS_IPC_REPLY`.
 
@@ -1683,8 +1696,8 @@ event queue lacks Post), `OutOfMemory` (the address space's observer array is fu
 ### `SYS_IPC_BUFFER_SET` (42)
 
 Register the per-thread IPC buffer page. This is the page the kernel uses for
-extended IPC payloads (when `flags` bit 0 is set in `SYS_IPC_CALL` or
-`SYS_IPC_REPLY`).
+IPC data words (`SYS_IPC_CALL`, `SYS_IPC_REPLY`, and `SYS_IPC_RECV` delivery,
+whenever `data_count` > 0) and for the cap-transfer result block.
 
 **Arguments:**
 
@@ -1696,12 +1709,18 @@ extended IPC payloads (when `flags` bit 0 is set in `SYS_IPC_CALL` or
 
 The page at `virt` must already be mapped in the calling thread's address space with
 at least read+write permissions. The kernel records the address in the calling
-thread's TCB. The page must remain mapped for the duration of any IPC that uses it;
-if the page is unmapped when an extended IPC is attempted, the IPC syscall returns
-`InvalidArgument`.
+thread's TCB. The page must remain mapped for the duration of any IPC that uses it.
+The error surface is read-side only: a *sending* data-carrying IPC fails with
+`InvalidArgument` when no page is registered and `InvalidAddress` when the
+registered page is unmapped, while delivery-side writes are best-effort — a
+receiver with no usable page silently misses the data words and the
+cap-result block. Transferred capabilities are still moved into that
+receiver's CSpace; without the result block it cannot learn their handles,
+so the slots stay consumed until the CSpace is torn down.
 
 Calling `SYS_IPC_BUFFER_SET` again replaces the previous registration. Passing 0
-deregisters the IPC buffer page (extended payloads will fail with `InvalidArgument`).
+deregisters the IPC buffer page (sending data-carrying IPC then fails with
+`InvalidArgument`).
 
 **Capability requirement:** None — acts on the calling thread implicitly.
 

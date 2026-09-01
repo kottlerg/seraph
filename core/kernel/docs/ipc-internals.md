@@ -75,8 +75,9 @@ TCB used only while the thread is blocked on an IPC object. No separate allocati
 4. if endpoint.state == RecvWait:
    // Fast path: receiver is already waiting
    a. recv_tcb = endpoint.recv_waiter
-   b. Copy message (label + data words) directly from sender's saved register state
-      into recv_tcb's trap frame / message buffer
+   b. Stage the message in recv_tcb.ipc_msg: label/counts/badge from the
+      sender's saved register state, data words read from the sender's IPC
+      buffer page (the receiver writes them to its own page when it resumes)
    c. Transfer capability slots (see capability-internals.md)
    d. Create reply capability in recv_tcb.reply_cap_slot
    e. Mark recv_tcb as Ready; set result to success
@@ -95,17 +96,17 @@ TCB used only while the thread is blocked on an IPC object. No separate allocati
    e. Block current thread: state = BlockedOnSend, call scheduler
 ```
 
-**Message copy — small messages (fast path):** Label and up to the register-capacity
-data words pass entirely through saved register state. No user memory is accessed
-after argument validation; no heap allocation occurs.
-
-**Message copy — extended payloads:** When `data_count` exceeds the register
-capacity (flagged via the `flags` argument bit 0 in `SYS_IPC_CALL`), the kernel
-reads the additional data words from the sender's per-thread IPC buffer page at the
-registered virtual address. The kernel writes the extended words into the receiver's
-IPC buffer page. If either IPC buffer page is unmapped, the syscall returns
-`InvalidArgument`. Capability slots always travel in registers regardless of payload
-size.
+**Message copy:** The label, counts, badge, and packed cap handles travel in
+saved register state. Data words travel through the per-thread IPC buffer
+pages: when `data_count` > 0 the kernel reads the words from the sender's
+registered page and writes them into the receiver's registered page; the
+delivered cap-transfer result block is likewise written into the receiver's
+page. The error surface is read-side only: a sender (or replier) with no
+registered page fails with `InvalidArgument`, and a sender page unmapped at
+copy time surfaces the copy fault (`InvalidAddress`), while delivery-side
+writes are best-effort — an unregistered or unmapped receiver page silently
+drops the data words and cap results; the drop fails no syscall on either
+side. No heap allocation occurs.
 
 ### Receive Path (Server)
 
@@ -118,7 +119,8 @@ size.
    // Fast path: a sender is waiting
    a. sender_tcb = endpoint.send_queue.dequeue()
    b. if send_queue is now empty: endpoint.state = Idle
-   c. Copy message from sender_tcb.pending_send into server's trap frame
+   c. Copy message from sender_tcb.pending_send (registers + the sender's
+      buffered data words) into the server's trap frame and IPC buffer page
    d. Transfer capability slots
    e. Create reply capability in current_tcb.reply_cap_slot
    f. Mark sender_tcb as BlockedOnReply (was already enqueued as BlockedOnSend)
@@ -142,7 +144,9 @@ size.
    (the reply cap is not in the CSpace; it is in a dedicated per-thread field)
 2. Validate: reply_cap must be present and unconsumed
 3. caller_tcb = reply_cap.caller
-4. Copy reply message into caller_tcb's trap frame (return registers)
+4. Stage the reply in caller_tcb.ipc_msg: label/count for the caller's
+   return registers, data words for the caller to write to its own IPC
+   buffer page when it resumes
 5. Transfer reply capability slots
 6. Consume (clear) current_tcb.reply_cap_slot
 7. Mark caller_tcb as Ready; enqueue

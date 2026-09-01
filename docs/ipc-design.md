@@ -59,17 +59,19 @@ A message consists of:
   direction the sender is rejected before blocking where the refusal is
   detectable up front, and otherwise proceeds without learning of the refusal.
 
-**Small messages (fast path):** When data fits within `MSG_REGS_DATA_MAX` words,
-the entire message passes through register state. No memory access or dynamic
-allocation occurs after argument validation.
-
-**Extended payloads:** When a message exceeds the register budget, the additional data
-words spill to a per-thread **IPC buffer page**. Each thread registers its IPC buffer
-page once via `SYS_IPC_BUFFER_SET`. The kernel reads from the sender's page and writes
-to the receiver's page directly — no arbitrary user pointer dereference, no heap
-allocation. If the IPC buffer page is not registered or is unmapped at the time of an
-extended IPC, the syscall fails with `InvalidArgument`. Capability slots always travel
-in registers regardless of payload size.
+**Data-word transport:** Data words travel through a per-thread **IPC buffer
+page**. Each thread registers its IPC buffer page once via `SYS_IPC_BUFFER_SET`.
+The kernel reads from the sender's page and writes to the receiver's page
+directly — no arbitrary user pointer dereference, no heap allocation. A
+data-carrying IPC with no registered page fails with `InvalidArgument`; a page
+unmapped after registration surfaces the copy fault (`InvalidAddress`).
+Capability handles always travel in registers on the send side, regardless
+of payload size; the delivered destination handles reach the receiver
+through the cap-transfer result block in its IPC buffer page. A thread that
+receives capabilities therefore needs a registered page: without one the
+caps are still moved into its CSpace, but their handles are unlearnable and
+the slots stay consumed until the CSpace is torn down. Message labels, counts,
+and badges travel in registers.
 
 For bulk data, pass a shared memory capability instead.
 

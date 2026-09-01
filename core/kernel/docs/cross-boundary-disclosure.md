@@ -66,9 +66,12 @@ is in [docs/syscalls.md](syscalls.md).
 
 Notes on the non-obvious entries:
 
-- **IPC `cap_slots[]`** carry destination CSpace *indices* re-derived for the
-  receiver, not pointers; the per-slot generation is stripped on the send path
-  (`ipc::unpack_cap_slots`).
+- **IPC `cap_slots[]`** carry cap *handles* (CSpace-local index + per-slot
+  generation), never pointers: the sender's own full handles inbound
+  (`syscall_abi::unpack_cap_handles`, generation-validated by
+  `ipc::prevalidate_transfer_slots` before any move), and freshly
+  re-derived destination handles outbound. Both directions expose only
+  values the owning process already holds or is being granted.
 - **Fault messages** source `d1`/`ip` from the live user `TrapFrame` — the faulting
   user address and user instruction pointer. The forwarded/readable `TrapFrame`
   holds only user-mode register state (no kernel stack pointer, kernel return

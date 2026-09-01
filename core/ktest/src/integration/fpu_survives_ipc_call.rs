@@ -82,9 +82,11 @@ fn child_entry(_arg: u64) -> !
     // SAFETY: inline asm loads PATTERN into xmm0..xmm15, issues
     // SYS_IPC_CALL preserving the live FP register file across it, then
     // captures xmm0..xmm15 back to `buf`. Operand lifetimes match. rcx/r11
-    // are syscall-architecturally-clobbered; rdx and r9 receive the
-    // secondary/tertiary returns (reply_label, reply_word_count) from
-    // `set_ipc_call_return` and are discarded. rdi/rsi/r10/r8 carry args.
+    // are syscall-architecturally-clobbered. rax carries the syscall number
+    // in and the primary return out; rdi/rsi/rdx/r10/r8/r9 carry the six
+    // arguments in; rdx and r9 then receive the secondary/tertiary returns
+    // (reply_label, reply_word_count) from `set_ipc_call_return`. All are
+    // declared clobbered and discarded.
     unsafe {
         core::arch::asm!(
             "vmovdqu xmm0,  [{p}]",
@@ -107,13 +109,15 @@ fn child_entry(_arg: u64) -> !
             "pause",
             "dec {it}",
             "jnz 2b",
-            // SYS_IPC_CALL(ep, REQ_LABEL, data=0, caps=0, packed=0).
+            // SYS_IPC_CALL(ep, REQ_LABEL, data=0, caps=0,
+            // cap_handles_lo=0, cap_handles_hi=0).
             "xor rax, rax",
             "mov edi, {ep:e}",
             "mov rsi, {label}",
             "xor rdx, rdx",
             "xor r10, r10",
             "xor r8, r8",
+            "xor r9, r9",
             "syscall",
             // Resumed (possibly on CPU 1). The first FP op (the capture
             // `vmovdqu`) traps to `#NM` because `switch_in_restore` set
@@ -183,11 +187,13 @@ fn child_entry(_arg: u64) -> !
     let spin: u64 = SPIN_ITERS;
 
     // SAFETY: inline asm loads PATTERN into f0..f31, issues SYS_IPC_CALL
-    // (a7=0, a0..a4 carry args) preserving the live FP register file
-    // across it, then captures f0..f31 back to `buf`. `.option arch, +d`
-    // locally enables the D extension because the kernel target is
-    // RV64IMAC. a0/a1/a2 are written by the kernel as (ret, reply_label,
-    // reply_word_count) via `set_ipc_call_return` and are discarded.
+    // (a7=0, a0..a5 carry args; a5 declared clobbered so the allocator
+    // never assigns it to a generic operand) preserving the live FP
+    // register file across it, then captures f0..f31 back to `buf`.
+    // `.option arch, +d` locally enables the D extension because the
+    // kernel target is RV64IMAC. a0/a1/a2 are written by the kernel as
+    // (ret, reply_label, reply_word_count) via `set_ipc_call_return` and
+    // are discarded.
     unsafe {
         core::arch::asm!(
             ".option push",
@@ -227,13 +233,15 @@ fn child_entry(_arg: u64) -> !
             "2:",
             "addi {it}, {it}, -1",
             "bnez {it}, 2b",
-            // SYS_IPC_CALL(ep, REQ_LABEL, data=0, caps=0, packed=0).
+            // SYS_IPC_CALL(ep, REQ_LABEL, data=0, caps=0,
+            // cap_handles_lo=0, cap_handles_hi=0).
             "li a7, 0",
             "mv a0, {ep}",
             "mv a1, {label}",
             "li a2, 0",
             "li a3, 0",
             "li a4, 0",
+            "li a5, 0",
             "ecall",
             // Resumed (possibly on CPU 1). The first FP op triggers an
             // illegal-instruction trap (FS=Off); `lazy_restore_fp_v`
@@ -278,7 +286,7 @@ fn child_entry(_arg: u64) -> !
             ep = in(reg) u64::from(ep),
             label = in(reg) REQ_LABEL,
             out("a0") _, out("a1") _, out("a2") _, out("a3") _, out("a4") _,
-            out("a7") _,
+            out("a5") _, out("a7") _,
             options(nostack),
         );
     }

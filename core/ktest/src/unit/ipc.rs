@@ -40,6 +40,8 @@ static mut SNAPSHOT_STACK: ChildStack = ChildStack::ZERO;
 static mut REPLY_OOM_STACK: ChildStack = ChildStack::ZERO;
 static mut DUP_REPLY_STACK: ChildStack = ChildStack::ZERO;
 static mut RECV_OOM_STACK: ChildStack = ChildStack::ZERO;
+static mut STALE_REPLY_STACK: ChildStack = ChildStack::ZERO;
+static mut FOUR_CAPS_STACK: ChildStack = ChildStack::ZERO;
 
 // ── SYS_IPC_CALL / SYS_IPC_RECV / SYS_IPC_REPLY ─────────────────────────────
 
@@ -899,7 +901,54 @@ fn reply_oom_caller_entry(arg: u64) -> !
     thread_exit()
 }
 
-// ── duplicate cap-slot rejection ─────────────────────────────────────────────
+// ── cap-transfer slot rejection (stale and duplicate) ───────────────────────
+
+/// `sys_ipc_call` rejects a message naming a stale cap handle, before the
+/// caller blocks.
+///
+/// The transfer words carry full 32-bit handles (index + generation), so a
+/// handle held across a free/reallocate of its slot must fail closed with
+/// `InvalidCapability` — never silently transmit the slot's current
+/// occupant (#349).
+pub fn call_stale_cap_handle_rejected(ctx: &TestContext) -> TestResult
+{
+    let ep = cap_create_endpoint(ctx.memory_base)
+        .map_err(|_| "cap_create_endpoint for stale_cap test failed")?;
+    let victim = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "cap_create_notification(victim) for stale_cap test failed")?;
+    cap_delete(victim).map_err(|_| "cap_delete(victim) for stale_cap test failed")?;
+    // The freed slot is the free-list head, so the next create recycles it
+    // with a bumped generation; `victim` is now a stale handle to the
+    // occupant's slot.
+    let occupant = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "cap_create_notification(occupant) for stale_cap test failed")?;
+    if syscall_abi::cap_handle_index(occupant) != syscall_abi::cap_handle_index(victim)
+    {
+        cap_delete(occupant).ok();
+        cap_delete(ep).ok();
+        return Err("stale_cap: freed slot was not recycled by the next create");
+    }
+
+    let msg = IpcMessage::builder(0x57A1).cap(victim).build();
+    // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
+    let attempt = unsafe { ipc::ipc_call(ep, &msg, ctx.ipc_buf) };
+    let outcome = match attempt
+    {
+        Err(code) if code == syscall_abi::SyscallError::InvalidCapability as i64 => Ok(()),
+        Err(_) => Err("stale_cap: wrong error code for stale handle"),
+        Ok(_) => Err("stale_cap: call with a stale cap handle succeeded"),
+    };
+
+    // The occupant must be untouched by the refused transfer.
+    let occupant_intact = notification_send(occupant, 0x1).is_ok();
+    cap_delete(occupant).ok();
+    cap_delete(ep).ok();
+    if !occupant_intact
+    {
+        return Err("stale_cap: occupant cap was disturbed by the refused transfer");
+    }
+    outcome
+}
 
 /// `sys_ipc_call` rejects a message that packs the same cap slot twice,
 /// before the caller blocks.
@@ -992,8 +1041,9 @@ pub fn reply_duplicate_cap_slot_rejected(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
-/// Child for `reply_duplicate_cap_slot_rejected`: registers its IPC buffer
-/// and issues an `ipc_call`; reports `0xFA11` if the kernel-synthesised
+/// Child for `reply_duplicate_cap_slot_rejected` and
+/// `reply_stale_cap_handle_rejected`: registers its IPC buffer and issues
+/// an `ipc_call`; reports `0xFA11` if the kernel-synthesised
 /// `IPC_REPLY_TRANSFER_FAILED` label arrives, `0xBAD` otherwise.
 fn dup_reply_caller_entry(arg: u64) -> !
 {
@@ -1015,6 +1065,199 @@ fn dup_reply_caller_entry(arg: u64) -> !
         _ => 0xBAD,
     };
     notification_send(done_slot, bits).ok();
+    thread_exit()
+}
+
+// ── reply-direction stale cap-handle rejection ───────────────────────────────
+
+/// A reply naming a stale cap handle is refused with `InvalidCapability`;
+/// the waiting caller is still woken with the synthetic
+/// `IPC_REPLY_TRANSFER_FAILED` label and the recycled slot's current
+/// occupant is untouched.
+///
+/// Exercises the generation-mismatch branch of the reply direction's
+/// pre-validation — a distinct rejection cause from the duplicate-index
+/// branch `reply_duplicate_cap_slot_rejected` covers, routed through the
+/// same `fail_reply_and_wake_caller` wake.
+pub fn reply_stale_cap_handle_rejected(ctx: &TestContext) -> TestResult
+{
+    let ep = cap_create_endpoint(ctx.memory_base)
+        .map_err(|_| "cap_create_endpoint for reply_stale test failed")?;
+    let done = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "cap_create_notification for reply_stale test failed")?;
+    let victim = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "cap_create_notification(victim) for reply_stale test failed")?;
+    cap_delete(victim).map_err(|_| "cap_delete(victim) for reply_stale test failed")?;
+    // Recycle the freed slot so `victim` is a stale handle to the
+    // occupant's slot (same shape as `call_stale_cap_handle_rejected`).
+    let occupant = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "cap_create_notification(occupant) for reply_stale test failed")?;
+    if syscall_abi::cap_handle_index(occupant) != syscall_abi::cap_handle_index(victim)
+    {
+        cap_delete(occupant).ok();
+        cap_delete(done).ok();
+        cap_delete(ep).ok();
+        return Err("reply_stale: freed slot was not recycled by the next create");
+    }
+
+    let child = crate::spawn::new_child(ctx).map_err(|_| "reply_stale: spawn::new_child failed")?;
+    let child_ep = cap_copy(ep, child.cs, RIGHTS_EP_SEND_GRANT)
+        .map_err(|_| "cap_copy ep for reply_stale test failed")?;
+    let child_done = cap_copy(done, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
+        .map_err(|_| "cap_copy done for reply_stale test failed")?;
+    let child_arg = u64::from(child_ep) | (u64::from(child_done) << 16);
+    let stack_top = ChildStack::top(core::ptr::addr_of!(STALE_REPLY_STACK));
+    crate::spawn::configure_and_start(&child, dup_reply_caller_entry, stack_top, child_arg)
+        .map_err(|_| "reply_stale: configure_and_start failed")?;
+
+    // Receive the child's call, then reply naming the stale handle.
+    // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
+    let msg = unsafe { ipc::ipc_recv(ep, ctx.ipc_buf) }
+        .map_err(|_| "ipc_recv for reply_stale test failed")?;
+    if msg.label != 0xCAFE
+    {
+        return Err("reply_stale: ipc_recv returned wrong label");
+    }
+    let cap_reply = IpcMessage::builder(0xBEEF).cap(victim).build();
+    // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
+    let attempt = unsafe { ipc::ipc_reply(&cap_reply, ctx.ipc_buf) };
+    match attempt
+    {
+        Err(code) if code == syscall_abi::SyscallError::InvalidCapability as i64 =>
+        {}
+        Err(_) => return Err("reply_stale: wrong error code for stale reply handle"),
+        Ok(()) => return Err("reply_stale: stale-handle reply succeeded unexpectedly"),
+    }
+
+    // The child must have un-parked observing the synthetic label.
+    let done_bits =
+        notification_wait(done).map_err(|_| "notification_wait(done) for reply_stale failed")?;
+    if done_bits != 0xFA11
+    {
+        return Err("reply_stale: child did not observe IPC_REPLY_TRANSFER_FAILED");
+    }
+    // The occupant must be untouched by the refused transfer.
+    notification_send(occupant, 0x1)
+        .map_err(|_| "reply_stale: occupant cap disturbed by refused reply")?;
+
+    cap_delete(child.th).ok();
+    cap_delete(ep).ok();
+    cap_delete(done).ok();
+    cap_delete(occupant).ok();
+    cap_delete(child.cs).ok();
+    Ok(())
+}
+
+// ── full-width cap transfer (both packed words) ──────────────────────────────
+
+/// An IPC call transferring `MSG_CAP_SLOTS_MAX` (4) capabilities delivers
+/// all four intact.
+///
+/// Caps 0/1 travel in the low packed word and caps 2/3 in the high word;
+/// this pins the two-word field arithmetic on both sides of the wire (the
+/// lo/hi boundary is the one place sender and kernel could disagree).
+pub fn call_four_caps_transfer(ctx: &TestContext) -> TestResult
+{
+    let ep = cap_create_endpoint(ctx.memory_base)
+        .map_err(|_| "cap_create_endpoint for four_caps test failed")?;
+    let done = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "cap_create_notification for four_caps test failed")?;
+
+    let child = crate::spawn::new_child(ctx).map_err(|_| "four_caps: spawn::new_child failed")?;
+    let child_ep = cap_copy(ep, child.cs, RIGHTS_EP_SEND_GRANT)
+        .map_err(|_| "cap_copy ep for four_caps test failed")?;
+    let child_done = cap_copy(done, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
+        .map_err(|_| "cap_copy done for four_caps test failed")?;
+    let child_memory = cap_copy(ctx.memory_base, child.cs, syscall::RIGHTS_ALL)
+        .map_err(|_| "cap_copy memory for four_caps test failed")?;
+    let child_arg =
+        u64::from(child_ep) | (u64::from(child_done) << 16) | (u64::from(child_memory) << 32);
+
+    let stack_top = ChildStack::top(core::ptr::addr_of!(FOUR_CAPS_STACK));
+    crate::spawn::configure_and_start(&child, four_caps_caller_entry, stack_top, child_arg)
+        .map_err(|_| "four_caps: configure_and_start failed")?;
+
+    // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
+    let msg = unsafe { ipc::ipc_recv(ep, ctx.ipc_buf) }
+        .map_err(|_| "ipc_recv for four_caps test failed")?;
+    if msg.label != 0x4CA5
+    {
+        return Err("four_caps: ipc_recv returned wrong label");
+    }
+    if msg.caps().len() != 4
+    {
+        return Err("four_caps: expected 4 transferred caps");
+    }
+    // Each delivered handle must name a distinct, usable notification.
+    for (i, &h) in msg.caps().iter().enumerate()
+    {
+        if msg.caps()[..i]
+            .iter()
+            .any(|&o| syscall_abi::cap_handle_index(o) == syscall_abi::cap_handle_index(h))
+        {
+            return Err("four_caps: duplicate destination slot delivered");
+        }
+        if notification_send(h, 1 << i).is_err()
+        {
+            return Err("four_caps: a transferred cap is not a usable notification");
+        }
+    }
+
+    // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
+    unsafe { ipc::ipc_reply(&IpcMessage::new(0), ctx.ipc_buf) }
+        .map_err(|_| "ipc_reply for four_caps test failed")?;
+    notification_wait(done).map_err(|_| "notification_wait for four_caps test failed")?;
+
+    for &h in msg.caps()
+    {
+        cap_delete(h).ok();
+    }
+    cap_delete(child.th).ok();
+    cap_delete(ep).ok();
+    cap_delete(done).ok();
+    cap_delete(child.cs).ok();
+    Ok(())
+}
+
+/// Child for `call_four_caps_transfer`: creates four notifications and
+/// sends all of them in one cap-bearing call, then signals completion.
+fn four_caps_caller_entry(arg: u64) -> !
+{
+    let ep_slot = (arg & 0xFFFF) as u32;
+    let done_slot = ((arg >> 16) & 0xFFFF) as u32;
+    let memory_slot = ((arg >> 32) & 0xFFFF) as u32;
+
+    let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
+    if syscall::ipc_buffer_set(buf_addr).is_err()
+    {
+        notification_send(done_slot, 0xBAD).ok();
+        thread_exit()
+    }
+
+    let mut caps = [0u32; 4];
+    for c in &mut caps
+    {
+        let Ok(h) = cap_create_notification(memory_slot)
+        else
+        {
+            notification_send(done_slot, 0xBAD).ok();
+            thread_exit()
+        };
+        *c = h;
+    }
+
+    let msg = IpcMessage::builder(0x4CA5)
+        .cap(caps[0])
+        .cap(caps[1])
+        .cap(caps[2])
+        .cap(caps[3])
+        .build();
+    // SAFETY: buf_addr was registered as this thread's IPC buffer above.
+    match unsafe { ipc::ipc_call(ep_slot, &msg, buf_addr as *mut u64) }
+    {
+        Ok(_) => notification_send(done_slot, 0xD00D).ok(),
+        Err(_) => notification_send(done_slot, 0xBAD).ok(),
+    };
     thread_exit()
 }
 

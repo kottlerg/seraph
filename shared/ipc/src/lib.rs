@@ -2175,7 +2175,7 @@ pub const ARGS_BLOB_MAX: usize = 256;
 /// construction.
 ///
 /// Fixed-size inline payload (`MSG_DATA_WORDS_MAX` = 64 data words, 512 B)
-/// plus `MSG_CAP_SLOTS_MAX` cap indices. No allocation; `no_std`-clean;
+/// plus `MSG_CAP_SLOTS_MAX` cap handles. No allocation; `no_std`-clean;
 /// cheap to return by value.
 #[derive(Clone, Copy)]
 pub struct IpcMessage
@@ -2264,7 +2264,9 @@ impl IpcMessage
         }
     }
 
-    /// Slice view of the received / replied cap-slot indices.
+    /// Slice view of the message's cap handles: on a received message, the
+    /// delivered destination handles; on a message being built, the full
+    /// handles to transfer (see [`IpcMessageBuilder::cap`]).
     #[must_use]
     pub fn caps(&self) -> &[u32]
     {
@@ -2299,8 +2301,8 @@ impl IpcMessage
             // for kernel-shared memory.
             *slot = unsafe { core::ptr::read_volatile(ipc_buf.add(i)) };
         }
-        // Cap metadata: cap_count at word[MSG_DATA_WORDS_MAX], slot
-        // indices at word[MSG_DATA_WORDS_MAX + 1 ..].
+        // Cap metadata: cap_count at word[MSG_DATA_WORDS_MAX], delivered
+        // cap handles at word[MSG_DATA_WORDS_MAX + 1 ..].
         // SAFETY: same invariants; MSG_DATA_WORDS_MAX + 1 + MSG_CAP_SLOTS_MAX
         // = 64 + 1 + 4 = 69 < 512 (4 KiB / 8 B).
         let cap_count_raw = unsafe { core::ptr::read_volatile(ipc_buf.add(MSG_DATA_WORDS_MAX)) };
@@ -2325,10 +2327,10 @@ impl IpcMessage
     /// Write the populated data words into the IPC buffer.
     ///
     /// Used by the `ipc_call` / `ipc_reply` wrappers before issuing the
-    /// syscall. Cap slots are passed as syscall arguments; the sender
+    /// syscall. Cap handles are passed as syscall arguments; the sender
     /// does not write cap metadata into the buffer (the kernel installs
-    /// caps in the receiver and writes the receiver-side slot indices
-    /// into the receiver's buffer).
+    /// caps in the receiver and writes the receiver-side handles into
+    /// the receiver's buffer).
     ///
     /// # Safety
     /// `ipc_buf` must point to the caller thread's 4 KiB-aligned IPC
@@ -2435,13 +2437,16 @@ impl IpcMessageBuilder
         self
     }
 
-    /// Append one cap slot. Debug-panics if the slot array is full.
+    /// Append one capability to transfer. `handle` must be the full cap
+    /// handle as returned by the cap syscalls (index + per-slot generation)
+    /// — the kernel generation-validates it and rejects a stale handle with
+    /// `InvalidCapability`. Debug-panics if the slot array is full.
     #[must_use]
-    pub fn cap(mut self, slot: u32) -> Self
+    pub fn cap(mut self, handle: u32) -> Self
     {
         debug_assert!((self.msg.cap_count as usize) < MSG_CAP_SLOTS_MAX);
         let i = self.msg.cap_count as usize;
-        self.msg.cap_slots[i] = slot;
+        self.msg.cap_slots[i] = handle;
         self.msg.cap_count += 1;
         self
     }
@@ -2506,9 +2511,9 @@ pub unsafe fn ipc_call(ep: u32, msg: &IpcMessage, ipc_buf: *mut u64) -> Result<I
         msg.write_to_ipc_buf(ipc_buf);
     }
     let caps = msg.caps();
-    let cap_packed = syscall::pack_cap_slots(caps);
+    let (cap_lo, cap_hi) = syscall::pack_cap_handles(caps);
     let (reply_label, reply_word_count) =
-        syscall::raw_ipc_call(ep, msg.label, msg.word_count(), caps.len(), cap_packed)?;
+        syscall::raw_ipc_call(ep, msg.label, msg.word_count(), caps.len(), cap_lo, cap_hi)?;
     // SAFETY: `ipc_buf` is the registered IPC buffer; kernel wrote the
     // reply (data + cap metadata) into it before return. `reply_word_count`
     // is already clamped to MSG_DATA_WORDS_MAX by `raw_ipc_call`.
@@ -2570,6 +2575,6 @@ pub unsafe fn ipc_reply(msg: &IpcMessage, ipc_buf: *mut u64) -> Result<(), i64>
         msg.write_to_ipc_buf(ipc_buf);
     }
     let caps = msg.caps();
-    let cap_packed = syscall::pack_cap_slots(caps);
-    syscall::raw_ipc_reply(msg.label, msg.word_count(), caps.len(), cap_packed)
+    let (cap_lo, cap_hi) = syscall::pack_cap_handles(caps);
+    syscall::raw_ipc_reply(msg.label, msg.word_count(), caps.len(), cap_lo, cap_hi)
 }

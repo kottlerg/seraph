@@ -15,7 +15,7 @@
 //!
 //! The server:
 //!   1. Receives the call.
-//!   2. Reads the transferred cap from the IPC buffer via `read_recv_caps`.
+//!   2. Reads the transferred cap from the IPC buffer via `IpcMessage::from_ipc_buf`.
 //!   3. Verifies the transferred cap is usable (`notification_send` works).
 //!   4. Replies to the child.
 //!   5. Waits for the child's post-transfer verification result.

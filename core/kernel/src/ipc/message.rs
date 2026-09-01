@@ -34,7 +34,10 @@ pub struct Message
     pub data: [u64; MSG_DATA_WORDS_MAX],
     /// Actual number of valid entries in `data` (`0..=MSG_DATA_WORDS_MAX`).
     pub data_count: usize,
-    /// Capability slot indices to transfer (from the sender's `CSpace`).
+    /// Capability handles in transfer: on the send side, the sender's full
+    /// cap handles (index + generation) as unpacked from the syscall's two
+    /// packed words; after a completed transfer, rewritten to the
+    /// destination-side handles delivered to the recipient.
     pub cap_slots: [u32; MSG_CAP_SLOTS_MAX],
     /// Actual number of valid entries in `cap_slots`.
     pub cap_count: usize,

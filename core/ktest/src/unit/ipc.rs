@@ -901,6 +901,53 @@ fn reply_oom_caller_entry(arg: u64) -> !
 
 // ── duplicate cap-slot rejection ─────────────────────────────────────────────
 
+/// `sys_ipc_call` rejects a message naming a stale cap handle, before the
+/// caller blocks.
+///
+/// The transfer words carry full 32-bit handles (index + generation), so a
+/// handle held across a free/reallocate of its slot must fail closed with
+/// `InvalidCapability` — never silently transmit the slot's current
+/// occupant (#349).
+pub fn call_stale_cap_handle_rejected(ctx: &TestContext) -> TestResult
+{
+    let ep = cap_create_endpoint(ctx.memory_base)
+        .map_err(|_| "cap_create_endpoint for stale_cap test failed")?;
+    let victim = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "cap_create_notification(victim) for stale_cap test failed")?;
+    cap_delete(victim).map_err(|_| "cap_delete(victim) for stale_cap test failed")?;
+    // The freed slot is the free-list head, so the next create recycles it
+    // with a bumped generation; `victim` is now a stale handle to the
+    // occupant's slot.
+    let occupant = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "cap_create_notification(occupant) for stale_cap test failed")?;
+    if syscall_abi::cap_handle_index(occupant) != syscall_abi::cap_handle_index(victim)
+    {
+        cap_delete(occupant).ok();
+        cap_delete(ep).ok();
+        return Err("stale_cap: freed slot was not recycled by the next create");
+    }
+
+    let msg = IpcMessage::builder(0x57A1).cap(victim).build();
+    // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
+    let attempt = unsafe { ipc::ipc_call(ep, &msg, ctx.ipc_buf) };
+    let outcome = match attempt
+    {
+        Err(code) if code == syscall_abi::SyscallError::InvalidCapability as i64 => Ok(()),
+        Err(_) => Err("stale_cap: wrong error code for stale handle"),
+        Ok(_) => Err("stale_cap: call with a stale cap handle succeeded"),
+    };
+
+    // The occupant must be untouched by the refused transfer.
+    let occupant_intact = notification_send(occupant, 0x1).is_ok();
+    cap_delete(occupant).ok();
+    cap_delete(ep).ok();
+    if !occupant_intact
+    {
+        return Err("stale_cap: occupant cap was disturbed by the refused transfer");
+    }
+    outcome
+}
+
 /// `sys_ipc_call` rejects a message that packs the same cap slot twice,
 /// before the caller blocks.
 ///

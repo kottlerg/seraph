@@ -390,6 +390,10 @@ pub fn run_all(ctx: &TestContext)
         ipc::reply_oom_wakes_caller_with_transfer_failed(ctx)
     );
     run_test!(
+        "ipc::call_stale_cap_handle_rejected",
+        ipc::call_stale_cap_handle_rejected(ctx)
+    );
+    run_test!(
         "ipc::call_duplicate_cap_slot_rejected",
         ipc::call_duplicate_cap_slot_rejected(ctx)
     );

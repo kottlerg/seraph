@@ -2506,9 +2506,9 @@ pub unsafe fn ipc_call(ep: u32, msg: &IpcMessage, ipc_buf: *mut u64) -> Result<I
         msg.write_to_ipc_buf(ipc_buf);
     }
     let caps = msg.caps();
-    let cap_packed = syscall::pack_cap_slots(caps);
+    let (cap_lo, cap_hi) = syscall::pack_cap_handles(caps);
     let (reply_label, reply_word_count) =
-        syscall::raw_ipc_call(ep, msg.label, msg.word_count(), caps.len(), cap_packed)?;
+        syscall::raw_ipc_call(ep, msg.label, msg.word_count(), caps.len(), cap_lo, cap_hi)?;
     // SAFETY: `ipc_buf` is the registered IPC buffer; kernel wrote the
     // reply (data + cap metadata) into it before return. `reply_word_count`
     // is already clamped to MSG_DATA_WORDS_MAX by `raw_ipc_call`.
@@ -2570,6 +2570,6 @@ pub unsafe fn ipc_reply(msg: &IpcMessage, ipc_buf: *mut u64) -> Result<(), i64>
         msg.write_to_ipc_buf(ipc_buf);
     }
     let caps = msg.caps();
-    let cap_packed = syscall::pack_cap_slots(caps);
-    syscall::raw_ipc_reply(msg.label, msg.word_count(), caps.len(), cap_packed)
+    let (cap_lo, cap_hi) = syscall::pack_cap_handles(caps);
+    syscall::raw_ipc_reply(msg.label, msg.word_count(), caps.len(), cap_lo, cap_hi)
 }

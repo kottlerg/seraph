@@ -155,18 +155,16 @@ unsafe fn write_cap_results(buf: u64, cap_count: usize, indices: &[u32; MSG_CAP_
 
 // ── Capability transfer ───────────────────────────────────────────────────────
 
-/// Unpack `count` slot indices from a packed u64 (4 × u16).
+/// Unpack `count` cap handles from the two packed argument words.
 ///
-/// Matches the encoding in `shared/syscall::pack_cap_slots`. Each value is a slot
-/// **index** only — the sender's handle generation was stripped by the 16-bit
-/// packing and is not transmitted. The kernel re-derives the destination handle's
-/// generation from the freshly inserted slot (so the recipient's handle is
-/// generation-correct), but it cannot generation-validate the sender's named
-/// index: a sender naming a stale, recycled handle transmits the slot's current
-/// occupant rather than failing closed. This is the one cap resolution path the
-/// per-slot generation backstop does not cover (#349).
+/// Matches the encoding in `shared/syscall::pack_cap_handles`: two `u64`
+/// words, each carrying two 32-bit **full cap handles** (index + per-slot
+/// generation, see `syscall::cap_handle_encode`) — handles 0/1 in the low
+/// word, 2/3 in the high word. Carrying the generation lets
+/// [`prevalidate_transfer_slots`] fail a stale, recycled sender handle
+/// closed instead of transmitting the slot's current occupant (#349).
 #[cfg(not(test))]
-fn unpack_cap_slots(packed: u64, count: usize) -> [u32; MSG_CAP_SLOTS_MAX]
+fn unpack_cap_handles(lo: u64, hi: u64, count: usize) -> [u32; MSG_CAP_SLOTS_MAX]
 {
     let mut out = [0u32; MSG_CAP_SLOTS_MAX];
     for (i, item) in out
@@ -174,7 +172,12 @@ fn unpack_cap_slots(packed: u64, count: usize) -> [u32; MSG_CAP_SLOTS_MAX]
         .enumerate()
         .take(count.min(MSG_CAP_SLOTS_MAX))
     {
-        *item = ((packed >> (i * 16)) & 0xFFFF) as u32;
+        let word = if i < 2 { lo } else { hi };
+        // cast_possible_truncation: deliberate — each 32-bit field is one handle.
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            *item = (word >> ((i % 2) * 32)) as u32;
+        }
     }
     out
 }
@@ -187,16 +190,28 @@ fn unpack_cap_slots(packed: u64, count: usize) -> [u32; MSG_CAP_SLOTS_MAX]
 /// degrades to zero-cap delivery without notifying the sender, which is
 /// why the call path must run this before parking.
 #[cfg(not(test))]
-fn prevalidate_transfer_slots(cs: &CSpace, slots: &[u32]) -> Result<(), SyscallError>
+fn prevalidate_transfer_slots(cs: &CSpace, handles: &[u32]) -> Result<(), SyscallError>
 {
-    for (i, &idx) in slots.iter().enumerate()
+    for (i, &handle) in handles.iter().enumerate()
     {
-        if slots[..i].contains(&idx)
+        let idx = syscall::cap_handle_index(handle);
+        // Distinctness is by decoded index: two handles naming the same
+        // slot are a repeat regardless of their generation bits.
+        if handles[..i]
+            .iter()
+            .any(|&h| syscall::cap_handle_index(h) == idx)
         {
             return Err(SyscallError::InvalidArgument);
         }
         let slot = cs.slot(idx).ok_or(SyscallError::InvalidCapability)?;
         if slot.tag == CapTag::Null
+        {
+            return Err(SyscallError::InvalidCapability);
+        }
+        // Stale handle to a recycled slot: the wire carries the sender's
+        // generation, so a transfer that would otherwise move the slot's
+        // current occupant fails closed instead (#349).
+        if slot.generation() != syscall::cap_handle_gen(handle)
         {
             return Err(SyscallError::InvalidCapability);
         }
@@ -233,24 +248,23 @@ fn prevalidate_transfer_slots(cs: &CSpace, slots: &[u32]) -> Result<(), SyscallE
 #[cfg(not(test))]
 unsafe fn transfer_caps(
     src_cspace: *mut CSpace,
-    src_slots: &[u32],
+    src_handles: &[u32],
     dst_cspace: *mut CSpace,
     dst_indices_out: &mut [u32; MSG_CAP_SLOTS_MAX],
 ) -> Result<usize, SyscallError>
 {
-    let cap_count = src_slots.len().min(MSG_CAP_SLOTS_MAX);
+    let cap_count = src_handles.len().min(MSG_CAP_SLOTS_MAX);
     if cap_count == 0
     {
         return Ok(0);
     }
 
     // Fast-path reject before the pre-allocation work — the locked
-    // re-validation below is the authoritative check. The index is bare
-    // (the send pack stripped the generation), so this cannot reject a
-    // sender's stale, recycled handle — the send-path residual documented
-    // on `unpack_cap_slots` (#349).
+    // re-validation below is the authoritative check. The handles carry
+    // the sender's generation, so a stale, recycled handle is rejected
+    // here rather than transmitting the slot's current occupant (#349).
     // SAFETY: src_cspace validated by caller.
-    prevalidate_transfer_slots(unsafe { &*src_cspace }, &src_slots[..cap_count])?;
+    prevalidate_transfer_slots(unsafe { &*src_cspace }, &src_handles[..cap_count])?;
 
     // Pre-allocate destination slots to avoid OOM mid-transfer. Take
     // cspace.lock so the freelist mutation cannot tear against a concurrent
@@ -281,7 +295,7 @@ unsafe fn transfer_caps(
     // thread's mid-revoke root, or packing one index twice, would trip
     // that branch from userspace.
     // SAFETY: src_cspace validated by caller; both locks held.
-    if let Err(e) = prevalidate_transfer_slots(unsafe { &*src_cspace }, &src_slots[..cap_count])
+    if let Err(e) = prevalidate_transfer_slots(unsafe { &*src_cspace }, &src_handles[..cap_count])
     {
         // SAFETY: saved1 and saved2 came from the lock_cspace_pair call above.
         unsafe { crate::cap::unlock_cspace_pair(src_cspace, dst_cspace, saved1, saved2) };
@@ -289,8 +303,9 @@ unsafe fn transfer_caps(
         return Err(e);
     }
 
-    for (i, &src_idx) in src_slots[..cap_count].iter().enumerate()
+    for (i, &src_handle) in src_handles[..cap_count].iter().enumerate()
     {
+        let src_idx = syscall::cap_handle_index(src_handle);
         // SAFETY: DERIVATION_LOCK and both CSpace locks held; pointers valid.
         dst_indices_out[i] =
             unsafe { crate::cap::move_cap_between_cspaces(src_cspace, src_idx, dst_cspace) }
@@ -454,7 +469,8 @@ unsafe fn consume_call_disposition(
 /// `SYS_IPC_CALL` (0): synchronous call on an endpoint.
 ///
 /// arg0 = endpoint cap index, arg1 = label, arg2 = `data_count`,
-/// arg3 = `cap_count` (0-4), arg4 = packed cap slot indices (4 × u16).
+/// arg3 = `cap_count` (0-4), arg4/arg5 = packed cap handles (two 32-bit
+/// full handles per word; handles 0/1 in arg4, 2/3 in arg5).
 ///
 /// If `cap_count` > 0, the endpoint cap must have `EpRights::GRANT`. Capabilities
 /// at the specified slots are moved from the caller's `CSpace` to the server's
@@ -479,7 +495,8 @@ pub fn sys_ipc_call(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // cast_possible_truncation: Seraph targets 64-bit only; usize == u64 on all supported targets.
     #[allow(clippy::cast_possible_truncation)]
     let cap_count = (tf.arg(3) as usize).min(MSG_CAP_SLOTS_MAX);
-    let cap_packed = tf.arg(4);
+    let cap_packed_lo = tf.arg(4);
+    let cap_packed_hi = tf.arg(5);
 
     // SAFETY: current_tcb() valid from syscall context.
     let tcb = unsafe { current_tcb() };
@@ -531,11 +548,11 @@ pub fn sys_ipc_call(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // The actual cap move happens in sys_ipc_recv after delivery.
     if cap_count > 0
     {
-        let indices = unpack_cap_slots(cap_packed, cap_count);
+        let handles = unpack_cap_handles(cap_packed_lo, cap_packed_hi, cap_count);
         // Fail-fast reject before blocking (see prevalidate_transfer_slots).
         // SAFETY: cspace_ptr validated above.
-        prevalidate_transfer_slots(unsafe { &*cspace_ptr }, &indices[..cap_count])?;
-        msg.cap_slots = indices;
+        prevalidate_transfer_slots(unsafe { &*cspace_ptr }, &handles[..cap_count])?;
+        msg.cap_slots = handles;
         msg.cap_count = cap_count;
     }
 
@@ -902,7 +919,8 @@ unsafe fn deposit_transfer_failed_reply(caller: *mut crate::sched::thread::Threa
 /// `SYS_IPC_REPLY` (1): reply to a blocked caller.
 ///
 /// arg0 = label, arg1 = `data_count`,
-/// arg2 = `cap_count` (0-4), arg3 = packed cap slot indices (4 × u16).
+/// arg2 = `cap_count` (0-4), arg3/arg4 = packed cap handles (two 32-bit
+/// full handles per word; handles 0/1 in arg3, 2/3 in arg4).
 ///
 /// Capabilities move from the server's `CSpace` to the caller's `CSpace`
 /// all-or-nothing with the reply; a transfer refused after the caller was
@@ -924,7 +942,8 @@ pub fn sys_ipc_reply(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // cast_possible_truncation: Seraph targets 64-bit only; usize == u64 on all supported targets.
     #[allow(clippy::cast_possible_truncation)]
     let cap_count = (tf.arg(2) as usize).min(MSG_CAP_SLOTS_MAX);
-    let cap_packed = tf.arg(3);
+    let cap_packed_lo = tf.arg(3);
+    let cap_packed_hi = tf.arg(4);
 
     // SAFETY: syscall entry ensures current_tcb() returns active thread's TCB.
     let tcb = unsafe { current_tcb() };
@@ -970,15 +989,15 @@ pub fn sys_ipc_reply(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         {
             // SAFETY: tcb validated above.
             let server_cspace = unsafe { (*tcb).cspace };
-            let indices = unpack_cap_slots(cap_packed, cap_count);
+            let handles = unpack_cap_handles(cap_packed_lo, cap_packed_hi, cap_count);
             // SAFETY: server_cspace extracted from validated TCB.
             let server_cs = unsafe { &*server_cspace };
-            if let Err(e) = prevalidate_transfer_slots(server_cs, &indices[..cap_count])
+            if let Err(e) = prevalidate_transfer_slots(server_cs, &handles[..cap_count])
             {
                 // SAFETY: tcb validated above.
                 return Err(unsafe { fail_reply_and_wake_caller(tcb, e) });
             }
-            msg.cap_slots = indices;
+            msg.cap_slots = handles;
             msg.cap_count = cap_count;
 
             // Pre-allocate caller's CSpace destination slots before transitioning

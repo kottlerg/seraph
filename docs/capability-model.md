@@ -58,14 +58,14 @@ holds (a live cap always has index ≥ 1 in the low bits).
 The handle is `u32`-wide and travels in the low half of a 64-bit syscall register.
 Capabilities transferred over IPC, and the second child of a range split, are
 delivered with their generation intact (the split delivers its two children in the
-two return registers rather than packing them into one). The handle's generation
-is **not** carried on the IPC *send* path (the packed send slots are index-only):
-a cap named for transfer is identified by index alone, so a sender naming a stale,
-recycled handle transmits the slot's current occupant rather than failing closed —
-the one resolution path the generation check does not cover (#349), no worse than
-the pre-generation behaviour and tightenable by widening the send pack. The cap the
-recipient *receives* is generation-correct: the kernel re-derives it from the
-freshly inserted destination slot.
+two return registers rather than packing them into one). The IPC *send* path
+carries the full handle as well — the packed transfer words hold one 32-bit
+handle per field — so the kernel generation-validates the sender's named slots:
+a stale, recycled handle fails closed with `InvalidCapability` instead of
+transmitting the slot's current occupant. Every handle-resolution path is
+covered by the generation check (#349). The cap the recipient *receives* is
+generation-correct: the kernel re-derives it from the freshly inserted
+destination slot.
 
 ---
 

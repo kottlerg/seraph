@@ -218,27 +218,28 @@ Send a message to an endpoint and block until a reply is received.
 | 0 | `endpoint_cap` | Send capability to an IPC endpoint |
 | 1 | `label` | Message label (opaque word; passed to server as-is) |
 | 2 | `data_count` | Number of data words (0–MSG_DATA_WORDS_MAX) |
-| 3 | `cap_slots` | Packed descriptor: up to MSG_CAP_SLOTS_MAX caps to transfer |
-| 4 | `flags` | Bit 0: extended payload in IPC buffer page (see below) |
+| 3 | `cap_count` | Number of capabilities to transfer (0–MSG_CAP_SLOTS_MAX) |
+| 4 | `cap_handles_lo` | Packed cap handles 0 and 1 (two 32-bit fields) |
+| 5 | `cap_handles_hi` | Packed cap handles 2 and 3 (two 32-bit fields) |
 
-`cap_slots` encodes up to `MSG_CAP_SLOTS_MAX` capability descriptors packed into one
-word (implementation constant; expected value 4, requiring 16 bits each in a 64-bit
-word for up to 4 caps).
+Each 32-bit field of the two packed words carries a **full** cap handle —
+slot index plus per-slot generation — so the kernel generation-validates the
+sender's named slots: a stale handle to a recycled slot is rejected
+(`InvalidCapability`) instead of transmitting the slot's current occupant.
+Capability handles always travel in these registers; they never spill to
+memory.
 
-**Small messages (fast path):** When `data_count` ≤ `MSG_REGS_DATA_MAX` and
-`flags` bit 0 is clear, all data words pass in registers. No memory access occurs
-after argument validation.
-
-**Extended payload:** When `flags` bit 0 is set, data words beyond the register
-capacity are read from the caller's IPC buffer page (registered via
-`SYS_IPC_BUFFER_SET`). The kernel reads directly from that page; no arbitrary pointer
-dereference occurs. Reply data beyond register capacity is written to the caller's
-IPC buffer page after the server replies.
+**Data words:** When `data_count` > 0, the kernel reads the data words from
+the caller's registered IPC buffer page (`SYS_IPC_BUFFER_SET`); the syscall
+fails with `InvalidArgument` if none is registered. Reply data words are
+written back to the same page when the server replies. No arbitrary user
+pointer is dereferenced.
 
 **Return:**
 
 - `rax`/`a0`: 0 on success; `SyscallError` on failure
 - `rdx`/`a1`: reply label (valid on success)
+- `r9`/`a2`: reply data-word count
 
 **Capability requirement:** `endpoint_cap` must have Send rights, plus Grant
 when the message carries capabilities.
@@ -263,8 +264,12 @@ Send a reply to the caller that issued the most recent `SYS_IPC_RECV` on this th
 |---|---|---|
 | 0 | `label` | Reply label |
 | 1 | `data_count` | Number of data words (0–MSG_DATA_WORDS_MAX) |
-| 2 | `cap_slots` | Capabilities to transfer in the reply (packed descriptors) |
-| 3 | `flags` | Bit 0: extended payload in IPC buffer page |
+| 2 | `cap_count` | Number of capabilities to transfer (0–MSG_CAP_SLOTS_MAX) |
+| 3 | `cap_handles_lo` | Packed cap handles 0 and 1 (two 32-bit fields) |
+| 4 | `cap_handles_hi` | Packed cap handles 2 and 3 (two 32-bit fields) |
+
+The packed-handle encoding matches `SYS_IPC_CALL`: full 32-bit handles, so a
+stale reply slot is rejected rather than resolved to its current occupant.
 
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
 
@@ -274,9 +279,9 @@ time). It is consumed by this syscall whether it succeeds or fails. If no reply
 capability is present (i.e. this thread did not receive a call), the syscall
 returns `InvalidCapability`.
 
-Extended payload follows the same rules as `SYS_IPC_CALL`: when `flags` bit 0 is
-set, data beyond register capacity is read from this thread's IPC buffer page and
-written to the original caller's IPC buffer page.
+Data words follow the same rules as `SYS_IPC_CALL`: when `data_count` > 0
+they are read from this thread's registered IPC buffer page and written to
+the original caller's IPC buffer page.
 
 **Capability requirement:** Implicit reply capability from `current_tcb.reply_cap_slot`.
 
@@ -307,8 +312,9 @@ Wait for a call on an endpoint. Blocks until a caller arrives.
 - `rdx`/`a1`: label from the incoming message
 - `rsi`/`a2`: badge from the sender's endpoint capability (0 if unbadged)
 
-Data words up to `MSG_REGS_DATA_MAX` are returned in registers. Extended payload
-(when the sender set `flags` bit 0) is written to the receiver's IPC buffer page.
+The message's data words are written to the receiver's registered IPC buffer
+page, followed by the cap-transfer result block (count, then the delivered
+destination handles) at word offset `MSG_DATA_WORDS_MAX`.
 The kernel places a reply capability into a per-thread slot (`reply_cap_slot`);
 this capability is retrieved implicitly by `SYS_IPC_REPLY`.
 

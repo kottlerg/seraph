@@ -5,11 +5,14 @@
 
 //! Capability space implementation.
 //!
-//! A [`CSpace`] is a two-level directory of [`CapabilitySlot`]s. The directory
-//! has [`L1_SIZE`] entries; each points to a [`CSpacePage`] containing
-//! [`L2_SIZE`] slots. Capacity is bounded only by the pool pages the owner
-//! has donated (see Growth below) and the directory's structural ceiling,
-//! [`MAX_SLOTS_STRUCTURAL`].
+//! A [`CSpace`] is a hybrid two-level radix of [`CapabilitySlot`]s. The
+//! inline root holds [`L1_DIRECT`] pointers to leaf [`CSpacePage`]s (the
+//! direct region, the first `L1_DIRECT × L2_SIZE` slots) plus
+//! [`L1_INDIRECT`] pointers to pool-allocated [`CSpaceDirPage`]s of
+//! [`DIR_FANOUT`] leaf pointers each (the indirect region). Lookup is O(1):
+//! two dereferences in the direct region, three in the indirect. Capacity
+//! is bounded only by the pool pages the owner has donated (see Growth
+//! below) and the structural ceiling, [`MAX_SLOTS_STRUCTURAL`].
 //!
 //! ## Free list
 //!
@@ -19,9 +22,14 @@
 //!
 //! ## Growth
 //!
-//! `CSpace` pages are allocated on demand by [`CSpace::grow`]. The first page
-//! skips slot 0 (always null); subsequent pages contribute all 56 slots to the
-//! free list.
+//! Leaves are allocated on demand by [`CSpace::grow`], strictly in index
+//! order behind the `next_leaf` cursor — allocated leaves are always the
+//! contiguous range `0..next_leaf`, so grow is O(1). The first leaf skips
+//! slot 0 (always null); every other leaf contributes all [`L2_SIZE`] slots
+//! to the free list. A grow into the indirect region first materialises the
+//! covering directory page from the same pool; a directory page that
+//! outlives a failed leaf allocation stays published — already paid for, it
+//! serves the next grow.
 
 // cast_possible_truncation: usize→u32 slot index bounded by MAX_SLOTS_STRUCTURAL.
 #![allow(clippy::cast_possible_truncation)]
@@ -47,13 +55,23 @@ use super::slot::{CSpaceId, CapTag, CapabilitySlot, Rights};
 /// with 64 B of tail slack).
 pub const L2_SIZE: usize = 56;
 
-/// Directory entries per `CSpace`.
-pub const L1_SIZE: usize = 256;
+/// Inline root pointers to leaf pages (the direct region).
+pub const L1_DIRECT: usize = 128;
+
+/// Inline root pointers to directory pages (the indirect region).
+pub const L1_INDIRECT: usize = 128;
+
+/// Leaf pointers per pool-allocated directory page (one 4 KiB page of
+/// 8-byte pointers).
+pub const DIR_FANOUT: usize = crate::mm::PAGE_SIZE / core::mem::size_of::<*mut CSpacePage>();
+
+/// Maximum leaf pages a `CSpace` can ever hold.
+pub const MAX_LEAVES: usize = L1_DIRECT + L1_INDIRECT * DIR_FANOUT;
 
 /// The directory's structural slot ceiling; see
-/// core/kernel/docs/capability-internals.md § Storage: Two-Level Array
-/// for the bound's role.
-pub const MAX_SLOTS_STRUCTURAL: usize = L1_SIZE * L2_SIZE;
+/// core/kernel/docs/capability-internals.md § Storage: Hybrid Two-Level
+/// Radix for the bound's role.
+pub const MAX_SLOTS_STRUCTURAL: usize = MAX_LEAVES * L2_SIZE;
 
 // Every slot index must fit in the cap handle's index field; the rest of the
 // handle carries the per-slot generation. If the maximum CSpace capacity ever
@@ -61,15 +79,19 @@ pub const MAX_SLOTS_STRUCTURAL: usize = L1_SIZE * L2_SIZE;
 // compile time instead.
 const _: () = assert!(MAX_SLOTS_STRUCTURAL <= (1usize << syscall::CAP_INDEX_BITS));
 
+// The leaf cursor is a u32; the ceiling must fit it.
+const _: () = assert!(MAX_LEAVES <= u32::MAX as usize);
+
 // ── Error type ────────────────────────────────────────────────────────────────
 
 /// Errors returned by `CSpace` operations.
 #[derive(Debug, PartialEq, Eq)]
 pub enum CapError
 {
-    /// The directory is full: every `L1_SIZE` entry is populated and no
-    /// free slot remains. A structural ceiling derived from the directory
-    /// shape and the cap-handle index width; donating memory cannot lift it.
+    /// The directory is full: every leaf up to [`MAX_LEAVES`] is populated
+    /// and no free slot remains. A structural ceiling derived from the
+    /// directory shape and the cap-handle index width; donating memory
+    /// cannot lift it.
     OutOfSlots,
     /// The slot-page pool was exhausted while growing. Refillable: donate
     /// pages via augment-mode `cap_create_cspace`. (Host-test heap path:
@@ -122,6 +144,23 @@ const _: () = assert!(
     "CSpacePage exceeds PAGE_SIZE — reduce L2_SIZE or shrink CapabilitySlot"
 );
 
+// ── CSpaceDirPage ─────────────────────────────────────────────────────────────
+
+/// One pool-allocated directory page of the indirect region: [`DIR_FANOUT`]
+/// leaf-page pointers. All-zeros (every entry null) is the valid initial
+/// state. Entries are write-once while the `CSpace` is live: published with
+/// Release by [`CSpace::grow`], read with Acquire by the lock-free lookup
+/// path.
+#[repr(C)]
+struct CSpaceDirPage
+{
+    entries: [AtomicPtr<CSpacePage>; DIR_FANOUT],
+}
+
+// A CSpaceDirPage occupies exactly one page — `grow` pops one pool page per
+// directory page and casts it wholesale.
+const _: () = assert!(core::mem::size_of::<CSpaceDirPage>() == crate::mm::PAGE_SIZE);
+
 // ── CSpace ────────────────────────────────────────────────────────────────────
 
 /// A capability space: a growable indexed collection of capability slots.
@@ -132,23 +171,34 @@ const _: () = assert!(
 /// To add a capability: call [`insert_cap`][CSpace::insert_cap].
 /// To look up a slot: call [`slot`][CSpace::slot] or [`slot_mut`][CSpace::slot_mut].
 ///
-/// ## Concurrency
+/// ## Concurrency and memory ordering
 ///
-/// All operations are protected by an internal spinlock to allow safe
-/// concurrent access from multiple CPUs (e.g., parent inserting caps into
-/// child's `CSpace` while child accesses it). External callers of `slot()` and
-/// `slot_mut()` automatically acquire the lock. Internal helpers use unlocked
-/// accessors when the lock is already held.
+/// All mutation is protected by the internal spinlock (`&mut self` is only
+/// reachable through a lock holder). Directory and leaf pointers are
+/// **write-once while the `CSpace` is live**: [`grow`][Self::grow] publishes
+/// each fully-initialised page with a Release store, and no page is freed,
+/// moved, or replaced before refcount-0 teardown. [`slot`][Self::slot]
+/// therefore supports lock-free readers (`lookup_cap`, `cap_info`): its
+/// Acquire loads at each level pair with grow's Release publication, so a
+/// reader that observes a pointer observes the initialised page behind it.
+/// Races on slot *content* are defended by the tag and per-slot generation
+/// checks every resolution path performs, not by the directory.
 pub struct CSpace
 {
     id: CSpaceId,
-    /// Two-level directory; each Some entry is an `L2_SIZE`-slot page.
-    /// Pages are stored as raw `NonNull` pointers so the heap-backed and
-    /// retype-pool-backed paths can coexist with different reclamation
-    /// semantics. The `kobj` field discriminates: null = heap (Drop walks
-    /// the directory and Box-frees each page); non-null = retype pool
-    /// (`dealloc_object(CSpaceObj)` reclaims chunks wholesale).
-    directory: [Option<NonNull<CSpacePage>>; L1_SIZE],
+    /// Direct region: inline pointers to the first [`L1_DIRECT`] leaf
+    /// pages. Null = unallocated. Pages come from the retype pool (or the
+    /// host heap in the test stub — the `kobj` field discriminates: null =
+    /// heap, Drop Box-frees each page; non-null = retype pool,
+    /// `dealloc_object(CSpaceObj)` reclaims chunks wholesale).
+    direct: [AtomicPtr<CSpacePage>; L1_DIRECT],
+    /// Indirect region: inline pointers to pool-allocated directory pages,
+    /// each fanning out to [`DIR_FANOUT`] further leaves. Null =
+    /// unallocated.
+    indirect: [AtomicPtr<CSpaceDirPage>; L1_INDIRECT],
+    /// Grow cursor: leaves `0..next_leaf` are allocated (contiguously);
+    /// `next_leaf` is the next leaf `grow` will materialise.
+    next_leaf: u32,
     /// Total usable slots allocated across all pages (excludes slot 0).
     allocated_slots: usize,
     /// Head of the intrusive free list; None if no free slots.
@@ -160,15 +210,17 @@ pub struct CSpace
     free_count: usize,
     /// Protects concurrent access to all `CSpace` state.
     pub(crate) lock: crate::sync::Spinlock,
-    /// Pool source for new slot pages. Null = legacy heap path
-    /// (`Box::leak` from kernel heap); non-null = retype-pool path
-    /// (pop from `CSpaceKernelObject::alloc_slot_page`). Set once via
+    /// Pool source for new slot and directory pages. Null = legacy heap
+    /// path (host-test stub); non-null = retype-pool path (pop from
+    /// `CSpaceKernelObject::alloc_slot_page`). Set once via
     /// [`Self::set_kobj`] right after construction.
     kobj: AtomicPtr<CSpaceKernelObject>,
 }
 
-// SAFETY: NonNull<CSpacePage> entries are accessed only under `self.lock`
-// or after the CSpace has reached refcount 0 (single-threaded teardown).
+// SAFETY: page pointers are write-once, Release-published after full
+// initialisation, and never freed while the CSpace is live; all other state
+// is mutated only under `self.lock` (or single-threaded refcount-0
+// teardown). Lock-free readers use Acquire loads.
 unsafe impl Send for CSpace {}
 // SAFETY: see Send impl above.
 unsafe impl Sync for CSpace {}
@@ -182,7 +234,9 @@ impl CSpace
     {
         Self {
             id,
-            directory: core::array::from_fn(|_| None),
+            direct: core::array::from_fn(|_| AtomicPtr::new(core::ptr::null_mut())),
+            indirect: core::array::from_fn(|_| AtomicPtr::new(core::ptr::null_mut())),
+            next_leaf: 0,
             allocated_slots: 0,
             free_head: None,
             free_count: 0,
@@ -258,32 +312,18 @@ impl CSpace
         Ok(idx)
     }
 
-    /// Grow the `CSpace` by one page.
+    /// Allocate one zeroed backing page for a leaf or directory page.
     ///
-    /// Allocates the next unoccupied directory entry, threads all its slots
-    /// onto the free list, then returns. Slot 0 in the first page is skipped.
-    /// The page comes from the retype-pool pool when [`Self::set_kobj`] has
-    /// installed a parent `CSpaceKernelObject`; otherwise from the kernel
-    /// heap (legacy bootstrap path).
-    fn grow(&mut self) -> Result<(), CapError>
+    /// Production `CSpace`s are always retype-backed (root via
+    /// `boot_retype_cspace`, userspace via `sys_cap_create_cspace`) and pop
+    /// from the wrapper's pool; the host-test stub allocates from the heap.
+    /// `T` must be a page-sized-or-smaller type whose all-zeros bit pattern
+    /// is a valid value (both `CSpacePage` and `CSpaceDirPage` are).
+    fn alloc_zeroed_page<T>(&self) -> Result<NonNull<T>, CapError>
     {
-        let page_idx = self
-            .directory
-            .iter()
-            .position(|p: &Option<NonNull<CSpacePage>>| p.is_none())
-            .ok_or(CapError::OutOfSlots)?;
-
-        let base = page_idx * L2_SIZE;
-        let start_slot = usize::from(page_idx == 0);
-        let new_free = L2_SIZE - start_slot;
-
-        // Source the page from the retype-pool. Production CSpaces are
-        // always retype-backed (root CSpace via `boot_retype_cspace`,
-        // userspace CSpaces via `sys_cap_create_cspace`); the heap fallback
-        // is for the host-test stubs only.
         let kobj_ptr = self.kobj.load(Ordering::Acquire);
         #[cfg(not(test))]
-        let page_nn: NonNull<CSpacePage> = {
+        {
             debug_assert!(
                 !kobj_ptr.is_null(),
                 "CSpace::grow: production CSpace must be retype-backed"
@@ -302,30 +342,71 @@ impl CSpace
             };
             let virt = crate::mm::paging::phys_to_virt(phys);
             // SAFETY: pool returns page-aligned, freshly-zeroed pages mapped
-            // in the kernel direct map.
-            unsafe { NonNull::new_unchecked(virt as *mut CSpacePage) }
-        };
-        #[cfg(test)]
-        let page_nn: NonNull<CSpacePage> = if kobj_ptr.is_null()
-        {
-            // Test stub: no retype machinery, allocate via the host heap.
-            // SAFETY: all-zeros is a valid CSpacePage (every slot null).
-            let boxed = Box::new(unsafe { core::mem::zeroed::<CSpacePage>() });
-            // SAFETY: Box::into_raw is non-null.
-            unsafe { NonNull::new_unchecked(Box::into_raw(boxed)) }
+            // in the kernel direct map; T fits one page and is zero-valid.
+            Ok(unsafe { NonNull::new_unchecked(virt as *mut T) })
         }
-        else
+        #[cfg(test)]
         {
-            return Err(CapError::PoolExhausted);
-        };
+            if kobj_ptr.is_null()
+            {
+                // Test stub: no retype machinery, allocate via the host
+                // heap.
+                // SAFETY: the caller's T is zero-valid per the contract.
+                let boxed = Box::new(unsafe { core::mem::zeroed::<T>() });
+                // SAFETY: Box::into_raw is non-null.
+                Ok(unsafe { NonNull::new_unchecked(Box::into_raw(boxed)) })
+            }
+            else
+            {
+                Err(CapError::PoolExhausted)
+            }
+        }
+    }
 
-        // SAFETY: page_nn points at an exclusively-owned, zeroed CSpacePage.
+    /// Grow the `CSpace` by one leaf page.
+    ///
+    /// Materialises leaf `next_leaf`, threads all its slots onto the free
+    /// list, publishes it, and advances the cursor. Slot 0 in the first
+    /// leaf is skipped. A grow into the indirect region first materialises
+    /// the covering directory page from the same pool; if the subsequent
+    /// leaf allocation fails, the directory page stays published — already
+    /// paid for, it serves the next grow.
+    fn grow(&mut self) -> Result<(), CapError>
+    {
+        let leaf_idx = self.next_leaf as usize;
+        if leaf_idx >= MAX_LEAVES
+        {
+            return Err(CapError::OutOfSlots);
+        }
+
+        // Indirect region: ensure the covering directory page exists.
+        if leaf_idx >= L1_DIRECT
+        {
+            let dir_idx = (leaf_idx - L1_DIRECT) / DIR_FANOUT;
+            if self.indirect[dir_idx].load(Ordering::Relaxed).is_null()
+            {
+                let dir_nn: NonNull<CSpaceDirPage> = self.alloc_zeroed_page()?;
+                // All-null entries are the valid empty state; the Release
+                // publication pairs with the lookup path's Acquire so a
+                // lock-free reader never observes uninitialised entries.
+                self.indirect[dir_idx].store(dir_nn.as_ptr(), Ordering::Release);
+            }
+        }
+
+        let page_nn: NonNull<CSpacePage> = self.alloc_zeroed_page()?;
+        // SAFETY: page_nn points at an exclusively-owned, zeroed CSpacePage
+        // not yet published to any reader.
         let page = unsafe { page_nn.as_ptr().as_mut().unwrap_unchecked() };
 
-        let end_slot = start_slot + new_free;
+        // Thread the leaf's slots onto the free list BEFORE publication so
+        // the Release store below orders the initialised slot bytes ahead
+        // of pointer visibility.
+        let base = leaf_idx * L2_SIZE;
+        let start_slot = usize::from(leaf_idx == 0);
+        let new_free = L2_SIZE - start_slot;
         let old_head = self.free_head;
         let mut next = old_head;
-        for i in (start_slot..end_slot).rev()
+        for i in (start_slot..L2_SIZE).rev()
         {
             let idx = NonZeroU32::new((base + i) as u32).ok_or(CapError::InvalidIndex)?;
             page.slots[i].set_next_free(next);
@@ -333,10 +414,53 @@ impl CSpace
         }
         self.free_head = next;
 
+        // Publish.
+        if leaf_idx < L1_DIRECT
+        {
+            self.direct[leaf_idx].store(page_nn.as_ptr(), Ordering::Release);
+        }
+        else
+        {
+            let rel = leaf_idx - L1_DIRECT;
+            let dir = self.indirect[rel / DIR_FANOUT].load(Ordering::Relaxed);
+            // SAFETY: ensured non-null above under the same lock; directory
+            // pages are write-once and never freed while the CSpace lives.
+            unsafe {
+                (*dir).entries[rel % DIR_FANOUT].store(page_nn.as_ptr(), Ordering::Release);
+            }
+        }
+
+        self.next_leaf += 1;
         self.allocated_slots += new_free;
         self.free_count += new_free;
-        self.directory[page_idx] = Some(page_nn);
         Ok(())
+    }
+
+    /// Resolve a leaf index to its page pointer, or `None` if the leaf is
+    /// unallocated or out of range.
+    ///
+    /// Acquire loads at each level pair with [`grow`][Self::grow]'s Release
+    /// publications, so a non-null result points at a fully-initialised
+    /// page (see the struct's memory-ordering contract).
+    fn leaf_ptr(&self, leaf_idx: usize) -> Option<NonNull<CSpacePage>>
+    {
+        if leaf_idx < L1_DIRECT
+        {
+            NonNull::new(self.direct[leaf_idx].load(Ordering::Acquire))
+        }
+        else if leaf_idx < MAX_LEAVES
+        {
+            let rel = leaf_idx - L1_DIRECT;
+            let dir = NonNull::new(self.indirect[rel / DIR_FANOUT].load(Ordering::Acquire))?;
+            // SAFETY: directory pages are write-once, Release-published
+            // after zero-init, and never freed while the CSpace is live.
+            let dir_ref = unsafe { dir.as_ref() };
+            NonNull::new(dir_ref.entries[rel % DIR_FANOUT].load(Ordering::Acquire))
+        }
+        else
+        {
+            None
+        }
     }
 
     /// Look up a slot by index. Returns `None` if the index is out of range
@@ -344,44 +468,47 @@ impl CSpace
     pub fn slot(&self, index: u32) -> Option<&CapabilitySlot>
     {
         let idx = index as usize;
-        let page_idx = idx / L2_SIZE;
-        let slot_idx = idx % L2_SIZE;
-        let page_nn = (*self.directory.get(page_idx)?)?;
-        // SAFETY: directory entries are never aliased while the CSpace lock
-        // is held; CapabilitySlot is repr(C) and the page bytes are exclusively
-        // owned by this CSpace.
+        let page_nn = self.leaf_ptr(idx / L2_SIZE)?;
+        // SAFETY: leaf pages are never freed or moved while the CSpace is
+        // live; CapabilitySlot is repr(C) and the page bytes belong to this
+        // CSpace. Content races are defended by tag/generation checks at
+        // every resolution site.
         let page = unsafe { page_nn.as_ref() };
-        Some(&page.slots[slot_idx])
+        Some(&page.slots[idx % L2_SIZE])
     }
 
     /// Mutable variant of [`slot`][Self::slot].
     pub fn slot_mut(&mut self, index: u32) -> Option<&mut CapabilitySlot>
     {
         let idx = index as usize;
-        let page_idx = idx / L2_SIZE;
-        let slot_idx = idx % L2_SIZE;
-        let mut page_nn = (*self.directory.get(page_idx)?)?;
-        // SAFETY: same as `slot`; `&mut self` excludes other readers.
+        let mut page_nn = self.leaf_ptr(idx / L2_SIZE)?;
+        // SAFETY: same as `slot`; `&mut self` (lock held) excludes other
+        // writers.
         let page = unsafe { page_nn.as_mut() };
-        Some(&mut page.slots[slot_idx])
+        Some(&mut page.slots[idx % L2_SIZE])
     }
 
-    /// Return the raw page pointer for a directory entry, or `None` if the
-    /// entry is unmapped or `page_idx` is out of range.
+    /// Number of allocated leaf pages; leaves `0..leaf_count()` are exactly
+    /// the allocated ones (the grow cursor keeps them contiguous).
     ///
     /// Used by the pre-unregister derivation drain in
-    /// `dealloc_object(CSpaceObj)` to determine which pages of the dying
-    /// `CSpace` are populated without holding a `&self` borrow across
+    /// `dealloc_object(CSpaceObj)` to bound its walk of the dying `CSpace`.
+    pub(crate) fn leaf_count(&self) -> usize
+    {
+        self.next_leaf as usize
+    }
+
+    /// Return the raw page pointer for a leaf, or `None` if the leaf is
+    /// unallocated or `leaf_idx` is out of range.
+    ///
+    /// Used by the drain in `dealloc_object(CSpaceObj)` to presence-test
+    /// pages of the dying `CSpace` without holding a `&self` borrow across
     /// per-slot calls into foreign `CSpace`s. The returned pointer is for
     /// presence-testing only — callers MUST go through `slot`/`slot_mut`
     /// for any actual read or write.
-    pub(crate) fn page_at(&self, page_idx: usize) -> Option<core::ptr::NonNull<u8>>
+    pub(crate) fn leaf_at(&self, leaf_idx: usize) -> Option<core::ptr::NonNull<u8>>
     {
-        self.directory
-            .get(page_idx)
-            .copied()
-            .flatten()
-            .map(core::ptr::NonNull::cast::<u8>)
+        self.leaf_ptr(leaf_idx).map(core::ptr::NonNull::cast::<u8>)
     }
 
     /// Return a slot to the free list and clear its contents.
@@ -628,9 +755,11 @@ impl CSpace
             return Err(CapError::InvalidIndex);
         }
 
-        // Ensure the page covering this index is allocated.
-        let page_idx = index as usize / L2_SIZE;
-        while self.directory[page_idx].is_none()
+        // Ensure the leaf covering this index is allocated. Leaves are
+        // contiguous behind the grow cursor, so every intermediate leaf up
+        // to the target is materialised on the way.
+        let leaf_idx = index as usize / L2_SIZE;
+        while (self.next_leaf as usize) <= leaf_idx
         {
             self.grow()?;
         }
@@ -688,14 +817,14 @@ impl CSpace
     where
         F: FnMut(NonNull<KernelObjectHeader>),
     {
-        for page_idx in 0..L1_SIZE
+        for leaf_idx in 0..self.next_leaf as usize
         {
-            if let Some(page_nn) = self.directory[page_idx]
+            if let Some(page_nn) = self.leaf_ptr(leaf_idx)
             {
                 // SAFETY: page_nn is owned by this CSpace and not aliased
                 // outside the lock.
                 let page = unsafe { page_nn.as_ref() };
-                let start = usize::from(page_idx == 0);
+                let start = usize::from(leaf_idx == 0);
                 for slot_idx in start..L2_SIZE
                 {
                     let slot = &page.slots[slot_idx];
@@ -726,15 +855,35 @@ impl Drop for CSpace
         {
             if self.kobj.load(Ordering::Acquire).is_null()
             {
-                for entry in &mut self.directory
+                for entry in &self.direct
                 {
-                    if let Some(page_nn) = entry.take()
+                    let p = entry.swap(core::ptr::null_mut(), Ordering::AcqRel);
+                    if !p.is_null()
                     {
-                        // SAFETY: test stub: page_nn came from Box::into_raw
-                        // via grow's heap branch.
-                        unsafe {
-                            drop(Box::from_raw(page_nn.as_ptr()));
+                        // SAFETY: test stub: p came from Box::into_raw via
+                        // alloc_zeroed_page's heap branch.
+                        unsafe { drop(Box::from_raw(p)) };
+                    }
+                }
+                for entry in &self.indirect
+                {
+                    let dir = entry.swap(core::ptr::null_mut(), Ordering::AcqRel);
+                    if dir.is_null()
+                    {
+                        continue;
+                    }
+                    // SAFETY: dir came from Box::into_raw; its entries hold
+                    // leaf pages from the same heap branch.
+                    unsafe {
+                        for leaf in &(*dir).entries
+                        {
+                            let p = leaf.swap(core::ptr::null_mut(), Ordering::AcqRel);
+                            if !p.is_null()
+                            {
+                                drop(Box::from_raw(p));
+                            }
                         }
+                        drop(Box::from_raw(dir));
                     }
                 }
             }
@@ -988,21 +1137,63 @@ mod tests
     #[test]
     fn structural_ceiling_returns_out_of_slots()
     {
-        // Fill every directory entry via the heap-backed grow path. The
-        // ceiling excludes only the permanently-reserved slot 0, so
-        // MAX_SLOTS_STRUCTURAL - 1 allocations must succeed and the next
-        // must fail with the structural OutOfSlots — not PoolExhausted.
+        // Filling all 3.6M slots is not host-viable (~270 MiB of pages);
+        // force the grow cursor to the ceiling instead — with an empty free
+        // list, the next allocation's grow must fail with the structural
+        // OutOfSlots, not PoolExhausted.
         let mut cs = CSpace::new(0);
-        for i in 0..(MAX_SLOTS_STRUCTURAL - 1)
-        {
-            assert!(
-                cs.allocate_slot().is_ok(),
-                "allocation {i} failed below the structural ceiling"
-            );
-        }
+        cs.next_leaf = MAX_LEAVES as u32;
         let err = cs.allocate_slot().unwrap_err();
         assert_eq!(err, CapError::OutOfSlots);
-        assert_eq!(cs.allocated_slots, MAX_SLOTS_STRUCTURAL - 1);
+    }
+
+    #[test]
+    fn growth_crosses_direct_indirect_boundary()
+    {
+        // Exhaust the direct region (128 leaves x 56 slots, minus reserved
+        // slot 0), then verify the next allocation materialises the first
+        // indirect leaf — directory page included — and that slots on both
+        // sides of the boundary round-trip.
+        let mut cs = CSpace::new(0);
+        let direct_slots = L1_DIRECT * L2_SIZE - 1;
+        let mut last_direct = 0u32;
+        for i in 0..direct_slots
+        {
+            let idx = cs
+                .allocate_slot()
+                .unwrap_or_else(|e| panic!("direct-region allocation {i} failed: {e:?}"));
+            last_direct = idx.get();
+        }
+        assert!(
+            (last_direct as usize) < L1_DIRECT * L2_SIZE,
+            "direct region overflowed early"
+        );
+        assert_eq!(cs.next_leaf as usize, L1_DIRECT);
+
+        // Crossing allocation: leaf 128, the first indirect leaf.
+        let obj = dummy_object();
+        let idx = cs
+            .insert_cap_typed(MemRights::MAP, obj)
+            .expect("first indirect-region insert failed");
+        assert!(
+            idx.get() as usize >= L1_DIRECT * L2_SIZE,
+            "expected an index in the indirect region"
+        );
+        let slot = cs.slot(idx.get()).expect("indirect slot unmapped");
+        assert_eq!(slot.tag, CapTag::Memory);
+        assert_eq!(slot.object, Some(obj));
+
+        // A direct-region slot still resolves after the boundary crossing.
+        assert!(cs.slot(1).is_some(), "direct-region slot lost");
+
+        // Deep explicit placement drives the cursor further into the
+        // indirect region through the same contiguous-grow path.
+        cs.insert_cap_at(8000, CapTag::Memory, MemRights::MAP.erase(), obj)
+            .expect("insert_cap_at(8000) failed");
+        let deep = cs.slot(8000).expect("slot 8000 unmapped");
+        assert_eq!(deep.object, Some(obj));
+        assert_eq!(cs.next_leaf as usize, 8000 / L2_SIZE + 1);
+        assert_eq!(cs.populated_count(), direct_slots + 2);
     }
 
     #[test]

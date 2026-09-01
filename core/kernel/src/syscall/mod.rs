@@ -694,7 +694,11 @@ pub(crate) unsafe fn lookup_cap<K: crate::cap::slot::CapKind>(
     }
     // ref_as_ptr: intentional — raw pointer cast to extend lifetime to 'static.
     #[allow(clippy::ref_as_ptr)]
-    // SAFETY: slot lives in the CSpace which is heap-allocated for the lifetime of the process.
+    // SAFETY: the slot lives in a leaf page of the CSpace's directory. Leaf
+    // pages are write-once, Release-published, and never freed or moved
+    // before refcount-0 teardown (see CSpace's memory-ordering contract),
+    // so the reference outlives this syscall; slot-content races are
+    // defended by the tag/generation checks above.
     Ok(unsafe { &*(slot as *const _) })
 }
 

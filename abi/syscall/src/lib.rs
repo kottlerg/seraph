@@ -345,10 +345,12 @@ pub const CAP_INFO_ASPACE_PT_BUDGET: u64 = 4;
 /// the remaining growth-budget pages would back, clamped to the highest
 /// reachable count (the directory's structural ceiling minus the
 /// permanently reserved slot 0). Grows with augment-mode
-/// `cap_create_cspace` donations. A mild over-estimate on a `CSpace` that
-/// has not yet allocated its first page (slot 0 is reserved); subtracting
-/// [`CAP_INFO_CSPACE_USED`] yields headroom, which tolerates that. Calling
-/// on a non-`CSpace` slot returns [`SyscallError::InvalidArgument`].
+/// `cap_create_cspace` donations. A mild over-estimate: the first page's
+/// reserved slot 0 is counted before that page exists, and deep growth
+/// spends an occasional budget page on a directory page that backs no
+/// slots. Subtracting [`CAP_INFO_CSPACE_USED`] yields headroom, which
+/// tolerates both. Calling on a non-`CSpace` slot returns
+/// [`SyscallError::InvalidArgument`].
 pub const CAP_INFO_CSPACE_CAPACITY: u64 = 5;
 
 /// `CSpace` only — number of currently populated (non-null) slots.

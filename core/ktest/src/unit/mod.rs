@@ -195,6 +195,10 @@ pub fn run_all(ctx: &TestContext)
         retype::cspace_grow_consumes_pool(ctx)
     );
     run_test!(
+        "retype::cspace_indirect_region",
+        retype::cspace_indirect_region(ctx)
+    );
+    run_test!(
         "retype::cspace_pool_exhaust_then_augment",
         retype::cspace_pool_exhaust_then_augment(ctx)
     );

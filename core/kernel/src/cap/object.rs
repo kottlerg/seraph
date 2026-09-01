@@ -2843,7 +2843,7 @@ unsafe fn drain_dying_cspace(
     dying_epoch: u32,
 )
 {
-    use crate::cap::cspace::{L1_SIZE, L2_SIZE};
+    use crate::cap::cspace::L2_SIZE;
     use crate::cap::slot::{CapTag, SlotId};
     use core::num::NonZeroU32;
 
@@ -2855,20 +2855,27 @@ unsafe fn drain_dying_cspace(
     // head dies must be redirected to the first LIVE sibling, not to
     // whatever dying slot happened to come next (that would strand live
     // children behind a stale link).
-    for page_idx in 0..L1_SIZE
+    // Leaves are contiguous behind the grow cursor; `leaf_count` bounds the
+    // walk exactly. The per-slot sibling walks are bounded by the dying
+    // CSpace's slot count (a dying run cannot be longer), snapshotted here.
+    // SAFETY: cs_ptr is uniquely owned (refcount = 0).
+    let leaf_count = unsafe { (*cs_ptr).leaf_count() };
+    // SAFETY: as above.
+    let walk_bound = unsafe { (*cs_ptr).allocated_slots() };
+    for leaf_idx in 0..leaf_count
     {
-        // Presence-test the page without holding a `&CSpace` borrow into
+        // Presence-test the leaf without holding a `&CSpace` borrow into
         // the per-slot scope below.
-        // SAFETY: cs_ptr is uniquely owned; `page_at` takes `&self` briefly
+        // SAFETY: cs_ptr is uniquely owned; `leaf_at` takes `&self` briefly
         // and returns before the borrow can be observed elsewhere.
-        if unsafe { (*cs_ptr).page_at(page_idx) }.is_none()
+        if unsafe { (*cs_ptr).leaf_at(leaf_idx) }.is_none()
         {
             continue;
         }
-        let start = usize::from(page_idx == 0);
+        let start = usize::from(leaf_idx == 0);
         for slot_idx_in_page in start..L2_SIZE
         {
-            let global_idx = (page_idx * L2_SIZE + slot_idx_in_page) as u32;
+            let global_idx = (leaf_idx * L2_SIZE + slot_idx_in_page) as u32;
             let Some(global_idx_nz) = NonZeroU32::new(global_idx)
             else
             {
@@ -2915,7 +2922,16 @@ unsafe fn drain_dying_cspace(
             // SAFETY: DERIVATION_LOCK held; foreign cspaces resolved via
             // registry lookup with epoch validation.
             unsafe {
-                drain_foreign_back_links(self_id, dying_id, dying_epoch, parent, fc, prev, next);
+                drain_foreign_back_links(
+                    self_id,
+                    dying_id,
+                    dying_epoch,
+                    parent,
+                    fc,
+                    prev,
+                    next,
+                    walk_bound,
+                );
             }
         }
     }
@@ -2924,17 +2940,17 @@ unsafe fn drain_dying_cspace(
     // hygienic: the CSpace is unregistered and its storage reclaimed right
     // after this drain, and Pass 1 guarantees no live slot still references
     // any of these.
-    for page_idx in 0..L1_SIZE
+    for leaf_idx in 0..leaf_count
     {
         // SAFETY: as in Pass 1.
-        if unsafe { (*cs_ptr).page_at(page_idx) }.is_none()
+        if unsafe { (*cs_ptr).leaf_at(leaf_idx) }.is_none()
         {
             continue;
         }
-        let start = usize::from(page_idx == 0);
+        let start = usize::from(leaf_idx == 0);
         for slot_idx_in_page in start..L2_SIZE
         {
-            let global_idx = (page_idx * L2_SIZE + slot_idx_in_page) as u32;
+            let global_idx = (leaf_idx * L2_SIZE + slot_idx_in_page) as u32;
             // SAFETY: cs_ptr uniquely owned; brief exclusive per-slot borrow.
             if let Some(slot) = unsafe { (*cs_ptr).slot_mut(global_idx) }
                 && slot.tag != CapTag::Null
@@ -2948,16 +2964,14 @@ unsafe fn drain_dying_cspace(
     }
 }
 
-/// Iteration bound for the drain's sibling walks: a dying run cannot
-/// exceed the dying `CSpace`'s slot count, so exceeding this means a
-/// corrupt sibling cycle — the walk truncates (returns `None`) instead of
-/// spinning under `DERIVATION_LOCK`.
-#[cfg(not(test))]
-const DRAIN_WALK_BOUND: usize = crate::cap::cspace::L1_SIZE * crate::cap::cspace::L2_SIZE;
-
 /// Walk `deriv_next_sibling` links starting at `from`, skipping slots that
 /// live in the dying `CSpace`, and return the first surviving sibling
 /// (`None` if the rest of the chain is dying or the chain ends).
+///
+/// `walk_bound` is the dying `CSpace`'s allocated slot count: a dying run
+/// cannot be longer, so exceeding it means a corrupt sibling cycle — the
+/// walk truncates (returns `None`) instead of spinning under
+/// `DERIVATION_LOCK`.
 ///
 /// Sound only during Pass 1 of [`drain_dying_cspace`], while the dying
 /// slots' sibling pointers are still intact.
@@ -2971,10 +2985,11 @@ unsafe fn first_live_forward(
     from: Option<crate::cap::slot::SlotId>,
     dying_id: crate::cap::slot::CSpaceId,
     dying_epoch: u32,
+    walk_bound: usize,
 ) -> Option<crate::cap::slot::SlotId>
 {
     let mut cur = from;
-    for _ in 0..=DRAIN_WALK_BOUND
+    for _ in 0..=walk_bound
     {
         let c = cur?;
         if c.cspace_id != dying_id
@@ -3000,10 +3015,11 @@ unsafe fn first_live_backward(
     from: Option<crate::cap::slot::SlotId>,
     dying_id: crate::cap::slot::CSpaceId,
     dying_epoch: u32,
+    walk_bound: usize,
 ) -> Option<crate::cap::slot::SlotId>
 {
     let mut cur = from;
-    for _ in 0..=DRAIN_WALK_BOUND
+    for _ in 0..=walk_bound
     {
         let c = cur?;
         if c.cspace_id != dying_id
@@ -3045,6 +3061,7 @@ unsafe fn first_live_backward(
 /// resolves for the intra-cspace walks, and no dying slot's derivation
 /// pointers may have been cleared yet (Pass-1 contract).
 #[cfg(not(test))]
+#[allow(clippy::too_many_arguments)]
 unsafe fn drain_foreign_back_links(
     self_id: crate::cap::slot::SlotId,
     dying_id: crate::cap::slot::CSpaceId,
@@ -3053,6 +3070,7 @@ unsafe fn drain_foreign_back_links(
     first_child: Option<crate::cap::slot::SlotId>,
     prev: Option<crate::cap::slot::SlotId>,
     next: Option<crate::cap::slot::SlotId>,
+    walk_bound: usize,
 )
 {
     // Parent: if first_child pointed at self_id, redirect to the first
@@ -3067,7 +3085,7 @@ unsafe fn drain_foreign_back_links(
         {
             // SAFETY: Pass-1 contract (see Safety above).
             parent_slot.deriv_first_child =
-                unsafe { first_live_forward(next, dying_id, dying_epoch) };
+                unsafe { first_live_forward(next, dying_id, dying_epoch, walk_bound) };
         }
     }
 
@@ -3083,7 +3101,7 @@ unsafe fn drain_foreign_back_links(
         {
             // SAFETY: Pass-1 contract (see Safety above).
             prev_slot.deriv_next_sibling =
-                unsafe { first_live_forward(next, dying_id, dying_epoch) };
+                unsafe { first_live_forward(next, dying_id, dying_epoch, walk_bound) };
         }
     }
 
@@ -3099,7 +3117,7 @@ unsafe fn drain_foreign_back_links(
         {
             // SAFETY: Pass-1 contract (see Safety above).
             next_slot.deriv_prev_sibling =
-                unsafe { first_live_backward(prev, dying_id, dying_epoch) };
+                unsafe { first_live_backward(prev, dying_id, dying_epoch, walk_bound) };
         }
     }
 

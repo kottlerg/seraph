@@ -26,45 +26,72 @@ From the design document:
   with its own Memory caps, so per-process kernel memory is bounded by
   what the process paid for
 
-### Storage: Two-Level Array
+### Storage: Hybrid Two-Level Radix
 
-The CSpace is implemented as a two-level array (similar to a small page table):
+The CSpace is a hybrid radix: an inline root of leaf pointers plus
+pool-allocated directory pages fanning out to further leaves (similar to a
+page table with a large root):
 
 ```rust
 pub struct CSpace
 {
-    /// L1 directory: array of pointers to L2 pages.
-    /// Statically sized; each entry covers L2_SIZE slots.
-    directory: [Option<Box<CSpacePage>>; L1_SIZE],
-
+    /// Direct region: inline pointers to the first L1_DIRECT leaf pages.
+    direct: [AtomicPtr<CSpacePage>; L1_DIRECT],
+    /// Indirect region: inline pointers to pool-allocated directory pages,
+    /// each fanning out to DIR_FANOUT further leaves.
+    indirect: [AtomicPtr<CSpaceDirPage>; L1_INDIRECT],
+    /// Grow cursor: leaves 0..next_leaf are allocated, contiguously.
+    next_leaf: u32,
     /// Total number of slots currently allocated (not necessarily in use).
     allocated_slots: usize,
 }
 
-/// One page of CSpace slots (an L2 block).
-/// Sized so that one CSpacePage is exactly one kernel heap allocation.
+/// One page of CSpace slots (a leaf).
 struct CSpacePage
 {
     slots: [CapabilitySlot; L2_SIZE],
 }
+
+/// One pool-allocated directory page: DIR_FANOUT leaf pointers.
+struct CSpaceDirPage
+{
+    entries: [AtomicPtr<CSpacePage>; DIR_FANOUT],
+}
 ```
 
-The concrete values of `L1_SIZE` and `L2_SIZE` are implementation constants
-chosen so that one `CSpacePage` fits in a single slab allocation and every
+The concrete values of `L1_DIRECT`, `L1_INDIRECT`, `DIR_FANOUT`, and
+`L2_SIZE` are implementation constants chosen so that one `CSpacePage` fits
+a single pool page, one `CSpaceDirPage` is exactly one pool page, and every
 slot index fits the cap handle's index field. They are established at
-implementation time and are not part of the public ABI. Their product is the
-directory's structural ceiling — the only slot bound a CSpace has; capacity
-below it is whatever the owner-funded slot-page pool backs.
+implementation time and are not part of the public ABI.
+`(L1_DIRECT + L1_INDIRECT × DIR_FANOUT) × L2_SIZE` is the directory's
+structural ceiling — the only slot bound a CSpace has; capacity below it is
+whatever the owner-funded slot-page pool backs.
 
-**Lookup is O(1):** A descriptor `d` maps to `directory[d / L2_SIZE].slots[d % L2_SIZE]`.
-Two array dereferences, always. No hash, no tree traversal, no search.
+**Lookup is O(1):** A descriptor `d` selects leaf `d / L2_SIZE` and slot
+`d % L2_SIZE`. Leaves below `L1_DIRECT` resolve through the inline root
+(two dereferences); higher leaves resolve through one directory page
+(three dereferences). No hash, no search.
 
-**Growth is demand-driven:** Directory entries start as `None`. The first allocation
-in a new L2 range triggers a `CSpacePage` allocation from the slab cache. L2 pages
-are never freed while the CSpace is live (slot indices must remain stable).
+**Growth is O(1) and strictly ordered:** leaves are materialised in index
+order behind the `next_leaf` cursor, so allocated leaves are always the
+contiguous range `0..next_leaf`. A grow into the indirect region first
+materialises the covering directory page from the same owner-funded pool
+(roughly one extra pool page per `DIR_FANOUT` leaves); a directory page
+that outlives a failed leaf allocation stays published — already paid for,
+it serves the next grow. Pages are never freed while the CSpace is live
+(slot indices must remain stable).
 
-**Slot 0** is always null. The directory entry for slot 0 exists but the slot is
-permanently locked to the null capability, enforced at the lookup level.
+**Memory ordering:** directory and leaf pointers are write-once while the
+CSpace is live, published with Release after full initialisation, and read
+with Acquire by the lock-free lookup path (`lookup_cap`, `cap_info`); all
+mutation happens under the CSpace spinlock. Races on slot content are
+defended by the tag and per-slot generation checks at every resolution
+site, not by the directory.
+
+**Slot 0** is always null. The leaf covering slot 0 exists once the CSpace
+has grown, but the slot is permanently locked to the null capability,
+enforced at the lookup level.
 
 ### Free Slot Tracking
 

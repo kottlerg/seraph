@@ -26,11 +26,12 @@ use crate::{TestContext, TestResult};
 /// Test virtual address for MMIO mapping. 1.25 GiB — above ktest's load address.
 const MMIO_TEST_VA: u64 = 0x1_5000_0000;
 
-/// Kernel pin: the `CSpace` directory's structural ceiling is
-/// `L1_SIZE * L2_SIZE` (256 * 56 = 14336) slots. Used as a fallback scan
+/// Kernel pin: the `CSpace` directory's structural ceiling —
+/// `(L1_DIRECT + L1_INDIRECT * DIR_FANOUT) * L2_SIZE`
+/// `= (128 + 128 * 512) * 56 = 3,677,184` slots. Used as a fallback scan
 /// bound if `cap_info` ever returns a value larger than `u32::MAX`, which
 /// the kernel's own invariants forbid today.
-const CSPACE_STRUCTURAL_CEILING: u32 = 14336;
+const CSPACE_STRUCTURAL_CEILING: u32 = 3_677_184;
 
 // ── SYS_MMIO_MAP ──────────────────────────────────────────────────────────────
 

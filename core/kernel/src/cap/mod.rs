@@ -50,7 +50,7 @@ pub mod split;
 // Re-exports for convenience. Many are consumed by future phases; suppress the
 // unused lint rather than removing symbols that future code will reference.
 #[allow(unused_imports)]
-pub use cspace::{CSpace, CapError, L1_SIZE, L2_SIZE};
+pub use cspace::{CSpace, CapError, L2_SIZE};
 #[allow(unused_imports)]
 pub use derivation::DERIVATION_LOCK;
 #[allow(unused_imports)]

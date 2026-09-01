@@ -2576,11 +2576,14 @@ pub fn sys_cap_info(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             // Currently-backed capacity: slots already threaded onto pages
             // plus what the remaining growth-budget pages would add, clamped
             // to the highest reachable count (the structural ceiling minus
-            // the permanently-reserved slot 0). A mild over-estimate for a
-            // CSpace that has not yet allocated page 0; headroom triggers
-            // tolerate that. The budget read is outside the CSpace lock,
-            // so grows landing between the two reads skew the sum; the
-            // value is advisory and headroom triggers tolerate the skew.
+            // the permanently-reserved slot 0). A mild over-estimate: page 0
+            // is counted before it exists (reserved slot 0), and past the
+            // direct region roughly one budget page per DIR_FANOUT leaves
+            // is spent on a directory page that backs no slots. Headroom
+            // triggers tolerate both. The budget read is outside the CSpace
+            // lock, so grows landing between the two reads skew the sum;
+            // the value is advisory and the same triggers tolerate the
+            // skew.
             // SAFETY: cs_obj.cspace validated non-null; allocated_slots is
             // mutated only under the CSpace lock, taken here; lock_raw /
             // unlock_raw paired.

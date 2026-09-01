@@ -30,11 +30,12 @@
 //! the suite). Each test cleans up only its own derived caps.
 
 use syscall::{
-    cap_copy, cap_create_aspace, cap_create_cspace, cap_create_endpoint, cap_delete, cap_info,
-    mem_map, mem_unmap, mem_unmap_reclaim,
+    cap_copy, cap_create_aspace, cap_create_cspace, cap_create_endpoint, cap_create_notification,
+    cap_delete, cap_info, cap_insert, mem_map, mem_unmap, mem_unmap_reclaim,
 };
 use syscall_abi::{
-    CAP_INFO_ASPACE_PT_BUDGET, CAP_INFO_CSPACE_BUDGET, CAP_INFO_CSPACE_USED, MAP_WRITABLE,
+    CAP_INFO_ASPACE_PT_BUDGET, CAP_INFO_CSPACE_BUDGET, CAP_INFO_CSPACE_USED,
+    CAP_INFO_MEMORY_AVAILABLE, MAP_WRITABLE, RIGHTS_NTF_NOTIFY,
 };
 
 use crate::{TestContext, TestResult};
@@ -426,6 +427,94 @@ pub fn cspace_pool_exhaust_then_augment(ctx: &TestContext) -> TestResult
         return Err(
             "retype::pool_exhaust: augmented pool did not back exactly 112 further inserts",
         );
+    }
+    Ok(())
+}
+
+/// The indirect directory region works end to end: explicit-destination
+/// placement past the direct region (slot 7300, leaf 130) and — memory
+/// permitting — at index 1,000,000 (leaf 17,857), growing every
+/// intermediate leaf and the covering pool-paid directory pages. The
+/// wholesale delete reclaims the entire slab.
+pub fn cspace_indirect_region(ctx: &TestContext) -> TestResult
+{
+    const PAGE: u64 = 4096;
+    const SMALL_SLOT: u32 = 7300;
+    const DEEP_SLOT: u32 = 1_000_000;
+    // Pages to back DEEP_SLOT: leaves 0..=17,857 plus 35 directory pages.
+    const DEEP_POOL_PAGES: u64 = 17_893;
+
+    let memory = ctx.memory_base;
+    let baseline = cap_info(memory, CAP_INFO_MEMORY_AVAILABLE)
+        .map_err(|_| "retype::indirect: cap_info(baseline) failed")?;
+    let probe = cap_create_notification(memory)
+        .map_err(|_| "retype::indirect: cap_create_notification failed")?;
+
+    let cspace = cap_create_cspace(memory, 0, 4)
+        .map_err(|_| "retype::indirect: cap_create_cspace failed")?;
+
+    // Deep placement first (while the pool is coldest): fund it only if the
+    // source cap has comfortable headroom, otherwise skip-pass the deep
+    // half — CI guests with small RAM still exercise the small crossing.
+    let deep = baseline > (DEEP_POOL_PAGES + 4096) * PAGE;
+    if deep
+    {
+        if cap_create_cspace(memory, cspace, DEEP_POOL_PAGES).is_err()
+        {
+            cap_delete(cspace).ok();
+            cap_delete(probe).ok();
+            return Err("retype::indirect: deep augment failed");
+        }
+        if cap_insert(probe, cspace, DEEP_SLOT, RIGHTS_NTF_NOTIFY).is_err()
+        {
+            cap_delete(cspace).ok();
+            cap_delete(probe).ok();
+            return Err("retype::indirect: cap_insert(1_000_000) failed");
+        }
+    }
+    else
+    {
+        crate::log("ktest: retype::cspace_indirect_region deep half SKIP (low memory)");
+        // Small augment instead: enough pool for 131 leaves + 1 dir page.
+        if cap_create_cspace(memory, cspace, 132).is_err()
+        {
+            cap_delete(cspace).ok();
+            cap_delete(probe).ok();
+            return Err("retype::indirect: small augment failed");
+        }
+    }
+
+    // Small crossing: leaf 130, three-level lookup path.
+    if cap_insert(probe, cspace, SMALL_SLOT, RIGHTS_NTF_NOTIFY).is_err()
+    {
+        cap_delete(cspace).ok();
+        cap_delete(probe).ok();
+        return Err("retype::indirect: cap_insert(7300) failed");
+    }
+
+    let used = cap_info(cspace, CAP_INFO_CSPACE_USED)
+        .map_err(|_| "retype::indirect: cap_info(used) failed")?;
+    let expected_used = if deep { 2 } else { 1 };
+    // An occupied high slot must also reject a second explicit placement.
+    let occupied = cap_insert(probe, cspace, SMALL_SLOT, RIGHTS_NTF_NOTIFY).is_err();
+
+    // Wholesale reclaim.
+    cap_delete(cspace).map_err(|_| "retype::indirect: cap_delete(cspace) failed")?;
+    cap_delete(probe).map_err(|_| "retype::indirect: cap_delete(probe) failed")?;
+
+    if used != expected_used
+    {
+        return Err("retype::indirect: CSPACE_USED mismatch after explicit placements");
+    }
+    if !occupied
+    {
+        return Err("retype::indirect: re-placement at an occupied high slot succeeded");
+    }
+    let after = cap_info(memory, CAP_INFO_MEMORY_AVAILABLE)
+        .map_err(|_| "retype::indirect: cap_info(after) failed")?;
+    if after != baseline
+    {
+        return Err("retype::indirect: slab not fully reclaimed on delete");
     }
     Ok(())
 }

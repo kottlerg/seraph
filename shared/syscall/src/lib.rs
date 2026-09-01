@@ -436,8 +436,8 @@ unsafe fn syscall6_ret3(
     let tertiary: u64;
     let nr = nr as i64;
     // SAFETY: inline asm issues syscall instruction per x86-64 ABI; syscall number in rax,
-    // args in rdi/rsi/rdx/r10/r8/r9; clobbers rcx/r11; reads secondary from rdx (lateout),
-    // tertiary from r9 (inout — r9 carries the sixth argument in, the tertiary return out).
+    // args in rdi/rsi/rdx/r10/r8/r9; clobbers rcx/r11. rdx and r9 are inout: third and
+    // sixth arguments in, secondary and tertiary returns out.
     unsafe {
         core::arch::asm!(
             "syscall",
@@ -550,9 +550,9 @@ unsafe fn syscall6(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64
     ret
 }
 
-// ── IPC capability slot helpers ───────────────────────────────────────────────
+// ── IPC capability handle helpers ─────────────────────────────────────────────
 
-pub use syscall_abi::pack_cap_handles;
+pub use syscall_abi::{pack_cap_handles, unpack_cap_handles};
 
 // ── Public syscall wrappers ───────────────────────────────────────────────────
 

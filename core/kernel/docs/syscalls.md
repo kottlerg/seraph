@@ -248,9 +248,10 @@ when the message carries capabilities.
 `InsufficientRights`, `InvalidArgument` (bad count, a cap slot repeated in one
 message, or `data_count` > 0 with no IPC buffer page registered),
 `InvalidAddress` (registered IPC buffer page unmapped), `InvalidState` (a cap
-slot is pinned by an in-flight `SYS_CAP_REVOKE`), `Interrupted`. Cap-slot problems are rejected before the
-caller blocks; a refusal that arises only afterwards degrades to delivery with
-zero caps (the caller keeps its capabilities).
+slot is pinned by an in-flight `SYS_CAP_REVOKE`), `Interrupted`. Cap-slot
+problems are rejected before the caller blocks; a refusal that arises only
+afterwards degrades to delivery with zero caps (the caller keeps its
+capabilities).
 
 ---
 
@@ -311,6 +312,7 @@ Wait for a call on an endpoint. Blocks until a caller arrives.
 - `rax`/`a0`: 0 on success; `SyscallError` on failure
 - `rdx`/`a1`: label from the incoming message
 - `rsi`/`a2`: badge from the sender's endpoint capability (0 if unbadged)
+- `r8`/`a3`: data-word count of the delivered message
 
 The message's data words are written to the receiver's registered IPC buffer
 page, followed by the cap-transfer result block (count, then the delivered
@@ -1689,8 +1691,8 @@ event queue lacks Post), `OutOfMemory` (the address space's observer array is fu
 ### `SYS_IPC_BUFFER_SET` (42)
 
 Register the per-thread IPC buffer page. This is the page the kernel uses for
-extended IPC payloads (when `flags` bit 0 is set in `SYS_IPC_CALL` or
-`SYS_IPC_REPLY`).
+IPC data words (`SYS_IPC_CALL`, `SYS_IPC_REPLY`, and `SYS_IPC_RECV` delivery,
+whenever `data_count` > 0) and for the cap-transfer result block.
 
 **Arguments:**
 
@@ -1703,11 +1705,12 @@ extended IPC payloads (when `flags` bit 0 is set in `SYS_IPC_CALL` or
 The page at `virt` must already be mapped in the calling thread's address space with
 at least read+write permissions. The kernel records the address in the calling
 thread's TCB. The page must remain mapped for the duration of any IPC that uses it;
-if the page is unmapped when an extended IPC is attempted, the IPC syscall returns
-`InvalidArgument`.
+if the page is unmapped when a data-carrying IPC is attempted, the IPC syscall
+returns `InvalidAddress` (the copy fault).
 
 Calling `SYS_IPC_BUFFER_SET` again replaces the previous registration. Passing 0
-deregisters the IPC buffer page (extended payloads will fail with `InvalidArgument`).
+deregisters the IPC buffer page (data-carrying IPC then fails with
+`InvalidArgument`).
 
 **Capability requirement:** None — acts on the calling thread implicitly.
 

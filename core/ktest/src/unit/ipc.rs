@@ -1071,12 +1071,14 @@ fn dup_reply_caller_entry(arg: u64) -> !
 // ── reply-direction stale cap-handle rejection ───────────────────────────────
 
 /// A reply naming a stale cap handle is refused with `InvalidCapability`;
-/// the claimed caller is still woken with the synthetic
+/// the waiting caller is still woken with the synthetic
 /// `IPC_REPLY_TRANSFER_FAILED` label and the recycled slot's current
 /// occupant is untouched.
 ///
-/// Same generation check as the call direction, but on the materially
-/// different post-claim failure path (`fail_reply_and_wake_caller`).
+/// Exercises the generation-mismatch branch of the reply direction's
+/// pre-validation — a distinct rejection cause from the duplicate-index
+/// branch `reply_duplicate_cap_slot_rejected` covers, routed through the
+/// same `fail_reply_and_wake_caller` wake.
 pub fn reply_stale_cap_handle_rejected(ctx: &TestContext) -> TestResult
 {
     let ep = cap_create_endpoint(ctx.memory_base)
@@ -1195,7 +1197,7 @@ pub fn call_four_caps_transfer(ctx: &TestContext) -> TestResult
         {
             return Err("four_caps: duplicate destination slot delivered");
         }
-        if syscall::notification_send(h, 1 << i).is_err()
+        if notification_send(h, 1 << i).is_err()
         {
             return Err("four_caps: a transferred cap is not a usable notification");
         }

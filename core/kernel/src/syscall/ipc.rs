@@ -110,33 +110,34 @@ unsafe fn write_ipc_buf(buf: u64, count: usize, src: &[u64; MSG_DATA_WORDS_MAX])
 /// Layout starting at word `MSG_DATA_WORDS_MAX`:
 /// ```text
 /// word[MSG_DATA_WORDS_MAX + 0] = cap_count as u64
-/// word[MSG_DATA_WORDS_MAX + 1] = idx[0] as u64
-/// word[MSG_DATA_WORDS_MAX + 2] = idx[1] as u64
+/// word[MSG_DATA_WORDS_MAX + 1] = handle[0] as u64
+/// word[MSG_DATA_WORDS_MAX + 2] = handle[1] as u64
 /// ...
 /// ```
 ///
-/// Silently skips if `buf == 0`. Matches the layout in `shared/syscall`
-/// `read_recv_caps`.
+/// Silently skips if `buf == 0`. Matches the layout read by `shared/ipc`
+/// `IpcMessage::from_ipc_buf`.
 ///
 /// # Safety
 /// `buf` must be a valid, mapped IPC buffer page VA, or 0.
 #[cfg(not(test))]
-unsafe fn write_cap_results(buf: u64, cap_count: usize, indices: &[u32; MSG_CAP_SLOTS_MAX])
+unsafe fn write_cap_results(buf: u64, cap_count: usize, handles: &[u32; MSG_CAP_SLOTS_MAX])
 {
     if buf == 0
     {
         return;
     }
     // Always write the cap_count word, even when 0: stale values from a prior
-    // IPC round would otherwise be read by `read_recv_caps` and mismatch the
-    // declared cap count, tripping `debug_assert_eq!` on the caller side.
+    // IPC round would otherwise be read by `IpcMessage::from_ipc_buf` and
+    // mismatch the declared cap count, tripping `debug_assert_eq!` on the
+    // caller side.
     let n = cap_count.min(MSG_CAP_SLOTS_MAX);
     // Assemble the result block [cap_count, idx0, idx1, ...] (indices widened
     // u32 -> u64) in a kernel buffer, then copy it to the user IPC buffer at word
     // offset MSG_DATA_WORDS_MAX.
     let mut block = [0u64; MSG_CAP_SLOTS_MAX + 1];
     block[0] = cap_count as u64;
-    for (slot, &idx) in block[1..].iter_mut().zip(indices.iter()).take(n)
+    for (slot, &idx) in block[1..].iter_mut().zip(handles.iter()).take(n)
     {
         *slot = u64::from(idx);
     }
@@ -207,7 +208,7 @@ fn prevalidate_transfer_slots(cs: &CSpace, handles: &[u32]) -> Result<(), Syscal
 /// re-validation immediately before the moves, so concurrent frees or
 /// revoke-marker changes cannot slip between validation and transfer.
 ///
-/// On success, writes the destination cap handles to `dst_indices_out` and
+/// On success, writes the destination cap handles to `dst_handles_out` and
 /// returns the number of caps transferred. The caller is responsible for
 /// writing the results to the appropriate IPC buffer.
 ///
@@ -224,7 +225,7 @@ unsafe fn transfer_caps(
     src_cspace: *mut CSpace,
     src_handles: &[u32],
     dst_cspace: *mut CSpace,
-    dst_indices_out: &mut [u32; MSG_CAP_SLOTS_MAX],
+    dst_handles_out: &mut [u32; MSG_CAP_SLOTS_MAX],
 ) -> Result<usize, SyscallError>
 {
     let cap_count = src_handles.len().min(MSG_CAP_SLOTS_MAX);
@@ -281,7 +282,7 @@ unsafe fn transfer_caps(
     {
         let src_idx = syscall::cap_handle_index(src_handle);
         // SAFETY: DERIVATION_LOCK and both CSpace locks held; pointers valid.
-        dst_indices_out[i] =
+        dst_handles_out[i] =
             unsafe { crate::cap::move_cap_between_cspaces(src_cspace, src_idx, dst_cspace) }
                 .unwrap_or_else(|_| {
                     // The locked re-validation above passed and destination
@@ -754,11 +755,10 @@ pub fn sys_ipc_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         }
         // Always write cap_count to the receiver's IPC buffer — including
         // the zero-cap case — so a prior IPC's cap metadata cannot be
-        // mis-read as if it belonged to this delivery. The kernel's
-        // `read_recv_caps` / userspace's `IpcMessage::from_ipc_buf` both
-        // read `cap_count` from a fixed buffer slot; without an
-        // unconditional write here, stale values trip handlers that loop
-        // over `req.caps()`.
+        // mis-read as if it belonged to this delivery. Userspace's
+        // `IpcMessage::from_ipc_buf` reads `cap_count` from a fixed buffer
+        // slot; without an unconditional write here, stale values trip
+        // handlers that loop over `req.caps()`.
         // SAFETY: server_buf is user-mapped or 0.
         unsafe {
             write_cap_results(server_buf, transferred, &dst_indices);

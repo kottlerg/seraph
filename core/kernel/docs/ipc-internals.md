@@ -95,17 +95,13 @@ TCB used only while the thread is blocked on an IPC object. No separate allocati
    e. Block current thread: state = BlockedOnSend, call scheduler
 ```
 
-**Message copy — small messages (fast path):** Label and up to the register-capacity
-data words pass entirely through saved register state. No user memory is accessed
-after argument validation; no heap allocation occurs.
-
-**Message copy — extended payloads:** When `data_count` exceeds the register
-capacity (flagged via the `flags` argument bit 0 in `SYS_IPC_CALL`), the kernel
-reads the additional data words from the sender's per-thread IPC buffer page at the
-registered virtual address. The kernel writes the extended words into the receiver's
-IPC buffer page. If either IPC buffer page is unmapped, the syscall returns
-`InvalidArgument`. Capability slots always travel in registers regardless of payload
-size.
+**Message copy:** The label, counts, badge, and packed cap handles travel in
+saved register state. Data words travel through the per-thread IPC buffer
+pages: when `data_count` > 0 the kernel reads the words from the sender's
+registered page and writes them into the receiver's registered page. A
+data-carrying IPC with no registered page fails with `InvalidArgument`; a
+registered page unmapped at copy time surfaces the copy fault
+(`InvalidAddress`). No heap allocation occurs on either path.
 
 ### Receive Path (Server)
 

@@ -116,6 +116,10 @@ pub const fn cap_handle_gen(handle: u32) -> u8
 #[must_use]
 pub fn pack_cap_handles(handles: &[u32]) -> (u64, u64)
 {
+    // The two-word layout holds exactly four 32-bit fields; raising
+    // MSG_CAP_SLOTS_MAX past 4 would silently alias fields. Trip at
+    // compile time instead.
+    const _: () = assert!(MSG_CAP_SLOTS_MAX <= 4);
     let mut lo: u64 = 0;
     let mut hi: u64 = 0;
     for (i, &handle) in handles.iter().take(MSG_CAP_SLOTS_MAX).enumerate()

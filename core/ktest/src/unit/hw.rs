@@ -30,7 +30,6 @@ const MMIO_TEST_VA: u64 = 0x1_5000_0000;
 /// `L1_SIZE * L2_SIZE` (256 * 56 = 14336) slots. Used as a fallback scan
 /// bound if `cap_info` ever returns a value larger than `u32::MAX`, which
 /// the kernel's own invariants forbid today.
-#[cfg(target_arch = "x86_64")]
 const CSPACE_STRUCTURAL_CEILING: u32 = 14336;
 
 // ── SYS_MMIO_MAP ──────────────────────────────────────────────────────────────
@@ -300,7 +299,9 @@ pub fn ioport_split(ctx: &TestContext) -> TestResult
 pub fn mmio_split_carves(ctx: &TestContext) -> TestResult
 {
     let scan_bound = syscall::cap_info(ctx.cspace_cap, syscall_abi::CAP_INFO_CSPACE_CAPACITY)
-        .map_or(ctx.aspace_cap, |n| u32::try_from(n).unwrap_or(u32::MAX));
+        .map_or(ctx.aspace_cap, |n| {
+            u32::try_from(n).unwrap_or(CSPACE_STRUCTURAL_CEILING)
+        });
 
     for slot in 1u32..=scan_bound
     {
@@ -348,7 +349,9 @@ pub fn mmio_split_wrong_tag_err(ctx: &TestContext) -> TestResult
 pub fn irq_split_carves(ctx: &TestContext) -> TestResult
 {
     let scan_bound = syscall::cap_info(ctx.cspace_cap, syscall_abi::CAP_INFO_CSPACE_CAPACITY)
-        .map_or(ctx.aspace_cap, |n| u32::try_from(n).unwrap_or(u32::MAX));
+        .map_or(ctx.aspace_cap, |n| {
+            u32::try_from(n).unwrap_or(CSPACE_STRUCTURAL_CEILING)
+        });
 
     for slot in 1u32..=scan_bound
     {

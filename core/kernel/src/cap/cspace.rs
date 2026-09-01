@@ -8,8 +8,8 @@
 //! A [`CSpace`] is a two-level directory of [`CapabilitySlot`]s. The directory
 //! has [`L1_SIZE`] entries; each points to a [`CSpacePage`] containing
 //! [`L2_SIZE`] slots. Capacity is bounded only by the pool pages the owner
-//! has donated (see Growth below) and the directory's structural ceiling of
-//! `L1_SIZE * L2_SIZE = 14336` slots.
+//! has donated (see Growth below) and the directory's structural ceiling,
+//! [`MAX_SLOTS_STRUCTURAL`].
 //!
 //! ## Free list
 //!
@@ -23,7 +23,7 @@
 //! skips slot 0 (always null); subsequent pages contribute all 56 slots to the
 //! free list.
 
-// cast_possible_truncation: usize→u32 slot index bounded by L1_SIZE * L2_SIZE (14336).
+// cast_possible_truncation: usize→u32 slot index bounded by MAX_SLOTS_STRUCTURAL.
 #![allow(clippy::cast_possible_truncation)]
 
 // `alloc` is needed by the host-test stubs (CSpace::grow heap fallback,
@@ -47,12 +47,11 @@ use super::slot::{CSpaceId, CapTag, CapabilitySlot, Rights};
 /// with 64 B of tail slack).
 pub const L2_SIZE: usize = 56;
 
-/// Directory entries per `CSpace` (max 256 × 56 = 14336 slots).
+/// Directory entries per `CSpace`.
 pub const L1_SIZE: usize = 256;
 
-/// The directory's structural slot ceiling — the only slot bound a
-/// `CSpace` has. Capacity below it is whatever the owner-funded
-/// slot-page pool backs.
+/// The directory's structural slot ceiling; see
+/// core/kernel/docs/capability-internals.md §Storage for the bound's role.
 pub const MAX_SLOTS_STRUCTURAL: usize = L1_SIZE * L2_SIZE;
 
 // Every slot index must fit in the cap handle's index field; the rest of the
@@ -620,10 +619,9 @@ impl CSpace
         // Reject indices beyond the directory's structural ceiling.
         //
         // Below the ceiling, the grow loop that follows allocates every
-        // intermediate page up to the chosen index — bounded by the pool
-        // pages the caller has funded, which is the intended bound. A
-        // donor placing a cap at a high well-known index pays for the
-        // intervening pages.
+        // intermediate page up to the chosen index — bounded by the
+        // destination CSpace's donated pool, which is the intended bound:
+        // whoever funded that pool pays for the intervening pages.
         if index as usize >= MAX_SLOTS_STRUCTURAL
         {
             return Err(CapError::InvalidIndex);
@@ -932,6 +930,44 @@ mod tests
                 expected
             );
         }
+    }
+
+    #[test]
+    fn insert_cap_at_grows_to_high_index()
+    {
+        // Placing a cap at index 200 (page 3) on a fresh CSpace must grow
+        // every intermediate page and land the cap at exactly that slot.
+        let mut cs = CSpace::new(0);
+        let obj = dummy_object();
+        cs.insert_cap_at(200, CapTag::Memory, MemRights::MAP.erase(), obj)
+            .expect("insert_cap_at(200) on a fresh CSpace failed");
+        let slot = cs.slot(200).expect("slot 200 unmapped after insert");
+        assert_eq!(slot.tag, CapTag::Memory);
+        assert_eq!(slot.object, Some(obj));
+        // Pages 0..=3 allocated: 55 + 3 * 56 usable slots.
+        assert_eq!(cs.allocated_slots, 55 + 3 * L2_SIZE);
+        assert_eq!(cs.populated_count(), 1);
+    }
+
+    #[test]
+    fn insert_cap_at_rejects_structural_ceiling()
+    {
+        let mut cs = CSpace::new(0);
+        let obj = dummy_object();
+        let err = cs
+            .insert_cap_at(
+                MAX_SLOTS_STRUCTURAL as u32,
+                CapTag::Memory,
+                MemRights::MAP.erase(),
+                obj,
+            )
+            .unwrap_err();
+        assert_eq!(err, CapError::InvalidIndex);
+        let err = cs
+            .insert_cap_at(0, CapTag::Memory, MemRights::MAP.erase(), obj)
+            .unwrap_err();
+        assert_eq!(err, CapError::InvalidIndex);
+        assert_eq!(cs.allocated_slots, 0, "rejected inserts must not grow");
     }
 
     #[test]

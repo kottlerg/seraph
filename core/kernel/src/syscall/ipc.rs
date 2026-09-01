@@ -1014,8 +1014,8 @@ pub fn sys_ipc_reply(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             {
                 // Caller's CSpace cannot accept reply caps. Wake the caller with
                 // a synthetic failure reply so it un-parks and surfaces the error
-                // rather than dead-locking; bubble the pool/quota distinction
-                // to the server.
+                // rather than dead-locking; bubble the pool/structural-ceiling
+                // distinction to the server.
                 // SAFETY: tcb validated above.
                 return Err(unsafe { fail_reply_and_wake_caller(tcb, e.into()) });
             }

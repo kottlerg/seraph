@@ -2574,21 +2574,25 @@ pub fn sys_cap_info(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             }
             // Currently-backed capacity: slots already threaded onto pages
             // plus what the remaining growth-budget pages would add, clamped
-            // to the directory's structural ceiling (a pool funded past 256
-            // pages cannot back more slots than the directory holds). A mild
-            // over-estimate for a CSpace that has not yet allocated page 0
-            // (slot 0 is reserved and never usable); headroom triggers
-            // tolerate that. The two loads are not one atomic snapshot — a
-            // concurrent grow between them skews the sum by at most one
+            // to the highest reachable count (the structural ceiling minus
+            // the permanently-reserved slot 0). A mild over-estimate for a
+            // CSpace that has not yet allocated page 0; headroom triggers
+            // tolerate that. The budget read is outside the CSpace lock —
+            // a grow between the two reads skews the sum by at most one
             // page's worth, which the same triggers also tolerate.
-            // SAFETY: cs_obj.cspace validated non-null; allocated_slots is an
-            // O(1) read of one usize field, and the kernel runs with the
-            // scheduler lock effectively held during a syscall.
-            let allocated = unsafe { (*target).allocated_slots() } as u64;
+            // SAFETY: cs_obj.cspace validated non-null; allocated_slots is
+            // mutated only under the CSpace lock, taken here; lock_raw /
+            // unlock_raw paired.
+            let allocated = unsafe {
+                let saved = (*target).lock.lock_raw();
+                let a = (*target).allocated_slots();
+                (*target).lock.unlock_raw(saved);
+                a
+            } as u64;
             let budget = cs_obj.cspace_growth_budget_bytes.load(Ordering::Acquire);
             let backed = allocated
                 + (budget / crate::mm::PAGE_SIZE as u64) * crate::cap::cspace::L2_SIZE as u64;
-            Ok(backed.min(crate::cap::cspace::MAX_SLOTS_STRUCTURAL as u64))
+            Ok(backed.min(crate::cap::cspace::MAX_SLOTS_STRUCTURAL as u64 - 1))
         }
         CAP_INFO_CSPACE_USED =>
         {
@@ -2604,10 +2608,15 @@ pub fn sys_cap_info(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             {
                 return Err(SyscallError::InvalidCapability);
             }
-            // SAFETY: cs_obj.cspace validated non-null; populated_count is O(1) read of two usize fields.
-            // The kernel runs with the scheduler lock effectively held during a syscall, so
-            // concurrent mutation of these fields by another CPU is not possible at this point.
-            let used = unsafe { (*target).populated_count() };
+            // SAFETY: cs_obj.cspace validated non-null; the two usize fields
+            // populated_count derives from are mutated only under the CSpace
+            // lock, taken here; lock_raw / unlock_raw paired.
+            let used = unsafe {
+                let saved = (*target).lock.lock_raw();
+                let u = (*target).populated_count();
+                (*target).lock.unlock_raw(saved);
+                u
+            };
             Ok(used as u64)
         }
         CAP_INFO_CSPACE_BUDGET =>

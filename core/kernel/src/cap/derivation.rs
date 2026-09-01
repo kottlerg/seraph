@@ -597,9 +597,9 @@ mod tests
     use crate::cap::slot::CapTag;
     use core::num::NonZeroU32;
 
-    fn mk_registered_cspace(id: crate::cap::slot::CSpaceId, max_slots: usize) -> *mut CSpace
+    fn mk_registered_cspace(id: crate::cap::slot::CSpaceId) -> *mut CSpace
     {
-        let cs = Box::leak(Box::new(CSpace::new(id, max_slots)));
+        let cs = Box::leak(Box::new(CSpace::new(id)));
         crate::cap::register_cspace(id, cs).expect("register test cspace");
         core::ptr::from_mut(cs)
     }
@@ -655,7 +655,7 @@ mod tests
     fn revoke_batch_clears_mixed_tree_and_preserves_root()
     {
         const ID: crate::cap::slot::CSpaceId = 3101;
-        let cs = mk_registered_cspace(ID, 512);
+        let cs = mk_registered_cspace(ID);
         let root = occupy(cs, ID);
         // Allocate before locking — no fallible call under the global lock.
         let children = occupy_many(cs, ID, 3);
@@ -694,7 +694,7 @@ mod tests
     fn revoke_batch_stops_at_edit_budget_then_clears()
     {
         const ID: crate::cap::slot::CSpaceId = 3102;
-        let cs = mk_registered_cspace(ID, 512);
+        let cs = mk_registered_cspace(ID);
         let root = occupy(cs, ID);
         let nodes = occupy_many(cs, ID, BUDGET_CHAIN);
         DERIVATION_LOCK.write_lock();
@@ -723,7 +723,7 @@ mod tests
     fn revoke_batch_hoists_survivors_under_root_between_batches()
     {
         const ID: crate::cap::slot::CSpaceId = 3105;
-        let cs = mk_registered_cspace(ID, 512);
+        let cs = mk_registered_cspace(ID);
         let root = occupy(cs, ID);
         let nodes = occupy_many(cs, ID, BUDGET_CHAIN);
         DERIVATION_LOCK.write_lock();
@@ -767,8 +767,8 @@ mod tests
     {
         const ID_A: crate::cap::slot::CSpaceId = 3103;
         const ID_B: crate::cap::slot::CSpaceId = 3104;
-        let cs_a = mk_registered_cspace(ID_A, 64);
-        let cs_b = mk_registered_cspace(ID_B, 64);
+        let cs_a = mk_registered_cspace(ID_A);
+        let cs_b = mk_registered_cspace(ID_B);
         let root = occupy(cs_a, ID_A);
         let foreign_child = occupy(cs_b, ID_B);
         DERIVATION_LOCK.write_lock();

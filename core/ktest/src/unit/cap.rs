@@ -59,11 +59,10 @@ pub fn create_event_q(ctx: &TestContext) -> TestResult
 
 // ── SYS_CAP_CREATE_CSPACE ────────────────────────────────────────────────────
 
-/// `cap_create_cspace` succeeds with a valid slot count.
+/// `cap_create_cspace` succeeds with a valid page count.
 pub fn create_cspace(ctx: &TestContext) -> TestResult
 {
-    let slot =
-        cap_create_cspace(ctx.memory_base, 0, 4, 32).map_err(|_| "cap_create_cspace(32) failed")?;
+    let slot = cap_create_cspace(ctx.memory_base, 0, 4).map_err(|_| "cap_create_cspace failed")?;
     cap_delete(slot).map_err(|_| "cap_delete after create_cspace failed")?;
     Ok(())
 }
@@ -119,7 +118,7 @@ pub fn copy(ctx: &TestContext) -> TestResult
 {
     let sig = cap_create_notification(ctx.memory_base)
         .map_err(|_| "create_notification for copy test failed")?;
-    let dest_cs = cap_create_cspace(ctx.memory_base, 0, 4, 16)
+    let dest_cs = cap_create_cspace(ctx.memory_base, 0, 4)
         .map_err(|_| "create_cspace for copy test failed")?;
 
     // Copy with all rights — `syscall::RIGHTS_ALL` passes through whatever rights the source has.
@@ -143,7 +142,7 @@ pub fn insert(ctx: &TestContext) -> TestResult
 {
     let sig = cap_create_notification(ctx.memory_base)
         .map_err(|_| "create_notification for insert test failed")?;
-    let dest_cs = cap_create_cspace(ctx.memory_base, 0, 4, 16)
+    let dest_cs = cap_create_cspace(ctx.memory_base, 0, 4)
         .map_err(|_| "create_cspace for insert test failed")?;
 
     // Insert at slot 5 in dest_cs.
@@ -165,7 +164,7 @@ pub fn r#move(ctx: &TestContext) -> TestResult
 {
     let sig = cap_create_notification(ctx.memory_base)
         .map_err(|_| "create_notification for move test failed")?;
-    let dest_cs = cap_create_cspace(ctx.memory_base, 0, 4, 16)
+    let dest_cs = cap_create_cspace(ctx.memory_base, 0, 4)
         .map_err(|_| "create_cspace for move test failed")?;
 
     // Move to dest_cs; auto-allocate destination slot (dest_index = 0).
@@ -372,7 +371,7 @@ pub fn insert_to_occupied_slot_err(ctx: &TestContext) -> TestResult
 {
     let sig = cap_create_notification(ctx.memory_base)
         .map_err(|_| "create_notification for occupied-slot test failed")?;
-    let dest_cs = cap_create_cspace(ctx.memory_base, 0, 4, 16)
+    let dest_cs = cap_create_cspace(ctx.memory_base, 0, 4)
         .map_err(|_| "create_cspace for occupied-slot test failed")?;
 
     // First insert at slot 5 — must succeed.
@@ -457,8 +456,7 @@ pub fn insert_out_of_bounds_err(ctx: &TestContext) -> TestResult
 {
     let sig = cap_create_notification(ctx.memory_base)
         .map_err(|_| "create_notification for insert_oob test failed")?;
-    // max_slots is clamped to [1, 14336]; create a small CSpace.
-    let dest_cs = cap_create_cspace(ctx.memory_base, 0, 4, 16)
+    let dest_cs = cap_create_cspace(ctx.memory_base, 0, 4)
         .map_err(|_| "create_cspace for insert_oob test failed")?;
 
     // Slot 99999 is beyond any cspace capacity.

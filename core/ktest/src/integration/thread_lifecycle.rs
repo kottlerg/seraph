@@ -117,7 +117,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     // The thread cap is still valid even after the thread exits; the kernel
     // allows these operations on any Thread object. Create a fresh thread just
     // to test these without depending on child exit timing.
-    let cs2 = cap_create_cspace(ctx.memory_base, 0, 4, 8)
+    let cs2 = cap_create_cspace(ctx.memory_base, 0, 4)
         .map_err(|_| "integration::thread_lifecycle: cap_create_cspace (step 8) failed")?;
     let th2 = cap_create_thread(ctx.memory_base, ctx.aspace_cap, cs2, 0, 0)
         .map_err(|_| "integration::thread_lifecycle: cap_create_thread (step 8) failed")?;

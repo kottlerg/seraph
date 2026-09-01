@@ -22,7 +22,9 @@ From the design document:
 - O(1) lookup — descriptor-to-slot resolution on every IPC call
 - Stable indices — a descriptor never changes after assignment
 - Grows on demand — no upfront size prediction needed
-- Per-process ceiling — bounded kernel memory per process
+- Pay-as-you-go — every slot page is drawn from a pool the owner funded
+  with its own Memory caps, so per-process kernel memory is bounded by
+  what the process paid for
 
 ### Storage: Two-Level Array
 
@@ -37,9 +39,6 @@ pub struct CSpace
 
     /// Total number of slots currently allocated (not necessarily in use).
     allocated_slots: usize,
-
-    /// Maximum slots this CSpace may ever hold (enforced ceiling).
-    max_slots: usize,
 }
 
 /// One page of CSpace slots (an L2 block).
@@ -50,10 +49,12 @@ struct CSpacePage
 }
 ```
 
-The concrete values of `L1_SIZE`, `L2_SIZE`, and the default `max_slots` are
-implementation constants chosen so that one `CSpacePage` fits in a single slab
-allocation and the maximum slot count per process is bounded. These values are
-established at implementation time and are not part of the public ABI.
+The concrete values of `L1_SIZE` and `L2_SIZE` are implementation constants
+chosen so that one `CSpacePage` fits in a single slab allocation and every
+slot index fits the cap handle's index field. They are established at
+implementation time and are not part of the public ABI. Their product is the
+directory's structural ceiling — the only slot bound a CSpace has; capacity
+below it is whatever the owner-funded slot-page pool backs.
 
 **Lookup is O(1):** A descriptor `d` maps to `directory[d / L2_SIZE].slots[d % L2_SIZE]`.
 Two array dereferences, always. No hash, no tree traversal, no search.

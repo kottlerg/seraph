@@ -51,13 +51,12 @@ pub fn new_child_at(
     priority: u8,
 ) -> Result<SpawnedChild, &'static str>
 {
-    // cap_create_cspace(memory, augment_target=0, init_pages=4,
-    // max_slots=16) — the 16-slot cspace covers tests that copy 1-3 caps
-    // into the child plus headroom. Tests with wider cap layouts (e.g.
-    // integration/cap_transfer.rs uses a 32-slot cspace,
-    // stress/retype_concurrent.rs uses 64) bypass this helper and
-    // call cap_create_cspace directly.
-    let cs = cap_create_cspace(ctx.memory_base, 0, 4, 16)
+    // cap_create_cspace(memory, augment_target=0, init_pages=4) — 3 pool
+    // pages back 167 usable slots, ample for tests that copy a few caps
+    // into the child. Tests needing a specific pool shape (e.g. the
+    // exhaustion fixtures in unit/ipc.rs seed a single pool page) bypass
+    // this helper and call cap_create_cspace directly.
+    let cs = cap_create_cspace(ctx.memory_base, 0, 4)
         .map_err(|_| "spawn::new_child: cap_create_cspace failed")?;
     let th = cap_create_thread(ctx.memory_base, ctx.aspace_cap, cs, sched_cap, priority)
         .map_err(|_| "spawn::new_child: cap_create_thread failed")?;

@@ -56,7 +56,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     //   child_ep       — SEND | GRANT copy of ep (needed to call and transfer caps)
     //   child_test_sig — NOTIFY-only copy of test_sig (the cap to transfer)
     //   child_sync_sig — NOTIFY-only copy of sync_sig (for reporting back)
-    let cs = cap_create_cspace(ctx.memory_base, 0, 4, 32)
+    let cs = cap_create_cspace(ctx.memory_base, 0, 4)
         .map_err(|_| "integration::cap_transfer: cap_create_cspace failed")?;
     crate::log("cap_transfer: cspace created");
 

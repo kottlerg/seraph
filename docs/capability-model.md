@@ -537,19 +537,22 @@ code at the failure site:
 
 - **Pool exhaustion** — the seeded slot-page pool is empty. Returns
   `OutOfMemory` (-8); refillable via augment mode. The kernel also logs
-  the CSpace id, allocated count, and quota.
-- **Quota reached** — `max_slots` (or the directory limit) is hit.
-  Returns `QuotaExceeded` (-17); a hard policy ceiling that no memory
-  donation can lift.
+  the CSpace id and allocated count.
+- **Structural ceiling** — the slot directory is full. Returns
+  `QuotaExceeded` (-17); a shape-derived bound (directory fan-out ×
+  slots per page) that no memory donation can lift.
 
-Seeding policy: every CSpace creation site MUST either seed the pool to
-cover its full `max_slots` quota (`pool_pages × 56 − 1 ≥ max_slots`,
-the default for all userspace creation sites), or document the shortfall
-at the site and name the owner responsible for augment-mode refill. The
-kernel-created root CSpace is the one documented under-seeded site (init
-owns the refill; see `ROOT_CSPACE_INIT_SLOT_CAPACITY` in the kernel).
-Passing `max_slots = 0` to create-mode `cap_create_cspace` defaults the
-quota to exactly what the seeded pool backs, never an unbacked ceiling.
+There is no per-CSpace slot quota: capacity below the structural
+ceiling is exactly what the paid pool backs. Containing a child's cap
+footprint is a memory-distribution decision — a supervisor that wants a
+child bounded gives it less memory to fund growth with — not a kernel
+knob.
+
+Seeding policy: a CSpace creation site seeds the pool for the process's
+expected startup population; a process that outgrows its seed self-funds
+via augment-mode `cap_create_cspace` against its own `CSpace` cap. The
+current backed capacity is observable via `SYS_CAP_INFO`
+(`CAP_INFO_CSPACE_CAPACITY`); subtracting slots used yields headroom.
 
 An `AddressSpace`'s intermediate page tables are also returned to its
 growth budget mid-life when a region is torn down: `SYS_MEM_UNMAP` with
@@ -568,7 +571,7 @@ kernel growth path.
 `SYS_CAP_INFO` is a read-only inquiry that returns runtime state for
 a held capability: tag and rights for any cap; size, available-bytes,
 and retype-rights flag for Memory caps; PT growth budget for AddressSpace
-caps; slot capacity, slots used, and growth budget for CSpace caps.
+caps; backed slot capacity, slots used, and growth budget for CSpace caps.
 The syscall enables defensive ledger checks (e.g. memmgr can verify a
 returning cap's available-bytes), and lets receivers of a cap from a
 less-trusted source validate its shape before relying on it.

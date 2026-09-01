@@ -303,7 +303,7 @@ fn bound_creation_masks(ctx: &TestContext) -> TestResult
         return r;
     }
 
-    let Ok(cs) = cap_create_cspace(ctx.memory_base, 0, 4, 64)
+    let Ok(cs) = cap_create_cspace(ctx.memory_base, 0, 4)
     else
     {
         cap_delete(aspace).ok();
@@ -346,32 +346,75 @@ fn bound_creation_masks(ctx: &TestContext) -> TestResult
 
 // ── CSpace-specific fields ───────────────────────────────────────────────────
 
-/// `CSpace` fields are consistent on a freshly created cspace.
+/// `CSpace` fields report the currently-backed capacity.
 ///
-/// `capacity == max_slots requested`; `used == 0` for a brand-new empty
-/// cspace; `budget` reads cleanly without erroring.
+/// A fresh `init_pages = 4` cspace (3 pool pages, none consumed) reports
+/// `capacity == 3 × 56`, `used == 0`, and `budget == 3` pages. Inserting
+/// one cap draws the first slot page from the pool, so capacity settles at
+/// `3 × 56 − 1` (slot 0 reserved) with `used == 1`. An augment-mode
+/// donation of 2 pages raises capacity by `2 × 56`.
 pub fn cspace_fields(ctx: &TestContext) -> TestResult
 {
-    const REQUESTED: u64 = 64;
-    let cs = cap_create_cspace(ctx.memory_base, 0, 4, REQUESTED)
-        .map_err(|_| "cap_create_cspace failed")?;
+    const PAGE_SIZE: u64 = 4096;
+    const L2_SIZE: u64 = 56;
+    let cs = cap_create_cspace(ctx.memory_base, 0, 4).map_err(|_| "cap_create_cspace failed")?;
 
-    let capacity = cap_info(cs, CAP_INFO_CSPACE_CAPACITY)
+    let fresh_capacity = cap_info(cs, CAP_INFO_CSPACE_CAPACITY)
         .map_err(|_| "cap_info(cspace, CSPACE_CAPACITY) failed")?;
-    let used =
+    let fresh_used =
         cap_info(cs, CAP_INFO_CSPACE_USED).map_err(|_| "cap_info(cspace, CSPACE_USED) failed")?;
-    let _budget = cap_info(cs, CAP_INFO_CSPACE_BUDGET)
+    let fresh_budget = cap_info(cs, CAP_INFO_CSPACE_BUDGET)
         .map_err(|_| "cap_info(cspace, CSPACE_BUDGET) failed")?;
 
+    // Populate one slot so the first slot page is drawn from the pool.
+    let probe =
+        cap_create_notification(ctx.memory_base).map_err(|_| "cap_create_notification failed")?;
+    if syscall::cap_copy(probe, cs, 1).is_err()
+    {
+        cap_delete(probe).ok();
+        cap_delete(cs).ok();
+        return Err("cap_copy into fresh cspace failed");
+    }
+    let after_capacity = cap_info(cs, CAP_INFO_CSPACE_CAPACITY)
+        .map_err(|_| "cap_info(CSPACE_CAPACITY) after insert failed")?;
+    let after_used = cap_info(cs, CAP_INFO_CSPACE_USED)
+        .map_err(|_| "cap_info(CSPACE_USED) after insert failed")?;
+
+    // Augment-mode donation must raise the backed capacity.
+    let augment_ok = cap_create_cspace(ctx.memory_base, cs, 2).is_ok();
+    let aug_capacity = cap_info(cs, CAP_INFO_CSPACE_CAPACITY)
+        .map_err(|_| "cap_info(CSPACE_CAPACITY) after augment failed")?;
+
+    cap_delete(probe).ok();
     cap_delete(cs).map_err(|_| "cap_delete(cspace) failed")?;
 
-    if capacity != REQUESTED
+    if fresh_capacity != 3 * L2_SIZE
     {
-        return Err("cap_info(cspace, CSPACE_CAPACITY) did not match requested max_slots");
+        return Err("fresh cspace capacity != pool-backed 3 x 56");
     }
-    if used != 0
+    if fresh_used != 0
     {
         return Err("freshly-created cspace reported non-zero CSPACE_USED");
+    }
+    if fresh_budget != 3 * PAGE_SIZE
+    {
+        return Err("fresh cspace budget != 3 pool pages");
+    }
+    if after_capacity != 3 * L2_SIZE - 1
+    {
+        return Err("capacity after first insert != 3 x 56 - 1 (slot 0 reserved)");
+    }
+    if after_used != 1
+    {
+        return Err("CSPACE_USED != 1 after one insert");
+    }
+    if !augment_ok
+    {
+        return Err("augment-mode cap_create_cspace failed");
+    }
+    if aug_capacity != after_capacity + 2 * L2_SIZE
+    {
+        return Err("capacity did not grow by 2 x 56 after 2-page augment");
     }
     Ok(())
 }
@@ -405,19 +448,28 @@ pub fn tag_mismatch_invalid_arg(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
-/// `max_slots = 0` on create-mode `cap_create_cspace` defaults the quota
-/// to what the seeded pool backs — `(init_pages - 1) * 56 - 1` usable
-/// slots — never an unbacked 14336 ceiling (#366).
-pub fn cspace_default_max_slots_is_pool_backed(ctx: &TestContext) -> TestResult
+/// `SYS_CAP_CREATE_CSPACE` rejects a non-zero arg3 with `InvalidArgument`.
+///
+/// arg3 carried the removed `max_slots` quota; it is reserved and must be
+/// zero in both create and augment modes. The 3-arg `cap_create_cspace`
+/// wrapper always passes 0, so the probe issues the raw entry point.
+pub fn cspace_create_rejects_nonzero_arg3(ctx: &TestContext) -> TestResult
 {
-    let cs = cap_create_cspace(ctx.memory_base, 0, 4, 0)
-        .map_err(|_| "cap_create_cspace(init_pages=4, max_slots=0) failed")?;
-    let capacity = cap_info(cs, CAP_INFO_CSPACE_CAPACITY);
-    cap_delete(cs).map_err(|_| "cap_delete(cspace) failed")?;
-    let capacity = capacity.map_err(|_| "cap_info(CSPACE_CAPACITY) failed")?;
-    if capacity != 3 * 56 - 1
+    // Create-mode with arg3 = 1.
+    let ret = syscall::raw_cap_create_cspace(ctx.memory_base, 0, 4, 1);
+    if ret != SyscallError::InvalidArgument as i64
     {
-        return Err("default max_slots != pool-backed capacity (3 pool pages)");
+        return Err("create-mode arg3 != 0 was not rejected with InvalidArgument");
+    }
+
+    // Augment-mode with arg3 = 1 against a valid target.
+    let cs = cap_create_cspace(ctx.memory_base, 0, 2)
+        .map_err(|_| "cap_create_cspace for augment-arg3 probe failed")?;
+    let ret = syscall::raw_cap_create_cspace(ctx.memory_base, cs, 2, 1);
+    cap_delete(cs).map_err(|_| "cap_delete(cspace) failed")?;
+    if ret != SyscallError::InvalidArgument as i64
+    {
+        return Err("augment-mode arg3 != 0 was not rejected with InvalidArgument");
     }
     Ok(())
 }

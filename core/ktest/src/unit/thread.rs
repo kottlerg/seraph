@@ -402,7 +402,7 @@ pub fn create_priority_args(ctx: &TestContext) -> TestResult
 {
     use syscall::{cap_create_cspace, cap_create_thread};
 
-    let cs = cap_create_cspace(ctx.memory_base, 0, 4, 16)
+    let cs = cap_create_cspace(ctx.memory_base, 0, 4)
         .map_err(|_| "thread::create_priority_args: cap_create_cspace failed")?;
 
     if cap_create_thread(ctx.memory_base, ctx.aspace_cap, cs, 0, 5).is_ok()

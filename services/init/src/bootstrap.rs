@@ -795,7 +795,7 @@ pub fn bootstrap_memmgr(
     let mm_aspace =
         syscall::cap_create_aspace(arena.cap, 0, crate::ASPACE_RETYPE_PAGES - 1).ok()?;
     let mm_cspace =
-        syscall::cap_create_cspace(arena.cap, 0, crate::CSPACE_RETYPE_PAGES - 1, 8192).ok()?;
+        syscall::cap_create_cspace(arena.cap, 0, crate::CSPACE_RETYPE_PAGES - 1).ok()?;
     // memmgr is the system pager: create its thread at the top of the
     // baseline band so nothing it serves can preempt it.
     let mm_thread = syscall::cap_create_thread(
@@ -1503,7 +1503,7 @@ pub fn bootstrap_procmgr(
     let pm_aspace =
         syscall::cap_create_aspace(arena.cap, 0, crate::ASPACE_RETYPE_PAGES - 1).ok()?;
     let pm_cspace =
-        syscall::cap_create_cspace(arena.cap, 0, crate::CSPACE_RETYPE_PAGES - 1, 8192).ok()?;
+        syscall::cap_create_cspace(arena.cap, 0, crate::CSPACE_RETYPE_PAGES - 1).ok()?;
     // procmgr sits directly below memmgr: above every process it manages,
     // preemptible only by its own pager.
     let pm_thread = syscall::cap_create_thread(

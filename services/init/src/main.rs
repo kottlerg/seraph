@@ -58,13 +58,12 @@ pub(crate) const ASPACE_RETYPE_PAGES: u64 = 48;
 /// reserves the slab's page 0 as the wrapper page. Mirrors procmgr's
 /// constant.
 ///
-/// Seed-to-cover policy (#366): both tier-1 services are immortal and
-/// accumulate caps for the system's whole lifetime (memmgr: per-allocation
-/// Memory caps; procmgr: per-child aspace/cspace/thread/slab caps), so
-/// the seeded pool MUST back the full `max_slots = 8192` quota — an
-/// under-seeded pool wedges the service on pool exhaustion long before
-/// quota, with no one positioned to augment it. 149 pages → 148 to the
-/// kernel → 147 pool pages → 147 × 56 − 1 = 8231 usable slots ≥ 8192.
+/// Both tier-1 services are immortal and accumulate caps for the
+/// system's whole lifetime (memmgr: per-allocation Memory caps;
+/// procmgr: per-child aspace/cspace/thread/slab caps), so their pools
+/// are seeded deep — an under-seeded pool wedges the service on pool
+/// exhaustion with no one positioned to augment it. 149 pages → 148 to
+/// the kernel → 147 pool pages → 147 × 56 − 1 = 8231 usable slots.
 pub(crate) const CSPACE_RETYPE_PAGES: u64 = 149;
 
 /// Base for init's scratch mappings (`ProcessInfo` memory caps, ELF pages).

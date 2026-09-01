@@ -1110,6 +1110,72 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     }
 }
 
+/// Leaves materialised per `CSpace`-lock hold while pre-growing for an
+/// explicit destination slot (each leaf costs one page zeroing plus
+/// free-list threading; 64 keeps the interrupts-off hold small).
+#[cfg(not(test))]
+const MAX_GROW_LEAVES_PER_HOLD: usize = 64;
+
+/// Pre-grow `cs_ptr` to cover explicit destination `index`, in bounded
+/// batches under only that `CSpace`'s lock, before the placement path
+/// takes `DERIVATION_LOCK` and the `CSpace` lock pair. Keeps the
+/// unbounded-donation growth out of the heavyweight critical sections:
+/// `insert_cap_at`'s own grow loop then runs zero iterations (leaves never
+/// un-grow).
+///
+/// Fails fast with `OutOfMemory` — before consuming a single pool page —
+/// when the pool budget cannot cover the remaining growth, so a doomed
+/// placement does not burn the destination's budget. The budget is
+/// re-checked each batch; leaves grown before a concurrent consumer
+/// drains the pool remain as ordinary free capacity (donor-funded, not
+/// leaked). An out-of-range index is left for `insert_cap_at` to reject.
+#[cfg(not(test))]
+fn pre_grow_for_explicit_slot(
+    cs_ptr: *mut crate::cap::cspace::CSpace,
+    index: u32,
+) -> Result<(), SyscallError>
+{
+    use core::sync::atomic::Ordering;
+    loop
+    {
+        // SAFETY: cs_ptr validated by the caller; lock_raw/unlock_raw paired.
+        let step = unsafe {
+            let saved = (*cs_ptr).lock.lock_raw();
+            let needed = (*cs_ptr).pages_to_cover(index);
+            let r = if needed == 0
+            {
+                Ok(true)
+            }
+            else
+            {
+                let budget_pages = (*cs_ptr).kobj_ptr().map_or(0, |k| {
+                    (*k).cspace_growth_budget_bytes.load(Ordering::Acquire)
+                        / crate::mm::PAGE_SIZE as u64
+                });
+                if budget_pages < needed
+                {
+                    Err(SyscallError::OutOfMemory)
+                }
+                else
+                {
+                    (*cs_ptr)
+                        .grow_toward(index, MAX_GROW_LEAVES_PER_HOLD)
+                        .map_err(SyscallError::from)
+                }
+            };
+            (*cs_ptr).lock.unlock_raw(saved);
+            r
+        };
+        match step
+        {
+            Ok(true) => return Ok(()),
+            Ok(false) =>
+            {}
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// `SYS_CAP_COPY` (24): copy a capability into another `CSpace.`
 ///
 /// arg0 = source slot index (in caller's `CSpace`).
@@ -1191,6 +1257,14 @@ pub fn sys_cap_copy(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     };
     // SAFETY: dest_cs_ptr extracted from validated CSpace object above.
     let dest_cs_id = unsafe { (*dest_cs_ptr).id() };
+
+    // Pre-grow for an explicit destination before the inc_ref and the
+    // destination lock: bounded holds, budget fast-fail, nothing to roll
+    // back on failure.
+    if dest_slot_idx != 0
+    {
+        pre_grow_for_explicit_slot(dest_cs_ptr, dest_slot_idx)?;
+    }
 
     // Increment reference count on the shared kernel object.
     // SAFETY: src_object is a valid NonNull from a live capability slot.
@@ -1989,6 +2063,10 @@ pub fn sys_cap_move(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     let src_idx_nz = core::num::NonZeroU32::new(src_idx).ok_or(SyscallError::InvalidCapability)?;
     let dest_idx_nz =
         core::num::NonZeroU32::new(dest_idx).ok_or(SyscallError::InvalidCapability)?;
+
+    // Pre-grow for the explicit destination before the heavyweight locks:
+    // bounded holds, budget fast-fail (see pre_grow_for_explicit_slot).
+    pre_grow_for_explicit_slot(dest_cs_ptr, dest_idx)?;
 
     crate::cap::DERIVATION_LOCK.write_lock();
 

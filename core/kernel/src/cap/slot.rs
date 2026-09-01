@@ -747,6 +747,8 @@ impl CapabilitySlot
         self.rights = Rights::NONE;
         self.badge = 0;
         self.object = None;
+        // deriv_first_child doubles as the free-list predecessor link;
+        // a fresh push always enters at the head, so it starts None.
         self.deriv_first_child = None;
         self.deriv_next_sibling = None;
         self.deriv_prev_sibling = None;
@@ -767,6 +769,47 @@ impl CapabilitySlot
             "next_free called on occupied slot"
         );
         self.deriv_parent.map(|s| s.index)
+    }
+
+    /// Read the free-list predecessor index from `deriv_first_child`.
+    ///
+    /// Only valid on a free-list member. `None` means this slot is the
+    /// list head. The predecessor link makes `CSpace::remove_from_free_list`
+    /// O(1); it uses the same epoch-0 `SlotId` encoding as
+    /// [`next_free`](Self::next_free).
+    pub fn prev_free(&self) -> Option<NonZeroU32>
+    {
+        debug_assert!(
+            self.tag == CapTag::Null,
+            "prev_free called on occupied slot"
+        );
+        self.deriv_first_child.map(|s| s.index)
+    }
+
+    /// Rewrite only the free-list successor link, leaving the rest of the
+    /// slot (marker, generation, predecessor) untouched. For splices on an
+    /// already-linked slot; the initial push uses
+    /// [`set_next_free`](Self::set_next_free).
+    pub fn set_next_free_link(&mut self, next: Option<NonZeroU32>)
+    {
+        debug_assert!(self.is_on_free_list(), "next-link rewrite off-list");
+        self.deriv_parent = next.map(|index| SlotId {
+            cspace_id: 0,
+            epoch: 0,
+            index,
+        });
+    }
+
+    /// Rewrite only the free-list predecessor link; see
+    /// [`set_next_free_link`](Self::set_next_free_link).
+    pub fn set_prev_free_link(&mut self, prev: Option<NonZeroU32>)
+    {
+        debug_assert!(self.is_on_free_list(), "prev-link rewrite off-list");
+        self.deriv_first_child = prev.map(|index| SlotId {
+            cspace_id: 0,
+            epoch: 0,
+            index,
+        });
     }
 
     /// Return `true` if this slot is currently linked on a `CSpace` free list.

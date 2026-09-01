@@ -1607,6 +1607,13 @@ caller-chosen index — the path init uses to populate well-known slots in new
 service CSpaces before starting their threads. This caller-chosen-slot mode
 absorbed the former `SYS_CAP_INSERT` (slot 32, now reserved).
 
+A high explicit `dst_slot` materialises every intermediate leaf page up to
+its own, drawn from the destination's slot-page pool (donor-funded, in
+bounded batches outside the heavyweight locks). When the pool cannot cover
+the required growth the call fails with `OutOfMemory` before consuming any
+pool page; leaves grown before a concurrent pool consumer intervenes remain
+as ordinary free capacity.
+
 **Capability requirements:** `src_cap` (at least one right), `dst_cspace_cap` (Insert).
 
 **Errors:** `InvalidCapability`, `InsufficientRights` (dst CSpace lacks Insert),
@@ -1619,6 +1626,9 @@ exhausted), `QuotaExceeded` (dst CSpace directory structurally full).
 
 Move a capability from the caller's CSpace into another CSpace. Transfer semantics:
 the source slot is cleared; the destination inherits the source's derivation position.
+An explicit high `dst_slot` follows `SYS_CAP_COPY`'s growth contract (every
+intermediate leaf materialised from the destination's pool; `OutOfMemory`
+without consumption when the pool cannot cover it).
 
 **Arguments:**
 

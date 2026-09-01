@@ -56,17 +56,17 @@ use super::slot::{CSpaceId, CapTag, CapabilitySlot, Rights};
 pub const L2_SIZE: usize = 56;
 
 /// Inline root pointers to leaf pages (the direct region).
-pub const L1_DIRECT: usize = 128;
+pub(crate) const L1_DIRECT: usize = 128;
 
 /// Inline root pointers to directory pages (the indirect region).
-pub const L1_INDIRECT: usize = 128;
+pub(crate) const L1_INDIRECT: usize = 128;
 
 /// Leaf pointers per pool-allocated directory page (one 4 KiB page of
 /// 8-byte pointers).
-pub const DIR_FANOUT: usize = crate::mm::PAGE_SIZE / core::mem::size_of::<*mut CSpacePage>();
+pub(crate) const DIR_FANOUT: usize = crate::mm::PAGE_SIZE / core::mem::size_of::<*mut CSpacePage>();
 
 /// Maximum leaf pages a `CSpace` can ever hold.
-pub const MAX_LEAVES: usize = L1_DIRECT + L1_INDIRECT * DIR_FANOUT;
+pub(crate) const MAX_LEAVES: usize = L1_DIRECT + L1_INDIRECT * DIR_FANOUT;
 
 /// The directory's structural slot ceiling; see
 /// core/kernel/docs/capability-internals.md § Storage: Hybrid Two-Level
@@ -173,16 +173,34 @@ const _: () = assert!(core::mem::size_of::<CSpaceDirPage>() == crate::mm::PAGE_S
 ///
 /// ## Concurrency and memory ordering
 ///
-/// All mutation is protected by the internal spinlock (`&mut self` is only
-/// reachable through a lock holder). Directory and leaf pointers are
-/// **write-once while the `CSpace` is live**: [`grow`][Self::grow] publishes
-/// each fully-initialised page with a Release store, and no page is freed,
-/// moved, or replaced before refcount-0 teardown. [`slot`][Self::slot]
-/// therefore supports lock-free readers (`lookup_cap`, `cap_info`): its
-/// Acquire loads at each level pair with grow's Release publication, so a
-/// reader that observes a pointer observes the initialised page behind it.
-/// Races on slot *content* are defended by the tag and per-slot generation
-/// checks every resolution path performs, not by the directory.
+/// Two lock domains guard disjoint field families:
+///
+/// - **`CSpace` spinlock** — slot occupancy (tag, rights, badge, object,
+///   the `pad` markers), the free list (including the `deriv_*` fields'
+///   free-list reuse on Null slots), the directory pointers, and the
+///   counters. Syscall paths mutate these through a lock holder's
+///   `&mut self`.
+/// - **`DERIVATION_LOCK`** — the derivation linkage (`deriv_*`) of
+///   *occupied* slots, reached from the derivation code via registry
+///   lookup without taking this spinlock (see
+///   `derivation::resolve_slot_mut`). Paths that move a slot between the
+///   families (free, revoke-collect, teardown) hold `DERIVATION_LOCK`
+///   outermost, then this spinlock.
+///
+/// Both domains reach slots through raw `CSpace` pointers with short,
+/// per-slot borrows never held across a foreign-slot access.
+///
+/// Directory and leaf pointers are **write-once while the `CSpace` is
+/// live**: [`grow`][Self::grow] publishes each fully-initialised page with
+/// a Release store, and no page is freed, moved, or replaced before
+/// refcount-0 teardown. [`slot`][Self::slot] therefore supports lock-free
+/// readers (`lookup_cap`, `cap_info`): its Acquire loads at each level
+/// pair with grow's Release publication, so a reader that observes a
+/// pointer observes the initialised page behind it. Races on slot
+/// *content* against such unlocked readers are narrowed — not closed — by
+/// the tag and per-slot generation checks at the resolution sites; the
+/// residual is confined to threads of the owning process racing each
+/// other (see `lookup_cap`'s SAFETY discussion).
 pub struct CSpace
 {
     id: CSpaceId,
@@ -303,6 +321,11 @@ impl CSpace
         };
 
         self.free_head = next;
+        if let Some(new_head) = next
+            && let Some(head_slot) = self.slot_mut(new_head.get())
+        {
+            head_slot.set_prev_free_link(None);
+        }
         // Clear the slot (removes free-list encoding) but keep the per-slot
         // generation that `free_slot` left, so the minted cap handle's
         // generation matches the slot the recipient will resolve (#349).
@@ -321,12 +344,18 @@ impl CSpace
     /// is a valid value (both `CSpacePage` and `CSpaceDirPage` are).
     fn alloc_zeroed_page<T>(&self) -> Result<NonNull<T>, CapError>
     {
+        const {
+            assert!(
+                core::mem::size_of::<T>() <= crate::mm::PAGE_SIZE,
+                "alloc_zeroed_page: T exceeds one pool page"
+            );
+        }
         let kobj_ptr = self.kobj.load(Ordering::Acquire);
         #[cfg(not(test))]
         {
             debug_assert!(
                 !kobj_ptr.is_null(),
-                "CSpace::grow: production CSpace must be retype-backed"
+                "CSpace::alloc_zeroed_page: production CSpace must be retype-backed"
             );
             // SAFETY: kobj_ptr is the wrapper that owns this CSpace; its
             // pool was seeded at retype time.
@@ -412,7 +441,27 @@ impl CSpace
             page.slots[i].set_next_free(next);
             next = Some(idx);
         }
+        // Back-fill the predecessor links (the doubly-linked list makes
+        // `remove_from_free_list` O(1)): each new slot's successor is the
+        // next slot in this page, except the last, whose successor is the
+        // old head in a possibly different page — patched below.
+        let mut prev: Option<NonZeroU32> = None;
+        for i in start_slot..L2_SIZE
+        {
+            page.slots[i].set_prev_free_link(prev);
+            prev = NonZeroU32::new((base + i) as u32);
+        }
         self.free_head = next;
+        if let Some(old_head_idx) = old_head
+        {
+            // The old head's predecessor is this page's last slot; it lives
+            // in an already-published page, reached via slot_mut.
+            let last = prev;
+            if let Some(old_head_slot) = self.slot_mut(old_head_idx.get())
+            {
+                old_head_slot.set_prev_free_link(last);
+            }
+        }
 
         // Publish.
         if leaf_idx < L1_DIRECT
@@ -482,8 +531,9 @@ impl CSpace
     {
         let idx = index as usize;
         let mut page_nn = self.leaf_ptr(idx / L2_SIZE)?;
-        // SAFETY: same as `slot`; `&mut self` (lock held) excludes other
-        // writers.
+        // SAFETY: same as `slot`; `&mut self` comes from the holder of
+        // whichever lock domain guards the fields being written (see the
+        // struct's concurrency contract).
         let page = unsafe { page_nn.as_mut() };
         Some(&mut page.slots[idx % L2_SIZE])
     }
@@ -498,17 +548,57 @@ impl CSpace
         self.next_leaf as usize
     }
 
-    /// Return the raw page pointer for a leaf, or `None` if the leaf is
-    /// unallocated or `leaf_idx` is out of range.
+    /// Pool pages a grow to cover `index`'s leaf would consume: the
+    /// missing leaves plus the missing directory pages over that span.
+    /// Zero when the covering leaf already exists; also zero for an
+    /// out-of-range index (the placement path rejects it instead).
     ///
-    /// Used by the drain in `dealloc_object(CSpaceObj)` to presence-test
-    /// pages of the dying `CSpace` without holding a `&self` borrow across
-    /// per-slot calls into foreign `CSpace`s. The returned pointer is for
-    /// presence-testing only — callers MUST go through `slot`/`slot_mut`
-    /// for any actual read or write.
-    pub(crate) fn leaf_at(&self, leaf_idx: usize) -> Option<core::ptr::NonNull<u8>>
+    /// Callers use this to fail a doomed explicit placement fast, before
+    /// any pool page is consumed.
+    pub(crate) fn pages_to_cover(&self, index: u32) -> u64
     {
-        self.leaf_ptr(leaf_idx).map(core::ptr::NonNull::cast::<u8>)
+        let target_leaf = index as usize / L2_SIZE;
+        let next = self.next_leaf as usize;
+        if target_leaf < next || target_leaf >= MAX_LEAVES
+        {
+            return 0;
+        }
+        let leaves = (target_leaf + 1 - next) as u64;
+        let mut dirs = 0u64;
+        if target_leaf >= L1_DIRECT
+        {
+            let first = (next.max(L1_DIRECT) - L1_DIRECT) / DIR_FANOUT;
+            let last = (target_leaf - L1_DIRECT) / DIR_FANOUT;
+            for d in first..=last
+            {
+                if self.indirect[d].load(Ordering::Relaxed).is_null()
+                {
+                    dirs += 1;
+                }
+            }
+        }
+        leaves + dirs
+    }
+
+    /// Grow toward covering `index`'s leaf, materialising at most
+    /// `max_leaves` leaves in this call. Returns `Ok(true)` once the
+    /// covering leaf exists. Lets the explicit-placement syscall path
+    /// pre-grow in bounded batches under only this `CSpace`'s lock,
+    /// keeping each interrupts-off hold constant-sized.
+    pub(crate) fn grow_toward(&mut self, index: u32, max_leaves: usize) -> Result<bool, CapError>
+    {
+        let target_leaf = (index as usize / L2_SIZE).min(MAX_LEAVES - 1);
+        let mut grown = 0usize;
+        while (self.next_leaf as usize) <= target_leaf
+        {
+            if grown >= max_leaves
+            {
+                return Ok(false);
+            }
+            self.grow()?;
+            grown += 1;
+        }
+        Ok(true)
     }
 
     /// Return a slot to the free list and clear its contents.
@@ -552,6 +642,11 @@ impl CSpace
         slot.bump_generation();
         slot.set_next_free(old_head);
         self.free_head = Some(nz_index);
+        if let Some(old_head_idx) = old_head
+            && let Some(old_head_slot) = self.slot_mut(old_head_idx.get())
+        {
+            old_head_slot.set_prev_free_link(Some(nz_index));
+        }
         self.free_count += 1;
     }
 
@@ -654,8 +749,11 @@ impl CSpace
     ///
     /// Returns `true` if the index was found and removed, `false` if not on the list.
     ///
-    /// O(n) walk of the singly-linked free list. Acceptable because callers
-    /// (`insert_cap_at`) are infrequent (only init populating child `CSpaces`).
+    /// O(1): the free list is doubly linked (successor in `deriv_parent`,
+    /// predecessor in `deriv_first_child`), so the splice reads the target's
+    /// two neighbours directly. Callers (`insert_cap_at` explicit
+    /// placement) run under the `CSpace` spinlock with interrupts disabled,
+    /// which is why a list walk is not acceptable here.
     pub fn remove_from_free_list(&mut self, target: u32) -> bool
     {
         let Some(target_nz) = NonZeroU32::new(target)
@@ -663,62 +761,42 @@ impl CSpace
         {
             return false;
         };
-        if self.free_head == Some(target_nz)
+        let (prev, next) = match self.slot(target)
         {
-            // Target is the head: pop it.
-            let next = self
-                .slot(target)
-                .and_then(super::slot::CapabilitySlot::next_free);
-            self.free_head = next;
-            self.free_count -= 1;
-            // Drop the free-list marker so the unlinked slot is canonical
-            // off-list (same state as an `allocate_slot` pop). Keep the
-            // generation so a cap later placed here via insert_cap_at carries
-            // the recycled slot's generation (#349).
-            if let Some(slot) = self.slot_mut(target)
-            {
-                slot.clear_keep_generation();
-            }
-            return true;
-        }
-        // Walk the list looking for the predecessor.
-        let Some(mut cur_idx) = self.free_head
-        else
-        {
-            return false;
+            Some(slot) if slot.is_on_free_list() => (slot.prev_free(), slot.next_free()),
+            _ => return false,
         };
-        loop
+        debug_assert_eq!(
+            prev.is_none(),
+            self.free_head == Some(target_nz),
+            "free-list head/prev disagreement"
+        );
+        match prev
         {
-            let Some(next_idx) = self
-                .slot(cur_idx.get())
-                .and_then(super::slot::CapabilitySlot::next_free)
-            else
+            None => self.free_head = next,
+            Some(p) =>
             {
-                return false;
-            };
-            if next_idx == target_nz
-            {
-                // Splice out: cur.next = target.next
-                let after = self
-                    .slot(target)
-                    .and_then(super::slot::CapabilitySlot::next_free);
-                let Some(cur_slot) = self.slot_mut(cur_idx.get())
-                else
+                if let Some(prev_slot) = self.slot_mut(p.get())
                 {
-                    return false;
-                };
-                cur_slot.set_next_free(after);
-                self.free_count -= 1;
-                // Drop the free-list marker on the spliced-out slot; keep the
-                // generation (see the head case above).
-                if let Some(slot) = self.slot_mut(target)
-                {
-                    slot.clear_keep_generation();
+                    prev_slot.set_next_free_link(next);
                 }
-                return true;
             }
-            cur_idx = next_idx;
         }
+        if let Some(n) = next
+            && let Some(next_slot) = self.slot_mut(n.get())
+        {
+            next_slot.set_prev_free_link(prev);
+        }
+        self.free_count -= 1;
+        // Drop the free-list marker so the unlinked slot is canonical
+        // off-list (same state as an `allocate_slot` pop). Keep the
+        // generation so a cap later placed here via insert_cap_at carries
+        // the recycled slot's generation (#349).
+        if let Some(slot) = self.slot_mut(target)
+        {
+            slot.clear_keep_generation();
+        }
+        true
     }
 
     /// Insert a capability at a caller-chosen slot index.
@@ -757,7 +835,11 @@ impl CSpace
 
         // Ensure the leaf covering this index is allocated. Leaves are
         // contiguous behind the grow cursor, so every intermediate leaf up
-        // to the target is materialised on the way.
+        // to the target is materialised on the way. Syscall paths pre-grow
+        // in bounded batches (`pre_grow_for_explicit_slot`) before taking
+        // the heavyweight locks, so this loop is a zero-iteration backstop
+        // there; boot-time callers run it directly (single-threaded, small
+        // indices).
         let leaf_idx = index as usize / L2_SIZE;
         while (self.next_leaf as usize) <= leaf_idx
         {

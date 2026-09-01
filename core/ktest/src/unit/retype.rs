@@ -492,9 +492,21 @@ pub fn cspace_indirect_region(ctx: &TestContext) -> TestResult
         return Err("retype::indirect: cap_insert(7300) failed");
     }
 
+    // Explicit high-slot MOVE: same growth contract on the path that also
+    // holds the derivation lock. The moved cap is consumed from this
+    // CSpace and lands in the target.
+    let mover = cap_create_notification(memory)
+        .map_err(|_| "retype::indirect: cap_create_notification(mover) failed")?;
+    if syscall::cap_move(mover, cspace, SMALL_SLOT + 56).is_err()
+    {
+        cap_delete(cspace).ok();
+        cap_delete(probe).ok();
+        return Err("retype::indirect: cap_move to a high explicit slot failed");
+    }
+
     let used = cap_info(cspace, CAP_INFO_CSPACE_USED)
         .map_err(|_| "retype::indirect: cap_info(used) failed")?;
-    let expected_used = if deep { 2 } else { 1 };
+    let expected_used = if deep { 3 } else { 2 };
     // An occupied high slot must also reject a second explicit placement.
     let occupied = cap_insert(probe, cspace, SMALL_SLOT, RIGHTS_NTF_NOTIFY).is_err();
 
@@ -517,4 +529,96 @@ pub fn cspace_indirect_region(ctx: &TestContext) -> TestResult
         return Err("retype::indirect: slab not fully reclaimed on delete");
     }
     Ok(())
+}
+
+/// A directory page that outlives a failed leaf allocation stays
+/// published and is not re-charged: with exactly one pool page at the
+/// direct/indirect boundary, the auto-allocating grow spends it on the
+/// directory page and fails the leaf with `OutOfMemory`; after a one-page
+/// refill the next insert succeeds without buying the directory page
+/// again. Also pins the explicit-placement fast-fail: a doomed high-slot
+/// placement fails without consuming any pool page.
+pub fn cspace_dir_page_survives_failed_grow(ctx: &TestContext) -> TestResult
+{
+    const PAGE: u64 = 4096;
+    // 128 direct leaves x 56 slots, minus reserved slot 0.
+    const DIRECT_SLOTS: u32 = 128 * 56 - 1;
+
+    let memory = ctx.memory_base;
+    let cspace = cap_create_cspace(memory, 0, 2)
+        .map_err(|_| "retype::dir_survives: cap_create_cspace failed")?;
+    let Ok(probe) = cap_create_endpoint(memory)
+    else
+    {
+        cap_delete(cspace).ok();
+        return Err("retype::dir_survives: cap_create_endpoint failed");
+    };
+
+    // Fast-fail check: covering slot 7300 needs 131 pages; the pool holds
+    // 1. The placement must fail without touching the budget.
+    let before = cap_info(cspace, CAP_INFO_CSPACE_BUDGET)
+        .map_err(|_| "retype::dir_survives: cap_info(budget) failed")?;
+    let doomed = cap_insert(probe, cspace, 7300, syscall::RIGHTS_ALL);
+    let after = cap_info(cspace, CAP_INFO_CSPACE_BUDGET)
+        .map_err(|_| "retype::dir_survives: cap_info(budget after) failed")?;
+    if doomed != Err(SYS_OUT_OF_MEMORY) || before != after || before != PAGE
+    {
+        cap_delete(probe).ok();
+        cap_delete(cspace).ok();
+        return Err("retype::dir_survives: doomed placement consumed budget");
+    }
+
+    // Fill the whole direct region so the free list empties exactly at the
+    // direct/indirect boundary. 128 leaf pages total; 127 more than seeded.
+    if cap_create_cspace(memory, cspace, 127).is_err()
+    {
+        cap_delete(probe).ok();
+        cap_delete(cspace).ok();
+        return Err("retype::dir_survives: boundary augment failed");
+    }
+    for i in 0..DIRECT_SLOTS
+    {
+        if cap_copy(probe, cspace, 1).is_err()
+        {
+            cap_delete(probe).ok();
+            cap_delete(cspace).ok();
+            let _ = i;
+            return Err("retype::dir_survives: direct-region fill failed early");
+        }
+    }
+
+    // One page in the pool at the boundary: the grow buys the directory
+    // page, then fails the leaf.
+    if cap_create_cspace(memory, cspace, 1).is_err()
+    {
+        cap_delete(probe).ok();
+        cap_delete(cspace).ok();
+        return Err("retype::dir_survives: one-page refill failed");
+    }
+    let at_boundary = cap_copy(probe, cspace, 1);
+    let budget_after_fail = cap_info(cspace, CAP_INFO_CSPACE_BUDGET).unwrap_or(u64::MAX);
+    if at_boundary != Err(SYS_OUT_OF_MEMORY) || budget_after_fail != 0
+    {
+        cap_delete(probe).ok();
+        cap_delete(cspace).ok();
+        return Err("retype::dir_survives: boundary grow did not fail after buying the dir page");
+    }
+
+    // One more page: the surviving directory page is not re-charged, so a
+    // single page now buys the leaf and the insert lands in leaf 128.
+    if cap_create_cspace(memory, cspace, 1).is_err()
+    {
+        cap_delete(probe).ok();
+        cap_delete(cspace).ok();
+        return Err("retype::dir_survives: second refill failed");
+    }
+    let landed = cap_copy(probe, cspace, 1);
+    cap_delete(probe).ok();
+    cap_delete(cspace).ok();
+    match landed
+    {
+        Ok(idx) if u64::from(idx) > u64::from(DIRECT_SLOTS) => Ok(()),
+        Ok(_) => Err("retype::dir_survives: post-refill insert landed below the boundary"),
+        Err(_) => Err("retype::dir_survives: insert after refill failed — dir page re-charged?"),
+    }
 }

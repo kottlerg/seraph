@@ -696,9 +696,14 @@ pub(crate) unsafe fn lookup_cap<K: crate::cap::slot::CapKind>(
     #[allow(clippy::ref_as_ptr)]
     // SAFETY: the slot lives in a leaf page of the CSpace's directory. Leaf
     // pages are write-once, Release-published, and never freed or moved
-    // before refcount-0 teardown (see CSpace's memory-ordering contract),
-    // so the reference outlives this syscall; slot-content races are
-    // defended by the tag/generation checks above.
+    // before refcount-0 teardown (see CSpace's memory-ordering contract);
+    // teardown mid-syscall is reachable only by the owning process
+    // deleting its own CSpace caps out from under its own threads. The
+    // unlocked tag/generation checks above narrow — but cannot close —
+    // the race against a sibling thread freeing/recycling this same slot
+    // concurrently. Both residuals are confined to the caller's own
+    // process (lookup_cap resolves only the caller's CSpace); no
+    // cross-process authority is reachable through them.
     Ok(unsafe { &*(slot as *const _) })
 }
 

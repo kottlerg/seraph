@@ -82,12 +82,19 @@ that outlives a failed leaf allocation stays published — already paid for,
 it serves the next grow. Pages are never freed while the CSpace is live
 (slot indices must remain stable).
 
-**Memory ordering:** directory and leaf pointers are write-once while the
-CSpace is live, published with Release after full initialisation, and read
-with Acquire by the lock-free lookup path (`lookup_cap`, `cap_info`); all
-mutation happens under the CSpace spinlock. Races on slot content are
-defended by the tag and per-slot generation checks at every resolution
-site, not by the directory.
+**Memory ordering and lock domains:** directory and leaf pointers are
+write-once while the CSpace is live, published with Release after full
+initialisation, and read with Acquire by the lock-free lookup path
+(`lookup_cap`, `cap_info`). Mutation is split across two lock domains:
+slot occupancy, the free list, the directory, and the counters change
+only under the CSpace spinlock, while the derivation linkage of occupied
+slots changes only under the global derivation write lock (which reaches
+any registered CSpace's slots via registry lookup without taking its
+spinlock — see Derivation Tree below). Paths crossing the families hold
+the derivation lock outermost, then the spinlock. Races on slot content
+against the unlocked readers are narrowed — not closed — by the tag and
+per-slot generation checks at the resolution sites; the residual is
+confined to threads of the owning process racing each other.
 
 **Slot 0** is always null. The leaf covering slot 0 exists once the CSpace
 has grown, but the slot is permanently locked to the null capability,
@@ -108,12 +115,15 @@ pub struct CSpace
 ```
 
 A free slot is `CapTag::Null` and encodes its successor's index in the `deriv_parent`
-field (the derivation parent is meaningless on an empty slot); `None` marks the list
-tail. The encoded `SlotId` carries `epoch == 0`, which a live derivation link never
-does, so the two uses of `deriv_parent` stay distinguishable. Allocation pops
-`free_head` and clears the slot; deallocation pushes onto the head. When the list is
-empty and more slots are needed, the next L2 page is allocated and all its usable
-slots are threaded onto the list.
+field and its predecessor's in `deriv_first_child` (both derivation fields are
+meaningless on an empty slot); `None` marks the list tail and the list head
+respectively. The encoded `SlotId` carries `epoch == 0`, which a live derivation
+link never does, so the two uses stay distinguishable. The predecessor link makes
+`remove_from_free_list` — the explicit-placement path that unlinks an arbitrary
+index — O(1); a list walk would run under the CSpace spinlock with interrupts
+disabled. Allocation pops `free_head` and clears the slot; deallocation pushes onto
+the head. When the list is empty and more slots are needed, the next leaf page is
+allocated and all its usable slots are threaded onto the list.
 
 A `Null` tag alone cannot tell a slot that is *linked on the free list* from one that
 was just allocated and not yet populated, and the list tail is byte-identical to a
@@ -409,12 +419,17 @@ concurrent ancestor revoke sheds the marker with the slot (that ancestor's
 revoke clears the hoisted survivors too, since they remain inside its
 subtree).
 
-Every derivation link reachable from a live slot resolves: `drain_dying_cspace`
-splices all foreign-facing links to surviving neighbours (walking through runs
-of dying siblings) before a `CSpace` unregisters. A link that fails to resolve
-anyway is corruption: the walk truncates the chain hanging from it
-(containment), logs it, and the syscall returns `InvalidState` instead of
-reporting a clean revoke.
+Every derivation link reachable from a live slot resolves: before a `CSpace`
+unregisters, its teardown drain (`drain_dying_cspace_batch`) unlinks every
+dying slot from the forest — foreign children are orphaned into derivation
+roots, and each slot is spliced out of its parent/sibling links with the
+neighbours re-linked directly. Each unlink leaves the forest fully
+consistent, so the drain runs in edit-bounded batches that release the
+derivation write lock between holds (mirroring revocation's batching); a
+foreign traversal in a window between batches sees ordinary consistent
+nodes. A link that fails to resolve anyway is corruption: the walk
+truncates the chain hanging from it (containment), logs it, and the syscall
+returns `InvalidState` instead of reporting a clean revoke.
 
 **Performance characteristics:** Revocation is O(N) in the number of descendants.
 For well-behaved systems, derivation trees are shallow (a server derives a
@@ -497,7 +512,7 @@ by:
 ```
 resolve(slot_id):
     cspace = cspace_table[slot_id.cspace_id]  // O(1) from global table
-    return cspace.slot(slot_id.index)         // O(1) two-level lookup
+    return cspace.slot(slot_id.index)         // O(1) lookup (two or three levels)
 ```
 
 Resolution does not require holding a lock on the target `CSpace` — the derivation

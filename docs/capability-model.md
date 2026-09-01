@@ -24,8 +24,9 @@ The CSpace has the following properties:
 - **Stable indices** — a capability descriptor remains valid for the lifetime of
   the capability; the kernel never moves or renumbers existing slots
 - **O(1) lookup** — descriptor-to-capability resolution MUST be O(1)
-- **Per-process ceiling** — each process has a maximum CSpace size enforced by the
-  kernel
+- **Pay-as-you-go** — capacity is whatever the owner-funded slot-page pool
+  backs (see growth budgets below), bounded only by the directory's
+  structural ceiling
 
 Slot 0 is permanently null and cannot be written — using index 0 always means "no
 capability".

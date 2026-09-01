@@ -2301,8 +2301,8 @@ impl IpcMessage
             // for kernel-shared memory.
             *slot = unsafe { core::ptr::read_volatile(ipc_buf.add(i)) };
         }
-        // Cap metadata: cap_count at word[MSG_DATA_WORDS_MAX], slot
-        // indices at word[MSG_DATA_WORDS_MAX + 1 ..].
+        // Cap metadata: cap_count at word[MSG_DATA_WORDS_MAX], delivered
+        // cap handles at word[MSG_DATA_WORDS_MAX + 1 ..].
         // SAFETY: same invariants; MSG_DATA_WORDS_MAX + 1 + MSG_CAP_SLOTS_MAX
         // = 64 + 1 + 4 = 69 < 512 (4 KiB / 8 B).
         let cap_count_raw = unsafe { core::ptr::read_volatile(ipc_buf.add(MSG_DATA_WORDS_MAX)) };
@@ -2327,10 +2327,10 @@ impl IpcMessage
     /// Write the populated data words into the IPC buffer.
     ///
     /// Used by the `ipc_call` / `ipc_reply` wrappers before issuing the
-    /// syscall. Cap slots are passed as syscall arguments; the sender
+    /// syscall. Cap handles are passed as syscall arguments; the sender
     /// does not write cap metadata into the buffer (the kernel installs
-    /// caps in the receiver and writes the receiver-side slot indices
-    /// into the receiver's buffer).
+    /// caps in the receiver and writes the receiver-side handles into
+    /// the receiver's buffer).
     ///
     /// # Safety
     /// `ipc_buf` must point to the caller thread's 4 KiB-aligned IPC

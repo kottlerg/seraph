@@ -67,8 +67,10 @@ data-carrying IPC with no registered page fails with `InvalidArgument`; a page
 unmapped after registration surfaces the copy fault (`InvalidAddress`).
 Capability handles always travel in registers on the send side, regardless
 of payload size; the delivered destination handles reach the receiver
-through the cap-transfer result block in its IPC buffer page, so a thread
-that receives capabilities needs a registered page. Message labels, counts,
+through the cap-transfer result block in its IPC buffer page. A thread that
+receives capabilities therefore needs a registered page: without one the
+caps are still moved into its CSpace, but their handles are unlearnable and
+the slots stay consumed until the CSpace is torn down. Message labels, counts,
 and badges travel in registers.
 
 For bulk data, pass a shared memory capability instead.

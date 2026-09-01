@@ -106,11 +106,6 @@ pub const fn cap_handle_gen(handle: u32) -> u8
     (handle >> CAP_INDEX_BITS) as u8
 }
 
-// The two-word transfer layout below (pack_cap_handles / unpack_cap_handles)
-// holds exactly four 32-bit fields; raising MSG_CAP_SLOTS_MAX past 4 would
-// silently alias fields. Trip at compile time instead.
-const _: () = assert!(MSG_CAP_SLOTS_MAX <= 4);
-
 /// Pack up to [`MSG_CAP_SLOTS_MAX`] cap handles into the two IPC transfer
 /// words: two 32-bit **full** handles per word (handles 0/1 in the low
 /// word, 2/3 in the high word). Carrying the whole handle — index plus
@@ -547,6 +542,11 @@ pub const MSG_DATA_WORDS_MAX: usize = 64;
 
 /// Maximum number of capability slots transferable in a single IPC message.
 pub const MSG_CAP_SLOTS_MAX: usize = 4;
+
+// The two-word transfer layout (`pack_cap_handles` / `unpack_cap_handles`)
+// holds exactly four 32-bit fields; raising MSG_CAP_SLOTS_MAX past 4 would
+// silently alias fields. Trip at compile time instead.
+const _: () = assert!(MSG_CAP_SLOTS_MAX <= 4);
 
 /// Synthetic reply label written to the caller's IPC message by the kernel
 /// when `SYS_IPC_REPLY` cannot deliver the server's reply intact: rejected

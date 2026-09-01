@@ -226,8 +226,9 @@ Each 32-bit field of the two packed words carries a **full** cap handle —
 slot index plus per-slot generation — so the kernel generation-validates the
 sender's named slots: a stale handle to a recycled slot is rejected
 (`InvalidCapability`) instead of transmitting the slot's current occupant.
-Capability handles always travel in these registers; they never spill to
-memory.
+Capability handles always travel in these registers on the send side; the
+delivered destination handles are reported through the result block in the
+receiver's IPC buffer page.
 
 **Data words:** When `data_count` > 0, the kernel reads the data words from
 the caller's registered IPC buffer page (`SYS_IPC_BUFFER_SET`); the syscall
@@ -292,10 +293,12 @@ stale), `InvalidArgument` (also: a cap slot repeated in one reply, or
 (registered IPC buffer page unmapped), `InvalidState` (a reply cap slot is
 pinned by an in-flight `SYS_CAP_REVOKE`), `QuotaExceeded` (caller's CSpace
 directory structurally full for reply cap transfer), `OutOfMemory`
-(slot-page pool exhausted), `Interrupted`. When the reply cap
-transfer is refused after the caller was already claimed, the caller is still
-woken — it resumes with the `IPC_REPLY_TRANSFER_FAILED` label and zero caps —
-and the server receives the error.
+(slot-page pool exhausted), `Interrupted`. Every payload or cap failure while
+a caller is pending — the data-path errors above included — consumes the
+pending reply and wakes the caller with the `IPC_REPLY_TRANSFER_FAILED` label
+and zero caps while the server receives the error. A fault reply skips
+payload and cap processing entirely: the label alone carries the disposition
+(see [fault-handling.md](../../docs/fault-handling.md)).
 
 ---
 
@@ -1710,8 +1713,10 @@ thread's TCB. The page must remain mapped for the duration of any IPC that uses 
 The error surface is read-side only: a *sending* data-carrying IPC fails with
 `InvalidArgument` when no page is registered and `InvalidAddress` when the
 registered page is unmapped, while delivery-side writes are best-effort — a
-receiver with no usable page silently misses the data words and cap results
-rather than failing the sender.
+receiver with no usable page silently misses the data words and the
+cap-result block. Transferred capabilities are still moved into that
+receiver's CSpace; without the result block it cannot learn their handles,
+so the slots stay consumed until the CSpace is torn down.
 
 Calling `SYS_IPC_BUFFER_SET` again replaces the previous registration. Passing 0
 deregisters the IPC buffer page (sending data-carrying IPC then fails with

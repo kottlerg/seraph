@@ -128,9 +128,10 @@ unsafe fn write_cap_results(buf: u64, cap_count: usize, handles: &[u32; MSG_CAP_
         return;
     }
     // Always write the cap_count word, even when 0: stale values from a
-    // prior IPC round would otherwise be read by `IpcMessage::from_ipc_buf`
-    // and surface as this delivery's cap results to handlers that loop over
-    // `req.caps()`.
+    // prior IPC round would otherwise be read by `IpcMessage::from_ipc_buf`,
+    // surface as this delivery's cap results to handlers that loop over
+    // `req.caps()`, and trip `shared/ipc`'s bootstrap `debug_assert_eq!`
+    // against the label-declared cap count.
     let n = cap_count.min(MSG_CAP_SLOTS_MAX);
     // Assemble the result block [cap_count, handle0, handle1, ...] (handles
     // widened u32 -> u64) in a kernel buffer, then copy it to the user IPC

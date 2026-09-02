@@ -147,21 +147,27 @@ pub unsafe fn dispatch(tf: *mut TrapFrame)
     // AddressSpace (SYS_CAP_DELETE / SYS_CAP_REVOKE, directly or through a
     // teardown cascade), or a concurrent teardown may have stopped this
     // thread while the handler ran: either way it is `Exited` in place and
-    // must never return to userspace. Reschedule away — any object whose
-    // free was deferred is then reclaimed off-CPU by `drain_deferred_reclaim`.
-    // Otherwise drain objects deferred earlier on this CPU, from this (live)
-    // thread's context where the dead thread is provably off-CPU.
-    // SAFETY: syscall context on the caller's kernel stack; current_tcb() is set.
+    // must never return to userspace. A live thread first drains objects
+    // deferred earlier on this CPU, from a context where their dead threads
+    // are provably off-CPU. The drain's CSpace/AddressSpace arms wait on
+    // other CPUs with interrupts enabled, so a teardown can stop this thread
+    // meanwhile: the `Exited` check runs after the drain as well. An `Exited`
+    // thread reschedules away; any object whose free it deferred is reclaimed
+    // by the next drain on this CPU.
+    // SAFETY: syscall context on the caller's kernel stack with interrupts
+    // disabled (the drain re-enables them only with preemption disabled), so
+    // this CPU and its `current` are stable across both checks.
     unsafe {
-        let cur = current_tcb();
-        if !cur.is_null() && (*cur).state == crate::sched::thread::ThreadState::Exited
+        let this_cpu = crate::arch::current::cpu::current_cpu() as usize;
+        if !crate::sched::running_thread_stopped(this_cpu)
+        {
+            crate::cap::object::drain_deferred_reclaim(this_cpu);
+        }
+        if crate::sched::running_thread_stopped(this_cpu)
         {
             crate::sched::schedule(false);
             crate::arch::current::cpu::halt_loop();
         }
-        crate::cap::object::drain_deferred_reclaim(
-            crate::arch::current::cpu::current_cpu() as usize
-        );
     }
 }
 

@@ -716,6 +716,11 @@ pub fn derive_badge_on_notification(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
+/// Derives the [`cspace_teardown_multibatch`] child performs: wider than one
+/// reparent batch (`MAX_REPARENT_EDITS`), so the dying child list is drained
+/// in several holds.
+const DERIVES: u64 = 300;
+
 /// Tearing down a `CSpace` whose derivation state spans multiple drain
 /// batches completes and leaves the survivors' forest clean.
 ///
@@ -737,8 +742,6 @@ pub fn derive_badge_on_notification(ctx: &TestContext) -> TestResult
 /// spawn helper or to derive semantics silently shrinking the burst.
 pub fn cspace_teardown_multibatch(ctx: &TestContext) -> TestResult
 {
-    const DERIVES: u64 = 300;
-
     let ep = cap_create_endpoint(ctx.memory_base)
         .map_err(|_| "teardown_batch: cap_create_endpoint failed")?;
     let done = cap_create_notification(ctx.memory_base)
@@ -755,7 +758,7 @@ pub fn cspace_teardown_multibatch(ctx: &TestContext) -> TestResult
         .map_err(|_| "teardown_batch: cap_copy ep failed")?;
     let child_done = cap_copy(done, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
         .map_err(|_| "teardown_batch: cap_copy done failed")?;
-    let child_arg = u64::from(child_ep) | (u64::from(child_done) << 16) | (DERIVES << 32);
+    let child_arg = u64::from(child_ep) | (u64::from(child_done) << 32);
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(TEARDOWN_BATCH_STACK));
     crate::spawn::configure_and_start(&child, teardown_batch_child_entry, stack_top, child_arg)
@@ -833,7 +836,7 @@ pub fn cspace_delete_stops_bound_thread(ctx: &TestContext) -> TestResult
         .map_err(|_| "stop_bound: cap_copy ready failed")?;
     let child_block = cap_copy(block, child.cs, syscall_abi::RIGHTS_NTF_WAIT)
         .map_err(|_| "stop_bound: cap_copy block failed")?;
-    let arg = u64::from(child_ready) | (u64::from(child_block) << 16);
+    let arg = u64::from(child_ready) | (u64::from(child_block) << 32);
     let stack_top = ChildStack::top(core::ptr::addr_of!(STOP_BLOCKED_STACK));
     crate::spawn::configure_and_start(&child, stop_blocked_child_entry, stack_top, arg)
         .map_err(|_| "stop_bound: configure_and_start (blocked) failed")?;
@@ -902,8 +905,8 @@ pub fn cspace_delete_stops_bound_thread(ctx: &TestContext) -> TestResult
 /// which the test never expects.
 fn stop_blocked_child_entry(arg: u64) -> !
 {
-    let ready_slot = (arg & 0xFFFF) as u32;
-    let block_slot = ((arg >> 16) & 0xFFFF) as u32;
+    let ready_slot = (arg & 0xFFFF_FFFF) as u32;
+    let block_slot = (arg >> 32) as u32;
     notification_send(ready_slot, 0x1).ok();
     notification_wait(block_slot).ok();
     syscall::thread_exit()
@@ -912,7 +915,7 @@ fn stop_blocked_child_entry(arg: u64) -> !
 /// Child for [`cspace_delete_stops_bound_thread`]: signal, then yield forever.
 fn stop_spinning_child_entry(arg: u64) -> !
 {
-    let ready_slot = (arg & 0xFFFF) as u32;
+    let ready_slot = (arg & 0xFFFF_FFFF) as u32;
     notification_send(ready_slot, 0x1).ok();
     loop
     {
@@ -985,12 +988,11 @@ fn self_delete_child_entry(arg: u64) -> !
 /// completion, and exits without cleaning up — teardown is the test.
 fn teardown_batch_child_entry(arg: u64) -> !
 {
-    let ep_slot = (arg & 0xFFFF) as u32;
-    let done_slot = ((arg >> 16) & 0xFFFF) as u32;
-    let count = arg >> 32;
+    let ep_slot = (arg & 0xFFFF_FFFF) as u32;
+    let done_slot = (arg >> 32) as u32;
 
     let mut ok = true;
-    for _ in 0..count
+    for _ in 0..DERIVES
     {
         if cap_derive(ep_slot, syscall_abi::RIGHTS_EP_SEND).is_err()
         {

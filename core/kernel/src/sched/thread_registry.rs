@@ -16,11 +16,13 @@
 //! (`sched::stop_threads_bound_to`).
 //!
 //! [`THREAD_REGISTRY_LOCK`] is never taken under a `sched_lock`, a run-queue
-//! lock, or an IPC-source lock; the teardown walk takes those under it, so
-//! the only lock-order edge is registry → (IPC source → `sched_lock` →
-//! run-queue locks). The lock is held with interrupts disabled and must not
-//! be held while waiting for another CPU to make progress: a CPU spinning on
-//! it inside [`register`] cannot deschedule.
+//! lock, an IPC-source lock, or `SLEEP_LIST_LOCK`; the teardown walk takes
+//! all of those under it (`cancel_ipc_block` takes the source lock, then
+//! `SLEEP_LIST_LOCK` alone for a timed waiter), so the only lock-order edges
+//! it adds are registry → IPC source → `sched_lock` → run-queue locks and
+//! registry → `SLEEP_LIST_LOCK`. The lock is held with interrupts disabled
+//! and must not be held while waiting for another CPU to make progress: a
+//! CPU spinning on it inside [`register`] cannot deschedule.
 //!
 //! Neither walk is length-bounded — a registry holds as many threads as
 //! memory backs. A list corrupted into a cycle is detected by a
@@ -34,7 +36,8 @@
 use super::thread::ThreadControlBlock;
 use crate::sync::Spinlock;
 
-/// Serialises every access to the registry list. Leaf lock (see module docs).
+/// Serialises every access to the registry list. Ordered above every
+/// IPC-source, sleep-list, `sched_lock`, and run-queue lock (see module docs).
 static THREAD_REGISTRY_LOCK: Spinlock = Spinlock::new();
 
 /// Head of the intrusive list (`null` when empty). Guarded by
@@ -74,7 +77,7 @@ pub unsafe fn register(tcb: *mut ThreadControlBlock)
 ///
 /// Must run before the TCB storage is freed: the walk holds
 /// [`THREAD_REGISTRY_LOCK`] across every dereference, so an unlink that precedes
-/// the free guarantees the watchdog never observes a dangling node.
+/// the free guarantees neither walk observes a dangling node.
 ///
 /// # Safety
 /// `tcb` must be a valid TCB pointer that is not concurrently freed.
@@ -164,6 +167,8 @@ pub unsafe fn try_for_each(f: impl FnMut(*mut ThreadControlBlock)) -> bool
         return false;
     };
     // SAFETY: lock held.
+    // A cycle ends the walk early; this is the stall dump's own diagnostic
+    // path, so the truncation is not reported further.
     let _complete = unsafe { walk_locked(f) };
     // SAFETY: paired with try_lock_raw above.
     unsafe { THREAD_REGISTRY_LOCK.unlock_raw(saved) };
@@ -184,8 +189,8 @@ pub unsafe fn try_for_each(f: impl FnMut(*mut ThreadControlBlock)) -> bool
 ///
 /// # Safety
 /// `f` must not register or unregister any thread. It may take IPC-source,
-/// `sched_lock`, and run-queue locks (all ordered after this lock) but must
-/// not block or spin on another CPU's progress.
+/// `SLEEP_LIST_LOCK`, `sched_lock`, and run-queue locks (all ordered after
+/// this lock) but must not block or spin on another CPU's progress.
 pub unsafe fn for_each(f: impl FnMut(*mut ThreadControlBlock))
 {
     // SAFETY: lock serialises all registry access.

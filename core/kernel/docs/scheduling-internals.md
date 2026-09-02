@@ -36,17 +36,19 @@ In scope:
 The following ordering MUST be observed everywhere in the kernel. Acquiring locks in reverse, or skipping levels, risks deadlock.
 
 ```
+   THREAD_REGISTRY_LOCK                      (outermost; live-thread list — the
+        │                                    object-teardown walk takes every
+        │                                    lock below it under this one;
+        │                                    see § Thread Registry)
+        ▼
        source IPC lock                derivation tree lock
    (sig.lock | ep.lock |    (outer)   (cap revocation;
     eq.lock | ws.lock)                 see capability-internals.md)
         │         │
-        │         └─────► SLEEP_LIST_LOCK   (leaf; held alone, or under a
-        │                                    source lock — source.lock →
-        │                                    SLEEP_LIST_LOCK is the only edge)
-        │
-        │                 THREAD_REGISTRY_LOCK (leaf; held strictly alone — never
-        │                                    under any other lock. Diagnostic-only
-        │                                    live-thread list; see § Thread Registry)
+        │         └─────► SLEEP_LIST_LOCK   (leaf; held alone, under a source
+        │                                    lock, or alone under
+        │                                    THREAD_REGISTRY_LOCK — never over
+        │                                    any other lock)
         ▼
    (*tcb).sched_lock                         (per-TCB Scheduling-group serializer)
         │
@@ -62,16 +64,19 @@ The following ordering MUST be observed everywhere in the kernel. Acquiring lock
 
 3. **`SLEEP_LIST_LOCK` is leaf-only.** It MAY be acquired from inside any source IPC lock. It MUST NOT contain calls that re-enter IPC or scheduler code while held.
 
-3a. **`THREAD_REGISTRY_LOCK` orders before every IPC-source, `sched_lock`, and
-run-queue lock, and is never taken under any of them.** The live-thread registry
+3a. **`THREAD_REGISTRY_LOCK` orders before every IPC-source lock,
+`SLEEP_LIST_LOCK`, `sched_lock`, and run-queue lock, and is never taken under
+any of them.** The live-thread registry
 (`core/kernel/src/sched/thread_registry.rs`) is linked at thread construction
 and unlinked at dealloc with `THREAD_REGISTRY_LOCK` held alone. The
 object-teardown walk (`stop_threads_bound_to`) holds it while cancelling IPC
-blocks and writing `Exited` under the all-locks discipline, so the registry
-lock sits above those in the hierarchy — the only edge it adds, and one no
-path traverses in reverse. It must not be held while waiting for another CPU
-to make progress (a CPU spinning on it inside `register` cannot deschedule):
-the teardown walk marks under the lock and waits after releasing it. The hold
+blocks (`cancel_ipc_block`: the source lock, then `SLEEP_LIST_LOCK` alone for
+a timed waiter) and writing `Exited` under the all-locks discipline, so the
+registry lock sits above all of those in the hierarchy — the only edges it
+adds, and ones no path traverses in reverse. It must not be held while
+waiting for another CPU to make progress (a CPU spinning on it inside
+`register` cannot deschedule): the teardown walk marks under the lock and
+waits after releasing it. The hold
 is interrupts-off on the walking CPU for the whole walk — every live thread
 is visited, and each bound one costs an all-CPU-locks transition — so its
 length is proportional to live threads plus bound threads × CPUs; thread
@@ -736,9 +741,8 @@ never returned to the scheduler is stuck in a protocol-spin, and the
 breadcrumb (`spin_site_enter`/`spin_site_exit`, set around each gate) names
 which one — `dealloc:not-current`, `dealloc:context-saved`,
 `dealloc:wake-in-flight`, `dealloc:as-active`, or `schedule:context-saved`.
-The
-`dealloc_object(Thread)` gates carried no overlong-duration warning of their
-own, so a wedge there showed only an opaque `current = Exited` in
+The `dealloc_object(Thread)` gates carried no overlong-duration warning of
+their own, so a wedge there showed only an opaque `current = Exited` in
 `SYS_CAP_DELETE` (#351); the breadcrumb makes it explicit. The `schedule()`
 context-saved dispatch barrier reports both ways: the breadcrumb names it in
 cross-CPU dumps, and its own single-shot warning fires after 100 ms of

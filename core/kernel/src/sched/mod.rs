@@ -2226,19 +2226,27 @@ impl SpinWarnOnce
 }
 
 /// Whether the thread running on `this_cpu` has been marked `Exited` by a
-/// concurrent teardown. Volatile so a spin re-reads it; the writer commits
-/// under the all-locks discipline, and a lagging read only lengthens the
-/// spin by one iteration.
+/// concurrent teardown (or by its own handler, on the self-teardown path).
+/// `current` and `state` are read under this CPU's scheduler lock, which the
+/// writer holds among all locks when it commits the transition.
+///
+/// # Safety
+/// The caller must be the thread running on `this_cpu`, with interrupts or
+/// preemption disabled so it cannot migrate, and must hold no scheduler
+/// lock.
 #[cfg(not(test))]
-fn running_thread_stopped(this_cpu: usize) -> bool
+pub(crate) unsafe fn running_thread_stopped(this_cpu: usize) -> bool
 {
-    // SAFETY: this_cpu < MAX_CPUS; our own CPU's `current` is written only by
-    // this CPU at dispatch, and we are that running thread.
+    // SAFETY: this_cpu < MAX_CPUS per contract; `current` and the TCB's
+    // `state` are read under this CPU's scheduler lock, and `current` cannot
+    // be freed while it is still installed on this CPU.
     unsafe {
-        let cur = scheduler_for(this_cpu).current;
-        !cur.is_null()
-            && core::ptr::read_volatile(core::ptr::addr_of!((*cur).state))
-                == thread::ThreadState::Exited
+        let sched = scheduler_for(this_cpu);
+        let saved = sched.lock.lock_raw();
+        let cur = sched.current;
+        let stopped = !cur.is_null() && (*cur).state == thread::ThreadState::Exited;
+        sched.lock.unlock_raw(saved);
+        stopped
     }
 }
 
@@ -2277,7 +2285,7 @@ unsafe fn mark_bound_threads(
             // observers, written before the Exited commit like every other
             // exit path. Not posted: kernel-initiated teardown is silent,
             // as for a thread reaped through its own capability.
-            (*tcb).exit_reason = thread::EXIT_KILLED;
+            (*tcb).exit_reason = syscall::EXIT_KILLED;
             let running_on = set_state_under_all_locks(tcb, thread::ThreadState::Exited);
             if is_self
             {
@@ -2425,7 +2433,9 @@ pub unsafe fn stop_threads_bound_to(bound: impl Fn(*mut ThreadControlBlock) -> b
     let mut stopped = false;
     loop
     {
-        if running_thread_stopped(this_cpu)
+        // SAFETY: we are the running thread on this_cpu with preemption
+        // disabled; no scheduler lock held.
+        if unsafe { running_thread_stopped(this_cpu) }
         {
             stopped = true;
             break;
@@ -2492,7 +2502,9 @@ pub unsafe fn wait_until_aspace_inactive(
     // SAFETY: aspace valid per contract; active_cpu_mask is an Acquire snapshot.
     while !unsafe { (*aspace).active_cpu_mask() }.is_empty()
     {
-        if running_thread_stopped(this_cpu)
+        // SAFETY: we are the running thread on this_cpu with preemption
+        // disabled; no scheduler lock held.
+        if unsafe { running_thread_stopped(this_cpu) }
         {
             completed = false;
             break;

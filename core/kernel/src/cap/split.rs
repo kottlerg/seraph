@@ -34,7 +34,8 @@ use syscall::SyscallError;
 ///   2. rewires the derivation tree under `DERIVATION_LOCK` — reparents the
 ///      original's children to its parent in `MAX_REPARENT_EDITS` batches
 ///      (lock released between batches), unlinks the original, then links
-///      both new caps to that parent;
+///      to that parent each new cap whose slot still holds it (a sibling may
+///      have deleted a child meanwhile; its returned handle is then stale);
 ///   3. frees the original slot and drops its object reference.
 ///
 /// The original was looked up without the derivation lock, so it is
@@ -162,10 +163,24 @@ pub(crate) unsafe fn install_split_children(
 
     if let Some(parent_id) = orig_parent
     {
-        // SAFETY: DERIVATION_LOCK held; parent_id/child1_id/child2_id valid.
-        unsafe { link_child(parent_id, child1_id) };
-        // SAFETY: DERIVATION_LOCK held; parent_id/child2_id valid.
-        unsafe { link_child(parent_id, child2_id) };
+        // A sibling thread may have deleted a child (and refilled its slot)
+        // since the insert: link only a slot that still holds our child, so
+        // an unrelated cap is never wired under the original's parent.
+        for (slot_nz, child_ptr, child_id) in [
+            (slot1_nz, child1_ptr, child1_id),
+            (slot2_nz, child2_ptr, child2_id),
+        ]
+        {
+            // SAFETY: caller_cspace validated; DERIVATION_LOCK held, so the
+            // slot's occupancy is stable from this check through the link.
+            let still_ours = unsafe { (*caller_cspace).slot(slot_nz.get()) }
+                .is_some_and(|s| s.object == Some(child_ptr));
+            if still_ours
+            {
+                // SAFETY: DERIVATION_LOCK held; parent_id and child_id occupied.
+                unsafe { link_child(parent_id, child_id) };
+            }
+        }
     }
 
     // ── Consume the original cap ──────────────────────────────────────────────
@@ -191,8 +206,10 @@ pub(crate) unsafe fn install_split_children(
     }
 
     // Encode both child handles (generation + index, #349). Returned separately
-    // so the caller can deliver them in two registers.
-    // SAFETY: caller_cspace validated; both slots occupied so the reads are stable.
+    // so the caller can deliver them in two registers. A child a sibling
+    // deleted meanwhile yields a handle that no longer resolves, exactly as
+    // if it had been deleted after the split returned.
+    // SAFETY: caller_cspace validated; the generation reads run under its lock.
     let handles = unsafe {
         let saved = (*caller_cspace).lock.lock_raw();
         let h = (

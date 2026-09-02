@@ -789,15 +789,16 @@ const _: () = assert!(MAP_EXECUTABLE == RIGHTS_MEM_EXECUTE);
 // a thread or process dies. It is a single flat space partitioned into disjoint
 // ranges, kernel-owned so userspace can never forge a fault or kill reason:
 //
-//   | Reason            | Class               | Meaning                          |
-//   |-------------------|---------------------|----------------------------------|
-//   | `0`               | Voluntary, clean    | success (`SYS_THREAD_EXIT`, or    |
-//   |                   |                     | `SYS_PROCESS_EXIT(0)`)            |
-//   | `1 ..= 0x0FFF`    | Voluntary, code     | `SYS_PROCESS_EXIT(code)`, where   |
-//   |                   |                     | reason == `encode_exit_code(code)`|
-//   | `0x1000 ..0x2000` | Fault               | `EXIT_FAULT_BASE + vector/cause`  |
-//   | `0x2000`          | Killed              | `EXIT_KILLED`: recorded by object   |
-//   |                   |                     | teardown, posted by userspace kill |
+//   | Reason            | Class               | Meaning                            |
+//   |-------------------|---------------------|------------------------------------|
+//   | `0`               | Voluntary, clean    | success (`SYS_THREAD_EXIT`, or     |
+//   |                   |                     | `SYS_PROCESS_EXIT(0)`)             |
+//   | `1 ..= 0x0FFF`    | Voluntary, code     | `SYS_PROCESS_EXIT(code)`, where    |
+//   |                   |                     | reason == `encode_exit_code(code)` |
+//   | `0x1000 ..0x2000` | Fault               | `EXIT_FAULT_BASE + vector/cause`   |
+//   | `0x2000`          | Killed              | `EXIT_KILLED`: recorded by         |
+//   |                   |                     | object teardown, posted by a       |
+//   |                   |                     | userspace kill                     |
 //
 // This is a Seraph-native encoding, not POSIX: exit codes are not 8-bit
 // `WEXITSTATUS`-truncated, and faults are native fault classes, not signals.

@@ -476,7 +476,7 @@ pub fn sched_split_rollback_on_full_cspace(ctx: &TestContext) -> TestResult
         .map_err(|_| "thread::split_rollback: cap_copy sched failed")?;
     let child_done = cap_copy(done, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
         .map_err(|_| "thread::split_rollback: cap_copy done failed")?;
-    let arg = u64::from(child_sched) | (u64::from(child_done) << 16);
+    let arg = u64::from(child_sched) | (u64::from(child_done) << 32);
     let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_SPLIT_ROLLBACK));
     crate::spawn::configure_and_start(&child, split_rollback_child_entry, stack_top, arg)
         .map_err(|_| "thread::split_rollback: configure_and_start failed")?;
@@ -503,8 +503,8 @@ pub fn sched_split_rollback_on_full_cspace(ctx: &TestContext) -> TestResult
 fn split_rollback_child_entry(arg: u64) -> !
 {
     const OUT_OF_MEMORY: i64 = -8;
-    let sched_slot = (arg & 0xFFFF) as u32;
-    let done_slot = ((arg >> 16) & 0xFFFF) as u32;
+    let sched_slot = (arg & 0xFFFF_FFFF) as u32;
+    let done_slot = (arg >> 32) as u32;
 
     let bits = 'run: {
         // Fill the CSpace until the pool is exhausted, keeping the last cap.

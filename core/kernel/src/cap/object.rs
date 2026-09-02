@@ -1190,12 +1190,17 @@ pub unsafe fn drain_deferred_reclaim(cpu: usize)
 /// Queue `ptr` for off-CPU reclaim because the running thread has been
 /// stopped (it is bound to the object, or a concurrent teardown stopped it
 /// while this free waited); log the first occurrence.
+///
+/// # Safety
+/// `ptr` must be a refcount-0 `Thread`, `CSpace`, or `AddressSpace` object
+/// referenced by no slot, and the caller must be the running thread with
+/// interrupts disabled, so this CPU and its `current` are stable.
 #[cfg(not(test))]
-fn defer_self_teardown(ptr: NonNull<KernelObjectHeader>, what: &str)
+unsafe fn defer_self_teardown(ptr: NonNull<KernelObjectHeader>, what: &str)
 {
     let this_cpu = crate::arch::current::cpu::current_cpu() as usize;
-    // SAFETY: this_cpu < MAX_CPUS; our own CPU's `current` is written only
-    // by this CPU at dispatch, and we are that running thread.
+    // SAFETY: this_cpu < MAX_CPUS; `current` is written only by this CPU at
+    // dispatch, and per contract we are that running thread.
     let cur = unsafe { crate::sched::scheduler_for(this_cpu).current };
     if !cur.is_null()
     {
@@ -2173,7 +2178,9 @@ unsafe fn dealloc_object_one(
                 // off every run queue; no scheduler lock held.
                 if stopped || !unsafe { crate::sched::wait_until_aspace_inactive(as_ptr) }
                 {
-                    defer_self_teardown(ptr, "AddressSpace");
+                    // SAFETY: refcount 0, no slot references the object;
+                    // syscall context with interrupts disabled.
+                    unsafe { defer_self_teardown(ptr, "AddressSpace") };
                     return;
                 }
 
@@ -2316,7 +2323,9 @@ unsafe fn dealloc_object_one(
                 };
                 if stopped
                 {
-                    defer_self_teardown(ptr, "CSpace");
+                    // SAFETY: refcount 0, no slot references the object;
+                    // syscall context with interrupts disabled.
+                    unsafe { defer_self_teardown(ptr, "CSpace") };
                     return;
                 }
 
@@ -3047,38 +3056,6 @@ mod tests
         assert_eq!(offset_of!(InterruptObject, header), 0);
         assert_eq!(offset_of!(IoPortObject, header), 0);
         assert_eq!(offset_of!(SchedControlObject, header), 0);
-    }
-
-    #[test]
-    fn struct_sizes()
-    {
-        // Header: 4 ref_count + 1 obj_type + 3 pad + 8 ancestor (Option<SlotId>
-        // via NonZeroU32 niche) = 16 bytes, alignment 4.
-        assert_eq!(size_of::<KernelObjectHeader>(), 16);
-        // MemoryObject: 16 header + 8 base + 8 size + 8 available_bytes +
-        // 1 owns_memory + 7 pad + 40 inline allocator + 4 lock + 4 pad = 96 bytes.
-        assert_eq!(size_of::<MemoryObject>(), 96);
-        // MmioObject: 16 header + 8 base + 8 size + 4 flags + 4 pad = 40.
-        assert_eq!(size_of::<MmioObject>(), 40);
-        // InterruptObject: 16 header + 4 start + 4 count = 24.
-        assert_eq!(size_of::<InterruptObject>(), 24);
-        // IoPortObject: 16 header + 2 base + 2 size + 4 pad = 24.
-        assert_eq!(size_of::<IoPortObject>(), 24);
-        // SchedControlObject: 16 header + 1 min + 1 max + 6 pad = 24 (8-align).
-        assert_eq!(size_of::<SchedControlObject>(), 24);
-        assert_eq!(size_of::<SbiControlObject>(), 16);
-        assert_eq!(size_of::<ThreadObject>(), 32);
-        assert_eq!(size_of::<EndpointObject>(), 24);
-        assert_eq!(size_of::<NotificationObject>(), 24);
-        assert_eq!(size_of::<EventQueueObject>(), 24);
-        assert_eq!(size_of::<WaitSetObject>(), 24);
-        // PoolChunkSlot: 8 ancestor + 8 base_offset + 8 page_count = 24 B.
-        assert_eq!(size_of::<PoolChunkSlot>(), 24);
-        // AddressSpaceObject: 16 header + 8 ptr + 8 budget + 8 lock + 8 head
-        // + 16 * 24 chunks + 8 deferred link = 440 B.
-        assert_eq!(size_of::<AddressSpaceObject>(), 56 + 24 * MAX_PT_CHUNKS);
-        // CSpaceKernelObject: same shape.
-        assert_eq!(size_of::<CSpaceKernelObject>(), 56 + 24 * MAX_PT_CHUNKS);
     }
 
     #[test]

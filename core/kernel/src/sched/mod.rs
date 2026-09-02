@@ -366,6 +366,9 @@ pub const SPIN_SITE_DEALLOC_WAKE_IN_FLIGHT: u32 = 3;
 /// `schedule()` dispatch barrier: spinning until the next thread's previous
 /// CPU publishes its register save (`context_saved == 1`).
 pub const SPIN_SITE_SCHED_CONTEXT_SAVED: u32 = 4;
+/// `dealloc_object(AddressSpace)` root-free gate: spinning until no CPU has
+/// the dying address space loaded (`active_cpus` empty).
+pub const SPIN_SITE_DEALLOC_AS_ACTIVE: u32 = 5;
 
 /// Per-CPU breadcrumb naming the bounded protocol-spin a CPU is currently
 /// executing, for the softlockup watchdog. A wedged CPU (no non-idle dispatch
@@ -414,6 +417,7 @@ fn spin_site_name(site: u32) -> &'static str
         SPIN_SITE_DEALLOC_CONTEXT_SAVED => "dealloc:context-saved",
         SPIN_SITE_DEALLOC_WAKE_IN_FLIGHT => "dealloc:wake-in-flight",
         SPIN_SITE_SCHED_CONTEXT_SAVED => "schedule:context-saved",
+        SPIN_SITE_DEALLOC_AS_ACTIVE => "dealloc:as-active",
         _ => "none",
     }
 }
@@ -2176,27 +2180,224 @@ pub unsafe fn wait_until_off_cpu(tcb: *mut ThreadControlBlock)
     }
 }
 
+/// Warn-once timer for the unbounded protocol spins in object teardown
+/// ([`stop_threads_bound_to`], [`wait_until_aspace_inactive`]). The first
+/// `due` call more than 100 ms after construction returns `true` so the
+/// caller prints one diagnostic line; the spin itself continues — giving up
+/// would free storage under a thread still using it. Mirrors the
+/// `sys_thread_stop` drain diagnostic.
+#[cfg(not(test))]
+struct SpinWarnOnce
+{
+    start: u64,
+    warned: bool,
+}
+
+#[cfg(not(test))]
+impl SpinWarnOnce
+{
+    fn new() -> Self
+    {
+        Self {
+            start: crate::arch::current::timer::current_tick(),
+            warned: false,
+        }
+    }
+
+    fn due(&mut self) -> bool
+    {
+        if self.warned
+        {
+            return false;
+        }
+        let tps = crate::arch::current::timer::ticks_per_second();
+        if tps == 0
+        {
+            return false;
+        }
+        let now = crate::arch::current::timer::current_tick();
+        if now.saturating_sub(self.start) > tps / 10
+        {
+            self.warned = true;
+            return true;
+        }
+        false
+    }
+}
+
+/// Whether the thread running on `this_cpu` has been marked `Exited` by a
+/// concurrent teardown. Volatile so a spin re-reads it; the writer commits
+/// under the all-locks discipline, and a lagging read only lengthens the
+/// spin by one iteration.
+#[cfg(not(test))]
+fn running_thread_stopped(this_cpu: usize) -> bool
+{
+    // SAFETY: this_cpu < MAX_CPUS; our own CPU's `current` is written only by
+    // this CPU at dispatch, and we are that running thread.
+    unsafe {
+        let cur = scheduler_for(this_cpu).current;
+        !cur.is_null()
+            && core::ptr::read_volatile(core::ptr::addr_of!((*cur).state))
+                == thread::ThreadState::Exited
+    }
+}
+
+/// Phase 1 of [`stop_threads_bound_to`]: under the registry lock, stop every
+/// bound thread not already `Exited`, then prod the CPUs found running one.
+/// Returns whether the running thread on `this_cpu` was among them.
+///
+/// # Safety
+/// As for [`stop_threads_bound_to`].
+#[cfg(not(test))]
+unsafe fn mark_bound_threads(
+    bound: &impl Fn(*mut ThreadControlBlock) -> bool,
+    this_cpu: usize,
+) -> bool
+{
+    let cpu_count = CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
+    let mut self_bound = false;
+    let mut prod = [false; MAX_CPUS];
+    // SAFETY: caller contract (no conflicting locks held); the walk body
+    // takes only locks ordered after the registry lock and never waits
+    // on another CPU.
+    unsafe {
+        thread_registry::for_each(|tcb| {
+            if !bound(tcb) || (*tcb).state == thread::ThreadState::Exited
+            {
+                return;
+            }
+            // Reading our own CPU's `current` needs no lock — only this
+            // CPU writes it at dispatch, and we are that running thread.
+            let is_self = core::ptr::eq(tcb, scheduler_for(this_cpu).current);
+            if (*tcb).state == thread::ThreadState::Blocked
+            {
+                crate::syscall::thread::cancel_ipc_block(tcb);
+            }
+            // Retained reason for `CAP_INFO_THREAD_STATE` and late-bound
+            // observers, written before the Exited commit like every other
+            // exit path. Not posted: kernel-initiated teardown is silent,
+            // as for a thread reaped through its own capability.
+            (*tcb).exit_reason = thread::EXIT_KILLED;
+            let running_on = set_state_under_all_locks(tcb, thread::ThreadState::Exited);
+            if is_self
+            {
+                self_bound = true;
+            }
+            else if let Some(cpu) = running_on
+                && cpu != this_cpu
+            {
+                prod[cpu] = true;
+            }
+        });
+    }
+    for (cpu, hit) in prod.iter().enumerate().take(cpu_count)
+    {
+        if *hit
+        {
+            // SAFETY: cpu < cpu_count.
+            unsafe { prod_remote_cpu(cpu) };
+        }
+    }
+    self_bound
+}
+
+/// Result of one phase-2 pass of [`stop_threads_bound_to`] over every other
+/// CPU's `current`.
+#[cfg(not(test))]
+enum BoundScan
+{
+    /// No other CPU is running a bound thread.
+    Clear,
+    /// A bound, already-`Exited` thread is still `current` somewhere.
+    Waiting,
+    /// A bound thread that is not `Exited` is `current` somewhere: it was
+    /// bound after the last phase-1 walk.
+    Unmarked,
+}
+
+/// One phase-2 pass: read every other CPU's `current` under that CPU's lock.
+///
+/// # Safety
+/// Preemption disabled; no scheduler lock held.
+#[cfg(not(test))]
+unsafe fn scan_bound_current(
+    bound: &impl Fn(*mut ThreadControlBlock) -> bool,
+    this_cpu: usize,
+) -> BoundScan
+{
+    let cpu_count = CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
+    let mut waiting = false;
+    for cpu in 0..cpu_count
+    {
+        if cpu == this_cpu
+        {
+            continue;
+        }
+        // SAFETY: cpu < cpu_count; `current` is stable under its CPU's
+        // lock and cannot be freed while it is current.
+        let (is_bound, unmarked) = unsafe {
+            let s = scheduler_for(cpu);
+            let f = s.lock.lock_raw();
+            let cur = s.current;
+            let r = if !cur.is_null() && bound(cur)
+            {
+                (true, (*cur).state != thread::ThreadState::Exited)
+            }
+            else
+            {
+                (false, false)
+            };
+            s.lock.unlock_raw(f);
+            r
+        };
+        if unmarked
+        {
+            return BoundScan::Unmarked;
+        }
+        waiting |= is_bound;
+    }
+    if waiting
+    {
+        BoundScan::Waiting
+    }
+    else
+    {
+        BoundScan::Clear
+    }
+}
+
 /// Stop every live thread bound to an object under teardown, identified by
 /// `bound`, before the object's storage is reclaimed.
 ///
-/// Phase 1 walks the thread registry under its lock: each bound thread not
-/// already `Exited` has any IPC block cancelled and is marked `Exited` under
-/// the all-locks discipline (draining every run queue); CPUs found running
-/// one are recorded. Phase 2, with the registry released — a CPU spinning
-/// on the registry lock inside `register` cannot deschedule, so it must not
-/// be waited for while the lock is held — prods those CPUs and spins until
-/// no CPU other than this one has a bound thread as `current`. A bound
-/// thread that appears as `current` without being `Exited` (bound after the
-/// walk, through a cap lookup that raced the object's last delete) sends
-/// the loop back to phase 1. Threads stopped here are dead but not freed:
-/// each object lives until its own last capability goes, and
+/// Phase 1 ([`mark_bound_threads`]) walks the thread registry under its
+/// lock: each bound thread not already `Exited` has any IPC block cancelled,
+/// records `EXIT_KILLED` as its retained exit reason, and is marked `Exited`
+/// under the all-locks discipline (draining every run queue); CPUs found
+/// running one are recorded. Phase 2, with the registry released — a CPU
+/// spinning on the registry lock inside `register` cannot deschedule, so it
+/// must not be waited for while the lock is held — prods those CPUs and
+/// spins until no CPU other than this one has a bound thread as `current`.
+/// A bound thread that appears as `current` without being `Exited` (bound
+/// after the walk, through a cap lookup that raced the object's last delete)
+/// sends the loop back to phase 1. Threads stopped here are dead but not
+/// freed: each object lives until its own last capability goes, and
 /// `dealloc_object(Thread)` then runs its full drain on an already-Exited,
 /// off-CPU thread. A stopped server's reply-bound client is released by
 /// that later drain, exactly as for a server stopped by `SYS_THREAD_STOP`.
 ///
-/// Returns `true` if the running thread itself was bound: it is marked
-/// `Exited` and not waited for — the syscall epilogue schedules it away and
-/// its object is reclaimed off-CPU once its last cap goes.
+/// Returns `true` if the running thread has itself been stopped — it was
+/// bound to this object, or a concurrent teardown on another CPU stopped it
+/// while this one waited (two teardowns each bound to the other's object
+/// would otherwise wait on each other forever, both preempt-disabled). In
+/// that case no wait is performed and the caller MUST NOT free the object:
+/// it queues it for off-CPU reclaim (`push_deferred_reclaim`) and returns,
+/// the syscall epilogue schedules this thread away, and the deferred drain
+/// re-enters the teardown from a context that is not a bound thread.
+///
+/// The phase-1 hold is proportional to the number of live threads (one
+/// all-locks transition per bound thread, each `O(CPUs)`), with interrupts
+/// disabled on this CPU throughout. The phase-2 spin has no bound; it warns
+/// once after 100 ms.
 ///
 /// # Safety
 /// The caller must hold no scheduler, IPC-source, or registry lock. `bound`
@@ -2205,50 +2406,12 @@ pub unsafe fn wait_until_off_cpu(tcb: *mut ThreadControlBlock)
 pub unsafe fn stop_threads_bound_to(bound: impl Fn(*mut ThreadControlBlock) -> bool) -> bool
 {
     let this_cpu = crate::arch::current::cpu::current_cpu() as usize;
-    let cpu_count = CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
-    let mut self_bound = false;
 
-    // Phase 1 (repeatable): mark under the registry lock, prod afterwards.
-    let mark_bound = |self_bound: &mut bool| {
-        let mut prod = [false; MAX_CPUS];
-        // SAFETY: caller contract (no conflicting locks held); the walk body
-        // takes only locks ordered after the registry lock and never waits
-        // on another CPU.
-        unsafe {
-            thread_registry::for_each(|tcb| {
-                if !bound(tcb) || (*tcb).state == thread::ThreadState::Exited
-                {
-                    return;
-                }
-                // Reading our own CPU's `current` needs no lock — only this
-                // CPU writes it at dispatch, and we are that running thread.
-                let is_self = core::ptr::eq(tcb, scheduler_for(this_cpu).current);
-                if (*tcb).state == thread::ThreadState::Blocked
-                {
-                    crate::syscall::thread::cancel_ipc_block(tcb);
-                }
-                let running_on = set_state_under_all_locks(tcb, thread::ThreadState::Exited);
-                if is_self
-                {
-                    *self_bound = true;
-                }
-                else if let Some(cpu) = running_on
-                    && cpu != this_cpu
-                {
-                    prod[cpu] = true;
-                }
-            });
-        }
-        for (cpu, hit) in prod.iter().enumerate().take(cpu_count)
-        {
-            if *hit
-            {
-                // SAFETY: cpu < cpu_count.
-                unsafe { prod_remote_cpu(cpu) };
-            }
-        }
-    };
-    mark_bound(&mut self_bound);
+    // SAFETY: caller contract.
+    if unsafe { mark_bound_threads(&bound, this_cpu) }
+    {
+        return true;
+    }
 
     // Phase 2: wait with interrupts enabled and preemption disabled, as the
     // dealloc UAF gate does (see `wait_until_off_cpu`).
@@ -2258,41 +2421,85 @@ pub unsafe fn stop_threads_bound_to(bound: impl Fn(*mut ThreadControlBlock) -> b
     // SAFETY: ring 0; IDT loaded; preempt disabled.
     unsafe { crate::arch::current::interrupts::enable() };
     spin_site_enter(SPIN_SITE_DEALLOC_NOT_CURRENT);
+    let mut warn = SpinWarnOnce::new();
+    let mut stopped = false;
     loop
     {
-        let mut waiting = false;
-        let mut unmarked = false;
-        for cpu in 0..cpu_count
+        if running_thread_stopped(this_cpu)
         {
-            if cpu == this_cpu
-            {
-                continue;
-            }
-            // SAFETY: cpu < cpu_count; `current` is stable under its CPU's
-            // lock and cannot be freed while it is current.
-            unsafe {
-                let s = scheduler_for(cpu);
-                let f = s.lock.lock_raw();
-                let cur = s.current;
-                if !cur.is_null() && bound(cur)
-                {
-                    waiting = true;
-                    if (*cur).state != thread::ThreadState::Exited
-                    {
-                        unmarked = true;
-                    }
-                }
-                s.lock.unlock_raw(f);
-            }
-        }
-        if unmarked
-        {
-            mark_bound(&mut self_bound);
-            continue;
-        }
-        if !waiting
-        {
+            stopped = true;
             break;
+        }
+        // SAFETY: preempt disabled; no scheduler lock held.
+        match unsafe { scan_bound_current(&bound, this_cpu) }
+        {
+            BoundScan::Clear => break,
+            BoundScan::Unmarked =>
+            {
+                // SAFETY: caller contract.
+                if unsafe { mark_bound_threads(&bound, this_cpu) }
+                {
+                    stopped = true;
+                    break;
+                }
+            }
+            BoundScan::Waiting =>
+            {
+                if warn.due()
+                {
+                    crate::kprintln!("kernel: stop_threads_bound_to spin >100ms on cpu {this_cpu}");
+                }
+                core::hint::spin_loop();
+            }
+        }
+    }
+    spin_site_exit();
+    // SAFETY: saved_int from save_and_disable_interrupts above.
+    unsafe { crate::arch::current::cpu::restore_interrupts(saved_int) };
+    crate::percpu::preempt_enable();
+    stopped
+}
+
+/// Wait until no CPU has `aspace` loaded in satp/CR3 — the gate before an
+/// `AddressSpace`'s root page table is freed.
+///
+/// [`stop_threads_bound_to`] returns once no other CPU has a bound thread as
+/// `current`, but a CPU switching away from one clears its `active_cpus` bit
+/// and loads the next root only after that `current` hand-off, outside the
+/// locks (`schedule()`'s address-space switch). Nothing can set a bit anew:
+/// every bound thread is `Exited` and off every run queue, and the dispatch
+/// flip aborts on an `Exited` candidate before the switch. Returns `false`
+/// if the running thread was stopped by a concurrent teardown while waiting
+/// (the caller defers, as for a `true` from `stop_threads_bound_to`).
+///
+/// # Safety
+/// `aspace` must be a valid `AddressSpace` that no thread other than
+/// already-stopped ones is bound to. No scheduler lock may be held.
+#[cfg(not(test))]
+pub unsafe fn wait_until_aspace_inactive(
+    aspace: *const crate::mm::address_space::AddressSpace,
+) -> bool
+{
+    let this_cpu = crate::arch::current::cpu::current_cpu() as usize;
+    crate::percpu::preempt_disable();
+    // SAFETY: ring 0; restored below.
+    let saved_int = unsafe { crate::arch::current::cpu::save_and_disable_interrupts() };
+    // SAFETY: ring 0; IDT loaded; preempt disabled.
+    unsafe { crate::arch::current::interrupts::enable() };
+    spin_site_enter(SPIN_SITE_DEALLOC_AS_ACTIVE);
+    let mut warn = SpinWarnOnce::new();
+    let mut completed = true;
+    // SAFETY: aspace valid per contract; active_cpu_mask is an Acquire snapshot.
+    while !unsafe { (*aspace).active_cpu_mask() }.is_empty()
+    {
+        if running_thread_stopped(this_cpu)
+        {
+            completed = false;
+            break;
+        }
+        if warn.due()
+        {
+            crate::kprintln!("kernel: wait_until_aspace_inactive spin >100ms on cpu {this_cpu}");
         }
         core::hint::spin_loop();
     }
@@ -2300,7 +2507,7 @@ pub unsafe fn stop_threads_bound_to(bound: impl Fn(*mut ThreadControlBlock) -> b
     // SAFETY: saved_int from save_and_disable_interrupts above.
     unsafe { crate::arch::current::cpu::restore_interrupts(saved_int) };
     crate::percpu::preempt_enable();
-    self_bound
+    completed
 }
 
 /// Test stub.

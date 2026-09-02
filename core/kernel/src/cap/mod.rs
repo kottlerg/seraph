@@ -1051,6 +1051,7 @@ pub(crate) unsafe fn boot_retype_aspace(
                 pt_pool_lock: AtomicU64::new(0),
                 pt_pool_head_phys: AtomicU64::new(0),
                 pt_chunks: vacant_chunk_slots(),
+                deferred_next: core::ptr::null_mut(),
             },
         );
     }
@@ -1143,6 +1144,7 @@ pub(crate) unsafe fn boot_retype_cspace(
                 cs_pool_lock: AtomicU64::new(0),
                 cs_pool_head_phys: AtomicU64::new(0),
                 cs_chunks: vacant_chunk_slots(),
+                deferred_next: core::ptr::null_mut(),
             },
         );
     }

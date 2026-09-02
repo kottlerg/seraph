@@ -347,8 +347,11 @@ A process dies when:
 - Its `AddressSpace` capability is revoked (the "kill process" pattern;
   see [`capability-model.md`](capability-model.md) §`"Kill process" pattern`).
 - The last capability to its `CSpace` or `AddressSpace` is deleted: the
-  kernel stops every thread bound to the object before reclaiming it, so
-  the process's threads cannot outlive either.
+  kernel stops every thread bound to the object (retained exit reason
+  `EXIT_KILLED`) before reclaiming it, so the process's threads cannot
+  outlive either. A thread deleting the last capability to its own
+  `CSpace` or `AddressSpace` is stopped by that same delete and never
+  returns from it.
 - An unhandled fault terminates its threads.
 
 ### Exit reason
@@ -363,7 +366,7 @@ a fault or kill reason — defined once in `syscall_abi`:
 | `0` (`EXIT_VOLUNTARY`) | Voluntary, clean | success — `sys_process_exit(0)`, `sys_thread_exit`, `ExitCode::SUCCESS` |
 | `1 ..= 0x0FFF` | Voluntary, code | `sys_process_exit(code)` via `encode_exit_code` (saturating); `std::process::exit(n)` / non-zero `ExitCode` |
 | `0x1000 ..= 0x1FFF` (`EXIT_FAULT_BASE + vector`) | Fault | unhandled CPU/VM fault; kernel-terminated |
-| `0x2000` (`EXIT_KILLED`) | Killed (synthetic) | posted by userspace (`Child::kill`); the kernel never emits it |
+| `0x2000` (`EXIT_KILLED`) | Killed | recorded (never posted) by the kernel as the retained reason of a thread stopped by its `CSpace`/`AddressSpace` teardown; posted by userspace (`Child::kill`) |
 
 `sys_process_exit` records the encoded reason as the calling thread's exit
 reason and posts it to that thread's death observers — a parent that bound the

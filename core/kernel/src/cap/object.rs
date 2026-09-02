@@ -464,7 +464,7 @@ pub struct ThreadObject
     /// that stack — between a thread deleting the last capability to its own
     /// `Thread` object and the off-CPU completion of that free. Null otherwise.
     /// Written only by the owning CPU.
-    pub deferred_next: *mut ThreadObject,
+    pub deferred_next: *mut KernelObjectHeader,
 }
 
 // SAFETY: ThreadObject is accessed only under the scheduler lock.
@@ -540,6 +540,12 @@ pub struct AddressSpaceObject
     /// Records of every retype-source chunk donated to this AS. `dealloc`
     /// walks this array and `retype_free`s each chunk wholesale.
     pub pt_chunks: [PoolChunkSlot; MAX_PT_CHUNKS],
+    /// Intrusive link for the per-CPU deferred reclaim stack
+    /// ([`drain_deferred_reclaim`]). Non-null only while this object sits on
+    /// that stack: the thread that dropped its last capability was itself
+    /// bound to it (or was stopped by a concurrent teardown while freeing
+    /// it), so the free completes off-CPU. Written only by the owning CPU.
+    pub deferred_next: *mut KernelObjectHeader,
 }
 
 // SAFETY: AddressSpaceObject is accessed only with proper locks.
@@ -571,6 +577,9 @@ pub struct CSpaceKernelObject
     pub cs_pool_head_phys: AtomicU64,
     /// Records of every retype-source chunk donated to this `CSpace`.
     pub cs_chunks: [PoolChunkSlot; MAX_PT_CHUNKS],
+    /// Intrusive link for the per-CPU deferred reclaim stack
+    /// ([`drain_deferred_reclaim`]); see `AddressSpaceObject::deferred_next`.
+    pub deferred_next: *mut KernelObjectHeader,
 }
 
 // The wrapper page hosts the CSpaceKernelObject followed by the inline
@@ -675,6 +684,7 @@ impl AddressSpaceObject
             pt_pool_lock: AtomicU64::new(0),
             pt_pool_head_phys: AtomicU64::new(0),
             pt_chunks: vacant_chunk_slots(),
+            deferred_next: core::ptr::null_mut(),
         }
     }
 
@@ -849,6 +859,7 @@ impl CSpaceKernelObject
             cs_pool_lock: AtomicU64::new(0),
             cs_pool_head_phys: AtomicU64::new(0),
             cs_chunks: vacant_chunk_slots(),
+            deferred_next: core::ptr::null_mut(),
         }
     }
 
@@ -1012,12 +1023,13 @@ unsafe impl Sync for WaitSetObject {}
 static SELF_TEARDOWN_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// One-shot diagnostic for the self-teardown path (#341). The first time a
-/// thread deletes the last capability to its own `Thread` object, log its id,
-/// the in-flight userspace instruction pointer, and the syscall number, so the
-/// triggering userspace call site can be symbolised from a burn-in log. Bounded
-/// to a single line so it never floods the boot log under thread churn.
+/// thread deletes the last capability to its own `Thread` object, `CSpace`,
+/// or `AddressSpace` (`what`), log its id, the in-flight userspace
+/// instruction pointer, and the syscall number, so the triggering userspace
+/// call site can be symbolised from a burn-in log. Bounded to a single line
+/// so it never floods the boot log under thread churn.
 #[cfg(not(test))]
-fn log_self_teardown(tcb: *mut crate::sched::thread::ThreadControlBlock)
+fn log_self_teardown(tcb: *mut crate::sched::thread::ThreadControlBlock, what: &str)
 {
     if SELF_TEARDOWN_LOGGED
         .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
@@ -1029,46 +1041,86 @@ fn log_self_teardown(tcb: *mut crate::sched::thread::ThreadControlBlock)
     let (tid, tf) = unsafe { ((*tcb).thread_id, (*tcb).trap_frame) };
     if tf.is_null()
     {
-        crate::kprintln!("sched: self-teardown deferred reclaim: tid={tid} (no trap frame)");
+        crate::kprintln!(
+            "sched: self-teardown deferred reclaim ({what}): tid={tid} (no trap frame)"
+        );
         return;
     }
     // SAFETY: tf non-null; it is the caller's saved userspace frame.
     let (rip, nr) = unsafe { ((*tf).instruction_pointer(), (*tf).syscall_nr()) };
     crate::kprintln!(
-        "sched: self-teardown deferred reclaim: tid={tid} user_rip=0x{rip:x} syscall_nr={nr}"
+        "sched: self-teardown deferred reclaim ({what}): tid={tid} user_rip=0x{rip:x} \
+         syscall_nr={nr}"
     );
 }
 
-/// Push a self-deleted `Thread` object onto its CPU's deferred-reclaim stack.
-///
-/// `dealloc_object`'s drain gate spins until the target TCB is no longer
-/// `current` on any CPU; for a thread freeing its own object on its own CPU
-/// that never holds (preemption is disabled across the spin), so the inline
-/// path would wedge the CPU (#341). The Thread arm of [`dealloc_object_one`]
-/// instead marks the thread `Exited`, drains its run-queue links, and pushes
-/// the object here; the syscall epilogue then `schedule()`s away.
-/// [`drain_deferred_reclaim`] completes the free from a context that is provably
-/// not the dead thread.
+/// The intrusive deferred-reclaim link of an object that may be queued on
+/// the per-CPU deferred-reclaim stack.
 ///
 /// # Safety
-/// `ptr` is an exclusively-owned `ThreadObject` (refcount 0) whose TCB is
-/// already `Exited` and unlinked from every run queue. `cpu` is the local CPU
-/// index (`< MAX_CPUS`) and its scheduler is initialised.
-// cast_ptr_alignment: the `*mut u8` head only ever holds a `*mut ThreadObject`
-// stored by this same function, so it carries ThreadObject's 8-byte alignment.
+/// `ptr` must be a valid `Thread`, `CSpaceObj`, or `AddressSpace` object.
+// cast_ptr_alignment: each concrete object is constructed in place at its own
+// alignment; the header sits at offset 0 of every one.
+#[allow(clippy::cast_ptr_alignment)]
+#[cfg(not(test))]
+unsafe fn deferred_link(ptr: NonNull<KernelObjectHeader>) -> *mut *mut KernelObjectHeader
+{
+    // SAFETY: header at offset 0 of every concrete object; caller contract.
+    unsafe {
+        match (*ptr.as_ptr()).obj_type
+        {
+            ObjectType::Thread =>
+            {
+                core::ptr::addr_of_mut!((*ptr.as_ptr().cast::<ThreadObject>()).deferred_next)
+            }
+            ObjectType::CSpaceObj =>
+            {
+                core::ptr::addr_of_mut!((*ptr.as_ptr().cast::<CSpaceKernelObject>()).deferred_next)
+            }
+            ObjectType::AddressSpace =>
+            {
+                core::ptr::addr_of_mut!((*ptr.as_ptr().cast::<AddressSpaceObject>()).deferred_next)
+            }
+            _ => crate::fatal("deferred reclaim: object type carries no link"),
+        }
+    }
+}
+
+/// Push an object whose free cannot complete on this CPU onto the CPU's
+/// deferred-reclaim stack.
+///
+/// A thread deleting the last capability to its own `Thread` object cannot
+/// run `dealloc_object`'s drain gate, which spins until the target TCB is no
+/// longer `current` on any CPU (#341); a thread deleting the last capability
+/// to its own `CSpace` or `AddressSpace` — directly, or through the cascade
+/// of another object's teardown — cannot free storage it is executing on
+/// (its slot pages, its root page table). In each case the arm marks the
+/// thread `Exited`, pushes the object here, and returns; the syscall
+/// epilogue then `schedule()`s away and [`drain_deferred_reclaim`] completes
+/// the free from a context that is provably not a bound thread.
+///
+/// # Safety
+/// `ptr` is an exclusively-owned `Thread`, `CSpaceObj`, or `AddressSpace`
+/// object (refcount 0). For a `Thread`, its TCB is already `Exited` and
+/// unlinked from every run queue. `cpu` is the local CPU index
+/// (`< MAX_CPUS`) and its scheduler is initialised.
+// cast_ptr_alignment: the `*mut u8` head only ever holds an object pointer
+// stored by this function (header at offset 0, 8-byte aligned).
 #[allow(clippy::cast_ptr_alignment)]
 #[cfg(not(test))]
 unsafe fn push_deferred_reclaim(cpu: usize, ptr: NonNull<KernelObjectHeader>)
 {
-    let node = ptr.as_ptr().cast::<ThreadObject>();
+    let node = ptr.as_ptr();
     // SAFETY: cpu < MAX_CPUS; scheduler initialised by sched::init.
     let sched = unsafe { crate::sched::scheduler_for(cpu) };
     let slot = &sched.deferred_reclaim_head;
+    // SAFETY: ptr is a valid object of a linkable type per contract.
+    let link = unsafe { deferred_link(ptr) };
     loop
     {
         let head = slot.load(Ordering::Acquire);
         // SAFETY: node is exclusively owned (refcount 0); the link field is ours.
-        unsafe { (*node).deferred_next = head.cast::<ThreadObject>() };
+        unsafe { *link = head.cast::<KernelObjectHeader>() };
         if slot
             .compare_exchange(head, node.cast::<u8>(), Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
@@ -1078,20 +1130,26 @@ unsafe fn push_deferred_reclaim(cpu: usize, ptr: NonNull<KernelObjectHeader>)
     }
 }
 
-/// Drain this CPU's deferred self-teardown reclaim stack, completing the free
-/// of each queued `Thread` object (TCB, kstack, retype slot, ancestor cascade).
+/// Drain this CPU's deferred reclaim stack, completing the free of each
+/// queued object (a `Thread`'s TCB, kstack, retype slot, and ancestor
+/// cascade; a `CSpace`'s or `AddressSpace`'s bound-thread stop, drain, and
+/// storage).
 ///
 /// Called from the syscall epilogue (when the returning thread is alive) and
-/// the idle loop — both contexts that are NOT one of the queued dead threads,
-/// so re-entering `dealloc_object` runs the normal Thread arm whose
-/// `current`-anywhere scan and `context_saved` gate pass on the first iteration.
+/// the idle loop — both contexts that are NOT one of the queued dead threads
+/// and are bound to none of the queued objects, so re-entering
+/// `dealloc_object` runs the normal arm: the Thread arm's `current`-anywhere
+/// scan and `context_saved` gate pass on the first iteration, and the
+/// `CSpace`/`AddressSpace` arms find their bound threads already `Exited`
+/// and off-CPU.
 ///
 /// # Safety
-/// Must not run on a thread whose own object is queued here; the producer
-/// contract guarantees this — a self-deleting thread reaches the Exited arm of
-/// the syscall epilogue and `schedule()`s away, never the drain arm.
-// cast_ptr_alignment: the `*mut u8` head only ever holds a `*mut ThreadObject`
-// (see push_deferred_reclaim), so it carries ThreadObject's 8-byte alignment.
+/// Must not run on a thread whose own object is queued here, or that is
+/// bound to a queued object; the producer contract guarantees this — a
+/// thread that queued an object here is `Exited`, reaches the Exited arm of
+/// the syscall epilogue, and `schedule()`s away, never the drain arm.
+// cast_ptr_alignment: the `*mut u8` head only ever holds an object pointer
+// stored by push_deferred_reclaim (header at offset 0, 8-byte aligned).
 #[allow(clippy::cast_ptr_alignment)]
 #[cfg(not(test))]
 pub unsafe fn drain_deferred_reclaim(cpu: usize)
@@ -1114,17 +1172,38 @@ pub unsafe fn drain_deferred_reclaim(cpu: usize)
     let mut node = sched
         .deferred_reclaim_head
         .swap(core::ptr::null_mut(), Ordering::AcqRel)
-        .cast::<ThreadObject>();
+        .cast::<KernelObjectHeader>();
     while !node.is_null()
     {
-        // SAFETY: node is an exclusively-owned, Exited, off-CPU ThreadObject
-        // pushed by push_deferred_reclaim; the link field is stable until freed.
-        let next = unsafe { (*node).deferred_next };
-        // SAFETY: refcount 0, exclusive ownership; re-enters the Thread arm with
-        // is_self false (the thread is off-CPU), running the full free path.
-        unsafe { dealloc_object(NonNull::new_unchecked(node.cast::<KernelObjectHeader>())) };
+        // SAFETY: node is an exclusively-owned object pushed by
+        // push_deferred_reclaim; the link field is stable until freed.
+        let nn = unsafe { NonNull::new_unchecked(node) };
+        // SAFETY: nn is a linkable object pushed by push_deferred_reclaim.
+        let next = unsafe { *deferred_link(nn) };
+        // SAFETY: refcount 0, exclusive ownership; re-enters the object's arm
+        // from a context bound to nothing queued here, running the full free.
+        unsafe { dealloc_object(nn) };
         node = next;
     }
+}
+
+/// Queue `ptr` for off-CPU reclaim because the running thread has been
+/// stopped (it is bound to the object, or a concurrent teardown stopped it
+/// while this free waited); log the first occurrence.
+#[cfg(not(test))]
+fn defer_self_teardown(ptr: NonNull<KernelObjectHeader>, what: &str)
+{
+    let this_cpu = crate::arch::current::cpu::current_cpu() as usize;
+    // SAFETY: this_cpu < MAX_CPUS; our own CPU's `current` is written only
+    // by this CPU at dispatch, and we are that running thread.
+    let cur = unsafe { crate::sched::scheduler_for(this_cpu).current };
+    if !cur.is_null()
+    {
+        log_self_teardown(cur, what);
+    }
+    // SAFETY: object exclusively owned (refcount 0) and of a linkable type;
+    // queued for off-CPU reclaim on this CPU.
+    unsafe { push_deferred_reclaim(this_cpu, ptr) };
 }
 
 /// Free a kernel object whose reference count has just reached zero.
@@ -1136,8 +1215,9 @@ pub unsafe fn drain_deferred_reclaim(cpu: usize)
 ///
 /// - `ptr` must be a valid, non-null pointer originally produced by
 ///   `Box::into_raw` (cast to `*mut KernelObjectHeader`).
-/// - The object's reference count must be 0; no other capability slot may
-///   reference it.
+/// - No capability slot may reference the object: its reference count is 0,
+///   or it is a fresh body that was never published (a range split's
+///   rollback frees such bodies at their initial count of 1).
 /// - Must NOT be called with `DERIVATION_LOCK` held, since freeing complex
 ///   objects (Thread, `AddressSpace`) may acquire the frame-allocator lock.
 ///
@@ -1483,7 +1563,7 @@ unsafe fn dealloc_object_one(
                 });
                 if is_self
                 {
-                    log_self_teardown(tcb);
+                    log_self_teardown(tcb, "Thread");
                     // Defensive net. For SYS_CAP_DELETE this is unreachable —
                     // sys_cap_delete refuses a self thread-cap delete before the
                     // dec-ref. It still guards any OTHER dealloc of the running
@@ -2000,13 +2080,11 @@ unsafe fn dealloc_object_one(
                 // is reclaimed wholesale by `retype_free` below as part of
                 // the same slot release, so no separate free is needed.
 
-                // Remove the TCB from the diagnostic live-thread registry
-                // before poisoning/freeing it. The registry walk
-                // (`thread_registry::try_for_each`) holds the registry lock
-                // across every dereference, so unlinking strictly before the
-                // free guarantees the watchdog never observes a dangling node.
-                // A no-op for a TCB that was never registered (e.g. a
-                // never-started thread torn down before its cap was inserted).
+                // Remove the TCB from the live-thread registry before
+                // poisoning/freeing it. Both registry walks hold the registry
+                // lock across every dereference, so unlinking strictly before
+                // the free guarantees neither the watchdog nor an object
+                // teardown observes a dangling node.
                 // SAFETY: tcb valid (not yet freed); leaf lock, nothing else held.
                 unsafe { crate::sched::thread_registry::unregister(tcb) };
 
@@ -2081,17 +2159,26 @@ unsafe fn dealloc_object_one(
                 // this address space is marked Exited and waited off-CPU
                 // before its root page table is freed, so no CPU can run in
                 // it afterwards. Objects of the stopped threads are freed
-                // when their own last caps go.
+                // when their own last caps go. If the running thread is
+                // itself stopped — bound here, or by a concurrent teardown
+                // — the free is deferred off-CPU (see push_deferred_reclaim).
                 // SAFETY: as_ptr uniquely owned (refcount 0); no scheduler,
                 // IPC, or registry lock is held here.
-                unsafe {
+                let stopped = unsafe {
                     crate::sched::stop_threads_bound_to(|tcb| {
                         core::ptr::eq((*tcb).address_space, as_ptr)
-                    });
+                    })
+                };
+                // SAFETY: as_ptr valid; every bound thread is Exited and
+                // off every run queue; no scheduler lock held.
+                if stopped || !unsafe { crate::sched::wait_until_aspace_inactive(as_ptr) }
+                {
+                    defer_self_teardown(ptr, "AddressSpace");
+                    return;
                 }
 
-                // No CPU should still have this address space loaded in
-                // satp/CR3 when we free its root page table.
+                // No CPU still has this address space loaded in satp/CR3
+                // (waited for above), so the root page table can go.
                 debug_assert!(
                     // SAFETY: as_ptr non-null; active_cpu_mask is an Acquire snapshot.
                     unsafe { (*as_ptr).active_cpu_mask() }.is_empty(),
@@ -2217,13 +2304,20 @@ unsafe fn dealloc_object_one(
                 // be mid-syscall against these slot pages when they are
                 // freed, and none can wire derivation links during the drain.
                 // Their objects are freed when their own last caps go — in
-                // the dec_ref cascade below if those caps live here. The
-                // running thread destroying its own CSpace is marked Exited
-                // and continues; the syscall epilogue schedules it away.
+                // the dec_ref cascade below if those caps live here. If the
+                // running thread is itself stopped — it is destroying its
+                // own CSpace, or a concurrent teardown stopped it — nothing
+                // is freed now: the object is queued for off-CPU reclaim
+                // and the syscall epilogue schedules the thread away.
                 // SAFETY: cs_ptr uniquely owned (refcount 0); no scheduler,
                 // IPC, or registry lock is held here.
-                unsafe {
-                    crate::sched::stop_threads_bound_to(|tcb| core::ptr::eq((*tcb).cspace, cs_ptr));
+                let stopped = unsafe {
+                    crate::sched::stop_threads_bound_to(|tcb| core::ptr::eq((*tcb).cspace, cs_ptr))
+                };
+                if stopped
+                {
+                    defer_self_teardown(ptr, "CSpace");
+                    return;
                 }
 
                 // SAFETY: cs_ptr non-null; allocated at creation.
@@ -2981,10 +3075,10 @@ mod tests
         // PoolChunkSlot: 8 ancestor + 8 base_offset + 8 page_count = 24 B.
         assert_eq!(size_of::<PoolChunkSlot>(), 24);
         // AddressSpaceObject: 16 header + 8 ptr + 8 budget + 8 lock + 8 head
-        // + 16 * 24 chunks = 432 B.
-        assert_eq!(size_of::<AddressSpaceObject>(), 48 + 24 * MAX_PT_CHUNKS);
+        // + 16 * 24 chunks + 8 deferred link = 440 B.
+        assert_eq!(size_of::<AddressSpaceObject>(), 56 + 24 * MAX_PT_CHUNKS);
         // CSpaceKernelObject: same shape.
-        assert_eq!(size_of::<CSpaceKernelObject>(), 48 + 24 * MAX_PT_CHUNKS);
+        assert_eq!(size_of::<CSpaceKernelObject>(), 56 + 24 * MAX_PT_CHUNKS);
     }
 
     #[test]

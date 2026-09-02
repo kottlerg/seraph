@@ -442,6 +442,10 @@ A `CSpace` reaching refcount zero first stops every thread bound to it
 marked `Exited` and waited off every CPU before any slot page is freed, so no
 thread can be mid-syscall against the dying directory, and none of the dying
 process's own threads can touch the derivation forest during the drain below.
+If the thread running the teardown is itself stopped — it deleted the last
+capability to its own `CSpace`, or a concurrent teardown stopped it — nothing
+below runs now: the object is queued for off-CPU reclaim and the whole arm
+re-runs from the deferred drain once the thread has been scheduled away.
 The same discipline applies to an `AddressSpace` reaching refcount zero.
 
 Every derivation link reachable from a live slot resolves: before a `CSpace`
@@ -455,8 +459,8 @@ foreign traversal in a window between batches sees ordinary consistent
 nodes. The one remaining source of a dead link is a foreign sender whose
 capability transfer into the dying CSpace had already committed to a
 receiver there before that receiver was stopped, wiring a link into a slot
-the drain cursor has passed. A link
-that fails to resolve — that race, or genuine corruption — is contained
+the drain cursor has passed. A link that fails to resolve — that race, or
+genuine corruption — is contained
 wherever a walk meets it, always by truncation: the revoke walk cuts the
 chain hanging from the dead link, logs it, and the syscall returns
 `InvalidState` instead of reporting a clean revoke; the reparent walk that

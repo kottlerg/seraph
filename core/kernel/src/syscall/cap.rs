@@ -473,6 +473,7 @@ pub fn sys_cap_create_aspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 pt_pool_lock: AtomicU64::new(0),
                 pt_pool_head_phys: AtomicU64::new(0),
                 pt_chunks: vacant_chunk_slots(),
+                deferred_next: core::ptr::null_mut(),
             },
         );
     }
@@ -697,6 +698,7 @@ pub fn sys_cap_create_cspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 cs_pool_lock: AtomicU64::new(0),
                 cs_pool_head_phys: AtomicU64::new(0),
                 cs_chunks: vacant_chunk_slots(),
+                deferred_next: core::ptr::null_mut(),
             },
         );
     }
@@ -1055,6 +1057,10 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 deferred_next: core::ptr::null_mut(),
             },
         );
+        // Register before the cap becomes visible: the TCB already names its
+        // CSpace and AddressSpace, and the teardown of either must find it
+        // (`sched::stop_threads_bound_to`). The rollback arm unregisters.
+        crate::sched::thread_registry::register(tcb_ptr);
     }
 
     // SAFETY: ancestor is the MemoryObject's header at offset 0; this lease
@@ -1077,28 +1083,21 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     {
         Ok(idx) =>
         {
-            // Thread the new TCB onto the diagnostic live-thread registry now
-            // that its cap is visible and the construction has committed.
-            // Registering only on the success path keeps it symmetric with the
-            // unregister in `dealloc_object(Thread)`: the rollback arm below
-            // frees the TCB via `retype_free` without ever registering it. The
-            // thread is still `Created` (not startable until
-            // SYS_THREAD_START), so it cannot become a Blocked watchdog victim
-            // before this point.
-            // SAFETY: tcb_ptr is the just-constructed, not-yet-registered TCB.
-            unsafe { crate::sched::thread_registry::register(tcb_ptr) };
             let _ = kstack_virt;
             Ok(u64::from(idx))
         }
         Err(e) =>
         {
             // The cap never reached visibility, so no scheduler queue can hold
-            // this TCB and no IPC object has a back-pointer to it. Drop both
-            // in-place objects, return the slot bytes (all 5 pages) to the
-            // ancestor cap, and undo the lease bump.
-            // SAFETY: tcb and wrapper were just constructed in place above and
-            // have not been observed by any other thread.
+            // this TCB and no IPC object has a back-pointer to it. Unlink it
+            // from the registry (an object teardown walking it meanwhile saw
+            // a `Created` thread and marked it `Exited`, which is harmless
+            // here), drop both in-place objects, return the slot bytes (all
+            // 5 pages) to the ancestor cap, and undo the lease bump.
+            // SAFETY: tcb and wrapper were just constructed in place above;
+            // the registry is the only structure that has observed the TCB.
             unsafe {
+                crate::sched::thread_registry::unregister(tcb_ptr);
                 core::ptr::drop_in_place(tcb_ptr);
                 core::ptr::drop_in_place(thread_obj_ptr);
             }

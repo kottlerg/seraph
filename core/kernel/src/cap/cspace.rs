@@ -1052,7 +1052,7 @@ mod tests
     #[test]
     fn growth_across_l2_boundary()
     {
-        // Allocate L2_SIZE - 1 slots (page 0 has 63 usable slots after skipping 0).
+        // Allocate L2_SIZE - 1 slots (page 0 has 55 usable slots after skipping 0).
         let mut cs = CSpace::new(0);
         let mut indices = Vec::new();
         for _ in 0..(L2_SIZE - 1)

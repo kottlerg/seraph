@@ -136,6 +136,10 @@ pub fn run_all(ctx: &TestContext)
         "cap::cspace_delete_stops_bound_thread",
         cap::cspace_delete_stops_bound_thread(ctx)
     );
+    run_test!(
+        "cap::cspace_self_delete_stops_caller",
+        cap::cspace_self_delete_stops_caller(ctx)
+    );
 
     // ── Capability inspection (SYS_CAP_INFO) ──────────────────────────────────
     run_test!(
@@ -221,6 +225,10 @@ pub fn run_all(ctx: &TestContext)
     run_test!(
         "retype::aspace_delete_stops_bound_thread",
         retype::aspace_delete_stops_bound_thread(ctx)
+    );
+    run_test!(
+        "retype::aspace_self_delete_stops_caller",
+        retype::aspace_self_delete_stops_caller(ctx)
     );
     run_test!(
         "retype::cspace_pool_exhaust_then_augment",

@@ -609,8 +609,11 @@ from the run queues. The kernel never terminates threads by policy of its own;
 the one thing it enforces is that a thread cannot outlive the `CSpace` or
 `AddressSpace` it is bound to: when the last capability to either object is
 deleted, every thread bound to it is stopped before the object's storage is
-reclaimed, wherever those threads' own capabilities are held. The process's
-resources are reclaimed as their capability reference counts reach zero.
+reclaimed, wherever those threads' own capabilities are held — including the
+deleting thread itself, when it holds that last capability to its own
+`CSpace` or `AddressSpace` (the delete then never returns to it). The
+process's resources are reclaimed as their capability reference counts reach
+zero.
 
 The kernel's only role in death is *notification*. An `AddressSpace` carries a
 death-observer set (mirroring the per-thread death observers). On a terminal

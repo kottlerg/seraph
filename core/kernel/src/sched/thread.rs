@@ -641,10 +641,10 @@ pub struct ThreadControlBlock
     /// Exit reason recorded by the kernel at the moment this thread became
     /// `Exited`. Written by `sys_thread_exit` (clean exit, value `0`), by
     /// `sys_process_exit` (`encode_exit_code(arg0)`, a voluntary code in
-    /// `[0, EXIT_FAULT_BASE)`), and by the architecture fault handlers (value
+    /// `[0, EXIT_FAULT_BASE)`), by the architecture fault handlers (value
     /// `EXIT_FAULT_BASE + vector`) before they call `post_death_notification`,
-    /// under the all-CPU scheduler locks held by the matching
-    /// `set_state_under_all_locks` transition. Read out-of-band by `sys_cap_info`'s
+    /// and by object teardown (`EXIT_KILLED`, not posted), in every case
+    /// before the matching `set_state_under_all_locks` transition. Read out-of-band by `sys_cap_info`'s
     /// `CAP_INFO_THREAD_STATE` selector so userspace process managers can
     /// answer "did this thread die, and with what reason?" without racing
     /// the userspace death-event drain.
@@ -679,6 +679,11 @@ pub struct ThreadControlBlock
 
 /// Expected value of `ThreadControlBlock::magic` for a live TCB.
 pub const TCB_MAGIC: u64 = 0xDEAD_BEEF_CAFE_F00D;
+
+/// Retained exit reason of a thread stopped by the teardown of its `CSpace`
+/// or `AddressSpace` (`sched::stop_threads_bound_to`). Recorded, never
+/// posted. Matches `syscall_abi::EXIT_KILLED`.
+pub const EXIT_KILLED: u64 = 0x2000;
 
 // SAFETY: TCB pointers are only accessed under the scheduler lock.
 unsafe impl Send for ThreadControlBlock {}

@@ -99,3 +99,52 @@ pub fn configure_and_start_pinned(
     thread_start(child.th).map_err(|_| "spawn::configure_and_start_pinned: thread_start failed")?;
     Ok(())
 }
+
+/// Poll `thread` (a Thread cap with OBSERVE) at 1 ms intervals until it
+/// reports `Exited`; returns its retained exit reason. Fails after
+/// `max_polls` polls.
+pub fn wait_until_exited(thread: u32, max_polls: u32) -> Result<u64, &'static str>
+{
+    let mut polls = 0;
+    loop
+    {
+        let packed = syscall::cap_info(thread, syscall_abi::CAP_INFO_THREAD_STATE)
+            .map_err(|_| "spawn::wait_until_exited: cap_info(THREAD_STATE) failed")?;
+        // cast_possible_truncation: 8-bit state in the high word, 32-bit reason low.
+        #[allow(clippy::cast_possible_truncation)]
+        if (packed >> 32) as u32 == syscall_abi::THREAD_STATE_EXITED
+        {
+            return Ok(packed & 0xFFFF_FFFF);
+        }
+        polls += 1;
+        if polls >= max_polls
+        {
+            return Err("spawn::wait_until_exited: thread never reached Exited");
+        }
+        syscall::thread_sleep(1).ok();
+    }
+}
+
+/// Poll `memory`'s `MEMORY_AVAILABLE` at 1 ms intervals until it returns to
+/// `baseline` — for objects whose free is deferred off-CPU (a thread that
+/// destroyed its own `CSpace` or `AddressSpace`). Fails after `max_polls`.
+pub fn wait_memory_baseline(memory: u32, baseline: u64, max_polls: u32)
+-> Result<(), &'static str>
+{
+    let mut polls = 0;
+    loop
+    {
+        let now = syscall::cap_info(memory, syscall_abi::CAP_INFO_MEMORY_AVAILABLE)
+            .map_err(|_| "spawn::wait_memory_baseline: cap_info(MEMORY_AVAILABLE) failed")?;
+        if now == baseline
+        {
+            return Ok(());
+        }
+        polls += 1;
+        if polls >= max_polls
+        {
+            return Err("spawn::wait_memory_baseline: memory did not return to baseline");
+        }
+        syscall::thread_sleep(1).ok();
+    }
+}

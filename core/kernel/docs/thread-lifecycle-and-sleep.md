@@ -107,7 +107,7 @@ This table is the authoritative per-transition rule set for the lifecycle syscal
 | arch fault handler (page fault, GP fault, etc.) | `*` | `Exited` | trapping CPU = current CPU | Same as `sys_exit`. |
 | `dealloc_object(Thread)` (caller ≠ tcb) | `*` | `Exited` | calling CPU (refcount → 0) | Acquires every CPU's scheduler.lock in ascending order, writes `state = Exited`, walks `remove_from_queue` for every CPU, releases all. After release: unconditionally scans every CPU until none has `sched.current == tcb`, then unconditionally on `tcb.context_saved == 1`, then proceeds to source-IPC unlink + free. See Drain Protocol below. |
 | `dealloc_object(Thread)` (caller == tcb, self-teardown) | `Running` | `Exited` | calling CPU = running CPU | A thread deleting the last capability to its own `Thread` object cannot run the post-release scan (its CPU's `current == tcb` never clears from within the spin). Marks Exited + drains run queues only, queues the object on this CPU's deferred-reclaim stack, and returns; the syscall epilogue reschedules and the free completes off-CPU. See [Self-teardown](#self-teardown-the-caller-is-the-freed-thread) below. |
-| `dealloc_object(CSpace)` / `dealloc_object(AddressSpace)` — bound-thread stop (`stop_threads_bound_to`) | `*` | `Exited` | calling CPU (object refcount → 0) | For every registered thread bound to the dying object: `cancel_ipc_block` if `Blocked`, then `set_state_under_all_locks(tcb, Exited)`; running CPUs are prodded after the registry lock is released and the caller spins until no other CPU has a bound thread as `current`. The thread is stopped, not freed: its object waits for its own last cap. The caller's own thread, if bound, is marked `Exited` and continues to the epilogue. See docs/scheduling-internals.md § Thread Registry. |
+| `dealloc_object(CSpaceObj)` / `dealloc_object(AddressSpace)` — bound-thread stop (`stop_threads_bound_to`) | `*` | `Exited` | calling CPU (object refcount → 0) | For every registered thread bound to the dying object: `cancel_ipc_block` if `Blocked`, `exit_reason = EXIT_KILLED`, then `set_state_under_all_locks(tcb, Exited)`; running CPUs are prodded after the registry lock is released and the caller spins until no other CPU has a bound thread as `current` (and, for an `AddressSpace`, until `active_cpus` is empty). The thread is stopped, not freed: its object waits for its own last cap. If the caller's own thread is stopped — bound here, or by a concurrent teardown — nothing is freed: the object goes onto this CPU's deferred-reclaim stack (as in the self-teardown row) and the epilogue schedules the thread away. See docs/scheduling-internals.md § Thread Registry. |
 
 **Why the all-CPU lock acquire in `dealloc_object(Thread)`:**
 
@@ -225,6 +225,10 @@ that CPU (#341).
   self check is false and steps 5-17 run normally: step 9's scan finds no CPU
   running `tcb` on the first pass and step 10's `context_saved` gate is already
   satisfied. Any server-side reply-bound client (steps 5/8/11) is woken here.
+
+The same stack carries `CSpace` and `AddressSpace` objects whose teardown
+found the running thread itself stopped (see docs/scheduling-internals.md
+§ Thread Registry); the drain re-enters their arms the same way.
 
 The drain runs only from contexts that are provably not one of the queued dead
 threads (a live thread's syscall return, or the idle thread), so it can never

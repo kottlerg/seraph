@@ -796,7 +796,8 @@ const _: () = assert!(MAP_EXECUTABLE == RIGHTS_MEM_EXECUTE);
 //   | `1 ..= 0x0FFF`    | Voluntary, code     | `SYS_PROCESS_EXIT(code)`, where   |
 //   |                   |                     | reason == `encode_exit_code(code)`|
 //   | `0x1000 ..0x2000` | Fault               | `EXIT_FAULT_BASE + vector/cause`  |
-//   | `0x2000`          | Killed (synthetic)  | `EXIT_KILLED`; never kernel-emitted|
+//   | `0x2000`          | Killed              | `EXIT_KILLED`: recorded by object   |
+//   |                   |                     | teardown, posted by userspace kill |
 //
 // This is a Seraph-native encoding, not POSIX: exit codes are not 8-bit
 // `WEXITSTATUS`-truncated, and faults are native fault classes, not signals.
@@ -811,11 +812,14 @@ pub const EXIT_VOLUNTARY: u64 = 0;
 /// alias.
 pub const EXIT_FAULT_BASE: u64 = 0x1000;
 
-/// Synthetic exit reason for a process killed by its supervisor (address-space
-/// cap revoked). Posted by userspace (e.g. `std::process::Child::kill`) so a
-/// waiter observes a defined status; the kernel never records this value — a
-/// revoke-driven teardown is silent on the kernel side. Sits just above the
-/// fault range so consumers tell a user-initiated kill from a hardware fault.
+/// Exit reason of a thread killed rather than exited or faulted. The kernel
+/// records it (readable via `CAP_INFO_THREAD_STATE`, and delivered to an
+/// observer bound afterwards) as the retained reason of every thread it stops
+/// when the last capability to the thread's `CSpace` or `AddressSpace` goes;
+/// it never posts it — a teardown-driven kill is silent on the kernel side.
+/// Userspace posts the same value (e.g. `std::process::Child::kill`) so a
+/// waiter observes a defined status. Sits just above the fault range so
+/// consumers tell a kill from a hardware fault.
 pub const EXIT_KILLED: u64 = 0x2000;
 
 /// Encode a voluntary process exit `code` into the flat exit-reason space.

@@ -71,10 +71,14 @@ blocks and writing `Exited` under the all-locks discipline, so the registry
 lock sits above those in the hierarchy — the only edge it adds, and one no
 path traverses in reverse. It must not be held while waiting for another CPU
 to make progress (a CPU spinning on it inside `register` cannot deschedule):
-the teardown walk marks under the lock and waits after releasing it. The
-softlockup watchdog walks the registry via `try_for_each` (a non-blocking
-`try_lock`, so a contended or CPU-died lock degrades to a skipped section
-rather than a hang). See § Thread Registry.
+the teardown walk marks under the lock and waits after releasing it. The hold
+is interrupts-off on the walking CPU for the whole walk — every live thread
+is visited, and each bound one costs an all-CPU-locks transition — so its
+length is proportional to live threads plus bound threads × CPUs; thread
+creation on other CPUs stalls on the lock meanwhile. The softlockup watchdog
+walks the registry via `try_for_each` (a non-blocking `try_lock`, so a
+contended or CPU-died lock degrades to a skipped section rather than a
+hang). See § Thread Registry.
 
 4. **Per-TCB-then-cross-CPU acquisition rule.** A path mutating a TCB's Scheduling field group MUST acquire `(*tcb).sched_lock` FIRST (outermost among the scheduler locks), THEN any per-CPU scheduler.lock(s); when two or more per-CPU scheduler.locks are needed simultaneously, they MUST be taken in ascending-CPU order. Live production sites: `sched::migrate_ready_thread` (used by `sys_thread_set_affinity` active migration and the periodic load balancer; `(*tcb).sched_lock` then the two CPU locks ascending), `dealloc_object(Thread)` (`(*tcb).sched_lock` then the all-CPU walk in ascending order), `sched::set_state_under_all_locks` (lifecycle state writes; same shape), and `sys_thread_set_priority` (priority write under `(*tcb).sched_lock`, then locate-and-relocate of the Ready TCB's queue entry via `sched::relocate_ready_priority`, which locks the single `preferred_cpu`-hinted CPU's run-queue on a hint hit and only on a miss falls back to the all-CPU walk in ascending order). A path MUST NEVER hold two different TCBs' `sched_lock`s at once — `schedule()`'s outgoing-then-incoming flip releases `current.sched_lock` before acquiring `next.sched_lock`.
 
@@ -731,7 +735,8 @@ Each per-CPU dump line carries a **spin-site breadcrumb**: a wedged CPU that
 never returned to the scheduler is stuck in a protocol-spin, and the
 breadcrumb (`spin_site_enter`/`spin_site_exit`, set around each gate) names
 which one — `dealloc:not-current`, `dealloc:context-saved`,
-`dealloc:wake-in-flight`, or `schedule:context-saved`. The
+`dealloc:wake-in-flight`, `dealloc:as-active`, or `schedule:context-saved`.
+The
 `dealloc_object(Thread)` gates carried no overlong-duration warning of their
 own, so a wedge there showed only an opaque `current = Exited` in
 `SYS_CAP_DELETE` (#351); the breadcrumb makes it explicit. The `schedule()`
@@ -806,41 +811,76 @@ softlockup watchdog, which enumerates `Blocked` waiters that the per-CPU
 to a dying `CSpace` or `AddressSpace`.
 
 **Membership.** `register` splices a TCB onto the head; `unregister` removes it.
-A thread is registered on the success path of `sys_cap_create_thread` (after its
-cap is inserted — the rollback arm frees the TCB via `retype_free` without ever
-registering it, so register-on-success keeps the two symmetric) and on
-init's bootstrap thread. It is unregistered in the `dealloc_object(Thread)` arm
-strictly before the TCB is poisoned/freed: the walk holds `THREAD_REGISTRY_LOCK`
-across every dereference, so unlinking before the free guarantees the watchdog
-never observes a dangling node. Idle TCBs are deliberately not registered — they
-are never `Blocked` and are already shown by the per-CPU `current` dump.
+A thread is registered in `sys_cap_create_thread` as soon as its TCB is
+constructed — before its capability is inserted, because the TCB already names
+its `CSpace` and `AddressSpace` and a teardown of either must find it (the
+rollback arm unregisters before freeing the TCB) — and on init's bootstrap
+thread. It is unregistered in the `dealloc_object(Thread)` arm strictly before
+the TCB is poisoned/freed: both walks hold `THREAD_REGISTRY_LOCK` across every
+dereference, so unlinking before the free guarantees neither observes a
+dangling node. Idle TCBs are deliberately not registered — they are never
+`Blocked`, bound to no object, and already shown by the per-CPU `current` dump.
 
 **Walk.** `try_for_each` takes the lock with a non-blocking `try_lock`: if it is
 contended (a register/unregister in flight) or a CPU died holding it, the walk is
 skipped rather than spun on — the watchdog must never block. `for_each` blocks
-on the lock: teardown must not skip a thread. A `MAX_WALK` bound caps a
-corrupted-into-a-cycle list so either walk still terminates.
+on the lock and visits every node: teardown must not skip a thread. Neither
+walk is length-bounded; a list corrupted into a cycle is detected by a
+tortoise-and-hare probe — the watchdog walk simply stops there, the teardown
+walk halts the kernel (`fatal`), since a thread it cannot reach could still be
+running on the object being freed.
 
 **Object teardown (`stop_threads_bound_to`).** Deleting the last capability to
 a `CSpace` or `AddressSpace` must not free storage a bound thread is still using,
 so `dealloc_object` for either type first stops every thread bound to it. Phase
-1 walks the registry under its lock — a TCB found there cannot be unregistered,
-and so cannot be freed, until the walk ends — and for each bound thread not
-already `Exited`: cancels its IPC block if `Blocked` (`cancel_ipc_block`, the
-`sys_thread_stop` primitive), writes `Exited` under the all-locks discipline
-(`set_state_under_all_locks`, draining every run queue), and records the CPU it
-was running on. Phase 2, after releasing the registry lock, prods those CPUs and
-spins — interrupts enabled, preemption disabled, as the dealloc UAF gate does —
-until no CPU other than the caller's has a bound thread as `current`. A bound
-thread found `current` but not `Exited` was bound after the walk (a
-`sys_cap_create_thread` whose unlocked cap lookup raced the object's last
-delete); the loop returns to phase 1 for it. The caller's own thread, if bound,
-is marked `Exited` and not waited for: it finishes the teardown, touches the
-object no further, and the syscall epilogue schedules it away. Stopped threads
-are dead but not freed — each Thread object lives until its own last capability
-goes, and `dealloc_object(Thread)` then runs its full drain protocol on an
-already-`Exited`, off-CPU thread (the off-CPU wait itself is the shared
-`wait_until_off_cpu`).
+1 (`mark_bound_threads`) walks the registry under its lock — a TCB found there
+cannot be unregistered, and so cannot be freed, until the walk ends — and for
+each bound thread not already `Exited`: cancels its IPC block if `Blocked`
+(`cancel_ipc_block`, the `sys_thread_stop` primitive), records `EXIT_KILLED` as
+its retained exit reason (not posted: kernel-initiated teardown is silent, as
+for a thread reaped through its own capability), writes `Exited` under the
+all-locks discipline (`set_state_under_all_locks`, draining every run queue),
+and records the CPU it was running on. Phase 2, after releasing the registry
+lock, prods those CPUs and spins — interrupts enabled, preemption disabled, as
+the dealloc UAF gate does — until no CPU other than the caller's has a bound
+thread as `current`. A bound thread found `current` but not `Exited` was bound
+after the walk (a `sys_cap_create_thread` whose unlocked cap lookup raced the
+object's last delete); the loop returns to phase 1 for it. The spin has no
+bound and warns once after 100 ms.
+
+*The caller is itself stopped.* `stop_threads_bound_to` returns `true`, and
+skips the wait, when the running thread has been marked `Exited`: it was bound
+to the object (it deleted the last capability to its own `CSpace` or
+`AddressSpace`, directly or through a teardown cascade), or a concurrent
+teardown on another CPU stopped it while it waited — two teardowns each bound
+to the other's object would otherwise spin on each other forever, both
+preempt-disabled, so every iteration of the phase-2 spin re-reads the running
+thread's own state. The caller then frees nothing: it pushes the object onto
+this CPU's deferred-reclaim stack (`push_deferred_reclaim`, the #341 mechanism
+generalised to `CSpace` and `AddressSpace` objects) and returns, the syscall
+epilogue schedules the thread away, and `drain_deferred_reclaim` re-enters the
+teardown from a context bound to nothing queued there, where the bound threads
+are all already `Exited` and off-CPU.
+
+*AddressSpace root free.* `current` changing hands is not enough for an
+`AddressSpace`: the CPU switching away clears its `active_cpus` bit and loads
+the next root only afterwards, outside the locks (`schedule()`'s address-space
+switch). The `AddressSpace` arm therefore also spins in
+`wait_until_aspace_inactive` (breadcrumb `dealloc:as-active`) until
+`active_cpus` is empty before freeing the root page table; nothing can set a
+bit anew, because every bound thread is `Exited` and off every run queue and
+the dispatch flip aborts on an `Exited` candidate before the switch. This spin
+bails the same way as phase 2 if the running thread is stopped meanwhile.
+
+Stopped threads are dead but not freed — each Thread object lives until its own
+last capability goes, and `dealloc_object(Thread)` then runs its full drain
+protocol on an already-`Exited`, off-CPU thread (the off-CPU wait itself is the
+shared `wait_until_off_cpu`). The one window this mechanism does not close is
+the unlocked cap lookup itself: a `sys_cap_create_thread` that resolved its
+`CSpace` or `AddressSpace` capability before the object's last delete and
+constructs its TCB after the teardown's walk binds a thread to freed storage;
+that residual is the documented "lookup does not pin the object" gap of
+`lookup_cap`, narrowed here to the lookup-to-construction window.
 
 **Not a scheduling structure.** The registry is never read on any hot path; it
 adds one lock acquire at thread create/destroy and a walk per `CSpace` or

@@ -716,8 +716,14 @@ Delete a single capability from the caller's CSpace. Does not affect derived cap
 
 If this is the last reference to the underlying object, the object is freed.
 Freeing a `CSpace` or an `AddressSpace` first stops every thread bound to it
-(each becomes `Exited`; its Thread object is freed when its own last
-capability goes), so a process's threads never outlive either object.
+(each becomes `Exited` with retained exit reason `EXIT_KILLED`; its Thread
+object is freed when its own last capability goes), so a process's threads
+never outlive either object. **This includes the caller**: a thread deleting
+the last capability to its own `CSpace` or `AddressSpace` — directly, or
+because the deleted object's teardown cascades into it — is stopped by that
+delete and the call does not return; the object is reclaimed once the thread
+is off its CPU. The caller's own `Thread` object is treated differently, as
+below.
 
 Refused for two cases, both returning `InvalidState` with the capability left in
 place: a thread may not delete the last capability to its **own running**

@@ -848,6 +848,11 @@ pub fn cspace_delete_stops_bound_thread(ctx: &TestContext) -> TestResult
         cap_delete(child.th).ok();
         return Err("stop_bound: blocked child not Exited after its CSpace was deleted");
     }
+    if state & 0xFFFF_FFFF != syscall_abi::EXIT_KILLED
+    {
+        cap_delete(child.th).ok();
+        return Err("stop_bound: blocked child's exit reason is not EXIT_KILLED");
+    }
     cap_delete(child.th).map_err(|_| "stop_bound: cap_delete(thread, blocked) failed")?;
 
     // Spinning child: yields forever; on a multi-CPU guest it may be running
@@ -873,6 +878,11 @@ pub fn cspace_delete_stops_bound_thread(ctx: &TestContext) -> TestResult
     {
         cap_delete(child.th).ok();
         return Err("stop_bound: spinning child not Exited after its CSpace was deleted");
+    }
+    if state & 0xFFFF_FFFF != syscall_abi::EXIT_KILLED
+    {
+        cap_delete(child.th).ok();
+        return Err("stop_bound: spinning child's exit reason is not EXIT_KILLED");
     }
     cap_delete(child.th).map_err(|_| "stop_bound: cap_delete(thread, spin) failed")?;
 
@@ -904,6 +914,66 @@ fn stop_spinning_child_entry(arg: u64) -> !
 {
     let ready_slot = (arg & 0xFFFF) as u32;
     notification_send(ready_slot, 0x1).ok();
+    loop
+    {
+        syscall::thread_yield().ok();
+    }
+}
+
+/// Poll bound for the self-delete child: ~2 s at 1 ms per poll.
+const SELF_DELETE_MAX_POLLS: u32 = 2000;
+
+static mut SELF_DELETE_STACK: ChildStack = ChildStack::ZERO;
+
+/// A thread deleting the last capability to its **own** `CSpace` is stopped
+/// by that delete and never returns from it; the `CSpace` is reclaimed
+/// off-CPU once the thread has been scheduled away.
+///
+/// The child holds the only capability to its own `CSpace` (copied in, then
+/// ktest's copy deleted before the child starts). It signals ready and
+/// deletes it. ktest observes the child `Exited` with `EXIT_KILLED`,
+/// reclaims the thread, and waits for memory to return to baseline — the
+/// `CSpace`'s own reclaim completes on the child's CPU after it is off it.
+pub fn cspace_self_delete_stops_caller(ctx: &TestContext) -> TestResult
+{
+    let baseline = cap_info(ctx.memory_base, syscall_abi::CAP_INFO_MEMORY_AVAILABLE)
+        .map_err(|_| "self_delete: cap_info(baseline) failed")?;
+    let ready =
+        cap_create_notification(ctx.memory_base).map_err(|_| "self_delete: create ready failed")?;
+    let child = crate::spawn::new_child(ctx).map_err(|_| "self_delete: new_child failed")?;
+    let child_ready = cap_copy(ready, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
+        .map_err(|_| "self_delete: cap_copy ready failed")?;
+    let own_cs = cap_copy(child.cs, child.cs, syscall_abi::RIGHTS_ALL)
+        .map_err(|_| "self_delete: cap_copy cspace into itself failed")?;
+    // Drop ktest's capability first, so the child's delete is the last one.
+    cap_delete(child.cs).map_err(|_| "self_delete: cap_delete(cspace) failed")?;
+
+    let arg = u64::from(child_ready) | (u64::from(own_cs) << 32);
+    let stack_top = ChildStack::top(core::ptr::addr_of!(SELF_DELETE_STACK));
+    crate::spawn::configure_and_start(&child, self_delete_child_entry, stack_top, arg)
+        .map_err(|_| "self_delete: configure_and_start failed")?;
+    notification_wait(ready).map_err(|_| "self_delete: wait ready failed")?;
+
+    let reason = crate::spawn::wait_until_exited(child.th, SELF_DELETE_MAX_POLLS);
+    cap_delete(child.th).map_err(|_| "self_delete: cap_delete(thread) failed")?;
+    cap_delete(ready).ok();
+    if reason? != syscall_abi::EXIT_KILLED
+    {
+        return Err("self_delete: child's exit reason is not EXIT_KILLED");
+    }
+    crate::spawn::wait_memory_baseline(ctx.memory_base, baseline, SELF_DELETE_MAX_POLLS)
+        .map_err(|_| "self_delete: memory did not return to baseline")
+}
+
+/// Child for [`cspace_self_delete_stops_caller`]: signal ready, then delete
+/// the last capability to its own `CSpace`. The delete never returns; the
+/// yield loop only satisfies the signature.
+fn self_delete_child_entry(arg: u64) -> !
+{
+    let ready_slot = (arg & 0xFFFF_FFFF) as u32;
+    let own_cs = (arg >> 32) as u32;
+    notification_send(ready_slot, 0x1).ok();
+    cap_delete(own_cs).ok();
     loop
     {
         syscall::thread_yield().ok();

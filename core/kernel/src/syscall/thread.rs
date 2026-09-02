@@ -383,7 +383,10 @@ pub fn sys_thread_stop(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// `tcb` must be a valid TCB. The caller MUST NOT hold the target's `sched_lock`
 /// or any per-CPU scheduler lock: this function acquires `tcb.sched_lock` itself
 /// for the binding read-and-clear, and per-source IPC locks for the unlink (lock
-/// order: source IPC → `sched_lock`, so the two are never held together).
+/// order: source IPC → `sched_lock`, so the two are never held together). The
+/// caller MAY hold `THREAD_REGISTRY_LOCK` (ordered before every lock taken
+/// here; the object-teardown walk does), which keeps `tcb` from being freed
+/// meanwhile.
 // too_many_lines: flat dispatch over every `IpcThreadState` variant; splitting
 // adds no clarity (each arm is independent and short).
 #[allow(clippy::too_many_lines)]

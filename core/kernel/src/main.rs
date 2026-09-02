@@ -1300,10 +1300,10 @@ unsafe fn kernel_entry_post_rebase(
                         deferred_next: core::ptr::null_mut(),
                     },
                 );
-                // Diagnostic registry: thread the init TCB onto the live-thread
-                // list so the softlockup watchdog can enumerate it as a Blocked
-                // waiter (#351). Removed by `dealloc_object(Thread)` if init's
-                // Thread cap is ever deleted/revoked.
+                // Thread the init TCB onto the live-thread registry (watchdog
+                // enumeration of Blocked waiters, #351; object-teardown stop
+                // walk). Removed by `dealloc_object(Thread)` if init's Thread
+                // cap is ever deleted/revoked.
                 sched::thread_registry::register(tcb_ptr);
             }
             seed.header.inc_ref();

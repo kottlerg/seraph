@@ -143,12 +143,14 @@ pub unsafe fn dispatch(tf: *mut TrapFrame)
     tf.set_return(ret_val);
 
     // Self-teardown epilogue (#341). A handler may have deleted the last
-    // capability to the running thread's own Thread object (SYS_CAP_DELETE /
-    // SYS_CAP_REVOKE), marking it `Exited` in place; such a thread must never
-    // return to userspace. Reschedule away — its object is then reclaimed
-    // off-CPU by `drain_deferred_reclaim`. Otherwise drain any threads that
-    // self-deleted earlier on this CPU, from this (live) thread's context where
-    // the dead thread is provably off-CPU.
+    // capability to the running thread's own Thread object, CSpace, or
+    // AddressSpace (SYS_CAP_DELETE / SYS_CAP_REVOKE, directly or through a
+    // teardown cascade), or a concurrent teardown may have stopped this
+    // thread while the handler ran: either way it is `Exited` in place and
+    // must never return to userspace. Reschedule away — any object whose
+    // free was deferred is then reclaimed off-CPU by `drain_deferred_reclaim`.
+    // Otherwise drain objects deferred earlier on this CPU, from this (live)
+    // thread's context where the dead thread is provably off-CPU.
     // SAFETY: syscall context on the caller's kernel stack; current_tcb() is set.
     unsafe {
         let cur = current_tcb();
@@ -700,14 +702,13 @@ pub(crate) unsafe fn lookup_cap<K: crate::cap::slot::CapKind>(
     // and that teardown first stops every thread bound to the CSpace and
     // waits until it is off every CPU (`sched::stop_threads_bound_to`), so
     // no thread can be executing this function — or holding the returned
-    // reference across a syscall — when the pages go. The one thread that
-    // still runs after its own CSpace is freed is the caller destroying it:
-    // it is marked Exited, touches no slot after the dealloc, and the
-    // syscall epilogue schedules it away for good. Within the process, the
-    // unlocked tag/generation checks above narrow — but cannot close — the
-    // race against a sibling thread freeing/recycling this same slot
-    // concurrently; lookup_cap resolves only the caller's CSpace, so that
-    // residual reaches no cross-process authority.
+    // reference across a syscall — when the pages go. A caller destroying
+    // its own CSpace is stopped the same way, and the free is deferred until
+    // the syscall epilogue has scheduled it away (`drain_deferred_reclaim`).
+    // Within the process, the unlocked tag/generation checks above narrow —
+    // but cannot close — the race against a sibling thread freeing/recycling
+    // this same slot concurrently; lookup_cap resolves only the caller's
+    // CSpace, so that residual reaches no cross-process authority.
     Ok(unsafe { &*(slot as *const _) })
 }
 

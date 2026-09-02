@@ -398,8 +398,21 @@ pub fn sys_cap_create_aspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     if augment_idx != 0
     {
         // SAFETY: cspace validated non-null above.
-        let target_slot = unsafe { super::lookup_cap(cspace, augment_idx, AsRights::MAP) }?;
-        let target_aso_nn = target_slot.object.ok_or(SyscallError::InvalidCapability)?;
+        let target_slot = match unsafe { super::lookup_cap(cspace, augment_idx, AsRights::MAP) }
+        {
+            Ok(slot) => slot,
+            Err(e) =>
+            {
+                retype_free(memory, offset, entry.raw_bytes);
+                return Err(e);
+            }
+        };
+        let Some(target_aso_nn) = target_slot.object
+        else
+        {
+            retype_free(memory, offset, entry.raw_bytes);
+            return Err(SyscallError::InvalidCapability);
+        };
         // SAFETY: tag confirmed AddressSpace.
         #[allow(clippy::cast_ptr_alignment)]
         let target_aso = unsafe { &*target_aso_nn.as_ptr().cast::<AddressSpaceObject>() };
@@ -895,6 +908,9 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // Resolve AddressSpace cap.
     // SAFETY: caller_cspace validated non-null above.
     let as_slot = unsafe { super::lookup_cap(caller_cspace, as_idx, AsRights::MAP) }?;
+    // Snapshot for the post-registration revalidation below: `as_slot` is a
+    // live reference into the leaf page, not a copy.
+    let as_object = as_slot.object;
     let as_ptr = {
         use crate::cap::object::AddressSpaceObject;
         let obj = as_slot.object.ok_or(SyscallError::InvalidCapability)?;
@@ -907,6 +923,7 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // Resolve CSpace cap.
     // SAFETY: caller_cspace validated non-null above.
     let cs_slot = unsafe { super::lookup_cap(caller_cspace, cs_idx, CsRights::INSERT) }?;
+    let cs_object = cs_slot.object;
     let new_cs_ptr = {
         use crate::cap::object::CSpaceKernelObject;
         let obj = cs_slot.object.ok_or(SyscallError::InvalidCapability)?;
@@ -1093,16 +1110,16 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // teardown of either object that ran between the lookups above and
     // `register` walked a registry without this thread and may already have
     // reclaimed the storage the TCB names. The last capability to the object
-    // is gone in that case, so a lookup that still resolves to the same
-    // object proves it outlived the registration — and any teardown starting
-    // now finds this thread in the walk (docs/capability-model.md, process
-    // termination).
+    // is gone in that case, so a lookup that still resolves to the object
+    // snapshotted above (the pointer bound into the TCB, not the slot, which
+    // could have been recycled through a full generation cycle) proves it
+    // outlived the registration — and any teardown starting now finds this
+    // thread in the walk (docs/capability-model.md, process termination).
     // SAFETY: caller_cspace validated non-null above.
     let bound = unsafe {
-        super::lookup_cap(caller_cspace, as_idx, AsRights::MAP)
-            .is_ok_and(|s| s.object == as_slot.object)
+        super::lookup_cap(caller_cspace, as_idx, AsRights::MAP).is_ok_and(|s| s.object == as_object)
             && super::lookup_cap(caller_cspace, cs_idx, CsRights::INSERT)
-                .is_ok_and(|s| s.object == cs_slot.object)
+                .is_ok_and(|s| s.object == cs_object)
     };
     let idx_res: Result<u32, SyscallError> = if bound
     {

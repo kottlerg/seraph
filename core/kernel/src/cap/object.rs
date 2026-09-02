@@ -1226,7 +1226,9 @@ unsafe fn defer_self_teardown(ptr: NonNull<KernelObjectHeader>, what: &str)
     unsafe { push_deferred_reclaim(this_cpu, ptr) };
 }
 
-/// Free a kernel object whose reference count has just reached zero.
+/// Free a kernel object that no capability slot references: its reference
+/// count has reached zero, or it is a fresh body that was never published
+/// (see Safety).
 ///
 /// Dispatches on `obj_type` to reconstruct the original `Box<ConcreteObject>`
 /// and drop it, freeing any sub-resources first.
@@ -1280,7 +1282,8 @@ pub unsafe fn dealloc_object(ptr: core::ptr::NonNull<KernelObjectHeader>)
         worklist[head] = None;
         // SAFETY: `next` is a NonNull<KernelObjectHeader> that was either the
         // original caller-supplied pointer or pushed onto the worklist by an
-        // ancestor-reclaim arm — both contracts require ref_count == 0 and
+        // ancestor-reclaim arm — both contracts require that no slot
+        // references the object (refcount 0, or a never-published body) and
         // exclusive ownership at this point.
         unsafe { dealloc_object_one(next, &mut worklist, &mut head) };
     }

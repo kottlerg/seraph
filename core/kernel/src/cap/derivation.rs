@@ -281,7 +281,11 @@ pub unsafe fn unlink_node(node: SlotId)
 /// slot's children under its parent. Same bound and rationale as
 /// [`MAX_REVOKE_EDITS`]: any slot can have been derived from up to the
 /// structural ceiling of every `CSpace`, and that walk must not hold the
-/// derivation lock end to end.
+/// derivation lock end to end. The one walk that does is a range split's
+/// rollback of a child it inserted in the same call (`split.rs`,
+/// `rollback_child`): it covers only what a sibling derived from that child
+/// inside one lock-release window, nothing can extend the list under the
+/// lock, and it must complete atomically with the child's free.
 pub const MAX_REPARENT_EDITS: usize = MAX_REVOKE_EDITS;
 
 /// Liveness backstop for the callers' [`reparent_children`] loops: more

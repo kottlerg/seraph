@@ -38,8 +38,8 @@ use syscall::SyscallError;
 ///   2. reparents the original's children to that parent in
 ///      `MAX_REPARENT_EDITS` batches (lock released between batches) and
 ///      unlinks the original; a batch that finds the original gone rolls
-///      both children back (a child a sibling deleted meanwhile is left as
-///      the sibling left it; its returned handle then no longer resolves);
+///      both children back (a child a sibling deleted or moved meanwhile is
+///      left as the sibling left it; no handle is returned);
 ///   3. frees the original slot and drops its object reference.
 ///
 /// The original was looked up without the derivation lock, so it is
@@ -290,9 +290,6 @@ unsafe fn rollback_children(
 ///
 /// As for [`insert_children`], plus: the caller holds `DERIVATION_LOCK`
 /// write lock and, when this returns `Err`, no longer does.
-// too_many_arguments: the children's coordinates plus the parent; a struct
-// would only move the list.
-#[allow(clippy::too_many_arguments)]
 unsafe fn insert_and_link_children(
     caller_cspace: *mut CSpace,
     cspace_id: CSpaceId,
@@ -447,15 +444,16 @@ unsafe fn insert_children(
 /// `dealloc_object(child.object)` after releasing the lock. Returns `false`
 /// if a sibling thread already deleted the child (its delete released the
 /// object), the slot was recycled since, or other slots still reference the
-/// object — a sibling may have derived or copied the child between its
-/// insert and this rollback, and those caps stay valid. Anything derived
-/// from the child is moved under the child's own parent first (the
-/// original's parent; roots if the original was a root), so the free never
-/// strands a child with a dangling parent link nor lets a descendant escape
-/// an ancestor's revoke reach. That walk runs to
-/// completion under the lock: its length is however many derivations a
-/// sibling landed in the window, not a constant, but nothing can extend the
-/// list while the lock is held, so it terminates.
+/// object — a sibling may have derived, copied, or moved the child between
+/// its insert and this rollback, and those caps stay valid (a moved child
+/// survives the failed split in its new `CSpace`). Anything derived from
+/// the child is moved under the child's own parent first (the original's
+/// parent; roots if the original was a root), so the free never strands a
+/// child with a dangling parent link nor lets a descendant escape an
+/// ancestor's revoke reach. That walk runs to completion under the lock:
+/// its length is however many derivations a sibling landed in the window,
+/// not a constant, but nothing can extend the list while the lock is held,
+/// so it terminates.
 ///
 /// # Safety
 ///

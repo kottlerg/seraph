@@ -130,7 +130,14 @@ The transition table below pins every ThreadState write to a syscall/event, the 
 | `*` | `Exited` | `dealloc_object(Thread)` (refcount → 0) | calling CPU | acquires `(*tcb).sched_lock` (outer), then every CPU's scheduler.lock in ascending order, writes `Exited`, walks `remove_from_queue` for every CPU, releases all; then waits unconditionally for `sched.current != tcb` on *every* CPU *and* `tcb.context_saved == 1` (see Cross-CPU TCB Ownership) before freeing |
 | `Exited` | `*` | any lifecycle write (`sys_thread_start`, `sys_thread_stop`, a second exit) | calling CPU | refused: `set_state_under_all_locks` returns `StateCommit::RefusedExited` and `enqueue_ready_thread` returns `false` when the target is `Exited` under the held locks — `Exited` is terminal. A lifecycle syscall's unlocked precheck can race an object teardown (§ Thread Registry) or an exit; `sys_thread_start` then returns `InvalidArgument`, `sys_thread_stop` `InvalidState`, and neither revives the thread. |
 
-All `Running→Blocked` parks MUST route through `commit_blocked_under_local_lock` (or `commit_reply_rebind_under_local_lock` for `endpoint_recv`'s rebind); all `Blocked→Ready` *wakes* MUST route through `enqueue_and_wake`. The deliberate `→Ready` *placements* that the caller owns (the thread is provably not live) route through `enqueue_ready_thread` instead — currently only `sys_thread_start`. Both `set_state_under_all_locks` and `enqueue_ready_thread` refuse an `Exited` target (the terminal row above), so a placement that raced a teardown cannot link a dead thread. Direct `(*tcb).state` writes from an IPC primitive — under the source lock or otherwise — are forbidden; they race `set_state_under_all_locks(Stopped)` and silently clobber Stopped.
+All `Running→Blocked` parks MUST route through `commit_blocked_under_local_lock` (or
+`commit_reply_rebind_under_local_lock` for `endpoint_recv`'s rebind); all `Blocked→Ready` *wakes*
+MUST route through `enqueue_and_wake`. The deliberate `→Ready` *placements* that the caller owns
+(the thread is provably not live) route through `enqueue_ready_thread` instead — currently only
+`sys_thread_start`. Both `set_state_under_all_locks` and `enqueue_ready_thread` refuse an `Exited`
+target (the terminal row above), so a placement that raced a teardown cannot link a dead thread.
+Direct `(*tcb).state` writes from an IPC primitive — under the source lock or otherwise — are
+forbidden; they race `set_state_under_all_locks(Stopped)` and silently clobber Stopped.
 
 **Voluntary-block window — `schedule()` never requeues a `Blocked` `current` (issue #299).** Between a thread committing `Blocked` (`commit_blocked_under_local_lock` writes `Blocked` under `(*tcb).sched_lock`, then releases it) and reaching its own `schedule(false)`, interrupts are enabled and a timer tick can fire `schedule(true)` (`requeue_current = true`). The outgoing-requeue guard therefore excludes a `Blocked` `current` regardless of `requeue_current`: re-marking the parking thread `Ready` and enqueuing it would race the pending `enqueue_and_wake` (which links the same TCB on its `Blocked → Ready` wake) into a `queued_on` double-enqueue — in debug the `#244` enqueue tripwire panics under `scheduler.lock`, wedging that CPU. `cur_state` is read under `current.sched_lock` (held from the top of `schedule()`), so the `Blocked` observation is authoritative, not the racy `state` read a `timer_tick`-side guard would require. The parked thread is redispatched by its deposited wake (the resume-DEPOSIT model, Wake Protocol Invariants).
 
@@ -297,7 +304,22 @@ self-enforcing at the single insertion chokepoint, closing the double-link class
 
 ## Cross-CPU TCB Ownership
 
-The TCB is owned in pieces. Different field groups have different lock disciplines. Cross-CPU access to any field MUST hold the lock specified for that field's group. Documented exceptions — the reads of `state` that hold no `sched_lock`: `running_thread_stopped` (`sched/mod.rs`) probes the running thread's own `state` with a volatile read that decides only whether to confirm — a positive probe is confirmed under this CPU's `scheduler.lock`, which every `state` writer on the lifecycle path holds through `set_state_under_all_locks` (see § Atomic Ordering Invariants); and the object-teardown walk (`mark_bound_threads` under `THREAD_REGISTRY_LOCK`, `scan_bound_current` under the remote CPU's `scheduler.lock`) reads `state` to skip threads already `Exited` and to decide whether a bound thread still needs marking. Those reads are sound only because `Exited` is monotone (§ ThreadState Transitions): a positive `Exited` read is final, and a negative read is re-decided under the full lock set by `set_state_under_all_locks`, which refuses if the thread exited meanwhile. A field without that monotonicity MUST NOT be read this way. The lifecycle syscalls' own prechecks (`sys_thread_configure`, `sys_thread_start`, `sys_thread_stop`) and the stop protocol's drain re-check are the same pattern — each is re-decided under the full lock set by `set_state_under_all_locks`, or under the remote run-queue lock the stop protocol documents — and `CAP_INFO_THREAD_STATE` is a diagnostic snapshot that decides nothing in the kernel.
+The TCB is owned in pieces. Different field groups have different lock disciplines. Cross-CPU access
+to any field MUST hold the lock specified for that field's group. Documented exceptions — the reads
+of `state` that hold no `sched_lock`: `running_thread_stopped` (`sched/mod.rs`) probes the running
+thread's own `state` with a volatile read that decides only whether to confirm — a positive probe is
+confirmed under this CPU's `scheduler.lock`, which every `state` writer on the lifecycle path holds
+through `set_state_under_all_locks` (see § Atomic Ordering Invariants); and the object-teardown walk
+(`mark_bound_threads` under `THREAD_REGISTRY_LOCK`, `scan_bound_current` under the remote CPU's
+`scheduler.lock`) reads `state` to skip threads already `Exited` and to decide whether a bound
+thread still needs marking. Those reads are sound only because `Exited` is monotone (§ ThreadState
+Transitions): a positive `Exited` read is final, and a negative read is re-decided under the full
+lock set by `set_state_under_all_locks`, which refuses if the thread exited meanwhile. A field
+without that monotonicity MUST NOT be read this way. The lifecycle syscalls' own prechecks
+(`sys_thread_configure`, `sys_thread_start`, `sys_thread_stop`) and the stop protocol's drain
+re-check are the same pattern — each is re-decided under the full lock set by
+`set_state_under_all_locks`, or under the remote run-queue lock the stop protocol documents — and
+`CAP_INFO_THREAD_STATE` is a diagnostic snapshot that decides nothing in the kernel.
 
 | Field group | Fields | Owning lock | Cross-CPU access rule |
 |---|---|---|---|
@@ -597,7 +619,16 @@ Pairing table for every load-bearing atomic in the scheduling and IPC paths. "Lo
 | `SCHEDULERS_PTR`, `IDLE_TCBS_PTR`, `AP_TSS_PTR`, `AP_GDT_PTR`, `AP_IST_STACKS_PTR` | per-`AtomicPtr` declaration sites | Release on `store` in `init_storage` and per-arch initialisers | Acquire on `load` in `scheduler_ptr`, `idle_tcb_ptr`, AP startup helpers | Publishes the zeroed and constructed slab to every CPU; the Acquire establishes happens-before with the storage construction. |
 
 **Rules:**
-- The per-TCB `sched_lock` (a `crate::sync::Spinlock`, not an atomic; see § Cross-CPU TCB Ownership) is the serializer the Scheduling-group fields above rely on: `state`/`ipc_state`/`blocked_on_object`/`preferred_cpu`/`wake_pending` are plain (non-atomic) fields written under it, and `queued_on`'s atomicity exists only for a well-defined cross-CPU guard read — not for lock-free synchronisation. It is listed here for cross-reference only. The one load-bearing read of `state` outside these locks is the probe in `running_thread_stopped` (the syscall epilogue and the object-teardown spins): a volatile read that only decides whether to take this CPU's `scheduler.lock` and confirm, never the outcome itself. A lagging probe delays detection by one spin iteration, or until the thread next enters the kernel; a same-CPU write is always observed.
+- The per-TCB `sched_lock` (a `crate::sync::Spinlock`, not an atomic; see § Cross-CPU TCB Ownership)
+  is the serializer the Scheduling-group fields above rely on:
+  `state`/`ipc_state`/`blocked_on_object`/`preferred_cpu`/`wake_pending` are plain (non-atomic)
+  fields written under it, and `queued_on`'s atomicity exists only for a well-defined cross-CPU
+  guard read — not for lock-free synchronisation. It is listed here for cross-reference only. The
+  one load-bearing read of `state` outside these locks is the probe in `running_thread_stopped` (the
+  syscall epilogue and the object-teardown spins): a volatile read that only decides whether to take
+  this CPU's `scheduler.lock` and confirm, never the outcome itself. A lagging probe delays
+  detection by one spin iteration, or until the thread next enters the kernel; a same-CPU write is
+  always observed.
 - Any new atomic in the scheduling or IPC path MUST be added to this table with its pairing rationale before merge.
 - Any change from Release/Acquire to Relaxed (or the inverse) MUST be justified against this table; "looks fine on x86" is not justification — the riscv64 build is RVWMO and is the binding test.
 - SeqCst is permitted only where a Dekker-style fence pair is the proven pattern; new SeqCst uses MUST cite the proof.

@@ -116,8 +116,9 @@ pub unsafe fn unregister(tcb: *mut ThreadControlBlock)
 
 /// Walk the list from the head, invoking `f` on every node, with a
 /// tortoise-and-hare cycle probe. Returns `false` if the walk met a cycle
-/// (the list is corrupt; `f` has run on every node up to the point of
-/// detection), `true` if it reached the terminating null.
+/// (the list is corrupt; `f` has run on every node reached before
+/// detection, and more than once on the cycle's members), `true` if it
+/// reached the terminating null.
 ///
 /// # Safety
 /// [`THREAD_REGISTRY_LOCK`] must be held by the caller.

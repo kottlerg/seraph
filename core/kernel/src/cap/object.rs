@@ -1191,6 +1191,12 @@ pub unsafe fn drain_deferred_reclaim(cpu: usize)
 /// stopped (it is bound to the object, or a concurrent teardown stopped it
 /// while this free waited); log the first occurrence.
 ///
+/// Reached only when the running thread is `Exited`, which the idle-loop
+/// drain can never be: an idle TCB is unregistered, binds no `CSpace` or
+/// address space, and is named by no capability, so no teardown or stop
+/// can mark it. Every caller is therefore on the syscall path (a handler,
+/// or the epilogue drain), where interrupts are disabled.
+///
 /// # Safety
 /// `ptr` must be a refcount-0 `Thread`, `CSpace`, or `AddressSpace` object
 /// referenced by no slot, and the caller must be the running thread with
@@ -2178,8 +2184,10 @@ unsafe fn dealloc_object_one(
                 // off every run queue; no scheduler lock held.
                 if stopped || !unsafe { crate::sched::wait_until_aspace_inactive(as_ptr) }
                 {
-                    // SAFETY: refcount 0, no slot references the object;
-                    // syscall context with interrupts disabled.
+                    // SAFETY: refcount 0, no slot references the object; the
+                    // running thread is `Exited`, which rules out the idle
+                    // drain (see defer_self_teardown), so this is the syscall
+                    // path with interrupts disabled.
                     unsafe { defer_self_teardown(ptr, "AddressSpace") };
                     return;
                 }
@@ -2323,8 +2331,10 @@ unsafe fn dealloc_object_one(
                 };
                 if stopped
                 {
-                    // SAFETY: refcount 0, no slot references the object;
-                    // syscall context with interrupts disabled.
+                    // SAFETY: refcount 0, no slot references the object; the
+                    // running thread is `Exited`, which rules out the idle
+                    // drain (see defer_self_teardown), so this is the syscall
+                    // path with interrupts disabled.
                     unsafe { defer_self_teardown(ptr, "CSpace") };
                     return;
                 }
@@ -3043,7 +3053,7 @@ unsafe fn drain_dying_cspace_batch(
 mod tests
 {
     use super::*;
-    use core::mem::{offset_of, size_of};
+    use core::mem::offset_of;
 
     // Header MUST sit at offset 0 in every concrete object type: the kernel casts
     // *mut ConcreteObject to *mut KernelObjectHeader to read the refcount and type

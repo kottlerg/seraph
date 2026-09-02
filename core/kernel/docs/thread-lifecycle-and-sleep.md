@@ -216,11 +216,12 @@ that CPU (#341).
   (`PerCpuScheduler::deferred_reclaim_head`) and `dealloc_object` returns without
   touching the UAF gate or `retype_free`.
 - **Reschedule:** the syscall epilogue (`syscall::dispatch`) observes the
-  `Exited` state — read under this CPU's scheduler lock, before its
-  deferred-reclaim drain and again after it, since the drain's own waits can
-  let a concurrent teardown stop the thread — and calls `schedule(false)` +
-  `halt_loop()`, so the dead thread never returns to user-mode. `schedule()` refuses to re-enqueue an `Exited`
-  thread (invariant 2), and the switch publishes `tcb.context_saved = 1`.
+  `Exited` state — probed without a lock and confirmed under this CPU's
+  scheduler lock, before its deferred-reclaim drain and again after it, since
+  the drain's own waits can let a concurrent teardown stop the thread — and
+  calls `schedule(false)` + `halt_loop()`, so the dead thread never returns
+  to user-mode. `schedule()` refuses to re-enqueue an `Exited` thread
+  (invariant 2), and the switch publishes `tcb.context_saved = 1`.
 - **Off-CPU completion:** `drain_deferred_reclaim` — called from the syscall
   epilogue of the *next* live thread on this CPU, and from the idle loop — pops
   the object and re-enters `dealloc_object`. The thread is now off-CPU, so the

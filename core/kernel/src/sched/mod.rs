@@ -2227,8 +2227,16 @@ impl SpinWarnOnce
 
 /// Whether the thread running on `this_cpu` has been marked `Exited` by a
 /// concurrent teardown (or by its own handler, on the self-teardown path).
-/// `current` and `state` are read under this CPU's scheduler lock, which the
-/// writer holds among all locks when it commits the transition.
+///
+/// `current` is written only by this CPU at dispatch, so the running thread
+/// reads it without a lock. `state` is committed by the writer under every
+/// scheduler lock; it is probed without the lock first and confirmed under
+/// this CPU's lock only when the probe reads `Exited`, so the fast path —
+/// every syscall epilogue and every teardown spin iteration — takes no lock.
+/// A probe that lags the store delays detection by one spin iteration, or
+/// in the epilogue until the thread next enters the kernel, exactly as for
+/// a thread stopped while it is in user-mode. A same-CPU transition (the
+/// self-teardown path) is always observed.
 ///
 /// # Safety
 /// The caller must be the thread running on `this_cpu`, with interrupts or
@@ -2237,14 +2245,19 @@ impl SpinWarnOnce
 #[cfg(not(test))]
 pub(crate) unsafe fn running_thread_stopped(this_cpu: usize) -> bool
 {
-    // SAFETY: this_cpu < MAX_CPUS per contract; `current` and the TCB's
-    // `state` are read under this CPU's scheduler lock, and `current` cannot
-    // be freed while it is still installed on this CPU.
+    // SAFETY: this_cpu < MAX_CPUS per contract; `current` cannot be freed
+    // while it is still installed on this CPU; the probe is a volatile read
+    // so a spin re-reads it, and the answer is confirmed under the lock.
     unsafe {
         let sched = scheduler_for(this_cpu);
-        let saved = sched.lock.lock_raw();
         let cur = sched.current;
-        let stopped = !cur.is_null() && (*cur).state == thread::ThreadState::Exited;
+        if cur.is_null()
+            || core::ptr::read_volatile(&raw const (*cur).state) != thread::ThreadState::Exited
+        {
+            return false;
+        }
+        let saved = sched.lock.lock_raw();
+        let stopped = (*cur).state == thread::ThreadState::Exited;
         sched.lock.unlock_raw(saved);
         stopped
     }

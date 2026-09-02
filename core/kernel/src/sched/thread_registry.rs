@@ -169,7 +169,7 @@ pub unsafe fn try_for_each(f: impl FnMut(*mut ThreadControlBlock)) -> bool
     // SAFETY: lock held.
     // A cycle ends the walk early; this is the stall dump's own diagnostic
     // path, so the truncation is not reported further.
-    let _complete = unsafe { walk_locked(f) };
+    let _ = unsafe { walk_locked(f) };
     // SAFETY: paired with try_lock_raw above.
     unsafe { THREAD_REGISTRY_LOCK.unlock_raw(saved) };
     true

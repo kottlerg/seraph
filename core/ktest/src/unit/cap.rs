@@ -719,7 +719,7 @@ pub fn derive_badge_on_notification(ctx: &TestContext) -> TestResult
 /// Derives the [`cspace_teardown_multibatch`] child performs: wider than one
 /// reparent batch (`MAX_REPARENT_EDITS`), so the dying child list is drained
 /// in several holds.
-const DERIVES: u64 = 300;
+const TEARDOWN_BATCH_DERIVES: u64 = 300;
 
 /// Tearing down a `CSpace` whose derivation state spans multiple drain
 /// batches completes and leaves the survivors' forest clean.
@@ -778,7 +778,7 @@ pub fn cspace_teardown_multibatch(ctx: &TestContext) -> TestResult
     // the derives), so the drain has more than one batch of edits ahead.
     let used = cap_info(child.cs, syscall_abi::CAP_INFO_CSPACE_USED)
         .map_err(|_| "teardown_batch: cap_info(child USED) failed")?;
-    if used < DERIVES + 2
+    if used < TEARDOWN_BATCH_DERIVES + 2
     {
         cap_delete(child.th).ok();
         cap_delete(child.cs).ok();
@@ -983,16 +983,16 @@ fn self_delete_child_entry(arg: u64) -> !
     }
 }
 
-/// Child for [`cspace_teardown_multibatch`]: derives `count` SEND caps
-/// from its endpoint copy (building a wide dying child list), signals
-/// completion, and exits without cleaning up — teardown is the test.
+/// Child for [`cspace_teardown_multibatch`]: derives `TEARDOWN_BATCH_DERIVES`
+/// SEND caps from its endpoint copy (building a wide dying child list),
+/// signals completion, and exits without cleaning up — teardown is the test.
 fn teardown_batch_child_entry(arg: u64) -> !
 {
     let ep_slot = (arg & 0xFFFF_FFFF) as u32;
     let done_slot = (arg >> 32) as u32;
 
     let mut ok = true;
-    for _ in 0..DERIVES
+    for _ in 0..TEARDOWN_BATCH_DERIVES
     {
         if cap_derive(ep_slot, syscall_abi::RIGHTS_EP_SEND).is_err()
         {

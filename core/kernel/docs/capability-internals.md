@@ -417,10 +417,13 @@ without the lock): a concurrent revoke starting on it stops the delete with
 concurrent delete finishing it first turns the delete into a success and a
 split into `InvalidState` with both children rolled back. The split's own
 children are checked the same way before each is linked under the parent —
-the slot must still hold the inserted child — so a sibling that deleted one
-(and refilled its slot) between the insert and the final hold leaves that
-child unlinked and its returned handle stale, never an unrelated cap wired
-under the original's parent.
+the slot must still hold the inserted child under the generation minted at
+insert — so a sibling that deleted one (and refilled its slot) between the
+insert and the final hold leaves that child unlinked, never an unrelated cap
+wired under the original's parent. The handles returned to the caller are
+the ones minted under the insert's own `CSpace` lock hold, so such a child's
+handle no longer resolves; re-reading the slot after the lock is released
+would instead return a live handle to the refill.
 
 Because hoisting destroys intermediate parent→child edges as the flattening
 proceeds, the root is pinned for the whole multi-batch operation with a

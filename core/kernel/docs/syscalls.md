@@ -960,7 +960,9 @@ split fails with `InvalidState` and both children are rolled back. Its children
 are re-linked under its derivation parent in batches (lock released between
 them); a concurrent deriver extending that list faster than it is moved returns
 `Interrupted`. A new child that a concurrent delete removed before the split
-finished is left unlinked; its returned handle is already stale. The three other range splits (`SYS_IRQ_SPLIT`, `SYS_IOPORT_SPLIT`,
+finished is left unlinked; its returned handle carries the generation minted
+at insert, so it no longer resolves even if the slot has since been refilled.
+The three other range splits (`SYS_IRQ_SPLIT`, `SYS_IOPORT_SPLIT`,
 `SYS_SCHED_SPLIT`) share this tail and these two errors.
 
 **Errors:** `InvalidState`, `Interrupted` (per above),

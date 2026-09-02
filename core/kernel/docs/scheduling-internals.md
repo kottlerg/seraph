@@ -37,9 +37,11 @@ The following ordering MUST be observed everywhere in the kernel. Acquiring lock
 
 ```
    THREAD_REGISTRY_LOCK                      (outermost; live-thread list — the
-        │                                    object-teardown walk takes every
-        │                                    lock below it under this one;
-        │                                    see § Thread Registry)
+        │                                    object-teardown walk takes source,
+        │                                    sleep-list, sched, and run-queue
+        │                                    locks under it, never the
+        │                                    derivation lock; see § Thread
+        │                                    Registry)
         ▼
        source IPC lock                derivation tree lock
    (sig.lock | ep.lock |    (outer)   (cap revocation;

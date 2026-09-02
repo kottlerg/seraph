@@ -388,7 +388,7 @@ pub fn sys_thread_stop(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 // adds no clarity (each arm is independent and short).
 #[allow(clippy::too_many_lines)]
 #[cfg(not(test))]
-unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadControlBlock)
+pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadControlBlock)
 {
     use crate::ipc::endpoint::{EndpointState, unlink_from_wait_queue};
     use crate::ipc::event_queue::EventQueueState;
@@ -1026,7 +1026,7 @@ pub fn sys_sched_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     use crate::cap::split::install_split_children;
     use crate::syscall::current_tcb;
 
-    let sched_idx = tf.arg(0) as u32;
+    let sched_handle = tf.arg(0) as u32;
     let split_at = tf.arg(1) as u8;
     // arg2 reserved.
 
@@ -1047,7 +1047,7 @@ pub fn sys_sched_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     let (min, max, rights, cspace_id, orig_obj_ptr) = {
         // SAFETY: caller_cspace validated; lookup_cap checks the tag (presence-only).
-        let slot = unsafe { super::lookup_cap(caller_cspace, sched_idx, SchedRights::NONE) }?;
+        let slot = unsafe { super::lookup_cap(caller_cspace, sched_handle, SchedRights::NONE) }?;
         let obj_ptr = slot.object.ok_or(SyscallError::InvalidCapability)?;
         // cast_ptr_alignment: header at offset 0; allocator guarantees alignment.
         // SAFETY: tag confirmed SchedControl; pointer is a valid SchedControlObject.
@@ -1100,7 +1100,7 @@ pub fn sys_sched_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         install_split_children(
             caller_cspace,
             cspace_id,
-            sched_idx,
+            sched_handle,
             CapTag::SchedControl,
             rights,
             orig_obj_ptr,

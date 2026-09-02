@@ -23,6 +23,8 @@ use syscall_abi::SyscallError;
 use crate::{ChildStack, TestContext, TestResult};
 
 static mut TEARDOWN_BATCH_STACK: ChildStack = ChildStack::ZERO;
+static mut STOP_BLOCKED_STACK: ChildStack = ChildStack::ZERO;
+static mut STOP_SPINNING_STACK: ChildStack = ChildStack::ZERO;
 
 // Rights bit constants (from kernel/src/cap/slot.rs).
 // Notification NOTIFY (send) / WAIT (receive-block); endpoint SEND / GRANT.
@@ -269,40 +271,53 @@ pub fn delete_intermediate_keeps_grandchildren_revocable(ctx: &TestContext) -> T
         .map_err(|_| "delete_intermediate: cap_info(used before) failed")?;
     let sig = cap_create_notification(ctx.memory_base)
         .map_err(|_| "delete_intermediate: create_notification failed")?;
-    let mid =
-        cap_derive(sig, RIGHTS_NOTIFY).map_err(|_| "delete_intermediate: derive mid failed")?;
 
-    let mut probes: [Option<u32>; 3] = [None; 3];
-    for i in 0..GRANDCHILDREN
-    {
-        let gc = cap_derive(mid, RIGHTS_NOTIFY)
-            .map_err(|_| "delete_intermediate: derive grandchild failed")?;
-        match i
+    // Everything below hangs off `sig`, so a failure anywhere is cleaned up
+    // by revoking and deleting it — a leaked 300-cap tail would otherwise
+    // skew every later USED baseline.
+    let body = || -> TestResult {
+        let mid =
+            cap_derive(sig, RIGHTS_NOTIFY).map_err(|_| "delete_intermediate: derive mid failed")?;
+        let mut probes: [Option<u32>; 3] = [None; 3];
+        for i in 0..GRANDCHILDREN
         {
-            0 => probes[0] = Some(gc),
-            x if x == GRANDCHILDREN / 2 => probes[1] = Some(gc),
-            x if x == GRANDCHILDREN - 1 => probes[2] = Some(gc),
-            _ =>
-            {}
+            let gc = cap_derive(mid, RIGHTS_NOTIFY)
+                .map_err(|_| "delete_intermediate: derive grandchild failed")?;
+            match i
+            {
+                0 => probes[0] = Some(gc),
+                x if x == GRANDCHILDREN / 2 => probes[1] = Some(gc),
+                x if x == GRANDCHILDREN - 1 => probes[2] = Some(gc),
+                _ =>
+                {}
+            }
         }
-    }
 
-    cap_delete(mid).map_err(|_| "delete_intermediate: cap_delete(mid) failed")?;
-    for probe in probes.iter().flatten()
-    {
-        notification_send(*probe, 0x1)
-            .map_err(|_| "delete_intermediate: grandchild unusable after deleting its parent")?;
-    }
-
-    cap_revoke(sig).map_err(|_| "delete_intermediate: cap_revoke(sig) failed")?;
-    for probe in probes.iter().flatten()
-    {
-        if notification_send(*probe, 0x1).is_ok()
+        cap_delete(mid).map_err(|_| "delete_intermediate: cap_delete(mid) failed")?;
+        for probe in probes.iter().flatten()
         {
-            return Err("delete_intermediate: grandchild survived the grandparent's revoke");
+            notification_send(*probe, 0x1).map_err(
+                |_| "delete_intermediate: grandchild unusable after deleting its parent",
+            )?;
         }
+
+        cap_revoke(sig).map_err(|_| "delete_intermediate: cap_revoke(sig) failed")?;
+        for probe in probes.iter().flatten()
+        {
+            if notification_send(*probe, 0x1).is_ok()
+            {
+                return Err("delete_intermediate: grandchild survived the grandparent's revoke");
+            }
+        }
+        Ok(())
+    };
+    let result = body();
+    if result.is_err()
+    {
+        cap_revoke(sig).ok();
     }
     cap_delete(sig).map_err(|_| "delete_intermediate: cap_delete(sig) failed")?;
+    result?;
 
     let used_after = cap_info(ctx.cspace_cap, syscall_abi::CAP_INFO_CSPACE_USED)
         .map_err(|_| "delete_intermediate: cap_info(used after) failed")?;
@@ -795,6 +810,104 @@ pub fn cspace_teardown_multibatch(ctx: &TestContext) -> TestResult
     cap_delete(ep).ok();
     cap_delete(done).ok();
     Ok(())
+}
+
+/// Deleting the last capability to a `CSpace` stops every thread bound to
+/// it before the slot pages are reclaimed: a child blocked in
+/// `notification_wait` and a child spinning on `thread_yield` both report
+/// `Exited` afterwards, their objects reclaim through the thread cap alone,
+/// and the parent's Memory cap returns to baseline. Deleting the `CSpace`
+/// before the thread is exactly the order the spawn helper used to forbid.
+pub fn cspace_delete_stops_bound_thread(ctx: &TestContext) -> TestResult
+{
+    let baseline = cap_info(ctx.memory_base, syscall_abi::CAP_INFO_MEMORY_AVAILABLE)
+        .map_err(|_| "stop_bound: cap_info(baseline) failed")?;
+    let ready =
+        cap_create_notification(ctx.memory_base).map_err(|_| "stop_bound: create ready failed")?;
+    let block =
+        cap_create_notification(ctx.memory_base).map_err(|_| "stop_bound: create block failed")?;
+
+    // Blocked child: signals ready, then waits on `block` (never signalled).
+    let child = crate::spawn::new_child(ctx).map_err(|_| "stop_bound: new_child failed")?;
+    let child_ready = cap_copy(ready, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
+        .map_err(|_| "stop_bound: cap_copy ready failed")?;
+    let child_block = cap_copy(block, child.cs, syscall_abi::RIGHTS_NTF_WAIT)
+        .map_err(|_| "stop_bound: cap_copy block failed")?;
+    let arg = u64::from(child_ready) | (u64::from(child_block) << 16);
+    let stack_top = ChildStack::top(core::ptr::addr_of!(STOP_BLOCKED_STACK));
+    crate::spawn::configure_and_start(&child, stop_blocked_child_entry, stack_top, arg)
+        .map_err(|_| "stop_bound: configure_and_start (blocked) failed")?;
+    notification_wait(ready).map_err(|_| "stop_bound: wait ready failed")?;
+
+    cap_delete(child.cs)
+        .map_err(|_| "stop_bound: cap_delete(cspace) under blocked child failed")?;
+    let state = cap_info(child.th, syscall_abi::CAP_INFO_THREAD_STATE)
+        .map_err(|_| "stop_bound: cap_info(thread state, blocked) failed")?;
+    if (state >> 32) as u32 != syscall_abi::THREAD_STATE_EXITED
+    {
+        cap_delete(child.th).ok();
+        return Err("stop_bound: blocked child not Exited after its CSpace was deleted");
+    }
+    cap_delete(child.th).map_err(|_| "stop_bound: cap_delete(thread, blocked) failed")?;
+
+    // Spinning child: yields forever; on a multi-CPU guest it may be running
+    // on another CPU when its CSpace goes.
+    let child = crate::spawn::new_child(ctx).map_err(|_| "stop_bound: new_child (spin) failed")?;
+    let child_ready = cap_copy(ready, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
+        .map_err(|_| "stop_bound: cap_copy ready (spin) failed")?;
+    let stack_top = ChildStack::top(core::ptr::addr_of!(STOP_SPINNING_STACK));
+    crate::spawn::configure_and_start(
+        &child,
+        stop_spinning_child_entry,
+        stack_top,
+        u64::from(child_ready),
+    )
+    .map_err(|_| "stop_bound: configure_and_start (spin) failed")?;
+    notification_wait(ready).map_err(|_| "stop_bound: wait ready (spin) failed")?;
+
+    cap_delete(child.cs)
+        .map_err(|_| "stop_bound: cap_delete(cspace) under spinning child failed")?;
+    let state = cap_info(child.th, syscall_abi::CAP_INFO_THREAD_STATE)
+        .map_err(|_| "stop_bound: cap_info(thread state, spin) failed")?;
+    if (state >> 32) as u32 != syscall_abi::THREAD_STATE_EXITED
+    {
+        cap_delete(child.th).ok();
+        return Err("stop_bound: spinning child not Exited after its CSpace was deleted");
+    }
+    cap_delete(child.th).map_err(|_| "stop_bound: cap_delete(thread, spin) failed")?;
+
+    cap_delete(block).ok();
+    cap_delete(ready).ok();
+    let after = cap_info(ctx.memory_base, syscall_abi::CAP_INFO_MEMORY_AVAILABLE)
+        .map_err(|_| "stop_bound: cap_info(after) failed")?;
+    if after != baseline
+    {
+        return Err("stop_bound: memory did not return to baseline");
+    }
+    Ok(())
+}
+
+/// Child for [`cspace_delete_stops_bound_thread`]: signal, then block on a
+/// notification nobody signals. Reaching the exit means the wait returned,
+/// which the test never expects.
+fn stop_blocked_child_entry(arg: u64) -> !
+{
+    let ready_slot = (arg & 0xFFFF) as u32;
+    let block_slot = ((arg >> 16) & 0xFFFF) as u32;
+    notification_send(ready_slot, 0x1).ok();
+    notification_wait(block_slot).ok();
+    syscall::thread_exit()
+}
+
+/// Child for [`cspace_delete_stops_bound_thread`]: signal, then yield forever.
+fn stop_spinning_child_entry(arg: u64) -> !
+{
+    let ready_slot = (arg & 0xFFFF) as u32;
+    notification_send(ready_slot, 0x1).ok();
+    loop
+    {
+        syscall::thread_yield().ok();
+    }
 }
 
 /// Child for [`cspace_teardown_multibatch`]: derives `count` SEND caps

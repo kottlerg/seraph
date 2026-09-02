@@ -523,7 +523,7 @@ pub unsafe fn revoke_subtree_batch(
 /// # Safety
 ///
 /// Caller must hold `DERIVATION_LOCK` write lock.
-unsafe fn truncate_dead_link(owner: SlotId, dead: SlotId, context: &str)
+pub(crate) unsafe fn truncate_dead_link(owner: SlotId, dead: SlotId, context: &str)
 {
     #[cfg(not(test))]
     crate::kprintln!(

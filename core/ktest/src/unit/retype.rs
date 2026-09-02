@@ -41,6 +41,46 @@ use syscall_abi::{
 use crate::{TestContext, TestResult};
 
 const TEST_VA_BASE: u64 = 0x0000_0001_4000_0000;
+
+/// Deleting the last capability to an `AddressSpace` stops every thread
+/// bound to it before its root page table is reclaimed: a thread created in
+/// the address space (never started, so `Created`) reports `Exited` after
+/// the address-space delete, and everything reclaims to baseline through
+/// the thread and `CSpace` caps afterwards.
+pub fn aspace_delete_stops_bound_thread(ctx: &TestContext) -> TestResult
+{
+    let memory = ctx.memory_base;
+    let baseline = cap_info(memory, CAP_INFO_MEMORY_AVAILABLE)
+        .map_err(|_| "retype::aspace_stop: cap_info(baseline) failed")?;
+    let aspace = cap_create_aspace(memory, 0, 8)
+        .map_err(|_| "retype::aspace_stop: cap_create_aspace failed")?;
+    let cspace = cap_create_cspace(memory, 0, 4)
+        .map_err(|_| "retype::aspace_stop: cap_create_cspace failed")?;
+    let thread = syscall::cap_create_thread(memory, aspace, cspace, 0, 0)
+        .map_err(|_| "retype::aspace_stop: cap_create_thread failed")?;
+
+    cap_delete(aspace).map_err(|_| "retype::aspace_stop: cap_delete(aspace) failed")?;
+    let state = cap_info(thread, syscall_abi::CAP_INFO_THREAD_STATE)
+        .map_err(|_| "retype::aspace_stop: cap_info(thread state) failed")?;
+    let exited = (state >> 32) as u32 == syscall_abi::THREAD_STATE_EXITED;
+
+    cap_delete(thread).map_err(|_| "retype::aspace_stop: cap_delete(thread) failed")?;
+    cap_delete(cspace).map_err(|_| "retype::aspace_stop: cap_delete(cspace) failed")?;
+    if !exited
+    {
+        return Err(
+            "retype::aspace_stop: bound thread not Exited after its AddressSpace was deleted",
+        );
+    }
+    let after = cap_info(memory, CAP_INFO_MEMORY_AVAILABLE)
+        .map_err(|_| "retype::aspace_stop: cap_info(after) failed")?;
+    if after != baseline
+    {
+        return Err("retype::aspace_stop: memory did not return to baseline");
+    }
+    Ok(())
+}
+
 const SYS_OUT_OF_MEMORY: i64 = -8;
 
 /// Augment-mode on `cap_create_aspace` increases the target AS's PT

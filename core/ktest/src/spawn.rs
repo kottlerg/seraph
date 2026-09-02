@@ -24,8 +24,10 @@ use crate::TestContext;
 /// Child-thread handle returned by [`new_child`].
 ///
 /// Caller is responsible for deleting both caps when the child has exited
-/// (typically via `notification_wait`-based handshake). Order: `th` first,
-/// then `cs`.
+/// (typically via `notification_wait`-based handshake). Either order is
+/// safe: deleting `cs` first stops a still-live child (the kernel stops
+/// every thread bound to a `CSpace` before reclaiming it); deleting `th`
+/// first is the tidy order, since the exited thread's object goes at once.
 pub struct SpawnedChild
 {
     pub th: u32,

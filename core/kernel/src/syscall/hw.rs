@@ -478,7 +478,7 @@ pub fn sys_mmio_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     use crate::mm::PAGE_SIZE;
     use crate::syscall::current_tcb;
 
-    let mmio_idx = tf.arg(0) as u32;
+    let mmio_handle = tf.arg(0) as u32;
     let split_offset = tf.arg(1);
     // arg2 is reserved; ignore.
 
@@ -510,7 +510,7 @@ pub fn sys_mmio_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     let (mmio_phys, mmio_size, mmio_flags, mmio_rights, cspace_id, orig_obj_ptr) = {
         // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
-        let slot = unsafe { super::lookup_cap(caller_cspace, mmio_idx, MmioRights::MAP) }?;
+        let slot = unsafe { super::lookup_cap(caller_cspace, mmio_handle, MmioRights::MAP) }?;
         let obj_ptr = slot.object.ok_or(SyscallError::InvalidCapability)?;
         // SAFETY: tag confirmed Mmio; pointer is valid MmioObject.
         #[allow(clippy::cast_ptr_alignment)]
@@ -574,7 +574,7 @@ pub fn sys_mmio_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         install_split_children(
             caller_cspace,
             cspace_id,
-            mmio_idx,
+            mmio_handle,
             CapTag::Mmio,
             mmio_rights,
             orig_obj_ptr,
@@ -621,7 +621,7 @@ pub fn sys_irq_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     use crate::cap::split::install_split_children;
     use crate::syscall::current_tcb;
 
-    let irq_idx = tf.arg(0) as u32;
+    let irq_handle = tf.arg(0) as u32;
     let split_at = tf.arg(1) as u32;
     // arg2 reserved.
 
@@ -642,7 +642,7 @@ pub fn sys_irq_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     let (start, count, rights, cspace_id, orig_obj_ptr) = {
         // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
-        let slot = unsafe { super::lookup_cap(caller_cspace, irq_idx, IrqRights::NOTIFY) }?;
+        let slot = unsafe { super::lookup_cap(caller_cspace, irq_handle, IrqRights::NOTIFY) }?;
         let obj_ptr = slot.object.ok_or(SyscallError::InvalidCapability)?;
         // SAFETY: tag confirmed Interrupt; pointer is valid InterruptObject.
         #[allow(clippy::cast_ptr_alignment)]
@@ -700,7 +700,7 @@ pub fn sys_irq_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         install_split_children(
             caller_cspace,
             cspace_id,
-            irq_idx,
+            irq_handle,
             CapTag::Interrupt,
             rights,
             orig_obj_ptr,
@@ -757,7 +757,7 @@ pub fn sys_ioport_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         use crate::cap::split::install_split_children;
         use crate::syscall::current_tcb;
 
-        let port_idx = tf.arg(0) as u32;
+        let port_handle = tf.arg(0) as u32;
         let split_at_raw = tf.arg(1);
         // arg2 reserved.
 
@@ -787,7 +787,7 @@ pub fn sys_ioport_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
         let (base, size_u16, rights, cspace_id, orig_obj_ptr) = {
             // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
-            let slot = unsafe { super::lookup_cap(caller_cspace, port_idx, IoPortRights::USE) }?;
+            let slot = unsafe { super::lookup_cap(caller_cspace, port_handle, IoPortRights::USE) }?;
             let obj_ptr = slot.object.ok_or(SyscallError::InvalidCapability)?;
             // SAFETY: tag confirmed IoPort; pointer is valid IoPortObject.
             #[allow(clippy::cast_ptr_alignment)]
@@ -862,7 +862,7 @@ pub fn sys_ioport_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             install_split_children(
                 caller_cspace,
                 cspace_id,
-                port_idx,
+                port_handle,
                 CapTag::IoPort,
                 rights,
                 orig_obj_ptr,

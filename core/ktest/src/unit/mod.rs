@@ -132,6 +132,10 @@ pub fn run_all(ctx: &TestContext)
         "cap::cspace_teardown_multibatch",
         cap::cspace_teardown_multibatch(ctx)
     );
+    run_test!(
+        "cap::cspace_delete_stops_bound_thread",
+        cap::cspace_delete_stops_bound_thread(ctx)
+    );
 
     // ── Capability inspection (SYS_CAP_INFO) ──────────────────────────────────
     run_test!(
@@ -213,6 +217,10 @@ pub fn run_all(ctx: &TestContext)
     run_test!(
         "retype::cspace_dir_page_survives_failed_grow",
         retype::cspace_dir_page_survives_failed_grow(ctx)
+    );
+    run_test!(
+        "retype::aspace_delete_stops_bound_thread",
+        retype::aspace_delete_stops_bound_thread(ctx)
     );
     run_test!(
         "retype::cspace_pool_exhaust_then_augment",
@@ -458,6 +466,10 @@ pub fn run_all(ctx: &TestContext)
     run_test!(
         "thread::sched_split_after_slot_reuse",
         thread::sched_split_after_slot_reuse(ctx)
+    );
+    run_test!(
+        "thread::sched_split_rollback_on_full_cspace",
+        thread::sched_split_rollback_on_full_cspace(ctx)
     );
     run_test!(
         "thread::create_priority_args",

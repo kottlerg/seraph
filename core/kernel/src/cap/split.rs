@@ -29,7 +29,8 @@ use syscall::SyscallError;
 /// The caller must have already validated the split point and allocated the
 /// two child object bodies. This:
 ///   1. inserts both children into the caller's `CSpace` under `cspace.lock`,
-///      rolling back (and deallocating both bodies) on either insert failure;
+///      rolling back on either insert failure (a body is deallocated only
+///      once nothing references it);
 ///   2. rewires the derivation tree under `DERIVATION_LOCK` — reparents the
 ///      original's children to its parent in `MAX_REPARENT_EDITS` batches
 ///      (lock released between batches), unlinks the original, then links
@@ -139,8 +140,8 @@ pub(crate) unsafe fn install_split_children(
                     )
                 };
                 DERIVATION_LOCK.write_unlock();
-                // SAFETY: each flagged pointer is refcount 1 and unreferenced
-                // by any slot once rollback_child reported it still ours.
+                // SAFETY: each flagged pointer reached refcount zero in
+                // rollback_child and is referenced by no slot.
                 unsafe { dealloc_rolled_back(released, child1_ptr, child2_ptr) };
                 return Err(
                     if orig_parent.is_some()
@@ -260,8 +261,8 @@ unsafe fn insert_children(
             r
         };
         // SAFETY: child2_ptr was freshly allocated with refcount 1 and never
-        // stored; child1_ptr likewise unless a sibling thread already
-        // released it (then rollback_child reported it gone).
+        // stored; child1_ptr is freed only if rollback_child dropped its
+        // last reference.
         unsafe { dealloc_rolled_back((release1, true), child1_ptr, child2_ptr) };
         SyscallError::from(e)
     })?;
@@ -270,14 +271,19 @@ unsafe fn insert_children(
 
 /// Release one inserted-but-not-yet-wired split child during rollback.
 ///
-/// Returns `true` if the slot still held `child_ptr` and was freed here —
-/// the caller must then `dealloc_object(child_ptr)` after dropping the
-/// lock. Returns `false` if a sibling thread already deleted the child (its
-/// delete released the object) or the slot was recycled since; nothing is
-/// touched in that case. Anything a sibling derived from the child in the
-/// meantime is detached into derivation roots first, so the free never
-/// strands a child of the released slot with a dangling parent link — that
-/// window is the insert-to-wire gap of one syscall, so the walk is short.
+/// If the slot still holds `child_ptr`, the slot is freed and the object's
+/// reference dropped; returns `true` only when that drop reached zero, in
+/// which case the caller must `dealloc_object(child_ptr)` after releasing
+/// the lock. Returns `false` if a sibling thread already deleted the child
+/// (its delete released the object), the slot was recycled since, or other
+/// slots still reference the object — a sibling may have derived or copied
+/// the child between its insert and this rollback, and those caps stay
+/// valid. Anything derived from the child is detached into derivation
+/// roots first, so the free never strands a child with a dangling parent
+/// link. That walk runs to completion under the lock: its length is
+/// however many derivations a sibling landed in the window, not a
+/// constant, but nothing can extend the list while the lock is held, so it
+/// terminates.
 ///
 /// # Safety
 ///
@@ -310,16 +316,18 @@ unsafe fn rollback_child(
         (*caller_cspace).free_slot(slot.get());
         (*caller_cspace).lock.unlock_raw(saved);
     }
-    true
+    // SAFETY: child_ptr is a live object header (the slot referenced it
+    // until the free above); the slot's reference is dropped exactly once.
+    unsafe { (*child_ptr.as_ptr()).dec_ref() == 0 }
 }
 
-/// Deallocate the split children flagged as released (`(child1, child2)`
-/// order) by [`rollback_child`], or never stored.
+/// Deallocate the split children flagged (`(child1, child2)` order) as
+/// having reached refcount zero in [`rollback_child`], or never stored.
 ///
 /// # Safety
 ///
 /// Must run with `DERIVATION_LOCK` released (dealloc may take inner locks);
-/// each flagged pointer must be an unreferenced refcount-1 body.
+/// each flagged pointer must be an unreferenced refcount-0 body.
 unsafe fn dealloc_rolled_back(
     released: (bool, bool),
     child1_ptr: NonNull<KernelObjectHeader>,

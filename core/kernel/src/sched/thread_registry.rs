@@ -3,19 +3,25 @@
 
 // kernel/src/sched/thread_registry.rs
 
-//! Global live-thread registry — a diagnostic-only intrusive doubly-linked
-//! list of every live TCB.
+//! Global live-thread registry — an intrusive doubly-linked list of every
+//! live TCB.
 //!
 //! Threads are spliced in at construction ([`register`]) and removed at dealloc
 //! ([`unregister`]), both under [`THREAD_REGISTRY_LOCK`]. The softlockup
 //! watchdog walks it ([`try_for_each`]) to enumerate `Blocked` waiters that the
 //! per-CPU `current` dump cannot reach: the lost-wakeup victim in #351 is a
 //! `Blocked` thread referenced only by the IPC object it parked on, invisible
-//! to a `current`-only dump.
+//! to a `current`-only dump. Object teardown walks it ([`for_each`]) to find
+//! and stop every thread bound to a dying `CSpace` or `AddressSpace`
+//! (`sched::stop_threads_bound_to`).
 //!
-//! [`THREAD_REGISTRY_LOCK`] is a leaf — taken alone, never nested under a
-//! `sched_lock` or a run-queue lock — so it introduces no new lock-order edge.
-//! See docs/scheduling-internals.md § Thread Registry.
+//! [`THREAD_REGISTRY_LOCK`] is never taken under a `sched_lock`, a run-queue
+//! lock, or an IPC-source lock; the teardown walk takes those under it, so
+//! the only lock-order edge is registry → (IPC source → `sched_lock` →
+//! run-queue locks). The lock is held with interrupts disabled and must not
+//! be held while waiting for another CPU to make progress: a CPU spinning on
+//! it inside [`register`] cannot deschedule. See
+//! docs/scheduling-internals.md § Thread Registry.
 
 #![cfg(not(test))]
 
@@ -136,4 +142,36 @@ pub unsafe fn try_for_each(mut f: impl FnMut(*mut ThreadControlBlock)) -> bool
     // SAFETY: paired with try_lock_raw above.
     unsafe { THREAD_REGISTRY_LOCK.unlock_raw(saved) };
     true
+}
+
+/// Walk the live-thread registry under its lock, invoking `f` on every
+/// registered TCB pointer — the object-teardown walk.
+///
+/// Blocks on the lock (teardown must not skip a thread the way the watchdog
+/// may). While `f` runs its TCB cannot be unregistered — and so cannot be
+/// freed, since every free is preceded by [`unregister`] — but `f` must not
+/// wait for another CPU: a CPU spinning on this lock inside [`register`]
+/// cannot deschedule, so a wait for it here deadlocks.
+///
+/// # Safety
+/// `f` must not register or unregister any thread. It may take IPC-source,
+/// `sched_lock`, and run-queue locks (all ordered after this lock) but must
+/// not block or spin on another CPU's progress.
+pub unsafe fn for_each(mut f: impl FnMut(*mut ThreadControlBlock))
+{
+    // SAFETY: lock serialises all registry access.
+    let saved = unsafe { THREAD_REGISTRY_LOCK.lock_raw() };
+    // SAFETY: list is consistent under the lock; MAX_WALK bounds a corrupt cycle.
+    unsafe {
+        let mut node = THREAD_REGISTRY_HEAD;
+        let mut visited = 0usize;
+        while !node.is_null() && visited < MAX_WALK
+        {
+            f(node);
+            node = (*node).registry_next;
+            visited += 1;
+        }
+    }
+    // SAFETY: paired with lock_raw above.
+    unsafe { THREAD_REGISTRY_LOCK.unlock_raw(saved) };
 }

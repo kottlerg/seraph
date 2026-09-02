@@ -1668,86 +1668,11 @@ unsafe fn dealloc_object_one(
 
                     // UAF gate: a TCB that is `current` on any CPU MUST NOT be
                     // reclaimed until every CPU has switched away from it AND
-                    // the in-flight register save has published. Two steps:
-                    //
-                    //   1. Spin until `tcb` is not `current` on ANY CPU —
-                    //      unconditional, across every CPU. A single-CPU wait
-                    //      keyed on one all-locks snapshot would be insufficient:
-                    //      such a snapshot names at most one CPU and can be stale
-                    //      the instant the locks drop (a CPU mid-`schedule()` may
-                    //      install or retain `tcb` as `current` after it was
-                    //      taken). #207.
-                    //   2. Spin until `context_saved == 1`, covering the window
-                    //      where a CPU set `current = next` and dropped its lock
-                    //      but `switch()` has not yet saved `tcb`'s registers.
-                    //
-                    // The spins run with interrupts ENABLED and preemption
-                    // DISABLED, mirroring `mm::tlb_shootdown::shootdown`. We
-                    // enter dealloc from a syscall with `IF=0`; spinning here
-                    // with `IF=0` blocks incoming IPIs (FPU flush, TLB
-                    // shootdown) targeted at this CPU and deadlocks them.
-                    // Enabling IF lets us service those, while `preempt_disable`
-                    // keeps the scheduler from migrating us mid-dealloc.
-                    crate::percpu::preempt_disable();
-                    // SAFETY: ring 0; saved in matching restore below.
-                    let saved_int = crate::arch::current::cpu::save_and_disable_interrupts();
-                    // SAFETY: ring 0; IDT loaded; preempt disabled.
-                    crate::arch::current::interrupts::enable();
-
-                    // Step 1: not `current` on any CPU. Find the (at most one)
-                    // CPU still running `tcb`, spin on just that CPU's lock
-                    // until it switches away, then re-scan; once a full scan is
-                    // clean, no CPU can re-install `tcb` (it is `Exited` and
-                    // unlinked from every run queue under the all-locks region).
-                    crate::sched::spin_site_enter(crate::sched::SPIN_SITE_DEALLOC_NOT_CURRENT);
-                    loop
-                    {
-                        let run_cpu = 'scan: {
-                            for cpu in 0..cpu_count
-                            {
-                                let s = crate::sched::scheduler_for(cpu);
-                                let f = s.lock.lock_raw();
-                                let is_cur = s.current == tcb;
-                                s.lock.unlock_raw(f);
-                                if is_cur
-                                {
-                                    break 'scan Some(cpu);
-                                }
-                            }
-                            None
-                        };
-                        let Some(run_cpu) = run_cpu
-                        else
-                        {
-                            break;
-                        };
-                        let sched = crate::sched::scheduler_for(run_cpu);
-                        while {
-                            let s = sched.lock.lock_raw();
-                            let still_current = sched.current == tcb;
-                            sched.lock.unlock_raw(s);
-                            still_current
-                        }
-                        {
-                            core::hint::spin_loop();
-                        }
-                    }
-
-                    // Step 2: register save published.
-                    crate::sched::spin_site_enter(crate::sched::SPIN_SITE_DEALLOC_CONTEXT_SAVED);
-                    while (*tcb)
-                        .context_saved
-                        .load(core::sync::atomic::Ordering::Acquire)
-                        == 0
-                    {
-                        core::hint::spin_loop();
-                    }
-                    crate::sched::spin_site_exit();
-
-                    // Restore the caller's interrupt state and preemption.
-                    // SAFETY: saved_int from save_and_disable_interrupts above.
-                    crate::arch::current::cpu::restore_interrupts(saved_int);
-                    crate::percpu::preempt_enable();
+                    // the in-flight register save has published. Shared with
+                    // the object-teardown stop path; see `wait_until_off_cpu`.
+                    // SAFETY: tcb is Exited and unlinked from every run queue
+                    // (all-locks region above); not the running thread here.
+                    crate::sched::wait_until_off_cpu(tcb);
 
                     // After eager FPU save (#108), no fpu_owner sweep is
                     // needed: `nm_handler` only ever names the currently
@@ -2151,6 +2076,20 @@ unsafe fn dealloc_object_one(
 
             if !as_ptr.is_null()
             {
+                // ── Stop bound threads ──
+                // Same discipline as the CSpace arm: every thread bound to
+                // this address space is marked Exited and waited off-CPU
+                // before its root page table is freed, so no CPU can run in
+                // it afterwards. Objects of the stopped threads are freed
+                // when their own last caps go.
+                // SAFETY: as_ptr uniquely owned (refcount 0); no scheduler,
+                // IPC, or registry lock is held here.
+                unsafe {
+                    crate::sched::stop_threads_bound_to(|tcb| {
+                        core::ptr::eq((*tcb).address_space, as_ptr)
+                    });
+                }
+
                 // No CPU should still have this address space loaded in
                 // satp/CR3 when we free its root page table.
                 debug_assert!(
@@ -2272,6 +2211,21 @@ unsafe fn dealloc_object_one(
 
             if !cs_ptr.is_null()
             {
+                // ── Stop bound threads ──
+                // Every thread bound to this CSpace is marked Exited and
+                // waited off-CPU before anything below runs: no thread can
+                // be mid-syscall against these slot pages when they are
+                // freed, and none can wire derivation links during the drain.
+                // Their objects are freed when their own last caps go — in
+                // the dec_ref cascade below if those caps live here. The
+                // running thread destroying its own CSpace is marked Exited
+                // and continues; the syscall epilogue schedules it away.
+                // SAFETY: cs_ptr uniquely owned (refcount 0); no scheduler,
+                // IPC, or registry lock is held here.
+                unsafe {
+                    crate::sched::stop_threads_bound_to(|tcb| core::ptr::eq((*tcb).cspace, cs_ptr));
+                }
+
                 // SAFETY: cs_ptr non-null; allocated at creation.
                 let id = unsafe { (*cs_ptr).id() };
                 dying_id = id;
@@ -2892,7 +2846,7 @@ unsafe fn drain_dying_cspace_batch(
 ) -> bool
 {
     use crate::cap::cspace::L2_SIZE;
-    use crate::cap::derivation::unlink_node;
+    use crate::cap::derivation::{truncate_dead_link, unlink_node};
     use crate::cap::slot::{CapTag, SlotId};
     use core::num::NonZeroU32;
 
@@ -2956,16 +2910,10 @@ unsafe fn drain_dying_cspace_batch(
                 unsafe { (*cs_ptr).slot(global_idx) }.and_then(|s| s.deriv_first_child);
             if still_head == Some(head)
             {
-                crate::kprintln!(
-                    "cap: teardown drain: unresolvable child link (cspace {} slot {}); truncating",
-                    head.cspace_id,
-                    head.index.get()
-                );
-                // SAFETY: brief exclusive borrow of the dying slot.
-                if let Some(slot) = unsafe { (*cs_ptr).slot_mut(global_idx) }
-                {
-                    slot.deriv_first_child = None;
-                }
+                // SAFETY: DERIVATION_LOCK held; self_id names an occupied
+                // slot of a CSpace that stays registered until the final
+                // batch.
+                unsafe { truncate_dead_link(self_id, head, "teardown drain") };
                 break;
             }
         }

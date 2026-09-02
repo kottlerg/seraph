@@ -423,10 +423,10 @@ impl CSpace
             }
         }
 
-        let page_nn: NonNull<CSpacePage> = self.alloc_zeroed_page()?;
+        let mut page_nn: NonNull<CSpacePage> = self.alloc_zeroed_page()?;
         // SAFETY: page_nn points at an exclusively-owned, zeroed CSpacePage
         // not yet published to any reader.
-        let page = unsafe { page_nn.as_ptr().as_mut().unwrap_unchecked() };
+        let page = unsafe { page_nn.as_mut() };
 
         // Thread the leaf's slots onto the free list BEFORE publication so
         // the Release store below orders the initialised slot bytes ahead

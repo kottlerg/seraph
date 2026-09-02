@@ -436,6 +436,14 @@ concurrent ancestor revoke sheds the marker with the slot (that ancestor's
 revoke clears the hoisted survivors too, since they remain inside its
 subtree).
 
+A `CSpace` reaching refcount zero first stops every thread bound to it
+(`sched::stop_threads_bound_to`, see
+[scheduling-internals.md](scheduling-internals.md) § Thread Registry): each is
+marked `Exited` and waited off every CPU before any slot page is freed, so no
+thread can be mid-syscall against the dying directory, and none of the dying
+process's own threads can touch the derivation forest during the drain below.
+The same discipline applies to an `AddressSpace` reaching refcount zero.
+
 Every derivation link reachable from a live slot resolves: before a `CSpace`
 unregisters, its teardown drain (`drain_dying_cspace_batch`) unlinks every
 dying slot from the forest — foreign children are orphaned into derivation
@@ -444,9 +452,10 @@ neighbours re-linked directly. Each unlink leaves the forest fully
 consistent, so the drain runs in edit-bounded batches that release the
 derivation write lock between holds (mirroring revocation's batching); a
 foreign traversal in a window between batches sees ordinary consistent
-nodes. The one remaining source of a dead link is the dying process racing
-its own teardown (wiring a link out of or into the dying CSpace from a
-surviving thread or an in-flight receive during the drain window). A link
+nodes. The one remaining source of a dead link is a foreign sender whose
+capability transfer into the dying CSpace had already committed to a
+receiver there before that receiver was stopped, wiring a link into a slot
+the drain cursor has passed. A link
 that fails to resolve — that race, or genuine corruption — is contained
 wherever a walk meets it, always by truncation: the revoke walk cuts the
 chain hanging from the dead link, logs it, and the syscall returns

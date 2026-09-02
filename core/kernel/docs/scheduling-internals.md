@@ -62,7 +62,19 @@ The following ordering MUST be observed everywhere in the kernel. Acquiring lock
 
 3. **`SLEEP_LIST_LOCK` is leaf-only.** It MAY be acquired from inside any source IPC lock. It MUST NOT contain calls that re-enter IPC or scheduler code while held.
 
-3a. **`THREAD_REGISTRY_LOCK` is strict-leaf-only.** The diagnostic live-thread registry (`core/kernel/src/sched/thread_registry.rs`) is linked at thread construction and unlinked at dealloc, both with `THREAD_REGISTRY_LOCK` held strictly alone — never nested under a source IPC lock, `(*tcb).sched_lock`, or a run-queue lock — so it adds no lock-order edge. The softlockup watchdog walks it via `try_for_each` (a non-blocking `try_lock`, so a contended or CPU-died lock degrades to a skipped section rather than a hang). See § Thread Registry.
+3a. **`THREAD_REGISTRY_LOCK` orders before every IPC-source, `sched_lock`, and
+run-queue lock, and is never taken under any of them.** The live-thread registry
+(`core/kernel/src/sched/thread_registry.rs`) is linked at thread construction
+and unlinked at dealloc with `THREAD_REGISTRY_LOCK` held alone. The
+object-teardown walk (`stop_threads_bound_to`) holds it while cancelling IPC
+blocks and writing `Exited` under the all-locks discipline, so the registry
+lock sits above those in the hierarchy — the only edge it adds, and one no
+path traverses in reverse. It must not be held while waiting for another CPU
+to make progress (a CPU spinning on it inside `register` cannot deschedule):
+the teardown walk marks under the lock and waits after releasing it. The
+softlockup watchdog walks the registry via `try_for_each` (a non-blocking
+`try_lock`, so a contended or CPU-died lock degrades to a skipped section
+rather than a hang). See § Thread Registry.
 
 4. **Per-TCB-then-cross-CPU acquisition rule.** A path mutating a TCB's Scheduling field group MUST acquire `(*tcb).sched_lock` FIRST (outermost among the scheduler locks), THEN any per-CPU scheduler.lock(s); when two or more per-CPU scheduler.locks are needed simultaneously, they MUST be taken in ascending-CPU order. Live production sites: `sched::migrate_ready_thread` (used by `sys_thread_set_affinity` active migration and the periodic load balancer; `(*tcb).sched_lock` then the two CPU locks ascending), `dealloc_object(Thread)` (`(*tcb).sched_lock` then the all-CPU walk in ascending order), `sched::set_state_under_all_locks` (lifecycle state writes; same shape), and `sys_thread_set_priority` (priority write under `(*tcb).sched_lock`, then locate-and-relocate of the Ready TCB's queue entry via `sched::relocate_ready_priority`, which locks the single `preferred_cpu`-hinted CPU's run-queue on a hint hit and only on a miss falls back to the all-CPU walk in ascending order). A path MUST NEVER hold two different TCBs' `sched_lock`s at once — `schedule()`'s outgoing-then-incoming flip releases `current.sched_lock` before acquiring `next.sched_lock`.
 
@@ -786,11 +798,12 @@ overhead in healthy paths.
 
 ## Thread Registry
 
-`core/kernel/src/sched/thread_registry.rs` is a diagnostic-only intrusive
-doubly-linked list of every live TCB, threaded through `registry_next` /
-`registry_prev` and guarded by the strict-leaf `THREAD_REGISTRY_LOCK` (Lock
-Hierarchy rule 3a). It exists solely so the softlockup watchdog can enumerate
-`Blocked` waiters that the per-CPU `current` dump cannot reach.
+`core/kernel/src/sched/thread_registry.rs` is an intrusive doubly-linked list of
+every live TCB, threaded through `registry_next` / `registry_prev` and guarded by
+`THREAD_REGISTRY_LOCK` (Lock Hierarchy rule 3a). It serves two readers: the
+softlockup watchdog, which enumerates `Blocked` waiters that the per-CPU
+`current` dump cannot reach, and object teardown, which finds every thread bound
+to a dying `CSpace` or `AddressSpace`.
 
 **Membership.** `register` splices a TCB onto the head; `unregister` removes it.
 A thread is registered on the success path of `sys_cap_create_thread` (after its
@@ -804,11 +817,34 @@ are never `Blocked` and are already shown by the per-CPU `current` dump.
 
 **Walk.** `try_for_each` takes the lock with a non-blocking `try_lock`: if it is
 contended (a register/unregister in flight) or a CPU died holding it, the walk is
-skipped rather than spun on — the watchdog must never block. A `MAX_WALK` bound
-caps a corrupted-into-a-cycle list so the already-fatal dump still terminates.
+skipped rather than spun on — the watchdog must never block. `for_each` blocks
+on the lock: teardown must not skip a thread. A `MAX_WALK` bound caps a
+corrupted-into-a-cycle list so either walk still terminates.
+
+**Object teardown (`stop_threads_bound_to`).** Deleting the last capability to
+a `CSpace` or `AddressSpace` must not free storage a bound thread is still using,
+so `dealloc_object` for either type first stops every thread bound to it. Phase
+1 walks the registry under its lock — a TCB found there cannot be unregistered,
+and so cannot be freed, until the walk ends — and for each bound thread not
+already `Exited`: cancels its IPC block if `Blocked` (`cancel_ipc_block`, the
+`sys_thread_stop` primitive), writes `Exited` under the all-locks discipline
+(`set_state_under_all_locks`, draining every run queue), and records the CPU it
+was running on. Phase 2, after releasing the registry lock, prods those CPUs and
+spins — interrupts enabled, preemption disabled, as the dealloc UAF gate does —
+until no CPU other than the caller's has a bound thread as `current`. A bound
+thread found `current` but not `Exited` was bound after the walk (a
+`sys_cap_create_thread` whose unlocked cap lookup raced the object's last
+delete); the loop returns to phase 1 for it. The caller's own thread, if bound,
+is marked `Exited` and not waited for: it finishes the teardown, touches the
+object no further, and the syscall epilogue schedules it away. Stopped threads
+are dead but not freed — each Thread object lives until its own last capability
+goes, and `dealloc_object(Thread)` then runs its full drain protocol on an
+already-`Exited`, off-CPU thread (the off-CPU wait itself is the shared
+`wait_until_off_cpu`).
 
 **Not a scheduling structure.** The registry is never read on any hot path; it
-adds one leaf-lock acquire at thread create/destroy and nothing elsewhere.
+adds one lock acquire at thread create/destroy and a walk per `CSpace` or
+`AddressSpace` teardown.
 
 ---
 

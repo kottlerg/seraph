@@ -56,6 +56,7 @@ static mut STACK_CONFIGURE: ChildStack = ChildStack::ZERO;
 static mut STACK_STOP_REGS: ChildStack = ChildStack::ZERO;
 static mut STACK_WRITE_REGS: ChildStack = ChildStack::ZERO;
 static mut STACK_CONFIGURE_ERR: ChildStack = ChildStack::ZERO;
+static mut STACK_SPLIT_ROLLBACK: ChildStack = ChildStack::ZERO;
 static mut STACK_AFFINITY_CPU1: ChildStack = ChildStack::ZERO;
 static mut STACK_AFFINITY_RESPECTED: ChildStack = ChildStack::ZERO;
 static mut STACK_DEFAULT_AFFINITY: ChildStack = ChildStack::ZERO;
@@ -451,6 +452,111 @@ pub fn sched_split_after_slot_reuse(ctx: &TestContext) -> TestResult
         return Err("thread::sched_split_after_slot_reuse: USED did not return to baseline");
     }
     Ok(())
+}
+
+/// A range split whose second child insert fails rolls the first child
+/// back: the original survives untouched and exactly the one free slot the
+/// split consumed is free again.
+///
+/// A child bound to a small `CSpace` derives from its `SchedControl` copy
+/// until the slot-page pool is exhausted, frees one slot, and splits: the
+/// first insert takes that slot, the second fails with `OutOfMemory`, and
+/// the tail must release the first child's slot and object. The child then
+/// proves one — and only one — slot is free and that the original still
+/// resolves.
+pub fn sched_split_rollback_on_full_cspace(ctx: &TestContext) -> TestResult
+{
+    let baseline = syscall::cap_info(ctx.memory_base, syscall_abi::CAP_INFO_MEMORY_AVAILABLE)
+        .map_err(|_| "thread::split_rollback: cap_info(baseline) failed")?;
+    let done = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "thread::split_rollback: create done failed")?;
+    let child =
+        crate::spawn::new_child(ctx).map_err(|_| "thread::split_rollback: new_child failed")?;
+    let child_sched = cap_copy(ctx.sched_control_cap, child.cs, RIGHTS_ALL)
+        .map_err(|_| "thread::split_rollback: cap_copy sched failed")?;
+    let child_done = cap_copy(done, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
+        .map_err(|_| "thread::split_rollback: cap_copy done failed")?;
+    let arg = u64::from(child_sched) | (u64::from(child_done) << 16);
+    let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_SPLIT_ROLLBACK));
+    crate::spawn::configure_and_start(&child, split_rollback_child_entry, stack_top, arg)
+        .map_err(|_| "thread::split_rollback: configure_and_start failed")?;
+
+    let bits = notification_wait(done).map_err(|_| "thread::split_rollback: wait done failed")?;
+    cap_delete(child.th).map_err(|_| "thread::split_rollback: cap_delete(thread) failed")?;
+    cap_delete(child.cs).map_err(|_| "thread::split_rollback: cap_delete(cspace) failed")?;
+    cap_delete(done).ok();
+    if bits != 0x1
+    {
+        return Err("thread::split_rollback: child observed a bad rollback (see child bits)");
+    }
+    let after = syscall::cap_info(ctx.memory_base, syscall_abi::CAP_INFO_MEMORY_AVAILABLE)
+        .map_err(|_| "thread::split_rollback: cap_info(after) failed")?;
+    if after != baseline
+    {
+        return Err("thread::split_rollback: memory did not return to baseline");
+    }
+    Ok(())
+}
+
+/// Child for [`sched_split_rollback_on_full_cspace`]; reports `0x1` on
+/// success, else a bit naming the first failed step.
+fn split_rollback_child_entry(arg: u64) -> !
+{
+    const OUT_OF_MEMORY: i64 = -8;
+    let sched_slot = (arg & 0xFFFF) as u32;
+    let done_slot = ((arg >> 16) & 0xFFFF) as u32;
+
+    let bits = 'run: {
+        // Fill the CSpace until the pool is exhausted, keeping the last cap.
+        let mut last = None;
+        for _ in 0..4096
+        {
+            match cap_derive(sched_slot, RIGHTS_ALL)
+            {
+                Ok(c) => last = Some(c),
+                Err(e) if e == OUT_OF_MEMORY => break,
+                Err(_) => break 'run 0x10,
+            }
+        }
+        let Some(last) = last
+        else
+        {
+            break 'run 0x20;
+        };
+        // Exactly one free slot.
+        if cap_delete(last).is_err()
+        {
+            break 'run 0x40;
+        }
+        // First insert takes it; the second fails; the first is rolled back.
+        match sched_split(sched_slot, 21)
+        {
+            Err(e) if e == OUT_OF_MEMORY =>
+            {}
+            _ => break 'run 0x80,
+        }
+        // The original survives.
+        if syscall::cap_info(sched_slot, syscall_abi::CAP_INFO_TAG_RIGHTS).is_err()
+        {
+            break 'run 0x100;
+        }
+        // One slot free again — and only one.
+        let Ok(probe) = cap_derive(sched_slot, RIGHTS_ALL)
+        else
+        {
+            break 'run 0x200;
+        };
+        let second = cap_derive(sched_slot, RIGHTS_ALL);
+        cap_delete(probe).ok();
+        if let Ok(extra) = second
+        {
+            cap_delete(extra).ok();
+            break 'run 0x400;
+        }
+        0x1
+    };
+    notification_send(done_slot, bits).ok();
+    thread_exit()
 }
 
 /// `SYS_CAP_CREATE_THREAD` priority arguments: floor creation needs no

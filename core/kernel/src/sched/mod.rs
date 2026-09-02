@@ -2075,6 +2075,234 @@ pub unsafe fn set_state_under_all_locks(
     running_on
 }
 
+/// Wait until `tcb` has left every CPU and its in-flight register save has
+/// published — the UAF gate shared by `dealloc_object(Thread)` and the
+/// object-teardown stop path ([`stop_threads_bound_to`]).
+///
+/// # Safety
+/// `tcb` must be a valid TCB already marked `Stopped` or `Exited` and
+/// unlinked from every run queue under the all-locks discipline (so no CPU
+/// can re-install it), and must not be the running thread on this CPU. No
+/// scheduler lock may be held.
+#[cfg(not(test))]
+pub unsafe fn wait_until_off_cpu(tcb: *mut ThreadControlBlock)
+{
+    let cpu_count = CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
+    // SAFETY: caller contract; the spins only read scheduler state under
+    // each CPU's lock and the TCB's atomic save flag.
+    unsafe {
+        // UAF gate: a TCB that is `current` on any CPU MUST NOT be
+        // reclaimed until every CPU has switched away from it AND
+        // the in-flight register save has published. Two steps:
+        //
+        //   1. Spin until `tcb` is not `current` on ANY CPU —
+        //      unconditional, across every CPU. A single-CPU wait
+        //      keyed on one all-locks snapshot would be insufficient:
+        //      such a snapshot names at most one CPU and can be stale
+        //      the instant the locks drop (a CPU mid-`schedule()` may
+        //      install or retain `tcb` as `current` after it was
+        //      taken). #207.
+        //   2. Spin until `context_saved == 1`, covering the window
+        //      where a CPU set `current = next` and dropped its lock
+        //      but `switch()` has not yet saved `tcb`'s registers.
+        //
+        // The spins run with interrupts ENABLED and preemption
+        // DISABLED, mirroring `mm::tlb_shootdown::shootdown`. We
+        // enter dealloc from a syscall with `IF=0`; spinning here
+        // with `IF=0` blocks incoming IPIs (FPU flush, TLB
+        // shootdown) targeted at this CPU and deadlocks them.
+        // Enabling IF lets us service those, while `preempt_disable`
+        // keeps the scheduler from migrating us mid-dealloc.
+        crate::percpu::preempt_disable();
+        // SAFETY: ring 0; saved in matching restore below.
+        let saved_int = crate::arch::current::cpu::save_and_disable_interrupts();
+        // SAFETY: ring 0; IDT loaded; preempt disabled.
+        crate::arch::current::interrupts::enable();
+
+        // Step 1: not `current` on any CPU. Find the (at most one)
+        // CPU still running `tcb`, spin on just that CPU's lock
+        // until it switches away, then re-scan; once a full scan is
+        // clean, no CPU can re-install `tcb` (it is `Exited` and
+        // unlinked from every run queue under the all-locks region).
+        crate::sched::spin_site_enter(crate::sched::SPIN_SITE_DEALLOC_NOT_CURRENT);
+        loop
+        {
+            let run_cpu = 'scan: {
+                for cpu in 0..cpu_count
+                {
+                    let s = crate::sched::scheduler_for(cpu);
+                    let f = s.lock.lock_raw();
+                    let is_cur = s.current == tcb;
+                    s.lock.unlock_raw(f);
+                    if is_cur
+                    {
+                        break 'scan Some(cpu);
+                    }
+                }
+                None
+            };
+            let Some(run_cpu) = run_cpu
+            else
+            {
+                break;
+            };
+            let sched = crate::sched::scheduler_for(run_cpu);
+            while {
+                let s = sched.lock.lock_raw();
+                let still_current = sched.current == tcb;
+                sched.lock.unlock_raw(s);
+                still_current
+            }
+            {
+                core::hint::spin_loop();
+            }
+        }
+
+        // Step 2: register save published.
+        crate::sched::spin_site_enter(crate::sched::SPIN_SITE_DEALLOC_CONTEXT_SAVED);
+        while (*tcb)
+            .context_saved
+            .load(core::sync::atomic::Ordering::Acquire)
+            == 0
+        {
+            core::hint::spin_loop();
+        }
+        crate::sched::spin_site_exit();
+
+        // Restore the caller's interrupt state and preemption.
+        // SAFETY: saved_int from save_and_disable_interrupts above.
+        crate::arch::current::cpu::restore_interrupts(saved_int);
+        crate::percpu::preempt_enable();
+    }
+}
+
+/// Stop every live thread bound to an object under teardown, identified by
+/// `bound`, before the object's storage is reclaimed.
+///
+/// Phase 1 walks the thread registry under its lock: each bound thread not
+/// already `Exited` has any IPC block cancelled and is marked `Exited` under
+/// the all-locks discipline (draining every run queue); CPUs found running
+/// one are recorded. Phase 2, with the registry released — a CPU spinning
+/// on the registry lock inside `register` cannot deschedule, so it must not
+/// be waited for while the lock is held — prods those CPUs and spins until
+/// no CPU other than this one has a bound thread as `current`. A bound
+/// thread that appears as `current` without being `Exited` (bound after the
+/// walk, through a cap lookup that raced the object's last delete) sends
+/// the loop back to phase 1. Threads stopped here are dead but not freed:
+/// each object lives until its own last capability goes, and
+/// `dealloc_object(Thread)` then runs its full drain on an already-Exited,
+/// off-CPU thread. A stopped server's reply-bound client is released by
+/// that later drain, exactly as for a server stopped by `SYS_THREAD_STOP`.
+///
+/// Returns `true` if the running thread itself was bound: it is marked
+/// `Exited` and not waited for — the syscall epilogue schedules it away and
+/// its object is reclaimed off-CPU once its last cap goes.
+///
+/// # Safety
+/// The caller must hold no scheduler, IPC-source, or registry lock. `bound`
+/// must only read through the TCB pointer it is given.
+#[cfg(not(test))]
+pub unsafe fn stop_threads_bound_to(bound: impl Fn(*mut ThreadControlBlock) -> bool) -> bool
+{
+    let this_cpu = crate::arch::current::cpu::current_cpu() as usize;
+    let cpu_count = CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
+    let mut self_bound = false;
+
+    // Phase 1 (repeatable): mark under the registry lock, prod afterwards.
+    let mark_bound = |self_bound: &mut bool| {
+        let mut prod = [false; MAX_CPUS];
+        // SAFETY: caller contract (no conflicting locks held); the walk body
+        // takes only locks ordered after the registry lock and never waits
+        // on another CPU.
+        unsafe {
+            thread_registry::for_each(|tcb| {
+                if !bound(tcb) || (*tcb).state == thread::ThreadState::Exited
+                {
+                    return;
+                }
+                // Reading our own CPU's `current` needs no lock — only this
+                // CPU writes it at dispatch, and we are that running thread.
+                let is_self = core::ptr::eq(tcb, scheduler_for(this_cpu).current);
+                if (*tcb).state == thread::ThreadState::Blocked
+                {
+                    crate::syscall::thread::cancel_ipc_block(tcb);
+                }
+                let running_on = set_state_under_all_locks(tcb, thread::ThreadState::Exited);
+                if is_self
+                {
+                    *self_bound = true;
+                }
+                else if let Some(cpu) = running_on
+                    && cpu != this_cpu
+                {
+                    prod[cpu] = true;
+                }
+            });
+        }
+        for (cpu, hit) in prod.iter().enumerate().take(cpu_count)
+        {
+            if *hit
+            {
+                // SAFETY: cpu < cpu_count.
+                unsafe { prod_remote_cpu(cpu) };
+            }
+        }
+    };
+    mark_bound(&mut self_bound);
+
+    // Phase 2: wait with interrupts enabled and preemption disabled, as the
+    // dealloc UAF gate does (see `wait_until_off_cpu`).
+    crate::percpu::preempt_disable();
+    // SAFETY: ring 0; restored below.
+    let saved_int = unsafe { crate::arch::current::cpu::save_and_disable_interrupts() };
+    // SAFETY: ring 0; IDT loaded; preempt disabled.
+    unsafe { crate::arch::current::interrupts::enable() };
+    spin_site_enter(SPIN_SITE_DEALLOC_NOT_CURRENT);
+    loop
+    {
+        let mut waiting = false;
+        let mut unmarked = false;
+        for cpu in 0..cpu_count
+        {
+            if cpu == this_cpu
+            {
+                continue;
+            }
+            // SAFETY: cpu < cpu_count; `current` is stable under its CPU's
+            // lock and cannot be freed while it is current.
+            unsafe {
+                let s = scheduler_for(cpu);
+                let f = s.lock.lock_raw();
+                let cur = s.current;
+                if !cur.is_null() && bound(cur)
+                {
+                    waiting = true;
+                    if (*cur).state != thread::ThreadState::Exited
+                    {
+                        unmarked = true;
+                    }
+                }
+                s.lock.unlock_raw(f);
+            }
+        }
+        if unmarked
+        {
+            mark_bound(&mut self_bound);
+            continue;
+        }
+        if !waiting
+        {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    spin_site_exit();
+    // SAFETY: saved_int from save_and_disable_interrupts above.
+    unsafe { crate::arch::current::cpu::restore_interrupts(saved_int) };
+    crate::percpu::preempt_enable();
+    self_bound
+}
+
 /// Test stub.
 #[cfg(test)]
 #[allow(unused_variables)]

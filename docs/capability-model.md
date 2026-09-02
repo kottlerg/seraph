@@ -605,9 +605,12 @@ for devmgr's specific initial capability set.
 Since there is no Process kernel object, terminating a process is a userspace
 (procmgr) policy, not a single kernel operation. procmgr revokes the capabilities
 backing the process's threads; each revocation stops that thread and removes it
-from the run queues. The kernel does not track which threads belong to an address
-space and never bulk-terminates threads on its own. The process's resources are
-reclaimed as their capability reference counts reach zero.
+from the run queues. The kernel never terminates threads by policy of its own;
+the one thing it enforces is that a thread cannot outlive the `CSpace` or
+`AddressSpace` it is bound to: when the last capability to either object is
+deleted, every thread bound to it is stopped before the object's storage is
+reclaimed, wherever those threads' own capabilities are held. The process's
+resources are reclaimed as their capability reference counts reach zero.
 
 The kernel's only role in death is *notification*. An `AddressSpace` carries a
 death-observer set (mirroring the per-thread death observers). On a terminal

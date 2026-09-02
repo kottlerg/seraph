@@ -696,17 +696,16 @@ pub(crate) unsafe fn lookup_cap<K: crate::cap::slot::CapKind>(
     #[allow(clippy::ref_as_ptr)]
     // SAFETY: the slot lives in a leaf page of the CSpace's directory. Leaf
     // pages are write-once, Release-published, and never freed or moved
-    // before refcount-0 teardown (see CSpace's memory-ordering contract).
-    // Nothing pins the CSpace to the calling thread: `tcb.cspace` is a
-    // bare pointer holding no reference, so whoever holds the CSpace cap
-    // (ordinarily the supervisor, in another process) can drop the last
-    // reference while this thread is mid-syscall, and teardown then frees
-    // the pages under this reference. Keeping a bound CSpace alive for its
-    // threads' lifetime is a supervisor convention (delete the thread
-    // before its CSpace — see ktest's spawn helper and procmgr), not a
-    // kernel-enforced invariant. Within the process, the unlocked
-    // tag/generation checks above narrow — but cannot close — the race
-    // against a sibling thread freeing/recycling this same slot
+    // before refcount-0 teardown (see CSpace's memory-ordering contract),
+    // and that teardown first stops every thread bound to the CSpace and
+    // waits until it is off every CPU (`sched::stop_threads_bound_to`), so
+    // no thread can be executing this function — or holding the returned
+    // reference across a syscall — when the pages go. The one thread that
+    // still runs after its own CSpace is freed is the caller destroying it:
+    // it is marked Exited, touches no slot after the dealloc, and the
+    // syscall epilogue schedules it away for good. Within the process, the
+    // unlocked tag/generation checks above narrow — but cannot close — the
+    // race against a sibling thread freeing/recycling this same slot
     // concurrently; lookup_cap resolves only the caller's CSpace, so that
     // residual reaches no cross-process authority.
     Ok(unsafe { &*(slot as *const _) })

@@ -15,10 +15,10 @@
 //! index (the doubly-linked list makes arbitrary unlinks O(1)). Call
 //! [`CapabilitySlot::set_next_free`] / [`CapabilitySlot::next_free`] and
 //! [`CapabilitySlot::set_prev_free_link`] / [`CapabilitySlot::prev_free`]
-//! to encode/decode; do not read the fields directly on a free slot. The `epoch` field of the encoded `SlotId` is the
-//! free-list sentinel value `0` and MUST NOT appear in any live derivation
-//! link — derivation links carry the registry epoch that was current when
-//! they were stamped.
+//! to encode/decode; do not read the fields directly on a free slot. The
+//! `epoch` field of the encoded `SlotId` is the free-list sentinel value
+//! `0` and MUST NOT appear in any live derivation link — derivation links
+//! carry the registry epoch that was current when they were stamped.
 //!
 //! ## Size derivation
 //!

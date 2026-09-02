@@ -253,6 +253,66 @@ pub fn revoke_invalidates(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
+/// Deleting an intermediate cap re-links its children under its parent in
+/// batches, so grandchildren stay usable after the delete and are still
+/// revoked from the grandparent afterwards.
+///
+/// 300 grandchildren exceed one `MAX_REPARENT_EDITS` batch, so the delete
+/// crosses a lock release with children still to move. Probes at the head,
+/// middle, and tail of the child list cover both batches; the `USED` count
+/// returns to its baseline once the revoke has freed everything.
+pub fn delete_intermediate_keeps_grandchildren_revocable(ctx: &TestContext) -> TestResult
+{
+    const GRANDCHILDREN: u32 = 300;
+
+    let used_before = cap_info(ctx.cspace_cap, syscall_abi::CAP_INFO_CSPACE_USED)
+        .map_err(|_| "delete_intermediate: cap_info(used before) failed")?;
+    let sig = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "delete_intermediate: create_notification failed")?;
+    let mid =
+        cap_derive(sig, RIGHTS_NOTIFY).map_err(|_| "delete_intermediate: derive mid failed")?;
+
+    let mut probes: [Option<u32>; 3] = [None; 3];
+    for i in 0..GRANDCHILDREN
+    {
+        let gc = cap_derive(mid, RIGHTS_NOTIFY)
+            .map_err(|_| "delete_intermediate: derive grandchild failed")?;
+        match i
+        {
+            0 => probes[0] = Some(gc),
+            x if x == GRANDCHILDREN / 2 => probes[1] = Some(gc),
+            x if x == GRANDCHILDREN - 1 => probes[2] = Some(gc),
+            _ =>
+            {}
+        }
+    }
+
+    cap_delete(mid).map_err(|_| "delete_intermediate: cap_delete(mid) failed")?;
+    for probe in probes.iter().flatten()
+    {
+        notification_send(*probe, 0x1)
+            .map_err(|_| "delete_intermediate: grandchild unusable after deleting its parent")?;
+    }
+
+    cap_revoke(sig).map_err(|_| "delete_intermediate: cap_revoke(sig) failed")?;
+    for probe in probes.iter().flatten()
+    {
+        if notification_send(*probe, 0x1).is_ok()
+        {
+            return Err("delete_intermediate: grandchild survived the grandparent's revoke");
+        }
+    }
+    cap_delete(sig).map_err(|_| "delete_intermediate: cap_delete(sig) failed")?;
+
+    let used_after = cap_info(ctx.cspace_cap, syscall_abi::CAP_INFO_CSPACE_USED)
+        .map_err(|_| "delete_intermediate: cap_info(used after) failed")?;
+    if used_after != used_before
+    {
+        return Err("delete_intermediate: USED did not return to baseline");
+    }
+    Ok(())
+}
+
 /// `cap_revoke` clears subtrees larger than one revoke batch — wide, deep,
 /// and bushy shapes — and the freed slots return to the `CSpace`.
 ///
@@ -653,12 +713,13 @@ pub fn derive_badge_on_notification(ctx: &TestContext) -> TestResult
 /// must afterwards revoke cleanly (no dead-link `InvalidState`) and stay
 /// usable.
 ///
-/// Two pins keep the test from passing vacuously: the child `CSpace`'s
-/// `USED` count must show the derive burst landed before the delete (so
-/// the drain really spans batches), and the parent's Memory cap must
-/// return to its pre-spawn `AVAILABLE` baseline afterwards — only the
-/// `CSpace` dealloc path (which runs the drain) returns those pages, so a
-/// lingering reference that skipped teardown would leave the delta.
+/// The pin against a vacuous pass is the parent's Memory cap returning to
+/// its pre-spawn `AVAILABLE` baseline afterwards — only the `CSpace`
+/// dealloc path (which runs the drain) returns those pages, so a lingering
+/// reference that skipped teardown would leave the delta. The child
+/// `CSpace`'s `USED` count is also checked before the delete; the handshake
+/// already implies it, so that check only guards a future change to the
+/// spawn helper or to derive semantics silently shrinking the burst.
 pub fn cspace_teardown_multibatch(ctx: &TestContext) -> TestResult
 {
     const DERIVES: u64 = 300;

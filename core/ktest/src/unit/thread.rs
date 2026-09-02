@@ -390,6 +390,69 @@ pub fn sched_split_enforces_bands(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
+/// A range split on a cap whose slot has been reused (non-zero handle
+/// generation) consumes the original and installs both children.
+///
+/// The split tail addresses the original by decoding the handle it was
+/// looked up with; using the raw handle as an index misses any recycled
+/// slot, leaving the original in place while its object is released — a
+/// refcount underflow that surfaces only after slot reuse, which every
+/// long-running service reaches.
+pub fn sched_split_after_slot_reuse(ctx: &TestContext) -> TestResult
+{
+    let used_before = syscall::cap_info(ctx.cspace_cap, syscall_abi::CAP_INFO_CSPACE_USED)
+        .map_err(|_| "thread::sched_split_after_slot_reuse: cap_info(used before) failed")?;
+
+    // Occupy a slot, free it (generation bump), and take it again: the
+    // free list is LIFO, so the second derive lands on the same index with
+    // a fresh generation.
+    let first = cap_derive(ctx.sched_control_cap, RIGHTS_ALL)
+        .map_err(|_| "thread::sched_split_after_slot_reuse: first cap_derive failed")?;
+    cap_delete(first)
+        .map_err(|_| "thread::sched_split_after_slot_reuse: cap_delete(first) failed")?;
+    let reused = cap_derive(ctx.sched_control_cap, RIGHTS_ALL)
+        .map_err(|_| "thread::sched_split_after_slot_reuse: second cap_derive failed")?;
+    if syscall_abi::cap_handle_index(reused) != syscall_abi::cap_handle_index(first)
+        || syscall_abi::cap_handle_gen(reused) == 0
+    {
+        cap_delete(reused).ok();
+        return Err(
+            "thread::sched_split_after_slot_reuse: slot was not reused with a new generation",
+        );
+    }
+
+    let (lower, upper) = sched_split(reused, 21)
+        .map_err(|_| "thread::sched_split_after_slot_reuse: sched_split on reused slot failed")?;
+
+    // The original must be consumed: its handle no longer resolves.
+    if syscall::cap_info(reused, syscall_abi::CAP_INFO_TAG_RIGHTS).is_ok()
+    {
+        return Err("thread::sched_split_after_slot_reuse: original survived the split");
+    }
+    let used_split = syscall::cap_info(ctx.cspace_cap, syscall_abi::CAP_INFO_CSPACE_USED)
+        .map_err(|_| "thread::sched_split_after_slot_reuse: cap_info(used after split) failed")?;
+    // Baseline predates the derive: one reused slot consumed, two children
+    // installed — a net of two over the baseline.
+    if used_split != used_before + 2
+    {
+        return Err(
+            "thread::sched_split_after_slot_reuse: split must consume one slot and add two",
+        );
+    }
+
+    cap_delete(lower)
+        .map_err(|_| "thread::sched_split_after_slot_reuse: cap_delete(lower) failed")?;
+    cap_delete(upper)
+        .map_err(|_| "thread::sched_split_after_slot_reuse: cap_delete(upper) failed")?;
+    let used_after = syscall::cap_info(ctx.cspace_cap, syscall_abi::CAP_INFO_CSPACE_USED)
+        .map_err(|_| "thread::sched_split_after_slot_reuse: cap_info(used after) failed")?;
+    if used_after != used_before
+    {
+        return Err("thread::sched_split_after_slot_reuse: USED did not return to baseline");
+    }
+    Ok(())
+}
+
 /// `SYS_CAP_CREATE_THREAD` priority arguments: floor creation needs no
 /// `SchedControl`; every above-floor placement is band-gated at creation.
 ///

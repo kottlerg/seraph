@@ -400,6 +400,23 @@ creator a slot plus a kernel object), so tripping it indicates sustained
 concurrent re-derivation and returns `Interrupted` — revoked nodes stay
 revoked, and a retry continues from the surviving subtree.
 
+Deletion and the range splits (`SYS_MMIO_SPLIT`, `SYS_IRQ_SPLIT`,
+`SYS_IOPORT_SPLIT`, `SYS_SCHED_SPLIT`) consume a slot without revoking
+under it: its children are re-linked under its derivation parent
+(`reparent_children`) so they stay inside every ancestor's subtree. That
+walk is batched on the same terms as revocation — `MAX_REPARENT_EDITS`
+head pops per lock hold, each child detached into a clean root and
+re-linked in O(1), the lock released between batches, and a
+`MAX_REPARENT_BATCHES` backstop against a concurrent deriver — because a
+slot can have been derived from up to the structural ceiling of every
+CSpace. The consumed slot is revalidated under the lock before every batch
+(tag and handle generation, no revoke in flight; the splits additionally
+check it still holds the object that was looked up, since their lookup ran
+without the lock): a concurrent revoke starting on it stops the delete with
+`InvalidState` and children already moved stay under the parent, a
+concurrent delete finishing it first turns the delete into a success and a
+split into `InvalidState` with both children rolled back.
+
 Because hoisting destroys intermediate parent→child edges as the flattening
 proceeds, the root is pinned for the whole multi-batch operation with a
 **revoke-in-progress marker** (`CapabilitySlot::revoke_in_progress`, stored in
@@ -430,11 +447,14 @@ foreign traversal in a window between batches sees ordinary consistent
 nodes. The one remaining source of a dead link is the dying process racing
 its own teardown (wiring a link out of or into the dying CSpace from a
 surviving thread or an in-flight receive during the drain window). A link
-that fails to resolve — that race, or genuine corruption — is contained at
-two sites, both by truncation: the revoke walk cuts the chain hanging from
-the dead link, logs it, and the syscall returns `InvalidState` instead of
-reporting a clean revoke; the teardown drain, which has no caller to
-report to, detects the same condition as a head pop that makes no
+that fails to resolve — that race, or genuine corruption — is contained
+wherever a walk meets it, always by truncation: the revoke walk cuts the
+chain hanging from the dead link, logs it, and the syscall returns
+`InvalidState` instead of reporting a clean revoke; the reparent walk that
+deletion and the range splits run on the consumed slot's children cuts and
+logs the same way and completes (the abandoned children were already
+orphaned from a vanished CSpace); the teardown drain, which has no caller
+to report to, detects the same condition as a head pop that makes no
 progress, logs it, cuts the dying slot's child list, and continues with
 the next slot. A drain truncation abandons the foreign children chained
 behind the dead link without clearing their parent pointers: they keep

@@ -1576,6 +1576,76 @@ fn log_self_cap_delete_refused(tcb: *mut crate::sched::thread::ThreadControlBloc
     );
 }
 
+/// Resolve `SYS_CAP_DELETE`'s target under `DERIVATION_LOCK`: the slot's
+/// object and derivation parent, or the syscall's early result — `Ok(0)` for
+/// an idempotent Null slot (or, after the first batch, a slot a concurrent
+/// delete finished), else the rejecting error.
+///
+/// # Safety
+///
+/// Caller must hold `DERIVATION_LOCK` write lock; `caller_cspace` must be
+/// valid and non-null.
+#[cfg(not(test))]
+#[allow(clippy::type_complexity)]
+unsafe fn resolve_delete_target(
+    caller_cspace: *mut crate::cap::cspace::CSpace,
+    slot_idx: u32,
+    slot_handle: u32,
+    first_batch: bool,
+) -> Result<
+    (
+        core::ptr::NonNull<crate::cap::object::KernelObjectHeader>,
+        Option<crate::cap::slot::SlotId>,
+    ),
+    Result<u64, SyscallError>,
+>
+{
+    // SAFETY: caller contract.
+    match unsafe { (*caller_cspace).slot(slot_idx) }
+    {
+        Some(slot) if slot.tag != crate::cap::slot::CapTag::Null =>
+        {
+            // Reject a stale handle to a recycled slot (#349). Must not fall to
+            // the idempotent Null arm below — that would silently succeed
+            // against the unrelated live cap now occupying the index. After
+            // the first batch a recycled index means a concurrent delete
+            // finished this slot: report success like the Null arm.
+            if slot.generation() != syscall::cap_handle_gen(slot_handle)
+            {
+                return Err(
+                    if first_batch
+                    {
+                        Err(SyscallError::InvalidCapability)
+                    }
+                    else
+                    {
+                        Ok(0)
+                    },
+                );
+            }
+            // A revoke is mid-flight on this slot (see
+            // `CapabilitySlot::revoke_in_progress`): deleting the root
+            // between revoke batches would promote its temporarily hoisted
+            // survivors and sever intermediate revocation edges.
+            // Transient — retry after the revoke completes.
+            if slot.revoke_in_progress()
+            {
+                return Err(Err(SyscallError::InvalidState));
+            }
+            let Some(obj) = slot.object
+            else
+            {
+                return Err(Err(SyscallError::InvalidCapability));
+            };
+            Ok((obj, slot.deriv_parent))
+        }
+        // Slot was Null on entry, or was cleared by a concurrent
+        // revoke_subtree_batch / delete before we acquired the lock. Idempotent.
+        Some(_) => Err(Ok(0)),
+        None => Err(Err(SyscallError::InvalidCapability)),
+    }
+}
+
 /// `SYS_CAP_DELETE` (31): delete a capability slot.
 ///
 /// arg0 = slot index in the caller's `CSpace.`
@@ -1583,6 +1653,15 @@ fn log_self_cap_delete_refused(tcb: *mut crate::sched::thread::ThreadControlBloc
 /// Reparents any children to the deleted slot's parent (preserving revocability
 /// from the grandparent), unlinks the slot from the derivation tree, clears it,
 /// and `dec_refs` the kernel object. If refcount reaches 0, frees the object.
+///
+/// The reparenting runs in `MAX_REPARENT_EDITS` batches with the derivation
+/// lock released in between (a slot can have arbitrarily many children); the
+/// slot is revalidated before every batch. Between batches it stays live with
+/// its remaining children still under it, so a concurrent revoke starting on
+/// it surfaces `InvalidState` (children already moved stay under the parent —
+/// still inside every ancestor's subtree) and a concurrent delete finishing
+/// it first makes this call return success. `MAX_REPARENT_BATCHES` bounds a
+/// concurrent-deriver livelock with `Interrupted`.
 ///
 /// Idempotent: deleting a Null slot returns success.
 #[cfg(not(test))]
@@ -1613,94 +1692,84 @@ pub fn sys_cap_delete(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // Resolve the slot, unlink, and clear under DERIVATION_LOCK so a concurrent
     // revoke_subtree_batch on a parent cap cannot race-clear this slot between the
     // tag-check and the dec_ref. Both paths must dec_ref the object exactly
-    // once between them.
-    crate::cap::DERIVATION_LOCK.write_lock();
-
-    // SAFETY: caller_cspace validated non-null above; DERIVATION_LOCK held.
-    let (obj_ptr, parent) = match unsafe { (*caller_cspace).slot(slot_idx) }
+    // once between them. The loop re-enters once per reparent batch; the
+    // final batch's hold performs the unlink and the free.
+    let mut batches: u32 = 0;
+    let obj_ptr = loop
     {
-        Some(slot) if slot.tag != crate::cap::slot::CapTag::Null =>
-        {
-            // Reject a stale handle to a recycled slot (#349). Must not fall to
-            // the idempotent Null arm below — that would silently succeed
-            // against the unrelated live cap now occupying the index.
-            if slot.generation() != syscall::cap_handle_gen(slot_handle)
-            {
-                crate::cap::DERIVATION_LOCK.write_unlock();
-                return Err(SyscallError::InvalidCapability);
-            }
-            // A revoke is mid-flight on this slot (see
-            // `CapabilitySlot::revoke_in_progress`): deleting the root
-            // between revoke batches would promote its temporarily hoisted
-            // survivors and sever intermediate revocation edges.
-            // Transient — retry after the revoke completes.
-            if slot.revoke_in_progress()
-            {
-                crate::cap::DERIVATION_LOCK.write_unlock();
-                return Err(SyscallError::InvalidState);
-            }
-            let Some(obj) = slot.object
-            else
-            {
-                crate::cap::DERIVATION_LOCK.write_unlock();
-                return Err(SyscallError::InvalidCapability);
-            };
-            (obj, slot.deriv_parent)
-        }
-        Some(_) =>
-        {
-            // Slot was Null on entry, or was cleared by a concurrent
-            // revoke_subtree_batch before we acquired the lock. Idempotent.
-            crate::cap::DERIVATION_LOCK.write_unlock();
-            return Ok(0);
-        }
-        None =>
-        {
-            crate::cap::DERIVATION_LOCK.write_unlock();
-            return Err(SyscallError::InvalidCapability);
-        }
-    };
+        crate::cap::DERIVATION_LOCK.write_lock();
 
-    // #341: refuse to delete the last capability to the RUNNING thread's own
-    // Thread object. This is always an aliased/stale-cap bug — std's
-    // `Process::drop` deletes a child's `thread_cap` whose slot was reused for
-    // the running (waiter) thread after the child was reaped. Completing the
-    // delete tears the running thread down mid-syscall and orphans whatever it
-    // was driving (the shell hangs). Refuse here, before the dec-ref/dealloc:
-    // the cap stays and is reclaimed normally when a DIFFERENT thread later
-    // joins/reaps this one. Logged once so the userspace site is symbolisable.
-    // SAFETY: obj_ptr is a live KernelObjectHeader (slot confirmed live above);
-    // tcb is the validated caller.
-    if unsafe {
-        (*obj_ptr.as_ptr()).obj_type == crate::cap::object::ObjectType::Thread
-            && core::ptr::eq(
-                (*obj_ptr.as_ptr().cast::<crate::cap::object::ThreadObject>()).tcb,
-                tcb,
+        // SAFETY: caller_cspace validated non-null above; DERIVATION_LOCK held.
+        let (obj_ptr, parent) = match unsafe {
+            resolve_delete_target(caller_cspace, slot_idx, slot_handle, batches == 0)
+        }
+        {
+            Ok(target) => target,
+            Err(early) =>
+            {
+                crate::cap::DERIVATION_LOCK.write_unlock();
+                return early;
+            }
+        };
+
+        // #341: refuse to delete the last capability to the RUNNING thread's own
+        // Thread object. This is always an aliased/stale-cap bug — std's
+        // `Process::drop` deletes a child's `thread_cap` whose slot was reused for
+        // the running (waiter) thread after the child was reaped. Completing the
+        // delete tears the running thread down mid-syscall and orphans whatever it
+        // was driving (the shell hangs). Refuse here, before the dec-ref/dealloc:
+        // the cap stays and is reclaimed normally when a DIFFERENT thread later
+        // joins/reaps this one. Logged once so the userspace site is symbolisable.
+        // SAFETY: obj_ptr is a live KernelObjectHeader (slot confirmed live above);
+        // tcb is the validated caller.
+        if unsafe {
+            (*obj_ptr.as_ptr()).obj_type == crate::cap::object::ObjectType::Thread
+                && core::ptr::eq(
+                    (*obj_ptr.as_ptr().cast::<crate::cap::object::ThreadObject>()).tcb,
+                    tcb,
+                )
+        }
+        {
+            log_self_cap_delete_refused(tcb, slot_idx);
+            crate::cap::DERIVATION_LOCK.write_unlock();
+            return Err(SyscallError::InvalidState);
+        }
+
+        // SAFETY: DERIVATION_LOCK held; node and parent are valid SlotIds.
+        let done = unsafe {
+            crate::cap::derivation::reparent_children(
+                node,
+                parent,
+                crate::cap::derivation::MAX_REPARENT_EDITS,
             )
-    }
-    {
-        log_self_cap_delete_refused(tcb, slot_idx);
+        };
+        batches += 1;
+        if !done
+        {
+            crate::cap::DERIVATION_LOCK.write_unlock();
+            if batches >= crate::cap::derivation::MAX_REPARENT_BATCHES
+            {
+                return Err(SyscallError::Interrupted);
+            }
+            continue;
+        }
+
+        // SAFETY: DERIVATION_LOCK held; node is a valid SlotId.
+        unsafe { crate::cap::derivation::unlink_node(node) };
+
+        // SAFETY: caller_cspace validated; slot confirmed live above. Take the
+        // cspace lock strictly inside DERIVATION_LOCK so the freelist mutation
+        // cannot tear against a concurrent SYS_CAP_CREATE_* on the same cspace.
+        // Lock order: DERIVATION_LOCK → cspace.lock (matches transfer_caps).
+        unsafe {
+            let saved = (*caller_cspace).lock.lock_raw();
+            (*caller_cspace).free_slot(slot_idx);
+            (*caller_cspace).lock.unlock_raw(saved);
+        }
+
         crate::cap::DERIVATION_LOCK.write_unlock();
-        return Err(SyscallError::InvalidState);
-    }
-
-    // SAFETY: DERIVATION_LOCK held; node and parent are valid SlotIds.
-    unsafe {
-        crate::cap::derivation::reparent_children(node, parent);
-        crate::cap::derivation::unlink_node(node);
-    }
-
-    // SAFETY: caller_cspace validated; slot confirmed live above. Take the
-    // cspace lock strictly inside DERIVATION_LOCK so the freelist mutation
-    // cannot tear against a concurrent SYS_CAP_CREATE_* on the same cspace.
-    // Lock order: DERIVATION_LOCK → cspace.lock (matches transfer_caps).
-    unsafe {
-        let saved = (*caller_cspace).lock.lock_raw();
-        (*caller_cspace).free_slot(slot_idx);
-        (*caller_cspace).lock.unlock_raw(saved);
-    }
-
-    crate::cap::DERIVATION_LOCK.write_unlock();
+        break obj_ptr;
+    };
 
     // Dec-ref outside the lock — dealloc_object may take other locks.
     // SAFETY: obj_ptr captured under DERIVATION_LOCK while the slot was live;

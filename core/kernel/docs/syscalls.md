@@ -723,7 +723,19 @@ thread down mid-syscall; the object is reclaimed normally when a different
 thread later releases it), and a slot with a `SYS_CAP_REVOKE` in flight may not
 be deleted until that revoke completes.
 
-**Errors:** `InvalidCapability`; `InvalidState` (per above).
+Capabilities derived from the deleted slot are re-linked under its own
+derivation parent, so they stay revocable from above. That re-linking runs in
+batches with the derivation lock released between them (a slot can have
+arbitrarily many children); between batches the slot stays live with its
+remaining children still under it. A `SYS_CAP_REVOKE` that starts on the slot
+between batches stops the delete with `InvalidState` (children already moved
+stay under the parent — still inside every ancestor's subtree); a concurrent
+delete of the same slot that finishes first makes this call return 0. A
+concurrent deriver extending the child list faster than one batch per hold
+returns `Interrupted`; a retry continues from the remaining children.
+
+**Errors:** `InvalidCapability`; `InvalidState` (per above); `Interrupted`
+(concurrent re-derivation backstop).
 
 ---
 
@@ -932,7 +944,9 @@ original's derivation parent. The original `mmio_cap` is consumed.
 
 **Capability requirement:** `mmio_cap` must have Map rights.
 
-**Errors:** `InvalidArgument` (`split_offset` not page-aligned, zero, `>= size`, or
+The original is revalidated under the derivation lock before it is consumed (see [capability-internals.md](capability-internals.md) § Revocation): if a concurrent delete removed it, or a `SYS_CAP_REVOKE` is in flight on it, the split fails with `InvalidState` and both children are rolled back. Its children are re-linked under its derivation parent in batches (lock released between them); a concurrent deriver extending that list faster than it is moved returns `Interrupted`.
+
+**Errors:** `InvalidState`, `Interrupted` (per above), `InvalidArgument` (`split_offset` not page-aligned, zero, `>= size`, or
 fewer than one page on the upper side), `InvalidCapability`, `InsufficientRights` (cap
 lacks Map), `OutOfMemory` (child allocation or slot-page pool exhausted), `QuotaExceeded`
 (caller's CSpace directory structurally full).
@@ -1125,7 +1139,9 @@ narrow a band — `SYS_CAP_DERIVE` attenuates rights and cannot shrink a range.
 **Capability requirements:** `sched_cap` must be a `SchedControl` (presence-only;
 no rights bit).
 
-**Errors:** `InvalidCapability` (not a `SchedControl`), `InvalidArgument`
+The original is revalidated under the derivation lock before it is consumed (see [capability-internals.md](capability-internals.md) § Revocation): if a concurrent delete removed it, or a `SYS_CAP_REVOKE` is in flight on it, the split fails with `InvalidState` and both children are rolled back. Its children are re-linked under its derivation parent in batches (lock released between them); a concurrent deriver extending that list faster than it is moved returns `Interrupted`.
+
+**Errors:** `InvalidState`, `Interrupted` (per above), `InvalidCapability` (not a `SchedControl`), `InvalidArgument`
 (`split_at` outside `(min, max]`), `OutOfMemory` (child allocation or slot-page pool
 exhausted), `QuotaExceeded` (caller's CSpace directory structurally full).
 
@@ -1484,7 +1500,9 @@ derivation parent. The original `irq_cap` is consumed.
 
 **Capability requirement:** `irq_cap` must have Notify rights.
 
-**Errors:** `InvalidArgument` (`split_at` outside `(start, start+count)`),
+The original is revalidated under the derivation lock before it is consumed (see [capability-internals.md](capability-internals.md) § Revocation): if a concurrent delete removed it, or a `SYS_CAP_REVOKE` is in flight on it, the split fails with `InvalidState` and both children are rolled back. Its children are re-linked under its derivation parent in batches (lock released between them); a concurrent deriver extending that list faster than it is moved returns `Interrupted`.
+
+**Errors:** `InvalidState`, `Interrupted` (per above), `InvalidArgument` (`split_at` outside `(start, start+count)`),
 `InvalidCapability`, `InsufficientRights` (cap lacks Notify), `OutOfMemory` (child
 allocation or slot-page pool exhausted), `QuotaExceeded` (caller's CSpace directory
 structurally full).
@@ -1517,7 +1535,9 @@ derivation parent. The original `ioport_cap` is consumed.
 
 **Capability requirement:** `ioport_cap` must have Use rights.
 
-**Errors:** `NotSupported` (RISC-V — no I/O ports), `InvalidArgument` (`split_at` 0,
+The original is revalidated under the derivation lock before it is consumed (see [capability-internals.md](capability-internals.md) § Revocation): if a concurrent delete removed it, or a `SYS_CAP_REVOKE` is in flight on it, the split fails with `InvalidState` and both children are rolled back. Its children are re-linked under its derivation parent in batches (lock released between them); a concurrent deriver extending that list faster than it is moved returns `Interrupted`.
+
+**Errors:** `InvalidState`, `Interrupted` (per above), `NotSupported` (RISC-V — no I/O ports), `InvalidArgument` (`split_at` 0,
 `> 0xFFFF`, or outside `(base, base+size)`), `InvalidCapability`, `InsufficientRights`
 (cap lacks Use), `OutOfMemory` (child allocation or slot-page pool exhausted),
 `QuotaExceeded` (caller's CSpace directory structurally full).
@@ -1611,8 +1631,10 @@ A high explicit `dst_slot` materialises every intermediate leaf page up to
 its own, drawn from the destination's slot-page pool (donor-funded, in
 bounded batches outside the heavyweight locks). When the pool cannot cover
 the required growth the call fails with `OutOfMemory` before consuming any
-pool page; leaves grown before a concurrent pool consumer intervenes remain
-as ordinary free capacity.
+pool page. Leaves grown for a placement that then fails — the target slot
+turns out to be occupied, or a concurrent pool consumer starves the final
+grow — stay behind as ordinary free capacity, and the pool pages they
+consumed stay spent.
 
 **Capability requirements:** `src_cap` (at least one right), `dst_cspace_cap` (Insert).
 

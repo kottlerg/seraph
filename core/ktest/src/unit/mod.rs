@@ -83,6 +83,10 @@ pub fn run_all(ctx: &TestContext)
     run_test!("cap::derive_attenuation", cap::derive_attenuation(ctx));
     run_test!("cap::revoke_invalidates", cap::revoke_invalidates(ctx));
     run_test!("cap::revoke_large_subtree", cap::revoke_large_subtree(ctx));
+    run_test!(
+        "cap::delete_intermediate_keeps_grandchildren_revocable",
+        cap::delete_intermediate_keeps_grandchildren_revocable(ctx)
+    );
     run_test!("cap::delete", cap::delete(ctx));
     run_test!(
         "cap::insert_to_occupied_slot_err",
@@ -450,6 +454,10 @@ pub fn run_all(ctx: &TestContext)
     run_test!(
         "thread::sched_split_enforces_bands",
         thread::sched_split_enforces_bands(ctx)
+    );
+    run_test!(
+        "thread::sched_split_after_slot_reuse",
+        thread::sched_split_after_slot_reuse(ctx)
     );
     run_test!(
         "thread::create_priority_args",

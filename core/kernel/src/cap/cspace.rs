@@ -433,16 +433,23 @@ impl CSpace
         // of pointer visibility.
         let base = leaf_idx * L2_SIZE;
         let start_slot = usize::from(leaf_idx == 0);
-        let new_free = L2_SIZE - start_slot;
+        let mut new_free = 0usize;
         let old_head = self.free_head;
         let mut next = old_head;
         for i in (start_slot..L2_SIZE).rev()
         {
-            // `base + i >= 1`: `start_slot` skips slot 0 of the first leaf.
-            debug_assert!(base + i >= 1);
-            let idx = NonZeroU32::new((base + i) as u32).unwrap_or(NonZeroU32::MIN);
+            // `base + i >= 1`: `start_slot` skips slot 0 of the first leaf. A
+            // zero index (unreachable) is left off the list — fail closed —
+            // rather than threaded as some other slot.
+            debug_assert!(base + i >= 1, "grow: slot 0 must not be threaded");
+            let Some(idx) = NonZeroU32::new((base + i) as u32)
+            else
+            {
+                continue;
+            };
             page.slots[i].set_next_free(next);
             next = Some(idx);
+            new_free += 1;
         }
         // Back-fill the predecessor links (the doubly-linked list makes
         // `remove_from_free_list` O(1)): each new slot's successor is the

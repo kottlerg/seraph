@@ -297,7 +297,7 @@ self-enforcing at the single insertion chokepoint, closing the double-link class
 
 ## Cross-CPU TCB Ownership
 
-The TCB is owned in pieces. Different field groups have different lock disciplines. Cross-CPU access to any field MUST hold the lock specified for that field's group. Documented exceptions — the reads of `state` that hold no `sched_lock` and act on the value: `running_thread_stopped` (`sched/mod.rs`) probes the running thread's own `state` with a volatile read and takes no decision on it — a positive probe is confirmed under this CPU's `scheduler.lock`, which every `state` writer on the lifecycle path holds through `set_state_under_all_locks` (see § Atomic Ordering Invariants); and the object-teardown walk (`mark_bound_threads` under `THREAD_REGISTRY_LOCK`, `scan_bound_current` under the remote CPU's `scheduler.lock`) reads `state` to skip threads already `Exited` and to decide whether a bound thread still needs marking. Those reads are sound only because `Exited` is monotone (§ ThreadState Transitions): a positive `Exited` read is final, and a negative read is re-decided under the full lock set by `set_state_under_all_locks`, which refuses if the thread exited meanwhile. A field without that monotonicity MUST NOT be read this way. The lifecycle syscalls' own prechecks (`sys_thread_configure`, `sys_thread_start`, `sys_thread_stop`) and the stop protocol's drain re-check are the same pattern — each is re-decided under the full lock set by `set_state_under_all_locks`, or under the remote run-queue lock the stop protocol documents — and `CAP_INFO_THREAD_STATE` is a diagnostic snapshot that decides nothing in the kernel.
+The TCB is owned in pieces. Different field groups have different lock disciplines. Cross-CPU access to any field MUST hold the lock specified for that field's group. Documented exceptions — the reads of `state` that hold no `sched_lock`: `running_thread_stopped` (`sched/mod.rs`) probes the running thread's own `state` with a volatile read that decides only whether to confirm — a positive probe is confirmed under this CPU's `scheduler.lock`, which every `state` writer on the lifecycle path holds through `set_state_under_all_locks` (see § Atomic Ordering Invariants); and the object-teardown walk (`mark_bound_threads` under `THREAD_REGISTRY_LOCK`, `scan_bound_current` under the remote CPU's `scheduler.lock`) reads `state` to skip threads already `Exited` and to decide whether a bound thread still needs marking. Those reads are sound only because `Exited` is monotone (§ ThreadState Transitions): a positive `Exited` read is final, and a negative read is re-decided under the full lock set by `set_state_under_all_locks`, which refuses if the thread exited meanwhile. A field without that monotonicity MUST NOT be read this way. The lifecycle syscalls' own prechecks (`sys_thread_configure`, `sys_thread_start`, `sys_thread_stop`) and the stop protocol's drain re-check are the same pattern — each is re-decided under the full lock set by `set_state_under_all_locks`, or under the remote run-queue lock the stop protocol documents — and `CAP_INFO_THREAD_STATE` is a diagnostic snapshot that decides nothing in the kernel.
 
 | Field group | Fields | Owning lock | Cross-CPU access rule |
 |---|---|---|---|
@@ -882,13 +882,13 @@ bails the same way as phase 2 if the running thread is stopped meanwhile.
 Stopped threads are dead but not freed — each Thread object lives until its own
 last capability goes, and `dealloc_object(Thread)` then runs its full drain
 protocol on an already-`Exited`, off-CPU thread (the off-CPU wait itself is the
-shared `wait_until_off_cpu`). The one window this mechanism does not close is
-the unlocked cap lookup itself: a `sys_cap_create_thread` that resolved its
-`CSpace` or `AddressSpace` capability before the object's last delete and
-constructs its TCB after the teardown's walk binds a thread to freed storage;
-that residual is the documented "lookup does not pin the object" gap of
-`lookup_cap`, narrowed here to the lookup-to-construction window. The
-lifecycle syscalls are not a second window: `sys_thread_start` and
+shared `wait_until_off_cpu`). The unlocked cap lookup in
+`sys_cap_create_thread` is not a window either: after `register`, the syscall
+looks both capabilities up again and requires the same objects. A teardown
+that ran between the first lookup and the registration removed the last
+capability to its object, so the second lookup fails and the create rolls
+back; a teardown that starts after the registration finds the thread in the
+walk. The lifecycle syscalls are not a window: `sys_thread_start` and
 `sys_thread_stop` read the target's state without a lock, but their commits
 refuse a target that is `Exited` under the locks (§ ThreadState
 Transitions), so a thread the walk stopped cannot be revived and linked

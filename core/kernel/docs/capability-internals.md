@@ -463,11 +463,12 @@ unregisters, its teardown drain (`drain_dying_cspace_batch`) unlinks every
 dying slot from the forest — foreign children are orphaned into derivation
 roots, and each slot is spliced out of its parent/sibling links with the
 neighbours re-linked directly. Each unlink leaves the forest fully
-consistent, so the drain runs in step-bounded batches (every slot visited and every link edit is one step) that release the
-derivation write lock between holds (mirroring revocation's batching); a
-foreign traversal in a window between batches sees ordinary consistent
-nodes. The one remaining source of a dead link is a foreign sender whose
-capability transfer into the dying CSpace had already committed to a
+consistent, so the drain runs in step-bounded batches (every slot visited
+and every link edit is one step) that release the derivation write lock
+between holds (mirroring revocation's batching); a foreign traversal in a
+window between batches sees ordinary consistent nodes. The one remaining
+source of a dead link is a foreign sender whose capability transfer into
+the dying CSpace had already committed to a
 receiver there before that receiver was stopped, wiring a link into a slot
 the drain cursor has passed. A link that fails to resolve — that race, or
 genuine corruption — is contained wherever a walk meets it, always by

@@ -1169,14 +1169,16 @@ pub fn memory_merge(parent_cap: u32, tail_cap: u32) -> Result<(), i64>
 ///
 /// # Errors
 /// Returns a negative `i64` error code if the cap is invalid, `split_offset`
-/// is not page-aligned, or is out of range for the region.///
+/// is not page-aligned, or is out of range for the region.
+///
 /// The split consumes the original under the derivation lock. `InvalidState`
 /// if a concurrent delete removed the original or a `SYS_CAP_REVOKE` on it is
 /// in flight; `Interrupted` if a concurrent deriver extended its child list
 /// faster than the batched reparent could move it (retry); `OutOfMemory` if
 /// the caller's `CSpace` cannot back two more slots.
 // cast_sign_loss: proven non-negative in Ok branch.
-// cast_possible_truncation: each half of the packed return is a 32-bit slot index.
+// cast_possible_truncation: each returned handle is 32 bits (a 24-bit slot index
+// plus an 8-bit generation).
 #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 #[inline]
 pub fn mmio_split(mmio_cap: u32, split_offset: u64) -> Result<(u32, u32), i64>
@@ -1201,12 +1203,13 @@ pub fn mmio_split(mmio_cap: u32, split_offset: u64) -> Result<(u32, u32), i64>
 /// `split_at` is the first IRQ id of the upper child (and the exclusive
 /// upper bound of the lower child); it must satisfy
 /// `start < split_at < start + count` on the cap being split. The
-/// original cap is revoked on success; both children inherit the parent's
-/// rights. Returns packed `(lower_slot, upper_slot)`.
+/// original cap is consumed on success; both children inherit the parent's
+/// rights. Returns `(lower_slot, upper_slot)`.
 ///
 /// # Errors
 /// Returns a negative `i64` error code if the cap is invalid or `split_at`
-/// falls outside the cap's range.///
+/// falls outside the cap's range.
+///
 /// The split consumes the original under the derivation lock. `InvalidState`
 /// if a concurrent delete removed the original or a `SYS_CAP_REVOKE` on it is
 /// in flight; `Interrupted` if a concurrent deriver extended its child list
@@ -1247,15 +1250,16 @@ pub fn irq_split(irq_cap: u32, split_at: u32) -> Result<(u32, u32), i64>
 /// range. Additionally `split_at` must be non-zero (a zero split would
 /// yield an empty lower half) and lie in `1..=0xFFFF`; the kernel rejects
 /// values outside that range with `InvalidArgument` before loading the cap.
-/// The original cap is revoked on success; both children inherit the
-/// parent's rights. Returns packed `(lower_slot, upper_slot)`.
+/// The original cap is consumed on success; both children inherit the
+/// parent's rights. Returns `(lower_slot, upper_slot)`.
 ///
 /// On RISC-V: always returns `NotSupported`.
 ///
 /// # Errors
 /// Returns a negative `i64` error code if the cap is invalid, `split_at`
 /// falls outside the cap's range, or the syscall is not supported on this
-/// architecture.///
+/// architecture.
+///
 /// The split consumes the original under the derivation lock. `InvalidState`
 /// if a concurrent delete removed the original or a `SYS_CAP_REVOKE` on it is
 /// in flight; `Interrupted` if a concurrent deriver extended its child list
@@ -1293,13 +1297,14 @@ pub fn ioport_split(ioport_cap: u32, split_at: u16) -> Result<(u32, u32), i64>
 /// `split_at` is the lowest priority level of the upper child (and one past the
 /// top of the lower child); it must satisfy `min < split_at <= max` on the cap
 /// being split. The lower child covers `[min, split_at - 1]`, the upper child
-/// `[split_at, max]`. The original cap is revoked on success. Returns packed
+/// `[split_at, max]`. The original cap is consumed on success. Returns
 /// `(lower_slot, upper_slot)`. `cap_derive` cannot narrow a band, so this is the
 /// only way to hand out a sub-band.
 ///
 /// # Errors
 /// Returns a negative `i64` error code if the cap is invalid or `split_at`
-/// falls outside the cap's band.///
+/// falls outside the cap's band.
+///
 /// The split consumes the original under the derivation lock. `InvalidState`
 /// if a concurrent delete removed the original or a `SYS_CAP_REVOKE` on it is
 /// in flight; `Interrupted` if a concurrent deriver extended its child list
@@ -1500,7 +1505,8 @@ pub fn cap_derive_badge(src_slot: u32, rights_mask: u64, badge: u64) -> Result<u
 ///
 /// # Errors
 /// Returns a negative `i64` error code: `InvalidCapability` if the handle
-/// is out of range, carries a stale generation, or names an empty slot;
+/// is out of range or carries a stale generation (deleting a Null slot
+/// succeeds);
 /// `InvalidState` if the slot names the caller's
 /// own thread or a `SYS_CAP_REVOKE` on it is in flight; `Interrupted` if a
 /// concurrent deriver extended the slot's child list faster than the

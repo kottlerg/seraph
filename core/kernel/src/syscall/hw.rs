@@ -461,7 +461,8 @@ pub fn sys_ioport_bind(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// `[base+split_offset, end)`. Both children are reparented to the original
 /// cap's derivation parent (same revocability semantics as sibling caps).
 ///
-/// Returns `slot1 | (slot2 << 32)` on success.
+/// Returns the two child handles in the primary and secondary return
+/// registers.
 // too_many_lines: splitting an MMIO cap requires validating the original,
 // building two child objects, wiring both into the derivation tree, and
 // freeing the original — each step has its own bookkeeping and no meaningful
@@ -608,7 +609,8 @@ pub fn sys_mmio_split(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// same rights, covering the two halves. Both children are reparented to the
 /// original's derivation parent.
 ///
-/// Returns `slot1 | (slot2 << 32)` on success.
+/// Returns the two child handles in the primary and secondary return
+/// registers.
 // too_many_lines: mirrors sys_mmio_split exactly; the shape is unavoidable.
 #[allow(clippy::too_many_lines)]
 #[cfg(not(test))]
@@ -736,7 +738,8 @@ pub fn sys_irq_split(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 ///
 /// On RISC-V: always returns `NotSupported` (no I/O port concept).
 ///
-/// Returns `slot1 | (slot2 << 32)` on success.
+/// Returns the two child handles in the primary and secondary return
+/// registers.
 // too_many_lines: mirrors sys_irq_split exactly; the shape is unavoidable.
 #[allow(clippy::too_many_lines)]
 #[cfg(not(test))]

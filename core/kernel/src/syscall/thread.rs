@@ -1049,7 +1049,8 @@ pub fn sys_thread_set_priority(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// `cap_derive` cannot narrow a band (it attenuates rights only), so this is
 /// the sole way to hand out a sub-band. Presence-only authority; no rights bit.
 ///
-/// Returns `slot1 | (slot2 << 32)` on success.
+/// Returns the two child handles in the primary and secondary return
+/// registers.
 #[cfg(not(test))]
 pub fn sys_sched_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {

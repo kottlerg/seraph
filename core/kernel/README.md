@@ -55,7 +55,10 @@ kernel/
 │   │   ├── mod.rs
 │   │   ├── cspace.rs           # CSpace: slot storage, lookup, growth
 │   │   ├── slot.rs             # Capability slot representation and rights
-│   │   └── derivation.rs       # Derivation tree, revocation algorithm
+│   │   ├── derivation.rs       # Derivation tree, revocation algorithm
+│   │   ├── object.rs           # Kernel object headers, allocation, teardown
+│   │   ├── retype.rs           # Memory-cap retype allocator (object carving)
+│   │   └── split.rs            # Shared tail of the range-cap split syscalls
 │   ├── entropy/                # Entropy subsystem and per-CPU CSPRNG
 │   │   ├── mod.rs              # Storage alloc, seeding, draw API (fill_bytes)
 │   │   ├── keccak.rs           # Keccak-f[1600] permutation (FIPS 202)

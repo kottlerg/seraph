@@ -628,8 +628,21 @@ pub fn sys_cap_create_cspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     if augment_idx != 0
     {
         // SAFETY: cspace validated non-null above.
-        let target_slot = unsafe { super::lookup_cap(cspace, augment_idx, CsRights::INSERT) }?;
-        let target_kobj_nn = target_slot.object.ok_or(SyscallError::InvalidCapability)?;
+        let target_slot = match unsafe { super::lookup_cap(cspace, augment_idx, CsRights::INSERT) }
+        {
+            Ok(slot) => slot,
+            Err(e) =>
+            {
+                retype_free(memory, offset, entry.raw_bytes);
+                return Err(e);
+            }
+        };
+        let Some(target_kobj_nn) = target_slot.object
+        else
+        {
+            retype_free(memory, offset, entry.raw_bytes);
+            return Err(SyscallError::InvalidCapability);
+        };
         // SAFETY: tag confirmed CSpace.
         #[allow(clippy::cast_ptr_alignment)]
         let target_kobj = unsafe { &*target_kobj_nn.as_ptr().cast::<CSpaceKernelObject>() };
@@ -1076,13 +1089,36 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // SAFETY: thread_obj_ptr is in-place; header at offset 0.
     let nonnull = unsafe { NonNull::new_unchecked(thread_obj_ptr.cast::<KernelObjectHeader>()) };
 
-    // SAFETY: caller_cspace validated non-null above; lock_raw/unlock_raw paired.
-    let idx_res = unsafe {
-        let saved = (*caller_cspace).lock.lock_raw();
-        let r = (*caller_cspace)
-            .insert_cap_handle_typed(ThreadRights::CONTROL | ThreadRights::OBSERVE, nonnull);
-        (*caller_cspace).lock.unlock_raw(saved);
-        r
+    // Revalidate both bindings now that the registry can find this TCB. A
+    // teardown of either object that ran between the lookups above and
+    // `register` walked a registry without this thread and may already have
+    // reclaimed the storage the TCB names. The last capability to the object
+    // is gone in that case, so a lookup that still resolves to the same
+    // object proves it outlived the registration — and any teardown starting
+    // now finds this thread in the walk (docs/capability-model.md, process
+    // termination).
+    // SAFETY: caller_cspace validated non-null above.
+    let bound = unsafe {
+        super::lookup_cap(caller_cspace, as_idx, AsRights::MAP)
+            .is_ok_and(|s| s.object == as_slot.object)
+            && super::lookup_cap(caller_cspace, cs_idx, CsRights::INSERT)
+                .is_ok_and(|s| s.object == cs_slot.object)
+    };
+    let idx_res: Result<u32, SyscallError> = if bound
+    {
+        // SAFETY: caller_cspace validated non-null above; lock_raw/unlock_raw paired.
+        unsafe {
+            let saved = (*caller_cspace).lock.lock_raw();
+            let r = (*caller_cspace)
+                .insert_cap_handle_typed(ThreadRights::CONTROL | ThreadRights::OBSERVE, nonnull);
+            (*caller_cspace).lock.unlock_raw(saved);
+            r
+        }
+        .map_err(SyscallError::from)
+    }
+    else
+    {
+        Err(SyscallError::InvalidCapability)
     };
 
     match idx_res
@@ -1110,7 +1146,7 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             retype_free(memory, offset, entry.raw_bytes);
             // SAFETY: matches the inc_ref above.
             unsafe { ancestor.as_ref().dec_ref() };
-            Err(e.into())
+            Err(e)
         }
     }
 }
@@ -1279,10 +1315,16 @@ pub fn sys_cap_copy(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         (*src_object.as_ptr()).inc_ref();
     }
 
-    // Insert into the destination CSpace under cspace.lock so the freelist/tag
-    // invariant cannot tear against a concurrent SYS_CAP_CREATE_*. dest_slot_idx
-    // == 0 allocates a free slot; otherwise the cap is placed at the
-    // caller-chosen index. The badge write happens in the same critical section.
+    // Insert and link under DERIVATION_LOCK (the destination's cspace.lock
+    // nested per the documented order): a cap reachable through the
+    // destination CSpace but not yet linked could be moved out by a
+    // sibling, and a move carries whatever derivation position it finds —
+    // the cap would leave the source's revoke reach for good. Every
+    // occupied→free transition holds the lock, so no move can interleave
+    // before the link. dest_slot_idx == 0 allocates a free slot; otherwise
+    // the cap is placed at the caller-chosen index. The badge write and the
+    // handle read share the insert's critical section.
+    crate::cap::DERIVATION_LOCK.write_lock();
     // SAFETY: dest_cs_ptr validated above; lock_raw/unlock_raw paired.
     let insert_res = unsafe {
         let saved = (*dest_cs_ptr).lock.lock_raw();
@@ -1306,40 +1348,38 @@ pub fn sys_cap_copy(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         {
             new_slot.badge = src_badge;
         }
+        // The index is non-zero: auto-allocation returns a non-zero slot and
+        // the explicit path used a non-zero dest_slot_idx.
+        let r = r
+            .and_then(|idx| {
+                core::num::NonZeroU32::new(idx).ok_or(crate::cap::cspace::CapError::InvalidIndex)
+            })
+            .map(|nz| (nz, (*dest_cs_ptr).cap_handle(nz)));
         (*dest_cs_ptr).lock.unlock_raw(saved);
         r
     };
-    let new_idx = insert_res.map_err(|e| {
-        // Roll back the inc_ref if insertion fails.
-        // SAFETY: src_object validated above; we just incremented refcount.
-        unsafe {
-            (*src_object.as_ptr()).dec_ref();
+    let (new_idx_nz, new_handle) = match insert_res
+    {
+        Ok(v) => v,
+        Err(e) =>
+        {
+            crate::cap::DERIVATION_LOCK.write_unlock();
+            // Roll back the inc_ref if insertion fails.
+            // SAFETY: src_object validated above; we just incremented refcount.
+            unsafe {
+                (*src_object.as_ptr()).dec_ref();
+            }
+            return Err(SyscallError::from(e));
         }
-        SyscallError::from(e)
-    })?;
-    // new_idx is non-zero: auto-allocation returns a non-zero slot and the
-    // explicit path used a non-zero dest_slot_idx.
-    let new_idx_nz = core::num::NonZeroU32::new(new_idx).ok_or(SyscallError::InvalidArgument)?;
-
+    };
     // Wire derivation tree: new slot is a child of the source slot.
     let parent = crate::cap::slot::SlotId::current(caller_cspace_id, src_idx_nz);
     let child = crate::cap::slot::SlotId::current(dest_cs_id, new_idx_nz);
-    crate::cap::DERIVATION_LOCK.write_lock();
     // SAFETY: DERIVATION_LOCK held; parent/child are valid SlotIds just created.
     unsafe {
         crate::cap::derivation::link_child(parent, child);
     }
     crate::cap::DERIVATION_LOCK.write_unlock();
-
-    // Encode the destination slot's generation into the returned handle (#349).
-    // Re-lock the destination CSpace to read the generation soundly.
-    // SAFETY: dest_cs_ptr validated above.
-    let new_handle = unsafe {
-        let saved = (*dest_cs_ptr).lock.lock_raw();
-        let h = (*dest_cs_ptr).cap_handle(new_idx_nz);
-        (*dest_cs_ptr).lock.unlock_raw(saved);
-        h
-    };
     Ok(u64::from(new_handle))
 }
 
@@ -1391,10 +1431,15 @@ pub fn sys_cap_derive(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         (*src_object.as_ptr()).inc_ref();
     }
 
-    // Insert under cspace.lock so the freelist/tag invariant cannot tear
-    // against a concurrent SYS_CAP_CREATE_*. Badge write happens in the same
-    // critical section so the new slot's fields are atomic w.r.t. other
-    // observers.
+    // Insert and link under DERIVATION_LOCK (cspace.lock nested per the
+    // documented order): a cap reachable through the CSpace but not yet
+    // linked could be moved out by a sibling, and a move carries whatever
+    // derivation position it finds — the cap would leave the source's revoke
+    // reach for good. Every occupied→free transition holds the lock, so no
+    // move can interleave before the link. The badge write and the handle
+    // read share the insert's critical section.
+    let src_idx_nz = core::num::NonZeroU32::new(src_idx).ok_or(SyscallError::InvalidCapability)?;
+    crate::cap::DERIVATION_LOCK.write_lock();
     // SAFETY: caller_cspace validated non-null above; lock_raw/unlock_raw paired.
     let insert_res = unsafe {
         let saved = (*caller_cspace).lock.lock_raw();
@@ -1405,37 +1450,30 @@ pub fn sys_cap_derive(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         {
             new_slot.badge = src_badge;
         }
+        let r = r.map(|idx| (idx, (*caller_cspace).cap_handle(idx)));
         (*caller_cspace).lock.unlock_raw(saved);
         r
     };
-    let new_idx_nz = insert_res.map_err(|e| {
-        // SAFETY: src_object validated above; we just incremented refcount.
-        unsafe {
-            (*src_object.as_ptr()).dec_ref();
+    let (new_idx_nz, new_handle) = match insert_res
+    {
+        Ok(v) => v,
+        Err(e) =>
+        {
+            crate::cap::DERIVATION_LOCK.write_unlock();
+            // SAFETY: src_object validated above; we just incremented refcount.
+            unsafe {
+                (*src_object.as_ptr()).dec_ref();
+            }
+            return Err(SyscallError::from(e));
         }
-        SyscallError::from(e)
-    })?;
-    // Wire derivation link.
-    let src_idx_nz = core::num::NonZeroU32::new(src_idx).ok_or(SyscallError::InvalidCapability)?;
+    };
     let parent = crate::cap::slot::SlotId::current(cspace_id, src_idx_nz);
     let child = crate::cap::slot::SlotId::current(cspace_id, new_idx_nz);
-    crate::cap::DERIVATION_LOCK.write_lock();
     // SAFETY: DERIVATION_LOCK held; parent/child are valid SlotIds.
     unsafe {
         crate::cap::derivation::link_child(parent, child);
     }
     crate::cap::DERIVATION_LOCK.write_unlock();
-
-    // Encode the new slot's generation into the returned handle (#349). Re-lock
-    // to read the generation soundly; the slot is occupied (no handle returned
-    // yet) so the value is stable.
-    // SAFETY: caller_cspace validated non-null above.
-    let new_handle = unsafe {
-        let saved = (*caller_cspace).lock.lock_raw();
-        let h = (*caller_cspace).cap_handle(new_idx_nz);
-        (*caller_cspace).lock.unlock_raw(saved);
-        h
-    };
     Ok(u64::from(new_handle))
 }
 
@@ -1501,9 +1539,15 @@ pub fn sys_cap_derive_badge(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         (*src_object.as_ptr()).inc_ref();
     }
 
-    // Insert under cspace.lock so the freelist/tag invariant cannot tear
-    // against a concurrent SYS_CAP_CREATE_*. Badge write happens in the same
-    // critical section.
+    // Insert and link under DERIVATION_LOCK (cspace.lock nested per the
+    // documented order): a cap reachable through the CSpace but not yet
+    // linked could be moved out by a sibling, and a move carries whatever
+    // derivation position it finds — the cap would leave the source's revoke
+    // reach for good. Every occupied→free transition holds the lock, so no
+    // move can interleave before the link. The badge write and the handle
+    // read share the insert's critical section.
+    let src_idx_nz = core::num::NonZeroU32::new(src_idx).ok_or(SyscallError::InvalidCapability)?;
+    crate::cap::DERIVATION_LOCK.write_lock();
     // SAFETY: caller_cspace validated non-null above; lock_raw/unlock_raw paired.
     let insert_res = unsafe {
         let saved = (*caller_cspace).lock.lock_raw();
@@ -1513,37 +1557,30 @@ pub fn sys_cap_derive_badge(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         {
             new_slot.badge = badge_value;
         }
+        let r = r.map(|idx| (idx, (*caller_cspace).cap_handle(idx)));
         (*caller_cspace).lock.unlock_raw(saved);
         r
     };
-    let new_idx_nz = insert_res.map_err(|e| {
-        // SAFETY: src_object validated above; we just incremented refcount.
-        unsafe {
-            (*src_object.as_ptr()).dec_ref();
+    let (new_idx_nz, new_handle) = match insert_res
+    {
+        Ok(v) => v,
+        Err(e) =>
+        {
+            crate::cap::DERIVATION_LOCK.write_unlock();
+            // SAFETY: src_object validated above; we just incremented refcount.
+            unsafe {
+                (*src_object.as_ptr()).dec_ref();
+            }
+            return Err(SyscallError::from(e));
         }
-        SyscallError::from(e)
-    })?;
-    // Wire derivation link.
-    let src_idx_nz = core::num::NonZeroU32::new(src_idx).ok_or(SyscallError::InvalidCapability)?;
+    };
     let parent = crate::cap::slot::SlotId::current(cspace_id, src_idx_nz);
     let child = crate::cap::slot::SlotId::current(cspace_id, new_idx_nz);
-    crate::cap::DERIVATION_LOCK.write_lock();
     // SAFETY: DERIVATION_LOCK held; parent/child are valid SlotIds.
     unsafe {
         crate::cap::derivation::link_child(parent, child);
     }
     crate::cap::DERIVATION_LOCK.write_unlock();
-
-    // Encode the new slot's generation into the returned handle (#349). Re-lock
-    // to read the generation soundly; the slot is occupied (no handle returned
-    // yet) so the value is stable.
-    // SAFETY: caller_cspace validated non-null above.
-    let new_handle = unsafe {
-        let saved = (*caller_cspace).lock.lock_raw();
-        let h = (*caller_cspace).cap_handle(new_idx_nz);
-        (*caller_cspace).lock.unlock_raw(saved);
-        h
-    };
     Ok(u64::from(new_handle))
 }
 

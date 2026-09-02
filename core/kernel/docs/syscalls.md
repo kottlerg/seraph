@@ -964,7 +964,11 @@ derivation parent in the first derivation-lock hold, so a concurrent move
 cannot carry one out of the grantor's revoke reach before it is linked; a
 child a concurrent delete removed before the split finished stays deleted,
 and its returned handle carries the generation minted at insert, so it no
-longer resolves even if the slot has since been refilled.
+longer resolves even if the slot has since been refilled. A split that fails
+after at least one batch leaves the children already moved under the
+original's derivation parent, where they stay: the surviving original no
+longer holds revoke authority over them, as after a `SYS_CAP_DELETE` of an
+intermediate.
 The three other range splits (`SYS_IRQ_SPLIT`, `SYS_IOPORT_SPLIT`,
 `SYS_SCHED_SPLIT`) share this tail and these two errors.
 

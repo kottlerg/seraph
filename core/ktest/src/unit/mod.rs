@@ -149,6 +149,10 @@ pub fn run_all(ctx: &TestContext)
     );
     run_test!("cap_info::cspace_fields", cap_info::cspace_fields(ctx));
     run_test!(
+        "cap::cspace_teardown_multibatch",
+        cap::cspace_teardown_multibatch(ctx)
+    );
+    run_test!(
         "cap_info::null_slot_invalid",
         cap_info::null_slot_invalid(ctx)
     );

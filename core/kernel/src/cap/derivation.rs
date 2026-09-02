@@ -26,8 +26,10 @@
 //! - `deriv_next_sibling` / `deriv_prev_sibling`: intrusive doubly-linked list
 //!   of slots derived from the same parent
 //!
-//! When `tag == Null`, `deriv_parent` is repurposed for the free list; do not
-//! read derivation fields on Null slots.
+//! When `tag == Null`, `deriv_parent` and `deriv_first_child` are repurposed
+//! for the free list (successor and predecessor); do not read derivation
+//! fields on Null slots — every resolution here goes through the occupancy
+//! gate in `resolve_slot_mut`.
 //!
 //! ## Adding new operations
 //!
@@ -125,7 +127,8 @@ impl DerivationLock
 
 /// Resolve a [`SlotId`] to a mutable slot reference.
 ///
-/// Returns `None` if the `CSpace` is not registered or the index is invalid.
+/// Returns `None` if the `CSpace` is not registered, the index is invalid,
+/// or the slot is Null (freed — see the occupancy gate below).
 ///
 /// # Safety
 ///
@@ -165,41 +168,39 @@ unsafe fn resolve_slot_mut(id: SlotId) -> Option<&'static mut super::slot::Capab
 /// be valid, live capability slots (not Null).
 pub unsafe fn link_child(parent: SlotId, child: SlotId)
 {
-    // Update child's parent pointer.
+    // Resolve the parent FIRST: if it is gone or freed (a stale id from an
+    // unlocked source resolution that raced a delete — see the occupancy
+    // gate in `resolve_slot_mut`), the whole link is skipped and the child
+    // stays a derivation root. Writing the child's parent pointer before
+    // this check would leave a dangling `SlotId` that a later recycle of
+    // the index could alias onto an unrelated live slot.
+    // SAFETY: DERIVATION_LOCK held; ensures exclusive access to derivation tree.
+    let old_first = if let Some(parent_slot) = unsafe { resolve_slot_mut(parent) }
+    {
+        let old = parent_slot.deriv_first_child;
+        parent_slot.deriv_first_child = Some(child);
+        old
+    }
+    else
+    {
+        return;
+    };
+
     // SAFETY: DERIVATION_LOCK held; ensures exclusive access to derivation tree.
     if let Some(child_slot) = unsafe { resolve_slot_mut(child) }
     {
         child_slot.deriv_parent = Some(parent);
         child_slot.deriv_prev_sibling = None;
+        child_slot.deriv_next_sibling = old_first;
+    }
 
-        // child.next = old first_child
-        // SAFETY: DERIVATION_LOCK held; ensures exclusive access to derivation tree.
-        let old_first = if let Some(parent_slot) = unsafe { resolve_slot_mut(parent) }
+    // Wire the former first_child's prev pointer to the new child.
+    if let Some(old_first_id) = old_first
+    {
+        // SAFETY: DERIVATION_LOCK held; old_first_id retrieved from parent's child list.
+        if let Some(old_first_slot) = unsafe { resolve_slot_mut(old_first_id) }
         {
-            let old = parent_slot.deriv_first_child;
-            parent_slot.deriv_first_child = Some(child);
-            old
-        }
-        else
-        {
-            None
-        };
-
-        // Wire the former first_child's prev pointer to the new child.
-        if let Some(old_first_id) = old_first
-        {
-            // SAFETY: DERIVATION_LOCK held; old_first_id retrieved from parent's child list.
-            if let Some(old_first_slot) = unsafe { resolve_slot_mut(old_first_id) }
-            {
-                old_first_slot.deriv_prev_sibling = Some(child);
-            }
-        }
-
-        // Wire child's next sibling to the former first child.
-        // SAFETY: DERIVATION_LOCK held; ensures exclusive access to derivation tree.
-        if let Some(child_slot2) = unsafe { resolve_slot_mut(child) }
-        {
-            child_slot2.deriv_next_sibling = old_first;
+            old_first_slot.deriv_prev_sibling = Some(child);
         }
     }
 }
@@ -363,9 +364,10 @@ pub enum BatchStatus
     /// releasing the lock, deallocating the collected objects, and
     /// revalidating the root.
     MoreWork,
-    /// A derivation link failed to resolve — an invariant violation (the
-    /// pre-unregister drain guarantees no live slot references a dead
-    /// `CSpace`). The dangling chain was truncated for containment; the
+    /// A derivation link failed to resolve — genuine corruption, or the
+    /// narrow teardown self-race the pre-unregister drain documents (the
+    /// dying process wiring a link during its own drain window). The
+    /// dangling chain was truncated for containment; the
     /// caller must surface an error rather than report a clean revoke.
     DeadLink,
 }

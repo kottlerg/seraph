@@ -1345,7 +1345,8 @@ mod tests
         cs.free_slot(1);
         let initial_free = cs.free_count;
 
-        // Not on the list: an occupied... slot 0 and out-of-range.
+        // Not on the list: slot 0 (permanently null, never linked) and an
+        // out-of-range index.
         assert!(!cs.remove_from_free_list(0));
         assert!(!cs.remove_from_free_list(999_999));
 

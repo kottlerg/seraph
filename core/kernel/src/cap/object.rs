@@ -2847,20 +2847,22 @@ const MAX_DRAIN_EDITS: usize = 256;
 /// then skips it as Null and the object refcount is settled once (revoke
 /// dec-refs it; the post-drain `for_each_object` pass skips Null slots).
 ///
-/// The batch loop terminates: the owning process's caps to this `CSpace`
-/// are gone at refcount 0, so the ordinary syscall surface cannot add
-/// links into it, and every edit removes one. Residual window, stated
-/// honestly (it matches the pre-batching design's equivalent window after
-/// its single hold): a surviving thread of the owning process can still
-/// `cap_copy` *out of* the dying `CSpace` via its own TCB pointer, and an
-/// in-flight `ipc_recv` delivery can land caps *into* it — either can
-/// wire a derivation link touching a slot the cursor already passed. Such
-/// a link dangles once the `CSpace` unregisters and surfaces downstream
-/// as `revoke_subtree_batch`'s dead-link truncation — contained, and
-/// reachable only by the dying process racing its own teardown. The end
-/// state otherwise matches the previous whole-drain design: no slot
-/// anywhere references the dying `CSpace`, which is the invariant
-/// `free_cspace_id` recycling relies on.
+/// The batch loop terminates. In the benign case (the dying process's
+/// threads are gone) nothing can reach this `CSpace`, every edit removes
+/// one link, and the head-pop's no-progress containment truncates any
+/// unresolvable or cyclic chain instead of spinning. Residual window,
+/// stated honestly (it matches the pre-batching design's equivalent
+/// window after its single hold): a surviving thread of the owning
+/// process racing its own teardown can still operate on the dying
+/// `CSpace` via its TCB pointer (deriving out of it appends bounded
+/// work; an in-flight `ipc_recv` delivery can land caps into it) —
+/// links wired behind the cursor dangle once the `CSpace` unregisters
+/// and surface downstream as dead-link truncation, in the drain's own
+/// containment or `revoke_subtree_batch`'s. Contained, and reachable
+/// only by the dying process harming itself. The end state otherwise
+/// matches the previous whole-drain design: no slot anywhere references
+/// the dying `CSpace`, which is the invariant `free_cspace_id`
+/// recycling relies on.
 ///
 /// Returns `true` once the whole `CSpace` is drained; `false` when the
 /// edit budget ran out (call again — the cursor resumes at the same
@@ -2944,6 +2946,28 @@ unsafe fn drain_dying_cspace_batch(
             // clears the child's parent link.
             unsafe { unlink_node(head) };
             edits += 1;
+            // No-progress containment: an unresolvable head (dead link, or
+            // a stale/cyclic chain) makes unlink_node a no-op and would
+            // otherwise pin the pop loop forever. Truncate the chain
+            // hanging from it — the same containment revocation applies to
+            // a dead link — and move on.
+            // SAFETY: brief borrows of the dying slot.
+            let still_head =
+                unsafe { (*cs_ptr).slot(global_idx) }.and_then(|s| s.deriv_first_child);
+            if still_head == Some(head)
+            {
+                crate::kprintln!(
+                    "cap: teardown drain: unresolvable child link (cspace {} slot {}); truncating",
+                    head.cspace_id,
+                    head.index.get()
+                );
+                // SAFETY: brief exclusive borrow of the dying slot.
+                if let Some(slot) = unsafe { (*cs_ptr).slot_mut(global_idx) }
+                {
+                    slot.deriv_first_child = None;
+                }
+                break;
+            }
         }
 
         if edits >= MAX_DRAIN_EDITS

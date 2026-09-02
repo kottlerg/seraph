@@ -20,7 +20,9 @@ use syscall::{
 };
 use syscall_abi::SyscallError;
 
-use crate::{TestContext, TestResult};
+use crate::{ChildStack, TestContext, TestResult};
+
+static mut TEARDOWN_BATCH_STACK: ChildStack = ChildStack::ZERO;
 
 // Rights bit constants (from kernel/src/cap/slot.rs).
 // Notification NOTIFY (send) / WAIT (receive-block); endpoint SEND / GRANT.
@@ -637,4 +639,88 @@ pub fn derive_badge_on_notification(ctx: &TestContext) -> TestResult
     cap_delete(badged).map_err(|_| "cap_delete badged notification failed")?;
     cap_delete(sig).map_err(|_| "cap_delete sig after derive_badge_on_notification failed")?;
     Ok(())
+}
+
+/// Tearing down a `CSpace` whose derivation state spans multiple drain
+/// batches completes and leaves the survivors' forest clean.
+///
+/// A child thread bound to its own `CSpace` derives ~300 SEND caps from
+/// its copy of the parent's endpoint (300 dying children head-popped off
+/// one dying slot) and exits; deleting the child `CSpace` then drives
+/// `drain_dying_cspace_batch` across several `MAX_DRAIN_EDITS` windows
+/// (each derive contributes an unlink edit, plus one per slot). The
+/// parent's endpoint — the derivation ancestor of everything that died —
+/// must afterwards revoke cleanly (no dead-link `InvalidState`) and stay
+/// usable.
+pub fn cspace_teardown_multibatch(ctx: &TestContext) -> TestResult
+{
+    const DERIVES: u64 = 300;
+
+    let ep = cap_create_endpoint(ctx.memory_base)
+        .map_err(|_| "teardown_batch: cap_create_endpoint failed")?;
+    let done = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "teardown_batch: cap_create_notification failed")?;
+
+    let child =
+        crate::spawn::new_child(ctx).map_err(|_| "teardown_batch: spawn::new_child failed")?;
+    // Headroom for the derive burst (default child pool backs 167 slots).
+    cap_create_cspace(ctx.memory_base, child.cs, 4)
+        .map_err(|_| "teardown_batch: child cspace augment failed")?;
+    let child_ep = cap_copy(ep, child.cs, syscall_abi::RIGHTS_EP_SEND)
+        .map_err(|_| "teardown_batch: cap_copy ep failed")?;
+    let child_done = cap_copy(done, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
+        .map_err(|_| "teardown_batch: cap_copy done failed")?;
+    let child_arg = u64::from(child_ep) | (u64::from(child_done) << 16) | (DERIVES << 32);
+
+    let stack_top = ChildStack::top(core::ptr::addr_of!(TEARDOWN_BATCH_STACK));
+    crate::spawn::configure_and_start(&child, teardown_batch_child_entry, stack_top, child_arg)
+        .map_err(|_| "teardown_batch: configure_and_start failed")?;
+
+    let bits = notification_wait(done).map_err(|_| "teardown_batch: notification_wait failed")?;
+    if bits != 0x1
+    {
+        cap_delete(child.th).ok();
+        cap_delete(child.cs).ok();
+        cap_delete(ep).ok();
+        cap_delete(done).ok();
+        return Err("teardown_batch: child failed its derive burst");
+    }
+
+    // Tear down: the child CSpace dies holding one slot with ~300 derived
+    // children plus the bootstrap copies — several drain batches.
+    cap_delete(child.th).map_err(|_| "teardown_batch: cap_delete(thread) failed")?;
+    cap_delete(child.cs).map_err(|_| "teardown_batch: cap_delete(cspace) failed")?;
+
+    // The ancestor's revoke must be clean: a dangling link left by the
+    // drain would surface as InvalidState (dead-link truncation).
+    cap_revoke(ep).map_err(|_| "teardown_batch: post-teardown revoke reported a dead link")?;
+    // And the endpoint itself must still be intact.
+    let probe = cap_derive(ep, syscall_abi::RIGHTS_EP_SEND)
+        .map_err(|_| "teardown_batch: endpoint unusable after teardown")?;
+    cap_delete(probe).ok();
+    cap_delete(ep).ok();
+    cap_delete(done).ok();
+    Ok(())
+}
+
+/// Child for [`cspace_teardown_multibatch`]: derives `count` SEND caps
+/// from its endpoint copy (building a wide dying child list), signals
+/// completion, and exits without cleaning up — teardown is the test.
+fn teardown_batch_child_entry(arg: u64) -> !
+{
+    let ep_slot = (arg & 0xFFFF) as u32;
+    let done_slot = ((arg >> 16) & 0xFFFF) as u32;
+    let count = arg >> 32;
+
+    let mut ok = true;
+    for _ in 0..count
+    {
+        if cap_derive(ep_slot, syscall_abi::RIGHTS_EP_SEND).is_err()
+        {
+            ok = false;
+            break;
+        }
+    }
+    notification_send(done_slot, if ok { 0x1 } else { 0xBAD }).ok();
+    syscall::thread_exit()
 }

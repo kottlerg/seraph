@@ -129,21 +129,19 @@ pub(crate) unsafe fn install_split_children(
         unsafe { link_child(parent_id, child2_id) };
     }
 
-    DERIVATION_LOCK.write_unlock();
-
     // ── Consume the original cap ──────────────────────────────────────────────
-
-    // SAFETY: caller_cspace validated; orig_idx within CSpace bounds.
-    // DERIVATION_LOCK brackets the free so the occupied-to-free transition
-    // stays atomic against derivation-side occupancy gates (see
-    // `resolve_slot_mut`).
+    // Freed inside the SAME derivation-lock hold as the unlink above: a gap
+    // would let a concurrent derive re-link a child under the
+    // still-handle-valid original, stranding it as a dangling parent link.
+    // SAFETY: caller_cspace validated; orig_idx within CSpace bounds;
+    // cspace.lock nests inside DERIVATION_LOCK per the documented order.
     unsafe {
-        DERIVATION_LOCK.write_lock();
         let saved = (*caller_cspace).lock.lock_raw();
         (*caller_cspace).free_slot(orig_idx);
         (*caller_cspace).lock.unlock_raw(saved);
-        DERIVATION_LOCK.write_unlock();
     }
+
+    DERIVATION_LOCK.write_unlock();
 
     // SAFETY: orig_obj_ptr from the caller's lookup; object still valid.
     let remaining = unsafe { (*orig_obj_ptr.as_ptr()).dec_ref() };

@@ -1974,10 +1974,19 @@ pub unsafe fn scheduler_for(id: usize) -> &'static mut PerCpuScheduler
 
 /// Write `tcb.state = new_state` under every CPU's scheduler.lock.
 ///
-/// Returns the CPU whose `current == tcb` (if any), so `sys_thread_stop`
-/// can prod-and-drain a remote Running target. Cost: up to `MAX_CPUS`
-/// spinlock acquires; for lifecycle syscalls only, not hot paths.
-/// See docs/scheduling-internals.md § Cross-CPU TCB Ownership.
+/// Returns [`StateCommit::Committed`] with the CPU whose `current == tcb`
+/// (if any), so `sys_thread_stop` can prod-and-drain a remote Running
+/// target. Cost: up to `MAX_CPUS` spinlock acquires; for lifecycle syscalls
+/// only, not hot paths. See docs/scheduling-internals.md § Cross-CPU TCB
+/// Ownership.
+///
+/// `Exited` is terminal: if `tcb` is already `Exited` when the locks are
+/// held, nothing is written and [`StateCommit::RefusedExited`] is returned.
+/// A lifecycle syscall reads the target's state without a lock before it
+/// commits, so an object teardown or an exit on another CPU can mark the
+/// thread `Exited` in between; a commit that overwrote that mark would
+/// revive the thread as `Ready`, pass the teardown's `current`-only scan,
+/// and later run it against reclaimed storage.
 ///
 /// When `new_state` is `Stopped` or `Exited`, also scans every CPU's run
 /// queue at `tcb.priority` and removes any lingering entry. Closes the
@@ -1995,7 +2004,7 @@ pub unsafe fn scheduler_for(id: usize) -> &'static mut PerCpuScheduler
 pub unsafe fn set_state_under_all_locks(
     tcb: *mut ThreadControlBlock,
     new_state: thread::ThreadState,
-) -> Option<usize>
+) -> StateCommit
 {
     let cpu_count = CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
 
@@ -2020,44 +2029,52 @@ pub unsafe fn set_state_under_all_locks(
         }
     }
 
-    // Write the state and snapshot priority under all locks so the queue
-    // drain below sees a value coherent with the state we just published.
-    // `sys_thread_set_priority` writes `priority` under the per-TCB `sched_lock`
-    // (`core/kernel/src/syscall/thread.rs`), which this path also holds (outer),
-    // so the priority read here is serialised against that writer.
-    // SAFETY: tcb validated by caller; state/priority fields always valid.
-    let priority = unsafe {
-        (*tcb).state = new_state;
-        (*tcb).priority
-    };
-
-    // Drain stale run-queue entries on Stopped/Exited transitions. The
-    // remove is best-effort: if the TCB isn't linked, it's a no-op. See
-    // docs/scheduling-internals.md § Stopped/Exited drain.
-    if matches!(
-        new_state,
-        thread::ThreadState::Stopped | thread::ThreadState::Exited
-    )
+    // `Exited` is terminal (see the function doc): read under the same locks
+    // every writer of `state` on this path holds.
+    // SAFETY: tcb validated by caller; state field always valid.
+    let exited = unsafe { (*tcb).state == thread::ThreadState::Exited };
+    let mut running_on: Option<usize> = None;
+    if !exited
     {
-        #[allow(clippy::needless_range_loop)]
-        for cpu in 0..cpu_count
+        // Write the state and snapshot priority under all locks so the queue
+        // drain below sees a value coherent with the state we just published.
+        // `sys_thread_set_priority` writes `priority` under the per-TCB
+        // `sched_lock` (`core/kernel/src/syscall/thread.rs`), which this path
+        // also holds (outer), so the priority read here is serialised against
+        // that writer.
+        // SAFETY: tcb validated by caller; state/priority fields always valid.
+        let priority = unsafe {
+            (*tcb).state = new_state;
+            (*tcb).priority
+        };
+
+        // Drain stale run-queue entries on Stopped/Exited transitions. The
+        // remove is best-effort: if the TCB isn't linked, it's a no-op. See
+        // docs/scheduling-internals.md § Stopped/Exited drain.
+        if matches!(
+            new_state,
+            thread::ThreadState::Stopped | thread::ThreadState::Exited
+        )
         {
-            // SAFETY: cpu < cpu_count; lock held; tcb valid.
-            unsafe {
-                scheduler_for(cpu).remove_from_queue(tcb, priority);
+            #[allow(clippy::needless_range_loop)]
+            for cpu in 0..cpu_count
+            {
+                // SAFETY: cpu < cpu_count; lock held; tcb valid.
+                unsafe {
+                    scheduler_for(cpu).remove_from_queue(tcb, priority);
+                }
             }
         }
-    }
 
-    // Identify which CPU (if any) currently has tcb as `current`.
-    let mut running_on: Option<usize> = None;
-    for cpu in 0..cpu_count
-    {
-        // SAFETY: cpu < cpu_count; scheduler slab initialised by init().
-        if unsafe { scheduler_for(cpu).current } == tcb
+        // Identify which CPU (if any) currently has tcb as `current`.
+        for cpu in 0..cpu_count
         {
-            running_on = Some(cpu);
-            break;
+            // SAFETY: cpu < cpu_count; scheduler slab initialised by init().
+            if unsafe { scheduler_for(cpu).current } == tcb
+            {
+                running_on = Some(cpu);
+                break;
+            }
         }
     }
 
@@ -2076,7 +2093,25 @@ pub unsafe fn set_state_under_all_locks(
         (*tcb).sched_lock.unlock_raw(tcb_sched_saved);
     }
 
-    running_on
+    if exited
+    {
+        StateCommit::RefusedExited
+    }
+    else
+    {
+        StateCommit::Committed(running_on)
+    }
+}
+
+/// Outcome of [`set_state_under_all_locks`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StateCommit
+{
+    /// The state was written; the payload names the CPU whose `current` is
+    /// the thread, if any.
+    Committed(Option<usize>),
+    /// Nothing was written: the thread is `Exited`, which is terminal.
+    RefusedExited,
 }
 
 /// Wait until `tcb` has left every CPU and its in-flight register save has
@@ -2299,12 +2334,12 @@ unsafe fn mark_bound_threads(
             // exit path. Not posted: kernel-initiated teardown is silent,
             // as for a thread reaped through its own capability.
             (*tcb).exit_reason = syscall::EXIT_KILLED;
-            let running_on = set_state_under_all_locks(tcb, thread::ThreadState::Exited);
+            let committed = set_state_under_all_locks(tcb, thread::ThreadState::Exited);
             if is_self
             {
                 self_bound = true;
             }
-            else if let Some(cpu) = running_on
+            else if let StateCommit::Committed(Some(cpu)) = committed
                 && cpu != this_cpu
             {
                 prod[cpu] = true;
@@ -2541,9 +2576,9 @@ pub unsafe fn wait_until_aspace_inactive(
 pub unsafe fn set_state_under_all_locks(
     _tcb: *mut ThreadControlBlock,
     _new_state: thread::ThreadState,
-) -> Option<usize>
+) -> StateCommit
 {
-    None
+    StateCommit::Committed(None)
 }
 
 /// Outcome of [`commit_blocked_under_local_lock`].
@@ -3671,16 +3706,22 @@ pub unsafe fn enqueue_and_wake(tcb: *mut ThreadControlBlock, target_cpu: usize)
 #[allow(unused_variables)]
 pub unsafe fn enqueue_and_wake(_tcb: *mut ThreadControlBlock, _target_cpu: usize) {}
 
-/// Unconditionally make `tcb` `Ready` and link it on `target_cpu`'s run queue,
-/// under the per-TCB `sched_lock` — the DELIBERATE-placement primitive.
+/// Make `tcb` `Ready` and link it on `target_cpu`'s run queue, under the
+/// per-TCB `sched_lock` — the DELIBERATE-placement primitive.
 ///
-/// Unlike [`enqueue_and_wake`], this does NOT classify `state`: it forces the
-/// `→Ready` transition and links. Use it only when the caller owns the
-/// transition and has established the thread is not live on any CPU — start /
-/// resume (`Created`/`Stopped` → run), the dealloc reply-bound-client wake, and
-/// `schedule()`'s cross-affinity requeue of `current`. Routing those through the
-/// gated `enqueue_and_wake` would be wrong: their thread is already (or becomes)
-/// `Ready`, which the gate coalesces — dropping it from every run queue.
+/// Unlike [`enqueue_and_wake`], this does NOT classify `state` beyond the
+/// terminal check: it forces the `→Ready` transition and links. Use it only
+/// when the caller owns the transition and has established the thread is not
+/// live on any CPU — start / resume (`Created`/`Stopped` → run), the dealloc
+/// reply-bound-client wake, and `schedule()`'s cross-affinity requeue of
+/// `current`. Routing those through the gated `enqueue_and_wake` would be
+/// wrong: their thread is already (or becomes) `Ready`, which the gate
+/// coalesces — dropping it from every run queue.
+///
+/// Returns `false` without writing or linking if the thread is `Exited`
+/// under `sched_lock`: an object teardown or an exit on another CPU can mark
+/// it between the caller's own state commit and this link, and `Exited` is
+/// terminal (see [`set_state_under_all_locks`]).
 ///
 /// Lock order: `(*tcb).sched_lock` (outer) → target run-queue lock (inner), then
 /// `wake_idle_cpu` after both are released — identical to `enqueue_and_wake`'s
@@ -3692,10 +3733,17 @@ pub unsafe fn enqueue_and_wake(_tcb: *mut ThreadControlBlock, _target_cpu: usize
 /// - `target_cpu` must be < [`MAX_CPUS`] and initialized by `sched::init`.
 /// - The caller must hold no run-queue lock.
 #[cfg(not(test))]
-pub unsafe fn enqueue_ready_thread(tcb: *mut ThreadControlBlock, target_cpu: usize)
+pub unsafe fn enqueue_ready_thread(tcb: *mut ThreadControlBlock, target_cpu: usize) -> bool
 {
     // SAFETY: tcb valid; sched_lock (outer) paired with unlock below.
     let sched_saved = unsafe { (*tcb).sched_lock.lock_raw() };
+    // SAFETY: state read under sched_lock, which every lifecycle writer holds.
+    if unsafe { (*tcb).state } == thread::ThreadState::Exited
+    {
+        // SAFETY: paired with the lock_raw above.
+        unsafe { (*tcb).sched_lock.unlock_raw(sched_saved) };
+        return false;
+    }
     // SAFETY: caller guarantees target_cpu is initialized.
     let sched = unsafe { scheduler_for(target_cpu) };
     // SAFETY: run-queue lock (inner) paired with unlock below.
@@ -3745,12 +3793,16 @@ pub unsafe fn enqueue_ready_thread(tcb: *mut ThreadControlBlock, target_cpu: usi
 
     // SAFETY: target_cpu validated < MAX_CPUS by scheduler_for.
     unsafe { wake_idle_cpu(target_cpu) };
+    true
 }
 
 /// Test stub for `enqueue_ready_thread` (no-op in test mode).
 #[cfg(test)]
 #[allow(unused_variables)]
-pub unsafe fn enqueue_ready_thread(_tcb: *mut ThreadControlBlock, _target_cpu: usize) {}
+pub unsafe fn enqueue_ready_thread(_tcb: *mut ThreadControlBlock, _target_cpu: usize) -> bool
+{
+    true
+}
 
 /// Select target CPU for enqueueing a thread based on affinity, soft
 /// affinity (cache warmth), and load.

@@ -1208,6 +1208,15 @@ unsafe fn defer_self_teardown(ptr: NonNull<KernelObjectHeader>, what: &str)
     // SAFETY: this_cpu < MAX_CPUS; `current` is written only by this CPU at
     // dispatch, and per contract we are that running thread.
     let cur = unsafe { crate::sched::scheduler_for(this_cpu).current };
+    // Tripwire for the contract above: the caller observed its own `Exited`
+    // state under the scheduler lock, so the read here is stable.
+    // SAFETY: cur is this CPU's `current`, valid while installed.
+    let cur_exited =
+        !cur.is_null() && unsafe { (*cur).state } == crate::sched::thread::ThreadState::Exited;
+    debug_assert!(
+        cur_exited,
+        "defer_self_teardown: running thread is not Exited"
+    );
     if !cur.is_null()
     {
         log_self_teardown(cur, what);

@@ -1017,7 +1017,9 @@ Transition a thread from `Created` state to `Ready` and enqueue it for schedulin
 **Capability requirement:** `thread_cap` must have Control rights.
 
 **Errors:** `InvalidCapability`, `InsufficientRights` (cap lacks Control),
-`InvalidArgument` (thread not in Created/Stopped state, or not yet configured).
+`InvalidArgument` (thread not in Created/Stopped state — including one that exited or
+was killed by an object teardown between the check and the locked commit — or not yet
+configured).
 
 ---
 
@@ -1040,7 +1042,8 @@ inter-processor interrupt is sent to force it out of userspace.
 **Capability requirement:** `thread_cap` must have Control rights.
 
 **Errors:** `InvalidCapability`, `InsufficientRights` (cap lacks Control),
-`InvalidState` (thread already stopped or exited).
+`InvalidState` (thread already stopped or exited, including one killed by an object
+teardown concurrently with the call).
 
 ---
 

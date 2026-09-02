@@ -1461,11 +1461,21 @@ pub fn cap_derive_badge(src_slot: u32, rights_mask: u64, badge: u64) -> Result<u
 
 /// Delete a capability slot in the caller's `CSpace` (`SYS_CAP_DELETE`).
 ///
-/// Reparents child derivations to the deleted slot's parent, unlinks from the
-/// derivation tree, and dec-refs the kernel object. Idempotent on Null slots.
+/// Reparents child derivations to the deleted slot's parent (in batches, the
+/// derivation lock released between them), unlinks from the derivation tree,
+/// and dec-refs the kernel object. Idempotent on Null slots.
+///
+/// Deleting the last capability to the caller's own `CSpace` or
+/// `AddressSpace` (directly, or through the teardown cascade) stops the
+/// caller: the call never returns. Deleting the caller's own Thread
+/// capability is refused instead.
 ///
 /// # Errors
-/// Returns a negative `i64` error code if the slot index is out of range.
+/// Returns a negative `i64` error code: `InvalidCapability` if the slot
+/// index is out of range or names the caller's own thread; `InvalidState`
+/// if a `SYS_CAP_REVOKE` on the slot is in flight; `Interrupted` if a
+/// concurrent deriver extended the slot's child list faster than the
+/// batched reparent could move it (retry).
 pub fn cap_delete(slot: u32) -> Result<(), i64>
 {
     // SAFETY: syscall2 issues raw syscall instruction; slot is cap index as u64;

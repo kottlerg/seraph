@@ -112,7 +112,7 @@ pub(crate) unsafe fn install_split_children(
         // the cap that was looked up, with no revoke in flight on it.
         // SAFETY: caller_cspace validated; DERIVATION_LOCK held, so a free
         // of this slot is observed stably (every free holds the lock).
-        let orig_parent = unsafe { (*caller_cspace).slot(orig_idx) }.and_then(|slot| {
+        let revalidated_parent = unsafe { (*caller_cspace).slot(orig_idx) }.and_then(|slot| {
             (slot.tag == tag
                 && slot.generation() == orig_gen
                 && slot.object == Some(orig_obj_ptr)
@@ -120,10 +120,10 @@ pub(crate) unsafe fn install_split_children(
             .then_some(slot.deriv_parent)
         });
         // SAFETY: DERIVATION_LOCK held; orig_node revalidated when Some.
-        let done = orig_parent
+        let done = revalidated_parent
             .map(|parent| unsafe { reparent_children(orig_node, parent, MAX_REPARENT_EDITS) });
         batches += 1;
-        match (orig_parent, done)
+        match (revalidated_parent, done)
         {
             (Some(parent), Some(true)) => break parent,
             (Some(_), Some(false)) if batches < MAX_REPARENT_BATCHES =>
@@ -147,7 +147,7 @@ pub(crate) unsafe fn install_split_children(
                 // rollback_child and is referenced by no slot.
                 unsafe { dealloc_rolled_back(released, child1_ptr, child2_ptr) };
                 return Err(
-                    if orig_parent.is_some()
+                    if revalidated_parent.is_some()
                     {
                         SyscallError::Interrupted
                     }
@@ -331,12 +331,12 @@ unsafe fn insert_children(
 /// if a sibling thread already deleted the child (its delete released the
 /// object), the slot was recycled since, or other slots still reference the
 /// object — a sibling may have derived or copied the child between its
-/// insert and this rollback, and those caps stay valid. Anything derived from the child is detached into derivation
-/// roots first, so the free never strands a child with a dangling parent
-/// link. That walk runs to completion under the lock: its length is
-/// however many derivations a sibling landed in the window, not a
-/// constant, but nothing can extend the list while the lock is held, so it
-/// terminates.
+/// insert and this rollback, and those caps stay valid. Anything derived
+/// from the child is detached into derivation roots first, so the free
+/// never strands a child with a dangling parent link. That walk runs to
+/// completion under the lock: its length is however many derivations a
+/// sibling landed in the window, not a constant, but nothing can extend the
+/// list while the lock is held, so it terminates.
 ///
 /// # Safety
 ///

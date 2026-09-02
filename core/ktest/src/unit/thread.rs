@@ -502,7 +502,7 @@ pub fn sched_split_rollback_on_full_cspace(ctx: &TestContext) -> TestResult
 /// success, else a bit naming the first failed step.
 fn split_rollback_child_entry(arg: u64) -> !
 {
-    const OUT_OF_MEMORY: i64 = -8;
+    const OUT_OF_MEMORY: i64 = SyscallError::OutOfMemory as i64;
     let sched_slot = (arg & 0xFFFF_FFFF) as u32;
     let done_slot = (arg >> 32) as u32;
 

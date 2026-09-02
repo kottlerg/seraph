@@ -427,9 +427,12 @@ neighbours re-linked directly. Each unlink leaves the forest fully
 consistent, so the drain runs in edit-bounded batches that release the
 derivation write lock between holds (mirroring revocation's batching); a
 foreign traversal in a window between batches sees ordinary consistent
-nodes. A link that fails to resolve anyway is corruption: the walk
-truncates the chain hanging from it (containment), logs it, and the syscall
-returns `InvalidState` instead of reporting a clean revoke.
+nodes. The one remaining source of a dead link is the dying process racing
+its own teardown (wiring a link out of or into the dying CSpace from a
+surviving thread or an in-flight receive during the drain window); a link
+that fails to resolve — that race, or genuine corruption — is contained
+identically: the walk truncates the chain hanging from it, logs it, and
+the syscall returns `InvalidState` instead of reporting a clean revoke.
 
 **Performance characteristics:** Revocation is O(N) in the number of descendants.
 For well-behaved systems, derivation trees are shallow (a server derives a

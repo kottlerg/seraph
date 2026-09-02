@@ -499,6 +499,7 @@ pub fn cspace_indirect_region(ctx: &TestContext) -> TestResult
         .map_err(|_| "retype::indirect: cap_create_notification(mover) failed")?;
     if syscall::cap_move(mover, cspace, SMALL_SLOT + 56).is_err()
     {
+        cap_delete(mover).ok();
         cap_delete(cspace).ok();
         cap_delete(probe).ok();
         return Err("retype::indirect: cap_move to a high explicit slot failed");
@@ -531,16 +532,45 @@ pub fn cspace_indirect_region(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
+/// A doomed explicit placement fails fast without consuming any pool
+/// page: covering slot 7300 needs 132 pages (131 leaves plus the first
+/// directory page) against a 1-page pool, and the budget is untouched
+/// after the rejection.
+pub fn cspace_explicit_placement_fast_fail(ctx: &TestContext) -> TestResult
+{
+    const PAGE: u64 = 4096;
+    let memory = ctx.memory_base;
+    let cspace = cap_create_cspace(memory, 0, 2)
+        .map_err(|_| "retype::fast_fail: cap_create_cspace failed")?;
+    let Ok(probe) = cap_create_endpoint(memory)
+    else
+    {
+        cap_delete(cspace).ok();
+        return Err("retype::fast_fail: cap_create_endpoint failed");
+    };
+
+    let before = cap_info(cspace, CAP_INFO_CSPACE_BUDGET)
+        .map_err(|_| "retype::fast_fail: cap_info(budget) failed")?;
+    let doomed = cap_insert(probe, cspace, 7300, syscall::RIGHTS_ALL);
+    let after = cap_info(cspace, CAP_INFO_CSPACE_BUDGET)
+        .map_err(|_| "retype::fast_fail: cap_info(budget after) failed")?;
+    cap_delete(probe).ok();
+    cap_delete(cspace).ok();
+    if doomed != Err(SYS_OUT_OF_MEMORY) || before != after || before != PAGE
+    {
+        return Err("retype::fast_fail: doomed placement consumed budget");
+    }
+    Ok(())
+}
+
 /// A directory page that outlives a failed leaf allocation stays
 /// published and is not re-charged: with exactly one pool page at the
 /// direct/indirect boundary, the auto-allocating grow spends it on the
 /// directory page and fails the leaf with `OutOfMemory`; after a one-page
 /// refill the next insert succeeds without buying the directory page
-/// again. Also pins the explicit-placement fast-fail: a doomed high-slot
-/// placement fails without consuming any pool page.
+/// again.
 pub fn cspace_dir_page_survives_failed_grow(ctx: &TestContext) -> TestResult
 {
-    const PAGE: u64 = 4096;
     // 128 direct leaves x 56 slots, minus reserved slot 0.
     const DIRECT_SLOTS: u32 = 128 * 56 - 1;
 
@@ -553,20 +583,6 @@ pub fn cspace_dir_page_survives_failed_grow(ctx: &TestContext) -> TestResult
         cap_delete(cspace).ok();
         return Err("retype::dir_survives: cap_create_endpoint failed");
     };
-
-    // Fast-fail check: covering slot 7300 needs 131 pages; the pool holds
-    // 1. The placement must fail without touching the budget.
-    let before = cap_info(cspace, CAP_INFO_CSPACE_BUDGET)
-        .map_err(|_| "retype::dir_survives: cap_info(budget) failed")?;
-    let doomed = cap_insert(probe, cspace, 7300, syscall::RIGHTS_ALL);
-    let after = cap_info(cspace, CAP_INFO_CSPACE_BUDGET)
-        .map_err(|_| "retype::dir_survives: cap_info(budget after) failed")?;
-    if doomed != Err(SYS_OUT_OF_MEMORY) || before != after || before != PAGE
-    {
-        cap_delete(probe).ok();
-        cap_delete(cspace).ok();
-        return Err("retype::dir_survives: doomed placement consumed budget");
-    }
 
     // Fill the whole direct region so the free list empties exactly at the
     // direct/indirect boundary. 128 leaf pages total; 127 more than seeded.

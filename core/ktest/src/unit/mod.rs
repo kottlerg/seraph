@@ -199,6 +199,10 @@ pub fn run_all(ctx: &TestContext)
         retype::cspace_indirect_region(ctx)
     );
     run_test!(
+        "retype::cspace_explicit_placement_fast_fail",
+        retype::cspace_explicit_placement_fast_fail(ctx)
+    );
+    run_test!(
         "retype::cspace_dir_page_survives_failed_grow",
         retype::cspace_dir_page_survives_failed_grow(ctx)
     );

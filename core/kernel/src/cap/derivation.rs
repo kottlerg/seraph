@@ -136,7 +136,22 @@ unsafe fn resolve_slot_mut(id: SlotId) -> Option<&'static mut super::slot::Capab
     let cs_ptr = crate::cap::lookup_cspace(id.cspace_id, id.epoch)?;
     // SAFETY: cspace registry lookup validated; CSpace pointer lives as long as the registry entry.
     let cs = unsafe { &mut *cs_ptr };
-    cs.slot_mut(id.index.get())
+    let slot = cs.slot_mut(id.index.get())?;
+    // Occupancy gate: a Null slot is not a derivation node — its `deriv_*`
+    // fields are free-list state (successor in `deriv_parent`, predecessor
+    // in `deriv_first_child`), which a derivation-side write would corrupt
+    // into handing out an occupied slot. A stale `SlotId` naming a freed
+    // slot (e.g. `link_child` after an unlocked source resolution raced a
+    // concurrent delete) resolves to `None` and the caller skips the edit.
+    // The gate is stable under `DERIVATION_LOCK`: every occupied-to-free
+    // transition happens with the lock held (delete, revoke's
+    // `unlink_free_collect`, the teardown drain, the split consume/rollback
+    // paths, and the memory-merge tail release).
+    if slot.is_null()
+    {
+        return None;
+    }
+    Some(slot)
 }
 
 /// Link `child` as a new child of `parent` in the derivation tree.
@@ -390,11 +405,13 @@ pub enum BatchStatus
 ///
 /// # Safety
 ///
-/// Caller must hold `DERIVATION_LOCK` write lock. Every derivation link
-/// reachable from a live slot resolves — `drain_dying_cspace` splices all
-/// foreign-facing links to surviving neighbours before a `CSpace`
-/// unregisters. A link that fails to resolve anyway is corruption: the walk
-/// truncates the chain hanging from it (containment), logs it, and reports
+/// Caller must hold `DERIVATION_LOCK` write lock. Derivation links
+/// reachable from a live slot resolve — `drain_dying_cspace_batch` unlinks
+/// every dying slot from the forest before a `CSpace` unregisters, save
+/// for the narrow teardown self-race window it documents (the dying
+/// process wiring a link during its own drain). A link that fails to
+/// resolve is treated as corruption-contained either way: the walk
+/// truncates the chain hanging from it, logs it, and reports
 /// [`BatchStatus::DeadLink`].
 pub unsafe fn revoke_subtree_batch(
     root: SlotId,

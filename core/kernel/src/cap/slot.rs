@@ -11,9 +11,11 @@
 //! ## Intrusive free list
 //!
 //! When a slot is free (`tag == Null`), the `deriv_parent` field is repurposed
-//! to store the next-free index. Call [`CapabilitySlot::set_next_free`] and
-//! [`CapabilitySlot::next_free`] to encode/decode; do not read `deriv_parent`
-//! directly on a free slot. The `epoch` field of the encoded `SlotId` is the
+//! to store the next-free index and `deriv_first_child` the previous-free
+//! index (the doubly-linked list makes arbitrary unlinks O(1)). Call
+//! [`CapabilitySlot::set_next_free`] / [`CapabilitySlot::next_free`] and
+//! [`CapabilitySlot::set_prev_free_link`] / [`CapabilitySlot::prev_free`]
+//! to encode/decode; do not read the fields directly on a free slot. The `epoch` field of the encoded `SlotId` is the
 //! free-list sentinel value `0` and MUST NOT appear in any live derivation
 //! link — derivation links carry the registry epoch that was current when
 //! they were stamped.
@@ -547,7 +549,7 @@ pub fn violates_wx(rights: Rights) -> bool
 ///       8     8  badge  (caller-identifying label; 0 = unbadged)
 ///      16     8  object (naturally 8-byte aligned at offset 16)
 ///      24    12  deriv_parent   (next_free index when tag == Null)
-///      36    12  deriv_first_child
+///      36    12  deriv_first_child (prev_free index when tag == Null)
 ///      48    12  deriv_next_sibling
 ///      60    12  deriv_prev_sibling
 /// total: 72 bytes
@@ -583,7 +585,8 @@ pub struct CapabilitySlot
     pub object: Option<NonNull<KernelObjectHeader>>,
     /// Derivation parent, or next-free index when tag == Null.
     pub deriv_parent: Option<SlotId>,
-    /// First child in the derivation tree (None if leaf).
+    /// First child in the derivation tree (None if leaf), or the
+    /// previous-free index when tag == Null.
     pub deriv_first_child: Option<SlotId>,
     /// Next sibling in the derivation tree.
     pub deriv_next_sibling: Option<SlotId>,
@@ -929,6 +932,20 @@ mod tests
         assert_eq!(s.next_free(), Some(next));
         assert_eq!(s.tag, CapTag::Null);
         assert!(s.is_on_free_list());
+        // A fresh push enters at the head: no predecessor.
+        assert_eq!(s.prev_free(), None);
+        // Predecessor link round-trips independently of the successor.
+        let prev = NonZeroU32::new(7).unwrap();
+        s.set_prev_free_link(Some(prev));
+        assert_eq!(s.prev_free(), Some(prev));
+        assert_eq!(s.next_free(), Some(next));
+        s.set_prev_free_link(None);
+        assert_eq!(s.prev_free(), None);
+        // Successor splice leaves the predecessor untouched.
+        s.set_prev_free_link(Some(prev));
+        s.set_next_free_link(None);
+        assert_eq!(s.next_free(), None);
+        assert_eq!(s.prev_free(), Some(prev));
     }
 
     #[test]

@@ -16,9 +16,10 @@
 //!
 //! ## Free list
 //!
-//! Freed slots are tracked via an intrusive singly-linked list encoded in each
-//! slot's `deriv_parent` field (see `slot.rs`). Slot 0 is permanently null and
-//! is never placed on the free list.
+//! Freed slots are tracked via an intrusive doubly-linked list encoded in
+//! each slot's `deriv_parent` (successor) and `deriv_first_child`
+//! (predecessor) fields (see `slot.rs`). Slot 0 is permanently null and is
+//! never placed on the free list.
 //!
 //! ## Growth
 //!
@@ -604,6 +605,12 @@ impl CSpace
     /// Return a slot to the free list and clear its contents.
     ///
     /// Silently ignores an out-of-range, unmapped, or zero index.
+    ///
+    /// Callers freeing an occupied slot MUST hold `DERIVATION_LOCK` around
+    /// the free (in addition to this `CSpace`'s spinlock): the derivation
+    /// code's occupancy gate (`resolve_slot_mut`) relies on
+    /// occupied-to-free transitions being excluded while it holds that
+    /// lock.
     ///
     /// Rejects a double-free of any slot: [`CapabilitySlot::is_on_free_list`]
     /// is true for every slot currently linked on the list (head, interior, or
@@ -1276,6 +1283,99 @@ mod tests
         assert_eq!(deep.object, Some(obj));
         assert_eq!(cs.next_leaf as usize, 8000 / L2_SIZE + 1);
         assert_eq!(cs.populated_count(), direct_slots + 2);
+    }
+
+    #[test]
+    fn pages_to_cover_counts_leaves_and_dir_pages()
+    {
+        let mut cs = CSpace::new(0);
+        // Fresh CSpace, direct-region target: leaves only.
+        assert_eq!(cs.pages_to_cover(0), 1, "slot 0 needs leaf 0");
+        assert_eq!(cs.pages_to_cover((L2_SIZE - 1) as u32), 1);
+        assert_eq!(cs.pages_to_cover((3 * L2_SIZE) as u32), 4, "leaves 0..=3");
+        // First indirect target: all 129 leaves plus one directory page.
+        assert_eq!(
+            cs.pages_to_cover((L1_DIRECT * L2_SIZE) as u32),
+            (L1_DIRECT + 1) as u64 + 1
+        );
+        // Out of range: zero (the placement path rejects instead).
+        assert_eq!(cs.pages_to_cover(MAX_SLOTS_STRUCTURAL as u32), 0);
+        // Already covered after an allocation.
+        cs.allocate_slot().unwrap();
+        assert_eq!(cs.pages_to_cover(1), 0);
+        // Second target under an already-materialised directory page costs
+        // only the missing leaves.
+        cs.insert_cap_at(
+            (L1_DIRECT * L2_SIZE) as u32,
+            CapTag::Memory,
+            MemRights::MAP.erase(),
+            dummy_object(),
+        )
+        .expect("indirect placement failed");
+        assert_eq!(
+            cs.pages_to_cover(((L1_DIRECT + 2) * L2_SIZE) as u32),
+            2,
+            "existing dir page must not be re-counted"
+        );
+    }
+
+    #[test]
+    fn grow_toward_batches_and_completes()
+    {
+        let mut cs = CSpace::new(0);
+        // Target leaf 9 with a 4-leaf batch: two partial calls, then done.
+        let target = (9 * L2_SIZE) as u32;
+        assert_eq!(cs.grow_toward(target, 4).unwrap(), false);
+        assert_eq!(cs.leaf_count(), 4);
+        assert_eq!(cs.grow_toward(target, 4).unwrap(), false);
+        assert_eq!(cs.leaf_count(), 8);
+        assert_eq!(cs.grow_toward(target, 4).unwrap(), true);
+        assert_eq!(cs.leaf_count(), 10);
+        // Covered target: immediate true, no growth.
+        assert_eq!(cs.grow_toward(target, 0).unwrap(), true);
+        assert_eq!(cs.leaf_count(), 10);
+    }
+
+    #[test]
+    fn remove_from_free_list_all_positions()
+    {
+        let mut cs = CSpace::new(0);
+        // Materialise the first page; free list = slots 1..=55 in order.
+        cs.allocate_slot().unwrap();
+        cs.free_slot(1);
+        let initial_free = cs.free_count;
+
+        // Not on the list: an occupied... slot 0 and out-of-range.
+        assert!(!cs.remove_from_free_list(0));
+        assert!(!cs.remove_from_free_list(999_999));
+
+        // Head removal (slot 1 was pushed last, so it is the head).
+        assert!(cs.remove_from_free_list(1));
+        assert_ne!(cs.free_head, NonZeroU32::new(1));
+
+        // Interior removal.
+        assert!(cs.remove_from_free_list(30));
+        // Tail removal (slot 55 is the deepest of the original threading).
+        assert!(cs.remove_from_free_list(55));
+        // Double removal: no longer on the list.
+        assert!(!cs.remove_from_free_list(30));
+        assert_eq!(cs.free_count, initial_free - 3);
+
+        // Drain exactly the remaining free entries; every pop must be
+        // unique and none may be a removed index — proving the doubly-
+        // linked splices left a consistent list.
+        let mut seen = Vec::new();
+        for _ in 0..cs.free_count
+        {
+            let idx = cs.allocate_slot().expect("free list drained early");
+            assert!(!seen.contains(&idx), "duplicate index from free list");
+            assert!(
+                ![1u32, 30, 55].contains(&idx.get()),
+                "removed index resurfaced on the free list"
+            );
+            seen.push(idx);
+        }
+        assert!(cs.free_head.is_none());
     }
 
     #[test]

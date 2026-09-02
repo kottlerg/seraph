@@ -86,10 +86,15 @@ pub(crate) unsafe fn install_split_children(
         // we free here); child2_ptr was passed to the failing insert_cap and
         // never stored.
         // SAFETY: caller_cspace validated; lock_raw/unlock_raw paired.
+        // DERIVATION_LOCK brackets the free so the occupied-to-free
+        // transition stays atomic against derivation-side occupancy gates
+        // (see `resolve_slot_mut`).
         unsafe {
+            DERIVATION_LOCK.write_lock();
             let saved = (*caller_cspace).lock.lock_raw();
             (*caller_cspace).free_slot(slot1);
             (*caller_cspace).lock.unlock_raw(saved);
+            DERIVATION_LOCK.write_unlock();
         }
         // SAFETY: both child pointers were freshly allocated with refcount 1.
         unsafe {
@@ -129,10 +134,15 @@ pub(crate) unsafe fn install_split_children(
     // ── Consume the original cap ──────────────────────────────────────────────
 
     // SAFETY: caller_cspace validated; orig_idx within CSpace bounds.
+    // DERIVATION_LOCK brackets the free so the occupied-to-free transition
+    // stays atomic against derivation-side occupancy gates (see
+    // `resolve_slot_mut`).
     unsafe {
+        DERIVATION_LOCK.write_lock();
         let saved = (*caller_cspace).lock.lock_raw();
         (*caller_cspace).free_slot(orig_idx);
         (*caller_cspace).lock.unlock_raw(saved);
+        DERIVATION_LOCK.write_unlock();
     }
 
     // SAFETY: orig_obj_ptr from the caller's lookup; object still valid.

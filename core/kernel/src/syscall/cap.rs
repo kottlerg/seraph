@@ -1154,7 +1154,9 @@ fn pre_grow_for_explicit_slot(
                 });
                 if budget_pages < needed
                 {
-                    Err(SyscallError::OutOfMemory)
+                    // Route through the canonical CapError mapping: the
+                    // shortfall is refillable pool exhaustion.
+                    Err(crate::cap::cspace::CapError::PoolExhausted.into())
                 }
                 else
                 {

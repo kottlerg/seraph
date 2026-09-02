@@ -33,18 +33,34 @@ const TOTAL_MESSAGES: u32 = NUM_PRODUCERS as u32 * MESSAGES_PER_PRODUCER;
 /// NOTIFY right (send) only.
 const RIGHTS_NOTIFY: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
 
+/// Per-producer arguments, handed to `producer_entry` by address.
+#[derive(Clone, Copy)]
+struct ProducerArgs
+{
+    queue: u32,
+    done: u32,
+    producer_id: u64,
+}
+
+static PRODUCER_ARGS: spawn::ArgBlock<ProducerArgs, NUM_PRODUCERS> =
+    spawn::ArgBlock::new(ProducerArgs {
+        queue: 0,
+        done: 0,
+        producer_id: 0,
+    });
+
 /// Producer: post `MESSAGES_PER_PRODUCER` messages each tagged with its
 /// producer id, then post done bit.
 ///
-/// `arg`: bits[15:0] = queue slot, bits[31:16] = done slot,
-///        bits[47:32] = producer id.
-// cast_possible_truncation: slot indices are < 2^32.
-#[allow(clippy::cast_possible_truncation)]
+/// `arg`: address of this producer's [`ProducerArgs`].
 fn producer_entry(arg: u64) -> !
 {
-    let queue_slot = (arg & 0xFFFF) as u32;
-    let done_slot = ((arg >> 16) & 0xFFFF) as u32;
-    let producer_id = (arg >> 32) & 0xFFFF;
+    // SAFETY: `arg` is the entry `run` published for this producer.
+    let ProducerArgs {
+        queue: queue_slot,
+        done: done_slot,
+        producer_id,
+    } = unsafe { spawn::child_args(arg) };
 
     for seq in 0..u64::from(MESSAGES_PER_PRODUCER)
     {
@@ -77,7 +93,18 @@ pub fn run(ctx: &TestContext) -> TestResult
             .map_err(|_| "concurrent_event_producers: cap_copy queue failed")?;
         let child_done = cap_copy(done, child.cs, RIGHTS_NOTIFY)
             .map_err(|_| "concurrent_event_producers: cap_copy done failed")?;
-        let arg = u64::from(child_eq) | (u64::from(child_done) << 16) | ((i as u64) << 32);
+        // SAFETY: producer `i` has not been started yet; the block is reused
+        // only after every producer has been reaped.
+        let arg = unsafe {
+            PRODUCER_ARGS.publish(
+                i,
+                ProducerArgs {
+                    queue: child_eq,
+                    done: child_done,
+                    producer_id: i as u64,
+                },
+            )
+        };
 
         // SAFETY: stress tests run sequentially; each producer gets its own stack.
         let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[i]) });

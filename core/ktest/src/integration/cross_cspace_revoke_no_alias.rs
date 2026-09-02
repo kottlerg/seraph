@@ -44,6 +44,7 @@ use syscall::{
 };
 use syscall_abi::{RIGHTS_EP_SEND_GRANT, SyscallError, cap_handle_gen, cap_handle_index};
 
+use crate::spawn::{ArgBlock, child_args};
 use crate::{ChildStack, TestContext, TestResult};
 
 // NOTIFY — send only; WAIT — wait only; SEND|GRANT for endpoint transfer.
@@ -68,6 +69,22 @@ const FRESH_BITS: u64 = 0xF5;
 const REPORT_TIMEOUT_MS: u64 = 1000;
 
 static mut CHILD_STACK: ChildStack = ChildStack::ZERO;
+
+/// The child's arguments (slots in its own `CSpace`), handed to
+/// `child_entry` by address.
+#[derive(Clone, Copy)]
+struct ChildArgs
+{
+    ep: u32,
+    go: u32,
+    report: u32,
+}
+
+static CHILD_ARGS: ArgBlock<ChildArgs, 1> = ArgBlock::new(ChildArgs {
+    ep: 0,
+    go: 0,
+    report: 0,
+});
 
 pub fn run(ctx: &TestContext) -> TestResult
 {
@@ -100,7 +117,17 @@ pub fn run(ctx: &TestContext) -> TestResult
     let child_report = cap_copy(report, child.cs, RIGHTS_NOTIFY)
         .map_err(|_| "cross_cspace_revoke_no_alias: cap_copy (child_report) failed")?;
 
-    let arg = u64::from(child_ep) | (u64::from(child_go) << 16) | (u64::from(child_report) << 32);
+    // SAFETY: the single child has not been started yet.
+    let arg = unsafe {
+        CHILD_ARGS.publish(
+            0,
+            ChildArgs {
+                ep: child_ep,
+                go: child_go,
+                report: child_report,
+            },
+        )
+    };
     let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
     crate::spawn::configure_and_start(&child, child_entry, stack_top, arg)
         .map_err(|_| "cross_cspace_revoke_no_alias: configure_and_start failed")?;
@@ -174,13 +201,15 @@ pub fn run(ctx: &TestContext) -> TestResult
 
 // ── Child thread ──────────────────────────────────────────────────────────────
 
-/// `arg` packs: bits[15:0] = `ep_slot`, bits[31:16] = `go_slot`,
-/// bits[47:32] = `report_slot` (all child `CSpace` indices).
+/// `arg`: address of the child's [`ChildArgs`].
 fn child_entry(arg: u64) -> !
 {
-    let ep_slot = (arg & 0xFFFF) as u32;
-    let go_slot = ((arg >> 16) & 0xFFFF) as u32;
-    let report_slot = ((arg >> 32) & 0xFFFF) as u32;
+    // SAFETY: `arg` is the entry `run` published for this child.
+    let ChildArgs {
+        ep: ep_slot,
+        go: go_slot,
+        report: report_slot,
+    } = unsafe { child_args(arg) };
 
     let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
     if ipc_buffer_set(buf_addr).is_err()

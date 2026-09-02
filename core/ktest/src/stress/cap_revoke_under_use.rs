@@ -24,6 +24,21 @@ const NUM_CHILDREN: usize = 64;
 const BALLAST_CHILDREN: usize = 200;
 const RIGHTS_NOTIFY: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
 
+/// Per-sender arguments, handed to `sender_loop_entry` by address.
+#[derive(Clone, Copy)]
+struct SenderArgs
+{
+    sig: u32,
+    done: u32,
+    bit_index: u64,
+}
+
+static SENDER_ARGS: spawn::ArgBlock<SenderArgs, NUM_CHILDREN> = spawn::ArgBlock::new(SenderArgs {
+    sig: 0,
+    done: 0,
+    bit_index: 0,
+});
+
 pub fn run(ctx: &TestContext) -> TestResult
 {
     let root = cap_create_notification(ctx.memory_base)
@@ -60,10 +75,18 @@ pub fn run(ctx: &TestContext) -> TestResult
         let child_done = cap_copy(done, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
             .map_err(|_| "cap_revoke_under_use: cap_copy done failed")?;
 
-        // Pack: sig_slot[15:0], done_slot[31:16], bit_index[47:32]. Encode
-        // the bit index (not bit value) so it fits in 16 bits even for
-        // NUM_CHILDREN up to 64.
-        let arg = u64::from(child_sig) | (u64::from(child_done) << 16) | ((i as u64) << 32);
+        // SAFETY: child `i` has not been started yet; the block is reused
+        // only after every child has been reaped.
+        let arg = unsafe {
+            SENDER_ARGS.publish(
+                i,
+                SenderArgs {
+                    sig: child_sig,
+                    done: child_done,
+                    bit_index: i as u64,
+                },
+            )
+        };
         // SAFETY: Each child uses a distinct stack index.
         let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[i]) });
         spawn::configure_and_start(&child, sender_loop_entry, stack_top, arg)
@@ -117,13 +140,14 @@ pub fn run(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
-// cast_possible_truncation: slot indices are kernel cap slots < 2^32.
-#[allow(clippy::cast_possible_truncation)]
 fn sender_loop_entry(arg: u64) -> !
 {
-    let sig_slot = (arg & 0xFFFF) as u32;
-    let done_slot = ((arg >> 16) & 0xFFFF) as u32;
-    let bit_index = (arg >> 32) & 0xFFFF;
+    // SAFETY: `arg` is the entry `run` published for this sender.
+    let SenderArgs {
+        sig: sig_slot,
+        done: done_slot,
+        bit_index,
+    } = unsafe { spawn::child_args(arg) };
     let done_bit = 1u64 << bit_index;
 
     // Send in a tight loop until the cap is revoked.

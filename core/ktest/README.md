@@ -158,6 +158,11 @@ Defined in `src/main.rs`:
   `configure_and_start_pinned(child, …)` — child-thread spawn helper
   wrapping the cspace + thread + configure + start sequence that ~30
   sites duplicated.
+- `spawn::ArgBlock` / `spawn::child_args` — per-test static argument
+  entries a child receives by address. A child's single `u64` argument
+  holds at most two 32-bit capability handles (as halves); anything more
+  goes through an `ArgBlock`. Narrower packings truncate the handle's
+  generation byte.
 
 ## Compile-time options
 

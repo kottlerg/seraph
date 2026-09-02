@@ -17,11 +17,25 @@ use crate::{ChildStack, TestContext, TestResult, spawn};
 const NUM_CHILDREN: usize = 16;
 const MAP_ITERATIONS: usize = 1000;
 
-// done_bit is packed at bits 48..63 of the spawn arg (16-bit lane), so
-// `1u64 << i` must fit in 16 bits — bounding NUM_CHILDREN at 16. Raising
-// past 16 requires widening the lane or switching to bit-index packing
-// (see concurrent_notification.rs for the larger-lane idiom).
-const _: () = assert!(NUM_CHILDREN <= 16);
+// Each child owns one bit of the 64-bit `done` notification word.
+const _: () = assert!(NUM_CHILDREN <= 64);
+
+/// Per-child arguments, handed to `mapper_entry` by address.
+#[derive(Clone, Copy)]
+struct MapperArgs
+{
+    done: u32,
+    memory: u32,
+    aspace: u32,
+    done_bit: u64,
+}
+
+static MAPPER_ARGS: spawn::ArgBlock<MapperArgs, NUM_CHILDREN> = spawn::ArgBlock::new(MapperArgs {
+    done: 0,
+    memory: 0,
+    aspace: 0,
+    done_bit: 0,
+});
 
 /// Base VA for stress mappings, well above normal test VAs.
 const STRESS_MAP_BASE: u64 = 0x1_5000_0000;
@@ -59,11 +73,19 @@ pub fn run(ctx: &TestContext) -> TestResult
 
         let done_bit = 1u64 << i;
         let va = STRESS_MAP_BASE + (i as u64) * VA_STRIDE;
-        // Pack: done_slot[15:0], child_memory[31:16], child_aspace[47:32], done_bit[63:48]
-        let arg = u64::from(child_done)
-            | (u64::from(child_memory) << 16)
-            | (u64::from(child_aspace) << 32)
-            | (done_bit << 48);
+        // SAFETY: child `i` has not been started yet; the block is reused
+        // only after every child has been reaped.
+        let arg = unsafe {
+            MAPPER_ARGS.publish(
+                i,
+                MapperArgs {
+                    done: child_done,
+                    memory: child_memory,
+                    aspace: child_aspace,
+                    done_bit,
+                },
+            )
+        };
 
         // Set the VA for this child via a static. Children read it from
         // a shared array indexed by child_memory slot (deterministic mapping).
@@ -123,12 +145,13 @@ static VA_PER_CHILD: [core::sync::atomic::AtomicU64; NUM_CHILDREN] = {
 #[allow(clippy::cast_possible_truncation)]
 fn mapper_entry(arg: u64) -> !
 {
-    let done_slot = (arg & 0xFFFF) as u32;
-    let memory_cap = ((arg >> 16) & 0xFFFF) as u32;
-    let aspace = ((arg >> 32) & 0xFFFF) as u32;
-    // done_bit is `1u64 << i` for i in 0..NUM_CHILDREN; at NUM=16 it spans
-    // bits 0..15, so the mask is 16-bit not 8-bit.
-    let done_bit = (arg >> 48) & 0xFFFF;
+    // SAFETY: `arg` is the entry `run` published for this child.
+    let MapperArgs {
+        done: done_slot,
+        memory: memory_cap,
+        aspace,
+        done_bit,
+    } = unsafe { spawn::child_args(arg) };
 
     // Determine our child index from done_bit (1<<i → i).
     let child_idx = done_bit.trailing_zeros() as usize;

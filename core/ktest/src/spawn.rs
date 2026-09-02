@@ -14,12 +14,78 @@
 //! Use [`new_child`] to mint the (`CSpace`, Thread) pair, do any `cap_copy`
 //! calls into `child.cs`, then call [`configure_and_start`] (or
 //! [`configure_and_start_pinned`] for an affinity-bound child) to launch.
+//!
+//! # Child arguments
+//!
+//! A child entry receives one `u64` register argument. A capability handle
+//! is 32 bits (a 24-bit slot index plus an 8-bit generation, see
+//! `syscall::cap_handle_encode`), so at most two fit in that word, as
+//! 32-bit halves (`u64::from(a) | (u64::from(b) << 32)`). A child that
+//! needs more than two values receives the address of an entry in a
+//! per-test [`ArgBlock`] instead, and decodes it with [`child_args`].
+//! Narrower packings truncate the generation and alias a recycled slot.
+
+use core::cell::UnsafeCell;
 
 use syscall::{
     cap_create_cspace, cap_create_thread, thread_configure, thread_set_affinity, thread_start,
 };
 
 use crate::TestContext;
+
+/// Static argument entries handed to child entries by address.
+///
+/// Each test that needs one declares its own block (as it does for
+/// `ChildStack`), sized to the number of children it runs concurrently,
+/// fills an entry with [`publish`](Self::publish) before starting that child,
+/// and the child reads it back with [`child_args`]. The block lives in the
+/// test's own image, and every ktest child runs in the test's address space,
+/// so the address is valid in the child. The write is ordered before the
+/// child's first instruction by the start syscall's scheduler locks.
+pub struct ArgBlock<T, const N: usize>(UnsafeCell<[T; N]>);
+
+// SAFETY: entries are written only through `publish`, whose contract makes
+// each write exclusive with any child reading that entry.
+unsafe impl<T, const N: usize> Sync for ArgBlock<T, N> {}
+
+impl<T: Copy, const N: usize> ArgBlock<T, N>
+{
+    /// A block with every entry set to `init`.
+    pub const fn new(init: T) -> Self
+    {
+        Self(UnsafeCell::new([init; N]))
+    }
+
+    /// Store `value` in entry `index` and return its address, the value to
+    /// pass as the child's argument.
+    ///
+    /// # Safety
+    ///
+    /// No child may be reading entry `index`: publish before the start, and
+    /// reuse an entry only after its previous child has exited.
+    pub unsafe fn publish(&self, index: usize, value: T) -> u64
+    {
+        assert!(index < N, "ArgBlock::publish: index out of range");
+        // SAFETY: index < N; exclusive access per the caller contract.
+        unsafe {
+            let entry = self.0.get().cast::<T>().add(index);
+            entry.write(value);
+            entry as u64
+        }
+    }
+}
+
+/// Decode a child argument published with [`ArgBlock::publish`].
+///
+/// # Safety
+///
+/// `arg` must be the value returned by `publish` on an `ArgBlock<T, _>`,
+/// and the parent must not have rewritten that entry since.
+pub unsafe fn child_args<T: Copy>(arg: u64) -> T
+{
+    // SAFETY: caller contract; the entry outlives the child (static).
+    unsafe { *(arg as *const T) }
+}
 
 /// Child-thread handle returned by [`new_child`].
 ///

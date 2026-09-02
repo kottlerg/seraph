@@ -27,12 +27,29 @@ use syscall::{
 };
 use syscall_abi::RIGHTS_EP_SEND_GRANT;
 
+use crate::spawn::{ArgBlock, child_args};
 use crate::{ChildStack, TestContext, TestResult};
 
 // NOTIFY right only for the test notification copy in child's CSpace.
 const RIGHTS_NOTIFY: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
 
 static mut CHILD_STACK: ChildStack = ChildStack::ZERO;
+
+/// The child's arguments (slots in its own `CSpace`), handed to
+/// `child_entry` by address.
+#[derive(Clone, Copy)]
+struct ChildArgs
+{
+    ep: u32,
+    test_sig: u32,
+    sync_sig: u32,
+}
+
+static CHILD_ARGS: ArgBlock<ChildArgs, 1> = ArgBlock::new(ChildArgs {
+    ep: 0,
+    test_sig: 0,
+    sync_sig: 0,
+});
 
 pub fn run(ctx: &TestContext) -> TestResult
 {
@@ -70,9 +87,17 @@ pub fn run(ctx: &TestContext) -> TestResult
         .map_err(|_| "integration::cap_transfer: cap_copy sync_sig failed")?;
     crate::log("cap_transfer: child_sync_sig copied");
 
-    // Pack three 16-bit slot indices into a single u64 argument.
-    let child_arg =
-        u64::from(child_ep) | (u64::from(child_test_sig) << 16) | (u64::from(child_sync_sig) << 32);
+    // SAFETY: the single child has not been started yet.
+    let child_arg = unsafe {
+        CHILD_ARGS.publish(
+            0,
+            ChildArgs {
+                ep: child_ep,
+                test_sig: child_test_sig,
+                sync_sig: child_sync_sig,
+            },
+        )
+    };
 
     let th = cap_create_thread(ctx.memory_base, ctx.aspace_cap, cs, 0, 0)
         .map_err(|_| "integration::cap_transfer: cap_create_thread failed")?;
@@ -136,13 +161,15 @@ pub fn run(ctx: &TestContext) -> TestResult
 
 // ── Child thread ──────────────────────────────────────────────────────────────
 
-/// `arg` packs: bits[15:0] = `ep_slot`, bits[31:16] = `test_sig_slot`,
-/// bits[47:32] = `sync_sig_slot` (all in the child's own `CSpace`).
+/// `arg`: address of the child's [`ChildArgs`].
 fn child_entry(arg: u64) -> !
 {
-    let ep_slot = (arg & 0xFFFF) as u32;
-    let test_sig_slot = ((arg >> 16) & 0xFFFF) as u32;
-    let sync_sig_slot = ((arg >> 32) & 0xFFFF) as u32;
+    // SAFETY: `arg` is the entry `run` published for this child.
+    let ChildArgs {
+        ep: ep_slot,
+        test_sig: test_sig_slot,
+        sync_sig: sync_sig_slot,
+    } = unsafe { child_args(arg) };
 
     // Register the shared IPC buffer for this child thread.
     let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;

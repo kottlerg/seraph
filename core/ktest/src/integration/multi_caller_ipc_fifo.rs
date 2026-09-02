@@ -32,6 +32,29 @@ static mut STACK_A: ChildStack = ChildStack::ZERO;
 static mut STACK_B: ChildStack = ChildStack::ZERO;
 static mut STACK_C: ChildStack = ChildStack::ZERO;
 
+/// Per-caller arguments (slots in the caller's own `CSpace`), handed to
+/// `caller_entry` by address; entries 0, 1, 2 are callers A, B, C.
+#[derive(Clone, Copy)]
+struct CallerArgs
+{
+    ep: u32,
+    done: u32,
+    label: u64,
+}
+
+static CALLER_ARGS: spawn::ArgBlock<CallerArgs, 3> = spawn::ArgBlock::new(CallerArgs {
+    ep: 0,
+    done: 0,
+    label: 0,
+});
+
+/// Publish caller `index`'s arguments and return the entry address.
+fn caller_arg(index: usize, ep: u32, done: u32, label: u64) -> u64
+{
+    // SAFETY: entry `index` is that caller's alone, published before its start.
+    unsafe { CALLER_ARGS.publish(index, CallerArgs { ep, done, label }) }
+}
+
 pub fn run(ctx: &TestContext) -> TestResult
 {
     crate::log("multi_caller_ipc_fifo: starting");
@@ -47,8 +70,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         .map_err(|_| "multi_caller_ipc_fifo: ep_a failed")?;
     let done_a = cap_copy(done, child_a.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
         .map_err(|_| "multi_caller_ipc_fifo: done_a failed")?;
-    // arg: ep_slot | (done_slot << 16) | (label << 32)
-    let arg_a = u64::from(ep_a) | (u64::from(done_a) << 16) | (1u64 << 32);
+    let arg_a = caller_arg(0, ep_a, done_a, 1);
     let stack_a = ChildStack::top(core::ptr::addr_of!(STACK_A));
     // Pin to CPU 0 so sleep-based FIFO ordering is reliable under SMP.
     spawn::configure_and_start_pinned(&child_a, caller_entry, stack_a, arg_a, 0)
@@ -63,7 +85,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         .map_err(|_| "multi_caller_ipc_fifo: ep_b failed")?;
     let done_b = cap_copy(done, child_b.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
         .map_err(|_| "multi_caller_ipc_fifo: done_b failed")?;
-    let arg_b = u64::from(ep_b) | (u64::from(done_b) << 16) | (2u64 << 32);
+    let arg_b = caller_arg(1, ep_b, done_b, 2);
     let stack_b = ChildStack::top(core::ptr::addr_of!(STACK_B));
     spawn::configure_and_start_pinned(&child_b, caller_entry, stack_b, arg_b, 0)
         .map_err(|_| "multi_caller_ipc_fifo: start B failed")?;
@@ -75,7 +97,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         .map_err(|_| "multi_caller_ipc_fifo: ep_c failed")?;
     let done_c = cap_copy(done, child_c.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
         .map_err(|_| "multi_caller_ipc_fifo: done_c failed")?;
-    let arg_c = u64::from(ep_c) | (u64::from(done_c) << 16) | (3u64 << 32);
+    let arg_c = caller_arg(2, ep_c, done_c, 3);
     let stack_c = ChildStack::top(core::ptr::addr_of!(STACK_C));
     spawn::configure_and_start_pinned(&child_c, caller_entry, stack_c, arg_c, 0)
         .map_err(|_| "multi_caller_ipc_fifo: start C failed")?;
@@ -149,13 +171,15 @@ pub fn run(ctx: &TestContext) -> TestResult
 /// Caller entry: calls the endpoint immediately with its label, then ORs its
 /// bit into the `done` notification when the reply arrives.
 ///
-/// `arg`: bits[15:0] = `ep_slot`, bits[31:16] = `done_slot`, bits[47:32] = label
-/// (all in the child's own `CSpace`).
+/// `arg`: address of the caller's [`CallerArgs`].
 fn caller_entry(arg: u64) -> !
 {
-    let ep_slot = (arg & 0xFFFF) as u32;
-    let done_slot = ((arg >> 16) & 0xFFFF) as u32;
-    let label = (arg >> 32) & 0xFFFF;
+    // SAFETY: `arg` is the entry `run` published for this caller.
+    let CallerArgs {
+        ep: ep_slot,
+        done: done_slot,
+        label,
+    } = unsafe { spawn::child_args(arg) };
 
     // Register the shared IPC buffer for this child thread.
     let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;

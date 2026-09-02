@@ -327,7 +327,8 @@ unsafe extern "C" fn common_exception_handler(
             // SAFETY: tcb validated non-null.
             unsafe {
                 (*tcb).exit_reason = 0x1000 + vector;
-                crate::sched::set_state_under_all_locks(
+                // Committing Exited: a refusal means a teardown already did.
+                let _ = crate::sched::set_state_under_all_locks(
                     tcb,
                     crate::sched::thread::ThreadState::Exited,
                 );

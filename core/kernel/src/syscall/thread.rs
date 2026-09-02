@@ -226,6 +226,7 @@ pub fn sys_thread_start(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 ///
 /// # Safety
 /// `tcb` must be a valid TCB pointer.
+#[cfg(not(test))]
 unsafe fn commit_stopped(
     tcb: *mut crate::sched::thread::ThreadControlBlock,
 ) -> Result<Option<usize>, SyscallError>

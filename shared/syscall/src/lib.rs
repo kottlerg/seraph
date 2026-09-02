@@ -791,8 +791,9 @@ pub fn notification_wait_timeout(sig: u32, timeout_ms: u64) -> Result<u64, i64>
 /// Returns a negative `i64` error code if `memory_cap` is invalid, lacks
 /// `RIGHTS_MEM_RETYPE`, has insufficient `available_bytes`, or the caller's
 /// `CSpace` is full.
-// cast_possible_truncation, cast_sign_loss: ret is a non-negative CSpace slot index
-// guaranteed to fit in u32 (the CSpace structural ceiling is below 2^24).
+// cast_possible_truncation, cast_sign_loss: ret is a non-negative cap handle —
+// a 24-bit slot index plus an 8-bit generation (`CAP_INDEX_BITS + 8 <= 32`),
+// so it fits u32.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 #[inline]
 pub fn cap_create_endpoint(memory_cap: u32) -> Result<u32, i64>
@@ -813,8 +814,9 @@ pub fn cap_create_endpoint(memory_cap: u32) -> Result<u32, i64>
 /// Returns a negative `i64` error code if `memory_cap` is invalid, lacks
 /// `RIGHTS_MEM_RETYPE`, has insufficient `available_bytes`, or the caller's
 /// `CSpace` is full.
-// cast_possible_truncation, cast_sign_loss: ret is a non-negative CSpace slot index
-// guaranteed to fit in u32 (the CSpace structural ceiling is below 2^24).
+// cast_possible_truncation, cast_sign_loss: ret is a non-negative cap handle —
+// a 24-bit slot index plus an 8-bit generation (`CAP_INDEX_BITS + 8 <= 32`),
+// so it fits u32.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 #[inline]
 pub fn cap_create_notification(memory_cap: u32) -> Result<u32, i64>
@@ -938,8 +940,9 @@ pub fn raw_cap_create_cspace(
 /// cap lacks `RETYPE` or sufficient `available_bytes`, the priority is
 /// outside the `SchedControl` band (or nonzero without one), or the
 /// caller's `CSpace` is full.
-// cast_possible_truncation, cast_sign_loss: ret is a non-negative CSpace slot index
-// guaranteed to fit in u32 (the CSpace structural ceiling is below 2^24).
+// cast_possible_truncation, cast_sign_loss: ret is a non-negative cap handle —
+// a 24-bit slot index plus an 8-bit generation (`CAP_INDEX_BITS + 8 <= 32`),
+// so it fits u32.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 #[inline]
 pub fn cap_create_thread(
@@ -1387,8 +1390,9 @@ pub fn thread_start(thread_cap: u32) -> Result<(), i64>
 /// # Errors
 /// Returns a negative `i64` error code if either cap is invalid, the caller
 /// lacks sufficient rights, or the destination `CSpace` is full.
-// cast_possible_truncation, cast_sign_loss: ret is a non-negative CSpace slot index
-// guaranteed to fit in u32 (the CSpace structural ceiling is below 2^24).
+// cast_possible_truncation, cast_sign_loss: ret is a non-negative cap handle —
+// a 24-bit slot index plus an 8-bit generation (`CAP_INDEX_BITS + 8 <= 32`),
+// so it fits u32.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 #[inline]
 pub fn cap_copy(src_slot: u32, dest_cspace_cap: u32, rights_mask: u64) -> Result<u32, i64>
@@ -1418,8 +1422,9 @@ pub fn cap_copy(src_slot: u32, dest_cspace_cap: u32, rights_mask: u64) -> Result
 /// # Errors
 /// Returns a negative `i64` error code if the source cap is invalid or the
 /// `CSpace` is full.
-// cast_possible_truncation, cast_sign_loss: ret is a non-negative CSpace slot index
-// guaranteed to fit in u32 (the CSpace structural ceiling is below 2^24).
+// cast_possible_truncation, cast_sign_loss: ret is a non-negative cap handle —
+// a 24-bit slot index plus an 8-bit generation (`CAP_INDEX_BITS + 8 <= 32`),
+// so it fits u32.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub fn cap_derive(src_slot: u32, rights_mask: u64) -> Result<u32, i64>
 {
@@ -1441,8 +1446,9 @@ pub fn cap_derive(src_slot: u32, rights_mask: u64) -> Result<u32, i64>
 /// # Errors
 /// Returns a negative `i64` error code if the source cap is invalid, the badge
 /// is zero, the source already has a badge, or the `CSpace` is full.
-// cast_possible_truncation, cast_sign_loss: ret is a non-negative CSpace slot index
-// guaranteed to fit in u32 (the CSpace structural ceiling is below 2^24).
+// cast_possible_truncation, cast_sign_loss: ret is a non-negative cap handle —
+// a 24-bit slot index plus an 8-bit generation (`CAP_INDEX_BITS + 8 <= 32`),
+// so it fits u32.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub fn cap_derive_badge(src_slot: u32, rights_mask: u64, badge: u64) -> Result<u32, i64>
 {
@@ -1472,8 +1478,8 @@ pub fn cap_derive_badge(src_slot: u32, rights_mask: u64, badge: u64) -> Result<u
 ///
 /// # Errors
 /// Returns a negative `i64` error code: `InvalidCapability` if the slot
-/// index is out of range or names the caller's own thread; `InvalidState`
-/// if a `SYS_CAP_REVOKE` on the slot is in flight; `Interrupted` if a
+/// index is out of range; `InvalidState` if the slot names the caller's
+/// own thread or a `SYS_CAP_REVOKE` on it is in flight; `Interrupted` if a
 /// concurrent deriver extended the slot's child list faster than the
 /// batched reparent could move it (retry).
 pub fn cap_delete(slot: u32) -> Result<(), i64>
@@ -1545,8 +1551,9 @@ pub fn cap_revoke_all(slot: u32) -> Result<(), i64>
 /// # Errors
 /// Returns a negative `i64` error code if either cap is invalid, the
 /// destination `CSpace` is full, or `dest_index` is already occupied.
-// cast_possible_truncation, cast_sign_loss: ret is a non-negative CSpace slot index
-// guaranteed to fit in u32 (the CSpace structural ceiling is below 2^24).
+// cast_possible_truncation, cast_sign_loss: ret is a non-negative cap handle —
+// a 24-bit slot index plus an 8-bit generation (`CAP_INDEX_BITS + 8 <= 32`),
+// so it fits u32.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub fn cap_move(src_slot: u32, dest_cspace_cap: u32, dest_index: u32) -> Result<u32, i64>
 {
@@ -1694,8 +1701,9 @@ pub fn aspace_query(aspace_cap: u32, virt: u64) -> Result<u64, i64>
 /// Returns a negative `i64` error code if `memory_cap` is invalid, lacks
 /// `RIGHTS_MEM_RETYPE`, has insufficient `available_bytes`, `capacity` is out
 /// of range, or the `CSpace` is full.
-// cast_possible_truncation, cast_sign_loss: ret is a non-negative CSpace slot index
-// guaranteed to fit in u32 (the CSpace structural ceiling is below 2^24).
+// cast_possible_truncation, cast_sign_loss: ret is a non-negative cap handle —
+// a 24-bit slot index plus an 8-bit generation (`CAP_INDEX_BITS + 8 <= 32`),
+// so it fits u32.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 #[inline]
 pub fn event_queue_create(memory_cap: u32, capacity: u32) -> Result<u32, i64>
@@ -1789,8 +1797,9 @@ pub fn event_recv_timeout(queue_cap: u32, timeout_ms: u64) -> Result<u64, i64>
 /// # Errors
 /// Returns a negative `i64` error code if `memory_cap` is invalid, lacks
 /// `RIGHTS_MEM_RETYPE`, or the `CSpace` is full.
-// cast_possible_truncation, cast_sign_loss: ret is a non-negative CSpace slot index
-// guaranteed to fit in u32 (the CSpace structural ceiling is below 2^24).
+// cast_possible_truncation, cast_sign_loss: ret is a non-negative cap handle —
+// a 24-bit slot index plus an 8-bit generation (`CAP_INDEX_BITS + 8 <= 32`),
+// so it fits u32.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 #[inline]
 pub fn wait_set_create(memory_cap: u32) -> Result<u32, i64>

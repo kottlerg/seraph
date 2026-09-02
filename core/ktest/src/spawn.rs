@@ -19,7 +19,7 @@
 //!
 //! A child entry receives one `u64` register argument. A capability handle
 //! is 32 bits (a 24-bit slot index plus an 8-bit generation, see
-//! `syscall::cap_handle_encode`), so at most two fit in that word, as
+//! `syscall_abi::cap_handle_encode`), so at most two fit in that word, as
 //! 32-bit halves (`u64::from(a) | (u64::from(b) << 32)`). A child that
 //! needs more than two values receives the address of an entry in a
 //! per-test [`ArgBlock`] instead, and decodes it with [`child_args`].
@@ -45,8 +45,9 @@ use crate::TestContext;
 pub struct ArgBlock<T, const N: usize>(UnsafeCell<[T; N]>);
 
 // SAFETY: entries are written only through `publish`, whose contract makes
-// each write exclusive with any child reading that entry.
-unsafe impl<T, const N: usize> Sync for ArgBlock<T, N> {}
+// each write exclusive with any child reading that entry; `T: Send` because
+// the child receives the value on another thread.
+unsafe impl<T: Send, const N: usize> Sync for ArgBlock<T, N> {}
 
 impl<T: Copy, const N: usize> ArgBlock<T, N>
 {

@@ -2103,7 +2103,10 @@ pub unsafe fn set_state_under_all_locks(
     }
 }
 
-/// Outcome of [`set_state_under_all_locks`].
+/// Outcome of [`set_state_under_all_locks`]. A caller committing `Exited`
+/// may discard it (a refusal means the thread already exited); every other
+/// caller must act on a refusal.
+#[must_use]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StateCommit
 {
@@ -2318,6 +2321,11 @@ unsafe fn mark_bound_threads(
     // on another CPU.
     unsafe {
         thread_registry::for_each(|tcb| {
+            // `state` is read without `sched_lock` here and below: `Exited`
+            // is terminal, so a positive read is final, and a negative read
+            // is re-decided under the full lock set by
+            // `set_state_under_all_locks`, which refuses an exited thread
+            // (docs/scheduling-internals.md § Cross-CPU TCB Ownership).
             if !bound(tcb) || (*tcb).state == thread::ThreadState::Exited
             {
                 return;
@@ -2395,6 +2403,10 @@ unsafe fn scan_bound_current(
             let s = scheduler_for(cpu);
             let f = s.lock.lock_raw();
             let cur = s.current;
+            // `state` is read under the run-queue lock, not `sched_lock`:
+            // sound only because `Exited` is terminal (a positive read is
+            // final; a negative one sends the caller back to phase 1, which
+            // re-decides under the full lock set).
             let r = if !cur.is_null() && bound(cur)
             {
                 (true, (*cur).state != thread::ThreadState::Exited)
@@ -3712,11 +3724,10 @@ pub unsafe fn enqueue_and_wake(_tcb: *mut ThreadControlBlock, _target_cpu: usize
 /// Unlike [`enqueue_and_wake`], this does NOT classify `state` beyond the
 /// terminal check: it forces the `→Ready` transition and links. Use it only
 /// when the caller owns the transition and has established the thread is not
-/// live on any CPU — start / resume (`Created`/`Stopped` → run), the dealloc
-/// reply-bound-client wake, and `schedule()`'s cross-affinity requeue of
-/// `current`. Routing those through the gated `enqueue_and_wake` would be
-/// wrong: their thread is already (or becomes) `Ready`, which the gate
-/// coalesces — dropping it from every run queue.
+/// live on any CPU — today only `sys_thread_start` (first start and resume,
+/// `Created`/`Stopped` → run). Routing that through the gated
+/// `enqueue_and_wake` would be wrong: the thread is already `Ready`, which
+/// the gate coalesces — dropping it from every run queue.
 ///
 /// Returns `false` without writing or linking if the thread is `Exited`
 /// under `sched_lock`: an object teardown or an exit on another CPU can mark

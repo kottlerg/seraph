@@ -211,7 +211,8 @@ fn sys_exit(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
         // SAFETY: tcb validated non-null.
         unsafe {
             (*tcb).exit_reason = 0;
-            crate::sched::set_state_under_all_locks(tcb, ThreadState::Exited);
+            // Committing Exited: a refusal means a teardown already did.
+            let _ = crate::sched::set_state_under_all_locks(tcb, ThreadState::Exited);
         }
 
         // Post death notification if bound (exit_reason 0 = clean exit).
@@ -270,7 +271,8 @@ fn sys_process_exit(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         // SAFETY: tcb validated non-null.
         unsafe {
             (*tcb).exit_reason = reason;
-            crate::sched::set_state_under_all_locks(tcb, ThreadState::Exited);
+            // Committing Exited: a refusal means a teardown already did.
+            let _ = crate::sched::set_state_under_all_locks(tcb, ThreadState::Exited);
         }
 
         // Notify the calling thread's observers (a parent that bound the main

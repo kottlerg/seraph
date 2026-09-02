@@ -124,6 +124,10 @@ pub fn run_all(ctx: &TestContext)
         "cap::derive_badge_on_notification",
         cap::derive_badge_on_notification(ctx)
     );
+    run_test!(
+        "cap::cspace_teardown_multibatch",
+        cap::cspace_teardown_multibatch(ctx)
+    );
 
     // ── Capability inspection (SYS_CAP_INFO) ──────────────────────────────────
     run_test!(
@@ -148,10 +152,6 @@ pub fn run_all(ctx: &TestContext)
         cap_info::creation_masks_match_abi(ctx)
     );
     run_test!("cap_info::cspace_fields", cap_info::cspace_fields(ctx));
-    run_test!(
-        "cap::cspace_teardown_multibatch",
-        cap::cspace_teardown_multibatch(ctx)
-    );
     run_test!(
         "cap_info::null_slot_invalid",
         cap_info::null_slot_invalid(ctx)

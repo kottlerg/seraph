@@ -429,10 +429,18 @@ derivation write lock between holds (mirroring revocation's batching); a
 foreign traversal in a window between batches sees ordinary consistent
 nodes. The one remaining source of a dead link is the dying process racing
 its own teardown (wiring a link out of or into the dying CSpace from a
-surviving thread or an in-flight receive during the drain window); a link
-that fails to resolve — that race, or genuine corruption — is contained
-identically: the walk truncates the chain hanging from it, logs it, and
-the syscall returns `InvalidState` instead of reporting a clean revoke.
+surviving thread or an in-flight receive during the drain window). A link
+that fails to resolve — that race, or genuine corruption — is contained at
+two sites, both by truncation: the revoke walk cuts the chain hanging from
+the dead link, logs it, and the syscall returns `InvalidState` instead of
+reporting a clean revoke; the teardown drain, which has no caller to
+report to, detects the same condition as a head pop that makes no
+progress, logs it, cuts the dying slot's child list, and continues with
+the next slot. A drain truncation abandons the foreign children chained
+behind the dead link without clearing their parent pointers: they keep
+naming the dying CSpace, and only the registry epoch check keeps such a
+pointer fail-closed (it resolves to nothing — the child behaves as a
+derivation root) rather than aliasing onto a recycled CSpace id.
 
 **Performance characteristics:** Revocation is O(N) in the number of descendants.
 For well-behaved systems, derivation trees are shallow (a server derives a

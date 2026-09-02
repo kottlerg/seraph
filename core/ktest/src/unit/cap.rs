@@ -652,6 +652,13 @@ pub fn derive_badge_on_notification(ctx: &TestContext) -> TestResult
 /// parent's endpoint — the derivation ancestor of everything that died —
 /// must afterwards revoke cleanly (no dead-link `InvalidState`) and stay
 /// usable.
+///
+/// Two pins keep the test from passing vacuously: the child `CSpace`'s
+/// `USED` count must show the derive burst landed before the delete (so
+/// the drain really spans batches), and the parent's Memory cap must
+/// return to its pre-spawn `AVAILABLE` baseline afterwards — only the
+/// `CSpace` dealloc path (which runs the drain) returns those pages, so a
+/// lingering reference that skipped teardown would leave the delta.
 pub fn cspace_teardown_multibatch(ctx: &TestContext) -> TestResult
 {
     const DERIVES: u64 = 300;
@@ -660,6 +667,8 @@ pub fn cspace_teardown_multibatch(ctx: &TestContext) -> TestResult
         .map_err(|_| "teardown_batch: cap_create_endpoint failed")?;
     let done = cap_create_notification(ctx.memory_base)
         .map_err(|_| "teardown_batch: cap_create_notification failed")?;
+    let baseline = cap_info(ctx.memory_base, syscall_abi::CAP_INFO_MEMORY_AVAILABLE)
+        .map_err(|_| "teardown_batch: cap_info(baseline) failed")?;
 
     let child =
         crate::spawn::new_child(ctx).map_err(|_| "teardown_batch: spawn::new_child failed")?;
@@ -686,14 +695,38 @@ pub fn cspace_teardown_multibatch(ctx: &TestContext) -> TestResult
         return Err("teardown_batch: child failed its derive burst");
     }
 
+    // Pin 1: the burst landed in the dying CSpace (ep + done copies plus
+    // the derives), so the drain has more than one batch of edits ahead.
+    let used = cap_info(child.cs, syscall_abi::CAP_INFO_CSPACE_USED)
+        .map_err(|_| "teardown_batch: cap_info(child USED) failed")?;
+    if used < DERIVES + 2
+    {
+        cap_delete(child.th).ok();
+        cap_delete(child.cs).ok();
+        cap_delete(ep).ok();
+        cap_delete(done).ok();
+        return Err("teardown_batch: derive burst did not populate the child CSpace");
+    }
+
     // Tear down: the child CSpace dies holding one slot with ~300 derived
     // children plus the bootstrap copies — several drain batches.
     cap_delete(child.th).map_err(|_| "teardown_batch: cap_delete(thread) failed")?;
     cap_delete(child.cs).map_err(|_| "teardown_batch: cap_delete(cspace) failed")?;
 
+    // Pin 2: both child objects were reclaimed — the CSpace dealloc (the
+    // only path that runs the drain) returned its pool and wrapper pages.
+    let after = cap_info(ctx.memory_base, syscall_abi::CAP_INFO_MEMORY_AVAILABLE)
+        .map_err(|_| "teardown_batch: cap_info(after) failed")?;
+    if after != baseline
+    {
+        cap_delete(ep).ok();
+        cap_delete(done).ok();
+        return Err("teardown_batch: child CSpace was not reclaimed (teardown did not run)");
+    }
+
     // The ancestor's revoke must be clean: a dangling link left by the
     // drain would surface as InvalidState (dead-link truncation).
-    cap_revoke(ep).map_err(|_| "teardown_batch: post-teardown revoke reported a dead link")?;
+    cap_revoke(ep).map_err(|_| "teardown_batch: cap_revoke(ep) failed after teardown")?;
     // And the endpoint itself must still be intact.
     let probe = cap_derive(ep, syscall_abi::RIGHTS_EP_SEND)
         .map_err(|_| "teardown_batch: endpoint unusable after teardown")?;

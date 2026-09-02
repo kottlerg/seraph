@@ -28,8 +28,9 @@
 //!
 //! When `tag == Null`, `deriv_parent` and `deriv_first_child` are repurposed
 //! for the free list (successor and predecessor); do not read derivation
-//! fields on Null slots — every resolution here goes through the occupancy
-//! gate in `resolve_slot_mut`.
+//! fields on Null slots — every derivation-field access here resolves
+//! through the occupancy gate in `resolve_slot_mut`, which is the only
+//! `SlotId` resolver in this module.
 //!
 //! ## Adding new operations
 //!
@@ -162,18 +163,26 @@ unsafe fn resolve_slot_mut(id: SlotId) -> Option<&'static mut super::slot::Capab
 /// Prepends `child` to `parent`'s child list (child becomes `first_child`).
 /// Updates `child.deriv_parent` and the prev/next sibling chain.
 ///
+/// The link is all-or-nothing: if either end fails to resolve (gone, or
+/// freed — a stale id from an unlocked source resolution that raced a
+/// delete; see the occupancy gate in `resolve_slot_mut`), neither slot is
+/// mutated. A one-sided write in either direction would leave a live slot
+/// holding a dangling `SlotId` that a later recycle of the index could
+/// alias onto an unrelated live slot.
+///
 /// # Safety
 ///
-/// Caller must hold `DERIVATION_LOCK` write lock. `parent` and `child` must
-/// be valid, live capability slots (not Null).
+/// Caller must hold `DERIVATION_LOCK` write lock.
 pub unsafe fn link_child(parent: SlotId, child: SlotId)
 {
-    // Resolve the parent FIRST: if it is gone or freed (a stale id from an
-    // unlocked source resolution that raced a delete — see the occupancy
-    // gate in `resolve_slot_mut`), the whole link is skipped and the child
-    // stays a derivation root. Writing the child's parent pointer before
-    // this check would leave a dangling `SlotId` that a later recycle of
-    // the index could alias onto an unrelated live slot.
+    // Probe the child before touching the parent: the lock is held for the
+    // whole call, so a child that resolves here still resolves below.
+    // SAFETY: DERIVATION_LOCK held; ensures exclusive access to derivation tree.
+    if unsafe { resolve_slot_mut(child) }.is_none()
+    {
+        return;
+    }
+
     // SAFETY: DERIVATION_LOCK held; ensures exclusive access to derivation tree.
     let old_first = if let Some(parent_slot) = unsafe { resolve_slot_mut(parent) }
     {
@@ -186,7 +195,8 @@ pub unsafe fn link_child(parent: SlotId, child: SlotId)
         return;
     };
 
-    // SAFETY: DERIVATION_LOCK held; ensures exclusive access to derivation tree.
+    // SAFETY: DERIVATION_LOCK held; the child resolved above and nothing
+    // can free it while the lock is held.
     if let Some(child_slot) = unsafe { resolve_slot_mut(child) }
     {
         child_slot.deriv_parent = Some(parent);
@@ -289,45 +299,37 @@ pub unsafe fn reparent_children(node: SlotId, new_parent: Option<SlotId>)
         return;
     };
 
-    // Walk the child list and re-link each child under new_parent.
+    // Walk the child list. Each child is first detached into a clean
+    // derivation root (no parent, no siblings), then re-linked under
+    // new_parent by `link_child`, which is all-or-nothing: a new_parent
+    // that fails to resolve leaves the child a root rather than holding a
+    // dangling parent pointer and stale sibling links.
     let mut cur = first_child;
     while let Some(child_id) = cur
     {
         // SAFETY: DERIVATION_LOCK held; child_id retrieved from node's child list.
-        let next = if let Some(slot) = unsafe { resolve_slot_mut(child_id) }
-        {
-            slot.deriv_parent = new_parent;
-            slot.deriv_next_sibling
-        }
+        let Some(slot) = (unsafe { resolve_slot_mut(child_id) })
         else
         {
-            None
+            // Dead child link: the rest of the chain hung off the dead
+            // node's sibling pointers and cannot be located. Same
+            // containment as the revoke walk — log and abandon it.
+            crate::kprintln!(
+                "cap: reparent: dead derivation link (cspace {} slot {}); truncating",
+                child_id.cspace_id,
+                child_id.index.get()
+            );
+            break;
         };
+        let next = slot.deriv_next_sibling;
+        slot.deriv_parent = None;
+        slot.deriv_prev_sibling = None;
+        slot.deriv_next_sibling = None;
 
         if let Some(np) = new_parent
         {
-            // Prepend child to new_parent's child list.
-            // SAFETY: DERIVATION_LOCK held; parent/child/sibling pointers maintained by link/unlink operations.
+            // SAFETY: DERIVATION_LOCK held; child resolved above.
             unsafe { link_child(np, child_id) };
-
-            // link_child sets deriv_parent again (idempotent) and wires the
-            // sibling chain. Clear the deriv_parent we set above to avoid
-            // double-set (link_child will set it properly).
-            // Actually link_child handles everything; the interim parent set
-            // above is harmless since link_child overwrites it.
-        }
-        else
-        {
-            // Make child a root (no parent).
-            // SAFETY: DERIVATION_LOCK held; child_id retrieved from node's child list.
-            if let Some(slot) = unsafe { resolve_slot_mut(child_id) }
-            {
-                slot.deriv_parent = None;
-                // prev_sibling already set to None by the prior walk? No —
-                // the siblings are still chained. For roots, detach from siblings.
-                slot.deriv_prev_sibling = None;
-                slot.deriv_next_sibling = None;
-            }
         }
 
         cur = next;
@@ -412,9 +414,10 @@ pub enum BatchStatus
 /// every dying slot from the forest before a `CSpace` unregisters, save
 /// for the narrow teardown self-race window it documents (the dying
 /// process wiring a link during its own drain). A link that fails to
-/// resolve is treated as corruption-contained either way: the walk
-/// truncates the chain hanging from it, logs it, and reports
-/// [`BatchStatus::DeadLink`].
+/// resolve — vanished `CSpace`, or a Null slot still chained into the tree
+/// (every free unlinks first under this lock, so that is corruption) — is
+/// contained either way: the walk truncates the chain hanging from it,
+/// logs it, and reports [`BatchStatus::DeadLink`].
 pub unsafe fn revoke_subtree_batch(
     root: SlotId,
 ) -> (&'static [Option<NonNull<KernelObjectHeader>>], BatchStatus)
@@ -442,19 +445,20 @@ pub unsafe fn revoke_subtree_batch(
             return (&out[..out_count], BatchStatus::Cleared);
         };
 
-        if !slot_exists(head)
+        // SAFETY: DERIVATION_LOCK held; ensures exclusive access to the tree.
+        let Some(head_slot) = (unsafe { resolve_slot_mut(head) })
+        else
         {
             // SAFETY: DERIVATION_LOCK held (see Safety: corruption path).
             unsafe { truncate_dead_link(root, head, "root child list") };
             return (&out[..out_count], BatchStatus::DeadLink);
-        }
-        // SAFETY: DERIVATION_LOCK held; existence checked above.
-        let grandchild =
-            (unsafe { resolve_slot_mut(head) }).and_then(|slot| slot.deriv_first_child);
+        };
+        let grandchild = head_slot.deriv_first_child;
 
         if let Some(g) = grandchild
         {
-            if !slot_exists(g)
+            // SAFETY: DERIVATION_LOCK held; ensures exclusive access to the tree.
+            if unsafe { resolve_slot_mut(g) }.is_none()
             {
                 // SAFETY: DERIVATION_LOCK held (see Safety: corruption path).
                 unsafe { truncate_dead_link(head, g, "child chain") };
@@ -485,17 +489,6 @@ pub unsafe fn revoke_subtree_batch(
             return (&out[..out_count], BatchStatus::MoreWork);
         }
     }
-}
-
-/// Return `true` if `id` resolves to a slot (its `CSpace` is registered
-/// with a matching epoch and the index is in range).
-fn slot_exists(id: SlotId) -> bool
-{
-    crate::cap::lookup_cspace(id.cspace_id, id.epoch)
-        // SAFETY: registry pointer valid while the entry resolves; brief
-        // immutable read under DERIVATION_LOCK.
-        .and_then(|cs| unsafe { (*cs).slot(id.index.get()) })
-        .is_some()
 }
 
 /// Containment for a dead derivation link: log it and cut `owner`'s
@@ -779,6 +772,42 @@ mod tests
         assert!(all_hoisted, "every survivor hoisted under root");
         assert_eq!(survivors, BUDGET_CHAIN - first_freed);
         crate::cap::unregister_cspace(ID);
+    }
+
+    #[test]
+    fn link_child_dead_child_leaves_parent_untouched()
+    {
+        const ID_A: crate::cap::slot::CSpaceId = 3106;
+        const ID_B: crate::cap::slot::CSpaceId = 3107;
+        let cs_a = mk_registered_cspace(ID_A);
+        let cs_b = mk_registered_cspace(ID_B);
+        let root = occupy(cs_a, ID_A);
+        let live_child = occupy(cs_a, ID_A);
+        let dead_child = occupy(cs_b, ID_B);
+        DERIVATION_LOCK.write_lock();
+        // SAFETY: DERIVATION_LOCK held; both slots live.
+        unsafe { link_child(root, live_child) };
+        // The child's CSpace vanishes before the (stale) link attempt.
+        crate::cap::unregister_cspace(ID_B);
+        // SAFETY: DERIVATION_LOCK held; the dead end must be tolerated.
+        unsafe { link_child(root, dead_child) };
+        // SAFETY: DERIVATION_LOCK held.
+        let root_first = unsafe { resolve_slot_mut(root) }.and_then(|s| s.deriv_first_child);
+        // SAFETY: DERIVATION_LOCK held.
+        let live_prev = unsafe { resolve_slot_mut(live_child) }.map(|s| s.deriv_prev_sibling);
+        DERIVATION_LOCK.write_unlock();
+
+        assert_eq!(
+            root_first,
+            Some(live_child),
+            "parent must not point at the dead child"
+        );
+        assert_eq!(
+            live_prev,
+            Some(None),
+            "former head's prev link must be untouched"
+        );
+        crate::cap::unregister_cspace(ID_A);
     }
 
     #[test]

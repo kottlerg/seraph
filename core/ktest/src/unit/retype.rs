@@ -909,7 +909,7 @@ pub fn cspace_dir_page_survives_failed_grow(ctx: &TestContext) -> TestResult
     cap_delete(cspace).ok();
     match landed
     {
-        Ok(idx) if u64::from(idx) > u64::from(DIRECT_SLOTS) => Ok(()),
+        Ok(handle) if syscall_abi::cap_handle_index(handle) > DIRECT_SLOTS => Ok(()),
         Ok(_) => Err("retype::dir_survives: post-refill insert landed below the boundary"),
         Err(_) => Err("retype::dir_survives: insert after refill failed — dir page re-charged?"),
     }

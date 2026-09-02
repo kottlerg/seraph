@@ -2118,8 +2118,10 @@ pub enum StateCommit
 }
 
 /// Wait until `tcb` has left every CPU and its in-flight register save has
-/// published — the UAF gate shared by `dealloc_object(Thread)` and the
-/// object-teardown stop path ([`stop_threads_bound_to`]).
+/// published — `dealloc_object(Thread)`'s UAF gate. (The object-teardown
+/// stop path, [`stop_threads_bound_to`], waits only for its bound threads
+/// to leave `current`; their register save is gated here when each Thread
+/// object is later freed.)
 ///
 /// # Safety
 /// `tcb` must be a valid TCB already marked `Stopped` or `Exited` and

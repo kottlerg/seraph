@@ -720,6 +720,9 @@ pub fn sys_cap_create_cspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             core::ptr::drop_in_place(cs_kobj_ptr);
             core::ptr::drop_in_place(cs_ptr);
         }
+        // The id was drawn but never registered; return it or the 4096-id
+        // namespace drains one entry per failed create.
+        crate::cap::free_cspace_id(id);
         retype_free(memory, offset, entry.raw_bytes);
         return Err(SyscallError::OutOfMemory);
     }
@@ -744,6 +747,7 @@ pub fn sys_cap_create_cspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             core::ptr::drop_in_place(cs_ptr);
         }
         crate::cap::unregister_cspace(id);
+        crate::cap::free_cspace_id(id);
         retype_free(memory, offset, entry.raw_bytes);
         // SAFETY: matches inc_ref above.
         unsafe { memory_obj_nn.as_ref().dec_ref() };
@@ -768,14 +772,16 @@ pub fn sys_cap_create_cspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         Ok(idx) => idx,
         Err(e) =>
         {
-            // Roll back the registry slot, the memory inc_ref, the in-place
-            // wrapper/CSpace constructions, and the retype carve. Without
-            // this rollback, a failed `insert_cap` would leak a live CSpace
-            // registry entry, leave `memory_obj_nn`'s refcount permanently
-            // incremented, and surrender the carved offset back to the
-            // retype allocator only when the source memory itself was
-            // dec_ref'd to zero.
+            // Roll back the registry slot and its id, the memory inc_ref,
+            // the in-place wrapper/CSpace constructions, and the retype
+            // carve. Without this rollback, a failed `insert_cap` would leak
+            // a live CSpace registry entry and its id (one of 4096 — a
+            // caller with a full slot pool could drain the namespace), leave
+            // `memory_obj_nn`'s refcount permanently incremented, and
+            // surrender the carved offset back to the retype allocator only
+            // when the source memory itself was dec_ref'd to zero.
             crate::cap::unregister_cspace(id);
+            crate::cap::free_cspace_id(id);
             // SAFETY: wrapper/cs not observed externally (no slot in any
             // CSpace points at `nonnull`, and we just removed the registry
             // entry).

@@ -416,14 +416,16 @@ without the lock): a concurrent revoke starting on it stops the delete with
 `InvalidState` and children already moved stay under the parent, a
 concurrent delete finishing it first turns the delete into a success and a
 split into `InvalidState` with both children rolled back. The split's own
-children are checked the same way before each is linked under the parent —
-the slot must still hold the inserted child under the generation minted at
-insert — so a sibling that deleted one (and refilled its slot) between the
-insert and the final hold leaves that child unlinked, never an unrelated cap
-wired under the original's parent. The handles returned to the caller are
-the ones minted under the insert's own `CSpace` lock hold, so such a child's
-handle no longer resolves; re-reading the slot after the lock is released
-would instead return a live handle to the refill.
+children are inserted and linked under the original's parent inside the
+first hold, before any batch releases the lock, so they are never reachable
+but unlinked — a sibling's `SYS_CAP_MOVE` carries whatever derivation
+position it finds, and an unlinked child would leave the grantor's revoke
+reach for good. Rolling a child back checks that its slot still holds it
+under the generation minted at insert, so a sibling that deleted one (and
+refilled its slot) never has an unrelated cap freed. The handles returned to
+the caller are the ones minted under the insert's own `CSpace` lock hold, so
+such a child's handle no longer resolves; re-reading the slot after the lock
+is released would instead return a live handle to the refill.
 
 Because hoisting destroys intermediate parent→child edges as the flattening
 proceeds, the root is pinned for the whole multi-batch operation with a
@@ -461,7 +463,7 @@ unregisters, its teardown drain (`drain_dying_cspace_batch`) unlinks every
 dying slot from the forest — foreign children are orphaned into derivation
 roots, and each slot is spliced out of its parent/sibling links with the
 neighbours re-linked directly. Each unlink leaves the forest fully
-consistent, so the drain runs in edit-bounded batches that release the
+consistent, so the drain runs in step-bounded batches (every slot visited and every link edit is one step) that release the
 derivation write lock between holds (mirroring revocation's batching); a
 foreign traversal in a window between batches sees ordinary consistent
 nodes. The one remaining source of a dead link is a foreign sender whose

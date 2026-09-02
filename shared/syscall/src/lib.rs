@@ -1169,7 +1169,12 @@ pub fn memory_merge(parent_cap: u32, tail_cap: u32) -> Result<(), i64>
 ///
 /// # Errors
 /// Returns a negative `i64` error code if the cap is invalid, `split_offset`
-/// is not page-aligned, or is out of range for the region.
+/// is not page-aligned, or is out of range for the region.///
+/// The split consumes the original under the derivation lock. `InvalidState`
+/// if a concurrent delete removed the original or a `SYS_CAP_REVOKE` on it is
+/// in flight; `Interrupted` if a concurrent deriver extended its child list
+/// faster than the batched reparent could move it (retry); `OutOfMemory` if
+/// the caller's `CSpace` cannot back two more slots.
 // cast_sign_loss: proven non-negative in Ok branch.
 // cast_possible_truncation: each half of the packed return is a 32-bit slot index.
 #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
@@ -1201,7 +1206,12 @@ pub fn mmio_split(mmio_cap: u32, split_offset: u64) -> Result<(u32, u32), i64>
 ///
 /// # Errors
 /// Returns a negative `i64` error code if the cap is invalid or `split_at`
-/// falls outside the cap's range.
+/// falls outside the cap's range.///
+/// The split consumes the original under the derivation lock. `InvalidState`
+/// if a concurrent delete removed the original or a `SYS_CAP_REVOKE` on it is
+/// in flight; `Interrupted` if a concurrent deriver extended its child list
+/// faster than the batched reparent could move it (retry); `OutOfMemory` if
+/// the caller's `CSpace` cannot back two more slots.
 // cast_sign_loss / cast_possible_truncation: identical to `mmio_split`.
 #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 #[inline]
@@ -1245,7 +1255,12 @@ pub fn irq_split(irq_cap: u32, split_at: u32) -> Result<(u32, u32), i64>
 /// # Errors
 /// Returns a negative `i64` error code if the cap is invalid, `split_at`
 /// falls outside the cap's range, or the syscall is not supported on this
-/// architecture.
+/// architecture.///
+/// The split consumes the original under the derivation lock. `InvalidState`
+/// if a concurrent delete removed the original or a `SYS_CAP_REVOKE` on it is
+/// in flight; `Interrupted` if a concurrent deriver extended its child list
+/// faster than the batched reparent could move it (retry); `OutOfMemory` if
+/// the caller's `CSpace` cannot back two more slots.
 // cast_sign_loss / cast_possible_truncation: identical to `mmio_split`.
 #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 #[inline]
@@ -1284,7 +1299,12 @@ pub fn ioport_split(ioport_cap: u32, split_at: u16) -> Result<(u32, u32), i64>
 ///
 /// # Errors
 /// Returns a negative `i64` error code if the cap is invalid or `split_at`
-/// falls outside the cap's band.
+/// falls outside the cap's band.///
+/// The split consumes the original under the derivation lock. `InvalidState`
+/// if a concurrent delete removed the original or a `SYS_CAP_REVOKE` on it is
+/// in flight; `Interrupted` if a concurrent deriver extended its child list
+/// faster than the batched reparent could move it (retry); `OutOfMemory` if
+/// the caller's `CSpace` cannot back two more slots.
 // cast_sign_loss / cast_possible_truncation: identical to `mmio_split`.
 #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 #[inline]
@@ -1389,7 +1409,9 @@ pub fn thread_start(thread_cap: u32) -> Result<(), i64>
 ///
 /// # Errors
 /// Returns a negative `i64` error code if either cap is invalid, the caller
-/// lacks sufficient rights, or the destination `CSpace` is full.
+/// lacks sufficient rights, or the destination `CSpace`'s slot pool cannot
+/// back a fresh slot (`OutOfMemory`; refill it with `cap_create_cspace` in
+/// augment mode).
 // cast_possible_truncation, cast_sign_loss: ret is a non-negative cap handle —
 // a 24-bit slot index plus an 8-bit generation (`CAP_INDEX_BITS + 8 <= 32`),
 // so it fits u32.
@@ -1477,8 +1499,9 @@ pub fn cap_derive_badge(src_slot: u32, rights_mask: u64, badge: u64) -> Result<u
 /// capability is refused instead.
 ///
 /// # Errors
-/// Returns a negative `i64` error code: `InvalidCapability` if the slot
-/// index is out of range; `InvalidState` if the slot names the caller's
+/// Returns a negative `i64` error code: `InvalidCapability` if the handle
+/// is out of range, carries a stale generation, or names an empty slot;
+/// `InvalidState` if the slot names the caller's
 /// own thread or a `SYS_CAP_REVOKE` on it is in flight; `Interrupted` if a
 /// concurrent deriver extended the slot's child list faster than the
 /// batched reparent could move it (retry).
@@ -1549,8 +1572,10 @@ pub fn cap_revoke_all(slot: u32) -> Result<(), i64>
 /// Returns the destination slot index.
 ///
 /// # Errors
-/// Returns a negative `i64` error code if either cap is invalid, the
-/// destination `CSpace` is full, or `dest_index` is already occupied.
+/// Returns a negative `i64` error code if either cap is invalid, `dest_index`
+/// is already occupied, or the destination `CSpace`'s slot pool cannot back
+/// the slot (`OutOfMemory` — for a non-zero `dest_index`, every leaf up to
+/// that index must be backed).
 // cast_possible_truncation, cast_sign_loss: ret is a non-negative cap handle —
 // a 24-bit slot index plus an 8-bit generation (`CAP_INDEX_BITS + 8 <= 32`),
 // so it fits u32.
@@ -1577,7 +1602,9 @@ pub fn cap_move(src_slot: u32, dest_cspace_cap: u32, dest_index: u32) -> Result<
 ///
 /// # Errors
 /// Returns a negative `i64` error code if either cap is invalid, the caller
-/// lacks sufficient rights, or `dest_index` is already occupied.
+/// lacks sufficient rights, `dest_index` is already occupied, or the
+/// destination `CSpace`'s slot pool cannot back every leaf up to
+/// `dest_index` (`OutOfMemory`).
 pub fn cap_insert(
     src_slot: u32,
     dest_cspace_cap: u32,

@@ -1770,8 +1770,8 @@ unsafe fn dealloc_object_one(
 
                     // UAF gate: a TCB that is `current` on any CPU MUST NOT be
                     // reclaimed until every CPU has switched away from it AND
-                    // the in-flight register save has published. Shared with
-                    // the object-teardown stop path; see `wait_until_off_cpu`.
+                    // the in-flight register save has published; see
+                    // `wait_until_off_cpu`.
                     // SAFETY: tcb is Exited and unlinked from every run queue
                     // (all-locks region above); not the running thread here.
                     crate::sched::wait_until_off_cpu(tcb);
@@ -2357,7 +2357,8 @@ unsafe fn dealloc_object_one(
 
                 // ── Batched pre-unregister derivation drain ──
                 // DERIVATION_LOCK is held per batch (bounded by
-                // MAX_DRAIN_EDITS link edits), released between batches so
+                // MAX_DRAIN_EDITS steps — slots visited plus link edits),
+                // released between batches so
                 // an arbitrarily large donor-funded CSpace never stalls
                 // concurrent derivation traffic behind its teardown.
                 // `unregister_cspace` runs inside the FINAL batch's
@@ -2943,8 +2944,9 @@ const MAX_DRAIN_EDITS: usize = 256;
 /// recycling relies on.
 ///
 /// Returns `true` once the whole `CSpace` is drained; `false` when the
-/// edit budget ran out (call again — the cursor resumes at the same
-/// slot).
+/// step budget ran out (call again — the cursor resumes at the same
+/// slot). Every slot visited and every link edit is one step, so a hold
+/// is bounded by `MAX_DRAIN_EDITS` whatever the population.
 ///
 /// ## Aliasing avoidance
 ///
@@ -2983,11 +2985,18 @@ unsafe fn drain_dying_cspace_batch(
     while *cursor < slot_count
     {
         let global_idx = *cursor;
+        // Every slot visited counts against the budget like a link edit, so
+        // a hold over a large but sparsely populated `CSpace` stays bounded.
+        if edits >= MAX_DRAIN_EDITS
+        {
+            return false;
+        }
         let Some(idx_nz) = NonZeroU32::new(global_idx)
         else
         {
             // Slot 0 is permanently null.
             *cursor += 1;
+            edits += 1;
             continue;
         };
         // SAFETY: brief immutable borrow; dropped at the end of the call.
@@ -2996,6 +3005,7 @@ unsafe fn drain_dying_cspace_batch(
         if !populated
         {
             *cursor += 1;
+            edits += 1;
             continue;
         }
         let self_id = SlotId::with_epoch(dying_id, dying_epoch, idx_nz);

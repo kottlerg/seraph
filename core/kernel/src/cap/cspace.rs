@@ -438,7 +438,9 @@ impl CSpace
         let mut next = old_head;
         for i in (start_slot..L2_SIZE).rev()
         {
-            let idx = NonZeroU32::new((base + i) as u32).ok_or(CapError::InvalidIndex)?;
+            // `base + i >= 1`: `start_slot` skips slot 0 of the first leaf.
+            debug_assert!(base + i >= 1);
+            let idx = NonZeroU32::new((base + i) as u32).unwrap_or(NonZeroU32::MIN);
             page.slots[i].set_next_free(next);
             next = Some(idx);
         }
@@ -585,7 +587,10 @@ impl CSpace
     /// `max_leaves` leaves in this call. Returns `Ok(true)` once the
     /// covering leaf exists. Lets the explicit-placement syscall path
     /// pre-grow in bounded batches under only this `CSpace`'s lock,
-    /// keeping each interrupts-off hold constant-sized.
+    /// keeping each interrupts-off hold constant-sized. An `index` beyond
+    /// the structural ceiling is clamped to the last leaf: the caller
+    /// rejects such an index up front (`pages_to_cover`), so the clamp
+    /// only keeps this function total.
     pub(crate) fn grow_toward(&mut self, index: u32, max_leaves: usize) -> Result<bool, CapError>
     {
         let target_leaf = (index as usize / L2_SIZE).min(MAX_LEAVES - 1);

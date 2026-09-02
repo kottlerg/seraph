@@ -959,9 +959,12 @@ if a concurrent delete removed it, or a `SYS_CAP_REVOKE` is in flight on it, the
 split fails with `InvalidState` and both children are rolled back. Its children
 are re-linked under its derivation parent in batches (lock released between
 them); a concurrent deriver extending that list faster than it is moved returns
-`Interrupted`. A new child that a concurrent delete removed before the split
-finished is left unlinked; its returned handle carries the generation minted
-at insert, so it no longer resolves even if the slot has since been refilled.
+`Interrupted`. Both children are inserted and linked under the original's
+derivation parent in the first derivation-lock hold, so a concurrent move
+cannot carry one out of the grantor's revoke reach before it is linked; a
+child a concurrent delete removed before the split finished stays deleted,
+and its returned handle carries the generation minted at insert, so it no
+longer resolves even if the slot has since been refilled.
 The three other range splits (`SYS_IRQ_SPLIT`, `SYS_IOPORT_SPLIT`,
 `SYS_SCHED_SPLIT`) share this tail and these two errors.
 

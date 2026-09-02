@@ -28,15 +28,18 @@ use syscall::SyscallError;
 ///
 /// The caller must have already validated the split point and allocated the
 /// two child object bodies. This:
-///   1. inserts both children into the caller's `CSpace` under `cspace.lock`,
-///      rolling back on either insert failure (a body is deallocated only
-///      once nothing references it);
-///   2. rewires the derivation tree under `DERIVATION_LOCK` — reparents the
-///      original's children to its parent in `MAX_REPARENT_EDITS` batches
-///      (lock released between batches), unlinks the original, then links
-///      to that parent each new cap whose slot still holds it under the
-///      generation minted at insert (a sibling may have deleted a child
-///      meanwhile; its returned handle then no longer resolves);
+///   1. under `DERIVATION_LOCK`, revalidates the original, inserts both
+///      children into the caller's `CSpace` (`cspace.lock` nested) and links
+///      each under the original's derivation parent — in the same hold, so
+///      no child is ever reachable but unlinked (a sibling's `SYS_CAP_MOVE`
+///      would carry an unlinked child out of the grantor's revoke reach);
+///      either insert failing rolls back (a body is deallocated only once
+///      nothing references it);
+///   2. reparents the original's children to that parent in
+///      `MAX_REPARENT_EDITS` batches (lock released between batches) and
+///      unlinks the original; a batch that finds the original gone rolls
+///      both children back (a child a sibling deleted meanwhile is left as
+///      the sibling left it; its returned handle then no longer resolves);
 ///   3. frees the original slot and drops its object reference.
 ///
 /// The original was looked up without the derivation lock, so it is
@@ -84,27 +87,14 @@ pub(crate) unsafe fn install_split_children(
     let orig_idx = syscall::cap_handle_index(orig_handle);
     let orig_gen = syscall::cap_handle_gen(orig_handle);
     let orig_idx_nz = NonZeroU32::new(orig_idx).ok_or(SyscallError::InvalidCapability)?;
-
-    // SAFETY: caller contract (children fresh, refcount 1, uninserted).
-    let (child1, child2) = unsafe {
-        insert_children(
-            caller_cspace,
-            cspace_id,
-            tag,
-            rights,
-            child1_ptr,
-            child2_ptr,
-        )
-    }?;
-
-    // ── Wire derivation tree ──────────────────────────────────────────────────
-
     let orig_node = SlotId::current(cspace_id, orig_idx_nz);
 
-    // Move the original's children under its parent in batches; the final
-    // batch's hold continues below with the unlink and the consume.
+    // Insert and link the children in the first hold, then move the
+    // original's children under its parent in batches; the final batch's
+    // hold continues below with the unlink and the consume.
+    let mut children: Option<(InsertedChild, InsertedChild)> = None;
     let mut batches: u32 = 0;
-    let orig_parent = loop
+    loop
     {
         DERIVATION_LOCK.write_lock();
 
@@ -119,13 +109,44 @@ pub(crate) unsafe fn install_split_children(
                 && !slot.revoke_in_progress())
             .then_some(slot.deriv_parent)
         });
+
+        if children.is_none()
+        {
+            let Some(parent) = revalidated_parent
+            else
+            {
+                DERIVATION_LOCK.write_unlock();
+                // SAFETY: both bodies are fresh (refcount 1) and were never
+                // inserted anywhere.
+                unsafe {
+                    dealloc_object(child1_ptr);
+                    dealloc_object(child2_ptr);
+                }
+                return Err(SyscallError::InvalidState);
+            };
+            // SAFETY: caller contract (children fresh, refcount 1,
+            // uninserted); DERIVATION_LOCK held, released by the helper on
+            // failure.
+            children = Some(unsafe {
+                insert_and_link_children(
+                    caller_cspace,
+                    cspace_id,
+                    tag,
+                    rights,
+                    parent,
+                    child1_ptr,
+                    child2_ptr,
+                )
+            }?);
+        }
+
         // SAFETY: DERIVATION_LOCK held; orig_node revalidated when Some.
         let done = revalidated_parent
             .map(|parent| unsafe { reparent_children(orig_node, parent, MAX_REPARENT_EDITS) });
         batches += 1;
         match (revalidated_parent, done)
         {
-            (Some(parent), Some(true)) => break parent,
+            (Some(_), Some(true)) => break,
             (Some(_), Some(false)) if batches < MAX_REPARENT_BATCHES =>
             {
                 DERIVATION_LOCK.write_unlock();
@@ -134,8 +155,14 @@ pub(crate) unsafe fn install_split_children(
             {
                 // Original gone (or revoke in flight), or the deriver
                 // backstop tripped: roll both children back, fail closed.
+                let Some((child1, child2)) = children
+                else
+                {
+                    DERIVATION_LOCK.write_unlock();
+                    return Err(SyscallError::InvalidState);
+                };
                 // SAFETY: DERIVATION_LOCK held; both child slots were
-                // inserted above and are released only here.
+                // inserted in the first hold and are released only here.
                 let released = unsafe {
                     (
                         rollback_child(caller_cspace, cspace_id, child1),
@@ -158,28 +185,16 @@ pub(crate) unsafe fn install_split_children(
                 );
             }
         }
+    }
+    let Some((child1, child2)) = children
+    else
+    {
+        DERIVATION_LOCK.write_unlock();
+        return Err(SyscallError::InvalidState);
     };
 
     // SAFETY: DERIVATION_LOCK held (final batch); orig_node revalidated.
     unsafe { unlink_node(orig_node) };
-
-    if let Some(parent_id) = orig_parent
-    {
-        // A sibling thread may have deleted a child (and refilled its slot)
-        // since the insert: link only a slot that still holds our child, so
-        // an unrelated cap is never wired under the original's parent.
-        for child in [child1, child2]
-        {
-            // SAFETY: caller_cspace validated; DERIVATION_LOCK held, so the
-            // slot's occupancy is stable from this check through the link.
-            if unsafe { child.still_held(caller_cspace) }
-            {
-                let child_id = SlotId::current(cspace_id, child.slot);
-                // SAFETY: DERIVATION_LOCK held; parent_id and child_id occupied.
-                unsafe { link_child(parent_id, child_id) };
-            }
-        }
-    }
 
     // ── Consume the original cap ──────────────────────────────────────────────
     // Freed inside the SAME derivation-lock hold as the unlink above: a gap
@@ -209,6 +224,65 @@ pub(crate) unsafe fn install_split_children(
     // re-reading the slot here could instead hand back a live handle to
     // whatever cap now occupies the recycled slot.
     Ok((child1.handle, child2.handle))
+}
+
+/// First-hold step of a split: insert both children into the caller's
+/// `CSpace` and link each under `parent` — the revalidated original's
+/// derivation parent (`None` for a root) — all inside the caller's
+/// `DERIVATION_LOCK` hold. On error the lock has been released and both
+/// bodies disposed of (deallocated, or left to their new owners).
+///
+/// # Safety
+///
+/// As for [`insert_children`], plus: the caller holds `DERIVATION_LOCK`
+/// write lock and, when this returns `Err`, no longer does.
+// too_many_arguments: the children's coordinates plus the parent; a struct
+// would only move the list.
+#[allow(clippy::too_many_arguments)]
+unsafe fn insert_and_link_children(
+    caller_cspace: *mut CSpace,
+    cspace_id: CSpaceId,
+    tag: CapTag,
+    rights: Rights,
+    parent: Option<SlotId>,
+    child1_ptr: NonNull<KernelObjectHeader>,
+    child2_ptr: NonNull<KernelObjectHeader>,
+) -> Result<(InsertedChild, InsertedChild), SyscallError>
+{
+    // SAFETY: caller contract; DERIVATION_LOCK held.
+    let inserted = unsafe {
+        insert_children(
+            caller_cspace,
+            cspace_id,
+            tag,
+            rights,
+            child1_ptr,
+            child2_ptr,
+        )
+    };
+    let (child1, child2) = match inserted
+    {
+        Ok(pair) => pair,
+        Err((e, released)) =>
+        {
+            DERIVATION_LOCK.write_unlock();
+            // SAFETY: each flagged pointer is an unreferenced refcount-0
+            // body (see insert_children).
+            unsafe { dealloc_rolled_back(released, child1_ptr, child2_ptr) };
+            return Err(e);
+        }
+    };
+    if let Some(parent_id) = parent
+    {
+        // SAFETY: DERIVATION_LOCK held; parent_id is the revalidated
+        // original's parent and both child slots are occupied by the
+        // inserts above.
+        unsafe {
+            link_child(parent_id, SlotId::current(cspace_id, child1.slot));
+            link_child(parent_id, SlotId::current(cspace_id, child2.slot));
+        }
+    }
+    Ok((child1, child2))
 }
 
 /// One split child as installed by [`insert_children`]: its slot, the
@@ -245,14 +319,17 @@ impl InsertedChild
 
 /// Insert both split children into the caller's `CSpace`, returning each
 /// with the handle minted under its insert's lock hold. On either insert
-/// failure both bodies are deallocated (and a slot1 already taken is
-/// released through [`rollback_child`]).
+/// failure the error carries, in `(child1, child2)` order, which bodies the
+/// caller must deallocate once it has released `DERIVATION_LOCK` (a slot1
+/// already taken is released through [`rollback_child`] first).
 ///
 /// # Safety
 ///
 /// `caller_cspace` must be valid and non-null with id `cspace_id`;
 /// `child1_ptr`/`child2_ptr` must be freshly-allocated refcount-1 bodies of
-/// tag `tag` not yet inserted anywhere.
+/// tag `tag` not yet inserted anywhere. Caller must hold `DERIVATION_LOCK`
+/// write lock: the slot1 rollback runs under it, and `cspace.lock` nests
+/// inside it per the documented order.
 unsafe fn insert_children(
     caller_cspace: *mut CSpace,
     cspace_id: CSpaceId,
@@ -260,7 +337,7 @@ unsafe fn insert_children(
     rights: Rights,
     child1_ptr: NonNull<KernelObjectHeader>,
     child2_ptr: NonNull<KernelObjectHeader>,
-) -> Result<(InsertedChild, InsertedChild), SyscallError>
+) -> Result<(InsertedChild, InsertedChild), (SyscallError, (bool, bool))>
 {
     // Insert both children into the caller's CSpace under cspace.lock so the
     // freelist mutation cannot tear against a concurrent SYS_CAP_CREATE_*.
@@ -279,15 +356,8 @@ unsafe fn insert_children(
         (*caller_cspace).lock.unlock_raw(saved);
         r
     }
-    .map_err(|e| {
-        // SAFETY: child1_ptr and child2_ptr were freshly allocated with
-        // refcount 1; neither has been inserted into any CSpace.
-        unsafe {
-            dealloc_object(child1_ptr);
-            dealloc_object(child2_ptr);
-        }
-        SyscallError::from(e)
-    })?;
+    // Neither body has been stored: the caller frees both.
+    .map_err(|e| (SyscallError::from(e), (true, true)))?;
     // SAFETY: caller_cspace validated by the caller; lock_raw/unlock_raw paired.
     let child2 = unsafe {
         let saved = (*caller_cspace).lock.lock_raw();
@@ -304,20 +374,13 @@ unsafe fn insert_children(
     .map_err(|e| {
         // Undo slot1: child1_ptr was inserted (reachable only via slot1);
         // child2_ptr was passed to the failing insert_cap and never stored.
-        // SAFETY: caller_cspace validated; DERIVATION_LOCK brackets the free
-        // so the occupied-to-free transition stays atomic against
+        // SAFETY: caller_cspace validated; DERIVATION_LOCK held by the
+        // caller, so the occupied-to-free transition stays atomic against
         // derivation-side occupancy gates (see `resolve_slot_mut`).
-        let release1 = unsafe {
-            DERIVATION_LOCK.write_lock();
-            let r = rollback_child(caller_cspace, cspace_id, child1);
-            DERIVATION_LOCK.write_unlock();
-            r
-        };
-        // SAFETY: child2_ptr was freshly allocated with refcount 1 and never
-        // stored; child1_ptr is freed only if rollback_child dropped its
-        // last reference.
-        unsafe { dealloc_rolled_back((release1, true), child1_ptr, child2_ptr) };
-        SyscallError::from(e)
+        let release1 = unsafe { rollback_child(caller_cspace, cspace_id, child1) };
+        // child1_ptr is freed only if rollback_child dropped its last
+        // reference; child2_ptr was never stored.
+        (SyscallError::from(e), (release1, true))
     })?;
     Ok((child1, child2))
 }

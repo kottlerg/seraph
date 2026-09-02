@@ -123,7 +123,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         .map_err(|_| "integration::ipc_call_interrupted_stop_start: cap_copy p1 ep failed")?;
     let c_done = cap_copy(done, client.cs, RIGHTS_SIGNAL)
         .map_err(|_| "integration::ipc_call_interrupted_stop_start: cap_copy p1 done failed")?;
-    let arg = pack(c_ep, c_done, BIT_P1_READY, BIT_P1_OK, BIT_P1_BAD);
+    let arg = publish_client_args(c_ep, c_done, BIT_P1_READY, BIT_P1_OK, BIT_P1_BAD);
     // Phase 1's client is the sole user of CLIENT_STACK until reaped.
     let stack = ChildStack::top(core::ptr::addr_of!(CLIENT_STACK));
     spawn::configure_and_start(&client, client_entry, stack, arg)
@@ -185,7 +185,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         .map_err(|_| "integration::ipc_call_interrupted_stop_start: cap_copy p2 ep failed")?;
     let p2c_done = cap_copy(done, client2.cs, RIGHTS_SIGNAL)
         .map_err(|_| "integration::ipc_call_interrupted_stop_start: cap_copy p2 done failed")?;
-    let c2_arg = pack(p2c_ep, p2c_done, 0, BIT_P2_OK, BIT_P2_BAD);
+    let c2_arg = publish_client_args(p2c_ep, p2c_done, 0, BIT_P2_OK, BIT_P2_BAD);
     // Phase 1's client was reaped above; CLIENT_STACK is free again.
     let c2_stack = ChildStack::top(core::ptr::addr_of!(CLIENT_STACK));
     spawn::configure_and_start(&client2, client_entry, c2_stack, c2_arg)
@@ -238,7 +238,7 @@ fn wait_for(done: u32, acc: &mut u64, mask: u64) -> Result<(), &'static str>
 }
 
 /// Publish the client's arguments and return the entry address.
-fn pack(ep: u32, done: u32, ready: u64, ok: u64, bad: u64) -> u64
+fn publish_client_args(ep: u32, done: u32, ready: u64, ok: u64, bad: u64) -> u64
 {
     // SAFETY: no client is live when this is called (see `ClientArgs`).
     unsafe {
@@ -259,7 +259,7 @@ fn pack(ep: u32, done: u32, ready: u64, ok: u64, bad: u64) -> u64
 /// iff the call returns `Interrupted`, the BAD bit otherwise.
 fn client_entry(arg: u64) -> !
 {
-    // SAFETY: `arg` is the entry `pack` published for this client.
+    // SAFETY: `arg` is the entry `publish_client_args` published for this client.
     let ClientArgs {
         ep,
         done,

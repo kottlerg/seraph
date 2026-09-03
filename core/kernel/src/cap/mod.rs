@@ -485,9 +485,9 @@ pub fn sum_memory_available_bytes(cspace: &cspace::CSpace) -> u64
 /// either retries indefinitely (e.g. `request_round` in a child) or
 /// surfaces an unexpected `OutOfMemory`.
 ///
-/// Backing the directory's full structural ceiling would cost 257 SEED
-/// pages (~1 MiB) for a `CSpace` whose occupancy peaks at boot and is
-/// bounded in steady state. Growth past the seeded pool returns the
+/// Backing the directory's full structural ceiling would cost about 65,800
+/// SEED pages (~257 MiB: 65,664 leaves plus 128 directory pages) for a
+/// `CSpace` whose occupancy peaks at boot and is bounded in steady state. Growth past the seeded pool returns the
 /// refillable `OutOfMemory`; init owns the shortfall and can refill via
 /// augment-mode `cap_create_cspace` against its own `CSpace` cap
 /// (`ProcessInfo.cspace_cap`).

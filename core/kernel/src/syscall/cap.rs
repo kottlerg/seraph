@@ -1272,6 +1272,8 @@ fn pre_grow_for_explicit_slot(
         match step
         {
             Ok(true) => return Ok(()),
+            // Budget for this hold spent with leaves still missing: the next
+            // iteration takes a fresh hold.
             Ok(false) =>
             {}
             Err(e) => return Err(e),
@@ -2403,6 +2405,13 @@ pub fn sys_cap_move(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         (*caller_cspace).free_slot(src_idx);
     }
 
+    // Encode the destination slot's generation into the returned handle
+    // (#349) while the destination lock is still held: read after the
+    // release, a sibling's delete-and-refill of the slot could hand back a
+    // live handle to the refill instead.
+    // SAFETY: dest_cs_ptr validated above; its lock is held by the pair.
+    let dest_handle = unsafe { (*dest_cs_ptr).cap_handle(dest_idx_nz) };
+
     // Unlock CSpaces in reverse order of acquisition.
     // SAFETY: saved1 and saved2 came from the lock_cspace_pair call above.
     unsafe {
@@ -2410,15 +2419,6 @@ pub fn sys_cap_move(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     }
 
     crate::cap::DERIVATION_LOCK.write_unlock();
-
-    // Encode the destination slot's generation into the returned handle (#349).
-    // SAFETY: dest_cs_ptr validated above; slot occupied so the read is stable.
-    let dest_handle = unsafe {
-        let saved = (*dest_cs_ptr).lock.lock_raw();
-        let h = (*dest_cs_ptr).cap_handle(dest_idx_nz);
-        (*dest_cs_ptr).lock.unlock_raw(saved);
-        h
-    };
     Ok(u64::from(dest_handle))
 }
 

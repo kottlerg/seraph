@@ -140,7 +140,7 @@ cycle counts; no PASS/FAIL verdict.
 
 ## Test infrastructure
 
-Defined in `src/main.rs`:
+Defined in `src/main.rs` (the `spawn::` items in `src/spawn.rs`):
 
 - `TestResult` — `Result<(), &'static str>` — no heap, no allocation.
 - `run_test!(name, body)` — macro that logs the test name, runs `body`,

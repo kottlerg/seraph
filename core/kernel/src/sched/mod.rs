@@ -2018,7 +2018,7 @@ pub unsafe fn set_state_under_all_locks(
 /// # Safety
 /// As for [`set_state_under_all_locks`].
 #[cfg(not(test))]
-pub unsafe fn kill_under_all_locks(tcb: *mut ThreadControlBlock, exit_reason: u64) -> StateCommit
+unsafe fn kill_under_all_locks(tcb: *mut ThreadControlBlock, exit_reason: u64) -> StateCommit
 {
     // SAFETY: caller contract.
     unsafe { commit_state_under_all_locks(tcb, thread::ThreadState::Exited, Some(exit_reason)) }
@@ -2360,7 +2360,7 @@ unsafe fn mark_bound_threads(
             // `state` is read without `sched_lock` here and below: `Exited`
             // is terminal, so a positive read is final, and a negative read
             // is re-decided under the full lock set by
-            // `set_state_under_all_locks`, which refuses an exited thread
+            // `kill_under_all_locks`, which refuses an exited thread
             // (docs/scheduling-internals.md § Cross-CPU TCB Ownership).
             if !bound(tcb) || (*tcb).state == thread::ThreadState::Exited
             {
@@ -2474,9 +2474,10 @@ unsafe fn scan_bound_current(
 /// `bound`, before the object's storage is reclaimed.
 ///
 /// Phase 1 ([`mark_bound_threads`]) walks the thread registry under its
-/// lock: each bound thread not already `Exited` has any IPC block cancelled,
-/// records `EXIT_KILLED` as its retained exit reason, and is marked `Exited`
-/// under the all-locks discipline (draining every run queue); CPUs found
+/// lock: each bound thread not already `Exited` has any IPC block cancelled
+/// and is marked `Exited` under the all-locks discipline with `EXIT_KILLED`
+/// recorded as its retained exit reason in the same hold
+/// (`kill_under_all_locks`, draining every run queue); CPUs found
 /// running one are recorded. Phase 2, with the registry released — a CPU
 /// spinning on the registry lock inside `register` cannot deschedule, so it
 /// must not be waited for while the lock is held — prods those CPUs and
@@ -2617,20 +2618,10 @@ pub unsafe fn wait_until_aspace_inactive(
 
 /// Test stub.
 #[cfg(test)]
-#[allow(unused_variables)]
 pub unsafe fn set_state_under_all_locks(
     _tcb: *mut ThreadControlBlock,
     _new_state: thread::ThreadState,
 ) -> StateCommit
-{
-    StateCommit::Committed(None)
-}
-
-/// Test stub.
-#[cfg(test)]
-#[allow(unused_variables)]
-pub unsafe fn kill_under_all_locks(_tcb: *mut ThreadControlBlock, _exit_reason: u64)
--> StateCommit
 {
     StateCommit::Committed(None)
 }

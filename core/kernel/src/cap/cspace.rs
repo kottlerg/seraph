@@ -228,10 +228,10 @@ pub struct CSpace
     free_count: usize,
     /// Protects concurrent access to all `CSpace` state.
     pub(crate) lock: crate::sync::Spinlock,
-    /// Pool source for new slot and directory pages. Null = legacy heap
-    /// path (host-test stub); non-null = retype-pool path (pop from
-    /// `CSpaceKernelObject::alloc_slot_page`). Set once via
-    /// [`Self::set_kobj`] right after construction.
+    /// Pool source for new slot and directory pages (pop from
+    /// `CSpaceKernelObject::alloc_slot_page`); null only in the host-test
+    /// stub, which boxes pages instead. Set once via [`Self::set_kobj`]
+    /// right after construction.
     kobj: AtomicPtr<CSpaceKernelObject>,
 }
 

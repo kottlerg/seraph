@@ -81,8 +81,9 @@ pub enum ObjectType
 /// `dealloc_object` frees it, dispatching on `obj_type`.
 ///
 /// `ancestor` is a direct pointer to the `MemoryObject`'s header from which
-/// this object was retyped. Auto-reclaim consults this on `dec_ref → 0` to credit bytes back to the
-/// source `MemoryObject` and return the chunk to the per-Memory-cap allocator.
+/// this object was retyped. Auto-reclaim consults this on `dec_ref → 0` to
+/// credit bytes back to the source `MemoryObject` and return the chunk to the
+/// per-Memory-cap allocator.
 ///
 /// A direct pointer (rather than a `SlotId`) is necessary because the source
 /// Memory cap's *slot* may be deleted before all retyped descendants are freed
@@ -107,9 +108,9 @@ pub struct KernelObjectHeader
     #[allow(clippy::pub_underscore_fields)]
     pub _pad: [u8; 2],
     /// Pointer to the `MemoryObject`'s header this object was retyped from;
-    /// every production object has one (null only in host tests). Set once
-    /// at creation, read at deallocation. `AtomicPtr` for the unforgeable null sentinel
-    /// without imposing const-init constraints on construction.
+    /// every production object has one (null only in host tests). Set once at
+    /// creation, read at deallocation. `AtomicPtr` for the unforgeable null
+    /// sentinel without imposing const-init constraints on construction.
     pub ancestor: AtomicPtr<KernelObjectHeader>,
 }
 
@@ -1252,10 +1253,11 @@ pub unsafe fn dealloc_object(ptr: core::ptr::NonNull<KernelObjectHeader>)
 /// # Safety
 ///
 /// Same contract as [`dealloc_object`].
-// cast_ptr_alignment: every concrete object type is allocated as Box<ConcreteType>,
-// which guarantees alignment to align_of::<ConcreteType>(). The NonNull<KernelObjectHeader>
-// points to the first field (header at offset 0), so the pointer retains the concrete
-// type's alignment even when stored as KernelObjectHeader*.
+// cast_ptr_alignment: every concrete object is constructed in place at a
+// size-class-aligned offset of a page-aligned retype slab (`retype_allocate`),
+// which satisfies align_of::<ConcreteType>(). The NonNull<KernelObjectHeader>
+// points to the first field (header at offset 0), so the pointer retains the
+// concrete type's alignment even when stored as KernelObjectHeader*.
 // too_many_lines: structural dispatch over all object types; splitting further
 // would obscure the type hierarchy without reducing complexity.
 #[allow(
@@ -2596,7 +2598,7 @@ unsafe fn dealloc_object_one(
             if new_rc == 0
             {
                 // SAFETY: refcount reached 0; recursion handles the Memory
-                // arm above (which frees the buddy pages and Box).
+                // arm above (which frees the buddy pages).
                 push_ancestor(worklist, head, ancestor_nn);
             }
         }

@@ -615,14 +615,14 @@ deleting thread itself, when it holds that last capability to its own
 process's resources are reclaimed as their capability reference counts reach
 zero.
 
-Beyond that stop, the kernel's role in death is *notification*. An `AddressSpace` carries a
-death-observer set (mirroring the per-thread death observers). On a terminal
-fault by any thread in the address space — no fault handler bound, or the handler
-replied `KILL` — the kernel posts the fault class (`EXIT_FAULT_BASE + vector`) to
-each bound observer and exits the faulting thread. procmgr binds such an observer
-at process creation, so a fatal fault on any thread — a worker, not just the main
-thread — drives procmgr's teardown of the whole process. Normal thread exit does
-not fire these observers.
+Beyond that stop, the kernel's role in death is *notification*. An
+`AddressSpace` carries a death-observer set (mirroring the per-thread death
+observers). On a terminal fault by any thread in the address space — no fault
+handler bound, or the handler replied `KILL` — the kernel posts the fault class
+(`EXIT_FAULT_BASE + vector`) to each bound observer and exits the faulting
+thread. procmgr binds such an observer at process creation, so a fatal fault on
+any thread — a worker, not just the main thread — drives procmgr's teardown of
+the whole process. Normal thread exit does not fire these observers.
 
 ---
 

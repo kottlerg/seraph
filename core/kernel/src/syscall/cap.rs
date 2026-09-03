@@ -1774,8 +1774,9 @@ unsafe fn resolve_delete_target(
 /// slot is revalidated before every batch. Between batches it stays live with
 /// its remaining children still under it, so a concurrent revoke starting on
 /// it surfaces `InvalidState` (children already moved stay under the parent —
-/// still inside every ancestor's subtree) and a concurrent delete finishing
-/// it first makes this call return success. `MAX_REPARENT_BATCHES` bounds a
+/// still inside every ancestor's subtree) and a concurrent delete — or move —
+/// that frees the slot first makes this call return success (the generation
+/// no longer matches; nothing is released here). `MAX_REPARENT_BATCHES` bounds a
 /// concurrent-deriver livelock with `Interrupted`.
 ///
 /// Idempotent: deleting a Null slot returns success.

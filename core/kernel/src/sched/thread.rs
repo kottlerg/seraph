@@ -640,16 +640,15 @@ pub struct ThreadControlBlock
 
     /// Exit reason recorded by the kernel at the moment this thread became
     /// `Exited`. Written by `sys_thread_exit` (clean exit, value `0`), by
-    /// `sys_process_exit` (`encode_exit_code(arg0)`, a voluntary code in
-    /// `[0, EXIT_FAULT_BASE)`), by the architecture fault handlers (value
+    /// `sys_process_exit` (`encode_exit_code(arg0)`, a voluntary code in `[0,
+    /// EXIT_FAULT_BASE)`), by the architecture fault handlers (value
     /// `EXIT_FAULT_BASE + vector`) before they call `post_death_notification`,
     /// and by object teardown (`syscall::EXIT_KILLED`, not posted, written
     /// under the same all-locks hold as its `Exited` commit by
     /// `kill_under_all_locks`), in every case before the matching state
-    /// transition. Read
-    /// out-of-band by `sys_cap_info`'s `CAP_INFO_THREAD_STATE` selector so
-    /// userspace process managers can answer "did this thread die, and with
-    /// what reason?" without racing the userspace death-event drain.
+    /// transition. Read out-of-band by `sys_cap_info`'s `CAP_INFO_THREAD_STATE`
+    /// selector so userspace process managers can answer "did this thread die,
+    /// and with what reason?" without racing the userspace death-event drain.
     pub exit_reason: u64,
 
     // === Sleep ===

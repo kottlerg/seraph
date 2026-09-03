@@ -739,9 +739,10 @@ arbitrarily many children); between batches the slot stays live with its
 remaining children still under it. A `SYS_CAP_REVOKE` that starts on the slot
 between batches stops the delete with `InvalidState` (children already moved
 stay under the parent — still inside every ancestor's subtree); a concurrent
-delete of the same slot that finishes first makes this call return 0. A
-concurrent deriver extending the child list faster than one batch per hold
-returns `Interrupted`; a retry continues from the remaining children.
+delete or move of the same slot that frees it first makes this call return 0
+(the generation no longer matches; nothing is released). A concurrent deriver
+extending the child list faster than one batch per hold returns `Interrupted`; a
+retry continues from the remaining children.
 
 **Errors:** `InvalidCapability`; `InvalidState` (per above); `Interrupted`
 (concurrent re-derivation backstop).

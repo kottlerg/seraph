@@ -656,8 +656,9 @@ mod tests
     // run. The global DERIVATION_LOCK is taken for fidelity with the
     // production contract; these tests assert only after `write_unlock`, so
     // a failing assertion unwinds without wedging the other tests on the
-    // lock (the code under test carries `debug_assert!`s of its own that
-    // would; they guard conditions these tests never provoke).
+    // lock (the one `debug_assert!` reachable under the hold —
+    // `revoke_subtree_batch`'s hoist-link check — guards a condition these
+    // tests never provoke).
 
     use crate::cap::cspace::CSpace;
     use crate::cap::slot::CapTag;
@@ -723,20 +724,23 @@ mod tests
     /// Link pre-occupied `nodes` as a derive chain under `root` (each node
     /// the sole child of the previous). Nodes are allocated by the caller
     /// before locking so no fallible call runs while `DERIVATION_LOCK` is
-    /// held.
+    /// held. Returns whether every link landed; callers assert on it after
+    /// releasing the lock.
     ///
     /// # Safety
     ///
     /// `DERIVATION_LOCK` must be held across the call.
-    unsafe fn link_chain(root: SlotId, nodes: &[SlotId])
+    unsafe fn link_chain(root: SlotId, nodes: &[SlotId]) -> bool
     {
         let mut parent = root;
+        let mut linked = true;
         for &child in nodes
         {
             // SAFETY: DERIVATION_LOCK held by caller; both slots live.
-            let _ = unsafe { link_child(parent, child) };
+            linked &= unsafe { link_child(parent, child) };
             parent = child;
         }
+        linked
     }
 
     /// [`occupy`] `len` slots up front, before the caller takes
@@ -777,7 +781,11 @@ mod tests
         DERIVATION_LOCK.write_unlock();
 
         assert_eq!(status, BatchStatus::Cleared);
-        assert_eq!(collected, 15, "3 children + 12 grandchildren collected");
+        assert_eq!(
+            collected,
+            children.len() + grandchildren.len(),
+            "every child and grandchild collected"
+        );
         assert_eq!(count_populated(cs), 1, "only the root survives");
         // SAFETY: test ownership.
         let root_slot = unsafe { (*cs).slot_mut(root.index.get()) }.expect("root slot");
@@ -799,7 +807,7 @@ mod tests
         let nodes = occupy_many(cs, ID, BUDGET_CHAIN);
         DERIVATION_LOCK.write_lock();
         // SAFETY: DERIVATION_LOCK held; all nodes live.
-        unsafe { link_chain(root, &nodes) };
+        let linked = unsafe { link_chain(root, &nodes) };
 
         // SAFETY: DERIVATION_LOCK held.
         let (first_objects, first_status) = unsafe { revoke_subtree_batch(root) };
@@ -809,6 +817,7 @@ mod tests
         let second_freed = second_objects.len();
         DERIVATION_LOCK.write_unlock();
 
+        assert!(linked, "setup chain must land");
         assert_eq!(first_status, BatchStatus::MoreWork);
         assert!(
             first_freed < BUDGET_CHAIN,
@@ -829,7 +838,7 @@ mod tests
         let nodes = occupy_many(cs, ID, BUDGET_CHAIN);
         DERIVATION_LOCK.write_lock();
         // SAFETY: DERIVATION_LOCK held; all nodes live.
-        unsafe { link_chain(root, &nodes) };
+        let linked = unsafe { link_chain(root, &nodes) };
 
         // SAFETY: DERIVATION_LOCK held.
         let (first_objects, first_status) = unsafe { revoke_subtree_batch(root) };
@@ -842,8 +851,15 @@ mod tests
         // SAFETY: DERIVATION_LOCK held.
         let mut cur = unsafe { resolve_slot_mut(root) }.and_then(|s| s.deriv_first_child);
         let mut all_resolved = true;
+        // Bounded: a cyclic list must end the walk, not the suite.
+        let mut walk_bounded = true;
         while let Some(node) = cur
         {
+            if survivors > BUDGET_CHAIN
+            {
+                walk_bounded = false;
+                break;
+            }
             // SAFETY: DERIVATION_LOCK held.
             let Some(slot) = (unsafe { resolve_slot_mut(node) })
             else
@@ -857,7 +873,9 @@ mod tests
         }
         DERIVATION_LOCK.write_unlock();
 
+        assert!(linked, "setup chain must land");
         assert_eq!(first_status, BatchStatus::MoreWork);
+        assert!(walk_bounded, "root's child list must not cycle");
         assert!(all_resolved, "every survivor must resolve");
         assert!(all_hoisted, "every survivor hoisted under root");
         assert_eq!(survivors, BUDGET_CHAIN - first_freed);
@@ -1035,16 +1053,26 @@ mod tests
                 unsafe { resolve_slot_mut(*child) }.is_some_and(|s| s.deriv_parent == Some(root));
         }
         let mut root_list = 0;
+        // Bounded: a cyclic list must end the walk, not the suite. The
+        // longest legitimate list is `mid` plus its children; the check runs
+        // before the increment, so exactly that many entries pass.
+        let mut walk_bounded = true;
         // SAFETY: DERIVATION_LOCK held.
         let mut cur = unsafe { resolve_slot_mut(root) }.and_then(|s| s.deriv_first_child);
         while let Some(node) = cur
         {
+            if root_list > children.len()
+            {
+                walk_bounded = false;
+                break;
+            }
             root_list += 1;
             // SAFETY: DERIVATION_LOCK held.
             cur = unsafe { resolve_slot_mut(node) }.and_then(|s| s.deriv_next_sibling);
         }
         DERIVATION_LOCK.write_unlock();
 
+        assert!(walk_bounded, "root's child list must not cycle");
         assert!(!first, "a two-edit budget must leave a third child");
         assert!(second, "the second batch must finish the list");
         assert_eq!(mid_children, None, "mid has no children left");

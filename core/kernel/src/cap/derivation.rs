@@ -656,9 +656,10 @@ mod tests
     // run. The global DERIVATION_LOCK is taken for fidelity with the
     // production contract; these tests assert only after `write_unlock`, so
     // a failing assertion unwinds without wedging the other tests on the
-    // lock (the one `debug_assert!` reachable under the hold —
-    // `revoke_subtree_batch`'s hoist-link check — guards a condition these
-    // tests never provoke).
+    // lock (the `debug_assert!`s reachable under the hold —
+    // `revoke_subtree_batch`'s hoist-link check and the free-list link
+    // rewrites reached through `free_slot` — guard conditions these tests
+    // never provoke).
 
     use crate::cap::cspace::CSpace;
     use crate::cap::slot::CapTag;
@@ -765,14 +766,15 @@ mod tests
         let children = occupy_many(cs, ID, 3);
         let grandchildren = occupy_many(cs, ID, 12);
         DERIVATION_LOCK.write_lock();
+        let mut linked = true;
         for (child, chunk) in children.iter().zip(grandchildren.chunks(4))
         {
             // SAFETY: DERIVATION_LOCK held; both slots live.
-            let _ = unsafe { link_child(root, *child) };
+            linked &= unsafe { link_child(root, *child) };
             for grandchild in chunk
             {
                 // SAFETY: as above.
-                let _ = unsafe { link_child(*child, *grandchild) };
+                linked &= unsafe { link_child(*child, *grandchild) };
             }
         }
         // SAFETY: DERIVATION_LOCK held.
@@ -780,6 +782,7 @@ mod tests
         let collected = objects.len();
         DERIVATION_LOCK.write_unlock();
 
+        assert!(linked, "setup links must land");
         assert_eq!(status, BatchStatus::Cleared);
         assert_eq!(
             collected,
@@ -852,14 +855,10 @@ mod tests
         let mut cur = unsafe { resolve_slot_mut(root) }.and_then(|s| s.deriv_first_child);
         let mut all_resolved = true;
         // Bounded: a cyclic list must end the walk, not the suite.
+        let expected_survivors = BUDGET_CHAIN - first_freed;
         let mut walk_bounded = true;
         while let Some(node) = cur
         {
-            if survivors > BUDGET_CHAIN
-            {
-                walk_bounded = false;
-                break;
-            }
             // SAFETY: DERIVATION_LOCK held.
             let Some(slot) = (unsafe { resolve_slot_mut(node) })
             else
@@ -869,16 +868,21 @@ mod tests
             };
             all_hoisted &= slot.deriv_parent == Some(root);
             survivors += 1;
+            if survivors > expected_survivors
+            {
+                walk_bounded = false;
+                break;
+            }
             cur = slot.deriv_next_sibling;
         }
         DERIVATION_LOCK.write_unlock();
 
         assert!(linked, "setup chain must land");
-        assert_eq!(first_status, BatchStatus::MoreWork);
         assert!(walk_bounded, "root's child list must not cycle");
+        assert_eq!(first_status, BatchStatus::MoreWork);
         assert!(all_resolved, "every survivor must resolve");
         assert!(all_hoisted, "every survivor hoisted under root");
-        assert_eq!(survivors, BUDGET_CHAIN - first_freed);
+        assert_eq!(survivors, expected_survivors);
         crate::cap::unregister_cspace(ID);
     }
 
@@ -893,8 +897,9 @@ mod tests
         let live_child = occupy(cs_a, ID_A);
         let dead_child = occupy(cs_b, ID_B);
         DERIVATION_LOCK.write_lock();
+        let mut linked = true;
         // SAFETY: DERIVATION_LOCK held; both slots live.
-        let _ = unsafe { link_child(root, live_child) };
+        linked &= unsafe { link_child(root, live_child) };
         // The child's CSpace vanishes before the (stale) link attempt.
         crate::cap::unregister_cspace(ID_B);
         // SAFETY: DERIVATION_LOCK held; the dead end must be tolerated.
@@ -905,6 +910,7 @@ mod tests
         let live_prev = unsafe { resolve_slot_mut(live_child) }.map(|s| s.deriv_prev_sibling);
         DERIVATION_LOCK.write_unlock();
 
+        assert!(linked, "setup links must land");
         assert!(!dead_linked, "a dead child must not link");
         assert_eq!(
             root_first,
@@ -930,8 +936,9 @@ mod tests
         let next = occupy(cs, ID);
         let orphan = occupy(cs, ID);
         DERIVATION_LOCK.write_lock();
+        let mut linked = true;
         // SAFETY: DERIVATION_LOCK held; both slots live.
-        let _ = unsafe { link_child(parent, real_first) };
+        linked &= unsafe { link_child(parent, real_first) };
         // Give both siblings a link of their own, so an ungated write of
         // `None` into them would be observable.
         // SAFETY: DERIVATION_LOCK held.
@@ -999,6 +1006,7 @@ mod tests
         let prev_next = unsafe { resolve_slot_mut(prev) }.map(|s| s.deriv_next_sibling);
         DERIVATION_LOCK.write_unlock();
 
+        assert!(linked, "setup links must land");
         assert!(wrote, "every hand-written slot must resolve");
         assert_eq!(
             parent_first,
@@ -1032,12 +1040,13 @@ mod tests
         let mid = occupy(cs, ID);
         let children = occupy_many(cs, ID, 3);
         DERIVATION_LOCK.write_lock();
+        let mut linked = true;
         // SAFETY: DERIVATION_LOCK held; all slots live.
-        let _ = unsafe { link_child(root, mid) };
+        linked &= unsafe { link_child(root, mid) };
         for child in &children
         {
             // SAFETY: as above.
-            let _ = unsafe { link_child(mid, *child) };
+            linked &= unsafe { link_child(mid, *child) };
         }
         // SAFETY: DERIVATION_LOCK held.
         let first = unsafe { reparent_children(mid, Some(root), 2) };
@@ -1052,34 +1061,35 @@ mod tests
             parents_ok &=
                 unsafe { resolve_slot_mut(*child) }.is_some_and(|s| s.deriv_parent == Some(root));
         }
-        let mut root_list = 0;
         // Bounded: a cyclic list must end the walk, not the suite. The
-        // longest legitimate list is `mid` plus its children; the check runs
-        // before the increment, so exactly that many entries pass.
+        // longest legitimate list is `mid` plus its children.
+        let expected_list = children.len() + 1;
+        let mut root_list = 0;
         let mut walk_bounded = true;
         // SAFETY: DERIVATION_LOCK held.
         let mut cur = unsafe { resolve_slot_mut(root) }.and_then(|s| s.deriv_first_child);
         while let Some(node) = cur
         {
-            if root_list > children.len()
+            root_list += 1;
+            if root_list > expected_list
             {
                 walk_bounded = false;
                 break;
             }
-            root_list += 1;
             // SAFETY: DERIVATION_LOCK held.
             cur = unsafe { resolve_slot_mut(node) }.and_then(|s| s.deriv_next_sibling);
         }
         DERIVATION_LOCK.write_unlock();
 
+        assert!(linked, "setup links must land");
         assert!(walk_bounded, "root's child list must not cycle");
         assert!(!first, "a two-edit budget must leave a third child");
         assert!(second, "the second batch must finish the list");
         assert_eq!(mid_children, None, "mid has no children left");
         assert!(parents_ok, "every child now hangs under root");
         assert_eq!(
-            root_list, 4,
-            "root lists mid plus its three former grandchildren"
+            root_list, expected_list,
+            "root lists mid plus its former grandchildren"
         );
         assert_eq!(count_populated(cs), 5, "reparenting frees nothing");
         crate::cap::unregister_cspace(ID);
@@ -1164,8 +1174,9 @@ mod tests
         let root = occupy(cs, ID);
         let child = occupy(cs, ID);
         DERIVATION_LOCK.write_lock();
+        let mut linked = true;
         // SAFETY: DERIVATION_LOCK held; both slots live.
-        let _ = unsafe { link_child(root, child) };
+        linked &= unsafe { link_child(root, child) };
         // Simulate the corruption the free-path invariant forbids: the
         // child is freed without being unlinked first.
         // SAFETY: single-threaded test ownership.
@@ -1177,6 +1188,7 @@ mod tests
         let root_child = unsafe { resolve_slot_mut(root) }.and_then(|s| s.deriv_first_child);
         DERIVATION_LOCK.write_unlock();
 
+        assert!(linked, "setup links must land");
         assert_eq!(status, BatchStatus::DeadLink);
         assert_eq!(
             collected, 0,
@@ -1197,8 +1209,9 @@ mod tests
         let root = occupy(cs_a, ID_A);
         let foreign_child = occupy(cs_b, ID_B);
         DERIVATION_LOCK.write_lock();
+        let mut linked = true;
         // SAFETY: DERIVATION_LOCK held; both slots live.
-        let _ = unsafe { link_child(root, foreign_child) };
+        linked &= unsafe { link_child(root, foreign_child) };
 
         // Simulate the corruption the drain invariant forbids: the child's
         // CSpace vanishes without its foreign back-links being spliced.
@@ -1212,6 +1225,7 @@ mod tests
         let root_state = unsafe { resolve_slot_mut(root) }.map(|s| s.deriv_first_child);
         DERIVATION_LOCK.write_unlock();
 
+        assert!(linked, "setup links must land");
         assert_eq!(status, BatchStatus::DeadLink);
         assert_eq!(collected, 0, "nothing collectable behind a dead link");
         // Containment: the dangling chain is cut so a retry cannot spin.

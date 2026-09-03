@@ -543,7 +543,8 @@ pub unsafe fn revoke_subtree_batch(
 /// revoke walk reports [`BatchStatus::DeadLink`] and its syscall surfaces
 /// an error instead of claiming a clean revoke; the reparent walk has no
 /// status to report and completes with the chain abandoned, and its
-/// callers (`SYS_CAP_DELETE`, the range splits) then free `owner`.
+/// callers then free `owner` — `SYS_CAP_DELETE` and the range splits the
+/// slot, the teardown drain the whole owning `CSpace`.
 ///
 /// An abandoned node keeps its `deriv_parent` (naming `owner`) and sibling
 /// links, so it is outside every ancestor's revoke reach from here on, and
@@ -859,6 +860,73 @@ mod tests
             "former head's prev link must be untouched"
         );
         crate::cap::unregister_cspace(ID_A);
+    }
+
+    #[test]
+    fn unlink_node_leaves_non_backpointing_neighbours_untouched()
+    {
+        const ID: crate::cap::slot::CSpaceId = 3111;
+        let cs = mk_registered_cspace(ID);
+        let parent = occupy(cs, ID);
+        let real_first = occupy(cs, ID);
+        let prev = occupy(cs, ID);
+        let next = occupy(cs, ID);
+        let orphan = occupy(cs, ID);
+        DERIVATION_LOCK.write_lock();
+        // SAFETY: DERIVATION_LOCK held; both slots live.
+        assert!(unsafe { link_child(parent, real_first) });
+
+        // The orphan's links name neighbours that do not point back at it —
+        // the shape a node abandoned behind a dead link takes once its
+        // recorded parent's index has been recycled.
+        // SAFETY: DERIVATION_LOCK held; the orphan is live.
+        let orphan_slot = unsafe { resolve_slot_mut(orphan) }.expect("orphan resolves");
+        orphan_slot.deriv_parent = Some(parent);
+        orphan_slot.deriv_prev_sibling = None;
+        orphan_slot.deriv_next_sibling = Some(next);
+        // SAFETY: DERIVATION_LOCK held.
+        unsafe { unlink_node(orphan) };
+        // SAFETY: DERIVATION_LOCK held.
+        let parent_first = unsafe { resolve_slot_mut(parent) }.and_then(|s| s.deriv_first_child);
+        // SAFETY: DERIVATION_LOCK held.
+        let next_prev = unsafe { resolve_slot_mut(next) }.map(|s| s.deriv_prev_sibling);
+        // SAFETY: DERIVATION_LOCK held.
+        let orphan_links = unsafe { resolve_slot_mut(orphan) }
+            .map(|s| (s.deriv_parent, s.deriv_prev_sibling, s.deriv_next_sibling));
+
+        // Sibling variant: prev names a predecessor that does not point back.
+        // SAFETY: DERIVATION_LOCK held; the orphan is live.
+        let orphan_slot = unsafe { resolve_slot_mut(orphan) }.expect("orphan resolves");
+        orphan_slot.deriv_parent = Some(parent);
+        orphan_slot.deriv_prev_sibling = Some(prev);
+        orphan_slot.deriv_next_sibling = None;
+        // SAFETY: DERIVATION_LOCK held.
+        unsafe { unlink_node(orphan) };
+        // SAFETY: DERIVATION_LOCK held.
+        let prev_next = unsafe { resolve_slot_mut(prev) }.map(|s| s.deriv_next_sibling);
+        DERIVATION_LOCK.write_unlock();
+
+        assert_eq!(
+            parent_first,
+            Some(real_first),
+            "a parent whose first child is not the node must be untouched"
+        );
+        assert_eq!(
+            next_prev,
+            Some(None),
+            "a next sibling that does not point back must be untouched"
+        );
+        assert_eq!(
+            orphan_links,
+            Some((None, None, None)),
+            "the node itself leaves the tree"
+        );
+        assert_eq!(
+            prev_next,
+            Some(None),
+            "a prev sibling that does not point back must be untouched"
+        );
+        crate::cap::unregister_cspace(ID);
     }
 
     #[test]

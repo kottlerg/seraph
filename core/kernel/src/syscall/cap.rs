@@ -71,15 +71,19 @@ unsafe fn resolve_src_cap(
     ))
 }
 
-/// Revalidate `handle`'s slot under `DERIVATION_LOCK` before a cap is
-/// inserted and linked relative to it (a copy, a derive, or a memory-split
-/// tail): same tag-bearing occupancy, same generation, same `object`, no
-/// revoke in flight. The unlocked resolution that produced `object` may have
-/// raced a delete, move, or revoke batch that freed the slot; `link_child`
-/// drops a link under a freed parent, and the new cap would then be a
-/// derivation root outside every ancestor's revoke reach. Every
-/// occupied→free transition holds the lock, so a slot that matches here
-/// stays the link's parent for the rest of the hold.
+/// Revalidate `handle`'s slot under `DERIVATION_LOCK` before its object is
+/// touched or the tree is edited around it — the source of a copy or
+/// derive, the parent of a memory split, both caps of a memory merge: same
+/// tag-bearing occupancy, same generation, same `object`, no revoke in
+/// flight. The unlocked resolution that produced `object` may have raced a
+/// delete, move, or revoke batch that freed the slot (and possibly the
+/// object): `link_child` drops a link under a freed parent, so a copy or
+/// derive would publish a derivation root outside every ancestor's revoke
+/// reach; the memory syscalls would dereference a freed wrapper, and the
+/// merge would free a recycled tail index holding an unrelated live cap.
+/// Every occupied→free transition holds the lock, so a slot that matches
+/// here stays live — and stays the link's parent — for the rest of the
+/// hold.
 ///
 /// # Errors
 ///

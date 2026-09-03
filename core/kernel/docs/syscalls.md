@@ -913,10 +913,10 @@ one with a `SYS_CAP_REVOKE` in flight with `InvalidState`.
 
 **Errors:** `InvalidArgument` (`split_offset` not page-aligned, zero, `>= size`,
 leaving fewer than one page on the upper side, below the bump boundary, or the
-parent has derivation children),
-`InvalidCapability`, `InvalidState` (per above), `InsufficientRights` (cap lacks
-Map), `OutOfMemory` (tail wrapper allocation or slot-page pool exhausted),
-`QuotaExceeded` (caller's CSpace directory structurally full).
+parent has derivation children), `InvalidCapability`, `InvalidState` (per
+above), `InsufficientRights` (cap lacks Map), `OutOfMemory` (tail wrapper
+allocation or slot-page pool exhausted), `QuotaExceeded` (caller's CSpace
+directory structurally full).
 
 ---
 

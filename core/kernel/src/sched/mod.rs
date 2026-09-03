@@ -2023,9 +2023,9 @@ pub unsafe fn set_state_under_all_locks(
 /// exit and fault paths, and the object-teardown walk (`EXIT_KILLED`). A
 /// refused commit (the thread is already `Exited`) writes neither, so the
 /// reason recorded by the commit that won survives; an exit path whose
-/// commit lost still posts its own reason (the kernel never posts
-/// `EXIT_KILLED`), so a thread killed mid-exit shows `EXIT_KILLED` only in
-/// the retained value.
+/// commit lost still posts its own reason (no death walk posts
+/// `EXIT_KILLED`; a bind after the stop delivers it), so a thread killed
+/// mid-exit carries `EXIT_KILLED` only as its retained reason.
 ///
 /// # Safety
 /// As for [`set_state_under_all_locks`].
@@ -2102,6 +2102,9 @@ unsafe fn commit_state_under_all_locks(
             thread::ThreadState::Stopped | thread::ThreadState::Exited
         )
         {
+            // needless_range_loop: `cpu` indexes the per-CPU scheduler slab
+            // through `scheduler_for`, not a slice — there is no iterator to
+            // prefer.
             #[allow(clippy::needless_range_loop)]
             for cpu in 0..cpu_count
             {

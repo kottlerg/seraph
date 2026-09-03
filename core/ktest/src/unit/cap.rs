@@ -16,7 +16,8 @@
 use syscall::{
     cap_copy, cap_create_aspace, cap_create_cspace, cap_create_endpoint, cap_create_notification,
     cap_delete, cap_derive, cap_derive_badge, cap_info, cap_insert, cap_move, cap_revoke,
-    event_queue_create, notification_send, notification_wait,
+    event_queue_create, event_try_recv, notification_send, notification_wait,
+    thread_bind_notification,
 };
 use syscall_abi::SyscallError;
 
@@ -815,12 +816,50 @@ pub fn cspace_teardown_multibatch(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
+/// Correlators for the death observers in `cspace_delete_stops_bound_thread`.
+const STOP_CORR_EARLY: u32 = 0x5701;
+const STOP_CORR_LATE: u32 = 0x5702;
+
+/// Death-event side of a teardown stop: the observer bound before the stop
+/// (`early`) received nothing, and a fresh observer bound now receives the
+/// retained `EXIT_KILLED` exactly once. Consumes `early`.
+fn check_stop_observers(ctx: &TestContext, thread: u32, early: u32) -> TestResult
+{
+    let late = event_queue_create(ctx.memory_base, 4)
+        .map_err(|_| "stop_bound: event_queue_create (late) failed")?;
+    thread_bind_notification(thread, late, STOP_CORR_LATE)
+        .map_err(|_| "stop_bound: thread_bind_notification (late) failed")?;
+    let expected = (u64::from(STOP_CORR_LATE) << 32) | syscall_abi::EXIT_KILLED;
+    let result = if event_try_recv(late) != Ok(expected)
+    {
+        Err("stop_bound: late-bound observer did not receive EXIT_KILLED")
+    }
+    else if event_try_recv(late) != Err(SyscallError::WouldBlock as i64)
+    {
+        Err("stop_bound: late-bound observer received more than one event")
+    }
+    else if event_try_recv(early) != Err(SyscallError::WouldBlock as i64)
+    {
+        Err("stop_bound: teardown posted a death event to the early observer")
+    }
+    else
+    {
+        Ok(())
+    };
+    cap_delete(late).ok();
+    cap_delete(early).ok();
+    result
+}
+
 /// Deleting the last capability to a `CSpace` stops every thread bound to
 /// it before the slot pages are reclaimed: a child blocked in
 /// `notification_wait` and a child spinning on `thread_yield` both report
 /// `Exited` afterwards, their objects reclaim through the thread cap alone,
 /// and the parent's Memory cap returns to baseline. Deleting the `CSpace`
 /// before the thread is exactly the order the spawn helper used to forbid.
+/// A death observer bound before the stop receives nothing from the
+/// teardown; one bound afterwards receives `EXIT_KILLED` through the bind,
+/// once.
 pub fn cspace_delete_stops_bound_thread(ctx: &TestContext) -> TestResult
 {
     let baseline = cap_info(ctx.memory_base, syscall_abi::CAP_INFO_MEMORY_AVAILABLE)
@@ -842,6 +881,12 @@ pub fn cspace_delete_stops_bound_thread(ctx: &TestContext) -> TestResult
         .map_err(|_| "stop_bound: configure_and_start (blocked) failed")?;
     notification_wait(ready).map_err(|_| "stop_bound: wait ready failed")?;
 
+    // Observer bound before the stop: the teardown walk posts nothing to it.
+    let early = event_queue_create(ctx.memory_base, 4)
+        .map_err(|_| "stop_bound: event_queue_create (early) failed")?;
+    thread_bind_notification(child.th, early, STOP_CORR_EARLY)
+        .map_err(|_| "stop_bound: thread_bind_notification (early) failed")?;
+
     cap_delete(child.cs)
         .map_err(|_| "stop_bound: cap_delete(cspace) under blocked child failed")?;
     let state = cap_info(child.th, syscall_abi::CAP_INFO_THREAD_STATE)
@@ -856,6 +901,9 @@ pub fn cspace_delete_stops_bound_thread(ctx: &TestContext) -> TestResult
         cap_delete(child.th).ok();
         return Err("stop_bound: blocked child's exit reason is not EXIT_KILLED");
     }
+    check_stop_observers(ctx, child.th, early).inspect_err(|_| {
+        cap_delete(child.th).ok();
+    })?;
     cap_delete(child.th).map_err(|_| "stop_bound: cap_delete(thread, blocked) failed")?;
 
     // Spinning child: yields forever; on a multi-CPU guest it may be running

@@ -331,10 +331,12 @@ unsafe fn insert_and_link_children(
         // SAFETY: DERIVATION_LOCK held; parent_id is the revalidated
         // original's parent and both child slots are occupied by the
         // inserts above.
-        unsafe {
-            link_child(parent_id, SlotId::current(cspace_id, child1.slot));
-            link_child(parent_id, SlotId::current(cspace_id, child2.slot));
-        }
+        let linked = unsafe {
+            let first = link_child(parent_id, SlotId::current(cspace_id, child1.slot));
+            let second = link_child(parent_id, SlotId::current(cspace_id, child2.slot));
+            first && second
+        };
+        debug_assert!(linked, "split child link dropped under DERIVATION_LOCK");
     }
     Ok((child1, child2))
 }

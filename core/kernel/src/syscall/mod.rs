@@ -207,7 +207,7 @@ fn sys_exit(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
         // schedule() below sees the Exited skip-bit. The reason (0 = clean
         // exit) is written in the same hold. A refusal means a teardown
         // already committed `EXIT_KILLED`; this path still posts its own
-        // reason below — the kernel never posts `EXIT_KILLED` (see the ABI
+        // reason below — no death walk posts `EXIT_KILLED` (see the ABI
         // constant) — so only the retained value says killed.
         // SAFETY: tcb validated non-null.
         let _ = unsafe { crate::sched::exit_under_all_locks(tcb, 0) };
@@ -264,7 +264,7 @@ fn sys_process_exit(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         // Commit Exited under all-CPU scheduler.locks (see sys_exit); the
         // reason is written in the same hold. A refusal means a teardown
         // already committed `EXIT_KILLED`; the post below still carries
-        // this path's own reason (the kernel never posts `EXIT_KILLED`).
+        // this path's own reason (no death walk posts `EXIT_KILLED`).
         // SAFETY: tcb validated non-null.
         let _ = unsafe { crate::sched::exit_under_all_locks(tcb, reason) };
 

@@ -165,23 +165,27 @@ unsafe fn resolve_slot_mut(id: SlotId) -> Option<&'static mut super::slot::Capab
 /// Updates `child.deriv_parent` and the prev/next sibling chain.
 ///
 /// The link is all-or-nothing: if either end fails to resolve (gone, or
-/// freed — a stale id from an unlocked source resolution that raced a
-/// delete; see the occupancy gate in `resolve_slot_mut`), neither slot is
-/// mutated. A one-sided write in either direction would leave a live slot
-/// holding a dangling `SlotId` that a later recycle of the index could
-/// alias onto an unrelated live slot.
+/// freed; see the occupancy gate in `resolve_slot_mut`), neither slot is
+/// mutated and `false` is returned. A one-sided write in either direction
+/// would leave a live slot holding a dangling `SlotId` that a later recycle
+/// of the index could alias onto an unrelated live slot. Callers that
+/// revalidated the parent and inserted the child under the same lock hold
+/// assert on the result in debug builds — for them a dropped link is an
+/// invariant violation; the reparent walk alone tolerates a dead new parent
+/// (see `truncate_dead_link`).
 ///
 /// # Safety
 ///
 /// Caller must hold `DERIVATION_LOCK` write lock.
-pub unsafe fn link_child(parent: SlotId, child: SlotId)
+#[must_use]
+pub unsafe fn link_child(parent: SlotId, child: SlotId) -> bool
 {
     // Probe the child before touching the parent: the lock is held for the
     // whole call, so a child that resolves here still resolves below.
     // SAFETY: DERIVATION_LOCK held; ensures exclusive access to derivation tree.
     if unsafe { resolve_slot_mut(child) }.is_none()
     {
-        return;
+        return false;
     }
 
     // SAFETY: DERIVATION_LOCK held; ensures exclusive access to derivation tree.
@@ -193,7 +197,7 @@ pub unsafe fn link_child(parent: SlotId, child: SlotId)
     }
     else
     {
-        return;
+        return false;
     };
 
     // SAFETY: DERIVATION_LOCK held; the child resolved above and nothing
@@ -214,6 +218,7 @@ pub unsafe fn link_child(parent: SlotId, child: SlotId)
             old_first_slot.deriv_prev_sibling = Some(child);
         }
     }
+    true
 }
 
 /// Remove `node` from the derivation tree without affecting its children.
@@ -351,8 +356,10 @@ pub unsafe fn reparent_children(node: SlotId, new_parent: Option<SlotId>, max_ed
         }
         if let Some(np) = new_parent
         {
-            // SAFETY: DERIVATION_LOCK held; head is a clean root.
-            unsafe { link_child(np, head) };
+            // SAFETY: DERIVATION_LOCK held; head is a clean root. A new
+            // parent that no longer resolves is a dead link (see
+            // `truncate_dead_link`); head then stays a clean root.
+            let _ = unsafe { link_child(np, head) };
         }
         edits += 1;
     }
@@ -491,7 +498,8 @@ pub unsafe fn revoke_subtree_batch(
             // SAFETY: DERIVATION_LOCK held; g and root are live.
             unsafe {
                 unlink_node(g);
-                link_child(root, g);
+                let linked = link_child(root, g);
+                debug_assert!(linked, "revoke hoist link dropped under DERIVATION_LOCK");
             }
         }
         else
@@ -669,7 +677,7 @@ mod tests
         for &child in nodes
         {
             // SAFETY: DERIVATION_LOCK held by caller; both slots live.
-            unsafe { link_child(parent, child) };
+            assert!(unsafe { link_child(parent, child) });
             parent = child;
         }
     }
@@ -699,11 +707,11 @@ mod tests
         for (c, child) in children.iter().enumerate()
         {
             // SAFETY: DERIVATION_LOCK held; both slots live.
-            unsafe { link_child(root, *child) };
+            assert!(unsafe { link_child(root, *child) });
             for grandchild in &grandchildren[c * 4..(c + 1) * 4]
             {
                 // SAFETY: as above.
-                unsafe { link_child(*child, *grandchild) };
+                assert!(unsafe { link_child(*child, *grandchild) });
             }
         }
         // SAFETY: DERIVATION_LOCK held.
@@ -809,11 +817,11 @@ mod tests
         let dead_child = occupy(cs_b, ID_B);
         DERIVATION_LOCK.write_lock();
         // SAFETY: DERIVATION_LOCK held; both slots live.
-        unsafe { link_child(root, live_child) };
+        assert!(unsafe { link_child(root, live_child) });
         // The child's CSpace vanishes before the (stale) link attempt.
         crate::cap::unregister_cspace(ID_B);
         // SAFETY: DERIVATION_LOCK held; the dead end must be tolerated.
-        unsafe { link_child(root, dead_child) };
+        assert!(!unsafe { link_child(root, dead_child) });
         // SAFETY: DERIVATION_LOCK held.
         let root_first = unsafe { resolve_slot_mut(root) }.and_then(|s| s.deriv_first_child);
         // SAFETY: DERIVATION_LOCK held.
@@ -843,11 +851,11 @@ mod tests
         let children = occupy_many(cs, ID, 3);
         DERIVATION_LOCK.write_lock();
         // SAFETY: DERIVATION_LOCK held; all slots live.
-        unsafe { link_child(root, mid) };
+        assert!(unsafe { link_child(root, mid) });
         for child in &children
         {
             // SAFETY: as above.
-            unsafe { link_child(mid, *child) };
+            assert!(unsafe { link_child(mid, *child) });
         }
         // SAFETY: DERIVATION_LOCK held.
         let first = unsafe { reparent_children(mid, Some(root), 2) };
@@ -897,11 +905,11 @@ mod tests
         let children = occupy_many(cs_a, ID_A, 2);
         DERIVATION_LOCK.write_lock();
         // SAFETY: DERIVATION_LOCK held; all slots live.
-        unsafe { link_child(parent, mid) };
+        assert!(unsafe { link_child(parent, mid) });
         for child in &children
         {
             // SAFETY: as above.
-            unsafe { link_child(mid, *child) };
+            assert!(unsafe { link_child(mid, *child) });
         }
         // The grandparent's CSpace vanishes; mid's parent link is now dead.
         crate::cap::unregister_cspace(ID_B);
@@ -941,7 +949,7 @@ mod tests
         let foreign_child = occupy(cs_b, ID_B);
         DERIVATION_LOCK.write_lock();
         // SAFETY: DERIVATION_LOCK held; both slots live.
-        unsafe { link_child(mid, foreign_child) };
+        assert!(unsafe { link_child(mid, foreign_child) });
         crate::cap::unregister_cspace(ID_B);
         // SAFETY: DERIVATION_LOCK held.
         let done = unsafe { reparent_children(mid, None, MAX_REPARENT_EDITS) };
@@ -963,7 +971,7 @@ mod tests
         let child = occupy(cs, ID);
         DERIVATION_LOCK.write_lock();
         // SAFETY: DERIVATION_LOCK held; both slots live.
-        unsafe { link_child(root, child) };
+        assert!(unsafe { link_child(root, child) });
         // Simulate the corruption the free-path invariant forbids: the
         // child is freed without being unlinked first.
         // SAFETY: single-threaded test ownership.
@@ -996,7 +1004,7 @@ mod tests
         let foreign_child = occupy(cs_b, ID_B);
         DERIVATION_LOCK.write_lock();
         // SAFETY: DERIVATION_LOCK held; both slots live.
-        unsafe { link_child(root, foreign_child) };
+        assert!(unsafe { link_child(root, foreign_child) });
 
         // Simulate the corruption the drain invariant forbids: the child's
         // CSpace vanishes without its foreign back-links being spliced.

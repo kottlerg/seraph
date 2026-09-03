@@ -584,7 +584,7 @@ extern "C" fn trap_dispatch(frame: &mut TrapFrame)
                 // 0x1000, matching syscall_abi::EXIT_FAULT_BASE) is written in
                 // the same hold. A refusal means a teardown already committed
                 // `EXIT_KILLED`; the posts below still carry the fault class
-                // (the kernel never posts `EXIT_KILLED`).
+                // (no death walk posts `EXIT_KILLED`).
                 // SAFETY: tcb validated non-null.
                 let _ = unsafe { crate::sched::exit_under_all_locks(tcb, 0x1000 + cause_code) };
 

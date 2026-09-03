@@ -551,10 +551,6 @@ pub fn sys_memory_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
     let parent_slot = unsafe { super::lookup_cap(caller_cspace, memory_handle, MemRights::MAP) }?;
     let parent_obj_nn = parent_slot.object.ok_or(SyscallError::InvalidCapability)?;
-    // cast_ptr_alignment: MemoryObject (8-byte) behind KernelObjectHeader header.
-    // SAFETY: tag confirmed Memory; pointer is valid MemoryObject.
-    #[allow(clippy::cast_ptr_alignment)]
-    let parent_ref = unsafe { &*(parent_obj_nn.as_ptr().cast::<MemoryObject>()) };
     let parent_rights = parent_slot.rights;
     let parent_retypable = parent_rights.contains(MemRights::RETYPE.erase());
     // SAFETY: caller_cspace validated non-null; id() reads discriminator.
@@ -566,6 +562,22 @@ pub fn sys_memory_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // ── Acquire locks (DERIVATION outer, frame-write inner) ──────────────────
     DERIVATION_LOCK.write_lock();
+    // The parent was resolved unlocked: pin it under the lock before its
+    // object is touched (a concurrent delete of its last cap would have freed
+    // the object) and before the tail is linked beside it.
+    // SAFETY: caller_cspace validated non-null; DERIVATION_LOCK held.
+    if let Err(e) = unsafe {
+        super::cap::revalidate_src_under_lock(caller_cspace, memory_handle, parent_obj_nn)
+    }
+    {
+        DERIVATION_LOCK.write_unlock();
+        return Err(e);
+    }
+    // cast_ptr_alignment: MemoryObject (8-byte) behind KernelObjectHeader header.
+    // SAFETY: tag confirmed Memory; the slot is pinned under DERIVATION_LOCK,
+    // so the object is live for the rest of the hold.
+    #[allow(clippy::cast_ptr_alignment)]
+    let parent_ref = unsafe { &*(parent_obj_nn.as_ptr().cast::<MemoryObject>()) };
     parent_ref.write_lock();
 
     // Snapshot parent state under the write lock. From here until unlock,
@@ -677,8 +689,10 @@ pub fn sys_memory_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     };
     if let Some(grandparent) = parent_deriv_parent
     {
-        // SAFETY: DERIVATION_LOCK held; ids valid.
-        unsafe { link_child(grandparent, tail_id) };
+        // SAFETY: DERIVATION_LOCK held; the grandparent link was read from
+        // the pinned parent and the tail was inserted under this hold.
+        let linked = unsafe { link_child(grandparent, tail_id) };
+        debug_assert!(linked, "split tail link dropped under DERIVATION_LOCK");
     }
     // If the parent was a derivation root, the tail is also a root: no
     // parent edge needed.

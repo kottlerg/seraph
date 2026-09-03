@@ -637,8 +637,17 @@ The derived capability references the same kernel object. The effective rights a
 silently masked off rather than rejected, so derivation can only attenuate. The
 derivation is recorded in the global derivation tree for revocation tracking.
 
-**Errors:** `InvalidCapability` (source invalid or null), `OutOfMemory` (slot-page pool
-exhausted), `QuotaExceeded` (caller's CSpace directory structurally full).
+The source is revalidated under the derivation lock before the new slot is
+linked beneath it (see [capability-internals.md](capability-internals.md)
+§ Global Derivation Lock): a source a concurrent delete, move, or revoke freed
+meanwhile fails with `InvalidCapability`, and one with a `SYS_CAP_REVOKE` in
+flight with `InvalidState`, rather than leaving the new capability an unlinked
+derivation root.
+
+**Errors:** `InvalidCapability` (source invalid, null, or freed meanwhile),
+`InvalidState` (a `SYS_CAP_REVOKE` is in flight on the source), `OutOfMemory`
+(slot-page pool exhausted), `QuotaExceeded` (caller's CSpace directory
+structurally full).
 
 If the source capability has a non-zero badge, the derived capability inherits it.
 
@@ -668,11 +677,13 @@ mechanism; userspace can use it for bookkeeping.
 
 The source capability must have `badge == 0`. Re-badging (setting a new badge
 on an already-badged cap) returns `InvalidArgument`. Derivation via
-`SYS_CAP_DERIVE` inherits the source's badge.
+`SYS_CAP_DERIVE` inherits the source's badge. Source revalidation under the
+derivation lock: as for `SYS_CAP_DERIVE`.
 
 **Errors:** `InvalidArgument` (badge is zero or source already badged),
-`InvalidCapability`, `OutOfMemory` (slot-page pool exhausted), `QuotaExceeded`
-(caller's CSpace directory structurally full).
+`InvalidCapability` (source invalid, null, or freed meanwhile), `InvalidState` (a
+`SYS_CAP_REVOKE` is in flight on the source), `OutOfMemory` (slot-page pool
+exhausted), `QuotaExceeded` (caller's CSpace directory structurally full).
 
 ---
 
@@ -690,9 +701,10 @@ Revoke all capabilities derived from a capability, across all processes.
 
 Every descendant in the derivation tree is invalidated; the target capability
 itself is preserved. Underlying kernel objects are not freed unless a revoked
-capability was the last reference. While the revoke is in flight, `SYS_CAP_DELETE`
-and `SYS_CAP_MOVE` on the target slot (and IPC transfer of it) are refused with
-`InvalidState`.
+capability was the last reference. While the revoke is in flight, `SYS_CAP_DELETE`,
+`SYS_CAP_MOVE`, `SYS_CAP_COPY`, `SYS_CAP_DERIVE`, `SYS_CAP_DERIVE_BADGE`,
+`SYS_MEMORY_SPLIT`, and the range splits on the target slot (and IPC transfer of
+it) are refused with `InvalidState`.
 
 **Errors:** `InvalidCapability`; `InvalidState` (another revoke is already in
 flight on this slot, or a corrupted derivation link was found — the revoke is
@@ -869,34 +881,41 @@ requested), `InvalidCapability`, `InsufficientRights` (requested perms exceed
 
 ### `SYS_MEMORY_SPLIT` (33)
 
-Split a memory capability at a page boundary, producing two memory capabilities that
-together cover the same physical range as the original. The original capability is
-consumed.
+Carve a virgin tail off a Memory capability at a page boundary. The parent
+capability stays in its slot and shrinks; a new capability covering the tail is
+inserted in the caller's CSpace.
 
 **Arguments:**
 
 | # | Name | Description |
 |---|---|---|
-| 0 | `memory_cap` | Memory capability to split |
-| 1 | `offset_pages` | Page offset within the frame at which to split |
+| 0 | `memory_cap` | Memory capability to split (Map rights) |
+| 1 | `split_offset` | Byte offset of the split: page-aligned, `> 0`, `< size`, and at or above the next page boundary above the cap's highest live retype offset |
+| 2 | — | Reserved |
 
-**Return:**
+**Return:** `rax`/`a0`: capability descriptor for the tail
+(`[base + split_offset, base + size)`) on success; `SyscallError` on failure.
 
-- `rax`/`a0`: capability descriptor for the lower portion (pages 0..offset_pages)
-  on success; `SyscallError` on failure
-- `rdx`/`a1`: capability descriptor for the upper portion (pages offset_pages..end)
-  on success
+The parent's `size` shrinks to `split_offset`; when it carries `RETYPE`, its
+`available_bytes` debits by the carved length. The tail inherits the parent's
+rights and ownership flag and is linked as a derivation sibling of the parent
+(a child of the parent's derivation parent; a root when the parent is one).
+Live retypes against the parent always sit below its bump offset, so the tail
+is virgin. A parent that has derivation children cannot be split.
 
-The original `memory_cap` is consumed by this call. Both halves inherit the same
-rights as the original. The derivation tree treats both halves as children of the
-original's position.
+The parent is revalidated under the derivation lock before its object is
+touched and the tail is linked beside it (see
+[capability-internals.md](capability-internals.md) § Global Derivation Lock): a
+parent a concurrent delete freed meanwhile fails with `InvalidCapability`, and
+one with a `SYS_CAP_REVOKE` in flight with `InvalidState`.
 
-`offset_pages` MUST be in the range [1, frame_size_pages − 1].
+**Capability requirement:** `memory_cap` must have Map rights.
 
-**Errors:** `InvalidArgument` (offset out of range or frame is already a single page),
-`InvalidCapability`, `InsufficientRights` (cap lacks Map), `OutOfMemory` (child
-allocation or slot-page pool exhausted), `QuotaExceeded` (caller's CSpace directory
-structurally full).
+**Errors:** `InvalidArgument` (`split_offset` not page-aligned, zero, `>= size`,
+below the bump boundary, or the parent has derivation children),
+`InvalidCapability`, `InvalidState` (per above), `InsufficientRights` (cap lacks
+Map), `OutOfMemory` (tail wrapper allocation or slot-page pool exhausted),
+`QuotaExceeded` (caller's CSpace directory structurally full).
 
 ---
 
@@ -1675,9 +1694,18 @@ consumed stay spent.
 
 **Capability requirements:** `src_cap` (at least one right), `dst_cspace_cap` (Insert).
 
-**Errors:** `InvalidCapability`, `InsufficientRights` (dst CSpace lacks Insert),
-`InvalidArgument` (dst_slot occupied or out of range), `OutOfMemory` (slot-page pool
-exhausted), `QuotaExceeded` (dst CSpace directory structurally full).
+The source is revalidated under the derivation lock before the copy is linked
+beneath it (see [capability-internals.md](capability-internals.md) § Global
+Derivation Lock): a source a concurrent delete, move, or revoke freed meanwhile
+fails with `InvalidCapability`, and one with a `SYS_CAP_REVOKE` in flight with
+`InvalidState`. If every other reference to the destination CSpace goes while
+the call is backing the slot, the call reclaims that CSpace and fails with
+`InvalidCapability`; a caller bound to it is stopped and the call never returns.
+
+**Errors:** `InvalidCapability`, `InvalidState` (a `SYS_CAP_REVOKE` is in flight
+on the source), `InsufficientRights` (dst CSpace lacks Insert), `InvalidArgument`
+(dst_slot occupied or out of range), `OutOfMemory` (slot-page pool exhausted),
+`QuotaExceeded` (dst CSpace directory structurally full).
 
 ---
 
@@ -1700,6 +1728,10 @@ without consumption when the pool cannot cover it).
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
 
 **Capability requirements:** `src_cap` (any), `dst_cspace_cap` (Insert).
+
+If every other reference to the destination CSpace goes while the call is
+backing the slot, the call reclaims that CSpace and fails with
+`InvalidCapability`; a caller bound to it is stopped and the call never returns.
 
 **Errors:** `InvalidCapability`, `InsufficientRights` (dst CSpace lacks Insert),
 `InvalidArgument` (dst_slot occupied or out of range), `OutOfMemory` (slot-page pool

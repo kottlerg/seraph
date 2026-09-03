@@ -339,12 +339,25 @@ inherits the donor's position in the tree. The donor's slot becomes null.
 
 ### Global Derivation Lock
 
-A single global reader-writer lock protects derivation tree modifications. Multiple
-readers may hold it simultaneously for traversal (during `SYS_CAP_DERIVE`); writers
-hold it exclusively during revocation.
+A single global reader-writer lock protects the derivation tree. Every path that
+inserts, links, moves, or frees an occupied slot holds it for writing: copy,
+derive, the splits, move and IPC transfer, delete, revoke, and object teardown.
+Lock-free readers never traverse the tree; they resolve one slot by handle and
+rely on the tag and generation checks described above.
 
-This is a deliberate design choice: revocation is rare relative to capability use.
-The global lock avoids deadlock from ordering multiple per-CSpace locks.
+The source of a copy, derive, or memory-split tail is looked up unlocked, so each
+of those paths revalidates it under the write lock — same tag-bearing occupancy,
+same generation, same object, no revoke in flight — before the new slot is
+inserted and linked beneath it (beside it, for a split tail). Every occupied→free
+transition holds the lock, so a source that revalidates stays the link's parent
+for the rest of the hold. A source freed meanwhile fails the call with
+`InvalidCapability` (a revoke in flight on it, `InvalidState`); the alternative —
+`link_child` dropping the link under a freed parent — would leave the new
+capability a derivation root outside every ancestor's revoke reach.
+
+This is a deliberate design choice: a single lock avoids deadlock from ordering
+multiple per-CSpace locks, and derivation-tree edits are rare relative to
+capability use.
 
 ### Revocation Algorithm
 

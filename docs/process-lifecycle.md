@@ -366,7 +366,7 @@ a fault or kill reason — defined once in `syscall_abi`:
 | `0` (`EXIT_VOLUNTARY`) | Voluntary, clean | success — `sys_process_exit(0)`, `sys_thread_exit`, `ExitCode::SUCCESS` |
 | `1 ..= 0x0FFF` | Voluntary, code | `sys_process_exit(code)` via `encode_exit_code` (saturating); `std::process::exit(n)` / non-zero `ExitCode` |
 | `0x1000 ..= 0x1FFF` (`EXIT_FAULT_BASE + vector`) | Fault | unhandled CPU/VM fault; kernel-terminated |
-| `0x2000` (`EXIT_KILLED`) | Killed | recorded (never posted) by the kernel as the retained reason of a thread stopped by its `CSpace`/`AddressSpace` teardown; posted by userspace (`Child::kill`) |
+| `0x2000` (`EXIT_KILLED`) | Killed | recorded by the kernel as the retained reason of a thread stopped by its `CSpace`/`AddressSpace` teardown (that stop posts no death event; an observer bound afterwards receives the retained reason through the bind); posted by userspace (`Child::kill`) |
 
 `sys_process_exit` records the encoded reason as the calling thread's exit
 reason and posts it to that thread's death observers — a parent that bound the

@@ -71,6 +71,68 @@ unsafe fn resolve_src_cap(
     ))
 }
 
+/// Revalidate `handle`'s slot under `DERIVATION_LOCK` before a cap is
+/// inserted and linked relative to it (a copy, a derive, or a memory-split
+/// tail): same tag-bearing occupancy, same generation, same `object`, no
+/// revoke in flight. The unlocked resolution that produced `object` may have
+/// raced a delete, move, or revoke batch that freed the slot; `link_child`
+/// drops a link under a freed parent, and the new cap would then be a
+/// derivation root outside every ancestor's revoke reach. Every
+/// occupied→free transition holds the lock, so a slot that matches here
+/// stays the link's parent for the rest of the hold.
+///
+/// # Errors
+///
+/// `InvalidCapability` when the slot no longer holds the resolved cap;
+/// `InvalidState` when a revoke is in flight on it (transient — retry after
+/// the revoke completes).
+///
+/// # Safety
+///
+/// `cspace` must be a valid `CSpace` pointer; the caller must hold
+/// `DERIVATION_LOCK` (write).
+#[cfg(not(test))]
+pub(super) unsafe fn revalidate_src_under_lock(
+    cspace: *mut crate::cap::cspace::CSpace,
+    handle: u32,
+    object: core::ptr::NonNull<crate::cap::object::KernelObjectHeader>,
+) -> Result<(), SyscallError>
+{
+    // SAFETY: caller contract.
+    let slot = unsafe { (*cspace).slot(syscall::cap_handle_index(handle)) }
+        .ok_or(SyscallError::InvalidCapability)?;
+    if slot.tag == crate::cap::slot::CapTag::Null
+        || slot.generation() != syscall::cap_handle_gen(handle)
+        || slot.object != Some(object)
+    {
+        return Err(SyscallError::InvalidCapability);
+    }
+    if slot.revoke_in_progress()
+    {
+        return Err(SyscallError::InvalidState);
+    }
+    Ok(())
+}
+
+/// Give up the reference a copy or derive took on its source object when the
+/// new slot did not materialise; frees the object if that was the last
+/// reference (a sibling may have deleted the source meanwhile).
+///
+/// # Safety
+///
+/// The caller must hold one reference on `object` that it is giving up; no
+/// lock may be held (`dealloc_object` takes its own).
+#[cfg(not(test))]
+unsafe fn release_src_ref(object: core::ptr::NonNull<crate::cap::object::KernelObjectHeader>)
+{
+    // SAFETY: caller contract.
+    if unsafe { (*object.as_ptr()).dec_ref() } == 0
+    {
+        // SAFETY: refcount reached 0; no other references exist.
+        unsafe { crate::cap::object::dealloc_object(object) };
+    }
+}
+
 /// `SYS_CAP_CREATE_ENDPOINT` (7): retype a Memory cap into a new Endpoint.
 ///
 /// arg0 = Memory-cap slot index in the caller's `CSpace`. The Memory cap
@@ -867,17 +929,17 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // TrapFrame base. 512 bytes is sufficient for the minimal C frame.
     const TRAMPOLINE_FRAME_SIZE: u64 = 512;
 
-    #[allow(clippy::cast_possible_truncation)]
     // cast_possible_truncation: Seraph targets 64-bit only; cap slot indices fit in u32.
+    #[allow(clippy::cast_possible_truncation)]
     let memory_idx = tf.arg(0) as u32;
-    #[allow(clippy::cast_possible_truncation)]
     // cast_possible_truncation: Seraph targets 64-bit only; cap slot indices fit in u32.
+    #[allow(clippy::cast_possible_truncation)]
     let as_idx = tf.arg(1) as u32;
-    #[allow(clippy::cast_possible_truncation)]
     // cast_possible_truncation: Seraph targets 64-bit only; cap slot indices fit in u32.
+    #[allow(clippy::cast_possible_truncation)]
     let cs_idx = tf.arg(2) as u32;
-    #[allow(clippy::cast_possible_truncation)]
     // cast_possible_truncation: Seraph targets 64-bit only; cap slot indices fit in u32.
+    #[allow(clippy::cast_possible_truncation)]
     let sched_idx = tf.arg(3) as u32;
     // Kept as u64 until range-checked: an `as u8` here would wrap 256 to 0
     // and silently select the band floor.
@@ -1390,16 +1452,28 @@ pub fn sys_cap_copy(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         (*src_object.as_ptr()).inc_ref();
     }
 
-    // Insert and link under DERIVATION_LOCK (the destination's cspace.lock
-    // nested per the documented order): a cap reachable through the
-    // destination CSpace but not yet linked could be moved out by a
-    // sibling, and a move carries whatever derivation position it finds —
-    // the cap would leave the source's revoke reach for good. Every
-    // occupied→free transition holds the lock, so no move can interleave
-    // before the link. dest_slot_idx == 0 allocates a free slot; otherwise
-    // the cap is placed at the caller-chosen index. The badge write and the
+    // Revalidate the source, then insert and link, under one DERIVATION_LOCK
+    // hold (the destination's cspace.lock nested per the documented order).
+    // The source was resolved unlocked: a delete, move, or revoke batch may
+    // have freed its slot meanwhile, and a link under a freed parent is
+    // dropped — the new cap would be a derivation root outside every
+    // ancestor's revoke reach. A cap reachable through the destination
+    // CSpace but not yet linked could be moved out by a sibling, and a move
+    // carries whatever derivation position it finds — the cap would leave
+    // the source's revoke reach for good. Every occupied→free transition
+    // holds the lock, so neither can interleave once the source
+    // revalidates. dest_slot_idx == 0 allocates a free slot; otherwise the
+    // cap is placed at the caller-chosen index. The badge write and the
     // handle read share the insert's critical section.
     crate::cap::DERIVATION_LOCK.write_lock();
+    // SAFETY: caller_cspace validated non-null above; DERIVATION_LOCK held.
+    if let Err(e) = unsafe { revalidate_src_under_lock(caller_cspace, src_handle, src_object) }
+    {
+        crate::cap::DERIVATION_LOCK.write_unlock();
+        // SAFETY: the reference taken above is given up; no lock held.
+        unsafe { release_src_ref(src_object) };
+        return Err(e);
+    }
     // SAFETY: dest_cs_ptr validated above; lock_raw/unlock_raw paired.
     let insert_res = unsafe {
         let saved = (*dest_cs_ptr).lock.lock_raw();
@@ -1439,26 +1513,18 @@ pub fn sys_cap_copy(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         Err(e) =>
         {
             crate::cap::DERIVATION_LOCK.write_unlock();
-            // Roll back the inc_ref if insertion fails; a sibling may have
-            // deleted the source meanwhile, making this the last reference.
-            // SAFETY: src_object validated above; we just incremented refcount;
-            // no lock held for the dealloc.
-            unsafe {
-                if (*src_object.as_ptr()).dec_ref() == 0
-                {
-                    crate::cap::object::dealloc_object(src_object);
-                }
-            }
+            // SAFETY: the reference taken above is given up; no lock held.
+            unsafe { release_src_ref(src_object) };
             return Err(SyscallError::from(e));
         }
     };
     // Wire derivation tree: new slot is a child of the source slot.
     let parent = crate::cap::slot::SlotId::current(caller_cspace_id, src_idx_nz);
     let child = crate::cap::slot::SlotId::current(dest_cs_id, new_idx_nz);
-    // SAFETY: DERIVATION_LOCK held; parent/child are valid SlotIds just created.
-    unsafe {
-        crate::cap::derivation::link_child(parent, child);
-    }
+    // SAFETY: DERIVATION_LOCK held; the parent revalidated and the child was
+    // inserted under this hold, so both ends resolve.
+    let linked = unsafe { crate::cap::derivation::link_child(parent, child) };
+    debug_assert!(linked, "derivation link dropped under DERIVATION_LOCK");
     crate::cap::DERIVATION_LOCK.write_unlock();
     Ok(u64::from(new_handle))
 }
@@ -1511,15 +1577,27 @@ pub fn sys_cap_derive(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         (*src_object.as_ptr()).inc_ref();
     }
 
-    // Insert and link under DERIVATION_LOCK (cspace.lock nested per the
-    // documented order): a cap reachable through the CSpace but not yet
-    // linked could be moved out by a sibling, and a move carries whatever
-    // derivation position it finds — the cap would leave the source's revoke
-    // reach for good. Every occupied→free transition holds the lock, so no
-    // move can interleave before the link. The badge write and the handle
-    // read share the insert's critical section.
+    // Revalidate the source, then insert and link, under one DERIVATION_LOCK
+    // hold (cspace.lock nested per the documented order). The source was
+    // resolved unlocked: a delete, move, or revoke batch may have freed its
+    // slot meanwhile, and a link under a freed parent is dropped — the new
+    // cap would be a derivation root outside every ancestor's revoke reach.
+    // A cap reachable through the CSpace but not yet linked could be moved
+    // out by a sibling, and a move carries whatever derivation position it
+    // finds — the cap would leave the source's revoke reach for good. Every
+    // occupied→free transition holds the lock, so neither can interleave
+    // once the source revalidates. The badge write and the handle read share
+    // the insert's critical section.
     let src_idx_nz = core::num::NonZeroU32::new(src_idx).ok_or(SyscallError::InvalidCapability)?;
     crate::cap::DERIVATION_LOCK.write_lock();
+    // SAFETY: caller_cspace validated non-null above; DERIVATION_LOCK held.
+    if let Err(e) = unsafe { revalidate_src_under_lock(caller_cspace, src_handle, src_object) }
+    {
+        crate::cap::DERIVATION_LOCK.write_unlock();
+        // SAFETY: the reference taken above is given up; no lock held.
+        unsafe { release_src_ref(src_object) };
+        return Err(e);
+    }
     // SAFETY: caller_cspace validated non-null above; lock_raw/unlock_raw paired.
     let insert_res = unsafe {
         let saved = (*caller_cspace).lock.lock_raw();
@@ -1540,25 +1618,17 @@ pub fn sys_cap_derive(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         Err(e) =>
         {
             crate::cap::DERIVATION_LOCK.write_unlock();
-            // A sibling may have deleted the source meanwhile, making this the
-            // last reference.
-            // SAFETY: src_object validated above; we just incremented refcount;
-            // no lock held for the dealloc.
-            unsafe {
-                if (*src_object.as_ptr()).dec_ref() == 0
-                {
-                    crate::cap::object::dealloc_object(src_object);
-                }
-            }
+            // SAFETY: the reference taken above is given up; no lock held.
+            unsafe { release_src_ref(src_object) };
             return Err(SyscallError::from(e));
         }
     };
     let parent = crate::cap::slot::SlotId::current(cspace_id, src_idx_nz);
     let child = crate::cap::slot::SlotId::current(cspace_id, new_idx_nz);
-    // SAFETY: DERIVATION_LOCK held; parent/child are valid SlotIds.
-    unsafe {
-        crate::cap::derivation::link_child(parent, child);
-    }
+    // SAFETY: DERIVATION_LOCK held; the parent revalidated and the child was
+    // inserted under this hold, so both ends resolve.
+    let linked = unsafe { crate::cap::derivation::link_child(parent, child) };
+    debug_assert!(linked, "derivation link dropped under DERIVATION_LOCK");
     crate::cap::DERIVATION_LOCK.write_unlock();
     Ok(u64::from(new_handle))
 }
@@ -1625,15 +1695,27 @@ pub fn sys_cap_derive_badge(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         (*src_object.as_ptr()).inc_ref();
     }
 
-    // Insert and link under DERIVATION_LOCK (cspace.lock nested per the
-    // documented order): a cap reachable through the CSpace but not yet
-    // linked could be moved out by a sibling, and a move carries whatever
-    // derivation position it finds — the cap would leave the source's revoke
-    // reach for good. Every occupied→free transition holds the lock, so no
-    // move can interleave before the link. The badge write and the handle
-    // read share the insert's critical section.
+    // Revalidate the source, then insert and link, under one DERIVATION_LOCK
+    // hold (cspace.lock nested per the documented order). The source was
+    // resolved unlocked: a delete, move, or revoke batch may have freed its
+    // slot meanwhile, and a link under a freed parent is dropped — the new
+    // cap would be a derivation root outside every ancestor's revoke reach.
+    // A cap reachable through the CSpace but not yet linked could be moved
+    // out by a sibling, and a move carries whatever derivation position it
+    // finds — the cap would leave the source's revoke reach for good. Every
+    // occupied→free transition holds the lock, so neither can interleave
+    // once the source revalidates. The badge write and the handle read share
+    // the insert's critical section.
     let src_idx_nz = core::num::NonZeroU32::new(src_idx).ok_or(SyscallError::InvalidCapability)?;
     crate::cap::DERIVATION_LOCK.write_lock();
+    // SAFETY: caller_cspace validated non-null above; DERIVATION_LOCK held.
+    if let Err(e) = unsafe { revalidate_src_under_lock(caller_cspace, src_handle, src_object) }
+    {
+        crate::cap::DERIVATION_LOCK.write_unlock();
+        // SAFETY: the reference taken above is given up; no lock held.
+        unsafe { release_src_ref(src_object) };
+        return Err(e);
+    }
     // SAFETY: caller_cspace validated non-null above; lock_raw/unlock_raw paired.
     let insert_res = unsafe {
         let saved = (*caller_cspace).lock.lock_raw();
@@ -1653,25 +1735,17 @@ pub fn sys_cap_derive_badge(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         Err(e) =>
         {
             crate::cap::DERIVATION_LOCK.write_unlock();
-            // A sibling may have deleted the source meanwhile, making this the
-            // last reference.
-            // SAFETY: src_object validated above; we just incremented refcount;
-            // no lock held for the dealloc.
-            unsafe {
-                if (*src_object.as_ptr()).dec_ref() == 0
-                {
-                    crate::cap::object::dealloc_object(src_object);
-                }
-            }
+            // SAFETY: the reference taken above is given up; no lock held.
+            unsafe { release_src_ref(src_object) };
             return Err(SyscallError::from(e));
         }
     };
     let parent = crate::cap::slot::SlotId::current(cspace_id, src_idx_nz);
     let child = crate::cap::slot::SlotId::current(cspace_id, new_idx_nz);
-    // SAFETY: DERIVATION_LOCK held; parent/child are valid SlotIds.
-    unsafe {
-        crate::cap::derivation::link_child(parent, child);
-    }
+    // SAFETY: DERIVATION_LOCK held; the parent revalidated and the child was
+    // inserted under this hold, so both ends resolve.
+    let linked = unsafe { crate::cap::derivation::link_child(parent, child) };
+    debug_assert!(linked, "derivation link dropped under DERIVATION_LOCK");
     crate::cap::DERIVATION_LOCK.write_unlock();
     Ok(u64::from(new_handle))
 }
@@ -1713,19 +1787,26 @@ fn log_self_cap_delete_refused(tcb: *mut crate::sched::thread::ThreadControlBloc
 /// Resolve `SYS_CAP_DELETE`'s target under `DERIVATION_LOCK`: the slot's
 /// object and derivation parent, or the syscall's early result — `Ok(0)` for
 /// an idempotent Null slot (or, after the first batch, a slot a concurrent
-/// delete finished), else the rejecting error.
+/// delete finished), else the rejecting error. `expected` is the object the
+/// first batch resolved (`None` on the first batch): a later batch that finds
+/// the generation current but a different object is looking at a recycled
+/// slot whose generation wrapped while the lock was released, and reports
+/// success like the finished-delete case.
 ///
 /// # Safety
 ///
 /// Caller must hold `DERIVATION_LOCK` write lock; `caller_cspace` must be
 /// valid and non-null.
 #[cfg(not(test))]
+// type_complexity: the outer `Err` carries the delete's early result — its
+// success (`Ok(0)`) or its rejecting error — so the loop returns it verbatim;
+// a named alias would restate the syscall's return type for one call site.
 #[allow(clippy::type_complexity)]
 unsafe fn resolve_delete_target(
     caller_cspace: *mut crate::cap::cspace::CSpace,
     slot_idx: u32,
     slot_handle: u32,
-    first_batch: bool,
+    expected: Option<core::ptr::NonNull<crate::cap::object::KernelObjectHeader>>,
 ) -> Result<
     (
         core::ptr::NonNull<crate::cap::object::KernelObjectHeader>,
@@ -1743,11 +1824,13 @@ unsafe fn resolve_delete_target(
             // the idempotent Null arm below — that would silently succeed
             // against the unrelated live cap now occupying the index. After
             // the first batch a recycled index means a concurrent delete
-            // finished this slot: report success like the Null arm.
+            // finished this slot: report success like the Null arm. The
+            // object comparison catches a generation that wrapped across the
+            // released-lock windows.
             if slot.generation() != syscall::cap_handle_gen(slot_handle)
             {
                 return Err(
-                    if first_batch
+                    if expected.is_none()
                     {
                         Err(SyscallError::InvalidCapability)
                     }
@@ -1756,6 +1839,11 @@ unsafe fn resolve_delete_target(
                         Ok(0)
                     },
                 );
+            }
+            if let Some(expected) = expected
+                && slot.object != Some(expected)
+            {
+                return Err(Ok(0));
             }
             // A revoke is mid-flight on this slot (see
             // `CapabilitySlot::revoke_in_progress`): deleting the root
@@ -1790,13 +1878,15 @@ unsafe fn resolve_delete_target(
 ///
 /// The reparenting runs in `MAX_REPARENT_EDITS` batches with the derivation
 /// lock released in between (a slot can have arbitrarily many children); the
-/// slot is revalidated before every batch. Between batches it stays live with
-/// its remaining children still under it, so a concurrent revoke starting on
-/// it stops this delete with `InvalidState` (children already moved stay under the parent —
-/// still inside every ancestor's subtree) and a concurrent delete — or move —
-/// that frees the slot first makes this call return success (the generation
-/// no longer matches; nothing is released here). `MAX_REPARENT_BATCHES` bounds a
-/// concurrent-deriver livelock with `Interrupted`.
+/// slot is revalidated (generation and object) before every batch. Between
+/// batches it stays live with its remaining children still under it, so a
+/// concurrent revoke starting on it stops this delete with `InvalidState`
+/// (children already moved stay under the parent — still inside every
+/// ancestor's subtree) and a concurrent delete — or move — that frees the
+/// slot first makes this call return success (the generation, or the object
+/// behind a wrapped generation, no longer matches; nothing is released here).
+/// `MAX_REPARENT_BATCHES` bounds a concurrent-deriver livelock with
+/// `Interrupted`.
 ///
 /// Idempotent: deleting a Null slot returns success.
 #[cfg(not(test))]
@@ -1830,22 +1920,23 @@ pub fn sys_cap_delete(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // once between them. The loop re-enters once per reparent batch; the
     // final batch's hold performs the unlink and the free.
     let mut batches: u32 = 0;
+    let mut expected = None;
     let obj_ptr = loop
     {
         crate::cap::DERIVATION_LOCK.write_lock();
 
         // SAFETY: caller_cspace validated non-null above; DERIVATION_LOCK held.
-        let (obj_ptr, parent) = match unsafe {
-            resolve_delete_target(caller_cspace, slot_idx, slot_handle, batches == 0)
-        }
-        {
-            Ok(target) => target,
-            Err(early) =>
+        let (obj_ptr, parent) =
+            match unsafe { resolve_delete_target(caller_cspace, slot_idx, slot_handle, expected) }
             {
-                crate::cap::DERIVATION_LOCK.write_unlock();
-                return early;
-            }
-        };
+                Ok(target) => target,
+                Err(early) =>
+                {
+                    crate::cap::DERIVATION_LOCK.write_unlock();
+                    return early;
+                }
+            };
+        expected = Some(obj_ptr);
 
         // #341: refuse to delete the last capability to the RUNNING thread's own
         // Thread object. This is always an aliased/stale-cap bug — std's

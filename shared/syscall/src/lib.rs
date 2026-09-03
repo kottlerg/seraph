@@ -1117,6 +1117,9 @@ pub fn mem_protect(
 /// Returns a negative `i64` error code if the cap is invalid,
 /// `split_offset` is not page-aligned, is out of range, lands inside
 /// the cap's bump region, or the parent has derivation children.
+/// `InvalidCapability` also covers a parent a concurrent delete freed
+/// before the tail was linked; `InvalidState` means a `cap_revoke` is in
+/// flight on the parent.
 // cast_sign_loss: proven non-negative in Ok branch.
 // cast_possible_truncation: returned value is a 32-bit slot index.
 #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
@@ -1421,11 +1424,19 @@ pub fn thread_start(thread_cap: u32) -> Result<(), i64>
 ///
 /// Returns the slot index in the destination `CSpace`.
 ///
+/// If every other reference to the destination `CSpace` goes while the call
+/// is backing the slot, the call reclaims it and returns `InvalidCapability`;
+/// when the caller itself is bound to that `CSpace`, the caller is stopped
+/// and the call never returns.
+///
 /// # Errors
 /// Returns a negative `i64` error code if either cap is invalid, the caller
 /// lacks sufficient rights, or the destination `CSpace`'s slot pool cannot
 /// back a fresh slot (`OutOfMemory`; refill it with `cap_create_cspace` in
-/// augment mode; `QuotaExceeded` at the structural ceiling).
+/// augment mode; `QuotaExceeded` at the structural ceiling). `InvalidCapability`
+/// also covers a source a concurrent delete, move, or revoke freed before the
+/// copy was linked; `InvalidState` means a `cap_revoke` is in flight on the
+/// source.
 // cast_possible_truncation, cast_sign_loss: ret is a non-negative cap handle —
 // a 24-bit slot index plus an 8-bit generation (`CAP_INDEX_BITS + 8 <= 32`),
 // so it fits u32.
@@ -1458,7 +1469,9 @@ pub fn cap_copy(src_slot: u32, dest_cspace_cap: u32, rights_mask: u64) -> Result
 /// # Errors
 /// Returns a negative `i64` error code if the source cap is invalid or the
 /// `CSpace`'s slot pool cannot back a fresh slot (`OutOfMemory`; `QuotaExceeded` at the
-/// structural ceiling).
+/// structural ceiling). `InvalidCapability` also covers a source a concurrent
+/// delete, move, or revoke freed before the new slot was linked;
+/// `InvalidState` means a `cap_revoke` is in flight on the source.
 // cast_possible_truncation, cast_sign_loss: ret is a non-negative cap handle —
 // a 24-bit slot index plus an 8-bit generation (`CAP_INDEX_BITS + 8 <= 32`),
 // so it fits u32.
@@ -1484,6 +1497,9 @@ pub fn cap_derive(src_slot: u32, rights_mask: u64) -> Result<u32, i64>
 /// Returns a negative `i64` error code if the source cap is invalid, the badge
 /// is zero, the source already has a badge, or the `CSpace`'s slot pool cannot
 /// back a fresh slot (`OutOfMemory`; `QuotaExceeded` at the structural ceiling).
+/// `InvalidCapability` also covers a source a concurrent delete, move, or
+/// revoke freed before the new slot was linked; `InvalidState` means a
+/// `cap_revoke` is in flight on the source.
 // cast_possible_truncation, cast_sign_loss: ret is a non-negative cap handle —
 // a 24-bit slot index plus an 8-bit generation (`CAP_INDEX_BITS + 8 <= 32`),
 // so it fits u32.
@@ -1587,6 +1603,11 @@ pub fn cap_revoke_all(slot: u32) -> Result<(), i64>
 /// The source slot is cleared; object refcount is unchanged.
 ///
 /// Returns the destination slot index.
+///
+/// If every other reference to the destination `CSpace` goes while the call
+/// is backing the slot, the call reclaims it and returns `InvalidCapability`;
+/// when the caller itself is bound to that `CSpace`, the caller is stopped
+/// and the call never returns.
 ///
 /// # Errors
 /// Returns a negative `i64` error code if either cap is invalid, `dest_index`

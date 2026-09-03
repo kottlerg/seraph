@@ -2022,7 +2022,10 @@ pub unsafe fn set_state_under_all_locks(
 /// hold as the state write — every exit path's commit: the thread's own
 /// exit and fault paths, and the object-teardown walk (`EXIT_KILLED`). A
 /// refused commit (the thread is already `Exited`) writes neither, so the
-/// reason recorded by the commit that won survives.
+/// reason recorded by the commit that won survives; an exit path whose
+/// commit lost still posts its own reason (the kernel never posts
+/// `EXIT_KILLED`), so a thread killed mid-exit shows `EXIT_KILLED` only in
+/// the retained value.
 ///
 /// # Safety
 /// As for [`set_state_under_all_locks`].
@@ -2068,12 +2071,9 @@ unsafe fn commit_state_under_all_locks(
     }
 
     // `Exited` is terminal (see the function doc): read under the same locks
-    // every writer of `state` on this path holds. A refused commit reports
-    // the reason the winning commit recorded, read under the same hold.
+    // every writer of `state` on this path holds.
     // SAFETY: tcb validated by caller; state field always valid.
     let exited = unsafe { (*tcb).state == thread::ThreadState::Exited };
-    // SAFETY: tcb validated by caller; exit_reason read under the same hold.
-    let standing_reason = unsafe { (*tcb).exit_reason };
     let mut running_on: Option<usize> = None;
     if !exited
     {
@@ -2141,9 +2141,7 @@ unsafe fn commit_state_under_all_locks(
 
     if exited
     {
-        StateCommit::RefusedExited {
-            exit_reason: standing_reason,
-        }
+        StateCommit::RefusedExited
     }
     else
     {
@@ -2155,33 +2153,14 @@ unsafe fn commit_state_under_all_locks(
 /// may discard it (a refusal means the thread already exited); every other
 /// caller must act on a refusal.
 #[must_use]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug)]
 pub enum StateCommit
 {
     /// The state was written; the payload names the CPU whose `current` is
     /// the thread, if any.
     Committed(Option<usize>),
-    /// Nothing was written: the thread is `Exited`, which is terminal. Carries
-    /// the exit reason the winning commit recorded, so an exit path whose
-    /// commit lost can post the reason that stands.
-    RefusedExited
-    {
-        exit_reason: u64
-    },
-}
-
-impl StateCommit
-{
-    /// The exit reason that stands after an exit commit: `own` if the commit
-    /// was written, the recorded one if it was refused.
-    pub fn exit_reason_or(self, own: u64) -> u64
-    {
-        match self
-        {
-            Self::Committed(_) => own,
-            Self::RefusedExited { exit_reason } => exit_reason,
-        }
-    }
+    /// Nothing was written: the thread is `Exited`, which is terminal.
+    RefusedExited,
 }
 
 /// Wait until `tcb` has left every CPU and its in-flight register save has

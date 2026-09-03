@@ -646,9 +646,12 @@ pub struct ThreadControlBlock
     /// `EXIT_FAULT_BASE + vector`) before they call `post_death_notification`, and
     /// by object teardown (`syscall::EXIT_KILLED`, not posted). A commit that finds
     /// the thread already `Exited` writes nothing, so the winning writer's reason
-    /// survives. Read out-of-band by `sys_cap_info`'s `CAP_INFO_THREAD_STATE`
-    /// selector so userspace process managers can answer "did this thread die, and
-    /// with what reason?" without racing the userspace death-event drain.
+    /// survives; a thread killed while inside its own exit or fault path still
+    /// posts that path's reason (the kernel never posts `EXIT_KILLED`), so the
+    /// two can differ. Read out-of-band by `sys_cap_info`'s
+    /// `CAP_INFO_THREAD_STATE` selector so userspace process managers can answer
+    /// "did this thread die, and with what reason?" without racing the userspace
+    /// death-event drain.
     pub exit_reason: u64,
 
     // === Sleep ===

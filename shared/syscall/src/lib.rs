@@ -790,7 +790,8 @@ pub fn notification_wait_timeout(sig: u32, timeout_ms: u64) -> Result<u64, i64>
 /// # Errors
 /// Returns a negative `i64` error code if `memory_cap` is invalid, lacks
 /// `RIGHTS_MEM_RETYPE`, has insufficient `available_bytes`, or the caller's
-/// `CSpace`'s slot pool cannot back a fresh slot (`OutOfMemory`).
+/// `CSpace`'s slot pool cannot back a fresh slot (`OutOfMemory`; `QuotaExceeded` at the
+/// structural ceiling).
 // cast_possible_truncation, cast_sign_loss: ret is a non-negative cap handle —
 // a 24-bit slot index plus an 8-bit generation (`CAP_INDEX_BITS + 8 <= 32`),
 // so it fits u32.
@@ -813,7 +814,8 @@ pub fn cap_create_endpoint(memory_cap: u32) -> Result<u32, i64>
 /// # Errors
 /// Returns a negative `i64` error code if `memory_cap` is invalid, lacks
 /// `RIGHTS_MEM_RETYPE`, has insufficient `available_bytes`, or the caller's
-/// `CSpace`'s slot pool cannot back a fresh slot (`OutOfMemory`).
+/// `CSpace`'s slot pool cannot back a fresh slot (`OutOfMemory`; `QuotaExceeded` at the
+/// structural ceiling).
 // cast_possible_truncation, cast_sign_loss: ret is a non-negative cap handle —
 // a 24-bit slot index plus an 8-bit generation (`CAP_INDEX_BITS + 8 <= 32`),
 // so it fits u32.
@@ -939,7 +941,8 @@ pub fn raw_cap_create_cspace(
 /// Returns a negative `i64` error code if any cap is invalid, the Memory
 /// cap lacks `RETYPE` or sufficient `available_bytes`, the priority is
 /// outside the `SchedControl` band (or nonzero without one), or the
-/// caller's `CSpace`'s slot pool cannot back a fresh slot (`OutOfMemory`).
+/// caller's `CSpace`'s slot pool cannot back a fresh slot (`OutOfMemory`; `QuotaExceeded` at the
+/// structural ceiling).
 // cast_possible_truncation, cast_sign_loss: ret is a non-negative cap handle —
 // a 24-bit slot index plus an 8-bit generation (`CAP_INDEX_BITS + 8 <= 32`),
 // so it fits u32.
@@ -1175,7 +1178,8 @@ pub fn memory_merge(parent_cap: u32, tail_cap: u32) -> Result<(), i64>
 /// if a concurrent delete removed the original or a `SYS_CAP_REVOKE` on it is
 /// in flight; `Interrupted` if a concurrent deriver extended its child list
 /// faster than the batched reparent could move it (retry); `OutOfMemory` if
-/// the caller's `CSpace` cannot back two more slots.
+/// the caller's `CSpace` cannot back two more slots (`QuotaExceeded` at the
+/// structural ceiling).
 // cast_sign_loss: proven non-negative in Ok branch.
 // cast_possible_truncation: each returned handle is 32 bits (a 24-bit slot index
 // plus an 8-bit generation).
@@ -1214,7 +1218,8 @@ pub fn mmio_split(mmio_cap: u32, split_offset: u64) -> Result<(u32, u32), i64>
 /// if a concurrent delete removed the original or a `SYS_CAP_REVOKE` on it is
 /// in flight; `Interrupted` if a concurrent deriver extended its child list
 /// faster than the batched reparent could move it (retry); `OutOfMemory` if
-/// the caller's `CSpace` cannot back two more slots.
+/// the caller's `CSpace` cannot back two more slots (`QuotaExceeded` at the
+/// structural ceiling).
 // cast_sign_loss / cast_possible_truncation: identical to `mmio_split`.
 #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 #[inline]
@@ -1264,7 +1269,8 @@ pub fn irq_split(irq_cap: u32, split_at: u32) -> Result<(u32, u32), i64>
 /// if a concurrent delete removed the original or a `SYS_CAP_REVOKE` on it is
 /// in flight; `Interrupted` if a concurrent deriver extended its child list
 /// faster than the batched reparent could move it (retry); `OutOfMemory` if
-/// the caller's `CSpace` cannot back two more slots.
+/// the caller's `CSpace` cannot back two more slots (`QuotaExceeded` at the
+/// structural ceiling).
 // cast_sign_loss / cast_possible_truncation: identical to `mmio_split`.
 #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 #[inline]
@@ -1309,7 +1315,8 @@ pub fn ioport_split(ioport_cap: u32, split_at: u16) -> Result<(u32, u32), i64>
 /// if a concurrent delete removed the original or a `SYS_CAP_REVOKE` on it is
 /// in flight; `Interrupted` if a concurrent deriver extended its child list
 /// faster than the batched reparent could move it (retry); `OutOfMemory` if
-/// the caller's `CSpace` cannot back two more slots.
+/// the caller's `CSpace` cannot back two more slots (`QuotaExceeded` at the
+/// structural ceiling).
 // cast_sign_loss / cast_possible_truncation: identical to `mmio_split`.
 #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 #[inline]
@@ -1418,7 +1425,7 @@ pub fn thread_start(thread_cap: u32) -> Result<(), i64>
 /// Returns a negative `i64` error code if either cap is invalid, the caller
 /// lacks sufficient rights, or the destination `CSpace`'s slot pool cannot
 /// back a fresh slot (`OutOfMemory`; refill it with `cap_create_cspace` in
-/// augment mode).
+/// augment mode; `QuotaExceeded` at the structural ceiling).
 // cast_possible_truncation, cast_sign_loss: ret is a non-negative cap handle —
 // a 24-bit slot index plus an 8-bit generation (`CAP_INDEX_BITS + 8 <= 32`),
 // so it fits u32.
@@ -1450,7 +1457,8 @@ pub fn cap_copy(src_slot: u32, dest_cspace_cap: u32, rights_mask: u64) -> Result
 ///
 /// # Errors
 /// Returns a negative `i64` error code if the source cap is invalid or the
-/// `CSpace`'s slot pool cannot back a fresh slot (`OutOfMemory`).
+/// `CSpace`'s slot pool cannot back a fresh slot (`OutOfMemory`; `QuotaExceeded` at the
+/// structural ceiling).
 // cast_possible_truncation, cast_sign_loss: ret is a non-negative cap handle —
 // a 24-bit slot index plus an 8-bit generation (`CAP_INDEX_BITS + 8 <= 32`),
 // so it fits u32.
@@ -1475,7 +1483,7 @@ pub fn cap_derive(src_slot: u32, rights_mask: u64) -> Result<u32, i64>
 /// # Errors
 /// Returns a negative `i64` error code if the source cap is invalid, the badge
 /// is zero, the source already has a badge, or the `CSpace`'s slot pool cannot
-/// back a fresh slot (`OutOfMemory`).
+/// back a fresh slot (`OutOfMemory`; `QuotaExceeded` at the structural ceiling).
 // cast_possible_truncation, cast_sign_loss: ret is a non-negative cap handle —
 // a 24-bit slot index plus an 8-bit generation (`CAP_INDEX_BITS + 8 <= 32`),
 // so it fits u32.
@@ -1584,7 +1592,7 @@ pub fn cap_revoke_all(slot: u32) -> Result<(), i64>
 /// Returns a negative `i64` error code if either cap is invalid, `dest_index`
 /// is already occupied, or the destination `CSpace`'s slot pool cannot back
 /// the slot (`OutOfMemory` — for a non-zero `dest_index`, every leaf up to
-/// that index must be backed).
+/// that index must be backed; `QuotaExceeded` at the structural ceiling).
 // cast_possible_truncation, cast_sign_loss: ret is a non-negative cap handle —
 // a 24-bit slot index plus an 8-bit generation (`CAP_INDEX_BITS + 8 <= 32`),
 // so it fits u32.
@@ -1613,7 +1621,7 @@ pub fn cap_move(src_slot: u32, dest_cspace_cap: u32, dest_index: u32) -> Result<
 /// Returns a negative `i64` error code if either cap is invalid, the caller
 /// lacks sufficient rights, `dest_index` is already occupied, or the
 /// destination `CSpace`'s slot pool cannot back every leaf up to
-/// `dest_index` (`OutOfMemory`).
+/// `dest_index` (`OutOfMemory`; `QuotaExceeded` at the structural ceiling).
 pub fn cap_insert(
     src_slot: u32,
     dest_cspace_cap: u32,
@@ -1736,7 +1744,8 @@ pub fn aspace_query(aspace_cap: u32, virt: u64) -> Result<u64, i64>
 /// # Errors
 /// Returns a negative `i64` error code if `memory_cap` is invalid, lacks
 /// `RIGHTS_MEM_RETYPE`, has insufficient `available_bytes`, `capacity` is out
-/// of range, or the `CSpace`'s slot pool cannot back a fresh slot (`OutOfMemory`).
+/// of range, or the `CSpace`'s slot pool cannot back a fresh slot
+/// (`OutOfMemory`; `QuotaExceeded` at the structural ceiling).
 // cast_possible_truncation, cast_sign_loss: ret is a non-negative cap handle —
 // a 24-bit slot index plus an 8-bit generation (`CAP_INDEX_BITS + 8 <= 32`),
 // so it fits u32.
@@ -1832,7 +1841,8 @@ pub fn event_recv_timeout(queue_cap: u32, timeout_ms: u64) -> Result<u64, i64>
 ///
 /// # Errors
 /// Returns a negative `i64` error code if `memory_cap` is invalid, lacks
-/// `RIGHTS_MEM_RETYPE`, or the `CSpace`'s slot pool cannot back a fresh slot (`OutOfMemory`).
+/// `RIGHTS_MEM_RETYPE`, or the `CSpace`'s slot pool cannot back a fresh slot
+/// (`OutOfMemory`; `QuotaExceeded` at the structural ceiling).
 // cast_possible_truncation, cast_sign_loss: ret is a non-negative cap handle —
 // a 24-bit slot index plus an 8-bit generation (`CAP_INDEX_BITS + 8 <= 32`),
 // so it fits u32.

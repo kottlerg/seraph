@@ -205,15 +205,17 @@ fn sys_exit(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
         // Commit Exited under all-CPU scheduler.locks so a concurrent
         // dealloc on another CPU observes a coherent state and the local
         // schedule() below sees the Exited skip-bit. The reason (0 = clean
-        // exit) is written in the same hold; a refusal means a teardown
-        // already committed both, and its reason is the one that stands.
+        // exit) is written in the same hold. A refusal means a teardown
+        // already committed `EXIT_KILLED`; this path still posts its own
+        // reason below — the kernel never posts `EXIT_KILLED` (see the ABI
+        // constant) — so only the retained value says killed.
         // SAFETY: tcb validated non-null.
-        let reason = unsafe { crate::sched::exit_under_all_locks(tcb, 0) }.exit_reason_or(0);
+        let _ = unsafe { crate::sched::exit_under_all_locks(tcb, 0) };
 
-        // Post death notification if bound, with the reason that stands.
+        // Post death notification if bound (exit_reason 0 = clean exit).
         // SAFETY: tcb is valid; post_death_notification handles null eq check.
         unsafe {
-            crate::sched::post_death_notification(tcb, reason);
+            crate::sched::post_death_notification(tcb, 0);
         }
     }
     // Switch to the next runnable thread. The exited thread must not be
@@ -260,11 +262,11 @@ fn sys_process_exit(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     if !tcb.is_null()
     {
         // Commit Exited under all-CPU scheduler.locks (see sys_exit); the
-        // reason is written in the same hold, and a refused commit yields
-        // the reason a teardown already recorded.
+        // reason is written in the same hold. A refusal means a teardown
+        // already committed `EXIT_KILLED`; the post below still carries
+        // this path's own reason (the kernel never posts `EXIT_KILLED`).
         // SAFETY: tcb validated non-null.
-        let reason =
-            unsafe { crate::sched::exit_under_all_locks(tcb, reason) }.exit_reason_or(reason);
+        let _ = unsafe { crate::sched::exit_under_all_locks(tcb, reason) };
 
         // Notify the calling thread's observers (a parent that bound the main
         // thread; procmgr's per-thread observer), then schedule immediately —
@@ -483,8 +485,9 @@ fn sys_thread_bind_notification(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // snapshot (`post_death_notification`):
     //
     //   * Already `Exited`: the death walk ran without this observer. The
-    //     thread's `exit_reason` was written before the `Exited` commit under
-    //     this same lock, so it is visible here; re-deliver it to the newly
+    //     thread's `exit_reason` was written in the same all-locks hold as
+    //     the `Exited` commit (`exit_under_all_locks`), which includes this
+    //     lock, so it is visible here; re-deliver it to the newly
     //     bound queue and do not append (the thread cannot die again). Closes
     //     the bind-after-death window for services bound after start (#106).
     //   * Not yet `Exited`: append the observer; the eventual death walk posts

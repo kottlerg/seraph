@@ -582,17 +582,16 @@ extern "C" fn trap_dispatch(frame: &mut TrapFrame)
                 // docs/thread-lifecycle-and-sleep.md § Lifecycle State Machine.
                 // The reason (EXIT_FAULT_BASE + cause_code; EXIT_FAULT_BASE =
                 // 0x1000, matching syscall_abi::EXIT_FAULT_BASE) is written in
-                // the same hold; a refused commit yields the reason a teardown
-                // recorded.
+                // the same hold. A refusal means a teardown already committed
+                // `EXIT_KILLED`; the posts below still carry the fault class
+                // (the kernel never posts `EXIT_KILLED`).
                 // SAFETY: tcb validated non-null.
-                let reason =
-                    unsafe { crate::sched::exit_under_all_locks(tcb, 0x1000 + cause_code) }
-                        .exit_reason_or(0x1000 + cause_code);
+                let _ = unsafe { crate::sched::exit_under_all_locks(tcb, 0x1000 + cause_code) };
 
-                // Post death notification if bound, with the reason that stands.
+                // Post death notification if bound (exit_reason = EXIT_FAULT_BASE + cause_code).
                 // SAFETY: tcb is valid; post_death_notification handles null check.
                 unsafe {
-                    crate::sched::post_death_notification(tcb, reason);
+                    crate::sched::post_death_notification(tcb, 0x1000 + cause_code);
                 }
 
                 // Terminal fault (no handler bound, or handler replied KILL): notify

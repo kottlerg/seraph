@@ -204,7 +204,7 @@ pub fn sys_thread_start(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         // Reviving it would let it run against reclaimed storage.
         if matches!(
             crate::sched::set_state_under_all_locks(target_tcb, ThreadState::Ready),
-            crate::sched::StateCommit::RefusedExited { .. }
+            crate::sched::StateCommit::RefusedExited
         )
         {
             return Err(SyscallError::InvalidArgument);
@@ -238,7 +238,7 @@ unsafe fn commit_stopped(
     match unsafe { crate::sched::set_state_under_all_locks(tcb, ThreadState::Stopped) }
     {
         crate::sched::StateCommit::Committed(running_on) => Ok(running_on),
-        crate::sched::StateCommit::RefusedExited { .. } => Err(SyscallError::InvalidState),
+        crate::sched::StateCommit::RefusedExited => Err(SyscallError::InvalidState),
     }
 }
 

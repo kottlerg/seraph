@@ -655,14 +655,13 @@ pub fn sys_memory_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // Insert under cspace.lock to keep the freelist/tag invariant against a
     // concurrent SYS_CAP_CREATE_* on the same cspace. Lock order:
-    // DERIVATION_LOCK → parent MemoryObject lock → cspace.lock. The returned
-    // handle is minted in the same hold: once the locks below are released a
-    // sibling can delete the tail and refill the slot, and a later read would
-    // return a live handle to the refill.
+    // DERIVATION_LOCK → parent MemoryObject lock → cspace.lock.
+    // `insert_cap_slot_and_handle` mints the returned handle in the same hold.
     // SAFETY: caller_cspace validated non-null; lock_raw/unlock_raw paired.
     let insert_res = unsafe {
         let saved = (*caller_cspace).lock.lock_raw();
-        let r = (*caller_cspace).insert_cap_with_handle(CapTag::Memory, parent_rights, tail_ptr);
+        let r =
+            (*caller_cspace).insert_cap_slot_and_handle(CapTag::Memory, parent_rights, tail_ptr);
         (*caller_cspace).lock.unlock_raw(saved);
         r
     };

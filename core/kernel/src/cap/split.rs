@@ -396,14 +396,13 @@ unsafe fn insert_children(
 ) -> Result<(InsertedChild, InsertedChild), (SyscallError, (bool, bool))>
 {
     // Insert both children into the caller's CSpace under cspace.lock so the
-    // freelist mutation cannot tear against a concurrent SYS_CAP_CREATE_*.
-    // The handle is read under the same hold: a later read could see the
-    // generation of a sibling's refill of the slot.
+    // freelist mutation cannot tear against a concurrent SYS_CAP_CREATE_*;
+    // `insert_cap_slot_and_handle` mints each handle in the same hold.
     // SAFETY: caller_cspace validated by the caller; lock_raw/unlock_raw paired.
     let child1 = unsafe {
         let saved = (*caller_cspace).lock.lock_raw();
         let r = (*caller_cspace)
-            .insert_cap_with_handle(tag, rights, child1_ptr)
+            .insert_cap_slot_and_handle(tag, rights, child1_ptr)
             .map(|(slot, handle)| InsertedChild {
                 slot,
                 handle,
@@ -418,7 +417,7 @@ unsafe fn insert_children(
     let child2 = unsafe {
         let saved = (*caller_cspace).lock.lock_raw();
         let r = (*caller_cspace)
-            .insert_cap_with_handle(tag, rights, child2_ptr)
+            .insert_cap_slot_and_handle(tag, rights, child2_ptr)
             .map(|(slot, handle)| InsertedChild {
                 slot,
                 handle,

@@ -204,20 +204,16 @@ fn sys_exit(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
     {
         // Commit Exited under all-CPU scheduler.locks so a concurrent
         // dealloc on another CPU observes a coherent state and the local
-        // schedule() below sees the Exited skip-bit. Write exit_reason
-        // first so any subsequent acquire of any sched.lock observes the
-        // reason alongside the Exited transition.
+        // schedule() below sees the Exited skip-bit. The reason (0 = clean
+        // exit) is written in the same hold; a refusal means a teardown
+        // already committed both, and its reason is the one that stands.
         // SAFETY: tcb validated non-null.
-        unsafe {
-            // Reason and Exited written under one all-locks hold; a refusal
-            // means a teardown already committed both.
-            let _ = crate::sched::exit_under_all_locks(tcb, 0);
-        }
+        let reason = unsafe { crate::sched::exit_under_all_locks(tcb, 0) }.exit_reason_or(0);
 
-        // Post death notification if bound (exit_reason 0 = clean exit).
+        // Post death notification if bound, with the reason that stands.
         // SAFETY: tcb is valid; post_death_notification handles null eq check.
         unsafe {
-            crate::sched::post_death_notification(tcb, 0);
+            crate::sched::post_death_notification(tcb, reason);
         }
     }
     // Switch to the next runnable thread. The exited thread must not be
@@ -263,15 +259,12 @@ fn sys_process_exit(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     let tcb = unsafe { current_tcb() };
     if !tcb.is_null()
     {
-        // Commit Exited under all-CPU scheduler.locks (see sys_exit): write
-        // exit_reason first so any subsequent sched.lock acquire observes the
-        // reason alongside the Exited transition.
+        // Commit Exited under all-CPU scheduler.locks (see sys_exit); the
+        // reason is written in the same hold, and a refused commit yields
+        // the reason a teardown already recorded.
         // SAFETY: tcb validated non-null.
-        unsafe {
-            // Reason and Exited written under one all-locks hold; a refusal
-            // means a teardown already committed both.
-            let _ = crate::sched::exit_under_all_locks(tcb, reason);
-        }
+        let reason =
+            unsafe { crate::sched::exit_under_all_locks(tcb, reason) }.exit_reason_or(reason);
 
         // Notify the calling thread's observers (a parent that bound the main
         // thread; procmgr's per-thread observer), then schedule immediately —

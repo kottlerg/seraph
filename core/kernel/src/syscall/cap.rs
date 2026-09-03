@@ -1439,10 +1439,15 @@ pub fn sys_cap_copy(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         Err(e) =>
         {
             crate::cap::DERIVATION_LOCK.write_unlock();
-            // Roll back the inc_ref if insertion fails.
-            // SAFETY: src_object validated above; we just incremented refcount.
+            // Roll back the inc_ref if insertion fails; a sibling may have
+            // deleted the source meanwhile, making this the last reference.
+            // SAFETY: src_object validated above; we just incremented refcount;
+            // no lock held for the dealloc.
             unsafe {
-                (*src_object.as_ptr()).dec_ref();
+                if (*src_object.as_ptr()).dec_ref() == 0
+                {
+                    crate::cap::object::dealloc_object(src_object);
+                }
             }
             return Err(SyscallError::from(e));
         }
@@ -1535,9 +1540,15 @@ pub fn sys_cap_derive(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         Err(e) =>
         {
             crate::cap::DERIVATION_LOCK.write_unlock();
-            // SAFETY: src_object validated above; we just incremented refcount.
+            // A sibling may have deleted the source meanwhile, making this the
+            // last reference.
+            // SAFETY: src_object validated above; we just incremented refcount;
+            // no lock held for the dealloc.
             unsafe {
-                (*src_object.as_ptr()).dec_ref();
+                if (*src_object.as_ptr()).dec_ref() == 0
+                {
+                    crate::cap::object::dealloc_object(src_object);
+                }
             }
             return Err(SyscallError::from(e));
         }
@@ -1642,9 +1653,15 @@ pub fn sys_cap_derive_badge(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         Err(e) =>
         {
             crate::cap::DERIVATION_LOCK.write_unlock();
-            // SAFETY: src_object validated above; we just incremented refcount.
+            // A sibling may have deleted the source meanwhile, making this the
+            // last reference.
+            // SAFETY: src_object validated above; we just incremented refcount;
+            // no lock held for the dealloc.
             unsafe {
-                (*src_object.as_ptr()).dec_ref();
+                if (*src_object.as_ptr()).dec_ref() == 0
+                {
+                    crate::cap::object::dealloc_object(src_object);
+                }
             }
             return Err(SyscallError::from(e));
         }
@@ -1775,7 +1792,7 @@ unsafe fn resolve_delete_target(
 /// lock released in between (a slot can have arbitrarily many children); the
 /// slot is revalidated before every batch. Between batches it stays live with
 /// its remaining children still under it, so a concurrent revoke starting on
-/// it surfaces `InvalidState` (children already moved stay under the parent —
+/// it stops this delete with `InvalidState` (children already moved stay under the parent —
 /// still inside every ancestor's subtree) and a concurrent delete — or move —
 /// that frees the slot first makes this call return success (the generation
 /// no longer matches; nothing is released here). `MAX_REPARENT_BATCHES` bounds a

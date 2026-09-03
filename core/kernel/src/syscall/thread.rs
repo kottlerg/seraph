@@ -202,8 +202,10 @@ pub fn sys_thread_start(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         // ran without a lock, and an object teardown (or an exit the target
         // reached through a concurrent start) may have ended the thread since.
         // Reviving it would let it run against reclaimed storage.
-        if crate::sched::set_state_under_all_locks(target_tcb, ThreadState::Ready)
-            == crate::sched::StateCommit::RefusedExited
+        if matches!(
+            crate::sched::set_state_under_all_locks(target_tcb, ThreadState::Ready),
+            crate::sched::StateCommit::RefusedExited { .. }
+        )
         {
             return Err(SyscallError::InvalidArgument);
         }
@@ -236,7 +238,7 @@ unsafe fn commit_stopped(
     match unsafe { crate::sched::set_state_under_all_locks(tcb, ThreadState::Stopped) }
     {
         crate::sched::StateCommit::Committed(running_on) => Ok(running_on),
-        crate::sched::StateCommit::RefusedExited => Err(SyscallError::InvalidState),
+        crate::sched::StateCommit::RefusedExited { .. } => Err(SyscallError::InvalidState),
     }
 }
 

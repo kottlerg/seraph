@@ -790,7 +790,7 @@ pub fn notification_wait_timeout(sig: u32, timeout_ms: u64) -> Result<u64, i64>
 /// # Errors
 /// Returns a negative `i64` error code if `memory_cap` is invalid, lacks
 /// `RIGHTS_MEM_RETYPE`, has insufficient `available_bytes`, or the caller's
-/// `CSpace` is full.
+/// `CSpace`'s slot pool cannot back a fresh slot (`OutOfMemory`).
 // cast_possible_truncation, cast_sign_loss: ret is a non-negative cap handle —
 // a 24-bit slot index plus an 8-bit generation (`CAP_INDEX_BITS + 8 <= 32`),
 // so it fits u32.
@@ -813,7 +813,7 @@ pub fn cap_create_endpoint(memory_cap: u32) -> Result<u32, i64>
 /// # Errors
 /// Returns a negative `i64` error code if `memory_cap` is invalid, lacks
 /// `RIGHTS_MEM_RETYPE`, has insufficient `available_bytes`, or the caller's
-/// `CSpace` is full.
+/// `CSpace`'s slot pool cannot back a fresh slot (`OutOfMemory`).
 // cast_possible_truncation, cast_sign_loss: ret is a non-negative cap handle —
 // a 24-bit slot index plus an 8-bit generation (`CAP_INDEX_BITS + 8 <= 32`),
 // so it fits u32.
@@ -939,7 +939,7 @@ pub fn raw_cap_create_cspace(
 /// Returns a negative `i64` error code if any cap is invalid, the Memory
 /// cap lacks `RETYPE` or sufficient `available_bytes`, the priority is
 /// outside the `SchedControl` band (or nonzero without one), or the
-/// caller's `CSpace` is full.
+/// caller's `CSpace`'s slot pool cannot back a fresh slot (`OutOfMemory`).
 // cast_possible_truncation, cast_sign_loss: ret is a non-negative cap handle —
 // a 24-bit slot index plus an 8-bit generation (`CAP_INDEX_BITS + 8 <= 32`),
 // so it fits u32.
@@ -1450,7 +1450,7 @@ pub fn cap_copy(src_slot: u32, dest_cspace_cap: u32, rights_mask: u64) -> Result
 ///
 /// # Errors
 /// Returns a negative `i64` error code if the source cap is invalid or the
-/// `CSpace` is full.
+/// `CSpace`'s slot pool cannot back a fresh slot (`OutOfMemory`).
 // cast_possible_truncation, cast_sign_loss: ret is a non-negative cap handle —
 // a 24-bit slot index plus an 8-bit generation (`CAP_INDEX_BITS + 8 <= 32`),
 // so it fits u32.
@@ -1474,7 +1474,8 @@ pub fn cap_derive(src_slot: u32, rights_mask: u64) -> Result<u32, i64>
 ///
 /// # Errors
 /// Returns a negative `i64` error code if the source cap is invalid, the badge
-/// is zero, the source already has a badge, or the `CSpace` is full.
+/// is zero, the source already has a badge, or the `CSpace`'s slot pool cannot
+/// back a fresh slot (`OutOfMemory`).
 // cast_possible_truncation, cast_sign_loss: ret is a non-negative cap handle —
 // a 24-bit slot index plus an 8-bit generation (`CAP_INDEX_BITS + 8 <= 32`),
 // so it fits u32.
@@ -1735,7 +1736,7 @@ pub fn aspace_query(aspace_cap: u32, virt: u64) -> Result<u64, i64>
 /// # Errors
 /// Returns a negative `i64` error code if `memory_cap` is invalid, lacks
 /// `RIGHTS_MEM_RETYPE`, has insufficient `available_bytes`, `capacity` is out
-/// of range, or the `CSpace` is full.
+/// of range, or the `CSpace`'s slot pool cannot back a fresh slot (`OutOfMemory`).
 // cast_possible_truncation, cast_sign_loss: ret is a non-negative cap handle —
 // a 24-bit slot index plus an 8-bit generation (`CAP_INDEX_BITS + 8 <= 32`),
 // so it fits u32.
@@ -1831,7 +1832,7 @@ pub fn event_recv_timeout(queue_cap: u32, timeout_ms: u64) -> Result<u64, i64>
 ///
 /// # Errors
 /// Returns a negative `i64` error code if `memory_cap` is invalid, lacks
-/// `RIGHTS_MEM_RETYPE`, or the `CSpace` is full.
+/// `RIGHTS_MEM_RETYPE`, or the `CSpace`'s slot pool cannot back a fresh slot (`OutOfMemory`).
 // cast_possible_truncation, cast_sign_loss: ret is a non-negative cap handle —
 // a 24-bit slot index plus an 8-bit generation (`CAP_INDEX_BITS + 8 <= 32`),
 // so it fits u32.

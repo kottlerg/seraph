@@ -355,7 +355,8 @@ static TICK_HEARTBEAT: [core::sync::atomic::AtomicU64; MAX_CPUS] =
 /// Spin-site code: this CPU is not in any bounded protocol-spin.
 pub const SPIN_SITE_NONE: u32 = 0;
 /// `dealloc_object(Thread)` UAF gate, step 1: spinning until the dying TCB is
-/// no longer `current` on any CPU.
+/// no longer `current` on any CPU. Also `stop_threads_bound_to`'s phase-2
+/// spin, which waits for the same condition over every bound thread.
 pub const SPIN_SITE_DEALLOC_NOT_CURRENT: u32 = 1;
 /// `dealloc_object(Thread)` UAF gate, step 2: spinning until the dying TCB's
 /// in-flight register save has published (`context_saved == 1`).
@@ -375,10 +376,12 @@ pub const SPIN_SITE_DEALLOC_AS_ACTIVE: u32 = 5;
 /// for the threshold) stuck in a `dealloc_object(Thread)` gate shows the gate
 /// here, turning an opaque `current = Exited` dump into a named site (#351).
 /// Set on gate entry, cleared on exit; [`SPIN_SITE_NONE`] when not spinning.
-/// The reporting sites are the three `dealloc_object(Thread)` gates and the
-/// `schedule()` context-saved dispatch barrier — the protocol spins that can
-/// wedge a CPU silently (the `sys_thread_stop` drain carries its own
-/// overlong-duration warning). Diagnostic-only — never gates control flow.
+/// The reporting sites are the three `dealloc_object(Thread)` gates (the
+/// first of which `stop_threads_bound_to`'s phase-2 spin shares), the
+/// `dealloc_object(AddressSpace)` root-free gate, and the `schedule()`
+/// context-saved dispatch barrier — the protocol spins that can wedge a CPU
+/// silently (the `sys_thread_stop` drain carries its own overlong-duration
+/// warning). Diagnostic-only — never gates control flow.
 #[cfg(not(test))]
 static SPIN_SITE: [core::sync::atomic::AtomicU32; MAX_CPUS] =
     [const { core::sync::atomic::AtomicU32::new(SPIN_SITE_NONE) }; MAX_CPUS];
@@ -2065,9 +2068,12 @@ unsafe fn commit_state_under_all_locks(
     }
 
     // `Exited` is terminal (see the function doc): read under the same locks
-    // every writer of `state` on this path holds.
+    // every writer of `state` on this path holds. A refused commit reports
+    // the reason the winning commit recorded, read under the same hold.
     // SAFETY: tcb validated by caller; state field always valid.
     let exited = unsafe { (*tcb).state == thread::ThreadState::Exited };
+    // SAFETY: tcb validated by caller; exit_reason read under the same hold.
+    let standing_reason = unsafe { (*tcb).exit_reason };
     let mut running_on: Option<usize> = None;
     if !exited
     {
@@ -2135,7 +2141,9 @@ unsafe fn commit_state_under_all_locks(
 
     if exited
     {
-        StateCommit::RefusedExited
+        StateCommit::RefusedExited {
+            exit_reason: standing_reason,
+        }
     }
     else
     {
@@ -2153,8 +2161,27 @@ pub enum StateCommit
     /// The state was written; the payload names the CPU whose `current` is
     /// the thread, if any.
     Committed(Option<usize>),
-    /// Nothing was written: the thread is `Exited`, which is terminal.
-    RefusedExited,
+    /// Nothing was written: the thread is `Exited`, which is terminal. Carries
+    /// the exit reason the winning commit recorded, so an exit path whose
+    /// commit lost can post the reason that stands.
+    RefusedExited
+    {
+        exit_reason: u64
+    },
+}
+
+impl StateCommit
+{
+    /// The exit reason that stands after an exit commit: `own` if the commit
+    /// was written, the recorded one if it was refused.
+    pub fn exit_reason_or(self, own: u64) -> u64
+    {
+        match self
+        {
+            Self::Committed(_) => own,
+            Self::RefusedExited { exit_reason } => exit_reason,
+        }
+    }
 }
 
 /// Wait until `tcb` has left every CPU and its in-flight register save has

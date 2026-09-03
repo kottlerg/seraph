@@ -322,20 +322,17 @@ unsafe extern "C" fn common_exception_handler(
             // Commit Exited under all-CPU scheduler.locks so a concurrent
             // dealloc observes a coherent state. See
             // docs/thread-lifecycle-and-sleep.md § Lifecycle State Machine.
-            // Write exit_reason first so any subsequent sched.lock acquire
-            // observes the reason alongside the Exited transition.
+            // The reason (EXIT_FAULT_BASE + vector; EXIT_FAULT_BASE = 0x1000,
+            // matching syscall_abi::EXIT_FAULT_BASE) is written in the same
+            // hold; a refused commit yields the reason a teardown recorded.
             // SAFETY: tcb validated non-null.
-            unsafe {
-                // Reason and Exited written under one all-locks hold; a
-                // refusal means a teardown already committed both.
-                let _ = crate::sched::exit_under_all_locks(tcb, 0x1000 + vector);
-            }
+            let reason = unsafe { crate::sched::exit_under_all_locks(tcb, 0x1000 + vector) }
+                .exit_reason_or(0x1000 + vector);
 
-            // Post death notification if bound (exit_reason = EXIT_FAULT_BASE + vector).
-            // EXIT_FAULT_BASE = 0x1000 (matches syscall_abi::EXIT_FAULT_BASE).
+            // Post death notification if bound, with the reason that stands.
             // SAFETY: tcb is valid; post_death_notification handles null check.
             unsafe {
-                crate::sched::post_death_notification(tcb, 0x1000 + vector);
+                crate::sched::post_death_notification(tcb, reason);
             }
 
             // Terminal fault (no handler bound, or handler replied KILL): notify

@@ -2766,11 +2766,12 @@ mod tests
         );
     }
 
-    /// `CSpaceId` reserved for the recycle test below. No other host
-    /// `#[test]` populates `CSPACE_REGISTRY` — every other
-    /// `register_cspace`/`unregister_cspace` call site is `#[cfg(not(test))]`
-    /// (boot, syscall, dealloc) — so there is no shared-static race; a high
-    /// id is used purely for clarity.
+    /// `CSpaceId` reserved for the recycle test below. `CSPACE_REGISTRY` is a
+    /// process-wide static and `cargo test` runs tests concurrently, so every
+    /// host `#[test]` that registers a `CSpace` directly — this one and the
+    /// derivation-tree tests in `cap/derivation.rs`, which use the `31xx`
+    /// block — picks an id unique to that test; nothing enforces it. A high
+    /// id keeps this one clear of that block.
     const RECYCLE_TEST_ID: CSpaceId = (MAX_CSPACES as u32) - 1;
 
     /// A `SlotId` stamped before a `CSpace` id is recycled must fail

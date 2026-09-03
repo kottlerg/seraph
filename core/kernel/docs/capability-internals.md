@@ -449,20 +449,18 @@ proceeds, the root is pinned for the whole multi-batch operation with a
 the slot's spare pad byte, read and written only under the derivation write
 lock). `SYS_CAP_DELETE`, `SYS_CAP_MOVE`, `SYS_CAP_COPY`, `SYS_CAP_DERIVE`,
 `SYS_CAP_DERIVE_BADGE`, `SYS_MEMORY_SPLIT`, `SYS_MEMORY_MERGE`, and the range
-splits refuse a marked slot with `InvalidState`; IPC capability transfer
-refuses to move one — the reply
-direction surfaces `InvalidState` to the server (the caller resumes with
-`IPC_REPLY_TRANSFER_FAILED`), the call direction rejects before blocking,
-and a refusal detected only post-commit delivers the message with zero
-caps (see [docs/ipc-design.md](../../../docs/ipc-design.md) § Message
+splits refuse a marked slot with `InvalidState`; IPC capability transfer refuses
+to move one — the reply direction surfaces `InvalidState` to the server (the
+caller resumes with `IPC_REPLY_TRANSFER_FAILED`), the call direction rejects
+before blocking, and a refusal detected only post-commit delivers the message
+with zero caps (see [docs/ipc-design.md](../../../docs/ipc-design.md) § Message
 Format). Deleting or moving the root between batches would promote the
-temporarily hoisted survivors and permanently sever the intermediate
-holders' revocation authority. The marker is cleared under the lock on
-every syscall exit path — completion, dead-link error, and the
-`Interrupted` backstop alike — so it cannot leak; a root freed by a
-concurrent ancestor revoke sheds the marker with the slot (that ancestor's
-revoke clears the hoisted survivors too, since they remain inside its
-subtree).
+temporarily hoisted survivors and permanently sever the intermediate holders'
+revocation authority. The marker is cleared under the lock on every syscall exit
+path — completion, dead-link error, and the `Interrupted` backstop alike — so it
+cannot leak; a root freed by a concurrent ancestor revoke sheds the marker with
+the slot (that ancestor's revoke clears the hoisted survivors too, since they
+remain inside its subtree).
 
 A `CSpace` reaching refcount zero first stops every thread bound to it
 (`sched::stop_threads_bound_to`, see

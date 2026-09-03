@@ -403,10 +403,10 @@ unsafe fn insert_children(
     let child1 = unsafe {
         let saved = (*caller_cspace).lock.lock_raw();
         let r = (*caller_cspace)
-            .insert_cap(tag, rights, child1_ptr)
-            .map(|slot| InsertedChild {
+            .insert_cap_with_handle(tag, rights, child1_ptr)
+            .map(|(slot, handle)| InsertedChild {
                 slot,
-                handle: (*caller_cspace).cap_handle(slot),
+                handle,
                 object: child1_ptr,
             });
         (*caller_cspace).lock.unlock_raw(saved);
@@ -418,10 +418,10 @@ unsafe fn insert_children(
     let child2 = unsafe {
         let saved = (*caller_cspace).lock.lock_raw();
         let r = (*caller_cspace)
-            .insert_cap(tag, rights, child2_ptr)
-            .map(|slot| InsertedChild {
+            .insert_cap_with_handle(tag, rights, child2_ptr)
+            .map(|(slot, handle)| InsertedChild {
                 slot,
-                handle: (*caller_cspace).cap_handle(slot),
+                handle,
                 object: child2_ptr,
             });
         (*caller_cspace).lock.unlock_raw(saved);

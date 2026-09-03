@@ -723,8 +723,24 @@ impl CSpace
         object: NonNull<KernelObjectHeader>,
     ) -> Result<u32, CapError>
     {
+        self.insert_cap_with_handle(tag, rights, object)
+            .map(|(_, handle)| handle)
+    }
+
+    /// [`insert_cap`](Self::insert_cap) returning the slot index and the
+    /// handle minted under the same `&mut self`: for callers that link the
+    /// new slot (they need the index) and return the handle to userspace,
+    /// which must be read before the `CSpace` lock is released — a later
+    /// read could carry the generation of a sibling's refill of the slot.
+    pub fn insert_cap_with_handle(
+        &mut self,
+        tag: CapTag,
+        rights: Rights,
+        object: NonNull<KernelObjectHeader>,
+    ) -> Result<(NonZeroU32, u32), CapError>
+    {
         let index = self.insert_cap(tag, rights, object)?;
-        Ok(self.cap_handle(index))
+        Ok((index, self.cap_handle(index)))
     }
 
     /// [`insert_cap`](Self::insert_cap) with the tag derived from the typed

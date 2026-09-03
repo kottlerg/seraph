@@ -865,7 +865,7 @@ mod tests
     #[test]
     fn unlink_node_leaves_non_backpointing_neighbours_untouched()
     {
-        const ID: crate::cap::slot::CSpaceId = 3111;
+        const ID: crate::cap::slot::CSpaceId = 3114;
         let cs = mk_registered_cspace(ID);
         let parent = occupy(cs, ID);
         let real_first = occupy(cs, ID);
@@ -875,6 +875,16 @@ mod tests
         DERIVATION_LOCK.write_lock();
         // SAFETY: DERIVATION_LOCK held; both slots live.
         assert!(unsafe { link_child(parent, real_first) });
+        // Give both siblings a link of their own, so an ungated write of
+        // `None` into them would be observable.
+        // SAFETY: DERIVATION_LOCK held; both slots live.
+        unsafe { resolve_slot_mut(next) }
+            .expect("next resolves")
+            .deriv_prev_sibling = Some(real_first);
+        // SAFETY: DERIVATION_LOCK held; both slots live.
+        unsafe { resolve_slot_mut(prev) }
+            .expect("prev resolves")
+            .deriv_next_sibling = Some(real_first);
 
         // The orphan's links name neighbours that do not point back at it —
         // the shape a node abandoned behind a dead link takes once its
@@ -913,7 +923,7 @@ mod tests
         );
         assert_eq!(
             next_prev,
-            Some(None),
+            Some(Some(real_first)),
             "a next sibling that does not point back must be untouched"
         );
         assert_eq!(
@@ -923,7 +933,7 @@ mod tests
         );
         assert_eq!(
             prev_next,
-            Some(None),
+            Some(Some(real_first)),
             "a prev sibling that does not point back must be untouched"
         );
         crate::cap::unregister_cspace(ID);

@@ -662,15 +662,13 @@ pub fn sys_memory_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // SAFETY: caller_cspace validated non-null; lock_raw/unlock_raw paired.
     let insert_res = unsafe {
         let saved = (*caller_cspace).lock.lock_raw();
-        let r = (*caller_cspace)
-            .insert_cap(CapTag::Memory, parent_rights, tail_ptr)
-            .map(|idx| (idx, (*caller_cspace).cap_handle(idx)));
+        let r = (*caller_cspace).insert_cap_with_handle(CapTag::Memory, parent_rights, tail_ptr);
         (*caller_cspace).lock.unlock_raw(saved);
         r
     };
     let (tail_slot_nz, tail_handle) = match insert_res
     {
-        Ok(idx) => idx,
+        Ok(inserted) => inserted,
         Err(e) =>
         {
             // SAFETY: tail_ptr just allocated; refcount is 1 with no other

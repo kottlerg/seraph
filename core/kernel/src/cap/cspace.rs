@@ -856,7 +856,8 @@ impl CSpace
         // to the target is materialised on the way. Syscall paths pre-grow
         // in bounded batches (`pre_grow_for_explicit_slot`) before taking
         // the heavyweight locks, so this loop is a zero-iteration backstop
-        // for them (`sys_cap_copy` and `sys_cap_move` are the only callers).
+        // for them (`sys_cap_copy` and `sys_cap_move`, the only syscall
+        // callers; the host tests drive this loop directly).
         let leaf_idx = index as usize / L2_SIZE;
         while (self.next_leaf as usize) <= leaf_idx
         {

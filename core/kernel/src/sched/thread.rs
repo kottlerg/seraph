@@ -639,16 +639,16 @@ pub struct ThreadControlBlock
     pub death_observer_count: u8,
 
     /// Exit reason recorded by the kernel at the moment this thread became
-    /// `Exited`. Written by `sys_thread_exit` (clean exit, value `0`), by
+    /// `Exited`, under the same all-locks hold as that commit
+    /// (`exit_under_all_locks`): by `sys_thread_exit` (clean exit, value `0`), by
     /// `sys_process_exit` (`encode_exit_code(arg0)`, a voluntary code in `[0,
     /// EXIT_FAULT_BASE)`), by the architecture fault handlers (value
-    /// `EXIT_FAULT_BASE + vector`) before they call `post_death_notification`,
-    /// and by object teardown (`syscall::EXIT_KILLED`, not posted, written
-    /// under the same all-locks hold as its `Exited` commit by
-    /// `kill_under_all_locks`), in every case before the matching state
-    /// transition. Read out-of-band by `sys_cap_info`'s `CAP_INFO_THREAD_STATE`
-    /// selector so userspace process managers can answer "did this thread die,
-    /// and with what reason?" without racing the userspace death-event drain.
+    /// `EXIT_FAULT_BASE + vector`) before they call `post_death_notification`, and
+    /// by object teardown (`syscall::EXIT_KILLED`, not posted). A commit that finds
+    /// the thread already `Exited` writes nothing, so the winning writer's reason
+    /// survives. Read out-of-band by `sys_cap_info`'s `CAP_INFO_THREAD_STATE`
+    /// selector so userspace process managers can answer "did this thread die, and
+    /// with what reason?" without racing the userspace death-event drain.
     pub exit_reason: u64,
 
     // === Sleep ===

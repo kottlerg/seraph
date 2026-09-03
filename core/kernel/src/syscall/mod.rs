@@ -198,7 +198,6 @@ fn sys_yield(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 #[cfg(not(test))]
 fn sys_exit(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
-    use crate::sched::thread::ThreadState;
     // SAFETY: current_tcb() returns current thread; interrupt context ensures it is set.
     let tcb = unsafe { current_tcb() };
     if !tcb.is_null()
@@ -210,9 +209,9 @@ fn sys_exit(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
         // reason alongside the Exited transition.
         // SAFETY: tcb validated non-null.
         unsafe {
-            (*tcb).exit_reason = 0;
-            // Committing Exited: a refusal means a teardown already did.
-            let _ = crate::sched::set_state_under_all_locks(tcb, ThreadState::Exited);
+            // Reason and Exited written under one all-locks hold; a refusal
+            // means a teardown already committed both.
+            let _ = crate::sched::exit_under_all_locks(tcb, 0);
         }
 
         // Post death notification if bound (exit_reason 0 = clean exit).
@@ -259,7 +258,6 @@ fn sys_exit(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 #[allow(clippy::cast_possible_truncation)]
 fn sys_process_exit(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
-    use crate::sched::thread::ThreadState;
     let reason = syscall::encode_exit_code(tf.arg(0) as u32);
     // SAFETY: current_tcb() returns current thread; interrupt context ensures it is set.
     let tcb = unsafe { current_tcb() };
@@ -270,9 +268,9 @@ fn sys_process_exit(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         // reason alongside the Exited transition.
         // SAFETY: tcb validated non-null.
         unsafe {
-            (*tcb).exit_reason = reason;
-            // Committing Exited: a refusal means a teardown already did.
-            let _ = crate::sched::set_state_under_all_locks(tcb, ThreadState::Exited);
+            // Reason and Exited written under one all-locks hold; a refusal
+            // means a teardown already committed both.
+            let _ = crate::sched::exit_under_all_locks(tcb, reason);
         }
 
         // Notify the calling thread's observers (a parent that bound the main

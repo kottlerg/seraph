@@ -1743,9 +1743,14 @@ pub fn init(cpu_count: u32) -> u32
                     exit_reason: 0,
                     sleep_deadline: 0,
                     extended: thread::ExtendedState::empty(),
-                    // Idle TCBs are never deallocated and never `Blocked`, and
-                    // are already shown by the watchdog's per-CPU `current` dump,
-                    // so they are not threaded onto the diagnostic registry.
+                    // Idle TCBs stay off the registry: they bind no CSpace
+                    // or address space (null above), so the object-teardown
+                    // walk never needs to stop one — and that same null
+                    // binding is what keeps phase 2's bound-`current` scan
+                    // from seeing an idle `current` as an unmarked bound
+                    // thread it would loop back to a phase 1 that cannot
+                    // mark it. They are never deallocated or `Blocked`, and
+                    // the watchdog's per-CPU `current` dump already shows them.
                     registry_next: core::ptr::null_mut(),
                     registry_prev: core::ptr::null_mut(),
                     magic: thread::TCB_MAGIC,
@@ -2011,20 +2016,21 @@ pub unsafe fn set_state_under_all_locks(
 }
 
 /// Mark `tcb` `Exited` with `exit_reason` recorded under the same all-locks
-/// hold as the state write — the object-teardown walk's commit. A refused
-/// commit (the thread exited on its own meanwhile) writes neither, so the
-/// thread's own reason survives.
+/// hold as the state write — every exit path's commit: the thread's own
+/// exit and fault paths, and the object-teardown walk (`EXIT_KILLED`). A
+/// refused commit (the thread is already `Exited`) writes neither, so the
+/// reason recorded by the commit that won survives.
 ///
 /// # Safety
 /// As for [`set_state_under_all_locks`].
 #[cfg(not(test))]
-unsafe fn kill_under_all_locks(tcb: *mut ThreadControlBlock, exit_reason: u64) -> StateCommit
+pub unsafe fn exit_under_all_locks(tcb: *mut ThreadControlBlock, exit_reason: u64) -> StateCommit
 {
     // SAFETY: caller contract.
     unsafe { commit_state_under_all_locks(tcb, thread::ThreadState::Exited, Some(exit_reason)) }
 }
 
-/// Shared body of [`set_state_under_all_locks`] and [`kill_under_all_locks`].
+/// Shared body of [`set_state_under_all_locks`] and [`exit_under_all_locks`].
 ///
 /// # Safety
 /// As for [`set_state_under_all_locks`].
@@ -2360,7 +2366,7 @@ unsafe fn mark_bound_threads(
             // `state` is read without `sched_lock` here and below: `Exited`
             // is terminal, so a positive read is final, and a negative read
             // is re-decided under the full lock set by
-            // `kill_under_all_locks`, which refuses an exited thread
+            // `exit_under_all_locks`, which refuses an exited thread
             // (docs/scheduling-internals.md § Cross-CPU TCB Ownership).
             if !bound(tcb) || (*tcb).state == thread::ThreadState::Exited
             {
@@ -2378,7 +2384,7 @@ unsafe fn mark_bound_threads(
             // a thread that exited on its own meanwhile (commit refused)
             // keeps its own reason. Not posted: kernel-initiated teardown is
             // silent, as for a thread reaped through its own capability.
-            let committed = kill_under_all_locks(tcb, syscall::EXIT_KILLED);
+            let committed = exit_under_all_locks(tcb, syscall::EXIT_KILLED);
             if is_self
             {
                 self_bound = true;
@@ -2477,7 +2483,7 @@ unsafe fn scan_bound_current(
 /// lock: each bound thread not already `Exited` has any IPC block cancelled
 /// and is marked `Exited` under the all-locks discipline with `EXIT_KILLED`
 /// recorded as its retained exit reason in the same hold
-/// (`kill_under_all_locks`, draining every run queue); CPUs found
+/// (`exit_under_all_locks`, draining every run queue); CPUs found
 /// running one are recorded. Phase 2, with the registry released — a CPU
 /// spinning on the registry lock inside `register` cannot deschedule, so it
 /// must not be waited for while the lock is held — prods those CPUs and

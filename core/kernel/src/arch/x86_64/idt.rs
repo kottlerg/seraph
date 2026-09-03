@@ -326,12 +326,9 @@ unsafe extern "C" fn common_exception_handler(
             // observes the reason alongside the Exited transition.
             // SAFETY: tcb validated non-null.
             unsafe {
-                (*tcb).exit_reason = 0x1000 + vector;
-                // Committing Exited: a refusal means a teardown already did.
-                let _ = crate::sched::set_state_under_all_locks(
-                    tcb,
-                    crate::sched::thread::ThreadState::Exited,
-                );
+                // Reason and Exited written under one all-locks hold; a
+                // refusal means a teardown already committed both.
+                let _ = crate::sched::exit_under_all_locks(tcb, 0x1000 + vector);
             }
 
             // Post death notification if bound (exit_reason = EXIT_FAULT_BASE + vector).

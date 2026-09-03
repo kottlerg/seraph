@@ -126,7 +126,7 @@ The transition table below pins every ThreadState write to a syscall/event, the 
 | `Running` | `Stopped` | `sys_thread_stop` on running target | calling CPU | `set_state_under_all_locks(Stopped)`; if running on a remote CPU, `prod_remote_cpu(run_cpu)` and spin until `sched_remote.current != tcb` |
 | `Ready` | `Stopped` | `sys_thread_stop` on a Ready target | calling CPU | `set_state_under_all_locks(Stopped)`; the helper also walks every CPU's run queue and calls `remove_from_queue` inside the all-locks region. See § *Stopped/Exited drain* below. |
 | `Blocked` | `Stopped` | `sys_thread_stop` on blocked target | calling CPU | `cancel_ipc_block` first (acquires the source IPC lock and unlinks the waiter), then `set_state_under_all_locks(Stopped)` |
-| `*` | `Exited` | `sys_thread_exit` (self) or fault handler | running CPU | `set_state_under_all_locks(Exited)` (on the dying CPU), then `schedule(false)` |
+| `*` | `Exited` | `sys_thread_exit` (self) or fault handler | running CPU | `exit_under_all_locks(reason)` (on the dying CPU; the exit reason and `Exited` are written in one all-locks hold, refused if already `Exited`), then `schedule(false)` |
 | `*` | `Exited` | `dealloc_object(Thread)` (refcount → 0) | calling CPU | acquires `(*tcb).sched_lock` (outer), then every CPU's scheduler.lock in ascending order, writes `Exited`, walks `remove_from_queue` for every CPU, releases all; then waits unconditionally for `sched.current != tcb` on *every* CPU *and* `tcb.context_saved == 1` (see Cross-CPU TCB Ownership) before freeing |
 | `Exited` | `*` | any lifecycle write (`sys_thread_start`, `sys_thread_stop`, a second exit) | calling CPU | refused: `set_state_under_all_locks` returns `StateCommit::RefusedExited` and `enqueue_ready_thread` returns `false` when the target is `Exited` under the held locks — `Exited` is terminal. A lifecycle syscall's unlocked precheck can race an object teardown (§ Thread Registry) or an exit; `sys_thread_start` then returns `InvalidArgument`, `sys_thread_stop` `InvalidState`, and neither revives the thread. |
 
@@ -875,7 +875,7 @@ it. Phase 1 (`mark_bound_threads`) walks the registry under its lock — a TCB
 found there cannot be unregistered, and so cannot be freed, until the walk
 ends — and for each bound thread not already `Exited`: cancels its IPC block
 if `Blocked` (`cancel_ipc_block`, the `sys_thread_stop` primitive), writes
-`Exited` under the all-locks discipline (`kill_under_all_locks`, draining
+`Exited` under the all-locks discipline (`exit_under_all_locks`, draining
 every run queue) with `EXIT_KILLED` recorded as its retained exit reason in
 the same hold (not posted: kernel-initiated teardown is silent, as for a
 thread reaped through its own capability; a commit refused because the thread

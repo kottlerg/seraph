@@ -1272,8 +1272,8 @@ fn pre_grow_for_explicit_slot(
         match step
         {
             Ok(true) => return Ok(()),
-            // Budget for this hold spent with leaves still missing: the next
-            // iteration takes a fresh hold.
+            // Leaf batch for this hold spent with leaves still missing: the
+            // next iteration takes a fresh hold.
             Ok(false) =>
             {}
             Err(e) => return Err(e),

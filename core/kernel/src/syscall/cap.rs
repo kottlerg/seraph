@@ -9,11 +9,13 @@
 //! Returns a slot index on success.
 //!
 //! # Adding a new capability creation syscall
-//! 1. Allocate any secondary state (e.g. `EndpointState`).
-//! 2. Allocate the kernel object (`Box::new(FooObject { ... })`).
-//! 3. Call `nonnull_from_box` to get a `NonNull<KernelObjectHeader>`.
-//! 4. Call `(*cspace).insert_cap(tag, rights, nonnull)`.
-//! 5. Return the slot index as `u64`.
+//! 1. Look the source Memory cap up with `RETYPE` and carve the object's
+//!    bytes with `retype_allocate` (`dispatch_for` gives the size).
+//! 2. Construct the wrapper, and any inline state, in place at the carved
+//!    offset with `KernelObjectHeader::with_ancestor`.
+//! 3. Insert with `insert_cap_handle_typed` under the `CSpace` lock, rolling
+//!    the carve back (`retype_free`) on failure.
+//! 4. Return the handle as `u64`.
 
 // cast_possible_truncation: all u64→u32 casts in this file extract cap slot indices
 // from 64-bit trap frame registers. Seraph runs on 64-bit only; slot indices are
@@ -1177,6 +1179,12 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// reference dropped here is the last: the destination's teardown runs here
 /// and the caller gets `InvalidCapability`.
 ///
+/// Residual: from the `dec_ref` here to the caller's next touch of the
+/// destination under `DERIVATION_LOCK`, the same race stays open — the
+/// `lookup_cap` residual, confined to a sibling thread of the caller's own
+/// process (the caller holds a destination capability in its own `CSpace`,
+/// so nobody else can drop the last one).
+///
 /// # Safety
 /// `dest_obj` must be the header of the live `CSpaceKernelObject` wrapping
 /// `dest_cs_ptr`; no scheduler, IPC-source, registry, or derivation lock
@@ -1348,6 +1356,8 @@ pub fn sys_cap_copy(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // back on failure. The destination wrapper is held across it.
     if dest_slot_idx != 0
     {
+        // May run the destination's teardown if its last capability went
+        // meanwhile (see pre_grow_holding_dest).
         // SAFETY: dest_obj is the live wrapper resolved above; no lock held.
         unsafe { pre_grow_holding_dest(dest_obj, dest_cs_ptr, dest_slot_idx)? };
     }
@@ -2243,6 +2253,8 @@ pub fn sys_cap_move(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // Pre-grow for the explicit destination before the heavyweight locks:
     // bounded holds, budget fast-fail (see pre_grow_for_explicit_slot), the
     // destination wrapper held across it.
+    // May run the destination's teardown if its last capability went
+    // meanwhile (see pre_grow_holding_dest).
     // SAFETY: dest_obj is the live wrapper resolved above; no lock held.
     unsafe { pre_grow_holding_dest(dest_obj, dest_cs_ptr, dest_idx)? };
 

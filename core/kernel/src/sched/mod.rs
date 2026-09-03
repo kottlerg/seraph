@@ -2006,6 +2006,35 @@ pub unsafe fn set_state_under_all_locks(
     new_state: thread::ThreadState,
 ) -> StateCommit
 {
+    // SAFETY: caller contract.
+    unsafe { commit_state_under_all_locks(tcb, new_state, None) }
+}
+
+/// Mark `tcb` `Exited` with `exit_reason` recorded under the same all-locks
+/// hold as the state write — the object-teardown walk's commit. A refused
+/// commit (the thread exited on its own meanwhile) writes neither, so the
+/// thread's own reason survives.
+///
+/// # Safety
+/// As for [`set_state_under_all_locks`].
+#[cfg(not(test))]
+pub unsafe fn kill_under_all_locks(tcb: *mut ThreadControlBlock, exit_reason: u64) -> StateCommit
+{
+    // SAFETY: caller contract.
+    unsafe { commit_state_under_all_locks(tcb, thread::ThreadState::Exited, Some(exit_reason)) }
+}
+
+/// Shared body of [`set_state_under_all_locks`] and [`kill_under_all_locks`].
+///
+/// # Safety
+/// As for [`set_state_under_all_locks`].
+#[cfg(not(test))]
+unsafe fn commit_state_under_all_locks(
+    tcb: *mut ThreadControlBlock,
+    new_state: thread::ThreadState,
+    exit_reason: Option<u64>,
+) -> StateCommit
+{
     let cpu_count = CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
 
     // Acquire (*tcb).sched_lock FIRST (outermost): the lifecycle Stopped/Exited
@@ -2042,8 +2071,13 @@ pub unsafe fn set_state_under_all_locks(
         // `sched_lock` (`core/kernel/src/syscall/thread.rs`), which this path
         // also holds (outer), so the priority read here is serialised against
         // that writer.
-        // SAFETY: tcb validated by caller; state/priority fields always valid.
+        // SAFETY: tcb validated by caller; state/priority/exit_reason fields
+        // always valid.
         let priority = unsafe {
+            if let Some(reason) = exit_reason
+            {
+                (*tcb).exit_reason = reason;
+            }
             (*tcb).state = new_state;
             (*tcb).priority
         };
@@ -2340,11 +2374,11 @@ unsafe fn mark_bound_threads(
                 crate::syscall::thread::cancel_ipc_block(tcb);
             }
             // Retained reason for `CAP_INFO_THREAD_STATE` and late-bound
-            // observers, written before the Exited commit like every other
-            // exit path. Not posted: kernel-initiated teardown is silent,
-            // as for a thread reaped through its own capability.
-            (*tcb).exit_reason = syscall::EXIT_KILLED;
-            let committed = set_state_under_all_locks(tcb, thread::ThreadState::Exited);
+            // observers, written under the same hold as the Exited commit so
+            // a thread that exited on its own meanwhile (commit refused)
+            // keeps its own reason. Not posted: kernel-initiated teardown is
+            // silent, as for a thread reaped through its own capability.
+            let committed = kill_under_all_locks(tcb, syscall::EXIT_KILLED);
             if is_self
             {
                 self_bound = true;
@@ -2502,6 +2536,10 @@ pub unsafe fn stop_threads_bound_to(bound: impl Fn(*mut ThreadControlBlock) -> b
             stopped = true;
             break;
         }
+        if warn.due()
+        {
+            crate::kprintln!("kernel: stop_threads_bound_to spin >100ms on cpu {this_cpu}");
+        }
         // SAFETY: preempt disabled; no scheduler lock held.
         match unsafe { scan_bound_current(&bound, this_cpu) }
         {
@@ -2515,14 +2553,7 @@ pub unsafe fn stop_threads_bound_to(bound: impl Fn(*mut ThreadControlBlock) -> b
                     break;
                 }
             }
-            BoundScan::Waiting =>
-            {
-                if warn.due()
-                {
-                    crate::kprintln!("kernel: stop_threads_bound_to spin >100ms on cpu {this_cpu}");
-                }
-                core::hint::spin_loop();
-            }
+            BoundScan::Waiting => core::hint::spin_loop(),
         }
     }
     spin_site_exit();
@@ -2591,6 +2622,15 @@ pub unsafe fn set_state_under_all_locks(
     _tcb: *mut ThreadControlBlock,
     _new_state: thread::ThreadState,
 ) -> StateCommit
+{
+    StateCommit::Committed(None)
+}
+
+/// Test stub.
+#[cfg(test)]
+#[allow(unused_variables)]
+pub unsafe fn kill_under_all_locks(_tcb: *mut ThreadControlBlock, _exit_reason: u64)
+-> StateCommit
 {
     StateCommit::Committed(None)
 }

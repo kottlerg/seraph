@@ -869,22 +869,24 @@ walk halts the kernel (`fatal`), since a thread it cannot reach could still be
 running on the object being freed.
 
 **Object teardown (`stop_threads_bound_to`).** Deleting the last capability to
-a `CSpace` or `AddressSpace` must not free storage a bound thread is still using,
-so `dealloc_object` for either type first stops every thread bound to it. Phase
-1 (`mark_bound_threads`) walks the registry under its lock — a TCB found there
-cannot be unregistered, and so cannot be freed, until the walk ends — and for
-each bound thread not already `Exited`: cancels its IPC block if `Blocked`
-(`cancel_ipc_block`, the `sys_thread_stop` primitive), records `EXIT_KILLED` as
-its retained exit reason (not posted: kernel-initiated teardown is silent, as
-for a thread reaped through its own capability), writes `Exited` under the
-all-locks discipline (`set_state_under_all_locks`, draining every run queue),
-and records the CPU it was running on. Phase 2, after releasing the registry
-lock, prods those CPUs and spins — interrupts enabled, preemption disabled, as
-the dealloc UAF gate does — until no CPU other than the caller's has a bound
-thread as `current`. A bound thread found `current` but not `Exited` was bound
-after the walk (a `sys_cap_create_thread` whose unlocked cap lookup raced the
-object's last delete); the loop returns to phase 1 for it. The spin has no
-bound and warns once after 100 ms.
+a `CSpace` or `AddressSpace` must not free storage a bound thread is still
+using, so `dealloc_object` for either type first stops every thread bound to
+it. Phase 1 (`mark_bound_threads`) walks the registry under its lock — a TCB
+found there cannot be unregistered, and so cannot be freed, until the walk
+ends — and for each bound thread not already `Exited`: cancels its IPC block
+if `Blocked` (`cancel_ipc_block`, the `sys_thread_stop` primitive), writes
+`Exited` under the all-locks discipline (`kill_under_all_locks`, draining
+every run queue) with `EXIT_KILLED` recorded as its retained exit reason in
+the same hold (not posted: kernel-initiated teardown is silent, as for a
+thread reaped through its own capability; a commit refused because the thread
+exited on its own meanwhile writes neither), and records the CPU it was
+running on. Phase 2, after releasing the registry lock, prods those CPUs and
+spins — interrupts enabled, preemption disabled, as the dealloc UAF gate does
+— until no CPU other than the caller's has a bound thread as `current`. A
+bound thread found `current` but not `Exited` was bound after the walk (a
+`sys_cap_create_thread` whose unlocked cap lookup raced the object's last
+delete); the loop returns to phase 1 for it. The spin has no bound and warns
+once after 100 ms.
 
 *The caller is itself stopped.* `stop_threads_bound_to` returns `true`, and
 skips the wait, when the running thread has been marked `Exited`: it was bound

@@ -126,9 +126,8 @@ impl From<CapError> for syscall::SyscallError
 
 /// One page of capability slots.
 ///
-/// Allocated either from the kernel heap (legacy bootstrap path) or popped
-/// from the parent `CSpaceKernelObject`'s growth pool (typed-memory path).
-/// All-zeros is a valid initial state (every slot is null).
+/// Popped from the owning `CSpaceKernelObject`'s growth pool (host tests
+/// box one). All-zeros is a valid initial state (every slot is null).
 #[repr(C)]
 struct CSpacePage
 {

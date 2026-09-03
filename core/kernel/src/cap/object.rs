@@ -51,7 +51,7 @@ use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
 /// Discriminant for the concrete type behind a `*mut KernelObjectHeader`.
 ///
-/// Used during deallocation to reconstruct the original `Box<ConcreteObject>`.
+/// Used during deallocation to select the concrete type's teardown arm.
 /// Values must not be renumbered after assignment.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -77,12 +77,11 @@ pub enum ObjectType
 /// Common header at offset 0 of every kernel object.
 ///
 /// The `ref_count` tracks how many capability slots reference this object.
-/// When `dec_ref` returns 0, the object has no remaining references and can
-/// be freed (future phases will handle deallocation via `obj_type`).
+/// When `dec_ref` returns 0, the object has no remaining references and
+/// `dealloc_object` frees it, dispatching on `obj_type`.
 ///
 /// `ancestor` is a direct pointer to the `MemoryObject`'s header from which
-/// this object was retyped, or null if heap-allocated (legacy path).
-/// Auto-reclaim consults this on `dec_ref → 0` to credit bytes back to the
+/// this object was retyped. Auto-reclaim consults this on `dec_ref → 0` to credit bytes back to the
 /// source `MemoryObject` and return the chunk to the per-Memory-cap allocator.
 ///
 /// A direct pointer (rather than a `SlotId`) is necessary because the source
@@ -107,9 +106,9 @@ pub struct KernelObjectHeader
     // Padding to reach 8-byte alignment for the ancestor pointer below.
     #[allow(clippy::pub_underscore_fields)]
     pub _pad: [u8; 2],
-    /// Pointer to the `MemoryObject`'s header this object was retyped from,
-    /// or null if allocated via the legacy heap path. Set once at creation,
-    /// read at deallocation. `AtomicPtr` for the unforgeable null sentinel
+    /// Pointer to the `MemoryObject`'s header this object was retyped from;
+    /// every production object has one (null only in host tests). Set once
+    /// at creation, read at deallocation. `AtomicPtr` for the unforgeable null sentinel
     /// without imposing const-init constraints on construction.
     pub ancestor: AtomicPtr<KernelObjectHeader>,
 }
@@ -133,7 +132,7 @@ impl KernelObjectHeader
 {
     /// Construct a new header with `ref_count = 1` and no ancestor cap.
     ///
-    /// Used by the legacy heap-allocation path. The retype primitive uses
+    /// Used by host tests only; production objects are retyped and use
     /// [`Self::with_ancestor`] to record the source `MemoryObject` for
     /// auto-reclaim.
     pub fn new(obj_type: ObjectType) -> Self
@@ -453,9 +452,8 @@ pub struct SbiControlObject
 pub struct ThreadObject
 {
     pub header: KernelObjectHeader,
-    /// Pointer to the TCB. Heap-allocated for legacy threads; for retype-
-    /// backed threads it points inside the same five-page retype slot that
-    /// holds the kstack and this wrapper. Discriminated by `header.ancestor`.
+    /// Pointer to the TCB, inside the same retype slot that holds the kstack
+    /// and this wrapper.
     pub tcb: *mut crate::sched::thread::ThreadControlBlock,
     /// Intrusive link for the per-CPU deferred self-teardown reclaim stack
     /// ([`drain_deferred_reclaim`]). Non-null only while this object sits on
@@ -1187,13 +1185,14 @@ unsafe fn defer_self_teardown(ptr: NonNull<KernelObjectHeader>, what: &str)
 /// count has reached zero, or it is a fresh body that was never published
 /// (see Safety).
 ///
-/// Dispatches on `obj_type` to reconstruct the original `Box<ConcreteObject>`
-/// and drop it, freeing any sub-resources first.
+/// Dispatches on `obj_type` to run the concrete type's teardown in place,
+/// freeing any sub-resources first, then returns the object's bytes to its
+/// ancestor `MemoryObject`.
 ///
 /// # Safety
 ///
-/// - `ptr` must be a valid, non-null pointer originally produced by
-///   `Box::into_raw` (cast to `*mut KernelObjectHeader`).
+/// - `ptr` must be the header of a live object constructed in place in
+///   retype-backed storage (the header sits at offset 0 of its wrapper).
 /// - No capability slot may reference the object: its reference count is 0,
 ///   or it is a fresh body that was never published (a range split's
 ///   rollback frees such bodies at their initial count of 1).
@@ -2437,10 +2436,9 @@ unsafe fn dealloc_object_one(
         // ── Endpoint ──────────────────────────────────────────────────────
         ObjectType::Endpoint =>
         {
-            // Distinguish heap-allocated (legacy) Endpoints from retype-backed
-            // ones by inspecting `header.ancestor`. Both share the same teardown
-            // logic for blocked queues and wait-set linkage; only the final
-            // memory-reclaim step differs.
+            // `header.ancestor` names the source Memory object (every Endpoint
+            // is retype-backed): the blocked-queue and wait-set teardown runs,
+            // then the slot is reclaimed to it.
             let ancestor_ptr = header.ancestor.load(Ordering::Acquire);
 
             // SAFETY: ptr originally points to an EndpointObject; header at offset 0.
@@ -2606,7 +2604,7 @@ unsafe fn dealloc_object_one(
         // ── Notification ────────────────────────────────────────────────────────
         ObjectType::Notification =>
         {
-            // Branch on `header.ancestor`: heap-backed (legacy) vs retype-backed.
+            // `header.ancestor` names the source Memory object the slot returns to.
             let ancestor_ptr = header.ancestor.load(Ordering::Acquire);
 
             // SAFETY: ptr originally points to a NotificationObject; header at offset 0.

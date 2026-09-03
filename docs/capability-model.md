@@ -615,7 +615,7 @@ deleting thread itself, when it holds that last capability to its own
 process's resources are reclaimed as their capability reference counts reach
 zero.
 
-The kernel's only role in death is *notification*. An `AddressSpace` carries a
+Beyond that stop, the kernel's role in death is *notification*. An `AddressSpace` carries a
 death-observer set (mirroring the per-thread death observers). On a terminal
 fault by any thread in the address space — no fault handler bound, or the handler
 replied `KILL` — the kernel posts the fault class (`EXIT_FAULT_BASE + vector`) to

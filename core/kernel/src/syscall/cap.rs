@@ -1169,6 +1169,40 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     }
 }
 
+/// Pre-grow `dest_cs_ptr` for `dest_idx` while holding a reference on the
+/// destination's wrapper (`dest_obj`): the pre-grow's holds are preemptible
+/// and the caller's destination lookup takes no reference, so without one a
+/// concurrent delete of the last capability to the destination could
+/// reclaim the wrapper under the walk. If that delete happens meanwhile, the
+/// reference dropped here is the last: the destination's teardown runs here
+/// and the caller gets `InvalidCapability`.
+///
+/// # Safety
+/// `dest_obj` must be the header of the live `CSpaceKernelObject` wrapping
+/// `dest_cs_ptr`; no scheduler, IPC-source, registry, or derivation lock
+/// may be held (the teardown takes them).
+#[cfg(not(test))]
+unsafe fn pre_grow_holding_dest(
+    dest_obj: core::ptr::NonNull<crate::cap::object::KernelObjectHeader>,
+    dest_cs_ptr: *mut crate::cap::cspace::CSpace,
+    dest_idx: u32,
+) -> Result<(), SyscallError>
+{
+    // SAFETY: dest_obj is a live header per the caller contract.
+    unsafe { dest_obj.as_ref().inc_ref() };
+    let grown = pre_grow_for_explicit_slot(dest_cs_ptr, dest_idx);
+    // SAFETY: matches the inc_ref above.
+    let remaining = unsafe { dest_obj.as_ref().dec_ref() };
+    if remaining == 0
+    {
+        // SAFETY: refcount reached zero here; no slot references the object
+        // and no conflicting lock is held (caller contract).
+        unsafe { crate::cap::object::dealloc_object(dest_obj) };
+        return Err(SyscallError::InvalidCapability);
+    }
+    grown
+}
+
 /// Leaves materialised per `CSpace`-lock hold while pre-growing for an
 /// explicit destination slot (each leaf costs one page zeroing plus
 /// free-list threading; 64 keeps the interrupts-off hold small).
@@ -1292,23 +1326,30 @@ pub fn sys_cap_copy(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             crate::cap::slot::CsRights::INSERT,
         )
     }?;
+    let dest_obj = dest_cs_slot.object.ok_or(SyscallError::InvalidCapability)?;
     let dest_cs_ptr = {
-        let obj = dest_cs_slot.object.ok_or(SyscallError::InvalidCapability)?;
         // cast_ptr_alignment: header is at offset 0 of CSpaceKernelObject; allocator guarantees alignment.
         #[allow(clippy::cast_ptr_alignment)]
         // SAFETY: cap tag confirmed CSpace; object pointer is valid.
-        let cs_obj = unsafe { &*(obj.as_ptr().cast::<CSpaceKernelObject>()) };
+        let cs_obj = unsafe { &*(dest_obj.as_ptr().cast::<CSpaceKernelObject>()) };
         cs_obj.cspace
     };
     // SAFETY: dest_cs_ptr extracted from validated CSpace object above.
     let dest_cs_id = unsafe { (*dest_cs_ptr).id() };
 
+    // Fail fast on an invalid or stale source before the pre-grow spends
+    // pool pages that stay spent (`syscalls.md`, SYS_CAP_COPY); the source
+    // is resolved again below, right before its reference is taken.
+    // SAFETY: caller_cspace validated non-null above.
+    unsafe { resolve_src_cap(caller_cspace, src_handle)? };
+
     // Pre-grow for an explicit destination before the inc_ref and the
     // destination lock: bounded holds, budget fast-fail, nothing to roll
-    // back on failure.
+    // back on failure. The destination wrapper is held across it.
     if dest_slot_idx != 0
     {
-        pre_grow_for_explicit_slot(dest_cs_ptr, dest_slot_idx)?;
+        // SAFETY: dest_obj is the live wrapper resolved above; no lock held.
+        unsafe { pre_grow_holding_dest(dest_obj, dest_cs_ptr, dest_slot_idx)? };
     }
 
     // Resolve the source only now, after the pre-grow's preemptible lock
@@ -1321,9 +1362,9 @@ pub fn sys_cap_copy(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     let (src_tag, src_rights, src_object, src_badge) =
         unsafe { resolve_src_cap(caller_cspace, src_handle)? };
 
-    // Convert src_idx to NonZeroU32 before any state mutation. The non-null
-    // tag check above excludes slot 0 (which is permanently Null), so this
-    // only fires on a malformed request.
+    // Convert src_idx to NonZeroU32 before the reference is taken. The
+    // non-null tag check above excludes slot 0 (which is permanently Null),
+    // so this only fires on a malformed request.
     let src_idx_nz = core::num::NonZeroU32::new(src_idx).ok_or(SyscallError::InvalidCapability)?;
 
     // Compute the effective rights for the copy: intersection of the requested
@@ -2134,12 +2175,12 @@ pub fn sys_cap_move(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             crate::cap::slot::CsRights::INSERT,
         )
     }?;
+    let dest_obj = dest_cs_slot.object.ok_or(SyscallError::InvalidCapability)?;
     let dest_cs_ptr = {
-        let obj = dest_cs_slot.object.ok_or(SyscallError::InvalidCapability)?;
         // cast_ptr_alignment: header is at offset 0 of CSpaceKernelObject; allocator guarantees alignment.
         #[allow(clippy::cast_ptr_alignment)]
         // SAFETY: cap tag confirmed CSpace; object pointer is valid.
-        let cs_obj = unsafe { &*(obj.as_ptr().cast::<CSpaceKernelObject>()) };
+        let cs_obj = unsafe { &*(dest_obj.as_ptr().cast::<CSpaceKernelObject>()) };
         cs_obj.cspace
     };
 
@@ -2200,8 +2241,10 @@ pub fn sys_cap_move(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         core::num::NonZeroU32::new(dest_idx).ok_or(SyscallError::InvalidCapability)?;
 
     // Pre-grow for the explicit destination before the heavyweight locks:
-    // bounded holds, budget fast-fail (see pre_grow_for_explicit_slot).
-    pre_grow_for_explicit_slot(dest_cs_ptr, dest_idx)?;
+    // bounded holds, budget fast-fail (see pre_grow_for_explicit_slot), the
+    // destination wrapper held across it.
+    // SAFETY: dest_obj is the live wrapper resolved above; no lock held.
+    unsafe { pre_grow_holding_dest(dest_obj, dest_cs_ptr, dest_idx)? };
 
     crate::cap::DERIVATION_LOCK.write_lock();
 
@@ -2222,7 +2265,8 @@ pub fn sys_cap_move(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             None => Some(SyscallError::InvalidCapability),
             Some(slot)
                 if slot.tag == crate::cap::slot::CapTag::Null
-                    || slot.generation() != syscall::cap_handle_gen(src_handle) =>
+                    || slot.generation() != syscall::cap_handle_gen(src_handle)
+                    || slot.object != Some(src_object) =>
             {
                 Some(SyscallError::InvalidCapability)
             }

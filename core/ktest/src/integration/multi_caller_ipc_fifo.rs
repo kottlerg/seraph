@@ -49,9 +49,13 @@ static CALLER_ARGS: spawn::ArgBlock<CallerArgs, 3> = spawn::ArgBlock::new(Caller
 });
 
 /// Publish caller `index`'s arguments and return the entry address.
-fn caller_arg(index: usize, ep: u32, done: u32, label: u64) -> u64
+///
+/// # Safety
+///
+/// `index < 3`, and that caller has not been started yet in this run.
+unsafe fn caller_arg(index: usize, ep: u32, done: u32, label: u64) -> u64
 {
-    // SAFETY: entry `index` is that caller's alone, published before its start.
+    // SAFETY: caller contract (entry `index` is that caller's alone).
     unsafe { CALLER_ARGS.publish(index, CallerArgs { ep, done, label }) }
 }
 
@@ -70,7 +74,8 @@ pub fn run(ctx: &TestContext) -> TestResult
         .map_err(|_| "multi_caller_ipc_fifo: ep_a failed")?;
     let done_a = cap_copy(done, child_a.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
         .map_err(|_| "multi_caller_ipc_fifo: done_a failed")?;
-    let arg_a = caller_arg(0, ep_a, done_a, 1);
+    // SAFETY: entry 0 is caller A's, not yet started.
+    let arg_a = unsafe { caller_arg(0, ep_a, done_a, 1) };
     let stack_a = ChildStack::top(core::ptr::addr_of!(STACK_A));
     // Pin to CPU 0 so sleep-based FIFO ordering is reliable under SMP.
     spawn::configure_and_start_pinned(&child_a, caller_entry, stack_a, arg_a, 0)
@@ -85,7 +90,8 @@ pub fn run(ctx: &TestContext) -> TestResult
         .map_err(|_| "multi_caller_ipc_fifo: ep_b failed")?;
     let done_b = cap_copy(done, child_b.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
         .map_err(|_| "multi_caller_ipc_fifo: done_b failed")?;
-    let arg_b = caller_arg(1, ep_b, done_b, 2);
+    // SAFETY: entry 1 is caller B's, not yet started.
+    let arg_b = unsafe { caller_arg(1, ep_b, done_b, 2) };
     let stack_b = ChildStack::top(core::ptr::addr_of!(STACK_B));
     spawn::configure_and_start_pinned(&child_b, caller_entry, stack_b, arg_b, 0)
         .map_err(|_| "multi_caller_ipc_fifo: start B failed")?;
@@ -97,7 +103,8 @@ pub fn run(ctx: &TestContext) -> TestResult
         .map_err(|_| "multi_caller_ipc_fifo: ep_c failed")?;
     let done_c = cap_copy(done, child_c.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
         .map_err(|_| "multi_caller_ipc_fifo: done_c failed")?;
-    let arg_c = caller_arg(2, ep_c, done_c, 3);
+    // SAFETY: entry 2 is caller C's, not yet started.
+    let arg_c = unsafe { caller_arg(2, ep_c, done_c, 3) };
     let stack_c = ChildStack::top(core::ptr::addr_of!(STACK_C));
     spawn::configure_and_start_pinned(&child_c, caller_entry, stack_c, arg_c, 0)
         .map_err(|_| "multi_caller_ipc_fifo: start C failed")?;

@@ -57,8 +57,8 @@ pub fn mmio_map(ctx: &TestContext) -> TestResult
     // the cap intact, so the scan is non-destructive until a split succeeds.
     // The scan bound is the cspace's backed capacity (queried at runtime)
     // so the test stays robust against cap mint order.
-    let scan_bound = scan_bound(ctx);
-    for slot in 1..=scan_bound
+    let bound = scan_bound(ctx);
+    for slot in 1..=bound
     {
         let Ok((lo, _hi)) = mmio_split(slot, 0x1000)
         else
@@ -102,8 +102,8 @@ pub fn irq_register_ack(ctx: &TestContext) -> TestResult
 
     // The scan bound is the cspace's backed capacity (queried at runtime)
     // so the test stays robust against cap mint order.
-    let scan_bound = scan_bound(ctx);
-    for slot in 1..=scan_bound
+    let bound = scan_bound(ctx);
+    for slot in 1..=bound
     {
         match irq_register(slot, irq_sig)
         {
@@ -163,8 +163,8 @@ pub fn ioport_bind(ctx: &TestContext) -> TestResult
         let th = cap_create_thread(ctx.memory_base, ctx.aspace_cap, cs, 0, 0)
             .map_err(|_| "cap_create_thread for ioport_bind test failed")?;
 
-        let scan_bound = scan_bound(ctx);
-        for slot in 1u32..=scan_bound
+        let bound = scan_bound(ctx);
+        for slot in 1u32..=bound
         {
             match syscall::ioport_bind(th, slot)
             {
@@ -233,8 +233,8 @@ pub fn ioport_split(ctx: &TestContext) -> TestResult
     // reachable, regardless of how the cspace has grown.
     #[cfg(target_arch = "x86_64")]
     {
-        let scan_bound = scan_bound(ctx);
-        for slot in 1u32..=scan_bound
+        let bound = scan_bound(ctx);
+        for slot in 1u32..=bound
         {
             // Try splitting at 0x80. If the slot is not an IoPort we
             // get InvalidCapability and keep scanning. If it is an
@@ -295,9 +295,9 @@ pub fn ioport_split(ctx: &TestContext) -> TestResult
 /// with disjoint base/size. Skipped if no suitable cap exists.
 pub fn mmio_split_carves(ctx: &TestContext) -> TestResult
 {
-    let scan_bound = scan_bound(ctx);
+    let bound = scan_bound(ctx);
 
-    for slot in 1u32..=scan_bound
+    for slot in 1u32..=bound
     {
         // Probe: split at PAGE_SIZE. InvalidCapability ⇒ wrong tag.
         // InvalidArgument ⇒ Mmio exists but too small.
@@ -342,9 +342,9 @@ pub fn mmio_split_wrong_tag_err(ctx: &TestContext) -> TestResult
 /// disjoint children. Skipped if no suitable cap exists.
 pub fn irq_split_carves(ctx: &TestContext) -> TestResult
 {
-    let scan_bound = scan_bound(ctx);
+    let bound = scan_bound(ctx);
 
-    for slot in 1u32..=scan_bound
+    for slot in 1u32..=bound
     {
         // Probe: split at base+1. Wrong-tag and unsplittable-range responses
         // both leave the cap intact.

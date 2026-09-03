@@ -18,14 +18,12 @@
 //! `MemoryObject`'s header pointer in `header.ancestor` so dealloc can
 //! reclaim the bytes back to the source cap. Init's bootstrap state
 //! (root `CSpace`, init's own `AddressSpace`/`Thread`/`CSpace`) and the
-//! Phase-7 boot-time identity wrappers remain heap-allocated for now;
-//! they have `header.ancestor == null` and dealloc through the legacy
-//! `Box::from_raw` path.
+//! Phase-7 boot-time identity wrappers are retyped from the SEED reserve
+//! (`boot_retype_*`, `mint_phase7_body`) and carry the SEED ancestor.
 //!
-//! Deallocation: read `header.obj_type` from the raw pointer; if
-//! `header.ancestor` is null, drop the originating `Box<ConcreteObject>`;
-//! otherwise drop the object in place and call `retype_free` against
-//! the ancestor `MemoryObject`.
+//! Deallocation: read `header.obj_type` from the raw pointer, drop the
+//! object in place, and call `retype_free` against the ancestor
+//! `MemoryObject`; every object has one.
 //!
 //! ## Sizes (verified by tests below)
 //!
@@ -913,10 +911,8 @@ impl CSpaceKernelObject
 pub struct EndpointObject
 {
     pub header: KernelObjectHeader,
-    /// Pointer to the endpoint's mutable state. For retype-backed Endpoints
-    /// the state lives inline at `wrapper + 8`; for legacy heap-allocated
-    /// Endpoints it points at a separate `Box<EndpointState>`. The
-    /// `header.ancestor` discriminant tells the dealloc path which is which.
+    /// Pointer to the endpoint's mutable state, inline at `wrapper + 8` in
+    /// the same retype slot.
     pub state: *mut crate::ipc::endpoint::EndpointState,
 }
 
@@ -930,9 +926,8 @@ unsafe impl Sync for EndpointObject {}
 pub struct NotificationObject
 {
     pub header: KernelObjectHeader,
-    /// Pointer to the notification's mutable state. Inline for retype-backed
-    /// Notifications, separately heap-allocated for legacy Notifications; discriminated
-    /// by `header.ancestor`.
+    /// Pointer to the notification's mutable state, inline in the same retype
+    /// slot.
     pub state: *mut crate::ipc::notification::NotificationState,
 }
 
@@ -943,19 +938,15 @@ unsafe impl Sync for NotificationObject {}
 
 /// Kernel object for an event queue (`EventQueue` capability).
 ///
-/// For retype-backed `EventQueue`s the wrapper, `EventQueueState`, and
-/// the ring buffer all live in the same retype slot — the ring is at
-/// offset [`crate::cap::retype::EVENT_QUEUE_RING_OFFSET`] from the wrapper
-/// base, and the slot is reclaimed wholesale via `retype_free`. Legacy
-/// heap-allocated `EventQueue`s keep `EventQueueState` and the ring as
-/// separate heap allocations.
+/// The wrapper, `EventQueueState`, and the ring buffer all live in the same
+/// retype slot — the ring is at offset
+/// [`crate::cap::retype::EVENT_QUEUE_RING_OFFSET`] from the wrapper base,
+/// and the slot is reclaimed wholesale via `retype_free`.
 #[repr(C)]
 pub struct EventQueueObject
 {
     pub header: KernelObjectHeader,
-    /// Pointer to the event-queue state — inline for retype-backed,
-    /// separately heap-allocated for legacy. Discriminated by
-    /// `header.ancestor`.
+    /// Pointer to the event-queue state, inline in the same retype slot.
     pub state: *mut crate::ipc::event_queue::EventQueueState,
 }
 
@@ -967,16 +958,13 @@ unsafe impl Sync for EventQueueObject {}
 /// Kernel object for a wait set (`WaitSet` capability).
 ///
 /// `WaitSetState` is the ~480-byte body holding member slots and the ready
-/// ring; for retype-backed wait sets it lives inline immediately after the
-/// 24-byte wrapper within a single `BIN_512` retype slot. Legacy heap-
-/// allocated wait sets keep the state as a separate heap allocation.
+/// ring; it lives inline immediately after the 24-byte wrapper within a single
+/// `BIN_512` retype slot.
 #[repr(C)]
 pub struct WaitSetObject
 {
     pub header: KernelObjectHeader,
-    /// Pointer to the wait-set state — inline for retype-backed,
-    /// separately heap-allocated for legacy. Discriminated by
-    /// `header.ancestor`.
+    /// Pointer to the wait-set state, inline in the same retype slot.
     pub state: *mut crate::ipc::wait_set::WaitSetState,
 }
 

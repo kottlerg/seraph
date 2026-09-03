@@ -1283,22 +1283,6 @@ pub fn sys_cap_copy(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // SAFETY: caller_cspace validated non-null above.
     let caller_cspace_id = unsafe { (*caller_cspace).id() };
 
-    // Resolve source slot (any non-null tag, any rights — just non-null).
-    // SAFETY: caller_cspace validated non-null above. Decodes + generation-
-    // checks the source handle, rejecting a stale handle to a recycled slot.
-    let (src_tag, src_rights, src_object, src_badge) =
-        unsafe { resolve_src_cap(caller_cspace, src_handle)? };
-
-    // Convert src_idx to NonZeroU32 before any state mutation. The non-null
-    // tag check above excludes slot 0 (which is permanently Null), so this
-    // only fires on a malformed request.
-    let src_idx_nz = core::num::NonZeroU32::new(src_idx).ok_or(SyscallError::InvalidCapability)?;
-
-    // Compute the effective rights for the copy: intersection of the requested
-    // mask and what the source actually grants. Bits not in the source are
-    // silently dropped — callers cannot escalate.
-    let effective_rights = rights_mask & src_rights;
-
     // Resolve destination CSpace cap.
     // SAFETY: caller_cspace validated non-null above.
     let dest_cs_slot = unsafe {
@@ -1326,6 +1310,26 @@ pub fn sys_cap_copy(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     {
         pre_grow_for_explicit_slot(dest_cs_ptr, dest_slot_idx)?;
     }
+
+    // Resolve the source only now, after the pre-grow's preemptible lock
+    // releases: the object reference is taken immediately below, and a
+    // sibling's delete of the source during a long pre-grow would otherwise
+    // free the body between the resolution and the inc_ref (the residual
+    // window is the lookup itself, as everywhere else).
+    // SAFETY: caller_cspace validated non-null above. Decodes + generation-
+    // checks the source handle, rejecting a stale handle to a recycled slot.
+    let (src_tag, src_rights, src_object, src_badge) =
+        unsafe { resolve_src_cap(caller_cspace, src_handle)? };
+
+    // Convert src_idx to NonZeroU32 before any state mutation. The non-null
+    // tag check above excludes slot 0 (which is permanently Null), so this
+    // only fires on a malformed request.
+    let src_idx_nz = core::num::NonZeroU32::new(src_idx).ok_or(SyscallError::InvalidCapability)?;
+
+    // Compute the effective rights for the copy: intersection of the requested
+    // mask and what the source actually grants. Bits not in the source are
+    // silently dropped — callers cannot escalate.
+    let effective_rights = rights_mask & src_rights;
 
     // Increment reference count on the shared kernel object.
     // SAFETY: src_object is a valid NonNull from a live capability slot.

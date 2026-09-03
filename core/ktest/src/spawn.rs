@@ -62,11 +62,12 @@ impl<T: Copy, const N: usize> ArgBlock<T, N>
     ///
     /// # Safety
     ///
-    /// No child may be reading entry `index`: publish before the start, and
-    /// reuse an entry only after its previous child has exited.
+    /// `index < N`, and no child may be reading entry `index`: publish
+    /// before the start, and reuse an entry only after its previous child
+    /// has exited.
     pub unsafe fn publish(&self, index: usize, value: T) -> u64
     {
-        assert!(index < N, "ArgBlock::publish: index out of range");
+        debug_assert!(index < N, "ArgBlock::publish: index out of range");
         // SAFETY: index < N; exclusive access per the caller contract.
         unsafe {
             let entry = self.0.get().cast::<T>().add(index);

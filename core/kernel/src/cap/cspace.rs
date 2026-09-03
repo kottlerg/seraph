@@ -6,10 +6,10 @@
 //! Capability space implementation.
 //!
 //! A [`CSpace`] is a hybrid two-level radix of [`CapabilitySlot`]s. The
-//! inline root holds [`L1_DIRECT`] pointers to leaf [`CSpacePage`]s (the
+//! inline root holds `L1_DIRECT` pointers to leaf [`CSpacePage`]s (the
 //! direct region, the first `L1_DIRECT × L2_SIZE` slots) plus
-//! [`L1_INDIRECT`] pointers to pool-allocated [`CSpaceDirPage`]s of
-//! [`DIR_FANOUT`] leaf pointers each (the indirect region). Lookup is O(1):
+//! `L1_INDIRECT` pointers to pool-allocated [`CSpaceDirPage`]s of
+//! `DIR_FANOUT` leaf pointers each (the indirect region). Lookup is O(1):
 //! two dereferences in the direct region, three in the indirect. Capacity
 //! is bounded only by the pool pages the owner has donated (see Growth
 //! below) and the structural ceiling, [`MAX_SLOTS_STRUCTURAL`].
@@ -89,7 +89,7 @@ const _: () = assert!(MAX_LEAVES <= u32::MAX as usize);
 #[derive(Debug, PartialEq, Eq)]
 pub enum CapError
 {
-    /// The directory is full: every leaf up to [`MAX_LEAVES`] is populated
+    /// The directory is full: every leaf up to `MAX_LEAVES` is populated
     /// and no free slot remains. A structural ceiling derived from the
     /// directory shape and the cap-handle index width; donating memory
     /// cannot lift it.
@@ -147,7 +147,7 @@ const _: () = assert!(
 
 // ── CSpaceDirPage ─────────────────────────────────────────────────────────────
 
-/// One pool-allocated directory page of the indirect region: [`DIR_FANOUT`]
+/// One pool-allocated directory page of the indirect region: `DIR_FANOUT`
 /// leaf-page pointers. All-zeros (every entry null) is the valid initial
 /// state. Entries are write-once while the `CSpace` is live: published with
 /// Release by [`CSpace::grow`], read with Acquire by the lock-free lookup
@@ -205,14 +205,14 @@ const _: () = assert!(core::mem::size_of::<CSpaceDirPage>() == crate::mm::PAGE_S
 pub struct CSpace
 {
     id: CSpaceId,
-    /// Direct region: inline pointers to the first [`L1_DIRECT`] leaf
+    /// Direct region: inline pointers to the first `L1_DIRECT` leaf
     /// pages. Null = unallocated. Pages come from the retype pool (or the
     /// host heap in the test stub — the `kobj` field discriminates: null =
     /// heap, Drop Box-frees each page; non-null = retype pool,
     /// `dealloc_object(CSpaceObj)` reclaims chunks wholesale).
     direct: [AtomicPtr<CSpacePage>; L1_DIRECT],
     /// Indirect region: inline pointers to pool-allocated directory pages,
-    /// each fanning out to [`DIR_FANOUT`] further leaves. Null =
+    /// each fanning out to `DIR_FANOUT` further leaves. Null =
     /// unallocated.
     indirect: [AtomicPtr<CSpaceDirPage>; L1_INDIRECT],
     /// Grow cursor: leaves `0..next_leaf` are allocated (contiguously);

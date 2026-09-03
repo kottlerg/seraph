@@ -517,10 +517,9 @@ impl PoolChunkSlot
 pub struct AddressSpaceObject
 {
     pub header: KernelObjectHeader,
-    /// Pointer to the `AddressSpace` (heap-allocated; the wrapper's PT pool
-    /// is retype-backed but the `AddressSpace` struct itself, holding the
-    /// root-PT virtual base and per-arch fields, still lives on the kernel
-    /// heap pending a follow-up that retypes init's bootstrap state).
+    /// Pointer to the `AddressSpace`, constructed in place in the wrapper
+    /// page immediately after this struct (`sys_cap_create_aspace`,
+    /// `boot_retype_aspace`); the PT pool below is retype-backed too.
     pub address_space: *mut crate::mm::address_space::AddressSpace,
     /// Bytes available to back new intermediate page-table pages on `mem_map`.
     ///
@@ -676,24 +675,6 @@ pub fn vacant_chunk_slots() -> [PoolChunkSlot; MAX_PT_CHUNKS]
 
 impl AddressSpaceObject
 {
-    /// Test-only heap-backed wrapper with empty pool. Retype-backed wrappers
-    /// are constructed in place by `sys_cap_create_aspace` and (for init's
-    /// bootstrap AS) by `cap::boot_retype_aspace`.
-    #[cfg(test)]
-    #[must_use]
-    pub fn heap_backed(address_space: *mut crate::mm::address_space::AddressSpace) -> Self
-    {
-        Self {
-            header: KernelObjectHeader::new(ObjectType::AddressSpace),
-            address_space,
-            pt_growth_budget_bytes: AtomicU64::new(0),
-            pt_pool_lock: AtomicU64::new(0),
-            pt_pool_head_phys: AtomicU64::new(0),
-            pt_chunks: vacant_chunk_slots(),
-            deferred_next: core::ptr::null_mut(),
-        }
-    }
-
     /// Pop a free PT page from this AS's pool, charging the growth budget.
     /// Returns the page's physical address, or `None` if the pool is empty.
     #[cfg(not(test))]
@@ -851,24 +832,6 @@ impl AddressSpaceObject
 
 impl CSpaceKernelObject
 {
-    /// Test-only heap-backed wrapper with empty pool. Retype-backed wrappers
-    /// are constructed in place by `sys_cap_create_cspace` and (for the
-    /// root CSpace) by `cap::boot_retype_cspace`.
-    #[cfg(test)]
-    #[must_use]
-    pub fn heap_backed(cspace: *mut crate::cap::cspace::CSpace) -> Self
-    {
-        Self {
-            header: KernelObjectHeader::new(ObjectType::CSpaceObj),
-            cspace,
-            cspace_growth_budget_bytes: AtomicU64::new(0),
-            cs_pool_lock: AtomicU64::new(0),
-            cs_pool_head_phys: AtomicU64::new(0),
-            cs_chunks: vacant_chunk_slots(),
-            deferred_next: core::ptr::null_mut(),
-        }
-    }
-
     /// Pop a free slot page from this `CSpace`'s pool, charging the growth
     /// budget. Returns the page's physical address, or `None` if empty.
     #[cfg(not(test))]
@@ -2116,7 +2079,8 @@ unsafe fn dealloc_object_one(
                 // lock across every dereference, so unlinking strictly before
                 // the free guarantees neither the watchdog nor an object
                 // teardown observes a dangling node.
-                // SAFETY: tcb valid (not yet freed); leaf lock, nothing else held.
+                // SAFETY: tcb valid (not yet freed); the registry lock is the
+                // outermost lock and nothing is held here.
                 unsafe { crate::sched::thread_registry::unregister(tcb) };
 
                 // Poison the TCB so any use-after-free reads garbage
@@ -2953,10 +2917,9 @@ const MAX_DRAIN_EDITS: usize = 256;
 /// surface downstream as dead-link truncation, in the drain's own
 /// containment or `revoke_subtree_batch`'s — contained, and in the
 /// owning-process case reachable only by the dying process harming
-/// itself. The end state otherwise
-/// matches the previous whole-drain design: no slot anywhere references
-/// the dying `CSpace`, which is the invariant `free_cspace_id`
-/// recycling relies on.
+/// itself. The end state otherwise matches the previous whole-drain
+/// design: no slot anywhere references the dying `CSpace`, which is the
+/// invariant `free_cspace_id` recycling relies on.
 ///
 /// Returns `true` once the whole `CSpace` is drained; `false` when the
 /// step budget ran out (call again — the cursor resumes at the same

@@ -1151,6 +1151,9 @@ pub fn memory_split(memory_cap: u32, split_offset: u64) -> Result<u32, i64>
 ///
 /// # Errors
 /// Returns a negative `i64` error code if the caps fail validation.
+/// `InvalidCapability` also covers a cap a concurrent delete freed before
+/// the merge took the derivation lock; `InvalidState` means a `cap_revoke`
+/// is in flight on either cap.
 #[inline]
 pub fn memory_merge(parent_cap: u32, tail_cap: u32) -> Result<(), i64>
 {
@@ -1424,11 +1427,6 @@ pub fn thread_start(thread_cap: u32) -> Result<(), i64>
 ///
 /// Returns the slot index in the destination `CSpace`.
 ///
-/// If every other reference to the destination `CSpace` goes while the call
-/// is backing the slot, the call reclaims it and returns `InvalidCapability`;
-/// when the caller itself is bound to that `CSpace`, the caller is stopped
-/// and the call never returns.
-///
 /// # Errors
 /// Returns a negative `i64` error code if either cap is invalid, the caller
 /// lacks sufficient rights, or the destination `CSpace`'s slot pool cannot
@@ -1604,10 +1602,10 @@ pub fn cap_revoke_all(slot: u32) -> Result<(), i64>
 ///
 /// Returns the destination slot index.
 ///
-/// If every other reference to the destination `CSpace` goes while the call
-/// is backing the slot, the call reclaims it and returns `InvalidCapability`;
-/// when the caller itself is bound to that `CSpace`, the caller is stopped
-/// and the call never returns.
+/// With a non-zero `dest_index`, if every other reference to the destination
+/// `CSpace` goes while the call is backing the leaves up to it, the call
+/// reclaims that `CSpace` and returns `InvalidCapability`; when the caller
+/// itself is bound to it, the caller is stopped and the call never returns.
 ///
 /// # Errors
 /// Returns a negative `i64` error code if either cap is invalid, `dest_index`
@@ -1637,6 +1635,11 @@ pub fn cap_move(src_slot: u32, dest_cspace_cap: u32, dest_index: u32) -> Result<
 ///
 /// Like `cap_copy` but the destination slot index is caller-chosen — a
 /// shorthand over `SYS_CAP_COPY` with a non-zero destination slot.
+///
+/// If every other reference to the destination `CSpace` goes while the call
+/// is backing the leaves up to `dest_index`, the call reclaims it and
+/// returns `InvalidCapability`; when the caller itself is bound to that
+/// `CSpace`, the caller is stopped and the call never returns.
 ///
 /// # Errors
 /// Returns a negative `i64` error code if either cap is invalid, the caller

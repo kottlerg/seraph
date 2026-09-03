@@ -703,8 +703,8 @@ Every descendant in the derivation tree is invalidated; the target capability
 itself is preserved. Underlying kernel objects are not freed unless a revoked
 capability was the last reference. While the revoke is in flight, `SYS_CAP_DELETE`,
 `SYS_CAP_MOVE`, `SYS_CAP_COPY`, `SYS_CAP_DERIVE`, `SYS_CAP_DERIVE_BADGE`,
-`SYS_MEMORY_SPLIT`, and the range splits on the target slot (and IPC transfer of
-it) are refused with `InvalidState`.
+`SYS_MEMORY_SPLIT`, `SYS_MEMORY_MERGE`, and the range splits on the target slot
+(and IPC transfer of it) are refused with `InvalidState`.
 
 **Errors:** `InvalidCapability`; `InvalidState` (another revoke is already in
 flight on this slot, or a corrupted derivation link was found — the revoke is
@@ -912,7 +912,8 @@ one with a `SYS_CAP_REVOKE` in flight with `InvalidState`.
 **Capability requirement:** `memory_cap` must have Map rights.
 
 **Errors:** `InvalidArgument` (`split_offset` not page-aligned, zero, `>= size`,
-below the bump boundary, or the parent has derivation children),
+leaving fewer than one page on the upper side, below the bump boundary, or the
+parent has derivation children),
 `InvalidCapability`, `InvalidState` (per above), `InsufficientRights` (cap lacks
 Map), `OutOfMemory` (tail wrapper allocation or slot-page pool exhausted),
 `QuotaExceeded` (caller's CSpace directory structurally full).
@@ -1021,9 +1022,15 @@ contiguous (`parent.base + parent.size == tail.base`), and the tail must be virg
 
 **Capability requirements:** `parent_cap` (Map), `tail_cap` (Map); rights must match.
 
+Both capabilities are revalidated under the derivation lock before either
+object is touched and the tail is unlinked and freed (see
+[capability-internals.md](capability-internals.md) § Global Derivation Lock): a
+cap a concurrent delete freed meanwhile fails with `InvalidCapability`, and one
+with a `SYS_CAP_REVOKE` in flight with `InvalidState`.
+
 **Errors:** `InvalidArgument` (same slot/object, rights mismatch, not contiguous, tail
 not virgin, not siblings, or either has children), `InvalidCapability`,
-`InsufficientRights` (either cap lacks Map).
+`InvalidState` (per above), `InsufficientRights` (either cap lacks Map).
 
 ---
 
@@ -1698,9 +1705,10 @@ The source is revalidated under the derivation lock before the copy is linked
 beneath it (see [capability-internals.md](capability-internals.md) § Global
 Derivation Lock): a source a concurrent delete, move, or revoke freed meanwhile
 fails with `InvalidCapability`, and one with a `SYS_CAP_REVOKE` in flight with
-`InvalidState`. If every other reference to the destination CSpace goes while
-the call is backing the slot, the call reclaims that CSpace and fails with
-`InvalidCapability`; a caller bound to it is stopped and the call never returns.
+`InvalidState`. With a non-zero `dst_slot`, if every other reference to the
+destination CSpace goes while the call is backing the leaves up to that index,
+the call reclaims that CSpace and fails with `InvalidCapability`; a caller bound
+to it is stopped and the call never returns.
 
 **Errors:** `InvalidCapability`, `InvalidState` (a `SYS_CAP_REVOKE` is in flight
 on the source), `InsufficientRights` (dst CSpace lacks Insert), `InvalidArgument`
@@ -1729,9 +1737,10 @@ without consumption when the pool cannot cover it).
 
 **Capability requirements:** `src_cap` (any), `dst_cspace_cap` (Insert).
 
-If every other reference to the destination CSpace goes while the call is
-backing the slot, the call reclaims that CSpace and fails with
-`InvalidCapability`; a caller bound to it is stopped and the call never returns.
+With a non-zero `dst_slot`, if every other reference to the destination CSpace
+goes while the call is backing the leaves up to that index, the call reclaims
+that CSpace and fails with `InvalidCapability`; a caller bound to it is stopped
+and the call never returns.
 
 **Errors:** `InvalidCapability`, `InsufficientRights` (dst CSpace lacks Insert),
 `InvalidArgument` (dst_slot occupied or out of range), `OutOfMemory` (slot-page pool

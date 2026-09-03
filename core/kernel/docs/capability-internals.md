@@ -340,20 +340,23 @@ inherits the donor's position in the tree. The donor's slot becomes null.
 ### Global Derivation Lock
 
 A single global reader-writer lock protects the derivation tree. Every path that
-inserts, links, moves, or frees an occupied slot holds it for writing: copy,
-derive, the splits, move and IPC transfer, delete, revoke, and object teardown.
+links, moves, or frees an occupied slot holds it for writing: copy, derive, the
+splits, the memory merge, move and IPC transfer, delete, revoke, and object
+teardown. Inserts that create a derivation root (`SYS_CAP_CREATE_*`, the boot
+population) take only the CSpace spinlock — a root has no linkage to edit.
 Lock-free readers never traverse the tree; they resolve one slot by handle and
 rely on the tag and generation checks described above.
 
-The source of a copy, derive, or memory-split tail is looked up unlocked, so each
-of those paths revalidates it under the write lock — same tag-bearing occupancy,
-same generation, same object, no revoke in flight — before the new slot is
-inserted and linked beneath it (beside it, for a split tail). Every occupied→free
-transition holds the lock, so a source that revalidates stays the link's parent
-for the rest of the hold. A source freed meanwhile fails the call with
-`InvalidCapability` (a revoke in flight on it, `InvalidState`); the alternative —
-`link_child` dropping the link under a freed parent — would leave the new
-capability a derivation root outside every ancestor's revoke reach.
+The source of a copy or derive, the parent of a memory split, and both caps of
+a memory merge are looked up unlocked, so each of those paths revalidates them
+under the write lock — same tag-bearing occupancy, same generation, same
+object, no revoke in flight — before touching the object or editing the tree.
+Every occupied→free transition holds the lock, so a slot that revalidates stays
+live (and stays the link's parent) for the rest of the hold. A slot freed
+meanwhile fails the call with `InvalidCapability` (a revoke in flight on it,
+`InvalidState`); the alternative — `link_child` dropping the link under a freed
+parent — would leave the new capability a derivation root outside every
+ancestor's revoke reach, and a merge would free a recycled tail index.
 
 This is a deliberate design choice: a single lock avoids deadlock from ordering
 multiple per-CSpace locks, and derivation-tree edits are rare relative to

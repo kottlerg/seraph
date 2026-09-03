@@ -929,17 +929,9 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // TrapFrame base. 512 bytes is sufficient for the minimal C frame.
     const TRAMPOLINE_FRAME_SIZE: u64 = 512;
 
-    // cast_possible_truncation: Seraph targets 64-bit only; cap slot indices fit in u32.
-    #[allow(clippy::cast_possible_truncation)]
     let memory_idx = tf.arg(0) as u32;
-    // cast_possible_truncation: Seraph targets 64-bit only; cap slot indices fit in u32.
-    #[allow(clippy::cast_possible_truncation)]
     let as_idx = tf.arg(1) as u32;
-    // cast_possible_truncation: Seraph targets 64-bit only; cap slot indices fit in u32.
-    #[allow(clippy::cast_possible_truncation)]
     let cs_idx = tf.arg(2) as u32;
-    // cast_possible_truncation: Seraph targets 64-bit only; cap slot indices fit in u32.
-    #[allow(clippy::cast_possible_truncation)]
     let sched_idx = tf.arg(3) as u32;
     // Kept as u64 until range-checked: an `as u8` here would wrap 256 to 0
     // and silently select the band floor.
@@ -1571,6 +1563,11 @@ pub fn sys_cap_derive(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     let effective_rights = rights_mask & src_rights;
 
+    // Convert src_idx to NonZeroU32 before the reference is taken; the
+    // non-null tag check above excludes slot 0, so this only fires on a
+    // malformed request.
+    let src_idx_nz = core::num::NonZeroU32::new(src_idx).ok_or(SyscallError::InvalidCapability)?;
+
     // Increment refcount, then insert into caller's CSpace.
     // SAFETY: src_object validated above as valid NonNull from live slot.
     unsafe {
@@ -1588,7 +1585,6 @@ pub fn sys_cap_derive(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // occupied→free transition holds the lock, so neither can interleave
     // once the source revalidates. The badge write and the handle read share
     // the insert's critical section.
-    let src_idx_nz = core::num::NonZeroU32::new(src_idx).ok_or(SyscallError::InvalidCapability)?;
     crate::cap::DERIVATION_LOCK.write_lock();
     // SAFETY: caller_cspace validated non-null above; DERIVATION_LOCK held.
     if let Err(e) = unsafe { revalidate_src_under_lock(caller_cspace, src_handle, src_object) }
@@ -1689,6 +1685,11 @@ pub fn sys_cap_derive_badge(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     let effective_rights = rights_mask & src_rights;
 
+    // Convert src_idx to NonZeroU32 before the reference is taken; the
+    // non-null tag check above excludes slot 0, so this only fires on a
+    // malformed request.
+    let src_idx_nz = core::num::NonZeroU32::new(src_idx).ok_or(SyscallError::InvalidCapability)?;
+
     // Increment refcount, then insert into caller's CSpace.
     // SAFETY: src_object validated above as valid NonNull from live slot.
     unsafe {
@@ -1706,7 +1707,6 @@ pub fn sys_cap_derive_badge(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // occupied→free transition holds the lock, so neither can interleave
     // once the source revalidates. The badge write and the handle read share
     // the insert's critical section.
-    let src_idx_nz = core::num::NonZeroU32::new(src_idx).ok_or(SyscallError::InvalidCapability)?;
     crate::cap::DERIVATION_LOCK.write_lock();
     // SAFETY: caller_cspace validated non-null above; DERIVATION_LOCK held.
     if let Err(e) = unsafe { revalidate_src_under_lock(caller_cspace, src_handle, src_object) }

@@ -168,11 +168,13 @@ unsafe fn resolve_slot_mut(id: SlotId) -> Option<&'static mut super::slot::Capab
 /// freed; see the occupancy gate in `resolve_slot_mut`), neither slot is
 /// mutated and `false` is returned. A one-sided write in either direction
 /// would leave a live slot holding a dangling `SlotId` that a later recycle
-/// of the index could alias onto an unrelated live slot. Callers that
-/// revalidated the parent and inserted the child under the same lock hold
-/// assert on the result in debug builds — for them a dropped link is an
-/// invariant violation; the reparent walk alone tolerates a dead new parent
-/// (see `truncate_dead_link`).
+/// of the index could alias onto an unrelated live slot. Callers linking
+/// under a parent in the caller's own registered `CSpace` (copy, derive,
+/// the revoke hoist) assert on the result in debug builds — for them a
+/// dropped link is an invariant violation. Callers linking under a foreign
+/// derivation parent (the reparent walk, the split tails) tolerate a parent
+/// whose `CSpace` has since unregistered — a dead link, see
+/// `truncate_dead_link` — and leave the child a clean root.
 ///
 /// # Safety
 ///
@@ -226,6 +228,13 @@ pub unsafe fn link_child(parent: SlotId, child: SlotId) -> bool
 /// Updates the parent's `first_child` pointer and the sibling chain around
 /// `node`. Clears `node`'s `deriv_parent` and sibling pointers.
 ///
+/// Each neighbour is written only if it still points back at `node`. In a
+/// consistent tree that always holds; it fails only for a node abandoned
+/// behind a dead link (see [`truncate_dead_link`]) whose recorded parent
+/// or sibling index has since been recycled — the guard keeps such a node
+/// from editing the unrelated slot now at that index. The node itself
+/// leaves the tree either way.
+///
 /// Children of `node` are left dangling (caller should call
 /// [`reparent_children`] first if needed).
 ///
@@ -257,6 +266,7 @@ pub unsafe fn unlink_node(node: SlotId)
     {
         // SAFETY: DERIVATION_LOCK held; prev_id retrieved from node's sibling pointer.
         if let Some(prev_slot) = unsafe { resolve_slot_mut(prev_id) }
+            && prev_slot.deriv_next_sibling == Some(node)
         {
             prev_slot.deriv_next_sibling = next;
         }
@@ -266,6 +276,7 @@ pub unsafe fn unlink_node(node: SlotId)
         // node was the first child; update parent's first_child.
         // SAFETY: DERIVATION_LOCK held; parent_id retrieved from node's parent pointer.
         if let Some(parent_slot) = unsafe { resolve_slot_mut(parent_id) }
+            && parent_slot.deriv_first_child == Some(node)
         {
             parent_slot.deriv_first_child = next;
         }
@@ -275,6 +286,7 @@ pub unsafe fn unlink_node(node: SlotId)
     {
         // SAFETY: DERIVATION_LOCK held; next_id retrieved from node's sibling pointer.
         if let Some(next_slot) = unsafe { resolve_slot_mut(next_id) }
+            && next_slot.deriv_prev_sibling == Some(node)
         {
             next_slot.deriv_prev_sibling = prev;
         }
@@ -496,11 +508,11 @@ pub unsafe fn revoke_subtree_batch(
             // Hoist: g leaves head's child list and becomes root's first
             // child (head keeps its own list position).
             // SAFETY: DERIVATION_LOCK held; g and root are live.
-            unsafe {
+            let linked = unsafe {
                 unlink_node(g);
-                let linked = link_child(root, g);
-                debug_assert!(linked, "revoke hoist link dropped under DERIVATION_LOCK");
-            }
+                link_child(root, g)
+            };
+            debug_assert!(linked, "revoke hoist link dropped under DERIVATION_LOCK");
         }
         else
         {
@@ -530,7 +542,15 @@ pub unsafe fn revoke_subtree_batch(
 /// nodes chained behind the dead link are abandoned — which is why the
 /// revoke walk reports [`BatchStatus::DeadLink`] and its syscall surfaces
 /// an error instead of claiming a clean revoke; the reparent walk has no
-/// status to report and completes with the chain abandoned.
+/// status to report and completes with the chain abandoned, and its
+/// callers (`SYS_CAP_DELETE`, the range splits) then free `owner`.
+///
+/// An abandoned node keeps its `deriv_parent` (naming `owner`) and sibling
+/// links, so it is outside every ancestor's revoke reach from here on, and
+/// once `owner`'s index is recycled those links alias whatever occupies it.
+/// [`unlink_node`] writes a neighbour only if it still points back at the
+/// node, so the abandoned node's own later delete or move cannot edit the
+/// aliased slot's lists.
 ///
 /// # Safety
 ///

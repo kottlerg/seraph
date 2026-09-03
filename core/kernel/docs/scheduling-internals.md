@@ -877,11 +877,11 @@ ends — and for each bound thread not already `Exited`: cancels its IPC block
 if `Blocked` (`cancel_ipc_block`, the `sys_thread_stop` primitive), writes
 `Exited` under the all-locks discipline (`exit_under_all_locks`, draining
 every run queue) with `EXIT_KILLED` recorded as its retained exit reason in
-the same hold (not posted: kernel-initiated teardown is silent, as for a
-thread reaped through its own capability; a commit refused because the thread
-exited on its own meanwhile writes neither, and that thread still posts its
-own reason — only the retained value says killed), and records the CPU it was
-running on. Phase 2, after releasing the registry lock, prods those CPUs and
+the same hold (the stop posts no death event — an observer bound afterwards
+receives the retained reason through the bind; a commit refused because the
+thread exited on its own meanwhile writes neither, and that thread still posts
+its own reason — only the retained value says killed), and records the CPU it
+was running on. Phase 2, after releasing the registry lock, prods those CPUs and
 spins — interrupts enabled, preemption disabled, as the dealloc UAF gate does
 — until no CPU other than the caller's has a bound thread as `current`. A
 bound thread found `current` but not `Exited` was bound after the walk (a

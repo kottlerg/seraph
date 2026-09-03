@@ -26,7 +26,7 @@
 //! yields and call `thread_exit` themselves. By the time the parent
 //! calls `cap_delete`, every worker is already Exited.
 
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use syscall::{
     cap_create_notification, cap_delete, notification_send, notification_wait, system_info,
@@ -326,6 +326,8 @@ struct ConcArgs
 {
     ready: u32,
     done: u32,
+    memory: u32,
+    aspace: u32,
     bit_index: usize,
     iters: u64,
 }
@@ -333,17 +335,11 @@ struct ConcArgs
 static CONC_ARGS: spawn::ArgBlock<ConcArgs, MAX_PINNED> = spawn::ArgBlock::new(ConcArgs {
     ready: 0,
     done: 0,
+    memory: 0,
+    aspace: 0,
     bit_index: 0,
     iters: 0,
 });
-
-/// Child-cspace slot of each worker's Memory cap, indexed by worker bit-index.
-/// Set by the parent before starting each worker; read by the worker. (Arg
-/// packing has no room for both memory and aspace slots alongside the notification
-/// slots, so these go through statics.)
-static CONC_MEMORY_SLOT: [AtomicU32; MAX_PINNED] = [const { AtomicU32::new(0) }; MAX_PINNED];
-/// Child-cspace slot of each worker's aspace cap, indexed by worker bit-index.
-static CONC_ASPACE_SLOT: [AtomicU32; MAX_PINNED] = [const { AtomicU32::new(0) }; MAX_PINNED];
 
 /// Release barrier: workers spin here after notifying ready so every worker
 /// starts its measured loop at the same instant (maximising overlap, which is
@@ -388,8 +384,8 @@ fn conc_map_fold(d: u64)
     CONC_MAP_MAX.fetch_max(d, Ordering::Relaxed);
 }
 
-/// Concurrent-initiator worker. `arg` packs
-/// `arg`: address of this worker's [`ConcArgs`].
+/// Concurrent-initiator worker. `arg`: address of this worker's
+/// [`ConcArgs`].
 ///
 /// Each worker sends its unique `1 << bit_index` on both `ready` and `done`;
 /// the kernel notification cap OR-accumulates, so identical bits from concurrent
@@ -400,13 +396,13 @@ fn conc_worker_entry(arg: u64) -> !
     let ConcArgs {
         ready: ready_slot,
         done: done_slot,
+        memory,
+        aspace,
         bit_index,
         iters,
     } = unsafe { spawn::child_args(arg) };
     let bit = 1u64 << bit_index;
 
-    let memory = CONC_MEMORY_SLOT[bit_index].load(Ordering::Acquire);
-    let aspace = CONC_ASPACE_SLOT[bit_index].load(Ordering::Acquire);
     let va = CONC_VA_BASE + (bit_index as u64) * CONC_VA_STRIDE;
 
     // Ready, then wait for the common GO so all initiators contend together.
@@ -541,9 +537,6 @@ pub(super) fn bench_tlb_shootdown_concurrent(ctx: &crate::TestContext, iters: u3
             break;
         };
 
-        CONC_MEMORY_SLOT[i].store(child_memory, Ordering::Release);
-        CONC_ASPACE_SLOT[i].store(child_aspace, Ordering::Release);
-
         // SAFETY: bench tier runs sequentially; this is the only use of
         // CONC_STACKS[i].
         let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(CONC_STACKS[i]) });
@@ -557,6 +550,8 @@ pub(super) fn bench_tlb_shootdown_concurrent(ctx: &crate::TestContext, iters: u3
                 ConcArgs {
                     ready: child_ready,
                     done: child_done,
+                    memory: child_memory,
+                    aspace: child_aspace,
                     bit_index: i,
                     iters: u64::from(iters),
                 },

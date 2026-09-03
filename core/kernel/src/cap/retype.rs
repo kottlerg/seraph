@@ -856,6 +856,20 @@ pub struct DispatchEntry
 /// `EventQueueObject` wrapper bytes, used by the `EventQueue` layout helpers.
 const EVENT_QUEUE_WRAPPER_BYTES: u64 = 24;
 
+// The sub-page wrappers are header (16) + one pointer, and `dispatch_for`
+// budgets them as the literal 24 (this constant, and the Endpoint /
+// Notification / WaitSet entries). Their construction sites write the state
+// at `size_of::<Wrapper>()`, so a field added to a wrapper would silently
+// drift the budget away from the layout; pin both sides here.
+const _: () = assert!(core::mem::size_of::<KernelObjectHeader>() == 16);
+const _: () = assert!(core::mem::size_of::<crate::cap::object::EndpointObject>() == 24);
+const _: () = assert!(core::mem::size_of::<crate::cap::object::NotificationObject>() == 24);
+const _: () = assert!(core::mem::size_of::<crate::cap::object::WaitSetObject>() == 24);
+const _: () = assert!(
+    core::mem::size_of::<crate::cap::object::EventQueueObject>()
+        == EVENT_QUEUE_WRAPPER_BYTES as usize
+);
+
 /// `EventQueueState` body bytes, kept in sync with the struct in
 /// `core/kernel/src/ipc/event_queue.rs` (anchored by the const assertion
 /// in that module). Update both sides together.
@@ -935,16 +949,17 @@ pub fn dispatch_for(object_type: ObjectType, size_arg: u64) -> Option<DispatchEn
             split: true,
         }),
         // AddressSpace and CSpace are both kernel-half growable objects.
-        // The wrapper struct (`AddressSpaceObject` / `CSpaceKernelObject`)
-        // and the inner `AddressSpace` / `CSpace` struct live in the
-        // kernel heap; the cap consumes pure budget pages: `size_arg`
-        // pages, all going onto the wrapper's growth pool.
+        // Page 0 of the slab is the wrapper page: the wrapper struct
+        // (`AddressSpaceObject` / `CSpaceKernelObject`) and the inner
+        // `AddressSpace` / `CSpace` are constructed in place there
+        // (`sys_cap_create_aspace` / `sys_cap_create_cspace`); the
+        // remaining pages go onto the wrapper's growth pool.
         //
-        // For AddressSpace, page 0 is consumed immediately as the root PT;
-        // pages 1..size_arg form the initial PT growth pool. Caller must
-        // pass `size_arg >= 1` (verified by sys_cap_create_aspace).
+        // For AddressSpace, page 1 is the root page table and pages
+        // 2..size_arg form the initial PT growth pool; the syscall verifies
+        // the minimum `size_arg`.
         //
-        // For CSpace, all `size_arg` pages enter the slot-page pool;
+        // For CSpace, pages 1..size_arg seed the slot-page pool;
         // CSpace::grow consumes them on demand.
         //
         // `size_arg.checked_mul` rejects pathological sizes (caller-supplied

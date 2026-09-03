@@ -51,7 +51,10 @@ use syscall::SyscallError;
 /// rolls both children back and fails with `InvalidState`. A concurrent
 /// deriver extending the original's child list faster than one batch per
 /// hold trips the `MAX_REPARENT_BATCHES` backstop (`Interrupted`, children
-/// rolled back).
+/// rolled back). On either failure the original's children that earlier
+/// batches already moved stay under its parent, so the surviving original
+/// no longer holds revoke authority over them (`syscalls.md`,
+/// `SYS_MMIO_SPLIT`).
 ///
 /// Returns the two encoded child handles `(handle1, handle2)` (generation +
 /// index each), captured under the insert's own `cspace.lock` hold so a

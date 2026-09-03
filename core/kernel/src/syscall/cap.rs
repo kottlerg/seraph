@@ -908,12 +908,13 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // Resolve AddressSpace cap.
     // SAFETY: caller_cspace validated non-null above.
     let as_slot = unsafe { super::lookup_cap(caller_cspace, as_idx, AsRights::MAP) }?;
-    // Snapshot for the post-registration revalidation below: `as_slot` is a
-    // live reference into the leaf page, not a copy.
+    // One read of the slot's object pointer: it is what the TCB binds below
+    // and what the post-registration revalidation compares against
+    // (`as_slot` is a live reference into the leaf page, not a copy).
     let as_object = as_slot.object;
     let as_ptr = {
         use crate::cap::object::AddressSpaceObject;
-        let obj = as_slot.object.ok_or(SyscallError::InvalidCapability)?;
+        let obj = as_object.ok_or(SyscallError::InvalidCapability)?;
         // SAFETY: cap tag confirmed AddressSpace; object pointer is valid.
         #[allow(clippy::cast_ptr_alignment)]
         let as_obj = unsafe { &*(obj.as_ptr().cast::<AddressSpaceObject>()) };
@@ -926,7 +927,7 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     let cs_object = cs_slot.object;
     let new_cs_ptr = {
         use crate::cap::object::CSpaceKernelObject;
-        let obj = cs_slot.object.ok_or(SyscallError::InvalidCapability)?;
+        let obj = cs_object.ok_or(SyscallError::InvalidCapability)?;
         // SAFETY: cap tag confirmed CSpace; object pointer is valid.
         #[allow(clippy::cast_ptr_alignment)]
         let cs_obj = unsafe { &*(obj.as_ptr().cast::<CSpaceKernelObject>()) };

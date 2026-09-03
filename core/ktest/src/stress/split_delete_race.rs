@@ -123,6 +123,8 @@ pub fn run(ctx: &TestContext) -> TestResult
         cap_delete(th).map_err(|_| "stress::split_delete_race: reap sibling failed")?;
     }
 
+    // Cleanup of a notification this test created; the verdict below rests
+    // on the slot count, which a failed delete would fail on its own.
     cap_delete(done).ok();
     let used_after = syscall::cap_info(ctx.cspace_cap, CAP_INFO_CSPACE_USED)
         .map_err(|_| "stress::split_delete_race: cap_info(used after) failed")?;
@@ -159,6 +161,9 @@ fn sibling_entry(arg: u64) -> !
     {
         BIT_DELETE_FAILED
     };
+    // A failed report (a kernel defect on a valid cap) leaves the parent
+    // waiting; the harness watchdog reports that hang, and this thread has
+    // no other channel.
     notification_send(done, bit).ok();
     thread_exit()
 }

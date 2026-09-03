@@ -57,17 +57,17 @@ use super::slot::{CSpaceId, CapTag, CapabilitySlot, Rights};
 pub const L2_SIZE: usize = 56;
 
 /// Inline root pointers to leaf pages (the direct region).
-pub(crate) const L1_DIRECT: usize = 128;
+const L1_DIRECT: usize = 128;
 
 /// Inline root pointers to directory pages (the indirect region).
-pub(crate) const L1_INDIRECT: usize = 128;
+const L1_INDIRECT: usize = 128;
 
 /// Leaf pointers per pool-allocated directory page (one 4 KiB page of
 /// 8-byte pointers).
-pub(crate) const DIR_FANOUT: usize = crate::mm::PAGE_SIZE / core::mem::size_of::<*mut CSpacePage>();
+const DIR_FANOUT: usize = crate::mm::PAGE_SIZE / core::mem::size_of::<*mut CSpacePage>();
 
 /// Maximum leaf pages a `CSpace` can ever hold.
-pub(crate) const MAX_LEAVES: usize = L1_DIRECT + L1_INDIRECT * DIR_FANOUT;
+const MAX_LEAVES: usize = L1_DIRECT + L1_INDIRECT * DIR_FANOUT;
 
 /// The directory's structural slot ceiling; see
 /// core/kernel/docs/capability-internals.md § Storage: Hybrid Two-Level

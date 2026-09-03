@@ -582,9 +582,15 @@ pub struct CSpaceKernelObject
     pub deferred_next: *mut KernelObjectHeader,
 }
 
-// The wrapper page hosts the CSpaceKernelObject followed by the inline
-// CSpace directory; both must fit one page (the construction sites also
+// The wrapper page hosts the AddressSpaceObject followed by the in-place
+// AddressSpace, or the CSpaceKernelObject followed by the inline CSpace
+// directory; each pair must fit one page (the construction sites also
 // debug-assert the offsets).
+const _: () = assert!(
+    core::mem::size_of::<AddressSpaceObject>()
+        + core::mem::size_of::<crate::mm::address_space::AddressSpace>()
+        <= crate::mm::PAGE_SIZE,
+);
 const _: () = assert!(
     core::mem::size_of::<CSpaceKernelObject>() + core::mem::size_of::<crate::cap::cspace::CSpace>()
         <= crate::mm::PAGE_SIZE,
@@ -2929,19 +2935,25 @@ const MAX_DRAIN_EDITS: usize = 256;
 /// then skips it as Null and the object refcount is settled once (revoke
 /// dec-refs it; the post-drain `for_each_object` pass skips Null slots).
 ///
-/// The batch loop terminates. In the benign case (the dying process's
-/// threads are gone) nothing can reach this `CSpace`, every edit removes
-/// one link, and the head-pop's no-progress containment truncates any
-/// unresolvable or cyclic chain instead of spinning. Residual window,
-/// stated honestly (it matches the pre-batching design's equivalent
-/// window after its single hold): a surviving thread of the owning
-/// process racing its own teardown can still operate on the dying
-/// `CSpace` via its TCB pointer (deriving out of it appends bounded
-/// work; an in-flight `ipc_recv` delivery can land caps into it) —
-/// links wired behind the cursor dangle once the `CSpace` unregisters
-/// and surface downstream as dead-link truncation, in the drain's own
-/// containment or `revoke_subtree_batch`'s. Contained, and reachable
-/// only by the dying process harming itself. The end state otherwise
+/// The batch loop's progress: every edit removes one link, and the
+/// head-pop's no-progress containment truncates any unresolvable or
+/// cyclic chain instead of spinning. Work can still arrive between holds
+/// — the `CSpace` stays registered until the final batch, so a foreign
+/// `SYS_CAP_DELETE` of a slot whose parent is a dying slot reparents that
+/// slot's children into the dying slot, and a surviving thread of the
+/// owning process can derive out of the dying `CSpace` via its TCB
+/// pointer or have an in-flight `ipc_recv` delivery land caps into it.
+/// Each such event adds at most one reparent batch of work while the
+/// drain removes a batch per hold, so the loop is bounded by lock
+/// contention rather than by a constant, and it carries no batch backstop
+/// (a teardown cannot fail): a holder of capabilities derived from the
+/// dying `CSpace` can prolong the teardown for as long as it keeps
+/// deleting, which stalls the deleting thread, not the system. Links
+/// wired behind the cursor dangle once the `CSpace` unregisters and
+/// surface downstream as dead-link truncation, in the drain's own
+/// containment or `revoke_subtree_batch`'s — contained, and in the
+/// owning-process case reachable only by the dying process harming
+/// itself. The end state otherwise
 /// matches the previous whole-drain design: no slot anywhere references
 /// the dying `CSpace`, which is the invariant `free_cspace_id`
 /// recycling relies on.

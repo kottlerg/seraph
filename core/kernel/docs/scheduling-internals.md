@@ -814,9 +814,9 @@ spinning for the derivation lock, a `MemoryObject` read or write lock, or a
 retype-allocator lock records the lock kind and the address of its state
 word once its first acquisition attempt fails
 (`lock_wait_enter`/`lock_wait_exit`; the uncontended path stores nothing),
-and the dump prints them with the state word's current value — `u32::MAX`
-for a held `MemoryObject` write lock, a reader count otherwise, 1 for a held
-allocator lock. These locks spin with interrupts masked, or on the idle
+and the dump prints them with the state word's current value —
+`0xffffffff` for a held `MemoryObject` write lock, a reader count otherwise,
+`0x1` for a held allocator lock. These locks spin with interrupts masked, or on the idle
 thread inside a deferred reclaim, so without the breadcrumb a CPU wedged on
 one is indistinguishable from a silent or idle one. The
 dump also prints the derivation lock's state word and the CPU stamped as its

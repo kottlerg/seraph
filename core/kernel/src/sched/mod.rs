@@ -484,6 +484,7 @@ pub fn lock_wait_exit()
     if cpu < MAX_CPUS
     {
         LOCK_WAIT_KIND[cpu].store(LOCK_WAIT_NONE, core::sync::atomic::Ordering::Relaxed);
+        LOCK_WAIT_WORD[cpu].store(0, core::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -509,14 +510,17 @@ pub fn cpu_stamp() -> u32
 }
 
 /// `(thread id, syscall number)` of the running thread, for lock-holder
-/// stamps: `(0, u64::MAX)` on the idle thread, and `u64::MAX` for a thread
-/// outside a syscall.
+/// stamps: `(0, u64::MAX)` before this CPU has dispatched a thread (boot),
+/// and `u64::MAX` for a thread outside a syscall — the idle thread (whose
+/// id is an ordinary registry id) or a kernel path entered without a trap
+/// frame.
 #[cfg(not(test))]
 pub fn holder_info() -> (u32, u64)
 {
-    // SAFETY: the running thread's TCB and its trap-frame pointer are set by
-    // the syscall entry and stay valid while the thread runs on this CPU; the
-    // idle thread has a null trap frame.
+    // SAFETY: `current_tcb()` is the calling thread's own TCB on whichever
+    // CPU it runs, so it outlives this call; `trap_frame` and the frame it
+    // names are written only by that thread's own trap entry and return, so
+    // both reads are stable even when the caller is preemptible.
     unsafe {
         let tcb = crate::syscall::current_tcb();
         if tcb.is_null()
@@ -556,37 +560,64 @@ pub fn holder_info() -> (u32, u64)
     (0, u64::MAX)
 }
 
-/// Per-kind one-shot latch for [`check_lock_hold_preemptible`]: bit 1 the
-/// derivation lock, bit 2 the `MemoryObject` locks.
+/// Per-kind one-shot latch for [`check_lock_hold_preemptible`]: bit
+/// `1 << kind` for each `LOCK_WAIT_*` kind.
 #[cfg(not(test))]
 static PREEMPTIBLE_HOLD_REPORTED: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(0);
+
+/// Whether `tcb` is one of the per-CPU idle TCBs.
+#[cfg(not(test))]
+fn is_idle_tcb(tcb: *const thread::ThreadControlBlock) -> bool
+{
+    let cpu_count = CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
+    // SAFETY: cpu < cpu_count; the idle slab is initialised by init().
+    (0..cpu_count).any(|cpu| core::ptr::eq(unsafe { idle_tcb_ptr(cpu) }.cast(), tcb))
+}
 
 /// Invariant tripwire for the bare spin locks (docs/scheduling-internals.md
 /// § Lock Hierarchy, "Bare spin locks"): a hold taken from a syscall with
 /// interrupts enabled and preemption enabled can be descheduled by the tick
 /// while held, and every later waiter then spins forever with interrupts
-/// masked. Reports the first such acquisition per lock kind once per boot,
-/// naming the thread, syscall, and call site; a debug build then halts. The
-/// idle thread, which has no syscall and no time slice, is exempt.
+/// masked. Called before each acquisition of a lock of `LOCK_WAIT_*` kind
+/// `kind`; reports the first violation per kind once per boot, naming the
+/// thread, syscall, and call site, and a debug build then halts. Exempt:
+/// boot, before this CPU has dispatched a thread, and the idle thread — it
+/// runs its deferred reclaim with interrupts enabled and preemption enabled,
+/// which is sound only because its time slice is permanently zero, so
+/// `timer_tick` never reaches `schedule()` for it (asserted here).
 #[cfg(not(test))]
-pub fn check_lock_hold_preemptible(kind: &str, site: &core::panic::Location<'_>)
+pub fn check_lock_hold_preemptible(kind: u32, site: &core::panic::Location<'_>)
 {
     if !crate::arch::current::interrupts::are_enabled() || crate::percpu::preemption_disabled()
     {
         return;
     }
-    let (tid, nr) = holder_info();
-    if nr == u64::MAX
-    {
-        return;
+    // SAFETY: `current_tcb()` is the calling thread's own TCB (see
+    // `holder_info`); the idle TCB's `slice_remaining` is written only by
+    // `timer_tick` on its own CPU and stays zero, so the read is stable.
+    unsafe {
+        let tcb = crate::syscall::current_tcb();
+        if tcb.is_null()
+        {
+            return;
+        }
+        if is_idle_tcb(tcb)
+        {
+            debug_assert!(
+                (*tcb).slice_remaining == 0,
+                "idle thread holds a bare spin lock with a live time slice"
+            );
+            return;
+        }
     }
-    let bit = if kind.starts_with("derivation") { 1 } else { 2 };
+    let (tid, nr) = holder_info();
+    let bit = 1u32 << kind;
     if PREEMPTIBLE_HOLD_REPORTED.fetch_or(bit, core::sync::atomic::Ordering::AcqRel) & bit == 0
     {
         crate::kprintln!(
             "kernel: {} lock taken preemptible: tid={} syscall={} site={}:{} cpu={}",
-            kind,
+            lock_wait_name(kind),
             tid,
             nr,
             site.file(),
@@ -602,7 +633,7 @@ pub fn check_lock_hold_preemptible(kind: &str, site: &core::panic::Location<'_>)
 
 /// Test stub; see [`check_lock_hold_preemptible`].
 #[cfg(test)]
-pub fn check_lock_hold_preemptible(_kind: &str, _site: &core::panic::Location<'_>) {}
+pub fn check_lock_hold_preemptible(_kind: u32, _site: &core::panic::Location<'_>) {}
 
 /// Mark `cpu` as having dispatched a non-idle thread at the current tick.
 pub fn watchdog_mark_non_idle(cpu: usize)
@@ -985,24 +1016,25 @@ fn watchdog_dump(reason: &str)
         if lock_kind != LOCK_WAIT_NONE
         {
             let word = LOCK_WAIT_WORD[cpu].load(core::sync::atomic::Ordering::Relaxed) as usize;
-            // SAFETY: `word` was published by this CPU's own spin loop, which
-            // has not returned; the state word is kernel direct-map storage
-            // that stays mapped, and the load is read-only. The
-            // retype-allocator lock is a 64-bit word; the others are 32-bit.
+            // The breadcrumb belongs to another CPU, read racily: it may
+            // leave and re-enter a wait between the two loads, and the word
+            // may name a retype slab recycled since. The value is diagnostic
+            // only. The retype-allocator lock is a 64-bit word; the others
+            // are 32-bit.
+            // SAFETY: `word` is a kernel direct-map address of a static or a
+            // retype slab, which stay mapped for the kernel's lifetime; the
+            // read is volatile, aligned for its width, and non-faulting, and
+            // nothing is written.
             let value = unsafe {
                 if lock_kind == LOCK_WAIT_RETYPE_ALLOC
                 {
-                    (*core::ptr::with_exposed_provenance::<core::sync::atomic::AtomicU64>(word))
-                        .load(core::sync::atomic::Ordering::Relaxed)
+                    core::ptr::read_volatile(core::ptr::with_exposed_provenance::<u64>(word))
                 }
                 else
                 {
-                    u64::from(
-                        (*core::ptr::with_exposed_provenance::<core::sync::atomic::AtomicU32>(
-                            word,
-                        ))
-                        .load(core::sync::atomic::Ordering::Relaxed),
-                    )
+                    u64::from(core::ptr::read_volatile(
+                        core::ptr::with_exposed_provenance::<u32>(word),
+                    ))
                 }
             };
             crate::kprintln!(

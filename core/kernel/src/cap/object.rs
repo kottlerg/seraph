@@ -307,7 +307,7 @@ impl MemoryObject
     pub fn read_lock(&self)
     {
         crate::sched::check_lock_hold_preemptible(
-            "memory-object read",
+            crate::sched::LOCK_WAIT_MEMORY_READ,
             core::panic::Location::caller(),
         );
         let mut waiting = false;
@@ -351,7 +351,7 @@ impl MemoryObject
     pub fn write_lock(&self)
     {
         crate::sched::check_lock_hold_preemptible(
-            "memory-object write",
+            crate::sched::LOCK_WAIT_MEMORY_WRITE,
             core::panic::Location::caller(),
         );
         let mut waiting = false;

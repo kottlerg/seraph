@@ -65,7 +65,8 @@ pub struct DerivationLock
     state: AtomicU32,
     /// Holder CPU plus one while the write lock is held; 0 otherwise.
     holder: AtomicU32,
-    /// Thread id of the most recent write holder (0 for the idle thread).
+    /// Thread id of the most recent write holder (0 before the scheduler has
+    /// dispatched a thread; the idle thread carries an ordinary id).
     holder_tid: AtomicU32,
     /// Syscall number the most recent write holder was executing
     /// (`u64::MAX` outside a syscall).
@@ -145,6 +146,10 @@ impl DerivationLock
     #[track_caller]
     pub fn write_lock(&self)
     {
+        let site = core::panic::Location::caller();
+        crate::sched::check_lock_hold_preemptible(crate::sched::LOCK_WAIT_DERIVATION, site);
+        // The uncontended probe is a strong CAS: a spurious weak failure
+        // would divert an uncontended acquisition into the breadcrumb path.
         if self
             .state
             .compare_exchange(0, WRITE_LOCKED, Ordering::Acquire, Ordering::Relaxed)
@@ -170,10 +175,8 @@ impl DerivationLock
         let (tid, nr) = crate::sched::holder_info();
         self.holder_tid.store(tid, Ordering::Relaxed);
         self.holder_nr.store(nr, Ordering::Relaxed);
-        let site = core::panic::Location::caller();
         self.holder_site
             .store(core::ptr::from_ref(site).cast_mut(), Ordering::Relaxed);
-        crate::sched::check_lock_hold_preemptible("derivation", site);
         self.holder
             .store(crate::sched::cpu_stamp(), Ordering::Relaxed);
     }
@@ -718,6 +721,28 @@ mod tests
         assert_eq!(lock.state.load(Ordering::Relaxed), WRITE_LOCKED);
         lock.write_unlock();
         assert_eq!(lock.state.load(Ordering::Relaxed), 0);
+    }
+
+    // The host stubs stamp cpu 1 (`cpu_stamp() == 1`) and no thread
+    // (`holder_info() == (0, u64::MAX)`); the site is this test.
+    #[test]
+    fn write_lock_stamps_holder_and_unlock_clears_it()
+    {
+        let lock = DerivationLock::new();
+        let before = lock.debug_snapshot();
+        assert_eq!((before.state, before.holder), (0, 0));
+        assert!(before.site.is_none());
+
+        lock.write_lock();
+        let held = lock.debug_snapshot();
+        assert_eq!((held.state, held.holder), (WRITE_LOCKED, 1));
+        assert_eq!((held.tid, held.syscall_nr), (0, u64::MAX));
+        assert_eq!(held.site.map(|loc| loc.file()), Some(file!()));
+
+        lock.write_unlock();
+        let released = lock.debug_snapshot();
+        assert_eq!((released.state, released.holder), (0, 0));
+        assert!(released.site.is_some(), "the last acquisition stays named");
     }
 
     // ── revoke_subtree_batch (host harness) ──────────────────────────────

@@ -1091,10 +1091,13 @@ pub fn disable() -> bool
 /// Trap vector must be installed before calling.
 pub unsafe fn enable()
 {
-    // SAFETY: csrsi sstatus is a privileged S-mode instruction that sets bit 1 (SIE);
-    // caller ensures trap vector installed; kernel runs in S-mode.
+    // SAFETY: csrsi sstatus is a privileged S-mode instruction that sets bit 1
+    // (SIE); it touches no memory and clobbers no register. Caller ensures the
+    // trap vector is installed; kernel runs in S-mode. `nomem` is omitted so
+    // no memory operation is reordered across the enable (see
+    // `cpu::disable_interrupts`).
     unsafe {
-        core::arch::asm!("csrsi sstatus, 0x2", options(nostack, nomem));
+        core::arch::asm!("csrsi sstatus, 0x2", options(nostack, preserves_flags));
     }
 }
 

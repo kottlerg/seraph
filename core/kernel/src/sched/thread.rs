@@ -535,11 +535,13 @@ pub struct ThreadControlBlock
     /// Points into the kernel stack below `kernel_stack_top`.
     pub trap_frame: *mut crate::arch::current::trap_frame::TrapFrame,
 
-    /// Number of the syscall the thread is executing: written by the
+    /// Number of the syscall the thread is executing: Relaxed-stored by the
     /// dispatcher at entry and reset to `u64::MAX` at exit. Read by the
     /// lock-holder stamps, which must not follow `trap_frame` from a
-    /// possibly stale TCB pointer.
-    pub syscall_nr: u64,
+    /// possibly stale TCB pointer and may read it from another CPU in the
+    /// state they report. A caller passing `u64::MAX` as a syscall number is
+    /// rejected as unknown and reads here as "no syscall".
+    pub syscall_nr: core::sync::atomic::AtomicU64,
 
     // === Address space / capability references ===
     /// Address space this thread executes in (null for kernel threads).

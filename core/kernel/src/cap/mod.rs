@@ -809,7 +809,8 @@ pub(crate) unsafe fn drain_and_install_seed(out: &mut [RamBlock]) -> usize
     // remainder, so the post-handoff buddy free count reaches 0. The PT pool
     // must also be live before Phase 9's first bootstrap map, which holds.
     reserve_init_backing();
-    // SAFETY: single-threaded Phase 7; kernel_pt_pool::init locks internally.
+    // SAFETY: single-threaded Phase 7 with no other pool consumer live yet,
+    // so the unlocked init has exclusive access.
     unsafe {
         crate::mm::kernel_pt_pool::init(POOL_SEED_PAGES);
     }

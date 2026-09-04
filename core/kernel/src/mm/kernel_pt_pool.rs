@@ -54,6 +54,7 @@ static LOCK: AtomicBool = AtomicBool::new(false);
 /// Acquire the pool lock. A contended wait is recorded in the calling CPU's
 /// lock-wait breadcrumb for the softlockup watchdog; the uncontended path
 /// records nothing.
+#[cfg(not(test))]
 #[track_caller]
 fn acquire()
 {
@@ -79,6 +80,7 @@ fn acquire()
     }
 }
 
+#[cfg(not(test))]
 fn release()
 {
     LOCK.store(false, Ordering::Release);
@@ -124,6 +126,7 @@ pub(crate) unsafe fn init(seed_pages: usize)
 /// upward (`map_user_page` returns `Err(())`, surfacing as
 /// `SyscallError::NoMemory` or `fatal()` in the boot bootstrap path).
 #[cfg(not(test))]
+#[track_caller]
 pub(crate) fn alloc_pt_page() -> Option<u64>
 {
     acquire();
@@ -159,7 +162,7 @@ pub(crate) fn alloc_pt_page() -> Option<u64>
 
 /// Push a 4 KiB frame back onto the pool. Symmetric to `alloc_pt_page`.
 #[cfg(not(test))]
-#[allow(dead_code)]
+#[track_caller]
 pub(crate) fn free_pt_page(pa: u64)
 {
     acquire();

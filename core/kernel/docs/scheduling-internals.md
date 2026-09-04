@@ -858,7 +858,9 @@ CPU's run queue — were invisible before this enumeration (#351).
 heartbeat store (APs add one Relaxed load + compare for the BSP check); one
 Relaxed counter increment per BSP tick and an O(`cpu_count`) early-exit
 loop; the registry scan and AP-stamp sweep run only on the 0.5 s cadence;
-one plain stamp store per park commit. Zero dump overhead when healthy.
+one plain stamp store per park commit; two Relaxed stores per syscall (the
+dispatcher's `syscall_nr` stamp on the running TCB at entry and exit, which
+feeds the lock-holder line). Zero dump overhead when healthy.
 
 **Catches:** all-CPUs-idle with work queued (lost-wake bugs); cross-CPU
 `context_saved` deadlock; every TCB incorrectly `Blocked`; a single thread

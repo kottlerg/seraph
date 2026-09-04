@@ -370,7 +370,8 @@ zero — and a holder never parks (see
 locks", for the contexts, the invariant each rests on, and the full order:
 derivation lock, then the `MemoryObject` write locks of a split or merge, then
 the SEED read lock of a retype, then the `CSpace` spinlock, then a wrapper pool
-lock). The lock records its write holder's CPU, thread, syscall, and call
+lock; the kernel page-table pool lock sits in a separate chain under
+`pt_lock`). The lock records its write holder's CPU, thread, syscall, and call
 site, and a CPU spinning for it records a lock-wait breadcrumb; the softlockup
 watchdog dump prints both.
 

@@ -574,20 +574,25 @@ pub fn cpu_stamp() -> u32
 
 /// This CPU's `current`, read through the raw scheduler slot so no `&mut`
 /// is minted (a caller up the stack may hold a scheduler reference); null
-/// before the scheduler storage exists or before this CPU has dispatched a
-/// thread.
+/// before the scheduler storage exists, when the CPU index is out of range,
+/// or before this CPU has dispatched a thread.
 #[cfg(not(test))]
 fn running_tcb_raw() -> *mut thread::ThreadControlBlock
 {
-    let base = SCHEDULERS_PTR.load(core::sync::atomic::Ordering::Acquire);
-    if base.is_null()
+    if SCHEDULERS_PTR
+        .load(core::sync::atomic::Ordering::Acquire)
+        .is_null()
     {
         return core::ptr::null_mut();
     }
     let cpu = crate::arch::current::cpu::current_cpu() as usize;
-    // SAFETY: the storage is allocated for `CPU_COUNT` slots and the calling
-    // CPU's index is below it; a plain read of the slot's `current`.
-    unsafe { (*base.add(cpu)).current }
+    if cpu >= CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize
+    {
+        return core::ptr::null_mut();
+    }
+    // SAFETY: the storage exists and `cpu < CPU_COUNT`, checked above —
+    // `scheduler_ptr`'s contract; a plain read of the slot's `current`.
+    unsafe { (*scheduler_ptr(cpu)).current }
 }
 
 /// `(thread id, syscall number)` of the running thread, for lock-holder
@@ -604,18 +609,24 @@ pub fn holder_info() -> (u32, u64)
     // is preempted between the CPU-index read and the load — possible only
     // in the preemptible state `check_lock_hold_preemptible` exists to
     // report, where the pointer may then name another CPU's thread, even one
-    // freed and recycled since. Both reads are plain words of the TCB, which
-    // lives in a retype slab or the boot-allocated idle slab — direct-map
-    // memory that stays mapped — so they cannot fault, and no pointer read
-    // from the TCB is followed. A stale value only mislabels a diagnostic
-    // line.
+    // freed and recycled since. Every read is a plain or atomic word of the
+    // TCB, which lives in a retype slab or the boot-allocated idle slab —
+    // direct-map memory that stays mapped — so none can fault, and no
+    // pointer read from the TCB is followed; a recycled slot fails the magic
+    // check (the TCB is poisoned on free). A stale value only mislabels a
+    // diagnostic line.
     unsafe {
         let tcb = running_tcb_raw();
-        if tcb.is_null()
+        if tcb.is_null() || (*tcb).magic != thread::TCB_MAGIC
         {
             return (0, u64::MAX);
         }
-        ((*tcb).thread_id, (*tcb).syscall_nr)
+        (
+            (*tcb).thread_id,
+            (*tcb)
+                .syscall_nr
+                .load(core::sync::atomic::Ordering::Relaxed),
+        )
     }
 }
 
@@ -655,7 +666,7 @@ static PREEMPTIBLE_HOLD_REPORTED: core::sync::atomic::AtomicU32 =
 /// # Safety
 /// The scheduler storage must be initialised and the calling CPU's index
 /// must be below `CPU_COUNT`; a non-null [`running_tcb_raw`] establishes
-/// both (`current` is written only by dispatch on an online CPU).
+/// both, since it returns null unless it has checked them.
 #[cfg(not(test))]
 unsafe fn is_idle_tcb(tcb: *const thread::ThreadControlBlock) -> bool
 {
@@ -689,8 +700,8 @@ pub fn check_lock_hold_preemptible(kind: LockKind, site: &core::panic::Location<
     {
         return;
     }
-    // SAFETY: `tcb` is non-null, so the scheduler storage is initialised and
-    // this CPU has dispatched a thread.
+    // SAFETY: `tcb` is non-null, so `running_tcb_raw` checked the storage
+    // and the CPU bound.
     if unsafe { is_idle_tcb(tcb) }
     {
         // SAFETY: tcb is this CPU's idle TCB in the boot-allocated idle slab,
@@ -1160,14 +1171,19 @@ fn watchdog_dump(reason: &str)
             }
             else
             {
+                // The syscall number comes from the dispatcher's stamp on
+                // the TCB, not the frame.
+                let nr = (*cur)
+                    .syscall_nr
+                    .load(core::sync::atomic::Ordering::Relaxed);
                 let tf = (*cur).trap_frame;
                 if tf.is_null()
                 {
-                    (false, 0u64, 0u64)
+                    (false, 0u64, nr)
                 }
                 else
                 {
-                    (true, (*tf).instruction_pointer(), (*tf).syscall_nr())
+                    (true, (*tf).instruction_pointer(), nr)
                 }
             }
         };
@@ -2062,7 +2078,6 @@ pub fn init(cpu_count: u32) -> u32
                     state: ThreadState::Running,
                     priority: IDLE_PRIORITY,
                     slice_remaining: 0,
-                    syscall_nr: u64::MAX,
                     cpu_affinity: cpu as u32,
                     preferred_cpu: cpu as u32,
                     run_queue_next: None,
@@ -2091,6 +2106,7 @@ pub fn init(cpu_count: u32) -> u32
                     saved_state: saved,
                     kernel_stack_top: stack_top,
                     trap_frame: core::ptr::null_mut(),
+                    syscall_nr: core::sync::atomic::AtomicU64::new(u64::MAX),
                     address_space: core::ptr::null_mut(),
                     cspace: core::ptr::null_mut(),
                     ipc_buffer: 0,

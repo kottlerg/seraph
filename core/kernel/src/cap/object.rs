@@ -644,9 +644,8 @@ unsafe impl Sync for CSpaceKernelObject {}
 /// Acquire a pool spinlock (`pt_pool_lock` or `cs_pool_lock`). A contended
 /// wait is recorded in the calling CPU's lock-wait breadcrumb for the
 /// softlockup watchdog; the uncontended path records nothing.
-// dead_code: every caller is compiled only outside host tests.
+#[cfg(not(test))]
 #[inline]
-#[allow(dead_code)]
 #[track_caller]
 fn pool_lock(lock: &AtomicU64)
 {
@@ -673,8 +672,8 @@ fn pool_lock(lock: &AtomicU64)
 }
 
 /// Release a pool spinlock.
+#[cfg(not(test))]
 #[inline]
-#[allow(dead_code)]
 fn pool_unlock(lock: &AtomicU64)
 {
     lock.store(0, Ordering::Release);

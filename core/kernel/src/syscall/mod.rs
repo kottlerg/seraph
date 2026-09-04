@@ -72,6 +72,9 @@ pub unsafe fn dispatch(tf: *mut TrapFrame)
     let tf = unsafe { &mut *tf };
 
     let nr = tf.syscall_nr();
+    // SAFETY: syscall context on the caller's kernel stack with interrupts
+    // masked; `current` is the calling thread and stable here.
+    unsafe { (*current_tcb()).syscall_nr = nr };
 
     let ret: Result<u64, SyscallError> = match nr
     {
@@ -168,6 +171,7 @@ pub unsafe fn dispatch(tf: *mut TrapFrame)
             crate::sched::schedule(false);
             crate::arch::current::cpu::halt_loop();
         }
+        (*current_tcb()).syscall_nr = u64::MAX;
     }
 }
 

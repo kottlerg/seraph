@@ -51,13 +51,31 @@ static REMAINING: AtomicUsize = AtomicUsize::new(0);
 /// never held simultaneously.
 static LOCK: AtomicBool = AtomicBool::new(false);
 
+/// Acquire the pool lock. A contended wait is recorded in the calling CPU's
+/// lock-wait breadcrumb for the softlockup watchdog; the uncontended path
+/// records nothing.
+#[track_caller]
 fn acquire()
 {
-    while LOCK
+    crate::sched::check_lock_hold_preemptible(
+        crate::sched::LockKind::KernelPtPool,
+        core::panic::Location::caller(),
+    );
+    if LOCK
         .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
         .is_err()
     {
-        core::hint::spin_loop();
+        crate::sched::lock_wait_enter(
+            crate::sched::LockKind::KernelPtPool,
+            core::ptr::from_ref(&LOCK).expose_provenance(),
+        );
+        while LOCK
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+        crate::sched::lock_wait_exit();
     }
 }
 

@@ -103,12 +103,12 @@ hang). See § Thread Registry.
 
 **Bare spin locks (MUST).** The derivation tree lock
 (`cap::derivation::DERIVATION_LOCK`), the per-`MemoryObject` reader-writer
-lock, the per-`MemoryObject` retype-allocator lock, and the `CSpace` and
-`AddressSpace` wrapper pool locks (`pt_pool_lock`, `cs_pool_lock`) are CAS
-spin locks that do not mask interrupts themselves. A holder is never
-descheduled, because every context that takes one cannot be descheduled:
-syscall context, where interrupts are already masked; a preempt-disabled
-window (kernel-mode
+lock, the per-`MemoryObject` retype-allocator lock, the `CSpace` and
+`AddressSpace` wrapper pool locks (`cs_pool_lock`, `pt_pool_lock`), and the
+kernel page-table pool lock (`mm::kernel_pt_pool`) are CAS spin locks that
+do not mask interrupts themselves. A holder is never descheduled, because no
+context that takes one can be descheduled: syscall context, where
+interrupts are already masked; a preempt-disabled window (kernel-mode
 preemption exists only at a slice expiry with preemption enabled, and every
 kernel window that enables interrupts — shootdown ack-waits, the teardown
 gates, the contended `pt_lock` path, the `sys_thread_stop` drain — runs
@@ -130,11 +130,13 @@ slice it rests on. Their order, outermost first: `DERIVATION_LOCK` → the
 SEED `MemoryObject` read lock taken by a retype allocation or free → that
 object's retype-allocator lock. The `CSpace` spinlock is taken after the
 object locks by the split and merge paths and inside the derivation lock by
-every tree edit that frees or inserts a slot. The wrapper pool locks are
-innermost: inside the `CSpace` spinlock for leaf growth, inside `pt_lock` for
-page-table frames, and alone on the augment path. A CPU wedged on one of
-these locks shows no heartbeat and no protocol spin site; the softlockup
-watchdog's lock-wait breadcrumb names the lock (§ Softlockup Watchdog).
+every tree edit that frees or inserts a slot. The pool locks are innermost:
+the wrapper pool locks inside the `CSpace` spinlock for leaf growth, inside
+`pt_lock` for pooled page-table frames, and alone on the augment path; the
+kernel page-table pool lock inside `pt_lock` on the heap-backed page-table
+path. A CPU wedged on one of these locks shows no heartbeat and no protocol
+spin site; the softlockup watchdog's lock-wait breadcrumb names the lock
+(§ Softlockup Watchdog).
 
 ---
 
@@ -819,19 +821,20 @@ spinning (`CS_SPIN_WARN_US`, time-based so it is meaningful under TCG's
 variable instruction rate).
 
 Each per-CPU dump line also carries a **lock-wait breadcrumb**: a CPU
-spinning for the derivation lock, a `MemoryObject` read or write lock, a
-retype-allocator lock, or a wrapper pool lock records the lock kind and the
-address of its state
-word once its first acquisition attempt fails
+spinning for one of the bare spin locks of § Lock Hierarchy (the derivation
+lock, a `MemoryObject` read or write lock, a retype-allocator lock, a wrapper
+pool lock, or the kernel page-table pool lock) records the lock kind and the
+address of its state word once its first acquisition attempt fails
 (`lock_wait_enter`/`lock_wait_exit`; the uncontended path stores nothing),
 and the dump prints them with the state word's current value —
 `0xffffffff` for a held `MemoryObject` write lock, a reader count otherwise,
-`0x1` for a held allocator lock. The dump reads another CPU's breadcrumb
-racily: it takes the kind before and after the word and prints only when
-both agree and the word is a non-zero address aligned for that kind, so a
-wait exited between the loads is skipped rather than read through a cleared
-word. These locks spin with interrupts masked, or on the idle thread inside
-a deferred reclaim, so without the breadcrumb a CPU wedged on one is
+`0x1` for a held allocator, wrapper pool, or kernel page-table pool lock. The
+dump reads another CPU's breadcrumb racily: it takes the kind before and
+after the word and prints only when both agree and the word is a non-zero
+address aligned for that kind, so a wait exited between the loads is skipped
+rather than read through a cleared word. These locks spin with interrupts
+masked, inside a preempt-disabled window, or on the idle thread inside a
+deferred reclaim, so without the breadcrumb a CPU wedged on one is
 indistinguishable from a silent or idle one. The dump also prints the
 derivation lock's state word and the CPU stamped as its write holder
 (`DerivationLock::debug_snapshot`), so a held lock with no spinning holder
@@ -990,5 +993,4 @@ adds one lock acquire at thread create/destroy and a walk per `CSpace` or
 
 ## Summarized By
 
-[kernel/README.md](../README.md)
-[capability-internals.md](capability-internals.md)
+[kernel/README.md](../README.md), [capability-internals.md](capability-internals.md)

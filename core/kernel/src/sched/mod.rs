@@ -450,18 +450,33 @@ pub enum LockKind
     RetypeAlloc = 4,
     /// A `CSpace` or `AddressSpace` wrapper's pool lock (a 64-bit word).
     Pool = 5,
+    /// The kernel page-table pool lock (`mm::kernel_pt_pool`, a byte).
+    KernelPtPool = 6,
 }
 
 impl LockKind
 {
+    /// Number of kinds; the exhaustive match ties it to the variant set.
+    #[cfg(not(test))]
+    const COUNT: usize = match Self::Derivation
+    {
+        Self::Derivation
+        | Self::MemoryRead
+        | Self::MemoryWrite
+        | Self::RetypeAlloc
+        | Self::Pool
+        | Self::KernelPtPool => 6,
+    };
+
     /// Every kind, for decoding a breadcrumb.
     #[cfg(not(test))]
-    const ALL: [Self; 5] = [
+    const ALL: [Self; Self::COUNT] = [
         Self::Derivation,
         Self::MemoryRead,
         Self::MemoryWrite,
         Self::RetypeAlloc,
         Self::Pool,
+        Self::KernelPtPool,
     ];
 
     /// Human-readable name for the watchdog dump.
@@ -475,6 +490,7 @@ impl LockKind
             Self::MemoryWrite => "memory-object write",
             Self::RetypeAlloc => "retype-allocator",
             Self::Pool => "wrapper pool",
+            Self::KernelPtPool => "kernel page-table pool",
         }
     }
 
@@ -486,6 +502,7 @@ impl LockKind
         {
             Self::RetypeAlloc | Self::Pool => 8,
             Self::Derivation | Self::MemoryRead | Self::MemoryWrite => 4,
+            Self::KernelPtPool => 1,
         }
     }
 
@@ -502,13 +519,13 @@ impl LockKind
 const LOCK_WAIT_NONE: u32 = 0;
 
 /// Per-CPU breadcrumb naming the bare spin lock a CPU is currently waiting
-/// for, for the softlockup watchdog: the lock kind and the address of its
-/// state word. The derivation lock, the `MemoryObject` locks, and the
-/// retype-allocator lock spin with interrupts masked (syscall context) or
-/// inside the idle thread's deferred reclaim, so a CPU wedged on one shows
-/// no protocol spin site and looks silent or idle; this breadcrumb names the
-/// lock and lets the dump read its state word. Recorded only once the first
-/// acquisition attempt fails, so the uncontended fast path stores nothing.
+/// for, for the softlockup watchdog: the lock kind (every [`LockKind`]) and
+/// the address of its state word. These locks spin with interrupts masked
+/// (syscall context), inside a preempt-disabled window, or inside the idle
+/// thread's deferred reclaim, so a CPU wedged on one shows no protocol spin
+/// site and looks silent or idle; this breadcrumb names the lock and lets
+/// the dump read its state word. Recorded only once the first acquisition
+/// attempt fails, so the uncontended fast path stores nothing.
 /// Diagnostic-only — never gates control flow.
 #[cfg(not(test))]
 static LOCK_WAIT_KIND: [core::sync::atomic::AtomicU32; MAX_CPUS] =
@@ -555,42 +572,50 @@ pub fn cpu_stamp() -> u32
     crate::arch::current::cpu::current_cpu().wrapping_add(1)
 }
 
+/// This CPU's `current`, read through the raw scheduler slot so no `&mut`
+/// is minted (a caller up the stack may hold a scheduler reference); null
+/// before the scheduler storage exists or before this CPU has dispatched a
+/// thread.
+#[cfg(not(test))]
+fn running_tcb_raw() -> *mut thread::ThreadControlBlock
+{
+    let base = SCHEDULERS_PTR.load(core::sync::atomic::Ordering::Acquire);
+    if base.is_null()
+    {
+        return core::ptr::null_mut();
+    }
+    let cpu = crate::arch::current::cpu::current_cpu() as usize;
+    // SAFETY: the storage is allocated for `CPU_COUNT` slots and the calling
+    // CPU's index is below it; a plain read of the slot's `current`.
+    unsafe { (*base.add(cpu)).current }
+}
+
 /// `(thread id, syscall number)` of the running thread, for lock-holder
 /// stamps: `(0, u64::MAX)` before this CPU has dispatched a thread (boot),
 /// and `u64::MAX` for a thread outside a syscall — the idle thread (whose
-/// id is an ordinary registry id) or a kernel path entered without a trap
-/// frame. Diagnostic only: in the preemptible state
+/// id is an ordinary registry id) or a kernel path entered without a
+/// syscall. Diagnostic only: in the preemptible state
 /// `check_lock_hold_preemptible` reports, the values may describe another
 /// thread (see the safety argument inside).
 #[cfg(not(test))]
 pub fn holder_info() -> (u32, u64)
 {
-    // SAFETY: `current_tcb()` reads this CPU's `current`, which names the
-    // calling thread unless the caller is preempted between the CPU-index
-    // read and the load — possible only in the preemptible state
-    // `check_lock_hold_preemptible` exists to report, where the pointer may
-    // then name another CPU's thread, even one being freed. TCB storage is
-    // a retype slab or the boot-allocated idle slab, direct-map memory that
-    // stays mapped, so the header loads cannot fault; the trap-frame
-    // pointer is followed only while the TCB's magic still matches, so a
-    // freed and recycled slot (poisoned on free) is never read through. A
-    // stale value only mislabels a diagnostic line.
+    // SAFETY: `running_tcb_raw()` names the calling thread unless the caller
+    // is preempted between the CPU-index read and the load — possible only
+    // in the preemptible state `check_lock_hold_preemptible` exists to
+    // report, where the pointer may then name another CPU's thread, even one
+    // freed and recycled since. Both reads are plain words of the TCB, which
+    // lives in a retype slab or the boot-allocated idle slab — direct-map
+    // memory that stays mapped — so they cannot fault, and no pointer read
+    // from the TCB is followed. A stale value only mislabels a diagnostic
+    // line.
     unsafe {
-        let tcb = crate::syscall::current_tcb();
-        if tcb.is_null() || (*tcb).magic != thread::TCB_MAGIC
+        let tcb = running_tcb_raw();
+        if tcb.is_null()
         {
             return (0, u64::MAX);
         }
-        let tf = (*tcb).trap_frame;
-        let nr = if tf.is_null()
-        {
-            u64::MAX
-        }
-        else
-        {
-            (*tf).syscall_nr()
-        };
-        ((*tcb).thread_id, nr)
+        ((*tcb).thread_id, (*tcb).syscall_nr)
     }
 }
 
@@ -623,19 +648,20 @@ static PREEMPTIBLE_HOLD_REPORTED: core::sync::atomic::AtomicU32 =
 /// Whether `tcb` is this CPU's idle TCB. The idle thread never migrates, so
 /// the calling thread is idle exactly when it is its own CPU's idle TCB; a
 /// user thread that migrates between the CPU-index read and the load still
-/// compares unequal to whichever idle TCB is read.
+/// compares unequal to whichever idle TCB is read. Reads `idle` through the
+/// raw scheduler slot, so it may run while a caller up the stack holds a
+/// reference into the same scheduler.
 ///
 /// # Safety
-/// The scheduler slab must be initialised (a non-null `current_tcb()`
-/// establishes it: `current` is written only by dispatch). Reads `idle`
-/// through the raw slot pointer, so it may run while a caller up the stack
-/// holds a reference into the same scheduler.
+/// The scheduler storage must be initialised and the calling CPU's index
+/// must be below `CPU_COUNT`; a non-null [`running_tcb_raw`] establishes
+/// both (`current` is written only by dispatch on an online CPU).
 #[cfg(not(test))]
 unsafe fn is_idle_tcb(tcb: *const thread::ThreadControlBlock) -> bool
 {
     let cpu = crate::arch::current::cpu::current_cpu() as usize;
-    // SAFETY: the scheduler slab is initialised per the caller contract and
-    // `cpu` is an online CPU index; `idle` is written once at init.
+    // SAFETY: storage initialised and `cpu < CPU_COUNT` per the caller
+    // contract; `idle` is written once at init.
     let idle = unsafe { (*scheduler_ptr(cpu)).idle };
     core::ptr::eq(tcb, idle)
 }
@@ -658,16 +684,13 @@ pub fn check_lock_hold_preemptible(kind: LockKind, site: &core::panic::Location<
     {
         return;
     }
-    // SAFETY: reads this CPU's `current`; see `holder_info` for why the
-    // pointer names the calling thread except in the state reported here,
-    // and why the load cannot fault.
-    let tcb = unsafe { crate::syscall::current_tcb() };
+    let tcb = running_tcb_raw();
     if tcb.is_null()
     {
         return;
     }
-    // SAFETY: `tcb` is non-null, so this CPU has dispatched a thread and the
-    // scheduler slab is initialised.
+    // SAFETY: `tcb` is non-null, so the scheduler storage is initialised and
+    // this CPU has dispatched a thread.
     if unsafe { is_idle_tcb(tcb) }
     {
         // SAFETY: tcb is this CPU's idle TCB in the boot-allocated idle slab,
@@ -1077,10 +1100,9 @@ fn watchdog_dump(reason: &str)
             crate::kprintln!("    spinning in {}", spin_site_name(spin));
         }
         // Name the bare spin lock this CPU is waiting for, if any, and read
-        // its state word: a derivation-lock, `MemoryObject`-lock, or
-        // retype-allocator wait spins with interrupts masked or on the idle
-        // thread, so it is otherwise indistinguishable from a silent or idle
-        // CPU.
+        // its state word: these waits spin with interrupts masked, inside a
+        // preempt-disabled window, or on the idle thread, so a wedged CPU is
+        // otherwise indistinguishable from a silent or idle one.
         // The breadcrumb belongs to another CPU, which may leave and
         // re-enter a wait meanwhile: the kind is read before and after the
         // word (Acquire, paired with the writer's Release), and the pair is
@@ -1106,15 +1128,15 @@ fn watchdog_dump(reason: &str)
             // read is volatile and nothing is written; the value is
             // diagnostic only.
             let value = unsafe {
-                if lock_kind == LockKind::RetypeAlloc
+                match lock_kind.word_width()
                 {
-                    core::ptr::read_volatile(core::ptr::with_exposed_provenance::<u64>(word))
-                }
-                else
-                {
-                    u64::from(core::ptr::read_volatile(
+                    8 => core::ptr::read_volatile(core::ptr::with_exposed_provenance::<u64>(word)),
+                    1 => u64::from(core::ptr::read_volatile(
+                        core::ptr::with_exposed_provenance::<u8>(word),
+                    )),
+                    _ => u64::from(core::ptr::read_volatile(
                         core::ptr::with_exposed_provenance::<u32>(word),
-                    ))
+                    )),
                 }
             };
             crate::kprintln!(
@@ -2040,6 +2062,7 @@ pub fn init(cpu_count: u32) -> u32
                     state: ThreadState::Running,
                     priority: IDLE_PRIORITY,
                     slice_remaining: 0,
+                    syscall_nr: u64::MAX,
                     cpu_affinity: cpu as u32,
                     preferred_cpu: cpu as u32,
                     run_queue_next: None,

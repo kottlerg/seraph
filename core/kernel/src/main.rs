@@ -1236,6 +1236,7 @@ unsafe fn kernel_entry_post_rebase(
                         state: sched::thread::ThreadState::Ready,
                         priority: sched::INIT_PRIORITY,
                         slice_remaining: sched::TIME_SLICE_TICKS,
+                        syscall_nr: u64::MAX,
                         cpu_affinity: sched::AFFINITY_ANY,
                         preferred_cpu: 0,
                         run_queue_next: None,

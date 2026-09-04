@@ -1097,6 +1097,7 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 state: ThreadState::Created,
                 priority: creation_priority,
                 slice_remaining: TIME_SLICE_TICKS,
+                syscall_nr: u64::MAX,
                 cpu_affinity: AFFINITY_ANY,
                 preferred_cpu: 0,
                 run_queue_next: None,

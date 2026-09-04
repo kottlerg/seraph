@@ -641,16 +641,34 @@ unsafe impl Send for CSpaceKernelObject {}
 // SAFETY: CSpaceKernelObject is accessed only with proper locks.
 unsafe impl Sync for CSpaceKernelObject {}
 
-/// Acquire a pool spinlock (`pt_pool_lock` or `cs_pool_lock`).
+/// Acquire a pool spinlock (`pt_pool_lock` or `cs_pool_lock`). A contended
+/// wait is recorded in the calling CPU's lock-wait breadcrumb for the
+/// softlockup watchdog; the uncontended path records nothing.
+// dead_code: every caller is compiled only outside host tests.
 #[inline]
 #[allow(dead_code)]
+#[track_caller]
 fn pool_lock(lock: &AtomicU64)
 {
-    while lock
+    crate::sched::check_lock_hold_preemptible(
+        crate::sched::LockKind::Pool,
+        core::panic::Location::caller(),
+    );
+    if lock
         .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
         .is_err()
     {
-        core::hint::spin_loop();
+        crate::sched::lock_wait_enter(
+            crate::sched::LockKind::Pool,
+            core::ptr::from_ref(lock).expose_provenance(),
+        );
+        while lock
+            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+        crate::sched::lock_wait_exit();
     }
 }
 

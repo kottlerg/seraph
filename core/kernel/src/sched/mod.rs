@@ -448,11 +448,24 @@ pub enum LockKind
     MemoryWrite = 3,
     /// A `MemoryObject`'s retype-allocator lock (a 64-bit word).
     RetypeAlloc = 4,
+    /// A `CSpace` or `AddressSpace` wrapper's pool lock (a 64-bit word).
+    Pool = 5,
 }
 
 impl LockKind
 {
+    /// Every kind, for decoding a breadcrumb.
+    #[cfg(not(test))]
+    const ALL: [Self; 5] = [
+        Self::Derivation,
+        Self::MemoryRead,
+        Self::MemoryWrite,
+        Self::RetypeAlloc,
+        Self::Pool,
+    ];
+
     /// Human-readable name for the watchdog dump.
+    #[cfg(not(test))]
     pub fn name(self) -> &'static str
     {
         match self
@@ -461,6 +474,7 @@ impl LockKind
             Self::MemoryRead => "memory-object read",
             Self::MemoryWrite => "memory-object write",
             Self::RetypeAlloc => "retype-allocator",
+            Self::Pool => "wrapper pool",
         }
     }
 
@@ -470,7 +484,7 @@ impl LockKind
     {
         match self
         {
-            Self::RetypeAlloc => 8,
+            Self::RetypeAlloc | Self::Pool => 8,
             Self::Derivation | Self::MemoryRead | Self::MemoryWrite => 4,
         }
     }
@@ -479,14 +493,7 @@ impl LockKind
     #[cfg(not(test))]
     fn from_code(code: u32) -> Option<Self>
     {
-        match code
-        {
-            1 => Some(Self::Derivation),
-            2 => Some(Self::MemoryRead),
-            3 => Some(Self::MemoryWrite),
-            4 => Some(Self::RetypeAlloc),
-            _ => None,
-        }
+        Self::ALL.into_iter().find(|kind| *kind as u32 == code)
     }
 }
 
@@ -562,13 +569,15 @@ pub fn holder_info() -> (u32, u64)
     // calling thread unless the caller is preempted between the CPU-index
     // read and the load — possible only in the preemptible state
     // `check_lock_hold_preemptible` exists to report, where the pointer may
-    // then name another CPU's thread, even one being freed. Every TCB lives
-    // in retype-slab or static storage and every trap frame on a kernel
-    // stack, all of which stay mapped for the kernel's lifetime, so the
-    // loads cannot fault; a stale value only mislabels a diagnostic line.
+    // then name another CPU's thread, even one being freed. TCB storage is
+    // a retype slab or the boot-allocated idle slab, direct-map memory that
+    // stays mapped, so the header loads cannot fault; the trap-frame
+    // pointer is followed only while the TCB's magic still matches, so a
+    // freed and recycled slot (poisoned on free) is never read through. A
+    // stale value only mislabels a diagnostic line.
     unsafe {
         let tcb = crate::syscall::current_tcb();
-        if tcb.is_null()
+        if tcb.is_null() || (*tcb).magic != thread::TCB_MAGIC
         {
             return (0, u64::MAX);
         }
@@ -616,15 +625,18 @@ static PREEMPTIBLE_HOLD_REPORTED: core::sync::atomic::AtomicU32 =
 /// user thread that migrates between the CPU-index read and the load still
 /// compares unequal to whichever idle TCB is read.
 ///
-/// The caller MUST have established that the scheduler slab is initialised
-/// (a non-null `current_tcb()` does: `current` is written only by dispatch).
+/// # Safety
+/// The scheduler slab must be initialised (a non-null `current_tcb()`
+/// establishes it: `current` is written only by dispatch). Reads `idle`
+/// through the raw slot pointer, so it may run while a caller up the stack
+/// holds a reference into the same scheduler.
 #[cfg(not(test))]
-fn is_idle_tcb(tcb: *const thread::ThreadControlBlock) -> bool
+unsafe fn is_idle_tcb(tcb: *const thread::ThreadControlBlock) -> bool
 {
     let cpu = crate::arch::current::cpu::current_cpu() as usize;
     // SAFETY: the scheduler slab is initialised per the caller contract and
-    // `cpu` is an online CPU index.
-    let idle = unsafe { scheduler_for(cpu) }.idle;
+    // `cpu` is an online CPU index; `idle` is written once at init.
+    let idle = unsafe { (*scheduler_ptr(cpu)).idle };
     core::ptr::eq(tcb, idle)
 }
 
@@ -654,10 +666,13 @@ pub fn check_lock_hold_preemptible(kind: LockKind, site: &core::panic::Location<
     {
         return;
     }
-    if is_idle_tcb(tcb)
+    // SAFETY: `tcb` is non-null, so this CPU has dispatched a thread and the
+    // scheduler slab is initialised.
+    if unsafe { is_idle_tcb(tcb) }
     {
-        // SAFETY: tcb is this CPU's idle TCB, static storage; its
-        // `slice_remaining` is written only by `timer_tick` on this CPU.
+        // SAFETY: tcb is this CPU's idle TCB in the boot-allocated idle slab,
+        // which is never freed; its `slice_remaining` is written only by
+        // `timer_tick` on this CPU.
         let slice = unsafe { (*tcb).slice_remaining };
         debug_assert!(
             slice == 0,
@@ -1070,9 +1085,11 @@ fn watchdog_dump(reason: &str)
         // re-enter a wait meanwhile: the kind is read before and after the
         // word (Acquire, paired with the writer's Release), and the pair is
         // used only if both reads agree and the word is a non-zero address
-        // aligned for that kind's width. A wait exited and re-entered for
-        // the same kind can still pair the kind with the earlier word: a
-        // stale but valid address of the same width.
+        // aligned for that kind's width. A wait exited and re-entered
+        // meanwhile can still pair the kind with the earlier word — or,
+        // across two re-entries, with a word recorded for another kind — a
+        // stale but mapped address aligned for the width read, so the line
+        // may be mislabeled but the read stays sound.
         let kind_before = LOCK_WAIT_KIND[cpu].load(core::sync::atomic::Ordering::Acquire);
         let word = LOCK_WAIT_WORD[cpu].load(core::sync::atomic::Ordering::Relaxed) as usize;
         let kind_after = LOCK_WAIT_KIND[cpu].load(core::sync::atomic::Ordering::Acquire);

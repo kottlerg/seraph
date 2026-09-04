@@ -713,10 +713,11 @@ pub fn disable() -> bool
 /// IDT must be loaded before calling this function.
 pub unsafe fn enable()
 {
-    // SAFETY: `sti` sets RFLAGS.IF; it touches no memory and clobbers no
-    // register. Caller guarantees the IDT is valid. `nomem` is omitted so
-    // no memory operation is reordered across the enable (see
-    // `cpu::disable_interrupts`).
+    // SAFETY: `sti` sets RFLAGS.IF, which lies outside the set
+    // `preserves_flags` covers (the status flags, DF, and the floating-point
+    // state); it touches no memory and no register. Caller guarantees the
+    // IDT is valid. `nomem` is omitted so no memory operation is reordered
+    // across the enable (see `cpu::disable_interrupts`).
     unsafe {
         core::arch::asm!("sti", options(nostack, preserves_flags));
     }

@@ -928,12 +928,14 @@ pub unsafe fn init()
     // SIE: global interrupt enable — starts disabled, timer::init() enables it.
     // SPP: previous privilege (0 = U-mode return target).
     // SUM: permit S-mode to access U-mode pages (not needed; keep disabled).
-    // SAFETY: csrc sstatus is a privileged S-mode instruction; caller ensures S-mode.
+    // SAFETY: csrc sstatus is a privileged S-mode instruction that clears the
+    // masked bits and touches no memory; caller ensures S-mode. `nomem` is
+    // omitted as for `cpu::disable_interrupts`.
     unsafe {
         core::arch::asm!(
             "csrc sstatus, {mask}",
             mask = in(reg) (1u64 << 1) | (1u64 << 8) | (1u64 << 18),
-            options(nostack, nomem),
+            options(nostack, preserves_flags),
         );
     }
 
@@ -1015,11 +1017,13 @@ pub unsafe fn init_ap()
     // privileged instructions; per-hart registers; no shared state.
     unsafe {
         // Clear SIE FIRST to prevent any stray interrupt from firing before
-        // stvec and sscratch are configured. Firmware may leave SIE=1.
+        // stvec and sscratch are configured. Firmware may leave SIE=1. The
+        // write touches no memory; `nomem` is omitted as for
+        // `cpu::disable_interrupts`.
         core::arch::asm!(
             "csrc sstatus, {mask}",
             mask = in(reg) (1u64 << 1) | (1u64 << 8) | (1u64 << 18),
-            options(nostack, nomem),
+            options(nostack, preserves_flags),
         );
 
         // Install stvec — per-hart CSR, must be written on every hart.

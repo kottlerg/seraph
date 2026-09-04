@@ -267,8 +267,10 @@ unsafe extern "C" fn common_exception_handler(
     let is_userspace = (f.cs & 3) != 0;
 
     // Disable interrupts before printing to prevent serial interleaving.
-    // SAFETY: ring 0 context; this is a crash path.
-    unsafe { core::arch::asm!("cli", options(nomem, nostack)) };
+    // SAFETY: ring 0 context; this is a crash path. `cli` clears RFLAGS.IF
+    // (outside the `preserves_flags` set) and touches no memory; `nomem` is
+    // omitted as for `cpu::disable_interrupts`.
+    unsafe { core::arch::asm!("cli", options(nostack, preserves_flags)) };
 
     if is_userspace
     {

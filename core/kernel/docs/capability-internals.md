@@ -362,14 +362,17 @@ This is a deliberate design choice: a single lock avoids deadlock from ordering
 multiple per-CSpace locks, and derivation-tree edits are rare relative to
 capability use.
 
-The lock is a bare CAS spin lock taken from syscall context with interrupts
-masked; a holder is never descheduled and never parks (see
+The lock is a bare CAS spin lock. Every context that takes it cannot be
+descheduled — syscall context with interrupts masked, a preempt-disabled
+window, or the idle thread's deferred reclaim, whose time slice is permanently
+zero — and a holder never parks (see
 [scheduling-internals.md](scheduling-internals.md) § Lock Hierarchy, "Bare spin
-locks", for the full order: derivation lock, then the `MemoryObject` write
-locks of a split or merge, then the SEED read lock of a retype, then the
-`CSpace` spinlock). The lock records its write holder's CPU, and a CPU
-spinning for it records a lock-wait breadcrumb; the softlockup watchdog dump
-prints both.
+locks", for the contexts, the invariant each rests on, and the full order:
+derivation lock, then the `MemoryObject` write locks of a split or merge, then
+the SEED read lock of a retype, then the `CSpace` spinlock, then a wrapper pool
+lock). The lock records its write holder's CPU, thread, syscall, and call
+site, and a CPU spinning for it records a lock-wait breadcrumb; the softlockup
+watchdog dump prints both.
 
 ### Revocation Algorithm
 

@@ -442,6 +442,109 @@ pub fn revoke_large_subtree(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
+/// `cap_move` relocates a cap with more children than one reparent batch
+/// (`MAX_REPARENT_EDITS` in the kernel's capability-internals design doc),
+/// through both destination modes, and every child follows: a child deleted
+/// afterwards hands its own child to the moved slot, and a revoke on the
+/// moved slot clears them all.
+///
+/// Same-`CSpace` moves — the destination is ktest's own `CSpace` cap — so
+/// the moved handle can be exercised, revoked, and deleted from here.
+pub fn move_large_subtree(ctx: &TestContext) -> TestResult
+{
+    const CHILDREN: usize = 600;
+
+    let used0 = cap_info(ctx.cspace_cap, syscall_abi::CAP_INFO_CSPACE_USED)
+        .map_err(|_| "cap_info(USED) baseline failed")?;
+
+    for explicit in [false, true]
+    {
+        let sig = cap_create_notification(ctx.memory_base)
+            .map_err(|_| "create_notification for move_large_subtree failed")?;
+        let mut probes: [Option<u32>; 3] = [None; 3];
+        let mut grandchild = None;
+        for i in 0..CHILDREN
+        {
+            let child = cap_derive(sig, RIGHTS_NOTIFY).map_err(|_| "cap_derive (move) failed")?;
+            if i == 0
+            {
+                probes[0] = Some(child);
+            }
+            else if i == CHILDREN / 2
+            {
+                probes[1] = Some(child);
+                grandchild = Some(
+                    cap_derive(child, RIGHTS_NOTIFY)
+                        .map_err(|_| "cap_derive (move grandchild) failed")?,
+                );
+            }
+            else if i == CHILDREN - 1
+            {
+                probes[2] = Some(child);
+            }
+        }
+        let [Some(head), Some(mid), Some(tail)] = probes
+        else
+        {
+            return Err("move_large_subtree built no probes");
+        };
+        let grandchild = grandchild.ok_or("move_large_subtree built no grandchild")?;
+
+        // Explicit mode targets a just-freed index; the kernel decodes the
+        // placement index from the stale handle without a generation check.
+        let dest_index = if explicit
+        {
+            let t = cap_create_notification(ctx.memory_base)
+                .map_err(|_| "create_notification (placement) failed")?;
+            cap_delete(t).map_err(|_| "cap_delete (placement) failed")?;
+            t
+        }
+        else
+        {
+            0
+        };
+        let moved = cap_move(sig, ctx.cspace_cap, dest_index).map_err(|_| "cap_move failed")?;
+        if explicit
+            && syscall_abi::cap_handle_index(moved) != syscall_abi::cap_handle_index(dest_index)
+        {
+            return Err("explicit cap_move landed at another index");
+        }
+        if notification_send(sig, 0x1).is_ok()
+        {
+            return Err("source slot still usable after cap_move");
+        }
+        notification_send(moved, 0x1).map_err(|_| "moved cap unusable")?;
+
+        // The deleted probe's child re-links under the moved slot only if
+        // the migration rewrote its parent pointer.
+        cap_delete(mid).map_err(|_| "cap_delete (mid probe) failed")?;
+        notification_send(grandchild, 0x1).map_err(|_| "grandchild unusable before revoke")?;
+        cap_revoke(moved).map_err(|_| "cap_revoke (moved) failed")?;
+        for cap in [head, tail, grandchild]
+        {
+            if notification_send(cap, 0x1).is_ok()
+            {
+                return Err("descendant still usable after revoke of the moved slot");
+            }
+        }
+
+        let used = cap_info(ctx.cspace_cap, syscall_abi::CAP_INFO_CSPACE_USED)
+            .map_err(|_| "cap_info(USED) after revoke failed")?;
+        if used != used0 + 1
+        {
+            return Err("slot count not restored after revoke of the moved slot");
+        }
+        cap_delete(moved).map_err(|_| "cap_delete (moved) failed")?;
+        let used = cap_info(ctx.cspace_cap, syscall_abi::CAP_INFO_CSPACE_USED)
+            .map_err(|_| "cap_info(USED) final failed")?;
+        if used != used0
+        {
+            return Err("slot count not at baseline after deleting the moved slot");
+        }
+    }
+    Ok(())
+}
+
 // ── SYS_CAP_COPY explicit slot negative ──────────────────────────────────────
 
 /// `cap_insert` to an already-occupied destination slot must return an error.

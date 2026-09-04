@@ -731,6 +731,7 @@ pub fn retype_free(memory: &MemoryObject, offset: u64, bytes: u64)
 /// Calls [`crate::fatal`] on `OutOfMemory` — Phase 7 boot-time mints cannot
 /// recover from a too-small seed.
 #[cfg(not(test))]
+#[track_caller]
 pub fn boot_retype_body<T>(seed: &MemoryObject, body: T) -> NonNull<KernelObjectHeader>
 {
     let bytes = core::mem::size_of::<T>() as u64;
@@ -767,6 +768,7 @@ pub fn boot_retype_body<T>(seed: &MemoryObject, body: T) -> NonNull<KernelObject
 ///
 /// `T` must be `#[repr(C)]` with [`KernelObjectHeader`] at offset 0.
 #[cfg(not(test))]
+#[track_caller]
 pub fn alloc_in_seed<T>(body: T) -> Result<NonNull<KernelObjectHeader>, SyscallError>
 {
     let seed = crate::cap::seed_memory_ref();
@@ -800,6 +802,7 @@ pub fn alloc_in_seed<T>(body: T) -> Result<NonNull<KernelObjectHeader>, SyscallE
 /// kstack + wrapper) so its memory comes from the user's Memory cap rather than
 /// the SEED bootstrap reserve.
 #[cfg(not(test))]
+#[track_caller]
 pub fn alloc_seed_scratch(bytes: u64) -> Result<*mut u8, SyscallError>
 {
     let seed = crate::cap::seed_memory_ref();
@@ -816,6 +819,7 @@ pub fn alloc_seed_scratch(bytes: u64) -> Result<*mut u8, SyscallError>
 /// so its refcount can never drop to zero in normal operation; the
 /// `dec_ref` here is bookkeeping for the scratch lease.
 #[cfg(not(test))]
+#[track_caller]
 pub fn free_seed_scratch(ptr: *mut u8, bytes: u64)
 {
     let seed = crate::cap::seed_memory_ref();

@@ -434,6 +434,13 @@ now-stale handle fail closed rather than alias a recycled slot (#349). (A move w
 the same CSpace likewise keeps the source's position.) To delegate a capability while
 keeping your own copy, use `SYS_CAP_COPY` instead (see [Revocation](#revocation)).
 
+The capabilities derived from a moved capability follow it: the move rewrites
+every child's parent link, in batches with the derivation lock released between
+them when the list is large. While a move is in flight both slots are pinned —
+the same refusal an in-flight revocation imposes on its root — so no other
+operation can tear the migration, and every descendant stays within its
+ancestors' revocation reach at every point.
+
 
 ---
 

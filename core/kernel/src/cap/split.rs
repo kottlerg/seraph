@@ -244,7 +244,7 @@ impl Original
                 if slot.tag == self.tag
                     && slot.generation() == self.generation
                     && slot.object == Some(self.object)
-                    && !slot.revoke_in_progress() =>
+                    && !slot.pinned() =>
             {
                 Revalidated::Live {
                     parent: slot.deriv_parent,

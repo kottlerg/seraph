@@ -52,8 +52,12 @@ A message consists of:
   The transfer is all-or-nothing: either every capability moves from sender to
   receiver atomically with the message (the sender loses access), or none does.
   A refused transfer — a source slot gone stale, repeated within the message, or
-  pinned by an in-flight revocation — does not block delivery: the message
-  arrives with zero capabilities and the sender keeps its own. On the reply
+  pinned by an in-flight revocation or move — does not block delivery: the
+  message arrives with zero capabilities and the sender keeps its own. A
+  capability whose derived children take more than one lock hold to migrate is
+  moved in batches after the message commits; if an ancestor revokes it
+  meanwhile, it arrives as handle 0 (the permanently null slot) — the revoke
+  won, exactly as if it had landed just after delivery. On the reply
   direction the sender (the replying server) receives the error and the waiting
   caller resumes with the `IPC_REPLY_TRANSFER_FAILED` label; on the call/receive
   direction the sender is rejected before blocking where the refusal is

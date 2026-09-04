@@ -215,7 +215,9 @@ impl DerivationLock
 ///
 /// Caller must hold `DERIVATION_LOCK` (write lock). The returned reference
 /// is valid only while the lock is held and the `CSpace` is live.
-unsafe fn resolve_slot_mut(id: SlotId) -> Option<&'static mut super::slot::CapabilitySlot>
+pub(crate) unsafe fn resolve_slot_mut(
+    id: SlotId,
+) -> Option<&'static mut super::slot::CapabilitySlot>
 {
     let cs_ptr = crate::cap::lookup_cspace(id.cspace_id, id.epoch)?;
     // SAFETY: cspace registry lookup validated; CSpace pointer lives as long as the registry entry.
@@ -519,7 +521,7 @@ pub enum BatchStatus
 /// so ancestor revocation reach is preserved; intermediate parent→child
 /// edges inside the subtree are destroyed as the flattening proceeds, which
 /// is why the syscall pins the root against delete/move for the whole
-/// multi-batch operation (see `CapabilitySlot::revoke_in_progress`) — an
+/// multi-batch operation (see `CapabilitySlot::pinned`) — an
 /// abandoned half-flattened subtree would otherwise permanently outlive the
 /// intermediate holders' revocation authority.
 ///
@@ -686,6 +688,123 @@ unsafe fn unlink_free_collect(id: SlotId) -> Option<NonNull<KernelObjectHeader>>
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
+/// Host-test harness shared by the derivation-tree modules (`derivation`,
+/// `transfer`).
+///
+/// Each test registers heap-backed CSpaces in the shared test registry
+/// under hard-coded ids unique to that test (the registry is a
+/// process-wide static and `cargo test` runs tests concurrently). The
+/// ids sit far above anything the test-stub `alloc_cspace_id` counter
+/// reaches in this suite and below the recycle test's reserved top id;
+/// nothing enforces that — a new direct-registration test must pick an
+/// unused id. Leaked Boxes are acceptable — the process exits after the
+/// run. The global DERIVATION_LOCK is taken for fidelity with the
+/// production contract; these tests assert only after `write_unlock`, so
+/// a failing assertion unwinds without wedging the other tests on the
+/// lock (the `debug_assert!`s reachable under the hold —
+/// `revoke_subtree_batch`'s hoist-link check and the free-list link
+/// rewrites reached through `free_slot` — guard conditions these tests
+/// never provoke).
+#[cfg(test)]
+pub(crate) mod harness
+{
+    use super::*;
+    use crate::cap::cspace::CSpace;
+    use crate::cap::slot::CapTag;
+    use core::num::NonZeroU32;
+
+    pub(crate) fn mk_registered_cspace(id: crate::cap::slot::CSpaceId) -> *mut CSpace
+    {
+        let cs = Box::leak(Box::new(CSpace::new(id)));
+        crate::cap::register_cspace(id, cs).expect("register test cspace");
+        core::ptr::from_mut(cs)
+    }
+
+    /// Populate one slot (Endpoint tag, dangling object pointer — the batch
+    /// only collects object pointers, never dereferences them) and return
+    /// its stamped `SlotId`.
+    pub(crate) fn occupy(cs: *mut CSpace, id: crate::cap::slot::CSpaceId) -> SlotId
+    {
+        // SAFETY: single-threaded test ownership of the leaked CSpace.
+        let idx = unsafe { (*cs).allocate_slot() }.expect("allocate slot");
+        // SAFETY: as above.
+        let slot = unsafe { (*cs).slot_mut(idx.get()) }.expect("slot_mut");
+        slot.tag = CapTag::Endpoint;
+        slot.object = Some(NonNull::dangling());
+        SlotId::current(id, idx)
+    }
+
+    /// Derivation links to hand-write into a slot (see [`set_links`]).
+    pub(crate) struct Links
+    {
+        pub(crate) parent: Option<SlotId>,
+        pub(crate) prev: Option<SlotId>,
+        pub(crate) next: Option<SlotId>,
+    }
+
+    /// Hand-write `id`'s derivation links; `false` if the slot does not
+    /// resolve. Callers assert on the result after releasing the lock.
+    ///
+    /// # Safety
+    ///
+    /// `DERIVATION_LOCK` must be held.
+    pub(crate) unsafe fn set_links(id: SlotId, links: Links) -> bool
+    {
+        // SAFETY: caller contract.
+        match unsafe { resolve_slot_mut(id) }
+        {
+            Some(slot) =>
+            {
+                slot.deriv_parent = links.parent;
+                slot.deriv_prev_sibling = links.prev;
+                slot.deriv_next_sibling = links.next;
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub(crate) fn count_populated(cs: *mut CSpace) -> usize
+    {
+        // SAFETY: single-threaded test ownership.
+        unsafe { (*cs).populated_count() }
+    }
+
+    /// Link pre-occupied `nodes` as a derive chain under `root` (each node
+    /// the sole child of the previous). Nodes are allocated by the caller
+    /// before locking so no fallible call runs while `DERIVATION_LOCK` is
+    /// held. Returns whether every link landed; callers assert on it after
+    /// releasing the lock.
+    ///
+    /// # Safety
+    ///
+    /// `DERIVATION_LOCK` must be held across the call.
+    pub(crate) unsafe fn link_chain(root: SlotId, nodes: &[SlotId]) -> bool
+    {
+        let mut parent = root;
+        let mut linked = true;
+        for &child in nodes
+        {
+            // SAFETY: DERIVATION_LOCK held by caller; both slots live.
+            linked &= unsafe { link_child(parent, child) };
+            parent = child;
+        }
+        linked
+    }
+
+    /// [`occupy`] `len` slots up front, before the caller takes
+    /// `DERIVATION_LOCK` — no fallible allocation may run under the global
+    /// lock (a panic there would wedge the whole suite).
+    pub(crate) fn occupy_many(
+        cs: *mut CSpace,
+        id: crate::cap::slot::CSpaceId,
+        len: usize,
+    ) -> std::vec::Vec<SlotId>
+    {
+        (0..len).map(|_| occupy(cs, id)).collect()
+    }
+}
+
 #[cfg(test)]
 mod tests
 {
@@ -743,117 +862,8 @@ mod tests
         assert!(released.site.is_some(), "the last acquisition stays named");
     }
 
-    // ── revoke_subtree_batch (host harness) ──────────────────────────────
-    //
-    // Each test registers heap-backed CSpaces in the shared test registry
-    // under hard-coded ids unique to that test (the registry is a
-    // process-wide static and `cargo test` runs tests concurrently). The
-    // ids sit far above anything the test-stub `alloc_cspace_id` counter
-    // reaches in this suite and below the recycle test's reserved top id;
-    // nothing enforces that — a new direct-registration test must pick an
-    // unused id. Leaked Boxes are acceptable — the process exits after the
-    // run. The global DERIVATION_LOCK is taken for fidelity with the
-    // production contract; these tests assert only after `write_unlock`, so
-    // a failing assertion unwinds without wedging the other tests on the
-    // lock (the `debug_assert!`s reachable under the hold —
-    // `revoke_subtree_batch`'s hoist-link check and the free-list link
-    // rewrites reached through `free_slot` — guard conditions these tests
-    // never provoke).
-
-    use crate::cap::cspace::CSpace;
+    use super::harness::*;
     use crate::cap::slot::CapTag;
-    use core::num::NonZeroU32;
-
-    fn mk_registered_cspace(id: crate::cap::slot::CSpaceId) -> *mut CSpace
-    {
-        let cs = Box::leak(Box::new(CSpace::new(id)));
-        crate::cap::register_cspace(id, cs).expect("register test cspace");
-        core::ptr::from_mut(cs)
-    }
-
-    /// Populate one slot (Endpoint tag, dangling object pointer — the batch
-    /// only collects object pointers, never dereferences them) and return
-    /// its stamped `SlotId`.
-    fn occupy(cs: *mut CSpace, id: crate::cap::slot::CSpaceId) -> SlotId
-    {
-        // SAFETY: single-threaded test ownership of the leaked CSpace.
-        let idx = unsafe { (*cs).allocate_slot() }.expect("allocate slot");
-        // SAFETY: as above.
-        let slot = unsafe { (*cs).slot_mut(idx.get()) }.expect("slot_mut");
-        slot.tag = CapTag::Endpoint;
-        slot.object = Some(NonNull::dangling());
-        SlotId::current(id, idx)
-    }
-
-    /// Derivation links to hand-write into a slot (see [`set_links`]).
-    struct Links
-    {
-        parent: Option<SlotId>,
-        prev: Option<SlotId>,
-        next: Option<SlotId>,
-    }
-
-    /// Hand-write `id`'s derivation links; `false` if the slot does not
-    /// resolve. Callers assert on the result after releasing the lock.
-    ///
-    /// # Safety
-    ///
-    /// `DERIVATION_LOCK` must be held.
-    unsafe fn set_links(id: SlotId, links: Links) -> bool
-    {
-        // SAFETY: caller contract.
-        match unsafe { resolve_slot_mut(id) }
-        {
-            Some(slot) =>
-            {
-                slot.deriv_parent = links.parent;
-                slot.deriv_prev_sibling = links.prev;
-                slot.deriv_next_sibling = links.next;
-                true
-            }
-            None => false,
-        }
-    }
-
-    fn count_populated(cs: *mut CSpace) -> usize
-    {
-        // SAFETY: single-threaded test ownership.
-        unsafe { (*cs).populated_count() }
-    }
-
-    /// Link pre-occupied `nodes` as a derive chain under `root` (each node
-    /// the sole child of the previous). Nodes are allocated by the caller
-    /// before locking so no fallible call runs while `DERIVATION_LOCK` is
-    /// held. Returns whether every link landed; callers assert on it after
-    /// releasing the lock.
-    ///
-    /// # Safety
-    ///
-    /// `DERIVATION_LOCK` must be held across the call.
-    unsafe fn link_chain(root: SlotId, nodes: &[SlotId]) -> bool
-    {
-        let mut parent = root;
-        let mut linked = true;
-        for &child in nodes
-        {
-            // SAFETY: DERIVATION_LOCK held by caller; both slots live.
-            linked &= unsafe { link_child(parent, child) };
-            parent = child;
-        }
-        linked
-    }
-
-    /// [`occupy`] `len` slots up front, before the caller takes
-    /// `DERIVATION_LOCK` — no fallible allocation may run under the global
-    /// lock (a panic there would wedge the whole suite).
-    fn occupy_many(
-        cs: *mut CSpace,
-        id: crate::cap::slot::CSpaceId,
-        len: usize,
-    ) -> std::vec::Vec<SlotId>
-    {
-        (0..len).map(|_| occupy(cs, id)).collect()
-    }
 
     #[test]
     fn revoke_batch_clears_mixed_tree_and_preserves_root()

@@ -1122,7 +1122,7 @@ unsafe fn deferred_link(ptr: NonNull<KernelObjectHeader>) -> *mut *mut KernelObj
 // stored by this function (header at offset 0, 8-byte aligned).
 #[allow(clippy::cast_ptr_alignment)]
 #[cfg(not(test))]
-unsafe fn push_deferred_reclaim(cpu: usize, ptr: NonNull<KernelObjectHeader>)
+pub(crate) unsafe fn push_deferred_reclaim(cpu: usize, ptr: NonNull<KernelObjectHeader>)
 {
     let node = ptr.as_ptr();
     // SAFETY: cpu < MAX_CPUS; scheduler initialised by sched::init.
@@ -2131,15 +2131,17 @@ unsafe fn dealloc_object_one(
                 unsafe { crate::sched::thread_registry::unregister(tcb) };
 
                 // Poison the TCB so any use-after-free reads garbage
-                // instead of plausible values. `magic` is written with a
-                // volatile store: the lock-holder diagnostic may read it
-                // from another CPU through a stale `current` pointer
-                // (`sched::holder_info`), and the pair stays a deliberate,
-                // documented race on a diagnostic-only word.
+                // instead of plausible values. Both stores are volatile:
+                // the lock-holder diagnostic may read the slot from another
+                // CPU through a stale `current` pointer
+                // (`sched::holder_info`) — a deliberate race the volatile
+                // pair keeps well-defined — and `magic` also gates the
+                // liveness debug assertions, so its store must not be
+                // reordered or elided.
                 // SAFETY: tcb is valid; we are about to free it.
                 unsafe {
                     core::ptr::write_volatile(core::ptr::addr_of_mut!((*tcb).magic), 0);
-                    (*tcb).priority = 0xFF;
+                    core::ptr::write_volatile(core::ptr::addr_of_mut!((*tcb).priority), 0xFF);
                 }
 
                 // SAFETY: tcb lives in-place inside the retype slot;

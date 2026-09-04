@@ -570,8 +570,8 @@ pub struct CapabilitySlot
     /// `pad[0]` doubles as the intrusive free-list membership marker
     /// ([`FREE_LIST_MARKER`] when the Null slot is linked on a `CSpace` free
     /// list); `pad[1]` holds the per-slot generation counter (see
-    /// [`CapabilitySlot::generation`]); `pad[2]` holds the revoke-in-progress
-    /// marker (see [`CapabilitySlot::revoke_in_progress`]).
+    /// [`CapabilitySlot::generation`]); `pad[2]` holds the in-flight pin
+    /// (see [`CapabilitySlot::pinned`]).
     pad: [u8; 3],
     /// Rights bitmask (type-specific).
     pub rights: Rights,
@@ -681,34 +681,38 @@ impl CapabilitySlot
         self.pad[1] = self.pad[1].wrapping_add(1);
     }
 
-    // ── Revoke-in-progress marker (`pad[2]`) ──────────────────────────────────
+    // ── In-flight pin (`pad[2]`) ──────────────────────────────────────────────
 
-    /// Return `true` if a multi-batch `SYS_CAP_REVOKE` is in flight on this
-    /// slot (marker stored in `pad[2]`).
+    /// Return `true` if a multi-batch operation is in flight on this slot
+    /// (marker stored in `pad[2]`): a `SYS_CAP_REVOKE` on its root, or a
+    /// `SYS_CAP_MOVE` / IPC capability transfer on its source and
+    /// destination.
     ///
-    /// While set, `SYS_CAP_DELETE`, `SYS_CAP_MOVE`, and IPC capability
-    /// transfer refuse to act on the slot: deleting or moving a revoke root
-    /// between batches would promote its temporarily hoisted survivors and
-    /// permanently sever intermediate revocation edges (see the revocation
-    /// algorithm in `capability-internals.md`). Read and written only under
-    /// `DERIVATION_LOCK`. A slot freed while marked sheds the marker on the
+    /// While set, `SYS_CAP_DELETE`, `SYS_CAP_MOVE`, `SYS_CAP_COPY`,
+    /// `SYS_CAP_DERIVE`, `SYS_CAP_DERIVE_BADGE`, the memory and range
+    /// splits, `SYS_MEMORY_MERGE`, a further `SYS_CAP_REVOKE`, and IPC
+    /// capability transfer refuse to act on the slot with `InvalidState`:
+    /// deleting or moving a revoke root between batches would promote its
+    /// temporarily hoisted survivors and permanently sever intermediate
+    /// revocation edges, and any of those operations on a slot mid-move
+    /// would tear the migration (see the revocation algorithm and § Move in
+    /// `capability-internals.md`). Read and written only under
+    /// `DERIVATION_LOCK`. A slot freed while pinned sheds the marker on the
     /// free path — [`set_next_free`](Self::set_next_free) zeroes `pad[2]`
     /// when threading the slot onto the free list.
-    pub fn revoke_in_progress(&self) -> bool
+    pub fn pinned(&self) -> bool
     {
         self.pad[2] != 0
     }
 
-    /// Set the revoke-in-progress marker (see
-    /// [`revoke_in_progress`](Self::revoke_in_progress)).
-    pub fn mark_revoke_in_progress(&mut self)
+    /// Set the in-flight pin (see [`pinned`](Self::pinned)).
+    pub fn pin(&mut self)
     {
         self.pad[2] = 1;
     }
 
-    /// Clear the revoke-in-progress marker (see
-    /// [`revoke_in_progress`](Self::revoke_in_progress)).
-    pub fn clear_revoke_in_progress(&mut self)
+    /// Clear the in-flight pin (see [`pinned`](Self::pinned)).
+    pub fn unpin(&mut self)
     {
         self.pad[2] = 0;
     }
@@ -734,9 +738,8 @@ impl CapabilitySlot
     /// is the list tail. Leaves `pad[1]` (the per-slot generation) untouched —
     /// `CSpace::free_slot` bumps it immediately before this call and the next
     /// allocation must observe the incremented value. Zeroes `pad[2]` — a
-    /// slot freed while a revoke had it pinned must not carry the
-    /// revoke-in-progress marker into its next occupant (see
-    /// [`revoke_in_progress`](Self::revoke_in_progress)).
+    /// slot freed while a revoke or move had it pinned must not carry the
+    /// pin into its next occupant (see [`pinned`](Self::pinned)).
     ///
     /// [`is_on_free_list`]: Self::is_on_free_list
     pub fn set_next_free(&mut self, next: Option<NonZeroU32>)

@@ -332,8 +332,10 @@ root_cap (no parent)
     └── derived_B1 (first child of B)
 ```
 
-**Transfer** does not create a new derivation tree node — the transferred slot
-inherits the donor's position in the tree. The donor's slot becomes null.
+**Transfer** (`SYS_CAP_MOVE`, IPC capability transfer) does not create a new
+derivation tree node — the destination slot takes the donor's position in the
+tree and the donor's slot becomes null (see [Move](#move) for how a large child
+list is migrated).
 
 **Derivation** creates a new node as a child of the source slot in the tree.
 
@@ -392,11 +394,10 @@ revoke(root_handle):
     loop:
         acquire derivation tree write lock
         revalidate root (non-Null, handle generation current); stop if not
-        first batch: refuse if the root is already marked revoke-in-progress,
-                     else set the marker
+        first batch: refuse if the root is already pinned, else pin it
         objects, status = revoke_subtree_batch(root) // ≤ MAX_REVOKE_EDITS edits
         final batch (status ≠ MoreWork, or MAX_REVOKE_BATCHES reached):
-            clear the marker
+            unpin the root
         release derivation tree write lock
         dec_ref / dealloc each collected object      // outside the lock
         Cleared → return success; DeadLink → return error;
@@ -457,21 +458,23 @@ such a child's handle no longer resolves; re-reading the slot after the lock
 is released would instead return a live handle to the refill.
 
 Because hoisting destroys intermediate parent→child edges as the flattening
-proceeds, the root is pinned for the whole multi-batch operation with a
-**revoke-in-progress marker** (`CapabilitySlot::revoke_in_progress`, stored in
-the slot's spare pad byte, read and written only under the derivation write
-lock). `SYS_CAP_DELETE`, `SYS_CAP_MOVE`, `SYS_CAP_COPY`, `SYS_CAP_DERIVE`,
-`SYS_CAP_DERIVE_BADGE`, `SYS_MEMORY_SPLIT`, `SYS_MEMORY_MERGE`, and the range
-splits refuse a marked slot with `InvalidState`; IPC capability transfer refuses
-to move one — the reply direction surfaces `InvalidState` to the server (the
-caller resumes with `IPC_REPLY_TRANSFER_FAILED`), the call direction rejects
-before blocking, and a refusal detected only post-commit delivers the message
-with zero caps (see [docs/ipc-design.md](../../../docs/ipc-design.md) § Message
-Format). Deleting or moving the root between batches would promote the
-temporarily hoisted survivors and permanently sever the intermediate holders'
-revocation authority. The marker is cleared under the lock on every syscall exit
-path — completion, dead-link error, and the `Interrupted` backstop alike — so it
-cannot leak; a root freed by a concurrent ancestor revoke sheds the marker with
+proceeds, the root is pinned for the whole multi-batch operation with the
+**in-flight pin** (`CapabilitySlot::pinned`, stored in the slot's spare pad
+byte, read and written only under the derivation write lock; a move pins its
+source and destination the same way — see [Move](#move)). `SYS_CAP_DELETE`,
+`SYS_CAP_MOVE`, `SYS_CAP_COPY`, `SYS_CAP_DERIVE`, `SYS_CAP_DERIVE_BADGE`,
+`SYS_MEMORY_SPLIT`, `SYS_MEMORY_MERGE`, the range splits, and a further
+`SYS_CAP_REVOKE` refuse a pinned slot with `InvalidState`; IPC capability
+transfer refuses to move one — the reply direction surfaces `InvalidState` to
+the server (the caller resumes with `IPC_REPLY_TRANSFER_FAILED`), the call
+direction rejects before blocking, and a refusal detected only post-commit
+delivers the message with zero caps (see
+[docs/ipc-design.md](../../../docs/ipc-design.md) § Message Format). Deleting
+or moving the root between batches would promote the temporarily hoisted
+survivors and permanently sever the intermediate holders' revocation
+authority. The pin is cleared under the lock on every syscall exit path —
+completion, dead-link error, and the `Interrupted` backstop alike — so it
+cannot leak; a root freed by a concurrent ancestor revoke sheds the pin with
 the slot (that ancestor's revoke clears the hoisted survivors too, since they
 remain inside its subtree).
 
@@ -534,6 +537,73 @@ locks (see lock ordering in [ipc-internals.md](ipc-internals.md)). Therefore,
 write lock. Revocation collects a set of IPC objects needing cleanup (e.g. endpoints
 that have a revoked capability in their send queue), releases the write lock, then
 acquires individual IPC object locks to perform cleanup.
+
+### Move
+
+`SYS_CAP_MOVE` and IPC capability transfer relocate an occupied slot to a
+fresh slot — auto-allocated or, for the syscall, caller-chosen — in the same
+or another `CSpace` (`cap/transfer.rs`). The destination takes the source's
+exact position in the tree: its parent, its siblings, and every one of its
+children are repointed onto the new slot, and the source is freed. The child
+walk is the unbounded part — a slot can have been derived from up to the
+structural ceiling of every `CSpace` — so it runs on the same terms as
+deletion's reparent walk: `MAX_REPARENT_EDITS` head pops per lock hold
+(`reparent_children`, each child detached and re-linked under the destination
+in O(1)), the derivation lock released between batches, and a
+`MAX_REPARENT_BATCHES` backstop against a concurrent deriver.
+
+```
+move(src, dst):
+    first hold (derivation lock + both CSpace locks, pointer order):
+        validate src: occupied, handle generation current, not pinned
+        insert dst; inc_ref the object; pin src and dst
+        migrate up to MAX_REPARENT_EDITS children of src under dst
+        all moved → finish; else link dst as src's first child
+    every later hold (derivation lock only):
+        revalidate src and dst: occupied, same generation, same object
+        both live     → unlink dst, migrate another batch, finish or re-link
+        src gone, dst live → unpin dst; done (whoever freed src dropped its reference)
+        dst gone      → unpin src; InvalidState (src keeps the cap and its remaining children)
+        both gone     → InvalidCapability
+    finish: dst takes src's links and every neighbour that points at src;
+            free src; unpin dst
+    after the hold: dec_ref the object for the freed src slot
+```
+
+A capability with at most `MAX_REPARENT_EDITS` children completes inside the
+first hold. Between holds the tree is consistent and revocation-complete: the
+destination hangs under the still-live source, so it and the children already
+moved beneath it remain descendants of every ancestor of the source, and the
+children not yet moved remain under the source. An ancestor's revoke running
+concurrently sees ordinary nodes — it may hoist the destination up to its own
+root, and the next batch detaches the destination from wherever it hangs
+before re-linking it. Two slots name the object while the move is in flight
+and the destination holds its own reference, so a revoke that frees either
+slot drops exactly that slot's reference.
+
+Both slots carry the in-flight pin between batches. The pin refuses every
+operation that would tear the migration — a delete, move, copy, derive,
+split, merge, revoke, or IPC transfer of either slot returns `InvalidState`
+until the move completes — and, because derivation from a pinned slot is
+refused, the source's child list can grow only indirectly (deleting one of
+its children promotes that child's children to it), which is what the
+backstop covers. Tripping it leaves the destination where the last batch
+re-linked it, a live derived child of the source with both pins cleared —
+the shape `SYS_CAP_COPY` produces — and returns `Interrupted` from the
+syscall; an IPC transfer delivers the destination handle.
+
+A `CSpace` bound to the running thread cannot be torn down mid-syscall (the
+teardown first stops and deschedules every bound thread), so the syscall
+paths and the call and reply directions of IPC transfer need nothing more.
+The receive direction moves out of a parked sender's `CSpace`: the receiver
+holds a reference on that `CSpace`'s wrapper across the transfer so its
+teardown drain — which would orphan the in-flight destination into a
+derivation root — cannot run between batches. If that reference turns out to
+be the last, the `CSpace` is queued for the CPU's deferred reclaim and torn
+down from the syscall epilogue, not inside IPC delivery. A capability whose
+source and destination an ancestor's revoke both freed mid-transfer is
+delivered as handle 0 (the permanently null slot): the revoke won, exactly as
+if it had landed just after delivery.
 
 ### Safe Delegation: the "Derive Twice" Pattern
 
@@ -636,35 +706,32 @@ on init's user stack before it begins execution.
 IPC capability transfer (via `SYS_IPC_CALL` and `SYS_IPC_REPLY` capability slots)
 moves all of a message's capabilities or none of them; a refused transfer does
 not block message delivery (see
-[docs/ipc-design.md](../../../docs/ipc-design.md) § Message Format). The
-per-capability move is:
+[docs/ipc-design.md](../../../docs/ipc-design.md) § Message Format). Each
+capability is relocated by the batched move described under [Move](#move):
 
 ```
-transfer_cap(sender, sender_slot_idx, receiver, receiver_slot_idx):
-    acquire derivation tree write lock
-    src_slot = sender.cspace.slot(sender_slot_idx)
-    dst_slot = receiver.cspace.slot(receiver_slot_idx)
-    // dst_slot must be null (verified before IPC delivery begins)
-    dst_slot.{tag, rights, badge, object} = src_slot.{...}  // copy the cap
+transfer_caps(sender, handles, receiver):
+    validate every handle: distinct, occupied, generation current, not pinned
+    pre-allocate len(handles) slots in receiver's CSpace
+    one hold (derivation lock + both CSpace locks, pointer order):
+        revalidate; begin every move (insert dst, pin both, first batch)
+    drive each move that did not finish, one batch per hold
+    deliver the destination handles
     // The moved cap takes the source's position in the derivation tree: its
-    // parent, children, and siblings are repointed onto dst_slot, including
-    // across the CSpace boundary. That cross-boundary edge is what lets an
-    // ancestor's cap_revoke reach the moved cap; per-slot generation (#349)
-    // makes the receiver's handle fail closed if such a revoke frees this slot.
-    repoint_derivation_links(src_slot_id -> dst_slot_id)
-    src_slot.tag = CapTag::Null                    // clear the sender's slot
-    src_slot.object = None
-    // Note: ref_count does not change (same number of slots reference the object)
-    release derivation tree write lock
+    // parent, children, and siblings are repointed onto the destination,
+    // including across the CSpace boundary. That cross-boundary edge is what
+    // lets an ancestor's cap_revoke reach the moved cap; per-slot generation
+    // (#349) makes the receiver's handle fail closed if such a revoke frees
+    // this slot.
 ```
 
 IPC capability transfer is always cross-`CSpace` (sender and receiver are distinct
 processes). The transferred cap keeps its position in the derivation tree, so it
 remains reachable by a `cap_revoke` on one of its ancestors; per-slot generation
 handles make the receiver's handle fail closed if such a revoke frees the
-receiver's slot (#349). The derivation write lock is held for the duration of the
-transfer, so no revocation can run concurrently with a transfer, preventing torn
-state.
+receiver's slot (#349). A move that finishes in the first hold is atomic against
+revocation; one that needs further batches is protected by the in-flight pins
+and stays revocation-complete between holds (see [Move](#move)).
 
 Reply capabilities are not part of the derivation tree — they are single-use,
 cannot be derived, and are not tracked for revocation. A reply capability is not

@@ -620,11 +620,12 @@ pub fn holder_info() -> (u32, u64)
     // mapped — so none can fault, and no pointer read from the TCB is
     // followed. `magic` and `thread_id` are read with volatile loads because
     // a teardown on another CPU may poison the slot concurrently (its poison
-    // store is volatile too; the pair is a deliberate race on diagnostic
-    // words): a freed slot fails the magic check, a slot already recycled
-    // into a new thread passes it and yields some mix of that thread's
-    // values (no ordering edge ties the reads), and a torn read only changes
-    // which branch this diagnostic takes.
+    // stores are volatile too; the pair is a deliberate race): a freed slot
+    // fails the magic check; a slot already recycled into a new thread
+    // passes it, and the `thread_id` read then names that thread — nothing
+    // orders the two loads against the recycle, so they may even straddle
+    // it. Either way a torn or stale read only changes which branch this
+    // diagnostic takes.
     unsafe {
         if core::ptr::read_volatile(core::ptr::addr_of!((*tcb).magic)) != thread::TCB_MAGIC
         {
@@ -2354,7 +2355,6 @@ pub unsafe fn idle_stack_top_for(cpu_id: usize) -> u64
 /// this CPU. No concurrent mutable access may occur without holding the
 /// scheduler lock (Phase 9+).
 #[cfg(not(test))]
-#[allow(dead_code)] // Multi-CPU accessor; called once SMP bringup is implemented.
 pub unsafe fn scheduler_for(id: usize) -> &'static mut PerCpuScheduler
 {
     let cpu_count = CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;

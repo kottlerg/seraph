@@ -83,6 +83,7 @@ pub fn run_all(ctx: &TestContext)
     run_test!("cap::derive_attenuation", cap::derive_attenuation(ctx));
     run_test!("cap::revoke_invalidates", cap::revoke_invalidates(ctx));
     run_test!("cap::revoke_large_subtree", cap::revoke_large_subtree(ctx));
+    run_test!("cap::move_large_subtree", cap::move_large_subtree(ctx));
     run_test!(
         "cap::delete_intermediate_keeps_grandchildren_revocable",
         cap::delete_intermediate_keeps_grandchildren_revocable(ctx)

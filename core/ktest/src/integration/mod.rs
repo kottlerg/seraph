@@ -20,6 +20,7 @@
 //! Files:
 //! - `thread_lifecycle.rs`       — full thread lifecycle end-to-end
 //! - `cap_transfer.rs`           — capability rights through an IPC endpoint round-trip
+//! - `cap_transfer_large.rs`     — IPC transfer of a cap with a multi-batch child list
 //! - `wait_concurrency.rs`       — wait set with simultaneous notification and queue sources
 //! - `memory_lifecycle.rs`       — memory split → map → protect → unmap with state checks
 //! - `multi_caller_ipc_fifo.rs`  — endpoint send-queue FIFO ordering with three concurrent callers
@@ -51,6 +52,7 @@ pub mod cap_delegation_chain;
 pub mod cap_generation_stale_handle;
 pub mod cap_move_into_fresh_cspace_then_ipc;
 pub mod cap_transfer;
+pub mod cap_transfer_large;
 pub mod cross_cspace_revoke_no_alias;
 pub mod death_notification_late_bind;
 pub mod fault_exception_no_handler_kills;
@@ -94,6 +96,10 @@ pub fn run_all(ctx: &TestContext)
         aspace_fault_notification_late_bind::run(ctx)
     );
     run_integration_test!("integration::cap_transfer", cap_transfer::run(ctx));
+    run_integration_test!(
+        "integration::cap_transfer_large",
+        cap_transfer_large::run(ctx)
+    );
     run_integration_test!("integration::wait_concurrency", wait_concurrency::run(ctx));
     run_integration_test!("integration::memory_lifecycle", memory_lifecycle::run(ctx));
     run_integration_test!(

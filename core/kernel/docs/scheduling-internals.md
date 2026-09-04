@@ -108,19 +108,20 @@ lock, the per-`MemoryObject` retype-allocator lock, the `CSpace` and
 kernel page-table pool lock (`mm::kernel_pt_pool`) are CAS spin locks that
 do not mask interrupts themselves. A holder is never descheduled, because no
 context that takes one can be descheduled: syscall context, where
-interrupts are already masked; a preempt-disabled window (kernel-mode
-preemption exists only at a slice expiry with preemption enabled, and every
-kernel window that enables interrupts — shootdown ack-waits, the teardown
-gates, the contended `pt_lock` path, the `sys_thread_stop` drain — runs
-preempt-disabled and returns to the saved interrupt state through
-`restore_interrupts`, which writes that state whatever the current one (the
-contract is stated in [arch-interface.md](arch-interface.md)); a window
-that left interrupts enabled behind it would make the rest of the syscall
-preemptible, and a lock taken there could be descheduled mid-hold);
-and the idle thread's deferred reclaim (`drain_deferred_reclaim` from
+interrupts are already masked; a preempt-disabled window; and the idle
+thread's deferred reclaim (`drain_deferred_reclaim` from
 `idle_thread_entry`), which runs with interrupts and preemption enabled and
 is sound only because the idle thread's time slice is permanently zero, so
-`timer_tick` returns before `schedule()` for it. A holder MUST NOT park,
+`timer_tick` returns before `schedule()` for it. Kernel-mode preemption
+exists only at a slice expiry with preemption enabled, and every kernel
+window that enables interrupts — shootdown ack-waits, the teardown gates,
+the contended `pt_lock` path, the `sys_thread_stop` drain — runs
+preempt-disabled and returns to the saved interrupt state through
+`restore_interrupts`, which writes that state whatever the current one; the
+contract is stated in [arch-interface.md](arch-interface.md). A window that
+left interrupts enabled behind it would make the rest of the syscall
+preemptible, and a lock taken there could be descheduled mid-hold. A holder
+MUST NOT park,
 and MUST NOT wait for another CPU to reach the scheduler while holding one
 of them. `check_lock_hold_preemptible` enforces the rule at every
 acquisition of these locks: an acquisition with interrupts and preemption

@@ -579,9 +579,8 @@ pub fn cpu_stamp() -> u32
 #[cfg(not(test))]
 fn running_tcb_raw() -> *mut thread::ThreadControlBlock
 {
-    if SCHEDULERS_PTR
-        .load(core::sync::atomic::Ordering::Acquire)
-        .is_null()
+    let base = SCHEDULERS_PTR.load(core::sync::atomic::Ordering::Acquire);
+    if base.is_null()
     {
         return core::ptr::null_mut();
     }
@@ -590,9 +589,11 @@ fn running_tcb_raw() -> *mut thread::ThreadControlBlock
     {
         return core::ptr::null_mut();
     }
-    // SAFETY: the storage exists and `cpu < CPU_COUNT`, checked above —
-    // `scheduler_ptr`'s contract; a plain read of the slot's `current`.
-    unsafe { (*scheduler_ptr(cpu)).current }
+    // SAFETY: `scheduler_ptr`'s contract, both parts checked above: the
+    // storage exists (non-null base, published after `CPU_COUNT`) and
+    // `cpu < CPU_COUNT`, which the allocation covers; a plain read of the
+    // slot's `current`.
+    unsafe { (*base.add(cpu)).current }
 }
 
 /// `(thread id, syscall number)` of the running thread, for lock-holder
@@ -605,19 +606,25 @@ fn running_tcb_raw() -> *mut thread::ThreadControlBlock
 #[cfg(not(test))]
 pub fn holder_info() -> (u32, u64)
 {
-    // SAFETY: `running_tcb_raw()` names the calling thread unless the caller
-    // is preempted between the CPU-index read and the load — possible only
-    // in the preemptible state `check_lock_hold_preemptible` exists to
+    let tcb = running_tcb_raw();
+    if tcb.is_null()
+    {
+        return (0, u64::MAX);
+    }
+    // SAFETY: `tcb` names the calling thread unless the caller was preempted
+    // between `running_tcb_raw`'s CPU-index read and its load — possible
+    // only in the preemptible state `check_lock_hold_preemptible` exists to
     // report, where the pointer may then name another CPU's thread, even one
-    // freed and recycled since. Every read is a plain or atomic word of the
-    // TCB, which lives in a retype slab or the boot-allocated idle slab —
-    // direct-map memory that stays mapped — so none can fault, and no
-    // pointer read from the TCB is followed; a recycled slot fails the magic
-    // check (the TCB is poisoned on free). A stale value only mislabels a
-    // diagnostic line.
+    // freed since. Every read is a word of the TCB, which lives in a retype
+    // slab or the boot-allocated idle slab — direct-map memory that stays
+    // mapped — so none can fault, and no pointer read from the TCB is
+    // followed. `magic` is read with a volatile load because a teardown on
+    // another CPU may clear it concurrently: a freed slot (poisoned on free)
+    // fails the check, a slot already recycled into a new thread passes it
+    // and yields that thread's values, and a torn read only changes which
+    // branch this diagnostic takes.
     unsafe {
-        let tcb = running_tcb_raw();
-        if tcb.is_null() || (*tcb).magic != thread::TCB_MAGIC
+        if core::ptr::read_volatile(core::ptr::addr_of!((*tcb).magic)) != thread::TCB_MAGIC
         {
             return (0, u64::MAX);
         }
@@ -664,15 +671,17 @@ static PREEMPTIBLE_HOLD_REPORTED: core::sync::atomic::AtomicU32 =
 /// reference into the same scheduler.
 ///
 /// # Safety
-/// The scheduler storage must be initialised and the calling CPU's index
-/// must be below `CPU_COUNT`; a non-null [`running_tcb_raw`] establishes
-/// both, since it returns null unless it has checked them.
+/// The scheduler storage must be initialised — a non-null
+/// [`running_tcb_raw`] establishes it, since it returns null otherwise.
+/// The CPU index read here is then below `CPU_COUNT` on any CPU executing
+/// kernel code: every online CPU's id is below the published count, and a
+/// caller migrated since `running_tcb_raw` ran is still on an online CPU.
 #[cfg(not(test))]
 unsafe fn is_idle_tcb(tcb: *const thread::ThreadControlBlock) -> bool
 {
     let cpu = crate::arch::current::cpu::current_cpu() as usize;
-    // SAFETY: storage initialised and `cpu < CPU_COUNT` per the caller
-    // contract; `idle` is written once at init.
+    // SAFETY: storage initialised per the caller contract and `cpu` is an
+    // online CPU's index; `idle` is written once at init.
     let idle = unsafe { (*scheduler_ptr(cpu)).idle };
     core::ptr::eq(tcb, idle)
 }
@@ -1162,12 +1171,20 @@ fn watchdog_dump(reason: &str)
         // SAFETY: trap_frame is set by every userspace-syscall entry and
         // cleared on userspace return; reading the pointed-to TrapFrame
         // races benignly with concurrent writes (we're already in stall).
-        let (tf_present, tf_ip, tf_syscall_nr) = unsafe {
+        let (tf_present, tf_ip, syscall_nr) = unsafe {
             let s = scheduler_for(cpu);
             let cur = s.current;
-            if cur.is_null()
+            let tf = if cur.is_null()
             {
-                (false, 0u64, 0u64)
+                core::ptr::null_mut()
+            }
+            else
+            {
+                (*cur).trap_frame
+            };
+            if tf.is_null()
+            {
+                (false, 0u64, u64::MAX)
             }
             else
             {
@@ -1176,20 +1193,12 @@ fn watchdog_dump(reason: &str)
                 let nr = (*cur)
                     .syscall_nr
                     .load(core::sync::atomic::Ordering::Relaxed);
-                let tf = (*cur).trap_frame;
-                if tf.is_null()
-                {
-                    (false, 0u64, nr)
-                }
-                else
-                {
-                    (true, (*tf).instruction_pointer(), nr)
-                }
+                (true, (*tf).instruction_pointer(), nr)
             }
         };
         if tf_present
         {
-            crate::kprintln!("    user_pc=0x{:x} syscall_nr={}", tf_ip, tf_syscall_nr);
+            crate::kprintln!("    user_pc=0x{:x} syscall_nr={}", tf_ip, syscall_nr);
         }
     }
     // Derivation-lock state, holder CPU, and the most recent acquisition's

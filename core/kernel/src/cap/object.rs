@@ -736,6 +736,7 @@ impl AddressSpaceObject
     /// Returns the page's physical address, or `None` if the pool is empty.
     #[cfg(not(test))]
     #[allow(dead_code)]
+    #[track_caller]
     pub fn alloc_pt_page(&self) -> Option<u64>
     {
         pool_lock(&self.pt_pool_lock);
@@ -763,6 +764,7 @@ impl AddressSpaceObject
     /// `phys` must come from a prior [`alloc_pt_page`] call on this AS, and
     /// the page must no longer be in use as a page table.
     #[cfg(not(test))]
+    #[track_caller]
     pub unsafe fn free_pt_page(&self, phys: u64)
     {
         pool_lock(&self.pt_pool_lock);
@@ -785,6 +787,7 @@ impl AddressSpaceObject
     /// any future non-pooled user mapping) against corrupting the pool's
     /// free-list and budget accounting.
     #[cfg(not(test))]
+    #[track_caller]
     pub fn owns_phys(&self, phys: u64) -> bool
     {
         let p = crate::mm::PAGE_SIZE as u64;
@@ -834,6 +837,7 @@ impl AddressSpaceObject
     /// pages occupy `[base_offset, base_offset + (total_pages - pool_pages) * PAGE_SIZE)`.
     #[cfg(not(test))]
     #[allow(dead_code)]
+    #[track_caller]
     pub unsafe fn add_chunk(
         &self,
         ancestor: NonNull<KernelObjectHeader>,
@@ -893,6 +897,7 @@ impl CSpaceKernelObject
     /// budget. Returns the page's physical address, or `None` if empty.
     #[cfg(not(test))]
     #[allow(dead_code)]
+    #[track_caller]
     pub fn alloc_slot_page(&self) -> Option<u64>
     {
         pool_lock(&self.cs_pool_lock);
@@ -917,6 +922,7 @@ impl CSpaceKernelObject
     /// See [`AddressSpaceObject::add_chunk`].
     #[cfg(not(test))]
     #[allow(dead_code)]
+    #[track_caller]
     pub unsafe fn add_chunk(
         &self,
         ancestor: NonNull<KernelObjectHeader>,

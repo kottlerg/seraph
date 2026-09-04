@@ -180,7 +180,6 @@ pub(crate) fn free_pt_page(pa: u64)
 
 /// Remaining pages in the pool. Diagnostic only.
 #[cfg(not(test))]
-#[allow(dead_code)]
 pub(crate) fn remaining_pages() -> usize
 {
     REMAINING.load(Ordering::Acquire)

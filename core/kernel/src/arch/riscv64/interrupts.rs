@@ -1074,12 +1074,15 @@ pub fn disable() -> bool
 {
     let prev: u64;
     // SAFETY: csrrci sstatus is a privileged S-mode instruction that atomically
-    // reads sstatus and clears bit 1 (SIE); kernel always runs in S-mode.
+    // reads sstatus into the output register and clears bit 1 (SIE); it
+    // touches no memory and clobbers no other register; kernel always runs in
+    // S-mode. `nomem` is omitted so no memory operation is reordered across
+    // the disable (see `cpu::disable_interrupts`).
     unsafe {
         core::arch::asm!(
             "csrrci {0}, sstatus, 0x2",
             out(reg) prev,
-            options(nostack, nomem),
+            options(nostack, preserves_flags),
         );
     }
     prev & (1 << 1) != 0 // SIE is bit 1 of sstatus

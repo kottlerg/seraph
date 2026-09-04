@@ -147,7 +147,7 @@ impl DerivationLock
     pub fn write_lock(&self)
     {
         let site = core::panic::Location::caller();
-        crate::sched::check_lock_hold_preemptible(crate::sched::LOCK_WAIT_DERIVATION, site);
+        crate::sched::check_lock_hold_preemptible(crate::sched::LockKind::Derivation, site);
         // The uncontended probe is a strong CAS: a spurious weak failure
         // would divert an uncontended acquisition into the breadcrumb path.
         if self
@@ -156,7 +156,7 @@ impl DerivationLock
             .is_err()
         {
             crate::sched::lock_wait_enter(
-                crate::sched::LOCK_WAIT_DERIVATION,
+                crate::sched::LockKind::Derivation,
                 core::ptr::from_ref(&self.state).expose_provenance(),
             );
             loop
@@ -723,8 +723,7 @@ mod tests
         assert_eq!(lock.state.load(Ordering::Relaxed), 0);
     }
 
-    // The host stubs stamp cpu 1 (`cpu_stamp() == 1`) and no thread
-    // (`holder_info() == (0, u64::MAX)`); the site is this test.
+    // The host stub stamps cpu 1 (`cpu_stamp() == 1`); the site is this test.
     #[test]
     fn write_lock_stamps_holder_and_unlock_clears_it()
     {
@@ -736,7 +735,6 @@ mod tests
         lock.write_lock();
         let held = lock.debug_snapshot();
         assert_eq!((held.state, held.holder), (WRITE_LOCKED, 1));
-        assert_eq!((held.tid, held.syscall_nr), (0, u64::MAX));
         assert_eq!(held.site.map(|loc| loc.file()), Some(file!()));
 
         lock.write_unlock();

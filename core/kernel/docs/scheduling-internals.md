@@ -104,21 +104,26 @@ hang). See § Thread Registry.
 **Bare spin locks (MUST).** The derivation tree lock
 (`cap::derivation::DERIVATION_LOCK`), the per-`MemoryObject` reader-writer
 lock, and the per-`MemoryObject` retype-allocator lock are CAS spin locks
-that do not mask interrupts themselves. They are taken only from syscall
-context, where interrupts are already masked, or inside a preempt-disabled
-window, so a holder is never descheduled: kernel-mode preemption exists only
-at a slice expiry with preemption enabled, and every kernel window that
-enables interrupts (shootdown ack-waits, the teardown gates, the contended
-`pt_lock` path, the `sys_thread_stop` drain) runs preempt-disabled and
-returns to the saved interrupt state through `restore_interrupts`, which
-writes that state whatever the current one (a window that left interrupts
-enabled behind it would make the rest of the syscall preemptible, and a
-lock taken there could be descheduled mid-hold). A holder MUST NOT park,
+that do not mask interrupts themselves. A holder is never descheduled,
+because every context that takes one is non-preemptible: syscall context,
+where interrupts are already masked; a preempt-disabled window (kernel-mode
+preemption exists only at a slice expiry with preemption enabled, and every
+kernel window that enables interrupts — shootdown ack-waits, the teardown
+gates, the contended `pt_lock` path, the `sys_thread_stop` drain — runs
+preempt-disabled and returns to the saved interrupt state through
+`restore_interrupts`, which writes that state whatever the current one; a
+window that left interrupts enabled behind it would make the rest of the
+syscall preemptible, and a lock taken there could be descheduled mid-hold);
+and the idle thread's deferred reclaim (`drain_deferred_reclaim` from
+`idle_thread_entry`), which runs with interrupts and preemption enabled and
+is sound only because the idle thread's time slice is permanently zero, so
+`timer_tick` returns before `schedule()` for it. A holder MUST NOT park,
 and MUST NOT wait for another CPU to reach the scheduler while holding one
 of them. `check_lock_hold_preemptible` enforces the rule at every
-acquisition of these locks: a syscall acquiring one with interrupts and
-preemption both enabled is reported once per lock kind, and a debug build
-halts. Their order, outermost first: `DERIVATION_LOCK` → the
+acquisition of these locks: an acquisition with interrupts and preemption
+both enabled by any thread other than the idle thread is reported once per
+lock kind, a debug build halts, and the idle exemption asserts the zero
+slice it rests on. Their order, outermost first: `DERIVATION_LOCK` → the
 `MemoryObject` write lock(s) of a split or merge (two in pointer order) → the
 SEED `MemoryObject` read lock taken by a retype allocation or free → that
 object's retype-allocator lock. The `CSpace` spinlock is taken after the
@@ -816,12 +821,16 @@ word once its first acquisition attempt fails
 (`lock_wait_enter`/`lock_wait_exit`; the uncontended path stores nothing),
 and the dump prints them with the state word's current value —
 `0xffffffff` for a held `MemoryObject` write lock, a reader count otherwise,
-`0x1` for a held allocator lock. These locks spin with interrupts masked, or on the idle
-thread inside a deferred reclaim, so without the breadcrumb a CPU wedged on
-one is indistinguishable from a silent or idle one. The
-dump also prints the derivation lock's state word and the CPU stamped as its
-write holder (`DerivationLock::debug_snapshot`), so a held lock with no
-spinning holder is visible as a leaked or wedged hold.
+`0x1` for a held allocator lock. The dump reads another CPU's breadcrumb
+racily: it takes the kind before and after the word and prints only when
+both agree and the word is a non-zero address aligned for that kind, so a
+wait exited between the loads is skipped rather than read through a cleared
+word. These locks spin with interrupts masked, or on the idle thread inside
+a deferred reclaim, so without the breadcrumb a CPU wedged on one is
+indistinguishable from a silent or idle one. The dump also prints the
+derivation lock's state word and the CPU stamped as its write holder
+(`DerivationLock::debug_snapshot`), so a held lock with no spinning holder
+is visible as a leaked or wedged hold.
 
 The dump then walks the live-thread registry (§ Thread Registry) and prints
 every non-running registered thread. For a `Blocked` thread it shows the

@@ -118,7 +118,7 @@ impl RetypeAllocator
     fn lock(&self)
     {
         crate::sched::check_lock_hold_preemptible(
-            crate::sched::LOCK_WAIT_RETYPE_ALLOC,
+            crate::sched::LockKind::RetypeAlloc,
             core::panic::Location::caller(),
         );
         if self
@@ -127,7 +127,7 @@ impl RetypeAllocator
             .is_err()
         {
             crate::sched::lock_wait_enter(
-                crate::sched::LOCK_WAIT_RETYPE_ALLOC,
+                crate::sched::LockKind::RetypeAlloc,
                 core::ptr::from_ref(&self.lock).expose_provenance(),
             );
             while self

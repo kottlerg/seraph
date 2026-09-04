@@ -433,16 +433,66 @@ pub fn spin_site_enter(_site: u32) {}
 #[cfg(test)]
 pub fn spin_site_exit() {}
 
-/// No lock wait recorded for a CPU.
-pub const LOCK_WAIT_NONE: u32 = 0;
-/// Waiting for `cap::derivation::DERIVATION_LOCK` (write side).
-pub const LOCK_WAIT_DERIVATION: u32 = 1;
-/// Waiting for a `MemoryObject` read lock.
-pub const LOCK_WAIT_MEMORY_READ: u32 = 2;
-/// Waiting for a `MemoryObject` write lock.
-pub const LOCK_WAIT_MEMORY_WRITE: u32 = 3;
-/// Waiting for a `MemoryObject`'s retype-allocator lock (a 64-bit word).
-pub const LOCK_WAIT_RETYPE_ALLOC: u32 = 4;
+/// The bare spin locks the softlockup watchdog can name. The lock-wait
+/// breadcrumb and the preemptible-hold tripwire are keyed by this kind; the
+/// discriminant is the breadcrumb encoding (0 means no wait).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u32)]
+pub enum LockKind
+{
+    /// `cap::derivation::DERIVATION_LOCK` (write side).
+    Derivation = 1,
+    /// A `MemoryObject` read lock.
+    MemoryRead = 2,
+    /// A `MemoryObject` write lock.
+    MemoryWrite = 3,
+    /// A `MemoryObject`'s retype-allocator lock (a 64-bit word).
+    RetypeAlloc = 4,
+}
+
+impl LockKind
+{
+    /// Human-readable name for the watchdog dump.
+    pub fn name(self) -> &'static str
+    {
+        match self
+        {
+            Self::Derivation => "derivation",
+            Self::MemoryRead => "memory-object read",
+            Self::MemoryWrite => "memory-object write",
+            Self::RetypeAlloc => "retype-allocator",
+        }
+    }
+
+    /// Width in bytes of the lock's state word.
+    #[cfg(not(test))]
+    fn word_width(self) -> usize
+    {
+        match self
+        {
+            Self::RetypeAlloc => 8,
+            Self::Derivation | Self::MemoryRead | Self::MemoryWrite => 4,
+        }
+    }
+
+    /// Decode a breadcrumb encoding; `None` for 0 (no wait) or garbage.
+    #[cfg(not(test))]
+    fn from_code(code: u32) -> Option<Self>
+    {
+        match code
+        {
+            1 => Some(Self::Derivation),
+            2 => Some(Self::MemoryRead),
+            3 => Some(Self::MemoryWrite),
+            4 => Some(Self::RetypeAlloc),
+            _ => None,
+        }
+    }
+}
+
+/// Breadcrumb encoding for "no lock wait recorded".
+#[cfg(not(test))]
+const LOCK_WAIT_NONE: u32 = 0;
 
 /// Per-CPU breadcrumb naming the bare spin lock a CPU is currently waiting
 /// for, for the softlockup watchdog: the lock kind and the address of its
@@ -464,41 +514,30 @@ static LOCK_WAIT_WORD: [core::sync::atomic::AtomicU64; MAX_CPUS] =
 /// Record that the current CPU is spinning for the lock of kind `kind` whose
 /// state word lives at address `word`. Callers spin with interrupts masked,
 /// preemption disabled, or on the idle thread, so the CPU index is stable
-/// across the wait.
+/// across the wait. The word is published before the kind (Release), so a
+/// reader that sees the kind sees the word it was recorded with.
 #[cfg(not(test))]
-pub fn lock_wait_enter(kind: u32, word: usize)
+pub fn lock_wait_enter(kind: LockKind, word: usize)
 {
     let cpu = crate::arch::current::cpu::current_cpu() as usize;
     if cpu < MAX_CPUS
     {
         LOCK_WAIT_WORD[cpu].store(word as u64, core::sync::atomic::Ordering::Relaxed);
-        LOCK_WAIT_KIND[cpu].store(kind, core::sync::atomic::Ordering::Relaxed);
+        LOCK_WAIT_KIND[cpu].store(kind as u32, core::sync::atomic::Ordering::Release);
     }
 }
 
-/// Clear the current CPU's lock-wait breadcrumb once the lock is acquired.
+/// Clear the current CPU's lock-wait breadcrumb once the lock is acquired:
+/// the kind first, so a reader that re-checks the kind after loading the
+/// word discards the pair, then the word.
 #[cfg(not(test))]
 pub fn lock_wait_exit()
 {
     let cpu = crate::arch::current::cpu::current_cpu() as usize;
     if cpu < MAX_CPUS
     {
-        LOCK_WAIT_KIND[cpu].store(LOCK_WAIT_NONE, core::sync::atomic::Ordering::Relaxed);
+        LOCK_WAIT_KIND[cpu].store(LOCK_WAIT_NONE, core::sync::atomic::Ordering::Release);
         LOCK_WAIT_WORD[cpu].store(0, core::sync::atomic::Ordering::Relaxed);
-    }
-}
-
-/// Human-readable name for a lock-wait kind, for the watchdog dump.
-#[cfg(not(test))]
-fn lock_wait_name(kind: u32) -> &'static str
-{
-    match kind
-    {
-        LOCK_WAIT_DERIVATION => "derivation",
-        LOCK_WAIT_MEMORY_READ => "memory-object read",
-        LOCK_WAIT_MEMORY_WRITE => "memory-object write",
-        LOCK_WAIT_RETYPE_ALLOC => "retype-allocator",
-        _ => "none",
     }
 }
 
@@ -513,14 +552,20 @@ pub fn cpu_stamp() -> u32
 /// stamps: `(0, u64::MAX)` before this CPU has dispatched a thread (boot),
 /// and `u64::MAX` for a thread outside a syscall — the idle thread (whose
 /// id is an ordinary registry id) or a kernel path entered without a trap
-/// frame.
+/// frame. Diagnostic only: in the preemptible state
+/// `check_lock_hold_preemptible` reports, the values may describe another
+/// thread (see the safety argument inside).
 #[cfg(not(test))]
 pub fn holder_info() -> (u32, u64)
 {
-    // SAFETY: `current_tcb()` is the calling thread's own TCB on whichever
-    // CPU it runs, so it outlives this call; `trap_frame` and the frame it
-    // names are written only by that thread's own trap entry and return, so
-    // both reads are stable even when the caller is preemptible.
+    // SAFETY: `current_tcb()` reads this CPU's `current`, which names the
+    // calling thread unless the caller is preempted between the CPU-index
+    // read and the load — possible only in the preemptible state
+    // `check_lock_hold_preemptible` exists to report, where the pointer may
+    // then name another CPU's thread, even one being freed. Every TCB lives
+    // in retype-slab or static storage and every trap frame on a kernel
+    // stack, all of which stay mapped for the kernel's lifetime, so the
+    // loads cannot fault; a stale value only mislabels a diagnostic line.
     unsafe {
         let tcb = crate::syscall::current_tcb();
         if tcb.is_null()
@@ -543,7 +588,7 @@ pub fn holder_info() -> (u32, u64)
 /// Test stubs: lock-wait breadcrumbs and holder stamps are diagnostic-only
 /// and compiled out under host `cfg(test)`.
 #[cfg(test)]
-pub fn lock_wait_enter(_kind: u32, _word: usize) {}
+pub fn lock_wait_enter(_kind: LockKind, _word: usize) {}
 /// Test stub; see [`lock_wait_enter`].
 #[cfg(test)]
 pub fn lock_wait_exit() {}
@@ -561,63 +606,72 @@ pub fn holder_info() -> (u32, u64)
 }
 
 /// Per-kind one-shot latch for [`check_lock_hold_preemptible`]: bit
-/// `1 << kind` for each `LOCK_WAIT_*` kind.
+/// `1 << (kind as u32)` for each [`LockKind`].
 #[cfg(not(test))]
 static PREEMPTIBLE_HOLD_REPORTED: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(0);
 
-/// Whether `tcb` is one of the per-CPU idle TCBs.
+/// Whether `tcb` is this CPU's idle TCB. The idle thread never migrates, so
+/// the calling thread is idle exactly when it is its own CPU's idle TCB; a
+/// user thread that migrates between the CPU-index read and the load still
+/// compares unequal to whichever idle TCB is read.
+///
+/// The caller MUST have established that the scheduler slab is initialised
+/// (a non-null `current_tcb()` does: `current` is written only by dispatch).
 #[cfg(not(test))]
 fn is_idle_tcb(tcb: *const thread::ThreadControlBlock) -> bool
 {
-    let cpu_count = CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
-    // SAFETY: cpu < cpu_count; the idle slab is initialised by init().
-    (0..cpu_count).any(|cpu| core::ptr::eq(unsafe { idle_tcb_ptr(cpu) }.cast(), tcb))
+    let cpu = crate::arch::current::cpu::current_cpu() as usize;
+    // SAFETY: the scheduler slab is initialised per the caller contract and
+    // `cpu` is an online CPU index.
+    let idle = unsafe { scheduler_for(cpu) }.idle;
+    core::ptr::eq(tcb, idle)
 }
 
 /// Invariant tripwire for the bare spin locks (docs/scheduling-internals.md
 /// § Lock Hierarchy, "Bare spin locks"): a hold taken from a syscall with
 /// interrupts enabled and preemption enabled can be descheduled by the tick
 /// while held, and every later waiter then spins forever with interrupts
-/// masked. Called before each acquisition of a lock of `LOCK_WAIT_*` kind
-/// `kind`; reports the first violation per kind once per boot, naming the
-/// thread, syscall, and call site, and a debug build then halts. Exempt:
-/// boot, before this CPU has dispatched a thread, and the idle thread — it
-/// runs its deferred reclaim with interrupts enabled and preemption enabled,
-/// which is sound only because its time slice is permanently zero, so
-/// `timer_tick` never reaches `schedule()` for it (asserted here).
+/// masked. Called before each acquisition of a lock of kind `kind`; reports
+/// the first violation per kind once per boot, naming the thread, syscall,
+/// and call site, and a debug build then halts. Exempt: boot, before this
+/// CPU has dispatched a thread, and the idle thread — it runs its deferred
+/// reclaim with interrupts enabled and preemption enabled, which is sound
+/// only because its time slice is permanently zero, so `timer_tick` never
+/// reaches `schedule()` for it (asserted here).
 #[cfg(not(test))]
-pub fn check_lock_hold_preemptible(kind: u32, site: &core::panic::Location<'_>)
+pub fn check_lock_hold_preemptible(kind: LockKind, site: &core::panic::Location<'_>)
 {
     if !crate::arch::current::interrupts::are_enabled() || crate::percpu::preemption_disabled()
     {
         return;
     }
-    // SAFETY: `current_tcb()` is the calling thread's own TCB (see
-    // `holder_info`); the idle TCB's `slice_remaining` is written only by
-    // `timer_tick` on its own CPU and stays zero, so the read is stable.
-    unsafe {
-        let tcb = crate::syscall::current_tcb();
-        if tcb.is_null()
-        {
-            return;
-        }
-        if is_idle_tcb(tcb)
-        {
-            debug_assert!(
-                (*tcb).slice_remaining == 0,
-                "idle thread holds a bare spin lock with a live time slice"
-            );
-            return;
-        }
+    // SAFETY: reads this CPU's `current`; see `holder_info` for why the
+    // pointer names the calling thread except in the state reported here,
+    // and why the load cannot fault.
+    let tcb = unsafe { crate::syscall::current_tcb() };
+    if tcb.is_null()
+    {
+        return;
+    }
+    if is_idle_tcb(tcb)
+    {
+        // SAFETY: tcb is this CPU's idle TCB, static storage; its
+        // `slice_remaining` is written only by `timer_tick` on this CPU.
+        let slice = unsafe { (*tcb).slice_remaining };
+        debug_assert!(
+            slice == 0,
+            "idle thread holds a bare spin lock with a live time slice"
+        );
+        return;
     }
     let (tid, nr) = holder_info();
-    let bit = 1u32 << kind;
+    let bit = 1u32 << (kind as u32);
     if PREEMPTIBLE_HOLD_REPORTED.fetch_or(bit, core::sync::atomic::Ordering::AcqRel) & bit == 0
     {
         crate::kprintln!(
             "kernel: {} lock taken preemptible: tid={} syscall={} site={}:{} cpu={}",
-            lock_wait_name(kind),
+            kind.name(),
             tid,
             nr,
             site.file(),
@@ -633,7 +687,7 @@ pub fn check_lock_hold_preemptible(kind: u32, site: &core::panic::Location<'_>)
 
 /// Test stub; see [`check_lock_hold_preemptible`].
 #[cfg(test)]
-pub fn check_lock_hold_preemptible(_kind: u32, _site: &core::panic::Location<'_>) {}
+pub fn check_lock_hold_preemptible(_kind: LockKind, _site: &core::panic::Location<'_>) {}
 
 /// Mark `cpu` as having dispatched a non-idle thread at the current tick.
 pub fn watchdog_mark_non_idle(cpu: usize)
@@ -1012,21 +1066,30 @@ fn watchdog_dump(reason: &str)
         // retype-allocator wait spins with interrupts masked or on the idle
         // thread, so it is otherwise indistinguishable from a silent or idle
         // CPU.
-        let lock_kind = LOCK_WAIT_KIND[cpu].load(core::sync::atomic::Ordering::Relaxed);
-        if lock_kind != LOCK_WAIT_NONE
+        // The breadcrumb belongs to another CPU, which may leave and
+        // re-enter a wait meanwhile: the kind is read before and after the
+        // word (Acquire, paired with the writer's Release), and the pair is
+        // used only if both reads agree and the word is a non-zero address
+        // aligned for that kind's width. A wait exited and re-entered for
+        // the same kind can still pair the kind with the earlier word: a
+        // stale but valid address of the same width.
+        let kind_before = LOCK_WAIT_KIND[cpu].load(core::sync::atomic::Ordering::Acquire);
+        let word = LOCK_WAIT_WORD[cpu].load(core::sync::atomic::Ordering::Relaxed) as usize;
+        let kind_after = LOCK_WAIT_KIND[cpu].load(core::sync::atomic::Ordering::Acquire);
+        if let Some(lock_kind) = LockKind::from_code(kind_before)
+            && kind_after == kind_before
+            && word != 0
+            && word.is_multiple_of(lock_kind.word_width())
         {
-            let word = LOCK_WAIT_WORD[cpu].load(core::sync::atomic::Ordering::Relaxed) as usize;
-            // The breadcrumb belongs to another CPU, read racily: it may
-            // leave and re-enter a wait between the two loads, and the word
-            // may name a retype slab recycled since. The value is diagnostic
-            // only. The retype-allocator lock is a 64-bit word; the others
-            // are 32-bit.
-            // SAFETY: `word` is a kernel direct-map address of a static or a
-            // retype slab, which stay mapped for the kernel's lifetime; the
-            // read is volatile, aligned for its width, and non-faulting, and
-            // nothing is written.
+            // SAFETY: `word` was recorded by a spinner as the address of a
+            // lock state word, which lives in a static or a retype slab —
+            // kernel direct-map storage that stays mapped for the kernel's
+            // lifetime, even after the slab is recycled — and the checks
+            // above give a non-null address aligned for the width read. The
+            // read is volatile and nothing is written; the value is
+            // diagnostic only.
             let value = unsafe {
-                if lock_kind == LOCK_WAIT_RETYPE_ALLOC
+                if lock_kind == LockKind::RetypeAlloc
                 {
                     core::ptr::read_volatile(core::ptr::with_exposed_provenance::<u64>(word))
                 }
@@ -1039,7 +1102,7 @@ fn watchdog_dump(reason: &str)
             };
             crate::kprintln!(
                 "    waiting on {} lock @0x{:x} word=0x{:x}",
-                lock_wait_name(lock_kind),
+                lock_kind.name(),
                 word,
                 value
             );

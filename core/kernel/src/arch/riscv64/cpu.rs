@@ -377,7 +377,7 @@ pub unsafe fn save_and_disable_interrupts() -> u64
         core::arch::asm!(
             "csrrci {sstatus}, sstatus, 2",
             sstatus = out(reg) sstatus,
-            options(nostack),
+            options(nostack, preserves_flags),
         );
     }
     sstatus

@@ -307,7 +307,7 @@ impl MemoryObject
     pub fn read_lock(&self)
     {
         crate::sched::check_lock_hold_preemptible(
-            crate::sched::LOCK_WAIT_MEMORY_READ,
+            crate::sched::LockKind::MemoryRead,
             core::panic::Location::caller(),
         );
         let mut waiting = false;
@@ -326,7 +326,7 @@ impl MemoryObject
             {
                 waiting = true;
                 crate::sched::lock_wait_enter(
-                    crate::sched::LOCK_WAIT_MEMORY_READ,
+                    crate::sched::LockKind::MemoryRead,
                     core::ptr::from_ref(&self.lock).expose_provenance(),
                 );
             }
@@ -351,7 +351,7 @@ impl MemoryObject
     pub fn write_lock(&self)
     {
         crate::sched::check_lock_hold_preemptible(
-            crate::sched::LOCK_WAIT_MEMORY_WRITE,
+            crate::sched::LockKind::MemoryWrite,
             core::panic::Location::caller(),
         );
         let mut waiting = false;
@@ -368,7 +368,7 @@ impl MemoryObject
             {
                 waiting = true;
                 crate::sched::lock_wait_enter(
-                    crate::sched::LOCK_WAIT_MEMORY_WRITE,
+                    crate::sched::LockKind::MemoryWrite,
                     core::ptr::from_ref(&self.lock).expose_provenance(),
                 );
             }

@@ -292,10 +292,8 @@ pub struct MemoryObject
 
 /// Sentinel encoding a held write lock in [`MemoryObject::lock`]. Matches
 /// `DerivationLock`'s convention.
-#[allow(dead_code)]
 const FRAME_WRITE_LOCKED: u32 = u32::MAX;
 
-#[allow(dead_code)]
 impl MemoryObject
 {
     /// Acquire a shared read lock. Spins while a writer holds the lock.
@@ -688,7 +686,6 @@ fn pool_unlock(lock: &AtomicU64)
 /// `head_phys` must point at the actual `AtomicU64` head field of a live
 /// pool. The free-list link slots in the pages must not be aliased.
 #[cfg(not(test))]
-#[allow(dead_code)]
 unsafe fn pool_pop(head_phys: &AtomicU64) -> u64
 {
     let head = head_phys.load(Ordering::Acquire);
@@ -711,7 +708,6 @@ unsafe fn pool_pop(head_phys: &AtomicU64) -> u64
 /// `phys` must be page-aligned, within a chunk owned by this pool, and not
 /// concurrently aliased.
 #[cfg(not(test))]
-#[allow(dead_code)]
 unsafe fn pool_push(head_phys: &AtomicU64, phys: u64)
 {
     let prev = head_phys.load(Ordering::Acquire);
@@ -735,7 +731,6 @@ impl AddressSpaceObject
     /// Pop a free PT page from this AS's pool, charging the growth budget.
     /// Returns the page's physical address, or `None` if the pool is empty.
     #[cfg(not(test))]
-    #[allow(dead_code)]
     #[track_caller]
     pub fn alloc_pt_page(&self) -> Option<u64>
     {
@@ -836,7 +831,6 @@ impl AddressSpaceObject
     /// Pool pages are taken from the *high* end of the chunk; reserved
     /// pages occupy `[base_offset, base_offset + (total_pages - pool_pages) * PAGE_SIZE)`.
     #[cfg(not(test))]
-    #[allow(dead_code)]
     #[track_caller]
     pub unsafe fn add_chunk(
         &self,
@@ -896,7 +890,6 @@ impl CSpaceKernelObject
     /// Pop a free slot page from this `CSpace`'s pool, charging the growth
     /// budget. Returns the page's physical address, or `None` if empty.
     #[cfg(not(test))]
-    #[allow(dead_code)]
     #[track_caller]
     pub fn alloc_slot_page(&self) -> Option<u64>
     {
@@ -921,7 +914,6 @@ impl CSpaceKernelObject
     /// # Safety
     /// See [`AddressSpaceObject::add_chunk`].
     #[cfg(not(test))]
-    #[allow(dead_code)]
     #[track_caller]
     pub unsafe fn add_chunk(
         &self,
@@ -2139,10 +2131,14 @@ unsafe fn dealloc_object_one(
                 unsafe { crate::sched::thread_registry::unregister(tcb) };
 
                 // Poison the TCB so any use-after-free reads garbage
-                // instead of plausible values.
+                // instead of plausible values. `magic` is written with a
+                // volatile store: the lock-holder diagnostic may read it
+                // from another CPU through a stale `current` pointer
+                // (`sched::holder_info`), and the pair stays a deliberate,
+                // documented race on a diagnostic-only word.
                 // SAFETY: tcb is valid; we are about to free it.
                 unsafe {
-                    (*tcb).magic = 0;
+                    core::ptr::write_volatile(core::ptr::addr_of_mut!((*tcb).magic), 0);
                     (*tcb).priority = 0xFF;
                 }
 

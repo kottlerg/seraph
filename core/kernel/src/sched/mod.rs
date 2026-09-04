@@ -618,18 +618,20 @@ pub fn holder_info() -> (u32, u64)
     // freed since. Every read is a word of the TCB, which lives in a retype
     // slab or the boot-allocated idle slab — direct-map memory that stays
     // mapped — so none can fault, and no pointer read from the TCB is
-    // followed. `magic` is read with a volatile load because a teardown on
-    // another CPU may clear it concurrently: a freed slot (poisoned on free)
-    // fails the check, a slot already recycled into a new thread passes it
-    // and yields that thread's values, and a torn read only changes which
-    // branch this diagnostic takes.
+    // followed. `magic` and `thread_id` are read with volatile loads because
+    // a teardown on another CPU may poison the slot concurrently (its poison
+    // store is volatile too; the pair is a deliberate race on diagnostic
+    // words): a freed slot fails the magic check, a slot already recycled
+    // into a new thread passes it and yields some mix of that thread's
+    // values (no ordering edge ties the reads), and a torn read only changes
+    // which branch this diagnostic takes.
     unsafe {
         if core::ptr::read_volatile(core::ptr::addr_of!((*tcb).magic)) != thread::TCB_MAGIC
         {
             return (0, u64::MAX);
         }
         (
-            (*tcb).thread_id,
+            core::ptr::read_volatile(core::ptr::addr_of!((*tcb).thread_id)),
             (*tcb)
                 .syscall_nr
                 .load(core::sync::atomic::Ordering::Relaxed),
@@ -709,8 +711,8 @@ pub fn check_lock_hold_preemptible(kind: LockKind, site: &core::panic::Location<
     {
         return;
     }
-    // SAFETY: `tcb` is non-null, so `running_tcb_raw` checked the storage
-    // and the CPU bound.
+    // SAFETY: `tcb` is non-null, so `running_tcb_raw` found the scheduler
+    // storage initialised.
     if unsafe { is_idle_tcb(tcb) }
     {
         // SAFETY: tcb is this CPU's idle TCB in the boot-allocated idle slab,
@@ -1171,7 +1173,7 @@ fn watchdog_dump(reason: &str)
         // SAFETY: trap_frame is set by every userspace-syscall entry and
         // cleared on userspace return; reading the pointed-to TrapFrame
         // races benignly with concurrent writes (we're already in stall).
-        let (tf_present, tf_ip, syscall_nr) = unsafe {
+        let user_frame = unsafe {
             let s = scheduler_for(cpu);
             let cur = s.current;
             let tf = if cur.is_null()
@@ -1184,7 +1186,7 @@ fn watchdog_dump(reason: &str)
             };
             if tf.is_null()
             {
-                (false, 0u64, u64::MAX)
+                None
             }
             else
             {
@@ -1193,12 +1195,12 @@ fn watchdog_dump(reason: &str)
                 let nr = (*cur)
                     .syscall_nr
                     .load(core::sync::atomic::Ordering::Relaxed);
-                (true, (*tf).instruction_pointer(), nr)
+                Some(((*tf).instruction_pointer(), nr))
             }
         };
-        if tf_present
+        if let Some((user_pc, syscall_nr)) = user_frame
         {
-            crate::kprintln!("    user_pc=0x{:x} syscall_nr={}", tf_ip, syscall_nr);
+            crate::kprintln!("    user_pc=0x{:x} syscall_nr={}", user_pc, syscall_nr);
         }
     }
     // Derivation-lock state, holder CPU, and the most recent acquisition's

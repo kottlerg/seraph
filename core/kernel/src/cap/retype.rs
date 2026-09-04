@@ -497,6 +497,7 @@ unsafe fn push_page_block(alloc: &RetypeAllocator, memory: &MemoryObject, offset
 /// is valid only while `memory` is live; use `memory.base + offset` and
 /// `phys_to_virt` to access the memory.
 #[cfg(not(test))]
+#[track_caller]
 pub fn retype_allocate(memory: &MemoryObject, bytes: u64) -> Result<u64, SyscallError>
 {
     let need = round_to_class(bytes);
@@ -631,6 +632,7 @@ pub fn current_bump(memory: &MemoryObject) -> u64
 /// at `offset` must not contain a live kernel object — caller has dropped
 /// any state, drained wait queues, etc., before calling.
 #[cfg(not(test))]
+#[track_caller]
 pub fn retype_free(memory: &MemoryObject, offset: u64, bytes: u64)
 {
     let need = round_to_class(bytes);

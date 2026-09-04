@@ -113,9 +113,10 @@ preemption exists only at a slice expiry with preemption enabled, and every
 kernel window that enables interrupts — shootdown ack-waits, the teardown
 gates, the contended `pt_lock` path, the `sys_thread_stop` drain — runs
 preempt-disabled and returns to the saved interrupt state through
-`restore_interrupts`, which writes that state whatever the current one; a
-window that left interrupts enabled behind it would make the rest of the
-syscall preemptible, and a lock taken there could be descheduled mid-hold);
+`restore_interrupts`, which writes that state whatever the current one (the
+contract is stated in [arch-interface.md](arch-interface.md)); a window
+that left interrupts enabled behind it would make the rest of the syscall
+preemptible, and a lock taken there could be descheduled mid-hold);
 and the idle thread's deferred reclaim (`drain_deferred_reclaim` from
 `idle_thread_entry`), which runs with interrupts and preemption enabled and
 is sound only because the idle thread's time slice is permanently zero, so
@@ -653,7 +654,7 @@ Pairing table for every load-bearing atomic in the scheduling and IPC paths. "Lo
 | `LOAD_BALANCE_TICK` | `sched/mod.rs` (decl, balancer) | Relaxed on `fetch_add` (sole writer is the loaded-path victim selection in `try_pull_balance`) | Relaxed on the same `fetch_add` (consumes the previous value) | Advisory random-victim seed; correctness does not depend on ordering — a stale value just biases victim selection slightly. |
 | `NEXT_THREAD_ID` | `sched/mod.rs` (counter) | Relaxed on `fetch_add` | n/a | Monotonic counter; no synchronisation needed. |
 | `CPU_COUNT` | `sched/mod.rs` (decl) | Relaxed on store (`init_storage`) | Relaxed on every read | Single-writer at boot; the SCHEDULERS_PTR Release publishes the storage; readers establish happens-before via the pointer load, not via CPU_COUNT itself. |
-| `SCHEDULERS_PTR`, `IDLE_TCBS_PTR`, `AP_TSS_PTR`, `AP_GDT_PTR`, `AP_IST_STACKS_PTR` | per-`AtomicPtr` declaration sites | Release on `store` in `init_storage` and per-arch initialisers | Acquire on `load` in `scheduler_ptr`, `idle_tcb_ptr`, AP startup helpers | Publishes the zeroed and constructed slab to every CPU; the Acquire establishes happens-before with the storage construction. |
+| `SCHEDULERS_PTR`, `IDLE_TCBS_PTR`, `AP_TSS_PTR`, `AP_GDT_PTR`, `AP_IST_STACKS_PTR` | per-`AtomicPtr` declaration sites | Release on `store` in `init_storage` and per-arch initialisers | Acquire on `load` in `scheduler_ptr`, `idle_tcb_ptr`, `running_tcb_raw`, AP startup helpers | Publishes the zeroed and constructed slab to every CPU; the Acquire establishes happens-before with the storage construction. |
 
 **Rules:**
 - The per-TCB `sched_lock` (a `crate::sync::Spinlock`, not an atomic; see § Cross-CPU TCB Ownership)

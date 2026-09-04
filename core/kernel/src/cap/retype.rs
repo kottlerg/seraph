@@ -111,14 +111,28 @@ impl RetypeAllocator
         }
     }
 
+    /// Acquire the allocator lock. A contended wait is recorded in the
+    /// calling CPU's lock-wait breadcrumb for the softlockup watchdog; the
+    /// uncontended path records nothing.
     fn lock(&self)
     {
-        while self
+        if self
             .lock
             .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
-            core::hint::spin_loop();
+            crate::sched::lock_wait_enter(
+                crate::sched::LOCK_WAIT_RETYPE_ALLOC,
+                core::ptr::from_ref(&self.lock).expose_provenance(),
+            );
+            while self
+                .lock
+                .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+                .is_err()
+            {
+                core::hint::spin_loop();
+            }
+            crate::sched::lock_wait_exit();
         }
     }
 

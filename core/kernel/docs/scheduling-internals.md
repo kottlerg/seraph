@@ -101,6 +101,32 @@ hang). See § Thread Registry.
 
 **Lock primitive.** All locks above are `crate::sync::Spinlock` (IRQ-disabling). Hold-time MUST be bounded (target ~10 µs on x86_64); no page-table walks, buddy allocations, IPC syscalls, or other long-latency operations under any spinlock.
 
+**Bare spin locks (MUST).** The derivation tree lock
+(`cap::derivation::DERIVATION_LOCK`), the per-`MemoryObject` reader-writer
+lock, and the per-`MemoryObject` retype-allocator lock are CAS spin locks
+that do not mask interrupts themselves. They are taken only from syscall
+context, where interrupts are already masked, or inside a preempt-disabled
+window, so a holder is never descheduled: kernel-mode preemption exists only
+at a slice expiry with preemption enabled, and every kernel window that
+enables interrupts (shootdown ack-waits, the teardown gates, the contended
+`pt_lock` path, the `sys_thread_stop` drain) runs preempt-disabled and
+returns to the saved interrupt state through `restore_interrupts`, which
+writes that state whatever the current one (a window that left interrupts
+enabled behind it would make the rest of the syscall preemptible, and a
+lock taken there could be descheduled mid-hold). A holder MUST NOT park,
+and MUST NOT wait for another CPU to reach the scheduler while holding one
+of them. `check_lock_hold_preemptible` enforces the rule at every
+acquisition of these locks: a syscall acquiring one with interrupts and
+preemption both enabled is reported once per lock kind, and a debug build
+halts. Their order, outermost first: `DERIVATION_LOCK` → the
+`MemoryObject` write lock(s) of a split or merge (two in pointer order) → the
+SEED `MemoryObject` read lock taken by a retype allocation or free → that
+object's retype-allocator lock. The `CSpace` spinlock is taken after the
+object locks by the split and merge paths and inside the derivation lock by
+every tree edit that frees or inserts a slot. A CPU wedged on one of these
+locks shows no heartbeat and no protocol spin site; the softlockup watchdog's
+lock-wait breadcrumb names the lock (§ Softlockup Watchdog).
+
 ---
 
 ## ThreadState Transitions
@@ -782,6 +808,20 @@ context-saved dispatch barrier reports both ways: the breadcrumb names it in
 cross-CPU dumps, and its own single-shot warning fires after 100 ms of
 spinning (`CS_SPIN_WARN_US`, time-based so it is meaningful under TCG's
 variable instruction rate).
+
+Each per-CPU dump line also carries a **lock-wait breadcrumb**: a CPU
+spinning for the derivation lock, a `MemoryObject` read or write lock, or a
+retype-allocator lock records the lock kind and the address of its state
+word once its first acquisition attempt fails
+(`lock_wait_enter`/`lock_wait_exit`; the uncontended path stores nothing),
+and the dump prints them with the state word's current value — `u32::MAX`
+for a held `MemoryObject` write lock, a reader count otherwise, 1 for a held
+allocator lock. These locks spin with interrupts masked, or on the idle
+thread inside a deferred reclaim, so without the breadcrumb a CPU wedged on
+one is indistinguishable from a silent or idle one. The
+dump also prints the derivation lock's state word and the CPU stamped as its
+write holder (`DerivationLock::debug_snapshot`), so a held lock with no
+spinning holder is visible as a leaked or wedged hold.
 
 The dump then walks the live-thread registry (§ Thread Registry) and prints
 every non-running registered thread. For a `Blocked` thread it shows the

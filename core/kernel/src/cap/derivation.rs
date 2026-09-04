@@ -39,7 +39,7 @@
 //! Resolve `SlotIds` via [`crate::cap::lookup_cspace`].
 
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
 use super::object::KernelObjectHeader;
 use super::slot::SlotId;
@@ -54,9 +54,40 @@ const WRITE_LOCKED: u32 = u32::MAX;
 pub static DERIVATION_LOCK: DerivationLock = DerivationLock::new();
 
 /// Spin-based reader/writer lock protecting the capability derivation tree.
+///
+/// The `holder_*` fields are diagnostic only, read by the softlockup
+/// watchdog dump: `holder` names the CPU while the write lock is held, and
+/// the others describe the most recent acquisition (they stay set after the
+/// release, so a hold the watchdog finds without a live holder still names
+/// its origin).
 pub struct DerivationLock
 {
     state: AtomicU32,
+    /// Holder CPU plus one while the write lock is held; 0 otherwise.
+    holder: AtomicU32,
+    /// Thread id of the most recent write holder (0 for the idle thread).
+    holder_tid: AtomicU32,
+    /// Syscall number the most recent write holder was executing
+    /// (`u64::MAX` outside a syscall).
+    holder_nr: AtomicU64,
+    /// Source location of the most recent acquiring `write_lock` call.
+    holder_site: AtomicPtr<core::panic::Location<'static>>,
+}
+
+/// Snapshot of a [`DerivationLock`] for the softlockup watchdog dump.
+#[derive(Clone, Copy)]
+pub struct DerivationLockSnapshot
+{
+    /// Raw state word: 0, a reader count, or `u32::MAX` for a held write lock.
+    pub state: u32,
+    /// Write holder's CPU plus one; 0 when unheld.
+    pub holder: u32,
+    /// Thread id of the most recent write holder.
+    pub tid: u32,
+    /// Syscall number of the most recent write holder.
+    pub syscall_nr: u64,
+    /// Acquiring call site of the most recent write holder.
+    pub site: Option<&'static core::panic::Location<'static>>,
 }
 
 impl DerivationLock
@@ -66,6 +97,10 @@ impl DerivationLock
     {
         Self {
             state: AtomicU32::new(0),
+            holder: AtomicU32::new(0),
+            holder_tid: AtomicU32::new(0),
+            holder_nr: AtomicU64::new(u64::MAX),
+            holder_site: AtomicPtr::new(core::ptr::null_mut()),
         }
     }
 
@@ -103,25 +138,66 @@ impl DerivationLock
     }
 
     /// Acquire the write lock. Spins until no readers or writers hold it.
+    ///
+    /// A contended wait is recorded in the calling CPU's lock-wait
+    /// breadcrumb for the softlockup watchdog; the uncontended path
+    /// records nothing. The acquisition stamps the holder fields.
+    #[track_caller]
     pub fn write_lock(&self)
     {
-        loop
+        if self
+            .state
+            .compare_exchange(0, WRITE_LOCKED, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
         {
-            if self
-                .state
-                .compare_exchange_weak(0, WRITE_LOCKED, Ordering::Acquire, Ordering::Relaxed)
-                .is_ok()
+            crate::sched::lock_wait_enter(
+                crate::sched::LOCK_WAIT_DERIVATION,
+                core::ptr::from_ref(&self.state).expose_provenance(),
+            );
+            loop
             {
-                break;
+                if self
+                    .state
+                    .compare_exchange_weak(0, WRITE_LOCKED, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    break;
+                }
+                core::hint::spin_loop();
             }
-            core::hint::spin_loop();
+            crate::sched::lock_wait_exit();
         }
+        let (tid, nr) = crate::sched::holder_info();
+        self.holder_tid.store(tid, Ordering::Relaxed);
+        self.holder_nr.store(nr, Ordering::Relaxed);
+        let site = core::panic::Location::caller();
+        self.holder_site
+            .store(core::ptr::from_ref(site).cast_mut(), Ordering::Relaxed);
+        crate::sched::check_lock_hold_preemptible("derivation", site);
+        self.holder
+            .store(crate::sched::cpu_stamp(), Ordering::Relaxed);
     }
 
     /// Release the write lock previously acquired with [`write_lock`].
     pub fn write_unlock(&self)
     {
+        self.holder.store(0, Ordering::Relaxed);
         self.state.store(0, Ordering::Release);
+    }
+
+    /// Snapshot the lock for the softlockup watchdog dump.
+    pub fn debug_snapshot(&self) -> DerivationLockSnapshot
+    {
+        let site = self.holder_site.load(Ordering::Relaxed);
+        DerivationLockSnapshot {
+            state: self.state.load(Ordering::Relaxed),
+            holder: self.holder.load(Ordering::Relaxed),
+            tid: self.holder_tid.load(Ordering::Relaxed),
+            syscall_nr: self.holder_nr.load(Ordering::Relaxed),
+            // SAFETY: the pointer is null or a `Location::caller()` result,
+            // which is `'static` program data.
+            site: unsafe { site.cast_const().as_ref() },
+        }
     }
 }
 

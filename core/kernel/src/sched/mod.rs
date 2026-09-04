@@ -433,6 +433,177 @@ pub fn spin_site_enter(_site: u32) {}
 #[cfg(test)]
 pub fn spin_site_exit() {}
 
+/// No lock wait recorded for a CPU.
+pub const LOCK_WAIT_NONE: u32 = 0;
+/// Waiting for `cap::derivation::DERIVATION_LOCK` (write side).
+pub const LOCK_WAIT_DERIVATION: u32 = 1;
+/// Waiting for a `MemoryObject` read lock.
+pub const LOCK_WAIT_MEMORY_READ: u32 = 2;
+/// Waiting for a `MemoryObject` write lock.
+pub const LOCK_WAIT_MEMORY_WRITE: u32 = 3;
+/// Waiting for a `MemoryObject`'s retype-allocator lock (a 64-bit word).
+pub const LOCK_WAIT_RETYPE_ALLOC: u32 = 4;
+
+/// Per-CPU breadcrumb naming the bare spin lock a CPU is currently waiting
+/// for, for the softlockup watchdog: the lock kind and the address of its
+/// state word. The derivation lock, the `MemoryObject` locks, and the
+/// retype-allocator lock spin with interrupts masked (syscall context) or
+/// inside the idle thread's deferred reclaim, so a CPU wedged on one shows
+/// no protocol spin site and looks silent or idle; this breadcrumb names the
+/// lock and lets the dump read its state word. Recorded only once the first
+/// acquisition attempt fails, so the uncontended fast path stores nothing.
+/// Diagnostic-only — never gates control flow.
+#[cfg(not(test))]
+static LOCK_WAIT_KIND: [core::sync::atomic::AtomicU32; MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU32::new(LOCK_WAIT_NONE) }; MAX_CPUS];
+/// Address of the state word the CPU is waiting on; see [`LOCK_WAIT_KIND`].
+#[cfg(not(test))]
+static LOCK_WAIT_WORD: [core::sync::atomic::AtomicU64; MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; MAX_CPUS];
+
+/// Record that the current CPU is spinning for the lock of kind `kind` whose
+/// state word lives at address `word`. Callers spin with interrupts masked,
+/// preemption disabled, or on the idle thread, so the CPU index is stable
+/// across the wait.
+#[cfg(not(test))]
+pub fn lock_wait_enter(kind: u32, word: usize)
+{
+    let cpu = crate::arch::current::cpu::current_cpu() as usize;
+    if cpu < MAX_CPUS
+    {
+        LOCK_WAIT_WORD[cpu].store(word as u64, core::sync::atomic::Ordering::Relaxed);
+        LOCK_WAIT_KIND[cpu].store(kind, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Clear the current CPU's lock-wait breadcrumb once the lock is acquired.
+#[cfg(not(test))]
+pub fn lock_wait_exit()
+{
+    let cpu = crate::arch::current::cpu::current_cpu() as usize;
+    if cpu < MAX_CPUS
+    {
+        LOCK_WAIT_KIND[cpu].store(LOCK_WAIT_NONE, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Human-readable name for a lock-wait kind, for the watchdog dump.
+#[cfg(not(test))]
+fn lock_wait_name(kind: u32) -> &'static str
+{
+    match kind
+    {
+        LOCK_WAIT_DERIVATION => "derivation",
+        LOCK_WAIT_MEMORY_READ => "memory-object read",
+        LOCK_WAIT_MEMORY_WRITE => "memory-object write",
+        LOCK_WAIT_RETYPE_ALLOC => "retype-allocator",
+        _ => "none",
+    }
+}
+
+/// Current CPU index plus one, for lock-holder stamps (0 means no holder).
+#[cfg(not(test))]
+pub fn cpu_stamp() -> u32
+{
+    crate::arch::current::cpu::current_cpu().wrapping_add(1)
+}
+
+/// `(thread id, syscall number)` of the running thread, for lock-holder
+/// stamps: `(0, u64::MAX)` on the idle thread, and `u64::MAX` for a thread
+/// outside a syscall.
+#[cfg(not(test))]
+pub fn holder_info() -> (u32, u64)
+{
+    // SAFETY: the running thread's TCB and its trap-frame pointer are set by
+    // the syscall entry and stay valid while the thread runs on this CPU; the
+    // idle thread has a null trap frame.
+    unsafe {
+        let tcb = crate::syscall::current_tcb();
+        if tcb.is_null()
+        {
+            return (0, u64::MAX);
+        }
+        let tf = (*tcb).trap_frame;
+        let nr = if tf.is_null()
+        {
+            u64::MAX
+        }
+        else
+        {
+            (*tf).syscall_nr()
+        };
+        ((*tcb).thread_id, nr)
+    }
+}
+
+/// Test stubs: lock-wait breadcrumbs and holder stamps are diagnostic-only
+/// and compiled out under host `cfg(test)`.
+#[cfg(test)]
+pub fn lock_wait_enter(_kind: u32, _word: usize) {}
+/// Test stub; see [`lock_wait_enter`].
+#[cfg(test)]
+pub fn lock_wait_exit() {}
+/// Test stub; see [`cpu_stamp`].
+#[cfg(test)]
+pub fn cpu_stamp() -> u32
+{
+    1
+}
+/// Test stub; see [`holder_info`].
+#[cfg(test)]
+pub fn holder_info() -> (u32, u64)
+{
+    (0, u64::MAX)
+}
+
+/// Per-kind one-shot latch for [`check_lock_hold_preemptible`]: bit 1 the
+/// derivation lock, bit 2 the `MemoryObject` locks.
+#[cfg(not(test))]
+static PREEMPTIBLE_HOLD_REPORTED: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+/// Invariant tripwire for the bare spin locks (docs/scheduling-internals.md
+/// § Lock Hierarchy, "Bare spin locks"): a hold taken from a syscall with
+/// interrupts enabled and preemption enabled can be descheduled by the tick
+/// while held, and every later waiter then spins forever with interrupts
+/// masked. Reports the first such acquisition per lock kind once per boot,
+/// naming the thread, syscall, and call site; a debug build then halts. The
+/// idle thread, which has no syscall and no time slice, is exempt.
+#[cfg(not(test))]
+pub fn check_lock_hold_preemptible(kind: &str, site: &core::panic::Location<'_>)
+{
+    if !crate::arch::current::interrupts::are_enabled() || crate::percpu::preemption_disabled()
+    {
+        return;
+    }
+    let (tid, nr) = holder_info();
+    if nr == u64::MAX
+    {
+        return;
+    }
+    let bit = if kind.starts_with("derivation") { 1 } else { 2 };
+    if PREEMPTIBLE_HOLD_REPORTED.fetch_or(bit, core::sync::atomic::Ordering::AcqRel) & bit == 0
+    {
+        crate::kprintln!(
+            "kernel: {} lock taken preemptible: tid={} syscall={} site={}:{} cpu={}",
+            kind,
+            tid,
+            nr,
+            site.file(),
+            site.line(),
+            crate::arch::current::cpu::current_cpu()
+        );
+        debug_assert!(
+            false,
+            "bare spin lock taken with interrupts and preemption enabled"
+        );
+    }
+}
+
+/// Test stub; see [`check_lock_hold_preemptible`].
+#[cfg(test)]
+pub fn check_lock_hold_preemptible(_kind: &str, _site: &core::panic::Location<'_>) {}
+
 /// Mark `cpu` as having dispatched a non-idle thread at the current tick.
 pub fn watchdog_mark_non_idle(cpu: usize)
 {
@@ -805,6 +976,42 @@ fn watchdog_dump(reason: &str)
         {
             crate::kprintln!("    spinning in {}", spin_site_name(spin));
         }
+        // Name the bare spin lock this CPU is waiting for, if any, and read
+        // its state word: a derivation-lock, `MemoryObject`-lock, or
+        // retype-allocator wait spins with interrupts masked or on the idle
+        // thread, so it is otherwise indistinguishable from a silent or idle
+        // CPU.
+        let lock_kind = LOCK_WAIT_KIND[cpu].load(core::sync::atomic::Ordering::Relaxed);
+        if lock_kind != LOCK_WAIT_NONE
+        {
+            let word = LOCK_WAIT_WORD[cpu].load(core::sync::atomic::Ordering::Relaxed) as usize;
+            // SAFETY: `word` was published by this CPU's own spin loop, which
+            // has not returned; the state word is kernel direct-map storage
+            // that stays mapped, and the load is read-only. The
+            // retype-allocator lock is a 64-bit word; the others are 32-bit.
+            let value = unsafe {
+                if lock_kind == LOCK_WAIT_RETYPE_ALLOC
+                {
+                    (*core::ptr::with_exposed_provenance::<core::sync::atomic::AtomicU64>(word))
+                        .load(core::sync::atomic::Ordering::Relaxed)
+                }
+                else
+                {
+                    u64::from(
+                        (*core::ptr::with_exposed_provenance::<core::sync::atomic::AtomicU32>(
+                            word,
+                        ))
+                        .load(core::sync::atomic::Ordering::Relaxed),
+                    )
+                }
+            };
+            crate::kprintln!(
+                "    waiting on {} lock @0x{:x} word=0x{:x}",
+                lock_wait_name(lock_kind),
+                word,
+                value
+            );
+        }
         // Dump the user-mode trap frame if present: tells us where in
         // userspace the thread entered its currently-stuck syscall.
         // SAFETY: trap_frame is set by every userspace-syscall entry and
@@ -835,6 +1042,24 @@ fn watchdog_dump(reason: &str)
             crate::kprintln!("    user_pc=0x{:x} syscall_nr={}", tf_ip, tf_syscall_nr);
         }
     }
+    // Derivation-lock state, holder CPU, and the most recent acquisition's
+    // thread, syscall, and call site: a wedged holder or a leaked hold shows
+    // here as a held state word whose last acquirer is not spinning.
+    let deriv = crate::cap::DERIVATION_LOCK.debug_snapshot();
+    let holder_cpu = i64::from(deriv.holder) - 1;
+    let (site_file, site_line) = deriv
+        .site
+        .map_or(("none", 0), |loc| (loc.file(), loc.line()));
+    crate::kprintln!(
+        "  DERIVATION_LOCK state=0x{:x} holder_cpu={} last_tid={} last_syscall={} \
+         last_site={}:{}",
+        deriv.state,
+        holder_cpu,
+        deriv.tid,
+        deriv.syscall_nr,
+        site_file,
+        site_line
+    );
     // Dump sleep list. Try-lock: a wedged CPU may hold SLEEP_LIST_LOCK, and
     // the dump must not deadlock on it.
     // SAFETY: read-only; paired unlock inside the map closure.

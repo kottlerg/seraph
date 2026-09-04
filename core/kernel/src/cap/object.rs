@@ -299,8 +299,18 @@ const FRAME_WRITE_LOCKED: u32 = u32::MAX;
 impl MemoryObject
 {
     /// Acquire a shared read lock. Spins while a writer holds the lock.
+    ///
+    /// A contended wait is recorded in the calling CPU's lock-wait
+    /// breadcrumb for the softlockup watchdog; the uncontended path
+    /// records nothing.
+    #[track_caller]
     pub fn read_lock(&self)
     {
+        crate::sched::check_lock_hold_preemptible(
+            "memory-object read",
+            core::panic::Location::caller(),
+        );
+        let mut waiting = false;
         loop
         {
             let cur = self.lock.load(Ordering::Relaxed);
@@ -312,7 +322,19 @@ impl MemoryObject
             {
                 break;
             }
+            if !waiting
+            {
+                waiting = true;
+                crate::sched::lock_wait_enter(
+                    crate::sched::LOCK_WAIT_MEMORY_READ,
+                    core::ptr::from_ref(&self.lock).expose_provenance(),
+                );
+            }
             core::hint::spin_loop();
+        }
+        if waiting
+        {
+            crate::sched::lock_wait_exit();
         }
     }
 
@@ -323,8 +345,16 @@ impl MemoryObject
     }
 
     /// Acquire the write lock. Spins until no readers or writers hold it.
+    ///
+    /// Contended waits are recorded like [`Self::read_lock`]'s.
+    #[track_caller]
     pub fn write_lock(&self)
     {
+        crate::sched::check_lock_hold_preemptible(
+            "memory-object write",
+            core::panic::Location::caller(),
+        );
+        let mut waiting = false;
         loop
         {
             if self
@@ -334,7 +364,19 @@ impl MemoryObject
             {
                 break;
             }
+            if !waiting
+            {
+                waiting = true;
+                crate::sched::lock_wait_enter(
+                    crate::sched::LOCK_WAIT_MEMORY_WRITE,
+                    core::ptr::from_ref(&self.lock).expose_provenance(),
+                );
+            }
             core::hint::spin_loop();
+        }
+        if waiting
+        {
+            crate::sched::lock_wait_exit();
         }
     }
 
@@ -358,6 +400,7 @@ impl<'a> MemoryReadGuard<'a>
 {
     /// Acquire `memory`'s read lock and return the guard. The lock is
     /// released when the guard is dropped.
+    #[track_caller]
     pub fn acquire(memory: &'a MemoryObject) -> Self
     {
         memory.read_lock();

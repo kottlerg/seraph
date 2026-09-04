@@ -377,6 +377,10 @@ pub unsafe fn save_and_disable_interrupts() -> u64
 
 /// Restore the interrupt-enable state saved by [`save_and_disable_interrupts`].
 ///
+/// Writes `sstatus.SIE` to the saved value whatever its current state, so a
+/// caller that enabled interrupts inside the window (a preempt-disabled
+/// wait) returns to the saved state too. Matches the x86-64 `popfq` restore.
+///
 /// # Safety
 /// Must execute in supervisor mode. `saved` must be a value returned by
 /// `save_and_disable_interrupts` on this hart.
@@ -387,9 +391,16 @@ pub unsafe fn restore_interrupts(saved: u64)
     let sie_bit = (saved >> 1) & 1;
     if sie_bit != 0
     {
-        // SAFETY: re-enabling SIE after we previously cleared it.
+        // SAFETY: csrsi sets SIE; supervisor mode per the caller contract.
         unsafe {
             core::arch::asm!("csrsi sstatus, 2", options(nostack, nomem));
+        }
+    }
+    else
+    {
+        // SAFETY: csrci clears SIE; supervisor mode per the caller contract.
+        unsafe {
+            core::arch::asm!("csrci sstatus, 2", options(nostack, nomem));
         }
     }
 }

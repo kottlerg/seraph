@@ -253,9 +253,12 @@ slot is pinned by an in-flight `SYS_CAP_REVOKE` or `SYS_CAP_MOVE`), `Interrupted
 problems are rejected before the caller blocks; a refusal that arises only
 afterwards degrades to delivery with zero caps (the caller keeps its
 capabilities). A capability whose derived children take more than one lock
-hold to migrate is moved in batches after the message commits; if an
-ancestor's revoke frees it meanwhile, it arrives as handle 0 (the permanently
-null slot).
+hold to migrate is moved in batches after the message commits (see
+[capability-internals.md](capability-internals.md) § Move); if an ancestor's
+revoke frees it meanwhile, or the receiver's CSpace is torn down, it arrives
+as handle 0 (the permanently null slot); if a concurrent deriver keeps its
+child list growing past the batch backstop it arrives live while the
+sender's slot survives as its derivation parent.
 
 ---
 
@@ -1738,7 +1741,11 @@ so the operations listed under `SYS_CAP_REVOKE` refuse them with
 `InvalidState`; a `SYS_CAP_REVOKE` on an ancestor still reaches every node.
 A concurrent deriver extending the child list faster than it is moved returns
 `Interrupted`, leaving the capability live in both slots with the destination
-a derived child of the source.
+a derived child of the source — a `SYS_CAP_REVOKE` on the source reclaims
+it, so nothing is left outside the caller's reach even when the destination
+index was auto-allocated. A CSpace torn down while the move is in flight
+releases the children hanging under its dying slots as derivation roots, as
+for any other slot.
 
 **Arguments:**
 

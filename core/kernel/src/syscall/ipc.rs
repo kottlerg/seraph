@@ -212,19 +212,21 @@ fn prevalidate_transfer_slots(cs: &CSpace, handles: &[u32]) -> Result<(), Syscal
 /// Each move then runs to completion through `cap::transfer` — inside the
 /// first lock hold for a cap with at most `MAX_REPARENT_EDITS` children,
 /// otherwise in further batches with the locks released in between (both
-/// slots pinned meanwhile). A cap an ancestor's revoke reaches during those
-/// batches is delivered as handle 0 (the permanently null slot): the revoke
-/// won, exactly as if it had landed just after delivery.
+/// slots pinned meanwhile, both revalidated through the registry before
+/// each batch). A cap whose slots are both freed during those batches (an
+/// ancestor's revoke) or whose destination is freed (the receiver's `CSpace`
+/// torn down) is delivered as handle 0 (the permanently null slot); one
+/// whose migration trips the liveness backstop is delivered live, with the
+/// sender's slot surviving as its derivation parent.
 ///
 /// On success, writes the destination cap handles to `dst_handles_out` and
 /// returns the number of caps transferred. The caller is responsible for
 /// writing the results to the appropriate IPC buffer.
 ///
 /// # Safety
-/// `src_cspace` and `dst_cspace` must be valid live `CSpace` pointers for
-/// the duration of the call. A `CSpace` bound to the running thread cannot
-/// be torn down mid-syscall; a caller whose source `CSpace` belongs to a
-/// parked thread must hold it (see `hold_foreign_cspace`).
+/// `src_cspace` and `dst_cspace` must be valid live `CSpace` pointers at
+/// entry (the first lock hold dereferences them; the later batches resolve
+/// both slots through the registry).
 #[cfg(not(test))]
 unsafe fn transfer_caps(
     src_cspace: *mut CSpace,
@@ -341,63 +343,6 @@ unsafe fn transfer_caps(
     }
 
     Ok(cap_count)
-}
-
-/// Take a reference on the wrapper of `cs`, a `CSpace` bound to a parked
-/// thread, so it cannot be torn down while a batched capability transfer out
-/// of it is in flight — a teardown drain between batches would orphan the
-/// in-flight destination into a derivation root, outside every ancestor's
-/// revoke reach. Returns `None` when `cs` is the running thread's own
-/// `CSpace` (`own`): a teardown must stop and deschedule the running thread
-/// before it drains, so it cannot proceed mid-syscall. Pair with
-/// [`release_foreign_cspace`].
-///
-/// # Safety
-/// `cs` must be a valid live `CSpace` pointer.
-#[cfg(not(test))]
-unsafe fn hold_foreign_cspace(
-    cs: *mut CSpace,
-    own: *mut CSpace,
-) -> Option<core::ptr::NonNull<crate::cap::object::KernelObjectHeader>>
-{
-    if core::ptr::eq(cs, own)
-    {
-        return None;
-    }
-    // SAFETY: caller contract. The wrapper's header is at offset 0.
-    let hdr = core::ptr::NonNull::new(
-        unsafe { (*cs).kobj_ptr() }?.cast::<crate::cap::object::KernelObjectHeader>(),
-    )?;
-    // SAFETY: hdr is the live wrapper of a registered CSpace.
-    unsafe { hdr.as_ref().inc_ref() };
-    Some(hdr)
-}
-
-/// Drop the reference taken by [`hold_foreign_cspace`]. If it was the last,
-/// the `CSpace` is queued for this CPU's deferred reclaim — the syscall
-/// epilogue drains it — rather than torn down here: the teardown stops bound
-/// threads and waits on other CPUs, which must not run inside IPC delivery.
-///
-/// # Safety
-/// Syscall context with interrupts disabled (the CPU index is stable).
-#[cfg(not(test))]
-unsafe fn release_foreign_cspace(
-    held: Option<core::ptr::NonNull<crate::cap::object::KernelObjectHeader>>,
-)
-{
-    let Some(hdr) = held
-    else
-    {
-        return;
-    };
-    // SAFETY: held came from hold_foreign_cspace's inc_ref.
-    if unsafe { hdr.as_ref().dec_ref() } == 0
-    {
-        let cpu = crate::arch::current::cpu::current_cpu() as usize;
-        // SAFETY: refcount 0, no slot references the wrapper; caller
-        // contract for the CPU index.
-        unsafe { crate::cap::object::push_deferred_reclaim(cpu, hdr) };
-    }
 }
 
 // ── IPC syscall handlers ──────────────────────────────────────────────────────
@@ -838,10 +783,6 @@ pub fn sys_ipc_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             let caller_cspace = unsafe { (*caller).cspace };
             // SAFETY: tcb validated above.
             let server_cspace = unsafe { (*tcb).cspace };
-            // The sender is parked, so its CSpace is held across the
-            // transfer's batches (see hold_foreign_cspace).
-            // SAFETY: caller_cspace is live (the sender is BlockedOnReply).
-            let held = unsafe { hold_foreign_cspace(caller_cspace, server_cspace) };
             // SAFETY: CSpace pointers extracted from valid TCBs.
             transferred = unsafe {
                 transfer_caps(
@@ -852,8 +793,6 @@ pub fn sys_ipc_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 )
             }
             .unwrap_or(0);
-            // SAFETY: syscall context, interrupts disabled.
-            unsafe { release_foreign_cspace(held) };
         }
         // Always write cap_count to the receiver's IPC buffer — including
         // the zero-cap case — so a prior IPC's cap metadata cannot be

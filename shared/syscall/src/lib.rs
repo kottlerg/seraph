@@ -1597,10 +1597,12 @@ pub fn cap_revoke_all(slot: u32) -> Result<(), i64>
 
 /// Move a capability to another `CSpace` (`SYS_CAP_MOVE`).
 ///
-/// `dest_index` = 0 auto-allocates a slot; non-zero inserts at that index.
-/// The source slot is cleared; object refcount is unchanged.
+/// `src_cap` is a capability handle (generation-checked). `dest_index` = 0
+/// auto-allocates a slot; non-zero inserts at that index. The source slot
+/// is cleared and every capability derived from it follows the move; the
+/// object refcount is unchanged.
 ///
-/// Returns the destination slot index.
+/// Returns the destination capability handle.
 ///
 /// With a non-zero `dest_index`, if every other reference to the destination
 /// `CSpace` goes while the call is backing the leaves up to it, the call
@@ -1608,22 +1610,31 @@ pub fn cap_revoke_all(slot: u32) -> Result<(), i64>
 /// itself is bound to it, the caller is stopped and the call never returns.
 ///
 /// # Errors
-/// Returns a negative `i64` error code if either cap is invalid, `dest_index`
-/// is already occupied, or the destination `CSpace`'s slot pool cannot back
-/// the slot (`OutOfMemory` — for a non-zero `dest_index`, every leaf up to
-/// that index must be backed; `QuotaExceeded` at the structural ceiling).
+/// Returns a negative `i64` error code: `InvalidCapability` if either cap is
+/// invalid or stale, or an ancestor's revoke freed the capability while the
+/// move was in flight; `InsufficientRights` if the destination `CSpace` cap
+/// lacks Insert; `InvalidArgument` if `dest_index` is occupied or out of
+/// range; `OutOfMemory` if the destination's slot pool cannot back the slot
+/// (for a non-zero `dest_index`, every leaf up to that index must be
+/// backed; `QuotaExceeded` at the structural ceiling); `InvalidState` if a
+/// revoke or another move is in flight on the source, or the destination
+/// slot was freed mid-move (the source keeps the capability);
+/// `Interrupted` if a concurrent deriver kept extending the child list past
+/// the kernel's batch backstop — the capability then lives in both slots,
+/// the destination a derived child of the source, and a `cap_revoke` on the
+/// source reclaims it.
 // cast_possible_truncation, cast_sign_loss: ret is a non-negative cap handle —
 // a 24-bit slot index plus an 8-bit generation (`CAP_INDEX_BITS + 8 <= 32`),
 // so it fits u32.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-pub fn cap_move(src_slot: u32, dest_cspace_cap: u32, dest_index: u32) -> Result<u32, i64>
+pub fn cap_move(src_cap: u32, dest_cspace_cap: u32, dest_index: u32) -> Result<u32, i64>
 {
     // SAFETY: syscall3 issues raw syscall instruction; all arguments are scalar u64 values
     // (source slot, dest CSpace cap, dest index); kernel validates and moves cap, returns slot.
     let ret = unsafe {
         syscall3(
             SYS_CAP_MOVE,
-            u64::from(src_slot),
+            u64::from(src_cap),
             u64::from(dest_cspace_cap),
             u64::from(dest_index),
         )

@@ -66,13 +66,24 @@ static CHILD_ARGS: ArgBlock<ChildArgs, 2> = ArgBlock::new(ChildArgs {
     go_sig: 0,
 });
 
-pub fn run(ctx: &TestContext) -> TestResult
+/// Which side reaches the endpoint first, selecting the transfer direction.
+#[derive(Clone, Copy)]
+enum Order
 {
-    run_round(ctx, 0, true)?;
-    run_round(ctx, 1, false)
+    /// The server blocks in recv before the child calls: call direction.
+    ServerRecvFirst,
+    /// The child is queued on the endpoint before the server receives:
+    /// receive direction.
+    SenderQueuedFirst,
 }
 
-fn run_round(ctx: &TestContext, round: usize, server_recv_first: bool) -> TestResult
+pub fn run(ctx: &TestContext) -> TestResult
+{
+    run_round(ctx, 0, Order::ServerRecvFirst)?;
+    run_round(ctx, 1, Order::SenderQueuedFirst)
+}
+
+fn run_round(ctx: &TestContext, round: usize, order: Order) -> TestResult
 {
     let ep = cap_create_endpoint(ctx.memory_base)
         .map_err(|_| "integration::cap_transfer_large: cap_create_endpoint failed")?;
@@ -115,7 +126,7 @@ fn run_round(ctx: &TestContext, round: usize, server_recv_first: bool) -> TestRe
         .map_err(|_| "integration::cap_transfer_large: thread_configure failed")?;
     thread_start(th).map_err(|_| "integration::cap_transfer_large: thread_start failed")?;
 
-    if !server_recv_first
+    if let Order::SenderQueuedFirst = order
     {
         // Let the child derive its subtree and enter the call before the
         // server receives, so the transfer runs on the receive path.

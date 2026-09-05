@@ -79,11 +79,21 @@ pub enum MoveStep
     /// deriver kept extending the source's child list. Both slots stay
     /// live and unpinned, the destination a derived child of the source —
     /// the same shape `SYS_CAP_COPY` produces — so nothing leaves any
-    /// ancestor's reach.
+    /// ancestor's reach, and a revoke on the source reclaims it.
     Abandoned
     {
         handle: u32
     },
+}
+
+/// Who holds the source `CSpace` lock when a batch frees the source slot.
+#[derive(Clone, Copy)]
+enum SourceLock
+{
+    /// The caller holds it (`move_cap_begin`, under the lock pair).
+    Held,
+    /// Nobody; the batch takes it for the free (`move_cap_drive`).
+    Take,
 }
 
 /// Begin a move: insert the destination, take its object reference, pin
@@ -95,7 +105,8 @@ pub enum MoveStep
 /// auto-allocates; `Some` places at that index (`insert_cap_at`, whose
 /// leaves the syscall path pre-grows).
 ///
-/// Nothing is modified when an error is returned.
+/// On error both slots are as they were; an explicit-index insert may have
+/// materialised leaves in the destination, which stay as free capacity.
 ///
 /// # Contract
 ///
@@ -112,6 +123,26 @@ pub unsafe fn move_cap_begin(
     dst_cspace: *mut CSpace,
     dst_idx: Option<NonZeroU32>,
 ) -> Result<MoveStep, SyscallError>
+{
+    // SAFETY: caller contract.
+    let mv = unsafe { stage_move(src_cspace, src_handle, dst_cspace, dst_idx)? };
+    // SAFETY: DERIVATION_LOCK held (caller contract); both slots live and
+    // pinned; the source lock is held by the caller.
+    Ok(unsafe { move_cap_step(&mv, SourceLock::Held) })
+}
+
+/// Validate the source, insert the destination, take the destination's
+/// object reference, and pin both slots.
+///
+/// # Safety
+///
+/// As for [`move_cap_begin`].
+unsafe fn stage_move(
+    src_cspace: *mut CSpace,
+    src_handle: u32,
+    dst_cspace: *mut CSpace,
+    dst_idx: Option<NonZeroU32>,
+) -> Result<CapMove, SyscallError>
 {
     let src_idx = syscall::cap_handle_index(src_handle);
     let src_idx_nz = NonZeroU32::new(src_idx).ok_or(SyscallError::InvalidCapability)?;
@@ -184,17 +215,14 @@ pub unsafe fn move_cap_begin(
 
     // SAFETY: caller contract.
     let (src_id, dst_id) = unsafe { ((*src_cspace).id(), (*dst_cspace).id()) };
-    let mv = CapMove {
+    Ok(CapMove {
         src: SlotId::current(src_id, src_idx_nz),
         src_gen,
         dst: SlotId::current(dst_id, dst_idx_nz),
         dst_gen,
         handle,
         object,
-    };
-    // SAFETY: DERIVATION_LOCK held (caller contract); both slots live and
-    // pinned; the source lock is held by the caller.
-    Ok(unsafe { move_cap_step(&mv, true, MAX_REPARENT_EDITS) })
+    })
 }
 
 /// Drive a pending move to completion, one [`MAX_REPARENT_EDITS`] batch
@@ -203,7 +231,7 @@ pub unsafe fn move_cap_begin(
 /// released here.
 pub fn move_cap_drive(mv: CapMove) -> MoveStep
 {
-    use super::derivation::{DERIVATION_LOCK, MAX_REPARENT_BATCHES};
+    use super::derivation::DERIVATION_LOCK;
 
     // The first batch ran in `move_cap_begin`.
     let mut batches: u32 = 1;
@@ -211,57 +239,8 @@ pub fn move_cap_drive(mv: CapMove) -> MoveStep
     loop
     {
         DERIVATION_LOCK.write_lock();
-        // SAFETY: DERIVATION_LOCK held; `live` resolves through the registry.
-        let step = match unsafe {
-            (
-                live(mv.src, mv.src_gen, mv.object),
-                live(mv.dst, mv.dst_gen, mv.object),
-            )
-        }
-        {
-            (false, false) => MoveStep::Lost(SyscallError::InvalidCapability),
-            (false, true) =>
-            {
-                // Whoever freed the source (an ancestor's revoke, after
-                // hoisting the destination out from under it) dropped the
-                // reference it held; the destination is the capability now.
-                // SAFETY: DERIVATION_LOCK held; dst resolved live.
-                unsafe { unpin(mv.dst) };
-                MoveStep::Done {
-                    handle: mv.handle,
-                    release: None,
-                }
-            }
-            (true, false) =>
-            {
-                // SAFETY: DERIVATION_LOCK held; src resolved live.
-                unsafe { unpin(mv.src) };
-                MoveStep::Lost(SyscallError::InvalidState)
-            }
-            (true, true) =>
-            {
-                batches += 1;
-                // SAFETY: DERIVATION_LOCK held; both slots live and pinned;
-                // no CSpace lock is held.
-                let step = unsafe { move_cap_step(&mv, false, MAX_REPARENT_EDITS) };
-                if let MoveStep::Pending(_) = step
-                    && batches >= MAX_REPARENT_BATCHES
-                {
-                    // Liveness backstop: leave the destination where the
-                    // step re-linked it, as a derived child of the source.
-                    // SAFETY: DERIVATION_LOCK held; both slots live.
-                    unsafe {
-                        unpin(mv.src);
-                        unpin(mv.dst);
-                    }
-                    MoveStep::Abandoned { handle: mv.handle }
-                }
-                else
-                {
-                    step
-                }
-            }
-        };
+        // SAFETY: DERIVATION_LOCK held.
+        let step = unsafe { drive_batch(&mv, &mut batches) };
         DERIVATION_LOCK.write_unlock();
 
         match step
@@ -283,46 +262,132 @@ pub fn move_cap_drive(mv: CapMove) -> MoveStep
     }
 }
 
+/// One `move_cap_drive` hold: revalidate both slots, then run a batch or
+/// settle the move according to which of them survived.
+///
+/// # Safety
+///
+/// Caller must hold `DERIVATION_LOCK` for writing.
+unsafe fn drive_batch(mv: &CapMove, batches: &mut u32) -> MoveStep
+{
+    use super::derivation::MAX_REPARENT_BATCHES;
+
+    // SAFETY: caller contract; `live` resolves through the registry.
+    let (src_live, dst_live) = unsafe {
+        (
+            live(mv.src, mv.src_gen, mv.object),
+            live(mv.dst, mv.dst_gen, mv.object),
+        )
+    };
+    match (src_live, dst_live)
+    {
+        (false, false) => MoveStep::Lost(SyscallError::InvalidCapability),
+        (false, true) =>
+        {
+            // Whoever freed the source (an ancestor's revoke, after
+            // hoisting the destination out from under it) dropped the
+            // reference it held; the destination is the capability now.
+            // SAFETY: caller contract; dst resolved live.
+            unsafe { unpin(mv.dst) };
+            MoveStep::Done {
+                handle: mv.handle,
+                release: None,
+            }
+        }
+        (true, false) =>
+        {
+            // SAFETY: caller contract; src resolved live.
+            unsafe { unpin(mv.src) };
+            MoveStep::Lost(SyscallError::InvalidState)
+        }
+        (true, true) =>
+        {
+            *batches += 1;
+            // SAFETY: caller contract; both slots live and pinned; no
+            // CSpace lock is held.
+            let step = unsafe { move_cap_step(mv, SourceLock::Take) };
+            if let MoveStep::Pending(_) = step
+                && *batches >= MAX_REPARENT_BATCHES
+            {
+                // Liveness backstop: leave the destination where the step
+                // re-linked it, as a derived child of the source.
+                // SAFETY: caller contract; both slots live.
+                unsafe {
+                    unpin(mv.src);
+                    unpin(mv.dst);
+                }
+                return MoveStep::Abandoned { handle: mv.handle };
+            }
+            step
+        }
+    }
+}
+
 /// Drop the object reference a freed source slot held; frees the object if
-/// that was the last reference. Must run outside `DERIVATION_LOCK` —
-/// `dealloc_object` may acquire the frame allocator and other inner locks.
+/// that was the last reference. Must run outside `DERIVATION_LOCK`.
+///
+/// A `Thread`, `CSpace`, or `AddressSpace` whose last reference goes here
+/// is queued for this CPU's deferred reclaim (drained at the next syscall
+/// epilogue or idle loop) rather than torn down in place: its teardown
+/// stops bound threads and waits on other CPUs, which must not run inside
+/// IPC delivery, and may stop the running thread itself. Every other type
+/// frees in place.
+#[cfg(not(test))]
 pub fn release_moved_object(obj: NonNull<KernelObjectHeader>)
 {
+    use super::object::{ObjectType, dealloc_object, push_deferred_reclaim};
+
     // SAFETY: obj was a live capability object when the move began and the
     // freed source slot's reference is still outstanding.
-    let remaining = unsafe { obj.as_ref().dec_ref() };
-    #[cfg(not(test))]
-    if remaining == 0
+    if unsafe { obj.as_ref().dec_ref() } != 0
     {
-        // SAFETY: refcount reached 0; no other references exist.
-        unsafe { super::object::dealloc_object(obj) };
+        return;
     }
-    // The host harness leaks its objects; nothing to free.
-    #[cfg(test)]
-    let _ = remaining;
+    // SAFETY: refcount reached 0; no slot references the object.
+    match unsafe { obj.as_ref().obj_type }
+    {
+        ObjectType::Thread | ObjectType::CSpaceObj | ObjectType::AddressSpace =>
+        {
+            let cpu = crate::arch::current::cpu::current_cpu() as usize;
+            // SAFETY: refcount 0, exclusively owned, a linkable type;
+            // syscall context with interrupts disabled, so the CPU index
+            // is stable.
+            unsafe { push_deferred_reclaim(cpu, obj) };
+        }
+        _ =>
+        {
+            // SAFETY: refcount 0; no other references exist.
+            unsafe { dealloc_object(obj) };
+        }
+    }
+}
+
+/// Host-test variant: the harness leaks its objects, so only the count is
+/// kept.
+#[cfg(test)]
+pub fn release_moved_object(obj: NonNull<KernelObjectHeader>)
+{
+    // SAFETY: a leaked test header.
+    unsafe { obj.as_ref().dec_ref() };
 }
 
 /// One migration batch: detach the destination from wherever it hangs (a
 /// clean root fresh from insert, the source's child list between batches,
-/// or a revoke root's list after a hoist), move up to `max_edits` of the
-/// source's children under it, then either finish the move — the
+/// or a revoke root's list after a hoist), move up to [`MAX_REPARENT_EDITS`]
+/// of the source's children under it, then either finish the move — the
 /// destination takes the source's position, the source is freed — or
 /// re-link the destination under the source for the next batch.
-///
-/// `src_lock_held`: whether the caller holds the source `CSpace` lock
-/// (`move_cap_begin` does; the drive loop takes it here for the free).
 ///
 /// # Safety
 ///
 /// Caller must hold `DERIVATION_LOCK` for writing; both slots must have
 /// been resolved live under this hold.
-pub(crate) unsafe fn move_cap_step(mv: &CapMove, src_lock_held: bool, max_edits: usize)
--> MoveStep
+unsafe fn move_cap_step(mv: &CapMove, src_lock: SourceLock) -> MoveStep
 {
     // SAFETY: caller contract.
     unsafe { unlink_node(mv.dst) };
     // SAFETY: caller contract.
-    let done = unsafe { reparent_children(mv.src, Some(mv.dst), max_edits) };
+    let done = unsafe { reparent_children(mv.src, Some(mv.dst), MAX_REPARENT_EDITS) };
     if !done
     {
         // SAFETY: caller contract; both slots live under this hold, so the
@@ -335,9 +400,26 @@ pub(crate) unsafe fn move_cap_step(mv: &CapMove, src_lock_held: bool, max_edits:
         );
         return MoveStep::Pending(*mv);
     }
+    // SAFETY: caller contract.
+    unsafe {
+        take_source_position(mv);
+        free_source(mv, src_lock);
+    }
+    MoveStep::Done {
+        handle: mv.handle,
+        release: Some(mv.object),
+    }
+}
 
-    // The destination takes the source's position: its own links, then
-    // every neighbour that points back at the source.
+/// Give the destination the source's links and repoint every neighbour
+/// that points at the source; clear the destination's pin.
+///
+/// # Safety
+///
+/// Caller must hold `DERIVATION_LOCK` for writing; the destination must be
+/// a clean root (unlinked) under this hold.
+unsafe fn take_source_position(mv: &CapMove)
+{
     // SAFETY: caller contract; short-lived borrows, one slot at a time.
     let (parent, prev, next) = match unsafe { resolve_slot_mut(mv.src) }
     {
@@ -373,31 +455,34 @@ pub(crate) unsafe fn move_cap_step(mv: &CapMove, src_lock_held: bool, max_edits:
     {
         ns.deriv_prev_sibling = Some(mv.dst);
     }
+}
 
-    // Free the source. Its links, pin, and generation are reset by the
-    // free path. Lock order: DERIVATION_LOCK → cspace.lock.
-    if let Some(cs) = super::lookup_cspace(mv.src.cspace_id, mv.src.epoch)
+/// Free the source slot; the free path resets its links, pin, and
+/// generation. Lock order: `DERIVATION_LOCK` → `cspace.lock`.
+///
+/// # Safety
+///
+/// Caller must hold `DERIVATION_LOCK` for writing, and the source `CSpace`
+/// lock when `src_lock` is [`SourceLock::Held`].
+unsafe fn free_source(mv: &CapMove, src_lock: SourceLock)
+{
+    let Some(cs) = super::lookup_cspace(mv.src.cspace_id, mv.src.epoch)
+    else
     {
-        // SAFETY: registry-resolved live CSpace; lock_raw/unlock_raw paired.
-        unsafe {
-            let saved = if src_lock_held
+        return;
+    };
+    // SAFETY: registry-resolved live CSpace; lock_raw/unlock_raw paired.
+    unsafe {
+        match src_lock
+        {
+            SourceLock::Held => (*cs).free_slot(mv.src.index.get()),
+            SourceLock::Take =>
             {
-                None
-            }
-            else
-            {
-                Some((*cs).lock.lock_raw())
-            };
-            (*cs).free_slot(mv.src.index.get());
-            if let Some(saved) = saved
-            {
+                let saved = (*cs).lock.lock_raw();
+                (*cs).free_slot(mv.src.index.get());
                 (*cs).lock.unlock_raw(saved);
             }
         }
-    }
-    MoveStep::Done {
-        handle: mv.handle,
-        release: Some(mv.object),
     }
 }
 

@@ -54,10 +54,14 @@ A message consists of:
   A refused transfer — a source slot gone stale, repeated within the message, or
   pinned by an in-flight revocation or move — does not block delivery: the
   message arrives with zero capabilities and the sender keeps its own. A
-  capability whose derived children take more than one lock hold to migrate is
-  moved in batches after the message commits; if an ancestor revokes it
-  meanwhile, it arrives as handle 0 (the permanently null slot) — the revoke
-  won, exactly as if it had landed just after delivery. On the reply
+  capability with more derived children than the kernel migrates in one lock
+  hold is moved in batches after the message commits (see
+  [capability-internals.md](../core/kernel/docs/capability-internals.md)
+  § Move); if an ancestor revokes it meanwhile, or the receiver's CSpace is
+  torn down, it arrives as handle 0 (the permanently null slot) — exactly as
+  if that had landed just after delivery — and if a concurrent deriver keeps
+  its child list growing past the kernel's batch backstop it arrives live
+  while the sender's slot survives as its derivation parent. On the reply
   direction the sender (the replying server) receives the error and the waiting
   caller resumes with the `IPC_REPLY_TRANSFER_FAILED` label; on the call/receive
   direction the sender is rejected before blocking where the refusal is

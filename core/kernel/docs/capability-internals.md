@@ -592,18 +592,28 @@ re-linked it, a live derived child of the source with both pins cleared —
 the shape `SYS_CAP_COPY` produces — and returns `Interrupted` from the
 syscall; an IPC transfer delivers the destination handle.
 
-A `CSpace` bound to the running thread cannot be torn down mid-syscall (the
-teardown first stops and deschedules every bound thread), so the syscall
-paths and the call and reply directions of IPC transfer need nothing more.
-The receive direction moves out of a parked sender's `CSpace`: the receiver
-holds a reference on that `CSpace`'s wrapper across the transfer so its
-teardown drain — which would orphan the in-flight destination into a
-derivation root — cannot run between batches. If that reference turns out to
-be the last, the `CSpace` is queued for the CPU's deferred reclaim and torn
-down from the syscall epilogue, not inside IPC delivery. A capability whose
-source and destination an ancestor's revoke both freed mid-transfer is
-delivered as handle 0 (the permanently null slot): the revoke won, exactly as
-if it had landed just after delivery.
+Neither slot pins its `CSpace` against teardown; the later batches resolve
+both through the registry, so a `CSpace` torn down meanwhile is observed as
+gone rather than dereferenced. The drain of a dying `CSpace` treats its
+in-flight slots like any other: the children hanging under a dying slot
+become derivation roots (the standard teardown semantic above) — the
+destination and its migrated children when the source's `CSpace` dies (the
+move then completes on the next batch, the destination now a root), the
+migrated children when the destination's `CSpace` dies (the move reports
+`InvalidState`, the source keeping the capability and its remaining
+children). A `CSpace` bound to the running thread cannot be torn down
+mid-syscall (the teardown first stops and deschedules every bound thread),
+so the source of `SYS_CAP_MOVE` and of the call and reply directions of IPC
+transfer never dies under a move; the receive direction's source belongs to
+a parked sender and can. When the freed source slot's reference was the last
+one to a `Thread`, `CSpace`, or `AddressSpace`, the object goes to the CPU's
+deferred reclaim rather than being torn down in place — a teardown stops
+bound threads and waits on other CPUs, which must not happen inside IPC
+delivery. A capability whose source and destination an ancestor's revoke
+both freed mid-transfer, or whose destination went with the receiver's
+`CSpace`, is delivered as handle 0 (the permanently null slot); one that
+trips the backstop is delivered live, the sender's slot surviving as its
+derivation parent.
 
 ### Safe Delegation: the "Derive Twice" Pattern
 

@@ -67,7 +67,7 @@ concurrent notification and queue events.
 |---|---|
 | `thread_lifecycle.rs` | Full thread lifecycle: create → configure → start → stop → read\_regs → write\_regs → resume → exit |
 | `cap_transfer.rs` | Cap rights flow through an IPC endpoint round-trip |
-| `cap_transfer_large.rs` | IPC transfer of a cap whose child list exceeds one reparent batch, both transfer directions |
+| `cap_transfer_large.rs` | IPC transfer of a cap with a multi-batch child list, both directions |
 | `wait_concurrency.rs` | Wait set with concurrent notification + queue sources |
 | `memory_lifecycle.rs` | Memory split → map → protect → unmap with aspace\_query at each step |
 | `multi_caller_ipc_fifo.rs` | Three concurrent IPC callers verify FIFO send-queue ordering |

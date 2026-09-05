@@ -439,7 +439,10 @@ every child's parent link, in batches with the derivation lock released between
 them when the list is large. While a move is in flight both slots are pinned —
 the same refusal an in-flight revocation imposes on its root — so no other
 operation can tear the migration, and every descendant stays within its
-ancestors' revocation reach at every point.
+ancestors' revocation reach throughout, with one exception the kernel shares
+with every other slot: a CSpace torn down while the move is in flight releases
+the children hanging under its dying slots as derivation roots. See
+[capability-internals.md](../core/kernel/docs/capability-internals.md) § Move.
 
 
 ---

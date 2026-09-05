@@ -1100,18 +1100,24 @@ unsafe fn deferred_link(ptr: NonNull<KernelObjectHeader>) -> *mut *mut KernelObj
     }
 }
 
-/// Push an object whose free cannot complete on this CPU onto the CPU's
+/// Push an object whose free must not complete here onto this CPU's
 /// deferred-reclaim stack.
 ///
-/// A thread deleting the last capability to its own `Thread` object cannot
-/// run `dealloc_object`'s drain gate, which spins until the target TCB is no
-/// longer `current` on any CPU (#341); a thread deleting the last capability
-/// to its own `CSpace` or `AddressSpace` — directly, or through the cascade
-/// of another object's teardown — cannot free storage it is executing on
-/// (its slot pages, its root page table). In each case the arm marks the
-/// thread `Exited`, pushes the object here, and returns; the syscall
-/// epilogue then `schedule()`s away and [`drain_deferred_reclaim`] completes
-/// the free from a context that is provably not a bound thread.
+/// Two producers. A thread deleting the last capability to its own `Thread`
+/// object cannot run `dealloc_object`'s drain gate, which spins until the
+/// target TCB is no longer `current` on any CPU (#341); a thread deleting
+/// the last capability to its own `CSpace` or `AddressSpace` — directly, or
+/// through the cascade of another object's teardown — cannot free storage
+/// it is executing on (its slot pages, its root page table). In each case
+/// the arm marks the thread `Exited`, pushes the object here, and returns;
+/// the syscall epilogue then `schedule()`s away and
+/// [`drain_deferred_reclaim`] completes the free from a context that is
+/// provably not a bound thread. Second, a batched capability move whose
+/// freed source slot held the last reference to a `Thread`, `CSpace`, or
+/// `AddressSpace` (`cap::transfer::release_moved_object`) pushes it from a
+/// live thread — possibly one bound to it, and possibly from inside IPC
+/// delivery, where a teardown's bound-thread stop and cross-CPU waits must
+/// not run.
 ///
 /// # Safety
 /// `ptr` is an exclusively-owned `Thread`, `CSpaceObj`, or `AddressSpace`
@@ -1150,18 +1156,21 @@ pub(crate) unsafe fn push_deferred_reclaim(cpu: usize, ptr: NonNull<KernelObject
 /// storage).
 ///
 /// Called from the syscall epilogue (when the returning thread is alive) and
-/// the idle loop — both contexts that are NOT one of the queued dead threads
-/// and are bound to none of the queued objects, so re-entering
+/// the idle loop — neither is one of the queued dead threads, so re-entering
 /// `dealloc_object` runs the normal arm: the Thread arm's `current`-anywhere
 /// scan and `context_saved` gate pass on the first iteration, and the
-/// `CSpace`/`AddressSpace` arms find their bound threads already `Exited`
-/// and off-CPU.
+/// `CSpace`/`AddressSpace` arms stop whatever threads are still bound (a
+/// self-teardown producer left them `Exited` and off-CPU already; a move
+/// producer may have left them live). If the draining thread is itself
+/// bound to a queued object, that arm stops it, re-queues the object
+/// through `defer_self_teardown`, and returns; the epilogue's post-drain
+/// `Exited` check then schedules the thread away and the next drain on this
+/// CPU completes the free.
 ///
 /// # Safety
-/// Must not run on a thread whose own object is queued here, or that is
-/// bound to a queued object; the producer contract guarantees this — a
-/// thread that queued an object here is `Exited`, reaches the Exited arm of
-/// the syscall epilogue, and `schedule()`s away, never the drain arm.
+/// Must not run on a thread whose own object is queued here: a thread that
+/// queued its own object is `Exited`, reaches the Exited arm of the syscall
+/// epilogue, and `schedule()`s away, never the drain arm.
 // cast_ptr_alignment: the `*mut u8` head only ever holds an object pointer
 // stored by push_deferred_reclaim (header at offset 0, 8-byte aligned).
 #[allow(clippy::cast_ptr_alignment)]

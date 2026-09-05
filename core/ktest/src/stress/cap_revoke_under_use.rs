@@ -9,9 +9,9 @@
 //!
 //! `BALLAST_CHILDREN` extra derived caps pad the subtree past one revoke
 //! batch (`MAX_REVOKE_EDITS` in the kernel), so the revoke runs multi-batch
-//! with the root pinned by the revoke-in-progress marker while the sender
+//! with the root pinned (`CapabilitySlot::pinned`) while the sender
 //! threads are live. The cleanup `cap_delete(root)` doubles as the check
-//! that the marker was released when the revoke completed.
+//! that the pin was released when the revoke completed.
 
 use syscall::{
     cap_copy, cap_create_notification, cap_delete, cap_derive, cap_revoke, notification_send,

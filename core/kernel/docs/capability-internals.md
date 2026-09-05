@@ -718,17 +718,20 @@ on init's user stack before it begins execution.
 ## Capability Transfer in IPC
 
 IPC capability transfer (via `SYS_IPC_CALL` and `SYS_IPC_REPLY` capability slots)
-moves all of a message's capabilities or none of them; a refused transfer does
-not block message delivery (see
-[docs/ipc-design.md](../../../docs/ipc-design.md) § Message Format). Each
+begins the move of all of a message's capabilities or of none of them —
+all-or-nothing at commit; a refused transfer does not block message delivery
+(see [docs/ipc-design.md](../../../docs/ipc-design.md) § Message Format). Each
 capability is relocated by the batched move described under [Move](#move):
 
 ```
-transfer_caps(sender, handles, receiver):
-    validate every handle: distinct, occupied, generation current, not pinned
-    pre-allocate len(handles) slots in receiver's CSpace
-    one hold (derivation lock + both CSpace locks, pointer order):
-        revalidate; begin every move (insert dst, pin both, first batch)
+transfer_caps(sender_tcb, handles, receiver_tcb):
+    one hold (derivation lock, then both CSpace locks in pointer order):
+        resolve both CSpaces through the registry from the identity each
+            TCB carries (cspace_id, cspace_epoch); either gone → refuse
+        validate every handle: distinct, occupied, generation current,
+            not pinned
+        pre-allocate len(handles) slots in the receiver's CSpace
+        begin every move (insert dst, pin both, first batch)
     drive each move that did not finish, one batch per hold
     deliver the destination handles
     // The moved cap takes the source's position in the derivation tree: its
@@ -739,8 +742,10 @@ transfer_caps(sender, handles, receiver):
     // this slot.
 ```
 
-IPC capability transfer is always cross-`CSpace` (sender and receiver are distinct
-processes). The transferred cap keeps its position in the derivation tree, so it
+IPC capability transfer is normally cross-`CSpace` (sender and receiver in
+distinct processes); two threads sharing one `CSpace` can transfer between
+themselves, the lock pair collapsing to a single acquisition. The transferred
+cap keeps its position in the derivation tree, so it
 remains reachable by a `cap_revoke` on one of its ancestors; per-slot generation
 handles make the receiver's handle fail closed if such a revoke frees the
 receiver's slot (#349). A move that finishes in the first hold is atomic against

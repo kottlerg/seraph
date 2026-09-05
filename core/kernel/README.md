@@ -58,7 +58,8 @@ kernel/
 │   │   ├── derivation.rs       # Derivation tree, revocation algorithm
 │   │   ├── object.rs           # Kernel object headers, allocation, teardown
 │   │   ├── retype.rs           # Memory-cap retype allocator (object carving)
-│   │   └── split.rs            # Shared tail of the range-cap split syscalls
+│   │   ├── split.rs            # Shared tail of the range-cap split syscalls
+│   │   └── transfer.rs         # Batched capability move (SYS_CAP_MOVE, IPC transfer)
 │   ├── entropy/                # Entropy subsystem and per-CPU CSPRNG
 │   │   ├── mod.rs              # Storage alloc, seeding, draw API (fill_bytes)
 │   │   ├── keccak.rs           # Keccak-f[1600] permutation (FIPS 202)
@@ -127,7 +128,9 @@ The capability subsystem. `cspace.rs` implements per-process capability spaces.
 bitmask. `derivation.rs` maintains the global derivation tree used for revocation.
 `object.rs` defines the kernel object headers and wrappers and their allocation and
 teardown; `retype.rs` is the allocator that carves kernel objects out of Memory-cap
-backing; `split.rs` is the tail shared by the range-capability split syscalls.
+backing; `split.rs` is the tail shared by the range-capability split syscalls;
+`transfer.rs` moves a capability, with its derived children, to another slot in
+batches — the mechanism behind `SYS_CAP_MOVE` and IPC capability transfer.
 See [`docs/capability-internals.md`](docs/capability-internals.md).
 
 ### `entropy/`

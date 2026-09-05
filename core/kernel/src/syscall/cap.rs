@@ -993,6 +993,10 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         let cs_obj = unsafe { &*(obj.as_ptr().cast::<CSpaceKernelObject>()) };
         cs_obj.cspace
     };
+    // The registry identity stamped into the TCB. Two unsynchronised reads;
+    // the post-registration lookup below (`bound`) proves the object never
+    // reached refcount 0 between here and the bind, so it was neither
+    // unregistered nor re-epoched and the pair still names it.
     // SAFETY: new_cs_ptr is the live CSpace of the object resolved above.
     let new_cs_id = unsafe { (*new_cs_ptr).id() };
     let new_cs_epoch = crate::cap::registry_epoch(new_cs_id);

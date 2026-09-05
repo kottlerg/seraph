@@ -158,12 +158,13 @@ unsafe fn write_cap_results(buf: u64, cap_count: usize, handles: &[u32; MSG_CAP_
 // ── Capability transfer ───────────────────────────────────────────────────────
 
 /// Validate a set of transfer source slots: distinct, non-null, and not
-/// pinned by an in-flight revoke or move. The single authoritative predicate for
-/// every cap-transfer direction — `sys_ipc_call`'s fail-fast reject before
-/// blocking, and `transfer_caps`' unlocked fast path and locked
-/// re-validation. A refusal detected only after a caller has blocked
-/// degrades to zero-cap delivery without notifying the sender, which is
-/// why the call path must run this before parking.
+/// pinned by an in-flight revoke or move. The single authoritative predicate
+/// for every cap-transfer direction — `sys_ipc_call`'s and `sys_ipc_reply`'s
+/// fail-fast rejects on the running thread's own `CSpace`, and
+/// `transfer_caps`' validation under the locks it moves under. A refusal
+/// detected only after a caller has blocked degrades to zero-cap delivery
+/// without notifying the sender, which is why the call path must run this
+/// before parking.
 #[cfg(not(test))]
 fn prevalidate_transfer_slots(cs: &CSpace, handles: &[u32]) -> Result<(), SyscallError>
 {
@@ -1020,10 +1021,12 @@ pub fn sys_ipc_reply(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             // BlockedOnReply to Ready and clears (*server).reply_tcb; if cap
             // transfer were to fail after that, the caller would be Ready but
             // never enqueued and unreachable by cancel_ipc_block. Pre-allocating
-            // here guarantees the post-`endpoint_reply` cap move cannot OOM.
-            // The inner pre_allocate inside `transfer_caps` remains as
-            // defense-in-depth against concurrent CSpace mutation in the
-            // unlocked window before its dst-CSpace lock acquisition.
+            // here guarantees the post-`endpoint_reply` cap move cannot OOM;
+            // `transfer_caps` pre-allocates again under the locks it moves
+            // under, so a slot consumed meanwhile is still covered. The
+            // caller is parked and holds no reference on its CSpace, so it is
+            // resolved through the registry under DERIVATION_LOCK (see
+            // `transfer_caps`) rather than dereferenced from the TCB.
             // SAFETY: tcb validated above; reply_tcb field always valid in TCB.
             let caller_peek =
                 unsafe { (*tcb).reply_tcb.load(core::sync::atomic::Ordering::Acquire) };
@@ -1034,24 +1037,36 @@ pub fn sys_ipc_reply(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             }
             // SAFETY: caller_peek non-null; magic check guards UAF in debug builds.
             debug_assert!(unsafe { (*caller_peek).magic } == crate::sched::thread::TCB_MAGIC);
-            // SAFETY: caller_peek is a valid TCB; cspace is set at TCB creation
-            // and never reassigned.
-            let caller_cspace = unsafe { (*caller_peek).cspace };
-            // SAFETY: caller_cspace extracted from valid TCB; lock_raw/unlock_raw paired.
+            // SAFETY: caller_peek is a valid TCB (the reply protocol pins it);
+            // the CSpace pointer is registry-resolved under the lock;
+            // lock_raw/unlock_raw paired.
             let pre_res = unsafe {
-                let saved = (*caller_cspace).lock.lock_raw();
-                let r = (*caller_cspace).pre_allocate(cap_count);
-                (*caller_cspace).lock.unlock_raw(saved);
+                crate::cap::DERIVATION_LOCK.write_lock();
+                let r = match crate::cap::lookup_cspace(
+                    (*caller_peek).cspace_id,
+                    (*caller_peek).cspace_epoch,
+                )
+                {
+                    Some(cs) =>
+                    {
+                        let saved = (*cs).lock.lock_raw();
+                        let r = (*cs).pre_allocate(cap_count);
+                        (*cs).lock.unlock_raw(saved);
+                        r.map_err(SyscallError::from)
+                    }
+                    None => Err(SyscallError::InvalidCapability),
+                };
+                crate::cap::DERIVATION_LOCK.write_unlock();
                 r
             };
             if let Err(e) = pre_res
             {
-                // Caller's CSpace cannot accept reply caps. Wake the caller with
-                // a synthetic failure reply so it un-parks and surfaces the error
-                // rather than dead-locking; bubble the pool/structural-ceiling
-                // distinction to the server.
+                // Caller's CSpace cannot accept reply caps, or is gone. Wake the
+                // caller with a synthetic failure reply so it un-parks and
+                // surfaces the error rather than dead-locking; bubble the
+                // pool/structural-ceiling distinction to the server.
                 // SAFETY: tcb validated above.
-                return Err(unsafe { fail_reply_and_wake_caller(tcb, e.into()) });
+                return Err(unsafe { fail_reply_and_wake_caller(tcb, e) });
             }
         }
     }

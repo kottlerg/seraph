@@ -419,8 +419,11 @@ unsafe fn move_cap_step(mv: &CapMove, src_lock: SourceLock) -> MoveStep
         take_source_position(mv);
         free_source(mv, src_lock)
     };
-    // A source whose CSpace unregistered before this hold keeps its slot
-    // occupied for the teardown's cascade to release; nothing to drop here.
+    // Guard, unreachable by construction: the source resolved through the
+    // registry under this hold (the caller's validation, or `live`), so it
+    // resolves for the free. Kept so the `Done` contract stays true should
+    // a caller ever validate the source another way — a source whose CSpace
+    // has unregistered keeps its slot for that teardown's cascade to release.
     MoveStep::Done {
         handle: mv.handle,
         release: freed.then_some(mv.object),

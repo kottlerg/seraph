@@ -745,9 +745,9 @@ transfer_caps(sender_tcb, handles, receiver_tcb):
 IPC capability transfer is normally cross-`CSpace` (sender and receiver in
 distinct processes); two threads sharing one `CSpace` can transfer between
 themselves, the lock pair collapsing to a single acquisition. The transferred
-cap keeps its position in the derivation tree, so it
-remains reachable by a `cap_revoke` on one of its ancestors; per-slot generation
-handles make the receiver's handle fail closed if such a revoke frees the
+cap keeps its position in the derivation tree, so it remains reachable by a
+`cap_revoke` on one of its ancestors; per-slot generation handles make the
+receiver's handle fail closed if such a revoke frees the
 receiver's slot (#349). A move that finishes in the first hold is atomic against
 revocation; one that needs further batches is protected by the in-flight pins
 and stays revocation-complete between holds (see [Move](#move)).

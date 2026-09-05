@@ -219,6 +219,10 @@ pub struct CSpace
     next_leaf: u32,
     /// Total usable slots allocated across all pages (excludes slot 0).
     allocated_slots: usize,
+    /// Slot-page pool exhaustions seen by `grow`, for the throttled
+    /// diagnostic (logged at powers of two). Atomic only because the grow
+    /// path holds `&self`; it is written under the `CSpace` lock.
+    pool_exhaustions: core::sync::atomic::AtomicU32,
     /// Head of the intrusive free list; None if no free slots.
     ///
     /// Slot 0 is permanently null and never placed on the free list, so the
@@ -256,6 +260,7 @@ impl CSpace
             indirect: core::array::from_fn(|_| AtomicPtr::new(core::ptr::null_mut())),
             next_leaf: 0,
             allocated_slots: 0,
+            pool_exhaustions: core::sync::atomic::AtomicU32::new(0),
             free_head: None,
             free_count: 0,
             lock: crate::sync::Spinlock::new(),
@@ -362,11 +367,24 @@ impl CSpace
             let Some(phys) = (unsafe { (*kobj_ptr).alloc_slot_page() })
             else
             {
-                crate::kprintln!(
-                    "cspace {}: slot-page pool exhausted (allocated={})",
-                    self.id,
-                    self.allocated_slots
-                );
+                // Logged at powers of two (the #365 pattern): a userspace
+                // loop retrying an insert, a reply, or a transfer into a
+                // pool-starved CSpace reaches this under the derivation
+                // lock, and a console write per attempt must not serialise
+                // behind it.
+                let occurrence = self
+                    .pool_exhaustions
+                    .fetch_add(1, Ordering::Relaxed)
+                    .wrapping_add(1);
+                if occurrence.is_power_of_two()
+                {
+                    crate::kprintln!(
+                        "cspace {}: slot-page pool exhausted (allocated={} occurrence={})",
+                        self.id,
+                        self.allocated_slots,
+                        occurrence
+                    );
+                }
                 return Err(CapError::PoolExhausted);
             };
             let virt = crate::mm::paging::phys_to_virt(phys);

@@ -689,8 +689,9 @@ derivation lock: as for `SYS_CAP_DERIVE`.
 
 **Errors:** `InvalidArgument` (badge is zero or source already badged),
 `InvalidCapability` (source invalid, null, or freed meanwhile), `InvalidState` (a
-`SYS_CAP_REVOKE` is in flight on the source), `OutOfMemory` (slot-page pool
-exhausted), `QuotaExceeded` (caller's CSpace directory structurally full).
+`SYS_CAP_REVOKE` or `SYS_CAP_MOVE` is in flight on the source), `OutOfMemory`
+(slot-page pool exhausted), `QuotaExceeded` (caller's CSpace directory
+structurally full).
 
 ---
 
@@ -1712,8 +1713,9 @@ consumed stay spent.
 The source is revalidated under the derivation lock before the copy is linked
 beneath it (see [capability-internals.md](capability-internals.md) § Global
 Derivation Lock): a source a concurrent delete, move, or revoke freed meanwhile
-fails with `InvalidCapability`, and one with a `SYS_CAP_REVOKE` in flight with
-`InvalidState`. With a non-zero `dst_slot`, if every other reference to the
+fails with `InvalidCapability`, and one with a `SYS_CAP_REVOKE` or
+`SYS_CAP_MOVE` in flight with `InvalidState`. With a non-zero `dst_slot`, if
+every other reference to the
 destination CSpace goes while the call is backing the leaves up to that index,
 the call reclaims that CSpace and fails with `InvalidCapability`; a caller bound
 to it is stopped and the call never returns.

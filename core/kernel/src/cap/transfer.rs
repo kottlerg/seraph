@@ -231,7 +231,7 @@ unsafe fn stage_move(
 /// released here.
 pub fn move_cap_drive(mv: CapMove) -> MoveStep
 {
-    use super::derivation::DERIVATION_LOCK;
+    use super::derivation::{DERIVATION_LOCK, MAX_REPARENT_BATCHES};
 
     // The first batch ran in `move_cap_begin`.
     let mut batches: u32 = 1;
@@ -240,7 +240,7 @@ pub fn move_cap_drive(mv: CapMove) -> MoveStep
     {
         DERIVATION_LOCK.write_lock();
         // SAFETY: DERIVATION_LOCK held.
-        let step = unsafe { drive_batch(&mv, &mut batches) };
+        let step = unsafe { drive_batch(&mv, &mut batches, MAX_REPARENT_BATCHES) };
         DERIVATION_LOCK.write_unlock();
 
         match step
@@ -265,15 +265,15 @@ pub fn move_cap_drive(mv: CapMove) -> MoveStep
 }
 
 /// One `move_cap_drive` hold: revalidate both slots, then run a batch or
-/// settle the move according to which of them survived.
+/// settle the move according to which of them survived. `backstop` is the
+/// batch count at which a still-pending move is abandoned
+/// (`MAX_REPARENT_BATCHES`; the host tests lower it to reach that arm).
 ///
 /// # Safety
 ///
 /// Caller must hold `DERIVATION_LOCK` for writing.
-unsafe fn drive_batch(mv: &CapMove, batches: &mut u32) -> MoveStep
+unsafe fn drive_batch(mv: &CapMove, batches: &mut u32, backstop: u32) -> MoveStep
 {
-    use super::derivation::MAX_REPARENT_BATCHES;
-
     // SAFETY: caller contract; `live` resolves through the registry.
     let (src_live, dst_live) = unsafe {
         (
@@ -309,7 +309,7 @@ unsafe fn drive_batch(mv: &CapMove, batches: &mut u32) -> MoveStep
             // CSpace lock is held.
             let step = unsafe { move_cap_step(mv, SourceLock::Take) };
             if let MoveStep::Pending(_) = step
-                && *batches >= MAX_REPARENT_BATCHES
+                && *batches >= backstop
             {
                 // Liveness backstop: leave the destination where the step
                 // re-linked it, as a derived child of the source.
@@ -858,6 +858,53 @@ mod tests
             obj.expect("object").as_ref().dec_ref();
         }
         DERIVATION_LOCK.write_unlock();
+    }
+
+    #[test]
+    fn backstop_abandons_destination_as_derived_child_of_source()
+    {
+        const ID_A: CSpaceId = 3215;
+        const ID_B: CSpaceId = 3216;
+        let a = mk_registered_cspace(ID_A);
+        let b = mk_registered_cspace(ID_B);
+        let obj = mk_object();
+        // Three batches' worth, so the second batch is still pending when
+        // a backstop of two trips.
+        let (root, src, sib, kids, handle) = mk_tree(a, ID_A, 2 * MAX_REPARENT_EDITS + 8, obj);
+        let MoveStep::Pending(mv) = begin(a, handle, b, None).expect("begin")
+        else
+        {
+            panic!("expected a pending move");
+        };
+        let dst = dst_of(ID_B, mv.handle());
+
+        let mut batches: u32 = 1;
+        DERIVATION_LOCK.write_lock();
+        // SAFETY: DERIVATION_LOCK held; both slots live.
+        let step = unsafe { drive_batch(&mv, &mut batches, 2) };
+        DERIVATION_LOCK.write_unlock();
+
+        let MoveStep::Abandoned { handle } = step
+        else
+        {
+            panic!("a pending second batch at the backstop is abandoned: {step:?}");
+        };
+        assert_eq!(handle, mv.handle());
+        let d = snap(dst).expect("destination live");
+        let s = snap(src).expect("source live");
+        assert!(!d.pinned && !s.pinned, "both pins cleared");
+        assert_eq!(
+            d.parent,
+            Some(src),
+            "destination left a derived child of the source"
+        );
+        assert_eq!(s.parent, Some(root));
+        assert_eq!(s.next, Some(sib), "source keeps its position");
+        assert_eq!(parents_under(&kids, dst), 2 * MAX_REPARENT_EDITS);
+        assert_eq!(parents_under(&kids, src), 8);
+        assert_eq!(refcount(obj), 2, "both slots keep their references");
+        crate::cap::unregister_cspace(ID_A);
+        crate::cap::unregister_cspace(ID_B);
     }
 
     #[test]

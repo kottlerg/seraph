@@ -80,14 +80,18 @@ kernel/
 │   ├── sched/                  # Scheduler
 │   │   ├── mod.rs              # Public API: init, schedule, timer_tick, wake protocol
 │   │   ├── thread.rs           # Thread control block (TCB) definition
+│   │   ├── thread_registry.rs  # Live-thread registry: teardown stops, watchdog walks
 │   │   └── run_queue.rs        # Per-CPU run queues and priority levels
 │   └── syscall/                # Syscall dispatch
-│       ├── mod.rs              # Dispatch table and entry coordination
-│       ├── ipc.rs              # IPC syscall implementations
+│       ├── mod.rs              # Dispatch table, entry coordination, thread syscalls
 │       ├── cap.rs              # Capability syscall implementations
-│       ├── mm.rs               # Memory syscall implementations
-│       ├── thread.rs           # Thread syscall implementations
-│       └── wait.rs             # Wait set syscall implementations
+│       ├── entropy.rs          # SYS_GETRANDOM
+│       ├── hw.rs               # MMIO, IRQ, and I/O-port syscalls and their splits
+│       ├── ipc.rs              # IPC syscall implementations
+│       ├── mem.rs              # Memory syscall implementations
+│       ├── sbi.rs              # SYS_SBI_CALL (riscv64)
+│       ├── sysinfo.rs          # SYS_SYSTEM_INFO
+│       └── thread.rs           # Thread lifecycle syscalls (stop, regs, sleep)
 └── docs/
     ├── arch-interface.md       # Architecture abstraction layer and dispatch surface
     ├── initialization.md       # Boot-to-init sequence, phase by phase

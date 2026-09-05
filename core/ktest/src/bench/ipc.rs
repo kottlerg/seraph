@@ -18,11 +18,29 @@ use crate::{ChildStack, spawn};
 
 static mut BENCH_IPC_STACK: ChildStack = ChildStack::ZERO;
 
+/// The caller child's arguments, handed to `ipc_caller_entry` by address.
+#[derive(Clone, Copy)]
+struct CallerArgs
+{
+    ep: u32,
+    done: u32,
+    n: u64,
+}
+
+static CALLER_ARGS: spawn::ArgBlock<CallerArgs, 1> = spawn::ArgBlock::new(CallerArgs {
+    ep: 0,
+    done: 0,
+    n: 0,
+});
+
 fn ipc_caller_entry(arg: u64) -> !
 {
-    let ep_slot = (arg & 0xFFFF) as u32;
-    let done_slot = ((arg >> 16) & 0xFFFF) as u32;
-    let n = arg >> 32;
+    // SAFETY: `arg` is the entry the bench published for this child.
+    let CallerArgs {
+        ep: ep_slot,
+        done: done_slot,
+        n,
+    } = unsafe { spawn::child_args(arg) };
 
     // Register the shared IPC buffer for this child thread.
     let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
@@ -78,7 +96,17 @@ pub(super) fn bench_ipc_round_trip(ctx: &crate::TestContext, iters: u32)
         return;
     };
 
-    let arg = u64::from(child_ep) | (u64::from(child_done) << 16) | (n << 32);
+    // SAFETY: the single child has not been started yet.
+    let arg = unsafe {
+        CALLER_ARGS.publish(
+            0,
+            CallerArgs {
+                ep: child_ep,
+                done: child_done,
+                n,
+            },
+        )
+    };
     let stack_top = ChildStack::top(core::ptr::addr_of!(BENCH_IPC_STACK));
 
     if spawn::configure_and_start(&child, ipc_caller_entry, stack_top, arg).is_err()

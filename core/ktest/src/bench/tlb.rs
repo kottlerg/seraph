@@ -26,7 +26,7 @@
 //! yields and call `thread_exit` themselves. By the time the parent
 //! calls `cap_delete`, every worker is already Exited.
 
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use syscall::{
     cap_create_notification, cap_delete, notification_send, notification_wait, system_info,
@@ -44,6 +44,21 @@ use crate::{ChildStack, spawn};
 const MAX_PINNED: usize = 7;
 static mut SHOOTDOWN_STACKS: [ChildStack; MAX_PINNED] = [const { ChildStack::ZERO }; MAX_PINNED];
 
+/// Per-worker arguments, handed to `shootdown_spinner_entry` by address.
+#[derive(Clone, Copy)]
+struct SpinnerArgs
+{
+    ready: u32,
+    done: u32,
+    bit_index: usize,
+}
+
+static SPINNER_ARGS: spawn::ArgBlock<SpinnerArgs, MAX_PINNED> = spawn::ArgBlock::new(SpinnerArgs {
+    ready: 0,
+    done: 0,
+    bit_index: 0,
+});
+
 /// Set by the parent before its `cap_delete` cleanup. Workers poll this
 /// between yields and exit cleanly when set; the parent then `notification_wait`s
 /// on the per-worker exited-bits before deleting any Thread cap, so
@@ -55,18 +70,19 @@ static EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 /// notify the parent's `done_slot` with the same unique bit so the
 /// parent knows it's safe to `cap_delete`.
 ///
-/// `arg` packs `ready_slot[15:0] | done_slot[31:16] | bit_index[39:32]`.
-/// Unique bits matter: the kernel's notification cap is a 64-bit OR-accumulator,
+/// `arg`: address of this worker's [`SpinnerArgs`]. Unique bits matter: the
+/// kernel's notification cap is a 64-bit OR-accumulator,
 /// so if all workers sent the same bit (`0x1`), N concurrent
 /// `notification_send`s collapse to one wakeup and the parent's `notification_wait`
 /// loop hangs on the second iteration.
-// cast_possible_truncation: slot indices and bit index fit in their packed widths.
-#[allow(clippy::cast_possible_truncation)]
 fn shootdown_spinner_entry(arg: u64) -> !
 {
-    let ready_slot = (arg & 0xFFFF) as u32;
-    let done_slot = ((arg >> 16) & 0xFFFF) as u32;
-    let bit_index = ((arg >> 32) & 0xFF) as u32;
+    // SAFETY: `arg` is the entry the bench published for this worker.
+    let SpinnerArgs {
+        ready: ready_slot,
+        done: done_slot,
+        bit_index,
+    } = unsafe { spawn::child_args(arg) };
     let bit = 1u64 << bit_index;
 
     notification_send(ready_slot, bit).ok();
@@ -143,8 +159,17 @@ pub(super) fn bench_tlb_shootdown(ctx: &crate::TestContext, iters: u32)
         // i runs 0..pin_count ≤ MAX_PINNED ≤ 7; fits in u32.
         #[allow(clippy::cast_possible_truncation)]
         let cpu = (i + 1) as u32;
-        // Pack: ready[15:0], done[31:16], done_bit_index[39:32].
-        let arg = u64::from(child_ready) | (u64::from(child_done) << 16) | ((i as u64) << 32);
+        // SAFETY: worker `i` has not been started yet; each is started once.
+        let arg = unsafe {
+            SPINNER_ARGS.publish(
+                i,
+                SpinnerArgs {
+                    ready: child_ready,
+                    done: child_done,
+                    bit_index: i,
+                },
+            )
+        };
         if spawn::configure_and_start_pinned(&child, shootdown_spinner_entry, stack_top, arg, cpu)
             .is_err()
         {
@@ -295,13 +320,26 @@ const CONC_VA_STRIDE: u64 = 0x1_0000;
 // `teardown` helper's fixed-size signature.
 static mut CONC_STACKS: [ChildStack; MAX_PINNED] = [const { ChildStack::ZERO }; MAX_PINNED];
 
-/// Child-cspace slot of each worker's Memory cap, indexed by worker bit-index.
-/// Set by the parent before starting each worker; read by the worker. (Arg
-/// packing has no room for both memory and aspace slots alongside the notification
-/// slots, so these go through statics.)
-static CONC_MEMORY_SLOT: [AtomicU32; MAX_PINNED] = [const { AtomicU32::new(0) }; MAX_PINNED];
-/// Child-cspace slot of each worker's aspace cap, indexed by worker bit-index.
-static CONC_ASPACE_SLOT: [AtomicU32; MAX_PINNED] = [const { AtomicU32::new(0) }; MAX_PINNED];
+/// Per-worker arguments, handed to `conc_worker_entry` by address.
+#[derive(Clone, Copy)]
+struct ConcArgs
+{
+    ready: u32,
+    done: u32,
+    memory: u32,
+    aspace: u32,
+    bit_index: usize,
+    iters: u64,
+}
+
+static CONC_ARGS: spawn::ArgBlock<ConcArgs, MAX_PINNED> = spawn::ArgBlock::new(ConcArgs {
+    ready: 0,
+    done: 0,
+    memory: 0,
+    aspace: 0,
+    bit_index: 0,
+    iters: 0,
+});
 
 /// Release barrier: workers spin here after notifying ready so every worker
 /// starts its measured loop at the same instant (maximising overlap, which is
@@ -346,25 +384,25 @@ fn conc_map_fold(d: u64)
     CONC_MAP_MAX.fetch_max(d, Ordering::Relaxed);
 }
 
-/// Concurrent-initiator worker. `arg` packs
-/// `ready[15:0] | done[31:16] | bit_index[39:32] | iters[63:40]` — the
-/// iteration count is capped at the 24-bit lane (far above any bench `iters`).
+/// Concurrent-initiator worker. `arg`: address of this worker's
+/// [`ConcArgs`].
 ///
 /// Each worker sends its unique `1 << bit_index` on both `ready` and `done`;
 /// the kernel notification cap OR-accumulates, so identical bits from concurrent
 /// workers would collapse to one wakeup and hang the parent's wait loop.
-// cast_possible_truncation: packed fields fit their lanes by construction.
-#[allow(clippy::cast_possible_truncation)]
 fn conc_worker_entry(arg: u64) -> !
 {
-    let ready_slot = (arg & 0xFFFF) as u32;
-    let done_slot = ((arg >> 16) & 0xFFFF) as u32;
-    let bit_index = ((arg >> 32) & 0xFF) as usize;
-    let iters = (arg >> 40) & 0xFF_FFFF;
+    // SAFETY: `arg` is the entry the bench published for this worker.
+    let ConcArgs {
+        ready: ready_slot,
+        done: done_slot,
+        memory,
+        aspace,
+        bit_index,
+        iters,
+    } = unsafe { spawn::child_args(arg) };
     let bit = 1u64 << bit_index;
 
-    let memory = CONC_MEMORY_SLOT[bit_index].load(Ordering::Acquire);
-    let aspace = CONC_ASPACE_SLOT[bit_index].load(Ordering::Acquire);
     let va = CONC_VA_BASE + (bit_index as u64) * CONC_VA_STRIDE;
 
     // Ready, then wait for the common GO so all initiators contend together.
@@ -499,19 +537,26 @@ pub(super) fn bench_tlb_shootdown_concurrent(ctx: &crate::TestContext, iters: u3
             break;
         };
 
-        CONC_MEMORY_SLOT[i].store(child_memory, Ordering::Release);
-        CONC_ASPACE_SLOT[i].store(child_aspace, Ordering::Release);
-
         // SAFETY: bench tier runs sequentially; this is the only use of
         // CONC_STACKS[i].
         let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(CONC_STACKS[i]) });
         // i < allocated ≤ want ≤ cpus-1, so CPU index i+1 is online.
         #[allow(clippy::cast_possible_truncation)]
         let cpu = (i + 1) as u32;
-        let arg = u64::from(child_ready)
-            | (u64::from(child_done) << 16)
-            | ((i as u64) << 32)
-            | (u64::from(iters & 0xFF_FFFF) << 40);
+        // SAFETY: worker `i` has not been started yet; each is started once.
+        let arg = unsafe {
+            CONC_ARGS.publish(
+                i,
+                ConcArgs {
+                    ready: child_ready,
+                    done: child_done,
+                    memory: child_memory,
+                    aspace: child_aspace,
+                    bit_index: i,
+                    iters: u64::from(iters),
+                },
+            )
+        };
         if spawn::configure_and_start_pinned(&child, conc_worker_entry, stack_top, arg, cpu)
             .is_err()
         {

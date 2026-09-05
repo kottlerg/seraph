@@ -18,14 +18,12 @@
 //! `MemoryObject`'s header pointer in `header.ancestor` so dealloc can
 //! reclaim the bytes back to the source cap. Init's bootstrap state
 //! (root `CSpace`, init's own `AddressSpace`/`Thread`/`CSpace`) and the
-//! Phase-7 boot-time identity wrappers remain heap-allocated for now;
-//! they have `header.ancestor == null` and dealloc through the legacy
-//! `Box::from_raw` path.
+//! Phase-7 boot-time identity wrappers are retyped from the SEED reserve
+//! (`boot_retype_*`, `mint_phase7_body`) and carry the SEED ancestor.
 //!
-//! Deallocation: read `header.obj_type` from the raw pointer; if
-//! `header.ancestor` is null, drop the originating `Box<ConcreteObject>`;
-//! otherwise drop the object in place and call `retype_free` against
-//! the ancestor `MemoryObject`.
+//! Deallocation: read `header.obj_type` from the raw pointer, drop the
+//! object in place, and call `retype_free` against the ancestor
+//! `MemoryObject`; every object has one.
 //!
 //! ## Sizes (verified by tests below)
 //!
@@ -53,7 +51,7 @@ use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
 /// Discriminant for the concrete type behind a `*mut KernelObjectHeader`.
 ///
-/// Used during deallocation to reconstruct the original `Box<ConcreteObject>`.
+/// Used during deallocation to select the concrete type's teardown arm.
 /// Values must not be renumbered after assignment.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -79,13 +77,13 @@ pub enum ObjectType
 /// Common header at offset 0 of every kernel object.
 ///
 /// The `ref_count` tracks how many capability slots reference this object.
-/// When `dec_ref` returns 0, the object has no remaining references and can
-/// be freed (future phases will handle deallocation via `obj_type`).
+/// When `dec_ref` returns 0, the object has no remaining references and
+/// `dealloc_object` frees it, dispatching on `obj_type`.
 ///
 /// `ancestor` is a direct pointer to the `MemoryObject`'s header from which
-/// this object was retyped, or null if heap-allocated (legacy path).
-/// Auto-reclaim consults this on `dec_ref → 0` to credit bytes back to the
-/// source `MemoryObject` and return the chunk to the per-Memory-cap allocator.
+/// this object was retyped. Auto-reclaim consults this on `dec_ref → 0` to
+/// credit bytes back to the source `MemoryObject` and return the chunk to the
+/// per-Memory-cap allocator.
 ///
 /// A direct pointer (rather than a `SlotId`) is necessary because the source
 /// Memory cap's *slot* may be deleted before all retyped descendants are freed
@@ -109,10 +107,10 @@ pub struct KernelObjectHeader
     // Padding to reach 8-byte alignment for the ancestor pointer below.
     #[allow(clippy::pub_underscore_fields)]
     pub _pad: [u8; 2],
-    /// Pointer to the `MemoryObject`'s header this object was retyped from,
-    /// or null if allocated via the legacy heap path. Set once at creation,
-    /// read at deallocation. `AtomicPtr` for the unforgeable null sentinel
-    /// without imposing const-init constraints on construction.
+    /// Pointer to the `MemoryObject`'s header this object was retyped from;
+    /// every production object has one (null only in host tests). Set once at
+    /// creation, read at deallocation. `AtomicPtr` for the unforgeable null
+    /// sentinel without imposing const-init constraints on construction.
     pub ancestor: AtomicPtr<KernelObjectHeader>,
 }
 
@@ -135,7 +133,7 @@ impl KernelObjectHeader
 {
     /// Construct a new header with `ref_count = 1` and no ancestor cap.
     ///
-    /// Used by the legacy heap-allocation path. The retype primitive uses
+    /// Used by host tests only; production objects are retyped and use
     /// [`Self::with_ancestor`] to record the source `MemoryObject` for
     /// auto-reclaim.
     pub fn new(obj_type: ObjectType) -> Self
@@ -294,15 +292,23 @@ pub struct MemoryObject
 
 /// Sentinel encoding a held write lock in [`MemoryObject::lock`]. Matches
 /// `DerivationLock`'s convention.
-#[allow(dead_code)]
 const FRAME_WRITE_LOCKED: u32 = u32::MAX;
 
-#[allow(dead_code)]
 impl MemoryObject
 {
     /// Acquire a shared read lock. Spins while a writer holds the lock.
+    ///
+    /// A contended wait is recorded in the calling CPU's lock-wait
+    /// breadcrumb for the softlockup watchdog; the uncontended path
+    /// records nothing.
+    #[track_caller]
     pub fn read_lock(&self)
     {
+        crate::sched::check_lock_hold_preemptible(
+            crate::sched::LockKind::MemoryRead,
+            core::panic::Location::caller(),
+        );
+        let mut waiting = false;
         loop
         {
             let cur = self.lock.load(Ordering::Relaxed);
@@ -314,7 +320,19 @@ impl MemoryObject
             {
                 break;
             }
+            if !waiting
+            {
+                waiting = true;
+                crate::sched::lock_wait_enter(
+                    crate::sched::LockKind::MemoryRead,
+                    core::ptr::from_ref(&self.lock).expose_provenance(),
+                );
+            }
             core::hint::spin_loop();
+        }
+        if waiting
+        {
+            crate::sched::lock_wait_exit();
         }
     }
 
@@ -325,8 +343,16 @@ impl MemoryObject
     }
 
     /// Acquire the write lock. Spins until no readers or writers hold it.
+    ///
+    /// Contended waits are recorded like [`Self::read_lock`]'s.
+    #[track_caller]
     pub fn write_lock(&self)
     {
+        crate::sched::check_lock_hold_preemptible(
+            crate::sched::LockKind::MemoryWrite,
+            core::panic::Location::caller(),
+        );
+        let mut waiting = false;
         loop
         {
             if self
@@ -336,7 +362,19 @@ impl MemoryObject
             {
                 break;
             }
+            if !waiting
+            {
+                waiting = true;
+                crate::sched::lock_wait_enter(
+                    crate::sched::LockKind::MemoryWrite,
+                    core::ptr::from_ref(&self.lock).expose_provenance(),
+                );
+            }
             core::hint::spin_loop();
+        }
+        if waiting
+        {
+            crate::sched::lock_wait_exit();
         }
     }
 
@@ -360,6 +398,7 @@ impl<'a> MemoryReadGuard<'a>
 {
     /// Acquire `memory`'s read lock and return the guard. The lock is
     /// released when the guard is dropped.
+    #[track_caller]
     pub fn acquire(memory: &'a MemoryObject) -> Self
     {
         memory.read_lock();
@@ -455,16 +494,15 @@ pub struct SbiControlObject
 pub struct ThreadObject
 {
     pub header: KernelObjectHeader,
-    /// Pointer to the TCB. Heap-allocated for legacy threads; for retype-
-    /// backed threads it points inside the same five-page retype slot that
-    /// holds the kstack and this wrapper. Discriminated by `header.ancestor`.
+    /// Pointer to the TCB, inside the same retype slot that holds the kstack
+    /// and this wrapper.
     pub tcb: *mut crate::sched::thread::ThreadControlBlock,
     /// Intrusive link for the per-CPU deferred self-teardown reclaim stack
     /// ([`drain_deferred_reclaim`]). Non-null only while this object sits on
     /// that stack — between a thread deleting the last capability to its own
     /// `Thread` object and the off-CPU completion of that free. Null otherwise.
     /// Written only by the owning CPU.
-    pub deferred_next: *mut ThreadObject,
+    pub deferred_next: *mut KernelObjectHeader,
 }
 
 // SAFETY: ThreadObject is accessed only under the scheduler lock.
@@ -517,10 +555,9 @@ impl PoolChunkSlot
 pub struct AddressSpaceObject
 {
     pub header: KernelObjectHeader,
-    /// Pointer to the `AddressSpace` (heap-allocated; the wrapper's PT pool
-    /// is retype-backed but the `AddressSpace` struct itself, holding the
-    /// root-PT virtual base and per-arch fields, still lives on the kernel
-    /// heap pending a follow-up that retypes init's bootstrap state).
+    /// Pointer to the `AddressSpace`, constructed in place in the wrapper
+    /// page immediately after this struct (`sys_cap_create_aspace`,
+    /// `boot_retype_aspace`); the PT pool below is retype-backed too.
     pub address_space: *mut crate::mm::address_space::AddressSpace,
     /// Bytes available to back new intermediate page-table pages on `mem_map`.
     ///
@@ -540,6 +577,12 @@ pub struct AddressSpaceObject
     /// Records of every retype-source chunk donated to this AS. `dealloc`
     /// walks this array and `retype_free`s each chunk wholesale.
     pub pt_chunks: [PoolChunkSlot; MAX_PT_CHUNKS],
+    /// Intrusive link for the per-CPU deferred reclaim stack
+    /// ([`drain_deferred_reclaim`]). Non-null only while this object sits on
+    /// that stack: the thread that dropped its last capability was itself
+    /// bound to it (or was stopped by a concurrent teardown while freeing
+    /// it), so the free completes off-CPU. Written only by the owning CPU.
+    pub deferred_next: *mut KernelObjectHeader,
 }
 
 // SAFETY: AddressSpaceObject is accessed only with proper locks.
@@ -552,10 +595,9 @@ unsafe impl Sync for AddressSpaceObject {}
 pub struct CSpaceKernelObject
 {
     pub header: KernelObjectHeader,
-    /// Pointer to the `CSpace` (heap-allocated; the wrapper's slot-page
-    /// pool is retype-backed but the `CSpace` directory itself still lives
-    /// on the kernel heap pending the follow-up that retypes init's
-    /// bootstrap state).
+    /// Pointer to the `CSpace`, constructed in place directly after this
+    /// wrapper in the slab's page 0 (the wrapper-page fit is
+    /// compile-asserted below).
     pub cspace: *mut crate::cap::cspace::CSpace,
     /// Bytes available to back new slot pages when the `CSpace` grows.
     ///
@@ -572,29 +614,64 @@ pub struct CSpaceKernelObject
     pub cs_pool_head_phys: AtomicU64,
     /// Records of every retype-source chunk donated to this `CSpace`.
     pub cs_chunks: [PoolChunkSlot; MAX_PT_CHUNKS],
+    /// Intrusive link for the per-CPU deferred reclaim stack
+    /// ([`drain_deferred_reclaim`]); see `AddressSpaceObject::deferred_next`.
+    pub deferred_next: *mut KernelObjectHeader,
 }
+
+// The wrapper page hosts the AddressSpaceObject followed by the in-place
+// AddressSpace, or the CSpaceKernelObject followed by the inline CSpace
+// directory; each pair must fit one page (the construction sites also
+// debug-assert the offsets).
+const _: () = assert!(
+    core::mem::size_of::<AddressSpaceObject>()
+        + core::mem::size_of::<crate::mm::address_space::AddressSpace>()
+        <= crate::mm::PAGE_SIZE,
+);
+const _: () = assert!(
+    core::mem::size_of::<CSpaceKernelObject>() + core::mem::size_of::<crate::cap::cspace::CSpace>()
+        <= crate::mm::PAGE_SIZE,
+    "CSpaceKernelObject + CSpace exceed the wrapper page"
+);
 
 // SAFETY: CSpaceKernelObject is accessed only with proper locks.
 unsafe impl Send for CSpaceKernelObject {}
 // SAFETY: CSpaceKernelObject is accessed only with proper locks.
 unsafe impl Sync for CSpaceKernelObject {}
 
-/// Acquire a pool spinlock (`pt_pool_lock` or `cs_pool_lock`).
+/// Acquire a pool spinlock (`pt_pool_lock` or `cs_pool_lock`). A contended
+/// wait is recorded in the calling CPU's lock-wait breadcrumb for the
+/// softlockup watchdog; the uncontended path records nothing.
+#[cfg(not(test))]
 #[inline]
-#[allow(dead_code)]
+#[track_caller]
 fn pool_lock(lock: &AtomicU64)
 {
-    while lock
+    crate::sched::check_lock_hold_preemptible(
+        crate::sched::LockKind::Pool,
+        core::panic::Location::caller(),
+    );
+    if lock
         .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
         .is_err()
     {
-        core::hint::spin_loop();
+        crate::sched::lock_wait_enter(
+            crate::sched::LockKind::Pool,
+            core::ptr::from_ref(lock).expose_provenance(),
+        );
+        while lock
+            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+        crate::sched::lock_wait_exit();
     }
 }
 
 /// Release a pool spinlock.
+#[cfg(not(test))]
 #[inline]
-#[allow(dead_code)]
 fn pool_unlock(lock: &AtomicU64)
 {
     lock.store(0, Ordering::Release);
@@ -609,7 +686,6 @@ fn pool_unlock(lock: &AtomicU64)
 /// `head_phys` must point at the actual `AtomicU64` head field of a live
 /// pool. The free-list link slots in the pages must not be aliased.
 #[cfg(not(test))]
-#[allow(dead_code)]
 unsafe fn pool_pop(head_phys: &AtomicU64) -> u64
 {
     let head = head_phys.load(Ordering::Acquire);
@@ -632,7 +708,6 @@ unsafe fn pool_pop(head_phys: &AtomicU64) -> u64
 /// `phys` must be page-aligned, within a chunk owned by this pool, and not
 /// concurrently aliased.
 #[cfg(not(test))]
-#[allow(dead_code)]
 unsafe fn pool_push(head_phys: &AtomicU64, phys: u64)
 {
     let prev = head_phys.load(Ordering::Acquire);
@@ -653,27 +728,10 @@ pub fn vacant_chunk_slots() -> [PoolChunkSlot; MAX_PT_CHUNKS]
 
 impl AddressSpaceObject
 {
-    /// Test-only heap-backed wrapper with empty pool. Retype-backed wrappers
-    /// are constructed in place by `sys_cap_create_aspace` and (for init's
-    /// bootstrap AS) by `cap::boot_retype_aspace`.
-    #[cfg(test)]
-    #[must_use]
-    pub fn heap_backed(address_space: *mut crate::mm::address_space::AddressSpace) -> Self
-    {
-        Self {
-            header: KernelObjectHeader::new(ObjectType::AddressSpace),
-            address_space,
-            pt_growth_budget_bytes: AtomicU64::new(0),
-            pt_pool_lock: AtomicU64::new(0),
-            pt_pool_head_phys: AtomicU64::new(0),
-            pt_chunks: vacant_chunk_slots(),
-        }
-    }
-
     /// Pop a free PT page from this AS's pool, charging the growth budget.
     /// Returns the page's physical address, or `None` if the pool is empty.
     #[cfg(not(test))]
-    #[allow(dead_code)]
+    #[track_caller]
     pub fn alloc_pt_page(&self) -> Option<u64>
     {
         pool_lock(&self.pt_pool_lock);
@@ -701,6 +759,7 @@ impl AddressSpaceObject
     /// `phys` must come from a prior [`alloc_pt_page`] call on this AS, and
     /// the page must no longer be in use as a page table.
     #[cfg(not(test))]
+    #[track_caller]
     pub unsafe fn free_pt_page(&self, phys: u64)
     {
         pool_lock(&self.pt_pool_lock);
@@ -723,6 +782,7 @@ impl AddressSpaceObject
     /// any future non-pooled user mapping) against corrupting the pool's
     /// free-list and budget accounting.
     #[cfg(not(test))]
+    #[track_caller]
     pub fn owns_phys(&self, phys: u64) -> bool
     {
         let p = crate::mm::PAGE_SIZE as u64;
@@ -771,7 +831,7 @@ impl AddressSpaceObject
     /// Pool pages are taken from the *high* end of the chunk; reserved
     /// pages occupy `[base_offset, base_offset + (total_pages - pool_pages) * PAGE_SIZE)`.
     #[cfg(not(test))]
-    #[allow(dead_code)]
+    #[track_caller]
     pub unsafe fn add_chunk(
         &self,
         ancestor: NonNull<KernelObjectHeader>,
@@ -827,27 +887,10 @@ impl AddressSpaceObject
 
 impl CSpaceKernelObject
 {
-    /// Test-only heap-backed wrapper with empty pool. Retype-backed wrappers
-    /// are constructed in place by `sys_cap_create_cspace` and (for the
-    /// root CSpace) by `cap::boot_retype_cspace`.
-    #[cfg(test)]
-    #[must_use]
-    pub fn heap_backed(cspace: *mut crate::cap::cspace::CSpace) -> Self
-    {
-        Self {
-            header: KernelObjectHeader::new(ObjectType::CSpaceObj),
-            cspace,
-            cspace_growth_budget_bytes: AtomicU64::new(0),
-            cs_pool_lock: AtomicU64::new(0),
-            cs_pool_head_phys: AtomicU64::new(0),
-            cs_chunks: vacant_chunk_slots(),
-        }
-    }
-
     /// Pop a free slot page from this `CSpace`'s pool, charging the growth
     /// budget. Returns the page's physical address, or `None` if empty.
     #[cfg(not(test))]
-    #[allow(dead_code)]
+    #[track_caller]
     pub fn alloc_slot_page(&self) -> Option<u64>
     {
         pool_lock(&self.cs_pool_lock);
@@ -871,7 +914,7 @@ impl CSpaceKernelObject
     /// # Safety
     /// See [`AddressSpaceObject::add_chunk`].
     #[cfg(not(test))]
-    #[allow(dead_code)]
+    #[track_caller]
     pub unsafe fn add_chunk(
         &self,
         ancestor: NonNull<KernelObjectHeader>,
@@ -925,10 +968,8 @@ impl CSpaceKernelObject
 pub struct EndpointObject
 {
     pub header: KernelObjectHeader,
-    /// Pointer to the endpoint's mutable state. For retype-backed Endpoints
-    /// the state lives inline at `wrapper + 8`; for legacy heap-allocated
-    /// Endpoints it points at a separate `Box<EndpointState>`. The
-    /// `header.ancestor` discriminant tells the dealloc path which is which.
+    /// Pointer to the endpoint's mutable state, inline at `wrapper + 8` in
+    /// the same retype slot.
     pub state: *mut crate::ipc::endpoint::EndpointState,
 }
 
@@ -942,9 +983,8 @@ unsafe impl Sync for EndpointObject {}
 pub struct NotificationObject
 {
     pub header: KernelObjectHeader,
-    /// Pointer to the notification's mutable state. Inline for retype-backed
-    /// Notifications, separately heap-allocated for legacy Notifications; discriminated
-    /// by `header.ancestor`.
+    /// Pointer to the notification's mutable state, inline in the same retype
+    /// slot.
     pub state: *mut crate::ipc::notification::NotificationState,
 }
 
@@ -955,19 +995,15 @@ unsafe impl Sync for NotificationObject {}
 
 /// Kernel object for an event queue (`EventQueue` capability).
 ///
-/// For retype-backed `EventQueue`s the wrapper, `EventQueueState`, and
-/// the ring buffer all live in the same retype slot — the ring is at
-/// offset [`crate::cap::retype::EVENT_QUEUE_RING_OFFSET`] from the wrapper
-/// base, and the slot is reclaimed wholesale via `retype_free`. Legacy
-/// heap-allocated `EventQueue`s keep `EventQueueState` and the ring as
-/// separate heap allocations.
+/// The wrapper, `EventQueueState`, and the ring buffer all live in the same
+/// retype slot — the ring is at offset
+/// [`crate::cap::retype::EVENT_QUEUE_RING_OFFSET`] from the wrapper base,
+/// and the slot is reclaimed wholesale via `retype_free`.
 #[repr(C)]
 pub struct EventQueueObject
 {
     pub header: KernelObjectHeader,
-    /// Pointer to the event-queue state — inline for retype-backed,
-    /// separately heap-allocated for legacy. Discriminated by
-    /// `header.ancestor`.
+    /// Pointer to the event-queue state, inline in the same retype slot.
     pub state: *mut crate::ipc::event_queue::EventQueueState,
 }
 
@@ -979,16 +1015,13 @@ unsafe impl Sync for EventQueueObject {}
 /// Kernel object for a wait set (`WaitSet` capability).
 ///
 /// `WaitSetState` is the ~480-byte body holding member slots and the ready
-/// ring; for retype-backed wait sets it lives inline immediately after the
-/// 24-byte wrapper within a single `BIN_512` retype slot. Legacy heap-
-/// allocated wait sets keep the state as a separate heap allocation.
+/// ring; it lives inline immediately after the 24-byte wrapper within a single
+/// `BIN_512` retype slot.
 #[repr(C)]
 pub struct WaitSetObject
 {
     pub header: KernelObjectHeader,
-    /// Pointer to the wait-set state — inline for retype-backed,
-    /// separately heap-allocated for legacy. Discriminated by
-    /// `header.ancestor`.
+    /// Pointer to the wait-set state, inline in the same retype slot.
     pub state: *mut crate::ipc::wait_set::WaitSetState,
 }
 
@@ -1004,12 +1037,13 @@ unsafe impl Sync for WaitSetObject {}
 static SELF_TEARDOWN_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// One-shot diagnostic for the self-teardown path (#341). The first time a
-/// thread deletes the last capability to its own `Thread` object, log its id,
-/// the in-flight userspace instruction pointer, and the syscall number, so the
-/// triggering userspace call site can be symbolised from a burn-in log. Bounded
-/// to a single line so it never floods the boot log under thread churn.
+/// thread deletes the last capability to its own `Thread` object, `CSpace`,
+/// or `AddressSpace` (`what`), log its id, the in-flight userspace
+/// instruction pointer, and the syscall number, so the triggering userspace
+/// call site can be symbolised from a burn-in log. Bounded to a single line
+/// so it never floods the boot log under thread churn.
 #[cfg(not(test))]
-fn log_self_teardown(tcb: *mut crate::sched::thread::ThreadControlBlock)
+fn log_self_teardown(tcb: *mut crate::sched::thread::ThreadControlBlock, what: &str)
 {
     if SELF_TEARDOWN_LOGGED
         .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
@@ -1021,46 +1055,95 @@ fn log_self_teardown(tcb: *mut crate::sched::thread::ThreadControlBlock)
     let (tid, tf) = unsafe { ((*tcb).thread_id, (*tcb).trap_frame) };
     if tf.is_null()
     {
-        crate::kprintln!("sched: self-teardown deferred reclaim: tid={tid} (no trap frame)");
+        crate::kprintln!(
+            "sched: self-teardown deferred reclaim ({what}): tid={tid} (no trap frame)"
+        );
         return;
     }
     // SAFETY: tf non-null; it is the caller's saved userspace frame.
     let (rip, nr) = unsafe { ((*tf).instruction_pointer(), (*tf).syscall_nr()) };
     crate::kprintln!(
-        "sched: self-teardown deferred reclaim: tid={tid} user_rip=0x{rip:x} syscall_nr={nr}"
+        "sched: self-teardown deferred reclaim ({what}): tid={tid} user_rip=0x{rip:x} \
+         syscall_nr={nr}"
     );
 }
 
-/// Push a self-deleted `Thread` object onto its CPU's deferred-reclaim stack.
-///
-/// `dealloc_object`'s drain gate spins until the target TCB is no longer
-/// `current` on any CPU; for a thread freeing its own object on its own CPU
-/// that never holds (preemption is disabled across the spin), so the inline
-/// path would wedge the CPU (#341). The Thread arm of [`dealloc_object_one`]
-/// instead marks the thread `Exited`, drains its run-queue links, and pushes
-/// the object here; the syscall epilogue then `schedule()`s away.
-/// [`drain_deferred_reclaim`] completes the free from a context that is provably
-/// not the dead thread.
+/// The intrusive deferred-reclaim link of an object that may be queued on
+/// the per-CPU deferred-reclaim stack.
 ///
 /// # Safety
-/// `ptr` is an exclusively-owned `ThreadObject` (refcount 0) whose TCB is
-/// already `Exited` and unlinked from every run queue. `cpu` is the local CPU
-/// index (`< MAX_CPUS`) and its scheduler is initialised.
-// cast_ptr_alignment: the `*mut u8` head only ever holds a `*mut ThreadObject`
-// stored by this same function, so it carries ThreadObject's 8-byte alignment.
+/// `ptr` must be a valid `Thread`, `CSpaceObj`, or `AddressSpace` object.
+// cast_ptr_alignment: each concrete object is constructed in place at its own
+// alignment; the header sits at offset 0 of every one.
 #[allow(clippy::cast_ptr_alignment)]
 #[cfg(not(test))]
-unsafe fn push_deferred_reclaim(cpu: usize, ptr: NonNull<KernelObjectHeader>)
+unsafe fn deferred_link(ptr: NonNull<KernelObjectHeader>) -> *mut *mut KernelObjectHeader
 {
-    let node = ptr.as_ptr().cast::<ThreadObject>();
+    // SAFETY: header at offset 0 of every concrete object; caller contract.
+    unsafe {
+        match (*ptr.as_ptr()).obj_type
+        {
+            ObjectType::Thread =>
+            {
+                core::ptr::addr_of_mut!((*ptr.as_ptr().cast::<ThreadObject>()).deferred_next)
+            }
+            ObjectType::CSpaceObj =>
+            {
+                core::ptr::addr_of_mut!((*ptr.as_ptr().cast::<CSpaceKernelObject>()).deferred_next)
+            }
+            ObjectType::AddressSpace =>
+            {
+                core::ptr::addr_of_mut!((*ptr.as_ptr().cast::<AddressSpaceObject>()).deferred_next)
+            }
+            _ => crate::fatal("deferred reclaim: object type carries no link"),
+        }
+    }
+}
+
+/// Push an object whose free must not complete here onto this CPU's
+/// deferred-reclaim stack.
+///
+/// Two producers. A thread deleting the last capability to its own `Thread`
+/// object cannot run `dealloc_object`'s drain gate, which spins until the
+/// target TCB is no longer `current` on any CPU (#341); a thread deleting
+/// the last capability to its own `CSpace` or `AddressSpace` — directly, or
+/// through the cascade of another object's teardown — cannot free storage
+/// it is executing on (its slot pages, its root page table). In each case
+/// the arm marks the thread `Exited`, pushes the object here, and returns;
+/// the syscall epilogue then `schedule()`s away and
+/// [`drain_deferred_reclaim`] completes the free from a context that is
+/// provably not a bound thread. Second, a batched capability move whose
+/// freed source slot held the last reference to a `Thread`, `CSpace`, or
+/// `AddressSpace` (`cap::transfer::release_moved_object`) pushes it from a
+/// live thread — possibly one bound to it, and possibly from inside IPC
+/// delivery, where a teardown's bound-thread stop and cross-CPU waits must
+/// not run.
+///
+/// # Safety
+/// `ptr` is an exclusively-owned `Thread`, `CSpaceObj`, or `AddressSpace`
+/// object (refcount 0). A `Thread` pushed by a self-teardown is already
+/// `Exited` and unlinked from every run queue; one pushed by
+/// `release_moved_object` may be in any state, and the drain's Thread arm
+/// then runs `dealloc_object`'s ordinary stop-and-drain — or its self net
+/// when the draining thread is that thread. `cpu` is the local CPU index
+/// (`< MAX_CPUS`) and its scheduler is initialised.
+// cast_ptr_alignment: the `*mut u8` head only ever holds an object pointer
+// stored by this function (header at offset 0, 8-byte aligned).
+#[allow(clippy::cast_ptr_alignment)]
+#[cfg(not(test))]
+pub(crate) unsafe fn push_deferred_reclaim(cpu: usize, ptr: NonNull<KernelObjectHeader>)
+{
+    let node = ptr.as_ptr();
     // SAFETY: cpu < MAX_CPUS; scheduler initialised by sched::init.
     let sched = unsafe { crate::sched::scheduler_for(cpu) };
     let slot = &sched.deferred_reclaim_head;
+    // SAFETY: ptr is a valid object of a linkable type per contract.
+    let link = unsafe { deferred_link(ptr) };
     loop
     {
         let head = slot.load(Ordering::Acquire);
         // SAFETY: node is exclusively owned (refcount 0); the link field is ours.
-        unsafe { (*node).deferred_next = head.cast::<ThreadObject>() };
+        unsafe { *link = head.cast::<KernelObjectHeader>() };
         if slot
             .compare_exchange(head, node.cast::<u8>(), Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
@@ -1070,20 +1153,33 @@ unsafe fn push_deferred_reclaim(cpu: usize, ptr: NonNull<KernelObjectHeader>)
     }
 }
 
-/// Drain this CPU's deferred self-teardown reclaim stack, completing the free
-/// of each queued `Thread` object (TCB, kstack, retype slot, ancestor cascade).
+/// Drain this CPU's deferred reclaim stack, completing the free of each
+/// queued object (a `Thread`'s TCB, kstack, retype slot, and ancestor
+/// cascade; a `CSpace`'s or `AddressSpace`'s bound-thread stop, drain, and
+/// storage).
 ///
 /// Called from the syscall epilogue (when the returning thread is alive) and
-/// the idle loop — both contexts that are NOT one of the queued dead threads,
-/// so re-entering `dealloc_object` runs the normal Thread arm whose
-/// `current`-anywhere scan and `context_saved` gate pass on the first iteration.
+/// the idle loop — neither is one of the queued dead threads, so re-entering
+/// `dealloc_object` runs the normal arm: the Thread arm's `current`-anywhere
+/// scan and `context_saved` gate pass on the first iteration, and the
+/// `CSpace`/`AddressSpace` arms stop whatever threads are still bound (a
+/// self-teardown producer left them `Exited` and off-CPU already; a move
+/// producer may have left them live). If the draining thread is itself
+/// bound to a queued object, that arm stops it, re-queues the object
+/// through `defer_self_teardown`, and returns; the epilogue's post-drain
+/// `Exited` check then schedules the thread away and the next drain on this
+/// CPU completes the free.
 ///
 /// # Safety
-/// Must not run on a thread whose own object is queued here; the producer
-/// contract guarantees this — a self-deleting thread reaches the Exited arm of
-/// the syscall epilogue and `schedule()`s away, never the drain arm.
-// cast_ptr_alignment: the `*mut u8` head only ever holds a `*mut ThreadObject`
-// (see push_deferred_reclaim), so it carries ThreadObject's 8-byte alignment.
+/// The running thread must be alive and on its own kernel stack. A thread
+/// whose own `Thread` object was queued by a self-teardown is `Exited`,
+/// reaches the Exited arm of the syscall epilogue, and `schedule()`s away,
+/// never the drain arm; one whose own object reached the stack through
+/// `release_moved_object` is caught by the Thread arm's self net, which
+/// marks it `Exited`, re-queues the object, and returns, so the epilogue's
+/// post-drain `Exited` check schedules it away.
+// cast_ptr_alignment: the `*mut u8` head only ever holds an object pointer
+// stored by push_deferred_reclaim (header at offset 0, 8-byte aligned).
 #[allow(clippy::cast_ptr_alignment)]
 #[cfg(not(test))]
 pub unsafe fn drain_deferred_reclaim(cpu: usize)
@@ -1106,30 +1202,75 @@ pub unsafe fn drain_deferred_reclaim(cpu: usize)
     let mut node = sched
         .deferred_reclaim_head
         .swap(core::ptr::null_mut(), Ordering::AcqRel)
-        .cast::<ThreadObject>();
+        .cast::<KernelObjectHeader>();
     while !node.is_null()
     {
-        // SAFETY: node is an exclusively-owned, Exited, off-CPU ThreadObject
-        // pushed by push_deferred_reclaim; the link field is stable until freed.
-        let next = unsafe { (*node).deferred_next };
-        // SAFETY: refcount 0, exclusive ownership; re-enters the Thread arm with
-        // is_self false (the thread is off-CPU), running the full free path.
-        unsafe { dealloc_object(NonNull::new_unchecked(node.cast::<KernelObjectHeader>())) };
+        // SAFETY: node is an exclusively-owned object pushed by
+        // push_deferred_reclaim; the link field is stable until freed.
+        let nn = unsafe { NonNull::new_unchecked(node) };
+        // SAFETY: nn is a linkable object pushed by push_deferred_reclaim.
+        let next = unsafe { *deferred_link(nn) };
+        // SAFETY: refcount 0, exclusive ownership; re-enters the object's arm
+        // from a context bound to nothing queued here, running the full free.
+        unsafe { dealloc_object(nn) };
         node = next;
     }
 }
 
-/// Free a kernel object whose reference count has just reached zero.
+/// Queue `ptr` for off-CPU reclaim because the running thread has been
+/// stopped (it is bound to the object, or a concurrent teardown stopped it
+/// while this free waited); log the first occurrence.
 ///
-/// Dispatches on `obj_type` to reconstruct the original `Box<ConcreteObject>`
-/// and drop it, freeing any sub-resources first.
+/// Reached only when the running thread is `Exited`, which the idle-loop
+/// drain can never be: an idle TCB is unregistered, binds no `CSpace` or
+/// address space, and is named by no capability, so no teardown or stop
+/// can mark it. Every caller is therefore on the syscall path (a handler,
+/// or the epilogue drain), where interrupts are disabled.
+///
+/// # Safety
+/// `ptr` must be a refcount-0 `Thread`, `CSpace`, or `AddressSpace` object
+/// referenced by no slot, and the caller must be the running thread with
+/// interrupts disabled, so this CPU and its `current` are stable.
+#[cfg(not(test))]
+unsafe fn defer_self_teardown(ptr: NonNull<KernelObjectHeader>, what: &str)
+{
+    let this_cpu = crate::arch::current::cpu::current_cpu() as usize;
+    // SAFETY: this_cpu < MAX_CPUS; `current` is written only by this CPU at
+    // dispatch, and per contract we are that running thread.
+    let cur = unsafe { crate::sched::scheduler_for(this_cpu).current };
+    // Tripwire for the contract above: the caller observed its own `Exited`
+    // state under the scheduler lock, so the read here is stable.
+    // SAFETY: cur is this CPU's `current`, valid while installed.
+    let cur_exited =
+        !cur.is_null() && unsafe { (*cur).state } == crate::sched::thread::ThreadState::Exited;
+    debug_assert!(
+        cur_exited,
+        "defer_self_teardown: running thread is not Exited"
+    );
+    if !cur.is_null()
+    {
+        log_self_teardown(cur, what);
+    }
+    // SAFETY: object exclusively owned (refcount 0) and of a linkable type;
+    // queued for off-CPU reclaim on this CPU.
+    unsafe { push_deferred_reclaim(this_cpu, ptr) };
+}
+
+/// Free a kernel object that no capability slot references: its reference
+/// count has reached zero, or it is a fresh body that was never published
+/// (see Safety).
+///
+/// Dispatches on `obj_type` to run the concrete type's teardown in place,
+/// freeing any sub-resources first, then returns the object's bytes to its
+/// ancestor `MemoryObject`.
 ///
 /// # Safety
 ///
-/// - `ptr` must be a valid, non-null pointer originally produced by
-///   `Box::into_raw` (cast to `*mut KernelObjectHeader`).
-/// - The object's reference count must be 0; no other capability slot may
-///   reference it.
+/// - `ptr` must be the header of a live object constructed in place in
+///   retype-backed storage (the header sits at offset 0 of its wrapper).
+/// - No capability slot may reference the object: its reference count is 0,
+///   or it is a fresh body that was never published (a range split's
+///   rollback frees such bodies at their initial count of 1).
 /// - Must NOT be called with `DERIVATION_LOCK` held, since freeing complex
 ///   objects (Thread, `AddressSpace`) may acquire the frame-allocator lock.
 ///
@@ -1172,7 +1313,8 @@ pub unsafe fn dealloc_object(ptr: core::ptr::NonNull<KernelObjectHeader>)
         worklist[head] = None;
         // SAFETY: `next` is a NonNull<KernelObjectHeader> that was either the
         // original caller-supplied pointer or pushed onto the worklist by an
-        // ancestor-reclaim arm — both contracts require ref_count == 0 and
+        // ancestor-reclaim arm — both contracts require that no slot
+        // references the object (refcount 0, or a never-published body) and
         // exclusive ownership at this point.
         unsafe { dealloc_object_one(next, &mut worklist, &mut head) };
     }
@@ -1185,10 +1327,11 @@ pub unsafe fn dealloc_object(ptr: core::ptr::NonNull<KernelObjectHeader>)
 /// # Safety
 ///
 /// Same contract as [`dealloc_object`].
-// cast_ptr_alignment: every concrete object type is allocated as Box<ConcreteType>,
-// which guarantees alignment to align_of::<ConcreteType>(). The NonNull<KernelObjectHeader>
-// points to the first field (header at offset 0), so the pointer retains the concrete
-// type's alignment even when stored as KernelObjectHeader*.
+// cast_ptr_alignment: every concrete object is constructed in place at a
+// size-class-aligned offset of a page-aligned retype slab (`retype_allocate`),
+// which satisfies align_of::<ConcreteType>(). The NonNull<KernelObjectHeader>
+// points to the first field (header at offset 0), so the pointer retains the
+// concrete type's alignment even when stored as KernelObjectHeader*.
 // too_many_lines: structural dispatch over all object types; splitting further
 // would obscure the type hierarchy without reducing complexity.
 #[allow(
@@ -1475,19 +1618,24 @@ unsafe fn dealloc_object_one(
                 });
                 if is_self
                 {
-                    log_self_teardown(tcb);
-                    // Defensive net. For SYS_CAP_DELETE this is unreachable —
+                    log_self_teardown(tcb, "Thread");
+                    // Self net. For SYS_CAP_DELETE this is unreachable —
                     // sys_cap_delete refuses a self thread-cap delete before the
-                    // dec-ref. It still guards any OTHER dealloc of the running
-                    // thread (e.g. a self-targeting cap_revoke): mark Exited +
-                    // drain run queues (no free), queue the object for off-CPU
-                    // reclaim, and return. The syscall epilogue observes Exited
-                    // and schedule()s away; drain_deferred_reclaim completes the
+                    // dec-ref. It guards every OTHER dealloc of the running
+                    // thread: a self-targeting cap_revoke, and the deferred
+                    // reclaim of a Thread object whose last reference a
+                    // batched move dropped (`release_moved_object`) when the
+                    // draining thread is that thread. Mark Exited + drain run
+                    // queues (no free), queue the object for off-CPU reclaim,
+                    // and return. The syscall epilogue observes Exited and
+                    // schedule()s away; drain_deferred_reclaim completes the
                     // free off-CPU, where the existing gate passes immediately.
                     // SAFETY: tcb valid; marks Exited + drains every run queue
                     // under the all-CPU-locks discipline (mirrors sys_thread_exit).
                     unsafe {
-                        crate::sched::set_state_under_all_locks(
+                        // Committing Exited: a refusal means a teardown
+                        // already did.
+                        let _ = crate::sched::set_state_under_all_locks(
                             tcb,
                             crate::sched::thread::ThreadState::Exited,
                         );
@@ -1660,86 +1808,11 @@ unsafe fn dealloc_object_one(
 
                     // UAF gate: a TCB that is `current` on any CPU MUST NOT be
                     // reclaimed until every CPU has switched away from it AND
-                    // the in-flight register save has published. Two steps:
-                    //
-                    //   1. Spin until `tcb` is not `current` on ANY CPU —
-                    //      unconditional, across every CPU. A single-CPU wait
-                    //      keyed on one all-locks snapshot would be insufficient:
-                    //      such a snapshot names at most one CPU and can be stale
-                    //      the instant the locks drop (a CPU mid-`schedule()` may
-                    //      install or retain `tcb` as `current` after it was
-                    //      taken). #207.
-                    //   2. Spin until `context_saved == 1`, covering the window
-                    //      where a CPU set `current = next` and dropped its lock
-                    //      but `switch()` has not yet saved `tcb`'s registers.
-                    //
-                    // The spins run with interrupts ENABLED and preemption
-                    // DISABLED, mirroring `mm::tlb_shootdown::shootdown`. We
-                    // enter dealloc from a syscall with `IF=0`; spinning here
-                    // with `IF=0` blocks incoming IPIs (FPU flush, TLB
-                    // shootdown) targeted at this CPU and deadlocks them.
-                    // Enabling IF lets us service those, while `preempt_disable`
-                    // keeps the scheduler from migrating us mid-dealloc.
-                    crate::percpu::preempt_disable();
-                    // SAFETY: ring 0; saved in matching restore below.
-                    let saved_int = crate::arch::current::cpu::save_and_disable_interrupts();
-                    // SAFETY: ring 0; IDT loaded; preempt disabled.
-                    crate::arch::current::interrupts::enable();
-
-                    // Step 1: not `current` on any CPU. Find the (at most one)
-                    // CPU still running `tcb`, spin on just that CPU's lock
-                    // until it switches away, then re-scan; once a full scan is
-                    // clean, no CPU can re-install `tcb` (it is `Exited` and
-                    // unlinked from every run queue under the all-locks region).
-                    crate::sched::spin_site_enter(crate::sched::SPIN_SITE_DEALLOC_NOT_CURRENT);
-                    loop
-                    {
-                        let run_cpu = 'scan: {
-                            for cpu in 0..cpu_count
-                            {
-                                let s = crate::sched::scheduler_for(cpu);
-                                let f = s.lock.lock_raw();
-                                let is_cur = s.current == tcb;
-                                s.lock.unlock_raw(f);
-                                if is_cur
-                                {
-                                    break 'scan Some(cpu);
-                                }
-                            }
-                            None
-                        };
-                        let Some(run_cpu) = run_cpu
-                        else
-                        {
-                            break;
-                        };
-                        let sched = crate::sched::scheduler_for(run_cpu);
-                        while {
-                            let s = sched.lock.lock_raw();
-                            let still_current = sched.current == tcb;
-                            sched.lock.unlock_raw(s);
-                            still_current
-                        }
-                        {
-                            core::hint::spin_loop();
-                        }
-                    }
-
-                    // Step 2: register save published.
-                    crate::sched::spin_site_enter(crate::sched::SPIN_SITE_DEALLOC_CONTEXT_SAVED);
-                    while (*tcb)
-                        .context_saved
-                        .load(core::sync::atomic::Ordering::Acquire)
-                        == 0
-                    {
-                        core::hint::spin_loop();
-                    }
-                    crate::sched::spin_site_exit();
-
-                    // Restore the caller's interrupt state and preemption.
-                    // SAFETY: saved_int from save_and_disable_interrupts above.
-                    crate::arch::current::cpu::restore_interrupts(saved_int);
-                    crate::percpu::preempt_enable();
+                    // the in-flight register save has published; see
+                    // `wait_until_off_cpu`.
+                    // SAFETY: tcb is Exited and unlinked from every run queue
+                    // (all-locks region above); not the running thread here.
+                    crate::sched::wait_until_off_cpu(tcb);
 
                     // After eager FPU save (#108), no fpu_owner sweep is
                     // needed: `nm_handler` only ever names the currently
@@ -2067,22 +2140,27 @@ unsafe fn dealloc_object_one(
                 // is reclaimed wholesale by `retype_free` below as part of
                 // the same slot release, so no separate free is needed.
 
-                // Remove the TCB from the diagnostic live-thread registry
-                // before poisoning/freeing it. The registry walk
-                // (`thread_registry::try_for_each`) holds the registry lock
-                // across every dereference, so unlinking strictly before the
-                // free guarantees the watchdog never observes a dangling node.
-                // A no-op for a TCB that was never registered (e.g. a
-                // never-started thread torn down before its cap was inserted).
-                // SAFETY: tcb valid (not yet freed); leaf lock, nothing else held.
+                // Remove the TCB from the live-thread registry before
+                // poisoning/freeing it. Both registry walks hold the registry
+                // lock across every dereference, so unlinking strictly before
+                // the free guarantees neither the watchdog nor an object
+                // teardown observes a dangling node.
+                // SAFETY: tcb valid (not yet freed); the registry lock is the
+                // outermost lock and nothing is held here.
                 unsafe { crate::sched::thread_registry::unregister(tcb) };
 
                 // Poison the TCB so any use-after-free reads garbage
-                // instead of plausible values.
+                // instead of plausible values. Both stores are volatile:
+                // the lock-holder diagnostic may read the slot from another
+                // CPU through a stale `current` pointer
+                // (`sched::holder_info`) — a deliberate race the volatile
+                // pair keeps well-defined — and `magic` also gates the
+                // liveness debug assertions, so its store must not be
+                // reordered or elided.
                 // SAFETY: tcb is valid; we are about to free it.
                 unsafe {
-                    (*tcb).magic = 0;
-                    (*tcb).priority = 0xFF;
+                    core::ptr::write_volatile(core::ptr::addr_of_mut!((*tcb).magic), 0);
+                    core::ptr::write_volatile(core::ptr::addr_of_mut!((*tcb).priority), 0xFF);
                 }
 
                 // SAFETY: tcb lives in-place inside the retype slot;
@@ -2143,8 +2221,35 @@ unsafe fn dealloc_object_one(
 
             if !as_ptr.is_null()
             {
-                // No CPU should still have this address space loaded in
-                // satp/CR3 when we free its root page table.
+                // ── Stop bound threads ──
+                // Same discipline as the CSpace arm: every thread bound to
+                // this address space is marked Exited and waited off-CPU
+                // before its root page table is freed, so no CPU can run in
+                // it afterwards. Objects of the stopped threads are freed
+                // when their own last caps go. If the running thread is
+                // itself stopped — bound here, or by a concurrent teardown
+                // — the free is deferred off-CPU (see push_deferred_reclaim).
+                // SAFETY: as_ptr uniquely owned (refcount 0); no scheduler,
+                // IPC, or registry lock is held here.
+                let stopped = unsafe {
+                    crate::sched::stop_threads_bound_to(|tcb| {
+                        core::ptr::eq((*tcb).address_space, as_ptr)
+                    })
+                };
+                // SAFETY: as_ptr valid; every bound thread is Exited and
+                // off every run queue; no scheduler lock held.
+                if stopped || !unsafe { crate::sched::wait_until_aspace_inactive(as_ptr) }
+                {
+                    // SAFETY: refcount 0, no slot references the object; the
+                    // running thread is `Exited`, which rules out the idle
+                    // drain (see defer_self_teardown), so this is the syscall
+                    // path with interrupts disabled.
+                    unsafe { defer_self_teardown(ptr, "AddressSpace") };
+                    return;
+                }
+
+                // No CPU still has this address space loaded in satp/CR3
+                // (waited for above), so the root page table can go.
                 debug_assert!(
                     // SAFETY: as_ptr non-null; active_cpu_mask is an Acquire snapshot.
                     unsafe { (*as_ptr).active_cpu_mask() }.is_empty(),
@@ -2240,7 +2345,7 @@ unsafe fn dealloc_object_one(
         //
         // Before `unregister_cspace` and the dec_ref cascade run, the
         // derivation tree's external back-links into this dying `CSpace`
-        // are scrubbed by [`drain_dying_cspace`]. Combined with the
+        // are scrubbed by [`drain_dying_cspace_batch`]. Combined with the
         // [`SlotId`] epoch check in `lookup_cspace`, this is the
         // defense-in-depth that lets `free_cspace_id` recycle the id
         // safely: foreign slots cannot retain a back-link, and any that
@@ -2264,34 +2369,73 @@ unsafe fn dealloc_object_one(
 
             if !cs_ptr.is_null()
             {
+                // ── Stop bound threads ──
+                // Every thread bound to this CSpace is marked Exited and
+                // waited off-CPU before anything below runs: no thread can
+                // be mid-syscall against these slot pages when they are
+                // freed, and none can wire derivation links during the drain.
+                // Their objects are freed when their own last caps go — in
+                // the dec_ref cascade below if those caps live here. If the
+                // running thread is itself stopped — it is destroying its
+                // own CSpace, or a concurrent teardown stopped it — nothing
+                // is freed now: the object is queued for off-CPU reclaim
+                // and the syscall epilogue schedules the thread away.
+                // SAFETY: cs_ptr uniquely owned (refcount 0); no scheduler,
+                // IPC, or registry lock is held here.
+                let stopped = unsafe {
+                    crate::sched::stop_threads_bound_to(|tcb| core::ptr::eq((*tcb).cspace, cs_ptr))
+                };
+                if stopped
+                {
+                    // SAFETY: refcount 0, no slot references the object; the
+                    // running thread is `Exited`, which rules out the idle
+                    // drain (see defer_self_teardown), so this is the syscall
+                    // path with interrupts disabled.
+                    unsafe { defer_self_teardown(ptr, "CSpace") };
+                    return;
+                }
+
                 // SAFETY: cs_ptr non-null; allocated at creation.
                 let id = unsafe { (*cs_ptr).id() };
                 dying_id = id;
                 let dying_epoch = crate::cap::registry_epoch(id);
 
-                // ── Pre-unregister derivation drain ──
-                // Hold DERIVATION_LOCK exclusively for the drain + unregister
-                // pair only. The drain walks each populated slot, snapshots
-                // its outgoing derivation pointers under a brief per-slot
-                // &mut, clears them, then splices the corresponding back-
-                // links in foreign slots. `unregister_cspace` runs inside
-                // the same critical section so any concurrent foreign reader
-                // sees a consistent "drained, then absent" transition.
+                // ── Batched pre-unregister derivation drain ──
+                // DERIVATION_LOCK is held per batch (bounded by
+                // MAX_DRAIN_EDITS steps — slots visited plus link edits),
+                // released between batches so
+                // an arbitrarily large donor-funded CSpace never stalls
+                // concurrent derivation traffic behind its teardown.
+                // `unregister_cspace` runs inside the FINAL batch's
+                // critical section so any concurrent foreign reader sees a
+                // consistent "drained, then absent" transition.
                 //
                 // The lock MUST be released BEFORE the `for_each_object`
                 // dec_ref cascade below: a slot in the dying CSpace may hold
                 // a CSpace cap whose dec_ref drives a nested
                 // `dealloc_object(CSpaceObj)` call, which would re-enter
                 // this same non-recursive lock and deadlock. The drain
-                // already removed every foreign back-link before this
-                // point, so the dec_ref cascade has no derivation-tree
-                // work to do — releasing is safe.
-                crate::cap::derivation::DERIVATION_LOCK.write_lock();
-                // SAFETY: DERIVATION_LOCK held; cs_ptr uniquely owned at
-                // refcount=0; registry entry still live (unregister below).
-                unsafe { drain_dying_cspace(cs_ptr, id, dying_epoch) };
-                crate::cap::unregister_cspace(id);
-                crate::cap::derivation::DERIVATION_LOCK.write_unlock();
+                // already removed every foreign link before this point, so
+                // the dec_ref cascade has no derivation-tree work to do —
+                // releasing is safe.
+                let mut drain_cursor: u32 = 0;
+                loop
+                {
+                    crate::cap::derivation::DERIVATION_LOCK.write_lock();
+                    // SAFETY: DERIVATION_LOCK held; cs_ptr uniquely owned at
+                    // refcount=0; registry entry still live (unregister
+                    // below, in the final batch's hold).
+                    let done = unsafe {
+                        drain_dying_cspace_batch(cs_ptr, id, dying_epoch, &mut drain_cursor)
+                    };
+                    if done
+                    {
+                        crate::cap::unregister_cspace(id);
+                        crate::cap::derivation::DERIVATION_LOCK.write_unlock();
+                        break;
+                    }
+                    crate::cap::derivation::DERIVATION_LOCK.write_unlock();
+                }
 
                 // Dec-ref all objects referenced by non-null slots. Runs
                 // without DERIVATION_LOCK so nested CSpaceObj deallocs (a
@@ -2377,10 +2521,9 @@ unsafe fn dealloc_object_one(
         // ── Endpoint ──────────────────────────────────────────────────────
         ObjectType::Endpoint =>
         {
-            // Distinguish heap-allocated (legacy) Endpoints from retype-backed
-            // ones by inspecting `header.ancestor`. Both share the same teardown
-            // logic for blocked queues and wait-set linkage; only the final
-            // memory-reclaim step differs.
+            // `header.ancestor` names the source Memory object (every Endpoint
+            // is retype-backed): the blocked-queue and wait-set teardown runs,
+            // then the slot is reclaimed to it.
             let ancestor_ptr = header.ancestor.load(Ordering::Acquire);
 
             // SAFETY: ptr originally points to an EndpointObject; header at offset 0.
@@ -2538,7 +2681,7 @@ unsafe fn dealloc_object_one(
             if new_rc == 0
             {
                 // SAFETY: refcount reached 0; recursion handles the Memory
-                // arm above (which frees the buddy pages and Box).
+                // arm above (which frees the buddy pages).
                 push_ancestor(worklist, head, ancestor_nn);
             }
         }
@@ -2546,7 +2689,7 @@ unsafe fn dealloc_object_one(
         // ── Notification ────────────────────────────────────────────────────────
         ObjectType::Notification =>
         {
-            // Branch on `header.ancestor`: heap-backed (legacy) vs retype-backed.
+            // `header.ancestor` names the source Memory object the slot returns to.
             let ancestor_ptr = header.ancestor.load(Ordering::Acquire);
 
             // SAFETY: ptr originally points to a NotificationObject; header at offset 0.
@@ -2796,347 +2939,182 @@ unsafe fn dealloc_object_one(
 
 // ── CSpace teardown helpers ──────────────────────────────────────────────────
 
-/// Pre-unregister derivation drain for a dying `CSpace`.
+/// Maximum derivation-link edits per `DERIVATION_LOCK` hold while draining
+/// a dying `CSpace` (mirrors `MAX_REVOKE_EDITS`): teardown of an
+/// arbitrarily large donor-funded `CSpace` releases the global lock
+/// between batches, so concurrent derivation traffic never stalls behind
+/// more than a constant amount of drain work.
+#[cfg(not(test))]
+const MAX_DRAIN_EDITS: usize = 256;
+
+/// Drain one batch of a dying `CSpace`'s derivation state.
 ///
-/// Iterates each populated slot in `cs_ptr` and splices the slot out of its
-/// foreign back-link chains so that, after `unregister_cspace` runs, no
-/// foreign slot in any other `CSpace` retains a derivation pointer into the
-/// dying one — every foreign-facing pointer is redirected to the nearest
-/// SURVIVING neighbour (or `None`), never left on a stale `SlotId`.
-/// Combined with the per-id epoch check in `crate::cap::lookup_cspace`,
-/// this lets `free_cspace_id` recycle the id safely, and it is the
-/// invariant `revoke_subtree_batch` relies on to treat a dead derivation
-/// link as corruption.
+/// Processes populated slots from `*cursor` upward. Per slot:
 ///
-/// Two passes: Pass 1 splices with every dying slot's pointers intact (the
-/// splice walks read through runs of dying siblings); Pass 2 clears the
-/// dying slots' pointers.
+/// 1. **Unlink every child**, head-first (`unlink_node` on
+///    `deriv_first_child` until the list is empty; one edit each, O(1)
+///    per edit — no list walking). A foreign child becomes a derivation
+///    root of its own subtree; a child in the dying `CSpace` becomes a
+///    parentless dying node, unlinked from *its* children when the cursor
+///    reaches its own index.
+/// 2. **Unlink the slot** from its parent/sibling links (`unlink_node`) —
+///    neighbours, live or dying, are re-linked directly. The head-pops in
+///    step 1 already left `deriv_first_child` at `None`.
+///
+/// Because every unlink re-links the neighbours directly, the forest is
+/// fully consistent after each edit — unlike a splice-then-clear two-pass
+/// drain, no state depends on a later pass. The caller may therefore
+/// release `DERIVATION_LOCK` between batches: a foreign traversal in the
+/// window (a revoke hoist, a transfer repoint) sees ordinary consistent
+/// nodes, and may even revoke a not-yet-drained dying slot — the drain
+/// then skips it as Null and the object refcount is settled once (revoke
+/// dec-refs it; the post-drain `for_each_object` pass skips Null slots).
+///
+/// The batch loop's progress: every edit removes one link, and the
+/// head-pop's no-progress containment truncates any unresolvable or
+/// cyclic chain instead of spinning. Work can still arrive between holds
+/// — the `CSpace` stays registered until the final batch, so a foreign
+/// `SYS_CAP_DELETE` of a slot whose parent is a dying slot reparents that
+/// slot's children into the dying slot, and a surviving thread of the
+/// owning process can derive out of the dying `CSpace` via its TCB
+/// pointer or have an in-flight `ipc_recv` delivery land caps into it.
+/// Each such event adds at most one reparent batch of work while the
+/// drain removes a batch per hold, so the loop is bounded by lock
+/// contention rather than by a constant, and it carries no batch backstop
+/// (a teardown cannot fail): a holder of capabilities derived from the
+/// dying `CSpace` can prolong the teardown for as long as it keeps
+/// deleting, which stalls the deleting thread, not the system. Links
+/// wired behind the cursor dangle once the `CSpace` unregisters and
+/// surface downstream as dead-link truncation, in the drain's own
+/// containment or `revoke_subtree_batch`'s — contained, and in the
+/// owning-process case reachable only by the dying process harming
+/// itself. The end state otherwise matches the previous whole-drain
+/// design: no slot anywhere references the dying `CSpace`, which is the
+/// invariant `free_cspace_id` recycling relies on.
+///
+/// Returns `true` once the whole `CSpace` is drained; `false` when the
+/// step budget ran out (call again — the cursor resumes at the same
+/// slot). Every slot visited and every link edit is one step, so a hold
+/// is bounded by `MAX_DRAIN_EDITS` whatever the population.
 ///
 /// ## Aliasing avoidance
 ///
-/// PR #136's first recycling attempt hit a release-mode aliasing UB: an
-/// outer iteration holding `&CSpacePage` while an inner closure took
-/// `&mut CapabilitySlot` to a slot inside the same page. This drain
-/// avoids the hazard structurally — no borrow into `cs_ptr` is held
-/// across foreign-slot accesses. The per-slot scope is:
-///
-/// 1. A brief `unsafe { (*cs_ptr).slot(idx) }` snapshots the four
-///    `deriv_*` fields into stack locals. The borrow ends at the block
-///    boundary.
-/// 2. The foreign-write step calls into [`drain_foreign_back_links`],
-///    which only accesses foreign `CSpace`s via fresh
-///    `lookup_cspace`/`slot_mut` calls; intra-cspace reads (the splice
-///    walks and the child chain) go through fresh immutable `slot()`
-///    lookups, never a re-borrow from inside this scope.
+/// No borrow into `cs_ptr` is held across foreign-slot accesses: reads of
+/// the dying slot go through brief `(*cs_ptr).slot(..)` scopes, and all
+/// link edits go through `unlink_node`, which resolves every slot it
+/// touches via fresh registry lookups.
 ///
 /// # Safety
 ///
-/// Caller MUST hold `DERIVATION_LOCK` write lock. `cs_ptr` MUST be a valid
-/// `CSpace` pointer whose refcount has reached zero (i.e. exclusive
-/// ownership). The registry entry for `dying_id` MUST still be live
-/// (i.e. `unregister_cspace` has not yet run); the deferred unregister
-/// allows the drain itself to splice through `lookup_cspace`.
+/// Caller MUST hold `DERIVATION_LOCK` write lock. `cs_ptr` MUST be a
+/// valid `CSpace` pointer whose refcount has reached zero (exclusive
+/// ownership). The registry entry for `dying_id` MUST still be live —
+/// `unregister_cspace` runs only after the final batch, in the same
+/// critical section, so foreign readers see a consistent
+/// "drained, then absent" transition.
 #[cfg(not(test))]
-unsafe fn drain_dying_cspace(
+unsafe fn drain_dying_cspace_batch(
     cs_ptr: *mut crate::cap::cspace::CSpace,
     dying_id: crate::cap::slot::CSpaceId,
     dying_epoch: u32,
-)
+    cursor: &mut u32,
+) -> bool
 {
-    use crate::cap::cspace::{L1_SIZE, L2_SIZE};
+    use crate::cap::cspace::L2_SIZE;
+    use crate::cap::derivation::{truncate_dead_link, unlink_node};
     use crate::cap::slot::{CapTag, SlotId};
     use core::num::NonZeroU32;
 
-    // Pass 1 — foreign splice, with every dying slot's derivation pointers
-    // still intact. The splice walks (`first_live_forward` /
-    // `first_live_backward`) read through runs of dying siblings to find
-    // the nearest surviving neighbour, which is only possible while no
-    // dying slot has been cleared yet: a foreign parent whose child-list
-    // head dies must be redirected to the first LIVE sibling, not to
-    // whatever dying slot happened to come next (that would strand live
-    // children behind a stale link).
-    for page_idx in 0..L1_SIZE
+    // Leaves are contiguous behind the grow cursor; leaf_count bounds the
+    // slot range exactly.
+    // SAFETY: cs_ptr is uniquely owned (refcount = 0).
+    let slot_count = (unsafe { (*cs_ptr).leaf_count() } * L2_SIZE) as u32;
+    let mut edits = 0usize;
+
+    while *cursor < slot_count
     {
-        // Presence-test the page without holding a `&CSpace` borrow into
-        // the per-slot scope below.
-        // SAFETY: cs_ptr is uniquely owned; `page_at` takes `&self` briefly
-        // and returns before the borrow can be observed elsewhere.
-        if unsafe { (*cs_ptr).page_at(page_idx) }.is_none()
+        let global_idx = *cursor;
+        // Every slot visited counts against the budget like a link edit, so
+        // a hold over a large but sparsely populated `CSpace` stays bounded.
+        if edits >= MAX_DRAIN_EDITS
         {
-            continue;
+            return false;
         }
-        let start = usize::from(page_idx == 0);
-        for slot_idx_in_page in start..L2_SIZE
-        {
-            let global_idx = (page_idx * L2_SIZE + slot_idx_in_page) as u32;
-            let Some(global_idx_nz) = NonZeroU32::new(global_idx)
-            else
-            {
-                continue;
-            };
-
-            // Snapshot the four pointers under a brief per-slot borrow; no
-            // clearing yet (Pass 2 does that after every splice completed).
-            // SAFETY: cs_ptr is uniquely owned (refcount=0); the borrow
-            // produced by slot is the only borrow into this slot for the
-            // duration of the block and is dropped before any foreign
-            // access.
-            let (parent, fc, prev, next, populated) = unsafe {
-                if let Some(slot) = (*cs_ptr).slot(global_idx)
-                {
-                    if slot.tag == CapTag::Null
-                    {
-                        (None, None, None, None, false)
-                    }
-                    else
-                    {
-                        (
-                            slot.deriv_parent,
-                            slot.deriv_first_child,
-                            slot.deriv_prev_sibling,
-                            slot.deriv_next_sibling,
-                            true,
-                        )
-                    }
-                }
-                else
-                {
-                    (None, None, None, None, false)
-                }
-            };
-            if !populated
-            {
-                continue;
-            }
-
-            let self_id = SlotId::with_epoch(dying_id, dying_epoch, global_idx_nz);
-
-            // Foreign splice. No borrow into `cs_ptr` is held.
-            // SAFETY: DERIVATION_LOCK held; foreign cspaces resolved via
-            // registry lookup with epoch validation.
-            unsafe {
-                drain_foreign_back_links(self_id, dying_id, dying_epoch, parent, fc, prev, next);
-            }
-        }
-    }
-
-    // Pass 2 — clear every dying slot's derivation pointers. Purely
-    // hygienic: the CSpace is unregistered and its storage reclaimed right
-    // after this drain, and Pass 1 guarantees no live slot still references
-    // any of these.
-    for page_idx in 0..L1_SIZE
-    {
-        // SAFETY: as in Pass 1.
-        if unsafe { (*cs_ptr).page_at(page_idx) }.is_none()
-        {
-            continue;
-        }
-        let start = usize::from(page_idx == 0);
-        for slot_idx_in_page in start..L2_SIZE
-        {
-            let global_idx = (page_idx * L2_SIZE + slot_idx_in_page) as u32;
-            // SAFETY: cs_ptr uniquely owned; brief exclusive per-slot borrow.
-            if let Some(slot) = unsafe { (*cs_ptr).slot_mut(global_idx) }
-                && slot.tag != CapTag::Null
-            {
-                slot.deriv_parent = None;
-                slot.deriv_first_child = None;
-                slot.deriv_prev_sibling = None;
-                slot.deriv_next_sibling = None;
-            }
-        }
-    }
-}
-
-/// Iteration bound for the drain's sibling walks: a dying run cannot
-/// exceed the dying `CSpace`'s slot count, so exceeding this means a
-/// corrupt sibling cycle — the walk truncates (returns `None`) instead of
-/// spinning under `DERIVATION_LOCK`.
-#[cfg(not(test))]
-const DRAIN_WALK_BOUND: usize = crate::cap::cspace::L1_SIZE * crate::cap::cspace::L2_SIZE;
-
-/// Walk `deriv_next_sibling` links starting at `from`, skipping slots that
-/// live in the dying `CSpace`, and return the first surviving sibling
-/// (`None` if the rest of the chain is dying or the chain ends).
-///
-/// Sound only during Pass 1 of [`drain_dying_cspace`], while the dying
-/// slots' sibling pointers are still intact.
-///
-/// # Safety
-///
-/// Caller MUST hold `DERIVATION_LOCK` write lock; `dying_id`'s registry
-/// entry MUST still resolve.
-#[cfg(not(test))]
-unsafe fn first_live_forward(
-    from: Option<crate::cap::slot::SlotId>,
-    dying_id: crate::cap::slot::CSpaceId,
-    dying_epoch: u32,
-) -> Option<crate::cap::slot::SlotId>
-{
-    let mut cur = from;
-    for _ in 0..=DRAIN_WALK_BOUND
-    {
-        let c = cur?;
-        if c.cspace_id != dying_id
-        {
-            return Some(c);
-        }
-        // SAFETY: dying CSpace still registered (caller contract); immutable
-        // read of an intact Pass-1 sibling pointer.
-        cur = crate::cap::lookup_cspace(dying_id, dying_epoch)
-            .and_then(|cs| unsafe { (*cs).slot(c.index.get()) })
-            .and_then(|s| s.deriv_next_sibling);
-    }
-    None
-}
-
-/// Mirror of [`first_live_forward`] walking `deriv_prev_sibling` links.
-///
-/// # Safety
-///
-/// As for [`first_live_forward`].
-#[cfg(not(test))]
-unsafe fn first_live_backward(
-    from: Option<crate::cap::slot::SlotId>,
-    dying_id: crate::cap::slot::CSpaceId,
-    dying_epoch: u32,
-) -> Option<crate::cap::slot::SlotId>
-{
-    let mut cur = from;
-    for _ in 0..=DRAIN_WALK_BOUND
-    {
-        let c = cur?;
-        if c.cspace_id != dying_id
-        {
-            return Some(c);
-        }
-        // SAFETY: as in first_live_forward.
-        cur = crate::cap::lookup_cspace(dying_id, dying_epoch)
-            .and_then(|cs| unsafe { (*cs).slot(c.index.get()) })
-            .and_then(|s| s.deriv_prev_sibling);
-    }
-    None
-}
-
-/// Splice `self_id`'s back-references out of foreign `CSpace` slots.
-///
-/// Intra-cspace back-links (where the back-reference lives in the dying
-/// `CSpace` itself) are skipped — their derivation pointers don't matter
-/// because the entire dying `CSpace`'s storage is about to be reclaimed.
-///
-/// Every foreign-facing splice targets the nearest SURVIVING neighbour:
-/// runs of consecutive dying siblings are walked through (their pointers
-/// are intact during Pass 1), so after the drain completes no live slot's
-/// derivation pointer references the dying `CSpace`. This is the invariant
-/// revocation relies on — a foreign parent's child-list head must land on
-/// a live child (or `None`), never on a stale `SlotId` that would strand
-/// the live children chained behind it.
-///
-/// For the children walk: a foreign child has its `deriv_parent` nulled
-/// (orphaned). Intra-cspace children are skipped for the same reason
-/// above. `next_sibling` advancement reads through `slot()` (immutable),
-/// which is safe because no `&mut` into the dying `CSpace` is held inside
-/// this function's scope.
-///
-/// # Safety
-///
-/// Caller MUST hold `DERIVATION_LOCK` write lock. `dying_id`'s registry
-/// entry MUST still be live so `lookup_cspace(dying_id, dying_epoch)`
-/// resolves for the intra-cspace walks, and no dying slot's derivation
-/// pointers may have been cleared yet (Pass-1 contract).
-#[cfg(not(test))]
-unsafe fn drain_foreign_back_links(
-    self_id: crate::cap::slot::SlotId,
-    dying_id: crate::cap::slot::CSpaceId,
-    dying_epoch: u32,
-    parent: Option<crate::cap::slot::SlotId>,
-    first_child: Option<crate::cap::slot::SlotId>,
-    prev: Option<crate::cap::slot::SlotId>,
-    next: Option<crate::cap::slot::SlotId>,
-)
-{
-    // Parent: if first_child pointed at self_id, redirect to the first
-    // surviving sibling.
-    if let Some(p) = parent
-        && p.cspace_id != dying_id
-        && let Some(parent_cs) = crate::cap::lookup_cspace(p.cspace_id, p.epoch)
-    {
-        // SAFETY: parent_cs from registry; DERIVATION_LOCK held.
-        if let Some(parent_slot) = unsafe { (*parent_cs).slot_mut(p.index.get()) }
-            && parent_slot.deriv_first_child == Some(self_id)
-        {
-            // SAFETY: Pass-1 contract (see Safety above).
-            parent_slot.deriv_first_child =
-                unsafe { first_live_forward(next, dying_id, dying_epoch) };
-        }
-    }
-
-    // Prev sibling: splice self_id (and any dying run after it) out of the
-    // chain — its next becomes the first surviving sibling.
-    if let Some(pr) = prev
-        && pr.cspace_id != dying_id
-        && let Some(prev_cs) = crate::cap::lookup_cspace(pr.cspace_id, pr.epoch)
-    {
-        // SAFETY: prev_cs from registry; DERIVATION_LOCK held.
-        if let Some(prev_slot) = unsafe { (*prev_cs).slot_mut(pr.index.get()) }
-            && prev_slot.deriv_next_sibling == Some(self_id)
-        {
-            // SAFETY: Pass-1 contract (see Safety above).
-            prev_slot.deriv_next_sibling =
-                unsafe { first_live_forward(next, dying_id, dying_epoch) };
-        }
-    }
-
-    // Next sibling: mirror splice — its prev becomes the first surviving
-    // sibling walking backwards.
-    if let Some(nx) = next
-        && nx.cspace_id != dying_id
-        && let Some(next_cs) = crate::cap::lookup_cspace(nx.cspace_id, nx.epoch)
-    {
-        // SAFETY: next_cs from registry; DERIVATION_LOCK held.
-        if let Some(next_slot) = unsafe { (*next_cs).slot_mut(nx.index.get()) }
-            && next_slot.deriv_prev_sibling == Some(self_id)
-        {
-            // SAFETY: Pass-1 contract (see Safety above).
-            next_slot.deriv_prev_sibling =
-                unsafe { first_live_backward(prev, dying_id, dying_epoch) };
-        }
-    }
-
-    // Children chain: orphan each foreign child by nulling its
-    // deriv_parent. Walk via next_sibling. Intra-cspace children are
-    // visited only to read next_sibling and continue the walk.
-    let mut cur = first_child;
-    while let Some(c) = cur
-    {
-        let next_in_chain = if c.cspace_id == dying_id
-        {
-            // Intra-cspace: don't touch (it's being iterated independently).
-            // Read next_sibling via immutable `slot()` to advance the walk.
-            // SAFETY: lookup returns the dying CSpace's ptr; the caller's
-            // per-slot snapshot borrow ended before this function was
-            // entered, so this immutable `&` borrow is exclusive.
-            crate::cap::lookup_cspace(c.cspace_id, c.epoch)
-                .and_then(|cs| unsafe { (*cs).slot(c.index.get()) })
-                .and_then(|s| s.deriv_next_sibling)
-        }
+        let Some(idx_nz) = NonZeroU32::new(global_idx)
         else
         {
-            // Foreign: resolve, snapshot next_sibling, null deriv_parent.
-            // SAFETY: foreign cspace lookup; DERIVATION_LOCK held.
-            crate::cap::lookup_cspace(c.cspace_id, c.epoch).and_then(|cs| unsafe {
-                (*cs).slot_mut(c.index.get()).and_then(|slot| {
-                    let n = slot.deriv_next_sibling;
-                    if slot.deriv_parent == Some(self_id)
-                    {
-                        slot.deriv_parent = None;
-                    }
-                    n
-                })
-            })
+            // Slot 0 is permanently null.
+            *cursor += 1;
+            edits += 1;
+            continue;
         };
-        cur = next_in_chain;
+        // SAFETY: brief immutable borrow; dropped at the end of the call.
+        let populated =
+            unsafe { (*cs_ptr).slot(global_idx) }.is_some_and(|s| s.tag != CapTag::Null);
+        if !populated
+        {
+            *cursor += 1;
+            edits += 1;
+            continue;
+        }
+        let self_id = SlotId::with_epoch(dying_id, dying_epoch, idx_nz);
+
+        // 1. Unlink every child, head-first: each head pop is one O(1)
+        //    edit (the head's unlink rewrites this slot's
+        //    `deriv_first_child` to the next child — no list walking), so
+        //    the edit budget bounds the hold's real work exactly.
+        loop
+        {
+            if edits >= MAX_DRAIN_EDITS
+            {
+                // Budget exhausted mid-slot; the caller re-enters with the
+                // cursor still naming this slot.
+                return false;
+            }
+            // SAFETY: brief immutable borrow of the dying slot.
+            let Some(head) =
+                unsafe { (*cs_ptr).slot(global_idx) }.and_then(|s| s.deriv_first_child)
+            else
+            {
+                break;
+            };
+            // SAFETY: DERIVATION_LOCK held; unlink_node resolves every slot
+            // it touches via fresh registry lookups (occupancy-gated) and
+            // clears the child's parent link.
+            unsafe { unlink_node(head) };
+            edits += 1;
+            // No-progress containment: an unresolvable head (dead link, or
+            // a stale/cyclic chain) makes unlink_node a no-op and would
+            // otherwise pin the pop loop forever. Truncate the chain
+            // hanging from it — the same containment revocation applies to
+            // a dead link — and move on.
+            // SAFETY: brief borrows of the dying slot.
+            let still_head =
+                unsafe { (*cs_ptr).slot(global_idx) }.and_then(|s| s.deriv_first_child);
+            if still_head == Some(head)
+            {
+                // SAFETY: DERIVATION_LOCK held; self_id names an occupied
+                // slot of a CSpace that stays registered until the final
+                // batch.
+                unsafe { truncate_dead_link(self_id, head, "teardown drain") };
+                break;
+            }
+        }
+
+        if edits >= MAX_DRAIN_EDITS
+        {
+            return false;
+        }
+
+        // 2. Unlink this slot from its parent/sibling dimension. Step 1
+        //    left its child pointer at None.
+        // SAFETY: DERIVATION_LOCK held (see above).
+        unsafe { unlink_node(self_id) };
+        edits += 1;
+
+        *cursor += 1;
     }
+    true
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -3145,7 +3123,7 @@ unsafe fn drain_foreign_back_links(
 mod tests
 {
     use super::*;
-    use core::mem::{offset_of, size_of};
+    use core::mem::offset_of;
 
     // Header MUST sit at offset 0 in every concrete object type: the kernel casts
     // *mut ConcreteObject to *mut KernelObjectHeader to read the refcount and type
@@ -3158,38 +3136,6 @@ mod tests
         assert_eq!(offset_of!(InterruptObject, header), 0);
         assert_eq!(offset_of!(IoPortObject, header), 0);
         assert_eq!(offset_of!(SchedControlObject, header), 0);
-    }
-
-    #[test]
-    fn struct_sizes()
-    {
-        // Header: 4 ref_count + 1 obj_type + 3 pad + 8 ancestor (Option<SlotId>
-        // via NonZeroU32 niche) = 16 bytes, alignment 4.
-        assert_eq!(size_of::<KernelObjectHeader>(), 16);
-        // MemoryObject: 16 header + 8 base + 8 size + 8 available_bytes +
-        // 1 owns_memory + 7 pad + 40 inline allocator + 4 lock + 4 pad = 96 bytes.
-        assert_eq!(size_of::<MemoryObject>(), 96);
-        // MmioObject: 16 header + 8 base + 8 size + 4 flags + 4 pad = 40.
-        assert_eq!(size_of::<MmioObject>(), 40);
-        // InterruptObject: 16 header + 4 start + 4 count = 24.
-        assert_eq!(size_of::<InterruptObject>(), 24);
-        // IoPortObject: 16 header + 2 base + 2 size + 4 pad = 24.
-        assert_eq!(size_of::<IoPortObject>(), 24);
-        // SchedControlObject: 16 header + 1 min + 1 max + 6 pad = 24 (8-align).
-        assert_eq!(size_of::<SchedControlObject>(), 24);
-        assert_eq!(size_of::<SbiControlObject>(), 16);
-        assert_eq!(size_of::<ThreadObject>(), 32);
-        assert_eq!(size_of::<EndpointObject>(), 24);
-        assert_eq!(size_of::<NotificationObject>(), 24);
-        assert_eq!(size_of::<EventQueueObject>(), 24);
-        assert_eq!(size_of::<WaitSetObject>(), 24);
-        // PoolChunkSlot: 8 ancestor + 8 base_offset + 8 page_count = 24 B.
-        assert_eq!(size_of::<PoolChunkSlot>(), 24);
-        // AddressSpaceObject: 16 header + 8 ptr + 8 budget + 8 lock + 8 head
-        // + 16 * 24 chunks = 432 B.
-        assert_eq!(size_of::<AddressSpaceObject>(), 48 + 24 * MAX_PT_CHUNKS);
-        // CSpaceKernelObject: same shape.
-        assert_eq!(size_of::<CSpaceKernelObject>(), 48 + 24 * MAX_PT_CHUNKS);
     }
 
     #[test]

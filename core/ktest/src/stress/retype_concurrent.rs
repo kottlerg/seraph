@@ -22,6 +22,7 @@ use syscall::{
 };
 use syscall_abi::CAP_INFO_MEMORY_AVAILABLE;
 
+use crate::spawn::{ArgBlock, child_args};
 use crate::{ChildStack, TestContext, TestResult};
 
 const NUM_WORKERS: usize = 64;
@@ -39,6 +40,21 @@ const fn worker_bits() -> [u64; NUM_WORKERS]
     bits
 }
 const WORKER_BIT: [u64; NUM_WORKERS] = worker_bits();
+
+/// Per-worker arguments, handed to `worker_entry` by address.
+#[derive(Clone, Copy)]
+struct WorkerArgs
+{
+    memory: u32,
+    done: u32,
+    bit_index: usize,
+}
+
+static WORKER_ARGS: ArgBlock<WorkerArgs, NUM_WORKERS> = ArgBlock::new(WorkerArgs {
+    memory: 0,
+    done: 0,
+    bit_index: 0,
+});
 
 pub fn run(ctx: &TestContext) -> TestResult
 {
@@ -74,7 +90,18 @@ pub fn run(ctx: &TestContext) -> TestResult
         let th = cap_create_thread(memory, ctx.aspace_cap, cs, 0, 0)
             .map_err(|_| "stress::retype_concurrent: create_thread failed")?;
 
-        let arg = u64::from(child_memory) | (u64::from(child_done) << 16) | ((i as u64) << 32);
+        // SAFETY: worker `i` has not been started yet; the block is reused
+        // only after every worker has been reaped.
+        let arg = unsafe {
+            WORKER_ARGS.publish(
+                i,
+                WorkerArgs {
+                    memory: child_memory,
+                    done: child_done,
+                    bit_index: i,
+                },
+            )
+        };
 
         // SAFETY: stress tests run sequentially; each worker uses a distinct stack.
         let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[i]) });
@@ -122,13 +149,14 @@ pub fn run(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
-// cast_possible_truncation: cap slots are < 2^32.
-#[allow(clippy::cast_possible_truncation)]
 fn worker_entry(arg: u64) -> !
 {
-    let memory_slot = (arg & 0xFFFF) as u32;
-    let done_slot = ((arg >> 16) & 0xFFFF) as u32;
-    let bit_index = ((arg >> 32) & 0xFFFF) as usize;
+    // SAFETY: `arg` is the entry `run` published for this worker.
+    let WorkerArgs {
+        memory: memory_slot,
+        done: done_slot,
+        bit_index,
+    } = unsafe { child_args(arg) };
     let bit = WORKER_BIT[bit_index.min(NUM_WORKERS - 1)];
 
     for _ in 0..ITERS_PER_WORKER

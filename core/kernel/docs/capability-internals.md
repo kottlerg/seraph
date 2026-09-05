@@ -26,45 +26,79 @@ From the design document:
   with its own Memory caps, so per-process kernel memory is bounded by
   what the process paid for
 
-### Storage: Two-Level Array
+### Storage: Hybrid Two-Level Radix
 
-The CSpace is implemented as a two-level array (similar to a small page table):
+The CSpace is a hybrid radix: an inline root of leaf pointers plus
+pool-allocated directory pages fanning out to further leaves (similar to a
+page table with a large root):
 
 ```rust
 pub struct CSpace
 {
-    /// L1 directory: array of pointers to L2 pages.
-    /// Statically sized; each entry covers L2_SIZE slots.
-    directory: [Option<Box<CSpacePage>>; L1_SIZE],
-
+    /// Direct region: inline pointers to the first L1_DIRECT leaf pages.
+    direct: [AtomicPtr<CSpacePage>; L1_DIRECT],
+    /// Indirect region: inline pointers to pool-allocated directory pages,
+    /// each fanning out to DIR_FANOUT further leaves.
+    indirect: [AtomicPtr<CSpaceDirPage>; L1_INDIRECT],
+    /// Grow cursor: leaves 0..next_leaf are allocated, contiguously.
+    next_leaf: u32,
     /// Total number of slots currently allocated (not necessarily in use).
     allocated_slots: usize,
 }
 
-/// One page of CSpace slots (an L2 block).
-/// Sized so that one CSpacePage is exactly one kernel heap allocation.
+/// One page of CSpace slots (a leaf).
 struct CSpacePage
 {
     slots: [CapabilitySlot; L2_SIZE],
 }
+
+/// One pool-allocated directory page: DIR_FANOUT leaf pointers.
+struct CSpaceDirPage
+{
+    entries: [AtomicPtr<CSpacePage>; DIR_FANOUT],
+}
 ```
 
-The concrete values of `L1_SIZE` and `L2_SIZE` are implementation constants
-chosen so that one `CSpacePage` fits in a single slab allocation and every
+The concrete values of `L1_DIRECT`, `L1_INDIRECT`, `DIR_FANOUT`, and
+`L2_SIZE` are implementation constants chosen so that one `CSpacePage` fits
+a single pool page, one `CSpaceDirPage` is exactly one pool page, and every
 slot index fits the cap handle's index field. They are established at
-implementation time and are not part of the public ABI. Their product is the
-directory's structural ceiling — the only slot bound a CSpace has; capacity
-below it is whatever the owner-funded slot-page pool backs.
+implementation time and are not part of the public ABI.
+`(L1_DIRECT + L1_INDIRECT × DIR_FANOUT) × L2_SIZE` is the directory's
+structural ceiling — the only slot bound a CSpace has; capacity below it is
+whatever the owner-funded slot-page pool backs.
 
-**Lookup is O(1):** A descriptor `d` maps to `directory[d / L2_SIZE].slots[d % L2_SIZE]`.
-Two array dereferences, always. No hash, no tree traversal, no search.
+**Lookup is O(1):** A descriptor `d` selects leaf `d / L2_SIZE` and slot
+`d % L2_SIZE`. Leaves below `L1_DIRECT` resolve through the inline root
+(two dereferences); higher leaves resolve through one directory page
+(three dereferences). No hash, no search.
 
-**Growth is demand-driven:** Directory entries start as `None`. The first allocation
-in a new L2 range triggers a `CSpacePage` allocation from the slab cache. L2 pages
-are never freed while the CSpace is live (slot indices must remain stable).
+**Growth is O(1) and strictly ordered:** leaves are materialised in index
+order behind the `next_leaf` cursor, so allocated leaves are always the
+contiguous range `0..next_leaf`. A grow into the indirect region first
+materialises the covering directory page from the same owner-funded pool
+(roughly one extra pool page per `DIR_FANOUT` leaves); a directory page
+that outlives a failed leaf allocation stays published — already paid for,
+it serves the next grow. Pages are never freed while the CSpace is live
+(slot indices must remain stable).
 
-**Slot 0** is always null. The directory entry for slot 0 exists but the slot is
-permanently locked to the null capability, enforced at the lookup level.
+**Memory ordering and lock domains:** directory and leaf pointers are
+write-once while the CSpace is live, published with Release after full
+initialisation, and read with Acquire by the lock-free lookup path
+(`lookup_cap`, `cap_info`). Mutation is split across two lock domains:
+slot occupancy, the free list, the directory, and the counters change
+only under the CSpace spinlock, while the derivation linkage of occupied
+slots changes only under the global derivation write lock (which reaches
+any registered CSpace's slots via registry lookup without taking its
+spinlock — see Derivation Tree below). Paths crossing the families hold
+the derivation lock outermost, then the spinlock. Races on slot content
+against the unlocked readers are narrowed — not closed — by the tag and
+per-slot generation checks at the resolution sites; the residual is
+confined to threads of the owning process racing each other.
+
+**Slot 0** is always null. The leaf covering slot 0 exists once the CSpace
+has grown, but the slot is permanently locked to the null capability,
+enforced at the lookup level.
 
 ### Free Slot Tracking
 
@@ -81,12 +115,15 @@ pub struct CSpace
 ```
 
 A free slot is `CapTag::Null` and encodes its successor's index in the `deriv_parent`
-field (the derivation parent is meaningless on an empty slot); `None` marks the list
-tail. The encoded `SlotId` carries `epoch == 0`, which a live derivation link never
-does, so the two uses of `deriv_parent` stay distinguishable. Allocation pops
-`free_head` and clears the slot; deallocation pushes onto the head. When the list is
-empty and more slots are needed, the next L2 page is allocated and all its usable
-slots are threaded onto the list.
+field and its predecessor's in `deriv_first_child` (both derivation fields are
+meaningless on an empty slot); `None` marks the list tail and the list head
+respectively. The encoded `SlotId` carries `epoch == 0`, which a live derivation
+link never does, so the two uses stay distinguishable. The predecessor link makes
+`remove_from_free_list` — the explicit-placement path that unlinks an arbitrary
+index — O(1); a list walk would run under the CSpace spinlock with interrupts
+disabled. Allocation pops `free_head` and clears the slot; deallocation pushes onto
+the head. When the list is empty and more slots are needed, the next leaf page is
+allocated and all its usable slots are threaded onto the list.
 
 A `Null` tag alone cannot tell a slot that is *linked on the free list* from one that
 was just allocated and not yet populated, and the list tail is byte-identical to a
@@ -295,19 +332,50 @@ root_cap (no parent)
     └── derived_B1 (first child of B)
 ```
 
-**Transfer** does not create a new derivation tree node — the transferred slot
-inherits the donor's position in the tree. The donor's slot becomes null.
+**Transfer** (`SYS_CAP_MOVE`, IPC capability transfer) does not create a new
+derivation tree node — the destination slot takes the donor's position in the
+tree and the donor's slot becomes null (see [Move](#move) for how a large child
+list is migrated).
 
 **Derivation** creates a new node as a child of the source slot in the tree.
 
 ### Global Derivation Lock
 
-A single global reader-writer lock protects derivation tree modifications. Multiple
-readers may hold it simultaneously for traversal (during `SYS_CAP_DERIVE`); writers
-hold it exclusively during revocation.
+A single global reader-writer lock protects the derivation tree. Every path that
+links, moves, or frees an occupied slot holds it for writing: copy, derive, the
+splits, the memory merge, move and IPC transfer, delete, revoke, and object
+teardown. Inserts that create a derivation root (`SYS_CAP_CREATE_*`, the boot
+population) take only the CSpace spinlock — a root has no linkage to edit.
+Lock-free readers never traverse the tree; they resolve one slot by handle and
+rely on the tag and generation checks described above.
 
-This is a deliberate design choice: revocation is rare relative to capability use.
-The global lock avoids deadlock from ordering multiple per-CSpace locks.
+The source of a copy or derive, the parent of a memory split, and both caps of
+a memory merge are looked up unlocked, so each of those paths revalidates them
+under the write lock — same tag-bearing occupancy, same generation, same
+object, no revoke in flight — before touching the object or editing the tree.
+Every occupied→free transition holds the lock, so a slot that revalidates stays
+live (and stays the link's parent) for the rest of the hold. A slot freed
+meanwhile fails the call with `InvalidCapability` (a revoke in flight on it,
+`InvalidState`); the alternative — `link_child` dropping the link under a freed
+parent — would leave the new capability a derivation root outside every
+ancestor's revoke reach, and a merge would free a recycled tail index.
+
+This is a deliberate design choice: a single lock avoids deadlock from ordering
+multiple per-CSpace locks, and derivation-tree edits are rare relative to
+capability use.
+
+The lock is a bare CAS spin lock. Every context that takes it cannot be
+descheduled — syscall context with interrupts masked, a preempt-disabled
+window, or the idle thread's deferred reclaim, whose time slice is permanently
+zero — and a holder never parks (see
+[scheduling-internals.md](scheduling-internals.md) § Lock Hierarchy, "Bare spin
+locks", for the contexts, the invariant each rests on, and the full order:
+derivation lock, then the `MemoryObject` write locks of a split or merge, then
+the SEED read lock of a retype, then the `CSpace` spinlock, then a wrapper pool
+lock; the kernel page-table pool lock sits in a separate chain under
+`pt_lock`). The lock records its write holder's CPU, thread, syscall, and call
+site, and a CPU spinning for it records a lock-wait breadcrumb; the softlockup
+watchdog dump prints both.
 
 ### Revocation Algorithm
 
@@ -326,11 +394,10 @@ revoke(root_handle):
     loop:
         acquire derivation tree write lock
         revalidate root (non-Null, handle generation current); stop if not
-        first batch: refuse if the root is already marked revoke-in-progress,
-                     else set the marker
+        first batch: refuse if the root is already pinned, else pin it
         objects, status = revoke_subtree_batch(root) // ≤ MAX_REVOKE_EDITS edits
         final batch (status ≠ MoreWork, or MAX_REVOKE_BATCHES reached):
-            clear the marker
+            unpin the root
         release derivation tree write lock
         dec_ref / dealloc each collected object      // outside the lock
         Cleared → return success; DeadLink → return error;
@@ -363,31 +430,91 @@ creator a slot plus a kernel object), so tripping it indicates sustained
 concurrent re-derivation and returns `Interrupted` — revoked nodes stay
 revoked, and a retry continues from the surviving subtree.
 
-Because hoisting destroys intermediate parent→child edges as the flattening
-proceeds, the root is pinned for the whole multi-batch operation with a
-**revoke-in-progress marker** (`CapabilitySlot::revoke_in_progress`, stored in
-the slot's spare pad byte, read and written only under the derivation write
-lock). `SYS_CAP_DELETE` and `SYS_CAP_MOVE` refuse a marked slot with
-`InvalidState`; IPC capability transfer refuses to move one — the reply
-direction surfaces `InvalidState` to the server (the caller resumes with
-`IPC_REPLY_TRANSFER_FAILED`), the call direction rejects before blocking,
-and a refusal detected only post-commit delivers the message with zero
-caps (see [docs/ipc-design.md](../../../docs/ipc-design.md) § Message
-Format). Deleting or moving the root between batches would promote the
-temporarily hoisted survivors and permanently sever the intermediate
-holders' revocation authority. The marker is cleared under the lock on
-every syscall exit path — completion, dead-link error, and the
-`Interrupted` backstop alike — so it cannot leak; a root freed by a
-concurrent ancestor revoke sheds the marker with the slot (that ancestor's
-revoke clears the hoisted survivors too, since they remain inside its
-subtree).
+Deletion and the range splits (`SYS_MMIO_SPLIT`, `SYS_IRQ_SPLIT`,
+`SYS_IOPORT_SPLIT`, `SYS_SCHED_SPLIT`) consume a slot without revoking
+under it: its children are re-linked under its derivation parent
+(`reparent_children`) so they stay inside every ancestor's subtree. That
+walk is batched on the same terms as revocation — `MAX_REPARENT_EDITS`
+head pops per lock hold, each child detached into a clean root and
+re-linked in O(1), the lock released between batches, and a
+`MAX_REPARENT_BATCHES` backstop against a concurrent deriver — because a
+slot can have been derived from up to the structural ceiling of every
+CSpace. The consumed slot is revalidated under the lock before every batch
+(tag and handle generation, no revoke in flight; the splits additionally
+check it still holds the object that was looked up, since their lookup ran
+without the lock): a concurrent revoke starting on it stops the delete with
+`InvalidState` and children already moved stay under the parent, a
+concurrent delete finishing it first turns the delete into a success and a
+split into `InvalidState` with both children rolled back. The split's own
+children are inserted and linked under the original's parent inside the
+first hold, before any batch releases the lock, so they are never reachable
+but unlinked — a sibling's `SYS_CAP_MOVE` carries whatever derivation
+position it finds, and an unlinked child would leave the grantor's revoke
+reach for good. Rolling a child back checks that its slot still holds it
+under the generation minted at insert, so a sibling that deleted one (and
+refilled its slot) never has an unrelated cap freed. The handles returned to
+the caller are the ones minted under the insert's own `CSpace` lock hold, so
+such a child's handle no longer resolves; re-reading the slot after the lock
+is released would instead return a live handle to the refill.
 
-Every derivation link reachable from a live slot resolves: `drain_dying_cspace`
-splices all foreign-facing links to surviving neighbours (walking through runs
-of dying siblings) before a `CSpace` unregisters. A link that fails to resolve
-anyway is corruption: the walk truncates the chain hanging from it
-(containment), logs it, and the syscall returns `InvalidState` instead of
-reporting a clean revoke.
+Because hoisting destroys intermediate parent→child edges as the flattening
+proceeds, the root is pinned for the whole multi-batch operation with the
+**in-flight pin** (`CapabilitySlot::pinned`, stored in the slot's spare pad
+byte, read and written only under the derivation write lock; a move pins its
+source and destination the same way — see [Move](#move)). `SYS_CAP_DELETE`,
+`SYS_CAP_MOVE`, `SYS_CAP_COPY`, `SYS_CAP_DERIVE`, `SYS_CAP_DERIVE_BADGE`,
+`SYS_MEMORY_SPLIT`, `SYS_MEMORY_MERGE`, the range splits, and a further
+`SYS_CAP_REVOKE` refuse a pinned slot with `InvalidState`; IPC capability
+transfer refuses to move one — the reply direction surfaces `InvalidState` to
+the server (the caller resumes with `IPC_REPLY_TRANSFER_FAILED`), the call
+direction rejects before blocking, and a refusal detected only post-commit
+delivers the message with zero caps (see
+[docs/ipc-design.md](../../../docs/ipc-design.md) § Message Format). Deleting
+or moving the root between batches would promote the temporarily hoisted
+survivors and permanently sever the intermediate holders' revocation
+authority. The pin is cleared under the lock on every syscall exit path —
+completion, dead-link error, and the `Interrupted` backstop alike — so it
+cannot leak; a root freed by a concurrent ancestor revoke sheds the pin with
+the slot (that ancestor's revoke clears the hoisted survivors too, since they
+remain inside its subtree).
+
+A `CSpace` reaching refcount zero first stops every thread bound to it
+(`sched::stop_threads_bound_to`, see
+[scheduling-internals.md](scheduling-internals.md) § Thread Registry): each is
+marked `Exited` and waited off every CPU before any slot page is freed, so no
+thread can be mid-syscall against the dying directory, and none of the dying
+process's own threads can touch the derivation forest during the drain below.
+If the thread running the teardown is itself stopped — it deleted the last
+capability to its own `CSpace`, or a concurrent teardown stopped it — nothing
+below runs now: the object is queued for off-CPU reclaim and the whole arm
+re-runs from the deferred drain once the thread has been scheduled away.
+The same discipline applies to an `AddressSpace` reaching refcount zero.
+
+Every derivation link reachable from a live slot resolves: before a `CSpace`
+unregisters, its teardown drain (`drain_dying_cspace_batch`) unlinks every
+dying slot from the forest — foreign children are orphaned into derivation
+roots, and each slot is spliced out of its parent/sibling links with the
+neighbours re-linked directly. Each unlink leaves the forest fully consistent,
+so the drain runs in step-bounded batches (every slot visited and every link
+edit is one step) that release the derivation write lock between holds
+(mirroring revocation's batching); a foreign traversal in a window between
+batches sees ordinary consistent nodes. The one remaining source of a dead
+link is a foreign sender whose capability transfer into the dying CSpace had
+already committed to a receiver there before that receiver was stopped, wiring
+a link into a slot the drain cursor has passed. A link that fails to resolve —
+that race, or genuine corruption — is contained wherever a walk meets it,
+always by truncation: the revoke walk cuts the chain hanging from the dead
+link, logs it, and the syscall returns `InvalidState` instead of reporting a
+clean revoke; the reparent walk that deletion and the range splits run on the
+consumed slot's children cuts and logs the same way and completes (the
+abandoned children were already orphaned from a vanished CSpace); the teardown
+drain, which has no caller to report to, detects the same condition as a head
+pop that makes no progress, logs it, cuts the dying slot's child list, and
+continues with the next slot. A drain truncation abandons the foreign children
+chained behind the dead link without clearing their parent pointers: they keep
+naming the dying CSpace, and only the registry epoch check keeps such a
+pointer fail-closed (it resolves to nothing — the child behaves as a
+derivation root) rather than aliasing onto a recycled CSpace id.
 
 **Performance characteristics:** Revocation is O(N) in the number of descendants.
 For well-behaved systems, derivation trees are shallow (a server derives a
@@ -410,6 +537,87 @@ locks (see lock ordering in [ipc-internals.md](ipc-internals.md)). Therefore,
 write lock. Revocation collects a set of IPC objects needing cleanup (e.g. endpoints
 that have a revoked capability in their send queue), releases the write lock, then
 acquires individual IPC object locks to perform cleanup.
+
+### Move
+
+`SYS_CAP_MOVE` and IPC capability transfer relocate an occupied slot to a
+fresh slot — auto-allocated or, for the syscall, caller-chosen — in the same
+or another `CSpace` (`cap/transfer.rs`). The destination takes the source's
+exact position in the tree: its parent, its siblings, and every one of its
+children are repointed onto the new slot, and the source is freed. The child
+walk is the unbounded part — a slot can have been derived from up to the
+structural ceiling of every `CSpace` — so it runs on the same terms as
+deletion's reparent walk: `MAX_REPARENT_EDITS` head pops per lock hold
+(`reparent_children`, each child detached and re-linked under the destination
+in O(1)), the derivation lock released between batches, and a
+`MAX_REPARENT_BATCHES` backstop against a concurrent deriver.
+
+```
+move(src, dst):
+    first hold (derivation lock + both CSpace locks, pointer order):
+        validate src: occupied, handle generation current, not pinned
+        insert dst; inc_ref the object; pin src and dst
+        migrate up to MAX_REPARENT_EDITS children of src under dst
+        all moved → finish; else link dst as src's first child
+    every later hold (derivation lock only):
+        revalidate src and dst: occupied, same generation, same object
+        both live     → unlink dst, migrate another batch, finish or re-link
+        src gone, dst live → unpin dst; done (whoever freed src dropped its reference)
+        dst gone      → unpin src; InvalidState (src keeps the cap and its remaining children)
+        both gone     → InvalidCapability
+    finish: dst takes src's links and every neighbour that points at src;
+            free src; unpin dst
+    after the hold: dec_ref the object for the freed src slot
+```
+
+A capability with at most `MAX_REPARENT_EDITS` children completes inside the
+first hold. Between holds the tree is consistent and revocation-complete: the
+destination hangs under the still-live source, so it and the children already
+moved beneath it remain descendants of every ancestor of the source, and the
+children not yet moved remain under the source. An ancestor's revoke running
+concurrently sees ordinary nodes — it may hoist the destination up to its own
+root, and the next batch detaches the destination from wherever it hangs
+before re-linking it. Two slots name the object while the move is in flight
+and the destination holds its own reference, so a revoke that frees either
+slot drops exactly that slot's reference.
+
+Both slots carry the in-flight pin between batches. The pin refuses every
+operation that would tear the migration — a delete, move, copy, derive,
+split, merge, revoke, or IPC transfer of either slot returns `InvalidState`
+until the move completes — and, because derivation from a pinned slot is
+refused, the source's child list can grow only indirectly (deleting one of
+its children promotes that child's children to it), which is what the
+backstop covers. Tripping it leaves the destination where the last batch
+re-linked it, a live derived child of the source with both pins cleared —
+the shape `SYS_CAP_COPY` produces — and returns `Interrupted` from the
+syscall; an IPC transfer delivers the destination handle.
+
+Neither slot pins its `CSpace` against teardown. IPC transfer resolves both
+`CSpace`s through the registry under the derivation lock, from the identity
+each TCB carries (`cspace_id`, `cspace_epoch`): a parked sender or receiver
+holds no reference on its `CSpace`, so a raw pointer read from its TCB could
+name storage a teardown has unregistered and freed, whereas a `CSpace` that
+resolves stays allocated for the hold — unregistration happens under the
+same lock and the storage is released only after it. The later batches
+resolve both slots the same way, so a `CSpace` torn down meanwhile is
+observed as gone rather than dereferenced, and a source slot that no longer
+resolves is left to that teardown's cascade, which releases the reference
+it holds. The drain of a dying `CSpace` treats its in-flight slots like any
+other: the children hanging under a dying slot become derivation roots (the
+standard teardown semantic above) — the destination, carrying its migrated
+children, when the source's `CSpace` dies (the move then completes on the
+next batch, the destination now a root), the migrated children when the
+destination's `CSpace` dies (the move reports `InvalidState`, the source
+keeping the capability and its remaining children). When the freed source
+slot's reference was the last one to a `Thread`, `CSpace`, or
+`AddressSpace`, the object goes to the CPU's deferred reclaim rather than
+being torn down in place — a teardown stops bound threads and waits on
+other CPUs, which must not happen inside IPC delivery. A capability whose
+source and destination an ancestor's revoke both freed mid-transfer, or
+whose destination went with the receiver's `CSpace` (the sender then keeps
+it), is delivered as handle 0 (the permanently null slot); one that trips
+the backstop is delivered live, the sender's slot surviving as its
+derivation parent.
 
 ### Safe Delegation: the "Derive Twice" Pattern
 
@@ -470,7 +678,7 @@ by:
 ```
 resolve(slot_id):
     cspace = cspace_table[slot_id.cspace_id]  // O(1) from global table
-    return cspace.slot(slot_id.index)         // O(1) two-level lookup
+    return cspace.slot(slot_id.index)         // O(1) lookup (two or three levels)
 ```
 
 Resolution does not require holding a lock on the target `CSpace` — the derivation
@@ -510,37 +718,39 @@ on init's user stack before it begins execution.
 ## Capability Transfer in IPC
 
 IPC capability transfer (via `SYS_IPC_CALL` and `SYS_IPC_REPLY` capability slots)
-moves all of a message's capabilities or none of them; a refused transfer does
-not block message delivery (see
-[docs/ipc-design.md](../../../docs/ipc-design.md) § Message Format). The
-per-capability move is:
+begins the move of all of a message's capabilities or of none of them —
+all-or-nothing at commit; a refused transfer does not block message delivery
+(see [docs/ipc-design.md](../../../docs/ipc-design.md) § Message Format). Each
+capability is relocated by the batched move described under [Move](#move):
 
 ```
-transfer_cap(sender, sender_slot_idx, receiver, receiver_slot_idx):
-    acquire derivation tree write lock
-    src_slot = sender.cspace.slot(sender_slot_idx)
-    dst_slot = receiver.cspace.slot(receiver_slot_idx)
-    // dst_slot must be null (verified before IPC delivery begins)
-    dst_slot.{tag, rights, badge, object} = src_slot.{...}  // copy the cap
+transfer_caps(sender_tcb, handles, receiver_tcb):
+    one hold (derivation lock, then both CSpace locks in pointer order):
+        resolve both CSpaces through the registry from the identity each
+            TCB carries (cspace_id, cspace_epoch); either gone → refuse
+        validate every handle: distinct, occupied, generation current,
+            not pinned
+        pre-allocate len(handles) slots in the receiver's CSpace
+        begin every move (insert dst, pin both, first batch)
+    drive each move that did not finish, one batch per hold
+    deliver the destination handles
     // The moved cap takes the source's position in the derivation tree: its
-    // parent, children, and siblings are repointed onto dst_slot, including
-    // across the CSpace boundary. That cross-boundary edge is what lets an
-    // ancestor's cap_revoke reach the moved cap; per-slot generation (#349)
-    // makes the receiver's handle fail closed if such a revoke frees this slot.
-    repoint_derivation_links(src_slot_id -> dst_slot_id)
-    src_slot.tag = CapTag::Null                    // clear the sender's slot
-    src_slot.object = None
-    // Note: ref_count does not change (same number of slots reference the object)
-    release derivation tree write lock
+    // parent, children, and siblings are repointed onto the destination,
+    // including across the CSpace boundary. That cross-boundary edge is what
+    // lets an ancestor's cap_revoke reach the moved cap; per-slot generation
+    // (#349) makes the receiver's handle fail closed if such a revoke frees
+    // this slot.
 ```
 
-IPC capability transfer is always cross-`CSpace` (sender and receiver are distinct
-processes). The transferred cap keeps its position in the derivation tree, so it
-remains reachable by a `cap_revoke` on one of its ancestors; per-slot generation
-handles make the receiver's handle fail closed if such a revoke frees the
-receiver's slot (#349). The derivation write lock is held for the duration of the
-transfer, so no revocation can run concurrently with a transfer, preventing torn
-state.
+IPC capability transfer is normally cross-`CSpace` (sender and receiver in
+distinct processes); two threads sharing one `CSpace` can transfer between
+themselves, the lock pair collapsing to a single acquisition. The transferred
+cap keeps its position in the derivation tree, so it remains reachable by a
+`cap_revoke` on one of its ancestors; per-slot generation handles make the
+receiver's handle fail closed if such a revoke frees the
+receiver's slot (#349). A move that finishes in the first hold is atomic against
+revocation; one that needs further batches is protected by the in-flight pins
+and stays revocation-complete between holds (see [Move](#move)).
 
 Reply capabilities are not part of the derivation tree — they are single-use,
 cannot be derived, and are not tracked for revocation. A reply capability is not
@@ -552,4 +762,6 @@ CSpace. The kernel clears the per-thread reply slot after `SYS_IPC_REPLY`.
 
 ## Summarized By
 
-[kernel/README.md](../README.md)
+[kernel/README.md](../README.md),
+[docs/capability-model.md](../../../docs/capability-model.md),
+[docs/ipc-design.md](../../../docs/ipc-design.md)

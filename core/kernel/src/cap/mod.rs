@@ -46,11 +46,12 @@ pub mod slot;
 // callers are the `#[cfg(not(test))]` split syscalls, so gate the whole module.
 #[cfg(not(test))]
 pub mod split;
+pub mod transfer;
 
 // Re-exports for convenience. Many are consumed by future phases; suppress the
 // unused lint rather than removing symbols that future code will reference.
 #[allow(unused_imports)]
-pub use cspace::{CSpace, CapError, L1_SIZE, L2_SIZE};
+pub use cspace::{CSpace, CapError, L2_SIZE};
 #[allow(unused_imports)]
 pub use derivation::DERIVATION_LOCK;
 #[allow(unused_imports)]
@@ -485,12 +486,12 @@ pub fn sum_memory_available_bytes(cspace: &cspace::CSpace) -> u64
 /// either retries indefinitely (e.g. `request_round` in a child) or
 /// surfaces an unexpected `OutOfMemory`.
 ///
-/// Backing the directory's full structural ceiling would cost 257 SEED
-/// pages (~1 MiB) for a `CSpace` whose occupancy peaks at boot and is
-/// bounded in steady state. Growth past the seeded pool returns the
-/// refillable `OutOfMemory`; init owns the shortfall and can refill via
-/// augment-mode `cap_create_cspace` against its own `CSpace` cap
-/// (`ProcessInfo.cspace_cap`).
+/// Backing the directory's full structural ceiling would cost about 65,800
+/// SEED pages (~257 MiB: 65,664 leaves plus 128 directory pages) for a
+/// `CSpace` whose occupancy peaks at boot and is bounded in steady state.
+/// Growth past the seeded pool returns the refillable `OutOfMemory`; init
+/// owns the shortfall and can refill via augment-mode `cap_create_cspace`
+/// against its own `CSpace` cap (`ProcessInfo.cspace_cap`).
 #[cfg(not(test))]
 const ROOT_CSPACE_INIT_SLOT_CAPACITY: u64 = 1536;
 
@@ -809,7 +810,8 @@ pub(crate) unsafe fn drain_and_install_seed(out: &mut [RamBlock]) -> usize
     // remainder, so the post-handoff buddy free count reaches 0. The PT pool
     // must also be live before Phase 9's first bootstrap map, which holds.
     reserve_init_backing();
-    // SAFETY: single-threaded Phase 7; kernel_pt_pool::init locks internally.
+    // SAFETY: single-threaded Phase 7 with no other pool consumer live yet,
+    // so the unlocked init has exclusive access.
     unsafe {
         crate::mm::kernel_pt_pool::init(POOL_SEED_PAGES);
     }
@@ -1051,6 +1053,7 @@ pub(crate) unsafe fn boot_retype_aspace(
                 pt_pool_lock: AtomicU64::new(0),
                 pt_pool_head_phys: AtomicU64::new(0),
                 pt_chunks: vacant_chunk_slots(),
+                deferred_next: core::ptr::null_mut(),
             },
         );
     }
@@ -1143,6 +1146,7 @@ pub(crate) unsafe fn boot_retype_cspace(
                 cs_pool_lock: AtomicU64::new(0),
                 cs_pool_head_phys: AtomicU64::new(0),
                 cs_chunks: vacant_chunk_slots(),
+                deferred_next: core::ptr::null_mut(),
             },
         );
     }
@@ -2462,193 +2466,6 @@ pub(crate) unsafe fn unlock_cspace_pair(a: *mut CSpace, b: *mut CSpace, saved_a:
     }
 }
 
-/// Move a capability between `CSpaces`, rewriting derivation tree pointers in place.
-///
-/// The destination slot takes the source's exact position in the derivation
-/// tree: parent, children, and siblings are repointed to the new
-/// `(dst_cspace_id, new_idx)` location. A cross-CSpace move preserves the
-/// derivation edge across the boundary, so a `revoke_subtree_batch` rooted in the
-/// source `CSpace` can reach and free the moved slot in the destination.
-///
-/// That cross-CSpace free is safe against stale-handle aliasing (#349) because
-/// cap handles carry a per-slot generation: freeing a slot bumps its
-/// generation, so a recipient that still holds the old handle fails with
-/// `InvalidCapability` instead of aliasing whatever later reuses the index.
-///
-/// No ref-count change occurs — this is a move, not a copy.
-///
-/// # Contract
-/// - **Caller must hold [`DERIVATION_LOCK`]`.write_lock()`** for the duration.
-/// - **Caller must hold both `src_cspace.lock` and `dst_cspace.lock`** (or
-///   the single lock when both pointers are equal). Acquire in pointer
-///   address order to prevent ABBA deadlock; the same order
-///   `transfer_caps` uses.
-/// - Source slot must be non-null.
-/// - `dst_cspace` must have at least one free slot (call `pre_allocate` first).
-///
-/// Returns the encoded cap handle (generation + index) for the new slot in
-/// `dst_cspace`, or an error if the source slot is null/invalid or the
-/// destination `CSpace` is full. `src_idx` must be a decoded (bare) index
-/// that the caller has already generation-validated: `sys_cap_move` checks
-/// the source handle itself, and the IPC transfer path checks every named
-/// handle in `prevalidate_transfer_slots` under the same locks (#349).
-///
-/// # Safety
-/// `src_cspace` and `dst_cspace` must be valid, live `CSpace` pointers.
-///
-/// # To add support for explicit destination index
-/// Add a `dst_idx: Option<u32>` parameter and call `insert_cap_at` when `Some`.
-#[cfg(not(test))]
-#[allow(clippy::too_many_lines)]
-pub unsafe fn move_cap_between_cspaces(
-    src_cspace: *mut CSpace,
-    src_idx: u32,
-    dst_cspace: *mut CSpace,
-) -> Result<u32, syscall::SyscallError>
-{
-    use syscall::SyscallError;
-
-    // Read source slot (tag, rights, object pointer, badge).
-    let (src_tag, src_rights, src_object, src_badge) = {
-        // SAFETY: src_cspace is a valid CSpace pointer; guaranteed by caller contract.
-        let cs = unsafe { &*src_cspace };
-        let slot = cs.slot(src_idx).ok_or(SyscallError::InvalidCapability)?;
-        if slot.tag == CapTag::Null
-        {
-            return Err(SyscallError::InvalidCapability);
-        }
-        // A revoke is mid-flight on this slot (see
-        // `CapabilitySlot::revoke_in_progress`): moving the root between
-        // revoke batches would abandon its temporarily hoisted survivors
-        // and sever intermediate revocation edges. Transient — the move
-        // can be retried once the revoke completes.
-        if slot.revoke_in_progress()
-        {
-            return Err(SyscallError::InvalidState);
-        }
-        (
-            slot.tag,
-            slot.rights,
-            slot.object.ok_or(SyscallError::InvalidCapability)?,
-            slot.badge,
-        )
-    };
-
-    // SAFETY: src_cspace is a valid CSpace pointer; guaranteed by caller contract.
-    let src_cspace_id = unsafe { (*src_cspace).id() };
-    // SAFETY: dst_cspace is a valid CSpace pointer; guaranteed by caller contract.
-    let dst_cspace_id = unsafe { (*dst_cspace).id() };
-
-    // Insert into destination (auto-allocate free slot).
-    // SAFETY: dst_cspace is a valid CSpace pointer; guaranteed by caller contract.
-    let new_idx_nz = unsafe { (*dst_cspace).insert_cap(src_tag, src_rights, src_object) }
-        .map_err(SyscallError::from)?;
-    let new_idx = new_idx_nz.get();
-
-    let src_idx_nz = core::num::NonZeroU32::new(src_idx).ok_or(SyscallError::InvalidCapability)?;
-    let src_slot_id = SlotId::current(src_cspace_id, src_idx_nz);
-    let dst_slot_id = SlotId::current(dst_cspace_id, new_idx_nz);
-
-    // The destination takes the source's exact position in the derivation tree:
-    // parent, children, and siblings are repointed to the new slot, including
-    // across a CSpace boundary. Read derivation links from the source slot.
-    let (src_parent, src_first_child, src_prev, src_next) = {
-        // SAFETY: src_cspace is a valid CSpace pointer; guaranteed by caller contract.
-        let cs = unsafe { &*src_cspace };
-        // SAFETY: src_idx was validated to index a live slot by the
-        // cs.slot(src_idx).ok_or(...) check in the source-slot read above.
-        #[allow(clippy::unwrap_used)]
-        let slot = cs.slot(src_idx).unwrap();
-        (
-            slot.deriv_parent,
-            slot.deriv_first_child,
-            slot.deriv_prev_sibling,
-            slot.deriv_next_sibling,
-        )
-    };
-
-    // Copy badge and derivation links to the destination slot.
-    // SAFETY: dst_cspace is a valid CSpace pointer; new_idx was just allocated by insert_cap.
-    if let Some(dst_slot) = unsafe { (*dst_cspace).slot_mut(new_idx) }
-    {
-        dst_slot.badge = src_badge;
-        dst_slot.deriv_parent = src_parent;
-        dst_slot.deriv_first_child = src_first_child;
-        dst_slot.deriv_prev_sibling = src_prev;
-        dst_slot.deriv_next_sibling = src_next;
-    }
-
-    // Update parent's first_child if it pointed to source.
-    if let Some(parent_id) = src_parent
-        && let Some(parent_cs) = lookup_cspace(parent_id.cspace_id, parent_id.epoch)
-    {
-        // SAFETY: parent_cs returned by lookup_cspace is valid; parent_id.index from derivation link is within bounds.
-        if let Some(parent_slot) = unsafe { (*parent_cs).slot_mut(parent_id.index.get()) }
-            && parent_slot.deriv_first_child == Some(src_slot_id)
-        {
-            parent_slot.deriv_first_child = Some(dst_slot_id);
-        }
-    }
-
-    // Update prev sibling's next pointer.
-    if let Some(prev_id) = src_prev
-        && let Some(prev_cs) = lookup_cspace(prev_id.cspace_id, prev_id.epoch)
-    {
-        // SAFETY: prev_cs returned by lookup_cspace is valid; prev_id.index from derivation link is within bounds.
-        if let Some(prev_slot) = unsafe { (*prev_cs).slot_mut(prev_id.index.get()) }
-            && prev_slot.deriv_next_sibling == Some(src_slot_id)
-        {
-            prev_slot.deriv_next_sibling = Some(dst_slot_id);
-        }
-    }
-
-    // Update next sibling's prev pointer.
-    if let Some(next_id) = src_next
-        && let Some(next_cs) = lookup_cspace(next_id.cspace_id, next_id.epoch)
-    {
-        // SAFETY: next_cs returned by lookup_cspace is valid; next_id.index from derivation link is within bounds.
-        if let Some(next_slot) = unsafe { (*next_cs).slot_mut(next_id.index.get()) }
-            && next_slot.deriv_prev_sibling == Some(src_slot_id)
-        {
-            next_slot.deriv_prev_sibling = Some(dst_slot_id);
-        }
-    }
-
-    // Update all children's parent pointer.
-    // Walk via next_sibling; children's order is preserved.
-    let mut child_cur = src_first_child;
-    while let Some(child_id) = child_cur
-    {
-        child_cur = if let Some(child_cs) = lookup_cspace(child_id.cspace_id, child_id.epoch)
-        {
-            // SAFETY: child_cs returned by lookup_cspace is valid; child_id.index from derivation link is within bounds.
-            if let Some(child_slot) = unsafe { (*child_cs).slot_mut(child_id.index.get()) }
-            {
-                child_slot.deriv_parent = Some(dst_slot_id);
-                child_slot.deriv_next_sibling
-            }
-            else
-            {
-                None
-            }
-        }
-        else
-        {
-            None
-        };
-    }
-
-    // Clear the source slot. No inc_ref/dec_ref — it's a move.
-    // SAFETY: src_cspace is a valid CSpace pointer; src_idx was validated at entry.
-    unsafe {
-        (*src_cspace).free_slot(src_idx);
-    }
-
-    // Return the encoded destination handle (generation + index, #349).
-    // SAFETY: dst_cspace valid and locked by the caller; slot just inserted.
-    Ok(unsafe { (*dst_cspace).cap_handle(new_idx_nz) })
-}
-
 /// Insert a capability, calling [`crate::fatal`] on error.
 ///
 /// The tag is derived from the typed rights argument, so a mint site cannot
@@ -2764,11 +2581,12 @@ mod tests
         );
     }
 
-    /// `CSpaceId` reserved for the recycle test below. No other host
-    /// `#[test]` populates `CSPACE_REGISTRY` — every other
-    /// `register_cspace`/`unregister_cspace` call site is `#[cfg(not(test))]`
-    /// (boot, syscall, dealloc) — so there is no shared-static race; a high
-    /// id is used purely for clarity.
+    /// `CSpaceId` reserved for the recycle test below. `CSPACE_REGISTRY` is a
+    /// process-wide static and `cargo test` runs tests concurrently, so every
+    /// host `#[test]` that registers a `CSpace` directly — this one and the
+    /// derivation-tree tests in `cap/derivation.rs`, which use the `31xx`
+    /// block — picks an id unique to that test; nothing enforces it. A high
+    /// id keeps this one clear of that block.
     const RECYCLE_TEST_ID: CSpaceId = (MAX_CSPACES as u32) - 1;
 
     /// A `SlotId` stamped before a `CSpace` id is recycled must fail

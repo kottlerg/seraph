@@ -3,36 +3,46 @@
 
 // kernel/src/sched/thread_registry.rs
 
-//! Global live-thread registry — a diagnostic-only intrusive doubly-linked
-//! list of every live TCB.
+//! Global live-thread registry — an intrusive doubly-linked list of every
+//! live TCB.
 //!
 //! Threads are spliced in at construction ([`register`]) and removed at dealloc
 //! ([`unregister`]), both under [`THREAD_REGISTRY_LOCK`]. The softlockup
 //! watchdog walks it ([`try_for_each`]) to enumerate `Blocked` waiters that the
 //! per-CPU `current` dump cannot reach: the lost-wakeup victim in #351 is a
 //! `Blocked` thread referenced only by the IPC object it parked on, invisible
-//! to a `current`-only dump.
+//! to a `current`-only dump. Object teardown walks it ([`for_each`]) to find
+//! and stop every thread bound to a dying `CSpace` or `AddressSpace`
+//! (`sched::stop_threads_bound_to`).
 //!
-//! [`THREAD_REGISTRY_LOCK`] is a leaf — taken alone, never nested under a
-//! `sched_lock` or a run-queue lock — so it introduces no new lock-order edge.
-//! See docs/scheduling-internals.md § Thread Registry.
+//! [`THREAD_REGISTRY_LOCK`] is never taken under a `sched_lock`, a run-queue
+//! lock, an IPC-source lock, or `SLEEP_LIST_LOCK`; the teardown walk takes
+//! all of those under it (`cancel_ipc_block` takes the source lock, then
+//! `SLEEP_LIST_LOCK` alone for a timed waiter), so the only lock-order edges
+//! it adds are registry → IPC source → `sched_lock` → run-queue locks and
+//! registry → `SLEEP_LIST_LOCK`. The lock is held with interrupts disabled
+//! and must not be held while waiting for another CPU to make progress: a
+//! CPU spinning on it inside [`register`] cannot deschedule.
+//!
+//! Neither walk is length-bounded — a registry holds as many threads as
+//! memory backs. A list corrupted into a cycle is detected by a
+//! tortoise-and-hare probe: the watchdog walk stops there (it is already
+//! inside a fatal stall dump), the teardown walk halts the kernel, since a
+//! thread it cannot enumerate could still be running on the object being
+//! freed. See docs/scheduling-internals.md § Thread Registry.
 
 #![cfg(not(test))]
 
 use super::thread::ThreadControlBlock;
 use crate::sync::Spinlock;
 
-/// Serialises every access to the registry list. Leaf lock (see module docs).
+/// Serialises every access to the registry list. Ordered above every
+/// IPC-source, sleep-list, `sched_lock`, and run-queue lock (see module docs).
 static THREAD_REGISTRY_LOCK: Spinlock = Spinlock::new();
 
 /// Head of the intrusive list (`null` when empty). Guarded by
 /// [`THREAD_REGISTRY_LOCK`].
 static mut THREAD_REGISTRY_HEAD: *mut ThreadControlBlock = core::ptr::null_mut();
-
-/// Upper bound on nodes visited by [`try_for_each`]. A defensive backstop: if
-/// the list is ever corrupted into a cycle, the watchdog walk terminates rather
-/// than spinning forever inside the already-fatal stall dump.
-const MAX_WALK: usize = 4096;
 
 /// Splice `tcb` onto the head of the live-thread registry.
 ///
@@ -67,7 +77,7 @@ pub unsafe fn register(tcb: *mut ThreadControlBlock)
 ///
 /// Must run before the TCB storage is freed: the walk holds
 /// [`THREAD_REGISTRY_LOCK`] across every dereference, so an unlink that precedes
-/// the free guarantees the watchdog never observes a dangling node.
+/// the free guarantees neither walk observes a dangling node.
 ///
 /// # Safety
 /// `tcb` must be a valid TCB pointer that is not concurrently freed.
@@ -104,17 +114,52 @@ pub unsafe fn unregister(tcb: *mut ThreadControlBlock)
     unsafe { THREAD_REGISTRY_LOCK.unlock_raw(saved) };
 }
 
+/// Walk the list from the head, invoking `f` on every node, with a
+/// tortoise-and-hare cycle probe. Returns `false` if the walk met a cycle
+/// (the list is corrupt; `f` has run on every node reached before
+/// detection, and more than once on the cycle's members), `true` if it
+/// reached the terminating null.
+///
+/// # Safety
+/// [`THREAD_REGISTRY_LOCK`] must be held by the caller.
+unsafe fn walk_locked(mut f: impl FnMut(*mut ThreadControlBlock)) -> bool
+{
+    // SAFETY: the list is consistent under the lock the caller holds; every
+    // node dereferenced is live because unregister precedes every free.
+    unsafe {
+        let mut hare = THREAD_REGISTRY_HEAD;
+        let mut tortoise = THREAD_REGISTRY_HEAD;
+        let mut steps = 0usize;
+        while !hare.is_null()
+        {
+            f(hare);
+            hare = (*hare).registry_next;
+            steps += 1;
+            if steps & 1 == 0
+            {
+                tortoise = (*tortoise).registry_next;
+            }
+            if !hare.is_null() && core::ptr::eq(hare, tortoise)
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// Walk the live-thread registry, invoking `f` on each registered TCB pointer.
 ///
 /// Best-effort: if the registry lock is contended — a `register`/`unregister`
 /// is in flight, or a CPU died holding it — returns `false` without walking
 /// rather than spinning. The watchdog must never block. Returns `true` if the
-/// walk ran to completion (or hit [`MAX_WALK`]).
+/// walk ran (a corrupt cycle ends it early, silently: this is the stall
+/// dump's own diagnostic path).
 ///
 /// # Safety
 /// `f` must only read through the TCB pointer and must not register or
 /// unregister any thread (it runs under [`THREAD_REGISTRY_LOCK`]).
-pub unsafe fn try_for_each(mut f: impl FnMut(*mut ThreadControlBlock)) -> bool
+pub unsafe fn try_for_each(f: impl FnMut(*mut ThreadControlBlock)) -> bool
 {
     // SAFETY: try_lock_raw never blocks; None means contended, so we back off.
     let Some(saved) = (unsafe { THREAD_REGISTRY_LOCK.try_lock_raw() })
@@ -122,18 +167,41 @@ pub unsafe fn try_for_each(mut f: impl FnMut(*mut ThreadControlBlock)) -> bool
     {
         return false;
     };
-    // SAFETY: list is consistent under the lock; MAX_WALK bounds a corrupt cycle.
-    unsafe {
-        let mut node = THREAD_REGISTRY_HEAD;
-        let mut visited = 0usize;
-        while !node.is_null() && visited < MAX_WALK
-        {
-            f(node);
-            node = (*node).registry_next;
-            visited += 1;
-        }
-    }
+    // SAFETY: lock held.
+    // A cycle ends the walk early; this is the stall dump's own diagnostic
+    // path, so the truncation is not reported further.
+    let _ = unsafe { walk_locked(f) };
     // SAFETY: paired with try_lock_raw above.
     unsafe { THREAD_REGISTRY_LOCK.unlock_raw(saved) };
     true
+}
+
+/// Walk the live-thread registry under its lock, invoking `f` on every
+/// registered TCB pointer — the object-teardown walk.
+///
+/// Blocks on the lock (teardown must not skip a thread the way the watchdog
+/// may) and visits every node: a registry corrupted into a cycle is a fatal
+/// invariant break, because a thread this walk cannot reach could still be
+/// running on the object being freed. While `f` runs its TCB cannot be
+/// unregistered — and so cannot be freed, since every free is preceded by
+/// [`unregister`] — but `f` must not wait for another CPU: a CPU spinning on
+/// this lock inside [`register`] cannot deschedule, so a wait for it here
+/// deadlocks.
+///
+/// # Safety
+/// `f` must not register or unregister any thread. It may take IPC-source,
+/// `SLEEP_LIST_LOCK`, `sched_lock`, and run-queue locks (all ordered after
+/// this lock) but must not block or spin on another CPU's progress.
+pub unsafe fn for_each(f: impl FnMut(*mut ThreadControlBlock))
+{
+    // SAFETY: lock serialises all registry access.
+    let saved = unsafe { THREAD_REGISTRY_LOCK.lock_raw() };
+    // SAFETY: lock held.
+    let complete = unsafe { walk_locked(f) };
+    // SAFETY: paired with lock_raw above.
+    unsafe { THREAD_REGISTRY_LOCK.unlock_raw(saved) };
+    if !complete
+    {
+        crate::fatal("thread registry: cycle detected during object teardown walk");
+    }
 }

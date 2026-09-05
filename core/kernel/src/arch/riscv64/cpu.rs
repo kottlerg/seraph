@@ -353,6 +353,12 @@ pub fn user_copy_fixup(pc: u64) -> Option<u64>
 }
 
 // ── Interrupt save/restore ────────────────────────────────────────────────────
+//
+// Every `sstatus.SIE` write below omits `nomem`, as `disable_interrupts`
+// does: an asm block marked `nomem` may have memory operations, atomics
+// included, reordered across it, and a lock acquisition or a shared-state
+// access moved across an interrupt-state change would run under the wrong
+// interrupt state.
 
 /// Save the current interrupt-enable state and disable supervisor interrupts.
 /// Returns the sstatus value at the time of the call (opaque to callers).
@@ -364,18 +370,24 @@ pub fn user_copy_fixup(pc: u64) -> Option<u64>
 pub unsafe fn save_and_disable_interrupts() -> u64
 {
     let sstatus: u64;
-    // SAFETY: csrrci atomically reads sstatus and clears the SIE bit.
+    // SAFETY: csrrci atomically reads sstatus into the output register and
+    // clears the SIE bit; it touches no memory and no other register.
+    // Supervisor mode per the caller contract.
     unsafe {
         core::arch::asm!(
             "csrrci {sstatus}, sstatus, 2",
             sstatus = out(reg) sstatus,
-            options(nostack, nomem),
+            options(nostack, preserves_flags),
         );
     }
     sstatus
 }
 
 /// Restore the interrupt-enable state saved by [`save_and_disable_interrupts`].
+///
+/// Writes `sstatus.SIE` to the saved value whatever its current state, so a
+/// caller that enabled interrupts inside the window (a preempt-disabled
+/// wait) returns to the saved state too. Matches the x86-64 `popfq` restore.
 ///
 /// # Safety
 /// Must execute in supervisor mode. `saved` must be a value returned by
@@ -387,9 +399,18 @@ pub unsafe fn restore_interrupts(saved: u64)
     let sie_bit = (saved >> 1) & 1;
     if sie_bit != 0
     {
-        // SAFETY: re-enabling SIE after we previously cleared it.
+        // SAFETY: csrsi sets the SIE bit of sstatus; it touches no memory
+        // and clobbers no register. Supervisor mode per the caller contract.
         unsafe {
-            core::arch::asm!("csrsi sstatus, 2", options(nostack, nomem));
+            core::arch::asm!("csrsi sstatus, 2", options(nostack, preserves_flags));
+        }
+    }
+    else
+    {
+        // SAFETY: csrci clears the SIE bit of sstatus; it touches no memory
+        // and clobbers no register. Supervisor mode per the caller contract.
+        unsafe {
+            core::arch::asm!("csrci sstatus, 2", options(nostack, preserves_flags));
         }
     }
 }

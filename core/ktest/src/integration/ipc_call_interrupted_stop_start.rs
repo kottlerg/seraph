@@ -69,6 +69,45 @@ static mut CLIENT_IPC_BUF: IpcBufPage = IpcBufPage([0u64; 512]);
 // SAFETY: used only by phase 2's single server child.
 static mut SERVER_IPC_BUF: IpcBufPage = IpcBufPage([0u64; 512]);
 
+/// The client's arguments, handed to `client_entry` by address. The phases
+/// run sequentially and each client is reaped before the next is spawned,
+/// so one entry serves both.
+#[derive(Clone, Copy)]
+struct ClientArgs
+{
+    ep: u32,
+    done: u32,
+    /// `done` bit raised before the call (0 = none).
+    ready: u64,
+    /// `done` bit raised when the call returns `Interrupted`.
+    ok: u64,
+    /// `done` bit raised on any other result.
+    bad: u64,
+}
+
+static CLIENT_ARGS: spawn::ArgBlock<ClientArgs, 1> = spawn::ArgBlock::new(ClientArgs {
+    ep: 0,
+    done: 0,
+    ready: 0,
+    ok: 0,
+    bad: 0,
+});
+
+/// The phase-2 server's arguments, handed to `server_entry` by address.
+#[derive(Clone, Copy)]
+struct ServerArgs
+{
+    ep: u32,
+    done: u32,
+    block: u32,
+}
+
+static SERVER_ARGS: spawn::ArgBlock<ServerArgs, 1> = spawn::ArgBlock::new(ServerArgs {
+    ep: 0,
+    done: 0,
+    block: 0,
+});
+
 pub fn run(ctx: &TestContext) -> TestResult
 {
     let done = cap_create_notification(ctx.memory_base)
@@ -84,7 +123,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         .map_err(|_| "integration::ipc_call_interrupted_stop_start: cap_copy p1 ep failed")?;
     let c_done = cap_copy(done, client.cs, RIGHTS_SIGNAL)
         .map_err(|_| "integration::ipc_call_interrupted_stop_start: cap_copy p1 done failed")?;
-    let arg = pack(c_ep, c_done, BIT_P1_READY, BIT_P1_OK, BIT_P1_BAD);
+    let arg = publish_client_args(c_ep, c_done, BIT_P1_READY, BIT_P1_OK, BIT_P1_BAD);
     // Phase 1's client is the sole user of CLIENT_STACK until reaped.
     let stack = ChildStack::top(core::ptr::addr_of!(CLIENT_STACK));
     spawn::configure_and_start(&client, client_entry, stack, arg)
@@ -124,7 +163,17 @@ pub fn run(ctx: &TestContext) -> TestResult
         .map_err(|_| "integration::ipc_call_interrupted_stop_start: cap_copy s done failed")?;
     let s_block = cap_copy(block, server.cs, RIGHTS_WAIT)
         .map_err(|_| "integration::ipc_call_interrupted_stop_start: cap_copy s block failed")?;
-    let s_arg = u64::from(s_ep) | (u64::from(s_done) << 16) | (u64::from(s_block) << 32);
+    // SAFETY: the single server has not been started yet.
+    let s_arg = unsafe {
+        SERVER_ARGS.publish(
+            0,
+            ServerArgs {
+                ep: s_ep,
+                done: s_done,
+                block: s_block,
+            },
+        )
+    };
     // Phase 2's server is the sole user of SERVER_STACK.
     let s_stack = ChildStack::top(core::ptr::addr_of!(SERVER_STACK));
     spawn::configure_and_start(&server, server_entry, s_stack, s_arg)
@@ -136,7 +185,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         .map_err(|_| "integration::ipc_call_interrupted_stop_start: cap_copy p2 ep failed")?;
     let p2c_done = cap_copy(done, client2.cs, RIGHTS_SIGNAL)
         .map_err(|_| "integration::ipc_call_interrupted_stop_start: cap_copy p2 done failed")?;
-    let c2_arg = pack(p2c_ep, p2c_done, 0, BIT_P2_OK, BIT_P2_BAD);
+    let c2_arg = publish_client_args(p2c_ep, p2c_done, 0, BIT_P2_OK, BIT_P2_BAD);
     // Phase 1's client was reaped above; CLIENT_STACK is free again.
     let c2_stack = ChildStack::top(core::ptr::addr_of!(CLIENT_STACK));
     spawn::configure_and_start(&client2, client_entry, c2_stack, c2_arg)
@@ -188,25 +237,36 @@ fn wait_for(done: u32, acc: &mut u64, mask: u64) -> Result<(), &'static str>
     Ok(())
 }
 
-/// Pack the client arg: ep[15:0] | done[31:16] | ready-bit[39:32] |
-/// ok-bit[47:40] | bad-bit[55:48] (the bits are < 64, stored as their log2
-/// positions' raw mask truncated to 8 bits each).
-fn pack(ep: u32, done: u32, ready: u64, ok: u64, bad: u64) -> u64
+/// Publish the client's arguments and return the entry address.
+fn publish_client_args(ep: u32, done: u32, ready: u64, ok: u64, bad: u64) -> u64
 {
-    u64::from(ep) | (u64::from(done) << 16) | (ready << 32) | (ok << 40) | (bad << 48)
+    // SAFETY: no client is live when this is called (see `ClientArgs`).
+    unsafe {
+        CLIENT_ARGS.publish(
+            0,
+            ClientArgs {
+                ep,
+                done,
+                ready,
+                ok,
+                bad,
+            },
+        )
+    }
 }
 
 /// Client: optionally announce readiness, then `ipc_call`; raise the OK bit
 /// iff the call returns `Interrupted`, the BAD bit otherwise.
-// cast_possible_truncation: packed fields are cap slots < 2^16 and 8-bit masks.
-#[allow(clippy::cast_possible_truncation)]
 fn client_entry(arg: u64) -> !
 {
-    let ep = (arg & 0xFFFF) as u32;
-    let done = ((arg >> 16) & 0xFFFF) as u32;
-    let ready = (arg >> 32) & 0xFF;
-    let ok = (arg >> 40) & 0xFF;
-    let bad = (arg >> 48) & 0xFF;
+    // SAFETY: `arg` is the entry `publish_client_args` published for this client.
+    let ClientArgs {
+        ep,
+        done,
+        ready,
+        ok,
+        bad,
+    } = unsafe { spawn::child_args(arg) };
 
     // SAFETY: sole live user of CLIENT_IPC_BUF (phases run sequentially).
     let buf = core::ptr::addr_of_mut!(CLIENT_IPC_BUF).cast::<u64>();
@@ -230,13 +290,10 @@ fn client_entry(arg: u64) -> !
 
 /// Server: receive one caller (rebinding it to `BlockedOnReply`), announce the
 /// armed window, then park on `block` without ever replying.
-// cast_possible_truncation: packed fields are cap slot indices < 2^16.
-#[allow(clippy::cast_possible_truncation)]
 fn server_entry(arg: u64) -> !
 {
-    let ep = (arg & 0xFFFF) as u32;
-    let done = ((arg >> 16) & 0xFFFF) as u32;
-    let block = ((arg >> 32) & 0xFFFF) as u32;
+    // SAFETY: `arg` is the entry `run` published for the server.
+    let ServerArgs { ep, done, block } = unsafe { spawn::child_args(arg) };
 
     // SAFETY: sole user of SERVER_IPC_BUF.
     let buf = core::ptr::addr_of_mut!(SERVER_IPC_BUF).cast::<u64>();

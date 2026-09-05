@@ -26,11 +26,17 @@ use crate::{TestContext, TestResult};
 /// Test virtual address for MMIO mapping. 1.25 GiB — above ktest's load address.
 const MMIO_TEST_VA: u64 = 0x1_5000_0000;
 
-/// Kernel pin: the `CSpace` directory's structural ceiling is
-/// `L1_SIZE * L2_SIZE` (256 * 56 = 14336) slots. Used as a fallback scan
-/// bound if `cap_info` ever returns a value larger than `u32::MAX`, which
-/// the kernel's own invariants forbid today.
-const CSPACE_STRUCTURAL_CEILING: u32 = 14336;
+/// Upper bound for a slot scan over the test's own `CSpace`: its backed
+/// capacity, which the kernel clamps below 2^24 so the narrowing cannot fail;
+/// the address-space cap's index if the query fails, which still covers every
+/// boot-minted cap.
+fn scan_bound(ctx: &TestContext) -> u32
+{
+    syscall::cap_info(ctx.cspace_cap, syscall_abi::CAP_INFO_CSPACE_CAPACITY)
+        .ok()
+        .and_then(|n| u32::try_from(n).ok())
+        .unwrap_or(ctx.aspace_cap)
+}
 
 // ── SYS_MMIO_MAP ──────────────────────────────────────────────────────────────
 
@@ -51,11 +57,8 @@ pub fn mmio_map(ctx: &TestContext) -> TestResult
     // the cap intact, so the scan is non-destructive until a split succeeds.
     // The scan bound is the cspace's backed capacity (queried at runtime)
     // so the test stays robust against cap mint order.
-    let scan_bound = syscall::cap_info(ctx.cspace_cap, syscall_abi::CAP_INFO_CSPACE_CAPACITY)
-        .map_or(ctx.aspace_cap, |n| {
-            u32::try_from(n).unwrap_or(CSPACE_STRUCTURAL_CEILING)
-        });
-    for slot in 1..=scan_bound
+    let bound = scan_bound(ctx);
+    for slot in 1..=bound
     {
         let Ok((lo, _hi)) = mmio_split(slot, 0x1000)
         else
@@ -99,11 +102,8 @@ pub fn irq_register_ack(ctx: &TestContext) -> TestResult
 
     // The scan bound is the cspace's backed capacity (queried at runtime)
     // so the test stays robust against cap mint order.
-    let scan_bound = syscall::cap_info(ctx.cspace_cap, syscall_abi::CAP_INFO_CSPACE_CAPACITY)
-        .map_or(ctx.aspace_cap, |n| {
-            u32::try_from(n).unwrap_or(CSPACE_STRUCTURAL_CEILING)
-        });
-    for slot in 1..=scan_bound
+    let bound = scan_bound(ctx);
+    for slot in 1..=bound
     {
         match irq_register(slot, irq_sig)
         {
@@ -163,18 +163,8 @@ pub fn ioport_bind(ctx: &TestContext) -> TestResult
         let th = cap_create_thread(ctx.memory_base, ctx.aspace_cap, cs, 0, 0)
             .map_err(|_| "cap_create_thread for ioport_bind test failed")?;
 
-        let scan_bound = if let Ok(n) =
-            syscall::cap_info(ctx.cspace_cap, syscall_abi::CAP_INFO_CSPACE_CAPACITY)
-        {
-            u32::try_from(n).unwrap_or(CSPACE_STRUCTURAL_CEILING)
-        }
-        else
-        {
-            syscall::cap_delete(th).ok();
-            syscall::cap_delete(cs).ok();
-            return Err("cap_info(CAP_INFO_CSPACE_CAPACITY) failed");
-        };
-        for slot in 1u32..=scan_bound
+        let bound = scan_bound(ctx);
+        for slot in 1u32..=bound
         {
             match syscall::ioport_bind(th, slot)
             {
@@ -243,13 +233,8 @@ pub fn ioport_split(ctx: &TestContext) -> TestResult
     // reachable, regardless of how the cspace has grown.
     #[cfg(target_arch = "x86_64")]
     {
-        let scan_bound =
-            match syscall::cap_info(ctx.cspace_cap, syscall_abi::CAP_INFO_CSPACE_CAPACITY)
-            {
-                Ok(n) => u32::try_from(n).unwrap_or(CSPACE_STRUCTURAL_CEILING),
-                Err(_) => return Err("cap_info(CAP_INFO_CSPACE_CAPACITY) failed"),
-            };
-        for slot in 1u32..=scan_bound
+        let bound = scan_bound(ctx);
+        for slot in 1u32..=bound
         {
             // Try splitting at 0x80. If the slot is not an IoPort we
             // get InvalidCapability and keep scanning. If it is an
@@ -310,12 +295,9 @@ pub fn ioport_split(ctx: &TestContext) -> TestResult
 /// with disjoint base/size. Skipped if no suitable cap exists.
 pub fn mmio_split_carves(ctx: &TestContext) -> TestResult
 {
-    let scan_bound = syscall::cap_info(ctx.cspace_cap, syscall_abi::CAP_INFO_CSPACE_CAPACITY)
-        .map_or(ctx.aspace_cap, |n| {
-            u32::try_from(n).unwrap_or(CSPACE_STRUCTURAL_CEILING)
-        });
+    let bound = scan_bound(ctx);
 
-    for slot in 1u32..=scan_bound
+    for slot in 1u32..=bound
     {
         // Probe: split at PAGE_SIZE. InvalidCapability ⇒ wrong tag.
         // InvalidArgument ⇒ Mmio exists but too small.
@@ -360,12 +342,9 @@ pub fn mmio_split_wrong_tag_err(ctx: &TestContext) -> TestResult
 /// disjoint children. Skipped if no suitable cap exists.
 pub fn irq_split_carves(ctx: &TestContext) -> TestResult
 {
-    let scan_bound = syscall::cap_info(ctx.cspace_cap, syscall_abi::CAP_INFO_CSPACE_CAPACITY)
-        .map_or(ctx.aspace_cap, |n| {
-            u32::try_from(n).unwrap_or(CSPACE_STRUCTURAL_CEILING)
-        });
+    let bound = scan_bound(ctx);
 
-    for slot in 1u32..=scan_bound
+    for slot in 1u32..=bound
     {
         // Probe: split at base+1. Wrong-tag and unsplittable-range responses
         // both leave the cap intact.

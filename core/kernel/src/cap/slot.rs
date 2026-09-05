@@ -11,12 +11,14 @@
 //! ## Intrusive free list
 //!
 //! When a slot is free (`tag == Null`), the `deriv_parent` field is repurposed
-//! to store the next-free index. Call [`CapabilitySlot::set_next_free`] and
-//! [`CapabilitySlot::next_free`] to encode/decode; do not read `deriv_parent`
-//! directly on a free slot. The `epoch` field of the encoded `SlotId` is the
-//! free-list sentinel value `0` and MUST NOT appear in any live derivation
-//! link — derivation links carry the registry epoch that was current when
-//! they were stamped.
+//! to store the next-free index and `deriv_first_child` the previous-free
+//! index (the doubly-linked list makes arbitrary unlinks O(1)). Call
+//! [`CapabilitySlot::set_next_free`] / [`CapabilitySlot::next_free`] and
+//! [`CapabilitySlot::set_prev_free_link`] / [`CapabilitySlot::prev_free`]
+//! to encode/decode; do not read the fields directly on a free slot. The
+//! `epoch` field of the encoded `SlotId` is the free-list sentinel value
+//! `0` and MUST NOT appear in any live derivation link — derivation links
+//! carry the registry epoch that was current when they were stamped.
 //!
 //! ## Size derivation
 //!
@@ -547,7 +549,7 @@ pub fn violates_wx(rights: Rights) -> bool
 ///       8     8  badge  (caller-identifying label; 0 = unbadged)
 ///      16     8  object (naturally 8-byte aligned at offset 16)
 ///      24    12  deriv_parent   (next_free index when tag == Null)
-///      36    12  deriv_first_child
+///      36    12  deriv_first_child (prev_free index when tag == Null)
 ///      48    12  deriv_next_sibling
 ///      60    12  deriv_prev_sibling
 /// total: 72 bytes
@@ -568,8 +570,8 @@ pub struct CapabilitySlot
     /// `pad[0]` doubles as the intrusive free-list membership marker
     /// ([`FREE_LIST_MARKER`] when the Null slot is linked on a `CSpace` free
     /// list); `pad[1]` holds the per-slot generation counter (see
-    /// [`CapabilitySlot::generation`]); `pad[2]` holds the revoke-in-progress
-    /// marker (see [`CapabilitySlot::revoke_in_progress`]).
+    /// [`CapabilitySlot::generation`]); `pad[2]` holds the in-flight pin
+    /// (see [`CapabilitySlot::pinned`]).
     pad: [u8; 3],
     /// Rights bitmask (type-specific).
     pub rights: Rights,
@@ -583,7 +585,8 @@ pub struct CapabilitySlot
     pub object: Option<NonNull<KernelObjectHeader>>,
     /// Derivation parent, or next-free index when tag == Null.
     pub deriv_parent: Option<SlotId>,
-    /// First child in the derivation tree (None if leaf).
+    /// First child in the derivation tree (None if leaf), or the
+    /// previous-free index when tag == Null.
     pub deriv_first_child: Option<SlotId>,
     /// Next sibling in the derivation tree.
     pub deriv_next_sibling: Option<SlotId>,
@@ -678,34 +681,38 @@ impl CapabilitySlot
         self.pad[1] = self.pad[1].wrapping_add(1);
     }
 
-    // ── Revoke-in-progress marker (`pad[2]`) ──────────────────────────────────
+    // ── In-flight pin (`pad[2]`) ──────────────────────────────────────────────
 
-    /// Return `true` if a multi-batch `SYS_CAP_REVOKE` is in flight on this
-    /// slot (marker stored in `pad[2]`).
+    /// Return `true` if a multi-batch operation is in flight on this slot
+    /// (marker stored in `pad[2]`): a `SYS_CAP_REVOKE` on its root, or a
+    /// `SYS_CAP_MOVE` / IPC capability transfer on its source and
+    /// destination.
     ///
-    /// While set, `SYS_CAP_DELETE`, `SYS_CAP_MOVE`, and IPC capability
-    /// transfer refuse to act on the slot: deleting or moving a revoke root
-    /// between batches would promote its temporarily hoisted survivors and
-    /// permanently sever intermediate revocation edges (see the revocation
-    /// algorithm in `capability-internals.md`). Read and written only under
-    /// `DERIVATION_LOCK`. A slot freed while marked sheds the marker on the
+    /// While set, `SYS_CAP_DELETE`, `SYS_CAP_MOVE`, `SYS_CAP_COPY`,
+    /// `SYS_CAP_DERIVE`, `SYS_CAP_DERIVE_BADGE`, the memory and range
+    /// splits, `SYS_MEMORY_MERGE`, a further `SYS_CAP_REVOKE`, and IPC
+    /// capability transfer refuse to act on the slot with `InvalidState`:
+    /// deleting or moving a revoke root between batches would promote its
+    /// temporarily hoisted survivors and permanently sever intermediate
+    /// revocation edges, and any of those operations on a slot mid-move
+    /// would tear the migration (see the revocation algorithm and § Move in
+    /// `capability-internals.md`). Read and written only under
+    /// `DERIVATION_LOCK`. A slot freed while pinned sheds the marker on the
     /// free path — [`set_next_free`](Self::set_next_free) zeroes `pad[2]`
     /// when threading the slot onto the free list.
-    pub fn revoke_in_progress(&self) -> bool
+    pub fn pinned(&self) -> bool
     {
         self.pad[2] != 0
     }
 
-    /// Set the revoke-in-progress marker (see
-    /// [`revoke_in_progress`](Self::revoke_in_progress)).
-    pub fn mark_revoke_in_progress(&mut self)
+    /// Set the in-flight pin (see [`pinned`](Self::pinned)).
+    pub fn pin(&mut self)
     {
         self.pad[2] = 1;
     }
 
-    /// Clear the revoke-in-progress marker (see
-    /// [`revoke_in_progress`](Self::revoke_in_progress)).
-    pub fn clear_revoke_in_progress(&mut self)
+    /// Clear the in-flight pin (see [`pinned`](Self::pinned)).
+    pub fn unpin(&mut self)
     {
         self.pad[2] = 0;
     }
@@ -731,9 +738,8 @@ impl CapabilitySlot
     /// is the list tail. Leaves `pad[1]` (the per-slot generation) untouched —
     /// `CSpace::free_slot` bumps it immediately before this call and the next
     /// allocation must observe the incremented value. Zeroes `pad[2]` — a
-    /// slot freed while a revoke had it pinned must not carry the
-    /// revoke-in-progress marker into its next occupant (see
-    /// [`revoke_in_progress`](Self::revoke_in_progress)).
+    /// slot freed while a revoke or move had it pinned must not carry the
+    /// pin into its next occupant (see [`pinned`](Self::pinned)).
     ///
     /// [`is_on_free_list`]: Self::is_on_free_list
     pub fn set_next_free(&mut self, next: Option<NonZeroU32>)
@@ -747,6 +753,8 @@ impl CapabilitySlot
         self.rights = Rights::NONE;
         self.badge = 0;
         self.object = None;
+        // deriv_first_child doubles as the free-list predecessor link;
+        // a fresh push always enters at the head, so it starts None.
         self.deriv_first_child = None;
         self.deriv_next_sibling = None;
         self.deriv_prev_sibling = None;
@@ -767,6 +775,47 @@ impl CapabilitySlot
             "next_free called on occupied slot"
         );
         self.deriv_parent.map(|s| s.index)
+    }
+
+    /// Read the free-list predecessor index from `deriv_first_child`.
+    ///
+    /// Only valid on a free-list member. `None` means this slot is the
+    /// list head. The predecessor link makes `CSpace::remove_from_free_list`
+    /// O(1); it uses the same epoch-0 `SlotId` encoding as
+    /// [`next_free`](Self::next_free).
+    pub fn prev_free(&self) -> Option<NonZeroU32>
+    {
+        debug_assert!(
+            self.tag == CapTag::Null,
+            "prev_free called on occupied slot"
+        );
+        self.deriv_first_child.map(|s| s.index)
+    }
+
+    /// Rewrite only the free-list successor link, leaving the rest of the
+    /// slot (marker, generation, predecessor) untouched. For splices on an
+    /// already-linked slot; the initial push uses
+    /// [`set_next_free`](Self::set_next_free).
+    pub fn set_next_free_link(&mut self, next: Option<NonZeroU32>)
+    {
+        debug_assert!(self.is_on_free_list(), "next-link rewrite off-list");
+        self.deriv_parent = next.map(|index| SlotId {
+            cspace_id: 0,
+            epoch: 0,
+            index,
+        });
+    }
+
+    /// Rewrite only the free-list predecessor link; see
+    /// [`set_next_free_link`](Self::set_next_free_link).
+    pub fn set_prev_free_link(&mut self, prev: Option<NonZeroU32>)
+    {
+        debug_assert!(self.is_on_free_list(), "prev-link rewrite off-list");
+        self.deriv_first_child = prev.map(|index| SlotId {
+            cspace_id: 0,
+            epoch: 0,
+            index,
+        });
     }
 
     /// Return `true` if this slot is currently linked on a `CSpace` free list.
@@ -886,6 +935,20 @@ mod tests
         assert_eq!(s.next_free(), Some(next));
         assert_eq!(s.tag, CapTag::Null);
         assert!(s.is_on_free_list());
+        // A fresh push enters at the head: no predecessor.
+        assert_eq!(s.prev_free(), None);
+        // Predecessor link round-trips independently of the successor.
+        let prev = NonZeroU32::new(7).unwrap();
+        s.set_prev_free_link(Some(prev));
+        assert_eq!(s.prev_free(), Some(prev));
+        assert_eq!(s.next_free(), Some(next));
+        s.set_prev_free_link(None);
+        assert_eq!(s.prev_free(), None);
+        // Successor splice leaves the predecessor untouched.
+        s.set_prev_free_link(Some(prev));
+        s.set_next_free_link(None);
+        assert_eq!(s.next_free(), None);
+        assert_eq!(s.prev_free(), Some(prev));
     }
 
     #[test]

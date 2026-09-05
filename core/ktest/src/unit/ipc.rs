@@ -25,6 +25,7 @@ use syscall::{
 };
 use syscall_abi::RIGHTS_EP_SEND_GRANT;
 
+use crate::spawn::{ArgBlock, child_args};
 use crate::{ChildStack, TestContext, TestResult};
 
 // Endpoint RECEIVE right only (no SEND).
@@ -42,6 +43,50 @@ static mut DUP_REPLY_STACK: ChildStack = ChildStack::ZERO;
 static mut RECV_OOM_STACK: ChildStack = ChildStack::ZERO;
 static mut STALE_REPLY_STACK: ChildStack = ChildStack::ZERO;
 static mut FOUR_CAPS_STACK: ChildStack = ChildStack::ZERO;
+
+/// Arguments of the cap-transfer children (`cap_xfer`, `four_caps`,
+/// `recv_oom`), handed to their entries by address; `memory` carries RETYPE
+/// so the child can mint the transferred objects.
+#[derive(Clone, Copy)]
+struct XferArgs
+{
+    ep: u32,
+    done: u32,
+    memory: u32,
+}
+
+static CAP_XFER_ARGS: ArgBlock<XferArgs, 1> = ArgBlock::new(XferArgs {
+    ep: 0,
+    done: 0,
+    memory: 0,
+});
+static FOUR_CAPS_ARGS: ArgBlock<XferArgs, 1> = ArgBlock::new(XferArgs {
+    ep: 0,
+    done: 0,
+    memory: 0,
+});
+static RECV_OOM_ARGS: ArgBlock<XferArgs, 1> = ArgBlock::new(XferArgs {
+    ep: 0,
+    done: 0,
+    memory: 0,
+});
+
+/// Arguments of the reply-OOM child, handed to its entry by address.
+#[derive(Clone, Copy)]
+struct ReplyOomArgs
+{
+    ep: u32,
+    ready: u32,
+    done: u32,
+    memory: u32,
+}
+
+static REPLY_OOM_ARGS: ArgBlock<ReplyOomArgs, 1> = ArgBlock::new(ReplyOomArgs {
+    ep: 0,
+    ready: 0,
+    done: 0,
+    memory: 0,
+});
 
 // ── SYS_IPC_CALL / SYS_IPC_RECV / SYS_IPC_REPLY ─────────────────────────────
 
@@ -70,7 +115,7 @@ pub fn call_reply_recv(ctx: &TestContext) -> TestResult
         .map_err(|_| "cap_copy notify into child CSpace failed")?;
 
     // Pack child ep and notify slots into the arg u64.
-    let child_arg = u64::from(child_ep) | (u64::from(child_notify) << 16);
+    let child_arg = u64::from(child_ep) | (u64::from(child_notify) << 32);
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
     crate::spawn::configure_and_start(&child, caller_entry, stack_top, child_arg)
@@ -126,7 +171,7 @@ pub fn recv_finds_queued_caller(ctx: &TestContext) -> TestResult
         .map_err(|_| "cap_copy ep for recv_finds_queued_caller failed")?;
     let child_done = cap_copy(done, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
         .map_err(|_| "cap_copy done for recv_finds_queued_caller failed")?;
-    let child_arg = u64::from(child_ep) | (u64::from(child_done) << 16);
+    let child_arg = u64::from(child_ep) | (u64::from(child_done) << 32);
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(RECV_BLOCKS_STACK));
     crate::spawn::configure_and_start(&child, queued_caller_entry, stack_top, child_arg)
@@ -224,7 +269,7 @@ pub fn call_with_data_words(ctx: &TestContext) -> TestResult
         .map_err(|_| "cap_copy ep for data_words test failed")?;
     let child_done = cap_copy(done, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
         .map_err(|_| "cap_copy done for data_words test failed")?;
-    let child_arg = u64::from(child_ep) | (u64::from(child_done) << 16);
+    let child_arg = u64::from(child_ep) | (u64::from(child_done) << 32);
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(DATA_WORDS_STACK));
     crate::spawn::configure_and_start(&child, data_caller_entry, stack_top, child_arg)
@@ -290,8 +335,17 @@ pub fn call_with_cap_transfer(ctx: &TestContext) -> TestResult
         .map_err(|_| "cap_copy done for cap_xfer test failed")?;
     let child_memory = cap_copy(ctx.memory_base, child.cs, syscall::RIGHTS_ALL)
         .map_err(|_| "cap_copy memory for cap_xfer test failed")?;
-    let child_arg =
-        u64::from(child_ep) | (u64::from(child_done) << 16) | (u64::from(child_memory) << 32);
+    // SAFETY: the single child has not been started yet.
+    let child_arg = unsafe {
+        CAP_XFER_ARGS.publish(
+            0,
+            XferArgs {
+                ep: child_ep,
+                done: child_done,
+                memory: child_memory,
+            },
+        )
+    };
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(CAP_XFER_STACK));
     crate::spawn::configure_and_start(&child, cap_xfer_caller_entry, stack_top, child_arg)
@@ -359,7 +413,7 @@ pub fn recv_delivers_badge(ctx: &TestContext) -> TestResult
         .map_err(|_| "cap_copy badged ep for recv_delivers_badge failed")?;
     let child_done = cap_copy(done, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
         .map_err(|_| "cap_copy done for recv_delivers_badge failed")?;
-    let child_arg = u64::from(child_ep) | (u64::from(child_done) << 16);
+    let child_arg = u64::from(child_ep) | (u64::from(child_done) << 32);
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(BADGE_STACK));
     crate::spawn::configure_and_start(&child, badge_caller_entry, stack_top, child_arg)
@@ -409,7 +463,7 @@ pub fn recv_unbadged_returns_zero(ctx: &TestContext) -> TestResult
         .map_err(|_| "cap_copy ep for recv_unbadged failed")?;
     let child_done = cap_copy(done, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
         .map_err(|_| "cap_copy done for recv_unbadged failed")?;
-    let child_arg = u64::from(child_ep) | (u64::from(child_done) << 16);
+    let child_arg = u64::from(child_ep) | (u64::from(child_done) << 32);
 
     // Reuse the caller_entry (sends 0xCAFE, expects reply 0xBEEF).
     let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
@@ -446,11 +500,11 @@ pub fn recv_unbadged_returns_zero(ctx: &TestContext) -> TestResult
 
 /// Child: calls the endpoint with label 0xCAFE, waits for reply, then signals.
 ///
-/// `arg`: bits[15:0] = `ep_slot`, bits[31:16] = `notify_slot` (in child's `CSpace`).
+/// `arg`: bits[31:0] = `ep_slot`, bits[63:32] = `notify_slot` (in child's `CSpace`).
 fn caller_entry(arg: u64) -> !
 {
-    let ep_slot = (arg & 0xFFFF) as u32;
-    let notify_slot = ((arg >> 16) & 0xFFFF) as u32;
+    let ep_slot = (arg & 0xFFFF_FFFF) as u32;
+    let notify_slot = (arg >> 32) as u32;
 
     // Register the shared IPC buffer for this child thread. Each thread has its
     // own IPC buffer pointer in its TCB; the child must register before calling.
@@ -488,11 +542,11 @@ fn caller_entry(arg: u64) -> !
 /// Child for `recv_finds_queued_caller`: calls endpoint immediately (no server
 /// yet), then signals the result after the server replies.
 ///
-/// `arg`: bits[15:0] = `ep_slot`, bits[31:16] = `done_slot` (in child's `CSpace`).
+/// `arg`: bits[31:0] = `ep_slot`, bits[63:32] = `done_slot` (in child's `CSpace`).
 fn queued_caller_entry(arg: u64) -> !
 {
-    let ep_slot = (arg & 0xFFFF) as u32;
-    let done_slot = ((arg >> 16) & 0xFFFF) as u32;
+    let ep_slot = (arg & 0xFFFF_FFFF) as u32;
+    let done_slot = (arg >> 32) as u32;
 
     // Register the shared IPC buffer for this child thread.
     let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
@@ -523,11 +577,11 @@ fn queued_caller_entry(arg: u64) -> !
 /// Child for `call_with_data_words`: registers its IPC buffer, builds a two-word
 /// message, then calls.
 ///
-/// `arg`: bits[15:0] = `ep_slot`, bits[31:16] = `done_slot`.
+/// `arg`: bits[31:0] = `ep_slot`, bits[63:32] = `done_slot`.
 fn data_caller_entry(arg: u64) -> !
 {
-    let ep_slot = (arg & 0xFFFF) as u32;
-    let done_slot = ((arg >> 16) & 0xFFFF) as u32;
+    let ep_slot = (arg & 0xFFFF_FFFF) as u32;
+    let done_slot = (arg >> 32) as u32;
 
     // Register the shared IPC buffer for this child thread. Each thread has its
     // own IPC buffer pointer in its TCB; the child must register before calling.
@@ -554,13 +608,15 @@ fn data_caller_entry(arg: u64) -> !
 
 /// Child for `call_with_cap_transfer`: creates a notification and transfers it via IPC.
 ///
-/// `arg`: bits[15:0] = `ep_slot`, bits[31:16] = `done_slot`,
-/// bits[47:32] = `memory_slot` (Memory cap with RETYPE for `cap_create_notification`).
+/// `arg`: address of the child's [`XferArgs`].
 fn cap_xfer_caller_entry(arg: u64) -> !
 {
-    let ep_slot = (arg & 0xFFFF) as u32;
-    let done_slot = ((arg >> 16) & 0xFFFF) as u32;
-    let memory_slot = ((arg >> 32) & 0xFFFF) as u32;
+    // SAFETY: `arg` is the entry the test published for this child.
+    let XferArgs {
+        ep: ep_slot,
+        done: done_slot,
+        memory: memory_slot,
+    } = unsafe { child_args(arg) };
 
     // Register IPC buffer for cap transfer.
     let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
@@ -591,11 +647,11 @@ fn cap_xfer_caller_entry(arg: u64) -> !
 
 /// Child for `recv_delivers_badge`: calls endpoint with label 0xD00D.
 ///
-/// `arg`: bits[15:0] = `ep_slot`, bits[31:16] = `done_slot`.
+/// `arg`: bits[31:0] = `ep_slot`, bits[63:32] = `done_slot`.
 fn badge_caller_entry(arg: u64) -> !
 {
-    let ep_slot = (arg & 0xFFFF) as u32;
-    let done_slot = ((arg >> 16) & 0xFFFF) as u32;
+    let ep_slot = (arg & 0xFFFF_FFFF) as u32;
+    let done_slot = (arg >> 32) as u32;
 
     // Register the shared IPC buffer for this child thread.
     let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
@@ -642,7 +698,7 @@ pub fn recv_snapshot_survives_buffer_clobber(ctx: &TestContext) -> TestResult
         .map_err(|_| "cap_copy ep for snapshot test failed")?;
     let child_done = cap_copy(done, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
         .map_err(|_| "cap_copy done for snapshot test failed")?;
-    let child_arg = u64::from(child_ep) | (u64::from(child_done) << 16);
+    let child_arg = u64::from(child_ep) | (u64::from(child_done) << 32);
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(SNAPSHOT_STACK));
     crate::spawn::configure_and_start(&child, snapshot_caller_entry, stack_top, child_arg)
@@ -703,8 +759,8 @@ pub fn recv_snapshot_survives_buffer_clobber(ctx: &TestContext) -> TestResult
 /// data words and exits.
 fn snapshot_caller_entry(arg: u64) -> !
 {
-    let ep_slot = (arg & 0xFFFF) as u32;
-    let done_slot = ((arg >> 16) & 0xFFFF) as u32;
+    let ep_slot = (arg & 0xFFFF_FFFF) as u32;
+    let done_slot = (arg >> 32) as u32;
 
     let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
     if syscall::ipc_buffer_set(buf_addr).is_err()
@@ -772,10 +828,18 @@ pub fn reply_oom_wakes_caller_with_transfer_failed(ctx: &TestContext) -> TestRes
     let child_memory = cap_copy(ctx.memory_base, child_cs, syscall::RIGHTS_ALL)
         .map_err(|_| "cap_copy memory for reply_oom test failed")?;
 
-    let child_arg = u64::from(child_ep)
-        | (u64::from(child_ready) << 16)
-        | (u64::from(child_done) << 32)
-        | (u64::from(child_memory) << 48);
+    // SAFETY: the single child has not been started yet.
+    let child_arg = unsafe {
+        REPLY_OOM_ARGS.publish(
+            0,
+            ReplyOomArgs {
+                ep: child_ep,
+                ready: child_ready,
+                done: child_done,
+                memory: child_memory,
+            },
+        )
+    };
 
     let child_th = cap_create_thread(ctx.memory_base, ctx.aspace_cap, child_cs, 0, 0)
         .map_err(|_| "cap_create_thread for reply_oom test failed")?;
@@ -846,10 +910,13 @@ pub fn reply_oom_wakes_caller_with_transfer_failed(ctx: &TestContext) -> TestRes
 /// `IPC_REPLY_TRANSFER_FAILED` label arrives, `0xBAD` otherwise.
 fn reply_oom_caller_entry(arg: u64) -> !
 {
-    let ep_slot = (arg & 0xFFFF) as u32;
-    let ready_slot = ((arg >> 16) & 0xFFFF) as u32;
-    let done_slot = ((arg >> 32) & 0xFFFF) as u32;
-    let memory_slot = ((arg >> 48) & 0xFFFF) as u32;
+    // SAFETY: `arg` is the entry the test published for this child.
+    let ReplyOomArgs {
+        ep: ep_slot,
+        ready: ready_slot,
+        done: done_slot,
+        memory: memory_slot,
+    } = unsafe { child_args(arg) };
 
     let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
     if syscall::ipc_buffer_set(buf_addr).is_err()
@@ -999,7 +1066,7 @@ pub fn reply_duplicate_cap_slot_rejected(ctx: &TestContext) -> TestResult
         .map_err(|_| "cap_copy ep for reply_dup test failed")?;
     let child_done = cap_copy(done, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
         .map_err(|_| "cap_copy done for reply_dup test failed")?;
-    let child_arg = u64::from(child_ep) | (u64::from(child_done) << 16);
+    let child_arg = u64::from(child_ep) | (u64::from(child_done) << 32);
     let stack_top = ChildStack::top(core::ptr::addr_of!(DUP_REPLY_STACK));
     crate::spawn::configure_and_start(&child, dup_reply_caller_entry, stack_top, child_arg)
         .map_err(|_| "reply_dup: configure_and_start failed")?;
@@ -1047,8 +1114,8 @@ pub fn reply_duplicate_cap_slot_rejected(ctx: &TestContext) -> TestResult
 /// `IPC_REPLY_TRANSFER_FAILED` label arrives, `0xBAD` otherwise.
 fn dup_reply_caller_entry(arg: u64) -> !
 {
-    let ep_slot = (arg & 0xFFFF) as u32;
-    let done_slot = ((arg >> 16) & 0xFFFF) as u32;
+    let ep_slot = (arg & 0xFFFF_FFFF) as u32;
+    let done_slot = (arg >> 32) as u32;
 
     let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
     if syscall::ipc_buffer_set(buf_addr).is_err()
@@ -1105,7 +1172,7 @@ pub fn reply_stale_cap_handle_rejected(ctx: &TestContext) -> TestResult
         .map_err(|_| "cap_copy ep for reply_stale test failed")?;
     let child_done = cap_copy(done, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
         .map_err(|_| "cap_copy done for reply_stale test failed")?;
-    let child_arg = u64::from(child_ep) | (u64::from(child_done) << 16);
+    let child_arg = u64::from(child_ep) | (u64::from(child_done) << 32);
     let stack_top = ChildStack::top(core::ptr::addr_of!(STALE_REPLY_STACK));
     crate::spawn::configure_and_start(&child, dup_reply_caller_entry, stack_top, child_arg)
         .map_err(|_| "reply_stale: configure_and_start failed")?;
@@ -1170,8 +1237,17 @@ pub fn call_four_caps_transfer(ctx: &TestContext) -> TestResult
         .map_err(|_| "cap_copy done for four_caps test failed")?;
     let child_memory = cap_copy(ctx.memory_base, child.cs, syscall::RIGHTS_ALL)
         .map_err(|_| "cap_copy memory for four_caps test failed")?;
-    let child_arg =
-        u64::from(child_ep) | (u64::from(child_done) << 16) | (u64::from(child_memory) << 32);
+    // SAFETY: the single child has not been started yet.
+    let child_arg = unsafe {
+        FOUR_CAPS_ARGS.publish(
+            0,
+            XferArgs {
+                ep: child_ep,
+                done: child_done,
+                memory: child_memory,
+            },
+        )
+    };
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(FOUR_CAPS_STACK));
     crate::spawn::configure_and_start(&child, four_caps_caller_entry, stack_top, child_arg)
@@ -1223,9 +1299,12 @@ pub fn call_four_caps_transfer(ctx: &TestContext) -> TestResult
 /// sends all of them in one cap-bearing call, then signals completion.
 fn four_caps_caller_entry(arg: u64) -> !
 {
-    let ep_slot = (arg & 0xFFFF) as u32;
-    let done_slot = ((arg >> 16) & 0xFFFF) as u32;
-    let memory_slot = ((arg >> 32) & 0xFFFF) as u32;
+    // SAFETY: `arg` is the entry the test published for this child.
+    let XferArgs {
+        ep: ep_slot,
+        done: done_slot,
+        memory: memory_slot,
+    } = unsafe { child_args(arg) };
 
     let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
     if syscall::ipc_buffer_set(buf_addr).is_err()
@@ -1293,8 +1372,17 @@ pub fn recv_oom_returns_cleanly(ctx: &TestContext) -> TestResult
         .map_err(|_| "cap_copy done for recv_oom test failed")?;
     let victim_memory = cap_copy(ctx.memory_base, victim_cs, syscall::RIGHTS_ALL)
         .map_err(|_| "cap_copy memory for recv_oom test failed")?;
-    let victim_arg =
-        u64::from(victim_ep) | (u64::from(victim_done) << 16) | (u64::from(victim_memory) << 32);
+    // SAFETY: the single victim has not been started yet.
+    let victim_arg = unsafe {
+        RECV_OOM_ARGS.publish(
+            0,
+            XferArgs {
+                ep: victim_ep,
+                done: victim_done,
+                memory: victim_memory,
+            },
+        )
+    };
 
     let victim_th = cap_create_thread(ctx.memory_base, ctx.aspace_cap, victim_cs, 0, 0)
         .map_err(|_| "cap_create_thread for recv_oom test failed")?;
@@ -1327,9 +1415,12 @@ pub fn recv_oom_returns_cleanly(ctx: &TestContext) -> TestResult
 /// (post-fix behavior), `0xBAD` otherwise.
 fn recv_oom_victim_entry(arg: u64) -> !
 {
-    let ep_slot = (arg & 0xFFFF) as u32;
-    let done_slot = ((arg >> 16) & 0xFFFF) as u32;
-    let memory_slot = ((arg >> 32) & 0xFFFF) as u32;
+    // SAFETY: `arg` is the entry the test published for this victim.
+    let XferArgs {
+        ep: ep_slot,
+        done: done_slot,
+        memory: memory_slot,
+    } = unsafe { child_args(arg) };
 
     let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
     if syscall::ipc_buffer_set(buf_addr).is_err()

@@ -72,6 +72,19 @@ pub unsafe fn dispatch(tf: *mut TrapFrame)
     let tf = unsafe { &mut *tf };
 
     let nr = tf.syscall_nr();
+    // SAFETY: syscall context on the caller's kernel stack with interrupts
+    // masked; `current` is the calling thread and stable here. Null-guarded
+    // like every handler's own check rather than asserted: the diagnostic
+    // stamp must never be the thing that faults.
+    unsafe {
+        let tcb = current_tcb();
+        if !tcb.is_null()
+        {
+            (*tcb)
+                .syscall_nr
+                .store(nr, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
 
     let ret: Result<u64, SyscallError> = match nr
     {
@@ -143,23 +156,38 @@ pub unsafe fn dispatch(tf: *mut TrapFrame)
     tf.set_return(ret_val);
 
     // Self-teardown epilogue (#341). A handler may have deleted the last
-    // capability to the running thread's own Thread object (SYS_CAP_DELETE /
-    // SYS_CAP_REVOKE), marking it `Exited` in place; such a thread must never
-    // return to userspace. Reschedule away — its object is then reclaimed
-    // off-CPU by `drain_deferred_reclaim`. Otherwise drain any threads that
-    // self-deleted earlier on this CPU, from this (live) thread's context where
-    // the dead thread is provably off-CPU.
-    // SAFETY: syscall context on the caller's kernel stack; current_tcb() is set.
+    // capability to the running thread's own Thread object, CSpace, or
+    // AddressSpace (SYS_CAP_DELETE / SYS_CAP_REVOKE, directly or through a
+    // teardown cascade), or a concurrent teardown may have stopped this
+    // thread while the handler ran: either way it is `Exited` in place and
+    // must never return to userspace. A live thread first drains objects
+    // deferred earlier on this CPU, from a context where their dead threads
+    // are provably off-CPU. The drain's CSpace/AddressSpace arms wait on
+    // other CPUs with interrupts enabled, so a teardown can stop this thread
+    // meanwhile: the `Exited` check runs after the drain as well. An `Exited`
+    // thread reschedules away; any object whose free it deferred is reclaimed
+    // by the next drain on this CPU.
+    // SAFETY: syscall context on the caller's kernel stack with interrupts
+    // disabled (the drain re-enables them only with preemption disabled), so
+    // this CPU and its `current` are stable across both checks.
     unsafe {
-        let cur = current_tcb();
-        if !cur.is_null() && (*cur).state == crate::sched::thread::ThreadState::Exited
+        let this_cpu = crate::arch::current::cpu::current_cpu() as usize;
+        if !crate::sched::running_thread_stopped(this_cpu)
+        {
+            crate::cap::object::drain_deferred_reclaim(this_cpu);
+        }
+        if crate::sched::running_thread_stopped(this_cpu)
         {
             crate::sched::schedule(false);
             crate::arch::current::cpu::halt_loop();
         }
-        crate::cap::object::drain_deferred_reclaim(
-            crate::arch::current::cpu::current_cpu() as usize
-        );
+        let tcb = current_tcb();
+        if !tcb.is_null()
+        {
+            (*tcb)
+                .syscall_nr
+                .store(u64::MAX, core::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
 
@@ -190,21 +218,19 @@ fn sys_yield(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 #[cfg(not(test))]
 fn sys_exit(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
-    use crate::sched::thread::ThreadState;
     // SAFETY: current_tcb() returns current thread; interrupt context ensures it is set.
     let tcb = unsafe { current_tcb() };
     if !tcb.is_null()
     {
         // Commit Exited under all-CPU scheduler.locks so a concurrent
         // dealloc on another CPU observes a coherent state and the local
-        // schedule() below sees the Exited skip-bit. Write exit_reason
-        // first so any subsequent acquire of any sched.lock observes the
-        // reason alongside the Exited transition.
+        // schedule() below sees the Exited skip-bit. The reason (0 = clean
+        // exit) is written in the same hold. A refusal means a teardown
+        // already committed `EXIT_KILLED`; this path still posts its own
+        // reason below — no death walk posts `EXIT_KILLED` (see the ABI
+        // constant) — so only the retained value says killed.
         // SAFETY: tcb validated non-null.
-        unsafe {
-            (*tcb).exit_reason = 0;
-            crate::sched::set_state_under_all_locks(tcb, ThreadState::Exited);
-        }
+        let _ = unsafe { crate::sched::exit_under_all_locks(tcb, 0) };
 
         // Post death notification if bound (exit_reason 0 = clean exit).
         // SAFETY: tcb is valid; post_death_notification handles null eq check.
@@ -250,20 +276,17 @@ fn sys_exit(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 #[allow(clippy::cast_possible_truncation)]
 fn sys_process_exit(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
-    use crate::sched::thread::ThreadState;
     let reason = syscall::encode_exit_code(tf.arg(0) as u32);
     // SAFETY: current_tcb() returns current thread; interrupt context ensures it is set.
     let tcb = unsafe { current_tcb() };
     if !tcb.is_null()
     {
-        // Commit Exited under all-CPU scheduler.locks (see sys_exit): write
-        // exit_reason first so any subsequent sched.lock acquire observes the
-        // reason alongside the Exited transition.
+        // Commit Exited under all-CPU scheduler.locks (see sys_exit); the
+        // reason is written in the same hold. A refusal means a teardown
+        // already committed `EXIT_KILLED`; the post below still carries
+        // this path's own reason (no death walk posts `EXIT_KILLED`).
         // SAFETY: tcb validated non-null.
-        unsafe {
-            (*tcb).exit_reason = reason;
-            crate::sched::set_state_under_all_locks(tcb, ThreadState::Exited);
-        }
+        let _ = unsafe { crate::sched::exit_under_all_locks(tcb, reason) };
 
         // Notify the calling thread's observers (a parent that bound the main
         // thread; procmgr's per-thread observer), then schedule immediately —
@@ -482,8 +505,9 @@ fn sys_thread_bind_notification(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // snapshot (`post_death_notification`):
     //
     //   * Already `Exited`: the death walk ran without this observer. The
-    //     thread's `exit_reason` was written before the `Exited` commit under
-    //     this same lock, so it is visible here; re-deliver it to the newly
+    //     thread's `exit_reason` was written in the same all-locks hold as
+    //     the `Exited` commit (`exit_under_all_locks`), which includes this
+    //     lock, so it is visible here; re-deliver it to the newly
     //     bound queue and do not append (the thread cannot die again). Closes
     //     the bind-after-death window for services bound after start (#106).
     //   * Not yet `Exited`: append the observer; the eventual death walk posts
@@ -694,7 +718,19 @@ pub(crate) unsafe fn lookup_cap<K: crate::cap::slot::CapKind>(
     }
     // ref_as_ptr: intentional — raw pointer cast to extend lifetime to 'static.
     #[allow(clippy::ref_as_ptr)]
-    // SAFETY: slot lives in the CSpace which is heap-allocated for the lifetime of the process.
+    // SAFETY: the slot lives in a leaf page of the CSpace's directory. Leaf
+    // pages are write-once, Release-published, and never freed or moved
+    // before refcount-0 teardown (see CSpace's memory-ordering contract),
+    // and that teardown first stops every thread bound to the CSpace and
+    // waits until it is off every CPU (`sched::stop_threads_bound_to`), so
+    // no thread can be executing this function — or holding the returned
+    // reference across a syscall — when the pages go. A caller destroying
+    // its own CSpace is stopped the same way, and the free is deferred until
+    // the syscall epilogue has scheduled it away (`drain_deferred_reclaim`).
+    // Within the process, the unlocked tag/generation checks above narrow —
+    // but cannot close — the race against a sibling thread freeing/recycling
+    // this same slot concurrently; lookup_cap resolves only the caller's
+    // CSpace, so that residual reaches no cross-process authority.
     Ok(unsafe { &*(slot as *const _) })
 }
 

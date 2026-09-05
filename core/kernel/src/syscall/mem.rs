@@ -489,7 +489,7 @@ pub fn sys_mem_protect(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// arg0 = Memory cap index (must have MAP right).
 /// arg1 = split offset in bytes (page-aligned; > 0 and < cap size; must be
 ///        at or above the cap's highest live retype offset, page-aligned).
-/// arg2 = reserved (must be 0).
+/// arg2 = reserved (ignored).
 ///
 /// The parent cap stays in its slot; its `size` shrinks to `split_offset`
 /// and its `available_bytes` debits by `(orig_size - split_offset)` (when
@@ -505,6 +505,9 @@ pub fn sys_mem_protect(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// refused.
 ///
 /// Returns the new tail-cap slot on success.
+// too_many_lines: one locked pass — pin, snapshot, validate, mint, insert,
+// link, mutate in place — that would otherwise thread the held locks
+// through helpers.
 #[allow(clippy::too_many_lines)]
 #[cfg(not(test))]
 pub fn sys_memory_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
@@ -551,21 +554,29 @@ pub fn sys_memory_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
     let parent_slot = unsafe { super::lookup_cap(caller_cspace, memory_handle, MemRights::MAP) }?;
     let parent_obj_nn = parent_slot.object.ok_or(SyscallError::InvalidCapability)?;
-    // cast_ptr_alignment: MemoryObject (8-byte) behind KernelObjectHeader header.
-    // SAFETY: tag confirmed Memory; pointer is valid MemoryObject.
-    #[allow(clippy::cast_ptr_alignment)]
-    let parent_ref = unsafe { &*(parent_obj_nn.as_ptr().cast::<MemoryObject>()) };
     let parent_rights = parent_slot.rights;
     let parent_retypable = parent_rights.contains(MemRights::RETYPE.erase());
     // SAFETY: caller_cspace validated non-null; id() reads discriminator.
     let cspace_id = unsafe { (*caller_cspace).id() };
 
-    let memory_idx_nz =
-        core::num::NonZeroU32::new(memory_idx).ok_or(SyscallError::InvalidCapability)?;
-    let parent_id = SlotId::current(cspace_id, memory_idx_nz);
-
     // ── Acquire locks (DERIVATION outer, frame-write inner) ──────────────────
     DERIVATION_LOCK.write_lock();
+    // The parent was resolved unlocked: pin it under the lock before its
+    // object is touched (a concurrent delete of its last cap would have freed
+    // the object) and before the tail is linked beside it.
+    // SAFETY: caller_cspace validated non-null; DERIVATION_LOCK held.
+    if let Err(e) = unsafe {
+        super::cap::revalidate_src_under_lock(caller_cspace, memory_handle, parent_obj_nn)
+    }
+    {
+        DERIVATION_LOCK.write_unlock();
+        return Err(e);
+    }
+    // cast_ptr_alignment: MemoryObject (8-byte) behind KernelObjectHeader header.
+    // SAFETY: tag confirmed Memory; the slot is pinned under DERIVATION_LOCK,
+    // so the object is live for the rest of the hold.
+    #[allow(clippy::cast_ptr_alignment)]
+    let parent_ref = unsafe { &*(parent_obj_nn.as_ptr().cast::<MemoryObject>()) };
     parent_ref.write_lock();
 
     // Snapshot parent state under the write lock. From here until unlock,
@@ -643,18 +654,20 @@ pub fn sys_memory_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     })?;
 
     // Insert under cspace.lock to keep the freelist/tag invariant against a
-    // concurrent SYS_CAP_CREATE_* on the same cspace. Lock order: parent
-    // MemoryObject lock → DERIVATION_LOCK → cspace.lock.
+    // concurrent SYS_CAP_CREATE_* on the same cspace. Lock order:
+    // DERIVATION_LOCK → parent MemoryObject lock → cspace.lock.
+    // `insert_cap_slot_and_handle` mints the returned handle in the same hold.
     // SAFETY: caller_cspace validated non-null; lock_raw/unlock_raw paired.
     let insert_res = unsafe {
         let saved = (*caller_cspace).lock.lock_raw();
-        let r = (*caller_cspace).insert_cap(CapTag::Memory, parent_rights, tail_ptr);
+        let r =
+            (*caller_cspace).insert_cap_slot_and_handle(CapTag::Memory, parent_rights, tail_ptr);
         (*caller_cspace).lock.unlock_raw(saved);
         r
     };
-    let tail_slot_nz = match insert_res
+    let (tail_slot_nz, tail_handle) = match insert_res
     {
-        Ok(idx) => idx,
+        Ok(inserted) => inserted,
         Err(e) =>
         {
             // SAFETY: tail_ptr just allocated; refcount is 1 with no other
@@ -677,12 +690,14 @@ pub fn sys_memory_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     };
     if let Some(grandparent) = parent_deriv_parent
     {
-        // SAFETY: DERIVATION_LOCK held; ids valid.
-        unsafe { link_child(grandparent, tail_id) };
+        // SAFETY: DERIVATION_LOCK held; the grandparent link was read from
+        // the pinned parent and the tail was inserted under this hold. A
+        // grandparent whose CSpace has since unregistered is a dead link
+        // (see `truncate_dead_link`); the tail then stays a root.
+        let _ = unsafe { link_child(grandparent, tail_id) };
     }
     // If the parent was a derivation root, the tail is also a root: no
     // parent edge needed.
-    let _ = parent_id; // silence unused if no grandparent
 
     // ── Mutate parent in place ────────────────────────────────────────────────
     //
@@ -710,14 +725,6 @@ pub fn sys_memory_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     parent_ref.write_unlock();
     DERIVATION_LOCK.write_unlock();
 
-    // Encode the tail slot's generation into the returned handle (#349).
-    // SAFETY: caller_cspace valid; slot occupied so the read is stable.
-    let tail_handle = unsafe {
-        let saved = (*caller_cspace).lock.lock_raw();
-        let h = (*caller_cspace).cap_handle(tail_slot_nz);
-        (*caller_cspace).lock.unlock_raw(saved);
-        h
-    };
     Ok(u64::from(tail_handle))
 }
 
@@ -736,7 +743,7 @@ pub fn sys_memory_split(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 ///        Stays valid; its `size` grows to cover the absorbed tail's region.
 /// arg1 = tail Memory cap index (must have MAP right; physically-upper half).
 ///        Consumed; its slot is freed.
-/// arg2 = reserved (must be 0).
+/// arg2 = reserved (ignored).
 ///
 /// Inverse of [`sys_memory_split`] under Option D. Both caps must:
 /// - Be physically contiguous (`parent.base + parent.size == tail.base`).
@@ -752,6 +759,9 @@ pub fn sys_memory_split(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 ///
 /// Returns 0 on success. The parent's slot index is unchanged; the tail's
 /// slot is returned to the caller's `CSpace` free list.
+// too_many_lines: one locked pass — pin, snapshot, validate, unlink, mutate,
+// free — over two objects under three locks that would otherwise be
+// threaded through helpers.
 #[allow(clippy::too_many_lines)]
 #[cfg(not(test))]
 pub fn sys_memory_merge(tf: &mut TrapFrame) -> Result<u64, SyscallError>
@@ -805,16 +815,35 @@ pub fn sys_memory_merge(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     let merged_rights = parent_slot.rights;
     let merged_retypable = merged_rights.contains(MemRights::RETYPE.erase());
 
-    #[allow(clippy::cast_ptr_alignment)]
-    // SAFETY: tag confirmed Memory; cap held by caller's CSpace, ref count > 0.
-    let parent_ref = unsafe { &*(parent_obj_nn.as_ptr().cast::<MemoryObject>()) };
-    #[allow(clippy::cast_ptr_alignment)]
-    // SAFETY: tag confirmed Memory; cap held by caller's CSpace, ref count > 0.
-    let tail_ref = unsafe { &*(tail_obj_nn.as_ptr().cast::<MemoryObject>()) };
-
-    // ── Acquire locks (DERIVATION outer; per-cap write locks inner, ordered
-    // by MemoryObject pointer to avoid deadlocks against concurrent merges) ──
+    // ── Acquire locks (DERIVATION outer; per-cap write locks inner, in a
+    // fixed order by MemoryObject pointer — DERIVATION_LOCK already excludes
+    // a concurrent merge, so the order is defence, not deadlock avoidance) ──
     DERIVATION_LOCK.write_lock();
+
+    // Both caps were resolved unlocked: pin them under the lock before their
+    // objects are touched (a concurrent delete of either's last cap would
+    // have freed the object) and before the tail is unlinked and its slot
+    // freed (a recycled tail index would free an unrelated live cap).
+    // SAFETY: caller_cspace validated non-null; DERIVATION_LOCK held.
+    let pinned = unsafe {
+        super::cap::revalidate_src_under_lock(caller_cspace, parent_handle, parent_obj_nn).and_then(
+            |()| super::cap::revalidate_src_under_lock(caller_cspace, tail_handle, tail_obj_nn),
+        )
+    };
+    if let Err(e) = pinned
+    {
+        DERIVATION_LOCK.write_unlock();
+        return Err(e);
+    }
+    // cast_ptr_alignment: MemoryObject (8-byte) behind KernelObjectHeader header.
+    // SAFETY: tag confirmed Memory; the slot is pinned under DERIVATION_LOCK,
+    // so the object is live for the rest of the hold.
+    #[allow(clippy::cast_ptr_alignment)]
+    let parent_ref = unsafe { &*(parent_obj_nn.as_ptr().cast::<MemoryObject>()) };
+    // cast_ptr_alignment: as above.
+    // SAFETY: as for parent_ref.
+    #[allow(clippy::cast_ptr_alignment)]
+    let tail_ref = unsafe { &*(tail_obj_nn.as_ptr().cast::<MemoryObject>()) };
 
     let (lock_first, lock_second) = if core::ptr::from_ref(parent_ref)
         < core::ptr::from_ref(tail_ref)
@@ -878,9 +907,7 @@ pub fn sys_memory_merge(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // ── Derivation-tree validation: parent and tail must be siblings, and
     //    neither may have derivation children. ────────────────────────────────
-    let parent_idx_nz = core::num::NonZeroU32::new(parent_idx);
-    let tail_idx_nz = core::num::NonZeroU32::new(tail_idx);
-    let (Some(parent_idx_nz), Some(tail_idx_nz)) = (parent_idx_nz, tail_idx_nz)
+    let Some(tail_idx_nz) = core::num::NonZeroU32::new(tail_idx)
     else
     {
         release_locks();
@@ -889,7 +916,6 @@ pub fn sys_memory_merge(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // SAFETY: caller_cspace validated non-null.
     let cspace_id = unsafe { (*caller_cspace).id() };
     let tail_id = SlotId::current(cspace_id, tail_idx_nz);
-    let _ = parent_idx_nz; // parent slot not unlinked (it stays alive)
 
     // SAFETY: DERIVATION_LOCK held; indices within CSpace bounds.
     let parent_deriv = unsafe {
@@ -960,7 +986,7 @@ pub fn sys_memory_merge(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // Free the tail slot under cspace.lock so the freelist mutation cannot
     // tear against a concurrent SYS_CAP_CREATE_* on the same cspace. Lock
-    // order: tail/parent locks → DERIVATION_LOCK → cspace.lock.
+    // order: DERIVATION_LOCK → tail/parent locks → cspace.lock.
     // SAFETY: caller_cspace validated; tail_idx within CSpace bounds.
     unsafe {
         let saved = (*caller_cspace).lock.lock_raw();
@@ -970,9 +996,7 @@ pub fn sys_memory_merge(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // Drop both write locks before dec_ref'ing the tail (dec_ref can take
     // dealloc_object, which may itself acquire other locks).
-    lock_second.write_unlock();
-    lock_first.write_unlock();
-    DERIVATION_LOCK.write_unlock();
+    release_locks();
 
     // SAFETY: tail_obj_nn from lookup_cap; object valid (ref > 0 at lookup).
     let remaining = unsafe { (*tail_obj_nn.as_ptr()).dec_ref() };

@@ -580,19 +580,15 @@ extern "C" fn trap_dispatch(frame: &mut TrapFrame)
             {
                 // Commit Exited under all-CPU scheduler.locks. See
                 // docs/thread-lifecycle-and-sleep.md § Lifecycle State Machine.
-                // Write exit_reason first so any subsequent sched.lock acquire
-                // observes the reason alongside the Exited transition.
+                // The reason (EXIT_FAULT_BASE + cause_code; EXIT_FAULT_BASE =
+                // 0x1000, matching syscall_abi::EXIT_FAULT_BASE) is written in
+                // the same hold. A refusal means a teardown already committed
+                // `EXIT_KILLED`; the posts below still carry the fault class
+                // (no death walk posts `EXIT_KILLED`).
                 // SAFETY: tcb validated non-null.
-                unsafe {
-                    (*tcb).exit_reason = 0x1000 + cause_code;
-                    crate::sched::set_state_under_all_locks(
-                        tcb,
-                        crate::sched::thread::ThreadState::Exited,
-                    );
-                }
+                let _ = unsafe { crate::sched::exit_under_all_locks(tcb, 0x1000 + cause_code) };
 
                 // Post death notification if bound (exit_reason = EXIT_FAULT_BASE + cause_code).
-                // EXIT_FAULT_BASE = 0x1000 (matches syscall_abi::EXIT_FAULT_BASE).
                 // SAFETY: tcb is valid; post_death_notification handles null check.
                 unsafe {
                     crate::sched::post_death_notification(tcb, 0x1000 + cause_code);
@@ -932,12 +928,14 @@ pub unsafe fn init()
     // SIE: global interrupt enable — starts disabled, timer::init() enables it.
     // SPP: previous privilege (0 = U-mode return target).
     // SUM: permit S-mode to access U-mode pages (not needed; keep disabled).
-    // SAFETY: csrc sstatus is a privileged S-mode instruction; caller ensures S-mode.
+    // SAFETY: csrc sstatus is a privileged S-mode instruction that clears the
+    // masked bits and touches no memory; caller ensures S-mode. `nomem` is
+    // omitted as for `cpu::disable_interrupts`.
     unsafe {
         core::arch::asm!(
             "csrc sstatus, {mask}",
             mask = in(reg) (1u64 << 1) | (1u64 << 8) | (1u64 << 18),
-            options(nostack, nomem),
+            options(nostack, preserves_flags),
         );
     }
 
@@ -1019,11 +1017,13 @@ pub unsafe fn init_ap()
     // privileged instructions; per-hart registers; no shared state.
     unsafe {
         // Clear SIE FIRST to prevent any stray interrupt from firing before
-        // stvec and sscratch are configured. Firmware may leave SIE=1.
+        // stvec and sscratch are configured. Firmware may leave SIE=1. The
+        // write touches no memory; `nomem` is omitted as for
+        // `cpu::disable_interrupts`.
         core::arch::asm!(
             "csrc sstatus, {mask}",
             mask = in(reg) (1u64 << 1) | (1u64 << 8) | (1u64 << 18),
-            options(nostack, nomem),
+            options(nostack, preserves_flags),
         );
 
         // Install stvec — per-hart CSR, must be written on every hart.
@@ -1078,12 +1078,15 @@ pub fn disable() -> bool
 {
     let prev: u64;
     // SAFETY: csrrci sstatus is a privileged S-mode instruction that atomically
-    // reads sstatus and clears bit 1 (SIE); kernel always runs in S-mode.
+    // reads sstatus into the output register and clears bit 1 (SIE); it
+    // touches no memory and clobbers no other register; kernel always runs in
+    // S-mode. `nomem` is omitted so no memory operation is reordered across
+    // the disable (see `cpu::disable_interrupts`).
     unsafe {
         core::arch::asm!(
             "csrrci {0}, sstatus, 0x2",
             out(reg) prev,
-            options(nostack, nomem),
+            options(nostack, preserves_flags),
         );
     }
     prev & (1 << 1) != 0 // SIE is bit 1 of sstatus
@@ -1095,10 +1098,13 @@ pub fn disable() -> bool
 /// Trap vector must be installed before calling.
 pub unsafe fn enable()
 {
-    // SAFETY: csrsi sstatus is a privileged S-mode instruction that sets bit 1 (SIE);
-    // caller ensures trap vector installed; kernel runs in S-mode.
+    // SAFETY: csrsi sstatus is a privileged S-mode instruction that sets bit 1
+    // (SIE); it touches no memory and clobbers no register. Caller ensures the
+    // trap vector is installed; kernel runs in S-mode. `nomem` is omitted so
+    // no memory operation is reordered across the enable (see
+    // `cpu::disable_interrupts`).
     unsafe {
-        core::arch::asm!("csrsi sstatus, 0x2", options(nostack, nomem));
+        core::arch::asm!("csrsi sstatus, 0x2", options(nostack, preserves_flags));
     }
 }
 

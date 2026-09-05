@@ -55,7 +55,11 @@ kernel/
 │   │   ├── mod.rs
 │   │   ├── cspace.rs           # CSpace: slot storage, lookup, growth
 │   │   ├── slot.rs             # Capability slot representation and rights
-│   │   └── derivation.rs       # Derivation tree, revocation algorithm
+│   │   ├── derivation.rs       # Derivation tree, revocation algorithm
+│   │   ├── object.rs           # Kernel object headers, allocation, teardown
+│   │   ├── retype.rs           # Memory-cap retype allocator (object carving)
+│   │   ├── split.rs            # Shared tail of the range-cap split syscalls
+│   │   └── transfer.rs         # Batched capability move (SYS_CAP_MOVE, IPC transfer)
 │   ├── entropy/                # Entropy subsystem and per-CPU CSPRNG
 │   │   ├── mod.rs              # Storage alloc, seeding, draw API (fill_bytes)
 │   │   ├── keccak.rs           # Keccak-f[1600] permutation (FIPS 202)
@@ -76,14 +80,18 @@ kernel/
 │   ├── sched/                  # Scheduler
 │   │   ├── mod.rs              # Public API: init, schedule, timer_tick, wake protocol
 │   │   ├── thread.rs           # Thread control block (TCB) definition
+│   │   ├── thread_registry.rs  # Live-thread registry: teardown stops, watchdog walks
 │   │   └── run_queue.rs        # Per-CPU run queues and priority levels
 │   └── syscall/                # Syscall dispatch
-│       ├── mod.rs              # Dispatch table and entry coordination
-│       ├── ipc.rs              # IPC syscall implementations
+│       ├── mod.rs              # Dispatch table, entry coordination, thread syscalls
 │       ├── cap.rs              # Capability syscall implementations
-│       ├── mm.rs               # Memory syscall implementations
-│       ├── thread.rs           # Thread syscall implementations
-│       └── wait.rs             # Wait set syscall implementations
+│       ├── entropy.rs          # SYS_GETRANDOM
+│       ├── hw.rs               # MMIO, IRQ, and I/O-port syscalls and their splits
+│       ├── ipc.rs              # IPC syscall implementations
+│       ├── mem.rs              # Memory syscall implementations
+│       ├── sbi.rs              # SYS_SBI_CALL (riscv64)
+│       ├── sysinfo.rs          # SYS_SYSTEM_INFO
+│       └── thread.rs           # Thread lifecycle syscalls (stop, regs, sleep)
 └── docs/
     ├── arch-interface.md       # Architecture abstraction layer and dispatch surface
     ├── initialization.md       # Boot-to-init sequence, phase by phase
@@ -122,6 +130,11 @@ address space objects. See [`docs/memory-internals.md`](docs/memory-internals.md
 The capability subsystem. `cspace.rs` implements per-process capability spaces.
 `slot.rs` defines the in-memory representation of a capability slot and its rights
 bitmask. `derivation.rs` maintains the global derivation tree used for revocation.
+`object.rs` defines the kernel object headers and wrappers and their allocation and
+teardown; `retype.rs` is the allocator that carves kernel objects out of Memory-cap
+backing; `split.rs` is the tail shared by the range-capability split syscalls;
+`transfer.rs` moves a capability, with its derived children, to another slot in
+batches — the mechanism behind `SYS_CAP_MOVE` and IPC capability transfer.
 See [`docs/capability-internals.md`](docs/capability-internals.md).
 
 ### `entropy/`

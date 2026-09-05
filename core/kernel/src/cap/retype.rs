@@ -111,14 +111,33 @@ impl RetypeAllocator
         }
     }
 
+    /// Acquire the allocator lock. A contended wait is recorded in the
+    /// calling CPU's lock-wait breadcrumb for the softlockup watchdog; the
+    /// uncontended path records nothing.
+    #[track_caller]
     fn lock(&self)
     {
-        while self
+        crate::sched::check_lock_hold_preemptible(
+            crate::sched::LockKind::RetypeAlloc,
+            core::panic::Location::caller(),
+        );
+        if self
             .lock
             .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
-            core::hint::spin_loop();
+            crate::sched::lock_wait_enter(
+                crate::sched::LockKind::RetypeAlloc,
+                core::ptr::from_ref(&self.lock).expose_provenance(),
+            );
+            while self
+                .lock
+                .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+                .is_err()
+            {
+                core::hint::spin_loop();
+            }
+            crate::sched::lock_wait_exit();
         }
     }
 
@@ -478,6 +497,7 @@ unsafe fn push_page_block(alloc: &RetypeAllocator, memory: &MemoryObject, offset
 /// is valid only while `memory` is live; use `memory.base + offset` and
 /// `phys_to_virt` to access the memory.
 #[cfg(not(test))]
+#[track_caller]
 pub fn retype_allocate(memory: &MemoryObject, bytes: u64) -> Result<u64, SyscallError>
 {
     let need = round_to_class(bytes);
@@ -612,6 +632,7 @@ pub fn current_bump(memory: &MemoryObject) -> u64
 /// at `offset` must not contain a live kernel object — caller has dropped
 /// any state, drained wait queues, etc., before calling.
 #[cfg(not(test))]
+#[track_caller]
 pub fn retype_free(memory: &MemoryObject, offset: u64, bytes: u64)
 {
     let need = round_to_class(bytes);
@@ -710,6 +731,7 @@ pub fn retype_free(memory: &MemoryObject, offset: u64, bytes: u64)
 /// Calls [`crate::fatal`] on `OutOfMemory` — Phase 7 boot-time mints cannot
 /// recover from a too-small seed.
 #[cfg(not(test))]
+#[track_caller]
 pub fn boot_retype_body<T>(seed: &MemoryObject, body: T) -> NonNull<KernelObjectHeader>
 {
     let bytes = core::mem::size_of::<T>() as u64;
@@ -746,6 +768,7 @@ pub fn boot_retype_body<T>(seed: &MemoryObject, body: T) -> NonNull<KernelObject
 ///
 /// `T` must be `#[repr(C)]` with [`KernelObjectHeader`] at offset 0.
 #[cfg(not(test))]
+#[track_caller]
 pub fn alloc_in_seed<T>(body: T) -> Result<NonNull<KernelObjectHeader>, SyscallError>
 {
     let seed = crate::cap::seed_memory_ref();
@@ -779,6 +802,7 @@ pub fn alloc_in_seed<T>(body: T) -> Result<NonNull<KernelObjectHeader>, SyscallE
 /// kstack + wrapper) so its memory comes from the user's Memory cap rather than
 /// the SEED bootstrap reserve.
 #[cfg(not(test))]
+#[track_caller]
 pub fn alloc_seed_scratch(bytes: u64) -> Result<*mut u8, SyscallError>
 {
     let seed = crate::cap::seed_memory_ref();
@@ -795,6 +819,7 @@ pub fn alloc_seed_scratch(bytes: u64) -> Result<*mut u8, SyscallError>
 /// so its refcount can never drop to zero in normal operation; the
 /// `dec_ref` here is bookkeeping for the scratch lease.
 #[cfg(not(test))]
+#[track_caller]
 pub fn free_seed_scratch(ptr: *mut u8, bytes: u64)
 {
     let seed = crate::cap::seed_memory_ref();
@@ -855,6 +880,20 @@ pub struct DispatchEntry
 
 /// `EventQueueObject` wrapper bytes, used by the `EventQueue` layout helpers.
 const EVENT_QUEUE_WRAPPER_BYTES: u64 = 24;
+
+// The sub-page wrappers are header (16) + one pointer, and `dispatch_for`
+// budgets them as the literal 24 (this constant, and the Endpoint /
+// Notification / WaitSet entries). Their construction sites write the state
+// at `size_of::<Wrapper>()`, so a field added to a wrapper would silently
+// drift the budget away from the layout; pin both sides here.
+const _: () = assert!(core::mem::size_of::<KernelObjectHeader>() == 16);
+const _: () = assert!(core::mem::size_of::<crate::cap::object::EndpointObject>() == 24);
+const _: () = assert!(core::mem::size_of::<crate::cap::object::NotificationObject>() == 24);
+const _: () = assert!(core::mem::size_of::<crate::cap::object::WaitSetObject>() == 24);
+const _: () = assert!(
+    core::mem::size_of::<crate::cap::object::EventQueueObject>()
+        == EVENT_QUEUE_WRAPPER_BYTES as usize
+);
 
 /// `EventQueueState` body bytes, kept in sync with the struct in
 /// `core/kernel/src/ipc/event_queue.rs` (anchored by the const assertion
@@ -935,16 +974,17 @@ pub fn dispatch_for(object_type: ObjectType, size_arg: u64) -> Option<DispatchEn
             split: true,
         }),
         // AddressSpace and CSpace are both kernel-half growable objects.
-        // The wrapper struct (`AddressSpaceObject` / `CSpaceKernelObject`)
-        // and the inner `AddressSpace` / `CSpace` struct live in the
-        // kernel heap; the cap consumes pure budget pages: `size_arg`
-        // pages, all going onto the wrapper's growth pool.
+        // Page 0 of the slab is the wrapper page: the wrapper struct
+        // (`AddressSpaceObject` / `CSpaceKernelObject`) and the inner
+        // `AddressSpace` / `CSpace` are constructed in place there
+        // (`sys_cap_create_aspace` / `sys_cap_create_cspace`); the
+        // remaining pages go onto the wrapper's growth pool.
         //
-        // For AddressSpace, page 0 is consumed immediately as the root PT;
-        // pages 1..size_arg form the initial PT growth pool. Caller must
-        // pass `size_arg >= 1` (verified by sys_cap_create_aspace).
+        // For AddressSpace, page 1 is the root page table and pages
+        // 2..size_arg form the initial PT growth pool; the syscall verifies
+        // the minimum `size_arg`.
         //
-        // For CSpace, all `size_arg` pages enter the slot-page pool;
+        // For CSpace, pages 1..size_arg seed the slot-page pool;
         // CSpace::grow consumes them on demand.
         //
         // `size_arg.checked_mul` rejects pathological sizes (caller-supplied

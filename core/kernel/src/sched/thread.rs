@@ -535,12 +535,32 @@ pub struct ThreadControlBlock
     /// Points into the kernel stack below `kernel_stack_top`.
     pub trap_frame: *mut crate::arch::current::trap_frame::TrapFrame,
 
+    /// Number of the syscall the thread is executing: Relaxed-stored by the
+    /// dispatcher at entry and reset to `u64::MAX` at exit. Read by the
+    /// lock-holder stamps, which must not follow `trap_frame` from a
+    /// possibly stale TCB pointer and may read it from another CPU in the
+    /// state they report. A caller passing `u64::MAX` as a syscall number is
+    /// rejected as unknown and reads here as "no syscall".
+    pub syscall_nr: core::sync::atomic::AtomicU64,
+
     // === Address space / capability references ===
     /// Address space this thread executes in (null for kernel threads).
     pub address_space: *mut crate::mm::address_space::AddressSpace,
 
     /// `CSpace` bound to this thread.
     pub cspace: *mut crate::cap::cspace::CSpace,
+
+    /// Registry identity of `cspace`, stamped when it is bound: the id and
+    /// the epoch `lookup_cspace` expects. A path that reaches a `CSpace`
+    /// through a thread other than the running one — IPC capability
+    /// transfer, whose sender or receiver is parked — resolves it through
+    /// the registry with these instead of dereferencing `cspace`: a parked
+    /// thread holds no reference on its `CSpace`, which a teardown can
+    /// unregister and free under it. `(0, 0)` for a null `cspace`; epoch 0
+    /// is never registered, so it resolves to nothing.
+    pub cspace_id: crate::cap::slot::CSpaceId,
+    /// See [`cspace_id`](Self::cspace_id).
+    pub cspace_epoch: u32,
 
     // === IPC buffer ===
     /// Virtual address of the per-thread IPC buffer page (0 = not registered).
@@ -639,15 +659,19 @@ pub struct ThreadControlBlock
     pub death_observer_count: u8,
 
     /// Exit reason recorded by the kernel at the moment this thread became
-    /// `Exited`. Written by `sys_thread_exit` (clean exit, value `0`), by
-    /// `sys_process_exit` (`encode_exit_code(arg0)`, a voluntary code in
-    /// `[0, EXIT_FAULT_BASE)`), and by the architecture fault handlers (value
+    /// `Exited`, under the same all-locks hold as that commit
+    /// (`exit_under_all_locks`): by `sys_thread_exit` (clean exit, value `0`),
+    /// by `sys_process_exit` (`encode_exit_code(arg0)`, a voluntary code in
+    /// `[0, EXIT_FAULT_BASE)`), by the architecture fault handlers (value
     /// `EXIT_FAULT_BASE + vector`) before they call `post_death_notification`,
-    /// under the all-CPU scheduler locks held by the matching
-    /// `set_state_under_all_locks` transition. Read out-of-band by `sys_cap_info`'s
-    /// `CAP_INFO_THREAD_STATE` selector so userspace process managers can
-    /// answer "did this thread die, and with what reason?" without racing
-    /// the userspace death-event drain.
+    /// and by object teardown (`syscall::EXIT_KILLED`; that stop posts
+    /// nothing). A commit that finds the thread already `Exited` writes
+    /// nothing, so the winning writer's reason survives; a thread killed while
+    /// inside its own exit or fault path still posts that path's reason (no
+    /// death walk posts `EXIT_KILLED`), so the two can differ. Read
+    /// out-of-band by `sys_cap_info`'s `CAP_INFO_THREAD_STATE` selector so
+    /// userspace process managers can answer "did this thread die, and with
+    /// what reason?" without racing the userspace death-event drain.
     pub exit_reason: u64,
 
     // === Sleep ===

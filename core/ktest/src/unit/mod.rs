@@ -83,6 +83,11 @@ pub fn run_all(ctx: &TestContext)
     run_test!("cap::derive_attenuation", cap::derive_attenuation(ctx));
     run_test!("cap::revoke_invalidates", cap::revoke_invalidates(ctx));
     run_test!("cap::revoke_large_subtree", cap::revoke_large_subtree(ctx));
+    run_test!("cap::move_large_subtree", cap::move_large_subtree(ctx));
+    run_test!(
+        "cap::delete_intermediate_keeps_grandchildren_revocable",
+        cap::delete_intermediate_keeps_grandchildren_revocable(ctx)
+    );
     run_test!("cap::delete", cap::delete(ctx));
     run_test!(
         "cap::insert_to_occupied_slot_err",
@@ -123,6 +128,18 @@ pub fn run_all(ctx: &TestContext)
     run_test!(
         "cap::derive_badge_on_notification",
         cap::derive_badge_on_notification(ctx)
+    );
+    run_test!(
+        "cap::cspace_teardown_multibatch",
+        cap::cspace_teardown_multibatch(ctx)
+    );
+    run_test!(
+        "cap::cspace_delete_stops_bound_thread",
+        cap::cspace_delete_stops_bound_thread(ctx)
+    );
+    run_test!(
+        "cap::cspace_self_delete_stops_caller",
+        cap::cspace_self_delete_stops_caller(ctx)
     );
 
     // ── Capability inspection (SYS_CAP_INFO) ──────────────────────────────────
@@ -193,6 +210,26 @@ pub fn run_all(ctx: &TestContext)
     run_test!(
         "retype::cspace_grow_consumes_pool",
         retype::cspace_grow_consumes_pool(ctx)
+    );
+    run_test!(
+        "retype::cspace_indirect_region",
+        retype::cspace_indirect_region(ctx)
+    );
+    run_test!(
+        "retype::cspace_explicit_placement_fast_fail",
+        retype::cspace_explicit_placement_fast_fail(ctx)
+    );
+    run_test!(
+        "retype::cspace_dir_page_survives_failed_grow",
+        retype::cspace_dir_page_survives_failed_grow(ctx)
+    );
+    run_test!(
+        "retype::aspace_delete_stops_bound_thread",
+        retype::aspace_delete_stops_bound_thread(ctx)
+    );
+    run_test!(
+        "retype::aspace_self_delete_stops_caller",
+        retype::aspace_self_delete_stops_caller(ctx)
     );
     run_test!(
         "retype::cspace_pool_exhaust_then_augment",
@@ -434,6 +471,14 @@ pub fn run_all(ctx: &TestContext)
     run_test!(
         "thread::sched_split_enforces_bands",
         thread::sched_split_enforces_bands(ctx)
+    );
+    run_test!(
+        "thread::sched_split_after_slot_reuse",
+        thread::sched_split_after_slot_reuse(ctx)
+    );
+    run_test!(
+        "thread::sched_split_rollback_on_full_cspace",
+        thread::sched_split_rollback_on_full_cspace(ctx)
     );
     run_test!(
         "thread::create_priority_args",

@@ -197,16 +197,49 @@ pub fn sys_thread_start(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         // All-CPU lock commit closes the cross-CPU dealloc race; see
         // docs/thread-lifecycle-and-sleep.md § Lifecycle State Machine. The
         // target is now not-`current` and unlinked, so the force-link below
-        // establishes enqueue_ready_thread's not-live precondition.
-        crate::sched::set_state_under_all_locks(target_tcb, ThreadState::Ready);
+        // establishes enqueue_ready_thread's not-live precondition. Both the
+        // commit and the link refuse an `Exited` target: the state read above
+        // ran without a lock, and an object teardown (or an exit the target
+        // reached through a concurrent start) may have ended the thread since.
+        // Reviving it would let it run against reclaimed storage.
+        if matches!(
+            crate::sched::set_state_under_all_locks(target_tcb, ThreadState::Ready),
+            crate::sched::StateCommit::RefusedExited
+        )
+        {
+            return Err(SyscallError::InvalidArgument);
+        }
         // Route to correct CPU based on affinity. The thread is already Ready
         // (committed above), so use enqueue_ready_thread to link it: the gated
         // enqueue_and_wake would coalesce an already-Ready thread and drop it.
         let target_cpu = crate::sched::select_target_cpu(target_tcb);
-        crate::sched::enqueue_ready_thread(target_tcb, target_cpu);
+        if !crate::sched::enqueue_ready_thread(target_tcb, target_cpu)
+        {
+            return Err(SyscallError::InvalidArgument);
+        }
     }
 
     Ok(0)
+}
+
+/// Commit `Stopped` for `tcb` under the all-locks discipline, returning the
+/// CPU running it (if any). An `Exited` target is terminal and refused with
+/// `InvalidState`.
+///
+/// # Safety
+/// `tcb` must be a valid TCB pointer.
+#[cfg(not(test))]
+unsafe fn commit_stopped(
+    tcb: *mut crate::sched::thread::ThreadControlBlock,
+) -> Result<Option<usize>, SyscallError>
+{
+    use crate::sched::thread::ThreadState;
+    // SAFETY: caller contract.
+    match unsafe { crate::sched::set_state_under_all_locks(tcb, ThreadState::Stopped) }
+    {
+        crate::sched::StateCommit::Committed(running_on) => Ok(running_on),
+        crate::sched::StateCommit::RefusedExited => Err(SyscallError::InvalidState),
+    }
 }
 
 /// `SYS_THREAD_STOP` (20): transition a thread to the Stopped state.
@@ -283,8 +316,8 @@ pub fn sys_thread_stop(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         }
 
         // See docs/thread-lifecycle-and-sleep.md § Lifecycle State Machine
-        // (sys_thread_stop rows).
-        let running_on = crate::sched::set_state_under_all_locks(target_tcb, ThreadState::Stopped);
+        // (sys_thread_stop rows); an `Exited` target is refused (terminal).
+        let running_on = commit_stopped(target_tcb)?;
 
         // If stopping self (Running → Stopped): yield so another thread runs.
         if core::ptr::eq(target_tcb, caller_tcb)
@@ -383,12 +416,15 @@ pub fn sys_thread_stop(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// `tcb` must be a valid TCB. The caller MUST NOT hold the target's `sched_lock`
 /// or any per-CPU scheduler lock: this function acquires `tcb.sched_lock` itself
 /// for the binding read-and-clear, and per-source IPC locks for the unlink (lock
-/// order: source IPC → `sched_lock`, so the two are never held together).
+/// order: source IPC → `sched_lock`, so the two are never held together). The
+/// caller MAY hold `THREAD_REGISTRY_LOCK` (ordered before every lock taken
+/// here; the object-teardown walk does), which keeps `tcb` from being freed
+/// meanwhile.
 // too_many_lines: flat dispatch over every `IpcThreadState` variant; splitting
 // adds no clarity (each arm is independent and short).
 #[allow(clippy::too_many_lines)]
 #[cfg(not(test))]
-unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadControlBlock)
+pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadControlBlock)
 {
     use crate::ipc::endpoint::{EndpointState, unlink_from_wait_queue};
     use crate::ipc::event_queue::EventQueueState;
@@ -1015,7 +1051,8 @@ pub fn sys_thread_set_priority(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// `cap_derive` cannot narrow a band (it attenuates rights only), so this is
 /// the sole way to hand out a sub-band. Presence-only authority; no rights bit.
 ///
-/// Returns `slot1 | (slot2 << 32)` on success.
+/// Returns the two child handles in the primary and secondary return
+/// registers.
 #[cfg(not(test))]
 pub fn sys_sched_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
@@ -1026,7 +1063,7 @@ pub fn sys_sched_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     use crate::cap::split::install_split_children;
     use crate::syscall::current_tcb;
 
-    let sched_idx = tf.arg(0) as u32;
+    let sched_handle = tf.arg(0) as u32;
     let split_at = tf.arg(1) as u8;
     // arg2 reserved.
 
@@ -1047,7 +1084,7 @@ pub fn sys_sched_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     let (min, max, rights, cspace_id, orig_obj_ptr) = {
         // SAFETY: caller_cspace validated; lookup_cap checks the tag (presence-only).
-        let slot = unsafe { super::lookup_cap(caller_cspace, sched_idx, SchedRights::NONE) }?;
+        let slot = unsafe { super::lookup_cap(caller_cspace, sched_handle, SchedRights::NONE) }?;
         let obj_ptr = slot.object.ok_or(SyscallError::InvalidCapability)?;
         // cast_ptr_alignment: header at offset 0; allocator guarantees alignment.
         // SAFETY: tag confirmed SchedControl; pointer is a valid SchedControlObject.
@@ -1100,7 +1137,7 @@ pub fn sys_sched_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         install_split_children(
             caller_cspace,
             cspace_id,
-            sched_idx,
+            sched_handle,
             CapTag::SchedControl,
             rights,
             orig_obj_ptr,

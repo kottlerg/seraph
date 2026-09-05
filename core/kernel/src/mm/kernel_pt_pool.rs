@@ -51,16 +51,36 @@ static REMAINING: AtomicUsize = AtomicUsize::new(0);
 /// never held simultaneously.
 static LOCK: AtomicBool = AtomicBool::new(false);
 
+/// Acquire the pool lock. A contended wait is recorded in the calling CPU's
+/// lock-wait breadcrumb for the softlockup watchdog; the uncontended path
+/// records nothing.
+#[cfg(not(test))]
+#[track_caller]
 fn acquire()
 {
-    while LOCK
+    crate::sched::check_lock_hold_preemptible(
+        crate::sched::LockKind::KernelPtPool,
+        core::panic::Location::caller(),
+    );
+    if LOCK
         .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
         .is_err()
     {
-        core::hint::spin_loop();
+        crate::sched::lock_wait_enter(
+            crate::sched::LockKind::KernelPtPool,
+            core::ptr::from_ref(&LOCK).expose_provenance(),
+        );
+        while LOCK
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+        crate::sched::lock_wait_exit();
     }
 }
 
+#[cfg(not(test))]
 fn release()
 {
     LOCK.store(false, Ordering::Release);
@@ -106,6 +126,7 @@ pub(crate) unsafe fn init(seed_pages: usize)
 /// upward (`map_user_page` returns `Err(())`, surfacing as
 /// `SyscallError::NoMemory` or `fatal()` in the boot bootstrap path).
 #[cfg(not(test))]
+#[track_caller]
 pub(crate) fn alloc_pt_page() -> Option<u64>
 {
     acquire();
@@ -141,7 +162,7 @@ pub(crate) fn alloc_pt_page() -> Option<u64>
 
 /// Push a 4 KiB frame back onto the pool. Symmetric to `alloc_pt_page`.
 #[cfg(not(test))]
-#[allow(dead_code)]
+#[track_caller]
 pub(crate) fn free_pt_page(pa: u64)
 {
     acquire();
@@ -159,7 +180,6 @@ pub(crate) fn free_pt_page(pa: u64)
 
 /// Remaining pages in the pool. Diagnostic only.
 #[cfg(not(test))]
-#[allow(dead_code)]
 pub(crate) fn remaining_pages() -> usize
 {
     REMAINING.load(Ordering::Acquire)

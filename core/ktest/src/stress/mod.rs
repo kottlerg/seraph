@@ -36,6 +36,7 @@ mod idle_wake_race;
 mod load_balance_handoff_steal;
 mod priority_dealloc_race;
 mod retype_concurrent;
+mod split_delete_race;
 mod stop_reply_race;
 mod stop_resume_race;
 mod thread_churn;
@@ -106,6 +107,7 @@ pub fn run_all(ctx: &TestContext)
         concurrent_map_unmap::run(ctx)
     );
     run_integration_test!("stress::retype_concurrent", retype_concurrent::run(ctx));
+    run_integration_test!("stress::split_delete_race", split_delete_race::run(ctx));
     run_integration_test!("stress::fpu_migration_churn", fpu_migration_churn::run(ctx));
     run_integration_test!(
         "stress::concurrent_event_producers",

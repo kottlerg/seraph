@@ -1272,6 +1272,8 @@ unsafe fn kernel_entry_post_rebase(
                         iopb: core::ptr::null_mut(),
                         blocked_on_object: core::ptr::null_mut(),
                         cspace: core::ptr::null_mut(),
+                        cspace_id: 0,
+                        cspace_epoch: 0,
                         // Init's tid is the one intentionally-stable thread
                         // correlator (kept for early-boot log triage); idle
                         // threads and all dynamically-created threads draw a
@@ -1388,7 +1390,12 @@ unsafe fn kernel_entry_post_rebase(
             fatal("Phase 9: ROOT_CSPACE missing");
         }
         // SAFETY: init_tcb was just retyped above and is valid; single-threaded boot.
-        unsafe { (*init_tcb).cspace = init_cspace_ptr };
+        unsafe {
+            let id = (*init_cspace_ptr).id();
+            (*init_tcb).cspace = init_cspace_ptr;
+            (*init_tcb).cspace_id = id;
+            (*init_tcb).cspace_epoch = cap::registry_epoch(id);
+        }
 
         // Enqueue init on the BSP scheduler at INIT_PRIORITY.
         // SAFETY: scheduler initialized in Phase 8; single-threaded boot phase;

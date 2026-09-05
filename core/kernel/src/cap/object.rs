@@ -1121,8 +1121,11 @@ unsafe fn deferred_link(ptr: NonNull<KernelObjectHeader>) -> *mut *mut KernelObj
 ///
 /// # Safety
 /// `ptr` is an exclusively-owned `Thread`, `CSpaceObj`, or `AddressSpace`
-/// object (refcount 0). For a `Thread`, its TCB is already `Exited` and
-/// unlinked from every run queue. `cpu` is the local CPU index
+/// object (refcount 0). A `Thread` pushed by a self-teardown is already
+/// `Exited` and unlinked from every run queue; one pushed by
+/// `release_moved_object` may be in any state, and the drain's Thread arm
+/// then runs `dealloc_object`'s ordinary stop-and-drain — or its self net
+/// when the draining thread is that thread. `cpu` is the local CPU index
 /// (`< MAX_CPUS`) and its scheduler is initialised.
 // cast_ptr_alignment: the `*mut u8` head only ever holds an object pointer
 // stored by this function (header at offset 0, 8-byte aligned).
@@ -1168,9 +1171,13 @@ pub(crate) unsafe fn push_deferred_reclaim(cpu: usize, ptr: NonNull<KernelObject
 /// CPU completes the free.
 ///
 /// # Safety
-/// Must not run on a thread whose own object is queued here: a thread that
-/// queued its own object is `Exited`, reaches the Exited arm of the syscall
-/// epilogue, and `schedule()`s away, never the drain arm.
+/// The running thread must be alive and on its own kernel stack. A thread
+/// whose own `Thread` object was queued by a self-teardown is `Exited`,
+/// reaches the Exited arm of the syscall epilogue, and `schedule()`s away,
+/// never the drain arm; one whose own object reached the stack through
+/// `release_moved_object` is caught by the Thread arm's self net, which
+/// marks it `Exited`, re-queues the object, and returns, so the epilogue's
+/// post-drain `Exited` check schedules it away.
 // cast_ptr_alignment: the `*mut u8` head only ever holds an object pointer
 // stored by push_deferred_reclaim (header at offset 0, 8-byte aligned).
 #[allow(clippy::cast_ptr_alignment)]
@@ -1612,13 +1619,16 @@ unsafe fn dealloc_object_one(
                 if is_self
                 {
                     log_self_teardown(tcb, "Thread");
-                    // Defensive net. For SYS_CAP_DELETE this is unreachable —
+                    // Self net. For SYS_CAP_DELETE this is unreachable —
                     // sys_cap_delete refuses a self thread-cap delete before the
-                    // dec-ref. It still guards any OTHER dealloc of the running
-                    // thread (e.g. a self-targeting cap_revoke): mark Exited +
-                    // drain run queues (no free), queue the object for off-CPU
-                    // reclaim, and return. The syscall epilogue observes Exited
-                    // and schedule()s away; drain_deferred_reclaim completes the
+                    // dec-ref. It guards every OTHER dealloc of the running
+                    // thread: a self-targeting cap_revoke, and the deferred
+                    // reclaim of a Thread object whose last reference a
+                    // batched move dropped (`release_moved_object`) when the
+                    // draining thread is that thread. Mark Exited + drain run
+                    // queues (no free), queue the object for off-CPU reclaim,
+                    // and return. The syscall epilogue observes Exited and
+                    // schedule()s away; drain_deferred_reclaim completes the
                     // free off-CPU, where the existing gate passes immediately.
                     // SAFETY: tcb valid; marks Exited + drains every run queue
                     // under the all-CPU-locks discipline (mirrors sys_thread_exit).

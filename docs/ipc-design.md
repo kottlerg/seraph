@@ -49,19 +49,21 @@ A message consists of:
   The kernel does not inspect or validate the label.
 - **Data words** — up to `MSG_DATA_WORDS_MAX` words carrying the message payload.
 - **Capability slots** — up to `MSG_CAP_SLOTS_MAX` capability references.
-  The transfer is all-or-nothing: either every capability moves from sender to
-  receiver atomically with the message (the sender loses access), or none does.
-  A refused transfer — a source slot gone stale, repeated within the message, or
-  pinned by an in-flight revocation or move — does not block delivery: the
-  message arrives with zero capabilities and the sender keeps its own. A
-  capability with more derived children than the kernel migrates in one lock
-  hold is moved in batches after the message commits (see
+  The transfer is all-or-nothing at commit: either every capability's move
+  begins with the message (the sender loses access as each completes), or none
+  does. A refused transfer — a source slot gone stale, repeated within the
+  message, or pinned by an in-flight revocation or move, or a sender's or
+  receiver's CSpace already torn down — does not block delivery: the message
+  arrives with zero capabilities and the sender keeps its own. A capability
+  with more derived children than the kernel migrates in one lock hold is
+  moved in batches after the message commits (see
   [capability-internals.md](../core/kernel/docs/capability-internals.md)
-  § Move); if an ancestor revokes it meanwhile, or the receiver's CSpace is
-  torn down, it arrives as handle 0 (the permanently null slot) — exactly as
-  if that had landed just after delivery — and if a concurrent deriver keeps
-  its child list growing past the kernel's batch backstop it arrives live
-  while the sender's slot survives as its derivation parent. On the reply
+  § Move); if an ancestor revokes it meanwhile it arrives as handle 0 (the
+  permanently null slot), exactly as if the revoke had landed just after
+  delivery; if the receiver's CSpace is torn down meanwhile it likewise
+  arrives as handle 0 but the sender keeps it; and if a concurrent deriver
+  keeps its child list growing past the kernel's batch backstop it arrives
+  live while the sender's slot survives as its derivation parent. On the reply
   direction the sender (the replying server) receives the error and the waiting
   caller resumes with the `IPC_REPLY_TRANSFER_FAILED` label; on the call/receive
   direction the sender is rejected before blocking where the refusal is

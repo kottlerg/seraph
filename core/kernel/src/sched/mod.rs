@@ -1981,11 +1981,16 @@ fn idle_thread_entry(_cpu_id: u64) -> !
         {
             let cpu = crate::arch::current::cpu::current_cpu() as usize;
 
-            // Reclaim any threads that self-deleted on this CPU (#341). The
-            // self-teardown path marks the dead thread Exited and queues its
-            // object for off-CPU reclaim; the idle thread is a safe context
-            // (never one of the queued dead threads). Done with interrupts
-            // enabled, before the halt-decision masking below.
+            // Reclaim the objects queued on this CPU (#341): threads that
+            // self-deleted (marked Exited, queued for off-CPU reclaim) and
+            // the last references a batched capability move dropped
+            // (`cap::transfer::release_moved_object`), whose `CSpace` or
+            // `AddressSpace` may still have live bound threads that the
+            // teardown stops here. The idle thread is a safe context: never
+            // one of the queued dead threads, bound to nothing, and — its
+            // time slice permanently zero — never descheduled inside the
+            // teardown's cross-CPU waits. Done with interrupts enabled,
+            // before the halt-decision masking below.
             // SAFETY: idle context on a valid kernel stack.
             unsafe { crate::cap::object::drain_deferred_reclaim(cpu) };
 
@@ -2121,6 +2126,8 @@ pub fn init(cpu_count: u32) -> u32
                     syscall_nr: core::sync::atomic::AtomicU64::new(u64::MAX),
                     address_space: core::ptr::null_mut(),
                     cspace: core::ptr::null_mut(),
+                    cspace_id: 0,
+                    cspace_epoch: 0,
                     ipc_buffer: 0,
                     wakeup_value: 0,
                     timed_out: false,

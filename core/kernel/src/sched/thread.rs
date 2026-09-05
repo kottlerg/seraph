@@ -550,6 +550,18 @@ pub struct ThreadControlBlock
     /// `CSpace` bound to this thread.
     pub cspace: *mut crate::cap::cspace::CSpace,
 
+    /// Registry identity of `cspace`, stamped when it is bound: the id and
+    /// the epoch `lookup_cspace` expects. A path that reaches a `CSpace`
+    /// through a thread other than the running one — IPC capability
+    /// transfer, whose sender or receiver is parked — resolves it through
+    /// the registry with these instead of dereferencing `cspace`: a parked
+    /// thread holds no reference on its `CSpace`, which a teardown can
+    /// unregister and free under it. `(0, 0)` for a null `cspace`; epoch 0
+    /// is never registered, so it resolves to nothing.
+    pub cspace_id: crate::cap::slot::CSpaceId,
+    /// See [`cspace_id`](Self::cspace_id).
+    pub cspace_epoch: u32,
+
     // === IPC buffer ===
     /// Virtual address of the per-thread IPC buffer page (0 = not registered).
     ///

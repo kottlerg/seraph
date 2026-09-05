@@ -993,6 +993,9 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         let cs_obj = unsafe { &*(obj.as_ptr().cast::<CSpaceKernelObject>()) };
         cs_obj.cspace
     };
+    // SAFETY: new_cs_ptr is the live CSpace of the object resolved above.
+    let new_cs_id = unsafe { (*new_cs_ptr).id() };
+    let new_cs_epoch = crate::cap::registry_epoch(new_cs_id);
 
     // Resolve the creation priority (validated before any allocation).
     let creation_priority = if sched_idx == 0
@@ -1128,6 +1131,8 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 syscall_nr: core::sync::atomic::AtomicU64::new(u64::MAX),
                 address_space: as_ptr,
                 cspace: new_cs_ptr,
+                cspace_id: new_cs_id,
+                cspace_epoch: new_cs_epoch,
                 ipc_buffer: 0,
                 wakeup_value: 0,
                 timed_out: false,
@@ -2366,7 +2371,8 @@ pub fn sys_cap_move(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         {
             if let Some(obj) = release
             {
-                release_moved_object(obj);
+                // SAFETY: the freed source slot's reference; syscall context.
+                unsafe { release_moved_object(obj) };
             }
             Ok(u64::from(handle))
         }

@@ -126,7 +126,7 @@ fn run_round(ctx: &TestContext, round: usize, order: Order) -> TestResult
         .map_err(|_| "integration::cap_transfer_large: thread_configure failed")?;
     thread_start(th).map_err(|_| "integration::cap_transfer_large: thread_start failed")?;
 
-    if let Order::SenderQueuedFirst = order
+    if matches!(order, Order::SenderQueuedFirst)
     {
         // Let the child derive its subtree and enter the call before the
         // server receives, so the transfer runs on the receive path.

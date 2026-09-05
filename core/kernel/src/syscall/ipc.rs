@@ -198,16 +198,20 @@ fn prevalidate_transfer_slots(cs: &CSpace, handles: &[u32]) -> Result<(), Syscal
     Ok(())
 }
 
-/// Move the caps named by `src_handles[..cap_count]` from `src_cspace` to
-/// `dst_cspace`.
+/// Move the caps named by `src_handles[..cap_count]` from `src_tcb`'s
+/// `CSpace` to `dst_tcb`'s.
 ///
-/// All-or-nothing at the start: if any slot is null/invalid, repeated within
-/// the same message, pinned by an in-flight revoke or move
-/// (`CapabilitySlot::pinned`), or the destination is full (`pre_allocate`
-/// fails), returns an error and no caps are transferred. Validation runs
-/// twice: an unlocked fast-path reject, then a locked re-validation
-/// immediately before the moves, so concurrent frees or pin changes cannot
-/// slip between validation and transfer.
+/// All-or-nothing at the start: if either `CSpace` is gone, any slot is
+/// null/invalid, repeated within the same message, pinned by an in-flight
+/// revoke or move (`CapabilitySlot::pinned`), or the destination is full
+/// (`pre_allocate` fails), returns an error and no caps are transferred.
+/// Both `CSpace`s are resolved through the registry under `DERIVATION_LOCK`
+/// from the identity stamped in each TCB (`cspace_id`/`cspace_epoch`), and
+/// the validation and pre-allocation run under the same hold, immediately
+/// before the moves: a `CSpace` a teardown has unregistered resolves to
+/// nothing, and one still registered stays allocated for the hold, since
+/// unregistration happens under this lock and the storage is released only
+/// after it.
 ///
 /// Each move then runs to completion through `cap::transfer` — inside the
 /// first lock hold for a cap with at most `MAX_REPARENT_EDITS` children,
@@ -215,23 +219,24 @@ fn prevalidate_transfer_slots(cs: &CSpace, handles: &[u32]) -> Result<(), Syscal
 /// slots pinned meanwhile, both revalidated through the registry before
 /// each batch). A cap whose slots are both freed during those batches (an
 /// ancestor's revoke) or whose destination is freed (the receiver's `CSpace`
-/// torn down) is delivered as handle 0 (the permanently null slot); one
-/// whose migration trips the liveness backstop is delivered live, with the
-/// sender's slot surviving as its derivation parent.
+/// torn down — the sender then keeps the capability) is delivered as handle
+/// 0 (the permanently null slot); one whose migration trips the liveness
+/// backstop is delivered live, with the sender's slot surviving as its
+/// derivation parent.
 ///
 /// On success, writes the destination cap handles to `dst_handles_out` and
 /// returns the number of caps transferred. The caller is responsible for
 /// writing the results to the appropriate IPC buffer.
 ///
 /// # Safety
-/// `src_cspace` and `dst_cspace` must be valid live `CSpace` pointers at
-/// entry (the first lock hold dereferences them; the later batches resolve
-/// both slots through the registry).
+/// `src_tcb` and `dst_tcb` must be valid TCBs for the duration of the call:
+/// the running thread, a sender parked `BlockedOnReply`, or a receiver
+/// pinned by `wake_in_flight`. Neither thread's `CSpace` needs to be held.
 #[cfg(not(test))]
 unsafe fn transfer_caps(
-    src_cspace: *mut CSpace,
+    src_tcb: *mut crate::sched::thread::ThreadControlBlock,
     src_handles: &[u32],
-    dst_cspace: *mut CSpace,
+    dst_tcb: *mut crate::sched::thread::ThreadControlBlock,
     dst_handles_out: &mut [u32; MSG_CAP_SLOTS_MAX],
 ) -> Result<usize, SyscallError>
 {
@@ -245,43 +250,43 @@ unsafe fn transfer_caps(
         return Ok(0);
     }
 
-    // Fast-path reject before the pre-allocation work — the locked
-    // re-validation below is the authoritative check. The handles carry
-    // the sender's generation, so a stale, recycled handle is rejected
-    // here rather than transmitting the slot's current occupant (#349).
-    // SAFETY: src_cspace validated by caller.
-    prevalidate_transfer_slots(unsafe { &*src_cspace }, &src_handles[..cap_count])?;
-
-    // Pre-allocate destination slots to avoid OOM mid-transfer. Take
-    // cspace.lock so the freelist mutation cannot tear against a concurrent
-    // SYS_CAP_CREATE_* on the same cspace.
-    // SAFETY: dst_cspace validated by caller; lock_raw/unlock_raw paired.
-    unsafe {
-        let saved = (*dst_cspace).lock.lock_raw();
-        let r = (*dst_cspace).pre_allocate(cap_count);
-        (*dst_cspace).lock.unlock_raw(saved);
-        r
-    }
-    .map_err(SyscallError::from)?;
-
-    // Acquire derivation lock for the batch move.
     crate::cap::DERIVATION_LOCK.write_lock();
+
+    // SAFETY: both TCBs are valid per the caller contract.
+    let resolved = unsafe {
+        (
+            crate::cap::lookup_cspace((*src_tcb).cspace_id, (*src_tcb).cspace_epoch),
+            crate::cap::lookup_cspace((*dst_tcb).cspace_id, (*dst_tcb).cspace_epoch),
+        )
+    };
+    let (Some(src_cspace), Some(dst_cspace)) = resolved
+    else
+    {
+        crate::cap::DERIVATION_LOCK.write_unlock();
+        return Err(SyscallError::InvalidCapability);
+    };
 
     // Lock both CSpaces in pointer address order to prevent deadlock when two
     // threads transfer caps between the same pair of CSpaces concurrently.
-    // SAFETY: both CSpace pointers validated above; released via
-    // unlock_cspace_pair with the same argument order.
+    // SAFETY: both CSpace pointers registry-resolved under the lock;
+    // released via unlock_cspace_pair with the same argument order.
     let (saved1, saved2) = unsafe { crate::cap::lock_cspace_pair(src_cspace, dst_cspace) };
 
-    // Re-validate under the locks: a source slot can be freed, or gain a
-    // pin, between the unlocked pre-validation and lock acquisition.
-    // Failing here preserves the all-or-nothing contract (nothing has moved
-    // yet) and keeps the per-move failure branch below genuinely
-    // unreachable — without this, a sender naming a sibling thread's
-    // mid-revoke root, or packing one index twice, would trip that branch
-    // from userspace.
-    // SAFETY: src_cspace validated by caller; both locks held.
-    if let Err(e) = prevalidate_transfer_slots(unsafe { &*src_cspace }, &src_handles[..cap_count])
+    // Validate under the locks — the handles carry the sender's generation,
+    // so a stale, recycled handle is rejected rather than transmitting the
+    // slot's current occupant (#349) — then pre-allocate the destination
+    // slots so no move can run out of slots mid-message. Failing here keeps
+    // the all-or-nothing contract (nothing has moved yet) and the per-move
+    // failure branch below genuinely unreachable.
+    // SAFETY: both pointers registry-resolved under the lock; dst lock held.
+    let prepared = unsafe {
+        prevalidate_transfer_slots(&*src_cspace, &src_handles[..cap_count]).and_then(|()| {
+            (*dst_cspace)
+                .pre_allocate(cap_count)
+                .map_err(SyscallError::from)
+        })
+    };
+    if let Err(e) = prepared
     {
         // SAFETY: saved1 and saved2 came from the lock_cspace_pair call above.
         unsafe { crate::cap::unlock_cspace_pair(src_cspace, dst_cspace, saved1, saved2) };
@@ -309,12 +314,12 @@ unsafe fn transfer_caps(
             }
             Ok(MoveStep::Lost(_) | MoveStep::Abandoned { .. }) | Err(_) =>
             {
-                // The locked re-validation above passed and destination
-                // slots are pre-allocated; this branch is unreachable in
-                // correct operation. Panic in debug builds only.
+                // The locked validation above passed and destination slots
+                // are pre-allocated; this branch is unreachable in correct
+                // operation. Panic in debug builds only.
                 debug_assert!(
                     false,
-                    "transfer_caps: unexpected move failure after locked re-validation"
+                    "transfer_caps: unexpected move failure after locked validation"
                 );
                 dst_handles_out[i] = 0;
             }
@@ -328,7 +333,8 @@ unsafe fn transfer_caps(
 
     for obj in releases.iter().flatten()
     {
-        release_moved_object(*obj);
+        // SAFETY: each is a freed source slot's reference; syscall context.
+        unsafe { release_moved_object(*obj) };
     }
     for (i, mv) in pending.iter().enumerate()
     {
@@ -378,17 +384,14 @@ unsafe fn deliver_call_caps(
     {
         return;
     }
-    // SAFETY: caller_tcb is the running caller; server_tcb a valid pinned TCB.
-    let caller_cspace = unsafe { (*caller_tcb).cspace };
-    // SAFETY: server_tcb valid and pinned by wake_in_flight.
-    let server_cspace = unsafe { (*server_tcb).cspace };
     let mut dst_handles = [0u32; MSG_CAP_SLOTS_MAX];
-    // SAFETY: CSpace pointers extracted from valid, live TCBs.
+    // SAFETY: caller_tcb is the running caller; server_tcb a valid TCB
+    // pinned by wake_in_flight.
     let transferred = unsafe {
         transfer_caps(
-            caller_cspace,
+            caller_tcb,
             &msg.cap_slots[..msg.cap_count],
-            server_cspace,
+            server_tcb,
             &mut dst_handles,
         )
     }
@@ -779,16 +782,13 @@ pub fn sys_ipc_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         let mut dst_handles = [0u32; MSG_CAP_SLOTS_MAX];
         if msg.cap_count > 0
         {
-            // SAFETY: caller returned by endpoint_recv; is valid TCB.
-            let caller_cspace = unsafe { (*caller).cspace };
-            // SAFETY: tcb validated above.
-            let server_cspace = unsafe { (*tcb).cspace };
-            // SAFETY: CSpace pointers extracted from valid TCBs.
+            // SAFETY: caller returned by endpoint_recv is a valid TCB parked
+            // BlockedOnReply; tcb is the running receiver.
             transferred = unsafe {
                 transfer_caps(
-                    caller_cspace,
+                    caller,
                     &msg.cap_slots[..msg.cap_count],
-                    server_cspace,
+                    tcb,
                     &mut dst_handles,
                 )
             }
@@ -1107,19 +1107,11 @@ pub fn sys_ipc_reply(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             // caller resumes in its own address space.
             if cap_count > 0
             {
-                // SAFETY: tcb validated above.
-                let server_cspace = unsafe { (*tcb).cspace };
-                // SAFETY: caller returned by endpoint_reply; is valid TCB.
-                let caller_cspace = unsafe { (*caller).cspace };
                 let mut dst_handles = [0u32; MSG_CAP_SLOTS_MAX];
-                // SAFETY: CSpace pointers extracted from valid TCBs.
+                // SAFETY: tcb is the running server; caller returned by
+                // endpoint_reply is a valid TCB parked BlockedOnReply.
                 let transfer = unsafe {
-                    transfer_caps(
-                        server_cspace,
-                        &msg.cap_slots[..cap_count],
-                        caller_cspace,
-                        &mut dst_handles,
-                    )
+                    transfer_caps(tcb, &msg.cap_slots[..cap_count], caller, &mut dst_handles)
                 };
                 let transferred = match transfer
                 {

@@ -592,27 +592,31 @@ re-linked it, a live derived child of the source with both pins cleared —
 the shape `SYS_CAP_COPY` produces — and returns `Interrupted` from the
 syscall; an IPC transfer delivers the destination handle.
 
-Neither slot pins its `CSpace` against teardown; the later batches resolve
-both through the registry, so a `CSpace` torn down meanwhile is observed as
-gone rather than dereferenced. The drain of a dying `CSpace` treats its
-in-flight slots like any other: the children hanging under a dying slot
-become derivation roots (the standard teardown semantic above) — the
-destination and its migrated children when the source's `CSpace` dies (the
-move then completes on the next batch, the destination now a root), the
-migrated children when the destination's `CSpace` dies (the move reports
-`InvalidState`, the source keeping the capability and its remaining
-children). A `CSpace` bound to the running thread cannot be torn down
-mid-syscall (the teardown first stops and deschedules every bound thread),
-so the source of `SYS_CAP_MOVE` and of the call and reply directions of IPC
-transfer never dies under a move; the receive direction's source belongs to
-a parked sender and can. When the freed source slot's reference was the last
-one to a `Thread`, `CSpace`, or `AddressSpace`, the object goes to the CPU's
-deferred reclaim rather than being torn down in place — a teardown stops
-bound threads and waits on other CPUs, which must not happen inside IPC
-delivery. A capability whose source and destination an ancestor's revoke
-both freed mid-transfer, or whose destination went with the receiver's
-`CSpace`, is delivered as handle 0 (the permanently null slot); one that
-trips the backstop is delivered live, the sender's slot surviving as its
+Neither slot pins its `CSpace` against teardown. IPC transfer resolves both
+`CSpace`s through the registry under the derivation lock, from the identity
+each TCB carries (`cspace_id`, `cspace_epoch`): a parked sender or receiver
+holds no reference on its `CSpace`, so a raw pointer read from its TCB could
+name storage a teardown has unregistered and freed, whereas a `CSpace` that
+resolves stays allocated for the hold — unregistration happens under the
+same lock and the storage is released only after it. The later batches
+resolve both slots the same way, so a `CSpace` torn down meanwhile is
+observed as gone rather than dereferenced, and a source slot that no longer
+resolves is left to that teardown's cascade, which releases the reference
+it holds. The drain of a dying `CSpace` treats its in-flight slots like any
+other: the children hanging under a dying slot become derivation roots (the
+standard teardown semantic above) — the destination, carrying its migrated
+children, when the source's `CSpace` dies (the move then completes on the
+next batch, the destination now a root), the migrated children when the
+destination's `CSpace` dies (the move reports `InvalidState`, the source
+keeping the capability and its remaining children). When the freed source
+slot's reference was the last one to a `Thread`, `CSpace`, or
+`AddressSpace`, the object goes to the CPU's deferred reclaim rather than
+being torn down in place — a teardown stops bound threads and waits on
+other CPUs, which must not happen inside IPC delivery. A capability whose
+source and destination an ancestor's revoke both freed mid-transfer, or
+whose destination went with the receiver's `CSpace` (the sender then keeps
+it), is delivered as handle 0 (the permanently null slot); one that trips
+the backstop is delivered live, the sender's slot surviving as its
 derivation parent.
 
 ### Safe Delegation: the "Derive Twice" Pattern
@@ -753,4 +757,6 @@ CSpace. The kernel clears the per-thread reply slot after `SYS_IPC_REPLY`.
 
 ## Summarized By
 
-[kernel/README.md](../README.md)
+[kernel/README.md](../README.md),
+[docs/capability-model.md](../../../docs/capability-model.md),
+[docs/ipc-design.md](../../../docs/ipc-design.md)

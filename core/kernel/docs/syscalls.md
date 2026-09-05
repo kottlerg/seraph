@@ -255,10 +255,11 @@ afterwards degrades to delivery with zero caps (the caller keeps its
 capabilities). A capability whose derived children take more than one lock
 hold to migrate is moved in batches after the message commits (see
 [capability-internals.md](capability-internals.md) § Move); if an ancestor's
-revoke frees it meanwhile, or the receiver's CSpace is torn down, it arrives
-as handle 0 (the permanently null slot); if a concurrent deriver keeps its
-child list growing past the batch backstop it arrives live while the
-sender's slot survives as its derivation parent.
+revoke frees it meanwhile it arrives as handle 0 (the permanently null
+slot), as it does when the receiver's CSpace is torn down meanwhile — the
+sender then keeps it; if a concurrent deriver keeps its child list growing
+past the batch backstop it arrives live while the sender's slot survives as
+its derivation parent.
 
 ---
 

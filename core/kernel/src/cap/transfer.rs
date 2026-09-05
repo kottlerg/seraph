@@ -250,7 +250,9 @@ pub fn move_cap_drive(mv: CapMove) -> MoveStep
             {
                 if let Some(obj) = release
                 {
-                    release_moved_object(obj);
+                    // SAFETY: the freed source slot's reference; the lock is
+                    // released and this is syscall context.
+                    unsafe { release_moved_object(obj) };
                 }
                 return MoveStep::Done {
                     handle,
@@ -324,7 +326,8 @@ unsafe fn drive_batch(mv: &CapMove, batches: &mut u32) -> MoveStep
 }
 
 /// Drop the object reference a freed source slot held; frees the object if
-/// that was the last reference. Must run outside `DERIVATION_LOCK`.
+/// that was the last reference. Must run outside `DERIVATION_LOCK` —
+/// `dealloc_object` may acquire the frame allocator and other inner locks.
 ///
 /// A `Thread`, `CSpace`, or `AddressSpace` whose last reference goes here
 /// is queued for this CPU's deferred reclaim (drained at the next syscall
@@ -332,8 +335,15 @@ unsafe fn drive_batch(mv: &CapMove, batches: &mut u32) -> MoveStep
 /// stops bound threads and waits on other CPUs, which must not run inside
 /// IPC delivery, and may stop the running thread itself. Every other type
 /// frees in place.
+///
+/// # Safety
+///
+/// `obj` must carry an outstanding reference the caller owns — the one the
+/// freed source slot held, as reported by [`MoveStep::Done`]. Syscall
+/// context with interrupts disabled: the deferred-reclaim push needs a
+/// stable CPU index.
 #[cfg(not(test))]
-pub fn release_moved_object(obj: NonNull<KernelObjectHeader>)
+pub unsafe fn release_moved_object(obj: NonNull<KernelObjectHeader>)
 {
     use super::object::{ObjectType, dealloc_object, push_deferred_reclaim};
 
@@ -364,8 +374,12 @@ pub fn release_moved_object(obj: NonNull<KernelObjectHeader>)
 
 /// Host-test variant: the harness leaks its objects, so only the count is
 /// kept.
+///
+/// # Safety
+///
+/// As for the kernel variant.
 #[cfg(test)]
-pub fn release_moved_object(obj: NonNull<KernelObjectHeader>)
+pub unsafe fn release_moved_object(obj: NonNull<KernelObjectHeader>)
 {
     // SAFETY: a leaked test header.
     unsafe { obj.as_ref().dec_ref() };
@@ -401,13 +415,15 @@ unsafe fn move_cap_step(mv: &CapMove, src_lock: SourceLock) -> MoveStep
         return MoveStep::Pending(*mv);
     }
     // SAFETY: caller contract.
-    unsafe {
+    let freed = unsafe {
         take_source_position(mv);
-        free_source(mv, src_lock);
-    }
+        free_source(mv, src_lock)
+    };
+    // A source whose CSpace unregistered before this hold keeps its slot
+    // occupied for the teardown's cascade to release; nothing to drop here.
     MoveStep::Done {
         handle: mv.handle,
-        release: Some(mv.object),
+        release: freed.then_some(mv.object),
     }
 }
 
@@ -458,18 +474,21 @@ unsafe fn take_source_position(mv: &CapMove)
 }
 
 /// Free the source slot; the free path resets its links, pin, and
-/// generation. Lock order: `DERIVATION_LOCK` → `cspace.lock`.
+/// generation. Lock order: `DERIVATION_LOCK` → `cspace.lock`. Returns
+/// whether the slot was freed — `false` when its `CSpace` no longer
+/// resolves, in which case the slot and the reference it holds belong to
+/// that `CSpace`'s teardown.
 ///
 /// # Safety
 ///
 /// Caller must hold `DERIVATION_LOCK` for writing, and the source `CSpace`
 /// lock when `src_lock` is [`SourceLock::Held`].
-unsafe fn free_source(mv: &CapMove, src_lock: SourceLock)
+unsafe fn free_source(mv: &CapMove, src_lock: SourceLock) -> bool
 {
     let Some(cs) = super::lookup_cspace(mv.src.cspace_id, mv.src.epoch)
     else
     {
-        return;
+        return false;
     };
     // SAFETY: registry-resolved live CSpace; lock_raw/unlock_raw paired.
     unsafe {
@@ -484,6 +503,7 @@ unsafe fn free_source(mv: &CapMove, src_lock: SourceLock)
             }
         }
     }
+    true
 }
 
 /// Whether `id` still holds the capability the move is relocating: occupied,
@@ -691,7 +711,8 @@ mod tests
             2,
             "destination reference taken, source's outstanding"
         );
-        release_moved_object(obj);
+        // SAFETY: the reference handed back above.
+        unsafe { release_moved_object(obj) };
         assert_eq!(refcount(obj), 1);
 
         let dst = dst_of(ID_B, handle);
@@ -775,7 +796,8 @@ mod tests
             panic!("two children complete in one batch: {step:?}");
         };
         assert_eq!(syscall::cap_handle_index(handle), want.get());
-        release_moved_object(release.expect("release"));
+        // SAFETY: the reference handed back above.
+        unsafe { release_moved_object(release.expect("release")) };
         assert_moved(root, src, sib, &kids, SlotId::current(ID_B, want), obj);
         crate::cap::unregister_cspace(ID_A);
         crate::cap::unregister_cspace(ID_B);

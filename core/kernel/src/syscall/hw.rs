@@ -301,8 +301,8 @@ pub fn sys_mmio_map(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         }
         else
         {
-            // SAFETY: heap-backed boot AS; map_page acquires pt_lock and
-            // FRAME_ALLOC_LOCK internally.
+            // SAFETY: AS without a recorded donation; map_page acquires
+            // pt_lock and FRAME_ALLOC_LOCK internally.
             unsafe { (*as_ptr).map_page(virt, phys, page_flags) }
         };
         result.map_err(|()| SyscallError::OutOfMemory)?;

@@ -657,4 +657,4 @@ The kernel does not provide:
 
 ## Summarized By
 
-[README.md](../README.md), [Architecture Overview](architecture.md), [storage.md](storage.md), [init](../services/init/README.md), [namespace-model.md](namespace-model.md)
+[README.md](../README.md), [Architecture Overview](architecture.md), [storage.md](storage.md), [init](../services/init/README.md), [namespace-model.md](namespace-model.md), [memory-model.md](memory-model.md)

@@ -135,7 +135,7 @@ object locks by the split and merge paths and inside the derivation lock by
 every tree edit that frees or inserts a slot. The pool locks are innermost:
 the wrapper pool locks inside the `CSpace` spinlock for leaf growth, inside
 `pt_lock` for pooled page-table frames, and alone on the augment path; the
-kernel page-table pool lock inside `pt_lock` on the heap-backed page-table
+kernel page-table pool lock inside `pt_lock` on the kernel-direct page-table
 path. A CPU wedged on one of these locks shows no heartbeat and no protocol
 spin site; the softlockup watchdog's lock-wait breadcrumb names the lock
 (§ Softlockup Watchdog).

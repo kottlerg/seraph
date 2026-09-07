@@ -259,8 +259,9 @@ on top of the buddy allocator and never exposed to userspace.
 
 ### Slab Allocator
 
-Fixed-size kernel objects — capability entries, thread control blocks, IPC endpoints
-— are managed by a slab allocator. Each object type has a dedicated slab cache:
+Fixed-size kernel objects — capability entries, thread control blocks, IPC
+endpoints — are managed by a slab allocator. Each object type has a dedicated slab
+cache:
 
 - The cache holds one or more slabs, each a physically contiguous set of pages
 - Each slab is divided into fixed-size slots for that object type

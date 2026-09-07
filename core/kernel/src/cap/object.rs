@@ -580,8 +580,10 @@ impl ChunkRecord
     };
 }
 
-/// Pages `PagePool::add_chunk` seeds onto the free list per pool-lock hold,
-/// bounding the hold for a donation of any size.
+/// Pages `PagePool::seed_pages` pushes per pool-lock hold. Bounds the hold
+/// (scheduling-internals targets ~10 µs per spinlock hold) for a donation of
+/// any size; the interrupts-off window of the syscall that seeds a large
+/// donation is the sum of its batches and is not bounded here.
 const SEED_BATCH_PAGES: u64 = 64;
 
 /// Bytes of `ChunkRecordPage` ahead of its records: `next_phys` and `used`.
@@ -659,10 +661,11 @@ impl PagePool
         }
     }
 
-    /// Whether record 0, the create-time slab, is populated: records are
-    /// appended from index 0, so this is true for every retype-backed
-    /// wrapper and false for the heap-backed boot address space, whose page
-    /// tables come from `kernel_pt_pool`.
+    /// Whether record 0, the create-time slab, is populated. Records are
+    /// appended from index 0, and every wrapper the kernel constructs
+    /// records its slab before the wrapper is published, so this is true
+    /// for every live object; the pooled map paths keep the kernel
+    /// page-table pool as the fallback for an object without it.
     #[must_use]
     pub fn retype_backed(&self) -> bool
     {
@@ -696,14 +699,17 @@ impl PagePool
         pool_unlock(&self.lock);
     }
 
-    /// Record a donation and seed its pool pages onto the free list.
-    /// Returns the number of pages seeded: `pool_pages`, or one fewer when
-    /// the donation had to supply a record page.
+    /// Record a donation, seed its pool pages onto the free list, and credit
+    /// `budget` with the bytes seeded: `pool_pages`, or one fewer when the
+    /// donation had to supply a record page.
     ///
     /// `Err(())` only when there is no record space and `pool_pages == 0`,
-    /// so the donation cannot supply a record page; nothing is recorded or
-    /// seeded then. A record is written before its pages are published, so
-    /// every seeded page belongs to a recorded, reclaimable chunk.
+    /// so the donation cannot supply a record page; nothing is recorded,
+    /// seeded, or credited then. The record is written under the first lock
+    /// hold, before any page is published, so every seeded page belongs to
+    /// a recorded, reclaimable chunk; the pages then go onto the free list
+    /// in batches of `SEED_BATCH_PAGES` under separate holds, each batch
+    /// credited as it lands.
     ///
     /// Pool pages are the high `pool_pages` of the chunk; the low
     /// `total_pages - pool_pages` stay reserved for the caller (wrapper
@@ -724,7 +730,8 @@ impl PagePool
         base_offset: u64,
         total_pages: u64,
         pool_pages: u64,
-    ) -> Result<u64, ()>
+        budget: &AtomicU64,
+    ) -> Result<(), ()>
     {
         debug_assert!(pool_pages <= total_pages);
         let p = crate::mm::PAGE_SIZE as u64;
@@ -736,10 +743,6 @@ impl PagePool
             page_count: total_pages,
         };
 
-        // The record is written and the first batch of pages seeded under
-        // one hold; further pages go in batches under fresh holds, so the
-        // hold time is bounded by SEED_BATCH_PAGES whatever the donation's
-        // size. Every seeded page belongs to the already-written record.
         pool_lock(&self.lock);
         let vacant = self
             .inline
@@ -771,28 +774,43 @@ impl PagePool
             unsafe { self.open_record_page(chunk_phys + first_pool * p, record) };
             first_pool += 1;
         }
+        pool_unlock(&self.lock);
 
-        // Push in reverse so the lowest address ends up at the head of the
-        // free list (purely cosmetic).
-        let mut next = total_pages;
-        loop
+        // SAFETY: the record covering these pages is written above; the
+        // pages were just retyped from `ancestor` and are unaliased.
+        unsafe { self.seed_pages(chunk_phys, first_pool, total_pages, budget) };
+        Ok(())
+    }
+
+    /// Push pages `first..total` of the chunk at `chunk_phys` onto the free
+    /// list, highest first so the lowest ends up at the head, in batches of
+    /// `SEED_BATCH_PAGES` under separate lock holds; credit `budget` with
+    /// each batch as it lands, so a concurrent pop never debits a budget
+    /// the pages have not yet been credited to.
+    ///
+    /// # Safety
+    /// The pages must belong to a donation already recorded in this pool,
+    /// be freshly retyped, and be unaliased. The pool lock must not be held.
+    #[cfg(not(test))]
+    #[track_caller]
+    unsafe fn seed_pages(&self, chunk_phys: u64, first: u64, total: u64, budget: &AtomicU64)
+    {
+        let p = crate::mm::PAGE_SIZE as u64;
+        let mut end = total;
+        while end > first
         {
-            let batch_end = next;
-            next = next.saturating_sub(SEED_BATCH_PAGES).max(first_pool);
-            for i in (next..batch_end).rev()
+            let start = end.saturating_sub(SEED_BATCH_PAGES).max(first);
+            pool_lock(&self.lock);
+            for i in (start..end).rev()
             {
-                // SAFETY: lock held; the page was just retyped from
-                // `ancestor` and is unaliased.
+                // SAFETY: lock held; the caller's contract makes the page
+                // exclusively owned and recorded.
                 unsafe { pool_push(&self.head_phys, chunk_phys + i * p) };
             }
+            budget.fetch_add((end - start) * p, Ordering::AcqRel);
             pool_unlock(&self.lock);
-            if next == first_pool
-            {
-                break;
-            }
-            pool_lock(&self.lock);
+            end = start;
         }
-        Ok(total_pages - first_pool)
     }
 
     /// Append `record` to the newest record page. `false` if there is none
@@ -820,6 +838,11 @@ impl PagePool
             (*page).records[used] = record;
             (*page).used = used + 1;
         }
+        // Re-publish the head with Release so the appended record and the
+        // new `used` are visible to a reader that Acquire-loads the head
+        // (`reclaim_chunks`), as they are for an inline record's ancestor
+        // store; teardown otherwise leans on the refcount edge alone.
+        self.record_head_phys.store(page_phys, Ordering::Release);
         true
     }
 
@@ -1102,8 +1125,8 @@ impl AddressSpaceObject
             .fetch_add(crate::mm::PAGE_SIZE as u64, Ordering::AcqRel);
     }
 
-    /// Record a freshly-retyped chunk and seed its pool pages, crediting
-    /// the growth budget with the pages actually seeded.
+    /// Record a freshly-retyped chunk, seed its pool pages, and credit the
+    /// growth budget with the pages actually seeded.
     ///
     /// # Safety
     /// See `PagePool::add_chunk`. The caller has already `inc_ref`'d
@@ -1121,18 +1144,16 @@ impl AddressSpaceObject
     ) -> Result<(), ()>
     {
         // SAFETY: forwarded from the caller's contract.
-        let seeded = unsafe {
+        unsafe {
             self.pt_pool.add_chunk(
                 ancestor,
                 ancestor_memory_base,
                 base_offset,
                 total_pages,
                 pool_pages,
-            )?
-        };
-        self.pt_growth_budget_bytes
-            .fetch_add(seeded * crate::mm::PAGE_SIZE as u64, Ordering::AcqRel);
-        Ok(())
+                &self.pt_growth_budget_bytes,
+            )
+        }
     }
 }
 
@@ -1157,8 +1178,8 @@ impl CSpaceKernelObject
         Some(phys)
     }
 
-    /// Record a freshly-retyped chunk and seed its pool pages, crediting
-    /// the growth budget with the pages actually seeded.
+    /// Record a freshly-retyped chunk, seed its pool pages, and credit the
+    /// growth budget with the pages actually seeded.
     ///
     /// # Safety
     /// See [`AddressSpaceObject::add_chunk`].
@@ -1174,18 +1195,16 @@ impl CSpaceKernelObject
     ) -> Result<(), ()>
     {
         // SAFETY: forwarded from the caller's contract.
-        let seeded = unsafe {
+        unsafe {
             self.cs_pool.add_chunk(
                 ancestor,
                 ancestor_memory_base,
                 base_offset,
                 total_pages,
                 pool_pages,
-            )?
-        };
-        self.cspace_growth_budget_bytes
-            .fetch_add(seeded * crate::mm::PAGE_SIZE as u64, Ordering::AcqRel);
-        Ok(())
+                &self.cspace_growth_budget_bytes,
+            )
+        }
     }
 }
 
@@ -2548,14 +2567,14 @@ unsafe fn dealloc_object_one(
 
                 // Return every donation, the create-time slab (holding the
                 // wrapper and this pool) last; `obj` is dangling afterwards.
+                let free = |anc: *mut KernelObjectHeader, off: u64, pages: u64| {
+                    // SAFETY: a record handed out by reclaim_chunks under
+                    // its contract; no lock held.
+                    unsafe { free_chunk(anc, off, pages) }
+                };
                 // SAFETY: refcount 0, no slot references the object, the
-                // in-place AddressSpace has been dropped, and no lock is
-                // held; free_chunk receives reclaim_chunks' records and
-                // never touches the pool.
-                unsafe {
-                    obj.pt_pool
-                        .reclaim_chunks(|anc, off, pages| free_chunk(anc, off, pages));
-                }
+                // in-place AddressSpace has been dropped, and no lock is held.
+                unsafe { obj.pt_pool.reclaim_chunks(free) };
             }
 
             // No separate `Box::from_raw(obj)` — the wrapper lives inside
@@ -2700,14 +2719,14 @@ unsafe fn dealloc_object_one(
 
             // Return every donation, the create-time slab (holding the
             // wrapper and this pool) last; `obj` is dangling afterwards.
+            let free = |anc: *mut KernelObjectHeader, off: u64, pages: u64| {
+                // SAFETY: a record handed out by reclaim_chunks under its
+                // contract; no lock held.
+                unsafe { free_chunk(anc, off, pages) }
+            };
             // SAFETY: refcount 0, no slot references the object, the
-            // in-place CSpace has been dropped, and no lock is held;
-            // free_chunk receives reclaim_chunks' records and never touches
-            // the pool.
-            unsafe {
-                obj.cs_pool
-                    .reclaim_chunks(|anc, off, pages| free_chunk(anc, off, pages));
-            }
+            // in-place CSpace has been dropped, and no lock is held.
+            unsafe { obj.cs_pool.reclaim_chunks(free) };
 
             // Recycle the id last, after all of the dying CSpace's storage
             // is reclaimed and DERIVATION_LOCK is released. Randomizing the

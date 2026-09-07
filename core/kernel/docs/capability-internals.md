@@ -138,7 +138,7 @@ allocation, and when `remove_from_free_list` unlinks a specific index);
 
 This gives amortised O(1) allocation and O(1) deallocation.
 
-### Page Pools and Donation Records
+## Page Pools (`cap/object.rs`)
 
 The wrapper object that owns a `CSpace` (`CSpaceKernelObject`) keeps the
 slot-page pool in a `PagePool`; the wrapper of an `AddressSpace` keeps its
@@ -165,11 +165,9 @@ inline records, the create-time slab last. A donation's Memory object that
 reaches zero there is reclaimed through its own nested cascade, not the
 bounded worklist the dealloc cascade otherwise uses, since the number of
 donations is unbounded. The records are never scanned while the owner is
-live: region reclaim in an address space returns an empty page table to
-the pool only when its parent entry carries the software bit the pooled
-map path set when it installed the table (`POOLED_TABLE` in each
-architecture's paging module), a constant-time test under the page-table
-lock, so tables from the kernel page-table pool stay where they are.
+live: an address space's reclaiming unmap recognises pool-owned page
+tables by a bit in the parent entry, not by the records — see
+[memory-internals.md](memory-internals.md) § Page Table Node Ownership.
 
 ---
 

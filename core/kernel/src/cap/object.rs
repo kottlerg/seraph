@@ -683,16 +683,16 @@ impl PagePool
         !self.inline[0].ancestor.load(Ordering::Acquire).is_null()
     }
 
-    /// Pop one free page; `0` if the pool is empty.
+    /// Pop one free page, or `None` if the pool is empty.
     #[cfg(not(test))]
     #[track_caller]
-    fn pop(&self) -> u64
+    fn pop(&self) -> Option<u64>
     {
         pool_lock(&self.lock);
         // SAFETY: lock held; `head_phys` is this pool's free-list head.
         let phys = unsafe { pool_pop(&self.head_phys) };
         pool_unlock(&self.lock);
-        phys
+        (phys != 0).then_some(phys)
     }
 
     /// Return a page to the free list.
@@ -889,9 +889,10 @@ impl PagePool
     /// `1..` before record 0 (whose chunk holds the page); then the inline
     /// records, snapshotted up front, with record 0 (the create-time slab
     /// that holds the owner and this pool) last. The walk is linear in the
-    /// donation count and runs to completion in the caller's context — in
-    /// syscall context, with interrupts masked for its whole length; an
-    /// owner that donated finely pays for it at teardown (see
+    /// donation count and runs to completion in whichever context drops the
+    /// last capability: the deleting syscall, with interrupts masked, or the
+    /// idle thread's deferred reclaim when the deleting thread was bound to
+    /// the object; an owner that donated finely pays for it at teardown (see
     /// capability-internals § Page Pools).
     ///
     /// # Safety
@@ -921,6 +922,9 @@ impl PagePool
             // record 0 is freed below, after every read of it.
             let (next, used) = unsafe { ((*page).next_phys, (*page).used) };
             debug_assert!((1..=CHUNK_RECORDS_PER_PAGE).contains(&used));
+            // The page is trusted kernel state, but a length read from
+            // donated memory stays within the page in every build.
+            let used = used.min(CHUNK_RECORDS_PER_PAGE);
             for i in 1..used
             {
                 // SAFETY: as above; `i < used`.
@@ -1111,11 +1115,7 @@ impl AddressSpaceObject
     #[track_caller]
     pub fn alloc_pt_page(&self) -> Option<u64>
     {
-        let phys = self.pt_pool.pop();
-        if phys == 0
-        {
-            return None;
-        }
+        let phys = self.pt_pool.pop()?;
         // Debit the growth budget. The free-list link bytes were written
         // when the page was last freed; zero the page now so the caller
         // sees a fresh PT.
@@ -1187,11 +1187,7 @@ impl CSpaceKernelObject
     #[track_caller]
     pub fn alloc_slot_page(&self) -> Option<u64>
     {
-        let phys = self.cs_pool.pop();
-        if phys == 0
-        {
-            return None;
-        }
+        let phys = self.cs_pool.pop()?;
         self.cspace_growth_budget_bytes
             .fetch_sub(crate::mm::PAGE_SIZE as u64, Ordering::AcqRel);
         let virt = crate::mm::paging::phys_to_virt(phys);

@@ -45,11 +45,12 @@ kernel/
 │   ├── mm/                     # Memory management subsystem
 │   │   ├── mod.rs
 │   │   ├── buddy.rs            # Physical frame allocator (buddy algorithm)
-│   │   ├── slab.rs             # Slab allocator for fixed-size kernel objects
-│   │   ├── size_class.rs       # General size-class allocator (heap)
+│   │   ├── paging.rs           # Phase 3 kernel page tables and the direct physical map
 │   │   ├── address_space.rs    # Virtual address space objects and lifecycle
+│   │   ├── init.rs             # Boot memory-map parsing; seeds the buddy allocator
 │   │   ├── init_reloc.rs       # Phase 9 PIE init fix-ups: RELATIVE relocation + RELRO sealing
 │   │   ├── kernel_pt_pool.rs   # Cap-backed pool for intermediate PT frames
+│   │   ├── tag_allocator.rs    # PCID/ASID tag allocation
 │   │   └── tlb_shootdown.rs    # Cross-CPU TLB shootdown protocol (per-CPU request slots)
 │   ├── cap/                    # Capability subsystem
 │   │   ├── mod.rs
@@ -120,10 +121,13 @@ and re-exported from `arch/mod.rs` as a unified interface.
 
 ### `mm/`
 
-Physical frame allocation, virtual address space management, the kernel heap, and TLB
-management. The buddy allocator (`buddy.rs`) is the foundation; the slab and size-class
-allocators build on top of it. The `address_space` module manages per-process virtual
-address space objects. See [`docs/memory-internals.md`](docs/memory-internals.md).
+Physical frame allocation, the kernel's own page tables and direct map, virtual address
+space objects, the kernel page-table pool, hardware address-space tags, and TLB
+management. The buddy allocator (`buddy.rs`) is the boot-time foundation: it seeds the
+kernel's fixed reserves and is drained into userspace Memory capabilities at the Phase 7
+handoff, after which kernel objects are carved from those capabilities by retype
+(`cap/retype.rs`). The `address_space` module manages per-process virtual address space
+objects. See [`docs/memory-internals.md`](docs/memory-internals.md).
 
 ### `cap/`
 
@@ -203,7 +207,7 @@ boot info validation
     └─► early console (arch)
             └─► buddy allocator (mm)
                     └─► kernel page tables (arch + mm)
-                            └─► slab allocator (mm)
+                            └─► typed-memory cap surface (cap)
                                     └─► arch hardware init (arch)
                                             └─► platform resource validation
                                                     └─► capability system (cap)

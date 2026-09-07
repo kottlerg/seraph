@@ -30,9 +30,10 @@
 //!
 //! The free list is intrusive: each free page's first 8 bytes (accessed
 //! via the direct physical map) hold the next-PA pointer, or 0 for the
-//! tail. `alloc_pt_page` pops, zeros the page, and returns the PA;
-//! `free_pt_page` writes the current head into the page's first 8 bytes
-//! and updates the head.
+//! tail. `alloc_pt_page` pops, zeros the page, and returns the PA. Pages
+//! are never returned: the only address space that draws on the pool is
+//! init's bootstrap space, which is never destroyed, and a reclaiming
+//! unmap leaves kernel-direct tables in place.
 
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -158,24 +159,6 @@ pub(crate) fn alloc_pt_page() -> Option<u64>
         core::ptr::write_bytes(phys_to_virt(pa) as *mut u8, 0, PAGE_SIZE);
     }
     Some(pa)
-}
-
-/// Push a 4 KiB frame back onto the pool. Symmetric to `alloc_pt_page`.
-#[cfg(not(test))]
-#[track_caller]
-pub(crate) fn free_pt_page(pa: u64)
-{
-    acquire();
-    // SAFETY: LOCK held; FREE_LIST_HEAD exclusively owned for the
-    // duration of this block. `pa` is a page-aligned PA whose direct-map
-    // VA is writable.
-    unsafe {
-        let head = FREE_LIST_HEAD;
-        *(phys_to_virt(pa) as *mut u64) = head;
-        FREE_LIST_HEAD = pa;
-    }
-    release();
-    REMAINING.fetch_add(1, Ordering::Release);
 }
 
 /// Remaining pages in the pool. Diagnostic only.

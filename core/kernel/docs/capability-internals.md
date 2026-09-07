@@ -8,10 +8,10 @@ covers the data structures and algorithms that realise those semantics.
 The capability subsystem comprises four components:
 
 1. **CSpace** — per-process capability space (slot storage and lookup)
-2. **Capability slot** — in-memory representation of one capability
-3. **Derivation tree** — cross-process tree for revocation
-4. **Page pools** — the donated pages behind a CSpace's slots and an address
+2. **Page pools** — the donated pages behind a CSpace's slots and an address
    space's page tables, and the record of every donation
+3. **Capability slot** — in-memory representation of one capability
+4. **Derivation tree** — cross-process tree for revocation
 
 ---
 
@@ -152,6 +152,8 @@ a record of every donation — its source Memory object, byte offset, and
 page count — so teardown can return each donation to its source wholesale.
 The wrapper, not the pool, keeps the byte budget the pool backs.
 
+### Donation Records
+
 Sixteen records live inline in the wrapper; the create-time slab, which
 holds the wrapper itself, is record 0. When the inline records are full,
 the next donation's first pool page becomes a *record page*: a chained
@@ -163,25 +165,34 @@ only by the memory donated — one donated page of bookkeeping per record
 page. A one-page donation that opens a record page seeds nothing; the
 budget reported by `SYS_CAP_INFO` is authoritative.
 
+A record page is kernel state kept in donated memory, like the wrapper
+page, the slot pages, and the page tables themselves: the kernel trusts its
+contents, and the donating Memory capability's holder is trusted not to map
+what it has retyped away. The records are never scanned while the owner is
+live: an address space's reclaiming unmap recognises pool-owned page tables
+by a bit in the parent entry, not by the records — see
+[memory-internals.md](memory-internals.md) § Page Table Node Ownership.
+
+### Teardown
+
 Teardown walks the record pages newest first, returning each page's other
 records before its record 0 (whose donation holds the page), then the
 inline records, the create-time slab last. A donation's Memory object that
 reaches zero there is reclaimed through its own nested cascade, not the
 bounded worklist the dealloc cascade otherwise uses, since the number of
-donations is unbounded. The walk costs one `retype_free` per donation and
-runs to completion inside the deleting syscall, with interrupts masked for
-its whole length on that CPU, so an owner's teardown latency scales with
-how finely it donated: the same memory donated as single pages costs one
-return per page, and the sixteen-donation cap that used to bound this
-window is gone. The standard runtime donates one page per page-table
-shortfall, so a process's count is its page-table page count, of the order
-of one per 2 MiB of mapped span. A record page is kernel state kept in
-donated memory, like the wrapper page, the slot pages, and the page tables
-themselves: the kernel trusts its contents, and the donating Memory
-capability's holder is trusted not to map what it has retyped away. The records are never scanned while the owner is
-live: an address space's reclaiming unmap recognises pool-owned page
-tables by a bit in the parent entry, not by the records — see
-[memory-internals.md](memory-internals.md) § Page Table Node Ownership.
+donations is unbounded.
+
+The walk costs one `retype_free` per donation and runs to completion in
+whichever context drops the last capability: inside the deleting syscall,
+with interrupts masked on that CPU, or — when the deleting thread was
+itself bound to the object — in the idle thread's deferred reclaim, with
+interrupts enabled but that CPU's idle drain occupied for the walk's
+length (scheduling-internals § Bare spin locks). So an owner's teardown
+latency scales with how finely it donated: the same memory donated as
+single pages costs one return per page, and the sixteen-donation cap that
+used to bound this window is gone. The standard runtime donates one page
+per page-table shortfall, so a process's count is its page-table page
+count, of the order of one per 2 MiB of mapped span.
 
 ---
 

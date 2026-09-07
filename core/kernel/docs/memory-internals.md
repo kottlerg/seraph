@@ -517,7 +517,9 @@ the mapping path:
 No per-node tracking structure exists. On address-space destruction the kernel
 does not walk the tables: the wrapper returns every donation wholesale to its
 source Memory cap, which reclaims the pool-drawn nodes with it, and the root
-table goes with the create-time slab. See
+table goes with the create-time slab. Kernel-direct nodes are not returned to
+the kernel page-table pool by destruction; only init's bootstrap space holds
+any, and it is never destroyed. See
 [capability-internals.md](capability-internals.md#page-pools-capobjectrs)
 for the donation-record mechanism.
 

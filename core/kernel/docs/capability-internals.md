@@ -138,6 +138,8 @@ allocation, and when `remove_from_free_list` unlinks a specific index);
 
 This gives amortised O(1) allocation and O(1) deallocation.
 
+---
+
 ## Page Pools (`cap/object.rs`)
 
 The wrapper object that owns a `CSpace` (`CSpaceKernelObject`) keeps the

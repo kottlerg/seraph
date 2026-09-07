@@ -547,7 +547,7 @@ bookkeeping inside the donated pages themselves, so a donation
 occasionally seeds one page fewer than it carried; the budget reported by
 `SYS_CAP_INFO` is authoritative. See
 [capability-internals.md](../core/kernel/docs/capability-internals.md)
-§ Page Pools and Donation Records.
+§ Page Pools.
 
 A `CSpace` has two independent growth bounds, distinguishable by error
 code at the failure site:

@@ -197,8 +197,8 @@ pub fn sys_mem_map(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
         // SAFETY: virt is in user range (validated above); phys is from a
         // Memory cap confirmed by the kernel at capability creation.
-        // as_ptr validated non-null. Pooled vs heap-backed dispatch is
-        // chosen once above based on the AS's typed-memory state.
+        // as_ptr validated non-null. Pooled vs kernel-direct dispatch is
+        // chosen once above from whether the AS records a donation.
         let result = if pooled
         {
             // SAFETY: aso_raw is valid; it wraps as_ptr.
@@ -207,7 +207,7 @@ pub fn sys_mem_map(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         else
         {
             // SAFETY: AS without a recorded donation; map_page acquires
-            // pt_lock and FRAME_ALLOC_LOCK internally.
+            // pt_lock and the kernel page-table pool lock internally.
             unsafe { (*as_ptr).map_page(virt, phys, page_flags) }
         };
         result.map_err(|()| SyscallError::OutOfMemory)?;

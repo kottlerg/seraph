@@ -580,14 +580,14 @@ impl ChunkRecord
     };
 }
 
-/// Pages `PagePool::seed_pages` pushes per pool-lock hold. Bounds the hold
-/// (scheduling-internals targets ~10 µs per spinlock hold) for a donation of
-/// any size; the interrupts-off window of the syscall that seeds a large
-/// donation is the sum of its batches and is not bounded here.
+/// Pages `PagePool::seed_pages` pushes per pool-lock hold, keeping each hold
+/// short for a donation of any size (scheduling-internals § Lock Hierarchy);
+/// the interrupts-off window of the syscall that seeds a large donation is
+/// the sum of its batches and is not bounded here.
 const SEED_BATCH_PAGES: u64 = 64;
 
 /// Bytes of `ChunkRecordPage` ahead of its records: `next_phys` and `used`.
-const RECORD_PAGE_HEADER: usize = 2 * core::mem::size_of::<u64>();
+const RECORD_PAGE_HEADER: usize = core::mem::size_of::<u64>() + core::mem::size_of::<usize>();
 
 /// Donation records per `ChunkRecordPage`.
 const CHUNK_RECORDS_PER_PAGE: usize =
@@ -664,8 +664,9 @@ impl PagePool
     /// Whether record 0, the create-time slab, is populated. Records are
     /// appended from index 0, and every wrapper the kernel constructs
     /// records its slab before the wrapper is published, so this is true
-    /// for every live object; the pooled map paths keep the kernel
-    /// page-table pool as the fallback for an object without it.
+    /// for every live object. The pooled map paths' fallback to the kernel
+    /// page-table pool and the dealloc arms' debug assertions check that
+    /// invariant rather than support an unrecorded object.
     #[must_use]
     pub fn retype_backed(&self) -> bool
     {
@@ -705,7 +706,10 @@ impl PagePool
     ///
     /// `Err(())` only when there is no record space and `pool_pages == 0`,
     /// so the donation cannot supply a record page; nothing is recorded,
-    /// seeded, or credited then. The record is written under the first lock
+    /// seeded, or credited then. No current caller can provoke it — an
+    /// augment always carries a pool page and a create finds record 0
+    /// vacant — so the callers' rollbacks are the contract for a future
+    /// caller, not a reachable path. The record is written under the first lock
     /// hold, before any page is published, so every seeded page belongs to
     /// a recorded, reclaimable chunk; the pages then go onto the free list
     /// in batches of `SEED_BATCH_PAGES` under separate holds, each batch
@@ -1110,6 +1114,10 @@ impl AddressSpaceObject
     }
 
     /// Return a previously-allocated PT page to the pool.
+    ///
+    /// The credit lands outside the pool lock: `alloc_pt_page` and this
+    /// function are both called under the address space's `pt_lock`, which
+    /// serialises the debit and the credit.
     ///
     /// # Safety
     /// `phys` must come from a prior [`alloc_pt_page`] call on this AS, and

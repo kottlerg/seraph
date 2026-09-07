@@ -292,8 +292,9 @@ pub fn sys_mmio_map(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         let phys = mmio_phys + (i * PAGE_SIZE) as u64;
 
         // SAFETY: virt in user range (validated above); phys from a
-        // kernel-provisioned Mmio boot object. Pooled vs heap-backed
-        // dispatch is chosen once above from the AS's typed-memory state.
+        // kernel-provisioned Mmio boot object. Pooled vs kernel-direct
+        // dispatch is chosen once above from whether the AS records a
+        // donation.
         let result = if pooled
         {
             // SAFETY: aso_raw is valid; it wraps as_ptr.
@@ -302,7 +303,7 @@ pub fn sys_mmio_map(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         else
         {
             // SAFETY: AS without a recorded donation; map_page acquires
-            // pt_lock and FRAME_ALLOC_LOCK internally.
+            // pt_lock and the kernel page-table pool lock internally.
             unsafe { (*as_ptr).map_page(virt, phys, page_flags) }
         };
         result.map_err(|()| SyscallError::OutOfMemory)?;

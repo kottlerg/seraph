@@ -518,11 +518,12 @@ No per-node tracking structure exists. On address-space destruction the kernel
 does not walk the tables: the wrapper returns every donation wholesale to its
 source Memory cap, which reclaims the pool-drawn nodes with it, and the root
 table goes with the create-time slab. See
-[capability-internals.md](capability-internals.md#page-pools-and-donation-records)
+[capability-internals.md](capability-internals.md#page-pools-capobjectrs)
 for the donation-record mechanism.
 
 ---
 
 ## Summarized By
 
-[kernel/README.md](../README.md)
+[kernel/README.md](../README.md),
+[kernel/docs/capability-internals.md](capability-internals.md)

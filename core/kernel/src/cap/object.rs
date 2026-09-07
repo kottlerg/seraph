@@ -923,19 +923,23 @@ impl PagePool
             // record 0 is freed below, after every read of it.
             let (next, used) = unsafe { ((*page).next_phys, (*page).used) };
             debug_assert!((1..=CHUNK_RECORDS_PER_PAGE).contains(&used));
-            // The page is trusted kernel state, and a corrupt record is not
-            // survivable; the count is clamped anyway so that a corrupt
-            // count cannot read past the page in a release build.
+            // The page is trusted kernel state; the count clamp and the null
+            // check below are the two cheap guards that keep a corrupt page
+            // from reading past itself or dereferencing null in a release
+            // build. A corrupt record is otherwise not survivable.
             let used = used.min(CHUNK_RECORDS_PER_PAGE);
-            for i in 1..used
+            for i in (0..used).rev()
             {
-                // SAFETY: as above; `i < used`.
+                // SAFETY: as above; `i < used`, and record 0 — whose chunk
+                // holds the page — is read last, after which the page is
+                // not read again.
                 let record = unsafe { (*page).records[i] };
+                if record.ancestor.is_null()
+                {
+                    continue;
+                }
                 free(record.ancestor, record.base_offset, record.page_count);
             }
-            // SAFETY: as above; the page is not read again after this.
-            let record = unsafe { (*page).records[0] };
-            free(record.ancestor, record.base_offset, record.page_count);
             page_phys = next;
         }
 

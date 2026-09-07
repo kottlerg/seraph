@@ -314,7 +314,7 @@ documented configuration alternative when the CI runner floor supports it.
 
 ### Kernel Testing Strategy
 
-**Host unit tests** — Pure algorithmic modules (buddy allocator, slab allocator, capability
+**Host unit tests** — Pure algorithmic modules (buddy allocator, capability
 tree, scheduler run queues) keep hardware dependencies behind trait boundaries. The kernel's
 `lib` target uses `#![cfg_attr(not(test), no_std)]`, allowing `cargo test -p seraph-kernel`
 to run these modules on the host under the standard test harness.

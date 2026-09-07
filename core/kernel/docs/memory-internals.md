@@ -1,7 +1,7 @@
 # Memory Subsystem Internals
 
 This document covers the implementation of the kernel's memory subsystem. The design
-goals (higher-half layout, buddy + slab allocation, W^X enforcement, TLB management) are
+goals (higher-half layout, buddy allocation, retype-backed kernel objects, W^X enforcement, TLB management) are
 specified in [docs/memory-model.md](../../../docs/memory-model.md). This document
 describes how those goals are realised in code.
 
@@ -86,182 +86,23 @@ changing the core algorithm.
 
 ---
 
-## Slab Allocator (`mm/slab.rs`)
+## Kernel Object Memory (`cap/retype.rs`)
 
-### Purpose
+The kernel runs no heap and no `GlobalAlloc`. Every kernel object — the slot
+pages of a CSpace, thread control blocks, endpoints, notifications, event
+queues, wait sets, address spaces, CSpaces, and Memory objects themselves — is
+carved out of a Memory capability by retype: the body is constructed in place
+at the offset the retype allocator returns, its header records the source, and
+the bytes go back to that source when the object's last capability is deleted
+(see [capability-internals.md](capability-internals.md) § Kernel Object
+Reference Counting). The kernel's own objects are retyped from the SEED
+reserve, carved from the buddy allocator before the Phase 7 handoff; userspace
+objects come from the capability a `cap_create_*` syscall names. Address spaces
+and CSpaces additionally own a page pool for their page tables and slot pages
+([capability-internals.md](capability-internals.md) § Page Pools).
 
-The slab allocator provides O(1) allocation and deallocation for fixed-size kernel
-objects. Each object type has a dedicated slab cache; objects of the same type are
-co-located for cache efficiency.
-
-### Cache Structure
-
-```rust
-pub struct SlabCache
-{
-    /// Size of each object in bytes.
-    object_size: usize,
-
-    /// Objects per slab (computed from object_size and slab page count).
-    objects_per_slab: usize,
-
-    /// Number of pages per slab (1–4, chosen so objects_per_slab >= SLAB_MIN_OBJECTS).
-    pages_per_slab: usize,
-
-    /// Slabs with at least one free slot.
-    partial_slabs: SlabList,
-
-    /// Slabs with no free slots (tracked for deallocation detection).
-    full_slabs: SlabList,
-
-    /// Slabs with all slots free (returned to buddy allocator when empty).
-    empty_slabs: SlabList,
-
-    /// Total allocation count (for diagnostics).
-    alloc_count: u64,
-}
-```
-
-### Slab Layout
-
-A slab is a contiguous group of `pages_per_slab` physical pages. Its layout is:
-
-```
-[ SlabHeader | padding to object alignment ][ object 0 ][ object 1 ] ... [ object N ]
-```
-
-`SlabHeader` is stored at the start of the slab:
-
-```rust
-struct SlabHeader
-{
-    /// Intrusive list links (for partial/full/empty lists).
-    list_next: Option<PhysAddr>,
-    list_prev: Option<PhysAddr>,
-
-    /// Head of the free slot list embedded in free objects.
-    free_head: Option<*mut FreeSlot>,
-
-    /// Number of currently allocated (in-use) objects in this slab.
-    in_use: u32,
-
-    /// Back-pointer to the cache this slab belongs to.
-    cache: *mut SlabCache,
-}
-```
-
-Free slots embed their next-pointer at offset 0 within the otherwise-unused object
-memory:
-
-```rust
-struct FreeSlot
-{
-    next: Option<*mut FreeSlot>,
-}
-```
-
-This avoids any external free-list allocation — the free list is intrusive into the
-free object memory itself.
-
-### Allocation
-
-```
-cache.alloc():
-    slab = partial_slabs.head
-    if slab is None:
-        slab = cache.grow()  // allocate a new slab from buddy allocator
-        if slab is None: return None (OOM)
-    slot = slab.free_head
-    slab.free_head = slot.next
-    slab.in_use += 1
-    if slab.free_head is None:
-        move slab from partial_slabs to full_slabs
-    return slot as *mut T (zeroed by grow() at slab creation)
-```
-
-### Deallocation
-
-```
-cache.free(ptr):
-    slab = find_slab_for(ptr)  // round ptr down to slab base
-    slot = ptr as *mut FreeSlot
-    slot.next = slab.free_head
-    slab.free_head = slot
-    slab.in_use -= 1
-    if slab.in_use == 0:
-        move slab from partial_slabs (or full_slabs) to empty_slabs
-        // optionally return to buddy allocator if empty_slabs grows large
-    else if was in full_slabs:
-        move slab from full_slabs to partial_slabs
-```
-
-Finding the slab from a pointer: since each slab is page-aligned and `pages_per_slab`
-is known, masking the pointer to the slab's page-aligned base reaches `SlabHeader`.
-
-### Registered Caches
-
-The following slab caches are registered during Phase 4 of initialization:
-
-| Cache | Object Type |
-|---|---|
-| `cap_slot_cache` | `CapabilitySlot` |
-| `tcb_cache` | `ThreadControlBlock` |
-| `endpoint_cache` | `Endpoint` |
-| `notification_cache` | `Notification` |
-| `event_queue_cache` | `EventQueueHeader` |
-| `wait_set_cache` | `WaitSet` |
-
-Object sizes are determined by the final struct layouts and are not part of the ABI.
-
----
-
-## Size-Class Allocator (`mm/size_class.rs`)
-
-### Purpose
-
-For variable-size kernel allocations (dynamic arrays, temporary buffers, strings in
-kernel paths), the size-class allocator provides O(1) allocation with bounded
-fragmentation.
-
-### Bin Sizes
-
-Bins are at successive powers of two, starting from a small minimum and covering
-up to a maximum bin size. The exact bin boundaries are implementation constants.
-Allocations are rounded up to the next bin size. Each bin is backed by a dedicated
-slab cache.
-
-Allocations larger than the maximum bin size are served directly from the buddy
-allocator (rounded up to a power-of-two page count).
-
-### Implementation
-
-```rust
-pub struct SizeClassAllocator
-{
-    bins: [SlabCache; NUM_BINS],  // one per power-of-two size
-}
-
-impl SizeClassAllocator
-{
-    pub fn alloc(&mut self, size: usize, align: usize) -> Option<NonNull<u8>>
-    {
-        if size > MAX_BIN_SIZE
-        {
-            // Direct buddy allocation, rounded to page order
-            let order = size.next_power_of_two().trailing_zeros() as usize
-                - PAGE_SHIFT;
-            BUDDY.lock().alloc(order).map(phys_to_virt)
-        } else
-        {
-            let bin_idx = bin_for(size, align);
-            self.bins[bin_idx].alloc()
-        }
-    }
-}
-```
-
-This allocator is exposed as the kernel's `GlobalAlloc` implementation, enabling
-`alloc::boxed::Box` and `alloc::vec::Vec` in kernel code.
+Retype and pool allocation are fallible and MUST be handled as fallible at every
+call site; there is no allocation that cannot fail.
 
 ---
 

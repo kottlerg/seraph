@@ -359,8 +359,9 @@ pub struct KernelObjectHeader
 ```
 
 When a slot is cleared (deletion, revocation), the reference count is decremented.
-When it reaches zero, the object is freed to its slab cache. This is the only
-mechanism by which kernel objects are freed — there is no explicit "destroy" syscall.
+When it reaches zero, the object's bytes are returned to the Memory object it was
+retyped from (`retype_free`). This is the only mechanism by which kernel objects
+are freed — there is no explicit "destroy" syscall.
 
 The same refcount also tracks kernel-internal owners of an object. Wait-set
 membership is one such owner: `sys_wait_set_add` `inc_ref`s the source's

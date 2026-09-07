@@ -90,8 +90,8 @@ This is not fatal — a headless system is valid.
 The buddy allocator MUST be initialized from a static buffer or boot stack, not
 from itself.
 
-**Memory at this point:** Only the buddy allocator metadata is allocated. No kernel
-heap exists yet.
+**Memory at this point:** Only the buddy allocator metadata is allocated. The kernel
+has no heap (see Phase 4).
 
 **Failure mode:** If total usable RAM is zero after exclusions, halt with message
 "fatal: no usable physical memory". This indicates a corrupt memory map.
@@ -155,7 +155,7 @@ Emit "fatal: cannot build kernel page tables (OOM)" and halt.
    kernel-object body is carved out of a Memory capability by retype
    (`cap/retype.rs`) — the SEED reserve for the kernel's own objects from
    Phase 7 on, a caller-supplied capability at each `cap_create_*` syscall.
-   The phase carries no setup cost; the machinery is live once `SEED_FRAME`
+   The phase carries no setup cost; the machinery is live once `SEED_MEMORY`
    is installed in Phase 7.
 2. Emit: "Phase 4: Typed-Memory Cap Surface (no kernel heap)"
 3. Cache the bootloader-discovered kernel MMIO bases from `BootInfo` for
@@ -170,7 +170,6 @@ Emit "fatal: cannot build kernel page tables (OOM)" and halt.
 
 **Completion criterion:** per-CPU storage is allocated; there is no kernel
 allocator to activate.
-allocations succeed.
 
 ---
 

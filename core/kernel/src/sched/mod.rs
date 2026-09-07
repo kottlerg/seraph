@@ -2056,7 +2056,7 @@ fn idle_thread_entry(_cpu_id: u64) -> !
 ///
 /// # Safety
 /// Must be called exactly once, from the single boot thread, after Phase 3
-/// (page tables active) and Phase 4 (heap + idle stacks active).
+/// (page tables active) and Phase 4 (per-CPU storage and idle stacks allocated).
 #[cfg(not(test))]
 pub fn init(cpu_count: u32) -> u32
 {
@@ -5468,7 +5468,7 @@ pub(crate) unsafe extern "C" fn user_thread_trampoline() -> !
 /// # Safety
 /// Must be called exactly once, from the single boot thread, after:
 /// - Phase 3 (page tables active)
-/// - Phase 4 (heap active)
+/// - Phase 4 (per-CPU storage allocated)
 /// - Phase 8 scheduler init
 /// - Phase 9 init TCB enqueued on BSP run queue
 #[cfg(not(test))]

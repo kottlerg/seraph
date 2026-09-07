@@ -12,8 +12,10 @@ The kernel occupies the upper portion of the virtual address space; userspace pr
 occupy the lower portion. Each process has its own isolated address space. The kernel
 address space is mapped into every address space but is inaccessible from userspace.
 
-Physical memory is managed by a buddy allocator. The kernel heap uses a slab allocator
-with a general size-class path for variable-size allocations.
+Physical memory is managed by a buddy allocator until the Phase 7 handoff, after which
+every page of RAM is either a fixed kernel reserve or a userspace Memory capability;
+kernel objects are carved out of Memory capabilities by retype (see Kernel Object
+Memory).
 
 ---
 

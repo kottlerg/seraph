@@ -5,7 +5,8 @@
 
 //! Thread Control Block (TCB) definition.
 //!
-//! Each kernel thread has exactly one TCB. TCBs are heap-allocated via `Box`.
+//! Each kernel thread has exactly one TCB, constructed in place in the Thread
+//! slab retyped from a Memory capability (idle TCBs in the Phase 4 per-CPU slab).
 //!
 //! Key fields:
 //! - `address_space`: typed pointer to the user address space (null for kernel threads).

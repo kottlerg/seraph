@@ -379,7 +379,7 @@ unsafe fn kernel_entry_post_rebase(
     // sourced from a Memory cap via `crate::cap::retype` (caller-supplied at
     // userspace `cap_create_*` boundaries; SEED-backed at boot time and for
     // split-derived wrappers). Phase 4 carries no setup cost — the typed-
-    // memory machinery is ready as soon as `SEED_FRAME` is installed in
+    // memory machinery is ready as soon as `SEED_MEMORY` is installed in
     // Phase 7.
     //
     // Note on bootloader page table frame reclamation:
@@ -413,8 +413,9 @@ unsafe fn kernel_entry_post_rebase(
 
     // ── Phase 5: architecture hardware initialization ─────────────────────────
     kprintln!("Phase 5: Architecture Hardware Initialisation");
-    // SAFETY: single-threaded boot phase; heap and direct map active; called
-    // once during initialization; dependencies (Phases 2-4) completed.
+    // SAFETY: single-threaded boot phase; direct map and per-CPU storage
+    // active; called once during initialization; dependencies (Phases 2-4)
+    // completed.
     unsafe {
         arch::current::interrupts::init();
     }
@@ -653,8 +654,8 @@ unsafe fn kernel_entry_post_rebase(
     }
 
     // ── Phase 9: create and launch init ───────────────────────────────────────
-    // Gated #[cfg(not(test))]: Phase 9 uses heap allocation and arch-specific
-    // functions unavailable in the host test environment. Tests exercise Phases
+    // Gated #[cfg(not(test))]: Phase 9 uses the typed-memory retype paths and
+    // arch-specific functions unavailable in the host test environment. Tests exercise Phases
     // 0-8 via their individual stub functions; kernel_entry is never invoked.
     #[cfg(not(test))]
     {
@@ -682,7 +683,7 @@ unsafe fn kernel_entry_post_rebase(
         let init_layout = mm::address_space::choose_init_layout();
 
         // Create init's user address space via the typed-memory boot path:
-        // a slab is retyped from `SEED_FRAME` (page 0 = wrapper page holding
+        // a slab is retyped from `SEED_MEMORY` (page 0 = wrapper page holding
         // `AddressSpaceObject` + inlined `AddressSpace`; page 1 = root PT;
         // pages 2..init_pages = PT growth pool). The wrapper header is the
         // cap object inserted into init's CSpace below.
@@ -1190,7 +1191,7 @@ unsafe fn kernel_entry_post_rebase(
             "post-handoff buddy is not empty — a Phase-7 reservation or drain leak",
         );
 
-        // Retype a 6-page slab from SEED_FRAME for init's Thread:
+        // Retype a 6-page slab from SEED_MEMORY for init's Thread:
         //   pages 0..3 — kernel stack (KERNEL_STACK_PAGES = 4 = 16 KiB)
         //   page 4   — ThreadObject (24 B) followed by ThreadControlBlock
         //   page 5   — per-thread FPU/SIMD/V save area
@@ -1464,8 +1465,8 @@ unsafe fn kernel_entry_post_rebase(
 /// the idle loop via [`sched::ap_enter`].
 ///
 /// # Safety
-/// Runs on a fresh kernel stack. All Phase 3–8 globals (direct map, heap,
-/// scheduler, IDT) must have been set up by the BSP before this is called.
+/// Runs on a fresh kernel stack. All Phase 3–8 globals (direct map, per-CPU
+/// storage, scheduler, IDT) must have been set up by the BSP before this is called.
 #[cfg(not(test))]
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_entry_ap(cpu_id: u32, ist1_top: u64, ist2_top: u64) -> !
@@ -1476,8 +1477,9 @@ pub extern "C" fn kernel_entry_ap(cpu_id: u32, ist1_top: u64, ist2_top: u64) -> 
     //    shadow-register base to 0. percpu::init_ap reinstalls it afterward.
     // SAFETY: idle threads allocated in Phase 8 (BSP); cpu_id in valid range.
     let idle_stack_top = unsafe { sched::idle_stack_top_for(cpu_id as usize) };
-    // SAFETY: heap active (Phase 4, BSP); init_ap box-allocates per-CPU GDT+TSS;
-    // called once per AP during startup; idle_stack_top from allocated idle thread.
+    // SAFETY: per-CPU storage allocated in Phase 4 (BSP), from which init_ap
+    // takes this AP's GDT+TSS; called once per AP during startup;
+    // idle_stack_top from allocated idle thread.
     unsafe {
         arch::current::gdt::init_ap(cpu_id, idle_stack_top, ist1_top, ist2_top);
     }

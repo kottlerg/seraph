@@ -6,13 +6,13 @@ enforcement, TLB management) are specified in
 [docs/memory-model.md](../../../docs/memory-model.md). This document
 describes how those goals are realised in code.
 
-The memory subsystem comprises five components:
+The memory subsystem comprises four components:
 
-1. **Buddy allocator** — physical frame allocation
-2. **Slab allocator** — fixed-size kernel object allocation
-3. **Size-class allocator** — general variable-size kernel heap
-4. **Address space management** — per-process virtual address space objects
-5. **TLB management** — local invalidation, tagged (PCID/ASID) no-flush context switch with a full-flush fallback, and SMP shootdown
+1. **Buddy allocator** — boot-time physical frame allocation
+2. **Kernel object memory** — objects carved out of Memory capabilities by retype,
+   and the page pools behind address spaces and CSpaces
+3. **Address space management** — per-process virtual address space objects
+4. **TLB management** — local invalidation, tagged (PCID/ASID) no-flush context switch with a full-flush fallback, and SMP shootdown
 
 ---
 
@@ -322,17 +322,17 @@ kernel image addresses.
 ## Kernel Stack Allocation
 
 Each kernel thread (the kernel-side execution context for syscall and interrupt
-handling) has a dedicated kernel stack. Kernel stacks are allocated directly from the
-buddy allocator:
+handling) has a dedicated kernel stack of `KERNEL_STACK_PAGES` pages. Two sources
+exist:
 
-- Size: `KERNEL_STACK_PAGES` pages (e.g. 8 pages = 32 KiB)
-- Alignment: `KERNEL_STACK_PAGES`-page aligned (enables O(1) stack-base recovery
-  from an arbitrary stack pointer by masking)
-- Guard page: one unmapped page immediately below the stack (allocated but not mapped,
-  so stack overflow faults immediately rather than silently corrupting adjacent memory)
-
-Stack allocation happens in Phase 8 (scheduler initialization) for idle threads and
-in `SYS_CAP_CREATE_THREAD` for user-created threads.
+- The idle threads' stacks come from the buddy allocator in Phase 4, one
+  power-of-two block per CPU, while the buddy still holds large contiguous blocks
+  (before the Phase 7 drain); they live for the kernel's lifetime.
+- Every other thread's stack is the first `KERNEL_STACK_PAGES` pages of the
+  Thread slab that `SYS_CAP_CREATE_THREAD` carves from the caller's Memory
+  capability — stack, then the page holding the `ThreadObject` and TCB, then the
+  per-thread FPU/SIMD save area — and returns to that capability when the
+  thread's last capability is deleted.
 
 ---
 

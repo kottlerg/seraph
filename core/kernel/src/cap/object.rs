@@ -885,10 +885,10 @@ impl PagePool
 
     /// Hand every recorded donation to `free` as `(ancestor, base_offset,
     /// page_count)`, in an order that keeps each record readable until it is
-    /// used: spilled records newest page first and, within a page, records
-    /// `1..` before record 0 (whose chunk holds the page); then the inline
-    /// records, snapshotted up front, with record 0 (the create-time slab
-    /// that holds the owner and this pool) last. The walk is linear in the
+    /// used: spilled records newest page first and, within a page, last to
+    /// first so record 0 (whose chunk holds the page) goes last; then the
+    /// inline records, snapshotted up front, with record 0 (the create-time
+    /// slab that holds the owner and this pool) last. The walk is linear in the
     /// donation count and runs to completion in whichever context drops the
     /// last reference: the deleting syscall, with interrupts masked, or —
     /// for an owner handed to the deferred-reclaim stack — the next syscall
@@ -923,10 +923,8 @@ impl PagePool
             // record 0 is freed below, after every read of it.
             let (next, used) = unsafe { ((*page).next_phys, (*page).used) };
             debug_assert!((1..=CHUNK_RECORDS_PER_PAGE).contains(&used));
-            // The page is trusted kernel state; the count clamp and the null
-            // check below are the two cheap guards that keep a corrupt page
-            // from reading past itself or dereferencing null in a release
-            // build. A corrupt record is otherwise not survivable.
+            // The page is trusted kernel state and a corrupt record is not
+            // survivable; the clamp only keeps the read inside the page.
             let used = used.min(CHUNK_RECORDS_PER_PAGE);
             for i in (0..used).rev()
             {
@@ -934,10 +932,6 @@ impl PagePool
                 // holds the page — is read last, after which the page is
                 // not read again.
                 let record = unsafe { (*page).records[i] };
-                if record.ancestor.is_null()
-                {
-                    continue;
-                }
                 free(record.ancestor, record.base_offset, record.page_count);
             }
             page_phys = next;

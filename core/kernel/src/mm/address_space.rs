@@ -406,7 +406,7 @@ impl AddressSpace
     /// # Safety
     /// `root_phys` must be a freshly-allocated, page-aligned 4 KiB physical
     /// frame mapped in the kernel direct map and not aliased anywhere.
-    /// Phase 3 (page tables) and Phase 4 (heap) must already be active.
+    /// Phase 3 (page tables) must already be active.
     #[cfg(not(test))]
     pub unsafe fn new_user_with_root(root_phys: u64) -> Self
     {

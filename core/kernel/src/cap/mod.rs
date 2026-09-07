@@ -1365,7 +1365,7 @@ fn push_descriptor(count: &mut usize, desc: CapDescriptor)
 ///
 /// # Safety
 ///
-/// Must be called exactly once, single-threaded, after Phase 4 (heap active)
+/// Must be called exactly once, single-threaded, after Phase 4 (per-CPU storage allocated)
 /// and Phase 3 (direct map active).
 pub fn init_capability_system(mmio_apertures: &[MmioAperture], boot_info_phys: u64)
 -> CSpaceLayout

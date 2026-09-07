@@ -354,7 +354,10 @@ count representing the number of capability slots that point to it:
 pub struct KernelObjectHeader
 {
     ref_count: AtomicU32,
-    kind: ObjectKind,
+    obj_type: ObjectType,
+    flags: u8,
+    /// The Memory object this object's bytes were retyped from.
+    ancestor: AtomicPtr<KernelObjectHeader>,
 }
 ```
 

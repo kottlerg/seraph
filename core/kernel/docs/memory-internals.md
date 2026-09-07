@@ -496,17 +496,27 @@ in `SYS_CAP_CREATE_THREAD` for user-created threads.
 
 Intermediate page table nodes (PML3/PML2/PML1 on x86-64; every level below
 the root on RISC-V — two to four of them depending on the negotiated paging
-mode)
-are allocated from the buddy allocator at order 0 (one 4 KiB page each). The kernel
-must track these to free them when an address space is destroyed.
+mode) are one 4 KiB page each and are owned exclusively by the address space
+that contains them; no reference counting is needed. Their source depends on
+the mapping path:
 
-Each intermediate node page is tracked via a `PageTableNode` entry in a slab cache.
-The entry records the physical address of the page and the level it occupies in the
-table hierarchy. On address space destruction, the kernel walks the derivation of the
-root table, freeing all tracked intermediate nodes before freeing the root.
+- `SYS_MEM_MAP` and `SYS_MMIO_MAP` into a retype-backed address space (every
+  user address space, including init's bootstrap space) draw them from the
+  page pool of the space's wrapper object, seeded at creation and refilled by
+  augment-mode donations from Memory caps; the map returns `OutOfMemory` when
+  the pool is empty. A reclaiming unmap (`MEM_UNMAP_RECLAIM_PTS`) returns a
+  now-empty node to that pool after checking it against the pool's donation
+  records.
+- Kernel-direct mappings through `map_page` (the Phase 9 init image, InitInfo
+  page, and stack) and any address space without a recorded donation draw
+  them from the fixed kernel page-table pool (`mm::kernel_pt_pool`).
 
-No reference counting is needed for intermediate nodes — they are owned exclusively
-by the address space that contains them.
+No per-node tracking structure exists. On address-space destruction the kernel
+does not walk the tables: the wrapper returns every donation wholesale to its
+source Memory cap, which reclaims the pool-drawn nodes with it, and the root
+table goes with the create-time slab. See
+[capability-internals.md](capability-internals.md#page-pools-and-donation-records)
+for the donation-record mechanism.
 
 ---
 

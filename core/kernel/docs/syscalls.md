@@ -592,6 +592,13 @@ kernel's higher-half mapping is shared into a newly created address space automa
 **Return:** `rax`/`a0`: create-mode — new address space capability (Map + Read + Control
 rights); augment-mode — `0`. `SyscallError` on failure.
 
+Augment-mode donations are unbounded in count. Once the target's inline donation
+records are full, the kernel keeps its bookkeeping in the donations themselves: once per
+record page (see [capability-internals.md](capability-internals.md#page-pools-and-donation-records))
+a donation's first page becomes that bookkeeping and only `init_pages − 1` pages reach
+the pool, so a one-page donation can leave the budget unchanged. Read the budget back via
+`SYS_CAP_INFO` rather than assuming `init_pages` were added.
+
 `Control` lets the creator register terminal-fault death observers via
 `SYS_ASPACE_BIND_NOTIFICATION`; copies handed to other components drop it via the
 `SYS_CAP_DERIVE` rights mask.
@@ -1663,6 +1670,10 @@ pages to an existing CSpace's slot-page pool (augment-mode).
 
 **Return:** `rax`/`a0`: create-mode — new CSpace capability (Insert + Delete + Derive
 rights); augment-mode — `0`. `SyscallError` on failure.
+
+Augment-mode donations are unbounded in count, with the same bookkeeping as
+`SYS_CAP_CREATE_ADDRESS_SPACE`: once per record page a donation's first page is kept by
+the kernel and only `init_pages − 1` pages reach the pool.
 
 **Capability requirements:** `memory_cap` (Retype); in augment-mode, `augment_cap` (Insert).
 

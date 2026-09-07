@@ -280,16 +280,10 @@ pub fn sys_mmio_map(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     };
 
     // Choose the PT-page source, mirroring sys_mem_map. A retype-backed AS
-    // (any chunk slot occupied) pulls intermediate PT pages from its own
-    // caller-funded growth pool; the chunk-less kernel-created boot AS (init's
-    // own AS, part of the fixed reserve) falls back to the kernel PT pool.
+    // pulls intermediate PT pages from its own caller-funded growth pool;
+    // an AS without a recorded donation falls back to the kernel PT pool.
     // SAFETY: aso_raw is non-null and valid for the lifetime of the cap.
-    let pooled = !unsafe {
-        (*aso_raw).pt_chunks[0]
-            .ancestor
-            .load(core::sync::atomic::Ordering::Acquire)
-            .is_null()
-    };
+    let pooled = unsafe { (*aso_raw).pt_pool.retype_backed() };
 
     // Map each page.
     for i in 0..page_count

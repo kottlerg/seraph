@@ -542,6 +542,10 @@ Memory cap — from which `mem_map` and `cap_insert` allocate. Exhausting
 the budget returns `OutOfMemory` (-8); the budget refills via *augment
 mode* on the same create syscall (passing the existing AS/CS slot as the
 augment target merges a new slab of pages into its growth budget).
+Donations are unbounded in number: the kernel keeps its donation
+bookkeeping inside the donated pages themselves, so a donation
+occasionally seeds one page fewer than it carried; the budget reported by
+`SYS_CAP_INFO` is authoritative.
 
 A `CSpace` has two independent growth bounds, distinguishable by error
 code at the failure site:

@@ -510,43 +510,408 @@ unsafe impl Send for ThreadObject {}
 // SAFETY: ThreadObject is accessed only under the scheduler lock.
 unsafe impl Sync for ThreadObject {}
 
-/// Maximum number of distinct retype-source chunks an `AddressSpaceObject`
-/// or `CSpaceKernelObject` may track.
+/// Number of donation records held inline in a wrapper's [`PagePool`].
 ///
-/// Each augment-mode call (`cap_create_aspace(memory, target)` /
-/// `cap_create_cspace(memory, target)`) consumes one slot. The original
-/// create-time chunk also occupies one slot. Sixteen is enough to absorb
-/// many augment events without bloating the wrapper struct.
-pub const MAX_PT_CHUNKS: usize = 16;
+/// The create-time slab occupies record 0; the next fifteen augment-mode
+/// donations fill the rest. Further donations spill into record pages
+/// carved from the donations themselves (see [`PagePool::add_chunk`]).
+pub const INLINE_CHUNK_SLOTS: usize = 16;
 
-/// Per-chunk record of a retype-allocated multi-page region donated to an
+/// Inline record of a retype-allocated multi-page region donated to an
 /// `AddressSpaceObject`'s PT pool or a `CSpaceKernelObject`'s slot-page
 /// pool.
 ///
-/// At dealloc, every non-vacant slot is fed back to its `ancestor`
+/// At dealloc, every non-vacant record is fed back to its `ancestor`
 /// `MemoryObject` via `retype_free`, then the ancestor is `dec_ref`'d.
 #[repr(C)]
-pub struct PoolChunkSlot
+struct PoolChunkSlot
 {
     /// `MemoryObject` ancestor this chunk was carved from. Null = vacant.
-    pub ancestor: AtomicPtr<KernelObjectHeader>,
+    ancestor: AtomicPtr<KernelObjectHeader>,
     /// Byte offset within the ancestor's region.
-    pub base_offset: AtomicU64,
+    base_offset: AtomicU64,
     /// Total pages carved (initial + grown).
-    pub page_count: AtomicU64,
+    page_count: AtomicU64,
 }
 
 impl PoolChunkSlot
 {
     /// Construct a vacant slot (ancestor = null, offset = 0, count = 0).
-    #[must_use]
-    pub const fn vacant() -> Self
+    const fn vacant() -> Self
     {
         Self {
             ancestor: AtomicPtr::new(core::ptr::null_mut()),
             base_offset: AtomicU64::new(0),
             page_count: AtomicU64::new(0),
         }
+    }
+}
+
+/// One donation record in a `ChunkRecordPage`: the content of a
+/// `PoolChunkSlot` as plain words. Record pages are read and written
+/// only under the pool lock, or at teardown with no other reference alive.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ChunkRecord
+{
+    ancestor: *mut KernelObjectHeader,
+    base_offset: u64,
+    page_count: u64,
+}
+
+impl ChunkRecord
+{
+    const VACANT: Self = Self {
+        ancestor: core::ptr::null_mut(),
+        base_offset: 0,
+        page_count: 0,
+    };
+}
+
+/// Donation records per `ChunkRecordPage`.
+pub const CHUNK_RECORDS_PER_PAGE: usize =
+    (crate::mm::PAGE_SIZE - 16) / core::mem::size_of::<ChunkRecord>();
+
+/// A page of spilled donation records, carved from a donation once the
+/// inline records are full. Record 0 always describes the chunk this page
+/// itself lives in, so freeing record 0 last releases the page.
+#[repr(C)]
+struct ChunkRecordPage
+{
+    /// Physical address of the next-older record page; `0` for the oldest.
+    next_phys: u64,
+    /// Records in use, `1..=CHUNK_RECORDS_PER_PAGE`.
+    used: usize,
+    records: [ChunkRecord; CHUNK_RECORDS_PER_PAGE],
+}
+
+const _: () = assert!(
+    core::mem::size_of::<ChunkRecordPage>() <= crate::mm::PAGE_SIZE,
+    "ChunkRecordPage exceeds one page"
+);
+
+/// A wrapper object's page pool: an intrusive free list of donated pages
+/// plus a record of every donation, for wholesale reclaim at teardown.
+///
+/// Shared by [`AddressSpaceObject`] (intermediate page tables) and
+/// [`CSpaceKernelObject`] (slot and directory pages). The owner keeps the
+/// byte budget the pool backs; the pool holds only pages and records.
+///
+/// Records live inline up to [`INLINE_CHUNK_SLOTS`], then in
+/// `ChunkRecordPage`s chained newest-first from `record_head_phys`. A
+/// record page is the first pool page of the donation that overflowed
+/// into it, so the number of donations is bounded only by the memory
+/// donated: one page of bookkeeping per [`CHUNK_RECORDS_PER_PAGE`]
+/// donations beyond the inline records.
+#[repr(C)]
+pub struct PagePool
+{
+    /// Spinlock guarding every other field and the record pages.
+    /// `0` = unlocked, `1` = locked.
+    lock: AtomicU64,
+    /// Head of the intrusive free list of available pages, by physical
+    /// address. `0` = empty. Each free page's first 8 bytes hold the
+    /// physical address of the next free page (read/written via the
+    /// kernel direct map).
+    head_phys: AtomicU64,
+    /// Newest record page, by physical address. `0` = none.
+    record_head_phys: AtomicU64,
+    /// Inline donation records; the create-time slab is record 0.
+    inline: [PoolChunkSlot; INLINE_CHUNK_SLOTS],
+}
+
+impl PagePool
+{
+    /// An empty pool: no pages, no records.
+    #[must_use]
+    pub const fn new() -> Self
+    {
+        Self {
+            lock: AtomicU64::new(0),
+            head_phys: AtomicU64::new(0),
+            record_head_phys: AtomicU64::new(0),
+            inline: [const { PoolChunkSlot::vacant() }; INLINE_CHUNK_SLOTS],
+        }
+    }
+
+    /// Whether any donation has been recorded: true for every retype-backed
+    /// wrapper (the create-time slab is record 0), false for the heap-backed
+    /// boot address space, whose page tables come from `kernel_pt_pool`.
+    #[must_use]
+    pub fn retype_backed(&self) -> bool
+    {
+        !self.inline[0].ancestor.load(Ordering::Acquire).is_null()
+    }
+
+    /// Pop one free page; `0` if the pool is empty.
+    #[cfg(not(test))]
+    #[track_caller]
+    fn pop(&self) -> u64
+    {
+        pool_lock(&self.lock);
+        // SAFETY: lock held; `head_phys` is this pool's free-list head.
+        let phys = unsafe { pool_pop(&self.head_phys) };
+        pool_unlock(&self.lock);
+        phys
+    }
+
+    /// Return a page to the free list.
+    ///
+    /// # Safety
+    /// `phys` must be a page of this pool that is no longer in use.
+    #[cfg(not(test))]
+    #[track_caller]
+    unsafe fn push(&self, phys: u64)
+    {
+        pool_lock(&self.lock);
+        // SAFETY: lock held; the caller's contract makes `phys` exclusively
+        // owned and unaliased.
+        unsafe { pool_push(&self.head_phys, phys) };
+        pool_unlock(&self.lock);
+    }
+
+    /// Whether `phys` lies inside one of the recorded donations.
+    #[cfg(not(test))]
+    #[track_caller]
+    pub fn owns_phys(&self, phys: u64) -> bool
+    {
+        let p = crate::mm::PAGE_SIZE as u64;
+        let covers = |record: ChunkRecord| {
+            // cast_ptr_alignment: header at offset 0; MemoryObject is repr(C).
+            #[allow(clippy::cast_ptr_alignment)]
+            // SAFETY: a recorded ancestor is a live MemoryObject, kept alive
+            // by the record's reference for the pool's lifetime; `base` is
+            // immutable after creation.
+            let base = unsafe { (*record.ancestor.cast::<MemoryObject>()).base };
+            let start = base + record.base_offset;
+            phys >= start && phys < start + record.page_count * p
+        };
+        pool_lock(&self.lock);
+        let mut owned = self.inline.iter().any(|slot| {
+            let ancestor = slot.ancestor.load(Ordering::Acquire);
+            !ancestor.is_null()
+                && covers(ChunkRecord {
+                    ancestor,
+                    base_offset: slot.base_offset.load(Ordering::Relaxed),
+                    page_count: slot.page_count.load(Ordering::Relaxed),
+                })
+        });
+        let mut page_phys = self.record_head_phys.load(Ordering::Acquire);
+        while !owned && page_phys != 0
+        {
+            let page = crate::mm::paging::phys_to_virt(page_phys) as *const ChunkRecordPage;
+            // SAFETY: lock held; a published record page stays mapped in the
+            // direct map and exclusively owned by this pool until teardown.
+            unsafe {
+                let used = (*page).used;
+                owned = (0..used).any(|i| covers((*page).records[i]));
+                page_phys = (*page).next_phys;
+            }
+        }
+        pool_unlock(&self.lock);
+        owned
+    }
+
+    /// Record a donation and seed its pool pages onto the free list.
+    /// Returns the number of pages seeded: `pool_pages`, or one fewer when
+    /// the donation had to supply a record page.
+    ///
+    /// `Err(())` only when there is no record space and `pool_pages == 0`,
+    /// so the donation cannot supply a record page; nothing is recorded or
+    /// seeded then. A record is written before its pages are published, so
+    /// every seeded page belongs to a recorded, reclaimable chunk.
+    ///
+    /// Pool pages are the high `pool_pages` of the chunk; the low
+    /// `total_pages - pool_pages` stay reserved for the caller (wrapper
+    /// page, root page table). The record always covers all `total_pages`
+    /// so teardown reclaims the entire span.
+    ///
+    /// # Safety
+    /// `ancestor` must be a live `MemoryObject`'s header on which the
+    /// caller holds a reference for the pool's lifetime; `base_offset` and
+    /// `total_pages` must come from a successful `retype_allocate` against
+    /// it, with `ancestor_memory_base` that object's `base`.
+    #[cfg(not(test))]
+    #[track_caller]
+    pub unsafe fn add_chunk(
+        &self,
+        ancestor: NonNull<KernelObjectHeader>,
+        ancestor_memory_base: u64,
+        base_offset: u64,
+        total_pages: u64,
+        pool_pages: u64,
+    ) -> Result<u64, ()>
+    {
+        debug_assert!(pool_pages <= total_pages);
+        let p = crate::mm::PAGE_SIZE as u64;
+        let chunk_phys = ancestor_memory_base + base_offset;
+        let mut first_pool = total_pages - pool_pages;
+        let record = ChunkRecord {
+            ancestor: ancestor.as_ptr(),
+            base_offset,
+            page_count: total_pages,
+        };
+
+        pool_lock(&self.lock);
+        let vacant = self
+            .inline
+            .iter()
+            .find(|slot| slot.ancestor.load(Ordering::Relaxed).is_null());
+        let recorded = if let Some(slot) = vacant
+        {
+            slot.base_offset.store(base_offset, Ordering::Relaxed);
+            slot.page_count.store(total_pages, Ordering::Relaxed);
+            // A non-null ancestor marks the record populated, so it is
+            // written last.
+            slot.ancestor.store(ancestor.as_ptr(), Ordering::Release);
+            true
+        }
+        else
+        {
+            // SAFETY: lock held.
+            unsafe { self.record_spilled(record) }
+        };
+        if !recorded
+        {
+            if first_pool == total_pages
+            {
+                pool_unlock(&self.lock);
+                return Err(());
+            }
+            // SAFETY: lock held; the page is the chunk's first pool page,
+            // freshly retyped from `ancestor` and not yet published.
+            unsafe { self.open_record_page(chunk_phys + first_pool * p, record) };
+            first_pool += 1;
+        }
+
+        // Push in reverse so the lowest address ends up at the head of the
+        // free list (purely cosmetic).
+        for i in (first_pool..total_pages).rev()
+        {
+            // SAFETY: lock held; the page was just retyped from `ancestor`
+            // and is unaliased.
+            unsafe { pool_push(&self.head_phys, chunk_phys + i * p) };
+        }
+        pool_unlock(&self.lock);
+        Ok(total_pages - first_pool)
+    }
+
+    /// Append `record` to the newest record page. `false` if there is none
+    /// or it is full.
+    ///
+    /// # Safety
+    /// The pool lock must be held.
+    #[cfg(not(test))]
+    unsafe fn record_spilled(&self, record: ChunkRecord) -> bool
+    {
+        let page_phys = self.record_head_phys.load(Ordering::Acquire);
+        if page_phys == 0
+        {
+            return false;
+        }
+        let page = crate::mm::paging::phys_to_virt(page_phys) as *mut ChunkRecordPage;
+        // SAFETY: lock held; a published record page stays mapped in the
+        // direct map and exclusively owned by this pool until teardown.
+        unsafe {
+            let used = (*page).used;
+            if used >= CHUNK_RECORDS_PER_PAGE
+            {
+                return false;
+            }
+            (*page).records[used] = record;
+            (*page).used = used + 1;
+        }
+        true
+    }
+
+    /// Make `page_phys` the newest record page, holding `record` (the chunk
+    /// the page belongs to) as record 0.
+    ///
+    /// # Safety
+    /// The pool lock must be held; `page_phys` must be a page-aligned page
+    /// of `record`'s chunk that is neither on the free list nor otherwise
+    /// in use.
+    #[cfg(not(test))]
+    unsafe fn open_record_page(&self, page_phys: u64, record: ChunkRecord)
+    {
+        let page = crate::mm::paging::phys_to_virt(page_phys) as *mut ChunkRecordPage;
+        // SAFETY: the page is exclusively owned and page-aligned (caller's
+        // contract) and holds one ChunkRecordPage (fit asserted at compile
+        // time).
+        unsafe {
+            core::ptr::write_bytes(page.cast::<u8>(), 0, crate::mm::PAGE_SIZE);
+            (*page).next_phys = self.record_head_phys.load(Ordering::Acquire);
+            (*page).used = 1;
+            (*page).records[0] = record;
+        }
+        self.record_head_phys.store(page_phys, Ordering::Release);
+    }
+
+    /// Hand every recorded donation to `free` as `(ancestor, base_offset,
+    /// page_count)`, in an order that keeps each record readable until it is
+    /// used: spilled records newest page first and, within a page, records
+    /// `1..` before record 0 (whose chunk holds the page); then the inline
+    /// records, snapshotted up front, with record 0 (the create-time slab
+    /// that holds the owner and this pool) last.
+    ///
+    /// # Safety
+    /// The owner is being torn down at refcount 0: no other reference to
+    /// it, the pool, or any recorded page exists, and `free` must not touch
+    /// the pool. `self` is dangling once this returns.
+    #[cfg(not(test))]
+    pub unsafe fn reclaim_chunks<F>(&self, mut free: F)
+    where
+        F: FnMut(*mut KernelObjectHeader, u64, u64),
+    {
+        let mut inline = [ChunkRecord::VACANT; INLINE_CHUNK_SLOTS];
+        let mut count = 0;
+        for slot in &self.inline
+        {
+            let ancestor = slot.ancestor.load(Ordering::Acquire);
+            if ancestor.is_null()
+            {
+                continue;
+            }
+            inline[count] = ChunkRecord {
+                ancestor,
+                base_offset: slot.base_offset.load(Ordering::Relaxed),
+                page_count: slot.page_count.load(Ordering::Relaxed),
+            };
+            count += 1;
+        }
+
+        let mut page_phys = self.record_head_phys.load(Ordering::Acquire);
+        while page_phys != 0
+        {
+            let page = crate::mm::paging::phys_to_virt(page_phys) as *const ChunkRecordPage;
+            // SAFETY: caller's contract; the page stays intact until its
+            // record 0 is freed below, after every read of it.
+            let (next, used) = unsafe { ((*page).next_phys, (*page).used) };
+            debug_assert!((1..=CHUNK_RECORDS_PER_PAGE).contains(&used));
+            for i in 1..used
+            {
+                // SAFETY: as above; `i < used`.
+                let record = unsafe { (*page).records[i] };
+                free(record.ancestor, record.base_offset, record.page_count);
+            }
+            // SAFETY: as above; the page is not read again after this.
+            let record = unsafe { (*page).records[0] };
+            free(record.ancestor, record.base_offset, record.page_count);
+            page_phys = next;
+        }
+
+        for record in inline[..count].iter().rev()
+        {
+            free(record.ancestor, record.base_offset, record.page_count);
+        }
+    }
+}
+
+impl Default for PagePool
+{
+    fn default() -> Self
+    {
+        Self::new()
     }
 }
 
@@ -566,17 +931,9 @@ pub struct AddressSpaceObject
     /// (`cap_create_aspace(memory_cap, target_aspace_cap)`). `mem_map` returns
     /// `NoMemory` if a new PT page is needed but the budget is exhausted.
     pub pt_growth_budget_bytes: AtomicU64,
-    /// Spinlock guarding `pt_pool_head_phys` and the `pt_chunks` array.
-    /// `0` = unlocked, `1` = locked.
-    pub pt_pool_lock: AtomicU64,
-    /// Head of the intrusive free-list of available PT pages, by physical
-    /// address. `0` = empty. Each free page's first 8 bytes hold the
-    /// physical address of the next free page (read/written via the
-    /// kernel direct map).
-    pub pt_pool_head_phys: AtomicU64,
-    /// Records of every retype-source chunk donated to this AS. `dealloc`
-    /// walks this array and `retype_free`s each chunk wholesale.
-    pub pt_chunks: [PoolChunkSlot; MAX_PT_CHUNKS],
+    /// Intermediate page-table pages donated to this AS, and the record of
+    /// every donation; `dealloc` reclaims the donations wholesale.
+    pub pt_pool: PagePool,
     /// Intrusive link for the per-CPU deferred reclaim stack
     /// ([`drain_deferred_reclaim`]). Non-null only while this object sits on
     /// that stack: the thread that dropped its last capability was itself
@@ -607,13 +964,9 @@ pub struct CSpaceKernelObject
     /// `cspace_grow` returns `NoMemory` if a new slot page is needed but the
     /// budget is exhausted.
     pub cspace_growth_budget_bytes: AtomicU64,
-    /// Spinlock guarding `cs_pool_head_phys` and the `cs_chunks` array.
-    pub cs_pool_lock: AtomicU64,
-    /// Head of the intrusive free-list of available slot pages, by physical
-    /// address. `0` = empty.
-    pub cs_pool_head_phys: AtomicU64,
-    /// Records of every retype-source chunk donated to this `CSpace`.
-    pub cs_chunks: [PoolChunkSlot; MAX_PT_CHUNKS],
+    /// Slot and directory pages donated to this `CSpace`, and the record of
+    /// every donation; `dealloc` reclaims the donations wholesale.
+    pub cs_pool: PagePool,
     /// Intrusive link for the per-CPU deferred reclaim stack
     /// ([`drain_deferred_reclaim`]); see `AddressSpaceObject::deferred_next`.
     pub deferred_next: *mut KernelObjectHeader,
@@ -639,9 +992,9 @@ unsafe impl Send for CSpaceKernelObject {}
 // SAFETY: CSpaceKernelObject is accessed only with proper locks.
 unsafe impl Sync for CSpaceKernelObject {}
 
-/// Acquire a pool spinlock (`pt_pool_lock` or `cs_pool_lock`). A contended
-/// wait is recorded in the calling CPU's lock-wait breadcrumb for the
-/// softlockup watchdog; the uncontended path records nothing.
+/// Acquire a pool spinlock ([`PagePool::lock`]). A contended wait is
+/// recorded in the calling CPU's lock-wait breadcrumb for the softlockup
+/// watchdog; the uncontended path records nothing.
 #[cfg(not(test))]
 #[inline]
 #[track_caller]
@@ -717,15 +1070,6 @@ unsafe fn pool_push(head_phys: &AtomicU64, phys: u64)
     head_phys.store(phys, Ordering::Release);
 }
 
-/// Stamp out a fresh `[PoolChunkSlot; MAX_PT_CHUNKS]` array of vacant slots.
-///
-/// Used by both `AddressSpaceObject` and `CSpaceKernelObject` constructors.
-#[must_use]
-pub fn vacant_chunk_slots() -> [PoolChunkSlot; MAX_PT_CHUNKS]
-{
-    core::array::from_fn(|_| PoolChunkSlot::vacant())
-}
-
 impl AddressSpaceObject
 {
     /// Pop a free PT page from this AS's pool, charging the growth budget.
@@ -734,10 +1078,7 @@ impl AddressSpaceObject
     #[track_caller]
     pub fn alloc_pt_page(&self) -> Option<u64>
     {
-        pool_lock(&self.pt_pool_lock);
-        // SAFETY: lock held; pt_pool_head_phys points at our atomic head.
-        let phys = unsafe { pool_pop(&self.pt_pool_head_phys) };
-        pool_unlock(&self.pt_pool_lock);
+        let phys = self.pt_pool.pop();
         if phys == 0
         {
             return None;
@@ -762,16 +1103,14 @@ impl AddressSpaceObject
     #[track_caller]
     pub unsafe fn free_pt_page(&self, phys: u64)
     {
-        pool_lock(&self.pt_pool_lock);
-        // SAFETY: lock held; caller's contract guarantees `phys` is owned by
-        // this pool and not aliased.
-        unsafe { pool_push(&self.pt_pool_head_phys, phys) };
-        pool_unlock(&self.pt_pool_lock);
+        // SAFETY: the caller's contract makes `phys` a pool page no longer
+        // in use.
+        unsafe { self.pt_pool.push(phys) };
         self.pt_growth_budget_bytes
             .fetch_add(crate::mm::PAGE_SIZE as u64, Ordering::AcqRel);
     }
 
-    /// Whether `phys` lies inside one of this AS's retype-source chunks — i.e.
+    /// Whether `phys` lies inside one of this AS's donated chunks — i.e.
     /// the page was carved from this AS's PT pool (rather than `kernel_pt_pool`
     /// or another allocator).
     ///
@@ -785,51 +1124,16 @@ impl AddressSpaceObject
     #[track_caller]
     pub fn owns_phys(&self, phys: u64) -> bool
     {
-        let p = crate::mm::PAGE_SIZE as u64;
-        pool_lock(&self.pt_pool_lock);
-        let mut owned = false;
-        for slot in &self.pt_chunks
-        {
-            let anc = slot.ancestor.load(Ordering::Acquire);
-            if anc.is_null()
-            {
-                continue;
-            }
-            // SAFETY: ancestor is published with Release at chunk recording and
-            // kept alive by the chunk's inc_ref for the AS's lifetime;
-            // MemoryObject.base is immutable after creation.
-            // cast_ptr_alignment: header at offset 0; MemoryObject is repr(C).
-            #[allow(clippy::cast_ptr_alignment)]
-            let base = unsafe { (*anc.cast::<MemoryObject>()).base };
-            let start = base + slot.base_offset.load(Ordering::Relaxed);
-            let end = start + slot.page_count.load(Ordering::Relaxed) * p;
-            if phys >= start && phys < end
-            {
-                owned = true;
-                break;
-            }
-        }
-        pool_unlock(&self.pt_pool_lock);
-        owned
+        self.pt_pool.owns_phys(phys)
     }
 
-    /// Record a freshly-retyped chunk and seed its pages onto the pool.
-    /// Returns `Err(())` if every chunk slot is occupied.
+    /// Record a freshly-retyped chunk and seed its pool pages, crediting
+    /// the growth budget with the pages actually seeded.
     ///
     /// # Safety
-    /// `ancestor` must be a live `MemoryObject`'s header; this call must
-    /// follow a successful `retype_allocate(.., page_count * PAGE_SIZE)`
-    /// against that ancestor returning `base_offset`. Caller has already
-    /// `inc_ref`'d `ancestor`.
-    ///
-    /// `pool_pages` controls how many of the chunk's pages are seeded onto
-    /// the free pool; the remainder are reserved (used for fixed-purpose
-    /// allocations like the root PT in create-mode). The chunk slot
-    /// always records the *full* `total_pages` so dealloc reclaims the
-    /// entire span.
-    ///
-    /// Pool pages are taken from the *high* end of the chunk; reserved
-    /// pages occupy `[base_offset, base_offset + (total_pages - pool_pages) * PAGE_SIZE)`.
+    /// See [`PagePool::add_chunk`]. The caller has already `inc_ref`'d
+    /// `ancestor`; the reference is released when the chunk is reclaimed at
+    /// dealloc.
     #[cfg(not(test))]
     #[track_caller]
     pub unsafe fn add_chunk(
@@ -841,46 +1145,18 @@ impl AddressSpaceObject
         pool_pages: u64,
     ) -> Result<(), ()>
     {
-        debug_assert!(pool_pages <= total_pages);
-        let p = crate::mm::PAGE_SIZE as u64;
-        let reserved = total_pages - pool_pages;
-        pool_lock(&self.pt_pool_lock);
-
-        // Find a vacant chunk slot.
-        let mut slot_idx = MAX_PT_CHUNKS;
-        for (i, slot) in self.pt_chunks.iter().enumerate()
-        {
-            if slot.ancestor.load(Ordering::Relaxed).is_null()
-            {
-                slot_idx = i;
-                break;
-            }
-        }
-        if slot_idx == MAX_PT_CHUNKS
-        {
-            pool_unlock(&self.pt_pool_lock);
-            return Err(());
-        }
-
-        let slot = &self.pt_chunks[slot_idx];
-        slot.base_offset.store(base_offset, Ordering::Relaxed);
-        slot.page_count.store(total_pages, Ordering::Relaxed);
-        // Set ancestor LAST: a non-null ancestor signifies a fully-populated
-        // slot.
-        slot.ancestor.store(ancestor.as_ptr(), Ordering::Release);
-
-        // Push pool pages in reverse so the lowest address ends up at the
-        // head of the free list (purely cosmetic).
-        for i in (reserved..total_pages).rev()
-        {
-            let page_phys = ancestor_memory_base + base_offset + i * p;
-            // SAFETY: lock held; chunk was just retyped from `ancestor`.
-            unsafe { pool_push(&self.pt_pool_head_phys, page_phys) };
-        }
-
-        pool_unlock(&self.pt_pool_lock);
+        // SAFETY: forwarded from the caller's contract.
+        let seeded = unsafe {
+            self.pt_pool.add_chunk(
+                ancestor,
+                ancestor_memory_base,
+                base_offset,
+                total_pages,
+                pool_pages,
+            )?
+        };
         self.pt_growth_budget_bytes
-            .fetch_add(pool_pages * p, Ordering::AcqRel);
+            .fetch_add(seeded * crate::mm::PAGE_SIZE as u64, Ordering::AcqRel);
         Ok(())
     }
 }
@@ -893,10 +1169,7 @@ impl CSpaceKernelObject
     #[track_caller]
     pub fn alloc_slot_page(&self) -> Option<u64>
     {
-        pool_lock(&self.cs_pool_lock);
-        // SAFETY: lock held.
-        let phys = unsafe { pool_pop(&self.cs_pool_head_phys) };
-        pool_unlock(&self.cs_pool_lock);
+        let phys = self.cs_pool.pop();
         if phys == 0
         {
             return None;
@@ -909,7 +1182,8 @@ impl CSpaceKernelObject
         Some(phys)
     }
 
-    /// Record a freshly-retyped chunk and seed its pages onto the pool.
+    /// Record a freshly-retyped chunk and seed its pool pages, crediting
+    /// the growth budget with the pages actually seeded.
     ///
     /// # Safety
     /// See [`AddressSpaceObject::add_chunk`].
@@ -924,41 +1198,18 @@ impl CSpaceKernelObject
         pool_pages: u64,
     ) -> Result<(), ()>
     {
-        debug_assert!(pool_pages <= total_pages);
-        let p = crate::mm::PAGE_SIZE as u64;
-        let reserved = total_pages - pool_pages;
-        pool_lock(&self.cs_pool_lock);
-
-        let mut slot_idx = MAX_PT_CHUNKS;
-        for (i, slot) in self.cs_chunks.iter().enumerate()
-        {
-            if slot.ancestor.load(Ordering::Relaxed).is_null()
-            {
-                slot_idx = i;
-                break;
-            }
-        }
-        if slot_idx == MAX_PT_CHUNKS
-        {
-            pool_unlock(&self.cs_pool_lock);
-            return Err(());
-        }
-
-        let slot = &self.cs_chunks[slot_idx];
-        slot.base_offset.store(base_offset, Ordering::Relaxed);
-        slot.page_count.store(total_pages, Ordering::Relaxed);
-        slot.ancestor.store(ancestor.as_ptr(), Ordering::Release);
-
-        for i in (reserved..total_pages).rev()
-        {
-            let page_phys = ancestor_memory_base + base_offset + i * p;
-            // SAFETY: see add_chunk on AddressSpaceObject.
-            unsafe { pool_push(&self.cs_pool_head_phys, page_phys) };
-        }
-
-        pool_unlock(&self.cs_pool_lock);
+        // SAFETY: forwarded from the caller's contract.
+        let seeded = unsafe {
+            self.cs_pool.add_chunk(
+                ancestor,
+                ancestor_memory_base,
+                base_offset,
+                total_pages,
+                pool_pages,
+            )?
+        };
         self.cspace_growth_budget_bytes
-            .fetch_add(pool_pages * p, Ordering::AcqRel);
+            .fetch_add(seeded * crate::mm::PAGE_SIZE as u64, Ordering::AcqRel);
         Ok(())
     }
 }
@@ -1360,6 +1611,33 @@ unsafe fn dealloc_object_one(
         {
             worklist[*head] = Some(anc);
             *head += 1;
+        }
+    }
+
+    /// Return one donated chunk to its ancestor Memory object and drop the
+    /// reference the donation held on it, cascading at zero.
+    fn free_chunk(
+        worklist: &mut [Option<core::ptr::NonNull<KernelObjectHeader>>],
+        head: &mut usize,
+        anc_ptr: *mut KernelObjectHeader,
+        off: u64,
+        pages: u64,
+    )
+    {
+        // SAFETY: anc_ptr was set at chunk recording from a live
+        // MemoryObject's header; the inc_ref then is matched by the
+        // dec_ref here.
+        let anc_hdr = unsafe { &*anc_ptr };
+        // cast_ptr_alignment: header at offset 0; MemoryObject is repr(C).
+        #[allow(clippy::cast_ptr_alignment)]
+        // SAFETY: as above; the ancestor stays live until the dec_ref below.
+        let anc_memory = unsafe { &*anc_ptr.cast::<MemoryObject>() };
+        crate::cap::retype::retype_free(anc_memory, off, pages * crate::mm::PAGE_SIZE as u64);
+        if anc_hdr.dec_ref() == 0
+        {
+            // SAFETY: refcount reached 0; no live cap holds it.
+            let anc_nn = unsafe { NonNull::new_unchecked(anc_ptr) };
+            push_ancestor(worklist, head, anc_nn);
         }
     }
 
@@ -2257,30 +2535,9 @@ unsafe fn dealloc_object_one(
                 );
 
                 debug_assert!(
-                    !obj.pt_chunks[0].ancestor.load(Ordering::Acquire).is_null(),
+                    obj.pt_pool.retype_backed(),
                     "dealloc AddressSpace: heap-backed AS reached typed-memory dealloc path"
                 );
-
-                // Snapshot every chunk slot into a stack array before
-                // freeing — `retype_free` may touch the chunk pages
-                // (writing free-list links into them), and the wrapper
-                // itself lives in the chunk being reclaimed, so the
-                // snapshot must finish before we free.
-                let mut snapshot: [(u64, u64, *mut KernelObjectHeader); MAX_PT_CHUNKS] =
-                    [(0, 0, core::ptr::null_mut()); MAX_PT_CHUNKS];
-                let mut count = 0;
-                for slot in &obj.pt_chunks
-                {
-                    let anc = slot.ancestor.load(Ordering::Acquire);
-                    if anc.is_null()
-                    {
-                        continue;
-                    }
-                    let off = slot.base_offset.load(Ordering::Relaxed);
-                    let pages = slot.page_count.load(Ordering::Relaxed);
-                    snapshot[count] = (off, pages, anc);
-                    count += 1;
-                }
 
                 // Return this space's hardware tag (PCID/ASID) to the pool, if
                 // any. No TLB flush is needed: active_cpus is empty (asserted
@@ -2303,29 +2560,15 @@ unsafe fn dealloc_object_one(
                     core::ptr::drop_in_place(as_ptr);
                 }
 
-                let p = crate::mm::PAGE_SIZE as u64;
-                for &(off, pages, anc_ptr) in &snapshot[..count]
-                {
-                    // SAFETY: anc_ptr was set at chunk recording from a
-                    // live MemoryObject's header; the inc_ref then is
-                    // matched by the dec_ref here.
-                    let anc_hdr = unsafe { &*anc_ptr };
-                    // Cast to MemoryObject for retype_free; the ancestor
-                    // is always a Memory cap (header at offset 0).
-                    // cast_ptr_alignment: header at offset 0; MemoryObject is repr(C).
-                    #[allow(clippy::cast_ptr_alignment)]
-                    // SAFETY: anc_ptr was set at chunk recording from a
-                    // live MemoryObject's header; refcount kept alive
-                    // until the dec_ref below.
-                    let anc_memory = unsafe { &*anc_ptr.cast::<MemoryObject>() };
-                    crate::cap::retype::retype_free(anc_memory, off, pages * p);
-                    let new_rc = anc_hdr.dec_ref();
-                    if new_rc == 0
-                    {
-                        // SAFETY: refcount reached 0; no live cap holds it.
-                        let anc_nn = unsafe { NonNull::new_unchecked(anc_ptr) };
-                        push_ancestor(worklist, head, anc_nn);
-                    }
+                // Return every donation, the create-time slab (holding the
+                // wrapper and this pool) last; `obj` is dangling afterwards.
+                // SAFETY: refcount 0, no slot references the object, and
+                // the in-place AddressSpace has been dropped; free_chunk
+                // never touches the pool.
+                unsafe {
+                    obj.pt_pool.reclaim_chunks(|anc_ptr, off, pages| {
+                        free_chunk(worklist, head, anc_ptr, off, pages);
+                    });
                 }
             }
 
@@ -2357,7 +2600,7 @@ unsafe fn dealloc_object_one(
             let cs_ptr = obj.cspace;
 
             debug_assert!(
-                !obj.cs_chunks[0].ancestor.load(Ordering::Acquire).is_null(),
+                obj.cs_pool.retype_backed(),
                 "dealloc CSpaceObj: heap-backed CSpace reached typed-memory dealloc path"
             );
 
@@ -2468,41 +2711,15 @@ unsafe fn dealloc_object_one(
                 needs_free_id = id != 0;
             }
 
-            // Snapshot every chunk slot before freeing — `retype_free`
-            // touches the chunk pages (writing free-list links), and the
-            // wrapper itself lives in the chunk being reclaimed.
-            let mut snapshot: [(u64, u64, *mut KernelObjectHeader); MAX_PT_CHUNKS] =
-                [(0, 0, core::ptr::null_mut()); MAX_PT_CHUNKS];
-            let mut count = 0;
-            for slot in &obj.cs_chunks
-            {
-                let anc = slot.ancestor.load(Ordering::Acquire);
-                if anc.is_null()
-                {
-                    continue;
-                }
-                let off = slot.base_offset.load(Ordering::Relaxed);
-                let pages = slot.page_count.load(Ordering::Relaxed);
-                snapshot[count] = (off, pages, anc);
-                count += 1;
-            }
-            let p = crate::mm::PAGE_SIZE as u64;
-            for &(off, pages, anc_ptr) in &snapshot[..count]
-            {
-                // SAFETY: anc_ptr was set at chunk recording.
-                let anc_hdr = unsafe { &*anc_ptr };
-                // cast_ptr_alignment: header at offset 0; MemoryObject repr(C).
-                #[allow(clippy::cast_ptr_alignment)]
-                // SAFETY: ancestor live until dec_ref below.
-                let anc_memory = unsafe { &*anc_ptr.cast::<MemoryObject>() };
-                crate::cap::retype::retype_free(anc_memory, off, pages * p);
-                let new_rc = anc_hdr.dec_ref();
-                if new_rc == 0
-                {
-                    // SAFETY: refcount reached 0.
-                    let anc_nn = unsafe { NonNull::new_unchecked(anc_ptr) };
-                    push_ancestor(worklist, head, anc_nn);
-                }
+            // Return every donation, the create-time slab (holding the
+            // wrapper and this pool) last; `obj` is dangling afterwards.
+            // SAFETY: refcount 0, no slot references the object, and the
+            // in-place CSpace has been dropped; free_chunk never touches
+            // the pool.
+            unsafe {
+                obj.cs_pool.reclaim_chunks(|anc_ptr, off, pages| {
+                    free_chunk(worklist, head, anc_ptr, off, pages);
+                });
             }
 
             // Recycle the id last, after all of the dying CSpace's storage

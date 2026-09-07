@@ -12,7 +12,9 @@
 //! - **Augment-mode** on `cap_create_aspace` / `cap_create_cspace` —
 //!   topping up an existing AS/CS growth budget by passing a non-zero
 //!   target. Functional coverage of the syscall path that is otherwise
-//!   only reached when an explicit refill is requested.
+//!   only reached when an explicit refill is requested, including
+//!   donation counts past the wrapper's inline records (the record pages
+//!   the kernel carves from the donations themselves).
 //! - **PT-budget exhaustion** — repeated `mem_map` against a freshly
 //!   created `AddressSpace` whose initial growth budget covers only its
 //!   root PT and one pool page eventually returns `OutOfMemory` from the
@@ -913,4 +915,159 @@ pub fn cspace_dir_page_survives_failed_grow(ctx: &TestContext) -> TestResult
         Ok(_) => Err("retype::dir_survives: post-refill insert landed below the boundary"),
         Err(_) => Err("retype::dir_survives: insert after refill failed — dir page re-charged?"),
     }
+}
+
+/// Donations are unbounded in count: the wrapper's sixteen inline donation
+/// records spill into record pages carved from the donations themselves
+/// (one page per `CHUNK_RECORDS_PER_PAGE` further donations). Two hundred
+/// one-page donations cross both the inline limit and one full record page,
+/// so exactly two donations supply a record page and seed nothing; every
+/// other page is usable, and the wholesale delete returns all of them to
+/// the source Memory cap.
+pub fn cspace_augment_many(ctx: &TestContext) -> TestResult
+{
+    const DONATIONS: u64 = 200;
+    // Donations 16 and 187 open the two record pages: the inline records
+    // hold the create-time slab plus fifteen donations, and a record page
+    // holds 170 records, the first being its own donation.
+    const RECORD_PAGES: u64 = 2;
+    const SEEDED: u64 = DONATIONS - RECORD_PAGES;
+    // Leaves past the direct region need one pool-paid directory page.
+    const DIRECTORY_PAGES: u64 = 1;
+    const SLOTS_PER_LEAF: u64 = 56;
+    let memory = ctx.memory_base;
+
+    let baseline = cap_info(memory, CAP_INFO_MEMORY_AVAILABLE)
+        .map_err(|_| "retype::cspace_augment_many: cap_info(baseline) failed")?;
+
+    // init_pages = 1 → wrapper only: empty pool, zero budget.
+    let cspace = cap_create_cspace(memory, 0, 1)
+        .map_err(|_| "retype::cspace_augment_many: cap_create_cspace failed")?;
+    let mut augment_failures = 0u32;
+    for _ in 0..DONATIONS
+    {
+        if cap_create_cspace(memory, cspace, 1).is_err()
+        {
+            augment_failures += 1;
+        }
+    }
+    let budget = cap_info(cspace, CAP_INFO_CSPACE_BUDGET).unwrap_or(u64::MAX);
+
+    // Every seeded page except the directory page backs a leaf; slot 0 of
+    // the first leaf is the null slot.
+    let Ok(probe) = cap_create_endpoint(memory)
+    else
+    {
+        cap_delete(cspace).ok();
+        return Err("retype::cspace_augment_many: cap_create_endpoint failed");
+    };
+    let expected_copies = (SEEDED - DIRECTORY_PAGES) * SLOTS_PER_LEAF - 1;
+    let mut copies = 0u64;
+    let mut terminal = 0i64;
+    for _ in 0..=expected_copies
+    {
+        match cap_copy(probe, cspace, 1)
+        {
+            Ok(_) => copies += 1,
+            Err(e) =>
+            {
+                terminal = e;
+                break;
+            }
+        }
+    }
+
+    // Deleting the CSpace reclaims the copies and every donation wholesale.
+    cap_delete(cspace).ok();
+    cap_delete(probe).ok();
+    let after = cap_info(memory, CAP_INFO_MEMORY_AVAILABLE)
+        .map_err(|_| "retype::cspace_augment_many: cap_info(after) failed")?;
+
+    if augment_failures != 0
+    {
+        return Err("retype::cspace_augment_many: a donation past the inline records failed");
+    }
+    if budget != SEEDED * 4096
+    {
+        return Err(
+            "retype::cspace_augment_many: budget != donated pages minus the two record pages",
+        );
+    }
+    if copies != expected_copies || terminal != SYS_OUT_OF_MEMORY
+    {
+        return Err("retype::cspace_augment_many: seeded pages did not back exactly their slots");
+    }
+    if after != baseline
+    {
+        return Err(
+            "retype::cspace_augment_many: delete did not return every donation to the Memory cap",
+        );
+    }
+    Ok(())
+}
+
+/// The address-space pool spills its donation records the same way. Pages
+/// described by spilled records serve as page tables, and a reclaiming
+/// unmap recognises them as pool-owned through the record pages: the free
+/// list is LIFO, so a fresh mapping's intermediate tables come from the
+/// newest donations, which the second record page describes.
+pub fn aspace_augment_many(ctx: &TestContext) -> TestResult
+{
+    const DONATIONS: u64 = 200;
+    const RECORD_PAGES: u64 = 2;
+    const SEEDED: u64 = DONATIONS - RECORD_PAGES;
+    let memory = ctx.memory_base;
+
+    let baseline = cap_info(memory, CAP_INFO_MEMORY_AVAILABLE)
+        .map_err(|_| "retype::aspace_augment_many: cap_info(baseline) failed")?;
+
+    // init_pages = 2 → wrapper + root PT: empty pool, zero budget.
+    let aspace = cap_create_aspace(memory, 0, 2)
+        .map_err(|_| "retype::aspace_augment_many: cap_create_aspace failed")?;
+    let mut augment_failures = 0u32;
+    for _ in 0..DONATIONS
+    {
+        if cap_create_aspace(memory, aspace, 1).is_err()
+        {
+            augment_failures += 1;
+        }
+    }
+    let budget = cap_info(aspace, CAP_INFO_ASPACE_PT_BUDGET).unwrap_or(u64::MAX);
+
+    let mapped = mem_map(memory, aspace, TEST_VA_BASE, 0, 1, MAP_WRITABLE).is_ok();
+    let after_map = cap_info(aspace, CAP_INFO_ASPACE_PT_BUDGET).unwrap_or(u64::MAX);
+    let reclaimed = mem_unmap_reclaim(aspace, TEST_VA_BASE, 1).is_ok();
+    let after_reclaim = cap_info(aspace, CAP_INFO_ASPACE_PT_BUDGET).unwrap_or(0);
+
+    cap_delete(aspace).ok();
+    let after = cap_info(memory, CAP_INFO_MEMORY_AVAILABLE)
+        .map_err(|_| "retype::aspace_augment_many: cap_info(after) failed")?;
+
+    if augment_failures != 0
+    {
+        return Err("retype::aspace_augment_many: a donation past the inline records failed");
+    }
+    if budget != SEEDED * 4096
+    {
+        return Err(
+            "retype::aspace_augment_many: budget != donated pages minus the two record pages",
+        );
+    }
+    if !mapped || after_map >= budget
+    {
+        return Err("retype::aspace_augment_many: mapping did not draw page tables from the pool");
+    }
+    if !reclaimed || after_reclaim != budget
+    {
+        return Err(
+            "retype::aspace_augment_many: reclaiming unmap did not credit spilled-record pages",
+        );
+    }
+    if after != baseline
+    {
+        return Err(
+            "retype::aspace_augment_many: delete did not return every donation to the Memory cap",
+        );
+    }
+    Ok(())
 }

@@ -986,7 +986,7 @@ fn coalesce_ram_blocks(blocks: &mut [RamBlock]) -> usize
 /// for init's bootstrap AS.
 ///
 /// `init_pages` MUST be `>= 2`. Calls [`crate::fatal`] on retype-allocator
-/// or chunk-slot exhaustion (boot cannot recover).
+/// exhaustion (boot cannot recover).
 #[cfg(not(test))]
 #[allow(clippy::missing_safety_doc)]
 pub(crate) unsafe fn boot_retype_aspace(
@@ -997,9 +997,7 @@ pub(crate) unsafe fn boot_retype_aspace(
     *mut crate::mm::address_space::AddressSpace,
 )
 {
-    use crate::cap::object::{
-        AddressSpaceObject, KernelObjectHeader, ObjectType, vacant_chunk_slots,
-    };
+    use crate::cap::object::{AddressSpaceObject, KernelObjectHeader, ObjectType, PagePool};
     use crate::mm::PAGE_SIZE;
     use crate::mm::address_space::AddressSpace;
     use crate::mm::paging::phys_to_virt;
@@ -1050,9 +1048,7 @@ pub(crate) unsafe fn boot_retype_aspace(
                 ),
                 address_space: aspace_ptr,
                 pt_growth_budget_bytes: AtomicU64::new(0),
-                pt_pool_lock: AtomicU64::new(0),
-                pt_pool_head_phys: AtomicU64::new(0),
-                pt_chunks: vacant_chunk_slots(),
+                pt_pool: PagePool::new(),
                 deferred_next: core::ptr::null_mut(),
             },
         );
@@ -1073,7 +1069,7 @@ pub(crate) unsafe fn boot_retype_aspace(
     };
     if res.is_err()
     {
-        crate::fatal("boot_retype_aspace: chunk slot exhausted");
+        crate::fatal("boot_retype_aspace: donation not recorded");
     }
 
     // SAFETY: aso_ptr is in-place; header at offset 0.
@@ -1090,7 +1086,7 @@ pub(crate) unsafe fn boot_retype_aspace(
 /// [`init_capability_system`] for the root `CSpace`.
 ///
 /// `init_pages` MUST be `>= 1`. Calls [`crate::fatal`] on retype-allocator
-/// or chunk-slot exhaustion.
+/// exhaustion.
 #[cfg(not(test))]
 #[allow(clippy::missing_safety_doc)]
 pub(crate) unsafe fn boot_retype_cspace(
@@ -1100,9 +1096,7 @@ pub(crate) unsafe fn boot_retype_cspace(
 ) -> (NonNull<object::KernelObjectHeader>, *mut cspace::CSpace)
 {
     use crate::cap::cspace::CSpace;
-    use crate::cap::object::{
-        CSpaceKernelObject, KernelObjectHeader, ObjectType, vacant_chunk_slots,
-    };
+    use crate::cap::object::{CSpaceKernelObject, KernelObjectHeader, ObjectType, PagePool};
     use crate::mm::PAGE_SIZE;
     use crate::mm::paging::phys_to_virt;
     use core::sync::atomic::AtomicU64;
@@ -1143,9 +1137,7 @@ pub(crate) unsafe fn boot_retype_cspace(
                 header: KernelObjectHeader::with_ancestor(ObjectType::CSpaceObj, seed_header_nn()),
                 cspace: cs_ptr,
                 cspace_growth_budget_bytes: AtomicU64::new(0),
-                cs_pool_lock: AtomicU64::new(0),
-                cs_pool_head_phys: AtomicU64::new(0),
-                cs_chunks: vacant_chunk_slots(),
+                cs_pool: PagePool::new(),
                 deferred_next: core::ptr::null_mut(),
             },
         );
@@ -1173,7 +1165,7 @@ pub(crate) unsafe fn boot_retype_cspace(
     };
     if res.is_err()
     {
-        crate::fatal("boot_retype_cspace: chunk slot exhausted");
+        crate::fatal("boot_retype_cspace: donation not recorded");
     }
 
     // SAFETY: cs_kobj_ptr is in-place; header at offset 0.

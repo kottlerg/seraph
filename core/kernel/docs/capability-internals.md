@@ -138,6 +138,33 @@ allocation, and when `remove_from_free_list` unlinks a specific index);
 
 This gives amortised O(1) allocation and O(1) deallocation.
 
+### Page Pools and Donation Records
+
+The wrapper object that owns a `CSpace` (`CSpaceKernelObject`) keeps the
+slot-page pool in a `PagePool`; the wrapper of an `AddressSpace` keeps its
+intermediate page-table pool in the same type. A pool is an intrusive free
+list of the donated pages (each free page's first word links the next) plus
+a record of every donation — its source Memory object, byte offset, and
+page count — so teardown can return each donation to its source wholesale.
+The wrapper, not the pool, keeps the byte budget the pool backs.
+
+Sixteen records live inline in the wrapper; the create-time slab, which
+holds the wrapper itself, is record 0. When the inline records are full,
+the next donation's first pool page becomes a *record page*: a chained
+page (newest first) holding up to `CHUNK_RECORDS_PER_PAGE` further records,
+whose record 0 is the donation the page came from. A donation is recorded
+before any of its pages is published to the free list, so every free page
+belongs to a reclaimable record, and the number of donations is bounded
+only by the memory donated — one donated page of bookkeeping per record
+page. A one-page donation that opens a record page seeds nothing; the
+budget reported by `SYS_CAP_INFO` is authoritative.
+
+Teardown walks the record pages newest first, returning each page's other
+records before its record 0 (whose donation holds the page), then the
+inline records, the create-time slab last. Region reclaim in an address
+space checks a page-table page against the records — inline and spilled —
+before returning it to the pool, so only pool-owned pages re-enter it.
+
 ---
 
 ## Capability Slot (`cap/slot.rs`)

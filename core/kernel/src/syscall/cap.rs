@@ -404,7 +404,7 @@ pub fn sys_cap_create_notification(tf: &mut TrapFrame) -> Result<u64, SyscallErr
 pub fn sys_cap_create_aspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::object::{
-        AddressSpaceObject, KernelObjectHeader, MemoryObject, ObjectType, vacant_chunk_slots,
+        AddressSpaceObject, KernelObjectHeader, MemoryObject, ObjectType, PagePool,
     };
     use crate::cap::retype::{dispatch_for, retype_allocate, retype_free};
     use crate::cap::slot::{AsRights, MemRights};
@@ -551,9 +551,7 @@ pub fn sys_cap_create_aspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 header: KernelObjectHeader::with_ancestor(ObjectType::AddressSpace, memory_obj_nn),
                 address_space: aspace_ptr,
                 pt_growth_budget_bytes: AtomicU64::new(0),
-                pt_pool_lock: AtomicU64::new(0),
-                pt_pool_head_phys: AtomicU64::new(0),
-                pt_chunks: vacant_chunk_slots(),
+                pt_pool: PagePool::new(),
                 deferred_next: core::ptr::null_mut(),
             },
         );
@@ -652,7 +650,7 @@ pub fn sys_cap_create_cspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     use crate::cap::alloc_cspace_id;
     use crate::cap::cspace::CSpace;
     use crate::cap::object::{
-        CSpaceKernelObject, KernelObjectHeader, MemoryObject, ObjectType, vacant_chunk_slots,
+        CSpaceKernelObject, KernelObjectHeader, MemoryObject, ObjectType, PagePool,
     };
     use crate::cap::retype::{dispatch_for, retype_allocate, retype_free};
     use crate::cap::slot::{CsRights, MemRights};
@@ -789,9 +787,7 @@ pub fn sys_cap_create_cspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 header: KernelObjectHeader::with_ancestor(ObjectType::CSpaceObj, memory_obj_nn),
                 cspace: cs_ptr,
                 cspace_growth_budget_bytes: AtomicU64::new(0),
-                cs_pool_lock: AtomicU64::new(0),
-                cs_pool_head_phys: AtomicU64::new(0),
-                cs_chunks: vacant_chunk_slots(),
+                cs_pool: PagePool::new(),
                 deferred_next: core::ptr::null_mut(),
             },
         );

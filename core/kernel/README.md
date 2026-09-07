@@ -130,8 +130,9 @@ address space objects. See [`docs/memory-internals.md`](docs/memory-internals.md
 The capability subsystem. `cspace.rs` implements per-process capability spaces.
 `slot.rs` defines the in-memory representation of a capability slot and its rights
 bitmask. `derivation.rs` maintains the global derivation tree used for revocation.
-`object.rs` defines the kernel object headers and wrappers and their allocation and
-teardown; `retype.rs` is the allocator that carves kernel objects out of Memory-cap
+`object.rs` defines the kernel object headers and wrappers, the page pools that back
+address-space page tables and CSpace slot pages, and their allocation and teardown;
+`retype.rs` is the allocator that carves kernel objects out of Memory-cap
 backing; `split.rs` is the tail shared by the range-capability split syscalls;
 `transfer.rs` moves a capability, with its derived children, to another slot in
 batches — the mechanism behind `SYS_CAP_MOVE` and IPC capability transfer.

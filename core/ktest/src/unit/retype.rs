@@ -927,7 +927,7 @@ pub fn cspace_dir_page_survives_failed_grow(ctx: &TestContext) -> TestResult
 pub fn cspace_augment_many(ctx: &TestContext) -> TestResult
 {
     const DONATIONS: u64 = 200;
-    // Donations 16 and 187 open the two record pages: the inline records
+    // Donations 16 and 186 open the two record pages: the inline records
     // hold the create-time slab plus fifteen donations, and a record page
     // holds 170 records, the first being its own donation.
     const RECORD_PAGES: u64 = 2;

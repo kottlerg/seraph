@@ -1009,13 +1009,21 @@ pub fn cspace_augment_many(ctx: &TestContext) -> TestResult
 /// The address-space pool spills its donation records the same way. Pages
 /// described by spilled records serve as page tables, and a reclaiming
 /// unmap recognises them as pool-owned through the record pages: the free
-/// list is LIFO, so a fresh mapping's intermediate tables come from the
-/// newest donations, which the second record page describes.
+/// list is LIFO, so fresh mappings draw first on the newest donations
+/// (described by the second record page) and, once those fourteen pages are
+/// used up, on donations the first record page describes — the walk from
+/// the newest record page to the older one. Every reclaimed table must be
+/// credited back, so the budget returns exactly to its post-donation value.
 pub fn aspace_augment_many(ctx: &TestContext) -> TestResult
 {
     const DONATIONS: u64 = 200;
     const RECORD_PAGES: u64 = 2;
     const SEEDED: u64 = DONATIONS - RECORD_PAGES;
+    // Each region at a 1 GiB stride costs at least two fresh intermediate
+    // tables in every paging mode, so twelve regions consume more than the
+    // fourteen pages the newest record page describes.
+    const REGIONS: u64 = 12;
+    const REGION_STRIDE: u64 = 1 << 30;
     let memory = ctx.memory_base;
 
     let baseline = cap_info(memory, CAP_INFO_MEMORY_AVAILABLE)
@@ -1034,9 +1042,31 @@ pub fn aspace_augment_many(ctx: &TestContext) -> TestResult
     }
     let budget = cap_info(aspace, CAP_INFO_ASPACE_PT_BUDGET).unwrap_or(u64::MAX);
 
-    let mapped = mem_map(memory, aspace, TEST_VA_BASE, 0, 1, MAP_WRITABLE).is_ok();
+    let mut map_failures = 0u32;
+    for i in 0..REGIONS
+    {
+        if mem_map(
+            memory,
+            aspace,
+            TEST_VA_BASE + i * REGION_STRIDE,
+            0,
+            1,
+            MAP_WRITABLE,
+        )
+        .is_err()
+        {
+            map_failures += 1;
+        }
+    }
     let after_map = cap_info(aspace, CAP_INFO_ASPACE_PT_BUDGET).unwrap_or(u64::MAX);
-    let reclaimed = mem_unmap_reclaim(aspace, TEST_VA_BASE, 1).is_ok();
+    let mut reclaim_failures = 0u32;
+    for i in 0..REGIONS
+    {
+        if mem_unmap_reclaim(aspace, TEST_VA_BASE + i * REGION_STRIDE, 1).is_err()
+        {
+            reclaim_failures += 1;
+        }
+    }
     let after_reclaim = cap_info(aspace, CAP_INFO_ASPACE_PT_BUDGET).unwrap_or(0);
 
     cap_delete(aspace).ok();
@@ -1053,14 +1083,16 @@ pub fn aspace_augment_many(ctx: &TestContext) -> TestResult
             "retype::aspace_augment_many: budget != donated pages minus the two record pages",
         );
     }
-    if !mapped || after_map >= budget
-    {
-        return Err("retype::aspace_augment_many: mapping did not draw page tables from the pool");
-    }
-    if !reclaimed || after_reclaim != budget
+    if map_failures != 0 || after_map > budget - 2 * REGIONS * 4096
     {
         return Err(
-            "retype::aspace_augment_many: reclaiming unmap did not credit spilled-record pages",
+            "retype::aspace_augment_many: mappings did not draw two tables per region from the pool",
+        );
+    }
+    if reclaim_failures != 0 || after_reclaim != budget
+    {
+        return Err(
+            "retype::aspace_augment_many: reclaiming unmaps did not credit every table back",
         );
     }
     if after != baseline

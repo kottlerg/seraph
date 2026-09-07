@@ -210,7 +210,6 @@ The following slab caches are registered during Phase 4 of initialization:
 | `notification_cache` | `Notification` |
 | `event_queue_cache` | `EventQueueHeader` |
 | `wait_set_cache` | `WaitSet` |
-| `address_space_cache` | `AddressSpace` |
 
 Object sizes are determined by the final struct layouts and are not part of the ABI.
 
@@ -294,9 +293,11 @@ pub struct AddressSpace
 
 ### Lifecycle
 
-1. **Creation** (`SYS_CAP_CREATE_ADDRESS_SPACE`): allocate a root page table frame,
-   zero it, map the kernel higher half (shared across all address spaces via a
-   shared PML4/root entry), allocate an `AddressSpace` from the slab cache.
+1. **Creation** (`SYS_CAP_CREATE_ADDRESS_SPACE`): carve a slab from the source
+   Memory cap; page 0 holds the wrapper object and the in-place `AddressSpace`,
+   page 1 the zeroed root page table with the kernel higher half mapped (shared
+   across all address spaces via a shared PML4/root entry), and the remaining
+   pages seed the page-table pool.
 
 2. **Use**: threads reference the `AddressSpace` via their TCB. When scheduled, the
    scheduler calls `arch::current::paging::activate(root_phys)` to switch the hardware
@@ -306,9 +307,10 @@ pub struct AddressSpace
    `pt_lock`, call `arch::current::paging::map_user_page`/`unmap_user_page`/
    `protect_user_page`, then perform TLB management (see TLB Management section below).
 
-4. **Destruction**: when the last capability to the address space is deleted, all
-   page table frames are freed to the buddy allocator and the `AddressSpace` object is
-   freed to the slab cache.
+4. **Destruction**: when the last capability to the address space is deleted, every
+   donation to its page-table pool — the create-time slab included, with the root
+   table and the `AddressSpace` itself — is returned to its source Memory cap
+   wholesale (see Page Table Node Tracking below).
 
 ### Fork-Like Operations
 

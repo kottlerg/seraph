@@ -397,8 +397,12 @@ pub fn sys_cap_create_notification(tf: &mut TrapFrame) -> Result<u64, SyscallErr
 /// derived copies handed to other components (e.g. memmgr) drop it via
 /// the `cap_derive` rights mask. Returns the new slot index.
 ///
-/// Augment-mode: pushes all carved pages onto the target AS's PT growth pool
-/// and increases its `pt_growth_budget_bytes`. Returns `0` on success.
+/// Augment-mode: seeds the carved pages onto the target AS's PT growth pool
+/// and credits `pt_growth_budget_bytes` with the pages seeded. Once the
+/// pool's inline donation records are full, one donation per record page
+/// keeps its first page as the kernel's donation bookkeeping and seeds
+/// `init_pages - 1` (see `PagePool::add_chunk`), so a one-page donation can
+/// leave the budget unchanged. Returns `0` on success.
 #[cfg(not(test))]
 #[allow(clippy::too_many_lines)]
 pub fn sys_cap_create_aspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
@@ -642,7 +646,10 @@ pub fn sys_cap_create_aspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 ///   [`CSpace::grow`](crate::cap::cspace::CSpace::grow) when the directory
 ///   needs another 56-slot leaf.
 ///
-/// Create-mode returns the new `CSpace` slot index. Augment-mode returns 0.
+/// Create-mode returns the new `CSpace` slot index. Augment-mode seeds the
+/// carved pages onto the slot-page pool and credits the budget with the
+/// pages seeded — one donation per record page keeps its first page as the
+/// kernel's donation bookkeeping (see `PagePool::add_chunk`) — and returns 0.
 #[cfg(not(test))]
 #[allow(clippy::too_many_lines)]
 pub fn sys_cap_create_cspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>

@@ -370,36 +370,40 @@ impl Heap {
         true
     }
 
-    /// `mem_map` wrapper that augments the AS's PT growth budget once on
+    /// `mem_map` wrapper that augments the AS's PT growth budget on
     /// `OutOfMemory` and retries.
     ///
     /// `mem_map` returns `OutOfMemory` (-8) when the destination AS's PT
     /// growth budget is exhausted (a new intermediate page-table page is
     /// needed but the budget has none). We acquire a fresh Memory cap from
     /// memmgr, augment the AS via `cap_create_aspace(memory_cap, self_aspace,
-    /// init_pages=2)`, and retry the map. One augment per failure; if the
-    /// retry also fails the caller treats the grow as failed.
+    /// init_pages=1)`, and retry the map. Up to two augments per call: the
+    /// kernel keeps a donation's first page as its own donation bookkeeping
+    /// once per record page, so one augment in that many seeds nothing and
+    /// the next one seeds. If the map still fails the caller treats the
+    /// grow as failed.
     fn mem_map_with_augment_retry(&self, memory_cap: u32, va: u64, pages: u64) -> bool {
         const SYSCALL_OUT_OF_MEMORY: i64 = -8;
-        match syscall::mem_map(memory_cap, self.self_aspace, va, 0, pages, MAP_WRITABLE) {
-            Ok(()) => return true,
-            Err(SYSCALL_OUT_OF_MEMORY) => { /* fall through to augment + retry */ }
-            Err(_) => return false,
-        }
-        // Augment: request 2 pages from memmgr, feed to cap_create_aspace
-        // in augment mode (target = self_aspace). One page covers ~511 new
-        // PT-entries' worth of mappable VA; the second keeps the donation
-        // useful when the kernel takes its first page for donation
-        // bookkeeping (once per record page). The AS's donation record
-        // holds its own ref on the augment's MemoryObject (`add_chunk` in
-        // `sys_cap_create_aspace`), so the slab machinery reclaims the
-        // source cap slot.
-        if object_slab_retype(2 * PAGE_SIZE, |aug| {
-            syscall::cap_create_aspace(aug, self.self_aspace, 2).ok()
-        })
-        .is_none()
-        {
-            return false;
+        const MAX_AUGMENTS: u32 = 2;
+        for _ in 0..MAX_AUGMENTS {
+            match syscall::mem_map(memory_cap, self.self_aspace, va, 0, pages, MAP_WRITABLE) {
+                Ok(()) => return true,
+                Err(SYSCALL_OUT_OF_MEMORY) => { /* fall through to augment + retry */ }
+                Err(_) => return false,
+            }
+            // Augment: request 1 page from memmgr, feed to cap_create_aspace
+            // in augment mode (target = self_aspace). Single page covers
+            // ~511 new PT-entries' worth of mappable VA. The AS's donation
+            // record holds its own ref on the augment's MemoryObject
+            // (`add_chunk` in `sys_cap_create_aspace`), so the slab
+            // machinery reclaims the source cap slot.
+            if object_slab_retype(PAGE_SIZE, |aug| {
+                syscall::cap_create_aspace(aug, self.self_aspace, 1).ok()
+            })
+            .is_none()
+            {
+                return false;
+            }
         }
         syscall::mem_map(memory_cap, self.self_aspace, va, 0, pages, MAP_WRITABLE).is_ok()
     }
@@ -1011,18 +1015,26 @@ pub fn fund_aspace_pt_budget(self_aspace: u32, region_pages: u64) -> bool {
     // the first few spawns. Funding only the shortfall (and nothing once the
     // budget already covers the region) keeps a spawn/join loop from leaking a
     // CSpace slot + PT pages on every spawn.
-    let have = syscall::cap_info(self_aspace, syscall_abi::CAP_INFO_ASPACE_PT_BUDGET).unwrap_or(0);
-    if have >= need_bytes {
-        return true;
+    // Up to two rounds: the kernel keeps a donation's first page as its own
+    // donation bookkeeping once per record page, so a round can leave the
+    // budget one page short of its request; the next round covers it.
+    const MAX_ROUNDS: u32 = 2;
+    let budget = || syscall::cap_info(self_aspace, syscall_abi::CAP_INFO_ASPACE_PT_BUDGET).unwrap_or(0);
+    for _ in 0..MAX_ROUNDS {
+        let have = budget();
+        if have >= need_bytes {
+            return true;
+        }
+        let shortfall_pages = (need_bytes - have).div_ceil(PAGE_SIZE).max(1);
+        if object_slab_retype(shortfall_pages * PAGE_SIZE, |frame| {
+            syscall::cap_create_aspace(frame, self_aspace, shortfall_pages).ok()
+        })
+        .is_none()
+        {
+            return false;
+        }
     }
-    // One extra page: the kernel may take a donation's first page for its
-    // donation bookkeeping (once per record page), seeding one fewer.
-    let shortfall_pages = (need_bytes - have).div_ceil(PAGE_SIZE).max(1) + 1;
-
-    object_slab_retype(shortfall_pages * PAGE_SIZE, |frame| {
-        syscall::cap_create_aspace(frame, self_aspace, shortfall_pages).ok()
-    })
-    .is_some()
+    budget() >= need_bytes
 }
 
 /// Abort the calling thread via `SYS_THREAD_EXIT`. Used as the allocation-

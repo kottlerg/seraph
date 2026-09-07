@@ -161,9 +161,15 @@ budget reported by `SYS_CAP_INFO` is authoritative.
 
 Teardown walks the record pages newest first, returning each page's other
 records before its record 0 (whose donation holds the page), then the
-inline records, the create-time slab last. Region reclaim in an address
-space checks a page-table page against the records — inline and spilled —
-before returning it to the pool, so only pool-owned pages re-enter it.
+inline records, the create-time slab last. A donation's Memory object that
+reaches zero there is reclaimed through its own nested cascade, not the
+bounded worklist the dealloc cascade otherwise uses, since the number of
+donations is unbounded. Region reclaim in an address space checks a
+page-table page against the records — inline and spilled — before
+returning it to the pool, so only pool-owned pages re-enter it; that check
+is a linear scan under the pool lock, inline records then record pages
+newest first, whose cost grows with the owner's own donation count and is
+confined to the owner's lock.
 
 ---
 
@@ -791,4 +797,6 @@ CSpace. The kernel clears the per-thread reply slot after `SYS_IPC_REPLY`.
 
 [kernel/README.md](../README.md),
 [docs/capability-model.md](../../../docs/capability-model.md),
-[docs/ipc-design.md](../../../docs/ipc-design.md)
+[docs/ipc-design.md](../../../docs/ipc-design.md),
+[kernel/docs/syscalls.md](syscalls.md),
+[kernel/docs/memory-internals.md](memory-internals.md)

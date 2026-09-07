@@ -812,8 +812,9 @@ impl AddressSpace
         crate::percpu::preempt_disable();
         self.pt_lock();
 
-        // Clear every leaf in the span and free each now-empty, aso-owned
-        // intermediate table back to the pool.
+        // Clear every leaf in the span and free each now-empty intermediate
+        // table whose parent entry carries the pooled-table bit back to the
+        // pool.
         // SAFETY: root_virt is valid; aso wraps this AS; the span is user-range
         // (caller's contract); pt_lock is held.
         let freed = unsafe { unmap_user_region_pooled(self.root_virt, virt_base, page_count, aso) };

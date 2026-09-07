@@ -148,34 +148,28 @@ Emit "fatal: cannot build kernel page tables (OOM)" and halt.
 
 ---
 
-## Phase 4: Slab Allocator and Kernel Heap
+## Phase 4: Typed-Memory Cap Surface
 
 ```
-1. Initialise the general size-class allocator:
-   - Bins at power-of-two sizes (exact range determined at implementation time)
-   - Each bin backed by slab pages from the buddy allocator on demand
-2. Register slab caches for core kernel objects:
-   - CapabilitySlot (fixed size)
-   - ThreadControlBlock (fixed size)
-   - Endpoint (fixed size)
-   - Notification (fixed size)
-   - EventQueue header (fixed size; ring buffer body from size-class allocator)
-   - WaitSet (fixed size)
-3. Install the kernel allocator (implements the `GlobalAlloc` trait via the
-   size-class path; used by any `alloc::*` usage in the kernel)
-4. Emit: "kernel heap active"
-5. Allocate per-CPU subsystem storage from the buddy allocator while it still
+1. No kernel heap is set up: the kernel runs no `GlobalAlloc`, and every
+   kernel-object body is carved out of a Memory capability by retype
+   (`cap/retype.rs`) — the SEED reserve for the kernel's own objects from
+   Phase 7 on, a caller-supplied capability at each `cap_create_*` syscall.
+   The phase carries no setup cost; the machinery is live once `SEED_FRAME`
+   is installed in Phase 7.
+2. Emit: "Phase 4: Typed-Memory Cap Surface (no kernel heap)"
+3. Cache the bootloader-discovered kernel MMIO bases from `BootInfo` for
+   Phase 5 (`platform::capture_kernel_mmio`)
+4. Allocate per-CPU subsystem storage from the buddy allocator while it still
    holds large contiguous blocks (before the Phase-7 user-cap drain): scheduler
    per-CPU state and idle stacks, and the entropy subsystem's per-CPU CSPRNGs,
    central pool, and jitter accumulators (see entropy.md)
 ```
 
-After this phase, `Box`, `Vec`, and other heap types work in kernel code.
+**Failure mode:** a failed per-CPU storage allocation halts the kernel.
 
-**Failure mode:** If slab initialisation fails to allocate its first backing pages,
-halt with "fatal: cannot initialise kernel heap".
-
-**Completion criterion:** The kernel allocator is active and `alloc::boxed::Box`
+**Completion criterion:** per-CPU storage is allocated; there is no kernel
+allocator to activate.
 allocations succeed.
 
 ---
@@ -499,7 +493,7 @@ that CPU only; the BSP and other CPUs continue.
 | 1 | Early console | Non-fatal (continues silently) |
 | 2 | Buddy allocator from memory map | Halt: no usable RAM |
 | 3 | Kernel page tables + direct map | Halt: OOM during PT construction |
-| 4 | Slab allocator + kernel heap | Halt: cannot init heap |
+| 4 | Typed-memory cap surface; per-CPU storage | Halt: per-CPU storage allocation failed |
 | 5 | CPU hardware (IDT/GDT/TSS/stvec); seed entropy pool | Halt: missing required feature |
 | 6 | Platform resource validation | Halt if entries pointer is null with non-zero count; bad entries skipped |
 | 7 | Capability system + root CSpace | Halt: OOM |

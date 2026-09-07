@@ -74,7 +74,9 @@ Addresses cross this boundary as raw `u64`. Page-permission and page-table-rewri
 
 Manages hardware page tables. A page table is referenced by its physical root frame
 (`root_phys`) and a direct-map virtual alias (`root_virt`) — not an owned table object;
-intermediate frames are allocated from and returned to the kernel page-table pool.
+intermediate frames come from the kernel page-table pool on the kernel-direct path and
+from the address-space object's own pool on the pooled path, and only the latter takes
+them back, through a reclaiming unmap.
 
 ```rust
 /// Install `root_phys` as the active page table for the current CPU with a full
@@ -133,7 +135,7 @@ pub unsafe fn map_user_page(
 ) -> Result<MapOutcome, ()>;
 
 /// As `map_user_page`, but draws intermediate page-table frames from the
-/// address-space object's reserved pool rather than the global allocator.
+/// address-space object's own pool rather than the kernel page-table pool.
 pub unsafe fn map_user_page_pooled(
     root_virt: u64,
     virt: u64,
@@ -152,14 +154,23 @@ pub unsafe fn protect_user_page(
 /// Remove the user mapping for `virt`. The caller must invalidate the TLB.
 pub unsafe fn unmap_user_page(root_virt: u64, virt: u64);
 
+/// Clear every 4 KiB leaf in `[virt_base, virt_base + page_count * 4 KiB)` and
+/// free each intermediate table the span leaves empty back to `aso`'s pool —
+/// only a table whose parent entry carries the pooled-table bit the pooled map
+/// path set when it installed the table. Returns the number of tables freed.
+/// The caller holds the address space's `pt_lock` and performs the shootdown.
+pub unsafe fn unmap_user_region_pooled(
+    root_virt: u64,
+    virt_base: u64,
+    page_count: usize,
+    aso: &AddressSpaceObject,
+) -> usize;
+
 /// Walk the user tables and return `(phys, flags_word)` mapped at `virt`, or
 /// None if unmapped. RISC-V decodes Svnapot 64 KiB group members internally,
 /// so `phys` is always the exact per-page frame; the raw flags word may carry
 /// the N bit.
 pub unsafe fn translate_user_page(root_virt: u64, virt: u64) -> Option<(u64, u64)>;
-
-/// Free all user page-table frames for the address space rooted at `root_virt`.
-pub unsafe fn free_user_page_tables(root_virt: u64);
 
 /// Invalidate the local-CPU TLB entry for a single virtual address
 /// (x86-64 `invlpg`; RISC-V `sfence.vma virt`).
@@ -611,7 +622,7 @@ pub fn platform::console_mmio() -> Option<(u64, u64)>;
 **Architecture-neutral** (lives in `mm/`, `cap/`, `ipc/`, `sched/`, `syscall/`):
 
 - Buddy allocator algorithm and zone management
-- Slab allocator and size-class allocator
+- Retype allocator and the page pools behind address spaces and CSpaces
 - CSpace slot storage, lookup, and growth
 - Capability derivation tree and revocation algorithm
 - Endpoint, notification, event queue, and wait set objects

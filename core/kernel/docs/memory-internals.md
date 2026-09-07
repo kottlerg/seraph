@@ -519,7 +519,7 @@ does not walk the tables: the wrapper returns every donation wholesale to its
 source Memory cap, which reclaims the pool-drawn nodes with it, and the root
 table goes with the create-time slab. Kernel-direct nodes are not returned to
 the kernel page-table pool by destruction; only init's bootstrap space holds
-any, and it is never destroyed. See
+any, nothing destroys it today, and destroying it would strand them. See
 [capability-internals.md](capability-internals.md#page-pools-capobjectrs)
 for the donation-record mechanism.
 

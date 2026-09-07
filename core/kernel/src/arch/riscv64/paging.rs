@@ -1107,7 +1107,7 @@ pub unsafe fn unmap_user_region_pooled(
 
 /// Clear every in-range leaf PTE of `[lo, hi)` under `table` (a table at
 /// `level`), then free each child table the clear left empty — gated on
-/// emptiness and `aso` ownership as documented on
+/// emptiness and the parent entry's [`POOLED_TABLE`] bit as documented on
 /// [`unmap_user_region_pooled`]. The frame holding `table` itself is left to
 /// the caller (the root call's frame is never freed). Bounded recursion:
 /// `level <= 4`.

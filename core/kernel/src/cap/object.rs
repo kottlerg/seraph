@@ -890,10 +890,11 @@ impl PagePool
     /// records, snapshotted up front, with record 0 (the create-time slab
     /// that holds the owner and this pool) last. The walk is linear in the
     /// donation count and runs to completion in whichever context drops the
-    /// last capability: the deleting syscall, with interrupts masked, or the
-    /// idle thread's deferred reclaim when the deleting thread was bound to
-    /// the object; an owner that donated finely pays for it at teardown (see
-    /// capability-internals § Page Pools).
+    /// last reference: the deleting syscall, with interrupts masked, or —
+    /// for an owner handed to the deferred-reclaim stack — the next syscall
+    /// epilogue on that CPU or the idle thread's drain; an owner that
+    /// donated finely pays for it at teardown (see capability-internals §
+    /// Page Pools).
     ///
     /// # Safety
     /// The owner is being torn down at refcount 0: no other reference to
@@ -922,8 +923,9 @@ impl PagePool
             // record 0 is freed below, after every read of it.
             let (next, used) = unsafe { ((*page).next_phys, (*page).used) };
             debug_assert!((1..=CHUNK_RECORDS_PER_PAGE).contains(&used));
-            // The page is trusted kernel state, but a length read from
-            // donated memory stays within the page in every build.
+            // The page is trusted kernel state, and a corrupt record is not
+            // survivable; the count is clamped anyway so that a corrupt
+            // count cannot read past the page in a release build.
             let used = used.min(CHUNK_RECORDS_PER_PAGE);
             for i in 1..used
             {

@@ -148,8 +148,9 @@ The wrapper object that owns a `CSpace` (`CSpaceKernelObject`) keeps the
 slot-page pool in a `PagePool`; the wrapper of an `AddressSpace` keeps its
 intermediate page-table pool in the same type. A pool is an intrusive free
 list of the donated pages (each free page's first word links the next) plus
-a record of every donation — its source Memory object, byte offset, and
-page count — so teardown can return each donation to its source wholesale.
+a record of every donation (a *chunk* in the code) — its source Memory
+object, byte offset, and page count — so teardown can return each donation
+to its source wholesale.
 The wrapper, not the pool, keeps the byte budget the pool backs.
 
 ### Donation Records
@@ -183,16 +184,19 @@ bounded worklist the dealloc cascade otherwise uses, since the number of
 donations is unbounded.
 
 The walk costs one `retype_free` per donation and runs to completion in
-whichever context drops the last capability: inside the deleting syscall,
-with interrupts masked on that CPU, or — when the deleting thread was
-itself bound to the object — in the idle thread's deferred reclaim, with
-interrupts enabled but that CPU's idle drain occupied for the walk's
-length (scheduling-internals § Bare spin locks). So an owner's teardown
-latency scales with how finely it donated: the same memory donated as
-single pages costs one return per page, and the sixteen-donation cap that
-used to bound this window is gone. The standard runtime donates one page
-per page-table shortfall, so a process's count is its page-table page
-count, of the order of one per 2 MiB of mapped span.
+whichever context drops the last reference: the deleting syscall, with
+interrupts masked on that CPU; or, when the owner is handed to the per-CPU
+deferred-reclaim stack — a thread deleting an object it is itself bound
+to, or the batched capability move releasing any `CSpace` or
+`AddressSpace` — the next syscall epilogue on that CPU, with interrupts
+masked, or the idle thread's drain, with interrupts enabled
+(scheduling-internals § Bare spin locks). So an owner's teardown latency
+scales with how finely it donated, and can land on an unrelated thread's
+syscall: the same memory donated as single pages costs one return per
+page, and the sixteen-donation cap that used to bound this window is
+gone. The standard runtime donates one page per page-table shortfall, so
+a process's count is its page-table page count, of the order of one per
+2 MiB of mapped span.
 
 ---
 

@@ -11,12 +11,12 @@
 //! builds init's (or ktest's) boot address space — ELF segments, stack,
 //! and `InitInfo` — which calls `map_page` directly, before any userspace
 //! runs. `sys_mmio_map` / `sys_mem_map` also fall back here, but only for
-//! an address space with no retype-backed PT chunk; every address space
-//! the boot actually creates is seeded with a chunk (`boot_retype_aspace`
+//! an address space with no recorded donation; every address space the
+//! boot actually creates records its create-time slab (`boot_retype_aspace`
 //! for the boot AS, `sys_cap_create_aspace` for services), so those
 //! syscalls take the pooled path and fund their own intermediate PT pages
 //! from the AS's own growth pool. The fallback is the safety net for the
-//! chunk-less case, not a routine path.
+//! donation-less case, not a routine path.
 //!
 //! Pages are seeded once during Phase 7 — `POOL_SEED_PAGES` allocated from the
 //! pristine buddy before the user-cap drain — threaded onto an intrusive
@@ -178,9 +178,6 @@ pub(crate) fn alloc_pt_page() -> Option<u64>
 {
     None
 }
-#[cfg(test)]
-#[allow(dead_code)]
-pub(crate) fn free_pt_page(_pa: u64) {}
 #[cfg(test)]
 #[allow(dead_code)]
 pub(crate) fn remaining_pages() -> usize

@@ -310,7 +310,7 @@ pub struct AddressSpace
 4. **Destruction**: when the last capability to the address space is deleted, every
    donation to its page-table pool — the create-time slab included, with the root
    table and the `AddressSpace` itself — is returned to its source Memory cap
-   wholesale (see Page Table Node Tracking below).
+   wholesale (see Page Table Node Ownership below).
 
 ### Fork-Like Operations
 
@@ -494,7 +494,7 @@ in `SYS_CAP_CREATE_THREAD` for user-created threads.
 
 ---
 
-## Page Table Node Tracking
+## Page Table Node Ownership
 
 Intermediate page table nodes (PML3/PML2/PML1 on x86-64; every level below
 the root on RISC-V — two to four of them depending on the negotiated paging

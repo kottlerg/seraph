@@ -377,8 +377,8 @@ impl Heap {
     /// growth budget is exhausted (a new intermediate page-table page is
     /// needed but the budget has none). We acquire a fresh Memory cap from
     /// memmgr, augment the AS via `cap_create_aspace(memory_cap, self_aspace,
-    /// init_pages=1)`, and retry the map, up to [`PT_FUND_ROUNDS`] times. If
-    /// the map still fails the caller treats the grow as failed.
+    /// init_pages=1)`, and retry the map — augmenting up to [`PT_FUND_ROUNDS`]
+    /// times. If the map still fails the caller treats the grow as failed.
     fn mem_map_with_augment_retry(&self, memory_cap: u32, va: u64, pages: u64) -> bool {
         const SYSCALL_OUT_OF_MEMORY: i64 = -8;
         for _ in 0..PT_FUND_ROUNDS {
@@ -687,15 +687,6 @@ pub fn slab_request_pages(memmgr_ep: u32, min_pages: u64) -> Option<(u32, u64, u
     Some((caps[0], reply.word(1), reply.word(1 + returned)))
 }
 
-/// Augment rounds a page-table funding path may make before giving up.
-///
-/// The kernel keeps a donation's first page as its own donation bookkeeping
-/// once per record page (see `SYS_CAP_CREATE_ADDRESS_SPACE`), so a single
-/// donation can seed one page fewer than it carried. A record page opened by
-/// one round has room for the next round's record, so two consecutive short
-/// seeds are impossible and a second round always covers the shortfall.
-pub const PT_FUND_ROUNDS: u32 = 2;
-
 /// Bytes withheld from a fresh grant's local ledger as slack against any
 /// kernel-side retype cost the mirror does not model. The kernel debits
 /// exactly the class-rounded dispatch cost, so this is conservative; the
@@ -989,6 +980,15 @@ pub fn memmgr_query_free_bytes() -> Option<u64> {
     }
     Some(reply.word(3))
 }
+
+/// Augment rounds a page-table funding path may make before giving up.
+///
+/// The kernel keeps a donation's first page as its own donation bookkeeping
+/// once per record page (see `SYS_CAP_CREATE_ADDRESS_SPACE`), so a single
+/// donation can seed one page fewer than it carried. A record page opened by
+/// one round has room for the next round's record, so two consecutive short
+/// seeds are impossible and a second round always covers the shortfall.
+pub const PT_FUND_ROUNDS: u32 = 2;
 
 /// Fund `self_aspace`'s page-table growth budget to cover mapping a
 /// `region_pages`-page foreign-frame region (MMIO, DMA) into a

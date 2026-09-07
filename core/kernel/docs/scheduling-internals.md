@@ -104,7 +104,7 @@ hang). See § Thread Registry.
 **Bare spin locks (MUST).** The derivation tree lock
 (`cap::derivation::DERIVATION_LOCK`), the per-`MemoryObject` reader-writer
 lock, the per-`MemoryObject` retype-allocator lock, the `CSpace` and
-`AddressSpace` wrapper pool locks (`cap::object::PagePool`), and the
+`AddressSpace` wrapper pool locks (`cap::object::PagePool::lock`), and the
 kernel page-table pool lock (`mm::kernel_pt_pool`) are CAS spin locks that
 do not mask interrupts themselves. A holder is never descheduled, because no
 context that takes one can be descheduled: syscall context, where

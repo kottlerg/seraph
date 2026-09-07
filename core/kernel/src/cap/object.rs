@@ -25,7 +25,7 @@
 //! object in place, and call `retype_free` against the ancestor
 //! `MemoryObject`; every object has one.
 //!
-//! ## Sizes (verified by tests below)
+//! ## Sizes (on the 64-bit targets; the wrapper-page fits are compile-asserted)
 //!
 //! | Type                | Size  |
 //! |---------------------|-------|
@@ -37,8 +37,8 @@
 //! | SchedControlObject  | 24 B  |
 //! | SbiControlObject    | 16 B  |
 //! | ThreadObject        | 32 B  |
-//! | AddressSpaceObject  | 432 B |
-//! | CSpaceKernelObject  | 432 B |
+//! | AddressSpaceObject  | 448 B |
+//! | CSpaceKernelObject  | 448 B |
 //! | EndpointObject      | 24 B  |
 //! | NotificationObject        | 24 B  |
 //! | EventQueueObject    | 24 B  |
@@ -580,6 +580,10 @@ impl ChunkRecord
     };
 }
 
+/// Pages `PagePool::add_chunk` seeds onto the free list per pool-lock hold,
+/// bounding the hold for a donation of any size.
+const SEED_BATCH_PAGES: u64 = 64;
+
 /// Bytes of `ChunkRecordPage` ahead of its records: `next_phys` and `used`.
 const RECORD_PAGE_HEADER: usize = 2 * core::mem::size_of::<u64>();
 
@@ -732,6 +736,10 @@ impl PagePool
             page_count: total_pages,
         };
 
+        // The record is written and the first batch of pages seeded under
+        // one hold; further pages go in batches under fresh holds, so the
+        // hold time is bounded by SEED_BATCH_PAGES whatever the donation's
+        // size. Every seeded page belongs to the already-written record.
         pool_lock(&self.lock);
         let vacant = self
             .inline
@@ -766,13 +774,24 @@ impl PagePool
 
         // Push in reverse so the lowest address ends up at the head of the
         // free list (purely cosmetic).
-        for i in (first_pool..total_pages).rev()
+        let mut next = total_pages;
+        loop
         {
-            // SAFETY: lock held; the page was just retyped from `ancestor`
-            // and is unaliased.
-            unsafe { pool_push(&self.head_phys, chunk_phys + i * p) };
+            let batch_end = next;
+            next = next.saturating_sub(SEED_BATCH_PAGES).max(first_pool);
+            for i in (next..batch_end).rev()
+            {
+                // SAFETY: lock held; the page was just retyped from
+                // `ancestor` and is unaliased.
+                unsafe { pool_push(&self.head_phys, chunk_phys + i * p) };
+            }
+            pool_unlock(&self.lock);
+            if next == first_pool
+            {
+                break;
+            }
+            pool_lock(&self.lock);
         }
-        pool_unlock(&self.lock);
         Ok(total_pages - first_pool)
     }
 
@@ -837,10 +856,9 @@ impl PagePool
     /// # Safety
     /// The owner is being torn down at refcount 0: no other reference to
     /// it, the pool, or any recorded page exists, and `free` must not touch
-    /// the pool. `self` is dangling once this returns. `free` is a safe
-    /// callback only because the bound cannot carry `unsafe`; it acts on
-    /// the raw records under this function's contract and may run a full
-    /// nested object teardown, so the caller must hold no lock.
+    /// the pool. `self` is dangling once this returns. `free` receives raw
+    /// records and may run a full nested object teardown, so the caller
+    /// must hold no lock.
     #[cfg(not(test))]
     unsafe fn reclaim_chunks<F>(&self, mut free: F)
     where
@@ -1584,8 +1602,13 @@ unsafe fn dealloc_object_one(
     /// worklist: a pool may hold any number of donations, each from a
     /// distinct Memory object, and the worklist is bounded. The nested call
     /// is the same re-entry the `CSpaceObj` arm already makes for the
-    /// objects its slots reference, and runs with no lock held.
-    fn free_chunk(anc_ptr: *mut KernelObjectHeader, off: u64, pages: u64)
+    /// objects its slots reference.
+    ///
+    /// # Safety
+    /// `(anc_ptr, off, pages)` must be a donation record handed out by
+    /// `PagePool::reclaim_chunks` under that function's contract, and the
+    /// caller must hold no lock: the nested cascade takes its own.
+    unsafe fn free_chunk(anc_ptr: *mut KernelObjectHeader, off: u64, pages: u64)
     {
         // SAFETY: anc_ptr was set at chunk recording from a live
         // MemoryObject's header; the inc_ref then is matched by the
@@ -2499,7 +2522,7 @@ unsafe fn dealloc_object_one(
 
                 debug_assert!(
                     obj.pt_pool.retype_backed(),
-                    "dealloc AddressSpace: heap-backed AS reached typed-memory dealloc path"
+                    "dealloc AddressSpace: donation-less AS reached typed-memory dealloc path"
                 );
 
                 // Return this space's hardware tag (PCID/ASID) to the pool, if
@@ -2525,10 +2548,14 @@ unsafe fn dealloc_object_one(
 
                 // Return every donation, the create-time slab (holding the
                 // wrapper and this pool) last; `obj` is dangling afterwards.
-                // SAFETY: refcount 0, no slot references the object, and
-                // the in-place AddressSpace has been dropped; free_chunk
+                // SAFETY: refcount 0, no slot references the object, the
+                // in-place AddressSpace has been dropped, and no lock is
+                // held; free_chunk receives reclaim_chunks' records and
                 // never touches the pool.
-                unsafe { obj.pt_pool.reclaim_chunks(free_chunk) };
+                unsafe {
+                    obj.pt_pool
+                        .reclaim_chunks(|anc, off, pages| free_chunk(anc, off, pages));
+                }
             }
 
             // No separate `Box::from_raw(obj)` — the wrapper lives inside
@@ -2561,7 +2588,7 @@ unsafe fn dealloc_object_one(
 
             debug_assert!(
                 obj.cs_pool.retype_backed(),
-                "dealloc CSpaceObj: heap-backed CSpace reached typed-memory dealloc path"
+                "dealloc CSpaceObj: donation-less CSpace reached typed-memory dealloc path"
             );
 
             // Captured for the final `free_cspace_id` after the lock release;
@@ -2673,10 +2700,14 @@ unsafe fn dealloc_object_one(
 
             // Return every donation, the create-time slab (holding the
             // wrapper and this pool) last; `obj` is dangling afterwards.
-            // SAFETY: refcount 0, no slot references the object, and the
-            // in-place CSpace has been dropped; free_chunk never touches
+            // SAFETY: refcount 0, no slot references the object, the
+            // in-place CSpace has been dropped, and no lock is held;
+            // free_chunk receives reclaim_chunks' records and never touches
             // the pool.
-            unsafe { obj.cs_pool.reclaim_chunks(free_chunk) };
+            unsafe {
+                obj.cs_pool
+                    .reclaim_chunks(|anc, off, pages| free_chunk(anc, off, pages));
+            }
 
             // Recycle the id last, after all of the dying CSpace's storage
             // is reclaimed and DERIVATION_LOCK is released. Randomizing the

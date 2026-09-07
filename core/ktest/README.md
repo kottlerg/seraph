@@ -43,7 +43,7 @@ kernel's own source layout.
 |---|---|
 | `cap.rs` | `SYS_CAP_CREATE_*`, `CAP_COPY`, `CAP_MOVE`, `CAP_INSERT`, `CAP_DERIVE`, `CAP_DERIVE_BADGE`, `CAP_REVOKE`, `CAP_DELETE` |
 | `cap_info.rs` | `SYS_CAP_INFO` (tag, rights, type-specific fields) |
-| `retype.rs` | Retype primitive: CSpace/AddressSpace augmentation (including unbounded donation counts), page-table walk budget, kernel PT pool consumption |
+| `retype.rs` | Retype primitive: augmentation and donation spill, PT walk budget, kernel PT pool |
 | `mm.rs` | `SYS_MEM_MAP/UNMAP/PROTECT`, `SYS_MEMORY_SPLIT`, `SYS_ASPACE_QUERY` |
 | `notification.rs` | `SYS_NOTIFICATION_SEND`, `SYS_NOTIFICATION_WAIT` (blocking and `notification_wait_timeout`) |
 | `event.rs` | `SYS_EVENT_POST`, `SYS_EVENT_RECV` (blocking, `try_recv`, timeout) |

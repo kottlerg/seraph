@@ -990,9 +990,7 @@ pub fn cspace_augment_many(ctx: &TestContext) -> TestResult
     }
     if budget != SEEDED * PAGE
     {
-        return Err(
-            "retype::cspace_augment_many: budget != donated pages minus the two record pages",
-        );
+        return Err("retype::cspace_augment_many: budget != donations minus the two record pages");
     }
     if copies != expected_copies || terminal != SYS_OUT_OF_MEMORY
     {
@@ -1080,9 +1078,7 @@ pub fn aspace_augment_many(ctx: &TestContext) -> TestResult
     }
     if budget != SEEDED * PAGE
     {
-        return Err(
-            "retype::aspace_augment_many: budget != donated pages minus the two record pages",
-        );
+        return Err("retype::aspace_augment_many: budget != donations minus the two record pages");
     }
     if map_failures != 0 || after_map > budget - 2 * REGIONS * PAGE
     {

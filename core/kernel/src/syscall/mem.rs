@@ -183,9 +183,8 @@ pub fn sys_mem_map(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     };
 
     // Choose the PT-page source. A retype-backed AS pulls intermediate PT
-    // pages from its own growth pool; the heap-backed bootstrap AS (or any
-    // other AS without a recorded donation) falls back to the kernel PT
-    // pool (`kernel_pt_pool`) via `map_page`.
+    // pages from its own growth pool; an AS without a recorded donation
+    // falls back to the kernel PT pool (`kernel_pt_pool`) via `map_page`.
     // SAFETY: aso_raw is non-null and valid for the lifetime of the cap.
     let pooled = unsafe { (*aso_raw).pt_pool.retype_backed() };
 

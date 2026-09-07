@@ -305,7 +305,7 @@ a caller is pending — the data-path errors above included — consumes the
 pending reply and wakes the caller with the `IPC_REPLY_TRANSFER_FAILED` label
 and zero caps while the server receives the error. A fault reply skips
 payload and cap processing entirely: the label alone carries the disposition
-(see [fault-handling.md](../../docs/fault-handling.md)).
+(see [fault-handling.md](../../../docs/fault-handling.md)).
 
 ---
 

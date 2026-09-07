@@ -1082,9 +1082,7 @@ pub fn aspace_augment_many(ctx: &TestContext) -> TestResult
     }
     if map_failures != 0 || after_map > budget - 2 * REGIONS * PAGE
     {
-        return Err(
-            "retype::aspace_augment_many: mappings did not draw two tables per region from the pool",
-        );
+        return Err("retype::aspace_augment_many: mappings did not draw two tables per region");
     }
     if reclaim_failures != 0 || after_reclaim != budget
     {

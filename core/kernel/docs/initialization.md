@@ -405,12 +405,12 @@ calls `sched::enter()`.
       entry point, then seal PT_GNU_RELRO: writable segments covered by
       the relro range flip to Read (splitting at the range end if it
       lands mid-segment). Logged as "init: PIE bias=0x… (N relocations)".
-2. Create the init address space (AddressSpace::new_user):
-   a. Allocate a new root page table frame from the buddy allocator
-   b. Zero the frame
-   c. Copy kernel root entries 256–511 (the kernel half in every paging
-      mode) from the active root so the kernel
-      remains reachable from init's address space
+2. Create the init address space (`boot_retype_aspace`): carve a slab from
+   the SEED Memory cap; page 0 holds the wrapper object and the in-place
+   `AddressSpace`, page 1 the zeroed root page table with kernel root
+   entries 256–511 (the kernel half in every paging mode) copied from the
+   active root so the kernel remains reachable from init's address space,
+   and the remaining pages seed the space's page-table pool
 3. Map init segments into the init address space:
    a. For each InitSegment in init_image.segments[0..segment_count]:
       - Align virt_addr and phys_addr to page boundaries before mapping

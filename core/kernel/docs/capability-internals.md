@@ -5,11 +5,13 @@ capability types, rights, derivation, revocation, and transfer semantics — is
 specified in [docs/capability-model.md](../../../docs/capability-model.md). This document
 covers the data structures and algorithms that realise those semantics.
 
-The capability subsystem comprises three components:
+The capability subsystem comprises four components:
 
 1. **CSpace** — per-process capability space (slot storage and lookup)
 2. **Capability slot** — in-memory representation of one capability
 3. **Derivation tree** — cross-process tree for revocation
+4. **Page pools** — the donated pages behind a CSpace's slots and an address
+   space's page tables, and the record of every donation
 
 ---
 
@@ -166,7 +168,13 @@ records before its record 0 (whose donation holds the page), then the
 inline records, the create-time slab last. A donation's Memory object that
 reaches zero there is reclaimed through its own nested cascade, not the
 bounded worklist the dealloc cascade otherwise uses, since the number of
-donations is unbounded. The records are never scanned while the owner is
+donations is unbounded. The walk costs one `retype_free` per donation and
+runs to completion inside the deleting syscall, so an owner's teardown
+latency scales with how finely it donated: the same memory donated as
+single pages costs one return per page, and the sixteen-donation cap that
+used to bound this is gone. The standard runtime donates one page per
+page-table shortfall, so a process's count is its page-table page count,
+of the order of one per 2 MiB of mapped span. The records are never scanned while the owner is
 live: an address space's reclaiming unmap recognises pool-owned page
 tables by a bit in the parent entry, not by the records — see
 [memory-internals.md](memory-internals.md) § Page Table Node Ownership.

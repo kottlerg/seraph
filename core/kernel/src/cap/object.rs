@@ -580,10 +580,11 @@ impl ChunkRecord
     };
 }
 
-/// Pages `PagePool::seed_pages` pushes per pool-lock hold, keeping each hold
-/// short for a donation of any size (scheduling-internals § Lock Hierarchy);
-/// the interrupts-off window of the syscall that seeds a large donation is
-/// the sum of its batches and is not bounded here.
+/// Pages `PagePool::seed_pages` pushes per pool-lock hold. The bare pool lock
+/// has no documented hold-time target, but a hold proportional to a
+/// caller-chosen donation size would be unbounded; batching keeps every
+/// hold to this many pushes. The interrupts-off window of the syscall that
+/// seeds a large donation is the sum of its batches and is not bounded here.
 const SEED_BATCH_PAGES: u64 = 64;
 
 /// Bytes of `ChunkRecordPage` ahead of its records: `next_phys` and `used`.
@@ -878,7 +879,10 @@ impl PagePool
     /// used: spilled records newest page first and, within a page, records
     /// `1..` before record 0 (whose chunk holds the page); then the inline
     /// records, snapshotted up front, with record 0 (the create-time slab
-    /// that holds the owner and this pool) last.
+    /// that holds the owner and this pool) last. The walk is linear in the
+    /// donation count and runs to completion in the caller's context; an
+    /// owner that donated finely pays for it at teardown (see
+    /// capability-internals § Page Pools).
     ///
     /// # Safety
     /// The owner is being torn down at refcount 0: no other reference to

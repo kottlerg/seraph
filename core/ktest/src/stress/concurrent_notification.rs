@@ -33,6 +33,21 @@ const fn sender_bits() -> [u64; NUM_SENDERS]
 const SENDER_BITS: [u64; NUM_SENDERS] = sender_bits();
 const ALL_BITS: u64 = u64::MAX;
 
+/// Per-sender arguments, handed to `sender_entry` by address.
+#[derive(Clone, Copy)]
+struct SenderArgs
+{
+    target: u32,
+    done: u32,
+    bit_index: usize,
+}
+
+static SENDER_ARGS: spawn::ArgBlock<SenderArgs, NUM_SENDERS> = spawn::ArgBlock::new(SenderArgs {
+    target: 0,
+    done: 0,
+    bit_index: 0,
+});
+
 pub fn run(ctx: &TestContext) -> TestResult
 {
     let target = cap_create_notification(ctx.memory_base)
@@ -54,8 +69,18 @@ pub fn run(ctx: &TestContext) -> TestResult
         let child_done = cap_copy(done, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
             .map_err(|_| "concurrent_notification: cap_copy done failed")?;
 
-        // Pack: bits[15:0]=target_slot, bits[31:16]=done_slot, bits[47:32]=bit_index
-        let arg = u64::from(child_target) | (u64::from(child_done) << 16) | ((i as u64) << 32);
+        // SAFETY: sender `i` has not been started yet; the block is reused
+        // only after every sender has been reaped.
+        let arg = unsafe {
+            SENDER_ARGS.publish(
+                i,
+                SenderArgs {
+                    target: child_target,
+                    done: child_done,
+                    bit_index: i,
+                },
+            )
+        };
 
         // SAFETY: Sequential setup; each child gets a unique stack index.
         let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[i]) });
@@ -99,13 +124,14 @@ pub fn run(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
-// cast_possible_truncation: slot indices are kernel cap slots < 2^32.
-#[allow(clippy::cast_possible_truncation)]
 fn sender_entry(arg: u64) -> !
 {
-    let target_slot = (arg & 0xFFFF) as u32;
-    let done_slot = ((arg >> 16) & 0xFFFF) as u32;
-    let bit_index = ((arg >> 32) & 0xFFFF) as usize;
+    // SAFETY: `arg` is the entry `run` published for this sender.
+    let SenderArgs {
+        target: target_slot,
+        done: done_slot,
+        bit_index,
+    } = unsafe { spawn::child_args(arg) };
 
     let bits = SENDER_BITS[bit_index.min(NUM_SENDERS - 1)];
 

@@ -145,9 +145,28 @@ fn failure_message(code: u32) -> &'static str
     }
 }
 
+/// Per-child arguments (the child-side slots of the four shared caps),
+/// handed to both child entries by address.
+#[derive(Clone, Copy)]
+struct RaceArgs
+{
+    eq: u32,
+    gate: u32,
+    ack: u32,
+    done: u32,
+}
+
+/// Entry 0 is the poller's, entry 1 the poster's (their stack indices).
+static RACE_ARGS: spawn::ArgBlock<RaceArgs, 2> = spawn::ArgBlock::new(RaceArgs {
+    eq: 0,
+    gate: 0,
+    ack: 0,
+    done: 0,
+});
+
 /// Spawn one pinned child with copies of the four shared caps (eq, gate, ack,
-/// done) at the given per-cap rights, packing the child-side slots into the
-/// entry arg 16 bits apiece in that order.
+/// done) at the given per-cap rights, publishing the child-side slots in a
+/// [`RaceArgs`] entry the child receives by address.
 fn start_pinned_child(
     ctx: &TestContext,
     caps: [u32; 4],
@@ -159,13 +178,25 @@ fn start_pinned_child(
 {
     let child = spawn::new_child(ctx)
         .map_err(|_| "stress::event_try_recv_post_race: spawn child failed")?;
-    let mut arg = 0u64;
-    for (i, (&cap, &r)) in caps.iter().zip(rights.iter()).enumerate()
+    let mut slots = [0u32; 4];
+    for (slot, (&cap, &r)) in slots.iter_mut().zip(caps.iter().zip(rights.iter()))
     {
-        let slot = cap_copy(cap, child.cs, r)
+        *slot = cap_copy(cap, child.cs, r)
             .map_err(|_| "stress::event_try_recv_post_race: cap_copy into child failed")?;
-        arg |= u64::from(slot) << (16 * i);
     }
+    // SAFETY: entry `stack_idx` belongs to this child alone and is published
+    // before its start; both children are reaped before the block is reused.
+    let arg = unsafe {
+        RACE_ARGS.publish(
+            stack_idx,
+            RaceArgs {
+                eq: slots[0],
+                gate: slots[1],
+                ack: slots[2],
+                done: slots[3],
+            },
+        )
+    };
     // SAFETY: stack_idx is unique per child; the children live for the whole
     // cell and are reaped after both report done.
     let stack = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[stack_idx]) });
@@ -202,7 +233,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         .map_err(|_| "stress::event_try_recv_post_race: cap_create_notification done failed")?;
 
     // POLLER (CPU 0): try_recv polls + gate park. POSTER (CPU 1): ticket +
-    // post + gate signal. Caps packed in (eq, gate, ack, done) order.
+    // post + gate signal. Caps published in (eq, gate, ack, done) order.
     let poller = start_pinned_child(
         ctx,
         [eq, gate, ack, done],
@@ -279,17 +310,12 @@ pub fn run(ctx: &TestContext) -> TestResult
 
 // ── Child entries ───────────────────────────────────────────────────────────
 
-/// Decode the four packed 16-bit cap slots shared by both child entries.
-// cast_possible_truncation: each field is a cap slot index < 2^16.
-#[allow(clippy::cast_possible_truncation)]
+/// Decode the four cap slots shared by both child entries.
 fn decode(arg: u64) -> (u32, u32, u32, u32)
 {
-    (
-        (arg & 0xFFFF) as u32,
-        ((arg >> 16) & 0xFFFF) as u32,
-        ((arg >> 32) & 0xFFFF) as u32,
-        ((arg >> 48) & 0xFFFF) as u32,
-    )
+    // SAFETY: `arg` is the entry `start_pinned_child` published for this child.
+    let a: RaceArgs = unsafe { spawn::child_args(arg) };
+    (a.eq, a.gate, a.ack, a.done)
 }
 
 /// POLLER: per round, spin until the ticket appears, publish the `POLLING`

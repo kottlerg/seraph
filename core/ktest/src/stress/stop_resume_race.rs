@@ -170,8 +170,8 @@ pub fn run(ctx: &TestContext) -> TestResult
             .map_err(|_| "stress::stop_resume_race: cap_copy stopper victim failed")?;
         let stopper_done = cap_copy(done, stopper.cs, RIGHTS_SIGNAL)
             .map_err(|_| "stress::stop_resume_race: cap_copy stopper done failed")?;
-        // arg packs victim_slot[15:0] | done_slot[31:16].
-        let stopper_arg = u64::from(stopper_victim) | (u64::from(stopper_done) << 16);
+        // arg packs victim_slot[31:0] | done_slot[63:32].
+        let stopper_arg = u64::from(stopper_victim) | (u64::from(stopper_done) << 32);
         // SAFETY: stack index 1 is the stopper's; sequential cycles never alias.
         let stopper_stack =
             ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[1]) });
@@ -191,8 +191,8 @@ pub fn run(ctx: &TestContext) -> TestResult
             .map_err(|_| "stress::stop_resume_race: cap_copy starter victim failed")?;
         let starter_done = cap_copy(done, starter.cs, RIGHTS_SIGNAL)
             .map_err(|_| "stress::stop_resume_race: cap_copy starter done failed")?;
-        // arg packs victim_slot[15:0] | done_slot[31:16].
-        let starter_arg = u64::from(starter_victim) | (u64::from(starter_done) << 16);
+        // arg packs victim_slot[31:0] | done_slot[63:32].
+        let starter_arg = u64::from(starter_victim) | (u64::from(starter_done) << 32);
         // SAFETY: stack index 2 is the starter's; sequential cycles never alias.
         let starter_stack =
             ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[2]) });
@@ -275,7 +275,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 #[allow(clippy::cast_possible_truncation)]
 fn victim_entry(arg: u64) -> !
 {
-    let done = (arg & 0xFFFF) as u32;
+    let done = (arg & 0xFFFF_FFFF) as u32;
     notification_send(done, BIT_VICTIM_RUNNING).ok();
     loop
     {
@@ -289,8 +289,8 @@ fn victim_entry(arg: u64) -> !
 #[allow(clippy::cast_possible_truncation)]
 fn stopper_entry(arg: u64) -> !
 {
-    let victim = (arg & 0xFFFF) as u32;
-    let done = ((arg >> 16) & 0xFFFF) as u32;
+    let victim = (arg & 0xFFFF_FFFF) as u32;
+    let done = (arg >> 32) as u32;
     notification_send(done, BIT_STOPPER_READY).ok();
     wait_for_release();
     let _ = thread_stop(victim);
@@ -304,8 +304,8 @@ fn stopper_entry(arg: u64) -> !
 #[allow(clippy::cast_possible_truncation)]
 fn starter_entry(arg: u64) -> !
 {
-    let victim = (arg & 0xFFFF) as u32;
-    let done = ((arg >> 16) & 0xFFFF) as u32;
+    let victim = (arg & 0xFFFF_FFFF) as u32;
+    let done = (arg >> 32) as u32;
     notification_send(done, BIT_STARTER_READY).ok();
     wait_for_release();
     let _ = thread_start(victim);

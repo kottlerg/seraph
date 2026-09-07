@@ -110,7 +110,7 @@ pub fn recv_blocks_until_post(ctx: &TestContext) -> TestResult
     let child_eq = cap_copy(eq, child.cs, syscall::RIGHTS_ALL).map_err(|_| "cap_copy eq failed")?;
     let child_sync = cap_copy(sync, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
         .map_err(|_| "cap_copy sync failed")?;
-    let child_arg = u64::from(child_eq) | (u64::from(child_sync) << 16);
+    let child_arg = u64::from(child_eq) | (u64::from(child_sync) << 32);
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(RECV_BLOCKS_STACK));
     crate::spawn::configure_and_start(&child, recv_and_report_entry, stack_top, child_arg)
@@ -336,11 +336,11 @@ pub fn recv_timeout_zero_blocks_forever(ctx: &TestContext) -> TestResult
 
 /// Child: blocks on `event_recv` then signals the received payload back.
 ///
-/// `arg`: bits[15:0] = `eq_slot`, bits[31:16] = `sync_slot` (in child's `CSpace`).
+/// `arg`: bits[31:0] = `eq_slot`, bits[63:32] = `sync_slot` (in child's `CSpace`).
 fn recv_and_report_entry(arg: u64) -> !
 {
-    let eq_slot = (arg & 0xFFFF) as u32;
-    let sync_slot = ((arg >> 16) & 0xFFFF) as u32;
+    let eq_slot = (arg & 0xFFFF_FFFF) as u32;
+    let sync_slot = (arg >> 32) as u32;
 
     match event_recv(eq_slot)
     {

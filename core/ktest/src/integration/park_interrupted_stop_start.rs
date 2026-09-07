@@ -230,7 +230,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 
 /// Spawn one phase's child: copy the phase's source cap (skipped when
 /// `source == 0`) and the `done` notification into its `CSpace`, then start it
-/// on the shared stack with `source[15:0] | done[31:16]` as its argument.
+/// on the shared stack with `source[31:0] | done[63:32]` as its argument.
 fn spawn_phase(
     ctx: &TestContext,
     done: u32,
@@ -252,7 +252,7 @@ fn spawn_phase(
     };
     let c_done = cap_copy(done, child.cs, RIGHTS_SIGNAL)
         .map_err(|_| "integration::park_interrupted_stop_start: cap_copy done failed")?;
-    let arg = u64::from(c_source) | (u64::from(c_done) << 16);
+    let arg = u64::from(c_source) | (u64::from(c_done) << 32);
     // Phases run sequentially and each child is reaped before the next spawn,
     // so the shared stack has exactly one live user.
     let stack = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
@@ -334,7 +334,7 @@ fn is_interrupted(e: i64) -> bool
 #[allow(clippy::cast_possible_truncation)]
 fn unpack(arg: u64) -> (u32, u32)
 {
-    ((arg & 0xFFFF) as u32, ((arg >> 16) & 0xFFFF) as u32)
+    ((arg & 0xFFFF_FFFF) as u32, (arg >> 32) as u32)
 }
 
 /// Phase 1 child: cancelled wait must return `Interrupted`; then a second,

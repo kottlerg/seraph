@@ -418,7 +418,11 @@ pub unsafe fn install_percpu(addr: u64);
 pub unsafe fn set_kernel_trap_stack(stack_top: u64);
 
 /// Disable interrupts and return the prior state; restore it later. (x86-64
-/// saves RFLAGS then `cli`; RISC-V clears `sstatus.SIE` atomically.)
+/// saves RFLAGS then `cli`; RISC-V clears `sstatus.SIE` atomically.) The
+/// restore writes the saved enable state whatever the current state is, so a
+/// window that enabled interrupts after saving (a preempt-disabled wait)
+/// returns to the saved state on both arches (x86-64 `popfq`; RISC-V sets or
+/// clears `sstatus.SIE`).
 pub unsafe fn save_and_disable_interrupts() -> u64;
 pub unsafe fn restore_interrupts(saved: u64);
 pub unsafe fn disable_interrupts();
@@ -644,4 +648,4 @@ equally clearly.
 
 ## Summarized By
 
-[kernel/README.md](../README.md)
+[kernel/README.md](../README.md), [scheduling-internals.md](scheduling-internals.md)

@@ -16,12 +16,32 @@ use crate::{ChildStack, spawn};
 
 static mut BENCH_SIGNAL_STACK: ChildStack = ChildStack::ZERO;
 
+/// The pong child's arguments, handed to `notification_pong_entry` by address.
+#[derive(Clone, Copy)]
+struct PongArgs
+{
+    ping: u32,
+    pong: u32,
+    done: u32,
+    n: u64,
+}
+
+static PONG_ARGS: spawn::ArgBlock<PongArgs, 1> = spawn::ArgBlock::new(PongArgs {
+    ping: 0,
+    pong: 0,
+    done: 0,
+    n: 0,
+});
+
 fn notification_pong_entry(arg: u64) -> !
 {
-    let in_slot = (arg & 0xFFFF) as u32;
-    let out_slot = ((arg >> 16) & 0xFFFF) as u32;
-    let done_slot = ((arg >> 32) & 0xFFFF) as u32;
-    let n = arg >> 48;
+    // SAFETY: `arg` is the entry the bench published for this child.
+    let PongArgs {
+        ping: in_slot,
+        pong: out_slot,
+        done: done_slot,
+        n,
+    } = unsafe { spawn::child_args(arg) };
 
     for _ in 0..n
     {
@@ -83,10 +103,18 @@ pub(super) fn bench_notification_roundtrip(ctx: &crate::TestContext, iters: u32)
         return;
     };
 
-    let arg = u64::from(child_ping)
-        | (u64::from(child_pong) << 16)
-        | (u64::from(child_done) << 32)
-        | (n << 48);
+    // SAFETY: the single child has not been started yet.
+    let arg = unsafe {
+        PONG_ARGS.publish(
+            0,
+            PongArgs {
+                ping: child_ping,
+                pong: child_pong,
+                done: child_done,
+                n,
+            },
+        )
+    };
     let stack_top = ChildStack::top(core::ptr::addr_of!(BENCH_SIGNAL_STACK));
 
     if spawn::configure_and_start(&child, notification_pong_entry, stack_top, arg).is_err()

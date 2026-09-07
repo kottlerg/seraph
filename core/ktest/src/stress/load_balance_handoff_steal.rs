@@ -144,6 +144,22 @@ static OBSERVED_CPUS: AtomicU32 = AtomicU32::new(0);
 /// witness: an unpinned thread the balancer relocated).
 static MIGRATIONS: AtomicU32 = AtomicU32::new(0);
 
+/// Per-client arguments, handed to `client_entry` by address.
+#[derive(Clone, Copy)]
+struct ClientArgs
+{
+    ep: u32,
+    done: u32,
+    /// Client index: its IPC buffer and its `done` bit.
+    idx: usize,
+}
+
+static CLIENT_ARGS: spawn::ArgBlock<ClientArgs, NUM_PAIRS> = spawn::ArgBlock::new(ClientArgs {
+    ep: 0,
+    done: 0,
+    idx: 0,
+});
+
 // too_many_lines: spawn (servers + clients) + drain + teardown + the
 // anti-vacuous guard are one linear scenario; splitting adds no clarity.
 #[allow(clippy::too_many_lines)]
@@ -184,10 +200,10 @@ pub fn run(ctx: &TestContext) -> TestResult
             .map_err(|_| "stress::load_balance_handoff_steal: spawn server failed")?;
         let server_ep = cap_copy(ep, server.cs, RIGHTS_EP_RECEIVE)
             .map_err(|_| "stress::load_balance_handoff_steal: cap_copy server ep failed")?;
-        // arg packs ep_slot[15:0] | buf_index[31:16]; servers use buffers
+        // arg packs ep_slot[31:0] | buf_index[63:32]; servers use buffers
         // [NUM_PAIRS, 2*NUM_PAIRS).
         let buf_index = NUM_PAIRS + j;
-        let server_arg = u64::from(server_ep) | ((buf_index as u64) << 16);
+        let server_arg = u64::from(server_ep) | ((buf_index as u64) << 32);
         // j < NUM_PAIRS <= u32::MAX; try_from keeps the narrow cast clippy-clean.
         let server_cpu = u32::try_from(j).unwrap_or(0) % cpu_mod;
         // SAFETY: server stacks occupy [NUM_PAIRS, 2*NUM_PAIRS); distinct per j.
@@ -210,9 +226,17 @@ pub fn run(ctx: &TestContext) -> TestResult
             .map_err(|_| "stress::load_balance_handoff_steal: cap_copy client ep failed")?;
         let client_done = cap_copy(done, client.cs, RIGHTS_SIGNAL)
             .map_err(|_| "stress::load_balance_handoff_steal: cap_copy client done failed")?;
-        // arg packs ep_slot[15:0] | done_slot[31:16] | client_index[47:32]; the
-        // client uses buffer `i` and done bit `1 << i`.
-        let client_arg = u64::from(client_ep) | (u64::from(client_done) << 16) | ((i as u64) << 32);
+        // SAFETY: client `i` has not been started yet; each is started once.
+        let client_arg = unsafe {
+            CLIENT_ARGS.publish(
+                i,
+                ClientArgs {
+                    ep: client_ep,
+                    done: client_done,
+                    idx: i,
+                },
+            )
+        };
         // SAFETY: client stacks occupy [0, NUM_PAIRS); distinct per i.
         let stack = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[i]) });
         spawn::configure_and_start(&client, client_entry, stack, client_arg)
@@ -297,14 +321,10 @@ pub fn run(ctx: &TestContext) -> TestResult
 
 /// Client: tight `ipc_call` loop on a private endpoint, sampling its CPU to
 /// witness migration. Unpinned, so the balancer may steal it mid-handoff.
-// cast_possible_truncation: cap slots and the client index are < 2^16; the CPU
-// index is < 2^32.
-#[allow(clippy::cast_possible_truncation)]
 fn client_entry(arg: u64) -> !
 {
-    let ep = (arg & 0xFFFF) as u32;
-    let done = ((arg >> 16) & 0xFFFF) as u32;
-    let idx = ((arg >> 32) & 0xFFFF) as usize;
+    // SAFETY: `arg` is the entry `run` published for this client.
+    let ClientArgs { ep, done, idx } = unsafe { spawn::child_args(arg) };
     let done_bit = 1u64 << idx;
 
     // SAFETY: client `idx` is the sole user of IPC_BUFS[idx] this run.
@@ -343,12 +363,13 @@ fn client_entry(arg: u64) -> !
 
 /// Server: reply to every call on its private endpoint until torn down. Pinned
 /// round-robin so its reply tends to wake the client from a different CPU.
-// cast_possible_truncation: ep slot and buffer index are < 2^16.
+// cast_possible_truncation: the low half is the ep slot, the high half the
+// buffer index.
 #[allow(clippy::cast_possible_truncation)]
 fn server_entry(arg: u64) -> !
 {
-    let ep = (arg & 0xFFFF) as u32;
-    let buf_index = ((arg >> 16) & 0xFFFF) as usize;
+    let ep = (arg & 0xFFFF_FFFF) as u32;
+    let buf_index = (arg >> 32) as usize;
 
     // SAFETY: server `buf_index` is the sole user of IPC_BUFS[buf_index] this run.
     let buf = unsafe { core::ptr::addr_of_mut!(IPC_BUFS[buf_index]) }.cast::<u64>();

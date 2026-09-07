@@ -19,6 +19,24 @@ use crate::{ChildStack, TestContext, TestResult, spawn};
 const NUM_CALLERS: usize = 64;
 const CYCLES: usize = 200;
 
+/// Per-caller arguments, handed to `caller_entry` by address.
+#[derive(Clone, Copy)]
+struct CallerArgs
+{
+    ep: u32,
+    done: u32,
+    /// 1-based caller label carried in the call.
+    label: u64,
+    bit_index: u64,
+}
+
+static CALLER_ARGS: spawn::ArgBlock<CallerArgs, NUM_CALLERS> = spawn::ArgBlock::new(CallerArgs {
+    ep: 0,
+    done: 0,
+    label: 0,
+    bit_index: 0,
+});
+
 pub fn run(ctx: &TestContext) -> TestResult
 {
     for _cycle in 0..CYCLES
@@ -41,13 +59,19 @@ pub fn run(ctx: &TestContext) -> TestResult
             let child_done = cap_copy(done, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
                 .map_err(|_| "concurrent_ipc: cap_copy done failed")?;
 
-            // Pack: ep_slot[15:0], done_slot[31:16], label=i+1 (1-based)[47:32],
-            // bit_index[55:48]. Encode bit index (not bit value) so it fits
-            // in 8 bits even for NUM_CALLERS up to 256.
-            let arg = u64::from(child_ep)
-                | (u64::from(child_done) << 16)
-                | (((i + 1) as u64) << 32)
-                | ((i as u64) << 48);
+            // SAFETY: caller `i` of this cycle has not been started yet, and
+            // the previous cycle's callers were all reaped before this cycle.
+            let arg = unsafe {
+                CALLER_ARGS.publish(
+                    i,
+                    CallerArgs {
+                        ep: child_ep,
+                        done: child_done,
+                        label: (i + 1) as u64,
+                        bit_index: i as u64,
+                    },
+                )
+            };
 
             // SAFETY: Each caller uses a distinct stack index.
             let stack_top =
@@ -126,14 +150,15 @@ pub fn run(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
-// cast_possible_truncation: slot indices are kernel cap slots < 2^32.
-#[allow(clippy::cast_possible_truncation)]
 fn caller_entry(arg: u64) -> !
 {
-    let ep_slot = (arg & 0xFFFF) as u32;
-    let done_slot = ((arg >> 16) & 0xFFFF) as u32;
-    let label = (arg >> 32) & 0xFFFF;
-    let bit_index = (arg >> 48) & 0xFF;
+    // SAFETY: `arg` is the entry `run` published for this caller.
+    let CallerArgs {
+        ep: ep_slot,
+        done: done_slot,
+        label,
+        bit_index,
+    } = unsafe { spawn::child_args(arg) };
     let done_bit = 1u64 << bit_index;
 
     // Register the shared IPC buffer for this child thread.

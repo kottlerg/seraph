@@ -67,6 +67,7 @@ concurrent notification and queue events.
 |---|---|
 | `thread_lifecycle.rs` | Full thread lifecycle: create → configure → start → stop → read\_regs → write\_regs → resume → exit |
 | `cap_transfer.rs` | Cap rights flow through an IPC endpoint round-trip |
+| `cap_transfer_large.rs` | IPC transfer of a cap with a multi-batch child list, both directions |
 | `wait_concurrency.rs` | Wait set with concurrent notification + queue sources |
 | `memory_lifecycle.rs` | Memory split → map → protect → unmap with aspace\_query at each step |
 | `multi_caller_ipc_fifo.rs` | Three concurrent IPC callers verify FIFO send-queue ordering |
@@ -103,16 +104,19 @@ mirrors that ceiling (64 × 16 KiB child-stack BSS = 1 MiB).
 | `idle_wake_race.rs` | Race wake of an idle CPU with concurrent ready-queue entry under affinity migration | `ITERATIONS=50_000` |
 | `thread_churn.rs` | Rapid thread create/destroy cycles (TCB and CSpace cleanup) | `ITERATIONS=1000` |
 | `cap_delete_running.rs` | Delete capabilities while child threads actively spin | `NUM_CHILDREN=16` |
+| `cap_delete_reply_wake.rs` | `cap_delete` of a server a client is `BlockedOnReply` on must wake that client (#351, the dealloc deferred reply-wake liveness invariant) | `CYCLES=2000` |
 | `priority_dealloc_race.rs` | Race `sys_thread_set_priority` against `cap_delete(Thread)` and affinity-driven migration (covers Scheduling-group all-locks discipline) | `NUM_WORKERS=16`, `CYCLES=200` |
 | `stop_reply_race.rs` | Race `thread_stop` on a reply-blocked client against `cap_delete` of the server it is parked on (#317 cross-CPU UAF) | `CYCLES=300` |
 | `stop_resume_race.rs` | Race `thread_stop` against a concurrent `thread_start` (resume) on a `Running` pinned victim across three CPUs (stop-drain liveness) | `CYCLES=256` |
 | `double_enqueue_storm.rs` | Run-queue double-link guard regression (#244): wake + priority + affinity churn, then wake racing `cap_delete(Thread)` | `NUM_WORKERS=32`, `CYCLES=600` |
+| `event_try_recv_post_race.rs` | A non-blocking `SYS_EVENT_RECV` try-once racing a concurrent `event_post` must never leave the poller wakeable (#352) | `CYCLES=1024` |
 | `load_balance_handoff_steal.rs` | Arm the load-balancer mid-handoff steal (#314/#293): unpinned IPC clients vs round-robin-pinned servers expose `pull_unpinned_ready` stealing a `context_saved == 0` thread | `NUM_PAIRS=16`, `ITERS=16000` |
 | `concurrent_notification.rs` | Multiple threads sending distinct bits to one notification simultaneously | `NUM_SENDERS=64`, `SEND_ITERATIONS=5000` |
 | `concurrent_ipc.rs` | Multiple callers racing on one endpoint (send-queue safety) | `NUM_CALLERS=64`, `CYCLES=200` |
 | `cap_revoke_under_use.rs` | Revoke root while child threads actively send on derived caps | `NUM_CHILDREN=64` |
 | `concurrent_map_unmap.rs` | Multiple threads mapping/unmapping distinct VAs in the same address space | `NUM_CHILDREN=16`, `MAP_ITERATIONS=1000` |
 | `retype_concurrent.rs` | Multiple workers retyping concurrently against one Memory-backed allocator | `NUM_WORKERS=64`, `ITERS_PER_WORKER=1000` |
+| `split_delete_race.rs` | A same-CSpace sibling deletes the original while this thread splits it across three reparent batches; the split's result classifies each cycle and the slot count returns to baseline | `CYCLES=40`, `CHILDREN=600` |
 | `fpu_migration_churn.rs` | 100 cycles of FPU-owner thread migration across CPUs; validates eager save / lazy restore under churn | `CYCLES=100` |
 | `concurrent_event_producers.rs` | Multiple producers post concurrently to one event queue; consumer verifies every producer's full sequence | `NUM_PRODUCERS=4`, `MESSAGES_PER_PRODUCER=64` |
 
@@ -140,7 +144,7 @@ cycle counts; no PASS/FAIL verdict.
 
 ## Test infrastructure
 
-Defined in `src/main.rs`:
+Defined in `src/main.rs` (the `spawn::` items in `src/spawn.rs`):
 
 - `TestResult` — `Result<(), &'static str>` — no heap, no allocation.
 - `run_test!(name, body)` — macro that logs the test name, runs `body`,
@@ -158,6 +162,16 @@ Defined in `src/main.rs`:
   `configure_and_start_pinned(child, …)` — child-thread spawn helper
   wrapping the cspace + thread + configure + start sequence that ~30
   sites duplicated.
+- `spawn::ArgBlock` / `spawn::child_args` — per-test static argument
+  entries a child receives by address. A child's single `u64` argument
+  holds at most two 32-bit capability handles (as halves); anything more
+  goes through an `ArgBlock`. Narrower packings truncate the handle's
+  generation byte.
+- `spawn::wait_until_exited(thread, max_polls)` /
+  `spawn::wait_memory_baseline(memory, baseline, max_polls)` — poll a
+  thread's `CAP_INFO_THREAD_STATE` until it reports `Exited`, or a Memory
+  cap's available bytes until they return to a baseline; the way a test
+  observes a deferred (off-CPU) reclaim completing.
 
 ## Compile-time options
 

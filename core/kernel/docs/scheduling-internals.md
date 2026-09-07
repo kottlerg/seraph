@@ -36,17 +36,21 @@ In scope:
 The following ordering MUST be observed everywhere in the kernel. Acquiring locks in reverse, or skipping levels, risks deadlock.
 
 ```
+   THREAD_REGISTRY_LOCK                      (outermost; live-thread list — the
+        │                                    object-teardown walk takes source,
+        │                                    sleep-list, sched, and run-queue
+        │                                    locks under it, never the
+        │                                    derivation lock; see § Thread
+        │                                    Registry)
+        ▼
        source IPC lock                derivation tree lock
    (sig.lock | ep.lock |    (outer)   (cap revocation;
     eq.lock | ws.lock)                 see capability-internals.md)
         │         │
-        │         └─────► SLEEP_LIST_LOCK   (leaf; held alone, or under a
-        │                                    source lock — source.lock →
-        │                                    SLEEP_LIST_LOCK is the only edge)
-        │
-        │                 THREAD_REGISTRY_LOCK (leaf; held strictly alone — never
-        │                                    under any other lock. Diagnostic-only
-        │                                    live-thread list; see § Thread Registry)
+        │         └─────► SLEEP_LIST_LOCK   (leaf; held alone, under a source
+        │                                    lock, or alone under
+        │                                    THREAD_REGISTRY_LOCK — never over
+        │                                    any other lock)
         ▼
    (*tcb).sched_lock                         (per-TCB Scheduling-group serializer)
         │
@@ -62,7 +66,26 @@ The following ordering MUST be observed everywhere in the kernel. Acquiring lock
 
 3. **`SLEEP_LIST_LOCK` is leaf-only.** It MAY be acquired from inside any source IPC lock. It MUST NOT contain calls that re-enter IPC or scheduler code while held.
 
-3a. **`THREAD_REGISTRY_LOCK` is strict-leaf-only.** The diagnostic live-thread registry (`core/kernel/src/sched/thread_registry.rs`) is linked at thread construction and unlinked at dealloc, both with `THREAD_REGISTRY_LOCK` held strictly alone — never nested under a source IPC lock, `(*tcb).sched_lock`, or a run-queue lock — so it adds no lock-order edge. The softlockup watchdog walks it via `try_for_each` (a non-blocking `try_lock`, so a contended or CPU-died lock degrades to a skipped section rather than a hang). See § Thread Registry.
+3a. **`THREAD_REGISTRY_LOCK` orders before every IPC-source lock,
+`SLEEP_LIST_LOCK`, `sched_lock`, and run-queue lock, and is never taken under
+any of them.** The live-thread registry
+(`core/kernel/src/sched/thread_registry.rs`) is linked at thread construction
+and unlinked at dealloc with `THREAD_REGISTRY_LOCK` held alone. The
+object-teardown walk (`stop_threads_bound_to`) holds it while cancelling IPC
+blocks (`cancel_ipc_block`: the source lock, then `SLEEP_LIST_LOCK` alone for
+a timed waiter) and writing `Exited` under the all-locks discipline, so the
+registry lock sits above all of those in the hierarchy — the only edges it
+adds, and ones no path traverses in reverse. It must not be held while
+waiting for another CPU to make progress (a CPU spinning on it inside
+`register` cannot deschedule): the teardown walk marks under the lock and
+waits after releasing it. The hold
+is interrupts-off on the walking CPU for the whole walk — every live thread
+is visited, and each bound one costs an all-CPU-locks transition — so its
+length is proportional to live threads plus bound threads × CPUs; thread
+creation on other CPUs stalls on the lock meanwhile. The softlockup watchdog
+walks the registry via `try_for_each` (a non-blocking `try_lock`, so a
+contended or CPU-died lock degrades to a skipped section rather than a
+hang). See § Thread Registry.
 
 4. **Per-TCB-then-cross-CPU acquisition rule.** A path mutating a TCB's Scheduling field group MUST acquire `(*tcb).sched_lock` FIRST (outermost among the scheduler locks), THEN any per-CPU scheduler.lock(s); when two or more per-CPU scheduler.locks are needed simultaneously, they MUST be taken in ascending-CPU order. Live production sites: `sched::migrate_ready_thread` (used by `sys_thread_set_affinity` active migration and the periodic load balancer; `(*tcb).sched_lock` then the two CPU locks ascending), `dealloc_object(Thread)` (`(*tcb).sched_lock` then the all-CPU walk in ascending order), `sched::set_state_under_all_locks` (lifecycle state writes; same shape), and `sys_thread_set_priority` (priority write under `(*tcb).sched_lock`, then locate-and-relocate of the Ready TCB's queue entry via `sched::relocate_ready_priority`, which locks the single `preferred_cpu`-hinted CPU's run-queue on a hint hit and only on a miss falls back to the all-CPU walk in ascending order). A path MUST NEVER hold two different TCBs' `sched_lock`s at once — `schedule()`'s outgoing-then-incoming flip releases `current.sched_lock` before acquiring `next.sched_lock`.
 
@@ -77,6 +100,45 @@ The following ordering MUST be observed everywhere in the kernel. Acquiring lock
 9. **Wake commit MUST go through `enqueue_and_wake`.** Wake primitives MUST NOT write `(*tcb).state = Ready`, `ipc_state = None`, or `blocked_on_object = null` themselves under the source IPC lock; they snapshot the wakeup payload (`wakeup_value`, `timed_out`) under the source lock and delegate the state writes to `enqueue_and_wake`, which performs them under `(*tcb).sched_lock` → the target CPU's run-queue lock. The function reads `state` under `sched_lock` first and classifies: a `Blocked`/`Created` target is linked (`state=Ready`/`ipc_state=None`/`blocked_on_object=null` written, then enqueued); a `Running`/`Ready`/`Stopped`/`Exited` target is *coalesced* (not linked). `Running` additionally records `wake_pending` (the wake-before-park net rule 8 consumes); `Ready` is an already-linked same-event duplicate; `Stopped`/`Exited` mean a concurrent `dealloc_object(Thread)` or stop already won (preventing UAF / a re-introduced run-queue entry over a being-freed TCB). Every exit path clears the target's `wake_in_flight` so a waiting `dealloc_object(Thread)` can proceed. This rule applies equally to dealloc-time wake walks (`endpoint_dealloc` send/recv heads, `notification_dealloc` waiter, `event_queue_drop`, `wait_set_drop`). The DELIBERATE-placement sibling `enqueue_ready_thread` does NOT classify `state` — it unconditionally forces `→Ready` and links; it is used only where the caller owns the `→Ready` transition and has established the thread is not live on any CPU (`sys_thread_start` first-start/resume), since routing those through the gated `enqueue_and_wake` would coalesce their `Ready` target and strand it.
 
 **Lock primitive.** All locks above are `crate::sync::Spinlock` (IRQ-disabling). Hold-time MUST be bounded (target ~10 µs on x86_64); no page-table walks, buddy allocations, IPC syscalls, or other long-latency operations under any spinlock.
+
+**Bare spin locks (MUST).** The derivation tree lock
+(`cap::derivation::DERIVATION_LOCK`), the per-`MemoryObject` reader-writer
+lock, the per-`MemoryObject` retype-allocator lock, the `CSpace` and
+`AddressSpace` wrapper pool locks (`cs_pool_lock`, `pt_pool_lock`), and the
+kernel page-table pool lock (`mm::kernel_pt_pool`) are CAS spin locks that
+do not mask interrupts themselves. A holder is never descheduled, because no
+context that takes one can be descheduled: syscall context, where
+interrupts are already masked; a preempt-disabled window; and the idle
+thread's deferred reclaim (`drain_deferred_reclaim` from
+`idle_thread_entry`), which runs with interrupts and preemption enabled and
+is sound only because the idle thread's time slice is permanently zero, so
+`timer_tick` returns before `schedule()` for it. Kernel-mode preemption
+exists only at a slice expiry with preemption enabled, and every kernel
+window that enables interrupts — shootdown ack-waits, the teardown gates,
+the contended `pt_lock` path, the `sys_thread_stop` drain — runs
+preempt-disabled and returns to the saved interrupt state through
+`restore_interrupts`, which writes that state whatever the current one; the
+contract is stated in [arch-interface.md](arch-interface.md). A window that
+left interrupts enabled behind it would make the rest of the syscall
+preemptible, and a lock taken there could be descheduled mid-hold. A holder
+MUST NOT park,
+and MUST NOT wait for another CPU to reach the scheduler while holding one
+of them. `check_lock_hold_preemptible` enforces the rule at every
+acquisition of these locks: an acquisition with interrupts and preemption
+both enabled by any thread other than the idle thread is reported once per
+lock kind, a debug build halts, and the idle exemption asserts the zero
+slice it rests on. Their order, outermost first: `DERIVATION_LOCK` → the
+`MemoryObject` write lock(s) of a split or merge (two in pointer order) → the
+SEED `MemoryObject` read lock taken by a retype allocation or free → that
+object's retype-allocator lock. The `CSpace` spinlock is taken after the
+object locks by the split and merge paths and inside the derivation lock by
+every tree edit that frees or inserts a slot. The pool locks are innermost:
+the wrapper pool locks inside the `CSpace` spinlock for leaf growth, inside
+`pt_lock` for pooled page-table frames, and alone on the augment path; the
+kernel page-table pool lock inside `pt_lock` on the heap-backed page-table
+path. A CPU wedged on one of these locks shows no heartbeat and no protocol
+spin site; the softlockup watchdog's lock-wait breadcrumb names the lock
+(§ Softlockup Watchdog).
 
 ---
 
@@ -103,10 +165,18 @@ The transition table below pins every ThreadState write to a syscall/event, the 
 | `Running` | `Stopped` | `sys_thread_stop` on running target | calling CPU | `set_state_under_all_locks(Stopped)`; if running on a remote CPU, `prod_remote_cpu(run_cpu)` and spin until `sched_remote.current != tcb` |
 | `Ready` | `Stopped` | `sys_thread_stop` on a Ready target | calling CPU | `set_state_under_all_locks(Stopped)`; the helper also walks every CPU's run queue and calls `remove_from_queue` inside the all-locks region. See § *Stopped/Exited drain* below. |
 | `Blocked` | `Stopped` | `sys_thread_stop` on blocked target | calling CPU | `cancel_ipc_block` first (acquires the source IPC lock and unlinks the waiter), then `set_state_under_all_locks(Stopped)` |
-| `*` | `Exited` | `sys_thread_exit` (self) or fault handler | running CPU | `set_state_under_all_locks(Exited)` (on the dying CPU), then `schedule(false)` |
+| `*` | `Exited` | `sys_thread_exit` (self) or fault handler | running CPU | `exit_under_all_locks(reason)` (on the dying CPU; the exit reason and `Exited` are written in one all-locks hold, refused if already `Exited`), then `schedule(false)` |
 | `*` | `Exited` | `dealloc_object(Thread)` (refcount → 0) | calling CPU | acquires `(*tcb).sched_lock` (outer), then every CPU's scheduler.lock in ascending order, writes `Exited`, walks `remove_from_queue` for every CPU, releases all; then waits unconditionally for `sched.current != tcb` on *every* CPU *and* `tcb.context_saved == 1` (see Cross-CPU TCB Ownership) before freeing |
+| `Exited` | `*` | any lifecycle write (`sys_thread_start`, `sys_thread_stop`, a second exit) | calling CPU | refused: `set_state_under_all_locks` returns `StateCommit::RefusedExited` and `enqueue_ready_thread` returns `false` when the target is `Exited` under the held locks — `Exited` is terminal. A lifecycle syscall's unlocked precheck can race an object teardown (§ Thread Registry) or an exit; `sys_thread_start` then returns `InvalidArgument`, `sys_thread_stop` `InvalidState`, and neither revives the thread. |
 
-All `Running→Blocked` parks MUST route through `commit_blocked_under_local_lock` (or `commit_reply_rebind_under_local_lock` for `endpoint_recv`'s rebind); all `Blocked→Ready` *wakes* MUST route through `enqueue_and_wake`. The deliberate `→Ready` *placements* that the caller owns (the thread is provably not live) route through `enqueue_ready_thread` instead — currently only `sys_thread_start`. Direct `(*tcb).state` writes from an IPC primitive — under the source lock or otherwise — are forbidden; they race `set_state_under_all_locks(Stopped)` and silently clobber Stopped.
+All `Running→Blocked` parks MUST route through `commit_blocked_under_local_lock` (or
+`commit_reply_rebind_under_local_lock` for `endpoint_recv`'s rebind); all `Blocked→Ready` *wakes*
+MUST route through `enqueue_and_wake`. The deliberate `→Ready` *placements* that the caller owns
+(the thread is provably not live) route through `enqueue_ready_thread` instead — currently only
+`sys_thread_start`. Both `set_state_under_all_locks` and `enqueue_ready_thread` refuse an `Exited`
+target (the terminal row above), so a placement that raced a teardown cannot link a dead thread.
+Direct `(*tcb).state` writes from an IPC primitive — under the source lock or otherwise — are
+forbidden; they race `set_state_under_all_locks(Stopped)` and silently clobber Stopped.
 
 **Voluntary-block window — `schedule()` never requeues a `Blocked` `current` (issue #299).** Between a thread committing `Blocked` (`commit_blocked_under_local_lock` writes `Blocked` under `(*tcb).sched_lock`, then releases it) and reaching its own `schedule(false)`, interrupts are enabled and a timer tick can fire `schedule(true)` (`requeue_current = true`). The outgoing-requeue guard therefore excludes a `Blocked` `current` regardless of `requeue_current`: re-marking the parking thread `Ready` and enqueuing it would race the pending `enqueue_and_wake` (which links the same TCB on its `Blocked → Ready` wake) into a `queued_on` double-enqueue — in debug the `#244` enqueue tripwire panics under `scheduler.lock`, wedging that CPU. `cur_state` is read under `current.sched_lock` (held from the top of `schedule()`), so the `Blocked` observation is authoritative, not the racy `state` read a `timer_tick`-side guard would require. The parked thread is redispatched by its deposited wake (the resume-DEPOSIT model, Wake Protocol Invariants).
 
@@ -273,7 +343,22 @@ self-enforcing at the single insertion chokepoint, closing the double-link class
 
 ## Cross-CPU TCB Ownership
 
-The TCB is owned in pieces. Different field groups have different lock disciplines. Cross-CPU access to any field MUST hold the lock specified for that field's group.
+The TCB is owned in pieces. Different field groups have different lock disciplines. Cross-CPU access
+to any field MUST hold the lock specified for that field's group. Documented exceptions — the reads
+of `state` that hold no `sched_lock`: `running_thread_stopped` (`sched/mod.rs`) probes the running
+thread's own `state` with a volatile read that decides only whether to confirm — a positive probe is
+confirmed under this CPU's `scheduler.lock`, which every `state` writer on the lifecycle path holds
+through `set_state_under_all_locks` (see § Atomic Ordering Invariants); and the object-teardown walk
+(`mark_bound_threads` under `THREAD_REGISTRY_LOCK`, `scan_bound_current` under the remote CPU's
+`scheduler.lock`) reads `state` to skip threads already `Exited` and to decide whether a bound
+thread still needs marking. Those reads are sound only because `Exited` is monotone (§ ThreadState
+Transitions): a positive `Exited` read is final, and a negative read is re-decided under the full
+lock set by `set_state_under_all_locks`, which refuses if the thread exited meanwhile. A field
+without that monotonicity MUST NOT be read this way. The lifecycle syscalls' own prechecks
+(`sys_thread_configure`, `sys_thread_start`, `sys_thread_stop`) and the stop protocol's drain
+re-check are the same pattern — each is re-decided under the full lock set by
+`set_state_under_all_locks`, or under the remote run-queue lock the stop protocol documents — and
+`CAP_INFO_THREAD_STATE` is a diagnostic snapshot that decides nothing in the kernel.
 
 | Field group | Fields | Owning lock | Cross-CPU access rule |
 |---|---|---|---|
@@ -570,10 +655,19 @@ Pairing table for every load-bearing atomic in the scheduling and IPC paths. "Lo
 | `LOAD_BALANCE_TICK` | `sched/mod.rs` (decl, balancer) | Relaxed on `fetch_add` (sole writer is the loaded-path victim selection in `try_pull_balance`) | Relaxed on the same `fetch_add` (consumes the previous value) | Advisory random-victim seed; correctness does not depend on ordering — a stale value just biases victim selection slightly. |
 | `NEXT_THREAD_ID` | `sched/mod.rs` (counter) | Relaxed on `fetch_add` | n/a | Monotonic counter; no synchronisation needed. |
 | `CPU_COUNT` | `sched/mod.rs` (decl) | Relaxed on store (`init_storage`) | Relaxed on every read | Single-writer at boot; the SCHEDULERS_PTR Release publishes the storage; readers establish happens-before via the pointer load, not via CPU_COUNT itself. |
-| `SCHEDULERS_PTR`, `IDLE_TCBS_PTR`, `AP_TSS_PTR`, `AP_GDT_PTR`, `AP_IST_STACKS_PTR` | per-`AtomicPtr` declaration sites | Release on `store` in `init_storage` and per-arch initialisers | Acquire on `load` in `scheduler_ptr`, `idle_tcb_ptr`, AP startup helpers | Publishes the zeroed and constructed slab to every CPU; the Acquire establishes happens-before with the storage construction. |
+| `SCHEDULERS_PTR`, `IDLE_TCBS_PTR`, `AP_TSS_PTR`, `AP_GDT_PTR`, `AP_IST_STACKS_PTR` | per-`AtomicPtr` declaration sites | Release on `store` in `init_storage` and per-arch initialisers | Acquire on `load` in `scheduler_ptr`, `idle_tcb_ptr`, `running_tcb_raw`, AP startup helpers | Publishes the zeroed and constructed slab to every CPU; the Acquire establishes happens-before with the storage construction. |
 
 **Rules:**
-- The per-TCB `sched_lock` (a `crate::sync::Spinlock`, not an atomic; see § Cross-CPU TCB Ownership) is the serializer the Scheduling-group fields above rely on: `state`/`ipc_state`/`blocked_on_object`/`preferred_cpu`/`wake_pending` are plain (non-atomic) fields written under it, and `queued_on`'s atomicity exists only for a well-defined cross-CPU guard read — not for lock-free synchronisation. It is listed here for cross-reference only.
+- The per-TCB `sched_lock` (a `crate::sync::Spinlock`, not an atomic; see § Cross-CPU TCB Ownership)
+  is the serializer the Scheduling-group fields above rely on:
+  `state`/`ipc_state`/`blocked_on_object`/`preferred_cpu`/`wake_pending` are plain (non-atomic)
+  fields written under it, and `queued_on`'s atomicity exists only for a well-defined cross-CPU
+  guard read — not for lock-free synchronisation. It is listed here for cross-reference only. The
+  one load-bearing read of `state` outside these locks is the probe in `running_thread_stopped` (the
+  syscall epilogue and the object-teardown spins): a volatile read that only decides whether to take
+  this CPU's `scheduler.lock` and confirm, never the outcome itself. A lagging probe delays
+  detection by one spin iteration, or until the thread next enters the kernel; a same-CPU write is
+  always observed.
 - Any new atomic in the scheduling or IPC path MUST be added to this table with its pairing rationale before merge.
 - Any change from Release/Acquire to Relaxed (or the inverse) MUST be justified against this table; "looks fine on x86" is not justification — the riscv64 build is RVWMO and is the binding test.
 - SeqCst is permitted only where a Dekker-style fence pair is the proven pattern; new SeqCst uses MUST cite the proof.
@@ -719,14 +813,34 @@ Each per-CPU dump line carries a **spin-site breadcrumb**: a wedged CPU that
 never returned to the scheduler is stuck in a protocol-spin, and the
 breadcrumb (`spin_site_enter`/`spin_site_exit`, set around each gate) names
 which one — `dealloc:not-current`, `dealloc:context-saved`,
-`dealloc:wake-in-flight`, or `schedule:context-saved`. The
-`dealloc_object(Thread)` gates carried no overlong-duration warning of their
-own, so a wedge there showed only an opaque `current = Exited` in
+`dealloc:wake-in-flight`, `dealloc:as-active`, or `schedule:context-saved`.
+The `dealloc_object(Thread)` gates carried no overlong-duration warning of
+their own, so a wedge there showed only an opaque `current = Exited` in
 `SYS_CAP_DELETE` (#351); the breadcrumb makes it explicit. The `schedule()`
 context-saved dispatch barrier reports both ways: the breadcrumb names it in
 cross-CPU dumps, and its own single-shot warning fires after 100 ms of
 spinning (`CS_SPIN_WARN_US`, time-based so it is meaningful under TCG's
 variable instruction rate).
+
+Each per-CPU dump line also carries a **lock-wait breadcrumb**: a CPU
+spinning for one of the bare spin locks of § Lock Hierarchy (the derivation
+lock, a `MemoryObject` read or write lock, a retype-allocator lock, a wrapper
+pool lock, or the kernel page-table pool lock) records the lock kind and the
+address of its state word once its first acquisition attempt fails
+(`lock_wait_enter`/`lock_wait_exit`; the uncontended path stores nothing),
+and the dump prints them with the state word's current value —
+`0xffffffff` for a held `MemoryObject` write lock, a reader count otherwise,
+`0x1` for a held allocator, wrapper pool, or kernel page-table pool lock. The
+dump reads another CPU's breadcrumb racily: it takes the kind before and
+after the word and prints only when both agree and the word is a non-zero
+address aligned for that kind, so a wait exited between the loads is skipped
+rather than read through a cleared word. These locks spin with interrupts
+masked, inside a preempt-disabled window, or on the idle thread inside a
+deferred reclaim, so without the breadcrumb a CPU wedged on one is
+indistinguishable from a silent or idle one. The dump also prints the
+derivation lock's state word and the CPU stamped as its write holder
+(`DerivationLock::debug_snapshot`), so a held lock with no spinning holder
+is visible as a leaked or wedged hold.
 
 The dump then walks the live-thread registry (§ Thread Registry) and prints
 every non-running registered thread. For a `Blocked` thread it shows the
@@ -746,7 +860,9 @@ CPU's run queue — were invisible before this enumeration (#351).
 heartbeat store (APs add one Relaxed load + compare for the BSP check); one
 Relaxed counter increment per BSP tick and an O(`cpu_count`) early-exit
 loop; the registry scan and AP-stamp sweep run only on the 0.5 s cadence;
-one plain stamp store per park commit. Zero dump overhead when healthy.
+one plain stamp store per park commit; two Relaxed stores per syscall (the
+dispatcher's `syscall_nr` stamp on the running TCB at entry and exit, which
+feeds the lock-holder line). Zero dump overhead when healthy.
 
 **Catches:** all-CPUs-idle with work queued (lost-wake bugs); cross-CPU
 `context_saved` deadlock; every TCB incorrectly `Blocked`; a single thread
@@ -786,32 +902,99 @@ overhead in healthy paths.
 
 ## Thread Registry
 
-`core/kernel/src/sched/thread_registry.rs` is a diagnostic-only intrusive
-doubly-linked list of every live TCB, threaded through `registry_next` /
-`registry_prev` and guarded by the strict-leaf `THREAD_REGISTRY_LOCK` (Lock
-Hierarchy rule 3a). It exists solely so the softlockup watchdog can enumerate
-`Blocked` waiters that the per-CPU `current` dump cannot reach.
+`core/kernel/src/sched/thread_registry.rs` is an intrusive doubly-linked list of
+every live TCB, threaded through `registry_next` / `registry_prev` and guarded by
+`THREAD_REGISTRY_LOCK` (Lock Hierarchy rule 3a). It serves two readers: the
+softlockup watchdog, which enumerates `Blocked` waiters that the per-CPU
+`current` dump cannot reach, and object teardown, which finds every thread bound
+to a dying `CSpace` or `AddressSpace`.
 
 **Membership.** `register` splices a TCB onto the head; `unregister` removes it.
-A thread is registered on the success path of `sys_cap_create_thread` (after its
-cap is inserted — the rollback arm frees the TCB via `retype_free` without ever
-registering it, so register-on-success keeps the two symmetric) and on
-init's bootstrap thread. It is unregistered in the `dealloc_object(Thread)` arm
-strictly before the TCB is poisoned/freed: the walk holds `THREAD_REGISTRY_LOCK`
-across every dereference, so unlinking before the free guarantees the watchdog
-never observes a dangling node. Idle TCBs are deliberately not registered — they
-are never `Blocked` and are already shown by the per-CPU `current` dump.
+A thread is registered in `sys_cap_create_thread` as soon as its TCB is
+constructed — before its capability is inserted, because the TCB already names
+its `CSpace` and `AddressSpace` and a teardown of either must find it (the
+rollback arm unregisters before freeing the TCB) — and on init's bootstrap
+thread. It is unregistered in the `dealloc_object(Thread)` arm strictly before
+the TCB is poisoned/freed: both walks hold `THREAD_REGISTRY_LOCK` across every
+dereference, so unlinking before the free guarantees neither observes a
+dangling node. Idle TCBs are deliberately not registered — they are never
+`Blocked`, bound to no object, and already shown by the per-CPU `current` dump.
 
 **Walk.** `try_for_each` takes the lock with a non-blocking `try_lock`: if it is
 contended (a register/unregister in flight) or a CPU died holding it, the walk is
-skipped rather than spun on — the watchdog must never block. A `MAX_WALK` bound
-caps a corrupted-into-a-cycle list so the already-fatal dump still terminates.
+skipped rather than spun on — the watchdog must never block. `for_each` blocks
+on the lock and visits every node: teardown must not skip a thread. Neither
+walk is length-bounded; a list corrupted into a cycle is detected by a
+tortoise-and-hare probe — the watchdog walk simply stops there, the teardown
+walk halts the kernel (`fatal`), since a thread it cannot reach could still be
+running on the object being freed.
+
+**Object teardown (`stop_threads_bound_to`).** Deleting the last capability to
+a `CSpace` or `AddressSpace` must not free storage a bound thread is still
+using, so `dealloc_object` for either type first stops every thread bound to
+it. Phase 1 (`mark_bound_threads`) walks the registry under its lock — a TCB
+found there cannot be unregistered, and so cannot be freed, until the walk
+ends — and for each bound thread not already `Exited`: cancels its IPC block
+if `Blocked` (`cancel_ipc_block`, the `sys_thread_stop` primitive), writes
+`Exited` under the all-locks discipline (`exit_under_all_locks`, draining
+every run queue) with `EXIT_KILLED` recorded as its retained exit reason in
+the same hold (the stop posts no death event — an observer bound afterwards
+receives the retained reason through the bind; a commit refused because the
+thread exited on its own meanwhile writes neither, and that thread still posts
+its own reason — only the retained value says killed), and records the CPU it
+was running on. Phase 2, after releasing the registry lock, prods those CPUs and
+spins — interrupts enabled, preemption disabled, as the dealloc UAF gate does
+— until no CPU other than the caller's has a bound thread as `current`. A
+bound thread found `current` but not `Exited` was bound after the walk (a
+`sys_cap_create_thread` whose unlocked cap lookup raced the object's last
+delete); the loop returns to phase 1 for it. The spin has no bound and warns
+once after 100 ms.
+
+*The caller is itself stopped.* `stop_threads_bound_to` returns `true`, and
+skips the wait, when the running thread has been marked `Exited`: it was bound
+to the object (it deleted the last capability to its own `CSpace` or
+`AddressSpace`, directly or through a teardown cascade), or a concurrent
+teardown on another CPU stopped it while it waited — two teardowns each bound
+to the other's object would otherwise spin on each other forever, both
+preempt-disabled, so every iteration of the phase-2 spin re-reads the running
+thread's own state. The caller then frees nothing: it pushes the object onto
+this CPU's deferred-reclaim stack (`push_deferred_reclaim`, the #341 mechanism
+generalised to `CSpace` and `AddressSpace` objects) and returns, the syscall
+epilogue schedules the thread away, and `drain_deferred_reclaim` re-enters the
+teardown from a context bound to nothing queued there, where the bound threads
+are all already `Exited` and off-CPU.
+
+*AddressSpace root free.* `current` changing hands is not enough for an
+`AddressSpace`: the CPU switching away clears its `active_cpus` bit and loads
+the next root only afterwards, outside the locks (`schedule()`'s address-space
+switch). The `AddressSpace` arm therefore also spins in
+`wait_until_aspace_inactive` (breadcrumb `dealloc:as-active`) until
+`active_cpus` is empty before freeing the root page table; nothing can set a
+bit anew, because every bound thread is `Exited` and off every run queue and
+the dispatch flip aborts on an `Exited` candidate before the switch. This spin
+bails the same way as phase 2 if the running thread is stopped meanwhile.
+
+Stopped threads are dead but not freed — each Thread object lives until its own
+last capability goes, and `dealloc_object(Thread)` then runs its full drain
+protocol on an already-`Exited`, off-CPU thread (the off-CPU wait itself is the
+shared `wait_until_off_cpu`). The unlocked cap lookup in
+`sys_cap_create_thread` is not a window either: after `register`, the syscall
+looks both capabilities up again and requires the same objects. A teardown
+that ran between the first lookup and the registration removed the last
+capability to its object, so the second lookup fails and the create rolls
+back; a teardown that starts after the registration finds the thread in the
+walk. The lifecycle syscalls are not a window: `sys_thread_start` and
+`sys_thread_stop` read the target's state without a lock, but their commits
+refuse a target that is `Exited` under the locks (§ ThreadState
+Transitions), so a thread the walk stopped cannot be revived and linked
+behind the `current`-only phase-2 scan.
 
 **Not a scheduling structure.** The registry is never read on any hot path; it
-adds one leaf-lock acquire at thread create/destroy and nothing elsewhere.
+adds one lock acquire at thread create/destroy and a walk per `CSpace` or
+`AddressSpace` teardown.
 
 ---
 
 ## Summarized By
 
-[kernel/README.md](../README.md)
+[kernel/README.md](../README.md), [capability-internals.md](capability-internals.md)

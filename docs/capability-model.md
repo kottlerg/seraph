@@ -24,8 +24,9 @@ The CSpace has the following properties:
 - **Stable indices** — a capability descriptor remains valid for the lifetime of
   the capability; the kernel never moves or renumbers existing slots
 - **O(1) lookup** — descriptor-to-capability resolution MUST be O(1)
-- **Per-process ceiling** — each process has a maximum CSpace size enforced by the
-  kernel
+- **Pay-as-you-go** — capacity is whatever the owner-funded slot-page pool
+  backs (see growth budgets below), bounded only by the directory's
+  structural ceiling
 
 Slot 0 is permanently null and cannot be written — using index 0 always means "no
 capability".
@@ -433,6 +434,16 @@ now-stale handle fail closed rather than alias a recycled slot (#349). (A move w
 the same CSpace likewise keeps the source's position.) To delegate a capability while
 keeping your own copy, use `SYS_CAP_COPY` instead (see [Revocation](#revocation)).
 
+The capabilities derived from a moved capability follow it: the move rewrites
+every child's parent link, in batches with the derivation lock released between
+them when the list is large. While a move is in flight both slots are pinned —
+the same refusal an in-flight revocation imposes on its root — so no other
+operation can tear the migration, and every descendant stays within its
+ancestors' revocation reach throughout, with one exception the kernel shares
+with every other slot: a CSpace torn down while the move is in flight releases
+the children hanging under its dying slots as derivation roots. See
+[capability-internals.md](../core/kernel/docs/capability-internals.md) § Move.
+
 
 ---
 
@@ -604,18 +615,24 @@ for devmgr's specific initial capability set.
 Since there is no Process kernel object, terminating a process is a userspace
 (procmgr) policy, not a single kernel operation. procmgr revokes the capabilities
 backing the process's threads; each revocation stops that thread and removes it
-from the run queues. The kernel does not track which threads belong to an address
-space and never bulk-terminates threads on its own. The process's resources are
-reclaimed as their capability reference counts reach zero.
+from the run queues. The kernel never terminates threads by policy of its own;
+the one thing it enforces is that a thread cannot outlive the `CSpace` or
+`AddressSpace` it is bound to: when the last capability to either object is
+deleted, every thread bound to it is stopped before the object's storage is
+reclaimed, wherever those threads' own capabilities are held — including the
+deleting thread itself, when it holds that last capability to its own
+`CSpace` or `AddressSpace` (the delete then never returns to it). The
+process's resources are reclaimed as their capability reference counts reach
+zero.
 
-The kernel's only role in death is *notification*. An `AddressSpace` carries a
-death-observer set (mirroring the per-thread death observers). On a terminal
-fault by any thread in the address space — no fault handler bound, or the handler
-replied `KILL` — the kernel posts the fault class (`EXIT_FAULT_BASE + vector`) to
-each bound observer and exits the faulting thread. procmgr binds such an observer
-at process creation, so a fatal fault on any thread — a worker, not just the main
-thread — drives procmgr's teardown of the whole process. Normal thread exit does
-not fire these observers.
+Beyond that stop, the kernel's role in death is *notification*. An
+`AddressSpace` carries a death-observer set (mirroring the per-thread death
+observers). On a terminal fault by any thread in the address space — no fault
+handler bound, or the handler replied `KILL` — the kernel posts the fault class
+(`EXIT_FAULT_BASE + vector`) to each bound observer and exits the faulting
+thread. procmgr binds such an observer at process creation, so a fatal fault on
+any thread — a worker, not just the main thread — drives procmgr's teardown of
+the whole process. Normal thread exit does not fire these observers.
 
 ---
 

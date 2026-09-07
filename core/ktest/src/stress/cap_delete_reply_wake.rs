@@ -146,9 +146,9 @@ pub fn run(ctx: &TestContext) -> TestResult
             .map_err(|_| "stress::cap_delete_reply_wake: cap_copy client ep failed")?;
         let client_done = cap_copy(done, client.cs, RIGHTS_SIGNAL)
             .map_err(|_| "stress::cap_delete_reply_wake: cap_copy client done failed")?;
-        // arg packs ep_slot[15:0] | done_slot[31:16]; the child reads its own
+        // arg packs ep_slot[31:0] | done_slot[63:32]; the child reads its own
         // dedicated IPC buffer address from the static directly.
-        let client_arg = u64::from(client_ep) | (u64::from(client_done) << 16);
+        let client_arg = u64::from(client_ep) | (u64::from(client_done) << 32);
         // SAFETY: stack index 1 is the client's; sequential cycles never alias.
         let client_stack = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[1]) });
         spawn::configure_and_start_pinned(
@@ -172,7 +172,7 @@ pub fn run(ctx: &TestContext) -> TestResult
             .map_err(|_| "stress::cap_delete_reply_wake: cap_copy server ep failed")?;
         let server_done = cap_copy(done, server.cs, RIGHTS_SIGNAL)
             .map_err(|_| "stress::cap_delete_reply_wake: cap_copy server done failed")?;
-        let server_arg = u64::from(server_ep) | (u64::from(server_done) << 16);
+        let server_arg = u64::from(server_ep) | (u64::from(server_done) << 32);
         // SAFETY: stack index 0 is the server's; sequential cycles never alias.
         let server_stack = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[0]) });
         spawn::configure_and_start_pinned(
@@ -255,14 +255,14 @@ pub fn run(ctx: &TestContext) -> TestResult
 // ── Child entries ───────────────────────────────────────────────────────────
 
 /// Decode the two packed fields shared by both child entries:
-/// `ep_slot[15:0]`, `done_slot[31:16]` (cap slot indices in the child's own
+/// `ep_slot[31:0]`, `done_slot[63:32]` (cap handles in the child's own
 /// `CSpace`). Each child reads its dedicated IPC buffer from its module static.
 // cast_possible_truncation: ep/done are kernel cap slot indices < 2^32.
 #[allow(clippy::cast_possible_truncation)]
 fn decode(arg: u64) -> (u32, u32)
 {
-    let ep_slot = (arg & 0xFFFF) as u32;
-    let done_slot = ((arg >> 16) & 0xFFFF) as u32;
+    let ep_slot = (arg & 0xFFFF_FFFF) as u32;
+    let done_slot = (arg >> 32) as u32;
     (ep_slot, done_slot)
 }
 

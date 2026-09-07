@@ -234,13 +234,16 @@ pub struct PerCpuScheduler
     /// docs/scheduling-internals.md § Off-Stack Scratch for Ceiling-Sized Arrays.
     pub saved_lock_flags: u64,
 
-    /// Head of this CPU's deferred self-teardown reclaim stack (#341). Holds
-    /// `Thread` objects whose owner deleted the last capability to itself: the
-    /// inline `dealloc_object` drain gate cannot run for the running thread on
-    /// its own CPU, so the object is queued here and freed off-CPU by
-    /// `crate::cap::object::drain_deferred_reclaim`. Typed opaquely (`*mut u8`,
-    /// really `*mut cap::object::ThreadObject`) to avoid a sched→cap layering
-    /// edge; the object module owns the cast and the intrusive link field.
+    /// Head of this CPU's deferred reclaim stack (#341). Holds objects whose
+    /// free could not complete on the thread that dropped their last
+    /// capability: a `Thread` object deleted by its own thread (the inline
+    /// `dealloc_object` drain gate cannot run for the running thread on its
+    /// own CPU), or a `CSpace` / `AddressSpace` whose teardown stopped the
+    /// running thread itself. Each is freed off-CPU by
+    /// `crate::cap::object::drain_deferred_reclaim`. Typed opaquely (`*mut
+    /// u8`, really `*mut cap::object::KernelObjectHeader`) to avoid a
+    /// sched→cap layering edge; the object module owns the cast and the
+    /// per-type intrusive link field.
     pub deferred_reclaim_head: core::sync::atomic::AtomicPtr<u8>,
 }
 

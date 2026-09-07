@@ -345,10 +345,12 @@ pub const CAP_INFO_ASPACE_PT_BUDGET: u64 = 4;
 /// the remaining growth-budget pages would back, clamped to the highest
 /// reachable count (the directory's structural ceiling minus the
 /// permanently reserved slot 0). Grows with augment-mode
-/// `cap_create_cspace` donations. A mild over-estimate on a `CSpace` that
-/// has not yet allocated its first page (slot 0 is reserved); subtracting
-/// [`CAP_INFO_CSPACE_USED`] yields headroom, which tolerates that. Calling
-/// on a non-`CSpace` slot returns [`SyscallError::InvalidArgument`].
+/// `cap_create_cspace` donations. A mild over-estimate: the first page's
+/// reserved slot 0 is counted before that page exists, and deep growth
+/// spends an occasional budget page on a directory page that backs no
+/// slots. Subtracting [`CAP_INFO_CSPACE_USED`] yields headroom, which
+/// tolerates both. Calling on a non-`CSpace` slot returns
+/// [`SyscallError::InvalidArgument`].
 pub const CAP_INFO_CSPACE_CAPACITY: u64 = 5;
 
 /// `CSpace` only — number of currently populated (non-null) slots.
@@ -787,14 +789,16 @@ const _: () = assert!(MAP_EXECUTABLE == RIGHTS_MEM_EXECUTE);
 // a thread or process dies. It is a single flat space partitioned into disjoint
 // ranges, kernel-owned so userspace can never forge a fault or kill reason:
 //
-//   | Reason            | Class               | Meaning                          |
-//   |-------------------|---------------------|----------------------------------|
-//   | `0`               | Voluntary, clean    | success (`SYS_THREAD_EXIT`, or    |
-//   |                   |                     | `SYS_PROCESS_EXIT(0)`)            |
-//   | `1 ..= 0x0FFF`    | Voluntary, code     | `SYS_PROCESS_EXIT(code)`, where   |
-//   |                   |                     | reason == `encode_exit_code(code)`|
-//   | `0x1000 ..0x2000` | Fault               | `EXIT_FAULT_BASE + vector/cause`  |
-//   | `0x2000`          | Killed (synthetic)  | `EXIT_KILLED`; never kernel-emitted|
+//   | Reason            | Class               | Meaning                            |
+//   |-------------------|---------------------|------------------------------------|
+//   | `0`               | Voluntary, clean    | success (`SYS_THREAD_EXIT`, or     |
+//   |                   |                     | `SYS_PROCESS_EXIT(0)`)             |
+//   | `1 ..= 0x0FFF`    | Voluntary, code     | `SYS_PROCESS_EXIT(code)`, where    |
+//   |                   |                     | reason == `encode_exit_code(code)` |
+//   | `0x1000 ..0x2000` | Fault               | `EXIT_FAULT_BASE + vector/cause`   |
+//   | `0x2000`          | Killed              | `EXIT_KILLED`: recorded by         |
+//   |                   |                     | object teardown (not posted by     |
+//   |                   |                     | it); posted by a userspace kill    |
 //
 // This is a Seraph-native encoding, not POSIX: exit codes are not 8-bit
 // `WEXITSTATUS`-truncated, and faults are native fault classes, not signals.
@@ -809,11 +813,17 @@ pub const EXIT_VOLUNTARY: u64 = 0;
 /// alias.
 pub const EXIT_FAULT_BASE: u64 = 0x1000;
 
-/// Synthetic exit reason for a process killed by its supervisor (address-space
-/// cap revoked). Posted by userspace (e.g. `std::process::Child::kill`) so a
-/// waiter observes a defined status; the kernel never records this value — a
-/// revoke-driven teardown is silent on the kernel side. Sits just above the
-/// fault range so consumers tell a user-initiated kill from a hardware fault.
+/// Exit reason of a thread killed rather than exited or faulted. The kernel
+/// records it as the retained reason of every thread it stops when the last
+/// capability to the thread's `CSpace` or `AddressSpace` goes (readable via
+/// `CAP_INFO_THREAD_STATE`). That stop posts no death event: an observer
+/// bound before it hears nothing from the kernel, while one bound afterwards
+/// receives the retained reason through the bind. A thread stopped while
+/// already inside its own exit or fault path still posts that path's reason;
+/// `EXIT_KILLED` is then at most the retained value. Userspace posts the same
+/// value (e.g. `std::process::Child::kill`) so a waiter observes a defined
+/// status. Sits just above the fault range so consumers tell a kill from a
+/// hardware fault.
 pub const EXIT_KILLED: u64 = 0x2000;
 
 /// Encode a voluntary process exit `code` into the flat exit-reason space.

@@ -1264,6 +1264,7 @@ unsafe fn kernel_entry_post_rebase(
                         saved_state: init_saved,
                         kernel_stack_top: kstack_top,
                         trap_frame: core::ptr::null_mut(),
+                        syscall_nr: core::sync::atomic::AtomicU64::new(u64::MAX),
                         address_space: init_as_ptr,
                         ipc_buffer: 0,
                         wakeup_value: 0,
@@ -1271,6 +1272,8 @@ unsafe fn kernel_entry_post_rebase(
                         iopb: core::ptr::null_mut(),
                         blocked_on_object: core::ptr::null_mut(),
                         cspace: core::ptr::null_mut(),
+                        cspace_id: 0,
+                        cspace_epoch: 0,
                         // Init's tid is the one intentionally-stable thread
                         // correlator (kept for early-boot log triage); idle
                         // threads and all dynamically-created threads draw a
@@ -1300,10 +1303,10 @@ unsafe fn kernel_entry_post_rebase(
                         deferred_next: core::ptr::null_mut(),
                     },
                 );
-                // Diagnostic registry: thread the init TCB onto the live-thread
-                // list so the softlockup watchdog can enumerate it as a Blocked
-                // waiter (#351). Removed by `dealloc_object(Thread)` if init's
-                // Thread cap is ever deleted/revoked.
+                // Thread the init TCB onto the live-thread registry (watchdog
+                // enumeration of Blocked waiters, #351; object-teardown stop
+                // walk). Removed by `dealloc_object(Thread)` if init's Thread
+                // cap is ever deleted/revoked.
                 sched::thread_registry::register(tcb_ptr);
             }
             seed.header.inc_ref();
@@ -1387,7 +1390,12 @@ unsafe fn kernel_entry_post_rebase(
             fatal("Phase 9: ROOT_CSPACE missing");
         }
         // SAFETY: init_tcb was just retyped above and is valid; single-threaded boot.
-        unsafe { (*init_tcb).cspace = init_cspace_ptr };
+        unsafe {
+            let id = (*init_cspace_ptr).id();
+            (*init_tcb).cspace = init_cspace_ptr;
+            (*init_tcb).cspace_id = id;
+            (*init_tcb).cspace_epoch = cap::registry_epoch(id);
+        }
 
         // Enqueue init on the BSP scheduler at INIT_PRIORITY.
         // SAFETY: scheduler initialized in Phase 8; single-threaded boot phase;

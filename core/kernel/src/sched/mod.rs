@@ -355,7 +355,8 @@ static TICK_HEARTBEAT: [core::sync::atomic::AtomicU64; MAX_CPUS] =
 /// Spin-site code: this CPU is not in any bounded protocol-spin.
 pub const SPIN_SITE_NONE: u32 = 0;
 /// `dealloc_object(Thread)` UAF gate, step 1: spinning until the dying TCB is
-/// no longer `current` on any CPU.
+/// no longer `current` on any CPU. Also `stop_threads_bound_to`'s phase-2
+/// spin, which waits for the same condition over every bound thread.
 pub const SPIN_SITE_DEALLOC_NOT_CURRENT: u32 = 1;
 /// `dealloc_object(Thread)` UAF gate, step 2: spinning until the dying TCB's
 /// in-flight register save has published (`context_saved == 1`).
@@ -366,16 +367,21 @@ pub const SPIN_SITE_DEALLOC_WAKE_IN_FLIGHT: u32 = 3;
 /// `schedule()` dispatch barrier: spinning until the next thread's previous
 /// CPU publishes its register save (`context_saved == 1`).
 pub const SPIN_SITE_SCHED_CONTEXT_SAVED: u32 = 4;
+/// `dealloc_object(AddressSpace)` root-free gate: spinning until no CPU has
+/// the dying address space loaded (`active_cpus` empty).
+pub const SPIN_SITE_DEALLOC_AS_ACTIVE: u32 = 5;
 
 /// Per-CPU breadcrumb naming the bounded protocol-spin a CPU is currently
 /// executing, for the softlockup watchdog. A wedged CPU (no non-idle dispatch
 /// for the threshold) stuck in a `dealloc_object(Thread)` gate shows the gate
 /// here, turning an opaque `current = Exited` dump into a named site (#351).
 /// Set on gate entry, cleared on exit; [`SPIN_SITE_NONE`] when not spinning.
-/// The reporting sites are the three `dealloc_object(Thread)` gates and the
-/// `schedule()` context-saved dispatch barrier — the protocol spins that can
-/// wedge a CPU silently (the `sys_thread_stop` drain carries its own
-/// overlong-duration warning). Diagnostic-only — never gates control flow.
+/// The reporting sites are the three `dealloc_object(Thread)` gates (the
+/// first of which `stop_threads_bound_to`'s phase-2 spin shares), the
+/// `dealloc_object(AddressSpace)` root-free gate, and the `schedule()`
+/// context-saved dispatch barrier — the protocol spins that can wedge a CPU
+/// silently (the `sys_thread_stop` drain carries its own overlong-duration
+/// warning). Diagnostic-only — never gates control flow.
 #[cfg(not(test))]
 static SPIN_SITE: [core::sync::atomic::AtomicU32; MAX_CPUS] =
     [const { core::sync::atomic::AtomicU32::new(SPIN_SITE_NONE) }; MAX_CPUS];
@@ -414,6 +420,7 @@ fn spin_site_name(site: u32) -> &'static str
         SPIN_SITE_DEALLOC_CONTEXT_SAVED => "dealloc:context-saved",
         SPIN_SITE_DEALLOC_WAKE_IN_FLIGHT => "dealloc:wake-in-flight",
         SPIN_SITE_SCHED_CONTEXT_SAVED => "schedule:context-saved",
+        SPIN_SITE_DEALLOC_AS_ACTIVE => "dealloc:as-active",
         _ => "none",
     }
 }
@@ -425,6 +432,323 @@ pub fn spin_site_enter(_site: u32) {}
 /// Test stub; see [`spin_site_enter`].
 #[cfg(test)]
 pub fn spin_site_exit() {}
+
+/// The bare spin locks the softlockup watchdog can name. The lock-wait
+/// breadcrumb and the preemptible-hold tripwire are keyed by this kind; the
+/// discriminant is the breadcrumb encoding (0 means no wait).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u32)]
+pub enum LockKind
+{
+    /// `cap::derivation::DERIVATION_LOCK` (write side).
+    Derivation = 1,
+    /// A `MemoryObject` read lock.
+    MemoryRead = 2,
+    /// A `MemoryObject` write lock.
+    MemoryWrite = 3,
+    /// A `MemoryObject`'s retype-allocator lock (a 64-bit word).
+    RetypeAlloc = 4,
+    /// A `CSpace` or `AddressSpace` wrapper's pool lock (a 64-bit word).
+    Pool = 5,
+    /// The kernel page-table pool lock (`mm::kernel_pt_pool`, a byte).
+    KernelPtPool = 6,
+}
+
+impl LockKind
+{
+    /// Number of kinds; the exhaustive match ties it to the variant set.
+    #[cfg(not(test))]
+    const COUNT: usize = match Self::Derivation
+    {
+        Self::Derivation
+        | Self::MemoryRead
+        | Self::MemoryWrite
+        | Self::RetypeAlloc
+        | Self::Pool
+        | Self::KernelPtPool => 6,
+    };
+
+    /// Every kind, for decoding a breadcrumb.
+    #[cfg(not(test))]
+    const ALL: [Self; Self::COUNT] = [
+        Self::Derivation,
+        Self::MemoryRead,
+        Self::MemoryWrite,
+        Self::RetypeAlloc,
+        Self::Pool,
+        Self::KernelPtPool,
+    ];
+
+    /// Human-readable name for the watchdog dump.
+    #[cfg(not(test))]
+    pub fn name(self) -> &'static str
+    {
+        match self
+        {
+            Self::Derivation => "derivation",
+            Self::MemoryRead => "memory-object read",
+            Self::MemoryWrite => "memory-object write",
+            Self::RetypeAlloc => "retype-allocator",
+            Self::Pool => "wrapper pool",
+            Self::KernelPtPool => "kernel page-table pool",
+        }
+    }
+
+    /// Width in bytes of the lock's state word.
+    #[cfg(not(test))]
+    fn word_width(self) -> usize
+    {
+        match self
+        {
+            Self::RetypeAlloc | Self::Pool => 8,
+            Self::Derivation | Self::MemoryRead | Self::MemoryWrite => 4,
+            Self::KernelPtPool => 1,
+        }
+    }
+
+    /// Decode a breadcrumb encoding; `None` for 0 (no wait) or garbage.
+    #[cfg(not(test))]
+    fn from_code(code: u32) -> Option<Self>
+    {
+        Self::ALL.into_iter().find(|kind| *kind as u32 == code)
+    }
+}
+
+/// Breadcrumb encoding for "no lock wait recorded".
+#[cfg(not(test))]
+const LOCK_WAIT_NONE: u32 = 0;
+
+/// Per-CPU breadcrumb naming the bare spin lock a CPU is currently waiting
+/// for, for the softlockup watchdog: the lock kind (every [`LockKind`]) and
+/// the address of its state word. These locks spin with interrupts masked
+/// (syscall context), inside a preempt-disabled window, or inside the idle
+/// thread's deferred reclaim, so a CPU wedged on one shows no protocol spin
+/// site and looks silent or idle; this breadcrumb names the lock and lets
+/// the dump read its state word. Recorded only once the first acquisition
+/// attempt fails, so the uncontended fast path stores nothing.
+/// Diagnostic-only — never gates control flow.
+#[cfg(not(test))]
+static LOCK_WAIT_KIND: [core::sync::atomic::AtomicU32; MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU32::new(LOCK_WAIT_NONE) }; MAX_CPUS];
+/// Address of the state word the CPU is waiting on; see [`LOCK_WAIT_KIND`].
+#[cfg(not(test))]
+static LOCK_WAIT_WORD: [core::sync::atomic::AtomicU64; MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; MAX_CPUS];
+
+/// Record that the current CPU is spinning for the lock of kind `kind` whose
+/// state word lives at address `word`. Callers spin with interrupts masked,
+/// preemption disabled, or on the idle thread, so the CPU index is stable
+/// across the wait. The word is published before the kind (Release), so a
+/// reader that sees the kind sees the word it was recorded with.
+#[cfg(not(test))]
+pub fn lock_wait_enter(kind: LockKind, word: usize)
+{
+    let cpu = crate::arch::current::cpu::current_cpu() as usize;
+    if cpu < MAX_CPUS
+    {
+        LOCK_WAIT_WORD[cpu].store(word as u64, core::sync::atomic::Ordering::Relaxed);
+        LOCK_WAIT_KIND[cpu].store(kind as u32, core::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Clear the current CPU's lock-wait breadcrumb once the lock is acquired:
+/// the kind first, so a reader that re-checks the kind after loading the
+/// word discards the pair, then the word.
+#[cfg(not(test))]
+pub fn lock_wait_exit()
+{
+    let cpu = crate::arch::current::cpu::current_cpu() as usize;
+    if cpu < MAX_CPUS
+    {
+        LOCK_WAIT_KIND[cpu].store(LOCK_WAIT_NONE, core::sync::atomic::Ordering::Release);
+        LOCK_WAIT_WORD[cpu].store(0, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Current CPU index plus one, for lock-holder stamps (0 means no holder).
+#[cfg(not(test))]
+pub fn cpu_stamp() -> u32
+{
+    crate::arch::current::cpu::current_cpu().wrapping_add(1)
+}
+
+/// This CPU's `current`, read through the raw scheduler slot so no `&mut`
+/// is minted (a caller up the stack may hold a scheduler reference); null
+/// before the scheduler storage exists, when the CPU index is out of range,
+/// or before this CPU has dispatched a thread.
+#[cfg(not(test))]
+fn running_tcb_raw() -> *mut thread::ThreadControlBlock
+{
+    let base = SCHEDULERS_PTR.load(core::sync::atomic::Ordering::Acquire);
+    if base.is_null()
+    {
+        return core::ptr::null_mut();
+    }
+    let cpu = crate::arch::current::cpu::current_cpu() as usize;
+    if cpu >= CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize
+    {
+        return core::ptr::null_mut();
+    }
+    // SAFETY: `scheduler_ptr`'s contract, both parts checked above: the
+    // storage exists (non-null base, published after `CPU_COUNT`) and
+    // `cpu < CPU_COUNT`, which the allocation covers; a plain read of the
+    // slot's `current`.
+    unsafe { (*base.add(cpu)).current }
+}
+
+/// `(thread id, syscall number)` of the running thread, for lock-holder
+/// stamps: `(0, u64::MAX)` before this CPU has dispatched a thread (boot),
+/// and `u64::MAX` for a thread outside a syscall — the idle thread (whose
+/// id is an ordinary registry id) or a kernel path entered without a
+/// syscall. Diagnostic only: in the preemptible state
+/// `check_lock_hold_preemptible` reports, the values may describe another
+/// thread (see the safety argument inside).
+#[cfg(not(test))]
+pub fn holder_info() -> (u32, u64)
+{
+    let tcb = running_tcb_raw();
+    if tcb.is_null()
+    {
+        return (0, u64::MAX);
+    }
+    // SAFETY: `tcb` names the calling thread unless the caller was preempted
+    // between `running_tcb_raw`'s CPU-index read and its load — possible
+    // only in the preemptible state `check_lock_hold_preemptible` exists to
+    // report, where the pointer may then name another CPU's thread, even one
+    // freed since. Every read is a word of the TCB, which lives in a retype
+    // slab or the boot-allocated idle slab — direct-map memory that stays
+    // mapped — so none can fault, and no pointer read from the TCB is
+    // followed. `magic` and `thread_id` are read with volatile loads because
+    // a teardown on another CPU may poison the slot concurrently (its poison
+    // stores are volatile too; the pair is a deliberate race): a freed slot
+    // fails the magic check; a slot already recycled into a new thread
+    // passes it, and the `thread_id` read then names that thread — nothing
+    // orders the two loads against the recycle, so they may even straddle
+    // it. Either way a torn or stale read only changes which branch this
+    // diagnostic takes.
+    unsafe {
+        if core::ptr::read_volatile(core::ptr::addr_of!((*tcb).magic)) != thread::TCB_MAGIC
+        {
+            return (0, u64::MAX);
+        }
+        (
+            core::ptr::read_volatile(core::ptr::addr_of!((*tcb).thread_id)),
+            (*tcb)
+                .syscall_nr
+                .load(core::sync::atomic::Ordering::Relaxed),
+        )
+    }
+}
+
+/// Test stubs: lock-wait breadcrumbs and holder stamps are diagnostic-only
+/// and compiled out under host `cfg(test)`.
+#[cfg(test)]
+pub fn lock_wait_enter(_kind: LockKind, _word: usize) {}
+/// Test stub; see [`lock_wait_enter`].
+#[cfg(test)]
+pub fn lock_wait_exit() {}
+/// Test stub; see [`cpu_stamp`].
+#[cfg(test)]
+pub fn cpu_stamp() -> u32
+{
+    1
+}
+/// Test stub; see [`holder_info`].
+#[cfg(test)]
+pub fn holder_info() -> (u32, u64)
+{
+    (0, u64::MAX)
+}
+
+/// Per-kind one-shot latch for [`check_lock_hold_preemptible`]: bit
+/// `1 << (kind as u32)` for each [`LockKind`].
+#[cfg(not(test))]
+static PREEMPTIBLE_HOLD_REPORTED: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+/// Whether `tcb` is this CPU's idle TCB. The idle thread never migrates, so
+/// the calling thread is idle exactly when it is its own CPU's idle TCB; a
+/// user thread that migrates between the CPU-index read and the load still
+/// compares unequal to whichever idle TCB is read. Reads `idle` through the
+/// raw scheduler slot, so it may run while a caller up the stack holds a
+/// reference into the same scheduler.
+///
+/// # Safety
+/// The scheduler storage must be initialised — a non-null
+/// [`running_tcb_raw`] establishes it, since it returns null otherwise.
+/// The CPU index read here is then below `CPU_COUNT` on any CPU executing
+/// kernel code: every online CPU's id is below the published count, and a
+/// caller migrated since `running_tcb_raw` ran is still on an online CPU.
+#[cfg(not(test))]
+unsafe fn is_idle_tcb(tcb: *const thread::ThreadControlBlock) -> bool
+{
+    let cpu = crate::arch::current::cpu::current_cpu() as usize;
+    // SAFETY: storage initialised per the caller contract and `cpu` is an
+    // online CPU's index; `idle` is written once at init.
+    let idle = unsafe { (*scheduler_ptr(cpu)).idle };
+    core::ptr::eq(tcb, idle)
+}
+
+/// Invariant tripwire for the bare spin locks (docs/scheduling-internals.md
+/// § Lock Hierarchy, "Bare spin locks"): a hold taken from a syscall with
+/// interrupts enabled and preemption enabled can be descheduled by the tick
+/// while held, and every later waiter then spins forever with interrupts
+/// masked. Called before each acquisition of a lock of kind `kind`; reports
+/// the first violation per kind once per boot, naming the thread, syscall,
+/// and call site, and a debug build then halts. Exempt: boot, before this
+/// CPU has dispatched a thread, and the idle thread — it runs its deferred
+/// reclaim with interrupts enabled and preemption enabled, which is sound
+/// only because its time slice is permanently zero, so `timer_tick` never
+/// reaches `schedule()` for it (asserted here).
+#[cfg(not(test))]
+pub fn check_lock_hold_preemptible(kind: LockKind, site: &core::panic::Location<'_>)
+{
+    if !crate::arch::current::interrupts::are_enabled() || crate::percpu::preemption_disabled()
+    {
+        return;
+    }
+    let tcb = running_tcb_raw();
+    if tcb.is_null()
+    {
+        return;
+    }
+    // SAFETY: `tcb` is non-null, so `running_tcb_raw` found the scheduler
+    // storage initialised.
+    if unsafe { is_idle_tcb(tcb) }
+    {
+        // SAFETY: tcb is this CPU's idle TCB in the boot-allocated idle slab,
+        // which is never freed; its `slice_remaining` is written only by
+        // `timer_tick` on this CPU.
+        let slice = unsafe { (*tcb).slice_remaining };
+        debug_assert!(
+            slice == 0,
+            "idle thread holds a bare spin lock with a live time slice"
+        );
+        return;
+    }
+    let (tid, nr) = holder_info();
+    let bit = 1u32 << (kind as u32);
+    if PREEMPTIBLE_HOLD_REPORTED.fetch_or(bit, core::sync::atomic::Ordering::AcqRel) & bit == 0
+    {
+        crate::kprintln!(
+            "kernel: {} lock taken preemptible: tid={} syscall={} site={}:{} cpu={}",
+            kind.name(),
+            tid,
+            nr,
+            site.file(),
+            site.line(),
+            crate::arch::current::cpu::current_cpu()
+        );
+        debug_assert!(
+            false,
+            "bare spin lock taken with interrupts and preemption enabled"
+        );
+    }
+}
+
+/// Test stub; see [`check_lock_hold_preemptible`].
+#[cfg(test)]
+pub fn check_lock_hold_preemptible(_kind: LockKind, _site: &core::panic::Location<'_>) {}
 
 /// Mark `cpu` as having dispatched a non-idle thread at the current tick.
 pub fn watchdog_mark_non_idle(cpu: usize)
@@ -798,36 +1122,106 @@ fn watchdog_dump(reason: &str)
         {
             crate::kprintln!("    spinning in {}", spin_site_name(spin));
         }
+        // Name the bare spin lock this CPU is waiting for, if any, and read
+        // its state word: these waits spin with interrupts masked, inside a
+        // preempt-disabled window, or on the idle thread, so a wedged CPU is
+        // otherwise indistinguishable from a silent or idle one.
+        // The breadcrumb belongs to another CPU, which may leave and
+        // re-enter a wait meanwhile: the kind is read before and after the
+        // word (Acquire, paired with the writer's Release), and the pair is
+        // used only if both reads agree and the word is a non-zero address
+        // aligned for that kind's width. A wait exited and re-entered
+        // meanwhile can still pair the kind with the earlier word — or,
+        // across two re-entries, with a word recorded for another kind — a
+        // stale but mapped address aligned for the width read, so the line
+        // may be mislabeled but the read stays sound.
+        let kind_before = LOCK_WAIT_KIND[cpu].load(core::sync::atomic::Ordering::Acquire);
+        let word = LOCK_WAIT_WORD[cpu].load(core::sync::atomic::Ordering::Relaxed) as usize;
+        let kind_after = LOCK_WAIT_KIND[cpu].load(core::sync::atomic::Ordering::Acquire);
+        if let Some(lock_kind) = LockKind::from_code(kind_before)
+            && kind_after == kind_before
+            && word != 0
+            && word.is_multiple_of(lock_kind.word_width())
+        {
+            // SAFETY: `word` was recorded by a spinner as the address of a
+            // lock state word, which lives in a static or a retype slab —
+            // kernel direct-map storage that stays mapped for the kernel's
+            // lifetime, even after the slab is recycled — and the checks
+            // above give a non-null address aligned for the width read. The
+            // read is volatile and nothing is written; the value is
+            // diagnostic only.
+            let value = unsafe {
+                match lock_kind.word_width()
+                {
+                    8 => core::ptr::read_volatile(core::ptr::with_exposed_provenance::<u64>(word)),
+                    1 => u64::from(core::ptr::read_volatile(
+                        core::ptr::with_exposed_provenance::<u8>(word),
+                    )),
+                    _ => u64::from(core::ptr::read_volatile(
+                        core::ptr::with_exposed_provenance::<u32>(word),
+                    )),
+                }
+            };
+            crate::kprintln!(
+                "    waiting on {} lock @0x{:x} word=0x{:x}",
+                lock_kind.name(),
+                word,
+                value
+            );
+        }
         // Dump the user-mode trap frame if present: tells us where in
         // userspace the thread entered its currently-stuck syscall.
         // SAFETY: trap_frame is set by every userspace-syscall entry and
         // cleared on userspace return; reading the pointed-to TrapFrame
         // races benignly with concurrent writes (we're already in stall).
-        let (tf_present, tf_ip, tf_syscall_nr) = unsafe {
+        let user_frame = unsafe {
             let s = scheduler_for(cpu);
             let cur = s.current;
-            if cur.is_null()
+            let tf = if cur.is_null()
             {
-                (false, 0u64, 0u64)
+                core::ptr::null_mut()
             }
             else
             {
-                let tf = (*cur).trap_frame;
-                if tf.is_null()
-                {
-                    (false, 0u64, 0u64)
-                }
-                else
-                {
-                    (true, (*tf).instruction_pointer(), (*tf).syscall_nr())
-                }
+                (*cur).trap_frame
+            };
+            if tf.is_null()
+            {
+                None
+            }
+            else
+            {
+                // The syscall number comes from the dispatcher's stamp on
+                // the TCB, not the frame.
+                let nr = (*cur)
+                    .syscall_nr
+                    .load(core::sync::atomic::Ordering::Relaxed);
+                Some(((*tf).instruction_pointer(), nr))
             }
         };
-        if tf_present
+        if let Some((user_pc, syscall_nr)) = user_frame
         {
-            crate::kprintln!("    user_pc=0x{:x} syscall_nr={}", tf_ip, tf_syscall_nr);
+            crate::kprintln!("    user_pc=0x{:x} syscall_nr={}", user_pc, syscall_nr);
         }
     }
+    // Derivation-lock state, holder CPU, and the most recent acquisition's
+    // thread, syscall, and call site: a wedged holder or a leaked hold shows
+    // here as a held state word whose last acquirer is not spinning.
+    let deriv = crate::cap::DERIVATION_LOCK.debug_snapshot();
+    let holder_cpu = i64::from(deriv.holder) - 1;
+    let (site_file, site_line) = deriv
+        .site
+        .map_or(("none", 0), |loc| (loc.file(), loc.line()));
+    crate::kprintln!(
+        "  DERIVATION_LOCK state=0x{:x} holder_cpu={} last_tid={} last_syscall={} \
+         last_site={}:{}",
+        deriv.state,
+        holder_cpu,
+        deriv.tid,
+        deriv.syscall_nr,
+        site_file,
+        site_line
+    );
     // Dump sleep list. Try-lock: a wedged CPU may hold SLEEP_LIST_LOCK, and
     // the dump must not deadlock on it.
     // SAFETY: read-only; paired unlock inside the map closure.
@@ -1587,11 +1981,16 @@ fn idle_thread_entry(_cpu_id: u64) -> !
         {
             let cpu = crate::arch::current::cpu::current_cpu() as usize;
 
-            // Reclaim any threads that self-deleted on this CPU (#341). The
-            // self-teardown path marks the dead thread Exited and queues its
-            // object for off-CPU reclaim; the idle thread is a safe context
-            // (never one of the queued dead threads). Done with interrupts
-            // enabled, before the halt-decision masking below.
+            // Reclaim the objects queued on this CPU (#341): threads that
+            // self-deleted (marked Exited, queued for off-CPU reclaim) and
+            // the last references a batched capability move dropped
+            // (`cap::transfer::release_moved_object`), whose `CSpace` or
+            // `AddressSpace` may still have live bound threads that the
+            // teardown stops here. The idle thread is a safe context: never
+            // one of the queued dead threads, bound to nothing, and — its
+            // time slice permanently zero — never descheduled inside the
+            // teardown's cross-CPU waits. Done with interrupts enabled,
+            // before the halt-decision masking below.
             // SAFETY: idle context on a valid kernel stack.
             unsafe { crate::cap::object::drain_deferred_reclaim(cpu) };
 
@@ -1724,8 +2123,11 @@ pub fn init(cpu_count: u32) -> u32
                     saved_state: saved,
                     kernel_stack_top: stack_top,
                     trap_frame: core::ptr::null_mut(),
+                    syscall_nr: core::sync::atomic::AtomicU64::new(u64::MAX),
                     address_space: core::ptr::null_mut(),
                     cspace: core::ptr::null_mut(),
+                    cspace_id: 0,
+                    cspace_epoch: 0,
                     ipc_buffer: 0,
                     wakeup_value: 0,
                     timed_out: false,
@@ -1739,9 +2141,14 @@ pub fn init(cpu_count: u32) -> u32
                     exit_reason: 0,
                     sleep_deadline: 0,
                     extended: thread::ExtendedState::empty(),
-                    // Idle TCBs are never deallocated and never `Blocked`, and
-                    // are already shown by the watchdog's per-CPU `current` dump,
-                    // so they are not threaded onto the diagnostic registry.
+                    // Idle TCBs stay off the registry: they bind no CSpace
+                    // or address space (null above), so the object-teardown
+                    // walk never needs to stop one — and that same null
+                    // binding is what keeps phase 2's bound-`current` scan
+                    // from seeing an idle `current` as an unmarked bound
+                    // thread it would loop back to a phase 1 that cannot
+                    // mark it. They are never deallocated or `Blocked`, and
+                    // the watchdog's per-CPU `current` dump already shows them.
                     registry_next: core::ptr::null_mut(),
                     registry_prev: core::ptr::null_mut(),
                     magic: thread::TCB_MAGIC,
@@ -1955,7 +2362,6 @@ pub unsafe fn idle_stack_top_for(cpu_id: usize) -> u64
 /// this CPU. No concurrent mutable access may occur without holding the
 /// scheduler lock (Phase 9+).
 #[cfg(not(test))]
-#[allow(dead_code)] // Multi-CPU accessor; called once SMP bringup is implemented.
 pub unsafe fn scheduler_for(id: usize) -> &'static mut PerCpuScheduler
 {
     let cpu_count = CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
@@ -1970,10 +2376,19 @@ pub unsafe fn scheduler_for(id: usize) -> &'static mut PerCpuScheduler
 
 /// Write `tcb.state = new_state` under every CPU's scheduler.lock.
 ///
-/// Returns the CPU whose `current == tcb` (if any), so `sys_thread_stop`
-/// can prod-and-drain a remote Running target. Cost: up to `MAX_CPUS`
-/// spinlock acquires; for lifecycle syscalls only, not hot paths.
-/// See docs/scheduling-internals.md § Cross-CPU TCB Ownership.
+/// Returns [`StateCommit::Committed`] with the CPU whose `current == tcb`
+/// (if any), so `sys_thread_stop` can prod-and-drain a remote Running
+/// target. Cost: up to `MAX_CPUS` spinlock acquires; for lifecycle syscalls
+/// only, not hot paths. See docs/scheduling-internals.md § Cross-CPU TCB
+/// Ownership.
+///
+/// `Exited` is terminal: if `tcb` is already `Exited` when the locks are
+/// held, nothing is written and [`StateCommit::RefusedExited`] is returned.
+/// A lifecycle syscall reads the target's state without a lock before it
+/// commits, so an object teardown or an exit on another CPU can mark the
+/// thread `Exited` in between; a commit that overwrote that mark would
+/// revive the thread as `Ready`, pass the teardown's `current`-only scan,
+/// and later run it against reclaimed storage.
 ///
 /// When `new_state` is `Stopped` or `Exited`, also scans every CPU's run
 /// queue at `tcb.priority` and removes any lingering entry. Closes the
@@ -1991,7 +2406,40 @@ pub unsafe fn scheduler_for(id: usize) -> &'static mut PerCpuScheduler
 pub unsafe fn set_state_under_all_locks(
     tcb: *mut ThreadControlBlock,
     new_state: thread::ThreadState,
-) -> Option<usize>
+) -> StateCommit
+{
+    // SAFETY: caller contract.
+    unsafe { commit_state_under_all_locks(tcb, new_state, None) }
+}
+
+/// Mark `tcb` `Exited` with `exit_reason` recorded under the same all-locks
+/// hold as the state write — every exit path's commit: the thread's own
+/// exit and fault paths, and the object-teardown walk (`EXIT_KILLED`). A
+/// refused commit (the thread is already `Exited`) writes neither, so the
+/// reason recorded by the commit that won survives; an exit path whose
+/// commit lost still posts its own reason (no death walk posts
+/// `EXIT_KILLED`; a bind after the stop delivers it), so a thread killed
+/// mid-exit carries `EXIT_KILLED` only as its retained reason.
+///
+/// # Safety
+/// As for [`set_state_under_all_locks`].
+#[cfg(not(test))]
+pub unsafe fn exit_under_all_locks(tcb: *mut ThreadControlBlock, exit_reason: u64) -> StateCommit
+{
+    // SAFETY: caller contract.
+    unsafe { commit_state_under_all_locks(tcb, thread::ThreadState::Exited, Some(exit_reason)) }
+}
+
+/// Shared body of [`set_state_under_all_locks`] and [`exit_under_all_locks`].
+///
+/// # Safety
+/// As for [`set_state_under_all_locks`].
+#[cfg(not(test))]
+unsafe fn commit_state_under_all_locks(
+    tcb: *mut ThreadControlBlock,
+    new_state: thread::ThreadState,
+    exit_reason: Option<u64>,
+) -> StateCommit
 {
     let cpu_count = CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
 
@@ -2016,44 +2464,60 @@ pub unsafe fn set_state_under_all_locks(
         }
     }
 
-    // Write the state and snapshot priority under all locks so the queue
-    // drain below sees a value coherent with the state we just published.
-    // `sys_thread_set_priority` writes `priority` under the per-TCB `sched_lock`
-    // (`core/kernel/src/syscall/thread.rs`), which this path also holds (outer),
-    // so the priority read here is serialised against that writer.
-    // SAFETY: tcb validated by caller; state/priority fields always valid.
-    let priority = unsafe {
-        (*tcb).state = new_state;
-        (*tcb).priority
-    };
-
-    // Drain stale run-queue entries on Stopped/Exited transitions. The
-    // remove is best-effort: if the TCB isn't linked, it's a no-op. See
-    // docs/scheduling-internals.md § Stopped/Exited drain.
-    if matches!(
-        new_state,
-        thread::ThreadState::Stopped | thread::ThreadState::Exited
-    )
+    // `Exited` is terminal (see the function doc): read under the same locks
+    // every writer of `state` on this path holds.
+    // SAFETY: tcb validated by caller; state field always valid.
+    let exited = unsafe { (*tcb).state == thread::ThreadState::Exited };
+    let mut running_on: Option<usize> = None;
+    if !exited
     {
-        #[allow(clippy::needless_range_loop)]
-        for cpu in 0..cpu_count
+        // Write the state and snapshot priority under all locks so the queue
+        // drain below sees a value coherent with the state we just published.
+        // `sys_thread_set_priority` writes `priority` under the per-TCB
+        // `sched_lock` (`core/kernel/src/syscall/thread.rs`), which this path
+        // also holds (outer), so the priority read here is serialised against
+        // that writer.
+        // SAFETY: tcb validated by caller; state/priority/exit_reason fields
+        // always valid.
+        let priority = unsafe {
+            if let Some(reason) = exit_reason
+            {
+                (*tcb).exit_reason = reason;
+            }
+            (*tcb).state = new_state;
+            (*tcb).priority
+        };
+
+        // Drain stale run-queue entries on Stopped/Exited transitions. The
+        // remove is best-effort: if the TCB isn't linked, it's a no-op. See
+        // docs/scheduling-internals.md § Stopped/Exited drain.
+        if matches!(
+            new_state,
+            thread::ThreadState::Stopped | thread::ThreadState::Exited
+        )
         {
-            // SAFETY: cpu < cpu_count; lock held; tcb valid.
-            unsafe {
-                scheduler_for(cpu).remove_from_queue(tcb, priority);
+            // needless_range_loop: `cpu` indexes the per-CPU scheduler slab
+            // through `scheduler_for`, not a slice — there is no iterator to
+            // prefer.
+            #[allow(clippy::needless_range_loop)]
+            for cpu in 0..cpu_count
+            {
+                // SAFETY: cpu < cpu_count; lock held; tcb valid.
+                unsafe {
+                    scheduler_for(cpu).remove_from_queue(tcb, priority);
+                }
             }
         }
-    }
 
-    // Identify which CPU (if any) currently has tcb as `current`.
-    let mut running_on: Option<usize> = None;
-    for cpu in 0..cpu_count
-    {
-        // SAFETY: cpu < cpu_count; scheduler slab initialised by init().
-        if unsafe { scheduler_for(cpu).current } == tcb
+        // Identify which CPU (if any) currently has tcb as `current`.
+        for cpu in 0..cpu_count
         {
-            running_on = Some(cpu);
-            break;
+            // SAFETY: cpu < cpu_count; scheduler slab initialised by init().
+            if unsafe { scheduler_for(cpu).current } == tcb
+            {
+                running_on = Some(cpu);
+                break;
+            }
         }
     }
 
@@ -2072,18 +2536,503 @@ pub unsafe fn set_state_under_all_locks(
         (*tcb).sched_lock.unlock_raw(tcb_sched_saved);
     }
 
-    running_on
+    if exited
+    {
+        StateCommit::RefusedExited
+    }
+    else
+    {
+        StateCommit::Committed(running_on)
+    }
+}
+
+/// Outcome of [`set_state_under_all_locks`]. A caller committing `Exited`
+/// may discard it (a refusal means the thread already exited); every other
+/// caller must act on a refusal.
+#[must_use]
+#[derive(Clone, Copy, Debug)]
+pub enum StateCommit
+{
+    /// The state was written; the payload names the CPU whose `current` is
+    /// the thread, if any.
+    Committed(Option<usize>),
+    /// Nothing was written: the thread is `Exited`, which is terminal.
+    RefusedExited,
+}
+
+/// Wait until `tcb` has left every CPU and its in-flight register save has
+/// published — `dealloc_object(Thread)`'s UAF gate. (The object-teardown
+/// stop path, [`stop_threads_bound_to`], waits only for its bound threads
+/// to leave `current`; their register save is gated here when each Thread
+/// object is later freed.)
+///
+/// # Safety
+/// `tcb` must be a valid TCB already marked `Stopped` or `Exited` and
+/// unlinked from every run queue under the all-locks discipline (so no CPU
+/// can re-install it), and must not be the running thread on this CPU. No
+/// scheduler lock may be held.
+#[cfg(not(test))]
+pub unsafe fn wait_until_off_cpu(tcb: *mut ThreadControlBlock)
+{
+    let cpu_count = CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
+    // SAFETY: caller contract; the spins only read scheduler state under
+    // each CPU's lock and the TCB's atomic save flag.
+    unsafe {
+        // UAF gate: a TCB that is `current` on any CPU MUST NOT be
+        // reclaimed until every CPU has switched away from it AND
+        // the in-flight register save has published. Two steps:
+        //
+        //   1. Spin until `tcb` is not `current` on ANY CPU —
+        //      unconditional, across every CPU. A single-CPU wait
+        //      keyed on one all-locks snapshot would be insufficient:
+        //      such a snapshot names at most one CPU and can be stale
+        //      the instant the locks drop (a CPU mid-`schedule()` may
+        //      install or retain `tcb` as `current` after it was
+        //      taken). #207.
+        //   2. Spin until `context_saved == 1`, covering the window
+        //      where a CPU set `current = next` and dropped its lock
+        //      but `switch()` has not yet saved `tcb`'s registers.
+        //
+        // The spins run with interrupts ENABLED and preemption
+        // DISABLED, mirroring `mm::tlb_shootdown::shootdown`. We
+        // enter dealloc from a syscall with `IF=0`; spinning here
+        // with `IF=0` blocks incoming IPIs (FPU flush, TLB
+        // shootdown) targeted at this CPU and deadlocks them.
+        // Enabling IF lets us service those, while `preempt_disable`
+        // keeps the scheduler from migrating us mid-dealloc.
+        crate::percpu::preempt_disable();
+        // SAFETY: ring 0; saved in matching restore below.
+        let saved_int = crate::arch::current::cpu::save_and_disable_interrupts();
+        // SAFETY: ring 0; IDT loaded; preempt disabled.
+        crate::arch::current::interrupts::enable();
+
+        // Step 1: not `current` on any CPU. Find the (at most one)
+        // CPU still running `tcb`, spin on just that CPU's lock
+        // until it switches away, then re-scan; once a full scan is
+        // clean, no CPU can re-install `tcb` (it is `Exited` and
+        // unlinked from every run queue under the all-locks region).
+        crate::sched::spin_site_enter(crate::sched::SPIN_SITE_DEALLOC_NOT_CURRENT);
+        loop
+        {
+            let run_cpu = 'scan: {
+                for cpu in 0..cpu_count
+                {
+                    let s = crate::sched::scheduler_for(cpu);
+                    let f = s.lock.lock_raw();
+                    let is_cur = s.current == tcb;
+                    s.lock.unlock_raw(f);
+                    if is_cur
+                    {
+                        break 'scan Some(cpu);
+                    }
+                }
+                None
+            };
+            let Some(run_cpu) = run_cpu
+            else
+            {
+                break;
+            };
+            let sched = crate::sched::scheduler_for(run_cpu);
+            while {
+                let s = sched.lock.lock_raw();
+                let still_current = sched.current == tcb;
+                sched.lock.unlock_raw(s);
+                still_current
+            }
+            {
+                core::hint::spin_loop();
+            }
+        }
+
+        // Step 2: register save published.
+        crate::sched::spin_site_enter(crate::sched::SPIN_SITE_DEALLOC_CONTEXT_SAVED);
+        while (*tcb)
+            .context_saved
+            .load(core::sync::atomic::Ordering::Acquire)
+            == 0
+        {
+            core::hint::spin_loop();
+        }
+        crate::sched::spin_site_exit();
+
+        // Restore the caller's interrupt state and preemption.
+        // SAFETY: saved_int from save_and_disable_interrupts above.
+        crate::arch::current::cpu::restore_interrupts(saved_int);
+        crate::percpu::preempt_enable();
+    }
+}
+
+/// Warn-once timer for the unbounded protocol spins in object teardown
+/// ([`stop_threads_bound_to`], [`wait_until_aspace_inactive`]). The first
+/// `due` call more than 100 ms after construction returns `true` so the
+/// caller prints one diagnostic line; the spin itself continues — giving up
+/// would free storage under a thread still using it. Mirrors the
+/// `sys_thread_stop` drain diagnostic.
+#[cfg(not(test))]
+struct SpinWarnOnce
+{
+    start: u64,
+    warned: bool,
+}
+
+#[cfg(not(test))]
+impl SpinWarnOnce
+{
+    fn new() -> Self
+    {
+        Self {
+            start: crate::arch::current::timer::current_tick(),
+            warned: false,
+        }
+    }
+
+    fn due(&mut self) -> bool
+    {
+        if self.warned
+        {
+            return false;
+        }
+        let tps = crate::arch::current::timer::ticks_per_second();
+        if tps == 0
+        {
+            return false;
+        }
+        let now = crate::arch::current::timer::current_tick();
+        if now.saturating_sub(self.start) > tps / 10
+        {
+            self.warned = true;
+            return true;
+        }
+        false
+    }
+}
+
+/// Whether the thread running on `this_cpu` has been marked `Exited` by a
+/// concurrent teardown (or by its own handler, on the self-teardown path).
+///
+/// `current` is written only by this CPU at dispatch, so the running thread
+/// reads it without a lock. `state` is committed by the writer under every
+/// scheduler lock; it is probed without the lock first and confirmed under
+/// this CPU's lock only when the probe reads `Exited`, so the fast path —
+/// every syscall epilogue and every teardown spin iteration — takes no lock.
+/// A probe that lags the store delays detection by one spin iteration, or
+/// in the epilogue until the thread next enters the kernel, exactly as for
+/// a thread stopped while it is in user-mode. A same-CPU transition (the
+/// self-teardown path) is always observed.
+///
+/// # Safety
+/// The caller must be the thread running on `this_cpu`, with interrupts or
+/// preemption disabled so it cannot migrate, and must hold no scheduler
+/// lock.
+#[cfg(not(test))]
+pub(crate) unsafe fn running_thread_stopped(this_cpu: usize) -> bool
+{
+    // SAFETY: this_cpu < MAX_CPUS per contract; `current` cannot be freed
+    // while it is still installed on this CPU; the probe is a volatile read
+    // so a spin re-reads it, and the answer is confirmed under the lock.
+    unsafe {
+        let sched = scheduler_for(this_cpu);
+        let cur = sched.current;
+        if cur.is_null()
+            || core::ptr::read_volatile(&raw const (*cur).state) != thread::ThreadState::Exited
+        {
+            return false;
+        }
+        let saved = sched.lock.lock_raw();
+        let stopped = (*cur).state == thread::ThreadState::Exited;
+        sched.lock.unlock_raw(saved);
+        stopped
+    }
+}
+
+/// Phase 1 of [`stop_threads_bound_to`]: under the registry lock, stop every
+/// bound thread not already `Exited`, then prod the CPUs found running one.
+/// Returns whether the running thread on `this_cpu` was among them.
+///
+/// # Safety
+/// As for [`stop_threads_bound_to`].
+#[cfg(not(test))]
+unsafe fn mark_bound_threads(
+    bound: &impl Fn(*mut ThreadControlBlock) -> bool,
+    this_cpu: usize,
+) -> bool
+{
+    let cpu_count = CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
+    let mut self_bound = false;
+    let mut prod = [false; MAX_CPUS];
+    // SAFETY: caller contract (no conflicting locks held); the walk body
+    // takes only locks ordered after the registry lock and never waits
+    // on another CPU.
+    unsafe {
+        thread_registry::for_each(|tcb| {
+            // `state` is read without `sched_lock` here and below: `Exited`
+            // is terminal, so a positive read is final, and a negative read
+            // is re-decided under the full lock set by
+            // `exit_under_all_locks`, which refuses an exited thread
+            // (docs/scheduling-internals.md § Cross-CPU TCB Ownership).
+            if !bound(tcb) || (*tcb).state == thread::ThreadState::Exited
+            {
+                return;
+            }
+            // Reading our own CPU's `current` needs no lock — only this
+            // CPU writes it at dispatch, and we are that running thread.
+            let is_self = core::ptr::eq(tcb, scheduler_for(this_cpu).current);
+            if (*tcb).state == thread::ThreadState::Blocked
+            {
+                crate::syscall::thread::cancel_ipc_block(tcb);
+            }
+            // Retained reason for `CAP_INFO_THREAD_STATE` and late-bound
+            // observers, written under the same hold as the Exited commit so
+            // a thread that exited on its own meanwhile (commit refused)
+            // keeps its own reason. Not posted: kernel-initiated teardown is
+            // silent, as for a thread reaped through its own capability.
+            let committed = exit_under_all_locks(tcb, syscall::EXIT_KILLED);
+            if is_self
+            {
+                self_bound = true;
+            }
+            else if let StateCommit::Committed(Some(cpu)) = committed
+                && cpu != this_cpu
+            {
+                prod[cpu] = true;
+            }
+        });
+    }
+    for (cpu, hit) in prod.iter().enumerate().take(cpu_count)
+    {
+        if *hit
+        {
+            // SAFETY: cpu < cpu_count.
+            unsafe { prod_remote_cpu(cpu) };
+        }
+    }
+    self_bound
+}
+
+/// Result of one phase-2 pass of [`stop_threads_bound_to`] over every other
+/// CPU's `current`.
+#[cfg(not(test))]
+enum BoundScan
+{
+    /// No other CPU is running a bound thread.
+    Clear,
+    /// A bound, already-`Exited` thread is still `current` somewhere.
+    Waiting,
+    /// A bound thread that is not `Exited` is `current` somewhere: it was
+    /// bound after the last phase-1 walk.
+    Unmarked,
+}
+
+/// One phase-2 pass: read every other CPU's `current` under that CPU's lock.
+///
+/// # Safety
+/// Preemption disabled; no scheduler lock held.
+#[cfg(not(test))]
+unsafe fn scan_bound_current(
+    bound: &impl Fn(*mut ThreadControlBlock) -> bool,
+    this_cpu: usize,
+) -> BoundScan
+{
+    let cpu_count = CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
+    let mut waiting = false;
+    for cpu in 0..cpu_count
+    {
+        if cpu == this_cpu
+        {
+            continue;
+        }
+        // SAFETY: cpu < cpu_count; `current` is stable under its CPU's
+        // lock and cannot be freed while it is current.
+        let (is_bound, unmarked) = unsafe {
+            let s = scheduler_for(cpu);
+            let f = s.lock.lock_raw();
+            let cur = s.current;
+            // `state` is read under the run-queue lock, not `sched_lock`:
+            // sound only because `Exited` is terminal (a positive read is
+            // final; a negative one sends the caller back to phase 1, which
+            // re-decides under the full lock set).
+            let r = if !cur.is_null() && bound(cur)
+            {
+                (true, (*cur).state != thread::ThreadState::Exited)
+            }
+            else
+            {
+                (false, false)
+            };
+            s.lock.unlock_raw(f);
+            r
+        };
+        if unmarked
+        {
+            return BoundScan::Unmarked;
+        }
+        waiting |= is_bound;
+    }
+    if waiting
+    {
+        BoundScan::Waiting
+    }
+    else
+    {
+        BoundScan::Clear
+    }
+}
+
+/// Stop every live thread bound to an object under teardown, identified by
+/// `bound`, before the object's storage is reclaimed.
+///
+/// Phase 1 ([`mark_bound_threads`]) walks the thread registry under its
+/// lock: each bound thread not already `Exited` has any IPC block cancelled
+/// and is marked `Exited` under the all-locks discipline with `EXIT_KILLED`
+/// recorded as its retained exit reason in the same hold
+/// (`exit_under_all_locks`, draining every run queue); CPUs found
+/// running one are recorded. Phase 2, with the registry released — a CPU
+/// spinning on the registry lock inside `register` cannot deschedule, so it
+/// must not be waited for while the lock is held — prods those CPUs and
+/// spins until no CPU other than this one has a bound thread as `current`.
+/// A bound thread that appears as `current` without being `Exited` (bound
+/// after the walk, through a cap lookup that raced the object's last delete)
+/// sends the loop back to phase 1. Threads stopped here are dead but not
+/// freed: each object lives until its own last capability goes, and
+/// `dealloc_object(Thread)` then runs its full drain on an already-Exited,
+/// off-CPU thread. A stopped server's reply-bound client is released by
+/// that later drain, exactly as for a server stopped by `SYS_THREAD_STOP`.
+///
+/// Returns `true` if the running thread has itself been stopped — it was
+/// bound to this object, or a concurrent teardown on another CPU stopped it
+/// while this one waited (two teardowns each bound to the other's object
+/// would otherwise wait on each other forever, both preempt-disabled). In
+/// that case no wait is performed and the caller MUST NOT free the object:
+/// it queues it for off-CPU reclaim (`push_deferred_reclaim`) and returns,
+/// the syscall epilogue schedules this thread away, and the deferred drain
+/// re-enters the teardown from a context that is not a bound thread.
+///
+/// The phase-1 hold is proportional to the number of live threads (one
+/// all-locks transition per bound thread, each `O(CPUs)`), with interrupts
+/// disabled on this CPU throughout. The phase-2 spin has no bound; it warns
+/// once after 100 ms.
+///
+/// # Safety
+/// The caller must hold no scheduler, IPC-source, or registry lock. `bound`
+/// must only read through the TCB pointer it is given.
+#[cfg(not(test))]
+pub unsafe fn stop_threads_bound_to(bound: impl Fn(*mut ThreadControlBlock) -> bool) -> bool
+{
+    let this_cpu = crate::arch::current::cpu::current_cpu() as usize;
+
+    // SAFETY: caller contract.
+    if unsafe { mark_bound_threads(&bound, this_cpu) }
+    {
+        return true;
+    }
+
+    // Phase 2: wait with interrupts enabled and preemption disabled, as the
+    // dealloc UAF gate does (see `wait_until_off_cpu`).
+    crate::percpu::preempt_disable();
+    // SAFETY: ring 0; restored below.
+    let saved_int = unsafe { crate::arch::current::cpu::save_and_disable_interrupts() };
+    // SAFETY: ring 0; IDT loaded; preempt disabled.
+    unsafe { crate::arch::current::interrupts::enable() };
+    spin_site_enter(SPIN_SITE_DEALLOC_NOT_CURRENT);
+    let mut warn = SpinWarnOnce::new();
+    let mut stopped = false;
+    loop
+    {
+        // SAFETY: we are the running thread on this_cpu with preemption
+        // disabled; no scheduler lock held.
+        if unsafe { running_thread_stopped(this_cpu) }
+        {
+            stopped = true;
+            break;
+        }
+        if warn.due()
+        {
+            crate::kprintln!("kernel: stop_threads_bound_to spin >100ms on cpu {this_cpu}");
+        }
+        // SAFETY: preempt disabled; no scheduler lock held.
+        match unsafe { scan_bound_current(&bound, this_cpu) }
+        {
+            BoundScan::Clear => break,
+            BoundScan::Unmarked =>
+            {
+                // SAFETY: caller contract.
+                if unsafe { mark_bound_threads(&bound, this_cpu) }
+                {
+                    stopped = true;
+                    break;
+                }
+            }
+            BoundScan::Waiting => core::hint::spin_loop(),
+        }
+    }
+    spin_site_exit();
+    // SAFETY: saved_int from save_and_disable_interrupts above.
+    unsafe { crate::arch::current::cpu::restore_interrupts(saved_int) };
+    crate::percpu::preempt_enable();
+    stopped
+}
+
+/// Wait until no CPU has `aspace` loaded in satp/CR3 — the gate before an
+/// `AddressSpace`'s root page table is freed.
+///
+/// [`stop_threads_bound_to`] returns once no other CPU has a bound thread as
+/// `current`, but a CPU switching away from one clears its `active_cpus` bit
+/// and loads the next root only after that `current` hand-off, outside the
+/// locks (`schedule()`'s address-space switch). Nothing can set a bit anew:
+/// every bound thread is `Exited` and off every run queue, and the dispatch
+/// flip aborts on an `Exited` candidate before the switch. Returns `false`
+/// if the running thread was stopped by a concurrent teardown while waiting
+/// (the caller defers, as for a `true` from `stop_threads_bound_to`).
+///
+/// # Safety
+/// `aspace` must be a valid `AddressSpace` that no thread other than
+/// already-stopped ones is bound to. No scheduler lock may be held.
+#[cfg(not(test))]
+pub unsafe fn wait_until_aspace_inactive(
+    aspace: *const crate::mm::address_space::AddressSpace,
+) -> bool
+{
+    let this_cpu = crate::arch::current::cpu::current_cpu() as usize;
+    crate::percpu::preempt_disable();
+    // SAFETY: ring 0; restored below.
+    let saved_int = unsafe { crate::arch::current::cpu::save_and_disable_interrupts() };
+    // SAFETY: ring 0; IDT loaded; preempt disabled.
+    unsafe { crate::arch::current::interrupts::enable() };
+    spin_site_enter(SPIN_SITE_DEALLOC_AS_ACTIVE);
+    let mut warn = SpinWarnOnce::new();
+    let mut completed = true;
+    // SAFETY: aspace valid per contract; active_cpu_mask is an Acquire snapshot.
+    while !unsafe { (*aspace).active_cpu_mask() }.is_empty()
+    {
+        // SAFETY: we are the running thread on this_cpu with preemption
+        // disabled; no scheduler lock held.
+        if unsafe { running_thread_stopped(this_cpu) }
+        {
+            completed = false;
+            break;
+        }
+        if warn.due()
+        {
+            crate::kprintln!("kernel: wait_until_aspace_inactive spin >100ms on cpu {this_cpu}");
+        }
+        core::hint::spin_loop();
+    }
+    spin_site_exit();
+    // SAFETY: saved_int from save_and_disable_interrupts above.
+    unsafe { crate::arch::current::cpu::restore_interrupts(saved_int) };
+    crate::percpu::preempt_enable();
+    completed
 }
 
 /// Test stub.
 #[cfg(test)]
-#[allow(unused_variables)]
 pub unsafe fn set_state_under_all_locks(
     _tcb: *mut ThreadControlBlock,
     _new_state: thread::ThreadState,
-) -> Option<usize>
+) -> StateCommit
 {
-    None
+    StateCommit::Committed(None)
 }
 
 /// Outcome of [`commit_blocked_under_local_lock`].
@@ -3211,16 +4160,21 @@ pub unsafe fn enqueue_and_wake(tcb: *mut ThreadControlBlock, target_cpu: usize)
 #[allow(unused_variables)]
 pub unsafe fn enqueue_and_wake(_tcb: *mut ThreadControlBlock, _target_cpu: usize) {}
 
-/// Unconditionally make `tcb` `Ready` and link it on `target_cpu`'s run queue,
-/// under the per-TCB `sched_lock` — the DELIBERATE-placement primitive.
+/// Make `tcb` `Ready` and link it on `target_cpu`'s run queue, under the
+/// per-TCB `sched_lock` — the DELIBERATE-placement primitive.
 ///
-/// Unlike [`enqueue_and_wake`], this does NOT classify `state`: it forces the
-/// `→Ready` transition and links. Use it only when the caller owns the
-/// transition and has established the thread is not live on any CPU — start /
-/// resume (`Created`/`Stopped` → run), the dealloc reply-bound-client wake, and
-/// `schedule()`'s cross-affinity requeue of `current`. Routing those through the
-/// gated `enqueue_and_wake` would be wrong: their thread is already (or becomes)
-/// `Ready`, which the gate coalesces — dropping it from every run queue.
+/// Unlike [`enqueue_and_wake`], this does NOT classify `state` beyond the
+/// terminal check: it forces the `→Ready` transition and links. Use it only
+/// when the caller owns the transition and has established the thread is not
+/// live on any CPU — today only `sys_thread_start` (first start and resume,
+/// `Created`/`Stopped` → run). Routing that through the gated
+/// `enqueue_and_wake` would be wrong: the thread is already `Ready`, which
+/// the gate coalesces — dropping it from every run queue.
+///
+/// Returns `false` without writing or linking if the thread is `Exited`
+/// under `sched_lock`: an object teardown or an exit on another CPU can mark
+/// it between the caller's own state commit and this link, and `Exited` is
+/// terminal (see [`set_state_under_all_locks`]).
 ///
 /// Lock order: `(*tcb).sched_lock` (outer) → target run-queue lock (inner), then
 /// `wake_idle_cpu` after both are released — identical to `enqueue_and_wake`'s
@@ -3232,10 +4186,17 @@ pub unsafe fn enqueue_and_wake(_tcb: *mut ThreadControlBlock, _target_cpu: usize
 /// - `target_cpu` must be < [`MAX_CPUS`] and initialized by `sched::init`.
 /// - The caller must hold no run-queue lock.
 #[cfg(not(test))]
-pub unsafe fn enqueue_ready_thread(tcb: *mut ThreadControlBlock, target_cpu: usize)
+pub unsafe fn enqueue_ready_thread(tcb: *mut ThreadControlBlock, target_cpu: usize) -> bool
 {
     // SAFETY: tcb valid; sched_lock (outer) paired with unlock below.
     let sched_saved = unsafe { (*tcb).sched_lock.lock_raw() };
+    // SAFETY: state read under sched_lock, which every lifecycle writer holds.
+    if unsafe { (*tcb).state } == thread::ThreadState::Exited
+    {
+        // SAFETY: paired with the lock_raw above.
+        unsafe { (*tcb).sched_lock.unlock_raw(sched_saved) };
+        return false;
+    }
     // SAFETY: caller guarantees target_cpu is initialized.
     let sched = unsafe { scheduler_for(target_cpu) };
     // SAFETY: run-queue lock (inner) paired with unlock below.
@@ -3285,12 +4246,16 @@ pub unsafe fn enqueue_ready_thread(tcb: *mut ThreadControlBlock, target_cpu: usi
 
     // SAFETY: target_cpu validated < MAX_CPUS by scheduler_for.
     unsafe { wake_idle_cpu(target_cpu) };
+    true
 }
 
 /// Test stub for `enqueue_ready_thread` (no-op in test mode).
 #[cfg(test)]
 #[allow(unused_variables)]
-pub unsafe fn enqueue_ready_thread(_tcb: *mut ThreadControlBlock, _target_cpu: usize) {}
+pub unsafe fn enqueue_ready_thread(_tcb: *mut ThreadControlBlock, _target_cpu: usize) -> bool
+{
+    true
+}
 
 /// Select target CPU for enqueueing a thread based on affinity, soft
 /// affinity (cache warmth), and load.

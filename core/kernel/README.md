@@ -83,7 +83,7 @@ kernel/
 │   │   ├── thread_registry.rs  # Live-thread registry: teardown stops, watchdog walks
 │   │   └── run_queue.rs        # Per-CPU run queues and priority levels
 │   └── syscall/                # Syscall dispatch
-│       ├── mod.rs              # Dispatch table, entry coordination, thread syscalls
+│       ├── mod.rs              # Dispatch table, entry coordination, sleep, IPC-buffer and notification-binding syscalls
 │       ├── cap.rs              # Capability syscall implementations
 │       ├── entropy.rs          # SYS_GETRANDOM
 │       ├── hw.rs               # MMIO, IRQ, and I/O-port syscalls and their splits
@@ -91,7 +91,7 @@ kernel/
 │       ├── mem.rs              # Memory syscall implementations
 │       ├── sbi.rs              # SYS_SBI_CALL (riscv64)
 │       ├── sysinfo.rs          # SYS_SYSTEM_INFO
-│       └── thread.rs           # Thread lifecycle syscalls (stop, regs, sleep)
+│       └── thread.rs           # Thread lifecycle syscalls (configure, start, stop, priority, affinity, regs, fault handler)
 └── docs/
     ├── arch-interface.md       # Architecture abstraction layer and dispatch surface
     ├── initialization.md       # Boot-to-init sequence, phase by phase

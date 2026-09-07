@@ -220,9 +220,8 @@ pub struct CSpace
     /// Total usable slots allocated across all pages (excludes slot 0).
     allocated_slots: usize,
     /// Slot-page pool exhaustions seen by `grow`, for the throttled
-    /// diagnostic (logged at powers of two). Atomic only because the grow
-    /// path holds `&self`; it is written under the `CSpace` lock.
-    pool_exhaustions: core::sync::atomic::AtomicU32,
+    /// diagnostic (logged at powers of two).
+    pool_exhaustions: u32,
     /// Head of the intrusive free list; None if no free slots.
     ///
     /// Slot 0 is permanently null and never placed on the free list, so the
@@ -260,7 +259,7 @@ impl CSpace
             indirect: core::array::from_fn(|_| AtomicPtr::new(core::ptr::null_mut())),
             next_leaf: 0,
             allocated_slots: 0,
-            pool_exhaustions: core::sync::atomic::AtomicU32::new(0),
+            pool_exhaustions: 0,
             free_head: None,
             free_count: 0,
             lock: crate::sync::Spinlock::new(),
@@ -347,7 +346,7 @@ impl CSpace
     /// from the wrapper's pool; the host-test stub allocates from the heap.
     /// `T` must be a page-sized-or-smaller type whose all-zeros bit pattern
     /// is a valid value (both `CSpacePage` and `CSpaceDirPage` are).
-    fn alloc_zeroed_page<T>(&self) -> Result<NonNull<T>, CapError>
+    fn alloc_zeroed_page<T>(&mut self) -> Result<NonNull<T>, CapError>
     {
         const {
             assert!(
@@ -372,10 +371,8 @@ impl CSpace
                 // pool-starved CSpace reaches this under the derivation
                 // lock, and a console write per attempt must not serialise
                 // behind it.
-                let occurrence = self
-                    .pool_exhaustions
-                    .fetch_add(1, Ordering::Relaxed)
-                    .wrapping_add(1);
+                self.pool_exhaustions = self.pool_exhaustions.wrapping_add(1);
+                let occurrence = self.pool_exhaustions;
                 if occurrence.is_power_of_two()
                 {
                     crate::kprintln!(

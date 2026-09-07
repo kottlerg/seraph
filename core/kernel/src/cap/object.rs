@@ -548,6 +548,7 @@ impl PoolChunkSlot
 
     /// The record, or `None` while vacant. The Acquire load of `ancestor`
     /// pairs with the Release store that publishes a populated record.
+    #[cfg(not(test))]
     fn load(&self) -> Option<ChunkRecord>
     {
         let ancestor = self.ancestor.load(Ordering::Acquire);
@@ -562,6 +563,7 @@ impl PoolChunkSlot
 /// One donation record in a `ChunkRecordPage`: the content of a
 /// `PoolChunkSlot` as plain words. Record pages are read and written
 /// only under the pool lock, or at teardown with no other reference alive.
+#[cfg(not(test))]
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct ChunkRecord
@@ -571,6 +573,7 @@ struct ChunkRecord
     page_count: u64,
 }
 
+#[cfg(not(test))]
 impl ChunkRecord
 {
     const VACANT: Self = Self {
@@ -585,18 +588,22 @@ impl ChunkRecord
 /// caller-chosen donation size would be unbounded; batching keeps every
 /// hold to this many pushes. The interrupts-off window of the syscall that
 /// seeds a large donation is the sum of its batches and is not bounded here.
+#[cfg(not(test))]
 const SEED_BATCH_PAGES: u64 = 64;
 
 /// Bytes of `ChunkRecordPage` ahead of its records: `next_phys` and `used`.
+#[cfg(not(test))]
 const RECORD_PAGE_HEADER: usize = core::mem::size_of::<u64>() + core::mem::size_of::<usize>();
 
 /// Donation records per `ChunkRecordPage`.
+#[cfg(not(test))]
 const CHUNK_RECORDS_PER_PAGE: usize =
     (crate::mm::PAGE_SIZE - RECORD_PAGE_HEADER) / core::mem::size_of::<ChunkRecord>();
 
 /// A page of spilled donation records, carved from a donation once the
 /// inline records are full. Record 0 always describes the chunk this page
 /// itself lives in, so freeing record 0 last releases the page.
+#[cfg(not(test))]
 #[repr(C)]
 struct ChunkRecordPage
 {
@@ -609,10 +616,12 @@ struct ChunkRecordPage
     records: [ChunkRecord; CHUNK_RECORDS_PER_PAGE],
 }
 
+#[cfg(not(test))]
 const _: () = assert!(
     core::mem::size_of::<ChunkRecordPage>() <= crate::mm::PAGE_SIZE,
     "ChunkRecordPage exceeds one page"
 );
+#[cfg(not(test))]
 const _: () = assert!(
     core::mem::offset_of!(ChunkRecordPage, records) == RECORD_PAGE_HEADER,
     "RECORD_PAGE_HEADER does not match the ChunkRecordPage layout"
@@ -880,7 +889,8 @@ impl PagePool
     /// `1..` before record 0 (whose chunk holds the page); then the inline
     /// records, snapshotted up front, with record 0 (the create-time slab
     /// that holds the owner and this pool) last. The walk is linear in the
-    /// donation count and runs to completion in the caller's context; an
+    /// donation count and runs to completion in the caller's context — in
+    /// syscall context, with interrupts masked for its whole length; an
     /// owner that donated finely pays for it at teardown (see
     /// capability-internals § Page Pools).
     ///

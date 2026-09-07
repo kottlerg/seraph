@@ -6,9 +6,10 @@
 //! User-mode address space management (Phase 9).
 //!
 //! An [`AddressSpace`] owns one root page table (PML4 on x86-64, the
-//! negotiated-mode root
-//! on RISC-V). Intermediate page table frames are allocated from the buddy
-//! allocator on demand.
+//! negotiated-mode root on RISC-V). Intermediate page table frames are
+//! drawn on demand from the wrapper object's page pool on the pooled map
+//! path, or from the kernel page-table pool (`mm::kernel_pt_pool`) on the
+//! kernel-direct path.
 //!
 //! `INIT_STACK_PAGES` is defined in the `init-protocol` ABI crate and
 //! re-exported here. Init's bootstrap virtual addresses (the `InitInfo` page and
@@ -16,7 +17,7 @@
 //! ABI constants.
 //!
 //! ## Kernel mapping inheritance
-//! `new_user` copies kernel PML4 entries [256..512] from the currently active
+//! `new_user_with_root` copies kernel PML4 entries [256..512] from the currently active
 //! page table root into the new user PML4, so kernel memory is reachable from
 //! user address spaces without per-process kernel mapping maintenance.
 //!

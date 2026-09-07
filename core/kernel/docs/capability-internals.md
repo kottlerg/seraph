@@ -169,12 +169,16 @@ inline records, the create-time slab last. A donation's Memory object that
 reaches zero there is reclaimed through its own nested cascade, not the
 bounded worklist the dealloc cascade otherwise uses, since the number of
 donations is unbounded. The walk costs one `retype_free` per donation and
-runs to completion inside the deleting syscall, so an owner's teardown
-latency scales with how finely it donated: the same memory donated as
-single pages costs one return per page, and the sixteen-donation cap that
-used to bound this is gone. The standard runtime donates one page per
-page-table shortfall, so a process's count is its page-table page count,
-of the order of one per 2 MiB of mapped span. The records are never scanned while the owner is
+runs to completion inside the deleting syscall, with interrupts masked for
+its whole length on that CPU, so an owner's teardown latency scales with
+how finely it donated: the same memory donated as single pages costs one
+return per page, and the sixteen-donation cap that used to bound this
+window is gone. The standard runtime donates one page per page-table
+shortfall, so a process's count is its page-table page count, of the order
+of one per 2 MiB of mapped span. A record page is kernel state kept in
+donated memory, like the wrapper page, the slot pages, and the page tables
+themselves: the kernel trusts its contents, and the donating Memory
+capability's holder is trusted not to map what it has retyped away. The records are never scanned while the owner is
 live: an address space's reclaiming unmap recognises pool-owned page
 tables by a bit in the parent entry, not by the records — see
 [memory-internals.md](memory-internals.md) § Page Table Node Ownership.

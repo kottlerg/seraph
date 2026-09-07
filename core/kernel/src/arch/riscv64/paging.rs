@@ -814,7 +814,8 @@ fn rv_walk_or_alloc(entry: &mut PageTableEntry) -> Result<u64, ()>
 }
 
 /// Map a single 4 KiB user page, drawing intermediate page-table frames from
-/// an `AddressSpaceObject`'s growth pool instead of the buddy allocator.
+/// an `AddressSpaceObject`'s growth pool instead of the kernel page-table
+/// pool.
 ///
 /// # Safety
 /// Same contract as [`map_user_page`]. `aso` must be the wrapper paired

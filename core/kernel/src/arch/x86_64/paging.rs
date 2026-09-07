@@ -615,10 +615,10 @@ fn user_walk_or_alloc(entry: &mut PageTableEntry) -> Result<u64, ()>
 }
 
 /// Map a single 4 KiB user page, drawing intermediate page-table frames from
-/// an `AddressSpaceObject`'s growth pool instead of the buddy allocator.
+/// an `AddressSpaceObject`'s growth pool instead of the kernel page-table
+/// pool.
 ///
-/// The pool is the typed-memory equivalent of buddy-backed PT allocation:
-/// each new PT page debits the AS's `pt_growth_budget_bytes`. Exhaustion
+/// Each new PT page debits the AS's `pt_growth_budget_bytes`. Exhaustion
 /// returns `Err(())`; the caller surfaces this as `SyscallError::NoMemory`
 /// so userspace can refill via augment-mode `cap_create_aspace`.
 ///

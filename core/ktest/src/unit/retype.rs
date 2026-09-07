@@ -935,6 +935,7 @@ pub fn cspace_augment_many(ctx: &TestContext) -> TestResult
     const SEEDED: u64 = DONATIONS - RECORD_PAGES;
     // Leaves past the direct region need one pool-paid directory page.
     const DIRECTORY_PAGES: u64 = 1;
+    // Mirrors the kernel's `L2_SIZE`: slots per leaf page.
     const SLOTS_PER_LEAF: u64 = 56;
     let memory = ctx.memory_base;
 

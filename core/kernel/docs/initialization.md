@@ -161,8 +161,6 @@ Emit "fatal: cannot build kernel page tables (OOM)" and halt.
    - Notification (fixed size)
    - EventQueue header (fixed size; ring buffer body from size-class allocator)
    - WaitSet (fixed size)
-   - AddressSpace (fixed size)
-   - PageTableNode (fixed size; one per level-below-root page table frame)
 3. Install the kernel allocator (implements the `GlobalAlloc` trait via the
    size-class path; used by any `alloc::*` usage in the kernel)
 4. Emit: "kernel heap active"

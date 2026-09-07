@@ -776,8 +776,10 @@ pub fn memmgr_pool_free_bytes() -> Option<u64> {
 /// budget (every driver mapping discovered MMIO).
 ///
 /// `region_pages == 0` is a no-op success. Returns `false` if memmgr is
-/// unreachable or the request/augment fails; the subsequent map then fails
-/// with `OutOfMemory` rather than silently drawing on the reserve.
+/// unreachable, the request/augment fails, or the budget still falls short
+/// after the funding rounds (another thread of the process drained it
+/// meanwhile); the subsequent map then fails with `OutOfMemory` rather than
+/// silently drawing on the reserve.
 #[stable(feature = "seraph_ext", since = "1.0.0")]
 pub fn fund_aspace_pt_budget(self_aspace: u32, region_pages: u64) -> bool {
     pal_alloc::fund_aspace_pt_budget(self_aspace, region_pages)

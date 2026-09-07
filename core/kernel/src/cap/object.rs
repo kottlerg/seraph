@@ -655,9 +655,10 @@ impl PagePool
         }
     }
 
-    /// Whether any donation has been recorded: true for every retype-backed
-    /// wrapper (the create-time slab is record 0), false for the heap-backed
-    /// boot address space, whose page tables come from `kernel_pt_pool`.
+    /// Whether record 0, the create-time slab, is populated: records are
+    /// appended from index 0, so this is true for every retype-backed
+    /// wrapper and false for the heap-backed boot address space, whose page
+    /// tables come from `kernel_pt_pool`.
     #[must_use]
     pub fn retype_backed(&self) -> bool
     {
@@ -689,50 +690,6 @@ impl PagePool
         // owned and unaliased.
         unsafe { pool_push(&self.head_phys, phys) };
         pool_unlock(&self.lock);
-    }
-
-    /// Whether `phys` lies inside one of the recorded donations.
-    ///
-    /// A linear scan of the records under the pool lock: the inline ones,
-    /// then the record pages newest first, stopping at the first hit. The
-    /// free list is LIFO, so a page popped recently tends to sit in a
-    /// recent record; a miss costs one pass over every donation. The cost
-    /// is confined to the owning object's lock and grows only with what
-    /// that owner donated.
-    #[cfg(not(test))]
-    #[track_caller]
-    fn owns_phys(&self, phys: u64) -> bool
-    {
-        let p = crate::mm::PAGE_SIZE as u64;
-        let covers = |record: ChunkRecord| {
-            // cast_ptr_alignment: header at offset 0; MemoryObject is repr(C).
-            #[allow(clippy::cast_ptr_alignment)]
-            // SAFETY: a recorded ancestor is a live MemoryObject, kept alive
-            // by the record's reference for the pool's lifetime; `base` is
-            // immutable after creation.
-            let base = unsafe { (*record.ancestor.cast::<MemoryObject>()).base };
-            let start = base + record.base_offset;
-            phys >= start && phys < start + record.page_count * p
-        };
-        pool_lock(&self.lock);
-        let mut owned = self
-            .inline
-            .iter()
-            .any(|slot| slot.load().is_some_and(covers));
-        let mut page_phys = self.record_head_phys.load(Ordering::Acquire);
-        while !owned && page_phys != 0
-        {
-            let page = crate::mm::paging::phys_to_virt(page_phys) as *const ChunkRecordPage;
-            // SAFETY: lock held; a published record page stays mapped in the
-            // direct map and exclusively owned by this pool until teardown.
-            unsafe {
-                let used = (*page).used;
-                owned = (0..used).any(|i| covers((*page).records[i]));
-                page_phys = (*page).next_phys;
-            }
-        }
-        pool_unlock(&self.lock);
-        owned
     }
 
     /// Record a donation and seed its pool pages onto the free list.
@@ -880,7 +837,10 @@ impl PagePool
     /// # Safety
     /// The owner is being torn down at refcount 0: no other reference to
     /// it, the pool, or any recorded page exists, and `free` must not touch
-    /// the pool. `self` is dangling once this returns.
+    /// the pool. `self` is dangling once this returns. `free` is a safe
+    /// callback only because the bound cannot carry `unsafe`; it acts on
+    /// the raw records under this function's contract and may run a full
+    /// nested object teardown, so the caller must hold no lock.
     #[cfg(not(test))]
     unsafe fn reclaim_chunks<F>(&self, mut free: F)
     where
@@ -1122,23 +1082,6 @@ impl AddressSpaceObject
         unsafe { self.pt_pool.push(phys) };
         self.pt_growth_budget_bytes
             .fetch_add(crate::mm::PAGE_SIZE as u64, Ordering::AcqRel);
-    }
-
-    /// Whether `phys` lies inside one of this AS's donated chunks — i.e.
-    /// the page was carved from this AS's PT pool (rather than `kernel_pt_pool`
-    /// or another allocator).
-    ///
-    /// The region-reclaim walk consults this before returning a now-empty
-    /// intermediate page table via [`free_pt_page`]: only pool-owned pages may
-    /// re-enter the pool. Every intermediate PT the walk reaches in a
-    /// retype-backed AS is pool-owned; the check defends a heap-backed AS (or
-    /// any future non-pooled user mapping) against corrupting the pool's
-    /// free-list and budget accounting.
-    #[cfg(not(test))]
-    #[track_caller]
-    pub fn owns_phys(&self, phys: u64) -> bool
-    {
-        self.pt_pool.owns_phys(phys)
     }
 
     /// Record a freshly-retyped chunk and seed its pool pages, crediting
@@ -1549,7 +1492,11 @@ unsafe fn defer_self_teardown(ptr: NonNull<KernelObjectHeader>, what: &str)
 /// function rather than by recursion: each arm pushes the freshly-orphaned
 /// ancestor into the worklist, and the outer loop processes it on the next
 /// iteration. Recursion would risk deadlock if a future change introduced a
-/// lock above this point.
+/// lock above this point. Two arms nevertheless re-enter this function with
+/// no lock held, because their fan-out is unbounded and the worklist is
+/// not: the `CSpaceObj` arm for the objects a dying `CSpace`'s slots
+/// reference, and the `AddressSpace` and `CSpaceObj` arms' `free_chunk`
+/// for a pool donation's Memory object that reaches zero.
 #[cfg(not(test))]
 pub unsafe fn dealloc_object(ptr: core::ptr::NonNull<KernelObjectHeader>)
 {

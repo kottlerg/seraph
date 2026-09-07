@@ -164,12 +164,12 @@ records before its record 0 (whose donation holds the page), then the
 inline records, the create-time slab last. A donation's Memory object that
 reaches zero there is reclaimed through its own nested cascade, not the
 bounded worklist the dealloc cascade otherwise uses, since the number of
-donations is unbounded. Region reclaim in an address space checks a
-page-table page against the records — inline and spilled — before
-returning it to the pool, so only pool-owned pages re-enter it; that check
-is a linear scan under the pool lock, inline records then record pages
-newest first, whose cost grows with the owner's own donation count and is
-confined to the owner's lock.
+donations is unbounded. The records are never scanned while the owner is
+live: region reclaim in an address space returns an empty page table to
+the pool only when its parent entry carries the software bit the pooled
+map path set when it installed the table (`POOLED_TABLE` in each
+architecture's paging module), a constant-time test under the page-table
+lock, so tables from the kernel page-table pool stay where they are.
 
 ---
 

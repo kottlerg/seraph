@@ -377,15 +377,11 @@ impl Heap {
     /// growth budget is exhausted (a new intermediate page-table page is
     /// needed but the budget has none). We acquire a fresh Memory cap from
     /// memmgr, augment the AS via `cap_create_aspace(memory_cap, self_aspace,
-    /// init_pages=1)`, and retry the map. Up to two augments per call: the
-    /// kernel keeps a donation's first page as its own donation bookkeeping
-    /// once per record page, so one augment in that many seeds nothing and
-    /// the next one seeds. If the map still fails the caller treats the
-    /// grow as failed.
+    /// init_pages=1)`, and retry the map, up to [`PT_FUND_ROUNDS`] times. If
+    /// the map still fails the caller treats the grow as failed.
     fn mem_map_with_augment_retry(&self, memory_cap: u32, va: u64, pages: u64) -> bool {
         const SYSCALL_OUT_OF_MEMORY: i64 = -8;
-        const MAX_AUGMENTS: u32 = 2;
-        for _ in 0..MAX_AUGMENTS {
+        for _ in 0..PT_FUND_ROUNDS {
             match syscall::mem_map(memory_cap, self.self_aspace, va, 0, pages, MAP_WRITABLE) {
                 Ok(()) => return true,
                 Err(SYSCALL_OUT_OF_MEMORY) => { /* fall through to augment + retry */ }
@@ -690,6 +686,15 @@ pub fn slab_request_pages(memmgr_ep: u32, min_pages: u64) -> Option<(u32, u64, u
     // Fallback: take the first (smaller) cap so sub-page retypes still work.
     Some((caps[0], reply.word(1), reply.word(1 + returned)))
 }
+
+/// Augment rounds a page-table funding path may make before giving up.
+///
+/// The kernel keeps a donation's first page as its own donation bookkeeping
+/// once per record page (see `SYS_CAP_CREATE_ADDRESS_SPACE`), so a single
+/// donation can seed one page fewer than it carried. A record page opened by
+/// one round has room for the next round's record, so two consecutive short
+/// seeds are impossible and a second round always covers the shortfall.
+pub const PT_FUND_ROUNDS: u32 = 2;
 
 /// Bytes withheld from a fresh grant's local ledger as slack against any
 /// kernel-side retype cost the mirror does not model. The kernel debits
@@ -997,8 +1002,10 @@ pub fn memmgr_query_free_bytes() -> Option<u64> {
 /// cost may exceed the AS's spare budget.
 ///
 /// `region_pages == 0` is a no-op success. Returns `false` if memmgr is
-/// unreachable or the request/augment fails; the subsequent map then
-/// fails with `OutOfMemory` rather than silently drawing on the reserve.
+/// unreachable, the request/augment fails, or the budget still falls short
+/// after [`PT_FUND_ROUNDS`] rounds (another thread of the process drained
+/// it meanwhile); the subsequent map then fails with `OutOfMemory` rather
+/// than silently drawing on the reserve.
 pub fn fund_aspace_pt_budget(self_aspace: u32, region_pages: u64) -> bool {
     if region_pages == 0 {
         return true;
@@ -1015,12 +1022,10 @@ pub fn fund_aspace_pt_budget(self_aspace: u32, region_pages: u64) -> bool {
     // the first few spawns. Funding only the shortfall (and nothing once the
     // budget already covers the region) keeps a spawn/join loop from leaking a
     // CSpace slot + PT pages on every spawn.
-    // Up to two rounds: the kernel keeps a donation's first page as its own
-    // donation bookkeeping once per record page, so a round can leave the
-    // budget one page short of its request; the next round covers it.
-    const MAX_ROUNDS: u32 = 2;
-    let budget = || syscall::cap_info(self_aspace, syscall_abi::CAP_INFO_ASPACE_PT_BUDGET).unwrap_or(0);
-    for _ in 0..MAX_ROUNDS {
+    let budget = || {
+        syscall::cap_info(self_aspace, syscall_abi::CAP_INFO_ASPACE_PT_BUDGET).unwrap_or(0)
+    };
+    for _ in 0..PT_FUND_ROUNDS {
         let have = budget();
         if have >= need_bytes {
             return true;

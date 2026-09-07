@@ -489,7 +489,7 @@ pub fn sys_cap_create_aspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         #[allow(clippy::cast_ptr_alignment)]
         let target_aso = unsafe { &*target_aso_nn.as_ptr().cast::<AddressSpaceObject>() };
 
-        // SAFETY: ref is held until AS-dealloc (released per chunk slot).
+        // SAFETY: ref is held until AS-dealloc (released per donation record).
         unsafe { memory_obj_nn.as_ref().inc_ref() };
 
         // SAFETY: target_aso wraps a live AS; offset/init_pages are from a

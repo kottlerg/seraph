@@ -36,6 +36,12 @@ const PCD: u64 = 1 << 4;
 const LARGE_PAGE: u64 = 1 << 7;
 /// No-Execute — blocks instruction fetch; requires `IA32_EFER.NXE` = 1.
 const NO_EXECUTE: u64 = 1 << 63;
+/// Software bit (AVL, ignored by hardware in every entry type) set in a
+/// table-pointer entry whose table frame came from the address space's own
+/// page-table pool (`user_walk_or_alloc_pooled`). A reclaiming unmap frees
+/// an empty table to that pool only when its parent entry carries this bit;
+/// tables from `kernel_pt_pool` (the kernel-direct `map_page` path) do not.
+const POOLED_TABLE: u64 = 1 << 9;
 /// Mask extracting the physical page number from bits \[51:12\].
 const PHYS_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 
@@ -672,7 +678,7 @@ fn user_walk_or_alloc_pooled(
     let frame_pa = aso.alloc_pt_page().ok_or(())?;
 
     let mut table_pte = PageTableEntry::new_table(frame_pa);
-    table_pte.0 |= USER;
+    table_pte.0 |= USER | POOLED_TABLE;
     *entry = table_pte;
 
     Ok(frame_pa)
@@ -975,8 +981,8 @@ fn table_is_empty(table: &[PageTableEntry; 512]) -> bool
 /// freed.
 ///
 /// Walks PML4 → PDPT → PD → PT over the span, clearing in-range leaf PTEs. A
-/// table is freed only when it is fully empty afterwards **and** `aso` owns the
-/// frame ([`owns_phys`](crate::cap::object::AddressSpaceObject::owns_phys)) —
+/// table is freed only when it is fully empty afterwards **and** its parent
+/// entry carries [`POOLED_TABLE`] (the frame came from `aso`'s pool) —
 /// emptiness, not span-containment, is the gate, so a boundary table shared
 /// with a live neighbour (or the guard-page table whose first slot sits just
 /// outside the span) is reclaimed exactly when its last live entry clears.
@@ -1053,31 +1059,31 @@ pub unsafe fn unmap_user_region_pooled(
                                 pt[pt_index(va1)] = PageTableEntry(0);
                                 va1 += p;
                             }
-                            if table_is_empty(pt) && aso.owns_phys(pt_pa)
+                            if table_is_empty(pt) && e2.0 & POOLED_TABLE != 0
                             {
                                 pd[l2] = PageTableEntry(0);
                                 // SAFETY: PT is empty and unlinked above; frame
-                                // came from this aso's pool (owns_phys).
+                                // came from this aso's pool (POOLED_TABLE).
                                 unsafe { aso.free_pt_page(pt_pa) };
                                 freed += 1;
                             }
                         }
                         va2 = l2_end;
                     }
-                    if table_is_empty(pd) && aso.owns_phys(pd_pa)
+                    if table_is_empty(pd) && e3.0 & POOLED_TABLE != 0
                     {
                         pdpt[l3] = PageTableEntry(0);
-                        // SAFETY: PD is empty and unlinked above; aso-owned.
+                        // SAFETY: PD is empty and unlinked above; pool-owned.
                         unsafe { aso.free_pt_page(pd_pa) };
                         freed += 1;
                     }
                 }
                 va3 = l3_end;
             }
-            if table_is_empty(pdpt) && aso.owns_phys(pdpt_pa)
+            if table_is_empty(pdpt) && e4.0 & POOLED_TABLE != 0
             {
                 pml4[l4] = PageTableEntry(0);
-                // SAFETY: PDPT is empty and unlinked above; aso-owned.
+                // SAFETY: PDPT is empty and unlinked above; pool-owned.
                 unsafe { aso.free_pt_page(pdpt_pa) };
                 freed += 1;
             }

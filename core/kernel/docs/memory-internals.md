@@ -506,9 +506,10 @@ the mapping path:
   user address space, including init's bootstrap space) draw them from the
   page pool of the space's wrapper object, seeded at creation and refilled by
   augment-mode donations from Memory caps; the map returns `OutOfMemory` when
-  the pool is empty. A reclaiming unmap (`MEM_UNMAP_RECLAIM_PTS`) returns a
-  now-empty node to that pool after checking it against the pool's donation
-  records.
+  the pool is empty. The pooled map path marks each table it installs with a
+  software bit in the parent entry (`POOLED_TABLE`); a reclaiming unmap
+  (`MEM_UNMAP_RECLAIM_PTS`) returns a now-empty node to that pool only when
+  its parent entry carries the bit.
 - Kernel-direct mappings through `map_page` (the Phase 9 init image, InitInfo
   page, and stack) and any address space without a recorded donation draw
   them from the fixed kernel page-table pool (`mm::kernel_pt_pool`).

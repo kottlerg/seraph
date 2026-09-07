@@ -926,6 +926,7 @@ pub fn cspace_dir_page_survives_failed_grow(ctx: &TestContext) -> TestResult
 /// the source Memory cap.
 pub fn cspace_augment_many(ctx: &TestContext) -> TestResult
 {
+    const PAGE: u64 = 4096;
     const DONATIONS: u64 = 200;
     // Donations 16 and 186 open the two record pages: the inline records
     // hold the create-time slab plus fifteen donations, and a record page
@@ -987,7 +988,7 @@ pub fn cspace_augment_many(ctx: &TestContext) -> TestResult
     {
         return Err("retype::cspace_augment_many: a donation past the inline records failed");
     }
-    if budget != SEEDED * 4096
+    if budget != SEEDED * PAGE
     {
         return Err(
             "retype::cspace_augment_many: budget != donated pages minus the two record pages",
@@ -1007,15 +1008,15 @@ pub fn cspace_augment_many(ctx: &TestContext) -> TestResult
 }
 
 /// The address-space pool spills its donation records the same way. Pages
-/// described by spilled records serve as page tables, and a reclaiming
-/// unmap recognises them as pool-owned through the record pages: the free
-/// list is LIFO, so fresh mappings draw first on the newest donations
-/// (described by the second record page) and, once those fourteen pages are
-/// used up, on donations the first record page describes — the walk from
-/// the newest record page to the older one. Every reclaimed table must be
-/// credited back, so the budget returns exactly to its post-donation value.
+/// described by spilled records serve as page tables: the free list is
+/// LIFO, so fresh mappings draw first on the newest donations (described by
+/// the second record page) and, once those fourteen pages are used up, on
+/// donations the first record page describes. Every table a reclaiming
+/// unmap frees must be credited back, so the budget returns exactly to its
+/// post-donation value, and the delete returns every donation.
 pub fn aspace_augment_many(ctx: &TestContext) -> TestResult
 {
+    const PAGE: u64 = 4096;
     const DONATIONS: u64 = 200;
     const RECORD_PAGES: u64 = 2;
     const SEEDED: u64 = DONATIONS - RECORD_PAGES;
@@ -1023,7 +1024,7 @@ pub fn aspace_augment_many(ctx: &TestContext) -> TestResult
     // tables in every paging mode, so twelve regions consume more than the
     // fourteen pages the newest record page describes.
     const REGIONS: u64 = 12;
-    const REGION_STRIDE: u64 = 1 << 30;
+    const REGION_STRIDE: u64 = 0x4000_0000;
     let memory = ctx.memory_base;
 
     let baseline = cap_info(memory, CAP_INFO_MEMORY_AVAILABLE)
@@ -1077,13 +1078,13 @@ pub fn aspace_augment_many(ctx: &TestContext) -> TestResult
     {
         return Err("retype::aspace_augment_many: a donation past the inline records failed");
     }
-    if budget != SEEDED * 4096
+    if budget != SEEDED * PAGE
     {
         return Err(
             "retype::aspace_augment_many: budget != donated pages minus the two record pages",
         );
     }
-    if map_failures != 0 || after_map > budget - 2 * REGIONS * 4096
+    if map_failures != 0 || after_map > budget - 2 * REGIONS * PAGE
     {
         return Err(
             "retype::aspace_augment_many: mappings did not draw two tables per region from the pool",

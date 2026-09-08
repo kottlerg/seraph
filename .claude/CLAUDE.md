@@ -12,6 +12,8 @@
   - Any deviation MUST be minimal, local, and explicitly justified at the point of use.
 - `docs/documentation-standards.md` is a system-wide, non-negotiable authority.
   - All documentation changes MUST comply with its rules.
+- Existing history or code that violates a written rule is not a convention;
+  the rule governs new work.
 
 ## Coding invariants
 See [docs/coding-standards.md](../docs/coding-standards.md) — non-negotiable authority.
@@ -53,14 +55,17 @@ truth for "how work is tracked and shipped" on this project.
   1. `@pr-reviewer` — adversarial code review of the diff and its blast
      radius.
   2. `@pr-auditor` — PR-body checklist, linked-issue Acceptance closure,
-     silent-deferral, and test-plan honesty audit.
+     silent-deferral, test-plan honesty, and commit-message compliance
+     audit.
 
   Surface both verdict lines to the user verbatim. If `pr-auditor` reports
   `AUDIT FAIL`, resolve the named items (`gh pr edit`, `gh issue edit`, or
   additional commits) before continuing. If `pr-reviewer` reports
   `BLOCKING ISSUES`, address them in additional commits before continuing.
   Non-blocking reviewer findings MAY be deferred only with a one-line
-  rationale to the user.
+  rationale to the user. A finding that names a MUST violation of the
+  standards is not deferrable whatever severity the reviewer gave it; it
+  is fixed before the merge prompt.
 
   Only after both verdicts clear (or are explicitly waived by the user),
   prompt for the merge decision. Merge via

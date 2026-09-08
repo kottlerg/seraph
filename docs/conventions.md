@@ -96,7 +96,7 @@ were swept to use `svctest` where they meant the services-tier harness.
 - Form: `<scope>: <summary>`.
 - `<scope>` names what the commit touches: a component path (`kernel`, `xtask`, `services/init`), a directory (`docs`, `.github`), a workspace-wide topic (`treewide`), or comma-separated combinations (`ci, xtask`; `docs, claude`). Use the narrowest scope that covers the change.
 - `<summary>` describes what changed and MAY use `;` to delimit independent sub-changes within one commit.
-- `<summary>` MUST NOT contain planning labels (per [documentation-standards.md](documentation-standards.md) §"Incomplete Work Markers"): no "step X", "phase Y", "tier N", "stage M", "the deferred follow-up". Components and concrete what-changed text only.
+- `<summary>` MUST NOT contain planning labels (per [documentation-standards.md](documentation-standards.md) §"Incomplete Work Markers"): no "step X", "phase Y", "tier N", "stage M", "round N", "the deferred follow-up", nor any other label that only a planning conversation can resolve. The list is illustrative, not exhaustive. Components and concrete what-changed text only.
 - `<summary>` MUST NOT include task IDs, branch names, or other transient identifiers. Issue references belong in the body.
 
 ### Body

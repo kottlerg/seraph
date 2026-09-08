@@ -125,9 +125,10 @@ error and log strings, and commit messages.
   MUST name the missing thing concretely (e.g. `// TODO: handle non-contiguous
   regions`).
 - Session-local planning labels MUST NOT appear in permanent text. Disallowed
-  forms include "step X", "phase Y", "tier N", "stage 7", and "the deferred
-  follow-up". These are pointers into a planning conversation that has no
-  permanence and rot the moment the plan moves on.
+  forms include "step X", "phase Y", "tier N", "stage 7", "round N", and "the
+  deferred follow-up"; the list is illustrative, not exhaustive. These are
+  pointers into a planning conversation that has no permanence and rot the
+  moment the plan moves on.
 - Commit messages name components and what changed, not planning labels.
 
 ---

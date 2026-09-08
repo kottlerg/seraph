@@ -192,7 +192,7 @@ pub unsafe fn event_queue_post(
     // Enqueue into ring.
     let ring_len = eq.capacity + 1;
     // SAFETY: write_idx < ring_len (invariant maintained by modulo arithmetic);
-    // ring is a valid heap allocation of ring_len u64 slots.
+    // ring is the retype slot's ring of ring_len u64 slots.
     unsafe {
         *eq.ring.add(eq.write_idx as usize) = payload;
     }

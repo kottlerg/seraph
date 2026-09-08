@@ -323,6 +323,18 @@ oversight. The runs below are procedurally REQUIRED for PRs touching the
 listed paths — binding the same way the pre-merge audit agents are, with
 no CI surface.
 
+**Documentation-only and comment-only changes.** A change whose diff, with
+Markdown files set aside, alters only comments (`//`, `///`, `//!`, `/* */`)
+in source files cannot change any built artifact, and the local host runs
+above are therefore NOT required for it — neither on its own nor as the
+trailing commit of an otherwise validated PR, whatever paths it touches. The
+CI gate and the pre-merge audit agents apply to it unchanged. When such a
+commit lands on top of a validated head, the PR's validation section names
+the head that was validated and states that the delta is documentation or
+comments only; that statement is what the audit checks. Any other line —
+code, a string literal, a constant, an attribute, build or configuration
+data — makes the change a code change under the rules above.
+
 ```sh
 # Boundary CPU counts, riscv64 (~70 s per passing run on a 16-core host;
 # the 600 s budget is for HANG classification):

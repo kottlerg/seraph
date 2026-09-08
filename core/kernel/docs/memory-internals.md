@@ -12,7 +12,8 @@ The memory subsystem comprises four components:
 2. **Kernel object memory** — objects carved out of Memory capabilities by retype,
    and the page pools behind address spaces and CSpaces
 3. **Address space management** — per-process virtual address space objects
-4. **TLB management** — local invalidation, tagged (PCID/ASID) no-flush context switch with a full-flush fallback, and SMP shootdown
+4. **TLB management** — local invalidation, tagged (PCID/ASID) no-flush context
+   switch with a full-flush fallback, and SMP shootdown
 
 ---
 
@@ -135,7 +136,7 @@ pub struct AddressSpace
 
 ### Lifecycle
 
-1. **Creation** (`SYS_CAP_CREATE_ADDRESS_SPACE`): carve a slab from the source
+1. **Creation** (`SYS_CAP_CREATE_ASPACE`): carve a slab from the source
    Memory cap; page 0 holds the wrapper object and the in-place `AddressSpace`,
    page 1 the zeroed root page table with the kernel higher half mapped (shared
    across all address spaces via a shared PML4/root entry), and the remaining
@@ -328,10 +329,11 @@ exist:
 - The idle threads' stacks come from the buddy allocator in Phase 4, one
   power-of-two block per CPU, while the buddy still holds large contiguous blocks
   (before the Phase 7 drain); they live for the kernel's lifetime.
-- Every other thread's stack is the first `KERNEL_STACK_PAGES` pages of the
-  Thread slab that `SYS_CAP_CREATE_THREAD` carves from the caller's Memory
-  capability — stack, then the page holding the `ThreadObject` and TCB, then the
-  per-thread FPU/SIMD save area — and returns to that capability when the
+- Every other thread's stack is the first `KERNEL_STACK_PAGES` pages of its
+  Thread slab — stack, then the page holding the `ThreadObject` and TCB, then the
+  per-thread FPU/SIMD save area — which `SYS_CAP_CREATE_THREAD` carves from the
+  caller's Memory capability, and boot code carves from the SEED reserve for
+  init's own thread; the slab returns to that capability when the
   thread's last capability is deleted.
 
 ---

@@ -654,9 +654,10 @@ unsafe fn kernel_entry_post_rebase(
     }
 
     // ── Phase 9: create and launch init ───────────────────────────────────────
-    // Gated #[cfg(not(test))]: Phase 9 uses the typed-memory retype paths and
-    // arch-specific functions unavailable in the host test environment. Tests exercise Phases
-    // 0-8 via their individual stub functions; kernel_entry is never invoked.
+    // Gated #[cfg(not(test))]: Phase 9 uses the typed-memory retype paths
+    // and arch-specific functions unavailable in the host test environment.
+    // Tests exercise Phases 0-8 via their individual stub functions;
+    // kernel_entry is never invoked.
     #[cfg(not(test))]
     {
         kprintln!("Phase 9: Init Creation and Scheduler Entry");

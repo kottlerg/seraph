@@ -575,7 +575,7 @@ directory structurally full).
 
 ---
 
-### `SYS_CAP_CREATE_ADDRESS_SPACE` (11)
+### `SYS_CAP_CREATE_ASPACE` (11)
 
 Retype a Memory capability into a new, empty address space (create-mode), or donate
 carved pages to an existing address space's page-table growth pool (augment-mode). The
@@ -1672,7 +1672,7 @@ pages to an existing CSpace's slot-page pool (augment-mode).
 rights); augment-mode — `0`. `SyscallError` on failure.
 
 Augment-mode donations are unbounded in count, with the same bookkeeping as
-`SYS_CAP_CREATE_ADDRESS_SPACE`: once per record page a donation's first page is kept by
+`SYS_CAP_CREATE_ASPACE`: once per record page a donation's first page is kept by
 the kernel and only `init_pages − 1` pages reach the pool.
 
 **Capability requirements:** `memory_cap` (Retype); in augment-mode, `augment_cap` (Insert).

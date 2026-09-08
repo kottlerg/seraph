@@ -984,7 +984,7 @@ pub fn memmgr_query_free_bytes() -> Option<u64> {
 /// Augment rounds a page-table funding path may make before giving up.
 ///
 /// The kernel keeps a donation's first page as its own donation bookkeeping
-/// once per record page (see `SYS_CAP_CREATE_ADDRESS_SPACE`), so a single
+/// once per record page (see `SYS_CAP_CREATE_ASPACE`), so a single
 /// donation can seed one page fewer than it carried. A record page opened by
 /// one round has room for the next round's record, so a second round covers
 /// the shortfall unless other threads of the process fill that page in

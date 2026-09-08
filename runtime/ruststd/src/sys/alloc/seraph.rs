@@ -377,7 +377,7 @@ impl Heap {
     /// growth budget is exhausted (a new intermediate page-table page is
     /// needed but the budget has none). We acquire a fresh Memory cap from
     /// memmgr, augment the AS via `cap_create_aspace(memory_cap, self_aspace,
-    /// init_pages=1)`, and retry the map — augmenting up to [`PT_FUND_ROUNDS`]
+    /// init_pages=1)`, and retry the map — augmenting up to `PT_FUND_ROUNDS`
     /// times. If the map still fails the caller treats the grow as failed.
     fn mem_map_with_augment_retry(&self, memory_cap: u32, va: u64, pages: u64) -> bool {
         const SYSCALL_OUT_OF_MEMORY: i64 = -8;
@@ -391,7 +391,7 @@ impl Heap {
             // in augment mode (target = self_aspace). Single page covers
             // ~511 new PT-entries' worth of mappable VA. The AS's donation
             // record holds its own ref on the augment's MemoryObject
-            // (`add_chunk` in `sys_cap_create_aspace`), so the slab
+            // (`add_donation` in `sys_cap_create_aspace`), so the slab
             // machinery reclaims the source cap slot.
             if object_slab_retype(PAGE_SIZE, |aug| {
                 syscall::cap_create_aspace(aug, self.self_aspace, 1).ok()
@@ -989,7 +989,7 @@ pub fn memmgr_query_free_bytes() -> Option<u64> {
 /// one round has room for the next round's record, so a second round covers
 /// the shortfall unless other threads of the process fill that page in
 /// between; the trailing budget check decides either way.
-pub const PT_FUND_ROUNDS: u32 = 2;
+const PT_FUND_ROUNDS: u32 = 2;
 
 /// Fund `self_aspace`'s page-table growth budget to cover mapping a
 /// `region_pages`-page foreign-frame region (MMIO, DMA) into a
@@ -1004,7 +1004,7 @@ pub const PT_FUND_ROUNDS: u32 = 2;
 ///
 /// `region_pages == 0` is a no-op success. Returns `false` if memmgr is
 /// unreachable, the request/augment fails, or the budget still falls short
-/// after [`PT_FUND_ROUNDS`] rounds (another thread of the process drained
+/// after `PT_FUND_ROUNDS` rounds (another thread of the process drained
 /// it meanwhile); the subsequent map then fails with `OutOfMemory` rather
 /// than silently drawing on the reserve.
 pub fn fund_aspace_pt_budget(self_aspace: u32, region_pages: u64) -> bool {

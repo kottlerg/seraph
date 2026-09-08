@@ -158,7 +158,7 @@ the pool backs.
 Sixteen records live inline in the wrapper; the create-time slab, which
 holds the wrapper itself, is record 0. When the inline records are full,
 the next donation's first pool page becomes a *record page*: a chained
-page (newest first) holding up to `CHUNK_RECORDS_PER_PAGE` further records,
+page (newest first) holding up to `RECORDS_PER_PAGE` further records,
 whose record 0 is the donation the page came from. A donation is recorded
 before any of its pages is published to the free list, so every free page
 belongs to a reclaimable record, and the number of donations is bounded
@@ -169,9 +169,11 @@ budget reported by `SYS_CAP_INFO` is authoritative.
 A record page is kernel state kept in donated memory, like the wrapper
 page, the slot pages, and the page tables themselves: the kernel trusts its
 contents, and the donating Memory capability's holder is trusted not to map
-what it has retyped away. The records are never scanned while the owner is
-live: an address space's reclaiming unmap recognises pool-owned page tables
-by a bit in the parent entry, not by the records; see
+what it has retyped away, which the kernel does not yet enforce
+([#433](https://github.com/kottlerg/seraph/issues/433)). The records are
+never scanned while the owner is live: an address space's reclaiming unmap
+recognises pool-owned page tables by a bit in the parent entry, not by the
+records; see
 [memory-internals.md](memory-internals.md) § Page Table Node Ownership.
 
 ### Teardown
@@ -197,7 +199,8 @@ scales with how finely it donated, and can land on an unrelated thread's
 syscall: the same memory donated as single pages costs one return per
 page. The standard runtime donates one page per page-table shortfall, so
 a process's count is its page-table page count, of the order of one per
-2 MiB of mapped span.
+2 MiB of mapped span. Bounding the walk, and the seeding of one donation,
+within a syscall is [#434](https://github.com/kottlerg/seraph/issues/434).
 
 ---
 

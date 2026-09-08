@@ -1059,7 +1059,7 @@ pub(crate) unsafe fn boot_retype_aspace(
     let pool_pages = init_pages - 2;
     // SAFETY: aso_ptr just constructed; offset/init_pages from a successful retype.
     let res = unsafe {
-        (*aso_ptr).add_chunk(
+        (*aso_ptr).add_donation(
             seed_header_nn(),
             memory_base,
             offset,
@@ -1155,7 +1155,7 @@ pub(crate) unsafe fn boot_retype_cspace(
     let pool_pages = init_pages - 1;
     // SAFETY: wrapper just constructed; offset/init_pages from a successful retype.
     let res = unsafe {
-        (*cs_kobj_ptr).add_chunk(
+        (*cs_kobj_ptr).add_donation(
             seed_header_nn(),
             memory_base,
             offset,

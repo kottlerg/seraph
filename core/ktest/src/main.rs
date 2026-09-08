@@ -280,9 +280,7 @@ fn fund_boot_aspace_pt(info: &init_protocol::InitInfo)
         {
             continue;
         }
-        // Donate all but one page of each spare cap; the cap on `want` bounds
-        // a single donation.
-        let want = (avail_pages - 1).min(PER_AUGMENT_MAX);
+        let want = avail_pages.min(PER_AUGMENT_MAX);
         // Best-effort: a refused donation leaves the budget short, and the
         // loop moves on to the next spare cap.
         syscall::cap_create_aspace(slot, info.aspace_cap, want).ok();

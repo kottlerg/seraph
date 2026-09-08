@@ -919,7 +919,7 @@ pub fn cspace_dir_page_survives_failed_grow(ctx: &TestContext) -> TestResult
 
 /// Donations are unbounded in count: the wrapper's sixteen inline donation
 /// records spill into record pages carved from the donations themselves
-/// (one page per `CHUNK_RECORDS_PER_PAGE` further donations). Two hundred
+/// (one page per `RECORDS_PER_PAGE` further donations). Two hundred
 /// one-page donations cross both the inline limit and one full record page,
 /// so exactly two donations supply a record page and seed nothing; every
 /// other page is usable, and the wholesale delete returns all of them to
@@ -930,7 +930,7 @@ pub fn cspace_augment_many(ctx: &TestContext) -> TestResult
     const DONATIONS: u64 = 200;
     // Donations 16 and 186 open the two record pages: the inline records
     // hold the create-time slab plus fifteen donations, and a record page
-    // holds 170 records — the kernel's CHUNK_RECORDS_PER_PAGE: a page's 4096
+    // holds 170 records — the kernel's RECORDS_PER_PAGE: a page's 4096
     // bytes less a 16-byte header, over 24-byte records — the first being its
     // own donation.
     const RECORD_PAGES: u64 = 2;

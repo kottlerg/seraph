@@ -283,11 +283,12 @@ pub fn sys_mmio_map(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         uncacheable: true,
     };
 
-    // Choose the PT-page source, mirroring sys_mem_map. A retype-backed AS
-    // pulls intermediate PT pages from its own caller-funded growth pool;
-    // an AS without a recorded donation falls back to the kernel PT pool.
+    // Choose the PT-page source, mirroring sys_mem_map. An AS that recorded
+    // its create-time donation pulls intermediate PT pages from its own
+    // caller-funded growth pool; one without falls back to the kernel PT
+    // pool.
     // SAFETY: aso_raw is non-null and valid for the lifetime of the cap.
-    let pooled = unsafe { (*aso_raw).pt_pool.retype_backed() };
+    let pooled = unsafe { (*aso_raw).pt_pool.has_create_donation() };
 
     // Map each page.
     for i in 0..page_count

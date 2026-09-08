@@ -401,7 +401,7 @@ pub fn sys_cap_create_notification(tf: &mut TrapFrame) -> Result<u64, SyscallErr
 /// and credits `pt_growth_budget_bytes` with the pages seeded. Once the
 /// pool's inline donation records are full, one donation per record page
 /// keeps its first page as the kernel's donation bookkeeping and seeds
-/// `init_pages - 1` (see `PagePool::add_chunk`), so a one-page donation can
+/// `init_pages - 1` (see `PagePool::add_donation`), so a one-page donation can
 /// leave the budget unchanged. Returns `0` on success.
 #[cfg(not(test))]
 #[allow(clippy::too_many_lines)]
@@ -495,7 +495,7 @@ pub fn sys_cap_create_aspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         // SAFETY: target_aso wraps a live AS; offset/init_pages are from a
         // successful retype against `memory`.
         let res = unsafe {
-            target_aso.add_chunk(memory_obj_nn, memory_base, offset, init_pages, init_pages)
+            target_aso.add_donation(memory_obj_nn, memory_base, offset, init_pages, init_pages)
         };
         if res.is_err()
         {
@@ -572,8 +572,9 @@ pub fn sys_cap_create_aspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     let pool_pages = init_pages - 2;
     // SAFETY: aso just constructed; offset/init_pages from a successful
     // retype against `memory`.
-    let res =
-        unsafe { (*aso_ptr).add_chunk(memory_obj_nn, memory_base, offset, init_pages, pool_pages) };
+    let res = unsafe {
+        (*aso_ptr).add_donation(memory_obj_nn, memory_base, offset, init_pages, pool_pages)
+    };
     if res.is_err()
     {
         // Roll back: drop the in-place objects, free the slab, dec_ref the
@@ -606,7 +607,7 @@ pub fn sys_cap_create_aspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         Ok(idx) => idx,
         Err(e) =>
         {
-            // The cap never reached visibility; mirror the add_chunk
+            // The cap never reached visibility; mirror the add_donation
             // rollback above (the chunk record lives inside the wrapper
             // page being freed, so no external bookkeeping survives).
             // SAFETY: aso/aspace not observed externally yet.
@@ -649,7 +650,7 @@ pub fn sys_cap_create_aspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// Create-mode returns the new `CSpace` slot index. Augment-mode seeds the
 /// carved pages onto the slot-page pool and credits the budget with the
 /// pages seeded — one donation per record page keeps its first page as the
-/// kernel's donation bookkeeping (see `PagePool::add_chunk`) — and returns 0.
+/// kernel's donation bookkeeping (see `PagePool::add_donation`) — and returns 0.
 #[cfg(not(test))]
 #[allow(clippy::too_many_lines)]
 pub fn sys_cap_create_cspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
@@ -738,7 +739,7 @@ pub fn sys_cap_create_cspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
         // SAFETY: target_kobj is live.
         let res = unsafe {
-            target_kobj.add_chunk(memory_obj_nn, memory_base, offset, init_pages, init_pages)
+            target_kobj.add_donation(memory_obj_nn, memory_base, offset, init_pages, init_pages)
         };
         if res.is_err()
         {
@@ -834,7 +835,7 @@ pub fn sys_cap_create_cspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // SAFETY: wrapper just constructed; offset/init_pages from a successful
     // retype against `memory`.
     let res = unsafe {
-        (*cs_kobj_ptr).add_chunk(memory_obj_nn, memory_base, offset, init_pages, pool_pages)
+        (*cs_kobj_ptr).add_donation(memory_obj_nn, memory_base, offset, init_pages, pool_pages)
     };
     if res.is_err()
     {

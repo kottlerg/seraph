@@ -183,7 +183,9 @@ reaches zero there is reclaimed through its own nested cascade, not the
 bounded worklist the dealloc cascade otherwise uses, since the number of
 donations is unbounded.
 
-The walk costs one `retype_free` per donation and runs to completion in
+The walk costs one `retype_free` per donation, holds no lock across
+records (each return takes only its ancestor's cap lock, so unlike a
+`CSpace`'s derivation drain it is not batched), and runs to completion in
 whichever context drops the last reference: the deleting syscall, with
 interrupts masked on that CPU; or, when the owner is handed to the per-CPU
 deferred-reclaim stack — a thread deleting an object it is itself bound

@@ -1689,9 +1689,8 @@ unsafe fn dealloc_object_one(
                     obj.owns_memory.load(core::sync::atomic::Ordering::Acquire),
                 )
             };
-            // The lazily-installed retype-allocator metadata lives at offset
-            // 0 of the cap's own backing region; freeing the buddy pages
-            // below reclaims it wholesale. `RetypeAllocator` has no Drop
+            // The retype allocator lives inline in the MemoryObject and goes
+            // with the object's own slot below; `RetypeAllocator` has no Drop
             // implementation, so no in-place teardown is required.
             if owned
             {
@@ -2736,6 +2735,10 @@ unsafe fn dealloc_object_one(
 
             // Return every donation, the create-time slab (holding the
             // wrapper and this pool) last; `obj` is dangling afterwards.
+            // Unlike the derivation drain above, this walk is not batched:
+            // no lock is held across it (each return takes only its
+            // ancestor's cap lock), so nothing else waits on it, and its
+            // length is the number of donations the owner paid for.
             let free = |anc: *mut KernelObjectHeader, off: u64, pages: u64| {
                 // SAFETY: a record handed out by reclaim_chunks under its
                 // contract; no lock held.

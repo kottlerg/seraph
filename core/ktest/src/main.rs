@@ -280,8 +280,8 @@ fn fund_boot_aspace_pt(info: &init_protocol::InitInfo)
         {
             continue;
         }
-        // Leave one page for the retype metadata header the kernel carves on a
-        // Memory cap's first retype; cap each augment to bound the per-chunk size.
+        // Donate all but one page of each spare cap; the cap on `want` bounds
+        // a single donation.
         let want = (avail_pages - 1).min(PER_AUGMENT_MAX);
         // Best-effort: a refused donation leaves the budget short, and the
         // loop moves on to the next spare cap.

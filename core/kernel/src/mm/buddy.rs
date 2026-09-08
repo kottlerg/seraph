@@ -428,7 +428,8 @@ impl BuddyAllocator
     }
 
     /// Drain free blocks for userspace Memory caps, keeping at least
-    /// `reserve_pages` pages for kernel-internal use (page tables, heap, stacks).
+    /// `reserve_pages` pages for kernel-internal use (page tables, the SEED
+    /// reserve, stacks).
     ///
     /// Pops blocks from highest order downward, writing `(physical_address, order)`
     /// pairs into `out`. Returns the number of entries written.

@@ -37,7 +37,7 @@
 
 // `alloc` is needed by the host-test stubs (CSpace::grow heap fallback,
 // CSpace::Drop heap reclaim, dummy-object factory). Production CSpace is
-// retype-pool-backed end-to-end and allocates nothing itself.
+// retype-pool-backed end-to-end and needs no `alloc` crate.
 #[cfg(test)]
 extern crate alloc;
 
@@ -249,8 +249,8 @@ unsafe impl Sync for CSpace {}
 impl CSpace
 {
     /// Create an empty `CSpace`. No pages are allocated until the first slot
-    /// is requested. The pool source defaults to null (heap path); call
-    /// [`Self::set_kobj`] to switch to a retype pool.
+    /// is requested. The pool source defaults to null (the host-test heap
+    /// path); call [`Self::set_kobj`] to switch to a retype pool.
     pub fn new(id: CSpaceId) -> Self
     {
         Self {

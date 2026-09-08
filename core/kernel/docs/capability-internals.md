@@ -171,8 +171,8 @@ page, the slot pages, and the page tables themselves: the kernel trusts its
 contents, and the donating Memory capability's holder is trusted not to map
 what it has retyped away. The records are never scanned while the owner is
 live: an address space's reclaiming unmap recognises pool-owned page tables
-by a bit in the parent entry, not by the records — see [memory-internals.md](memory-internals.md)
-§ Page Table Node Ownership.
+by a bit in the parent entry, not by the records; see
+[memory-internals.md](memory-internals.md) § Page Table Node Ownership.
 
 ### Teardown
 

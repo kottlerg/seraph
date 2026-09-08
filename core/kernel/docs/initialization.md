@@ -81,8 +81,8 @@ This is not fatal — a headless system is valid.
    - Maximum order: implementation constant `MAX_ORDER` = 11 (2048 pages =
      8 MiB), sized so the largest per-CPU boot slab at `MAX_CPUS` fits one
      block (see memory-internals.md)
-5. Call mm::buddy::BuddyAllocator::new(max_order) — this is a static or
-   early-heap allocation using only the bootloader-provided stack
+5. Call mm::buddy::BuddyAllocator::new(max_order) — static storage, using
+   only the bootloader-provided stack
 6. For each candidate range, call BuddyAllocator::add_region(phys_start, phys_end)
 7. Emit: total usable RAM in MiB
 ```

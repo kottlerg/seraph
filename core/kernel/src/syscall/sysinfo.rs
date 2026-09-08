@@ -117,9 +117,9 @@ pub fn sys_aspace_query(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     let as_ptr = {
         let obj = aspace_slot.object.ok_or(SyscallError::InvalidCapability)?;
         // SAFETY: tag confirmed AddressSpace; pointer is valid.
-        // cast_ptr_alignment: AddressSpaceObject (8-byte) stored behind KernelObjectHeader
-        // (4-byte header); the object is constructed in place at the start of its
-        // page-aligned wrapper page, so the pointer is 8-byte aligned.
+        // cast_ptr_alignment: the header pointer names an AddressSpaceObject
+        // constructed in place at the start of its page-aligned wrapper page, so
+        // the cast target's 8-byte alignment holds.
         #[allow(clippy::cast_ptr_alignment)]
         let as_obj = unsafe { &*(obj.as_ptr().cast::<AddressSpaceObject>()) };
         as_obj.address_space

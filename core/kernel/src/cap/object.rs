@@ -2595,8 +2595,7 @@ unsafe fn dealloc_object_one(
                 unsafe { obj.pt_pool.reclaim_chunks(free) };
             }
 
-            // No separate free of the wrapper — it lives inside
-            // the slab reclaimed above.
+            // No separate free of the wrapper — it lives inside the slab reclaimed above.
         }
 
         // ── CSpaceObj ─────────────────────────────────────────────────────
@@ -2755,8 +2754,7 @@ unsafe fn dealloc_object_one(
                 crate::cap::free_cspace_id(dying_id);
             }
 
-            // No separate free of the wrapper — it lives inside
-            // the slab reclaimed above.
+            // No separate free of the wrapper — it lives inside the slab reclaimed above.
         }
 
         // ── Endpoint ──────────────────────────────────────────────────────

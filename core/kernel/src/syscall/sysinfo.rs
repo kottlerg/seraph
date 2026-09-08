@@ -128,7 +128,7 @@ pub fn sys_aspace_query(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         return Err(SyscallError::InvalidCapability);
     }
 
-    // SAFETY: as_ptr is a valid heap-allocated AddressSpace.
+    // SAFETY: as_ptr is a valid AddressSpace, in place in its wrapper page.
     let aspace = unsafe { &*as_ptr };
     match aspace.query_page(virt)
     {

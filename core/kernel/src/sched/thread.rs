@@ -588,8 +588,8 @@ pub struct ThreadControlBlock
     pub timed_out: bool,
 
     // === I/O port permissions (x86_64 only) ===
-    /// Per-thread I/O Permission Bitmap (8 KiB, heap-allocated on first
-    /// `SYS_IOPORT_BIND`). Null if this thread has no port bindings.
+    /// Per-thread I/O Permission Bitmap (8 KiB, carved from the SEED Memory
+    /// cap on first `SYS_IOPORT_BIND`). Null if this thread has no port bindings.
     ///
     /// On context switch, if non-null, this bitmap is copied into the TSS
     /// IOPB region so `in`/`out` instructions work for this thread.

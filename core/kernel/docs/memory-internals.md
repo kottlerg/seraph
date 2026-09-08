@@ -330,11 +330,11 @@ exist:
   power-of-two block per CPU, while the buddy still holds large contiguous blocks
   (before the Phase 7 drain); they live for the kernel's lifetime.
 - Every other thread's stack is the first `KERNEL_STACK_PAGES` pages of its
-  Thread slab — stack, then the page holding the `ThreadObject` and TCB, then the
-  per-thread FPU/SIMD save area — which `SYS_CAP_CREATE_THREAD` carves from the
-  caller's Memory capability, and boot code carves from the SEED reserve for
-  init's own thread; the slab returns to that capability when the
-  thread's last capability is deleted.
+  Thread slab — stack, then the page holding the `ThreadObject` and TCB, then
+  the per-thread FPU/SIMD save area — which `SYS_CAP_CREATE_THREAD` carves from
+  the caller's Memory capability, and boot code carves from the SEED reserve
+  for init's own thread; the slab returns to that capability when the thread's
+  last capability is deleted.
 
 ---
 

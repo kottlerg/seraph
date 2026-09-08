@@ -83,12 +83,11 @@ truth for "how work is tracked and shipped" on this project.
   run the local host runs defined there.
 - Host-side compilation, unit tests, and `cargo check` alone do not
   satisfy this requirement.
-- A documentation-only or comment-only change (Markdown, or only comment
-  lines in source files — the definition in
-  [docs/testing.md](../docs/testing.md) "Coverage tiers") requires none of
-  the runs above, whatever paths it touches; the CI gate and the pre-merge
-  audit still apply, and the PR body MUST state the validated head and that
-  the delta is documentation or comments only.
+- A documentation-only or comment-only change, as
+  [docs/testing.md](../docs/testing.md) "Coverage tiers" defines it,
+  requires none of the runs above; the CI gate and the pre-merge audit
+  still apply, and the PR body states the validated head and the
+  documentation-only delta.
 
 ## Completeness
 - Drift or defects discovered on the surface under audit MUST be fixed in

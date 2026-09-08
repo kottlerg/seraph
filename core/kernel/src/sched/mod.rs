@@ -4993,7 +4993,8 @@ pub unsafe fn schedule(requeue_current: bool)
     // Load the per-thread IOPB into the TSS (x86-64 only; `load_iopb` is a
     // no-op on RISC-V, where `iopb` is always null). If the thread has no port
     // bindings, fill the TSS IOPB with 0xFF (deny all).
-    // SAFETY: next is a valid TCB; iopb pointer is null or a valid heap-allocated [u8; IOPB_SIZE].
+    // SAFETY: next is a valid TCB; iopb pointer is null or a valid [u8; IOPB_SIZE]
+    // carved from the SEED Memory cap.
     #[cfg(not(test))]
     unsafe {
         let iopb_ptr = (*next).iopb;
@@ -5104,7 +5105,7 @@ pub unsafe fn schedule(requeue_current: bool)
     if !current_state.is_null()
     {
         // SAFETY: both current_state and next_state are valid SavedState pointers
-        // on heap-allocated TCBs; kernel stacks are valid; interrupts are disabled;
+        // on live TCBs; kernel stacks are valid; interrupts are disabled;
         // save_flag is valid or null.
         unsafe {
             switch(current_state, next_state, save_flag);

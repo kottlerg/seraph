@@ -2595,7 +2595,7 @@ unsafe fn dealloc_object_one(
                 unsafe { obj.pt_pool.reclaim_chunks(free) };
             }
 
-            // No separate `Box::from_raw(obj)` — the wrapper lives inside
+            // No separate free of the wrapper — it lives inside
             // the slab reclaimed above.
         }
 
@@ -2755,7 +2755,7 @@ unsafe fn dealloc_object_one(
                 crate::cap::free_cspace_id(dying_id);
             }
 
-            // No separate `Box::from_raw(obj)` — the wrapper lives inside
+            // No separate free of the wrapper — it lives inside
             // the slab reclaimed above.
         }
 

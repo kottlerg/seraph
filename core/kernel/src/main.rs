@@ -393,7 +393,7 @@ unsafe fn kernel_entry_post_rebase(
 
     // Cache `BootInfo.kernel_mmio` so Phase 5 arch hardware init can read
     // bootloader-discovered MMIO bases instead of compile-time defaults. This
-    // is heap-free and depends only on the direct physical map (Phase 3).
+    // allocates nothing and depends only on the direct physical map (Phase 3).
     // SAFETY: single-threaded boot; called exactly once, after Phase 3.
     unsafe { platform::capture_kernel_mmio(boot_info_phys) };
 
@@ -1424,8 +1424,8 @@ unsafe fn kernel_entry_post_rebase(
         //                + SEED_available + Σ caps_available
         //                + bootloader-loaded modules
         //
-        // observable byte-for-byte. The kernel heap is deleted; no `Box::new`
-        // path remains in production.
+        // observable byte-for-byte: the kernel allocates nothing outside the
+        // typed-memory paths.
         // SAFETY: init_cspace_ptr is the root CSpace, single-threaded boot.
         let cap_available_bytes = unsafe { cap::sum_memory_available_bytes(&*init_cspace_ptr) };
         let seed_available_bytes = cap::seed_memory_ref()

@@ -37,7 +37,7 @@
 
 // `alloc` is needed by the host-test stubs (CSpace::grow heap fallback,
 // CSpace::Drop heap reclaim, dummy-object factory). Production CSpace is
-// retype-pool-backed end-to-end and does not allocate from the kernel heap.
+// retype-pool-backed end-to-end and allocates nothing itself.
 #[cfg(test)]
 extern crate alloc;
 
@@ -270,7 +270,7 @@ impl CSpace
     /// Wire this `CSpace` to a `CSpaceKernelObject`'s slot-page pool.
     ///
     /// MUST be called before any `grow()` if the `CSpace` is retype-backed.
-    /// Calling on a `CSpace` that has already grown via the heap path
+    /// Calling on a `CSpace` that has already grown via the host-test heap path
     /// produces a mixed-allocation directory and is a kernel bug.
     pub fn set_kobj(&self, kobj: *mut CSpaceKernelObject)
     {

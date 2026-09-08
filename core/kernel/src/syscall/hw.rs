@@ -62,7 +62,8 @@ pub fn sys_irq_ack(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     let irq_slot = unsafe { super::lookup_cap(cspace, irq_cap_idx, IrqRights::NOTIFY) }?;
     let irq_id = {
         let obj = irq_slot.object.ok_or(SyscallError::InvalidCapability)?;
-        // SAFETY: tag confirmed Interrupt; object was allocated as Box<InterruptObject>.
+        // SAFETY: tag confirmed Interrupt; the object is an InterruptObject
+        // constructed in place at a size-class-aligned retype offset.
         #[allow(clippy::cast_ptr_alignment)]
         let io = unsafe { &*obj.as_ptr().cast::<InterruptObject>() };
         if io.count != 1
@@ -125,7 +126,8 @@ pub fn sys_irq_register(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     let irq_slot = unsafe { super::lookup_cap(cspace, irq_cap_idx, IrqRights::NOTIFY) }?;
     let irq_id = {
         let obj = irq_slot.object.ok_or(SyscallError::InvalidCapability)?;
-        // SAFETY: tag confirmed Interrupt; object was allocated as Box<InterruptObject>.
+        // SAFETY: tag confirmed Interrupt; the object is an InterruptObject
+        // constructed in place at a size-class-aligned retype offset.
         #[allow(clippy::cast_ptr_alignment)]
         let io = unsafe { &*obj.as_ptr().cast::<InterruptObject>() };
         if io.count != 1
@@ -141,7 +143,8 @@ pub fn sys_irq_register(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     let sig_slot = unsafe { super::lookup_cap(cspace, sig_cap_idx, NtfRights::NOTIFY) }?;
     let sig_state = {
         let obj = sig_slot.object.ok_or(SyscallError::InvalidCapability)?;
-        // SAFETY: tag confirmed Notification; object was allocated as Box<NotificationObject>.
+        // SAFETY: tag confirmed Notification; the object is a NotificationObject
+        // constructed in place at a size-class-aligned retype offset.
         #[allow(clippy::cast_ptr_alignment)]
         unsafe {
             (*obj.as_ptr().cast::<NotificationObject>()).state
@@ -232,7 +235,8 @@ pub fn sys_mmio_map(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     let mmio_slot = unsafe { super::lookup_cap(cspace, mmio_idx, MmioRights::MAP) }?;
     let (mmio_phys, mmio_size) = {
         let obj = mmio_slot.object.ok_or(SyscallError::InvalidCapability)?;
-        // SAFETY: tag confirmed Mmio; object was allocated as Box<MmioObject>.
+        // SAFETY: tag confirmed Mmio; the object is a MmioObject
+        // constructed in place at a size-class-aligned retype offset.
         #[allow(clippy::cast_ptr_alignment)]
         let mo = unsafe { &*obj.as_ptr().cast::<MmioObject>() };
         (mo.base, mo.size)
@@ -327,8 +331,8 @@ pub fn sys_mmio_map(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 ///
 /// On first bind, an 8 KiB per-thread IOPB bitmap is carved from the SEED
 /// Memory cap and all ports are denied (0xFF). The requested range bits are
-/// then cleared (0 =
-/// allowed). On context switch the bitmap is copied into the TSS IOPB region.
+/// then cleared (0 = allowed). On context switch the bitmap is copied into
+/// the TSS IOPB region.
 ///
 /// On RISC-V: always returns `NotSupported` (no I/O port concept).
 ///
@@ -365,7 +369,8 @@ pub fn sys_ioport_bind(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         let th_slot = unsafe { super::lookup_cap(cspace, thread_idx, ThreadRights::CONTROL) }?;
         let target_tcb = {
             let obj = th_slot.object.ok_or(SyscallError::InvalidCapability)?;
-            // SAFETY: tag confirmed Thread; object was allocated as Box<ThreadObject>.
+            // SAFETY: tag confirmed Thread; the object is a ThreadObject
+            // constructed in place at a size-class-aligned retype offset.
             #[allow(clippy::cast_ptr_alignment)]
             unsafe {
                 (*obj.as_ptr().cast::<ThreadObject>()).tcb
@@ -381,8 +386,8 @@ pub fn sys_ioport_bind(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         let port_slot = unsafe { super::lookup_cap(cspace, ioport_idx, IoPortRights::USE) }?;
         let (port_base, port_size) = {
             let obj = port_slot.object.ok_or(SyscallError::InvalidCapability)?;
-            // SAFETY: tag confirmed IoPort; the object is an IoPortObject minted in
-            // place at boot.
+            // SAFETY: tag confirmed IoPort; the object is an IoPortObject retyped in
+            // place from the SEED reserve (at boot, or by sys_ioport_split).
             #[allow(clippy::cast_ptr_alignment)]
             let po = unsafe { &*obj.as_ptr().cast::<IoPortObject>() };
             (po.base, po.size)

@@ -91,7 +91,7 @@ const SOURCE_WRAPPER_BYTES: usize = 24;
 /// point into a retype-backed source slot (Endpoint/Notification/EventQueue). The
 /// production paths in `sys_cap_create_*` always retype-back these objects,
 /// and the dealloc arms in `cap::object::dealloc_object_one` assert
-/// `ancestor.is_some()`; there is no other construction path.
+/// a non-null `ancestor`; there is no other construction path.
 unsafe fn source_header(state_ptr: *mut u8) -> *mut crate::cap::object::KernelObjectHeader
 {
     // SAFETY: state_ptr is the inner-body pointer; the wrapper (with header at
@@ -161,7 +161,7 @@ impl WaitSetMember
 /// the 512 B retype bin (≈ 440 B: 16 × 24 B members, plus ready ring,
 /// waiter pointer, and bookkeeping). The cap-create path constructs
 /// both objects in place inside the source `Memory` cap's region;
-/// nothing is heap-allocated.
+/// nothing else is allocated.
 pub struct WaitSetState
 {
     /// Per-`WaitSetState` spinlock. Serialises every mutation of the

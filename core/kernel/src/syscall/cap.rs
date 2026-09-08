@@ -2712,7 +2712,8 @@ pub fn sys_cap_info(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 return Err(SyscallError::InvalidArgument);
             }
             // SAFETY: tag confirmed Memory; header is at offset 0 of MemoryObject.
-            // cast_ptr_alignment: MemoryObject (8-byte aligned via Box) holds the header at offset 0.
+            // cast_ptr_alignment: MemoryObject (constructed in place at a size-class-aligned
+            // retype offset, so 8-byte aligned) holds the header at offset 0.
             #[allow(clippy::cast_ptr_alignment)]
             let memory = unsafe { &*(obj.as_ptr().cast::<MemoryObject>()) };
             Ok(memory.size)

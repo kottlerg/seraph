@@ -75,8 +75,10 @@ kernel/
 │   ├── ipc/                    # IPC subsystem
 │   │   ├── mod.rs
 │   │   ├── endpoint.rs         # Endpoint object: wait queues, state machine
-│   │   ├── notification.rs           # Notification object: atomic bitmask
+│   │   ├── notification.rs     # Notification object: atomic bitmask
 │   │   ├── event_queue.rs      # Event queue: ring buffer
+│   │   ├── fault.rs            # Fault redirection to a thread's fault handler
+│   │   ├── message.rs          # IPC message type: label, data words, cap slots
 │   │   └── wait_set.rs         # Wait set: multi-source aggregation
 │   ├── sched/                  # Scheduler
 │   │   ├── mod.rs              # Public API: init, schedule, timer_tick, wake protocol

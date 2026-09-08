@@ -150,8 +150,8 @@ intermediate page-table pool in the same type. A pool is an intrusive free
 list of the donated pages (each free page's first word links the next) plus
 a record of every donation (a *chunk* in the code) — its source Memory
 object, byte offset, and page count — so teardown can return each donation
-to its source wholesale.
-The wrapper, not the pool, keeps the byte budget the pool backs.
+to its source wholesale. The wrapper, not the pool, keeps the byte budget
+the pool backs.
 
 ### Donation Records
 
@@ -171,8 +171,8 @@ page, the slot pages, and the page tables themselves: the kernel trusts its
 contents, and the donating Memory capability's holder is trusted not to map
 what it has retyped away. The records are never scanned while the owner is
 live: an address space's reclaiming unmap recognises pool-owned page tables
-by a bit in the parent entry, not by the records — see
-[memory-internals.md](memory-internals.md) § Page Table Node Ownership.
+by a bit in the parent entry, not by the records — see [memory-internals.md](memory-internals.md)
+§ Page Table Node Ownership.
 
 ### Teardown
 

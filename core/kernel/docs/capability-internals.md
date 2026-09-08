@@ -193,8 +193,7 @@ masked, or the idle thread's drain, with interrupts enabled
 (scheduling-internals § Bare spin locks). So an owner's teardown latency
 scales with how finely it donated, and can land on an unrelated thread's
 syscall: the same memory donated as single pages costs one return per
-page, and the sixteen-donation cap that used to bound this window is
-gone. The standard runtime donates one page per page-table shortfall, so
+page. The standard runtime donates one page per page-table shortfall, so
 a process's count is its page-table page count, of the order of one per
 2 MiB of mapped span.
 

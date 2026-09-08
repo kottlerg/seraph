@@ -325,8 +325,9 @@ pub fn sys_mmio_map(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// arg0 = Thread cap index (must have CONTROL right).
 /// arg1 = `IoPort` cap index (must have USE right).
 ///
-/// On first bind, an 8 KiB per-thread IOPB bitmap is carved from the SEED Memory cap and all
-/// ports are denied (0xFF). The requested range bits are then cleared (0 =
+/// On first bind, an 8 KiB per-thread IOPB bitmap is carved from the SEED
+/// Memory cap and all ports are denied (0xFF). The requested range bits are
+/// then cleared (0 =
 /// allowed). On context switch the bitmap is copied into the TSS IOPB region.
 ///
 /// On RISC-V: always returns `NotSupported` (no I/O port concept).
@@ -380,7 +381,8 @@ pub fn sys_ioport_bind(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         let port_slot = unsafe { super::lookup_cap(cspace, ioport_idx, IoPortRights::USE) }?;
         let (port_base, port_size) = {
             let obj = port_slot.object.ok_or(SyscallError::InvalidCapability)?;
-            // SAFETY: tag confirmed IoPort; the object is an IoPortObject minted in place at boot.
+            // SAFETY: tag confirmed IoPort; the object is an IoPortObject minted in
+            // place at boot.
             #[allow(clippy::cast_ptr_alignment)]
             let po = unsafe { &*obj.as_ptr().cast::<IoPortObject>() };
             (po.base, po.size)

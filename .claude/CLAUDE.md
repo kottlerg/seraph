@@ -86,7 +86,7 @@ truth for "how work is tracked and shipped" on this project.
 - A documentation-only or comment-only change, as
   [docs/testing.md](../docs/testing.md) "Coverage tiers" defines it,
   requires none of the runs above; the CI gate and the pre-merge audit
-  still apply, and the PR body states the validated head and the
+  still apply, and the PR body MUST state the validated head and the
   documentation-only delta.
 
 ## Completeness

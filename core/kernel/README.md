@@ -57,7 +57,7 @@ kernel/
 │   │   ├── cspace.rs           # CSpace: slot storage, lookup, growth
 │   │   ├── slot.rs             # Capability slot representation and rights
 │   │   ├── derivation.rs       # Derivation tree, revocation algorithm
-│   │   ├── object.rs           # Kernel object headers, allocation, teardown
+│   │   ├── object.rs           # Kernel object headers and wrappers, page pools, teardown
 │   │   ├── retype.rs           # Memory-cap retype allocator (object carving)
 │   │   ├── split.rs            # Shared tail of the range-cap split syscalls
 │   │   └── transfer.rs         # Batched capability move (SYS_CAP_MOVE, IPC transfer)

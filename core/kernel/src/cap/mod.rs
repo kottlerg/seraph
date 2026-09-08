@@ -649,7 +649,7 @@ pub(crate) const MAX_DRAIN_BLOCKS: usize = 4096;
 
 /// Backing storage for the buddy drain in [`drain_and_install_seed`] and
 /// the per-block (base, size) results consumed by [`populate_cspace`].
-/// Lives in BSS so the kernel never grows the heap during Phase 7. Cost:
+/// Lives in BSS so Phase 7 allocates nothing for it. Cost:
 /// 4096 × 16 B (`RamBlock`) + 4096 × 16 B (`(u64, usize)` order tuple) ≈ 128 KiB.
 #[cfg(not(test))]
 static mut DRAIN_ORDER_BUF: [(u64, usize); MAX_DRAIN_BLOCKS] = [(0u64, 0usize); MAX_DRAIN_BLOCKS];

@@ -323,15 +323,6 @@ oversight. The runs below are procedurally REQUIRED for PRs touching the
 listed paths — binding the same way the pre-merge audit agents are, with
 no CI surface.
 
-**Documentation-only and comment-only changes.** A diff that, Markdown
-aside, alters only comment lines in source files cannot change program
-behaviour, so none of the runs in this section are required for it, whatever
-paths it touches. Source text a build embeds verbatim (`include_str!`,
-`include_bytes!`, `global_asm!` inputs) is build input, not comment. The CI
-gate and the pre-merge audit apply unchanged; the PR body states the
-validated head and that the delta is documentation or comments only, and
-the audit checks that against the diff.
-
 ```sh
 # Boundary CPU counts, riscv64 (~70 s per passing run on a 16-core host;
 # the 600 s budget is for HANG classification):
@@ -383,6 +374,16 @@ mandate above.
 # classification):
 cargo xtask run-parallel --arch riscv64 --cpus 128 --parallel 1 --runs 1 --timeout 1800
 ```
+
+**Documentation-only and comment-only changes.** A diff that, Markdown
+aside, alters only comment lines in source files cannot change program
+behaviour, so none of the local host runs in this section are required for
+it, whatever paths it touches. Source text a build embeds verbatim
+(`include_str!`, `include_bytes!`, `global_asm!` inputs) is build input,
+not comment or Markdown. The CI gate and the pre-merge audit apply
+unchanged; the PR body MUST state the validated head and that the delta is
+documentation or comments only, and the audit MUST check that against the
+diff.
 
 **Known boundaries**, established empirically (QEMU 11.0.1; update this
 list as the tracking Issues move):

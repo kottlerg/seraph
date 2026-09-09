@@ -127,12 +127,13 @@ from the donated `BootInfo` page after consuming them.)
 
 The surfaces above are values the kernel emits. A distinct surface is kernel
 state the kernel keeps in memory retyped from a user-held Memory capability:
-wrapper pages, capability slot pages (each slot holds an object pointer),
-page tables, and page-pool record pages (each record holds a raw
-`KernelObjectHeader` pointer to its donation's ancestor; see
-[capability-internals.md](capability-internals.md) § Page Pools). The holder
-of the donating capability is trusted not to map what it has retyped away;
-the kernel does not yet enforce that boundary
+wrapper pages, capability slot pages (each slot holds an object pointer), page
+tables, page-pool record pages (each record holds a raw `KernelObjectHeader`
+pointer to its donation's ancestor; see
+[capability-internals.md](capability-internals.md) § Page Pools), and the
+retype allocator's free-list links (offsets into the region, not addresses).
+The holder of the donating capability is trusted not to map what it has
+retyped away; the kernel does not yet enforce that boundary
 ([#433](https://github.com/kottlerg/seraph/issues/433)). Until it does, the
 class (a) claim holds only under that trust.
 

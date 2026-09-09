@@ -594,7 +594,7 @@ rights); augment-mode — `0`. `SyscallError` on failure.
 
 Augment-mode donations are unbounded in count. Once the target's inline donation
 records are full, the kernel keeps its bookkeeping in the donations themselves: once per
-record page (see [capability-internals.md](capability-internals.md#page-pools-capobjectrs))
+record page (see [capability-internals.md](capability-internals.md) § Page Pools)
 a donation's first page becomes that bookkeeping and only `init_pages − 1` pages reach
 the pool, so a one-page donation can leave the budget unchanged. Read the budget back via
 `SYS_CAP_INFO` rather than assuming `init_pages` were added.

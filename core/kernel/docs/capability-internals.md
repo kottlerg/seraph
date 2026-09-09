@@ -173,9 +173,8 @@ what it has retyped away, which the kernel does not yet enforce
 [cross-boundary-disclosure.md](cross-boundary-disclosure.md) § Kernel state
 in donated memory records that surface. The records are never scanned while
 the owner is live: an address space's reclaiming unmap recognises pool-owned
-page tables by a bit in the parent entry, not by the
-records; see [memory-internals.md](memory-internals.md) § Page Table Node
-Ownership.
+page tables by a bit in the parent entry, not by the records; see
+[memory-internals.md](memory-internals.md) § Page Table Node Ownership.
 
 ### Teardown
 

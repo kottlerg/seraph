@@ -248,16 +248,17 @@ pub extern "C" fn _start(info_ptr: u64) -> !
 /// from memmgr; ktest has no memmgr, so it draws on the kernel-minted RAM caps it
 /// inherits as init.
 ///
-/// `sys_mmio_map` and `sys_mem_map` into ktest's retype-backed boot
-/// AS draw intermediate PT pages from that AS's own pool, not the fixed kernel
-/// reserve. The seeded `INIT_ASPACE_PAGES` pool sizes init's own bootstrap
-/// footprint; ktest additionally maps the framebuffer and serial MMIO and runs
-/// the `mem_map` suite against this AS, so it needs a modest top-up. Source the
+/// `sys_mmio_map` and `sys_mem_map` into ktest's retype-backed boot AS draw
+/// intermediate PT pages from that AS's own pool, not the fixed kernel reserve.
+/// The seeded `INIT_ASPACE_PAGES` pool sizes init's own bootstrap footprint;
+/// ktest additionally maps the framebuffer and serial MMIO and runs the
+/// `mem_map` suite against this AS, so it needs a modest top-up. Source the
 /// slabs from spare RAM caps — every inherited RAM cap except `memory_base`,
-/// which `frame_pool` and the retype-heavy tests draw from. The kernel coalesces
-/// drained RAM and places the largest extent at `memory_base`, leaving the
-/// smaller extents as spares, so accumulate across several augments.
-/// Best-effort: a partial top-up still helps; failures surface in the tests.
+/// which `frame_pool` and the retype-heavy tests draw from. The kernel
+/// coalesces drained RAM and places the largest extent at `memory_base`,
+/// leaving the smaller extents as spares, so accumulate across several
+/// augments. Best-effort: a partial top-up still helps; failures surface in the
+/// tests.
 fn fund_boot_aspace_pt(info: &init_protocol::InitInfo)
 {
     const TARGET_BYTES: u64 = 64 * 4096;

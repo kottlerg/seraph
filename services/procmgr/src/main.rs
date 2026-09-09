@@ -201,16 +201,12 @@ const WS_BADGE_DEATH: u64 = 1;
 
 /// Pages requested from memmgr per spawned child for the child's Thread
 /// retype slab. The kernel consumes `KERNEL_STACK_PAGES + 1 = 5` pages
-/// (4 kstack + 1 wrapper/TCB) plus a small one-time per-`MemoryObject`
-/// allocator metadata footprint; one extra page is included so the
-/// retype's `available_bytes >= raw_bytes` check passes after that
-/// metadata debit.
+/// (4 kstack + 1 wrapper/TCB); the sixth page is slack over that count.
 pub(crate) const THREAD_RETYPE_PAGES: u64 = 6;
 
 /// Pages requested from memmgr for the child's `AddressSpace` retype slab.
-/// Page 0 becomes the root PT; the remaining pages form the initial PT
-/// growth pool. The +1 covers the ~64 B per-memory-cap allocator metadata
-/// footprint debited at the first retype.
+/// Page 0 holds the wrapper and page 1 the root PT; the remaining pages
+/// form the initial PT growth pool.
 ///
 /// Sized to cover the typical small-process mapping pattern: 3-6 LOAD
 /// segments + stack + IPC buffer + TLS + `ProcessInfo` memory cap. Each
@@ -225,15 +221,14 @@ pub(crate) const ASPACE_RETYPE_PAGES: u64 = 48;
 
 /// Pages requested from memmgr for the child's `CSpace` retype slab.
 /// Each slot page holds `L2_SIZE` capability slots (currently 56 slots
-/// × 72 B = 4032 B/page); the +1 covers the per-memory-cap allocator
-/// metadata footprint, and the kernel reserves the slab's page 0 as the
+/// × 72 B = 4032 B/page); the kernel reserves the slab's page 0 as the
 /// wrapper page.
 ///
 /// Seeded for the expected startup population of a spawned child
 /// (bootstrap caps plus working headroom); a child that outgrows the
 /// pool sees the refillable `OutOfMemory` and self-funds via
-/// augment-mode `cap_create_cspace`. 7 pages → 6 to the kernel →
-/// 5 pool pages → 5 × 56 − 1 = 279 usable slots.
+/// augment-mode `cap_create_cspace`. 7 pages → page 0 is the wrapper →
+/// 6 slot pages → 6 × 56 − 1 = 335 usable slots.
 pub(crate) const CSPACE_RETYPE_PAGES: u64 = 7;
 
 /// Register a new child with memmgr. On success returns

@@ -6,7 +6,7 @@ enforcement, TLB management) are specified in
 [docs/memory-model.md](../../../docs/memory-model.md). This document describes how
 those goals are realised in code.
 
-The memory subsystem comprises four components:
+The memory subsystem comprises six components:
 
 1. **Buddy allocator** — boot-time physical frame allocation
 2. **Kernel object memory** — objects carved out of Memory capabilities by retype,
@@ -14,6 +14,10 @@ The memory subsystem comprises four components:
 3. **Address space management** — per-process virtual address space objects
 4. **TLB management** — local invalidation, tagged (PCID/ASID) no-flush context
    switch with a full-flush fallback, and SMP shootdown
+5. **Kernel stack allocation** — idle stacks from the buddy, every other stack from
+   the thread's own slab
+6. **Page table node ownership** — which page-table pages belong to an address
+   space's pool and which the kernel lends
 
 ---
 

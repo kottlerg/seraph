@@ -94,17 +94,27 @@ were swept to use `svctest` where they meant the services-tier harness.
 
 - One line, SHOULD be ≤ 72 characters.
 - Form: `<scope>: <summary>`.
-- `<scope>` names what the commit touches: a component path (`kernel`, `xtask`, `services/init`), a directory (`docs`, `.github`), a workspace-wide topic (`treewide`), or comma-separated combinations (`ci, xtask`; `docs, claude`). Use the narrowest scope that covers the change.
-- `<summary>` describes what changed and MAY use `;` to delimit independent sub-changes within one commit.
-- `<summary>` MUST NOT contain planning labels (per [documentation-standards.md](documentation-standards.md) §"Incomplete Work Markers"): no "step X", "phase Y", "tier N", "stage M", "round N", "the deferred follow-up", nor any other label that only a planning conversation can resolve. The list is illustrative, not exhaustive. Components and concrete what-changed text only.
-- `<summary>` MUST NOT include task IDs, branch names, or other transient identifiers. Issue references belong in the body.
+- `<scope>` names what the commit touches: a component path (`kernel`, `xtask`, `services/init`), a
+  directory (`docs`, `.github`), a workspace-wide topic (`treewide`), or comma-separated
+  combinations (`ci, xtask`; `docs, claude`). Use the narrowest scope that covers the change.
+- `<summary>` describes what changed and MAY use `;` to delimit independent sub-changes within one
+  commit.
+- `<summary>` MUST NOT contain planning labels (per
+  [documentation-standards.md](documentation-standards.md) §"Incomplete Work Markers"): no "step X",
+  "phase Y", "tier N", "stage M", "round N", "the deferred follow-up", nor any other label that only
+  a planning conversation can resolve. The list is illustrative, not exhaustive. Components and
+  concrete what-changed text only.
+- `<summary>` MUST NOT include task IDs, branch names, or other transient identifiers. Issue
+  references belong in the body.
 
 ### Body
 
 - Optional for trivial changes (typo fixes, single-line tweaks).
 - Expected for substantive changes: explain the why, not the what (the diff shows the what).
 - Wrap at ~72 columns.
-- A commit (or its enclosing PR description) that closes an Issue MUST include `Fixes #N` / `Closes #N` so the merge auto-closes the Issue. Closing manually after the fact is a procedural miss, not a substitute.
+- A commit (or its enclosing PR description) that closes an Issue MUST include `Fixes #N` / `Closes
+  #N` so the merge auto-closes the Issue. Closing manually after the fact is a procedural miss, not
+  a substitute.
 
 ### Style
 

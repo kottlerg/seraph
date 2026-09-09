@@ -67,10 +67,9 @@ pub fn run(ctx: &TestContext) -> TestResult
 {
     let memory = ctx.memory_base;
 
-    // Pre-warm: pay the per-MemoryObject allocator metadata cost (if not
-    // already paid by an earlier test) so the baseline reflects steady
-    // state. The mint-and-immediate-delete cycle leaves `available_bytes`
-    // exactly where it was after the metadata debit.
+    // Warm the cap's allocator with one mint-and-delete cycle before
+    // taking the baseline, so the baseline reflects the steady state the
+    // measured cycles below run in.
     let warmup = cap_create_endpoint(memory)
         .map_err(|_| "integration::retype_reclaim: warmup cap_create_endpoint failed")?;
     cap_delete(warmup).map_err(|_| "integration::retype_reclaim: warmup cap_delete failed")?;

@@ -148,8 +148,8 @@ The wrapper object that owns a `CSpace` (`CSpaceKernelObject`) keeps the
 slot-page pool in a `PagePool`; the wrapper of an `AddressSpace` keeps its
 intermediate page-table pool in the same type. A pool is an intrusive free
 list of the donated pages (each free page's first word links the next) plus
-a record of every donation — its source Memory
-object, byte offset, and page count — so teardown can return each donation
+a record of every donation — its source Memory object, byte offset, and
+page count — so teardown can return each donation
 to its source wholesale. The wrapper, not the pool, keeps the byte budget
 the pool backs.
 
@@ -194,7 +194,8 @@ deferred-reclaim stack — a thread deleting an object it is itself bound
 to, or the batched capability move releasing any `CSpace` or
 `AddressSpace` — the next syscall epilogue on that CPU, with interrupts
 masked, or the idle thread's drain, with interrupts enabled
-(scheduling-internals § Bare spin locks). So an owner's teardown latency
+([scheduling-internals.md](scheduling-internals.md) § Bare spin locks). So
+an owner's teardown latency
 scales with how finely it donated, and can land on an unrelated thread's
 syscall: the same memory donated as single pages costs one return per
 page. The standard runtime donates one page per page-table shortfall, so

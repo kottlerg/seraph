@@ -388,7 +388,7 @@ pub fn sys_cap_create_notification(tf: &mut TrapFrame) -> Result<u64, SyscallErr
 /// - page 1 — root page table (PML4 / RISC-V root), zeroed, kernel-half PT
 ///   entries copied from the active root.
 /// - pages `2..init_pages` — PT growth pool. Drawn on demand by
-///   [`AddressSpace::map_page`](crate::mm::address_space::AddressSpace::map_page)
+///   [`AddressSpace::map_page_pooled`](crate::mm::address_space::AddressSpace::map_page_pooled)
 ///   for intermediate PT levels.
 ///
 /// Inserts a cap with `MAP | READ | CONTROL` rights into the caller's

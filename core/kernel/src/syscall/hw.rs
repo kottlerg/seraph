@@ -395,8 +395,8 @@ pub fn sys_ioport_bind(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         };
 
         // Allocate per-thread IOPB on first bind. Sourced from the kernel
-        // SEED Memory cap; freed back to SEED on thread
-        // dealloc via the Thread arm of `dealloc_object`.
+        // SEED Memory cap; freed back to SEED on thread dealloc via the
+        // Thread arm of `dealloc_object`.
         // SAFETY: target_tcb validated non-null; iopb field always valid.
         if unsafe { (*target_tcb).iopb.is_null() }
         {

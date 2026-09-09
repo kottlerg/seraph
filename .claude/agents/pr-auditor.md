@@ -59,7 +59,8 @@ claims.
    (`git log master..HEAD --format=%B`) against `docs/conventions.md`
    § Commit Messages. A planning label ("step X", "phase Y", "tier N",
    "stage M", "round N", or any label that only a planning conversation
-   can resolve), a task ID, or a branch name in a subject is a FAIL.
+   can resolve; the kernel's documented boot phases are not labels), a
+   task ID, or a branch name in a subject is a FAIL.
 
 ## Output
 

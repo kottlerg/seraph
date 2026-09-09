@@ -129,7 +129,8 @@ error and log strings, and commit messages.
   deferred follow-up"; the list is illustrative, not exhaustive. These are
   pointers into a planning conversation that has no permanence and rot the
   moment the plan moves on. A count the code itself performs ("two augment
-  rounds") is not a label.
+  rounds") and the kernel's documented boot phases ("Phase 6", named in
+  `core/kernel/docs/initialization.md`) are not labels.
 - Commit messages name components and what changed, not planning labels.
 
 ---

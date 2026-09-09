@@ -40,7 +40,14 @@ kernel/
 │   │   │   ├── syscall.rs      # SYSCALL/SYSRET entry glue
 │   │   │   ├── cpu.rs          # CPUID, topology, per-CPU state (GDT/TSS)
 │   │   │   ├── console.rs      # Early framebuffer/serial output
-│   │   │   └── entropy.rs      # Hardware RNG (RDSEED/RDRAND) + cycle counter
+│   │   │   ├── entropy.rs      # Hardware RNG (RDSEED/RDRAND) + cycle counter
+│   │   │   ├── ap_trampoline.rs # AP SIPI startup trampoline
+│   │   │   ├── fpu.rs          # Extended-state (x87/SSE/AVX) control
+│   │   │   ├── gdt.rs          # Global Descriptor Table and TSS
+│   │   │   ├── idt.rs          # Interrupt Descriptor Table
+│   │   │   ├── ioapic.rs       # I/O APIC driver
+│   │   │   ├── platform.rs     # Bootloader-discovered hardware accessors
+│   │   │   └── trap_frame.rs   # Trap/syscall frame: user register snapshot
 │   │   └── riscv64/            # RISC-V implementation
 │   │       ├── mod.rs
 │   │       ├── paging.rs       # Page table management (mode-parameterized)
@@ -50,7 +57,14 @@ kernel/
 │   │       ├── syscall.rs      # ECALL entry glue
 │   │       ├── cpu.rs          # Hart ID, topology, per-hart state
 │   │       ├── console.rs      # Early SBI console / framebuffer output
-│   │       └── entropy.rs      # Hardware RNG (none; jitter-only) + cycle counter
+│   │       ├── entropy.rs      # Hardware RNG (none; jitter-only) + cycle counter
+│   │       ├── ap_trampoline.rs # AP startup trampoline (SBI HSM hart_start)
+│   │       ├── fpu.rs          # Extended-state (F/D/V) control
+│   │       ├── gdt.rs          # GDT stub
+│   │       ├── idt.rs          # IDT stub
+│   │       ├── platform.rs     # Bootloader-discovered hardware accessors
+│   │       ├── sbi.rs          # Generic SBI ecall forwarding
+│   │       └── trap_frame.rs   # Trap frame: user register snapshot
 │   ├── mm/                     # Memory management subsystem
 │   │   ├── mod.rs
 │   │   ├── buddy.rs            # Physical frame allocator (buddy algorithm)
@@ -197,7 +211,7 @@ and is compiled with a custom target specification for each architecture:
 | x86-64 | `x86_64-seraph-none` |
 | RISC-V | `riscv64imac-seraph-none` |
 
-Custom target JSON files live in `targets/`. They specify the code model,
+Custom target JSON files live in `xtask/targets/`. They specify the code model,
 relocation model, and disable features the kernel cannot use (SSE/AVX before explicit
 initialization, for example).
 

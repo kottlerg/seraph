@@ -2521,6 +2521,11 @@ unsafe fn dealloc_object_one(
             let obj = unsafe { &*(ptr.as_ptr().cast::<AddressSpaceObject>()) };
             let as_ptr = obj.address_space;
 
+            debug_assert!(
+                obj.pt_pool.has_create_donation(),
+                "dealloc AddressSpace: donation-less AS reached typed-memory dealloc path"
+            );
+
             if !as_ptr.is_null()
             {
                 // ── Stop bound threads ──
@@ -2579,11 +2584,6 @@ unsafe fn dealloc_object_one(
                     core::ptr::drop_in_place(as_ptr);
                 }
             }
-
-            debug_assert!(
-                obj.pt_pool.has_create_donation(),
-                "dealloc AddressSpace: donation-less AS reached typed-memory dealloc path"
-            );
 
             // Return every donation, the create-time slab (holding the
             // wrapper and this pool) last; `obj` is dangling afterwards.

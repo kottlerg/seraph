@@ -187,6 +187,8 @@ control blocks, and context switch coordination live here. See
 [`docs/scheduler.md`](docs/scheduler.md) for the scheduling algorithm,
 [`docs/scheduling-internals.md`](docs/scheduling-internals.md) for the SMP
 locking invariants, wake protocol, IPI taxonomy, and BSP boot transient,
+[`docs/sched-ipc-redesign.md`](docs/sched-ipc-redesign.md) for the rationale
+behind the per-TCB scheduler lock on the SMP hot path,
 and [`docs/thread-lifecycle-and-sleep.md`](docs/thread-lifecycle-and-sleep.md)
 for the lifecycle-syscall, sleep-list, and `dealloc_object(Thread)` drain
 protocol.

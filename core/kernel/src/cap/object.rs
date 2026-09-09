@@ -27,10 +27,11 @@
 //!
 //! ## Layout
 //!
-//! The header is at offset 0 of every object. Each wrapper page — an
-//! `AddressSpaceObject` followed by its in-place `AddressSpace`, a
-//! `CSpaceKernelObject` followed by its inline `CSpace` — is compile-asserted
-//! to fit one page; no other size is asserted.
+//! Compile-time assertions cover each wrapper page — an `AddressSpaceObject`
+//! followed by its in-place `AddressSpace`, a `CSpaceKernelObject` followed
+//! by its inline `CSpace` — fitting one page, a `RecordPage` fitting one
+//! page, and its records starting at `RECORD_PAGE_HEADER`; no other size is
+//! asserted.
 
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};

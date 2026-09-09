@@ -291,9 +291,9 @@ fn do_reap(state: InitReapState, memmgr_ep: u32, ipc_buf: *mut u64)
     // 3. Destroy init's AddressSpace. Revoke first to clear any
     //    derived child caps, then delete to drop procmgr's reference
     //    (which is the last one, since init's CSpace moved its copy
-    //    over via IPC). `dealloc_object` for AddressSpace returns PT
-    //    chunks via `retype_free`; user-page mappings disappear at
-    //    the same moment.
+    //    over via IPC). `dealloc_object` for AddressSpace returns its
+    //    pool donations via `retype_free`; user-page mappings disappear
+    //    at the same moment.
     let _ = syscall::cap_revoke_all(aspace);
     let _ = syscall::cap_delete(aspace);
 

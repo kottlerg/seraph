@@ -377,8 +377,8 @@ cargo xtask run-parallel --arch riscv64 --cpus 128 --parallel 1 --runs 1 --timeo
 
 **Documentation-only and comment-only changes.** A diff that, Markdown
 aside, alters only comment lines in source files cannot change program
-behaviour other than the source positions `#[track_caller]` propagates
-(`line!()`, `column!()`) and assertion messages record, which the CI gate's
+behaviour other than the source positions that `#[track_caller]`, `line!()`,
+and `column!()` record and assertion messages carry, which the CI gate's
 boots cover, so none of the local host runs in this section are required for
 it, whatever paths it touches. Source text a build embeds verbatim
 (`include_str!`, `include_bytes!`, `global_asm!` inputs) is build input, not

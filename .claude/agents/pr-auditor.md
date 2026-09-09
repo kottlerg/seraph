@@ -57,10 +57,13 @@ claims.
 
 8. Commit-message compliance: every commit subject and body on the branch
    (`git log master..HEAD --format=%B`) against `docs/conventions.md`
-   § Commit Messages. A planning label ("step X", "phase Y", "tier N",
-   "stage M", "round N", or any label that only a planning conversation
-   can resolve; the kernel's documented boot phases are not labels), a
-   task ID, or a branch name in a subject is a FAIL.
+   § Commit Messages, applying every rule of its Title, Body, and Style
+   sections as written there. A subject that breaks any Title rule —
+   a planning label ("step X", "phase Y", "tier N", "stage M", "round N",
+   or any label that only a planning conversation can resolve; the
+   kernel's documented boot phases are not labels), a task ID, a branch
+   name, or an issue reference placed where the rule says it belongs in
+   the body — is a FAIL.
 
 ## Output
 

@@ -1056,7 +1056,7 @@ pub fn cspace_augment_many(ctx: &TestContext) -> TestResult
 /// The address-space pool spills its donation records the same way. Pages
 /// described by spilled records serve as page tables: the free list is
 /// LIFO, so fresh mappings draw first on the newest donations (described by
-/// the second record page) and, once those fourteen pages are used up, on
+/// the second record page) and, once the pages it describes are used up, on
 /// donations the first record page describes. Every table a reclaiming
 /// unmap frees must be credited back, so the budget returns exactly to its
 /// post-donation value, and the delete returns every donation.

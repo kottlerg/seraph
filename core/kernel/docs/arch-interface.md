@@ -76,7 +76,8 @@ Manages hardware page tables. A page table is referenced by its physical root fr
 (`root_phys`) and a direct-map virtual alias (`root_virt`) — not an owned table object;
 intermediate frames come from the kernel page-table pool on the kernel-direct path and
 from the address-space object's own pool on the pooled path, and only the latter takes
-them back, through a reclaiming unmap.
+them back, through a reclaiming unmap ([memory-internals.md](memory-internals.md) § Page Table
+Node Ownership).
 
 ```rust
 /// Install `root_phys` as the active page table for the current CPU with a full

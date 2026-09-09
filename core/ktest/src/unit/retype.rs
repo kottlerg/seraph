@@ -609,17 +609,31 @@ pub fn cspace_grow_consumes_pool(ctx: &TestContext) -> TestResult
     let copies = 70usize;
     for _ in 0..copies
     {
-        if cap_copy(probe, cspace, 1).is_err()
+        match cap_copy(probe, cspace, 1)
         {
-            break;
+            Ok(_) =>
+            {}
+            Err(SYS_OUT_OF_MEMORY) => break,
+            Err(_) =>
+            {
+                cap_delete(probe).ok();
+                cap_delete(cspace).ok();
+                return Err(
+                    "retype::cspace_grow: cap_copy failed for a reason other than the pool",
+                );
+            }
         }
     }
 
-    let used_after = cap_info(cspace, CAP_INFO_CSPACE_USED).unwrap_or(0);
-    let budget_after = cap_info(cspace, CAP_INFO_CSPACE_BUDGET).unwrap_or(u64::MAX);
+    let used_after = cap_info(cspace, CAP_INFO_CSPACE_USED);
+    let budget_after = cap_info(cspace, CAP_INFO_CSPACE_BUDGET);
 
     cap_delete(probe).ok();
     cap_delete(cspace).ok();
+
+    let used_after = used_after.map_err(|_| "retype::cspace_grow: cap_info(used after) failed")?;
+    let budget_after =
+        budget_after.map_err(|_| "retype::cspace_grow: cap_info(budget after) failed")?;
 
     if used_after <= used_before
     {
@@ -890,7 +904,13 @@ pub fn cspace_dir_page_survives_failed_grow(ctx: &TestContext) -> TestResult
         return Err("retype::dir_survives: one-page refill failed");
     }
     let at_boundary = cap_copy(probe, cspace, 1);
-    let budget_after_fail = cap_info(cspace, CAP_INFO_CSPACE_BUDGET).unwrap_or(u64::MAX);
+    let Ok(budget_after_fail) = cap_info(cspace, CAP_INFO_CSPACE_BUDGET)
+    else
+    {
+        cap_delete(probe).ok();
+        cap_delete(cspace).ok();
+        return Err("retype::dir_survives: cap_info(budget after boundary) failed");
+    };
     if at_boundary != Err(SYS_OUT_OF_MEMORY) || budget_after_fail != 0
     {
         cap_delete(probe).ok();
@@ -973,7 +993,12 @@ pub fn cspace_augment_many(ctx: &TestContext) -> TestResult
             augment_failures += 1;
         }
     }
-    let budget = cap_info(cspace, CAP_INFO_CSPACE_BUDGET).unwrap_or(u64::MAX);
+    let Ok(budget) = cap_info(cspace, CAP_INFO_CSPACE_BUDGET)
+    else
+    {
+        cap_delete(cspace).ok();
+        return Err("retype::cspace_augment_many: cap_info(budget) failed");
+    };
 
     // Every seeded page except the directory page backs a leaf; slot 0 of
     // the first leaf is the null slot.
@@ -1011,7 +1036,9 @@ pub fn cspace_augment_many(ctx: &TestContext) -> TestResult
     }
     if budget != SEEDED * PAGE
     {
-        return Err("retype::cspace_augment_many: budget != donations minus the two record pages");
+        return Err(
+            "retype::cspace_augment_many: budget != SEEDED pages (mirrors RECORDS_PER_PAGE)",
+        );
     }
     if copies != expected_copies || terminal != SYS_OUT_OF_MEMORY
     {
@@ -1060,7 +1087,12 @@ pub fn aspace_augment_many(ctx: &TestContext) -> TestResult
             augment_failures += 1;
         }
     }
-    let budget = cap_info(aspace, CAP_INFO_ASPACE_PT_BUDGET).unwrap_or(u64::MAX);
+    let Ok(budget) = cap_info(aspace, CAP_INFO_ASPACE_PT_BUDGET)
+    else
+    {
+        cap_delete(aspace).ok();
+        return Err("retype::aspace_augment_many: cap_info(budget) failed");
+    };
 
     let mut map_failures = 0u32;
     for i in 0..REGIONS
@@ -1078,7 +1110,12 @@ pub fn aspace_augment_many(ctx: &TestContext) -> TestResult
             map_failures += 1;
         }
     }
-    let after_map = cap_info(aspace, CAP_INFO_ASPACE_PT_BUDGET).unwrap_or(u64::MAX);
+    let Ok(after_map) = cap_info(aspace, CAP_INFO_ASPACE_PT_BUDGET)
+    else
+    {
+        cap_delete(aspace).ok();
+        return Err("retype::aspace_augment_many: cap_info(after map) failed");
+    };
     let mut reclaim_failures = 0u32;
     for i in 0..REGIONS
     {
@@ -1087,9 +1124,11 @@ pub fn aspace_augment_many(ctx: &TestContext) -> TestResult
             reclaim_failures += 1;
         }
     }
-    let after_reclaim = cap_info(aspace, CAP_INFO_ASPACE_PT_BUDGET).unwrap_or(u64::MAX);
+    let after_reclaim = cap_info(aspace, CAP_INFO_ASPACE_PT_BUDGET);
 
     cap_delete(aspace).ok();
+    let after_reclaim =
+        after_reclaim.map_err(|_| "retype::aspace_augment_many: cap_info(after reclaim) failed")?;
     let after = cap_info(memory, CAP_INFO_MEMORY_AVAILABLE)
         .map_err(|_| "retype::aspace_augment_many: cap_info(after) failed")?;
 
@@ -1099,7 +1138,9 @@ pub fn aspace_augment_many(ctx: &TestContext) -> TestResult
     }
     if budget != SEEDED * PAGE
     {
-        return Err("retype::aspace_augment_many: budget != donations minus the two record pages");
+        return Err(
+            "retype::aspace_augment_many: budget != SEEDED pages (mirrors RECORDS_PER_PAGE)",
+        );
     }
     if map_failures != 0 || after_map > budget.saturating_sub(2 * REGIONS * PAGE)
     {

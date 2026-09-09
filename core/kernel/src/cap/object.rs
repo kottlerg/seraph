@@ -25,24 +25,12 @@
 //! object in place, and call `retype_free` against the ancestor
 //! `MemoryObject`; every object has one.
 //!
-//! ## Sizes (on the 64-bit targets; the wrapper-page fits are compile-asserted)
+//! ## Layout
 //!
-//! | Type                | Size  |
-//! |---------------------|-------|
-//! | KernelObjectHeader  | 16 B  |
-//! | MemoryObject        | 96 B  |
-//! | MmioObject          | 40 B  |
-//! | InterruptObject     | 24 B  |
-//! | IoPortObject        | 24 B  |
-//! | SchedControlObject  | 24 B  |
-//! | SbiControlObject    | 16 B  |
-//! | ThreadObject        | 32 B  |
-//! | AddressSpaceObject  | 448 B |
-//! | CSpaceKernelObject  | 448 B |
-//! | EndpointObject      | 24 B  |
-//! | NotificationObject  | 24 B  |
-//! | EventQueueObject    | 24 B  |
-//! | WaitSetObject       | 24 B  |
+//! The header is at offset 0 of every object. Each wrapper page — an
+//! `AddressSpaceObject` followed by its in-place `AddressSpace`, a
+//! `CSpaceKernelObject` followed by its inline `CSpace` — is compile-asserted
+//! to fit one page; no other size is asserted.
 
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
@@ -1554,7 +1542,8 @@ unsafe fn defer_self_teardown(ptr: NonNull<KernelObjectHeader>, what: &str)
 /// no lock held, because their fan-out is unbounded and the worklist is
 /// not: the `CSpaceObj` arm for the objects a dying `CSpace`'s slots
 /// reference, and the `AddressSpace` and `CSpaceObj` arms' `free_donation`
-/// for a pool donation's Memory object that reaches zero.
+/// (nested in `dealloc_object_one`) for a pool donation's Memory object that
+/// reaches zero.
 #[cfg(not(test))]
 pub unsafe fn dealloc_object(ptr: core::ptr::NonNull<KernelObjectHeader>)
 {

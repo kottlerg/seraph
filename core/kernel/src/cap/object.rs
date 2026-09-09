@@ -30,17 +30,17 @@
 //! | Type                | Size  |
 //! |---------------------|-------|
 //! | KernelObjectHeader  | 16 B  |
-//! | MemoryObject         | 64 B  |
-//! | MmioObject    | 40 B  |
+//! | MemoryObject        | 64 B  |
+//! | MmioObject          | 40 B  |
 //! | InterruptObject     | 24 B  |
-//! | IoPortObject   | 24 B  |
+//! | IoPortObject        | 24 B  |
 //! | SchedControlObject  | 24 B  |
 //! | SbiControlObject    | 16 B  |
 //! | ThreadObject        | 32 B  |
 //! | AddressSpaceObject  | 448 B |
 //! | CSpaceKernelObject  | 448 B |
 //! | EndpointObject      | 24 B  |
-//! | NotificationObject        | 24 B  |
+//! | NotificationObject  | 24 B  |
 //! | EventQueueObject    | 24 B  |
 //! | WaitSetObject       | 24 B  |
 

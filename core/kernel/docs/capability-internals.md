@@ -196,10 +196,11 @@ thread's drain, with interrupts enabled
 ([scheduling-internals.md](scheduling-internals.md) § Bare spin locks). So
 an owner's teardown latency scales with how finely it donated, and can land
 on an unrelated thread's syscall: the same memory donated as single pages
-costs one return per page. The standard runtime donates one page per
-page-table shortfall, so a process's count is its page-table page count, of
-the order of one per 2 MiB of mapped span. Bounding the walk, and the
-seeding of one donation, within a syscall is
+costs one return per page. The standard runtime's map retry donates one page
+per page-table shortfall (its budget top-up donates the shortfall in one
+call), so a process's count is of the order of its page-table page count,
+one per 2 MiB of mapped span. Bounding the walk, and the seeding of one
+donation, within a syscall is
 [#434](https://github.com/kottlerg/seraph/issues/434).
 
 ---

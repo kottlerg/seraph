@@ -1087,7 +1087,7 @@ pub fn aspace_augment_many(ctx: &TestContext) -> TestResult
             reclaim_failures += 1;
         }
     }
-    let after_reclaim = cap_info(aspace, CAP_INFO_ASPACE_PT_BUDGET).unwrap_or(0);
+    let after_reclaim = cap_info(aspace, CAP_INFO_ASPACE_PT_BUDGET).unwrap_or(u64::MAX);
 
     cap_delete(aspace).ok();
     let after = cap_info(memory, CAP_INFO_MEMORY_AVAILABLE)
@@ -1101,7 +1101,7 @@ pub fn aspace_augment_many(ctx: &TestContext) -> TestResult
     {
         return Err("retype::aspace_augment_many: budget != donations minus the two record pages");
     }
-    if map_failures != 0 || after_map > budget - 2 * REGIONS * PAGE
+    if map_failures != 0 || after_map > budget.saturating_sub(2 * REGIONS * PAGE)
     {
         return Err("retype::aspace_augment_many: mappings did not draw two tables per region");
     }

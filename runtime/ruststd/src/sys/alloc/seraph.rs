@@ -75,6 +75,16 @@ const GROW_MIN_PAGES: u64 = 16;
 /// large `Vec` reallocations stay within a single round.
 const GROW_MAX_PAGES: u64 = 256;
 
+/// Augment rounds a page-table funding path may make before giving up.
+///
+/// The kernel keeps a donation's first page as its own donation bookkeeping
+/// once per record page (see `SYS_CAP_CREATE_ASPACE`), so a single
+/// donation can seed one page fewer than it carried. A record page opened by
+/// one round has room for the next round's record, so a second round covers
+/// the shortfall unless other threads of the process fill that page in
+/// between; the trailing budget check decides either way.
+const PT_FUND_ROUNDS: u32 = 2;
+
 // ── Spinlock ────────────────────────────────────────────────────────────────
 
 struct SpinLock {
@@ -980,16 +990,6 @@ pub fn memmgr_query_free_bytes() -> Option<u64> {
     }
     Some(reply.word(3))
 }
-
-/// Augment rounds a page-table funding path may make before giving up.
-///
-/// The kernel keeps a donation's first page as its own donation bookkeeping
-/// once per record page (see `SYS_CAP_CREATE_ASPACE`), so a single
-/// donation can seed one page fewer than it carried. A record page opened by
-/// one round has room for the next round's record, so a second round covers
-/// the shortfall unless other threads of the process fill that page in
-/// between; the trailing budget check decides either way.
-const PT_FUND_ROUNDS: u32 = 2;
 
 /// Fund `self_aspace`'s page-table growth budget to cover mapping a
 /// `region_pages`-page foreign-frame region (MMIO, DMA) into a

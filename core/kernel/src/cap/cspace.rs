@@ -208,7 +208,7 @@ pub struct CSpace
     /// pages. Null = unallocated. Pages come from the retype pool (or the
     /// host heap in the test stub — the `kobj` field discriminates: null =
     /// heap, Drop Box-frees each page; non-null = retype pool,
-    /// `dealloc_object(CSpaceObj)` reclaims chunks wholesale).
+    /// `dealloc_object(CSpaceObj)` reclaims donations wholesale).
     direct: [AtomicPtr<CSpacePage>; L1_DIRECT],
     /// Indirect region: inline pointers to pool-allocated directory pages,
     /// each fanning out to `DIR_FANOUT` further leaves. Null =
@@ -972,7 +972,7 @@ impl CSpace
 
 impl Drop for CSpace
 {
-    /// Production `CSpace` is always retype-backed: pages live inside chunks
+    /// Production `CSpace` is always retype-backed: pages live inside donations
     /// tracked by [`CSpaceKernelObject`] which `dealloc_object(CSpaceObj)`
     /// reclaims wholesale via `retype_free`. Drop is a no-op so we don't
     /// double-free pool pages through the global allocator.

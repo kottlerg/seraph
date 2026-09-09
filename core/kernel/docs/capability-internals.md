@@ -148,7 +148,7 @@ The wrapper object that owns a `CSpace` (`CSpaceKernelObject`) keeps the
 slot-page pool in a `PagePool`; the wrapper of an `AddressSpace` keeps its
 intermediate page-table pool in the same type. A pool is an intrusive free
 list of the donated pages (each free page's first word links the next) plus
-a record of every donation (a *chunk* in the code) — its source Memory
+a record of every donation — its source Memory
 object, byte offset, and page count — so teardown can return each donation
 to its source wholesale. The wrapper, not the pool, keeps the byte budget
 the pool backs.

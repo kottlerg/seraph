@@ -563,11 +563,11 @@ pub fn sys_cap_create_aspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // Hold a reference on the source Memory cap for the AS's lifetime; the
     // matching dec_ref happens in `dealloc_object(AddressSpace)` after the
-    // chunk is reclaimed.
+    // donation is reclaimed.
     // SAFETY: memory_obj_nn is a live MemoryObject.
     unsafe { memory_obj_nn.as_ref().inc_ref() };
 
-    // Record the chunk covering all `init_pages`; the lower 2 pages
+    // Record the donation covering all `init_pages`; the lower 2 pages
     // (wrapper + root PT) are reserved, the remainder seeds the pool.
     let pool_pages = init_pages - 2;
     // SAFETY: aso just constructed; offset/init_pages from a successful
@@ -608,7 +608,7 @@ pub fn sys_cap_create_aspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         Err(e) =>
         {
             // The cap never reached visibility; mirror the add_donation
-            // rollback above (the chunk record lives inside the wrapper
+            // rollback above (the donation record lives inside the wrapper
             // page being freed, so no external bookkeeping survives).
             // SAFETY: aso/aspace not observed externally yet.
             unsafe {
@@ -829,7 +829,7 @@ pub fn sys_cap_create_cspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // SAFETY: memory_obj_nn is live.
     unsafe { memory_obj_nn.as_ref().inc_ref() };
 
-    // Record the chunk covering all init_pages; reserve page 0 (wrapper),
+    // Record the donation covering all init_pages; reserve page 0 (wrapper),
     // pool seeds pages 1..init_pages.
     let pool_pages = init_pages - 1;
     // SAFETY: wrapper just constructed; offset/init_pages from a successful

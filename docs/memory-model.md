@@ -142,7 +142,7 @@ physically-contiguous group of 4 KiB leaves — a TLB-reach optimisation that ke
 No page is simultaneously writable and executable. This is enforced at the page table
 level using the NX bit (x86-64) and the equivalent execute permission control on
 RISC-V. The kernel image itself follows W^X: text is executable but not writable;
-data and heap are writable but not executable.
+data is writable but not executable.
 
 On x86-64, kernel-side W^X additionally depends on `CR0.WP` (supervisor write-protect);
 without it a ring-0 write would bypass a read-only page permission. `CR0.WP` is required by

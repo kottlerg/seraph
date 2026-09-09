@@ -79,7 +79,7 @@ use crate::mm::paging::phys_to_virt;
 /// Root capability space, populated during Phase 7.
 ///
 /// The pointer indexes into a SEED-derived retype slab whose storage is
-/// pinned for the lifetime of the kernel (the seed's pin keeps the chunk
+/// pinned for the lifetime of the kernel (the seed's pin keeps the slab
 /// alive — see [`install_seed_memory`]). Set in [`init_capability_system`]
 /// via [`boot_retype_cspace`]; consumed (read out into init's TCB) during
 /// Phase 9. Access is single-threaded during boot; `static mut` is safe

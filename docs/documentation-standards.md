@@ -128,7 +128,8 @@ error and log strings, and commit messages.
   forms include "step X", "phase Y", "tier N", "stage 7", "round N", and "the
   deferred follow-up"; the list is illustrative, not exhaustive. These are
   pointers into a planning conversation that has no permanence and rot the
-  moment the plan moves on.
+  moment the plan moves on. A count the code itself performs ("two augment
+  rounds") is not a label.
 - Commit messages name components and what changed, not planning labels.
 
 ---

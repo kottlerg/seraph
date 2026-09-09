@@ -920,7 +920,7 @@ pub fn cspace_dir_page_survives_failed_grow(ctx: &TestContext) -> TestResult
 /// Donations are unbounded in count: the wrapper's sixteen inline donation
 /// records spill into record pages carved from the donations themselves
 /// (one page per `RECORDS_PER_PAGE` further donations). Two hundred
-/// one-page donations cross both the inline limit and one full record page,
+/// donations of one page each cross the inline limit and one full record page,
 /// so exactly two donations supply a record page and seed nothing; every
 /// other page is usable, and the wholesale delete returns all of them to
 /// the source Memory cap.

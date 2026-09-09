@@ -82,8 +82,8 @@ pub enum ObjectType
 ///
 /// `ancestor` is a direct pointer to the `MemoryObject`'s header from which
 /// this object was retyped. Auto-reclaim consults this on `dec_ref → 0` to
-/// credit bytes back to the source `MemoryObject` and return the chunk to the
-/// per-Memory-cap allocator.
+/// credit bytes back to the source `MemoryObject` and return the object's
+/// region to the per-Memory-cap allocator.
 ///
 /// A direct pointer (rather than a `SlotId`) is necessary because the source
 /// Memory cap's *slot* may be deleted before all retyped descendants are freed
@@ -536,7 +536,7 @@ struct InlineRecord
 
 impl InlineRecord
 {
-    /// Construct a vacant slot (ancestor = null, offset = 0, count = 0).
+    /// Construct a vacant record (ancestor = null, offset = 0, count = 0).
     const fn vacant() -> Self
     {
         Self {
@@ -560,7 +560,7 @@ impl InlineRecord
     }
 }
 
-/// One donation record in a `RecordPage`: the content of a
+/// One donation record in a `RecordPage`: the content of an
 /// `InlineRecord` as plain words. Record pages are read and written
 /// only under the pool lock, or at teardown with no other reference alive.
 #[cfg(not(test))]
@@ -763,14 +763,14 @@ impl PagePool
         let vacant = self
             .inline
             .iter()
-            .find(|slot| slot.ancestor.load(Ordering::Relaxed).is_null());
-        let recorded = if let Some(slot) = vacant
+            .find(|record| record.ancestor.load(Ordering::Relaxed).is_null());
+        let recorded = if let Some(record) = vacant
         {
-            slot.base_offset.store(base_offset, Ordering::Relaxed);
-            slot.page_count.store(total_pages, Ordering::Relaxed);
+            record.base_offset.store(base_offset, Ordering::Relaxed);
+            record.page_count.store(total_pages, Ordering::Relaxed);
             // A non-null ancestor marks the record populated, so it is
             // written last.
-            slot.ancestor.store(ancestor.as_ptr(), Ordering::Release);
+            record.ancestor.store(ancestor.as_ptr(), Ordering::Release);
             true
         }
         else
@@ -2558,11 +2558,6 @@ unsafe fn dealloc_object_one(
                     "dealloc AddressSpace: freeing root while active_cpus != 0"
                 );
 
-                debug_assert!(
-                    obj.pt_pool.has_create_donation(),
-                    "dealloc AddressSpace: donation-less AS reached typed-memory dealloc path"
-                );
-
                 // Return this space's hardware tag (PCID/ASID) to the pool, if
                 // any. No TLB flush is needed: active_cpus is empty (asserted
                 // above), and any CPU that cached the tag while switched away is
@@ -2584,6 +2579,11 @@ unsafe fn dealloc_object_one(
                     core::ptr::drop_in_place(as_ptr);
                 }
             }
+
+            debug_assert!(
+                obj.pt_pool.has_create_donation(),
+                "dealloc AddressSpace: donation-less AS reached typed-memory dealloc path"
+            );
 
             // Return every donation, the create-time slab (holding the
             // wrapper and this pool) last; `obj` is dangling afterwards.

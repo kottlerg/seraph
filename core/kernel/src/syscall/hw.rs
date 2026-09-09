@@ -192,10 +192,10 @@ pub fn sys_irq_register(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// All pages are mapped with `uncacheable = true` (PCD|PWT on `x86_64`,
 /// Svpbmt PBMT=IO on RISC-V — see [`PageFlags`]).
 ///
-/// Intermediate page-table pages are drawn from the target AS's own
-/// retype-backed PT growth pool when it has one (every userspace driver's
-/// AS); the chunk-less kernel-created boot AS falls back to the fixed
-/// kernel PT pool. Callers mapping a region larger than the AS's spare PT
+/// Intermediate page-table pages are drawn from the target AS's own PT
+/// growth pool: every address space the boot or a service creates records
+/// its create-time donation, and one without would fall back to the kernel
+/// page-table pool. Callers mapping a region larger than the AS's spare PT
 /// budget must augment it first via `cap_create_aspace` augment-mode, else
 /// the map fails with `OutOfMemory` rather than drawing on the reserve.
 ///
@@ -395,7 +395,7 @@ pub fn sys_ioport_bind(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         };
 
         // Allocate per-thread IOPB on first bind. Sourced from the kernel
-        // SEED Memory cap (no heap alloc); freed back to SEED on thread
+        // SEED Memory cap; freed back to SEED on thread
         // dealloc via the Thread arm of `dealloc_object`.
         // SAFETY: target_tcb validated non-null; iopb field always valid.
         if unsafe { (*target_tcb).iopb.is_null() }

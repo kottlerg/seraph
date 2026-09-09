@@ -2306,7 +2306,7 @@ pub(crate) fn alloc_zeroed_slab<T>(
 ///
 /// `kernel_entry` (in main.rs) is compiled in test mode even though it is
 /// never called; this stub satisfies the call site without requiring access to
-/// arch-specific or heap types that are unavailable on the host.
+/// arch-specific types that are unavailable on the host.
 #[cfg(test)]
 #[allow(unused_variables)]
 pub fn init(_cpu_count: u32) -> u32

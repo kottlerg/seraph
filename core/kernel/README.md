@@ -20,6 +20,15 @@ kernel/
 │   └── riscv64.ld              # Linker script for RISC-V
 ├── src/
 │   ├── main.rs                 # kernel_entry() — arch-neutral init sequence
+│   ├── console.rs              # Early console: serial and framebuffer output
+│   ├── cpu_mask.rs             # Fixed-capacity sets of logical CPU indices
+│   ├── framebuffer.rs          # Framebuffer text renderer
+│   ├── irq.rs                  # IRQ routing table: lines to notification objects
+│   ├── percpu.rs               # Per-CPU private state
+│   ├── platform.rs             # Phase 6 platform resource validation
+│   ├── sync.rs                 # Kernel synchronisation primitives
+│   ├── uaccess.rs              # Fault-recoverable user-memory copies
+│   ├── validate.rs             # Phase 0 boot-info validation
 │   ├── arch/                   # Architecture-specific implementations
 │   │   ├── mod.rs              # Re-exports the active arch module
 │   │   ├── x86_64/             # x86-64 implementation

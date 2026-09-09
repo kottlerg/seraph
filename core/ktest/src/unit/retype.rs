@@ -961,7 +961,8 @@ pub fn cspace_augment_many(ctx: &TestContext) -> TestResult
     // Mirrors the kernel's `DIR_FANOUT`: leaves per pool-paid directory page.
     const DIR_FANOUT: u64 = 512;
     // Directory pages the pool pays for leaves past the direct region; each
-    // costs a page that would otherwise be a leaf.
+    // costs a page that would otherwise be a leaf. For the 198 seeded pages
+    // here: one directory page, leaving 197 leaves.
     const fn directory_pages(pool_pages: u64) -> u64
     {
         let mut dirs = 0;

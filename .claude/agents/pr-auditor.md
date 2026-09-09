@@ -62,8 +62,8 @@ claims.
    a planning label ("step X", "phase Y", "tier N", "stage M", "round N",
    or any label that only a planning conversation can resolve; the
    kernel's documented boot phases are not labels), a task ID, a branch
-   name, or an issue reference placed where the rule says it belongs in
-   the body — is a FAIL.
+   name, or an issue reference, which the Title rule assigns to the body —
+   is a FAIL.
 
 ## Output
 

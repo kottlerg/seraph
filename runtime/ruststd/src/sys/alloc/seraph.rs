@@ -75,7 +75,10 @@ const GROW_MIN_PAGES: u64 = 16;
 /// large `Vec` reallocations stay within a single round.
 const GROW_MAX_PAGES: u64 = 256;
 
-/// Augment rounds a page-table funding path may make before giving up.
+/// Augment rounds a page-table funding path may make before giving up: the
+/// map retry alternates a map attempt with a one-page augment, the budget
+/// top-up alternates a budget read with a shortfall-sized augment, and each
+/// ends with one more attempt or read after its last augment.
 ///
 /// The kernel keeps a donation's first page as its own donation bookkeeping
 /// once per record page (see `SYS_CAP_CREATE_ASPACE`), so a single

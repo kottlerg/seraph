@@ -25,7 +25,8 @@ distinct, narrower concern handled in "Physical-address surfaces" below.
 Each surface is classified as one of:
 
 - **(a) kernel VA / pointer** — a kernel virtual address, kernel pointer, or value
-  derived from one. A leak. **None found.**
+  derived from one. A leak. **None found** among emitted values; kernel state
+  kept in donated memory is a separate surface, below.
 - **(b) userspace VA** — an address in the caller's own (or a delegate's) address
   space. The caller already owns it; not a disclosure.
 - **(c) opaque / randomized** — a kernel-minted identifier that is unguessable
@@ -121,6 +122,19 @@ also knowing that page's virtual address, which these surfaces do not disclose. 
 not KASLR leaks. (`kernel_physical_base` is likewise a physical value and unaffected;
 the kernel scrubs the *virtual* KASLR bases — `kernel_virtual_base`, `direct_map_base` —
 from the donated `BootInfo` page after consuming them.)
+
+## Kernel state in donated memory
+
+The surfaces above are values the kernel emits. A distinct surface is kernel
+state the kernel keeps in memory retyped from a user-held Memory capability:
+wrapper pages, capability slot pages (each slot holds an object pointer),
+page tables, and page-pool record pages (each record holds a raw
+`KernelObjectHeader` pointer to its donation's ancestor; see
+[capability-internals.md](capability-internals.md) § Page Pools). The holder
+of the donating capability is trusted not to map what it has retyped away;
+the kernel does not yet enforce that boundary
+([#433](https://github.com/kottlerg/seraph/issues/433)). Until it does, the
+class (a) claim holds only under that trust.
 
 ## Kernel console diagnostics
 

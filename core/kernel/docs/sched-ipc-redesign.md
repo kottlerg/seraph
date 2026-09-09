@@ -402,4 +402,4 @@ issue #314 (with #316).
 
 ## Summarized By
 
-None
+[kernel/README.md](../README.md)

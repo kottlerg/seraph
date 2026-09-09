@@ -1546,7 +1546,8 @@ unsafe fn defer_self_teardown(ptr: NonNull<KernelObjectHeader>, what: &str)
 /// not: the `CSpaceObj` arm for the objects a dying `CSpace`'s slots
 /// reference, and the `AddressSpace` and `CSpaceObj` arms' `free_donation`
 /// (nested in `dealloc_object_one`) for a pool donation's Memory object that
-/// reaches zero.
+/// reaches zero. The first recurses one frame per nested `CSpace` whose last
+/// reference the dying one held; bounding that depth is #435.
 #[cfg(not(test))]
 pub unsafe fn dealloc_object(ptr: core::ptr::NonNull<KernelObjectHeader>)
 {

@@ -183,7 +183,9 @@ records before its record 0 (whose donation holds the page), then the
 inline records, the create-time slab last. A donation's Memory object that
 reaches zero there is reclaimed through its own nested cascade, not the
 bounded worklist the dealloc cascade otherwise uses, since the number of
-donations is unbounded.
+donations is unbounded. The cascade's other re-entry, one frame per nested
+`CSpace` whose last reference the dying one held, is unbounded in depth;
+bounding it is [#435](https://github.com/kottlerg/seraph/issues/435).
 
 The walk costs one `retype_free` per donation, holds no lock across records
 (each return takes only its ancestor's cap lock, so unlike a `CSpace`'s

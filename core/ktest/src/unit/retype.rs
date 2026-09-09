@@ -935,8 +935,22 @@ pub fn cspace_augment_many(ctx: &TestContext) -> TestResult
     // own donation.
     const RECORD_PAGES: u64 = 2;
     const SEEDED: u64 = DONATIONS - RECORD_PAGES;
-    // Leaves past the direct region need one pool-paid directory page.
-    const DIRECTORY_PAGES: u64 = 1;
+    // Mirrors the kernel's `L1_DIRECT` and `DIR_FANOUT`: leaves the inline
+    // root addresses directly, and leaves per pool-paid directory page.
+    const DIRECT_LEAVES: u64 = 128;
+    const DIR_FANOUT: u64 = 512;
+    // Directory pages the pool pays for leaves past the direct region; each
+    // costs a page that would otherwise be a leaf.
+    const fn directory_pages(pool_pages: u64) -> u64
+    {
+        let mut dirs = 0;
+        while (pool_pages - dirs).saturating_sub(DIRECT_LEAVES) > dirs * DIR_FANOUT
+        {
+            dirs += 1;
+        }
+        dirs
+    }
+    const DIRECTORY_PAGES: u64 = directory_pages(SEEDED);
     // Mirrors the kernel's `L2_SIZE`: slots per leaf page.
     const SLOTS_PER_LEAF: u64 = 56;
     let memory = ctx.memory_base;

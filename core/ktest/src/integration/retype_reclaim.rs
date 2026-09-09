@@ -19,7 +19,7 @@
 //! - `Notification`       (sub-page, in-place)
 //! - `WaitSet`      (sub-page, in-place)
 //! - `EventQueue`   (sub-page when small, page-aligned split when large)
-//! - `Thread`       (page-aligned split — kstack + wrapper page)
+//! - `Thread`       (page-aligned split — kstack + wrapper page + save area)
 //! - `AddressSpace` (page-aligned split — `init_pages` PT pool)
 //! - `CSpaceObj`    (page-aligned split — `init_pages` slot pool)
 //!
@@ -151,7 +151,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     // ── AddressSpace ─────────────────────────────────────────────────────────
     //
-    // 8 pages of PT pool (page 0 root, pages 1..8 growth budget).
+    // An 8-page slab: page 0 wrapper, page 1 root PT, pages 2..8 PT pool.
     let aspace_cap = cap_create_aspace(memory, 0, 8)
         .map_err(|_| "integration::retype_reclaim: cap_create_aspace failed")?;
     let mid = read_available(memory)?;
@@ -168,6 +168,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     // ── CSpaceObj ────────────────────────────────────────────────────────────
     //
+    // A 4-page slab: page 0 wrapper, three leaves (3 × 56 − 1 = 167 slots).
     let cspace_cap = cap_create_cspace(memory, 0, 4)
         .map_err(|_| "integration::retype_reclaim: cap_create_cspace failed")?;
     let mid = read_available(memory)?;

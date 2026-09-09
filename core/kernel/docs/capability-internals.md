@@ -360,6 +360,7 @@ pub struct KernelObjectHeader
     ref_count: AtomicU32,
     obj_type: ObjectType,
     flags: u8,
+    _pad: [u8; 2],
     /// The Memory object this object's bytes were retyped from.
     ancestor: AtomicPtr<KernelObjectHeader>,
 }

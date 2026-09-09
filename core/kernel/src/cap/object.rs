@@ -763,14 +763,14 @@ impl PagePool
         let vacant = self
             .inline
             .iter()
-            .find(|record| record.ancestor.load(Ordering::Relaxed).is_null());
-        let recorded = if let Some(record) = vacant
+            .find(|cell| cell.ancestor.load(Ordering::Relaxed).is_null());
+        let recorded = if let Some(cell) = vacant
         {
-            record.base_offset.store(base_offset, Ordering::Relaxed);
-            record.page_count.store(total_pages, Ordering::Relaxed);
+            cell.base_offset.store(base_offset, Ordering::Relaxed);
+            cell.page_count.store(total_pages, Ordering::Relaxed);
             // A non-null ancestor marks the record populated, so it is
             // written last.
-            record.ancestor.store(ancestor.as_ptr(), Ordering::Release);
+            cell.ancestor.store(ancestor.as_ptr(), Ordering::Release);
             true
         }
         else
@@ -1019,6 +1019,7 @@ const _: () = assert!(
     core::mem::size_of::<AddressSpaceObject>()
         + core::mem::size_of::<crate::mm::address_space::AddressSpace>()
         <= crate::mm::PAGE_SIZE,
+    "AddressSpaceObject + AddressSpace exceed the wrapper page"
 );
 const _: () = assert!(
     core::mem::size_of::<CSpaceKernelObject>() + core::mem::size_of::<crate::cap::cspace::CSpace>()

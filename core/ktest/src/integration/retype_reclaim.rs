@@ -16,12 +16,12 @@
 //!
 //! Object types covered:
 //! - `Endpoint`     (sub-page, in-place)
-//! - `Notification`       (sub-page, in-place)
+//! - `Notification` (sub-page, in-place)
 //! - `WaitSet`      (sub-page, in-place)
 //! - `EventQueue`   (sub-page when small, page-aligned split when large)
 //! - `Thread`       (page-aligned split — kstack + wrapper page + save area)
-//! - `AddressSpace` (page-aligned split — `init_pages` PT pool)
-//! - `CSpaceObj`    (page-aligned split — `init_pages` slot pool)
+//! - `AddressSpace` (page-aligned split — wrapper, root PT, `init_pages - 2` pool pages)
+//! - `CSpaceObj`    (page-aligned split — wrapper, `init_pages - 1` pool pages)
 //!
 //! ## Test isolation
 //!
@@ -168,7 +168,8 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     // ── CSpaceObj ────────────────────────────────────────────────────────────
     //
-    // A 4-page slab: page 0 wrapper, three leaves (3 × 56 − 1 = 167 slots).
+    // A 4-page slab: page 0 wrapper, three pool pages that would back three
+    // leaves (3 × 56 − 1 = 167 slots) on demand.
     let cspace_cap = cap_create_cspace(memory, 0, 4)
         .map_err(|_| "integration::retype_reclaim: cap_create_cspace failed")?;
     let mid = read_available(memory)?;

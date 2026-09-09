@@ -376,4 +376,5 @@ for the donation-record mechanism.
 ## Summarized By
 
 [kernel/README.md](../README.md),
+[kernel/docs/arch-interface.md](arch-interface.md),
 [kernel/docs/capability-internals.md](capability-internals.md)

@@ -1064,10 +1064,10 @@ fn table_is_empty(table: &[PageTableEntry; 512]) -> bool
 /// Walks from the root to the leaf level over the span, clearing in-range
 /// leaf PTEs. A table is freed only when it is fully empty afterwards **and**
 /// its parent entry carries [`POOLED_TABLE`] (the frame came from `aso`'s
-/// pool) —
-/// emptiness, not span-containment, is the gate, so a boundary table shared
-/// with a live neighbour (or the guard-page table whose first slot sits just
-/// outside the span) is reclaimed exactly when its last live entry clears.
+/// pool) — emptiness, not span-containment, is the gate, so a boundary table
+/// shared with a live neighbour (or the guard-page table whose first slot
+/// sits just outside the span) is reclaimed exactly when its last live entry
+/// clears.
 /// Leaf entries at a non-leaf level (mega/gigapages: R/W/X set) are not
 /// produced by the user mapping path; they are skipped (never descended, never
 /// freed), so a table holding one is never seen as empty. The root frame is

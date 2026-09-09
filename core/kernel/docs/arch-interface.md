@@ -157,7 +157,8 @@ pub unsafe fn unmap_user_page(root_virt: u64, virt: u64);
 /// Clear every 4 KiB leaf in `[virt_base, virt_base + page_count * 4 KiB)` and
 /// free each intermediate table the span leaves empty back to `aso`'s pool —
 /// only a table whose parent entry carries the pooled-table bit the pooled map
-/// path set when it installed the table. Returns the number of tables freed.
+/// path set when it installed the table (memory-internals.md § Page Table Node
+/// Ownership). Returns the number of tables freed.
 /// The caller holds the address space's `pt_lock` and performs the shootdown.
 pub unsafe fn unmap_user_region_pooled(
     root_virt: u64,

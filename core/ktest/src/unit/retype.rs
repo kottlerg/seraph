@@ -615,8 +615,8 @@ pub fn cspace_grow_consumes_pool(ctx: &TestContext) -> TestResult
         }
     }
 
-    let used_after = cap_info(cspace, CAP_INFO_CSPACE_USED).unwrap_or(used_before);
-    let budget_after = cap_info(cspace, CAP_INFO_CSPACE_BUDGET).unwrap_or(budget_before);
+    let used_after = cap_info(cspace, CAP_INFO_CSPACE_USED).unwrap_or(0);
+    let budget_after = cap_info(cspace, CAP_INFO_CSPACE_BUDGET).unwrap_or(u64::MAX);
 
     cap_delete(probe).ok();
     cap_delete(cspace).ok();

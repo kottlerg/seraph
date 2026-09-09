@@ -30,7 +30,7 @@
 //! | Type                | Size  |
 //! |---------------------|-------|
 //! | KernelObjectHeader  | 16 B  |
-//! | MemoryObject        | 64 B  |
+//! | MemoryObject        | 96 B  |
 //! | MmioObject          | 40 B  |
 //! | InterruptObject     | 24 B  |
 //! | IoPortObject        | 24 B  |

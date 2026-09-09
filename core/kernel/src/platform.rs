@@ -77,8 +77,8 @@ pub unsafe fn capture_kernel_mmio(boot_info_phys: u64)
 
 /// Maximum number of MMIO apertures the kernel accepts at boot.
 ///
-/// Bounded so the validated-aperture buffer can live in BSS instead of the
-/// kernel heap. Real platforms (UEFI `x86_64` or RISC-V virt) report at most
+/// Bounded so the validated-aperture buffer can live in BSS with no runtime
+/// allocation. Real platforms (UEFI `x86_64` or RISC-V virt) report at most
 /// a handful of apertures (`PCIe` ECAM + a few platform MMIO ranges); 64 is
 /// generous headroom. Apertures beyond this cap are ignored with a
 /// `kprintln` warning.

@@ -431,8 +431,8 @@ fn collect_exclusions(info: &BootInfo) -> RangeList<MAX_EXCL>
 
     // AP SIPI trampoline page (x86-64 SMP). Reported as Usable by the bootloader
     // (EfiBootServicesData → Usable), so without this exclusion the buddy
-    // allocator would hand it out for IST stacks or heap, zeroing the trampoline
-    // code that the BSP writes there during AP startup.
+    // allocator would hand it out for IST stacks or per-CPU storage, zeroing
+    // the trampoline code that the BSP writes there during AP startup.
     if info.ap_trampoline_page != 0
     {
         add(
@@ -500,7 +500,7 @@ fn add_surviving_subranges(
 )
 {
     // `work` holds the set of ranges still available after applying each
-    // exclusion in turn. Using a fixed-size array avoids heap allocation.
+    // exclusion in turn. A fixed-size array needs no allocation.
     let mut work = RangeList::<MAX_RANGES>::new();
     work.push(r_start, r_end);
 

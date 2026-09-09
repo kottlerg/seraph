@@ -79,7 +79,7 @@ use crate::mm::paging::phys_to_virt;
 /// Root capability space, populated during Phase 7.
 ///
 /// The pointer indexes into a SEED-derived retype slab whose storage is
-/// pinned for the lifetime of the kernel (the seed's pin keeps the chunk
+/// pinned for the lifetime of the kernel (the seed's pin keeps the slab
 /// alive — see [`install_seed_memory`]). Set in [`init_capability_system`]
 /// via [`boot_retype_cspace`]; consumed (read out into init's TCB) during
 /// Phase 9. Access is single-threaded during boot; `static mut` is safe
@@ -649,7 +649,7 @@ pub(crate) const MAX_DRAIN_BLOCKS: usize = 4096;
 
 /// Backing storage for the buddy drain in [`drain_and_install_seed`] and
 /// the per-block (base, size) results consumed by [`populate_cspace`].
-/// Lives in BSS so the kernel never grows the heap during Phase 7. Cost:
+/// Lives in BSS so Phase 7 allocates nothing for it. Cost:
 /// 4096 × 16 B (`RamBlock`) + 4096 × 16 B (`(u64, usize)` order tuple) ≈ 128 KiB.
 #[cfg(not(test))]
 static mut DRAIN_ORDER_BUF: [(u64, usize); MAX_DRAIN_BLOCKS] = [(0u64, 0usize); MAX_DRAIN_BLOCKS];
@@ -986,7 +986,7 @@ fn coalesce_ram_blocks(blocks: &mut [RamBlock]) -> usize
 /// for init's bootstrap AS.
 ///
 /// `init_pages` MUST be `>= 2`. Calls [`crate::fatal`] on retype-allocator
-/// or chunk-slot exhaustion (boot cannot recover).
+/// exhaustion (boot cannot recover).
 #[cfg(not(test))]
 #[allow(clippy::missing_safety_doc)]
 pub(crate) unsafe fn boot_retype_aspace(
@@ -997,9 +997,7 @@ pub(crate) unsafe fn boot_retype_aspace(
     *mut crate::mm::address_space::AddressSpace,
 )
 {
-    use crate::cap::object::{
-        AddressSpaceObject, KernelObjectHeader, ObjectType, vacant_chunk_slots,
-    };
+    use crate::cap::object::{AddressSpaceObject, KernelObjectHeader, ObjectType, PagePool};
     use crate::mm::PAGE_SIZE;
     use crate::mm::address_space::AddressSpace;
     use crate::mm::paging::phys_to_virt;
@@ -1050,9 +1048,7 @@ pub(crate) unsafe fn boot_retype_aspace(
                 ),
                 address_space: aspace_ptr,
                 pt_growth_budget_bytes: AtomicU64::new(0),
-                pt_pool_lock: AtomicU64::new(0),
-                pt_pool_head_phys: AtomicU64::new(0),
-                pt_chunks: vacant_chunk_slots(),
+                pt_pool: PagePool::new(),
                 deferred_next: core::ptr::null_mut(),
             },
         );
@@ -1063,7 +1059,7 @@ pub(crate) unsafe fn boot_retype_aspace(
     let pool_pages = init_pages - 2;
     // SAFETY: aso_ptr just constructed; offset/init_pages from a successful retype.
     let res = unsafe {
-        (*aso_ptr).add_chunk(
+        (*aso_ptr).add_donation(
             seed_header_nn(),
             memory_base,
             offset,
@@ -1073,7 +1069,7 @@ pub(crate) unsafe fn boot_retype_aspace(
     };
     if res.is_err()
     {
-        crate::fatal("boot_retype_aspace: chunk slot exhausted");
+        crate::fatal("boot_retype_aspace: donation not recorded");
     }
 
     // SAFETY: aso_ptr is in-place; header at offset 0.
@@ -1090,7 +1086,7 @@ pub(crate) unsafe fn boot_retype_aspace(
 /// [`init_capability_system`] for the root `CSpace`.
 ///
 /// `init_pages` MUST be `>= 1`. Calls [`crate::fatal`] on retype-allocator
-/// or chunk-slot exhaustion.
+/// exhaustion.
 #[cfg(not(test))]
 #[allow(clippy::missing_safety_doc)]
 pub(crate) unsafe fn boot_retype_cspace(
@@ -1100,9 +1096,7 @@ pub(crate) unsafe fn boot_retype_cspace(
 ) -> (NonNull<object::KernelObjectHeader>, *mut cspace::CSpace)
 {
     use crate::cap::cspace::CSpace;
-    use crate::cap::object::{
-        CSpaceKernelObject, KernelObjectHeader, ObjectType, vacant_chunk_slots,
-    };
+    use crate::cap::object::{CSpaceKernelObject, KernelObjectHeader, ObjectType, PagePool};
     use crate::mm::PAGE_SIZE;
     use crate::mm::paging::phys_to_virt;
     use core::sync::atomic::AtomicU64;
@@ -1143,9 +1137,7 @@ pub(crate) unsafe fn boot_retype_cspace(
                 header: KernelObjectHeader::with_ancestor(ObjectType::CSpaceObj, seed_header_nn()),
                 cspace: cs_ptr,
                 cspace_growth_budget_bytes: AtomicU64::new(0),
-                cs_pool_lock: AtomicU64::new(0),
-                cs_pool_head_phys: AtomicU64::new(0),
-                cs_chunks: vacant_chunk_slots(),
+                cs_pool: PagePool::new(),
                 deferred_next: core::ptr::null_mut(),
             },
         );
@@ -1163,7 +1155,7 @@ pub(crate) unsafe fn boot_retype_cspace(
     let pool_pages = init_pages - 1;
     // SAFETY: wrapper just constructed; offset/init_pages from a successful retype.
     let res = unsafe {
-        (*cs_kobj_ptr).add_chunk(
+        (*cs_kobj_ptr).add_donation(
             seed_header_nn(),
             memory_base,
             offset,
@@ -1173,7 +1165,7 @@ pub(crate) unsafe fn boot_retype_cspace(
     };
     if res.is_err()
     {
-        crate::fatal("boot_retype_cspace: chunk slot exhausted");
+        crate::fatal("boot_retype_cspace: donation not recorded");
     }
 
     // SAFETY: cs_kobj_ptr is in-place; header at offset 0.
@@ -1373,7 +1365,7 @@ fn push_descriptor(count: &mut usize, desc: CapDescriptor)
 ///
 /// # Safety
 ///
-/// Must be called exactly once, single-threaded, after Phase 4 (heap active)
+/// Must be called exactly once, single-threaded, after Phase 4 (per-CPU storage allocated)
 /// and Phase 3 (direct map active).
 pub fn init_capability_system(mmio_apertures: &[MmioAperture], boot_info_phys: u64)
 -> CSpaceLayout

@@ -182,17 +182,12 @@ pub fn sys_mem_map(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         (as_inner, aso)
     };
 
-    // Choose the PT-page source. Retype-backed AS (any chunk slot occupied)
-    // pulls intermediate PT pages from its own growth pool; the heap-backed
-    // bootstrap AS (or any other AS without a recorded chunk) falls back
-    // to the kernel PT pool (`kernel_pt_pool`) via `map_page`.
+    // Choose the PT-page source. An AS that recorded its create-time
+    // donation pulls intermediate PT pages from its own growth pool; one
+    // without falls back to the kernel PT pool (`kernel_pt_pool`) via
+    // `map_page`.
     // SAFETY: aso_raw is non-null and valid for the lifetime of the cap.
-    let pooled = !unsafe {
-        (*aso_raw).pt_chunks[0]
-            .ancestor
-            .load(core::sync::atomic::Ordering::Acquire)
-            .is_null()
-    };
+    let pooled = unsafe { (*aso_raw).pt_pool.has_create_donation() };
 
     // ── Mapping loop ──────────────────────────────────────────────────────────
 
@@ -203,8 +198,8 @@ pub fn sys_mem_map(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
         // SAFETY: virt is in user range (validated above); phys is from a
         // Memory cap confirmed by the kernel at capability creation.
-        // as_ptr validated non-null. Pooled vs heap-backed dispatch is
-        // chosen once above based on the AS's typed-memory state.
+        // as_ptr validated non-null. Pooled vs kernel-direct dispatch is
+        // chosen once above from whether the AS records a donation.
         let result = if pooled
         {
             // SAFETY: aso_raw is valid; it wraps as_ptr.
@@ -212,8 +207,8 @@ pub fn sys_mem_map(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         }
         else
         {
-            // SAFETY: heap-backed AS; map_page acquires pt_lock and
-            // FRAME_ALLOC_LOCK internally.
+            // SAFETY: AS without a recorded donation; map_page acquires
+            // pt_lock and the kernel page-table pool lock internally.
             unsafe { (*as_ptr).map_page(virt, phys, page_flags) }
         };
         result.map_err(|()| SyscallError::OutOfMemory)?;

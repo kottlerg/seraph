@@ -62,7 +62,8 @@ pub fn sys_irq_ack(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     let irq_slot = unsafe { super::lookup_cap(cspace, irq_cap_idx, IrqRights::NOTIFY) }?;
     let irq_id = {
         let obj = irq_slot.object.ok_or(SyscallError::InvalidCapability)?;
-        // SAFETY: tag confirmed Interrupt; object was allocated as Box<InterruptObject>.
+        // SAFETY: tag confirmed Interrupt; the object is an InterruptObject
+        // constructed in place at a size-class-aligned retype offset.
         #[allow(clippy::cast_ptr_alignment)]
         let io = unsafe { &*obj.as_ptr().cast::<InterruptObject>() };
         if io.count != 1
@@ -125,7 +126,8 @@ pub fn sys_irq_register(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     let irq_slot = unsafe { super::lookup_cap(cspace, irq_cap_idx, IrqRights::NOTIFY) }?;
     let irq_id = {
         let obj = irq_slot.object.ok_or(SyscallError::InvalidCapability)?;
-        // SAFETY: tag confirmed Interrupt; object was allocated as Box<InterruptObject>.
+        // SAFETY: tag confirmed Interrupt; the object is an InterruptObject
+        // constructed in place at a size-class-aligned retype offset.
         #[allow(clippy::cast_ptr_alignment)]
         let io = unsafe { &*obj.as_ptr().cast::<InterruptObject>() };
         if io.count != 1
@@ -141,7 +143,8 @@ pub fn sys_irq_register(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     let sig_slot = unsafe { super::lookup_cap(cspace, sig_cap_idx, NtfRights::NOTIFY) }?;
     let sig_state = {
         let obj = sig_slot.object.ok_or(SyscallError::InvalidCapability)?;
-        // SAFETY: tag confirmed Notification; object was allocated as Box<NotificationObject>.
+        // SAFETY: tag confirmed Notification; the object is a NotificationObject
+        // constructed in place at a size-class-aligned retype offset.
         #[allow(clippy::cast_ptr_alignment)]
         unsafe {
             (*obj.as_ptr().cast::<NotificationObject>()).state
@@ -189,10 +192,10 @@ pub fn sys_irq_register(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// All pages are mapped with `uncacheable = true` (PCD|PWT on `x86_64`,
 /// Svpbmt PBMT=IO on RISC-V — see [`PageFlags`]).
 ///
-/// Intermediate page-table pages are drawn from the target AS's own
-/// retype-backed PT growth pool when it has one (every userspace driver's
-/// AS); the chunk-less kernel-created boot AS falls back to the fixed
-/// kernel PT pool. Callers mapping a region larger than the AS's spare PT
+/// Intermediate page-table pages are drawn from the target AS's own PT
+/// growth pool: every address space the boot or a service creates records
+/// its create-time donation, and one without would fall back to the kernel
+/// page-table pool. Callers mapping a region larger than the AS's spare PT
 /// budget must augment it first via `cap_create_aspace` augment-mode, else
 /// the map fails with `OutOfMemory` rather than drawing on the reserve.
 ///
@@ -232,7 +235,8 @@ pub fn sys_mmio_map(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     let mmio_slot = unsafe { super::lookup_cap(cspace, mmio_idx, MmioRights::MAP) }?;
     let (mmio_phys, mmio_size) = {
         let obj = mmio_slot.object.ok_or(SyscallError::InvalidCapability)?;
-        // SAFETY: tag confirmed Mmio; object was allocated as Box<MmioObject>.
+        // SAFETY: tag confirmed Mmio; the object is a MmioObject
+        // constructed in place at a size-class-aligned retype offset.
         #[allow(clippy::cast_ptr_alignment)]
         let mo = unsafe { &*obj.as_ptr().cast::<MmioObject>() };
         (mo.base, mo.size)
@@ -279,17 +283,12 @@ pub fn sys_mmio_map(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         uncacheable: true,
     };
 
-    // Choose the PT-page source, mirroring sys_mem_map. A retype-backed AS
-    // (any chunk slot occupied) pulls intermediate PT pages from its own
-    // caller-funded growth pool; the chunk-less kernel-created boot AS (init's
-    // own AS, part of the fixed reserve) falls back to the kernel PT pool.
+    // Choose the PT-page source, mirroring sys_mem_map. An AS that recorded
+    // its create-time donation pulls intermediate PT pages from its own
+    // caller-funded growth pool; one without falls back to the kernel PT
+    // pool.
     // SAFETY: aso_raw is non-null and valid for the lifetime of the cap.
-    let pooled = !unsafe {
-        (*aso_raw).pt_chunks[0]
-            .ancestor
-            .load(core::sync::atomic::Ordering::Acquire)
-            .is_null()
-    };
+    let pooled = unsafe { (*aso_raw).pt_pool.has_create_donation() };
 
     // Map each page.
     for i in 0..page_count
@@ -298,8 +297,9 @@ pub fn sys_mmio_map(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         let phys = mmio_phys + (i * PAGE_SIZE) as u64;
 
         // SAFETY: virt in user range (validated above); phys from a
-        // kernel-provisioned Mmio boot object. Pooled vs heap-backed
-        // dispatch is chosen once above from the AS's typed-memory state.
+        // kernel-provisioned Mmio boot object. Pooled vs kernel-direct
+        // dispatch is chosen once above from whether the AS records a
+        // donation.
         let result = if pooled
         {
             // SAFETY: aso_raw is valid; it wraps as_ptr.
@@ -307,8 +307,8 @@ pub fn sys_mmio_map(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         }
         else
         {
-            // SAFETY: heap-backed boot AS; map_page acquires pt_lock and
-            // FRAME_ALLOC_LOCK internally.
+            // SAFETY: AS without a recorded donation; map_page acquires
+            // pt_lock and the kernel page-table pool lock internally.
             unsafe { (*as_ptr).map_page(virt, phys, page_flags) }
         };
         result.map_err(|()| SyscallError::OutOfMemory)?;
@@ -330,9 +330,10 @@ pub fn sys_mmio_map(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// arg0 = Thread cap index (must have CONTROL right).
 /// arg1 = `IoPort` cap index (must have USE right).
 ///
-/// On first bind, a 8 KiB per-thread IOPB bitmap is heap-allocated and all
-/// ports are denied (0xFF). The requested range bits are then cleared (0 =
-/// allowed). On context switch the bitmap is copied into the TSS IOPB region.
+/// On first bind, an 8 KiB per-thread IOPB bitmap is carved from the SEED
+/// Memory cap and all ports are denied (0xFF). The requested range bits are
+/// then cleared (0 = allowed). On context switch the bitmap is copied into
+/// the TSS IOPB region.
 ///
 /// On RISC-V: always returns `NotSupported` (no I/O port concept).
 ///
@@ -369,7 +370,8 @@ pub fn sys_ioport_bind(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         let th_slot = unsafe { super::lookup_cap(cspace, thread_idx, ThreadRights::CONTROL) }?;
         let target_tcb = {
             let obj = th_slot.object.ok_or(SyscallError::InvalidCapability)?;
-            // SAFETY: tag confirmed Thread; object was allocated as Box<ThreadObject>.
+            // SAFETY: tag confirmed Thread; the object is a ThreadObject
+            // constructed in place at a size-class-aligned retype offset.
             #[allow(clippy::cast_ptr_alignment)]
             unsafe {
                 (*obj.as_ptr().cast::<ThreadObject>()).tcb
@@ -385,15 +387,16 @@ pub fn sys_ioport_bind(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         let port_slot = unsafe { super::lookup_cap(cspace, ioport_idx, IoPortRights::USE) }?;
         let (port_base, port_size) = {
             let obj = port_slot.object.ok_or(SyscallError::InvalidCapability)?;
-            // SAFETY: tag confirmed IoPort; object was allocated as Box<IoPortObject>.
+            // SAFETY: tag confirmed IoPort; the object is an IoPortObject retyped in
+            // place from the SEED reserve (at boot, or by sys_ioport_split).
             #[allow(clippy::cast_ptr_alignment)]
             let po = unsafe { &*obj.as_ptr().cast::<IoPortObject>() };
             (po.base, po.size)
         };
 
         // Allocate per-thread IOPB on first bind. Sourced from the kernel
-        // SEED Memory cap (no heap alloc); freed back to SEED on thread
-        // dealloc via the Thread arm of `dealloc_object`.
+        // SEED Memory cap; freed back to SEED on thread dealloc via the
+        // Thread arm of `dealloc_object`.
         // SAFETY: target_tcb validated non-null; iopb field always valid.
         if unsafe { (*target_tcb).iopb.is_null() }
         {

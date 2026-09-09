@@ -30,7 +30,7 @@ use crate::sched::thread::ThreadControlBlock;
 
 /// Kernel object backing a Notification capability.
 ///
-/// Allocated from the kernel heap via `Box`. The `KernelObjectHeader` is
+/// Constructed in place in a retype slot of a Memory capability. The `KernelObjectHeader` is
 /// NOT included here; it lives in `cap::object::NotificationKernelObject` which
 /// wraps this struct.
 pub struct NotificationState

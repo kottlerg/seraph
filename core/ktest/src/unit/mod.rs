@@ -22,7 +22,8 @@
 //! Files:
 //! - `cap.rs`      — capability creation, copy, move, insert, derive, revoke, delete
 //! - `cap_info.rs` — read-only capability state inspection (`SYS_CAP_INFO`)
-//! - `retype.rs`   — retype primitive: aspace/cspace augment, PT budget, kernel PT pool
+//! - `retype.rs`   — retype primitive: aspace/cspace augment (unbounded donations), PT
+//!   budget, kernel PT pool
 //! - `mm.rs`       — memory map/unmap/protect, memory split, address space query
 //! - `entropy.rs`  — userspace randomness (`SYS_GETRANDOM`), incl. the user-copy
 //!   fault-recovery regression (unmapped or read-only buffer ⇒ `InvalidAddress`,
@@ -234,6 +235,14 @@ pub fn run_all(ctx: &TestContext)
     run_test!(
         "retype::cspace_pool_exhaust_then_augment",
         retype::cspace_pool_exhaust_then_augment(ctx)
+    );
+    run_test!(
+        "retype::cspace_augment_many",
+        retype::cspace_augment_many(ctx)
+    );
+    run_test!(
+        "retype::aspace_augment_many",
+        retype::aspace_augment_many(ctx)
     );
 
     // ── Memory management syscalls ────────────────────────────────────────────

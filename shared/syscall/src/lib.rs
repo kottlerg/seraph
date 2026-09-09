@@ -835,14 +835,18 @@ pub fn cap_create_notification(memory_cap: u32) -> Result<u32, i64>
 /// one's PT growth budget.
 ///
 /// `memory_cap` must carry `MemRights::RETYPE` and have at least
-/// `init_pages * PAGE_SIZE` of `available_bytes`. Page 0 of the slab
-/// becomes the root PT; pages 1..`init_pages` form the initial PT growth
-/// pool. `init_pages` must be `>= 1`.
+/// `init_pages * PAGE_SIZE` of `available_bytes`. In create mode page 0 of
+/// the slab is the kernel wrapper page, page 1 the root PT, and pages
+/// `2..init_pages` seed the PT growth pool; `init_pages` must be `>= 2`.
 ///
 /// `augment_target` selects the mode:
 /// - `0` → create a new `AddressSpace`; returns the new cap slot index.
-/// - non-zero `AddressSpace` cap slot → augment that AS's PT growth pool;
-///   returns `0`.
+/// - non-zero `AddressSpace` cap slot → augment that AS's PT growth pool
+///   with the `init_pages` carved pages (`init_pages >= 1`); returns `0`.
+///   Once per record page of the kernel's donation bookkeeping, a donation
+///   keeps its first page for that bookkeeping and seeds `init_pages - 1`,
+///   so a one-page donation can leave the budget unchanged; read the budget
+///   back with `CAP_INFO_ASPACE_PT_BUDGET` rather than assuming the count.
 ///
 /// # Errors
 /// Returns a negative `i64` error code on insufficient memory budget,
@@ -874,7 +878,10 @@ pub fn cap_create_aspace(memory_cap: u32, augment_target: u32, init_pages: u64)
 ///
 /// `augment_target`:
 /// - `0` → create new; returns the new cap slot index.
-/// - non-zero → augment that `CSpace`'s growth pool; returns `0`.
+/// - non-zero → augment that `CSpace`'s growth pool with the `init_pages`
+///   carved pages; returns `0`. As for `cap_create_aspace`, once per record
+///   page of the kernel's donation bookkeeping a donation seeds
+///   `init_pages - 1`; read the budget back with `CAP_INFO_CSPACE_BUDGET`.
 ///
 /// A `CSpace` has no slot quota: its capacity is whatever its slot-page
 /// pool backs (query via `CAP_INFO_CSPACE_CAPACITY`), bounded only by the

@@ -248,32 +248,30 @@ pub extern "C" fn _start(info_ptr: u64) -> !
 /// from memmgr; ktest has no memmgr, so it draws on the kernel-minted RAM caps it
 /// inherits as init.
 ///
-/// Post-Gap-B, `sys_mmio_map` and `sys_mem_map` into ktest's retype-backed boot
-/// AS draw intermediate PT pages from that AS's own pool, not the fixed kernel
-/// reserve. The seeded `INIT_ASPACE_PAGES` pool sizes init's own bootstrap
-/// footprint; ktest additionally maps the framebuffer and serial MMIO and runs
-/// the `mem_map` suite against this AS, so it needs a modest top-up. Source the
+/// `sys_mmio_map` and `sys_mem_map` into ktest's retype-backed boot AS draw
+/// intermediate PT pages from that AS's own pool, not the fixed kernel reserve.
+/// The seeded `INIT_ASPACE_PAGES` pool sizes init's own bootstrap footprint;
+/// ktest additionally maps the framebuffer and serial MMIO and runs the
+/// `mem_map` suite against this AS, so it needs a modest top-up. Source the
 /// slabs from spare RAM caps — every inherited RAM cap except `memory_base`,
-/// which `frame_pool` and the retype-heavy tests draw from. The kernel coalesces
-/// drained RAM and places the largest extent at `memory_base`, leaving the
-/// smaller extents as spares, so accumulate across several augments.
-/// Best-effort: a partial top-up still helps; failures surface in the tests.
+/// which `frame_pool` and the retype-heavy tests draw from. The kernel
+/// coalesces drained RAM and places the largest extent at `memory_base`,
+/// leaving the smaller extents as spares, so accumulate across several
+/// augments. Best-effort: a partial top-up still helps; failures surface in the
+/// tests.
 fn fund_boot_aspace_pt(info: &init_protocol::InitInfo)
 {
     const TARGET_BYTES: u64 = 64 * 4096;
     const PER_AUGMENT_MAX: u64 = 64;
     const MIN_SPARE_PAGES: u64 = 16;
-    const MAX_AUGMENTS: u32 = 8; // stay within MAX_PT_CHUNKS headroom
     if info.memory_count < 2
     {
         return;
     }
-    let mut augments = 0u32;
     for slot in (info.memory_base + 1)..(info.memory_base + info.memory_count)
     {
-        if augments >= MAX_AUGMENTS
-            || syscall::cap_info(info.aspace_cap, syscall_abi::CAP_INFO_ASPACE_PT_BUDGET)
-                .is_ok_and(|b| b >= TARGET_BYTES)
+        if syscall::cap_info(info.aspace_cap, syscall_abi::CAP_INFO_ASPACE_PT_BUDGET)
+            .is_ok_and(|b| b >= TARGET_BYTES)
         {
             break;
         }
@@ -283,13 +281,10 @@ fn fund_boot_aspace_pt(info: &init_protocol::InitInfo)
         {
             continue;
         }
-        // Leave one page for the retype metadata header the kernel carves on a
-        // Memory cap's first retype; cap each augment to bound the per-chunk size.
-        let want = (avail_pages - 1).min(PER_AUGMENT_MAX);
-        if syscall::cap_create_aspace(slot, info.aspace_cap, want).is_ok()
-        {
-            augments += 1;
-        }
+        let want = avail_pages.min(PER_AUGMENT_MAX);
+        // Best-effort: a refused donation leaves the budget short, and the
+        // loop moves on to the next spare cap.
+        let _ = syscall::cap_create_aspace(slot, info.aspace_cap, want);
     }
 }
 

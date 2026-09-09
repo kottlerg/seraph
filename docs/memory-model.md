@@ -12,8 +12,10 @@ The kernel occupies the upper portion of the virtual address space; userspace pr
 occupy the lower portion. Each process has its own isolated address space. The kernel
 address space is mapped into every address space but is inaccessible from userspace.
 
-Physical memory is managed by a buddy allocator. The kernel heap uses a slab allocator
-with a general size-class path for variable-size allocations.
+Physical memory is managed by a buddy allocator until the Phase 7 handoff, after which
+every page of RAM is either a fixed kernel reserve or a userspace Memory capability;
+kernel objects are carved out of Memory capabilities by retype (see Kernel Object
+Memory).
 
 ---
 
@@ -140,7 +142,7 @@ physically-contiguous group of 4 KiB leaves — a TLB-reach optimisation that ke
 No page is simultaneously writable and executable. This is enforced at the page table
 level using the NX bit (x86-64) and the equivalent execute permission control on
 RISC-V. The kernel image itself follows W^X: text is executable but not writable;
-data and heap are writable but not executable.
+data is writable but not executable.
 
 On x86-64, kernel-side W^X additionally depends on `CR0.WP` (supervisor write-protect);
 without it a ring-0 write would bypass a read-only page permission. `CR0.WP` is required by
@@ -252,36 +254,26 @@ the caller. This applies inside the kernel as well as in userspace allocation pa
 
 ---
 
-## Kernel Heap
+## Kernel Object Memory
 
-The kernel heap provides dynamic allocation for internal kernel objects. It is built
-on top of the buddy allocator and never exposed to userspace.
+The kernel has no heap: it runs no `GlobalAlloc`, and every kernel object —
+capability slot pages, thread control blocks, IPC endpoints and notifications,
+event queues, wait sets, address spaces, CSpaces — is carved out of a Memory
+capability by retype and returned to it when the object's last capability is
+deleted; see [capability-model.md](capability-model.md) § Auto-reclaim. The
+kernel's own boot-time objects come from a reserve carved from the buddy
+allocator before the Phase 7 handoff, after which the buddy is sealed and every
+other page of RAM is a userspace Memory capability.
 
-### Slab Allocator
+Address spaces and CSpaces additionally own a pool that their page tables or
+slot pages come from, carved from a Memory capability with the object and grown
+only by further donations from Memory capabilities; see
+[capability-model.md](capability-model.md) § Address-space and CSpace growth
+budgets.
 
-Fixed-size kernel objects — capability entries, thread control blocks, IPC endpoints,
-address space descriptors, page table nodes — are managed by a slab allocator. Each
-object type has a dedicated slab cache:
+### Kernel Allocation is Fallible
 
-- The cache holds one or more slabs, each a physically contiguous set of pages
-- Each slab is divided into fixed-size slots for that object type
-- Allocation and deallocation within a slab are O(1)
-- Free slots are tracked with a free list embedded in unused object memory
-
-### General Size-Class Allocator
-
-For the occasional variable-size allocation (e.g. dynamic arrays, strings in kernel
-paths), a size-class allocator provides bins at powers of two (16, 32, 64, 128, ...
-bytes). Each bin is backed by slab pages from the buddy allocator. This provides
-O(1) allocation with bounded fragmentation for the general case without implementing
-a full general-purpose allocator.
-
-Allocations larger than the largest bin size are served directly from the buddy
-allocator.
-
-### Kernel Heap Allocation is Fallible
-
-Kernel heap allocation MUST be handled as fallible at every call site.
+Retype and pool allocation MUST be handled as fallible at every call site.
 
 ---
 

@@ -1,17 +1,23 @@
 # Memory Subsystem Internals
 
 This document covers the implementation of the kernel's memory subsystem. The design
-goals (higher-half layout, buddy + slab allocation, W^X enforcement, TLB management) are
-specified in [docs/memory-model.md](../../../docs/memory-model.md). This document
-describes how those goals are realised in code.
+goals (higher-half layout, buddy allocation, retype-backed kernel objects, W^X
+enforcement, TLB management) are specified in
+[docs/memory-model.md](../../../docs/memory-model.md). This document describes how
+those goals are realised in code.
 
-The memory subsystem comprises five components:
+The memory subsystem comprises six components:
 
-1. **Buddy allocator** — physical frame allocation
-2. **Slab allocator** — fixed-size kernel object allocation
-3. **Size-class allocator** — general variable-size kernel heap
-4. **Address space management** — per-process virtual address space objects
-5. **TLB management** — local invalidation, tagged (PCID/ASID) no-flush context switch with a full-flush fallback, and SMP shootdown
+1. **Buddy allocator** — boot-time physical frame allocation
+2. **Kernel object memory** — objects carved out of Memory capabilities by retype,
+   and the page pools behind address spaces and CSpaces
+3. **Address space management** — per-process virtual address space objects
+4. **TLB management** — local invalidation, tagged (PCID/ASID) no-flush context
+   switch with a full-flush fallback, and SMP shootdown
+5. **Kernel stack allocation** — idle stacks from the buddy, every other stack from
+   the thread's own slab
+6. **Page table node ownership** — which page-table pages belong to an address
+   space's pool and which the kernel lends
 
 ---
 
@@ -86,183 +92,23 @@ changing the core algorithm.
 
 ---
 
-## Slab Allocator (`mm/slab.rs`)
+## Kernel Object Memory (`cap/retype.rs`)
 
-### Purpose
+The kernel runs no heap and no `GlobalAlloc`. Every kernel object — the slot
+pages of a CSpace, thread control blocks, endpoints, notifications, event
+queues, wait sets, address spaces, CSpaces, and Memory objects themselves — is
+carved out of a Memory capability by retype: the body is constructed in place
+at the offset the retype allocator returns, its header records the source, and
+the bytes go back to that source when the object's last capability is deleted
+(see [capability-internals.md](capability-internals.md) § Kernel Object
+Reference Counting). The kernel's own objects are retyped from the SEED
+reserve, carved from the buddy allocator before the Phase 7 handoff; userspace
+objects come from the capability a `cap_create_*` syscall names. Address spaces
+and CSpaces additionally own a page pool for their page tables and slot pages
+([capability-internals.md](capability-internals.md) § Page Pools).
 
-The slab allocator provides O(1) allocation and deallocation for fixed-size kernel
-objects. Each object type has a dedicated slab cache; objects of the same type are
-co-located for cache efficiency.
-
-### Cache Structure
-
-```rust
-pub struct SlabCache
-{
-    /// Size of each object in bytes.
-    object_size: usize,
-
-    /// Objects per slab (computed from object_size and slab page count).
-    objects_per_slab: usize,
-
-    /// Number of pages per slab (1–4, chosen so objects_per_slab >= SLAB_MIN_OBJECTS).
-    pages_per_slab: usize,
-
-    /// Slabs with at least one free slot.
-    partial_slabs: SlabList,
-
-    /// Slabs with no free slots (tracked for deallocation detection).
-    full_slabs: SlabList,
-
-    /// Slabs with all slots free (returned to buddy allocator when empty).
-    empty_slabs: SlabList,
-
-    /// Total allocation count (for diagnostics).
-    alloc_count: u64,
-}
-```
-
-### Slab Layout
-
-A slab is a contiguous group of `pages_per_slab` physical pages. Its layout is:
-
-```
-[ SlabHeader | padding to object alignment ][ object 0 ][ object 1 ] ... [ object N ]
-```
-
-`SlabHeader` is stored at the start of the slab:
-
-```rust
-struct SlabHeader
-{
-    /// Intrusive list links (for partial/full/empty lists).
-    list_next: Option<PhysAddr>,
-    list_prev: Option<PhysAddr>,
-
-    /// Head of the free slot list embedded in free objects.
-    free_head: Option<*mut FreeSlot>,
-
-    /// Number of currently allocated (in-use) objects in this slab.
-    in_use: u32,
-
-    /// Back-pointer to the cache this slab belongs to.
-    cache: *mut SlabCache,
-}
-```
-
-Free slots embed their next-pointer at offset 0 within the otherwise-unused object
-memory:
-
-```rust
-struct FreeSlot
-{
-    next: Option<*mut FreeSlot>,
-}
-```
-
-This avoids any external free-list allocation — the free list is intrusive into the
-free object memory itself.
-
-### Allocation
-
-```
-cache.alloc():
-    slab = partial_slabs.head
-    if slab is None:
-        slab = cache.grow()  // allocate a new slab from buddy allocator
-        if slab is None: return None (OOM)
-    slot = slab.free_head
-    slab.free_head = slot.next
-    slab.in_use += 1
-    if slab.free_head is None:
-        move slab from partial_slabs to full_slabs
-    return slot as *mut T (zeroed by grow() at slab creation)
-```
-
-### Deallocation
-
-```
-cache.free(ptr):
-    slab = find_slab_for(ptr)  // round ptr down to slab base
-    slot = ptr as *mut FreeSlot
-    slot.next = slab.free_head
-    slab.free_head = slot
-    slab.in_use -= 1
-    if slab.in_use == 0:
-        move slab from partial_slabs (or full_slabs) to empty_slabs
-        // optionally return to buddy allocator if empty_slabs grows large
-    else if was in full_slabs:
-        move slab from full_slabs to partial_slabs
-```
-
-Finding the slab from a pointer: since each slab is page-aligned and `pages_per_slab`
-is known, masking the pointer to the slab's page-aligned base reaches `SlabHeader`.
-
-### Registered Caches
-
-The following slab caches are registered during Phase 4 of initialization:
-
-| Cache | Object Type |
-|---|---|
-| `cap_slot_cache` | `CapabilitySlot` |
-| `tcb_cache` | `ThreadControlBlock` |
-| `endpoint_cache` | `Endpoint` |
-| `notification_cache` | `Notification` |
-| `event_queue_cache` | `EventQueueHeader` |
-| `wait_set_cache` | `WaitSet` |
-| `address_space_cache` | `AddressSpace` |
-
-Object sizes are determined by the final struct layouts and are not part of the ABI.
-
----
-
-## Size-Class Allocator (`mm/size_class.rs`)
-
-### Purpose
-
-For variable-size kernel allocations (dynamic arrays, temporary buffers, strings in
-kernel paths), the size-class allocator provides O(1) allocation with bounded
-fragmentation.
-
-### Bin Sizes
-
-Bins are at successive powers of two, starting from a small minimum and covering
-up to a maximum bin size. The exact bin boundaries are implementation constants.
-Allocations are rounded up to the next bin size. Each bin is backed by a dedicated
-slab cache.
-
-Allocations larger than the maximum bin size are served directly from the buddy
-allocator (rounded up to a power-of-two page count).
-
-### Implementation
-
-```rust
-pub struct SizeClassAllocator
-{
-    bins: [SlabCache; NUM_BINS],  // one per power-of-two size
-}
-
-impl SizeClassAllocator
-{
-    pub fn alloc(&mut self, size: usize, align: usize) -> Option<NonNull<u8>>
-    {
-        if size > MAX_BIN_SIZE
-        {
-            // Direct buddy allocation, rounded to page order
-            let order = size.next_power_of_two().trailing_zeros() as usize
-                - PAGE_SHIFT;
-            BUDDY.lock().alloc(order).map(phys_to_virt)
-        } else
-        {
-            let bin_idx = bin_for(size, align);
-            self.bins[bin_idx].alloc()
-        }
-    }
-}
-```
-
-This allocator is exposed as the kernel's `GlobalAlloc` implementation, enabling
-`alloc::boxed::Box` and `alloc::vec::Vec` in kernel code.
+Retype and pool allocation are fallible and MUST be handled as fallible at every
+call site; there is no allocation that cannot fail.
 
 ---
 
@@ -294,9 +140,11 @@ pub struct AddressSpace
 
 ### Lifecycle
 
-1. **Creation** (`SYS_CAP_CREATE_ADDRESS_SPACE`): allocate a root page table frame,
-   zero it, map the kernel higher half (shared across all address spaces via a
-   shared PML4/root entry), allocate an `AddressSpace` from the slab cache.
+1. **Creation** (`SYS_CAP_CREATE_ASPACE`): carve a slab from the source
+   Memory cap; page 0 holds the wrapper object and the in-place `AddressSpace`,
+   page 1 the zeroed root page table with the kernel higher half mapped (shared
+   across all address spaces via a shared PML4/root entry), and the remaining
+   pages seed the page-table pool.
 
 2. **Use**: threads reference the `AddressSpace` via their TCB. When scheduled, the
    scheduler calls `arch::current::paging::activate(root_phys)` to switch the hardware
@@ -306,9 +154,10 @@ pub struct AddressSpace
    `pt_lock`, call `arch::current::paging::map_user_page`/`unmap_user_page`/
    `protect_user_page`, then perform TLB management (see TLB Management section below).
 
-4. **Destruction**: when the last capability to the address space is deleted, all
-   page table frames are freed to the buddy allocator and the `AddressSpace` object is
-   freed to the slab cache.
+4. **Destruction**: when the last capability to the address space is deleted, every
+   donation to its page-table pool — the create-time slab included, with the root
+   table and the `AddressSpace` itself — is returned to its source Memory cap
+   wholesale (see Page Table Node Ownership below).
 
 ### Fork-Like Operations
 
@@ -478,38 +327,54 @@ kernel image addresses.
 ## Kernel Stack Allocation
 
 Each kernel thread (the kernel-side execution context for syscall and interrupt
-handling) has a dedicated kernel stack. Kernel stacks are allocated directly from the
-buddy allocator:
+handling) has a dedicated kernel stack of `KERNEL_STACK_PAGES` pages. Two sources
+exist:
 
-- Size: `KERNEL_STACK_PAGES` pages (e.g. 8 pages = 32 KiB)
-- Alignment: `KERNEL_STACK_PAGES`-page aligned (enables O(1) stack-base recovery
-  from an arbitrary stack pointer by masking)
-- Guard page: one unmapped page immediately below the stack (allocated but not mapped,
-  so stack overflow faults immediately rather than silently corrupting adjacent memory)
-
-Stack allocation happens in Phase 8 (scheduler initialization) for idle threads and
-in `SYS_CAP_CREATE_THREAD` for user-created threads.
+- The idle threads' stacks come from the buddy allocator in Phase 4, one
+  power-of-two block per CPU, while the buddy still holds large contiguous blocks
+  (before the Phase 7 drain); they live for the kernel's lifetime.
+- Every other thread's stack is the first `KERNEL_STACK_PAGES` pages of its
+  Thread slab — stack, then the page holding the `ThreadObject` and TCB, then
+  the per-thread FPU/SIMD save area — which `SYS_CAP_CREATE_THREAD` carves from
+  the caller's Memory capability, and boot code carves from the SEED reserve
+  for init's own thread; the slab returns to that capability when the thread's
+  last capability is deleted.
 
 ---
 
-## Page Table Node Tracking
+## Page Table Node Ownership
 
 Intermediate page table nodes (PML3/PML2/PML1 on x86-64; every level below
 the root on RISC-V — two to four of them depending on the negotiated paging
-mode)
-are allocated from the buddy allocator at order 0 (one 4 KiB page each). The kernel
-must track these to free them when an address space is destroyed.
+mode) are one 4 KiB page each and are owned exclusively by the address space
+that contains them; no reference counting is needed. Their source depends on
+the mapping path:
 
-Each intermediate node page is tracked via a `PageTableNode` entry in a slab cache.
-The entry records the physical address of the page and the level it occupies in the
-table hierarchy. On address space destruction, the kernel walks the derivation of the
-root table, freeing all tracked intermediate nodes before freeing the root.
+- `SYS_MEM_MAP` and `SYS_MMIO_MAP` into a retype-backed address space (every
+  user address space, including init's bootstrap space) draw them from the
+  page pool of the space's wrapper object, seeded at creation and refilled by
+  augment-mode donations from Memory caps; the map returns `OutOfMemory` when
+  the pool is empty. The pooled map path marks each table it installs with a
+  software bit in the parent entry (`POOLED_TABLE`); a reclaiming unmap
+  (`MEM_UNMAP_RECLAIM_PTS`) returns a now-empty node to that pool only when
+  its parent entry carries the bit.
+- Kernel-direct mappings through `map_page` (the Phase 9 init image, InitInfo
+  page, and stack) and any address space without a recorded donation draw
+  them from the fixed kernel page-table pool (`mm::kernel_pt_pool`).
 
-No reference counting is needed for intermediate nodes — they are owned exclusively
-by the address space that contains them.
+No per-node tracking structure exists. On address-space destruction the kernel
+does not walk the tables: the wrapper returns every donation wholesale to its
+source Memory cap, which reclaims the pool-drawn nodes with it, and the root
+table goes with the create-time slab. Kernel-direct nodes are not returned to
+the kernel page-table pool by destruction; only init's bootstrap space holds
+any, nothing destroys it today, and destroying it would strand them. See
+[capability-internals.md](capability-internals.md) § Page Pools for the
+donation-record mechanism.
 
 ---
 
 ## Summarized By
 
-[kernel/README.md](../README.md)
+[kernel/README.md](../README.md),
+[kernel/docs/arch-interface.md](arch-interface.md),
+[kernel/docs/capability-internals.md](capability-internals.md)

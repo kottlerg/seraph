@@ -11,12 +11,12 @@
 //! builds init's (or ktest's) boot address space — ELF segments, stack,
 //! and `InitInfo` — which calls `map_page` directly, before any userspace
 //! runs. `sys_mmio_map` / `sys_mem_map` also fall back here, but only for
-//! an address space with no retype-backed PT chunk; every address space
-//! the boot actually creates is seeded with a chunk (`boot_retype_aspace`
+//! an address space with no recorded donation; every address space the
+//! boot actually creates records its create-time slab (`boot_retype_aspace`
 //! for the boot AS, `sys_cap_create_aspace` for services), so those
 //! syscalls take the pooled path and fund their own intermediate PT pages
 //! from the AS's own growth pool. The fallback is the safety net for the
-//! chunk-less case, not a routine path.
+//! donation-less case, not a routine path.
 //!
 //! Pages are seeded once during Phase 7 — `POOL_SEED_PAGES` allocated from the
 //! pristine buddy before the user-cap drain — threaded onto an intrusive
@@ -30,9 +30,10 @@
 //!
 //! The free list is intrusive: each free page's first 8 bytes (accessed
 //! via the direct physical map) hold the next-PA pointer, or 0 for the
-//! tail. `alloc_pt_page` pops, zeros the page, and returns the PA;
-//! `free_pt_page` writes the current head into the page's first 8 bytes
-//! and updates the head.
+//! tail. `alloc_pt_page` pops, zeros the page, and returns the PA. Pages
+//! are never returned: in practice only init's bootstrap space draws on the
+//! pool, nothing destroys it today, and a reclaiming unmap leaves
+//! kernel-direct tables in place.
 
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -160,24 +161,6 @@ pub(crate) fn alloc_pt_page() -> Option<u64>
     Some(pa)
 }
 
-/// Push a 4 KiB frame back onto the pool. Symmetric to `alloc_pt_page`.
-#[cfg(not(test))]
-#[track_caller]
-pub(crate) fn free_pt_page(pa: u64)
-{
-    acquire();
-    // SAFETY: LOCK held; FREE_LIST_HEAD exclusively owned for the
-    // duration of this block. `pa` is a page-aligned PA whose direct-map
-    // VA is writable.
-    unsafe {
-        let head = FREE_LIST_HEAD;
-        *(phys_to_virt(pa) as *mut u64) = head;
-        FREE_LIST_HEAD = pa;
-    }
-    release();
-    REMAINING.fetch_add(1, Ordering::Release);
-}
-
 /// Remaining pages in the pool. Diagnostic only.
 #[cfg(not(test))]
 pub(crate) fn remaining_pages() -> usize
@@ -195,9 +178,6 @@ pub(crate) fn alloc_pt_page() -> Option<u64>
 {
     None
 }
-#[cfg(test)]
-#[allow(dead_code)]
-pub(crate) fn free_pt_page(_pa: u64) {}
 #[cfg(test)]
 #[allow(dead_code)]
 pub(crate) fn remaining_pages() -> usize

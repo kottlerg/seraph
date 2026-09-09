@@ -388,7 +388,7 @@ pub fn sys_cap_create_notification(tf: &mut TrapFrame) -> Result<u64, SyscallErr
 /// - page 1 — root page table (PML4 / RISC-V root), zeroed, kernel-half PT
 ///   entries copied from the active root.
 /// - pages `2..init_pages` — PT growth pool. Drawn on demand by
-///   [`AddressSpace::map_page`](crate::mm::address_space::AddressSpace::map_page)
+///   [`AddressSpace::map_page_pooled`](crate::mm::address_space::AddressSpace::map_page_pooled)
 ///   for intermediate PT levels.
 ///
 /// Inserts a cap with `MAP | READ | CONTROL` rights into the caller's
@@ -397,14 +397,18 @@ pub fn sys_cap_create_notification(tf: &mut TrapFrame) -> Result<u64, SyscallErr
 /// derived copies handed to other components (e.g. memmgr) drop it via
 /// the `cap_derive` rights mask. Returns the new slot index.
 ///
-/// Augment-mode: pushes all carved pages onto the target AS's PT growth pool
-/// and increases its `pt_growth_budget_bytes`. Returns `0` on success.
+/// Augment-mode: seeds the carved pages onto the target AS's PT growth pool
+/// and credits `pt_growth_budget_bytes` with the pages seeded. Once the
+/// pool's inline donation records are full, one donation per record page
+/// keeps its first page as the kernel's donation bookkeeping and seeds
+/// `init_pages - 1` (see `PagePool::add_donation`), so a one-page donation can
+/// leave the budget unchanged. Returns `0` on success.
 #[cfg(not(test))]
 #[allow(clippy::too_many_lines)]
 pub fn sys_cap_create_aspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::object::{
-        AddressSpaceObject, KernelObjectHeader, MemoryObject, ObjectType, vacant_chunk_slots,
+        AddressSpaceObject, KernelObjectHeader, MemoryObject, ObjectType, PagePool,
     };
     use crate::cap::retype::{dispatch_for, retype_allocate, retype_free};
     use crate::cap::slot::{AsRights, MemRights};
@@ -485,13 +489,13 @@ pub fn sys_cap_create_aspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         #[allow(clippy::cast_ptr_alignment)]
         let target_aso = unsafe { &*target_aso_nn.as_ptr().cast::<AddressSpaceObject>() };
 
-        // SAFETY: ref is held until AS-dealloc (released per chunk slot).
+        // SAFETY: ref is held until AS-dealloc (released per donation record).
         unsafe { memory_obj_nn.as_ref().inc_ref() };
 
         // SAFETY: target_aso wraps a live AS; offset/init_pages are from a
         // successful retype against `memory`.
         let res = unsafe {
-            target_aso.add_chunk(memory_obj_nn, memory_base, offset, init_pages, init_pages)
+            target_aso.add_donation(memory_obj_nn, memory_base, offset, init_pages, init_pages)
         };
         if res.is_err()
         {
@@ -551,9 +555,7 @@ pub fn sys_cap_create_aspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 header: KernelObjectHeader::with_ancestor(ObjectType::AddressSpace, memory_obj_nn),
                 address_space: aspace_ptr,
                 pt_growth_budget_bytes: AtomicU64::new(0),
-                pt_pool_lock: AtomicU64::new(0),
-                pt_pool_head_phys: AtomicU64::new(0),
-                pt_chunks: vacant_chunk_slots(),
+                pt_pool: PagePool::new(),
                 deferred_next: core::ptr::null_mut(),
             },
         );
@@ -561,17 +563,18 @@ pub fn sys_cap_create_aspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // Hold a reference on the source Memory cap for the AS's lifetime; the
     // matching dec_ref happens in `dealloc_object(AddressSpace)` after the
-    // chunk is reclaimed.
+    // donation is reclaimed.
     // SAFETY: memory_obj_nn is a live MemoryObject.
     unsafe { memory_obj_nn.as_ref().inc_ref() };
 
-    // Record the chunk covering all `init_pages`; the lower 2 pages
+    // Record the donation covering all `init_pages`; the lower 2 pages
     // (wrapper + root PT) are reserved, the remainder seeds the pool.
     let pool_pages = init_pages - 2;
     // SAFETY: aso just constructed; offset/init_pages from a successful
     // retype against `memory`.
-    let res =
-        unsafe { (*aso_ptr).add_chunk(memory_obj_nn, memory_base, offset, init_pages, pool_pages) };
+    let res = unsafe {
+        (*aso_ptr).add_donation(memory_obj_nn, memory_base, offset, init_pages, pool_pages)
+    };
     if res.is_err()
     {
         // Roll back: drop the in-place objects, free the slab, dec_ref the
@@ -604,8 +607,8 @@ pub fn sys_cap_create_aspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         Ok(idx) => idx,
         Err(e) =>
         {
-            // The cap never reached visibility; mirror the add_chunk
-            // rollback above (the chunk record lives inside the wrapper
+            // The cap never reached visibility; mirror the add_donation
+            // rollback above (the donation record lives inside the wrapper
             // page being freed, so no external bookkeeping survives).
             // SAFETY: aso/aspace not observed externally yet.
             unsafe {
@@ -644,7 +647,10 @@ pub fn sys_cap_create_aspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 ///   [`CSpace::grow`](crate::cap::cspace::CSpace::grow) when the directory
 ///   needs another 56-slot leaf.
 ///
-/// Create-mode returns the new `CSpace` slot index. Augment-mode returns 0.
+/// Create-mode returns the new `CSpace` slot index. Augment-mode seeds the
+/// carved pages onto the slot-page pool and credits the budget with the
+/// pages seeded — one donation per record page keeps its first page as the
+/// kernel's donation bookkeeping (see `PagePool::add_donation`) — and returns 0.
 #[cfg(not(test))]
 #[allow(clippy::too_many_lines)]
 pub fn sys_cap_create_cspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
@@ -652,7 +658,7 @@ pub fn sys_cap_create_cspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     use crate::cap::alloc_cspace_id;
     use crate::cap::cspace::CSpace;
     use crate::cap::object::{
-        CSpaceKernelObject, KernelObjectHeader, MemoryObject, ObjectType, vacant_chunk_slots,
+        CSpaceKernelObject, KernelObjectHeader, MemoryObject, ObjectType, PagePool,
     };
     use crate::cap::retype::{dispatch_for, retype_allocate, retype_free};
     use crate::cap::slot::{CsRights, MemRights};
@@ -733,7 +739,7 @@ pub fn sys_cap_create_cspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
         // SAFETY: target_kobj is live.
         let res = unsafe {
-            target_kobj.add_chunk(memory_obj_nn, memory_base, offset, init_pages, init_pages)
+            target_kobj.add_donation(memory_obj_nn, memory_base, offset, init_pages, init_pages)
         };
         if res.is_err()
         {
@@ -789,9 +795,7 @@ pub fn sys_cap_create_cspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 header: KernelObjectHeader::with_ancestor(ObjectType::CSpaceObj, memory_obj_nn),
                 cspace: cs_ptr,
                 cspace_growth_budget_bytes: AtomicU64::new(0),
-                cs_pool_lock: AtomicU64::new(0),
-                cs_pool_head_phys: AtomicU64::new(0),
-                cs_chunks: vacant_chunk_slots(),
+                cs_pool: PagePool::new(),
                 deferred_next: core::ptr::null_mut(),
             },
         );
@@ -825,13 +829,13 @@ pub fn sys_cap_create_cspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // SAFETY: memory_obj_nn is live.
     unsafe { memory_obj_nn.as_ref().inc_ref() };
 
-    // Record the chunk covering all init_pages; reserve page 0 (wrapper),
+    // Record the donation covering all init_pages; reserve page 0 (wrapper),
     // pool seeds pages 1..init_pages.
     let pool_pages = init_pages - 1;
     // SAFETY: wrapper just constructed; offset/init_pages from a successful
     // retype against `memory`.
     let res = unsafe {
-        (*cs_kobj_ptr).add_chunk(memory_obj_nn, memory_base, offset, init_pages, pool_pages)
+        (*cs_kobj_ptr).add_donation(memory_obj_nn, memory_base, offset, init_pages, pool_pages)
     };
     if res.is_err()
     {
@@ -2709,7 +2713,8 @@ pub fn sys_cap_info(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 return Err(SyscallError::InvalidArgument);
             }
             // SAFETY: tag confirmed Memory; header is at offset 0 of MemoryObject.
-            // cast_ptr_alignment: MemoryObject (8-byte aligned via Box) holds the header at offset 0.
+            // cast_ptr_alignment: MemoryObject (constructed in place at a size-class-aligned
+            // retype offset, so 8-byte aligned) holds the header at offset 0.
             #[allow(clippy::cast_ptr_alignment)]
             let memory = unsafe { &*(obj.as_ptr().cast::<MemoryObject>()) };
             Ok(memory.size)

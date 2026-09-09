@@ -58,13 +58,7 @@ static WORKER_ARGS: ArgBlock<WorkerArgs, NUM_WORKERS> = ArgBlock::new(WorkerArgs
 
 pub fn run(ctx: &TestContext) -> TestResult
 {
-    // Pre-warm: pay the per-MemoryObject allocator metadata cost on
-    // ctx.memory_base (if some earlier test hasn't already) so the
-    // post-stress baseline matches the pre-stress baseline.
     let memory = ctx.memory_base;
-    let warm = syscall::cap_create_endpoint(memory)
-        .map_err(|_| "stress::retype_concurrent: warmup endpoint failed")?;
-    cap_delete(warm).ok();
     let baseline = cap_info(memory, CAP_INFO_MEMORY_AVAILABLE)
         .map_err(|_| "stress::retype_concurrent: cap_info(baseline) failed")?;
 

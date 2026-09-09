@@ -16,22 +16,19 @@
 //!
 //! Object types covered:
 //! - `Endpoint`     (sub-page, in-place)
-//! - `Notification`       (sub-page, in-place)
+//! - `Notification` (sub-page, in-place)
 //! - `WaitSet`      (sub-page, in-place)
 //! - `EventQueue`   (sub-page when small, page-aligned split when large)
-//! - `Thread`       (page-aligned split — kstack + wrapper page)
-//! - `AddressSpace` (page-aligned split — `init_pages` PT pool)
-//! - `CSpaceObj`    (page-aligned split — `init_pages` slot pool)
+//! - `Thread`       (page-aligned split — kstack + wrapper page + save area)
+//! - `AddressSpace` (page-aligned split — wrapper, root PT, `init_pages - 2` pool pages)
+//! - `CSpaceObj`    (page-aligned split — wrapper, `init_pages - 1` pool pages)
 //!
 //! ## Test isolation
 //!
-//! Every retype runs against `ctx.memory_base`. A throwaway
-//! `cap_create_endpoint` + delete pays the per-`MemoryObject` allocator-
-//! metadata cost (paid once on the cap's lifetime) before the baseline
-//! read, so the post-mint-then-delete equality check reflects steady
-//! state. If an earlier test already paid the metadata cost, the warmup
-//! is a no-op and the baseline simply reflects current `available_bytes`
-//! — the round-trip equality still holds either way.
+//! Every retype runs against `ctx.memory_base`. The baseline is the cap's
+//! `available_bytes` before the first mint; every mint-then-delete pair
+//! must return the cap to it, since a retype debits exactly its class-
+//! rounded cost and the matching free credits exactly that.
 
 use syscall::{
     cap_create_aspace, cap_create_cspace, cap_create_endpoint, cap_create_notification,
@@ -66,14 +63,6 @@ fn assert_baseline(label: &'static str, memory_cap: u32, baseline: u64) -> TestR
 pub fn run(ctx: &TestContext) -> TestResult
 {
     let memory = ctx.memory_base;
-
-    // Pre-warm: pay the per-MemoryObject allocator metadata cost (if not
-    // already paid by an earlier test) so the baseline reflects steady
-    // state. The mint-and-immediate-delete cycle leaves `available_bytes`
-    // exactly where it was after the metadata debit.
-    let warmup = cap_create_endpoint(memory)
-        .map_err(|_| "integration::retype_reclaim: warmup cap_create_endpoint failed")?;
-    cap_delete(warmup).map_err(|_| "integration::retype_reclaim: warmup cap_delete failed")?;
 
     let baseline = read_available(memory)?;
 
@@ -162,7 +151,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     // ── AddressSpace ─────────────────────────────────────────────────────────
     //
-    // 8 pages of PT pool (page 0 root, pages 1..8 growth budget).
+    // An 8-page slab: page 0 wrapper, page 1 root PT, pages 2..8 PT pool.
     let aspace_cap = cap_create_aspace(memory, 0, 8)
         .map_err(|_| "integration::retype_reclaim: cap_create_aspace failed")?;
     let mid = read_available(memory)?;
@@ -179,6 +168,8 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     // ── CSpaceObj ────────────────────────────────────────────────────────────
     //
+    // A 4-page slab: page 0 wrapper, three pool pages that would back three
+    // leaves (3 × 56 − 1 = 167 slots) on demand.
     let cspace_cap = cap_create_cspace(memory, 0, 4)
         .map_err(|_| "integration::retype_reclaim: cap_create_cspace failed")?;
     let mid = read_available(memory)?;

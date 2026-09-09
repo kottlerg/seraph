@@ -36,6 +36,12 @@ const PCD: u64 = 1 << 4;
 const LARGE_PAGE: u64 = 1 << 7;
 /// No-Execute — blocks instruction fetch; requires `IA32_EFER.NXE` = 1.
 const NO_EXECUTE: u64 = 1 << 63;
+/// Software bit (AVL, ignored by hardware in every entry type) set in a
+/// table-pointer entry whose table frame came from the address space's own
+/// page-table pool (`user_walk_or_alloc_pooled`). A reclaiming unmap frees
+/// an empty table to that pool only when its parent entry carries this bit;
+/// tables from `kernel_pt_pool` (the kernel-direct `map_page` path) do not.
+const POOLED_TABLE: u64 = 1 << 9;
 /// Mask extracting the physical page number from bits \[51:12\].
 const PHYS_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 
@@ -609,10 +615,10 @@ fn user_walk_or_alloc(entry: &mut PageTableEntry) -> Result<u64, ()>
 }
 
 /// Map a single 4 KiB user page, drawing intermediate page-table frames from
-/// an `AddressSpaceObject`'s growth pool instead of the buddy allocator.
+/// an `AddressSpaceObject`'s growth pool instead of the kernel page-table
+/// pool.
 ///
-/// The pool is the typed-memory equivalent of buddy-backed PT allocation:
-/// each new PT page debits the AS's `pt_growth_budget_bytes`. Exhaustion
+/// Each new PT page debits the AS's `pt_growth_budget_bytes`. Exhaustion
 /// returns `Err(())`; the caller surfaces this as `SyscallError::NoMemory`
 /// so userspace can refill via augment-mode `cap_create_aspace`.
 ///
@@ -672,94 +678,10 @@ fn user_walk_or_alloc_pooled(
     let frame_pa = aso.alloc_pt_page().ok_or(())?;
 
     let mut table_pte = PageTableEntry::new_table(frame_pa);
-    table_pte.0 |= USER;
+    table_pte.0 |= USER | POOLED_TABLE;
     *entry = table_pte;
 
     Ok(frame_pa)
-}
-
-/// Walk the user half of the page table rooted at `root_virt` and free every
-/// intermediate table frame (PDPT, PD, PT) back to `allocator`.
-///
-/// Retained for the case where a future caller needs to reclaim PT pages
-/// to the buddy directly. Production retype-backed `AddressSpace`s
-/// reclaim PT pages through `dealloc_object(AddressSpace)`'s chunk walk
-/// (`retype_free` per chunk → ancestor `dec_ref`), not via this function.
-///
-/// Leaf PTEs (4 KiB and 2 MiB large pages) point at physical memory owned by
-/// Memory capabilities; those frames are freed through `MemoryObject` teardown
-/// when the owning `CSpace` is destroyed, not here. This function only
-/// reclaims the *page-table* pages the aspace allocated via
-/// `user_walk_or_alloc`. The root PML4 itself is not freed here; the caller
-/// in `dealloc_object(AddressSpace)` frees it after this walk completes.
-///
-/// Only entries in PML4 indices 0..256 (user half) are examined. Kernel-half
-/// entries (256..512) are copies of the global kernel PML4; freeing any of
-/// their descendants would corrupt every other address space.
-///
-/// # Safety
-/// `root_virt` must be the direct-map virtual address of a valid 4 KiB PML4
-/// frame. No CPU may still be using this address space (the caller verifies
-/// `active_cpu_mask().is_empty()` before invocation).
-#[cfg(not(test))]
-#[allow(dead_code)]
-pub unsafe fn free_user_page_tables(root_virt: u64)
-{
-    use crate::mm::paging::phys_to_virt;
-
-    const LARGE_PAGE_BIT: u64 = 1 << 7;
-
-    // SAFETY: root_virt is direct-map VA of a valid PML4 page; caller's contract.
-    let pml4 = unsafe { table_at(root_virt) };
-    for pml4e in pml4.iter().take(256)
-    {
-        if !pml4e.is_present()
-        {
-            continue;
-        }
-        // PML4 entries never encode a leaf on x86-64 (no 512 GiB page support
-        // on this target). Treat every present entry as a PDPT pointer.
-        let pdpt_pa = pml4e.phys_addr();
-        // SAFETY: pdpt_pa from a present PML4E points at a live PDPT frame.
-        let pdpt = unsafe { table_at(phys_to_virt(pdpt_pa)) };
-        for pdpte in pdpt.iter()
-        {
-            if !pdpte.is_present()
-            {
-                continue;
-            }
-            // 1 GiB large-page leaves are not produced by the user mapping
-            // path today; guard against them anyway so future additions don't
-            // leak or crash.
-            if pdpte.0 & LARGE_PAGE_BIT != 0
-            {
-                continue;
-            }
-            let pd_pa = pdpte.phys_addr();
-            // SAFETY: pd_pa from a present PDPTE points at a live PD frame.
-            let pd = unsafe { table_at(phys_to_virt(pd_pa)) };
-            for pde in pd.iter()
-            {
-                if !pde.is_present()
-                {
-                    continue;
-                }
-                // 2 MiB large-page leaves skip the PT level — no PT to free.
-                if pde.0 & LARGE_PAGE_BIT != 0
-                {
-                    continue;
-                }
-                let pt_pa = pde.phys_addr();
-                // PT frame originated from `kernel_pt_pool::alloc_pt_page`;
-                // return it there. Caller guarantees no CPU still references it.
-                crate::mm::kernel_pt_pool::free_pt_page(pt_pa);
-            }
-            // PD frame likewise originated from the pool.
-            crate::mm::kernel_pt_pool::free_pt_page(pd_pa);
-        }
-        // PDPT frame likewise originated from the pool.
-        crate::mm::kernel_pt_pool::free_pt_page(pdpt_pa);
-    }
 }
 
 /// Flush the TLB entry for a single page at `virt` using `invlpg`.
@@ -975,8 +897,8 @@ fn table_is_empty(table: &[PageTableEntry; 512]) -> bool
 /// freed.
 ///
 /// Walks PML4 → PDPT → PD → PT over the span, clearing in-range leaf PTEs. A
-/// table is freed only when it is fully empty afterwards **and** `aso` owns the
-/// frame ([`owns_phys`](crate::cap::object::AddressSpaceObject::owns_phys)) —
+/// table is freed only when it is fully empty afterwards **and** its parent
+/// entry carries [`POOLED_TABLE`] (the frame came from `aso`'s pool) —
 /// emptiness, not span-containment, is the gate, so a boundary table shared
 /// with a live neighbour (or the guard-page table whose first slot sits just
 /// outside the span) is reclaimed exactly when its last live entry clears.
@@ -1053,31 +975,31 @@ pub unsafe fn unmap_user_region_pooled(
                                 pt[pt_index(va1)] = PageTableEntry(0);
                                 va1 += p;
                             }
-                            if table_is_empty(pt) && aso.owns_phys(pt_pa)
+                            if table_is_empty(pt) && e2.0 & POOLED_TABLE != 0
                             {
                                 pd[l2] = PageTableEntry(0);
                                 // SAFETY: PT is empty and unlinked above; frame
-                                // came from this aso's pool (owns_phys).
+                                // came from this aso's pool (POOLED_TABLE).
                                 unsafe { aso.free_pt_page(pt_pa) };
                                 freed += 1;
                             }
                         }
                         va2 = l2_end;
                     }
-                    if table_is_empty(pd) && aso.owns_phys(pd_pa)
+                    if table_is_empty(pd) && e3.0 & POOLED_TABLE != 0
                     {
                         pdpt[l3] = PageTableEntry(0);
-                        // SAFETY: PD is empty and unlinked above; aso-owned.
+                        // SAFETY: PD is empty and unlinked above; pool-owned.
                         unsafe { aso.free_pt_page(pd_pa) };
                         freed += 1;
                     }
                 }
                 va3 = l3_end;
             }
-            if table_is_empty(pdpt) && aso.owns_phys(pdpt_pa)
+            if table_is_empty(pdpt) && e4.0 & POOLED_TABLE != 0
             {
                 pml4[l4] = PageTableEntry(0);
-                // SAFETY: PDPT is empty and unlinked above; aso-owned.
+                // SAFETY: PDPT is empty and unlinked above; pool-owned.
                 unsafe { aso.free_pt_page(pdpt_pa) };
                 freed += 1;
             }

@@ -106,7 +106,7 @@ registered page fails with `InvalidArgument`, and a sender page unmapped at
 copy time surfaces the copy fault (`InvalidAddress`), while delivery-side
 writes are best-effort — an unregistered or unmapped receiver page silently
 drops the data words and cap results; the drop fails no syscall on either
-side. No heap allocation occurs.
+side. Nothing is allocated on the path.
 
 ### Receive Path (Server)
 
@@ -486,9 +486,9 @@ enum WaitSetSource
 }
 ```
 
-The fixed-capacity arrays avoid heap allocation on the notification hot path.
-`waitset_notify` runs under the source object lock; heap allocation there would
-require a second lock (the allocator lock) and create a lock-ordering hazard.
+The arrays are fixed-capacity because the kernel runs no allocator: a wait
+set's membership storage is part of the object carved at creation, and
+`waitset_notify`, under the source object lock, only walks it.
 
 ### Readiness Notification
 

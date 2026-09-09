@@ -64,7 +64,7 @@ impl RunQueue
         // rather than `debug_assert!` so it can read the debug-only
         // `last_enqueue` breadcrumb field, which is absent in release.
         #[cfg(debug_assertions)]
-        // SAFETY: tcb is a valid heap-allocated TCB pointer; the caller holds
+        // SAFETY: tcb is a valid live TCB pointer; the caller holds
         // the owning scheduler.lock so these fields are stable.
         unsafe {
             let tid = (*tcb).thread_id;
@@ -85,7 +85,7 @@ impl RunQueue
                 head = self.head,
             );
         }
-        // SAFETY: tcb is a valid heap-allocated TCB pointer.
+        // SAFETY: tcb is a valid live TCB pointer.
         unsafe { (*tcb).run_queue_next = None };
 
         match self.tail
@@ -97,7 +97,7 @@ impl RunQueue
             }
             Some(tail) =>
             {
-                // SAFETY: tail is a valid heap-allocated TCB pointer.
+                // SAFETY: tail is a valid live TCB pointer.
                 unsafe { (*tail).run_queue_next = Some(tcb) };
                 self.tail = Some(tcb);
             }
@@ -167,7 +167,7 @@ impl RunQueue
                     None => self.head = next,
                     Some(p) =>
                     {
-                        // SAFETY: prev is a valid heap-allocated TCB pointer.
+                        // SAFETY: prev is a valid live TCB pointer.
                         unsafe { (*p).run_queue_next = next }
                     }
                 }

@@ -199,7 +199,7 @@ services, and talks to devmgr, all from the endowment.
   `INIT_REAP_CORRELATOR`) fires and runs
   [`init_reap::run_reap`](../../procmgr/src/init_reap.rs): both
   Thread caps are deleted, init's `AddressSpace` is revoked +
-  deleted (PT chunks `retype_free`'d, user-page mappings
+  deleted (its pool donations `retype_free`'d, user-page mappings
   vanish), the accumulated Memory caps are `DONATE_MEMORY_CAPS`'d to
   memmgr's pool, init's `CSpace` is revoked + deleted (cascading
   dec_ref through init's remaining caps — endpoint SENDs and the

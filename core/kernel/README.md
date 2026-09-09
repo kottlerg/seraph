@@ -35,36 +35,36 @@ kernel/
 │   │   │   ├── mod.rs
 │   │   │   ├── paging.rs       # Page table management (PML4/PML3/PML2/PML1)
 │   │   │   ├── context.rs      # Thread context save/restore, context switch
+│   │   │   ├── trap_frame.rs   # Trap/syscall frame: user register snapshot
 │   │   │   ├── interrupts.rs   # IDT, exception handlers, APIC
+│   │   │   ├── idt.rs          # Interrupt Descriptor Table
+│   │   │   ├── ioapic.rs       # I/O APIC driver
 │   │   │   ├── timer.rs        # TSC-deadline / periodic-APIC timer for preemption
 │   │   │   ├── syscall.rs      # SYSCALL/SYSRET entry glue
 │   │   │   ├── cpu.rs          # CPUID, topology, per-CPU state (GDT/TSS)
-│   │   │   ├── console.rs      # Early framebuffer/serial output
-│   │   │   ├── entropy.rs      # Hardware RNG (RDSEED/RDRAND) + cycle counter
-│   │   │   ├── ap_trampoline.rs # AP SIPI startup trampoline
-│   │   │   ├── fpu.rs          # Extended-state (x87/SSE/AVX) control
 │   │   │   ├── gdt.rs          # Global Descriptor Table and TSS
-│   │   │   ├── idt.rs          # Interrupt Descriptor Table
-│   │   │   ├── ioapic.rs       # I/O APIC driver
+│   │   │   ├── fpu.rs          # Extended-state (x87/SSE/AVX) control
+│   │   │   ├── ap_trampoline.rs # AP SIPI startup trampoline
 │   │   │   ├── platform.rs     # Bootloader-discovered hardware accessors
-│   │   │   └── trap_frame.rs   # Trap/syscall frame: user register snapshot
+│   │   │   ├── console.rs      # Early framebuffer/serial output
+│   │   │   └── entropy.rs      # Hardware RNG (RDSEED/RDRAND) + cycle counter
 │   │   └── riscv64/            # RISC-V implementation
 │   │       ├── mod.rs
 │   │       ├── paging.rs       # Page table management (mode-parameterized)
 │   │       ├── context.rs      # Thread context save/restore, context switch
+│   │       ├── trap_frame.rs   # Trap frame: user register snapshot
 │   │       ├── interrupts.rs   # stvec, trap handler, PLIC
+│   │       ├── idt.rs          # IDT stub
+│   │       ├── sbi.rs          # Generic SBI ecall forwarding
 │   │       ├── timer.rs        # Sstc (stimecmp) timer for preemption
 │   │       ├── syscall.rs      # ECALL entry glue
 │   │       ├── cpu.rs          # Hart ID, topology, per-hart state
-│   │       ├── console.rs      # Early SBI console / framebuffer output
-│   │       ├── entropy.rs      # Hardware RNG (none; jitter-only) + cycle counter
-│   │       ├── ap_trampoline.rs # AP startup trampoline (SBI HSM hart_start)
-│   │       ├── fpu.rs          # Extended-state (F/D/V) control
 │   │       ├── gdt.rs          # GDT stub
-│   │       ├── idt.rs          # IDT stub
+│   │       ├── fpu.rs          # Extended-state (F/D/V) control
+│   │       ├── ap_trampoline.rs # AP startup trampoline (SBI HSM hart_start)
 │   │       ├── platform.rs     # Bootloader-discovered hardware accessors
-│   │       ├── sbi.rs          # Generic SBI ecall forwarding
-│   │       └── trap_frame.rs   # Trap frame: user register snapshot
+│   │       ├── console.rs      # Early SBI console / framebuffer output
+│   │       └── entropy.rs      # Hardware RNG (none; jitter-only) + cycle counter
 │   ├── mm/                     # Memory management subsystem
 │   │   ├── mod.rs
 │   │   ├── buddy.rs            # Physical frame allocator (buddy algorithm)

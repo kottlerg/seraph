@@ -200,13 +200,13 @@ const WS_BADGE_SERVICE: u64 = 0;
 const WS_BADGE_DEATH: u64 = 1;
 
 /// Pages requested from memmgr per spawned child for the child's Thread
-/// retype slab. The kernel consumes `KERNEL_STACK_PAGES + 1 = 5` pages
-/// (4 kstack + 1 wrapper/TCB); the sixth page is slack over that count.
+/// retype slab: `KERNEL_STACK_PAGES + 2 = 6` pages (4 kstack, 1
+/// wrapper/TCB, 1 extended-state save area), all consumed by the kernel.
 pub(crate) const THREAD_RETYPE_PAGES: u64 = 6;
 
 /// Pages requested from memmgr for the child's `AddressSpace` retype slab.
-/// Page 0 holds the wrapper and page 1 the root PT; the remaining pages
-/// form the initial PT growth pool.
+/// Every page reaches the kernel: page 0 holds the wrapper, page 1 the
+/// root PT, and the remaining 46 form the initial PT growth pool.
 ///
 /// Sized to cover the typical small-process mapping pattern: 3-6 LOAD
 /// segments + stack + IPC buffer + TLS + `ProcessInfo` memory cap. Each
@@ -227,8 +227,8 @@ pub(crate) const ASPACE_RETYPE_PAGES: u64 = 48;
 /// Seeded for the expected startup population of a spawned child
 /// (bootstrap caps plus working headroom); a child that outgrows the
 /// pool sees the refillable `OutOfMemory` and self-funds via
-/// augment-mode `cap_create_cspace`. 7 pages → page 0 is the wrapper →
-/// 6 slot pages → 6 × 56 − 1 = 335 usable slots.
+/// augment-mode `cap_create_cspace`. All 7 pages reach the kernel: page
+/// 0 is the wrapper, the 6 slot pages give 6 × 56 − 1 = 335 usable slots.
 pub(crate) const CSPACE_RETYPE_PAGES: u64 = 7;
 
 /// Register a new child with memmgr. On success returns

@@ -45,9 +45,9 @@ pub(crate) const INIT_IPC_BUF_VA: u64 = 0x0000_0000_C000_0000;
 /// retype reserve of init's and the tier-1 services' bootstrap arenas.
 pub(crate) const THREAD_RETYPE_PAGES: u64 = 6;
 
-/// Pages init carves for memmgr/procmgr's `AddressSpace`. Page 0 holds
-/// the wrapper and page 1 the root PT; the remaining pages form the
-/// initial PT growth pool. Mirrors procmgr's constant,
+/// Pages init carves for memmgr/procmgr's `AddressSpace`, all reaching
+/// the kernel: page 0 holds the wrapper, page 1 the root PT, and the
+/// remaining 46 form the initial PT growth pool. Mirrors procmgr's constant,
 /// including the ASLR (#39) headroom for bootstrap surfaces spread across
 /// distinct 64 GiB window strides (~13 pooled pages vs ~3 clustered).
 pub(crate) const ASPACE_RETYPE_PAGES: u64 = 48;
@@ -61,8 +61,10 @@ pub(crate) const ASPACE_RETYPE_PAGES: u64 = 48;
 /// system's whole lifetime (memmgr: per-allocation Memory caps;
 /// procmgr: per-child aspace/cspace/thread/slab caps), so their pools
 /// are seeded deep — an under-seeded pool wedges the service on pool
-/// exhaustion with no one positioned to augment it. 149 pages → page 0
-/// is the wrapper → 148 slot pages → 148 × 56 − 1 = 8287 usable slots.
+/// exhaustion with no one positioned to augment it. All 149 pages reach
+/// the kernel: page 0 is the wrapper; of the 148 pool pages, one becomes
+/// the directory page for leaves past the 128 direct ones, so 147 leaves
+/// give 147 × 56 − 1 = 8231 usable slots.
 pub(crate) const CSPACE_RETYPE_PAGES: u64 = 149;
 
 /// Base for init's scratch mappings (`ProcessInfo` memory caps, ELF pages).

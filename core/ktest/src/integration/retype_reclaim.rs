@@ -25,13 +25,10 @@
 //!
 //! ## Test isolation
 //!
-//! Every retype runs against `ctx.memory_base`. A throwaway
-//! `cap_create_endpoint` + delete pays the per-`MemoryObject` allocator-
-//! metadata cost (paid once on the cap's lifetime) before the baseline
-//! read, so the post-mint-then-delete equality check reflects steady
-//! state. If an earlier test already paid the metadata cost, the warmup
-//! is a no-op and the baseline simply reflects current `available_bytes`
-//! — the round-trip equality still holds either way.
+//! Every retype runs against `ctx.memory_base`. The baseline is the cap's
+//! `available_bytes` before the first mint; every mint-then-delete pair
+//! must return the cap to it, since a retype debits exactly its class-
+//! rounded cost and the matching free credits exactly that.
 
 use syscall::{
     cap_create_aspace, cap_create_cspace, cap_create_endpoint, cap_create_notification,
@@ -66,13 +63,6 @@ fn assert_baseline(label: &'static str, memory_cap: u32, baseline: u64) -> TestR
 pub fn run(ctx: &TestContext) -> TestResult
 {
     let memory = ctx.memory_base;
-
-    // Warm the cap's allocator with one mint-and-delete cycle before
-    // taking the baseline, so the baseline reflects the steady state the
-    // measured cycles below run in.
-    let warmup = cap_create_endpoint(memory)
-        .map_err(|_| "integration::retype_reclaim: warmup cap_create_endpoint failed")?;
-    cap_delete(warmup).map_err(|_| "integration::retype_reclaim: warmup cap_delete failed")?;
 
     let baseline = read_available(memory)?;
 

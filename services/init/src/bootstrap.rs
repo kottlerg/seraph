@@ -114,13 +114,11 @@ fn log_hex(prefix: &str, value: u64)
 // never frees into the post-handoff buddy.
 
 /// Front region of a tier-1 service arena reserved for the three kernel-object
-/// retypes. `AddressSpace` and `CSpace` each consume `*_RETYPE_PAGES - 1` pages
-/// (the value passed as their growth budget); `Thread` consumes
-/// `THREAD_RETYPE_PAGES`. The retype bump is page-aligned and monotonic, so
-/// backing offsets at or above this bound never collide with a retype slab.
-const RETYPE_RESERVE_PAGES: u64 = (crate::ASPACE_RETYPE_PAGES - 1)
-    + (crate::CSPACE_RETYPE_PAGES - 1)
-    + crate::THREAD_RETYPE_PAGES;
+/// retypes, each of which consumes its `*_RETYPE_PAGES` pages. The retype bump
+/// is page-aligned and monotonic, so backing offsets at or above this bound
+/// never collide with a retype slab.
+const RETYPE_RESERVE_PAGES: u64 =
+    crate::ASPACE_RETYPE_PAGES + crate::CSPACE_RETYPE_PAGES + crate::THREAD_RETYPE_PAGES;
 
 /// Front region of init's own arena reserved for its kernel-object retypes.
 ///
@@ -792,10 +790,8 @@ pub fn bootstrap_memmgr(
     let backing_pages = elf_backing_pages(ehdr, module_bytes)? + 1 + u64::from(stack_pages) + 1;
     let mut arena = BootArena::carve(alloc, init_aspace, backing_pages)?;
 
-    let mm_aspace =
-        syscall::cap_create_aspace(arena.cap, 0, crate::ASPACE_RETYPE_PAGES - 1).ok()?;
-    let mm_cspace =
-        syscall::cap_create_cspace(arena.cap, 0, crate::CSPACE_RETYPE_PAGES - 1).ok()?;
+    let mm_aspace = syscall::cap_create_aspace(arena.cap, 0, crate::ASPACE_RETYPE_PAGES).ok()?;
+    let mm_cspace = syscall::cap_create_cspace(arena.cap, 0, crate::CSPACE_RETYPE_PAGES).ok()?;
     // memmgr is the system pager: create its thread at the top of the
     // baseline band so nothing it serves can preempt it.
     let mm_thread = syscall::cap_create_thread(
@@ -1500,10 +1496,8 @@ pub fn bootstrap_procmgr(
         + 1;
     let mut arena = BootArena::carve(alloc, init_aspace, backing_pages)?;
 
-    let pm_aspace =
-        syscall::cap_create_aspace(arena.cap, 0, crate::ASPACE_RETYPE_PAGES - 1).ok()?;
-    let pm_cspace =
-        syscall::cap_create_cspace(arena.cap, 0, crate::CSPACE_RETYPE_PAGES - 1).ok()?;
+    let pm_aspace = syscall::cap_create_aspace(arena.cap, 0, crate::ASPACE_RETYPE_PAGES).ok()?;
+    let pm_cspace = syscall::cap_create_cspace(arena.cap, 0, crate::CSPACE_RETYPE_PAGES).ok()?;
     // procmgr sits directly below memmgr: above every process it manages,
     // preemptible only by its own pager.
     let pm_thread = syscall::cap_create_thread(

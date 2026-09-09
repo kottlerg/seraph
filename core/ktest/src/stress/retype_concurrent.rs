@@ -58,12 +58,7 @@ static WORKER_ARGS: ArgBlock<WorkerArgs, NUM_WORKERS> = ArgBlock::new(WorkerArgs
 
 pub fn run(ctx: &TestContext) -> TestResult
 {
-    // Warm ctx.memory_base's allocator with one mint-and-delete cycle so
-    // the post-stress baseline is compared against a steady-state one.
     let memory = ctx.memory_base;
-    let warm = syscall::cap_create_endpoint(memory)
-        .map_err(|_| "stress::retype_concurrent: warmup endpoint failed")?;
-    cap_delete(warm).ok();
     let baseline = cap_info(memory, CAP_INFO_MEMORY_AVAILABLE)
         .map_err(|_| "stress::retype_concurrent: cap_info(baseline) failed")?;
 

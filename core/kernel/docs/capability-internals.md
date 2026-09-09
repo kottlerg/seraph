@@ -148,10 +148,9 @@ The wrapper object that owns a `CSpace` (`CSpaceKernelObject`) keeps the
 slot-page pool in a `PagePool`; the wrapper of an `AddressSpace` keeps its
 intermediate page-table pool in the same type. A pool is an intrusive free
 list of the donated pages (each free page's first word links the next) plus
-a record of every donation — its source Memory object, byte offset, and
-page count — so teardown can return each donation
-to its source wholesale. The wrapper, not the pool, keeps the byte budget
-the pool backs.
+a record of every donation — its source Memory object, byte offset, and page
+count — so teardown can return each donation to its source wholesale. The
+wrapper, not the pool, keeps the byte budget the pool backs.
 
 ### Donation Records
 
@@ -166,15 +165,15 @@ only by the memory donated — one donated page of bookkeeping per record
 page. A one-page donation that opens a record page seeds nothing; the
 budget reported by `SYS_CAP_INFO` is authoritative.
 
-A record page is kernel state kept in donated memory, like the wrapper
-page, the slot pages, and the page tables themselves: the kernel trusts its
+A record page is kernel state kept in donated memory, like the wrapper page,
+the slot pages, and the page tables themselves: the kernel trusts its
 contents, and the donating Memory capability's holder is trusted not to map
 what it has retyped away, which the kernel does not yet enforce
 ([#433](https://github.com/kottlerg/seraph/issues/433)). The records are
 never scanned while the owner is live: an address space's reclaiming unmap
 recognises pool-owned page tables by a bit in the parent entry, not by the
-records; see
-[memory-internals.md](memory-internals.md) § Page Table Node Ownership.
+records; see [memory-internals.md](memory-internals.md) § Page Table Node
+Ownership.
 
 ### Teardown
 
@@ -185,23 +184,23 @@ reaches zero there is reclaimed through its own nested cascade, not the
 bounded worklist the dealloc cascade otherwise uses, since the number of
 donations is unbounded.
 
-The walk costs one `retype_free` per donation, holds no lock across
-records (each return takes only its ancestor's cap lock, so unlike a
-`CSpace`'s derivation drain it is not batched), and runs to completion in
-whichever context drops the last reference: the deleting syscall, with
-interrupts masked on that CPU; or, when the owner is handed to the per-CPU
-deferred-reclaim stack — a thread deleting an object it is itself bound
-to, or the batched capability move releasing any `CSpace` or
-`AddressSpace` — the next syscall epilogue on that CPU, with interrupts
-masked, or the idle thread's drain, with interrupts enabled
+The walk costs one `retype_free` per donation, holds no lock across records
+(each return takes only its ancestor's cap lock, so unlike a `CSpace`'s
+derivation drain it is not batched), and runs to completion in whichever
+context drops the last reference: the deleting syscall, with interrupts
+masked on that CPU; or, when the owner is handed to the per-CPU
+deferred-reclaim stack — a thread deleting an object it is itself bound to,
+or the batched capability move releasing any `CSpace` or `AddressSpace` —
+the next syscall epilogue on that CPU, with interrupts masked, or the idle
+thread's drain, with interrupts enabled
 ([scheduling-internals.md](scheduling-internals.md) § Bare spin locks). So
-an owner's teardown latency
-scales with how finely it donated, and can land on an unrelated thread's
-syscall: the same memory donated as single pages costs one return per
-page. The standard runtime donates one page per page-table shortfall, so
-a process's count is its page-table page count, of the order of one per
-2 MiB of mapped span. Bounding the walk, and the seeding of one donation,
-within a syscall is [#434](https://github.com/kottlerg/seraph/issues/434).
+an owner's teardown latency scales with how finely it donated, and can land
+on an unrelated thread's syscall: the same memory donated as single pages
+costs one return per page. The standard runtime donates one page per
+page-table shortfall, so a process's count is its page-table page count, of
+the order of one per 2 MiB of mapped span. Bounding the walk, and the
+seeding of one donation, within a syscall is
+[#434](https://github.com/kottlerg/seraph/issues/434).
 
 ---
 

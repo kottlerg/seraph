@@ -512,6 +512,8 @@ const INLINE_RECORDS: usize = 16;
 ///
 /// At dealloc, every non-vacant record is fed back to its `ancestor`
 /// `MemoryObject` via `retype_free`, then the ancestor is `dec_ref`'d.
+/// The type builds in every configuration because the wrapper structs
+/// embed it; only the non-test pool code reads it.
 #[repr(C)]
 struct InlineRecord
 {

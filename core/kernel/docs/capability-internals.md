@@ -169,9 +169,11 @@ A record page is kernel state kept in donated memory, like the wrapper page,
 the slot pages, and the page tables themselves: the kernel trusts its
 contents, and the donating Memory capability's holder is trusted not to map
 what it has retyped away, which the kernel does not yet enforce
-([#433](https://github.com/kottlerg/seraph/issues/433)). The records are
-never scanned while the owner is live: an address space's reclaiming unmap
-recognises pool-owned page tables by a bit in the parent entry, not by the
+([#433](https://github.com/kottlerg/seraph/issues/433));
+[cross-boundary-disclosure.md](cross-boundary-disclosure.md) § Kernel state
+in donated memory records that surface. The records are never scanned while
+the owner is live: an address space's reclaiming unmap recognises pool-owned
+page tables by a bit in the parent entry, not by the
 records; see [memory-internals.md](memory-internals.md) § Page Table Node
 Ownership.
 
@@ -836,4 +838,5 @@ CSpace. The kernel clears the per-thread reply slot after `SYS_IPC_REPLY`.
 [docs/capability-model.md](../../../docs/capability-model.md),
 [docs/ipc-design.md](../../../docs/ipc-design.md),
 [kernel/docs/syscalls.md](syscalls.md),
-[kernel/docs/memory-internals.md](memory-internals.md)
+[kernel/docs/memory-internals.md](memory-internals.md),
+[kernel/docs/cross-boundary-disclosure.md](cross-boundary-disclosure.md)

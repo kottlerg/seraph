@@ -248,7 +248,7 @@ pub extern "C" fn _start(info_ptr: u64) -> !
 /// from memmgr; ktest has no memmgr, so it draws on the kernel-minted RAM caps it
 /// inherits as init.
 ///
-/// Post-Gap-B, `sys_mmio_map` and `sys_mem_map` into ktest's retype-backed boot
+/// `sys_mmio_map` and `sys_mem_map` into ktest's retype-backed boot
 /// AS draw intermediate PT pages from that AS's own pool, not the fixed kernel
 /// reserve. The seeded `INIT_ASPACE_PAGES` pool sizes init's own bootstrap
 /// footprint; ktest additionally maps the framebuffer and serial MMIO and runs

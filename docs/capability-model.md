@@ -543,8 +543,9 @@ the budget returns `OutOfMemory` (-8); the budget refills via *augment
 mode* on the same create syscall (passing the existing AS/CS slot as the
 augment target merges a new slab of pages into its growth budget).
 Donations are unbounded in number: the kernel keeps its donation
-bookkeeping inside the donated pages themselves, so a donation
-occasionally seeds one page fewer than it carried; the budget reported by
+bookkeeping inside the donated pages themselves, so once per record page
+of bookkeeping a donation seeds one page fewer than it carried; the budget
+reported by
 `SYS_CAP_INFO` is authoritative. See
 [capability-internals.md](../core/kernel/docs/capability-internals.md)
 § Page Pools.

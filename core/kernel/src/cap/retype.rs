@@ -345,8 +345,8 @@ unsafe fn push_subpage(alloc: &RetypeAllocator, memory: &MemoryObject, bin: usiz
 
 /// Predecessor pointer for the page-aligned free-list walk.
 ///
-/// The list head lives in the `RetypeAllocator` (which itself sits at
-/// offset 0 of the cap region); mid-list next-pointers live inline at
+/// The list head lives in the `RetypeAllocator` (inline in the
+/// `MemoryObject`, in kernel-owned memory); mid-list next-pointers live inline at
 /// `memory.base + offset + 8`. The two storage shapes need different
 /// update paths, captured here.
 enum PagePrev

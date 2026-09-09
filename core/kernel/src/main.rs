@@ -693,8 +693,8 @@ unsafe fn kernel_entry_post_rebase(
         // kernel-direct call whose intermediate PT pages come from
         // `kernel_pt_pool`, not this wrapper's pool. The wrapper's pool
         // serves init's userspace pooled paths: `sys_mem_map`
-        // (TEMP_MAP_BASE + ELF_PAGE_TEMP_VA scratch) and, post-Gap-B,
-        // `sys_mmio_map` for init's own MMIO (the riscv64 serial UART, one
+        // (TEMP_MAP_BASE + ELF_PAGE_TEMP_VA scratch) and `sys_mmio_map`
+        // for init's own MMIO (the riscv64 serial UART, one
         // page). 16 pool pages cover that footprint with margin.
         #[allow(clippy::items_after_statements)]
         const INIT_ASPACE_PAGES: u64 = 18;

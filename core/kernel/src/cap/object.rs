@@ -30,8 +30,9 @@
 //! Compile-time assertions cover each wrapper page — an `AddressSpaceObject`
 //! followed by its in-place `AddressSpace`, a `CSpaceKernelObject` followed
 //! by its inline `CSpace` — fitting one page, a `RecordPage` fitting one
-//! page, and its records starting at `RECORD_PAGE_HEADER`; the pool types
-//! assert no other size.
+//! page, and its records starting at `RECORD_PAGE_HEADER`. The header and
+//! sub-page object sizes the retype bins depend on are asserted in
+//! `cap/retype.rs`.
 
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
@@ -576,11 +577,10 @@ impl DonationRecord
 
 /// Pages `PagePool::seed_pages` pushes per pool-lock hold. The pool lock is a
 /// bare spin lock (scheduling-internals.md § Bare spin locks), and a hold
-/// proportional to a
-/// caller-chosen donation size would be unbounded; batching keeps every
-/// hold to this many pushes. The interrupts-off window of the syscall that
-/// seeds a donation is the sum of its batches, `init_pages` pushes chosen by
-/// the caller, and is not bounded here (#434).
+/// proportional to a caller-chosen donation size would be unbounded; batching
+/// keeps every hold to this many pushes. The interrupts-off window of the
+/// syscall that seeds a donation is the sum of its batches, `init_pages`
+/// pushes chosen by the caller, and is not bounded here (#434).
 #[cfg(not(test))]
 const SEED_BATCH_PAGES: u64 = 64;
 
@@ -960,7 +960,7 @@ pub struct AddressSpaceObject
     /// Seeded at retype time from the source Memory cap's `available_bytes`.
     /// Refilled via augment-mode on `SYS_CAP_CREATE_ASPACE`
     /// (`cap_create_aspace(memory_cap, target_aspace_cap)`). `mem_map` returns
-    /// `NoMemory` if a new PT page is needed but the budget is exhausted.
+    /// `OutOfMemory` if a new PT page is needed but the budget is exhausted.
     pub pt_growth_budget_bytes: AtomicU64,
     /// Intermediate page-table pages donated to this AS, and the record of
     /// every donation; `dealloc` reclaims the donations wholesale.
@@ -992,7 +992,7 @@ pub struct CSpaceKernelObject
     /// Seeded at retype time from the source Memory cap's `available_bytes`.
     /// Refilled via augment-mode on `SYS_CAP_CREATE_CSPACE`
     /// (`cap_create_cspace(memory_cap, target_cspace_cap)`).
-    /// `cspace_grow` returns `NoMemory` if a new slot page is needed but the
+    /// `CSpace::grow` returns `OutOfMemory` if a new slot page is needed but the
     /// budget is exhausted.
     pub cspace_growth_budget_bytes: AtomicU64,
     /// Slot and directory pages donated to this `CSpace`, and the record of

@@ -54,8 +54,8 @@ pub(crate) const ASPACE_RETYPE_PAGES: u64 = 48;
 
 /// Pages init carves for memmgr/procmgr's `CSpace`. Each slot page holds
 /// `L2_SIZE` capability slots (currently 56 slots × 72 B = 4032 B/page);
-/// the kernel reserves the slab's page 0 as the wrapper page. Mirrors
-/// procmgr's constant.
+/// the kernel reserves the slab's page 0 as the wrapper page. Deeper than
+/// procmgr's per-child constant, for the reason below.
 ///
 /// Both tier-1 services are immortal and accumulate caps for the
 /// system's whole lifetime (memmgr: per-allocation Memory caps;

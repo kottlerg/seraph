@@ -125,7 +125,7 @@ pub(crate) unsafe fn init(seed_pages: usize)
 ///
 /// Returns `None` if the pool is exhausted. Callers should propagate
 /// upward (`map_user_page` returns `Err(())`, surfacing as
-/// `SyscallError::NoMemory` or `fatal()` in the boot bootstrap path).
+/// `SyscallError::OutOfMemory` or `fatal()` in the boot bootstrap path).
 #[cfg(not(test))]
 #[track_caller]
 pub(crate) fn alloc_pt_page() -> Option<u64>

@@ -619,7 +619,7 @@ fn user_walk_or_alloc(entry: &mut PageTableEntry) -> Result<u64, ()>
 /// pool.
 ///
 /// Each new PT page debits the AS's `pt_growth_budget_bytes`. Exhaustion
-/// returns `Err(())`; the caller surfaces this as `SyscallError::NoMemory`
+/// returns `Err(())`; the caller surfaces this as `SyscallError::OutOfMemory`
 /// so userspace can refill via augment-mode `cap_create_aspace`.
 ///
 /// # Safety

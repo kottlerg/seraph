@@ -19,7 +19,8 @@
 See [docs/coding-standards.md](../docs/coding-standards.md) — non-negotiable authority.
 
 ## Documentation invariants
-See [docs/documentation-standards.md](../docs/documentation-standards.md) — non-negotiable authority.
+See [docs/documentation-standards.md](../docs/documentation-standards.md) — non-negotiable
+authority.
 
 ## Project conventions
 See [docs/conventions.md](../docs/conventions.md) for versioning, backlog tracking (GitHub Issues),
@@ -46,29 +47,35 @@ truth for "how work is tracked and shipped" on this project.
   `gh pr checks <N> --watch` (or `gh run watch <run-id>`) as a backgrounded
   `Bash` invocation (`run_in_background: true`). Do not poll, do not sleep —
   the harness notifies on completion.
-- On green: confirm the pass in one line, then run the pre-merge audit
-  before prompting for merge. Invoke both audit agents in parallel (single
-  message, two `Agent` tool calls). The invocation prompt MUST supply the
-  PR number (or the feature-branch name when no PR exists yet) as the
-  per-PR scope; the agents discover binding authority from the repo
-  themselves.
-  1. `@pr-reviewer` — adversarial code review of the diff and its blast
-     radius.
-  2. `@pr-auditor` — PR-body checklist, linked-issue Acceptance closure,
-     silent-deferral, test-plan honesty, and commit-message compliance
-     audit.
+- On green: confirm the pass in one line, then run the pre-merge review
+  before prompting for merge. The review is the saved `pr-review`
+  workflow; this bullet is the maintainer's standing request to run it:
+  `Workflow({name: "pr-review", args: {pr: <N>, mode: "full"}})` for the
+  first run on a PR, then `mode: "delta"` with `since` set to the head
+  the previous run reviewed. It shards the diff across parallel
+  `@pr-reviewer` agents, adversarially verifies each finding, runs
+  `@pr-auditor` alongside, and returns one report with a reviewer verdict
+  (`READY TO MERGE`, `BLOCKING ISSUES`, `NON-BLOCKING ISSUES ONLY`) and
+  an audit verdict (`AUDIT PASS`, `AUDIT FAIL`). Save the report under
+  `target/xtask/review/pr<N>/` and surface both verdict lines to the user
+  verbatim. If the Workflow tool is unavailable, invoke `@pr-reviewer`
+  and `@pr-auditor` directly in parallel (single message, two `Agent`
+  tool calls) with the PR number as scope and the same verdict handling.
 
-  Surface both verdict lines to the user verbatim. If `pr-auditor` reports
-  `AUDIT FAIL`, resolve the named items (`gh pr edit`, `gh issue edit`, or
-  additional commits) before continuing. If `pr-reviewer` reports
-  `BLOCKING ISSUES`, address them in additional commits before continuing.
-  Non-blocking reviewer findings MAY be deferred only with a one-line
-  rationale to the user. A finding that names a MUST violation of the
-  standards is not deferrable whatever severity the reviewer gave it; it
-  is fixed before the merge prompt.
+  Findings are fixed as one batch per run, whatever their severity:
+  `AUDIT FAIL` items via `gh pr edit`, `gh issue edit`, or commits;
+  reviewer findings via commits. A finding the verifiers contested is put
+  to the user; it resolves as a fix or, when it misreads a rule, as a
+  clarification of that rule's text in the same PR. No finding is
+  waived, ruled, or exempted anywhere but in the standards themselves. A
+  finding that names a MUST violation of the standards is not deferrable
+  whatever severity the reviewer gave it; it is fixed before the merge
+  prompt. A genuine deferral is an Issue filed with the user's approval,
+  per "Completeness" below.
 
-  Only after both verdicts clear (or are explicitly waived by the user),
-  prompt for the merge decision. Merge via
+  After the fixes are pushed and CI is green again, run the workflow in
+  `delta` mode. Prompt for the merge decision only when a run returns no
+  findings and `AUDIT PASS`. Merge via
   `gh pr merge <N> --merge --delete-branch`.
 - On red: surface the failing job's tail (`gh run view <run-id> --log-failed`
   or equivalent) so the user can see the actual error without asking.

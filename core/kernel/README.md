@@ -20,43 +20,67 @@ kernel/
 │   └── riscv64.ld              # Linker script for RISC-V
 ├── src/
 │   ├── main.rs                 # kernel_entry() — arch-neutral init sequence
+│   ├── console.rs              # Early console: serial and framebuffer output
+│   ├── cpu_mask.rs             # Fixed-capacity sets of logical CPU indices
+│   ├── framebuffer.rs          # Framebuffer text renderer
+│   ├── irq.rs                  # IRQ routing table: lines to notification objects
+│   ├── percpu.rs               # Per-CPU private state
+│   ├── platform.rs             # Phase 6 platform resource validation
+│   ├── sync.rs                 # Kernel synchronisation primitives
+│   ├── uaccess.rs              # Fault-recoverable user-memory copies
+│   ├── validate.rs             # Phase 0 boot-info validation
 │   ├── arch/                   # Architecture-specific implementations
 │   │   ├── mod.rs              # Re-exports the active arch module
 │   │   ├── x86_64/             # x86-64 implementation
 │   │   │   ├── mod.rs
 │   │   │   ├── paging.rs       # Page table management (PML4/PML3/PML2/PML1)
 │   │   │   ├── context.rs      # Thread context save/restore, context switch
+│   │   │   ├── trap_frame.rs   # Trap/syscall frame: user register snapshot
 │   │   │   ├── interrupts.rs   # IDT, exception handlers, APIC
+│   │   │   ├── idt.rs          # Interrupt Descriptor Table
+│   │   │   ├── ioapic.rs       # I/O APIC driver
 │   │   │   ├── timer.rs        # TSC-deadline / periodic-APIC timer for preemption
 │   │   │   ├── syscall.rs      # SYSCALL/SYSRET entry glue
 │   │   │   ├── cpu.rs          # CPUID, topology, per-CPU state (GDT/TSS)
+│   │   │   ├── gdt.rs          # Global Descriptor Table and TSS
+│   │   │   ├── fpu.rs          # Extended-state (x87/SSE/AVX) control
+│   │   │   ├── ap_trampoline.rs # AP SIPI startup trampoline
+│   │   │   ├── platform.rs     # Bootloader-discovered hardware accessors
 │   │   │   ├── console.rs      # Early framebuffer/serial output
 │   │   │   └── entropy.rs      # Hardware RNG (RDSEED/RDRAND) + cycle counter
 │   │   └── riscv64/            # RISC-V implementation
 │   │       ├── mod.rs
 │   │       ├── paging.rs       # Page table management (mode-parameterized)
 │   │       ├── context.rs      # Thread context save/restore, context switch
+│   │       ├── trap_frame.rs   # Trap frame: user register snapshot
 │   │       ├── interrupts.rs   # stvec, trap handler, PLIC
+│   │       ├── idt.rs          # IDT stub
+│   │       ├── sbi.rs          # Generic SBI ecall forwarding
 │   │       ├── timer.rs        # Sstc (stimecmp) timer for preemption
 │   │       ├── syscall.rs      # ECALL entry glue
 │   │       ├── cpu.rs          # Hart ID, topology, per-hart state
+│   │       ├── gdt.rs          # GDT stub
+│   │       ├── fpu.rs          # Extended-state (F/D/V) control
+│   │       ├── ap_trampoline.rs # AP startup trampoline (SBI HSM hart_start)
+│   │       ├── platform.rs     # Bootloader-discovered hardware accessors
 │   │       ├── console.rs      # Early SBI console / framebuffer output
 │   │       └── entropy.rs      # Hardware RNG (none; jitter-only) + cycle counter
 │   ├── mm/                     # Memory management subsystem
 │   │   ├── mod.rs
 │   │   ├── buddy.rs            # Physical frame allocator (buddy algorithm)
-│   │   ├── slab.rs             # Slab allocator for fixed-size kernel objects
-│   │   ├── size_class.rs       # General size-class allocator (heap)
+│   │   ├── paging.rs           # Phase 3 kernel page tables and the direct physical map
 │   │   ├── address_space.rs    # Virtual address space objects and lifecycle
+│   │   ├── init.rs             # Boot memory-map parsing; seeds the buddy allocator
 │   │   ├── init_reloc.rs       # Phase 9 PIE init fix-ups: RELATIVE relocation + RELRO sealing
 │   │   ├── kernel_pt_pool.rs   # Cap-backed pool for intermediate PT frames
+│   │   ├── tag_allocator.rs    # PCID/ASID tag allocation
 │   │   └── tlb_shootdown.rs    # Cross-CPU TLB shootdown protocol (per-CPU request slots)
 │   ├── cap/                    # Capability subsystem
 │   │   ├── mod.rs
 │   │   ├── cspace.rs           # CSpace: slot storage, lookup, growth
 │   │   ├── slot.rs             # Capability slot representation and rights
 │   │   ├── derivation.rs       # Derivation tree, revocation algorithm
-│   │   ├── object.rs           # Kernel object headers, allocation, teardown
+│   │   ├── object.rs           # Kernel object headers and wrappers, page pools, teardown
 │   │   ├── retype.rs           # Memory-cap retype allocator (object carving)
 │   │   ├── split.rs            # Shared tail of the range-cap split syscalls
 │   │   └── transfer.rs         # Batched capability move (SYS_CAP_MOVE, IPC transfer)
@@ -74,8 +98,10 @@ kernel/
 │   ├── ipc/                    # IPC subsystem
 │   │   ├── mod.rs
 │   │   ├── endpoint.rs         # Endpoint object: wait queues, state machine
-│   │   ├── notification.rs           # Notification object: atomic bitmask
+│   │   ├── notification.rs     # Notification object: atomic bitmask
 │   │   ├── event_queue.rs      # Event queue: ring buffer
+│   │   ├── fault.rs            # Fault redirection to a thread's fault handler
+│   │   ├── message.rs          # IPC message type: label, data words, cap slots
 │   │   └── wait_set.rs         # Wait set: multi-source aggregation
 │   ├── sched/                  # Scheduler
 │   │   ├── mod.rs              # Public API: init, schedule, timer_tick, wake protocol
@@ -83,7 +109,7 @@ kernel/
 │   │   ├── thread_registry.rs  # Live-thread registry: teardown stops, watchdog walks
 │   │   └── run_queue.rs        # Per-CPU run queues and priority levels
 │   └── syscall/                # Syscall dispatch
-│       ├── mod.rs              # Dispatch table, entry coordination, thread syscalls
+│       ├── mod.rs              # Dispatch; yield/exit/sleep, IPC-buffer and notification binding
 │       ├── cap.rs              # Capability syscall implementations
 │       ├── entropy.rs          # SYS_GETRANDOM
 │       ├── hw.rs               # MMIO, IRQ, and I/O-port syscalls and their splits
@@ -91,7 +117,7 @@ kernel/
 │       ├── mem.rs              # Memory syscall implementations
 │       ├── sbi.rs              # SYS_SBI_CALL (riscv64)
 │       ├── sysinfo.rs          # SYS_SYSTEM_INFO
-│       └── thread.rs           # Thread lifecycle syscalls (stop, regs, sleep)
+│       └── thread.rs           # Thread lifecycle and control syscalls
 └── docs/
     ├── arch-interface.md       # Architecture abstraction layer and dispatch surface
     ├── initialization.md       # Boot-to-init sequence, phase by phase
@@ -101,9 +127,9 @@ kernel/
     ├── capability-internals.md # Capability subsystem implementation details
     ├── entropy.md              # Entropy subsystem, CSPRNG, health tests, draw API
     ├── ipc-internals.md        # IPC subsystem implementation details
-    ├── scheduler.md                  # Scheduler internals and algorithms
-    ├── scheduling-internals.md       # SMP locking, wake protocol, IPI taxonomy, BSP boot transient
-    ├── sched-ipc-redesign.md         # Design rationale: per-TCB sched_lock SMP hotpath redesign (#292)
+    ├── scheduler.md            # Scheduler internals and algorithms
+    ├── scheduling-internals.md # SMP locking, wake protocol, IPI taxonomy, BSP boot transient
+    ├── sched-ipc-redesign.md   # Design rationale: per-TCB sched_lock SMP hotpath redesign (#292)
     └── thread-lifecycle-and-sleep.md # Lifecycle syscalls, sleep list, dealloc drain protocol
 ```
 
@@ -120,18 +146,22 @@ and re-exported from `arch/mod.rs` as a unified interface.
 
 ### `mm/`
 
-Physical frame allocation, virtual address space management, the kernel heap, and TLB
-management. The buddy allocator (`buddy.rs`) is the foundation; the slab and size-class
-allocators build on top of it. The `address_space` module manages per-process virtual
-address space objects. See [`docs/memory-internals.md`](docs/memory-internals.md).
+Physical frame allocation, the kernel's own page tables and direct map, virtual address
+space objects, the kernel page-table pool, hardware address-space tags, and TLB
+management. The buddy allocator (`buddy.rs`) is the boot-time foundation: it seeds the
+kernel's fixed reserves and is drained into userspace Memory capabilities at the Phase 7
+handoff, after which kernel objects are carved from those capabilities by retype
+(`cap/retype.rs`). The `address_space` module manages per-process virtual address space
+objects. See [`docs/memory-internals.md`](docs/memory-internals.md).
 
 ### `cap/`
 
 The capability subsystem. `cspace.rs` implements per-process capability spaces.
 `slot.rs` defines the in-memory representation of a capability slot and its rights
 bitmask. `derivation.rs` maintains the global derivation tree used for revocation.
-`object.rs` defines the kernel object headers and wrappers and their allocation and
-teardown; `retype.rs` is the allocator that carves kernel objects out of Memory-cap
+`object.rs` defines the kernel object headers and wrappers, the page pools that back
+address-space page tables and CSpace slot pages, and their allocation and teardown;
+`retype.rs` is the allocator that carves kernel objects out of Memory-cap
 backing; `split.rs` is the tail shared by the range-capability split syscalls;
 `transfer.rs` moves a capability, with its derived children, to another slot in
 batches — the mechanism behind `SYS_CAP_MOVE` and IPC capability transfer.
@@ -157,6 +187,8 @@ control blocks, and context switch coordination live here. See
 [`docs/scheduler.md`](docs/scheduler.md) for the scheduling algorithm,
 [`docs/scheduling-internals.md`](docs/scheduling-internals.md) for the SMP
 locking invariants, wake protocol, IPI taxonomy, and BSP boot transient,
+[`docs/sched-ipc-redesign.md`](docs/sched-ipc-redesign.md) for the rationale
+behind the per-TCB scheduler lock on the SMP hot path,
 and [`docs/thread-lifecycle-and-sleep.md`](docs/thread-lifecycle-and-sleep.md)
 for the lifecycle-syscall, sleep-list, and `dealloc_object(Thread)` drain
 protocol.
@@ -181,7 +213,7 @@ and is compiled with a custom target specification for each architecture:
 | x86-64 | `x86_64-seraph-none` |
 | RISC-V | `riscv64imac-seraph-none` |
 
-Custom target JSON files live in `targets/`. They specify the code model,
+Custom target JSON files live in `xtask/targets/`. They specify the code model,
 relocation model, and disable features the kernel cannot use (SSE/AVX before explicit
 initialization, for example).
 
@@ -202,7 +234,7 @@ boot info validation
     └─► early console (arch)
             └─► buddy allocator (mm)
                     └─► kernel page tables (arch + mm)
-                            └─► slab allocator (mm)
+                            └─► typed-memory cap surface (cap)
                                     └─► arch hardware init (arch)
                                             └─► platform resource validation
                                                     └─► capability system (cap)

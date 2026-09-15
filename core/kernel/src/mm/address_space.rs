@@ -6,9 +6,10 @@
 //! User-mode address space management (Phase 9).
 //!
 //! An [`AddressSpace`] owns one root page table (PML4 on x86-64, the
-//! negotiated-mode root
-//! on RISC-V). Intermediate page table frames are allocated from the buddy
-//! allocator on demand.
+//! negotiated-mode root on RISC-V). Intermediate page table frames are
+//! drawn on demand from the wrapper object's page pool on the pooled map
+//! path, or from the kernel page-table pool (`mm::kernel_pt_pool`) on the
+//! kernel-direct path.
 //!
 //! `INIT_STACK_PAGES` is defined in the `init-protocol` ABI crate and
 //! re-exported here. Init's bootstrap virtual addresses (the `InitInfo` page and
@@ -16,7 +17,7 @@
 //! ABI constants.
 //!
 //! ## Kernel mapping inheritance
-//! `new_user` copies kernel PML4 entries [256..512] from the currently active
+//! `new_user_with_root` copies kernel PML4 entries [256..512] from the currently active
 //! page table root into the new user PML4, so kernel memory is reachable from
 //! user address spaces without per-process kernel mapping maintenance.
 //!
@@ -36,8 +37,8 @@
 //!
 //! The shootdown itself is lock-free — each CPU publishes into its own request
 //! slot — so `pt_lock` nests with no shootdown lock. The only lock the PTE edit
-//! nests under `pt_lock` is the PT-frame source
-//! (`pt_lock` → `FRAME_ALLOC_LOCK` on the heap-backed path).
+//! nests under `pt_lock` is the PT-frame source: the wrapper's pool lock on
+//! the pooled path, the kernel page-table pool lock on the kernel-direct path.
 //!
 //! ## Operation-class shootdown elision
 //!
@@ -75,8 +76,8 @@ use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use boot_protocol::{InitSegment, SegmentFlags};
 
 use crate::cpu_mask::{AtomicCpuMask, CpuMask};
+use crate::mm::PAGE_SIZE;
 use crate::mm::paging::phys_to_virt;
-use crate::mm::{BuddyAllocator, PAGE_SIZE};
 
 // Init stack page count is part of the init protocol ABI; the init VA layout
 // (info page + stack top) is the kernel's per-boot choice, not an ABI constant.
@@ -391,65 +392,6 @@ impl AddressSpace
         }
     }
 
-    /// Allocate a new, empty user address space.
-    ///
-    /// 1. Allocates one frame from `allocator` for the root page table.
-    /// 2. Zeros the frame.
-    /// 3. Copies kernel-half entries (indices 256–511) from the current
-    ///    hardware page table root so the kernel is reachable from this space.
-    ///
-    /// # Panics
-    /// Calls `crate::fatal` if the buddy allocator is exhausted.
-    ///
-    /// # Safety
-    /// Must be called after Phase 3 (page tables active) and Phase 4 (heap active).
-    /// The current CPU's page table root must be the kernel's root table.
-    #[cfg(not(test))]
-    pub unsafe fn new_user(allocator: &mut BuddyAllocator) -> Self
-    {
-        // Allocate one 4 KiB frame (order 0) for the root page table.
-        let root_phys = allocator
-            .alloc(0)
-            .unwrap_or_else(|| crate::fatal("address_space::new_user: out of memory for root PT"));
-
-        let root_virt = phys_to_virt(root_phys);
-
-        // Zero the frame (page table entries are 0 = not-present by default).
-        // SAFETY: root_virt is a valid, exclusively-owned kernel virtual address
-        // mapped RW in the direct physical map; write_bytes stays within PAGE_SIZE bounds.
-        unsafe {
-            core::ptr::write_bytes(root_virt as *mut u8, 0, PAGE_SIZE);
-        }
-
-        // Copy kernel-half root entries (indices 256–511, the kernel half in
-        // every paging mode) from the current
-        // active page table root so the kernel stays accessible from user mode.
-        //
-        // On x86-64: read CR3 for the current PML4 physical address.
-        // On RISC-V: read satp for the current root physical address.
-        // SAFETY: root_virt is valid and page-aligned; copy_kernel_entries
-        // reads the current root and copies 256 u64 entries within bounds.
-        unsafe {
-            Self::copy_kernel_entries(root_virt);
-        }
-
-        Self {
-            root_phys,
-            root_virt,
-            active_cpus: AtomicCpuMask::new(),
-            pt_lock: AtomicBool::new(false),
-            tag: AtomicU16::new(0),
-            tag_gen: AtomicU64::new(0),
-            tlb_gen: AtomicU64::new(0),
-            death_observers: [crate::sched::thread::DeathObserver::empty();
-                crate::sched::thread::MAX_DEATH_OBSERVERS],
-            death_observer_count: 0,
-            death_lock: crate::sync::Spinlock::new(),
-            terminal_faulted: false,
-            terminal_fault_reason: 0,
-        }
-    }
-
     /// Allocate a fresh user address space backed by a caller-supplied root
     /// page-table frame.
     ///
@@ -464,7 +406,7 @@ impl AddressSpace
     /// # Safety
     /// `root_phys` must be a freshly-allocated, page-aligned 4 KiB physical
     /// frame mapped in the kernel direct map and not aliased anywhere.
-    /// Phase 3 (page tables) and Phase 4 (heap) must already be active.
+    /// Phase 3 (page tables) must already be active.
     #[cfg(not(test))]
     pub unsafe fn new_user_with_root(root_phys: u64) -> Self
     {
@@ -684,7 +626,7 @@ impl AddressSpace
 
     /// Pooled variant of [`map_page`]: draws intermediate PT frames from
     /// the supplied [`AddressSpaceObject`](crate::cap::object::AddressSpaceObject)'s
-    /// growth pool instead of the kernel buddy.
+    /// growth pool instead of the kernel page-table pool.
     ///
     /// The `aso` MUST wrap *this* `AddressSpace`. `sys_mem_map` enforces this
     /// implicitly because it resolves both via the same capability.
@@ -870,8 +812,9 @@ impl AddressSpace
         crate::percpu::preempt_disable();
         self.pt_lock();
 
-        // Clear every leaf in the span and free each now-empty, aso-owned
-        // intermediate table back to the pool.
+        // Clear every leaf in the span and free each now-empty intermediate
+        // table whose parent entry carries the pooled-table bit back to the
+        // pool.
         // SAFETY: root_virt is valid; aso wraps this AS; the span is user-range
         // (caller's contract); pt_lock is held.
         let freed = unsafe { unmap_user_region_pooled(self.root_virt, virt_base, page_count, aso) };

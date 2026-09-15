@@ -182,7 +182,7 @@ pub unsafe fn setup_trampoline(trampoline_pa: u64)
 ///
 /// # Safety
 /// - [`setup_trampoline`] must have been called.
-/// - Phase 3–8 must be active (direct map, heap, scheduler state).
+/// - Phase 3–8 must be active (direct map, per-CPU storage, scheduler state).
 /// - `hart_id` must be a valid secondary hart listed in `BootInfo::cpu_ids`.
 #[cfg(not(test))]
 pub unsafe fn start_ap(

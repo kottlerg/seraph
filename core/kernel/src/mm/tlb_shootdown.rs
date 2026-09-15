@@ -128,7 +128,7 @@ impl TlbShootdownRequest
 ///
 /// ~80 bytes per slot; sized to `MAX_CPUS` so it needs no runtime allocation
 /// and is available from the first shootdown onward (including boot-time
-/// identity-map teardown, which runs before any heap-backed per-CPU storage is
+/// identity-map teardown, which runs before the buddy-backed per-CPU storage is
 /// guaranteed).
 static TLB_REQUESTS: [TlbShootdownRequest; MAX_CPUS] =
     [const { TlbShootdownRequest::new() }; MAX_CPUS];

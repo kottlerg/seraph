@@ -599,8 +599,9 @@ fn sys_aspace_bind_notification(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // Extract the inner AddressSpace from the AddressSpace cap.
     // SAFETY: slot validated as AddressSpace cap; header at offset 0.
     let aspace_obj = aspace_slot.object.ok_or(SyscallError::InvalidCapability)?;
-    // cast_ptr_alignment: AddressSpaceObject (8-byte) stored behind the 4-byte
-    // KernelObjectHeader; Box<AddressSpaceObject> guarantees 8-byte alignment.
+    // cast_ptr_alignment: the header pointer names an AddressSpaceObject
+    // constructed in place at the start of its page-aligned wrapper page, so
+    // the cast target's 8-byte alignment holds.
     // SAFETY: tag confirmed AddressSpace; pointer is valid AddressSpaceObject.
     #[allow(clippy::cast_ptr_alignment)]
     let as_ptr = unsafe {

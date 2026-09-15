@@ -5,7 +5,8 @@
 
 //! Thread Control Block (TCB) definition.
 //!
-//! Each kernel thread has exactly one TCB. TCBs are heap-allocated via `Box`.
+//! Each kernel thread has exactly one TCB, constructed in place in the Thread
+//! slab retyped from a Memory capability (idle TCBs in the Phase 4 per-CPU slab).
 //!
 //! Key fields:
 //! - `address_space`: typed pointer to the user address space (null for kernel threads).
@@ -587,8 +588,8 @@ pub struct ThreadControlBlock
     pub timed_out: bool,
 
     // === I/O port permissions (x86_64 only) ===
-    /// Per-thread I/O Permission Bitmap (8 KiB, heap-allocated on first
-    /// `SYS_IOPORT_BIND`). Null if this thread has no port bindings.
+    /// Per-thread I/O Permission Bitmap (8 KiB, carved from the SEED Memory
+    /// cap on first `SYS_IOPORT_BIND`). Null if this thread has no port bindings.
     ///
     /// On context switch, if non-null, this bitmap is copied into the TSS
     /// IOPB region so `in`/`out` instructions work for this thread.

@@ -55,11 +55,21 @@ claims.
    should have plausible basis (cited tool output, file presence, commit
    message). Surface bare ticks with no evidence.
 
+8. Commit-message compliance: every commit subject and body on the branch
+   (`git log master..HEAD --format=%B`) against `docs/conventions.md`
+   § Commit Messages, applying every rule of its Title, Body, and Style
+   sections as written there. A subject that breaks a Title rule — a
+   planning label ("step X", "phase Y", "tier N", "stage M", "round N",
+   or any label that only a planning conversation can resolve; the
+   kernel's documented boot phases are not labels), a task ID, or a
+   branch name — is a FAIL. An issue reference such as a trailing `(#N)`
+   is none of those; the maintainer has ruled it compliant.
+
 ## Output
 
 A per-section verdict: PR-body checklist PASS/FAIL, per-issue closure
 PASS/FAIL with per-criterion lines, deferral findings, test-plan honesty
-findings.
+findings, commit-message compliance PASS/FAIL.
 
 **Final line MUST be exactly one of:** `AUDIT PASS`, `AUDIT FAIL`. Any FAIL
 section forces `AUDIT FAIL`.

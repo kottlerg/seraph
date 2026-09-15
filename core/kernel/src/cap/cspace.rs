@@ -37,7 +37,7 @@
 
 // `alloc` is needed by the host-test stubs (CSpace::grow heap fallback,
 // CSpace::Drop heap reclaim, dummy-object factory). Production CSpace is
-// retype-pool-backed end-to-end and does not allocate from the kernel heap.
+// retype-pool-backed end-to-end and needs no `alloc` crate.
 #[cfg(test)]
 extern crate alloc;
 
@@ -208,7 +208,7 @@ pub struct CSpace
     /// pages. Null = unallocated. Pages come from the retype pool (or the
     /// host heap in the test stub — the `kobj` field discriminates: null =
     /// heap, Drop Box-frees each page; non-null = retype pool,
-    /// `dealloc_object(CSpaceObj)` reclaims chunks wholesale).
+    /// `dealloc_object(CSpaceObj)` reclaims donations wholesale).
     direct: [AtomicPtr<CSpacePage>; L1_DIRECT],
     /// Indirect region: inline pointers to pool-allocated directory pages,
     /// each fanning out to `DIR_FANOUT` further leaves. Null =
@@ -220,9 +220,8 @@ pub struct CSpace
     /// Total usable slots allocated across all pages (excludes slot 0).
     allocated_slots: usize,
     /// Slot-page pool exhaustions seen by `grow`, for the throttled
-    /// diagnostic (logged at powers of two). Atomic only because the grow
-    /// path holds `&self`; it is written under the `CSpace` lock.
-    pool_exhaustions: core::sync::atomic::AtomicU32,
+    /// diagnostic (logged at powers of two).
+    pool_exhaustions: u32,
     /// Head of the intrusive free list; None if no free slots.
     ///
     /// Slot 0 is permanently null and never placed on the free list, so the
@@ -250,8 +249,8 @@ unsafe impl Sync for CSpace {}
 impl CSpace
 {
     /// Create an empty `CSpace`. No pages are allocated until the first slot
-    /// is requested. The pool source defaults to null (heap path); call
-    /// [`Self::set_kobj`] to switch to a retype pool.
+    /// is requested. The pool source defaults to null (the host-test heap
+    /// path); call [`Self::set_kobj`] to switch to a retype pool.
     pub fn new(id: CSpaceId) -> Self
     {
         Self {
@@ -260,7 +259,7 @@ impl CSpace
             indirect: core::array::from_fn(|_| AtomicPtr::new(core::ptr::null_mut())),
             next_leaf: 0,
             allocated_slots: 0,
-            pool_exhaustions: core::sync::atomic::AtomicU32::new(0),
+            pool_exhaustions: 0,
             free_head: None,
             free_count: 0,
             lock: crate::sync::Spinlock::new(),
@@ -271,7 +270,7 @@ impl CSpace
     /// Wire this `CSpace` to a `CSpaceKernelObject`'s slot-page pool.
     ///
     /// MUST be called before any `grow()` if the `CSpace` is retype-backed.
-    /// Calling on a `CSpace` that has already grown via the heap path
+    /// Calling on a `CSpace` that has already grown via the host-test heap path
     /// produces a mixed-allocation directory and is a kernel bug.
     pub fn set_kobj(&self, kobj: *mut CSpaceKernelObject)
     {
@@ -347,7 +346,7 @@ impl CSpace
     /// from the wrapper's pool; the host-test stub allocates from the heap.
     /// `T` must be a page-sized-or-smaller type whose all-zeros bit pattern
     /// is a valid value (both `CSpacePage` and `CSpaceDirPage` are).
-    fn alloc_zeroed_page<T>(&self) -> Result<NonNull<T>, CapError>
+    fn alloc_zeroed_page<T>(&mut self) -> Result<NonNull<T>, CapError>
     {
         const {
             assert!(
@@ -372,10 +371,8 @@ impl CSpace
                 // pool-starved CSpace reaches this under the derivation
                 // lock, and a console write per attempt must not serialise
                 // behind it.
-                let occurrence = self
-                    .pool_exhaustions
-                    .fetch_add(1, Ordering::Relaxed)
-                    .wrapping_add(1);
+                self.pool_exhaustions = self.pool_exhaustions.wrapping_add(1);
+                let occurrence = self.pool_exhaustions;
                 if occurrence.is_power_of_two()
                 {
                     crate::kprintln!(
@@ -975,7 +972,7 @@ impl CSpace
 
 impl Drop for CSpace
 {
-    /// Production `CSpace` is always retype-backed: pages live inside chunks
+    /// Production `CSpace` is always retype-backed: pages live inside donations
     /// tracked by [`CSpaceKernelObject`] which `dealloc_object(CSpaceObj)`
     /// reclaims wholesale via `retype_free`. Drop is a no-op so we don't
     /// double-free pool pages through the global allocator.

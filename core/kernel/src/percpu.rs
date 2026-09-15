@@ -272,7 +272,7 @@ pub fn per_cpu_ptr(cpu: usize) -> *mut PerCpuData
 /// Initialise per-CPU state for the BSP (logical CPU 0) and install the
 /// architecture-specific access register (GS-base on x86-64, `tp` on RISC-V).
 ///
-/// Called from Phase 5 (`kernel_entry`) after the kernel heap is active.
+/// Called from Phase 5 (`kernel_entry`) after per-CPU storage is allocated (Phase 4).
 /// Must be called before any code that reads [`current_cpu`].
 ///
 /// # Safety

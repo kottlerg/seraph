@@ -5,11 +5,13 @@ capability types, rights, derivation, revocation, and transfer semantics — is
 specified in [docs/capability-model.md](../../../docs/capability-model.md). This document
 covers the data structures and algorithms that realise those semantics.
 
-The capability subsystem comprises three components:
+The capability subsystem comprises four components:
 
 1. **CSpace** — per-process capability space (slot storage and lookup)
-2. **Capability slot** — in-memory representation of one capability
-3. **Derivation tree** — cross-process tree for revocation
+2. **Page pools** — the donated pages behind a CSpace's slots and an address
+   space's page tables, and the record of every donation
+3. **Capability slot** — in-memory representation of one capability
+4. **Derivation tree** — cross-process tree for revocation
 
 ---
 
@@ -137,6 +139,72 @@ allocation, and when `remove_from_free_list` unlinks a specific index);
 `allocate_slot` debug-asserts the popped slot was a genuine member.
 
 This gives amortised O(1) allocation and O(1) deallocation.
+
+---
+
+## Page Pools (`cap/object.rs`)
+
+The wrapper object that owns a `CSpace` (`CSpaceKernelObject`) keeps the
+slot-page pool in a `PagePool`; the wrapper of an `AddressSpace` keeps its
+intermediate page-table pool in the same type. A pool is an intrusive free
+list of the donated pages (each free page's first word links the next) plus
+a record of every donation — its source Memory object, byte offset, and page
+count — so teardown can return each donation to its source wholesale. The
+wrapper, not the pool, keeps the byte budget the pool backs.
+
+### Donation Records
+
+Sixteen records live inline in the wrapper; the create-time slab, which
+holds the wrapper itself, is record 0. When the inline records are full,
+the next donation's first pool page becomes a *record page*: a chained
+page (newest first) holding up to `RECORDS_PER_PAGE` further records,
+whose record 0 is the donation the page came from. A donation is recorded
+before any of its pages is published to the free list, so every free page
+belongs to a reclaimable record, and the number of donations is bounded
+only by the memory donated — one donated page of bookkeeping per record
+page. A one-page donation that opens a record page seeds nothing; the
+budget reported by `SYS_CAP_INFO` is authoritative.
+
+A record page is kernel state kept in donated memory, like the wrapper page,
+the slot pages, and the page tables themselves: the kernel trusts its
+contents, and the donating Memory capability's holder is trusted not to map
+what it has retyped away, which the kernel does not yet enforce
+([#433](https://github.com/kottlerg/seraph/issues/433));
+[cross-boundary-disclosure.md](cross-boundary-disclosure.md) § Kernel state
+in donated memory records that surface. The records are never scanned while
+the owner is live: an address space's reclaiming unmap recognises pool-owned
+page tables by a bit in the parent entry, not by the records; see
+[memory-internals.md](memory-internals.md) § Page Table Node Ownership.
+
+### Teardown
+
+Teardown walks the record pages newest first, returning each page's other
+records before its record 0 (whose donation holds the page), then the
+inline records, the create-time slab last. A donation's Memory object that
+reaches zero there is reclaimed through its own nested cascade, not the
+bounded worklist the dealloc cascade otherwise uses, since the number of
+donations is unbounded. The cascade's other re-entry, one frame per nested
+`CSpace` whose last reference the dying one held, is unbounded in depth;
+bounding it is [#435](https://github.com/kottlerg/seraph/issues/435).
+
+The walk costs one `retype_free` per donation, holds no lock across records
+(each return takes only its ancestor's cap lock, so unlike a `CSpace`'s
+derivation drain it is not batched), and runs to completion in whichever
+context drops the last reference: the deleting syscall, with interrupts
+masked on that CPU; or, when the owner is handed to the per-CPU
+deferred-reclaim stack — a thread deleting an object it is itself bound to,
+or the batched capability move releasing any `CSpace` or `AddressSpace` —
+the next syscall epilogue on that CPU, with interrupts masked, or the idle
+thread's drain, with interrupts enabled
+([scheduling-internals.md](scheduling-internals.md) § Bare spin locks). So
+an owner's teardown latency scales with how finely it donated, and can land
+on an unrelated thread's syscall: the same memory donated as single pages
+costs one return per page. The standard runtime's map retry donates one page
+per page-table shortfall (its budget top-up donates the shortfall in one
+call), so a process's count is of the order of its page-table page count,
+one per 2 MiB of mapped span. Bounding the walk, and the seeding of one
+donation, within a syscall is
+[#434](https://github.com/kottlerg/seraph/issues/434).
 
 ---
 
@@ -294,13 +362,18 @@ count representing the number of capability slots that point to it:
 pub struct KernelObjectHeader
 {
     ref_count: AtomicU32,
-    kind: ObjectKind,
+    obj_type: ObjectType,
+    flags: u8,
+    _pad: [u8; 2],
+    /// The Memory object this object's bytes were retyped from.
+    ancestor: AtomicPtr<KernelObjectHeader>,
 }
 ```
 
 When a slot is cleared (deletion, revocation), the reference count is decremented.
-When it reaches zero, the object is freed to its slab cache. This is the only
-mechanism by which kernel objects are freed — there is no explicit "destroy" syscall.
+When it reaches zero, the object's bytes are returned to the Memory object it was
+retyped from (`retype_free`). This is the only mechanism by which kernel objects
+are freed — there is no explicit "destroy" syscall.
 
 The same refcount also tracks kernel-internal owners of an object. Wait-set
 membership is one such owner: `sys_wait_set_add` `inc_ref`s the source's
@@ -764,4 +837,7 @@ CSpace. The kernel clears the per-thread reply slot after `SYS_IPC_REPLY`.
 
 [kernel/README.md](../README.md),
 [docs/capability-model.md](../../../docs/capability-model.md),
-[docs/ipc-design.md](../../../docs/ipc-design.md)
+[docs/ipc-design.md](../../../docs/ipc-design.md),
+[kernel/docs/syscalls.md](syscalls.md),
+[kernel/docs/memory-internals.md](memory-internals.md),
+[kernel/docs/cross-boundary-disclosure.md](cross-boundary-disclosure.md)

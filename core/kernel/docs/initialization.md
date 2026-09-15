@@ -81,8 +81,8 @@ This is not fatal — a headless system is valid.
    - Maximum order: implementation constant `MAX_ORDER` = 11 (2048 pages =
      8 MiB), sized so the largest per-CPU boot slab at `MAX_CPUS` fits one
      block (see memory-internals.md)
-5. Call mm::buddy::BuddyAllocator::new(max_order) — this is a static or
-   early-heap allocation using only the bootloader-provided stack
+5. Call mm::buddy::BuddyAllocator::new(max_order) — static storage, using
+   only the bootloader-provided stack
 6. For each candidate range, call BuddyAllocator::add_region(phys_start, phys_end)
 7. Emit: total usable RAM in MiB
 ```
@@ -90,8 +90,8 @@ This is not fatal — a headless system is valid.
 The buddy allocator MUST be initialized from a static buffer or boot stack, not
 from itself.
 
-**Memory at this point:** Only the buddy allocator metadata is allocated. No kernel
-heap exists yet.
+**Memory at this point:** Only the buddy allocator metadata is allocated. The kernel
+has no heap (see Phase 4).
 
 **Failure mode:** If total usable RAM is zero after exclusions, halt with message
 "fatal: no usable physical memory". This indicates a corrupt memory map.
@@ -148,37 +148,28 @@ Emit "fatal: cannot build kernel page tables (OOM)" and halt.
 
 ---
 
-## Phase 4: Slab Allocator and Kernel Heap
+## Phase 4: Typed-Memory Cap Surface
 
 ```
-1. Initialise the general size-class allocator:
-   - Bins at power-of-two sizes (exact range determined at implementation time)
-   - Each bin backed by slab pages from the buddy allocator on demand
-2. Register slab caches for core kernel objects:
-   - CapabilitySlot (fixed size)
-   - ThreadControlBlock (fixed size)
-   - Endpoint (fixed size)
-   - Notification (fixed size)
-   - EventQueue header (fixed size; ring buffer body from size-class allocator)
-   - WaitSet (fixed size)
-   - AddressSpace (fixed size)
-   - PageTableNode (fixed size; one per level-below-root page table frame)
-3. Install the kernel allocator (implements the `GlobalAlloc` trait via the
-   size-class path; used by any `alloc::*` usage in the kernel)
-4. Emit: "kernel heap active"
-5. Allocate per-CPU subsystem storage from the buddy allocator while it still
+1. No kernel heap is set up: the kernel runs no `GlobalAlloc`, and every
+   kernel-object body is carved out of a Memory capability by retype
+   (`cap/retype.rs`) — the SEED reserve for the kernel's own objects from
+   Phase 7 on, a caller-supplied capability at each `cap_create_*` syscall.
+   The phase carries no setup cost; the machinery is live once `SEED_MEMORY`
+   is installed in Phase 7.
+2. Emit: "Phase 4: Typed-Memory Cap Surface (no kernel heap)"
+3. Cache the bootloader-discovered kernel MMIO bases from `BootInfo` for
+   Phase 5 (`platform::capture_kernel_mmio`)
+4. Allocate per-CPU subsystem storage from the buddy allocator while it still
    holds large contiguous blocks (before the Phase-7 user-cap drain): scheduler
    per-CPU state and idle stacks, and the entropy subsystem's per-CPU CSPRNGs,
    central pool, and jitter accumulators (see entropy.md)
 ```
 
-After this phase, `Box`, `Vec`, and other heap types work in kernel code.
+**Failure mode:** a failed per-CPU storage allocation halts the kernel.
 
-**Failure mode:** If slab initialisation fails to allocate its first backing pages,
-halt with "fatal: cannot initialise kernel heap".
-
-**Completion criterion:** The kernel allocator is active and `alloc::boxed::Box`
-allocations succeed.
+**Completion criterion:** per-CPU storage is allocated; there is no kernel
+allocator to activate.
 
 ---
 
@@ -407,12 +398,12 @@ calls `sched::enter()`.
       entry point, then seal PT_GNU_RELRO: writable segments covered by
       the relro range flip to Read (splitting at the range end if it
       lands mid-segment). Logged as "init: PIE bias=0x… (N relocations)".
-2. Create the init address space (AddressSpace::new_user):
-   a. Allocate a new root page table frame from the buddy allocator
-   b. Zero the frame
-   c. Copy kernel root entries 256–511 (the kernel half in every paging
-      mode) from the active root so the kernel
-      remains reachable from init's address space
+2. Create the init address space (`boot_retype_aspace`): carve a slab from
+   the SEED Memory cap; page 0 holds the wrapper object and the in-place
+   `AddressSpace`, page 1 the zeroed root page table with kernel root
+   entries 256–511 (the kernel half in every paging mode) copied from the
+   active root so the kernel remains reachable from init's address space,
+   and the remaining pages seed the space's page-table pool
 3. Map init segments into the init address space:
    a. For each InitSegment in init_image.segments[0..segment_count]:
       - Align virt_addr and phys_addr to page boundaries before mapping
@@ -501,7 +492,7 @@ that CPU only; the BSP and other CPUs continue.
 | 1 | Early console | Non-fatal (continues silently) |
 | 2 | Buddy allocator from memory map | Halt: no usable RAM |
 | 3 | Kernel page tables + direct map | Halt: OOM during PT construction |
-| 4 | Slab allocator + kernel heap | Halt: cannot init heap |
+| 4 | Typed-memory cap surface; per-CPU storage | Halt: per-CPU storage allocation failed |
 | 5 | CPU hardware (IDT/GDT/TSS/stvec); seed entropy pool | Halt: missing required feature |
 | 6 | Platform resource validation | Halt if entries pointer is null with non-zero count; bad entries skipped |
 | 7 | Capability system + root CSpace | Halt: OOM |

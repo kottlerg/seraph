@@ -148,6 +148,13 @@ const DIRTY: u64 = 1 << 7;
 const PPN_MASK: u64 = 0x003F_FFFF_FFFF_FC00;
 /// A leaf at any level sets at least one of R/W/X; a table pointer has none.
 const LEAF_BITS: u64 = READ | WRITE | EXECUTE;
+/// Software bit (RSW, reserved for supervisor software and ignored by
+/// hardware) set in a table-pointer entry whose table frame came from the
+/// address space's own page-table pool (`rv_walk_or_alloc_pooled`). A
+/// reclaiming unmap frees an empty table to that pool only when its parent
+/// entry carries this bit; tables from `kernel_pt_pool` (the kernel-direct
+/// `map_page` path) do not.
+const POOLED_TABLE: u64 = 1 << 8;
 /// Svpbmt PBMT field, bits \[62:61\]: 00=PMA (defer to platform memory
 /// attributes), 01=NC (non-cacheable idempotent main memory), 10=IO.
 const PBMT_MASK: u64 = 0b11 << 61;
@@ -807,7 +814,8 @@ fn rv_walk_or_alloc(entry: &mut PageTableEntry) -> Result<u64, ()>
 }
 
 /// Map a single 4 KiB user page, drawing intermediate page-table frames from
-/// an `AddressSpaceObject`'s growth pool instead of the buddy allocator.
+/// an `AddressSpaceObject`'s growth pool instead of the kernel page-table
+/// pool.
 ///
 /// # Safety
 /// Same contract as [`map_user_page`]. `aso` must be the wrapper paired
@@ -852,75 +860,10 @@ fn rv_walk_or_alloc_pooled(
     }
 
     let frame_pa = aso.alloc_pt_page().ok_or(())?;
-    *entry = PageTableEntry::new_table(frame_pa);
+    let mut table_pte = PageTableEntry::new_table(frame_pa);
+    table_pte.0 |= POOLED_TABLE;
+    *entry = table_pte;
     Ok(frame_pa)
-}
-
-/// Walk the user half of the page table rooted at `root_virt` and free every
-/// intermediate table frame back to the kernel PT pool.
-///
-/// Leaf PTEs (R/W/X any set) point at physical memory owned by Memory
-/// capabilities; those frames are freed through `MemoryObject` teardown when
-/// the owning `CSpace` is destroyed, not here. This function only reclaims
-/// the *page-table* pages the aspace allocated via `rv_walk_or_alloc`. The
-/// root frame itself is not freed here; the caller in
-/// `dealloc_object(AddressSpace)` frees it after this walk completes.
-///
-/// Only root entries 0..256 (the user half in every mode) are examined.
-/// Entries 256..512 are copies of the global kernel root; freeing any of
-/// their descendants would corrupt every other address space.
-///
-/// # Safety
-/// `root_virt` must be the direct-map VA of a valid 4 KiB root frame.
-/// No CPU may still be using this address space (the caller verifies
-/// `active_cpu_mask().is_empty()` before invocation).
-#[cfg(not(test))]
-#[allow(dead_code)]
-pub unsafe fn free_user_page_tables(root_virt: u64)
-{
-    let top = paging_mode().levels() - 1;
-    // SAFETY: root_virt is direct-map VA of a valid root; caller's contract.
-    let root = unsafe { table_at(root_virt) };
-    for root_e in root.iter().take(256)
-    {
-        // Root-level leaves aren't produced by the mapping path; guard
-        // against them regardless — a leaf has no child tables to free.
-        if !root_e.is_present() || root_e.0 & LEAF_BITS != 0
-        {
-            continue;
-        }
-        // SAFETY: present non-leaf root entry points at a live child table
-        // one level below the root; caller guarantees exclusive access.
-        unsafe { free_subtree(root_e.phys_addr(), top - 1) };
-    }
-}
-
-/// Free the kernel-PT-pool frame holding the level-`level` table at
-/// `table_pa`, after recursively freeing every descendant table frame.
-/// Large leaves (R/W/X set) are skipped — their PPN is data, not a table.
-/// Bounded recursion: `level < levels - 1 <= 4`.
-///
-/// # Safety
-/// `table_pa` must be a live PT-pool frame holding a table at `level` whose
-/// present non-leaf entries all point at live PT-pool frames; no CPU may be
-/// using the containing address space.
-#[cfg(not(test))]
-unsafe fn free_subtree(table_pa: u64, level: usize)
-{
-    if level > 0
-    {
-        // SAFETY: table_pa is a live PT frame (caller contract).
-        let table = unsafe { table_at(crate::mm::paging::phys_to_virt(table_pa)) };
-        for e in table.iter()
-        {
-            if e.is_present() && e.0 & LEAF_BITS == 0
-            {
-                // SAFETY: present non-leaf entry points at a live child table.
-                unsafe { free_subtree(e.phys_addr(), level - 1) };
-            }
-        }
-    }
-    crate::mm::kernel_pt_pool::free_pt_page(table_pa);
 }
 
 /// Flush the TLB entry for a single virtual address using `sfence.vma addr`.
@@ -1120,11 +1063,11 @@ fn table_is_empty(table: &[PageTableEntry; 512]) -> bool
 ///
 /// Walks from the root to the leaf level over the span, clearing in-range
 /// leaf PTEs. A table is freed only when it is fully empty afterwards **and**
-/// `aso` owns the frame
-/// ([`owns_phys`](crate::cap::object::AddressSpaceObject::owns_phys)) —
-/// emptiness, not span-containment, is the gate, so a boundary table shared
-/// with a live neighbour (or the guard-page table whose first slot sits just
-/// outside the span) is reclaimed exactly when its last live entry clears.
+/// its parent entry carries [`POOLED_TABLE`] (the frame came from `aso`'s
+/// pool) — emptiness, not span-containment, is the gate, so a boundary table
+/// shared with a live neighbour (or the guard-page table whose first slot
+/// sits just outside the span) is reclaimed exactly when its last live entry
+/// clears.
 /// Leaf entries at a non-leaf level (mega/gigapages: R/W/X set) are not
 /// produced by the user mapping path; they are skipped (never descended, never
 /// freed), so a table holding one is never seen as empty. The root frame is
@@ -1164,7 +1107,7 @@ pub unsafe fn unmap_user_region_pooled(
 
 /// Clear every in-range leaf PTE of `[lo, hi)` under `table` (a table at
 /// `level`), then free each child table the clear left empty — gated on
-/// emptiness and `aso` ownership as documented on
+/// emptiness and the parent entry's [`POOLED_TABLE`] bit as documented on
 /// [`unmap_user_region_pooled`]. The frame holding `table` itself is left to
 /// the caller (the root call's frame is never freed). Bounded recursion:
 /// `level <= 4`.
@@ -1221,11 +1164,11 @@ unsafe fn unmap_span(
             // SAFETY: child is a live table at level - 1; same aso/pt_lock
             // guarantees as this call.
             unsafe { unmap_span(child, level - 1, va, entry_end, aso, freed) };
-            if table_is_empty(child) && aso.owns_phys(child_pa)
+            if table_is_empty(child) && e.0 & POOLED_TABLE != 0
             {
                 table[idx] = PageTableEntry(0);
                 // SAFETY: child is empty and unlinked above; frame came from
-                // this aso's pool (owns_phys).
+                // this aso's pool (POOLED_TABLE).
                 unsafe { aso.free_pt_page(child_pa) };
                 *freed += 1;
             }

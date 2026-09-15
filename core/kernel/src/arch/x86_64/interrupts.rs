@@ -182,7 +182,7 @@ pub(super) fn apic_read(offset: usize) -> u32
 
 /// Initialise interrupt infrastructure for x86-64.
 ///
-/// Must be called once during Phase 5, after the heap is active (Phase 4)
+/// Must be called once during Phase 5, after per-CPU storage is allocated (Phase 4)
 /// and before `timer::init()`.
 ///
 /// # Safety

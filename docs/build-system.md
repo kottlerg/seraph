@@ -314,10 +314,10 @@ documented configuration alternative when the CI runner floor supports it.
 
 ### Kernel Testing Strategy
 
-**Host unit tests** — Pure algorithmic modules (buddy allocator, slab allocator, capability
-tree, scheduler run queues) keep hardware dependencies behind trait boundaries. The kernel's
-`lib` target uses `#![cfg_attr(not(test), no_std)]`, allowing `cargo test -p seraph-kernel`
-to run these modules on the host under the standard test harness.
+**Host unit tests** — Pure algorithmic modules (buddy allocator, capability
+tree, scheduler run queues) keep hardware dependencies behind trait boundaries. The kernel
+crate's root uses `#![cfg_attr(not(test), no_std)]`, so `cargo xtask test --component kernel`
+runs these modules on the host under the standard test harness.
 
 **QEMU integration tests** — Code requiring real hardware (page tables, interrupts, context
 switching) is tested under QEMU by the [`core/ktest`](../core/ktest/README.md) harness, which

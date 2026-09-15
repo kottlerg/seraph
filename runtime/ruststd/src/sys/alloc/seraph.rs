@@ -75,6 +75,19 @@ const GROW_MIN_PAGES: u64 = 16;
 /// large `Vec` reallocations stay within a single round.
 const GROW_MAX_PAGES: u64 = 256;
 
+/// Augment rounds a page-table funding path may make before giving up: the
+/// map retry alternates a map attempt with a one-page augment, the budget
+/// top-up alternates a budget read with a shortfall-sized augment, and each
+/// ends with one more attempt or read after its last augment.
+///
+/// The kernel keeps a donation's first page as its own donation bookkeeping
+/// once per record page (see `SYS_CAP_CREATE_ASPACE`), so a single
+/// donation can seed one page fewer than it carried. A record page opened by
+/// one round has room for the next round's record, so a second round covers
+/// the shortfall unless other threads of the process fill that page in
+/// between; the trailing budget check decides either way.
+const PT_FUND_ROUNDS: u32 = 2;
+
 // ── Spinlock ────────────────────────────────────────────────────────────────
 
 struct SpinLock {
@@ -370,34 +383,36 @@ impl Heap {
         true
     }
 
-    /// `mem_map` wrapper that augments the AS's PT growth budget once on
+    /// `mem_map` wrapper that augments the AS's PT growth budget on
     /// `OutOfMemory` and retries.
     ///
     /// `mem_map` returns `OutOfMemory` (-8) when the destination AS's PT
     /// growth budget is exhausted (a new intermediate page-table page is
     /// needed but the budget has none). We acquire a fresh Memory cap from
     /// memmgr, augment the AS via `cap_create_aspace(memory_cap, self_aspace,
-    /// init_pages=1)`, and retry the map. One augment per failure; if the
-    /// retry also fails the caller treats the grow as failed.
+    /// init_pages=1)`, and retry the map — augmenting up to `PT_FUND_ROUNDS`
+    /// times. If the map still fails the caller treats the grow as failed.
     fn mem_map_with_augment_retry(&self, memory_cap: u32, va: u64, pages: u64) -> bool {
         const SYSCALL_OUT_OF_MEMORY: i64 = -8;
-        match syscall::mem_map(memory_cap, self.self_aspace, va, 0, pages, MAP_WRITABLE) {
-            Ok(()) => return true,
-            Err(SYSCALL_OUT_OF_MEMORY) => { /* fall through to augment + retry */ }
-            Err(_) => return false,
-        }
-        // Augment: request 1 page from memmgr, feed to cap_create_aspace
-        // in augment mode (target = self_aspace). Single page covers
-        // ~511 new PT-entries' worth of mappable VA. The AS's PT chunk
-        // holds its own ref on the augment's MemoryObject (`add_chunk` in
-        // `sys_cap_create_aspace`), so the slab machinery reclaims the
-        // source cap slot.
-        if object_slab_retype(PAGE_SIZE, |aug| {
-            syscall::cap_create_aspace(aug, self.self_aspace, 1).ok()
-        })
-        .is_none()
-        {
-            return false;
+        for _ in 0..PT_FUND_ROUNDS {
+            match syscall::mem_map(memory_cap, self.self_aspace, va, 0, pages, MAP_WRITABLE) {
+                Ok(()) => return true,
+                Err(SYSCALL_OUT_OF_MEMORY) => { /* fall through to augment + retry */ }
+                Err(_) => return false,
+            }
+            // Augment: request 1 page from memmgr, feed to cap_create_aspace
+            // in augment mode (target = self_aspace). Single page covers
+            // ~511 new PT-entries' worth of mappable VA. The AS's donation
+            // record holds its own ref on the augment's MemoryObject
+            // (`add_donation` in `sys_cap_create_aspace`), so the slab
+            // machinery reclaims the source cap slot.
+            if object_slab_retype(PAGE_SIZE, |aug| {
+                syscall::cap_create_aspace(aug, self.self_aspace, 1).ok()
+            })
+            .is_none()
+            {
+                return false;
+            }
         }
         syscall::mem_map(memory_cap, self.self_aspace, va, 0, pages, MAP_WRITABLE).is_ok()
     }
@@ -991,8 +1006,10 @@ pub fn memmgr_query_free_bytes() -> Option<u64> {
 /// cost may exceed the AS's spare budget.
 ///
 /// `region_pages == 0` is a no-op success. Returns `false` if memmgr is
-/// unreachable or the request/augment fails; the subsequent map then
-/// fails with `OutOfMemory` rather than silently drawing on the reserve.
+/// unreachable, the request/augment fails, or the budget still falls short
+/// after `PT_FUND_ROUNDS` rounds (another thread of the process drained
+/// it meanwhile); the subsequent map then fails with `OutOfMemory` rather
+/// than silently drawing on the reserve.
 pub fn fund_aspace_pt_budget(self_aspace: u32, region_pages: u64) -> bool {
     if region_pages == 0 {
         return true;
@@ -1009,16 +1026,24 @@ pub fn fund_aspace_pt_budget(self_aspace: u32, region_pages: u64) -> bool {
     // the first few spawns. Funding only the shortfall (and nothing once the
     // budget already covers the region) keeps a spawn/join loop from leaking a
     // CSpace slot + PT pages on every spawn.
-    let have = syscall::cap_info(self_aspace, syscall_abi::CAP_INFO_ASPACE_PT_BUDGET).unwrap_or(0);
-    if have >= need_bytes {
-        return true;
+    let budget = || {
+        syscall::cap_info(self_aspace, syscall_abi::CAP_INFO_ASPACE_PT_BUDGET).unwrap_or(0)
+    };
+    for _ in 0..PT_FUND_ROUNDS {
+        let have = budget();
+        if have >= need_bytes {
+            return true;
+        }
+        let shortfall_pages = (need_bytes - have).div_ceil(PAGE_SIZE).max(1);
+        if object_slab_retype(shortfall_pages * PAGE_SIZE, |frame| {
+            syscall::cap_create_aspace(frame, self_aspace, shortfall_pages).ok()
+        })
+        .is_none()
+        {
+            return false;
+        }
     }
-    let shortfall_pages = (need_bytes - have).div_ceil(PAGE_SIZE).max(1);
-
-    object_slab_retype(shortfall_pages * PAGE_SIZE, |frame| {
-        syscall::cap_create_aspace(frame, self_aspace, shortfall_pages).ok()
-    })
-    .is_some()
+    budget() >= need_bytes
 }
 
 /// Abort the calling thread via `SYS_THREAD_EXIT`. Used as the allocation-

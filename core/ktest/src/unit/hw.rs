@@ -42,7 +42,7 @@ fn scan_bound(ctx: &TestContext) -> u32
 
 /// `mmio_map` maps a hardware MMIO region into the address space.
 ///
-/// Maps only a single carved page, not the whole aperture: post-Gap-B,
+/// Maps only a single carved page, not the whole aperture:
 /// `sys_mmio_map` draws intermediate PT pages from the *target* AS's own pool,
 /// and the first `Mmio` in the boot config can span hundreds of MiB
 /// (hundreds of PT pages) — mapping it whole would drain `ctx.aspace_cap`'s

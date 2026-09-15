@@ -519,7 +519,7 @@ pub unsafe fn init_ap(cpu_id: u32, rsp0: u64, ist1_top: u64, ist2_top: u64)
         base: gdt_ptr as u64,
     };
     // SAFETY: lgdt is a privileged x86 instruction; GDT pointer is valid and
-    // references heap-allocated GDT properly aligned; executed at ring 0.
+    // references a live, properly aligned GDT; executed at ring 0.
     unsafe {
         core::arch::asm!(
             "lgdt [{0}]",

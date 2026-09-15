@@ -30,8 +30,8 @@
 //! Compile-time assertions cover each wrapper page — an `AddressSpaceObject`
 //! followed by its in-place `AddressSpace`, a `CSpaceKernelObject` followed
 //! by its inline `CSpace` — fitting one page, a `RecordPage` fitting one
-//! page, and its records starting at `RECORD_PAGE_HEADER`; no other size is
-//! asserted.
+//! page, and its records starting at `RECORD_PAGE_HEADER`; the pool types
+//! assert no other size.
 
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
@@ -574,8 +574,9 @@ impl DonationRecord
     };
 }
 
-/// Pages `PagePool::seed_pages` pushes per pool-lock hold. The bare pool lock
-/// has no documented hold-time target, but a hold proportional to a
+/// Pages `PagePool::seed_pages` pushes per pool-lock hold. The pool lock is a
+/// bare spin lock (scheduling-internals.md § Bare spin locks), and a hold
+/// proportional to a
 /// caller-chosen donation size would be unbounded; batching keeps every
 /// hold to this many pushes. The interrupts-off window of the syscall that
 /// seeds a donation is the sum of its batches, `init_pages` pushes chosen by
@@ -1105,6 +1106,9 @@ impl AddressSpaceObject
 {
     /// Pop a free PT page from this AS's pool, charging the growth budget.
     /// Returns the page's physical address, or `None` if the pool is empty.
+    /// Called under the address space's `pt_lock`, which serialises this
+    /// debit against `free_pt_page`'s credit; a debit outside it could
+    /// wrap the budget.
     #[cfg(not(test))]
     #[track_caller]
     pub fn alloc_pt_page(&self) -> Option<u64>
@@ -1177,6 +1181,8 @@ impl CSpaceKernelObject
 {
     /// Pop a free slot page from this `CSpace`'s pool, charging the growth
     /// budget. Returns the page's physical address, or `None` if empty.
+    /// Called from `CSpace::grow` under the `CSpace` lock, the only debit;
+    /// credits land under the pool lock in `seed_pages`.
     #[cfg(not(test))]
     #[track_caller]
     pub fn alloc_slot_page(&self) -> Option<u64>

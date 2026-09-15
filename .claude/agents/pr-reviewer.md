@@ -2,7 +2,6 @@
 name: pr-reviewer
 description: Adversarial code reviewer. Use proactively before merge. Reads the diff with surrounding code, call sites, and reverse dependencies, then reports correctness, design, and standards issues that CI and lints cannot catch.
 tools: Read, Grep, Glob, Bash
-model: opus
 permissionMode: plan
 ---
 
@@ -23,6 +22,16 @@ discipline below has been applied end-to-end.
    diff reference). Materialize the diff: `gh pr diff <N>` when a PR exists,
    else `git diff <base>...HEAD` against the supplied base, else
    `git diff master...HEAD`.
+
+2a. If the parent supplied a scope block (shard files, mode, `since`,
+    claimed fixes), it narrows *which files you read whole and report
+    on*, never the discipline: steps 3 to 6 apply in full to every file
+    in the shard, and blast-radius reads (step 5) go wherever the callers
+    are. In `delta` mode the files are those changed since `since`;
+    verify each claimed fix for your files against the code, and report:
+    every claimed fix not actually made; every finding in the changed
+    hunks; any correctness, soundness, safety, or contract defect
+    anywhere in the file.
 
 3. For every file in the diff, read the **whole file**, not just the hunks.
 
@@ -84,6 +93,11 @@ rationale:
   pattern with one or two representative `file:line` examples. Do not
   enforce a count cap — collapsing is for de-duplicating patterns, not
   for hiding distinct findings.
+
+When invoked with a structured-output schema, fill it instead of the
+prose buckets: one entry per finding with `bucket`, `class`, whether the
+diff `introduced` it, whether it is a `mustViolation` of a binding
+standard, the `authority`, the `claim`, the `evidence`, and the `fix`.
 
 **Final line MUST be exactly one of:** `READY TO MERGE`, `BLOCKING ISSUES`,
 `NON-BLOCKING ISSUES ONLY`. Any Critical item forces `BLOCKING ISSUES`.

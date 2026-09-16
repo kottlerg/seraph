@@ -85,7 +85,8 @@ after `ExitBootServices` by
 3. Sort by `phys_base`.
 4. Merge adjacent and overlapping entries into a minimal non-overlapping
    list.
-5. Cap at [`MAX_APERTURES`] (16); surplus is dropped with a diagnostic.
+5. Cap at `MAX_APERTURES` (16, `abi/boot-protocol`); surplus is dropped with a
+   diagnostic.
 
 The UEFI memory map on every currently-targeted host is the primary
 source; firmware-table seeds cover the regions the UEFI map often
@@ -125,4 +126,4 @@ from the ACPI/DTB passthrough addresses in `BootInfo`.
 
 ## Summarized By
 
-[boot/README.md](../README.md)
+[boot/README.md](../README.md), [boot-flow.md](boot-flow.md)

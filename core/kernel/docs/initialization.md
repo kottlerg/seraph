@@ -240,21 +240,20 @@ and the syscall entry mechanism is installed.
 
 ## Phase 6: Platform Resource Validation
 
-Caches `kernel_mmio` and validates `mmio_apertures` before Phase 7 mints
-capabilities from it.
+Validates `mmio_apertures` before Phase 7 mints capabilities from it
+(`kernel_mmio` was captured into the kernel-local cache in Phase 4).
 
 ```
-1. Copy BootInfo.kernel_mmio into the kernel-local KERNEL_MMIO cache.
-2. If mmio_apertures.count == 0: skip aperture validation, proceed with empty set.
-3. Verify mmio_apertures.entries is non-null (required when count > 0).
-4. Verify the slice falls within boot-provided physical memory:
+1. If mmio_apertures.count == 0: skip aperture validation, proceed with empty set.
+2. Verify mmio_apertures.entries is non-null (required when count > 0).
+3. Verify the slice falls within boot-provided physical memory:
    - The entire range [entries, entries + count * size_of::<MmioAperture>())
      must be within regions the memory map marks as Usable or Loaded.
-5. For each MmioAperture entry:
+4. For each MmioAperture entry:
    - Verify phys_base is page-aligned; skip with warning if not.
    - Verify size > 0 and size is page-aligned; skip with warning if not.
    - Verify phys_base + size does not wrap u64; skip with warning if not.
-6. Emit: "mmio apertures: N validated (M skipped)".
+5. Emit: "mmio apertures: N validated (M skipped)".
 ```
 
 **Failure mode:** Null `entries` when `count > 0`: halt with "fatal:
@@ -262,7 +261,7 @@ mmio_apertures.entries is null with non-zero count". Individual bad
 entries: emit a warning and skip.
 
 **Completion criterion:** The validated aperture list is available to
-Phase 7, and `KERNEL_MMIO` is populated.
+Phase 7.
 
 ---
 
@@ -507,4 +506,4 @@ that CPU only; the BSP and other CPUs continue.
 
 ## Summarized By
 
-[kernel/README.md](../README.md)
+[kernel/README.md](../README.md), [docs/bootstrap.md](../../../docs/bootstrap.md)

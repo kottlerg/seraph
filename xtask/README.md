@@ -168,10 +168,10 @@ cargo xtask compose-bundle [--arch x86_64|riscv64] [--harness init|ktest]
 | `--harness` | `init` | Which binary becomes the bundle's `init` entry: `init` for the regular userspace init, `ktest` for the kernel-test harness |
 
 `--harness init` produces a 9-entry bundle (`init` + the 8 boot modules
-listed in `xtask/src/bundle.rs::MODULES`, in the order the bootloader
-expects). `--harness ktest` produces a
-single-entry bundle (`ktest` as the `init` entry, zero modules); ktest
-is monolithic and does not spawn userspace.
+listed in `xtask/src/bundle.rs::MODULES`; the bootloader and init
+address entries by name, so order is not significant). `--harness ktest`
+produces a single-entry bundle (`ktest` as the `init` entry, zero
+modules); ktest is monolithic and does not spawn userspace.
 
 Both `cargo xtask build` and `compose-bundle` are *authoring* steps —
 both deliberately overwrite the bundle. `mkdisk` is the
@@ -348,7 +348,8 @@ then boots a second QEMU with a different GUID and `-incoming` restoring the
 state. Asserts — host-side — the kernel's `entropy: VM generation change
 detected` marker and a post-resume interactive liveness round (`help` over
 QMP → `shell built-ins:` on serial). Exits non-zero on a QMP error, a failed
-migration, or a per-phase 180 s timeout.
+migration, or a timeout: 180 s per marker-wait phase, 120 s for the
+migrate-to-file poll, 30 s for the source to quit.
 
 A pure runner with the same boot requirements as `test-terminal`:
 

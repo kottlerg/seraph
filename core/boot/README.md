@@ -29,7 +29,7 @@ boot/
     ├── elf.rs                  # UEFI-allocation layer over `shared/elf` + InitImage construction
     ├── firmware.rs             # ACPI / Device Tree address discovery (dispatch)
     ├── acpi.rs                 # ACPI walker (CPUs, hart caps, MMIO, apertures, VMGENID)
-    ├── dtb.rs                  # Flat Device Tree walker (CPUs, hart caps, MMIO, rng-seed)
+    ├── dtb.rs                  # DTB walker (CPUs, hart caps, mmu-type, apertures, rng-seed)
     ├── memory_map.rs           # UEFI memory map → MemoryType; mmio_apertures derivation
     ├── framebuffer.rs          # GOP framebuffer setup
     ├── console.rs              # Early framebuffer console (uses shared/font)
@@ -47,6 +47,9 @@ boot/
             ├── paging.rs       # RISC-V page tables + paging-mode negotiation
             ├── handoff.rs      # satp write + sfence + kernel jump
             ├── serial.rs       # UART serial output for early debug
+            ├── acpi_kernel_mmio.rs # ACPI MADT/RHCT kernel_mmio extraction
+            ├── acpi_spcr.rs    # ACPI SPCR UART discovery
+            ├── dtb_kernel_mmio.rs  # DTB kernel_mmio fill-in
             └── header.S        # Hand-crafted PE32+ header and entry trampoline
 ```
 

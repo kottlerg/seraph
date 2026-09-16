@@ -21,10 +21,11 @@ extracts the `/chosen/rng-seed` boot-entropy fallback and scrubs the
 property in place while the blob is still writable (before
 `ExitBootServices`), since the same blob is later handed to userspace;
 which firmware exposes which entropy source is documented in
-[boot-flow.md](boot-flow.md). The full DTB is
-additionally recorded as a single `PlatformTable` entry so `devmgr` can
-perform its own complete walk — including IOMMU-topology discovery,
-which is exclusively a userspace concern. See
+[boot-flow.md](boot-flow.md). The `rng-seed` reader is a flat scan that
+takes the first property of that name anywhere in the tree. The DTB's
+physical address is passed through unchanged in `BootInfo.device_tree`
+so `devmgr` can perform its own complete walk — including IOMMU-topology
+discovery, which is exclusively a userspace concern. See
 [`docs/device-management.md`](../../../docs/device-management.md) for
 the system-scope IOMMU model.
 
@@ -75,8 +76,10 @@ exhaustive coverage; `devmgr` re-parses the full DTB.
 ## Compatible-String Matching
 
 MMIO peripherals are matched by an exact entry in the node's
-`compatible` string list (`ns16550a`, `virtio,mmio`, …). Matches emit an
-`MmioRange` per `reg` entry. Unknown `compatible` strings are skipped
+`compatible` string list (`ns16550a`, `virtio,mmio`, …). A match
+contributes its first `reg` entry as an `MmioAperture` seed; PCI host
+bridges additionally contribute their MMIO `ranges` windows. Unknown
+`compatible` strings are skipped
 without warning; `devmgr` is responsible for identifying every other
 device.
 

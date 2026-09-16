@@ -384,8 +384,8 @@ it, whatever paths it touches. Source text a build embeds verbatim
 (`include_str!`, `include_bytes!`, `global_asm!` inputs) is build input, not
 comment or Markdown. The CI gate and the pre-merge review apply unchanged;
 the PR body MUST state the validated head and that the delta is
-documentation or comments only, and the audit MUST check that against the
-diff.
+documentation or comments only, and the pre-merge review's audit MUST check
+that against the diff.
 
 **Known boundaries**, established empirically (QEMU 11.0.1; update this
 list as the tracking Issues move):
@@ -479,4 +479,5 @@ note in full.
 [services/svcmgr/README.md](../services/svcmgr/README.md),
 [services/usertest/README.md](../services/usertest/README.md),
 [programs/terminal/README.md](../programs/terminal/README.md),
-[programs/shell/README.md](../programs/shell/README.md)
+[programs/shell/README.md](../programs/shell/README.md),
+[core/kernel/docs/entropy.md](../core/kernel/docs/entropy.md)

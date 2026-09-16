@@ -182,6 +182,11 @@ are forbidden; `master` MUST NOT receive force pushes.
 - PRs that close an Issue MUST carry `Fixes #N` / `Closes #N` in the PR
   description so merge auto-closes the Issue. The acceptance-checklist
   tick-through (see above) lands in the same merge action.
+- Merge is gated by the pre-merge review: the `pr-review` workflow
+  (`.claude/workflows/pr-review.js`) runs the adversarial code review and
+  the closure audit, and both of its verdict lines MUST clear before the
+  merge prompt; `.claude/CLAUDE.md` § PR workflow operations states when
+  it runs and how findings are handled.
 
 ### Branch naming
 

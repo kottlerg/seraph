@@ -11,7 +11,8 @@ Build task runner for Seraph. Invoke via `cargo xtask <command>`.
 Build Seraph components and populate `sysroot/`.
 
 ```
-cargo xtask build [--arch x86_64|riscv64] [--release] [--component boot|kernel|init|all] [--debug <comp>[,...]]
+cargo xtask build [--arch x86_64|riscv64] [--release] \
+    [--component boot|kernel|init|all] [--debug <comp>[,...]]
 ```
 
 | Option | Default | Description |
@@ -341,7 +342,8 @@ cargo xtask test-vmgenid [--cpus N] [--mem MIB]
 ```
 
 See [docs/testing.md](../docs/testing.md) for the harness model and
-`core/kernel/docs/entropy.md` for the snapshot-detection design.
+[core/kernel/docs/entropy.md](../core/kernel/docs/entropy.md) for the
+snapshot-detection design.
 
 ---
 

@@ -174,8 +174,9 @@ All work — including single-line fixes and documentation changes — flows
 through a short-lived feature branch and a PR. Direct commits to `master`
 are forbidden; `master` MUST NOT receive force pushes.
 
-- PRs are self-reviewed; the file-by-file diff view, line comments, and CI
-  status integration are the value.
+- PRs have no second human reviewer; the file-by-file diff view, line
+  comments, and CI status integration are the value, and the pre-merge
+  review below is the gate.
 - CI MUST gate merge. `master` MUST stay linearly green: every commit on
   `master` is a passing CI state. Branches MAY have intermediate failures;
   merge is the green gate.
@@ -184,9 +185,12 @@ are forbidden; `master` MUST NOT receive force pushes.
   tick-through (see above) lands in the same merge action.
 - Merge is gated by the pre-merge review: the `pr-review` workflow
   (`.claude/workflows/pr-review.js`) runs the adversarial code review and
-  the closure audit, and both of its verdict lines MUST clear before the
-  merge prompt; `.claude/CLAUDE.md` § PR workflow operations states when
-  it runs and how findings are handled.
+  the closure audit. Findings from a run are fixed as one batch; a contested
+  finding resolves in the same PR as a fix or as a clarification of the
+  rule, code, or document it misread; no finding is waived or ruled outside
+  the standards; the merge prompt requires a completed run with no failed
+  agent, `READY TO MERGE`, and `AUDIT PASS`. `.claude/CLAUDE.md` § PR
+  workflow operations gives the assistant's procedure.
 
 ### Branch naming
 
@@ -223,6 +227,9 @@ gives the PR-level linear view.
   with a one-line rationale in the same edit. Same shape as the Issue
   acceptance rule under "Backlog Tracking" above.
 - Edit via `gh pr edit <N> --body "$(cat <<'EOF' …EOF)"` or the web UI.
+- Every PR body MUST state the validated head in its `## Validation`
+  section; for a documentation-only or comment-only delta since that head,
+  it MUST say so (see [testing.md](testing.md) "Coverage tiers").
 
 ## CI Gating
 

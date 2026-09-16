@@ -334,7 +334,7 @@ source lands. The boot self-test is the API's continuous validator.
   fixed generation GUID, saves the guest via QMP migrate-to-file, restores it
   under a different GUID with `-incoming`, and asserts the kernel's
   `entropy: VM generation change detected` line plus a post-resume
-  interactive liveness round. See `docs/testing.md`.
+  interactive liveness round. See [docs/testing.md](../../../docs/testing.md).
 
 ---
 

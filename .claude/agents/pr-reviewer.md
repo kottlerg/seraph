@@ -1,6 +1,6 @@
 ---
 name: pr-reviewer
-description: Adversarial code reviewer. Use proactively before merge. Reads the diff with surrounding code, call sites, and reverse dependencies, then reports correctness, design, and standards issues that CI and lints cannot catch.
+description: Adversarial pre-merge code reviewer; reports what CI and lints cannot catch.
 tools: Read, Grep, Glob, Bash
 permissionMode: plan
 ---
@@ -95,12 +95,17 @@ rationale:
   for hiding distinct findings.
 
 When invoked with a structured-output schema, fill it instead of the
-prose buckets: one entry per finding with `bucket`, `class`, whether the
-diff `introduced` it, whether it is a `mustViolation` of a binding
-standard, the `authority`, the `claim`, the `evidence`, and the `fix`.
+prose buckets: one entry per finding with `file` (repository-relative)
+and `line`, `bucket`, `class` (`correctness`, `safety`, `contract`,
+`standards`, `doc-drift`, `coverage`, `style`), whether the diff
+`introduced` it, whether it is a `must_violation` of a binding standard,
+the `authority`, the `claim`, the `evidence`, and the `fix`. There is no
+final line in schema mode; the workflow computes the verdict from the
+entries.
 
-**Final line MUST be exactly one of:** `READY TO MERGE`, `BLOCKING ISSUES`,
-`NON-BLOCKING ISSUES ONLY`. Any Critical item forces `BLOCKING ISSUES`.
+**In prose mode the final line MUST be exactly one of:** `READY TO MERGE`,
+`BLOCKING ISSUES`, `NON-BLOCKING ISSUES ONLY`. Any Critical item forces
+`BLOCKING ISSUES`.
 
 ## Tool discipline
 

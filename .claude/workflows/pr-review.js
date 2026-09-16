@@ -228,7 +228,7 @@ const REPORT_SCHEMA = {
 
 let agent_calls = 0
 const failed_review = [] // shard and lens reviewers that returned nothing: unreviewed surface
-const failed_other = [] // auditor and synthesizer failures: reported, not blocking by themselves
+const failed_other = [] // auditor, synthesizer, and verifier failures: reported, not blocking
 
 function run(prompt, opts) {
     agent_calls += 1
@@ -641,10 +641,13 @@ function verify_one(f) {
         return Promise.resolve(f)
     }
     return parallel(
-        VERIFY_LENSES.map((lens) => () =>
-            run(verify_prompt(f, lens), {
+        VERIFY_LENSES.map((lens) => () => {
+            // The record index keeps the label unique when two records share a
+            // location (dedup keeps different buckets or flags apart).
+            const label = 'verify:' + lens + ':' + f.file + ':' + f.line + '#' + seen.indexOf(f)
+            return run(verify_prompt(f, lens), {
                 agentType: INVESTIGATOR,
-                label: 'verify:' + lens + ':' + f.file + ':' + f.line,
+                label,
                 phase: 'Verify',
                 schema: VERDICT_SCHEMA,
             }).then(
@@ -652,12 +655,12 @@ function verify_one(f) {
                 () => null,
             ).then((v) => {
                 if (!v) {
-                    const label = 'verify:' + lens + ':' + f.file + ':' + f.line
                     failed_other.push(label)
                     log(label + ': no result (agent failed or was stopped)')
                 }
                 return v
-            }),
+            })
+        }),
         ),
     ).then((votes) => {
         const valid = votes.filter(Boolean)
@@ -742,9 +745,9 @@ log(
 // ─── Verdicts (computed here, not by an agent) ───
 
 // A failed shard or lens reviewer means part of the diff was never reviewed;
-// that is a blocking condition in itself. A failed auditor or synthesizer
-// is reported through the audit verdict and the notes, not through the
-// reviewer verdict.
+// that is a blocking condition in itself. A failed auditor or synthesizer is
+// reported through the audit verdict and the notes, and a failed verifier
+// through the notes and the failed list, not through the reviewer verdict.
 const blocking =
     failed_review.length > 0 ||
     findings.some((f) => f.bucket === 'critical' || f.must_violation)
@@ -774,6 +777,13 @@ if (missing_sections.length) {
 if (failed_review.length) {
     notes.push(
         'Incomplete run: ' + failed_review.join(', ') + ' returned no result; treated as blocking.',
+    )
+}
+const failed_verifiers = failed_other.filter((l) => l.startsWith('verify:'))
+if (failed_verifiers.length) {
+    notes.push(
+        'Incomplete verification: ' + failed_verifiers.join(', ') + ' returned no result; the ' +
+            'affected findings were judged on the remaining votes.',
     )
 }
 

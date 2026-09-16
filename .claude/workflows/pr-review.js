@@ -642,9 +642,10 @@ function verify_one(f) {
     }
     return parallel(
         VERIFY_LENSES.map((lens) => () => {
-            // The record index keeps the label unique when two records share a
-            // location (dedup keeps different buckets or flags apart).
-            const label = 'verify:' + lens + ':' + f.file + ':' + f.line + '#' + seen.indexOf(f)
+            // The 1-based record index keeps the label unique when two records
+            // share a location (dedup keeps different buckets or flags apart).
+            const index = seen.indexOf(f) + 1
+            const label = 'verify:' + lens + ':' + f.file + ':' + f.line + '#' + index
             return run(verify_prompt(f, lens), {
                 agentType: INVESTIGATOR,
                 label,
@@ -783,7 +784,8 @@ const failed_verifiers = failed_other.filter((l) => l.startsWith('verify:'))
 if (failed_verifiers.length) {
     notes.push(
         'Incomplete verification: ' + failed_verifiers.join(', ') + ' returned no result; the ' +
-            'affected findings were judged on the remaining votes.',
+            'affected findings were judged on the remaining votes, or marked unverified when ' +
+            'none remained.',
     )
 }
 

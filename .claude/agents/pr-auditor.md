@@ -28,7 +28,7 @@ claims.
 4. PR-body checklist: every `- [ ]` in the PR body MUST be `- [x]` or
    removed with rationale. List violators.
 
-5. Linked-issue closure: extract every `Closes #N` / `Fixes #N` /
+5. Per-issue closure: extract every `Closes #N` / `Fixes #N` /
    `Resolves #N` from PR body and commits. For each, `gh issue view <N>
    --json body`. For every `- [ ]` under `## Acceptance` in the issue,
    one of two outcomes MUST be reconciled per `docs/conventions.md`:
@@ -93,9 +93,9 @@ A per-section verdict, each PASS or FAIL: PR-body checklist; per-issue
 closure with per-criterion lines; silent-deferral scan (FAIL on any
 unreconciled hit); test-plan honesty (FAIL on any bare tick); commit-message
 compliance; validation claim; PR-body claims. When invoked with a
-structured-output schema, fill it instead of the prose: one section per
-section named above, with its verdict and items, and the overall verdict;
-there is no final line in schema mode.
+structured-output schema, fill it instead of the prose: one output section
+for each of the seven named above, with its verdict and items, and the
+overall verdict; there is no final line in schema mode.
 
 **In prose mode the final line MUST be exactly one of:** `AUDIT PASS`,
 `AUDIT FAIL`. Any FAIL section forces `AUDIT FAIL`.

@@ -74,7 +74,6 @@ const AUDIT_SECTION_NAMES = [
     'PR-body checklist', 'per-issue closure', 'silent-deferral scan', 'test-plan honesty',
     'commit-message compliance', 'validation claim', 'PR-body claims',
 ]
-const AUDIT_SECTIONS = AUDIT_SECTION_NAMES.length
 // Read-only agent type for scope, verify, and synthesize. Its brief pins the
 // model: these stages answer bounded questions, so they run on a cheaper tier
 // than the shard reviewers and lenses, which inherit the session model.
@@ -699,7 +698,8 @@ const reviewed = await pipeline(
 )
 
 // Whatever the runtime did with a failed item, a missing slot is a failed
-// reviewer; reconcile by index so no failure can slip past the accounting.
+// agent: a reviewer (blocking) or the auditor (an audit failure). Reconcile
+// by index so no failure can slip past the accounting.
 review_items.forEach((item, i) => {
     const slot = reviewed[i]
     const list = item.kind === 'audit' ? failed_other : failed_review

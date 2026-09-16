@@ -1,6 +1,6 @@
 # xtask
 
-Build task runner for Seraph. Invoke via `cargo xtask <command>`.
+Build task runner for Seraph, invoked as `cargo xtask <command>`.
 
 ---
 
@@ -12,14 +12,14 @@ Build Seraph components and populate `sysroot/`.
 
 ```
 cargo xtask build [--arch x86_64|riscv64] [--release] \
-    [--component boot|kernel|init|all] [--debug <comp>[,...]]
+    [--component <name>|all] [--debug <comp>[,...]]
 ```
 
 | Option | Default | Description |
 |---|---|---|
 | `--arch` | `x86_64` | Target architecture |
 | `--release` | off | Build in release mode |
-| `--component` | `all` | Build a single component (`boot`, `kernel`, `init`, or `all`) |
+| `--component` | `all` | Build a single component: any `BuildComponent` name (`boot`, `kernel`, `init`, `ktest`, each service or program crate), or `all` |
 | `--debug` | (none) | Emit debuginfo (`debug=2`, `opt-level=1`) for the named component(s) only, e.g. `--debug kernel,procmgr`; applies within the active profile. See [Build Profiles](../docs/build-system.md#build-profiles). |
 
 The sysroot is architecture-specific. Building for a different arch than the
@@ -34,7 +34,8 @@ Run `cargo xtask build` first; `run` errors fast if the sysroot is empty
 or stamped for a different architecture.
 
 ```
-cargo xtask run [--arch x86_64|riscv64] [--gdb] [--headless] [--verbose] [--cpus N] [--mem MIB] [--riscv-mmu sv39|sv48|sv57]
+cargo xtask run [--arch x86_64|riscv64] [--gdb] [--headless] [--verbose] \
+    [--cpus N] [--mem MIB] [--riscv-mmu sv39|sv48|sv57]
 ```
 
 | Option | Description |
@@ -79,7 +80,9 @@ and the distro ships standard firmware packages.
 
 Default firmware search paths per host:
 
-- **Linux** OVMF: `/usr/share/edk2/ovmf/OVMF_CODE.fd`, `/usr/share/OVMF/OVMF_CODE.fd`, `/usr/share/edk2-ovmf/x64/OVMF_CODE.fd`, `/usr/share/ovmf/OVMF.fd`, `/usr/share/edk2/x64/OVMF_CODE.4m.fd`
+- **Linux** OVMF: `/usr/share/edk2/ovmf/OVMF_CODE.fd`, `/usr/share/OVMF/OVMF_CODE.fd`,
+  `/usr/share/edk2-ovmf/x64/OVMF_CODE.fd`, `/usr/share/ovmf/OVMF.fd`,
+  `/usr/share/edk2/x64/OVMF_CODE.4m.fd`
 - **Linux** RISC-V: `/usr/share/edk2/riscv`, `/usr/share/edk2-riscv`, `/usr/share/qemu-efi-riscv64`
 - **macOS** (both): `/opt/homebrew/share/qemu`, `/usr/local/share/qemu`
 - **BSD** (both): `/usr/local/share/qemu`, `/usr/local/share/uefi-firmware`
@@ -253,7 +256,7 @@ cargo xtask run-parallel \
 | `--mem` | `512` | Guest memory size in MiB |
 | `--riscv-mmu` | `sv48` | Guest RISC-V paging-mode ceiling (riscv64 only, ignored on x86_64); same semantics as `cargo xtask run --riscv-mmu` |
 | `--pass` | `ALL TESTS PASSED` | Regex marking a successful run. The default matches the cross-harness terminal marker `[<harness>] ALL TESTS PASSED` standardised in [docs/testing.md](../docs/testing.md). On match the log is discarded and the run is classified `PASS` |
-| `--fail` | `SOME TESTS FAILED\|KERNEL EXCEPTION\|FATAL:\|PANIC( at \|: )\|=== WATCHDOG` | Regex marking a failed run; the **first** match wins. Matches the cross-harness terminal marker `[<harness>] SOME TESTS FAILED` ([docs/testing.md](../docs/testing.md)) plus the kernel's own death markers (`KERNEL EXCEPTION` + `FATAL:` for a hardware trap, `PANIC at`/`PANIC:` for a Rust `panic!`, `=== WATCHDOG` for a scheduler wedge-detector dump) so a crash classifies `FAIL` rather than `HANG`. The benign `USERSPACE FAULT` path matches none of these. On match the log is preserved as `FAIL-<run>.log`. Failure takes precedence over success. Override with a never-matching pattern (e.g. `'$.^'`) to disable |
+| `--fail` | `SOME TESTS FAILED\|KERNEL EXCEPTION\|FATAL:\|PANIC( at \|: )\|=== WATCHDOG\|entropy: SELFTEST FAIL` | Regex marking a failed run; the **first** match wins. Matches the cross-harness terminal marker `[<harness>] SOME TESTS FAILED` ([docs/testing.md](../docs/testing.md)) plus the kernel's own death markers (`KERNEL EXCEPTION` + `FATAL:` for a hardware trap, `PANIC at`/`PANIC:` for a Rust `panic!`, `=== WATCHDOG` for a scheduler wedge-detector dump, `entropy: SELFTEST FAIL` for a kernel entropy self-test failure) so a crash classifies `FAIL` rather than `HANG`. The benign `USERSPACE FAULT` path matches none of these. On match the log is preserved as `FAIL-<run>.log`. Failure takes precedence over success. Override with a never-matching pattern (e.g. `'$.^'`) to disable |
 | `--fail-grace-secs` | `10` | After the first `--fail` match, wait this many seconds (bounded by `--timeout`) before SIGKILL, so the trailing fault dump still lands in the log. A crashed run thus aborts ~grace seconds after the first match instead of idling to `--timeout` |
 | `--debug-listen` | off | Expose each guest's gdbstub without pausing it (QEMU `-s`, tcp::1234) so a wedged guest can be attached post-hoc: `gdb -ex 'target remote :1234'`. Requires `--parallel 1` (one gdbstub port) |
 | `--hold-on-hang` | off | On a hard-timeout `HANG` (no `--fail` match), do not kill QEMU: print the attach instructions and block until the instance is terminated externally, preserving the wedged guest for a debugger. Pair with `--debug-listen`. Requires `--parallel 1` |
@@ -288,7 +291,8 @@ PASS logs are discarded.
    crashed, not the guest. Tallied in the summary and preserved as
    `QEMU-CRASH-<run>.log`, but does **not** fail the run (infrastructure flake,
    not a regression in the OS under test; the recurring case is the QEMU 8.2.x
-   multi-threaded-TCG segfault, [QEMU gitlab #2220](https://gitlab.com/qemu-project/qemu/-/issues/2220)).
+   multi-threaded-TCG segfault,
+   [QEMU gitlab #2220](https://gitlab.com/qemu-project/qemu/-/issues/2220)).
    SIGKILL is excluded (the `--timeout` kill, or an OOM).
 6. Other exit code → `ERR rc=<n>` (a signal death is reported as `128 + signum`,
    e.g. `139` for SIGSEGV)
@@ -366,7 +370,7 @@ cargo xtask test-kaslr [--arch x86_64|riscv64] [--cpus N] [--mem MIB] [--riscv-m
 ```
 
 See [docs/testing.md](../docs/testing.md) for the harness model and
-`docs/memory-model.md` for the randomized layout.
+[docs/memory-model.md](../docs/memory-model.md) for the randomized layout.
 
 ---
 
@@ -389,4 +393,9 @@ See [docs/testing.md](../docs/testing.md) for the harness model and
 
 ## Summarized By
 
-[README.md](../README.md), [docs/build-system.md](../docs/build-system.md)
+[README.md](../README.md), [docs/build-system.md](../docs/build-system.md),
+[docs/testing.md](../docs/testing.md),
+[core/kernel/docs/entropy.md](../core/kernel/docs/entropy.md),
+[core/ktest/README.md](../core/ktest/README.md),
+[core/boot/README.md](../core/boot/README.md),
+[programs/terminal/README.md](../programs/terminal/README.md)

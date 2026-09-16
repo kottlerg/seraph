@@ -41,7 +41,8 @@ in the root `Cargo.toml`; all member crates opt in via `[lints] workspace = true
 
 ### Markdown
 
-Markdown source MUST be soft-wrapped to the project column limit (100 characters).
+Markdown source MUST be soft-wrapped to the project column limit (100 characters). A Markdown
+table row is exempt where the syntax cannot break it; keep cells short.
 Paragraphs are separated by exactly one blank line.
 Hard line breaks MUST NOT be used for visual layout only.
 

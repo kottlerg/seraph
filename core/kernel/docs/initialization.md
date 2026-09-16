@@ -163,7 +163,7 @@ Emit "fatal: cannot build kernel page tables (OOM)" and halt.
 4. Allocate per-CPU subsystem storage from the buddy allocator while it still
    holds large contiguous blocks (before the Phase-7 user-cap drain): scheduler
    per-CPU state and idle stacks, and the entropy subsystem's per-CPU CSPRNGs,
-   central pool, and jitter accumulators (see entropy.md)
+   central pool, and jitter accumulators (see [entropy.md](entropy.md))
 ```
 
 **Failure mode:** a failed per-CPU storage allocation halts the kernel.
@@ -349,7 +349,7 @@ are excluded because `mint_module_memory_caps` already covers them).
    handoff in Phase 9.
 7. Run the entropy power-on self-test across all online CPUs: each CPU captured
    a sample from its generator during bringup, and the BSP now checks per-CPU
-   independence and basic sanity, printing PASS/FAIL (see entropy.md).
+   independence and basic sanity, printing PASS/FAIL (see [entropy.md](entropy.md)).
 ```
 
 The AP SIPI trampoline page is flagged `RECLAIM_FLAG_LATE` in
@@ -446,7 +446,9 @@ calls `sched::enter()`.
 ```
 
 **Implementation notes:**
-- CSpace hand-off (step 5d): `sched::enter()` calls `set_current(init_tcb)` so `current_tcb()` returns the init TCB during init's syscalls; init receives ROOT_CSPACE.
+- CSpace hand-off (step 5d): `sched::enter()` calls `set_current(init_tcb)` so
+  `current_tcb()` returns the init TCB during init's syscalls; init receives
+  ROOT_CSPACE.
 - The x86-64 `switch_and_enter_user` function atomically switches the stack pointer
   BEFORE writing CR3. This is required because the boot stack is identity-mapped in
   PML4 entries 0–255 (the lower half), which are not copied into init's page tables.

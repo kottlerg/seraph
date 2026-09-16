@@ -11,10 +11,7 @@
 //! therefore `false` — this in-kernel arch path provides no hardware RNG by
 //! design. Early-boot entropy arrives as the conditioned firmware seed the
 //! bootloader passes in `BootInfo`; its sources and the degradation to jitter
-//! are documented in `core/kernel/docs/entropy.md`. A runtime riscv64
-//! hardware-RNG source via a userspace virtio-rng/hwrng driver, the mechanism
-//! the RISC-V design intends for lower privilege levels, is tracked as future
-//! work.
+//! are documented in `core/kernel/docs/entropy.md`.
 //!
 //! The raw cycle counter (the `time` CSR, always S-mode readable) feeds jitter
 //! sampling. Same `arch::current` entropy contract as the x86-64 counterpart.

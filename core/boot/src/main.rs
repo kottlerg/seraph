@@ -169,9 +169,10 @@ struct CpuTopology
     cpu_ids: [u32; MAX_CPUS],
 }
 
-/// Conditioned early-boot entropy drawn from UEFI `EFI_RNG_PROTOCOL`.
+/// Conditioned early-boot entropy drawn from UEFI `EFI_RNG_PROTOCOL` or, as a
+/// fallback, from the DTB `/chosen/rng-seed` property.
 ///
-/// `len` is `0` when the firmware exposes no RNG; the kernel then degrades to
+/// `len` is `0` when no source produced a seed; the kernel then degrades to
 /// timing jitter alone. Produced by [`step5c_fetch_boot_entropy`] while boot
 /// services are live and written into [`BootInfo`] by step 9. The `kaslr`
 /// words are a separate draw feeding the KASLR slide / direct-map base
@@ -180,7 +181,8 @@ struct BootEntropy
 {
     /// Random bytes for the entropy pool; only the first `len` are valid.
     seed: [u8; 32],
-    /// Number of valid leading bytes in `seed` (`0` or `32`).
+    /// Number of valid leading bytes in `seed` (`0..=32`: 32 from the firmware
+    /// RNG, fewer from the DTB fallback).
     len: u32,
     /// Two 64-bit KASLR entropy words: `[0]` picks the image slide, `[1]`
     /// the direct-map base. Valid only when `kaslr_available`.
@@ -765,15 +767,12 @@ unsafe fn step5b_alloc_ap_trampoline(ctx: &UefiContext) -> u64
 /// Draw conditioned early-boot entropy for the pool seed and the KASLR
 /// slide / direct-map base.
 ///
-/// Draws from UEFI `EFI_RNG_PROTOCOL` wherever the firmware or a firmware RNG
-/// driver exposes it (x86-64 OVMF natively; riscv64 EDK2 through `VirtioRngDxe`
-/// binding `virtio-rng-pci`). The DTB `/chosen/rng-seed` reader (see
-/// [`fetch_dtb_rng_seed`]) is a secondary fallback for firmware that delivers a
-/// DTB. When neither source is available, returns `len == 0` and
-/// `kaslr_available == false`; the kernel then degrades to timing jitter and
-/// the layout to its deterministic fallback (no regression). The platform
-/// matrix is documented in `core/boot/docs/boot-flow.md` and
-/// `core/kernel/docs/entropy.md`.
+/// Draws from UEFI `EFI_RNG_PROTOCOL` when the firmware exposes it, else from
+/// the DTB `/chosen/rng-seed` reader ([`dtb::parse_rng_seed`]), else returns
+/// `len == 0` and `kaslr_available == false`, and the kernel degrades to timing
+/// jitter and the layout to its deterministic fallback (no regression). Which
+/// firmware exposes which source is documented in
+/// `core/boot/docs/boot-flow.md`.
 ///
 /// # Safety
 /// `ctx.bs` must be valid UEFI boot services (before `ExitBootServices`);

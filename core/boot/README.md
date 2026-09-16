@@ -28,9 +28,9 @@ boot/
     ├── uefi.rs                 # UEFI protocol wrappers and memory services
     ├── elf.rs                  # UEFI-allocation layer over `shared/elf` + InitImage construction
     ├── firmware.rs             # ACPI / Device Tree address discovery (dispatch)
-    ├── acpi.rs                 # ACPI RSDP/XSDT/MADT/MCFG walker (CPU topology, kernel_mmio, aperture seeds)
-    ├── dtb.rs                  # Flat Device Tree walker (CPU topology, kernel_mmio, aperture seeds)
-    ├── memory_map.rs           # UEFI memory map → boot_protocol::MemoryType + mmio_apertures derivation
+    ├── acpi.rs                 # ACPI RSDP/XSDT/MADT/MCFG walker (CPUs, kernel_mmio, apertures)
+    ├── dtb.rs                  # Flat Device Tree walker (CPUs, kernel_mmio, apertures, rng-seed)
+    ├── memory_map.rs           # UEFI memory map → MemoryType; mmio_apertures derivation
     ├── framebuffer.rs          # GOP framebuffer setup
     ├── console.rs              # Early framebuffer console (uses shared/font)
     ├── paging.rs               # Initial page table construction (arch-neutral)

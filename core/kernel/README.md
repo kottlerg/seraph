@@ -241,7 +241,7 @@ boot info validation
                                                     └─► capability system (cap)
                                                     └─► scheduler (sched)
                                                             └─► SMP bringup (arch + sched)
-                                                                    └─► init thread (cap + mm + sched)
+                                                                    └─► init thread (cap, mm, sched)
 ```
 
 The kernel creates init's AddressSpace, CSpace, and Thread directly from the

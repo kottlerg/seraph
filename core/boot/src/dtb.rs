@@ -21,6 +21,8 @@
 //! - [`parse_aperture_seed`]: collect MMIO extents (PLIC, CLINT, UART, PCI
 //!   ECAM + ranges, `virtio,mmio` transports) as seeds for
 //!   [`super::memory_map::derive_mmio_apertures`].
+//! - [`parse_rng_seed`]: extract and scrub the `/chosen/rng-seed` boot-entropy
+//!   fallback.
 //!
 //! The arch-specific `kernel_mmio` extractor for RISC-V (PLIC + UART
 //! from compatible nodes) lives under [`crate::arch::riscv64`] and
@@ -952,8 +954,8 @@ pub unsafe fn parse_boot_cpu_mmu_type(dtb_addr: u64, boot_hart_id: u64) -> Optio
 /// Callable unconditionally on every supported architecture; a zero
 /// `dtb_addr` (no DTB) is a fast no-op that returns 0. The caller
 /// typically also calls [`super::acpi::parse_aperture_seed`] to cover
-/// ACPI-only platforms (and RISC-V platforms such as QEMU+EDK2 that
-/// expose ACPI alongside a DTB); both feeds merge inside
+/// ACPI-only platforms (including QEMU+EDK2 on RISC-V, which hands the
+/// bootloader ACPI rather than a DTB); both feeds merge inside
 /// [`super::memory_map::derive_mmio_apertures`].
 ///
 /// Returns the number of entries written.
@@ -1035,13 +1037,12 @@ pub unsafe fn parse_aperture_seed(dtb_addr: u64, out: &mut [MmioAperture]) -> us
 /// Extract the `/chosen/rng-seed` property into `out`, scrub it from the
 /// blob, and return the number of bytes copied (0 when absent).
 ///
-/// QEMU's `virt` machine populates `rng-seed` with host-random bytes. Under the
-/// EDK2 `RiscVVirtQemu` firmware the bootloader receives ACPI rather than a
-/// DTB, so this reader is a secondary fallback for firmware that delivers a
-/// DTB; the primary riscv64 source is `EFI_RNG_PROTOCOL` through the firmware's
-/// `VirtioRngDxe` driver (see `core/boot/docs/boot-flow.md`). The property
-/// bytes are zeroed in place because the same blob is later handed to userspace
-/// via `BootInfo.device_tree`; the seed must not outlive its consumption.
+/// QEMU's `virt` machine populates `rng-seed` with host-random bytes. This
+/// reader is a secondary fallback for firmware that delivers a DTB; which
+/// firmware exposes which boot-entropy source is documented in
+/// `core/boot/docs/boot-flow.md`. The property bytes are zeroed in place
+/// because the same blob is later handed to userspace via
+/// `BootInfo.device_tree`; the seed must not outlive its consumption.
 ///
 /// # Safety
 /// `dtb_addr` must be 0 or the physical address of a valid, identity-mapped

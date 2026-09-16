@@ -53,29 +53,30 @@ truth for "how work is tracked and shipped" on this project.
   `Workflow({name: "pr-review", args: {pr: <N>, mode: "full"}})` for the
   first run on a PR, then `mode: "delta"` with `since` set to the head
   the previous run reviewed. It shards the diff across parallel
-  `@pr-reviewer` agents, adversarially verifies each finding, runs
-  `@pr-auditor` alongside, and returns one report with a reviewer verdict
-  (`READY TO MERGE`, `BLOCKING ISSUES`, `NON-BLOCKING ISSUES ONLY`) and
-  an audit verdict (`AUDIT PASS`, `AUDIT FAIL`). Save the report under
-  `target/xtask/review/pr<N>/` and surface both verdict lines to the user
-  verbatim. If the Workflow tool is unavailable, invoke `@pr-reviewer`
-  and `@pr-auditor` directly in parallel (single message, two `Agent`
-  tool calls) with the PR number as scope and the same verdict handling.
+  `@pr-reviewer` agents, adversarially verifies each Critical or Should
+  finding and each MUST violation, runs `@pr-auditor` alongside, and
+  returns one report with a reviewer verdict (`READY TO MERGE`,
+  `BLOCKING ISSUES`, `NON-BLOCKING ISSUES ONLY`) and an audit verdict
+  (`AUDIT PASS`, `AUDIT FAIL`). Save the report as
+  `target/xtask/review/pr<N>/<mode>-<head>.md` and surface both verdict
+  lines to the user verbatim. If the Workflow tool is unavailable, invoke
+  `@pr-reviewer` and `@pr-auditor` directly in parallel (single message,
+  two `Agent` tool calls) with the PR number as scope and the same verdict
+  handling.
 
   Findings are fixed as one batch per run, whatever their severity:
   `AUDIT FAIL` items via `gh pr edit`, `gh issue edit`, or commits;
   reviewer findings via commits. A finding the verifiers contested is put
-  to the user; it resolves as a fix or, when it misreads a rule, as a
-  clarification of that rule's text in the same PR. No finding is
-  waived, ruled, or exempted anywhere but in the standards themselves. A
-  finding that names a MUST violation of the standards is not deferrable
-  whatever severity the reviewer gave it; it is fixed before the merge
-  prompt. A genuine deferral is an Issue filed with the user's approval,
-  per "Completeness" below.
+  to the user; it resolves as a fix, as a clarification of the rule it
+  misread in the same PR, or, when the user finds it false on the facts,
+  as dropped with the reason stated. A finding no verifier could judge is
+  treated as confirmed. No finding is waived, ruled, or exempted anywhere
+  but in the standards themselves. A genuine deferral is an Issue filed
+  with the user's approval, per "Completeness" below.
 
   After the fixes are pushed and CI is green again, run the workflow in
-  `delta` mode. Prompt for the merge decision only when a run returns no
-  findings and `AUDIT PASS`. Merge via
+  `delta` mode. Prompt for the merge decision only when a run completes
+  with no failed agent, `READY TO MERGE`, and `AUDIT PASS`. Merge via
   `gh pr merge <N> --merge --delete-branch`.
 - On red: surface the failing job's tail (`gh run view <run-id> --log-failed`
   or equivalent) so the user can see the actual error without asking.
@@ -98,7 +99,7 @@ truth for "how work is tracked and shipped" on this project.
 - A documentation-only or comment-only change, as
   [docs/testing.md](../docs/testing.md) "Coverage tiers" defines it,
   requires none of the runs above (the CI gate builds and boots both
-  architectures); the pre-merge audit still applies, and the PR body MUST
+  architectures); the pre-merge review still applies, and the PR body MUST
   state the validated head and the documentation-only delta.
 
 ## Completeness

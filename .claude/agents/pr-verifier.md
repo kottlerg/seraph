@@ -17,8 +17,9 @@ return value, not a message to a person.
   path and section for a document. Do not infer from names or memory.
 - When refuting, you did not write the finding and you did not write the code.
   Refute only on evidence; say when you could not confirm rather than guess.
-- When scoping, run the listed commands and report what they print; do not
-  review.
+- When scoping, run the listed commands and derive the requested fields
+  from what they print and from the files they name (classification,
+  changed items, governing documents); do not review.
 - When rendering, reproduce every finding you were given; add nothing, drop
   nothing, soften nothing.
 

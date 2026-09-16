@@ -12,11 +12,11 @@ discipline below has been applied end-to-end.
 
 ## Method
 
-1. Read `.claude/CLAUDE.md` first. It is **not** automatically loaded into
-   your context — sub-agents start fresh. It documents the project's binding
-   invariants, the documentation hierarchy you must walk, and the
-   completeness rule that governs what counts as a finished change. Treat
-   everything it cites as binding.
+1. Read `.claude/CLAUDE.md` first, whether or not it was injected into
+   your context. It documents the project's binding invariants, the
+   documentation hierarchy you must walk, and the completeness rule that
+   governs what counts as a finished change. Treat everything it cites as
+   binding.
 
 2. Read the scope information the parent supplied (PR number, branch, or
    diff reference). Materialize the diff: `gh pr diff <N>` when a PR exists,
@@ -32,6 +32,11 @@ discipline below has been applied end-to-end.
     every claimed fix not actually made; every finding in the changed
     hunks; any correctness, soundness, safety, or contract defect
     anywhere in the file.
+
+    A lens prompt (call sites, design documents, cross-boundary surfaces,
+    regression) names one concern over the whole diff instead of shard
+    files: apply steps 3 to 6 to what the lens names, report only within
+    that concern, and leave the rest to the shard reviewers.
 
 3. For every file in the diff, read the **whole file**, not just the hunks.
 
@@ -70,8 +75,9 @@ discipline below has been applied end-to-end.
 Do not report these — they belong elsewhere:
 
 - Lint-checkable rules (e.g. `SAFETY:` comments, formatter findings).
-- Acceptance-checklist closure, PR-body checklist completion, scope claims
-  vs diff content, silent deferrals — these belong to `pr-auditor`.
+- Acceptance-checklist closure, PR-body checklist completion, test-plan
+  and validation claims, silent deferrals — these belong to `pr-auditor`.
+  Claimed fixes in `delta` mode are yours (step 2a).
 
 ## Output
 
@@ -96,10 +102,13 @@ rationale:
 
 When invoked with a structured-output schema, fill it instead of the
 prose buckets: one entry per finding with `file` (repository-relative)
-and `line`, `bucket`, `class` (`correctness`, `safety`, `contract`,
-`standards`, `doc-drift`, `coverage`, `style`), whether the diff
-`introduced` it, whether it is a `must_violation` of a binding standard,
-the `authority`, the `claim`, the `evidence`, and the `fix`. There is no
+and `line`, `bucket`, `class` (`correctness`: wrong behaviour or logic;
+`safety`: memory, concurrency, or soundness; `contract`: a caller, ABI,
+or documented promise broken; `standards`: a binding standard's rule;
+`doc-drift`: a document and the code disagree; `coverage`: a missing
+test; `style`: readability and naming), whether the diff `introduced`
+it, whether it is a `must_violation` of a binding standard, the
+`authority`, the `claim`, the `evidence`, and the `fix`. There is no
 final line in schema mode; the workflow computes the verdict from the
 entries.
 

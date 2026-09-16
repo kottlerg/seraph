@@ -91,7 +91,8 @@ mod imp
     /// BSP, after the cycle counter is available. Called exactly once.
     ///
     /// `boot_seed` is the conditioned early-boot seed the bootloader drew from
-    /// the firmware (empty when no source produced one; see `docs/entropy.md`).
+    /// the firmware (empty when no source produced one; see
+    /// `core/kernel/docs/entropy.md`).
     /// `vmgenid_paddr` is the VMGENID GUID physical address (zero when absent);
     /// arming it before `mark_seeded` guarantees no draw precedes snapshot
     /// detection.
@@ -135,11 +136,10 @@ mod imp
 
     /// Mix every available entropy source into the pool.
     ///
-    /// The firmware boot seed (where the bootloader supplied one) and the
-    /// hardware RNG (where present,
-    /// health-gated) are mixed *with* boot-time jitter — never trusted alone.
-    /// With neither a firmware seed nor a hardware RNG this degrades to jitter
-    /// only.
+    /// The firmware boot seed (where the bootloader supplied one) and the hardware
+    /// RNG (where present, health-gated) are mixed *with* boot-time jitter — never
+    /// trusted alone. With neither a firmware seed nor a hardware RNG this degrades
+    /// to jitter only.
     fn seed_pool_from_sources(boot_seed: &[u8])
     {
         use crate::arch::current::entropy as hw;
@@ -147,9 +147,9 @@ mod imp
         let mut seeded = false;
 
         // Firmware-provided boot seed: pre-conditioned by its source (see
-        // docs/entropy.md § Health tests), so absorb it directly rather than
-        // through the raw-source health gate
-        // (which expects raw samples and a 1024-byte startup run).
+        // core/kernel/docs/entropy.md § Health tests), so absorb it directly
+        // rather than through the raw-source health gate (which expects raw
+        // samples and a 1024-byte startup run).
         if !boot_seed.is_empty()
         {
             pool::absorb(boot_seed);

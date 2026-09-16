@@ -63,12 +63,6 @@ mod syscall;
 mod uaccess;
 mod validate;
 
-/// Kernel entry point.
-///
-/// Called by the bootloader with CPU state per `core/boot/docs/kernel-handoff.md`.
-/// `boot_info` is the physical address of a populated [`BootInfo`] structure,
-/// accessible before the kernel's own page tables are established because the
-/// bootloader identity-maps the `BootInfo` region.
 /// Report the KASLR layout at Phase 1.
 ///
 /// A framebuffer-safe summary line (no addresses — the console mirrors to the
@@ -160,6 +154,12 @@ fn report_kaslr(_flags: u32, _image_base: u64, _dm_base: u64) {}
 // the function is `extern "C"` and cannot be marked unsafe per the ABI contract.
 // needless_range_loop/cast_possible_truncation: cpu_idx loop uses the index directly
 // as both slice index and CPU ID; Seraph never has > 2^32 CPUs.
+/// Kernel entry point.
+///
+/// Called by the bootloader with CPU state per `core/boot/docs/kernel-handoff.md`.
+/// `boot_info` is the physical address of a populated [`BootInfo`] structure,
+/// accessible before the kernel's own page tables are established because the
+/// bootloader identity-maps the `BootInfo` region.
 #[unsafe(no_mangle)]
 #[allow(
     clippy::too_many_lines,

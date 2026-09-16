@@ -172,11 +172,12 @@ struct CpuTopology
 /// Conditioned early-boot entropy drawn from UEFI `EFI_RNG_PROTOCOL` or, as a
 /// fallback, from the DTB `/chosen/rng-seed` property.
 ///
-/// `len` is `0` when no source produced a seed; the kernel then degrades to
-/// timing jitter alone. Produced by [`step5c_fetch_boot_entropy`] while boot
-/// services are live and written into [`BootInfo`] by step 9. The `kaslr`
-/// words are a separate draw feeding the KASLR slide / direct-map base
-/// (#252); `kaslr_available` is false when no RNG source produced them.
+/// `len` is `0` when no source produced a seed; the kernel then seeds from its
+/// remaining sources (see `core/kernel/docs/entropy.md`). Produced by
+/// [`step5c_fetch_boot_entropy`] while boot services are live and written into
+/// [`BootInfo`] by step 9. The `kaslr` words are a separate draw feeding the
+/// KASLR slide / direct-map base (#252); `kaslr_available` is false when no RNG
+/// source produced them.
 struct BootEntropy
 {
     /// Random bytes for the entropy pool; only the first `len` are valid.
@@ -772,8 +773,8 @@ unsafe fn step5b_alloc_ap_trampoline(ctx: &UefiContext) -> u64
 /// it and the draw succeeds; a failed KASLR draw after a successful pool draw
 /// returns `len == 32` with `kaslr_available == false`. Otherwise draws from
 /// the DTB `/chosen/rng-seed` reader ([`dtb::parse_rng_seed`]); otherwise
-/// returns `len == 0` and `kaslr_available == false`, and the kernel degrades
-/// to timing jitter and the layout to its deterministic fallback (no
+/// returns `len == 0` and `kaslr_available == false`, and the kernel seeds the
+/// pool from its remaining sources and the layout is deterministic (no
 /// regression). Which firmware exposes which source is documented in
 /// `core/boot/docs/boot-flow.md`.
 ///

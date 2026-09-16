@@ -145,6 +145,15 @@ impl NodeState
 
 // ── Fdt implementation ────────────────────────────────────────────────────────
 
+/// Offset of the token after a property whose data starts at `off` and is
+/// `prop_len` bytes long, rounded up to the 4-byte token alignment. `None` when
+/// a firmware-supplied length would overflow the offset, which ends the walk
+/// like any other unreadable token.
+fn advance_prop(off: u32, prop_len: u32) -> Option<u32>
+{
+    off.checked_add(prop_len.checked_add(3)? & !3)
+}
+
 impl Fdt
 {
     /// Validate and wrap an FDT blob at the given physical address.
@@ -319,7 +328,12 @@ impl Fdt
                     off += 4;
                     let data_off = off;
                     // Advance past prop data (4-byte aligned).
-                    off += (prop_len + 3) & !3;
+                    let Some(next) = advance_prop(off, prop_len)
+                    else
+                    {
+                        break;
+                    };
+                    off = next;
 
                     // Only process properties for nodes within stack depth.
                     if depth == 0 || depth > MAX_DEPTH
@@ -507,7 +521,12 @@ impl Fdt
                     };
                     off += 4;
                     let data_off = off;
-                    off += (prop_len + 3) & !3;
+                    let Some(next) = advance_prop(off, prop_len)
+                    else
+                    {
+                        break;
+                    };
+                    off = next;
 
                     if depth == 0 || depth > MAX_DEPTH
                     {
@@ -652,7 +671,12 @@ impl Fdt
                     };
                     off += 4;
                     let data_off = off;
-                    off += (prop_len + 3) & !3;
+                    let Some(next) = advance_prop(off, prop_len)
+                    else
+                    {
+                        break;
+                    };
+                    off = next;
 
                     if self.string_at(nameoff) == b"timebase-frequency"
                     {
@@ -699,7 +723,7 @@ impl Fdt
                     let nameoff = self.read_struct_u32(off)?;
                     off += 4;
                     let data_off = off;
-                    off += (prop_len + 3) & !3;
+                    off = advance_prop(off, prop_len)?;
                     if self.string_at(nameoff) == name
                     {
                         return Some((data_off, prop_len));
@@ -1221,6 +1245,25 @@ mod tests
     {
         // SAFETY: blob is a valid in-memory FDT built by FdtBuilder.
         unsafe { parse_hart_caps(blob.as_ptr() as u64) }
+    }
+
+    #[test]
+    fn bad_magic_is_rejected()
+    {
+        let mut blob = tree(None, |b| cpu_node(b, b"cpu@0", 0, &[]));
+        blob[0..4].copy_from_slice(&0xdead_beef_u32.to_be_bytes());
+        // SAFETY: blob is a valid in-memory buffer of at least 40 bytes.
+        assert!(unsafe { Fdt::from_raw(blob.as_ptr() as u64) }.is_none());
+    }
+
+    #[test]
+    fn struct_block_past_totalsize_is_rejected()
+    {
+        let mut blob = tree(None, |b| cpu_node(b, b"cpu@0", 0, &[]));
+        // Header byte offset 36 is `size_dt_struct`.
+        blob[36..40].copy_from_slice(&u32::MAX.to_be_bytes());
+        // SAFETY: blob is a valid in-memory buffer of at least 40 bytes.
+        assert!(unsafe { Fdt::from_raw(blob.as_ptr() as u64) }.is_none());
     }
 
     #[test]

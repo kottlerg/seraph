@@ -68,23 +68,26 @@ claims.
    branch name — is a FAIL.
 
 9. Validation claim: the PR body's `## Validation` section states the
-   validated head X. When the body claims a documentation-only or
-   comment-only delta under `docs/testing.md` § Coverage tiers, X MUST be
-   the merge base or a commit in the PR's history, and `git diff X <head>`
-   MUST alter, Markdown aside, only comment lines, with the build-embedded
-   text that section names (`include_str!`, `include_bytes!`,
-   `global_asm!` inputs) counted as build input, not comment. FAIL when X
-   is not in the PR's history, when that range is not documentation or
-   comments only, or when the body claims the whole PR is
-   documentation-only and the PR diff is not. PASS when the body makes no
-   such claim.
+   validated head X. X MUST be the PR head, or X MUST be the merge base
+   or a commit in the PR's history and `git diff X <head>` MUST alter,
+   Markdown aside, only comment lines, with the build-embedded text
+   `docs/testing.md` § Coverage tiers names (`include_str!`,
+   `include_bytes!`, `global_asm!` inputs) counted as build input, not
+   comment. FAIL when X is absent, when X is not in the PR's history, when
+   X is not the head and that range is not documentation or comments
+   only, or when the body claims the whole PR is documentation-only and
+   the PR diff is not.
+
+10. PR-body claims: the Summary and Changes prose against the diff. Every
+    file, argument, behaviour, or number the body describes MUST exist in
+    the diff as described; a stale or false description is a FAIL.
 
 ## Output
 
 A per-section verdict, each PASS or FAIL: PR-body checklist; per-issue
 closure with per-criterion lines; silent-deferral scan (FAIL on any
 unreconciled hit); test-plan honesty (FAIL on any bare tick);
-commit-message compliance; validation claim. When invoked with a
+commit-message compliance; validation claim; PR-body claims. When invoked with a
 structured-output schema, fill it instead of the prose: one section per
 step with its verdict and items, and the overall verdict; there is no
 final line in schema mode.

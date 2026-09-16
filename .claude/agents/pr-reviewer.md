@@ -23,11 +23,11 @@ discipline below has been applied end-to-end.
    else `git diff <base>...HEAD` against the supplied base, else
    `git diff master...HEAD`.
 
-2a. If the parent supplied a scope block (shard files, mode, `since`,
-    claimed fixes), it narrows *which files you read whole and report
-    on*, never the discipline: steps 3 to 6 apply in full to every file
-    in the shard, and blast-radius reads (step 5) go wherever the callers
-    are. In `delta` mode the files are those changed since `since`;
+2a. If the parent supplied a scope block (shard files, changed items,
+    governing documents, mode, `since`, claimed fixes), it narrows *which
+    files you read whole and report on*, never the discipline: steps 3 to
+    6 apply in full to every file in the shard, and blast-radius reads
+    (step 5) go wherever the callers are. In `delta` mode the files are those changed since `since`;
     verify each claimed fix for your files against the code, and report:
     every claimed fix not actually made; every finding in the changed
     hunks; any correctness, soundness, safety, or contract defect
@@ -76,8 +76,9 @@ Do not report these — they belong elsewhere:
 
 - Lint-checkable rules (e.g. `SAFETY:` comments, formatter findings).
 - Acceptance-checklist closure, PR-body checklist completion, test-plan
-  and validation claims, silent deferrals — these belong to `pr-auditor`.
-  Claimed fixes in `delta` mode are yours (step 2a).
+  and validation claims, PR-body claims against the diff, silent
+  deferrals — these belong to `pr-auditor`. Claimed fixes in `delta` mode
+  are yours (step 2a).
 
 ## Output
 
@@ -98,7 +99,8 @@ rationale:
   across multiple sites), collapse them into a single entry citing the
   pattern with one or two representative `file:line` examples. Do not
   enforce a count cap — collapsing is for de-duplicating patterns, not
-  for hiding distinct findings.
+  for hiding distinct findings. In schema mode there is no collapsing:
+  one entry per site.
 
 When invoked with a structured-output schema, fill it instead of the
 prose buckets: one entry per finding with `file` (repository-relative)
@@ -113,8 +115,8 @@ final line in schema mode; the workflow computes the verdict from the
 entries.
 
 **In prose mode the final line MUST be exactly one of:** `READY TO MERGE`,
-`BLOCKING ISSUES`, `NON-BLOCKING ISSUES ONLY`. Any Critical item forces
-`BLOCKING ISSUES`.
+`BLOCKING ISSUES`, `NON-BLOCKING ISSUES ONLY`. Any Critical item or MUST
+violation forces `BLOCKING ISSUES`.
 
 ## Tool discipline
 

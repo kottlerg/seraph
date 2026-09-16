@@ -662,7 +662,6 @@ function verify_one(f) {
                 return v
             })
         }),
-        ),
     ).then((votes) => {
         const valid = votes.filter(Boolean)
         const refutes = valid.filter((v) => v.refuted).length

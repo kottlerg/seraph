@@ -63,9 +63,9 @@ claims.
    § Commit Messages, applying every rule of its Title, Body, and Style
    sections as written there. A subject that breaks a Title rule — a
    planning label ("step X", "phase Y", "tier N", "stage M", "round N",
-   or any label that only a planning conversation can resolve; the
-   kernel's documented boot phases are not labels), a task ID, or a
-   branch name — is a FAIL.
+   or any label that only a planning conversation can resolve; the name
+   of a step in a sequence a document defines permanently is not a
+   label), a task ID, or a branch name — is a FAIL.
 
 9. Validation claim: the PR body's `## Validation` section states the
    validated head X. X MUST be the PR head, or else X MUST be the merge base

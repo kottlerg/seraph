@@ -191,8 +191,8 @@ are forbidden; `master` MUST NOT receive force pushes.
   as one batch. A finding the verifiers contested MUST be put to the
   maintainer and MUST resolve in the same PR as a fix, as a clarification of
   the rule it misread, or, when the maintainer finds it false on the facts,
-  as a clarification of the code or document it misread. No finding MAY be
-  waived or ruled outside the standards. The merge prompt MUST follow a
+  as a clarification of the code or document it misread. A finding MUST
+  NOT be waived or ruled outside the standards. The merge prompt MUST follow a
   completed run with no failed agent, `READY TO MERGE`, and `AUDIT PASS`.
   `.claude/CLAUDE.md` § PR workflow operations gives the assistant's
   procedure.
@@ -267,4 +267,4 @@ Producing a release for tag `v<X>.<Y>.<Z>`:
 
 ## Summarized By
 
-[README.md](../README.md), [testing.md](testing.md)
+[README.md](../README.md), [build-system.md](build-system.md), [testing.md](testing.md)

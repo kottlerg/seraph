@@ -306,7 +306,7 @@ paging mode (sv48 — per-mode runs via `cargo xtask run --riscv-mmu sv39|sv57`
 are manual, same posture as CPU-count variations). The `virtio-rng` device is
 the KASLR boot-entropy source: the firmware's RNG driver binds it and exposes
 `EFI_RNG_PROTOCOL`, which the bootloader draws from (on riscv64 it is the only
-such source).
+such source; see [core/kernel/docs/entropy.md](../core/kernel/docs/entropy.md)).
 A device or filesystem joining the default boot set joins the canonical
 cells automatically; variants belong to the tiers below.
 

@@ -490,7 +490,7 @@ unsafe fn kernel_entry_post_rebase(
         // randomized kernel image and direct-map bases defeat KASLR if
         // disclosed. All Phase-3 consumers of the two bases have run; later
         // phases read only layout-free BootInfo fields.
-        for b in boot_entropy_seed.iter_mut()
+        for b in &mut boot_entropy_seed
         {
             // SAFETY: `b` is a valid exclusive reference into the local array.
             // Volatile so the scrub of a value never read again is not elided.

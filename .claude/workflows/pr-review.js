@@ -600,8 +600,9 @@ phase('Review')
 
 const seen = []
 
-// A later finding on the same file, class, bucket, and MUST-violation flag
-// within DEDUP_LINE_SLACK lines is the same finding; its claim and evidence
+// A later finding from another agent on the same file, class, bucket, and
+// MUST-violation flag within DEDUP_LINE_SLACK lines is the same finding (one
+// agent's own adjacent findings are distinct by construction); its claim and evidence
 // are kept on the first record. Anything that differs in bucket or in the
 // MUST-violation flag is a distinct finding with its own verification, so a
 // stronger finding is never absorbed into a weaker record.
@@ -611,6 +612,7 @@ function dedup(findings, source) {
         f.file = normalize(f.file)
         const dup = seen.find(
             (s) =>
+                s.source !== source &&
                 s.file === f.file && s.class === f.class && s.bucket === f.bucket &&
                 s.must_violation === f.must_violation &&
                 Math.abs(s.line - f.line) <= DEDUP_LINE_SLACK,
@@ -793,7 +795,8 @@ const SYNTH_PROMPT = [
     'Rules: every finding below appears exactly once, under its bucket, with its status tag; ' +
         'do not drop, add, merge, re-rank, or soften a finding. You may order entries within ' +
         'a bucket by file and group entries that share one root cause under one lead entry ' +
-        'that still lists every file:line. Each entry: `file:line` [status] claim, with ' +
+        'that still lists every file:line, each site with its own status and MUST-violation ' +
+        'tags. Each entry: `file:line` [status] claim, with ' +
         '`(MUST violation)` after the status when must_violation is true, since such an entry ' +
         'blocks the merge whatever its bucket. Authority: ' +
         'the cited authority. Rationale: one sentence from the evidence. Fix: the proposed ' +

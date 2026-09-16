@@ -132,10 +132,10 @@ on x86-64 OVMF and by the firmware's `VirtioRngDxe` driver binding the
 seed at all, since its EDK2 exposes no RNG on its own and hands the bootloader ACPI
 rather than a DTB). A DTB `/chosen/rng-seed` reader is a secondary fallback for
 firmware that delivers a DTB: a draw of at least 24 bytes is split, the first 16
-bytes to the KASLR word and the rest to the pool seed, and a shorter draw feeds
-the pool alone; the property is scrubbed from the blob in place. When neither source yields a seed the length is zero,
-the KASLR entropy is absent, and the kernel degrades to timing jitter and the
-deterministic layout.
+bytes to the KASLR word and the rest to the pool seed, and a shorter draw feeds the
+pool alone; the property is scrubbed from the blob in place. When neither source
+yields a seed the length is zero, the KASLR entropy is absent, and the kernel
+degrades to timing jitter and the deterministic layout.
 See [core/kernel/docs/entropy.md](../../kernel/docs/entropy.md).
 
 Detail: [firmware-parsing.md](firmware-parsing.md)

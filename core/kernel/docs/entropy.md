@@ -61,12 +61,13 @@ Three source classes are mixed into the pool:
   set's `virtio-rng`; without a seed from either origin, `boot_entropy_len == 0`
   and the pool falls back to jitter (see "Boot-time entropy").
 - **Hardware RNG** — drawn through the `arch::current::entropy` contract
-  (`hw_rng_available`, `hw_rng_u64`; [arch-interface.md § entropy](arch-interface.md#entropy--archcurrententropy)). On x86-64 this is RDSEED (a conditioned,
-  seed-grade source, preferred) with an RDRAND fallback, CPUID-gated, each with
-  bounded retry on the transient not-ready condition the ISA permits. Hardware
-  output is health-gated (below) before it is trusted. riscv64 has no S-mode
-  hardware RNG — the `Zkr` `seed` CSR is M-mode-owned (`mseccfg.SSEED`) — so
-  `hw_rng_available` is false there.
+  (`hw_rng_available`, `hw_rng_u64`; [arch-interface.md §
+  entropy](arch-interface.md#entropy--archcurrententropy)). On x86-64 this is
+  RDSEED (a conditioned, seed-grade source, preferred) with an RDRAND fallback,
+  CPUID-gated, each with bounded retry on the transient not-ready condition the
+  ISA permits. Hardware output is health-gated (below) before it is trusted.
+  riscv64 has no S-mode hardware RNG — the `Zkr` `seed` CSR is M-mode-owned
+  (`mseccfg.SSEED`) — so `hw_rng_available` is false there.
 - **Timing jitter** — cycle-counter samples (`read_cycle_counter`: TSC on
   x86-64; the `time` CSR on riscv64) taken at distinct interrupt event classes.
   This is the always-available source.

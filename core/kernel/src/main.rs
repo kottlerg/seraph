@@ -148,18 +148,18 @@ fn report_kaslr(flags: u32, image_base: u64, dm_base: u64)
 #[cfg(test)]
 fn report_kaslr(_flags: u32, _image_base: u64, _dm_base: u64) {}
 
-// too_many_lines: kernel_entry is the single-entry boot sequence; splitting it would
-// obscure the sequential phase structure without reducing actual complexity.
-// not_unsafe_ptr_arg_deref: boot_info is validated (null + alignment) before deref;
-// the function is `extern "C"` and cannot be marked unsafe per the ABI contract.
-// needless_range_loop/cast_possible_truncation: cpu_idx loop uses the index directly
-// as both slice index and CPU ID; Seraph never has > 2^32 CPUs.
 /// Kernel entry point.
 ///
 /// Called by the bootloader with CPU state per `core/boot/docs/kernel-handoff.md`.
 /// `boot_info` is the physical address of a populated [`BootInfo`] structure,
 /// accessible before the kernel's own page tables are established because the
 /// bootloader identity-maps the `BootInfo` region.
+// too_many_lines: kernel_entry is the single-entry boot sequence; splitting it would
+// obscure the sequential phase structure without reducing actual complexity.
+// not_unsafe_ptr_arg_deref: boot_info is validated (null + alignment) before deref;
+// the function is `extern "C"` and cannot be marked unsafe per the ABI contract.
+// needless_range_loop/cast_possible_truncation: cpu_idx loop uses the index directly
+// as both slice index and CPU ID; Seraph never has > 2^32 CPUs.
 #[unsafe(no_mangle)]
 #[allow(
     clippy::too_many_lines,
@@ -490,7 +490,12 @@ unsafe fn kernel_entry_post_rebase(
         // randomized kernel image and direct-map bases defeat KASLR if
         // disclosed. All Phase-3 consumers of the two bases have run; later
         // phases read only layout-free BootInfo fields.
-        boot_entropy_seed.fill(0);
+        for b in boot_entropy_seed.iter_mut()
+        {
+            // SAFETY: `b` is a valid exclusive reference into the local array.
+            // Volatile so the scrub of a value never read again is not elided.
+            unsafe { core::ptr::write_volatile(b, 0) };
+        }
         // SAFETY: the direct map covers all RAM since Phase 3; boot_info_phys
         // was validated in Phase 0. Single-threaded boot, and no live BootInfo
         // reference aliases the page at this point. Volatile stores so the

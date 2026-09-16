@@ -53,8 +53,9 @@ mod imp
 
     static CPURNG_PTR: AtomicPtr<CpuRng> = AtomicPtr::new(core::ptr::null_mut());
 
-    /// Allocate per-CPU generator storage and the central pool from the buddy
-    /// allocator. Phase 4; must precede [`init`]. Called exactly once.
+    /// Allocate the per-CPU generators, the central pool, the per-CPU jitter
+    /// accumulators, and the self-test sample slab from the buddy allocator.
+    /// Phase 4; must precede [`init`]. Called exactly once.
     pub fn init_storage(cpu_count: u32, allocator: &mut BuddyAllocator)
     {
         let n = cpu_count as usize;

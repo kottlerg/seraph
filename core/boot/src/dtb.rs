@@ -286,7 +286,12 @@ impl Fdt
                     }
                     depth += 1;
                     // Skip null-terminated, 4-byte-aligned node name.
-                    off = skip_node_name(self, off);
+                    let Some(next) = skip_node_name(self, off)
+                    else
+                    {
+                        break;
+                    };
+                    off = next;
                 }
                 FDT_END_NODE =>
                 {
@@ -485,7 +490,12 @@ impl Fdt
                         };
                     }
                     depth += 1;
-                    off = skip_node_name(self, off);
+                    let Some(next) = skip_node_name(self, off)
+                    else
+                    {
+                        break;
+                    };
+                    off = next;
                 }
                 FDT_END_NODE =>
                 {
@@ -652,7 +662,12 @@ impl Fdt
             {
                 FDT_BEGIN_NODE =>
                 {
-                    off = skip_node_name(self, off);
+                    let Some(next) = skip_node_name(self, off)
+                    else
+                    {
+                        break;
+                    };
+                    off = next;
                 }
                 FDT_END_NODE | FDT_NOP =>
                 {}
@@ -713,7 +728,7 @@ impl Fdt
             off += 4;
             match token
             {
-                FDT_BEGIN_NODE => off = skip_node_name(self, off),
+                FDT_BEGIN_NODE => off = skip_node_name(self, off)?,
                 FDT_END_NODE | FDT_NOP =>
                 {}
                 FDT_PROP =>
@@ -754,7 +769,7 @@ impl Fdt
 // `len` (usize) is bounded by `max` which equals `size_struct.saturating_sub(start)` (u32),
 // so the `len as u32` cast below cannot truncate.
 #[allow(clippy::cast_possible_truncation)]
-fn skip_node_name(fdt: &Fdt, start: u32) -> u32
+fn skip_node_name(fdt: &Fdt, start: u32) -> Option<u32>
 {
     let base_addr = fdt.base + u64::from(fdt.off_struct) + u64::from(start);
     let max = fdt.size_struct.saturating_sub(start) as usize;
@@ -769,8 +784,11 @@ fn skip_node_name(fdt: &Fdt, start: u32) -> u32
             break;
         }
     }
-    // Round up to 4-byte alignment. `len ≤ max ≤ size_struct (u32::MAX)` so cast is exact.
-    (start + len as u32 + 3) & !3
+    // Round up to 4-byte alignment. `len ≤ max ≤ size_struct (u32::MAX)` so the
+    // cast is exact; a firmware-supplied name that runs to the end of the block
+    // can still overflow the offset, which ends the walk like any other
+    // unreadable token.
+    advance_prop(start, len as u32)
 }
 
 /// Check whether `data` (a null-separated compatible string list) contains
@@ -1260,10 +1278,32 @@ mod tests
     fn struct_block_past_totalsize_is_rejected()
     {
         let mut blob = tree(None, |b| cpu_node(b, b"cpu@0", 0, &[]));
-        // Header byte offset 36 is `size_dt_struct`.
-        blob[36..40].copy_from_slice(&u32::MAX.to_be_bytes());
+        // Header byte offsets: 4 is `totalsize`, 36 is `size_dt_struct`. A struct
+        // block one byte longer than the blob, with no arithmetic overflow, must
+        // fail the bounds check itself.
+        let total = u32::from_be_bytes(blob[4..8].try_into().unwrap());
+        blob[36..40].copy_from_slice(&(total - 40 + 1).to_be_bytes());
         // SAFETY: blob is a valid in-memory buffer of at least 40 bytes.
         assert!(unsafe { Fdt::from_raw(blob.as_ptr() as u64) }.is_none());
+    }
+
+    #[test]
+    fn property_length_overflow_ends_the_walk()
+    {
+        let mut blob = tree(None, |b| cpu_node(b, b"cpu@0", 0, &[]));
+        // The first FDT_PROP token in the struct block is followed by its
+        // length cell; a length that overflows the offset must end the walk
+        // with the results collected before it, not panic.
+        let structs = 40..blob.len();
+        let prop = structs
+            .step_by(4)
+            .find(|&i| u32::from_be_bytes(blob[i..i + 4].try_into().unwrap()) == FDT_PROP)
+            .expect("the tree has a property");
+        blob[prop + 4..prop + 8].copy_from_slice(&u32::MAX.to_be_bytes());
+        // SAFETY: blob is a valid in-memory FDT built by FdtBuilder.
+        let (count, _) = unsafe { parse_cpu_count(blob.as_ptr() as u64) };
+        assert_eq!(count, 0);
+        assert_eq!(hart_caps(&blob), (0, 0));
     }
 
     #[test]

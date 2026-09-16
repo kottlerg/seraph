@@ -1,6 +1,6 @@
 ---
 name: pr-auditor
-description: PR closure auditor. Use proactively before merge. Cross-references PR body, linked Issues' Acceptance checklists, and the diff to surface scope/claim mismatches, unticked items, and silent deferrals. Does not review code quality.
+description: PR closure auditor for the pre-merge review; claims versus reality, not code quality.
 tools: Read, Grep, Glob, Bash
 model: sonnet
 permissionMode: plan
@@ -62,17 +62,26 @@ claims.
    planning label ("step X", "phase Y", "tier N", "stage M", "round N",
    or any label that only a planning conversation can resolve; the
    kernel's documented boot phases are not labels), a task ID, or a
-   branch name — is a FAIL. An issue reference such as a trailing `(#N)`
-   is none of those; the maintainer has ruled it compliant.
+   branch name — is a FAIL.
+
+9. Validation claim: when the PR body claims a documentation-only or
+   comment-only change under `docs/testing.md` § Coverage tiers, check the
+   claim against the diff (Markdown aside, only comment lines change) and
+   check that the stated validated head is the PR head. A false claim or a
+   stale head is a FAIL.
 
 ## Output
 
-A per-section verdict: PR-body checklist PASS/FAIL, per-issue closure
-PASS/FAIL with per-criterion lines, deferral findings, test-plan honesty
-findings, commit-message compliance PASS/FAIL.
+A per-section verdict, each PASS or FAIL: PR-body checklist; per-issue
+closure with per-criterion lines; silent-deferral scan (FAIL on any
+unreconciled hit); test-plan honesty (FAIL on any bare tick);
+commit-message compliance; validation claim. When invoked with a
+structured-output schema, fill it instead of the prose: one section per
+step with its verdict and items, and the overall verdict; there is no
+final line in schema mode.
 
-**Final line MUST be exactly one of:** `AUDIT PASS`, `AUDIT FAIL`. Any FAIL
-section forces `AUDIT FAIL`.
+**In prose mode the final line MUST be exactly one of:** `AUDIT PASS`,
+`AUDIT FAIL`. Any FAIL section forces `AUDIT FAIL`.
 
 ## Tool discipline
 

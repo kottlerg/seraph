@@ -167,8 +167,9 @@ cargo xtask compose-bundle [--arch x86_64|riscv64] [--harness init|ktest]
 | `--arch` | `x86_64` | Target architecture — must match the existing sysroot's arch tag |
 | `--harness` | `init` | Which binary becomes the bundle's `init` entry: `init` for the regular userspace init, `ktest` for the kernel-test harness |
 
-`--harness init` produces a 7-entry bundle (`init` + 6 boot modules in
-the order the bootloader expects). `--harness ktest` produces a
+`--harness init` produces a 9-entry bundle (`init` + the 8 boot modules
+listed in `xtask/src/bundle.rs::MODULES`, in the order the bootloader
+expects). `--harness ktest` produces a
 single-entry bundle (`ktest` as the `init` entry, zero modules); ktest
 is monolithic and does not spawn userspace.
 
@@ -256,10 +257,19 @@ cargo xtask run-parallel \
 | `--mem` | `512` | Guest memory size in MiB |
 | `--riscv-mmu` | `sv48` | Guest RISC-V paging-mode ceiling (riscv64 only, ignored on x86_64); same semantics as `cargo xtask run --riscv-mmu` |
 | `--pass` | `ALL TESTS PASSED` | Regex marking a successful run. The default matches the cross-harness terminal marker `[<harness>] ALL TESTS PASSED` standardised in [docs/testing.md](../docs/testing.md). On match the log is discarded and the run is classified `PASS` |
-| `--fail` | `SOME TESTS FAILED\|KERNEL EXCEPTION\|FATAL:\|PANIC( at \|: )\|=== WATCHDOG\|entropy: SELFTEST FAIL` | Regex marking a failed run; the **first** match wins. Matches the cross-harness terminal marker `[<harness>] SOME TESTS FAILED` ([docs/testing.md](../docs/testing.md)) plus the kernel's own death markers (`KERNEL EXCEPTION` + `FATAL:` for a hardware trap, `PANIC at`/`PANIC:` for a Rust `panic!`, `=== WATCHDOG` for a scheduler wedge-detector dump, `entropy: SELFTEST FAIL` for a kernel entropy self-test failure) so a crash classifies `FAIL` rather than `HANG`. The benign `USERSPACE FAULT` path matches none of these. On match the log is preserved as `FAIL-<run>.log`. Failure takes precedence over success. Override with a never-matching pattern (e.g. `'$.^'`) to disable |
+| `--fail` | `SOME TESTS FAILED\|KERNEL EXCEPTION\|FATAL:\|PANIC( at \|: )\|=== WATCHDOG\|entropy: SELFTEST FAIL` | Regex marking a failed run; the **first** match wins, the log is preserved as `FAIL-<run>.log`, and failure takes precedence over success. The default's markers are explained below the table |
 | `--fail-grace-secs` | `10` | After the first `--fail` match, wait this many seconds (bounded by `--timeout`) before SIGKILL, so the trailing fault dump still lands in the log. A crashed run thus aborts ~grace seconds after the first match instead of idling to `--timeout` |
 | `--debug-listen` | off | Expose each guest's gdbstub without pausing it (QEMU `-s`, tcp::1234) so a wedged guest can be attached post-hoc: `gdb -ex 'target remote :1234'`. Requires `--parallel 1` (one gdbstub port) |
 | `--hold-on-hang` | off | On a hard-timeout `HANG` (no `--fail` match), do not kill QEMU: print the attach instructions and block until the instance is terminated externally, preserving the wedged guest for a debugger. Pair with `--debug-listen`. Requires `--parallel 1` |
+
+The default `--fail` regex matches the cross-harness terminal marker
+`[<harness>] SOME TESTS FAILED` ([docs/testing.md](../docs/testing.md)) plus the
+kernel's own death markers: `KERNEL EXCEPTION` and `FATAL:` for a hardware trap,
+`PANIC at` or `PANIC:` for a Rust `panic!`, `=== WATCHDOG` for a scheduler
+wedge-detector dump, and `entropy: SELFTEST FAIL` for a kernel entropy self-test
+failure, so a crash classifies `FAIL` rather than `HANG`. The benign `USERSPACE
+FAULT` path matches none of these. Override with a never-matching pattern (for
+example `'$.^'`) to disable.
 
 **Mode-agnostic**: xtask does not know about ktest, svctest, or any other
 rootfs configuration. Pass/fail markers come from the invoker. The default
@@ -308,9 +318,12 @@ QEMU headless with a QMP control socket, waits for the guest to print
 sequence (`help`, a stray `x`, Backspace, Return) via QMP `input-send-event`,
 and asserts — host-side — that the terminal's local echo, the shell's `$ `
 prompt, and the relayed `help` output (`shell built-ins:`) appear on the serial
-stream. Exits non-zero on an injection error or the 180 s timeout. This subsumes
-the former standalone keyboard smoke test: the echoed `help` proves keysym
-decode, and Return/Backspace prove the named-key decodes.
+stream. After the keyboard round passes, the transcript is cleared and the same
+sequence is written to the guest UART over QEMU's bidirectional `-serial stdio`,
+with the same echo, prompt, and `shell built-ins:` assertions (the serial RX
+round, #291). Exits non-zero on an injection error or the 180 s timeout. This
+subsumes the former standalone keyboard smoke test: the echoed `help` proves
+keysym decode, and Return/Backspace prove the named-key decodes.
 
 A pure runner — it neither builds nor stages. `terminal.svc` is in the default
 boot set, so the terminal autostarts; just build and repack:
@@ -398,4 +411,6 @@ See [docs/testing.md](../docs/testing.md) for the harness model and
 [core/kernel/docs/entropy.md](../core/kernel/docs/entropy.md),
 [core/ktest/README.md](../core/ktest/README.md),
 [core/boot/README.md](../core/boot/README.md),
+[core/boot/docs/riscv-uefi-boot.md](../core/boot/docs/riscv-uefi-boot.md),
+[docs/architecture.md](../docs/architecture.md),
 [programs/terminal/README.md](../programs/terminal/README.md)

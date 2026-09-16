@@ -80,7 +80,7 @@ MMIO peripherals are matched by an exact entry in the node's
 without warning; `devmgr` is responsible for identifying every other
 device.
 
-PCI host bridges match `pci-host-ecam-generic` (and close variants).
+PCI host bridges match `pci-host-ecam-generic`.
 A node's raw `interrupts` values are collected alongside its `reg`
 entries; the bootloader does not resolve `interrupt-parent`, and
 associating lines with a PLIC is a `devmgr` concern.

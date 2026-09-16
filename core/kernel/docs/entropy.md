@@ -52,14 +52,15 @@ Three source classes are mixed into the pool:
 - **Firmware boot seed** — a conditioned draw the bootloader passes to the
   kernel in `BootInfo` (`boot_entropy_seed` / `boot_entropy_len`, boot protocol
   v9): UEFI `EFI_RNG_PROTOCOL` output (a DRBG output) or, for firmware that
-  delivers a DTB, the host-random bytes of `/chosen/rng-seed`;
+  delivers a DTB, the firmware-supplied bytes of `/chosen/rng-seed`;
   [boot-flow.md](../../boot/docs/boot-flow.md) step 5c owns the draw.
   Pre-conditioned by its source, so it is absorbed directly rather than
   health-gated. The protocol is present wherever the firmware implements it or a
   firmware RNG driver binds a device that exposes it — x86-64 OVMF natively
   (RDRAND-backed), riscv64 EDK2 through `VirtioRngDxe` with the default boot
   set's `virtio-rng`; without a seed from either origin, `boot_entropy_len == 0`
-  and the pool falls back to jitter (see "Boot-time entropy").
+  and the pool seeds from the remaining sources below (jitter only where no
+  hardware RNG is present; see "Boot-time entropy").
 - **Hardware RNG** — drawn through the `arch::current::entropy` contract
   (`hw_rng_available`, `hw_rng_u64`; [arch-interface.md §
   entropy](arch-interface.md#entropy--archcurrententropy)). On x86-64 this is
@@ -342,7 +343,9 @@ continuous validator.
   fixed generation GUID, saves the guest via QMP migrate-to-file, restores it
   under a different GUID with `-incoming`, and asserts the kernel's
   `entropy: VM generation change detected` line plus a post-resume
-  interactive liveness round. See [docs/testing.md](../../../docs/testing.md).
+  interactive liveness round. See
+  [xtask/README.md § test-vmgenid](../../../xtask/README.md#cargo-xtask-test-vmgenid)
+  and [docs/testing.md](../../../docs/testing.md).
 
 ---
 

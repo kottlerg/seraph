@@ -121,7 +121,9 @@ capabilities. The seed covers LAPIC / IOAPIC / PLIC / ECAM / BAR
 windows / `virtio,mmio` transports from the firmware tables and is
 merged with the UEFI memory map's `MemoryMappedIO` regions in step 8.
 
-The bootloader also draws **conditioned early-boot entropy** from UEFI
+### Step 5c: Boot Entropy Seed
+
+The bootloader draws **conditioned early-boot entropy** from UEFI
 `EFI_RNG_PROTOCOL` (`GetRNG`, default algorithm) while boot services are live: a
 32-byte pool seed recorded in `BootInfo.boot_entropy_seed` / `boot_entropy_len`,
 and an independent 16-byte KASLR word (kept separate so neither reveals the other)
@@ -134,8 +136,9 @@ rather than a DTB). A DTB `/chosen/rng-seed` reader is a secondary fallback for
 firmware that delivers a DTB: a draw of at least 24 bytes is split, the first 16
 bytes to the KASLR word and the rest to the pool seed, and a shorter draw feeds the
 pool alone; the property is scrubbed from the blob in place. When neither source
-yields a seed the length is zero, the KASLR entropy is absent, and the kernel
-degrades to timing jitter and the deterministic layout.
+yields a seed the length is zero, the KASLR entropy is absent, the kernel seeds the
+pool from its remaining sources (hardware RNG where present, jitter), and the layout
+is deterministic.
 See [core/kernel/docs/entropy.md](../../kernel/docs/entropy.md).
 
 Detail: [firmware-parsing.md](firmware-parsing.md)

@@ -174,10 +174,10 @@ Each feature is classified per architecture as one of:
 - **Sv57** — a larger-VA expansion above the Sv48 default; used when the
   platform advertises and the probe confirms it.
 - **Zvk vector crypto** — crypto acceleration.
-- **EFI_RNG_PROTOCOL** — the boot seed's sole firmware source on riscv64 (through the
-  firmware's `VirtioRngDxe` binding `virtio-rng`); without it the bootloader's DTB `rng-seed`
-  fallback or jitter applies (see
-  [core/kernel/docs/entropy.md](../core/kernel/docs/entropy.md)).
+- **EFI_RNG_PROTOCOL** — the boot seed's only firmware source under the EDK2 firmware the
+  default boot uses, exposed through the firmware's `VirtioRngDxe` binding `virtio-rng`;
+  firmware that delivers a DTB may supply `/chosen/rng-seed` instead, and with neither the pool
+  seeds from jitter (see [core/kernel/docs/entropy.md](../core/kernel/docs/entropy.md)).
 - **GOP framebuffer, PCIe ECAM** — as on x86-64.
 
 ### Unsupported

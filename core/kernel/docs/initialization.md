@@ -163,7 +163,7 @@ Emit "fatal: cannot build kernel page tables (OOM)" and halt.
 4. Allocate per-CPU subsystem storage from the buddy allocator while it still
    holds large contiguous blocks (before the Phase-7 user-cap drain): scheduler
    per-CPU state and idle stacks, and the entropy subsystem's per-CPU CSPRNGs,
-   central pool, and jitter accumulators (see entropy.md)
+   central pool, jitter accumulators, and self-test sample slab (see entropy.md)
 ```
 
 **Failure mode:** a failed per-CPU storage allocation halts the kernel.
@@ -226,7 +226,7 @@ firmware boot seed in `BootInfo`, the hardware RNG (health-gated where present),
 and boot-time jitter, and opens the kernel draw API; with neither a firmware
 seed nor a hardware RNG this degrades to jitter only. The BSP then scrubs the
 seed and the two KASLR bases from the `BootInfo` page (a Phase-7 reclaim range)
-and from its local copy. See [entropy.md](entropy.md).
+and zeroes its local copy of the seed. See [entropy.md](entropy.md).
 
 **Failure mode:** Hardware initialisation failures (e.g. CPUID indicates a required
 feature is absent) halt with a descriptive message. The specific required features

@@ -29,7 +29,7 @@ boot/
     ├── elf.rs                  # UEFI-allocation layer over `shared/elf` + InitImage construction
     ├── firmware.rs             # ACPI / Device Tree address discovery (dispatch)
     ├── acpi.rs                 # ACPI walker (CPUs, hart caps, MMIO, apertures, VMGENID)
-    ├── dtb.rs                  # Flat Device Tree walker (CPUs, kernel_mmio, apertures, rng-seed)
+    ├── dtb.rs                  # Flat Device Tree walker (CPUs, hart caps, MMIO, rng-seed)
     ├── memory_map.rs           # UEFI memory map → MemoryType; mmio_apertures derivation
     ├── framebuffer.rs          # GOP framebuffer setup
     ├── console.rs              # Early framebuffer console (uses shared/font)
@@ -112,7 +112,7 @@ for details.
 | [docs/boot-flow.md](docs/boot-flow.md) | Ten-step boot sequence, `BootInfo` population, kernel handoff |
 | [docs/uefi-environment.md](docs/uefi-environment.md) | UEFI protocols, memory allocation, `ExitBootServices`, error handling |
 | [docs/elf-loading.md](docs/elf-loading.md) | ELF validation, LOAD segment processing, boot module loading |
-| [docs/firmware-parsing.md](docs/firmware-parsing.md) | ACPI and Device Tree extractors: kernel-facing MMIO bases and coarse MMIO apertures |
+| [docs/firmware-parsing.md](docs/firmware-parsing.md) | ACPI and Device Tree extractors: CPU topology, kernel-facing MMIO bases, coarse MMIO apertures, and the DTB rng-seed fallback |
 | [docs/acpi.md](docs/acpi.md) | ACPI table-walk invariants (RSDP/XSDT/MADT/MCFG) |
 | [docs/dtb.md](docs/dtb.md) | Flat Device Tree walk invariants (header validation, compatible matching, rng-seed extraction and scrub) |
 | [docs/memory-map.md](docs/memory-map.md) | UEFI memory map → `BootInfo.memory_map` translation policy |
@@ -146,8 +146,9 @@ The CPU state established at the kernel entry point is specified in
   the VMGENID GUID address. No per-device descriptors, no
   IRQ descriptors, no PCI enumeration. Namespace evaluation and
   device-level assignment are userspace's responsibility.
-- **No boot menu or interactive UI.** The kernel and bundle ESP paths are
-  hardcoded; there is no boot configuration file and no kernel command line.
+- **No boot menu or interactive UI.** The kernel, bundle, and `nokaslr` knob
+  ESP paths are hardcoded; there is no boot configuration file beyond the
+  presence-only knob and no kernel command line.
 - **No permanent page tables.** The initial tables are minimal and temporary; the
   kernel replaces them during Phase 3 of its initialisation sequence.
 

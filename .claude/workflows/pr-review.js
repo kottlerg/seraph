@@ -601,8 +601,9 @@ phase('Review')
 const seen = []
 
 // A later finding from another agent on the same file, class, bucket, and
-// MUST-violation flag within DEDUP_LINE_SLACK lines is the same finding (one
-// agent's own adjacent findings are distinct by construction); its claim and evidence
+// MUST-violation flag within DEDUP_LINE_SLACK lines is the same finding. A
+// record absorbs at most one finding per agent, so one agent's own adjacent
+// findings stay distinct; its claim and evidence
 // are kept on the first record. Anything that differs in bucket or in the
 // MUST-violation flag is a distinct finding with its own verification, so a
 // stronger finding is never absorbed into a weaker record.
@@ -612,17 +613,20 @@ function dedup(findings, source) {
         f.file = normalize(f.file)
         const dup = seen.find(
             (s) =>
-                s.source !== source &&
+                !s.sources.includes(source) &&
                 s.file === f.file && s.class === f.class && s.bucket === f.bucket &&
                 s.must_violation === f.must_violation &&
                 Math.abs(s.line - f.line) <= DEDUP_LINE_SLACK,
         )
         if (dup) {
             dup.duplicates += 1
+            dup.sources.push(source)
             dup.evidence += '\n[also reported by ' + source + ': ' + f.claim + '] ' + f.evidence
             continue
         }
-        const record = { ...f, source, duplicates: 0, status: 'pending', votes: [] }
+        const record = {
+            ...f, source, sources: [source], duplicates: 0, status: 'pending', votes: [],
+        }
         seen.push(record)
         fresh.push(record)
     }
@@ -643,7 +647,7 @@ function verify_one(f) {
                 label: 'verify:' + lens + ':' + f.file + ':' + f.line,
                 phase: 'Verify',
                 schema: VERDICT_SCHEMA,
-            }).then((v) => (v ? { lens, ...v } : null)),
+            }).then((v) => (v ? { lens, ...v } : null), () => null),
         ),
     ).then((votes) => {
         const valid = votes.filter(Boolean)

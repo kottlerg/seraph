@@ -67,12 +67,14 @@ truth for "how work is tracked and shipped" on this project.
   Findings are fixed as one batch per run, whatever their severity:
   `AUDIT FAIL` items via `gh pr edit`, `gh issue edit`, or commits;
   reviewer findings via commits. A finding the verifiers contested is put
-  to the user; it resolves as a fix, as a clarification of the rule it
-  misread in the same PR, or, when the user finds it false on the facts,
-  as dropped with the reason stated. A finding no verifier could judge is
-  treated as confirmed. No finding is waived, ruled, or exempted anywhere
-  but in the standards themselves. A genuine deferral is an Issue filed
-  with the user's approval, per "Completeness" below.
+  to the user; it resolves in the same PR as a fix, as a clarification
+  of the rule it misread, or, when the user finds it false on the facts,
+  as a clarification of the code or document it misread, so the next run
+  reads what the user knows. Nothing else carries the decision forward.
+  A finding no verifier could judge is treated as confirmed. No finding
+  is waived, ruled, or exempted anywhere but in the standards themselves.
+  A genuine deferral is an Issue filed with the user's approval, per
+  "Completeness" below.
 
   After the fixes are pushed and CI is green again, run the workflow in
   `delta` mode. Prompt for the merge decision only when a run completes

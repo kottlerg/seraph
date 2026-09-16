@@ -320,7 +320,7 @@ cells automatically; variants belong to the tiers below.
 65-vCPU guest is a ~16× thread oversubscription and a 512-vCPU guest is
 infeasible there. High `-smp` coverage is local by design, not an
 oversight. The runs below are procedurally REQUIRED for PRs touching the
-listed paths — binding the same way the pre-merge audit agents are, with
+listed paths — binding the same way the pre-merge review agents are, with
 no CI surface.
 
 ```sh
@@ -382,7 +382,7 @@ and `column!()` record and assertion messages carry, which the CI gate's
 boots cover, so none of the local host runs in this section are required for
 it, whatever paths it touches. Source text a build embeds verbatim
 (`include_str!`, `include_bytes!`, `global_asm!` inputs) is build input, not
-comment or Markdown. The CI gate and the pre-merge audit apply unchanged;
+comment or Markdown. The CI gate and the pre-merge review apply unchanged;
 the PR body MUST state the validated head and that the delta is
 documentation or comments only, and the audit MUST check that against the
 diff.
@@ -474,4 +474,9 @@ note in full.
 
 ## Summarized By
 
-[Conventions](conventions.md), [Root README](../README.md), [core/ktest/README.md](../core/ktest/README.md), [services/svcmgr/README.md](../services/svcmgr/README.md), [services/usertest/README.md](../services/usertest/README.md), [programs/terminal/README.md](../programs/terminal/README.md), [programs/shell/README.md](../programs/shell/README.md)
+[Conventions](conventions.md), [Root README](../README.md),
+[core/ktest/README.md](../core/ktest/README.md),
+[services/svcmgr/README.md](../services/svcmgr/README.md),
+[services/usertest/README.md](../services/usertest/README.md),
+[programs/terminal/README.md](../programs/terminal/README.md),
+[programs/shell/README.md](../programs/shell/README.md)

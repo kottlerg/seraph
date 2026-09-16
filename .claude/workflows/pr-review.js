@@ -75,7 +75,10 @@ const AUDIT_SECTION_NAMES = [
     'commit-message compliance', 'validation claim', 'PR-body claims',
 ]
 const AUDIT_SECTIONS = AUDIT_SECTION_NAMES.length
-const INVESTIGATOR = 'pr-verifier' // read-only agent type for scope, verify, and synthesize
+// Read-only agent type for scope, verify, and synthesize. Its brief pins the
+// model: these stages answer bounded questions, so they run on a cheaper tier
+// than the shard reviewers and lenses, which inherit the session model.
+const INVESTIGATOR = 'pr-verifier'
 
 // ─── Schemas ───
 
@@ -639,7 +642,6 @@ function verify_one(f) {
                 label: 'verify:' + lens + ':' + f.file + ':' + f.line,
                 phase: 'Verify',
                 schema: VERDICT_SCHEMA,
-                effort: 'xhigh',
             }).then((v) => (v ? { lens, ...v } : null)),
         ),
     ).then((votes) => {

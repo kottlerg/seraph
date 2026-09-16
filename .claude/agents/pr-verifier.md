@@ -2,6 +2,7 @@
 name: pr-verifier
 description: Read-only investigator for the pr-review workflow; scope, refute, or render.
 tools: Read, Grep, Glob, Bash
+model: sonnet
 permissionMode: plan
 ---
 

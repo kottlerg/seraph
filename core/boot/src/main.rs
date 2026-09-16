@@ -296,7 +296,8 @@ unsafe fn boot_sequence(image: EfiHandle, st: *mut EfiSystemTable) -> Result<!, 
     let ap_trampoline_phys = unsafe { step5b_alloc_ap_trampoline(&ctx) };
     // SAFETY: ctx.bs valid pre-exit; draws the boot entropy seed while boot
     // services (and thus EFI_RNG_PROTOCOL) are still available; firm.device_tree
-    // is zero or an identity-mapped FDT for the DTB rng-seed fallback.
+    // is zero or an identity-mapped, writable (pre-ExitBootServices) FDT for the
+    // DTB rng-seed fallback's in-place scrub.
     let mut boot_entropy = unsafe { step5c_fetch_boot_entropy(&ctx, &firm) };
     // Apply the KASLR slide before step 6 maps the segments at their
     // (biased) virtual addresses.
@@ -767,12 +768,13 @@ unsafe fn step5b_alloc_ap_trampoline(ctx: &UefiContext) -> u64
 /// Draw conditioned early-boot entropy for the pool seed and the KASLR
 /// slide / direct-map base.
 ///
-/// Draws from UEFI `EFI_RNG_PROTOCOL` when the firmware exposes it and the draw
-/// succeeds, else from
-/// the DTB `/chosen/rng-seed` reader ([`dtb::parse_rng_seed`]), else returns
-/// `len == 0` and `kaslr_available == false`, and the kernel degrades to timing
-/// jitter and the layout to its deterministic fallback (no regression). Which
-/// firmware exposes which source is documented in
+/// Draws the pool seed from UEFI `EFI_RNG_PROTOCOL` when the firmware exposes
+/// it and the draw succeeds; a failed KASLR draw after a successful pool draw
+/// returns `len == 32` with `kaslr_available == false`. Otherwise draws from
+/// the DTB `/chosen/rng-seed` reader ([`dtb::parse_rng_seed`]); otherwise
+/// returns `len == 0` and `kaslr_available == false`, and the kernel degrades
+/// to timing jitter and the layout to its deterministic fallback (no
+/// regression). Which firmware exposes which source is documented in
 /// `core/boot/docs/boot-flow.md`.
 ///
 /// # Safety

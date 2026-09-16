@@ -28,7 +28,7 @@ boot/
     ├── uefi.rs                 # UEFI protocol wrappers and memory services
     ├── elf.rs                  # UEFI-allocation layer over `shared/elf` + InitImage construction
     ├── firmware.rs             # ACPI / Device Tree address discovery (dispatch)
-    ├── acpi.rs                 # ACPI RSDP/XSDT/MADT/MCFG walker (CPUs, MMIO, apertures, VMGENID)
+    ├── acpi.rs                 # ACPI walker (CPUs, hart caps, MMIO, apertures, VMGENID)
     ├── dtb.rs                  # Flat Device Tree walker (CPUs, kernel_mmio, apertures, rng-seed)
     ├── memory_map.rs           # UEFI memory map → MemoryType; mmio_apertures derivation
     ├── framebuffer.rs          # GOP framebuffer setup
@@ -114,7 +114,7 @@ for details.
 | [docs/elf-loading.md](docs/elf-loading.md) | ELF validation, LOAD segment processing, boot module loading |
 | [docs/firmware-parsing.md](docs/firmware-parsing.md) | ACPI and Device Tree extractors: kernel-facing MMIO bases and coarse MMIO apertures |
 | [docs/acpi.md](docs/acpi.md) | ACPI table-walk invariants (RSDP/XSDT/MADT/MCFG) |
-| [docs/dtb.md](docs/dtb.md) | Flat Device Tree walk invariants (header validation, compatible matching) |
+| [docs/dtb.md](docs/dtb.md) | Flat Device Tree walk invariants (header validation, compatible matching, rng-seed extraction and scrub) |
 | [docs/memory-map.md](docs/memory-map.md) | UEFI memory map → `BootInfo.memory_map` translation policy |
 | [docs/console.md](docs/console.md) | Early console (serial + framebuffer): backend discovery, glyph rendering, handoff |
 | [docs/page-tables.md](docs/page-tables.md) | Initial page table construction for x86-64 and RISC-V |
@@ -142,7 +142,8 @@ The CPU state established at the kernel entry point is specified in
   them, extracts the arch-specific MMIO bases the kernel itself needs
   (`BootInfo.kernel_mmio`), and derives a short list of coarse MMIO
   apertures (`BootInfo.mmio_apertures`) from the UEFI memory map unioned
-  with firmware-advertised PCI windows. No per-device descriptors, no
+  with firmware-advertised PCI windows, plus the boot-entropy seed and
+  the VMGENID GUID address. No per-device descriptors, no
   IRQ descriptors, no PCI enumeration. Namespace evaluation and
   device-level assignment are userspace's responsibility.
 - **No boot menu or interactive UI.** The kernel and bundle ESP paths are

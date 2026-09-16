@@ -1,7 +1,7 @@
 # Firmware Parsing
 
 The bootloader performs narrow, targeted firmware parsing to populate
-three parts of `BootInfo`:
+four parts of `BootInfo`:
 
 1. `cpu_count` / `bsp_id` / `cpu_ids` — the CPU topology handed to the
    kernel for SMP bring-up.
@@ -13,6 +13,9 @@ three parts of `BootInfo`:
    regions, used as seeds into the final aperture list that is merged
    with the UEFI memory map's MMIO classifications. The kernel mints
    one `Mmio` capability per aperture entry.
+4. `boot_entropy_seed` / `boot_entropy_len` — the DTB `/chosen/rng-seed`
+   fallback, consulted only when `EFI_RNG_PROTOCOL` yields no seed
+   (DTB-only; see [boot-flow.md](boot-flow.md) step 5c).
 
 The bootloader does **not** emit per-device capabilities, interrupt
 descriptors, PCI ECAM descriptors, or firmware-table read-only caps.
@@ -42,10 +45,11 @@ each found table in the appropriate `BootInfo` field. If a GUID is
 absent, its field is zeroed.
 
 Both fields may be non-zero on a platform that exposes both ACPI and a
-DTB (QEMU+EDK2 on RISC-V hands the bootloader ACPI only). On RISC-V the bootloader runs
-ACPI first for `kernel_mmio` and then lets the DTB pass fill in any
-field ACPI left zero; the two never overwrite each other. Userspace
-handles both passthrough addresses the same way.
+DTB; no currently targeted host does, since QEMU+EDK2 on RISC-V hands
+the bootloader ACPI only. On RISC-V the bootloader runs ACPI first for
+`kernel_mmio` and then lets the DTB pass fill in any field ACPI left
+zero; the two never overwrite each other. Userspace handles both
+passthrough addresses the same way.
 
 ---
 

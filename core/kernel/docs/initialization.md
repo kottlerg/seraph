@@ -224,8 +224,9 @@ Architecture-specific hardware initialization; x86-64 and RISC-V diverge here.
 After the architecture hardware path, the BSP seeds the entropy pool from the
 firmware boot seed in `BootInfo`, the hardware RNG (health-gated where present),
 and boot-time jitter, and opens the kernel draw API; with neither a firmware
-seed nor a hardware RNG this degrades to jitter only. See
-[entropy.md](entropy.md).
+seed nor a hardware RNG this degrades to jitter only. The BSP then scrubs the
+seed and the two KASLR bases from the `BootInfo` page (a Phase-7 reclaim range)
+and from its local copy. See [entropy.md](entropy.md).
 
 **Failure mode:** Hardware initialisation failures (e.g. CPUID indicates a required
 feature is absent) halt with a descriptive message. The specific required features

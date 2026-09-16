@@ -14,11 +14,13 @@ The implementation lives in [`boot/src/dtb.rs`](../src/dtb.rs).
 
 The bootloader extracts a minimal set of platform resources from the
 DTB: MMIO-backed peripherals matched by known `compatible` strings,
-PLIC interrupt controllers, and PCI host bridges, and extracts the
-`/chosen/rng-seed` boot-entropy fallback, scrubbing the property in
-place while the blob is still writable (before `ExitBootServices`),
-since the same blob is later handed to userspace; which firmware
-exposes which entropy source is documented in
+PLIC interrupt controllers, PCI host bridges, the `/cpus` hart
+capabilities (`timebase-frequency` and the `HART_CAP_*` bits) and the
+boot hart's `mmu-type` claim for paging-mode negotiation. It also
+extracts the `/chosen/rng-seed` boot-entropy fallback and scrubs the
+property in place while the blob is still writable (before
+`ExitBootServices`), since the same blob is later handed to userspace;
+which firmware exposes which entropy source is documented in
 [boot-flow.md](boot-flow.md). The full DTB is
 additionally recorded as a single `PlatformTable` entry so `devmgr` can
 perform its own complete walk — including IOMMU-topology discovery,
@@ -44,7 +46,8 @@ but it is not fatal at boot time.
 
 Validation checks:
 - `magic == 0xD00DFEED` (big-endian per the FDT spec).
-- Struct-block and strings-block offsets fall within `totalsize`.
+- `off_dt_struct + size_dt_struct` and `off_dt_strings + size_dt_strings`
+  (overflow-checked) do not exceed `totalsize`.
 
 All header fields and struct-block tokens are big-endian per the FDT
 specification, regardless of target CPU byte order.
@@ -71,25 +74,26 @@ exhaustive coverage; `devmgr` re-parses the full DTB.
 
 ## Compatible-String Matching
 
-MMIO peripherals are matched by `compatible` string containing known
-substrings (`ns16550`, `virtio`, `sifive`, …). Matches emit an
+MMIO peripherals are matched by an exact entry in the node's
+`compatible` string list (`ns16550a`, `virtio,mmio`, …). Matches emit an
 `MmioRange` per `reg` entry. Unknown `compatible` strings are skipped
 without warning; `devmgr` is responsible for identifying every other
 device.
 
 PCI host bridges match `pci-host-ecam-generic` (and close variants).
-Interrupt lines come from `interrupts` values on nodes whose
-`interrupt-parent` resolves to a PLIC node.
+A node's raw `interrupts` values are collected alongside its `reg`
+entries; the bootloader does not resolve `interrupt-parent`, and
+associating lines with a PLIC is a `devmgr` concern.
 
 ---
 
 ## Error Handling
 
 Malformed nodes are skipped; partial results are returned. An
-out-of-bounds token offset aborts the walk for the current subtree but
-not the whole tree. A bad header aborts DTB parsing entirely (see
-§Header Validation). Warnings are logged for skipped nodes; the
-bootloader never halts on DTB parse error.
+unreadable or unknown token ends the walk with the partial results
+collected so far. A bad header aborts DTB parsing entirely (see
+§Header Validation). Nothing is logged for skipped nodes, and the
+bootloader never halts on a DTB parse error.
 
 ---
 

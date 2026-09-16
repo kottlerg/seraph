@@ -49,18 +49,19 @@ mixed with timing jitter before any byte is drawn.
 
 Three source classes are mixed into the pool:
 
-- **Firmware boot seed** — a conditioned random draw the bootloader obtains from
-  UEFI `EFI_RNG_PROTOCOL` while boot services are live and passes to the kernel
-  in `BootInfo` (`boot_entropy_seed` / `boot_entropy_len`, boot protocol v9).
-  Arch-neutral mechanism; already conditioned (a DRBG output), so it is absorbed
-  directly rather than health-gated. Present wherever the firmware implements
-  the protocol or a firmware RNG driver binds a device that exposes it — x86-64
-  OVMF natively (RDRAND-backed), riscv64 EDK2 through `VirtioRngDxe` with the
-  default boot set's `virtio-rng`; without a seed from the protocol or from the
-  bootloader's DTB fallback, `boot_entropy_len == 0` and the pool falls back to
-  jitter (see "Boot-time entropy").
+- **Firmware boot seed** — a conditioned draw the bootloader passes to the
+  kernel in `BootInfo` (`boot_entropy_seed` / `boot_entropy_len`, boot protocol
+  v9): UEFI `EFI_RNG_PROTOCOL` output (a DRBG output) or, for firmware that
+  delivers a DTB, the host-random bytes of `/chosen/rng-seed`;
+  [boot-flow.md](../../boot/docs/boot-flow.md) step 5c owns the draw.
+  Pre-conditioned by its source, so it is absorbed directly rather than
+  health-gated. The protocol is present wherever the firmware implements it or a
+  firmware RNG driver binds a device that exposes it — x86-64 OVMF natively
+  (RDRAND-backed), riscv64 EDK2 through `VirtioRngDxe` with the default boot
+  set's `virtio-rng`; without a seed from either origin, `boot_entropy_len == 0`
+  and the pool falls back to jitter (see "Boot-time entropy").
 - **Hardware RNG** — drawn through the `arch::current::entropy` contract
-  (`hw_rng_available`, `hw_rng_u64`). On x86-64 this is RDSEED (a conditioned,
+  (`hw_rng_available`, `hw_rng_u64`; [arch-interface.md § entropy](arch-interface.md#entropy--archcurrententropy)). On x86-64 this is RDSEED (a conditioned,
   seed-grade source, preferred) with an RDRAND fallback, CPUID-gated, each with
   bounded retry on the transient not-ready condition the ISA permits. Hardware
   output is health-gated (below) before it is trusted. riscv64 has no S-mode
@@ -219,10 +220,10 @@ which closes the riscv64 boot-entropy hole: the boot log shows
 device is present, riscv64 falls back to jitter only — narrowed continuously at
 runtime by the timer-tick jitter hook, which feeds a fresh sample into each CPU's
 accumulator on every tick (and per device IRQ). The bootloader also keeps a DTB
-`/chosen/rng-seed` reader as a secondary fallback for firmware that *does* deliver
-a DTB (extracted and scrubbed from the userspace-visible blob; a draw of at
-least 24 bytes is split first-16-bytes-to-KASLR / rest-to-pool, a shorter one
-feeds the pool alone); it is inactive under QEMU+EDK2.
+`/chosen/rng-seed` reader as a secondary fallback for firmware that delivers a
+DTB, scrubbed from the userspace-visible blob and split between the KASLR word
+and the pool seed as [boot-flow.md](../../boot/docs/boot-flow.md) step 5c
+describes; it is inactive under QEMU+EDK2.
 
 The KASLR draw is kept **separate** from the pool seed: the bootloader draws an
 independent 16-byte `EFI_RNG_PROTOCOL` word for the image slide / direct-map base,
@@ -239,7 +240,8 @@ rather than riding the 64-sample scrape.
 
 The riscv64 *runtime* hardware-RNG path — a virtio-rng/hwrng device owned by a
 userspace driver, the mechanism the RISC-V design intends for lower privilege
-levels to obtain entropy — is also future work.
+levels to obtain entropy — is future work
+([#396](https://github.com/kottlerg/seraph/issues/396)).
 
 TODO: persist a saved seed across boots (read at `init_storage`, rewritten at
 shutdown) as a second mitigation for jitter-only platforms; deferred — it
@@ -351,4 +353,6 @@ continuous validator.
 [boot/docs/boot-flow.md](../../boot/docs/boot-flow.md),
 [docs/testing.md](../../../docs/testing.md),
 [docs/platform-requirements.md](../../../docs/platform-requirements.md),
-[docs/userspace-memory-model.md](../../../docs/userspace-memory-model.md)
+[docs/userspace-memory-model.md](../../../docs/userspace-memory-model.md),
+[docs/cross-boundary-disclosure.md](cross-boundary-disclosure.md),
+[xtask/README.md](../../../xtask/README.md)

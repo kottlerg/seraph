@@ -149,7 +149,8 @@ impl Fdt
 {
     /// Validate and wrap an FDT blob at the given physical address.
     ///
-    /// Returns `None` on bad magic, blob too small, or out-of-range offsets.
+    /// Returns `None` on bad magic or when the struct or strings block falls
+    /// outside `totalsize`.
     ///
     /// # Safety
     /// `base` must be the physical address of a valid, identity-mapped FDT

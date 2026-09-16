@@ -15,7 +15,7 @@
 //! entry if the versions differ.
 //!
 //! See [`README.md`](../README.md) for the compliant-bootloader policy and
-//! `boot/docs/kernel-handoff.md` for the CPU-state contract at kernel entry.
+//! `core/boot/docs/kernel-handoff.md` for the CPU-state contract at kernel entry.
 
 #![no_std]
 
@@ -78,7 +78,7 @@ pub use layout::{collect_mmio_direct_map_regions, direct_map_ceiling, max_ram_ad
 ///     kernel absorbs it into the entropy pool at Phase 5, narrowing the
 ///     boot-time entropy hole before any early consumer (KASLR/ASLR) draws
 ///     randomness. `boot_entropy_len` is `0` when no source was available, in
-///     which case the kernel degrades to timing jitter alone.
+///     which case the kernel seeds from its remaining sources.
 /// v10: [`InitImage`] gained `flags: u32` (bit 0 = [`INIT_IMAGE_FLAG_PIE`]:
 ///     init is `ET_DYN`; the kernel chooses a load bias and applies the
 ///     image's `RELATIVE` relocations before mapping), plus `rela_phys: u64`
@@ -860,19 +860,20 @@ pub struct BootInfo
     // ── Boot entropy seed (added in protocol version 9) ───────────────────────
     /// Conditioned early-boot entropy seed obtained by the bootloader from the
     /// firmware (see `core/boot/docs/boot-flow.md`). Valid only for the first
-    /// `boot_entropy_len` bytes; the remainder is zero. The kernel absorbs it
-    /// into the entropy pool at Phase 5, then **scrubs it from this page**
-    /// (`boot_entropy_seed`/`_len` zeroed) before Phase 7 — this page is a
-    /// reclaim range donated to
-    /// userspace, so the secret seed must not outlive boot.
+    /// `boot_entropy_len` bytes; the remainder is zero. The kernel absorbs it into
+    /// the entropy pool at Phase 5, then **scrubs it from this page**
+    /// (`boot_entropy_seed`/`_len` zeroed) before Phase 7 — this page is a reclaim
+    /// range donated to userspace, so the secret seed must not outlive boot.
     ///
-    /// This is already a conditioned (DRBG) output, not a raw source, so the
-    /// kernel absorbs it directly without the raw-source health gating.
+    /// Pre-conditioned by its source (see `core/kernel/docs/entropy.md` § Health
+    /// tests), so the kernel absorbs it directly without the raw-source health
+    /// gating.
     pub boot_entropy_seed: [u8; 32],
 
     /// Number of valid leading bytes in `boot_entropy_seed`. `0` means the
-    /// bootloader found no entropy source; the kernel then degrades to timing
-    /// jitter alone (no regression).
+    /// bootloader found no entropy source; the kernel then seeds from its remaining
+    /// sources (hardware RNG where present, timing jitter; see
+    /// `core/kernel/docs/entropy.md`).
     pub boot_entropy_len: u32,
 
     // ── VM Generation ID (added in protocol version 13) ───────────────────────

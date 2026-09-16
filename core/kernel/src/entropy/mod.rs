@@ -135,8 +135,8 @@ mod imp
 
     /// Mix every available entropy source into the pool.
     ///
-    /// The firmware boot seed (a conditioned `EFI_RNG_PROTOCOL` draw, where the
-    /// bootloader supplied one) and the hardware RNG (where present,
+    /// The firmware boot seed (where the bootloader supplied one) and the
+    /// hardware RNG (where present,
     /// health-gated) are mixed *with* boot-time jitter — never trusted alone.
     /// With neither a firmware seed nor a hardware RNG this degrades to jitter
     /// only.
@@ -146,8 +146,9 @@ mod imp
 
         let mut seeded = false;
 
-        // Firmware-provided boot seed: already conditioned (a DRBG output), so
-        // absorb it directly rather than through the raw-source health gate
+        // Firmware-provided boot seed: pre-conditioned by its source (see
+        // docs/entropy.md § Health tests), so absorb it directly rather than
+        // through the raw-source health gate
         // (which expects raw samples and a 1024-byte startup run).
         if !boot_seed.is_empty()
         {

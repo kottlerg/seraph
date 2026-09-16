@@ -6,7 +6,7 @@
 //! Seraph microkernel — kernel entry point.
 //!
 //! Receives control from the bootloader after page tables are installed and
-//! UEFI boot services have exited. See `boot/docs/kernel-handoff.md` for the
+//! UEFI boot services have exited. See `core/boot/docs/kernel-handoff.md` for the
 //! CPU-state contract and the `abi/boot-protocol` crate for the `BootInfo`
 //! layout.
 //!
@@ -65,7 +65,7 @@ mod validate;
 
 /// Kernel entry point.
 ///
-/// Called by the bootloader with CPU state per `boot/docs/kernel-handoff.md`.
+/// Called by the bootloader with CPU state per `core/boot/docs/kernel-handoff.md`.
 /// `boot_info` is the physical address of a populated [`BootInfo`] structure,
 /// accessible before the kernel's own page tables are established because the
 /// bootloader identity-maps the `BootInfo` region.

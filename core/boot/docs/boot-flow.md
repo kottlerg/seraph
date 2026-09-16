@@ -131,7 +131,9 @@ on x86-64 OVMF and by the firmware's `VirtioRngDxe` driver binding the
 `virtio-rng-pci` device on both arches (the mechanism that gives riscv64 a boot
 seed at all, since its EDK2 exposes no RNG on its own and hands the bootloader ACPI
 rather than a DTB). A DTB `/chosen/rng-seed` reader is a secondary fallback for
-firmware that delivers a DTB. When neither source yields a seed the length is zero,
+firmware that delivers a DTB: a draw of at least 24 bytes is split, the first 16
+bytes to the KASLR word and the rest to the pool seed, and a shorter draw feeds
+the pool alone; the property is scrubbed from the blob in place. When neither source yields a seed the length is zero,
 the KASLR entropy is absent, and the kernel degrades to timing jitter and the
 deterministic layout.
 See [core/kernel/docs/entropy.md](../../kernel/docs/entropy.md).
@@ -210,9 +212,9 @@ scrubs from this donated page after consuming them. The `version` field is set t
 | `ap_trampoline_page` | 4 KiB physical frame for AP startup code. x86-64: below 1 MiB (SIPI vector constraint). RISC-V: any 4 KiB page (SBI HSM has no placement constraint). Zero if allocation failed (SMP disabled). |
 | `reclaim_ranges` | `ReclaimSlice` over a dedicated 4 KiB scratch page recording bootloader pages the kernel reclaims into the cap surface. Populated from `BootAllocations` (`BootInfo` page, module descriptor array, memory-map entry array, MMIO aperture array, the reclaim-array page itself, the AP trampoline page), `page_table.allocated_frames()` (the bootloader's transient page-table frames), and per-gap carve-outs over the bundle allocation — the header + entry table + leading pad, the init ELF source body (no longer needed after `load_init` copied segments out), and any inter-module or trailing slack pages. Module bodies are skipped here because `cap::mint_module_memory_caps` already mints Memory caps over them; pushing them again would double-register pages in the buddy ledger. Each `ReclaimRange` carries a `flags: u32`; bit 0 (`RECLAIM_FLAG_LATE`) marks the AP trampoline entry so the kernel defers minting it until the post-SMP-bringup late-reclaim pass. All other entries are minted by `cap::mint_reclaim_memory_caps` inside `populate_cspace`. |
 | `boot_entropy_seed` | Conditioned entropy seed for the pool, drawn from `EFI_RNG_PROTOCOL` (or a DTB `/chosen/rng-seed` fallback) in step 5; valid for `boot_entropy_len` bytes, remainder zero. Absorbed into the kernel entropy pool at Phase 5. The separate KASLR entropy word never appears in `BootInfo`. |
-| `boot_entropy_len` | Valid leading byte count of `boot_entropy_seed`; zero when no RNG source is present, in which case the kernel degrades to timing jitter. |
+| `boot_entropy_len` | Valid leading byte count of `boot_entropy_seed`; zero when neither source yields a seed, in which case the kernel seeds from its remaining sources. |
 | `vmgenid_paddr` | Physical address of the 16-byte ACPI VMGENID GUID (x86-64 QEMU SSDT scan in step 9); zero when absent. |
-| `direct_map_base` | KASLR-chosen direct-map virtual base — a 1 GiB-aligned base at or above the paging mode's kernel-half floor, chosen in step 9 from the KASLR entropy and the final memory map. A KASLR secret; the kernel scrubs it after Phase 3. |
+| `direct_map_base` | KASLR-chosen direct-map virtual base — a 1 GiB-aligned base at or above the paging mode's kernel-half floor, chosen in step 9 from the KASLR entropy and the final memory map. A KASLR secret; the kernel scrubs it at Phase 5, after its Phase-3 consumers have run. |
 | `kaslr_flags` | `KASLR_*` status bits: which layout dimensions were randomized, the entropy source, and any skip reason (knob / window-limited). Zero means an entirely un-randomized layout. |
 
 All arrays pointed to by `BootInfo` fields reside in physical memory that the UEFI
@@ -250,4 +252,4 @@ the kernel has consumed them.
 
 ## Summarized By
 
-[boot/README.md](../README.md)
+[boot/README.md](../README.md), [kernel/docs/entropy.md](../../kernel/docs/entropy.md)

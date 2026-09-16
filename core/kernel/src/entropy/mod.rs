@@ -91,7 +91,7 @@ mod imp
     /// BSP, after the cycle counter is available. Called exactly once.
     ///
     /// `boot_seed` is the conditioned early-boot seed the bootloader drew from
-    /// UEFI `EFI_RNG_PROTOCOL` (empty when the firmware exposed no RNG).
+    /// the firmware (empty when no source produced one; see `docs/entropy.md`).
     /// `vmgenid_paddr` is the VMGENID GUID physical address (zero when absent);
     /// arming it before `mark_seeded` guarantees no draw precedes snapshot
     /// detection.

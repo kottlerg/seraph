@@ -8,7 +8,7 @@
 //! Loads the kernel ELF and init module from the ESP, establishes initial
 //! page tables with W^X enforcement, discovers firmware table addresses,
 //! exits UEFI boot services, populates `BootInfo`, and jumps to the kernel
-//! entry point. See `boot/docs/boot-flow.md` for the step-by-step design.
+//! entry point. See `core/boot/docs/boot-flow.md` for the step-by-step design.
 
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(not(test), no_main)]
@@ -296,7 +296,7 @@ unsafe fn boot_sequence(image: EfiHandle, st: *mut EfiSystemTable) -> Result<!, 
     let ap_trampoline_phys = unsafe { step5b_alloc_ap_trampoline(&ctx) };
     // SAFETY: ctx.bs valid pre-exit; draws the boot entropy seed while boot
     // services (and thus EFI_RNG_PROTOCOL) are still available; firm.device_tree
-    // is zero or an identity-mapped FDT for the riscv64 rng-seed fallback.
+    // is zero or an identity-mapped FDT for the DTB rng-seed fallback.
     let mut boot_entropy = unsafe { step5c_fetch_boot_entropy(&ctx, &firm) };
     // Apply the KASLR slide before step 6 maps the segments at their
     // (biased) virtual addresses.
@@ -767,7 +767,8 @@ unsafe fn step5b_alloc_ap_trampoline(ctx: &UefiContext) -> u64
 /// Draw conditioned early-boot entropy for the pool seed and the KASLR
 /// slide / direct-map base.
 ///
-/// Draws from UEFI `EFI_RNG_PROTOCOL` when the firmware exposes it, else from
+/// Draws from UEFI `EFI_RNG_PROTOCOL` when the firmware exposes it and the draw
+/// succeeds, else from
 /// the DTB `/chosen/rng-seed` reader ([`dtb::parse_rng_seed`]), else returns
 /// `len == 0` and `kaslr_available == false`, and the kernel degrades to timing
 /// jitter and the layout to its deterministic fallback (no regression). Which
@@ -839,7 +840,7 @@ unsafe fn step5c_fetch_boot_entropy(ctx: &UefiContext, firm: &FirmwareInfo) -> B
         seed = [0u8; 32];
     }
 
-    // riscv64 fallback: the QEMU-authored DTB /chosen/rng-seed. One draw
+    // DTB fallback: the firmware-delivered /chosen/rng-seed. One draw
     // serves both consumers: the first 16 bytes seed KASLR, the remainder
     // seeds the entropy pool (non-overlapping so the pool seed never
     // reveals the KASLR words).

@@ -28,7 +28,7 @@ boot/
     ├── uefi.rs                 # UEFI protocol wrappers and memory services
     ├── elf.rs                  # UEFI-allocation layer over `shared/elf` + InitImage construction
     ├── firmware.rs             # ACPI / Device Tree address discovery (dispatch)
-    ├── acpi.rs                 # ACPI RSDP/XSDT/MADT/MCFG walker (CPUs, kernel_mmio, apertures)
+    ├── acpi.rs                 # ACPI RSDP/XSDT/MADT/MCFG walker (CPUs, MMIO, apertures, VMGENID)
     ├── dtb.rs                  # Flat Device Tree walker (CPUs, kernel_mmio, apertures, rng-seed)
     ├── memory_map.rs           # UEFI memory map → MemoryType; mmio_apertures derivation
     ├── framebuffer.rs          # GOP framebuffer setup

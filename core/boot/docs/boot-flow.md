@@ -130,9 +130,10 @@ hole before any early consumer draws randomness. The protocol is backed by RDRAN
 on x86-64 OVMF and by the firmware's `VirtioRngDxe` driver binding the
 `virtio-rng-pci` device on both arches (the mechanism that gives riscv64 a boot
 seed at all, since its EDK2 exposes no RNG on its own and hands the bootloader ACPI
-rather than a DTB). When no RNG is exposed the length is zero, the KASLR entropy is
-absent, and the kernel degrades to timing jitter and the deterministic layout. A DTB
-`/chosen/rng-seed` reader is a secondary fallback for firmware that delivers a DTB.
+rather than a DTB). A DTB `/chosen/rng-seed` reader is a secondary fallback for
+firmware that delivers a DTB. When neither source yields a seed the length is zero,
+the KASLR entropy is absent, and the kernel degrades to timing jitter and the
+deterministic layout.
 See [core/kernel/docs/entropy.md](../../kernel/docs/entropy.md).
 
 Detail: [firmware-parsing.md](firmware-parsing.md)
@@ -234,7 +235,7 @@ by [kernel-handoff.md](kernel-handoff.md).
 Every pointer in `BootInfo` is a physical address. The kernel cannot dereference
 these pointers through its own virtual address space until its direct physical map is
 active (Phase 3 of kernel initialisation). Before that point, the kernel accesses
-`BootInfo` fields through the identity mapping established in step 5.
+`BootInfo` fields through the identity mapping established in step 6.
 
 The `BootInfo` structure itself must not be placed in a region the kernel will
 reclaim before reading all fields. In practice this means placing it in a range the

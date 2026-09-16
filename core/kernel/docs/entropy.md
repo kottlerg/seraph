@@ -220,8 +220,9 @@ device is present, riscv64 falls back to jitter only — narrowed continuously a
 runtime by the timer-tick jitter hook, which feeds a fresh sample into each CPU's
 accumulator on every tick (and per device IRQ). The bootloader also keeps a DTB
 `/chosen/rng-seed` reader as a secondary fallback for firmware that *does* deliver
-a DTB (extracted, split first-16-bytes-to-KASLR / rest-to-pool, and scrubbed from
-the userspace-visible blob); it is inactive under QEMU+EDK2.
+a DTB (extracted and scrubbed from the userspace-visible blob; a draw of at
+least 24 bytes is split first-16-bytes-to-KASLR / rest-to-pool, a shorter one
+feeds the pool alone); it is inactive under QEMU+EDK2.
 
 The KASLR draw is kept **separate** from the pool seed: the bootloader draws an
 independent 16-byte `EFI_RNG_PROTOCOL` word for the image slide / direct-map base,
@@ -238,7 +239,7 @@ rather than riding the 64-sample scrape.
 
 The riscv64 *runtime* hardware-RNG path — a virtio-rng/hwrng device owned by a
 userspace driver, the mechanism the RISC-V design intends for lower privilege
-levels to obtain entropy — is also future work, tracked separately.
+levels to obtain entropy — is also future work.
 
 TODO: persist a saved seed across boots (read at `init_storage`, rewritten at
 shutdown) as a second mitigation for jitter-only platforms; deferred — it
@@ -262,9 +263,9 @@ subsystem proceeds on jitter alone. Because the hardware RNG is never the sole
 input, a source that passes startup but later degrades still cannot by itself
 determine pool output.
 
-These tests gate the *raw* hardware RNG only. The firmware boot seed is a
-pre-conditioned DRBG output (`EFI_RNG_PROTOCOL`), so it is absorbed directly and
-is not subject to the raw-source tests.
+These tests gate the *raw* hardware RNG only. The boot seed is a pre-conditioned
+DRBG output (`EFI_RNG_PROTOCOL`) or the host-random bytes of the DTB fallback,
+so it is absorbed directly and is not subject to the raw-source tests.
 
 ## Draw API and consumers
 
@@ -349,4 +350,5 @@ continuous validator.
 [docs/initialization.md](initialization.md),
 [boot/docs/boot-flow.md](../../boot/docs/boot-flow.md),
 [docs/testing.md](../../../docs/testing.md),
+[docs/platform-requirements.md](../../../docs/platform-requirements.md),
 [docs/userspace-memory-model.md](../../../docs/userspace-memory-model.md)

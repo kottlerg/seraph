@@ -42,7 +42,7 @@ each found table in the appropriate `BootInfo` field. If a GUID is
 absent, its field is zeroed.
 
 Both fields may be non-zero on a platform that exposes both ACPI and a
-DTB (UEFI RISC-V firmware commonly does). On RISC-V the bootloader runs
+DTB (QEMU+EDK2 on RISC-V hands the bootloader ACPI only). On RISC-V the bootloader runs
 ACPI first for `kernel_mmio` and then lets the DTB pass fill in any
 field ACPI left zero; the two never overwrite each other. Userspace
 handles both passthrough addresses the same way.

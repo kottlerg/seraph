@@ -860,10 +860,10 @@ pub struct BootInfo
     // ── Boot entropy seed (added in protocol version 9) ───────────────────────
     /// Conditioned early-boot entropy seed obtained by the bootloader from the
     /// firmware (see `core/boot/docs/boot-flow.md`). Valid only for the first
-    /// `boot_entropy_len` bytes;
-    /// the remainder is zero. The kernel absorbs it into the entropy pool at
-    /// Phase 5, then **scrubs it from this page** (`boot_entropy_seed`/`_len`
-    /// zeroed) before Phase 7 — this page is a reclaim range donated to
+    /// `boot_entropy_len` bytes; the remainder is zero. The kernel absorbs it
+    /// into the entropy pool at Phase 5, then **scrubs it from this page**
+    /// (`boot_entropy_seed`/`_len` zeroed) before Phase 7 — this page is a
+    /// reclaim range donated to
     /// userspace, so the secret seed must not outlive boot.
     ///
     /// This is already a conditioned (DRBG) output, not a raw source, so the

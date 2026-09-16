@@ -14,7 +14,12 @@ The implementation lives in [`boot/src/dtb.rs`](../src/dtb.rs).
 
 The bootloader extracts a minimal set of platform resources from the
 DTB: MMIO-backed peripherals matched by known `compatible` strings,
-PLIC interrupt controllers, and PCI host bridges. The full DTB is
+PLIC interrupt controllers, and PCI host bridges, and extracts the
+`/chosen/rng-seed` boot-entropy fallback, scrubbing the property in
+place while the blob is still writable (before `ExitBootServices`),
+since the same blob is later handed to userspace; which firmware
+exposes which entropy source is documented in
+[boot-flow.md](boot-flow.md). The full DTB is
 additionally recorded as a single `PlatformTable` entry so `devmgr` can
 perform its own complete walk — including IOMMU-topology discovery,
 which is exclusively a userspace concern. See
@@ -30,17 +35,15 @@ flat walk. Driver binding and property-evaluation logic belong to
 
 ## Header Validation
 
-The DTB header is validated before any parsing. Validation failures
-zero the `BootInfo.device_tree` field and leave the resource count at
-zero; the bootloader then proceeds without a DTB. On RISC-V platforms
+The DTB header is validated before any parsing. A blob that fails
+validation yields no resources (the walkers return `None` or zero) and
+the bootloader proceeds without DTB-derived resources; the
+`BootInfo.device_tree` passthrough is unaffected. On RISC-V platforms
 this reduces available hardware to what the kernel can infer directly,
 but it is not fatal at boot time.
 
 Validation checks:
 - `magic == 0xD00DFEED` (big-endian per the FDT spec).
-- `version >= 17`.
-- `last_comp_version <= 17`.
-- `totalsize > sizeof(fdt_header)`.
 - Struct-block and strings-block offsets fall within `totalsize`.
 
 All header fields and struct-block tokens are big-endian per the FDT

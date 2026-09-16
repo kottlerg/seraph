@@ -21,10 +21,12 @@
 //                head the previous run reviewed) and the head, verifies the
 //                fixes claimed since then, and adds a whole-PR correctness-only
 //                regression lens that also verifies claimed fixes for files
-//                outside the delta. The whole-diff lenses run in both modes.
-//                `since` must resolve in this clone; it need not be an ancestor
-//                of the head, so an amended or rebased branch still works, at
-//                the cost of over-including files a rebase brought in.
+//                outside the delta. The whole-diff lenses run in both modes;
+//                the cross-boundary lens runs whenever the PR diff, not only
+//                the delta, touches a code file. `since` must resolve in this
+//                clone; it need not be an ancestor of the head, so an amended
+//                or rebased branch still works, at the cost of over-including
+//                files a rebase brought in.
 //   mode 'scope' stops after Scope and returns the shard plan and sample
 //                prompts (one agent); with `since` it scopes as delta would.
 
@@ -35,7 +37,10 @@ export const meta = {
     phases: [
         { title: 'Scope', detail: 'materialize the diff, shard the files, list changed items' },
         { title: 'Review', detail: 'one pr-reviewer per shard, whole-diff lenses, pr-auditor' },
-        { title: 'Verify', detail: 'two independent refuters per Critical or Should finding' },
+        {
+            title: 'Verify',
+            detail: 'two independent refuters per Critical, Should, or MUST-violation finding',
+        },
         { title: 'Synthesize', detail: 'one report; verdict lines computed by the script' },
     ],
 }
@@ -53,7 +58,9 @@ if (MODE === null) return { error: "args.mode must be 'full', 'delta', or 'scope
 if (MODE === 'delta' && !DELTA) {
     return { error: "args.since (the head the previous run reviewed) is required in 'delta' mode" }
 }
-if (MODE === 'full' && DELTA) return { error: "args.since is only meaningful with mode 'delta'" }
+if (MODE === 'full' && DELTA) {
+    return { error: "args.since is only meaningful with mode 'delta' or 'scope'" }
+}
 
 // ─── Tunables ───
 
@@ -62,6 +69,7 @@ const MAX_SHARD_LINES = 500 // changed lines per shard reviewer
 const MAX_LENS_DOCS = 8 // design documents per design-docs lens agent
 const DEDUP_LINE_SLACK = 3 // findings this close on the same file, class, and bucket are one
 const VERIFY_LENSES = ['reality', 'authority']
+const AUDIT_SECTIONS = 6 // pr-auditor steps 4 to 9, one section each
 const INVESTIGATOR = 'pr-verifier' // read-only agent type for scope, verify, and synthesize
 
 // ─── Schemas ───
@@ -73,7 +81,7 @@ const PATH_DESCRIPTION =
 const SCOPE_SCHEMA = {
     type: 'object',
     required: [
-        'head', 'base', 'repo_root', 'tree_at_head', 'since_reachable', 'files',
+        'head', 'base', 'repo_root', 'tree_at_head', 'since_reachable', 'pr_has_code', 'files',
         'changed_items', 'design_docs', 'claimed_fixes',
     ],
     properties: {
@@ -95,6 +103,10 @@ const SCOPE_SCHEMA = {
             type: 'boolean',
             description:
                 '`since` resolves to a commit in this clone; true when no `since` was given.',
+        },
+        pr_has_code: {
+            type: 'boolean',
+            description: 'The whole PR diff (not only the delta) changes a file of kind code.',
         },
         files: {
             type: 'array',
@@ -208,7 +220,8 @@ const REPORT_SCHEMA = {
 // ─── Helpers ───
 
 let agent_calls = 0
-const failed = []
+const failed_review = [] // shard and lens reviewers that returned nothing: unreviewed surface
+const failed_other = [] // auditor and synthesizer failures: reported, not blocking by themselves
 
 function run(prompt, opts) {
     agent_calls += 1
@@ -288,9 +301,9 @@ const SCOPE_PROMPT = [
         '`git rev-parse HEAD`, `git status --porcelain`, and `gh pr diff ' + PR + '`.' +
         (DELTA
             ? ' Then run `git cat-file -e ' + SINCE + '^{commit}` (reachability), ' +
-              '`git diff --numstat ' + DELTA_RANGE + '` (a tree diff between the two commits, ' +
-              'valid whether or not ' + SINCE + ' is an ancestor of the head), and ' +
-              '`git log --format=%B ' + SINCE + '..<head>`.'
+                '`git diff --numstat ' + DELTA_RANGE + '` (a tree diff between the two ' +
+                'commits, valid whether or not ' + SINCE + ' is an ancestor of the head), and ' +
+                '`git log --format=%B ' + SINCE + '..<head>`.'
             : ''),
     '',
     'Return, per the schema, with every path repository-relative exactly as git prints it:',
@@ -299,6 +312,7 @@ const SCOPE_PROMPT = [
     '- tree_at_head: whether HEAD is the PR head and the tree is clean.',
     '- since_reachable: ' +
         (DELTA ? 'whether ' + SINCE + ' resolves to a commit.' : 'true (no `since` given).'),
+    '- pr_has_code: whether the whole PR diff changes a file of kind code.',
     '- files: one entry per file in ' +
         (DELTA ? 'the tree diff ' + DELTA_RANGE : 'the PR diff') +
         ', with path; changed = added plus deleted lines; kind = code (Rust, assembly, ' +
@@ -314,7 +328,7 @@ const SCOPE_PROMPT = [
     '- claimed_fixes: ' +
         (DELTA
             ? 'every fix the commit messages in ' + SINCE + '..<head> and the PR body claim, as ' +
-              'file, line (0 when unknown), and a one-line summary.'
+                'file, line (0 when unknown), and a one-line summary.'
             : 'an empty array.'),
     '',
     'Only scope; do not review. Structured output only.',
@@ -348,7 +362,6 @@ scope.design_docs = scope.design_docs.map(normalize)
 const shards = shards_of(scope.files)
 const delta_paths = new Set(scope.files.map((f) => f.path))
 const unmatched_fixes = scope.claimed_fixes.filter((c) => !delta_paths.has(c.file))
-const has_code = scope.files.some((f) => f.kind === 'code')
 
 log(
     'PR #' + PR + ' ' + MODE + ': ' + scope.files.length + ' files, ' + shards.length +
@@ -356,7 +369,7 @@ log(
         scope.design_docs.length + ' design docs' +
         (DELTA
             ? ', ' + scope.claimed_fixes.length + ' claimed fixes (' + unmatched_fixes.length +
-              ' outside the delta)'
+                ' outside the delta)'
             : ''),
 )
 
@@ -368,27 +381,36 @@ const HEAD_LINE =
     '` is the PR diff' +
     (DELTA ? ' and `git diff ' + SINCE + ' ' + scope.head + '` is the delta' : '') + '.'
 
+const DELTA_NOTE = DELTA
+    ? 'This is a re-review: the previous run reviewed head ' + SINCE + ', and the commits and ' +
+        'PR body since then claim fixes for its findings.'
+    : null
+
 const SHARD_HEADER = [
     HEAD_LINE,
+    DELTA_NOTE,
     DELTA
-        ? 'This is a re-review: the previous run reviewed head ' + SINCE + ' and its findings ' +
-          'were fixed since. Apply the scope-block rule of your brief: the changed hunks are ' +
-          'those of the delta diff.'
+        ? 'Apply the scope-block rule of your brief: the changed hunks are those of the delta diff.'
         : null,
 ].filter((line) => line !== null).join('\n')
 
 const LENS_HEADER = [
     HEAD_LINE,
-    DELTA
-        ? 'This is a re-review: the previous run reviewed head ' + SINCE + ' and its findings ' +
-          'were fixed since. Your lens covers the whole PR diff in both modes.'
-        : null,
+    DELTA_NOTE,
+    DELTA ? 'Your lens covers the whole PR diff in both modes.' : null,
 ].filter((line) => line !== null).join('\n')
 
-// System-scope documents govern every shard; component-scope documents only
-// the shard of their component.
-const docs_for = (component) =>
-    scope.design_docs.filter((d) => d.startsWith('docs/') || component_of(d) === component)
+// System-scope documents (the top-level `docs/` tree and the root README)
+// govern every shard; a component's own documents and its parent directory's
+// README govern only that component's shards.
+const docs_for = (component) => {
+    const top = component.split('/')[0]
+    return scope.design_docs.filter(
+        (d) =>
+            d.startsWith('docs/') || d === 'README.md' || d === top + '/README.md' ||
+            component_of(d) === component,
+    )
+}
 
 function shard_prompt(shard) {
     const paths = new Set(shard.files.map((f) => f.path))
@@ -410,7 +432,7 @@ function shard_prompt(shard) {
         bullets(docs_for(shard.component), doc_line),
         DELTA
             ? '\nClaimed fixes for your files, each to be verified against the code:\n' +
-              bullets(fixes, fix_line)
+                bullets(fixes, fix_line)
             : null,
         '',
         'Other files in the diff belong to other reviewers: read them as callers or reverse ' +
@@ -420,7 +442,7 @@ function shard_prompt(shard) {
     ].filter((line) => line !== null).join('\n')
 }
 
-const LENSES = [
+const lenses = [
     {
         name: 'callsites',
         body: () => [
@@ -437,8 +459,8 @@ const LENSES = [
     },
 ]
 
-if (has_code) {
-    LENSES.push({
+if (scope.pr_has_code) {
+    lenses.push({
         name: 'boundary',
         body: () => [
             'Lens: cross-boundary surfaces over the whole diff.',
@@ -458,7 +480,7 @@ const doc_lens_count = Math.ceil(scope.design_docs.length / MAX_LENS_DOCS)
 for (let start = 0; start < scope.design_docs.length; start += MAX_LENS_DOCS) {
     const docs = scope.design_docs.slice(start, start + MAX_LENS_DOCS)
     const index = start / MAX_LENS_DOCS + 1
-    LENSES.push({
+    lenses.push({
         name: 'design-docs' + (doc_lens_count > 1 ? '#' + index : ''),
         body: () => [
             'Lens: design documents against the code, over the whole diff' +
@@ -476,7 +498,7 @@ for (let start = 0; start < scope.design_docs.length; start += MAX_LENS_DOCS) {
 }
 
 if (DELTA) {
-    LENSES.push({
+    lenses.push({
         name: 'regression',
         body: () => [
             'Lens: correctness only, over the whole pull request diff (' + scope.base + '..' +
@@ -502,18 +524,19 @@ if (MODE === 'scope') {
     return {
         scope,
         shards,
-        lenses: LENSES.map((l) => l.name),
+        lenses: lenses.map((l) => l.name),
         sample_prompts: {
             shard: shards.length ? shard_prompt(shards[0]) : null,
-            lens: LENSES.length ? lens_prompt(LENSES[0]) : null,
+            lens: lenses.length ? lens_prompt(lenses[0]) : null,
         },
     }
 }
 
 const AUDIT_PROMPT = [
     'Scope: pull request #' + PR + '. Run your audit per your brief, every step.',
-    'Fill the structured schema: the overall verdict, and one section per audit step with ' +
-        'its PASS or FAIL and the items it found. Structured output only.',
+    'Fill the structured schema: the overall verdict, and one section per audit step (steps 4 ' +
+        'to 9, six sections) with its PASS or FAIL and the items it found. Structured output ' +
+        'only.',
 ].join('\n')
 
 function verify_prompt(f, lens) {
@@ -538,11 +561,12 @@ function verify_prompt(f, lens) {
             finding,
             '',
             'Read the whole file at the location and every caller or reverse dependency the ' +
-                'claim depends on. refuted=true when the defect does not exist as stated, the ' +
-                'code or document already handles the case, or the evidence does not support ' +
-                'the claim; also refuted=true when you cannot confirm the defect. ' +
-                'refuted=false only when you can point to the place that exhibits it. ' +
-                'Evidence must cite file:line. Structured output only.',
+                'claim depends on. refuted=true only with evidence that the defect does not ' +
+                'exist as stated, that the code or document already handles the case, or that ' +
+                'the evidence does not support the claim. refuted=false when you can point to ' +
+                'the place that exhibits the defect, and also when you can neither confirm nor ' +
+                'refute it; say so, with confidence low. Evidence must cite file:line. ' +
+                'Structured output only.',
         ].join('\n')
     }
     return [
@@ -567,21 +591,23 @@ phase('Review')
 
 const seen = []
 
-// A later finding on the same file, class, and bucket within DEDUP_LINE_SLACK
-// lines is the same finding; its evidence and claim are kept on the first
-// record. A different bucket is a different finding, so a Critical near a nit
-// is never absorbed. A MUST-violation flag escalates the record.
+// A later finding on the same file, class, bucket, and MUST-violation flag
+// within DEDUP_LINE_SLACK lines is the same finding; its claim and evidence
+// are kept on the first record. Anything that differs in bucket or in the
+// MUST-violation flag is a distinct finding with its own verification, so a
+// stronger finding is never absorbed into a weaker record.
 function dedup(findings, source) {
     const fresh = []
     for (const f of findings) {
         f.file = normalize(f.file)
         const dup = seen.find(
-            (s) => s.file === f.file && s.class === f.class && s.bucket === f.bucket &&
+            (s) =>
+                s.file === f.file && s.class === f.class && s.bucket === f.bucket &&
+                s.must_violation === f.must_violation &&
                 Math.abs(s.line - f.line) <= DEDUP_LINE_SLACK,
         )
         if (dup) {
             dup.duplicates += 1
-            dup.must_violation = dup.must_violation || f.must_violation
             dup.evidence += '\n[also reported by ' + source + ': ' + f.claim + '] ' + f.evidence
             continue
         }
@@ -624,7 +650,7 @@ function verify_one(f) {
 
 const review_items = [
     ...shards.map((s) => ({ kind: 'shard', label: s.label, shard: s })),
-    ...LENSES.map((l) => ({ kind: 'lens', label: 'lens:' + l.name, lens: l })),
+    ...lenses.map((l) => ({ kind: 'lens', label: 'lens:' + l.name, lens: l })),
     { kind: 'audit', label: 'audit' },
 ]
 
@@ -633,19 +659,19 @@ const reviewed = await pipeline(
     (item) => {
         const launch = item.kind === 'audit'
             ? run(AUDIT_PROMPT, {
-                  agentType: 'pr-auditor', label: item.label, phase: 'Review', schema: AUDIT_SCHEMA,
-              })
+                agentType: 'pr-auditor', label: item.label, phase: 'Review', schema: AUDIT_SCHEMA,
+            })
             : run(item.kind === 'shard' ? shard_prompt(item.shard) : lens_prompt(item.lens), {
-                  agentType: 'pr-reviewer', label: item.label, phase: 'Review',
-                  schema: FINDINGS_SCHEMA,
-              })
+                agentType: 'pr-reviewer', label: item.label, phase: 'Review',
+                schema: FINDINGS_SCHEMA,
+            })
         // A thrown launch would drop the item from the pipeline before the
         // next stage could record the failure.
         return launch.catch(() => null)
     },
     (result, item) => {
         if (!result) {
-            failed.push(item.label)
+            ;(item.kind === 'audit' ? failed_other : failed_review).push(item.label)
             log(item.label + ': no result (agent failed or was stopped)')
             return { item, findings: [], audit: null }
         }
@@ -673,29 +699,43 @@ log(
     'Review done: ' + all.length + ' findings; ' + count('confirmed') + ' confirmed, ' +
         count('contested') + ' contested, ' + count('unverified') + ' unverified, ' +
         count('nit') + ' nits, ' + dropped.length + ' dropped' +
-        (failed.length ? '; failed agents: ' + failed.join(', ') : ''),
+        (failed_review.length ? '; failed reviewers: ' + failed_review.join(', ') : ''),
 )
 
 // ─── Verdicts (computed here, not by an agent) ───
 
-// A failed review agent means part of the diff was never reviewed; that is a
-// blocking condition in itself.
+// A failed shard or lens reviewer means part of the diff was never reviewed;
+// that is a blocking condition in itself. A failed auditor or synthesizer
+// is reported through the audit verdict and the notes, not through the
+// reviewer verdict.
 const blocking =
-    failed.length > 0 || findings.some((f) => f.bucket === 'critical' || f.must_violation)
+    failed_review.length > 0 ||
+    findings.some((f) => f.bucket === 'critical' || f.must_violation)
 const verdict = blocking
     ? 'BLOCKING ISSUES'
     : findings.length > 0
-      ? 'NON-BLOCKING ISSUES ONLY'
-      : 'READY TO MERGE'
+        ? 'NON-BLOCKING ISSUES ONLY'
+        : 'READY TO MERGE'
 
-// The auditor's own contract: any FAIL section forces AUDIT FAIL.
+// The auditor's own contract: any FAIL section forces AUDIT FAIL, and an
+// audit that skipped a step is not a pass.
+const audit_incomplete = audit !== null && audit.sections.length < AUDIT_SECTIONS
 const audit_failed =
-    !audit || audit.verdict === 'AUDIT FAIL' || audit.sections.some((s) => s.verdict === 'FAIL')
+    !audit || audit_incomplete || audit.verdict === 'AUDIT FAIL' ||
+    audit.sections.some((s) => s.verdict === 'FAIL')
 const audit_verdict = audit_failed ? 'AUDIT FAIL' : 'AUDIT PASS'
 const notes = []
 if (!audit) notes.push('The auditor returned no result; treated as AUDIT FAIL.')
-if (failed.length) {
-    notes.push('Incomplete run: ' + failed.join(', ') + ' returned no result; treated as blocking.')
+if (audit_incomplete) {
+    notes.push(
+        'The auditor returned ' + audit.sections.length + ' of ' + AUDIT_SECTIONS +
+            ' sections; treated as AUDIT FAIL.',
+    )
+}
+if (failed_review.length) {
+    notes.push(
+        'Incomplete run: ' + failed_review.join(', ') + ' returned no result; treated as blocking.',
+    )
 }
 
 const stats = {
@@ -706,14 +746,13 @@ const stats = {
     base: scope.base,
     files: scope.files.length,
     shards: shards.length,
-    lenses: LENSES.map((l) => l.name),
+    lenses: lenses.map((l) => l.name),
     findings: findings.length,
     confirmed: count('confirmed'),
     contested: count('contested'),
     unverified: count('unverified'),
     nits: count('nit'),
     dropped: dropped.length,
-    failed,
 }
 
 // ─── Phase: Synthesize ───
@@ -755,12 +794,17 @@ const SYNTH_PROMPT = [
 
 const synthesized = await run(SYNTH_PROMPT, {
     agentType: INVESTIGATOR, label: 'synthesize', phase: 'Synthesize', schema: REPORT_SCHEMA,
-})
+}).catch(() => null)
+
+if (!synthesized) {
+    failed_other.push('synthesize')
+    notes.push('The synthesizer returned no result; the report body is a placeholder.')
+}
 
 const body = synthesized
     ? synthesized.report
     : '# Pre-merge review: PR #' + PR + '\n\nSynthesis agent returned no result; ' +
-      'the raw findings are in the `findings`, `dropped`, and `audit` fields.\n'
+        'the raw findings are in the `findings`, `dropped`, and `audit` fields.\n'
 
 // The two verdict lines stand alone so they can be surfaced verbatim; notes
 // follow on their own lines.
@@ -768,6 +812,7 @@ const report =
     body.replace(/\s+$/, '') + '\n\n' + verdict + '\n' + audit_verdict + '\n' +
     (notes.length ? '\n' + notes.join('\n') + '\n' : '')
 
+stats.failed = [...failed_review, ...failed_other]
 stats.agents = agent_calls
 
 return { verdict, audit_verdict, report, findings, dropped, audit, stats }

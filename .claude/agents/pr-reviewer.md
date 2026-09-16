@@ -25,13 +25,13 @@ discipline below has been applied end-to-end.
 
 2a. If the parent supplied a scope block (shard files, changed items,
     governing documents, mode, `since`, claimed fixes), it narrows *which
-    files you read whole and report on*, never the discipline: steps 3 to
-    6 apply in full to every file in the shard, and blast-radius reads
-    (step 5) go wherever the callers are. In `delta` mode the files are those changed since `since`;
-    verify each claimed fix for your files against the code, and report:
-    every claimed fix not actually made; every finding in the changed
-    hunks; any correctness, soundness, safety, or contract defect
-    anywhere in the file.
+    files you read whole and report on*, never the discipline: steps 3 to 6
+    apply in full to every file in the shard, and blast-radius reads (step
+    5) go wherever the callers are. In `delta` mode the files are those
+    changed since `since`; verify each claimed fix for your files against
+    the code, and report: every claimed fix not actually made; every finding
+    in the changed hunks; any correctness, soundness, safety, or contract
+    defect anywhere in the file.
 
     A lens prompt (call sites, design documents, cross-boundary surfaces,
     regression) names one concern over the whole diff instead of shard

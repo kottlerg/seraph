@@ -68,29 +68,34 @@ claims.
    branch name — is a FAIL.
 
 9. Validation claim: the PR body's `## Validation` section states the
-   validated head X. X MUST be the PR head, or X MUST be the merge base
-   or a commit in the PR's history and `git diff X <head>` MUST alter,
-   Markdown aside, only comment lines, with the build-embedded text
-   `docs/testing.md` § Coverage tiers names (`include_str!`,
-   `include_bytes!`, `global_asm!` inputs) counted as build input, not
-   comment. FAIL when X is absent, when X is not in the PR's history, when
-   X is not the head and that range is not documentation or comments
-   only, or when the body claims the whole PR is documentation-only and
-   the PR diff is not.
+   validated head X. X MUST be the PR head, or else X MUST be the merge base
+   or a commit between it and the head, the body MUST state that the delta
+   from X to the head is documentation or comments only, and `git diff X
+   <head>` MUST alter, Markdown aside, only comment lines, with the
+   build-embedded text `docs/testing.md` § Coverage tiers names
+   (`include_str!`, `include_bytes!`, `global_asm!` inputs) counted as build
+   input, not comment. FAIL when X is absent, when X is none of the head,
+   the merge base, or a commit between them, when X is not the head and that
+   statement is missing or that range is not documentation or comments only,
+   or when the body claims the whole PR is documentation-only and the PR
+   diff is not.
 
-10. PR-body claims: the Summary and Changes prose against the diff. Every
-    file, argument, behaviour, or number the body describes MUST exist in
-    the diff as described; a stale or false description is a FAIL.
+10. PR-body claims: the body's prose (Summary, Notes, and any section
+    the template does not define) against the diff. Every file, argument,
+    behaviour, or number the body describes as changed by this PR MUST exist
+    in the diff as described; a stale or false description is a FAIL.
+    Context the body gives about things outside the diff (motivation,
+    history, settings outside the repository) is not checked against it.
 
 ## Output
 
 A per-section verdict, each PASS or FAIL: PR-body checklist; per-issue
 closure with per-criterion lines; silent-deferral scan (FAIL on any
-unreconciled hit); test-plan honesty (FAIL on any bare tick);
-commit-message compliance; validation claim; PR-body claims. When invoked with a
+unreconciled hit); test-plan honesty (FAIL on any bare tick); commit-message
+compliance; validation claim; PR-body claims. When invoked with a
 structured-output schema, fill it instead of the prose: one section per
-step with its verdict and items, and the overall verdict; there is no
-final line in schema mode.
+section named above, with its verdict and items, and the overall verdict;
+there is no final line in schema mode.
 
 **In prose mode the final line MUST be exactly one of:** `AUDIT PASS`,
 `AUDIT FAIL`. Any FAIL section forces `AUDIT FAIL`.

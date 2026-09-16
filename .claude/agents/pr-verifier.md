@@ -21,8 +21,10 @@ return value, not a message to a person.
 - When scoping, run the listed commands and derive the requested fields
   from what they print and from the files they name (classification,
   changed items, governing documents); do not review.
-- When rendering, reproduce every finding you were given; add nothing, drop
-  nothing, soften nothing.
+- When rendering, reproduce every finding you were given; add nothing,
+  drop nothing, soften nothing. Grouping entries that share one root cause
+  under a lead entry that still lists every site is presentation, not
+  merging.
 
 ## Tool discipline
 

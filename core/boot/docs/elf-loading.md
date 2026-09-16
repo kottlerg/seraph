@@ -24,7 +24,7 @@ is a fatal error.
 ## File Paths
 
 Files are opened via `EFI_SIMPLE_FILE_SYSTEM_PROTOCOL` on the ESP volume. The
-bootloader carries two hardcoded ESP path constants in
+bootloader carries three hardcoded ESP path constants in
 [`boot/src/main.rs`](../src/main.rs) (see
 [uefi-environment.md](uefi-environment.md)):
 
@@ -32,6 +32,7 @@ bootloader carries two hardcoded ESP path constants in
 |---|---|
 | Kernel | `\EFI\seraph\kernel` |
 | Bootstrap bundle | `\EFI\seraph\bootstrap.bundle` |
+| KASLR override knob | `\EFI\seraph\nokaslr` (presence-only) |
 
 All paths use backslash separators as required by the UEFI file
 protocol. There is no per-file extension mechanism: the bundle is a
@@ -157,8 +158,8 @@ DT_RELASZ`. The `PT_GNU_RELRO` span rides along unbiased
 (`relro_vaddr`/`relro_size`) so the kernel can seal the covered pages
 read-only after relocation. Segment `virt_addr`s and the entry point
 stay unbiased link VAs — the kernel draws the load bias and applies the
-`RELATIVE` relocations itself (the bootloader has no entropy source on
-riscv64; see `kernel/src/mm/init_reloc.rs` and ASLR
+`RELATIVE` relocations itself (the kernel, not the bootloader, owns the
+layout draw; see `kernel/src/mm/init_reloc.rs` and ASLR
 [#39](https://github.com/kottlerg/seraph/issues/39)). An `ET_DYN` image
 whose dynamic section describes any other relocation format
 (`DT_REL`/`DT_RELR`/active `DT_JMPREL`) is rejected as invalid.
@@ -207,4 +208,4 @@ ordinal.
 
 ## Summarized By
 
-[boot/README.md](../README.md)
+[boot/README.md](../README.md), [boot-flow.md](boot-flow.md)

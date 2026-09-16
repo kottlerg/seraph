@@ -23,8 +23,10 @@ In scope:
 
 Out of scope (owned elsewhere, referenced here):
 
-- The psABI / toolchain feature level and target JSONs — [build-system.md](build-system.md#custom-targets).
-- The mechanism of W^X, NX, SMEP/SMAP, SUM/PMP, and tagged-TLB tagging — [memory-model.md](memory-model.md).
+- The psABI / toolchain feature level and target JSONs —
+  [build-system.md](build-system.md#custom-targets).
+- The mechanism of W^X, NX, SMEP/SMAP, SUM/PMP, and tagged-TLB tagging —
+  [memory-model.md](memory-model.md).
 - IOMMU discovery and the DMA safety model — [device-management.md](device-management.md).
 - Console / serial ownership across boot — [console-model.md](console-model.md).
 - The UEFI handoff, firmware tables, and `BootInfo` surface — [bootstrap.md](bootstrap.md) and
@@ -97,7 +99,8 @@ Each feature is classified per architecture as one of:
   kernel sets bit 63 on non-executable PTEs; `NX` is mandatory.
 - **`CR0.WP`** — supervisor write-protect. Without it, ring-0 writes bypass read-only page
   permissions and the kernel's own W^X is unenforced. The kernel sets and requires it on every CPU.
-- **SMEP and SMAP** — supervisor execution and access prevention. See [memory-model.md](memory-model.md).
+- **SMEP and SMAP** — supervisor execution and access prevention. See
+  [memory-model.md](memory-model.md).
 - **PCID and INVPCID** — address-space-tagged TLBs. The kernel assigns a tag per address space and
   elides the per-switch flush; see [memory-model.md](memory-model.md).
 - **Invariant TSC** — a constant-rate timestamp counter, the basis of timekeeping.
@@ -131,9 +134,9 @@ Each feature is classified per architecture as one of:
 
 - **AVX-512 / x86-64-v4** — server-class; never required, never depended upon.
 - **LA57 (5-level paging)** — the kernel uses 4-level paging.
-- **1 GiB huge pages, global pages (`PGE`), `FSGSBASE`/`SWAPGS`, MTRR reprogramming, HPET, the legacy
-  8259 PIC** — not used. (The kernel sets per-CPU GS through `IA32_GS_BASE` and never swaps; it
-  relies on firmware's default PAT and leaves the 8259 masked.)
+- **1 GiB huge pages, global pages (`PGE`), `FSGSBASE`/`SWAPGS`, MTRR reprogramming, HPET, the
+  legacy 8259 PIC** — not used. (The kernel sets per-CPU GS through `IA32_GS_BASE` and never
+  swaps; it relies on firmware's default PAT and leaves the 8259 masked.)
 - **Legacy BIOS / multiboot** — boot is UEFI-only.
 - **Secure Boot, TPM, RTC** — not boot dependencies.
 
@@ -155,7 +158,6 @@ Each feature is classified per architecture as one of:
   NAPOT page encodings; asserted at paging initialization from the bootloader-confirmed hart
   capabilities. Svade is the baseline A/D-bit model.
 - **Ssstateen / Smstateen** — state-enable CSRs, required for the hardening posture.
-- **Zkr seed CSR** — the supervisor-accessible hardware entropy source.
 - **`time` CSR (Zicntr)** — the timestamp source.
 - **Address translation**: one of Sv39/Sv48/Sv57, negotiated at boot (DTB
   `mmu-type` plus a `satp` write-probe; the widest confirmed mode wins). Sv39
@@ -172,7 +174,11 @@ Each feature is classified per architecture as one of:
 - **Sv57** — a larger-VA expansion above the Sv48 default; used when the
   platform advertises and the probe confirms it.
 - **Zvk vector crypto** — crypto acceleration.
-- **EFI_RNG_PROTOCOL, GOP framebuffer, PCIe ECAM** — as on x86-64.
+- **EFI_RNG_PROTOCOL** — the boot seed's only firmware source under the EDK2 firmware the
+  default boot uses, exposed through the firmware's `VirtioRngDxe` binding `virtio-rng`;
+  firmware that delivers a DTB may supply `/chosen/rng-seed` instead, and with neither the pool
+  seeds from jitter (see [core/kernel/docs/entropy.md](../core/kernel/docs/entropy.md)).
+- **GOP framebuffer, PCIe ECAM** — as on x86-64.
 
 ### Unsupported
 
@@ -183,6 +189,9 @@ Each feature is classified per architecture as one of:
   cache-coherent DMA. (Distinct from Svpbmt: the PBMT memory type governs how a hart's own
   accesses to a mapping behave, not DMA cache coherence.)
 - **Secure Boot, TPM, RTC** — not boot dependencies.
+- **Zkr seed CSR** — not used: M-mode-owned under default firmware, so it is not an S-mode
+  entropy source; the kernel reports no riscv64 hardware RNG (see
+  [core/kernel/docs/entropy.md](../core/kernel/docs/entropy.md)).
 
 ---
 

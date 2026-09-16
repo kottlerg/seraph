@@ -8,7 +8,7 @@
 //! Loads the kernel ELF and init module from the ESP, establishes initial
 //! page tables with W^X enforcement, discovers firmware table addresses,
 //! exits UEFI boot services, populates `BootInfo`, and jumps to the kernel
-//! entry point. See `boot/docs/boot-flow.md` for the step-by-step design.
+//! entry point. See `core/boot/docs/boot-flow.md` for the step-by-step design.
 
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(not(test), no_main)]
@@ -169,18 +169,21 @@ struct CpuTopology
     cpu_ids: [u32; MAX_CPUS],
 }
 
-/// Conditioned early-boot entropy drawn from UEFI `EFI_RNG_PROTOCOL`.
+/// Conditioned early-boot entropy drawn from UEFI `EFI_RNG_PROTOCOL` or, as a
+/// fallback, from the DTB `/chosen/rng-seed` property.
 ///
-/// `len` is `0` when the firmware exposes no RNG; the kernel then degrades to
-/// timing jitter alone. Produced by [`step5c_fetch_boot_entropy`] while boot
-/// services are live and written into [`BootInfo`] by step 9. The `kaslr`
-/// words are a separate draw feeding the KASLR slide / direct-map base
-/// (#252); `kaslr_available` is false when no RNG source produced them.
+/// `len` is `0` when no source produced a seed; the kernel then seeds from its
+/// remaining sources (see `core/kernel/docs/entropy.md`). Produced by
+/// [`step5c_fetch_boot_entropy`] while boot services are live and written into
+/// [`BootInfo`] by step 9. The `kaslr` words are a separate draw feeding the
+/// KASLR slide / direct-map base (#252); `kaslr_available` is false when no RNG
+/// source produced them.
 struct BootEntropy
 {
     /// Random bytes for the entropy pool; only the first `len` are valid.
     seed: [u8; 32],
-    /// Number of valid leading bytes in `seed` (`0` or `32`).
+    /// Number of valid leading bytes in `seed` (`0..=32`: 32 from the firmware
+    /// RNG, fewer from the DTB fallback).
     len: u32,
     /// Two 64-bit KASLR entropy words: `[0]` picks the image slide, `[1]`
     /// the direct-map base. Valid only when `kaslr_available`.
@@ -294,7 +297,8 @@ unsafe fn boot_sequence(image: EfiHandle, st: *mut EfiSystemTable) -> Result<!, 
     let ap_trampoline_phys = unsafe { step5b_alloc_ap_trampoline(&ctx) };
     // SAFETY: ctx.bs valid pre-exit; draws the boot entropy seed while boot
     // services (and thus EFI_RNG_PROTOCOL) are still available; firm.device_tree
-    // is zero or an identity-mapped FDT for the riscv64 rng-seed fallback.
+    // is zero or an identity-mapped, writable (pre-ExitBootServices) FDT for the
+    // DTB rng-seed fallback's in-place scrub.
     let mut boot_entropy = unsafe { step5c_fetch_boot_entropy(&ctx, &firm) };
     // Apply the KASLR slide before step 6 maps the segments at their
     // (biased) virtual addresses.
@@ -765,12 +769,14 @@ unsafe fn step5b_alloc_ap_trampoline(ctx: &UefiContext) -> u64
 /// Draw conditioned early-boot entropy for the pool seed and the KASLR
 /// slide / direct-map base.
 ///
-/// Prefers UEFI `EFI_RNG_PROTOCOL` (x86-64 OVMF). Where it is absent —
-/// riscv64 EDK2 exposes none — falls back to the QEMU-provided DTB
-/// `/chosen/rng-seed` (see [`fetch_dtb_rng_seed`]). When neither source is
-/// available, returns `len == 0` and `kaslr_available == false`; the kernel
-/// then degrades to timing jitter and the layout to its deterministic
-/// fallback (no regression).
+/// Draws the pool seed from UEFI `EFI_RNG_PROTOCOL` when the firmware exposes
+/// it and the draw succeeds; a failed KASLR draw after a successful pool draw
+/// returns `len == 32` with `kaslr_available == false`. Otherwise draws from
+/// the DTB `/chosen/rng-seed` reader ([`dtb::parse_rng_seed`]); otherwise
+/// returns `len == 0` and `kaslr_available == false`, and the kernel seeds the
+/// pool from its remaining sources and the layout is deterministic (no
+/// regression). Which firmware exposes which source is documented in
+/// `core/boot/docs/boot-flow.md`.
 ///
 /// # Safety
 /// `ctx.bs` must be valid UEFI boot services (before `ExitBootServices`);
@@ -837,7 +843,7 @@ unsafe fn step5c_fetch_boot_entropy(ctx: &UefiContext, firm: &FirmwareInfo) -> B
         seed = [0u8; 32];
     }
 
-    // riscv64 fallback: the QEMU-authored DTB /chosen/rng-seed. One draw
+    // DTB fallback: the firmware-delivered /chosen/rng-seed. One draw
     // serves both consumers: the first 16 bytes seed KASLR, the remainder
     // seeds the entropy pool (non-overlapping so the pool seed never
     // reveals the KASLR words).

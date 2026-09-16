@@ -14,5 +14,8 @@ Closes #<issue>
 - [ ] `cargo xtask run --arch riscv64`, terminal pass marker observed
 - [ ] additional component-specific checks: <…>
 
+## Validation
+<validated head; for a documentation-only or comment-only delta since it, say so>
+
 ## Notes
 <design tradeoffs; follow-ups filed as Issues; anything reviewers should see>

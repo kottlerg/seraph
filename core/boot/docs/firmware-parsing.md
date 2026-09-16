@@ -1,18 +1,24 @@
 # Firmware Parsing
 
 The bootloader performs narrow, targeted firmware parsing to populate
-three parts of `BootInfo`:
+five parts of `BootInfo`:
 
 1. `cpu_count` / `bsp_id` / `cpu_ids` — the CPU topology handed to the
    kernel for SMP bring-up.
 2. `kernel_mmio` — the arch-specific MMIO register bases the kernel
    itself consumes (LAPIC / IOAPIC on x86-64 via ACPI MADT; PLIC / UART
    on RISC-V via ACPI MADT + SPCR, with any fields left zero by ACPI
-   filled from the DTB). Not a capability surface.
+   filled from the DTB), plus the riscv64 hart facts carried in the same
+   struct (`timebase_freq`, `hart_caps`). Not a capability surface.
 3. `mmio_apertures` — a short list of coarse `{phys_base, size}` MMIO
    regions, used as seeds into the final aperture list that is merged
    with the UEFI memory map's MMIO classifications. The kernel mints
    one `Mmio` capability per aperture entry.
+4. `boot_entropy_seed` / `boot_entropy_len` — the DTB `/chosen/rng-seed`
+   fallback, consulted only when `EFI_RNG_PROTOCOL` yields no seed
+   (DTB-only; see [boot-flow.md](boot-flow.md) step 5c).
+5. `vmgenid_paddr` — the VM Generation ID GUID address from the x86-64
+   QEMU SSDT scan; zero when absent.
 
 The bootloader does **not** emit per-device capabilities, interrupt
 descriptors, PCI ECAM descriptors, or firmware-table read-only caps.
@@ -33,7 +39,7 @@ Firmware table location is obtained from `EFI_CONFIGURATION_TABLE`:
 | GUID | `BootInfo` field | Typical architecture |
 |---|---|---|
 | `EFI_ACPI_20_TABLE_GUID` | `acpi_rsdp` | x86-64 (and ACPI-capable RISC-V platforms such as QEMU+EDK2 virt) |
-| `EFI_DTB_TABLE_GUID` | `device_tree` | RISC-V (and any DTB-capable x86-64 platform) |
+| `EFI_DTB_TABLE_GUID` | `device_tree` | RISC-V firmware that installs the FDT table (not QEMU+EDK2, which publishes ACPI only) |
 
 The configuration table is a flat array (`SystemTable->NumberOfTableEntries`
 entries, each a `(GUID, pointer)` pair). The bootloader scans the entire
@@ -42,10 +48,11 @@ each found table in the appropriate `BootInfo` field. If a GUID is
 absent, its field is zeroed.
 
 Both fields may be non-zero on a platform that exposes both ACPI and a
-DTB (UEFI RISC-V firmware commonly does). On RISC-V the bootloader runs
-ACPI first for `kernel_mmio` and then lets the DTB pass fill in any
-field ACPI left zero; the two never overwrite each other. Userspace
-handles both passthrough addresses the same way.
+DTB; no currently targeted host does, since QEMU+EDK2 on RISC-V hands
+the bootloader ACPI only. On RISC-V the bootloader runs ACPI first for
+`kernel_mmio` and then lets the DTB pass fill in any field ACPI left
+zero; the two never overwrite each other. Userspace handles both
+passthrough addresses the same way.
 
 ---
 
@@ -78,7 +85,8 @@ after `ExitBootServices` by
 3. Sort by `phys_base`.
 4. Merge adjacent and overlapping entries into a minimal non-overlapping
    list.
-5. Cap at [`MAX_APERTURES`] (16); surplus is dropped with a diagnostic.
+5. Cap at `MAX_APERTURES` (16, `abi/boot-protocol`); surplus is dropped with a
+   diagnostic.
 
 The UEFI memory map on every currently-targeted host is the primary
 source; firmware-table seeds cover the regions the UEFI map often
@@ -118,4 +126,4 @@ from the ACPI/DTB passthrough addresses in `BootInfo`.
 
 ## Summarized By
 
-[boot/README.md](../README.md)
+[boot/README.md](../README.md), [boot-flow.md](boot-flow.md)

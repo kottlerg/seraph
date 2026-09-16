@@ -6,7 +6,7 @@
 //! Seraph microkernel — kernel entry point.
 //!
 //! Receives control from the bootloader after page tables are installed and
-//! UEFI boot services have exited. See `boot/docs/kernel-handoff.md` for the
+//! UEFI boot services have exited. See `core/boot/docs/kernel-handoff.md` for the
 //! CPU-state contract and the `abi/boot-protocol` crate for the `BootInfo`
 //! layout.
 //!
@@ -63,12 +63,6 @@ mod syscall;
 mod uaccess;
 mod validate;
 
-/// Kernel entry point.
-///
-/// Called by the bootloader with CPU state per `boot/docs/kernel-handoff.md`.
-/// `boot_info` is the physical address of a populated [`BootInfo`] structure,
-/// accessible before the kernel's own page tables are established because the
-/// bootloader identity-maps the `BootInfo` region.
 /// Report the KASLR layout at Phase 1.
 ///
 /// A framebuffer-safe summary line (no addresses — the console mirrors to the
@@ -154,6 +148,12 @@ fn report_kaslr(flags: u32, image_base: u64, dm_base: u64)
 #[cfg(test)]
 fn report_kaslr(_flags: u32, _image_base: u64, _dm_base: u64) {}
 
+/// Kernel entry point.
+///
+/// Called by the bootloader with CPU state per `core/boot/docs/kernel-handoff.md`.
+/// `boot_info` is the physical address of a populated [`BootInfo`] structure,
+/// accessible before the kernel's own page tables are established because the
+/// bootloader identity-maps the `BootInfo` region.
 // too_many_lines: kernel_entry is the single-entry boot sequence; splitting it would
 // obscure the sequential phase structure without reducing actual complexity.
 // not_unsafe_ptr_arg_deref: boot_info is validated (null + alignment) before deref;
@@ -490,7 +490,12 @@ unsafe fn kernel_entry_post_rebase(
         // randomized kernel image and direct-map bases defeat KASLR if
         // disclosed. All Phase-3 consumers of the two bases have run; later
         // phases read only layout-free BootInfo fields.
-        boot_entropy_seed.fill(0);
+        for b in &mut boot_entropy_seed
+        {
+            // SAFETY: `b` is a valid exclusive reference into the local array.
+            // Volatile so the scrub of a value never read again is not elided.
+            unsafe { core::ptr::write_volatile(b, 0) };
+        }
         // SAFETY: the direct map covers all RAM since Phase 3; boot_info_phys
         // was validated in Phase 0. Single-threaded boot, and no live BootInfo
         // reference aliases the page at this point. Volatile stores so the

@@ -163,7 +163,7 @@ Emit "fatal: cannot build kernel page tables (OOM)" and halt.
 4. Allocate per-CPU subsystem storage from the buddy allocator while it still
    holds large contiguous blocks (before the Phase-7 user-cap drain): scheduler
    per-CPU state and idle stacks, and the entropy subsystem's per-CPU CSPRNGs,
-   central pool, and jitter accumulators (see entropy.md)
+   central pool, jitter accumulators, and self-test sample slab (see entropy.md)
 ```
 
 **Failure mode:** a failed per-CPU storage allocation halts the kernel.
@@ -222,9 +222,11 @@ Architecture-specific hardware initialization; x86-64 and RISC-V diverge here.
 ```
 
 After the architecture hardware path, the BSP seeds the entropy pool from the
-hardware RNG (health-gated where present) and boot-time jitter and opens the
-kernel draw API; without a hardware RNG (RISC-V under default firmware) this
-degrades to jitter only. See [entropy.md](entropy.md).
+firmware boot seed in `BootInfo`, the hardware RNG (health-gated where present),
+and boot-time jitter, and opens the kernel draw API; with neither a firmware
+seed nor a hardware RNG this degrades to jitter only. The BSP then scrubs the
+seed and the two KASLR bases from the `BootInfo` page (a Phase-7 reclaim range)
+and zeroes its local copy of the seed. See [entropy.md](entropy.md).
 
 **Failure mode:** Hardware initialisation failures (e.g. CPUID indicates a required
 feature is absent) halt with a descriptive message. The specific required features
@@ -238,21 +240,20 @@ and the syscall entry mechanism is installed.
 
 ## Phase 6: Platform Resource Validation
 
-Caches `kernel_mmio` and validates `mmio_apertures` before Phase 7 mints
-capabilities from it.
+Validates `mmio_apertures` before Phase 7 mints capabilities from it
+(`kernel_mmio` was captured into the kernel-local cache in Phase 4).
 
 ```
-1. Copy BootInfo.kernel_mmio into the kernel-local KERNEL_MMIO cache.
-2. If mmio_apertures.count == 0: skip aperture validation, proceed with empty set.
-3. Verify mmio_apertures.entries is non-null (required when count > 0).
-4. Verify the slice falls within boot-provided physical memory:
+1. If mmio_apertures.count == 0: skip aperture validation, proceed with empty set.
+2. Verify mmio_apertures.entries is non-null (required when count > 0).
+3. Verify the slice falls within boot-provided physical memory:
    - The entire range [entries, entries + count * size_of::<MmioAperture>())
      must be within regions the memory map marks as Usable or Loaded.
-5. For each MmioAperture entry:
+4. For each MmioAperture entry:
    - Verify phys_base is page-aligned; skip with warning if not.
    - Verify size > 0 and size is page-aligned; skip with warning if not.
    - Verify phys_base + size does not wrap u64; skip with warning if not.
-6. Emit: "mmio apertures: N validated (M skipped)".
+5. Emit: "mmio apertures: N validated (M skipped)".
 ```
 
 **Failure mode:** Null `entries` when `count > 0`: halt with "fatal:
@@ -260,7 +261,7 @@ mmio_apertures.entries is null with non-zero count". Individual bad
 entries: emit a warning and skip.
 
 **Completion criterion:** The validated aperture list is available to
-Phase 7, and `KERNEL_MMIO` is populated.
+Phase 7.
 
 ---
 
@@ -445,7 +446,9 @@ calls `sched::enter()`.
 ```
 
 **Implementation notes:**
-- CSpace hand-off (step 5d): `sched::enter()` calls `set_current(init_tcb)` so `current_tcb()` returns the init TCB during init's syscalls; init receives ROOT_CSPACE.
+- CSpace hand-off (step 5d): `sched::enter()` calls `set_current(init_tcb)` so
+  `current_tcb()` returns the init TCB during init's syscalls; init receives
+  ROOT_CSPACE.
 - The x86-64 `switch_and_enter_user` function atomically switches the stack pointer
   BEFORE writing CR3. This is required because the boot stack is identity-mapped in
   PML4 entries 0–255 (the lower half), which are not copied into init's page tables.
@@ -503,4 +506,4 @@ that CPU only; the BSP and other CPUs continue.
 
 ## Summarized By
 
-[kernel/README.md](../README.md)
+[kernel/README.md](../README.md), [docs/bootstrap.md](../../../docs/bootstrap.md)

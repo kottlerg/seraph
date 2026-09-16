@@ -674,11 +674,12 @@ const reviewed = await pipeline(
                 agentType: 'pr-reviewer', label: item.label, phase: 'Review',
                 schema: FINDINGS_SCHEMA,
             })
-        // A thrown launch would drop the item from the pipeline before the
-        // next stage could record the failure.
-        return launch.catch(() => null)
+        // The pipeline skips the remaining stages of an item whose stage
+        // value is null, and agent() returns null for a dead or skipped
+        // subagent, so a failure is wrapped rather than passed through.
+        return launch.then((result) => ({ result }), () => ({ result: null }))
     },
-    (result, item) => {
+    ({ result }, item) => {
         if (!result) {
             ;(item.kind === 'audit' ? failed_other : failed_review).push(item.label)
             log(item.label + ': no result (agent failed or was stopped)')
@@ -696,6 +697,17 @@ const reviewed = await pipeline(
         }))
     },
 )
+
+// Whatever the runtime did with a failed item, a missing slot is a failed
+// reviewer; reconcile by index so no failure can slip past the accounting.
+review_items.forEach((item, i) => {
+    const slot = reviewed[i]
+    const list = item.kind === 'audit' ? failed_other : failed_review
+    if (!slot && !list.includes(item.label)) {
+        list.push(item.label)
+        log(item.label + ': no result (dropped by the pipeline)')
+    }
+})
 
 const results = reviewed.filter(Boolean)
 const audit = results.map((r) => r.audit).find(Boolean) || null
@@ -727,18 +739,20 @@ const verdict = blocking
         : 'READY TO MERGE'
 
 // The auditor's own contract: any FAIL section forces AUDIT FAIL, and an
-// audit that skipped a step is not a pass.
-const audit_incomplete = audit !== null && audit.sections.length < AUDIT_SECTIONS
+// audit that skipped a named section is not a pass.
+const section_present = (name) =>
+    audit.sections.some((s) => s.name.toLowerCase().includes(name.toLowerCase()))
+const missing_sections = audit ? AUDIT_SECTION_NAMES.filter((n) => !section_present(n)) : []
 const audit_failed =
-    !audit || audit_incomplete || audit.verdict === 'AUDIT FAIL' ||
+    !audit || missing_sections.length > 0 || audit.verdict === 'AUDIT FAIL' ||
     audit.sections.some((s) => s.verdict === 'FAIL')
 const audit_verdict = audit_failed ? 'AUDIT FAIL' : 'AUDIT PASS'
 const notes = []
 if (!audit) notes.push('The auditor returned no result; treated as AUDIT FAIL.')
-if (audit_incomplete) {
+if (missing_sections.length) {
     notes.push(
-        'The auditor returned ' + audit.sections.length + ' of ' + AUDIT_SECTIONS +
-            ' sections; treated as AUDIT FAIL.',
+        'The audit lacks the sections ' + missing_sections.join(', ') +
+            '; treated as AUDIT FAIL.',
     )
 }
 if (failed_review.length) {
@@ -747,6 +761,7 @@ if (failed_review.length) {
     )
 }
 
+// `failed` is read again after Synthesize, which can add to it.
 const stats = {
     pr: PR,
     mode: MODE,
@@ -762,7 +777,9 @@ const stats = {
     unverified: count('unverified'),
     nits: count('nit'),
     dropped: dropped.length,
-    failed: [...failed_review, ...failed_other],
+    get failed() {
+        return [...failed_review, ...failed_other]
+    },
 }
 
 // ─── Phase: Synthesize ───
@@ -824,7 +841,6 @@ const report =
     body.replace(/\s+$/, '') + '\n\n' + verdict + '\n' + audit_verdict + '\n' +
     (notes.length ? '\n' + notes.join('\n') + '\n' : '')
 
-stats.failed = [...failed_review, ...failed_other]
 stats.agents = agent_calls
 
-return { verdict, audit_verdict, report, findings, dropped, audit, stats }
+return { verdict, audit_verdict, report, findings, dropped, audit, stats: { ...stats } }

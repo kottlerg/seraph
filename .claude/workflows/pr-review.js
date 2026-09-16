@@ -67,9 +67,14 @@ if (MODE === 'full' && DELTA) {
 const MAX_SHARD_FILES = 6 // files per shard reviewer
 const MAX_SHARD_LINES = 500 // changed lines per shard reviewer
 const MAX_LENS_DOCS = 8 // design documents per design-docs lens agent
-const DEDUP_LINE_SLACK = 3 // findings this close on the same file, class, and bucket are one
+const DEDUP_LINE_SLACK = 3 // lines apart at which same file, class, bucket, and flag are one
 const VERIFY_LENSES = ['reality', 'authority']
-const AUDIT_SECTIONS = 6 // pr-auditor steps 4 to 9, one section each
+// The sections pr-auditor's Output lists; the audit must return each of them.
+const AUDIT_SECTION_NAMES = [
+    'PR-body checklist', 'per-issue closure', 'silent-deferral scan', 'test-plan honesty',
+    'commit-message compliance', 'validation claim', 'PR-body claims',
+]
+const AUDIT_SECTIONS = AUDIT_SECTION_NAMES.length
 const INVESTIGATOR = 'pr-verifier' // read-only agent type for scope, verify, and synthesize
 
 // ─── Schemas ───
@@ -321,8 +326,9 @@ const SCOPE_PROMPT = [
     '- changed_items: every public or crate-visible function, type, trait, constant, syscall, ' +
         'or wire-protocol element whose signature, contract, semantics, or documentation the ' +
         'PR diff changes, with the kind of change.',
-    '- design_docs: the system-scope (`docs/`) and component-scope (`<component>/README.md`, ' +
-        '`<component>/docs/*.md`) documents that govern the touched areas, found by walking the ' +
+    '- design_docs: the system-scope documents (the root `README.md` and `docs/`) and the ' +
+        'component-scope documents (`<component>/README.md`, `<component>/docs/*.md`, and the ' +
+        'parent directory\'s `README.md`) that govern the touched areas, found by walking the ' +
         'scope order the root README and the component READMEs define; include every document ' +
         'the diff itself edits.',
     '- claimed_fixes: ' +
@@ -534,9 +540,9 @@ if (MODE === 'scope') {
 
 const AUDIT_PROMPT = [
     'Scope: pull request #' + PR + '. Run your audit per your brief, every step.',
-    'Fill the structured schema: the overall verdict, and one section per audit step (steps 4 ' +
-        'to 9, six sections) with its PASS or FAIL and the items it found. Structured output ' +
-        'only.',
+    'Fill the structured schema: the overall verdict, and one section for each of ' +
+        AUDIT_SECTION_NAMES.join(', ') + ' with its PASS or FAIL and the items it found. ' +
+        'Structured output only.',
 ].join('\n')
 
 function verify_prompt(f, lens) {
@@ -580,7 +586,8 @@ function verify_prompt(f, lens) {
             'authority does not say what the finding claims, that it is not binding on this ' +
             'surface, or that the code or document does not violate it as claimed. ' +
             'refuted=false when the authority says what is claimed and the location violates ' +
-            'it, or when the authority is a correctness contract the location breaks. ' +
+            'it, when the authority is a correctness contract the location breaks, and also ' +
+            'when you can neither confirm nor refute it; say so, with confidence low. ' +
             'Structured output only.',
     ].join('\n')
 }
@@ -753,6 +760,7 @@ const stats = {
     unverified: count('unverified'),
     nits: count('nit'),
     dropped: dropped.length,
+    failed: [...failed_review, ...failed_other],
 }
 
 // ─── Phase: Synthesize ───
@@ -766,7 +774,9 @@ const SYNTH_PROMPT = [
     'Rules: every finding below appears exactly once, under its bucket, with its status tag; ' +
         'do not drop, add, merge, re-rank, or soften a finding. You may order entries within ' +
         'a bucket by file and group entries that share one root cause under one lead entry ' +
-        'that still lists every file:line. Each entry: `file:line` [status] claim. Authority: ' +
+        'that still lists every file:line. Each entry: `file:line` [status] claim, with ' +
+        '`(MUST violation)` after the status when must_violation is true, since such an entry ' +
+        'blocks the merge whatever its bucket. Authority: ' +
         'the cited authority. Rationale: one sentence from the evidence. Fix: the proposed ' +
         'fix. For contested and unverified entries add one line per verifier vote with its ' +
         'lens, refuted flag, confidence, and evidence. The dropped section lists each dropped ' +

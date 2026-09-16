@@ -1,8 +1,8 @@
 # Kernel Entropy Subsystem
 
-Kernel-internal randomness: a multi-source entropy pool feeding per-CPU
-forward-secure CSPRNGs, with a small draw API, hardware-source health gating,
-and a boot-time power-on self-test.
+Kernel randomness for kernel consumers and `SYS_GETRANDOM`: a multi-source
+entropy pool feeding per-CPU forward-secure CSPRNGs, with a small draw API,
+hardware-source health gating, and a boot-time power-on self-test.
 
 ---
 
@@ -56,7 +56,7 @@ Three source classes are mixed into the pool:
   directly rather than health-gated. Present wherever the firmware implements
   the protocol or a firmware RNG driver binds a device that exposes it — x86-64
   OVMF natively (RDRAND-backed), riscv64 EDK2 through `VirtioRngDxe` with the
-  default boot set's `virtio-rng`; without such a device `boot_entropy_len == 0`
+  default boot set's `virtio-rng`; without the protocol `boot_entropy_len == 0`
   and the pool falls back to jitter (see "Boot-time entropy").
 - **Hardware RNG** — drawn through the `arch::current::entropy` contract
   (`hw_rng_available`, `hw_rng_u64`). On x86-64 this is RDSEED (a conditioned,
@@ -344,4 +344,7 @@ continuous validator.
 ## Summarized By
 
 [Kernel](../README.md), [docs/syscalls.md](syscalls.md),
-[docs/testing.md](../../../docs/testing.md)
+[docs/initialization.md](initialization.md),
+[boot/docs/boot-flow.md](../../boot/docs/boot-flow.md),
+[docs/testing.md](../../../docs/testing.md),
+[docs/userspace-memory-model.md](../../../docs/userspace-memory-model.md)

@@ -765,12 +765,15 @@ unsafe fn step5b_alloc_ap_trampoline(ctx: &UefiContext) -> u64
 /// Draw conditioned early-boot entropy for the pool seed and the KASLR
 /// slide / direct-map base.
 ///
-/// Prefers UEFI `EFI_RNG_PROTOCOL` (x86-64 OVMF). Where it is absent —
-/// riscv64 EDK2 exposes none — falls back to the QEMU-provided DTB
-/// `/chosen/rng-seed` (see [`fetch_dtb_rng_seed`]). When neither source is
-/// available, returns `len == 0` and `kaslr_available == false`; the kernel
-/// then degrades to timing jitter and the layout to its deterministic
-/// fallback (no regression).
+/// Draws from UEFI `EFI_RNG_PROTOCOL` wherever the firmware or a firmware RNG
+/// driver exposes it (x86-64 OVMF natively; riscv64 EDK2 through `VirtioRngDxe`
+/// binding `virtio-rng-pci`). The DTB `/chosen/rng-seed` reader (see
+/// [`fetch_dtb_rng_seed`]) is a secondary fallback for firmware that delivers a
+/// DTB. When neither source is available, returns `len == 0` and
+/// `kaslr_available == false`; the kernel then degrades to timing jitter and
+/// the layout to its deterministic fallback (no regression). The platform
+/// matrix is documented in `core/boot/docs/boot-flow.md` and
+/// `core/kernel/docs/entropy.md`.
 ///
 /// # Safety
 /// `ctx.bs` must be valid UEFI boot services (before `ExitBootServices`);

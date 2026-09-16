@@ -2068,15 +2068,15 @@ intact.
 
 | Constant | Value | Meaning |
 |---|---|---|
-| `MSG_DATA_WORDS_MAX` | TBD (≥4) | Maximum data words per message |
+| `MSG_DATA_WORDS_MAX` | 64 | Maximum data words per message |
 | `MSG_CAP_SLOTS_MAX` | 4 | Maximum capabilities per message |
 | `PRIORITY_MIN` | 1 | Lowest priority a userspace thread may be assigned (0 is the idle band) |
 | `PRIORITY_MAX` | 30 | Maximum priority for userspace threads |
 | `EVENT_QUEUE_MAX_CAPACITY` | 4096 | Maximum entries in an event queue |
-| `BOOT_PROTOCOL_VERSION` | 5 | Expected version in `BootInfo.version` |
+| `BOOT_PROTOCOL_VERSION` | 14 | Expected version in `BootInfo.version` |
 
-`MSG_DATA_WORDS_MAX` is fixed at implementation time. A value of 4–8 words balances
-message capacity against syscall overhead. The exact value becomes stable ABI.
+The values are those of the `abi/syscall` and `abi/boot-protocol` crates, which are
+the source of truth.
 
 ---
 

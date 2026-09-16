@@ -1035,11 +1035,12 @@ pub unsafe fn parse_aperture_seed(dtb_addr: u64, out: &mut [MmioAperture]) -> us
 /// Extract the `/chosen/rng-seed` property into `out`, scrub it from the
 /// blob, and return the number of bytes copied (0 when absent).
 ///
-/// QEMU's `virt` machine populates `rng-seed` with host-random bytes and
-/// the EDK2 `RiscVVirtQemu` firmware passes the FDT through unmodified, so
-/// on riscv64 — where no `EFI_RNG_PROTOCOL` exists — this is the bootloader's
-/// only entropy source (KASLR draws and the pool seed). The property bytes
-/// are zeroed in place because the same blob is later handed to userspace
+/// QEMU's `virt` machine populates `rng-seed` with host-random bytes. Under the
+/// EDK2 `RiscVVirtQemu` firmware the bootloader receives ACPI rather than a
+/// DTB, so this reader is a secondary fallback for firmware that delivers a
+/// DTB; the primary riscv64 source is `EFI_RNG_PROTOCOL` through the firmware's
+/// `VirtioRngDxe` driver (see `core/boot/docs/boot-flow.md`). The property
+/// bytes are zeroed in place because the same blob is later handed to userspace
 /// via `BootInfo.device_tree`; the seed must not outlive its consumption.
 ///
 /// # Safety

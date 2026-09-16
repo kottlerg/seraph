@@ -9,13 +9,12 @@
 //! M-mode-owned (`mseccfg.SSEED`) and unavailable to S-mode under default
 //! `OpenSBI`, and there is no standard SBI entropy call. [`hw_rng_available`] is
 //! therefore `false` — this in-kernel arch path provides no hardware RNG by
-//! design. Early-boot entropy is meant to arrive as a conditioned seed the
-//! bootloader draws from UEFI `EFI_RNG_PROTOCOL` and passes in `BootInfo`, but
-//! the current riscv64 EDK2 does not implement that protocol, so today riscv64
-//! seeds from timing jitter alone (see `core/kernel/docs/entropy.md`). Exposing
-//! a firmware seed, and a *runtime* riscv64 hardware-RNG source via a userspace
-//! virtio-rng/hwrng driver — the mechanism the RISC-V design intends for lower
-//! privilege levels — are tracked as future work.
+//! design. Early-boot entropy arrives as the conditioned firmware seed the
+//! bootloader passes in `BootInfo`; its sources and the degradation to jitter
+//! are documented in `core/kernel/docs/entropy.md`. A runtime riscv64
+//! hardware-RNG source via a userspace virtio-rng/hwrng driver, the mechanism
+//! the RISC-V design intends for lower privilege levels, is tracked as future
+//! work.
 //!
 //! The raw cycle counter (the `time` CSR, always S-mode readable) feeds jitter
 //! sampling. Same `arch::current` entropy contract as the x86-64 counterpart.

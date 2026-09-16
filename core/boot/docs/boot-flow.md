@@ -133,7 +133,7 @@ seed at all, since its EDK2 exposes no RNG on its own and hands the bootloader A
 rather than a DTB). When no RNG is exposed the length is zero, the KASLR entropy is
 absent, and the kernel degrades to timing jitter and the deterministic layout. A DTB
 `/chosen/rng-seed` reader is a secondary fallback for firmware that delivers a DTB.
-See `core/kernel/docs/entropy.md`.
+See [core/kernel/docs/entropy.md](../../kernel/docs/entropy.md).
 
 Detail: [firmware-parsing.md](firmware-parsing.md)
 

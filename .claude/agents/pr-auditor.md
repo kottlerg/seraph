@@ -13,11 +13,11 @@ claims.
 
 ## Method
 
-1. Read `.claude/CLAUDE.md` first. It is **not** auto-loaded into your
-   context. Sections that bind your audit specifically: "PR workflow
-   operations", "Completeness", and the project conventions referenced from
-   `docs/conventions.md` (PR body shape, `Closes #N` semantics,
-   Acceptance-checklist closure).
+1. Read `.claude/CLAUDE.md` first, whether or not it was injected into
+   your context. Sections that bind your audit specifically: "PR workflow
+   operations", "Validation", "Completeness", and the project conventions
+   referenced from `docs/conventions.md` (PR body shape, `Closes #N`
+   semantics, Acceptance-checklist closure).
 
 2. Resolve scope from the parent's invocation: PR number, or current-branch
    PR via `gh pr view --json number,body,title,files`, or local feature
@@ -49,7 +49,10 @@ claims.
      `will come later`. Do **not** flag bare `TODO` tokens in the diff.
    Per the Completeness rule in `.claude/CLAUDE.md`, mechanically
    reachable work cannot be deferred; surface every hit matching the
-   criteria above.
+   criteria above. A hit is reconciled when the same text names the Issue
+   filed for the deferral under the Completeness rule, or when it is not a
+   deferral of this PR's work (a rule's wording, a quotation, a
+   description of past work).
 
 7. Test-plan honesty: every `- [x]` under `## Test plan` in the PR body
    should have plausible basis (cited tool output, file presence, commit
@@ -64,11 +67,17 @@ claims.
    kernel's documented boot phases are not labels), a task ID, or a
    branch name — is a FAIL.
 
-9. Validation claim: when the PR body claims a documentation-only or
-   comment-only change under `docs/testing.md` § Coverage tiers, check the
-   claim against the diff (Markdown aside, only comment lines change) and
-   check that the stated validated head is the PR head. A false claim or a
-   stale head is a FAIL.
+9. Validation claim: the PR body's `## Validation` section states the
+   validated head X. When the body claims a documentation-only or
+   comment-only delta under `docs/testing.md` § Coverage tiers, X MUST be
+   the merge base or a commit in the PR's history, and `git diff X <head>`
+   MUST alter, Markdown aside, only comment lines, with the build-embedded
+   text that section names (`include_str!`, `include_bytes!`,
+   `global_asm!` inputs) counted as build input, not comment. FAIL when X
+   is not in the PR's history, when that range is not documentation or
+   comments only, or when the body claims the whole PR is
+   documentation-only and the PR diff is not. PASS when the body makes no
+   such claim.
 
 ## Output
 

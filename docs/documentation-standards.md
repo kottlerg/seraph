@@ -66,7 +66,7 @@ If no non-structural document summarizes this document:
 
 ## Summarized By
 
-None
+[Conventions](conventions.md)
 ```
 
 **Exception — release notes.** The per-tag release notes under `docs/releases/`
@@ -194,4 +194,4 @@ to system-level documents this component summarizes or depends on).
 
 ## Summarized By
 
-None
+[Conventions](conventions.md)

@@ -858,8 +858,9 @@ pub struct BootInfo
     pub reclaim_ranges: ReclaimSlice,
 
     // ── Boot entropy seed (added in protocol version 9) ───────────────────────
-    /// Conditioned early-boot entropy seed obtained by the bootloader from UEFI
-    /// `EFI_RNG_PROTOCOL`. Valid only for the first `boot_entropy_len` bytes;
+    /// Conditioned early-boot entropy seed obtained by the bootloader from the
+    /// firmware (see `core/boot/docs/boot-flow.md`). Valid only for the first
+    /// `boot_entropy_len` bytes;
     /// the remainder is zero. The kernel absorbs it into the entropy pool at
     /// Phase 5, then **scrubs it from this page** (`boot_entropy_seed`/`_len`
     /// zeroed) before Phase 7 — this page is a reclaim range donated to

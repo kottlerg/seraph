@@ -186,16 +186,16 @@ are forbidden; `master` MUST NOT receive force pushes.
 - Merge is gated by the pre-merge review: the `pr-review` workflow
   (`.claude/workflows/pr-review.js`) runs the adversarial code review and
   the closure audit; when the Workflow tool is unavailable, the
-  `pr-reviewer` and `pr-auditor` agents invoked directly are the review, and
-  their prose verdict lines are the gate. Findings from a run MUST be fixed
-  as one batch. A finding the verifiers contested MUST be put to the
-  maintainer and MUST resolve in the same PR as a fix, as a clarification of
-  the rule it misread, or, when the maintainer finds it false on the facts,
-  as a clarification of the code or document it misread. A finding MUST
-  NOT be waived or ruled outside the standards. The merge prompt MUST follow a
-  completed run with no failed agent, `READY TO MERGE`, and `AUDIT PASS`.
-  `.claude/CLAUDE.md` § PR workflow operations gives the assistant's
-  procedure.
+  `pr-reviewer` and `pr-auditor` agents invoked directly are the review,
+  and their prose verdict lines are the gate. Findings from a run MUST be
+  fixed as one batch. A finding the verifiers contested MUST be put to the
+  maintainer and MUST resolve in the same PR as a fix, as a clarification
+  of the rule it misread, or, when the maintainer finds it false on the
+  facts, as a clarification of the code or document it misread. A finding
+  MUST NOT be waived or ruled outside the standards. The merge prompt MUST
+  follow a completed run with no failed agent, `READY TO MERGE`, and
+  `AUDIT PASS`. `.claude/CLAUDE.md` § PR workflow operations gives the
+  assistant's procedure.
 
 ### Branch naming
 

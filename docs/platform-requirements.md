@@ -155,7 +155,8 @@ Each feature is classified per architecture as one of:
   NAPOT page encodings; asserted at paging initialization from the bootloader-confirmed hart
   capabilities. Svade is the baseline A/D-bit model.
 - **Ssstateen / Smstateen** — state-enable CSRs, required for the hardening posture.
-- **Zkr seed CSR** — the supervisor-accessible hardware entropy source.
+- **Zkr seed CSR** — the hardware entropy source; M-mode-owned under default firmware and so
+  not an S-mode source (see [core/kernel/docs/entropy.md](../core/kernel/docs/entropy.md)).
 - **`time` CSR (Zicntr)** — the timestamp source.
 - **Address translation**: one of Sv39/Sv48/Sv57, negotiated at boot (DTB
   `mmu-type` plus a `satp` write-probe; the widest confirmed mode wins). Sv39

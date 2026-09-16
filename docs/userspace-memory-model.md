@@ -171,8 +171,9 @@ draw fails (a kernel-contract violation once the pool is seeded) logs
 and degrades to the deterministic `DEFAULT_*` addresses, which lie
 outside the windows — the test harnesses' window assertions then fail
 loudly by design. The default boot on both architectures is
-firmware-seeded through `virtio-rng`; a riscv64 boot without that device
-seeds from jitter alone
+firmware-seeded through `EFI_RNG_PROTOCOL` (OVMF natively on x86_64; the
+firmware's `VirtioRngDxe` with `virtio-rng` on riscv64); a riscv64 boot
+without that device seeds from jitter alone
 ([#393](https://github.com/kottlerg/seraph/issues/393)); see
 [`core/kernel/docs/entropy.md`](../core/kernel/docs/entropy.md) for the
 quality caveat.

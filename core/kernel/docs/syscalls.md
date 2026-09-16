@@ -1977,8 +1977,8 @@ each maps to a distinct `SbiControl` right. Extensions outside that set are reje
 ### `SYS_GETRANDOM` (55)
 
 Fill a user buffer with CSPRNG-quality random bytes drawn from the kernel
-entropy pool (see `docs/entropy.md`). Each call draws fresh from the kernel's
-per-CPU forward-secure generator; userspace holds no generator state.
+entropy pool (see [docs/entropy.md](entropy.md)). Each call draws fresh from the
+kernel's per-CPU forward-secure generator; userspace holds no generator state.
 
 **Arguments:**
 
@@ -2082,4 +2082,4 @@ message capacity against syscall overhead. The exact value becomes stable ABI.
 
 ## Summarized By
 
-[kernel/README.md](../README.md)
+[kernel/README.md](../README.md), [docs/entropy.md](entropy.md)

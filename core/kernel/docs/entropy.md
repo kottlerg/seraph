@@ -10,9 +10,9 @@ and a boot-time power-on self-test.
 
 This subsystem is the kernel's sole source of randomness, for both
 kernel-internal consumers and the userspace `SYS_GETRANDOM` syscall (see
-`docs/syscalls.md`). Kernel consumers call `fill_bytes` directly; userspace
-draws through the syscall, which fills the caller's buffer from the same
-per-CPU generators. Userspace holds **no** generator state of its own — every
+[docs/syscalls.md](syscalls.md)). Kernel consumers call `fill_bytes` directly;
+userspace draws through the syscall, which fills the caller's buffer from the
+same per-CPU generators. Userspace holds **no** generator state of its own — every
 draw advances the kernel generator — so the two surfaces share the per-CPU
 generators but no userspace-resident secret.
 
@@ -53,10 +53,11 @@ Three source classes are mixed into the pool:
   UEFI `EFI_RNG_PROTOCOL` while boot services are live and passes to the kernel
   in `BootInfo` (`boot_entropy_seed` / `boot_entropy_len`, boot protocol v9).
   Arch-neutral mechanism; already conditioned (a DRBG output), so it is absorbed
-  directly rather than health-gated. Present only where the firmware implements
-  the protocol — x86-64 OVMF does (RDRAND-backed); the current riscv64 EDK2 does
-  not, so `boot_entropy_len == 0` there and riscv64 falls back to jitter (see
-  "Boot-time entropy").
+  directly rather than health-gated. Present wherever the firmware implements
+  the protocol or a firmware RNG driver binds a device that exposes it — x86-64
+  OVMF natively (RDRAND-backed), riscv64 EDK2 through `VirtioRngDxe` with the
+  default boot set's `virtio-rng`; without such a device `boot_entropy_len == 0`
+  and the pool falls back to jitter (see "Boot-time entropy").
 - **Hardware RNG** — drawn through the `arch::current::entropy` contract
   (`hw_rng_available`, `hw_rng_u64`). On x86-64 this is RDSEED (a conditioned,
   seed-grade source, preferred) with an RDRAND fallback, CPUID-gated, each with
@@ -282,9 +283,10 @@ init's image load bias the same way (both Phase 9, boot thread). All run after
 Phase 5 seeding and never in interrupt context. Userspace ASLR (the
 per-process bootstrap-layout, image-bias, heap-base, and reservation-arena
 draws in procmgr/init/`std::sys::seraph`) consumes the same generators through
-`SYS_GETRANDOM`. On riscv64 the pool currently seeds from timing jitter alone
-(#393), so those draws carry the boot-entropy-hole caveat above until a hardware
-source lands. The boot self-test is the API's continuous validator.
+`SYS_GETRANDOM`. Without a firmware boot seed (a riscv64 boot without
+`virtio-rng`, #393) the pool seeds from timing jitter alone and those draws
+carry the boot-entropy-hole caveat above. The boot self-test is the API's
+continuous validator.
 
 ## Boot wiring and lifecycle
 
@@ -323,8 +325,9 @@ source lands. The boot self-test is the API's continuous validator.
   or `entropy: SELFTEST FAIL`; the FAIL marker is matched by the run-parallel
   fail-regex, turning a QEMU run red on either architecture. Validated on
   x86_64 (firmware-seeded — `entropy: seeded from firmware RNG` — since OVMF
-  implements `EFI_RNG_PROTOCOL`) and riscv64 (jitter-only — its current EDK2
-  exposes no RNG protocol).
+  implements `EFI_RNG_PROTOCOL`) and riscv64 (firmware-seeded through
+  `VirtioRngDxe` with the default boot set's `virtio-rng`; jitter-only without
+  it).
 - **Guest reseed coverage**: ktest's
   `entropy::getrandom_reseed_interval_stream` streams 300 draws across the
   256-draw interval on both architectures; svctest's `random-contention`
@@ -340,4 +343,5 @@ source lands. The boot self-test is the API's continuous validator.
 
 ## Summarized By
 
-[Kernel](../README.md)
+[Kernel](../README.md), [docs/syscalls.md](syscalls.md),
+[docs/testing.md](../../../docs/testing.md)

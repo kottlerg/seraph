@@ -176,7 +176,7 @@ are forbidden; `master` MUST NOT receive force pushes.
 
 - PRs have no second human reviewer; the file-by-file diff view, line
   comments, and CI status integration are the value, and the pre-merge
-  review below is the gate.
+  review below gates the merge alongside CI.
 - CI MUST gate merge. `master` MUST stay linearly green: every commit on
   `master` is a passing CI state. Branches MAY have intermediate failures;
   merge is the green gate.
@@ -185,12 +185,17 @@ are forbidden; `master` MUST NOT receive force pushes.
   tick-through (see above) lands in the same merge action.
 - Merge is gated by the pre-merge review: the `pr-review` workflow
   (`.claude/workflows/pr-review.js`) runs the adversarial code review and
-  the closure audit. Findings from a run are fixed as one batch; a contested
-  finding resolves in the same PR as a fix or as a clarification of the
-  rule, code, or document it misread; no finding is waived or ruled outside
-  the standards; the merge prompt requires a completed run with no failed
-  agent, `READY TO MERGE`, and `AUDIT PASS`. `.claude/CLAUDE.md` § PR
-  workflow operations gives the assistant's procedure.
+  the closure audit; when the Workflow tool is unavailable, the
+  `pr-reviewer` and `pr-auditor` agents invoked directly are the review, and
+  their prose verdict lines are the gate. Findings from a run MUST be fixed
+  as one batch. A finding the verifiers contested MUST be put to the
+  maintainer and MUST resolve in the same PR as a fix, as a clarification of
+  the rule it misread, or, when the maintainer finds it false on the facts,
+  as a clarification of the code or document it misread. No finding MAY be
+  waived or ruled outside the standards. The merge prompt MUST follow a
+  completed run with no failed agent, `READY TO MERGE`, and `AUDIT PASS`.
+  `.claude/CLAUDE.md` § PR workflow operations gives the assistant's
+  procedure.
 
 ### Branch naming
 
@@ -229,7 +234,7 @@ gives the PR-level linear view.
 - Edit via `gh pr edit <N> --body "$(cat <<'EOF' …EOF)"` or the web UI.
 - Every PR body MUST state the validated head in its `## Validation`
   section; for a documentation-only or comment-only delta since that head,
-  it MUST say so (see [testing.md](testing.md) "Coverage tiers").
+  it MUST say so (see [testing.md](testing.md#coverage-tiers)).
 
 ## CI Gating
 
@@ -262,4 +267,4 @@ Producing a release for tag `v<X>.<Y>.<Z>`:
 
 ## Summarized By
 
-[README.md](../README.md)
+[README.md](../README.md), [testing.md](testing.md)

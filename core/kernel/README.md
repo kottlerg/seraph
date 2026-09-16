@@ -171,8 +171,9 @@ See [`docs/capability-internals.md`](docs/capability-internals.md).
 
 The kernel entropy subsystem: a multi-source pool feeding per-CPU forward-secure
 CSPRNGs, with hardware-source health gating, an interrupt-time jitter source, a
-kernel-internal draw API, and a boot-time power-on self-test. Kernel-internal
-only — no syscall surface. See [`docs/entropy.md`](docs/entropy.md).
+kernel-internal draw API, and a boot-time power-on self-test. Kernel consumers
+call `fill_bytes`; userspace draws from the same generators through
+`SYS_GETRANDOM`. See [`docs/entropy.md`](docs/entropy.md).
 
 ### `ipc/`
 

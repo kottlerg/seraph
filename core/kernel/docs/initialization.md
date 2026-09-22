@@ -356,7 +356,9 @@ are excluded because `mint_module_memory_caps` already covers them).
    a sample from its generator during bringup, and the BSP now checks per-CPU
    independence and basic sanity, printing PASS/FAIL (see entropy.md).
 6. Tear down the low-VA identity mapping at the trampoline PA via
-   mm::paging::unmap_identity_page (TLB shootdown to all other CPUs).
+   mm::paging::unmap_identity_page (TLB shootdown to all other CPUs), then
+   zero the page through the direct map: its parameter slots carried the
+   AP entry point and idle-stack VAs, which would reveal the layout.
 7. Mint a late-reclaim Memory cap over the trampoline page via
    cap::mint_late_reclaim_memory_caps; the descriptor lands in
    cspace_layout so init sees the cap through the standard CSpace

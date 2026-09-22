@@ -17,8 +17,9 @@ five parts of `BootInfo`:
 4. `boot_entropy_seed` / `boot_entropy_len` — the DTB `/chosen/rng-seed`
    fallback, consulted only when `EFI_RNG_PROTOCOL` yields no seed
    (DTB-only; see [boot-flow.md](boot-flow.md) step 5c).
-5. `vmgenid_paddr` — the VM Generation ID GUID address from the x86-64
-   QEMU SSDT scan; zero when absent.
+5. `vmgenid_paddr` — the VM Generation ID GUID address from the QEMU
+   VMGENID SSDT scan, run wherever an RSDP is present (only x86-64 QEMU
+   wires the device today); zero when absent.
 
 The bootloader does **not** emit per-device capabilities, interrupt
 descriptors, PCI ECAM descriptors, or firmware-table read-only caps.
@@ -87,8 +88,8 @@ after `ExitBootServices` by
 3. Sort by `phys_base`.
 4. Merge adjacent and overlapping entries into a minimal non-overlapping
    list.
-5. Cap at `MAX_APERTURES` (16, `abi/boot-protocol`); surplus is dropped with a
-   diagnostic.
+5. Cap at `MAX_APERTURES` (16, [`abi/boot-protocol`](../../../abi/boot-protocol/src/lib.rs));
+   surplus is dropped with a diagnostic.
 
 The UEFI memory map on every currently-targeted host is the primary
 source; firmware-table seeds cover the regions the UEFI map often

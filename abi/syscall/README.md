@@ -23,4 +23,4 @@ calling convention.
 
 ## Summarized By
 
-None
+[core/kernel/docs/syscalls.md](../../core/kernel/docs/syscalls.md)

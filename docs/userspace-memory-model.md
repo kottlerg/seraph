@@ -36,13 +36,13 @@ transfers them to memmgr (derive-twice). From that point on, memmgr is
 the sole userspace authority over RAM frame allocation; the kernel does
 not delegate further to anyone.
 
-The handoff is total. At Phase 7 the kernel reserves its fixed
-contributors (PT-pool seed, idle-thread stacks, the `InitInfo` block,
-init's user stack, the SEED arena) from the pristine buddy, then drains
-**every** remaining page into userspace Memory caps — coalescing
-physically-adjacent drained blocks into the fewest contiguous caps so the
-cap count tracks memory-map fragmentation, not total RAM — and *seals* the
-buddy.
+The handoff is total. At Phase 7 the kernel reserves the PT-pool seed,
+the `InitInfo` block, and init's user stack from the pristine buddy (the
+idle-thread stacks were already taken in Phase 4), then drains **every**
+remaining page into userspace Memory caps — coalescing physically-adjacent
+drained blocks into the fewest contiguous caps so the cap count tracks
+memory-map fragmentation, not total RAM — and *seals* the buddy; the SEED
+arena is then pinned out of the front of the largest drained block.
 After the seal the buddy is an inert boot artifact: it holds no free
 pages, allocates nothing, and must receive no frees. Every page of RAM is
 therefore either a bounded fixed kernel reserve or owned by memmgr's pool
@@ -322,4 +322,5 @@ yet implemented), not a kernel feature.
 [ruststd/README.md](../runtime/ruststd/README.md),
 [process-layout/README.md](../shared/process-layout/README.md),
 [Capability Model](capability-model.md), [Process Lifecycle](process-lifecycle.md),
-[memmgr/docs/memory-pool.md](../services/memmgr/docs/memory-pool.md)
+[memmgr/docs/memory-pool.md](../services/memmgr/docs/memory-pool.md),
+[System Bootstrap](bootstrap.md), [Fault Handling](fault-handling.md)

@@ -72,6 +72,7 @@ A compliant bootloader MUST NOT:
 ## Summarized By
 
 [core/boot/README.md](../../core/boot/README.md),
+[core/boot/docs/firmware-parsing.md](../../core/boot/docs/firmware-parsing.md),
 [docs/bootstrap.md](../../docs/bootstrap.md),
 [docs/build-system.md](../../docs/build-system.md),
 [docs/architecture.md](../../docs/architecture.md),
@@ -79,6 +80,7 @@ A compliant bootloader MUST NOT:
 [docs/device-management.md](../../docs/device-management.md),
 [core/kernel/README.md](../../core/kernel/README.md),
 [core/kernel/docs/initialization.md](../../core/kernel/docs/initialization.md),
+[core/kernel/docs/syscalls.md](../../core/kernel/docs/syscalls.md),
 [services/init/README.md](../../services/init/README.md),
 [services/procmgr/README.md](../../services/procmgr/README.md),
 [services/devmgr/README.md](../../services/devmgr/README.md),

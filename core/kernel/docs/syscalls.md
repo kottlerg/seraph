@@ -2075,8 +2075,9 @@ intact.
 | `EVENT_QUEUE_MAX_CAPACITY` | 4096 | Maximum entries in an event queue |
 | `BOOT_PROTOCOL_VERSION` | 14 | Expected version in `BootInfo.version` |
 
-The values are those of the `abi/syscall` and `abi/boot-protocol` crates, which are
-the source of truth.
+The values are those of the [`abi/syscall`](../../../abi/syscall/src/lib.rs) and
+[`abi/boot-protocol`](../../../abi/boot-protocol/src/lib.rs) crates, which are the
+source of truth.
 
 ---
 

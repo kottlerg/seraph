@@ -765,7 +765,9 @@ impl Fdt
 // ── Private helpers ───────────────────────────────────────────────────────────
 
 /// Skip the null-terminated, 4-byte-aligned node name starting at `off` in
-/// the struct block. Returns the updated offset after the name.
+/// the struct block. Returns the offset after the name, or `None` when the
+/// aligned offset would overflow (a name running to the end of a struct block
+/// that reaches the top of the address space).
 // `len` (usize) is bounded by `max` which equals `size_struct.saturating_sub(start)` (u32),
 // so the `len as u32` cast below cannot truncate.
 #[allow(clippy::cast_possible_truncation)]
@@ -1283,6 +1285,29 @@ mod tests
         // fail the bounds check itself.
         let total = u32::from_be_bytes(blob[4..8].try_into().unwrap());
         blob[36..40].copy_from_slice(&(total - 40 + 1).to_be_bytes());
+        // SAFETY: blob is a valid in-memory buffer of at least 40 bytes.
+        assert!(unsafe { Fdt::from_raw(blob.as_ptr() as u64) }.is_none());
+    }
+
+    #[test]
+    fn struct_block_extent_overflow_is_rejected()
+    {
+        let mut blob = tree(None, |b| cpu_node(b, b"cpu@0", 0, &[]));
+        // `off_dt_struct + size_dt_struct` must not overflow before the bounds
+        // check; a maximal size with the 40-byte offset exercises that arm.
+        blob[36..40].copy_from_slice(&u32::MAX.to_be_bytes());
+        // SAFETY: blob is a valid in-memory buffer of at least 40 bytes.
+        assert!(unsafe { Fdt::from_raw(blob.as_ptr() as u64) }.is_none());
+    }
+
+    #[test]
+    fn strings_block_past_totalsize_is_rejected()
+    {
+        let mut blob = tree(None, |b| cpu_node(b, b"cpu@0", 0, &[]));
+        // Header byte offset 32 is `size_dt_strings`.
+        let total = u32::from_be_bytes(blob[4..8].try_into().unwrap());
+        let off_strings = u32::from_be_bytes(blob[12..16].try_into().unwrap());
+        blob[32..36].copy_from_slice(&(total - off_strings + 1).to_be_bytes());
         // SAFETY: blob is a valid in-memory buffer of at least 40 bytes.
         assert!(unsafe { Fdt::from_raw(blob.as_ptr() as u64) }.is_none());
     }

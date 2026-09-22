@@ -15,9 +15,10 @@
 //! - Phase 1: initialize early console (serial + framebuffer); emit startup banner.
 //! - Phase 2: parse memory map, populate buddy frame allocator.
 //! - Phase 3: install kernel page tables (direct physical map + W^X image).
-//! - Phase 4: typed-memory cap surface (no `GlobalAlloc`; bodies sourced from caps).
+//! - Phase 4: typed-memory cap surface (no `GlobalAlloc`; bodies sourced from caps);
+//!   cache `kernel_mmio` for Phase 5.
 //! - Phase 5: architecture hardware init (GDT/IDT/APIC or stvec/PLIC, timer, syscall).
-//! - Phase 6: cache `kernel_mmio` and validate `mmio_apertures` slice before capability minting.
+//! - Phase 6: validate the `mmio_apertures` slice before capability minting.
 //! - Phase 7: initialise capability subsystem; mint root `CSpace` with initial hardware caps;
 //!   mint reclaimable Memory caps over bootloader scratch pages (`BootInfo`,
 //!   descriptor arrays, transient PT frames) so they flow to userspace via the
@@ -160,7 +161,8 @@ fn report_kaslr(_flags: u32, _image_base: u64, _dm_base: u64) {}
 // the function is `extern "C"` and cannot be marked unsafe per the ABI contract.
 // needless_range_loop/cast_possible_truncation: cpu_idx loop uses the index directly
 // as both slice index and CPU ID; Seraph never has > 2^32 CPUs.
-#[unsafe(no_mangle)]
+// similar_names: the boot_cpu_count/boot_cpu_ids and kaslr_image_base/kaslr_dm_base
+// pairs are the BootInfo field names; renaming them would hide the correspondence.
 #[allow(
     clippy::too_many_lines,
     clippy::not_unsafe_ptr_arg_deref,
@@ -168,6 +170,7 @@ fn report_kaslr(_flags: u32, _image_base: u64, _dm_base: u64) {}
     clippy::cast_possible_truncation,
     clippy::similar_names
 )]
+#[unsafe(no_mangle)]
 pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
 {
     // ── Phase 0: validate BootInfo ──────────────────────────────────────────
@@ -197,7 +200,7 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
     let boot_cpu_ids = info.cpu_ids;
     let trampoline_pa = info.ap_trampoline_page;
     let init_image = info.init_image; // InitImage is Copy
-    let boot_entropy_seed = info.boot_entropy_seed;
+    let mut boot_entropy_seed = info.boot_entropy_seed;
     let boot_entropy_len = info.boot_entropy_len;
     // KASLR: copy the status flags and the slid/randomized bases out of the
     // donated BootInfo page before Phase 5 scrubs the two base fields. The
@@ -307,7 +310,7 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
             boot_cpu_ids,
             trampoline_pa,
             init_image,
-            boot_entropy_seed,
+            &mut boot_entropy_seed,
             boot_entropy_len,
             vmgenid_paddr,
             fb_phys,
@@ -348,7 +351,7 @@ unsafe fn kernel_entry_post_rebase(
     boot_cpu_ids: [u32; boot_protocol::MAX_CPUS],
     trampoline_pa: u64,
     init_image: boot_protocol::InitImage,
-    mut boot_entropy_seed: [u8; 32],
+    boot_entropy_seed: &mut [u8; 32],
     boot_entropy_len: u32,
     vmgenid_paddr: u64,
     fb_phys: u64,
@@ -404,8 +407,8 @@ unsafe fn kernel_entry_post_rebase(
     // tables with dynamically sized allocations.
     sched::init_storage(boot_cpu_count, allocator);
 
-    // Allocate entropy subsystem per-CPU storage (CSPRNGs, jitter accumulators)
-    // and the central pool from the buddy allocator, alongside the scheduler
+    // Allocate entropy subsystem storage (per-CPU CSPRNGs, jitter accumulators,
+    // self-test samples, and the central pool) from the buddy allocator, alongside the scheduler
     // slabs and for the same reason: before the Phase-7 user-cap drain, while
     // the buddy still holds large contiguous blocks.
     #[cfg(not(test))]
@@ -482,15 +485,15 @@ unsafe fn kernel_entry_post_rebase(
         let n = (boot_entropy_len as usize).min(boot_entropy_seed.len());
         entropy::init(&boot_entropy_seed[..n], vmgenid_paddr);
 
-        // Scrub the KASLR/entropy secrets once consumed. The BootInfo page is
-        // a reclaim range donated to userspace at Phase 7 (memmgr re-hands its
-        // frames without zeroing), so none of them may survive there; the
-        // local seed copy is wiped too. The pool retains the entropy — the
-        // seed itself is secret (it feeds key/nonce generation), and the
-        // randomized kernel image and direct-map bases defeat KASLR if
-        // disclosed. All Phase-3 consumers of the two bases have run; later
-        // phases read only layout-free BootInfo fields.
-        for b in &mut boot_entropy_seed
+        // Scrub the KASLR/entropy secrets once consumed. The BootInfo page is a
+        // reclaim range donated to userspace at Phase 7 (memmgr re-hands its
+        // frames without zeroing), so none of them may survive there; the one
+        // local copy, in `kernel_entry`'s frame, is wiped too. The pool retains
+        // the entropy — the seed itself is secret (it feeds key/nonce
+        // generation), and the randomized kernel image and direct-map bases
+        // defeat KASLR if disclosed. All Phase-3 consumers of the two bases
+        // have run; later phases read only layout-free BootInfo fields.
+        for b in boot_entropy_seed
         {
             // SAFETY: `b` is a valid exclusive reference into the local array.
             // Volatile so the scrub of a value never read again is not elided.
@@ -519,8 +522,8 @@ unsafe fn kernel_entry_post_rebase(
 
     // ── Phase 6: platform resource validation ─────────────────────────────────
     // Validate mmio_apertures from BootInfo before Phase 7 mints caps from
-    // them. (kernel_mmio was cached earlier, after Phase 4, so Phase 5 arch
-    // init can read it.)
+    // them. (kernel_mmio was cached in Phase 4 so Phase 5 arch init can
+    // read it.)
     kprintln!("Phase 6: Platform Resource Validation");
     // SAFETY: single-threaded boot Phase 6; first and only call.
     let mmio_apertures = unsafe { platform::validate_mmio_apertures(boot_info_phys) };

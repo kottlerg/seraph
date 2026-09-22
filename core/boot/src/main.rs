@@ -43,8 +43,8 @@ use boot_protocol::{
 };
 
 /// Maximum boot modules carried in [`BootInfo::modules`]. Sized to comfortably
-/// cover the current `procmgr, memmgr, devmgr, vfsd, virtio-blk, fatfs` set
-/// plus future additions before the bundle entry count exceeds the array.
+/// cover the current set (`xtask/src/bundle.rs::MODULES`) plus future additions
+/// before the bundle entry count exceeds the array.
 const MAX_MODULES: usize = 16;
 
 /// `\EFI\seraph\kernel` as a NUL-terminated UTF-16 path for

@@ -71,7 +71,7 @@ const MAX_SHARD_LINES = 500 // changed lines per shard reviewer
 const MAX_LENS_DOCS = 8 // design documents per design-docs lens agent
 const DEDUP_LINE_SLACK = 3 // lines apart at which same file, class, bucket, and flag are one
 const VERIFY_LENSES = ['reality', 'authority']
-// A defect of these classes is on the review surface wherever it sits.
+// A defect of these classes in a touched file is on the review surface.
 const ALWAYS_IN_BOUND = ['correctness', 'safety', 'contract']
 // The sections pr-auditor's Output lists; the audit must return each of them.
 const AUDIT_SECTION_NAMES = [
@@ -93,7 +93,7 @@ const SCOPE_SCHEMA = {
     type: 'object',
     required: [
         'head', 'base', 'repo_root', 'tree_at_head', 'since_reachable', 'pr_has_code', 'files',
-        'changed_items', 'design_docs', 'claimed_fixes',
+        'pr_files', 'changed_items', 'design_docs', 'claimed_fixes',
     ],
     properties: {
         head: { type: 'string', description: 'Full SHA of the PR head commit.' },
@@ -130,6 +130,12 @@ const SCOPE_SCHEMA = {
                     kind: { enum: ['code', 'markdown', 'comment-only', 'rules', 'other'] },
                 },
             },
+        },
+        pr_files: {
+            type: 'array',
+            items: { type: 'string', description: PATH_DESCRIPTION },
+            description:
+                'Every file the whole PR diff touches (in delta mode the files list is a subset).',
         },
         changed_items: {
             type: 'array',
@@ -337,6 +343,7 @@ const SCOPE_PROMPT = [
         ', with path; changed = added plus deleted lines; kind = code (Rust, assembly, ' +
         'linker scripts, build inputs, anything a build embeds), markdown, comment-only (only ' +
         'comment lines changed), rules (`.claude/` and `.github/`), or other.',
+    '- pr_files: every file the whole PR diff touches, whatever the mode.',
     '- changed_items: every public or crate-visible function, type, trait, constant, syscall, ' +
         'or wire-protocol element whose signature, contract, semantics, or documentation the ' +
         'PR diff changes, with the kind of change.',
@@ -375,6 +382,7 @@ const normalize = (p) => {
     return s
 }
 for (const f of scope.files) f.path = normalize(f.path)
+const pr_files = new Set(scope.pr_files.map(normalize))
 for (const i of scope.changed_items) i.file = normalize(i.file)
 for (const c of scope.claimed_fixes) c.file = normalize(c.file)
 scope.design_docs = scope.design_docs.map(normalize)
@@ -617,12 +625,15 @@ const seen = []
 // nearest such record keeps its claim and evidence and absorbs the later one.
 // A record absorbs at most one finding per agent, so one agent's own adjacent
 // findings stay distinct. Anything that differs in bucket or in the
-// MUST-violation flag is a distinct finding with its own verification, so a
+// MUST-violation flag is a distinct finding with its own verification, and an
+// absorbed finding's in-bound placement is OR-ed into the record, so a
 // stronger finding is never absorbed into a weaker record.
 function dedup(findings, source) {
     const fresh = []
     for (const f of findings) {
         f.file = normalize(f.file)
+        const in_bound =
+            f.in_bound || (ALWAYS_IN_BOUND.includes(f.class) && pr_files.has(f.file))
         const distance = (s) => Math.abs(s.line - f.line)
         const dup = seen
             .filter(
@@ -634,11 +645,11 @@ function dedup(findings, source) {
             .sort((a, b) => distance(a) - distance(b))[0]
         if (dup) {
             dup.duplicates += 1
+            dup.in_bound = dup.in_bound || in_bound
             dup.sources.push(source)
             dup.evidence += '\n[also reported by ' + source + ': ' + f.claim + '] ' + f.evidence
             continue
         }
-        const in_bound = f.in_bound || ALWAYS_IN_BOUND.includes(f.class)
         const record = {
             ...f, in_bound, sources: [source], duplicates: 0, status: 'pending', votes: [],
         }
@@ -838,13 +849,15 @@ const SYNTH_PROMPT = [
     'Render the pre-merge review report for pull request #' + PR + ' (mode ' + MODE +
         ', head ' + scope.head + ') as Markdown.',
     '',
-    'Rules: every finding below appears exactly once, under its bucket, with its status tag; ' +
+    'Rules: every finding on the review surface appears exactly once under its bucket, and ' +
+        'every recorded finding exactly once under the Recorded section with its bucket named ' +
+        'in the entry, each with its status tag; ' +
         'do not drop, add, merge, re-rank, or soften a finding. You may order entries within ' +
         'a bucket by file and group entries that share one root cause under one lead entry ' +
         'that still lists every file:line, each site with its own status and MUST-violation ' +
         'tags. Each entry: `file:line` [status] claim, with ' +
         '`(MUST violation)` after the status when must_violation is true, since such an entry ' +
-        'blocks the merge whatever its bucket. Authority: ' +
+        'on the review surface blocks the merge whatever its bucket. Authority: ' +
         'the cited authority. Rationale: one sentence from the evidence. Fix: the proposed ' +
         'fix. For contested and unverified entries add one line per verifier vote with its ' +
         'lens, refuted flag, confidence, and evidence. The dropped section lists each dropped ' +
@@ -888,7 +901,7 @@ if (!synthesized) {
 const body = synthesized
     ? synthesized.report
     : '# Pre-merge review: PR #' + PR + '\n\nSynthesis agent returned no result; ' +
-        'the raw findings are in the `findings`, `dropped`, and `audit` fields.\n'
+        'the raw findings are in the `findings`, `recorded`, `dropped`, and `audit` fields.\n'
 
 // The two verdict lines stand alone so they can be surfaced verbatim; notes
 // follow on their own lines.

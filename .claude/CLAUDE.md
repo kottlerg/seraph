@@ -67,23 +67,23 @@ truth for "how work is tracked and shipped" on this project.
   Findings on the review surface are fixed as one batch per run, whatever
   their severity, and findings off it are appended to the audit Issue in
   the same pass: `AUDIT FAIL` items via `gh pr edit`, `gh issue edit`, or
-  commits;
-  reviewer findings via commits. A finding the verifiers contested is put
-  to the user; it resolves in the same PR as a fix, as a clarification
-  of the rule it misread, or, when the user finds it false on the facts,
-  as a clarification of the code or document it misread, so the next run
-  reads what the user knows. Nothing else carries the decision forward.
-  A finding no verifier could judge is treated as confirmed. No finding
-  is waived, ruled, or exempted anywhere but in the standards themselves.
-  A genuine deferral is an Issue filed with the user's approval, per
+  commits; reviewer findings via commits. A finding the verifiers
+  contested is put to the user. On the surface it resolves in the same PR
+  as a fix, as a clarification of the rule it misread, or, when the user
+  finds it false on the facts, as a clarification of the code or document
+  it misread, so the next run reads what the user knows. Off the surface
+  it is appended to the audit Issue with the user's answer, or resolved by
+  that clarification alone. Nothing else carries the decision forward. A
+  finding no verifier could judge is treated as confirmed. No finding is
+  waived, ruled, or exempted anywhere but in the standards themselves. A
+  genuine deferral is an Issue filed with the user's approval, per
   "Completeness" below.
 
   After the fixes are pushed and CI is green again, run the workflow in
   `delta` mode. Prompt for the merge decision only when a run completes
   with no failed agent, `READY TO MERGE`, and `AUDIT PASS` (the reviewer
-  verdict counts findings on the surface; recorded drift does not block).
-  Merge via
-  `gh pr merge <N> --merge --delete-branch`.
+  verdict counts findings on the surface; recorded off-surface findings do
+  not block). Merge via `gh pr merge <N> --merge --delete-branch`.
 - On red: surface the failing job's tail (`gh run view <run-id> --log-failed`
   or equivalent) so the user can see the actual error without asking.
 - The assistant MUST NOT merge a PR while its CI run is pending or failing.
@@ -113,7 +113,8 @@ truth for "how work is tracked and shipped" on this project.
   [docs/conventions.md](../docs/conventions.md) § Branch and PR Workflow
   defines it, MUST be fixed in the same pass; they are the scope, surfaced
   incidentally. Findings off the surface MUST be appended to the open audit
-  Issue in the same pass, never dropped.
+  Issue (or to a new one filed with the user's approval) in the same pass,
+  never dropped.
 - "Out of scope", "follow-up", and similar deferrals MUST NOT be used to
   avoid mechanically reachable work on the surface.
 - Material scope expansions MUST be stated in one line and continued, not

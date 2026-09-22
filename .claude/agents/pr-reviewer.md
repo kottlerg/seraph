@@ -66,9 +66,12 @@ discipline below has been applied end-to-end.
 6. Evaluate. The project's principles (root `README.md` Goals,
    `docs/architecture.md`), coding standards, and documentation standards
    are **binding**, not advisory — `.claude/CLAUDE.md` says so explicitly.
-   Treat any drift from them as a blocking issue, on par with a correctness
-   bug. Same for system-scope design docs: if the diff silently contradicts
-   one, the doc and the code now disagree, and that is blocking.
+   On the review surface (`docs/conventions.md` § Branch and PR Workflow),
+   treat any drift from them as a blocking issue, on par with a correctness
+   bug; drift you find off the surface you still report, marked out of
+   bound, and it is recorded rather than fixed, never dropped. Same for
+   system-scope design docs: if the diff silently contradicts one, the doc
+   and the code now disagree, and that is blocking.
 
 ## Out of scope
 
@@ -109,8 +112,10 @@ and `line`, `bucket`, `class` (`correctness`: wrong behaviour or logic;
 or documented promise broken; `standards`: a binding standard's rule;
 `doc-drift`: a document and the code disagree; `coverage`: a missing
 test; `style`: readability and naming), whether the diff `introduced`
-it, whether it is a `must_violation` of a binding standard, the
-`authority`, the `claim`, the `evidence`, and the `fix`. There is no
+it, whether it is a `must_violation` of a binding standard, whether it is
+`in_bound` (on the review surface; a correctness, soundness, safety, or
+contract defect in a touched file always is), the `authority`, the
+`claim`, the `evidence`, and the `fix`. There is no
 final line in schema mode; the workflow computes the verdict from the
 entries.
 

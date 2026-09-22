@@ -186,16 +186,27 @@ are forbidden; `master` MUST NOT receive force pushes.
 - Merge is gated by the pre-merge review: the `pr-review` workflow
   (`.claude/workflows/pr-review.js`) runs the adversarial code review and
   the closure audit; when the Workflow tool is unavailable, the
-  `pr-reviewer` and `pr-auditor` agents invoked directly are the review,
-  and their prose verdict lines are the gate. Findings from a run MUST be
-  fixed as one batch. A finding the verifiers contested MUST be put to the
-  maintainer and MUST resolve in the same PR as a fix, as a clarification
-  of the rule it misread, or, when the maintainer finds it false on the
-  facts, as a clarification of the code or document it misread. A finding
-  MUST NOT be waived or ruled outside the standards. The merge prompt MUST
-  follow a completed run with no failed agent, `READY TO MERGE`, and
-  `AUDIT PASS`. `.claude/CLAUDE.md` § PR workflow operations gives the
+  `pr-reviewer` and `pr-auditor` agents invoked directly are the review, and
+  their prose verdict lines are the gate. Findings on the review surface
+  MUST be fixed as one batch; findings off it MUST be appended to the audit
+  Issue in the same pass. A finding the verifiers contested MUST be put to
+  the maintainer and MUST resolve in the same PR as a fix, as a
+  clarification of the rule it misread, or, when the maintainer finds it
+  false on the facts, as a clarification of the code or document it misread.
+  A finding MUST NOT be waived or ruled outside the standards. The merge
+  prompt MUST follow a completed run with no failed agent, `READY TO MERGE`,
+  and `AUDIT PASS`. `.claude/CLAUDE.md` § PR workflow operations gives the
   assistant's procedure.
+- The review surface of a change is what it touches: the changed hunks and
+  the items that contain them (a function, a paragraph, a section, a table
+  row, a list), everything the change introduces, and the callers and
+  reverse dependencies of what it changes; a correctness, soundness, safety,
+  or contract defect anywhere in a touched file is on the surface too. A
+  finding on the surface MUST be fixed before merge. A finding off the
+  surface MUST be recorded, not fixed: the pre-merge review reports it as
+  out of bound, and it is appended, with file, line, authority, and fix, to
+  the open audit Issue for that surface (or to a new one, filed with the
+  maintainer's approval) before the merge prompt. Nothing found is dropped.
 
 ### Branch naming
 

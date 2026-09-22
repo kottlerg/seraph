@@ -11,9 +11,11 @@
 // and every finding that names a MUST violation, to two independent refuters as
 // soon as its shard completes. Synthesize renders one report. The script
 // computes the reviewer verdict line itself and derives the audit verdict line
-// from the auditor's per-section verdicts. `.claude/CLAUDE.md` § PR workflow
-// operations says when the assistant runs this workflow and what it does with
-// the result.
+// from the auditor's per-section verdicts. Findings on the review surface
+// (docs/conventions.md § Branch and PR Workflow) count toward the verdict;
+// findings off it are recorded for the audit Issue. `.claude/CLAUDE.md` § PR
+// workflow operations says when the assistant runs this workflow and what it
+// does with the result.
 //
 // args: { pr: number, mode: 'full' | 'delta' | 'scope', since?: string }
 //   mode 'full'  reviews every file in the PR diff.
@@ -69,6 +71,8 @@ const MAX_SHARD_LINES = 500 // changed lines per shard reviewer
 const MAX_LENS_DOCS = 8 // design documents per design-docs lens agent
 const DEDUP_LINE_SLACK = 3 // lines apart at which same file, class, bucket, and flag are one
 const VERIFY_LENSES = ['reality', 'authority']
+// A defect of these classes is on the review surface wherever it sits.
+const ALWAYS_IN_BOUND = ['correctness', 'safety', 'contract']
 // The sections pr-auditor's Output lists; the audit must return each of them.
 const AUDIT_SECTION_NAMES = [
     'PR-body checklist', 'per-issue closure', 'silent-deferral scan', 'test-plan honesty',
@@ -158,7 +162,7 @@ const SCOPE_SCHEMA = {
 const FINDING_SCHEMA = {
     type: 'object',
     required: [
-        'file', 'line', 'bucket', 'class', 'introduced', 'must_violation',
+        'file', 'line', 'bucket', 'class', 'introduced', 'must_violation', 'in_bound',
         'authority', 'claim', 'evidence', 'fix',
     ],
     properties: {
@@ -174,6 +178,14 @@ const FINDING_SCHEMA = {
         must_violation: {
             type: 'boolean',
             description: 'It names a MUST violation of a binding standard.',
+        },
+        in_bound: {
+            type: 'boolean',
+            description:
+                'It lies on the review surface (docs/conventions.md § Branch and PR Workflow): ' +
+                'a changed hunk or its containing item, something the change introduces, a ' +
+                'caller or reverse dependency of a changed item, or any correctness, safety, ' +
+                'or contract defect in a touched file.',
         },
         authority: { type: 'string', description: 'Doc path and section, or contract location.' },
         claim: { type: 'string' },
@@ -626,7 +638,10 @@ function dedup(findings, source) {
             dup.evidence += '\n[also reported by ' + source + ': ' + f.claim + '] ' + f.evidence
             continue
         }
-        const record = { ...f, sources: [source], duplicates: 0, status: 'pending', votes: [] }
+        const in_bound = f.in_bound || ALWAYS_IN_BOUND.includes(f.class)
+        const record = {
+            ...f, in_bound, sources: [source], duplicates: 0, status: 'pending', votes: [],
+        }
         seen.push(record)
         fresh.push(record)
     }
@@ -732,13 +747,18 @@ const results = reviewed.filter(Boolean)
 const audit = results.map((r) => r.audit).find(Boolean) || null
 const all = results.flatMap((r) => r.findings)
 const dropped = all.filter((f) => f.status === 'dropped')
-const findings = all.filter((f) => f.status !== 'dropped')
+const surviving = all.filter((f) => f.status !== 'dropped')
+// Findings on the review surface are fixed; findings off it are recorded for
+// the audit Issue and do not count toward the verdict.
+const findings = surviving.filter((f) => f.in_bound)
+const recorded = surviving.filter((f) => !f.in_bound)
 const count = (status) => findings.filter((f) => f.status === status).length
 
 log(
     'Review done: ' + all.length + ' findings; ' + count('confirmed') + ' confirmed, ' +
         count('contested') + ' contested, ' + count('unverified') + ' unverified, ' +
-        count('nit') + ' nits, ' + dropped.length + ' dropped' +
+        count('nit') + ' nits, ' + recorded.length + ' recorded off the surface, ' +
+        dropped.length + ' dropped' +
         (failed_review.length ? '; failed reviewers: ' + failed_review.join(', ') : ''),
 )
 
@@ -803,6 +823,7 @@ const stats = {
     contested: count('contested'),
     unverified: count('unverified'),
     nits: count('nit'),
+    recorded: recorded.length,
     dropped: dropped.length,
     get failed() {
         return [...failed_review, ...failed_other]
@@ -831,11 +852,17 @@ const SYNTH_PROMPT = [
         'section with its verdict and items.',
     '',
     'Headings, in this order: `# Pre-merge review: PR #' + PR + '`, `## Critical (blocking)`, ' +
-        '`## Should fix`, `## Nit`, `## Dropped by verification`, `## Audit`. Write `(none)` ' +
-        'under an empty heading. Do not write verdict lines; the workflow appends them.',
+        '`## Should fix`, `## Nit`, `## Recorded for audit (off the review surface)`, ' +
+        '`## Dropped by verification`, `## Audit`. The recorded section lists each off-surface ' +
+        'finding with the same fields as the others; they are appended to the audit Issue, ' +
+        'not fixed. Write `(none)` under an empty heading. Do not write verdict lines; the ' +
+        'workflow appends them.',
     '',
-    'Findings (JSON):',
+    'Findings on the review surface (JSON):',
     JSON.stringify(findings, null, 1),
+    '',
+    'Findings recorded off the surface (JSON):',
+    JSON.stringify(recorded, null, 1),
     '',
     'Dropped (JSON):',
     JSON.stringify(dropped, null, 1),
@@ -871,4 +898,4 @@ const report =
 
 stats.agents = agent_calls
 
-return { verdict, audit_verdict, report, findings, dropped, audit, stats: { ...stats } }
+return { verdict, audit_verdict, report, findings, recorded, dropped, audit, stats: { ...stats } }

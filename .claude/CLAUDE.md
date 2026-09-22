@@ -64,8 +64,10 @@ truth for "how work is tracked and shipped" on this project.
   two `Agent` tool calls) with the PR number as scope and the same verdict
   handling.
 
-  Findings are fixed as one batch per run, whatever their severity:
-  `AUDIT FAIL` items via `gh pr edit`, `gh issue edit`, or commits;
+  Findings on the review surface are fixed as one batch per run, whatever
+  their severity, and findings off it are appended to the audit Issue in
+  the same pass: `AUDIT FAIL` items via `gh pr edit`, `gh issue edit`, or
+  commits;
   reviewer findings via commits. A finding the verifiers contested is put
   to the user; it resolves in the same PR as a fix, as a clarification
   of the rule it misread, or, when the user finds it false on the facts,
@@ -78,7 +80,9 @@ truth for "how work is tracked and shipped" on this project.
 
   After the fixes are pushed and CI is green again, run the workflow in
   `delta` mode. Prompt for the merge decision only when a run completes
-  with no failed agent, `READY TO MERGE`, and `AUDIT PASS`. Merge via
+  with no failed agent, `READY TO MERGE`, and `AUDIT PASS` (the reviewer
+  verdict counts findings on the surface; recorded drift does not block).
+  Merge via
   `gh pr merge <N> --merge --delete-branch`.
 - On red: surface the failing job's tail (`gh run view <run-id> --log-failed`
   or equivalent) so the user can see the actual error without asking.
@@ -105,10 +109,13 @@ truth for "how work is tracked and shipped" on this project.
   state the validated head and the documentation-only delta.
 
 ## Completeness
-- Drift or defects discovered on the surface under audit MUST be fixed in
-  the same pass; they are the scope, surfaced incidentally.
+- Drift or defects found on the review surface, as
+  [docs/conventions.md](../docs/conventions.md) § Branch and PR Workflow
+  defines it, MUST be fixed in the same pass; they are the scope, surfaced
+  incidentally. Findings off the surface MUST be appended to the open audit
+  Issue in the same pass, never dropped.
 - "Out of scope", "follow-up", and similar deferrals MUST NOT be used to
-  avoid mechanically reachable work consistent with the task's intent.
+  avoid mechanically reachable work on the surface.
 - Material scope expansions MUST be stated in one line and continued, not
   paused for permission.
 - Genuine deferrals (different review surface, or expansion too large to

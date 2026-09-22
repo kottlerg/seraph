@@ -195,6 +195,18 @@ struct BootEntropy
     kaslr_source_flag: u32,
 }
 
+impl BootEntropy
+{
+    /// No seed and no KASLR draw.
+    const NONE: Self = Self {
+        seed: [0u8; 32],
+        len: 0,
+        kaslr: [0u64; 2],
+        kaslr_available: false,
+        kaslr_source_flag: 0,
+    };
+}
+
 /// The KASLR layout the bootloader chose, threaded from
 /// [`step5d_apply_kaslr_slide`] (which biases the kernel image) to
 /// [`step9_populate_boot_info`] (which selects the direct-map base and
@@ -295,11 +307,12 @@ unsafe fn boot_sequence(image: EfiHandle, st: *mut EfiSystemTable) -> Result<!, 
     unsafe { arch::current::negotiate_paging(ctx.bs, firm.device_tree, cpus.boot_hart_id)? };
     // SAFETY: ctx.bs valid pre-exit.
     let ap_trampoline_phys = unsafe { step5b_alloc_ap_trampoline(&ctx) };
+    let mut boot_entropy = BootEntropy::NONE;
     // SAFETY: ctx.bs valid pre-exit; draws the boot entropy seed while boot
     // services (and thus EFI_RNG_PROTOCOL) are still available; firm.device_tree
     // is zero or an identity-mapped, writable (pre-ExitBootServices) FDT for the
     // DTB rng-seed fallback's in-place scrub.
-    let mut boot_entropy = unsafe { step5c_fetch_boot_entropy(&ctx, &firm) };
+    unsafe { step5c_fetch_boot_entropy(&ctx, &firm, &mut boot_entropy) };
     // Apply the KASLR slide before step 6 maps the segments at their
     // (biased) virtual addresses.
     // SAFETY: kernel.info comes from load_kernel with its span allocation
@@ -346,9 +359,10 @@ unsafe fn boot_sequence(image: EfiHandle, st: *mut EfiSystemTable) -> Result<!, 
     // applied and the direct-map base chosen, so neither the source draw
     // (`boot_entropy.kaslr`) nor the `dm_rand` copy that step 9 consumed
     // (`kaslr.dm_rand`) may linger in BootServicesData that is later reclaimed
-    // to userspace. The pool seed is already in BootInfo, which the kernel
-    // scrubs after absorbing it; the bootloader's own copies (this local and
-    // the step 5c frame that produced it) are scrubbed for the same reason.
+    // to userspace. The pool seed is already in BootInfo (step 9 copies it
+    // into the page in place), which the kernel scrubs after absorbing it;
+    // this local is the bootloader's only other copy, since step 5c writes
+    // into it directly and scrubs its own byte buffers.
     scrub(&mut boot_entropy.seed);
     // SAFETY: all are live locals; volatile so the stores are not elided as
     // dead ahead of the values going out of scope.
@@ -768,13 +782,15 @@ unsafe fn step5b_alloc_ap_trampoline(ctx: &UefiContext) -> u64
 // ── Step 5c: boot entropy seed ───────────────────────────────────────────────
 
 /// Draw conditioned early-boot entropy for the pool seed and the KASLR
-/// slide / direct-map base.
+/// slide / direct-map base into `out`, which the caller owns zeroed and
+/// scrubs; the seed and the KASLR words are written straight into it, so this
+/// frame holds only the byte buffers it scrubs itself.
 ///
 /// Draws the pool seed from UEFI `EFI_RNG_PROTOCOL` when the firmware exposes
 /// it and the draw succeeds; a failed KASLR draw after a successful pool draw
-/// returns `len == 32` with `kaslr_available == false`. Otherwise draws from
+/// leaves `len == 32` with `kaslr_available == false`. Otherwise draws from
 /// the DTB `/chosen/rng-seed` reader ([`dtb::parse_rng_seed`]); otherwise
-/// returns `len == 0` and `kaslr_available == false`, and the kernel seeds the
+/// leaves `len == 0` and `kaslr_available == false`, and the kernel seeds the
 /// pool from its remaining sources and the layout is deterministic (no
 /// regression). Which firmware exposes which source is documented in
 /// `core/boot/docs/boot-flow.md`.
@@ -782,9 +798,8 @@ unsafe fn step5b_alloc_ap_trampoline(ctx: &UefiContext) -> u64
 /// # Safety
 /// `ctx.bs` must be valid UEFI boot services (before `ExitBootServices`);
 /// `firm.device_tree` must be 0 or an identity-mapped writable FDT.
-unsafe fn step5c_fetch_boot_entropy(ctx: &UefiContext, firm: &FirmwareInfo) -> BootEntropy
+unsafe fn step5c_fetch_boot_entropy(ctx: &UefiContext, firm: &FirmwareInfo, out: &mut BootEntropy)
 {
-    let mut seed = [0u8; 32];
     let mut iface: *mut core::ffi::c_void = core::ptr::null_mut();
     // SAFETY: ctx.bs is valid; locate_protocol fills iface on success.
     let status = unsafe {
@@ -798,18 +813,19 @@ unsafe fn step5c_fetch_boot_entropy(ctx: &UefiContext, firm: &FirmwareInfo) -> B
     {
         let proto = iface.cast::<EfiRngProtocol>();
         // SAFETY: proto is a valid protocol pointer from LocateProtocol; a
-        // null algorithm selects the default; seed has room for 32 bytes.
+        // null algorithm selects the default; out.seed has room for 32 bytes.
         // GetRNG returns EFI_SUCCESS only after writing all requested bytes.
         let s = unsafe {
             ((*proto).get_rng)(
                 proto,
                 core::ptr::null::<EfiGuid>(),
-                seed.len(),
-                seed.as_mut_ptr(),
+                out.seed.len(),
+                out.seed.as_mut_ptr(),
             )
         };
         if s == EFI_SUCCESS
         {
+            out.len = 32;
             // Independent 16-byte KASLR draw, kept separate from the pool
             // seed so neither reveals the other.
             let mut kaslr_bytes = [0u8; 16];
@@ -822,28 +838,17 @@ unsafe fn step5c_fetch_boot_entropy(ctx: &UefiContext, firm: &FirmwareInfo) -> B
                     kaslr_bytes.as_mut_ptr(),
                 )
             };
-            let (kaslr, kaslr_available, kaslr_source_flag) = if ks == EFI_SUCCESS
+            if ks == EFI_SUCCESS
             {
-                let w = kaslr_words(&kaslr_bytes);
-                scrub(&mut kaslr_bytes);
-                (w, true, boot_protocol::KASLR_ENTROPY_FW_RNG)
+                out.kaslr = kaslr_words(&kaslr_bytes);
+                out.kaslr_available = true;
+                out.kaslr_source_flag = boot_protocol::KASLR_ENTROPY_FW_RNG;
             }
-            else
-            {
-                ([0u64; 2], false, 0)
-            };
-            let out = BootEntropy {
-                seed,
-                len: 32,
-                kaslr,
-                kaslr_available,
-                kaslr_source_flag,
-            };
-            scrub(&mut seed);
-            return out;
+            scrub(&mut kaslr_bytes);
+            return;
         }
         // Partial/failed draw: discard and fall through to the DTB source.
-        seed = [0u8; 32];
+        scrub(&mut out.seed);
     }
 
     // DTB fallback: the firmware-delivered /chosen/rng-seed. One draw
@@ -859,59 +864,34 @@ unsafe fn step5c_fetch_boot_entropy(ctx: &UefiContext, firm: &FirmwareInfo) -> B
     {
         let mut kb = [0u8; 16];
         kb.copy_from_slice(&dtb_seed[0..16]);
-        let kaslr = kaslr_words(&kb);
+        out.kaslr = kaslr_words(&kb);
         scrub(&mut kb);
+        out.kaslr_available = true;
+        out.kaslr_source_flag = boot_protocol::KASLR_ENTROPY_DTB_SEED;
         let pool_len = n - 16;
-        seed[..pool_len].copy_from_slice(&dtb_seed[16..n]);
-        scrub(&mut dtb_seed);
-        let out = BootEntropy {
-            seed,
-            len: pool_len as u32,
-            kaslr,
-            kaslr_available: true,
-            kaslr_source_flag: boot_protocol::KASLR_ENTROPY_DTB_SEED,
-        };
-        scrub(&mut seed);
-        return out;
+        out.seed[..pool_len].copy_from_slice(&dtb_seed[16..n]);
+        out.len = pool_len as u32;
     }
-    #[allow(clippy::cast_possible_truncation)]
-    if n > 0
+    else if n > 0
     {
         // Too short to split: feed the whole draw to the pool; KASLR uses
         // its deterministic fallback.
-        seed[..n].copy_from_slice(&dtb_seed[..n]);
-        scrub(&mut dtb_seed);
-        let out = BootEntropy {
-            seed,
-            len: n as u32,
-            kaslr: [0; 2],
-            kaslr_available: false,
-            kaslr_source_flag: 0,
-        };
-        scrub(&mut seed);
-        return out;
+        out.seed[..n].copy_from_slice(&dtb_seed[..n]);
+        // n ≤ 32, so the cast is exact.
+        #[allow(clippy::cast_possible_truncation)]
+        let len = n as u32;
+        out.len = len;
     }
-
-    // No source at all.
-    BootEntropy {
-        seed: [0u8; 32],
-        len: 0,
-        kaslr: [0; 2],
-        kaslr_available: false,
-        kaslr_source_flag: 0,
-    }
+    // No source at all leaves `out` as the caller zeroed it.
+    scrub(&mut dtb_seed);
 }
 
-/// Pack 16 little-endian bytes into two KASLR entropy words. Slices straight
-/// from the caller's array so no partial copy of the secret lands in this frame.
+/// Pack 16 little-endian bytes into two KASLR entropy words; no named
+/// intermediate buffer.
 fn kaslr_words(bytes: &[u8; 16]) -> [u64; 2]
 {
-    let mut w = [0u64; 2];
-    for (i, word) in w.iter_mut().enumerate()
-    {
-        *word = u64::from_le_bytes(bytes[i * 8..i * 8 + 8].try_into().unwrap_or([0u8; 8]));
-    }
-    w
+    let (chunks, _) = bytes.as_chunks::<8>();
+    [u64::from_le_bytes(chunks[0]), u64::from_le_bytes(chunks[1])]
 }
 
 /// Zero a secret that is never read again. Volatile so the stores survive
@@ -1527,13 +1507,22 @@ unsafe fn step9_populate_boot_info(
                     entries: allocs.reclaim_array_phys as *const ReclaimRange,
                     count: reclaim_len as u64,
                 },
-                boot_entropy_seed: boot_entropy.seed,
-                boot_entropy_len: boot_entropy.len,
+                boot_entropy_seed: [0u8; 32],
+                boot_entropy_len: 0,
                 vmgenid_paddr,
                 direct_map_base,
                 kaslr_flags,
             },
         );
+        // The seed goes into the page in place rather than through the struct
+        // literal above, so no copy of it is materialised in this frame.
+        let bi = allocs.boot_info_phys as *mut BootInfo;
+        core::ptr::copy_nonoverlapping(
+            boot_entropy.seed.as_ptr(),
+            core::ptr::addr_of_mut!((*bi).boot_entropy_seed).cast::<u8>(),
+            boot_entropy.seed.len(),
+        );
+        core::ptr::addr_of_mut!((*bi).boot_entropy_len).write(boot_entropy.len);
     }
 }
 

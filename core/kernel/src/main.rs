@@ -650,6 +650,20 @@ unsafe fn kernel_entry_post_rebase(
         unsafe {
             mm::paging::unmap_identity_page(trampoline_pa);
         }
+        // The page's parameter slots carried kernel VAs (the AP entry point
+        // and each AP's idle-stack top), which would reveal the image slide
+        // and the direct-map base once the page reaches userspace; zero it
+        // before it is minted.
+        // SAFETY: direct map covers the page; no AP is inside it (APS_READY
+        // observed above) and its identity mapping is gone. Volatile so the
+        // scrub of a page never read again by the kernel is not elided.
+        unsafe {
+            let page = mm::paging::phys_to_virt(trampoline_pa) as *mut u8;
+            for i in 0..mm::PAGE_SIZE
+            {
+                core::ptr::write_volatile(page.add(i), 0);
+            }
+        }
         // Re-resolve `BootInfo` through the direct physical map. The
         // original `info` reference points to the bootloader's
         // identity-mapped VA, which Phase 3 unmapped; reading through it
@@ -710,6 +724,8 @@ unsafe fn kernel_entry_post_rebase(
         // (TEMP_MAP_BASE + ELF_PAGE_TEMP_VA scratch) and `sys_mmio_map` for
         // init's own MMIO (the riscv64 serial UART, one page). 16 pool
         // pages cover that footprint with margin.
+        // items_after_statements: the constant is documented by the comment
+        // above, next to its only use.
         #[allow(clippy::items_after_statements)]
         const INIT_ASPACE_PAGES: u64 = 18;
         // SAFETY: SEED installed in Phase 7; single-threaded Phase 9.
@@ -877,6 +893,8 @@ unsafe fn kernel_entry_post_rebase(
             };
             /// Resolve a byte offset within the `InitInfo` region to a writable
             /// direct-map pointer, handling page boundaries.
+            // items_after_statements: the helper is scoped to this block and
+            // has no other use.
             #[allow(clippy::items_after_statements)]
             fn info_ptr(page_ptrs: &[*mut u8], offset: usize) -> *mut u8
             {
@@ -1055,6 +1073,7 @@ unsafe fn kernel_entry_post_rebase(
             // referential cap slot range.
             // SAFETY: info_base mapped writable through the direct map;
             // header lives at offset 0; single-threaded boot.
+            // cast_ptr_alignment: page alignment (4096) exceeds InitInfo alignment (4).
             #[allow(clippy::cast_ptr_alignment)]
             unsafe {
                 let info_ptr = info_base.cast::<InitInfo>();
@@ -1162,6 +1181,7 @@ unsafe fn kernel_entry_post_rebase(
         // Patch InitInfo with the just-minted stack cap slot range.
         // SAFETY: info_page_virt mapped writable through the direct map;
         // header at offset 0; single-threaded boot.
+        // cast_ptr_alignment: page alignment (4096) exceeds InitInfo alignment (4).
         #[allow(clippy::cast_ptr_alignment)]
         unsafe {
             let info_ptr = info_page_virt.cast::<init_protocol::InitInfo>();
@@ -1177,6 +1197,7 @@ unsafe fn kernel_entry_post_rebase(
         let kernel_reserved = system_ram.saturating_sub(cap::owns_memory_minted_bytes());
         // SAFETY: info_page_virt mapped writable through the direct map;
         // header at offset 0; single-threaded boot.
+        // cast_ptr_alignment: page alignment (4096) exceeds InitInfo alignment (4).
         #[allow(clippy::cast_ptr_alignment)]
         unsafe {
             let info_ptr = info_page_virt.cast::<init_protocol::InitInfo>();
@@ -1211,6 +1232,8 @@ unsafe fn kernel_entry_post_rebase(
         //   page 4   — ThreadObject (24 B) followed by ThreadControlBlock
         //   page 5   — per-thread FPU/SIMD/V save area
         // Mirrors the layout established in `sys_cap_create_thread`.
+        // items_after_statements: the constant is documented by the comment
+        // above, next to its only use.
         #[allow(clippy::items_after_statements)]
         const INIT_THREAD_PAGES: u64 = (sched::KERNEL_STACK_PAGES + 2) as u64;
         let (init_thread_obj_nn, init_kstack_top, init_tcb) = {
@@ -1430,9 +1453,10 @@ unsafe fn kernel_entry_post_rebase(
 
         // ── Boot-handover ledger ────────────────────────────────────────────
         // Sum MemoryObject.available_bytes across every Memory cap in init's
-        // CSpace plus SEED's residual reserve. After 4b, SEED is the kernel's
-        // ongoing body source for split-derived wrappers and per-thread IOPB
-        // pages; printing both makes the invariant
+        // CSpace plus SEED's residual reserve. After Phase 7 installs
+        // SEED_MEMORY, SEED is the kernel's ongoing body source for
+        // split-derived wrappers and per-thread IOPB pages; printing both
+        // makes the invariant
         //
         //   total_RAM == kernel_static_image_size + Σ per-CPU kstack pages
         //                + SEED_available + Σ caps_available

@@ -135,7 +135,8 @@ const SCOPE_SCHEMA = {
             type: 'array',
             items: { type: 'string', description: PATH_DESCRIPTION },
             description:
-                'Every file the whole PR diff touches (in delta mode the files list is a subset).',
+                'Every file the whole PR diff touches, whatever the mode (a delta after a rebase ' +
+                'can list files outside it).',
         },
         changed_items: {
             type: 'array',
@@ -382,7 +383,15 @@ const normalize = (p) => {
     return s
 }
 for (const f of scope.files) f.path = normalize(f.path)
-const pr_files = new Set(scope.pr_files.map(normalize))
+// The in-bound gate keys on the PR's own file list; in full mode that is the
+// files list itself, and in delta mode an empty list would silently demote
+// every correctness, safety, and contract finding to recorded.
+const pr_files = new Set(
+    DELTA ? scope.pr_files.map(normalize) : scope.files.map((f) => f.path),
+)
+if (DELTA && pr_files.size === 0) {
+    return { error: 'scope returned no pr_files; the in-bound gate cannot be applied' }
+}
 for (const i of scope.changed_items) i.file = normalize(i.file)
 for (const c of scope.claimed_fixes) c.file = normalize(c.file)
 scope.design_docs = scope.design_docs.map(normalize)
@@ -625,9 +634,10 @@ const seen = []
 // nearest such record keeps its claim and evidence and absorbs the later one.
 // A record absorbs at most one finding per agent, so one agent's own adjacent
 // findings stay distinct. Anything that differs in bucket or in the
-// MUST-violation flag is a distinct finding with its own verification, and an
-// absorbed finding's in-bound placement is OR-ed into the record, so a
-// stronger finding is never absorbed into a weaker record.
+// MUST-violation flag is a distinct finding with its own verification, so a
+// stronger finding is never absorbed into a weaker record. An absorbed
+// finding's in-bound placement is OR-ed into the record, so an off-surface
+// record cannot hide an on-surface duplicate.
 function dedup(findings, source) {
     const fresh = []
     for (const f of findings) {
@@ -845,6 +855,20 @@ const stats = {
 
 phase('Synthesize')
 
+// The synthesizer's input is bounded: evidence and vote text are cut to the
+// lengths below so a run with many findings stays within the output limit,
+// and the full record is saved beside the report by the caller.
+const RENDER_EVIDENCE_CHARS = 400
+const RENDER_VOTE_CHARS = 240
+const clip = (s, n) => (s.length > n ? s.slice(0, n) + '…' : s)
+function for_render(f) {
+    return {
+        ...f,
+        evidence: clip(f.evidence, RENDER_EVIDENCE_CHARS),
+        votes: f.votes.map((v) => ({ ...v, evidence: clip(v.evidence, RENDER_VOTE_CHARS) })),
+    }
+}
+
 const SYNTH_PROMPT = [
     'Render the pre-merge review report for pull request #' + PR + ' (mode ' + MODE +
         ', head ' + scope.head + ') as Markdown.',
@@ -857,12 +881,14 @@ const SYNTH_PROMPT = [
         'that still lists every file:line, each site with its own status and MUST-violation ' +
         'tags. Each entry: `file:line` [status] claim, with ' +
         '`(MUST violation)` after the status when must_violation is true, since such an entry ' +
-        'on the review surface blocks the merge whatever its bucket. Authority: ' +
+        'on the review surface blocks the merge whatever its bucket, and in the Recorded ' +
+        'section `file:line` [status] (bucket) claim. Authority: ' +
         'the cited authority. Rationale: one sentence from the evidence. Fix: the proposed ' +
         'fix. For contested and unverified entries add one line per verifier vote with its ' +
         'lens, refuted flag, confidence, and evidence. The dropped section lists each dropped ' +
         'finding in one line with the refuting evidence. The audit section lists each audit ' +
-        'section with its verdict and items.',
+        'section with its verdict and items. Keep each entry to its fields; the full record ' +
+        'is saved beside the report.',
     '',
     'Headings, in this order: `# Pre-merge review: PR #' + PR + '`, `## Critical (blocking)`, ' +
         '`## Should fix`, `## Nit`, `## Recorded for audit (off the review surface)`, ' +
@@ -872,13 +898,13 @@ const SYNTH_PROMPT = [
         'workflow appends them.',
     '',
     'Findings on the review surface (JSON):',
-    JSON.stringify(findings, null, 1),
+    JSON.stringify(findings.map(for_render), null, 1),
     '',
     'Findings recorded off the surface (JSON):',
-    JSON.stringify(recorded, null, 1),
+    JSON.stringify(recorded.map(for_render), null, 1),
     '',
     'Dropped (JSON):',
-    JSON.stringify(dropped, null, 1),
+    JSON.stringify(dropped.map(for_render), null, 1),
     '',
     'Audit (JSON):',
     JSON.stringify(audit, null, 1),

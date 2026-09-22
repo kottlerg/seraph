@@ -66,18 +66,19 @@ truth for "how work is tracked and shipped" on this project.
 
   Findings on the review surface are fixed as one batch per run, whatever
   their severity, and findings off it are appended to the audit Issue in
-  the same pass: `AUDIT FAIL` items via `gh pr edit`, `gh issue edit`, or
-  commits; reviewer findings via commits. A finding the verifiers
-  contested is put to the user. On the surface it resolves in the same PR
-  as a fix, as a clarification of the rule it misread, or, when the user
-  finds it false on the facts, as a clarification of the code or document
-  it misread, so the next run reads what the user knows. Off the surface
-  it is appended to the audit Issue with the user's answer, or resolved by
-  that clarification alone. Nothing else carries the decision forward. A
-  finding no verifier could judge is treated as confirmed. No finding is
-  waived, ruled, or exempted anywhere but in the standards themselves. A
-  genuine deferral is an Issue filed with the user's approval, per
-  "Completeness" below.
+  the same pass: reviewer findings on the surface via commits, reviewer
+  findings off it via `gh issue edit`, and `AUDIT FAIL` items via `gh pr
+  edit`, `gh issue edit`, or commits. A finding the verifiers contested is
+  put to the user. On the surface it resolves in the same PR as a fix, as
+  a clarification of the rule it misread, or, when the user finds it false
+  on the facts, as a clarification of the code or document it misread, so
+  the next run reads what the user knows. Off the surface it is appended
+  to the audit Issue with the user's answer, or, when it misread a rule,
+  resolved by the clarification of that rule alone, which is its record.
+  Nothing else carries the decision forward. A finding no verifier could
+  judge is treated as confirmed. No finding is waived, ruled, or exempted
+  anywhere but in the standards themselves. A genuine deferral is an Issue
+  filed with the user's approval, per "Completeness" below.
 
   After the fixes are pushed and CI is green again, run the workflow in
   `delta` mode. Prompt for the merge decision only when a run completes

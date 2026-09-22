@@ -140,8 +140,9 @@ were swept to use `svctest` where they meant the services-tier harness.
 - `<summary>` MUST NOT contain planning labels (per
   [documentation-standards.md](documentation-standards.md) §"Incomplete Work Markers"): no "step X",
   "phase Y", "tier N", "stage M", "round N", "the deferred follow-up", nor any other label that only
-  a planning conversation can resolve. The list is illustrative, not exhaustive. Components and
-  concrete what-changed text only.
+  a planning conversation can resolve; the name of a step or phase in a sequence a document defines
+  permanently (a kernel boot phase, a bootloader boot step) is not a label. The list is
+  illustrative, not exhaustive. Components and concrete what-changed text only.
 - `<summary>` MUST NOT include task IDs, branch names, or other transient identifiers. Issue
   references belong in the body.
 
@@ -193,11 +194,12 @@ are forbidden; `master` MUST NOT receive force pushes.
   resolve in the same PR as a fix, as a clarification of the rule it
   misread, or, when the maintainer finds it false on the facts, as a
   clarification of the code or document it misread; off the surface it is
-  recorded on the audit Issue with the maintainer's answer, or resolved by
-  that clarification alone. A finding MUST NOT be waived or ruled outside
-  the standards. The merge prompt MUST follow a completed run with no failed
-  agent, `READY TO MERGE`, and `AUDIT PASS`. `.claude/CLAUDE.md` § PR
-  workflow operations gives the assistant's procedure.
+  recorded on the audit Issue with the maintainer's answer, or, when it
+  misread a rule, resolved by the clarification of that rule alone, which is
+  its record. A finding MUST NOT be waived or ruled outside the standards.
+  The merge prompt MUST follow a completed run with no failed agent, `READY
+  TO MERGE`, and `AUDIT PASS`. `.claude/CLAUDE.md` § PR workflow operations
+  gives the assistant's procedure.
 - The review surface of a change is what it touches: the changed hunks and
   the items that contain them (a function, a paragraph, a section, a table
   row, a list), everything the change introduces, and the callers and
@@ -208,6 +210,9 @@ are forbidden; `master` MUST NOT receive force pushes.
   out of bound, and it is appended, with file, line, authority, and fix, to
   the open audit Issue for that surface (or to a new one, filed with the
   maintainer's approval) before the merge prompt. Nothing found is dropped.
+  Work an open Issue already names, filed with the maintainer's approval, is
+  off the surface of every other PR; a finding on it is recorded against
+  that Issue.
 
 ### Branch naming
 

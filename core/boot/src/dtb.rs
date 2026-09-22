@@ -766,8 +766,8 @@ impl Fdt
 
 /// Skip the null-terminated, 4-byte-aligned node name starting at `off` in
 /// the struct block. Returns the offset after the name, or `None` when the
-/// aligned offset would overflow (a name running to the end of a struct block
-/// that reaches the top of the address space).
+/// 4-byte-aligned offset after it would overflow the u32 struct-block offset
+/// (a name ending at the top of a ~4 GiB struct block).
 // `len` (usize) is bounded by `max` which equals `size_struct.saturating_sub(start)` (u32),
 // so the `len as u32` cast below cannot truncate.
 #[allow(clippy::cast_possible_truncation)]
@@ -786,10 +786,7 @@ fn skip_node_name(fdt: &Fdt, start: u32) -> Option<u32>
             break;
         }
     }
-    // Round up to 4-byte alignment. `len ≤ max ≤ size_struct (u32::MAX)` so the
-    // cast is exact; a firmware-supplied name that runs to the end of the block
-    // can still overflow the offset, which ends the walk like any other
-    // unreadable token.
+    // `len ≤ max ≤ size_struct (u32::MAX)`, so the cast is exact.
     advance_prop(start, len as u32)
 }
 
@@ -1308,6 +1305,17 @@ mod tests
         let total = u32::from_be_bytes(blob[4..8].try_into().unwrap());
         let off_strings = u32::from_be_bytes(blob[12..16].try_into().unwrap());
         blob[32..36].copy_from_slice(&(total - off_strings + 1).to_be_bytes());
+        // SAFETY: blob is a valid in-memory buffer of at least 40 bytes.
+        assert!(unsafe { Fdt::from_raw(blob.as_ptr() as u64) }.is_none());
+    }
+
+    #[test]
+    fn strings_block_extent_overflow_is_rejected()
+    {
+        let mut blob = tree(None, |b| cpu_node(b, b"cpu@0", 0, &[]));
+        // Header byte offset 32 is `size_dt_strings`; a maximal size with a
+        // non-zero offset exercises the overflow arm of the strings bound.
+        blob[32..36].copy_from_slice(&u32::MAX.to_be_bytes());
         // SAFETY: blob is a valid in-memory buffer of at least 40 bytes.
         assert!(unsafe { Fdt::from_raw(blob.as_ptr() as u64) }.is_none());
     }

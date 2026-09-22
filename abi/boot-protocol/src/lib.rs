@@ -76,9 +76,10 @@ pub use layout::{collect_mmio_direct_map_regions, direct_map_ceiling, max_ram_ad
 ///     bootloader can hand the kernel a conditioned early-boot entropy seed
 ///     obtained from UEFI `EFI_RNG_PROTOCOL` while boot services are live. The
 ///     kernel absorbs it into the entropy pool at Phase 5, narrowing the
-///     boot-time entropy hole before any early consumer (KASLR/ASLR) draws
-///     randomness. `boot_entropy_len` is `0` when no source was available, in
-///     which case the kernel seeds from its remaining sources.
+///     boot-time entropy hole before any early kernel consumer draws
+///     randomness (the KASLR word is a separate bootloader-side draw).
+///     `boot_entropy_len` is `0` when no source was available, in which
+///     case the kernel seeds from its remaining sources.
 /// v10: [`InitImage`] gained `flags: u32` (bit 0 = [`INIT_IMAGE_FLAG_PIE`]:
 ///     init is `ET_DYN`; the kernel chooses a load bias and applies the
 ///     image's `RELATIVE` relocations before mapping), plus `rela_phys: u64`

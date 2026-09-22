@@ -200,7 +200,6 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
     let boot_cpu_ids = info.cpu_ids;
     let trampoline_pa = info.ap_trampoline_page;
     let init_image = info.init_image; // InitImage is Copy
-    let mut boot_entropy_seed = info.boot_entropy_seed;
     let boot_entropy_len = info.boot_entropy_len;
     // KASLR: copy the status flags and the slid/randomized bases out of the
     // donated BootInfo page before Phase 5 scrubs the two base fields. The
@@ -310,7 +309,6 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
             boot_cpu_ids,
             trampoline_pa,
             init_image,
-            &mut boot_entropy_seed,
             boot_entropy_len,
             vmgenid_paddr,
             fb_phys,
@@ -329,6 +327,23 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
 /// `#[inline(never)]` is load-bearing: see the comment in `kernel_entry`
 /// at the rebase site. The body runs phase-3 console rebasing through
 /// phase-9 `init` launch and the scheduler hand-off.
+///
+/// # Safety
+/// Phases 0 to 3 have completed: `boot_info_phys` was validated in Phase 0,
+/// the kernel page tables and the direct physical map are active, and the
+/// boot stack has been rebased onto them. Every other argument was copied out
+/// of that validated `BootInfo`. Called exactly once, from the boot thread,
+/// and never returns.
+// too_many_arguments: the boot state read out of BootInfo before Phase 3 must
+// cross the `#[inline(never)]` boundary as explicit arguments.
+// too_many_lines, cast_possible_truncation, needless_range_loop, similar_names:
+// the same rationale as `kernel_entry`, whose body this continues.
+// large_types_passed_by_value: boot_cpu_ids ([u32; 512] = 2 KiB) and init_image
+// (272 B) cross the by-value/by-reference threshold. The `#[inline(never)]`
+// boundary is what defeats the cross-rebase hoist; the by-value signature is
+// incidental — the ABI passes both via hidden-pointer and emits an explicit
+// memcpy into the callee's stack frame either way. Single boot-path copy;
+// nothing on the hot path.
 #[cfg(not(test))]
 #[inline(never)]
 #[allow(
@@ -337,12 +352,6 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
     clippy::cast_possible_truncation,
     clippy::needless_range_loop,
     clippy::similar_names,
-    // boot_cpu_ids ([u32; 512] = 2 KiB) and init_image (272 B) cross
-    // the by-value/by-reference threshold. The `#[inline(never)]`
-    // boundary is what defeats the cross-rebase hoist; the by-value
-    // signature is incidental — the ABI passes both via hidden-pointer
-    // and emits an explicit memcpy into the callee's stack frame either
-    // way. Single boot-path copy; nothing on the hot path.
     clippy::large_types_passed_by_value
 )]
 unsafe fn kernel_entry_post_rebase(
@@ -351,7 +360,6 @@ unsafe fn kernel_entry_post_rebase(
     boot_cpu_ids: [u32; boot_protocol::MAX_CPUS],
     trampoline_pa: u64,
     init_image: boot_protocol::InitImage,
-    boot_entropy_seed: &mut [u8; 32],
     boot_entropy_len: u32,
     vmgenid_paddr: u64,
     fb_phys: u64,
@@ -408,9 +416,9 @@ unsafe fn kernel_entry_post_rebase(
     sched::init_storage(boot_cpu_count, allocator);
 
     // Allocate entropy subsystem storage (per-CPU CSPRNGs, jitter accumulators,
-    // self-test samples, and the central pool) from the buddy allocator, alongside the scheduler
-    // slabs and for the same reason: before the Phase-7 user-cap drain, while
-    // the buddy still holds large contiguous blocks.
+    // self-test samples, and the central pool) from the buddy allocator,
+    // alongside the scheduler slabs and for the same reason: before the Phase-7
+    // user-cap drain, while the buddy still holds large contiguous blocks.
     #[cfg(not(test))]
     entropy::init_storage(boot_cpu_count, allocator);
 
@@ -480,31 +488,31 @@ unsafe fn kernel_entry_post_rebase(
     // counter is live for jitter samples.
     #[cfg(not(test))]
     {
-        // Clamp defensively: the Phase-0 validator checks only the protocol
-        // version, not this length field.
-        let n = (boot_entropy_len as usize).min(boot_entropy_seed.len());
-        entropy::init(&boot_entropy_seed[..n], vmgenid_paddr);
+        // The seed is read through the direct map rather than copied out in
+        // `kernel_entry`, so the BootInfo page holds the only copy and one
+        // scrub covers it. Clamp defensively: the Phase-0 validator checks
+        // only the protocol version, not this length field.
+        let bi = mm::paging::phys_to_virt(boot_info_phys) as *mut BootInfo;
+        let n = (boot_entropy_len as usize).min(32);
+        // SAFETY: the direct map covers all RAM since Phase 3; boot_info_phys
+        // was validated in Phase 0. Single-threaded boot, and no live BootInfo
+        // reference aliases the page; the shared borrow taken here ends before
+        // the scrub below writes through `bi`.
+        unsafe {
+            let seed: &[u8; 32] = &*core::ptr::addr_of!((*bi).boot_entropy_seed);
+            entropy::init(&seed[..n], vmgenid_paddr);
+        }
 
         // Scrub the KASLR/entropy secrets once consumed. The BootInfo page is a
         // reclaim range donated to userspace at Phase 7 (memmgr re-hands its
-        // frames without zeroing), so none of them may survive there; the one
-        // local copy, in `kernel_entry`'s frame, is wiped too. The pool retains
-        // the entropy — the seed itself is secret (it feeds key/nonce
+        // frames without zeroing), so none of them may survive there. The pool
+        // retains the entropy — the seed itself is secret (it feeds key/nonce
         // generation), and the randomized kernel image and direct-map bases
         // defeat KASLR if disclosed. All Phase-3 consumers of the two bases
         // have run; later phases read only layout-free BootInfo fields.
-        for b in boot_entropy_seed
-        {
-            // SAFETY: `b` is a valid exclusive reference into the local array.
-            // Volatile so the scrub of a value never read again is not elided.
-            unsafe { core::ptr::write_volatile(b, 0) };
-        }
-        // SAFETY: the direct map covers all RAM since Phase 3; boot_info_phys
-        // was validated in Phase 0. Single-threaded boot, and no live BootInfo
-        // reference aliases the page at this point. Volatile stores so the
-        // scrub of this donated page cannot be elided as a dead store.
+        // SAFETY: as above. Volatile stores so the scrub of this donated page
+        // cannot be elided as a dead store.
         unsafe {
-            let bi = mm::paging::phys_to_virt(boot_info_phys) as *mut BootInfo;
             core::ptr::write_volatile(core::ptr::addr_of_mut!((*bi).boot_entropy_seed), [0u8; 32]);
             core::ptr::write_volatile(core::ptr::addr_of_mut!((*bi).boot_entropy_len), 0u32);
             core::ptr::write_volatile(core::ptr::addr_of_mut!((*bi).kernel_virtual_base), 0u64);

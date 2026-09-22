@@ -347,13 +347,14 @@ unsafe fn boot_sequence(image: EfiHandle, st: *mut EfiSystemTable) -> Result<!, 
     // (`boot_entropy.kaslr`) nor the `dm_rand` copy that step 9 consumed
     // (`kaslr.dm_rand`) may linger in BootServicesData that is later reclaimed
     // to userspace. The pool seed is already in BootInfo, which the kernel
-    // scrubs after absorbing it; the bootloader's own stack copy of that seed
-    // shares the general remanence of UEFI-reclaimed pages and is not
-    // separately scrubbed here.
-    // SAFETY: both are live locals; volatile so the stores are not elided as
+    // scrubs after absorbing it; the bootloader's own stack copy is scrubbed
+    // here for the same reason.
+    // SAFETY: all are live locals; volatile so the stores are not elided as
     // dead ahead of the values going out of scope.
     unsafe {
         core::ptr::write_volatile(core::ptr::addr_of_mut!(boot_entropy.kaslr), [0u64; 2]);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!(boot_entropy.seed), [0u8; 32]);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!(boot_entropy.len), 0u32);
         core::ptr::write_volatile(core::ptr::addr_of_mut!(kaslr.dm_rand), 0u64);
     }
     // SAFETY: page_table root frames are valid; kernel_info.entry_virtual is
@@ -764,6 +765,17 @@ unsafe fn step5b_alloc_ap_trampoline(ctx: &UefiContext) -> u64
     }
 }
 
+/// Zero a secret that is never read again. Volatile so the stores survive
+/// dead-store elimination; a plain `fill(0)` on a dying local may be dropped.
+fn scrub(bytes: &mut [u8])
+{
+    for b in bytes
+    {
+        // SAFETY: `b` is a valid exclusive reference into the caller's array.
+        unsafe { core::ptr::write_volatile(b, 0) };
+    }
+}
+
 // ── Step 5c: boot entropy seed ───────────────────────────────────────────────
 
 /// Draw conditioned early-boot entropy for the pool seed and the KASLR
@@ -824,7 +836,7 @@ unsafe fn step5c_fetch_boot_entropy(ctx: &UefiContext, firm: &FirmwareInfo) -> B
             let (kaslr, kaslr_available, kaslr_source_flag) = if ks == EFI_SUCCESS
             {
                 let w = kaslr_words(&kaslr_bytes);
-                kaslr_bytes.fill(0);
+                scrub(&mut kaslr_bytes);
                 (w, true, boot_protocol::KASLR_ENTROPY_FW_RNG)
             }
             else
@@ -857,9 +869,10 @@ unsafe fn step5c_fetch_boot_entropy(ctx: &UefiContext, firm: &FirmwareInfo) -> B
         let mut kb = [0u8; 16];
         kb.copy_from_slice(&dtb_seed[0..16]);
         let kaslr = kaslr_words(&kb);
+        scrub(&mut kb);
         let pool_len = n - 16;
         seed[..pool_len].copy_from_slice(&dtb_seed[16..n]);
-        dtb_seed.fill(0);
+        scrub(&mut dtb_seed);
         return BootEntropy {
             seed,
             len: pool_len as u32,
@@ -874,7 +887,7 @@ unsafe fn step5c_fetch_boot_entropy(ctx: &UefiContext, firm: &FirmwareInfo) -> B
         // Too short to split: feed the whole draw to the pool; KASLR uses
         // its deterministic fallback.
         seed[..n].copy_from_slice(&dtb_seed[..n]);
-        dtb_seed.fill(0);
+        scrub(&mut dtb_seed);
         return BootEntropy {
             seed,
             len: n as u32,

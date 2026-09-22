@@ -321,4 +321,5 @@ yet implemented), not a kernel feature.
 [procmgr/README.md](../services/procmgr/README.md),
 [ruststd/README.md](../runtime/ruststd/README.md),
 [process-layout/README.md](../shared/process-layout/README.md),
-[Capability Model](capability-model.md)
+[Capability Model](capability-model.md), [Process Lifecycle](process-lifecycle.md),
+[memmgr/docs/memory-pool.md](../services/memmgr/docs/memory-pool.md)

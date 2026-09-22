@@ -107,11 +107,12 @@ Both GUIDs are searched unconditionally; absent entries produce a zero field in
 `BootInfo`. Whichever tables are present are passed through to userspace as
 opaque physical addresses (`BootInfo.acpi_rsdp`, `BootInfo.device_tree`).
 
-Step 9 later extracts two narrow views from the tables discovered here for
+The bootloader extracts two narrow views from the tables discovered here for
 the kernel's own consumption:
 
 - **CPU topology** — MADT `LocalApic` / `RINTC` entries (ACPI) and `/cpus`
   nodes (DTB) populate `BootInfo.cpu_count`, `bsp_id`, and `cpu_ids`.
+  Derived here in step 5 and written into `BootInfo` in step 9.
 - **`kernel_mmio`** — arch-specific MMIO bases: LAPIC / IOAPIC on x86-64
   (from MADT), PLIC (MADT) / UART (SPCR) on RISC-V, or DTB compatible
   nodes, plus the riscv64 hart facts (`timebase_freq`, `hart_caps`).

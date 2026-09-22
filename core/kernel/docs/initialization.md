@@ -230,9 +230,10 @@ Architecture-specific hardware initialization; x86-64 and RISC-V diverge here.
 After the architecture hardware path, the BSP seeds the entropy pool from the
 firmware boot seed in `BootInfo`, the hardware RNG (health-gated where present),
 and boot-time jitter, and opens the kernel draw API; with neither a firmware
-seed nor a hardware RNG this degrades to jitter only. The BSP then scrubs the
-seed and the two KASLR bases from the `BootInfo` page (a Phase-7 reclaim range)
-and zeroes its local copy of the seed. See [entropy.md](entropy.md).
+seed nor a hardware RNG this degrades to jitter only. The BSP reads the seed in
+place from the `BootInfo` page (no kernel-side copy is made), then scrubs the
+seed, its length, and the two KASLR bases from that page (a Phase-7 reclaim
+range). See [entropy.md](entropy.md).
 
 **Failure mode:** Hardware initialisation failures halt with a descriptive
 message. The required-feature baseline itself is checked in Phase 1.
@@ -295,10 +296,11 @@ Phase 7.
       per-consumer copies.
    f. (Thread and process capabilities for init are added in Phase 9)
 
-   The kernel's own reservations (the SEED reserve, the InitInfo block, and
-   init's stack frames) are carved from the pristine buddy before the drain
-   in step 3a, so Phase 9 consumes pages already accounted as
-   kernel-reserved.
+   Before the drain in step 3a the InitInfo block, init's INIT_STACK_PAGES
+   stack frames, and the kernel page-table pool are reserved from the
+   pristine buddy; the drain then takes the remainder, and the SEED reserve
+   is pinned out of the front of the largest drained block. Phase 9
+   therefore consumes only pages already accounted as kernel-reserved.
 4. Mint reclaimable Memory caps from `BootInfo.reclaim_ranges` via
    `cap::mint_reclaim_memory_caps`:
    - One cap per range with `owns_memory = true` and full byte ledger;

@@ -33,7 +33,7 @@ boot/
     ├── memory_map.rs           # UEFI memory map → MemoryType; mmio_apertures derivation
     ├── framebuffer.rs          # GOP framebuffer setup
     ├── console.rs              # Early framebuffer console (uses shared/font)
-    ├── paging.rs           # Initial page table construction (arch-neutral)
+    ├── paging.rs               # Initial page table construction (arch-neutral)
     ├── error.rs                # Bootloader error type
     └── arch/
         ├── mod.rs              # Re-exports the active arch module

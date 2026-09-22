@@ -786,7 +786,6 @@ fn skip_node_name(fdt: &Fdt, start: u32) -> Option<u32>
             break;
         }
     }
-    // `len ≤ max ≤ size_struct (u32::MAX)`, so the cast is exact.
     advance_prop(start, len as u32)
 }
 

@@ -347,13 +347,13 @@ unsafe fn boot_sequence(image: EfiHandle, st: *mut EfiSystemTable) -> Result<!, 
     // (`boot_entropy.kaslr`) nor the `dm_rand` copy that step 9 consumed
     // (`kaslr.dm_rand`) may linger in BootServicesData that is later reclaimed
     // to userspace. The pool seed is already in BootInfo, which the kernel
-    // scrubs after absorbing it; the bootloader's own stack copy is scrubbed
-    // here for the same reason.
+    // scrubs after absorbing it; the bootloader's own copies (this local and
+    // the step 5c frame that produced it) are scrubbed for the same reason.
+    scrub(&mut boot_entropy.seed);
     // SAFETY: all are live locals; volatile so the stores are not elided as
     // dead ahead of the values going out of scope.
     unsafe {
         core::ptr::write_volatile(core::ptr::addr_of_mut!(boot_entropy.kaslr), [0u64; 2]);
-        core::ptr::write_volatile(core::ptr::addr_of_mut!(boot_entropy.seed), [0u8; 32]);
         core::ptr::write_volatile(core::ptr::addr_of_mut!(boot_entropy.len), 0u32);
         core::ptr::write_volatile(core::ptr::addr_of_mut!(kaslr.dm_rand), 0u64);
     }
@@ -765,17 +765,6 @@ unsafe fn step5b_alloc_ap_trampoline(ctx: &UefiContext) -> u64
     }
 }
 
-/// Zero a secret that is never read again. Volatile so the stores survive
-/// dead-store elimination; a plain `fill(0)` on a dying local may be dropped.
-fn scrub(bytes: &mut [u8])
-{
-    for b in bytes
-    {
-        // SAFETY: `b` is a valid exclusive reference into the caller's array.
-        unsafe { core::ptr::write_volatile(b, 0) };
-    }
-}
-
 // ── Step 5c: boot entropy seed ───────────────────────────────────────────────
 
 /// Draw conditioned early-boot entropy for the pool seed and the KASLR
@@ -843,13 +832,15 @@ unsafe fn step5c_fetch_boot_entropy(ctx: &UefiContext, firm: &FirmwareInfo) -> B
             {
                 ([0u64; 2], false, 0)
             };
-            return BootEntropy {
+            let out = BootEntropy {
                 seed,
                 len: 32,
                 kaslr,
                 kaslr_available,
                 kaslr_source_flag,
             };
+            scrub(&mut seed);
+            return out;
         }
         // Partial/failed draw: discard and fall through to the DTB source.
         seed = [0u8; 32];
@@ -873,13 +864,15 @@ unsafe fn step5c_fetch_boot_entropy(ctx: &UefiContext, firm: &FirmwareInfo) -> B
         let pool_len = n - 16;
         seed[..pool_len].copy_from_slice(&dtb_seed[16..n]);
         scrub(&mut dtb_seed);
-        return BootEntropy {
+        let out = BootEntropy {
             seed,
             len: pool_len as u32,
             kaslr,
             kaslr_available: true,
             kaslr_source_flag: boot_protocol::KASLR_ENTROPY_DTB_SEED,
         };
+        scrub(&mut seed);
+        return out;
     }
     #[allow(clippy::cast_possible_truncation)]
     if n > 0
@@ -888,13 +881,15 @@ unsafe fn step5c_fetch_boot_entropy(ctx: &UefiContext, firm: &FirmwareInfo) -> B
         // its deterministic fallback.
         seed[..n].copy_from_slice(&dtb_seed[..n]);
         scrub(&mut dtb_seed);
-        return BootEntropy {
+        let out = BootEntropy {
             seed,
             len: n as u32,
             kaslr: [0; 2],
             kaslr_available: false,
             kaslr_source_flag: 0,
         };
+        scrub(&mut seed);
+        return out;
     }
 
     // No source at all.
@@ -907,17 +902,27 @@ unsafe fn step5c_fetch_boot_entropy(ctx: &UefiContext, firm: &FirmwareInfo) -> B
     }
 }
 
-/// Pack 16 little-endian bytes into two KASLR entropy words.
+/// Pack 16 little-endian bytes into two KASLR entropy words. Slices straight
+/// from the caller's array so no partial copy of the secret lands in this frame.
 fn kaslr_words(bytes: &[u8; 16]) -> [u64; 2]
 {
     let mut w = [0u64; 2];
     for (i, word) in w.iter_mut().enumerate()
     {
-        let mut b = [0u8; 8];
-        b.copy_from_slice(&bytes[i * 8..i * 8 + 8]);
-        *word = u64::from_le_bytes(b);
+        *word = u64::from_le_bytes(bytes[i * 8..i * 8 + 8].try_into().unwrap_or([0u8; 8]));
     }
     w
+}
+
+/// Zero a secret that is never read again. Volatile so the stores survive
+/// dead-store elimination; a plain `fill(0)` on a dying local may be dropped.
+fn scrub(bytes: &mut [u8])
+{
+    for b in bytes
+    {
+        // SAFETY: `b` is a valid exclusive reference into the caller's array.
+        unsafe { core::ptr::write_volatile(b, 0) };
+    }
 }
 
 // ── Step 5d: KASLR slide ─────────────────────────────────────────────────────

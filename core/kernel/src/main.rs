@@ -200,7 +200,6 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
     let boot_cpu_ids = info.cpu_ids;
     let trampoline_pa = info.ap_trampoline_page;
     let init_image = info.init_image; // InitImage is Copy
-    let boot_entropy_len = info.boot_entropy_len;
     // KASLR: copy the status flags and the slid/randomized bases out of the
     // donated BootInfo page before Phase 5 scrubs the two base fields. The
     // bases are secrets, so they only ever reach the serial-only console.
@@ -309,7 +308,6 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
             boot_cpu_ids,
             trampoline_pa,
             init_image,
-            boot_entropy_len,
             vmgenid_paddr,
             fb_phys,
             allocator,
@@ -331,9 +329,10 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
 /// # Safety
 /// Phases 0 to 3 have completed: `boot_info_phys` was validated in Phase 0,
 /// the kernel page tables and the direct physical map are active, and the
-/// boot stack has been rebased onto them. Every other argument was copied out
-/// of that validated `BootInfo`. Called exactly once, from the boot thread,
-/// and never returns.
+/// boot stack has been rebased onto them. The `BootInfo`-derived arguments
+/// were copied or validated from that `BootInfo` before Phase 3; `allocator`
+/// is the live frame allocator initialised in Phase 2. Called exactly once,
+/// from the boot thread, and never returns.
 // too_many_arguments: the boot state read out of BootInfo before Phase 3 must
 // cross the `#[inline(never)]` boundary as explicit arguments.
 // too_many_lines, cast_possible_truncation, needless_range_loop, similar_names:
@@ -344,8 +343,6 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
 // incidental — the ABI passes both via hidden-pointer and emits an explicit
 // memcpy into the callee's stack frame either way. Single boot-path copy;
 // nothing on the hot path.
-#[cfg(not(test))]
-#[inline(never)]
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -354,13 +351,14 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
     clippy::similar_names,
     clippy::large_types_passed_by_value
 )]
+#[cfg(not(test))]
+#[inline(never)]
 unsafe fn kernel_entry_post_rebase(
     boot_info_phys: u64,
     boot_cpu_count: u32,
     boot_cpu_ids: [u32; boot_protocol::MAX_CPUS],
     trampoline_pa: u64,
     init_image: boot_protocol::InitImage,
-    boot_entropy_len: u32,
     vmgenid_paddr: u64,
     fb_phys: u64,
     allocator: &'static mut mm::buddy::BuddyAllocator,
@@ -488,18 +486,18 @@ unsafe fn kernel_entry_post_rebase(
     // counter is live for jitter samples.
     #[cfg(not(test))]
     {
-        // The seed is read through the direct map rather than copied out in
-        // `kernel_entry`, so the BootInfo page holds the only copy and one
-        // scrub covers it. Clamp defensively: the Phase-0 validator checks
-        // only the protocol version, not this length field.
+        // The seed and its length are read through the direct map rather
+        // than copied out in `kernel_entry`, so the BootInfo page holds the
+        // only copy and one scrub covers it. The length is clamped because
+        // the Phase-0 validator does not check it.
         let bi = mm::paging::phys_to_virt(boot_info_phys) as *mut BootInfo;
-        let n = (boot_entropy_len as usize).min(32);
         // SAFETY: the direct map covers all RAM since Phase 3; boot_info_phys
         // was validated in Phase 0. Single-threaded boot, and no live BootInfo
         // reference aliases the page; the shared borrow taken here ends before
         // the scrub below writes through `bi`.
         unsafe {
             let seed: &[u8; 32] = &*core::ptr::addr_of!((*bi).boot_entropy_seed);
+            let n = ((*bi).boot_entropy_len as usize).min(seed.len());
             entropy::init(&seed[..n], vmgenid_paddr);
         }
 

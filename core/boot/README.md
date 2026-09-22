@@ -41,14 +41,15 @@ boot/
         │   ├── mod.rs          # x86-64 arch re-exports
         │   ├── paging.rs       # x86-64 4-level page table implementation
         │   ├── handoff.rs      # CR3 write + kernel jump
-        │   └── serial.rs       # 16550 serial output for early debug
+        │   ├── serial.rs       # 16550 serial output for early debug
+        │   └── acpi_kernel_mmio.rs # ACPI MADT kernel_mmio extraction
         └── riscv64/
             ├── mod.rs          # RISC-V arch re-exports
             ├── paging.rs       # RISC-V page tables + paging-mode negotiation
             ├── handoff.rs      # satp write + sfence + kernel jump
             ├── serial.rs       # UART serial output for early debug
             ├── acpi_kernel_mmio.rs # ACPI MADT/RHCT kernel_mmio extraction
-            ├── acpi_spcr.rs    # ACPI SPCR UART discovery
+            ├── acpi_spcr.rs        # ACPI SPCR UART discovery
             ├── dtb_kernel_mmio.rs  # DTB kernel_mmio fill-in
             └── header.S        # Hand-crafted PE32+ header and entry trampoline
 ```
@@ -115,7 +116,7 @@ for details.
 | [docs/boot-flow.md](docs/boot-flow.md) | Ten-step boot sequence, `BootInfo` population, kernel handoff |
 | [docs/uefi-environment.md](docs/uefi-environment.md) | UEFI protocols, memory allocation, `ExitBootServices`, error handling |
 | [docs/elf-loading.md](docs/elf-loading.md) | ELF validation, LOAD segment processing, boot module loading |
-| [docs/firmware-parsing.md](docs/firmware-parsing.md) | ACPI and Device Tree extractors: CPU topology, kernel-facing MMIO bases, coarse MMIO apertures, and the DTB rng-seed fallback |
+| [docs/firmware-parsing.md](docs/firmware-parsing.md) | ACPI and Device Tree extractors: CPU topology, kernel-facing MMIO bases, coarse MMIO apertures, the DTB rng-seed fallback, and the VMGENID GUID address |
 | [docs/acpi.md](docs/acpi.md) | ACPI table-walk invariants (RSDP/XSDT/MADT/MCFG) |
 | [docs/dtb.md](docs/dtb.md) | Flat Device Tree walk invariants (header validation, compatible matching, rng-seed extraction and scrub) |
 | [docs/memory-map.md](docs/memory-map.md) | UEFI memory map → `BootInfo.memory_map` translation policy |

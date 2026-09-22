@@ -268,9 +268,8 @@ input, a source that passes startup but later degrades still cannot by itself
 determine pool output.
 
 These tests gate the *raw* hardware RNG only. The boot seed is a pre-conditioned
-DRBG output (`EFI_RNG_PROTOCOL`) or the firmware-supplied bytes of
-the DTB fallback,
-so it is absorbed directly and is not subject to the raw-source tests.
+DRBG output (`EFI_RNG_PROTOCOL`) or the firmware-supplied bytes of the DTB
+fallback, so it is absorbed directly and is not subject to the raw-source tests.
 
 ## Draw API and consumers
 

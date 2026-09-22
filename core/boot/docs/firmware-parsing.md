@@ -81,7 +81,9 @@ after `ExitBootServices` by
 2. Union with the seeds produced by
    [`boot/src/acpi.rs::parse_aperture_seed`](../src/acpi.rs) and
    [`boot/src/dtb.rs::parse_aperture_seed`](../src/dtb.rs) for every
-   firmware source that is present.
+   firmware source that is present, and with the GOP framebuffer, which
+   UEFI reports as `EfiReservedMemoryType` and only the bootloader can
+   carry past `ExitBootServices`.
 3. Sort by `phys_base`.
 4. Merge adjacent and overlapping entries into a minimal non-overlapping
    list.
@@ -97,8 +99,8 @@ PLIC / ECAM / BAR windows).
 
 Apertures are coarse but **not indiscriminate**: regions classified as
 `EfiRuntimeServices*`, `EfiACPIMemoryNVS`, or `EfiReserved` are omitted
-from the aperture list (they are neither `EfiMemoryMappedIO` nor
-explicitly added by the firmware-table extractors). Userspace therefore
+from the aperture list unless a seed names them explicitly; the GOP
+framebuffer is the one reserved region so seeded. Userspace therefore
 never receives capabilities that cover firmware-exclusive state.
 
 ---

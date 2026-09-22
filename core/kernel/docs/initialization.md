@@ -47,12 +47,17 @@ instruction is used in a loop to handle spurious wakeups.
      framebuffer initialisation same as x86-64 if present
 2. Emit a startup banner identifying the kernel and the protocol version
 3. Emit: CPU architecture identifier and core count if detectable at this stage
+4. Report the KASLR layout, then run the platform feature gate
+   (arch::current::cpu::verify_baseline): refuse hardware missing a required
+   baseline feature with a diagnostic, before any subsystem that assumes the
+   baseline runs (see docs/platform-requirements.md)
 ```
 
 The early console is allocation-free and output-only.
 
 **Failure mode:** If no output device is found, initialisation continues silently.
-This is not fatal — a headless system is valid.
+This is not fatal — a headless system is valid. A missing required feature halts
+with a descriptive message.
 
 **Completion criterion:** `console::init()` has returned.
 
@@ -228,10 +233,8 @@ seed nor a hardware RNG this degrades to jitter only. The BSP then scrubs the
 seed and the two KASLR bases from the `BootInfo` page (a Phase-7 reclaim range)
 and zeroes its local copy of the seed. See [entropy.md](entropy.md).
 
-**Failure mode:** Hardware initialisation failures (e.g. CPUID indicates a required
-feature is absent) halt with a descriptive message. The specific required features
-are checked against constants defined in `arch/x86_64/cpu.rs` and
-`arch/riscv64/cpu.rs`.
+**Failure mode:** Hardware initialisation failures halt with a descriptive
+message. The required-feature baseline itself is checked in Phase 1 (below).
 
 **Completion criterion:** Interrupts are enabled, the preemption timer is running,
 and the syscall entry mechanism is installed.
@@ -341,15 +344,15 @@ are excluded because `mint_module_memory_caps` already covers them).
    c. Wait for APS_READY.fetch_add(1) before launching the next AP
       (the Acquire load doubles as the barrier guaranteeing the AP has
       jumped from the trampoline page to its kernel-VA entry)
-5. Tear down the low-VA identity mapping at the trampoline PA via
+5. Run the entropy power-on self-test across all online CPUs: each CPU captured
+   a sample from its generator during bringup, and the BSP now checks per-CPU
+   independence and basic sanity, printing PASS/FAIL (see entropy.md).
+6. Tear down the low-VA identity mapping at the trampoline PA via
    mm::paging::unmap_identity_page (TLB shootdown to all other CPUs).
-6. Mint a late-reclaim Memory cap over the trampoline page via
+7. Mint a late-reclaim Memory cap over the trampoline page via
    cap::mint_late_reclaim_memory_caps; the descriptor lands in
    cspace_layout so init sees the cap through the standard CSpace
    handoff in Phase 9.
-7. Run the entropy power-on self-test across all online CPUs: each CPU captured
-   a sample from its generator during bringup, and the BSP now checks per-CPU
-   independence and basic sanity, printing PASS/FAIL (see entropy.md).
 ```
 
 The AP SIPI trampoline page is flagged `RECLAIM_FLAG_LATE` in
@@ -413,10 +416,10 @@ calls `sched::enter()`.
         adds it to the physical frame address at translation time
       - Apply permissions from segment.flags (Read → RO, ReadWrite → RW,
         ReadExecute → RX); W^X is enforced (ReadWrite cannot also be executable)
-4. Allocate init's user stack (inlined in `kernel_entry`):
-   a. Allocate INIT_STACK_PAGES (4) frames from the buddy allocator
-      one at a time so each phys address is captured for the reclaim
-      Memory cap minted alongside it
+4. Map init's user stack (inlined in `kernel_entry`):
+   a. Take the INIT_STACK_PAGES (4) frames reserved from the buddy in
+      Phase 7, before the user-cap drain, one at a time so each phys
+      address is captured for the reclaim Memory cap minted alongside it
    b. Zero each frame
    c. Map below the chosen init stack top (`choose_init_layout().init_stack_top`,
       drawn per boot from the init-stack-guard window in `process-layout`;
@@ -506,4 +509,5 @@ that CPU only; the BSP and other CPUs continue.
 
 ## Summarized By
 
-[kernel/README.md](../README.md), [docs/bootstrap.md](../../../docs/bootstrap.md)
+[kernel/README.md](../README.md), [docs/bootstrap.md](../../../docs/bootstrap.md),
+[docs/memory-model.md](../../../docs/memory-model.md)

@@ -117,4 +117,4 @@ bootloader never halts on a DTB parse error.
 
 ## Summarized By
 
-[boot/README.md](../README.md)
+[boot/README.md](../README.md), [boot-flow.md](boot-flow.md)

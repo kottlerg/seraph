@@ -88,7 +88,8 @@ The bootloader does not inspect module content; what each module does
 and in what order init spawns them is init's concern, and after
 init-protocol v7 init identifies modules by `BootModule.name` rather
 than ordinal position. Typical modules: procmgr, memmgr, devmgr, vfsd,
-virtio-blk, fatfs.
+virtio-blk, serial, framebuffer, fatfs (the authoritative list is
+`xtask/src/bundle.rs::MODULES`).
 
 Only the whole bundle allocation is identity-mapped (one region in
 place of today's per-module pair of read-buffer + loaded-region
@@ -112,14 +113,20 @@ the kernel's own consumption:
 - **CPU topology** — MADT `LocalApic` / `RINTC` entries (ACPI) and `/cpus`
   nodes (DTB) populate `BootInfo.cpu_count`, `bsp_id`, and `cpu_ids`.
 - **`kernel_mmio`** — arch-specific MMIO bases: LAPIC / IOAPIC on x86-64
-  (from MADT), PLIC / UART on RISC-V (from MADT `PLIC` type or DTB
-  compatible nodes).
+  (from MADT), PLIC (MADT) / UART (SPCR) on RISC-V, or DTB compatible
+  nodes, plus the riscv64 hart facts (`timebase_freq`, `hart_caps`).
+  Extracted into `BootInfo` in step 9.
 
 A third extraction produces **seed entries** for `mmio_apertures` —
 coarse `{phys_base, size}` regions the kernel mints as `Mmio`
 capabilities. The seed covers LAPIC / IOAPIC / PLIC / ECAM / BAR
-windows / `virtio,mmio` transports from the firmware tables and is
-merged with the UEFI memory map's `MemoryMappedIO` regions in step 8.
+windows / `virtio,mmio` transports from the firmware tables, plus the GOP
+framebuffer, and is merged with the UEFI memory map's `MemoryMappedIO`
+regions in step 9.
+
+On RISC-V the paging mode is negotiated here, from the DTB `mmu-type` claim and
+a `satp` probe, before step 6 fixes the table hierarchy depth (see
+[page-tables.md](page-tables.md) § Mode negotiation).
 
 ### Step 5b: Allocate the AP Trampoline Page
 
@@ -214,8 +221,8 @@ scrubs from this donated page after consuming them. The `version` field is set t
 | `framebuffer` | GOP framebuffer from step 1 (zeroed if GOP is absent) |
 | `acpi_rsdp` | Physical address of ACPI RSDP from step 5; zero if GUID absent |
 | `device_tree` | Physical address of DTB from step 5; zero if GUID absent |
-| `kernel_mmio` | Arch-specific MMIO bases extracted from firmware tables in step 5 (see `firmware-parsing.md`). Fields the extractor cannot populate stay zero and the kernel falls back to its compiled-in defaults. |
-| `mmio_apertures` | Coarse `{phys_base, size}` array from step 8 (UEFI MMIO regions merged with firmware-table seeds). Empty if no MMIO regions were reported. |
+| `kernel_mmio` | Arch-specific MMIO bases and riscv64 hart facts, extracted from the firmware tables discovered in step 5 and written here in step 9 (see `firmware-parsing.md`). MMIO bases the extractor cannot populate stay zero and the kernel falls back to its compiled-in defaults; a zero riscv64 `timebase_freq` or missing `hart_caps` bit is fatal at kernel Phase 5. |
+| `mmio_apertures` | Coarse `{phys_base, size}` array assembled in step 9 (UEFI MMIO regions merged with the firmware-table and framebuffer seeds). Empty if no MMIO regions were reported. |
 | `cpu_count` | Enabled LAPIC count from MADT (x86-64) or enabled RINTC / DTB hart count (RISC-V); always ≥ 1 |
 | `bsp_id` | APIC ID of the BSP (x86-64) or boot hart ID from `EFI_RISCV_BOOT_PROTOCOL` (RISC-V) |
 | `cpu_ids` | Per-CPU hardware identifiers; `cpu_ids[0] == bsp_id`; entries beyond `cpu_count` are zero |

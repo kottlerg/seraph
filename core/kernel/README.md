@@ -260,7 +260,7 @@ and the CPU state guaranteed at entry are specified in
 `BootInfo` layout is owned by the
 [`abi/boot-protocol/`](../../abi/boot-protocol/) crate.
 
-The entry point is `#[no_mangle] pub extern "C"` and marked `-> !`. It receives a
+The entry point is `#[unsafe(no_mangle)] pub extern "C"` and marked `-> !`. It receives a
 single argument: a `*const BootInfo` pointer whose physical address is in `rdi`
 (x86-64) or `a0` (RISC-V) per the boot protocol.
 

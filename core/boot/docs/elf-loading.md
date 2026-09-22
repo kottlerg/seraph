@@ -73,7 +73,8 @@ the `nokaslr` knob is present). The dynamic-linking sections lld emits under `-p
 the kernel linker scripts, so they keep the single-linear-offset invariant above and
 Phase 3 maps them read-only.
 
-The same validation applies to the kernel ELF and the init ELF. Boot modules (the
+The shared-crate format validation applies to both the kernel ELF and the init
+ELF; the placement ruleset above is kernel-only. Boot modules (the
 `BootInfo.modules` slice) are not ELF-validated by the bootloader — they are loaded
 as opaque flat binaries. Their validation and execution is init's responsibility.
 

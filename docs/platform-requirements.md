@@ -259,4 +259,5 @@ required-vs-opportunistic rule are architecture-neutral and unchanged.
 
 ## Summarized By
 
-[README.md](../README.md), [Architecture Overview](architecture.md), [Memory Model](memory-model.md)
+[README.md](../README.md), [Architecture Overview](architecture.md), [Memory Model](memory-model.md),
+[Kernel Initialization](../core/kernel/docs/initialization.md)

@@ -99,9 +99,9 @@ PLIC / ECAM / BAR windows).
 
 Apertures are coarse but **not indiscriminate**: regions classified as
 `EfiRuntimeServices*`, `EfiACPIMemoryNVS`, or `EfiReserved` are omitted
-from the aperture list unless a seed names them explicitly; the GOP
-framebuffer is the one reserved region so seeded. Userspace therefore
-never receives capabilities that cover firmware-exclusive state.
+from the aperture list unless a firmware-table or framebuffer seed names
+them explicitly. Userspace therefore never receives capabilities that
+cover firmware-exclusive state.
 
 ---
 

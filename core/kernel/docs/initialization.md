@@ -59,7 +59,8 @@ The early console is allocation-free and output-only.
 This is not fatal — a headless system is valid. A missing required feature halts
 with a descriptive message.
 
-**Completion criterion:** `console::init()` has returned.
+**Completion criterion:** `console::init()` has returned and `verify_baseline`
+has accepted the platform.
 
 ---
 
@@ -234,7 +235,7 @@ seed and the two KASLR bases from the `BootInfo` page (a Phase-7 reclaim range)
 and zeroes its local copy of the seed. See [entropy.md](entropy.md).
 
 **Failure mode:** Hardware initialisation failures halt with a descriptive
-message. The required-feature baseline itself is checked in Phase 1 (below).
+message. The required-feature baseline itself is checked in Phase 1.
 
 **Completion criterion:** Interrupts are enabled, the preemption timer is running,
 and the syscall entry mechanism is installed.
@@ -293,6 +294,11 @@ Phase 7.
       right, for init to forward sanctioned SBI extensions and attenuate
       per-consumer copies.
    f. (Thread and process capabilities for init are added in Phase 9)
+
+   The kernel's own reservations (the SEED reserve, the InitInfo block, and
+   init's stack frames) are carved from the pristine buddy before the drain
+   in step 3a, so Phase 9 consumes pages already accounted as
+   kernel-reserved.
 4. Mint reclaimable Memory caps from `BootInfo.reclaim_ranges` via
    `cap::mint_reclaim_memory_caps`:
    - One cap per range with `owns_memory = true` and full byte ledger;
@@ -495,11 +501,11 @@ that CPU only; the BSP and other CPUs continue.
 | Phase | Key Action | Failure |
 |---|---|---|
 | 0 | Validate BootInfo version | Silent halt |
-| 1 | Early console | Non-fatal (continues silently) |
+| 1 | Early console; platform feature gate | Halt: missing required baseline feature (no console is non-fatal) |
 | 2 | Buddy allocator from memory map | Halt: no usable RAM |
 | 3 | Kernel page tables + direct map | Halt: OOM during PT construction |
 | 4 | Typed-memory cap surface; per-CPU storage | Halt: per-CPU storage allocation failed |
-| 5 | CPU hardware (IDT/GDT/TSS/stvec); seed entropy pool | Halt: missing required feature |
+| 5 | CPU hardware (IDT/GDT/TSS/stvec); seed entropy pool | Halt: hardware initialisation failure |
 | 6 | Platform resource validation | Halt if entries pointer is null with non-zero count; bad entries skipped |
 | 7 | Capability system + root CSpace | Halt: OOM |
 | 8 | Scheduler + idle threads, SMP bringup, AP trampoline reclaim, entropy self-test | Halt: OOM (idle stack/TCB); start_ap failure per CPU is logged and skipped |

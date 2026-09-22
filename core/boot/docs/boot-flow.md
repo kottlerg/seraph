@@ -107,7 +107,7 @@ Both GUIDs are searched unconditionally; absent entries produce a zero field in
 `BootInfo`. Whichever tables are present are passed through to userspace as
 opaque physical addresses (`BootInfo.acpi_rsdp`, `BootInfo.device_tree`).
 
-The bootloader also extracts two narrow views from the firmware tables for
+Step 9 later extracts two narrow views from the tables discovered here for
 the kernel's own consumption:
 
 - **CPU topology** — MADT `LocalApic` / `RINTC` entries (ACPI) and `/cpus`
@@ -149,10 +149,10 @@ seed at all, since its EDK2 exposes no RNG on its own and hands the bootloader A
 rather than a DTB). A DTB `/chosen/rng-seed` reader is a secondary fallback for
 firmware that delivers a DTB: a draw of at least 24 bytes is split, the first 16
 bytes to the KASLR word and the rest to the pool seed, and a shorter draw feeds the
-pool alone; the property is scrubbed from the blob in place. When neither source
-yields a seed the length is zero, the KASLR entropy is absent, the kernel seeds the
-pool from its remaining sources (hardware RNG where present, jitter), and the layout
-is deterministic.
+pool alone; the property is scrubbed from the blob in place ([dtb.md](dtb.md)). When
+neither source yields a seed the length is zero, the KASLR entropy is absent, the
+kernel seeds the pool from its remaining sources (hardware RNG where present,
+jitter), and the layout is deterministic.
 See [core/kernel/docs/entropy.md](../../kernel/docs/entropy.md).
 
 Detail: [firmware-parsing.md](firmware-parsing.md)

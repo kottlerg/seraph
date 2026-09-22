@@ -33,25 +33,25 @@ boot/
     ├── memory_map.rs           # UEFI memory map → MemoryType; mmio_apertures derivation
     ├── framebuffer.rs          # GOP framebuffer setup
     ├── console.rs              # Early framebuffer console (uses shared/font)
-    ├── paging.rs               # Initial page table construction (arch-neutral)
+    ├── paging.rs           # Initial page table construction (arch-neutral)
     ├── error.rs                # Bootloader error type
     └── arch/
         ├── mod.rs              # Re-exports the active arch module
         ├── x86_64/
-        │   ├── mod.rs          # x86-64 arch re-exports
-        │   ├── paging.rs       # x86-64 4-level page table implementation
-        │   ├── handoff.rs      # CR3 write + kernel jump
-        │   ├── serial.rs       # 16550 serial output for early debug
+        │   ├── mod.rs              # x86-64 arch re-exports
+        │   ├── paging.rs           # x86-64 4-level page table implementation
+        │   ├── handoff.rs          # CR3 write + kernel jump
+        │   ├── serial.rs           # 16550 serial output for early debug
         │   └── acpi_kernel_mmio.rs # ACPI MADT kernel_mmio extraction
         └── riscv64/
-            ├── mod.rs          # RISC-V arch re-exports
-            ├── paging.rs       # RISC-V page tables + paging-mode negotiation
-            ├── handoff.rs      # satp write + sfence + kernel jump
-            ├── serial.rs       # UART serial output for early debug
+            ├── mod.rs              # RISC-V arch re-exports
+            ├── paging.rs           # RISC-V page tables + paging-mode negotiation
+            ├── handoff.rs          # satp write + sfence + kernel jump
+            ├── serial.rs           # UART serial output for early debug
             ├── acpi_kernel_mmio.rs # ACPI MADT/RHCT kernel_mmio extraction
             ├── acpi_spcr.rs        # ACPI SPCR UART discovery
             ├── dtb_kernel_mmio.rs  # DTB kernel_mmio fill-in
-            └── header.S        # Hand-crafted PE32+ header and entry trampoline
+            └── header.S            # Hand-crafted PE32+ header and entry trampoline
 ```
 
 ---

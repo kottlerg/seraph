@@ -133,8 +133,9 @@ a `satp` probe, before step 6 fixes the table hierarchy depth (see
 
 One 4 KiB page is reserved for the AP startup trampoline: below 1 MiB on
 x86-64 (SIPI vector constraint), any page on RISC-V (SBI HSM has no placement
-constraint). Allocation failure records zero and disables SMP; the page is
-reported in `BootInfo.ap_trampoline_page`.
+constraint). Allocation failure records zero, and the kernel then halts at Phase 8
+when more than one CPU is listed (`abi/boot-protocol` `ap_trampoline_page`); the page
+is reported in `BootInfo.ap_trampoline_page`.
 
 ### Step 5c: Boot Entropy Seed
 
@@ -230,13 +231,13 @@ scrubs from this donated page after consuming them. The `version` field is set t
 | `cpu_count` | Enabled LAPIC count from MADT (x86-64) or enabled RINTC / DTB hart count (RISC-V); always ≥ 1 |
 | `bsp_id` | APIC ID of the BSP (x86-64) or boot hart ID from `EFI_RISCV_BOOT_PROTOCOL` (RISC-V) |
 | `cpu_ids` | Per-CPU hardware identifiers; `cpu_ids[0] == bsp_id`; entries beyond `cpu_count` are zero |
-| `ap_trampoline_page` | 4 KiB physical frame for AP startup code. x86-64: below 1 MiB (SIPI vector constraint). RISC-V: any 4 KiB page (SBI HSM has no placement constraint). Zero if allocation failed (SMP disabled). |
+| `ap_trampoline_page` | 4 KiB physical frame for AP startup code. x86-64: below 1 MiB (SIPI vector constraint). RISC-V: any 4 KiB page (SBI HSM has no placement constraint). Zero if allocation failed; the kernel halts at Phase 8 when more than one CPU is listed. |
 | `reclaim_ranges` | `ReclaimSlice` over a dedicated 4 KiB scratch page recording bootloader pages the kernel reclaims into the cap surface. Populated from `BootAllocations` (`BootInfo` page, module descriptor array, memory-map entry array, MMIO aperture array, the reclaim-array page itself, the AP trampoline page), `page_table.allocated_frames()` (the bootloader's transient page-table frames), and per-gap carve-outs over the bundle allocation — the header + entry table + leading pad, the init ELF source body (no longer needed after `load_init` copied segments out), and any inter-module or trailing slack pages. Module bodies are skipped here because `cap::mint_module_memory_caps` already mints Memory caps over them; pushing them again would double-register pages in the buddy ledger. Each `ReclaimRange` carries a `flags: u32`; bit 0 (`RECLAIM_FLAG_LATE`) marks the AP trampoline entry so the kernel defers minting it until the post-SMP-bringup late-reclaim pass. All other entries are minted by `cap::mint_reclaim_memory_caps` inside `populate_cspace`. |
 | `boot_entropy_seed` | Conditioned entropy seed for the pool, drawn from `EFI_RNG_PROTOCOL` (or a DTB `/chosen/rng-seed` fallback) in step 5c; valid for `boot_entropy_len` bytes, remainder zero. Absorbed into the kernel entropy pool at Phase 5. The separate KASLR entropy word never appears in `BootInfo`. |
 | `boot_entropy_len` | Valid leading byte count of `boot_entropy_seed`; zero when neither source yields a seed, in which case the kernel seeds from its remaining sources. |
 | `vmgenid_paddr` | Physical address of the 16-byte ACPI VMGENID GUID (QEMU VMGENID SSDT scan in step 9, run wherever an RSDP is present; only x86-64 QEMU wires the device today); zero when absent. |
 | `direct_map_base` | KASLR-chosen direct-map virtual base — a 1 GiB-aligned base at or above the paging mode's kernel-half floor, chosen in step 9 from the KASLR entropy and the final memory map. A KASLR secret; the kernel scrubs it at Phase 5, after its Phase-3 consumers have run. |
-| `kaslr_flags` | `KASLR_*` status bits: which layout dimensions were randomized, the entropy source, and any skip reason (knob / window-limited). Zero means an entirely un-randomized layout. |
+| `kaslr_flags` | `KASLR_*` status bits: which layout dimensions were randomized, the entropy source, and any skip reason (knob / window-limited); an `ET_EXEC` image carries its source bits with `KASLR_IMAGE_RANDOMIZED` clear. Zero means an entirely un-randomized layout. |
 
 All arrays pointed to by `BootInfo` fields reside in physical memory that the UEFI
 memory map marks as `Loaded` or `Usable`, ensuring they survive until the kernel

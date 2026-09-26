@@ -210,19 +210,17 @@ are forbidden; `master` MUST NOT receive force pushes.
   run), a standards, documentation-drift, coverage, or style finding is on
   the surface only when the delta introduced it, wherever it anchors: a
   statement the delta made stale, or a test the delta's new code lacks, is
-  one the delta introduced. Such a finding the delta did not introduce is
-  recorded, not fixed; the earlier runs reviewed the earlier hunks.
-  Correctness, soundness, safety, and contract findings stay on the surface
-  as above. A finding on the surface MUST be fixed before merge. A finding
-  off the surface MUST be recorded, not fixed: the pre-merge review reports
-  it as out of bound, and it is appended, with file, line, authority, and
-  fix, to the open audit Issue for that surface (or to a new one, filed with
-  the maintainer's approval) before the merge prompt. Nothing found is
-  dropped. Work an open Issue already names, filed with the maintainer's
-  approval, is off the surface of every other PR; a finding on it is
-  recorded against that Issue. A finding two independent refuters refute on
-  evidence is dropped and listed in the report's Dropped section; every
-  other finding is fixed or recorded.
+  one the delta introduced. Correctness, soundness, safety, and contract
+  findings stay on the surface as above. A finding on the surface MUST be
+  fixed before merge. A finding off the surface MUST be recorded, not fixed:
+  the pre-merge review reports it as out of bound, and it is appended, with
+  file, line, authority, and fix, to the open audit Issue for that surface
+  (or to a new one, filed with the maintainer's approval) before the merge
+  prompt. Nothing found is dropped. Work an open Issue already names, filed
+  with the maintainer's approval, is off the surface of every other PR; a
+  finding on it is recorded against that Issue. A finding two independent
+  refuters refute on evidence is dropped and listed in the report's Dropped
+  section; every other finding is fixed or recorded.
 
 ### Branch naming
 

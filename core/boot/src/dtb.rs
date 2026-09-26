@@ -21,6 +21,8 @@
 //! - [`parse_aperture_seed`]: collect MMIO extents (PLIC, CLINT, UART, PCI
 //!   ECAM + ranges, `virtio,mmio` transports) as seeds for
 //!   [`super::memory_map::derive_mmio_apertures`].
+//! - [`parse_rng_seed`]: extract and scrub the `/chosen/rng-seed` boot-entropy
+//!   fallback.
 //!
 //! The arch-specific `kernel_mmio` extractor for RISC-V (PLIC + UART
 //! from compatible nodes) lives under [`crate::arch::riscv64`] and
@@ -143,11 +145,21 @@ impl NodeState
 
 // ── Fdt implementation ────────────────────────────────────────────────────────
 
+/// Offset of the token after a property whose data starts at `off` and is
+/// `prop_len` bytes long, rounded up to the 4-byte token alignment. `None` when
+/// a firmware-supplied length would overflow the offset, which ends the walk
+/// like any other unreadable token.
+fn advance_prop(off: u32, prop_len: u32) -> Option<u32>
+{
+    off.checked_add(prop_len.checked_add(3)? & !3)
+}
+
 impl Fdt
 {
     /// Validate and wrap an FDT blob at the given physical address.
     ///
-    /// Returns `None` on bad magic, blob too small, or out-of-range offsets.
+    /// Returns `None` on bad magic or when the struct or strings block falls
+    /// outside `totalsize`.
     ///
     /// # Safety
     /// `base` must be the physical address of a valid, identity-mapped FDT
@@ -274,7 +286,12 @@ impl Fdt
                     }
                     depth += 1;
                     // Skip null-terminated, 4-byte-aligned node name.
-                    off = skip_node_name(self, off);
+                    let Some(next) = skip_node_name(self, off)
+                    else
+                    {
+                        break;
+                    };
+                    off = next;
                 }
                 FDT_END_NODE =>
                 {
@@ -316,7 +333,12 @@ impl Fdt
                     off += 4;
                     let data_off = off;
                     // Advance past prop data (4-byte aligned).
-                    off += (prop_len + 3) & !3;
+                    let Some(next) = advance_prop(off, prop_len)
+                    else
+                    {
+                        break;
+                    };
+                    off = next;
 
                     // Only process properties for nodes within stack depth.
                     if depth == 0 || depth > MAX_DEPTH
@@ -468,7 +490,12 @@ impl Fdt
                         };
                     }
                     depth += 1;
-                    off = skip_node_name(self, off);
+                    let Some(next) = skip_node_name(self, off)
+                    else
+                    {
+                        break;
+                    };
+                    off = next;
                 }
                 FDT_END_NODE =>
                 {
@@ -504,7 +531,12 @@ impl Fdt
                     };
                     off += 4;
                     let data_off = off;
-                    off += (prop_len + 3) & !3;
+                    let Some(next) = advance_prop(off, prop_len)
+                    else
+                    {
+                        break;
+                    };
+                    off = next;
 
                     if depth == 0 || depth > MAX_DEPTH
                     {
@@ -630,7 +662,12 @@ impl Fdt
             {
                 FDT_BEGIN_NODE =>
                 {
-                    off = skip_node_name(self, off);
+                    let Some(next) = skip_node_name(self, off)
+                    else
+                    {
+                        break;
+                    };
+                    off = next;
                 }
                 FDT_END_NODE | FDT_NOP =>
                 {}
@@ -649,7 +686,12 @@ impl Fdt
                     };
                     off += 4;
                     let data_off = off;
-                    off += (prop_len + 3) & !3;
+                    let Some(next) = advance_prop(off, prop_len)
+                    else
+                    {
+                        break;
+                    };
+                    off = next;
 
                     if self.string_at(nameoff) == b"timebase-frequency"
                     {
@@ -686,7 +728,7 @@ impl Fdt
             off += 4;
             match token
             {
-                FDT_BEGIN_NODE => off = skip_node_name(self, off),
+                FDT_BEGIN_NODE => off = skip_node_name(self, off)?,
                 FDT_END_NODE | FDT_NOP =>
                 {}
                 FDT_PROP =>
@@ -696,7 +738,7 @@ impl Fdt
                     let nameoff = self.read_struct_u32(off)?;
                     off += 4;
                     let data_off = off;
-                    off += (prop_len + 3) & !3;
+                    off = advance_prop(off, prop_len)?;
                     if self.string_at(nameoff) == name
                     {
                         return Some((data_off, prop_len));
@@ -723,11 +765,13 @@ impl Fdt
 // ── Private helpers ───────────────────────────────────────────────────────────
 
 /// Skip the null-terminated, 4-byte-aligned node name starting at `off` in
-/// the struct block. Returns the updated offset after the name.
+/// the struct block. Returns the offset after the name, or `None` when the
+/// 4-byte-aligned offset after it would overflow the u32 struct-block offset
+/// (a name ending at the top of a ~4 GiB struct block).
 // `len` (usize) is bounded by `max` which equals `size_struct.saturating_sub(start)` (u32),
 // so the `len as u32` cast below cannot truncate.
 #[allow(clippy::cast_possible_truncation)]
-fn skip_node_name(fdt: &Fdt, start: u32) -> u32
+fn skip_node_name(fdt: &Fdt, start: u32) -> Option<u32>
 {
     let base_addr = fdt.base + u64::from(fdt.off_struct) + u64::from(start);
     let max = fdt.size_struct.saturating_sub(start) as usize;
@@ -742,8 +786,7 @@ fn skip_node_name(fdt: &Fdt, start: u32) -> u32
             break;
         }
     }
-    // Round up to 4-byte alignment. `len ≤ max ≤ size_struct (u32::MAX)` so cast is exact.
-    (start + len as u32 + 3) & !3
+    advance_prop(start, len as u32)
 }
 
 /// Check whether `data` (a null-separated compatible string list) contains
@@ -952,8 +995,8 @@ pub unsafe fn parse_boot_cpu_mmu_type(dtb_addr: u64, boot_hart_id: u64) -> Optio
 /// Callable unconditionally on every supported architecture; a zero
 /// `dtb_addr` (no DTB) is a fast no-op that returns 0. The caller
 /// typically also calls [`super::acpi::parse_aperture_seed`] to cover
-/// ACPI-only platforms (and RISC-V platforms such as QEMU+EDK2 that
-/// expose ACPI alongside a DTB); both feeds merge inside
+/// ACPI-only platforms (including QEMU+EDK2 on RISC-V, which hands the
+/// bootloader ACPI rather than a DTB); both feeds merge inside
 /// [`super::memory_map::derive_mmio_apertures`].
 ///
 /// Returns the number of entries written.
@@ -1035,12 +1078,12 @@ pub unsafe fn parse_aperture_seed(dtb_addr: u64, out: &mut [MmioAperture]) -> us
 /// Extract the `/chosen/rng-seed` property into `out`, scrub it from the
 /// blob, and return the number of bytes copied (0 when absent).
 ///
-/// QEMU's `virt` machine populates `rng-seed` with host-random bytes and
-/// the EDK2 `RiscVVirtQemu` firmware passes the FDT through unmodified, so
-/// on riscv64 — where no `EFI_RNG_PROTOCOL` exists — this is the bootloader's
-/// only entropy source (KASLR draws and the pool seed). The property bytes
-/// are zeroed in place because the same blob is later handed to userspace
-/// via `BootInfo.device_tree`; the seed must not outlive its consumption.
+/// QEMU's `virt` machine populates `rng-seed` with host-random bytes. This
+/// reader is a secondary fallback for firmware that delivers a DTB; which
+/// firmware exposes which boot-entropy source is documented in
+/// `core/boot/docs/boot-flow.md`. The property bytes are zeroed in place
+/// because the same blob is later handed to userspace via
+/// `BootInfo.device_tree`; the seed must not outlive its consumption.
 ///
 /// # Safety
 /// `dtb_addr` must be 0 or the physical address of a valid, identity-mapped
@@ -1218,6 +1261,81 @@ mod tests
     {
         // SAFETY: blob is a valid in-memory FDT built by FdtBuilder.
         unsafe { parse_hart_caps(blob.as_ptr() as u64) }
+    }
+
+    #[test]
+    fn bad_magic_is_rejected()
+    {
+        let mut blob = tree(None, |b| cpu_node(b, b"cpu@0", 0, &[]));
+        blob[0..4].copy_from_slice(&0xdead_beef_u32.to_be_bytes());
+        // SAFETY: blob is a valid in-memory buffer of at least 40 bytes.
+        assert!(unsafe { Fdt::from_raw(blob.as_ptr() as u64) }.is_none());
+    }
+
+    #[test]
+    fn struct_block_past_totalsize_is_rejected()
+    {
+        let mut blob = tree(None, |b| cpu_node(b, b"cpu@0", 0, &[]));
+        // Header byte offsets: 4 is `totalsize`, 36 is `size_dt_struct`. A struct
+        // block one byte longer than the blob, with no arithmetic overflow, must
+        // fail the bounds check itself.
+        let total = u32::from_be_bytes(blob[4..8].try_into().unwrap());
+        blob[36..40].copy_from_slice(&(total - 40 + 1).to_be_bytes());
+        // SAFETY: blob is a valid in-memory buffer of at least 40 bytes.
+        assert!(unsafe { Fdt::from_raw(blob.as_ptr() as u64) }.is_none());
+    }
+
+    #[test]
+    fn struct_block_extent_overflow_is_rejected()
+    {
+        let mut blob = tree(None, |b| cpu_node(b, b"cpu@0", 0, &[]));
+        // `off_dt_struct + size_dt_struct` must not overflow before the bounds
+        // check; a maximal size with the 40-byte offset exercises that arm.
+        blob[36..40].copy_from_slice(&u32::MAX.to_be_bytes());
+        // SAFETY: blob is a valid in-memory buffer of at least 40 bytes.
+        assert!(unsafe { Fdt::from_raw(blob.as_ptr() as u64) }.is_none());
+    }
+
+    #[test]
+    fn strings_block_past_totalsize_is_rejected()
+    {
+        let mut blob = tree(None, |b| cpu_node(b, b"cpu@0", 0, &[]));
+        // Header byte offset 32 is `size_dt_strings`.
+        let total = u32::from_be_bytes(blob[4..8].try_into().unwrap());
+        let off_strings = u32::from_be_bytes(blob[12..16].try_into().unwrap());
+        blob[32..36].copy_from_slice(&(total - off_strings + 1).to_be_bytes());
+        // SAFETY: blob is a valid in-memory buffer of at least 40 bytes.
+        assert!(unsafe { Fdt::from_raw(blob.as_ptr() as u64) }.is_none());
+    }
+
+    #[test]
+    fn strings_block_extent_overflow_is_rejected()
+    {
+        let mut blob = tree(None, |b| cpu_node(b, b"cpu@0", 0, &[]));
+        // Header byte offset 32 is `size_dt_strings`; a maximal size with a
+        // non-zero offset exercises the overflow arm of the strings bound.
+        blob[32..36].copy_from_slice(&u32::MAX.to_be_bytes());
+        // SAFETY: blob is a valid in-memory buffer of at least 40 bytes.
+        assert!(unsafe { Fdt::from_raw(blob.as_ptr() as u64) }.is_none());
+    }
+
+    #[test]
+    fn property_length_overflow_ends_the_walk()
+    {
+        let mut blob = tree(None, |b| cpu_node(b, b"cpu@0", 0, &[]));
+        // The first FDT_PROP token in the struct block is followed by its
+        // length cell; a length that overflows the offset must end the walk
+        // with the results collected before it, not panic.
+        let structs = 40..blob.len();
+        let prop = structs
+            .step_by(4)
+            .find(|&i| u32::from_be_bytes(blob[i..i + 4].try_into().unwrap()) == FDT_PROP)
+            .expect("the tree has a property");
+        blob[prop + 4..prop + 8].copy_from_slice(&u32::MAX.to_be_bytes());
+        // SAFETY: blob is a valid in-memory FDT built by FdtBuilder.
+        let (count, _) = unsafe { parse_cpu_count(blob.as_ptr() as u64) };
+        assert_eq!(count, 0);
+        assert_eq!(hart_caps(&blob), (0, 0));
     }
 
     #[test]

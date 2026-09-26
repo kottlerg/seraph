@@ -141,6 +141,18 @@ trusted not to map what it has retyped away; the kernel does not yet enforce
 that boundary ([#433](https://github.com/kottlerg/seraph/issues/433)). Until
 it does, the class (a) claim holds only under that trust.
 
+Memory the bootloader used is a related surface, whether it is donated
+through `reclaim_ranges` or returned by the memory map as usable and drained
+at Phase 7. The `BootInfo` page is scrubbed of the seed and the two KASLR
+bases in Phase 5, and the AP trampoline page is zeroed in Phase 8 before its
+late-reclaim cap is minted, because its parameter block carried the AP entry
+point and idle-stack VAs ([initialization.md](initialization.md) § Phase 5
+and § Phase 8). The bootloader's transient page-table frames (a
+`reclaim_ranges` entry) and the UEFI stack it ran on (BootServicesData,
+drained at Phase 7) still reach userspace unzeroed and encode the slid
+layout; closing that is
+[#439](https://github.com/kottlerg/seraph/issues/439).
+
 ## Kernel console diagnostics
 
 The kernel's `kprint!` / `kprintln!` macros (`console.rs`) and the register-dump,
@@ -150,12 +162,13 @@ These are **not** a userspace-readable data channel: per the console-model contr
 directly and never becomes a client of the userspace serial or framebuffer driver,
 and no IPC channel delivers kernel log output to a userspace process as data. The
 always-on `USERSPACE FAULT` serial dumps print the faulting thread's *own* user
-registers, not kernel addresses. Kernel-pointer console output is therefore an
-operator-console diagnostic outside the KASLR threat model; it must not be routed to
-any userspace-reachable IPC or log channel.
+registers, not kernel addresses. Kernel-pointer console output that reveals nothing
+of the KASLR layout is therefore an operator-console diagnostic outside the KASLR
+threat model; it must not be routed to any userspace-reachable IPC or log channel.
 
 **KASLR values are serial-only.** The randomized kernel image base, direct-map base,
-and slide are secrets whose disclosure defeats KASLR, and they are subject to a
+and slide, and any kernel virtual address derived from them (an image VA or a
+direct-map VA), are secrets whose disclosure defeats KASLR, and they are subject to a
 tighter rule than other kernel-pointer diagnostics. `kprintln!` mirrors to the
 framebuffer, and although the kernel writes that framebuffer directly (not as a driver
 client), the framebuffer *memory* is later handed to the userspace framebuffer driver,
@@ -163,8 +176,14 @@ which can read the pixels back — so a KASLR value printed via `kprintln!` beco
 userspace-recoverable. These values must be emitted **only** via the serial-only path
 (`kprintln_serial!` / `console::serial_write_fmt`), never `kprintln!`, and never
 through any IPC or log channel. The Phase-1 KASLR report prints an address-free status
-line via `kprintln!` and the slide/bases only via `kprintln_serial!`; the bootloader's
-console (which also mirrors to the framebuffer) prints only the opaque `kaslr_flags`.
+line via `kprintln!` and the slide/bases only via `kprintln_serial!`; the Phase-9
+init-thread report prints the thread id and priority on one `kprintln!` line and init's
+kernel stack top (a direct-map VA) on a separate `kprintln_serial!` line; the
+bootloader's console (which also mirrors to the framebuffer) prints only the opaque
+`kaslr_flags`. The register-dump and `KERNEL EXCEPTION` paths precede a halt, so what
+they print never reaches a running userspace. The non-fatal watchdog dump still prints
+direct-map TCB and endpoint pointers via `kprintln!`; closing that is
+[#440](https://github.com/kottlerg/seraph/issues/440).
 
 ## Maintaining this inventory
 

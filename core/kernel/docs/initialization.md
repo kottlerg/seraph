@@ -47,14 +47,20 @@ instruction is used in a loop to handle spurious wakeups.
      framebuffer initialisation same as x86-64 if present
 2. Emit a startup banner identifying the kernel and the protocol version
 3. Emit: CPU architecture identifier and core count if detectable at this stage
+4. Report the KASLR layout, then run the platform feature gate
+   (arch::current::cpu::verify_baseline): refuse hardware missing a required
+   baseline feature with a diagnostic, before any subsystem that assumes the
+   baseline runs (see docs/platform-requirements.md)
 ```
 
 The early console is allocation-free and output-only.
 
 **Failure mode:** If no output device is found, initialisation continues silently.
-This is not fatal — a headless system is valid.
+This is not fatal — a headless system is valid. A missing required feature halts
+with a descriptive message.
 
-**Completion criterion:** `console::init()` has returned.
+**Completion criterion:** `console::init()` has returned and `verify_baseline`
+has accepted the platform.
 
 ---
 
@@ -163,7 +169,7 @@ Emit "fatal: cannot build kernel page tables (OOM)" and halt.
 4. Allocate per-CPU subsystem storage from the buddy allocator while it still
    holds large contiguous blocks (before the Phase-7 user-cap drain): scheduler
    per-CPU state and idle stacks, and the entropy subsystem's per-CPU CSPRNGs,
-   central pool, and jitter accumulators (see entropy.md)
+   central pool, jitter accumulators, and self-test sample slab (see entropy.md)
 ```
 
 **Failure mode:** a failed per-CPU storage allocation halts the kernel.
@@ -222,14 +228,15 @@ Architecture-specific hardware initialization; x86-64 and RISC-V diverge here.
 ```
 
 After the architecture hardware path, the BSP seeds the entropy pool from the
-hardware RNG (health-gated where present) and boot-time jitter and opens the
-kernel draw API; without a hardware RNG (RISC-V under default firmware) this
-degrades to jitter only. See [entropy.md](entropy.md).
+firmware boot seed in `BootInfo`, the hardware RNG (health-gated where present),
+and boot-time jitter, and opens the kernel draw API; with neither a firmware
+seed nor a hardware RNG this degrades to jitter only. The BSP reads the seed in
+place from the `BootInfo` page (no kernel-side copy is made), then scrubs the
+seed, its length, and the two KASLR bases from that page (a Phase-7 reclaim
+range). See [entropy.md](entropy.md).
 
-**Failure mode:** Hardware initialisation failures (e.g. CPUID indicates a required
-feature is absent) halt with a descriptive message. The specific required features
-are checked against constants defined in `arch/x86_64/cpu.rs` and
-`arch/riscv64/cpu.rs`.
+**Failure mode:** Hardware initialisation failures halt with a descriptive
+message. The required-feature baseline itself is checked in Phase 1.
 
 **Completion criterion:** Interrupts are enabled, the preemption timer is running,
 and the syscall entry mechanism is installed.
@@ -238,21 +245,20 @@ and the syscall entry mechanism is installed.
 
 ## Phase 6: Platform Resource Validation
 
-Caches `kernel_mmio` and validates `mmio_apertures` before Phase 7 mints
-capabilities from it.
+Validates `mmio_apertures` before Phase 7 mints capabilities from it
+(`kernel_mmio` was captured into the kernel-local cache in Phase 4).
 
 ```
-1. Copy BootInfo.kernel_mmio into the kernel-local KERNEL_MMIO cache.
-2. If mmio_apertures.count == 0: skip aperture validation, proceed with empty set.
-3. Verify mmio_apertures.entries is non-null (required when count > 0).
-4. Verify the slice falls within boot-provided physical memory:
+1. If mmio_apertures.count == 0: skip aperture validation, proceed with empty set.
+2. Verify mmio_apertures.entries is non-null (required when count > 0).
+3. Verify the slice falls within boot-provided physical memory:
    - The entire range [entries, entries + count * size_of::<MmioAperture>())
      must be within regions the memory map marks as Usable or Loaded.
-5. For each MmioAperture entry:
+4. For each MmioAperture entry:
    - Verify phys_base is page-aligned; skip with warning if not.
    - Verify size > 0 and size is page-aligned; skip with warning if not.
    - Verify phys_base + size does not wrap u64; skip with warning if not.
-6. Emit: "mmio apertures: N validated (M skipped)".
+5. Emit: "mmio apertures: N validated (M skipped)".
 ```
 
 **Failure mode:** Null `entries` when `count > 0`: halt with "fatal:
@@ -260,7 +266,7 @@ mmio_apertures.entries is null with non-zero count". Individual bad
 entries: emit a warning and skip.
 
 **Completion criterion:** The validated aperture list is available to
-Phase 7, and `KERNEL_MMIO` is populated.
+Phase 7.
 
 ---
 
@@ -289,6 +295,12 @@ Phase 7, and `KERNEL_MMIO` is populated.
       right, for init to forward sanctioned SBI extensions and attenuate
       per-consumer copies.
    f. (Thread and process capabilities for init are added in Phase 9)
+
+   Before the drain in step 3a the InitInfo block, init's INIT_STACK_PAGES
+   stack frames, and the kernel page-table pool are reserved from the
+   pristine buddy; the drain then takes the remainder, and the SEED reserve
+   is pinned out of the front of the largest drained block. Phase 9
+   therefore consumes only pages already accounted as kernel-reserved.
 4. Mint reclaimable Memory caps from `BootInfo.reclaim_ranges` via
    `cap::mint_reclaim_memory_caps`:
    - One cap per range with `owns_memory = true` and full byte ledger;
@@ -340,15 +352,17 @@ are excluded because `mint_module_memory_caps` already covers them).
    c. Wait for APS_READY.fetch_add(1) before launching the next AP
       (the Acquire load doubles as the barrier guaranteeing the AP has
       jumped from the trampoline page to its kernel-VA entry)
-5. Tear down the low-VA identity mapping at the trampoline PA via
-   mm::paging::unmap_identity_page (TLB shootdown to all other CPUs).
-6. Mint a late-reclaim Memory cap over the trampoline page via
+5. Run the entropy power-on self-test across all online CPUs: each CPU captured
+   a sample from its generator during bringup, and the BSP now checks per-CPU
+   independence and basic sanity, printing PASS/FAIL (see entropy.md).
+6. Tear down the low-VA identity mapping at the trampoline PA via
+   mm::paging::unmap_identity_page (TLB shootdown to all other CPUs), then
+   zero the page through the direct map: its parameter block carried the
+   AP entry point and idle-stack VAs, which would reveal the layout.
+7. Mint a late-reclaim Memory cap over the trampoline page via
    cap::mint_late_reclaim_memory_caps; the descriptor lands in
    cspace_layout so init sees the cap through the standard CSpace
    handoff in Phase 9.
-7. Run the entropy power-on self-test across all online CPUs: each CPU captured
-   a sample from its generator during bringup, and the BSP now checks per-CPU
-   independence and basic sanity, printing PASS/FAIL (see entropy.md).
 ```
 
 The AP SIPI trampoline page is flagged `RECLAIM_FLAG_LATE` in
@@ -367,8 +381,13 @@ state, so SMP bringup completes within Phase 8 and the trampoline page
 is reclaim-safe by the time Phase 9 consumes `cspace_layout`.
 
 **Failure mode:** Allocation failure for any idle stack or TCB halts with
-"fatal: cannot initialise scheduler". `start_ap` failure for an
-individual AP is logged and skipped (that CPU stays offline).
+"fatal: cannot initialise scheduler". A rejected `start_ap` (riscv64, where
+SBI reports a hart it cannot start), or a zero `BootInfo.ap_trampoline_page`
+with more than one CPU listed, is fatal: every CPU the boot reported is
+assumed online from Phase 8 on (IPI targets, scheduler placement, affinity),
+so a CPU that cannot be started halts the boot with a descriptive message.
+On x86-64 SIPI delivery is unacknowledged, so a listed CPU that never
+answers leaves the BSP waiting at `APS_READY`.
 
 **Completion criterion:** Per-CPU scheduler state and idle threads are
 initialised for all CPUs, every AP has incremented `APS_READY`, the
@@ -412,10 +431,10 @@ calls `sched::enter()`.
         adds it to the physical frame address at translation time
       - Apply permissions from segment.flags (Read → RO, ReadWrite → RW,
         ReadExecute → RX); W^X is enforced (ReadWrite cannot also be executable)
-4. Allocate init's user stack (inlined in `kernel_entry`):
-   a. Allocate INIT_STACK_PAGES (4) frames from the buddy allocator
-      one at a time so each phys address is captured for the reclaim
-      Memory cap minted alongside it
+4. Map init's user stack (inlined in `kernel_entry`):
+   a. Take the INIT_STACK_PAGES (4) frames reserved from the buddy in
+      Phase 7, before the user-cap drain, one at a time so each phys
+      address is captured for the reclaim Memory cap minted alongside it
    b. Zero each frame
    c. Map below the chosen init stack top (`choose_init_layout().init_stack_top`,
       drawn per boot from the init-stack-guard window in `process-layout`;
@@ -445,7 +464,9 @@ calls `sched::enter()`.
 ```
 
 **Implementation notes:**
-- CSpace hand-off (step 5d): `sched::enter()` calls `set_current(init_tcb)` so `current_tcb()` returns the init TCB during init's syscalls; init receives ROOT_CSPACE.
+- CSpace hand-off (step 5d): `sched::enter()` calls `set_current(init_tcb)` so
+  `current_tcb()` returns the init TCB during init's syscalls; init receives
+  ROOT_CSPACE.
 - The x86-64 `switch_and_enter_user` function atomically switches the stack pointer
   BEFORE writing CR3. This is required because the boot stack is identity-mapped in
   PML4 entries 0–255 (the lower half), which are not copied into init's page tables.
@@ -489,18 +510,23 @@ that CPU only; the BSP and other CPUs continue.
 | Phase | Key Action | Failure |
 |---|---|---|
 | 0 | Validate BootInfo version | Silent halt |
-| 1 | Early console | Non-fatal (continues silently) |
+| 1 | Early console; platform feature gate | Halt: missing required baseline feature (no console is non-fatal) |
 | 2 | Buddy allocator from memory map | Halt: no usable RAM |
 | 3 | Kernel page tables + direct map | Halt: OOM during PT construction |
 | 4 | Typed-memory cap surface; per-CPU storage | Halt: per-CPU storage allocation failed |
-| 5 | CPU hardware (IDT/GDT/TSS/stvec); seed entropy pool | Halt: missing required feature |
+| 5 | CPU hardware (IDT/GDT/TSS/stvec); seed entropy pool | Halt: hardware initialisation failure |
 | 6 | Platform resource validation | Halt if entries pointer is null with non-zero count; bad entries skipped |
 | 7 | Capability system + root CSpace | Halt: OOM |
-| 8 | Scheduler + idle threads, SMP bringup, AP trampoline reclaim, entropy self-test | Halt: OOM (idle stack/TCB); start_ap failure per CPU is logged and skipped |
+| 8 | Scheduler + idle threads, SMP bringup, AP trampoline reclaim, entropy self-test | Halt: OOM (idle stack/TCB); rejected start_ap (riscv64); zero ap_trampoline_page with more than one CPU listed. A listed x86-64 CPU that never answers its SIPI leaves the BSP waiting |
 | 9 | Init creation + scheduler entry (user mode) | Halt: invalid InitImage or OOM |
 
 ---
 
 ## Summarized By
 
-[kernel/README.md](../README.md)
+[kernel/README.md](../README.md), [docs/bootstrap.md](../../../docs/bootstrap.md),
+[docs/memory-model.md](../../../docs/memory-model.md),
+[docs/userspace-memory-model.md](../../../docs/userspace-memory-model.md),
+[cross-boundary-disclosure.md](cross-boundary-disclosure.md),
+[boot/docs/boot-flow.md](../../boot/docs/boot-flow.md),
+[boot/docs/memory-map.md](../../boot/docs/memory-map.md)

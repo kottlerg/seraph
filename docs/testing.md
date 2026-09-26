@@ -304,9 +304,12 @@ Fixed per CI run: vCPU count (4), guest memory (512 MiB), device set
 on x86_64; CI boots headless, so no framebuffer), filesystem (FAT), riscv64
 paging mode (sv48 — per-mode runs via `cargo xtask run --riscv-mmu sv39|sv57`
 are manual, same posture as CPU-count variations). The `virtio-rng` device is
-the KASLR boot-entropy source: the firmware's RNG driver binds it and exposes
-`EFI_RNG_PROTOCOL`, which the bootloader draws from (on riscv64 it is the only
-such source).
+a boot-entropy source for the pool seed and KASLR: the firmware's RNG driver
+binds it and exposes `EFI_RNG_PROTOCOL`, which the bootloader draws from (OVMF
+also backs the protocol with RDRAND on x86_64; on riscv64 the device is the
+only firmware source under the EDK2 firmware CI boots, and the pool mixes
+jitter besides; see
+[core/kernel/docs/entropy.md](../core/kernel/docs/entropy.md)).
 A device or filesystem joining the default boot set joins the canonical
 cells automatically; variants belong to the tiers below.
 
@@ -320,8 +323,9 @@ cells automatically; variants belong to the tiers below.
 65-vCPU guest is a ~16× thread oversubscription and a 512-vCPU guest is
 infeasible there. High `-smp` coverage is local by design, not an
 oversight. The runs below are procedurally REQUIRED for PRs touching the
-listed paths — binding the same way the pre-merge audit agents are, with
-no CI surface.
+listed paths — binding the same way the
+[pre-merge review](conventions.md#branch-and-pr-workflow) is, with no CI
+surface.
 
 ```sh
 # Boundary CPU counts, riscv64 (~70 s per passing run on a 16-core host;
@@ -382,10 +386,11 @@ and `column!()` record and assertion messages carry, which the CI gate's
 boots cover, so none of the local host runs in this section are required for
 it, whatever paths it touches. Source text a build embeds verbatim
 (`include_str!`, `include_bytes!`, `global_asm!` inputs) is build input, not
-comment or Markdown. The CI gate and the pre-merge audit apply unchanged;
+comment or Markdown. The CI gate and the
+[pre-merge review](conventions.md#branch-and-pr-workflow) apply unchanged;
 the PR body MUST state the validated head and that the delta is
-documentation or comments only, and the audit MUST check that against the
-diff.
+documentation or comments only, and the pre-merge review's audit MUST check
+that against the diff.
 
 **Known boundaries**, established empirically (QEMU 11.0.1; update this
 list as the tracking Issues move):
@@ -474,4 +479,11 @@ note in full.
 
 ## Summarized By
 
-[Conventions](conventions.md), [Root README](../README.md), [core/ktest/README.md](../core/ktest/README.md), [services/svcmgr/README.md](../services/svcmgr/README.md), [services/usertest/README.md](../services/usertest/README.md), [programs/terminal/README.md](../programs/terminal/README.md), [programs/shell/README.md](../programs/shell/README.md)
+[Conventions](conventions.md), [Root README](../README.md),
+[core/ktest/README.md](../core/ktest/README.md),
+[services/svcmgr/README.md](../services/svcmgr/README.md),
+[services/usertest/README.md](../services/usertest/README.md),
+[programs/terminal/README.md](../programs/terminal/README.md),
+[programs/shell/README.md](../programs/shell/README.md),
+[core/kernel/docs/entropy.md](../core/kernel/docs/entropy.md),
+[xtask/README.md](../xtask/README.md)

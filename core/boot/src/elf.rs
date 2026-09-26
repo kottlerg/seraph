@@ -36,6 +36,8 @@ use crate::error::BootError;
 // referenced per target arch build.
 #[allow(unused_imports)]
 pub use elf::{EM_RISCV, EM_X86_64};
+// The image kind, consumed by the KASLR layout decision in main.rs.
+pub use elf::ElfKind;
 
 // ── Output types ──────────────────────────────────────────────────────────────
 
@@ -77,8 +79,9 @@ pub struct KernelInfo
     pub segments: [LoadedSegment; MAX_LOAD_SEGMENTS],
     /// Number of valid entries in `segments`.
     pub segment_count: usize,
-    /// Image is `ET_DYN` (static-PIE) and accepts a nonzero KASLR slide.
-    pub is_pie: bool,
+    /// Object-file type: `Dyn` (static-PIE) accepts a nonzero KASLR slide,
+    /// `Exec` is pinned at its link addresses.
+    pub kind: elf::ElfKind,
     /// Physical address of the `.rela.dyn` table within the copied span;
     /// 0 when the image has no relocation table.
     pub rela_phys: u64,
@@ -358,7 +361,7 @@ pub unsafe fn load_kernel(
         entry_virtual: elf::entry_point(ehdr),
         segments,
         segment_count,
-        is_pie: matches!(kind, elf::ElfKind::Dyn),
+        kind,
         rela_phys,
         rela_size,
     })
@@ -390,7 +393,7 @@ pub unsafe fn relocate_kernel(
     expected_machine: u16,
 ) -> Result<(), BootError>
 {
-    if !info.is_pie
+    if info.kind == elf::ElfKind::Exec
     {
         if slide != 0
         {

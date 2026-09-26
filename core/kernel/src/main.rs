@@ -6,7 +6,7 @@
 //! Seraph microkernel — kernel entry point.
 //!
 //! Receives control from the bootloader after page tables are installed and
-//! UEFI boot services have exited. See `boot/docs/kernel-handoff.md` for the
+//! UEFI boot services have exited. See `core/boot/docs/kernel-handoff.md` for the
 //! CPU-state contract and the `abi/boot-protocol` crate for the `BootInfo`
 //! layout.
 //!
@@ -15,9 +15,10 @@
 //! - Phase 1: initialize early console (serial + framebuffer); emit startup banner.
 //! - Phase 2: parse memory map, populate buddy frame allocator.
 //! - Phase 3: install kernel page tables (direct physical map + W^X image).
-//! - Phase 4: typed-memory cap surface (no `GlobalAlloc`; bodies sourced from caps).
+//! - Phase 4: typed-memory cap surface (no `GlobalAlloc`; bodies sourced from caps);
+//!   cache `kernel_mmio` for Phase 5.
 //! - Phase 5: architecture hardware init (GDT/IDT/APIC or stvec/PLIC, timer, syscall).
-//! - Phase 6: cache `kernel_mmio` and validate `mmio_apertures` slice before capability minting.
+//! - Phase 6: validate the `mmio_apertures` slice before capability minting.
 //! - Phase 7: initialise capability subsystem; mint root `CSpace` with initial hardware caps;
 //!   mint reclaimable Memory caps over bootloader scratch pages (`BootInfo`,
 //!   descriptor arrays, transient PT frames) so they flow to userspace via the
@@ -63,12 +64,6 @@ mod syscall;
 mod uaccess;
 mod validate;
 
-/// Kernel entry point.
-///
-/// Called by the bootloader with CPU state per `boot/docs/kernel-handoff.md`.
-/// `boot_info` is the physical address of a populated [`BootInfo`] structure,
-/// accessible before the kernel's own page tables are established because the
-/// bootloader identity-maps the `BootInfo` region.
 /// Report the KASLR layout at Phase 1.
 ///
 /// A framebuffer-safe summary line (no addresses — the console mirrors to the
@@ -106,6 +101,10 @@ fn report_kaslr(flags: u32, image_base: u64, dm_base: u64)
     {
         kprintln!("kaslr: image randomized ({source})");
     }
+    else if flags & (KASLR_ENTROPY_FW_RNG | KASLR_ENTROPY_DTB_SEED) != 0
+    {
+        kprintln!("kaslr: image at link base (fixed image; {source})");
+    }
     else
     {
         kprintln!("kaslr: image at link base (no boot entropy)");
@@ -129,14 +128,14 @@ fn report_kaslr(flags: u32, image_base: u64, dm_base: u64)
     let slide = image_base.wrapping_sub(link_base);
     kprintln_serial!("kaslr: slide={slide:#x} image_base={image_base:#x} dm_base={dm_base:#x}");
 
-    // Invariants (checked on every debug boot): the IMAGE_RANDOMIZED flag
-    // agrees with a nonzero slide, the slide is 2 MiB-aligned, and the
-    // direct-map base is 1 GiB-aligned. Production placement is enforced by
-    // validate_boot_info / init_paging_mode; these catch a flag/layout drift.
-    debug_assert_eq!(
-        flags & KASLR_IMAGE_RANDOMIZED != 0,
-        slide != 0,
-        "KASLR_IMAGE_RANDOMIZED flag disagrees with the applied slide"
+    // Invariants (checked on every debug boot): a nonzero slide implies the
+    // IMAGE_RANDOMIZED flag (a randomized draw may still select slide 0), the
+    // slide is 2 MiB-aligned, and the direct-map base is 1 GiB-aligned.
+    // Production placement is enforced by validate_boot_info /
+    // init_paging_mode; these catch a flag/layout drift.
+    debug_assert!(
+        slide == 0 || flags & KASLR_IMAGE_RANDOMIZED != 0,
+        "nonzero slide without the KASLR_IMAGE_RANDOMIZED flag"
     );
     debug_assert_eq!(
         slide % (2 * 1024 * 1024),
@@ -154,13 +153,20 @@ fn report_kaslr(flags: u32, image_base: u64, dm_base: u64)
 #[cfg(test)]
 fn report_kaslr(_flags: u32, _image_base: u64, _dm_base: u64) {}
 
+/// Kernel entry point.
+///
+/// Called by the bootloader with CPU state per `core/boot/docs/kernel-handoff.md`.
+/// `boot_info` is the physical address of a populated [`BootInfo`] structure,
+/// accessible before the kernel's own page tables are established because the
+/// bootloader identity-maps the `BootInfo` region.
 // too_many_lines: kernel_entry is the single-entry boot sequence; splitting it would
 // obscure the sequential phase structure without reducing actual complexity.
 // not_unsafe_ptr_arg_deref: boot_info is validated (null + alignment) before deref;
 // the function is `extern "C"` and cannot be marked unsafe per the ABI contract.
 // needless_range_loop/cast_possible_truncation: cpu_idx loop uses the index directly
 // as both slice index and CPU ID; Seraph never has > 2^32 CPUs.
-#[unsafe(no_mangle)]
+// similar_names: the boot_cpu_count/boot_cpu_ids and kaslr_image_base/kaslr_dm_base
+// pairs are the BootInfo field names; renaming them would hide the correspondence.
 #[allow(
     clippy::too_many_lines,
     clippy::not_unsafe_ptr_arg_deref,
@@ -168,6 +174,7 @@ fn report_kaslr(_flags: u32, _image_base: u64, _dm_base: u64) {}
     clippy::cast_possible_truncation,
     clippy::similar_names
 )]
+#[unsafe(no_mangle)]
 pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
 {
     // ── Phase 0: validate BootInfo ──────────────────────────────────────────
@@ -197,8 +204,6 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
     let boot_cpu_ids = info.cpu_ids;
     let trampoline_pa = info.ap_trampoline_page;
     let init_image = info.init_image; // InitImage is Copy
-    let boot_entropy_seed = info.boot_entropy_seed;
-    let boot_entropy_len = info.boot_entropy_len;
     // KASLR: copy the status flags and the slid/randomized bases out of the
     // donated BootInfo page before Phase 5 scrubs the two base fields. The
     // bases are secrets, so they only ever reach the serial-only console.
@@ -307,8 +312,6 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
             boot_cpu_ids,
             trampoline_pa,
             init_image,
-            boot_entropy_seed,
-            boot_entropy_len,
             vmgenid_paddr,
             fb_phys,
             allocator,
@@ -326,30 +329,40 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
 /// `#[inline(never)]` is load-bearing: see the comment in `kernel_entry`
 /// at the rebase site. The body runs phase-3 console rebasing through
 /// phase-9 `init` launch and the scheduler hand-off.
-#[cfg(not(test))]
-#[inline(never)]
+///
+/// # Safety
+/// Phases 0 to 3 have completed: `boot_info_phys` was validated in Phase 0,
+/// the kernel page tables and the direct physical map are active, and the
+/// boot stack has been rebased onto them. The `BootInfo`-derived arguments
+/// were copied or validated from that `BootInfo` before Phase 3; `allocator`
+/// is the live frame allocator initialised in Phase 2. Called exactly once,
+/// from the boot thread, and never returns.
+// too_many_arguments: the boot state read out of BootInfo before Phase 3 must
+// cross the `#[inline(never)]` boundary as explicit arguments.
+// too_many_lines, cast_possible_truncation, needless_range_loop, similar_names:
+// the same rationale as `kernel_entry`, whose body this continues.
+// large_types_passed_by_value: boot_cpu_ids ([u32; 512] = 2 KiB) and init_image
+// (272 B) cross the by-value/by-reference threshold. The `#[inline(never)]`
+// boundary is what defeats the cross-rebase hoist; the by-value signature is
+// incidental — the ABI passes both via hidden-pointer and emits an explicit
+// memcpy into the callee's stack frame either way. Single boot-path copy;
+// nothing on the hot path.
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
     clippy::cast_possible_truncation,
     clippy::needless_range_loop,
     clippy::similar_names,
-    // boot_cpu_ids ([u32; 512] = 2 KiB) and init_image (272 B) cross
-    // the by-value/by-reference threshold. The `#[inline(never)]`
-    // boundary is what defeats the cross-rebase hoist; the by-value
-    // signature is incidental — the ABI passes both via hidden-pointer
-    // and emits an explicit memcpy into the callee's stack frame either
-    // way. Single boot-path copy; nothing on the hot path.
     clippy::large_types_passed_by_value
 )]
+#[cfg(not(test))]
+#[inline(never)]
 unsafe fn kernel_entry_post_rebase(
     boot_info_phys: u64,
     boot_cpu_count: u32,
     boot_cpu_ids: [u32; boot_protocol::MAX_CPUS],
     trampoline_pa: u64,
     init_image: boot_protocol::InitImage,
-    mut boot_entropy_seed: [u8; 32],
-    boot_entropy_len: u32,
     vmgenid_paddr: u64,
     fb_phys: u64,
     allocator: &'static mut mm::buddy::BuddyAllocator,
@@ -404,10 +417,10 @@ unsafe fn kernel_entry_post_rebase(
     // tables with dynamically sized allocations.
     sched::init_storage(boot_cpu_count, allocator);
 
-    // Allocate entropy subsystem per-CPU storage (CSPRNGs, jitter accumulators)
-    // and the central pool from the buddy allocator, alongside the scheduler
-    // slabs and for the same reason: before the Phase-7 user-cap drain, while
-    // the buddy still holds large contiguous blocks.
+    // Allocate entropy subsystem storage (per-CPU CSPRNGs, jitter accumulators,
+    // self-test samples, and the central pool) from the buddy allocator,
+    // alongside the scheduler slabs and for the same reason: before the Phase-7
+    // user-cap drain, while the buddy still holds large contiguous blocks.
     #[cfg(not(test))]
     entropy::init_storage(boot_cpu_count, allocator);
 
@@ -477,26 +490,31 @@ unsafe fn kernel_entry_post_rebase(
     // counter is live for jitter samples.
     #[cfg(not(test))]
     {
-        // Clamp defensively: the Phase-0 validator checks only the protocol
-        // version, not this length field.
-        let n = (boot_entropy_len as usize).min(boot_entropy_seed.len());
-        entropy::init(&boot_entropy_seed[..n], vmgenid_paddr);
-
-        // Scrub the KASLR/entropy secrets once consumed. The BootInfo page is
-        // a reclaim range donated to userspace at Phase 7 (memmgr re-hands its
-        // frames without zeroing), so none of them may survive there; the
-        // local seed copy is wiped too. The pool retains the entropy — the
-        // seed itself is secret (it feeds key/nonce generation), and the
-        // randomized kernel image and direct-map bases defeat KASLR if
-        // disclosed. All Phase-3 consumers of the two bases have run; later
-        // phases read only layout-free BootInfo fields.
-        boot_entropy_seed.fill(0);
+        // The seed and its length are read through the direct map rather
+        // than copied out in `kernel_entry`, so the BootInfo page holds the
+        // only copy and one scrub covers it. The length is clamped because
+        // the Phase-0 validator does not check it.
+        let bi = mm::paging::phys_to_virt(boot_info_phys) as *mut BootInfo;
         // SAFETY: the direct map covers all RAM since Phase 3; boot_info_phys
         // was validated in Phase 0. Single-threaded boot, and no live BootInfo
-        // reference aliases the page at this point. Volatile stores so the
-        // scrub of this donated page cannot be elided as a dead store.
+        // reference aliases the page; the shared borrow taken here ends before
+        // the scrub below writes through `bi`.
         unsafe {
-            let bi = mm::paging::phys_to_virt(boot_info_phys) as *mut BootInfo;
+            let seed: &[u8; 32] = &*core::ptr::addr_of!((*bi).boot_entropy_seed);
+            let n = ((*bi).boot_entropy_len as usize).min(seed.len());
+            entropy::init(&seed[..n], vmgenid_paddr);
+        }
+
+        // Scrub the KASLR/entropy secrets once consumed. The BootInfo page is a
+        // reclaim range donated to userspace at Phase 7 (memmgr re-hands its
+        // frames without zeroing), so none of them may survive there. The pool
+        // retains the entropy — the seed itself is secret (it feeds key/nonce
+        // generation), and the randomized kernel image and direct-map bases
+        // defeat KASLR if disclosed. All Phase-3 consumers of the two bases
+        // have run; later phases read only layout-free BootInfo fields.
+        // SAFETY: as above. Volatile stores so the scrub of this donated page
+        // cannot be elided as a dead store.
+        unsafe {
             core::ptr::write_volatile(core::ptr::addr_of_mut!((*bi).boot_entropy_seed), [0u8; 32]);
             core::ptr::write_volatile(core::ptr::addr_of_mut!((*bi).boot_entropy_len), 0u32);
             core::ptr::write_volatile(core::ptr::addr_of_mut!((*bi).kernel_virtual_base), 0u64);
@@ -514,8 +532,8 @@ unsafe fn kernel_entry_post_rebase(
 
     // ── Phase 6: platform resource validation ─────────────────────────────────
     // Validate mmio_apertures from BootInfo before Phase 7 mints caps from
-    // them. (kernel_mmio was cached earlier, after Phase 4, so Phase 5 arch
-    // init can read it.)
+    // them. (kernel_mmio was cached in Phase 4 so Phase 5 arch init can
+    // read it.)
     kprintln!("Phase 6: Platform Resource Validation");
     // SAFETY: single-threaded boot Phase 6; first and only call.
     let mmio_apertures = unsafe { platform::validate_mmio_apertures(boot_info_phys) };
@@ -523,7 +541,7 @@ unsafe fn kernel_entry_post_rebase(
     // ── Phase 7: capability system ─────────────────────────────────────────────
     // Initialises the root CSpace and mints initial capabilities for all
     // boot-provided hardware resources. `cspace_layout` is held `mut` so
-    // the post-SMP late-reclaim pass (after Phase 8) can append the AP
+    // the late-reclaim pass at the end of Phase 8 can append the AP
     // trampoline cap to its descriptor table before Phase 9 consumes it.
     kprintln!("Phase 7: Capability System");
     let mut cspace_layout = cap::init_capability_system(mmio_apertures, boot_info_phys);
@@ -562,7 +580,9 @@ unsafe fn kernel_entry_post_rebase(
         {
             if trampoline_pa == 0
             {
-                kprintln!("smp: no AP trampoline page — SMP disabled");
+                // A listed CPU that cannot be started is fatal
+                // (core/kernel/docs/initialization.md § Phase 8).
+                fatal("smp: no AP trampoline page; listed CPUs cannot be brought online");
             }
             else
             {
@@ -596,10 +616,14 @@ unsafe fn kernel_entry_post_rebase(
                             stack_top,
                         )
                     };
+                    // A listed CPU that cannot be started is fatal
+                    // (core/kernel/docs/initialization.md § Phase 8); on x86-64
+                    // SIPI delivery is unacknowledged, so `start_ap` cannot
+                    // report one and a CPU that never answers leaves the wait
+                    // below spinning.
                     if !ok
                     {
-                        kprintln!("smp: start_ap(cpu={}) failed", cpu_idx);
-                        continue;
+                        fatal("smp: start_ap failed; a listed CPU cannot be brought online");
                     }
 
                     while APS_READY.load(Ordering::Acquire) < cpu_idx as u32
@@ -630,11 +654,23 @@ unsafe fn kernel_entry_post_rebase(
     #[cfg(not(test))]
     if trampoline_pa != 0
     {
-        // SAFETY: APS_READY-observed Acquire above guarantees no AP is
-        // still inside the trampoline page; preempt discipline is handled
-        // by `unmap_identity_page` internally.
+        // SAFETY: the Acquire wait above observed `APS_READY` reach the AP
+        // count, so no AP is still inside the trampoline page; preempt
+        // discipline is handled by `unmap_identity_page` internally.
         unsafe {
             mm::paging::unmap_identity_page(trampoline_pa);
+        }
+        // Zero the page before its late-reclaim cap is minted; its parameter
+        // block carried kernel VAs (core/kernel/docs/initialization.md § Phase 8).
+        let page = mm::paging::phys_to_virt(trampoline_pa) as *mut u8;
+        // SAFETY: direct map covers the page; no AP is inside it (the started
+        // count observed above) and its identity mapping is gone. Volatile so
+        // the scrub of a page never read again by the kernel is not elided.
+        unsafe {
+            for i in 0..mm::PAGE_SIZE
+            {
+                core::ptr::write_volatile(page.add(i), 0);
+            }
         }
         // Re-resolve `BootInfo` through the direct physical map. The
         // original `info` reference points to the bootloader's
@@ -696,6 +732,8 @@ unsafe fn kernel_entry_post_rebase(
         // (TEMP_MAP_BASE + ELF_PAGE_TEMP_VA scratch) and `sys_mmio_map` for
         // init's own MMIO (the riscv64 serial UART, one page). 16 pool
         // pages cover that footprint with margin.
+        // items_after_statements: the constant is documented by the comment
+        // above, next to its only use.
         #[allow(clippy::items_after_statements)]
         const INIT_ASPACE_PAGES: u64 = 18;
         // SAFETY: SEED installed in Phase 7; single-threaded Phase 9.
@@ -863,6 +901,8 @@ unsafe fn kernel_entry_post_rebase(
             };
             /// Resolve a byte offset within the `InitInfo` region to a writable
             /// direct-map pointer, handling page boundaries.
+            // items_after_statements: the helper is scoped to this block and
+            // has no other use.
             #[allow(clippy::items_after_statements)]
             fn info_ptr(page_ptrs: &[*mut u8], offset: usize) -> *mut u8
             {
@@ -968,6 +1008,7 @@ unsafe fn kernel_entry_post_rebase(
 
             // Write InitInfo header (always fits in first page).
             // SAFETY: info_base is page-aligned; InitInfo fits in one page.
+            // cast_ptr_alignment: page alignment (4096) exceeds InitInfo alignment (8).
             #[allow(clippy::cast_ptr_alignment)]
             unsafe {
                 core::ptr::write(info_base.cast::<InitInfo>(), info);
@@ -1041,6 +1082,7 @@ unsafe fn kernel_entry_post_rebase(
             // referential cap slot range.
             // SAFETY: info_base mapped writable through the direct map;
             // header lives at offset 0; single-threaded boot.
+            // cast_ptr_alignment: page alignment (4096) exceeds InitInfo alignment (8).
             #[allow(clippy::cast_ptr_alignment)]
             unsafe {
                 let info_ptr = info_base.cast::<InitInfo>();
@@ -1148,6 +1190,7 @@ unsafe fn kernel_entry_post_rebase(
         // Patch InitInfo with the just-minted stack cap slot range.
         // SAFETY: info_page_virt mapped writable through the direct map;
         // header at offset 0; single-threaded boot.
+        // cast_ptr_alignment: page alignment (4096) exceeds InitInfo alignment (8).
         #[allow(clippy::cast_ptr_alignment)]
         unsafe {
             let info_ptr = info_page_virt.cast::<init_protocol::InitInfo>();
@@ -1163,6 +1206,7 @@ unsafe fn kernel_entry_post_rebase(
         let kernel_reserved = system_ram.saturating_sub(cap::owns_memory_minted_bytes());
         // SAFETY: info_page_virt mapped writable through the direct map;
         // header at offset 0; single-threaded boot.
+        // cast_ptr_alignment: page alignment (4096) exceeds InitInfo alignment (8).
         #[allow(clippy::cast_ptr_alignment)]
         unsafe {
             let info_ptr = info_page_virt.cast::<init_protocol::InitInfo>();
@@ -1197,6 +1241,8 @@ unsafe fn kernel_entry_post_rebase(
         //   page 4   — ThreadObject (24 B) followed by ThreadControlBlock
         //   page 5   — per-thread FPU/SIMD/V save area
         // Mirrors the layout established in `sys_cap_create_thread`.
+        // items_after_statements: the constant is documented by the comment
+        // above, next to its only use.
         #[allow(clippy::items_after_statements)]
         const INIT_THREAD_PAGES: u64 = (sched::KERNEL_STACK_PAGES + 2) as u64;
         let (init_thread_obj_nn, init_kstack_top, init_tcb) = {
@@ -1373,7 +1419,7 @@ unsafe fn kernel_entry_post_rebase(
         // SAFETY: info_page_virt points to a kernel-writable page (mapped
         // read-only in userspace but writable via the direct physical map);
         // single-threaded boot; the write is within the InitInfo struct bounds.
-        // cast_ptr_alignment: page alignment (4096) exceeds InitInfo alignment (4).
+        // cast_ptr_alignment: page alignment (4096) exceeds InitInfo alignment (8).
         #[allow(clippy::cast_ptr_alignment)]
         unsafe {
             let info_ptr = info_page_virt.cast::<init_protocol::InitInfo>();
@@ -1408,17 +1454,18 @@ unsafe fn kernel_entry_post_rebase(
             debug_assert!(linked, "boot: init enqueue skipped");
         }
 
-        kprintln!(
-            "init: TCB tid=1 priority={} stack={:#x}",
-            sched::INIT_PRIORITY,
-            init_kstack_top
-        );
+        kprintln!("init: TCB tid=1 priority={}", sched::INIT_PRIORITY);
+        // The stack top is a direct-map VA: serial-only, like the KASLR bases
+        // (core/kernel/docs/cross-boundary-disclosure.md § Kernel console
+        // diagnostics).
+        kprintln_serial!("init: kernel stack top={init_kstack_top:#x}");
 
         // ── Boot-handover ledger ────────────────────────────────────────────
         // Sum MemoryObject.available_bytes across every Memory cap in init's
-        // CSpace plus SEED's residual reserve. After 4b, SEED is the kernel's
-        // ongoing body source for split-derived wrappers and per-thread IOPB
-        // pages; printing both makes the invariant
+        // CSpace plus SEED's residual reserve. After Phase 7 installs
+        // SEED_MEMORY, SEED is the kernel's ongoing body source for
+        // split-derived wrappers and per-thread IOPB pages; printing both
+        // makes the invariant
         //
         //   total_RAM == kernel_static_image_size + Σ per-CPU kstack pages
         //                + SEED_available + Σ caps_available

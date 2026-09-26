@@ -1,8 +1,8 @@
 # Kernel Entropy Subsystem
 
-Kernel-internal randomness: a multi-source entropy pool feeding per-CPU
-forward-secure CSPRNGs, with a small draw API, hardware-source health gating,
-and a boot-time power-on self-test.
+Kernel randomness for kernel consumers and `SYS_GETRANDOM`: a multi-source
+entropy pool feeding per-CPU forward-secure CSPRNGs, with a small draw API,
+hardware-source health gating, and a boot-time power-on self-test.
 
 ---
 
@@ -10,9 +10,9 @@ and a boot-time power-on self-test.
 
 This subsystem is the kernel's sole source of randomness, for both
 kernel-internal consumers and the userspace `SYS_GETRANDOM` syscall (see
-`docs/syscalls.md`). Kernel consumers call `fill_bytes` directly; userspace
-draws through the syscall, which fills the caller's buffer from the same
-per-CPU generators. Userspace holds **no** generator state of its own — every
+[docs/syscalls.md](syscalls.md)). Kernel consumers call `fill_bytes` directly;
+userspace draws through the syscall, which fills the caller's buffer from the
+same per-CPU generators. Userspace holds **no** generator state of its own — every
 draw advances the kernel generator — so the two surfaces share the per-CPU
 generators but no userspace-resident secret.
 
@@ -49,21 +49,27 @@ mixed with timing jitter before any byte is drawn.
 
 Three source classes are mixed into the pool:
 
-- **Firmware boot seed** — a conditioned random draw the bootloader obtains from
-  UEFI `EFI_RNG_PROTOCOL` while boot services are live and passes to the kernel
-  in `BootInfo` (`boot_entropy_seed` / `boot_entropy_len`, boot protocol v9).
-  Arch-neutral mechanism; already conditioned (a DRBG output), so it is absorbed
-  directly rather than health-gated. Present only where the firmware implements
-  the protocol — x86-64 OVMF does (RDRAND-backed); the current riscv64 EDK2 does
-  not, so `boot_entropy_len == 0` there and riscv64 falls back to jitter (see
-  "Boot-time entropy").
+- **Firmware boot seed** — a conditioned draw the bootloader passes to the
+  kernel in [`BootInfo`](../../../abi/boot-protocol/src/lib.rs)
+  (`boot_entropy_seed` / `boot_entropy_len`, boot protocol v9): UEFI
+  `EFI_RNG_PROTOCOL` output (a DRBG output) or, for firmware that delivers a
+  DTB, the firmware-supplied bytes of `/chosen/rng-seed`;
+  [boot-flow.md](../../boot/docs/boot-flow.md) step 5c owns the draw.
+  Pre-conditioned by its source, so it is absorbed directly rather than
+  health-gated. The protocol is present wherever the firmware implements it or a
+  firmware RNG driver binds a device that exposes it — x86-64 OVMF natively
+  (RDRAND-backed), riscv64 EDK2 through `VirtioRngDxe` with the default boot
+  set's `virtio-rng`; without a seed from either origin, `boot_entropy_len == 0`
+  and the pool seeds from the remaining sources below (jitter only where no
+  hardware RNG is present; see "Boot-time entropy").
 - **Hardware RNG** — drawn through the `arch::current::entropy` contract
-  (`hw_rng_available`, `hw_rng_u64`). On x86-64 this is RDSEED (a conditioned,
-  seed-grade source, preferred) with an RDRAND fallback, CPUID-gated, each with
-  bounded retry on the transient not-ready condition the ISA permits. Hardware
-  output is health-gated (below) before it is trusted. riscv64 has no S-mode
-  hardware RNG — the `Zkr` `seed` CSR is M-mode-owned (`mseccfg.SSEED`) — so
-  `hw_rng_available` is false there.
+  (`hw_rng_available`, `hw_rng_u64`; [arch-interface.md §
+  entropy](arch-interface.md#entropy--archcurrententropy)). On x86-64 this is
+  RDSEED (a conditioned, seed-grade source, preferred) with an RDRAND fallback,
+  CPUID-gated, each with bounded retry on the transient not-ready condition the
+  ISA permits. Hardware output is health-gated (below) before it is trusted.
+  riscv64 has no S-mode hardware RNG — the `Zkr` `seed` CSR is M-mode-owned
+  (`mseccfg.SSEED`) — so `hw_rng_available` is false there.
 - **Timing jitter** — cycle-counter samples (`read_cycle_counter`: TSC on
   x86-64; the `time` CSR on riscv64) taken at distinct interrupt event classes.
   This is the always-available source.
@@ -166,8 +172,9 @@ execution history forks.
   `VGIA` named DWORD holds the linker-patched `etc/vmgenid_guid` blob base;
   the GUID sits 40 bytes in. There is no AML interpreter anywhere in the tree,
   so the generic (AML `ADDR`-evaluating) discovery path is out of scope. The
-  address reaches the kernel as `BootInfo.vmgenid_paddr` (boot protocol v13;
-  zero = absent).
+  address reaches the kernel as
+  [`BootInfo.vmgenid_paddr`](../../../abi/boot-protocol/src/lib.rs) (boot
+  protocol v13; zero = absent).
 - **Detection** is per-draw and per-CPU (`entropy::vmgenid`): each generator
   records the GUID it last reseeded under, and every fill volatile-reads the
   live GUID through the direct map and compares. Because the hypervisor
@@ -217,9 +224,10 @@ which closes the riscv64 boot-entropy hole: the boot log shows
 device is present, riscv64 falls back to jitter only — narrowed continuously at
 runtime by the timer-tick jitter hook, which feeds a fresh sample into each CPU's
 accumulator on every tick (and per device IRQ). The bootloader also keeps a DTB
-`/chosen/rng-seed` reader as a secondary fallback for firmware that *does* deliver
-a DTB (extracted, split first-16-bytes-to-KASLR / rest-to-pool, and scrubbed from
-the userspace-visible blob); it is inactive under QEMU+EDK2.
+`/chosen/rng-seed` reader as a secondary fallback for firmware that delivers a
+DTB, scrubbed from the userspace-visible blob and split between the KASLR word
+and the pool seed as [boot-flow.md](../../boot/docs/boot-flow.md) step 5c
+describes; it is inactive under QEMU+EDK2.
 
 The KASLR draw is kept **separate** from the pool seed: the bootloader draws an
 independent 16-byte `EFI_RNG_PROTOCOL` word for the image slide / direct-map base,
@@ -236,7 +244,8 @@ rather than riding the 64-sample scrape.
 
 The riscv64 *runtime* hardware-RNG path — a virtio-rng/hwrng device owned by a
 userspace driver, the mechanism the RISC-V design intends for lower privilege
-levels to obtain entropy — is also future work, tracked separately.
+levels to obtain entropy — is future work
+([#396](https://github.com/kottlerg/seraph/issues/396)).
 
 TODO: persist a saved seed across boots (read at `init_storage`, rewritten at
 shutdown) as a second mitigation for jitter-only platforms; deferred — it
@@ -260,9 +269,9 @@ subsystem proceeds on jitter alone. Because the hardware RNG is never the sole
 input, a source that passes startup but later degrades still cannot by itself
 determine pool output.
 
-These tests gate the *raw* hardware RNG only. The firmware boot seed is a
-pre-conditioned DRBG output (`EFI_RNG_PROTOCOL`), so it is absorbed directly and
-is not subject to the raw-source tests.
+These tests gate the *raw* hardware RNG only. The boot seed is a pre-conditioned
+DRBG output (`EFI_RNG_PROTOCOL`) or the firmware-supplied bytes of the DTB
+fallback, so it is absorbed directly and is not subject to the raw-source tests.
 
 ## Draw API and consumers
 
@@ -282,9 +291,10 @@ init's image load bias the same way (both Phase 9, boot thread). All run after
 Phase 5 seeding and never in interrupt context. Userspace ASLR (the
 per-process bootstrap-layout, image-bias, heap-base, and reservation-arena
 draws in procmgr/init/`std::sys::seraph`) consumes the same generators through
-`SYS_GETRANDOM`. On riscv64 the pool currently seeds from timing jitter alone
-(#393), so those draws carry the boot-entropy-hole caveat above until a hardware
-source lands. The boot self-test is the API's continuous validator.
+`SYS_GETRANDOM`. Without a firmware boot seed (a riscv64 boot without
+`virtio-rng`, #393) the pool seeds from timing jitter alone and those draws
+carry the boot-entropy-hole caveat above. The boot self-test is the API's
+continuous validator.
 
 ## Boot wiring and lifecycle
 
@@ -323,8 +333,9 @@ source lands. The boot self-test is the API's continuous validator.
   or `entropy: SELFTEST FAIL`; the FAIL marker is matched by the run-parallel
   fail-regex, turning a QEMU run red on either architecture. Validated on
   x86_64 (firmware-seeded — `entropy: seeded from firmware RNG` — since OVMF
-  implements `EFI_RNG_PROTOCOL`) and riscv64 (jitter-only — its current EDK2
-  exposes no RNG protocol).
+  implements `EFI_RNG_PROTOCOL`) and riscv64 (firmware-seeded through
+  `VirtioRngDxe` with the default boot set's `virtio-rng`; jitter-only without
+  it).
 - **Guest reseed coverage**: ktest's
   `entropy::getrandom_reseed_interval_stream` streams 300 draws across the
   256-draw interval on both architectures; svctest's `random-contention`
@@ -334,10 +345,20 @@ source lands. The boot self-test is the API's continuous validator.
   fixed generation GUID, saves the guest via QMP migrate-to-file, restores it
   under a different GUID with `-incoming`, and asserts the kernel's
   `entropy: VM generation change detected` line plus a post-resume
-  interactive liveness round. See `docs/testing.md`.
+  interactive liveness round. See
+  [xtask/README.md § test-vmgenid](../../../xtask/README.md#cargo-xtask-test-vmgenid)
+  and [docs/testing.md](../../../docs/testing.md).
 
 ---
 
 ## Summarized By
 
-[Kernel](../README.md)
+[Kernel](../README.md), [docs/syscalls.md](syscalls.md),
+[docs/arch-interface.md](arch-interface.md),
+[docs/initialization.md](initialization.md),
+[boot/docs/boot-flow.md](../../boot/docs/boot-flow.md),
+[docs/testing.md](../../../docs/testing.md),
+[docs/platform-requirements.md](../../../docs/platform-requirements.md),
+[docs/userspace-memory-model.md](../../../docs/userspace-memory-model.md),
+[docs/cross-boundary-disclosure.md](cross-boundary-disclosure.md),
+[xtask/README.md](../../../xtask/README.md)

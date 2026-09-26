@@ -36,10 +36,12 @@ transfers them to memmgr (derive-twice). From that point on, memmgr is
 the sole userspace authority over RAM frame allocation; the kernel does
 not delegate further to anyone.
 
-The handoff is total. At Phase 7 the kernel reserves its fixed
-contributors (PT-pool seed, idle-thread stacks, the `InitInfo` block,
-init's user stack, the SEED arena) from the pristine buddy, then drains
-**every** remaining page into userspace Memory caps — coalescing
+The handoff is total. By the end of Phase 7 the kernel has taken its
+bounded reserves from the buddy (the Phase 4 per-CPU storage and the Phase
+7 contributors, in the order
+[initialization.md](../core/kernel/docs/initialization.md) § Phase 4 and
+§ Phase 7 give), drains **every** remaining page into userspace Memory
+caps — coalescing
 physically-adjacent drained blocks into the fewest contiguous caps so the
 cap count tracks memory-map fragmentation, not total RAM — and *seals* the
 buddy.
@@ -170,7 +172,11 @@ both architectures; that ceiling is what caps these windows at 21 bits. A creato
 draw fails (a kernel-contract violation once the pool is seeded) logs
 and degrades to the deterministic `DEFAULT_*` addresses, which lie
 outside the windows — the test harnesses' window assertions then fail
-loudly by design. On riscv64 the boot entropy is currently jitter-only
+loudly by design. The default boot on both architectures is
+firmware-seeded through `EFI_RNG_PROTOCOL` (OVMF natively on x86_64; the
+firmware's `VirtioRngDxe` with `virtio-rng` on riscv64); a riscv64 boot
+without that device, under the EDK2 firmware the default boot uses, seeds
+from jitter alone
 ([#393](https://github.com/kottlerg/seraph/issues/393)); see
 [`core/kernel/docs/entropy.md`](../core/kernel/docs/entropy.md) for the
 quality caveat.
@@ -313,4 +319,11 @@ yet implemented), not a kernel feature.
 
 ## Summarized By
 
-[README.md](../README.md), [Memory Model](memory-model.md), [Architecture Overview](architecture.md), [memmgr/README.md](../services/memmgr/README.md), [procmgr/README.md](../services/procmgr/README.md), [ruststd/README.md](../runtime/ruststd/README.md), [process-layout/README.md](../shared/process-layout/README.md)
+[README.md](../README.md), [Memory Model](memory-model.md),
+[Architecture Overview](architecture.md), [memmgr/README.md](../services/memmgr/README.md),
+[procmgr/README.md](../services/procmgr/README.md),
+[ruststd/README.md](../runtime/ruststd/README.md),
+[process-layout/README.md](../shared/process-layout/README.md),
+[Capability Model](capability-model.md), [Process Lifecycle](process-lifecycle.md),
+[memmgr/docs/memory-pool.md](../services/memmgr/docs/memory-pool.md),
+[System Bootstrap](bootstrap.md), [Fault Handling](fault-handling.md)

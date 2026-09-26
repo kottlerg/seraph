@@ -8,7 +8,7 @@
 //! Loads the kernel ELF and init module from the ESP, establishes initial
 //! page tables with W^X enforcement, discovers firmware table addresses,
 //! exits UEFI boot services, populates `BootInfo`, and jumps to the kernel
-//! entry point. See `boot/docs/boot-flow.md` for the step-by-step design.
+//! entry point. See `core/boot/docs/boot-flow.md` for the step-by-step design.
 
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(not(test), no_main)]
@@ -26,7 +26,7 @@ mod memory_map;
 mod paging;
 mod uefi;
 
-use crate::elf::{KernelInfo, load_init, load_kernel};
+use crate::elf::{ElfKind, KernelInfo, load_init, load_kernel};
 use crate::error::BootError;
 use crate::firmware::{FirmwareInfo, discover_firmware};
 use crate::paging::{PageTableBuilder, build_initial_tables};
@@ -43,8 +43,8 @@ use boot_protocol::{
 };
 
 /// Maximum boot modules carried in [`BootInfo::modules`]. Sized to comfortably
-/// cover the current `procmgr, memmgr, devmgr, vfsd, virtio-blk, fatfs` set
-/// plus future additions before the bundle entry count exceeds the array.
+/// cover the current set (`xtask/src/bundle.rs::MODULES`) plus future additions
+/// before the bundle entry count exceeds the array.
 const MAX_MODULES: usize = 16;
 
 /// `\EFI\seraph\kernel` as a NUL-terminated UTF-16 path for
@@ -169,18 +169,21 @@ struct CpuTopology
     cpu_ids: [u32; MAX_CPUS],
 }
 
-/// Conditioned early-boot entropy drawn from UEFI `EFI_RNG_PROTOCOL`.
+/// Conditioned early-boot entropy drawn from UEFI `EFI_RNG_PROTOCOL` or, as a
+/// fallback, from the DTB `/chosen/rng-seed` property.
 ///
-/// `len` is `0` when the firmware exposes no RNG; the kernel then degrades to
-/// timing jitter alone. Produced by [`step5c_fetch_boot_entropy`] while boot
-/// services are live and written into [`BootInfo`] by step 9. The `kaslr`
-/// words are a separate draw feeding the KASLR slide / direct-map base
-/// (#252); `kaslr_available` is false when no RNG source produced them.
+/// `len` is `0` when no source produced a seed; the kernel then seeds from its
+/// remaining sources (see `core/kernel/docs/entropy.md`). Produced by
+/// [`step5c_fetch_boot_entropy`] while boot services are live and written into
+/// [`BootInfo`] by step 9. The `kaslr` words are a separate draw feeding the
+/// KASLR slide / direct-map base (#252); `kaslr_available` is false when no RNG
+/// source produced them.
 struct BootEntropy
 {
     /// Random bytes for the entropy pool; only the first `len` are valid.
     seed: [u8; 32],
-    /// Number of valid leading bytes in `seed` (`0` or `32`).
+    /// Number of valid leading bytes in `seed` (`0..=32`: 32 from the firmware
+    /// RNG, fewer from the DTB fallback).
     len: u32,
     /// Two 64-bit KASLR entropy words: `[0]` picks the image slide, `[1]`
     /// the direct-map base. Valid only when `kaslr_available`.
@@ -190,6 +193,28 @@ struct BootEntropy
     /// KASLR flag identifying the entropy source (0, or a `KASLR_ENTROPY_*`
     /// bit); merged into `BootInfo::kaslr_flags`.
     kaslr_source_flag: u32,
+}
+
+impl BootEntropy
+{
+    /// No seed and no KASLR draw.
+    const NONE: Self = Self {
+        seed: [0u8; 32],
+        len: 0,
+        kaslr: [0u64; 2],
+        kaslr_available: false,
+        kaslr_source_flag: 0,
+    };
+}
+
+/// Whether the `\EFI\seraph\nokaslr` override knob is present on the ESP.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum KaslrOverride
+{
+    /// No knob: the layout follows the entropy draw.
+    Absent,
+    /// The knob is present: both layout dimensions stay deterministic.
+    DisabledByKnob,
 }
 
 /// The KASLR layout the bootloader chose, threaded from
@@ -292,10 +317,12 @@ unsafe fn boot_sequence(image: EfiHandle, st: *mut EfiSystemTable) -> Result<!, 
     unsafe { arch::current::negotiate_paging(ctx.bs, firm.device_tree, cpus.boot_hart_id)? };
     // SAFETY: ctx.bs valid pre-exit.
     let ap_trampoline_phys = unsafe { step5b_alloc_ap_trampoline(&ctx) };
+    let mut boot_entropy = BootEntropy::NONE;
     // SAFETY: ctx.bs valid pre-exit; draws the boot entropy seed while boot
     // services (and thus EFI_RNG_PROTOCOL) are still available; firm.device_tree
-    // is zero or an identity-mapped FDT for the riscv64 rng-seed fallback.
-    let mut boot_entropy = unsafe { step5c_fetch_boot_entropy(&ctx, &firm) };
+    // is zero or an identity-mapped, writable (pre-ExitBootServices) FDT for the
+    // DTB rng-seed fallback's in-place scrub.
+    unsafe { step5c_fetch_boot_entropy(&ctx, &firm, &mut boot_entropy) };
     // Apply the KASLR slide before step 6 maps the segments at their
     // (biased) virtual addresses.
     // SAFETY: kernel.info comes from load_kernel with its span allocation
@@ -342,14 +369,16 @@ unsafe fn boot_sequence(image: EfiHandle, st: *mut EfiSystemTable) -> Result<!, 
     // applied and the direct-map base chosen, so neither the source draw
     // (`boot_entropy.kaslr`) nor the `dm_rand` copy that step 9 consumed
     // (`kaslr.dm_rand`) may linger in BootServicesData that is later reclaimed
-    // to userspace. The pool seed is already in BootInfo, which the kernel
-    // scrubs after absorbing it; the bootloader's own stack copy of that seed
-    // shares the general remanence of UEFI-reclaimed pages and is not
-    // separately scrubbed here.
-    // SAFETY: both are live locals; volatile so the stores are not elided as
+    // to userspace. The pool seed is already in BootInfo (step 9 copies it
+    // into the page in place), which the kernel scrubs after absorbing it;
+    // this local is the bootloader's only other copy, since step 5c writes
+    // into it directly and scrubs its own byte buffers.
+    scrub(&mut boot_entropy.seed);
+    // SAFETY: all are live locals; volatile so the stores are not elided as
     // dead ahead of the values going out of scope.
     unsafe {
         core::ptr::write_volatile(core::ptr::addr_of_mut!(boot_entropy.kaslr), [0u64; 2]);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!(boot_entropy.len), 0u32);
         core::ptr::write_volatile(core::ptr::addr_of_mut!(kaslr.dm_rand), 0u64);
     }
     // SAFETY: page_table root frames are valid; kernel_info.entry_virtual is
@@ -740,8 +769,9 @@ fn single_cpu_topology(boot_hart_id: u64, bsp_id: u32) -> CpuTopology
 // ── Step 5b: AP trampoline allocation ────────────────────────────────────────
 
 /// Reserve a 4 KiB page for the AP startup trampoline. Returns 0 if the
-/// allocation fails (SMP is then disabled); arch-specific placement
-/// constraints are enforced inside `arch::current::allocate_ap_trampoline`.
+/// allocation fails (the consequence is in `core/boot/docs/boot-flow.md`
+/// § Step 5b); arch-specific placement constraints are enforced inside
+/// `arch::current::allocate_ap_trampoline`.
 ///
 /// # Safety
 /// `ctx.bs` must be valid UEFI boot services.
@@ -755,7 +785,10 @@ unsafe fn step5b_alloc_ap_trampoline(ctx: &UefiContext) -> u64
     }
     else
     {
-        bprintln!("[--------] boot: WARNING: cannot allocate AP trampoline page — SMP disabled");
+        bprintln!(
+            "[--------] boot: WARNING: cannot allocate AP trampoline page; the kernel halts \
+             at Phase 8 if more than one CPU is listed"
+        );
         0
     }
 }
@@ -763,21 +796,24 @@ unsafe fn step5b_alloc_ap_trampoline(ctx: &UefiContext) -> u64
 // ── Step 5c: boot entropy seed ───────────────────────────────────────────────
 
 /// Draw conditioned early-boot entropy for the pool seed and the KASLR
-/// slide / direct-map base.
+/// slide / direct-map base into `out`, which the caller owns zeroed and
+/// scrubs; the seed and the KASLR words are written straight into it, so this
+/// frame holds only the byte buffers it scrubs itself.
 ///
-/// Prefers UEFI `EFI_RNG_PROTOCOL` (x86-64 OVMF). Where it is absent —
-/// riscv64 EDK2 exposes none — falls back to the QEMU-provided DTB
-/// `/chosen/rng-seed` (see [`fetch_dtb_rng_seed`]). When neither source is
-/// available, returns `len == 0` and `kaslr_available == false`; the kernel
-/// then degrades to timing jitter and the layout to its deterministic
-/// fallback (no regression).
+/// Draws the pool seed from UEFI `EFI_RNG_PROTOCOL` when the firmware exposes
+/// it and the draw succeeds; a failed KASLR draw after a successful pool draw
+/// leaves `len == 32` with `kaslr_available == false`. Otherwise draws from
+/// the DTB `/chosen/rng-seed` reader ([`dtb::parse_rng_seed`]); otherwise
+/// leaves `len == 0` and `kaslr_available == false`, and the kernel seeds the
+/// pool from its remaining sources and the layout is deterministic (no
+/// regression). Which firmware exposes which source is documented in
+/// `core/boot/docs/boot-flow.md`.
 ///
 /// # Safety
 /// `ctx.bs` must be valid UEFI boot services (before `ExitBootServices`);
 /// `firm.device_tree` must be 0 or an identity-mapped writable FDT.
-unsafe fn step5c_fetch_boot_entropy(ctx: &UefiContext, firm: &FirmwareInfo) -> BootEntropy
+unsafe fn step5c_fetch_boot_entropy(ctx: &UefiContext, firm: &FirmwareInfo, out: &mut BootEntropy)
 {
-    let mut seed = [0u8; 32];
     let mut iface: *mut core::ffi::c_void = core::ptr::null_mut();
     // SAFETY: ctx.bs is valid; locate_protocol fills iface on success.
     let status = unsafe {
@@ -791,18 +827,19 @@ unsafe fn step5c_fetch_boot_entropy(ctx: &UefiContext, firm: &FirmwareInfo) -> B
     {
         let proto = iface.cast::<EfiRngProtocol>();
         // SAFETY: proto is a valid protocol pointer from LocateProtocol; a
-        // null algorithm selects the default; seed has room for 32 bytes.
+        // null algorithm selects the default; out.seed has room for 32 bytes.
         // GetRNG returns EFI_SUCCESS only after writing all requested bytes.
         let s = unsafe {
             ((*proto).get_rng)(
                 proto,
                 core::ptr::null::<EfiGuid>(),
-                seed.len(),
-                seed.as_mut_ptr(),
+                out.seed.len(),
+                out.seed.as_mut_ptr(),
             )
         };
         if s == EFI_SUCCESS
         {
+            out.len = 32;
             // Independent 16-byte KASLR draw, kept separate from the pool
             // seed so neither reveals the other.
             let mut kaslr_bytes = [0u8; 16];
@@ -815,29 +852,20 @@ unsafe fn step5c_fetch_boot_entropy(ctx: &UefiContext, firm: &FirmwareInfo) -> B
                     kaslr_bytes.as_mut_ptr(),
                 )
             };
-            let (kaslr, kaslr_available, kaslr_source_flag) = if ks == EFI_SUCCESS
+            if ks == EFI_SUCCESS
             {
-                let w = kaslr_words(&kaslr_bytes);
-                kaslr_bytes.fill(0);
-                (w, true, boot_protocol::KASLR_ENTROPY_FW_RNG)
+                out.kaslr = kaslr_words(&kaslr_bytes);
+                out.kaslr_available = true;
+                out.kaslr_source_flag = boot_protocol::KASLR_ENTROPY_FW_RNG;
             }
-            else
-            {
-                ([0u64; 2], false, 0)
-            };
-            return BootEntropy {
-                seed,
-                len: 32,
-                kaslr,
-                kaslr_available,
-                kaslr_source_flag,
-            };
+            scrub(&mut kaslr_bytes);
+            return;
         }
         // Partial/failed draw: discard and fall through to the DTB source.
-        seed = [0u8; 32];
+        scrub(&mut out.seed);
     }
 
-    // riscv64 fallback: the QEMU-authored DTB /chosen/rng-seed. One draw
+    // DTB fallback: the firmware-delivered /chosen/rng-seed. One draw
     // serves both consumers: the first 16 bytes seed KASLR, the remainder
     // seeds the entropy pool (non-overlapping so the pool seed never
     // reveals the KASLR words).
@@ -850,55 +878,42 @@ unsafe fn step5c_fetch_boot_entropy(ctx: &UefiContext, firm: &FirmwareInfo) -> B
     {
         let mut kb = [0u8; 16];
         kb.copy_from_slice(&dtb_seed[0..16]);
-        let kaslr = kaslr_words(&kb);
+        out.kaslr = kaslr_words(&kb);
+        scrub(&mut kb);
+        out.kaslr_available = true;
+        out.kaslr_source_flag = boot_protocol::KASLR_ENTROPY_DTB_SEED;
         let pool_len = n - 16;
-        seed[..pool_len].copy_from_slice(&dtb_seed[16..n]);
-        dtb_seed.fill(0);
-        return BootEntropy {
-            seed,
-            len: pool_len as u32,
-            kaslr,
-            kaslr_available: true,
-            kaslr_source_flag: boot_protocol::KASLR_ENTROPY_DTB_SEED,
-        };
+        out.seed[..pool_len].copy_from_slice(&dtb_seed[16..n]);
+        out.len = pool_len as u32;
     }
-    #[allow(clippy::cast_possible_truncation)]
-    if n > 0
+    else if n > 0
     {
         // Too short to split: feed the whole draw to the pool; KASLR uses
         // its deterministic fallback.
-        seed[..n].copy_from_slice(&dtb_seed[..n]);
-        dtb_seed.fill(0);
-        return BootEntropy {
-            seed,
-            len: n as u32,
-            kaslr: [0; 2],
-            kaslr_available: false,
-            kaslr_source_flag: 0,
-        };
+        out.seed[..n].copy_from_slice(&dtb_seed[..n]);
+        out.len = n as u32;
     }
-
-    // No source at all.
-    BootEntropy {
-        seed: [0u8; 32],
-        len: 0,
-        kaslr: [0; 2],
-        kaslr_available: false,
-        kaslr_source_flag: 0,
-    }
+    // No source at all leaves `out` as the caller zeroed it.
+    scrub(&mut dtb_seed);
 }
 
-/// Pack 16 little-endian bytes into two KASLR entropy words.
+/// Pack 16 little-endian bytes into two KASLR entropy words; no named
+/// intermediate buffer.
 fn kaslr_words(bytes: &[u8; 16]) -> [u64; 2]
 {
-    let mut w = [0u64; 2];
-    for (i, word) in w.iter_mut().enumerate()
+    let (chunks, _) = bytes.as_chunks::<8>();
+    [u64::from_le_bytes(chunks[0]), u64::from_le_bytes(chunks[1])]
+}
+
+/// Zero a secret that is never read again. Volatile so the stores survive
+/// dead-store elimination; a plain `fill(0)` on a dying local may be dropped.
+fn scrub(bytes: &mut [u8])
+{
+    for b in bytes
     {
-        let mut b = [0u8; 8];
-        b.copy_from_slice(&bytes[i * 8..i * 8 + 8]);
-        *word = u64::from_le_bytes(b);
+        // SAFETY: `b` is a valid exclusive reference into the caller's array.
+        unsafe { core::ptr::write_volatile(b, 0) };
     }
-    w
 }
 
 // ── Step 5d: KASLR slide ─────────────────────────────────────────────────────
@@ -907,12 +922,13 @@ fn kaslr_words(bytes: &[u8; 16]) -> [u64; 2]
 /// before step 6 maps its segments; return the [`KaslrDecision`] step 9 needs
 /// to pick the matching direct-map base.
 ///
-/// The slide comes from the bootloader's KASLR entropy draw. It is forced to
-/// 0 — the deterministic layout — when no entropy was available or when the
-/// `\EFI\seraph\nokaslr` override knob is present. Relocations are applied
-/// even at slide 0, so the mapped image never depends on lld having
-/// pre-filled the RELATIVE targets. The KASLR entropy word is scrubbed before
-/// return.
+/// The decision is [`choose_kaslr_layout`]'s: the slide comes from the
+/// bootloader's KASLR entropy draw and is forced to 0 — the deterministic
+/// layout — when no entropy was available or when the `\EFI\seraph\nokaslr`
+/// override knob is present, and an `ET_EXEC` kernel is pinned to slide 0
+/// while the direct-map base is still randomized. For a PIE, relocations are
+/// applied even at slide 0, so the mapped image never depends on lld having
+/// pre-filled the RELATIVE targets.
 ///
 /// # Safety
 /// `ctx.esp_root` must be valid; `info` must come from `load_kernel` with its
@@ -926,44 +942,70 @@ unsafe fn step5d_apply_kaslr_slide(
 {
     // SAFETY: ctx.esp_root is a valid ESP root directory handle per the
     // caller's contract.
-    let knob = unsafe { nokaslr_knob_present(ctx) };
+    let knob = unsafe { nokaslr_override(ctx) };
+    let (slide, decision) = choose_kaslr_layout(knob, entropy, info.kind, info.size);
 
-    let (slide, dm_rand, randomize_dm, flags) = if knob
+    // SAFETY: forwarded from the caller's contract; slide is a valid 2 MiB
+    // multiple within the image window.
+    unsafe { elf::relocate_kernel(info, slide, arch::current::EXPECTED_ELF_MACHINE)? };
+
+    Ok(decision)
+}
+
+/// Choose the image slide and the direct-map decision from the override knob,
+/// the entropy draw, and the image kind. Pure, so the outcomes are host-tested.
+fn choose_kaslr_layout(
+    knob: KaslrOverride,
+    entropy: &BootEntropy,
+    kind: ElfKind,
+    image_size: u64,
+) -> (u64, KaslrDecision)
+{
+    let (slide, dm_rand, randomize_dm, flags) = if knob == KaslrOverride::DisabledByKnob
     {
         (0u64, 0u64, false, boot_protocol::KASLR_DISABLED_BY_KNOB)
     }
     else if entropy.kaslr_available
     {
-        let slide = boot_protocol::layout::image_slide(entropy.kaslr[0], info.size);
-        let mut f = entropy.kaslr_source_flag;
-        if slide != 0
+        // A PIE takes the drawn slide (KASLR_IMAGE_RANDOMIZED marks the draw,
+        // whichever slot it selected); an ET_EXEC kernel cannot slide
+        // (elf-loading.md § ELF Validation) and stays at the link base with
+        // only the source bits set.
+        let (slide, image_flag) = match kind
         {
-            f |= boot_protocol::KASLR_IMAGE_RANDOMIZED;
-        }
-        (slide, entropy.kaslr[1], true, f)
+            ElfKind::Dyn => (
+                boot_protocol::layout::image_slide(entropy.kaslr[0], image_size),
+                boot_protocol::KASLR_IMAGE_RANDOMIZED,
+            ),
+            ElfKind::Exec => (0, 0),
+        };
+        (
+            slide,
+            entropy.kaslr[1],
+            true,
+            entropy.kaslr_source_flag | image_flag,
+        )
     }
     else
     {
         // No boot entropy: the defined fallback — deterministic layout.
         (0u64, 0u64, false, 0)
     };
-
-    // SAFETY: forwarded from the caller's contract; slide is a valid 2 MiB
-    // multiple within the image window.
-    unsafe { elf::relocate_kernel(info, slide, arch::current::EXPECTED_ELF_MACHINE)? };
-
-    Ok(KaslrDecision {
-        dm_rand,
-        randomize_dm,
-        flags,
-    })
+    (
+        slide,
+        KaslrDecision {
+            dm_rand,
+            randomize_dm,
+            flags,
+        },
+    )
 }
 
 /// Whether the `\EFI\seraph\nokaslr` override knob file exists on the ESP.
 ///
 /// # Safety
 /// `ctx.esp_root` must be a valid ESP root directory handle.
-unsafe fn nokaslr_knob_present(ctx: &UefiContext) -> bool
+unsafe fn nokaslr_override(ctx: &UefiContext) -> KaslrOverride
 {
     // SAFETY: esp_root is a valid directory handle; path is NUL-terminated UTF-16.
     match unsafe {
@@ -980,9 +1022,9 @@ unsafe fn nokaslr_knob_present(ctx: &UefiContext) -> bool
             unsafe {
                 ((*file).close)(file);
             }
-            true
+            KaslrOverride::DisabledByKnob
         }
-        Err(_) => false,
+        Err(_) => KaslrOverride::Absent,
     }
 }
 
@@ -1455,7 +1497,10 @@ unsafe fn step9_populate_boot_info(
     bprintln!("[--------] boot: kaslr flags={kaslr_flags:#x}");
 
     // Write the populated BootInfo.
-    // SAFETY: boot_info_phys is a valid 4 KiB allocation; BootInfo fits in one page.
+    // SAFETY: boot_info_phys is a valid 4 KiB allocation; BootInfo fits in one
+    // page. `boot_entropy.seed` is a live local distinct from that page, so
+    // the in-place copy cannot overlap, and both field pointers are derived
+    // from the just-written BootInfo.
     unsafe {
         core::ptr::write(
             allocs.boot_info_phys as *mut BootInfo,
@@ -1503,13 +1548,22 @@ unsafe fn step9_populate_boot_info(
                     entries: allocs.reclaim_array_phys as *const ReclaimRange,
                     count: reclaim_len as u64,
                 },
-                boot_entropy_seed: boot_entropy.seed,
-                boot_entropy_len: boot_entropy.len,
+                boot_entropy_seed: [0u8; 32],
+                boot_entropy_len: 0,
                 vmgenid_paddr,
                 direct_map_base,
                 kaslr_flags,
             },
         );
+        // The seed goes into the page in place rather than through the struct
+        // literal above, so no copy of it is materialised in this frame.
+        let bi = allocs.boot_info_phys as *mut BootInfo;
+        core::ptr::copy_nonoverlapping(
+            boot_entropy.seed.as_ptr(),
+            core::ptr::addr_of_mut!((*bi).boot_entropy_seed).cast::<u8>(),
+            boot_entropy.seed.len(),
+        );
+        core::ptr::addr_of_mut!((*bi).boot_entropy_len).write(boot_entropy.len);
     }
 }
 
@@ -1541,5 +1595,84 @@ unsafe fn step10_handoff(
             stack_top,
             boot_hart_id,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests
+{
+    use super::{BootEntropy, ElfKind, KaslrOverride, choose_kaslr_layout};
+    use boot_protocol::{KASLR_DISABLED_BY_KNOB, KASLR_ENTROPY_FW_RNG, KASLR_IMAGE_RANDOMIZED};
+
+    const IMAGE: u64 = 8 << 20;
+
+    fn draw(word: u64) -> BootEntropy
+    {
+        BootEntropy {
+            kaslr: [word, 0x0fed_cba9_8765_4321],
+            kaslr_available: true,
+            kaslr_source_flag: KASLR_ENTROPY_FW_RNG,
+            ..BootEntropy::NONE
+        }
+    }
+
+    #[test]
+    fn knob_disables_both_dimensions()
+    {
+        let e = draw(0x1234_5678_9abc_def1);
+        let (slide, d) =
+            choose_kaslr_layout(KaslrOverride::DisabledByKnob, &e, ElfKind::Dyn, IMAGE);
+        assert_eq!(slide, 0);
+        assert!(!d.randomize_dm);
+        assert_eq!(d.dm_rand, 0);
+        assert_eq!(d.flags, KASLR_DISABLED_BY_KNOB);
+    }
+
+    #[test]
+    fn no_entropy_is_the_deterministic_layout()
+    {
+        let (slide, d) = choose_kaslr_layout(
+            KaslrOverride::Absent,
+            &BootEntropy::NONE,
+            ElfKind::Dyn,
+            IMAGE,
+        );
+        assert_eq!(slide, 0);
+        assert!(!d.randomize_dm);
+        assert_eq!(d.flags, 0);
+    }
+
+    #[test]
+    fn pie_with_entropy_slides_and_flags_agree()
+    {
+        let e = draw(0x1234_5678_9abc_def1);
+        let (slide, d) = choose_kaslr_layout(KaslrOverride::Absent, &e, ElfKind::Dyn, IMAGE);
+        assert_eq!(slide, boot_protocol::layout::image_slide(e.kaslr[0], IMAGE));
+        assert_ne!(slide, 0);
+        assert!(d.randomize_dm);
+        assert_eq!(d.dm_rand, e.kaslr[1]);
+        assert_eq!(d.flags, KASLR_ENTROPY_FW_RNG | KASLR_IMAGE_RANDOMIZED);
+    }
+
+    #[test]
+    fn pie_whose_draw_lands_on_slot_zero_still_reads_as_randomized()
+    {
+        let e = draw(0);
+        let (slide, d) = choose_kaslr_layout(KaslrOverride::Absent, &e, ElfKind::Dyn, IMAGE);
+        assert_eq!(slide, 0);
+        assert!(d.randomize_dm);
+        assert_eq!(d.dm_rand, e.kaslr[1]);
+        assert_eq!(d.flags, KASLR_ENTROPY_FW_RNG | KASLR_IMAGE_RANDOMIZED);
+    }
+
+    #[test]
+    fn et_exec_with_entropy_is_pinned_but_randomizes_the_direct_map()
+    {
+        let e = draw(0x1234_5678_9abc_def1);
+        let (slide, d) = choose_kaslr_layout(KaslrOverride::Absent, &e, ElfKind::Exec, IMAGE);
+        assert_eq!(slide, 0);
+        assert!(d.randomize_dm);
+        assert_eq!(d.dm_rand, e.kaslr[1]);
+        assert_eq!(d.flags, KASLR_ENTROPY_FW_RNG);
     }
 }

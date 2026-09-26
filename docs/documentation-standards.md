@@ -29,13 +29,19 @@ Four documentation scopes exist:
   targets (for example `xtask/README.md`). Every summary MUST link its
   authoritative source. Summaries MUST NOT introduce normative or
   behavior-bearing content not present in the authoritative source.
+- `.claude/` holds the assistant's operating instructions; its files are outside this
+  hierarchy and are neither authoritative documents nor summaries. A restatement of a rule
+  in them MUST name the document that owns it.
 
 ---
 
 ## Authority and Duplication
 
 - An **authoritative** document is the primary specification for the content it contains.
-- A **summary** condenses content owned by an authoritative document.
+- A **summary** condenses content owned by an authoritative document. A summary is prose
+  that restates a rule, invariant, or behavior the authoritative document owns. A
+  directory-index table row, a citation of a constant's value, or a cross-reference that
+  points at the document without restating its content is not a summary.
 - Higher-level documents MAY summarize lower-level documents.
 - Higher-level documents MUST NOT specify or restate behavior owned by an authoritative
   lower-level document.
@@ -47,9 +53,9 @@ Four documentation scopes exist:
 
 Every authoritative document MUST include a `## Summarized By` section at the end of the
 document (after a `---` separator) listing every document that contains a summary of its
-content, regardless of hierarchical relationship. Structural parent READMEs are not
-implicitly exempt; if a parent README summarizes a child doc, the parent MUST appear in
-the child's `## Summarized By` list.
+content (as § Authority and Duplication defines a summary), regardless of hierarchical
+relationship. Structural parent READMEs are not implicitly exempt; if a parent README
+summarizes a child doc, the parent MUST appear in the child's `## Summarized By` list.
 
 ```markdown
 ---
@@ -129,8 +135,8 @@ error and log strings, and commit messages.
   deferred follow-up"; the list is illustrative, not exhaustive. These are
   pointers into a planning conversation that has no permanence and rot the
   moment the plan moves on. A count the code itself performs ("two augment
-  rounds") and the kernel's documented boot phases ("Phase 6", named in
-  `core/kernel/docs/initialization.md`) are not labels.
+  rounds") and the name of a step in a sequence a document defines permanently
+  (a kernel boot phase, a bootloader boot step) are not labels.
 - Commit messages name components and what changed, not planning labels.
 
 ---
@@ -194,4 +200,4 @@ to system-level documents this component summarizes or depends on).
 
 ## Summarized By
 
-None
+[Conventions](conventions.md)

@@ -101,6 +101,10 @@ fn report_kaslr(flags: u32, image_base: u64, dm_base: u64)
     {
         kprintln!("kaslr: image randomized ({source})");
     }
+    else if flags & (KASLR_ENTROPY_FW_RNG | KASLR_ENTROPY_DTB_SEED) != 0
+    {
+        kprintln!("kaslr: image at link base (pinned; {source})");
+    }
     else
     {
         kprintln!("kaslr: image at link base (no boot entropy)");
@@ -576,8 +580,8 @@ unsafe fn kernel_entry_post_rebase(
         {
             if trampoline_pa == 0
             {
-                // Every listed CPU is assumed online from Phase 8 on, so a
-                // boot that lists APs but cannot start them does not proceed.
+                // A listed CPU that cannot be started is fatal
+                // (docs/initialization.md § Phase 8).
                 fatal("smp: no AP trampoline page; listed CPUs cannot be brought online");
             }
             else

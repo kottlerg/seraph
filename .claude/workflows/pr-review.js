@@ -71,8 +71,9 @@ const MAX_SHARD_LINES = 500 // changed lines per shard reviewer
 const MAX_LENS_DOCS = 8 // design documents per design-docs lens agent
 const DEDUP_LINE_SLACK = 3 // lines apart at which same file, class, bucket, and flag are one
 const VERIFY_LENSES = ['reality', 'authority']
-// A defect of these classes in a touched file is on the review surface; the
-// remaining classes are on it in a delta run only when the delta introduced them.
+// The finding classes: a defect of the first set in a touched file is on the
+// review surface; one of the second set is on it in a delta run only when the
+// delta introduced it. The schema's class enum is their union.
 const ALWAYS_IN_BOUND = ['correctness', 'safety', 'contract']
 const SOFT_CLASSES = ['standards', 'doc-drift', 'coverage', 'style']
 // The sections pr-auditor's Output lists; the audit must return each of them.
@@ -187,11 +188,7 @@ const FINDING_SCHEMA = {
         file: { type: 'string', description: PATH_DESCRIPTION },
         line: { type: 'integer', description: '1-based line the finding anchors to.' },
         bucket: { enum: ['critical', 'should', 'nit'] },
-        class: {
-            enum: [
-                'correctness', 'safety', 'contract', 'standards', 'doc-drift', 'coverage', 'style',
-            ],
-        },
+        class: { enum: [...ALWAYS_IN_BOUND, ...SOFT_CLASSES] },
         introduced: {
             type: 'boolean',
             description:

@@ -84,8 +84,8 @@ const SBI_FID_HART_START: u64 = 0;
 /// # Safety
 /// - `start_pa` must be the physical address of a valid, executable trampoline
 ///   that has been set up by [`setup_trampoline`].
-/// - `opaque` must be the physical address of a valid per-AP params block
-///   written by [`setup_ap_params`].
+/// - `opaque` must be the physical address of the startup parameter block
+///   written by [`setup_ap_params`] for this AP.
 #[cfg(not(test))]
 pub unsafe fn sbi_hart_start(hart_id: u64, start_pa: u64, opaque: u64) -> bool
 {

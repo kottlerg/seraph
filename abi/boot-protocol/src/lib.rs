@@ -907,8 +907,10 @@ pub struct BootInfo
 
     /// KASLR status flags (`KASLR_*` bits): which layout dimensions were
     /// randomized, which entropy source fed the draw, and why
-    /// randomization was skipped when it was. Zero means an entirely
-    /// un-randomized layout (no boot entropy and no override knob).
+    /// randomization was skipped when it was. An `ET_EXEC` image is pinned at
+    /// the link base with its source bits set and [`KASLR_IMAGE_RANDOMIZED`]
+    /// clear. Zero means an entirely un-randomized layout (no boot entropy
+    /// and no override knob).
     pub kaslr_flags: u32,
 }
 

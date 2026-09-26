@@ -381,11 +381,13 @@ state, so SMP bringup completes within Phase 8 and the trampoline page
 is reclaim-safe by the time Phase 9 consumes `cspace_layout`.
 
 **Failure mode:** Allocation failure for any idle stack or TCB halts with
-"fatal: cannot initialise scheduler". A `start_ap` failure for any AP, or
-a zero `BootInfo.ap_trampoline_page` with more than one CPU listed, is
-fatal: every CPU the boot reported is assumed online from Phase 8 on (IPI
-targets, scheduler placement, affinity), so a CPU that cannot be started
-halts the boot with a descriptive message.
+"fatal: cannot initialise scheduler". A rejected `start_ap` (riscv64, where
+SBI reports a hart it cannot start), or a zero `BootInfo.ap_trampoline_page`
+with more than one CPU listed, is fatal: every CPU the boot reported is
+assumed online from Phase 8 on (IPI targets, scheduler placement, affinity),
+so a CPU that cannot be started halts the boot with a descriptive message.
+On x86-64 SIPI delivery is unacknowledged, so a listed CPU that never
+answers leaves the BSP waiting at `APS_READY`.
 
 **Completion criterion:** Per-CPU scheduler state and idle threads are
 initialised for all CPUs, every AP has incremented `APS_READY`, the
@@ -515,7 +517,7 @@ that CPU only; the BSP and other CPUs continue.
 | 5 | CPU hardware (IDT/GDT/TSS/stvec); seed entropy pool | Halt: hardware initialisation failure |
 | 6 | Platform resource validation | Halt if entries pointer is null with non-zero count; bad entries skipped |
 | 7 | Capability system + root CSpace | Halt: OOM |
-| 8 | Scheduler + idle threads, SMP bringup, AP trampoline reclaim, entropy self-test | Halt: OOM (idle stack/TCB); start_ap failure for any CPU; zero ap_trampoline_page with more than one CPU listed |
+| 8 | Scheduler + idle threads, SMP bringup, AP trampoline reclaim, entropy self-test | Halt: OOM (idle stack/TCB); rejected start_ap (riscv64); zero ap_trampoline_page with more than one CPU listed. A listed x86-64 CPU that never answers its SIPI leaves the BSP waiting |
 | 9 | Init creation + scheduler entry (user mode) | Halt: invalid InitImage or OOM |
 
 ---

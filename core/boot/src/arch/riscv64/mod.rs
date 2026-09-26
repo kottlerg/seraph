@@ -170,7 +170,8 @@ pub fn bsp_hardware_id(boot_hart_id: u64) -> u32
 /// On RISC-V SBI `HART_START` accepts any physical address for the AP
 /// entry point, so no placement constraint applies beyond page alignment
 /// (guaranteed by `allocate_pages`). Returns `None` if the allocation
-/// fails; the kernel then halts at Phase 8 when more than one CPU is listed.
+/// fails; the kernel's response is in `core/kernel/docs/initialization.md`
+/// § Phase 8.
 ///
 /// # Safety
 /// `bs` must be valid UEFI boot services; call before `ExitBootServices`.

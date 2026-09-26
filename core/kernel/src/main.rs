@@ -103,7 +103,7 @@ fn report_kaslr(flags: u32, image_base: u64, dm_base: u64)
     }
     else if flags & (KASLR_ENTROPY_FW_RNG | KASLR_ENTROPY_DTB_SEED) != 0
     {
-        kprintln!("kaslr: image at link base (pinned; {source})");
+        kprintln!("kaslr: image at link base (slide 0; {source})");
     }
     else
     {

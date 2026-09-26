@@ -27,8 +27,8 @@ pub const EXPECTED_ELF_MACHINE: u16 = EM_X86_64;
 ///
 /// On x86-64 the SIPI vector encodes the real-mode start address in
 /// bits `[19:12]` of the IPI ICR, so the page MUST live below 1 MiB.
-/// Returns `None` if no qualifying page can be reserved; the kernel then
-/// halts at Phase 8 when more than one CPU is listed.
+/// Returns `None` if no qualifying page can be reserved; the kernel's
+/// response is in `core/kernel/docs/initialization.md` § Phase 8.
 ///
 /// # Safety
 /// `bs` must be valid UEFI boot services; call before `ExitBootServices`.

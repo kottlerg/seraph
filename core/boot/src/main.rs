@@ -211,6 +211,16 @@ impl BootEntropy
 /// [`step5d_apply_kaslr_slide`] (which biases the kernel image) to
 /// [`step9_populate_boot_info`] (which selects the direct-map base and
 /// writes both into [`BootInfo`]).
+/// Whether the `\EFI\seraph\nokaslr` override knob is present on the ESP.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum KaslrOverride
+{
+    /// No knob: the layout follows the entropy draw.
+    Absent,
+    /// The knob is present: both layout dimensions stay deterministic.
+    DisabledByKnob,
+}
+
 struct KaslrDecision
 {
     /// Entropy word reserved for the direct-map base selection in step 9.
@@ -759,9 +769,8 @@ fn single_cpu_topology(boot_hart_id: u64, bsp_id: u32) -> CpuTopology
 // ── Step 5b: AP trampoline allocation ────────────────────────────────────────
 
 /// Reserve a 4 KiB page for the AP startup trampoline. Returns 0 if the
-/// allocation fails, in which case the kernel halts at Phase 8 when more than
-/// one CPU is listed (`BootInfo::ap_trampoline_page`); arch-specific
-/// placement constraints are enforced inside
+/// allocation fails (the consequence is in `core/boot/docs/boot-flow.md`
+/// § Step 5b); arch-specific placement constraints are enforced inside
 /// `arch::current::allocate_ap_trampoline`.
 ///
 /// # Safety
@@ -933,8 +942,8 @@ unsafe fn step5d_apply_kaslr_slide(
 {
     // SAFETY: ctx.esp_root is a valid ESP root directory handle per the
     // caller's contract.
-    let knob = unsafe { nokaslr_knob_present(ctx) };
-    let (slide, decision) = choose_kaslr_layout(knob, entropy, info.is_pie, info.size);
+    let knob = unsafe { nokaslr_override(ctx) };
+    let (slide, decision) = choose_kaslr_layout(knob, entropy, info.kind, info.size);
 
     // SAFETY: forwarded from the caller's contract; slide is a valid 2 MiB
     // multiple within the image window.
@@ -946,13 +955,13 @@ unsafe fn step5d_apply_kaslr_slide(
 /// Choose the image slide and the direct-map decision from the override knob,
 /// the entropy draw, and the image kind. Pure, so the outcomes are host-tested.
 fn choose_kaslr_layout(
-    knob: bool,
+    knob: KaslrOverride,
     entropy: &BootEntropy,
-    is_pie: bool,
+    kind: ::elf::ElfKind,
     image_size: u64,
 ) -> (u64, KaslrDecision)
 {
-    let (slide, dm_rand, randomize_dm, flags) = if knob
+    let (slide, dm_rand, randomize_dm, flags) = if knob == KaslrOverride::DisabledByKnob
     {
         (0u64, 0u64, false, boot_protocol::KASLR_DISABLED_BY_KNOB)
     }
@@ -960,14 +969,15 @@ fn choose_kaslr_layout(
     {
         // An ET_EXEC kernel cannot slide (elf-loading.md § ELF Validation); it
         // stays at the link base with the source bits set and
-        // KASLR_IMAGE_RANDOMIZED clear.
-        let slide = if is_pie
+        // KASLR_IMAGE_RANDOMIZED clear, as a PIE whose draw selects slide 0
+        // does.
+        let slide = match kind
         {
-            boot_protocol::layout::image_slide(entropy.kaslr[0], image_size)
-        }
-        else
-        {
-            0
+            ::elf::ElfKind::Dyn =>
+            {
+                boot_protocol::layout::image_slide(entropy.kaslr[0], image_size)
+            }
+            ::elf::ElfKind::Exec => 0,
         };
         let mut f = entropy.kaslr_source_flag;
         if slide != 0
@@ -991,75 +1001,11 @@ fn choose_kaslr_layout(
     )
 }
 
-#[cfg(test)]
-mod kaslr_tests
-{
-    use super::{BootEntropy, choose_kaslr_layout};
-
-    const IMAGE: u64 = 8 << 20;
-
-    fn draw() -> BootEntropy
-    {
-        BootEntropy {
-            kaslr: [0x1234_5678_9abc_def1, 0x0fed_cba9_8765_4321],
-            kaslr_available: true,
-            kaslr_source_flag: boot_protocol::KASLR_ENTROPY_FW_RNG,
-            ..BootEntropy::NONE
-        }
-    }
-
-    #[test]
-    fn knob_disables_both_dimensions()
-    {
-        let (slide, d) = choose_kaslr_layout(true, &draw(), true, IMAGE);
-        assert_eq!(slide, 0);
-        assert!(!d.randomize_dm);
-        assert_eq!(d.dm_rand, 0);
-        assert_eq!(d.flags, boot_protocol::KASLR_DISABLED_BY_KNOB);
-    }
-
-    #[test]
-    fn no_entropy_is_the_deterministic_layout()
-    {
-        let (slide, d) = choose_kaslr_layout(false, &BootEntropy::NONE, true, IMAGE);
-        assert_eq!(slide, 0);
-        assert!(!d.randomize_dm);
-        assert_eq!(d.flags, 0);
-    }
-
-    #[test]
-    fn pie_with_entropy_slides_and_flags_agree()
-    {
-        let e = draw();
-        let (slide, d) = choose_kaslr_layout(false, &e, true, IMAGE);
-        assert_eq!(slide, boot_protocol::layout::image_slide(e.kaslr[0], IMAGE));
-        assert!(d.randomize_dm);
-        assert_eq!(d.dm_rand, e.kaslr[1]);
-        assert_eq!(
-            d.flags & boot_protocol::KASLR_IMAGE_RANDOMIZED != 0,
-            slide != 0
-        );
-        assert_ne!(d.flags & boot_protocol::KASLR_ENTROPY_FW_RNG, 0);
-    }
-
-    #[test]
-    fn et_exec_with_entropy_is_pinned_but_randomizes_the_direct_map()
-    {
-        let e = draw();
-        let (slide, d) = choose_kaslr_layout(false, &e, false, IMAGE);
-        assert_eq!(slide, 0);
-        assert!(d.randomize_dm);
-        assert_eq!(d.dm_rand, e.kaslr[1]);
-        assert_eq!(d.flags & boot_protocol::KASLR_IMAGE_RANDOMIZED, 0);
-        assert_ne!(d.flags & boot_protocol::KASLR_ENTROPY_FW_RNG, 0);
-    }
-}
-
 /// Whether the `\EFI\seraph\nokaslr` override knob file exists on the ESP.
 ///
 /// # Safety
 /// `ctx.esp_root` must be a valid ESP root directory handle.
-unsafe fn nokaslr_knob_present(ctx: &UefiContext) -> bool
+unsafe fn nokaslr_override(ctx: &UefiContext) -> KaslrOverride
 {
     // SAFETY: esp_root is a valid directory handle; path is NUL-terminated UTF-16.
     match unsafe {
@@ -1076,9 +1022,9 @@ unsafe fn nokaslr_knob_present(ctx: &UefiContext) -> bool
             unsafe {
                 ((*file).close)(file);
             }
-            true
+            KaslrOverride::DisabledByKnob
         }
-        Err(_) => false,
+        Err(_) => KaslrOverride::Absent,
     }
 }
 
@@ -1649,5 +1595,81 @@ unsafe fn step10_handoff(
             stack_top,
             boot_hart_id,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests
+{
+    use super::{BootEntropy, KaslrOverride, choose_kaslr_layout};
+    use ::elf::ElfKind;
+    use boot_protocol::{KASLR_DISABLED_BY_KNOB, KASLR_ENTROPY_FW_RNG, KASLR_IMAGE_RANDOMIZED};
+
+    const IMAGE: u64 = 8 << 20;
+
+    fn draw(word: u64) -> BootEntropy
+    {
+        BootEntropy {
+            kaslr: [word, 0x0fed_cba9_8765_4321],
+            kaslr_available: true,
+            kaslr_source_flag: KASLR_ENTROPY_FW_RNG,
+            ..BootEntropy::NONE
+        }
+    }
+
+    #[test]
+    fn knob_disables_both_dimensions()
+    {
+        let e = draw(0x1234_5678_9abc_def1);
+        let (slide, d) =
+            choose_kaslr_layout(KaslrOverride::DisabledByKnob, &e, ElfKind::Dyn, IMAGE);
+        assert_eq!(slide, 0);
+        assert!(!d.randomize_dm);
+        assert_eq!(d.dm_rand, 0);
+        assert_eq!(d.flags, KASLR_DISABLED_BY_KNOB);
+    }
+
+    #[test]
+    fn no_entropy_is_the_deterministic_layout()
+    {
+        let (slide, d) =
+            choose_kaslr_layout(KaslrOverride::Absent, &BootEntropy::NONE, ElfKind::Dyn, IMAGE);
+        assert_eq!(slide, 0);
+        assert!(!d.randomize_dm);
+        assert_eq!(d.flags, 0);
+    }
+
+    #[test]
+    fn pie_with_entropy_slides_and_flags_agree()
+    {
+        let e = draw(0x1234_5678_9abc_def1);
+        let (slide, d) = choose_kaslr_layout(KaslrOverride::Absent, &e, ElfKind::Dyn, IMAGE);
+        assert_eq!(slide, boot_protocol::layout::image_slide(e.kaslr[0], IMAGE));
+        assert_ne!(slide, 0);
+        assert!(d.randomize_dm);
+        assert_eq!(d.dm_rand, e.kaslr[1]);
+        assert_eq!(d.flags, KASLR_ENTROPY_FW_RNG | KASLR_IMAGE_RANDOMIZED);
+    }
+
+    #[test]
+    fn pie_whose_draw_lands_on_slot_zero_stays_at_link_base()
+    {
+        let e = draw(0);
+        let (slide, d) = choose_kaslr_layout(KaslrOverride::Absent, &e, ElfKind::Dyn, IMAGE);
+        assert_eq!(slide, 0);
+        assert!(d.randomize_dm);
+        assert_eq!(d.dm_rand, e.kaslr[1]);
+        assert_eq!(d.flags, KASLR_ENTROPY_FW_RNG);
+    }
+
+    #[test]
+    fn et_exec_with_entropy_is_pinned_but_randomizes_the_direct_map()
+    {
+        let e = draw(0x1234_5678_9abc_def1);
+        let (slide, d) = choose_kaslr_layout(KaslrOverride::Absent, &e, ElfKind::Exec, IMAGE);
+        assert_eq!(slide, 0);
+        assert!(d.randomize_dm);
+        assert_eq!(d.dm_rand, e.kaslr[1]);
+        assert_eq!(d.flags, KASLR_ENTROPY_FW_RNG);
     }
 }

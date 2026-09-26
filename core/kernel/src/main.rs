@@ -103,7 +103,7 @@ fn report_kaslr(flags: u32, image_base: u64, dm_base: u64)
     }
     else if flags & (KASLR_ENTROPY_FW_RNG | KASLR_ENTROPY_DTB_SEED) != 0
     {
-        kprintln!("kaslr: image at link base (slide 0; {source})");
+        kprintln!("kaslr: image at link base (fixed image; {source})");
     }
     else
     {
@@ -128,14 +128,14 @@ fn report_kaslr(flags: u32, image_base: u64, dm_base: u64)
     let slide = image_base.wrapping_sub(link_base);
     kprintln_serial!("kaslr: slide={slide:#x} image_base={image_base:#x} dm_base={dm_base:#x}");
 
-    // Invariants (checked on every debug boot): the IMAGE_RANDOMIZED flag
-    // agrees with a nonzero slide, the slide is 2 MiB-aligned, and the
-    // direct-map base is 1 GiB-aligned. Production placement is enforced by
-    // validate_boot_info / init_paging_mode; these catch a flag/layout drift.
-    debug_assert_eq!(
-        flags & KASLR_IMAGE_RANDOMIZED != 0,
-        slide != 0,
-        "KASLR_IMAGE_RANDOMIZED flag disagrees with the applied slide"
+    // Invariants (checked on every debug boot): a nonzero slide implies the
+    // IMAGE_RANDOMIZED flag (a randomized draw may still select slide 0), the
+    // slide is 2 MiB-aligned, and the direct-map base is 1 GiB-aligned.
+    // Production placement is enforced by validate_boot_info /
+    // init_paging_mode; these catch a flag/layout drift.
+    debug_assert!(
+        slide == 0 || flags & KASLR_IMAGE_RANDOMIZED != 0,
+        "nonzero slide without the KASLR_IMAGE_RANDOMIZED flag"
     );
     debug_assert_eq!(
         slide % (2 * 1024 * 1024),

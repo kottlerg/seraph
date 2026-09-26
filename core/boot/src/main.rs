@@ -26,7 +26,7 @@ mod memory_map;
 mod paging;
 mod uefi;
 
-use crate::elf::{KernelInfo, load_init, load_kernel};
+use crate::elf::{ElfKind, KernelInfo, load_init, load_kernel};
 use crate::error::BootError;
 use crate::firmware::{FirmwareInfo, discover_firmware};
 use crate::paging::{PageTableBuilder, build_initial_tables};
@@ -207,10 +207,6 @@ impl BootEntropy
     };
 }
 
-/// The KASLR layout the bootloader chose, threaded from
-/// [`step5d_apply_kaslr_slide`] (which biases the kernel image) to
-/// [`step9_populate_boot_info`] (which selects the direct-map base and
-/// writes both into [`BootInfo`]).
 /// Whether the `\EFI\seraph\nokaslr` override knob is present on the ESP.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum KaslrOverride
@@ -221,6 +217,10 @@ enum KaslrOverride
     DisabledByKnob,
 }
 
+/// The KASLR layout the bootloader chose, threaded from
+/// [`step5d_apply_kaslr_slide`] (which biases the kernel image) to
+/// [`step9_populate_boot_info`] (which selects the direct-map base and
+/// writes both into [`BootInfo`]).
 struct KaslrDecision
 {
     /// Entropy word reserved for the direct-map base selection in step 9.
@@ -957,7 +957,7 @@ unsafe fn step5d_apply_kaslr_slide(
 fn choose_kaslr_layout(
     knob: KaslrOverride,
     entropy: &BootEntropy,
-    kind: ::elf::ElfKind,
+    kind: ElfKind,
     image_size: u64,
 ) -> (u64, KaslrDecision)
 {
@@ -967,21 +967,19 @@ fn choose_kaslr_layout(
     }
     else if entropy.kaslr_available
     {
-        // An ET_EXEC kernel cannot slide (elf-loading.md § ELF Validation); it
-        // stays at the link base with the source bits set and
-        // KASLR_IMAGE_RANDOMIZED clear, as a PIE whose draw selects slide 0
-        // does.
-        let slide = match kind
+        // A PIE takes the drawn slide (KASLR_IMAGE_RANDOMIZED marks the draw,
+        // whichever slot it selected); an ET_EXEC kernel cannot slide
+        // (elf-loading.md § ELF Validation) and stays at the link base with
+        // only the source bits set.
+        let (slide, image_flag) = match kind
         {
-            ::elf::ElfKind::Dyn => boot_protocol::layout::image_slide(entropy.kaslr[0], image_size),
-            ::elf::ElfKind::Exec => 0,
+            ElfKind::Dyn => (
+                boot_protocol::layout::image_slide(entropy.kaslr[0], image_size),
+                boot_protocol::KASLR_IMAGE_RANDOMIZED,
+            ),
+            ElfKind::Exec => (0, 0),
         };
-        let mut f = entropy.kaslr_source_flag;
-        if slide != 0
-        {
-            f |= boot_protocol::KASLR_IMAGE_RANDOMIZED;
-        }
-        (slide, entropy.kaslr[1], true, f)
+        (slide, entropy.kaslr[1], true, entropy.kaslr_source_flag | image_flag)
     }
     else
     {
@@ -1598,8 +1596,7 @@ unsafe fn step10_handoff(
 #[cfg(test)]
 mod tests
 {
-    use super::{BootEntropy, KaslrOverride, choose_kaslr_layout};
-    use ::elf::ElfKind;
+    use super::{BootEntropy, ElfKind, KaslrOverride, choose_kaslr_layout};
     use boot_protocol::{KASLR_DISABLED_BY_KNOB, KASLR_ENTROPY_FW_RNG, KASLR_IMAGE_RANDOMIZED};
 
     const IMAGE: u64 = 8 << 20;
@@ -1653,14 +1650,14 @@ mod tests
     }
 
     #[test]
-    fn pie_whose_draw_lands_on_slot_zero_stays_at_link_base()
+    fn pie_whose_draw_lands_on_slot_zero_still_reads_as_randomized()
     {
         let e = draw(0);
         let (slide, d) = choose_kaslr_layout(KaslrOverride::Absent, &e, ElfKind::Dyn, IMAGE);
         assert_eq!(slide, 0);
         assert!(d.randomize_dm);
         assert_eq!(d.dm_rand, e.kaslr[1]);
-        assert_eq!(d.flags, KASLR_ENTROPY_FW_RNG);
+        assert_eq!(d.flags, KASLR_ENTROPY_FW_RNG | KASLR_IMAGE_RANDOMIZED);
     }
 
     #[test]

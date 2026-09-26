@@ -909,20 +909,23 @@ pub struct BootInfo
     /// randomized, which entropy source fed the draw, and why
     /// randomization was skipped when it was. When entropy was available, an
     /// `ET_EXEC` image is pinned at the link base with its source bits set and
-    /// [`KASLR_IMAGE_RANDOMIZED`] clear, which a PIE whose draw selects slide 0
-    /// reads the same; the direct-map bits still apply. Zero means an entirely
-    /// un-randomized layout (no boot entropy and no override knob).
+    /// [`KASLR_IMAGE_RANDOMIZED`] clear; the direct-map bits still apply. Zero
+    /// means an entirely un-randomized layout (no boot entropy and no override
+    /// knob).
     pub kaslr_flags: u32,
 }
 
 // ── KASLR flags (protocol version 14) ────────────────────────────────────────
 
-/// `kaslr_flags` bit 0: the kernel image base carries a nonzero random slide.
+/// `kaslr_flags` bit 0: the kernel image slide was drawn from boot entropy
+/// (a PIE with entropy; the draw may select slide 0 by chance). Clear for an
+/// `ET_EXEC` image, the override knob, and no entropy.
 pub const KASLR_IMAGE_RANDOMIZED: u32 = 1 << 0;
 
-/// `kaslr_flags` bit 1: the direct-map base was randomly drawn (it may
-/// still equal the mode floor by chance only when the window is one slot;
-/// see [`KASLR_DM_WINDOW_LIMITED`]).
+/// `kaslr_flags` bit 1: the direct-map base was randomly drawn from a window
+/// of two or more 1 GiB slots; the draw may select the mode floor by chance.
+/// Never set together with [`KASLR_DM_WINDOW_LIMITED`], which marks the
+/// one-slot fallback.
 pub const KASLR_DM_RANDOMIZED: u32 = 1 << 1;
 
 /// `kaslr_flags` bit 2: the KASLR draws came from UEFI `EFI_RNG_PROTOCOL`.

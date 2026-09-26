@@ -35,7 +35,7 @@ use crate::error::BootError;
 // Both constants are re-exported here for arch-mod consumers; only one is
 // referenced per target arch build.
 #[allow(unused_imports)]
-pub use elf::{ElfKind, EM_RISCV, EM_X86_64};
+pub use elf::{EM_RISCV, EM_X86_64, ElfKind};
 
 // ── Output types ──────────────────────────────────────────────────────────────
 

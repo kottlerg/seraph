@@ -979,7 +979,12 @@ fn choose_kaslr_layout(
             ),
             ElfKind::Exec => (0, 0),
         };
-        (slide, entropy.kaslr[1], true, entropy.kaslr_source_flag | image_flag)
+        (
+            slide,
+            entropy.kaslr[1],
+            true,
+            entropy.kaslr_source_flag | image_flag,
+        )
     }
     else
     {

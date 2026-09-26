@@ -973,10 +973,7 @@ fn choose_kaslr_layout(
         // does.
         let slide = match kind
         {
-            ::elf::ElfKind::Dyn =>
-            {
-                boot_protocol::layout::image_slide(entropy.kaslr[0], image_size)
-            }
+            ::elf::ElfKind::Dyn => boot_protocol::layout::image_slide(entropy.kaslr[0], image_size),
             ::elf::ElfKind::Exec => 0,
         };
         let mut f = entropy.kaslr_source_flag;
@@ -1632,8 +1629,12 @@ mod tests
     #[test]
     fn no_entropy_is_the_deterministic_layout()
     {
-        let (slide, d) =
-            choose_kaslr_layout(KaslrOverride::Absent, &BootEntropy::NONE, ElfKind::Dyn, IMAGE);
+        let (slide, d) = choose_kaslr_layout(
+            KaslrOverride::Absent,
+            &BootEntropy::NONE,
+            ElfKind::Dyn,
+            IMAGE,
+        );
         assert_eq!(slide, 0);
         assert!(!d.randomize_dm);
         assert_eq!(d.flags, 0);

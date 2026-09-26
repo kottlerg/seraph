@@ -190,7 +190,11 @@ const FINDING_SCHEMA = {
                 'correctness', 'safety', 'contract', 'standards', 'doc-drift', 'coverage', 'style',
             ],
         },
-        introduced: { type: 'boolean', description: 'The diff introduced it (else pre-existing).' },
+        introduced: {
+            type: 'boolean',
+            description:
+                'The diff introduced it (in delta mode, the delta did); else pre-existing.',
+        },
         must_violation: {
             type: 'boolean',
             description: 'It names a MUST violation of a binding standard.',
@@ -695,7 +699,12 @@ function dedup(findings, source) {
                 ', not an open Issue; kept on the surface')
             f.issue = 0
         }
-        const surface = f.in_bound || (ALWAYS_IN_BOUND.includes(f.class) && pr_files.has(f.file))
+        // In a delta run a soft-class finding is on the surface only when the
+        // delta introduced it.
+        const soft_preexisting = DELTA && !ALWAYS_IN_BOUND.includes(f.class) && !f.introduced
+        const surface =
+            !soft_preexisting &&
+            (f.in_bound || (ALWAYS_IN_BOUND.includes(f.class) && pr_files.has(f.file)))
         const in_bound = !f.issue && surface
         const distance = (s) => Math.abs(s.line - f.line)
         const dup = seen

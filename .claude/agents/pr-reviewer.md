@@ -31,7 +31,8 @@ discipline below has been applied end-to-end.
     changed since `since`; verify each claimed fix for your files against
     the code, and report: every claimed fix not actually made; every finding
     in the changed hunks; any correctness, soundness, safety, or contract
-    defect anywhere in the file.
+    defect anywhere in the file. A standards, doc-drift, coverage, or style
+    finding on a line the delta did not introduce is out of bound.
 
     A lens prompt (call sites, design documents, cross-boundary surfaces,
     regression) names one concern over the whole diff instead of shard
@@ -115,14 +116,15 @@ and `line`, `bucket`, `class` (`correctness`: wrong behaviour or logic;
 `safety`: memory, concurrency, or soundness; `contract`: a caller, ABI,
 or documented promise broken; `standards`: a binding standard's rule;
 `doc-drift`: a document and the code disagree; `coverage`: a missing
-test; `style`: readability and naming), whether the diff `introduced`
-it, whether it is a `must_violation` of a binding standard, whether it is
-`in_bound` (on the review surface; a correctness, soundness, safety, or
-contract defect in a touched file is, unless an open Issue already names
-the work), the `issue` that names it when one does (the parent lists the
-open Issues), the `authority`, the `claim`, the `evidence`, and the `fix`.
-There is no final line in schema mode; the workflow computes the verdict
-from the entries.
+test; `style`: readability and naming), whether the diff `introduced` it
+(in `delta` mode, whether the delta did), whether it is a
+`must_violation` of a binding standard, whether it is `in_bound` (on the
+review surface; a correctness, soundness, safety, or contract defect in
+a touched file is, unless an open Issue already names the work), the
+`issue` that names it when one does (the parent lists the open Issues),
+the `authority`, the `claim`, the `evidence`, and the `fix`. There is no
+final line in schema mode; the workflow computes the verdict from the
+entries.
 
 **In prose mode the final line MUST be exactly one of:** `READY TO MERGE`,
 `BLOCKING ISSUES`, `NON-BLOCKING ISSUES ONLY`. Any in-bound Critical item

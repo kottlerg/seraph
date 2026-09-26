@@ -877,10 +877,7 @@ unsafe fn step5c_fetch_boot_entropy(ctx: &UefiContext, firm: &FirmwareInfo, out:
         // Too short to split: feed the whole draw to the pool; KASLR uses
         // its deterministic fallback.
         out.seed[..n].copy_from_slice(&dtb_seed[..n]);
-        // n ≤ 32, so the cast is exact.
-        #[allow(clippy::cast_possible_truncation)]
-        let len = n as u32;
-        out.len = len;
+        out.len = n as u32;
     }
     // No source at all leaves `out` as the caller zeroed it.
     scrub(&mut dtb_seed);
@@ -1459,7 +1456,10 @@ unsafe fn step9_populate_boot_info(
     bprintln!("[--------] boot: kaslr flags={kaslr_flags:#x}");
 
     // Write the populated BootInfo.
-    // SAFETY: boot_info_phys is a valid 4 KiB allocation; BootInfo fits in one page.
+    // SAFETY: boot_info_phys is a valid 4 KiB allocation; BootInfo fits in one
+    // page. `boot_entropy.seed` is a live local distinct from that page, so
+    // the in-place copy cannot overlap, and both field pointers are derived
+    // from the just-written BootInfo.
     unsafe {
         core::ptr::write(
             allocs.boot_info_phys as *mut BootInfo,

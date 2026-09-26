@@ -537,7 +537,7 @@ unsafe fn kernel_entry_post_rebase(
     // ── Phase 7: capability system ─────────────────────────────────────────────
     // Initialises the root CSpace and mints initial capabilities for all
     // boot-provided hardware resources. `cspace_layout` is held `mut` so
-    // the post-SMP late-reclaim pass (after Phase 8) can append the AP
+    // the late-reclaim pass at the end of Phase 8 can append the AP
     // trampoline cap to its descriptor table before Phase 9 consumes it.
     kprintln!("Phase 7: Capability System");
     let mut cspace_layout = cap::init_capability_system(mmio_apertures, boot_info_phys);
@@ -590,6 +590,10 @@ unsafe fn kernel_entry_post_rebase(
                 }
 
                 let entry_fn = kernel_entry_ap as *const () as u64;
+                // APs that came online; an AP whose start failed never
+                // increments `APS_READY`, so the wait below keys on this
+                // count, not on `cpu_idx`.
+                let mut started = 0u32;
 
                 for cpu_idx in 1..=ap_count
                 {
@@ -615,14 +619,15 @@ unsafe fn kernel_entry_post_rebase(
                         kprintln!("smp: start_ap(cpu={}) failed", cpu_idx);
                         continue;
                     }
+                    started += 1;
 
-                    while APS_READY.load(Ordering::Acquire) < cpu_idx as u32
+                    while APS_READY.load(Ordering::Acquire) < started
                     {
                         core::hint::spin_loop();
                     }
                 }
 
-                kprintln!("smp: all {} AP(s) online", ap_count);
+                kprintln!("smp: {} of {} AP(s) online", started, ap_count);
             }
         }
     }
@@ -644,9 +649,10 @@ unsafe fn kernel_entry_post_rebase(
     #[cfg(not(test))]
     if trampoline_pa != 0
     {
-        // SAFETY: APS_READY-observed Acquire above guarantees no AP is
-        // still inside the trampoline page; preempt discipline is handled
-        // by `unmap_identity_page` internally.
+        // SAFETY: the Acquire wait above observed `APS_READY` reach the
+        // count of APs whose start succeeded, so no AP is still inside the
+        // trampoline page (an AP whose start failed never entered it);
+        // preempt discipline is handled by `unmap_identity_page` internally.
         unsafe {
             mm::paging::unmap_identity_page(trampoline_pa);
         }
@@ -654,11 +660,11 @@ unsafe fn kernel_entry_post_rebase(
         // and each AP's idle-stack top), which would reveal the image slide
         // and the direct-map base once the page reaches userspace; zero it
         // before it is minted.
-        // SAFETY: direct map covers the page; no AP is inside it (APS_READY
-        // observed above) and its identity mapping is gone. Volatile so the
-        // scrub of a page never read again by the kernel is not elided.
+        let page = mm::paging::phys_to_virt(trampoline_pa) as *mut u8;
+        // SAFETY: direct map covers the page; no AP is inside it (the started
+        // count observed above) and its identity mapping is gone. Volatile so
+        // the scrub of a page never read again by the kernel is not elided.
         unsafe {
-            let page = mm::paging::phys_to_virt(trampoline_pa) as *mut u8;
             for i in 0..mm::PAGE_SIZE
             {
                 core::ptr::write_volatile(page.add(i), 0);
@@ -1000,6 +1006,7 @@ unsafe fn kernel_entry_post_rebase(
 
             // Write InitInfo header (always fits in first page).
             // SAFETY: info_base is page-aligned; InitInfo fits in one page.
+            // cast_ptr_alignment: page alignment (4096) exceeds InitInfo alignment (4).
             #[allow(clippy::cast_ptr_alignment)]
             unsafe {
                 core::ptr::write(info_base.cast::<InitInfo>(), info);

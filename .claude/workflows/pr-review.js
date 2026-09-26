@@ -93,7 +93,7 @@ const SCOPE_SCHEMA = {
     type: 'object',
     required: [
         'head', 'base', 'repo_root', 'tree_at_head', 'since_reachable', 'pr_has_code', 'files',
-        'pr_files', 'changed_items', 'design_docs', 'claimed_fixes',
+        'pr_files', 'open_issues', 'changed_items', 'design_docs', 'claimed_fixes',
     ],
     properties: {
         head: { type: 'string', description: 'Full SHA of the PR head commit.' },
@@ -138,6 +138,15 @@ const SCOPE_SCHEMA = {
                 'Every file the whole PR diff touches, whatever the mode (a delta after a rebase ' +
                 'can list files outside it).',
         },
+        open_issues: {
+            type: 'array',
+            description: 'Every open Issue of the repository, by number and title.',
+            items: {
+                type: 'object',
+                required: ['number', 'title'],
+                properties: { number: { type: 'integer' }, title: { type: 'string' } },
+            },
+        },
         changed_items: {
             type: 'array',
             items: {
@@ -170,7 +179,7 @@ const FINDING_SCHEMA = {
     type: 'object',
     required: [
         'file', 'line', 'bucket', 'class', 'introduced', 'must_violation', 'in_bound',
-        'authority', 'claim', 'evidence', 'fix',
+        'issue', 'authority', 'claim', 'evidence', 'fix',
     ],
     properties: {
         file: { type: 'string', description: PATH_DESCRIPTION },
@@ -192,7 +201,14 @@ const FINDING_SCHEMA = {
                 'It lies on the review surface (docs/conventions.md § Branch and PR Workflow): ' +
                 'a changed hunk or its containing item, something the change introduces, a ' +
                 'caller or reverse dependency of a changed item, or any correctness, safety, ' +
-                'or contract defect in a touched file.',
+                'or contract defect in a touched file, unless an open Issue already names ' +
+                'the work (then `issue` names it and the finding is off the surface).',
+        },
+        issue: {
+            type: 'integer',
+            description:
+                'The open Issue that already names this work, when one does (0 otherwise); ' +
+                'such a finding is recorded against that Issue, not fixed here.',
         },
         authority: { type: 'string', description: 'Doc path and section, or contract location.' },
         claim: { type: 'string' },
@@ -324,7 +340,8 @@ const SCOPE_PROMPT = [
     '',
     'Run `gh pr view ' + PR + ' --json headRefOid,baseRefName,body,files,commits`, ' +
         '`git merge-base <head> origin/<baseRefName>`, `git rev-parse --show-toplevel`, ' +
-        '`git rev-parse HEAD`, `git status --porcelain`, and `gh pr diff ' + PR + '`.' +
+        '`git rev-parse HEAD`, `git status --porcelain`, `gh pr diff ' + PR + '`, and ' +
+        '`gh issue list --state open --limit 500 --json number,title`.' +
         (DELTA
             ? ' Then run `git cat-file -e ' + SINCE + '^{commit}` (reachability), ' +
                 '`git diff --numstat ' + DELTA_RANGE + '` (a tree diff between the two ' +
@@ -345,6 +362,7 @@ const SCOPE_PROMPT = [
         'linker scripts, build inputs, anything a build embeds), markdown, comment-only (only ' +
         'comment lines changed), rules (`.claude/` and `.github/`), or other.',
     '- pr_files: every file the whole PR diff touches, whatever the mode.',
+    '- open_issues: every open Issue, by number and title.',
     '- changed_items: every public or crate-visible function, type, trait, constant, syscall, ' +
         'or wire-protocol element whose signature, contract, semantics, or documentation the ' +
         'PR diff changes, with the kind of change.',
@@ -384,12 +402,13 @@ const normalize = (p) => {
 }
 for (const f of scope.files) f.path = normalize(f.path)
 // The in-bound gate keys on the PR's own file list; in full mode that is the
-// files list itself, and in delta mode an empty list would silently demote
-// every correctness, safety, and contract finding to recorded.
+// files list itself, and in delta mode an empty list would silently leave
+// every correctness, safety, or contract finding the reviewer marked out of
+// bound recorded. Scope mode returns the plan before the gate applies.
 const pr_files = new Set(
     DELTA ? scope.pr_files.map(normalize) : scope.files.map((f) => f.path),
 )
-if (DELTA && pr_files.size === 0) {
+if (DELTA && MODE !== 'scope' && pr_files.size === 0) {
     return { error: 'scope returned no pr_files; the in-bound gate cannot be applied' }
 }
 for (const i of scope.changed_items) i.file = normalize(i.file)
@@ -437,6 +456,15 @@ const LENS_HEADER = [
     DELTA ? 'Your lens covers the whole PR diff in both modes.' : null,
 ].filter((line) => line !== null).join('\n')
 
+// Work an open Issue already names is off the surface of this PR; every
+// reviewer gets the list so it can set `issue` on such a finding.
+const ISSUES_BLOCK = [
+    'Open Issues (work one of them already names is off the review surface: set `issue` to ' +
+        'its number on such a finding, reading the Issue body when its title matches the ' +
+        'area; 0 otherwise):',
+    bullets(scope.open_issues, (i) => '- #' + i.number + ' ' + i.title),
+].join('\n')
+
 // System-scope documents (the top-level `docs/` tree and the root README)
 // govern every shard; a component's own documents and its parent directory's
 // README govern only that component's shards.
@@ -467,6 +495,8 @@ function shard_prompt(shard) {
         '',
         'Design documents governing this shard (read the relevant ones in full):',
         bullets(docs_for(shard.component), doc_line),
+        '',
+        ISSUES_BLOCK,
         DELTA
             ? '\nClaimed fixes for your files, each to be verified against the code:\n' +
                 bullets(fixes, fix_line)
@@ -554,7 +584,10 @@ if (DELTA) {
 }
 
 const lens_prompt = (lens) =>
-    [LENS_HEADER, '', ...lens.body(), '', 'Fill the structured schema. Structured output only.']
+    [
+        LENS_HEADER, '', ...lens.body(), '', ISSUES_BLOCK, '',
+        'Fill the structured schema. Structured output only.',
+    ]
         .join('\n')
 
 if (MODE === 'scope') {
@@ -642,8 +675,10 @@ function dedup(findings, source) {
     const fresh = []
     for (const f of findings) {
         f.file = normalize(f.file)
+        // Work an open Issue already names is off the surface whatever its class.
         const in_bound =
-            f.in_bound || (ALWAYS_IN_BOUND.includes(f.class) && pr_files.has(f.file))
+            !f.issue &&
+            (f.in_bound || (ALWAYS_IN_BOUND.includes(f.class) && pr_files.has(f.file)))
         const distance = (s) => Math.abs(s.line - f.line)
         const dup = seen
             .filter(
@@ -893,8 +928,9 @@ const SYNTH_PROMPT = [
     'Headings, in this order: `# Pre-merge review: PR #' + PR + '`, `## Critical (blocking)`, ' +
         '`## Should fix`, `## Nit`, `## Recorded for audit (off the review surface)`, ' +
         '`## Dropped by verification`, `## Audit`. The recorded section lists each off-surface ' +
-        'finding with the same fields as the others; they are appended to the audit Issue, ' +
-        'not fixed. Write `(none)` under an empty heading. Do not write verdict lines; the ' +
+        'finding with the same fields as the others, naming its `issue` when set; they are ' +
+        'appended to the audit Issue, or to the open Issue that already names the work, not ' +
+        'fixed. Write `(none)` under an empty heading. Do not write verdict lines; the ' +
         'workflow appends them.',
     '',
     'Findings on the review surface (JSON):',

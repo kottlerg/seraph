@@ -1452,11 +1452,10 @@ unsafe fn kernel_entry_post_rebase(
             debug_assert!(linked, "boot: init enqueue skipped");
         }
 
-        kprintln!(
-            "init: TCB tid=1 priority={} stack={:#x}",
-            sched::INIT_PRIORITY,
-            init_kstack_top
-        );
+        kprintln!("init: TCB tid=1 priority={}", sched::INIT_PRIORITY);
+        // The stack top is a direct-map VA: serial-only, like the KASLR bases
+        // (docs/cross-boundary-disclosure.md § Kernel console diagnostics).
+        kprintln_serial!("init: kernel stack top={init_kstack_top:#x}");
 
         // ── Boot-handover ledger ────────────────────────────────────────────
         // Sum MemoryObject.available_bytes across every Memory cap in init's

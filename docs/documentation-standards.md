@@ -30,8 +30,8 @@ Four documentation scopes exist:
   authoritative source. Summaries MUST NOT introduce normative or
   behavior-bearing content not present in the authoritative source.
 - `.claude/` holds the assistant's operating instructions; its files are outside this
-  hierarchy and are neither authoritative documents nor summaries, and their restatements
-  of a rule name the document that owns it.
+  hierarchy and are neither authoritative documents nor summaries. A restatement of a rule
+  in them MUST name the document that owns it.
 
 ---
 

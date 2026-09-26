@@ -238,7 +238,7 @@ scrubs from this donated page after consuming them. The `version` field is set t
 | `boot_entropy_len` | Valid leading byte count of `boot_entropy_seed`; zero when neither source yields a seed, in which case the kernel seeds from its remaining sources. |
 | `vmgenid_paddr` | Physical address of the 16-byte ACPI VMGENID GUID (QEMU VMGENID SSDT scan in step 9, run wherever an RSDP is present; only x86-64 QEMU wires the device today); zero when absent. |
 | `direct_map_base` | KASLR-chosen direct-map virtual base — a 1 GiB-aligned base at or above the paging mode's kernel-half floor, chosen in step 9 from the KASLR entropy and the final memory map. A KASLR secret; the kernel scrubs it at Phase 5, after its Phase-3 consumers have run. |
-| `kaslr_flags` | `KASLR_*` status bits: which layout dimensions were randomized, the entropy source, and any skip reason (knob / window-limited); when entropy was available, an `ET_EXEC` image carries its source bits with `KASLR_IMAGE_RANDOMIZED` clear (a PIE whose draw selects slide 0 reads the same). Zero means an entirely un-randomized layout. |
+| `kaslr_flags` | `KASLR_*` status bits: which layout dimensions were randomized, the entropy source, and any skip reason (knob / window-limited); `KASLR_IMAGE_RANDOMIZED` marks a slide drawn from entropy whichever slot it selected, so an `ET_EXEC` image with entropy carries its source bits with that bit clear. Zero means an entirely un-randomized layout. |
 
 All arrays pointed to by `BootInfo` fields reside in physical memory that the UEFI
 memory map marks as `Loaded` or `Usable`, ensuring they survive until the kernel

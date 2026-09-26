@@ -29,6 +29,9 @@ Four documentation scopes exist:
   targets (for example `xtask/README.md`). Every summary MUST link its
   authoritative source. Summaries MUST NOT introduce normative or
   behavior-bearing content not present in the authoritative source.
+- `.claude/` holds the assistant's operating instructions; its files are outside this
+  hierarchy and are neither authoritative documents nor summaries, and their restatements
+  of a rule name the document that owns it.
 
 ---
 

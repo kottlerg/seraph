@@ -13,9 +13,9 @@
 // computes the reviewer verdict line itself and derives the audit verdict line
 // from the auditor's per-section verdicts. Findings on the review surface
 // (docs/conventions.md § Branch and PR Workflow) count toward the verdict;
-// findings off it are recorded for the audit Issue. `.claude/CLAUDE.md` § PR
-// workflow operations says when the assistant runs this workflow and what it
-// does with the result.
+// findings off it are recorded for the audit Issue or for the open Issue that
+// already names the work. `.claude/CLAUDE.md` § PR workflow operations says
+// when the assistant runs this workflow and what it does with the result.
 //
 // args: { pr: number, mode: 'full' | 'delta' | 'scope', since?: string }
 //   mode 'full'  reviews every file in the PR diff.
@@ -228,6 +228,10 @@ const VERDICT_SCHEMA = {
     required: ['refuted', 'confidence', 'evidence'],
     properties: {
         refuted: { type: 'boolean' },
+        issue_refuted: {
+            type: 'boolean',
+            description: 'The named open Issue does not name this work (false when none is named).',
+        },
         confidence: { enum: ['high', 'medium', 'low'] },
         evidence: { type: 'string' },
     },
@@ -408,6 +412,8 @@ for (const f of scope.files) f.path = normalize(f.path)
 const pr_files = new Set(
     DELTA ? scope.pr_files.map(normalize) : scope.files.map((f) => f.path),
 )
+const open_issue_numbers = new Set(scope.open_issues.map((i) => i.number))
+const issue_title = (n) => (scope.open_issues.find((i) => i.number === n) || {}).title || ''
 if (DELTA && MODE !== 'scope' && pr_files.size === 0) {
     return { error: 'scope returned no pr_files; the in-bound gate cannot be applied' }
 }
@@ -618,7 +624,8 @@ function verify_prompt(f, lens) {
         '- cited authority: ' + f.authority,
         '- evidence: ' + f.evidence,
         '- proposed fix: ' + f.fix,
-    ].join('\n')
+        f.issue ? '- named open Issue: #' + f.issue + ' ' + issue_title(f.issue) : null,
+    ].filter((line) => line !== null).join('\n')
     const tree =
         'The working tree is checked out at the head; `gh pr diff ' + PR + '` is the diff. ' +
         'A defect may be in code or in a document; an absence (a missing check, test, or ' +
@@ -652,6 +659,12 @@ function verify_prompt(f, lens) {
             'refuted=false when the authority says what is claimed and the location violates ' +
             'it, when the authority is a correctness contract the location breaks, and also ' +
             'when you can neither confirm nor refute it; say so, with confidence low. ' +
+            (f.issue
+                ? 'The finding names an open Issue as already covering this work, which takes ' +
+                    'it off the review surface: read that Issue (`gh issue view ' + f.issue +
+                    '`) and set issue_refuted=true when it does not name this work; that ' +
+                    'judgement is separate from refuted. '
+                : '') +
             'Structured output only.',
     ].join('\n')
 }
@@ -675,10 +688,15 @@ function dedup(findings, source) {
     const fresh = []
     for (const f of findings) {
         f.file = normalize(f.file)
-        // Work an open Issue already names is off the surface whatever its class.
-        const in_bound =
-            !f.issue &&
-            (f.in_bound || (ALWAYS_IN_BOUND.includes(f.class) && pr_files.has(f.file)))
+        // Work an open Issue already names is off the surface whatever its
+        // class; an Issue number that is not open is not a placement.
+        if (f.issue && !open_issue_numbers.has(f.issue)) {
+            log(source + ': ' + f.file + ':' + f.line + ' names #' + f.issue +
+                ', not an open Issue; kept on the surface')
+            f.issue = 0
+        }
+        const surface = f.in_bound || (ALWAYS_IN_BOUND.includes(f.class) && pr_files.has(f.file))
+        const in_bound = !f.issue && surface
         const distance = (s) => Math.abs(s.line - f.line)
         const dup = seen
             .filter(
@@ -690,13 +708,24 @@ function dedup(findings, source) {
             .sort((a, b) => distance(a) - distance(b))[0]
         if (dup) {
             dup.duplicates += 1
-            dup.in_bound = dup.in_bound || in_bound
+            // Placement is reconciled with the Issue: a record that lands on the
+            // surface carries no Issue, and an off-surface record adopts the
+            // Issue a later reporter named.
+            if (in_bound && !dup.in_bound) {
+                dup.evidence += '\n[placed on the surface by ' + source +
+                    (dup.issue ? '; ' + dup.sources[0] + ' named #' + dup.issue : '') + ']'
+                dup.in_bound = true
+                dup.issue = 0
+            } else if (!dup.in_bound && !dup.issue && f.issue) {
+                dup.issue = f.issue
+            }
             dup.sources.push(source)
             dup.evidence += '\n[also reported by ' + source + ': ' + f.claim + '] ' + f.evidence
             continue
         }
         const record = {
-            ...f, in_bound, sources: [source], duplicates: 0, status: 'pending', votes: [],
+            ...f, in_bound, surface, sources: [source], duplicates: 0, status: 'pending',
+            votes: [],
         }
         seen.push(record)
         fresh.push(record)
@@ -741,6 +770,14 @@ function verify_one(f) {
         else if (all_refute) f.status = 'dropped'
         else if (refutes > 0) f.status = 'contested'
         else f.status = 'confirmed'
+        // A refuted Issue claim puts the finding back where the surface
+        // definition places it.
+        if (f.issue && valid.some((v) => v.issue_refuted)) {
+            log(f.file + ':' + f.line + ': #' + f.issue + ' does not name this work; ' +
+                'placed on the surface')
+            f.issue = 0
+            f.in_bound = f.surface
+        }
         f.votes = valid
         return f
     })
@@ -805,7 +842,8 @@ const all = results.flatMap((r) => r.findings)
 const dropped = all.filter((f) => f.status === 'dropped')
 const surviving = all.filter((f) => f.status !== 'dropped')
 // Findings on the review surface are fixed; findings off it are recorded for
-// the audit Issue and do not count toward the verdict.
+// the audit Issue or for the open Issue that already names the work, and do
+// not count toward the verdict.
 const findings = surviving.filter((f) => f.in_bound)
 const recorded = surviving.filter((f) => !f.in_bound)
 const count = (status) => findings.filter((f) => f.status === status).length

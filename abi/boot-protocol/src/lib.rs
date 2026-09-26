@@ -866,9 +866,9 @@ pub struct BootInfo
     /// (`boot_entropy_seed`/`_len` zeroed) before Phase 7 — this page is a reclaim
     /// range donated to userspace, so the secret seed must not outlive boot.
     ///
-    /// Pre-conditioned by its source (see `core/kernel/docs/entropy.md` § Health
-    /// tests), so the kernel absorbs it directly without the raw-source health
-    /// gating.
+    /// Absorbed directly without raw-source health gating: a conditioned
+    /// `EFI_RNG_PROTOCOL` output, or the firmware-supplied bytes of the DTB
+    /// fallback (see `core/kernel/docs/entropy.md` § Health tests).
     pub boot_entropy_seed: [u8; 32],
 
     /// Number of valid leading bytes in `boot_entropy_seed`. `0` means the

@@ -590,10 +590,6 @@ unsafe fn kernel_entry_post_rebase(
                 }
 
                 let entry_fn = kernel_entry_ap as *const () as u64;
-                // APs that came online; an AP whose start failed never
-                // increments `APS_READY`, so the wait below keys on this
-                // count, not on `cpu_idx`.
-                let mut started = 0u32;
 
                 for cpu_idx in 1..=ap_count
                 {
@@ -614,20 +610,21 @@ unsafe fn kernel_entry_post_rebase(
                             stack_top,
                         )
                     };
+                    // Every CPU below `CPU_COUNT` is assumed online from here
+                    // on (IPI targets, scheduler placement, affinity), so a CPU
+                    // that cannot be started is fatal rather than skipped.
                     if !ok
                     {
-                        kprintln!("smp: start_ap(cpu={}) failed", cpu_idx);
-                        continue;
+                        fatal("smp: start_ap failed; a listed CPU cannot be brought online");
                     }
-                    started += 1;
 
-                    while APS_READY.load(Ordering::Acquire) < started
+                    while APS_READY.load(Ordering::Acquire) < cpu_idx as u32
                     {
                         core::hint::spin_loop();
                     }
                 }
 
-                kprintln!("smp: {} of {} AP(s) online", started, ap_count);
+                kprintln!("smp: all {} AP(s) online", ap_count);
             }
         }
     }
@@ -649,17 +646,14 @@ unsafe fn kernel_entry_post_rebase(
     #[cfg(not(test))]
     if trampoline_pa != 0
     {
-        // SAFETY: the Acquire wait above observed `APS_READY` reach the
-        // count of APs whose start succeeded, so no AP is still inside the
-        // trampoline page (an AP whose start failed never entered it);
-        // preempt discipline is handled by `unmap_identity_page` internally.
+        // SAFETY: the Acquire wait above observed `APS_READY` reach the AP
+        // count, so no AP is still inside the trampoline page; preempt
+        // discipline is handled by `unmap_identity_page` internally.
         unsafe {
             mm::paging::unmap_identity_page(trampoline_pa);
         }
-        // The page's parameter slots carried kernel VAs (the AP entry point
-        // and each AP's idle-stack top), which would reveal the image slide
-        // and the direct-map base once the page reaches userspace; zero it
-        // before it is minted.
+        // Zero the page before its late-reclaim cap is minted; its slots
+        // carried kernel VAs (docs/initialization.md § Phase 8).
         let page = mm::paging::phys_to_virt(trampoline_pa) as *mut u8;
         // SAFETY: direct map covers the page; no AP is inside it (the started
         // count observed above) and its identity mapping is gone. Volatile so
@@ -1006,7 +1000,7 @@ unsafe fn kernel_entry_post_rebase(
 
             // Write InitInfo header (always fits in first page).
             // SAFETY: info_base is page-aligned; InitInfo fits in one page.
-            // cast_ptr_alignment: page alignment (4096) exceeds InitInfo alignment (4).
+            // cast_ptr_alignment: page alignment (4096) exceeds InitInfo alignment (8).
             #[allow(clippy::cast_ptr_alignment)]
             unsafe {
                 core::ptr::write(info_base.cast::<InitInfo>(), info);
@@ -1080,7 +1074,7 @@ unsafe fn kernel_entry_post_rebase(
             // referential cap slot range.
             // SAFETY: info_base mapped writable through the direct map;
             // header lives at offset 0; single-threaded boot.
-            // cast_ptr_alignment: page alignment (4096) exceeds InitInfo alignment (4).
+            // cast_ptr_alignment: page alignment (4096) exceeds InitInfo alignment (8).
             #[allow(clippy::cast_ptr_alignment)]
             unsafe {
                 let info_ptr = info_base.cast::<InitInfo>();
@@ -1188,7 +1182,7 @@ unsafe fn kernel_entry_post_rebase(
         // Patch InitInfo with the just-minted stack cap slot range.
         // SAFETY: info_page_virt mapped writable through the direct map;
         // header at offset 0; single-threaded boot.
-        // cast_ptr_alignment: page alignment (4096) exceeds InitInfo alignment (4).
+        // cast_ptr_alignment: page alignment (4096) exceeds InitInfo alignment (8).
         #[allow(clippy::cast_ptr_alignment)]
         unsafe {
             let info_ptr = info_page_virt.cast::<init_protocol::InitInfo>();
@@ -1204,7 +1198,7 @@ unsafe fn kernel_entry_post_rebase(
         let kernel_reserved = system_ram.saturating_sub(cap::owns_memory_minted_bytes());
         // SAFETY: info_page_virt mapped writable through the direct map;
         // header at offset 0; single-threaded boot.
-        // cast_ptr_alignment: page alignment (4096) exceeds InitInfo alignment (4).
+        // cast_ptr_alignment: page alignment (4096) exceeds InitInfo alignment (8).
         #[allow(clippy::cast_ptr_alignment)]
         unsafe {
             let info_ptr = info_page_virt.cast::<init_protocol::InitInfo>();
@@ -1417,7 +1411,7 @@ unsafe fn kernel_entry_post_rebase(
         // SAFETY: info_page_virt points to a kernel-writable page (mapped
         // read-only in userspace but writable via the direct physical map);
         // single-threaded boot; the write is within the InitInfo struct bounds.
-        // cast_ptr_alignment: page alignment (4096) exceeds InitInfo alignment (4).
+        // cast_ptr_alignment: page alignment (4096) exceeds InitInfo alignment (8).
         #[allow(clippy::cast_ptr_alignment)]
         unsafe {
             let info_ptr = info_page_virt.cast::<init_protocol::InitInfo>();

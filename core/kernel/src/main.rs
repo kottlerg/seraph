@@ -581,7 +581,7 @@ unsafe fn kernel_entry_post_rebase(
             if trampoline_pa == 0
             {
                 // A listed CPU that cannot be started is fatal
-                // (docs/initialization.md § Phase 8).
+                // (core/kernel/docs/initialization.md § Phase 8).
                 fatal("smp: no AP trampoline page; listed CPUs cannot be brought online");
             }
             else
@@ -616,9 +616,11 @@ unsafe fn kernel_entry_post_rebase(
                             stack_top,
                         )
                     };
-                    // Every CPU below `CPU_COUNT` is assumed online from here
-                    // on (IPI targets, scheduler placement, affinity), so a CPU
-                    // that cannot be started is fatal rather than skipped.
+                    // A listed CPU that cannot be started is fatal
+                    // (core/kernel/docs/initialization.md § Phase 8); on x86-64
+                    // SIPI delivery is unacknowledged, so `start_ap` cannot
+                    // report one and a CPU that never answers leaves the wait
+                    // below spinning.
                     if !ok
                     {
                         fatal("smp: start_ap failed; a listed CPU cannot be brought online");
@@ -659,7 +661,7 @@ unsafe fn kernel_entry_post_rebase(
             mm::paging::unmap_identity_page(trampoline_pa);
         }
         // Zero the page before its late-reclaim cap is minted; its parameter
-        // block carried kernel VAs (docs/initialization.md § Phase 8).
+        // block carried kernel VAs (core/kernel/docs/initialization.md § Phase 8).
         let page = mm::paging::phys_to_virt(trampoline_pa) as *mut u8;
         // SAFETY: direct map covers the page; no AP is inside it (the started
         // count observed above) and its identity mapping is gone. Volatile so
@@ -1454,7 +1456,8 @@ unsafe fn kernel_entry_post_rebase(
 
         kprintln!("init: TCB tid=1 priority={}", sched::INIT_PRIORITY);
         // The stack top is a direct-map VA: serial-only, like the KASLR bases
-        // (docs/cross-boundary-disclosure.md § Kernel console diagnostics).
+        // (core/kernel/docs/cross-boundary-disclosure.md § Kernel console
+        // diagnostics).
         kprintln_serial!("init: kernel stack top={init_kstack_top:#x}");
 
         // ── Boot-handover ledger ────────────────────────────────────────────

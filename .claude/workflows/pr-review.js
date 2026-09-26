@@ -718,16 +718,28 @@ function dedup(findings, source) {
             .sort((a, b) => distance(a) - distance(b))[0]
         if (dup) {
             dup.duplicates += 1
-            // Placement is reconciled with the Issue: a record that lands on the
-            // surface carries no Issue, and an off-surface record adopts the
-            // Issue a later reporter named.
+            // Placement is reconciled with the Issue. A record that names an
+            // Issue keeps it and its off-surface placement: whether the Issue
+            // covers the work is the authority refuter's call (issue_refuted),
+            // not a later reporter's omission. A record without an Issue moves
+            // onto the surface when a later reporter places it there, and
+            // adopts a later reporter's Issue only while its verification has
+            // not started, since the refuters see the Issue in their prompt.
             if (in_bound && !dup.in_bound) {
-                dup.evidence += '\n[placed on the surface by ' + source +
-                    (dup.issue ? '; ' + dup.sources[0] + ' named #' + dup.issue : '') + ']'
-                dup.in_bound = true
-                dup.issue = 0
+                if (dup.issue) {
+                    dup.evidence += '\n[placed on the surface by ' + source + '; ' +
+                        dup.sources[0] + ' named #' + dup.issue + ']'
+                } else {
+                    dup.evidence += '\n[placed on the surface by ' + source + ']'
+                    dup.in_bound = true
+                }
             } else if (!dup.in_bound && !dup.issue && f.issue) {
-                dup.issue = f.issue
+                if (dup.verify_started) {
+                    dup.evidence +=
+                        '\n[' + source + ' named #' + f.issue + ' after verification began]'
+                } else {
+                    dup.issue = f.issue
+                }
             }
             dup.sources.push(source)
             dup.evidence += '\n[also reported by ' + source + ': ' + f.claim + '] ' + f.evidence
@@ -735,7 +747,7 @@ function dedup(findings, source) {
         }
         const record = {
             ...f, in_bound, surface, sources: [source], duplicates: 0, status: 'pending',
-            votes: [],
+            votes: [], verify_started: false,
         }
         seen.push(record)
         fresh.push(record)
@@ -750,6 +762,7 @@ function verify_one(f) {
         f.status = 'nit'
         return Promise.resolve(f)
     }
+    f.verify_started = true
     return parallel(
         VERIFY_LENSES.map((lens) => () => {
             // The 1-based record index keeps the label unique when two records

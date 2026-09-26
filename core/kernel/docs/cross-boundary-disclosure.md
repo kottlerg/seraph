@@ -145,7 +145,7 @@ Memory the bootloader used is a related surface, whether it is donated
 through `reclaim_ranges` or returned by the memory map as usable and drained
 at Phase 7. The `BootInfo` page is scrubbed of the seed and the two KASLR
 bases in Phase 5, and the AP trampoline page is zeroed in Phase 8 before its
-late-reclaim cap is minted, because its parameter slots carried the AP entry
+late-reclaim cap is minted, because its parameter block carried the AP entry
 point and idle-stack VAs ([initialization.md](initialization.md) § Phase 5
 and § Phase 8). The bootloader's transient page-table frames (a
 `reclaim_ranges` entry) and the UEFI stack it ran on (BootServicesData,

@@ -357,7 +357,7 @@ are excluded because `mint_module_memory_caps` already covers them).
    independence and basic sanity, printing PASS/FAIL (see entropy.md).
 6. Tear down the low-VA identity mapping at the trampoline PA via
    mm::paging::unmap_identity_page (TLB shootdown to all other CPUs), then
-   zero the page through the direct map: its parameter slots carried the
+   zero the page through the direct map: its parameter block carried the
    AP entry point and idle-stack VAs, which would reveal the layout.
 7. Mint a late-reclaim Memory cap over the trampoline page via
    cap::mint_late_reclaim_memory_caps; the descriptor lands in
@@ -381,7 +381,8 @@ state, so SMP bringup completes within Phase 8 and the trampoline page
 is reclaim-safe by the time Phase 9 consumes `cspace_layout`.
 
 **Failure mode:** Allocation failure for any idle stack or TCB halts with
-"fatal: cannot initialise scheduler". A `start_ap` failure for any AP is
+"fatal: cannot initialise scheduler". A `start_ap` failure for any AP, or
+a zero `BootInfo.ap_trampoline_page` with more than one CPU listed, is
 fatal: every CPU the boot reported is assumed online from Phase 8 on (IPI
 targets, scheduler placement, affinity), so a CPU that cannot be started
 halts the boot with a descriptive message.

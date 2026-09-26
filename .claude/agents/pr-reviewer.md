@@ -32,7 +32,9 @@ discipline below has been applied end-to-end.
     the code, and report: every claimed fix not actually made; every finding
     in the changed hunks; any correctness, soundness, safety, or contract
     defect anywhere in the file. A standards, doc-drift, coverage, or style
-    finding on a line the delta did not introduce is out of bound.
+    finding the delta did not introduce is out of bound; a statement the
+    delta made stale, or a test the delta's new code lacks, is one the delta
+    introduced wherever it anchors.
 
     A lens prompt (call sites, design documents, cross-boundary surfaces,
     regression) names one concern over the whole diff instead of shard
@@ -120,11 +122,12 @@ test; `style`: readability and naming), whether the diff `introduced` it
 (in `delta` mode, whether the delta did), whether it is a
 `must_violation` of a binding standard, whether it is `in_bound` (on the
 review surface; a correctness, soundness, safety, or contract defect in
-a touched file is, unless an open Issue already names the work), the
-`issue` that names it when one does (the parent lists the open Issues),
-the `authority`, the `claim`, the `evidence`, and the `fix`. There is no
-final line in schema mode; the workflow computes the verdict from the
-entries.
+a touched file is, unless an open Issue already names the work; in a
+delta run, a standards, doc-drift, coverage, or style finding only when
+the delta introduced it), the `issue` that names it when one does (the
+parent lists the open Issues), the `authority`, the `claim`, the
+`evidence`, and the `fix`. There is no final line in schema mode; the
+workflow computes the verdict from the entries.
 
 **In prose mode the final line MUST be exactly one of:** `READY TO MERGE`,
 `BLOCKING ISSUES`, `NON-BLOCKING ISSUES ONLY`. Any in-bound Critical item

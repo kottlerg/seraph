@@ -64,7 +64,7 @@ truth for "how work is tracked and shipped" on this project.
   Workflow tool is unavailable, invoke `@pr-reviewer` and `@pr-auditor`
   directly in parallel (single message, two `Agent` tool calls) with the
   PR number as scope and the open Issue list (`gh issue list --state
-  open --json number,title`), and the same verdict handling.
+  open --limit 500 --json number,title`), and the same verdict handling.
 
   Findings on the review surface are fixed as one batch per run, whatever
   their severity, and findings off it are recorded in the same pass:

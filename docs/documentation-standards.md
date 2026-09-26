@@ -36,7 +36,7 @@ Four documentation scopes exist:
 
 - An **authoritative** document is the primary specification for the content it contains.
 - A **summary** condenses content owned by an authoritative document. A summary is prose
-  that restates a rule, invariant, or behaviour the authoritative document owns. A
+  that restates a rule, invariant, or behavior the authoritative document owns. A
   directory-index table row, a citation of a constant's value, or a cross-reference that
   points at the document without restating its content is not a summary.
 - Higher-level documents MAY summarize lower-level documents.
@@ -51,9 +51,8 @@ Four documentation scopes exist:
 Every authoritative document MUST include a `## Summarized By` section at the end of the
 document (after a `---` separator) listing every document that contains a summary of its
 content (as § Authority and Duplication defines a summary), regardless of hierarchical
-relationship. Structural parent READMEs are not
-implicitly exempt; if a parent README summarizes a child doc, the parent MUST appear in
-the child's `## Summarized By` list.
+relationship. Structural parent READMEs are not implicitly exempt; if a parent README
+summarizes a child doc, the parent MUST appear in the child's `## Summarized By` list.
 
 ```markdown
 ---

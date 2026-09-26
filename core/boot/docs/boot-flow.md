@@ -164,7 +164,8 @@ Detail: [firmware-parsing.md](firmware-parsing.md)
 
 Before the page tables are built, the bootloader chooses a 2 MiB-aligned kernel
 image slide within the top-2 GiB window from the KASLR entropy (0 when no entropy,
-or when the `\EFI\seraph\nokaslr` override knob is present), applies the kernel's
+when the `\EFI\seraph\nokaslr` override knob is present, or for an `ET_EXEC` kernel,
+whose direct-map base is still randomized), applies the kernel's
 `RELATIVE` relocations through the loaded span, and biases the recorded kernel
 virtual base and entry point. The matching 1 GiB-aligned direct-map base is chosen
 in step 9 once the final memory map is known. The chosen layout and its entropy

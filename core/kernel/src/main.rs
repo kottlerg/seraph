@@ -576,7 +576,9 @@ unsafe fn kernel_entry_post_rebase(
         {
             if trampoline_pa == 0
             {
-                kprintln!("smp: no AP trampoline page — SMP disabled");
+                // Every listed CPU is assumed online from Phase 8 on, so a
+                // boot that lists APs but cannot start them does not proceed.
+                fatal("smp: no AP trampoline page; listed CPUs cannot be brought online");
             }
             else
             {
@@ -652,8 +654,8 @@ unsafe fn kernel_entry_post_rebase(
         unsafe {
             mm::paging::unmap_identity_page(trampoline_pa);
         }
-        // Zero the page before its late-reclaim cap is minted; its slots
-        // carried kernel VAs (docs/initialization.md § Phase 8).
+        // Zero the page before its late-reclaim cap is minted; its parameter
+        // block carried kernel VAs (docs/initialization.md § Phase 8).
         let page = mm::paging::phys_to_virt(trampoline_pa) as *mut u8;
         // SAFETY: direct map covers the page; no AP is inside it (the started
         // count observed above) and its identity mapping is gone. Volatile so

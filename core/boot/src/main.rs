@@ -910,7 +910,9 @@ fn scrub(bytes: &mut [u8])
 ///
 /// The slide comes from the bootloader's KASLR entropy draw. It is forced to
 /// 0 — the deterministic layout — when no entropy was available or when the
-/// `\EFI\seraph\nokaslr` override knob is present. Relocations are applied
+/// `\EFI\seraph\nokaslr` override knob is present, and an `ET_EXEC` kernel is
+/// pinned to slide 0 while the direct-map base is still randomized.
+/// Relocations are applied
 /// even at slide 0, so the mapped image never depends on lld having
 /// pre-filled the RELATIVE targets. The KASLR entropy word is scrubbed before
 /// return.
@@ -935,7 +937,15 @@ unsafe fn step5d_apply_kaslr_slide(
     }
     else if entropy.kaslr_available
     {
-        let slide = boot_protocol::layout::image_slide(entropy.kaslr[0], info.size);
+        // An ET_EXEC kernel cannot slide (elf-loading.md § ELF Validation).
+        let slide = if info.is_pie
+        {
+            boot_protocol::layout::image_slide(entropy.kaslr[0], info.size)
+        }
+        else
+        {
+            0
+        };
         let mut f = entropy.kaslr_source_flag;
         if slide != 0
         {

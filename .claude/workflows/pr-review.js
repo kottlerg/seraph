@@ -71,8 +71,10 @@ const MAX_SHARD_LINES = 500 // changed lines per shard reviewer
 const MAX_LENS_DOCS = 8 // design documents per design-docs lens agent
 const DEDUP_LINE_SLACK = 3 // lines apart at which same file, class, bucket, and flag are one
 const VERIFY_LENSES = ['reality', 'authority']
-// A defect of these classes in a touched file is on the review surface.
+// A defect of these classes in a touched file is on the review surface; the
+// remaining classes are on it in a delta run only when the delta introduced them.
 const ALWAYS_IN_BOUND = ['correctness', 'safety', 'contract']
+const SOFT_CLASSES = ['standards', 'doc-drift', 'coverage', 'style']
 // The sections pr-auditor's Output lists; the audit must return each of them.
 const AUDIT_SECTION_NAMES = [
     'PR-body checklist', 'per-issue closure', 'silent-deferral scan', 'test-plan honesty',
@@ -206,7 +208,9 @@ const FINDING_SCHEMA = {
                 'a changed hunk or its containing item, something the change introduces, a ' +
                 'caller or reverse dependency of a changed item, or any correctness, safety, ' +
                 'or contract defect in a touched file, unless an open Issue already names ' +
-                'the work (then `issue` names it and the finding is off the surface).',
+                'the work (then `issue` names it and the finding is off the surface); in a ' +
+                'delta run, a standards, doc-drift, coverage, or style finding only when the ' +
+                'delta introduced it.',
         },
         issue: {
             type: 'integer',
@@ -701,7 +705,7 @@ function dedup(findings, source) {
         }
         // In a delta run a soft-class finding is on the surface only when the
         // delta introduced it.
-        const soft_preexisting = DELTA && !ALWAYS_IN_BOUND.includes(f.class) && !f.introduced
+        const soft_preexisting = DELTA && SOFT_CLASSES.includes(f.class) && !f.introduced
         const surface =
             !soft_preexisting &&
             (f.in_bound || (ALWAYS_IN_BOUND.includes(f.class) && pr_files.has(f.file)))

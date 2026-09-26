@@ -844,8 +844,9 @@ pub struct BootInfo
     ///   physical address for the entry point, so no placement constraint
     ///   applies beyond page alignment.
     ///
-    /// Zero if the bootloader could not reserve a trampoline page (SMP will
-    /// then be unavailable; the kernel continues BSP-only).
+    /// Zero if the bootloader could not reserve a trampoline page; the kernel
+    /// then halts at Phase 8 when more than one CPU is listed, since every
+    /// listed CPU is assumed online from there on.
     pub ap_trampoline_page: u64,
 
     // ── Reclaimable scratch (added in protocol version 7) ─────────────────────

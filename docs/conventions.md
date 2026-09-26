@@ -194,9 +194,10 @@ are forbidden; `master` MUST NOT receive force pushes.
   resolve in the same PR as a fix, as a clarification of the rule it
   misread, or, when the maintainer finds it false on the facts, as a
   clarification of the code or document it misread; off the surface it is
-  recorded on the audit Issue with the maintainer's answer, or, when it
-  misread a rule, resolved by the clarification of that rule alone, which
-  is its record. A finding MUST NOT be waived or ruled outside the
+  recorded, with the maintainer's answer, on the Issue that records it (the
+  open Issue that already names the work, else the audit Issue), or, when
+  it misread a rule, resolved by the clarification of that rule alone,
+  which is its record. A finding MUST NOT be waived or ruled outside the
   standards. The merge prompt MUST follow a completed run with no failed
   agent, `READY TO MERGE`, and `AUDIT PASS`. `.claude/CLAUDE.md` § PR
   workflow operations gives the assistant's procedure.
@@ -212,7 +213,9 @@ are forbidden; `master` MUST NOT receive force pushes.
   (or to a new one, filed with the maintainer's approval) before the merge
   prompt. Nothing found is dropped. Work an open Issue already names, filed
   with the maintainer's approval, is off the surface of every other PR; a
-  finding on it is recorded against that Issue.
+  finding on it is recorded against that Issue. A finding two independent
+  refuters refute on evidence is dropped and listed in the report's Dropped
+  section; every other finding is fixed or recorded.
 
 ### Branch naming
 

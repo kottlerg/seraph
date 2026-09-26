@@ -36,10 +36,12 @@ transfers them to memmgr (derive-twice). From that point on, memmgr is
 the sole userspace authority over RAM frame allocation; the kernel does
 not delegate further to anyone.
 
-The handoff is total. At Phase 7 the kernel takes its bounded reserves
-from the buddy (which contributors, and in what order, is in
-[initialization.md](../core/kernel/docs/initialization.md) § Phase 7),
-drains **every** remaining page into userspace Memory caps — coalescing
+The handoff is total. By the end of Phase 7 the kernel has taken its
+bounded reserves from the buddy (the Phase 4 per-CPU storage and the Phase
+7 contributors, in the order
+[initialization.md](../core/kernel/docs/initialization.md) § Phase 4 and
+§ Phase 7 give), drains **every** remaining page into userspace Memory
+caps — coalescing
 physically-adjacent drained blocks into the fewest contiguous caps so the
 cap count tracks memory-map fragmentation, not total RAM — and *seals* the
 buddy.

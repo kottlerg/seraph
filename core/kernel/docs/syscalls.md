@@ -9,7 +9,8 @@ specifications, error codes, and atomicity guarantees.
   enum, scheduling and message constants. This is the binary contract: `#[repr(C)]`,
   `no_std`, no deps outside `core`. Both the kernel and userspace depend on it. Changes
   here are ABI breaks.
-- `shared/syscall/` — Rust wrapper functions for userspace. Thin inline-asm wrappers
+- [`shared/syscall/`](../../../shared/syscall/README.md) — Rust wrapper functions for
+  userspace. Thin inline-asm wrappers
   around the abi constants. No stability obligation; internal code reuse only.
 
 ---

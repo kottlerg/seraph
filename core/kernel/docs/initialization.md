@@ -381,8 +381,10 @@ state, so SMP bringup completes within Phase 8 and the trampoline page
 is reclaim-safe by the time Phase 9 consumes `cspace_layout`.
 
 **Failure mode:** Allocation failure for any idle stack or TCB halts with
-"fatal: cannot initialise scheduler". `start_ap` failure for an
-individual AP is logged and skipped (that CPU stays offline).
+"fatal: cannot initialise scheduler". A `start_ap` failure for any AP is
+fatal: every CPU the boot reported is assumed online from Phase 8 on (IPI
+targets, scheduler placement, affinity), so a CPU that cannot be started
+halts the boot with a descriptive message.
 
 **Completion criterion:** Per-CPU scheduler state and idle threads are
 initialised for all CPUs, every AP has incremented `APS_READY`, the
@@ -512,7 +514,7 @@ that CPU only; the BSP and other CPUs continue.
 | 5 | CPU hardware (IDT/GDT/TSS/stvec); seed entropy pool | Halt: hardware initialisation failure |
 | 6 | Platform resource validation | Halt if entries pointer is null with non-zero count; bad entries skipped |
 | 7 | Capability system + root CSpace | Halt: OOM |
-| 8 | Scheduler + idle threads, SMP bringup, AP trampoline reclaim, entropy self-test | Halt: OOM (idle stack/TCB); start_ap failure per CPU is logged and skipped |
+| 8 | Scheduler + idle threads, SMP bringup, AP trampoline reclaim, entropy self-test | Halt: OOM (idle stack/TCB); start_ap failure for any CPU |
 | 9 | Init creation + scheduler entry (user mode) | Halt: invalid InitImage or OOM |
 
 ---
@@ -523,4 +525,5 @@ that CPU only; the BSP and other CPUs continue.
 [docs/memory-model.md](../../../docs/memory-model.md),
 [docs/userspace-memory-model.md](../../../docs/userspace-memory-model.md),
 [cross-boundary-disclosure.md](cross-boundary-disclosure.md),
-[boot/docs/boot-flow.md](../../boot/docs/boot-flow.md)
+[boot/docs/boot-flow.md](../../boot/docs/boot-flow.md),
+[boot/docs/memory-map.md](../../boot/docs/memory-map.md)

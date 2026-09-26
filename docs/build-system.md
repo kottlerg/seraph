@@ -47,7 +47,7 @@ protocol ABI; both the bootloader and kernel depend on it. The kernel-entry cont
 ABI supports is in [`core/boot/docs/kernel-handoff.md`](../core/boot/docs/kernel-handoff.md).
 [`abi/syscall`](../abi/syscall/README.md) defines syscall numbers, argument layout, and
 return codes; both the kernel and userspace import it. Inline assembly that invokes
-syscalls lives in `shared/syscall`.
+syscalls lives in [`shared/syscall`](../shared/syscall/README.md).
 
 ---
 

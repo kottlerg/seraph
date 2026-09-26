@@ -256,7 +256,8 @@ by [kernel-handoff.md](kernel-handoff.md).
 
 Every pointer in `BootInfo` is a physical address. The kernel cannot dereference
 these pointers through its own virtual address space until its direct physical map is
-active (Phase 3 of kernel initialisation). Before that point, the kernel accesses
+active (Phase 3 of [kernel initialisation](../../kernel/docs/initialization.md)). Before
+that point, the kernel accesses
 `BootInfo` fields through the identity mapping established in step 6.
 
 The `BootInfo` structure itself must not be placed in a region the kernel will

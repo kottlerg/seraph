@@ -262,9 +262,11 @@ event queues, wait sets, address spaces, CSpaces — is carved out of a Memory
 capability by retype and returned to it when the object's last capability is
 deleted; see [capability-model.md](capability-model.md) § Auto-reclaim. The
 kernel's own objects come from the SEED reserve pinned at the Phase 7
-handoff, after which the buddy is sealed and every other page of RAM is a
-userspace Memory capability; the reservation order is in
-[initialization.md](../core/kernel/docs/initialization.md) § Phase 7.
+handoff, after which the buddy is sealed and every page of RAM is either a
+bounded fixed kernel reserve or a userspace Memory capability; the reserves
+and their order are in
+[initialization.md](../core/kernel/docs/initialization.md) § Phase 4 and
+§ Phase 7.
 
 Address spaces and CSpaces additionally own a pool that their page tables or
 slot pages come from, carved from a Memory capability with the object and grown
@@ -283,4 +285,5 @@ Retype and pool allocation MUST be handled as fallible at every call site.
 [README.md](../README.md), [Architecture Overview](architecture.md),
 [xtask/README.md](../xtask/README.md),
 [Memory Subsystem Internals](../core/kernel/docs/memory-internals.md),
-[kernel/README.md](../core/kernel/README.md)
+[kernel/README.md](../core/kernel/README.md), [boot/README.md](../core/boot/README.md),
+[Platform Requirements](platform-requirements.md)

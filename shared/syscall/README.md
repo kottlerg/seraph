@@ -16,4 +16,5 @@ syscall specification.
 
 ## Summarized By
 
-None
+[core/kernel/docs/syscalls.md](../../core/kernel/docs/syscalls.md),
+[docs/build-system.md](../../docs/build-system.md)

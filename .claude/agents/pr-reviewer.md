@@ -38,6 +38,10 @@ discipline below has been applied end-to-end.
     files: apply steps 3 to 6 to what the lens names, report only within
     that concern, and leave the rest to the shard reviewers.
 
+    When the parent supplies no open-Issue list, run
+    `gh issue list --state open --limit 500 --json number,title` and read
+    the body of any Issue whose title matches the area.
+
 3. For every file in the diff, read the **whole file**, not just the hunks.
 
 4. Identify the binding authority for the touched surface by walking the
@@ -123,7 +127,8 @@ from the entries.
 **In prose mode the final line MUST be exactly one of:** `READY TO MERGE`,
 `BLOCKING ISSUES`, `NON-BLOCKING ISSUES ONLY`. Any in-bound Critical item
 or MUST violation forces `BLOCKING ISSUES`; out-of-bound findings are
-listed for the audit Issue and do not affect the line.
+listed, each naming the Issue that records it (the open Issue that already
+names the work, else the audit Issue), and do not affect the line.
 
 ## Tool discipline
 

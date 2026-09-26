@@ -50,9 +50,10 @@ mixed with timing jitter before any byte is drawn.
 Three source classes are mixed into the pool:
 
 - **Firmware boot seed** — a conditioned draw the bootloader passes to the
-  kernel in `BootInfo` (`boot_entropy_seed` / `boot_entropy_len`, boot protocol
-  v9): UEFI `EFI_RNG_PROTOCOL` output (a DRBG output) or, for firmware that
-  delivers a DTB, the firmware-supplied bytes of `/chosen/rng-seed`;
+  kernel in [`BootInfo`](../../../abi/boot-protocol/src/lib.rs)
+  (`boot_entropy_seed` / `boot_entropy_len`, boot protocol v9): UEFI
+  `EFI_RNG_PROTOCOL` output (a DRBG output) or, for firmware that delivers a
+  DTB, the firmware-supplied bytes of `/chosen/rng-seed`;
   [boot-flow.md](../../boot/docs/boot-flow.md) step 5c owns the draw.
   Pre-conditioned by its source, so it is absorbed directly rather than
   health-gated. The protocol is present wherever the firmware implements it or a
@@ -171,8 +172,9 @@ execution history forks.
   `VGIA` named DWORD holds the linker-patched `etc/vmgenid_guid` blob base;
   the GUID sits 40 bytes in. There is no AML interpreter anywhere in the tree,
   so the generic (AML `ADDR`-evaluating) discovery path is out of scope. The
-  address reaches the kernel as `BootInfo.vmgenid_paddr` (boot protocol v13;
-  zero = absent).
+  address reaches the kernel as
+  [`BootInfo.vmgenid_paddr`](../../../abi/boot-protocol/src/lib.rs) (boot
+  protocol v13; zero = absent).
 - **Detection** is per-draw and per-CPU (`entropy::vmgenid`): each generator
   records the GUID it last reseeded under, and every fill volatile-reads the
   live GUID through the direct map and compares. Because the hypervisor

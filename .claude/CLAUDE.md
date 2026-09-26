@@ -63,7 +63,8 @@ truth for "how work is tracked and shipped" on this project.
   beside it, and surface both verdict lines to the user verbatim. If the
   Workflow tool is unavailable, invoke `@pr-reviewer` and `@pr-auditor`
   directly in parallel (single message, two `Agent` tool calls) with the
-  PR number as scope and the same verdict handling.
+  PR number as scope and the open Issue list (`gh issue list --state
+  open --json number,title`), and the same verdict handling.
 
   Findings on the review surface are fixed as one batch per run, whatever
   their severity, and findings off it are recorded in the same pass:
@@ -75,10 +76,11 @@ truth for "how work is tracked and shipped" on this project.
   resolves in the same PR as a fix, as a clarification of the rule it
   misread, or, when the user finds it false on the facts, as a
   clarification of the code or document it misread, so the next run reads
-  what the user knows. Off the surface it is recorded on the Issue that
-  records it with the user's answer, or, when it misread a rule, resolved
-  by the clarification of that rule alone, which is its record. Nothing
-  else carries the decision forward. A finding no verifier could judge is
+  what the user knows. Off the surface it is recorded, with the user's
+  answer, on the Issue named above (the one that already names the work,
+  else the audit Issue), or, when it misread a rule, resolved by the
+  clarification of that rule alone, which is its record. Nothing else
+  carries the decision forward. A finding no verifier could judge is
   treated as confirmed. No finding is waived, ruled, or exempted anywhere
   but in the standards themselves. A genuine deferral is an Issue filed
   with the user's approval, per "Completeness" below.

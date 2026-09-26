@@ -175,8 +175,10 @@ which can read the pixels back — so a KASLR value printed via `kprintln!` beco
 userspace-recoverable. These values must be emitted **only** via the serial-only path
 (`kprintln_serial!` / `console::serial_write_fmt`), never `kprintln!`, and never
 through any IPC or log channel. The Phase-1 KASLR report prints an address-free status
-line via `kprintln!` and the slide/bases only via `kprintln_serial!`; the bootloader's
-console (which also mirrors to the framebuffer) prints only the opaque `kaslr_flags`.
+line via `kprintln!` and the slide/bases only via `kprintln_serial!`, and the Phase-9
+init-thread line prints the thread id and priority via `kprintln!` and init's kernel
+stack top (a direct-map VA) only via `kprintln_serial!`; the bootloader's console
+(which also mirrors to the framebuffer) prints only the opaque `kaslr_flags`.
 
 ## Maintaining this inventory
 

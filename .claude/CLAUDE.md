@@ -36,9 +36,9 @@ truth for "how work is tracked and shipped" on this project.
 
 ## Tooling constraints
 - All build, run, clean, and test actions MUST be performed via `cargo xtask` commands
-  (per [docs/build-system.md](../docs/build-system.md) § Workspace Structure).
+  (per [docs/build-system.md](../docs/build-system.md) § Convenience Commands).
 - Direct invocation of `cargo build`, `cargo run`, `cargo test`, or `cargo clippy` is forbidden.
-- When switching architectures or targets, `cargo xtask clean` MUST be run first
+- When switching architectures, `cargo xtask clean` MUST be run first
   (per [docs/build-system.md](../docs/build-system.md) § Build Output: the Sysroot).
 
 ## PR workflow operations

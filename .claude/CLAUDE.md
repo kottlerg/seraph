@@ -58,27 +58,30 @@ truth for "how work is tracked and shipped" on this project.
   returns one report with a reviewer verdict (`READY TO MERGE`,
   `BLOCKING ISSUES`, `NON-BLOCKING ISSUES ONLY`) and an audit verdict
   (`AUDIT PASS`, `AUDIT FAIL`). Save the report as
-  `target/xtask/review/pr<N>/<mode>-<head>.md` and surface both verdict
-  lines to the user verbatim. If the Workflow tool is unavailable, invoke
-  `@pr-reviewer` and `@pr-auditor` directly in parallel (single message,
-  two `Agent` tool calls) with the PR number as scope and the same verdict
-  handling.
+  `target/xtask/review/pr<N>/<mode>-<head>.md` and the returned
+  findings, recorded, dropped, and audit fields as `<mode>-<head>.json`
+  beside it, and surface both verdict lines to the user verbatim. If the
+  Workflow tool is unavailable, invoke `@pr-reviewer` and `@pr-auditor`
+  directly in parallel (single message, two `Agent` tool calls) with the
+  PR number as scope and the same verdict handling.
 
   Findings on the review surface are fixed as one batch per run, whatever
-  their severity, and findings off it are appended to the audit Issue in
-  the same pass: reviewer findings on the surface via commits, reviewer
-  findings off it via `gh issue edit`, and `AUDIT FAIL` items via `gh pr
-  edit`, `gh issue edit`, or commits. A finding the verifiers contested is
-  put to the user. On the surface it resolves in the same PR as a fix, as
-  a clarification of the rule it misread, or, when the user finds it false
-  on the facts, as a clarification of the code or document it misread, so
-  the next run reads what the user knows. Off the surface it is appended
-  to the audit Issue with the user's answer, or, when it misread a rule,
-  resolved by the clarification of that rule alone, which is its record.
-  Nothing else carries the decision forward. A finding no verifier could
-  judge is treated as confirmed. No finding is waived, ruled, or exempted
-  anywhere but in the standards themselves. A genuine deferral is an Issue
-  filed with the user's approval, per "Completeness" below.
+  their severity, and findings off it are recorded in the same pass:
+  reviewer findings on the surface via commits, reviewer findings off it
+  via `gh issue edit` on the open Issue that already names the work, else
+  on the audit Issue (or `gh issue create` with the user's approval), and
+  `AUDIT FAIL` items via `gh pr edit`, `gh issue edit`, or commits. A
+  finding the verifiers contested is put to the user. On the surface it
+  resolves in the same PR as a fix, as a clarification of the rule it
+  misread, or, when the user finds it false on the facts, as a
+  clarification of the code or document it misread, so the next run reads
+  what the user knows. Off the surface it is recorded on the Issue that
+  records it with the user's answer, or, when it misread a rule, resolved
+  by the clarification of that rule alone, which is its record. Nothing
+  else carries the decision forward. A finding no verifier could judge is
+  treated as confirmed. No finding is waived, ruled, or exempted anywhere
+  but in the standards themselves. A genuine deferral is an Issue filed
+  with the user's approval, per "Completeness" below.
 
   After the fixes are pushed and CI is green again, run the workflow in
   `delta` mode. Prompt for the merge decision only when a run completes
@@ -113,9 +116,9 @@ truth for "how work is tracked and shipped" on this project.
 - Drift or defects found on the review surface, as
   [docs/conventions.md](../docs/conventions.md) § Branch and PR Workflow
   defines it, MUST be fixed in the same pass; they are the scope, surfaced
-  incidentally. Findings off the surface MUST be appended to the open audit
-  Issue (or to a new one filed with the user's approval) in the same pass,
-  never dropped.
+  incidentally. Findings off the surface MUST be recorded in the same pass,
+  never dropped: on the open Issue that already names the work, else on the
+  open audit Issue (or a new one filed with the user's approval).
 - "Out of scope", "follow-up", and similar deferrals MUST NOT be used to
   avoid mechanically reachable work on the surface.
 - Material scope expansions MUST be stated in one line and continued, not

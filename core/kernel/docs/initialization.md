@@ -520,4 +520,7 @@ that CPU only; the BSP and other CPUs continue.
 ## Summarized By
 
 [kernel/README.md](../README.md), [docs/bootstrap.md](../../../docs/bootstrap.md),
-[docs/memory-model.md](../../../docs/memory-model.md)
+[docs/memory-model.md](../../../docs/memory-model.md),
+[docs/userspace-memory-model.md](../../../docs/userspace-memory-model.md),
+[cross-boundary-disclosure.md](cross-boundary-disclosure.md),
+[boot/docs/boot-flow.md](../../boot/docs/boot-flow.md)

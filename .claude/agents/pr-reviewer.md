@@ -114,14 +114,16 @@ or documented promise broken; `standards`: a binding standard's rule;
 test; `style`: readability and naming), whether the diff `introduced`
 it, whether it is a `must_violation` of a binding standard, whether it is
 `in_bound` (on the review surface; a correctness, soundness, safety, or
-contract defect in a touched file always is), the `authority`, the
-`claim`, the `evidence`, and the `fix`. There is no
-final line in schema mode; the workflow computes the verdict from the
-entries.
+contract defect in a touched file is, unless an open Issue already names
+the work), the `issue` that names it when one does (the parent lists the
+open Issues), the `authority`, the `claim`, the `evidence`, and the `fix`.
+There is no final line in schema mode; the workflow computes the verdict
+from the entries.
 
 **In prose mode the final line MUST be exactly one of:** `READY TO MERGE`,
-`BLOCKING ISSUES`, `NON-BLOCKING ISSUES ONLY`. Any Critical item or MUST
-violation forces `BLOCKING ISSUES`.
+`BLOCKING ISSUES`, `NON-BLOCKING ISSUES ONLY`. Any in-bound Critical item
+or MUST violation forces `BLOCKING ISSUES`; out-of-bound findings are
+listed for the audit Issue and do not affect the line.
 
 ## Tool discipline
 

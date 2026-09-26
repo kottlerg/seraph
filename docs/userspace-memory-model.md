@@ -36,13 +36,13 @@ transfers them to memmgr (derive-twice). From that point on, memmgr is
 the sole userspace authority over RAM frame allocation; the kernel does
 not delegate further to anyone.
 
-The handoff is total. At Phase 7 the kernel reserves the PT-pool seed,
-the `InitInfo` block, and init's user stack from the pristine buddy (the
-idle-thread stacks were already taken in Phase 4), then drains **every**
-remaining page into userspace Memory caps — coalescing physically-adjacent
-drained blocks into the fewest contiguous caps so the cap count tracks
-memory-map fragmentation, not total RAM — and *seals* the buddy; the SEED
-arena is then pinned out of the front of the largest drained block.
+The handoff is total. At Phase 7 the kernel takes its bounded reserves
+from the buddy (which contributors, and in what order, is in
+[initialization.md](../core/kernel/docs/initialization.md) § Phase 7),
+drains **every** remaining page into userspace Memory caps — coalescing
+physically-adjacent drained blocks into the fewest contiguous caps so the
+cap count tracks memory-map fragmentation, not total RAM — and *seals* the
+buddy.
 After the seal the buddy is an inert boot artifact: it holds no free
 pages, allocates nothing, and must receive no frees. Every page of RAM is
 therefore either a bounded fixed kernel reserve or owned by memmgr's pool
@@ -173,7 +173,8 @@ outside the windows — the test harnesses' window assertions then fail
 loudly by design. The default boot on both architectures is
 firmware-seeded through `EFI_RNG_PROTOCOL` (OVMF natively on x86_64; the
 firmware's `VirtioRngDxe` with `virtio-rng` on riscv64); a riscv64 boot
-without that device seeds from jitter alone
+without that device, under the EDK2 firmware the default boot uses, seeds
+from jitter alone
 ([#393](https://github.com/kottlerg/seraph/issues/393)); see
 [`core/kernel/docs/entropy.md`](../core/kernel/docs/entropy.md) for the
 quality caveat.

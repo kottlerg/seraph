@@ -141,12 +141,15 @@ trusted not to map what it has retyped away; the kernel does not yet enforce
 that boundary ([#433](https://github.com/kottlerg/seraph/issues/433)). Until
 it does, the class (a) claim holds only under that trust.
 
-Memory the bootloader used and donates through `reclaim_ranges` is a related
-surface. The `BootInfo` page is scrubbed of the seed and the two KASLR bases
-in Phase 5, and the AP trampoline page is zeroed in Phase 8 before its
+Memory the bootloader used is a related surface, whether it is donated
+through `reclaim_ranges` or returned by the memory map as usable and drained
+at Phase 7. The `BootInfo` page is scrubbed of the seed and the two KASLR
+bases in Phase 5, and the AP trampoline page is zeroed in Phase 8 before its
 late-reclaim cap is minted, because its parameter slots carried the AP entry
-point and idle-stack VAs. The bootloader's transient page-table frames and
-the UEFI stack it ran on still reach userspace unzeroed and encode the slid
+point and idle-stack VAs ([initialization.md](initialization.md) § Phase 5
+and § Phase 8). The bootloader's transient page-table frames (a
+`reclaim_ranges` entry) and the UEFI stack it ran on (BootServicesData,
+drained at Phase 7) still reach userspace unzeroed and encode the slid
 layout; closing that is
 [#439](https://github.com/kottlerg/seraph/issues/439).
 

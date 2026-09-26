@@ -23,4 +23,7 @@ calling convention.
 
 ## Summarized By
 
-[core/kernel/docs/syscalls.md](../../core/kernel/docs/syscalls.md)
+[core/kernel/docs/syscalls.md](../../core/kernel/docs/syscalls.md),
+[docs/build-system.md](../../docs/build-system.md),
+[services/procmgr/docs/ipc-interface.md](../../services/procmgr/docs/ipc-interface.md),
+[shared/syscall/README.md](../../shared/syscall/README.md)

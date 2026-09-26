@@ -73,6 +73,11 @@ A compliant bootloader MUST NOT:
 
 [core/boot/README.md](../../core/boot/README.md),
 [core/boot/docs/firmware-parsing.md](../../core/boot/docs/firmware-parsing.md),
+[core/boot/docs/boot-flow.md](../../core/boot/docs/boot-flow.md),
+[core/boot/docs/kernel-handoff.md](../../core/boot/docs/kernel-handoff.md),
+[core/boot/docs/memory-map.md](../../core/boot/docs/memory-map.md),
+[core/boot/docs/console.md](../../core/boot/docs/console.md),
+[xtask/README.md](../../xtask/README.md),
 [docs/bootstrap.md](../../docs/bootstrap.md),
 [docs/build-system.md](../../docs/build-system.md),
 [docs/architecture.md](../../docs/architecture.md),

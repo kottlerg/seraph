@@ -10,8 +10,9 @@ and version); this document covers how the bootloader fulfils that contract.
 
 ## Boot Sequence
 
-The following ten steps correspond to the bootloader's execution order. Each step is
-described briefly here; detailed implementation is in the referenced document.
+The following ten numbered steps correspond to the bootloader's execution order, with
+5b to 5d as sub-steps of step 5 executed before step 6. Each step is described briefly
+here; detailed implementation is in the referenced document.
 
 ### Step 1: UEFI Protocol Discovery
 
@@ -91,9 +92,8 @@ than ordinal position. Typical modules: procmgr, memmgr, devmgr, vfsd,
 virtio-blk, serial, framebuffer, fatfs (the authoritative list is
 `xtask/src/bundle.rs::MODULES`).
 
-Only the whole bundle allocation is identity-mapped (one region in
-place of today's per-module pair of read-buffer + loaded-region
-mappings); see step 6.
+Only the whole bundle allocation is identity-mapped; module bodies are
+slices of it (see step 6).
 
 Detail: [elf-loading.md](elf-loading.md)
 

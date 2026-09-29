@@ -78,9 +78,9 @@ discipline below has been applied end-to-end.
    bug; drift the surface definition excludes you still report, marked out
    of bound; drift an open Issue already names you report with `in_bound`
    judged as if no Issue named it and `issue` set. Both are recorded rather
-   than fixed, never dropped. Same for
-   system-scope design docs: if the diff silently contradicts one, the doc
-   and the code now disagree, and that is blocking.
+   than fixed, never dropped. Same for system-scope design docs: if the
+   diff silently contradicts one, the doc and the code now disagree, and
+   that is blocking.
 
 ## Out of scope
 

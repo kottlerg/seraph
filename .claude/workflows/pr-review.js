@@ -780,7 +780,7 @@ function verify_one(f) {
                 phase: 'Verify',
                 schema: VERDICT_SCHEMA,
             }).then(
-                (v) => (v ? { lens, ...v } : null),
+                (v) => (v ? { ...v, lens } : null),
                 () => null,
             ).then((v) => {
                 if (!v) {
@@ -805,6 +805,12 @@ function verify_one(f) {
                 'placed on the surface')
             f.issue = 0
             f.in_bound = f.surface
+        } else if (f.issue && !valid.some((v) => v.lens === 'authority')) {
+            // No authority vote: the Issue claim stands unjudged, and the
+            // record says so for the maintainer.
+            log(f.file + ':' + f.line + ': #' + f.issue + ' unjudged; authority refuter ' +
+                'returned no result')
+            f.evidence += '\n[#' + f.issue + ' unjudged: authority refuter returned no result]'
         }
         f.votes = valid
         return f
@@ -926,7 +932,8 @@ if (failed_verifiers.length) {
     notes.push(
         'Incomplete verification: ' + failed_verifiers.join(', ') + ' returned no result; the ' +
             'affected findings were judged on the remaining votes, or marked unverified when ' +
-            'none remained.',
+            'none remained, and an Issue named on a finding whose authority refuter failed ' +
+            'was kept unjudged (its evidence says so).',
     )
 }
 

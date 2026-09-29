@@ -201,13 +201,13 @@ const FINDING_SCHEMA = {
         in_bound: {
             type: 'boolean',
             description:
-                'It lies on the review surface (docs/conventions.md § Branch and PR Workflow): ' +
-                'a changed hunk or its containing item, something the change introduces, a ' +
-                'caller or reverse dependency of a changed item, or any correctness, safety, ' +
-                'or contract defect in a touched file, unless an open Issue already names ' +
-                'the work (then `issue` names it and the finding is off the surface); in a ' +
-                'delta run, a standards, doc-drift, coverage, or style finding only when the ' +
-                'delta introduced it.',
+                'It lies on the review surface (docs/conventions.md § Branch and PR Workflow), ' +
+                'judged as if no open Issue named the work: a changed hunk or its containing ' +
+                'item, something the change introduces, a caller or reverse dependency of a ' +
+                'changed item, or any correctness, safety, or contract defect in a touched ' +
+                'file; in a delta run, a standards, doc-drift, coverage, or style finding only ' +
+                'when the delta introduced it. Name the Issue in `issue`; the workflow takes ' +
+                'the finding off the surface.',
         },
         issue: {
             type: 'integer',
@@ -230,7 +230,7 @@ const FINDINGS_SCHEMA = {
 
 const VERDICT_SCHEMA = {
     type: 'object',
-    required: ['refuted', 'confidence', 'evidence'],
+    required: ['refuted', 'issue_refuted', 'confidence', 'evidence'],
     properties: {
         refuted: { type: 'boolean' },
         issue_refuted: {
@@ -686,11 +686,13 @@ const seen = []
 // A record absorbs at most one finding per agent, so one agent's own adjacent
 // findings stay distinct. Anything that differs in bucket or in the
 // MUST-violation flag is a distinct finding with its own verification, so a
-// stronger finding is never absorbed into a weaker record. A later reporter's
-// on-surface placement is OR-ed into a record that names no Issue; a record
-// that names an Issue keeps its off-surface placement and the authority
-// refuter's issue_refuted vote decides, and it adopts a later reporter's Issue
-// only before its verification starts.
+// stronger finding is never absorbed into a weaker record. Every absorbed
+// finding's surface placement is OR-ed into the record, so a refuted Issue
+// claim restores any reporter's placement; the record's in-bound placement
+// moves onto the surface only when it names no Issue. A record without an
+// Issue adopts a later reporter's Issue only before its verification starts
+// (a nit is never verified, so never adopts one); a record with an Issue keeps
+// it, and the authority refuter's issue_refuted vote decides.
 function dedup(findings, source) {
     const fresh = []
     for (const f of findings) {
@@ -720,31 +722,29 @@ function dedup(findings, source) {
             .sort((a, b) => distance(a) - distance(b))[0]
         if (dup) {
             dup.duplicates += 1
-            // Placement is reconciled with the Issue. A record that names an
-            // Issue keeps it and its off-surface placement: whether the Issue
-            // covers the work is the authority refuter's call (issue_refuted),
-            // not a later reporter's omission. A record without an Issue moves
-            // onto the surface when a later reporter places it there, and
-            // adopts a later reporter's Issue only while its verification has
-            // not started, since the refuters see the Issue in their prompt.
+            // Placement is reconciled with the Issue (the function comment
+            // states the rule).
             dup.surface = dup.surface || surface
+            const unverified = dup.verify_started || (dup.bucket === 'nit' && !dup.must_violation)
             if (in_bound && !dup.in_bound) {
                 if (dup.issue) {
                     dup.evidence += '\n[placed on the surface by ' + source + '; ' +
-                        dup.sources[0] + ' named #' + dup.issue + ']'
+                        dup.issue_source + ' named #' + dup.issue + ']'
                 } else {
                     dup.evidence += '\n[placed on the surface by ' + source + ']'
                     dup.in_bound = true
                 }
             } else if (!dup.issue && f.issue) {
-                if (dup.verify_started) {
-                    dup.evidence +=
-                        '\n[' + source + ' named #' + f.issue + ' after verification began]'
+                if (unverified) {
+                    dup.evidence += '\n[' + source + ' named #' + f.issue +
+                        (dup.verify_started
+                            ? ' after verification began]'
+                            : '; nits are not verified]')
                 } else {
-                    // The Issue claim goes to the refuters; a refuted claim
-                    // restores the OR-ed surface placement.
                     dup.issue = f.issue
+                    dup.issue_source = source
                     dup.in_bound = false
+                    dup.evidence += '\n[#' + f.issue + ' adopted from ' + source + ']'
                 }
             }
             dup.sources.push(source)
@@ -752,8 +752,8 @@ function dedup(findings, source) {
             continue
         }
         const record = {
-            ...f, in_bound, surface, sources: [source], duplicates: 0, status: 'pending',
-            votes: [], verify_started: false,
+            ...f, in_bound, surface, sources: [source], issue_source: f.issue ? source : '',
+            duplicates: 0, status: 'pending', votes: [], verify_started: false,
         }
         seen.push(record)
         fresh.push(record)

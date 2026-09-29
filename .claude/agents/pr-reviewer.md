@@ -121,10 +121,10 @@ or documented promise broken; `standards`: a binding standard's rule;
 test; `style`: readability and naming), whether the diff `introduced` it
 (in `delta` mode, whether the delta did), whether it is a
 `must_violation` of a binding standard, whether it is `in_bound` (on the
-review surface; a correctness, soundness, safety, or contract defect in
-a touched file is, unless an open Issue already names the work; in a
-delta run, a standards, doc-drift, coverage, or style finding only when
-the delta introduced it), the `issue` that names it when one does (the
+review surface as if no open Issue named the work; a correctness,
+soundness, safety, or contract defect in a touched file is; in a delta
+run, a standards, doc-drift, coverage, or style finding only when the
+delta introduced it), the `issue` that names it when one does (the
 parent lists the open Issues), the `authority`, the `claim`, the
 `evidence`, and the `fix`. There is no final line in schema mode; the
 workflow computes the verdict from the entries.

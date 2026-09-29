@@ -972,11 +972,12 @@ const clip = (s, n) => (s.length > n ? s.slice(0, n) + '…' : s)
 // The reviewer's evidence is clipped; the script's own annotations (placement,
 // Issue adoption, unjudged claims) follow it whole, so the report shows them.
 function for_render(f) {
+    const { annotations, ...rest } = f
     return {
-        ...f,
+        ...rest,
         evidence:
             clip(f.evidence, RENDER_EVIDENCE_CHARS) +
-            f.annotations.map((a) => '\n[' + a + ']').join(''),
+            annotations.map((a) => '\n[' + a + ']').join(''),
         votes: f.votes.map((v) => ({ ...v, evidence: clip(v.evidence, RENDER_VOTE_CHARS) })),
     }
 }
@@ -996,7 +997,10 @@ const SYNTH_PROMPT = [
         'on the review surface blocks the merge whatever its bucket, and in the Recorded ' +
         'section `file:line` [status] (bucket) claim. Authority: ' +
         'the cited authority. Rationale: one sentence from the evidence. Fix: the proposed ' +
-        'fix. For contested and unverified entries add one line per verifier vote with its ' +
+        'fix. Every bracketed note at the end of a finding\'s evidence (`[placed on the ' +
+        'surface by ...]`, `[#N adopted from ...]`, `[#N unjudged: ...]`) is rendered ' +
+        'verbatim as its own line on the entry. For contested and unverified entries add ' +
+        'one line per verifier vote with its ' +
         'lens, refuted flag, confidence, and evidence. The dropped section lists each dropped ' +
         'finding in one line with the refuting evidence. The audit section lists each audit ' +
         'section with its verdict and items. Keep each entry to its fields; the full record ' +

@@ -86,8 +86,10 @@ Once [`shared/elf`](../../../shared/elf/README.md) has yielded the validated
 `PT_LOAD` program-header array, the bootloader layers UEFI-specific placement
 on each segment:
 
-1. Enforce W^X: a segment with both `PF_W` and `PF_X` is rejected when its
-   first page is mapped and surfaced as [`BootError::WxViolation`](../src/error.rs).
+1. Enforce W^X: a segment with both `PF_W` and `PF_X` is rejected and surfaced
+   as [`BootError::WxViolation`](../src/error.rs): a kernel segment by the
+   page-table builder when its first page is mapped, an init segment by
+   `init_segment_flags` during `load_init`, before any frame is allocated.
 2. Allocate physical frames via `AllocatePages`, classified `EfiLoaderData`:
    - **Kernel ELF** — one `AllocateAnyPages` span covering the whole image at
      any free physical base; each segment is copied to
@@ -138,15 +140,17 @@ can identity-map each segment without a second copy.
 
 ```
 For each PT_LOAD segment:
-1. AllocatePages(AllocateAnyPages, EfiLoaderData, page_count, &phys_base).
+1. Reject PF_W | PF_X with BootError::WxViolation; derive flags otherwise.
+2. AllocatePages(AllocateAnyPages, EfiLoaderData, page_count, &phys_base).
    page_count = ceil(p_memsz / PAGE_SIZE).
-2. Copy p_filesz bytes from file offset p_offset into phys_base.
-3. Zero the BSS tail: memset(phys_base + p_filesz, 0, p_memsz - p_filesz).
-4. Record an InitSegment { phys_addr, virt_addr: p_vaddr, size: p_memsz, flags }.
+3. Copy p_filesz bytes from file offset p_offset into phys_base.
+4. Zero the BSS tail: memset(phys_base + p_filesz, 0, p_memsz - p_filesz).
+5. Record an InitSegment { phys_addr, virt_addr: p_vaddr, size: p_memsz, flags }.
 ```
 
-`flags` is derived from `p_flags`: `ReadExecute` if `PF_X` is set, `ReadWrite` if
-`PF_W` is set (and `PF_X` is not), otherwise `Read`. The resulting `InitImage`
+`flags` is derived from `p_flags`: a segment with both `PF_W` and `PF_X` is
+rejected with `BootError::WxViolation` (§ Categories); otherwise `ReadExecute` if
+`PF_X` is set, `ReadWrite` if `PF_W` is set, `Read` if neither. The resulting `InitImage`
 (entry point + segment array) is stored in `BootInfo.init_image`. The kernel uses
 the `phys_addr`/`virt_addr` pairs to build init's page tables without an ELF parser.
 

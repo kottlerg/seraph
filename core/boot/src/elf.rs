@@ -466,6 +466,7 @@ pub unsafe fn relocate_kernel(
 /// - `BootError::OutOfMemory` if any segment's physical allocation fails.
 /// - `BootError::InvalidElf` if the image is malformed (bridged from
 ///   `elf::ElfError`).
+/// - `BootError::WxViolation` if a segment is both writable and executable.
 ///
 /// # Safety
 ///
@@ -549,18 +550,7 @@ pub unsafe fn load_init(
             unsafe { core::ptr::write_bytes(bss_ptr, 0, bss_sz) };
         }
 
-        let flags = if seg.executable
-        {
-            SegmentFlags::ReadExecute
-        }
-        else if seg.writable
-        {
-            SegmentFlags::ReadWrite
-        }
-        else
-        {
-            SegmentFlags::Read
-        };
+        let flags = init_segment_flags(&seg)?;
 
         segments[count] = InitSegment {
             // Encode the in-page offset: phys_addr & 0xFFF = virt_addr & 0xFFF.
@@ -643,10 +633,26 @@ fn rela_phys_for(segments: &[boot_protocol::InitSegment], table: &elf::RelaTable
 // allocation in `BootModule.physical_base`; only the `init` entry is ELF-
 // loaded (via [`load_init`]). See `main.rs::step4_parse_bundle`.
 
+/// Page permissions for one init segment. A segment that is both writable
+/// and executable is rejected: the boot protocol's `SegmentFlags` carries no
+/// such variant, and init W^X violations are fatal at load time
+/// (`docs/elf-loading.md` § Categories).
+fn init_segment_flags(seg: &elf::LoadSegment) -> Result<boot_protocol::SegmentFlags, BootError>
+{
+    match (seg.writable, seg.executable)
+    {
+        (true, true) => Err(BootError::WxViolation),
+        (false, true) => Ok(boot_protocol::SegmentFlags::ReadExecute),
+        (true, false) => Ok(boot_protocol::SegmentFlags::ReadWrite),
+        (false, false) => Ok(boot_protocol::SegmentFlags::Read),
+    }
+}
+
 #[cfg(test)]
 mod tests
 {
     use super::*;
+    use boot_protocol::SegmentFlags;
 
     // A realistic kernel link layout: one linear vaddr→paddr offset, 4 KiB-aligned.
     const VBASE: u64 = 0xFFFF_FFFF_8000_0000;
@@ -674,6 +680,34 @@ mod tests
             seg(VBASE + 0x2000, PBASE + 0x2000, 0x1000, 0x1000),
             seg(VBASE + 0x3000, PBASE + 0x3000, 0x800, 0x1800),
         ]
+    }
+
+    #[test]
+    fn init_segment_flags_reject_writable_executable()
+    {
+        let mut wx = seg(VBASE, PBASE, 0x1000, 0x1000);
+        wx.writable = true;
+        wx.executable = true;
+        assert!(matches!(
+            init_segment_flags(&wx),
+            Err(BootError::WxViolation)
+        ));
+    }
+
+    #[test]
+    fn init_segment_flags_map_each_permitted_combination()
+    {
+        let mut text = seg(VBASE, PBASE, 0x1000, 0x1000);
+        text.executable = true;
+        let mut data = seg(VBASE, PBASE, 0x1000, 0x1000);
+        data.writable = true;
+        let rodata = seg(VBASE, PBASE, 0x1000, 0x1000);
+        assert_eq!(
+            init_segment_flags(&text).unwrap(),
+            SegmentFlags::ReadExecute
+        );
+        assert_eq!(init_segment_flags(&data).unwrap(), SegmentFlags::ReadWrite);
+        assert_eq!(init_segment_flags(&rodata).unwrap(), SegmentFlags::Read);
     }
 
     #[test]

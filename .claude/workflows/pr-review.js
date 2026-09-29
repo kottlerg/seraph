@@ -997,8 +997,8 @@ const SYNTH_PROMPT = [
         'on the review surface blocks the merge whatever its bucket, and in the Recorded ' +
         'section `file:line` [status] (bucket) claim. Authority: ' +
         'the cited authority. Rationale: one sentence from the evidence. Fix: the proposed ' +
-        'fix. Every bracketed note at the end of a finding\'s evidence (`[placed on the ' +
-        'surface by ...]`, `[#N adopted from ...]`, `[#N unjudged: ...]`) is rendered ' +
+        'fix. Every bracketed note at the end of a finding\'s evidence (the script\'s ' +
+        'placement, Issue-adoption, late-Issue, and unjudged-Issue notes) is rendered ' +
         'verbatim as its own line on the entry. For contested and unverified entries add ' +
         'one line per verifier vote with its ' +
         'lens, refuted flag, confidence, and evidence. The dropped section lists each dropped ' +

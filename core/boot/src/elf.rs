@@ -21,10 +21,11 @@
 //!   kernel never needs an ELF parser.
 //! - Load opaque boot modules as flat binaries (no ELF parsing).
 //!
-//! W^X policy is enforced by the bootloader's page-table builder
-//! (`paging.rs` and `arch/*/paging.rs`). A `PT_LOAD` segment with both
-//! `PF_W` and `PF_X` is rejected when its first page is mapped, surfaced
-//! as [`BootError::WxViolation`].
+//! W^X policy: a kernel `PT_LOAD` segment with both `PF_W` and `PF_X` is
+//! rejected by the bootloader's page-table builder (`paging.rs` and
+//! `arch/*/paging.rs`) when its first page is mapped; an init segment, which
+//! the kernel maps, is rejected at load time by `init_segment_flags` before
+//! any frame is allocated. Both surface as [`BootError::WxViolation`].
 //!
 //! Header and segment validation come from `shared/elf`; format errors
 //! arrive here as `elf::ElfError` and bridge to [`BootError::InvalidElf`]
@@ -511,6 +512,8 @@ pub unsafe fn load_init(
                 "init ELF has more than INIT_MAX_SEGMENTS LOAD segments",
             ));
         }
+        // W^X is checked before any frame is allocated for the segment.
+        let flags = init_segment_flags(&seg)?;
 
         // p_vaddr & 0xFFF fits in usize (≤ 4095). p_memsz → usize: 64-bit only.
         #[allow(clippy::cast_possible_truncation)]
@@ -549,8 +552,6 @@ pub unsafe fn load_init(
             // SAFETY: `bss_ptr` is within the allocated region.
             unsafe { core::ptr::write_bytes(bss_ptr, 0, bss_sz) };
         }
-
-        let flags = init_segment_flags(&seg)?;
 
         segments[count] = InitSegment {
             // Encode the in-page offset: phys_addr & 0xFFF = virt_addr & 0xFFF.
@@ -636,7 +637,7 @@ fn rela_phys_for(segments: &[boot_protocol::InitSegment], table: &elf::RelaTable
 /// Page permissions for one init segment. A segment that is both writable
 /// and executable is rejected: the boot protocol's `SegmentFlags` carries no
 /// such variant, and init W^X violations are fatal at load time
-/// (`docs/elf-loading.md` § Categories).
+/// (`core/boot/docs/elf-loading.md` § Categories).
 fn init_segment_flags(seg: &elf::LoadSegment) -> Result<boot_protocol::SegmentFlags, BootError>
 {
     match (seg.writable, seg.executable)
@@ -683,7 +684,7 @@ mod tests
     }
 
     #[test]
-    fn init_segment_flags_reject_writable_executable()
+    fn writable_executable_init_segment_is_rejected()
     {
         let mut wx = seg(VBASE, PBASE, 0x1000, 0x1000);
         wx.writable = true;
@@ -695,7 +696,7 @@ mod tests
     }
 
     #[test]
-    fn init_segment_flags_map_each_permitted_combination()
+    fn permitted_init_segment_permissions_map_to_their_flags()
     {
         let mut text = seg(VBASE, PBASE, 0x1000, 0x1000);
         text.executable = true;

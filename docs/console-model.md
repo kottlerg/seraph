@@ -36,8 +36,11 @@ earlier ones, which remain as fallbacks.
    framebuffer memory is later handed to the userspace framebuffer driver — so
    anything `kprintln!` draws can be read back by userspace. Secrets that must
    not cross that boundary — the KASLR image base, direct-map base, and slide
-   ([#252](https://github.com/kottlerg/seraph/issues/252)) — go through the
-   serial-only class only. See
+   ([#252](https://github.com/kottlerg/seraph/issues/252)), and every kernel
+   virtual address, since each lies in a region KASLR randomizes — go through
+   the serial-only class only (`kprintln_serial!` / `console::serial_write_fmt`,
+   and the lock-bypassing `console::panic_write_fmt` and `kprintln_nmi!` /
+   `console::nmi_write_fmt` for the panic and NMI paths). See
    [`core/kernel/docs/cross-boundary-disclosure.md`](../core/kernel/docs/cross-boundary-disclosure.md).
 
 3. **init-logd direct-UART fallback** — during early userspace boot, the

@@ -4,9 +4,10 @@ This document describes the kernel's initialization sequence from `kernel_entry(
 the first userspace instruction of init. The sequence is divided into numbered phases,
 each with a completion criterion and a defined failure mode.
 
-Any phase failure is fatal; the kernel halts with a diagnostic message, except
-that a started CPU which never announces itself leaves the BSP waiting at
-`APS_READY` (§ Phase 8).
+A phase failure halts the kernel with a diagnostic message unless the phase's
+failure mode states otherwise: a headless boot continues (§ Phase 1), a bad
+aperture entry is skipped (§ Phase 6), and a started CPU that never announces
+itself leaves the BSP waiting at `APS_READY` (§ Phase 8).
 
 For the boot protocol contract (CPU state and register contents, BootInfo
 layout) that Phase 0 depends on, see

@@ -248,7 +248,8 @@ The kernel creates init's AddressSpace, CSpace, and Thread directly from the
 `init_image` segments in `BootInfo` — no ELF parsing occurs in the kernel.
 
 Each arrow means "requires the item above to be complete". Nothing in this chain is
-reversible — a failure at any phase is a fatal boot error.
+reversible; a phase failure halts the boot except where the phase's failure mode in
+[initialization.md](docs/initialization.md) states otherwise.
 
 ---
 

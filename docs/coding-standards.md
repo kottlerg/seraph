@@ -242,9 +242,11 @@ fields, fault and exception messages, exit and death reasons, and `SYS_CAP_INFO`
   already holds the capability the address describes; the kernel virtual mapping of
   that physical address MUST NOT be exposed.
 - Kernel-pointer values MAY appear only in kernel-owned console diagnostics that
-  userspace cannot read back; which console paths qualify is defined in
-  `core/kernel/docs/cross-boundary-disclosure.md` § Kernel console diagnostics.
-  They MUST NOT reach a userspace IPC or log channel.
+  userspace cannot read back: the serial-only class
+  [docs/console-model.md](console-model.md) § Ownership across the boot lifecycle
+  defines, with each site classified in
+  [cross-boundary-disclosure.md](../core/kernel/docs/cross-boundary-disclosure.md)
+  § Kernel console diagnostics. They MUST NOT reach a userspace IPC or log channel.
 
 New or changed cross-boundary outputs MUST be classified in the kernel
 cross-boundary disclosure inventory (`core/kernel/docs/cross-boundary-disclosure.md`)

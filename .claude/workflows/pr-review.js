@@ -686,9 +686,11 @@ const seen = []
 // A record absorbs at most one finding per agent, so one agent's own adjacent
 // findings stay distinct. Anything that differs in bucket or in the
 // MUST-violation flag is a distinct finding with its own verification, so a
-// stronger finding is never absorbed into a weaker record. An absorbed
-// finding's in-bound placement is OR-ed into the record, so an off-surface
-// record cannot hide an on-surface duplicate.
+// stronger finding is never absorbed into a weaker record. A later reporter's
+// on-surface placement is OR-ed into a record that names no Issue; a record
+// that names an Issue keeps its off-surface placement and the authority
+// refuter's issue_refuted vote decides, and it adopts a later reporter's Issue
+// only before its verification starts.
 function dedup(findings, source) {
     const fresh = []
     for (const f of findings) {
@@ -725,6 +727,7 @@ function dedup(findings, source) {
             // onto the surface when a later reporter places it there, and
             // adopts a later reporter's Issue only while its verification has
             // not started, since the refuters see the Issue in their prompt.
+            dup.surface = dup.surface || surface
             if (in_bound && !dup.in_bound) {
                 if (dup.issue) {
                     dup.evidence += '\n[placed on the surface by ' + source + '; ' +
@@ -733,12 +736,15 @@ function dedup(findings, source) {
                     dup.evidence += '\n[placed on the surface by ' + source + ']'
                     dup.in_bound = true
                 }
-            } else if (!dup.in_bound && !dup.issue && f.issue) {
+            } else if (!dup.issue && f.issue) {
                 if (dup.verify_started) {
                     dup.evidence +=
                         '\n[' + source + ' named #' + f.issue + ' after verification began]'
                 } else {
+                    // The Issue claim goes to the refuters; a refuted claim
+                    // restores the OR-ed surface placement.
                     dup.issue = f.issue
+                    dup.in_bound = false
                 }
             }
             dup.sources.push(source)

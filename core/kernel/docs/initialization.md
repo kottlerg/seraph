@@ -6,8 +6,9 @@ each with a completion criterion and a defined failure mode.
 
 A phase failure halts the kernel with a diagnostic message unless the phase's
 failure mode states otherwise: a headless boot continues (§ Phase 1), a bad
-aperture entry is skipped (§ Phase 6), and a started CPU that never announces
-itself leaves the BSP waiting at `APS_READY` (§ Phase 8).
+aperture entry is skipped (§ Phase 6), an entropy self-test FAIL is reported
+and the boot continues, and a started CPU that never announces itself leaves
+the BSP waiting at `APS_READY` (both § Phase 8).
 
 For the boot protocol contract (CPU state and register contents, BootInfo
 layout) that Phase 0 depends on, see
@@ -392,6 +393,8 @@ so a CPU that cannot be started halts the boot with a descriptive message.
 A started CPU that never announces itself leaves the BSP waiting at
 `APS_READY` on either architecture; on x86-64 that wait is the only signal,
 since SIPI delivery is unacknowledged and `start_ap` cannot report a failure.
+An entropy self-test FAIL (step 5) is printed and the boot continues; the
+marker is what the QEMU harnesses match to fail a run (see entropy.md).
 
 **Completion criterion:** Per-CPU scheduler state and idle threads are
 initialised for all CPUs, every AP has incremented `APS_READY`, the
@@ -521,7 +524,7 @@ that CPU only; the BSP and other CPUs continue.
 | 5 | CPU hardware (IDT/GDT/TSS/stvec); seed entropy pool | Halt: hardware initialisation failure |
 | 6 | Platform resource validation | Halt if entries pointer is null with non-zero count; bad entries skipped |
 | 7 | Capability system + root CSpace | Halt: OOM |
-| 8 | Scheduler + idle threads, SMP bringup, AP trampoline reclaim, entropy self-test | Halt: OOM (idle stack/TCB); rejected start_ap (riscv64); zero ap_trampoline_page with more than one CPU listed. A started CPU that never announces itself leaves the BSP waiting (x86-64 cannot detect this earlier: SIPI is unacknowledged) |
+| 8 | Scheduler + idle threads, SMP bringup, AP trampoline reclaim, entropy self-test | Halt: OOM (idle stack/TCB); rejected start_ap (riscv64); zero ap_trampoline_page with more than one CPU listed. A started CPU that never announces itself leaves the BSP waiting (x86-64 cannot detect this earlier: SIPI is unacknowledged); an entropy self-test FAIL is printed and the boot continues |
 | 9 | Init creation + scheduler entry (user mode) | Halt: invalid InitImage or OOM |
 
 ---

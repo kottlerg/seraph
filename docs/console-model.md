@@ -29,8 +29,10 @@ earlier ones, which remain as fallbacks.
    as the panic console. The kernel never becomes a client of the userspace
    serial or framebuffer driver.
 
-   A **serial-only class** of kernel output (`kprintln_serial!` /
-   `console::serial_write_fmt`) writes the UART but skips the framebuffer. It
+   A **serial-only class** of kernel output writes the UART but skips the
+   framebuffer: the spin-locking `kprintln_serial!` / `console::serial_write_fmt`
+   and the lock-bypassing `console::panic_write_fmt` and `kprintln_nmi!` /
+   `console::nmi_write_fmt` for the panic and NMI paths. It
    exists because `kprintln!` *mirrors* to the framebuffer, and although the
    kernel writes that framebuffer directly rather than as a driver client, the
    framebuffer memory is later handed to the userspace framebuffer driver — so
@@ -38,9 +40,7 @@ earlier ones, which remain as fallbacks.
    not cross that boundary — the KASLR image base, direct-map base, and slide
    ([#252](https://github.com/kottlerg/seraph/issues/252)), and every kernel
    virtual address, since each lies in a region KASLR randomizes — go through
-   the serial-only class only (`kprintln_serial!` / `console::serial_write_fmt`,
-   and the lock-bypassing `console::panic_write_fmt` and `kprintln_nmi!` /
-   `console::nmi_write_fmt` for the panic and NMI paths). See
+   the serial-only class only. See
    [`core/kernel/docs/cross-boundary-disclosure.md`](../core/kernel/docs/cross-boundary-disclosure.md).
 
 3. **init-logd direct-UART fallback** — during early userspace boot, the
@@ -188,4 +188,6 @@ surface prints the identical glyph set.
 [services/drivers/README.md](../services/drivers/README.md),
 [services/drivers/serial/README.md](../services/drivers/serial/README.md),
 [services/drivers/framebuffer/README.md](../services/drivers/framebuffer/README.md),
-[services/logd/README.md](../services/logd/README.md)
+[services/logd/README.md](../services/logd/README.md),
+[Coding Standards](coding-standards.md),
+[Kernel Cross-Boundary Disclosure Inventory](../core/kernel/docs/cross-boundary-disclosure.md)

@@ -162,9 +162,10 @@ These are **not** a userspace-readable data channel: per the console-model contr
 directly and never becomes a client of the userspace serial or framebuffer driver,
 and no IPC channel delivers kernel log output to a userspace process as data. The
 always-on `USERSPACE FAULT` serial dumps print the faulting thread's *own* user
-registers, not kernel addresses. Kernel-pointer console output that reveals nothing
-of the KASLR layout is therefore an operator-console diagnostic outside the KASLR
-threat model; it must not be routed to any userspace-reachable IPC or log channel.
+registers, not kernel addresses. Because the kernel's two virtual regions are both
+randomized, every kernel VA is a KASLR-derived value, so kernel-pointer console output
+is governed by the serial-only rule below; it must not be routed to any
+userspace-reachable IPC or log channel.
 
 **KASLR values are serial-only.** The randomized kernel image base, direct-map base,
 and slide, and any kernel virtual address derived from them (an image VA or a
@@ -180,10 +181,10 @@ line via `kprintln!` and the slide/bases only via `kprintln_serial!`; the Phase-
 init-thread report prints the thread id and priority on one `kprintln!` line and init's
 kernel stack top (a direct-map VA) on a separate `kprintln_serial!` line; the
 bootloader's console (which also mirrors to the framebuffer) prints only the opaque
-`kaslr_flags`. The register-dump and `KERNEL EXCEPTION` paths precede a halt, so what
-they print never reaches a running userspace. The non-fatal watchdog dump still prints
-direct-map TCB and endpoint pointers via `kprintln!`; closing that is
-[#440](https://github.com/kottlerg/seraph/issues/440).
+`kaslr_flags`. The `KERNEL EXCEPTION` dumps print `rip`/`sepc` and the register file
+via `kprintln!` and `fatal` halts only the faulting CPU, so on SMP they are
+userspace-recoverable, as is the non-fatal watchdog dump's direct-map TCB and endpoint
+pointers; closing both is [#440](https://github.com/kottlerg/seraph/issues/440).
 
 ## Maintaining this inventory
 

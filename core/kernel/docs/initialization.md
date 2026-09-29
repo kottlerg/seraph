@@ -4,7 +4,9 @@ This document describes the kernel's initialization sequence from `kernel_entry(
 the first userspace instruction of init. The sequence is divided into numbered phases,
 each with a completion criterion and a defined failure mode.
 
-Any phase failure is fatal; the kernel halts with a diagnostic message.
+Any phase failure is fatal; the kernel halts with a diagnostic message, except
+that a started CPU which never announces itself leaves the BSP waiting at
+`APS_READY` (§ Phase 8).
 
 For the boot protocol contract (CPU state and register contents, BootInfo
 layout) that Phase 0 depends on, see
@@ -386,8 +388,9 @@ SBI reports a hart it cannot start), or a zero `BootInfo.ap_trampoline_page`
 with more than one CPU listed, is fatal: every CPU the boot reported is
 assumed online from Phase 8 on (IPI targets, scheduler placement, affinity),
 so a CPU that cannot be started halts the boot with a descriptive message.
-On x86-64 SIPI delivery is unacknowledged, so a listed CPU that never
-answers leaves the BSP waiting at `APS_READY`.
+A started CPU that never announces itself leaves the BSP waiting at
+`APS_READY` on either architecture; on x86-64 that wait is the only signal,
+since SIPI delivery is unacknowledged and `start_ap` cannot report a failure.
 
 **Completion criterion:** Per-CPU scheduler state and idle threads are
 initialised for all CPUs, every AP has incremented `APS_READY`, the
@@ -517,7 +520,7 @@ that CPU only; the BSP and other CPUs continue.
 | 5 | CPU hardware (IDT/GDT/TSS/stvec); seed entropy pool | Halt: hardware initialisation failure |
 | 6 | Platform resource validation | Halt if entries pointer is null with non-zero count; bad entries skipped |
 | 7 | Capability system + root CSpace | Halt: OOM |
-| 8 | Scheduler + idle threads, SMP bringup, AP trampoline reclaim, entropy self-test | Halt: OOM (idle stack/TCB); rejected start_ap (riscv64); zero ap_trampoline_page with more than one CPU listed. A listed x86-64 CPU that never answers its SIPI leaves the BSP waiting |
+| 8 | Scheduler + idle threads, SMP bringup, AP trampoline reclaim, entropy self-test | Halt: OOM (idle stack/TCB); rejected start_ap (riscv64); zero ap_trampoline_page with more than one CPU listed. A started CPU that never announces itself leaves the BSP waiting (x86-64 cannot detect this earlier: SIPI is unacknowledged) |
 | 9 | Init creation + scheduler entry (user mode) | Halt: invalid InitImage or OOM |
 
 ---

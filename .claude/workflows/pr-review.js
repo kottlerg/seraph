@@ -648,7 +648,8 @@ function verify_prompt(f, lens) {
                 'the evidence does not support the claim. refuted=false when you can point to ' +
                 'the place that exhibits the defect, and also when you can neither confirm nor ' +
                 'refute it; say so, with confidence low. Evidence must cite file:line. ' +
-                'Structured output only.',
+                'Return issue_refuted=false: whether a named Issue covers the work is the ' +
+                'authority refuter\'s judgement. Structured output only.',
         ].join('\n')
     }
     return [
@@ -690,9 +691,10 @@ const seen = []
 // finding's surface placement is OR-ed into the record, so a refuted Issue
 // claim restores any reporter's placement; the record's in-bound placement
 // moves onto the surface only when it names no Issue. A record without an
-// Issue adopts a later reporter's Issue only before its verification starts
-// (a nit is never verified, so never adopts one); a record with an Issue keeps
-// it, and the authority refuter's issue_refuted vote decides.
+// Issue adopts a later reporter's Issue only before its verification starts;
+// a record with an Issue keeps it, and the authority refuter's issue_refuted
+// vote decides. A nit that names no MUST violation is never verified, so an
+// Issue any reporter names on it is final whichever reporter arrived first.
 function dedup(findings, source) {
     const fresh = []
     for (const f of findings) {
@@ -725,7 +727,6 @@ function dedup(findings, source) {
             // Placement is reconciled with the Issue (the function comment
             // states the rule).
             dup.surface = dup.surface || surface
-            const unverified = dup.verify_started || (dup.bucket === 'nit' && !dup.must_violation)
             if (in_bound && !dup.in_bound) {
                 if (dup.issue) {
                     dup.evidence += '\n[placed on the surface by ' + source + '; ' +
@@ -735,11 +736,9 @@ function dedup(findings, source) {
                     dup.in_bound = true
                 }
             } else if (!dup.issue && f.issue) {
-                if (unverified) {
-                    dup.evidence += '\n[' + source + ' named #' + f.issue +
-                        (dup.verify_started
-                            ? ' after verification began]'
-                            : '; nits are not verified]')
+                if (dup.verify_started) {
+                    dup.evidence +=
+                        '\n[' + source + ' named #' + f.issue + ' after verification began]'
                 } else {
                     dup.issue = f.issue
                     dup.issue_source = source
@@ -801,7 +800,7 @@ function verify_one(f) {
         else f.status = 'confirmed'
         // A refuted Issue claim puts the finding back where the surface
         // definition places it.
-        if (f.issue && valid.some((v) => v.issue_refuted)) {
+        if (f.issue && valid.some((v) => v.lens === 'authority' && v.issue_refuted)) {
             log(f.file + ':' + f.line + ': #' + f.issue + ' does not name this work; ' +
                 'placed on the surface')
             f.issue = 0

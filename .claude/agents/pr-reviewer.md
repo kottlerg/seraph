@@ -75,8 +75,10 @@ discipline below has been applied end-to-end.
    are **binding**, not advisory — `.claude/CLAUDE.md` says so explicitly.
    On the review surface (`docs/conventions.md` § Branch and PR Workflow),
    treat any drift from them as a blocking issue, on par with a correctness
-   bug; drift you find off the surface you still report, marked out of
-   bound, and it is recorded rather than fixed, never dropped. Same for
+   bug; drift the surface definition excludes you still report, marked out
+   of bound; drift an open Issue already names you report with `in_bound`
+   judged as if no Issue named it and `issue` set. Both are recorded rather
+   than fixed, never dropped. Same for
    system-scope design docs: if the diff silently contradicts one, the doc
    and the code now disagree, and that is blocking.
 

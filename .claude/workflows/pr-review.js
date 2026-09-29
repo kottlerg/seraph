@@ -729,21 +729,21 @@ function dedup(findings, source) {
             dup.surface = dup.surface || surface
             if (in_bound && !dup.in_bound) {
                 if (dup.issue) {
-                    dup.evidence += '\n[placed on the surface by ' + source + '; ' +
-                        dup.issue_source + ' named #' + dup.issue + ']'
+                    dup.annotations.push('placed on the surface by ' + source + '; ' +
+                        dup.issue_source + ' named #' + dup.issue)
                 } else {
-                    dup.evidence += '\n[placed on the surface by ' + source + ']'
+                    dup.annotations.push('placed on the surface by ' + source)
                     dup.in_bound = true
                 }
             } else if (!dup.issue && f.issue) {
                 if (dup.verify_started) {
-                    dup.evidence +=
-                        '\n[' + source + ' named #' + f.issue + ' after verification began]'
+                    dup.annotations.push(
+                        source + ' named #' + f.issue + ' after verification began')
                 } else {
                     dup.issue = f.issue
                     dup.issue_source = source
                     dup.in_bound = false
-                    dup.evidence += '\n[#' + f.issue + ' adopted from ' + source + ']'
+                    dup.annotations.push('#' + f.issue + ' adopted from ' + source)
                 }
             }
             dup.sources.push(source)
@@ -752,7 +752,7 @@ function dedup(findings, source) {
         }
         const record = {
             ...f, in_bound, surface, sources: [source], issue_source: f.issue ? source : '',
-            duplicates: 0, status: 'pending', votes: [], verify_started: false,
+            duplicates: 0, status: 'pending', votes: [], verify_started: false, annotations: [],
         }
         seen.push(record)
         fresh.push(record)
@@ -810,7 +810,7 @@ function verify_one(f) {
             // record says so for the maintainer.
             log(f.file + ':' + f.line + ': #' + f.issue + ' unjudged; authority refuter ' +
                 'returned no result')
-            f.evidence += '\n[#' + f.issue + ' unjudged: authority refuter returned no result]'
+            f.annotations.push('#' + f.issue + ' unjudged: authority refuter returned no result')
         }
         f.votes = valid
         return f
@@ -933,7 +933,7 @@ if (failed_verifiers.length) {
         'Incomplete verification: ' + failed_verifiers.join(', ') + ' returned no result; the ' +
             'affected findings were judged on the remaining votes, or marked unverified when ' +
             'none remained, and an Issue named on a finding whose authority refuter failed ' +
-            'was kept unjudged (its evidence says so).',
+            'was kept unjudged (its entry says so).',
     )
 }
 
@@ -969,10 +969,14 @@ phase('Synthesize')
 const RENDER_EVIDENCE_CHARS = 400
 const RENDER_VOTE_CHARS = 240
 const clip = (s, n) => (s.length > n ? s.slice(0, n) + '…' : s)
+// The reviewer's evidence is clipped; the script's own annotations (placement,
+// Issue adoption, unjudged claims) follow it whole, so the report shows them.
 function for_render(f) {
     return {
         ...f,
-        evidence: clip(f.evidence, RENDER_EVIDENCE_CHARS),
+        evidence:
+            clip(f.evidence, RENDER_EVIDENCE_CHARS) +
+            f.annotations.map((a) => '\n[' + a + ']').join(''),
         votes: f.votes.map((v) => ({ ...v, evidence: clip(v.evidence, RENDER_VOTE_CHARS) })),
     }
 }

@@ -189,5 +189,5 @@ surface prints the identical glyph set.
 [services/drivers/serial/README.md](../services/drivers/serial/README.md),
 [services/drivers/framebuffer/README.md](../services/drivers/framebuffer/README.md),
 [services/logd/README.md](../services/logd/README.md),
-[Coding Standards](coding-standards.md),
-[Kernel Cross-Boundary Disclosure Inventory](../core/kernel/docs/cross-boundary-disclosure.md)
+[coding-standards.md](coding-standards.md),
+[core/kernel/docs/cross-boundary-disclosure.md](../core/kernel/docs/cross-boundary-disclosure.md)

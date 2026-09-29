@@ -394,7 +394,8 @@ A started CPU that never announces itself leaves the BSP waiting at
 `APS_READY` on either architecture; on x86-64 that wait is the only signal,
 since SIPI delivery is unacknowledged and `start_ap` cannot report a failure.
 An entropy self-test FAIL (step 5) is printed and the boot continues; the
-marker is what the QEMU harnesses match to fail a run (see entropy.md).
+marker is matched by the `run-parallel` fail regex, which turns a QEMU run red
+(see [entropy.md](entropy.md) § Testing).
 
 **Completion criterion:** Per-CPU scheduler state and idle threads are
 initialised for all CPUs, every AP has incremented `APS_READY`, the

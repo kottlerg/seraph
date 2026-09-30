@@ -89,7 +89,8 @@ on each segment:
 1. Enforce W^X: a segment with both `PF_W` and `PF_X` is rejected and surfaced
    as [`BootError::WxViolation`](../src/error.rs): a kernel segment by the
    page-table builder when its first page is mapped, an init segment by
-   `init_segment_flags` during `load_init`, before any frame is allocated.
+   `init_segment_flags` during `load_init`, before any frame is allocated for
+   that segment.
 2. Allocate physical frames via `AllocatePages`, classified `EfiLoaderData`:
    - **Kernel ELF** — one `AllocateAnyPages` span covering the whole image at
      any free physical base; each segment is copied to

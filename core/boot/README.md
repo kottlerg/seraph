@@ -82,13 +82,10 @@ constructs the `BootInfo.init_image` ABI surface so the kernel never needs
 an ELF parser. Boot modules are loaded as opaque flat binaries with no
 parsing.
 
-W^X policy: a kernel `PT_LOAD` segment with both `PF_W` and `PF_X` is
-rejected by the bootloader's page-table builder (`boot/src/paging.rs` and
-`boot/src/arch/*/paging.rs`) when its first page is mapped; an init
-segment, which the kernel maps, is rejected at load time in
-`boot/src/elf.rs` (`init_segment_flags`). Both surface as
-`BootError::WxViolation`. ELF format errors arrive
-in boot as `elf::ElfError` and bridge to `BootError::InvalidElf` via the
+W^X is enforced for both images; where each segment kind is rejected is in
+[docs/elf-loading.md](docs/elf-loading.md) § LOAD Segment Processing and
+[docs/page-tables.md](docs/page-tables.md) § W^X Enforcement. ELF format errors
+arrive in boot as `elf::ElfError` and bridge to `BootError::InvalidElf` via the
 `From` impl in `error.rs`.
 
 ---

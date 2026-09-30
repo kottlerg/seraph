@@ -21,12 +21,8 @@
 //!   kernel never needs an ELF parser.
 //! - Load opaque boot modules as flat binaries (no ELF parsing).
 //!
-//! W^X policy: a kernel `PT_LOAD` segment with both `PF_W` and `PF_X` is
-//! rejected by the bootloader's page-table builder (`paging.rs` and
-//! `arch/*/paging.rs`) when its first page is mapped; an init segment, which
-//! the kernel maps, is rejected at load time by `init_segment_flags` before
-//! any frame is allocated for that segment. Both surface as
-//! [`BootError::WxViolation`].
+//! W^X is enforced for both images; where each segment kind is rejected is
+//! in `core/boot/docs/elf-loading.md` § LOAD Segment Processing.
 //!
 //! Header and segment validation come from `shared/elf`; format errors
 //! arrive here as `elf::ElfError` and bridge to [`BootError::InvalidElf`]

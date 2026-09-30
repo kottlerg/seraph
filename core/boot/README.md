@@ -83,10 +83,9 @@ an ELF parser. Boot modules are loaded as opaque flat binaries with no
 parsing.
 
 W^X is enforced for both images; where each segment kind is rejected is in
-[docs/elf-loading.md](docs/elf-loading.md) § LOAD Segment Processing and
-[docs/page-tables.md](docs/page-tables.md) § W^X Enforcement. ELF format errors
-arrive in boot as `elf::ElfError` and bridge to `BootError::InvalidElf` via the
-`From` impl in `error.rs`.
+[docs/elf-loading.md](docs/elf-loading.md) § LOAD Segment Processing. ELF format
+errors arrive in boot as `elf::ElfError` and bridge to `BootError::InvalidElf` via
+the `From` impl in `error.rs`.
 
 ---
 

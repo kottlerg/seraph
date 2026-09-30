@@ -25,7 +25,8 @@
 //! rejected by the bootloader's page-table builder (`paging.rs` and
 //! `arch/*/paging.rs`) when its first page is mapped; an init segment, which
 //! the kernel maps, is rejected at load time by `init_segment_flags` before
-//! any frame is allocated. Both surface as [`BootError::WxViolation`].
+//! any frame is allocated for that segment. Both surface as
+//! [`BootError::WxViolation`].
 //!
 //! Header and segment validation come from `shared/elf`; format errors
 //! arrive here as `elf::ElfError` and bridge to [`BootError::InvalidElf`]

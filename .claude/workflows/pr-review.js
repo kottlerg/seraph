@@ -162,7 +162,11 @@ const SCOPE_SCHEMA = {
                 },
             },
         },
-        design_docs: { type: 'array', items: { type: 'string', description: PATH_DESCRIPTION } },
+        design_docs: {
+            type: 'array',
+            items: { type: 'string', description: PATH_DESCRIPTION },
+            description: 'Documents present at the head, each confirmed with `git ls-files`.',
+        },
         claimed_fixes: {
             type: 'array',
             items: {
@@ -379,7 +383,8 @@ const SCOPE_PROMPT = [
         'component-scope documents (`<component>/README.md`, `<component>/docs/*.md`, and the ' +
         'parent directory\'s `README.md`) that govern the touched areas, found by walking the ' +
         'scope order the root README and the component READMEs define; include every document ' +
-        'the diff itself edits.',
+        'the diff itself edits. List only paths `git ls-files` prints: a document you cannot ' +
+        'confirm exists at the head is left out, since a lens reads what it is given.',
     '- claimed_fixes: ' +
         (DELTA
             ? 'every fix the commit messages in ' + SINCE + '..<head> and the PR body claim, as ' +

@@ -41,7 +41,8 @@ in the root `Cargo.toml`; all member crates opt in via `[lints] workspace = true
 
 ### Markdown
 
-Markdown source MUST be soft-wrapped to the project column limit (100 characters).
+Markdown source MUST be soft-wrapped to the project column limit (100 characters). A Markdown
+table row is exempt, since the syntax cannot break it; cells SHOULD stay short.
 Paragraphs are separated by exactly one blank line.
 Hard line breaks MUST NOT be used for visual layout only.
 
@@ -240,9 +241,12 @@ fields, fault and exception messages, exit and death reasons, and `SYS_CAP_INFO`
 - A physical address MAY cross only where an ABI contract requires it and the caller
   already holds the capability the address describes; the kernel virtual mapping of
   that physical address MUST NOT be exposed.
-- Kernel-pointer values MAY appear only in kernel-owned console diagnostics
-  (`kprint!` / `kprintln!`), which the console-model contract keeps off any
-  userspace-readable channel. They MUST NOT reach a userspace IPC or log channel.
+- Kernel-pointer values MAY appear only in kernel-owned console diagnostics that
+  userspace cannot read back: the serial-only class
+  [docs/console-model.md](console-model.md) § Ownership across the boot lifecycle
+  defines, with each site classified in
+  [cross-boundary-disclosure.md](../core/kernel/docs/cross-boundary-disclosure.md)
+  § Kernel console diagnostics. They MUST NOT reach a userspace IPC or log channel.
 
 New or changed cross-boundary outputs MUST be classified in the kernel
 cross-boundary disclosure inventory (`core/kernel/docs/cross-boundary-disclosure.md`)

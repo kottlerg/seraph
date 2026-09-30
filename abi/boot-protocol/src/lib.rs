@@ -15,7 +15,7 @@
 //! entry if the versions differ.
 //!
 //! See [`README.md`](../README.md) for the compliant-bootloader policy and
-//! `boot/docs/kernel-handoff.md` for the CPU-state contract at kernel entry.
+//! `core/boot/docs/kernel-handoff.md` for the CPU-state contract at kernel entry.
 
 #![no_std]
 
@@ -76,9 +76,10 @@ pub use layout::{collect_mmio_direct_map_regions, direct_map_ceiling, max_ram_ad
 ///     bootloader can hand the kernel a conditioned early-boot entropy seed
 ///     obtained from UEFI `EFI_RNG_PROTOCOL` while boot services are live. The
 ///     kernel absorbs it into the entropy pool at Phase 5, narrowing the
-///     boot-time entropy hole before any early consumer (KASLR/ASLR) draws
-///     randomness. `boot_entropy_len` is `0` when no source was available, in
-///     which case the kernel degrades to timing jitter alone.
+///     boot-time entropy hole before any early kernel consumer draws
+///     randomness (the KASLR word is a separate bootloader-side draw).
+///     `boot_entropy_len` is `0` when no source was available, in which
+///     case the kernel seeds from its remaining sources.
 /// v10: [`InitImage`] gained `flags: u32` (bit 0 = [`INIT_IMAGE_FLAG_PIE`]:
 ///     init is `ET_DYN`; the kernel chooses a load bias and applies the
 ///     image's `RELATIVE` relocations before mapping), plus `rela_phys: u64`
@@ -843,8 +844,9 @@ pub struct BootInfo
     ///   physical address for the entry point, so no placement constraint
     ///   applies beyond page alignment.
     ///
-    /// Zero if the bootloader could not reserve a trampoline page (SMP will
-    /// then be unavailable; the kernel continues BSP-only).
+    /// Zero if the bootloader could not reserve a trampoline page; the kernel
+    /// then halts at Phase 8 when more than one CPU is listed, since every
+    /// listed CPU is assumed online from there on.
     pub ap_trampoline_page: u64,
 
     // ── Reclaimable scratch (added in protocol version 7) ─────────────────────
@@ -858,20 +860,22 @@ pub struct BootInfo
     pub reclaim_ranges: ReclaimSlice,
 
     // ── Boot entropy seed (added in protocol version 9) ───────────────────────
-    /// Conditioned early-boot entropy seed obtained by the bootloader from UEFI
-    /// `EFI_RNG_PROTOCOL`. Valid only for the first `boot_entropy_len` bytes;
-    /// the remainder is zero. The kernel absorbs it into the entropy pool at
-    /// Phase 5, then **scrubs it from this page** (`boot_entropy_seed`/`_len`
-    /// zeroed) before Phase 7 — this page is a reclaim range donated to
-    /// userspace, so the secret seed must not outlive boot.
+    /// Conditioned early-boot entropy seed obtained by the bootloader from the
+    /// firmware (see `core/boot/docs/boot-flow.md`). Valid only for the first
+    /// `boot_entropy_len` bytes; the remainder is zero. The kernel absorbs it into
+    /// the entropy pool at Phase 5, then **scrubs it from this page**
+    /// (`boot_entropy_seed`/`_len` zeroed) before Phase 7 — this page is a reclaim
+    /// range donated to userspace, so the secret seed must not outlive boot.
     ///
-    /// This is already a conditioned (DRBG) output, not a raw source, so the
-    /// kernel absorbs it directly without the raw-source health gating.
+    /// Absorbed directly without raw-source health gating: a conditioned
+    /// `EFI_RNG_PROTOCOL` output, or the firmware-supplied bytes of the DTB
+    /// fallback (see `core/kernel/docs/entropy.md` § Health tests).
     pub boot_entropy_seed: [u8; 32],
 
     /// Number of valid leading bytes in `boot_entropy_seed`. `0` means the
-    /// bootloader found no entropy source; the kernel then degrades to timing
-    /// jitter alone (no regression).
+    /// bootloader found no entropy source; the kernel then seeds from its remaining
+    /// sources (hardware RNG where present, timing jitter; see
+    /// `core/kernel/docs/entropy.md`).
     pub boot_entropy_len: u32,
 
     // ── VM Generation ID (added in protocol version 13) ───────────────────────
@@ -903,19 +907,25 @@ pub struct BootInfo
 
     /// KASLR status flags (`KASLR_*` bits): which layout dimensions were
     /// randomized, which entropy source fed the draw, and why
-    /// randomization was skipped when it was. Zero means an entirely
-    /// un-randomized layout (no boot entropy and no override knob).
+    /// randomization was skipped when it was. When entropy was available, an
+    /// `ET_EXEC` image is pinned at the link base with its source bits set and
+    /// [`KASLR_IMAGE_RANDOMIZED`] clear; the direct-map bits still apply. Zero
+    /// means an entirely un-randomized layout (no boot entropy and no override
+    /// knob).
     pub kaslr_flags: u32,
 }
 
 // ── KASLR flags (protocol version 14) ────────────────────────────────────────
 
-/// `kaslr_flags` bit 0: the kernel image base carries a nonzero random slide.
+/// `kaslr_flags` bit 0: the kernel image slide was drawn from boot entropy
+/// (a PIE with entropy; the draw may select slide 0 by chance). Clear for an
+/// `ET_EXEC` image, the override knob, and no entropy.
 pub const KASLR_IMAGE_RANDOMIZED: u32 = 1 << 0;
 
-/// `kaslr_flags` bit 1: the direct-map base was randomly drawn (it may
-/// still equal the mode floor by chance only when the window is one slot;
-/// see [`KASLR_DM_WINDOW_LIMITED`]).
+/// `kaslr_flags` bit 1: the direct-map base was randomly drawn from a window
+/// of two or more 1 GiB slots; the draw may select the mode floor by chance.
+/// Never set together with [`KASLR_DM_WINDOW_LIMITED`], which marks the
+/// one-slot fallback.
 pub const KASLR_DM_RANDOMIZED: u32 = 1 << 1;
 
 /// `kaslr_flags` bit 2: the KASLR draws came from UEFI `EFI_RNG_PROTOCOL`.

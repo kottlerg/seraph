@@ -24,7 +24,7 @@ is a fatal error.
 ## File Paths
 
 Files are opened via `EFI_SIMPLE_FILE_SYSTEM_PROTOCOL` on the ESP volume. The
-bootloader carries two hardcoded ESP path constants in
+bootloader carries three hardcoded ESP path constants in
 [`boot/src/main.rs`](../src/main.rs) (see
 [uefi-environment.md](uefi-environment.md)):
 
@@ -32,6 +32,7 @@ bootloader carries two hardcoded ESP path constants in
 |---|---|
 | Kernel | `\EFI\seraph\kernel` |
 | Bootstrap bundle | `\EFI\seraph\bootstrap.bundle` |
+| KASLR override knob | `\EFI\seraph\nokaslr` (presence-only) |
 
 All paths use backslash separators as required by the UEFI file
 protocol. There is no per-file extension mechanism: the bundle is a
@@ -72,7 +73,8 @@ the `nokaslr` knob is present). The dynamic-linking sections lld emits under `-p
 the kernel linker scripts, so they keep the single-linear-offset invariant above and
 Phase 3 maps them read-only.
 
-The same validation applies to the kernel ELF and the init ELF. Boot modules (the
+The shared-crate format validation applies to both the kernel ELF and the init
+ELF; the placement ruleset above is kernel-only. Boot modules (the
 `BootInfo.modules` slice) are not ELF-validated by the bootloader — they are loaded
 as opaque flat binaries. Their validation and execution is init's responsibility.
 
@@ -84,8 +86,11 @@ Once [`shared/elf`](../../../shared/elf/README.md) has yielded the validated
 `PT_LOAD` program-header array, the bootloader layers UEFI-specific placement
 on each segment:
 
-1. Enforce W^X: a segment with both `PF_W` and `PF_X` is rejected when its
-   first page is mapped and surfaced as [`BootError::WxViolation`](../src/error.rs).
+1. Enforce W^X: a segment with both `PF_W` and `PF_X` is rejected and surfaced
+   as [`BootError::WxViolation`](../src/error.rs): a kernel segment by the
+   page-table builder when its first page is mapped, an init segment by
+   `init_segment_flags` during `load_init`, before any frame is allocated for
+   that segment.
 2. Allocate physical frames via `AllocatePages`, classified `EfiLoaderData`:
    - **Kernel ELF** — one `AllocateAnyPages` span covering the whole image at
      any free physical base; each segment is copied to
@@ -136,15 +141,17 @@ can identity-map each segment without a second copy.
 
 ```
 For each PT_LOAD segment:
-1. AllocatePages(AllocateAnyPages, EfiLoaderData, page_count, &phys_base).
+1. Reject PF_W | PF_X with BootError::WxViolation; derive flags otherwise.
+2. AllocatePages(AllocateAnyPages, EfiLoaderData, page_count, &phys_base).
    page_count = ceil(p_memsz / PAGE_SIZE).
-2. Copy p_filesz bytes from file offset p_offset into phys_base.
-3. Zero the BSS tail: memset(phys_base + p_filesz, 0, p_memsz - p_filesz).
-4. Record an InitSegment { phys_addr, virt_addr: p_vaddr, size: p_memsz, flags }.
+3. Copy p_filesz bytes from file offset p_offset into phys_base.
+4. Zero the BSS tail: memset(phys_base + p_filesz, 0, p_memsz - p_filesz).
+5. Record an InitSegment { phys_addr, virt_addr: p_vaddr, size: p_memsz, flags }.
 ```
 
-`flags` is derived from `p_flags`: `ReadExecute` if `PF_X` is set, `ReadWrite` if
-`PF_W` is set (and `PF_X` is not), otherwise `Read`. The resulting `InitImage`
+`flags` is derived from `p_flags`: a segment with both `PF_W` and `PF_X` is
+rejected with `BootError::WxViolation` (§ Categories); otherwise `ReadExecute` if
+`PF_X` is set, `ReadWrite` if `PF_W` is set, `Read` if neither. The resulting `InitImage`
 (entry point + segment array) is stored in `BootInfo.init_image`. The kernel uses
 the `phys_addr`/`virt_addr` pairs to build init's page tables without an ELF parser.
 
@@ -157,8 +164,8 @@ DT_RELASZ`. The `PT_GNU_RELRO` span rides along unbiased
 (`relro_vaddr`/`relro_size`) so the kernel can seal the covered pages
 read-only after relocation. Segment `virt_addr`s and the entry point
 stay unbiased link VAs — the kernel draws the load bias and applies the
-`RELATIVE` relocations itself (the bootloader has no entropy source on
-riscv64; see `kernel/src/mm/init_reloc.rs` and ASLR
+`RELATIVE` relocations itself (the kernel, not the bootloader, owns the
+layout draw; see `kernel/src/mm/init_reloc.rs` and ASLR
 [#39](https://github.com/kottlerg/seraph/issues/39)). An `ET_DYN` image
 whose dynamic section describes any other relocation format
 (`DT_REL`/`DT_RELR`/active `DT_JMPREL`) is rejected as invalid.
@@ -207,4 +214,4 @@ ordinal.
 
 ## Summarized By
 
-[boot/README.md](../README.md)
+[boot/README.md](../README.md), [boot-flow.md](boot-flow.md)

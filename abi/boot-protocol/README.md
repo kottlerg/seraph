@@ -71,7 +71,16 @@ A compliant bootloader MUST NOT:
 
 ## Summarized By
 
+[abi/README.md](../README.md),
 [core/boot/README.md](../../core/boot/README.md),
+[core/boot/docs/firmware-parsing.md](../../core/boot/docs/firmware-parsing.md),
+[core/boot/docs/elf-loading.md](../../core/boot/docs/elf-loading.md),
+[core/boot/docs/uefi-environment.md](../../core/boot/docs/uefi-environment.md),
+[core/boot/docs/boot-flow.md](../../core/boot/docs/boot-flow.md),
+[core/boot/docs/kernel-handoff.md](../../core/boot/docs/kernel-handoff.md),
+[core/boot/docs/memory-map.md](../../core/boot/docs/memory-map.md),
+[core/boot/docs/console.md](../../core/boot/docs/console.md),
+[xtask/README.md](../../xtask/README.md),
 [docs/bootstrap.md](../../docs/bootstrap.md),
 [docs/build-system.md](../../docs/build-system.md),
 [docs/architecture.md](../../docs/architecture.md),
@@ -79,6 +88,8 @@ A compliant bootloader MUST NOT:
 [docs/device-management.md](../../docs/device-management.md),
 [core/kernel/README.md](../../core/kernel/README.md),
 [core/kernel/docs/initialization.md](../../core/kernel/docs/initialization.md),
+[core/kernel/docs/syscalls.md](../../core/kernel/docs/syscalls.md),
+[core/kernel/docs/entropy.md](../../core/kernel/docs/entropy.md),
 [services/init/README.md](../../services/init/README.md),
 [services/procmgr/README.md](../../services/procmgr/README.md),
 [services/devmgr/README.md](../../services/devmgr/README.md),

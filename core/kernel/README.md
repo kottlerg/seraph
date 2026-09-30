@@ -64,7 +64,7 @@ kernel/
 │   │       ├── ap_trampoline.rs # AP startup trampoline (SBI HSM hart_start)
 │   │       ├── platform.rs     # Bootloader-discovered hardware accessors
 │   │       ├── console.rs      # Early SBI console / framebuffer output
-│   │       └── entropy.rs      # Hardware RNG (none; jitter-only) + cycle counter
+│   │       └── entropy.rs      # No S-mode hardware RNG; cycle counter for jitter
 │   ├── mm/                     # Memory management subsystem
 │   │   ├── mod.rs
 │   │   ├── buddy.rs            # Physical frame allocator (buddy algorithm)
@@ -122,7 +122,7 @@ kernel/
     ├── arch-interface.md       # Architecture abstraction layer and dispatch surface
     ├── initialization.md       # Boot-to-init sequence, phase by phase
     ├── syscalls.md             # Syscall ABI and complete syscall table
-    ├── cross-boundary-disclosure.md # Kernel-pointer leak audit of cross-boundary outputs (KASLR prerequisite)
+    ├── cross-boundary-disclosure.md # Kernel-pointer leak audit of outputs
     ├── memory-internals.md     # Memory subsystem implementation details
     ├── capability-internals.md # Capability subsystem implementation details
     ├── entropy.md              # Entropy subsystem, CSPRNG, health tests, draw API
@@ -171,8 +171,9 @@ See [`docs/capability-internals.md`](docs/capability-internals.md).
 
 The kernel entropy subsystem: a multi-source pool feeding per-CPU forward-secure
 CSPRNGs, with hardware-source health gating, an interrupt-time jitter source, a
-kernel-internal draw API, and a boot-time power-on self-test. Kernel-internal
-only — no syscall surface. See [`docs/entropy.md`](docs/entropy.md).
+kernel-internal draw API, and a boot-time power-on self-test. Kernel consumers
+call `fill_bytes`; userspace draws from the same generators through
+`SYS_GETRANDOM`. See [`docs/entropy.md`](docs/entropy.md).
 
 ### `ipc/`
 
@@ -240,14 +241,15 @@ boot info validation
                                                     └─► capability system (cap)
                                                     └─► scheduler (sched)
                                                             └─► SMP bringup (arch + sched)
-                                                                    └─► init thread (cap + mm + sched)
+                                                                    └─► init thread (cap, mm, sched)
 ```
 
 The kernel creates init's AddressSpace, CSpace, and Thread directly from the
 `init_image` segments in `BootInfo` — no ELF parsing occurs in the kernel.
 
 Each arrow means "requires the item above to be complete". Nothing in this chain is
-reversible — a failure at any phase is a fatal boot error.
+reversible; a phase failure halts the boot except where the phase's failure mode in
+[initialization.md](docs/initialization.md) states otherwise.
 
 ---
 
@@ -259,7 +261,7 @@ and the CPU state guaranteed at entry are specified in
 `BootInfo` layout is owned by the
 [`abi/boot-protocol/`](../../abi/boot-protocol/) crate.
 
-The entry point is `#[no_mangle] pub extern "C"` and marked `-> !`. It receives a
+The entry point is `#[unsafe(no_mangle)] pub extern "C"` and marked `-> !`. It receives a
 single argument: a `*const BootInfo` pointer whose physical address is in `rdi`
 (x86-64) or `a0` (RISC-V) per the boot protocol.
 

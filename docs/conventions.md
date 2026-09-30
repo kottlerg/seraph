@@ -140,8 +140,9 @@ were swept to use `svctest` where they meant the services-tier harness.
 - `<summary>` MUST NOT contain planning labels (per
   [documentation-standards.md](documentation-standards.md) §"Incomplete Work Markers"): no "step X",
   "phase Y", "tier N", "stage M", "round N", "the deferred follow-up", nor any other label that only
-  a planning conversation can resolve. The list is illustrative, not exhaustive. Components and
-  concrete what-changed text only.
+  a planning conversation can resolve; the name of a step or phase in a sequence a document defines
+  permanently (a kernel boot phase, a bootloader boot step) is not a label. The list is
+  illustrative, not exhaustive. Components and concrete what-changed text only.
 - `<summary>` MUST NOT include task IDs, branch names, or other transient identifiers. Issue
   references belong in the body.
 
@@ -174,14 +175,52 @@ All work — including single-line fixes and documentation changes — flows
 through a short-lived feature branch and a PR. Direct commits to `master`
 are forbidden; `master` MUST NOT receive force pushes.
 
-- PRs are self-reviewed; the file-by-file diff view, line comments, and CI
-  status integration are the value.
+- PRs have no second human reviewer; the file-by-file diff view, line
+  comments, and CI status integration are the value, and the pre-merge
+  review below gates the merge alongside CI.
 - CI MUST gate merge. `master` MUST stay linearly green: every commit on
   `master` is a passing CI state. Branches MAY have intermediate failures;
   merge is the green gate.
 - PRs that close an Issue MUST carry `Fixes #N` / `Closes #N` in the PR
   description so merge auto-closes the Issue. The acceptance-checklist
   tick-through (see above) lands in the same merge action.
+- Merge is gated by the pre-merge review: the `pr-review` workflow
+  (`.claude/workflows/pr-review.js`) runs the adversarial code review and
+  the closure audit; when the Workflow tool is unavailable, the
+  `pr-reviewer` and `pr-auditor` agents invoked directly are the review,
+  and their prose verdict lines are the gate. Findings are handled per the
+  review surface defined below, as one batch per run. A finding the
+  verifiers contested MUST be put to the maintainer; on the surface it MUST
+  resolve in the same PR as a fix, as a clarification of the rule it
+  misread, or, when the maintainer finds it false on the facts, as a
+  clarification of the code or document it misread; off the surface it is
+  recorded, with the maintainer's answer, on the Issue that records it (the
+  open Issue that already names the work, else the audit Issue), or, when
+  it misread a rule, resolved by the clarification of that rule alone,
+  which is its record. A finding MUST NOT be waived or ruled outside the
+  standards. The merge prompt MUST follow a completed run with no failed
+  agent, `READY TO MERGE`, and `AUDIT PASS`. `.claude/CLAUDE.md` § PR
+  workflow operations gives the assistant's procedure.
+- The review surface of a change is what it touches: the changed hunks and
+  the items that contain them (a function, a paragraph, a section, a table
+  row, a list), everything the change introduces, and the callers and
+  reverse dependencies of what it changes; a correctness, soundness, safety,
+  or contract defect anywhere in a touched file is on the surface too,
+  unless an open Issue already names it. In a re-review of a PR (a delta
+  run), a standards, documentation-drift, coverage, or style finding is on
+  the surface only when the delta introduced it, wherever it anchors: a
+  statement the delta made stale, or a test the delta's new code lacks, is
+  one the delta introduced. Correctness, soundness, safety, and contract
+  findings stay on the surface as above. A finding on the surface MUST be
+  fixed before merge. A finding off the surface MUST be recorded, not fixed:
+  the pre-merge review reports it as out of bound, and it is appended, with
+  file, line, authority, and fix, to the open audit Issue for that surface
+  (or to a new one, filed with the maintainer's approval) before the merge
+  prompt. Nothing found is dropped. Work an open Issue already names, filed
+  with the maintainer's approval, is off the surface of every other PR; a
+  finding on it is recorded against that Issue. A finding two independent
+  refuters refute on evidence is dropped and listed in the report's Dropped
+  section; every other finding is fixed or recorded.
 
 ### Branch naming
 
@@ -218,6 +257,9 @@ gives the PR-level linear view.
   with a one-line rationale in the same edit. Same shape as the Issue
   acceptance rule under "Backlog Tracking" above.
 - Edit via `gh pr edit <N> --body "$(cat <<'EOF' …EOF)"` or the web UI.
+- Every PR body MUST state the validated head in its `## Validation`
+  section; for a documentation-only or comment-only delta since that head,
+  it MUST say so (see [testing.md](testing.md#coverage-tiers)).
 
 ## CI Gating
 
@@ -250,4 +292,4 @@ Producing a release for tag `v<X>.<Y>.<Z>`:
 
 ## Summarized By
 
-[README.md](../README.md)
+[README.md](../README.md), [build-system.md](build-system.md), [testing.md](testing.md)

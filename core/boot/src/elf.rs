@@ -21,10 +21,8 @@
 //!   kernel never needs an ELF parser.
 //! - Load opaque boot modules as flat binaries (no ELF parsing).
 //!
-//! W^X policy is enforced by the bootloader's page-table builder
-//! (`paging.rs` and `arch/*/paging.rs`). A `PT_LOAD` segment with both
-//! `PF_W` and `PF_X` is rejected when its first page is mapped, surfaced
-//! as [`BootError::WxViolation`].
+//! W^X is enforced for both images; where each segment kind is rejected is
+//! in `core/boot/docs/elf-loading.md` § LOAD Segment Processing.
 //!
 //! Header and segment validation come from `shared/elf`; format errors
 //! arrive here as `elf::ElfError` and bridge to [`BootError::InvalidElf`]
@@ -36,6 +34,8 @@ use crate::error::BootError;
 // referenced per target arch build.
 #[allow(unused_imports)]
 pub use elf::{EM_RISCV, EM_X86_64};
+// The image kind, consumed by the KASLR layout decision in main.rs.
+pub use elf::ElfKind;
 
 // ── Output types ──────────────────────────────────────────────────────────────
 
@@ -77,8 +77,9 @@ pub struct KernelInfo
     pub segments: [LoadedSegment; MAX_LOAD_SEGMENTS],
     /// Number of valid entries in `segments`.
     pub segment_count: usize,
-    /// Image is `ET_DYN` (static-PIE) and accepts a nonzero KASLR slide.
-    pub is_pie: bool,
+    /// Object-file type: `Dyn` (static-PIE) accepts a nonzero KASLR slide,
+    /// `Exec` is pinned at its link addresses.
+    pub kind: elf::ElfKind,
     /// Physical address of the `.rela.dyn` table within the copied span;
     /// 0 when the image has no relocation table.
     pub rela_phys: u64,
@@ -358,7 +359,7 @@ pub unsafe fn load_kernel(
         entry_virtual: elf::entry_point(ehdr),
         segments,
         segment_count,
-        is_pie: matches!(kind, elf::ElfKind::Dyn),
+        kind,
         rela_phys,
         rela_size,
     })
@@ -390,7 +391,7 @@ pub unsafe fn relocate_kernel(
     expected_machine: u16,
 ) -> Result<(), BootError>
 {
-    if !info.is_pie
+    if info.kind == elf::ElfKind::Exec
     {
         if slide != 0
         {
@@ -463,6 +464,7 @@ pub unsafe fn relocate_kernel(
 /// - `BootError::OutOfMemory` if any segment's physical allocation fails.
 /// - `BootError::InvalidElf` if the image is malformed (bridged from
 ///   `elf::ElfError`).
+/// - `BootError::WxViolation` if a segment is both writable and executable.
 ///
 /// # Safety
 ///
@@ -507,6 +509,8 @@ pub unsafe fn load_init(
                 "init ELF has more than INIT_MAX_SEGMENTS LOAD segments",
             ));
         }
+        // W^X is checked before any frame is allocated for the segment.
+        let flags = init_segment_flags(&seg)?;
 
         // p_vaddr & 0xFFF fits in usize (≤ 4095). p_memsz → usize: 64-bit only.
         #[allow(clippy::cast_possible_truncation)]
@@ -545,19 +549,6 @@ pub unsafe fn load_init(
             // SAFETY: `bss_ptr` is within the allocated region.
             unsafe { core::ptr::write_bytes(bss_ptr, 0, bss_sz) };
         }
-
-        let flags = if seg.executable
-        {
-            SegmentFlags::ReadExecute
-        }
-        else if seg.writable
-        {
-            SegmentFlags::ReadWrite
-        }
-        else
-        {
-            SegmentFlags::Read
-        };
 
         segments[count] = InitSegment {
             // Encode the in-page offset: phys_addr & 0xFFF = virt_addr & 0xFFF.
@@ -640,10 +631,26 @@ fn rela_phys_for(segments: &[boot_protocol::InitSegment], table: &elf::RelaTable
 // allocation in `BootModule.physical_base`; only the `init` entry is ELF-
 // loaded (via [`load_init`]). See `main.rs::step4_parse_bundle`.
 
+/// Page permissions for one init segment. A segment that is both writable
+/// and executable is rejected: the boot protocol's `SegmentFlags` carries no
+/// such variant, and init W^X violations are fatal at load time
+/// (`core/boot/docs/elf-loading.md` § Categories).
+fn init_segment_flags(seg: &elf::LoadSegment) -> Result<boot_protocol::SegmentFlags, BootError>
+{
+    match (seg.writable, seg.executable)
+    {
+        (true, true) => Err(BootError::WxViolation),
+        (false, true) => Ok(boot_protocol::SegmentFlags::ReadExecute),
+        (true, false) => Ok(boot_protocol::SegmentFlags::ReadWrite),
+        (false, false) => Ok(boot_protocol::SegmentFlags::Read),
+    }
+}
+
 #[cfg(test)]
 mod tests
 {
     use super::*;
+    use boot_protocol::SegmentFlags;
 
     // A realistic kernel link layout: one linear vaddr→paddr offset, 4 KiB-aligned.
     const VBASE: u64 = 0xFFFF_FFFF_8000_0000;
@@ -671,6 +678,34 @@ mod tests
             seg(VBASE + 0x2000, PBASE + 0x2000, 0x1000, 0x1000),
             seg(VBASE + 0x3000, PBASE + 0x3000, 0x800, 0x1800),
         ]
+    }
+
+    #[test]
+    fn writable_executable_init_segment_is_rejected()
+    {
+        let mut wx = seg(VBASE, PBASE, 0x1000, 0x1000);
+        wx.writable = true;
+        wx.executable = true;
+        assert!(matches!(
+            init_segment_flags(&wx),
+            Err(BootError::WxViolation)
+        ));
+    }
+
+    #[test]
+    fn permitted_init_segment_permissions_map_to_their_flags()
+    {
+        let mut text = seg(VBASE, PBASE, 0x1000, 0x1000);
+        text.executable = true;
+        let mut data = seg(VBASE, PBASE, 0x1000, 0x1000);
+        data.writable = true;
+        let rodata = seg(VBASE, PBASE, 0x1000, 0x1000);
+        assert_eq!(
+            init_segment_flags(&text).unwrap(),
+            SegmentFlags::ReadExecute
+        );
+        assert_eq!(init_segment_flags(&data).unwrap(), SegmentFlags::ReadWrite);
+        assert_eq!(init_segment_flags(&rodata).unwrap(), SegmentFlags::Read);
     }
 
     #[test]

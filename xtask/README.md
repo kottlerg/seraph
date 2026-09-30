@@ -1,6 +1,6 @@
 # xtask
 
-Build task runner for Seraph. Invoke via `cargo xtask <command>`.
+Build task runner for Seraph, invoked as `cargo xtask <command>`.
 
 ---
 
@@ -11,14 +11,15 @@ Build task runner for Seraph. Invoke via `cargo xtask <command>`.
 Build Seraph components and populate `sysroot/`.
 
 ```
-cargo xtask build [--arch x86_64|riscv64] [--release] [--component boot|kernel|init|all] [--debug <comp>[,...]]
+cargo xtask build [--arch x86_64|riscv64] [--release] \
+    [--component <name>|all] [--debug <comp>[,...]]
 ```
 
 | Option | Default | Description |
 |---|---|---|
 | `--arch` | `x86_64` | Target architecture |
 | `--release` | off | Build in release mode |
-| `--component` | `all` | Build a single component (`boot`, `kernel`, `init`, or `all`) |
+| `--component` | `all` | Build a single component: any `BuildComponent` name (`boot`, `kernel`, `init`, `ktest`, each service or program crate), or `all` |
 | `--debug` | (none) | Emit debuginfo (`debug=2`, `opt-level=1`) for the named component(s) only, e.g. `--debug kernel,procmgr`; applies within the active profile. See [Build Profiles](../docs/build-system.md#build-profiles). |
 
 The sysroot is architecture-specific. Building for a different arch than the
@@ -33,7 +34,8 @@ Run `cargo xtask build` first; `run` errors fast if the sysroot is empty
 or stamped for a different architecture.
 
 ```
-cargo xtask run [--arch x86_64|riscv64] [--gdb] [--headless] [--verbose] [--cpus N] [--mem MIB] [--riscv-mmu sv39|sv48|sv57]
+cargo xtask run [--arch x86_64|riscv64] [--gdb] [--headless] [--verbose] \
+    [--cpus N] [--mem MIB] [--riscv-mmu sv39|sv48|sv57]
 ```
 
 | Option | Description |
@@ -42,7 +44,7 @@ cargo xtask run [--arch x86_64|riscv64] [--gdb] [--headless] [--verbose] [--cpus
 | `--gdb` | Start QEMU with a GDB server on localhost:1234; QEMU pauses at startup. Userspace binaries are PIE with a per-spawn randomized base (ASLR, #39): take the bias from the creator's log line (procmgr `spawn image bias=0x…`, init `init: <svc> image bias=0x…`, kernel `init: PIE bias=0x…`) and load symbols with `add-symbol-file <binary> -o <bias>` |
 | `--headless` | Run without a display window (`-display none`) |
 | `--verbose` | Show all serial output; by default output is filtered until `[--------] boot:` appears |
-| `--cpus` | Number of vCPUs to expose to the guest (default: `4`; bounded by `1..=512`, the boot-protocol `MAX_CPUS` the kernel sizes its per-CPU structures from) |
+| `--cpus` | Number of vCPUs to expose to the guest (default: `4`; bounded by `1..=512`, the [boot-protocol](../abi/boot-protocol/README.md) `MAX_CPUS` the kernel sizes its per-CPU structures from) |
 | `--mem` | Guest memory size in MiB (default: `512`) |
 | `--riscv-mmu` | Guest RISC-V paging-mode ceiling (default: `sv48`; riscv64 only, ignored on x86_64). Sets the QEMU `svNN` CPU properties so the DTB `mmu-type` advertises the chosen ceiling; the kernel negotiates the highest advertised mode it supports at boot. The default pins `sv48` because QEMU ≥ 8.0 otherwise defaults the rv64 CPU to `sv57` |
 
@@ -78,7 +80,9 @@ and the distro ships standard firmware packages.
 
 Default firmware search paths per host:
 
-- **Linux** OVMF: `/usr/share/edk2/ovmf/OVMF_CODE.fd`, `/usr/share/OVMF/OVMF_CODE.fd`, `/usr/share/edk2-ovmf/x64/OVMF_CODE.fd`, `/usr/share/ovmf/OVMF.fd`, `/usr/share/edk2/x64/OVMF_CODE.4m.fd`
+- **Linux** OVMF: `/usr/share/edk2/ovmf/OVMF_CODE.fd`, `/usr/share/OVMF/OVMF_CODE.fd`,
+  `/usr/share/edk2-ovmf/x64/OVMF_CODE.fd`, `/usr/share/ovmf/OVMF.fd`,
+  `/usr/share/edk2/x64/OVMF_CODE.4m.fd`
 - **Linux** RISC-V: `/usr/share/edk2/riscv`, `/usr/share/edk2-riscv`, `/usr/share/qemu-efi-riscv64`
 - **macOS** (both): `/opt/homebrew/share/qemu`, `/usr/local/share/qemu`
 - **BSD** (both): `/usr/local/share/qemu`, `/usr/local/share/uefi-firmware`
@@ -163,10 +167,11 @@ cargo xtask compose-bundle [--arch x86_64|riscv64] [--harness init|ktest]
 | `--arch` | `x86_64` | Target architecture — must match the existing sysroot's arch tag |
 | `--harness` | `init` | Which binary becomes the bundle's `init` entry: `init` for the regular userspace init, `ktest` for the kernel-test harness |
 
-`--harness init` produces a 7-entry bundle (`init` + 6 boot modules in
-the order the bootloader expects). `--harness ktest` produces a
-single-entry bundle (`ktest` as the `init` entry, zero modules); ktest
-is monolithic and does not spawn userspace.
+`--harness init` produces a 9-entry bundle (`init` + the 8 boot modules
+listed in `xtask/src/bundle.rs::MODULES`; the bootloader and init
+address entries by name, so order is not significant). `--harness ktest`
+produces a single-entry bundle (`ktest` as the `init` entry, zero
+modules); ktest is monolithic and does not spawn userspace.
 
 Both `cargo xtask build` and `compose-bundle` are *authoring* steps —
 both deliberately overwrite the bundle. `mkdisk` is the
@@ -248,14 +253,23 @@ cargo xtask run-parallel \
 | `--parallel` | (required) | Concurrency: QEMU instances in flight at once |
 | `--runs` | (required) | Total runs, dispatched in waves of `--parallel` |
 | `--timeout` | `30` | Per-run timeout in seconds; expired runs are SIGKILLed and classified `HANG` (unless a pass marker matched first) |
-| `--cpus` | `4` | vCPUs per guest (bounded by `1..=512`, the boot-protocol `MAX_CPUS`) |
+| `--cpus` | `4` | vCPUs per guest (bounded by `1..=512`, the [boot-protocol](../abi/boot-protocol/README.md) `MAX_CPUS`) |
 | `--mem` | `512` | Guest memory size in MiB |
 | `--riscv-mmu` | `sv48` | Guest RISC-V paging-mode ceiling (riscv64 only, ignored on x86_64); same semantics as `cargo xtask run --riscv-mmu` |
 | `--pass` | `ALL TESTS PASSED` | Regex marking a successful run. The default matches the cross-harness terminal marker `[<harness>] ALL TESTS PASSED` standardised in [docs/testing.md](../docs/testing.md). On match the log is discarded and the run is classified `PASS` |
-| `--fail` | `SOME TESTS FAILED\|KERNEL EXCEPTION\|FATAL:\|PANIC( at \|: )\|=== WATCHDOG` | Regex marking a failed run; the **first** match wins. Matches the cross-harness terminal marker `[<harness>] SOME TESTS FAILED` ([docs/testing.md](../docs/testing.md)) plus the kernel's own death markers (`KERNEL EXCEPTION` + `FATAL:` for a hardware trap, `PANIC at`/`PANIC:` for a Rust `panic!`, `=== WATCHDOG` for a scheduler wedge-detector dump) so a crash classifies `FAIL` rather than `HANG`. The benign `USERSPACE FAULT` path matches none of these. On match the log is preserved as `FAIL-<run>.log`. Failure takes precedence over success. Override with a never-matching pattern (e.g. `'$.^'`) to disable |
+| `--fail` | `SOME TESTS FAILED\|KERNEL EXCEPTION\|FATAL:\|PANIC( at \|: )\|=== WATCHDOG\|entropy: SELFTEST FAIL` | Regex marking a failed run; the **first** match wins, the log is preserved as `FAIL-<run>.log`, and failure takes precedence over success. The default's markers are explained below the table |
 | `--fail-grace-secs` | `10` | After the first `--fail` match, wait this many seconds (bounded by `--timeout`) before SIGKILL, so the trailing fault dump still lands in the log. A crashed run thus aborts ~grace seconds after the first match instead of idling to `--timeout` |
 | `--debug-listen` | off | Expose each guest's gdbstub without pausing it (QEMU `-s`, tcp::1234) so a wedged guest can be attached post-hoc: `gdb -ex 'target remote :1234'`. Requires `--parallel 1` (one gdbstub port) |
 | `--hold-on-hang` | off | On a hard-timeout `HANG` (no `--fail` match), do not kill QEMU: print the attach instructions and block until the instance is terminated externally, preserving the wedged guest for a debugger. Pair with `--debug-listen`. Requires `--parallel 1` |
+
+The default `--fail` regex matches the cross-harness terminal marker
+`[<harness>] SOME TESTS FAILED` ([docs/testing.md](../docs/testing.md)) plus the
+kernel's own death markers: `KERNEL EXCEPTION` and `FATAL:` for a hardware trap,
+`PANIC at` or `PANIC:` for a Rust `panic!`, `=== WATCHDOG` for a scheduler
+wedge-detector dump, and `entropy: SELFTEST FAIL` for a kernel entropy self-test
+failure, so a crash classifies `FAIL` rather than `HANG`. The benign `USERSPACE
+FAULT` path matches none of these. Override with a never-matching pattern (for
+example `'$.^'`) to disable.
 
 **Mode-agnostic**: xtask does not know about ktest, svctest, or any other
 rootfs configuration. Pass/fail markers come from the invoker. The default
@@ -287,7 +301,8 @@ PASS logs are discarded.
    crashed, not the guest. Tallied in the summary and preserved as
    `QEMU-CRASH-<run>.log`, but does **not** fail the run (infrastructure flake,
    not a regression in the OS under test; the recurring case is the QEMU 8.2.x
-   multi-threaded-TCG segfault, [QEMU gitlab #2220](https://gitlab.com/qemu-project/qemu/-/issues/2220)).
+   multi-threaded-TCG segfault,
+   [QEMU gitlab #2220](https://gitlab.com/qemu-project/qemu/-/issues/2220)).
    SIGKILL is excluded (the `--timeout` kill, or an OOM).
 6. Other exit code → `ERR rc=<n>` (a signal death is reported as `128 + signum`,
    e.g. `139` for SIGSEGV)
@@ -303,9 +318,12 @@ QEMU headless with a QMP control socket, waits for the guest to print
 sequence (`help`, a stray `x`, Backspace, Return) via QMP `input-send-event`,
 and asserts — host-side — that the terminal's local echo, the shell's `$ `
 prompt, and the relayed `help` output (`shell built-ins:`) appear on the serial
-stream. Exits non-zero on an injection error or the 180 s timeout. This subsumes
-the former standalone keyboard smoke test: the echoed `help` proves keysym
-decode, and Return/Backspace prove the named-key decodes.
+stream. After the keyboard round passes, the transcript is cleared and the same
+sequence is written to the guest UART over QEMU's bidirectional `-serial stdio`,
+with the same echo, prompt, and `shell built-ins:` assertions (the serial RX
+round, #291). Exits non-zero on an injection error or the 180 s timeout. This
+subsumes the former standalone keyboard smoke test: the echoed `help` proves
+keysym decode, and Return/Backspace prove the named-key decodes.
 
 A pure runner — it neither builds nor stages. `terminal.svc` is in the default
 boot set, so the terminal autostarts; just build and repack:
@@ -330,7 +348,8 @@ then boots a second QEMU with a different GUID and `-incoming` restoring the
 state. Asserts — host-side — the kernel's `entropy: VM generation change
 detected` marker and a post-resume interactive liveness round (`help` over
 QMP → `shell built-ins:` on serial). Exits non-zero on a QMP error, a failed
-migration, or a per-phase 180 s timeout.
+migration, or a timeout: 180 s per marker-wait phase, 120 s for the
+migrate-to-file poll, 30 s for the source to quit.
 
 A pure runner with the same boot requirements as `test-terminal`:
 
@@ -341,7 +360,8 @@ cargo xtask test-vmgenid [--cpus N] [--mem MIB]
 ```
 
 See [docs/testing.md](../docs/testing.md) for the harness model and
-`core/kernel/docs/entropy.md` for the snapshot-detection design.
+[core/kernel/docs/entropy.md](../core/kernel/docs/entropy.md) for the
+snapshot-detection design.
 
 ---
 
@@ -364,7 +384,7 @@ cargo xtask test-kaslr [--arch x86_64|riscv64] [--cpus N] [--mem MIB] [--riscv-m
 ```
 
 See [docs/testing.md](../docs/testing.md) for the harness model and
-`docs/memory-model.md` for the randomized layout.
+[docs/memory-model.md](../docs/memory-model.md) for the randomized layout.
 
 ---
 
@@ -387,4 +407,11 @@ See [docs/testing.md](../docs/testing.md) for the harness model and
 
 ## Summarized By
 
-[README.md](../README.md), [docs/build-system.md](../docs/build-system.md)
+[README.md](../README.md), [docs/build-system.md](../docs/build-system.md),
+[docs/testing.md](../docs/testing.md),
+[core/kernel/docs/entropy.md](../core/kernel/docs/entropy.md),
+[core/ktest/README.md](../core/ktest/README.md),
+[core/boot/README.md](../core/boot/README.md),
+[core/boot/docs/riscv-uefi-boot.md](../core/boot/docs/riscv-uefi-boot.md),
+[docs/architecture.md](../docs/architecture.md),
+[programs/terminal/README.md](../programs/terminal/README.md)

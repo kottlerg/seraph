@@ -10,8 +10,9 @@ and version); this document covers how the bootloader fulfils that contract.
 
 ## Boot Sequence
 
-The following ten steps correspond to the bootloader's execution order. Each step is
-described briefly here; detailed implementation is in the referenced document.
+The following ten numbered steps correspond to the bootloader's execution order, with
+5b to 5d as sub-steps of step 5 executed before step 6. Each step is described briefly
+here; detailed implementation is in the referenced document.
 
 ### Step 1: UEFI Protocol Discovery
 
@@ -88,11 +89,11 @@ The bootloader does not inspect module content; what each module does
 and in what order init spawns them is init's concern, and after
 init-protocol v7 init identifies modules by `BootModule.name` rather
 than ordinal position. Typical modules: procmgr, memmgr, devmgr, vfsd,
-virtio-blk, fatfs.
+virtio-blk, serial, framebuffer, fatfs (the authoritative list is
+`xtask/src/bundle.rs::MODULES`).
 
-Only the whole bundle allocation is identity-mapped (one region in
-place of today's per-module pair of read-buffer + loaded-region
-mappings); see step 6.
+Only the whole bundle allocation is identity-mapped; module bodies are
+slices of it (see step 6).
 
 Detail: [elf-loading.md](elf-loading.md)
 
@@ -106,22 +107,40 @@ Both GUIDs are searched unconditionally; absent entries produce a zero field in
 `BootInfo`. Whichever tables are present are passed through to userspace as
 opaque physical addresses (`BootInfo.acpi_rsdp`, `BootInfo.device_tree`).
 
-The bootloader also extracts two narrow views from the firmware tables for
+The bootloader extracts two narrow views from the tables discovered here for
 the kernel's own consumption:
 
 - **CPU topology** — MADT `LocalApic` / `RINTC` entries (ACPI) and `/cpus`
   nodes (DTB) populate `BootInfo.cpu_count`, `bsp_id`, and `cpu_ids`.
+  Derived here in step 5 and written into `BootInfo` in step 9.
 - **`kernel_mmio`** — arch-specific MMIO bases: LAPIC / IOAPIC on x86-64
-  (from MADT), PLIC / UART on RISC-V (from MADT `PLIC` type or DTB
-  compatible nodes).
+  (from MADT), PLIC (MADT) / UART (SPCR) on RISC-V, or DTB compatible
+  nodes, plus the riscv64 hart facts (`timebase_freq`, `hart_caps`).
+  Extracted into `BootInfo` in step 9.
 
 A third extraction produces **seed entries** for `mmio_apertures` —
 coarse `{phys_base, size}` regions the kernel mints as `Mmio`
 capabilities. The seed covers LAPIC / IOAPIC / PLIC / ECAM / BAR
-windows / `virtio,mmio` transports from the firmware tables and is
-merged with the UEFI memory map's `MemoryMappedIO` regions in step 8.
+windows / `virtio,mmio` transports from the firmware tables, plus the GOP
+framebuffer, and is merged with the UEFI memory map's `MemoryMappedIO`
+regions in step 9.
 
-The bootloader also draws **conditioned early-boot entropy** from UEFI
+On RISC-V the paging mode is negotiated here, from the DTB `mmu-type` claim and
+a `satp` probe, before step 6 fixes the table hierarchy depth (see
+[page-tables.md](page-tables.md) § Mode negotiation).
+
+### Step 5b: Allocate the AP Trampoline Page
+
+One 4 KiB page is reserved for the AP startup trampoline: below 1 MiB on
+x86-64 (SIPI vector constraint), any page on RISC-V (SBI HSM has no placement
+constraint). Allocation failure records zero, and the kernel then halts at Phase 8
+when more than one CPU is listed
+([kernel initialisation § Phase 8](../../kernel/docs/initialization.md)); the page is
+reported in `BootInfo.ap_trampoline_page`.
+
+### Step 5c: Boot Entropy Seed
+
+The bootloader draws **conditioned early-boot entropy** from UEFI
 `EFI_RNG_PROTOCOL` (`GetRNG`, default algorithm) while boot services are live: a
 32-byte pool seed recorded in `BootInfo.boot_entropy_seed` / `boot_entropy_len`,
 and an independent 16-byte KASLR word (kept separate so neither reveals the other)
@@ -130,10 +149,16 @@ hole before any early consumer draws randomness. The protocol is backed by RDRAN
 on x86-64 OVMF and by the firmware's `VirtioRngDxe` driver binding the
 `virtio-rng-pci` device on both arches (the mechanism that gives riscv64 a boot
 seed at all, since its EDK2 exposes no RNG on its own and hands the bootloader ACPI
-rather than a DTB). When no RNG is exposed the length is zero, the KASLR entropy is
-absent, and the kernel degrades to timing jitter and the deterministic layout. A DTB
-`/chosen/rng-seed` reader is a secondary fallback for firmware that delivers a DTB.
-See `core/kernel/docs/entropy.md`.
+rather than a DTB). A DTB `/chosen/rng-seed` reader is a secondary fallback for
+firmware that delivers a DTB: a draw of at least 24 bytes is split, the first 16
+bytes to the KASLR word and the rest to the pool seed, and a shorter draw feeds the
+pool alone; the property is scrubbed from the blob in place ([dtb.md](dtb.md)). A
+firmware pool draw that succeeds while the separate KASLR draw fails keeps the
+32-byte pool seed and leaves the KASLR entropy absent. When neither source yields
+a seed the length is zero, the KASLR entropy is absent, the kernel seeds the pool
+from its remaining sources (hardware RNG where present, jitter), and the layout
+is deterministic.
+See [core/kernel/docs/entropy.md](../../kernel/docs/entropy.md).
 
 Detail: [firmware-parsing.md](firmware-parsing.md)
 
@@ -141,7 +166,8 @@ Detail: [firmware-parsing.md](firmware-parsing.md)
 
 Before the page tables are built, the bootloader chooses a 2 MiB-aligned kernel
 image slide within the top-2 GiB window from the KASLR entropy (0 when no entropy,
-or when the `\EFI\seraph\nokaslr` override knob is present), applies the kernel's
+when the `\EFI\seraph\nokaslr` override knob is present, or for an `ET_EXEC` kernel,
+whose direct-map base is still randomized), applies the kernel's
 `RELATIVE` relocations through the loaded span, and biases the recorded kernel
 virtual base and entry point. The matching 1 GiB-aligned direct-map base is chosen
 in step 9 once the final memory map is known. The chosen layout and its entropy
@@ -201,18 +227,18 @@ scrubs from this donated page after consuming them. The `version` field is set t
 | `framebuffer` | GOP framebuffer from step 1 (zeroed if GOP is absent) |
 | `acpi_rsdp` | Physical address of ACPI RSDP from step 5; zero if GUID absent |
 | `device_tree` | Physical address of DTB from step 5; zero if GUID absent |
-| `kernel_mmio` | Arch-specific MMIO bases extracted from firmware tables in step 5 (see `firmware-parsing.md`). Fields the extractor cannot populate stay zero and the kernel falls back to its compiled-in defaults. |
-| `mmio_apertures` | Coarse `{phys_base, size}` array from step 8 (UEFI MMIO regions merged with firmware-table seeds). Empty if no MMIO regions were reported. |
+| `kernel_mmio` | Arch-specific MMIO bases and riscv64 hart facts, extracted from the firmware tables discovered in step 5 and written here in step 9 (see `firmware-parsing.md`). MMIO bases the extractor cannot populate stay zero and the kernel falls back to its compiled-in defaults; a zero riscv64 `timebase_freq` or missing `hart_caps` bit is fatal at kernel Phase 5. |
+| `mmio_apertures` | Coarse `{phys_base, size}` array assembled in step 9 (UEFI MMIO regions merged with the firmware-table and framebuffer seeds). Empty if no MMIO regions were reported. |
 | `cpu_count` | Enabled LAPIC count from MADT (x86-64) or enabled RINTC / DTB hart count (RISC-V); always ≥ 1 |
 | `bsp_id` | APIC ID of the BSP (x86-64) or boot hart ID from `EFI_RISCV_BOOT_PROTOCOL` (RISC-V) |
 | `cpu_ids` | Per-CPU hardware identifiers; `cpu_ids[0] == bsp_id`; entries beyond `cpu_count` are zero |
-| `ap_trampoline_page` | 4 KiB physical frame for AP startup code. x86-64: below 1 MiB (SIPI vector constraint). RISC-V: any 4 KiB page (SBI HSM has no placement constraint). Zero if allocation failed (SMP disabled). |
+| `ap_trampoline_page` | 4 KiB physical frame for AP startup code. x86-64: below 1 MiB (SIPI vector constraint). RISC-V: any 4 KiB page (SBI HSM has no placement constraint). Zero if allocation failed; the kernel then halts at Phase 8 when more than one CPU is listed ([initialization.md § Phase 8](../../kernel/docs/initialization.md)). |
 | `reclaim_ranges` | `ReclaimSlice` over a dedicated 4 KiB scratch page recording bootloader pages the kernel reclaims into the cap surface. Populated from `BootAllocations` (`BootInfo` page, module descriptor array, memory-map entry array, MMIO aperture array, the reclaim-array page itself, the AP trampoline page), `page_table.allocated_frames()` (the bootloader's transient page-table frames), and per-gap carve-outs over the bundle allocation — the header + entry table + leading pad, the init ELF source body (no longer needed after `load_init` copied segments out), and any inter-module or trailing slack pages. Module bodies are skipped here because `cap::mint_module_memory_caps` already mints Memory caps over them; pushing them again would double-register pages in the buddy ledger. Each `ReclaimRange` carries a `flags: u32`; bit 0 (`RECLAIM_FLAG_LATE`) marks the AP trampoline entry so the kernel defers minting it until the post-SMP-bringup late-reclaim pass. All other entries are minted by `cap::mint_reclaim_memory_caps` inside `populate_cspace`. |
-| `boot_entropy_seed` | Conditioned entropy seed for the pool, drawn from `EFI_RNG_PROTOCOL` (or a DTB `/chosen/rng-seed` fallback) in step 5; valid for `boot_entropy_len` bytes, remainder zero. Absorbed into the kernel entropy pool at Phase 5. The separate KASLR entropy word never appears in `BootInfo`. |
-| `boot_entropy_len` | Valid leading byte count of `boot_entropy_seed`; zero when no RNG source is present, in which case the kernel degrades to timing jitter. |
-| `vmgenid_paddr` | Physical address of the 16-byte ACPI VMGENID GUID (x86-64 QEMU SSDT scan in step 9); zero when absent. |
-| `direct_map_base` | KASLR-chosen direct-map virtual base — a 1 GiB-aligned base at or above the paging mode's kernel-half floor, chosen in step 9 from the KASLR entropy and the final memory map. A KASLR secret; the kernel scrubs it after Phase 3. |
-| `kaslr_flags` | `KASLR_*` status bits: which layout dimensions were randomized, the entropy source, and any skip reason (knob / window-limited). Zero means an entirely un-randomized layout. |
+| `boot_entropy_seed` | Conditioned entropy seed for the pool, drawn from `EFI_RNG_PROTOCOL` (or a DTB `/chosen/rng-seed` fallback) in step 5c; valid for `boot_entropy_len` bytes, remainder zero. Absorbed into the kernel entropy pool at Phase 5. The separate KASLR entropy word never appears in `BootInfo`. |
+| `boot_entropy_len` | Valid leading byte count of `boot_entropy_seed`; zero when neither source yields a seed, in which case the kernel seeds from its remaining sources. |
+| `vmgenid_paddr` | Physical address of the 16-byte ACPI VMGENID GUID (QEMU VMGENID SSDT scan in step 9, run wherever an RSDP is present; only x86-64 QEMU wires the device today); zero when absent. |
+| `direct_map_base` | KASLR-chosen direct-map virtual base — a 1 GiB-aligned base at or above the paging mode's kernel-half floor, chosen in step 9 from the KASLR entropy and the final memory map. A KASLR secret; the kernel scrubs it at Phase 5, after its Phase-3 consumers have run. |
+| `kaslr_flags` | `KASLR_*` status bits: which layout dimensions were randomized, the entropy source, and any skip reason (knob / window-limited); `KASLR_IMAGE_RANDOMIZED` marks a slide drawn from entropy whichever slot it selected, so an `ET_EXEC` image with entropy carries its source bits with that bit clear. Zero means an entirely un-randomized layout. |
 
 All arrays pointed to by `BootInfo` fields reside in physical memory that the UEFI
 memory map marks as `Loaded` or `Usable`, ensuring they survive until the kernel
@@ -233,8 +259,9 @@ by [kernel-handoff.md](kernel-handoff.md).
 
 Every pointer in `BootInfo` is a physical address. The kernel cannot dereference
 these pointers through its own virtual address space until its direct physical map is
-active (Phase 3 of kernel initialisation). Before that point, the kernel accesses
-`BootInfo` fields through the identity mapping established in step 5.
+active (Phase 3 of [kernel initialisation](../../kernel/docs/initialization.md)). Before
+that point, the kernel accesses
+`BootInfo` fields through the identity mapping established in step 6.
 
 The `BootInfo` structure itself must not be placed in a region the kernel will
 reclaim before reading all fields. In practice this means placing it in a range the
@@ -249,4 +276,5 @@ the kernel has consumed them.
 
 ## Summarized By
 
-[boot/README.md](../README.md)
+[boot/README.md](../README.md), [kernel/docs/entropy.md](../../kernel/docs/entropy.md),
+[docs/bootstrap.md](../../../docs/bootstrap.md), [firmware-parsing.md](firmware-parsing.md)

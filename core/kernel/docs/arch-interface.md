@@ -661,4 +661,5 @@ equally clearly.
 
 ## Summarized By
 
-[kernel/README.md](../README.md), [scheduling-internals.md](scheduling-internals.md)
+[kernel/README.md](../README.md), [entropy.md](entropy.md),
+[scheduling-internals.md](scheduling-internals.md)

@@ -9,7 +9,7 @@
 //! (EID = 0x48534D, FID = 0: `hart_start`). The BSP calls `hart_start` with:
 //!   - `hartid`    = RISC-V hart ID of the AP to start
 //!   - `start_pa`  = physical address of the trampoline page (paging off)
-//!   - `opaque`    = physical address of per-AP startup parameters
+//!   - `opaque`    = physical address of the startup parameter block
 //!
 //! The AP starts in S-mode with paging disabled, a0 = `hart_id`, a1 = opaque.
 //!
@@ -18,8 +18,9 @@
 //! ```text
 //! 0x000  Trampoline code (32 bytes, 8 PIC instructions)
 //! 0x020  Zero padding
-//! 0x040  Per-AP param slots: (cpu_count - 1) × PARAM_SLOT_SIZE (32) bytes
-//!        Slot for cpu_idx N (1-based):  trampoline_pa + PARAMS_OFFSET + (N-1)*PARAM_SLOT_SIZE
+//! 0x040  Param block: 32 bytes, rewritten by the BSP for each
+//!        AP before its hart_start; the BSP waits for that AP to come online
+//!        (it has loaded every word by then) before starting the next.
 //!          +0   satp:       u64   — SATP value under the active paging mode
 //!          +8   entry_virt: u64   — virtual address of kernel_entry_ap
 //!          +16  stack_top:  u64   — kernel idle-thread stack top (loaded into sp)
@@ -56,13 +57,10 @@ use crate::mm::paging::phys_to_virt;
 
 // ── Trampoline page offsets ───────────────────────────────────────────────────
 
-/// Byte offset within the trampoline page where per-AP params begin.
+/// Byte offset within the trampoline page of the startup parameter block.
 pub const PARAMS_OFFSET: usize = 0x40;
 
-/// Size of one per-AP param slot in bytes.
-pub const PARAM_SLOT_SIZE: usize = 32;
-
-// Sub-offsets within each param slot (byte offsets, u64-aligned).
+// Sub-offsets within the parameter block (byte offsets, u64-aligned).
 const PARAM_SATP: usize = 0; // u64: SATP value under the active paging mode
 const PARAM_ENTRY: usize = 8; // u64: kernel_entry_ap virtual address
 const PARAM_STACK: usize = 16; // u64: kernel idle stack top
@@ -86,8 +84,8 @@ const SBI_FID_HART_START: u64 = 0;
 /// # Safety
 /// - `start_pa` must be the physical address of a valid, executable trampoline
 ///   that has been set up by [`setup_trampoline`].
-/// - `opaque` must be the physical address of a valid per-AP params block
-///   written by [`setup_ap_params`].
+/// - `opaque` must be the physical address of the startup parameter block
+///   written by [`setup_ap_params`] for this AP.
 #[cfg(not(test))]
 pub unsafe fn sbi_hart_start(hart_id: u64, start_pa: u64, opaque: u64) -> bool
 {
@@ -168,8 +166,9 @@ pub unsafe fn setup_trampoline(trampoline_pa: u64)
 
 /// Start one AP via SBI HSM `hart_start`.
 ///
-/// Sets up per-AP params, constructs the SATP value from the kernel root page
-/// table under the active paging mode, and calls `sbi_hart_start`. Returns
+/// Writes this AP's params into the shared block, constructs the SATP value
+/// from the kernel root page table under the active paging mode, and calls
+/// `sbi_hart_start`. Returns
 /// `false` if SBI rejected the request (e.g. invalid hart ID or
 /// implementation error).
 ///
@@ -184,6 +183,8 @@ pub unsafe fn setup_trampoline(trampoline_pa: u64)
 /// - [`setup_trampoline`] must have been called.
 /// - Phase 3–8 must be active (direct map, per-CPU storage, scheduler state).
 /// - `hart_id` must be a valid secondary hart listed in `BootInfo::cpu_ids`.
+/// - The previously started AP must have come online (`APS_READY` observed),
+///   since it read its parameters from the same block.
 #[cfg(not(test))]
 pub unsafe fn start_ap(
     trampoline_pa: u64,
@@ -201,8 +202,7 @@ pub unsafe fn start_ap(
         setup_ap_params(trampoline_pa, cpu_idx, satp, entry_fn, stack_top);
     }
 
-    let params_pa =
-        trampoline_pa + PARAMS_OFFSET as u64 + (u64::from(cpu_idx) - 1) * PARAM_SLOT_SIZE as u64;
+    let params_pa = trampoline_pa + PARAMS_OFFSET as u64;
 
     // SAFETY: trampoline_pa is identity-mapped RWX; params_pa is in the same page.
     unsafe { sbi_hart_start(u64::from(hart_id), trampoline_pa, params_pa) }
@@ -221,17 +221,18 @@ pub unsafe fn start_ap(
     false
 }
 
-/// Write per-AP startup parameters into the trampoline page.
+/// Write one AP's startup parameters into the trampoline page.
 ///
-/// Parameters are stored at `trampoline_pa + PARAMS_OFFSET + (cpu_idx-1)*PARAM_SLOT_SIZE`.
-/// The AP receives the physical address of its slot in `a1` and loads all
-/// four values before enabling paging.
+/// Parameters are stored at `trampoline_pa + PARAMS_OFFSET`, one block for
+/// every AP in turn: the AP receives its physical address in `a1` and loads
+/// all four values before enabling paging and jumping to its kernel entry,
+/// where it announces itself, so the block is free once it is online.
 ///
 /// # Safety
 /// - Direct map must be active (Phase 3 complete).
 /// - `trampoline_pa` must match the value passed to [`setup_trampoline`].
-/// - `cpu_idx` must be in `1..cpu_count` (< 64); the param slot must lie
-///   within the trampoline page.
+/// - `cpu_idx` must be in `1..cpu_count`, and the previously started AP
+///   must have come online.
 #[cfg(not(test))]
 pub unsafe fn setup_ap_params(
     trampoline_pa: u64,
@@ -241,9 +242,8 @@ pub unsafe fn setup_ap_params(
     stack_top: u64,
 )
 {
-    let slot_off = PARAMS_OFFSET + (cpu_idx as usize - 1) * PARAM_SLOT_SIZE;
-    let base = (phys_to_virt(trampoline_pa) + slot_off as u64) as *mut u64;
-    // SAFETY: direct map active; 4 × u64 stay within the 4 KiB page (slot_off ≤ 0x7E0).
+    let base = (phys_to_virt(trampoline_pa) + PARAMS_OFFSET as u64) as *mut u64;
+    // SAFETY: direct map active; 4 × u64 at offset 0x40 lie within the 4 KiB page.
     unsafe {
         base.add(PARAM_SATP / 8).write_volatile(satp);
         base.add(PARAM_ENTRY / 8).write_volatile(entry_virt);

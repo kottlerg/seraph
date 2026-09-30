@@ -42,12 +42,12 @@ binary. Components targeting the kernel, bootloader, or std-userspace triples
 must be built via `cargo xtask build` so the correct custom target JSON and
 `-Zbuild-std` flags are passed.
 
-[`abi/boot-protocol`](../abi/boot-protocol/README.md) is the source of truth for the boot protocol ABI; both
-the bootloader and kernel depend on it. The kernel-entry contract the ABI
-supports is in [`core/boot/docs/kernel-handoff.md`](../core/boot/docs/kernel-handoff.md).
-`abi/syscall` defines syscall numbers, argument layout, and return codes; both
-the kernel and userspace import it. Inline assembly that invokes syscalls
-lives in `shared/syscall`.
+[`abi/boot-protocol`](../abi/boot-protocol/README.md) is the source of truth for the boot
+protocol ABI; both the bootloader and kernel depend on it. The kernel-entry contract the
+ABI supports is in [`core/boot/docs/kernel-handoff.md`](../core/boot/docs/kernel-handoff.md).
+[`abi/syscall`](../abi/syscall/README.md) defines syscall numbers, argument layout, and
+return codes; both the kernel and userspace import it. Inline assembly that invokes
+syscalls lives in [`shared/syscall`](../shared/syscall/README.md).
 
 ---
 

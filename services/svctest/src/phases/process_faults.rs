@@ -3,8 +3,7 @@
 
 // services/svctest/src/phases/process_faults.rs
 
-//! Kernel process-fault surfaces (stack guard, RELRO seal, future
-//! notification paths).
+//! Kernel process-fault surfaces (stack guard, RELRO seal).
 
 use std::os::seraph::startup_info;
 

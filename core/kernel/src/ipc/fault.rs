@@ -7,7 +7,7 @@
 //! the thread's bound fault-handler endpoint and block until it is resolved.
 //!
 //! This is the shared, architecture-independent core of the fault-handler
-//! protocol ([`docs/fault-handling.md`](../../../docs/fault-handling.md)). The
+//! protocol (`docs/fault-handling.md`). The
 //! architecture fault handlers (x86-64 `#PF`, RISC-V page-fault traps) marshal
 //! their register frame into the canonical [`TrapFrame`] the handler will
 //! read/edit, then call [`fault_dispatch`]; the disposition it returns tells the

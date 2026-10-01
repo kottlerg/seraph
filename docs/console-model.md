@@ -49,15 +49,12 @@ earlier ones, which remain as fallbacks.
    lines to the UART directly. It owns console output from the moment init
    spawns it through the entire init → svcmgr handover and svcmgr's reconcile,
    until the svcmgr-launched [real-logd](../services/logd/README.md) assumes the endpoint's RECV,
-   pulls
-   init-logd's captured history via `log_labels::HANDOVER_PULL`, then releases
-   it with `log_labels::HANDOVER_RELEASE` — at which point init-logd
-   self-terminates. This direct path is **permanent**, not
-   transitional: it is the only writer before the serial driver is up, and the
-   fallback if the driver fails to come up. There is no parallel init-logd
-   direct-framebuffer path today; pre-driver framebuffer writes are deferred
-   to a future surface (see "Planned future surface" in the framebuffer driver
-   README).
+   pulls init-logd's captured history via `log_labels::HANDOVER_PULL`, then releases it with
+   `log_labels::HANDOVER_RELEASE` — at which point init-logd self-terminates. This direct path is
+   **permanent**, not transitional: it is the only writer before the serial driver is up, and the
+   fallback if the driver fails to come up. There is no parallel init-logd direct-framebuffer path
+   today; pre-driver framebuffer writes are deferred to a future surface (see "Planned future
+   surface" in the framebuffer driver README).
 
 4. **Serial-driver-mediated path** — once devmgr has spawned the serial driver
    (`services/drivers/serial/`), every userspace UART writer routes bytes to it

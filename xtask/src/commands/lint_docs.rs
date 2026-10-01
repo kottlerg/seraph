@@ -251,7 +251,8 @@ impl Patterns
 fn check_columns(pat: &Patterns, file: &SourceFile) -> Vec<Diagnostic>
 {
     let mut diags = Vec::new();
-    for (idx, line) in file.text.lines().enumerate()
+    let skip = front_matter_len(&file.text);
+    for (idx, line) in file.text.lines().enumerate().skip(skip)
     {
         let width = line.chars().count();
         if width <= COLUMN_LIMIT
@@ -290,18 +291,48 @@ fn check_bare_cites(pat: &Patterns, file: &SourceFile) -> Vec<Diagnostic>
     diags
 }
 
-/// Lines outside fenced code blocks, with their zero-based index.
+/// Lines outside fenced code blocks, with their zero-based index. A fence
+/// opens with a run of three or more backticks or tildes and closes only on a
+/// run of the same character at least as long.
 fn prose_lines(text: &str) -> impl Iterator<Item = (usize, &str)>
 {
-    let mut fenced = false;
+    let mut open: Option<(char, usize)> = None;
     text.lines().enumerate().filter(move |(_, line)| {
-        if line.trim_start().starts_with("```")
+        let trimmed = line.trim_start();
+        let fence = trimmed
+            .chars()
+            .next()
+            .filter(|c| *c == '`' || *c == '~')
+            .map(|c| (c, trimmed.chars().take_while(|x| *x == c).count()));
+        match (open, fence)
         {
-            fenced = !fenced;
-            return false;
+            (None, Some((c, n))) if n >= 3 =>
+            {
+                open = Some((c, n));
+                false
+            }
+            (Some((oc, on)), Some((c, n))) if c == oc && n >= on =>
+            {
+                open = None;
+                false
+            }
+            (Some(_), _) => false,
+            (None, _) => true,
         }
-        !fenced
     })
+}
+
+/// Number of leading lines a YAML front-matter block occupies (`---` on the
+/// first line through the next `---` line); zero when there is none. Front
+/// matter is metadata, not Markdown source.
+fn front_matter_len(text: &str) -> usize
+{
+    let mut lines = text.lines();
+    if lines.next() != Some("---")
+    {
+        return 0;
+    }
+    lines.position(|l| l == "---").map_or(0, |i| i + 2)
 }
 
 // ── src-header ────────────────────────────────────────────────────────────────
@@ -373,35 +404,47 @@ fn header_violation(path: &str, text: &str) -> Option<(usize, String)>
     }
     // The license block ends at the first blank line (a bare ` *` for blocks).
     let blank = |l: &str| l.trim().is_empty() || (prefix == " *" && l.trim() == "*");
-    let end = lines[start..]
+    let Some(end) = lines[start..]
         .iter()
         .position(|l| blank(l))
-        .map(|i| start + i)?;
-    let expected = format!("{prefix} {path}");
-    let path_line = lines[end..]
-        .iter()
-        .position(|l| *l == expected)
-        .map(|i| end + i);
-    let Some(path_idx) = path_line
+        .map(|i| start + i)
     else
     {
         return Some((
-            end + 1,
-            format!("missing path line `{expected}` after the license block"),
+            lines.len(),
+            "license block is not followed by a blank line".into(),
         ));
     };
+    // The path line is the first non-blank line after the license block.
+    let expected = format!("{prefix} {path}");
+    let Some(path_idx) = lines[end..].iter().position(|l| !blank(l)).map(|i| end + i)
+    else
+    {
+        return Some((end + 1, format!("missing path line `{expected}`")));
+    };
+    if lines[path_idx] != expected
+    {
+        return Some((path_idx + 1, format!("expected path line `{expected}`")));
+    }
     if has_ext(path, "rs")
     {
-        let rest = &lines[path_idx + 1..];
+        if !lines.get(path_idx + 1).is_some_and(|l| l.trim().is_empty())
+        {
+            return Some((
+                path_idx + 2,
+                "path line must be followed by a blank line".into(),
+            ));
+        }
+        let rest = &lines[path_idx + 2..];
         let doc = rest.iter().position(|l| l.starts_with("//!"));
         let attr = rest.iter().position(|l| l.starts_with("#!["));
         match (doc, attr)
         {
-            (None, _) => return Some((path_idx + 2, "missing `//!` description".into())),
+            (None, _) => return Some((path_idx + 3, "missing `//!` description".into())),
             (Some(d), Some(a)) if a < d =>
             {
                 return Some((
-                    path_idx + 2 + a,
+                    path_idx + 3 + a,
                     "crate attribute precedes the `//!` block".into(),
                 ));
             }
@@ -468,7 +511,10 @@ fn summarized_by(
     let heading = lines
         .iter()
         .rposition(|(_, l)| l.trim_end() == "## Summarized By")
-        .ok_or((lines.len(), "missing `## Summarized By` section".to_owned()))?;
+        .ok_or((
+            text.lines().count(),
+            "missing `## Summarized By` section".to_owned(),
+        ))?;
     let (heading_line, _) = lines[heading];
     let before: Vec<&str> = lines[..heading]
         .iter()
@@ -678,16 +724,57 @@ mod tests
     }
 
     #[test]
-    fn header_rejects_attribute_before_doc_and_missing_doc()
+    fn header_rejects_attribute_before_doc()
     {
         let attr_first = "// SPDX-License-Identifier: GPL-2.0-only\n// (C)\n\n// a.rs\n\n#![no_std]\n\n//! Doc.\n";
         assert_eq!(
             header_violation("a.rs", attr_first).map(|(l, _)| l),
             Some(6)
         );
+    }
+
+    #[test]
+    fn header_rejects_missing_doc()
+    {
         let no_doc =
             "// SPDX-License-Identifier: GPL-2.0-only\n// (C)\n\n// a.rs\n\nfn main() {}\n";
         assert!(header_violation("a.rs", no_doc).is_some());
+    }
+
+    #[test]
+    fn header_rejects_license_block_without_blank_line()
+    {
+        let no_blank = "// SPDX-License-Identifier: GPL-2.0-only\n// (C)\n//! Doc.\nfn main() {}\n";
+        assert!(header_violation("a.rs", no_blank).is_some());
+    }
+
+    #[test]
+    fn header_requires_path_line_first_after_license_and_blank_before_doc()
+    {
+        let late =
+            "// SPDX-License-Identifier: GPL-2.0-only\n// (C)\n\n// note\n\n// a.rs\n\n//! Doc.\n";
+        assert_eq!(header_violation("a.rs", late).map(|(l, _)| l), Some(4));
+        let adjacent = "// SPDX-License-Identifier: GPL-2.0-only\n// (C)\n\n// a.rs\n//! Doc.\n";
+        assert_eq!(header_violation("a.rs", adjacent).map(|(l, _)| l), Some(5));
+    }
+
+    #[test]
+    fn front_matter_is_exempt_from_the_column_limit()
+    {
+        let long = "x".repeat(101);
+        let text = format!("---\nname: {long}\n---\n\n{long}\n");
+        let diags = check_columns(&pat(), &md("a.md", &text));
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].line, 5);
+    }
+
+    #[test]
+    fn fences_close_only_on_a_matching_run()
+    {
+        let text = "````\n```\n(see x.md)\n```\n````\n(see y.md)\n~~~\n(see z.md)\n~~~\n";
+        let diags = check_bare_cites(&pat(), &md("a.md", text));
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].line, 6);
     }
 
     #[test]

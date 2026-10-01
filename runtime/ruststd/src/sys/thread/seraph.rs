@@ -4,8 +4,11 @@
 // runtime/ruststd/src/sys/thread/seraph.rs
 
 //! Thread spawning backed by the Seraph kernel's Thread/Notification primitives.
-//! Stacks and per-thread IPC buffers are allocated from the process heap
-//! (page-aligned, no guard pages for now — deferred polish). Join
+//! A demand-paged process gives each thread a guarded demand-paged stack
+//! (`GUARD_PAGES` below at least `DEFAULT_DEMAND_STACK_PAGES`; see
+//! `alloc_stack`); a non-demand-paged process, or a failed reservation, falls
+//! back to an eager page-aligned heap stack without a guard. Per-thread IPC
+//! buffers are page-aligned heap allocations. Join
 //! synchronises on a Notification cap; the child thread signals just before
 //! calling SYS_THREAD_EXIT, and join then reclaims the child's kernel object,
 //! caps, and heap/VA resources. A detached handle (dropped without join) hands

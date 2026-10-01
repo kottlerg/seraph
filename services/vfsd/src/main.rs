@@ -18,8 +18,8 @@
 //! serving any request; the runtime `MOUNT` IPC remains for
 //! explicit/foreign-GUID mounts.
 //!
-//! See `vfsd/README.md` for the design and `fs/docs/fs-driver-protocol.md`
-//! for the driver-side protocol.
+//! See `services/vfsd/README.md` for the design and
+//! `services/fs/docs/fs-driver-protocol.md` for the driver-side protocol.
 
 #![allow(clippy::cast_possible_truncation)]
 

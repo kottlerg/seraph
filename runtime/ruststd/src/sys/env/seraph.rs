@@ -8,15 +8,13 @@
 //! Storage model: a process-global `Mutex<BTreeMap<OsString, OsString>>` lazily
 //! initialised on first access. The seed source is `StartupInfo::env_blob` (a
 //! concatenation of NUL-terminated UTF-8 `KEY=VALUE` strings written by the
-//! spawner into the read-only `ProcessInfo` page). Spawner-side env wiring is
-//! not yet implemented, so the seed is currently empty in every process — the
-//! API works, but `var()` returns `None` for any key not first set with
-//! `set_var()` from inside this process.
+//! spawner into the read-only `ProcessInfo` page; format defined in
+//! `abi/process-abi/README.md`), after which `set_var` / `remove_var` mutate
+//! the map in place.
 //!
-//! `BTreeMap` instead of `HashMap` to avoid std::collections::HashMap, which
-//! would pull in randomness for hash DoS resistance — seraph does not yet
-//! expose a kernel RNG (see `sys/random/seraph.rs` stub). The set is small
-//! (dozens of entries at most) and lookup is rare; ordered tree is fine.
+//! `BTreeMap` rather than `HashMap`: the set is small (dozens of entries at
+//! most) and lookup is rare, so an ordered tree needs no per-process hash keys
+//! and gives `vars()` a deterministic order.
 
 use crate::collections::BTreeMap;
 use crate::ffi::{OsStr, OsString};

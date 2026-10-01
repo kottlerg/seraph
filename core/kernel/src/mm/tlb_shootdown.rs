@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-// Copyright (C) 2026 Gregory Kottler <me@gregorykottler.com>
+// Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
 // core/kernel/src/mm/tlb_shootdown.rs
 

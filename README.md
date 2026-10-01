@@ -55,6 +55,7 @@ cargo xtask compose-bundle --harness ktest   # swap boot bundle to ktest harness
 cargo xtask run                              # launch existing sysroot under QEMU
 cargo xtask run --gdb                        # pause at start; GDB on :1234
 cargo xtask test                             # run host-side workspace tests
+cargo xtask lint-docs                        # check docs and source-header rules
 cargo xtask clean [--all]                    # remove sysroot/ (and target/ with --all)
 ```
 

@@ -7,13 +7,8 @@
 //! argv blob that procmgr wrote into the read-only `ProcessInfo` page at
 //! spawn time, surfaced by `std::os::seraph::startup_info().args_blob`.
 //!
-//! Semantics of the blob (see `project_argv_env_invariants.md`):
-//!   * Concatenation of `args_count` NUL-terminated UTF-8 strings.
-//!   * No embedded cap references, badges, or security data — argv is
-//!     plain data, set exclusively by the spawning process.
-//!   * Single encoding across the system (UTF-8); non-UTF-8 bytes are
-//!     surfaced losslessly via `args_os` (`OsString` on seraph is
-//!     UTF-8 bytes).
+//! The blob format and its `ProcessInfo` fields are defined in
+//! `abi/process-abi/README.md`; the field walk is `argv_env::next_field`.
 //!
 //! Invalid UTF-8 inside an argv entry makes that entry come out as its
 //! replacement-character form when iterating via `args()`; `args_os()`

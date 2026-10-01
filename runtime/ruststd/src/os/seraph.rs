@@ -7,10 +7,10 @@
 //! code written against std can reach the platform primitives:
 //!
 //!   * `_start` — the ELF entry symbol exported for std-built binaries; reads
-//!     `ProcessInfo` at the well-known VA, registers the IPC buffer, wires
-//!     stdio caps, bootstraps the heap, then jumps to the rustc-synthesised
-//!     `extern "C" fn main` which calls `std::rt::lang_start` and in turn the
-//!     user's idiomatic `fn main`. When `main` returns, exits the process via
+//!     `ProcessInfo` at the VA delivered in the entry register, registers the
+//!     IPC buffer, wires stdio caps, bootstraps the heap, then jumps to the
+//!     rustc-synthesised `extern "C" fn main` which calls `std::rt::lang_start`
+//!     and in turn the user's idiomatic `fn main`. When `main` returns, exits the process via
 //!     `process_exit`, forwarding its code.
 //!   * `startup_info()` / `try_startup_info()` — accessors for the
 //!     `StartupInfo` stashed by `_start`. Services use these to obtain their

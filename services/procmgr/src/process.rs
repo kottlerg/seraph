@@ -448,9 +448,8 @@ pub struct UniversalCaps
 /// Program arguments delivered to a child process at spawn time.
 ///
 /// `blob` is a concatenation of `count` NUL-terminated UTF-8 strings. Empty
-/// slice + zero count means "no argv". See `project_argv_env_invariants.md`:
-/// plain data only, no caps, no security-relevant content, capped to what
-/// fits in the `ProcessInfo` page after the struct.
+/// slice + zero count means "no argv". The blob format and its page-remainder
+/// bound are defined in `abi/process-abi/README.md`.
 #[derive(Clone, Copy, Default)]
 pub struct ChildArgs<'a>
 {

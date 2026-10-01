@@ -4,7 +4,7 @@
 // runtime/ruststd/src/sys/stdio/seraph.rs
 
 //! Stdin/Stdout/Stderr for Seraph userspace, backed by shmem SPSC rings
-//! + notification caps (Phase 3 of LOGGING_STDIO_ROADMAP). Each direction is
+//! + notification caps. Each direction is
 //! an independent `sys::pipe::seraph::Pipe` end attached at child
 //! startup from the (memory, data_notification, space_notification) triple the
 //! spawner installed via `procmgr_labels::CONFIGURE_PIPE`.

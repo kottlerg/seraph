@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only AND OFL-1.1
+// Copyright (C) 2020 Dimitar Toshkov Zhekov (Terminus Font, bitmap data)
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 //
 // Code: GPL-2.0-only. Bitmap data: OFL-1.1, adapted from Terminus 10×20

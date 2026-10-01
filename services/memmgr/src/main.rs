@@ -6,7 +6,7 @@
 //! Tier-1 userspace service that owns the userspace RAM memory-cap pool.
 //!
 //! memmgr serves memory-cap allocation, release, and per-process accounting over
-//! IPC. See `memmgr/docs/{memory-pool,ipc-interface}.md` for the authoritative
+//! IPC. See `services/memmgr/docs/{memory-pool,ipc-interface}.md` for the authoritative
 //! contracts. memmgr is `no_std` and uses statically-bounded data structures
 //! only — it cannot bootstrap a heap against itself.
 

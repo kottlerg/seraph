@@ -76,9 +76,9 @@ skipping levels, risks deadlock.
    run-queue link acquires the per-CPU scheduler.lock under that. `(*tcb).sched_lock` is the single
    authoritative serializer of the TCB's Scheduling field group (`{state, ipc_state, queued_on,
    run_queue_next, preferred_cpu, blocked_on_object, wake_pending}`), keyed on the TCB pointer
-   rather than on whichever CPU's queue currently links it. The per-CPU
-   scheduler.lock no longer guards any TCB's `state`; it guards only that CPU's run-queue list
-   structure (head/tail/`non_empty`/load). See § Cross-CPU TCB Ownership.
+   rather than on whichever CPU's queue currently links it. The per-CPU scheduler.lock no longer
+   guards any TCB's `state`; it guards only that CPU's run-queue list structure
+   (head/tail/`non_empty`/load). See § Cross-CPU TCB Ownership.
 
 2. **At most one source IPC lock at a time.** A code path holding `sig.lock` MUST NOT acquire
    `ep.lock`, `eq.lock`, or `ws.lock`. The single exception is `waitset_notify`, which is invoked
@@ -526,7 +526,7 @@ path MUST NEVER hold two different TCBs' `sched_lock`s simultaneously.
 
 **Magic-cookie discipline.** `magic == TCB_MAGIC` MUST be read on every dereference of a TCB pointer
 that crossed a CPU boundary or came from an intrusive list (run queue, IPC wait queue, sleep list,
-death observer). the run-queue ops `enqueue` / `dequeue_highest` in
+death observer). The run-queue ops `enqueue` / `dequeue_highest` in
 `core/kernel/src/sched/run_queue.rs` already do this; the same pattern applies anywhere a stale
 pointer might be observed.
 
@@ -943,7 +943,7 @@ iteration cap is far beyond any architectural timing; exhaustion indicates a har
 
 The x86-64 IDT registers a dedicated stub at vector 2 (IST=2 per the NMI ABI) that builds the
 canonical `TrapFrame`, calls a returning handler, then writes back and `iretq`s. The handler reads
-`NMI_BACKTRACE_REQUEST[cpu]`:
+the per-CPU request flag returned by `nmi_backtrace_request(cpu)`:
 - **Set** (watchdog-requested): dump the saved frame to serial and return; the stub's `iretq`
   resumes the interrupted code.
 - **Clear** (real hardware NMI): tail-call `common_exception_handler` which never returns — the

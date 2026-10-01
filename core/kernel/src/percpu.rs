@@ -5,19 +5,22 @@
 
 //! Per-CPU private state.
 //!
-//! One [`PerCpuData`] instance exists per logical CPU. The BSP's entry
-//! (`PER_CPU[0]`) is initialised during Phase 5 via [`init_bsp`].
-//! AP entries are initialised in SMP startup during AP startup.
+//! One [`PerCpuData`] instance exists per logical CPU, held in the
+//! `PER_CPU_PTR` slab that [`init_storage`] allocates from the buddy
+//! allocator in Phase 4; [`per_cpu_ptr`] returns CPU `cpu_id`'s entry.
+//! The BSP's entry (`per_cpu_ptr(0)`) is initialised during Phase 5 via
+//! [`init_bsp`]. AP entries are initialised by [`init_ap`] from
+//! `kernel_entry_ap` during SMP startup.
 //!
 //! ## Access mechanism
 //!
-//! **x86-64**: the `IA32_GS_BASE` MSR is set to `&PER_CPU[cpu_id]` so that
+//! **x86-64**: the `IA32_GS_BASE` MSR is set to `per_cpu_ptr(cpu_id)` so that
 //! GS-relative addressing (`gs:[offset]`) reaches the current CPU's data
 //! without a memory indirection or lock. The `PERCPU_*_OFFSET` constants
 //! must match the `#[repr(C)]` field layout exactly — they are used in
 //! the `syscall_entry` naked-asm stub.
 //!
-//! **RISC-V**: the `tp` (thread pointer) register is set to `&PER_CPU[cpu_id]`.
+//! **RISC-V**: the `tp` (thread pointer) register is set to `per_cpu_ptr(cpu_id)`.
 //! `current_cpu()` dereferences `tp` to read `cpu_id`.
 //!
 //! ## Field offsets

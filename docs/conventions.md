@@ -203,7 +203,8 @@ are forbidden; `master` MUST NOT receive force pushes.
   workflow operations gives the assistant's procedure.
 - The review surface of a change is what it touches: the changed hunks and
   the items that contain them (a function, a paragraph, a section, a table
-  row, a list), everything the change introduces, and the callers and
+  row, a list; for a hunk inside a file header, the header block of license,
+  path, and description), everything the change introduces, and the callers and
   reverse dependencies of what it changes; a correctness, soundness, safety,
   or contract defect anywhere in a touched file is on the surface too,
   unless an open Issue already names it. In a re-review of a PR (a delta

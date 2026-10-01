@@ -5,7 +5,7 @@
 
 //! Clap derive structs for the xtask CLI.
 //!
-//! Add a new top-level command by adding a variant to `Command` and a
+//! Add a new top-level command by adding a variant to `CliCommand` and a
 //! corresponding `Args` struct below, then handle it in `main.rs`.
 
 use clap::{Parser, Subcommand, ValueEnum};

@@ -4,10 +4,11 @@
 // runtime/ruststd/src/sys/reserve/seraph.rs
 
 //! Page-granular reservation allocator. Owns one fixed-size arena per
-//! process, carved out at process start. Hands out unmapped contiguous VA
-//! ranges; the caller is responsible for `mem_map` / `mem_unmap` against
-//! owned Memory caps. The arena holds no Memory caps and issues no syscalls
-//! — it is pure VA bookkeeping.
+//! process, carved out on first use at a per-process randomised base (see
+//! `Arena::ensure_init`). Hands out unmapped contiguous VA ranges; the caller
+//! is responsible for `mem_map` / `mem_unmap` against owned Memory caps. The
+//! arena holds no Memory caps and, beyond the one `getrandom` base draw, issues
+//! no syscalls — it is pure VA bookkeeping.
 //!
 //! Used for foreign Memory mappings: MMIO from devmgr, DMA buffers from
 //! drivers, shmem backings, zero-copy file pages from fs drivers, ELF-load

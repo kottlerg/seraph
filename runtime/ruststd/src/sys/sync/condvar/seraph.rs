@@ -4,16 +4,17 @@
 // runtime/ruststd/src/sys/sync/condvar/seraph.rs
 
 //! Condvar built on a monotonically-incrementing generation counter and a
-//! lazily-allocated Notification cap. Mirrors the upstream `sync/condvar/
-//! futex.rs` design: waiters snapshot the counter before unlocking the
-//! mutex, then block; notifiers bump the counter (invalidating in-flight
-//! snapshots) and notification. Because `notification_wait` has no address-compare,
-//! a waiter that awakes spuriously just re-acquires the mutex and
-//! returns — the std layer's loop-condition recheck absorbs it.
+//! lazily-allocated Notification cap. Mirrors the upstream
+//! `sync/condvar/futex.rs` design: waiters snapshot the counter before
+//! unlocking the mutex, then block; notifiers bump the counter (invalidating
+//! in-flight snapshots) and send on the notification. Because
+//! `notification_wait` has no address-compare, a waiter that wakes spuriously
+//! just re-acquires the mutex and returns — the std layer's loop-condition
+//! recheck absorbs it.
 //!
 //! `wait_timeout` passes the millisecond timeout through `arg1` of
-//! `SYS_NOTIFICATION_WAIT`. A non-zero bit return means notification wake; a `0`
-//! return means the timer expired.
+//! `SYS_NOTIFICATION_WAIT`. A non-zero bit return means notification wake; a
+//! `0` return means the timer expired.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 

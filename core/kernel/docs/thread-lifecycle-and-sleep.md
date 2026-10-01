@@ -91,8 +91,8 @@ claims against concurrent IPC sources via the relevant source IPC lock (Notifica
    - default (plain sleep, `None`): claim unconditionally; no concurrent waker.
 
    The snapshot is read without the source lock; the `waiter == tcb` (or `reply_tcb` CAS) check
-under the source lock / on the atomic is the authoritative arbitration (stale snapshot = benign
-skip).
+   under the source lock / on the atomic is the authoritative arbitration (stale snapshot = benign
+   skip).
 
 7. **Wake-side `sleep_list_remove` MUST be inside the source IPC lock, preceded by clearing
    `sleep_deadline = 0`.** Producer half of the snapshot-then-claim protocol. See
@@ -133,10 +133,10 @@ contrast `sys_notification_wait` whose `wakeup_value == 0` is unambiguous becaus
      list, releases `eq.lock`. `timed_out` remains `false`.
    - `sleep_check_wakeups` BlockedOnEventQueue arm writes `wakeup_value = 0`, sets
      `timed_out = true`, sets state = Ready, releases `eq.lock`.
-   
+
    The `(*eq).waiter == tcb` arbitration under `eq.lock` ensures exactly one of these paths fires
-per park. The reader can then trust that `timed_out == true` ⇔ "no payload" and `timed_out == false`
-⇔ "wakeup_value is the payload" (which may legitimately be zero).
+   per park. The reader can then trust that `timed_out == true` ⇔ "no payload" and
+   `timed_out == false` ⇔ "wakeup_value is the payload" (which may legitimately be zero).
 
 4. **No third writer.** `cancel_ipc_block` MUST NOT touch `timed_out`. A cancelled wait returns
    `Interrupted`, not "timed out": the cancel stamps the park episode `INTERRUPTED` at its
@@ -235,7 +235,7 @@ stated explicitly.
    that CPU's lock until it switches away, then re-scan. Proceed only when a
    full scan finds no CPU running tcb. tcb is `Exited` and unlinked from every
    run queue (steps 3-4), so no CPU can re-install it after a clean scan.
-10. Spin on tcb.context_saved.load(Acquire) == 1 (UNCONDITIONAL — see invariant 4).
+10. Spin on tcb.context_saved.load(Acquire) == 1 (UNCONDITIONAL — see invariant 5).
     Steps 9-10 run with `preempt_disable` and interrupts enabled
     (`save_and_disable_interrupts` → `enable`); the local CPU MUST be
     able to service incoming flush / TLB-shootdown IPIs during the
@@ -337,16 +337,16 @@ re-enter the wedge it exists to avoid.
    it never reaches `schedule()` from within the spin, so steps 9-17 are skipped inline and deferred
    off-CPU instead — see [Self-teardown](#self-teardown-the-caller-is-the-freed-thread).
 
-4a. **No `fpu_owner` sweep is needed after eager save (#108).** The `#NM` handler only ever installs
-    the currently Running thread on its CPU as `fpu_owner`. `switch_out_save` clears the slot on
-    switch-out before the thread re-enters the Ready / Blocked / Stopped / Exited states. By the
-    time steps 9 and 10 above have completed — the thread has switched out on every CPU and
-    `context_saved == 1` — no CPU's owner slot can name this TCB. Steps 9-10's
-    interrupt-enabled-while-spinning discipline is still required to prevent the spin from
-    deadlocking against a peer CPU's TLB-shootdown IPI; without it, two CPUs in mutual TLB shootdown
-    would deadlock.
+4. **No `fpu_owner` sweep is needed after eager save (#108).** The `#NM` handler only ever installs
+   the currently Running thread on its CPU as `fpu_owner`. `switch_out_save` clears the slot on
+   switch-out before the thread re-enters the Ready / Blocked / Stopped / Exited states. By the
+   time steps 9 and 10 above have completed — the thread has switched out on every CPU and
+   `context_saved == 1` — no CPU's owner slot can name this TCB. Steps 9-10's
+   interrupt-enabled-while-spinning discipline is still required to prevent the spin from
+   deadlocking against a peer CPU's TLB-shootdown IPI; without it, two CPUs in mutual TLB shootdown
+   would deadlock.
 
-4. **Step 10's `context_saved` spin is the load-bearing UAF gate, and is unconditional.** On both
+5. **Step 10's `context_saved` spin is the load-bearing UAF gate, and is unconditional.** On both
    arches, `schedule()` calls `set_current(next)` and `release_lock_only(sched.lock)` *before*
    `switch()` saves the dying thread's registers into `tcb.saved_state`. A peer CPU acquiring the
    same lock at any moment after the release can therefore observe `sched.current = idle` while
@@ -361,11 +361,11 @@ re-enter the wedge it exists to avoid.
    lock release), and step 10 is what waits for that save. New TCBs initialise `context_saved = 1`,
    so the wait is bounded for threads that never ran.
 
-5. **Step 11's source-IPC unlink MUST acquire the source's lock for every variant.** This is the
+6. **Step 11's source-IPC unlink MUST acquire the source's lock for every variant.** This is the
    symmetry rule with `cancel_ipc_block`: both clear IPC-blocking field-group writes from a
    non-owning CPU and MUST hold the matching source lock.
 
-6. **Step 11 BlockedOnReply / BlockedOnFault.** The client's (or faulter's) `blocked_on_object` is
+7. **Step 11 BlockedOnReply / BlockedOnFault.** The client's (or faulter's) `blocked_on_object` is
    the *server* / *handler* TCB pointer (the lifetime owner of `reply_tcb`). The dealloc'd thread
    must claim its own slot via `compare_exchange(self, null, AcqRel, Acquire)` before freeing —
    otherwise a later `endpoint_reply` / fault reply on the still-live server would load the freed
@@ -373,15 +373,15 @@ re-enter the wedge it exists to avoid.
    `reply_tcb`). Stores to `null` outside `ep.lock` MUST use compare_exchange (never an
    unconditional store) so a concurrent cancel cannot lose a peer client's binding.
 
-6a. **Step 13 fault-handler binding release.** A thread that *holds* a fault-handler binding
-    (independent of whether it is itself fault-blocked) owns one `inc_ref` on its `fault_handler`
-    EndpointObject. The drain swaps the field to null and dec_refs; if the endpoint's refcount
-    reaches 0 it is enqueued on the cascade worklist (step 17), not freed by a nested
-    `dealloc_object` call — the function's worklist mechanism exists precisely to keep the cascade
-    non-recursive. Ordering after step 11 ensures a queued faulter is off the endpoint's send queue
-    before the endpoint can be torn down.
+8. **Step 13 fault-handler binding release.** A thread that *holds* a fault-handler binding
+   (independent of whether it is itself fault-blocked) owns one `inc_ref` on its `fault_handler`
+   EndpointObject. The drain swaps the field to null and dec_refs; if the endpoint's refcount
+   reaches 0 it is enqueued on the cascade worklist (step 17), not freed by a nested
+   `dealloc_object` call — the function's worklist mechanism exists precisely to keep the cascade
+   non-recursive. Ordering after step 11 ensures a queued faulter is off the endpoint's send queue
+   before the endpoint can be torn down.
 
-7. **Step 15's poison precedes step 16's drop.** `magic = 0` and `priority = 0xFF` are the
+9. **Step 15's poison precedes step 16's drop.** `magic = 0` and `priority = 0xFF` are the
    use-after-free traps — any later code that reads these fields and dereferences will fail loudly
    via the `debug_assert!((*tcb).magic == TCB_MAGIC, ...)` checks in the scheduler. Step 16 calls
    `drop_in_place(tcb)` on the in-place body; `ThreadControlBlock` has no Drop today, so this is a
@@ -403,14 +403,17 @@ domains:
 2. **Server in `endpoint_recv`** — dequeues a `BlockedOnSend` caller and rebinds it to
    `reply_tcb = caller` under `ep.lock`, then commits the caller's `BlockedOnSend → BlockedOnReply`
    (`ipc_state` + `blocked_on_object`) transition via `commit_reply_rebind_under_local_lock` (the
-   current CPU's scheduler.lock), mirroring `endpoint_call`'s `commit_blocked_under_local_lock`. If
+   caller's per-TCB `sched_lock`), mirroring `endpoint_call`'s `commit_blocked_under_local_lock`. If
    that commit fails (the caller died/stopped concurrently) it rolls the binding back —
    `compare_exchange(caller, null)` on `reply_tcb`, clear `wake_in_flight` — and skips to the next
    queued sender. See invariant 4 (#289).
 3. **Server in `endpoint_reply`** — loads `reply_tcb` (Acquire), stores `null` (Release) under
    `ep.lock`.
 4. **Client cancel via `cancel_ipc_block`** — `compare_exchange(this_client, null, AcqRel, Acquire)`
-   from the client's CPU's scheduler.lock, NOT under `ep.lock`.
+   under the client's per-TCB `sched_lock` — not a per-CPU scheduler.lock and not `ep.lock`. The
+   lock is held across a re-read of the client's `blocked_on_object` and the CAS; a dying server
+   nulls a claimed client's `blocked_on_object` under that same `sched_lock` before it is freed, so
+   observing `blocked_on_object == server` under the lock pins the server alive for the CAS.
 5. **Client dealloc via `dealloc_object(Thread)`** —
    `compare_exchange(this_client, null, AcqRel, Acquire)` in the BlockedOnReply branch of the
    source-IPC unlink walk. Mirrors `cancel_ipc_block`'s discipline.
@@ -451,7 +454,7 @@ setting a *different* non-null caller.
 4. **Client-death-during-the-`endpoint_recv`-rebind** must not leave a dangling `reply_tcb` (#289).
    Client dealloc (actor 5) finds and clears the binding using the client's
    `(ipc_state, blocked_on_object)` pair; that pair is therefore published consistently with
-   `reply_tcb`. `endpoint_call` already does this under the scheduler lock
+   `reply_tcb`. `endpoint_call` already does this under the caller's per-TCB `sched_lock`
    (`commit_blocked_under_local_lock`); the `endpoint_recv` rebind (actor 2) MUST do the same via
    `commit_reply_rebind_under_local_lock` so the publication serialises with
    `dealloc_object(Thread)`'s all-CPU-locks `Exited` mark (and `dealloc` reads `ipc_state` *after*
@@ -477,7 +480,7 @@ invariants common with the global wake protocol (`RESCHEDULE_PENDING`, `non_empt
 |---|---|---|---|
 | `tcb.timed_out` (bool, plain field) | non-atomic store under `eq.lock` (timer arm) | non-atomic load by resuming syscall on the same CPU | Single-writer per park (eq.lock excludes any concurrent payload-delivery write); reader is local CPU after `schedule()` returns. No atomic required because the source IPC lock provides mutual exclusion at the write side and the `Blocked → Ready` transition under that same lock provides the happens-before edge to the reader. |
 | `tcb.sleep_deadline` (u64, plain field) | non-atomic store under source IPC lock (when waker clears) OR under no lock (when registrant sets, before `sleep_list_add`) OR under `SLEEP_LIST_LOCK` (when timer claims) | non-atomic load under `SLEEP_LIST_LOCK` (timer snapshot pass) | The deadline read by `sleep_check_wakeups` under `SLEEP_LIST_LOCK` is the load-bearing observation; later state mutations follow the snapshot-then-claim arbitration. Cross-CPU writes are serialised either by the source IPC lock (waker's clear) or by the registrant being the parking thread itself (single-writer semantics during park). |
-| `tcb.state` (enum, plain field) | non-atomic store under either every CPU's scheduler.lock (`set_state_under_all_locks`) or the current CPU's scheduler.lock (`commit_blocked_under_local_lock` and `enqueue_and_wake`) | non-atomic load by any CPU's scheduler under its own scheduler.lock | The state field is in the Scheduling field group per [scheduling-internals.md § Cross-CPU TCB Ownership](scheduling-internals.md#cross-cpu-tcb-ownership). The all-locks vs single-CPU split exists because `Stopped`/`Exited` writes must be visible to *every* CPU's `schedule()` skip-check, while routine `Ready ↔ Running` and `Running ↔ Blocked` writes only need to coordinate with the local scheduler that owns the run-queue link. |
+| `tcb.state` (enum, plain field) | non-atomic store under either every CPU's scheduler.lock (`set_state_under_all_locks`) or the TCB's own `(*tcb).sched_lock` (`commit_blocked_under_local_lock` and `enqueue_and_wake`) | non-atomic load by any CPU's scheduler under its own scheduler.lock | The state field is in the Scheduling field group per [scheduling-internals.md § Cross-CPU TCB Ownership](scheduling-internals.md#cross-cpu-tcb-ownership). The all-locks vs single-CPU split exists because `Stopped`/`Exited` writes must be visible to *every* CPU's `schedule()` skip-check, while routine `Ready ↔ Running` and `Running ↔ Blocked` writes only need to coordinate with the local scheduler that owns the run-queue link. |
 | `tcb.priority` (u8, plain field) | non-atomic store by `sys_thread_set_priority` under `(*tcb).sched_lock` | non-atomic loads, each under the TCB's own `(*tcb).sched_lock`: `dealloc_object(Thread)` and `set_state_under_all_locks` (sched_lock held outer of their all-locks region), `migrate_ready_thread`, `enqueue_and_wake`, `enqueue_ready_thread`, and `schedule()`'s requeue arm | `(*tcb).sched_lock` is the serializer: every reader and writer of this field holds it. `schedule()`'s dispatch path deliberately does NOT read `(*next).priority` (it would race the store without `next.sched_lock`); it dispatches by run-queue index, which `dequeue_highest` already validated. After the store, `sys_thread_set_priority` relocates the Ready TCB's queue entry to the new priority (`relocate_ready_priority`, under the run-queue lock); the brief link-at-old / `priority`-new window inside the `sched_lock` region is benign because consumers dispatch by queue index, not by this field. |
 | `tcb.reply_tcb` (`AtomicPtr<TCB>`) | Release on `endpoint_*` store under ep.lock; AcqRel on `compare_exchange` from cancel/client-dealloc/server-dealloc paths | Acquire on `endpoint_reply` load under ep.lock; Acquire on the server-dealloc snapshot under all sched.locks | The `compare_exchange` discipline lets non-`ep.lock`-holding actors (cancel, client dealloc, server dealloc) clear the slot only when it still references *their* TCB, so two concurrent invalidators cannot lose a third unrelated client's binding. |
 
@@ -533,7 +536,10 @@ The handler then drains the target.
    cancellation.
 3. `set_state_under_all_locks(target, Stopped)` — acquires every CPU's scheduler.lock in ascending
    order, writes `state = Stopped`, snapshots `running_on` (the CPU whose
-   `sched.current == target_tcb`, if any), releases all locks. Returns `Option<run_cpu>`.
+   `sched.current == target_tcb`, if any), releases all locks. Returns `StateCommit`:
+   `Committed(running_on)` on a write, or `RefusedExited` when the target exited between step 1's
+   unlocked check and the locked commit; `commit_stopped` surfaces the refusal as `InvalidState`
+   (table row `sys_thread_stop (Created or Exited or Stopped)`).
 4. **Self-stop fast path.** If the target is the calling thread, call `schedule(false)` immediately.
    The skip-loop in `schedule()` never re-enqueues a `Stopped` TCB.
 5. **Cross-CPU drain.** If `running_on = Some(run_cpu)` and `run_cpu != current_cpu`:
@@ -561,10 +567,11 @@ The handler then drains the target.
 3. The bounded spin in step 5 holds NO lock; it acquires `sched_remote.lock` briefly per iteration
    to read `current` and the target's `state` (the latter coherent because
    `set_state_under_all_locks` writes `state` under every CPU lock, including this one), then
-   releases. IRQs are disabled in the syscall context (SYSCALL clears IF), so the spin-holder cannot
-   itself service interrupts during the wait — but the remote CPU's IRQs are independent and the
-   spin therefore terminates as soon as the remote drains or a concurrent `sys_thread_start` resumes
-   the target.
+   releases. The syscall enters with interrupts disabled, so the spin runs under `preempt_disable`
+   with interrupts re-enabled (`save_and_disable_interrupts` → `enable`, restored afterwards) — the
+   discipline of drain-protocol steps 9-10: spinning with interrupts disabled would block an
+   inbound TLB-shootdown IPI targeted at this CPU and deadlock it. The spin terminates as soon as
+   the remote deschedules the target or a concurrent `sys_thread_start` resumes it.
 
 ---
 

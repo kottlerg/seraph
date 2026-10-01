@@ -19,8 +19,8 @@ serial/
     └── arch/
         ├── mod.rs                # #[cfg(target_arch)] dispatch
         ├── x86_64/mod.rs         # COM1 IoPort (0x3F8): enable IER, poll LSR, write THR / read RBR
-        └── riscv64/mod.rs        # NS16550 Mmio
-                                    (ACPI SPCR base): enable IER, poll LSR, write THR / read RBR
+        └── riscv64/mod.rs        # NS16550 Mmio (ACPI SPCR base):
+                                  # enable IER, poll LSR, write THR / read RBR
 ```
 
 ---

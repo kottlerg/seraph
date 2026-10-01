@@ -63,8 +63,7 @@ The kernel hands init the maximal capability set in init's CSpace
 (see [`capability-model.md`](capability-model.md) §"Initial Capability
 Distribution") and an `InitInfo` page — mapped at a kernel-chosen VA
 delivered in init's entry register — describing it. `InitInfo.memory_base` and
-`InitInfo.memory_count`
-identify the contiguous slot range in init's CSpace holding the RAM
+`InitInfo.memory_count` identify the contiguous slot range in init's CSpace holding the RAM
 Memory caps. The kernel coalesces physically-adjacent drained RAM into the
 fewest contiguous extents and places the largest at `memory_base`, so the
 first cap is the largest; consumers that take the whole range read each

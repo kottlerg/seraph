@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only
-// Copyright (C) 2026 Gregory Kottler <me@gregorykottler.com>
+// Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
 // core/ktest/src/integration/tlb_coherency.rs
 
-//! Integration: TLB coherency across CPUs (Phase E).
+//! Integration: TLB coherency across CPUs.
 //!
 //! Exercises the TLB shootdown protocol by creating threads pinned to different
 //! CPUs and performing map/unmap operations that trigger inter-processor

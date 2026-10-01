@@ -288,8 +288,7 @@ for a full-width band, or copy-then-`SYS_SCHED_SPLIT` to mint a narrowed
 `[1, band_max]` when the spawner requested one (the create label's
 `CREATE_BAND_MAX` field, validated against the spawner's own band). The
 per-service level assignments live in `shared/ipc`'s `sched_policy` module
-and the svcmgr `.svc` recipes. For priority levels, ranges, and constants,
-see
+and the svcmgr `.svc` recipes. For priority levels, ranges, and constants, see
 [core/kernel/docs/scheduler.md § Priority Levels](../core/kernel/docs/scheduler.md#priority-levels).
 
 ---

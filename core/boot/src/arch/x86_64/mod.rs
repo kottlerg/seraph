@@ -3,10 +3,21 @@
 
 // core/boot/src/arch/x86_64/mod.rs
 
-//! x86-64 architecture module for the bootloader.
+//! x86-64 arch-dispatch surface for the bootloader.
 //!
-//! Exports the expected ELF machine type constant and the kernel handoff
-//! function. Page table implementation is in [`paging`].
+//! Defines the per-arch hooks the arch-neutral boot flow calls:
+//! [`EXPECTED_ELF_MACHINE`]; CPU identification via CPUID
+//! ([`bsp_hardware_id`], [`max_phys_addr_bits`]); AP trampoline reservation
+//! below 1 MiB ([`allocate_ap_trampoline`]); paging and handoff hooks
+//! ([`negotiate_paging`], [`default_direct_map_base`], re-exported
+//! [`BootPageTable`], [`perform_handoff`], [`trampoline_page_range`]);
+//! firmware MMIO population ([`populate_kernel_mmio`]); and the hooks that
+//! are no-ops or empty on x86-64 ([`pre_serial_init`], [`uart_mmio_region`],
+//! [`discover_boot_hart_id`], [`default_pci_apertures`]).
+//!
+//! Submodules: [`paging`] (4-level page tables), [`handoff`] (kernel entry
+//! transfer), [`serial`] (COM1 UART), [`acpi_kernel_mmio`] (LAPIC/IOAPIC
+//! extraction from the MADT).
 
 pub mod acpi_kernel_mmio;
 pub mod handoff;

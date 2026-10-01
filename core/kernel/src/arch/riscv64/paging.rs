@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// kernel/src/arch/riscv64/paging.rs
+// core/kernel/src/arch/riscv64/paging.rs
 
 //! RISC-V page table operations, parameterized over the active paging mode.
 //!

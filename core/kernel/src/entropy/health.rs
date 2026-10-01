@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// kernel/src/entropy/health.rs
+// core/kernel/src/entropy/health.rs
 
 //! Continuous health tests for the hardware RNG (NIST SP 800-90B §4.4).
 //!

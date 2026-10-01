@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// kernel/src/uaccess.rs
+// core/kernel/src/uaccess.rs
 
 //! Fault-recoverable user-memory copies.
 //!

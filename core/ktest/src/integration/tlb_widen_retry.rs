@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// ktest/src/integration/tlb_widen_retry.rs
+// core/ktest/src/integration/tlb_widen_retry.rs
 
 //! Integration: a permission-widen that elides its TLB shootdown still lets a
 //! remote CPU's stale-TLB write complete via the spurious-fault retry path.

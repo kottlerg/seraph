@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-//! commands/test.rs
-//!
+// xtask/src/commands/test.rs
+
 //! Test command: run unit tests on the host target.
 //!
 //! Tests compile for the host (not a bare-metal target), so no --arch flag is

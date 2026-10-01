@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
+// core/ktest/src/stress/priority_dealloc_race.rs
+
 //! Stress: race `sys_thread_set_priority` against `cap_delete(Thread)` and
 //! the load balancer.
 //!

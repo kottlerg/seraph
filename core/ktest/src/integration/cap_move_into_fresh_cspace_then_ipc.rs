@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
+// core/ktest/src/integration/cap_move_into_fresh_cspace_then_ipc.rs
+
 //! Integration: `cap_move` an endpoint into a fresh `CSpace`, then IPC across it.
 //!
 //! Validates that `cap_move` correctly relocates an IPC-bearing cap into a

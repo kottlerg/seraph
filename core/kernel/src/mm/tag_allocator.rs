@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// kernel/src/mm/tag_allocator.rs
+// core/kernel/src/mm/tag_allocator.rs
 
 //! Hardware address-space tag (PCID / ASID) allocator.
 //!

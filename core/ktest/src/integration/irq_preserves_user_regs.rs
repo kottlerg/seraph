@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// ktest/src/integration/irq_preserves_user_regs.rs
+// core/ktest/src/integration/irq_preserves_user_regs.rs
 
 //! Tier 2 integration: a ring-3 thread's callee-saved registers survive a timer
 //! preemption via the frame-authoritative IRQ path.

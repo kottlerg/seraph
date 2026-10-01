@@ -2,7 +2,7 @@
  * SPDX-License-Identifier: GPL-2.0-only
  * Copyright (C) 2026 George Kottler <mail@kottlerg.com>
  *
- * kernel/linker/riscv64.ld
+ * core/kernel/linker/riscv64.ld
  *
  * Linker script for the Seraph kernel (RISC-V RV64IMAC, soft-float).
  * Mirrors the x86-64 layout: the kernel links as a static-PIE (ET_DYN)

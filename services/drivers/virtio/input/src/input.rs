@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// drivers/virtio/input/src/input.rs
+// services/drivers/virtio/input/src/input.rs
 
 //! virtio-input event-queue buffer management.
 //!

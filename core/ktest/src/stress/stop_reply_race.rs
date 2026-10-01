@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// ktest/src/stress/stop_reply_race.rs
+// core/ktest/src/stress/stop_reply_race.rs
 
 //! Stress: race `sys_thread_stop` on a reply-blocked client against the
 //! death (`cap_delete(Thread)`) of the server it is parked on — issue #317.

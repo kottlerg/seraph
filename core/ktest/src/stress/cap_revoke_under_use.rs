@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
+// core/ktest/src/stress/cap_revoke_under_use.rs
+
 //! Stress test: revoke while derived capabilities are actively used.
 //!
 //! `NUM_CHILDREN` threads send on derived caps in a tight loop. The parent

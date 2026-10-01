@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
+// core/ktest/src/bench/wait_set.rs
+
 //! Wait-set create → add → wait → remove → delete cycle benchmark.
 
 use syscall::{

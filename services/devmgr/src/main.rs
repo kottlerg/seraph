@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// devmgr/src/main.rs
+// services/devmgr/src/main.rs
 
 //! Seraph device manager — platform enumeration, hardware discovery, and
 //! driver binding.

@@ -1,31 +1,34 @@
-// seraph-overlay: std::sys::pipe::seraph
-//
-// Anonymous shmem-backed pipe for `Stdio::piped()` / `Command::output()`
-// and the per-direction backing of `std::io::{stdin, stdout, stderr}` on
-// children spawned with piped stdio.
-//
-// Each pipe is one 4 KiB shmem page holding a `shmem::SpscHeader` plus
-// a power-of-two byte ring, plus two notification caps:
-//
-//   * data_notification  — writer kicks reader after producing bytes; reader
-//                    waits on this when the ring is empty.
-//   * space_notification — reader kicks writer after consuming bytes; writer
-//                    waits on this when the ring is full.
-//
-// Each `Pipe` instance represents one end (Reader or Writer). Both ends
-// hold caps to all three objects (the same memory cap and both notifications
-// are mapped/copied into both processes' CSpaces); read/write logic drives
-// the appropriate notification direction. EOF/BrokenPipe is notified via
-// the header's `closed` flag, set on Drop with one final notification kick
-// so the surviving peer wakes and observes the flag. A reader returns EOF
-// only after a drain performed AFTER observing `closed` (or the bridge's
-// `peer_dead`) comes back empty — the flags are Release-stored after the
-// writer's last ring write, so flag-then-drain ordering cannot lose bytes.
-//
-// `pipe()` itself returns `Unsupported`: the symmetric upstream
-// constructor doesn't fit our two-process model. `Command::spawn` and
-// `stdio::stdio_init` build `Pipe` instances directly via
-// `Pipe::create_for_child` / `Pipe::attach_from_caps`.
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 2026 George Kottler <mail@kottlerg.com>
+
+// runtime/ruststd/src/sys/pipe/seraph.rs
+
+//! Anonymous shmem-backed pipe for `Stdio::piped()` / `Command::output()`
+//! and the per-direction backing of `std::io::{stdin, stdout, stderr}` on
+//! children spawned with piped stdio.
+//!
+//! Each pipe is one 4 KiB shmem page holding a `shmem::SpscHeader` plus
+//! a power-of-two byte ring, plus two notification caps:
+//!
+//!   * data_notification  — writer kicks reader after producing bytes; reader
+//!                    waits on this when the ring is empty.
+//!   * space_notification — reader kicks writer after consuming bytes; writer
+//!                    waits on this when the ring is full.
+//!
+//! Each `Pipe` instance represents one end (Reader or Writer). Both ends
+//! hold caps to all three objects (the same memory cap and both notifications
+//! are mapped/copied into both processes' CSpaces); read/write logic drives
+//! the appropriate notification direction. EOF/BrokenPipe is notified via
+//! the header's `closed` flag, set on Drop with one final notification kick
+//! so the surviving peer wakes and observes the flag. A reader returns EOF
+//! only after a drain performed AFTER observing `closed` (or the bridge's
+//! `peer_dead`) comes back empty — the flags are Release-stored after the
+//! writer's last ring write, so flag-then-drain ordering cannot lose bytes.
+//!
+//! `pipe()` itself returns `Unsupported`: the symmetric upstream
+//! constructor doesn't fit our two-process model. `Command::spawn` and
+//! `stdio::stdio_init` build `Pipe` instances directly via
+//! `Pipe::create_for_child` / `Pipe::attach_from_caps`.
 
 use crate::fmt;
 use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut};

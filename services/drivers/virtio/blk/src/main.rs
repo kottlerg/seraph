@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// drivers/virtio/blk/src/main.rs
+// services/drivers/virtio/blk/src/main.rs
 
 //! Seraph `VirtIO` block device driver.
 //!

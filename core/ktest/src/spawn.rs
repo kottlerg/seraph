@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// ktest/src/spawn.rs
+// core/ktest/src/spawn.rs
 
 //! Child-thread spawn helper.
 //!

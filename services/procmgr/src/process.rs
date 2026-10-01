@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// procmgr/src/process.rs
+// services/procmgr/src/process.rs
 
 //! Process table, creation, and lifecycle management.
 //!

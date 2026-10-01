@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// kernel/build.rs
+// core/kernel/build.rs
 
-// Cargo build script: selects the kernel linker script for the active target.
+//! Cargo build script: selects the kernel linker script for the active target.
 
 fn main()
 {

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
+// core/ktest/src/bench/thread.rs
+
 //! Thread lifecycle benchmark: create → start → exit → cleanup.
 
 use syscall::{

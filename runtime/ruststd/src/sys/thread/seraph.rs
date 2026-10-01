@@ -1,20 +1,23 @@
-// seraph-overlay: std::sys::thread::seraph
-//
-// Thread spawning backed by the Seraph kernel's Thread/Notification primitives.
-// Stacks and per-thread IPC buffers are allocated from the process heap
-// (page-aligned, no guard pages for now — deferred polish). Join
-// synchronises on a Notification cap; the child thread signals just before
-// calling SYS_THREAD_EXIT, and join then reclaims the child's kernel object,
-// caps, and heap/VA resources. A detached handle (dropped without join) hands
-// its resources to the in-module `reaper`, which reclaims them once the child's
-// kernel death notification lands (see the `reaper` module).
-//
-// Native ELF TLS is live: `SYS_THREAD_CONFIGURE` accepts `tls_base`, the
-// kernel context switch saves/restores `IA32_FS_BASE` (x86-64) / `tp`
-// (RISC-V), procmgr pre-populates a main-thread TLS block from `PT_TLS`,
-// and `Thread::new` allocates a per-child TLS block here. Target-JSON
-// `has-thread-local: true`, so `#[thread_local]` statics and the
-// `thread_local!` macro both route through native TLS.
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 2026 George Kottler <mail@kottlerg.com>
+
+// runtime/ruststd/src/sys/thread/seraph.rs
+
+//! Thread spawning backed by the Seraph kernel's Thread/Notification primitives.
+//! Stacks and per-thread IPC buffers are allocated from the process heap
+//! (page-aligned, no guard pages for now — deferred polish). Join
+//! synchronises on a Notification cap; the child thread signals just before
+//! calling SYS_THREAD_EXIT, and join then reclaims the child's kernel object,
+//! caps, and heap/VA resources. A detached handle (dropped without join) hands
+//! its resources to the in-module `reaper`, which reclaims them once the child's
+//! kernel death notification lands (see the `reaper` module).
+//!
+//! Native ELF TLS is live: `SYS_THREAD_CONFIGURE` accepts `tls_base`, the
+//! kernel context switch saves/restores `IA32_FS_BASE` (x86-64) / `tp`
+//! (RISC-V), procmgr pre-populates a main-thread TLS block from `PT_TLS`,
+//! and `Thread::new` allocates a per-child TLS block here. Target-JSON
+//! `has-thread-local: true`, so `#[thread_local]` statics and the
+//! `thread_local!` macro both route through native TLS.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 

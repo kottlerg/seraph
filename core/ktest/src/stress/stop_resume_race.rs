@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// ktest/src/stress/stop_resume_race.rs
+// core/ktest/src/stress/stop_resume_race.rs
 
 //! Stress: race `sys_thread_stop` against a concurrent `sys_thread_start`
 //! (resume) on the same `Running` thread — the `thread_stop` cross-CPU drain

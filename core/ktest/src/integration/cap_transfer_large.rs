@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// ktest/src/integration/cap_transfer_large.rs
+// core/ktest/src/integration/cap_transfer_large.rs
 
 //! Integration: IPC transfer of a capability whose child list exceeds one
 //! reparent batch (`MAX_REPARENT_EDITS` in the kernel's capability-internals

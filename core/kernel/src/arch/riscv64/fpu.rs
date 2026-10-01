@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// kernel/src/arch/riscv64/fpu.rs
+// core/kernel/src/arch/riscv64/fpu.rs
 
 //! RISC-V extended-state (F / D / V) control primitives.
 //!

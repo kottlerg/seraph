@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// boot/src/dtb.rs
+// core/boot/src/dtb.rs
 
 //! Minimal Flattened Device Tree (FDT/DTB) parser.
 //!

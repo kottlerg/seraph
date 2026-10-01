@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
+// services/svctest/src/phases/mod.rs
+
 //! Test-phase registry, organised by **services-tier surface under
 //! test**.
 //!

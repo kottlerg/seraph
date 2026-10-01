@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// kernel/src/ipc/fault.rs
+// core/kernel/src/ipc/fault.rs
 
 //! Fault redirection — deliver a kernel-unresolvable userspace thread fault to
 //! the thread's bound fault-handler endpoint and block until it is resolved.

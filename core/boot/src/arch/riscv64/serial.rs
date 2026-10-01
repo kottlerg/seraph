@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// boot/src/arch/riscv64/serial.rs
+// core/boot/src/arch/riscv64/serial.rs
 
 //! RISC-V UART backend: runtime-discovered MMIO 16550 address.
 //!

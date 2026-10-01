@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// commands/test_terminal.rs
+// xtask/src/commands/test_terminal.rs
 
 //! Terminal interactive test (#111, #291). Launches QEMU (headless) with a QMP
 //! control socket, waits for the guest `terminal` to print its READY marker on

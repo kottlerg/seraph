@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// fs/fat/src/eviction.rs
+// services/fs/fat/src/eviction.rs
 
 //! Eviction worker for the FAT page cache.
 //!

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// ktest/src/frame_pool.rs
+// core/ktest/src/frame_pool.rs
 
 //! Memory capability pool for test memory management.
 //!

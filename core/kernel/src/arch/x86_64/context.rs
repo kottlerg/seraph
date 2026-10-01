@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// kernel/src/arch/x86_64/context.rs
+// core/kernel/src/arch/x86_64/context.rs
 
 //! x86-64 thread context management.
 //!

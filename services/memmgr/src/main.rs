@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// memmgr/src/main.rs
+// services/memmgr/src/main.rs
 
 //! Tier-1 userspace service that owns the userspace RAM memory-cap pool.
 //!

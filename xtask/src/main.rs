@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
+// xtask/src/main.rs
+
 //! xtask — build task runner for Seraph.
 //!
 //! Invoke via `cargo xtask <command>`. Replaces `build.sh`, `run.sh`,

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// drivers/serial/src/arch/x86_64/mod.rs
+// services/drivers/serial/src/arch/x86_64/mod.rs
 
 //! x86-64 serial I/O via COM1.
 //!

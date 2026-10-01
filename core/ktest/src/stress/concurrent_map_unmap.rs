@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
+// core/ktest/src/stress/concurrent_map_unmap.rs
+
 //! Stress test: concurrent memory map/unmap from multiple threads.
 //!
 //! `NUM_CHILDREN` threads each map and unmap a distinct VA range

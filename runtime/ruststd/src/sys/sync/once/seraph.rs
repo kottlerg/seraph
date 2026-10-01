@@ -1,10 +1,13 @@
-// seraph-overlay: std::sys::sync::once::seraph
-//
-// Atomic state machine matching the upstream `sync/once/futex.rs` design,
-// but with `futex_wait` replaced by `notification_wait` on a lazily-allocated
-// Notification cap. Because notification_send wakes one thread at a time we emulate
-// wake_all by issuing a bounded burst; a waiter that awakes spuriously
-// just rechecks state and re-parks (setting the QUEUED bit again).
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 2026 George Kottler <mail@kottlerg.com>
+
+// runtime/ruststd/src/sys/sync/once/seraph.rs
+
+//! Atomic state machine matching the upstream `sync/once/futex.rs` design,
+//! but with `futex_wait` replaced by `notification_wait` on a lazily-allocated
+//! Notification cap. Because notification_send wakes one thread at a time we emulate
+//! wake_all by issuing a bounded burst; a waiter that awakes spuriously
+//! just rechecks state and re-parks (setting the QUEUED bit again).
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 

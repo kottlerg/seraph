@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// boot/src/acpi.rs
+// core/boot/src/acpi.rs
 
 //! Minimal ACPI table parser: RSDP → XSDT → MADT, MCFG.
 //!

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
+// core/ktest/src/bench/notification.rs
+
 //! Notification ping-pong round-trip benchmark.
 //!
 //! Parent and child ping-pong via two notifications. Per-iteration bracketing

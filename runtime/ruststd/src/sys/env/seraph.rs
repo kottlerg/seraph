@@ -1,19 +1,22 @@
-// seraph-overlay: std::sys::env::seraph
-//
-// Backing for `std::env::{var, vars, set_var, remove_var}` on seraph.
-//
-// Storage model: a process-global `Mutex<BTreeMap<OsString, OsString>>` lazily
-// initialised on first access. The seed source is `StartupInfo::env_blob` (a
-// concatenation of NUL-terminated UTF-8 `KEY=VALUE` strings written by the
-// spawner into the read-only `ProcessInfo` page). Spawner-side env wiring is
-// not yet implemented, so the seed is currently empty in every process — the
-// API works, but `var()` returns `None` for any key not first set with
-// `set_var()` from inside this process.
-//
-// `BTreeMap` instead of `HashMap` to avoid std::collections::HashMap, which
-// would pull in randomness for hash DoS resistance — seraph does not yet
-// expose a kernel RNG (see `sys/random/seraph.rs` stub). The set is small
-// (dozens of entries at most) and lookup is rare; ordered tree is fine.
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 2026 George Kottler <mail@kottlerg.com>
+
+// runtime/ruststd/src/sys/env/seraph.rs
+
+//! Backing for `std::env::{var, vars, set_var, remove_var}` on seraph.
+//!
+//! Storage model: a process-global `Mutex<BTreeMap<OsString, OsString>>` lazily
+//! initialised on first access. The seed source is `StartupInfo::env_blob` (a
+//! concatenation of NUL-terminated UTF-8 `KEY=VALUE` strings written by the
+//! spawner into the read-only `ProcessInfo` page). Spawner-side env wiring is
+//! not yet implemented, so the seed is currently empty in every process — the
+//! API works, but `var()` returns `None` for any key not first set with
+//! `set_var()` from inside this process.
+//!
+//! `BTreeMap` instead of `HashMap` to avoid std::collections::HashMap, which
+//! would pull in randomness for hash DoS resistance — seraph does not yet
+//! expose a kernel RNG (see `sys/random/seraph.rs` stub). The set is small
+//! (dozens of entries at most) and lookup is rare; ordered tree is fine.
 
 use crate::collections::BTreeMap;
 use crate::ffi::{OsStr, OsString};

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// svcmgr/src/arch/riscv64/mod.rs
+// services/svcmgr/src/arch/riscv64/mod.rs
 
 //! RISC-V architecture primitives used by svcmgr.
 

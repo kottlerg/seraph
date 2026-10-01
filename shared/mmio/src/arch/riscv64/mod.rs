@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// shared/mmio/src/arch/riscv64.rs
+// shared/mmio/src/arch/riscv64/mod.rs
 
 //! RISC-V MMIO ordering barriers.
 //!

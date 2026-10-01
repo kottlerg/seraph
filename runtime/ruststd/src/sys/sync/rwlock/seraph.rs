@@ -1,21 +1,24 @@
-// seraph-overlay: std::sys::sync::rwlock::seraph
-//
-// RwLock using a single AtomicU32 state:
-//   * low 30 bits — reader count (up to `MAX_READERS`).
-//   * bit 30       — writer bit (set while a writer holds the lock).
-//   * bit 31       — waiters bit (at least one thread has parked or is about
-//                    to park on the lazy Notification).
-//
-// Blocking waiters share one Notification cap. `notification_send` wakes exactly one,
-// so we rely on a chain-wake pattern: every unlock that observes the
-// waiters bit does one `notification_send`; the awoken thread either takes the
-// lock (and eventually unlocks, triggering the next wake) or re-parks,
-// re-asserting the waiters bit. The design is simple but serialises
-// waiters; good enough until contention profiles force a richer queue.
-//
-// Readers and writers park on the same Notification, so a wake_one may pick
-// either a reader or a writer. A waking reader that acquires a shared
-// lock before queued writers is the standard "reader preference" tradeoff.
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 2026 George Kottler <mail@kottlerg.com>
+
+// runtime/ruststd/src/sys/sync/rwlock/seraph.rs
+
+//! RwLock using a single AtomicU32 state:
+//!   * low 30 bits — reader count (up to `MAX_READERS`).
+//!   * bit 30       — writer bit (set while a writer holds the lock).
+//!   * bit 31       — waiters bit (at least one thread has parked or is about
+//!                    to park on the lazy Notification).
+//!
+//! Blocking waiters share one Notification cap. `notification_send` wakes exactly one,
+//! so we rely on a chain-wake pattern: every unlock that observes the
+//! waiters bit does one `notification_send`; the awoken thread either takes the
+//! lock (and eventually unlocks, triggering the next wake) or re-parks,
+//! re-asserting the waiters bit. The design is simple but serialises
+//! waiters; good enough until contention profiles force a richer queue.
+//!
+//! Readers and writers park on the same Notification, so a wake_one may pick
+//! either a reader or a writer. A waking reader that acquires a shared
+//! lock before queued writers is the standard "reader preference" tradeoff.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 

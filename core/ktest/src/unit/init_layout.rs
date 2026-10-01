@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// ktest/src/unit/init_layout.rs
+// core/ktest/src/unit/init_layout.rs
 
 //! Tier 1 tests for the kernel's randomized init bootstrap layout (ASLR, #39).
 //!

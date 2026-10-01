@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
+// abi/syscall/src/lib.rs
+
 //! Syscall ABI definitions — single source of truth.
 //!
 //! This crate defines the binary interface between userspace and the kernel.

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// kernel/src/mm/init_reloc.rs
+// core/kernel/src/mm/init_reloc.rs
 
 //! PIE init image fix-ups (#39): `RELATIVE` relocation application and
 //! `PT_GNU_RELRO` sealing.

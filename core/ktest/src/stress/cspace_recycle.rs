@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
+// core/ktest/src/stress/cspace_recycle.rs
+
 //! Stress test: repeated `CSpace` create + delete past the live-count bound.
 //!
 //! `CSpaceId`s are recycled via a free list, so the `CSpace` namespace is

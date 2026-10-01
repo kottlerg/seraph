@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-//! commands/mod.rs
-//!
+// xtask/src/commands/mod.rs
+
 //! Re-exports all subcommand modules.
 
 pub mod build;

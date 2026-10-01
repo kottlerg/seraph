@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// ktest/src/integration/retype_subpage_clobber.rs
+// core/ktest/src/integration/retype_subpage_clobber.rs
 
 //! Integration: the retype sub-page allocator must never dereference a
 //! free-list link that has been clobbered through a userspace mapping of the

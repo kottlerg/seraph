@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-//! `rust_src.rs`
-//!
+// xtask/src/rust_src.rs
+
 //! Assembles an in-project sysroot under `target/seraph-toolchain/` so
 //! `-Z build-std` can compile `std` with our `std::sys::seraph` overlay,
 //! without touching the real rustup toolchain or rustup metadata.

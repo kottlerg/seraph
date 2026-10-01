@@ -1,49 +1,52 @@
-// seraph-overlay: std::sys::process::seraph
-//
-// `std::process::Command` for Seraph: spawns the target binary via
-// `CREATE_FROM_FILE` to procmgr, optionally installs shmem-backed stdio
-// pipes via `CONFIGURE_PIPE`, binds a death-notification `EventQueue`
-// to the child's main thread, starts it, and surfaces `Child::wait` /
-// `Child::kill` on top of the resulting caps.
-//
-// Wire-up:
-//   * Create: ipc_call(procmgr_endpoint, CREATE_FROM_FILE, ...).
-//             Reply caps: [process_handle, thread_for_caller].
-//   * Pipe (per piped direction): allocate (memory, data_sig, space_sig)
-//             via Pipe::create_for_child; ipc_call(process_handle,
-//             CONFIGURE_PIPE, data=[direction, ring_capacity],
-//             caps=[memory_handoff, data_sig_handoff, space_sig_handoff]).
-//             Parent retains its own Pipe end (the originals).
-//   * Bind death: syscall::thread_bind_notification(thread_cap, event_queue_cap).
-//   * Start: ipc_call(process_handle, START_PROCESS, 0, &[]).
-//   * Wait: syscall::event_recv(event_queue_cap) — blocks until kernel posts
-//           the exit reason on thread exit. Exit reason 0 = clean
-//           `SYS_THREAD_EXIT`; 0x1000+vector = fault exit.
-//   * Kill: ipc_call(process_handle, DESTROY_PROCESS, 0, &[]) — procmgr
-//           revokes + deletes the child's kernel objects; the bound
-//           EventQueue is woken with exit reason 0.
-//
-// Stdio:
-//   * `Stdio::Inherit` (default) / `Stdio::Null` — no pipe installed
-//     for that direction. Child reads return EOF; child writes silent-
-//     drop. Same shape as a Unix daemon with no stderr.
-//   * `Stdio::MakePipe` — allocates a shmem SPSC ring + 2 notification caps,
-//     calls CONFIGURE_PIPE, and retains the parent-side Pipe end as
-//     `ChildStdin` / `ChildStdout` / `ChildStderr`.
-//
-// Identity:
-//   * `Process::id()` returns the low 32 bits of procmgr's internal process
-//     badge (unique, monotonic, nonzero). Not a POSIX pid — processes in
-//     Seraph are identified by capability, not pid.
-//
-// Argv/env:
-//   * `Command::arg(...)` accumulates into `self.args`; `Command::env_mut()`
-//     tracks into `CommandEnv`. Both are serialised at `spawn` time into the
-//     label + data of `CREATE_FROM_FILE` (same encoding as `CREATE_PROCESS`
-//     and end up in the child's `ProcessInfo` page, surfaced via
-//     `std::env::{args, vars}` on the child side. Blobs are bounded by
-//     `ipc::ARGS_BLOB_MAX` and 8-bit counts; oversize returns
-//     `ArgumentListTooLong`.
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 2026 George Kottler <mail@kottlerg.com>
+
+// runtime/ruststd/src/sys/process/seraph.rs
+
+//! `std::process::Command` for Seraph: spawns the target binary via
+//! `CREATE_FROM_FILE` to procmgr, optionally installs shmem-backed stdio
+//! pipes via `CONFIGURE_PIPE`, binds a death-notification `EventQueue`
+//! to the child's main thread, starts it, and surfaces `Child::wait` /
+//! `Child::kill` on top of the resulting caps.
+//!
+//! Wire-up:
+//!   * Create: ipc_call(procmgr_endpoint, CREATE_FROM_FILE, ...).
+//!             Reply caps: [process_handle, thread_for_caller].
+//!   * Pipe (per piped direction): allocate (memory, data_sig, space_sig)
+//!             via Pipe::create_for_child; ipc_call(process_handle,
+//!             CONFIGURE_PIPE, data=[direction, ring_capacity],
+//!             caps=[memory_handoff, data_sig_handoff, space_sig_handoff]).
+//!             Parent retains its own Pipe end (the originals).
+//!   * Bind death: syscall::thread_bind_notification(thread_cap, event_queue_cap).
+//!   * Start: ipc_call(process_handle, START_PROCESS, 0, &[]).
+//!   * Wait: syscall::event_recv(event_queue_cap) — blocks until kernel posts
+//!           the exit reason on thread exit. Exit reason 0 = clean
+//!           `SYS_THREAD_EXIT`; 0x1000+vector = fault exit.
+//!   * Kill: ipc_call(process_handle, DESTROY_PROCESS, 0, &[]) — procmgr
+//!           revokes + deletes the child's kernel objects; the bound
+//!           EventQueue is woken with exit reason 0.
+//!
+//! Stdio:
+//!   * `Stdio::Inherit` (default) / `Stdio::Null` — no pipe installed
+//!     for that direction. Child reads return EOF; child writes silent-
+//!     drop. Same shape as a Unix daemon with no stderr.
+//!   * `Stdio::MakePipe` — allocates a shmem SPSC ring + 2 notification caps,
+//!     calls CONFIGURE_PIPE, and retains the parent-side Pipe end as
+//!     `ChildStdin` / `ChildStdout` / `ChildStderr`.
+//!
+//! Identity:
+//!   * `Process::id()` returns the low 32 bits of procmgr's internal process
+//!     badge (unique, monotonic, nonzero). Not a POSIX pid — processes in
+//!     Seraph are identified by capability, not pid.
+//!
+//! Argv/env:
+//!   * `Command::arg(...)` accumulates into `self.args`; `Command::env_mut()`
+//!     tracks into `CommandEnv`. Both are serialised at `spawn` time into the
+//!     label + data of `CREATE_FROM_FILE` (same encoding as `CREATE_PROCESS`
+//!     and end up in the child's `ProcessInfo` page, surfaced via
+//!     `std::env::{args, vars}` on the child side. Blobs are bounded by
+//!     `ipc::ARGS_BLOB_MAX` and 8-bit counts; oversize returns
+//!     `ArgumentListTooLong`.
 
 use crate::ffi::{OsStr, OsString};
 pub use crate::ffi::OsString as EnvKey;

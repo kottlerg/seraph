@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
+// core/ktest/src/integration/priority_preemption.rs
+
 //! Integration: a higher-priority runnable thread preempts a CPU-bound lower
 //! priority one within a small time budget.
 //!

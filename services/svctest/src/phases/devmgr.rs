@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
+// services/svctest/src/phases/devmgr.rs
+
 //! devmgr surface — driver-spawn orphan teardown (#176).
 //!
 //! Drives devmgr's temporary `TEST_SPAWN_ORPHAN` shim to force a round-2

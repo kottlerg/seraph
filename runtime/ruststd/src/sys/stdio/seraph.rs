@@ -1,26 +1,29 @@
-// seraph-overlay: std::sys::stdio::seraph
-//
-// Stdin/Stdout/Stderr for Seraph userspace, backed by shmem SPSC rings
-// + notification caps (Phase 3 of LOGGING_STDIO_ROADMAP). Each direction is
-// an independent `sys::pipe::seraph::Pipe` end attached at child
-// startup from the (memory, data_notification, space_notification) triple the
-// spawner installed via `procmgr_labels::CONFIGURE_PIPE`.
-//
-// Cap topology per direction:
-//   * stdin:  child = Reader (parent writes into the ring).
-//   * stdout: child = Writer (child writes out; parent reads).
-//   * stderr: child = Writer.
-//
-// Memory cap zero in any direction means "no pipe attached":
-//   * stdout/stderr write returns Ok(buf.len()) (silent drop).
-//   * stdin read returns Ok(0) (immediate EOF).
-//
-// Panic output defaults to the system log endpoint (pre-seeded badged
-// SEND cap in `ProcessInfo.log_send_cap`); the stdio rings here do NOT
-// touch the log. A process that serves the log endpoint registers a
-// sink via `set_panic_sink` so its own panic / alloc-error output routes
-// elsewhere (logd → serial driver) rather than self-IPCing into the
-// endpoint it serves.
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 2026 George Kottler <mail@kottlerg.com>
+
+// runtime/ruststd/src/sys/stdio/seraph.rs
+
+//! Stdin/Stdout/Stderr for Seraph userspace, backed by shmem SPSC rings
+//! + notification caps (Phase 3 of LOGGING_STDIO_ROADMAP). Each direction is
+//! an independent `sys::pipe::seraph::Pipe` end attached at child
+//! startup from the (memory, data_notification, space_notification) triple the
+//! spawner installed via `procmgr_labels::CONFIGURE_PIPE`.
+//!
+//! Cap topology per direction:
+//!   * stdin:  child = Reader (parent writes into the ring).
+//!   * stdout: child = Writer (child writes out; parent reads).
+//!   * stderr: child = Writer.
+//!
+//! Memory cap zero in any direction means "no pipe attached":
+//!   * stdout/stderr write returns Ok(buf.len()) (silent drop).
+//!   * stdin read returns Ok(0) (immediate EOF).
+//!
+//! Panic output defaults to the system log endpoint (pre-seeded badged
+//! SEND cap in `ProcessInfo.log_send_cap`); the stdio rings here do NOT
+//! touch the log. A process that serves the log endpoint registers a
+//! sink via `set_panic_sink` so its own panic / alloc-error output routes
+//! elsewhere (logd → serial driver) rather than self-IPCing into the
+//! endpoint it serves.
 
 use crate::cell::UnsafeCell;
 use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut};

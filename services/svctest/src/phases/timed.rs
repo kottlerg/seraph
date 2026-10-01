@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
+// services/svctest/src/phases/timed.rs
+
 //! `timed` service surface: `std::time::SystemTime::now()` end-to-end
 //! through the per-process `service_registry_cap` → svcmgr
 //! `QUERY_ENDPOINT` → timed `GET_WALL_TIME` → kernel monotonic + offset.

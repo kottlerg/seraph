@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// ktest/src/stress/load_balance_handoff_steal.rs
+// core/ktest/src/stress/load_balance_handoff_steal.rs
 
 //! Stress: arm the load balancer stealing a mid-handoff thread — the
 //! empirically-reproduced root of the cross-CPU double-dispatch class

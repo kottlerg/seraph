@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// fs/fat/src/cache.rs
+// services/fs/fat/src/cache.rs
 
 //! Page-granular sector cache for FAT block I/O.
 //!

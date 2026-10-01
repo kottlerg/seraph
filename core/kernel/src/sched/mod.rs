@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// kernel/src/sched/mod.rs
+// core/kernel/src/sched/mod.rs
 
 //! Kernel scheduler — per-CPU state, idle threads, init launch, and context switching.
 //!

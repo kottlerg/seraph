@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// ktest/src/integration/park_interrupted_stop_start.rs
+// core/ktest/src/integration/park_interrupted_stop_start.rs
 
 //! Integration: a thread stopped while parked in any non-call blocking
 //! syscall and then restarted returns `Interrupted` — never a stale wake

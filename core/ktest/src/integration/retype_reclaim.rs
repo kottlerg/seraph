@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// ktest/src/integration/retype_reclaim.rs
+// core/ktest/src/integration/retype_reclaim.rs
 
 //! Integration: end-to-end auto-reclaim of every retyped kernel-object type.
 //!

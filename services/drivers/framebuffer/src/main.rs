@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// drivers/framebuffer/src/main.rs
+// services/drivers/framebuffer/src/main.rs
 
 //! Seraph userspace framebuffer device driver.
 //!

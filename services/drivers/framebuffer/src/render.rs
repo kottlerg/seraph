@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// drivers/framebuffer/src/render.rs
+// services/drivers/framebuffer/src/render.rs
 
 //! Framebuffer text renderer (bitmap-input).
 //!

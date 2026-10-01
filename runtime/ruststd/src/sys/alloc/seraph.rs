@@ -1,30 +1,33 @@
-// seraph-overlay: std::sys::alloc::seraph
-//
-// Seraph PAL allocator: a spinlock-guarded first-fit free list whose
-// backing pages are lazily requested from memmgr. All syscall wrappers
-// and protocol labels come from the workspace crates `syscall-abi`,
-// `syscall`, and `ipc`, pulled into std's dep graph through
-// `library/std/Cargo.toml` — mirrors the `hermit-abi` /
-// `fortanix-sgx-abi` pattern. The overlay itself holds no inline asm
-// and duplicates no protocol numbers. Heap-zone VAs are private
-// constants below; the page-reservation allocator (`std::sys::reserve`)
-// owns its own arena disjoint from the heap.
-//
-// Bootstrap is explicit: `std::os::seraph::heap_bootstrap(procmgr_ep,
-// self_aspace)` must be called once, after the bootstrap IPC round
-// that produces `procmgr_ep`, before the first allocation. An
-// allocation before bootstrap returns a null pointer and the alloc
-// crate aborts via `handle_alloc_error`.
-//
-// The IPC buffer pointer used by `grow` is read from the TLS slot
-// populated in `_start` / the thread trampoline (see
-// `std::os::seraph::current_ipc_buf`). Each thread's allocation-
-// triggered grow thus targets the buffer the kernel actually reads
-// from for that thread.
-//
-// `unsafe impl GlobalAlloc for System` below delegates to the static
-// heap; services that want this allocator simply omit a custom
-// `#[global_allocator]` and use `System` (std's default).
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 2026 George Kottler <mail@kottlerg.com>
+
+// runtime/ruststd/src/sys/alloc/seraph.rs
+
+//! Seraph PAL allocator: a spinlock-guarded first-fit free list whose
+//! backing pages are lazily requested from memmgr. All syscall wrappers
+//! and protocol labels come from the workspace crates `syscall-abi`,
+//! `syscall`, and `ipc`, pulled into std's dep graph through
+//! `library/std/Cargo.toml` — mirrors the `hermit-abi` /
+//! `fortanix-sgx-abi` pattern. The overlay itself holds no inline asm
+//! and duplicates no protocol numbers. Heap-zone VAs are private
+//! constants below; the page-reservation allocator (`std::sys::reserve`)
+//! owns its own arena disjoint from the heap.
+//!
+//! Bootstrap is explicit: `std::os::seraph::heap_bootstrap(procmgr_ep,
+//! self_aspace)` must be called once, after the bootstrap IPC round
+//! that produces `procmgr_ep`, before the first allocation. An
+//! allocation before bootstrap returns a null pointer and the alloc
+//! crate aborts via `handle_alloc_error`.
+//!
+//! The IPC buffer pointer used by `grow` is read from the TLS slot
+//! populated in `_start` / the thread trampoline (see
+//! `std::os::seraph::current_ipc_buf`). Each thread's allocation-
+//! triggered grow thus targets the buffer the kernel actually reads
+//! from for that thread.
+//!
+//! `unsafe impl GlobalAlloc for System` below delegates to the static
+//! heap; services that want this allocator simply omit a custom
+//! `#[global_allocator]` and use `System` (std's default).
 
 use crate::alloc::{GlobalAlloc, Layout, System};
 use crate::cell::UnsafeCell;

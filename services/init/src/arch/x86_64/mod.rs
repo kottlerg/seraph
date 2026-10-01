@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// init/src/arch/x86_64.rs
+// services/init/src/arch/x86_64/mod.rs
 
 //! x86-64 serial output via COM1 and architecture constants.
 

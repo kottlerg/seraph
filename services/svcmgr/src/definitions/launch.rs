@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// svcmgr/src/definitions/launch.rs
+// services/svcmgr/src/definitions/launch.rs
 
 //! First-launch spawn path driven by a parsed `.svc` [`Definition`].
 //!

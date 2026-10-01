@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// drivers/cmos/src/main.rs
+// services/drivers/cmos/src/main.rs
 
 //! Seraph x86-64 CMOS / MC146818-compatible RTC driver.
 //!

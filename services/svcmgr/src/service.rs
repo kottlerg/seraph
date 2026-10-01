@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// svcmgr/src/service.rs
+// services/svcmgr/src/service.rs
 
 //! Service table and bootstrap cap acquisition for svcmgr.
 //!

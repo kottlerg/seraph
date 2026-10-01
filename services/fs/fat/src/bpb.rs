@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// fs/fat/src/bpb.rs
+// services/fs/fat/src/bpb.rs
 
 //! BIOS Parameter Block parsing and FAT filesystem state.
 //!

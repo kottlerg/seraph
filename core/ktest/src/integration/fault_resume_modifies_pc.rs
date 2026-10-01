@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// ktest/src/integration/fault_resume_modifies_pc.rs
+// core/ktest/src/integration/fault_resume_modifies_pc.rs
 
 //! Integration: a fault handler edits the faulting thread's registers, then
 //! resumes it at a new instruction pointer.

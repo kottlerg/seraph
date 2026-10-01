@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// kernel/src/cap/retype.rs
+// core/kernel/src/cap/retype.rs
 
 //! Retype primitive — turn Memory-cap-backed memory into kernel-object backings.
 //!

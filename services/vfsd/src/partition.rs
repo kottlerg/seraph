@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// vfsd/src/partition.rs
+// services/vfsd/src/partition.rs
 
 //! Boot-disk partition discovery: block-device I/O wrapped around the pure
 //! [`gpt`] format parser.

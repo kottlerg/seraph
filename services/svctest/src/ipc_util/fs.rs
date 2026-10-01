@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
+// services/svctest/src/ipc_util/fs.rs
+
 //! Raw `fs_labels::*` IPC helpers. Each wraps one wire transaction with
 //! a typed signature so phases can call sites read as intent.
 

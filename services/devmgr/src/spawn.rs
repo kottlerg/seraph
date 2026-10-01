@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// devmgr/src/spawn.rs
+// services/devmgr/src/spawn.rs
 
 //! Driver process spawning with per-device capability delivery via bootstrap.
 //!

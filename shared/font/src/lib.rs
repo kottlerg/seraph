@@ -9,8 +9,6 @@
 
 // shared/font/src/lib.rs
 
-#![no_std]
-
 //! Embedded 9×20 bitmap font.
 //!
 //! 256 glyphs × 20 rows each, stored as a flat `[u16; 5120]` array.
@@ -23,6 +21,8 @@
 //! from a UTF-8 byte stream to a glyph (CP437 reverse → ext → ASCII
 //! fallback → U+FFFD) is handled by the `shared/text` crate; this crate
 //! holds only the bitmap data.
+
+#![no_std]
 
 /// Glyph width in pixels.
 pub const GLYPH_WIDTH: u32 = 9;

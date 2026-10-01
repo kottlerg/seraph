@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// ktest/src/integration/fault_handler_declines_kills.rs
+// core/ktest/src/integration/fault_handler_declines_kills.rs
 
 //! Integration: a fault handler that replies `FAULT_REPLY_KILL` terminates the
 //! faulting thread as an unhandled fault.

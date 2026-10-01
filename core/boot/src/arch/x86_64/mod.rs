@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// boot/src/arch/x86_64/mod.rs
+// core/boot/src/arch/x86_64/mod.rs
 
 //! x86-64 architecture module for the bootloader.
 //!

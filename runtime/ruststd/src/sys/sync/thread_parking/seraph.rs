@@ -1,12 +1,15 @@
-// seraph-overlay: std::sys::sync::thread_parking::seraph
-//
-// Per-Parker AtomicU32 state (EMPTY / NOTIFIED / PARKED) backed by a
-// lazily-allocated Notification cap. Patterned after `sync/thread_parking/
-// futex.rs` but using `SYS_NOTIFICATION_WAIT` (kernel cap-based, no address
-// expectation) in place of a futex. `park_timeout` uses the timeout
-// variant (`notification_wait_timeout`, backed by `SYS_NOTIFICATION_WAIT` with
-// `arg1 = ms`) so a concurrent `unpark` still wakes us early and the
-// timer path wakes us otherwise.
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 2026 George Kottler <mail@kottlerg.com>
+
+// runtime/ruststd/src/sys/sync/thread_parking/seraph.rs
+
+//! Per-Parker AtomicU32 state (EMPTY / NOTIFIED / PARKED) backed by a
+//! lazily-allocated Notification cap. Patterned after `sync/thread_parking/
+//! futex.rs` but using `SYS_NOTIFICATION_WAIT` (kernel cap-based, no address
+//! expectation) in place of a futex. `park_timeout` uses the timeout
+//! variant (`notification_wait_timeout`, backed by `SYS_NOTIFICATION_WAIT` with
+//! `arg1 = ms`) so a concurrent `unpark` still wakes us early and the
+//! timer path wakes us otherwise.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 

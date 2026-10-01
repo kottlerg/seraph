@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// kernel/src/arch/x86_64/ap_trampoline.rs
+// core/kernel/src/arch/x86_64/ap_trampoline.rs
 
 //! AP (Application Processor) SIPI startup trampoline for x86-64.
 //!

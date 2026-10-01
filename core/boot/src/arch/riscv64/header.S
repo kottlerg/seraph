@@ -7,7 +7,7 @@
 // The Linux RISC-V EFI header is adapted from the ARM64 implementation
 // by Ard Biesheuvel and ARM64 Linux contributors.
 
-// boot/src/arch/riscv64/header.S
+// core/boot/src/arch/riscv64/header.S
 
 // UEFI firmware loads EFI applications as PE32+ images. LLVM's PE/COFF backend
 // does not support RISC-V, so we compile the bootloader as a PIC ELF and

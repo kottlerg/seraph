@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// init/src/logging.rs
+// services/init/src/logging.rs
 
 //! Logging subsystem for init — the system's *interim* log mediator.
 //!

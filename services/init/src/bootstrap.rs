@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// init/src/bootstrap.rs
+// services/init/src/bootstrap.rs
 
 //! Procmgr bootstrap — raw ELF loading and process creation.
 //!

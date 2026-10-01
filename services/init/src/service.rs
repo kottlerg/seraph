@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// init/src/service.rs
+// services/init/src/service.rs
 
 //! Service creation helpers for init.
 //!

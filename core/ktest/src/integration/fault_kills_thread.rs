@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// ktest/src/integration/fault_kills_thread.rs
+// core/ktest/src/integration/fault_kills_thread.rs
 
 //! Integration: a genuine userspace page fault still kills the thread.
 //!

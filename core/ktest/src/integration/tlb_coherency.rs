@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 Gregory Kottler <me@gregorykottler.com>
 
-// ktest/src/integration/tlb_coherency.rs
+// core/ktest/src/integration/tlb_coherency.rs
 
 //! Integration: TLB coherency across CPUs (Phase E).
 //!

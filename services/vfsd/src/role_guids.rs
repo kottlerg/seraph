@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// vfsd/src/role_guids.rs
+// services/vfsd/src/role_guids.rs
 
 //! Compile-time selection of the Seraph root partition GPT type-GUID.
 //!

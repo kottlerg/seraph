@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
+// core/ktest/src/stress/cap_delete_running.rs
+
 //! Stress test: `cap_delete` a Thread cap while the thread is still running.
 //!
 //! Children spin in pure userspace (no syscalls back to the kernel). The

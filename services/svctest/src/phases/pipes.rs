@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
+// services/svctest/src/phases/pipes.rs
+
 //! Kernel pipe object surface (Stdio piped, death-bridge EOF).
 
 use std::os::seraph::startup_info;

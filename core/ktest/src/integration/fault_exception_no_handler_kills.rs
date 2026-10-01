@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// ktest/src/integration/fault_exception_no_handler_kills.rs
+// core/ktest/src/integration/fault_exception_no_handler_kills.rs
 
 //! Integration: a non-page-fault CPU exception with no handler bound is terminal.
 //!

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// kernel/src/mm/paging.rs
+// core/kernel/src/mm/paging.rs
 
 //! Kernel page table initialization (Phase 3).
 //!

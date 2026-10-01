@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// devmgr/src/caps.rs
+// services/devmgr/src/caps.rs
 
 //! Bootstrap cap acquisition for devmgr.
 //!

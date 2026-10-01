@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// svcmgr/svc-defs/src/parse.rs
+// services/svcmgr/svc-defs/src/parse.rs
 
 //! Bespoke `key = value` parser for `.svc` service-definition files.
 //!

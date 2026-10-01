@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// boot/src/uefi.rs
+// core/boot/src/uefi.rs
 
 //! UEFI raw type definitions and safe wrapper functions.
 //!

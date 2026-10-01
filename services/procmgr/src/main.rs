@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// procmgr/src/main.rs
+// services/procmgr/src/main.rs
 
 //! Seraph process manager — IPC server for process lifecycle management.
 //!

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-//! cli.rs
-//!
+// xtask/src/cli.rs
+
 //! Clap derive structs for the xtask CLI.
 //!
 //! Add a new top-level command by adding a variant to `Command` and a
@@ -424,3 +424,4 @@ pub struct RunParallelArgs
     #[arg(long, default_value = "10")]
     pub fail_grace_secs: u64,
 }
+

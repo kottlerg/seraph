@@ -1,21 +1,24 @@
-// seraph-overlay: std::sys::args::seraph
-//
-// Iterator backing for `std::env::args` / `std::env::args_os`. Reads the
-// argv blob that procmgr wrote into the read-only `ProcessInfo` page at
-// spawn time, surfaced by `std::os::seraph::startup_info().args_blob`.
-//
-// Semantics of the blob (see `project_argv_env_invariants.md`):
-//   * Concatenation of `args_count` NUL-terminated UTF-8 strings.
-//   * No embedded cap references, badges, or security data — argv is
-//     plain data, set exclusively by the spawning process.
-//   * Single encoding across the system (UTF-8); non-UTF-8 bytes are
-//     surfaced losslessly via `args_os` (`OsString` on seraph is
-//     UTF-8 bytes).
-//
-// Invalid UTF-8 inside an argv entry makes that entry come out as its
-// replacement-character form when iterating via `args()`; `args_os()`
-// preserves the raw bytes. Callers that need to tolerate non-UTF-8 argv
-// should use `args_os`.
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 2026 George Kottler <mail@kottlerg.com>
+
+// runtime/ruststd/src/sys/args/seraph.rs
+
+//! Iterator backing for `std::env::args` / `std::env::args_os`. Reads the
+//! argv blob that procmgr wrote into the read-only `ProcessInfo` page at
+//! spawn time, surfaced by `std::os::seraph::startup_info().args_blob`.
+//!
+//! Semantics of the blob (see `project_argv_env_invariants.md`):
+//!   * Concatenation of `args_count` NUL-terminated UTF-8 strings.
+//!   * No embedded cap references, badges, or security data — argv is
+//!     plain data, set exclusively by the spawning process.
+//!   * Single encoding across the system (UTF-8); non-UTF-8 bytes are
+//!     surfaced losslessly via `args_os` (`OsString` on seraph is
+//!     UTF-8 bytes).
+//!
+//! Invalid UTF-8 inside an argv entry makes that entry come out as its
+//! replacement-character form when iterating via `args()`; `args_os()`
+//! preserves the raw bytes. Callers that need to tolerate non-UTF-8 argv
+//! should use `args_os`.
 
 use argv_env::next_field;
 

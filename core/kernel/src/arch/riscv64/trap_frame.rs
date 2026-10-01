@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// kernel/src/arch/riscv64/trap_frame.rs
+// core/kernel/src/arch/riscv64/trap_frame.rs
 
 //! RISC-V 64-bit trap frame — full user-mode register snapshot.
 //!

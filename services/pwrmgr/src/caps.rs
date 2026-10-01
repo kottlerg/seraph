@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// pwrmgr/src/caps.rs
+// services/pwrmgr/src/caps.rs
 
 //! Bootstrap and devmgr-query acquisition for pwrmgr.
 //!

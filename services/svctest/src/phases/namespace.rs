@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
+// services/svctest/src/phases/namespace.rs
+
 //! vfsd / namespace-protocol surface.
 //!
 //! Hosts the child-mode entries `sandbox_child_main` and

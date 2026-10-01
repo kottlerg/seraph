@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// devmgr/src/pci.rs
+// services/devmgr/src/pci.rs
 
 //! PCI device discovery via ECAM, BAR probing, and `VirtIO` capability parsing.
 //!

@@ -17,7 +17,8 @@ and `memmgr`.
 memmgr/
 ├── Cargo.toml                  # Workspace member; no_std binary
 ├── README.md
-├── free-pool/                  # `memmgr-free-pool` crate: pure host-tested allocator + region logic
+├── free-pool/                  # `memmgr-free-pool` crate:
+│                                 pure host-tested allocator + region logic
 ├── src/
 │   └── main.rs                 # _start() entry point, IPC dispatch loop
 └── docs/
@@ -191,4 +192,6 @@ mint or retire process badges.
 
 ## Summarized By
 
-[Userspace Memory Model](../../docs/userspace-memory-model.md), [Process Lifecycle](../../docs/process-lifecycle.md), [Architecture Overview](../../docs/architecture.md)
+[Userspace Memory Model](../../docs/userspace-memory-model.md),
+[Process Lifecycle](../../docs/process-lifecycle.md),
+[Architecture Overview](../../docs/architecture.md)

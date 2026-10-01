@@ -36,7 +36,8 @@ ruststd/
     └── sys/                    # std::sys::seraph backends, one directory per area
         ├── alloc/              # byte heap (#[global_allocator])
         ├── args/               # std::env::args — consumes argv_env::next_field
-        ├── env/                # std::env::{var,vars,…} — consumes argv_env::{next_field,split_key_value}
+        ├── env/                # std::env::{var,vars,…} —
+        │                         consumes argv_env::{next_field,split_key_value}
         ├── fs/                 # filesystem over the namespace protocol
         ├── pipe/               # stdio pipe backing
         ├── process/            # process spawn

@@ -300,4 +300,8 @@ describes vfsd's synthetic-root composition in detail.
 
 ## Summarized By
 
-[services/vfsd/README.md](../../services/vfsd/README.md), [services/fs/README.md](../../services/fs/README.md), [services/fs/docs/fs-driver-protocol.md](../../services/fs/docs/fs-driver-protocol.md), [services/vfsd/docs/namespace-composition.md](../../services/vfsd/docs/namespace-composition.md), [services/vfsd/docs/vfs-ipc-interface.md](../../services/vfsd/docs/vfs-ipc-interface.md)
+[services/vfsd/README.md](../../services/vfsd/README.md),
+[services/fs/README.md](../../services/fs/README.md),
+[services/fs/docs/fs-driver-protocol.md](../../services/fs/docs/fs-driver-protocol.md),
+[services/vfsd/docs/namespace-composition.md](../../services/vfsd/docs/namespace-composition.md),
+[services/vfsd/docs/vfs-ipc-interface.md](../../services/vfsd/docs/vfs-ipc-interface.md)

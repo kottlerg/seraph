@@ -209,4 +209,5 @@ marked degraded and not restarted automatically. See
 
 ## Summarized By
 
-[Architecture Overview](../../docs/architecture.md), [System Bootstrap](../../docs/bootstrap.md), [Process Lifecycle](../../docs/process-lifecycle.md), [Testing](../../docs/testing.md)
+[Architecture Overview](../../docs/architecture.md), [System Bootstrap](../../docs/bootstrap.md),
+[Process Lifecycle](../../docs/process-lifecycle.md), [Testing](../../docs/testing.md)

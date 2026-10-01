@@ -9,7 +9,8 @@ System-wide model of userspace process creation, identity, and destruction from 
 This document is authoritative for:
 
 - The boot ordering of userspace tier-1 services
-  ([`init`](../services/init/README.md) → [`memmgr`](../services/memmgr/README.md) → [`procmgr`](../services/procmgr/README.md) → [`svcmgr`](../services/svcmgr/README.md)).
+  ([`init`](../services/init/README.md) → [`memmgr`](../services/memmgr/README.md) →
+  [`procmgr`](../services/procmgr/README.md) → [`svcmgr`](../services/svcmgr/README.md)).
 - The capability flow at each step — who hands what to whom.
 - The `ProcessInfo` / `InitInfo` handover discipline: which fields are
   parent-chosen runtime values and which are ABI constants.
@@ -61,7 +62,8 @@ applications) is std-built and bootstraps its heap via memmgr.
 The kernel hands init the maximal capability set in init's CSpace
 (see [`capability-model.md`](capability-model.md) §"Initial Capability
 Distribution") and an `InitInfo` page — mapped at a kernel-chosen VA
-delivered in init's entry register — describing it. `InitInfo.memory_base` and `InitInfo.memory_count`
+delivered in init's entry register — describing it. `InitInfo.memory_base` and
+`InitInfo.memory_count`
 identify the contiguous slot range in init's CSpace holding the RAM
 Memory caps. The kernel coalesces physically-adjacent drained RAM into the
 fewest contiguous extents and places the largest at `memory_base`, so the
@@ -88,7 +90,8 @@ knows where in its own CSpace the pool lives.
 
 After this step, memmgr is ready: it serves `REQUEST_MEMORY_CAPS`,
 `RELEASE_MEMORY_CAPS`, `REGISTER_PROCESS`, and `PROCESS_DIED` (the last two
-restricted to procmgr; see [`memmgr/docs/ipc-interface.md`](../services/memmgr/docs/ipc-interface.md)).
+restricted to procmgr; see
+[`memmgr/docs/ipc-interface.md`](../services/memmgr/docs/ipc-interface.md)).
 
 memmgr is `no_std` and inherits the constraint that motivated the split:
 it cannot bootstrap a heap against itself while owning frame allocation.

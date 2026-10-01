@@ -289,7 +289,8 @@ for a full-width band, or copy-then-`SYS_SCHED_SPLIT` to mint a narrowed
 `CREATE_BAND_MAX` field, validated against the spawner's own band). The
 per-service level assignments live in `shared/ipc`'s `sched_policy` module
 and the svcmgr `.svc` recipes. For priority levels, ranges, and constants,
-see [core/kernel/docs/scheduler.md § Priority Levels](../core/kernel/docs/scheduler.md#priority-levels).
+see
+[core/kernel/docs/scheduler.md § Priority Levels](../core/kernel/docs/scheduler.md#priority-levels).
 
 ---
 
@@ -613,7 +614,8 @@ the CSpace with an initial set of capabilities covering all available resources:
 - Memory capabilities for each boot module image (raw ELF images for early services)
 
 Init is responsible for delegating appropriate subsets of this authority to each service it starts,
-following the principle of least privilege. See [device-management.md](device-management.md#what-devmgr-receives-from-init)
+following the principle of least privilege. See
+[device-management.md](device-management.md#what-devmgr-receives-from-init)
 for devmgr's specific initial capability set.
 
 ### "Kill process" pattern

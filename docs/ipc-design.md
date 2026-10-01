@@ -153,8 +153,10 @@ identifies which source triggered the wake.
 ## Capability Semantics in IPC
 
 IPC capabilities carry three rights — Send (call the endpoint), Receive (accept calls), and Grant
-(pass capabilities in messages) — with scoping rules defined in [capability-model.md#ipc-endpoint](capability-model.md#ipc-endpoint).
-Capabilities passed in IPC messages are moved, not copied; see [capability-model.md#transfer](capability-model.md#transfer).
+(pass capabilities in messages) — with scoping rules defined in
+[capability-model.md#ipc-endpoint](capability-model.md#ipc-endpoint).
+Capabilities passed in IPC messages are moved, not copied; see
+[capability-model.md#transfer](capability-model.md#transfer).
 
 ---
 

@@ -1,6 +1,7 @@
 ---
 name: Work
-about: Decided work item — feature, cleanup, perf, security, or infra. Pick the class label at file time.
+about: Decided work item — feature, cleanup, perf, security, or infra. Pick the class label at file
+  time.
 title: ''
 labels: ''
 ---

@@ -32,7 +32,8 @@ drivers/
 │   │       └── lib.rs
 │   └── blk/                        # VirtIO block device driver (binary)
 │       ├── Cargo.toml
-│       ├── README.md               # Block-driver IPC interface (BLK_READ_INTO_MEMORY, REGISTER_PARTITION)
+│       ├── README.md               # Block-driver IPC interface
+│       │                             (BLK_READ_INTO_MEMORY, REGISTER_PARTITION)
 │       └── src/
 │           ├── main.rs
 │           └── io.rs
@@ -101,6 +102,8 @@ holds ambient hardware authority. The full driver lifecycle is specified in
 
 | Document | Content |
 |---|---|
+| [docs/driver-model.md](docs/driver-model.md) | Driver lifecycle and capability delegation |
+| [docs/virtio-architecture.md](docs/virtio-architecture.md) | VirtIO transport abstraction and queue internals |
 | [docs/device-management.md](../../docs/device-management.md) | Driver lifecycle, DMA safety, security boundary |
 | [docs/ipc-design.md](../../docs/ipc-design.md) | IPC semantics, endpoints, message format |
 | [docs/capability-model.md](../../docs/capability-model.md) | Capability types, rights, delegation |

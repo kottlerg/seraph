@@ -133,4 +133,5 @@ driver's.
 
 ## Summarized By
 
-[Architecture Overview](../../docs/architecture.md), [System Bootstrap](../../docs/bootstrap.md), [Console Model](../../docs/console-model.md)
+[Architecture Overview](../../docs/architecture.md), [System Bootstrap](../../docs/bootstrap.md),
+[Console Model](../../docs/console-model.md)

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-//! term/guard.rs
-//!
+// xtask/src/term/guard.rs
+
 //! RAII guard that snapshots the host terminal's state on creation
 //! and restores it on drop.
 //!

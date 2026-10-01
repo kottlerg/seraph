@@ -8,6 +8,7 @@ Closes #<issue>
 - [ ]
 
 ## Test plan
+- [ ] `cargo xtask lint-docs`
 - [ ] `cargo xtask build` (x86_64)
 - [ ] `cargo xtask run` (x86_64), terminal pass marker observed
 - [ ] `cargo xtask build --arch riscv64`

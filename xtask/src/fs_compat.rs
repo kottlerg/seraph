@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-//! `fs_compat.rs`
-//!
+// xtask/src/fs_compat.rs
+
 //! Portable file-materialisation helpers.
 //!
 //! `link_or_copy` makes `dst` refer to the same content as `src` using

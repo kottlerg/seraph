@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// init/src/arch/mod.rs
+// services/init/src/arch/mod.rs
 
 //! Architecture dispatch module.
 //!

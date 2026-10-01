@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// vfsd/src/worker_pool.rs
+// services/vfsd/src/worker_pool.rs
 
 //! Worker pool for vfsd outbound IPC.
 //!

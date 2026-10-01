@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// devmgr/src/firmware/acpi.rs
+// services/devmgr/src/firmware/acpi.rs
 
 //! Narrow ACPI walk: RSDP → XSDT → MCFG.
 //!

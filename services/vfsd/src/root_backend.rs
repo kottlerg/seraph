@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// vfsd/src/root_backend.rs
+// services/vfsd/src/root_backend.rs
 
 //! Synthetic system-root [`NamespaceBackend`] composed at boot time.
 //!

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// drivers/virtio/core/src/pci.rs
+// services/drivers/virtio/core/src/pci.rs
 
 //! `VirtIO` modern PCI transport (`VirtIO` 1.2 §4.1).
 //!

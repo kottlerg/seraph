@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// kernel/src/cap/transfer.rs
+// core/kernel/src/cap/transfer.rs
 
 //! Capability move — `SYS_CAP_MOVE` and IPC capability transfer.
 //!

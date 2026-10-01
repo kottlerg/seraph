@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// ktest/src/main.rs
+// core/ktest/src/main.rs
 
 //! ktest — Seraph kernel test binary.
 //!

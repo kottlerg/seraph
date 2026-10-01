@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// ktest/src/unit/retype.rs
+// core/ktest/src/unit/retype.rs
 
 //! Unit tests for the retype primitive itself.
 //!

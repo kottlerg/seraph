@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// ktest/src/stress/event_try_recv_post_race.rs
+// core/ktest/src/stress/event_try_recv_post_race.rs
 
 //! Stress: a non-blocking `SYS_EVENT_RECV` try-once racing a concurrent
 //! `event_post` MUST never make the poller wakeable (issue #352).

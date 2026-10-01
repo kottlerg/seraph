@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// svcmgr/src/restart.rs
+// services/svcmgr/src/restart.rs
 
 //! Service death handling and restart logic.
 //!

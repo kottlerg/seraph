@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-//! commands/clean.rs
-//!
+// xtask/src/commands/clean.rs
+
 //! Clean command: remove the sysroot and optionally the cargo target/ directory.
 
 use std::process::Command;

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// kernel/src/entropy/sponge.rs
+// core/kernel/src/entropy/sponge.rs
 
 //! Forward-secure duplex PRNG over Keccak-f[1600].
 //!

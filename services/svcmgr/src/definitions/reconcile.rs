@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// svcmgr/src/definitions/reconcile.rs
+// services/svcmgr/src/definitions/reconcile.rs
 
 //! Post-handover reconciliation between the substrate registrations init
 //! delivers in the handover endowment and the on-disk

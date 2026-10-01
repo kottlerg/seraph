@@ -149,31 +149,29 @@ devmgr loads driver binaries from one of two places:
   MODULE bootstrap round. devmgr spawns them via
   `procmgr_labels::CREATE_PROCESS` during initial enumeration.
 - **On-disk rootfs** — non-essentials (the per-arch RTC and the
-  [virtio-input keyboard driver](../services/drivers/virtio/input/README.md)) live at `/services/drivers/` and are
-  loaded via `procmgr_labels::CREATE_FROM_FILE`. virtio-input is
-  PCI-enumerated during the initial scan — its BAR/IRQ caps are carved
-  and stashed then — but its spawn is deferred to this path, since a
-  keyboard is not on the read-the-disk critical path. A PCI device that
-  shares an `INTx` line may get no private IRQ cap; such a driver is
-  delivered a 2-cap bootstrap round (BAR + service, no IRQ) and polls
-  its queue. Post-handover, svcmgr walks its
-  universal root to `/services/drivers/` and hands devmgr that
-  subtree cap via `devmgr_labels::SET_DRIVERS_DIR` (gated by
-  `DRIVERS_DIR_AUTHORITY`, minted from the devmgr-registry source init
-  endows svcmgr with; sent at `LOOKUP | READ` rights only — devmgr
-  cannot reach outside the drivers subtree). Devmgr replies SUCCESS
-  before doing any spawn work so svcmgr never blocks on driver
-  bring-up; the actual walk + `CREATE_FROM_FILE` + bootstrap rounds
-  run after `ipc_reply` and before devmgr returns to its next
-  `ipc_recv`. The spawn is at-most-once per boot; on failure
-  (binary missing, ELF corrupt, hardware-carve failure, OOM, etc.)
-  devmgr replies `devmgr_errors::NO_DEVICE` on subsequent
-  `QUERY_RTC_DEVICE` / `QUERY_INPUT_DEVICE` calls and clients (timed
-  today; future input consumers) degrade to their no-device path.
-  Growing the boot bundle with non-essentials would waste
-  permanently-leaked post-`ExitBootServices` UEFI allocation
-  (see `core/boot/src/main.rs`), so on-disk loading is preferred for
-  anything not on the read-the-disk-in-the-first-place critical path.
+  [virtio-input keyboard driver](../services/drivers/virtio/input/README.md))
+  live at `/services/drivers/` and are loaded via
+  `procmgr_labels::CREATE_FROM_FILE`. virtio-input is PCI-enumerated during the
+  initial scan — its BAR/IRQ caps are carved and stashed then — but its spawn is
+  deferred to this path, since a keyboard is not on the read-the-disk critical
+  path. A PCI device that shares an `INTx` line may get no private IRQ cap; such
+  a driver is delivered a 2-cap bootstrap round (BAR + service, no IRQ) and
+  polls its queue. Post-handover, svcmgr walks its universal root to
+  `/services/drivers/` and hands devmgr that subtree cap via
+  `devmgr_labels::SET_DRIVERS_DIR` (gated by `DRIVERS_DIR_AUTHORITY`, minted
+  from the devmgr-registry source init endows svcmgr with; sent at
+  `LOOKUP | READ` rights only — devmgr cannot reach outside the drivers
+  subtree). Devmgr replies SUCCESS before doing any spawn work so svcmgr never
+  blocks on driver bring-up; the actual walk + `CREATE_FROM_FILE` + bootstrap
+  rounds run after `ipc_reply` and before devmgr returns to its next `ipc_recv`.
+  The spawn is at-most-once per boot; on failure (binary missing, ELF corrupt,
+  hardware-carve failure, OOM, etc.) devmgr replies `devmgr_errors::NO_DEVICE`
+  on subsequent `QUERY_RTC_DEVICE` / `QUERY_INPUT_DEVICE` calls and clients
+  (timed today; future input consumers) degrade to their no-device path. Growing
+  the boot bundle with non-essentials would waste permanently-leaked
+  post-`ExitBootServices` UEFI allocation (see `core/boot/src/main.rs`), so
+  on-disk loading is preferred for anything not on the
+  read-the-disk-in-the-first-place critical path.
 
 Storage-side cap delegation downstream of devmgr (whole-disk
 endpoint → vfsd → partition-scoped endpoint → fs driver) is
@@ -183,4 +181,5 @@ specified in [`storage.md`](storage.md).
 
 ## Summarized By
 
-[README.md](../README.md), [Architecture Overview](architecture.md), [storage.md](storage.md), [devmgr](../services/devmgr/README.md), [drivers](../services/drivers/README.md)
+[README.md](../README.md), [Architecture Overview](architecture.md), [storage.md](storage.md),
+[devmgr](../services/devmgr/README.md), [drivers](../services/drivers/README.md)

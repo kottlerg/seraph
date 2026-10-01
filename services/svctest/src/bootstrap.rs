@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
+// services/svctest/src/bootstrap.rs
+
 //! Decode the creator-endpoint bootstrap round into a typed [`Caps`].
 //!
 //! Slot layout (set by whichever launcher minted the round):

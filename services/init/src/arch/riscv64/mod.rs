@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// init/src/arch/riscv64.rs
+// services/init/src/arch/riscv64/mod.rs
 
 //! RISC-V serial output via 16550 UART MMIO and architecture constants.
 

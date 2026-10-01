@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// drivers/goldfish-rtc/src/main.rs
+// services/drivers/goldfish-rtc/src/main.rs
 
 //! Seraph Goldfish RTC driver (QEMU `virt` RISC-V).
 //!

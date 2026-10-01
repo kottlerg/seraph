@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
+// core/ktest/src/bench/cap.rs
+
 //! Capability operation benchmarks.
 
 use syscall::{cap_create_notification, cap_delete};

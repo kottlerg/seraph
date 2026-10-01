@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// kernel/src/arch/riscv64/ap_trampoline.rs
+// core/kernel/src/arch/riscv64/ap_trampoline.rs
 
 //! RISC-V AP startup trampoline (SBI HSM `hart_start`).
 //!

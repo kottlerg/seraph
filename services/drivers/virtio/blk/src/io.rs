@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// drivers/virtio/blk/src/io.rs
+// services/drivers/virtio/blk/src/io.rs
 
 //! Block I/O request submission and completion for the `VirtIO` block driver.
 //!

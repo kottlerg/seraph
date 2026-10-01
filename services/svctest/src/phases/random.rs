@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
+// services/svctest/src/phases/random.rs
+
 //! Userspace randomness surface (#246) and ASLR layout divergence (#39).
 //!
 //! Exercises `SYS_GETRANDOM` directly and the std `RandomState`/`HashMap`

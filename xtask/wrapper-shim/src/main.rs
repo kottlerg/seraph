@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-//! seraph-wrapper-shim
-//!
+// xtask/wrapper-shim/src/main.rs
+
 //! Tiny native binary installed into the seraph toolchain mirror as
 //! both `rustc` and `ws-clippy`. Replaces the previous `#!/bin/sh`
 //! wrapper scripts so the toolchain mirror works on every host with a

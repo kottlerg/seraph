@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// boot/src/arch/riscv64/paging.rs
+// core/boot/src/arch/riscv64/paging.rs
 
 //! RISC-V page table construction for the bootloader, parameterized over
 //! the negotiated paging mode.

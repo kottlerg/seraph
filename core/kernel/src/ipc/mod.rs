@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// kernel/src/ipc/mod.rs
+// core/kernel/src/ipc/mod.rs
 
 //! IPC subsystem — synchronous endpoint messaging, notifications, event queues, wait sets.
 //!

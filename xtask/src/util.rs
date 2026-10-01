@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-//! util.rs
-//!
+// xtask/src/util.rs
+
 //! Shared utilities: step printing, command execution, and tool
 //! discovery. (The terminal-state RAII guard moved to `term::guard`.)
 

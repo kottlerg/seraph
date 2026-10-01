@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
+// core/ktest/src/bench/null.rs
+
 //! Null-syscall round-trip benchmark.
 //!
 //! Measures the cost of a minimal kernel entry + exit. Uses

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
+// services/svctest/src/ipc_util/mod.rs
+
 //! Raw-IPC helpers shared across phase modules.
 //!
 //! Each helper wraps one wire-level transaction in a typed signature

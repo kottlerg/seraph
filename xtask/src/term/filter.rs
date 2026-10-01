@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-//! term/filter.rs
-//!
+// xtask/src/term/filter.rs
+
 //! Byte-stream control-sequence filter for QEMU output.
 //!
 //! `FilterWriter` is a `Write` adapter that strips terminal-control

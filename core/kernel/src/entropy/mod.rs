@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// kernel/src/entropy/mod.rs
+// core/kernel/src/entropy/mod.rs
 
 //! Kernel entropy subsystem and per-CPU CSPRNG.
 //!

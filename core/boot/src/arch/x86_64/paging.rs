@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// boot/src/arch/x86_64/paging.rs
+// core/boot/src/arch/x86_64/paging.rs
 
 //! x86-64 4-level (PML4) page table construction for the bootloader.
 //!

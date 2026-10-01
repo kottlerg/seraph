@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-//! seraph-overlay: std::sys::fs (seraph-only)
-//!
+// runtime/ruststd/src/sys/fs/seraph.rs
+
 //! `std::fs::File`, `OpenOptions`, `read_dir`, `metadata`, and the
 //! mutating free functions (`write`, `create_dir`, `remove_file`,
 //! `remove_dir`, `remove_dir_all`, `rename`) backed by vfsd /

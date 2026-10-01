@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// init/src/walk.rs
+// services/init/src/walk.rs
 
 //! Init's namespace walk surface, re-exporting [`ns_client`].
 //!

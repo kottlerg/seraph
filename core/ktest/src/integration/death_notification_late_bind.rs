@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// ktest/src/integration/death_notification_late_bind.rs
+// core/ktest/src/integration/death_notification_late_bind.rs
 
 //! Integration: a death observer bound *after* the thread has already died
 //! still receives the retained exit reason.

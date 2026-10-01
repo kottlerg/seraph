@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-//! disk.rs
-//!
+// xtask/src/disk.rs
+
 //! Build a GPT disk image from sysroot contents. The image contains three
 //! FAT partitions: an EFI System Partition (from sysroot/esp/), a Seraph
 //! root partition (from sysroot/), and a Seraph data partition (from

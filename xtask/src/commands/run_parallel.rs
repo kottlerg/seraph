@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-//! `commands/run_parallel.rs`
-//!
+// xtask/src/commands/run_parallel.rs
+
 //! Run-parallel command: launch N QEMU instances concurrently against an
 //! already-built sysroot, classifying each run's outcome via user-supplied
 //! pass/fail regexes. Intended for shaking out timing-dependent bugs that

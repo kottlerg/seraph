@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
+// services/svctest/src/phases/pwrmgr.rs
+
 //! pwrmgr service surface: cap-deny enforcement + terminal shutdown.
 
 use std::os::seraph::startup_info;

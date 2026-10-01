@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-//! qemu.rs
-//!
+// xtask/src/qemu.rs
+
 //! Shared QEMU argv construction and per-launch pflash cache for RISC-V.
 //!
 //! Both `run` and `run-parallel` produce QEMU command lines from the same

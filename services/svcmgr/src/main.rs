@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// svcmgr/src/main.rs
+// services/svcmgr/src/main.rs
 
 //! Seraph service manager — monitors services, detects crashes via a
 //! single shared death-notification event queue, and restarts them per

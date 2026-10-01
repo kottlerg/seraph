@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
+// core/ktest/src/stress/concurrent_notification.rs
+
 //! Stress test: concurrent notification send/wait races.
 //!
 //! `NUM_SENDERS` child threads simultaneously send distinct bit patterns

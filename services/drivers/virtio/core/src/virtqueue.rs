@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// drivers/virtio/core/src/virtqueue.rs
+// services/drivers/virtio/core/src/virtqueue.rs
 
 //! Split virtqueue implementation (`VirtIO` 1.2 §2.7).
 //!

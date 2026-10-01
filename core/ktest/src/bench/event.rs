@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
+// core/ktest/src/bench/event.rs
+
 //! Event-queue post/recv benchmark.
 
 use syscall::{cap_delete, event_post, event_queue_create, event_recv};

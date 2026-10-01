@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
+// services/svctest/src/runner.rs
+
 //! Phase registry and driver.
 //!
 //! Phases are ordered `fn(&Caps)` entries collected from each

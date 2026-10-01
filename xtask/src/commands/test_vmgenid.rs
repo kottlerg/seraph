@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// commands/test_vmgenid.rs
+// xtask/src/commands/test_vmgenid.rs
 
 //! VMGENID snapshot-resume test (#395). `x86_64` only — the `riscv64` `virt`
 //! machine has no VMGENID ACPI support in QEMU.

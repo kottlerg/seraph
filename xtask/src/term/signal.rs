@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-//! term/signal.rs
-//!
+// xtask/src/term/signal.rs
+
 //! Portable Ctrl+C / SIGINT handling for the xtask process.
 //!
 //! `install()` installs a no-op handler so that pressing Ctrl+C does

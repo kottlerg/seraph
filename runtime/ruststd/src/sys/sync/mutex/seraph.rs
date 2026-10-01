@@ -1,26 +1,29 @@
-// seraph-overlay: std::sys::sync::mutex::seraph
-//
-// Futex-style three-state Mutex backed by a lazily-allocated Notification cap.
-// Uncontended lock/unlock is a single CAS on `state`. Contention allocates
-// a Notification (once per Mutex, cached in `notification`) and blocks via
-// `SYS_NOTIFICATION_WAIT`; the releasing thread wakes one waiter via
-// `SYS_NOTIFICATION_SEND`. Matches the state machine of upstream
-// `sync/mutex/futex.rs` with one structural deviation.
-//
-// Seraph's Notification cap is a separately-allocated kernel object (unlike
-// upstream futex where the state atom address IS the wait key), so the
-// slot is populated lazily on first contention. The contender in
-// `lock_contended` installs the Notification cap BEFORE publishing `CONTENDED`
-// so that any concurrent `unlock` observing `CONTENDED` is guaranteed to
-// see a non-zero slot and deliver the wake. Skipping this step allowed
-// a lost-wakeup deadlock when the slot was populated after the unlock's
-// check — `threading_phase` intermittently parked one worker on a cap
-// nobody would ever notification.
-//
-// `swap` on `state` uses `AcqRel`: Release publishes the install (and
-// any critical-section stores on unlock); Acquire synchronizes with the
-// other side's Release so the subsequent `notification` load is guaranteed to
-// observe the install on weak-memory architectures (RVWMO).
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 2026 George Kottler <mail@kottlerg.com>
+
+// runtime/ruststd/src/sys/sync/mutex/seraph.rs
+
+//! Futex-style three-state Mutex backed by a lazily-allocated Notification cap.
+//! Uncontended lock/unlock is a single CAS on `state`. Contention allocates
+//! a Notification (once per Mutex, cached in `notification`) and blocks via
+//! `SYS_NOTIFICATION_WAIT`; the releasing thread wakes one waiter via
+//! `SYS_NOTIFICATION_SEND`. Matches the state machine of upstream
+//! `sync/mutex/futex.rs` with one structural deviation.
+//!
+//! Seraph's Notification cap is a separately-allocated kernel object (unlike
+//! upstream futex where the state atom address IS the wait key), so the
+//! slot is populated lazily on first contention. The contender in
+//! `lock_contended` installs the Notification cap BEFORE publishing `CONTENDED`
+//! so that any concurrent `unlock` observing `CONTENDED` is guaranteed to
+//! see a non-zero slot and deliver the wake. Skipping this step allowed
+//! a lost-wakeup deadlock when the slot was populated after the unlock's
+//! check — `threading_phase` intermittently parked one worker on a cap
+//! nobody would ever notification.
+//!
+//! `swap` on `state` uses `AcqRel`: Release publishes the install (and
+//! any critical-section stores on unlock); Acquire synchronizes with the
+//! other side's Release so the subsequent `notification` load is guaranteed to
+//! observe the install on weak-memory architectures (RVWMO).
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 

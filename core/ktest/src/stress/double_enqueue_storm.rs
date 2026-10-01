@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// ktest/src/stress/double_enqueue_storm.rs
+// core/ktest/src/stress/double_enqueue_storm.rs
 
 //! Stress: regression test for the run-queue double-link guard (issue #244).
 //!

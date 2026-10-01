@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
+// core/ktest/src/stress/fpu_migration_churn.rs
+
 //! Stress: FPU + scheduler-migration churn.
 //!
 //! Runs the cross-CPU FPU preservation pattern (`unit::fpu::

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// ktest/src/unit/cap_info.rs
+// core/ktest/src/unit/cap_info.rs
 
 //! Tier 1 tests for `SYS_CAP_INFO`.
 //!

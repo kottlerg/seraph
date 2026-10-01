@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// boot/src/arch/riscv64/dtb_kernel_mmio.rs
+// core/boot/src/arch/riscv64/dtb_kernel_mmio.rs
 
 //! RISC-V `kernel_mmio` extraction from the Flattened Device Tree.
 //!

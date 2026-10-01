@@ -40,7 +40,8 @@ migration effort). Decision: **per-TCB `sched_lock`** (this document's design).
 
 Evidence (audit adversarial per-design panel; `scored[]` totals out of 21):
 - `scored[0]` per-TCB `sched_lock`: **19** (correctness 7, simplicity 6, completeness 6).
-- `scored[3]` `running_on`+**defer**: **13** (correctness **4**, simplicity 3.5, completeness 5.5) — the lowest of all four designs.
+- `scored[3]` `running_on`+**defer**: **13** (correctness **4**, simplicity 3.5, completeness 5.5)
+  — the lowest of all four designs.
 - (`scored[1]` home_cpu+inbox 19.5, `scored[2]` park_claim epoch 19.5 — slightly
   higher panel scores but more bespoke/lock-free schemes that perpetuate the
   "subtle invariant easy to miss on a new transition" pattern that caused the

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// kernel/src/mm/paging.rs
+// core/kernel/src/mm/paging.rs
 
 //! Kernel page table initialization (Phase 3).
 //!
@@ -9,11 +9,17 @@
 //! - **Direct physical map** at [`direct_map_base`]: every 2 MiB chunk of RAM
 //!   is mapped R/W- via 2 MiB large pages, so any physical address is
 //!   accessible as `direct_map_base() + phys`.
-//! - **Kernel image** at `0xFFFF_FFFF_8000_0000+`: `.text` as R-X, `.rodata`
-//!   as R--, `.data`+`.bss` as RW- (W^X enforced per section).
+//! - **Kernel image** at `BootInfo::kernel_virtual_base`, a KASLR-randomized
+//!   base in the top 2 GiB (`0xFFFF_FFFF_8000_0000` is the no-entropy
+//!   fallback; see `docs/memory-model.md`): `.text` as R-X, `.rodata` as R--,
+//!   `.data`+`.bss` as RW- (W^X enforced per section).
 //!
 //! The boot stack's identity mapping is preserved so the CPU has a valid
-//! stack immediately after `activate`.
+//! stack immediately after `activate`. The framebuffer and arch kernel MMIO
+//! regions above the RAM ceiling (`max_phys_rounded`, the 2 MiB-rounded top of
+//! RAM-backed memory) get 4 KiB direct-map pages, and the AP trampoline page
+//! is identity-mapped until [`unmap_identity_page`] retires it after SMP
+//! bringup.
 //!
 //! ## Bootstrap pool
 //!

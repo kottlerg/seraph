@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// ktest/src/integration/mod.rs
+// core/ktest/src/integration/mod.rs
 
 //! Tier 2 — cross-subsystem integration tests.
 //!

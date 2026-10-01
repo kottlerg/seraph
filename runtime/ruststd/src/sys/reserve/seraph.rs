@@ -1,18 +1,22 @@
-// seraph-overlay: std::sys::reserve (seraph-only)
-//
-// Page-granular reservation allocator. Owns one fixed-size arena per
-// process, carved out at process start. Hands out unmapped contiguous VA
-// ranges; the caller is responsible for `mem_map` / `mem_unmap` against
-// owned Memory caps. The arena holds no Memory caps and issues no syscalls
-// — it is pure VA bookkeeping.
-//
-// Used for foreign Memory mappings: MMIO from devmgr, DMA buffers from
-// drivers, shmem backings, zero-copy file pages from fs drivers, ELF-load
-// scratch in procmgr. The byte heap (`#[global_allocator]`) is a
-// disjoint surface owned by `sys::alloc::seraph`.
-//
-// Concurrency: a single spin-lock guards the arena. The free-list is a
-// bounded sorted array; coalescing runs on every release.
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 2026 George Kottler <mail@kottlerg.com>
+
+// runtime/ruststd/src/sys/reserve/seraph.rs
+
+//! Page-granular reservation allocator. Owns one fixed-size arena per
+//! process, carved out on first use at a per-process randomised base (see
+//! `Arena::ensure_init`). Hands out unmapped contiguous VA ranges; the caller
+//! is responsible for `mem_map` / `mem_unmap` against owned Memory caps. The
+//! arena holds no Memory caps and, beyond the one `getrandom` base draw, issues
+//! no syscalls — it is pure VA bookkeeping.
+//!
+//! Used for foreign Memory mappings: MMIO from devmgr, DMA buffers from
+//! drivers, shmem backings, zero-copy file pages from fs drivers, ELF-load
+//! scratch in procmgr. The byte heap (`#[global_allocator]`) is a
+//! disjoint surface owned by `sys::alloc::seraph`.
+//!
+//! Concurrency: a single spin-lock guards the arena. The free-list is a
+//! bounded sorted array; coalescing runs on every release.
 
 use crate::cell::UnsafeCell;
 use crate::sync::atomic::{AtomicBool, Ordering};

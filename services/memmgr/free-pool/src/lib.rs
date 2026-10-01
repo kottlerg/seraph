@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// memmgr/free-pool/src/lib.rs
+// services/memmgr/free-pool/src/lib.rs
 
 //! Pure free-pool allocator and region-interval logic.
 //!

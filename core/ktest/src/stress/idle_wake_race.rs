@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// ktest/src/stress/idle_wake_race.rs
+// core/ktest/src/stress/idle_wake_race.rs
 
 //! Stress test: cross-CPU idle → wake race.
 //!

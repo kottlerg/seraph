@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// drivers/serial/src/arch/riscv64/mod.rs
+// services/drivers/serial/src/arch/riscv64/mod.rs
 
 //! RISC-V serial I/O via a memory-mapped NS16550 UART.
 //!

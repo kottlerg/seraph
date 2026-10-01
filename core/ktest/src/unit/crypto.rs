@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// ktest/src/unit/crypto.rs
+// core/ktest/src/unit/crypto.rs
 
 //! Tier 1 tests for the shared `crypto` crate (SHA-512, Ed25519 verify).
 //!

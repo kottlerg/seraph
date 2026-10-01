@@ -115,6 +115,10 @@ truth for "how work is tracked and shipped" on this project.
   requires none of the runs above (the CI gate builds and boots both
   architectures); the pre-merge review still applies, and the PR body MUST
   state the validated head and the documentation-only delta.
+- `cargo xtask lint-docs` MUST pass on every change, documentation-only
+  ones included (per [docs/conventions.md](../docs/conventions.md) § CI
+  Gating; CI's `host-tests` job runs it, per
+  [docs/build-system.md](../docs/build-system.md) § Continuous Integration).
 
 ## Completeness
 - Drift or defects found on the review surface, as

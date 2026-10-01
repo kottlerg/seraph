@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// kernel/src/arch/x86_64/timer.rs
+// core/kernel/src/arch/x86_64/timer.rs
 
 //! x86-64 preemption timer: TSC-deadline mode where the CPU advertises it
 //! (CPUID.01H:ECX[24]), otherwise the periodic local APIC timer.

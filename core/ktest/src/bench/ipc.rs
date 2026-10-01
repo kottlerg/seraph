@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
+// core/ktest/src/bench/ipc.rs
+
 //! Synchronous IPC round-trip benchmark.
 //!
 //! Spawns one child caller that loops `ipc_call`; parent loops

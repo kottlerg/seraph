@@ -2,7 +2,7 @@
  * SPDX-License-Identifier: GPL-2.0-only
  * Copyright (C) 2026 George Kottler <mail@kottlerg.com>
  *
- * boot/loader/linker/riscv64-uefi.ld
+ * core/boot/linker/riscv64-uefi.ld
  *
  * Linker script for the RISC-V UEFI bootloader. Produces an ELF that
  * llvm-objcopy converts to a flat PE32+ binary. The hand-crafted PE/COFF

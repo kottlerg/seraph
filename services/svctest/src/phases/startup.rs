@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
+// services/svctest/src/phases/startup.rs
+
 //! Process-startup surface (procmgr/kernel `_start`).
 //!
 //! Covers what every process inherits at entry: argv, env, stack

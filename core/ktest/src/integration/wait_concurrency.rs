@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// ktest/src/integration/wait_concurrency.rs
+// core/ktest/src/integration/wait_concurrency.rs
 
 //! Integration: wait set with concurrent notification and event queue sources.
 //!

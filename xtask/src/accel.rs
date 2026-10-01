@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-//! accel.rs
-//!
+// xtask/src/accel.rs
+
 //! Per-host QEMU acceleration-backend selection.
 //!
 //! `Accel` enumerates the same-architecture accelerators QEMU supports:

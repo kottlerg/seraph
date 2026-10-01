@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// kernel/src/sched/run_queue.rs
+// core/kernel/src/sched/run_queue.rs
 
 //! Per-CPU run queue and scheduler state.
 //!

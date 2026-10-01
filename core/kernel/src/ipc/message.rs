@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// kernel/src/ipc/message.rs
+// core/kernel/src/ipc/message.rs
 
 //! IPC message type — label + inline data words + capability slot indices.
 //!

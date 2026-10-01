@@ -31,6 +31,9 @@ jobs:
         with:
           shared-key: host-tests
 
+      - name: cargo xtask lint-docs
+        run: cargo xtask lint-docs
+
       - name: cargo xtask test
         run: cargo xtask test
 

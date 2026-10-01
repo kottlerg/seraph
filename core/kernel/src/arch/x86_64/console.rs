@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// kernel/src/arch/x86_64/console.rs
+// core/kernel/src/arch/x86_64/console.rs
 
 //! COM1 serial backend for x86-64 (UART 16550, I/O port 0x3F8, 115200 8N1).
 //!

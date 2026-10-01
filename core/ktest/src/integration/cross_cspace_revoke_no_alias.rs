@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// ktest/src/integration/cross_cspace_revoke_no_alias.rs
+// core/ktest/src/integration/cross_cspace_revoke_no_alias.rs
 
 //! Integration: a cross-`CSpace` `cap_revoke` must not let a recipient's stale
 //! handle alias a recycled slot (#349).

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// kernel/src/entropy/vmgenid.rs
+// core/kernel/src/entropy/vmgenid.rs
 
 //! VM Generation ID (VMGENID) snapshot-resume detector.
 //!

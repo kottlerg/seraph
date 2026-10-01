@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// ktest/src/acpi_shutdown.rs
+// core/ktest/src/acpi_shutdown.rs
 
 //! ACPI S5 (soft-off) shutdown for x86-64.
 //!

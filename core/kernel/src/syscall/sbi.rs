@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// kernel/src/syscall/sbi.rs
+// core/kernel/src/syscall/sbi.rs
 
 //! `SYS_SBI_CALL` (44): forward an SBI call to M-mode firmware.
 //!

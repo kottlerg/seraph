@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// ktest/src/integration/fault_exception_redirect.rs
+// core/ktest/src/integration/fault_exception_redirect.rs
 
 //! Integration: a non-page-fault CPU exception is redirected to a bound fault
 //! handler, which resumes the thread at a new instruction pointer.

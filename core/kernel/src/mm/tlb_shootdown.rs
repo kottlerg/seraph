@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
-// Copyright (C) 2026 Gregory Kottler <me@gregorykottler.com>
+// Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// kernel/src/mm/tlb_shootdown.rs
+// core/kernel/src/mm/tlb_shootdown.rs
 
 //! TLB shootdown protocol for cross-CPU page table invalidation.
 //!

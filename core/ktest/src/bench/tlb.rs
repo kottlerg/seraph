@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
+// core/ktest/src/bench/tlb.rs
+
 //! TLB-shootdown latency benchmark.
 //!
 //! Pre-spawns one worker thread per available CPU (besides ktest's

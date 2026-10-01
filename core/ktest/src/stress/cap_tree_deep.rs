@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
+// core/ktest/src/stress/cap_tree_deep.rs
+
 //! Stress test: deep capability derivation chains.
 //!
 //! Derives a chain 8 levels deep from a root notification, verifies each level

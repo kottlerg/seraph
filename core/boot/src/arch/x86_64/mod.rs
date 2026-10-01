@@ -11,9 +11,10 @@
 //! below 1 MiB ([`allocate_ap_trampoline`]); paging and handoff hooks
 //! ([`negotiate_paging`], [`default_direct_map_base`], re-exported
 //! [`BootPageTable`], [`perform_handoff`], [`trampoline_page_range`]);
-//! firmware MMIO population ([`populate_kernel_mmio`]); and the hooks that
-//! are no-ops or empty on x86-64 ([`pre_serial_init`], [`uart_mmio_region`],
-//! [`discover_boot_hart_id`], [`default_pci_apertures`]).
+//! firmware MMIO population ([`populate_kernel_mmio`]); and stubs, each
+//! stating why the concept does not apply on x86-64, for hooks such as
+//! [`pre_serial_init`], [`uart_mmio_region`], [`discover_boot_hart_id`], and
+//! [`default_pci_apertures`].
 //!
 //! Submodules: [`paging`] (4-level page tables), [`handoff`] (kernel entry
 //! transfer), [`serial`] (COM1 UART), [`acpi_kernel_mmio`] (LAPIC/IOAPIC

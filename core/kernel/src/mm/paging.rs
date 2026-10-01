@@ -16,9 +16,10 @@
 //!
 //! The boot stack's identity mapping is preserved so the CPU has a valid
 //! stack immediately after `activate`. The framebuffer and arch kernel MMIO
-//! regions above the direct-map ceiling get 4 KiB direct-map pages, and the
-//! AP trampoline page is identity-mapped until [`unmap_identity_page`]
-//! retires it after SMP bringup.
+//! regions above the RAM ceiling (`max_phys_rounded`, the 2 MiB-rounded top of
+//! RAM-backed memory) get 4 KiB direct-map pages, and the AP trampoline page
+//! is identity-mapped until [`unmap_identity_page`] retires it after SMP
+//! bringup.
 //!
 //! ## Bootstrap pool
 //!

@@ -230,7 +230,8 @@ struct Patterns
     link_only: Regex,
     /// A `(see <name>.md)` citation outside link syntax.
     bare_cite: Regex,
-    /// A Markdown inline link; group 1 is the target.
+    /// A Markdown inline link, including a badge whose text is an image; group 1
+    /// is the outer target.
     md_link: Regex,
 }
 
@@ -240,10 +241,10 @@ impl Patterns
     {
         Ok(Self {
             link_only: Regex::new(
-                r"^\s*(?:[-*]\s+|\d+\.\s+)?(?:\[!\[[^\]]*\]\([^)]*\)\]\([^)]*\)|\[[^\]]*\]\([^)]*\)|<?https?://\S+>?)[.,;:)]*\s*$",
+                r"^\s*(?:[-*+]\s+|\d+\.\s+)?(?:!?\[!?\[[^\]]*\]\([^)]*\)\]\([^)]*\)|!?\[[^\]]*\]\([^)]*\)|<?https?://\S+>?)[.,;:)]*\s*$",
             )?,
             bare_cite: Regex::new(r"\(see [A-Za-z0-9_./-]+\.md\)")?,
-            md_link: Regex::new(r"\[[^\]]*\]\(([^)\s]+)\)")?,
+            md_link: Regex::new(r"\[(?:!\[[^\]]*\]\([^)]*\)|[^\]]*)\]\(([^)\s]+)\)")?,
         })
     }
 }
@@ -435,21 +436,19 @@ fn header_violation(path: &str, text: &str) -> Option<(usize, String)>
                 "path line must be followed by a blank line".into(),
             ));
         }
-        let rest = &lines[path_idx + 2..];
-        let doc = rest.iter().position(|l| l.starts_with("//!"));
-        let attr = rest.iter().position(|l| l.starts_with("#!["));
-        match (doc, attr)
+        // The description opens the line after the blank.
+        match lines.get(path_idx + 2)
         {
-            (None, _) => return Some((path_idx + 3, "missing `//!` description".into())),
-            (Some(d), Some(a)) if a < d =>
+            Some(l) if l.starts_with("//!") =>
+            {}
+            Some(l) if l.starts_with("#![") =>
             {
                 return Some((
-                    path_idx + 3 + a,
+                    path_idx + 3,
                     "crate attribute precedes the `//!` block".into(),
                 ));
             }
-            _ =>
-            {}
+            _ => return Some((path_idx + 3, "missing `//!` description".into())),
         }
     }
     None
@@ -749,13 +748,54 @@ mod tests
     }
 
     #[test]
-    fn header_requires_path_line_first_after_license_and_blank_before_doc()
+    fn header_requires_path_line_first_after_license()
     {
         let late =
             "// SPDX-License-Identifier: GPL-2.0-only\n// (C)\n\n// note\n\n// a.rs\n\n//! Doc.\n";
         assert_eq!(header_violation("a.rs", late).map(|(l, _)| l), Some(4));
+    }
+
+    #[test]
+    fn header_requires_blank_line_then_doc_after_path_line()
+    {
         let adjacent = "// SPDX-License-Identifier: GPL-2.0-only\n// (C)\n\n// a.rs\n//! Doc.\n";
         assert_eq!(header_violation("a.rs", adjacent).map(|(l, _)| l), Some(5));
+        let note_first =
+            "// SPDX-License-Identifier: GPL-2.0-only\n// (C)\n\n// a.rs\n\n// note\n//! Doc.\n";
+        assert_eq!(
+            header_violation("a.rs", note_first).map(|(l, _)| l),
+            Some(6)
+        );
+    }
+
+    #[test]
+    fn header_rejects_missing_path_line()
+    {
+        let eof = "// SPDX-License-Identifier: GPL-2.0-only\n// (C)\n\n";
+        assert!(header_violation("a.rs", eof).is_some());
+    }
+
+    #[test]
+    fn front_matter_length_covers_absent_closed_and_unclosed_blocks()
+    {
+        assert_eq!(front_matter_len("# T\n"), 0);
+        assert_eq!(front_matter_len("---\nname: x\n---\n# T\n"), 3);
+        assert_eq!(front_matter_len("---\nname: x\n# T\n"), 0);
+    }
+
+    #[test]
+    fn image_only_and_plus_marked_link_lines_are_exempt()
+    {
+        let long = "x".repeat(101);
+        let text = format!("![a](https://e/{long})\n+ [t](x.md#{long})\n");
+        assert!(check_columns(&pat(), &md("a.md", &text)).is_empty());
+    }
+
+    #[test]
+    fn badge_links_resolve_to_their_outer_target()
+    {
+        let targets = link_targets(&pat(), "d/x.md", "[![b](https://img)](../a.md)\n");
+        assert_eq!(targets, BTreeSet::from(["a.md".to_owned()]));
     }
 
     #[test]

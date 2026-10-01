@@ -8,11 +8,11 @@
 //! (`GUARD_PAGES` below at least `DEFAULT_DEMAND_STACK_PAGES`; see
 //! `alloc_stack`); a non-demand-paged process, or a failed reservation, falls
 //! back to an eager page-aligned heap stack without a guard. Per-thread IPC
-//! buffers are page-aligned heap allocations. Join
-//! synchronises on a Notification cap; the child thread signals just before
-//! calling SYS_THREAD_EXIT, and join then reclaims the child's kernel object,
-//! caps, and heap/VA resources. A detached handle (dropped without join) hands
-//! its resources to the in-module `reaper`, which reclaims them once the child's
+//! buffers are page-aligned heap allocations. Join synchronises on a
+//! Notification cap; the child thread signals just before calling
+//! SYS_THREAD_EXIT, and join then reclaims the child's kernel object, caps, and
+//! heap/VA resources. A detached handle (dropped without join) hands its
+//! resources to the in-module `reaper`, which reclaims them once the child's
 //! kernel death notification lands (see the `reaper` module).
 //!
 //! Native ELF TLS is live: `SYS_THREAD_CONFIGURE` accepts `tls_base`, the

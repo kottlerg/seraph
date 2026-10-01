@@ -110,6 +110,9 @@ truth for "how work is tracked and shipped" on this project.
   run the local host runs defined there.
 - Host-side compilation, unit tests, and `cargo check` alone do not
   satisfy this requirement.
+- `cargo xtask lint-docs` MUST pass on every change (it runs in CI's
+  `host-tests` job, per [docs/build-system.md](../docs/build-system.md)
+  § Continuous Integration).
 - A documentation-only or comment-only change, as
   [docs/testing.md](../docs/testing.md) "Coverage tiers" defines it,
   requires none of the runs above (the CI gate builds and boots both

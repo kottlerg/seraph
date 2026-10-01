@@ -82,6 +82,12 @@ pub enum CliCommand
     /// staged and assert the deterministic layout. Requires a populated
     /// sysroot with the ktest bundle composed (see xtask/README.md).
     TestKaslr(TestKaslrArgs),
+
+    /// Check the mechanical documentation and source-header rules: Markdown
+    /// column limit, file-header layout, `## Summarized By` shape and forward
+    /// links, and document reachability from the root README. Runs in CI's
+    /// host-tests job; see xtask/README.md for the rule list and levels.
+    LintDocs(LintDocsArgs),
 }
 
 // ── Build ─────────────────────────────────────────────────────────────────────
@@ -425,3 +431,7 @@ pub struct RunParallelArgs
     pub fail_grace_secs: u64,
 }
 
+// ── LintDocs ──────────────────────────────────────────────────────────────────
+
+#[derive(Parser)]
+pub struct LintDocsArgs {}

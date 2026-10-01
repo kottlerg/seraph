@@ -34,6 +34,9 @@ jobs:
       - name: cargo xtask test
         run: cargo xtask test
 
+      - name: cargo xtask lint-docs
+        run: cargo xtask lint-docs
+
   validate:
     runs-on: ubuntu-latest
     strategy:

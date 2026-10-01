@@ -76,6 +76,7 @@ fn main()
         CliCommand::TestTerminal(args) => commands::test_terminal::run(&ctx, args),
         CliCommand::TestVmgenid(args) => commands::test_vmgenid::run(&ctx, args),
         CliCommand::TestKaslr(args) => commands::test_kaslr::run(&ctx, args),
+        CliCommand::LintDocs(args) => commands::lint_docs::run(&ctx, args),
     };
 
     if let Err(err) = result

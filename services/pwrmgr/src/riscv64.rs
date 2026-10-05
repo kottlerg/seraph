@@ -18,7 +18,7 @@ use ipc::devmgr_labels;
 const SBI_EXT_SRST: u64 = 0x5352_5354; // "SRST" in ASCII.
 const SBI_SRST_RESET: u64 = 0; // function 0: system_reset
 const SRST_TYPE_SHUTDOWN: u64 = 0;
-const SRST_TYPE_COLD_REBOOT: u64 = 2;
+const SRST_TYPE_COLD_REBOOT: u64 = 1;
 const SRST_REASON_NONE: u64 = 0;
 
 /// Resolved shutdown actuation state: a `cap_derive` copy of devmgr's

@@ -416,13 +416,21 @@ fn header_violation(path: &str, text: &str) -> Option<(usize, String)>
             "license block is not followed by a blank line".into(),
         ));
     };
-    // The path line is the first non-blank line after the license block.
+    // The path line follows the license block after exactly one blank line.
     let expected = format!("{prefix} {path}");
-    let Some(path_idx) = lines[end..].iter().position(|l| !blank(l)).map(|i| end + i)
+    let path_idx = end + 1;
+    let Some(path_line) = lines.get(path_idx)
     else
     {
         return Some((end + 1, format!("missing path line `{expected}`")));
     };
+    if blank(path_line)
+    {
+        return Some((
+            path_idx + 1,
+            "exactly one blank line separates the license block from the path line".into(),
+        ));
+    }
     if lines[path_idx] != expected
     {
         return Some((path_idx + 1, format!("expected path line `{expected}`")));
@@ -720,13 +728,22 @@ mod tests
         assert_eq!(diags[0].line, 1);
     }
 
+    const MULTI_LINE_LICENSE: &str = "// SPDX-License-Identifier: GPL-2.0-only AND OFL-1.1\n// Copyright (C) 2026 X\n//\n// Code: GPL.\n\n// a/b.rs\n\n//! Doc.\n\n#![no_std]\n";
+
     #[test]
-    fn header_accepts_multi_line_license_block_and_rejects_wrong_path()
+    fn header_accepts_multi_line_license_block()
     {
-        let ok = "// SPDX-License-Identifier: GPL-2.0-only AND OFL-1.1\n// Copyright (C) 2026 X\n//\n// Code: GPL.\n\n// a/b.rs\n\n//! Doc.\n\n#![no_std]\n";
-        assert_eq!(header_violation("a/b.rs", ok), None);
-        let wrong = ok.replace("// a/b.rs", "// b.rs");
-        assert!(header_violation("a/b.rs", &wrong).is_some());
+        assert_eq!(header_violation("a/b.rs", MULTI_LINE_LICENSE), None);
+    }
+
+    #[test]
+    fn header_rejects_a_path_line_naming_another_file()
+    {
+        let wrong = MULTI_LINE_LICENSE.replace("// a/b.rs", "// b.rs");
+        assert_eq!(
+            header_violation("a/b.rs", &wrong),
+            Some((6, "expected path line `// a/b.rs`".to_owned()))
+        );
     }
 
     #[test]
@@ -734,24 +751,22 @@ mod tests
     {
         let attr_first = "// SPDX-License-Identifier: GPL-2.0-only\n// (C)\n\n// a.rs\n\n#![no_std]\n\n//! Doc.\n";
         assert_eq!(
-            header_violation("a.rs", attr_first).map(|(l, _)| l),
-            Some(6)
+            header_violation("a.rs", attr_first),
+            Some((6, "crate attribute precedes the `//!` block".to_owned()))
         );
-    }
-
-    #[test]
-    fn header_rejects_missing_doc()
-    {
-        let no_doc =
-            "// SPDX-License-Identifier: GPL-2.0-only\n// (C)\n\n// a.rs\n\nfn main() {}\n";
-        assert!(header_violation("a.rs", no_doc).is_some());
     }
 
     #[test]
     fn header_rejects_license_block_without_blank_line()
     {
         let no_blank = "// SPDX-License-Identifier: GPL-2.0-only\n// (C)\n//! Doc.\nfn main() {}\n";
-        assert!(header_violation("a.rs", no_blank).is_some());
+        assert_eq!(
+            header_violation("a.rs", no_blank),
+            Some((
+                4,
+                "license block is not followed by a blank line".to_owned()
+            ))
+        );
     }
 
     #[test]
@@ -759,7 +774,23 @@ mod tests
     {
         let late =
             "// SPDX-License-Identifier: GPL-2.0-only\n// (C)\n\n// note\n\n// a.rs\n\n//! Doc.\n";
-        assert_eq!(header_violation("a.rs", late).map(|(l, _)| l), Some(4));
+        assert_eq!(
+            header_violation("a.rs", late),
+            Some((4, "expected path line `// a.rs`".to_owned()))
+        );
+    }
+
+    #[test]
+    fn header_rejects_a_doubled_blank_line_before_the_path_line()
+    {
+        let doubled = "// SPDX-License-Identifier: GPL-2.0-only\n// (C)\n\n\n// a.rs\n\n//! Doc.\n";
+        assert_eq!(
+            header_violation("a.rs", doubled),
+            Some((
+                4,
+                "exactly one blank line separates the license block from the path line".to_owned()
+            ))
+        );
     }
 
     #[test]

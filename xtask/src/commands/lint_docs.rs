@@ -474,24 +474,58 @@ fn header_violation(path: &str, text: &str) -> Option<(usize, String)>
 
 // ── md-summarized-by, md-backlink-forward ────────────────────────────────────
 
-/// Link targets in `text` outside fenced code, resolved to repository-relative
-/// paths. External and in-page links are skipped, and a link whose `..` climbs
-/// past the repository root resolves to nothing and is omitted; callers that must
-/// report such links resolve them with [`normalize`] themselves.
+/// Prose paragraphs of `text` outside fenced code: each maximal run of
+/// consecutive non-blank prose lines joined with single spaces, so a link whose
+/// text wraps across lines is matched whole.
+fn prose_paragraphs(text: &str) -> Vec<String>
+{
+    let mut paragraphs: Vec<String> = Vec::new();
+    let mut last: Option<usize> = None;
+    for (idx, line) in prose_lines(text)
+    {
+        if line.trim().is_empty()
+        {
+            last = None;
+            continue;
+        }
+        match (last, paragraphs.last_mut())
+        {
+            (Some(prev), Some(paragraph)) if prev + 1 == idx =>
+            {
+                paragraph.push(' ');
+                paragraph.push_str(line.trim());
+            }
+            _ => paragraphs.push(line.trim().to_owned()),
+        }
+        last = Some(idx);
+    }
+    paragraphs
+}
+
+/// A link target resolved against `dir`, the directory of the document holding
+/// it: `None` for an external URL, an in-page anchor, or a `..` that climbs past
+/// the repository root.
+fn resolve_link(dir: &Path, raw: &str) -> Option<String>
+{
+    let target = raw.split('#').next().unwrap_or("");
+    if target.is_empty() || target.contains("://") || target.starts_with("mailto:")
+    {
+        return None;
+    }
+    normalize(&dir.join(target))
+}
+
+/// Link targets in `text` outside fenced code that [`resolve_link`] resolves to
+/// repository-relative paths; the rest are omitted.
 fn link_targets(pat: &Patterns, path: &str, text: &str) -> BTreeSet<String>
 {
     let dir = Path::new(path).parent().unwrap_or_else(|| Path::new(""));
     let mut out = BTreeSet::new();
-    for (_, line) in prose_lines(text)
+    for paragraph in prose_paragraphs(text)
     {
-        for cap in pat.md_link.captures_iter(line)
+        for cap in pat.md_link.captures_iter(&paragraph)
         {
-            let target = cap[1].split('#').next().unwrap_or("");
-            if target.is_empty() || target.contains("://") || target.starts_with("mailto:")
-            {
-                continue;
-            }
-            if let Some(resolved) = normalize(&dir.join(target))
+            if let Some(resolved) = resolve_link(dir, &cap[1])
             {
                 out.insert(resolved);
             }
@@ -521,14 +555,13 @@ fn normalize(path: &Path) -> Option<String>
     Some(parts.join("/"))
 }
 
-/// The `## Summarized By` section of an authoritative document: `None` when
-/// the section is missing or malformed (the violation is reported separately),
-/// else the resolved entry paths.
-fn summarized_by(
-    pat: &Patterns,
-    path: &str,
-    text: &str,
-) -> std::result::Result<BTreeSet<String>, (usize, String)>
+/// A section violation: the 1-based line it anchors to and the message.
+type Violation = (usize, String);
+
+/// The body of the document's `## Summarized By` section, joined into one line,
+/// with the heading's 1-based line number; `Err` when the section is missing,
+/// does not follow a `---` separator, or is not the last section.
+fn summarized_by_section(text: &str) -> std::result::Result<(usize, String), Violation>
 {
     let lines: Vec<(usize, &str)> = prose_lines(text).collect();
     let heading = lines
@@ -538,17 +571,16 @@ fn summarized_by(
             text.lines().count(),
             "missing `## Summarized By` section".to_owned(),
         ))?;
-    let (heading_line, _) = lines[heading];
-    let before: Vec<&str> = lines[..heading]
+    let line = lines[heading].0 + 1;
+    let before = lines[..heading]
         .iter()
         .rev()
         .map(|(_, l)| *l)
-        .filter(|l| !l.trim().is_empty())
-        .collect();
-    if before.first().copied() != Some("---")
+        .find(|l| !l.trim().is_empty());
+    if before != Some("---")
     {
         return Err((
-            heading_line + 1,
+            line,
             "`## Summarized By` must follow a `---` separator".into(),
         ));
     }
@@ -559,52 +591,61 @@ fn summarized_by(
         .collect();
     if body.iter().any(|l| l.starts_with('#'))
     {
-        return Err((
-            heading_line + 1,
-            "`## Summarized By` must be the last section".into(),
-        ));
+        return Err((line, "`## Summarized By` must be the last section".into()));
     }
-    let joined = body.join(" ");
-    if joined.trim() == "None"
+    Ok((line, body.join(" ")))
+}
+
+/// The entries of the document's `## Summarized By` section, resolved to
+/// repository-relative paths; empty for `None`. `Err` describes the first
+/// violation: a missing or misplaced section, a body holding neither links nor
+/// `None`, text other than links, or an entry [`resolve_link`] cannot resolve.
+fn summarized_by(
+    pat: &Patterns,
+    path: &str,
+    text: &str,
+) -> std::result::Result<BTreeSet<String>, Violation>
+{
+    let (line, body) = summarized_by_section(text)?;
+    let body = body.trim();
+    if body == "None"
     {
         return Ok(BTreeSet::new());
     }
-    let stripped = pat.md_link.replace_all(&joined, "").replace(',', "");
-    if !stripped.trim().is_empty()
+    if pat.md_link.find(body).is_none()
     {
         return Err((
-            heading_line + 1,
+            line,
+            "`## Summarized By` holds neither links nor `None`".into(),
+        ));
+    }
+    if !pat
+        .md_link
+        .replace_all(body, "")
+        .replace(',', "")
+        .trim()
+        .is_empty()
+    {
+        return Err((
+            line,
             "`## Summarized By` holds text other than links or `None`".into(),
         ));
     }
-    // Every entry must resolve to a repository document: an external,
-    // in-page-only, or root-escaping entry is malformed.
     let dir = Path::new(path).parent().unwrap_or_else(|| Path::new(""));
-    let mut entries = BTreeSet::new();
-    for cap in pat.md_link.captures_iter(&joined)
-    {
-        let raw = &cap[1];
-        let target = raw.split('#').next().unwrap_or("");
-        let resolved =
-            if target.is_empty() || target.contains("://") || target.starts_with("mailto:")
-            {
-                None
-            }
-            else
-            {
-                normalize(&dir.join(target))
-            };
-        let Some(resolved) = resolved
-        else
-        {
-            return Err((
-                heading_line + 1,
-                format!("Summarized By entry `{raw}` does not resolve to a repository document"),
-            ));
-        };
-        entries.insert(resolved);
-    }
-    Ok(entries)
+    pat.md_link
+        .captures_iter(body)
+        .map(|cap| {
+            resolve_link(dir, &cap[1]).ok_or_else(|| {
+                (
+                    line,
+                    format!(
+                        "Summarized By entry `{}` does not resolve to a repository document",
+                        &cap[1]
+                    ),
+                )
+            })
+        })
+        .collect()
 }
 
 fn check_summarized_by(pat: &Patterns, markdown: &[&SourceFile]) -> Vec<Diagnostic>
@@ -1038,5 +1079,33 @@ mod tests
         let text = "```x``` (see a.md)\n(see b.md)\n";
         let diags = check_bare_cites(&pat(), &md("a.md", text));
         assert_eq!(diags.iter().map(|d| d.line).collect::<Vec<_>>(), vec![1, 2]);
+    }
+
+    #[test]
+    fn summarized_by_rejects_a_section_with_neither_links_nor_none()
+    {
+        for body in ["", ", ,"]
+        {
+            let text = format!("# T\n\n---\n\n## Summarized By\n\n{body}\n");
+            assert_eq!(
+                summarized_by(&pat(), "docs/a.md", &text),
+                Err((
+                    5,
+                    "`## Summarized By` holds neither links nor `None`".to_owned()
+                )),
+                "{body:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_link_whose_text_wraps_across_lines_is_found()
+    {
+        let targets = link_targets(
+            &pat(),
+            "docs/a.md",
+            "See [the\nother doc](b.md).\n\n```\n[c](c.md)\n```\n",
+        );
+        assert_eq!(targets, BTreeSet::from(["docs/b.md".to_owned()]));
     }
 }

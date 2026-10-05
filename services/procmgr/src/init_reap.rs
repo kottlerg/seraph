@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
+// services/procmgr/src/init_reap.rs
+
 //! Init reap-handoff: receives init's own kernel-object caps and
 //! reclaimable Memory caps in the post-Phase-3 exit IPCs, binds death-EQ
 //! observers on both init threads (main + init-logd), and once both have

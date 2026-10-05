@@ -8,9 +8,13 @@ capabilities delegated by devmgr.
 ## Source Layout
 
 ```
-drivers/
+services/drivers/
 ├── README.md
 ├── cmos/                           # x86-64 CMOS / MC146818 RTC driver (binary)
+│   ├── Cargo.toml
+│   ├── README.md
+│   └── src/
+│       └── main.rs
 ├── framebuffer/                    # Linear-framebuffer text driver (binary)
 │   ├── Cargo.toml
 │   ├── README.md                   # Framebuffer IPC interface (FB_WRITE_BYTES, FB_SET_ATTRS)
@@ -19,23 +23,41 @@ drivers/
 │       ├── render.rs               # 9×20 bitmap glyph blit + cursor + scroll
 │       └── arch/                   # Per-arch MMIO mapping (x86_64 / riscv64)
 ├── goldfish-rtc/                   # RISC-V Goldfish RTC driver (binary)
+│   ├── Cargo.toml
+│   ├── README.md
+│   └── src/
+│       └── main.rs
 ├── serial/                         # Serial (UART) device driver (binary)
 │   ├── Cargo.toml
 │   ├── README.md                   # Serial-driver IPC interface (SERIAL_WRITE_BYTES)
 │   └── src/
 │       ├── main.rs
 │       └── arch/                   # Per-arch UART access (x86_64 COM1, riscv64 NS16550)
+├── test-orphan/                    # Test-only fault-injection driver for devmgr (binary)
+│   ├── Cargo.toml
+│   └── src/
+│       └── main.rs
 ├── virtio/
 │   ├── core/                       # Shared VirtIO transport and queue primitives (library)
 │   │   ├── Cargo.toml
 │   │   └── src/
-│   │       └── lib.rs
-│   └── blk/                        # VirtIO block device driver (binary)
+│   │       ├── lib.rs
+│   │       ├── pci.rs              # Modern PCI transport register access
+│   │       └── virtqueue.rs        # Split virtqueue rings and descriptors
+│   ├── blk/                        # VirtIO block device driver (binary)
+│   │   ├── Cargo.toml
+│   │   ├── README.md               # Block-driver IPC interface
+│   │   │                           #   (BLK_READ_INTO_MEMORY, REGISTER_PARTITION)
+│   │   └── src/
+│   │       ├── main.rs
+│   │       └── io.rs
+│   └── input/                      # VirtIO input (keyboard) device driver (binary)
 │       ├── Cargo.toml
-│       ├── README.md               # Block-driver IPC interface (BLK_READ_INTO_MEMORY, REGISTER_PARTITION)
+│       ├── README.md               # Input-driver IPC interface (INPUT_READ_EVENTS)
 │       └── src/
 │           ├── main.rs
-│           └── io.rs
+│           ├── input.rs            # Event virtqueue receive-buffer ring
+│           └── decode.rs           # Keycode → keysym tables + modifier state
 └── docs/
     ├── driver-model.md             # Driver lifecycle and capability delegation
     └── virtio-architecture.md      # VirtIO transport abstraction and queue internals
@@ -75,10 +97,12 @@ holds ambient hardware authority. The full driver lifecycle is specified in
 |---|---|---|
 | `virtio/core/` | Library | Shared VirtIO transport primitives: device initialisation, virtqueue setup, descriptor chain management |
 | [`virtio/blk/`](virtio/blk/README.md) | Binary | VirtIO block device driver — exposes per-request DMA block-read IPC endpoint |
+| [`virtio/input/`](virtio/input/README.md) | Binary | VirtIO input (keyboard) device driver — decodes `EV_KEY` events into keysyms; answers `INPUT_READ_EVENTS` behind devmgr's `QUERY_INPUT_DEVICE` |
 | [`serial/`](serial/README.md) | Binary | Serial (UART) device driver — COM1 (x86-64) / NS16550 (RISC-V); sole driver-mediated serial-byte sink |
 | [`framebuffer/`](framebuffer/README.md) | Binary | Linear framebuffer text driver — owns the GOP framebuffer MMIO; sole driver-mediated framebuffer-byte sink |
 | [`cmos/`](cmos/README.md) | Binary | x86-64 CMOS / MC146818 RTC driver — devmgr-spawned; answers `RTC_GET_EPOCH_TIME` behind devmgr's `QUERY_RTC_DEVICE` |
 | [`goldfish-rtc/`](goldfish-rtc/README.md) | Binary | RISC-V Goldfish RTC driver — devmgr-spawned; answers `RTC_GET_EPOCH_TIME` behind devmgr's `QUERY_RTC_DEVICE` |
+| `test-orphan/` | Binary | Test-only fault-injection driver — forces a mid-bootstrap spawn failure so svctest exercises devmgr's orphan-teardown path |
 
 ---
 
@@ -101,6 +125,8 @@ holds ambient hardware authority. The full driver lifecycle is specified in
 
 | Document | Content |
 |---|---|
+| [docs/driver-model.md](docs/driver-model.md) | Driver lifecycle and capability delegation |
+| [docs/virtio-architecture.md](docs/virtio-architecture.md) | VirtIO transport abstraction and queue internals |
 | [docs/device-management.md](../../docs/device-management.md) | Driver lifecycle, DMA safety, security boundary |
 | [docs/ipc-design.md](../../docs/ipc-design.md) | IPC semantics, endpoints, message format |
 | [docs/capability-model.md](../../docs/capability-model.md) | Capability types, rights, delegation |

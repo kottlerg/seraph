@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// pwrmgr/src/riscv64.rs
+// services/pwrmgr/src/riscv64.rs
 
 //! RISC-V platform shutdown and reboot via the SBI SRST extension.
 //!

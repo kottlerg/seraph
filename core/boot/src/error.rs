@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// boot/src/error.rs
+// core/boot/src/error.rs
 
 //! Bootloader error type.
 //!

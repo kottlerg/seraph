@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// vfsd/src/role_guids.rs
+// services/vfsd/src/role_guids.rs
 
-//! Compile-time selection of the Seraph root partition GPT type-GUID.
+//! vfsd's GPT partition type-GUID table: the Seraph root GUID, selected at
+//! compile time for the target arch, plus the ESP and Seraph data GUIDs.
 //!
 //! [`boot_protocol::role_guids`] mints both arch-specific root GUIDs.
 //! vfsd is compiled for exactly one arch, so the constant resolves

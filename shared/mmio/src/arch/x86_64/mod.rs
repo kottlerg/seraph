@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// shared/mmio/src/arch/x86_64.rs
+// shared/mmio/src/arch/x86_64/mod.rs
 
 //! `x86_64` MMIO ordering barriers.
 //!

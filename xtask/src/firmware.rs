@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-//! firmware.rs
-//!
+// xtask/src/firmware.rs
+
 //! Host-side discovery of QEMU pflash firmware images.
 //!
 //! Two firmware surfaces are needed by the launch flow:

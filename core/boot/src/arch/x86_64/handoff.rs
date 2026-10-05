@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// boot/src/arch/x86_64/handoff.rs
+// core/boot/src/arch/x86_64/handoff.rs
 
 //! Kernel handoff for x86-64.
 //!

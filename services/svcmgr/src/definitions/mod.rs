@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// svcmgr/src/definitions/mod.rs
+// services/svcmgr/src/definitions/mod.rs
 
 //! On-disk service definitions.
 //!

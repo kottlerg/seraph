@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// ktest/src/unit/fpu.rs
+// core/ktest/src/unit/fpu.rs
 
 //! Tier 1 test for extended-state (FPU / SIMD / V) isolation across
 //! preemption.

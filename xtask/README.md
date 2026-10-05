@@ -388,6 +388,38 @@ See [docs/testing.md](../docs/testing.md) for the harness model and
 
 ---
 
+### `cargo xtask lint-docs`
+
+Check the mechanical documentation and source-header rules. Runs in CI's
+`host-tests` job.
+
+```
+cargo xtask lint-docs
+```
+
+Each violation prints as `<level> <rule>: <path>:<line>: <message>`; any
+error-level diagnostic fails the command. The rules check what a script can
+decide; whether a passage is a summary, or a statement matches the code, is
+the pre-merge review's.
+
+| Rule | Level | Check |
+|---|---|---|
+| `md-columns` | error | Every line of a tracked `.md` fits the column limit in [docs/coding-standards.md](../docs/coding-standards.md) § Markdown, with the exemptions that section lists (table rows; single link, image, badge, or URL constructs; YAML front matter). |
+| `src-header` | error | Every tracked `.rs`, `.ld`, `.S`, `.sh`: the SPDX line first (after a shebang in `.sh`; on line 2, after `/*`, in a block-comment `.ld`); exactly one blank line, then the path line; for Rust, exactly one blank line, then the `//!` block before any `#![` attribute, per § File Headers. |
+| `md-summarized-by` | error | Every authoritative document ends with `---` and a `## Summarized By` section holding `None` or a non-empty list of links, each resolving to a path inside the repository (no external URL, in-page-only anchor, or `..` past the root), per [docs/documentation-standards.md](../docs/documentation-standards.md) § Backlinks and Change Propagation. |
+| `md-backlink-forward` | warning | Every `## Summarized By` entry names a tracked document that links this one. |
+| `md-reachable` | warning | Every authoritative document is reachable by links from the root `README.md`; each component README links every document in its own `docs/`. |
+| `md-bare-cite` | warning | A `(see <name>.md)` citation outside link syntax. |
+
+The lint treats as authoritative every tracked `.md` except the root `README.md`, `.claude/`,
+`.github/`, and the per-tag release notes and template under `docs/releases/`: the documents
+[docs/documentation-standards.md](../docs/documentation-standards.md) § Document Hierarchy
+defines, with the release-notes exception of § Backlinks and Change Propagation. Warning-level
+rules are reported and counted but do not fail the command; they become errors as Issue #438's
+audit lands.
+
+---
+
 ## Sub-crates
 
 | Sub-crate | Purpose |

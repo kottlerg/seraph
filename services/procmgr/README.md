@@ -19,7 +19,8 @@ from memmgr, not from a procmgr-owned pool.
 procmgr/
 ├── Cargo.toml                  # Workspace member; std-using binary
 ├── README.md
-├── process-table/              # `procmgr-process-table` crate: pure host-tested table + badge logic
+├── process-table/              # `procmgr-process-table` crate:
+│                                 pure host-tested table + badge logic
 ├── src/
 │   ├── main.rs                 # _start() entry point, IPC dispatch loop
 │   ├── loader.rs               # ELF load pipeline
@@ -189,4 +190,5 @@ only case where a process is created without going through procmgr.
 
 ## Summarized By
 
-[Architecture Overview](../../docs/architecture.md), [Process Lifecycle](../../docs/process-lifecycle.md)
+[Architecture Overview](../../docs/architecture.md),
+[Process Lifecycle](../../docs/process-lifecycle.md)

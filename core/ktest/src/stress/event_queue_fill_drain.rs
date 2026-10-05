@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
+// core/ktest/src/stress/event_queue_fill_drain.rs
+
 //! Stress test: event queue fill/drain cycles.
 //!
 //! Fills a capacity-8 event queue to capacity, verifies overflow error,

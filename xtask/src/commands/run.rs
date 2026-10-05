@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-//! commands/run.rs
-//!
+// xtask/src/commands/run.rs
+
 //! Run command: launch Seraph under QEMU against an already-built sysroot.
 //!
 //! `run` is a pure runner. It does not invoke the build pipeline; the

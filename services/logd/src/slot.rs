@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// logd/src/slot.rs
+// services/logd/src/slot.rs
 
 //! Per-sender state: display name, partial-line buffer, and the bounded
 //! history ring of completed lines retained for future query/disk/syslog

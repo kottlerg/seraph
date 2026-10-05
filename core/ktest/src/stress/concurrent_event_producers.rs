@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
+// core/ktest/src/stress/concurrent_event_producers.rs
+
 //! Stress: many concurrent producers on one event queue.
 //!
 //! Existing `stress/event_queue_fill_drain.rs` is single-threaded

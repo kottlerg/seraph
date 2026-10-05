@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
+// core/ktest/src/integration/shared_memory_two_aspaces.rs
+
 //! Integration: a single Memory cap is mappable into two distinct address
 //! spaces and the kernel reports the same physical backing in both.
 //!

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// ktest/src/integration/multi_caller_ipc_fifo.rs
+// core/ktest/src/integration/multi_caller_ipc_fifo.rs
 
 //! Integration: endpoint send-queue FIFO ordering with three concurrent callers.
 //!

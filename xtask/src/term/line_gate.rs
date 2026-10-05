@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-//! `term/line_gate.rs`
-//!
+// xtask/src/term/line_gate.rs
+
 //! Line-level marker gate for QEMU output.
 //!
 //! `LineGate` is a `Write` adapter that buffers incoming bytes line by

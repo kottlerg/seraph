@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// kernel/src/entropy/keccak.rs
+// core/kernel/src/entropy/keccak.rs
 
 //! Keccak-f[1600] permutation (FIPS 202).
 //!

@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// boot/src/acpi.rs
+// core/boot/src/acpi.rs
 
-//! Minimal ACPI table parser: RSDP → XSDT → MADT, MCFG.
+//! Minimal ACPI table parser: RSDP → XSDT → MADT, MCFG, RHCT, SSDT (VMGENID).
 //!
 //! Reads tables in-place from identity-mapped physical memory. No allocation.
 //! Architecture-neutral: runs on any platform where `acpi_rsdp != 0`, which
@@ -20,6 +20,8 @@
 //!   seeds fed into [`super::memory_map::derive_mmio_apertures`].
 //! - [`parse_hart_caps`]: RHCT walk (RISC-V, ACPI 6.5+) producing the
 //!   `time` CSR frequency and the `HART_CAP_*` bits every hart advertises.
+//! - [`parse_vmgenid_paddr`]: SSDT walk (QEMU VMGENID) producing the
+//!   physical address of the 16-byte VM Generation ID GUID, or `0`.
 //!
 //! Arch-specific `kernel_mmio` extractors (LAPIC+IOAPIC on x86-64;
 //! PLIC+UART on RISC-V) consume the byte helpers and layout constants

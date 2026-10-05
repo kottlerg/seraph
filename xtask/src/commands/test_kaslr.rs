@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// commands/test_kaslr.rs
+// xtask/src/commands/test_kaslr.rs
 
 //! KASLR randomization test (#252). Both arches.
 //!

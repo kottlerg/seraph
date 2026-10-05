@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
+// core/ktest/src/bench/mm.rs
+
 //! Memory-management benchmarks: map/unmap, protect.
 
 use super::{cycles_now, log_bench_header};

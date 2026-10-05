@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// drivers/test-orphan/src/main.rs
+// services/drivers/test-orphan/src/main.rs
 
 //! Test-only fault-injection driver for devmgr's spawn-orphan unwind (#176).
 //!

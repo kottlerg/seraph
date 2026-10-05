@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// kernel/src/syscall/hw.rs
+// core/kernel/src/syscall/hw.rs
 
 //! Hardware access syscall handlers.
 //!

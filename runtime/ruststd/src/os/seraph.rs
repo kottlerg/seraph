@@ -1,20 +1,23 @@
-// seraph-overlay: std::os::seraph
-//
-// Seraph-specific public surface. Lives under `std::os::seraph` so service
-// code written against std can reach the platform primitives:
-//
-//   * `_start` — the ELF entry symbol exported for std-built binaries; reads
-//     `ProcessInfo` at the well-known VA, registers the IPC buffer, wires
-//     stdio caps, bootstraps the heap, then jumps to the rustc-synthesised
-//     `extern "C" fn main` which calls `std::rt::lang_start` and in turn the
-//     user's idiomatic `fn main`. When `main` returns, exits the process via
-//     `process_exit`, forwarding its code.
-//   * `startup_info()` / `try_startup_info()` — accessors for the
-//     `StartupInfo` stashed by `_start`. Services use these to obtain their
-//     initial caps.
-//   * `heap_bootstrap` / `heap_is_initialized` — allocator bring-up against
-//     procmgr.
-//   * `abort_thread` — placeholder thread terminator.
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 2026 George Kottler <mail@kottlerg.com>
+
+// runtime/ruststd/src/os/seraph.rs
+
+//! Seraph-specific public surface. Lives under `std::os::seraph` so service
+//! code written against std can reach the platform primitives:
+//!
+//!   * `_start` — the ELF entry symbol exported for std-built binaries; reads
+//!     `ProcessInfo` at the VA delivered in the entry register, registers the
+//!     IPC buffer, wires stdio caps, bootstraps the heap, then jumps to the
+//!     rustc-synthesised `extern "C" fn main` which calls `std::rt::lang_start`
+//!     and in turn the user's idiomatic `fn main`. When `main` returns, exits
+//!     the process via `process_exit`, forwarding its code.
+//!   * `startup_info()` / `try_startup_info()` — accessors for the
+//!     `StartupInfo` stashed by `_start`. Services use these to obtain their
+//!     initial caps.
+//!   * `heap_bootstrap` / `heap_is_initialized` — allocator bring-up against
+//!     procmgr.
+//!   * `abort_thread` — placeholder thread terminator.
 
 // std requires every public item to carry a stability attribute. Everything
 // in `std::os::seraph` is specific to this target and not promoted through

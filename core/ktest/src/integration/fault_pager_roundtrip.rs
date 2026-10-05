@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// ktest/src/integration/fault_pager_roundtrip.rs
+// core/ktest/src/integration/fault_pager_roundtrip.rs
 
 //! Integration: a userspace pager resolves a page fault and resumes the thread.
 //!

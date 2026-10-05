@@ -55,6 +55,7 @@ cargo xtask compose-bundle --harness ktest   # swap boot bundle to ktest harness
 cargo xtask run                              # launch existing sysroot under QEMU
 cargo xtask run --gdb                        # pause at start; GDB on :1234
 cargo xtask test                             # run host-side workspace tests
+cargo xtask lint-docs                        # check docs and source-header rules
 cargo xtask clean [--all]                    # remove sysroot/ (and target/ with --all)
 ```
 
@@ -86,8 +87,8 @@ Overall project design documents live in [`docs/`](docs/):
   GPT role-GUID discovery; mount lifecycle
 - [Device Management](docs/device-management.md) — platform enumeration, devmgr,
   driver binding, DMA safety
-- [Platform Requirements](docs/platform-requirements.md) — per-arch required/opportunistic/unsupported
-  CPU and platform feature baseline; boot-time feature-gate
+- [Platform Requirements](docs/platform-requirements.md) — per-arch
+  required/opportunistic/unsupported CPU and platform feature baseline; boot-time feature-gate
 - [Console Model](docs/console-model.md) — serial/console output ownership across boot;
   serial-driver-mediated userspace output
 - [Build System](docs/build-system.md) — toolchain, workspace layout, sysroot, xtask commands

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only AND OFL-1.1
+// Copyright (C) 2020 Dimitar Toshkov Zhekov (Terminus Font, bitmap data)
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 //
 // Code: GPL-2.0-only. Bitmap data: OFL-1.1, adapted from Terminus 10×20
@@ -8,8 +9,6 @@
 // blank for each codepoint in `FONT_9X20_EXT`).
 
 // shared/font/src/lib.rs
-
-#![no_std]
 
 //! Embedded 9×20 bitmap font.
 //!
@@ -23,6 +22,8 @@
 //! from a UTF-8 byte stream to a glyph (CP437 reverse → ext → ASCII
 //! fallback → U+FFFD) is handled by the `shared/text` crate; this crate
 //! holds only the bitmap data.
+
+#![no_std]
 
 /// Glyph width in pixels.
 pub const GLYPH_WIDTH: u32 = 9;

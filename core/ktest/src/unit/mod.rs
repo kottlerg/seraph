@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// ktest/src/unit/mod.rs
+// core/ktest/src/unit/mod.rs
 
 //! Tier 1 — per-syscall isolation tests.
 //!

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// kernel/src/mm/kernel_pt_pool.rs
+// core/kernel/src/mm/kernel_pt_pool.rs
 
 //! Kernel-internal intermediate page-table frame pool.
 //!

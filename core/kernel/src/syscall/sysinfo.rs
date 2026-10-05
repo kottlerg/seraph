@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// kernel/src/syscall/sysinfo.rs
+// core/kernel/src/syscall/sysinfo.rs
 
 //! System info and address-space query syscall handlers.
 //!

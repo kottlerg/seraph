@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-//! bundle.rs
-//!
+// xtask/src/bundle.rs
+
 //! Compose the bootloader bundle (`sysroot/esp/EFI/seraph/bootstrap.bundle`)
 //! from canonical userspace binaries staged in the sysroot. The format is
 //! defined by [`boot_protocol::bundle`] and shared with the bootloader

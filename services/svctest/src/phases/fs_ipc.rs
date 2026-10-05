@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
+// services/svctest/src/phases/fs_ipc.rs
+
 //! fatfs / vfsd FS IPC surface (raw `FS_*` labels).
 
 use std::os::seraph::startup_info;

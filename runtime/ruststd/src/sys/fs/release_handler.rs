@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
+// runtime/ruststd/src/sys/fs/release_handler.rs
+
 //! Per-process release-handler thread for the seraph fs frame protocol.
 //!
 //! The fs driver evicts cached pages by sending `FS_RELEASE_MEMORY` on

@@ -1,16 +1,19 @@
-// seraph-overlay: std::sys::time::seraph
-//
-// `Instant` reads the kernel's microsecond-granularity elapsed counter via
-// `SYS_SYSTEM_INFO(SystemInfoType::ElapsedUs)` (see `abi/syscall/src/lib.rs`).
-// `SystemTime::now()` discovers the `timed` service via the per-process
-// `service_registry_cap` (installed by `_start` from `ProcessInfo` into
-// `registry_client::REGISTRY_CAP`), calls `timed_labels::GET_WALL_TIME`,
-// and returns the reply as a Duration since the Unix epoch. The discovered
-// cap is cached for the rest of the process lifetime in a process-global
-// atomic; subsequent calls skip the lookup. On registry-miss (no `timed`
-// registered) or any IPC failure, `now()` returns `UNIX_EPOCH` — the
-// documented degraded-mode behaviour matching
-// `timed_errors::WALL_CLOCK_UNAVAILABLE`.
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 2026 George Kottler <mail@kottlerg.com>
+
+// runtime/ruststd/src/sys/time/seraph.rs
+
+//! `Instant` reads the kernel's microsecond-granularity elapsed counter via
+//! `SYS_SYSTEM_INFO(SystemInfoType::ElapsedUs)` (see `abi/syscall/src/lib.rs`).
+//! `SystemTime::now()` discovers the `timed` service via the per-process
+//! `service_registry_cap` (installed by `_start` from `ProcessInfo` into
+//! `registry_client::REGISTRY_CAP`), calls `timed_labels::GET_WALL_TIME`,
+//! and returns the reply as a Duration since the Unix epoch. The discovered
+//! cap is cached for the rest of the process lifetime in a process-global
+//! atomic; subsequent calls skip the lookup. On registry-miss (no `timed`
+//! registered) or any IPC failure, `now()` returns `UNIX_EPOCH` — the
+//! documented degraded-mode behaviour matching
+//! `timed_errors::WALL_CLOCK_UNAVAILABLE`.
 
 use crate::time::Duration;
 use core::sync::atomic::{AtomicU32, Ordering};

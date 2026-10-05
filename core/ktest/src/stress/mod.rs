@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// ktest/src/stress/mod.rs
+// core/ktest/src/stress/mod.rs
 
 //! Tier S — Stress and torture tests.
 //!

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// logd/src/handover.rs
+// services/logd/src/handover.rs
 
 //! Real-logd → init-logd handover client.
 //!

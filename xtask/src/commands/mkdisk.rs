@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-//! commands/mkdisk.rs
-//!
+// xtask/src/commands/mkdisk.rs
+
 //! Mkdisk command: re-mirror `rootfs/` into `sysroot/`, re-synthesise
 //! test fixtures, and regenerate `disk.img` without invoking cargo.
 //! Used to refresh the boot image after `rootfs/` or sysroot files were

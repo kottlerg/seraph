@@ -41,8 +41,12 @@ in the root `Cargo.toml`; all member crates opt in via `[lints] workspace = true
 
 ### Markdown
 
-Markdown source MUST be soft-wrapped to the project column limit (100 characters). A Markdown
-table row is exempt, since the syntax cannot break it; cells SHOULD stay short.
+Markdown source MUST be soft-wrapped to the project column limit (100 characters). Exempt, since
+the syntax cannot break them: a Markdown table row; a line consisting of one link, image, badge,
+or bare URL construct, optionally preceded by a list-item marker and followed by sentence
+punctuation; and a leading YAML front-matter block, which is metadata rather than Markdown
+source. Cells and link text SHOULD stay short. `cargo xtask lint-docs`
+([xtask/README.md](../xtask/README.md)) checks the limit.
 Paragraphs are separated by exactly one blank line.
 Hard line breaks MUST NOT be used for visual layout only.
 
@@ -470,5 +474,5 @@ mandated lint groups and treats all warnings as errors. Invocation details are i
 
 ## Summarized By
 
-[Build System](build-system.md)
+[Build System](build-system.md), [xtask/README.md](../xtask/README.md)
 

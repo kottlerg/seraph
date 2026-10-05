@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
+// services/svctest/src/phases/exit_code.rs
+
 //! Process exit-code propagation surface (#302).
 //!
 //! A child spawned via `std::process::Command` that calls

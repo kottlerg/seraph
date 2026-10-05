@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
+// services/svctest/src/reentry.rs
+
 //! argv-driven child-mode dispatch.
 //!
 //! Several phases respawn `/tests/svctest` with a single argv token to

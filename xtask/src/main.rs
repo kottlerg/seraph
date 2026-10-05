@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
+// xtask/src/main.rs
+
 //! xtask — build task runner for Seraph.
 //!
 //! Invoke via `cargo xtask <command>`. Replaces `build.sh`, `run.sh`,
@@ -74,6 +76,7 @@ fn main()
         CliCommand::TestTerminal(args) => commands::test_terminal::run(&ctx, args),
         CliCommand::TestVmgenid(args) => commands::test_vmgenid::run(&ctx, args),
         CliCommand::TestKaslr(args) => commands::test_kaslr::run(&ctx, args),
+        CliCommand::LintDocs(args) => commands::lint_docs::run(&ctx, args),
     };
 
     if let Err(err) = result

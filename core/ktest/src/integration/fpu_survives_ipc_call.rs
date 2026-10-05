@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// ktest/src/integration/fpu_survives_ipc_call.rs
+// core/ktest/src/integration/fpu_survives_ipc_call.rs
 
 //! Tier 2 integration: FPU register file survives a raw `SYS_IPC_CALL`
 //! round-trip across CPU migration.

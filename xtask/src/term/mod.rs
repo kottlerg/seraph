@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-//! term/mod.rs
-//!
+// xtask/src/term/mod.rs
+
 //! Host-terminal I/O adapters for the QEMU launch pipeline.
 //!
 //! This module owns the byte-stream and line-stream `Write` adapters

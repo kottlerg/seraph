@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// procmgr/src/main.rs
+// services/procmgr/src/main.rs
 
 //! Seraph process manager — IPC server for process lifecycle management.
 //!
 //! Receives requests via IPC to create, configure, and start new processes.
 //! Supports both in-memory ELF loading from boot module memory caps and streaming
-//! from the VFS. See `procmgr/docs/ipc-interface.md`.
+//! from the VFS. See `services/procmgr/docs/ipc-interface.md`.
 //!
 //! `CREATE_PROCESS` and `CREATE_FROM_FILE` accept the child's module source and
 //! the caller's bootstrap endpoint (a badged send cap); the endpoint is

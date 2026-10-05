@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-//! cli.rs
-//!
+// xtask/src/cli.rs
+
 //! Clap derive structs for the xtask CLI.
 //!
-//! Add a new top-level command by adding a variant to `Command` and a
+//! Add a new top-level command by adding a variant to `CliCommand` and a
 //! corresponding `Args` struct below, then handle it in `main.rs`.
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -82,6 +82,12 @@ pub enum CliCommand
     /// staged and assert the deterministic layout. Requires a populated
     /// sysroot with the ktest bundle composed (see xtask/README.md).
     TestKaslr(TestKaslrArgs),
+
+    /// Check the mechanical documentation and source-header rules: Markdown
+    /// column limit, file-header layout, `## Summarized By` shape and forward
+    /// links, and document reachability from the root README. Runs in CI's
+    /// host-tests job; see xtask/README.md for the rule list and levels.
+    LintDocs(LintDocsArgs),
 }
 
 // ── Build ─────────────────────────────────────────────────────────────────────
@@ -424,3 +430,8 @@ pub struct RunParallelArgs
     #[arg(long, default_value = "10")]
     pub fail_grace_secs: u64,
 }
+
+// ── LintDocs ──────────────────────────────────────────────────────────────────
+
+#[derive(Parser)]
+pub struct LintDocsArgs {}

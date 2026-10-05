@@ -2,7 +2,7 @@
  * SPDX-License-Identifier: GPL-2.0-only
  * Copyright (C) 2026 George Kottler <mail@kottlerg.com>
  *
- * kernel/linker/x86_64.ld
+ * core/kernel/linker/x86_64.ld
  *
  * Linker script for the Seraph kernel (x86-64). The kernel links as a
  * static-PIE (ET_DYN) image at KERNEL_VBASE, the zero-bias virtual origin;

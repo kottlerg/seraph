@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// drivers/virtio/core/src/lib.rs
+// services/drivers/virtio/core/src/lib.rs
 
 //! `VirtIO` transport and virtqueue primitives shared by all `VirtIO` drivers.
 //!

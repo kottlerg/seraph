@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// ktest/src/stress/split_delete_race.rs
+// core/ktest/src/stress/split_delete_race.rs
 
 //! Stress: a range split racing a delete of its original.
 //!

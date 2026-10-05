@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
+// services/svctest/src/ipc_util/ns.rs
+
 //! Namespace-protocol IPC helpers (`NS_LOOKUP`, `NS_STAT`, `NS_READDIR`).
 
 /// Issue `NS_LOOKUP` against `dir_cap` and return `(node_cap, kind, size)`.

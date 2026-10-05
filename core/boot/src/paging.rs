@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// boot/src/paging.rs
+// core/boot/src/paging.rs
 
 //! Architecture-neutral page table trait and boot mapping orchestration.
 //!

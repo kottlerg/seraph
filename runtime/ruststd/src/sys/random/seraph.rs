@@ -1,16 +1,19 @@
-// seraph-overlay: std::sys::random::seraph
-//
-// Userspace randomness backing for `std::sys::random`: `fill_bytes` (the
-// public `std::random` surface) and `hashmap_random_keys` (the per-process
-// SipHash keys that seed `RandomState`/`HashMap` against hash-flooding).
-//
-// Every draw is a `SYS_GETRANDOM` syscall into the kernel entropy pool (see
-// `core/kernel/docs/entropy.md`). Userspace holds no generator state: the
-// kernel's per-CPU forward-secure CSPRNG advances on each draw, so the surface
-// inherits the kernel's forward secrecy and is prediction- and fork/clone-safe
-// by construction. The kernel never blocks for entropy — the pool is seeded
-// before any userspace process runs — so a well-formed request always fills
-// completely.
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 2026 George Kottler <mail@kottlerg.com>
+
+// runtime/ruststd/src/sys/random/seraph.rs
+
+//! Userspace randomness backing for `std::sys::random`: `fill_bytes` (the
+//! public `std::random` surface) and `hashmap_random_keys` (the per-process
+//! SipHash keys that seed `RandomState`/`HashMap` against hash-flooding).
+//!
+//! Every draw is a `SYS_GETRANDOM` syscall into the kernel entropy pool (see
+//! `core/kernel/docs/entropy.md`). Userspace holds no generator state: the
+//! kernel's per-CPU forward-secure CSPRNG advances on each draw, so the surface
+//! inherits the kernel's forward secrecy and is prediction- and fork/clone-safe
+//! by construction. The kernel never blocks for entropy — the pool is seeded
+//! before any userspace process runs — so a well-formed request always fills
+//! completely.
 
 /// Fill `bytes` with cryptographically-secure random data from the kernel.
 ///

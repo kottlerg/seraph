@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
+// services/svctest/src/phases/recv_guard.rs
+
 //! Shared recv-loop failure policy (`RecvGuard`) surface.
 
 use std::os::seraph::startup_info;

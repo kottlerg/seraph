@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-//! arch.rs
-//!
+// xtask/src/arch.rs
+
 //! Supported target architectures and their per-arch constants (target triples,
 //! EFI filenames, QEMU binary names).
 

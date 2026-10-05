@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// procmgr/process-table/src/lib.rs
+// services/procmgr/process-table/src/lib.rs
 
 //! Pure process-table, badge, and recent-exit logic for procmgr.
 //!

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// boot/src/firmware.rs
+// core/boot/src/firmware.rs
 
 //! Firmware table discovery: ACPI RSDP and Device Tree blob addresses.
 //!

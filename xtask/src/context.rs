@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-//! context.rs
-//!
+// xtask/src/context.rs
+
 //! Resolved workspace and build output paths, shared by all commands.
 
 use std::path::PathBuf;

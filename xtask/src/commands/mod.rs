@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-//! commands/mod.rs
-//!
+// xtask/src/commands/mod.rs
+
 //! Re-exports all subcommand modules.
 
 pub mod build;
 pub mod clean;
 pub mod compose_bundle;
+pub mod lint_docs;
 pub mod mkdisk;
 pub mod run;
 pub mod run_parallel;

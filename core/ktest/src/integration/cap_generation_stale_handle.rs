@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// ktest/src/integration/cap_generation_stale_handle.rs
+// core/ktest/src/integration/cap_generation_stale_handle.rs
 
 //! Integration: a same-`CSpace` stale cap handle fails closed (#349).
 //!

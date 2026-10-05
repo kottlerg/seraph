@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// fs/fat/src/backend.rs
+// services/fs/fat/src/backend.rs
 
 //! [`NamespaceBackend`] implementation over FAT16/FAT32 storage.
 //!

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// kernel/src/console.rs
+// core/kernel/src/console.rs
 
 //! Kernel early console: dual serial + framebuffer output.
 //!

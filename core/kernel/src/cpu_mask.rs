@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// kernel/src/cpu_mask.rs
+// core/kernel/src/cpu_mask.rs
 
 //! Fixed-capacity sets of logical CPU indices.
 //!

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-//! commands/build.rs
-//!
+// xtask/src/commands/build.rs
+
 //! Build command: cross-compile Seraph components and populate the sysroot.
 
 use std::fs;

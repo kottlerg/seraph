@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// ktest/src/integration/ipc_call_interrupted_stop_start.rs
+// core/ktest/src/integration/ipc_call_interrupted_stop_start.rs
 
 //! Integration: a client stopped while parked in `ipc_call` and then
 //! restarted returns `Interrupted` — never a stale-`ipc_msg` "reply" (#361).

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-//! qmp.rs
-//!
+// xtask/src/qmp.rs
+
 //! Minimal QMP (QEMU Machine Protocol) client for the QMP-driven tests.
 //! Connects to QEMU's `-qmp unix:...` socket, completes the capabilities
 //! handshake, and issues the handful of commands the harnesses need:

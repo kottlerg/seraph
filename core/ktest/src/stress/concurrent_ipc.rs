@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
+// core/ktest/src/stress/concurrent_ipc.rs
+
 //! Stress test: concurrent IPC endpoint races.
 //!
 //! `NUM_CALLERS` callers simultaneously block on one endpoint. The server

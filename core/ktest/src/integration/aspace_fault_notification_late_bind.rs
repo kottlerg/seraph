@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// ktest/src/integration/aspace_fault_notification_late_bind.rs
+// core/ktest/src/integration/aspace_fault_notification_late_bind.rs
 
 //! Integration: an address-space terminal-fault observer bound *after* a thread
 //! in that space already faulted still receives the retained fault reason.

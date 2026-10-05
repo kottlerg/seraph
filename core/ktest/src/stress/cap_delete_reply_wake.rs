@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// ktest/src/stress/cap_delete_reply_wake.rs
+// core/ktest/src/stress/cap_delete_reply_wake.rs
 
 //! Stress: `cap_delete` of a server that a client is `BlockedOnReply` on MUST
 //! wake that client — the dealloc deferred reply-wake *liveness* invariant

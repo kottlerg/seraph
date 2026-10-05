@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-//! sysroot.rs
-//!
+// xtask/src/sysroot.rs
+
 //! Sysroot architecture consistency checks, arch recording, and rootfs
 //! installation.
 //!

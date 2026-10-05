@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// vfsd/gpt/src/lib.rs
+// services/vfsd/gpt/src/lib.rs
 
 //! Pure GUID Partition Table parsing.
 //!

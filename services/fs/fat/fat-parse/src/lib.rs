@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// fs/fat/fat-parse/src/lib.rs
+// services/fs/fat/fat-parse/src/lib.rs
 
 //! Pure FAT on-disk structure decoders.
 //!

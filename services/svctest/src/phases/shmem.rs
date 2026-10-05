@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
+// services/svctest/src/phases/shmem.rs
+
 //! Shared-memory primitive (kernel shmem objects).
 
 use crate::bootstrap::Caps;

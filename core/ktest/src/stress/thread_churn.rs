@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
+// core/ktest/src/stress/thread_churn.rs
+
 //! Stress test: rapid thread create/destroy cycles.
 //!
 //! Creates and destroys 20 threads sequentially, verifying that kernel

@@ -293,8 +293,10 @@ fn check_bare_cites(pat: &Patterns, file: &SourceFile) -> Vec<Diagnostic>
 }
 
 /// Lines outside fenced code blocks, with their zero-based index. A fence
-/// opens with a run of three or more backticks or tildes and closes only on a
-/// run of the same character at least as long.
+/// opens with a run of three or more backticks or tildes (a backtick run whose
+/// info string contains a backtick is not a fence) and closes only on a run of
+/// the same character at least as long with nothing after it but whitespace (a
+/// line carrying an info string is content).
 fn prose_lines(text: &str) -> impl Iterator<Item = (usize, &str)>
 {
     let mut open: Option<(char, usize)> = None;
@@ -307,7 +309,7 @@ fn prose_lines(text: &str) -> impl Iterator<Item = (usize, &str)>
             .map(|c| (c, trimmed.chars().take_while(|x| *x == c).count()));
         match (open, fence)
         {
-            (None, Some((c, n))) if n >= 3 =>
+            (None, Some((c, n))) if n >= 3 && (c != '`' || !trimmed[n..].contains('`')) =>
             {
                 open = Some((c, n));
                 false
@@ -473,7 +475,9 @@ fn header_violation(path: &str, text: &str) -> Option<(usize, String)>
 // ── md-summarized-by, md-backlink-forward ────────────────────────────────────
 
 /// Link targets in `text` outside fenced code, resolved to repository-relative
-/// paths; external and in-page links are skipped.
+/// paths. External and in-page links are skipped, and a link whose `..` climbs
+/// past the repository root resolves to nothing and is omitted; callers that must
+/// report such links resolve them with [`normalize`] themselves.
 fn link_targets(pat: &Patterns, path: &str, text: &str) -> BTreeSet<String>
 {
     let dir = Path::new(path).parent().unwrap_or_else(|| Path::new(""));
@@ -573,7 +577,34 @@ fn summarized_by(
             "`## Summarized By` holds text other than links or `None`".into(),
         ));
     }
-    Ok(link_targets(pat, path, &format!("\n{joined}\n")))
+    // Every entry must resolve to a repository document: an external,
+    // in-page-only, or root-escaping entry is malformed.
+    let dir = Path::new(path).parent().unwrap_or_else(|| Path::new(""));
+    let mut entries = BTreeSet::new();
+    for cap in pat.md_link.captures_iter(&joined)
+    {
+        let raw = &cap[1];
+        let target = raw.split('#').next().unwrap_or("");
+        let resolved =
+            if target.is_empty() || target.contains("://") || target.starts_with("mailto:")
+            {
+                None
+            }
+            else
+            {
+                normalize(&dir.join(target))
+            };
+        let Some(resolved) = resolved
+        else
+        {
+            return Err((
+                heading_line + 1,
+                format!("Summarized By entry `{raw}` does not resolve to a repository document"),
+            ));
+        };
+        entries.insert(resolved);
+    }
+    Ok(entries)
 }
 
 fn check_summarized_by(pat: &Patterns, markdown: &[&SourceFile]) -> Vec<Diagnostic>
@@ -984,5 +1015,28 @@ mod tests
     {
         let targets = link_targets(&pat(), "docs/a.md", "[x](../../x.md) [y](../y.md)\n");
         assert_eq!(targets, BTreeSet::from(["y.md".to_owned()]));
+    }
+
+    #[test]
+    fn summarized_by_rejects_entries_outside_the_repository()
+    {
+        for entry in ["[X](../../x.md)", "[X](#a)", "[X](https://e/x.md)"]
+        {
+            let text = format!("# T\n\n---\n\n## Summarized By\n\n{entry}\n");
+            let err = summarized_by(&pat(), "docs/a.md", &text).unwrap_err();
+            assert_eq!(err.0, 5);
+            assert!(
+                err.1.contains("does not resolve to a repository document"),
+                "{entry}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_backtick_line_with_a_backtick_in_its_info_string_is_not_a_fence()
+    {
+        let text = "```x``` (see a.md)\n(see b.md)\n";
+        let diags = check_bare_cites(&pat(), &md("a.md", text));
+        assert_eq!(diags.iter().map(|d| d.line).collect::<Vec<_>>(), vec![1, 2]);
     }
 }

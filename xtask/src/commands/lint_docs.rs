@@ -56,8 +56,8 @@ const RULES: &[(&str, Level)] = &[
     ("md-columns", Level::Error),
     ("src-header", Level::Error),
     ("md-summarized-by", Level::Error),
-    ("md-backlink-forward", Level::Warning),
-    ("md-reachable", Level::Warning),
+    ("md-backlink-forward", Level::Error),
+    ("md-reachable", Level::Error),
     ("md-bare-cite", Level::Warning),
 ];
 

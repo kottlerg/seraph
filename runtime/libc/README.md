@@ -7,8 +7,8 @@ FFI. Wraps Seraph's native syscall ABI with a POSIX-shaped surface (file
 descriptors, `read`/`write`, etc.).
 
 Native Rust components use Seraph syscalls directly via `abi/syscall` and
-`shared/syscall`; `ruststd` provides the `std` platform layer without going
-through libc. libc is for C code and for maximum source compatibility with
+`shared/syscall`; [`ruststd`](../ruststd/README.md) provides the `std` platform
+layer without going through libc. libc is for C code and for maximum source compatibility with
 existing POSIX software.
 
 ## Status

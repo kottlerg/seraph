@@ -11,14 +11,16 @@ svcmgr binds every supervised service's main thread to one shared
 EventQueue (`deaths_eq`) via `SYS_THREAD_BIND_NOTIFICATION`, using the
 service's table index as the correlator. When a thread exits — either
 cleanly via `SYS_THREAD_EXIT` or due to an unhandled fault — the
-kernel posts `(correlator << 32) | exit_reason` to `deaths_eq`.
+kernel posts `(correlator << 32) | exit_reason` to `deaths_eq` (per
+[syscalls.md](../../../core/kernel/docs/syscalls.md)).
 
 The WaitSet has two members: the service endpoint (badge 0) and the
 deaths queue (badge 1). On wakeup svcmgr drains the queue and routes
 each payload to its `ServiceEntry` via the correlator, then dispatches
 through [`restart::handle_death`](../src/restart.rs).
 
-Exit reason encoding:
+Exit reason encoding (owned by
+[process-lifecycle.md](../../../docs/process-lifecycle.md#exit-reason)):
 
 | Value | Meaning |
 |---|---|
@@ -35,11 +37,12 @@ decided **solely** by the restart policy + budget; `system_critical`
 (`critical = yes|no`) is consulted only once a service ends up
 permanently down. The two concerns are orthogonal — `restart` owns
 *whether/when to respawn*, `critical` owns *can the system survive its
-permanent loss*.
+permanent loss* (per [service-definitions.md](service-definitions.md#critical)).
 
 1. **`should_restart(svc, exit_reason)`** evaluates the restart policy:
    * `POLICY_NEVER` → no restart.
-   * `POLICY_ON_FAILURE` → restart iff `exit_reason >= EXIT_FAULT_BASE`.
+   * `POLICY_ON_FAILURE` → restart iff `exit_reason >= EXIT_FAULT_BASE`
+     (per [service-definitions.md](service-definitions.md#restart)).
    * `POLICY_ALWAYS` → restart unconditionally.
    * The restart-count budget (`MAX_RESTARTS`, currently `1`) is
      enforced here; an exhausted budget reports "max restarts reached,
@@ -48,9 +51,10 @@ permanent loss*.
      "no restart source" and returns false.
 2. **Restart not permitted** → mark service inactive; route to
    `permanent_death_outcome`:
-   * `system_critical` (`critical = yes`) → log `critical service
-     unrecoverable: <name>; initiating graceful shutdown`, return
-     `Unrecoverable`.
+   * `system_critical` (`critical = yes`, per
+     [service-definitions.md](service-definitions.md#critical)) → log
+     `critical service unrecoverable: <name>; initiating graceful shutdown`,
+     return `Unrecoverable`.
    * Otherwise (`critical = no`) → log `service down: <name>; system
      continues degraded`, return `Degraded`.
 3. **Restart permitted** → call `restart_process`:
@@ -81,7 +85,8 @@ permanent loss*.
 registry and issues `pwrmgr_labels::SHUTDOWN`. Edge case: a
 `system_critical` pwrmgr death cannot trigger graceful shutdown
 (the shutdown source is itself gone); svcmgr logs the degraded
-state and returns.
+state and returns (see
+[service-definitions.md](service-definitions.md#critical)).
 
 ---
 
@@ -155,8 +160,10 @@ back with the same surfaces first launch gave it.
 ## Supervision hierarchy
 
 svcmgr only supervises top-level services. Drivers (cmos / virtio-rtc
-/ future block / net) are supervised by devmgr. Filesystem drivers
-(fatfs / future ext / btrfs) are supervised by vfsd. None of those
+/ future block / net) are supervised by devmgr
+([devmgr/README.md](../../devmgr/README.md)). Filesystem drivers
+(fatfs / future ext / btrfs) are supervised by vfsd
+([storage.md](../../../docs/storage.md)). None of those
 flow through the handover endowment.
 
 The set of services svcmgr currently supervises (per the shipped
@@ -165,8 +172,8 @@ The set of services svcmgr currently supervises (per the shipped
 `svctest` and `crasher` are test-tier fixtures: their recipes live in
 `/config/svcmgr/tests/` (svcmgr does not scan it) and are staged into
 `/config/svcmgr/services/` only for test boots — `crasher` is co-staged
-with `svctest`. The rest ship in `/config/svcmgr/services/` and load on
-every boot.
+with `svctest` (per [testing.md](../../../docs/testing.md#sysroot-layout)).
+The rest ship in `/config/svcmgr/services/` and load on every boot.
 
 | Service | Source | Restart | Critical |
 |---|---|---|---|
@@ -184,17 +191,19 @@ Restart paths for the init-endowed (bind-only) substrate set are
 aspirational today: each was spawned with arch-/firmware-authority caps
 that init holds and svcmgr cannot re-mint (memmgr/procmgr via raw
 `cap_create_*` syscalls; devmgr/vfsd/logd with one-shot authority
-handover). When their `.svc` `restart` value moves off `never` in the
-future, the spawn path needs to gain access to those caps — either via a
-new init→svcmgr handover round, or by relocating the spawn entirely into
-svcmgr.
+handover; per [init bootstrap](../../init/docs/bootstrap.md)). When their
+`.svc` `restart` value moves off `never` in the future, the spawn path
+needs to gain access to those caps — either via a new init→svcmgr
+handover round, or by relocating the spawn entirely into svcmgr.
 
 `timed` and `pwrmgr` are *not* in that set: they are svcmgr-launched
 providers and genuinely restartable. Neither holds a unique source cap —
 each re-acquires its authority on (re)start by querying devmgr
-(`QUERY_RTC_DEVICE` for timed; `QUERY_ACPI_TABLE` + `QUERY_SHUTDOWN_DEVICE`
-for pwrmgr), and svcmgr re-serves a fresh RECV on the persistent service
-endpoint so cached client caps survive the restart.
+(`QUERY_RTC_DEVICE` for timed, per [timed/README.md](../../timed/README.md);
+`QUERY_ACPI_TABLE` + `QUERY_SHUTDOWN_DEVICE` for pwrmgr, per
+[pwrmgr/README.md](../../pwrmgr/README.md)), and svcmgr re-serves a fresh
+RECV on the persistent service endpoint so cached client caps survive the
+restart.
 
 ---
 
@@ -203,11 +212,14 @@ endpoint so cached client caps survive the restart.
 If procmgr itself crashes, svcmgr cannot use procmgr IPC to restart it.
 svcmgr holds raw kernel capabilities (AddressSpace, CSpace, Thread
 creation syscalls) as a documented future fallback to reconstruct
-procmgr from its boot module. Not implemented today; procmgr is
-`critical = yes`, so its death falls into the graceful-shutdown path.
+procmgr from its boot module (per
+[process-lifecycle.md](../../../docs/process-lifecycle.md#procmgr-restart-fallback)).
+Not implemented today; procmgr is `critical = yes`, so its death falls
+into the graceful-shutdown path.
 
 ---
 
 ## Summarized By
 
-[svcmgr/README.md](../README.md)
+[services/pwrmgr/README.md](../../pwrmgr/README.md), [services/svcmgr/README.md](../README.md),
+[svcmgr IPC Interface](ipc-interface.md), [`.svc` Service Definitions](service-definitions.md)

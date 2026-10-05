@@ -43,7 +43,8 @@ These are the LLVM defaults for the respective `extern "C"` ABI on the
 Seraph custom targets; the bootloader places the `BootInfo` pointer in
 `rdi` / `a0` accordingly. Any future change to the kernel entry's
 calling convention is an ABI break and MUST accompany a
-`BOOT_PROTOCOL_VERSION` bump.
+`BOOT_PROTOCOL_VERSION` bump (see
+[`abi/boot-protocol/README.md`](../../../abi/boot-protocol/README.md)).
 
 The `BootInfo` type and all its fields are defined in the
 [`abi/boot-protocol`](../../../abi/boot-protocol/) crate. The kernel must
@@ -65,7 +66,7 @@ rather than proceed with a mismatched structure.
 | Stack | Valid; at least 64 KiB available |
 | `rdi` | Physical address of `BootInfo` structure |
 | Floating point | Not initialised; kernel must not use SSE/AVX before enabling |
-| GDT | Bootloader-provided; kernel replaces it during early initialisation |
+| GDT | Bootloader-provided; kernel replaces it during early initialisation ([initialization.md](../../kernel/docs/initialization.md) §"Phase 5: Architecture Hardware Initialisation") |
 | IDT | Not loaded; interrupts must remain disabled until the kernel installs its own |
 
 ### RISC-V (RV64IMAC, soft-float)
@@ -81,7 +82,8 @@ rather than proceed with a mismatched structure.
 | Floating point | Not initialised |
 
 Secondary harts remain in the UEFI firmware's spin loop or halted state
-until the kernel releases them via SBI HSM calls during SMP bringup.
+until the kernel releases them via SBI HSM calls during SMP bringup
+([initialization.md](../../kernel/docs/initialization.md) §"Phase 8: Scheduler and SMP Bringup").
 
 ---
 
@@ -96,7 +98,8 @@ established per the contract above, and control transfers to
 `kernel_entry` via an unconditional jump that does not return.
 
 The bootloader-provided GDT (x86-64) and ASID 0 (RISC-V) remain active
-at entry; the kernel replaces them during its own initialisation.
+at entry; the kernel replaces them during its own initialisation (see
+[initialization.md](../../kernel/docs/initialization.md)).
 
 ---
 
@@ -118,4 +121,5 @@ at entry; the kernel replaces them during its own initialisation.
 
 ## Summarized By
 
-[docs/bootstrap.md](../../../docs/bootstrap.md), [boot/README.md](../README.md)
+[Boot Flow](boot-flow.md), [Page Tables](page-tables.md),
+[core/kernel/README.md](../../kernel/README.md), [System Bootstrap](../../../docs/bootstrap.md)

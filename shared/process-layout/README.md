@@ -11,7 +11,8 @@ instead of being pinned as ABI constants in `process-abi`.
 Used by `init` (lays out memmgr and procmgr) and `procmgr` (lays out all other
 processes). The creator draws entropy, calls `choose_process_layout` once per
 process, and writes the result into the handover surface and the entry register;
-the created process reads the addresses back rather than assuming fixed values.
+the created process reads the addresses back rather than assuming fixed values
+(see [docs/process-lifecycle.md](../../docs/process-lifecycle.md) § Handover-page addresses).
 
 Each surface is drawn independently inside a fixed per-region `VaWindow`
 (ASLR, [#39](https://github.com/kottlerg/seraph/issues/39)): 2^21 page-aligned
@@ -21,6 +22,9 @@ under every paging mode on both architectures, with disjointness, region
 ordering, and the stack guard gap holding for every possible draw. The crate is
 pure: entropy is injected as pre-drawn bytes, and a creator whose entropy draw
 failed passes `None` to fall back to the deterministic `DEFAULT_*` addresses.
+The zone map, draw windows, and fallback addresses are specified in
+[docs/userspace-memory-model.md](../../docs/userspace-memory-model.md) § Bootstrap
+Cross-Boundary VAs.
 The kernel reuses the `INIT_*` windows for init's per-boot layout, and the
 `IMAGE_WINDOW` constants parameterise ET_DYN load-bias placement.
 
@@ -42,7 +46,7 @@ The kernel reuses the `INIT_*` windows for init's per-boot layout, and the
 
 Page counts are not part of the layout: stack size comes from the binary's
 `.note.seraph.stack` ELF note and TLS size from its `PT_TLS` segment, both
-resolved by the creator.
+resolved by the creator (see [abi/process-abi/README.md](../../abi/process-abi/README.md)).
 
 ---
 
@@ -59,4 +63,4 @@ resolved by the creator.
 
 ## Summarized By
 
-None
+[Process Lifecycle](../../docs/process-lifecycle.md)

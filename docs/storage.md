@@ -14,7 +14,7 @@ exclusively by capability delegation:
 
 | Layer | Process | Owns |
 |---|---|---|
-| Block | `virtio-blk` (per disk) | Hardware MMIO, IRQ, descriptor rings |
+| Block | `virtio-blk` (single instance, first virtio-blk device) | Hardware MMIO, IRQ, descriptor rings |
 | Filesystem | one fs driver per mount (e.g. `fatfs`) | On-disk format, BPB, FAT chains |
 | Namespace | `vfsd` (single instance) | Synthetic root, GPT discovery, mount tree |
 
@@ -27,18 +27,23 @@ Four system-scope invariants govern the stack:
 - **vfsd holds no on-disk storage and is off the I/O path after the
   walk.** Once a client has walked `NS_LOOKUP` into a mounted
   filesystem, subsequent reads and writes go directly to the owning
-  fs driver. vfsd is not a proxy.
+  fs driver. vfsd is not a proxy. See
+  [`services/vfsd/README.md`](../services/vfsd/README.md) §"After the walk".
 - **One fs-driver process per mount.** A crash in one mount cannot
-  corrupt another. `vfsd` is the supervisor for the fs-driver
-  lifecycle.
+  corrupt another. `vfsd` spawns every fs driver.
 - **Block access is partition-scoped at the capability layer.** The
-  block driver exposes one unbadged whole-disk endpoint (held by
-  vfsd alone) and badged per-partition endpoints (handed to fs
-  drivers). Out-of-bounds LBAs are rejected by the block driver on
-  every request.
-- **System root is delivered, never discovered.** Every process's
-  namespace authority arrives as `ProcessInfo.system_root_cap`
-  installed by `procmgr_labels::CONFIGURE_NAMESPACE` on spawn.
+  block driver serves only badged callers: vfsd holds a
+  `MOUNT_AUTHORITY`-badged whole-disk cap minted by devmgr, and fs
+  drivers hold partition-identity-badged caps the block driver mints
+  on `REGISTER_PARTITION`; unbadged callers are rejected.
+  Out-of-bounds LBAs are rejected by the block driver on every
+  request. See
+  [`services/drivers/virtio/blk/README.md`](../services/drivers/virtio/blk/README.md).
+- **System root is delivered, never discovered.** Every process
+  spawned with a namespace receives its authority as
+  `ProcessInfo.system_root_cap` installed by
+  `procmgr_labels::CONFIGURE_NAMESPACE` on spawn; only init pulls the
+  seed, from vfsd via `GET_SYSTEM_ROOT_CAP`.
   There is no ambient mount table and no global lookup.
 
 The cap-as-namespace principles these invariants rest on are
@@ -49,19 +54,20 @@ specified in [`namespace-model.md`](namespace-model.md).
 ## Capability Delegation Chain
 
 Storage authority flows from the kernel's initial cap mint outward in
-one direction. Each arrow is a single capability transfer; revoking
-any link kills the subtree beneath it.
+one direction. Each arrow is one capability transfer or request;
+revoking a block-layer cap cuts off the partition caps derived
+beneath it.
 
 ```
 kernel (phase 7) mints Mmio + IRQ from BootInfo
   → init delegates Mmio + IRQ caps to devmgr
     → devmgr binds virtio-blk; delegates per-device MMIO + IRQ
-      → virtio-blk publishes its whole-disk service endpoint to devmgr
-        → vfsd queries devmgr's device registry → whole-disk SEND
+      → devmgr creates the block service endpoint and hands it to virtio-blk at spawn
+        → vfsd queries devmgr's device registry → MOUNT_AUTHORITY-badged whole-disk SEND_GRANT
           → vfsd issues REGISTER_PARTITION (whole-disk endpoint only)
-            → vfsd derives a badged per-partition SEND
+            → virtio-blk mints a partition-badged SEND_GRANT and returns it in the reply
               → vfsd spawns fs driver; injects partition-scoped block cap
-                → fs driver issues FS_MOUNT, reads BPB, replies OK
+                → vfsd sends FS_MOUNT; fs driver reads BPB, replies OK
                   → vfsd captures fs driver's root namespace cap
                     → init pulls system root via GET_SYSTEM_ROOT_CAP
                       → init distributes copies via CONFIGURE_NAMESPACE
@@ -72,8 +78,9 @@ is owned by [`device-management.md`](device-management.md). Badge
 semantics, derivation, and revocation are owned by
 [`capability-model.md`](capability-model.md) §"Badges".
 
-`REGISTER_PARTITION` is rejected over badged callers: only the holder
-of the whole-disk endpoint (vfsd) can mint a partition binding. The
+`REGISTER_PARTITION` is rejected unless the caller's badge carries
+`MOUNT_AUTHORITY`: only the holder of the devmgr-minted whole-disk cap
+(vfsd) can mint a partition binding. The
 block driver enforces the LBA bound on every read and write against
 the caller's badge. See
 [`services/drivers/virtio/blk/README.md`](../services/drivers/virtio/blk/README.md).
@@ -113,15 +120,16 @@ or on-disk UUID. The model is:
   partition only.
 - **DPS-style priority tie-break.** Where multiple partitions match
   a role GUID, GPT attribute bits 48–63 are compared as an unsigned
-  priority; the highest wins. Tied non-zero priorities are a fatal
-  boot error — the configuration is ambiguous and must be repaired.
+  priority; the highest wins. A tie at the highest priority is
+  ambiguous: for the root role it is a fatal boot error that must be
+  repaired; the `/esp` and `/data` auto-mounts skip the mount.
 - **Nothing else binds.** There is no `mounts.conf`, no `/etc/fstab`,
   no kernel command line carrying mount config, no on-disk
   filesystem label or UUID consulted by vfsd. The GUID is the
   binding.
 
-The role-GUID model is the only mount-discovery mechanism. The wire
-shape vfsd uses internally (a `MountRole` byte mapped to a type GUID)
+The role-GUID model is the only mount-discovery mechanism. The
+`MOUNT` request's wire shape (a `MountRole` byte mapped to a type GUID)
 is owned by [`services/vfsd/docs/vfs-ipc-interface.md`](../services/vfsd/docs/vfs-ipc-interface.md).
 
 ---
@@ -130,44 +138,48 @@ is owned by [`services/vfsd/docs/vfs-ipc-interface.md`](../services/vfsd/docs/vf
 
 Three actors cooperate to bring a filesystem online:
 
-**init** holds one storage-relevant cap after vfsd is spawned: a
-`SEED_AUTHORITY`-badged SEND on vfsd's service endpoint (required by
-the `GET_SYSTEM_ROOT_CAP` gate). Init issues no `MOUNT` — vfsd
+**init** holds the un-badged vfsd service endpoint it created plus a
+`SEED_AUTHORITY`-badged SEND derived from it (required by the
+`GET_SYSTEM_ROOT_CAP` gate). Init issues no `MOUNT` — vfsd
 self-mounts root. Init pulls the system root via
 `GET_SYSTEM_ROOT_CAP` (which vfsd serves only once root is mounted, so
 the call blocks until the root filesystem is up), then distributes
 per-child copies on every spawn via
 `procmgr_labels::CONFIGURE_NAMESPACE`. Init retains no further
-filesystem access of its own.
+filesystem access of its own. The `GET_SYSTEM_ROOT_CAP` contract is
+owned by
+[`services/vfsd/docs/vfs-ipc-interface.md`](../services/vfsd/docs/vfs-ipc-interface.md).
 
 **vfsd** parses the GPT once at startup, then self-mounts the root
 partition: it resolves the arch root GUID, looks the partition up in
 its parsed table, registers the partition bound with virtio-blk,
 spawns the fs driver, sends `FS_MOUNT` to validate the BPB, and
 captures the driver's root cap into the synthetic root (see
+[`services/vfsd/README.md`](../services/vfsd/README.md) and
 [`services/vfsd/docs/namespace-composition.md`](../services/vfsd/docs/namespace-composition.md)).
 It then auto-mounts the ESP at `/esp` and the data partition at
 `/data`. All three run before any service thread serves a request, so
 `GET_SYSTEM_ROOT_CAP` never observes an unmounted root. The runtime
-`MOUNT` label is retained for explicit / foreign-GUID mounts and shares
-this resolution path.
+`MOUNT` label carries a `MountRole` byte (`Root` or `Data` today; other values are
+reserved for explicit and foreign-GUID mounts) and shares this resolution path.
 
 **fs driver** runs as a separate process. After `FS_MOUNT` succeeds,
 it serves the cap-native `NS_*` protocol plus the surviving
 `FS_*` labels against per-node badged SEND caps on its own
 endpoint. The block endpoint it receives is partition-scoped at
 delivery time; the fs driver reads and writes by partition-relative
-LBA.
+LBA. See
+[`services/fs/docs/fs-driver-protocol.md`](../services/fs/docs/fs-driver-protocol.md).
 
 ### First-mount structural constraint
 
 The first fatfs process is spawned from the boot-module cap, not via
 the namespace. `/services/fs/fatfs` is unreachable until root mounts, so the
 fatfs that brings root online cannot be spawned from disk —
-chicken-and-egg. Subsequent fs-driver respawns walk vfsd's own
+chicken-and-egg. Every subsequent mount's fs-driver spawn walks vfsd's own
 held system-root cap to `/services/fs/fatfs` and pass the resulting file cap
 to procmgr via `CREATE_FROM_FILE`. The first-mount path is permanent
-by structure.
+by structure. See [`services/vfsd/README.md`](../services/vfsd/README.md).
 
 ---
 
@@ -176,23 +188,24 @@ by structure.
 The contract between fs drivers and the block driver has three
 elements:
 
-- **Two-tier endpoint.** Whole-disk unbadged (vfsd only) versus
-  per-partition badged (fs drivers). The block driver distinguishes
-  by the kernel-supplied caller badge.
+- **Two-tier endpoint.** Whole-disk `MOUNT_AUTHORITY`-badged (vfsd
+  only) versus per-partition badged (fs drivers); unbadged callers
+  are rejected. The block driver distinguishes by the
+  kernel-supplied caller badge.
 - **Partition-scoped LBA.** Reads and writes carry an LBA relative
   to the caller badge's partition base. The block driver enforces
   the bound on every request.
-- **Single-page Frame-cap DMA.** Each read or write transfers one
-  Memory cap as the DMA target; the Memory cap is moved back to the caller
-  in every reply (success or error). The block driver never retains
-  the data Memory cap.
+- **Caller-supplied Memory-cap DMA.** Each read or write transfers one
+  Memory cap of at least `count * 512` bytes as the DMA target; the
+  Memory cap is moved back to the caller in every reply (success or
+  error). The block driver never retains the data Memory cap.
 
 Authoritative wire shapes for `REGISTER_PARTITION`,
 `BLK_READ_INTO_MEMORY`, and `BLK_WRITE_FROM_MEMORY` live in
 [`services/drivers/virtio/blk/README.md`](../services/drivers/virtio/blk/README.md).
 The fs-driver side — `FS_MOUNT`, `FS_READ`, `FS_READ_MEMORY`,
-`FS_RELEASE_MEMORY`, `FS_WRITE`, `FS_WRITE_MEMORY`, `FS_CLOSE`, and
-the directory-mutation labels — is owned by
+`FS_RELEASE_MEMORY`, `FS_RELEASE_ACK`, `FS_WRITE`, `FS_WRITE_MEMORY`,
+`FS_TRUNCATE`, `FS_CLOSE`, and the directory-mutation labels — is owned by
 [`services/fs/docs/fs-driver-protocol.md`](../services/fs/docs/fs-driver-protocol.md).
 
 DMA safety (IOMMU vs. no-IOMMU policy) is a devmgr concern, not a
@@ -205,11 +218,10 @@ storage concern; see [`device-management.md`](device-management.md)
 
 The supported failure-handling primitives are:
 
-- **fs-driver crash.** vfsd MAY respawn a failed fs driver and
-  reinstall the new root cap. Other mounts are unaffected; the
-  block driver is unaffected. The respawn path uses
-  `CREATE_FROM_FILE` against vfsd's own held system-root cap walked
-  to `/services/<driver>`.
+- **fs-driver crash.** Not handled: vfsd does not observe fs-driver
+  death and does not respawn a driver; the mount stays installed
+  against the dead endpoint. Other mounts and the block driver are
+  unaffected.
 - **Mount-tree-wide revocation.** `cap_revoke` on an fs driver's
   namespace endpoint cascades through the kernel derivation graph
   and invalidates every cap ever derived from it: vfsd's retained
@@ -247,11 +259,20 @@ To prevent inference of behavior that does not exist:
   and no kernel command line carrying mount config.
 - **No process-global filesystem authority.** A process delivered no
   namespace cap has no filesystem access; `std::fs` returns
-  `Unsupported`. There is no fallback to a system identity.
+  `Unsupported`. There is no fallback to a system identity. See
+  [`runtime/ruststd/README.md`](../runtime/ruststd/README.md).
 
 ---
 
 ## Summarized By
 
-[README.md](../README.md),
-[architecture.md](architecture.md)
+[System Bootstrap](bootstrap.md), [Build System](build-system.md),
+[rootfs/README.md](../rootfs/README.md),
+[services/drivers/README.md](../services/drivers/README.md),
+[services/drivers/virtio/blk/README.md](../services/drivers/virtio/blk/README.md),
+[services/fs/README.md](../services/fs/README.md),
+[init Bootstrap Stages](../services/init/docs/bootstrap.md),
+[Restart Protocol](../services/svcmgr/docs/restart-protocol.md),
+[services/vfsd/README.md](../services/vfsd/README.md),
+[vfsd Service Interface](../services/vfsd/docs/vfs-ipc-interface.md),
+[xtask/README.md](../xtask/README.md)

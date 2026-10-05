@@ -32,7 +32,7 @@ the system-scope IOMMU model.
 The bootloader does **not** resolve `interrupt-map` tables, complex
 `ranges` translations, phandle graphs, or node-tree semantics beyond a
 flat walk. Driver binding and property-evaluation logic belong to
-`devmgr`.
+`devmgr` (see [`docs/device-management.md`](../../../docs/device-management.md)).
 
 ---
 
@@ -69,7 +69,8 @@ Walker limits: `MAX_DEPTH = 8` for node nesting, `MAX_REG_ENTRIES = 8`
 for `reg` tuples per node, `MAX_IRQ_ENTRIES = 4` for `interrupts`
 values, `MAX_RANGES_ENTRIES = 4` for PCI `ranges`. Nodes exceeding
 these bounds truncate silently — the bootloader does not need
-exhaustive coverage; `devmgr` re-parses the full DTB.
+exhaustive coverage; `devmgr` re-parses the full DTB (see
+[`docs/device-management.md`](../../../docs/device-management.md)).
 
 ---
 
@@ -81,7 +82,7 @@ contributes its first `reg` entry as an `MmioAperture` seed; PCI host
 bridges additionally contribute their MMIO `ranges` windows. Unknown
 `compatible` strings are skipped
 without warning; `devmgr` is responsible for identifying every other
-device.
+device (see [`docs/device-management.md`](../../../docs/device-management.md)).
 
 PCI host bridges match `pci-host-ecam-generic`.
 A node's raw `interrupts` values are collected alongside its `reg`
@@ -117,4 +118,4 @@ bootloader never halts on a DTB parse error.
 
 ## Summarized By
 
-[boot/README.md](../README.md), [boot-flow.md](boot-flow.md)
+[Boot Flow](boot-flow.md), [Early Console](console.md)

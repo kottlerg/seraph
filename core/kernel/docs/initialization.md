@@ -57,6 +57,9 @@ instruction is used in a loop to handle spurious wakeups.
    baseline runs (see docs/platform-requirements.md)
 ```
 
+The step-4 gate and the baseline it enforces are defined in
+[platform-requirements.md](../../../docs/platform-requirements.md) § Boot-Time Feature Gate.
+
 The early console is allocation-free and output-only.
 
 **Failure mode:** If no output device is found, initialisation continues silently.
@@ -96,6 +99,9 @@ has accepted the platform.
 6. For each candidate range, call BuddyAllocator::add_region(phys_start, phys_end)
 7. Emit: total usable RAM in MiB
 ```
+
+`MAX_ORDER` and the per-CPU boot slab sizing it accommodates are specified in
+[memory-internals.md](memory-internals.md) § Buddy Allocator.
 
 The buddy allocator MUST be initialized from a static buffer or boot stack, not
 from itself.
@@ -148,6 +154,13 @@ has no heap (see Phase 4).
    framebuffer-mirrored console)
 ```
 
+The direct-map page sizes, the kernel-half floor, and the KASLR placement of the direct map
+are defined in [memory-model.md](../../../docs/memory-model.md) § Virtual Address Space Layout
+and § Paging. The bootloader page table retired in step 7 is described in
+[page-tables.md](../../boot/docs/page-tables.md), and the scratch pages and bundle layout
+reclaimed alongside it in [boot-flow.md](../../boot/docs/boot-flow.md). The step-8 disclosure
+rule is recorded in [cross-boundary-disclosure.md](cross-boundary-disclosure.md).
+
 After this phase, the kernel can access any physical frame at `direct_map_base() + phys`.
 All kernel pointers derived from physical addresses use this translation.
 
@@ -175,6 +188,10 @@ Emit "fatal: cannot build kernel page tables (OOM)" and halt.
    per-CPU state and idle stacks, and the entropy subsystem's per-CPU CSPRNGs,
    central pool, jitter accumulators, and self-test sample slab (see entropy.md)
 ```
+
+Retype-based kernel object memory, which replaces a kernel heap, is specified in
+[memory-internals.md](memory-internals.md) § Kernel Object Memory; the entropy
+subsystem's per-CPU state is described in [entropy.md](entropy.md).
 
 **Failure mode:** a failed per-CPU storage allocation halts the kernel.
 
@@ -215,6 +232,9 @@ Architecture-specific hardware initialization; x86-64 and RISC-V diverge here.
    TSC-deadline mode where CPUID advertises it, periodic APIC timer otherwise
 8. Enable interrupts (STI)
 ```
+
+The step-7 timer mode selection is specified in [arch-interface.md](arch-interface.md)
+§ `timer`.
 
 ### RISC-V
 
@@ -321,6 +341,12 @@ Phase 7.
 6. Emit: "capability system initialised, N slots populated"
 ```
 
+The SbiControl rights are defined in
+[capability-model.md § SbiControl](../../../docs/capability-model.md). Init's reap-time
+donation of the reclaim caps is described in
+[process-lifecycle.md § Init reap](../../../docs/process-lifecycle.md), and the sealed buddy
+in [userspace-memory-model.md § Ownership Boundaries](../../../docs/userspace-memory-model.md).
+
 **Failure mode:** Allocation failure during CSpace construction halts with
 "fatal: cannot initialise capability system".
 
@@ -331,6 +357,8 @@ MMIO aperture array, reclaim-array page, transient page-table frames)
 and the bundle's non-module pages (header + entry table + 4 KiB pad,
 init ELF source body, inter-module and trailing slack — module bodies
 are excluded because `mint_module_memory_caps` already covers them).
+The scratch pages and bundle layout are described in
+[boot-flow.md](../../boot/docs/boot-flow.md).
 
 ---
 
@@ -368,6 +396,10 @@ are excluded because `mint_module_memory_caps` already covers them).
    cspace_layout so init sees the cap through the standard CSpace
    handoff in Phase 9.
 ```
+
+The run-queue structure, idle priority, and idle-thread loop are specified in
+[scheduler.md](scheduler.md) § Run Queue Structure and § Idle Thread; the step-5
+self-test in [entropy.md](entropy.md) § Boot wiring and lifecycle.
 
 The AP SIPI trampoline page is flagged `RECLAIM_FLAG_LATE` in
 `BootInfo.reclaim_ranges`. `cap::mint_reclaim_memory_caps` skips it in
@@ -471,6 +503,13 @@ calls `sched::enter()`.
       then return_to_user(tf_ptr) — restores registers and executes sret
 ```
 
+The PIE bias window, relocation rules, and init stack placement are defined in
+[userspace-memory-model.md](../../../docs/userspace-memory-model.md) § Image Placement and
+§ Bootstrap Cross-Boundary VAs; the kernel-half root entries and W^X rule in
+[memory-model.md](../../../docs/memory-model.md) § Virtual Address Space Layout and § Paging;
+the reap-time donation of the stack pages in
+[process-lifecycle.md § Init reap](../../../docs/process-lifecycle.md).
+
 **Implementation notes:**
 - CSpace hand-off (step 5d): `sched::enter()` calls `set_current(init_tcb)` so
   `current_tcb()` returns the init TCB during init's syscalls; init receives
@@ -532,9 +571,18 @@ that CPU only; the BSP and other CPUs continue.
 
 ## Summarized By
 
-[kernel/README.md](../README.md), [docs/bootstrap.md](../../../docs/bootstrap.md),
-[docs/memory-model.md](../../../docs/memory-model.md),
-[docs/userspace-memory-model.md](../../../docs/userspace-memory-model.md),
-[cross-boundary-disclosure.md](cross-boundary-disclosure.md),
-[boot/docs/boot-flow.md](../../boot/docs/boot-flow.md),
-[boot/docs/memory-map.md](../../boot/docs/memory-map.md)
+[abi/boot-protocol/README.md](../../../abi/boot-protocol/README.md),
+[Boot Flow](../../boot/docs/boot-flow.md), [ELF Loading](../../boot/docs/elf-loading.md),
+[Firmware Parsing](../../boot/docs/firmware-parsing.md),
+[Kernel Handoff Contract](../../boot/docs/kernel-handoff.md),
+[Memory Map Translation](../../boot/docs/memory-map.md),
+[Page Tables](../../boot/docs/page-tables.md), [core/kernel/README.md](../README.md),
+[Kernel Cross-Boundary Disclosure Inventory](cross-boundary-disclosure.md),
+[Kernel Entropy Subsystem](entropy.md), [Memory Subsystem Internals](memory-internals.md),
+[SMP Scheduling and Locking Invariants](scheduling-internals.md),
+[System Bootstrap](../../../docs/bootstrap.md),
+[Capability Model](../../../docs/capability-model.md),
+[Device Management](../../../docs/device-management.md),
+[Memory Model](../../../docs/memory-model.md),
+[Userspace Memory Model](../../../docs/userspace-memory-model.md),
+[shared/elf/README.md](../../../shared/elf/README.md)

@@ -8,13 +8,15 @@ Per [docs/documentation-standards.md](../docs/documentation-standards.md) § Doc
 - Each component’s `README.md` defines that component’s scope, role, and links to any authoritative
   design documents.
 - Detailed behavior is defined only in component-specific `docs/` where present.
-- `docs/coding-standards.md` is a system-wide, non-negotiable authority.
-  - All code changes MUST comply with its rules.
-  - Any deviation MUST be minimal, local, and explicitly justified at the point of use.
-- `docs/documentation-standards.md` is a system-wide, non-negotiable authority.
-  - All documentation changes MUST comply with its rules.
-- Existing history or code that violates a written rule is not a convention;
-  the rule governs new work.
+
+- `docs/coding-standards.md` governs all source code; all code changes MUST comply with its
+  rules (per its preamble), and a suppression MUST be narrowly scoped and carry a rationale
+  comment at the point of use (per [docs/coding-standards.md](../docs/coding-standards.md)
+  § E. Exception Policy).
+- `docs/documentation-standards.md` is the authoritative standard for all documentation; all
+  documentation changes MUST comply with its rules (per its preamble).
+- For the assistant: existing history or code that violates a written rule is not a
+  convention; the rule governs new work.
 
 ## Coding invariants
 See [docs/coding-standards.md](../docs/coding-standards.md) — non-negotiable authority.
@@ -34,7 +36,7 @@ truth for "how work is tracked and shipped" on this project.
   defines (grouping READMEs and the root README only route to them):
   1. System scope (`docs/`)
   2. Component scope (`<component>/README.md`)
-  3. Component design scope (`<component>/docs/*.md`)
+  3. Design-authority scope (`<component>/docs/*.md`)
 - Additional documentation MUST NOT be loaded unless required by the task.
 
 ## Tooling constraints
@@ -67,9 +69,10 @@ truth for "how work is tracked and shipped" on this project.
   `target/xtask/review/pr<N>/<mode>-<head>.md` and the returned
   findings, recorded, dropped, and audit fields as `<mode>-<head>.json`
   beside it, and surface both verdict lines to the user verbatim. If the
-  Workflow tool is unavailable, invoke `@pr-reviewer` and `@pr-auditor`
-  directly in parallel (single message, two `Agent` tool calls) with the
-  PR number as scope and the open Issue list (`gh issue list --state
+  Workflow tool is unavailable (the directly invoked agents are then the review, per
+  [docs/conventions.md](../docs/conventions.md) § Branch and PR Workflow), invoke
+  `@pr-reviewer` and `@pr-auditor` directly in parallel (single message, two
+  `Agent` tool calls) with the PR number as scope and the open Issue list (`gh issue list --state
   open --limit 500 --json number,title`), and the same verdict handling.
 
   Per [docs/conventions.md](../docs/conventions.md) § Branch and PR
@@ -93,7 +96,8 @@ truth for "how work is tracked and shipped" on this project.
   with the user's approval, per "Completeness" below.
 
   After the fixes are pushed and CI is green again, run the workflow in
-  `delta` mode. Prompt for the merge decision only when a run completes
+  `delta` mode. Prompt for the merge decision only when a run completes (per
+  [docs/conventions.md](../docs/conventions.md) § Branch and PR Workflow)
   with no failed agent, `READY TO MERGE`, and `AUDIT PASS` (the reviewer
   verdict counts findings on the surface; recorded off-surface findings do
   not block). Merge via `gh pr merge <N> --merge --delete-branch` (per

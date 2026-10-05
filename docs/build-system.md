@@ -3,8 +3,9 @@
 Seraph uses Cargo as its build system. `cargo xtask` provides commands for
 cross-compilation, QEMU invocation, and artifact management for x86-64 and
 RISC-V from a single source tree. Kernel is soft-float on both
-architectures (x86-64 baseline; RV64IMAC); userspace pins x86-64-v3 and
-the RVA23U64 subset respectively.
+architectures (x86-64 baseline; RV64IMAC); std-userspace pins x86-64-v3 and
+the RVA23U64 subset respectively; low-level userspace (init, ktest, memmgr)
+keeps the kernel's soft-float baseline.
 
 ---
 
@@ -15,7 +16,7 @@ components must be installed:
 
 | Component | Purpose |
 |---|---|
-| `rust-src` | Required for `-Zbuild-std` (rebuilds `core`/`alloc` for custom targets) |
+| `rust-src` | Required for `-Zbuild-std` (rebuilds `core`/`alloc`, and `std` for std-userspace triples, from source) and the overlaid `std::sys::seraph` mirror |
 | `rustfmt` | Code formatting |
 | `clippy` | Linting |
 | `llvm-tools` | `llvm-objcopy`, `llvm-objdump`, symbol map utilities |
@@ -54,8 +55,9 @@ syscalls lives in [`shared/syscall`](../shared/syscall/README.md).
 ## Custom Targets
 
 The kernel cannot be compiled with standard Rust targets because it requires
-specific hardware configuration: no red zone, no SSE/AVX before explicit
-initialisation, and the kernel code model for higher-half placement.
+specific hardware configuration: no red zone, no SSE/AVX/MMX codegen
+(soft-float throughout), and a static-PIE image the bootloader relocates into
+the higher half.
 Std-enabled userspace additionally needs a Seraph-OS target (`os: seraph`)
 so `-Zbuild-std` selects `std::sys::seraph` rather than `std::sys::unknown`.
 
@@ -68,7 +70,7 @@ Key properties shared by the kernel-triple JSONs
 (`x86_64-seraph-none.json`, `riscv64imac-seraph-none.json`):
 
 - x86-64: red zone off, SSE/AVX/MMX off, soft-float, small code model.
-- RISC-V: RV64IMAC feature set, soft-float, medium code model, lp64 ABI.
+- RISC-V: RV64IMAC plus Svinval/Svpbmt/Svnapot, soft-float, medium code model, lp64 ABI.
 - Both: `panic-strategy: abort`, `relocation-model: pic`, `-pie
   --no-dynamic-linker -Bsymbolic -z max-page-size=4096` link args, link
   with `rust-lld`. The kernel is a static-PIE (`ET_DYN`) image; the
@@ -90,9 +92,9 @@ kernel-side soft-float discipline, and pin a hard-microarchitecture
 floor for userspace SIMD / Vector codegen:
 
 - `x86_64-seraph.json` — **x86-64-v3** psABI feature level: SSE2/3/SSSE3/
-  SSE4.1/4.2, AVX, AVX2, FMA, BMI1/2, LZCNT, MOVBE, F16C, POPCNT, plus
-  XSAVE for the eager-save / lazy-restore discipline.
-- `riscv64a23-seraph.json` — **RVA23U64** userspace profile (RVA23 v1.0,
+  SSE4.1/4.2, AVX, AVX2, FMA, BMI1/2, LZCNT, MOVBE, F16C, POPCNT, CX16, LAHF/SAHF,
+  plus XSAVE/XSAVEOPT for the eager-save / lazy-restore discipline.
+- `riscv64a23-seraph.json` — a subset of the **RVA23U64** userspace profile (RVA23 v1.0,
   ratified 2024-10-21): IMAFDCV plus the Zba/Zbb/Zbs bitmanip set,
   hard-float LP64D ABI.
 
@@ -103,8 +105,9 @@ uses opportunistically, or does not support, and the boot-time feature-gate that
 
 Userspace correctness under preemption is provided by eager FP/SIMD/V save
 on switch-out and lazy restore on first FP/V use after switch-in (`#NM`
-trap on x86-64, illegal-instruction trap on RISC-V). See
-`core/kernel/src/arch/{x86_64,riscv64}/fpu.rs` for the per-arch primitives.
+trap on x86-64, illegal-instruction trap on RISC-V). The switch-out save discipline is
+specified in [scheduling-internals.md](../core/kernel/docs/scheduling-internals.md#ipi-taxonomy);
+the per-arch primitives are in `core/kernel/src/arch/{x86_64,riscv64}/fpu.rs`.
 
 The x86-64 bootloader uses the built-in `x86_64-unknown-uefi` target, so no
 custom JSON is needed. The RISC-V bootloader uses
@@ -112,8 +115,8 @@ custom JSON is needed. The RISC-V bootloader uses
 
 Custom targets require `-Zbuild-std` (`core,alloc,compiler_builtins` for
 kernel/no_std triples; `core,alloc,std,panic_abort` for std-userspace
-triples) to rebuild the standard library from source. The build scripts
-pass the flag explicitly.
+triples) to rebuild the standard library from source. `cargo xtask build`
+passes the flag explicitly.
 
 By default `os: seraph` is not in rustc's recognised-OS list, so upstream
 `std`'s build script would mark the crate `restricted_std`-gated. Because
@@ -145,8 +148,8 @@ use the directory names `debug`/`release`.
 ### Debuginfo is opt-in
 
 `debug = 0` means a plain `cargo xtask build` (or `--release`) emits no
-per-binary DWARF — every installed binary is symbol-free. To debug specific
-components, opt them in:
+per-binary DWARF — every installed binary carries no debuginfo (symbol tables
+remain; no `strip` is configured). To debug specific components, opt them in:
 
 ```
 cargo xtask build --debug <component>[,<component>…]
@@ -154,7 +157,7 @@ cargo xtask build --debug <component>[,<component>…]
 
 This injects `--config profile.<active>.package."<pkg>".debug=2` plus
 `opt-level=1` for the named package(s) only, leaving every other binary
-symbol-free. `<active>` is `dev` by default, `release` under `--release`.
+without debuginfo. `<active>` is `dev` by default, `release` under `--release`.
 The debugged crate drops to `opt-level = 1` (not `0`): opt-0 inflates stack
 frames and risks overflowing the tight kernel/thread stacks.
 
@@ -182,7 +185,7 @@ sysroot/
         BOOTX64.EFI       # x86-64
         BOOTRISCV64.EFI   # RISC-V
       seraph/             # Seraph vendor directory
-        boot.efi          # Bootloader (also copied to EFI/BOOT/<arch>.EFI)
+        boot.efi          # Bootloader (also copied to EFI/BOOT/BOOT<arch>.EFI)
         kernel            # Microkernel
         bootstrap.bundle  # Init + every boot module, packed by
                           # `cargo xtask build` (or `compose-bundle`)
@@ -196,17 +199,20 @@ sysroot/
                           # pwrmgr, timed). The bundle composer reads
                           # from this tree.
   services/drivers/       # Device drivers sourced from
-                          # services/drivers/<x>/ (cmos-rtc on x86-64,
-                          # goldfish-rtc on RISC-V, virtio-blk).
+                          # services/drivers/<x>/ (the
+                          # InstallDest::ServicesDrivers entries in
+                          # xtask/src/commands/build.rs SPECS; per-arch
+                          # RTC drivers install only on their arch).
                           # Grouped to anticipate per-spawner namespace
                           # attenuation.
   services/fs/            # Filesystem drivers sourced from
                           # services/fs/<x>/ (fatfs today). VFS-loaded
                           # respawns walk /services/fs/<name>.
   programs/               # Userspace utilities and test programs sourced
-                          # from programs/ in the repo tree (hello,
-                          # fsbench, stackoverflow, pipefault,
-                          # stdiotest). Loaded by procmgr from the root
+                          # from programs/ in the repo tree (the
+                          # InstallDest::Programs entries in
+                          # xtask/src/commands/build.rs SPECS).
+                          # Loaded by procmgr from the root
                           # partition via VFS at runtime.
   tests/                  # All test artifacts: kernel-surface harness
                           # (ktest), services-surface (svctest),
@@ -218,8 +224,9 @@ sysroot/
                           # the usertest orchestrator.
   config/                 # System configuration (from rootfs/)
   data/                   # Data files used by fs / namespace tests
-                          # (from rootfs/), plus svctest scratch space
-                          # synthesised under data/svctest/.
+                          # (from rootfs/), plus deterministic svctest
+                          # fixtures synthesised under data/svctest/,
+                          # which svctest also uses as scratch space.
 ```
 
 The UEFI firmware discovers the bootloader at `EFI/BOOT/BOOT<arch>.EFI`
@@ -241,7 +248,8 @@ partition, except the discoverable `/data` mountpoint.
 The `esp/` and root-partition trees are populated from two sources:
 
 - Compiled binaries are installed by `cargo xtask build` to their
-  destinations (`esp/EFI/seraph/<name>` for boot modules,
+  destinations (`esp/EFI/seraph/kernel` for the kernel; boot modules reach
+  the ESP only inside `bootstrap.bundle`),
   `services/<name>`, `services/drivers/<name>`,
   `services/fs/<name>`, or `programs/<name>` for std-userspace
   binaries, `tests/<name>` or `tests/programs/<name>` for harness
@@ -286,8 +294,9 @@ guest as a virtio-blk-pci device.
 
 **RISC-V:** Requires `edk2-riscv64` firmware. `cargo xtask run` searches
 per-platform default paths and pads `RISCV_VIRT_CODE.fd` / `RISCV_VIRT_VARS.fd`
-to 32 MiB in temporary files if necessary (QEMU virt ≥ 9.0 requires exactly
-32 MiB). `SERAPH_RISCV_CODE` and `SERAPH_RISCV_VARS` override discovery;
+to 32 MiB in cached copies under `target/xtask/firmware/riscv/` (the code image
+regenerated only when stale, the vars template re-copied every launch); QEMU virt
+≥ 9.0 requires exactly 32 MiB. `SERAPH_RISCV_CODE` and `SERAPH_RISCV_VARS` override discovery;
 they are an all-or-nothing pair (setting only one is rejected).
 
 **Acceleration:** controlled by `SERAPH_ACCEL` (`auto` / `tcg` / `kvm` /
@@ -300,12 +309,14 @@ table lives in [`xtask/README.md`](../xtask/README.md#environment-variables).
 **Minimum QEMU version:** QEMU ≥ 8.0 (V extension support) is required;
 `xtask/src/qemu.rs` passes
 `-cpu rv64,v=true,zba=true,zbb=true,zbs=true,svpbmt=on,svinval=on,svnapot=on`
-for RISC-V and `-cpu max,migratable=no` on x86-64 TCG. The explicit
-feature string is the source of truth; the supervisor paging extensions
+plus the `--riscv-mmu` satp-mode suffix (default `,sv57=off`) for RISC-V and
+`-cpu max,migratable=no` on x86-64 TCG. The explicit feature string is the source of
+truth; the supervisor paging extensions
 (Svpbmt, Svinval, Svnapot) are required by the kernel's boot-time
-feature-gate, which refuses CPUs that lack them. The named
-`-cpu rva23s64` single-flag equivalent (QEMU ≥ 9.1, 2024-09) is a
-documented configuration alternative when the CI runner floor supports it.
+feature-gate, which refuses CPUs that lack them (see
+[platform-requirements.md](platform-requirements.md)). The named
+`-cpu rva23s64` model (QEMU ≥ 9.1, 2024-09), a superset that adds the remaining RVA23
+mandates, is a documented configuration alternative when the CI runner floor supports it.
 
 ---
 
@@ -351,7 +362,7 @@ CI workflows live in `.github/workflows/`. Local equivalents are the
 
 | Workflow | Trigger | Purpose |
 |---|---|---|
-| `build-test.yml` | push to `master`, PR to `master`, manual dispatch | Light validation: one `host-tests` job runs `cargo xtask lint-docs` and then `cargo xtask test`; the matrix `validate` job builds each `arch × profile` cell, then per-tester either stages a recipe + `mkdisk` (svctest, usertest) or re-composes the bundle via `compose-bundle --harness ktest`, and runs one iteration. |
+| `build-test.yml` | push to `master`, PR to `master`, manual dispatch | Light validation: one `host-tests` job runs `cargo xtask lint-docs` and then `cargo xtask test`; the matrix `validate` job builds each `arch × profile` cell, then per-tester either stages a recipe (svctest also co-stages `crasher`), drops the autostarted `terminal`, and runs `mkdisk --repack-only` (svctest, usertest), or re-composes the bundle via `compose-bundle --harness ktest`, and runs one `run-parallel --parallel 1 --runs 1 --timeout 180` iteration; ktest cells then run `test-kaslr`, and usertest cells re-mirror the default boot (`mkdisk`) and run `test-terminal`, plus `test-vmgenid` on x86_64. |
 | `burnin.yml` | tag push (`v*.*.*`), manual dispatch | Heavy validation: the `arch × profile × tester` matrix builds each cell, stages that one harness (svctest/usertest drop the autostarted `terminal` and `mkdisk --repack-only`; ktest via `compose-bundle --harness ktest`), then burns it in with `run-parallel --parallel 2 --runs 20 --timeout 180`. |
 | `release.yml` | tag push (`v*.*.*`), manual dispatch | A `preflight` job verifies the workspace version matches the tag and `docs/releases/<tag>.md` exists and follows the template; then builds release-profile disk images per architecture, compresses with zstd, generates `SHA256SUMS`, creates a draft GitHub Release whose body is `docs/releases/<tag>.md`. |
 
@@ -360,6 +371,9 @@ CI workflows live in `.github/workflows/`. Local equivalents are the
 cancel on the same ref — a tag-push run completes even if a later tag
 pushes.
 
+Harness staging and the per-cell boot sequence are specified in
+[testing.md](testing.md#gating).
+
 The merge-gating rule (CI must pass green before merge) lives in
 [conventions.md](conventions.md#branch-and-pr-workflow).
 
@@ -367,5 +381,9 @@ The merge-gating rule (CI must pass green before merge) lives in
 
 ## Summarized By
 
-[README.md](../README.md), [conventions.md](conventions.md),
-[ruststd/README.md](../runtime/ruststd/README.md)
+[README.md](../README.md), [ELF Loading](../core/boot/docs/elf-loading.md),
+[core/kernel/README.md](../core/kernel/README.md), [Coding Standards](coding-standards.md),
+[Platform Requirements](platform-requirements.md), [rootfs/README.md](../rootfs/README.md),
+[runtime/ruststd/README.md](../runtime/ruststd/README.md),
+[`.svc` Service Definitions](../services/svcmgr/docs/service-definitions.md),
+[xtask/README.md](../xtask/README.md), [xtask/targets/README.md](../xtask/targets/README.md)

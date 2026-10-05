@@ -62,16 +62,19 @@ segments share one `p_vaddr → p_paddr` offset, no two segments' physical range
 and the entry point lies within a `PT_LOAD` segment. A violation is surfaced as
 `BootError::InvalidElf`.
 
-The kernel is a **static-PIE** (`ET_DYN`) image (an `ET_EXEC` kernel is still accepted
-and pinned to zero slide). Its `.rela.dyn` table is pre-located and validated during
-load — `RELATIVE`-only, every target inside the load span — and `relocate_kernel`
+The kernel is a **static-PIE** (`ET_DYN`) image
+([build-system.md](../../../docs/build-system.md#custom-targets)); an `ET_EXEC` kernel is
+still accepted and pinned to zero slide. Its `.rela.dyn` table is pre-located and validated
+during load — `RELATIVE`-only, every target inside the load span — and `relocate_kernel`
 applies it (`*target = slide + addend`) through the copied span before the page tables
-are built, then biases `KernelInfo`'s virtual base and entry by the KASLR slide. The
-slide is 2 MiB-aligned within the top-2 GiB window (0 when there is no boot entropy or
-the `nokaslr` knob is present). The dynamic-linking sections lld emits under `-pie`
-(`.rela.dyn`, `.dynamic`, `.got`, …) are placed inside the image's read-only region by
-the kernel linker scripts, so they keep the single-linear-offset invariant above and
-Phase 3 maps them read-only.
+are built, then biases `KernelInfo`'s virtual base and entry by the KASLR slide
+([boot-flow.md](boot-flow.md#step-5d-apply-the-kaslr-slide)). The slide is 2 MiB-aligned
+within the top-2 GiB window (0 when there is no boot entropy or the `nokaslr` knob is
+present; see [memory-model.md](../../../docs/memory-model.md#virtual-address-space-layout)).
+The dynamic-linking sections lld emits under `-pie` (`.rela.dyn`, `.dynamic`, `.got`, …)
+are placed inside the image's read-only region by the kernel linker scripts, so they keep
+the single-linear-offset invariant above and Phase 3 maps them read-only
+([initialization.md](../../kernel/docs/initialization.md#phase-3-kernel-page-tables)).
 
 The shared-crate format validation applies to both the kernel ELF and the init
 ELF; the placement ruleset above is kernel-only. Boot modules (the
@@ -153,7 +156,8 @@ For each PT_LOAD segment:
 rejected with `BootError::WxViolation` (§ Categories); otherwise `ReadExecute` if
 `PF_X` is set, `ReadWrite` if `PF_W` is set, `Read` if neither. The resulting `InitImage`
 (entry point + segment array) is stored in `BootInfo.init_image`. The kernel uses
-the `phys_addr`/`virt_addr` pairs to build init's page tables without an ELF parser.
+the `phys_addr`/`virt_addr` pairs to build init's page tables without an ELF parser; see
+[initialization.md](../../kernel/docs/initialization.md#phase-9-init-creation-and-scheduler-entry).
 
 Both `ET_EXEC` and `ET_DYN` init images are accepted
 (`elf::validate_executable`). For `ET_DYN`, `InitImage.flags` carries
@@ -165,7 +169,9 @@ DT_RELASZ`. The `PT_GNU_RELRO` span rides along unbiased
 read-only after relocation. Segment `virt_addr`s and the entry point
 stay unbiased link VAs — the kernel draws the load bias and applies the
 `RELATIVE` relocations itself (the kernel, not the bootloader, owns the
-layout draw; see `kernel/src/mm/init_reloc.rs` and ASLR
+layout draw; see
+[initialization.md](../../kernel/docs/initialization.md#phase-9-init-creation-and-scheduler-entry),
+`kernel/src/mm/init_reloc.rs`, and ASLR
 [#39](https://github.com/kottlerg/seraph/issues/39)). An `ET_DYN` image
 whose dynamic section describes any other relocation format
 (`DT_REL`/`DT_RELR`/active `DT_JMPREL`) is rejected as invalid.
@@ -194,8 +200,9 @@ Bundle bodies are 4 KiB-aligned per `BODY_ALIGNMENT`, so
 a page-rounded allocation (the kernel's `mint_module_memory_caps`,
 which rounds `size` up to the next page boundary for the Memory cap)
 does not need to copy or relocate bytes. Init receives the module
-slice via its initial `CSpace` and is responsible for validating and
-starting each service.
+slice via its initial `CSpace`
+([init bootstrap.md](../../../services/init/docs/bootstrap.md#initial-cspace-at-_start))
+and is responsible for validating and starting each service.
 
 ---
 
@@ -208,10 +215,12 @@ binary needs no change. `BootInfo.modules.count` accurately reflects
 the bundle's non-`init` entry count; the kernel and init iterate it
 without assuming a fixed count or fixed ordering, and init looks
 modules up by name via `InitInfo::module_names` rather than by
-ordinal.
+ordinal ([init bootstrap.md](../../../services/init/docs/bootstrap.md#initial-cspace-at-_start)).
 
 ---
 
 ## Summarized By
 
-[boot/README.md](../README.md), [boot-flow.md](boot-flow.md)
+[core/boot/README.md](../README.md), [Boot Flow](boot-flow.md), [Page Tables](page-tables.md),
+[UEFI Environment](uefi-environment.md), [System Bootstrap](../../../docs/bootstrap.md),
+[Userspace Memory Model](../../../docs/userspace-memory-model.md)

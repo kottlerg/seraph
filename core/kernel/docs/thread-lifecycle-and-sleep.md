@@ -158,7 +158,7 @@ the handler uses for the target's `state` write.
 |---|---|---|---|---|
 | `sys_cap_create_thread` | (uninit) | `Created` | calling CPU | none — TCB not yet visible to schedulers; written in-place during construction. |
 | `sys_thread_configure` | `Created` | `Created` | calling CPU | does NOT touch `state`; mutates `trap_frame` and `saved_state.fs_base`. Target MUST be `Created`. |
-| `sys_thread_start` (first start) | `Created` | `Ready` | calling CPU | `await_descheduled(target)` (drains the target off every CPU's `current` and waits `context_saved == 1`; a never-dispatched `Created` thread is `current` nowhere, so this returns immediately), then `set_state_under_all_locks(target, Ready)`, then `enqueue_ready_thread(target_cpu)`. The all-locks write closes the dealloc race: a concurrent `dealloc_object(Thread)` on another CPU cannot free the TCB between the state write and the link. `enqueue_ready_thread` (not `enqueue_and_wake`) is used because the gated wake would coalesce an already-`Ready` thread and silently drop the link. Both the commit and the link refuse an `Exited` target (`StateCommit::RefusedExited` / `false`): the syscall's state precheck ran without a lock, and an object teardown or an exit on another CPU may have ended the thread since; the syscall then returns `InvalidArgument` and nothing is linked. |
+| `sys_thread_start` (first start) | `Created` | `Ready` | calling CPU | `await_descheduled(target)` (drains the target off every CPU's `current` and waits `context_saved == 1`; a never-dispatched `Created` thread is `current` nowhere, so this returns immediately), then `set_state_under_all_locks(target, Ready)`, then `enqueue_ready_thread(target_cpu)`. The all-locks write closes the dealloc race: a concurrent `dealloc_object(Thread)` on another CPU cannot free the TCB between the state write and the link. `enqueue_ready_thread` (not `enqueue_and_wake`) is used because the gated wake would coalesce an already-`Ready` thread and silently drop the link (see [scheduling-internals.md § ThreadState Transitions](scheduling-internals.md#threadstate-transitions)). Both the commit and the link refuse an `Exited` target (`StateCommit::RefusedExited` / `false`): the syscall's state precheck ran without a lock, and an object teardown or an exit on another CPU may have ended the thread since; the syscall then returns `InvalidArgument` and nothing is linked. |
 | `sys_thread_start` (resume from stop) | `Stopped` | `Ready` | calling CPU | Same as first-start, but the `await_descheduled` drain is load-bearing here: a thread stopped while Running may still be `current`/executing on a remote CPU. The drain runs while the target is still `Stopped` (a state `schedule()`'s requeue denylist rejects, so the owning CPU deschedules it without re-linking), and only then commits `Ready` and force-links it — otherwise `enqueue_ready_thread` would dispatch a still-live thread on a second CPU (the cross-CPU double-dispatch of #314/#293). The kernel uses `sys_thread_start` for both first-start and resume; this overload is intentional and `Stopped → Ready` is a permitted transition. |
 | `sys_thread_stop` (running self) | `Running` | `Stopped` | calling CPU = running CPU | `set_state_under_all_locks(target, Stopped)`, then `schedule(false)` immediately yields. The skip-loop in `schedule()` never re-enqueues a `Stopped` TCB. |
 | `sys_thread_stop` (running remote) | `Running` | `Stopped` | calling CPU ≠ running CPU | `set_state_under_all_locks(target, Stopped)` returns `StateCommit::Committed(Some(run_cpu))`; the syscall handler then calls `prod_remote_cpu(run_cpu)` (sends an IPI so the target traps into kernel and runs `schedule()`) and bounded-spins until `sched_remote.current != target_tcb` or the target is no longer `Stopped` (a concurrent `sys_thread_start` overtook the stop). The IPI is required for `sys_thread_read_regs` to observe a fresh `trap_frame` snapshot rather than stale registers from the target's previous kernel entry. |
@@ -173,7 +173,7 @@ the handler uses for the target's `state` write.
 | arch fault handler (page fault, GP fault, etc.) | `*` | `Exited` | trapping CPU = current CPU | Same as `sys_exit`. |
 | `dealloc_object(Thread)` (caller ≠ tcb) | `*` | `Exited` | calling CPU (refcount → 0) | Acquires every CPU's scheduler.lock in ascending order, writes `state = Exited`, walks `remove_from_queue` for every CPU, releases all. After release: unconditionally scans every CPU until none has `sched.current == tcb`, then unconditionally on `tcb.context_saved == 1`, then proceeds to source-IPC unlink + free. See Drain Protocol below. |
 | `dealloc_object(Thread)` (caller == tcb, self-teardown) | `Running` | `Exited` | calling CPU = running CPU | A thread deleting the last capability to its own `Thread` object cannot run the post-release scan (its CPU's `current == tcb` never clears from within the spin). Marks Exited + drains run queues only, queues the object on this CPU's deferred-reclaim stack, and returns; the syscall epilogue reschedules and the free completes off-CPU. See [Self-teardown](#self-teardown-the-caller-is-the-freed-thread) below. |
-| `dealloc_object(CSpaceObj)` / `dealloc_object(AddressSpace)` — bound-thread stop (`stop_threads_bound_to`) | `*` | `Exited` | calling CPU (object refcount → 0) | For every registered thread bound to the dying object: `cancel_ipc_block` if `Blocked`, then `exit_under_all_locks(tcb, EXIT_KILLED)` — the `Exited` commit with `EXIT_KILLED` recorded in the same all-locks hold (a commit refused because the thread exited on its own meanwhile writes neither, and that thread still posts its own reason — no death walk posts `EXIT_KILLED`; an observer bound after the stop receives it through the bind); running CPUs are prodded after the registry lock is released and the caller spins until no other CPU has a bound thread as `current` (and, for an `AddressSpace`, until `active_cpus` is empty). The thread is stopped, not freed: its object waits for its own last cap. If the caller's own thread is stopped — bound here, or by a concurrent teardown — nothing is freed: the object goes onto this CPU's deferred-reclaim stack (as in the self-teardown row) and the epilogue schedules the thread away. See docs/scheduling-internals.md § Thread Registry. |
+| `dealloc_object(CSpaceObj)` / `dealloc_object(AddressSpace)` — bound-thread stop (`stop_threads_bound_to`) | `*` | `Exited` | calling CPU (object refcount → 0) | For every registered thread bound to the dying object: `cancel_ipc_block` if `Blocked`, then `exit_under_all_locks(tcb, EXIT_KILLED)` — the `Exited` commit with `EXIT_KILLED` recorded in the same all-locks hold (a commit refused because the thread exited on its own meanwhile writes neither, and that thread still posts its own reason — no death walk posts `EXIT_KILLED`; an observer bound after the stop receives it through the bind); running CPUs are prodded after the registry lock is released and the caller spins until no other CPU has a bound thread as `current` (and, for an `AddressSpace`, until `active_cpus` is empty). The thread is stopped, not freed: its object waits for its own last cap. If the caller's own thread is stopped — bound here, or by a concurrent teardown — nothing is freed: the object goes onto this CPU's deferred-reclaim stack (as in the self-teardown row) and the epilogue schedules the thread away. See [scheduling-internals.md § Thread Registry](scheduling-internals.md#thread-registry). |
 
 **Why the all-CPU lock acquire in `dealloc_object(Thread)`:**
 
@@ -307,8 +307,9 @@ that CPU (#341).
   satisfied. Any server-side reply-bound client (steps 5/8/11) is woken here.
 
 The same stack carries `CSpace` and `AddressSpace` objects whose teardown
-found the running thread itself stopped (see docs/scheduling-internals.md
-§ Thread Registry); the drain re-enters their arms the same way.
+found the running thread itself stopped (see
+[scheduling-internals.md § Thread Registry](scheduling-internals.md#thread-registry)); the drain
+re-enters their arms the same way.
 
 The drain runs only from contexts that are provably not one of the queued dead
 threads (a live thread's syscall return, or the idle thread), so it can never
@@ -355,7 +356,9 @@ re-enter the wedge it exists to avoid.
    (`stress::thread_churn`, `bench thread_lifecycle`) or worse. Step 10 closes the window:
    `context_saved` is cleared by `schedule()` *before* the save and written `1` (Release) by
    `switch()` *after* the save; spinning on the Acquire load until it observes `1` guarantees the
-   save has fully published. It is unconditional and runs after step 9's `current`-anywhere scan:
+   save has fully published (the `context_saved` protocol of
+   [scheduling-internals.md](scheduling-internals.md#cross-cpu-tcb-ownership) § Cross-CPU TCB
+   Ownership). It is unconditional and runs after step 9's `current`-anywhere scan:
    that scan guarantees no CPU still names tcb as `current`, but a CPU that has just switched *away*
    may still be mid-save into `tcb.saved_state` (the save trails the `current = next` store and the
    lock release), and step 10 is what waits for that save. New TCBs initialise `context_saved = 1`,
@@ -421,7 +424,9 @@ domains:
    `(*server).reply_tcb`; if non-null, `compare_exchange(bound, null, AcqRel, Acquire)` to claim the
    binding, then prepares the bound client for wake and schedules an `enqueue_and_wake` for after
    the all-locks region releases. For a `BlockedOnReply` client it stamps the park episode
-   `INTERRUPTED`; for a `BlockedOnFault` client (handler-thread death) it instead records
+   `INTERRUPTED` (per the episode table in
+   [ipc-internals.md](ipc-internals.md#park-dispositions-and-episodes)); for a `BlockedOnFault`
+   client (handler-thread death) it instead records
    `fault_outcome = Kill` (read on entry to the branch, before `ipc_state` is cleared) so the
    faulter runs its kill path on resume. Without this, a client blocked on a dying server/handler
    would remain blocked indefinitely with a dangling `blocked_on_object` pointer to freed memory.
@@ -500,6 +505,10 @@ invariants common with the global wake protocol (`RESCHEDULE_PENDING`, `non_empt
    the park disposition (Ok(0) on a timer wake, Interrupted on a cancel).
 ```
 
+Step 5's disposition is the park episode's, per
+[ipc-internals.md](ipc-internals.md#park-dispositions-and-episodes) § Park Dispositions and
+Episodes.
+
 **Invariants:**
 
 1. `ipc_state == None` is the discriminator that selects the plain-sleep arm in
@@ -511,7 +520,9 @@ invariants common with the global wake protocol (`RESCHEDULE_PENDING`, `non_empt
    `IpcThreadState::None` arm does no source-lock work; the function then removes the TCB from the
    sleep list (before clearing `sleep_deadline` — the #117 order) and stamps the park episode
    `INTERRUPTED` so the restarted sleeper returns `Interrupted` instead of reporting the truncated
-   sleep as success. The stamp is NOT gated on the remove win: a plain sleeper has no competing
+   sleep as success. The stamp is NOT gated on the remove win (the plain-sleep cleanup row of
+   [ipc-internals.md](ipc-internals.md#park-dispositions-and-episodes) § Park Dispositions and
+   Episodes): a plain sleeper has no competing
    depositor (the timer's claim deposits nothing), and a cancel landing between the commit and
    `sleep_list_add` finds no entry to remove yet must still cancel the park — that window is
    reachable in practice under TCG host-descheduling. A timer claim racing the cancel resolves to
@@ -532,7 +543,9 @@ The handler then drains the target.
 1. Resolve the target Thread cap; reject `Created`, `Exited`, `Stopped` with `InvalidState`.
 2. If `state == Blocked`, call `cancel_ipc_block(target)` — acquires the source IPC lock matching
    `tcb.ipc_state`, unlinks the waiter, and on the claim win stamps the park episode `INTERRUPTED`
-   (fault episodes: `fault_outcome = Kill`) so the restarted thread's resume reports the
+   (fault episodes: `fault_outcome = Kill`; see
+   [ipc-internals.md](ipc-internals.md#park-dispositions-and-episodes) § Park Dispositions and
+   Episodes) so the restarted thread's resume reports the
    cancellation.
 3. `set_state_under_all_locks(target, Stopped)` — acquires every CPU's scheduler.lock in ascending
    order, writes `state = Stopped`, snapshots `running_on` (the CPU whose
@@ -577,4 +590,7 @@ The handler then drains the target.
 
 ## Summarized By
 
-[kernel/README.md](../README.md)
+[IPC Subsystem Internals](ipc-internals.md),
+[SMP Scheduler/IPC Hotpath Redesign — per-TCB `sched_lock` (authoritative serializer)](sched-ipc-redesign.md),
+[SMP Scheduling and Locking Invariants](scheduling-internals.md),
+[Syscall Interface Specification](syscalls.md)

@@ -66,7 +66,9 @@ in-place, no-allocation, no-recursion implementation is preferred.
 Every bootloader allocation uses `EfiLoaderCode` or `EfiLoaderData` and
 therefore surfaces as `MemoryType::Loaded`. The kernel treats `Loaded`
 regions as in-use until it explicitly reclaims them in Phase 3 (kernel
-page-table replacement). Specifically:
+page-table replacement; see
+[initialization.md](../../kernel/docs/initialization.md) §"Phase 3: Kernel Page Tables").
+Specifically:
 
 - Kernel image LOAD segments, placed in a bootloader-chosen contiguous span.
 - Init image LOAD segments, placed at any free physical address.
@@ -81,7 +83,8 @@ page-table replacement). Specifically:
 
 The `BootInfo.modules` slice and its backing page are similarly
 `Loaded`; the kernel only reclaims them after init has copied whatever
-is needed.
+is needed (see
+[initialization.md](../../kernel/docs/initialization.md) §"Phase 7: Capability System").
 
 ---
 
@@ -93,7 +96,8 @@ first, size-query call and padded with extra slack for the map-buffer
 allocation itself. The exact slack constant is internal to
 [`boot/src/memory_map.rs`](../src/memory_map.rs); it is sized so the
 post-allocation map fits without reallocation under every supported
-firmware implementation.
+firmware implementation. The acquisition sequence that sizes and fills the buffer is
+owned by [uefi-environment.md](uefi-environment.md) §"Memory Map Acquisition".
 
 ---
 
@@ -107,7 +111,8 @@ kernel-MMIO regions above it form the direct-map ceiling
 1 GiB-aligned in the gap between the mode's kernel-half floor and the kernel
 image. The kernel re-derives the same ceiling from the same helper at Phase 3
 to guard the mapping, so bootloader and kernel cannot disagree. See
-[boot-flow.md](boot-flow.md) step 9 and `core/kernel/docs/initialization.md`.
+[boot-flow.md](boot-flow.md) step 9 and [initialization.md](../../kernel/docs/initialization.md)
+§"Phase 3: Kernel Page Tables".
 
 ## What Lives Elsewhere
 
@@ -124,4 +129,4 @@ to guard the mapping, so bootloader and kernel cannot disagree. See
 
 ## Summarized By
 
-[boot/README.md](../README.md)
+[Boot Flow](boot-flow.md), [UEFI Environment](uefi-environment.md)

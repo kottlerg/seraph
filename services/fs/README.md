@@ -26,21 +26,25 @@ Each filesystem implementation is a standalone userspace process. A
 driver is a namespace server: it serves the cap-native `NS_*`
 protocol against per-node badged SEND caps on its own endpoint, plus
 the surviving fs-driver-specific labels (`FS_MOUNT`, `FS_READ`,
-`FS_READ_MEMORY` family, `FS_CLOSE`). vfsd captures the driver's root
-cap at mount time and forwards walks through it; subsequent
-operations bypass vfsd entirely. See
-[`vfsd/README.md`](../vfsd/README.md) for the composition layer.
+`FS_READ_MEMORY` family, `FS_CLOSE`) specified in
+[`docs/fs-driver-protocol.md`](docs/fs-driver-protocol.md). vfsd
+captures the driver's root cap at mount time and forwards walks
+through it; subsequent operations bypass vfsd entirely (see
+[`vfsd/docs/namespace-composition.md`](../vfsd/docs/namespace-composition.md)).
+See [`vfsd/README.md`](../vfsd/README.md) for the composition layer.
 
 Filesystem drivers do not access hardware directly. They receive
 partition-scoped block device IPC endpoints from vfsd (originating
 from devmgr's device registry) and perform all storage I/O through
-those endpoints. See
+those endpoints (delivery in
+[`docs/fs-driver-protocol.md`](docs/fs-driver-protocol.md) § Bootstrap caps). See
 [`docs/device-management.md`](../../docs/device-management.md) for
 how block device endpoints are established.
 
 A filesystem driver crash does not affect other mounted filesystems
-or the block device driver — vfsd can respawn a failed driver and
-re-install the new root cap.
+or the block device driver; vfsd does not observe the death or
+respawn the driver (see
+[`docs/storage.md`](../../docs/storage.md) § Failure and Revocation Invariants).
 
 ---
 
@@ -64,7 +68,8 @@ re-install the new root cap.
    `FS_*` labels through your own dispatcher (see
    [`docs/fs-driver-protocol.md`](docs/fs-driver-protocol.md)).
 4. For disk-backed filesystems, read from the partition-scoped block
-   device endpoint vfsd delivers at mount time.
+   device endpoint vfsd delivers at mount time (see
+   [`docs/fs-driver-protocol.md`](docs/fs-driver-protocol.md) § Bootstrap caps).
 5. For in-memory filesystems (e.g. tmpfs), no block device endpoint
    is needed; the storage layer lives in driver-private RAM.
 
@@ -84,4 +89,4 @@ re-install the new root cap.
 
 ## Summarized By
 
-[docs/storage.md](../../docs/storage.md)
+[Architecture Overview](../../docs/architecture.md)

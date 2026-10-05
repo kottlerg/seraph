@@ -2,7 +2,8 @@
 
 The bootloader establishes minimal initial page tables before kernel handoff: enough
 for the kernel to execute at its ELF virtual addresses and read `BootInfo` before its
-own page tables are ready. The kernel replaces them during Phase 3.
+own page tables are ready. The kernel replaces them during
+[Phase 3](../../kernel/docs/initialization.md#phase-3-kernel-page-tables).
 
 All page table frames MUST be allocated via `AllocatePages` before `ExitBootServices`;
 no page table allocation occurs after the firmware exits.
@@ -18,7 +19,8 @@ bootloader *builds*, described in later sections — is:
   (text, rodata, data, bss; ELF virtual base + slide), with page
   permissions matching each segment's ELF flags (W^X enforced). The
   bootloader has already applied the image's `RELATIVE` relocations for
-  the chosen slide, so the mapped image is internally consistent.
+  the chosen slide ([boot-flow.md](boot-flow.md#step-5d-apply-the-kaslr-slide)),
+  so the mapped image is internally consistent.
 - An identity map covers the physical memory region containing the
   `BootInfo` structure and every physical region it references
   (memory-map buffer, `MmioAperture` array, `InitImage` segments,
@@ -29,7 +31,9 @@ bootloader *builds*, described in later sections — is:
 - Nothing else is mapped. Any access outside these ranges faults.
 
 The initial tables are **not** intended to be permanent. The kernel
-replaces them during Phase 3. The CPU state at the moment of jump —
+replaces them during
+[Phase 3](../../kernel/docs/initialization.md#phase-3-kernel-page-tables).
+The CPU state at the moment of jump —
 paging bit set, interrupts disabled, BootInfo pointer in the
 first-argument register — is specified in
 [kernel-handoff.md](kernel-handoff.md).
@@ -48,7 +52,8 @@ This allows the kernel to execute from the first instruction.
 **Identity map of the boot region** — the `BootInfo` structure, the `MmioAperture`
 array, the memory map buffer, and all boot modules are identity-mapped (virtual address
 equals physical address). This allows the kernel to read them using physical addresses
-before its direct physical map is established in Phase 3.
+before its direct physical map is established in
+[Phase 3](../../kernel/docs/initialization.md#phase-3-kernel-page-tables).
 
 **Bootloader stack** — the stack in use at the point of kernel handoff is mapped at
 its current virtual address. On x86-64 and RISC-V, the stack is allocated by UEFI
@@ -239,9 +244,9 @@ continued execution are present before `satp` is written. See
 the asm and the full SAFETY justification.
 
 ASID 0 is used for the bootloader's tables. The kernel uses ASID 0 for
-its own initial context (per the boot protocol's description of kernel
-entry state) and reassigns ASIDs when it brings up its own page table
-management in Phase 3.
+its own initial context (per the kernel entry state in
+[kernel-handoff.md](kernel-handoff.md)) and reassigns ASIDs when it
+brings up its own page table management in Phase 3.
 
 ---
 
@@ -265,11 +270,13 @@ mapping that reaches the kernel is a security defect, not just a policy violatio
 Each arch-specific `BootPageTable` records the physical address of every
 frame it allocates from `AllocatePages` — the root table and every
 intermediate table allocated during `map` — in an inline `frame_log`.
-After step 8, step 9 reads this log via the trait method
+After [step 8](boot-flow.md#step-8-exitbootservices),
+[step 9](boot-flow.md#step-9-populate-bootinfo) reads this log via the trait method
 `PageTableBuilder::allocated_frames` and appends one
 `boot_protocol::ReclaimRange` per frame to `BootInfo.reclaim_ranges`.
 The kernel mints reclaimable Memory caps over the recorded frames during
-Phase 7 (`cap::mint_reclaim_memory_caps`), so they flow into userspace
+[Phase 7](../../kernel/docs/initialization.md#phase-7-capability-system)
+(`cap::mint_reclaim_memory_caps`), so they flow into userspace
 through the standard `CapDescriptor` path rather than being orphaned as
 `MemoryType::Loaded` pages outside the buddy.
 
@@ -277,4 +284,8 @@ through the standard `CapDescriptor` path rather than being orphaned as
 
 ## Summarized By
 
-[boot/README.md](../README.md)
+[core/boot/README.md](../README.md), [Boot Flow](boot-flow.md), [ELF Loading](elf-loading.md),
+[Kernel Initialization Sequence](../../kernel/docs/initialization.md),
+[Memory Subsystem Internals](../../kernel/docs/memory-internals.md),
+[Memory Model](../../../docs/memory-model.md),
+[Platform Requirements](../../../docs/platform-requirements.md)

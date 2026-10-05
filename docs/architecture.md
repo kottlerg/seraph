@@ -18,7 +18,8 @@ a goal. Filesystem formats and network protocols may be adopted as data
 formats, not as API commitments. Seraph does not provide binary
 compatibility with other operating systems. 32-bit and legacy x86 are
 not targeted. Userspace targets these native interfaces through standard
-language runtimes (`ruststd`, `libc`), not through compatibility shims.
+language runtimes (`ruststd`; `libc` is design intent, not yet implemented), not through
+compatibility shims.
 
 ---
 
@@ -71,7 +72,7 @@ services and applications. All services communicate exclusively via IPC and oper
 under explicit capability grants.
 
 **init**
-First userspace process. Bootstraps tier-1 services (memmgr, procmgr),
+First userspace process. Bootstraps memmgr and procmgr by raw syscalls,
 spawns the remaining early services, delegates per-service capabilities,
 then exits. See [`process-lifecycle.md`](process-lifecycle.md) and
 [`services/init/README.md`](../services/init/README.md).
@@ -89,9 +90,10 @@ and teardown go through procmgr. See
 [`services/procmgr/README.md`](../services/procmgr/README.md).
 
 **svcmgr**
-Service health monitor. Detects crashes and requests restarts via
-procmgr; holds the fallback capabilities needed to restart procmgr
-itself. See [`services/svcmgr/README.md`](../services/svcmgr/README.md).
+Service supervisor and discovery registry. Detects crashes and restarts
+services via procmgr; a procmgr death triggers graceful shutdown (the
+raw-syscall procmgr-restart fallback is not implemented). See
+[`services/svcmgr/README.md`](../services/svcmgr/README.md).
 
 **devmgr**
 Device manager. Enumerates platform hardware, spawns driver processes,
@@ -105,7 +107,7 @@ Power manager. Owns the platform shutdown surface and serves
 
 **drivers**
 Isolated userspace processes. Access hardware only through capabilities
-granted by devmgr.
+granted by devmgr; see [device-management.md](device-management.md).
 
 **vfsd**
 Unified filesystem namespace over separate fs driver processes. The
@@ -113,36 +115,42 @@ system-scope composition (cap-delegation chain, GPT role-GUID
 discovery, mount lifecycle) is specified in [storage.md](storage.md).
 
 **fs drivers**
-Separate binaries in `fs/` (FAT, ext4, tmpfs, etc.), launched by vfsd.
+Separate binaries under `services/fs/` (currently FAT only), launched by
+vfsd. See [`services/fs/README.md`](../services/fs/README.md).
 
 **netd**
-Network stack. Manages interfaces via driver IPC and exposes socket-
-like endpoints to applications.
+Network stack (design intent; not yet implemented). Manages interfaces via driver IPC
+and exposes socket-like endpoints to applications. See
+[`services/netd/README.md`](../services/netd/README.md).
 
 **logd**
 Owner of the master log endpoint; drains log messages from every
 process holding a pre-installed log SEND cap. See
 [`services/logd/README.md`](../services/logd/README.md).
 
-**base**
-Unprivileged applications (shell, terminal, editor, core tools).
+**programs**
+Unprivileged applications (shell, terminal, and utilities) under `programs/`.
 
 ---
 
 ## Kernel Primitives vs. Userspace Abstractions
 
-The kernel manages three primitive object types:
+Three of the kernel's object types make up what userspace calls a process:
 
 - **Thread** — a schedulable unit of execution with a saved register state, a priority,
   and bindings to an AddressSpace, a CSpace, and an IPC buffer.
 - **AddressSpace** — a virtual address space with a page table root and a set of
-  frame mappings. Revoking an AddressSpace capability stops all threads bound to it.
+  frame mappings. When the last capability to an AddressSpace (or a CSpace) is deleted,
+  every thread bound to it is stopped (see
+  [capability-model.md](capability-model.md#kill-process-pattern)).
 - **CSpace** — a capability space: a growable array of capability slots that a thread
   uses to name kernel objects.
 
 The kernel has no "Process" object. A **process** is a userspace convention: a group
 of threads sharing an AddressSpace and a CSpace, managed by procmgr. The kernel
 enforces isolation via AddressSpace and CSpace boundaries, not via a process abstraction.
+See [capability-model.md](capability-model.md#kill-process-pattern) for the authoritative
+object and process-teardown model.
 
 ---
 
@@ -159,13 +167,15 @@ live in the component scope:
 - init's userspace bootstrap — [`services/init/README.md`](../services/init/README.md) and
   [`services/init/docs/bootstrap.md`](../services/init/docs/bootstrap.md).
 
-Boot modules (procmgr, memmgr, devmgr, vfsd, virtio-blk, fatfs) are packed into
+Boot modules (the eight entries of `xtask/src/bundle.rs::MODULES`: procmgr,
+memmgr, devmgr, vfsd, virtio-blk, serial, framebuffer, fatfs) are packed into
 `\EFI\seraph\bootstrap.bundle` by `cargo xtask build` (see
 [`xtask/README.md`](../xtask/README.md) for the producer side and
 [`abi/boot-protocol`](../abi/boot-protocol/README.md)'s
 [`bundle.rs`](../abi/boot-protocol/src/bundle.rs) for the
-wire format); the bootloader exposes each entry as a named `BootModule` and
-init looks them up by `BootModule.name`.
+wire format); the bootloader exposes each non-`init` entry as a named
+`BootModule`, the kernel publishes those names in `InitInfo::module_names`,
+and init looks each module up by name there.
 
 ---
 
@@ -182,17 +192,19 @@ control. Once mapped, drivers access registers directly without kernel mediation
 **Port I/O (x86‑64 only)**
 Drivers receive an IoPort capability for assigned port ranges. Binding this
 capability enables direct execution of port I/O instructions for those ranges.
-Access is revoked automatically when the capability is revoked. RISC‑V does not
+Access is revoked automatically when the capability is revoked (see
+[capability-model.md](capability-model.md#ioport-x86-64-only)). RISC‑V does not
 support port I/O.
 
 **DMA**
 DMA isolation is exclusively a userspace concern. devmgr discovers IOMMU
 hardware (via firmware-table passthrough), programs the translation tables
-itself, and authorises DMA on a per-device basis. The kernel reads no
+itself, and authorises DMA on a per-device basis (design intent; no IOMMU
+support is implemented yet, so DMA is unconfined). The kernel reads no
 IOMMU registers, holds no per-device DMA state, and exposes no DMA-grant
 syscall. Memory physical-base addresses (which DMA-issuing drivers program
 into device transports) reach drivers through memmgr's `REQUEST_MEMORY_CAPS`
-reply. See `device-management.md`.
+reply. See [device-management.md](device-management.md#dma-safety-model).
 
 **Interrupts**
 Hardware interrupts are received by the kernel and delivered to drivers as
@@ -231,7 +243,9 @@ Seraph targets 64‑bit architectures with modern MMU and privilege support.
 
 **x86‑64**
 Uses APIC. IOMMU hardware, when present, is discovered and
-programmed by devmgr in userspace; the kernel does not touch it.
+programmed by devmgr in userspace (design intent; not yet implemented); the kernel does not
+touch it. See
+[device-management.md](device-management.md#iommu-discovery-and-programming).
 
 **RISC‑V**
 Embedded or non-standard configurations are not targeted.
@@ -259,12 +273,7 @@ with a clear diagnostic. The IOMMU is opportunistic with a degraded DMA-unconfin
 
 ## Summarized By
 
-[README.md](../README.md),
-[devmgr/README.md](../services/devmgr/README.md),
-[init/README.md](../services/init/README.md),
-[logd/README.md](../services/logd/README.md),
-[memmgr/README.md](../services/memmgr/README.md),
-[procmgr/README.md](../services/procmgr/README.md),
-[pwrmgr/README.md](../services/pwrmgr/README.md),
-[svcmgr/README.md](../services/svcmgr/README.md)
-
+[README.md](../README.md), [core/kernel/README.md](../core/kernel/README.md),
+[Syscall Interface Specification](../core/kernel/docs/syscalls.md),
+[services/drivers/README.md](../services/drivers/README.md),
+[services/netd/README.md](../services/netd/README.md)

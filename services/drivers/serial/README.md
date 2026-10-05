@@ -4,7 +4,8 @@ Userspace serial (UART) device driver. Owns the platform UART hardware
 authority end-to-end and exposes byte write, byte read, and RX-notify
 registration; it is the sole driver-mediated path for userspace serial bytes in
 both directions (real-logd and every other writer reach the UART through it;
-the terminal reads typed input through it).
+the terminal reads typed input through it), per
+[console-model.md](../../../docs/console-model.md#the-serial-driver-as-sole-userspace-uart-owner).
 
 ---
 
@@ -27,18 +28,22 @@ serial/
 
 ## Endpoint
 
-Devmgr discovers the platform UART (ACPI SPCR; COM1 at I/O port `0x3F8` on
-x86-64, a memory-mapped NS16550 at the SPCR-reported base on RISC-V), spawns
-the driver via procmgr, and delegates the per-device arch authority cap — an
-`IoPort` on x86-64, an `Mmio` on RISC-V — plus the UART interrupt cap (COM1 is
-ISA IRQ 4; the QEMU `virt` NS16550 is PLIC source 10). The driver owns those
-caps end-to-end; no other userspace process except init-logd (the permanent
-pre-driver boot fallback) holds UART authority. The interrupt cap is optional:
-without it the driver still answers reads (RX then relies on the client's
-bounded poll) but `SERIAL_REGISTER_RX_NOTIFY` reports `REGISTER_FAILED`.
+[Devmgr](../../devmgr/README.md) discovers the platform UART (ACPI SPCR; COM1
+at I/O port `0x3F8` on x86-64, a memory-mapped NS16550 at the SPCR-reported
+base on RISC-V), spawns the driver via procmgr, and delegates the per-device
+arch authority cap — an `IoPort` on x86-64, an `Mmio` on RISC-V — plus the UART
+interrupt cap (COM1 is ISA IRQ 4; the QEMU `virt` NS16550 is PLIC source 10).
+The driver owns those caps end-to-end; no other userspace process except
+init-logd (the permanent pre-driver boot fallback, per
+[console-model.md](../../../docs/console-model.md#why-four-permanent-direct-paths-remain))
+holds UART authority. The interrupt cap is optional: without it the driver
+still answers reads (RX then relies on the client's bounded poll) but
+`SERIAL_REGISTER_RX_NOTIFY` reports `REGISTER_FAILED`.
 
 Clients obtain a read/write cap through devmgr, not svcmgr: a UART is a device,
-not a service. devmgr answers [`devmgr_labels::QUERY_SERIAL_DEVICE`] by minting
+not a service
+([console-model.md](../../../docs/console-model.md#the-serial-driver-as-sole-userspace-uart-owner)).
+devmgr answers [`devmgr_labels::QUERY_SERIAL_DEVICE`] by minting
 a `SEND_GRANT` cap on the driver's service endpoint badged with
 [`serial_labels::WRITE_AUTHORITY`] | [`serial_labels::READ_AUTHORITY`],
 mirroring the `QUERY_BLOCK_DEVICE` flow. The caller's devmgr-registry badge
@@ -128,10 +133,12 @@ RX is interrupt-driven. `serial_init` enables the receive-data interrupt in the
 UART's IER (every earlier boot stage left `IER = 0`), and the driver routes the
 UART interrupt to a client notification via `SERIAL_REGISTER_RX_NOTIFY`. The
 kernel masks the line on each fire; the next `SERIAL_READ_BYTES` re-arms it
-after draining. Because the x86 IOAPIC delivers edge-triggered, a client must
-wait with a bounded timeout (the terminal uses 20 ms) so a byte racing the
-re-arm is recovered on the next drain; this also degrades gracefully to polling
-when no IRQ cap was delivered. The riscv PLIC is level-sensitive and re-asserts
+after draining, via
+[`SYS_IRQ_ACK`](../../../core/kernel/docs/syscalls.md#sys_irq_ack-29). Because
+the x86 IOAPIC delivers edge-triggered, a client must wait with a bounded
+timeout (the terminal uses 20 ms) so a byte racing the re-arm is recovered on
+the next drain; this also degrades gracefully to polling when no IRQ cap was
+delivered. The riscv PLIC is level-sensitive and re-asserts
 on its own, but clients use the same bounded wait for uniformity.
 
 ---
@@ -160,4 +167,5 @@ implemented.
 
 ## Summarized By
 
-[docs/console-model.md](../../../docs/console-model.md)
+[Console Model](../../../docs/console-model.md),
+[programs/terminal/README.md](../../../programs/terminal/README.md)

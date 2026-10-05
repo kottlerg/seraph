@@ -9,7 +9,8 @@ running system goes through procmgr.
 procmgr is itself a memmgr client: it is std-using and bootstraps its
 heap by calling memmgr on its first IPC. Memory caps for child stacks,
 IPC buffers, `ProcessInfo` pages, TLS blocks, and ELF segments come
-from memmgr, not from a procmgr-owned pool.
+from memmgr, not from a procmgr-owned pool. See
+[docs/process-lifecycle.md](../../docs/process-lifecycle.md) § Init → procmgr.
 
 ---
 
@@ -46,10 +47,13 @@ procmgr/
   initial caps to newly created processes via `ProcessInfo`.
 - **memmgr coordination** — call `memmgr.REGISTER_PROCESS` before
   spawning a child to obtain the child's `memmgr_endpoint_cap`; call
-  `memmgr.PROCESS_DIED` after a child exits so memmgr can reclaim.
+  `memmgr.PROCESS_DIED` after a child exits so memmgr can reclaim. See
+  [docs/process-lifecycle.md](../../docs/process-lifecycle.md) § Steady-State
+  Process Creation and § Process Death.
 - **Process teardown** — on exit or crash, revoke the process's
   `AddressSpace` capability (which stops all threads bound to it) and
-  notify memmgr.
+  notify memmgr. See
+  [docs/process-lifecycle.md](../../docs/process-lifecycle.md) § Process Death.
 - **Process registry** — maintain a table of running processes; answer
   queries from svcmgr and other services.
 - **Per-child log cap seeding** — derive a badged SEND cap on the
@@ -57,13 +61,16 @@ procmgr/
   badge) and install the slot at `ProcessInfo.log_send_cap`. The
   un-badged source cap arrives in procmgr's bootstrap round from
   init. Children call `seraph::log!` directly through the seeded
-  cap; no `GET_LOG_CAP` discovery roundtrip.
+  cap; no `GET_LOG_CAP` discovery roundtrip. See
+  [docs/process-lifecycle.md](../../docs/process-lifecycle.md) § Runtime
+  fields (parent-chosen, per-process).
 - **Death-notification fan-out to logd** — accept
   `REGISTER_DEATH_EQ` from real-logd (gated by the
   `DEATH_EQ_AUTHORITY` badge), store logd's `EventQueue` cap, bind
   it retroactively on every existing thread, and bind it on every
   new spawn alongside procmgr's own death observer (correlator =
-  process badge, equal to logd's per-sender slot key).
+  process badge, equal to logd's per-sender slot key). See
+  [docs/ipc-interface.md](docs/ipc-interface.md) § `REGISTER_DEATH_EQ`.
 - **Init reap** — accept init's `REGISTER_INIT_TEARDOWN` handoff at
   end-of-Phase-3 and tear down init's residue. See the
   [Init reap](#init-reap) subsection below.
@@ -85,21 +92,28 @@ launches), init-logd serves on and init's memory caps stay held until shutdown
 closes only once the handover completes. The reap path tears down
 init's kernel objects in order — Threads → AddressSpace → donate Memory
 caps to memmgr via `DONATE_MEMORY_CAPS` → CSpace cascade — leaving zero init
-residue. Implementation in [`src/init_reap.rs`](src/init_reap.rs).
+residue. Implementation in [`src/init_reap.rs`](src/init_reap.rs); the
+handoff protocol is in [docs/ipc-interface.md](docs/ipc-interface.md)
+§ `REGISTER_INIT_TEARDOWN`.
 
 ---
 
 ## What procmgr does NOT do
 
 - **Allocate or own memory caps.** memmgr holds the RAM memory-cap pool. procmgr
-  is a memmgr client like every other std-built service.
+  is a memmgr client like every other std-built service. See
+  [docs/userspace-memory-model.md](../../docs/userspace-memory-model.md)
+  § Ownership Boundaries.
 - **Track per-process memory-cap ownership.** memmgr's per-process records
   cover this; procmgr only tracks the kernel objects it owns
   (`AddressSpace`, `Thread`, etc.) plus the procmgr-side process
-  registry.
+  registry. See [docs/process-lifecycle.md](../../docs/process-lifecycle.md)
+  § Authority Boundaries Between memmgr and procmgr.
 - **Choose virtual addresses inside the running child.** procmgr picks
   bootstrap-cross-boundary VAs (stack, IPC buffer, `ProcessInfo`, TLS
-  block); the child's `std::sys::seraph` owns every other VA.
+  block); the child's `std::sys::seraph` owns every other VA. See
+  [docs/userspace-memory-model.md](../../docs/userspace-memory-model.md)
+  § Bootstrap Cross-Boundary VAs.
 - **Hold or distribute namespace caps.** procmgr holds no system-root
   cap and has no broadcast path. A child's `ProcessInfo.system_root_cap`
   is sourced exclusively from the spawner's
@@ -191,4 +205,7 @@ only case where a process is created without going through procmgr.
 ## Summarized By
 
 [Architecture Overview](../../docs/architecture.md),
-[Process Lifecycle](../../docs/process-lifecycle.md)
+[Namespace Model](../../docs/namespace-model.md),
+[Process Lifecycle](../../docs/process-lifecycle.md),
+[Userspace Memory Model](../../docs/userspace-memory-model.md),
+[services/init/README.md](../init/README.md), [services/memmgr/README.md](../memmgr/README.md)

@@ -160,7 +160,10 @@ Deferred. Not implemented.
 
 ### Label 5: reserved
 
-Memory-cap allocation is owned by memmgr, not procmgr. See
+Memory-cap allocation is owned by memmgr, not procmgr, per
+[docs/process-lifecycle.md](../../../docs/process-lifecycle.md)
+§ Authority Boundaries Between memmgr and procmgr.
+See
 [`services/memmgr/docs/ipc-interface.md`](../../memmgr/docs/ipc-interface.md)
 for `REQUEST_MEMORY_CAPS` and related labels.
 
@@ -235,7 +238,10 @@ configuration; subsequent calls overwrite the stored endpoint.
 
 Capability transfer uses the IPC message's cap slot array (up to 4 caps per
 message). On `CREATE_PROCESS`, the caller's Memory cap is moved into procmgr's
-CSpace atomically with the message delivery. procmgr consumes the cap during
+CSpace atomically with the message delivery, per
+[docs/ipc-design.md](../../../docs/ipc-design.md#capability-semantics-in-ipc)
+§ Capability Semantics in IPC.
+procmgr consumes the cap during
 process creation and does not return it.
 
 On reply, procmgr transfers a badged process handle endpoint (for
@@ -269,7 +275,9 @@ transferred. Re-registration replaces the previous cap.
 
 logd derives a `POST`-only copy from its `RECV+POST` event queue
 before sending — the kernel's cap-transfer moves the sent cap into
-procmgr's CSpace, so logd must retain `RECV` on its own copy to
+procmgr's CSpace (per
+[docs/capability-model.md § Transfer](../../../docs/capability-model.md#transfer)),
+so logd must retain `RECV` on its own copy to
 keep `wait_set_add` and `event_try_recv` working.
 
 ---
@@ -304,7 +312,9 @@ Wire format:
 | caps | none |
 
 Procmgr replies `SUCCESS` then arms the state machine. Init proceeds
-to `sys_thread_exit` immediately; the death-EQ event with
+to `sys_thread_exit` immediately (per
+[services/init/docs/bootstrap.md § Handover](../../init/docs/bootstrap.md#handover));
+the death-EQ event with
 `INIT_REAP_CORRELATOR` (reserved `u32::MAX`) triggers
 [`init_reap::run_reap`](../src/init_reap.rs) which executes the six-step
 teardown (Threads → AddressSpace → DONATE_MEMORY_CAPS → CSpace → log).
@@ -325,4 +335,9 @@ teardown (Threads → AddressSpace → DONATE_MEMORY_CAPS → CSpace → log).
 
 ## Summarized By
 
-[procmgr/README.md](../README.md)
+[Scheduler Internals](../../../core/kernel/docs/scheduler.md),
+[Capability Model](../../../docs/capability-model.md),
+[init Bootstrap Stages](../../init/docs/bootstrap.md),
+[services/logd/README.md](../../logd/README.md),
+[logd IPC interface](../../logd/docs/ipc-interface.md), [services/procmgr/README.md](../README.md),
+[`.svc` Service Definitions](../../svcmgr/docs/service-definitions.md)

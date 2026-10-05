@@ -29,8 +29,9 @@ first launch, so there is no handover source. The restarted logd skips
 the pull entirely (guarded on a non-zero `cap[1]`) and serves a fresh
 table on the same endpoint object — svcmgr holds the master-log source
 for the system's life, so the restarted logd's RECV re-attaches to the
-object every sender already targets. In-flight history from the prior
-instance is not recoverable.
+object every sender already targets (see
+[`service-definitions.md` § `log_sink`](../../svcmgr/docs/service-definitions.md#log_sink)).
+In-flight history from the prior instance is not recoverable.
 
 ## Call shape
 
@@ -137,4 +138,6 @@ side) and [`services/logd/src/handover.rs`](../src/handover.rs)
 
 ## Summarized By
 
-[logd/README.md](../README.md)
+[System Bootstrap](../../../docs/bootstrap.md), [services/init/README.md](../../init/README.md),
+[init Bootstrap Stages](../../init/docs/bootstrap.md), [services/logd/README.md](../README.md),
+[`.svc` Service Definitions](../../svcmgr/docs/service-definitions.md)

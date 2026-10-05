@@ -48,14 +48,14 @@ no handler bound is still terminated, the behavior for all faults absent this me
 The demand-paging consumer is implemented: memmgr acts as the pager, procmgr binds it for
 every ordinary process it creates (demand paging is the default; a process opts out with the
 `CREATE_PINNED` flag) and delegates the child address space, and the `ProcessInfo` pager
-field (`pager_endpoint_cap` / `pager_badge`, `PROCESS_ABI_VERSION` 19) advertises it so the
-runtime inherits the handler onto spawned threads. Userspace reserves
+field (`pager_endpoint_cap` / `pager_badge`) advertises it so the
+runtime inherits the handler onto spawned threads. See
+[services/procmgr/docs/ipc-interface.md](../services/procmgr/docs/ipc-interface.md).
+Userspace reserves
 unbacked VA and registers it via `std::os::seraph::register_demand_paged`; first touch faults,
 memmgr maps a frame and resumes. See
-[memmgr/docs/ipc-interface.md](../services/memmgr/docs/ipc-interface.md) (`REGISTER_REGION`,
-`DELEGATE_ASPACE`, and the fault arm). Binding a default pager to *all* ordinary processes
-remains a userspace policy decision (a creator default plus runtime propagation), not yet
-enabled.
+[services/memmgr/docs/ipc-interface.md](../services/memmgr/docs/ipc-interface.md)
+(`REGISTER_REGION`, `DELEGATE_ASPACE`, and the fault arm).
 
 Not yet implemented (this section is narrowed as each part lands):
 
@@ -100,7 +100,7 @@ exhaust the kernel stack.
 
 The fault handler is bound **per thread**. The handler is an ordinary
 [`Endpoint`](capability-model.md#ipc-endpoint); there is no distinct fault-endpoint
-capability type. The binding is the new state.
+capability type. The binding is per-thread kernel state: the bound endpoint and its badge.
 
 `SYS_THREAD_SET_FAULT_HANDLER(thread_cap, endpoint_cap, badge, fault_class_mask)`:
 
@@ -160,7 +160,8 @@ thread's behalf. Its format is a stable cross-boundary contract.
     unknown class); the **architecture auxiliary code** (x86-64 the hardware error code,
     `0` where the vector has none; RISC-V `stval`); the faulting instruction pointer. The
     kernel maps each architecture's raw vector/cause to a normalized class
-    (`arch/x86_64/idt.rs`, `arch/riscv64/interrupts.rs`).
+    (`normalize_x86_exception` in `core/kernel/src/arch/x86_64/idt.rs`,
+    `normalize_riscv_exception` in `core/kernel/src/arch/riscv64/interrupts.rs`).
 
 The faulting thread's full register state is not embedded; a handler that needs it reads
 it with [`SYS_THREAD_READ_REGS`](capability-model.md#thread) on the faulting thread.
@@ -237,8 +238,12 @@ thread would block on its own fault endpoint indefinitely.
 
 The kernel synthesizes the fault delivery on the faulting thread's behalf using the bound
 endpoint; it does not require, and the protocol does not distribute, a send capability to
-the fault endpoint. A handler keeps `RECEIVE` and does not hand out `SEND`, so no other
-party can deliver a forged fault message bearing `FAULT_LABEL`. The `badge` identifying the
+the fault endpoint. A handler that hands out no `SEND` to its fault endpoint receives
+`FAULT_LABEL` only from the kernel. A handler that also serves ordinary clients on the same
+endpoint (memmgr as the default pager) cannot rely on the label alone: a client holding
+`SEND` can send a message bearing `FAULT_LABEL`, and the handler attributes it by the
+unforgeable badge of that client's cap, so a client can at most fabricate a fault against
+itself. The `badge` identifying the
 faulting thread is fixed by the binder, not by the message sender.
 
 ---
@@ -269,29 +274,34 @@ a process.
 
 The default MUST exempt only the narrow set that cannot depend on the fault path:
 
-- **init, the frame manager, and the pager itself** — these are pre-pager and are never
+- **init, memmgr (the frame manager and pager), and procmgr** — these are pre-pager and are never
   routed through procmgr's pager-binding path (init is created by the kernel; it creates
   memmgr and procmgr via raw syscalls), so they are pinned by construction. A demand-paged
   pager would recurse on its own faults.
 - **Drivers requiring pinned memory (DMA)** — a device may write a process's memory before a
   demand fault could back it, so DMA-capable drivers must be eager-mapped. The creator opts a
-  process out with `procmgr_labels::CREATE_PINNED`; devmgr sets it for the DMA-capable driver
-  class (PCI devices with BAR + IRQ). The exemption is a capability-flag decision, never a
+  process out with `procmgr_labels::CREATE_PINNED` (see
+  [services/procmgr/docs/ipc-interface.md](../services/procmgr/docs/ipc-interface.md)); devmgr
+  sets it for the DMA-capable driver
+  class (PCI devices with BAR + IRQ). The exemption is a creation-request flag, never a
   badge-range test.
 
 A userspace fault round-trip is costlier than a kernel-internal fill; this cost is accepted
 to keep paging policy out of the kernel.
 
-A declarative paging key on svcmgr service definitions is a reserved future extension: no
-svcmgr-launched service does DMA or sits on the fault path today, so none needs to opt out.
-It would be added when the first pinned svcmgr-launched service exists.
+svcmgr service definitions carry no paging key; see
+[services/svcmgr/docs/service-definitions.md](../services/svcmgr/docs/service-definitions.md).
 
 ---
 
 ## Summarized By
 
-[README.md](../README.md),
-[IPC Design](ipc-design.md),
-[Capability Model](capability-model.md),
-[Process Lifecycle](process-lifecycle.md),
-[Userspace Memory Model](userspace-memory-model.md)
+[abi/process-abi/README.md](../abi/process-abi/README.md),
+[Kernel Cross-Boundary Disclosure Inventory](../core/kernel/docs/cross-boundary-disclosure.md),
+[SMP Scheduling and Locking Invariants](../core/kernel/docs/scheduling-internals.md),
+[Syscall Interface Specification](../core/kernel/docs/syscalls.md),
+[Capability Model](capability-model.md), [IPC Design](ipc-design.md),
+[Process Lifecycle](process-lifecycle.md), [Userspace Memory Model](userspace-memory-model.md),
+[memmgr IPC Interface](../services/memmgr/docs/ipc-interface.md),
+[procmgr IPC Interface](../services/procmgr/docs/ipc-interface.md),
+[`.svc` Service Definitions](../services/svcmgr/docs/service-definitions.md)

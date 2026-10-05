@@ -69,22 +69,26 @@ services/drivers/
 
 Each driver is a separate userspace process with its own address space. Drivers
 receive only the capabilities for the specific device they manage — no driver
-holds ambient hardware authority. The full driver lifecycle is specified in
+holds ambient hardware authority (see [docs/architecture.md](../../docs/architecture.md)).
+The full driver lifecycle is specified in
 [docs/device-management.md](../../docs/device-management.md); the key points are:
 
 - **Isolation** — every driver runs in its own address space. A driver crash
-  cannot corrupt another driver or the kernel.
-- **Per-device capabilities** — devmgr delegates the minimum capability set
-  for each device: MMIO region, interrupt line, and optionally DMA grant and
-  IoPort (x86-64). See
+  cannot corrupt another driver or the kernel. See
+  [docs/architecture.md](../../docs/architecture.md).
+- **Per-device capabilities** — [devmgr](../devmgr/README.md) delegates the
+  minimum capability set for each device: MMIO region, interrupt line, and
+  optionally DMA grant and IoPort (x86-64). See
   [docs/capability-model.md](../../docs/capability-model.md) for capability types
   and rights.
-- **Spawning** — devmgr discovers devices (PCI enumeration, firmware tables),
-  matches them to driver binaries, and requests procmgr to create driver
-  processes. devmgr then delegates per-device capabilities to the new process.
+- **Spawning** — [devmgr](../devmgr/README.md) discovers devices (PCI
+  enumeration, firmware tables), matches them to driver binaries, and requests
+  procmgr to create driver processes. devmgr then delegates per-device
+  capabilities to the new process.
 - **Communication** — drivers expose IPC endpoints for their clients (e.g. a
   block driver exposes a read/write endpoint consumed by filesystem drivers via
-  vfsd). See [docs/ipc-design.md](../../docs/ipc-design.md) for IPC semantics.
+  vfsd; see [docs/storage.md](../../docs/storage.md)). See
+  [docs/ipc-design.md](../../docs/ipc-design.md) for IPC semantics.
 - **DMA** — requires explicit DMA grant capability. The DMA safety model
   (IOMMU-isolated vs DMA-unsafe) is specified in
   [docs/device-management.md](../../docs/device-management.md).
@@ -112,10 +116,11 @@ holds ambient hardware authority. The full driver lifecycle is specified in
    where appropriate, e.g. `virtio/`, `pci/`, `platform/`).
 2. Add a `Cargo.toml` for a `no_std` binary crate targeting the userspace
    Seraph target.
-3. The driver binary receives its device capabilities from devmgr after
-   creation. It MUST NOT assume any capabilities beyond what devmgr delegates.
+3. The driver binary receives its device capabilities from
+   [devmgr](../devmgr/README.md) after creation. It MUST NOT assume any
+   capabilities beyond what devmgr delegates.
 4. Expose an IPC endpoint for clients (block read/write, network send/receive,
-   etc.) and register it with devmgr's device registry.
+   etc.) and register it with [devmgr's device registry](../devmgr/README.md).
 5. Use shared library crates (e.g. `virtio/core/`) where applicable to avoid
    duplicating transport logic.
 

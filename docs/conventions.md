@@ -41,8 +41,8 @@ is a one-time decision per member, recorded with a comment in that member's `Car
 criterion that justifies it.
 
 An opted-out member's version is independent of the project version and MAY sit below it — a
-still-primitive `terminal` and `shell` at `0.0.1` while the project is at `0.1.0` is expected, not
-an error.
+still-primitive `terminal` and `shell` at `0.0.1` below the project's `0.Y.Z` is expected, not an
+error.
 
 The opt-out covers the program's whole subtree: any internal library extracted from the program (for
 testability or structure) and the program's own test harness carry the **same** explicit version as
@@ -52,10 +52,12 @@ child's `Cargo.toml`.
 
 ### ABI / wire-protocol versions
 
-Hand-maintained integer constants inside ABI crates, read at runtime to gate compatibility.
+Hand-maintained integer constants that version cross-boundary protocols; where a protocol has a
+handshake or handover point, the constant is checked there at runtime to gate compatibility.
 
-- Constants live inside the ABI crate that owns the protocol (e.g., `BOOT_PROTOCOL_VERSION`,
-  `PROCESS_ABI_VERSION`, `INIT_PROTOCOL_VERSION`, plus per-namespace `<NAMESPACE>_LABELS_VERSION`).
+- Constants live inside the crate that owns the protocol: the ABI crates for
+  `BOOT_PROTOCOL_VERSION`, `PROCESS_ABI_VERSION`, and `INIT_PROTOCOL_VERSION`, and `shared/ipc` for
+  the per-namespace `<NAMESPACE>_LABELS_VERSION` constants.
 - One protocol = one version constant. Every breaking change to that protocol MUST bump its
   constant.
 - ABI protocol versions are independent of the project version and of Cargo crate versions.
@@ -95,9 +97,9 @@ milestone. Issues blocking a milestone MUST be assigned to it; everything else M
 ### Commit and PR cross-references
 
 - Commit messages MAY reference Issues by `#N` where useful.
-- Any commit (or PR description, when merging via PR) that closes an Issue MUST reference it via
-  `Fixes #N` / `Closes #N` in the message so the push (or merge) auto-closes the Issue. Manual
-  `gh issue close` after the fact is a procedural miss, not a substitute.
+- Any commit or PR description that closes an Issue MUST reference it via `Fixes #N` /
+  `Closes #N` so the merge auto-closes the Issue. Manual `gh issue close` after the fact is a
+  procedural miss, not a substitute.
 
 ### Acceptance checklist discipline
 
@@ -137,12 +139,9 @@ were swept to use `svctest` where they meant the services-tier harness.
   combinations (`ci, xtask`; `docs, claude`). Use the narrowest scope that covers the change.
 - `<summary>` describes what changed and MAY use `;` to delimit independent sub-changes within one
   commit.
-- `<summary>` MUST NOT contain planning labels (per
-  [documentation-standards.md](documentation-standards.md) §"Incomplete Work Markers"): no "step X",
-  "phase Y", "tier N", "stage M", "round N", "the deferred follow-up", nor any other label that only
-  a planning conversation can resolve; the name of a step or phase in a sequence a document defines
-  permanently (a kernel boot phase, a bootloader boot step) is not a label. The list is
-  illustrative, not exhaustive. Components and concrete what-changed text only.
+- `<summary>` MUST NOT contain planning labels as
+  [documentation-standards.md](documentation-standards.md) § Incomplete Work Markers defines
+  them. Components and concrete what-changed text only.
 - `<summary>` MUST NOT include task IDs, branch names, or other transient identifiers. Issue
   references belong in the body.
 
@@ -215,9 +214,10 @@ are forbidden; `master` MUST NOT receive force pushes.
   findings stay on the surface as above. A finding on the surface MUST be
   fixed before merge. A finding off the surface MUST be recorded, not fixed:
   the pre-merge review reports it as out of bound, and it is appended, with
-  file, line, authority, and fix, to the open audit Issue for that surface
-  (or to a new one, filed with the maintainer's approval) before the merge
-  prompt. No finding is dropped for being off the surface. Work an open
+  file, line, authority, and fix, to the open Issue that already names the
+  work, else to the open audit Issue for that surface (or to a new one,
+  filed with the maintainer's approval) before the merge prompt. No finding
+  is dropped for being off the surface. Work an open
   Issue already names, filed with the maintainer's approval, is off the
   surface of every other PR; a finding on it is recorded against that Issue.
   A finding two independent refuters refute on evidence is dropped and listed
@@ -225,7 +225,7 @@ are forbidden; `master` MUST NOT receive force pushes.
 
 ### Branch naming
 
-`feature/<slug>`, `fix/<slug>`, `cleanup/<slug>`, `audit/<slug>` — matching the Class labels above.
+`feature/<slug>`, `fix/<slug>`, `cleanup/<slug>`, `audit/<slug>`.
 
 ### Merge method
 
@@ -293,4 +293,5 @@ Producing a release for tag `v<X>.<Y>.<Z>`:
 
 ## Summarized By
 
-[README.md](../README.md), [build-system.md](build-system.md), [testing.md](testing.md)
+[abi/syscall/README.md](../abi/syscall/README.md), [Build System](build-system.md),
+[Documentation Standards](documentation-standards.md), [Testing](testing.md)

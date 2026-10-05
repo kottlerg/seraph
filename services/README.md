@@ -20,8 +20,6 @@ Userspace OS processes — managers, the crate-collections they bind, and freest
 | `svctest/` | Services-surface test harness |
 | `crasher/` | Test-tier fixture: deliberate-crash canary for svcmgr's restart path (gated, opt-in) |
 
-Manager↔managed pairings are co-located: `devmgr` ↔ `drivers/`, `vfsd` ↔ `fs/`.
-
 ---
 
 ## Summarized By

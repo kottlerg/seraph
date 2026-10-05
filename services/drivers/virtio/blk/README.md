@@ -24,7 +24,8 @@ virtio/blk/
 Devmgr spawns the driver and delegates per-device capabilities (BAR MMIO,
 IRQ, MSI-X). The driver creates a service endpoint and registers it with
 devmgr's device registry; vfsd queries devmgr to obtain the whole-disk
-SEND cap.
+SEND cap. The delegation chain is owned by
+[docs/storage.md](../../../../docs/storage.md) § Capability Delegation Chain.
 
 Two access tiers exist on this endpoint, distinguished by the kernel-supplied
 caller badge:
@@ -105,7 +106,9 @@ the userspace IOMMU driver lands, that driver and the block driver agree
 on a userspace cap shape to occupy this slot, and the block driver
 inspects, consumes, and releases the cap entirely in userspace before
 issuing the I/O. Reserving the slot now keeps the wire shape stable across
-that introduction.
+that introduction. IOMMU ownership is defined in
+[docs/device-management.md](../../../../docs/device-management.md) § IOMMU Discovery and
+Programming.
 
 `caps[1]` is reserved for a per-request release handle if the cooperative
 release protocol grows a block-layer analogue; today the cap is null and
@@ -187,4 +190,5 @@ values in the `CapDescriptor.aux0` field, per
 
 ## Summarized By
 
-[docs/storage.md](../../../../docs/storage.md)
+[Storage](../../../../docs/storage.md),
+[Filesystem Driver Protocol](../../../fs/docs/fs-driver-protocol.md)

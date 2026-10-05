@@ -34,6 +34,7 @@ The following individual lints are additionally mandatory:
 
 - `clippy::unwrap_used`
 - `clippy::expect_used`
+- `clippy::undocumented_unsafe_blocks`
 
 `cargo xtask build` runs Clippy with all warnings treated as errors. Code that does
 not pass this configuration is non-compliant. Configuration lives in `[workspace.lints]`
@@ -233,8 +234,8 @@ Kernel virtual addresses, kernel pointers, and any value derived from one — a
 pointer cast to an integer, a fixed kernel VA, a kernel return address, a saved
 kernel stack pointer — MUST NOT cross into userspace. This covers every
 cross-boundary output: syscall return registers, IPC label/badge/data/cap-slot
-fields, fault and exception messages, exit and death reasons, and `SYS_CAP_INFO` /
-`SYS_SYSTEM_INFO` / `SYS_ASPACE_QUERY` selectors.
+fields, fault and exception messages, exit and death reasons, `SYS_CAP_INFO` /
+`SYS_SYSTEM_INFO` selectors, and `SYS_ASPACE_QUERY` results.
 
 - Kernel-minted identifiers observed across the boundary MUST be opaque and
   unguessable — drawn from the entropy root (`entropy::next_u32` /
@@ -248,8 +249,8 @@ fields, fault and exception messages, exit and death reasons, and `SYS_CAP_INFO`
 - Kernel-pointer values MAY appear only in kernel-owned console diagnostics that
   userspace cannot read back: the serial-only class
   [docs/console-model.md](console-model.md) § Ownership across the boot lifecycle
-  defines, with each site classified in
-  [cross-boundary-disclosure.md](../core/kernel/docs/cross-boundary-disclosure.md)
+  defines, with the known sites listed in
+  [core/kernel/docs/cross-boundary-disclosure.md](../core/kernel/docs/cross-boundary-disclosure.md)
   § Kernel console diagnostics. They MUST NOT reach a userspace IPC or log channel.
 
 New or changed cross-boundary outputs MUST be classified in the kernel
@@ -264,7 +265,8 @@ in the same change.
   and all error variants.
 - Comments explain *why*, not *what*. Self-evident code needs no comment; non-obvious
   logic must explain its reasoning.
-- TODO comments MUST state what needs doing and why it was deferred.
+- TODO comments follow [documentation-standards.md](documentation-standards.md) § Incomplete
+  Work Markers and MUST additionally state why the work was deferred.
 - Architecture decisions not obvious from the code belong in the relevant `docs/` file,
   not only in inline comments.
 - Comments and rustdoc MUST reference code by stable identifier (symbol, function, const,
@@ -301,7 +303,7 @@ in the same change.
 - Every inline assembly block MUST comment what it does, what registers it clobbers,
   and what constraints it assumes.
 - When adding a new architecture, do not diverge from the interface contract without
-  updating both implementations.
+  updating every implementation.
 
 ---
 
@@ -326,8 +328,9 @@ allocator, a state machine — it SHOULD be factored so that logic is host-reach
 `no_std` library crate, or a trait boundary that injects the platform, rather than logic
 entangled with IPC, syscall, or `std::os::seraph` calls. The goal is keeping the algorithmic
 core separable from mechanism, as the kernel already does for its allocators and capability
-tree; host-testability is the symptom of that separation, not the goal. This is a SHOULD that
-applies to non-trivial logic — it is not a mandate to extract trivial glue into crates.
+tree ([build-system.md](build-system.md#kernel-testing-strategy)); host-testability is the
+symptom of that separation, not the goal. This is a SHOULD that applies to non-trivial logic —
+it is not a mandate to extract trivial glue into crates.
 
 ### Tests assert behaviour, not surface area
 
@@ -356,7 +359,7 @@ mod tests
     #[test]
     fn alloc_fails_when_no_regions_added()
     {
-        let mut alloc = BuddyAllocator::new(10);
+        let mut alloc = BuddyAllocator::new();
         assert_eq!(alloc.alloc(0), None);
     }
 }
@@ -468,11 +471,13 @@ capacity: usize,
 
 `cargo xtask build` is the single mandatory build command; it runs Clippy with the
 mandated lint groups and treats all warnings as errors. Invocation details are in
-[build-system.md](build-system.md).
+[xtask/README.md](../xtask/README.md) § `cargo xtask build`.
 
 ---
 
 ## Summarized By
 
-[Build System](build-system.md), [xtask/README.md](../xtask/README.md)
-
+[core/boot/README.md](../core/boot/README.md),
+[Architecture Abstraction Layer](../core/kernel/docs/arch-interface.md),
+[Kernel Cross-Boundary Disclosure Inventory](../core/kernel/docs/cross-boundary-disclosure.md),
+[xtask/README.md](../xtask/README.md)

@@ -18,78 +18,79 @@ Two processes that do not share an IPC capability cannot communicate.
 
 ### Endpoints
 
-An endpoint is a kernel object through which synchronous IPC occurs. It is created by
-a server and referenced by capability. Holding a send capability to an endpoint allows
+An endpoint is a kernel object through which synchronous IPC occurs. It is created with
+`SYS_CAP_CREATE_ENDPOINT` — by the server itself or, commonly, by init or a parent on its
+behalf — and referenced by capability. Holding a send capability to an endpoint allows
 a process to call the server; only the process holding the receive capability can accept
 calls on it.
 
-Endpoints are stateless rendezvous points.
+Endpoints are rendezvous points: they buffer no messages, only FIFO queues of blocked callers
+and blocked receivers.
 
 ### The Call/Reply Model
 
 Synchronous IPC follows a strict call/reply pattern:
 
 1. **Caller** invokes `call(endpoint_cap, message)` and blocks.
-2. **Server** invokes `recv(endpoint_cap)`, which returns the message and a
-   single-use **reply capability**.
-3. **Server** processes the request and invokes `reply(reply_cap, message)`.
+2. **Server** invokes `recv(endpoint_cap)`, which returns the message and binds the caller
+   to the receiving thread as its single pending reply (an implicit, single-use **reply
+   capability** held in the thread, outside its CSpace).
+3. **Server** processes the request and invokes `reply(message)`; the kernel delivers it to
+   the bound caller and clears the binding.
 4. **Caller** is unblocked and receives the reply.
 
 The reply capability is valid for exactly one use; it cannot be stored, delegated,
 or reused.
 
-A server that needs to delegate work may save its reply capability and reply after
-receiving the downstream result.
+A server that needs to delegate work may make a downstream call before replying: the pending
+reply stays bound to the receiving thread until that thread replies.
 
 ### Message Format
 
 A message consists of:
 
 - **Label** — one word. Interpreted by the receiver as a message type or opcode.
-  The kernel does not inspect or validate the label.
+  The kernel does not inspect or validate the label of an ordinary call or reply; it
+  interprets the reply label to a fault-blocked thread (see
+  [Fault Handling](fault-handling.md) § Reply) and reserves `IPC_REPLY_TRANSFER_FAILED`
+  for its own synthetic reply.
 - **Data words** — up to `MSG_DATA_WORDS_MAX` words carrying the message payload.
 - **Capability slots** — up to `MSG_CAP_SLOTS_MAX` capability references.
   The transfer is all-or-nothing at commit: either every capability's move
   begins with the message (the sender loses access as each completes), or none
   does. A refused transfer — a source slot gone stale, repeated within the
   message, or pinned by an in-flight revocation or move, or a sender's or
-  receiver's CSpace already torn down — does not block delivery: the message
-  arrives with zero capabilities and the sender keeps its own. A capability
+  receiver's CSpace already torn down — never delivers a partial set. On the
+  call/receive direction a refusal detectable up front rejects the sender before
+  blocking; one that arises after the sender blocked does not block delivery: the
+  message arrives with zero capabilities and the sender keeps its own, without
+  learning of the refusal. On the reply direction the replying server receives the
+  error and the waiting caller resumes with the `IPC_REPLY_TRANSFER_FAILED` label,
+  zero data words, and zero capabilities in place of the reply. A capability
   with more derived children than the kernel migrates in one lock hold is
-  moved in batches after the message commits (see
-  [capability-internals.md](../core/kernel/docs/capability-internals.md)
-  § Move); if an ancestor revokes it meanwhile it arrives as handle 0 (the
-  permanently null slot), exactly as if the revoke had landed just after
-  delivery; if the receiver's CSpace is torn down meanwhile it likewise
-  arrives as handle 0 but the sender keeps it; and if a concurrent deriver
-  keeps its child list growing past the kernel's batch backstop it arrives
-  live while the sender's slot survives as its derivation parent. On the reply
-  direction the sender (the replying server) receives the error and the waiting
-  caller resumes with the `IPC_REPLY_TRANSFER_FAILED` label; on the call/receive
-  direction the sender is rejected before blocking where the refusal is
-  detectable up front, and otherwise proceeds without learning of the refusal.
+  moved in batches after the message commits; what the receiver and the
+  sender then hold under a concurrent revoke, CSpace teardown, or deriver is
+  specified in [capability-internals.md](../core/kernel/docs/capability-internals.md)
+  § Move.
 
 **Data-word transport:** Data words travel through a per-thread **IPC buffer
 page**. Each thread registers its IPC buffer page once via `SYS_IPC_BUFFER_SET`.
 The kernel reads from the sender's page and writes to the receiver's page
-directly — no arbitrary user pointer dereference, no heap allocation. A
-data-carrying IPC with no registered page fails with `InvalidArgument`; a page
-unmapped after registration surfaces the copy fault (`InvalidAddress`).
+directly — no arbitrary user pointer dereference, no heap allocation. The error
+surface of a missing or unmapped page, on the sending and the delivery side, is
+specified in [syscalls.md](../core/kernel/docs/syscalls.md) § `SYS_IPC_BUFFER_SET`.
 Capability handles always travel in registers on the send side, regardless
 of payload size; the delivered destination handles reach the receiver
-through the cap-transfer result block in its IPC buffer page. A thread that
-receives capabilities therefore needs a registered page: without one the
-caps are still moved into its CSpace, but their handles are unlearnable and
-the slots stay consumed until the CSpace is torn down. Message labels, counts,
-and badges travel in registers.
+through the cap-transfer result block in its IPC buffer page. Message labels,
+counts, and badges travel in registers.
 
 For bulk data, pass a shared memory capability instead.
 
 ### Large Data Transfers
 
-Fixed-size messages are intentionally small. For large payloads — bulk data, file
-contents, frame buffers — the correct approach is to pass a shared memory capability
-rather than embedding data in the message.
+Messages are intentionally small (at most `MSG_DATA_WORDS_MAX` data words). For large
+payloads — bulk data, file contents, frame buffers — the correct approach is to pass a
+shared memory capability rather than embedding data in the message.
 
 The sender maps a region, writes data, and passes a capability to the receiver. No
 kernel copy occurs. The capability controls access rights (read-only, read-write).
@@ -162,11 +163,11 @@ Capabilities passed in IPC messages are moved, not copied; see
 
 ## Fault Delivery
 
-Under the fault-handler protocol ([Fault Handling](fault-handling.md); not yet
-implemented), a userspace thread fault the kernel cannot resolve is delivered to the
-thread's bound fault-handler endpoint as a kernel-originated synchronous message,
-suspending the thread until the handler replies to resume (or the binding is severed and
-the thread is killed).
+Under the fault-handler protocol ([Fault Handling](fault-handling.md)), a userspace thread
+fault the kernel cannot resolve is delivered to the thread's bound fault-handler endpoint as
+a kernel-originated synchronous message, suspending the thread until the handler replies —
+resuming it, or killing it on `FAULT_REPLY_KILL` — or the binding is severed and the thread
+is killed.
 This reuses the call/reply machinery above — the suspended thread occupies the caller's
 role and the handler services it with the ordinary receive/reply cycle. See
 [Fault Handling](fault-handling.md).
@@ -178,7 +179,7 @@ role and the handler services it with the ordinary receive/reply cycle. See
 `SYS_IPC_RECV` pre-allocates worst-case capability-slot headroom (`MSG_CAP_SLOTS_MAX`) in the
 receiver's CSpace before parking, so capability transfer on the immediate-delivery path cannot
 fail mid-handshake. The consequence: a receiver whose CSpace cannot provide that headroom fails
-the receive *before* blocking. The condition is structural, not transient — an unguarded
+the receive *before* blocking. A structural-ceiling failure is not transient — an unguarded
 `loop { ipc_recv }` retries at syscall rate, indefinitely.
 
 Two mechanisms make the condition diagnosable:
@@ -207,8 +208,8 @@ shared/ipc policy block.
 ## Kernel Role
 
 The kernel delivers messages, manages endpoint queuing, and transfers capability
-references atomically with messages. It has no opinion on message content, service
-protocols, or what capabilities mean to the receiving process.
+references all-or-nothing with messages (see § Message Format). It has no opinion on
+message content, service protocols, or what capabilities mean to the receiving process.
 
 The kernel does not provide:
 - Service discovery — endpoint capabilities are delegated by init or a parent
@@ -219,9 +220,9 @@ The kernel does not provide:
 
 ## Summarized By
 
-[README.md](../README.md),
+[Capability Subsystem Internals](../core/kernel/docs/capability-internals.md),
+[IPC Subsystem Internals](../core/kernel/docs/ipc-internals.md),
+[Syscall Interface Specification](../core/kernel/docs/syscalls.md),
 [Architecture Overview](architecture.md),
-[devmgr/README.md](../services/devmgr/README.md),
-[logd/README.md](../services/logd/README.md),
-[shared/README.md](../shared/README.md),
-[vfsd/README.md](../services/vfsd/README.md)
+[procmgr IPC Interface](../services/procmgr/docs/ipc-interface.md),
+[shared/namespace-protocol/README.md](../shared/namespace-protocol/README.md)

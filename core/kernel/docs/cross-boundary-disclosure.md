@@ -72,14 +72,17 @@ Notes on the non-obvious entries:
   (`syscall_abi::unpack_cap_handles`, generation-validated by
   `ipc::prevalidate_transfer_slots` before any move), and freshly
   re-derived destination handles outbound. Both directions expose only
-  values the owning process already holds or is being granted.
+  values the owning process already holds or is being granted; see
+  [syscalls.md](syscalls.md) § Capability Handles.
 - **Fault messages** source `d1`/`ip` from the live user `TrapFrame` — the faulting
-  user address and user instruction pointer. The forwarded/readable `TrapFrame`
-  holds only user-mode register state (no kernel stack pointer, kernel return
-  address, or `CR3`/`satp`); the write path re-validates through
-  `sanitize_for_user_resume`.
-- **Thread IDs** are random per `sched::alloc_thread_id` (issue #248) — a monotonic
-  id would leak thread creation counts/rates wherever logged. They are diagnostic
+  user address and user instruction pointer
+  ([docs/fault-handling.md](../../../docs/fault-handling.md) § Fault Message). The
+  forwarded/readable `TrapFrame` holds only user-mode register state (no kernel stack
+  pointer, kernel return address, or `CR3`/`satp`); the write path re-validates
+  through `sanitize_for_user_resume`.
+- **Thread IDs** are random per `sched::alloc_thread_id` (issue #248;
+  [scheduling-internals.md](scheduling-internals.md) § Cross-CPU TCB Ownership) — a
+  monotonic id would leak thread creation counts/rates wherever logged. They are diagnostic
   correlators only and never cross the boundary as syscall data.
 - **`SYS_SBI_CALL`** forwards caller-supplied arguments to M-mode firmware and
   returns the firmware result; neither the arguments the kernel forwards nor the
@@ -98,8 +101,9 @@ Notes on the non-obvious entries:
 Three surfaces emit real addresses. All are **physical**, not kernel virtual:
 
 - `SYS_ASPACE_QUERY` (`sysinfo::sys_aspace_query`) returns the leaf physical address
-  backing a *user* page, gated on an `AddressSpace` capability with the `READ` right.
-  The intermediate page-table addresses traversed during the walk are not returned.
+  backing a *user* page, gated on an `AddressSpace` capability with the `READ` right
+  ([syscalls.md](syscalls.md) § `SYS_ASPACE_QUERY` (41)). The intermediate page-table
+  addresses traversed during the walk are not returned.
 - `CAP_INFO_MEMORY_PHYS_BASE` (`cap::sys_cap_info`) returns `MemoryObject::base`, the
   physical base of a Memory object the caller holds a capability to. memmgr depends
   on it to track region contiguity.
@@ -114,6 +118,7 @@ are fixed-by-contract disclosures, not leaks.
 
 **Resolved for the KASLR work ([#252](https://github.com/kottlerg/seraph/issues/252)):**
 KASLR draws the direct-map base from the boot-entropy source at 1 GiB granularity
+([docs/memory-model.md](../../../docs/memory-model.md) § Virtual Address Space Layout)
 (≈17–26 bits on x86-64 / Sv48 / Sv57, ≈8 bits on a near-full Sv39 half), independently
 of any physical address. A leaked physical address therefore does **not** reveal the
 phys→virt offset — recovering the direct-map base from a physical address would require
@@ -121,7 +126,8 @@ also knowing that page's virtual address, which these surfaces do not disclose. 
 `SYS_ASPACE_QUERY` and `CAP_INFO_MEMORY_PHYS_BASE` remain fixed-by-contract disclosures,
 not KASLR leaks. (`kernel_physical_base` is likewise a physical value and unaffected;
 the kernel scrubs the *virtual* KASLR bases — `kernel_virtual_base`, `direct_map_base` —
-from the donated `BootInfo` page after consuming them.)
+from the donated `BootInfo` page after consuming them; see
+[initialization.md](initialization.md) § Phase 5.)
 
 ## Kernel state in donated memory
 
@@ -163,17 +169,20 @@ directly and never becomes a client of the userspace serial or framebuffer drive
 and no IPC channel delivers kernel log output to a userspace process as data. The
 always-on `USERSPACE FAULT` serial dumps print the faulting thread's *own* user
 registers, not kernel addresses. Every kernel VA lies in one of the two regions KASLR
-randomizes (the image or the direct map), so kernel-pointer console output is governed
-by the serial-only rule below; it must not be routed to any userspace-reachable IPC or
-log channel.
+randomizes (the image or the direct map; see
+[docs/memory-model.md](../../../docs/memory-model.md) § Virtual Address Space Layout), so
+kernel-pointer console output is governed by the serial-only rule below; it must not be
+routed to any userspace-reachable IPC or log channel.
 
 **KASLR values are serial-only.** The randomized kernel image base, direct-map base,
 and slide, and any kernel virtual address derived from them (an image VA or a
 direct-map VA), are secrets whose disclosure defeats KASLR. `kprintln!` mirrors to the
 framebuffer, and although the kernel writes that framebuffer directly (not as a driver
-client), the framebuffer *memory* is later handed to the userspace framebuffer driver,
-which can read the pixels back — so a KASLR value printed via `kprintln!` becomes
-userspace-recoverable. These values must be emitted **only** via the serial-only sinks
+client), the framebuffer *memory* is later handed to the userspace framebuffer driver
+([docs/console-model.md](../../../docs/console-model.md) § The framebuffer driver as sole
+userspace framebuffer owner), which can read the pixels back — so a KASLR value printed
+via `kprintln!` becomes userspace-recoverable. These values must be emitted **only** via
+the serial-only sinks
 (`kprintln_serial!` / `console::serial_write_fmt`; on the panic and NMI paths the
 lock-bypassing `console::panic_write_fmt` and `kprintln_nmi!` /
 `console::nmi_write_fmt`), never `kprintln!`, and never through any IPC or log channel.
@@ -203,4 +212,7 @@ identifier observed across the boundary is drawn from the entropy root
 
 ## Summarized By
 
-[Kernel](../README.md)
+[core/kernel/README.md](../README.md), [Capability Subsystem Internals](capability-internals.md),
+[Kernel Initialization Sequence](initialization.md),
+[SMP Scheduling and Locking Invariants](scheduling-internals.md),
+[Console Model](../../../docs/console-model.md)

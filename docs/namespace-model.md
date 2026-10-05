@@ -20,7 +20,8 @@ override.
 - Walking is monotonically attenuating. A capability obtained by walking
   from a parent capability MUST NOT carry rights that exceed the parent's.
 - Authority is delivered, not discovered. Every namespace capability a
-  process holds arrived via the per-process bootstrap-cap handover or via
+  process holds arrived via the spawner's delivery at process creation
+  (see [Initial Capability Delivery](#initial-capability-delivery)) or via
   IPC from another process that already held it.
 
 ---
@@ -28,9 +29,10 @@ override.
 ## Node Capabilities
 
 A **node capability** is a badged send capability on a namespace
-server's endpoint. The badge packs a 40-bit server-private node
-identifier and a 24-bit namespace rights mask (see
-[Namespace Rights](#namespace-rights)). See
+server's endpoint. The badge packs a server-private node identifier and
+a namespace rights mask (layout in
+[shared/namespace-protocol/README.md](../shared/namespace-protocol/README.md)
+§ Badge shape; see [Namespace Rights](#namespace-rights)). See
 [capability-model.md](capability-model.md) §"Badges" for the
 kernel-side derivation and set-once semantics that govern these caps.
 
@@ -39,20 +41,26 @@ the server permits and the operations the server accepts on the
 addressed node:
 
 - **Directory capability** — references a directory node. Operations:
-  `NS_LOOKUP`, `NS_READDIR`, `NS_STAT`.
-- **File capability** — references a file node. Operations: `NS_READ`,
-  `NS_READ_MEMORY`, `NS_RELEASE_MEMORY`/`_ACK`, `NS_STAT`.
+  `NS_LOOKUP`, `NS_READDIR`, `NS_STAT`, and the `MUTATE_DIR`-gated
+  `FS_CREATE`, `FS_REMOVE`, `FS_MKDIR`, `FS_RENAME`.
+- **File capability** — references a file node. Operations: `NS_STAT`,
+  plus the file labels `FS_READ`, `FS_READ_MEMORY`,
+  `FS_RELEASE_MEMORY`/`FS_RELEASE_ACK`, `FS_WRITE`, `FS_WRITE_MEMORY`,
+  `FS_TRUNCATE`, and `FS_CLOSE`; `namespace_protocol::gate` checks each
+  request label against the caller's namespace rights.
 
 The kernel layer holds no notion of "directory" or "file." Type
 distinctions are server-private and surface to clients via the
-`kind` field of the `NS_LOOKUP` reply.
+kind word of the `NS_LOOKUP`, `NS_STAT`, and `NS_READDIR` replies.
 
 ### Derivation root
 
 Every node capability the system ever issues derives from a server's
-**namespace endpoint capability**: an un-badged send capability the
-server holds in its own CSpace. The namespace tree therefore lives in
-server state, not in the kernel's derivation graph.
+**namespace endpoint capability**: the un-badged endpoint capability the
+server receives on, or the un-badged SEND copy of it that a composing
+server holds to mint caps across a mount (see
+[Cross-server entries](#cross-server-entries)). The namespace tree
+therefore lives in server state, not in the kernel's derivation graph.
 
 ### Revocation
 
@@ -82,17 +90,9 @@ govern the cap-as-send-capability layer (`SEND`, `MAP`, etc.). Every
 node capability is a `SEND` cap from the kernel's perspective; namespace
 rights are only inspected by the server.
 
-| Bit | Name | Meaning |
-|----:|------|---------|
-| 0 | `LOOKUP` | NS_LOOKUP into this directory is permitted |
-| 1 | `READDIR` | NS_READDIR enumeration of this directory is permitted |
-| 2 | `STAT` | NS_STAT on this node is permitted |
-| 3 | `READ` | NS_READ / NS_READ_MEMORY on this file is permitted |
-| 4 | `WRITE` | NS_WRITE on this file is permitted |
-| 5 | `EXEC` | This file is executable (consumed by ELF loaders) |
-| 6 | `MUTATE_DIR` | NS_CREATE / NS_UNLINK in this directory are permitted |
-| 7 | `ADMIN` | Reserved for visibility gating (see Per-Entry Visibility) |
-| 8..23 | — | Reserved; MUST be zero on derive, ignored on read |
+Bit assignments and their gated operations are specified in
+[shared/namespace-protocol/README.md](../shared/namespace-protocol/README.md)
+§ Rights.
 
 Servers MUST reject any operation requiring a rights bit that is not
 set in the caller's badge. Servers MUST NOT promote rights at any
@@ -103,7 +103,8 @@ operation; rights can only narrow.
 ## Per-Entry Rights and Visibility
 
 Each entry in a directory's storage carries two namespace-rights masks
-in addition to the child's `node_id` and `kind`:
+in addition to the child's target (a local `node_id` or a peer namespace
+endpoint; see [Cross-server entries](#cross-server-entries)) and `kind`:
 
 - `max_rights` — the ceiling on rights any child capability minted for
   this entry MAY carry. Independent of the parent directory's rights.
@@ -112,7 +113,7 @@ in addition to the child's `node_id` and `kind`:
 
 On `NS_LOOKUP`, the returned child rights equal
 `parent_rights ∩ entry.max_rights ∩ caller_requested_rights`; entries
-failing the `visible_requires` check appear as `NOT_FOUND` (the caller
+failing the `visible_requires` check appear as `NsError::NotFound` (the caller
 MUST NOT be able to distinguish "hidden" from "absent"). The
 namespace-protocol crate executes this uniformly for every backend; see
 [`shared/namespace-protocol/README.md`](../shared/namespace-protocol/README.md)
@@ -128,7 +129,7 @@ This composition is what gives the namespace its security properties:
 - A directory invisible to unprivileged callers is expressed by setting
   `visible_requires` to require a rights bit (e.g., `ADMIN`) the
   unprivileged caller does not hold. Such an entry does not appear in
-  readdir and lookup returns `NOT_FOUND`.
+  readdir and lookup returns `NsError::NotFound`.
 - Higher rights to a node are obtainable only from a separately
   delivered capability, minted at the source by a holder of the higher
   rights. The two capabilities name the same node with different
@@ -149,8 +150,8 @@ capability for the parent. There is no kernel-level "absolute path";
 a leading `/` in a string path is stripped and the walk begins at
 whatever directory capability the client has chosen as its root.
 
-Servers MUST reject `..` and `.` as component names along with any
-name containing `/` (0x2F) or `\0` (0x00). See Naming.
+Servers reject `.`, `..`, and names containing `/` or NUL per
+[shared/namespace-protocol/README.md](../shared/namespace-protocol/README.md) § Names.
 
 ### Current working directory
 
@@ -164,31 +165,25 @@ them.
 
 Spawners install the child's initial cwd cap via the same wire that
 delivers the root cap (`procmgr_labels::CONFIGURE_NAMESPACE`,
-`caps[1]`). A child without a delivered cwd cap holds no cwd cap;
+`caps[1]`; see [services/procmgr/README.md](../services/procmgr/README.md)).
+A child without a delivered cwd cap holds no cwd cap;
 relative-path resolution fails until the child obtains one (typically
 by walking its root cap to a directory). The convention in std is
 that `File::open` resolves a leading-`/` path against the root cap
 and any other path against the cwd cap, but this is a userspace
 convention — the namespace protocol does not interpret path strings.
+The std bindings are specified in
+[runtime/ruststd/README.md](../runtime/ruststd/README.md).
 
 ---
 
 ## Naming
 
-A name accepted by `NS_LOOKUP` is a single component:
-
-- UTF-8 encoded.
-- Length 1..=255 bytes.
-- MUST NOT contain `/` (0x2F) or `\0` (0x00).
-- MUST NOT be `.` or `..`.
-
-Backends MAY further restrict (reserved words, on-disk encoding limits,
-case-sensitivity rules). Such restrictions MUST be enforced inside the
-backend and surfaced as `NOT_FOUND` or `INVALID_NAME` per the
-namespace protocol.
-
-Case sensitivity is backend-defined. The protocol contract does not
-mandate either policy.
+Names are single components; the encoding, length, forbidden-byte and
+reserved-name rules, and how backend-specific restrictions surface, are
+specified in
+[shared/namespace-protocol/README.md](../shared/namespace-protocol/README.md)
+§ Names. Case sensitivity is backend-defined.
 
 ---
 
@@ -196,9 +191,11 @@ mandate either policy.
 
 A namespace server is any process that implements the
 `NamespaceBackend` trait and serves a namespace endpoint. The protocol
-crate (`shared/namespace-protocol`) owns the IPC dispatch loop, name
-validation, rights composition, visibility filtering, and capability
-minting. Backends own only their storage layer.
+crate ([shared/namespace-protocol/README.md](../shared/namespace-protocol/README.md))
+owns per-message dispatch (`dispatch_request`), the per-label rights
+gate (`gate`), name validation, rights composition, visibility
+filtering, and capability minting; each backend runs its own receive
+loop and owns only its storage layer.
 
 This isolates the security-relevant code in a single place. Adding a
 new filesystem driver is an exercise in implementing
@@ -217,7 +214,10 @@ A directory entry's stored target is one of:
   cap — is what carries attenuation across the mount boundary: a node
   cap's rights live in its badge, and the kernel forbids re-badging an
   already-badged capability, so a stored cross-server cap could only be
-  copied at its original rights, laundering authority. The composing
+  copied at its original rights, laundering authority (see
+  [shared/namespace-protocol/README.md](../shared/namespace-protocol/README.md)
+  § NS_LOOKUP and [docs/capability-model.md](capability-model.md)
+  § Badges). The composing
   server therefore stores the peer's unbadged endpoint and badges each
   crossing lookup's result itself.
 
@@ -226,7 +226,12 @@ A "mount" is a directory entry whose stored target is the mounted
 filesystem server's namespace endpoint. The composing server holds those
 endpoints at boot or from runtime mount events; lookups crossing the
 mount point mint cross-server capabilities and subsequent operations
-go directly to the owning backend with no proxy hop.
+go directly to the owning backend with no proxy hop. A composing server
+MAY instead forward a lookup to a peer through a held badged cap (vfsd's
+root-mount fall-through; see
+[services/vfsd/docs/namespace-composition.md](../services/vfsd/docs/namespace-composition.md));
+the forwarder MUST intersect the caller's rights into the forwarded
+request so walking stays monotonically attenuating.
 
 A "view" — for example, a per-process sandbox root — is a directory
 constructed in any backend (typically a small in-memory backend) whose
@@ -238,13 +243,17 @@ entries are capabilities chosen by the view's constructor.
 ## Initial Capability Delivery
 
 A process that needs namespace access receives one or more node
-capabilities at process bootstrap. The mechanism is the same per-process
-[bootstrap-cap handover](process-lifecycle.md) used to deliver every
-other per-process capability.
+capabilities at process bootstrap. The spawner supplies them through
+procmgr's `CONFIGURE_NAMESPACE` call between create and start; procmgr
+installs them in the child's CSpace and records their slots in
+`ProcessInfo.system_root_cap` and `ProcessInfo.current_dir_cap` (see
+[process-lifecycle.md](process-lifecycle.md) § ProcessInfo / InitInfo
+Handover Discipline).
 
 A process that is delivered no namespace capability has no namespace
 access. The runtime library (`std`) treats this as the absence of
-filesystem support and returns `Unsupported` from `std::fs` operations.
+filesystem support and returns `Unsupported` from `std::fs` operations (see
+[runtime/ruststd/README.md](../runtime/ruststd/README.md)).
 
 There is no ambient namespace endpoint, no global lookup service, and
 no `ProcessInfo` field carrying a default fs capability. Namespace
@@ -261,7 +270,8 @@ that is not the system root. The capability MAY be:
   rights;
 - the root of a synthetic directory composed by the spawner with
   cap entries pointing wherever the spawner chose;
-- the null capability (no namespace access at all).
+- no capability: the spawner skips `CONFIGURE_NAMESPACE`, and the child has no namespace
+  access at all.
 
 There is no chroot syscall, no mount namespace, no per-process mount
 table, and no permission-check syscall. The capability delivered *is*
@@ -301,7 +311,9 @@ This makes the mechanism agnostic to:
 
 ## Summarized By
 
-[README.md](../README.md), [docs/capability-model.md](capability-model.md),
-[docs/storage.md](storage.md),
-[shared/namespace-protocol/README.md](../shared/namespace-protocol/README.md),
-[services/vfsd/docs/namespace-composition.md](../services/vfsd/docs/namespace-composition.md)
+[Capability Model](capability-model.md), [Storage](storage.md),
+[runtime/ruststd/README.md](../runtime/ruststd/README.md),
+[services/procmgr/README.md](../services/procmgr/README.md),
+[`.svc` Service Definitions](../services/svcmgr/docs/service-definitions.md),
+[Synthetic Root and Namespace Composition](../services/vfsd/docs/namespace-composition.md),
+[shared/namespace-protocol/README.md](../shared/namespace-protocol/README.md)

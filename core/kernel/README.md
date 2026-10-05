@@ -216,7 +216,8 @@ and is compiled with a custom target specification for each architecture:
 
 Custom target JSON files live in `xtask/targets/`. They specify the code model,
 relocation model, and disable features the kernel cannot use (SSE/AVX before explicit
-initialization, for example).
+initialization, for example). See [docs/build-system.md](../../docs/build-system.md) for the
+toolchain and target configuration.
 
 `build.rs` selects the appropriate linker script from `linker/` based on the active
 target. Linker scripts place sections at the intended virtual addresses and establish

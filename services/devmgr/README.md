@@ -143,4 +143,14 @@ MUST NOT be started independently of devmgr. See
 
 ## Summarized By
 
-[docs/device-management.md](../../docs/device-management.md)
+[Capability Model](../../docs/capability-model.md),
+[Device Management](../../docs/device-management.md),
+[services/drivers/README.md](../drivers/README.md),
+[services/drivers/cmos/README.md](../drivers/cmos/README.md),
+[services/drivers/framebuffer/README.md](../drivers/framebuffer/README.md),
+[services/drivers/goldfish-rtc/README.md](../drivers/goldfish-rtc/README.md),
+[services/drivers/serial/README.md](../drivers/serial/README.md),
+[services/drivers/virtio/input/README.md](../drivers/virtio/input/README.md),
+[services/init/README.md](../init/README.md), [init Bootstrap Stages](../init/docs/bootstrap.md),
+[services/pwrmgr/README.md](../pwrmgr/README.md),
+[Restart Protocol](../svcmgr/docs/restart-protocol.md)

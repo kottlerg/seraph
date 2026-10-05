@@ -87,4 +87,5 @@ remount-survive testing is tracked as a follow-up.
 
 ## Summarized By
 
+[Filesystem Driver Protocol](../../docs/fs-driver-protocol.md),
 [services/fs/fat/README.md](../README.md)

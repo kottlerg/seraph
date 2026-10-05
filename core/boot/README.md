@@ -5,7 +5,7 @@ UEFI bootloader for Seraph. Loads the kernel ELF and the
 parses init's ELF into `InitImage`, establishes
 initial page tables with W^X enforcement, discovers firmware table addresses (ACPI
 RSDP / Device Tree blob) for passthrough to userspace, and jumps to the kernel entry
-point.
+point. The full sequence is in [docs/boot-flow.md](docs/boot-flow.md).
 
 The boot protocol contract — `BootInfo` layout, `BOOT_PROTOCOL_VERSION`,
 `KernelMmio` / `MmioAperture` shape, and the compliant-bootloader
@@ -62,15 +62,17 @@ boot/
 Defines `BootInfo` and all associated types as a stable `#[repr(C)]` interface shared
 between the bootloader and the kernel. Also exports the `BOOT_PROTOCOL_VERSION`
 constant. Neither crate links to the other; both depend on `boot-protocol` as a
-workspace member.
+workspace member. The contract is specified in
+[abi/boot-protocol/README.md](../../abi/boot-protocol/README.md).
 
 **`seraph-boot`** (`boot/`) — the UEFI application. Depends on `boot-protocol` for the
 `BootInfo` type it populates. Architecture-specific code is isolated to `arch/<target>/`;
 `#[cfg(target_arch)]` appears only at the arch-module declaration site in
-`arch/mod.rs`. Each shared module dispatches to the active arch implementation via
+`arch/mod.rs`, per [docs/coding-standards.md](../../docs/coding-standards.md)
+§ C. Architecture Invariants. Each shared module dispatches to the active arch implementation via
 the re-exports in `arch/mod.rs`.
 
-`shared/elf/` is the workspace's authoritative ELF format decoder
+[`shared/elf/`](../../shared/elf/README.md) is the workspace's authoritative ELF format decoder
 (header validation, `PT_LOAD` segment iteration, entry point, TLS).
 `boot/src/elf.rs` is a thin UEFI-allocation layer over it: for the kernel
 image it allocates one contiguous span at any available physical base via
@@ -80,7 +82,7 @@ firmware memory layout; for the init image it allocates at any available
 address while preserving the in-page byte offset of `p_vaddr`, then
 constructs the `BootInfo.init_image` ABI surface so the kernel never needs
 an ELF parser. Boot modules are loaded as opaque flat binaries with no
-parsing.
+parsing. Both loading paths are specified in [docs/elf-loading.md](docs/elf-loading.md).
 
 W^X is enforced for both images; where each segment kind is rejected is in
 [docs/elf-loading.md](docs/elf-loading.md) § LOAD Segment Processing. ELF format
@@ -129,7 +131,8 @@ for details.
 `efi_main` in `src/main.rs` is the UEFI application entry point, declared
 `extern "efiapi"`. UEFI firmware calls it with `(image_handle, system_table)` after
 loading and relocating the image. It does not return; the final act is a one-way jump
-to `kernel_entry` in the kernel binary.
+to `kernel_entry` in the kernel binary. The steps between entry and that jump are in
+[docs/boot-flow.md](docs/boot-flow.md).
 
 The CPU state established at the kernel entry point is specified in
 [docs/kernel-handoff.md](docs/kernel-handoff.md).
@@ -138,7 +141,8 @@ The CPU state established at the kernel entry point is specified in
 
 ## What the Bootloader Does Not Do
 
-- **No UEFI runtime services.** UEFI is fully exited before the kernel runs.
+- **No UEFI runtime services.** UEFI is fully exited before the kernel runs
+  ([docs/uefi-environment.md](docs/uefi-environment.md) § ExitBootServices).
 - **Narrow firmware extraction only.** The bootloader records the ACPI RSDP
   and Device Tree blob addresses in `BootInfo` so userspace can re-parse
   them, extracts the arch-specific MMIO bases the kernel itself needs
@@ -147,12 +151,15 @@ The CPU state established at the kernel entry point is specified in
   with firmware-advertised PCI windows, plus the boot-entropy seed and
   the VMGENID GUID address. No per-device descriptors, no
   IRQ descriptors, no PCI enumeration. Namespace evaluation and
-  device-level assignment are userspace's responsibility.
+  device-level assignment are userspace's responsibility. Extraction scope is in
+  [docs/firmware-parsing.md](docs/firmware-parsing.md).
 - **No boot menu or interactive UI.** The kernel, bundle, and `nokaslr` knob
   ESP paths are hardcoded; there is no boot configuration file beyond the
-  presence-only knob and no kernel command line.
+  presence-only knob and no kernel command line
+  ([docs/elf-loading.md](docs/elf-loading.md) § File Paths).
 - **No permanent page tables.** The initial tables are minimal and temporary; the
-  kernel replaces them during Phase 3 of its initialisation sequence.
+  kernel replaces them during Phase 3 of its initialisation sequence
+  ([docs/page-tables.md](docs/page-tables.md)).
 
 ---
 
@@ -170,4 +177,4 @@ The CPU state established at the kernel entry point is specified in
 
 ## Summarized By
 
-None
+[core/ktest/README.md](../ktest/README.md), [rootfs/README.md](../../rootfs/README.md)

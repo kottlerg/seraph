@@ -25,8 +25,9 @@ claims.
 
 3. Materialize the diff: `gh pr diff <N>` (or `git diff master...HEAD`).
 
-4. PR-body checklist: every `- [ ]` in the PR body MUST be `- [x]` or
-   removed with rationale. List violators.
+4. PR-body checklist: per `docs/conventions.md` § PR-body checklist
+   discipline, every `- [ ]` in the PR body MUST be `- [x]` or removed
+   with a one-line rationale in the same edit. List violators.
 
 5. Per-issue closure: extract every `Closes #N` / `Fixes #N` /
    `Resolves #N` from PR body and commits. For each, `gh issue view <N>
@@ -39,9 +40,10 @@ claims.
 
 6. Silent-deferral scan. The target notification is *intent to defer
    mechanically-reachable work this PR should have covered*, not in-code
-   work markers — `docs/documentation-standards.md` endorses bare `TODO`
-   tokens as the canonical in-code annotation for independent future
-   work, and flagging them generates noise on any code-touching PR.
+   work markers — `docs/documentation-standards.md` § Incomplete Work
+   Markers makes `TODO` the vocabulary for incomplete-work markers in
+   permanent text, so flagging the token itself generates noise on any
+   code-touching PR.
    - PR body and commit messages: surface any of `out of scope`,
      `follow-up`, `defer`, `deferred`, `later`, `TODO`.
    - Diff: surface only multi-word deferral phrases — `out of scope`,

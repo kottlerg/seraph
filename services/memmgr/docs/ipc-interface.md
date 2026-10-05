@@ -19,7 +19,8 @@ For all subsequent processes, procmgr is the chooser: it calls
 `REGISTER_PROCESS` (below) before spawning a child, receives a badged
 SEND cap on memmgr's endpoint, and installs that cap into the child's
 `ProcessInfo.memmgr_endpoint_cap`. The child's std heap-bootstrap path
-calls `REQUEST_MEMORY_CAPS` on it with no further setup.
+calls `REQUEST_MEMORY_CAPS` on it with no further setup. See
+[docs/process-lifecycle.md](../../../docs/process-lifecycle.md) §"Steady-State Process Creation".
 
 ---
 
@@ -43,7 +44,8 @@ Two privilege classes:
 
 Badges cannot be forged: they are minted by `cap_derive_badge` only
 under the kernel's derivation rules, and procmgr is the only process
-that holds memmgr's procmgr-only cap.
+that holds memmgr's procmgr-only cap. See
+[docs/capability-model.md](../../../docs/capability-model.md) §"Badges".
 
 A third, kernel-origin class is the **fault message**: when a demand-paged
 process's thread takes a page fault, the kernel (not a userspace caller)
@@ -100,8 +102,9 @@ The `phys_base_for_cap_i` field is the host physical address of the
 first page of the i-th returned cap. It is what DMA-issuing drivers
 program into device transports (VirtIO PCI rings, e.g.). DMA isolation,
 when present, is established through devmgr-managed IOMMU policy
-outside the kernel surface; memmgr exposes only the addresses, not the
-isolation policy.
+outside the kernel surface (see
+[docs/device-management.md](../../../docs/device-management.md) §"DMA Safety Model");
+memmgr exposes only the addresses, not the isolation policy.
 
 There is no fixed ceiling on `returned_cap_count` other than the IPC
 reply-side cap-slot limit (see [`docs/ipc-design.md`](../../../docs/ipc-design.md)).
@@ -169,7 +172,8 @@ Bases that match no outstanding grant are ignored — release is idempotent,
 so a racing double-release (join plus reaper) is harmless. The caller MUST
 have already deleted every kernel object retyped from the region; releasing
 a region with a live retype is correctness-safe (the kernel refuses to
-re-hand-out live bytes) but strands the run until that retype is freed.
+re-hand-out live bytes) but strands the run until that retype is freed. See
+[`memory-pool.md`](memory-pool.md) §"Reclamation".
 
 ### Label 3: `REGISTER_PROCESS`
 
@@ -218,7 +222,8 @@ the eventual `PROCESS_DIED`.
 
 Procmgr signals process death. memmgr looks up the per-process tracking
 entry by badge, reclaims every Memory cap memmgr has issued to that
-process, and runs coalescing. Privilege: procmgr-only.
+process, and runs coalescing (see [`memory-pool.md`](memory-pool.md) §"Reclamation").
+Privilege: procmgr-only.
 
 **Request:**
 
@@ -313,7 +318,8 @@ lazily on fault, and only once procmgr has delegated this process's
 
 Per-process region and frame counts are bounded by RAM (the self-hosted
 node arena), not by a fixed constant; `Quota` therefore signals genuine RAM
-exhaustion, not a per-process ceiling.
+exhaustion, not a per-process ceiling. See [`memory-pool.md`](memory-pool.md)
+§"Metadata Arena".
 
 ### Label 8: `DELEGATE_ASPACE`
 
@@ -361,8 +367,11 @@ memmgr finds the exact-match region and tears the whole span down in one
 `mem_unmap_reclaim` call against the caller's delegated `AddressSpace`: the
 kernel clears the span's leaf PTEs and returns the now-empty intermediate page
 tables to that address space's PT growth budget (observable via
-`CAP_INFO_ASPACE_PT_BUDGET`) under a single coarse TLB shootdown. memmgr then
-returns each backing frame to the free pool and frees the region. The region
+`CAP_INFO_ASPACE_PT_BUDGET`; see
+[docs/capability-model.md](../../../docs/capability-model.md)
+§"Address-space and CSpace growth budgets") under a single coarse TLB shootdown.
+memmgr then returns each backing frame to the free pool and frees the region (see
+[`memory-pool.md`](memory-pool.md) §"Reclamation"). The region
 occupies its own VA surface, so the span unmap touches only frames memmgr
 backed on fault; frames the caller mapped itself (e.g. `REQUEST_MEMORY_CAPS`
 grants) live on a disjoint surface and are untouched. The frames return to the
@@ -404,7 +413,8 @@ from a free run to the process record; they were already owned).
 Every Memory cap memmgr returns is a derive-twice copy: memmgr retains
 an intermediary in its own CSpace, the caller receives the second
 derivation. This guarantees memmgr can reclaim on `PROCESS_DIED` even
-after the caller's CSpace is torn down.
+after the caller's CSpace is torn down. See [`memory-pool.md`](memory-pool.md)
+§"Allocation".
 
 `RELEASE_MEMORY_CAPS` and `PROCESS_DIED` move caps out of the caller's
 CSpace via IPC transfer; the caller's slots become null. memmgr does
@@ -441,4 +451,8 @@ reply-then-death ordering is therefore enforced by the kernel.
 
 ## Summarized By
 
-[memmgr/README.md](../README.md)
+[Device Management](../../../docs/device-management.md),
+[Fault Handling](../../../docs/fault-handling.md),
+[Process Lifecycle](../../../docs/process-lifecycle.md),
+[Userspace Memory Model](../../../docs/userspace-memory-model.md),
+[services/memmgr/README.md](../README.md)

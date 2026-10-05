@@ -30,7 +30,8 @@ time through its `SchedControl`-cap and priority arguments: with no
 (`PRIORITY_MIN` = 1); with a `SchedControl` cap, priority 0 selects the cap's
 band floor and a nonzero priority must lie within the cap's `[min, max]` band.
 Priority is changed afterwards via `SYS_THREAD_SET_PRIORITY`. The kernel does
-not implement dynamic priority adjustment or aging.
+not implement dynamic priority adjustment or aging. Both syscalls' argument and error
+contracts are in [syscalls.md](syscalls.md).
 
 The one kernel-assigned exception is init's boot thread, created at
 `INIT_PRIORITY` (= 30, the top settable level): init is the root of all
@@ -46,7 +47,8 @@ within that band. `SYS_CAP_CREATE_THREAD` applies the same rule at creation:
 placing a new thread above the floor requires a `SchedControl` cap whose band
 covers the level. There is no ambient authority — a process holding no
 `SchedControl` (or one whose band excludes the level) cannot set that priority.
-Lowering is not special-cased; every assignment is checked against the band.
+Lowering is not special-cased; every assignment is checked against the band. See
+[syscalls.md](syscalls.md) § `SYS_THREAD_SET_PRIORITY` for the band check and its errors.
 
 The kernel does **not** define a normal/elevated boundary. The numeric level
 space is uniform; any partition into tiers is userspace policy, expressed by how
@@ -66,12 +68,13 @@ space is uniform; any partition into tiers is userspace policy, expressed by how
   level under its own baseline authority. The per-service level map is pure
   userspace policy — `shared/ipc`'s `sched_policy` module for the
   init/procmgr/devmgr/vfsd-assigned levels, svcmgr `.svc` recipes
-  (`priority = ...` / `sched_max = ...`) for supervised services.
+  (`priority = ...` / `sched_max = ...`) for supervised services. The mint is specified in
+  [procmgr ipc-interface.md](../../../services/procmgr/docs/ipc-interface.md) § `CREATE_PROCESS`.
 
 `SchedControl` is the sole authority; see
 [capability-model.md § SchedControl](../../../docs/capability-model.md) for the
 cap shape, `SYS_SCHED_SPLIT`-based band splitting, and delegation. `cap_derive`
-cannot shrink a band — it attenuates rights only.
+cannot shrink a band — it attenuates rights only ([syscalls.md](syscalls.md) § `SYS_CAP_DERIVE`).
 
 ### Run Queue Structure
 
@@ -238,8 +241,9 @@ fields are subject to the lock hierarchy specified in that document.
 
 ### What Gets Saved and Restored
 
-On each context switch, the arch `context::switch` function saves and restores the
-minimal register set needed for correct execution:
+On each context switch, the arch `context::switch` function (see
+[arch-interface.md](arch-interface.md) § `context`) saves and restores the minimal register
+set needed for correct execution:
 
 **x86-64 (callee-saved registers):**
 - `rbx`, `rbp`, `r12`, `r13`, `r14`, `r15`
@@ -344,7 +348,7 @@ pull_unpinned_ready(src, dst):
     wake_idle_cpu(dst)                        // always-IPI
 ```
 
-Lock order follows scheduling-internals.md § Lock Hierarchy rule 4
+Lock order follows [scheduling-internals.md](scheduling-internals.md) § Lock Hierarchy rule 4
 (ascending CPU id), and both acquisitions are **try-locks**: the pull runs
 from every CPU's timer tick with interrupts disabled, and under a
 pinned-heavy imbalance every idle CPU converges on the same victim every
@@ -440,7 +444,8 @@ syscall may be preempted while the timer fires if:
 
 Spinlock-hold intervals must be short (< ~10 µs) by policy. Code that holds a
 spinlock must not call anything that blocks or takes another lock (except in defined
-lock-ordering sequences).
+lock-ordering sequences). The hold-time bound and lock ordering are specified in
+[scheduling-internals.md](scheduling-internals.md) § Lock Hierarchy.
 
 The scheduler does not preempt the kernel while a spinlock is held. Instead, a
 `preemption_pending` flag is set per-CPU; preemption occurs when the last spinlock
@@ -506,12 +511,12 @@ Hard affinity is intended for:
 ### Active migration on affinity change
 
 `SYS_THREAD_SET_AFFINITY` enforces the new affinity immediately rather than
-deferring to the next enqueue:
+deferring to the next enqueue ([syscalls.md](syscalls.md) § `SYS_THREAD_SET_AFFINITY`):
 
 - **Ready** thread queued on the old CPU: the syscall calls
   `migrate_ready_thread` which dequeues the TCB from the source CPU's run
   queue and re-enqueues it on the destination under both scheduler locks
-  (lower-numbered CPU first; see scheduling-internals.md § Lock Hierarchy
+  (lower-numbered CPU first; see [scheduling-internals.md](scheduling-internals.md) § Lock Hierarchy
   rule 4) and sends a wakeup IPI to the destination.
 - **Running** thread on a different CPU: the syscall sets the
   **source** CPU's reschedule-pending flag and sends a wakeup IPI to the
@@ -519,11 +524,13 @@ deferring to the next enqueue:
   does not call `schedule()`; the running thread observes the new
   affinity at its next entry to `schedule()` — preempt-on-slice-expiry,
   voluntary yield, or IPC block. The re-enqueue site in `schedule()`
-  checks `cpu_affinity != current_cpu` and routes the requeue cross-CPU
-  via `enqueue_and_wake` (which then sets the destination's
-  reschedule-pending flag and IPIs it) instead of doing a local enqueue.
+  checks `cpu_affinity != current_cpu` and routes the requeue cross-CPU —
+  linking the thread directly on the destination's run queue, setting its
+  reschedule-pending flag, and IPIing it — instead of doing a local enqueue
+  (see [scheduling-internals.md](scheduling-internals.md) § ThreadState Transitions).
   Worst-case latency is therefore one time slice
-  (`TIME_SLICE_TICKS` × tick period), not one tick.
+  (`TIME_SLICE_TICKS` × tick period), not one tick, as
+  [syscalls.md](syscalls.md) § `SYS_THREAD_SET_AFFINITY` states.
 - **Blocked / Stopped / Created**: the new affinity takes effect on the
   next wake via `select_target_cpu`; no migration work is needed.
 
@@ -550,4 +557,7 @@ optimisation.
 
 ## Summarized By
 
-[kernel/README.md](../README.md)
+[core/kernel/README.md](../README.md), [Kernel Initialization Sequence](initialization.md),
+[IPC Subsystem Internals](ipc-internals.md),
+[SMP Scheduling and Locking Invariants](scheduling-internals.md),
+[Syscall Interface Specification](syscalls.md)

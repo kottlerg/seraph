@@ -40,8 +40,9 @@ rendered as literal glyphs.
 
 The 16 → RGB mapping (Windows 10 console / Campbell palette; index 0 and 15
 pinned to pure black / white so unstyled text matches the pre-colour default)
-lives here, not in the framebuffer driver. The driver renders whatever 24-bit colour it is handed
-via `fb_labels::FB_SET_ATTRS` and holds no palette, so a future direct-RGB
+lives here, not in the framebuffer driver. The
+[driver](../../services/drivers/framebuffer/README.md) renders whatever 24-bit colour it is
+handed via `fb_labels::FB_SET_ATTRS` and holds no palette, so a future direct-RGB
 client reuses the same wire without inheriting ANSI's colour vocabulary.
 
 ## Consumers
@@ -63,4 +64,4 @@ client reuses the same wire without inheriting ANSI's colour vocabulary.
 
 ## Summarized By
 
-None
+[services/drivers/framebuffer/README.md](../../services/drivers/framebuffer/README.md)

@@ -11,9 +11,12 @@ outside `rootfs/`, and are never pruned.
 This directory holds the non-binary parts of the runtime image: boot
 configuration, system configuration, and pre-populated data files for
 services and tests. Compiled binaries are installed by the build pipeline
-directly to their sysroot destinations, not via this tree.
+directly to their sysroot destinations, not via this tree (see
+[`docs/build-system.md`](../docs/build-system.md)).
 
-## Tree
+---
+
+## Source Layout
 
 ```
 rootfs/
@@ -33,11 +36,14 @@ not stored under `rootfs/` since they are deterministic build artifacts.
 
 The bootloader's `bootstrap.bundle` (which now carries every userspace
 binary the system needs to boot) is composed by `cargo xtask build`
-and written to `sysroot/esp/EFI/seraph/bootstrap.bundle`; it has no
+and written to `sysroot/esp/EFI/seraph/bootstrap.bundle` (see
+[`docs/build-system.md`](../docs/build-system.md)); it has no
 hand-authored counterpart under `rootfs/`. There is no `boot.conf`
-(replaced by hardcoded ESP paths in the bootloader) and no
+(replaced by hardcoded ESP paths in the bootloader; see
+[`core/boot/README.md`](../core/boot/README.md)) and no
 `mounts.conf` (replaced by GPT-type-GUID-driven mount discovery in
-vfsd, plus automatic `/esp` mount).
+vfsd, plus automatic `/esp` mount; see
+[`docs/storage.md`](../docs/storage.md#gpt-role-guid-discovery)).
 
 To add a new static file, place it under the path it should occupy in the
 sysroot; the build picks it up automatically. Removing a file here removes it
@@ -51,6 +57,17 @@ performs the mirror is
 
 ---
 
+## Relevant Design Documents
+
+| Document | Content |
+|---|---|
+| [docs/build-system.md](../docs/build-system.md) | Sysroot layout, `cargo xtask build` and `mkdisk` mirroring |
+| [docs/storage.md](../docs/storage.md) | GPT role-GUID mount discovery that replaced `mounts.conf` |
+| [services/svcmgr/docs/service-definitions.md](../services/svcmgr/docs/service-definitions.md) | The `.svc` recipe format under `config/svcmgr/` |
+| [docs/testing.md](../docs/testing.md) | Opt-in harness recipes under `config/svcmgr/tests/` |
+
+---
+
 ## Summarized By
 
-[../docs/build-system.md](../docs/build-system.md)
+[Build System](../docs/build-system.md)

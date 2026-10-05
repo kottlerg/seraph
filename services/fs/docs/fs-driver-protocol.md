@@ -21,7 +21,9 @@ driver dispatches incoming requests by their badge shape:
 - `badge == 0` — service-level request from vfsd (only `FS_MOUNT`
   today).
 - `badge != 0` carrying namespace rights in bits 40..64 — node-cap
-  request. Per-node opcodes (`NS_*`, `FS_READ`, `FS_READ_MEMORY`,
+  request (badge layout per
+  [`shared/namespace-protocol/README.md`](../../../shared/namespace-protocol/README.md)
+  § Badge shape). Per-node opcodes (`NS_*`, `FS_READ`, `FS_READ_MEMORY`,
   `FS_RELEASE_MEMORY`, `FS_CLOSE`) are dispatched by label.
 
 ---
@@ -479,6 +481,8 @@ The block device endpoint is partition-scoped: vfsd registers the
 partition bound with virtio-blk before delivering this cap, so the
 driver reads by partition-relative LBA and virtio-blk enforces the
 bound on every `BLK_READ_INTO_MEMORY`. See
+[`services/vfsd/docs/vfs-ipc-interface.md`](../../vfsd/docs/vfs-ipc-interface.md)
+§ Label 10: `MOUNT` for the registration step and
 [`services/drivers/virtio/blk/README.md`](../../drivers/virtio/blk/README.md).
 
 ---
@@ -497,5 +501,6 @@ bound on every `BLK_READ_INTO_MEMORY`. See
 
 ## Summarized By
 
-[services/fs/README.md](../README.md), [services/fs/fat/README.md](../fat/README.md),
-[docs/storage.md](../../../docs/storage.md)
+[Storage](../../../docs/storage.md), [services/fs/README.md](../README.md),
+[services/fs/fat/README.md](../fat/README.md),
+[vfsd Service Interface](../../vfsd/docs/vfs-ipc-interface.md)

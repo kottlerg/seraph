@@ -62,9 +62,10 @@ endpoint dispatches in two stages, from `vfsd::namespace_loop`:
 1. **Local-child match.** [`VfsdRootBackend::lookup`] walks the
    parent node's child list. A match on a *terminal* child returns
    an [`EntryTarget::External`] view carrying the driver's unbadged
-   endpoint and the peer root node; the namespace-protocol crate mints
-   a fresh `cap_derive_badge` on that endpoint carrying the composed
-   `parent_rights ∩ entry.max_rights ∩ caller_requested` rights. The
+   endpoint and the peer root node; the namespace-protocol crate
+   ([`shared/namespace-protocol/README.md`](../../../shared/namespace-protocol/README.md)
+   § NS_LOOKUP) mints a fresh `cap_derive_badge` on that endpoint carrying the
+   composed `parent_rights ∩ entry.max_rights ∩ caller_requested` rights. The
    reply cap belongs to the underlying filesystem driver's namespace
    endpoint; subsequent walks bypass vfsd entirely. A match on a
    *synthetic intermediate* child returns an [`EntryTarget::Local`]
@@ -85,9 +86,11 @@ endpoint dispatches in two stages, from `vfsd::namespace_loop`:
    travels back unchanged. This is required because the fall-through
    cap was minted by vfsd's own walk and carries full namespace
    rights — the receiving fs driver composes its returned rights
-   against the destination cap's badge, so without the repack the
+   against the destination cap's badge
+   ([`shared/namespace-protocol/README.md`](../../../shared/namespace-protocol/README.md)
+   § NS_LOOKUP), so without the repack the
    caller's attenuation would be discarded. Repacking preserves the
-   `docs/namespace-model.md` § "Walking" invariant
+   [`docs/namespace-model.md`](../../../docs/namespace-model.md#walking) § "Walking" invariant
    (walk-monotonic-attenuation) across mount boundaries: a child cap
    minted at the fs driver carries at most the caller's parent
    rights, intersected with the entry's `max_rights` ceiling.
@@ -126,11 +129,17 @@ backend then retains the driver's **unbadged** namespace endpoint
 Every `NS_LOOKUP` that crosses the mount mints a *fresh* badged SEND on
 that endpoint carrying the composed
 `parent_rights ∩ entry.max_rights ∩ caller_requested` rights (the
-[`EntryTarget::External`] arm of `handle_lookup`). Storing the unbadged
+[`EntryTarget::External`] arm of `handle_lookup`; see
+[`shared/namespace-protocol/README.md`](../../../shared/namespace-protocol/README.md)
+§ NS_LOOKUP). Storing the unbadged
 endpoint — rather than a pre-badged root cap — is what carries
-attenuation across the mount boundary: a node cap's rights live in its
+attenuation across the mount boundary
+([`docs/namespace-model.md`](../../../docs/namespace-model.md#cross-server-entries)
+§ Cross-server entries): a node cap's rights live in its
 badge, and the kernel forbids re-badging an already-badged cap
-(`SYS_CAP_DERIVE_BADGE` rejects a badged source), so a stored badged cap
+(`SYS_CAP_DERIVE_BADGE` rejects a badged source; see
+[`docs/capability-model.md`](../../../docs/capability-model.md#kernel-guarantees)
+§ Badges), so a stored badged cap
 could only ever be `cap_derive`-copied at its original full rights,
 laundering authority. The root mount is the exception — its
 `fallthrough_cap` is a *badged* SEND on the root fs (see fall-through
@@ -210,4 +219,5 @@ seeing different roots) and `cap_revoke`-driven unmount.
 
 ## Summarized By
 
-[services/vfsd/README.md](../README.md), [docs/storage.md](../../../docs/storage.md)
+[Storage](../../../docs/storage.md), [services/fs/README.md](../../fs/README.md),
+[services/vfsd/README.md](../README.md)

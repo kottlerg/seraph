@@ -8,4 +8,4 @@ devices.
 
 ## Summarized By
 
-[devmgr/README.md](../README.md)
+[services/devmgr/README.md](../README.md)

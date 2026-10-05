@@ -15,7 +15,8 @@ EventQueue via a WaitSet.
 
 A SEND on the same endpoint (without the [`PUBLISH_AUTHORITY`](#publish-authority)
 verb bit) is delivered to every process via
-`ProcessInfo.service_registry_cap` so userspace consumers can
+[`ProcessInfo.service_registry_cap`](../../../abi/process-abi/README.md#processinfo)
+so userspace consumers can
 `QUERY_ENDPOINT` for published names.
 
 ---
@@ -47,7 +48,7 @@ aborts bootstrap (svcmgr exits).
 
 **Rounds 2..N — `SUBSTRATE` (`data[0] = 2`; the final round is terminal):**
 one per init-bootstrapped substrate service (memmgr, procmgr, devmgr,
-vfsd, logd).
+vfsd, logd); see init's [Handover](../../init/docs/bootstrap.md#handover) stage.
 
 | Field | Value |
 |---|---|
@@ -183,7 +184,8 @@ WaitSet has two members: the service endpoint (badge 0) and the
 deaths queue (badge 1).
 
 When a thread exits (clean or fault), the kernel posts
-`(correlator << 32) | exit_reason` to `deaths_eq`. svcmgr drains the
+`(correlator << 32) | exit_reason` to `deaths_eq` (see
+[restart-protocol.md](restart-protocol.md#death-detection)). svcmgr drains the
 queue and routes each payload to its `ServiceEntry` via the
 correlator, then dispatches through
 [`restart::handle_death`](../src/restart.rs).
@@ -193,7 +195,7 @@ Exit reason encoding:
 | Value | Meaning |
 |---|---|
 | `0` | clean exit (`SYS_THREAD_EXIT`) |
-| `EXIT_FAULT_BASE..` | fault (exception vector / scause + base) |
+| `EXIT_FAULT_BASE..` | fault (exception vector / scause + base); full space in [process-lifecycle.md](../../../docs/process-lifecycle.md#exit-reason) |
 
 ---
 
@@ -243,4 +245,6 @@ policy + budget):
 
 ## Summarized By
 
-[svcmgr/README.md](../README.md)
+[Process Lifecycle](../../../docs/process-lifecycle.md),
+[services/init/README.md](../../init/README.md),
+[init Bootstrap Stages](../../init/docs/bootstrap.md), [services/svcmgr/README.md](../README.md)

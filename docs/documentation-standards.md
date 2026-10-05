@@ -21,17 +21,17 @@ Five documentation scopes exist:
 - A component MAY have a `docs/` directory.
 - If a component has no `docs/` directory, its `README.md` is the sole authoritative
   document for that component.
-- A component README carries original authoritative content only if the component has
-  no `docs/` subdirectory. If a `docs/` subdirectory exists, the README contains only
-  summaries of its `docs/*.md` files and the system-scope documents it depends on;
-  every such summary MUST link the authoritative source.
+- If a component has a `docs/` subdirectory, its README's original content is limited to the
+  component's scope and structure (its Source Layout); everything else it says about the
+  component is summaries of its `docs/*.md` files and of the system-scope documents it
+  depends on, and every such summary MUST link the authoritative source.
 - A grouping README is reached from the root README's Structure table. It carries the
   title, a one-sentence purpose, and one table with a row per component in the directory,
   whose cell links the component's `README.md`; it summarizes nothing, and its
   `## Summarized By` is `None`.
 - The root README routes to `docs/*.md` via its link list and MAY contain
-  summaries of content owned by `docs/*.md` or by top-level non-component
-  targets (for example `xtask/README.md`). Every summary MUST link its
+  summaries of content owned by `docs/*.md` or by a component that sits
+  outside a group (for example `xtask/README.md`). Every summary MUST link its
   authoritative source. Summaries MUST NOT introduce normative or
   behavior-bearing content not present in the authoritative source. The link list,
   with each entry's one-line description, is routing, not a summary.
@@ -73,7 +73,10 @@ summarizes a child doc, the parent MUST appear in the child's `## Summarized By`
 [Title](relative/path.md), [Title](relative/path.md)
 ```
 
-If no non-structural document summarizes this document:
+Entries are sorted by path and wrapped to the column limit; an entry for a `README.md` is
+labelled with its repository path, any other entry with the document's `# Title`.
+
+If no document summarizes this document:
 
 ```markdown
 ---
@@ -86,12 +89,14 @@ None
 **Exception — release notes.** The per-tag release notes under `docs/releases/`
 (`<tag>.md`) and the `docs/releases/TEMPLATE.md` skeleton they are copied from are
 release records, not authoritative documents: they sit outside the hierarchy above,
-carry no content another document summarizes, and (for `<tag>.md`) are frozen at their
-tag. Their structure is defined by `TEMPLATE.md` and validated by the release workflow,
-not by the Required Structure rules below: they carry neither a `# Title` heading (the
-GitHub Release name supplies the title) nor a `## Summarized By` section.
-`docs/releases/README.md`, which governs release-notes discipline, is an ordinary
-authoritative document and follows the standard structure.
+carry no content another document summarizes, and (for `<tag>.md`) change after their
+tag only through the procedure in [docs/releases/README.md](releases/README.md)
+§ Post-Publish Edits. Their structure is defined by `TEMPLATE.md` and validated by the
+release workflow, as [docs/releases/README.md](releases/README.md) § Source of Truth
+specifies, not by the Required Structure rules below: they carry neither a `# Title`
+heading (the GitHub Release name supplies the title) nor a `## Summarized By` section.
+[docs/releases/README.md](releases/README.md), which governs release-notes discipline, is
+an ordinary authoritative document and follows the standard structure.
 
 ### Change propagation procedure
 
@@ -121,6 +126,16 @@ Comment conventions, including how comments reference code, are in
 
 ---
 
+## Design Intent
+
+A design document MAY specify behavior the code does not yet implement. Each such statement
+MUST be marked as intent where it is made, inline ("design intent; not yet implemented") or by
+a section-level implementation-status note naming what is unimplemented, so that specified but
+unimplemented behavior is distinguishable from drift. A summary of such a statement carries the
+same mark. An unmarked statement of behavior is a statement of fact and MUST match the code.
+
+---
+
 ## Tone and Language
 
 - Use normative language where the rule admits no discretion: MUST, MUST NOT, SHOULD, MAY
@@ -145,7 +160,8 @@ error and log strings, and commit messages.
   moment the plan moves on. A count the code itself performs ("two augment
   rounds") and the name of a step in a sequence a document defines permanently
   (a kernel boot phase, a bootloader boot step) are not labels.
-- Commit messages name components and what changed, not planning labels.
+- Commit messages follow [conventions.md](conventions.md) § Commit Messages, which applies
+  the planning-label rule above to the commit title.
 
 ---
 
@@ -215,4 +231,5 @@ to system-level documents this component summarizes or depends on).
 
 ## Summarized By
 
-[Conventions](conventions.md), [xtask/README.md](../xtask/README.md)
+[README.md](../README.md), [Project Conventions](conventions.md),
+[xtask/README.md](../xtask/README.md)

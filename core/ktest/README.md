@@ -175,7 +175,8 @@ Defined in `src/main.rs` (the `spawn::` items in `src/spawn.rs`):
 
 ## Compile-time options
 
-The boot protocol carries no kernel command line; ktest's runtime
+The boot protocol carries no kernel command line
+([core/boot/README.md](../boot/README.md) § What the Bootloader Does Not Do); ktest's runtime
 knobs live in `KtestConfig::DEFAULT` in
 [`src/cmdline.rs`](src/cmdline.rs) and are baked in at compile time.
 Editing the constant and rebuilding ktest (`cargo xtask build -p
@@ -214,4 +215,4 @@ narrower-scope run is produced.
 
 ## Summarized By
 
-[docs/testing.md](../../docs/testing.md)
+[Build System](../../docs/build-system.md), [xtask/README.md](../../xtask/README.md)

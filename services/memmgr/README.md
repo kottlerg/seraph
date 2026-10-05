@@ -7,7 +7,8 @@ per-process memory-cap ownership, and reclaims memory caps when a process dies.
 memmgr is a `no_std` binary: it cannot bootstrap a heap against itself, so
 its bookkeeping uses statically-bounded data structures only. After memmgr
 is in place, the only `no_std` userspace services in the system are `init`
-and `memmgr`.
+and `memmgr` (see [`docs/process-lifecycle.md`](../../docs/process-lifecycle.md)
+§"Userspace Boot Order").
 
 ---
 
@@ -34,18 +35,23 @@ memmgr is the sole holder of the userspace RAM memory-cap pool. Every std-built
 process bootstraps its heap by calling memmgr; drivers acquiring DMA-capable
 memory call memmgr; vfsd and fs drivers backing zero-copy file pages call
 memmgr. memmgr returns Memory capabilities; callers map them into their own
-address space at virtual addresses they choose themselves.
+address space at virtual addresses they choose themselves (see
+[`docs/userspace-memory-model.md`](../../docs/userspace-memory-model.md) §"Memory
+Allocation Contract").
 
 ## Responsibilities
 
 - **Memory-cap allocation** — serve the `REQUEST_MEMORY_CAPS` IPC, returning one or
   more Memory caps that cumulatively cover the requested page count. Honour
   the `REQUIRE_CONTIGUOUS` flag for callers that need a single multi-page
-  cap (DMA buffers, large heap grow operations).
+  cap (DMA buffers, large heap grow operations). Wire shape in
+  [`docs/ipc-interface.md`](docs/ipc-interface.md) §"Label 1: `REQUEST_MEMORY_CAPS`".
 - **Per-process tracking** — maintain a per-process record of the Memory
-  caps memmgr has handed out, keyed on a procmgr-minted badge.
+  caps memmgr has handed out, keyed on a procmgr-minted badge (see
+  [`docs/memory-pool.md`](docs/memory-pool.md) §"Per-Process Tracking").
 - **Reclamation on process death** — on `PROCESS_DIED` from procmgr,
-  reclaim the dead process's memory caps into the free pool.
+  reclaim the dead process's memory caps into the free pool (see
+  [`docs/memory-pool.md`](docs/memory-pool.md) §"Reclamation").
 - **Mid-life reclamation** — on `RELEASE_MEMORY_CAPS` (or `UNREGISTER_REGION`
   for a demand-paged region) from a live process, return the named grant to the
   free pool so a per-unit-of-work retype loop holds a bounded footprint without
@@ -55,12 +61,15 @@ address space at virtual addresses they choose themselves.
   memmgr's own per-run tracking-anchor (CSpace) footprint. A high-volume
   spawn/free churn — e.g. ruststd thread creation, which grants and frees a
   fresh Thread-retype slab per spawn — therefore cannot drift memmgr's CSpace
-  toward exhaustion even though its RAM stays flat.
+  toward exhaustion even though its RAM stays flat. Selection and reclamation
+  rules live in [`docs/memory-pool.md`](docs/memory-pool.md) §"Allocation" and
+  §"Reclamation".
 - **Coalescing** — fold adjacent free pages back into larger contiguous
   Memory caps via reverse-`memory_split`, sustaining the success rate of
   `REQUIRE_CONTIGUOUS` requests as the pool fragments. Runs after every
   reclamation (death, release, unregister), so reclaimed runs rejoin their
-  physical neighbours instead of accumulating as discrete parked runs.
+  physical neighbours instead of accumulating as discrete parked runs (see
+  [`docs/memory-pool.md`](docs/memory-pool.md) §"Coalescing").
 
 ## What memmgr deliberately does NOT do
 
@@ -74,7 +83,8 @@ address space at virtual addresses they choose themselves.
   memmgr never sees them.
 - **Implement swap, paging, or page-fault handling.** Memory caps are allocated
   out of physical RAM; there is no backing store. A failed allocation
-  returns an out-of-memory error to the caller.
+  returns an out-of-memory error to the caller (see
+  [`docs/memory-pool.md`](docs/memory-pool.md) §"Failure Modes").
 - **Operate a page cache.** Caching of file pages (when fs drivers
   implement it) lives in the fs driver, not in memmgr.
 
@@ -103,7 +113,7 @@ when those workloads grow.
 
 | Constant | Value | Surface effect on overflow | Revisit when |
 |---|---|---|---|
-| `MAX_PROCESSES` | 64 | `REGISTER_PROCESS` returns `TooManyProcesses` | a workload approaches ~50 concurrent processes |
+| `MAX_PROCESSES` | 64 | `REGISTER_PROCESS` returns `TooManyProcesses` (see [`docs/ipc-interface.md`](docs/ipc-interface.md) §"Label 3: `REGISTER_PROCESS`") | a workload approaches ~50 concurrent processes |
 | `MAX_FREE_RUNS` | 512 | `push_or_coalesce` parks the run after a coalesce retry: still owned and counted in `pool_total`, but with no free-pool slot (unreachable for allocation until a later coalesce frees one) | post-coalesce free-run count regularly approaches 512 |
 
 Donation and reclamation push through `push_or_coalesce`, which coalesces
@@ -143,7 +153,9 @@ ProcessInfo handover lives in [`docs/process-lifecycle.md`](../../docs/process-l
 Init delivers RAM Memory caps to memmgr in a single bootstrap-IPC round,
 packed two page-counts per `u64` after a three-word prefix. The capacity
 of a single round is `MEMMGR_BOOTSTRAP_MAX_MEMORY_CAPS = 122` memory caps. Init
-currently has ~90 RAM memory caps at boot, so this fits comfortably.
+currently has ~90 RAM memory caps at boot, so this fits comfortably. The
+round's place in the boot sequence is described in
+[`docs/process-lifecycle.md`](../../docs/process-lifecycle.md) §"Init → memmgr".
 
 If a future memory map (or an architecture with fragmented physical RAM)
 produces more than 122 RAM memory caps, memmgr will own only the first
@@ -168,12 +180,14 @@ memmgr and procmgr are sister tier-1 services with disjoint authority:
 - **memmgr** owns the RAM memory-cap pool and answers `REQUEST_MEMORY_CAPS`.
 - **procmgr** owns process lifecycle, ELF loading, and `ProcessInfo`
   population; it is itself a memmgr client (procmgr is std-using and
-  bootstraps its own heap against memmgr).
+  bootstraps its own heap against memmgr). See
+  [`services/procmgr/README.md`](../procmgr/README.md).
 
 procmgr is the privileged caller that registers new processes with
 memmgr (so memmgr can tag the per-process memory-cap list) and notifies
 memmgr of deaths (so memmgr can reclaim). Ordinary callers cannot
-mint or retire process badges.
+mint or retire process badges (see [`docs/ipc-interface.md`](docs/ipc-interface.md)
+§"Badge Discipline").
 
 ---
 
@@ -192,6 +206,8 @@ mint or retire process badges.
 
 ## Summarized By
 
+[abi/process-abi/README.md](../../abi/process-abi/README.md),
+[Architecture Overview](../../docs/architecture.md),
+[Capability Model](../../docs/capability-model.md),
 [Userspace Memory Model](../../docs/userspace-memory-model.md),
-[Process Lifecycle](../../docs/process-lifecycle.md),
-[Architecture Overview](../../docs/architecture.md)
+[init Bootstrap Stages](../init/docs/bootstrap.md)

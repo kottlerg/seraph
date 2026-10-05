@@ -16,7 +16,7 @@ The terminal renders no prompt, so the shell owns the `$ ` prompt.
 - **Prompt**: `$ ` written (and flushed) before each line is read.
 - **Built-ins**:
   - `help` — list the built-ins.
-  - `exit` — exit the shell (the terminal respawns it).
+  - `exit` — exit the shell (the [terminal](../terminal/README.md) respawns it).
   - `echo <args...>` — print the arguments separated by single spaces.
   - `pwd` — print the working directory.
   - `cd <path>` — change directory.
@@ -52,8 +52,9 @@ The shell occupies bash's *role* — the interactive REPL child of the terminal
 that spawns and reaps its own children — but over a different I/O substrate. A
 Unix shell does **not** relay stdin: the shell and its children share one kernel
 TTY, and the kernel routes input to the foreground process group (job control).
-Seraph has no shared tty and no job control yet ([#29]); the terminal relays to
-exactly one pipe (the shell's stdin) and is oblivious to grandchildren. So the
+Seraph has no shared tty and no job control yet ([#29]); the
+[terminal](../terminal/README.md) relays to exactly one pipe (the shell's stdin) and is
+oblivious to grandchildren. So the
 shell forwarding stdin to its child is the *interim* substitute for the
 shared-tty / foreground-group model — not a bash-faithful mechanism. The
 Unix-faithful design (the terminal re-pointing input at the foreground

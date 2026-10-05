@@ -19,8 +19,11 @@ does not change.
   events dropped) and serial RX ([#291], received UART bytes forwarded
   verbatim). A headless boot with no keyboard is still interactive over serial.
 - **Output**: framebuffer text ([#67], primary) mirrored to serial TX ([#66],
-  debug). Both share one wire format (`*_WRITE_BYTES`, length in the label's
-  high bits, payload chunked at 512 bytes). The framebuffer is optional: a
+  debug). Both share one wire format, specified in the
+  [serial](../../services/drivers/serial/README.md) and
+  [framebuffer](../../services/drivers/framebuffer/README.md) driver READMEs
+  (`*_WRITE_BYTES`, length in the label's high bits, payload chunked at 512
+  bytes). The framebuffer is optional: a
   headless boot has none, and the terminal then mirrors to serial only — so a
   headless `cargo xtask run` still gives a usable terminal over serial.
 - **Line discipline**:
@@ -93,4 +96,5 @@ stream. It runs as a boot in the `usertest` cell. See
 
 ## Summarized By
 
-[Testing](../../docs/testing.md)
+[Testing](../../docs/testing.md), [programs/fb-charset/README.md](../fb-charset/README.md),
+[programs/shell/README.md](../shell/README.md), [xtask/README.md](../../xtask/README.md)

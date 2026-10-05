@@ -4,13 +4,15 @@ x86-64 CMOS / MC146818-compatible RTC driver. Serves
 [`rtc_labels::RTC_GET_EPOCH_TIME`](../../../shared/ipc/src/lib.rs).
 
 Installed to `/services/drivers/cmos-rtc` on the rootfs. Spawned by
-devmgr on x86-64 platforms via the non-PCI simple-device path,
+devmgr on x86-64 platforms via the non-PCI simple-device path
+([Device Management](../../../docs/device-management.md#driver-binary-sources)),
 `procmgr_labels::CREATE_FROM_FILE` against a vfsd file SEND devmgr
 walks to from the `/services/drivers/` subtree cap init delivers
-post-vfsd-mount via `devmgr_labels::SET_DRIVERS_DIR`. devmgr owns the
+post-vfsd-mount via `devmgr_labels::SET_DRIVERS_DIR`.
+[devmgr](../../devmgr/README.md) owns the
 driver's service endpoint and mints client SEND caps on
 `devmgr_labels::QUERY_RTC_DEVICE`, each badged with
-`rtc_labels::READ_AUTHORITY`. The `timed` service resolves the SEND
+`rtc_labels::READ_AUTHORITY`. The [`timed`](../../timed/README.md) service resolves the SEND
 once at startup to seed its wall-clock offset.
 
 ---
@@ -46,7 +48,7 @@ protocol.
 
 * **`rtc_labels::RTC_GET_EPOCH_TIME`** — no payload. The driver
   re-reads the CMOS hardware on every request (no caching). Caller's
-  badge must carry `rtc_labels::READ_AUTHORITY` (devmgr stamps it on
+  badge must carry `rtc_labels::READ_AUTHORITY` ([devmgr](../../devmgr/README.md) stamps it on
   every SEND minted from `QUERY_RTC_DEVICE`); the driver replies
   `rtc_errors::UNAUTHORIZED` otherwise. Reply label is a
   [`rtc_errors`](../../../shared/ipc/src/lib.rs) status code; on

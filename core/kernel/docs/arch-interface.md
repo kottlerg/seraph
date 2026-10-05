@@ -11,17 +11,18 @@ Architecture-neutral code reaches it through the `arch::current` module alias �
 module as `current` via `#[cfg(target_arch)]`.
 
 The dispatch surface is **free functions and concrete types grouped into per-concern
-submodules**, not cross-architecture traits. `docs/coding-standards.md` §C permits this —
-the arch-dispatch surface may be "traits, type aliases, or re-exports", and a module
-boundary that re-exports per-architecture free functions satisfies the rule — and requires
-architecture-neutral code to route arch divergence through the surface rather than
-`#[cfg(target_arch)]` blocks. There are no `trait` definitions or trait `impl`s under
-`arch/`; inherent `impl` blocks on concrete types (`SavedState`, `TrapFrame`, …) are normal.
+submodules**, not cross-architecture traits.
+[coding-standards.md](../../../docs/coding-standards.md) §C permits this — the arch-dispatch
+surface may be "traits, type aliases, or re-exports", and a module boundary that re-exports
+per-architecture free functions satisfies the rule — and requires architecture-neutral code
+to route arch divergence through the surface rather than `#[cfg(target_arch)]` blocks. There
+are no `trait` definitions or trait `impl`s under `arch/`; inherent `impl` blocks on concrete
+types (`SavedState`, `TrapFrame`, …) are normal.
 
 Every function in the dispatch surface MUST be defined on every supported architecture
-(§C). The completeness check is the per-architecture build: if a surface function is
-missing on the target being compiled, an `arch::current::…` call fails to resolve and the
-build breaks.
+([coding-standards.md](../../../docs/coding-standards.md) §C). The completeness check is the
+per-architecture build: if a surface function is missing on the target being compiled, an
+`arch::current::…` call fails to resolve and the build breaks.
 
 ---
 
@@ -77,7 +78,9 @@ Manages hardware page tables. A page table is referenced by its physical root fr
 intermediate frames come from the kernel page-table pool on the kernel-direct path and
 from the address-space object's own pool on the pooled path, and only the latter takes
 them back, through a reclaiming unmap ([memory-internals.md](memory-internals.md) § Page Table
-Node Ownership).
+Node Ownership). The direct-map placement and kernel-half floor the functions below publish
+are specified in [memory-model.md](../../../docs/memory-model.md) § Virtual Address Space
+Layout.
 
 ```rust
 /// Install `root_phys` as the active page table for the current CPU with a full
@@ -114,7 +117,9 @@ pub fn init_paging_mode(info: &boot_protocol::BootInfo);
 
 /// Base virtual address of the direct physical map: the KASLR-chosen base from
 /// `BootInfo` — a 1 GiB-aligned base at or above the kernel-half floor
-/// (0xFFFF800000000000 on x86-64 / Sv48), published by `init_paging_mode`. A
+/// (0xFFFF800000000000 on x86-64 / Sv48; see
+/// docs/memory-model.md § Virtual Address Space Layout),
+/// published by `init_paging_mode`. A
 /// runtime `AtomicU64` on both arches (a single relaxed load); wrapped by
 /// `mm::paging::direct_map_base()` for architecture-neutral consumers.
 pub fn direct_map_base() -> u64;
@@ -158,8 +163,8 @@ pub unsafe fn unmap_user_page(root_virt: u64, virt: u64);
 /// Clear every 4 KiB leaf in `[virt_base, virt_base + page_count * 4 KiB)` and
 /// free each intermediate table the span leaves empty back to `aso`'s pool —
 /// only a table whose parent entry carries the pooled-table bit the pooled map
-/// path set when it installed the table (memory-internals.md § Page Table Node
-/// Ownership). Returns the number of tables freed.
+/// path set when it installed the table (core/kernel/docs/memory-internals.md
+/// § Page Table Node Ownership). Returns the number of tables freed.
 /// The caller holds the address space's `pt_lock` and performs the shootdown.
 pub unsafe fn unmap_user_region_pooled(
     root_virt: u64,
@@ -220,19 +225,21 @@ pub unsafe fn inval_batch_end();
 /// Per-CPU enable of tagged TLBs; returns the number of hardware tags available.
 /// x86-64 sets `CR4.PCIDE` and returns 4096, or `0` where PCID/INVPCID are absent
 /// (the kernel keeps a full-flush fallback — see
-/// [platform-requirements.md](../../../docs/platform-requirements.md)). RISC-V
+/// docs/platform-requirements.md). RISC-V
 /// probes the `satp` ASID width and returns `1 << width`; a hart with no ASID
-/// support is refused, since tagged TLBs are gated as required on RISC-V. Called
-/// on the BSP (whose return seeds the tag pool) and on every AP (which must set
-/// its own `CR4.PCIDE` before any tagged CR3 load).
+/// support is refused, since tagged TLBs are gated as required on RISC-V
+/// (docs/platform-requirements.md § riscv64
+/// Classification). Called on the BSP (whose return seeds the tag pool) and on
+/// every AP (which must set its own `CR4.PCIDE` before any tagged CR3 load).
 pub unsafe fn enable_tagged_tlb() -> usize;
 
 /// BSP-only boot gate for paging extensions the kernel uses unconditionally.
 /// RISC-V refuses to boot unless the bootloader confirmed Svpbmt, Svinval, and
-/// Svnapot on every enabled hart (`KernelMmio::hart_caps`); x86-64 provides a
-/// no-op (its paging baseline is asserted by `cpu::verify_baseline` and
-/// `enable_nx`). Runs after `platform::capture_kernel_mmio`, before the first
-/// userspace mapping or TLB shootdown.
+/// Svnapot on every enabled hart (`KernelMmio::hart_caps`; see
+/// docs/platform-requirements.md § riscv64
+/// Classification); x86-64 provides a no-op (its paging baseline is asserted by
+/// `cpu::verify_baseline` and `enable_nx`). Runs after `platform::capture_kernel_mmio`,
+/// before the first userspace mapping or TLB shootdown.
 pub unsafe fn verify_paging_extensions();
 
 /// Classify a user page fault as spurious (the live PTE already permits the
@@ -250,8 +257,8 @@ has no read-disable bit); `uncacheable` selects the device memory type explicitl
 architectures — PCD|PWT (strong UC) on x86-64, Svpbmt PBMT=IO on RISC-V — so MMIO
 attributes do not depend on platform PMAs. W^X is enforced at the memory syscall layer
 (`syscall::mem` map/protect reject a writable-and-executable request with
-`SyscallError::WxViolation`); the arch mapping primitives require the caller to have already
-validated W^X.
+`SyscallError::WxViolation`; see [syscalls.md](syscalls.md) § Memory Syscalls); the arch
+mapping primitives require the caller to have already validated W^X.
 
 ---
 
@@ -344,7 +351,8 @@ pub unsafe fn send_tlb_shootdown_ipi(target_hw_id: u32);
 pub unsafe fn send_wakeup_ipi(target_hw_id: u32);
 
 /// Spin until `cond` holds, escalating (resend IPIs → NMI backtrace → panic) per
-/// the timing ladder described by `ctx`. Used by the shootdown initiator's wait.
+/// the timing ladder described by `ctx` (core/kernel/docs/scheduling-internals.md
+/// § IPI Watchdog Ladder). Used by the shootdown initiator's wait.
 pub unsafe fn wait_for_ack(cond: impl FnMut() -> bool, ctx: &IpiWaitCtx<'_>);
 ```
 
@@ -418,7 +426,7 @@ pub fn current_stack_pointer() -> u64;
 /// checks the CPUID-detectable required features and sets `CR0.WP`; RISC-V probes
 /// the SBI substrate. The required/opportunistic/unsupported classification and
 /// what each arch gates are in
-/// [platform-requirements.md](../../../docs/platform-requirements.md).
+/// docs/platform-requirements.md.
 pub unsafe fn verify_baseline();
 
 /// Install the current CPU's per-CPU data block at `addr`. Call once per CPU
@@ -581,7 +589,7 @@ pub const IOPB_SIZE: usize;
 /// Forward a sanctioned SBI call to firmware, mapping SBI errors to `Err(())`
 /// (and always `Err(())` on x86-64, which has no SBI). The neutral
 /// `syscall::sbi` handler enforces the required `SbiControl` right and gates on
-/// `HAS_SBI` before calling.
+/// `HAS_SBI` before calling (core/kernel/docs/syscalls.md § `SYS_SBI_CALL`).
 pub fn sbi_forward(extension: u64, function: u64, a0: u64, a1: u64, a2: u64) -> Result<u64, ()>;
 
 /// Allocate architecture-specific per-CPU tables during SMP bring-up: x86-64
@@ -661,5 +669,7 @@ equally clearly.
 
 ## Summarized By
 
-[kernel/README.md](../README.md), [entropy.md](entropy.md),
-[scheduling-internals.md](scheduling-internals.md)
+[core/kernel/README.md](../README.md), [Kernel Entropy Subsystem](entropy.md),
+[Kernel Initialization Sequence](initialization.md), [Scheduler Internals](scheduler.md),
+[SMP Scheduling and Locking Invariants](scheduling-internals.md),
+[Syscall Interface Specification](syscalls.md)

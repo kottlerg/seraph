@@ -91,19 +91,22 @@ kernel rejects any `mem_map` or `mem_protect` call that would make a page
 simultaneously writable and executable.
 
 The kernel mints Memory caps for all usable RAM at boot with `Map | Write |
-Execute | Retype` and places them in init's CSpace. Boot-module and
-init-segment Memory caps carry the same full rights: the pages are mapped at
-their true protection before the caps exist, so the rights gate derivation
-only, and full rights let the caps donate into memmgr's pool as general RAM
-at init's reap. Only firmware-table Memory caps (ACPI regions, RSDP, DTB)
+Execute | Retype` and places them in init's CSpace. Boot-module, init-segment,
+and reclaimed boot-scratch Memory caps carry the same full rights: cap rights
+gate derivation, not existing mappings (init's segments are already mapped at
+their true protection, and loaders map boot-module ELF sources read-only), and
+full rights let the caps donate into memmgr's pool as general RAM at init's
+reap. Only firmware-table Memory caps (ACPI regions, RSDP, DTB)
 mint without `Retype` — mappable references to fixed-purpose memory that
 cannot be consumed for kernel-object creation.
 
-Init transfers RAM Memory caps (via the derive-twice pattern) to memmgr, which
+Init transfers RAM Memory caps (via the
+[derive-twice pattern](../core/kernel/docs/capability-internals.md#safe-delegation-the-derive-twice-pattern))
+to memmgr, which
 thereafter owns userspace RAM frame allocation and answers `REQUEST_MEMORY_CAPS`
 for every std-built service. See
 [`userspace-memory-model.md`](userspace-memory-model.md) and
-[`services/memmgr/README.md`](../services/memmgr/README.md). MMIO Memory caps
+[`services/memmgr/README.md`](../services/memmgr/README.md). Mmio caps
 follow a separate flow through devmgr; see
 [`device-management.md`](device-management.md).
 
@@ -127,18 +130,19 @@ A capability to an IPC endpoint. Rights:
 - **Grant** — may include capabilities in the message's capability slots
 
 A send capability without grant right cannot pass capabilities to the server.
-A server that should not receive unexpected resources from clients holds a receive
-capability without grant on its own endpoint.
+A server that should not receive unexpected resources from clients distributes only
+send capabilities without the grant right; the receive path does not consult the
+receiver's Grant right.
 
 An endpoint may additionally be designated a thread's **fault handler** — a protocol
-specified in [Fault Handling](fault-handling.md) (not yet implemented), with no distinct
+specified in [Fault Handling](fault-handling.md), with no distinct
 fault-endpoint capability type: the kernel delivers that thread's unresolvable faults to
 the bound endpoint.
 
 ### Notification
 
 A capability to a notification object (bitmask-based async notification). Rights:
-- **Notification** — may OR bits into the notification word (deliver notifications)
+- **Notify** — may OR bits into the notification word (deliver notifications)
 - **Wait** — may wait on this notification object and read the bitmask
 
 ### Event Queue
@@ -149,10 +153,19 @@ A capability to an event queue (ordered ring buffer). Rights:
 
 ### Interrupt
 
-A capability granting the right to handle a specific hardware interrupt line.
-The holder registers an endpoint to receive interrupt notifications on that line.
-Interrupt capabilities are created by the kernel at boot and initially granted to
-init, which delegates them to appropriate drivers.
+A capability to a contiguous range of hardware interrupt lines (a range authority,
+narrowed with `SYS_IRQ_SPLIT`). Rights:
+- **Notify** — may register and acknowledge a line (`SYS_IRQ_REGISTER` requires a
+  single-line cap)
+
+The holder binds a Notification to the line with `SYS_IRQ_REGISTER`; each interrupt
+ORs bit 0 into that Notification, and the holder re-enables the line with
+`SYS_IRQ_ACK`.
+
+The kernel mints one root Interrupt range capability at boot that covers every IRQ
+id on the architecture and places it in init's CSpace. Init hands it to devmgr,
+which splits single-line children with `SYS_IRQ_SPLIT` and delegates one to each
+driver.
 
 ### Mmio
 
@@ -175,10 +188,9 @@ A capability to a thread. Rights:
 
 A capability to a capability space. Rights:
 - **Insert** — may place a new capability into a slot
-- **Delete** — may clear a slot
-- **Derive** — may derive a new capability from an existing slot
-- **Revoke** — may revoke all descendants of a capability (the target slot
-  itself is preserved; see [Revocation](#revocation))
+- **Delete**, **Derive**, **Revoke** — defined but not checked by any syscall; slot
+  deletion, derivation, and revocation act on the caller's own CSpace and need no
+  CSpace capability
 
 CSpace capabilities are used when configuring a new thread (binding a CSpace to
 the thread) and when cross-CSpace capability operations are needed (e.g. init
@@ -186,7 +198,8 @@ populating a new process's CSpace before handing it off).
 
 ### Wait Set
 
-A capability to a wait set (see IPC design). Rights:
+A capability to a wait set (see
+[IPC Design § Waiting on Multiple Sources](ipc-design.md#waiting-on-multiple-sources)). Rights:
 - **Modify** — may add or remove members
 - **Wait** — may block on the wait set
 
@@ -196,10 +209,10 @@ A capability to a contiguous range of x86 I/O port numbers. Rights:
 - **Use** — may bind this port range to a thread, allowing that thread to execute
   `in`/`out` instructions for those ports without a syscall
 
-IoPort capabilities are created at boot from `IoPort` entries in the
-boot-provided `platform_resources`. They are not creatable at runtime. A driver
-that needs port I/O access receives a derived IoPort capability from init
-(via devmgr), covering only its assigned port range.
+The kernel mints one root IoPort capability over the full 64K port space at boot
+(x86-64 only); IoPort capabilities are not creatable at runtime. Init hands devmgr a
+copy, and devmgr narrows it with `SYS_IOPORT_SPLIT` and gives each driver only its
+assigned port range (see [services/devmgr/README.md](../services/devmgr/README.md)).
 
 Revoking an IoPort capability removes port access from all threads it has
 been bound to. The kernel tracks bindings and updates each affected thread's IOPB
@@ -225,17 +238,15 @@ own right:
 `SYS_SBI_CALL` maps the requested extension ID to the right it requires and
 rejects the call with `InsufficientRights` unless the cap carries that right.
 
-**Kernel floor.** The kernel hard-denies exactly one class, regardless of cap
-(`InvalidArgument`): the extensions it manages internally — TIME (scheduler
-timer), IPI (TLB shootdown / wakeups), RFENCE (remote fences), HSM (hart
-lifecycle). These have no right and are absent from the vocabulary; forwarding
-them from userspace would break a kernel invariant — halt a hart, corrupt TLB
-coherence, or derail scheduling. The kernel draws the line at *soundness* only;
-it does not encode preference about which otherwise-harmless extensions
-userspace "should" use.
+**Kernel floor.** The kernel forwards only the six sanctioned extensions above and
+rejects every other extension ID regardless of cap (`InvalidArgument`). The rejected
+set includes the extensions it manages internally — TIME (scheduler timer), IPI (TLB
+shootdown / wakeups), RFENCE (remote fences), HSM (hart lifecycle) — whose forwarding
+would break a kernel invariant. Sanctioning a further extension adds one entry to the
+kernel's extension-to-right map and one `SbiControl` right.
 
-**Distribution is policy, not kernel enforcement.** Every non-reserved extension
-is sanctioned with a right, but a holder can only forward an extension whose
+**Distribution is policy, not kernel enforcement.** Each sanctioned extension has a
+right, but a holder can only forward an extension whose
 right its cap actually carries — so what userspace may do is set by which caps
 are handed out, by ordinary minimum-privilege distribution (`cap_derive`, which
 only narrows rights, never widens; there is no dedicated SBI split operation).
@@ -252,13 +263,14 @@ userspace serial driver owns the console; forwarding the firmware console would
 bypass the console-ownership model), and **Cppc** / **Base** / **Pmu** are simply
 not needed by any current service. devmgr serves pwrmgr a copy further narrowed to
 **Reset** only (system reset / reboot); **Suspend** is retained against a future
-power-management path but delegated to no one today.
+power-management path but delegated to no one today. See
+[services/devmgr/README.md](../services/devmgr/README.md).
 
 **Gating-granularity decision.** Per-cap authority is encoded as rights bits, not
 an EID set carried by `SbiControlObject`, because the extension set is small and
 non-numeric and only one actuating consumer exists (pwrmgr, SRST-only).
-`SbiControlObject` stays bare and the init descriptor is unchanged
-(`aux0 = aux1 = 0`), so `INIT_PROTOCOL_VERSION` is not bumped. Rights are scoped
+`SbiControlObject` carries no fields, and its init descriptor has `aux0 = aux1 = 0`.
+Rights are scoped
 per capability type, so `SbiControl` draws on its own full 32-bit space —
 sanctioning further extensions does not compete with any other type's rights.
 
@@ -286,7 +298,8 @@ Every spawned process receives a band via `ProcessInfo.sched_control_cap`:
 procmgr fans its baseline out per child at create time — a plain `cap_copy`
 for a full-width band, or copy-then-`SYS_SCHED_SPLIT` to mint a narrowed
 `[1, band_max]` when the spawner requested one (the create label's
-`CREATE_BAND_MAX` field, validated against the spawner's own band). The
+`CREATE_BAND_MAX` field, validated against the spawner's own band; see
+[services/procmgr/docs/ipc-interface.md](../services/procmgr/docs/ipc-interface.md)). The
 per-service level assignments live in `shared/ipc`'s `sched_policy` module
 and the svcmgr `.svc` recipes. For priority levels, ranges, and constants, see
 [core/kernel/docs/scheduler.md § Priority Levels](../core/kernel/docs/scheduler.md#priority-levels).
@@ -295,15 +308,12 @@ and the svcmgr `.svc` recipes. For priority levels, ranges, and constants, see
 
 ## Rights and Attenuation
 
-Rights are a bitmask attached to each capability slot. The bitmask is **scoped per
-capability type**: each slot stores one 32-bit rights word, and the slot's type tag
-selects which type's rights vocabulary interprets it. Every type numbers its bits
-from 0 in its own full-width space, so bit assignments never compete across types —
-adding a right to one capability type cannot exhaust another type's budget. The
-`u64` masks in `abi/syscall` are the single source of truth for bit values; the
-kernel's typed rights constants are derived from them, and a rights mask is only
-meaningful for the capability type it is named for. The all-ones mask (`RIGHTS_ALL`)
-is valid for every type.
+Rights are a bitmask attached to each capability slot, scoped per capability type:
+each type numbers its bits from 0 in its own space, and a rights mask is meaningful
+only for the type it is named for. The all-ones mask (`RIGHTS_ALL`) is valid for
+every type. Bit values are defined in [`abi/syscall`](../abi/syscall/README.md).
+Storage and bit assignments are in
+[core/kernel/docs/capability-internals.md § Rights Bitmask](../core/kernel/docs/capability-internals.md#rights-bitmask).
 
 When deriving a capability, the derived copy may have equal or fewer rights than
 the source — rights can only be removed, never added. This is called
@@ -313,11 +323,11 @@ and numbered, not how they attenuate.
 
 A process cannot grant another process more authority than it holds itself. If a
 process holds a send-only endpoint capability, it can derive another send-only
-capability (or a weaker one with no grant right), but it cannot produce a receive
+capability (or one with no rights at all), but it cannot produce a grant or receive
 capability it does not hold.
 
-The kernel enforces this at derivation time. Any attempt to derive a capability
-with rights not present in the source is rejected.
+The kernel enforces this at derivation time: requested rights not present in the
+source are dropped, never granted.
 
 ---
 
@@ -381,7 +391,8 @@ badged child can be derived.
 In practice this means: the un-badged source cap on a server's endpoint lives
 exclusively in the server's own CSpace (used internally to mint per-client
 badged copies) and in the CSpaces of trusted bootstrap-time minters (today: init,
-which dies and is fully reclaimed at the end of Phase 3). Every other client
+which procmgr reaps once both its threads have exited after Phase 3; see
+[process-lifecycle.md § Init reap](process-lifecycle.md#init-reap)). Every other client
 receives a badged cap whose badge value is chosen by the trusted minter — the
 client cannot subsequently re-badgeize it because of the set-once rule above.
 
@@ -421,9 +432,10 @@ dispatch crate are in
 
 A capability may be transferred via IPC (see [ipc-design.md](ipc-design.md)) or moved
 with `SYS_CAP_MOVE`. Transfer moves the capability from the source CSpace to the
-destination CSpace — the source slot becomes null. This is not derivation; no new
-entry appears in the derivation tree — the existing node is restamped onto the
-destination slot.
+destination CSpace — the source slot becomes null, except in the races
+[capability-internals.md](../core/kernel/docs/capability-internals.md) § Move lists. This is
+not derivation; no new entry appears in the derivation tree — the existing node is restamped
+onto the destination slot.
 
 Because the cap keeps its derivation position, a move transfers ownership of the
 slot but not revocation authority over the lineage: the mover, having nulled its own
@@ -449,14 +461,15 @@ the children hanging under its dying slots as derivation roots. See
 
 ## Revocation
 
-Any process may revoke a capability it has derived. Revocation recursively
+Any process may revoke the descendants of any capability it holds. Revocation recursively
 invalidates all capabilities derived from the target, in all processes. The target
 slot itself is preserved — the revoker keeps its own capability and only withdraws
 delegated authority.
 
 After revocation, any process that held a derived capability can no longer use it.
-The underlying kernel object is not destroyed — only the authority to access it is
-withdrawn.
+The target's kernel object is not destroyed, because the preserved target slot still
+references it. A descendant that references a distinct object, such as a range-split
+child, frees that object when its last reference goes.
 
 A descendant delivered to another CSpace — by **IPC transfer**, `SYS_CAP_MOVE`, or
 `SYS_CAP_COPY` — keeps its position in the derivation tree (see
@@ -464,7 +477,8 @@ A descendant delivered to another CSpace — by **IPC transfer**, `SYS_CAP_MOVE`
 recipient's slot in the recipient's own CSpace. Per-slot generation handles ensure
 the recipient's now-stale handle then fails with `InvalidCapability` rather than
 aliasing a recycled slot index — the cross-CSpace stale-slot alias that was the #349
-hazard.
+hazard. See [capability-internals.md](../core/kernel/docs/capability-internals.md)
+§ Capability Transfer in IPC.
 
 
 ---
@@ -477,19 +491,20 @@ argument; the kernel constructs the new object inside that Memory's
 backing region, debiting bytes from the Memory's available-bytes ledger.
 
 ```
-create_endpoint(frame)             → endpoint_cap  (Send + Receive + Grant)
-create_notification(frame)               → notification_cap    (Notification + Wait)
-create_event_queue(frame, n)       → queue_cap     (Post + Recv)
-create_thread(frame, aspace, cs)   → thread_cap    (Control + Observe)
-create_address_space(frame, ...)   → aspace_cap    (Map + Read + Control)
-create_cspace(frame, ...)          → cspace_cap    (Insert + Delete + Derive)
-create_wait_set(frame)             → wait_set_cap  (Modify + Wait)
+SYS_CAP_CREATE_ENDPOINT(memory)               → endpoint_cap     (Send + Receive + Grant)
+SYS_CAP_CREATE_NOTIFICATION(memory)           → notification_cap (Notify + Wait)
+SYS_CAP_CREATE_EVENT_Q(memory, capacity)      → queue_cap        (Post + Recv)
+SYS_CAP_CREATE_THREAD(memory, aspace, cspace, sched, priority) → thread_cap (Control + Observe)
+SYS_CAP_CREATE_ASPACE(memory, augment, pages) → aspace_cap       (Map + Read + Control)
+SYS_CAP_CREATE_CSPACE(memory, augment, pages) → cspace_cap       (Insert + Delete + Derive)
+SYS_CAP_CREATE_WAIT_SET(memory)               → wait_set_cap     (Modify + Wait)
 ```
 
 The kernel rejects creation if the Memory cap lacks `Retype` rights or
 if its available-bytes ledger has insufficient room for the requested
 object. The returned capability is placed in a free slot in the caller's
-CSpace. The caller holds all rights on a freshly created object.
+CSpace. The caller receives the rights listed above; a freshly created CSpace
+capability carries no Revoke right.
 
 The kernel does not track ownership beyond the derivation tree. If a process destroys
 all capabilities in the derivation tree for an object — including its own — the kernel
@@ -529,8 +544,9 @@ own reference count then reaches zero, the reclamation cascades upward
 through the derivation chain. Process death is an instance of this
 cascade: revoking a child's CSpace destroys all caps the child held,
 which deallocates every kernel object the child created, which credits
-all bytes back to memmgr's frame pool — closing the loop without
-explicit cleanup.
+each object's bytes back to the Memory cap it was retyped from; memmgr
+returns the child's frames to its pool when procmgr sends `PROCESS_DIED`
+(see [userspace-memory-model.md](userspace-memory-model.md)).
 
 ### Address-space and CSpace growth budgets
 
@@ -554,10 +570,12 @@ code at the failure site:
 
 - **Pool exhaustion** — the seeded slot-page pool is empty. Returns
   `OutOfMemory` (-8); refillable via augment mode. The kernel also logs
-  the CSpace id and allocated count.
+  the CSpace id, allocated count, and occurrence count on power-of-two
+  occurrences.
 - **Structural ceiling** — the slot directory is full. Returns
-  `QuotaExceeded` (-17); a shape-derived bound (directory fan-out ×
-  slots per page) that no memory donation can lift.
+  `QuotaExceeded` (-17); a shape-derived bound (see
+  [capability-internals.md](../core/kernel/docs/capability-internals.md)
+  § Storage: Hybrid Two-Level Radix) that no memory donation can lift.
 
 There is no per-CSpace slot quota: capacity below the structural
 ceiling is exactly what the paid pool backs. Containing a child's cap
@@ -587,8 +605,10 @@ kernel growth path.
 
 `SYS_CAP_INFO` is a read-only inquiry that returns runtime state for
 a held capability: tag and rights for any cap; size, available-bytes,
-and retype-rights flag for Memory caps; PT growth budget for AddressSpace
-caps; backed slot capacity, slots used, and growth budget for CSpace caps.
+retype-rights flag, and physical base for Memory caps; lifecycle state and
+exit reason for Thread caps; PT growth budget for AddressSpace caps; backed
+slot capacity, slots used, and growth budget for CSpace caps; plus two
+system-wide tagged-TLB diagnostic counters.
 The syscall enables defensive ledger checks (e.g. memmgr can verify a
 returning cap's available-bytes), and lets receivers of a cap from a
 less-trusted source validate its shape before relying on it.
@@ -598,19 +618,26 @@ less-trusted source validate its shape before relying on it.
 ## Initial Capability Distribution
 
 At boot, the kernel creates init's Thread, AddressSpace, and CSpace and populates
-the CSpace with an initial set of capabilities covering all available resources:
+the CSpace with an initial set of capabilities covering all available resources.
+The kernel mints these during Phase 7 and Phase 9 of
+[initialization.md](../core/kernel/docs/initialization.md#phase-7-capability-system).
 
 - Memory capabilities for all usable physical memory
-- Mmio capabilities for all boot-provided platform resource regions
-  (MmioRange and PciEcam entries from `BootInfo.platform_resources`)
-- Interrupt capabilities for all boot-provided interrupt lines
-- Read-only Memory capabilities for firmware table regions (PlatformTable entries),
-  allowing userspace to parse ACPI or Device Tree data
-- IoPort capabilities for all boot-provided I/O port ranges (x86-64 only)
+- Mmio capabilities (Map | Write), one per `BootInfo.mmio_apertures` entry, plus one
+  over the kernel console UART on RISC-V
+- One root Interrupt range capability covering every valid IRQ id on the architecture
+- Map-only Memory capabilities over each `AcpiReclaimable` memory-map region, the page
+  holding `BootInfo.acpi_rsdp`, and the `BootInfo.device_tree` blob, allowing userspace
+  to parse ACPI or Device Tree data
+- One root IoPort capability covering the full 64K I/O port space (x86-64 only)
 - One SbiControl capability (RISC-V only) carrying every sanctioned SBI right
 - One SchedControl capability spanning the full userspace priority range `[1, PRIORITY_MAX]`
 - Thread, AddressSpace, and CSpace capabilities for init itself
 - Memory capabilities for each boot module image (raw ELF images for early services)
+- Reclaimable Memory capabilities, one per `BootInfo.reclaim_ranges` entry (bootloader
+  scratch pages and the bundle's non-module pages)
+- Memory capabilities for init's own ELF segments, InitInfo pages, and stack pages,
+  which init donates to memmgr at its reap
 
 Init is responsible for delegating appropriate subsets of this authority to each service it starts,
 following the principle of least privilege. See
@@ -620,9 +647,11 @@ for devmgr's specific initial capability set.
 ### "Kill process" pattern
 
 Since there is no Process kernel object, terminating a process is a userspace
-(procmgr) policy, not a single kernel operation. procmgr revokes the capabilities
-backing the process's threads; each revocation stops that thread and removes it
-from the run queues. The kernel never terminates threads by policy of its own;
+(procmgr) policy, not a single kernel operation. procmgr revokes and deletes the
+capabilities it holds to the process's main thread, `CSpace`, and `AddressSpace`; a
+thread stops and leaves the run queues when the last capability to it is deleted, and
+the process's other threads stop when the `CSpace` or `AddressSpace` they are bound to
+is reclaimed. The kernel never terminates threads by policy of its own;
 the one thing it enforces is that a thread cannot outlive the `CSpace` or
 `AddressSpace` it is bound to: when the last capability to either object is
 deleted, every thread bound to it is stopped before the object's storage is
@@ -658,6 +687,20 @@ The kernel does not provide:
 
 ## Summarized By
 
-[README.md](../README.md), [Architecture Overview](architecture.md),
-[storage.md](storage.md), [init](../services/init/README.md),
-[namespace-model.md](namespace-model.md), [memory-model.md](memory-model.md)
+[abi/process-abi/README.md](../abi/process-abi/README.md),
+[Capability Subsystem Internals](../core/kernel/docs/capability-internals.md),
+[Kernel Initialization Sequence](../core/kernel/docs/initialization.md),
+[Scheduler Internals](../core/kernel/docs/scheduler.md),
+[Syscall Interface Specification](../core/kernel/docs/syscalls.md),
+[Architecture Overview](architecture.md), [IPC Design](ipc-design.md),
+[Memory Model](memory-model.md), [Namespace Model](namespace-model.md),
+[Process Lifecycle](process-lifecycle.md),
+[services/devmgr/README.md](../services/devmgr/README.md),
+[init Bootstrap Stages](../services/init/docs/bootstrap.md),
+[services/memmgr/README.md](../services/memmgr/README.md),
+[memmgr IPC Interface](../services/memmgr/docs/ipc-interface.md),
+[memmgr Memory Pool](../services/memmgr/docs/memory-pool.md),
+[procmgr IPC Interface](../services/procmgr/docs/ipc-interface.md),
+[svcmgr IPC Interface](../services/svcmgr/docs/ipc-interface.md),
+[Synthetic Root and Namespace Composition](../services/vfsd/docs/namespace-composition.md),
+[shared/namespace-protocol/README.md](../shared/namespace-protocol/README.md)

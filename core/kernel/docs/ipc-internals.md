@@ -97,16 +97,18 @@ TCB used only while the thread is blocked on an IPC object. No separate allocati
 ```
 
 **Message copy:** The label, counts, badge, and packed cap handles travel in
-saved register state. Data words travel through the per-thread IPC buffer
-pages: when `data_count` > 0 the kernel reads the words from the sender's
-registered page and writes them into the receiver's registered page; the
-delivered cap-transfer result block is likewise written into the receiver's
-page. The error surface is read-side only: a sender (or replier) with no
-registered page fails with `InvalidArgument`, and a sender page unmapped at
-copy time surfaces the copy fault (`InvalidAddress`), while delivery-side
-writes are best-effort — an unregistered or unmapped receiver page silently
-drops the data words and cap results; the drop fails no syscall on either
-side. Nothing is allocated on the path.
+saved register state (message format per
+[docs/ipc-design.md § Message Format](../../../docs/ipc-design.md#message-format)).
+Data words travel through the per-thread IPC buffer pages: when `data_count` > 0
+the kernel reads the words from the sender's registered page and writes them
+into the receiver's registered page; the delivered cap-transfer result block is
+likewise written into the receiver's page. The error surface is read-side only,
+per [syscalls.md § `SYS_IPC_BUFFER_SET`](syscalls.md#sys_ipc_buffer_set-42): a
+sender (or replier) with no registered page fails with `InvalidArgument`, and a
+sender page unmapped at copy time surfaces the copy fault (`InvalidAddress`),
+while delivery-side writes are best-effort — an unregistered or unmapped
+receiver page silently drops the data words and cap results; the drop fails no
+syscall on either side. Nothing is allocated on the path.
 
 ### Receive Path (Server)
 
@@ -182,7 +184,8 @@ the payload write; the resume's Acquire load orders the payload reads after
 it. The wake chain (stamp → `enqueue_and_wake`'s `sched_lock`/run-queue
 Release → dispatch Acquire → resume) carries the stamp; for the
 wake-before-park refusal, `wake_pending` is written and consumed under the
-same `(*tcb).sched_lock`, which carries it to the refusing parker.
+same `(*tcb).sched_lock`, which carries it to the refusing parker (see
+[scheduling-internals.md § Lock Hierarchy](scheduling-internals.md#lock-hierarchy) rule 8).
 
 | Deposit site | Exclusive claim | Stamp |
 |---|---|---|
@@ -300,7 +303,7 @@ pub struct NotificationState
 
 The atomic OR in step 1 is the only operation on the hot path when no waiter is
 present. Setting an already-set bit is idempotent — this is the defined coalescing
-behaviour.
+behaviour (per [docs/ipc-design.md § Notifications](../../../docs/ipc-design.md#notifications)).
 
 ### Wait Path
 
@@ -328,7 +331,8 @@ behaviour.
 ```
 
 The acquired bitmask is delivered in the secondary return register
-(rdx / a1), matching `SYS_EVENT_RECV`'s register layout. An in-band
+(rdx / a1), matching `SYS_EVENT_RECV`'s register layout, per
+[syscalls.md § `SYS_NOTIFICATION_WAIT`](syscalls.md#sys_notification_wait-4). An in-band
 encoding via the dispatcher's `cast_signed()` of the primary would alias
 bit-63-set bitmasks with negative-Err codes.
 
@@ -419,14 +423,19 @@ occupancy and doubles as the lockless wait-set level-readiness witness.
    else             -> return payload from wakeup_value
 ```
 
+The try-once mode never takes the park path, per
+[scheduling-internals.md § Lock Hierarchy](scheduling-internals.md#lock-hierarchy) rule 8.
+
 The `tcb.timed_out` flag is the out-of-band timeout marker — required
 because event-queue payloads may be any `u64` (including 0), so an
 in-band sentinel on `wakeup_value` is unavailable. The flag is set by
 the `BlockedOnEventQueue` arm of `sleep_check_wakeups` when the timer
 arbitrates against `event_queue_post` and wins; cleared by the resuming
-syscall.
+syscall (protocol per
+[thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md#timed_out-cross-cpu-protocol)).
 
-Lock order: `eq.lock → SLEEP_LIST_LOCK` (post path).
+Lock order: `eq.lock → SLEEP_LIST_LOCK` (post path), per
+[scheduling-internals.md § Lock Hierarchy](scheduling-internals.md#lock-hierarchy) rule 3.
 `SLEEP_LIST_LOCK` is released before `eq.lock` is taken on the timer
 path — sequential, not nested, so no cycle.
 
@@ -447,7 +456,7 @@ pub struct WaitSet
     lock: Spinlock,
 
     /// Members of this wait set. Each entry pairs a source with its badge.
-    /// Fixed capacity; SYS_WAIT_SET_ADD returns OutOfMemory when full.
+    /// Fixed capacity; SYS_WAIT_SET_ADD returns InvalidArgument when full.
     members: [Option<WaitSetMember>; WAIT_SET_MAX_MEMBERS],
 
     /// Count of valid entries in `members`.
@@ -486,9 +495,13 @@ enum WaitSetSource
 }
 ```
 
-The arrays are fixed-capacity because the kernel runs no allocator: a wait
-set's membership storage is part of the object carved at creation, and
-`waitset_notify`, under the source object lock, only walks it.
+The arrays are fixed-capacity because the kernel runs no allocator (see
+§ Kernel Object Memory in
+[memory-internals.md](memory-internals.md#kernel-object-memory-capretypers)): a
+wait set's membership storage is part of the object carved at creation, and
+`waitset_notify`, under the source object lock, only walks it. A full wait set
+refuses `SYS_WAIT_SET_ADD` with `InvalidArgument`, per
+[syscalls.md § `SYS_WAIT_SET_ADD`](syscalls.md#sys_wait_set_add-26).
 
 ### Readiness Notification
 
@@ -539,14 +552,18 @@ item per wakeup — would be invisible without the level re-check in step 3.
 The self-heal reads source readiness **without taking the source lock**: taking
 it here would acquire `source.lock` while holding `ws.lock`, inverting the
 `source.lock → ws.lock` order `waitset_notify` uses (it runs under the source
-lock and acquires `ws.lock`) and deadlocking. Because the read is lockless, each
-source's readiness signal MUST be an atomic that the self-heal reads with
-`Acquire`, paired with `Release` mutations under the source lock — otherwise a
-weak-memory target (riscv64) can observe a stale not-ready and strand a queued
-sender/event whose enqueue fired no edge notify (lost wakeup). The readiness
-signals are: `NotificationState::bits` (`AtomicU64`), `EventQueueState::count`
-(`AtomicU32`), and `EndpointState::send_nonempty` (`AtomicU32`, a shadow of
-`send_head != null` republished under `ep.lock` at every send-queue mutation).
+lock and acquires `ws.lock`) and deadlocking (rule 2 of
+[scheduling-internals.md § Lock Hierarchy](scheduling-internals.md#lock-hierarchy)).
+Because the read is lockless, each source's readiness signal MUST be an atomic
+that the self-heal reads with `Acquire`, paired with `Release` mutations under
+the source lock — otherwise a weak-memory target (riscv64) can observe a stale
+not-ready and strand a queued sender/event whose enqueue fired no edge notify
+(lost wakeup). The readiness signals are: `NotificationState::bits`
+(`AtomicU64`), `EventQueueState::count` (`AtomicU32`), and
+`EndpointState::send_nonempty` (`AtomicU32`, a shadow of `send_head != null`
+republished under `ep.lock` at every send-queue mutation);
+their pairings are tabulated in § Atomic Ordering Invariants of
+[scheduling-internals.md](scheduling-internals.md#atomic-ordering-invariants).
 
 ### Wait Set Add/Remove
 
@@ -569,14 +586,17 @@ clears every member's back-pointer and `dec_ref`s each source's header; any
 source whose refcount reaches zero at that point is reclaimed via the
 standard `dealloc_object` cascade. The source's dealloc arm therefore never
 runs while a wait-set member references it; each source's dealloc arm
-carries a `debug_assert!(state.wait_set.is_null())` invariant check.
+carries a `debug_assert!(state.wait_set.is_null())` invariant check (refcount
+ownership per § Kernel Object Reference Counting in
+[capability-internals.md](capability-internals.md#kernel-object-reference-counting)).
 
 ### Multiple Ready Sources
 
 If multiple members become ready before `SYS_WAIT_SET_WAIT` is called, `ready_queue`
 accumulates all of them in order. Subsequent `SYS_WAIT_SET_WAIT` calls drain the
-queue without blocking until it is empty. This prevents readiness loss — any number
-of readiness events are remembered.
+queue without blocking until it is empty, per
+[syscalls.md § `SYS_WAIT_SET_WAIT`](syscalls.md#sys_wait_set_wait-28). This prevents
+readiness loss — any number of readiness events are remembered.
 
 ---
 
@@ -621,10 +641,15 @@ entire send/receive/switch sequence executes atomically with interrupts enabled 
 within the endpoint lock. The timer interrupt may fire during this sequence; the
 interrupt handler will observe that the current thread is in kernel mode (not
 preemptible at the scheduler level) and defer preemption until the thread returns
-to userspace.
+to userspace (see
+[scheduler.md § Kernel-Mode Preemption Points](scheduler.md#kernel-mode-preemption-points)).
 
 ---
 
 ## Summarized By
 
-[kernel/README.md](../README.md)
+[core/kernel/README.md](../README.md), [Capability Subsystem Internals](capability-internals.md),
+[Scheduler Internals](scheduler.md),
+[SMP Scheduling and Locking Invariants](scheduling-internals.md),
+[Syscall Interface Specification](syscalls.md),
+[Thread Lifecycle and Sleep List Invariants](thread-lifecycle-and-sleep.md)

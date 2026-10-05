@@ -5,7 +5,9 @@ storage: it composes a synthetic system root from per-mount badged
 SEND caps on filesystem drivers, mints the root cap that every
 process receives in `ProcessInfo.system_root_cap`, and stays out of
 the I/O path after the walk. vfsd self-mounts the Seraph root partition
-(and the ESP) at startup; init issues no `MOUNT`.
+(and the ESP) at startup; init issues no `MOUNT`. See
+[`docs/namespace-composition.md`](docs/namespace-composition.md) and
+[`docs/storage.md`](../../docs/storage.md).
 
 ---
 
@@ -47,14 +49,16 @@ vfsd/
   the mounts, so `GET_SYSTEM_ROOT_CAP` is never served against an
   unmounted root. The `/esp` and `/data` mounts are best-effort: an
   absent partition is skipped (non-fatal) and the mount point falls
-  through to the root partition.
+  through to the root partition. See
+  [`docs/storage.md`](../../docs/storage.md).
 - **Service endpoint** — handles `MOUNT` and `GET_SYSTEM_ROOT_CAP` on
   its un-badged service endpoint, with multi-threaded recv so a
   worker-driven `CREATE_FROM_FILE` re-entry cannot deadlock an in-
   flight reply. `MOUNT` is the runtime explicit-mount surface
   (foreign-GUID disks, user-invoked mounts); no in-tree caller issues
   it, since root, `/esp`, and `/data` are self-mounted. See
-  [`docs/vfs-ipc-interface.md`](docs/vfs-ipc-interface.md).
+  [`docs/vfs-ipc-interface.md`](docs/vfs-ipc-interface.md) and
+  [`docs/namespace-composition.md`](docs/namespace-composition.md).
 - **System-root cap delivery** — vfsd does not push a system-root
   cap anywhere at boot. Init pulls one via
   `vfsd_labels::GET_SYSTEM_ROOT_CAP`; vfsd replies `NO_MOUNT` until
@@ -63,7 +67,9 @@ vfsd/
   `procmgr_labels::CONFIGURE_NAMESPACE` on every spawn. Procmgr
   itself holds no namespace cap — children spawned without an
   explicit `CONFIGURE_NAMESPACE` cap see
-  `ProcessInfo.system_root_cap == 0`.
+  `ProcessInfo.system_root_cap == 0`. See
+  [`docs/vfs-ipc-interface.md`](docs/vfs-ipc-interface.md) and
+  [`docs/storage.md`](../../docs/storage.md).
 - **Filesystem driver lifecycle** — vfsd is the dispatcher for fs
   driver processes. The root self-mount spawns fatfs from a boot
   module cap; subsequent mounts walk vfsd's own held system-root cap
@@ -72,7 +78,9 @@ vfsd/
   structural — `/services/fs/fatfs` is unreachable until root mounts,
   so spawning the fatfs that brings the root online cannot be moved
   elsewhere. vfsd supplies each driver with a partition-scoped block
-  device endpoint and the receive side of its own service endpoint.
+  device endpoint and the receive side of its own service endpoint. See
+  [`docs/namespace-composition.md`](docs/namespace-composition.md) and
+  [`docs/storage.md`](../../docs/storage.md).
 - **GPT enumeration + mount discovery** — parses the GPT partition
   table from a single scratch memory cap at startup, then resolves the
   arch-conditional root GUID in `src/role_guids.rs` via
@@ -83,11 +91,14 @@ vfsd/
   `INGEST_CONFIG_MOUNTS` IPC. The runtime `MOUNT` handler decodes a
   `MountRole` byte from the wire payload and reuses the same
   resolution path. See
-  [`docs/namespace-composition.md`](docs/namespace-composition.md).
+  [`docs/namespace-composition.md`](docs/namespace-composition.md),
+  [`docs/vfs-ipc-interface.md`](docs/vfs-ipc-interface.md), and
+  [`docs/storage.md`](../../docs/storage.md).
 
 vfsd does not touch hardware directly. All storage I/O is mediated
 through partition-scoped block device IPC endpoints derived from
-virtio-blk's whole-disk endpoint.
+virtio-blk's whole-disk endpoint. See
+[`docs/storage.md`](../../docs/storage.md).
 
 ---
 
@@ -97,7 +108,8 @@ Once a client holds a node cap returned by `NS_LOOKUP` through the
 synthetic root or via transparent root delegation, every subsequent
 operation (`NS_LOOKUP` on subdirectories, `NS_READ` / `NS_READ_MEMORY`,
 `FS_CLOSE`) goes directly to the owning filesystem driver. vfsd is
-not on the request path.
+not on the request path. See
+[`docs/storage.md`](../../docs/storage.md).
 
 ---
 
@@ -107,7 +119,8 @@ devmgr discovers storage hardware, spawns block device drivers, and
 publishes their endpoints in the device registry. vfsd queries the
 registry at startup to obtain the whole-disk virtio-blk endpoint;
 per-mount partition badges are derived from it. See
-[`docs/device-management.md`](../../docs/device-management.md).
+[`docs/device-management.md`](../../docs/device-management.md) and
+[`docs/storage.md`](../../docs/storage.md).
 
 ---
 
@@ -127,4 +140,4 @@ per-mount partition badges are derived from it. See
 
 ## Summarized By
 
-[docs/storage.md](../../docs/storage.md)
+[Storage](../../docs/storage.md)

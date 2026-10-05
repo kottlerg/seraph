@@ -105,7 +105,8 @@ The UEFI configuration table is scanned for two GUIDs:
 
 Both GUIDs are searched unconditionally; absent entries produce a zero field in
 `BootInfo`. Whichever tables are present are passed through to userspace as
-opaque physical addresses (`BootInfo.acpi_rsdp`, `BootInfo.device_tree`).
+opaque physical addresses (`BootInfo.acpi_rsdp`, `BootInfo.device_tree`); see
+[firmware-parsing.md](firmware-parsing.md).
 
 The bootloader extracts two narrow views from the tables discovered here for
 the kernel's own consumption:
@@ -136,7 +137,8 @@ x86-64 (SIPI vector constraint), any page on RISC-V (SBI HSM has no placement
 constraint). Allocation failure records zero, and the kernel then halts at Phase 8
 when more than one CPU is listed
 ([kernel initialisation § Phase 8](../../kernel/docs/initialization.md)); the page is
-reported in `BootInfo.ap_trampoline_page`.
+reported in `BootInfo.ap_trampoline_page`. The below-1 MiB allocation is described in
+[uefi-environment.md](uefi-environment.md).
 
 ### Step 5c: Boot Entropy Seed
 
@@ -171,7 +173,8 @@ whose direct-map base is still randomized), applies the kernel's
 `RELATIVE` relocations through the loaded span, and biases the recorded kernel
 virtual base and entry point. The matching 1 GiB-aligned direct-map base is chosen
 in step 9 once the final memory map is known. The chosen layout and its entropy
-source are recorded in `BootInfo.kaslr_flags` (KASLR, #252).
+source are recorded in `BootInfo.kaslr_flags` (KASLR, #252). Relocation and slide
+detail: [elf-loading.md](elf-loading.md).
 
 ### Step 6: Allocate and Build Page Tables
 
@@ -192,7 +195,8 @@ The UEFI memory map is queried immediately before `ExitBootServices`. Every UEFI
 allocation performed after the previous query invalidates the map key; this final
 query must be the last allocation-generating action before the exit call. The map is
 translated from UEFI memory types to the `MemoryType` values defined in the boot
-protocol and sorted by `physical_base`.
+protocol and sorted by `physical_base`, per the policy in
+[memory-map.md](memory-map.md).
 
 Detail: [uefi-environment.md](uefi-environment.md)
 
@@ -234,15 +238,15 @@ scrubs from this donated page after consuming them. The `version` field is set t
 | `cpu_ids` | Per-CPU hardware identifiers; `cpu_ids[0] == bsp_id`; entries beyond `cpu_count` are zero |
 | `ap_trampoline_page` | 4 KiB physical frame for AP startup code. x86-64: below 1 MiB (SIPI vector constraint). RISC-V: any 4 KiB page (SBI HSM has no placement constraint). Zero if allocation failed; the kernel then halts at Phase 8 when more than one CPU is listed ([initialization.md § Phase 8](../../kernel/docs/initialization.md)). |
 | `reclaim_ranges` | `ReclaimSlice` over a dedicated 4 KiB scratch page recording bootloader pages the kernel reclaims into the cap surface. Populated from `BootAllocations` (`BootInfo` page, module descriptor array, memory-map entry array, MMIO aperture array, the reclaim-array page itself, the AP trampoline page), `page_table.allocated_frames()` (the bootloader's transient page-table frames), and per-gap carve-outs over the bundle allocation — the header + entry table + leading pad, the init ELF source body (no longer needed after `load_init` copied segments out), and any inter-module or trailing slack pages. Module bodies are skipped here because `cap::mint_module_memory_caps` already mints Memory caps over them; pushing them again would double-register pages in the buddy ledger. Each `ReclaimRange` carries a `flags: u32`; bit 0 (`RECLAIM_FLAG_LATE`) marks the AP trampoline entry so the kernel defers minting it until the post-SMP-bringup late-reclaim pass. All other entries are minted by `cap::mint_reclaim_memory_caps` inside `populate_cspace`. |
-| `boot_entropy_seed` | Conditioned entropy seed for the pool, drawn from `EFI_RNG_PROTOCOL` (or a DTB `/chosen/rng-seed` fallback) in step 5c; valid for `boot_entropy_len` bytes, remainder zero. Absorbed into the kernel entropy pool at Phase 5. The separate KASLR entropy word never appears in `BootInfo`. |
+| `boot_entropy_seed` | Conditioned entropy seed for the pool, drawn from `EFI_RNG_PROTOCOL` (or a DTB `/chosen/rng-seed` fallback) in step 5c; valid for `boot_entropy_len` bytes, remainder zero. Absorbed into the kernel entropy pool at Phase 5 ([entropy.md](../../kernel/docs/entropy.md)). The separate KASLR entropy word never appears in `BootInfo`. |
 | `boot_entropy_len` | Valid leading byte count of `boot_entropy_seed`; zero when neither source yields a seed, in which case the kernel seeds from its remaining sources. |
-| `vmgenid_paddr` | Physical address of the 16-byte ACPI VMGENID GUID (QEMU VMGENID SSDT scan in step 9, run wherever an RSDP is present; only x86-64 QEMU wires the device today); zero when absent. |
+| `vmgenid_paddr` | Physical address of the 16-byte ACPI VMGENID GUID (QEMU VMGENID SSDT scan in step 9, run wherever an RSDP is present; only x86-64 QEMU wires the device today; see [firmware-parsing.md](firmware-parsing.md)); zero when absent. |
 | `direct_map_base` | KASLR-chosen direct-map virtual base — a 1 GiB-aligned base at or above the paging mode's kernel-half floor, chosen in step 9 from the KASLR entropy and the final memory map. A KASLR secret; the kernel scrubs it at Phase 5, after its Phase-3 consumers have run. |
 | `kaslr_flags` | `KASLR_*` status bits: which layout dimensions were randomized, the entropy source, and any skip reason (knob / window-limited); `KASLR_IMAGE_RANDOMIZED` marks a slide drawn from entropy whichever slot it selected, so an `ET_EXEC` image with entropy carries its source bits with that bit clear. Zero means an entirely un-randomized layout. |
 
 All arrays pointed to by `BootInfo` fields reside in physical memory that the UEFI
 memory map marks as `Loaded` or `Usable`, ensuring they survive until the kernel
-reclaims or remaps them.
+reclaims or remaps them ([memory-map.md](memory-map.md)).
 
 ### Step 10: Kernel Handoff
 
@@ -266,7 +270,7 @@ that point, the kernel accesses
 The `BootInfo` structure itself must not be placed in a region the kernel will
 reclaim before reading all fields. In practice this means placing it in a range the
 memory map marks as `Loaded`, which the kernel treats as in-use until it explicitly
-chooses to reclaim it.
+chooses to reclaim it ([memory-map.md](memory-map.md)).
 
 Slices within `BootInfo` (`memory_map`, `modules`, `mmio_apertures`) point to
 separately allocated physical regions. These regions must also remain readable until
@@ -276,5 +280,10 @@ the kernel has consumed them.
 
 ## Summarized By
 
-[boot/README.md](../README.md), [kernel/docs/entropy.md](../../kernel/docs/entropy.md),
-[docs/bootstrap.md](../../../docs/bootstrap.md), [firmware-parsing.md](firmware-parsing.md)
+[core/boot/README.md](../README.md), [ACPI Parsing](acpi.md), [Early Console](console.md),
+[ELF Loading](elf-loading.md), [Firmware Parsing](firmware-parsing.md),
+[Memory Map Translation](memory-map.md), [Page Tables](page-tables.md),
+[UEFI Environment](uefi-environment.md), [Kernel Entropy Subsystem](../../kernel/docs/entropy.md),
+[Kernel Initialization Sequence](../../kernel/docs/initialization.md),
+[Architecture Overview](../../../docs/architecture.md),
+[System Bootstrap](../../../docs/bootstrap.md), [xtask/README.md](../../../xtask/README.md)

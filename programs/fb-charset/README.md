@@ -11,9 +11,10 @@ It is **not** a service and does **not** auto-start. Run it from the shell:
 $ fb-charset
 ```
 
-The shell's stdout is relayed by `programs/terminal` to the framebuffer (and
-serial), so this exercises the driver's glyph rendering through the normal
-stdio path — no driver or capability awareness in the program itself.
+The shell's stdout is relayed by [`programs/terminal`](../terminal/README.md) to
+the framebuffer (and serial), so this exercises the driver's glyph rendering
+through the normal stdio path — no driver or capability awareness in the program
+itself.
 
 ---
 
@@ -26,8 +27,10 @@ Pure `std`: the sample is written to stdout in labelled sections —
 - CP437 box-drawing (single, double, and mixed junction grids),
 - block / shading elements,
 - the font-extension table (em-dash, ellipsis, `×`, `⇒`, `≠`, `✓`, arrows, …),
-- the ASCII multi-byte substitute path (`©` → `(C)`, `™` → `(TM)`, …),
-- one deliberately ill-formed UTF-8 sequence so the `U+FFFD` glyph is reachable.
+- the ASCII multi-byte substitute path (`©` → `(C)`, `™` → `(TM)`, …) of the
+  [framebuffer driver](../../services/drivers/framebuffer/README.md),
+- one deliberately ill-formed UTF-8 sequence so the `U+FFFD` glyph is reachable (the
+  [driver](../../services/drivers/framebuffer/README.md) emits it for invalid UTF-8).
 
 There are no assertions and no PASS/FAIL — the verdict is visual, which is why
 there is no automated tester (CI cannot inspect rendered pixels). With no stdout
@@ -44,4 +47,5 @@ attached the output silently drops.
 
 ## Summarized By
 
-None
+[Console Model](../../docs/console-model.md),
+[services/drivers/framebuffer/README.md](../../services/drivers/framebuffer/README.md)

@@ -227,16 +227,17 @@ Send a message to an endpoint and block until a reply is received.
 Each 32-bit field of the two packed words carries a **full** cap handle —
 slot index plus per-slot generation — so the kernel generation-validates the
 sender's named slots: a stale handle to a recycled slot is rejected
-(`InvalidCapability`) instead of transmitting the slot's current occupant.
+(`InvalidCapability`) instead of transmitting the slot's current occupant
+(see [capability-model.md](../../../docs/capability-model.md) § Capability Handle Format).
 Capability handles always travel in these registers on the send side; the
 delivered destination handles are reported through the result block in the
-receiver's IPC buffer page.
+receiver's IPC buffer page (see [ipc-design.md](../../../docs/ipc-design.md) § Message Format).
 
 **Data words:** When `data_count` > 0, the kernel reads the data words from
 the caller's registered IPC buffer page (`SYS_IPC_BUFFER_SET`); the syscall
 fails with `InvalidArgument` if none is registered. Reply data words are
 written back to the same page when the server replies. No arbitrary user
-pointer is dereferenced.
+pointer is dereferenced (see [ipc-design.md](../../../docs/ipc-design.md) § Message Format).
 
 **Return:**
 
@@ -254,7 +255,8 @@ message, or `data_count` > 0 with no IPC buffer page registered),
 slot is pinned by an in-flight `SYS_CAP_REVOKE` or `SYS_CAP_MOVE`), `Interrupted`. Cap-slot
 problems are rejected before the caller blocks; a refusal that arises only
 afterwards degrades to delivery with zero caps (the caller keeps its
-capabilities). A capability whose derived children take more than one lock
+capabilities; see [ipc-design.md](../../../docs/ipc-design.md) § Message Format).
+A capability whose derived children take more than one lock
 hold to migrate is moved in batches after the message commits (see
 [capability-internals.md](capability-internals.md) § Move); if an ancestor's
 revoke frees it meanwhile it arrives as handle 0 (the permanently null
@@ -280,13 +282,15 @@ Send a reply to the caller that issued the most recent `SYS_IPC_RECV` on this th
 | 4 | `cap_handles_hi` | Packed cap handles 2 and 3 (two 32-bit fields) |
 
 The packed-handle encoding matches `SYS_IPC_CALL`: full 32-bit handles, so a
-stale reply slot is rejected rather than resolved to its current occupant.
+stale reply slot is rejected rather than resolved to its current occupant (see
+[capability-model.md](../../../docs/capability-model.md) § Capability Handle Format).
 
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
 
 The reply capability is implicit — it is retrieved from the calling thread's
 `reply_cap_slot` (a per-thread field outside the CSpace, set at `SYS_IPC_RECV`
-time). It is consumed by this syscall whether it succeeds or fails. If no reply
+time; see [capability-internals.md](capability-internals.md) § Capability Transfer
+in IPC). It is consumed by this syscall whether it succeeds or fails. If no reply
 capability is present (i.e. this thread did not receive a call), the syscall
 returns `InvalidCapability`.
 
@@ -305,7 +309,8 @@ directory structurally full for reply cap transfer), `OutOfMemory`
 (slot-page pool exhausted), `Interrupted`. Every payload or cap failure while
 a caller is pending — the data-path errors above included — consumes the
 pending reply and wakes the caller with the `IPC_REPLY_TRANSFER_FAILED` label
-and zero caps while the server receives the error. A fault reply skips
+and zero caps while the server receives the error (see
+[ipc-design.md](../../../docs/ipc-design.md) § Message Format). A fault reply skips
 payload and cap processing entirely: the label alone carries the disposition
 (see [fault-handling.md](../../../docs/fault-handling.md)).
 
@@ -343,13 +348,15 @@ The badge is the value attached to the sender's endpoint capability via
 directory structurally full for an incoming cap transfer), `OutOfMemory` (slot-page pool exhausted),
 `Interrupted`. If an already-queued sender's cap transfer is refused (a source
 slot went stale or is pinned by an in-flight `SYS_CAP_REVOKE` or `SYS_CAP_MOVE`), the message is
-still delivered — with zero caps; the sender keeps its capabilities.
+still delivered — with zero caps; the sender keeps its capabilities (see
+[ipc-design.md](../../../docs/ipc-design.md) § Message Format).
 
 ---
 
 ### `SYS_NOTIFICATION_SEND` (3)
 
-OR bits into a notification object. Non-blocking; wakes the waiter if one is present.
+OR bits into a notification object. Non-blocking; wakes the waiter if one is present
+(see [ipc-design.md](../../../docs/ipc-design.md) § Notifications).
 
 **Arguments:**
 
@@ -370,7 +377,7 @@ OR bits into a notification object. Non-blocking; wakes the waiter if one is pre
 
 Block until at least one bit is set in the notification object, or until the
 optional millisecond timeout elapses. Returns and atomically clears the
-entire bitmask.
+entire bitmask (see [ipc-design.md](../../../docs/ipc-design.md) § Notifications).
 
 **Arguments:**
 
@@ -388,7 +395,8 @@ entire bitmask.
 
 Same register layout as `SYS_EVENT_RECV`. The split avoids aliasing
 bit-63-set bitmasks with the dispatcher's negative-Err encoding, so the
-full 64-bit bitmask range is usable.
+full 64-bit bitmask range is usable (see [ipc-internals.md](ipc-internals.md) § Notification,
+Wait Path).
 
 **Capability requirement:** `notification_cap` must have Wait rights.
 
@@ -398,7 +406,8 @@ full 64-bit bitmask range is usable.
 
 ### `SYS_EVENT_POST` (5)
 
-Append one entry to an event queue. Non-blocking; returns `QueueFull` if at capacity.
+Append one entry to an event queue. Non-blocking; returns `QueueFull` if at capacity
+(see [ipc-design.md](../../../docs/ipc-design.md) § Event Queues).
 
 **Arguments:**
 
@@ -448,7 +457,8 @@ the caller already knows which mode it asked for. The kernel uses an
 out-of-band marker (`tcb.timed_out`) rather than an in-band
 `wakeup_value` sentinel because event-queue payloads may be any `u64`
 (including 0) — contrast `SYS_NOTIFICATION_WAIT`, where `wakeup_value == 0`
-suffices because `notification_send` rejects zero-bit sends.
+suffices because `notification_send` rejects zero-bit sends (see
+[ipc-internals.md](ipc-internals.md) § Event Queue, Recv Path).
 
 ---
 
@@ -603,7 +613,8 @@ the pool, so a one-page donation can leave the budget unchanged. Read the budget
 
 `Control` lets the creator register terminal-fault death observers via
 `SYS_ASPACE_BIND_NOTIFICATION`; copies handed to other components drop it via the
-`SYS_CAP_DERIVE` rights mask.
+`SYS_CAP_DERIVE` rights mask (see
+[capability-model.md](../../../docs/capability-model.md) § Address Space).
 
 **Capability requirements:** `memory_cap` (Retype); in augment-mode, `augment_cap` (Map).
 
@@ -689,12 +700,14 @@ the badge to the receiver as the third return value of `SYS_IPC_RECV`.
 
 Badges are generic — any capability type can carry a badge, not just endpoints.
 For non-endpoint types, the badge is stored but not delivered via any kernel
-mechanism; userspace can use it for bookkeeping.
+mechanism; userspace can use it for bookkeeping (see
+[capability-model.md](../../../docs/capability-model.md) § Badges).
 
 The source capability must have `badge == 0`. Re-badging (setting a new badge
 on an already-badged cap) returns `InvalidArgument`. Derivation via
-`SYS_CAP_DERIVE` inherits the source's badge. Source revalidation under the
-derivation lock: as for `SYS_CAP_DERIVE`.
+`SYS_CAP_DERIVE` inherits the source's badge (see
+[capability-model.md](../../../docs/capability-model.md) § Badges). Source revalidation
+under the derivation lock: as for `SYS_CAP_DERIVE`.
 
 **Errors:** `InvalidArgument` (badge is zero or source already badged),
 `InvalidCapability` (source invalid, null, or freed meanwhile), `InvalidState` (a
@@ -718,11 +731,14 @@ Revoke all capabilities derived from a capability, across all processes.
 
 Every descendant in the derivation tree is invalidated; the target capability
 itself is preserved. Underlying kernel objects are not freed unless a revoked
-capability was the last reference. While the revoke is in flight, `SYS_CAP_DELETE`,
+capability was the last reference (see
+[capability-model.md](../../../docs/capability-model.md) § Revocation). While the revoke is
+in flight, `SYS_CAP_DELETE`,
 `SYS_CAP_MOVE`, `SYS_CAP_COPY`, `SYS_CAP_DERIVE`, `SYS_CAP_DERIVE_BADGE`,
 `SYS_MEMORY_SPLIT`, `SYS_MEMORY_MERGE`, and the range splits on the target slot
 (and IPC transfer of it) are refused with `InvalidState`. A `SYS_CAP_MOVE` or
-IPC transfer in flight pins its source and destination slots the same way.
+IPC transfer in flight pins its source and destination slots the same way (see
+[capability-internals.md](capability-internals.md) § Revocation Algorithm).
 
 **Errors:** `InvalidCapability`; `InvalidState` (another revoke, or a move, is
 already in flight on this slot, or a corrupted derivation link was found — the revoke is
@@ -748,7 +764,9 @@ If this is the last reference to the underlying object, the object is freed.
 Freeing a `CSpace` or an `AddressSpace` first stops every thread bound to it
 (each becomes `Exited` with retained exit reason `EXIT_KILLED`; its Thread
 object is freed when its own last capability goes), so a process's threads
-never outlive either object. **This includes the caller**: a thread deleting
+never outlive either object (see
+[scheduling-internals.md](scheduling-internals.md) § Thread Registry).
+**This includes the caller**: a thread deleting
 the last capability to its own `CSpace` or `AddressSpace` — directly, or
 because the deleted object's teardown cascades into it — is stopped by that
 delete and the call does not return; the object is reclaimed once the thread
@@ -763,7 +781,9 @@ thread later releases it), and a slot with a `SYS_CAP_REVOKE` or `SYS_CAP_MOVE`
 in flight may not be deleted until that operation completes.
 
 Capabilities derived from the deleted slot are re-linked under its own
-derivation parent, so they stay revocable from above. That re-linking runs in
+derivation parent, so they stay revocable from above (see
+[capability-internals.md](capability-internals.md) § Revocation Algorithm). That
+re-linking runs in
 batches with the derivation lock released between them (a slot can have
 arbitrarily many children); between batches the slot stays live with its
 remaining children still under it. A `SYS_CAP_REVOKE` that starts on the slot
@@ -857,7 +877,7 @@ Remove a mapping from an address space.
 
 The physical frame is not freed — only the virtual mapping is removed. The memory
 capability continues to exist. TLB shootdowns are performed on all CPUs running
-threads in `aspace_cap`.
+threads in `aspace_cap` (see [memory-internals.md](memory-internals.md) § SMP TLB Shootdown).
 
 **Capability requirement:** `aspace_cap` must have Map rights.
 
@@ -942,7 +962,8 @@ directory structurally full).
 
 Map an MMIO region capability into an address space. MMIO mappings use uncacheable
 page attributes (PCD|PWT strong-uncacheable on x86-64; Svpbmt PBMT=IO on RISC-V)
-rather than the default writeback caching.
+rather than the default writeback caching (see
+[arch-interface.md](arch-interface.md) § `paging`).
 
 **Arguments:**
 
@@ -1089,7 +1110,9 @@ Stop a running or runnable thread. The thread transitions to `Stopped` state.
 
 If the thread is blocked on IPC, the block is cancelled (the blocked syscall on the
 target thread returns `Interrupted`). If the thread is running on another CPU, an
-inter-processor interrupt is sent to force it out of userspace.
+inter-processor interrupt is sent to force it out of userspace (see
+[thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § `sys_thread_stop` Cross-CPU
+Stop Protocol).
 
 **Capability requirement:** `thread_cap` must have Control rights.
 
@@ -1134,13 +1157,15 @@ with a code, use `SYS_PROCESS_EXIT`.
 Exit the calling process with a voluntary exit code (the `std::process::exit` /
 `main`-return path). The kernel encodes `code` via `syscall_abi::encode_exit_code`
 into the exit-reason space (`0` clean, `1..0x0FFF` saturating; disjoint from the
-fault range `0x1000+`), records it as the calling thread's exit reason, and posts
+fault range `0x1000+`; see [process-lifecycle.md](../../../docs/process-lifecycle.md)
+§ Exit reason), records it as the calling thread's exit reason, and posts
 it to that thread's death observers — a parent that bound the main thread (so
 `ExitStatus::code()` carries it) and procmgr's per-thread observer (which reaps
 the process). Structurally identical to `SYS_THREAD_EXIT` but with a non-zero
 reason; it does not post to the address-space death surface (reserved for
 terminal faults). Sibling threads are reaped by procmgr's cap-revoke teardown;
-the kernel does not enumerate or stop them here.
+the kernel does not enumerate or stop them here (see
+[process-lifecycle.md](../../../docs/process-lifecycle.md) § Process Death).
 
 **Arguments:**
 
@@ -1209,7 +1234,8 @@ bands. Mirrors the range-split shape of `SYS_IRQ_SPLIT` / `SYS_MMIO_SPLIT` /
 The lower child covers `[min, split_at - 1]`, the upper child `[split_at, max]`.
 The original cap is consumed; both children are reparented to the original's
 derivation parent and carry the same (absent) rights. This is the only way to
-narrow a band — `SYS_CAP_DERIVE` attenuates rights and cannot shrink a range.
+narrow a band — `SYS_CAP_DERIVE` attenuates rights and cannot shrink a range (see
+[capability-model.md](../../../docs/capability-model.md) § SchedControl).
 
 **Capability requirements:** `sched_cap` must be a `SchedControl` (presence-only;
 no rights bit).
@@ -1246,7 +1272,8 @@ takes effect immediately:
   and routed cross-CPU on its next `schedule()` entry. The IPI does not
   itself call `schedule()`; the running thread observes the new affinity
   at its next slice-expiry, voluntary yield, or IPC block. Worst-case
-  latency is one time slice.
+  latency is one time slice (see
+  [scheduler.md](scheduler.md) § Active migration on affinity change).
 - A **Blocked / Stopped / Created** thread observes the new affinity on
   its next wake.
 
@@ -1337,16 +1364,19 @@ handler bound the fault is terminal. See
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
 
 Binding takes a reference on the endpoint object for the binding's lifetime;
-rebinding, unbinding, or thread destruction releases it. Binding requires only a
+rebinding, unbinding, or thread destruction releases it (see
+[fault-handling.md](../../../docs/fault-handling.md) § Liveness). Binding requires only a
 valid `Endpoint` cap — `Control` on the thread is the authority; the endpoint cap
 merely names where the thread's faults are delivered. The kernel synthesizes fault
 delivery via the binding and distributes no send capability to the endpoint, so a
-fault message bearing `FAULT_LABEL` cannot be forged.
+fault message bearing `FAULT_LABEL` cannot be forged (see
+[fault-handling.md](../../../docs/fault-handling.md) § Security).
 
 Both page faults (`FAULT_KIND_VM`) and other kernel-unresolvable ring-3 exceptions
 (`FAULT_KIND_EXCEPTION`) are routed to the bound handler; the handler dispatches on
-the fault kind and replies `FAULT_REPLY_KILL` for kinds it does not handle. See the
-fault-handling design doc's implementation-status note.
+the fault kind and replies `FAULT_REPLY_KILL` for kinds it does not handle (see
+[fault-handling.md](../../../docs/fault-handling.md) § Fault-Handler Binding and
+§ Implementation Status).
 
 **Capability requirement:** `thread_cap` MUST have Control rights; `endpoint_cap`
 (when non-zero) MUST refer to an `Endpoint`.
@@ -1462,7 +1492,8 @@ Block until any member of the wait set becomes ready.
 - `rdx`/`a1`: badge of the ready source (valid on success)
 
 Only one ready source is returned per call (wake-one semantics). If multiple sources
-are ready simultaneously, subsequent calls return them without blocking.
+are ready simultaneously, subsequent calls return them without blocking (see
+[ipc-internals.md](ipc-internals.md) § Multiple Ready Sources).
 
 **Capability requirement:** `wait_set_cap` must have Wait rights.
 
@@ -1515,7 +1546,8 @@ the registered notification.
 
 Only one notification may be registered per interrupt line at a time. A second call
 replaces the previous registration. The kernel masks the interrupt line before
-delivering the notification; the driver MUST call `SYS_IRQ_ACK` to re-enable it.
+delivering the notification; the driver MUST call `SYS_IRQ_ACK` to re-enable it
+(see [architecture.md](../../../docs/architecture.md) § Driver Model).
 
 **Capability requirements:** `irq_cap` (valid interrupt capability), `notification_cap`
 (Notification rights).
@@ -1544,7 +1576,8 @@ Permission Bitmap (IOPB).
 
 Multiple bindings may be made to the same thread, each authorising a different port
 range. When `ioport_cap` is revoked, port access is removed from all threads it has
-been bound to; access is always revocable.
+been bound to; access is always revocable (see
+[capability-model.md](../../../docs/capability-model.md) § IoPort (x86-64 only)).
 
 **Capability requirements:** `thread_cap` (Control rights), `ioport_cap` (Use rights).
 
@@ -1675,7 +1708,8 @@ rights); augment-mode — `0`. `SyscallError` on failure.
 
 Augment-mode donations are unbounded in count, with the same bookkeeping as
 `SYS_CAP_CREATE_ASPACE`: once per record page a donation's first page is kept by
-the kernel and only `init_pages − 1` pages reach the pool.
+the kernel and only `init_pages − 1` pages reach the pool (see
+[capability-internals.md](capability-internals.md) § Donation Records).
 
 **Capability requirements:** `memory_cap` (Retype); in augment-mode, `augment_cap` (Insert).
 
@@ -1719,7 +1753,8 @@ the required growth the call fails with `OutOfMemory` before consuming any
 pool page. Leaves grown for a placement that then fails — the target slot
 turns out to be occupied, or a concurrent pool consumer starves the final
 grow — stay behind as ordinary free capacity, and the pool pages they
-consumed stay spent.
+consumed stay spent (see [capability-internals.md](capability-internals.md) § Storage:
+Hybrid Two-Level Radix).
 
 **Capability requirements:** `src_cap` (at least one right), `dst_cspace_cap` (Insert).
 
@@ -1731,7 +1766,8 @@ fails with `InvalidCapability`, and one with a `SYS_CAP_REVOKE` or
 every other reference to the
 destination CSpace goes while the call is backing the leaves up to that index,
 the call reclaims that CSpace and fails with `InvalidCapability`; a caller bound
-to it is stopped and the call never returns.
+to it is stopped and the call never returns (see
+[capability-model.md](../../../docs/capability-model.md) § "Kill process" pattern).
 
 **Errors:** `InvalidCapability`, `InvalidState` (a `SYS_CAP_REVOKE` or `SYS_CAP_MOVE` is in flight
 on the source), `InsufficientRights` (dst CSpace lacks Insert), `InvalidArgument`
@@ -1779,7 +1815,8 @@ for any other slot.
 With a non-zero `dst_slot`, if every other reference to the destination CSpace
 goes while the call is backing the leaves up to that index, the call reclaims
 that CSpace and fails with `InvalidCapability`; a caller bound to it is stopped
-and the call never returns.
+and the call never returns (see
+[capability-model.md](../../../docs/capability-model.md) § "Kill process" pattern).
 
 **Errors:** `InvalidCapability` (also: an ancestor's revoke freed the
 capability while the move was in flight), `InsufficientRights` (dst CSpace
@@ -1823,7 +1860,8 @@ Translate a user virtual address to its mapped physical address.
 Bind a terminal-fault death observer to an address space. When any thread in the space
 faults terminally (no handler bound, or the handler replied KILL), the kernel posts the
 fault reason to the bound event queue. Voluntary `SYS_THREAD_EXIT` does not fire these
-observers.
+observers (see [capability-model.md](../../../docs/capability-model.md) § "Kill process"
+pattern).
 
 **Arguments:**
 
@@ -1867,9 +1905,11 @@ The error surface is read-side only: a *sending* data-carrying IPC fails with
 `InvalidArgument` when no page is registered and `InvalidAddress` when the
 registered page is unmapped, while delivery-side writes are best-effort — a
 receiver with no usable page silently misses the data words and the
-cap-result block. Transferred capabilities are still moved into that
+cap-result block (see [ipc-internals.md](ipc-internals.md) § Call Path (Sender)).
+Transferred capabilities are still moved into that
 receiver's CSpace; without the result block it cannot learn their handles,
-so the slots stay consumed until the CSpace is torn down.
+so the slots stay consumed until the CSpace is torn down (see
+[ipc-design.md](../../../docs/ipc-design.md) § Message Format).
 
 Calling `SYS_IPC_BUFFER_SET` again replaces the previous registration. Passing 0
 deregisters the IPC buffer page (sending data-carrying IPC then fails with
@@ -1965,7 +2005,8 @@ Forward a sanctioned SBI firmware call to M-mode on RISC-V, gated by a per-exten
 failure. A nonzero SBI firmware error collapses to `NotSupported`.
 
 Only a fixed set of extensions is forwardable (e.g. SRST, SUSP, CPPC, BASE, DBCN, PMU);
-each maps to a distinct `SbiControl` right. Extensions outside that set are rejected.
+each maps to a distinct `SbiControl` right. Extensions outside that set are rejected
+(see [capability-model.md](../../../docs/capability-model.md) § SbiControl (RISC-V only)).
 
 **Capability requirement:** `sbi_cap` must be an `SbiControl` cap holding the right that
 `extension` maps to.
@@ -1991,7 +2032,8 @@ kernel's per-CPU forward-secure generator; userspace holds no generator state.
 
 **Return:** `rax`/`a0`: the number of bytes written (always `len` on success —
 the kernel never blocks for entropy once the pool is seeded, which happens
-before any userspace process runs); negative `SyscallError` on failure.
+before any userspace process runs — see [entropy.md](entropy.md) § Boot-time entropy);
+negative `SyscallError` on failure.
 
 **Capability requirement:** None (ambient, like `SYS_SYSTEM_INFO`). Random bytes
 name no object and confer no authority; the call is draw-only and injects no
@@ -2002,7 +2044,8 @@ entropy.
 yet seeded — unreachable in practice).
 
 Larger buffers are filled by looping in `MAX_GETRANDOM_LEN`-byte chunks, which
-bounds the per-call interrupt-off window of the kernel draw.
+bounds the per-call interrupt-off window of the kernel draw (see
+[entropy.md](entropy.md) § Draw API and consumers).
 
 ---
 
@@ -2031,21 +2074,24 @@ To delegate authority that can later be revoked without losing your own access:
 
 This pattern works because revocation is subtree-local: revoking C1 removes C1's
 descendants (including C2) but leaves C1 itself, C, and any other children of C
-intact.
+intact (see [capability-internals.md](capability-internals.md) § Safe Delegation: the
+"Derive Twice" Pattern).
 
 ---
 
 ## Atomicity and Preemption Guarantees
 
 - **IPC message delivery is atomic.** A message either fully transfers (including all
-  capability slots) or does not transfer at all. There is no partial delivery.
+  capability slots) or does not transfer at all. There is no partial delivery (see
+  [ipc-design.md](../../../docs/ipc-design.md) § Message Format).
 
 - **Capability operations complete before returning.** Derivation, deletion, and
   revocation each complete fully before the syscall returns. A revocation that
   affects capabilities in other processes completes before `SYS_CAP_REVOKE`
   returns; a large revocation proceeds in bounded batches, so other CPUs can
   observe not-yet-revoked descendants (still usable) mid-syscall — the fully
-  revoked state is guaranteed only at return.
+  revoked state is guaranteed only at return (see
+  [capability-internals.md](capability-internals.md) § Revocation Algorithm).
 
 - **Memory mapping operations are atomic with respect to the address space.** After
   `SYS_MEM_MAP` or `SYS_MEM_UNMAP` returns, every CPU observes the updated mapping on
@@ -2053,7 +2099,8 @@ intact.
   permission narrowing, frame replacement) complete a synchronous cross-CPU TLB
   shootdown before returning; fresh maps and permission widenings instead rely on the
   page-fault handler's spurious-fault retry, which re-walks the live page table on
-  first remote access. Either way the end state is coherent before the access
+  first remote access (see [memory-internals.md](memory-internals.md) § SMP TLB Shootdown).
+  Either way the end state is coherent before the access
   completes.
 
 - **Syscalls may be preempted.** Long-running operations (revocation traversal, SMP
@@ -2085,4 +2132,14 @@ source of truth.
 
 ## Summarized By
 
-[kernel/README.md](../README.md), [docs/entropy.md](entropy.md)
+[core/kernel/README.md](../README.md), [Architecture Abstraction Layer](arch-interface.md),
+[Kernel Cross-Boundary Disclosure Inventory](cross-boundary-disclosure.md),
+[Kernel Entropy Subsystem](entropy.md), [IPC Subsystem Internals](ipc-internals.md),
+[Scheduler Internals](scheduler.md),
+[SMP Scheduling and Locking Invariants](scheduling-internals.md),
+[IPC Design](../../../docs/ipc-design.md), [Process Lifecycle](../../../docs/process-lifecycle.md),
+[Testing](../../../docs/testing.md),
+[services/drivers/serial/README.md](../../../services/drivers/serial/README.md),
+[memmgr Memory Pool](../../../services/memmgr/docs/memory-pool.md),
+[Restart Protocol](../../../services/svcmgr/docs/restart-protocol.md),
+[shared/syscall/README.md](../../../shared/syscall/README.md)

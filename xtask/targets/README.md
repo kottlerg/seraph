@@ -29,4 +29,4 @@ See [../../docs/build-system.md](../../docs/build-system.md) for target properti
 
 ## Summarized By
 
-[../../docs/build-system.md](../../docs/build-system.md)
+None

@@ -31,8 +31,9 @@ order-`n` block contains 2^n contiguous 4 KiB pages.
 
 Free-block metadata lives in fixed-size static arrays inside the allocator
 struct, not in the free pages themselves: the bootloader identity-maps only
-specific regions (`BootInfo`, modules, stack, memory map buffer), so free RAM
-is not generally writable when the allocator initialises in Phase 2.
+specific regions (`BootInfo`, modules, stack, memory map buffer; see
+[boot/docs/page-tables.md](../../boot/docs/page-tables.md) § What Gets Mapped), so
+free RAM is not generally writable when the allocator initialises in Phase 2.
 
 ```rust
 pub struct BuddyAllocator
@@ -68,7 +69,7 @@ than the boot.
 The allocator manages a single zone: one `BuddyAllocator` instance covering all
 usable RAM. It has no zone concept; physical-address-range constraints (e.g.
 DMA reachability) are handled by the userspace memory authority after the
-Phase-7 handoff, per
+Phase-7 handoff, per [docs/memory-model.md](../../../docs/memory-model.md) § Buddy Allocator and
 [docs/device-management.md](../../../docs/device-management.md).
 
 ### Allocation and Deallocation Properties
@@ -80,8 +81,10 @@ well-behaved workloads.
 
 **Deallocation and coalescing:** On free, the buddy address is computed via XOR of
 the block address with its size (buddy pairs differ in exactly one bit). If the buddy
-is free, the two blocks are merged and the process repeats at the next order. This
-is O(MAX_ORDER) in the worst case and eliminates long-term fragmentation.
+is free, the two blocks are merged and the process repeats at the next order, at most
+MAX_ORDER times. Each merge removes the buddy from its order's free list by a linear search
+of that list (`remove_block`), so a free costs up to MAX_ORDER levels, each linear in that
+order's free-list length. Coalescing eliminates long-term fragmentation.
 
 ### Thread Safety
 
@@ -94,21 +97,24 @@ changing the core algorithm.
 
 ## Kernel Object Memory (`cap/retype.rs`)
 
-The kernel runs no heap and no `GlobalAlloc`. Every kernel object — the slot
-pages of a CSpace, thread control blocks, endpoints, notifications, event
+The kernel runs no heap and no `GlobalAlloc`
+([docs/memory-model.md](../../../docs/memory-model.md) § Kernel Object Memory). Every kernel object
+— the slot pages of a CSpace, thread control blocks, endpoints, notifications, event
 queues, wait sets, address spaces, CSpaces, and Memory objects themselves — is
 carved out of a Memory capability by retype: the body is constructed in place
 at the offset the retype allocator returns, its header records the source, and
 the bytes go back to that source when the object's last capability is deleted
 (see [capability-internals.md](capability-internals.md) § Kernel Object
 Reference Counting). The kernel's own objects are retyped from the SEED
-reserve, carved from the buddy allocator before the Phase 7 handoff; userspace
+reserve, carved from the buddy allocator before the Phase 7 handoff
+([initialization.md](initialization.md) § Phase 7: Capability System); userspace
 objects come from the capability a `cap_create_*` syscall names. Address spaces
 and CSpaces additionally own a page pool for their page tables and slot pages
 ([capability-internals.md](capability-internals.md) § Page Pools).
 
 Retype and pool allocation are fallible and MUST be handled as fallible at every
-call site; there is no allocation that cannot fail.
+call site; there is no allocation that cannot fail
+([docs/memory-model.md](../../../docs/memory-model.md) § Kernel Allocation is Fallible).
 
 ---
 
@@ -157,7 +163,8 @@ pub struct AddressSpace
 4. **Destruction**: when the last capability to the address space is deleted, every
    donation to its page-table pool — the create-time slab included, with the root
    table and the `AddressSpace` itself — is returned to its source Memory cap
-   wholesale (see Page Table Node Ownership below).
+   wholesale (see Page Table Node Ownership below and
+   [capability-internals.md](capability-internals.md) § Teardown).
 
 ### Fork-Like Operations
 
@@ -223,7 +230,8 @@ activation) and loads the root under that tag **without** flushing
 (`arch::current::paging::activate_tagged`): x86-64 writes CR3 with the PCID and bit 63 set
 (`CR4.PCIDE` is on); RISC-V writes `satp` with the ASID and no `sfence.vma`. A per-CPU
 generation check then flushes only that tag if it was reissued to a different space
-(`tag_gen` mismatch) or accrued unmaps while this CPU was switched away (`tlb_gen` lag). A
+(`tag_gen` mismatch) or accrued unmaps while this CPU was switched away (`tlb_gen` lag;
+see [docs/memory-model.md](../../../docs/memory-model.md) § TLB Management). A
 `SeqCst` fence between the scheduler's `mark_active` and the generation reads is the
 load-bearing barrier (paired with fences in the unmap and eviction paths) that closes the
 switch-away races. Where tagging is unavailable — no hardware tags, or a tag field too
@@ -232,8 +240,9 @@ narrow to provide more usable tags than CPUs — `activate` uses the full-flush 
 ASID 0 + `sfence.vma`) on every switch. When tagging is enabled the pool can never be
 exhausted (the allocator keeps more usable tags than CPUs, and at most one space per CPU is
 active), so a claim always succeeds and no user space ever runs untagged. Threads sharing an
-address space require no TLB operation on switch. The per-CPU elided/performed flush counts are
-summed by the `CAP_INFO_TLB_*` `cap_info` selectors.
+address space require no TLB operation on switch
+([docs/memory-model.md](../../../docs/memory-model.md) § TLB Management). The per-CPU
+elided/performed flush counts are summed by the `CAP_INFO_TLB_*` `cap_info` selectors.
 
 ### SMP TLB Shootdown
 
@@ -291,7 +300,8 @@ flushed the outgoing space's entries, so a switched-away CPU has nothing stale.
 
 ### Direct Physical Map Access
 
-The direct physical map is set up during Phase 3 of initialization and covers all
+The direct physical map is set up during Phase 3 of initialization
+([initialization.md](initialization.md) § Phase 3: Kernel Page Tables) and covers all
 usable physical memory. The kernel uses `phys_to_virt` and `virt_to_phys` helpers:
 
 ```rust
@@ -318,7 +328,8 @@ randomizes the direct-map base per boot (KASLR) and the kernel publishes it once
 entry (`init_paging_mode`), after which the accessor is a single relaxed atomic load.
 The Phase-3 builder guards the layout with the shared `boot_protocol::direct_map_ceiling`
 (RAM plus any framebuffer / kernel MMIO above the RAM ceiling), which must end at or
-below the kernel image base. These are the only valid paths for physical-to-virtual
+below the kernel image base ([initialization.md](initialization.md) § Phase 3: Kernel Page
+Tables). These are the only valid paths for physical-to-virtual
 conversion. Arbitrary physical addresses must not be accessed by computing offsets from
 kernel image addresses.
 
@@ -332,7 +343,8 @@ exist:
 
 - The idle threads' stacks come from the buddy allocator in Phase 4, one
   power-of-two block per CPU, while the buddy still holds large contiguous blocks
-  (before the Phase 7 drain); they live for the kernel's lifetime.
+  (before the Phase 7 drain); they live for the kernel's lifetime
+  ([initialization.md](initialization.md) § Phase 4: Typed-Memory Cap Surface).
 - Every other thread's stack is the first `KERNEL_STACK_PAGES` pages of its
   Thread slab — stack, then the page holding the `ThreadObject` and TCB, then
   the per-thread FPU/SIMD save area — which `SYS_CAP_CREATE_THREAD` carves from
@@ -375,6 +387,8 @@ donation-record mechanism.
 
 ## Summarized By
 
-[kernel/README.md](../README.md),
-[kernel/docs/arch-interface.md](arch-interface.md),
-[kernel/docs/capability-internals.md](capability-internals.md)
+[core/kernel/README.md](../README.md), [Architecture Abstraction Layer](arch-interface.md),
+[Capability Subsystem Internals](capability-internals.md),
+[Kernel Initialization Sequence](initialization.md), [IPC Subsystem Internals](ipc-internals.md),
+[SMP Scheduling and Locking Invariants](scheduling-internals.md),
+[Syscall Interface Specification](syscalls.md), [Memory Model](../../../docs/memory-model.md)

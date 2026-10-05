@@ -19,7 +19,7 @@ The capability subsystem comprises four components:
 
 ### Design Constraints
 
-From the design document:
+From [docs/capability-model.md](../../../docs/capability-model.md) § Capability Spaces:
 
 - O(1) lookup — descriptor-to-slot resolution on every IPC call
 - Stable indices — a descriptor never changes after assignment
@@ -68,7 +68,9 @@ slot index fits the cap handle's index field. They are established at
 implementation time and are not part of the public ABI.
 `(L1_DIRECT + L1_INDIRECT × DIR_FANOUT) × L2_SIZE` is the directory's
 structural ceiling — the only slot bound a CSpace has; capacity below it is
-whatever the owner-funded slot-page pool backs.
+whatever the owner-funded slot-page pool backs (see
+[docs/capability-model.md](../../../docs/capability-model.md) § Address-space and
+CSpace growth budgets).
 
 **Lookup is O(1):** A descriptor `d` selects leaf `d / L2_SIZE` and slot
 `d % L2_SIZE`. Leaves below `L1_DIRECT` resolve through the inline root
@@ -100,7 +102,8 @@ confined to threads of the owning process racing each other.
 
 **Slot 0** is always null. The leaf covering slot 0 exists once the CSpace
 has grown, but the slot is permanently locked to the null capability,
-enforced at the lookup level.
+enforced at the lookup level (see
+[docs/capability-model.md](../../../docs/capability-model.md) § Capability Spaces).
 
 ### Free Slot Tracking
 
@@ -311,7 +314,8 @@ The `u64` `RIGHTS_*` constants in `abi/syscall` are the single source of truth
 for bit values; the kernel defines a `TypedRights<K: CapKind>` newtype per type
 (`MemRights`, `EpRights`, `NtfRights`, ...) whose constants are derived from the
 ABI values, so a rights constant of the wrong capability type cannot be passed
-to a lookup at compile time.
+to a lookup at compile time. Scoping and attenuation semantics are in
+[docs/capability-model.md](../../../docs/capability-model.md) § Rights and Attenuation.
 
 Per-type vocabularies (bit positions within each type's own space):
 
@@ -351,7 +355,8 @@ fn check_wx(rights: Rights) -> Result<(), SyscallError>
 
 A capability may carry both Write and Execute rights (representing independent
 authorities). W^X is enforced when those rights are exercised on a specific
-mapping — no page may be simultaneously writable and executable.
+mapping — no page may be simultaneously writable and executable (see
+[docs/capability-model.md](../../../docs/capability-model.md) § Memory).
 
 ### Kernel Object Reference Counting
 
@@ -373,7 +378,8 @@ pub struct KernelObjectHeader
 When a slot is cleared (deletion, revocation), the reference count is decremented.
 When it reaches zero, the object's bytes are returned to the Memory object it was
 retyped from (`retype_free`). This is the only mechanism by which kernel objects
-are freed — there is no explicit "destroy" syscall.
+are freed — there is no explicit "destroy" syscall (see
+[docs/capability-model.md](../../../docs/capability-model.md) § Auto-reclaim).
 
 The same refcount also tracks kernel-internal owners of an object. Wait-set
 membership is one such owner: `sys_wait_set_add` `inc_ref`s the source's
@@ -382,6 +388,8 @@ header under the source's lock together with the back-pointer publication;
 source's state therefore outlives every wait-set member referencing it; the
 Endpoint/Notification/EventQueue dealloc arms only `debug_assert` that
 `state.wait_set` is null on entry (the invariant follows from the refcount).
+The membership protocol is in [ipc-internals.md](ipc-internals.md) § Wait Set
+Add/Remove.
 
 ---
 
@@ -407,8 +415,9 @@ root_cap (no parent)
 
 **Transfer** (`SYS_CAP_MOVE`, IPC capability transfer) does not create a new
 derivation tree node — the destination slot takes the donor's position in the
-tree and the donor's slot becomes null (see [Move](#move) for how a large child
-list is migrated).
+tree and the donor's slot becomes null (see
+[docs/capability-model.md](../../../docs/capability-model.md) § Transfer for the
+semantics and [Move](#move) for how a large child list is migrated).
 
 **Derivation** creates a new node as a child of the source slot in the tree.
 
@@ -695,8 +704,9 @@ derivation parent.
 ### Safe Delegation: the "Derive Twice" Pattern
 
 Revoking a capability via `SYS_CAP_REVOKE` invalidates all its descendants while
-preserving the target slot itself. To delegate authority that can later be revoked
-without losing your own access:
+preserving the target slot itself (see
+[docs/capability-model.md](../../../docs/capability-model.md) § Revocation). To
+delegate authority that can later be revoked without losing your own access:
 
 ```
 1. Hold capability C (the original).
@@ -713,6 +723,7 @@ descendants but leaves C1 itself, C, and any siblings of C1 untouched. Delegatio
 `SYS_CAP_COPY` so you keep your own access to C2 while the child holds a revocable
 copy. **IPC transfer** and `SYS_CAP_MOVE` instead hand the slot away — the sender's
 slot is freed — but the moved cap keeps its position in the derivation tree (see
+[docs/capability-model.md](../../../docs/capability-model.md) § Transfer and
 [Derivation Across Processes](#derivation-across-processes)), so it stays a
 descendant of C1 and a `SYS_CAP_REVOKE` on C1 still reaches it across the `CSpace`
 boundary. Revoking C1 frees the child's C2 slot in the child's own `CSpace`;
@@ -734,13 +745,16 @@ of cross-`CSpace` sharing keep a derivation edge across the boundary:
   free the sender's slot, but the moved cap keeps its position in the derivation
   tree — it stays a descendant of whatever it was derived from, so an ancestor's
   `cap_revoke` reaches it across the boundary. (Same-`CSpace` moves likewise keep
-  the source's position.)
+  the source's position; see
+  [docs/capability-model.md](../../../docs/capability-model.md) § Transfer.)
 - **`SYS_CAP_COPY`** keeps the new cap a derivation **child** of the source (the
   "Derive Twice" pattern above), so the source can revoke the delegated copy.
 
 In both cases a `cap_revoke` can `free_slot` the recipient's slot in its own
 `CSpace`. The handle the recipient holds carries the slot's **generation**
-(`handle = (generation << CAP_INDEX_BITS) | index`); `free_slot` bumps the
+(`handle = (generation << CAP_INDEX_BITS) | index`, per
+[docs/capability-model.md](../../../docs/capability-model.md) § Capability Handle
+Format); `free_slot` bumps the
 generation, so the recipient's now-stale handle fails with `InvalidCapability`
 rather than aliasing whatever later occupies the recycled index. See the per-slot
 generation discussion under [Capability Slot](#capability-slot-capslotrs).
@@ -819,25 +833,31 @@ IPC capability transfer is normally cross-`CSpace` (sender and receiver in
 distinct processes); two threads sharing one `CSpace` can transfer between
 themselves, the lock pair collapsing to a single acquisition. The transferred
 cap keeps its position in the derivation tree, so it remains reachable by a
-`cap_revoke` on one of its ancestors; per-slot generation handles make the
+`cap_revoke` on one of its ancestors (see
+[docs/capability-model.md](../../../docs/capability-model.md) § Revocation);
+per-slot generation handles make the
 receiver's handle fail closed if such a revoke frees the
 receiver's slot (#349). A move that finishes in the first hold is atomic against
 revocation; one that needs further batches is protected by the in-flight pins
 and stays revocation-complete between holds (see [Move](#move)).
 
 Reply capabilities are not part of the derivation tree — they are single-use,
-cannot be derived, and are not tracked for revocation. A reply capability is not
-a `CapTag` variant; it is an implicit per-thread mechanism created by the kernel
-at `SYS_IPC_RECV` time and stored in a per-thread slot, outside the process
-CSpace. The kernel clears the per-thread reply slot after `SYS_IPC_REPLY`.
+cannot be derived, and are not tracked for revocation (see
+[docs/ipc-design.md](../../../docs/ipc-design.md) § The Call/Reply Model). A reply
+capability is not a `CapTag` variant; it is an implicit per-thread mechanism
+created by the kernel at `SYS_IPC_RECV` time and stored in a per-thread slot,
+outside the process CSpace. The kernel clears the per-thread reply slot after
+`SYS_IPC_REPLY` (see [ipc-internals.md](ipc-internals.md) § Receive Path (Server)
+and § Reply Path).
 
 ---
 
 ## Summarized By
 
-[kernel/README.md](../README.md),
-[docs/capability-model.md](../../../docs/capability-model.md),
-[docs/ipc-design.md](../../../docs/ipc-design.md),
-[kernel/docs/syscalls.md](syscalls.md),
-[kernel/docs/memory-internals.md](memory-internals.md),
-[kernel/docs/cross-boundary-disclosure.md](cross-boundary-disclosure.md)
+[core/kernel/README.md](../README.md),
+[Kernel Cross-Boundary Disclosure Inventory](cross-boundary-disclosure.md),
+[IPC Subsystem Internals](ipc-internals.md), [Memory Subsystem Internals](memory-internals.md),
+[SMP Scheduling and Locking Invariants](scheduling-internals.md),
+[Syscall Interface Specification](syscalls.md),
+[Capability Model](../../../docs/capability-model.md), [IPC Design](../../../docs/ipc-design.md),
+[init Bootstrap Stages](../../../services/init/docs/bootstrap.md)

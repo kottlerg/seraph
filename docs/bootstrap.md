@@ -16,16 +16,22 @@ that packs init and every boot module into one file — see
 [`abi/boot-protocol::bundle`](../abi/boot-protocol/src/bundle.rs)), loads
 the kernel from `\EFI\seraph\kernel`, ELF-parses the bundle entry named
 `init` into `BootInfo.init_image`, exposes every other bundle entry as a
-named `BootModule`, queries the UEFI memory map, builds initial page
-tables, calls `ExitBootServices`, populates `BootInfo`, and jumps to the
+named `BootModule`, builds initial page tables, queries the final UEFI
+memory map, calls `ExitBootServices`, populates `BootInfo`, and jumps to the
 kernel entry point. The sequence is specified in ten bootloader steps in
 [`core/boot/docs/boot-flow.md`](../core/boot/docs/boot-flow.md).
 
-Boot-time configuration on disk consists of only the three ESP files
-named above plus the EFI fallback bootloader. `BootInfo` carries no
-kernel command line; root-partition identity comes from GPT type-GUID
-role discovery, performed by vfsd, and ktest options are baked into
-ktest's compile-time defaults.
+Boot-time configuration on disk consists of only the two ESP files
+named above, the optional presence-only `\EFI\seraph\nokaslr` KASLR
+override knob
+([boot-flow.md § Step 5d](../core/boot/docs/boot-flow.md#step-5d-apply-the-kaslr-slide),
+[elf-loading.md § File Paths](../core/boot/docs/elf-loading.md#file-paths)),
+and the EFI fallback bootloader. `BootInfo` carries no kernel command
+line; root-partition identity comes from GPT type-GUID role discovery,
+performed by vfsd
+([storage.md § GPT Role-GUID Discovery](storage.md#gpt-role-guid-discovery)),
+and ktest options are baked into ktest's compile-time defaults
+([ktest README § Compile-time options](../core/ktest/README.md#compile-time-options)).
 
 ---
 
@@ -46,9 +52,12 @@ The kernel runs ten numbered phases (kernel phase 0 through kernel phase 9)
 from entry-point validation to scheduler handoff. Authoritative enumeration
 and per-phase failure behavior are in
 [`core/kernel/docs/initialization.md`](../core/kernel/docs/initialization.md). Phase 7
-is the capability-minting phase: the kernel synthesizes the initial
-capability set from `BootInfo.platform_resources` and populates init's root
-CSpace. Downstream documents
+is the capability-minting phase: the kernel mints the initial capability
+set from `BootInfo.memory_map` (via the drained buddy), `mmio_apertures`,
+`acpi_rsdp`, `device_tree`, `modules`, and `reclaim_ranges` and populates
+the root CSpace that Phase 9 hands to init (see
+[initialization.md § Phase 7](../core/kernel/docs/initialization.md#phase-7-capability-system)).
+Downstream documents
 ([`device-management.md`](device-management.md),
 [`userspace-memory-model.md`](userspace-memory-model.md)) anchor their
 timing claims to kernel phase 7.
@@ -57,7 +66,7 @@ timing claims to kernel phase 7.
 
 ## init spawn (ABI gate)
 
-At the end of kernel phase 9, the kernel maps the init image — pre-parsed
+In kernel phase 9, the kernel maps the init image — pre-parsed
 by the bootloader and delivered via `BootInfo.init_image` — into a new
 address space, creates init's initial thread, and enters userspace. The
 init-image contract is specified by the `InitImage` type in the
@@ -72,11 +81,13 @@ whatever binary was staged in the init slot.
 
 ## Userspace bootstrap (init)
 
-The init binary starts memmgr and procmgr via raw syscalls (no IPC yet),
-transferring the RAM frame pool to memmgr and minting procmgr's
+The init binary creates memmgr and procmgr via raw syscalls (process
+creation through procmgr IPC is not yet available), transferring the RAM
+frame pool to memmgr and minting procmgr's
 `memmgr_endpoint_cap` so procmgr's std heap bootstrap finds memmgr on its
-first call. Init then requests procmgr to start the remaining early services
-(devmgr, svcmgr, drivers, vfsd, optionally netd), delegates the appropriate
+first call. Init then requests procmgr to start devmgr and vfsd, and later svcmgr
+from `/services/svcmgr` (devmgr spawns the drivers; svcmgr launches every
+other service post-handover), delegates the appropriate
 subsets of its initial capability set to each service, endows svcmgr with the
 handover endowment, and exits.
 
@@ -102,10 +113,11 @@ slot for specialised purposes and follow their own bootstrap shape.
 
 ## Handover to svcmgr
 
-At the end of Phase 3, init transfers its kernel-object and
-reclaimable Memory capabilities to procmgr via
-`REGISTER_INIT_TEARDOWN` and exits; procmgr reaps the kernel objects
-and reclaims the frames. See
+At the end of init's Handover stage (logged as `phase 3`), init
+transfers its kernel-object and reclaimable Memory capabilities to
+procmgr via `REGISTER_INIT_TEARDOWN` and exits; once both init threads
+have exited, procmgr reaps the kernel objects and donates the Memory
+caps to memmgr's pool. See
 [`process-lifecycle.md`](process-lifecycle.md) §"Init reap".
 
 Once init exits, svcmgr is the resident supervisor. See
@@ -115,6 +127,4 @@ Once init exits, svcmgr is the resident supervisor. See
 
 ## Summarized By
 
-[README.md](../README.md),
-[init/README.md](../services/init/README.md),
-[logd/README.md](../services/logd/README.md)
+None

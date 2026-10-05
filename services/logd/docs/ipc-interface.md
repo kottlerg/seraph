@@ -3,7 +3,8 @@
 logd is the receive-side of the master log endpoint. It does not
 publish a separate service endpoint; every userspace sender already
 holds a badged SEND cap on the log endpoint (seeded by procmgr at
-spawn time, or installed by init for itself / procmgr-self). The
+spawn time, or installed by init for itself / procmgr-self; see
+[`docs/process-lifecycle.md`](../../../docs/process-lifecycle.md)). The
 labels documented below are the ones logd's receive loop dispatches
 on.
 
@@ -88,7 +89,9 @@ unreachable; init-logd is the only intended target.
 Pre-pivot discovery path. Reserved in the label table for backward
 compatibility but no caller in the current codebase issues it
 (every spawn receives a pre-installed badged SEND cap in
-`ProcessInfo.log_send_cap`). logd replies empty if it ever
+`ProcessInfo.log_send_cap`, per
+[`docs/process-lifecycle.md`](../../../docs/process-lifecycle.md) § ProcessInfo / InitInfo
+Handover Discipline). logd replies empty if it ever
 arrives, so an out-of-tree v0 caller fails closed without crashing
 logd. A follow-up PR removes the label entirely once the
 pre-pivot discovery path is gone for good.
@@ -121,7 +124,7 @@ Procmgr installs the second binding inside
 [`finalize_creation`](../../procmgr/src/process.rs) when its
 `LOGD_DEATH_EQ` static is non-zero, AND retroactively across every
 existing process table entry when logd's
-`REGISTER_DEATH_EQ` IPC arrives. Children spawned before logd
+[`REGISTER_DEATH_EQ`](../../procmgr/docs/ipc-interface.md) IPC arrives. Children spawned before logd
 registers see only the first binding until the retroactive bind
 catches them up.
 
@@ -134,4 +137,4 @@ already-evicted badges.
 
 ## Summarized By
 
-[logd/README.md](../README.md)
+[services/logd/README.md](../README.md)

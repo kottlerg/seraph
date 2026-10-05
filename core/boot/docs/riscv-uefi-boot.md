@@ -258,4 +258,4 @@ for Seraph's specific binary layout.
 
 ## Summarized By
 
-[boot/README.md](../README.md)
+[core/boot/README.md](../README.md)

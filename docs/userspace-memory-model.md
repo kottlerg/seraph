@@ -19,7 +19,10 @@ Authority over memory is partitioned across four layers:
 - **memmgr** — tier-1 userspace service holding the userspace RAM
   frame pool. Allocates Memory capabilities to all std-built services
   on demand, tracks per-process ownership, reclaims on process death,
-  coalesces freed runs. memmgr knows nothing about virtual addresses.
+  coalesces freed runs. memmgr chooses no virtual addresses for its
+  clients; as the demand pager it records each client's registered
+  regions (`REGISTER_REGION`) and maps frames into delegated address
+  spaces on fault ([Fault Handling](fault-handling.md)).
   See [`services/memmgr/README.md`](../services/memmgr/README.md).
 - **procmgr** — tier-1 userspace service holding process lifecycle
   authority. Loads ELF images, allocates kernel objects (`AddressSpace`,
@@ -32,15 +35,17 @@ Authority over memory is partitioned across four layers:
   allocator for foreign Memory mappings.
 
 The kernel hands the initial RAM memory caps to init at boot. Init
-transfers them to memmgr (derive-twice). From that point on, memmgr is
+transfers them to memmgr (derive-twice; see
+[Process Lifecycle](process-lifecycle.md) § Init → memmgr and
+[Capability Model](capability-model.md)). From that point on, memmgr is
 the sole userspace authority over RAM frame allocation; the kernel does
 not delegate further to anyone.
 
 The handoff is total. By the end of Phase 7 the kernel has taken its
-bounded reserves from the buddy (the Phase 4 per-CPU storage and the Phase
-7 contributors, in the order
-[initialization.md](../core/kernel/docs/initialization.md) § Phase 4 and
-§ Phase 7 give), drains **every** remaining page into userspace Memory
+bounded reserves from the buddy (the Phase 4 per-CPU storage, the Phase 5
+per-CPU tag-state slab, and the Phase 7 contributors, in the order
+[initialization.md](../core/kernel/docs/initialization.md) § Phase 4,
+§ Phase 5, and § Phase 7 give), drains **every** remaining page into userspace Memory
 caps — coalescing
 physically-adjacent drained blocks into the fewest contiguous caps so the
 cap count tracks memory-map fragmentation, not total RAM — and *seals* the
@@ -71,7 +76,7 @@ disjoint surfaces:
 | Surface | Granularity | Owner | Used for |
 |---|---|---|---|
 | Byte heap | Bytes | `std::sys::seraph::alloc` (`#[global_allocator]`) | `Box`, `Vec`, `String`, all `alloc`/`std` collections |
-| Page reservations | 4 KiB pages | `std::sys::seraph` | Foreign Memory mappings: MMIO, DMA, shmem, zero-copy file pages, ELF-load scratch, per-thread stacks and IPC buffers when not heap-allocated |
+| Page reservations | 4 KiB pages | `std::sys::seraph` | Foreign Memory mappings: MMIO, DMA, shmem, zero-copy file pages, ELF-load scratch, demand-paged per-thread stacks (heap-backed stacks and spawned-thread IPC buffers come from the byte heap) |
 | Bootstrap cross-boundary VAs | 4 KiB pages | Process creator (kernel for init, init for memmgr/procmgr, procmgr for everyone else) | `ProcessInfo`/`InitInfo` page, main-thread stack, main-thread IPC buffer, main-thread TLS block |
 
 Each surface is independent of the others; their VA ranges do not
@@ -84,7 +89,8 @@ communicates them via `ProcessInfo` / `InitInfo`.
 
 ### Byte Heap
 
-`std::sys::seraph::alloc` declares `#[global_allocator]`, so the full
+`std::sys::seraph::alloc` implements `GlobalAlloc` for std's default
+`System` allocator, so with no `#[global_allocator]` override the full
 `alloc` / `std` collections surface (`Box`, `Vec`, `String`,
 `BTreeMap`, …) is available to every std-built service.
 
@@ -92,8 +98,9 @@ communicates them via `ProcessInfo` / `InitInfo`.
   from memmgr via `REQUEST_MEMORY_CAPS` on the process's
   `ProcessInfo.memmgr_endpoint_cap` and maps them at a contiguous VA
   range above its current high-water mark. Multi-page contiguous
-  caps (one cap covering many pages) are requested when available;
-  the multi-page-cap reply path collapses what would otherwise be
+  caps (one cap covering many pages) are returned whenever one free run
+  covers a best-effort request (`flags` = 0); the multi-page-cap
+  reply path collapses what would otherwise be
   many single-page IPCs into a single round.
 - **Bootstrap.** `std::os::seraph::_start` calls `REQUEST_MEMORY_CAPS`
   before `fn main()` runs and maps the returned caps at the process's
@@ -102,10 +109,10 @@ communicates them via `ProcessInfo` / `InitInfo`.
   [#39](https://github.com/kottlerg/seraph/issues/39)) via one raw
   non-allocating `SYS_GETRANDOM` call. The size of the initial
   bootstrap heap is a `std::sys::seraph` implementation detail.
-- **Out-of-memory.** `GlobalAlloc::alloc` returns null; the `alloc`
-  crate panics; the std panic handler exits the thread. svcmgr observes
-  the death via its event queue and applies restart policy. No kernel
-  panic.
+- **Out-of-memory.** `GlobalAlloc::alloc` returns null and the `alloc`
+  crate aborts through `handle_alloc_error` (std's abort path, which
+  traps on seraph), terminating the faulting thread. svcmgr observes the
+  death via its event queue and applies restart policy. No kernel panic.
 - **Thread safety.** A spinlock guards the allocator. Multi-threaded
   services share one allocator instance.
 - **`no_std` exceptions.** `init` and `memmgr` are `no_std` and have
@@ -119,7 +126,8 @@ buffers, from fs drivers for zero-copy file pages, from memmgr for
 heap-disjoint allocations like long-lived DMA regions) are mapped into
 the process via the page-reservation allocator inside `std::sys::seraph`.
 
-- **API surface.** `std::os::seraph::reserve_pages(n) → ReservedRange`
+- **API surface.**
+  `std::os::seraph::reserve_pages(n) → Result<ReservedRange, ReserveError>`
   returns a contiguous unmapped VA range of `n` pages.
   `unreserve_pages(range)` releases it. The caller maps owned Memory
   caps into the reservation with `mem_map`. The caller is responsible
@@ -181,8 +189,9 @@ from jitter alone
 [`core/kernel/docs/entropy.md`](../core/kernel/docs/entropy.md) for the
 quality caveat.
 
-- **`ProcessInfo` page.** Procmgr maps a read-only page at the chosen
-  `process_info_va`, writes the `ProcessInfo` struct into it, and delivers
+- **`ProcessInfo` page.** The creator (procmgr, or init for memmgr and
+  procmgr) maps a read-only page at the chosen `process_info_va`,
+  writes the `ProcessInfo` struct into it, and delivers
   that address to the child in its entry register (`rdi`/`a0`). The
   child's `_start` takes the address as its argument — it cannot read the
   address from the struct, since the address is what locates the struct.
@@ -193,8 +202,8 @@ quality caveat.
   init) maps `ProcessInfo.stack_pages` pages ending at the chosen
   `ProcessInfo.stack_top_vaddr` with a guard page below. The page
   count comes from the binary's optional `.note.seraph.stack` ELF note
-  (declared via the `process_abi::stack_pages!` / `seraph::stack_pages!`
-  macro); binaries that omit the note inherit
+  (declared via the `process_abi::stack_pages!` /
+  `std::os::seraph::stack_pages!` macro); binaries that omit the note inherit
   `DEFAULT_PROCESS_STACK_PAGES`. Loaders clamp to
   `MAX_PROCESS_STACK_PAGES`; the pool's available RAM is the remaining
   gate on the resulting `REQUEST_MEMORY_CAPS` calls (memmgr tracks
@@ -214,8 +223,11 @@ addresses ride the entry register, and the stack/TLS/IPC VAs are
 declare are policy bounds — `DEFAULT_PROCESS_STACK_PAGES`,
 `MAX_PROCESS_STACK_PAGES`, `PROCESS_MAIN_TLS_MAX_PAGES`,
 `INIT_STACK_PAGES`, `INIT_INFO_MAX_PAGES` — not layout addresses. The
-draw windows and the degraded-fallback `DEFAULT_*` addresses live in
-`shared/process-layout` (shared by the kernel's `choose_init_layout`).
+draw windows and the per-process degraded-fallback `DEFAULT_*` addresses
+live in `shared/process-layout`, whose windows the kernel's
+`choose_init_layout` shares; init's fallback addresses
+(`DEFAULT_INIT_INFO_VA`, `DEFAULT_INIT_STACK_TOP`) are kernel constants in
+`mm::address_space`.
 
 See [`process-lifecycle.md`](process-lifecycle.md) for the full
 handover discipline.
@@ -223,9 +235,9 @@ handover discipline.
 ### Image Placement
 
 Userspace binaries are position-independent executables (`ET_DYN`; the
-kernel image is now static-PIE too, with the bootloader biasing its base
-per boot — KASLR,
-[#252](https://github.com/kottlerg/seraph/issues/252)). The creator
+kernel image is static-PIE too, with the bootloader biasing its base per
+boot — KASLR, [#252](https://github.com/kottlerg/seraph/issues/252); see
+[core/boot/docs/elf-loading.md](../core/boot/docs/elf-loading.md)). The creator
 draws a load bias per spawn from a fixed window of 2²³ page-aligned
 slots above `0x30_0000_0000` (23 bits of entropy; ASLR,
 [#39](https://github.com/kottlerg/seraph/issues/39)) — procmgr for its
@@ -233,7 +245,8 @@ children, init for memmgr and procmgr, the kernel for init itself — and
 applies the image's `RELATIVE` relocations while the segments are
 staged, before the process exists. Placement is validated before
 loading: the biased span must fit the window's 1 GiB image budget and
-stay below the user half. A failed entropy draw degrades to the window
+stay below `LAYOUT_VA_CEILING` (2³⁸, the Sv39 user half). A failed
+entropy draw degrades to the window
 base (never bias 0), keeping the single relocation path; loaders reject
 any relocation format other than the architecture's `RELATIVE` type,
 and every table record must land in exactly one loaded *writable*
@@ -266,8 +279,10 @@ memmgr serves frame requests over IPC. The contract:
 - **Best-effort reply.** One or more Memory caps whose page counts sum
   to `want_pages`. The reply carries each returned cap's page count
   alongside it. memmgr prefers fewer caps over many.
-- **No fixed cap-count ceiling.** Replies may use the full IPC
-  reply-side cap-slot capacity; there is no 4-cap limit.
+- **Reply cap-count bound.** A reply carries at most `MSG_CAP_SLOTS_MAX`
+  (4) Memory caps, the IPC reply-side cap-slot capacity; a best-effort
+  request no single free run covers is served largest-first across at
+  most that many runs, else fails with `OutOfMemoryBestEffort`.
 - **Caller maps.** Every returned Memory cap is mapped at a caller-
   chosen VA via `mem_map` (which already accepts a multi-page
   `page_count` argument).
@@ -294,13 +309,15 @@ owns them.
 - **Heap** — the kernel only sees mappings of Memory caps at user-
   supplied VAs.
 - **VA allocation policy** — the kernel enforces page alignment and
-  the user-half bound; it does not track or allocate VAs.
+  the user-half bound; it does not track VAs, and allocates none except
+  init's bootstrap layout and image bias, drawn once per boot.
 - **Memory ownership beyond the derivation tree** — the kernel does
   not know which process "owns" a Memory.
 - **Process death implications for memory** — when a process's
   `AddressSpace` is revoked, the kernel tears down threads and page
   tables. memmgr's reclamation runs separately, driven by procmgr's
-  death notification.
+  death notification. See [Process Lifecycle](process-lifecycle.md)
+  § Process Death.
 
 The userspace process abstraction itself is owned by
 [`architecture.md`](architecture.md) §"Kernel Primitives vs.
@@ -312,18 +329,23 @@ the client through the page-reservation allocator.
 
 Lazy or demand backing of a reservation — mapping frames only on first
 access rather than up front — is a userspace-pager policy built on the
-fault-handler protocol ([Fault Handling](fault-handling.md); specified, not
-yet implemented), not a kernel feature.
+fault-handler protocol ([Fault Handling](fault-handling.md)), not a kernel
+feature. memmgr implements it as the pager: a process reserves and
+registers a range via `std::os::seraph::register_demand_paged`, and memmgr
+maps a frame on each first-touch fault.
 
 ---
 
 ## Summarized By
 
-[README.md](../README.md), [Memory Model](memory-model.md),
-[Architecture Overview](architecture.md), [memmgr/README.md](../services/memmgr/README.md),
-[procmgr/README.md](../services/procmgr/README.md),
-[ruststd/README.md](../runtime/ruststd/README.md),
-[process-layout/README.md](../shared/process-layout/README.md),
-[Capability Model](capability-model.md), [Process Lifecycle](process-lifecycle.md),
-[memmgr/docs/memory-pool.md](../services/memmgr/docs/memory-pool.md),
-[System Bootstrap](bootstrap.md), [Fault Handling](fault-handling.md)
+[abi/init-protocol/README.md](../abi/init-protocol/README.md),
+[Kernel Entropy Subsystem](../core/kernel/docs/entropy.md),
+[Kernel Initialization Sequence](../core/kernel/docs/initialization.md),
+[Architecture Overview](architecture.md), [Capability Model](capability-model.md),
+[Memory Model](memory-model.md), [Process Lifecycle](process-lifecycle.md),
+[runtime/ruststd/README.md](../runtime/ruststd/README.md),
+[services/memmgr/README.md](../services/memmgr/README.md),
+[memmgr Memory Pool](../services/memmgr/docs/memory-pool.md),
+[services/procmgr/README.md](../services/procmgr/README.md),
+[shared/process-layout/README.md](../shared/process-layout/README.md),
+[xtask/README.md](../xtask/README.md)

@@ -6,24 +6,29 @@ svcmgr launches and supervises logd post-handover, minting its bootstrap
 round from the reserved log-sink sources init endows (see
 [`services/svcmgr/docs/service-definitions.md`](../svcmgr/docs/service-definitions.md)).
 logd assumes the receive side of the kernel endpoint that init-logd has
-been draining since boot, ingests init-logd's captured history,
-subscribes to procmgr's death-notification cascade, and from then on is
-the single owner of every log line emitted by every userspace process.
+been draining since boot, ingests init-logd's captured history (see
+[`docs/handover-protocol.md`](docs/handover-protocol.md)), subscribes to
+procmgr's death-notification cascade, and from then on is the single owner
+of every log line emitted by every userspace process.
 It is restartable (`restart = on_failure`): svcmgr holds the master-log
 endpoint source for the system's life, so a restarted logd re-attaches a
 fresh RECV to the same endpoint object every sender already targets; only
-the one-time init-logd history pull is skipped on restart.
+the one-time init-logd history pull
+([`docs/handover-protocol.md`](docs/handover-protocol.md)) is skipped on
+restart.
 
 ## Role
 
 * **Receiver of the master log endpoint.** Every userspace process
   holds a pre-installed badged SEND cap on the same kernel endpoint
   (seeded into `ProcessInfo.log_send_cap` by procmgr at spawn time;
-  see [`services/procmgr/src/process.rs`](../procmgr/src/process.rs)).
+  see [docs/process-lifecycle.md](../../docs/process-lifecycle.md) and
+  [`services/procmgr/src/process.rs`](../procmgr/src/process.rs)).
   Across the init-logd → real-logd handover the kernel endpoint
   object is unchanged — only the holder of the RECV cap changes —
   so every pre-existing badged SEND cap continues to work without
-  re-derivation or re-registration.
+  re-derivation or re-registration (see
+  [`docs/handover-protocol.md`](docs/handover-protocol.md)).
 
 * **Driver-mediated serial writer.** logd emits received log lines
   and its own diagnostics through the userspace serial driver
@@ -49,6 +54,7 @@ the one-time init-logd history pull is skipped on restart.
   to a no-op when no framebuffer driver is present (headless boot),
   leaving serial the authoritative channel; the resolution is attempted
   exactly once so a headless boot does not re-query devmgr per line.
+  See [docs/console-model.md](../../docs/console-model.md).
 
 * **History buffer.** logd maintains a per-sender ring of completed
   log lines, populated by every `STREAM_BYTES`-derived flush and
@@ -64,9 +70,12 @@ the one-time init-logd history pull is skipped on restart.
   (authorised by the `DEATH_EQ_AUTHORITY` badged SEND cap svcmgr mints
   into logd's bootstrap round). Procmgr binds that EQ as an
   additional death observer on every existing thread and on every
-  future spawn. When a process exits, logd's EQ receives
+  future spawn (see
+  [`services/procmgr/docs/ipc-interface.md`](../procmgr/docs/ipc-interface.md)).
+  When a process exits, logd's EQ receives
   `(process_badge << 32) | exit_reason`; logd evicts the matching
-  slot from its hash-keyed badge table. This is the slot-table
+  slot from its hash-keyed badge table (see
+  [`docs/ipc-interface.md`](docs/ipc-interface.md)). This is the slot-table
   scale + reclamation work folded into the same service per issue
   [#1](https://github.com/kottlerg/seraph/issues/1).
 
@@ -97,12 +106,14 @@ logd/
 
 svcmgr's bootstrap round (one round, `done = true`) delivers four caps,
 minted from the reserved log-sink sources svcmgr holds (master-log
-endpoint, procmgr `SEND|GRANT`, devmgr registry):
+endpoint, procmgr `SEND|GRANT`, devmgr registry; see
+[`services/svcmgr/docs/service-definitions.md`](../svcmgr/docs/service-definitions.md)
+and [`docs/ipc-interface.md`](docs/ipc-interface.md)):
 
 | Index | Cap |
 |---|---|
 | 0 | RECV on the master log endpoint |
-| 1 | SEND on the master log endpoint (single-use; carries `HANDOVER_PULL` for the history drain then the terminal `HANDOVER_RELEASE`, then deleted). `0` on a restart — there is no init-logd left to pull from, so logd skips the handover |
+| 1 | SEND on the master log endpoint (single-use; carries `HANDOVER_PULL` for the history drain then the terminal `HANDOVER_RELEASE`, then deleted; see [`docs/ipc-interface.md`](docs/ipc-interface.md)). `0` on a restart — there is no init-logd left to pull from, so logd skips the handover |
 | 2 | Badged SEND on procmgr's service endpoint carrying `DEATH_EQ_AUTHORITY` |
 | 3 | Badged SEND on devmgr's registry endpoint carrying `REGISTRY_QUERY_AUTHORITY` (to resolve the serial driver via `QUERY_SERIAL_DEVICE` and the framebuffer driver via `QUERY_FRAMEBUFFER_DEVICE`) |
 
@@ -133,5 +144,5 @@ driver's.
 
 ## Summarized By
 
-[Architecture Overview](../../docs/architecture.md), [System Bootstrap](../../docs/bootstrap.md),
-[Console Model](../../docs/console-model.md)
+[Architecture Overview](../../docs/architecture.md), [Console Model](../../docs/console-model.md),
+[`.svc` Service Definitions](../svcmgr/docs/service-definitions.md)

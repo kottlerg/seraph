@@ -58,9 +58,9 @@ The floor has two layers. A platform MUST satisfy both.
 The psABI feature level the userspace toolchain emits, owned by the target JSONs
 ([build-system.md](build-system.md#custom-targets)):
 
-- **x86-64**: x86-64-v3 (AVX2, BMI1/2, FMA, MOVBE, F16C, LZCNT, POPCNT, plus XSAVE) — Haswell-class
-  instruction selection.
-- **riscv64**: RVA23U64 (RV64GCV plus Zba/Zbb/Zbs).
+- **x86-64**: x86-64-v3 (AVX, AVX2, BMI1/2, FMA, MOVBE, F16C, LZCNT, POPCNT, CMPXCHG16B, plus
+  XSAVE) — Haswell-class instruction selection.
+- **riscv64**: the RVA23U64 subset RV64GCV plus Zba/Zbb/Zbs.
 
 ### Platform / silicon-era floor
 
@@ -81,7 +81,9 @@ The instruction baseline alone does not pin a platform generation. The platform 
 Each feature is classified per architecture as one of:
 
 - **Required** — the kernel MUST have it; the boot-time feature-gate (or a subsystem's own boot
-  assertion) refuses hardware that lacks it. W^X, isolation, and the floor depend on these.
+  assertion) refuses hardware that lacks it, except where
+  [§ Boot-Time Feature Gate](#boot-time-feature-gate) names a feature as deliberately ungated or
+  not CPU-detectable. W^X, isolation, and the floor depend on these.
 - **Opportunistic** — used when present, not required. Absence degrades performance or a
   non-essential capability, never correctness.
 - **Unsupported** — not used, and in some cases actively refused. Listed so absence is never
@@ -93,8 +95,8 @@ Each feature is classified per architecture as one of:
 
 ### Required
 
-- **Instruction baseline** — the x86-64-v3 set above (AVX2, BMI1/2, FMA, MOVBE, F16C, LZCNT,
-  POPCNT, CMPXCHG16B) and `XSAVE`.
+- **Instruction baseline** — the x86-64-v3 set above (AVX, AVX2, BMI1/2, FMA, MOVBE, F16C,
+  LZCNT, POPCNT, CMPXCHG16B) and `XSAVE`.
 - **Long mode, `SYSCALL`/`SYSRET`, `NX` (`EFER.NXE`)** — the privilege and W^X substrate. The
   kernel sets bit 63 on non-executable PTEs; `NX` is mandatory.
 - **`CR0.WP`** — supervisor write-protect. Without it, ring-0 writes bypass read-only page
@@ -107,7 +109,8 @@ Each feature is classified per architecture as one of:
 - **8254 PIT** — used once at boot to calibrate the TSC (and the local-APIC timer for the
   periodic-fallback tick path).
 - **Local APIC and an I/O APIC** — interrupt delivery and routing.
-- **CPUID extended-topology leaf 0x0B** — SMT/topology enumeration.
+- **CPUID extended-topology leaf 0x0B** — the source of the BSP's full 32-bit x2APIC ID (CPU
+  topology itself comes from the ACPI MADT).
 - **`RDRAND` and `RDSEED`** — hardware entropy sources seeded into the kernel CSPRNG.
 - **In-silicon transient-execution mitigations** (MDS, L1TF, and the rest of the ~2019 set) — a
   consequence of the platform floor. Their per-vulnerability enforcement is a hardening concern and
@@ -122,8 +125,8 @@ Each feature is classified per architecture as one of:
 
 - **x2APIC mode** — used when present (and required to address more than 255 CPUs); the kernel
   falls back to xAPIC MMIO.
-- **AES-NI and SHA-NI** — crypto acceleration.
-- **CET (shadow stack / IBT)** — control-flow integrity, when enabled.
+- **AES-NI and SHA-NI** — crypto acceleration (design intent; not yet enabled).
+- **CET (shadow stack / IBT)** — control-flow integrity (design intent; not yet enabled).
 - **TSC-deadline timer mode** — drives the preemption tick when present; the periodic APIC
   timer is the fallback.
 - **EFI_RNG_PROTOCOL** — an additional boot entropy seed.
@@ -147,20 +150,23 @@ Each feature is classified per architecture as one of:
 ### Required
 
 - **Instruction baseline** — RV64GCV plus Zba/Zbb/Zbs. The Vector extension is a hard requirement;
-  the kernel refuses a hart reporting `vlenb == 0`.
+  the kernel reads `vlenb` on the boot hart and refuses `vlenb == 0` or `vlenb` above `MAX_VLENB`
+  (VLEN 512).
 - **Supervisor isolation — `SUM` and PMP** — supervisor-user access control and physical-memory
   protection (PMP is established by M-mode firmware). See [memory-model.md](memory-model.md).
 - **ASID-tagged TLBs** — the `satp` ASID field, the RISC-V counterpart of PCID; see
   [memory-model.md](memory-model.md).
-- **AIA — Ssaia, with APLIC and IMSIC** — the interrupt controller. PLIC is unsupported.
+- **PLIC** — the interrupt controller the kernel drives (base from `BootInfo.kernel_mmio`). AIA
+  (Ssaia, APLIC, IMSIC) is not yet supported.
 - **Sstc — `stimecmp`** — the supervisor timer.
 - **Svpbmt, Svinval, Svnapot** — page-based memory types, fine-grained fence invalidation, and
-  NAPOT page encodings; asserted at paging initialization from the bootloader-confirmed hart
-  capabilities. Svade is the baseline A/D-bit model.
-- **Ssstateen / Smstateen** — state-enable CSRs, required for the hardening posture.
+  NAPOT page encodings; asserted by `paging::verify_paging_extensions`, before the first
+  userspace mapping, from the bootloader-confirmed hart capabilities. Svade is the baseline A/D-bit
+  model.
 - **`time` CSR (Zicntr)** — the timestamp source.
 - **Address translation**: one of Sv39/Sv48/Sv57, negotiated at boot (DTB
-  `mmu-type` plus a `satp` write-probe; the widest confirmed mode wins). Sv39
+  `mmu-type` claim, confirmed by a `satp` write-probe that falls back to the next-narrower mode;
+  see [core/boot/docs/page-tables.md](../core/boot/docs/page-tables.md#mode-negotiation)). Sv39
   is the RVA23 mandatory minimum and the refusal floor; Sv48 is the standing
   default in CI and development.
 - **UEFI firmware over an SBI (M-mode) implementation; a device tree or ACPI** — the boot and
@@ -173,7 +179,7 @@ Each feature is classified per architecture as one of:
 - **Svadu** — hardware A/D-bit updates (Svade is the required baseline).
 - **Sv57** — a larger-VA expansion above the Sv48 default; used when the
   platform advertises and the probe confirms it.
-- **Zvk vector crypto** — crypto acceleration.
+- **Zvk vector crypto** — crypto acceleration (design intent; not yet enabled).
 - **EFI_RNG_PROTOCOL** — the boot seed's only firmware source under the EDK2 firmware the
   default boot uses, exposed through the firmware's `VirtioRngDxe` binding `virtio-rng`;
   firmware that delivers a DTB may supply `/chosen/rng-seed` instead, and with neither the pool
@@ -182,7 +188,8 @@ Each feature is classified per architecture as one of:
 
 ### Unsupported
 
-- **PLIC** — replaced by AIA, no fallback.
+- **AIA (Ssaia, APLIC, IMSIC)** — not yet supported; the kernel drives a PLIC.
+- **Ssstateen / Smstateen** — not used; the kernel does not program the state-enable CSRs.
 - **Legacy / embedded RISC-V profiles** — outside the RVA23 floor.
 - **Port-mapped I/O** — RISC-V has no port I/O; all device access is MMIO.
 - **Cache-block-management instructions (Zicbom/Zicboz/Zicbop)** — not used; the kernel assumes
@@ -202,7 +209,8 @@ is a platform/chipset feature whose presence and usability vary across the envel
 disable it, fuse it off, or omit it on consumer boards and handhelds — so requiring it would exclude
 in-envelope hardware.
 
-The IOMMU is discovered and programmed by the userspace device manager, not the kernel. When an
+The IOMMU is discovered and programmed by the userspace device manager, not the kernel (design
+intent; not yet implemented, so DMA currently runs unconfined). When an
 IOMMU is present and configured, device DMA is confined to explicitly mapped frames; when it is
 absent or unconfigured, DMA is unconfined (a degraded mode). The authoritative DMA safety model is
 in [device-management.md](device-management.md).
@@ -223,12 +231,12 @@ feature it halts with a message naming the specific feature, rather than failing
   kernel retains a full-flush fallback), invariant TSC (a frequency-stability guarantee; the kernel
   calibrates the TSC against the PIT), and the vendor-specific in-silicon mitigations.
 - **riscv64**: required features are asserted where each is safely detectable from supervisor mode —
-  SBI presence at the gate, and the Vector extension and the ASID-tagged TLB at their initialization
-  sites (a hart lacking either is refused; emulated RISC-V provides ASID, so unlike x86-64 PCID this
-  is gated). Extension requirements introduced by a subsystem (the interrupt controller, the timer,
-  the paging extensions) are asserted by that subsystem at its own initialization — the timer, for
-  example, refuses to boot unless the bootloader confirmed Sstc (and a timebase frequency) for every
-  hart from the firmware tables (ACPI RHCT, or the DTB `/cpus` nodes).
+  the SBI HSM extension at the gate, and the Vector extension and the ASID-tagged TLB at their
+  initialization sites (the boot hart is refused without V, and every hart without ASIDs; emulated
+  RISC-V provides ASID, so unlike x86-64 PCID this is gated). Extension requirements introduced by
+  a subsystem (the timer, the paging extensions) are asserted by that subsystem during boot — the
+  timer, for example, refuses to boot unless the bootloader confirmed Sstc (and a timebase
+  frequency) for every hart from the firmware tables (ACPI RHCT, or the DTB `/cpus` nodes).
 
 Platform features that are not CPU-detectable (the PIT, UEFI, ACPI/DTB, the UART) are not probed by
 the gate; their absence manifests as a boot failure on the discovery path they feed.
@@ -237,13 +245,15 @@ the gate; their absence manifests as a boot failure on the discovery path they f
 
 ## Platform Limits
 
-Independent of the feature classification, the kernel imposes two fixed platform limits on both
-architectures:
+Independent of the feature classification, the kernel imposes fixed platform limits:
 
-- **Page size** is 4 KiB.
+- **Page size** is 4 KiB ([memory-model.md](memory-model.md)).
 - **Maximum RAM** is approximately 248 GiB. The kernel's boot-time direct-map pool is a fixed-size
   table sized for that ceiling; a platform with more RAM is refused at boot
   (`core/kernel/src/mm/paging.rs`).
+- **CPU count** is at most `MAX_CPUS` (512, [`abi/boot-protocol/`](../abi/boot-protocol/)); CPUs
+  beyond it are not brought up.
+- **riscv64 vector length** is at most VLEN 512 (`MAX_VLENB`); a wider boot hart is refused at boot.
 
 ---
 
@@ -259,8 +269,8 @@ required-vs-opportunistic rule are architecture-neutral and unchanged.
 
 ## Summarized By
 
-[README.md](../README.md), [Architecture Overview](architecture.md),
-[Memory Model](memory-model.md), [Build System](build-system.md),
-[Kernel Initialization](../core/kernel/docs/initialization.md),
+[Page Tables](../core/boot/docs/page-tables.md),
 [Architecture Abstraction Layer](../core/kernel/docs/arch-interface.md),
-[Page Tables](../core/boot/docs/page-tables.md)
+[Kernel Initialization Sequence](../core/kernel/docs/initialization.md),
+[Architecture Overview](architecture.md), [Build System](build-system.md),
+[Memory Model](memory-model.md)

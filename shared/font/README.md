@@ -13,4 +13,4 @@ console. No stability obligation.
 
 ## Summarized By
 
-None
+[Early Console](../../core/boot/docs/console.md)

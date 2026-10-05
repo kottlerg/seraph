@@ -65,7 +65,8 @@ requests Memory caps from memmgr via `memmgr_labels::REQUEST_MEMORY_CAPS` on
 `ProcessInfo.memmgr_endpoint_cap`, mapping them at a contiguous VA above the
 heap's high-water mark with a single multi-page `mem_map` per returned cap.
 The bootstrap heap is allocated by `std::os::seraph::_start` before
-`fn main()` runs; OOM panics the thread.
+`fn main()` runs; OOM panics the thread. See
+[§ Byte Heap](../../docs/userspace-memory-model.md#byte-heap).
 
 ### Page reservations
 
@@ -92,14 +93,16 @@ The arena is carved out of the process's address space on first use, at a
 base drawn per process from a fixed 64 GiB window via `SYS_GETRANDOM`
 (ASLR, [#39](https://github.com/kottlerg/seraph/issues/39); deterministic
 default only if the draw fails). The caller owns `mem_map`/`mem_unmap`;
-the allocator only manages VA space.
+the allocator only manages VA space. See
+[§ Page Reservations](../../docs/userspace-memory-model.md#page-reservations).
 
 ### Bootstrap-cross-boundary VAs
 
 `_start` reads `ProcessInfo` to learn the IPC-buffer VA, the memmgr/procmgr
 endpoint slots, and other parent-chosen state. It does not allocate these
 VAs — procmgr (or for init, the kernel) chose them. Subsequent foreign
-mappings go through the page-reservation allocator above.
+mappings go through the page-reservation allocator above. See
+[§ Bootstrap Cross-Boundary VAs](../../docs/userspace-memory-model.md#bootstrap-cross-boundary-vas).
 
 ---
 
@@ -174,4 +177,7 @@ require a POSIX layer; it maps directly onto Seraph primitives.
 
 ## Summarized By
 
-None
+[abi/process-abi/README.md](../../abi/process-abi/README.md),
+[Namespace Model](../../docs/namespace-model.md), [Storage](../../docs/storage.md),
+[runtime/libc/README.md](../libc/README.md),
+[`.svc` Service Definitions](../../services/svcmgr/docs/service-definitions.md)

@@ -449,8 +449,8 @@ pub struct UniversalCaps
 ///
 /// `blob` is a concatenation of `count` NUL-terminated UTF-8 strings. Empty
 /// slice + zero count means "no argv". The blob format and its page-remainder
-/// bound are defined by the `ProcessInfo::args_offset` / `args_count` field
-/// docs in `abi/process-abi/src/lib.rs`.
+/// bound are defined by the argv section comment above
+/// `ProcessInfo::args_offset` in `abi/process-abi/src/lib.rs`.
 #[derive(Clone, Copy, Default)]
 pub struct ChildArgs<'a>
 {

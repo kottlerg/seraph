@@ -8,8 +8,8 @@
 //! Storage model: a process-global `Mutex<BTreeMap<OsString, OsString>>` lazily
 //! initialised on first access. The seed source is `StartupInfo::env_blob` (a
 //! concatenation of NUL-terminated UTF-8 `KEY=VALUE` strings written by the
-//! spawner into the read-only `ProcessInfo` page; format defined by the
-//! `ProcessInfo::env_offset` / `env_count` field docs in
+//! spawner into the read-only `ProcessInfo` page; format defined by the env
+//! section comment above `ProcessInfo::env_offset` in
 //! `abi/process-abi/src/lib.rs`), after which `set_var` / `remove_var` mutate
 //! the map in place.
 //!

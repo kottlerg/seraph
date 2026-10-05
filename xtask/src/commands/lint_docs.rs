@@ -448,6 +448,13 @@ fn header_violation(path: &str, text: &str) -> Option<(usize, String)>
                     "crate attribute precedes the `//!` block".into(),
                 ));
             }
+            Some(l) if l.trim().is_empty() =>
+            {
+                return Some((
+                    path_idx + 3,
+                    "exactly one blank line separates the path line from the `//!` block".into(),
+                ));
+            }
             _ => return Some((path_idx + 3, "missing `//!` description".into())),
         }
     }
@@ -756,15 +763,36 @@ mod tests
     }
 
     #[test]
-    fn header_requires_blank_line_then_doc_after_path_line()
+    fn header_rejects_description_adjacent_to_the_path_line()
     {
         let adjacent = "// SPDX-License-Identifier: GPL-2.0-only\n// (C)\n\n// a.rs\n//! Doc.\n";
-        assert_eq!(header_violation("a.rs", adjacent).map(|(l, _)| l), Some(5));
+        assert_eq!(
+            header_violation("a.rs", adjacent),
+            Some((5, "path line must be followed by a blank line".to_owned()))
+        );
+    }
+
+    #[test]
+    fn header_rejects_a_comment_between_the_path_line_and_the_description()
+    {
         let note_first =
             "// SPDX-License-Identifier: GPL-2.0-only\n// (C)\n\n// a.rs\n\n// note\n//! Doc.\n";
         assert_eq!(
-            header_violation("a.rs", note_first).map(|(l, _)| l),
-            Some(6)
+            header_violation("a.rs", note_first),
+            Some((6, "missing `//!` description".to_owned()))
+        );
+    }
+
+    #[test]
+    fn header_rejects_a_doubled_blank_line_before_the_description()
+    {
+        let doubled = "// SPDX-License-Identifier: GPL-2.0-only\n// (C)\n\n// a.rs\n\n\n//! Doc.\n";
+        assert_eq!(
+            header_violation("a.rs", doubled),
+            Some((
+                6,
+                "exactly one blank line separates the path line from the `//!` block".to_owned()
+            ))
         );
     }
 
@@ -772,14 +800,27 @@ mod tests
     fn header_rejects_missing_path_line()
     {
         let eof = "// SPDX-License-Identifier: GPL-2.0-only\n// (C)\n\n";
-        assert!(header_violation("a.rs", eof).is_some());
+        assert_eq!(
+            header_violation("a.rs", eof),
+            Some((3, "missing path line `// a.rs`".to_owned()))
+        );
     }
 
     #[test]
-    fn front_matter_length_covers_absent_closed_and_unclosed_blocks()
+    fn front_matter_is_absent_without_a_leading_rule()
     {
         assert_eq!(front_matter_len("# T\n"), 0);
+    }
+
+    #[test]
+    fn closed_front_matter_spans_its_lines()
+    {
         assert_eq!(front_matter_len("---\nname: x\n---\n# T\n"), 3);
+    }
+
+    #[test]
+    fn unclosed_front_matter_is_not_skipped()
+    {
         assert_eq!(front_matter_len("---\nname: x\n# T\n"), 0);
     }
 

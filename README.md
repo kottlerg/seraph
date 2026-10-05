@@ -29,15 +29,18 @@ see there for the authoritative statement.
 
 | Directory | Purpose |
 |---|---|
-| `abi/` | Stable cross-boundary contracts |
-| `core/` | Core OS: bootloader, kernel, and the kernel-validation harness (ktest) |
+| `.cargo/` | Cargo configuration: the `cargo xtask` alias |
+| `.claude/` | Assistant operating instructions, agents, and workflows (outside the documentation hierarchy) |
+| `.github/` | CI workflows and Issue and PR templates (outside the documentation hierarchy) |
+| [`abi/`](abi/README.md) | Stable cross-boundary contracts |
+| [`core/`](core/README.md) | Core OS: bootloader, kernel, and the kernel-validation harness (ktest) |
 | `docs/` | Architecture and design documentation |
-| `programs/` | General-purpose userspace applications and utilities |
-| `rootfs/` | System files installed into the sysroot during builds (config files, etc) |
-| `runtime/` | Language runtime layers consumed by userspace (libc, ruststd) |
-| `services/` | Userspace OS processes: managers, drivers, filesystems, daemons |
-| `shared/` | Shared utility crates |
-| `xtask/` | Build task runner (`cargo xtask`); custom target JSON specs under `xtask/targets/` |
+| [`programs/`](programs/README.md) | General-purpose userspace applications and utilities |
+| [`rootfs/`](rootfs/README.md) | System files installed into the sysroot during builds (config files, etc) |
+| [`runtime/`](runtime/README.md) | Language runtime layers consumed by userspace (libc, ruststd) |
+| [`services/`](services/README.md) | Userspace OS processes: managers, drivers, filesystems, daemons |
+| [`shared/`](shared/README.md) | Shared utility crates |
+| [`xtask/`](xtask/README.md) | Build task runner (`cargo xtask`); custom target JSON specs under `xtask/targets/` |
 
 ## Usage
 

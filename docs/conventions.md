@@ -217,11 +217,11 @@ are forbidden; `master` MUST NOT receive force pushes.
   the pre-merge review reports it as out of bound, and it is appended, with
   file, line, authority, and fix, to the open audit Issue for that surface
   (or to a new one, filed with the maintainer's approval) before the merge
-  prompt. Nothing found is dropped. Work an open Issue already names, filed
-  with the maintainer's approval, is off the surface of every other PR; a
-  finding on it is recorded against that Issue. A finding two independent
-  refuters refute on evidence is dropped and listed in the report's Dropped
-  section; every other finding is fixed or recorded.
+  prompt. No finding is dropped for being off the surface. Work an open
+  Issue already names, filed with the maintainer's approval, is off the
+  surface of every other PR; a finding on it is recorded against that Issue.
+  A finding two independent refuters refute on evidence is dropped and listed
+  in the report's Dropped section; every other finding is fixed or recorded.
 
 ### Branch naming
 

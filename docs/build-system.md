@@ -266,10 +266,9 @@ All build, run, clean, and test operations go through `cargo xtask`. The
 authoritative command reference — every subcommand, every flag, expected
 behavior — lives in [`xtask/README.md`](../xtask/README.md).
 
-The available subcommands are `build`, `run`, `run-parallel`, `clean`, and
-`test`. `build` and `run` are intentionally decoupled: `run` is a pure
-runner and does not build, so a typical workflow is `cargo xtask build`
-followed by `cargo xtask run` (or `cargo xtask run-parallel` for stress).
+`build` and `run` are intentionally decoupled: `run` is a pure runner and
+does not build, so a typical workflow is `cargo xtask build` followed by
+`cargo xtask run` (or `cargo xtask run-parallel` for stress).
 
 ---
 

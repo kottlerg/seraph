@@ -3,6 +3,7 @@
 @../README.md
 
 ## Authority
+Per [docs/documentation-standards.md](../docs/documentation-standards.md) § Document Hierarchy:
 - System-wide design and architectural invariants are defined exclusively in `docs/`.
 - Each component’s `README.md` defines that component’s scope, role, and links to any authoritative
   design documents.
@@ -28,7 +29,9 @@ branch/PR workflow, CI gating, and release production. Treat its rules as the so
 truth for "how work is tracked and shipped" on this project.
 
 ## Operating procedure
-- Documentation MUST be consumed by scope:
+- Documentation MUST be consumed in the order of the authoritative scopes
+  [docs/documentation-standards.md](../docs/documentation-standards.md) § Document Hierarchy
+  defines (grouping READMEs and the root README only route to them):
   1. System scope (`docs/`)
   2. Component scope (`<component>/README.md`)
   3. Component design scope (`<component>/docs/*.md`)
@@ -37,7 +40,8 @@ truth for "how work is tracked and shipped" on this project.
 ## Tooling constraints
 - All build, run, clean, and test actions MUST be performed via `cargo xtask` commands
   (per [docs/build-system.md](../docs/build-system.md) § Convenience Commands).
-- Direct invocation of `cargo build`, `cargo run`, `cargo test`, or `cargo clippy` is forbidden.
+- Direct invocation of `cargo build`, `cargo run`, `cargo test`, or `cargo clippy` is forbidden
+  (same section).
 - When switching architectures, `cargo xtask clean` MUST be run first
   (per [docs/build-system.md](../docs/build-system.md) § Build Output: the Sysroot).
 
@@ -68,7 +72,8 @@ truth for "how work is tracked and shipped" on this project.
   PR number as scope and the open Issue list (`gh issue list --state
   open --limit 500 --json number,title`), and the same verdict handling.
 
-  Findings on the review surface are fixed as one batch per run, whatever
+  Per [docs/conventions.md](../docs/conventions.md) § Branch and PR
+  Workflow, findings on the review surface are fixed as one batch per run, whatever
   their severity, and findings off it are recorded in the same pass:
   reviewer findings on the surface via commits, reviewer findings off it
   via `gh issue edit` on the open Issue that already names the work, else
@@ -91,10 +96,12 @@ truth for "how work is tracked and shipped" on this project.
   `delta` mode. Prompt for the merge decision only when a run completes
   with no failed agent, `READY TO MERGE`, and `AUDIT PASS` (the reviewer
   verdict counts findings on the surface; recorded off-surface findings do
-  not block). Merge via `gh pr merge <N> --merge --delete-branch`.
+  not block). Merge via `gh pr merge <N> --merge --delete-branch` (per
+  [docs/conventions.md](../docs/conventions.md) § Merge method).
 - On red: surface the failing job's tail (`gh run view <run-id> --log-failed`
   or equivalent) so the user can see the actual error without asking.
-- The assistant MUST NOT merge a PR while its CI run is pending or failing.
+- The assistant MUST NOT merge a PR while its CI run is pending or failing (CI gates
+  merge, per [docs/conventions.md](../docs/conventions.md) § Branch and PR Workflow).
   Merge is the user's call; the assistant prepares the merge but does not
   execute it without explicit instruction.
 

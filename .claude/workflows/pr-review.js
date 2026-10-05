@@ -975,7 +975,8 @@ const RENDER_EVIDENCE_CHARS = 400
 const RENDER_VOTE_CHARS = 240
 const clip = (s, n) => (s.length > n ? s.slice(0, n) + '…' : s)
 // The reviewer's evidence is clipped; the script's own annotations (placement,
-// Issue adoption, unjudged claims) follow it whole, so the report shows them.
+// Issue adoption, an Issue named after verification began, unjudged claims)
+// follow it whole, so the report shows them.
 function for_render(f) {
     const { annotations, ...rest } = f
     return {

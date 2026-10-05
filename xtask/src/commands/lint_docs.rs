@@ -218,15 +218,13 @@ fn is_authoritative(path: &str) -> bool
 
 // ── md-columns ────────────────────────────────────────────────────────────────
 
-/// A line that is one link, image, or badge construct (optionally a list item,
-/// optionally followed by sentence punctuation): the URL cannot break, so the
-/// column limit exempts it (docs/coding-standards.md § Markdown).
 /// The regular expressions the rules share, compiled once per run.
 struct Patterns
 {
     /// A line that is one link, image, or badge construct (optionally a list
-    /// item, optionally followed by sentence punctuation): the URL cannot
-    /// break, so the column limit exempts it (docs/coding-standards.md § Markdown).
+    /// item, optionally followed by sentence punctuation or closing
+    /// parentheses): the URL cannot break, so the column limit exempts it
+    /// (docs/coding-standards.md § Markdown).
     link_only: Regex,
     /// A `(see <name>.md)` citation outside link syntax.
     bare_cite: Regex,
@@ -241,7 +239,7 @@ impl Patterns
     {
         Ok(Self {
             link_only: Regex::new(
-                r"^\s*(?:[-*+]\s+|\d+\.\s+)?(?:!?\[!?\[[^\]]*\]\([^)]*\)\]\([^)]*\)|!?\[[^\]]*\]\([^)]*\)|<?https?://\S+>?)[.,;:)]*\s*$",
+                r"^\s*(?:[-*+]\s+|\d+[.)]\s+)?(?:!?\[!?\[[^\]]*\]\([^)]*\)\]\([^)]*\)|!?\[[^\]]*\]\([^)]*\)|<?https?://\S+>?)[.,;:!?)]*\s*$",
             )?,
             bare_cite: Regex::new(r"\(see [A-Za-z0-9_./-]+\.md\)")?,
             md_link: Regex::new(r"\[(?:!\[[^\]]*\]\([^)]*\)|[^\]]*)\]\(([^)\s]+)\)")?,
@@ -937,6 +935,14 @@ mod tests
     {
         let long = "x".repeat(101);
         let text = format!("![a](https://e/{long})\n+ [t](x.md#{long})\n");
+        assert!(check_columns(&pat(), &md("a.md", &text)).is_empty());
+    }
+
+    #[test]
+    fn link_lines_with_paren_list_markers_or_question_and_exclamation_marks_are_exempt()
+    {
+        let long = "x".repeat(101);
+        let text = format!("1) [t](x.md#{long})?\n2. [t](x.md#{long})!\n");
         assert!(check_columns(&pat(), &md("a.md", &text)).is_empty());
     }
 

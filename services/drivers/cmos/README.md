@@ -7,8 +7,8 @@ Installed to `/services/drivers/cmos-rtc` on the rootfs. Spawned by
 devmgr on x86-64 platforms via the non-PCI simple-device path
 ([Device Management](../../../docs/device-management.md#driver-binary-sources)),
 `procmgr_labels::CREATE_FROM_FILE` against a vfsd file SEND devmgr
-walks to from the `/services/drivers/` subtree cap init delivers
-post-vfsd-mount via `devmgr_labels::SET_DRIVERS_DIR`.
+walks to from the `LOOKUP | READ` `/services/drivers/` subtree cap svcmgr
+delivers post-handover via `devmgr_labels::SET_DRIVERS_DIR`.
 [devmgr](../../devmgr/README.md) owns the
 driver's service endpoint and mints client SEND caps on
 `devmgr_labels::QUERY_RTC_DEVICE`, each badged with

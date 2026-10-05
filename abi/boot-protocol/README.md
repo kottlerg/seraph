@@ -64,8 +64,6 @@ A compliant bootloader MUST, before jumping to the kernel entry point:
 A compliant bootloader MUST NOT:
 
 - Leave UEFI boot services active at kernel entry.
-- Map any region as both writable and executable (see
-  [docs/memory-model.md](../../docs/memory-model.md) § W^X Enforcement).
 - Assume anything about the kernel's internal layout beyond the ELF
   headers.
 - Include in `BootInfo.mmio_apertures` any region that is inaccessible

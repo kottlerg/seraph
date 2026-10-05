@@ -171,7 +171,7 @@ stay unbiased link VAs — the kernel draws the load bias and applies the
 `RELATIVE` relocations itself (the kernel, not the bootloader, owns the
 layout draw; see
 [initialization.md](../../kernel/docs/initialization.md#phase-9-init-creation-and-scheduler-entry),
-`kernel/src/mm/init_reloc.rs`, and ASLR
+[`core/kernel/src/mm/init_reloc.rs`](../../kernel/src/mm/init_reloc.rs), and ASLR
 [#39](https://github.com/kottlerg/seraph/issues/39)). An `ET_DYN` image
 whose dynamic section describes any other relocation format
 (`DT_REL`/`DT_RELR`/active `DT_JMPREL`) is rejected as invalid.
@@ -223,4 +223,6 @@ ordinal ([init bootstrap.md](../../../services/init/docs/bootstrap.md#initial-cs
 
 [core/boot/README.md](../README.md), [Boot Flow](boot-flow.md), [Page Tables](page-tables.md),
 [UEFI Environment](uefi-environment.md), [System Bootstrap](../../../docs/bootstrap.md),
-[Userspace Memory Model](../../../docs/userspace-memory-model.md)
+[Testing](../../../docs/testing.md),
+[Userspace Memory Model](../../../docs/userspace-memory-model.md),
+[shared/elf/README.md](../../../shared/elf/README.md)

@@ -53,8 +53,8 @@ discipline below has been applied end-to-end.
    defines. Do not pre-enumerate paths; discover them from the repo as it
    exists today:
 
-   - System scope: the top-level `docs/*.md` (the root `README.md` only
-     routes to and summarizes them).
+   - System scope: the top-level `docs/*.md` and `docs/releases/README.md`
+     (the root `README.md` only routes to and summarizes them).
    - Component scope: the touched component's `README.md`.
    - Design-authority scope: the component's `docs/*.md`.
 

@@ -13,8 +13,8 @@
 // computes the reviewer verdict line itself and derives the audit verdict line
 // from the auditor's per-section verdicts. Findings on the review surface
 // (docs/conventions.md § Branch and PR Workflow) count toward the verdict;
-// findings off it are recorded for the audit Issue or for the open Issue that
-// already names the work. `.claude/CLAUDE.md` § PR workflow operations says
+// findings off it are recorded for the open Issue that already names the work,
+// else for the audit Issue. `.claude/CLAUDE.md` § PR workflow operations says
 // when the assistant runs this workflow and what it does with the result.
 //
 // args: { pr: number, mode: 'full' | 'delta' | 'scope', since?: string }
@@ -379,12 +379,15 @@ const SCOPE_PROMPT = [
     '- changed_items: every public or crate-visible function, type, trait, constant, syscall, ' +
         'or wire-protocol element whose signature, contract, semantics, or documentation the ' +
         'PR diff changes, with the kind of change.',
-    '- design_docs: the system-scope documents (the root `README.md` and `docs/`) and the ' +
-        'component-scope documents (`<component>/README.md`, `<component>/docs/*.md`, and the ' +
-        'parent directory\'s `README.md`) that govern the touched areas, found by walking the ' +
-        'scope order the root README and the component READMEs define; include every document ' +
-        'the diff itself edits. List only paths `git ls-files` prints: a document you cannot ' +
-        'confirm exists at the head is left out, since a lens reads what it is given.',
+    '- design_docs: the documents that govern the touched areas, found by walking the scope ' +
+        'order `docs/documentation-standards.md` § Document Hierarchy defines: system scope ' +
+        '(the top-level `docs/*.md` and `docs/releases/README.md`), component scope ' +
+        '(`<component>/README.md`), and ' +
+        'design-authority scope (`<component>/docs/*.md`). Also list the root `README.md` and ' +
+        'the touched component\'s grouping `README.md` (its parent directory\'s) as routing ' +
+        'documents, not authorities; include every document the diff itself edits. List only ' +
+        'paths `git ls-files` prints: a document you cannot confirm exists at the head is left ' +
+        'out, since a lens reads what it is given.',
     '- claimed_fixes: ' +
         (DELTA
             ? 'every fix the commit messages in ' + SINCE + '..<head> and the PR body claim, as ' +
@@ -481,9 +484,10 @@ const ISSUES_BLOCK = [
     bullets(scope.open_issues, (i) => '- #' + i.number + ' ' + i.title),
 ].join('\n')
 
-// System-scope documents (the top-level `docs/` tree and the root README)
-// govern every shard; a component's own documents and its parent directory's
-// README govern only that component's shards.
+// System-scope documents (the top-level `docs/*.md` and `docs/releases/README.md`)
+// govern every shard; the root README and a component's grouping README are
+// passed as routing context; a component's `README.md` and `docs/*.md` govern
+// only its own shards.
 const docs_for = (component) => {
     const top = component.split('/')[0]
     return scope.design_docs.filter(
@@ -881,7 +885,7 @@ const all = results.flatMap((r) => r.findings)
 const dropped = all.filter((f) => f.status === 'dropped')
 const surviving = all.filter((f) => f.status !== 'dropped')
 // Findings on the review surface are fixed; findings off it are recorded for
-// the audit Issue or for the open Issue that already names the work, and do
+// the open Issue that already names the work, else for the audit Issue, and do
 // not count toward the verdict.
 const findings = surviving.filter((f) => f.in_bound)
 const recorded = surviving.filter((f) => !f.in_bound)
@@ -1016,7 +1020,7 @@ const SYNTH_PROMPT = [
         '`## Should fix`, `## Nit`, `## Recorded for audit (off the review surface)`, ' +
         '`## Dropped by verification`, `## Audit`. The recorded section lists each off-surface ' +
         'finding with the same fields as the others, naming its `issue` when set; they are ' +
-        'appended to the audit Issue, or to the open Issue that already names the work, not ' +
+        'appended to the open Issue that already names the work, else to the audit Issue, not ' +
         'fixed. Write `(none)` under an empty heading. Do not write verdict lines; the ' +
         'workflow appends them.',
     '',

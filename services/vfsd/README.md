@@ -50,7 +50,8 @@ vfsd/
   unmounted root. The `/esp` and `/data` mounts are best-effort: an
   absent partition is skipped (non-fatal) and the mount point falls
   through to the root partition. See
-  [`docs/storage.md`](../../docs/storage.md).
+  [`docs/namespace-composition.md`](docs/namespace-composition.md#two-endpoints-one-process)
+  and [`docs/storage.md`](../../docs/storage.md).
 - **Service endpoint** — handles `MOUNT` and `GET_SYSTEM_ROOT_CAP` on
   its un-badged service endpoint, with multi-threaded recv so a
   worker-driven `CREATE_FROM_FILE` re-entry cannot deadlock an in-
@@ -61,9 +62,10 @@ vfsd/
   [`docs/namespace-composition.md`](docs/namespace-composition.md).
 - **System-root cap delivery** — vfsd does not push a system-root
   cap anywhere at boot. Init pulls one via
-  `vfsd_labels::GET_SYSTEM_ROOT_CAP`; vfsd replies `NO_MOUNT` until
-  root is mounted, so the pull blocks until the root filesystem is up.
-  Init then distributes per-child copies via
+  `vfsd_labels::GET_SYSTEM_ROOT_CAP`; service threads start only after
+  the root self-mount, so the pull blocks until root is up; if the root
+  mount failed, vfsd replies `NO_MOUNT` and init aborts. Init then
+  distributes per-child copies via
   `procmgr_labels::CONFIGURE_NAMESPACE` on every spawn. Procmgr
   itself holds no namespace cap — children spawned without an
   explicit `CONFIGURE_NAMESPACE` cap see
@@ -78,9 +80,10 @@ vfsd/
   structural — `/services/fs/fatfs` is unreachable until root mounts,
   so spawning the fatfs that brings the root online cannot be moved
   elsewhere. vfsd supplies each driver with a partition-scoped block
-  device endpoint and the receive side of its own service endpoint. See
-  [`docs/namespace-composition.md`](docs/namespace-composition.md) and
-  [`docs/storage.md`](../../docs/storage.md).
+  device endpoint and the receive side of its own service endpoint (see
+  [`services/fs/docs/fs-driver-protocol.md`](../fs/docs/fs-driver-protocol.md#bootstrap-caps)).
+  See [`docs/namespace-composition.md`](docs/namespace-composition.md)
+  and [`docs/storage.md`](../../docs/storage.md).
 - **GPT enumeration + mount discovery** — parses the GPT partition
   table from a single scratch memory cap at startup, then resolves the
   arch-conditional root GUID in `src/role_guids.rs` via
@@ -117,8 +120,9 @@ not on the request path. See
 
 devmgr discovers storage hardware, spawns block device drivers, and
 publishes their endpoints in the device registry. vfsd queries the
-registry at startup to obtain the whole-disk virtio-blk endpoint;
-per-mount partition badges are derived from it. See
+registry at startup to obtain the `MOUNT_AUTHORITY`-badged whole-disk
+virtio-blk cap. vfsd sends `REGISTER_PARTITION` on that cap, and
+virtio-blk mints and returns a partition-badged cap per mount. See
 [`docs/device-management.md`](../../docs/device-management.md) and
 [`docs/storage.md`](../../docs/storage.md).
 
@@ -132,6 +136,7 @@ per-mount partition badges are derived from it. See
 | [docs/capability-model.md](../../docs/capability-model.md) | Badge semantics, derivation, revocation |
 | [docs/ipc-design.md](../../docs/ipc-design.md) | IPC semantics, endpoints, message format |
 | [docs/device-management.md](../../docs/device-management.md) | Device registry, block device endpoints |
+| [docs/storage.md](../../docs/storage.md) | Storage-stack composition, GPT role-GUID discovery, mount lifecycle |
 | [docs/architecture.md](../../docs/architecture.md) | vfsd role in the boot lifecycle |
 | [shared/namespace-protocol/README.md](../../shared/namespace-protocol/README.md) | NS_* wire surface |
 | [services/fs/docs/fs-driver-protocol.md](../fs/docs/fs-driver-protocol.md) | Filesystem-driver protocol (FS_MOUNT, FS_READ, FS_READ_MEMORY, …) |
@@ -140,4 +145,4 @@ per-mount partition badges are derived from it. See
 
 ## Summarized By
 
-[Storage](../../docs/storage.md)
+None

@@ -1291,8 +1291,8 @@ fn finalize_creation(
     // otherwise-complete creation. Demand paging is the system-wide default;
     // `demand_paged` is false only when the caller set `CREATE_PINNED` (a DMA
     // driver). init, memmgr, and procmgr are pre-pager and are never routed
-    // through this path, so they are pinned by construction — the exemption is
-    // a capability-flag decision, never a badge-range test.
+    // through this path, so they are pinned by construction. The exemption
+    // rule is in docs/fault-handling.md § Default System Pager.
     if demand_paged && memmgr_send_cap != 0 && self_memmgr_ep != 0
     {
         // Hand memmgr its own copy of the child AS, keyed by the child's

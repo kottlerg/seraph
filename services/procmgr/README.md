@@ -7,10 +7,12 @@ process-death observation. All non-bootstrap process creation in the
 running system goes through procmgr.
 
 procmgr is itself a memmgr client: it is std-using and bootstraps its
-heap by calling memmgr on its first IPC. Memory caps for child stacks,
-IPC buffers, `ProcessInfo` pages, TLS blocks, and ELF segments come
-from memmgr, not from a procmgr-owned pool. See
-[docs/process-lifecycle.md](../../docs/process-lifecycle.md) § Init → procmgr.
+heap by calling memmgr on its first IPC (see
+[docs/process-lifecycle.md](../../docs/process-lifecycle.md) § Init → procmgr). Memory
+caps for child stacks, IPC buffers, `ProcessInfo` pages, TLS blocks, and ELF segments
+come from memmgr, not from a procmgr-owned pool (see
+[docs/process-lifecycle.md](../../docs/process-lifecycle.md) § Authority Boundaries
+Between memmgr and procmgr).
 
 ---
 
@@ -71,30 +73,35 @@ procmgr/
   new spawn alongside procmgr's own death observer (correlator =
   process badge, equal to logd's per-sender slot key). See
   [docs/ipc-interface.md](docs/ipc-interface.md) § `REGISTER_DEATH_EQ`.
-- **Init reap** — accept init's `REGISTER_INIT_TEARDOWN` handoff at
-  end-of-Phase-3 and tear down init's residue. See the
-  [Init reap](#init-reap) subsection below.
+- **Init reap** — accept init's `REGISTER_INIT_TEARDOWN` handoff at the
+  end of init's Handover stage
+  ([services/init/docs/bootstrap.md](../init/docs/bootstrap.md) § Handover) and tear
+  down init's residue. See the [Init reap](#init-reap) subsection below.
 
 ---
 
 ## Init reap
 
-Procmgr accepts init's `REGISTER_INIT_TEARDOWN` handoff at the end of
-init's Phase 3: init's own `AddressSpace` / `CSpace` / `Thread` caps
-plus every reclaimable Memory cap. Procmgr binds a death-EQ observer on
-**both** init threads (main + init-logd) with `INIT_REAP_CORRELATOR` and
-reaps once both have exited — init-logd outlives main until the
-svcmgr-launched real-logd releases it via `HANDOVER_RELEASE`. The reap is
-purely death-driven: procmgr waits for that natural exit and never force-stops
-init-logd. If a handover never completes (real-logd crashes mid-pull or never
-launches), init-logd serves on and init's memory caps stay held until shutdown
-— a benign hold, not a wedge; the all-RAM-accounted identity correspondingly
-closes only once the handover completes. The reap path tears down
-init's kernel objects in order — Threads → AddressSpace → donate Memory
-caps to memmgr via `DONATE_MEMORY_CAPS` → CSpace cascade — leaving zero init
-residue. Implementation in [`src/init_reap.rs`](src/init_reap.rs); the
-handoff protocol is in [docs/ipc-interface.md](docs/ipc-interface.md)
-§ `REGISTER_INIT_TEARDOWN`.
+Procmgr accepts init's `REGISTER_INIT_TEARDOWN` handoff at the end of init's Handover
+stage ([services/init/docs/bootstrap.md](../init/docs/bootstrap.md) § Handover): init's
+own `AddressSpace` / `CSpace` / `Thread` caps plus every reclaimable Memory cap. Procmgr
+binds a death-EQ observer on **both** init threads (main + init-logd) with
+`INIT_REAP_CORRELATOR` and reaps once both have exited — init-logd outlives main until
+the svcmgr-launched real-logd releases it via `HANDOVER_RELEASE` (see
+[logd handover protocol](../logd/docs/handover-protocol.md)). The reap is purely
+death-driven: procmgr waits for that natural exit and never force-stops init-logd. If a
+handover never completes (real-logd crashes mid-pull or never launches), init-logd serves
+on and init's memory caps stay held until shutdown — a benign hold, not a wedge; the
+all-RAM-accounted identity correspondingly closes only once the handover completes. The
+reap path tears down init's kernel objects in order — Threads → AddressSpace → donate
+Memory caps to memmgr via `DONATE_MEMORY_CAPS` → CSpace cascade — leaving zero init
+residue. Implementation in [`src/init_reap.rs`](src/init_reap.rs). The two-thread,
+death-driven reap model is in
+[docs/process-lifecycle.md](../../docs/process-lifecycle.md) § Init reap; the hold when a
+handover never completes is in
+[services/logd/docs/handover-protocol.md](../logd/docs/handover-protocol.md) § Failure
+modes; the handoff protocol is in [docs/ipc-interface.md](docs/ipc-interface.md)
+§ `REGISTER_INIT_TEARDOWN` and § `INIT_TEARDOWN_DONE`.
 
 ---
 
@@ -110,10 +117,11 @@ handoff protocol is in [docs/ipc-interface.md](docs/ipc-interface.md)
   registry. See [docs/process-lifecycle.md](../../docs/process-lifecycle.md)
   § Authority Boundaries Between memmgr and procmgr.
 - **Choose virtual addresses inside the running child.** procmgr picks
-  bootstrap-cross-boundary VAs (stack, IPC buffer, `ProcessInfo`, TLS
-  block); the child's `std::sys::seraph` owns every other VA. See
+  the bootstrap-cross-boundary VAs (stack, IPC buffer, `ProcessInfo`, TLS
+  block) and draws the per-spawn image load bias that places the child's ELF
+  segments; the child's runtime (`std::sys::seraph`) owns every remaining VA. See
   [docs/userspace-memory-model.md](../../docs/userspace-memory-model.md)
-  § Bootstrap Cross-Boundary VAs.
+  § Bootstrap Cross-Boundary VAs and § Image Placement.
 - **Hold or distribute namespace caps.** procmgr holds no system-root
   cap and has no broadcast path. A child's `ProcessInfo.system_root_cap`
   is sourced exclusively from the spawner's
@@ -134,9 +142,9 @@ handoff protocol is in [docs/ipc-interface.md](docs/ipc-interface.md)
 The full procmgr IPC specification is in
 [`docs/ipc-interface.md`](docs/ipc-interface.md). Key operations:
 
-- `CREATE_PROCESS(elf_module_cap)` → suspended process handle, child caps
+- `CREATE_PROCESS(elf_module_cap)` → suspended process handle, child `Thread` cap
 - `CREATE_FROM_FILE(file_cap, file_size, …)` → suspended process handle,
-  child caps. Caller has already walked its own namespace cap to the
+  child `Thread` cap. Caller has already walked its own namespace cap to the
   binary; procmgr issues `FS_READ` against the supplied file cap.
 - `START_PROCESS(process_handle)` — start a previously created process
 - `CONFIGURE_NAMESPACE(process_handle)` — install root and (optional)

@@ -48,12 +48,11 @@ no handler bound is still terminated, the behavior for all faults absent this me
 The demand-paging consumer is implemented: memmgr acts as the pager, procmgr binds it for
 every ordinary process it creates (demand paging is the default; a process opts out with the
 `CREATE_PINNED` flag) and delegates the child address space, and the `ProcessInfo` pager
-field (`pager_endpoint_cap` / `pager_badge`) advertises it so the
-runtime inherits the handler onto spawned threads. See
+field (`pager_endpoint_cap` / `pager_badge`) advertises it so the runtime inherits the
+handler onto spawned threads. See
 [services/procmgr/docs/ipc-interface.md](../services/procmgr/docs/ipc-interface.md).
-Userspace reserves
-unbacked VA and registers it via `std::os::seraph::register_demand_paged`; first touch faults,
-memmgr maps a frame and resumes. See
+Userspace reserves unbacked VA and registers it via `std::os::seraph::register_demand_paged`;
+first touch faults, memmgr maps a frame and resumes. See
 [services/memmgr/docs/ipc-interface.md](../services/memmgr/docs/ipc-interface.md)
 (`REGISTER_REGION`, `DELEGATE_ASPACE`, and the fault arm).
 
@@ -142,9 +141,10 @@ a policy decision, not a kernel change.
 The fault message is delivered to the handler endpoint by the kernel on the faulting
 thread's behalf. Its format is a stable cross-boundary contract.
 
-- **Label** — the reserved `FAULT_LABEL`. It marks the message as kernel-originated so a
-  handler that multiplexes other traffic can distinguish faults. Userspace MUST NOT be
-  able to forge it; see [Security](#security).
+- **Label** — the reserved `FAULT_LABEL`. It proves kernel origin only on an endpoint whose
+  handler hands out no `SEND`. A handler that multiplexes client traffic on the same endpoint
+  (memmgr) attributes the message by its unforgeable badge, not by the label; see
+  [Security](#security).
 - **Badge** — the bound `badge`.
 - **Data word 0** — the fault **kind**:
   - `FAULT_KIND_VM` — a virtual-memory (page) fault.
@@ -180,8 +180,9 @@ it resumes by re-executing its faulting instruction, not by returning a value.
   instruction. For a page fault whose handler has installed a satisfying mapping, the
   instruction now succeeds.
 - **Kill (cancellation).** If the binding is severed before a reply — the handler thread
-  dies, the binding is cleared, or the thread is stopped — the faulting thread is killed,
-  exactly as an unhandled fault. It is never resumed with a spurious value.
+  dies, the binding is cleared (design intent; not yet implemented, #242), or the thread is
+  stopped — the faulting thread is killed, exactly as an unhandled fault. It is never resumed
+  with a spurious value.
 
 ### Modifying the faulting thread
 
@@ -237,14 +238,16 @@ thread would block on its own fault endpoint indefinitely.
 ## Security
 
 The kernel synthesizes the fault delivery on the faulting thread's behalf using the bound
-endpoint; it does not require, and the protocol does not distribute, a send capability to
-the fault endpoint. A handler that hands out no `SEND` to its fault endpoint receives
-`FAULT_LABEL` only from the kernel. A handler that also serves ordinary clients on the same
-endpoint (memmgr as the default pager) cannot rely on the label alone: a client holding
-`SEND` can send a message bearing `FAULT_LABEL`, and the handler attributes it by the
-unforgeable badge of that client's cap, so a client can at most fabricate a fault against
-itself. The `badge` identifying the
-faulting thread is fixed by the binder, not by the message sender.
+endpoint; it needs no send capability to the fault endpoint to deliver a fault. A handler
+that hands out no `SEND` to its fault endpoint receives `FAULT_LABEL` only from the kernel.
+The default pager's endpoint is not such an endpoint: it is memmgr's badged client endpoint,
+and [`ProcessInfo`](process-lifecycle.md#processinfo--initinfo-handover-discipline)
+distributes it as `SEND` to every demand-paged process (`pager_endpoint_cap`). A handler that
+also serves ordinary clients on the same endpoint therefore cannot rely on the label alone: a
+client holding `SEND` can send a message bearing `FAULT_LABEL`, and the handler attributes it
+by the unforgeable badge of that client's cap, so a client can at most fabricate a fault
+against itself. The `badge` identifying the faulting thread is fixed by the binder, not by
+the message sender.
 
 ---
 
@@ -281,10 +284,9 @@ The default MUST exempt only the narrow set that cannot depend on the fault path
 - **Drivers requiring pinned memory (DMA)** — a device may write a process's memory before a
   demand fault could back it, so DMA-capable drivers must be eager-mapped. The creator opts a
   process out with `procmgr_labels::CREATE_PINNED` (see
-  [services/procmgr/docs/ipc-interface.md](../services/procmgr/docs/ipc-interface.md)); devmgr
-  sets it for the DMA-capable driver
-  class (PCI devices with BAR + IRQ). The exemption is a creation-request flag, never a
-  badge-range test.
+  [services/procmgr/docs/ipc-interface.md](../services/procmgr/docs/ipc-interface.md));
+  devmgr sets it for the DMA-capable driver class (PCI devices with BAR + IRQ). The exemption
+  is a creation-request flag, never a badge-range test.
 
 A userspace fault round-trip is costlier than a kernel-internal fill; this cost is accepted
 to keep paging policy out of the kernel.

@@ -78,7 +78,7 @@ cargo xtask run [--arch x86_64|riscv64] [--gdb] [--headless] [--verbose] \
 | `--verbose` | Show all serial output; by default output is filtered until `[--------] boot:` appears |
 | `--cpus` | Number of vCPUs to expose to the guest (default: `4`; bounded by `1..=512`, the [boot-protocol](../abi/boot-protocol/README.md) `MAX_CPUS` the kernel sizes its per-CPU structures from) |
 | `--mem` | Guest memory size in MiB (default: `512`) |
-| `--riscv-mmu` | Guest RISC-V paging-mode ceiling (default: `sv48`; riscv64 only, ignored on x86_64). Sets the QEMU `svNN` CPU properties so the DTB `mmu-type` advertises the chosen ceiling; the kernel negotiates the highest advertised mode it supports at boot, per [docs/memory-model.md](../docs/memory-model.md) § Virtual Address Space Layout. The default pins `sv48` because QEMU ≥ 8.0 otherwise defaults the rv64 CPU to `sv57` |
+| `--riscv-mmu` | Guest RISC-V paging-mode ceiling (default: `sv48`; riscv64 only, ignored on x86_64). Sets the QEMU `svNN` CPU properties so the DTB `mmu-type` advertises the chosen ceiling; the bootloader negotiates the paging mode from that advertisement at boot (confirmed by a `satp` probe) and the kernel recovers the active mode from `satp`, per [docs/memory-model.md](../docs/memory-model.md) § RISC-V (Sv39 / Sv48 / Sv57). The default pins `sv48` because QEMU ≥ 8.0 otherwise defaults the rv64 CPU to `sv57` |
 
 **x86-64** selects an acceleration backend per host: KVM on Linux,
 HVF on macOS, WHPX on Windows, NVMM on NetBSD, or TCG everywhere else
@@ -141,7 +141,8 @@ hand-staged sysroot that diverges from `rootfs/` — e.g. a test recipe
 copied from `sysroot/config/svcmgr/tests/` into
 `sysroot/config/svcmgr/services/` — use `--repack-only`, which skips the
 re-mirror and packs the sysroot exactly as it stands (a plain repack would
-prune the hand-added recipe).
+prune the hand-added recipe). The mirror rules are owned by
+[rootfs/README.md](../rootfs/README.md).
 
 `mkdisk` does **not** author `sysroot/EFI/seraph/bootstrap.bundle` — it
 fails if the bundle is missing. The bundle is composed by
@@ -446,7 +447,7 @@ the pre-merge review's.
 | `src-header` | error | Every tracked `.rs`, `.ld`, `.S`, `.sh`: the SPDX line first (after a shebang in `.sh`; on line 2, after `/*`, in a block-comment `.ld`); exactly one blank line, then the path line; for Rust, exactly one blank line, then the `//!` block before any `#![` attribute, per [docs/coding-standards.md](../docs/coding-standards.md) § File Headers. |
 | `md-summarized-by` | error | Every authoritative document ends with `---` and a `## Summarized By` section holding `None` or a non-empty list of links, each resolving to a path inside the repository (no external URL, in-page-only anchor, or `..` past the root), per [docs/documentation-standards.md](../docs/documentation-standards.md) § Backlinks and Change Propagation. |
 | `md-backlink-forward` | error | Every `## Summarized By` entry names a tracked document that links this one. |
-| `md-reachable` | error | Every authoritative document is reachable by links from the root `README.md`; each component README links every document in its own `docs/`, per [docs/documentation-standards.md](../docs/documentation-standards.md) § Discoverability and Linking. |
+| `md-reachable` | error | Every authoritative document is reachable by links from the root `README.md`; the root README links every `docs/*.md` and every other README links each document in its own `docs/`, per [docs/documentation-standards.md](../docs/documentation-standards.md) § Discoverability and Linking. |
 | `md-bare-cite` | warning | A `(see <name>.md)` citation outside link syntax. |
 
 The lint treats as authoritative every tracked `.md` except the root `README.md`, `.claude/`,
@@ -471,6 +472,9 @@ pattern also matches legitimate prose.
 | Document | Content |
 |---|---|
 | [docs/build-system.md](../docs/build-system.md) | Toolchain, workspace layout, custom targets, sysroot, CI workflows |
+| [docs/memory-model.md](../docs/memory-model.md) | Randomized kernel layout `test-kaslr` checks; RISC-V paging-mode ceiling behind `--riscv-mmu` |
+| [docs/userspace-memory-model.md](../docs/userspace-memory-model.md) | PIE image placement and the per-spawn ASLR bias used with `--gdb` |
+| [docs/storage.md](../docs/storage.md) | GPT role-GUID discovery of the data partition the disk image carries |
 | [docs/testing.md](../docs/testing.md) | Harnesses, markers, and the host-driven boot tests the test commands run |
 | [docs/coding-standards.md](../docs/coding-standards.md) | Lints `build` enforces; the Markdown and file-header rules `lint-docs` checks |
 | [docs/documentation-standards.md](../docs/documentation-standards.md) | Document hierarchy and backlink rules `lint-docs` checks |

@@ -25,7 +25,7 @@ Out of scope (owned elsewhere, referenced here):
 
 - The psABI / toolchain feature level and target JSONs —
   [build-system.md](build-system.md#custom-targets).
-- The mechanism of W^X, NX, SMEP/SMAP, SUM/PMP, and tagged-TLB tagging —
+- The mechanism of W^X, NX, SMEP/SMAP, the RISC-V U-bit/`SUM` isolation, and tagged-TLB tagging —
   [memory-model.md](memory-model.md).
 - IOMMU discovery and the DMA safety model — [device-management.md](device-management.md).
 - Console / serial ownership across boot — [console-model.md](console-model.md).
@@ -152,8 +152,11 @@ Each feature is classified per architecture as one of:
 - **Instruction baseline** — RV64GCV plus Zba/Zbb/Zbs. The Vector extension is a hard requirement;
   the kernel reads `vlenb` on the boot hart and refuses `vlenb == 0` or `vlenb` above `MAX_VLENB`
   (VLEN 512).
-- **Supervisor isolation — `SUM` and PMP** — supervisor-user access control and physical-memory
-  protection (PMP is established by M-mode firmware). See [memory-model.md](memory-model.md).
+- **Supervisor isolation — the U bit and `sstatus.SUM`** — S-mode never executes from user
+  (U=1) pages, and the kernel keeps `SUM` clear outside its user-copy routines so supervisor
+  accesses to user pages fault. See [memory-model.md](memory-model.md).
+- **PMP** — physical-memory protection established by M-mode firmware; it protects firmware
+  memory, not user pages.
 - **ASID-tagged TLBs** — the `satp` ASID field, the RISC-V counterpart of PCID; see
   [memory-model.md](memory-model.md).
 - **PLIC** — the interrupt controller the kernel drives (base from `BootInfo.kernel_mmio`). AIA
@@ -176,7 +179,8 @@ Each feature is classified per architecture as one of:
 
 ### Opportunistic
 
-- **Svadu** — hardware A/D-bit updates (Svade is the required baseline).
+- **Svadu** — hardware A/D-bit updates (design intent; not yet implemented: the kernel pre-sets
+  the A/D bits in every leaf PTE; Svade is the required baseline).
 - **Sv57** — a larger-VA expansion above the Sv48 default; used when the
   platform advertises and the probe confirms it.
 - **Zvk vector crypto** — crypto acceleration (design intent; not yet enabled).
@@ -189,7 +193,8 @@ Each feature is classified per architecture as one of:
 ### Unsupported
 
 - **AIA (Ssaia, APLIC, IMSIC)** — not yet supported; the kernel drives a PLIC.
-- **Ssstateen / Smstateen** — not used; the kernel does not program the state-enable CSRs.
+- **Ssstateen / Smstateen** — not used, although the RVA23 floor mandates Ssstateen: the kernel
+  does not program the state-enable CSRs.
 - **Legacy / embedded RISC-V profiles** — outside the RVA23 floor.
 - **Port-mapped I/O** — RISC-V has no port I/O; all device access is MMIO.
 - **Cache-block-management instructions (Zicbom/Zicboz/Zicbop)** — not used; the kernel assumes

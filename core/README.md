@@ -1,6 +1,6 @@
 # core
 
-Core OS: bootloader, kernel, and the kernel-validation harness. All `no_std`.
+Core OS: bootloader, kernel, and the kernel-validation harness.
 
 | Crate | Purpose |
 |---|---|

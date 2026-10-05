@@ -27,8 +27,7 @@ Four system-scope invariants govern the stack:
 - **vfsd holds no on-disk storage and is off the I/O path after the
   walk.** Once a client has walked `NS_LOOKUP` into a mounted
   filesystem, subsequent reads and writes go directly to the owning
-  fs driver. vfsd is not a proxy. See
-  [`services/vfsd/README.md`](../services/vfsd/README.md) §"After the walk".
+  fs driver. vfsd is not a proxy.
 - **One fs-driver process per mount.** A crash in one mount cannot
   corrupt another. `vfsd` spawns every fs driver.
 - **Block access is partition-scoped at the capability layer.** The
@@ -59,7 +58,7 @@ revoking a block-layer cap cuts off the partition caps derived
 beneath it.
 
 ```
-kernel (phase 7) mints Mmio + IRQ from BootInfo
+kernel (phase 7) mints Mmio caps from BootInfo.mmio_apertures and the root IRQ range cap
   → init delegates Mmio + IRQ caps to devmgr
     → devmgr binds virtio-blk; delegates per-device MMIO + IRQ
       → devmgr creates the block service endpoint and hands it to virtio-blk at spawn
@@ -155,7 +154,6 @@ partition: it resolves the arch root GUID, looks the partition up in
 its parsed table, registers the partition bound with virtio-blk,
 spawns the fs driver, sends `FS_MOUNT` to validate the BPB, and
 captures the driver's root cap into the synthetic root (see
-[`services/vfsd/README.md`](../services/vfsd/README.md) and
 [`services/vfsd/docs/namespace-composition.md`](../services/vfsd/docs/namespace-composition.md)).
 It then auto-mounts the ESP at `/esp` and the data partition at
 `/data`. All three run before any service thread serves a request, so
@@ -177,9 +175,11 @@ The first fatfs process is spawned from the boot-module cap, not via
 the namespace. `/services/fs/fatfs` is unreachable until root mounts, so the
 fatfs that brings root online cannot be spawned from disk —
 chicken-and-egg. Every subsequent mount's fs-driver spawn walks vfsd's own
-held system-root cap to `/services/fs/fatfs` and pass the resulting file cap
+held system-root cap to `/services/fs/fatfs` and passes the resulting file cap
 to procmgr via `CREATE_FROM_FILE`. The first-mount path is permanent
-by structure. See [`services/vfsd/README.md`](../services/vfsd/README.md).
+by structure. See
+[`services/vfsd/docs/namespace-composition.md`](../services/vfsd/docs/namespace-composition.md)
+§ Two endpoints, one process.
 
 ---
 

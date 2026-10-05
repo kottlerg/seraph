@@ -80,9 +80,10 @@ static NEXT_BADGE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64
 //
 // log and procmgr endpoints arrive via `ProcessInfo`/`StartupInfo`.
 //
-// After bootstrap, vfsd probes fatfs with an empty `FS_MOUNT` so the driver
-// can validate the BPB and report mount success/failure before vfsd replies
-// to the upstream MOUNT caller.
+// After bootstrap, vfsd probes fatfs with `FS_MOUNT`
+// (data[0] = FS_LABELS_VERSION) so the driver can check the label version,
+// validate the BPB, and report mount success/failure before vfsd replies to
+// the upstream MOUNT caller.
 
 struct FatCaps
 {

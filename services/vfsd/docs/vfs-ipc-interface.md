@@ -10,12 +10,11 @@ the synthetic-root composition that backs it is described in
 
 The system-root cap is requested by init via
 [`vfsd_labels::GET_SYSTEM_ROOT_CAP`]. vfsd self-mounts root before any
-service thread starts, and replies `NO_MOUNT` to this request until
-root is mounted, so the pull blocks until the root filesystem is up
-(and fails fast — letting init FATAL — if the self-mount failed).
-Vfsd derives a fresh badged SEND on its own namespace endpoint
-addressing `NodeId::ROOT` at full namespace rights and replies with
-it. Init holds the cap as the seed for all later tier-3 namespace-cap
+service thread starts receiving, so the pull blocks until the root
+filesystem is up; if the self-mount failed, vfsd replies `NO_MOUNT`
+and init FATALs. Vfsd derives a fresh badged SEND on its own namespace
+endpoint addressing `NodeId::ROOT` at full namespace rights and replies
+with it. Init holds the cap as the seed for all later namespace-cap
 distribution; children of init receive a `cap_copy` of it via
 `procmgr_labels::CONFIGURE_NAMESPACE` (see
 [services/init/docs/bootstrap.md](../../init/docs/bootstrap.md#root-acquisition)).
@@ -23,9 +22,9 @@ Clients consume it via
 `std::os::seraph::root_dir_cap()`. Vfsd holds no namespace cap on
 procmgr's behalf — there is no boot-time push.
 
-vfsd self-mounts the Seraph root partition at `/` and the EFI System
-Partition at `/esp` at startup; additional partitions are discovered by
-their type GUID, not by a config file (see
+vfsd self-mounts the Seraph root partition at `/` at startup, then mounts the EFI System
+Partition at `/esp` and the data partition at `/data` (both best-effort); additional partitions
+are discovered by their type GUID, not by a config file (see
 [docs/storage.md](../../../docs/storage.md#gpt-role-guid-discovery)).
 Label `12` on the service endpoint is reserved and MUST NOT be reused for an unrelated request.
 
@@ -57,8 +56,9 @@ for the root role, arch-neutral for data; see
 [`services/vfsd/src/role_guids.rs`](../src/role_guids.rs)),
 looks the partition up in its parsed GPT table via
 [`gpt::lookup_partition_by_type_guid`](../gpt/src/lib.rs) (DPS-style
-priority tie-break on attribute bits 48-63; tied priorities are
-fatal; see [docs/storage.md](../../../docs/storage.md#gpt-role-guid-discovery)),
+priority tie-break on attribute bits 48-63; a tie at the highest
+priority is rejected with `NO_MOUNT` (fatal only for the root
+self-mount); see [docs/storage.md](../../../docs/storage.md#gpt-role-guid-discovery)),
 registers the partition bound with virtio-blk, spawns a fatfs
 driver, sends `FS_MOUNT` (see
 [services/fs/docs/fs-driver-protocol.md](../../fs/docs/fs-driver-protocol.md))

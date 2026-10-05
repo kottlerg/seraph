@@ -154,9 +154,11 @@ The CPU state established at the kernel entry point is specified in
   device-level assignment are userspace's responsibility. Extraction scope is in
   [docs/firmware-parsing.md](docs/firmware-parsing.md).
 - **No boot menu or interactive UI.** The kernel, bundle, and `nokaslr` knob
-  ESP paths are hardcoded; there is no boot configuration file beyond the
-  presence-only knob and no kernel command line
-  ([docs/elf-loading.md](docs/elf-loading.md) § File Paths).
+  ESP paths are hardcoded and are the only files the bootloader opens, so
+  there is no boot configuration file beyond the presence-only knob
+  ([docs/elf-loading.md](docs/elf-loading.md) § File Paths). There is no
+  kernel command line: `BootInfo` carries no command-line field
+  ([abi/boot-protocol/src/lib.rs](../../abi/boot-protocol/src/lib.rs)).
 - **No permanent page tables.** The initial tables are minimal and temporary; the
   kernel replaces them during Phase 3 of its initialisation sequence
   ([docs/page-tables.md](docs/page-tables.md)).

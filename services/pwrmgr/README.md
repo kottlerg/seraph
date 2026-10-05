@@ -29,12 +29,12 @@ a device driver":
 - **x86-64** — the FADT and DSDT it parses are served read-only by devmgr
   via `devmgr_labels::QUERY_ACPI_TABLE` (devmgr is the sole owner of the
   `AcpiReclaimable` Memory caps and the only service that walks the ACPI
-  table tree, per [devmgr](../devmgr/README.md#responsibilities)). pwrmgr
+  table tree, per [devmgr](../devmgr/docs/responsibilities.md#responsibilities)). pwrmgr
   extracts `PM1a_CNT_BLK` from the FADT and the `\_S5_` sleep type from the
   DSDT, then requests a narrow `IoPort` over the PM1a control port and the
   8042 reset port via `devmgr_labels::QUERY_SHUTDOWN_DEVICE`.
 - **RISC-V** — `QUERY_SHUTDOWN_DEVICE` serves a `cap_derive` copy of
-  devmgr's `SbiControl` cap ([devmgr](../devmgr/README.md#responsibilities)),
+  devmgr's `SbiControl` cap ([devmgr](../devmgr/docs/responsibilities.md#responsibilities)),
   which authorises forwarding `system_reset` through the kernel to M-mode
   firmware.
 
@@ -44,7 +44,7 @@ It exposes a small IPC surface (`shared/ipc/src/lib.rs::pwrmgr_labels`):
   on RISC-V). On the success path the platform powers off and no reply is
   delivered. A reply only arrives on rejection or hardware-failure paths.
 - `REBOOT` — cold reboot the platform (8042 KBC reset on x86-64, SBI SRST
-  type 2 on RISC-V).
+  type 1 on RISC-V).
 
 Both labels are gated by `pwrmgr_labels::SHUTDOWN_AUTHORITY` (badge bit
 `1<<63`). Calls without the bit reply `pwrmgr_errors::UNAUTHORIZED`.
@@ -70,8 +70,9 @@ Both labels are gated by `pwrmgr_labels::SHUTDOWN_AUTHORITY` (badge bit
    (e.g. svctest, and svcmgr's own critical-service-death escalation); the
    badge rides through the registry lookup unchanged
    ([`provides`](../svcmgr/docs/service-definitions.md#provides)). svctest
-   also seeds `pwrmgr.deny` to assert the gate rejects an unauthorised cap
-   ([Cross-harness conventions](../../docs/testing.md#cross-harness-conventions)).
+   also seeds `pwrmgr.deny`, the negative-test twin, to assert the gate
+   rejects an unauthorised cap
+   ([`provides`](../svcmgr/docs/service-definitions.md#provides)).
 4. svctest, at the end of `main()` after `ALL TESTS PASSED`, sends
    `pwrmgr_labels::SHUTDOWN` through the authorised cap, per
    [Cross-harness conventions](../../docs/testing.md#cross-harness-conventions).
@@ -89,14 +90,16 @@ service endpoint, so a `pwrmgr.shutdown` cap cached against the published
 name survives the restart (see
 [Supervision hierarchy](../svcmgr/docs/restart-protocol.md#supervision-hierarchy)).
 The restarted instance re-acquires its actuator caps from devmgr on startup
-— `QUERY_SHUTDOWN_DEVICE` re-carves the I/O ports from devmgr's root cap on
-every call, so nothing is consumed
-([devmgr](../devmgr/README.md#responsibilities)).
+— `QUERY_SHUTDOWN_DEVICE` re-derives the actuator caps (the x86-64 I/O
+ports, or the RISC-V `SbiControl` copy) from devmgr's root caps on every
+call, so nothing is consumed ([devmgr](../devmgr/docs/responsibilities.md#responsibilities)).
 
 `critical = no`: a permanently-dead pwrmgr (restart budget exhausted)
 cannot power the platform off, so the graceful-shutdown-via-`pwrmgr.shutdown`
 escalation would be circular. The honest terminal state is logged and the
-system continues degraded, matching `timed`
+system continues degraded
+([`critical`](../svcmgr/docs/service-definitions.md#critical)), matching
+`timed`
 ([Supervision hierarchy](../svcmgr/docs/restart-protocol.md#supervision-hierarchy)).
 
 ---
@@ -139,6 +142,7 @@ between the two trees.
 | Document | Content |
 |---|---|
 | [docs/architecture.md](../../docs/architecture.md) | System-wide service inventory; pwrmgr's role |
+| [docs/testing.md](../../docs/testing.md) | Cross-harness completion convention; harnesses request pwrmgr shutdown when they finish |
 | [shared/ipc/src/lib.rs](../../shared/ipc/src/lib.rs) | Authoritative IPC label and error definitions (`pwrmgr_labels`, `pwrmgr_errors`, `devmgr_labels`) |
 | [services/devmgr/README.md](../devmgr/README.md) | Hardware + ACPI authority; the `QUERY_ACPI_TABLE` / `QUERY_SHUTDOWN_DEVICE` brokers pwrmgr acquires its caps through |
 | [services/svcmgr/README.md](../svcmgr/README.md) | Launcher + supervisor; the provider path that publishes `pwrmgr.shutdown` / `pwrmgr.deny` |

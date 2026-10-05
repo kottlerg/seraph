@@ -69,7 +69,8 @@ space is uniform; any partition into tiers is userspace policy, expressed by how
   userspace policy — `shared/ipc`'s `sched_policy` module for the
   init/procmgr/devmgr/vfsd-assigned levels, svcmgr `.svc` recipes
   (`priority = ...` / `sched_max = ...`) for supervised services. The mint is specified in
-  [procmgr ipc-interface.md](../../../services/procmgr/docs/ipc-interface.md) § `CREATE_PROCESS`.
+  [procmgr ipc-interface.md](../../../services/procmgr/docs/ipc-interface.md) § Label 1:
+  `CREATE_PROCESS`.
 
 `SchedControl` is the sole authority; see
 [capability-model.md § SchedControl](../../../docs/capability-model.md) for the
@@ -250,6 +251,7 @@ set needed for correct execution:
 - `rip` (return address, via the call to `context::switch`)
 - `rsp` (stack pointer)
 - The `fs_base` MSR (TLS base pointer)
+- `rflags`
 - The kernel stack pointer is stored separately in the TSS `RSP0` field
 
 Caller-saved registers (`rax`, `rcx`, `rdx`, `rsi`, `rdi`, `r8`–`r11`) are not saved
@@ -259,11 +261,19 @@ Caller-saved registers (`rax`, `rcx`, `rdx`, `rsi`, `rdi`, `r8`–`r11`) are not
 - `s0`–`s11` (saved registers)
 - `ra` (return address — `context::switch` returns here)
 - `sp` (stack pointer)
-- `tp` (thread pointer, used for TLS)
+- `a0` (argument delivered on a new kernel thread's first entry; meaningful only at
+  thread creation)
 
-The full user register file (all 31 general-purpose registers plus `sepc`, `sstatus`,
-and the floating-point state) is saved in the thread's trap frame, not in
-`SavedState`. `SavedState` holds only the kernel-mode callee-saved state.
+`tp` is not in `SavedState`: it is a per-hart kernel register that is never
+thread-switched, and the user-mode TLS pointer lives in the trap frame's `tp`.
+
+The full user register file (all 31 general-purpose registers on RISC-V, plus `sepc`
+and `sstatus`) is saved in the thread's trap frame, not in `SavedState`. `SavedState`
+holds only the kernel-mode callee-saved state. Floating-point, SIMD, and vector state
+is in neither: it lives in the TCB's extended-state area, saved eagerly by the arch
+`fpu::switch_out_save` on switch-out of a user thread and restored lazily on the
+thread's first FP/SIMD/vector instruction after it is switched back in (`#NM` on
+x86-64, the illegal-instruction trap with `sstatus.FS`/`VS` Off on RISC-V).
 
 ### Switch Sequence
 
@@ -322,7 +332,7 @@ Victim selection is mode-dependent:
 - **Loaded CPU (`my_load > 0`)** — pick a pseudo-random victim
   (splitmix-style hash of the global `LOAD_BALANCE_TICK` counter and the
   local CPU id). Skip if the victim is not significantly busier than us
-  (`their_load <= my_load + IMBALANCE_THRESHOLD`).
+  (`their_load <= my_load + LOAD_BALANCE_IMBALANCE_THRESHOLD`).
 - **Idle CPU (`my_load == 0`)** — scan all other CPUs and pull from the
   heaviest. Scanning is cheap (one Relaxed atomic load per CPU) and
   guarantees an idle CPU finds work on the first tick that sees an
@@ -338,15 +348,31 @@ pull_unpinned_ready(src, dst):
     if !try_lock(min(src, dst).scheduler.lock): return   // ascending-CPU order
     if !try_lock(max(src, dst).scheduler.lock):
         unlock(min); return
-    tcb = src.find_runnable(|t| t.cpu_affinity == AFFINITY_ANY)
+    (tcb, prio) = src.find_runnable(|t| t.cpu_affinity == AFFINITY_ANY
+                                        && t.context_saved.load(Acquire) == 1)
     if tcb is None: unlock both; return
-    src.remove_from_queue(tcb, tcb.priority)  // decrements CPU_LOAD[src]
-    dst.enqueue(tcb, tcb.priority)            // increments CPU_LOAD[dst]
-    tcb.preferred_cpu = dst
-    set_reschedule_pending_for(dst)
-    unlock both
-    wake_idle_cpu(dst)                        // always-IPI
+    if !try_lock(tcb.sched_lock): unlock both; return  // taken after run-queue locks
+    // relocate_ready_thread: revalidate under sched_lock, then move.
+    moved = false
+    if tcb.state == Ready && tcb.context_saved == 1
+       && (tcb.cpu_affinity == AFFINITY_ANY || tcb.cpu_affinity == dst):
+        src.remove_from_queue(tcb, prio)       // decrements CPU_LOAD[src]
+        dst.enqueue(tcb, prio)                 // increments CPU_LOAD[dst]
+        tcb.preferred_cpu = dst
+        set_reschedule_pending_for(dst)
+        moved = true
+    unlock tcb.sched_lock; unlock both
+    if moved: wake_idle_cpu(dst)               // always-IPI
 ```
+
+The `context_saved == 1` predicate is the load-balancer liveness gate of
+[scheduling-internals.md](scheduling-internals.md) § Cross-CPU TCB Ownership step 11: a
+`Ready` thread with `context_saved == 0` is mid-handoff, still `current` on `src`, and
+relocating it would dispatch it on two CPUs at once (#314/#293). The candidate's
+`sched_lock` is try-acquired because it is taken after the run-queue locks, the reverse of
+the canonical order; a failed try defers the pull. `relocate_ready_thread` re-checks
+`Ready`, `context_saved == 1`, and affinity under that `sched_lock`, closing a
+`sys_thread_set_affinity` that races between the `find_runnable` predicate and the move.
 
 Lock order follows [scheduling-internals.md](scheduling-internals.md) § Lock Hierarchy rule 4
 (ascending CPU id), and both acquisitions are **try-locks**: the pull runs
@@ -362,7 +388,7 @@ Hot-path cost per CPU per tick:
 - Idle CPU: one Relaxed load per remote CPU to find the heaviest victim.
 - Loaded CPU: one Relaxed increment + one Relaxed load for the victim.
 - Scheduler locks are try-acquired, and only when an imbalance above
-  `IMBALANCE_THRESHOLD` is observed.
+  `LOAD_BALANCE_IMBALANCE_THRESHOLD` is observed.
 
 ---
 
@@ -529,8 +555,7 @@ deferring to the next enqueue ([syscalls.md](syscalls.md) § `SYS_THREAD_SET_AFF
   reschedule-pending flag, and IPIing it — instead of doing a local enqueue
   (see [scheduling-internals.md](scheduling-internals.md) § ThreadState Transitions).
   Worst-case latency is therefore one time slice
-  (`TIME_SLICE_TICKS` × tick period), not one tick, as
-  [syscalls.md](syscalls.md) § `SYS_THREAD_SET_AFFINITY` states.
+  (`TIME_SLICE_TICKS` × tick period), not one tick.
 - **Blocked / Stopped / Created**: the new affinity takes effect on the
   next wake via `select_target_cpu`; no migration work is needed.
 

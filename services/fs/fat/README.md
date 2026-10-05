@@ -48,12 +48,10 @@ Each label's wire shape and error set are specified in
 | `FS_RENAME` | no | rename within a single directory |
 | `FS_TRUNCATE` | no | shrink a file to zero (v1: `new_len == 0` only) |
 
-`FS_RENAME` is single-directory only at v0.1.0 because servers cannot
-introspect the badge packed in a received cap; cross-directory rename
-needs either a kernel-level `cap_info` selector for badges or a wire
-shape that conveys the destination `NodeId` out-of-band; see
+`FS_RENAME` is single-directory only because servers cannot introspect
+the badge packed in a received cap, so a second directory cap cannot
+resolve to a `NodeId`. Cross-directory rename is deferred; see
 [`../docs/fs-driver-protocol.md`](../docs/fs-driver-protocol.md) § Label 16: `FS_RENAME`.
-Tracked as [Issue #89](https://github.com/kottlerg/seraph/issues/89).
 
 Per-label rights gating (`WRITE` for the write / truncate labels,
 `MUTATE_DIR` for the directory-mutation labels) goes through

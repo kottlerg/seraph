@@ -21,20 +21,24 @@ virtio/blk/
 
 ## Endpoint
 
-Devmgr spawns the driver and delegates per-device capabilities (BAR MMIO,
-IRQ, MSI-X). The driver creates a service endpoint and registers it with
-devmgr's device registry; vfsd queries devmgr to obtain the whole-disk
-SEND cap. The delegation chain is owned by
+Devmgr spawns the driver, creates its service endpoint, and delivers BAR
+MMIO, IRQ, and the service endpoint in the first bootstrap round, then a
+per-device badged devmgr query endpoint in the second. vfsd obtains a
+`MOUNT_AUTHORITY`-badged whole-disk `SEND_GRANT` cap through devmgr's
+`QUERY_BLOCK_DEVICE`. The delegation chain is owned by
 [docs/storage.md](../../../../docs/storage.md) § Capability Delegation Chain.
 
 Two access tiers exist on this endpoint, distinguished by the kernel-supplied
-caller badge:
+caller badge; unbadged callers are rejected:
 
-1. **Whole-disk (unbadged)** — vfsd holds this cap directly. Permitted to
-   issue `REGISTER_PARTITION` to mint partition-scoped badges.
-2. **Per-partition (badged)** — derived by vfsd from the whole-disk cap and
-   handed to filesystem drivers. Reads are bounded by the partition LBA range
-   registered for the badge.
+1. **Whole-disk (`MOUNT_AUTHORITY`-badged)** — minted by devmgr on
+   `QUERY_BLOCK_DEVICE` and held by vfsd. Reads are bounded only by device
+   capacity. Permitted to issue `REGISTER_PARTITION`.
+2. **Per-partition (partition badge, `MOUNT_AUTHORITY` clear)** — minted by
+   the driver and returned in the `REGISTER_PARTITION` reply; vfsd hands them
+   to filesystem drivers. The kernel rejects re-badging a badged source, so
+   the caller cannot derive partition caps itself. Reads and writes are
+   bounded by the partition LBA range registered for the badge.
 
 ---
 
@@ -45,23 +49,25 @@ defined in `shared/ipc::blk_labels`; error codes in `shared/ipc::blk_errors`.
 
 ### Label 2: `REGISTER_PARTITION`
 
-Mint a partition-scoped binding for a badged SEND cap. Callable only over
-the whole-disk endpoint; badged callers are rejected.
+Register a partition LBA range and receive a partition-badged `SEND_GRANT`
+cap scoped to it. Callable only with a `MOUNT_AUTHORITY`-badged cap (the
+whole-disk cap); callers whose badge lacks it receive `RegisterRejected`.
 
 **Request:**
 
 | Field | Value |
 |---|---|
 | label | 2 |
-| data[0] | Badge to bind |
+| data[0] | Caller's `BLK_LABELS_VERSION` |
 | data[1] | Base LBA |
-| data[2] | Length in sectors |
+| data[2] | Length in sectors (`>= 1`; base + length within device capacity) |
 
 **Reply:**
 
 | Field | Value |
 |---|---|
-| label | 0 (success) or `RegisterRejected` (4) |
+| label | 0 (success), `RegisterRejected` (4), or `LabelVersionMismatch` (6) |
+| caps[0] | On success, the partition-badged `SEND_GRANT` cap on this endpoint |
 
 ### Label 3: `BLK_READ_INTO_MEMORY`
 
@@ -94,7 +100,7 @@ page, packed contiguously; the rest of the page is unspecified.
 | 1 | `DeviceStatusIoerr` | VirtIO device returned `VIRTIO_BLK_S_IOERR` |
 | 2 | `DeviceStatusUnsupp` | VirtIO device returned `VIRTIO_BLK_S_UNSUPP` |
 | 3 | `OutOfBounds` | LBA outside the caller badge's partition range |
-| 5 | `InvalidMemoryCap` | Target Memory cap missing `MAP|WRITE`, sized other than one page, or absent |
+| 5 | `InvalidMemoryCap` | Target Memory cap missing `MAP|WRITE`, smaller than `count * 512`, or absent; or `count` is 0 or `count * 512` exceeds the u32 descriptor length |
 
 #### Reserved cap slots and the IOMMU forward-compat shape
 
@@ -146,7 +152,7 @@ read.
 | 1 | `DeviceStatusIoerr` | VirtIO device returned `VIRTIO_BLK_S_IOERR` |
 | 2 | `DeviceStatusUnsupp` | VirtIO device returned `VIRTIO_BLK_S_UNSUPP` |
 | 3 | `OutOfBounds` | LBA outside the caller badge's partition range |
-| 5 | `InvalidMemoryCap` | Source Memory cap missing `MAP|READ`, sized smaller than `count * 512`, or absent |
+| 5 | `InvalidMemoryCap` | Source Memory cap missing `MAP|READ`, smaller than `count * 512`, or absent; or `count` is 0 or `count * 512` exceeds the u32 descriptor length |
 
 ---
 

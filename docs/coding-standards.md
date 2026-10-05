@@ -470,8 +470,8 @@ capacity: usize,
 ## Build and CI
 
 `cargo xtask build` is the single mandatory build command; it runs Clippy with the
-mandated lint groups and treats all warnings as errors. Invocation details are in
-[xtask/README.md](../xtask/README.md) § `cargo xtask build`.
+mandated lint groups and treats all warnings as errors. The command's options are listed
+in [xtask/README.md](../xtask/README.md) § `cargo xtask build`.
 
 ---
 

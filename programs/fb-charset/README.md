@@ -27,10 +27,16 @@ Pure `std`: the sample is written to stdout in labelled sections —
 - CP437 box-drawing (single, double, and mixed junction grids),
 - block / shading elements,
 - the font-extension table (em-dash, ellipsis, `×`, `⇒`, `≠`, `✓`, arrows, …),
-- the ASCII multi-byte substitute path (`©` → `(C)`, `™` → `(TM)`, …) of the
-  [framebuffer driver](../../services/drivers/framebuffer/README.md),
+- the ASCII multi-byte substitute path (`©` → `(C)`, `™` → `(TM)`, …), whose
+  substitute table [`shared/text`](../../shared/text/README.md) owns and the
+  [framebuffer driver](../../services/drivers/framebuffer/README.md) applies,
 - one deliberately ill-formed UTF-8 sequence so the `U+FFFD` glyph is reachable (the
-  [driver](../../services/drivers/framebuffer/README.md) emits it for invalid UTF-8).
+  [driver](../../services/drivers/framebuffer/README.md) emits it for invalid UTF-8),
+- a 16-colour ANSI SGR sample: normal and bright foreground and background rows, bold
+  promoting a base colour to bright, `ESC[39m` / `ESC[49m` default restore, and a non-SGR
+  CSI that is swallowed rather than rendered. The terminal's
+  [`shared/ansi`](../../shared/ansi/README.md) parser maps these sequences to
+  `FB_SET_ATTRS` colour changes; serial receives the raw bytes.
 
 There are no assertions and no PASS/FAIL — the verdict is visual, which is why
 there is no automated tester (CI cannot inspect rendered pixels). With no stdout

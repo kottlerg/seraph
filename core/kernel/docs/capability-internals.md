@@ -754,10 +754,10 @@ In both cases a `cap_revoke` can `free_slot` the recipient's slot in its own
 `CSpace`. The handle the recipient holds carries the slot's **generation**
 (`handle = (generation << CAP_INDEX_BITS) | index`, per
 [docs/capability-model.md](../../../docs/capability-model.md) § Capability Handle
-Format); `free_slot` bumps the
-generation, so the recipient's now-stale handle fails with `InvalidCapability`
-rather than aliasing whatever later occupies the recycled index. See the per-slot
-generation discussion under [Capability Slot](#capability-slot-capslotrs).
+Format); `free_slot` bumps the generation, so the recipient's now-stale handle fails
+with `InvalidCapability` rather than aliasing whatever later occupies the recycled
+index. See the per-slot generation discussion under
+[Capability Slot](#capability-slot-capslotrs).
 
 `SlotId` encodes `(cspace_id, epoch, slot_index)`. The derivation tree is resolved
 by:
@@ -790,11 +790,11 @@ layout via a well-known structure at the top of init's stack.
 | 3 | Init's own CSpace capability |
 | 4 | SchedControl capability (band `[1, PRIORITY_MAX]`) |
 | 5..N | Memory capabilities (one per usable physical region) |
-| N+1..M | MMIO region capabilities (one per MmioRange / PciEcam entry) |
-| M+1..K | Interrupt capabilities (one per IrqLine entry) |
-| K+1..L | Read-only Memory capabilities (one per PlatformTable entry) |
-| L+1..P | IoPort capabilities (one per IoPort entry; x86-64 only) |
-| P+1..Q | Memory capabilities for boot module images (raw ELF for procmgr, devmgr, etc.) |
+| N+1..M | Mmio capabilities, Map and Write rights (one per `BootInfo.mmio_apertures` entry, plus one over the kernel console UART on RISC-V) |
+| M+1 | One root Interrupt range capability (every valid IRQ id on the architecture) |
+| M+2..L | Map-only Memory capabilities (one per `AcpiReclaimable` memory-map region, plus the page holding `BootInfo.acpi_rsdp` and the `BootInfo.device_tree` blob) |
+| L+1 | One root IoPort capability over the full 64K I/O port space (x86-64 only), or one SbiControl capability carrying every sanctioned SBI right (RISC-V only) |
+| L+2..Q | Memory capabilities for boot module images (raw ELF for procmgr, devmgr, etc.) |
 | Q+1..R | Reclaimable Memory capabilities for bootloader scratch pages (`BootInfo`, descriptor arrays, MMIO aperture array, reclaim-array page, transient page-table frames) and the bundle's non-module pages (header + entry table + pad, init ELF source body, inter-module and trailing slack — module bodies are excluded, covered by the boot-module Memory caps above) — one cap per `BootInfo.reclaim_ranges` entry |
 
 The exact slot numbers are passed to init in the `KernelHandoff` structure placed
@@ -835,11 +835,10 @@ themselves, the lock pair collapsing to a single acquisition. The transferred
 cap keeps its position in the derivation tree, so it remains reachable by a
 `cap_revoke` on one of its ancestors (see
 [docs/capability-model.md](../../../docs/capability-model.md) § Revocation);
-per-slot generation handles make the
-receiver's handle fail closed if such a revoke frees the
-receiver's slot (#349). A move that finishes in the first hold is atomic against
-revocation; one that needs further batches is protected by the in-flight pins
-and stays revocation-complete between holds (see [Move](#move)).
+per-slot generation handles make the receiver's handle fail closed if such a revoke
+frees the receiver's slot (#349). A move that finishes in the first hold is atomic
+against revocation; one that needs further batches is protected by the in-flight
+pins and stays revocation-complete between holds (see [Move](#move)).
 
 Reply capabilities are not part of the derivation tree — they are single-use,
 cannot be derived, and are not tracked for revocation (see
@@ -860,4 +859,5 @@ and § Reply Path).
 [SMP Scheduling and Locking Invariants](scheduling-internals.md),
 [Syscall Interface Specification](syscalls.md),
 [Capability Model](../../../docs/capability-model.md), [IPC Design](../../../docs/ipc-design.md),
+[Process Lifecycle](../../../docs/process-lifecycle.md),
 [init Bootstrap Stages](../../../services/init/docs/bootstrap.md)

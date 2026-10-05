@@ -10,9 +10,6 @@ This crate adds only the inline-assembly invocation layer.
 
 No stability obligation. Not used by the kernel.
 
-See [core/kernel/docs/syscalls.md](../../core/kernel/docs/syscalls.md) for the full
-syscall specification.
-
 ---
 
 ## Summarized By

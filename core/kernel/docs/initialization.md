@@ -342,10 +342,12 @@ Phase 7.
 ```
 
 The SbiControl rights are defined in
-[capability-model.md § SbiControl](../../../docs/capability-model.md). Init's reap-time
-donation of the reclaim caps is described in
-[process-lifecycle.md § Init reap](../../../docs/process-lifecycle.md), and the sealed buddy
-in [userspace-memory-model.md § Ownership Boundaries](../../../docs/userspace-memory-model.md).
+[capability-model.md § SbiControl](../../../docs/capability-model.md#sbicontrol-risc-v-only).
+Init's reap-time donation of the reclaim caps is described in
+[process-lifecycle.md § Init reap](../../../docs/process-lifecycle.md#init-reap), and the
+sealed buddy in
+[userspace-memory-model.md](../../../docs/userspace-memory-model.md#ownership-boundaries)
+§ Ownership Boundaries.
 
 **Failure mode:** Allocation failure during CSpace construction halts with
 "fatal: cannot initialise capability system".
@@ -367,7 +369,8 @@ The scratch pages and bundle layout are described in
 ```
 1. Initialise per-CPU run queues:
    - NUM_PRIORITY_LEVELS priority queues per CPU (e.g. 32 levels)
-   - Each queue is an intrusive doubly-linked list of TCBs
+   - Each queue is an intrusive singly-linked FIFO of TCBs (head/tail,
+     linked through run_queue_next)
 2. For each CPU (including the BSP):
    a. Use the idle kernel stack pre-allocated at per-CPU storage init
       (Phase 4); read its top from the IDLE_STACK_TOPS slab
@@ -508,7 +511,7 @@ The PIE bias window, relocation rules, and init stack placement are defined in
 § Bootstrap Cross-Boundary VAs; the kernel-half root entries and W^X rule in
 [memory-model.md](../../../docs/memory-model.md) § Virtual Address Space Layout and § Paging;
 the reap-time donation of the stack pages in
-[process-lifecycle.md § Init reap](../../../docs/process-lifecycle.md).
+[process-lifecycle.md § Init reap](../../../docs/process-lifecycle.md#init-reap).
 
 **Implementation notes:**
 - CSpace hand-off (step 5d): `sched::enter()` calls `set_current(init_tcb)` so

@@ -18,10 +18,12 @@ total RAM (see
 Capability Distribution" and
 [`docs/userspace-memory-model.md`](../../../docs/userspace-memory-model.md#ownership-boundaries)
 §"Ownership Boundaries"). Memory cap sizes vary — they reflect the firmware
-memory map and may span many MiB each. Init copies the entire RAM
-range into memmgr's CSpace via the derive-twice pattern, then transfers
-the slot range `(memory_base, memory_count)` to memmgr in a
-single bootstrap IPC round (see
+memory map and may span many MiB each. Init copies the RAM caps left after its
+own bootstrap allocations into memmgr's CSpace via the derive-twice pattern, as
+many as one bootstrap IPC round carries, forwards the memmgr/procmgr/init
+bootstrap arenas as in-use runs, and transfers the slot range
+`(memory_base, memory_count)` to memmgr in that round; the remaining RAM caps
+join the pool through the init-reap donation below (see
 [`docs/process-lifecycle.md`](../../../docs/process-lifecycle.md#init--memmgr)
 §"Init → memmgr").
 
@@ -30,8 +32,9 @@ each ingested cap at its native size; splitting happens on the
 allocation path via `memory_split`, and coalescing reverses the split on
 the free path.
 
-Beyond the bootstrap pool, memmgr also receives reclaimed frames at init's reap
-(`DONATE_MEMORY_CAPS`: init's ELF segments, InitInfo, stack, boot-module ELF
+Beyond the bootstrap pool, memmgr also receives RAM at init's reap
+(`DONATE_MEMORY_CAPS`: RAM caps beyond the bootstrap round, init's
+`MemoryAlloc` leftovers, init's ELF segments, InitInfo, stack, boot-module ELF
 sources, reclaim scratch, AP trampoline; see
 [`services/init/docs/bootstrap.md`](../../init/docs/bootstrap.md#handover)
 §"Handover"). Both entry points feed the same free
@@ -107,9 +110,9 @@ to the caller. The intermediary lets memmgr reclaim the cap on
 
 ## Per-Process Tracking
 
-memmgr maintains a per-process table keyed on the procmgr-minted badge
-delivered with every `REQUEST_MEMORY_CAPS` call (and established at
-`REGISTER_PROCESS`). Each entry records:
+memmgr maintains a per-process table keyed on the per-process badge memmgr
+mints at procmgr's `REGISTER_PROCESS` and that is delivered with every
+`REQUEST_MEMORY_CAPS` call. Each entry records:
 
 - The badge (process identity).
 - The head of an intrusive list of the Memory cap slots memmgr has handed
@@ -200,13 +203,15 @@ bump pointer blocks `memory_split`, per
 §"`SYS_MEMORY_SPLIT`" — until the retype is freed.
 
 `UNREGISTER_REGION` from a live process is the mid-life counterpart for a
-demand-paged region: memmgr removes the region node, and for each frame it
-backed inside that region **actively unmaps** the page from the delegated
-child `AddressSpace` (the process is still alive, so the mapping must be
-removed before the frame returns to the pool), inserts the cap back into the
-pool, frees the node, and coalesces the freed runs with their physical
-neighbours. Frames the caller mapped itself are left untouched. This is the
-reclamation path the ruststd guarded-stack consumer uses on `join()`.
+demand-paged region: memmgr removes the region node and **actively unmaps** the
+whole region span from the delegated child `AddressSpace` in one
+`mem_unmap_reclaim` call, which also returns the emptied page tables to that
+address space's page-table budget (the process is still alive, so the mappings
+must be removed before the frames return to the pool). It then inserts each
+backing frame's cap back into the pool, frees the frame nodes, and coalesces
+the freed runs with their physical neighbours. Frames the caller mapped itself
+are left untouched. This is the reclamation path the ruststd guarded-stack
+consumer uses on `join()`.
 
 ---
 
@@ -218,11 +223,11 @@ cap. Eligibility:
 
 - Both caps are present in the free pool.
 - The physical-base addresses are adjacent (`base_a + size_a == base_b`).
-- The kernel's `memory_merge` (or equivalent; see
+- The kernel's `memory_merge` accepts the operation (see
   [`core/kernel/docs/syscalls.md`](../../../core/kernel/docs/syscalls.md#sys_memory_merge-50)
-  §"`SYS_MEMORY_MERGE`") accepts the operation — the caps must share a common
-  ancestor in the derivation tree, which the original boot-time ingest
-  guarantees for caps derived from the same `BootInfo` Memory cap.
+  §"`SYS_MEMORY_MERGE`"): the caps must be derivation siblings with identical
+  rights, the tail must be virgin (never retyped or sub-allocated), and neither
+  may have derivation children.
 
 Coalescing runs explicitly after every reclamation — `PROCESS_DIED`,
 `RELEASE_MEMORY_CAPS`, and `UNREGISTER_REGION` alike — so a freed run rejoins
@@ -243,9 +248,10 @@ see [`core/kernel/docs/syscalls.md`](../../../core/kernel/docs/syscalls.md#sys_m
 cost scales with the live run count, which best-fit and this pass jointly keep small, so the
 per-reclamation merge is negligible.
 
-Coalescing across boot-time ingest boundaries (between two distinct
-`BootInfo` Memory caps) is not attempted — those caps have no common
-derivation ancestor.
+memmgr does not pre-filter for eligibility: it sorts the free runs by physical
+base and attempts `memory_merge` on every adjacent pair, and the kernel declines
+any pair that fails the preconditions above. A declined pair stays as two
+discrete runs.
 
 ---
 

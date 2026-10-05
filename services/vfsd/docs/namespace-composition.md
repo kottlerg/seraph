@@ -89,11 +89,12 @@ endpoint dispatches in two stages, from `vfsd::namespace_loop`:
    against the destination cap's badge
    ([`shared/namespace-protocol/README.md`](../../../shared/namespace-protocol/README.md)
    § NS_LOOKUP), so without the repack the
-   caller's attenuation would be discarded. Repacking preserves the
-   [`docs/namespace-model.md`](../../../docs/namespace-model.md#walking) § "Walking" invariant
-   (walk-monotonic-attenuation) across mount boundaries: a child cap
-   minted at the fs driver carries at most the caller's parent
-   rights, intersected with the entry's `max_rights` ceiling.
+   caller's attenuation would be discarded. Repacking keeps walking
+   monotonically attenuating across mount boundaries, as
+   [`docs/namespace-model.md`](../../../docs/namespace-model.md#cross-server-entries)
+   § Cross-server entries requires of a forwarder: a child cap minted
+   at the fs driver carries at most the caller's parent rights,
+   intersected with the entry's `max_rights` ceiling.
 
    The fall-through preserves the namespace-model rule that root-fs
    entries remain reachable unless explicitly shadowed by a
@@ -139,7 +140,7 @@ attenuation across the mount boundary
 badge, and the kernel forbids re-badging an already-badged cap
 (`SYS_CAP_DERIVE_BADGE` rejects a badged source; see
 [`docs/capability-model.md`](../../../docs/capability-model.md#kernel-guarantees)
-§ Badges), so a stored badged cap
+§ Kernel guarantees), so a stored badged cap
 could only ever be `cap_derive`-copied at its original full rights,
 laundering authority. The root mount is the exception — its
 `fallthrough_cap` is a *badged* SEND on the root fs (see fall-through
@@ -181,6 +182,14 @@ vfsd holds two un-badged endpoints:
   kernel-derivation parent for every system-root cap vfsd ever
   issues via `cap_derive_badge` (the synthetic root cap, plus a
   fresh cap per synthetic intermediate descent).
+
+At startup vfsd spawns the namespace dispatcher first, then self-mounts
+root, `/esp`, and `/data`, then spawns the service threads. The
+dispatcher runs first because the `/esp` and `/data` mounts spawn fatfs
+via `CREATE_FROM_FILE`, which re-enters the namespace endpoint to
+resolve `/services/fs/fatfs`. Service threads start only after the
+self-mounts, so `GET_SYSTEM_ROOT_CAP` is never served against an
+unmounted root; if the root self-mount failed, it replies `NO_MOUNT`.
 
 vfsd is also the owner of fs-process lifecycle: `MOUNT` spawns the
 fatfs driver via `worker_pool` (or, on the very first mount, from

@@ -46,9 +46,10 @@ svcmgr mints the `devmgr.registry` publish cap
 (`DRIVERS_DIR_AUTHORITY`) from caps[3]. A version mismatch in `data[1]`
 aborts bootstrap (svcmgr exits).
 
-**Rounds 2..N — `SUBSTRATE` (`data[0] = 2`; the final round is terminal):**
+**Rounds 2..N — `SUBSTRATE` (`data[0] = 2`, not terminal):**
 one per init-bootstrapped substrate service (memmgr, procmgr, devmgr,
-vfsd, logd); see init's [Handover](../../init/docs/bootstrap.md#handover) stage.
+vfsd) whose thread cap init captured; logd is not a substrate. See init's
+[Handover](../../init/docs/bootstrap.md#handover) stage.
 
 | Field | Value |
 |---|---|
@@ -57,7 +58,19 @@ vfsd, logd); see init's [Handover](../../init/docs/bootstrap.md#handover) stage.
 | data[1] | `name_len` (byte length of the service name) |
 | data[2..] | service name bytes packed LE into `u64` words (≤ 32 bytes) |
 
-svcmgr parks each pair in its pending-registration table. It does **not**
+**Final round — `LOGD_SOURCES` (`data[0] = 3`, terminal):**
+
+| Field | Value |
+|---|---|
+| caps[0] | `master_log_source`: `RIGHTS_ALL` source on init's master log endpoint; svcmgr mints real-logd's master-log RECV from it on every (re)launch and the one-shot `HANDOVER_PULL` SEND on the first launch; holding it keeps the log endpoint alive across a logd crash (`0` if absent) |
+| caps[1] | `procmgr_death_auth_source`: badge-0 `SEND\|GRANT` source on procmgr's service endpoint; svcmgr mints real-logd's `DEATH_EQ_AUTHORITY` SEND from it per launch (`0` if absent) |
+| data[0] | `3` (`LOGD_SOURCES`) |
+
+svcmgr holds both sources for the system's life and mints real-logd's
+[`log_sink`](service-definitions.md#log_sink) bootstrap round from them on
+every (re)launch. A zero slot leaves logd unlaunchable; svcmgr continues.
+
+svcmgr parks each substrate pair in its pending-registration table. It does **not**
 bind death-notification at endowment time — the matching `.svc`
 definition is paired at reconciliation, on
 [`HANDOVER_COMPLETE`](#label-2-handover_complete). After draining the
@@ -195,7 +208,12 @@ Exit reason encoding:
 | Value | Meaning |
 |---|---|
 | `0` | clean exit (`SYS_THREAD_EXIT`) |
-| `EXIT_FAULT_BASE..` | fault (exception vector / scause + base); full space in [process-lifecycle.md](../../../docs/process-lifecycle.md#exit-reason) |
+| `1..=0x0FFF` | voluntary exit code |
+| `0x1000..=0x1FFF` (`EXIT_FAULT_BASE + vector`) | fault (exception vector / scause + base) |
+| `0x2000` (`EXIT_KILLED`) | killed |
+
+The full space is defined in
+[process-lifecycle.md](../../../docs/process-lifecycle.md#exit-reason).
 
 ---
 
@@ -245,6 +263,7 @@ policy + budget):
 
 ## Summarized By
 
+[Device Management](../../../docs/device-management.md),
 [Process Lifecycle](../../../docs/process-lifecycle.md),
 [services/init/README.md](../../init/README.md),
 [init Bootstrap Stages](../../init/docs/bootstrap.md), [services/svcmgr/README.md](../README.md)

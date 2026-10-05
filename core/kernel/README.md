@@ -214,9 +214,9 @@ and is compiled with a custom target specification for each architecture:
 | x86-64 | `x86_64-seraph-none` |
 | RISC-V | `riscv64imac-seraph-none` |
 
-Custom target JSON files live in `xtask/targets/`. They specify the code model,
-relocation model, and disable features the kernel cannot use (SSE/AVX before explicit
-initialization, for example). See [docs/build-system.md](../../docs/build-system.md) for the
+Custom target JSON files live in `xtask/targets/`. They specify the code model, a
+static-PIE relocation model, and soft-float codegen (no SSE/AVX/MMX in the kernel on
+x86-64). See [docs/build-system.md](../../docs/build-system.md) § Custom Targets for the
 toolchain and target configuration.
 
 `build.rs` selects the appropriate linker script from `linker/` based on the active
@@ -278,6 +278,7 @@ single argument: a `*const BootInfo` pointer whose physical address is in `rdi`
 | [docs/capability-model.md](../../docs/capability-model.md) | Capability types, rights, revocation |
 | [abi/boot-protocol/](../../abi/boot-protocol/) | `BootInfo` structure, `BOOT_PROTOCOL_VERSION` |
 | [boot/docs/kernel-handoff.md](../boot/docs/kernel-handoff.md) | CPU state and register contents at kernel entry |
+| [docs/build-system.md](../../docs/build-system.md) | Toolchain, custom kernel target specifications |
 | [docs/coding-standards.md](../../docs/coding-standards.md) | Formatting, naming, safety rules |
 
 ---

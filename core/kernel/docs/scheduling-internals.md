@@ -1020,15 +1020,20 @@ The kernel does not auto-cascade IPC unblock on process exit. The contract:
 
 2. **Kernel-side unblock sites that DO exist:**
    - `event_queue_drop` (`core/kernel/src/ipc/event_queue.rs`): when the EQ refcount hits zero, any
-     parked consumer is woken with `wakeup_value = 0`. The consumer's syscall return path treats
-     `wakeup_value == 0` as "object gone" via the `timed_out` companion flag
-     (`core/kernel/src/sched/thread.rs`).
+     parked consumer is woken with `wakeup_value = 0` and `timed_out` left clear, so its
+     `sys_event_recv` returns success with a zero payload; no separate "object gone" signal is
+     set.
    - `wait_set_drop` (`core/kernel/src/ipc/wait_set.rs`): walks every member's source, clears the
      back-pointer under the source's lock, then wakes any blocked waiter on the wait set itself.
      See [ipc-internals.md](ipc-internals.md) § Wait Set Add/Remove.
-   - `notification` and `endpoint` do **not** auto-unblock parked threads on drop today. A blocked
-     sender on an endpoint that loses its last cap holder will remain blocked indefinitely. This is
-     by design at the kernel level — capability revocation is the higher-level mechanism.
+   - `dealloc_object` Endpoint arm (`core/kernel/src/cap/object.rs`): under `ep.lock`, drains the
+     send and receive queues and wakes every queued thread. Senders are stamped INTERRUPTED (a
+     queued fault sender is stamped KILL); receivers are stamped INTERRUPTED.
+   - `dealloc_object` Notification arm (`core/kernel/src/cap/object.rs`): under the notification
+     lock, wakes a parked waiter with `wakeup_value = 0`.
+
+   The endpoint drain dispositions are listed in [ipc-internals.md](ipc-internals.md)
+   § Park Dispositions and Episodes.
 
 3. **Wait-set member lifetime is refcounted.** `core/kernel/src/ipc/wait_set.rs` still holds raw
    `source_ptr`s into endpoint/notification/EQ objects, but each `WaitSetMember` now also holds a +1

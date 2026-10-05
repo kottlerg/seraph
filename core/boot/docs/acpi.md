@@ -64,8 +64,10 @@ Malformed tables are skipped, not fatal:
 - Unknown MADT / MCFG entry types are silently skipped.
 
 A warning is logged on hard failure; the bootloader proceeds with
-whatever it successfully extracted and lets the kernel fall back to its
-compile-time defaults for any zero fields (see [boot-flow.md](boot-flow.md) §"Step 9").
+whatever it successfully extracted. The kernel falls back to its compile-time defaults
+for any zero MMIO base field, but a zero riscv64 `timebase_freq` or a missing `hart_caps`
+bit (both filled by the RHCT walk) halts the kernel at Phase 5 (see
+[boot-flow.md](boot-flow.md) §"Step 9").
 
 ---
 

@@ -72,8 +72,8 @@ The driver feeds each byte to its `text::Utf8Decoder`:
 * `\n` advances to the start of the next line (scrolling if at the
   bottom); `\r` returns the cursor to column 0; `\x08` (backspace) moves
   the cursor back one column (clamped at column 0). All three bypass the
-  decoder. The terminal pairs `\x08` with an overwriting space for a
-  destructive backspace.
+  decoder. The terminal ([programs/terminal](../../../programs/terminal/README.md))
+  pairs `\x08` with an overwriting space for a destructive backspace.
 * Other bytes drive the decoder; on a completed codepoint the driver
   calls `text::render_codepoint` ([`shared/text`](../../../shared/text/README.md)), which
   dispatches in order:

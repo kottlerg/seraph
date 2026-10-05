@@ -11,6 +11,20 @@ The terminal renders no prompt, so the shell owns the `$ ` prompt.
 
 ---
 
+## Source Layout
+
+```
+shell/
+├── Cargo.toml
+├── README.md
+├── src/main.rs                 # REPL, built-ins, external-command relay
+├── path/                       # `shell-path` crate: pure host-tested lexical
+│                               # path resolution
+└── tester/                     # `shell-tester` crate: tier-3 per-program tester
+```
+
+---
+
 ## v0.0.1 scope
 
 - **Prompt**: `$ ` written (and flushed) before each line is read.
@@ -48,18 +62,15 @@ blocked stdin read cannot be cancelled, so a child that never reads stdin (e.g.
 
 ### Placement relative to a real shell
 
-The shell occupies bash's *role* — the interactive REPL child of the terminal
-that spawns and reaps its own children — but over a different I/O substrate. A
-Unix shell does **not** relay stdin: the shell and its children share one kernel
-TTY, and the kernel routes input to the foreground process group (job control).
-Seraph has no shared tty and no job control yet ([#29]); the
-[terminal](../terminal/README.md) relays to exactly one pipe (the shell's stdin) and is
-oblivious to grandchildren. So the
-shell forwarding stdin to its child is the *interim* substitute for the
-shared-tty / foreground-group model — not a bash-faithful mechanism. The
-Unix-faithful design (the terminal re-pointing input at the foreground
-grandchild) is [#29] job control, deliberately deferred. Layering
-(shell → `ruststd` → IPC) mirrors shell → libc → syscalls; the shell holds no
+The shell occupies bash's *role* — the interactive REPL child of the terminal that spawns and reaps
+its own children — but over a different I/O substrate. A Unix shell does **not** relay stdin: the
+shell and its children share one kernel TTY, and the kernel routes input to the foreground process
+group (job control). Seraph has no shared tty and no job control yet ([#29]); the
+[terminal](../terminal/README.md) relays to exactly one pipe (the shell's stdin) and is oblivious to
+grandchildren. So the shell forwarding stdin to its child is the *interim* substitute for the
+shared-tty / foreground-group model — not a bash-faithful mechanism. The Unix-faithful design (the
+terminal re-pointing input at the foreground grandchild) is [#29] job control, deliberately
+deferred. Layering (shell → `ruststd` → IPC) mirrors shell → libc → syscalls; the shell holds no
 capabilities of its own.
 
 ## Known limitations

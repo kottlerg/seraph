@@ -117,10 +117,9 @@ pub fn init_paging_mode(info: &boot_protocol::BootInfo);
 
 /// Base virtual address of the direct physical map: the KASLR-chosen base from
 /// `BootInfo` — a 1 GiB-aligned base at or above the kernel-half floor
-/// (0xFFFF800000000000 on x86-64 / Sv48; see
-/// docs/memory-model.md § Virtual Address Space Layout),
-/// published by `init_paging_mode`. A
-/// runtime `AtomicU64` on both arches (a single relaxed load); wrapped by
+/// (0xFFFF800000000000 on x86-64 / Sv48; see docs/memory-model.md § Virtual
+/// Address Space Layout), published by `init_paging_mode`. A runtime
+/// `AtomicU64` on both arches (a single relaxed load); wrapped by
 /// `mm::paging::direct_map_base()` for architecture-neutral consumers.
 pub fn direct_map_base() -> u64;
 

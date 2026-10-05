@@ -72,10 +72,11 @@ firmware. Discovery runs in
    resort. This keeps the bootloader functional on bare-QEMU-like
    environments that advertise neither table.
 
-SPCR is the one ACPI table consumed outside Step 5's firmware-parsing
-path ([acpi.md](acpi.md)); the pre-Step-1 order is load-bearing because every
-later step wants diagnostics and every subsequent ACPI walk would itself want to emit
-diagnostics if something went wrong.
+SPCR is the one ACPI table consumed outside the firmware-parsing path
+(steps 5 and 9 of [boot-flow.md](boot-flow.md); see [acpi.md](acpi.md)); the
+pre-Step-1 order is load-bearing because every later step wants diagnostics and
+every subsequent ACPI walk would itself want to emit diagnostics if something
+went wrong.
 
 ---
 
@@ -97,10 +98,10 @@ result feeds both the on-screen early-boot messages and the
 ### Glyph Rendering
 
 The font is the `9×20` bitmap array exposed by
-[`shared/font/`](../../../shared/font/): 256 glyphs, each stored as a
-flat `[u16; 5120]` with `FONT_9X20[N * 20 + R]` yielding scanline `R`
-of glyph `N`. Bits 15–7 of each scanline are the 9 pixels, MSB first
-(see [`shared/font/README.md`](../../../shared/font/README.md)).
+[`shared/font/`](../../../shared/font/): 256 glyphs stored in one flat
+`[u16; 5120]` array (20 scanlines per glyph), with `FONT_9X20[N * 20 + R]`
+yielding scanline `R` of glyph `N`. Bits 15–7 of each scanline are the 9
+pixels, MSB first (see [`shared/font/README.md`](../../../shared/font/README.md)).
 
 The writer tracks a character-cell cursor. Its operations:
 - Advance on each glyph (wrap on `max_cols`, scroll on `max_rows`).
@@ -154,4 +155,5 @@ all is a userspace policy decision, not a bootloader concern.
 
 ## Summarized By
 
-[ACPI Parsing](acpi.md), [UEFI Environment](uefi-environment.md)
+[ACPI Parsing](acpi.md), [UEFI Environment](uefi-environment.md),
+[Console Model](../../../docs/console-model.md)

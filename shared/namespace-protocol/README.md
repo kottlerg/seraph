@@ -37,8 +37,8 @@ capability slots ([docs/ipc-design.md](../../docs/ipc-design.md)
 | 21 | `NS_STAT` | client → server | Attribute snapshot for the addressed node |
 | 22 | `NS_READDIR` | client → server | Enumerate one entry of a directory by index |
 
-The label's low 16 bits carry the opcode; the high 16 bits carry an
-opcode-defined header (today: name length for `NS_LOOKUP`).
+Label bits 0..16 carry the opcode; bits 16..32 carry an opcode-defined
+header (today: name length for `NS_LOOKUP`); bits 32..64 are zero.
 
 Error replies use the matching [`NsError`] discriminant value as the
 reply label; success replies use label `0`.
@@ -73,8 +73,8 @@ badge.
 
 | Field | Value |
 |---|---|
-| `label` low 16 bits | `20` |
-| `label` high 16 bits | `name_len` (1..=255) |
+| `label` bits 0..16 | `20` |
+| `label` bits 16..32 | `name_len` (1..=255) |
 | `data[0]` | Caller-requested rights (low 24 bits; sentinel `0xFFFF` requests "everything I am allowed") |
 | `data[1..]` | Name bytes packed little-endian, `name_len` bytes total |
 | `caps` | empty |
@@ -216,7 +216,7 @@ bits are defined; sixteen are reserved.
 | 0 | `LOOKUP` | `NS_LOOKUP` into this directory |
 | 1 | `READDIR` | `NS_READDIR` enumeration |
 | 2 | `STAT` | `NS_STAT` |
-| 3 | `READ` | `NS_READ` / `NS_READ_MEMORY` (file) |
+| 3 | `READ` | `FS_READ` / `FS_READ_MEMORY` (file) |
 | 4 | `WRITE` | `NS_WRITE` (deferred; reserved) |
 | 5 | `EXEC` | File is executable; consumed by ELF loaders |
 | 6 | `MUTATE_DIR` | `NS_CREATE` / `NS_UNLINK` (deferred; reserved) |
@@ -308,5 +308,6 @@ describes vfsd's synthetic-root composition in detail.
 ## Summarized By
 
 [Namespace Model](../../docs/namespace-model.md),
+[services/fs/README.md](../../services/fs/README.md),
 [Filesystem Driver Protocol](../../services/fs/docs/fs-driver-protocol.md),
 [Synthetic Root and Namespace Composition](../../services/vfsd/docs/namespace-composition.md)

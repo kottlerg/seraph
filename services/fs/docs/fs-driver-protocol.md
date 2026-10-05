@@ -37,10 +37,11 @@ A filesystem driver exposes one IPC endpoint, used as both:
 - the un-badged **namespace endpoint** routed through
   [`namespace_protocol::dispatch_request`] for `NS_*` dispatch.
 
-The receive-side cap is injected into the driver's CSpace at two-
-phase process creation. The same endpoint is also the kernel-
-derivation parent for every node cap the driver ever issues via
-`cap_derive_badge`.
+vfsd delivers the endpoint cap (all rights: receive and badge
+derivation) in the driver's bootstrap round; see
+[Bootstrap caps](#bootstrap-caps). The same endpoint is also the
+kernel-derivation parent for every node cap the driver ever issues
+via `cap_derive_badge`.
 
 Numeric label values live in [`ipc::fs_labels`] (this document) and
 [`ipc::ns_labels`] (namespace-protocol document).
@@ -59,15 +60,17 @@ its block device endpoint and reply success or a typed error.
 | Field | Value |
 |---|---|
 | `label` | `10` |
-| body | empty |
+| `data[0]` | Caller's `ipc::FS_LABELS_VERSION` |
 
 **Reply (success)**: `label = 0`, empty body.
 
-**Reply (error)**: `label = ipc::fs_errors::*` (e.g. `IO_ERROR`,
-`NOT_FOUND` for a malformed BPB).
+**Reply (error)**: `label = ipc::fs_errors::*`:
+`LABEL_VERSION_MISMATCH` when `data[0]` differs from the driver's
+`FS_LABELS_VERSION` (checked before the BPB is read), else e.g.
+`IO_ERROR`, or `NOT_FOUND` for a malformed BPB.
 
-The block device endpoint arrives in the driver's CSpace at creation
-time; see [Bootstrap caps](#bootstrap-caps).
+The block device endpoint arrives in the driver's bootstrap round;
+see [Bootstrap caps](#bootstrap-caps).
 
 ---
 
@@ -111,9 +114,11 @@ Memory-cap read. The driver returns a single-page Memory cap with
 attenuated rights (`MAP|READ`) covering the cached page that contains
 the requested byte. The client maps the memory cap, reads up to
 `bytes_valid` bytes starting at `memory_data_offset`, then releases
-the page either synchronously after the read or in response to a
-driver-initiated [`FS_RELEASE_MEMORY`](#label-8-fs_release_memory)
-arriving on the per-process release endpoint.
+the page either synchronously after the read, by sending
+[`FS_RELEASE_MEMORY`](#client-to-driver-release) on the node cap, or
+in response to a driver-initiated
+[`FS_RELEASE_MEMORY`](#driver-to-client-release) arriving on the
+per-process release endpoint.
 
 The request `offset` has no alignment requirement; the driver reports
 where the file's content for `offset` lives within the returned memory cap
@@ -229,7 +234,12 @@ TCG (no KVM); the *ratio* between paths is what informs the policy.
 
 ## Label 8: `FS_RELEASE_MEMORY`
 
-Driver-to-client request to release a previously-returned Memory cap.
+Release of a previously-returned Memory cap, in either direction:
+driver-to-client for cooperative eviction, and client-to-driver for
+synchronous release after a read.
+
+### Driver-to-client release
+
 Sent by the driver's eviction worker on the client's per-process
 release endpoint cap, recorded by the driver from `caps[0]` of the
 client's first [`FS_READ_MEMORY`](#label-7-fs_read_memory) for the
@@ -252,6 +262,28 @@ The client unmaps the matching Memory cap and replies with
 [`FS_RELEASE_ACK`](#label-9-fs_release_ack). If the client does not
 acknowledge within the cooperative-release watchdog window (100 ms),
 the driver `cap_revoke`s the parent Memory cap.
+
+### Client-to-driver release
+
+Sent by the client on the per-node badged cap the page was read
+through, once it has finished reading the page; the client then tears
+down its local mapping. No release endpoint and no
+[`FS_RELEASE_ACK`](#label-9-fs_release_ack) are involved.
+
+**Request**
+
+| Field | Value |
+|---|---|
+| `label` | `8` |
+| `data[0]` | Release cookie from the [`FS_READ_MEMORY`](#label-7-fs_read_memory) reply |
+
+The driver revokes every cap derived from the matching outstanding
+page's parent Memory cap, deletes that parent, and releases the
+page-cache slot.
+
+**Reply (success)**: `label = 0`, empty body. A cookie that matches
+no outstanding page on the node (including a node with no open-file
+slot) is a no-op success.
 
 ---
 
@@ -414,8 +446,11 @@ directory cap with `MUTATE_DIR`.
 
 Cross-directory rename is deferred: servers cannot introspect the
 badge packed in a received cap, so a second-directory cap cannot
-resolve to a `NodeId`. A future Issue may add a wire shape that
-conveys the destination directory's `NodeId` explicitly.
+resolve to a `NodeId`. Supporting it needs either a kernel-level
+`cap_info` selector that reports a cap's badge or a wire shape that
+conveys the destination directory's `NodeId` out-of-band (design
+intent; not yet implemented). Tracked as
+[Issue #89](https://github.com/kottlerg/seraph/issues/89).
 
 `FS_RENAME` is not atomic — see
 [`services/fs/fat/docs/crash-safety.md`](../fat/docs/crash-safety.md)
@@ -462,20 +497,23 @@ at this index" by reply label.
 
 ## Bootstrap caps
 
-A filesystem driver receives the following caps in its CSpace at
-two-phase process creation, identified by sentinel values in the
-`CapDescriptor.aux0` field:
+A filesystem driver obtains its service-specific caps in a single
+`ipc::bootstrap` round: at startup it calls
+`ipc::bootstrap::request_round` on its `creator_endpoint`, and vfsd
+replies with one round marked done, carrying two caps and zero data
+words:
 
-| Sentinel | Meaning |
+| Slot | Cap |
 |---|---|
-| `0xFFFF_FFFF_FFFF_FFFF` | Log endpoint |
-| `0xFFFF_FFFF_FFFF_FFFE` | Service endpoint (Receive-side) |
-| `0xFFFF_FFFF_FFFF_FFFD` | Block device endpoint (Send-side, partition-scoped) |
-| `0x0000_0000_0000_0000` (aux0 and aux1 both zero) | procmgr endpoint |
+| `caps[0]` | Block device endpoint (SEND, partition-scoped badge on virtio-blk) |
+| `caps[1]` | Driver service endpoint (all rights: receive and badge derivation) |
 
-All sentinels use `CapType::Memory` as the discriminant — the actual
-kernel object is an Endpoint, but the `CapType` field is overloaded
-for sentinel identification.
+A round with fewer than two caps, or not marked done, is a bootstrap
+failure and the driver exits. The log and procmgr endpoints are not
+part of this round; the driver takes them from `ProcessInfo` (exposed
+to `main` as `StartupInfo`), per
+[abi/process-abi/README.md](../../../abi/process-abi/README.md)
+§ ProcessInfo.
 
 The block device endpoint is partition-scoped: vfsd registers the
 partition bound with virtio-blk before delivering this cap, so the
@@ -502,5 +540,5 @@ bound on every `BLK_READ_INTO_MEMORY`. See
 ## Summarized By
 
 [Storage](../../../docs/storage.md), [services/fs/README.md](../README.md),
-[services/fs/fat/README.md](../fat/README.md),
+[services/fs/fat/README.md](../fat/README.md), [services/vfsd/README.md](../../vfsd/README.md),
 [vfsd Service Interface](../../vfsd/docs/vfs-ipc-interface.md)

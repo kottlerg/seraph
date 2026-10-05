@@ -19,7 +19,7 @@
 //!
 //! ## Reply capability
 //! Phase 9 uses a simple approach: the "reply cap" is stored directly in the
-//! caller's TCB (`reply_tcb` field). The server's `reply_cap_slot` points at the
+//! server's TCB (`reply_tcb` field). The server's `reply_tcb` points at the
 //! caller's TCB. Full derivation-tree reply caps are deferred to a future phase.
 //!
 //! ## Thread safety

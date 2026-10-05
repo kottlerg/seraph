@@ -30,9 +30,9 @@ Authority over memory is partitioned across four layers:
   procmgr is itself a memmgr client; its heap is backed by memmgr.
   See [`services/procmgr/README.md`](../services/procmgr/README.md).
 - **`std::sys::seraph`** — per-process Rust standard library platform
-  layer. Owns the process's virtual address space layout, hosts the
-  `#[global_allocator]`, and hosts the page-granular reservation
-  allocator for foreign Memory mappings.
+  layer. Owns the process's virtual address space layout, provides the
+  `GlobalAlloc` impl behind std's default `System` allocator, and hosts
+  the page-granular reservation allocator for foreign Memory mappings.
 
 The kernel hands the initial RAM memory caps to init at boot. Init
 transfers them to memmgr (derive-twice; see
@@ -75,7 +75,7 @@ disjoint surfaces:
 
 | Surface | Granularity | Owner | Used for |
 |---|---|---|---|
-| Byte heap | Bytes | `std::sys::seraph::alloc` (`#[global_allocator]`) | `Box`, `Vec`, `String`, all `alloc`/`std` collections |
+| Byte heap | Bytes | `std::sys::seraph::alloc` (`GlobalAlloc` for `System`) | `Box`, `Vec`, `String`, all `alloc`/`std` collections |
 | Page reservations | 4 KiB pages | `std::sys::seraph` | Foreign Memory mappings: MMIO, DMA, shmem, zero-copy file pages, ELF-load scratch, demand-paged per-thread stacks (heap-backed stacks and spawned-thread IPC buffers come from the byte heap) |
 | Bootstrap cross-boundary VAs | 4 KiB pages | Process creator (kernel for init, init for memmgr/procmgr, procmgr for everyone else) | `ProcessInfo`/`InitInfo` page, main-thread stack, main-thread IPC buffer, main-thread TLS block |
 
@@ -111,8 +111,10 @@ communicates them via `ProcessInfo` / `InitInfo`.
   bootstrap heap is a `std::sys::seraph` implementation detail.
 - **Out-of-memory.** `GlobalAlloc::alloc` returns null and the `alloc`
   crate aborts through `handle_alloc_error` (std's abort path, which
-  traps on seraph), terminating the faulting thread. svcmgr observes the
-  death via its event queue and applies restart policy. No kernel panic.
+  traps on seraph): a terminal fault that tears down the whole process
+  (procmgr reaps it on the address-space death notification). svcmgr
+  observes the death via its event queue and applies restart policy. No
+  kernel panic.
 - **Thread safety.** A spinlock guards the allocator. Multi-threaded
   services share one allocator instance.
 - **`no_std` exceptions.** `init` and `memmgr` are `no_std` and have
@@ -158,7 +160,7 @@ its first instruction. The creator chooses every one of these virtual
 addresses per-process — none is a fixed ABI constant — and communicates
 them either through the handover struct or, for the handover page itself,
 through the entry register. Procmgr and init draw process layouts via
-[`shared/process-layout`](../shared/process-layout/)
+[`shared/process-layout`](../shared/process-layout/README.md)
 (`choose_process_layout`, fed `SYS_GETRANDOM` entropy); the kernel draws
 init's layout per boot via its own `choose_init_layout` over the same
 window constants (`crate::entropy::fill_bytes`).
@@ -203,7 +205,9 @@ quality caveat.
   `ProcessInfo.stack_top_vaddr` with a guard page below. The page
   count comes from the binary's optional `.note.seraph.stack` ELF note
   (declared via the `process_abi::stack_pages!` /
-  `std::os::seraph::stack_pages!` macro); binaries that omit the note inherit
+  `std::os::seraph::stack_pages!` macro; see
+  [Stack-size note](../abi/process-abi/README.md#stack-size-note-noteseraphstack));
+  binaries that omit the note inherit
   `DEFAULT_PROCESS_STACK_PAGES`. Loaders clamp to
   `MAX_PROCESS_STACK_PAGES`; the pool's available RAM is the remaining
   gate on the resulting `REQUEST_MEMORY_CAPS` calls (memmgr tracks
@@ -331,8 +335,9 @@ Lazy or demand backing of a reservation — mapping frames only on first
 access rather than up front — is a userspace-pager policy built on the
 fault-handler protocol ([Fault Handling](fault-handling.md)), not a kernel
 feature. memmgr implements it as the pager: a process reserves and
-registers a range via `std::os::seraph::register_demand_paged`, and memmgr
-maps a frame on each first-touch fault.
+registers a range via `std::os::seraph::register_demand_paged`, and on each
+first-touch fault memmgr backs the registered chunk containing the faulting
+page (up to `DEMAND_CHUNK_PAGES` pages).
 
 ---
 

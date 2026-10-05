@@ -37,7 +37,7 @@ see there for the authoritative statement.
 | `docs/` | Architecture and design documentation |
 | [`programs/`](programs/README.md) | General-purpose userspace applications, utilities, and the test fixtures the harnesses spawn |
 | [`rootfs/`](rootfs/README.md) | System files installed into the sysroot during builds (config files, etc) |
-| [`runtime/`](runtime/README.md) | Language runtime layers consumed by userspace (libc, ruststd) |
+| [`runtime/`](runtime/README.md) | Language runtime layers consumed by userspace (ruststd; libc is design intent, not yet implemented) |
 | [`services/`](services/README.md) | Userspace OS processes: managers, drivers, filesystems, daemons |
 | [`shared/`](shared/README.md) | Shared utility crates |
 | [`xtask/`](xtask/README.md) | Build task runner (`cargo xtask`); custom target JSON specs under `xtask/targets/` |
@@ -108,4 +108,4 @@ Overall project design documents live in [`docs/`](docs/):
   source-of-truth discipline, workflow integration
 
 Each component's `README.md` references the design docs relevant to that component
-(see [Documentation Standards](docs/documentation-standards.md#document-hierarchy)).
+(see [Documentation Standards](docs/documentation-standards.md#required-structure)).

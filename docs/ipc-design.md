@@ -167,9 +167,9 @@ Under the fault-handler protocol ([Fault Handling](fault-handling.md)), a usersp
 fault the kernel cannot resolve is delivered to the thread's bound fault-handler endpoint as
 a kernel-originated synchronous message, suspending the thread until the handler replies —
 resuming it, or killing it on `FAULT_REPLY_KILL` — or the binding is severed and the thread
-is killed.
-This reuses the call/reply machinery above — the suspended thread occupies the caller's
-role and the handler services it with the ordinary receive/reply cycle. See
+is killed (severing by clearing the binding mid-fault: design intent; not yet implemented,
+#242). This reuses the call/reply machinery above — the suspended thread occupies the
+caller's role and the handler services it with the ordinary receive/reply cycle. See
 [Fault Handling](fault-handling.md).
 
 ---

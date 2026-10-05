@@ -38,16 +38,15 @@ tag's release notes.
 ## Workflow Integration
 
 The release workflow at `.github/workflows/release.yml` is the sole
-mechanism for creating GitHub Releases. It triggers on tag push matching
-`v*.*.*`, or on manual dispatch against such a tag ref (its jobs refuse
-branch refs). A `preflight` job first verifies that the workspace version
-in the root `Cargo.toml` matches the tag and that `docs/releases/<tag>.md`
-exists and contains every `##` section heading of `TEMPLATE.md`. The
-workflow then builds release-profile disk images for every supported
-architecture, compresses them with `zstd -19`, and creates a draft Release
-whose body is the contents of `docs/releases/<tag>.md`. The workflow's
-authoritative shape is defined in
-[build-system.md](../build-system.md#continuous-integration).
+mechanism for creating GitHub Releases. Its triggers and jobs are defined in
+[build-system.md](../build-system.md#continuous-integration): it runs on tag
+push matching `v*.*.*`, or on manual dispatch against such a tag ref (its
+jobs refuse branch refs). A `preflight` job first verifies that the
+workspace version matches the tag and that the notes file passes the check
+in [§ Source of Truth](#source-of-truth). The workflow then builds
+release-profile disk images per architecture, compresses them with zstd,
+generates `SHA256SUMS`, and creates a draft GitHub Release whose body is
+`docs/releases/<tag>.md`.
 
 The draft is published manually by the maintainer after verifying the
 burn-in workflow at `.github/workflows/burnin.yml` completed successfully
@@ -75,4 +74,5 @@ are immutable; the title, body, and asset list are mutable.
 
 ## Summarized By
 
-[Project Conventions](../conventions.md), [Documentation Standards](../documentation-standards.md)
+[Build System](../build-system.md), [Project Conventions](../conventions.md),
+[Documentation Standards](../documentation-standards.md)

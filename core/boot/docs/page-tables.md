@@ -55,11 +55,10 @@ equals physical address). This allows the kernel to read them using physical add
 before its direct physical map is established in
 [Phase 3](../../kernel/docs/initialization.md#phase-3-kernel-page-tables).
 
-**Bootloader stack** — the stack in use at the point of kernel handoff is mapped at
-its current virtual address. On x86-64 and RISC-V, the stack is allocated by UEFI
-and its virtual address equals its physical address (UEFI runs with a 1:1 mapping
-or a well-defined identity region). The stack mapping uses read-write, non-executable
-permissions.
+**Handoff stack** — the bootloader allocates the kernel's entry stack
+(`KERNEL_STACK_PAGES`, 64 KiB) through `AllocatePages`, identity-maps it with read-write,
+non-executable permissions, and switches the stack pointer to it in the
+[handoff sequence](kernel-handoff.md#handoff-sequence) before jumping to the kernel.
 
 The UEFI firmware's own page tables (before `ExitBootServices`) already contain a
 full 1:1 mapping of physical memory. After `ExitBootServices`, those page tables are
@@ -243,10 +242,14 @@ continued execution are present before `satp` is written. See
 [`boot/src/arch/riscv64/paging.rs`](../src/arch/riscv64/paging.rs) for
 the asm and the full SAFETY justification.
 
-ASID 0 is used for the bootloader's tables. The kernel uses ASID 0 for
-its own initial context (per the kernel entry state in
-[kernel-handoff.md](kernel-handoff.md)) and reassigns ASIDs when it
-brings up its own page table management in Phase 3.
+ASID 0 is used for the bootloader's tables. The kernel keeps ASID 0 for its own root
+(per the kernel entry state in [kernel-handoff.md](kernel-handoff.md)): in
+[Phase 3](../../kernel/docs/initialization.md#phase-3-kernel-page-tables) its untagged
+`activate` writes `satp` with ASID 0. It enables the ASID pool in
+[Phase 5](../../kernel/docs/initialization.md#phase-5-architecture-hardware-initialisation)
+and assigns each address space an ASID on its first tagged activation (see
+[Context Switch TLB Handling](../../kernel/docs/memory-internals.md#context-switch-tlb-handling)
+and [TLB Management](../../../docs/memory-model.md#tlb-management)).
 
 ---
 

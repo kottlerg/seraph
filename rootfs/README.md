@@ -8,8 +8,8 @@ remap table is involved. The mirror is authoritative over the subtrees it owns
 binaries and the synthesised `data/svctest/` fixtures live in the sysroot but
 outside `rootfs/`, and are never pruned.
 
-This directory holds the non-binary parts of the runtime image: boot
-configuration, system configuration, and pre-populated data files for
+This directory holds the non-binary parts of the runtime image: system
+configuration (svcmgr `.svc` recipes) and pre-populated data files for
 services and tests. Compiled binaries are installed by the build pipeline
 directly to their sysroot destinations, not via this tree (see
 [`docs/build-system.md`](../docs/build-system.md)).
@@ -34,21 +34,22 @@ xtask synthesises additional data fixtures at build time directly into
 the sysroot at `sysroot/data/svctest/{large.bin, bench.bin}`; they are
 not stored under `rootfs/` since they are deterministic build artifacts.
 
-The bootloader's `bootstrap.bundle` (which now carries every userspace
-binary the system needs to boot) is composed by `cargo xtask build`
-and written to `sysroot/esp/EFI/seraph/bootstrap.bundle` (see
-[`docs/build-system.md`](../docs/build-system.md)); it has no
-hand-authored counterpart under `rootfs/`. There is no `boot.conf`
-(replaced by hardcoded ESP paths in the bootloader; see
-[`core/boot/README.md`](../core/boot/README.md)) and no
-`mounts.conf` (replaced by GPT-type-GUID-driven mount discovery in
-vfsd, plus automatic `/esp` mount; see
-[`docs/storage.md`](../docs/storage.md#gpt-role-guid-discovery)).
+The bootloader's `bootstrap.bundle` (init plus every boot module) is
+composed by `cargo xtask build` and written to
+`sysroot/esp/EFI/seraph/bootstrap.bundle` (see
+[`docs/build-system.md`](../docs/build-system.md#build-output-the-sysroot));
+it has no hand-authored counterpart under `rootfs/`. The bootloader reads
+hardcoded ESP paths (see [`core/boot/README.md`](../core/boot/README.md)),
+and vfsd discovers mounts by GPT role GUID and auto-mounts `/esp` (see
+[`docs/storage.md`](../docs/storage.md#gpt-role-guid-discovery)); neither
+needs a file under `rootfs/`.
 
 To add a new static file, place it under the path it should occupy in the
 sysroot; the build picks it up automatically. Removing a file here removes it
 from the sysroot on the next build. `README.md` files are the only excluded
-names.
+names. To refresh the sysroot and disk image after editing this tree without
+a full build, use
+[`cargo xtask mkdisk`](../xtask/README.md#cargo-xtask-mkdisk).
 
 For the sysroot layout this tree contributes to, see
 [`docs/build-system.md`](../docs/build-system.md). The implementation that
@@ -61,8 +62,9 @@ performs the mirror is
 
 | Document | Content |
 |---|---|
-| [docs/build-system.md](../docs/build-system.md) | Sysroot layout, `cargo xtask build` and `mkdisk` mirroring |
-| [docs/storage.md](../docs/storage.md) | GPT role-GUID mount discovery that replaced `mounts.conf` |
+| [docs/build-system.md](../docs/build-system.md) | Sysroot layout and the `cargo xtask build` mirror |
+| [xtask/README.md](../xtask/README.md#cargo-xtask-mkdisk) | `cargo xtask mkdisk` re-mirror and `--repack-only` |
+| [docs/storage.md](../docs/storage.md) | GPT role-GUID mount discovery and `/esp` auto-mount |
 | [services/svcmgr/docs/service-definitions.md](../services/svcmgr/docs/service-definitions.md) | The `.svc` recipe format under `config/svcmgr/` |
 | [docs/testing.md](../docs/testing.md) | Opt-in harness recipes under `config/svcmgr/tests/` |
 
@@ -70,4 +72,4 @@ performs the mirror is
 
 ## Summarized By
 
-[Build System](../docs/build-system.md)
+[Build System](../docs/build-system.md), [xtask/README.md](../xtask/README.md)

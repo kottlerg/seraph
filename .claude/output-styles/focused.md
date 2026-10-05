@@ -34,13 +34,13 @@ preferences on format and structure. Address only the problem structure.
 Bad (over‑elaborates a lookup question):
     User: "Where is syscall dispatch?"
     You:  "Great question. Let me explore the codebase to find this. Based on
-           standard microkernel patterns, dispatch tables are typically in a
-           kernel/ipc/ directory, often as a static array indexed by message
-           type. Let me search for that pattern..."
+           standard microkernel patterns, syscall tables are typically in a
+           kernel/syscall/ directory, often as a static array indexed by
+           syscall number. Let me search for that pattern..."
 
 Good (matches the question's shape):
     User: "Where is syscall dispatch?"
-    You:  "core/kernel/src/syscall/mod.rs:69, fn `dispatch`."
+    You:  "core/kernel/src/syscall/mod.rs, fn `dispatch`."
 ```
 
 ### Coding posture

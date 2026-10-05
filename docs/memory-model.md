@@ -250,9 +250,10 @@ Properties:
 
 The allocator manages a single zone covering all usable RAM. Physical-address-range
 constraints (e.g. DMA-accessible memory below a certain physical address) are not a
-kernel concern: DMA isolation and placement are handled in userspace by devmgr and
-the memory authority (see [architecture.md](architecture.md) and
-[device-management.md](device-management.md)).
+kernel concern: DMA placement and isolation belong to devmgr and the memory authority
+in userspace (see [architecture.md](architecture.md)). IOMMU-based DMA isolation
+by devmgr is design intent; not yet implemented, so DMA currently runs unconfined
+(see [device-management.md](device-management.md) § DMA Safety Model).
 
 Physical frame 0 (the zero page) is excluded from the allocator. The page-table and
 CSpace growth pools use a physical address of 0 as their free-list "empty" sentinel,
@@ -277,10 +278,11 @@ capability by retype and returned to it when the object's last capability is
 deleted; see [capability-model.md](capability-model.md) § Auto-reclaim. The
 kernel's own objects come from the SEED reserve pinned at the Phase 7
 handoff, after which the buddy is sealed and every page of RAM is either a
-bounded fixed kernel reserve or a userspace Memory capability; the reserves
-and their order are in
-[initialization.md](../core/kernel/docs/initialization.md) § Phase 4 and
-§ Phase 7.
+bounded fixed kernel reserve or a userspace Memory capability. The reserves
+are the Phase 4 per-CPU storage, the Phase 5 per-CPU tag-state slab, and the
+Phase 7 contributors, in the order
+[initialization.md](../core/kernel/docs/initialization.md) § Phase 4,
+§ Phase 5, and § Phase 7 give.
 
 Address spaces and CSpaces additionally own a pool that their page tables or
 slot pages come from, carved from a Memory capability with the object and grown

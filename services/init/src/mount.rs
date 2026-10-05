@@ -25,8 +25,10 @@ use ipc::vfsd_labels;
 ///
 /// Returns the badged SEND cap on vfsd's namespace endpoint addressing
 /// the synthetic root at full namespace rights, or `0` on failure. vfsd
-/// replies an error (and this returns `0`) until it has mounted root, so
-/// the call blocks until the root filesystem is available. Init holds
+/// self-mounts root before any service thread serves its endpoint, so the
+/// call blocks until the root filesystem is available; vfsd replies
+/// `NO_MOUNT` (and this returns `0`, which init treats as FATAL) only when
+/// the self-mount failed. Init holds
 /// this cap as the seed from which all later tier-3 namespace-cap
 /// distribution flows (`cap_copy` for the parent-inherit default,
 /// walk-and-attenuate for sandboxed views).

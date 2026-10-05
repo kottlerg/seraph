@@ -15,9 +15,11 @@ These apertures, the arch-specific `BootInfo.kernel_mmio`, and the framebuffer d
 are the only device descriptors the bootloader produces. Firmware parsing (ACPI / DTB table
 walking) is a userspace concern; the kernel's TCB contains no parser.
 
-Phase 7 minting is specified in
+The kernel mints these capabilities in
 [`core/kernel/docs/initialization.md`](../core/kernel/docs/initialization.md) § Phase 7:
-Capability System; the bootloader's descriptor production is specified in
+Capability System; the full set it mints is listed in
+[`docs/capability-model.md`](capability-model.md) § Initial Capability Distribution; the
+bootloader's descriptor production is specified in
 [`core/boot/docs/firmware-parsing.md`](../core/boot/docs/firmware-parsing.md).
 
 See [`abi/boot-protocol/src/lib.rs`](../abi/boot-protocol/src/lib.rs) for
@@ -54,21 +56,24 @@ enumeration and per-driver delegation (MMIO apertures, firmware-table
 Memory caps, the IRQ range, and the root `IoPort` on x86-64 or `SbiControl`
 on RISC-V); its SchedControl band arrives from procmgr via `ProcessInfo`.
 Init exits after bootstrap; devmgr is `restart = never`, `critical = yes`,
-so its death triggers a graceful shutdown rather than re-delegation. See
-[`services/devmgr/README.md`](../services/devmgr/README.md) for the
-authoritative cap-by-cap list.
+so its death triggers a graceful shutdown rather than re-delegation. The
+per-round list of what init delivers is specified in
+[`services/init/docs/bootstrap.md`](../services/init/docs/bootstrap.md) §
+Per-stage authority transfers.
 
 ### What devmgr does
 
 devmgr's per-responsibility specification — firmware-table parsing,
 PCI enumeration, driver binding, device-registry IPC, and hotplug —
-is in [`services/devmgr/README.md`](../services/devmgr/README.md) §
-Responsibilities. This document covers only the system-scope
+is in [`services/devmgr/docs/responsibilities.md`](../services/devmgr/docs/responsibilities.md)
+§ Responsibilities. This document covers only the system-scope
 boundary devmgr sits inside.
 
 ### Security boundary
 
-devmgr holds only the capabilities delegated to it by init. Its authority is
+devmgr holds only the capabilities delegated to it at bootstrap (by init, plus the
+SchedControl band procmgr delivers in its `ProcessInfo`) and the `/services/drivers/` cap
+svcmgr sends after handover (see Driver binary sources). Its authority is
 not re-delegable after bootstrap: init exits, and svcmgr treats devmgr as
 `restart = never`, `critical = yes`, so devmgr's death triggers a graceful shutdown.
 
@@ -95,10 +100,9 @@ can reach any physical address the device can address.
 
 devmgr is responsible for detecting the platform IOMMU situation,
 deciding per-device policy, and programming the IOMMU itself when
-present. No IOMMU support is implemented yet, so every DMA-capable
-driver currently runs in the DMA-unsafe mode. Policy on platforms
-without IOMMU protection is devmgr-defined; see
-[`services/devmgr/README.md`](../services/devmgr/README.md).
+present. No IOMMU support is implemented yet, so devmgr spawns every
+DMA-capable driver unconfined, in the DMA-unsafe mode, with no refuse or
+warn path.
 
 The kernel is agnostic to DMA mode: it does not read or write IOMMU
 registers, does not track per-device DMA state, and does not return a
@@ -113,7 +117,8 @@ descriptor; ACPI and DTB reach userspace only as the opaque
 `BootInfo.acpi_rsdp` / `BootInfo.device_tree` physical addresses (see Raw
 Firmware Passthrough), over which the kernel mints read-only Memory caps,
 and `devmgr` is to perform the IOMMU-topology walk itself. Discovery
-specifics live in [`services/devmgr/README.md`](../services/devmgr/README.md).
+specifics live in
+[`services/devmgr/docs/responsibilities.md`](../services/devmgr/docs/responsibilities.md).
 
 Once implemented, for each IOMMU discovered `devmgr` will acquire an `Mmio`
 cap for that IOMMU's register range through the same aperture-carving flow
@@ -134,7 +139,9 @@ device DMA transports on no-IOMMU systems), are supplied to drivers by
 memmgr in the `REQUEST_MEMORY_CAPS` reply alongside the Memory caps themselves (see
 [`services/memmgr/docs/ipc-interface.md`](../services/memmgr/docs/ipc-interface.md)).
 `SYS_CAP_INFO`'s `CAP_INFO_MEMORY_PHYS_BASE` selector also returns a Memory cap's physical
-base to its holder; a driver that receives a client-supplied Memory cap uses it to program
+base to its holder (see
+[`core/kernel/docs/cross-boundary-disclosure.md`](../core/kernel/docs/cross-boundary-disclosure.md)
+§ Physical-address surfaces); a driver that receives a client-supplied Memory cap uses it to program
 that cap's address.
 
 ---
@@ -152,14 +159,17 @@ init
  ├── vfsd  (receives storage endpoint via QUERY_BLOCK_DEVICE)
  ├── ...
  └── svcmgr
-      └── timed (receives RTC endpoint via QUERY_RTC_DEVICE)
+      ├── logd     (serial endpoint via QUERY_SERIAL_DEVICE)
+      ├── pwrmgr   (ACPI tables + shutdown hw via QUERY_ACPI_TABLE / QUERY_SHUTDOWN_DEVICE)
+      ├── timed    (RTC endpoint via QUERY_RTC_DEVICE)
+      └── terminal (input, framebuffer, serial endpoints via QUERY_*_DEVICE)
 ```
 
-vfsd and the post-handover consumers (timed, terminal) query devmgr's registry for their
-device endpoints, which devmgr serves only after initial enumeration and binding complete.
-The dependency ordering is fixed by init's bootstrap sequence (devmgr before vfsd) and by
-svcmgr's post-handover launch of timed and terminal; devmgr and vfsd are `restart = never`,
-so no restart ordering exists.
+vfsd and the consumers svcmgr launches after handover (logd, pwrmgr, timed, terminal)
+query devmgr's registry for their device endpoints and hardware caps, which devmgr serves
+only after initial enumeration and binding complete. The dependency ordering is fixed by
+init's bootstrap sequence (devmgr before vfsd) and by svcmgr launching those consumers only
+after handover; devmgr and vfsd are `restart = never`, so no restart ordering exists.
 
 ### Driver binary sources
 
@@ -187,11 +197,11 @@ devmgr loads driver binaries from one of two places:
   walk + `CREATE_FROM_FILE` + bootstrap rounds run after `ipc_reply` and before devmgr returns to
   its next `ipc_recv`. The spawn is at-most-once per boot; on failure (binary missing, ELF corrupt,
   hardware-carve failure, OOM, etc.) devmgr replies `devmgr_errors::NO_DEVICE` on subsequent
-  `QUERY_RTC_DEVICE` / `QUERY_INPUT_DEVICE` calls and clients (timed degrades to its no-RTC path;
-  the terminal, today's only `QUERY_INPUT_DEVICE` consumer, logs and exits). Keeping non-essentials
-  out of the boot bundle keeps the ESP-loaded image to what the system needs before the rootfs is
-  mounted, so on-disk loading is preferred for anything not on the read-the-disk-in-the-first-place
-  critical path.
+  `QUERY_RTC_DEVICE` / `QUERY_INPUT_DEVICE` calls and clients ([timed](../services/timed/README.md)
+  degrades to its no-RTC path; the terminal, today's only `QUERY_INPUT_DEVICE` consumer, logs and
+  exits). Keeping non-essentials out of the boot bundle keeps the ESP-loaded image to what the
+  system needs before the rootfs is mounted, so on-disk loading is preferred for anything not on
+  the read-the-disk-in-the-first-place critical path.
 
 Storage-side cap delegation downstream of devmgr (whole-disk
 endpoint → vfsd → partition-scoped endpoint → fs driver) is
@@ -205,10 +215,12 @@ specified in [`docs/storage.md`](storage.md).
 [Firmware Parsing](../core/boot/docs/firmware-parsing.md), [Architecture Overview](architecture.md),
 [Memory Model](memory-model.md), [Platform Requirements](platform-requirements.md),
 [Storage](storage.md), [services/devmgr/README.md](../services/devmgr/README.md),
+[services/drivers/README.md](../services/drivers/README.md),
 [services/drivers/cmos/README.md](../services/drivers/cmos/README.md),
 [services/drivers/goldfish-rtc/README.md](../services/drivers/goldfish-rtc/README.md),
 [services/drivers/virtio/blk/README.md](../services/drivers/virtio/blk/README.md),
 [services/drivers/virtio/input/README.md](../services/drivers/virtio/input/README.md),
 [init Bootstrap Stages](../services/init/docs/bootstrap.md),
 [services/memmgr/README.md](../services/memmgr/README.md),
-[memmgr IPC Interface](../services/memmgr/docs/ipc-interface.md)
+[memmgr IPC Interface](../services/memmgr/docs/ipc-interface.md),
+[services/vfsd/README.md](../services/vfsd/README.md)

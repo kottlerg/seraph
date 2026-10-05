@@ -70,11 +70,15 @@ so the first cap is the largest; consumers that take the whole range read each
 cap's size individually and do not depend on the order of the rest.
 
 Init delegates authority to downstream services by deriving intermediaries
-(the "derive twice" pattern in [`capability-model.md`](capability-model.md))
-and handing each service the second derivation; the kernel-minted root caps
-it still holds at exit move to procmgr through the init-reap handoff. This
-preserves init's ability to
-revoke if a service misbehaves before svcmgr takes over supervision.
+(the "derive twice" pattern in
+[`capability-internals.md`](../core/kernel/docs/capability-internals.md#safe-delegation-the-derive-twice-pattern))
+and handing each service the second derivation. This preserves init's ability to
+revoke if a service misbehaves before svcmgr takes over supervision. At the
+init-reap handoff init moves only its kernel-object caps and the reclaimable
+Memory caps it solely owns to procmgr (see "Init reap" below). The remaining
+root caps (the RAM roots of memory forwarded to memmgr, the firmware caps, and
+the `Interrupt`, `IoPort`, `SbiControl`, `Mmio`, and elevated `SchedControl`
+roots) stay in init's CSpace and are destroyed in its teardown cascade.
 
 ### Init → memmgr
 
@@ -131,8 +135,9 @@ harnesses) are not in this list: svcmgr launches them itself
 post-handover from
 their `/config/svcmgr/services/*.svc` recipes. Nor is the per-arch RTC
 chip driver: devmgr spawns it from `/services/drivers/` once svcmgr installs
-the drivers-dir cap (`devmgr_labels::SET_DRIVERS_DIR`), and timed
-resolves it via `devmgr_labels::QUERY_RTC_DEVICE` at startup. For each
+the drivers-dir cap (`devmgr_labels::SET_DRIVERS_DIR`), and
+[timed](../services/timed/README.md) resolves it via
+`devmgr_labels::QUERY_RTC_DEVICE` at startup. For each
 service init starts, it delegates the appropriate capability subset (see
 [`capability-model.md`](capability-model.md) §"Initial Capability
 Distribution"). svcmgr is configured with the universal
@@ -189,15 +194,15 @@ are already accounted in memmgr's pool and never reach the reap route.
 
 Procmgr binds a death-EQ observer on **both** init threads (main +
 init-logd) and reaps only once both have exited — init is threadless. The
-main thread exits at the end of Phase 3, but init-logd keeps serving the
-master log endpoint until the svcmgr-launched real-logd pulls its
-handover, so it outlives main; reclaiming init's address space while a
+main thread exits at the end of init's Handover stage, but init-logd keeps
+serving the master log endpoint until the svcmgr-launched real-logd pulls
+its handover, so it outlives main; reclaiming init's address space while a
 thread still runs in it would fault that thread. On the last death procmgr
 tears down init's kernel objects in order (Threads → AddressSpace → donate
 Memory caps to memmgr → CSpace cascade), leaving zero init residue. The
-procmgr side is described in
-[`services/procmgr/README.md`](../services/procmgr/README.md) §"Init
-reap".
+procmgr-side protocol is specified in
+[procmgr IPC Interface](../services/procmgr/docs/ipc-interface.md)
+§ `REGISTER_INIT_TEARDOWN` and § `INIT_TEARDOWN_DONE`.
 
 After init's reap completes, svcmgr is the resident supervisor. See
 [`services/svcmgr/README.md`](../services/svcmgr/README.md).
@@ -319,13 +324,11 @@ After bootstrap, every process is created by procmgr. The flow:
 2. **Procmgr → memmgr.** Procmgr calls `memmgr.REGISTER_PROCESS` and
    receives a badged SEND cap identifying the new process; every later
    allocation for the child uses it.
-3. **Procmgr ELF load.** Procmgr maps the ELF source, parses headers,
-   draws the image load bias, and computes the segment layout, applying
-   the image's relocations while segments are staged (PIE; see
+3. **Procmgr ELF parse.** Procmgr maps the ELF source, validates its
+   headers, draws the image load bias, and computes the segment layout
+   and relocation plan (PIE; see
    [userspace-memory-model.md](userspace-memory-model.md) "Image
-   Placement"). Segment frames are requested from memmgr on the child's
-   badged cap and staged through a transient procmgr-side scratch mapping
-   before being mapped into the child.
+   Placement").
 4. **Procmgr kernel-object allocation.** Procmgr creates the new
    process's `AddressSpace`, `CSpace`, and `Thread` via the
    `cap_create_*` syscalls.
@@ -334,10 +337,12 @@ After bootstrap, every process is created by procmgr. The flow:
    TLS block, and ELF segments. These calls go over the child's badged
    SEND cap returned by `REGISTER_PROCESS` (step 2), so memmgr accounts
    the frames against the child's per-process record from allocation.
-6. **Procmgr maps + populates the child.** Procmgr maps the frames
-   into the child's address space at procmgr-chosen VAs, copies ELF
-   segment bytes, populates `ProcessInfo` (including
-   `memmgr_endpoint_cap` from step 2 and the procmgr/log endpoints).
+6. **Procmgr maps + populates the child.** Procmgr stages each ELF
+   segment's frames through a transient procmgr-side scratch mapping,
+   copying the segment bytes and applying the image's relocations, then
+   maps the frames into the child's address space at procmgr-chosen VAs
+   and populates `ProcessInfo` (including `memmgr_endpoint_cap` from
+   step 2 and the procmgr/log endpoints).
 7. **No ownership transfer.** Every child frame and kernel-object retype
    slab is requested on the child's badged memmgr cap, so memmgr accounts
    it to the child's record from the moment it leaves the pool; procmgr
@@ -369,8 +374,9 @@ A process dies when:
 - It calls `sys_process_exit` (the `std::process::exit` / `main`-return path),
   carrying a voluntary exit code.
 - It calls `sys_thread_exit` on its last thread (a thread completing).
-- Its `AddressSpace` capability is revoked (the "kill process" pattern;
-  see [`capability-model.md`](capability-model.md) §`"Kill process" pattern`).
+- procmgr revokes and deletes its caps to the process's `Thread`, `CSpace`,
+  and `AddressSpace` (the "kill process" pattern; see
+  [`capability-model.md`](capability-model.md) §`"Kill process" pattern`).
 - The last capability to its `CSpace` or `AddressSpace` is deleted: the
   kernel stops every thread bound to the object (retained exit reason
   `EXIT_KILLED`) before reclaiming it, so the process's threads cannot
@@ -447,7 +453,10 @@ reclamation step inserts back into the free pool.
 If procmgr itself dies, no other process can spawn replacements via the
 normal path. procmgr's recipe is `restart = never`, `critical = yes`:
 svcmgr does not recreate procmgr and initiates a graceful shutdown (see
-[`services/svcmgr/README.md`](../services/svcmgr/README.md)). A raw-syscall
+[Restart Protocol](../services/svcmgr/docs/restart-protocol.md#procmgr-fallback)
+§ procmgr Fallback and
+[`.svc` Service Definitions](../services/svcmgr/docs/service-definitions.md#critical)
+§ `critical`). A raw-syscall
 fallback that recreates procmgr and re-establishes its memmgr cap is not
 implemented.
 
@@ -485,6 +494,7 @@ notification flow above.
 [Architecture Overview](architecture.md), [System Bootstrap](bootstrap.md),
 [Capability Model](capability-model.md), [Fault Handling](fault-handling.md), [Testing](testing.md),
 [Userspace Memory Model](userspace-memory-model.md),
+[init Bootstrap Stages](../services/init/docs/bootstrap.md),
 [services/logd/README.md](../services/logd/README.md),
 [logd IPC interface](../services/logd/docs/ipc-interface.md),
 [services/memmgr/README.md](../services/memmgr/README.md),
@@ -495,5 +505,6 @@ notification flow above.
 [services/svcmgr/README.md](../services/svcmgr/README.md),
 [svcmgr IPC Interface](../services/svcmgr/docs/ipc-interface.md),
 [Restart Protocol](../services/svcmgr/docs/restart-protocol.md),
+[`.svc` Service Definitions](../services/svcmgr/docs/service-definitions.md),
 [shared/elf/README.md](../shared/elf/README.md),
 [shared/process-layout/README.md](../shared/process-layout/README.md)

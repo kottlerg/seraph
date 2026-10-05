@@ -39,9 +39,6 @@ completion:
 
 `<harness>` is the harness name (`ktest`, `svctest`, `usertest`).
 
-`svctest` fails by panicking, so a failed run carries the panic line (matched by
-`run-parallel`'s default `--fail` regex) in place of `[svctest] SOME TESTS FAILED`.
-
 - For harnesses launched as a userspace service, `std::os::seraph::log!`
   with a name registered via `std::os::seraph::log::register_name(b"<name>")`
   produces the `[<name>]` prefix automatically; the harness payload is just
@@ -275,9 +272,9 @@ the command and [memory-model.md](memory-model.md) for the randomized layout.
 Requires a populated sysroot with the ktest bundle composed
 (`cargo xtask compose-bundle --harness ktest`). The `kaslr:` line is emitted only
 through the kernel's serial-only console class (see
-[docs/console-model.md](console-model.md)). In CI it runs
-as extra boots inside each `ktest` cell (both arches, both profiles), after the
-`ktest` run-parallel boot.
+[cross-boundary-disclosure.md § Kernel console diagnostics](../core/kernel/docs/cross-boundary-disclosure.md#kernel-console-diagnostics)).
+In CI it runs as extra boots inside each `ktest` cell (both arches, both
+profiles), after the `ktest` run-parallel boot.
 
 ### One shutdown-invoking harness per boot
 
@@ -430,10 +427,11 @@ list as the tracking Issues move):
   claimed — independent of guest memory size. The kernel image is now placed as
   one contiguous span allocated anywhere (`AllocateAnyPages`), so loading
   tolerates any firmware layout; `validate_kernel_layout` enforces the
-  relocation invariants (single offset, alignment, non-overlap, entry-in-image)
-  at load time. 128 harts now boots clean (3×, ~475 s/run at 8× hart
-  oversubscription on a 16-core host). The residual ceiling is upstream and
-  pre-bootloader: at 192, 256, and 512 harts under TCG the edk2 firmware emits
+  [relocation invariants](../core/boot/docs/elf-loading.md#elf-validation) (single
+  offset, alignment, non-overlap, entry-in-image) at load time. 128 harts now
+  boots clean (3×, ~475 s/run at 8× hart oversubscription on a 16-core host).
+  The residual ceiling is upstream and pre-bootloader: at 192, 256, and 512
+  harts under TCG the edk2 firmware emits
   no serial output at all (192: nothing in 60 min; 256/512: nothing in 20/30
   min) — an MP-init crawl that runs before Seraph's bootloader and cannot be
   addressed in-tree. High-hart cross-architecture parity is therefore
@@ -470,14 +468,14 @@ list as the tracking Issues move):
 
 These conventions apply to harnesses launched as svcmgr services (`svctest`,
 `usertest`); `ktest`, the init replacement, has no recipe and powers off directly
-via ACPI (x86_64) or SBI (riscv64) per `KtestConfig::DEFAULT.shutdown_policy`.
+via ACPI (x86_64) or SBI (riscv64) per `KtestConfig::DEFAULT.shutdown_policy`
+(see [core/ktest/README.md § Shutdown](../core/ktest/README.md#shutdown)).
 
 - **Completion behavior.** A harness MUST request `pwrmgr` shutdown when
   it finishes (pass or fail). This terminates the QEMU instance and lets
   CI move on. Harnesses launched as services obtain the shutdown
   capability via the `pwrmgr.shutdown` and `pwrmgr.deny` seeds in their
-  `.svc` recipe. `svctest`'s failure path ends at the panic, before its
-  shutdown phase.
+  `.svc` recipe.
 - **Restart policy.** A harness MUST set `restart = never` in its `.svc`
   recipe. Re-running on accidental exit corrupts CI semantics.
 - **Critical class.** A harness MUST set `critical = no`. Harness death
@@ -506,8 +504,9 @@ note in full.
 ## Summarized By
 
 [README.md](../README.md), [Kernel Entropy Subsystem](../core/kernel/docs/entropy.md),
-[core/ktest/README.md](../core/ktest/README.md), [Console Model](console-model.md),
-[Project Conventions](conventions.md), [programs/shell/README.md](../programs/shell/README.md),
+[core/ktest/README.md](../core/ktest/README.md), [Build System](build-system.md),
+[Console Model](console-model.md), [Project Conventions](conventions.md),
+[programs/shell/README.md](../programs/shell/README.md),
 [programs/terminal/README.md](../programs/terminal/README.md),
 [services/pwrmgr/README.md](../services/pwrmgr/README.md),
 [services/svcmgr/README.md](../services/svcmgr/README.md),

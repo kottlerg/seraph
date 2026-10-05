@@ -69,8 +69,7 @@ than the boot.
 The allocator manages a single zone: one `BuddyAllocator` instance covering all
 usable RAM. It has no zone concept; physical-address-range constraints (e.g.
 DMA reachability) are handled by the userspace memory authority after the
-Phase-7 handoff, per [docs/memory-model.md](../../../docs/memory-model.md) § Buddy Allocator and
-[docs/device-management.md](../../../docs/device-management.md).
+Phase-7 handoff, per [docs/memory-model.md](../../../docs/memory-model.md) § Buddy Allocator.
 
 ### Allocation and Deallocation Properties
 
@@ -106,10 +105,11 @@ at the offset the retype allocator returns, its header records the source, and
 the bytes go back to that source when the object's last capability is deleted
 (see [capability-internals.md](capability-internals.md) § Kernel Object
 Reference Counting). The kernel's own objects are retyped from the SEED
-reserve, carved from the buddy allocator before the Phase 7 handoff
+reserve, pinned at the Phase 7 handoff from the front of the largest block
+drained from the buddy allocator
 ([initialization.md](initialization.md) § Phase 7: Capability System); userspace
-objects come from the capability a `cap_create_*` syscall names. Address spaces
-and CSpaces additionally own a page pool for their page tables and slot pages
+objects come from the capability a `cap_create_*` syscall names. Address spaces and CSpaces
+additionally own a page pool for their page tables and slot pages
 ([capability-internals.md](capability-internals.md) § Page Pools).
 
 Retype and pool allocation are fallible and MUST be handled as fallible at every

@@ -177,10 +177,9 @@ Defined in `src/main.rs` (the `spawn::` items in `src/spawn.rs`):
 
 The boot protocol carries no kernel command line
 ([core/boot/README.md](../boot/README.md) § What the Bootloader Does Not Do); ktest's runtime
-knobs live in `KtestConfig::DEFAULT` in
-[`src/cmdline.rs`](src/cmdline.rs) and are baked in at compile time.
-Editing the constant and rebuilding ktest (`cargo xtask build -p
-ktest`) is the canonical way to flip them.
+knobs live in `KtestConfig::DEFAULT` in [`src/cmdline.rs`](src/cmdline.rs) and are baked in at
+compile time. Editing the constant and rebuilding ktest (`cargo xtask build --component ktest`)
+is the canonical way to flip them.
 
 | Field | Values | Default | Description |
 |---|---|---|---|
@@ -215,4 +214,5 @@ narrower-scope run is produced.
 
 ## Summarized By
 
-[Build System](../../docs/build-system.md), [xtask/README.md](../../xtask/README.md)
+[System Bootstrap](../../docs/bootstrap.md), [Build System](../../docs/build-system.md),
+[Testing](../../docs/testing.md), [xtask/README.md](../../xtask/README.md)

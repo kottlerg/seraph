@@ -44,10 +44,10 @@ addressed node:
   `NS_LOOKUP`, `NS_READDIR`, `NS_STAT`, and the `MUTATE_DIR`-gated
   `FS_CREATE`, `FS_REMOVE`, `FS_MKDIR`, `FS_RENAME`.
 - **File capability** — references a file node. Operations: `NS_STAT`,
-  plus the file labels `FS_READ`, `FS_READ_MEMORY`,
-  `FS_RELEASE_MEMORY`/`FS_RELEASE_ACK`, `FS_WRITE`, `FS_WRITE_MEMORY`,
-  `FS_TRUNCATE`, and `FS_CLOSE`; `namespace_protocol::gate` checks each
-  request label against the caller's namespace rights.
+  plus the file labels `FS_READ`, `FS_READ_MEMORY`, `FS_RELEASE_MEMORY`,
+  `FS_WRITE`, `FS_WRITE_MEMORY`, `FS_TRUNCATE`, and `FS_CLOSE`;
+  `namespace_protocol::gate` checks each request label against the
+  caller's namespace rights.
 
 The kernel layer holds no notion of "directory" or "file." Type
 distinctions are server-private and surface to clients via the
@@ -215,11 +215,9 @@ A directory entry's stored target is one of:
   cap's rights live in its badge, and the kernel forbids re-badging an
   already-badged capability, so a stored cross-server cap could only be
   copied at its original rights, laundering authority (see
-  [shared/namespace-protocol/README.md](../shared/namespace-protocol/README.md)
-  § NS_LOOKUP and [docs/capability-model.md](capability-model.md)
-  § Badges). The composing
-  server therefore stores the peer's unbadged endpoint and badges each
-  crossing lookup's result itself.
+  [docs/capability-model.md](capability-model.md) § Badges). The
+  composing server therefore stores the peer's unbadged endpoint and
+  badges each crossing lookup's result itself.
 
 This is how mounting works: there is no runtime mount-resolution table.
 A "mount" is a directory entry whose stored target is the mounted

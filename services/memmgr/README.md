@@ -4,8 +4,11 @@ Tier-1 userspace service that owns the userspace physical-memory-cap pool. memmg
 allocates Memory capabilities to all std-built services on demand, tracks
 per-process memory-cap ownership, and reclaims memory caps when a process dies.
 
-memmgr is a `no_std` binary: it cannot bootstrap a heap against itself, so
-its bookkeeping uses statically-bounded data structures only. After memmgr
+memmgr is a `no_std` binary: it cannot bootstrap a general heap against
+itself, so it has none. Its free pool and process table are statically
+sized; per-process frame and region descriptors live in a self-hosted
+metadata arena carved from its own pool (see
+[`docs/memory-pool.md`](docs/memory-pool.md) §"Metadata Arena"). After memmgr
 is in place, the only `no_std` userspace services in the system are `init`
 and `memmgr` (see [`docs/process-lifecycle.md`](../../docs/process-lifecycle.md)
 §"Userspace Boot Order").
@@ -47,7 +50,8 @@ Allocation Contract").
   cap (DMA buffers, large heap grow operations). Wire shape in
   [`docs/ipc-interface.md`](docs/ipc-interface.md) §"Label 1: `REQUEST_MEMORY_CAPS`".
 - **Per-process tracking** — maintain a per-process record of the Memory
-  caps memmgr has handed out, keyed on a procmgr-minted badge (see
+  caps memmgr has handed out, keyed on a memmgr-minted per-process badge
+  (issued at procmgr's `REGISTER_PROCESS`; see
   [`docs/memory-pool.md`](docs/memory-pool.md) §"Per-Process Tracking").
 - **Reclamation on process death** — on `PROCESS_DIED` from procmgr,
   reclaim the dead process's memory caps into the free pool (see
@@ -151,25 +155,16 @@ ProcessInfo handover lives in [`docs/process-lifecycle.md`](../../docs/process-l
 ### Bootstrap-IPC memory-cap-count cap
 
 Init delivers RAM Memory caps to memmgr in a single bootstrap-IPC round,
-packed two page-counts per `u64` after a three-word prefix. The capacity
-of a single round is `MEMMGR_BOOTSTRAP_MAX_MEMORY_CAPS = 122` memory caps. Init
-currently has ~90 RAM memory caps at boot, so this fits comfortably. The
-round's place in the boot sequence is described in
-[`docs/process-lifecycle.md`](../../docs/process-lifecycle.md) §"Init → memmgr".
-
-If a future memory map (or an architecture with fragmented physical RAM)
-produces more than 122 RAM memory caps, memmgr will own only the first
-122 and the rest will sit unused in init's CSpace. Resolutions when
-needed:
-
-- **Multi-round bootstrap.** init does N `serve_round`s, each carrying
-  up to 122 page-counts; memmgr's `_start` does N `request_round`s.
-  Small change to memmgr's bootstrap parser and init's main.
-- **Memory-cap-count discovery via a kernel syscall** that reads the size
-  from the cap itself. No such syscall exists today; would also enable
-  cleaner per-cap accounting throughout.
-
-Not pressing until init's memory-cap count grows past 122.
+packed two page-counts per `u64` after a three-word prefix, so a round holds
+`ipc::memmgr_bootstrap::MAX_MEMORY_CAPS` entries. Two are reserved for the
+`MemoryAlloc` tail and the phys-table page, which have no `InitInfo`
+descriptor and must ride this round; the round therefore carries at most
+`MAX_MEMORY_CAPS - 2` regular RAM caps. Any RAM caps beyond that are not
+lost: init donates them at its reap, and procmgr forwards them to memmgr's
+pool via `DONATE_MEMORY_CAPS`, which has no per-round cap. The round's place
+in the boot sequence is described in
+[`docs/process-lifecycle.md`](../../docs/process-lifecycle.md) §"Init → memmgr",
+and the donation in §"Init reap".
 
 ---
 

@@ -10,7 +10,7 @@
 //! defaults are picked for CI: every tier runs, the VM auto-shuts down
 //! on completion, and shutdown is immediate. To preserve QEMU for
 //! interactive inspection (or trim the tier set for a focused run),
-//! edit [`KtestConfig::DEFAULT`] and `cargo xtask build -p ktest`.
+//! edit [`KtestConfig::DEFAULT`] and `cargo xtask build --component ktest`.
 
 /// When to perform system shutdown after tests complete. `Pass` and
 /// `Never` are not used by [`KtestConfig::DEFAULT`] but are the

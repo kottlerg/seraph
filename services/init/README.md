@@ -43,7 +43,7 @@ Init runs three stages between `_start` and `sys_thread_exit`:
    then drive procmgr IPC to create devmgr and vfsd.
 2. **Root acquisition** — vfsd self-mounts the Seraph root partition at `/`
    on its own startup; init issues no `MOUNT` (see
-   [vfsd IPC interface](../vfsd/docs/vfs-ipc-interface.md)). Pull the seed
+   [vfsd service interface](../vfsd/docs/vfs-ipc-interface.md)). Pull the seed
    `system_root_cap` via `GET_SYSTEM_ROOT_CAP` (which vfsd serves only once
    root is mounted, so the call blocks until root is up). The init-logd
    thread keeps serving the master log endpoint and writing serial directly;
@@ -56,10 +56,13 @@ Init runs three stages between `_start` and `sys_thread_exit`:
    one `(name, thread_cap)` round per init-bootstrapped substrate
    service, and a terminal round carrying the reserved log-sink sources
    (master-log endpoint + procmgr `SEND|GRANT`) svcmgr keeps to launch and
-   supervise real-logd. Notification `HANDOVER_COMPLETE`; hand init's own kernel
-   objects + reclaimable Memory caps to procmgr via `REGISTER_INIT_TEARDOWN`;
-   call `sys_thread_exit`. [Procmgr](../procmgr/README.md) binds a death-EQ on
-   both init threads (main + init-logd) and runs the reap path once both have
+   supervise real-logd. Move init's own kernel objects to procmgr in the
+   first `REGISTER_INIT_TEARDOWN` round, which binds
+   [procmgr](../procmgr/README.md)'s death-EQ on both init threads (main +
+   init-logd) before real-logd can release init-logd; notify
+   `HANDOVER_COMPLETE`; stream init's reclaimable Memory caps to procmgr in
+   later `REGISTER_INIT_TEARDOWN` rounds; send `INIT_TEARDOWN_DONE`; call
+   `sys_thread_exit`. Procmgr runs the reap path once both threads have
    exited — purely death-driven, with no force-stop; a handover that never
    completes leaves init-logd serving and init's memory caps held until
    shutdown (a benign hold, not a wedge).
@@ -68,8 +71,8 @@ Init runs three stages between `_start` and `sys_thread_exit`:
    cap via `SET_DRIVERS_DIR` from the endowment (see
    [svcmgr IPC interface](../svcmgr/docs/ipc-interface.md)); it then
    launches the non-bootstrap services itself — `timed` and `pwrmgr`
-   (providers), the staged test harnesses — and publishes their names (see
-   [svcmgr](../svcmgr/README.md)). The per-arch RTC chip driver is
+   (providers), `terminal`, the staged test harnesses — and publishes their
+   names (see [svcmgr](../svcmgr/README.md)). The per-arch RTC chip driver is
    [devmgr](../devmgr/README.md)-spawned lazily after `SET_DRIVERS_DIR` and
    resolved by [timed](../timed/README.md) via `QUERY_RTC_DEVICE`.
 

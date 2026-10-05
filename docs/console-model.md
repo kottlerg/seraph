@@ -9,14 +9,16 @@ mediated by per-device drivers.
 ## Ownership across the boot lifecycle
 
 Console output passes through a sequence of owners as the system comes up.
-Each owner is authoritative for its window; later owners do not retract the
-earlier ones, which remain as fallbacks.
+Each owner is authoritative for its window. The bootloader console's window ends at the
+kernel handoff, and init-logd's ends at the real-logd handover (item 3); only the kernel's
+direct console paths remain as fallbacks for the life of the system.
 
 1. **Bootloader early console** — `core/boot/src/console.rs` drives the UART
    and framebuffer directly during UEFI boot, before the kernel exists. On
    RISC-V the UART base is discovered via ACPI SPCR
    (`core/boot/src/arch/riscv64/acpi_spcr.rs`), then the Device Tree, falling back to the QEMU
-   `virt` default `0x10000000`; on x86-64 it is COM1 at I/O port `0x3F8`. The framebuffer
+   `virt` default `0x10000000`; on x86-64 it is COM1 at I/O port `0x3F8` (discovery order per
+   [Early Console § Serial Backend](../core/boot/docs/console.md#serial-backend)). The framebuffer
    base is discovered via UEFI GOP and captured into `BootInfo.framebuffer` before
    `ExitBootServices` — GOP's active framebuffer identity is unreachable from any later
    component, so the bootloader is the only entity that can carry the geometry forward.
@@ -51,10 +53,11 @@ earlier ones, which remain as fallbacks.
    until the svcmgr-launched [real-logd](../services/logd/README.md) assumes the
    endpoint's RECV, pulls init-logd's captured history via
    `log_labels::HANDOVER_PULL`, then releases it with
-   `log_labels::HANDOVER_RELEASE` — at which point init-logd self-terminates.
-   This direct path is **permanent**, not transitional: together with init's main thread, which
-   writes the UART directly until init-logd is spawned, it is the only userspace writer until
-   real-logd takes the endpoint. The handover is unconditional, so if the serial driver never
+   `log_labels::HANDOVER_RELEASE` — at which point init-logd self-terminates (see
+   [logd handover protocol](../services/logd/docs/handover-protocol.md)). This direct path is
+   **permanent**, not transitional: together with init's main thread, which writes the UART
+   directly until init-logd is spawned, it is the only userspace writer until real-logd takes
+   the endpoint. The handover is unconditional, so if the serial driver never
    comes up, userspace serial output after the handover is dropped (real-logd keeps the lines in
    its history ring). init-logd has no direct-framebuffer path; before the framebuffer driver is
    up, userspace output reaches only the UART.
@@ -96,9 +99,9 @@ earlier ones, which remain as fallbacks.
      UART. The framebuffer driver, when present, is spawned before svcmgr launches logd;
      logd resolves the mirror once and, when devmgr reports no framebuffer driver (headless
      boot), latches it off for its lifetime, so serial stays the authoritative channel.
-   - **`programs/terminal`** (#111) resolves the framebuffer write cap via
-     `QUERY_FRAMEBUFFER_DEVICE` and renders its child's stdout — the shell
-     (#112) and anything the shell runs — to the screen, mirrored to serial.
+   - **[`programs/terminal`](../programs/terminal/README.md)** (#111) resolves the
+     framebuffer write cap via `QUERY_FRAMEBUFFER_DEVICE` and renders its child's stdout — the
+     shell (#112) and anything the shell runs — to the screen, mirrored to serial.
      This is the production console path: ordinary programs do not resolve the
      framebuffer themselves; they write stdout and the terminal relays it.
      [programs/fb-charset/README.md](../programs/fb-charset/README.md) describes one such
@@ -196,4 +199,5 @@ surface prints the identical glyph set.
 [Coding Standards](coding-standards.md),
 [services/drivers/framebuffer/README.md](../services/drivers/framebuffer/README.md),
 [services/drivers/serial/README.md](../services/drivers/serial/README.md),
-[services/logd/README.md](../services/logd/README.md)
+[services/logd/README.md](../services/logd/README.md),
+[shared/ansi/README.md](../shared/ansi/README.md)

@@ -22,9 +22,10 @@ under every paging mode on both architectures, with disjointness, region
 ordering, and the stack guard gap holding for every possible draw. The crate is
 pure: entropy is injected as pre-drawn bytes, and a creator whose entropy draw
 failed passes `None` to fall back to the deterministic `DEFAULT_*` addresses.
-The zone map, draw windows, and fallback addresses are specified in
+The zone map and draw windows are specified in
 [docs/userspace-memory-model.md](../../docs/userspace-memory-model.md) § Bootstrap
-Cross-Boundary VAs.
+Cross-Boundary VAs; the `DEFAULT_*` fallback addresses are this crate's own constants
+(see § Surface).
 The kernel reuses the `INIT_*` windows for init's per-boot layout, and the
 `IMAGE_WINDOW` constants parameterise ET_DYN load-bias placement.
 
@@ -63,4 +64,5 @@ resolved by the creator (see [abi/process-abi/README.md](../../abi/process-abi/R
 
 ## Summarized By
 
-[Process Lifecycle](../../docs/process-lifecycle.md)
+[Process Lifecycle](../../docs/process-lifecycle.md),
+[Userspace Memory Model](../../docs/userspace-memory-model.md)

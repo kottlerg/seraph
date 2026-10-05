@@ -264,10 +264,11 @@ isolation rules are in
 
 ## Platform Requirements (summary — [platform-requirements.md](platform-requirements.md))
 
-Each architecture pins a two-layer floor — an instruction baseline (x86-64-v3 / RVA23U64) and a
-platform/silicon-era floor — and classifies every CPU and platform feature as required,
-opportunistic, or unsupported. A boot-time feature-gate refuses hardware missing a required feature
-with a clear diagnostic. The IOMMU is opportunistic with a degraded DMA-unconfined mode.
+Each architecture pins a two-layer floor — an instruction baseline (x86-64-v3 / an RVA23U64
+subset) and a platform/silicon-era floor — and classifies every CPU and platform feature as
+required, opportunistic, or unsupported. A boot-time feature-gate refuses hardware missing a gated
+required feature with a clear diagnostic. The IOMMU is opportunistic with a degraded DMA-unconfined
+mode.
 
 ---
 

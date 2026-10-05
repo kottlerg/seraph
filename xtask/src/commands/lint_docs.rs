@@ -48,10 +48,8 @@ impl fmt::Display for Level
     }
 }
 
-/// The rules, with the level each runs at. `md-reachable` and
-/// `md-backlink-forward` are warnings until the grouping-directory scope and
-/// the tree-wide Summarized By rewrite land (Issue #438); `md-bare-cite` stays
-/// a warning because the pattern has legitimate uses.
+/// The rules, with the level each runs at. `md-bare-cite` stays a warning
+/// because its pattern also matches legitimate prose.
 const RULES: &[(&str, Level)] = &[
     ("md-columns", Level::Error),
     ("src-header", Level::Error),

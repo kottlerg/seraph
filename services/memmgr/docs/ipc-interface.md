@@ -27,7 +27,7 @@ calls `REQUEST_MEMORY_CAPS` on it with no further setup. See
 ## Badge Discipline
 
 Every memmgr-callable message arrives over a badged endpoint cap. The
-badge is the procmgr-minted process identity established at
+badge is the memmgr-minted process identity established at procmgr's
 `REGISTER_PROCESS`; memmgr uses it to key the per-process tracking table
 (see [`memory-pool.md`](memory-pool.md) §"Per-Process Tracking").
 
@@ -38,9 +38,10 @@ Two privilege classes:
   to procmgr at procmgr's bootstrap round. memmgr identifies this cap by
   badge and rejects procmgr-only calls received over any other badged cap.
 - **Universal** labels (`REQUEST_MEMORY_CAPS`, `RELEASE_MEMORY_CAPS`,
-  `REGISTER_REGION`, `UNREGISTER_REGION`) are callable over any badged cap,
-  including those memmgr returned from `REGISTER_PROCESS`. `REGISTER_REGION`
-  and `UNREGISTER_REGION` are attributed to the caller by its own badge.
+  `DONATE_MEMORY_CAPS`, `QUERY_POOL_STATUS`, `REGISTER_REGION`,
+  `UNREGISTER_REGION`) are callable over any badged cap, including those
+  memmgr returned from `REGISTER_PROCESS`. `REGISTER_REGION` and
+  `UNREGISTER_REGION` are attributed to the caller by its own badge.
 
 Badges cannot be forged: they are minted by `cap_derive_badge` only
 under the kernel's derivation rules, and procmgr is the only process
@@ -51,10 +52,13 @@ A third, kernel-origin class is the **fault message**: when a demand-paged
 process's thread takes a page fault, the kernel (not a userspace caller)
 synthesises an IPC to memmgr's endpoint with label `FAULT_LABEL`
 (`u64::MAX - 1`) and `badge` set to the faulting process's memmgr badge.
-Userspace cannot forge it — no SEND cap to the fault delivery is
-distributed; the binding is installed by procmgr via
-`SYS_THREAD_SET_FAULT_HANDLER` and the kernel owns the send. See
-[docs/fault-handling.md](../../../docs/fault-handling.md).
+The binding is installed by procmgr via `SYS_THREAD_SET_FAULT_HANDLER`.
+The fault endpoint is memmgr's client endpoint, so any holder of a badged
+SEND cap can also send a message labelled `FAULT_LABEL`; memmgr does not
+distinguish it from a kernel delivery. memmgr resolves every fault message
+against the sender's own badge record, so a forged fault can at most back
+a page of a region the sender itself registered. See
+[docs/fault-handling.md](../../../docs/fault-handling.md) §"Security".
 
 ---
 
@@ -260,6 +264,38 @@ IPC. Idempotent on stale badges (already-reaped or never-registered).
 `PROCESS_DIED` for an unknown badge is not an error — memmgr returns
 success. Reclamation is idempotent.
 
+### Label 5: `DONATE_MEMORY_CAPS`
+
+Permanently transfer Memory caps into memmgr's pool. Privilege: universal —
+the call gives memmgr RAM and takes nothing back. Used by procmgr's init
+reap to hand over init's reclaimed boot memory (ELF segments, `InitInfo`,
+stack, boot-module ELF sources). See
+[docs/process-lifecycle.md](../../../docs/process-lifecycle.md).
+
+**Request:**
+
+| Field | Value |
+|---|---|
+| label | 5 |
+| cap[..] | Memory caps to donate; each MUST carry WRITE, EXECUTE, and RETYPE rights |
+
+**Reply (success):**
+
+| Field | Value |
+|---|---|
+| label | 0 (success) |
+| data[0] | `accepted_caps` — number of transferred caps memmgr accepted |
+| data[1] | `accepted_pages` — total pages across the accepted caps |
+| data[2] | `pool_total_pages` — memmgr's owned page count after the donation |
+
+The reply is always success. memmgr validates each cap with `cap_info`; a
+cap that is not a Memory cap or lacks a required right is deleted and not
+counted. Each accepted cap is owned by memmgr for the rest of its life: it
+is added to `pool_total` (see Label 6) and placed in the free pool,
+coalescing where possible. A donated cap that finds no free-pool slot stays
+owned and counted but is unreachable for allocation until a later coalesce
+frees a slot.
+
 ### Label 6: `QUERY_POOL_STATUS`
 
 Read-only query of the all-RAM-accounted identity plus the current free
@@ -416,10 +452,12 @@ derivation. This guarantees memmgr can reclaim on `PROCESS_DIED` even
 after the caller's CSpace is torn down. See [`memory-pool.md`](memory-pool.md)
 §"Allocation".
 
-`RELEASE_MEMORY_CAPS` and `PROCESS_DIED` move caps out of the caller's
-CSpace via IPC transfer; the caller's slots become null. memmgr does
-not derive further from received caps — it inserts the underlying
-intermediary back into the free pool.
+Neither `RELEASE_MEMORY_CAPS` nor `PROCESS_DIED` transfers the caps it
+reclaims. `RELEASE_MEMORY_CAPS` names each region by `phys_base`, and
+`PROCESS_DIED` names the dead process by badge; memmgr deletes any cap
+transferred with either call defensively. Reclamation returns memmgr's
+retained intermediary to the free pool; memmgr does not derive from the
+caller's cap.
 
 ---
 

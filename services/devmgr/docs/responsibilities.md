@@ -125,7 +125,7 @@ capability set via IPC. Drivers MUST NOT be started independently of devmgr. See
 ## Summarized By
 
 [Capability Model](../../../docs/capability-model.md),
-[Device Management](../../../docs/device-management.md),
-[services/devmgr/README.md](../README.md), [services/drivers/README.md](../../drivers/README.md),
+[Device Management](../../../docs/device-management.md), [services/devmgr/README.md](../README.md),
+[services/drivers/README.md](../../drivers/README.md),
 [Driver Model](../../drivers/docs/driver-model.md),
 [services/pwrmgr/README.md](../../pwrmgr/README.md)

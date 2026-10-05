@@ -71,4 +71,5 @@ GPL-2.0-only for code. The bitmap data the crate resolves into lives in
 ## Summarized By
 
 [Console Model](../../docs/console-model.md),
+[programs/fb-charset/README.md](../../programs/fb-charset/README.md),
 [services/drivers/framebuffer/README.md](../../services/drivers/framebuffer/README.md)

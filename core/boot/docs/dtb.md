@@ -24,9 +24,11 @@ which firmware exposes which entropy source is documented in
 [boot-flow.md](boot-flow.md). The `rng-seed` reader is a flat scan that
 takes the first property of that name anywhere in the tree. The DTB's
 physical address is passed through unchanged in `BootInfo.device_tree`
-so `devmgr` can perform its own complete walk — including IOMMU-topology
-discovery, which is exclusively a userspace concern. See
-[`docs/device-management.md`](../../../docs/device-management.md) for
+because device-level discovery, IOMMU topology included, is a userspace
+concern; `devmgr`'s own firmware-table parsing is specified under
+Responsibilities in
+[`services/devmgr/README.md`](../../../services/devmgr/README.md#responsibilities).
+See [`docs/device-management.md`](../../../docs/device-management.md) for
 the system-scope IOMMU model.
 
 The bootloader does **not** resolve `interrupt-map` tables, complex
@@ -69,8 +71,9 @@ Walker limits: `MAX_DEPTH = 8` for node nesting, `MAX_REG_ENTRIES = 8`
 for `reg` tuples per node, `MAX_IRQ_ENTRIES = 4` for `interrupts`
 values, `MAX_RANGES_ENTRIES = 4` for PCI `ranges`. Nodes exceeding
 these bounds truncate silently — the bootloader does not need
-exhaustive coverage; `devmgr` re-parses the full DTB (see
-[`docs/device-management.md`](../../../docs/device-management.md)).
+exhaustive coverage, because device-level discovery is a userspace
+concern (see Responsibilities in
+[`services/devmgr/README.md`](../../../services/devmgr/README.md#responsibilities)).
 
 ---
 

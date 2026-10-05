@@ -415,4 +415,4 @@ issue #314 (with #316).
 
 ## Summarized By
 
-None
+[IPC Subsystem Internals](ipc-internals.md)

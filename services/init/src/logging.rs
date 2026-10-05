@@ -182,12 +182,8 @@ pub fn register_name(name: &[u8])
 
 // ── Serial output ────────────────────────────────────────────────────────────
 
-/// Direct serial output: the permanent pre-driver console fallback.
-///
-/// init-logd writes the UART directly here — during early boot before any
-/// log daemon exists, and as the fallback writer if the userspace serial
-/// driver never comes up. Permanent, not deprecated: it is the only writer
-/// before the serial driver is reachable. See `docs/console-model.md`.
+/// Direct serial output for init's pre-handover window; see
+/// `docs/console-model.md` item 3.
 pub(crate) fn serial_log(s: &str)
 {
     for &b in s.as_bytes()

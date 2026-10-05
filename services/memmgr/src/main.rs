@@ -1416,8 +1416,8 @@ fn handle_donate_memory_caps(req: &IpcMessage, ipc_buf: *mut u64)
     // can derive the R / RW / RX inner a demand fault or REQUEST_MEMORY_CAPS
     // consumer needs and retype on their behalf.
     //
-    // We trust the caller (single-tenant userspace; donation is gated by
-    // possessing a memmgr SEND cap, which only init and procmgr hold) but
+    // We trust the caller (single-tenant userspace; donation is ungated: any
+    // badged SEND holder may donate, which only grows the pool) but
     // still validate the cap shape via `cap_info` — a malformed or under-rights
     // cap from a buggy loader should reject, not poison the pool.
     let pool = pool_mut();

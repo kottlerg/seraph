@@ -178,8 +178,8 @@ next to its `fault_outcome = Pending` reset.
 
 **Claim-then-stamp rule.** A site may stamp the episode only after winning
 the episode's exclusive wake claim. Per the DEPOSIT model (rule 8 /
-sched-ipc-redesign.md §2.1) every deposit now carries a disposition; the
-resume remains deposit-read, never re-check. Stamps are Release-ordered after
+[sched-ipc-redesign.md](sched-ipc-redesign.md) § 2.1) every deposit now carries a disposition;
+the resume remains deposit-read, never re-check. Stamps are Release-ordered after
 the payload write; the resume's Acquire load orders the payload reads after
 it. The wake chain (stamp → `enqueue_and_wake`'s `sched_lock`/run-queue
 Release → dispatch Acquire → resume) carries the stamp; for the
@@ -446,54 +446,56 @@ path — sequential, not nested, so no cycle.
 ### Object Structure
 
 ```rust
-/// Maximum number of sources a single WaitSet may contain.
-/// Chosen so the WaitSet fits in the sub-page in-place retype slot
-/// (per scheduling-internals.md and the typed-memory cap design).
+/// Maximum number of sources a single wait set may contain.
 pub const WAIT_SET_MAX_MEMBERS: usize = 16;
 
-pub struct WaitSet
+pub struct WaitSetState
 {
     lock: Spinlock,
 
-    /// Members of this wait set. Each entry pairs a source with its badge.
+    /// Registered members. A slot whose `source_ptr` is null is vacant.
     /// Fixed capacity; SYS_WAIT_SET_ADD returns InvalidArgument when full.
-    members: [Option<WaitSetMember>; WAIT_SET_MAX_MEMBERS],
+    members: [WaitSetMember; WAIT_SET_MAX_MEMBERS],
 
-    /// Count of valid entries in `members`.
-    member_count: usize,
+    /// Number of occupied member slots.
+    member_count: u8,
 
-    /// Ring buffer of member indices that are currently ready.
-    /// Fixed capacity: at most WAIT_SET_MAX_MEMBERS entries can be ready.
+    /// Ring buffer of pending member indices. One slot stays empty to tell
+    /// full from empty, so it holds at most WAIT_SET_MAX_MEMBERS - 1 entries.
     ready_ring: [u8; WAIT_SET_MAX_MEMBERS],
-    ready_head: usize,
-    ready_tail: usize,
+    ready_head: u8,
+    ready_tail: u8,
 
-    /// Thread blocked in SYS_WAIT_SET_WAIT, or None.
-    waiter: Option<*mut ThreadControlBlock>,
-
-    header: KernelObjectHeader,
+    /// Single thread blocked in SYS_WAIT_SET_WAIT, or null.
+    waiter: *mut ThreadControlBlock,
 }
 
 struct WaitSetMember
 {
-    /// The IPC object being watched.
-    source: WaitSetSource,
+    /// The source's state struct (`EndpointState` / `NotificationState` /
+    /// `EventQueueState`), interpreted per `source_tag`. Null when vacant.
+    source_ptr: *mut u8,
+
+    /// Kind of source; meaningful only when `source_ptr` is non-null.
+    source_tag: WaitSetSourceTag,
 
     /// Opaque badge returned to the caller when this source is ready.
     badge: u64,
-
-    /// Whether this source currently has pending readiness (to handle
-    /// readiness arriving before the waiter blocks).
-    pending: bool,
 }
 
-enum WaitSetSource
+#[repr(u8)]
+enum WaitSetSourceTag
 {
-    Endpoint(NonNull<Endpoint>),
-    Notification(NonNull<Notification>),
-    EventQueue(NonNull<EventQueueHeader>),
+    Endpoint = 0,
+    Notification = 1,
+    EventQueue = 2,
 }
 ```
+
+Folding vacancy into a null `source_ptr` keeps each `WaitSetMember` at 24 B, so
+the 16-slot member array is 384 B and `WaitSetState` (at most 440 B) fits,
+with its 24 B `WaitSetObject` wrapper, in the 512 B retype bin; `wait_set.rs`
+asserts both sizes at compile time.
 
 The arrays are fixed-capacity because the kernel runs no allocator (see
 § Kernel Object Memory in
@@ -506,20 +508,19 @@ refuses `SYS_WAIT_SET_ADD` with `InvalidArgument`, per
 ### Readiness Notification
 
 Each IPC object type is extended with a "wait set registration" — a pointer back to
-the `WaitSet` and the member index. When an object becomes ready (a sender calls an
+the `WaitSetState` and the member index. When an object becomes ready (a sender calls an
 endpoint, a notification has bits set, an event is posted), it calls into the wait set:
 
 ```
 waitset_notify(wait_set, member_idx):
     Acquire wait_set.lock
-    if waiter is Some(tcb):
-        waiter = None
-        tcb.wakeup_badge = members[member_idx].badge
+    if waiter is non-null (tcb):
+        waiter = null
+        tcb.wakeup_value = members[member_idx].badge
         Release lock
-        Mark tcb as Ready; enqueue
+        enqueue_and_wake(tcb)
     else:
-        members[member_idx].pending = true
-        ready_queue.push_back(member_idx)
+        ready_ring.push(member_idx)   // dropped if the ring is full
         Release lock
 ```
 
@@ -529,17 +530,16 @@ waitset_notify(wait_set, member_idx):
 
 ```
 1. Acquire lock
-2. if ready_queue is non-empty:
-   a. member_idx = ready_queue.pop_front()
-   b. members[member_idx].pending = false
-   c. badge = members[member_idx].badge
-   d. Release lock; return badge
+2. while ready_ring is non-empty:
+   a. member_idx = ready_ring.pop()
+   b. if members[member_idx] is vacant (removed): skip it
+   c. Release lock; return members[member_idx].badge
 3. Level-readiness self-heal: for each member, if source_is_ready(source)
    right now, Release lock and return its badge.
 4. else:
    a. waiter = current_tcb
    b. Release lock
-   c. Block current thread; return wakeup_badge when woken
+   c. Block current thread; return wakeup_value when woken
 ```
 
 **Why step 3 exists, and its memory-ordering requirement.** Readiness
@@ -561,9 +561,9 @@ not-ready and strand a queued sender/event whose enqueue fired no edge notify
 (lost wakeup). The readiness signals are: `NotificationState::bits`
 (`AtomicU64`), `EventQueueState::count` (`AtomicU32`), and
 `EndpointState::send_nonempty` (`AtomicU32`, a shadow of `send_head != null`
-republished under `ep.lock` at every send-queue mutation);
-their pairings are tabulated in § Atomic Ordering Invariants of
-[scheduling-internals.md](scheduling-internals.md#atomic-ordering-invariants).
+republished under `ep.lock` at every send-queue mutation); their pairings are tabulated in
+[scheduling-internals.md](scheduling-internals.md#atomic-ordering-invariants) § Atomic Ordering
+Invariants.
 
 ### Wait Set Add/Remove
 
@@ -592,11 +592,13 @@ ownership per § Kernel Object Reference Counting in
 
 ### Multiple Ready Sources
 
-If multiple members become ready before `SYS_WAIT_SET_WAIT` is called, `ready_queue`
-accumulates all of them in order. Subsequent `SYS_WAIT_SET_WAIT` calls drain the
-queue without blocking until it is empty, per
-[syscalls.md § `SYS_WAIT_SET_WAIT`](syscalls.md#sys_wait_set_wait-28). This prevents
-readiness loss — any number of readiness events are remembered.
+If multiple members become ready before `SYS_WAIT_SET_WAIT` is called, `ready_ring`
+buffers their member indices in arrival order, up to `WAIT_SET_MAX_MEMBERS - 1`
+entries; it does not deduplicate, and a push to a full ring is dropped.
+Subsequent `SYS_WAIT_SET_WAIT` calls drain the ring without blocking until it is
+empty, per [syscalls.md § `SYS_WAIT_SET_WAIT`](syscalls.md#sys_wait_set_wait-28).
+An edge lost to a full ring is recovered by the level-readiness self-heal
+(§ Wait Path step 3), which returns any member whose source is still ready.
 
 ---
 
@@ -636,13 +638,14 @@ the primary scheduling interaction. The scheduler itself does not need to know a
 IPC — the IPC path directly manipulates TCB state and, when appropriate, calls the
 low-level context switch primitive.
 
-The scheduler's preemption timer is irrelevant during IPC fast-path execution — the
-entire send/receive/switch sequence executes atomically with interrupts enabled but
-within the endpoint lock. The timer interrupt may fire during this sequence; the
-interrupt handler will observe that the current thread is in kernel mode (not
-preemptible at the scheduler level) and defer preemption until the thread returns
-to userspace (see
-[scheduler.md § Kernel-Mode Preemption Points](scheduler.md#kernel-mode-preemption-points)).
+The scheduler's preemption timer does not interrupt the IPC fast path. Syscall entry
+masks interrupts, and every IPC object lock is an IRQ-disabling
+`crate::sync::Spinlock`, so the endpoint-lock critical section that performs the
+send/receive/switch runs with interrupts disabled. A timer interrupt that arrives
+meanwhile stays pending until interrupts are re-enabled, which for syscall context
+is the return to userspace; kernel-mode preemption exists only at a slice expiry
+with preemption enabled (see the "Lock primitive" and "Bare spin locks" paragraphs
+of [scheduling-internals.md § Lock Hierarchy](scheduling-internals.md#lock-hierarchy)).
 
 ---
 

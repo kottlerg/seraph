@@ -33,6 +33,17 @@ object every sender already targets (see
 [`service-definitions.md` § `log_sink`](../../svcmgr/docs/service-definitions.md#log_sink)).
 In-flight history from the prior instance is not recoverable.
 
+## Startup ordering
+
+logd creates its death-notification `EventQueue` and registers it with procmgr
+(`REGISTER_DEATH_EQ`) before it issues the first `HANDOVER_PULL`. The handover ends with
+init-logd exiting, which lets procmgr reap init; that reap logs, and until logd enters its
+receive loop the master log endpoint has no reader. Registering first, while init-logd still
+serves the endpoint and procmgr is not yet reaping init, keeps logd from blocking on procmgr in
+that window, which would deadlock against procmgr blocking on the unread log endpoint. After the
+release, logd has no further procmgr dependency before its receive loop, so it drains the reap's
+log line itself (see [`main.rs`](../src/main.rs)).
+
 ## Call shape
 
 * Request: `IpcMessage::new(HANDOVER_PULL)`. Empty payload, no caps.
@@ -138,6 +149,8 @@ side) and [`services/logd/src/handover.rs`](../src/handover.rs)
 
 ## Summarized By
 
-[System Bootstrap](../../../docs/bootstrap.md), [services/init/README.md](../../init/README.md),
+[System Bootstrap](../../../docs/bootstrap.md), [Console Model](../../../docs/console-model.md),
+[services/init/README.md](../../init/README.md),
 [init Bootstrap Stages](../../init/docs/bootstrap.md), [services/logd/README.md](../README.md),
+[logd IPC interface](ipc-interface.md), [services/procmgr/README.md](../../procmgr/README.md),
 [`.svc` Service Definitions](../../svcmgr/docs/service-definitions.md)

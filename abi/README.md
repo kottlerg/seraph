@@ -1,7 +1,7 @@
 # abi
 
-Binary contract crates that cross component or privilege boundaries; a change to one is an ABI
-break. [shared/README.md](../shared/README.md) indexes the non-contract crates.
+Binary contract crates that cross component or privilege boundaries;
+[shared/README.md](../shared/README.md) indexes the non-contract crates.
 
 | Crate | Purpose |
 |---|---|

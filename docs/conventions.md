@@ -294,4 +294,5 @@ Producing a release for tag `v<X>.<Y>.<Z>`:
 ## Summarized By
 
 [abi/syscall/README.md](../abi/syscall/README.md), [Build System](build-system.md),
-[Documentation Standards](documentation-standards.md), [Testing](testing.md)
+[Documentation Standards](documentation-standards.md),
+[docs/releases/README.md](releases/README.md), [Testing](testing.md)

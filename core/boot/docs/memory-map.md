@@ -64,11 +64,15 @@ in-place, no-allocation, no-recursion implementation is preferred.
 ## Allocation-Class Classification
 
 Every bootloader allocation uses `EfiLoaderCode` or `EfiLoaderData` and
-therefore surfaces as `MemoryType::Loaded`. The kernel treats `Loaded`
-regions as in-use until it explicitly reclaims them in Phase 3 (kernel
-page-table replacement; see
-[initialization.md](../../kernel/docs/initialization.md) §"Phase 3: Kernel Page Tables").
-Specifically:
+therefore surfaces as `MemoryType::Loaded`. The kernel never hands
+`Loaded` regions to its buddy allocator. The bootloader-scratch subset
+recorded in `BootInfo.reclaim_ranges` is minted as reclaimable Memory caps
+in Phase 7 (the AP trampoline page is late-minted in Phase 8), and init
+donates those caps to memmgr at reap; kernel-image and init-segment pages
+are never reclaimed. See
+[initialization.md](../../kernel/docs/initialization.md) §"Phase 7: Capability System",
+and §"Phase 3: Kernel Page Tables" step 7 for the bootloader page-table
+frames. The `Loaded` allocations are:
 
 - Kernel image LOAD segments, placed in a bootloader-chosen contiguous span.
 - Init image LOAD segments, placed at any free physical address.
@@ -76,28 +80,26 @@ Specifically:
 - `BootInfo` structure page.
 - `MmioAperture` array page (`mmio_apertures.entries`).
 - Memory-map buffer itself.
-- Bootloader stack region (mapped by UEFI at boot; classified by
-  firmware, not by the bootloader).
+- Kernel handoff stack (`KERNEL_STACK_PAGES`, 64 KiB), allocated by the
+  bootloader as `EfiLoaderData`.
 - Page-table frames allocated for the initial mapping (see
   [page-tables.md](page-tables.md)).
 
-The `BootInfo.modules` slice and its backing page are similarly
-`Loaded`; the kernel only reclaims them after init has copied whatever
-is needed (see
+The `BootInfo.modules` descriptor page is similarly `Loaded` and is a
+`BootInfo.reclaim_ranges` entry; the module bodies get Memory caps from
+`mint_module_memory_caps`. The kernel mints both in Phase 7, before init
+exists, and hands them to init (see
 [initialization.md](../../kernel/docs/initialization.md) §"Phase 7: Capability System").
+The pages return to the pool only when init donates those caps to memmgr at
+reap (see [process-lifecycle.md](../../../docs/process-lifecycle.md) §"Init reap").
 
 ---
 
 ## Sizing the Map Buffer
 
-The UEFI map query is racy with allocation: each `AllocatePages` call
-can grow the map by one entry. The buffer size is taken from the
-first, size-query call and padded with extra slack for the map-buffer
-allocation itself. The exact slack constant is internal to
-[`boot/src/memory_map.rs`](../src/memory_map.rs); it is sized so the
-post-allocation map fits without reallocation under every supported
-firmware implementation. The acquisition sequence that sizes and fills the buffer is
-owned by [uefi-environment.md](uefi-environment.md) §"Memory Map Acquisition".
+The acquisition sequence that sizes and fills the map buffer, including
+its slack margin, is owned by
+[uefi-environment.md](uefi-environment.md) §"Memory Map Acquisition".
 
 ---
 

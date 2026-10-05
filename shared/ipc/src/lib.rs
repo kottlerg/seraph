@@ -478,8 +478,8 @@ pub mod memmgr_labels
     /// identifying the new process. Procmgr installs the returned cap in
     /// the new process's `ProcessInfo.memmgr_endpoint_cap`.
     pub const REGISTER_PROCESS: u64 = 3;
-    /// Procmgr-only: notification process death. The transferred cap (`caps[0]`)
-    /// carries the dead process's badge; memmgr reclaims every Memory cap
+    /// Procmgr-only: notify process death. `data[0]` carries the dead process's
+    /// memmgr badge (no cap is required); memmgr reclaims every Memory cap
     /// it had issued to that badge, runs coalescing, and clears the
     /// per-process record. Idempotent on unknown badges.
     pub const PROCESS_DIED: u64 = 4;
@@ -2136,7 +2136,8 @@ pub mod blk_errors
     pub const REGISTER_REJECTED: u64 = 4;
     /// Memory cap rejected: `BLK_READ_INTO_MEMORY` target missing
     /// `MAP|WRITE` rights, `BLK_WRITE_FROM_MEMORY` source missing
-    /// `MAP|READ` rights, sized other than one page, or absent.
+    /// `MAP|READ` rights, smaller than `count * 512` bytes, or absent;
+    /// also returned when `count` is 0 or `count * 512` exceeds `u32::MAX`.
     pub const INVALID_MEMORY_CAP: u64 = 5;
     /// Caller's compiled `BLK_LABELS_VERSION` does not match the receiver's.
     /// `REGISTER_PARTITION` is the handshake entry point and carries the

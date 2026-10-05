@@ -155,8 +155,8 @@ A capability to an event queue (ordered ring buffer). Rights:
 
 A capability to a contiguous range of hardware interrupt lines (a range authority,
 narrowed with `SYS_IRQ_SPLIT`). Rights:
-- **Notify** — may register and acknowledge a line (`SYS_IRQ_REGISTER` requires a
-  single-line cap)
+- **Notify** — may register, acknowledge, and split (`SYS_IRQ_REGISTER`, `SYS_IRQ_ACK`,
+  `SYS_IRQ_SPLIT`); register and acknowledge require a single-line cap
 
 The holder binds a Notification to the line with `SYS_IRQ_REGISTER`; each interrupt
 ORs bit 0 into that Notification, and the holder re-enables the line with
@@ -212,11 +212,13 @@ A capability to a contiguous range of x86 I/O port numbers. Rights:
 The kernel mints one root IoPort capability over the full 64K port space at boot
 (x86-64 only); IoPort capabilities are not creatable at runtime. Init hands devmgr a
 copy, and devmgr narrows it with `SYS_IOPORT_SPLIT` and gives each driver only its
-assigned port range (see [services/devmgr/README.md](../services/devmgr/README.md)).
+assigned port range (see
+[services/devmgr/docs/responsibilities.md](../services/devmgr/docs/responsibilities.md)).
 
 Revoking an IoPort capability removes port access from all threads it has
-been bound to. The kernel tracks bindings and updates each affected thread's IOPB
-in the TSS on revocation.
+been bound to; the kernel tracks bindings and updates each affected thread's IOPB
+in the TSS on revocation (design intent; not yet implemented — `SYS_IOPORT_BIND`
+records no binding and revocation does not withdraw bound IOPB access, #457).
 
 ### SbiControl (RISC-V only)
 
@@ -264,7 +266,7 @@ bypass the console-ownership model), and **Cppc** / **Base** / **Pmu** are simpl
 not needed by any current service. devmgr serves pwrmgr a copy further narrowed to
 **Reset** only (system reset / reboot); **Suspend** is retained against a future
 power-management path but delegated to no one today. See
-[services/devmgr/README.md](../services/devmgr/README.md).
+[services/devmgr/docs/responsibilities.md](../services/devmgr/docs/responsibilities.md).
 
 **Gating-granularity decision.** Per-cap authority is encoded as rights bits, not
 an EID set carried by `SbiControlObject`, because the extension set is small and
@@ -389,10 +391,13 @@ un-badged cap is a blank cheque — it is, by design, the source from which any
 badged child can be derived.
 
 In practice this means: the un-badged source cap on a server's endpoint lives
-exclusively in the server's own CSpace (used internally to mint per-client
-badged copies) and in the CSpaces of trusted bootstrap-time minters (today: init,
-which procmgr reaps once both its threads have exited after Phase 3; see
-[process-lifecycle.md § Init reap](process-lifecycle.md#init-reap)). Every other client
+only in the server's own CSpace (used internally to mint per-client badged
+copies) and in the CSpaces of trusted minters. Today these are init, which
+procmgr reaps once both its threads have exited after init's
+[Handover stage](../services/init/docs/bootstrap.md#handover) (see
+[process-lifecycle.md § Init reap](process-lifecycle.md#init-reap)), plus procmgr
+and svcmgr, which hold un-badged sources on other servers' endpoints for the
+system's lifetime to mint per-client badges. Every other client
 receives a badged cap whose badge value is chosen by the trusted minter — the
 client cannot subsequently re-badgeize it because of the set-once rule above.
 
@@ -619,8 +624,9 @@ less-trusted source validate its shape before relying on it.
 
 At boot, the kernel creates init's Thread, AddressSpace, and CSpace and populates
 the CSpace with an initial set of capabilities covering all available resources.
-The kernel mints these during Phase 7 and Phase 9 of
-[initialization.md](../core/kernel/docs/initialization.md#phase-7-capability-system).
+The kernel mints these during Phases 7–9 of
+[initialization.md](../core/kernel/docs/initialization.md#phase-7-capability-system)
+(Phase 8 mints the late-reclaim cap over the x86-64 AP trampoline page).
 
 - Memory capabilities for all usable physical memory
 - Mmio capabilities (Map | Write), one per `BootInfo.mmio_apertures` entry, plus one
@@ -692,8 +698,8 @@ The kernel does not provide:
 [Kernel Initialization Sequence](../core/kernel/docs/initialization.md),
 [Scheduler Internals](../core/kernel/docs/scheduler.md),
 [Syscall Interface Specification](../core/kernel/docs/syscalls.md),
-[Architecture Overview](architecture.md), [IPC Design](ipc-design.md),
-[Memory Model](memory-model.md), [Namespace Model](namespace-model.md),
+[Architecture Overview](architecture.md), [Device Management](device-management.md),
+[IPC Design](ipc-design.md), [Memory Model](memory-model.md), [Namespace Model](namespace-model.md),
 [Process Lifecycle](process-lifecycle.md),
 [services/devmgr/README.md](../services/devmgr/README.md),
 [init Bootstrap Stages](../services/init/docs/bootstrap.md),

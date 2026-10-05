@@ -74,12 +74,14 @@ Notes on the non-obvious entries:
   re-derived destination handles outbound. Both directions expose only
   values the owning process already holds or is being granted; see
   [syscalls.md](syscalls.md) § Capability Handles.
-- **Fault messages** source `d1`/`ip` from the live user `TrapFrame` — the faulting
-  user address and user instruction pointer
-  ([docs/fault-handling.md](../../../docs/fault-handling.md) § Fault Message). The
-  forwarded/readable `TrapFrame` holds only user-mode register state (no kernel stack
-  pointer, kernel return address, or `CR3`/`satp`); the write path re-validates
-  through `sanitize_for_user_resume`.
+- **Fault messages** carry, for `FAULT_KIND_VM`, the user faulting address in `d1`
+  (`CR2` on x86-64, `stval` on RISC-V), access flags in `d2`, and the user instruction
+  pointer from the `TrapFrame` in `ip`; for `FAULT_KIND_EXCEPTION`, a normalized
+  exception code in `d1` and an architecture code (x86-64 error code, RISC-V `stval`)
+  in `d2` ([docs/fault-handling.md](../../../docs/fault-handling.md) § Fault Message).
+  No word carries a kernel VA. The forwarded/readable `TrapFrame` holds only user-mode
+  register state (no kernel stack pointer, kernel return address, or `CR3`/`satp`); the
+  write path re-validates through `sanitize_for_user_resume`.
 - **Thread IDs** are random per `sched::alloc_thread_id` (issue #248;
   [scheduling-internals.md](scheduling-internals.md) § Cross-CPU TCB Ownership) — a
   monotonic id would leak thread creation counts/rates wherever logged. They are diagnostic
@@ -118,15 +120,15 @@ are fixed-by-contract disclosures, not leaks.
 
 **Resolved for the KASLR work ([#252](https://github.com/kottlerg/seraph/issues/252)):**
 KASLR draws the direct-map base from the boot-entropy source at 1 GiB granularity
-([docs/memory-model.md](../../../docs/memory-model.md) § Virtual Address Space Layout)
-(≈17–26 bits on x86-64 / Sv48 / Sv57, ≈8 bits on a near-full Sv39 half), independently
-of any physical address. A leaked physical address therefore does **not** reveal the
-phys→virt offset — recovering the direct-map base from a physical address would require
-also knowing that page's virtual address, which these surfaces do not disclose. So
-`SYS_ASPACE_QUERY` and `CAP_INFO_MEMORY_PHYS_BASE` remain fixed-by-contract disclosures,
-not KASLR leaks. (`kernel_physical_base` is likewise a physical value and unaffected;
-the kernel scrubs the *virtual* KASLR bases — `kernel_virtual_base`, `direct_map_base` —
-from the donated `BootInfo` page after consuming them; see
+(≈17–26 bits on x86-64 / Sv48 / Sv57, ≈8 bits on a near-full Sv39 half; see
+[docs/memory-model.md](../../../docs/memory-model.md) § Virtual Address Space Layout),
+independently of any physical address. A leaked physical address therefore does **not**
+reveal the phys→virt offset — recovering the direct-map base from a physical address
+would require also knowing that page's virtual address, which these surfaces do not
+disclose. So `SYS_ASPACE_QUERY` and `CAP_INFO_MEMORY_PHYS_BASE` remain fixed-by-contract
+disclosures, not KASLR leaks. (`kernel_physical_base` is likewise a physical value and
+unaffected; the kernel scrubs the *virtual* KASLR bases — `kernel_virtual_base`,
+`direct_map_base` — from the donated `BootInfo` page after consuming them; see
 [initialization.md](initialization.md) § Phase 5.)
 
 ## Kernel state in donated memory
@@ -215,4 +217,5 @@ identifier observed across the boundary is drawn from the entropy root
 [core/kernel/README.md](../README.md), [Capability Subsystem Internals](capability-internals.md),
 [Kernel Initialization Sequence](initialization.md),
 [SMP Scheduling and Locking Invariants](scheduling-internals.md),
-[Console Model](../../../docs/console-model.md)
+[Console Model](../../../docs/console-model.md),
+[Device Management](../../../docs/device-management.md), [Testing](../../../docs/testing.md)

@@ -33,7 +33,7 @@ ruststd/
     ├── os/
     │   └── seraph.rs           # std::os::seraph surface (startup info, caps, cwd)
     └── sys/                    # std::sys::seraph backends, one directory per area
-        ├── alloc/              # byte heap (#[global_allocator])
+        ├── alloc/              # byte heap (GlobalAlloc for System)
         ├── args/               # std::env::args — consumes argv_env::next_field
         ├── env/                # std::env::{var,vars,…} —
         │                         consumes argv_env::{next_field,split_key_value}
@@ -57,15 +57,17 @@ chosen by the process creator and only consumed by std at `_start`. See
 [`docs/userspace-memory-model.md`](../../docs/userspace-memory-model.md) for
 the full contract.
 
-### Byte heap (`#[global_allocator]`)
+### Byte heap (`System`)
 
-`std::sys::seraph::alloc` declares the global allocator. Every `Box`, `Vec`,
+`std::sys::seraph::alloc` implements `GlobalAlloc` for std's default `System`
+allocator, so no `#[global_allocator]` override is needed. Every `Box`, `Vec`,
 `String`, and `alloc`/`std` collection allocates here. The grow path
 requests Memory caps from memmgr via `memmgr_labels::REQUEST_MEMORY_CAPS` on
 `ProcessInfo.memmgr_endpoint_cap`, mapping them at a contiguous VA above the
 heap's high-water mark with a single multi-page `mem_map` per returned cap.
 The bootstrap heap is allocated by `std::os::seraph::_start` before
-`fn main()` runs; OOM panics the thread. See
+`fn main()` runs. On OOM, `GlobalAlloc::alloc` returns null and the `alloc`
+crate aborts through `handle_alloc_error`; nothing unwinds. See
 [§ Byte Heap](../../docs/userspace-memory-model.md#byte-heap).
 
 ### Page reservations
@@ -100,8 +102,10 @@ the allocator only manages VA space. See
 
 `_start` reads `ProcessInfo` to learn the IPC-buffer VA, the memmgr/procmgr
 endpoint slots, and other parent-chosen state. It does not allocate these
-VAs — procmgr (or for init, the kernel) chose them. Subsequent foreign
-mappings go through the page-reservation allocator above. See
+VAs — the process creator chose them (init for procmgr, procmgr for every
+other std-built process; see the owner column of
+[§ VA Management Surfaces](../../docs/userspace-memory-model.md#va-management-surfaces)).
+Subsequent foreign mappings go through the page-reservation allocator above. See
 [§ Bootstrap Cross-Boundary VAs](../../docs/userspace-memory-model.md#bootstrap-cross-boundary-vas).
 
 ---
@@ -138,10 +142,13 @@ returns `Unsupported`. A process with a non-zero root but zero cwd
 can open absolute paths only; relative paths return `Unsupported`
 until `set_current_dir` installs a cwd cap.
 
-The setter is the seraph-native cwd primitive. The upstream
-`std::env::set_current_dir` / `current_dir` currently return
-`Unsupported` because seraph lacks a `pal/` entry that bridges to the
-cap-native machinery.
+The setter is the seraph-native cwd primitive. The env-dispatch overlay
+(a patch to `library/std/src/env.rs`) bridges the upstream API to it:
+`std::env::set_current_dir` delegates to `std::os::seraph::set_current_dir`,
+which walks the root cap and installs the cwd cap and its path string
+together. `std::env::current_dir` returns the recorded path, or
+`Unsupported` until one is recorded, because the startup cwd cap carries
+no path string.
 
 `Command::spawn` defaults the child's root cap to a `cap_copy` of the
 spawner's `root_dir_cap()` (parent-inherit); explicit override via

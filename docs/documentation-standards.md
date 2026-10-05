@@ -18,6 +18,9 @@ Five documentation scopes exist:
 | Routing | Root `README.md` | Routes to authoritative documents; may summarize their content; carries no original behavior |
 
 - Every component MUST have a `README.md`.
+- A library or tester crate extracted from a single component and nested in that component's
+  directory is part of that component, not a component of its own: it needs no `README.md`,
+  and the component's README describes it.
 - A component MAY have a `docs/` directory.
 - If a component has no `docs/` directory, its `README.md` is the sole authoritative
   document for that component.

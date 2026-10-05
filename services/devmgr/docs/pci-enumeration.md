@@ -71,4 +71,4 @@ For each matched device, devmgr:
 
 ## Summarized By
 
-[services/devmgr/README.md](../README.md)
+[devmgr Responsibilities and Capabilities](responsibilities.md)

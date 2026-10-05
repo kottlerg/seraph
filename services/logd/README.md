@@ -56,14 +56,13 @@ restart.
   exactly once so a headless boot does not re-query devmgr per line.
   See [docs/console-model.md](../../docs/console-model.md).
 
-* **History buffer.** logd maintains a per-sender ring of completed
-  log lines, populated by every `STREAM_BYTES`-derived flush and
-  seeded at startup from init-logd's handover payload. Lines stay in
-  memory until per-slot bounds are reached (FIFO drop). A future PR
-  exposes this buffer through a query IPC and/or durable sinks
-  (disk file, network syslog). For now the buffer is write-only;
-  the deliverable here is the retention contract, not yet the read
-  surface.
+* **History buffer.** logd keeps a bounded per-sender ring of completed
+  log lines (oldest line dropped when full), appended on every
+  `STREAM_BYTES` line flush (see
+  [`docs/ipc-interface.md`](docs/ipc-interface.md) § `stream_labels::STREAM_BYTES`)
+  and seeded at startup from init-logd's handover `LINE` chunks (see
+  [`docs/handover-protocol.md`](docs/handover-protocol.md) § `LINE`). The
+  ring has no read surface. TODO: a query IPC that reads the history ring.
 
 * **Per-sender slot reclamation.** logd creates an `EventQueue` and
   registers it with procmgr via `procmgr_labels::REGISTER_DEATH_EQ`
@@ -75,9 +74,7 @@ restart.
   When a process exits, logd's EQ receives
   `(process_badge << 32) | exit_reason`; logd evicts the matching
   slot from its hash-keyed badge table (see
-  [`docs/ipc-interface.md`](docs/ipc-interface.md)). This is the slot-table
-  scale + reclamation work folded into the same service per issue
-  [#1](https://github.com/kottlerg/seraph/issues/1).
+  [`docs/ipc-interface.md`](docs/ipc-interface.md)).
 
 ## Out of scope (follow-up issues)
 
@@ -113,17 +110,14 @@ and [`docs/ipc-interface.md`](docs/ipc-interface.md)):
 | Index | Cap |
 |---|---|
 | 0 | RECV on the master log endpoint |
-| 1 | SEND on the master log endpoint (single-use; carries `HANDOVER_PULL` for the history drain then the terminal `HANDOVER_RELEASE`, then deleted; see [`docs/ipc-interface.md`](docs/ipc-interface.md)). `0` on a restart — there is no init-logd left to pull from, so logd skips the handover |
+| 1 | SEND on the master log endpoint (single-use; carries the `HANDOVER_PULL` history drain, then the terminal `HANDOVER_RELEASE`, then deleted; see [`docs/handover-protocol.md`](docs/handover-protocol.md)). `0` on a restart — there is no init-logd left to pull from, so logd skips the handover |
 | 2 | Badged SEND on procmgr's service endpoint carrying `DEATH_EQ_AUTHORITY` |
 | 3 | Badged SEND on devmgr's registry endpoint carrying `REGISTRY_QUERY_AUTHORITY` (to resolve the serial driver via `QUERY_SERIAL_DEVICE` and the framebuffer driver via `QUERY_FRAMEBUFFER_DEVICE`) |
 
-logd registers its death-EQ with procmgr before the handover pull (while
-init-logd still drains the endpoint and procmgr is not yet reaping init),
-then pulls cap[1] and deletes it (no other use for a SEND cap on its own
-endpoint). The devmgr-registry cap is kept for the lifetime of the
-process; logd uses it to resolve and cache the serial driver's write
-endpoint and, when a framebuffer driver is present, the framebuffer
-driver's.
+logd registers its death-EQ with procmgr before the handover pull and keeps
+the devmgr-registry cap for its lifetime (see
+[`docs/handover-protocol.md`](docs/handover-protocol.md) § Startup ordering and
+[`docs/ipc-interface.md`](docs/ipc-interface.md) § Bootstrap caps).
 
 ## Relevant Design Documents
 
@@ -144,5 +138,6 @@ driver's.
 
 ## Summarized By
 
-[Architecture Overview](../../docs/architecture.md), [Console Model](../../docs/console-model.md),
+[Architecture Overview](../../docs/architecture.md), [System Bootstrap](../../docs/bootstrap.md),
+[Console Model](../../docs/console-model.md),
 [`.svc` Service Definitions](../svcmgr/docs/service-definitions.md)

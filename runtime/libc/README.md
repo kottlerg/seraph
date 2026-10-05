@@ -1,15 +1,15 @@
 # libc
 
-C standard library and POSIX compatibility layer for Seraph userspace.
-Implements the C standard library (stdio, stdlib, string, math, etc.) and
-standard POSIX interfaces for components written in C or targeting C-compatible
-FFI. Wraps Seraph's native syscall ABI with a POSIX-shaped surface (file
-descriptors, `read`/`write`, etc.).
+C standard library over Seraph's native interfaces for Seraph userspace (design intent; not yet
+implemented). The design provides the C standard library (stdio, stdlib, string, math, etc.)
+for components written in C or targeting C-compatible FFI. libc is a language runtime, not a
+compatibility shim: it does not provide a POSIX compatibility layer, and POSIX API compatibility
+is not a goal.
 
-Native Rust components use Seraph syscalls directly via `abi/syscall` and
-`shared/syscall`; [`ruststd`](../ruststd/README.md) provides the `std` platform
-layer without going through libc. libc is for C code and for maximum source compatibility with
-existing POSIX software.
+Native Rust code does not go through libc. For its syscall interface, see
+[`abi/syscall`](../../abi/syscall/README.md) and
+[`shared/syscall`](../../shared/syscall/README.md);
+[`ruststd`](../ruststd/README.md) provides the `std` platform layer.
 
 ## Status
 

@@ -64,4 +64,6 @@ client reuses the same wire without inheriting ANSI's colour vocabulary.
 
 ## Summarized By
 
+[programs/fb-charset/README.md](../../programs/fb-charset/README.md),
+[programs/terminal/README.md](../../programs/terminal/README.md),
 [services/drivers/framebuffer/README.md](../../services/drivers/framebuffer/README.md)

@@ -3,10 +3,12 @@
 logd is the receive-side of the master log endpoint. It does not
 publish a separate service endpoint; every userspace sender already
 holds a badged SEND cap on the log endpoint (seeded by procmgr at
-spawn time, or installed by init for itself / procmgr-self; see
-[`docs/process-lifecycle.md`](../../../docs/process-lifecycle.md)). The
-labels documented below are the ones logd's receive loop dispatches
-on.
+spawn time, per [`docs/process-lifecycle.md`](../../../docs/process-lifecycle.md)
+§ ProcessInfo / InitInfo Handover Discipline, or installed by init for
+itself / procmgr-self, per
+[`services/init/docs/bootstrap.md`](../../init/docs/bootstrap.md) § Raw
+bootstrap). The labels documented below are the ones logd's receive
+loop dispatches on.
 
 logd additionally calls procmgr's
 [`procmgr_labels::REGISTER_DEATH_EQ`](../../procmgr/docs/ipc-interface.md)
@@ -23,7 +25,7 @@ The shape mirrors the README's "Bootstrap caps" table:
 | Index | Cap |
 |---|---|
 | 0 | `RECV` on the master log endpoint |
-| 1 | `SEND` on the master log endpoint (single-use; `HANDOVER_PULL` only). `0` on a restart — no init-logd remains to pull from, so logd skips the history pull |
+| 1 | `SEND` on the master log endpoint (single-use; carries the `HANDOVER_PULL` history drain, then the terminal `HANDOVER_RELEASE` (retried until acked), then `cap_delete`; see [`handover-protocol.md`](handover-protocol.md)). `0` on a restart — no init-logd remains to pull from, so logd skips the history pull |
 | 2 | badged `SEND` on procmgr's service endpoint carrying `DEATH_EQ_AUTHORITY` |
 | 3 | badged `SEND` on devmgr's registry endpoint carrying `REGISTRY_QUERY_AUTHORITY` (resolves the serial driver via `QUERY_SERIAL_DEVICE` and the framebuffer driver via `QUERY_FRAMEBUFFER_DEVICE`) |
 
@@ -33,13 +35,17 @@ object every sender already targets. Only `cap[1]` differs across the two
 paths: present on the first launch (one-shot history pull from init-logd),
 `0` on a restart (history pull skipped, fresh table served).
 
+logd keeps `cap[0]` and the devmgr-registry `cap[3]` for its lifetime, using `cap[3]` to
+resolve and cache the serial driver's write endpoint and, when a framebuffer driver is
+present, the framebuffer driver's; `cap[1]` is deleted after the handover release.
+
 ## Endpoint
 
 | Cap holder | Right | Purpose |
 |---|---|---|
 | logd's main thread | `RECV` | drains the endpoint via `ipc_recv` inside the wait-set loop |
 | every userspace sender | `SEND` (badged) | `STREAM_BYTES`, `STREAM_REGISTER_NAME` |
-| real-logd on its first launch | `SEND` (un-badged) | single-use `HANDOVER_PULL` to init-logd; deleted immediately after `DONE`. Absent (`cap[1] = 0`) on a restart |
+| real-logd on its first launch | `SEND` (un-badged) | single-use `HANDOVER_PULL` drain to init-logd, then `HANDOVER_RELEASE` (retried until acked), then deleted via `cap_delete`. Absent (`cap[1] = 0`) on a restart |
 
 ## Labels accepted
 
@@ -54,6 +60,10 @@ line, emitted as `[sec.usfrac] [name] <line>\r\n` to the serial
 driver (`SERIAL_WRITE_BYTES`) and mirrored to the framebuffer driver
 (`FB_WRITE_BYTES`) when one is present, then appended to the slot's
 history ring.
+
+The history ring holds `PER_SLOT_HISTORY` (16) completed lines per slot (see
+[`slot.rs`](../src/slot.rs)); appending to a full ring drops its oldest line (FIFO). The ring
+has no read surface. TODO: a query IPC that reads the history ring.
 
 Lines exceeding `LINE_BUF_SIZE` (256 bytes) flush without a
 trailing `\n` to keep the per-line attribution visible. Senders
@@ -86,15 +96,14 @@ unreachable; init-logd is the only intended target.
 
 ### `log_labels::GET_LOG_CAP` (12) — legacy
 
-Pre-pivot discovery path. Reserved in the label table for backward
+Legacy discovery label. Reserved in the label table for backward
 compatibility but no caller in the current codebase issues it
 (every spawn receives a pre-installed badged SEND cap in
 `ProcessInfo.log_send_cap`, per
 [`docs/process-lifecycle.md`](../../../docs/process-lifecycle.md) § ProcessInfo / InitInfo
 Handover Discipline). logd replies empty if it ever
 arrives, so an out-of-tree v0 caller fails closed without crashing
-logd. A follow-up PR removes the label entirely once the
-pre-pivot discovery path is gone for good.
+logd.
 
 ## Wait-set
 

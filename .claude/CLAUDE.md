@@ -33,7 +33,8 @@ truth for "how work is tracked and shipped" on this project.
 ## Operating procedure
 - Documentation MUST be consumed in the order of the authoritative scopes
   [docs/documentation-standards.md](../docs/documentation-standards.md) § Document Hierarchy
-  defines (grouping READMEs and the root README only route to them):
+  defines (grouping READMEs only index components; the root README routes to and may
+  summarize the authoritative documents):
   1. System scope (`docs/`)
   2. Component scope (`<component>/README.md`)
   3. Design-authority scope (`<component>/docs/*.md`)
@@ -43,7 +44,8 @@ truth for "how work is tracked and shipped" on this project.
 - All build, run, clean, and test actions MUST be performed via `cargo xtask` commands
   (per [docs/build-system.md](../docs/build-system.md) § Convenience Commands).
 - Direct invocation of `cargo build`, `cargo run`, `cargo test`, or `cargo clippy` is forbidden
-  (same section).
+  (per [docs/build-system.md](../docs/build-system.md) § Workspace Structure and § Convenience
+  Commands, and [docs/coding-standards.md](../docs/coding-standards.md) § Clippy).
 - When switching architectures, `cargo xtask clean` MUST be run first
   (per [docs/build-system.md](../docs/build-system.md) § Build Output: the Sysroot).
 
@@ -96,9 +98,9 @@ truth for "how work is tracked and shipped" on this project.
   with the user's approval, per "Completeness" below.
 
   After the fixes are pushed and CI is green again, run the workflow in
-  `delta` mode. Prompt for the merge decision only when a run completes (per
-  [docs/conventions.md](../docs/conventions.md) § Branch and PR Workflow)
-  with no failed agent, `READY TO MERGE`, and `AUDIT PASS` (the reviewer
+  `delta` mode. Prompt for the merge decision only when a run completes
+  with no failed agent, `READY TO MERGE`, and `AUDIT PASS` (per
+  [docs/conventions.md](../docs/conventions.md) § Branch and PR Workflow; the reviewer
   verdict counts findings on the surface; recorded off-surface findings do
   not block). Merge via `gh pr merge <N> --merge --delete-branch` (per
   [docs/conventions.md](../docs/conventions.md) § Merge method).

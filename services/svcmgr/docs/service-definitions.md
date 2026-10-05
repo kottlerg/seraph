@@ -236,7 +236,7 @@ death-auth source — see
 | Index | Cap |
 |---|---|
 | 0 | `RECV` on the master log endpoint |
-| 1 | `SEND` on the master log endpoint (single-use; `HANDOVER_PULL` only). `0` on a restart — no init-logd remains to pull from |
+| 1 | `SEND` on the master log endpoint (single-use; the `HANDOVER_PULL` drain then the terminal `HANDOVER_RELEASE`, then deleted; see the [logd handover protocol](../../logd/docs/handover-protocol.md#call-shape)). `0` on a restart — no init-logd remains to pull from |
 | 2 | badged `SEND` on procmgr carrying `DEATH_EQ_AUTHORITY` (logd registers per-sender death-notifications for slot reclaim; see [logd README](../../logd/README.md#bootstrap-caps)) |
 | 3 | badged `SEND` on devmgr's registry carrying `REGISTRY_QUERY_AUTHORITY` (logd resolves the serial driver via `QUERY_SERIAL_DEVICE`; see [logd README](../../logd/README.md#bootstrap-caps)) |
 

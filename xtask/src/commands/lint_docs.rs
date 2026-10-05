@@ -312,7 +312,8 @@ fn prose_lines(text: &str) -> impl Iterator<Item = (usize, &str)>
                 open = Some((c, n));
                 false
             }
-            (Some((oc, on)), Some((c, n))) if c == oc && n >= on =>
+            (Some((oc, on)), Some((c, n)))
+                if c == oc && n >= on && trimmed[n..].trim().is_empty() =>
             {
                 open = None;
                 false
@@ -486,14 +487,18 @@ fn link_targets(pat: &Patterns, path: &str, text: &str) -> BTreeSet<String>
             {
                 continue;
             }
-            out.insert(normalize(&dir.join(target)));
+            if let Some(resolved) = normalize(&dir.join(target))
+            {
+                out.insert(resolved);
+            }
         }
     }
     out
 }
 
-/// Collapse `.` and `..` components without touching the filesystem.
-fn normalize(path: &Path) -> String
+/// Collapse `.` and `..` components without touching the filesystem; `None` when a `..`
+/// climbs past the repository root.
+fn normalize(path: &Path) -> Option<String>
 {
     let mut parts: Vec<String> = Vec::new();
     for component in path.components()
@@ -502,14 +507,14 @@ fn normalize(path: &Path) -> String
         {
             Component::ParentDir =>
             {
-                parts.pop();
+                parts.pop()?;
             }
             Component::Normal(s) => parts.push(s.to_string_lossy().into_owned()),
             _ =>
             {}
         }
     }
-    parts.join("/")
+    Some(parts.join("/"))
 }
 
 /// The `## Summarized By` section of an authoritative document: `None` when
@@ -963,5 +968,21 @@ mod tests
         let diags = check_bare_cites(&pat(), &md("a.md", text));
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].line, 1);
+    }
+
+    #[test]
+    fn a_fence_line_with_an_info_string_does_not_close_an_open_fence()
+    {
+        let text = "```\n```rust\n(see x.md)\n```\n(see y.md)\n";
+        let diags = check_bare_cites(&pat(), &md("a.md", text));
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].line, 5);
+    }
+
+    #[test]
+    fn links_that_climb_past_the_repository_root_resolve_to_nothing()
+    {
+        let targets = link_targets(&pat(), "docs/a.md", "[x](../../x.md) [y](../y.md)\n");
+        assert_eq!(targets, BTreeSet::from(["y.md".to_owned()]));
     }
 }

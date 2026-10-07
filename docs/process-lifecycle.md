@@ -377,13 +377,17 @@ A process dies when:
 - It calls `sys_process_exit` (the `std::process::exit` / `main`-return path),
   carrying a voluntary exit code.
 - It calls `sys_thread_exit` on its last thread (a thread completing).
-- procmgr revokes and deletes its caps to the process's `Thread`, `CSpace`,
-  and `AddressSpace` (the "kill process" pattern; see
-  [`capability-model.md`](capability-model.md) §`"Kill process" pattern`).
+- procmgr revokes and deletes its caps to the process's `Thread`, `CSpace`, and `AddressSpace` (the
+  "kill process" pattern; see [`capability-model.md`](capability-model.md)
+  §`"Kill process" pattern`; for a thread displaced from a server's pending-reply binding, the
+  pattern is not memory-safe and can hang the kernel; see
+  [IPC Design](ipc-design.md#the-callreply-model),
+  [#443](https://github.com/kottlerg/seraph/issues/443)).
 - The last capability to its `CSpace` or `AddressSpace` is deleted: the kernel stops every thread
   bound to the object (retained exit reason `EXIT_KILLED`) before reclaiming it, so the process's
-  threads cannot outlive either (a thread displaced from a server's pending-reply binding excepted;
-  see [IPC Design](ipc-design.md#the-callreply-model),
+  threads cannot outlive either (for a thread displaced from a server's pending-reply binding, this
+  stop and its later reap are not memory-safe and can hang the kernel; see
+  [IPC Design](ipc-design.md#the-callreply-model),
   [#443](https://github.com/kottlerg/seraph/issues/443)). A thread deleting the last capability to
   its own `CSpace` or `AddressSpace` is stopped by that same delete and never returns from it.
 - An unhandled fault terminates its threads.
@@ -411,8 +415,9 @@ for terminal faults), because doing so on every clean exit would dereference the
 procmgr had already been woken to reap it. The kernel only *notifies*; it does not enumerate or stop
 sibling threads at that point — they are stopped when procmgr's cap-revoke teardown below deletes
 the process's `CSpace` (every thread bound to it is stopped before its storage is reclaimed,
-wherever their thread caps are held, except a thread displaced from a server's pending-reply
-binding; see [IPC Design](ipc-design.md#the-callreply-model),
+wherever their thread caps are held; for a thread displaced from a server's pending-reply binding,
+this stop and its later reap are not memory-safe and can hang the kernel; see
+[IPC Design](ipc-design.md#the-callreply-model),
 [#443](https://github.com/kottlerg/seraph/issues/443)) and reaped through their own thread caps.
 `ExitStatus::success()`/`code()` decode the reason on the consumer side. This is a Seraph-native
 encoding, not POSIX: codes are not 8-bit `WEXITSTATUS`-truncated and faults are native fault

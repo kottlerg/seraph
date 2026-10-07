@@ -561,16 +561,17 @@ the slot (that ancestor's revoke clears the hoisted survivors too, since they
 remain inside its subtree).
 
 A `CSpace` reaching refcount zero first stops every thread bound to it
-(`sched::stop_threads_bound_to`, see
-[scheduling-internals.md](scheduling-internals.md) § Thread Registry): each is
-marked `Exited` and waited off every CPU before any slot page is freed, so no
-thread can be mid-syscall against the dying directory, and none of the dying
-process's own threads can touch the derivation forest during the drain below.
-If the thread running the teardown is itself stopped — it deleted the last
-capability to its own `CSpace`, or a concurrent teardown stopped it — nothing
-below runs now: the object is queued for off-CPU reclaim and the whole arm
-re-runs from the deferred drain once the thread has been scheduled away.
-The same discipline applies to an `AddressSpace` reaching refcount zero.
+(`sched::stop_threads_bound_to`, see [scheduling-internals.md](scheduling-internals.md) § Thread
+Registry): each is marked `Exited` and waited off every CPU before any slot page is freed, so no
+thread can be mid-syscall against the dying directory, and none of the dying process's own threads
+can touch the derivation forest during the drain below. If the thread running the teardown is itself
+stopped — it deleted the last capability to its own `CSpace`, or a concurrent teardown stopped it —
+nothing below runs now: the object is queued for off-CPU reclaim and the whole arm re-runs from the
+deferred drain once the thread has been scheduled away. The same discipline applies to an
+`AddressSpace` reaching refcount zero. For a thread displaced from a server's pending-reply binding,
+this stop and its later reap are not memory-safe and can hang the kernel; see
+[ipc-design.md](../../../docs/ipc-design.md#the-callreply-model),
+[#443](https://github.com/kottlerg/seraph/issues/443).
 
 Every derivation link reachable from a live slot resolves: before a `CSpace`
 unregisters, its teardown drain (`drain_dying_cspace_batch`) unlinks every

@@ -141,8 +141,9 @@ Three of the kernel's object types make up what userspace calls a process:
   and bindings to an AddressSpace, a CSpace, and an IPC buffer.
 - **AddressSpace** — a virtual address space with a page table root and a set of frame mappings.
   When the last capability to an AddressSpace (or a CSpace) is deleted, every thread bound to it is
-  stopped, except a thread displaced from a server's pending-reply binding (see
-  [capability-model.md](capability-model.md#kill-process-pattern),
+  stopped (see [capability-model.md](capability-model.md#kill-process-pattern); for a thread
+  displaced from a server's pending-reply binding, this stop and its later reap are not memory-safe
+  and can hang the kernel; see [IPC Design](ipc-design.md#the-callreply-model),
   [#443](https://github.com/kottlerg/seraph/issues/443)).
 - **CSpace** — a capability space: a growable array of capability slots that a thread
   uses to name kernel objects.

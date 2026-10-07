@@ -236,7 +236,9 @@ The kernel does not provide:
 [Capability Subsystem Internals](../core/kernel/docs/capability-internals.md),
 [IPC Subsystem Internals](../core/kernel/docs/ipc-internals.md),
 [Syscall Interface Specification](../core/kernel/docs/syscalls.md),
-[Architecture Overview](architecture.md),
+[Thread Lifecycle and Sleep List Invariants](../core/kernel/docs/thread-lifecycle-and-sleep.md),
+[Architecture Overview](architecture.md), [Capability Model](capability-model.md),
+[Fault Handling](fault-handling.md), [Process Lifecycle](process-lifecycle.md),
 [programs/capexhaust/README.md](../programs/capexhaust/README.md),
 [procmgr IPC Interface](../services/procmgr/docs/ipc-interface.md),
 [shared/namespace-protocol/README.md](../shared/namespace-protocol/README.md)

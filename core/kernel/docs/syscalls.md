@@ -773,19 +773,18 @@ Delete a single capability from the caller's CSpace. Does not affect derived cap
 
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
 
-If this is the last reference to the underlying object, the object is freed.
-Freeing a `CSpace` or an `AddressSpace` first stops every thread bound to it
-(each becomes `Exited` with retained exit reason `EXIT_KILLED`; its Thread
-object is freed when its own last capability goes), so a process's threads
-never outlive either object (see
-[scheduling-internals.md](scheduling-internals.md) § Thread Registry), except a thread displaced
-from a server's pending-reply binding ([ipc-design.md](../../../docs/ipc-design.md) § The
-Call/Reply Model, [#443](https://github.com/kottlerg/seraph/issues/443)).
-**This includes the caller**: a thread deleting the last capability to its own
-`CSpace` or `AddressSpace` — directly, or because the deleted object's teardown
-cascades into it — is stopped by that delete and the call does not return; the
-object is reclaimed once the thread is off its CPU. The caller's own `Thread`
-object is treated differently, as below.
+If this is the last reference to the underlying object, the object is freed. Freeing a `CSpace` or
+an `AddressSpace` first stops every thread bound to it (each becomes `Exited` with retained exit
+reason `EXIT_KILLED`; its Thread object is freed when its own last capability goes), so a process's
+threads never outlive either object (see [scheduling-internals.md](scheduling-internals.md) § Thread
+Registry). **The stop includes the caller**: a thread deleting the last capability to its own
+`CSpace` or `AddressSpace` — directly, or because the deleted object's teardown cascades into it —
+is stopped by that delete and the call does not return; the object is reclaimed once the thread is
+off its CPU. The caller's own `Thread` object is treated differently, as below. For a thread
+displaced from a server's pending-reply binding, this stop, the free of its Thread object, and the
+deletion of its last Thread capability are not memory-safe and can hang the kernel
+([ipc-design.md](../../../docs/ipc-design.md) § The Call/Reply Model,
+[#443](https://github.com/kottlerg/seraph/issues/443)).
 
 Refused for two cases, both returning `InvalidState` with the capability left in
 place: a thread may not delete the last capability to its **own running**

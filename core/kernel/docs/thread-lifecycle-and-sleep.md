@@ -407,10 +407,9 @@ domains:
 1. **Server in `endpoint_call`** — sets `reply_tcb = caller` under `ep.lock` by an unconditional
    Release `store` that overwrites any binding still pending (see the Symmetry rule; #443). If the
    caller's park commit is refused (a concurrent stop or exit, or a coalesced wake),
-   `rollback_uncommitted_call` rolls the
-   binding back under the same `ep.lock` — `compare_exchange(caller, null)` on `reply_tcb`; on a
-   win it stamps a cancelled deposit (INTERRUPTED, or KILL for a faulter) and clears
-   `wake_in_flight`.
+   `rollback_uncommitted_call` rolls the binding back under the same `ep.lock` —
+   `compare_exchange(caller, null)` on `reply_tcb`; on a win it stamps a cancelled deposit
+   (INTERRUPTED, or KILL for a faulter) and clears `wake_in_flight`.
 2. **Server in `endpoint_recv`** — dequeues a `BlockedOnSend` caller and rebinds it to
    `reply_tcb = caller` under `ep.lock` by the same unconditional store, then commits the caller's
    `BlockedOnSend → BlockedOnReply` (`ipc_state` + `blocked_on_object`) transition via
@@ -418,8 +417,7 @@ domains:
    `endpoint_call`'s `commit_blocked_under_local_lock`. If that commit fails (the caller
    died/stopped concurrently) it rolls the binding back — `compare_exchange(caller, null)` on
    `reply_tcb`; on a win it stamps a cancelled deposit (INTERRUPTED, or KILL for a faulter) and
-   clears `wake_in_flight` — and skips to the next queued sender. See invariant 4
-   (#289).
+   clears `wake_in_flight` — and skips to the next queued sender. See invariant 4 (#289).
 3. **Server in `endpoint_reply`** — loads `reply_tcb` (Acquire), then claims it by
    `compare_exchange(caller, null, AcqRel, Acquire)` with no lock held; on a lost race it returns
    `None` and the winning claimant owns the wake.

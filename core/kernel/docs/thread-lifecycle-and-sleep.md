@@ -446,11 +446,13 @@ setting a *different* non-null caller.
 **Invariants on the BlockedOnReply protocol:**
 
 1. The client's `blocked_on_object` is the server TCB pointer (NOT an endpoint or other source).
-2. The server is the lifetime owner of the reply slot. As long as the server is alive, the slot is
-   read/written under `ep.lock` for `endpoint_*` paths. Cancel and dealloc paths use atomic
-   compare_exchange because they cannot acquire `ep.lock` (they don't know which endpoint this reply
-   is for; the server may have moved on to a different endpoint between the original `call` and the
-   cancel).
+2. The server is the lifetime owner of the reply slot. As long as the server is alive,
+   `endpoint_call` and `endpoint_recv` publish the slot (and roll it back on a failed commit) under
+   `ep.lock`; every claim is a `compare_exchange(client, null)` (or, on the `SYS_IPC_REPLY` failure
+   path, `fail_reply_and_wake_caller`'s `swap(null)`) taken outside `ep.lock`. `endpoint_reply`
+   takes no lock and claims by that CAS; cancel and dealloc paths claim by it because they cannot
+   acquire `ep.lock` (they don't know which endpoint this reply is for; the server may have moved
+   on to a different endpoint between the original `call` and the cancel).
 3. **Server-death-while-client-blocked-on-reply** is handled by actor 6 above: the dying server
    walks its `reply_tcb`, claims the bound client via compare_exchange, and wakes it with
    `Interrupted` so the client's syscall returns rather than dereferencing the freed server. The

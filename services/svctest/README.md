@@ -139,6 +139,7 @@ spawned by the `fs_crossover_bench` phase, reads the build-synthesised
 
 ## Summarized By
 
+[Testing](../../docs/testing.md),
 [programs/capexhaust/README.md](../../programs/capexhaust/README.md),
 [programs/demandpaged/README.md](../../programs/demandpaged/README.md),
 [programs/fsbench/README.md](../../programs/fsbench/README.md),
@@ -148,4 +149,5 @@ spawned by the `fs_crossover_bench` phase, reads the build-synthesised
 [programs/stackoverflow/README.md](../../programs/stackoverflow/README.md),
 [programs/stdiotest/README.md](../../programs/stdiotest/README.md),
 [services/drivers/test-orphan/README.md](../drivers/test-orphan/README.md),
-[services/pwrmgr/README.md](../pwrmgr/README.md)
+[services/pwrmgr/README.md](../pwrmgr/README.md),
+[`.svc` Service Definitions](../svcmgr/docs/service-definitions.md)

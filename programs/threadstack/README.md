@@ -6,9 +6,9 @@ Test fixture for the guarded demand-paged stack that a spawned thread gets.
 
 ## Role
 
-Its per-program tester, `threadstack-tester`, drives it in two modes, and the `usertest`
-orchestrator discovers and runs that tester. The fixture installs at `/programs/threadstack`
-and the tester at `/tests/programs/threadstack`, per
+The fixture's per-program tester, `threadstack-tester`, drives it in two modes, and the
+`usertest` orchestrator discovers and runs that tester. The fixture installs at
+`/programs/threadstack` and the tester at `/tests/programs/threadstack`, per
 [docs/testing.md § Per-program tester protocol](../../docs/testing.md#per-program-tester-protocol).
 Both use idiomatic `std` only and handle no Seraph capabilities directly.
 

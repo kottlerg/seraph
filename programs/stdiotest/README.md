@@ -56,13 +56,14 @@ line `hello-stdio`, closes stdin, and reads stdout to EOF. Its verdict follows t
 | Condition | Stdout | Exit code |
 |---|---|---|
 | Spawn, stdin write, stdout read, or wait fails | No verdict line; the tester panics through `expect` | Non-zero (panic) |
-| No stdout line is `PASS` | `[stdiotest-tester] FAIL PASS marker missing from stdout`, then `[stdiotest-tester] captured stdout: <out>`, with `<out>` the `Debug` form of the captured stdout | `1` |
+| No stdout line is `PASS` | `[stdiotest-tester] FAIL PASS marker missing from stdout`, then `[stdiotest-tester] captured stdout: <out>` | `1` |
 | `stdiotest` exited non-zero | `[stdiotest-tester] FAIL non-zero exit: <code>`, with `<code>` the `Debug` form of `ExitStatus::code()` | `2` |
 | Otherwise | `[stdiotest-tester] PASS` | `0` |
 
-The tester checks only the `PASS` line and the exit status. The `svctest` `pipes` phase also
-checks the byte-count and uppercase lines for its probe `hello`, and the shell per-program tester
-checks the `shouted: HELLO-STDIO` line for its probe `hello-stdio` and the `PASS` line.
+`<out>` is the `Debug` form of the captured stdout. The tester checks only the `PASS` line and
+the exit status. The `svctest` `pipes` phase also checks the byte-count and uppercase lines for
+its probe `hello`, and the shell per-program tester checks the `shouted: HELLO-STDIO` line for
+its probe `hello-stdio` and the `PASS` line.
 
 ---
 

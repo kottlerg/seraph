@@ -516,6 +516,8 @@ reply-then-death ordering is therefore enforced by the kernel.
 [Userspace Memory Model](../../../docs/userspace-memory-model.md),
 [programs/capexhaust/README.md](../../../programs/capexhaust/README.md),
 [programs/demandpaged/README.md](../../../programs/demandpaged/README.md),
+[programs/stackoverflow/README.md](../../../programs/stackoverflow/README.md),
 [programs/threadchurn/README.md](../../../programs/threadchurn/README.md),
 [programs/threadstack/README.md](../../../programs/threadstack/README.md),
+[runtime/ruststd/README.md](../../../runtime/ruststd/README.md),
 [services/memmgr/README.md](../README.md)

@@ -324,6 +324,7 @@ svcmgr service definitions carry no paging key; see
 [programs/demandpaged/README.md](../programs/demandpaged/README.md),
 [programs/stackoverflow/README.md](../programs/stackoverflow/README.md),
 [programs/threadstack/README.md](../programs/threadstack/README.md),
+[runtime/ruststd/README.md](../runtime/ruststd/README.md),
 [memmgr IPC Interface](../services/memmgr/docs/ipc-interface.md),
 [procmgr IPC Interface](../services/procmgr/docs/ipc-interface.md),
 [`.svc` Service Definitions](../services/svcmgr/docs/service-definitions.md)

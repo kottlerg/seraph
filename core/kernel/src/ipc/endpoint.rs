@@ -240,7 +240,9 @@ unsafe fn rollback_uncommitted_call(
 /// with `enqueue_and_wake` after moving any caps. The calling thread is
 /// committed to `parked_state`, unless the park is refused, in which case the
 /// reply linkage is rolled back. Returns `Err(())` if no receiver was
-/// available (the calling thread is now blocked on the send queue).
+/// available: the calling thread is committed `BlockedOnSend` on the send
+/// queue, unless the park is refused, in which case it is unlinked and the
+/// call is stamped cancelled.
 ///
 /// `parked_state` is the blocked state the caller commits when a receiver was
 /// waiting: [`IpcThreadState::BlockedOnReply`] for a normal `SYS_IPC_CALL`, or
@@ -563,8 +565,11 @@ pub unsafe fn endpoint_recv(
 ///
 /// Claims the reply binding (CAS `server.reply_tcb` from the bound caller to
 /// null) and stages `msg` in the caller's `ipc_msg`. Returns the claimed
-/// caller, which the syscall layer MUST wake with `enqueue_and_wake`. Returns
-/// `None` if no binding exists or a concurrent claimant won.
+/// caller; the CAS win makes the syscall layer the episode's sole depositor,
+/// so it MUST finish the deposit (cap results), stamp the disposition (REPLY,
+/// or `fault_outcome` and the episode for a `BlockedOnFault` caller), and then
+/// wake it with `enqueue_and_wake`. Returns `None` if no binding exists or a
+/// concurrent claimant won.
 ///
 /// # Safety
 /// Must be called with the scheduler lock held.

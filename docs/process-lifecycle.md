@@ -502,6 +502,7 @@ notification flow above.
 [programs/relrofault/README.md](../programs/relrofault/README.md),
 [programs/stackoverflow/README.md](../programs/stackoverflow/README.md),
 [programs/threadstack/README.md](../programs/threadstack/README.md),
+[runtime/ruststd/README.md](../runtime/ruststd/README.md),
 [services/crasher/README.md](../services/crasher/README.md),
 [init Bootstrap Stages](../services/init/docs/bootstrap.md),
 [services/logd/README.md](../services/logd/README.md),

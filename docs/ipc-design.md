@@ -43,7 +43,9 @@ The reply capability is valid for exactly one use; it cannot be stored, delegate
 or reused.
 
 A server that needs to delegate work may make a downstream call before replying: the pending
-reply stays bound to the receiving thread until that thread replies.
+reply stays bound to the receiving thread until that thread replies or receives again, and a
+later receive replaces the binding. A delegating server therefore makes its downstream call,
+which does not touch its own binding, and replies before it next receives.
 
 ### Message Format
 
@@ -60,14 +62,15 @@ A message consists of:
   begins with the message (the sender loses access as each completes), or none
   does. A refused transfer — a source slot gone stale, repeated within the
   message, or pinned by an in-flight revocation or move, a sender's or
-  receiver's CSpace already torn down, or (on the reply direction) a caller CSpace
-  that cannot supply the destination slots — never delivers a partial set. On the
-  call/receive direction a refusal detectable up front rejects the sender before
-  blocking; one that arises after the sender blocked does not block delivery: the
-  message arrives with zero capabilities and the sender keeps its own, without
-  learning of the refusal. On the reply direction the replying server receives the
-  error and the waiting caller resumes with the `IPC_REPLY_TRANSFER_FAILED` label,
-  zero data words, and zero capabilities in place of the reply. A capability
+  receiver's CSpace already torn down, or a receiving CSpace (the server's on a
+  call, the caller's on a reply) that cannot supply the destination slots — never
+  delivers a partial set. On the call/receive direction a refusal detectable up
+  front rejects the sender before blocking; one that arises after the sender
+  blocked does not block delivery: the message arrives with zero capabilities and
+  the sender keeps its own, without learning of the refusal. On the reply
+  direction the replying server receives the error and the waiting caller resumes
+  with the `IPC_REPLY_TRANSFER_FAILED` label, zero data words, and zero
+  capabilities in place of the reply. A capability
   with more derived children than the kernel migrates in one lock hold is
   moved in batches after the message commits; what the receiver and the
   sender then hold under a concurrent revoke, CSpace teardown, or deriver is

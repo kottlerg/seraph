@@ -98,22 +98,30 @@ default only if the draw fails). The caller owns `mem_map`/`mem_unmap`;
 the allocator only manages VA space. See
 [§ Page Reservations](../../docs/userspace-memory-model.md#page-reservations).
 
-### Spawned-thread stacks
+#### Spawned-thread stacks
 
-`std::thread::spawn` gives each spawned thread its own stack, allocated by `sys/thread`. In a
-demand-paged process (`StartupInfo.pager_endpoint_cap` non-zero) the stack is a page
-reservation of one guard page below the usable pages. Only the usable pages are registered
-with memmgr through
+`std::thread::spawn` gives each spawned thread its own stack, allocated by `sys/thread` as a
+consumer of the page-reservation surface above. In a demand-paged process
+(`StartupInfo.pager_endpoint_cap` non-zero) the stack is a page reservation of one guard page
+below the usable pages. Only the usable pages are registered with memmgr through
 [`REGISTER_REGION`](../../services/memmgr/docs/ipc-interface.md#label-7-register_region), so
-memmgr backs each on first touch; the guard page stays unregistered, so an overflow faults on
-an address the pager declines and the fault is terminal for the whole process. The usable
+memmgr backs each on first touch; the guard page stays unregistered. An overflow whose first
+touch lands in the guard page faults on an address the pager declines, and the fault ends the
+whole process, per [docs/fault-handling.md § Reply](../../docs/fault-handling.md#reply),
+[docs/process-lifecycle.md § Process Death](../../docs/process-lifecycle.md#process-death), and
+[Capability Model § "Kill process" pattern](../../docs/capability-model.md#kill-process-pattern).
+The userspace targets emit no stack probes, so a frame larger than one page can skip the guard
+and write into an adjacent registered region, such as another thread's stack, which memmgr
+backs without a fault ([#445](https://github.com/kottlerg/seraph/issues/445)). The usable
 size is the larger of the requested stack size (at least `DEFAULT_MIN_STACK_SIZE`, 64 KiB)
 and 512 pages (2 MiB). If the reservation, the page-table funding, or the registration fails,
 or the process is not demand-paged, the stack is instead an eager byte-heap allocation of the
 requested size (at least 64 KiB, rounded up to whole pages) with no guard page. `join` frees
 the stack once the thread has left user mode: a demand stack through
 [`UNREGISTER_REGION`](../../services/memmgr/docs/ipc-interface.md#label-9-unregister_region)
-and release of its reservation, a heap stack through `dealloc`.
+and release of its reservation, a heap stack through `dealloc`. A detached thread's stack is
+freed the same way when the reaper sees the kernel's death notification for that thread, or
+leaks until process exit when no reaper slot was available at spawn.
 
 ### Bootstrap-cross-boundary VAs
 
@@ -195,6 +203,7 @@ primitives.
 |---|---|
 | [docs/userspace-memory-model.md](../../docs/userspace-memory-model.md) | Three-surface VA model, frame-allocation contract |
 | [docs/process-lifecycle.md](../../docs/process-lifecycle.md) | ProcessInfo handover, `memmgr_endpoint_cap` discipline |
+| [docs/capability-model.md](../../docs/capability-model.md) | "Kill process" pattern: a terminal fault on any thread tears down the whole process |
 | [services/memmgr/docs/ipc-interface.md](../../services/memmgr/docs/ipc-interface.md) | Wire shape of `REQUEST_MEMORY_CAPS`/`RELEASE_MEMORY_CAPS`, `REGISTER_REGION`/`UNREGISTER_REGION` |
 | [abi/process-abi/README.md](../../abi/process-abi/README.md) | `ProcessInfo`, `StartupInfo`, `main()` signature |
 

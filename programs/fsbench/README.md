@@ -51,7 +51,7 @@ without crossing a page tail, memory cap otherwise, per
 
 For each size in 16 B, 1 KiB, 4 KiB, 16 KiB, and 64 KiB, and for each path, it runs 8
 untimed warm-up iterations, then 256 timed ones. Each iteration seeks to offset 0 and reads the
-full size through as many `read` calls as the path's buffer needs: 130 inline or 16 memory-cap
+full size through as many `read` calls as the path's buffer needs: 144 inline or 16 memory-cap
 calls for 64 KiB. Cycles come from `rdtsc` on x86_64 and `csrr cycle` on riscv64. A timed
 iteration that reads fewer bytes than the size panics.
 

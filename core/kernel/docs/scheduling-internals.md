@@ -132,15 +132,16 @@ hang). See § Thread Registry.
    `wake_in_flight` under the source lock, RELEASE the source lock, then call `enqueue_and_wake` —
    releasing first bounds source-lock hold-time. `endpoint_reply` takes no source lock: its
    exclusive claim is the `reply_tcb` `compare_exchange(client, null)`, the caller's
-   `wake_in_flight` was set when `endpoint_call` / `endpoint_recv` published the binding, and it
-   calls `enqueue_and_wake` after winning the CAS. Between a source-lock claim (waiter slot
-   cleared, payload deposited, `wake_in_flight = 1`) and the waker's post-unlock `enqueue_and_wake`,
-   the wake is half-complete and owned exclusively by the in-flight waker: code executing *as the
-   claimed thread* in that window (it is still live, mid-park) has exactly one legal continuation —
-   fall through to `schedule()`. Consuming the deposited payload and returning to user mode is
-   forbidden; it strands the waker's run-queue link (#352). The `still_waiter` rechecks (the
-   sleep-list arming in `sys_event_recv` / `sys_notification_wait`) respect this: they only add a
-   timer on the not-claimed branch and fall through to `schedule()` on both branches. The
+   `wake_in_flight` was set when `endpoint_call` / `endpoint_recv` published the binding, and
+   `sys_ipc_reply` stamps the disposition and calls `enqueue_and_wake` once `endpoint_reply` has won
+   the CAS. Between a claim (a source-lock claim: waiter slot cleared, payload deposited,
+   `wake_in_flight = 1`; or the `endpoint_reply` `reply_tcb` CAS) and the waker's
+   `enqueue_and_wake`, the wake is half-complete and owned exclusively by the in-flight waker: code
+   executing *as the claimed thread* in that window (it is still live, mid-park) has exactly one
+   legal continuation — fall through to `schedule()`. Consuming the deposited payload and returning
+   to user mode is forbidden; it strands the waker's run-queue link (#352). The `still_waiter`
+   rechecks (the sleep-list arming in `sys_event_recv` / `sys_notification_wait`) respect this: they
+   only add a timer on the not-claimed branch and fall through to `schedule()` on both branches. The
    `endpoint_dealloc` send/recv drain instead HOLDS `ep.lock` across the per-waiter
    `enqueue_and_wake` walk (a multi-waiter drain; sound precisely because the order is canonical,
    and `wake_in_flight = 1` per waiter blocks a racing `dealloc(waiter)` unlink from freeing a TCB

@@ -247,9 +247,9 @@ every reply wakes the recipient through `enqueue_and_wake` on the CPU
 `select_target_cpu` chooses, after the endpoint lock is released (call) or the
 `reply_tcb` claim is won (reply, which takes no endpoint lock); the run queue
 decides when it runs. A receive that finds a waiting sender wakes no thread:
-the server continues and the sender stays parked `BlockedOnReply` until the
-reply. The call path then parks the caller through `schedule`; the reply path
-returns to the server.
+the server continues and the sender stays parked awaiting the reply
+(`BlockedOnReply`, or `BlockedOnFault` for a fault sender). The call path then
+parks the caller through `schedule`; the reply path returns to the server.
 
 ---
 

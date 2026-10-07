@@ -215,8 +215,8 @@ cycle sources are in that README's
 | 16       | 1            | 61 426        | 1           | 123 139      |
 | 1 024    | 3            | 236 906       | 1           | 130 553      |
 | 4 096    | 9            | 938 019       | 1           | 244 221      |
-| 16 384   | 33           | 3 780 641     | 4           | 1 000 699    |
-| 65 536   | 130          | 15 347 991    | 16          | 3 987 730    |
+| 16 384   | 36           | 3 780 641     | 4           | 1 000 699    |
+| 65 536   | 144          | 15 347 991    | 16          | 3 987 730    |
 
 **riscv64 (TCG-emulated, `cycle` CSR via `scounteren.CY`)**
 
@@ -225,8 +225,8 @@ cycle sources are in that README's
 | 16       | 1            | 548 333       | 1           | 1 232 195    |
 | 1 024    | 3            | 2 131 616     | 1           | 1 383 683    |
 | 4 096    | 9            | 8 205 397     | 1           | 2 389 154    |
-| 16 384   | 33           | 33 249 701    | 4           | 9 735 094    |
-| 65 536   | 130          | 134 748 016   | 16          | 39 159 872   |
+| 16 384   | 36           | 33 249 701    | 4           | 9 735 094    |
+| 65 536   | 144          | 134 748 016   | 16          | 39 159 872   |
 
 **Reading the table:** the single-call inline cost is consistently
 ≈ 0.5× the single-call memory-cap cost on both architectures. Once the

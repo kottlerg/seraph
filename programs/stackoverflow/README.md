@@ -15,8 +15,10 @@ base, per
 procmgr binds memmgr as the fixture's pager, per
 [docs/fault-handling.md § Default System Pager](../../docs/fault-handling.md#default-system-pager),
 so the fault is delivered to memmgr. The guard page lies outside every registered region, so
-memmgr replies `FAULT_REPLY_KILL` and the kernel kills the thread as an unhandled fault with
-a fault exit reason (`EXIT_FAULT_BASE + <fault code>`), per
+memmgr replies `FAULT_REPLY_KILL`, per
+[memmgr IPC Interface § Kernel-origin fault message](../../services/memmgr/docs/ipc-interface.md#kernel-origin-fault-message-fault_label),
+and the kernel kills the thread as an unhandled fault with a fault exit reason
+(`EXIT_FAULT_BASE + <fault code>`), per
 [docs/fault-handling.md § Delivery, Resume, and Kill](../../docs/fault-handling.md#delivery-resume-and-kill),
 [docs/fault-handling.md § Reply](../../docs/fault-handling.md#reply), and
 [docs/process-lifecycle.md § Exit reason](../../docs/process-lifecycle.md#exit-reason).
@@ -56,6 +58,7 @@ listing of `/programs`.
 | [docs/testing.md](../../docs/testing.md) | Harness model and where test fixtures install |
 | [docs/userspace-memory-model.md](../../docs/userspace-memory-model.md) | Main-thread stack placement and the guard page below it |
 | [docs/fault-handling.md](../../docs/fault-handling.md) | Pager fault delivery, `FAULT_REPLY_KILL`, and the fault exit reason |
+| [services/memmgr/docs/ipc-interface.md](../../services/memmgr/docs/ipc-interface.md) | memmgr's fault reply: `FAULT_REPLY_KILL` for an address outside every registered region |
 | [docs/process-lifecycle.md](../../docs/process-lifecycle.md) | Exit-reason ranges and process death |
 
 ---

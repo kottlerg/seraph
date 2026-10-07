@@ -115,4 +115,4 @@ path (the `$ ` prompt rendered via the terminal) is covered by
 
 ## Summarized By
 
-None
+[programs/stdiotest/README.md](../stdiotest/README.md)

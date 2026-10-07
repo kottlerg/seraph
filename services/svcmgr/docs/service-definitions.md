@@ -179,10 +179,11 @@ pwrmgr_deny_send]` on the child's `bootstrap::request_round`. The
 list is truncated to `MSG_CAP_SLOTS_MAX` (currently 4) entries; any
 truncation is logged.
 
-An unresolved name leaves slot `i` as `0`. Consumers that already
-tolerate `cap == 0 → skip` (e.g. svctest's pwrmgr phases) continue
-to work; consumers that don't fail on first use, which is the right
-surface for a real misconfiguration.
+An unresolved name leaves slot `i` as `0`. Consumers that already tolerate `cap == 0 → skip`
+(e.g. svctest's pwrmgr phases, per
+[services/svctest/README.md § Run Sequence](../../svctest/README.md#run-sequence))
+continue to work; consumers that don't fail on first use, which is the right surface for a real
+misconfiguration.
 
 Well-known names are centralised in
 [`ipc::published_names`](../../../shared/ipc/src/lib.rs):

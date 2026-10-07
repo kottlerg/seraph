@@ -719,6 +719,7 @@ The kernel does not provide:
 [Process Lifecycle](process-lifecycle.md), [Storage](storage.md),
 [programs/capexhaust/README.md](../programs/capexhaust/README.md),
 [programs/threadstack/README.md](../programs/threadstack/README.md),
+[runtime/ruststd/README.md](../runtime/ruststd/README.md),
 [services/devmgr/README.md](../services/devmgr/README.md),
 [init Bootstrap Stages](../services/init/docs/bootstrap.md),
 [services/memmgr/README.md](../services/memmgr/README.md),

@@ -188,9 +188,10 @@ revocable (for MMIO and x86-64 port I/O, design intent; not yet implemented, #45
 **MMIO**
 Physical MMIO regions are mapped into a driver’s address space under capability
 control. Once mapped, drivers access registers directly without kernel mediation.
-Revoking an Mmio capability blocks new `SYS_MMIO_MAP` calls but does not unmap
-mappings already established (unmapping on revocation is design intent; not yet
-implemented, #457; see [capability-model.md](capability-model.md#mmio)).
+Revoking an Mmio capability blocks new `SYS_MMIO_MAP` calls through its descendants
+but does not unmap mappings already established through them (unmapping on revocation
+is design intent; not yet implemented, #457; see
+[capability-model.md](capability-model.md#mmio)).
 
 **Port I/O (x86‑64 only)**
 Drivers receive an IoPort capability for assigned port ranges. Binding this

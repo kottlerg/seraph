@@ -21,10 +21,10 @@ init/
     ├── main.rs                 # _start, run() orchestration across the three stages
     ├── bootstrap.rs            # Raw memmgr / procmgr ELF-load + kernel-object setup
     ├── service.rs              # IPC-driven spawns (devmgr, vfsd, svcmgr)
-    │                             and phase3_svcmgr_handover
+    │                           # and phase3_svcmgr_handover
     ├── mount.rs                # GET_SYSTEM_ROOT_CAP pull (vfsd self-mounts root)
     ├── logging.rs              # init-logd thread
-    │                             (serves the log endpoint until real-logd takes over)
+    │                           # (serves the log endpoint until real-logd takes over)
     ├── walk.rs                 # /services/<name> path walker over the seed system-root cap
     └── arch/                   # Per-arch serial init (x86-64, riscv64)
 ```

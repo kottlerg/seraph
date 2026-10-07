@@ -28,8 +28,8 @@ A working logd **restart** is design intent; not yet implemented (#262):
 svcmgr's death handler blocks on `log!` calls to the unread master-log
 endpoint before it respawns logd, and procmgr's first-wins
 `REGISTER_DEATH_EQ` rejects a restarted logd's registration (per
-[Restart Protocol](../../svcmgr/docs/restart-protocol.md)). On the
-implemented restart path, svcmgr mints `cap[1] = 0`: init-logd exited after
+[Restart Protocol](../../svcmgr/docs/restart-protocol.md)). In the restart
+code path (unreached today), svcmgr mints `cap[1] = 0`: init-logd exited after
 the first launch, so there is no handover source. The restarted logd skips
 the pull entirely (guarded on a non-zero `cap[1]`) and serves a fresh
 table on the same endpoint object — svcmgr holds the master-log source

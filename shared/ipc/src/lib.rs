@@ -74,7 +74,8 @@ use syscall_abi::{MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
 //     LOG_LABELS_VERSION    — log_labels::GET_LOG_CAP carries it, but no
 //                             caller issues that handshake
 //     STREAM_LABELS_VERSION — stream caps arrive pre-installed in
-//                             ProcessInfo.log_send_cap, not via a handshake
+//                             ProcessInfo.log_send_cap (init derives its
+//                             own), not via a handshake
 
 pub const PROCMGR_LABELS_VERSION: u32 = 3;
 /// IPC labels for the process manager (`procmgr`).
@@ -489,15 +490,12 @@ pub mod memmgr_labels
     pub const PROCESS_DIED: u64 = 4;
     /// Permanently transfer a batch of Memory caps into memmgr's pool.
     ///
-    /// The caller is procmgr's init reap, which hands over init's reclaimed
-    /// memory: the usable-RAM caps that did not fit memmgr's bootstrap round,
-    /// the free remainders `MemoryAlloc` abandoned, ELF segments, `InitInfo`,
-    /// stack, the bootloader/bundle reclaim ranges, the AP-trampoline frame,
-    /// and boot-module ELF sources (see `services/memmgr/docs/ipc-interface.md`
-    /// "Label 5: `DONATE_MEMORY_CAPS`" and `docs/process-lifecycle.md`
-    /// "Init reap"). memmgr accepts the label from any badged client today and
-    /// does not check a donated cap's provenance; gating it to procmgr is
-    /// tracked in #459.
+    /// The caller is procmgr's init reap (donated set:
+    /// `docs/process-lifecycle.md` "Init reap"; contract:
+    /// `services/memmgr/docs/ipc-interface.md` "Label 5:
+    /// `DONATE_MEMORY_CAPS`"). memmgr accepts the label from any badged
+    /// client today and does not check a donated cap's provenance; gating it
+    /// to procmgr is tracked in #459.
     ///
     /// Wire format:
     /// * `caps[..]` — up to `MSG_CAP_SLOTS_MAX` Memory caps to donate; each
@@ -1176,10 +1174,11 @@ pub mod fs_labels
     pub const FS_READ_MEMORY: u64 = 7;
     /// Release of a previously-returned page, in either direction.
     ///
-    /// Driver-to-client (cooperative eviction): sent on the per-process
-    /// release endpoint cap the client transferred on its first
-    /// [`FS_READ_MEMORY`]; `data[0]` = the release cookie naming the Memory
-    /// cap to unmap. The client unmaps it and replies [`FS_RELEASE_ACK`];
+    /// Driver-to-client (cooperative eviction): sent on the release endpoint
+    /// cap recorded in the node's open-file slot, taken from `caps[0]` of
+    /// the [`FS_READ_MEMORY`] that allocated the slot (shared per node, not
+    /// per client; tracked in #447); `data[0]` = the release cookie naming
+    /// the Memory cap to unmap. The client unmaps it and replies [`FS_RELEASE_ACK`];
     /// without an ack inside the watchdog window the driver hard-revokes.
     ///
     /// Client-to-driver (synchronous release after a read): sent on the

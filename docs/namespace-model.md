@@ -164,9 +164,9 @@ or neither, or only one. There is no kernel mechanism that ties
 them.
 
 Spawners install the child's initial cwd cap via the same wire that
-delivers the root cap (`procmgr_labels::CONFIGURE_NAMESPACE`,
-`caps[1]`; see [services/procmgr/README.md](../services/procmgr/README.md)).
-A child without a delivered cwd cap holds no cwd cap;
+delivers the root cap (`procmgr_labels::CONFIGURE_NAMESPACE`, `caps[1]`;
+see [procmgr IPC Interface](../services/procmgr/docs/ipc-interface.md#label-12-configure_namespace)
+§ Label 12). A child without a delivered cwd cap holds no cwd cap;
 relative-path resolution fails until the child obtains one (typically
 by walking its root cap to a directory). The convention in std is
 that `File::open` resolves a leading-`/` path against the root cap
@@ -243,10 +243,11 @@ entries are capabilities chosen by the view's constructor.
 A process that needs namespace access receives one or more node
 capabilities at process bootstrap. The spawner supplies them through
 procmgr's `CONFIGURE_NAMESPACE` call between create and start; procmgr
-installs them in the child's CSpace and records their slots in
-`ProcessInfo.system_root_cap` and `ProcessInfo.current_dir_cap` (see
-[process-lifecycle.md](process-lifecycle.md) § ProcessInfo / InitInfo
-Handover Discipline).
+copies them into the child's CSpace at `START_PROCESS` and records their
+slots in `ProcessInfo.system_root_cap` and `ProcessInfo.current_dir_cap`
+(see [procmgr IPC Interface](../services/procmgr/docs/ipc-interface.md#label-12-configure_namespace)
+§ Label 12 and [process-lifecycle.md](process-lifecycle.md) § ProcessInfo /
+InitInfo Handover Discipline).
 
 A process that is delivered no namespace capability has no namespace
 access. The runtime library (`std`) treats this as the absence of

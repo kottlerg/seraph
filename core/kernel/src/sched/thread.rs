@@ -496,8 +496,10 @@ pub struct ThreadControlBlock
     /// pointer (releasing the previous object's ref); the faulter loads it.
     pub fault_handler: core::sync::atomic::AtomicPtr<crate::cap::object::EndpointObject>,
 
-    /// Caller-chosen identity delivered as the fault message badge, identifying
-    /// this thread (or its process) to the handler. Opaque to the kernel;
+    /// Binder-chosen value (`SYS_THREAD_SET_FAULT_HANDLER` arg2) delivered as
+    /// the fault message badge; it is not the badge of a cap the handler
+    /// minted, so it does not by itself identify the faulter (see
+    /// `docs/fault-handling.md` § Security). Opaque to the kernel;
     /// mirrors the death-observer correlator. `AtomicU64` for the same
     /// cross-thread binder/faulter access as [`Self::fault_handler`].
     pub fault_badge: core::sync::atomic::AtomicU64,

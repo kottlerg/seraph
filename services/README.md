@@ -17,7 +17,7 @@ Userspace OS processes — managers, the crate-collections they bind, and freest
 | [`pwrmgr/`](pwrmgr/README.md) | Power manager — platform shutdown and reboot |
 | [`timed/`](timed/README.md) | Wall-clock service over the devmgr-resolved RTC |
 | [`usertest/`](usertest/README.md) | Programs-surface test orchestrator |
-| `svctest/` | Services-surface test harness |
+| [`svctest/`](svctest/README.md) | Services-surface test harness |
 | [`crasher/`](crasher/README.md) | Test-tier fixture: deliberate-crash canary for svcmgr's restart path (gated, opt-in) |
 
 ---

@@ -244,9 +244,10 @@ the disposition is the only cancellation channel.
 
 The kernel performs no direct thread switch on IPC. Every rendezvous and reply
 wakes the recipient through `enqueue_and_wake` on the CPU `select_target_cpu`
-chooses, after the endpoint lock is released; the run queue decides when it
-runs. The call path then parks the caller through `schedule`; the reply path
-returns to the server.
+chooses, after the endpoint lock is released (call and receive) or the
+`reply_tcb` claim is won (reply, which takes no endpoint lock); the run queue
+decides when it runs. The call path then parks the caller through `schedule`;
+the reply path returns to the server.
 
 ---
 
@@ -636,7 +637,10 @@ atomic instruction in the no-waiter case.
 ## IPC Scheduling Interaction
 
 The IPC paths interact with the scheduler only through its park and wake
-primitives (`commit_blocked_under_local_lock`, `enqueue_and_wake`, `schedule`; see
+primitives: `commit_blocked_under_local_lock` to park,
+`commit_reply_rebind_under_local_lock` to rebind an already parked sender to its
+reply, `select_target_cpu` and `enqueue_and_wake` to wake, `schedule` to switch
+away, and `sleep_list_add` and `sleep_list_remove` for timed waits (see
 § Waking the Recipient). The scheduler itself does not need to know about IPC.
 
 The scheduler's preemption timer does not interrupt the IPC fast path. Syscall entry

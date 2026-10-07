@@ -185,7 +185,7 @@ allocated from UEFI before `ExitBootServices`. The tables map:
 - A read-write, non-executable identity map of the `BootInfo` structure, all boot modules,
   and the 64 KiB kernel handoff stack the bootloader allocates (`KERNEL_STACK_PAGES`),
   among others, so the kernel can read them before replacing the page tables; the full
-  set is in [page-tables.md](page-tables.md#what-gets-mapped)
+  set is in [page-tables.md](page-tables.md#contract-at-kernel-entry)
 - A read-execute identity map of the handoff trampoline's page or pages, so execution
   continues across the root-table switch
 

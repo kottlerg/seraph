@@ -313,24 +313,31 @@ Phase 7.
 3. Populate the root CSpace with initial capabilities:
    a. Memory capabilities for all usable physical memory ranges
       (one capability per contiguous usable region from the memory map)
-   b. One Mmio capability (Map | Write rights) per validated
-      `BootInfo.mmio_apertures` entry. Userspace narrows these into
-      per-device sub-caps and distributes them to drivers.
-   c. One root IoPort capability (x86-64 only, Use rights) covering
-      the full 64K I/O port space; init subdivides for services that
-      need port I/O.
-   d. One SchedControl capability spanning the full userspace priority range
+   b. Mmio capabilities (Map | Write rights): on RISC-V, first one over the
+      kernel console UART (`BootInfo.kernel_mmio.uart_base`, outside the
+      apertures), then one per validated `BootInfo.mmio_apertures` entry.
+      Userspace narrows these into per-device sub-caps and distributes them
+      to drivers.
+   c. One SchedControl capability spanning the full userspace priority range
       `[1, PRIORITY_MAX]` — holding it (plus its band) authorises setting thread
       priorities within that band. Init splits it into a baseline band and an
       elevated remainder and delegates copies per policy (see
       [capability-model.md § SchedControl](../../../docs/capability-model.md))
-   e. One SbiControl capability (RISC-V only) carrying every sanctioned SBI
-      right, for init to forward sanctioned SBI extensions and attenuate
-      per-consumer copies.
-   f. One root Interrupt range capability (Notify rights) covering every valid
+   d. One root Interrupt range capability (Notify rights) covering every valid
       IRQ id on the architecture (ROOT_IRQ_COUNT: 256 on x86-64, 1024 on RISC-V);
       userspace narrows it to single-IRQ children via SYS_IRQ_SPLIT.
-   g. (Thread and process capabilities for init are added in Phase 9)
+   e. Map-only Memory capabilities over firmware tables (not retypable, not
+      buddy-backed): one per `AcpiReclaimable` memory-map region (up to
+      eight), then the page holding `BootInfo.acpi_rsdp`, then the
+      `BootInfo.device_tree` blob.
+   f. One root IoPort capability (x86-64 only, Use rights) covering the full
+      64K I/O port space, which init subdivides for services that need port
+      I/O; or one SbiControl capability (RISC-V only) carrying every
+      sanctioned SBI right, for init to forward sanctioned SBI extensions and
+      attenuate per-consumer copies.
+   g. Memory capabilities for the boot module images, via
+      `cap::mint_module_memory_caps` (one per `BootInfo.modules` entry).
+   h. (Thread and process capabilities for init are added in Phase 9)
 
    Before the drain in step 3a the InitInfo block, init's INIT_STACK_PAGES
    stack frames, and the kernel page-table pool are reserved from the

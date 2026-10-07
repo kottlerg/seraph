@@ -168,9 +168,11 @@ pub const SYS_NOTIFICATION_SEND: u64 = 3;
 /// milliseconds have elapsed, whichever comes first.
 ///
 /// On success returns `0` in the primary return register and the bitmask
-/// in the secondary register (rdx / a1); on timeout returns `0` in both
-/// (unambiguous because `notification_send` rejects zero-bit sends, so a
-/// legitimate wake always carries non-zero bits). The split avoids
+/// in the secondary register (rdx / a1). A notification wake always carries
+/// non-zero bits, because `notification_send` rejects zero-bit sends. A `0`
+/// bitmask with a `0` status means the timeout elapsed, or the notification
+/// was destroyed while the caller waited; the latter returns no
+/// `Interrupted`, even with `timeout_ms = 0` (#443). The split avoids
 /// aliasing bit-63-set bitmasks with the dispatcher's negative-Err
 /// encoding — the full 64-bit bitmask range is usable. Same register
 /// layout as `SYS_EVENT_RECV`.
@@ -869,13 +871,10 @@ pub const fn encode_exit_code(code: u32) -> u64
 /// handler can recognise a fault message. The label proves kernel origin only
 /// on an endpoint whose handler hands out no SEND. The badge of a fault message
 /// is the value its binder chose in `SYS_THREAD_SET_FAULT_HANDLER`, not the
-/// badge of a cap the handler minted: binding needs only `CONTROL` on the
-/// thread and any cap to the endpoint, so a client holding a cap to a shared
-/// endpoint can bind its own thread with any badge. A handler that shares its
-/// endpoint with clients therefore cannot attribute a fault message by badge
-/// alone (see `docs/fault-handling.md` § Security). Reserved by the kernel;
-/// servers must not produce this label themselves. Chosen adjacent to
-/// [`IPC_REPLY_TRANSFER_FAILED`] (`u64::MAX`) in the reserved high range.
+/// badge of a cap the handler minted (see `docs/fault-handling.md`
+/// § Security). Reserved by the kernel; servers must not produce this label
+/// themselves. Chosen adjacent to [`IPC_REPLY_TRANSFER_FAILED`] (`u64::MAX`)
+/// in the reserved high range.
 pub const FAULT_LABEL: u64 = u64::MAX - 1;
 
 /// Fault kind (data word 0): a virtual-memory (page) fault. Data words 1–3 are

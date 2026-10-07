@@ -410,6 +410,7 @@ The system-scope reap model is in
 [Scheduler Internals](../../../core/kernel/docs/scheduler.md),
 [Capability Model](../../../docs/capability-model.md),
 [Fault Handling](../../../docs/fault-handling.md),
+[Namespace Model](../../../docs/namespace-model.md),
 [Process Lifecycle](../../../docs/process-lifecycle.md),
 [init Bootstrap Stages](../../init/docs/bootstrap.md),
 [services/logd/README.md](../../logd/README.md),

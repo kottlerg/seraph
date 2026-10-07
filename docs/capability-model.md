@@ -178,6 +178,11 @@ memory-mapped I/O. Rights:
 Without this capability a process cannot map physical addresses — it cannot
 name hardware it has not been granted access to.
 
+Revoking an Mmio capability blocks new `SYS_MMIO_MAP` calls through it but does not
+unmap mappings already established; the kernel unmapping every mapping made through
+the capability on revocation is design intent (not yet implemented — `SYS_MMIO_MAP`
+records no mapping, #457).
+
 ### Thread
 
 A capability to a thread. Rights:
@@ -480,10 +485,11 @@ invalidates all capabilities derived from the target, in all processes. The targ
 slot itself is preserved — the revoker keeps its own capability and only withdraws
 delegated authority.
 
-After revocation, any process that held a derived capability can no longer use it.
-The target's kernel object is not destroyed, because the preserved target slot still
-references it. A descendant that references a distinct object, such as a range-split
-child, frees that object when its last reference goes.
+After revocation, any process that held a derived capability can no longer use it
+(an established MMIO mapping or IoPort binding outlives it; see [Mmio](#mmio) and
+[IoPort](#ioport-x86-64-only)). The target's kernel object is not destroyed, because the
+preserved target slot still references it. A descendant that references a distinct
+object, such as a range-split child, frees that object when its last reference goes.
 
 A descendant delivered to another CSpace — by **IPC transfer**, `SYS_CAP_MOVE`, or
 `SYS_CAP_COPY` — keeps its position in the derivation tree (see
@@ -711,6 +717,8 @@ The kernel does not provide:
 [Device Management](device-management.md), [IPC Design](ipc-design.md),
 [Memory Model](memory-model.md), [Namespace Model](namespace-model.md),
 [Process Lifecycle](process-lifecycle.md), [Storage](storage.md),
+[programs/capexhaust/README.md](../programs/capexhaust/README.md),
+[programs/threadstack/README.md](../programs/threadstack/README.md),
 [services/devmgr/README.md](../services/devmgr/README.md),
 [init Bootstrap Stages](../services/init/docs/bootstrap.md),
 [services/memmgr/README.md](../services/memmgr/README.md),

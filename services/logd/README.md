@@ -111,7 +111,7 @@ and [`docs/ipc-interface.md`](docs/ipc-interface.md)):
 | Index | Cap |
 |---|---|
 | 0 | RECV on the master log endpoint |
-| 1 | SEND on the master log endpoint (single-use; carries the `HANDOVER_PULL` history drain, then the terminal `HANDOVER_RELEASE`, then deleted; see [`docs/handover-protocol.md`](docs/handover-protocol.md)). `0` on a restart — there is no init-logd left to pull from, so logd skips the handover |
+| 1 | SEND on the master log endpoint (single-use; carries the `HANDOVER_PULL` history drain, then the terminal `HANDOVER_RELEASE`, then deleted; see [`docs/handover-protocol.md`](docs/handover-protocol.md)). `0` on a restart — there is no init-logd left to pull from, so logd skips the handover (restart: design intent; not yet implemented (#262)) |
 | 2 | Badged SEND on procmgr's service endpoint carrying `DEATH_EQ_AUTHORITY` |
 | 3 | Badged SEND on devmgr's registry endpoint carrying `REGISTRY_QUERY_AUTHORITY` (to resolve the serial driver via `QUERY_SERIAL_DEVICE` and the framebuffer driver via `QUERY_FRAMEBUFFER_DEVICE`) |
 

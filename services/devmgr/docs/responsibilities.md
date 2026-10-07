@@ -97,8 +97,8 @@ devmgr's responsibilities are:
 ## Capabilities Received
 
 devmgr receives the following capabilities during bootstrap. Init delivers every one
-except SchedControl, which procmgr delivers in `ProcessInfo`, over the bootstrap
-protocol in rounds. Round 1 carries the registry endpoint, then whichever of the
+except SchedControl over the bootstrap protocol in rounds; procmgr delivers SchedControl
+in `ProcessInfo`. Round 1 carries the registry endpoint, then whichever of the
 Interrupt range, RSDP, and DTB caps are present, with a presence bitmap, the exact
 RSDP physical address, the DTB page base, and the DTB's page-rounded size in its data
 words. Each later round names its kind in `data[0]`: `APERTURE` rounds carry up to

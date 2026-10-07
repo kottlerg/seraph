@@ -3,8 +3,10 @@
 Enumerates every value the kernel emits across the user/kernel boundary and
 classifies it toward the goal that no kernel virtual address or kernel pointer
 escapes to userspace — a prerequisite for kernel address-space layout
-randomization (KASLR). One emitted value is a known open disclosure: the x86-64
-fault-message present bit ([#443](https://github.com/kottlerg/seraph/issues/443)).
+randomization (KASLR). Known open disclosures: the x86-64 fault-message present
+bit ([#443](https://github.com/kottlerg/seraph/issues/443)), mirrored console
+diagnostics ([#440](https://github.com/kottlerg/seraph/issues/440)), and unzeroed
+bootloader frames ([#439](https://github.com/kottlerg/seraph/issues/439)).
 
 ---
 
@@ -13,11 +15,13 @@ fault-message present bit ([#443](https://github.com/kottlerg/seraph/issues/443)
 KASLR randomizes the kernel's virtual base. A single kernel virtual address (VA),
 kernel pointer, or value derived from one that reaches userspace defeats base
 randomization. This inventory audits the kernel's complete output surface and
-records, per surface, why it carries no kernel VA or, for the one known open
-disclosure ([#443](https://github.com/kottlerg/seraph/issues/443)), what it
-leaks. It is the standing reference the coding-standards rule "Cross-Boundary
-Data Hygiene" ([docs/coding-standards.md](../../../docs/coding-standards.md))
-requires every new cross-boundary output to be added to.
+records, per surface, why it carries no kernel VA or, for each known open
+disclosure ([#443](https://github.com/kottlerg/seraph/issues/443),
+[#439](https://github.com/kottlerg/seraph/issues/439),
+[#440](https://github.com/kottlerg/seraph/issues/440)), what it leaks. It is the
+standing reference the coding-standards rule "Cross-Boundary Data Hygiene"
+([docs/coding-standards.md](../../../docs/coding-standards.md)) requires every new
+cross-boundary output to be added to.
 
 Scope is the *kernel-virtual-address* leak. Physical-address disclosure is a
 distinct, narrower concern handled in "Physical-address surfaces" below.
@@ -157,8 +161,8 @@ source-object pointers) — plus the retype allocator's free-list links (offsets
 into the region, not addresses). The holder of the donating capability is
 trusted not to map what it has retyped away; the kernel does not yet enforce
 that boundary ([#433](https://github.com/kottlerg/seraph/issues/433)). Until
-it does, the claim that no other kernel VA reaches userspace holds only under
-that trust.
+it does, the claim that no kernel object state in donated memory reaches
+userspace holds only under that trust.
 
 Memory the bootloader used is a related surface, whether it is donated
 through `reclaim_ranges` or returned by the memory map as usable and drained

@@ -1,11 +1,12 @@
 # namespace-protocol
 
-Wire-format specification, name validation, rights composition, and IPC
-dispatch loop shared by every Seraph namespace server. Filesystem
-drivers (`fs/fat`, future `fs/ext4`, future `tmpfs`) and composing
-servers (`vfsd`'s synthetic root) embed this crate; they implement
-[`NamespaceBackend`] for their storage layer and the crate owns every
-security-relevant code path.
+Wire-format specification, name validation, rights composition, and
+per-request dispatch (`dispatch_request`) that every Seraph namespace
+server calls from its own receive loop. Filesystem drivers (`fs/fat`,
+future `fs/ext4`, future `tmpfs`) and composing servers (`vfsd`'s
+synthetic root) embed this crate; they implement [`NamespaceBackend`]
+for their storage layer and the crate owns every security-relevant
+code path.
 
 ---
 

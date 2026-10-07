@@ -224,5 +224,6 @@ The kernel does not provide:
 [IPC Subsystem Internals](../core/kernel/docs/ipc-internals.md),
 [Syscall Interface Specification](../core/kernel/docs/syscalls.md),
 [Architecture Overview](architecture.md),
+[programs/capexhaust/README.md](../programs/capexhaust/README.md),
 [procmgr IPC Interface](../services/procmgr/docs/ipc-interface.md),
 [shared/namespace-protocol/README.md](../shared/namespace-protocol/README.md)

@@ -18,7 +18,7 @@ Three harnesses exercise three surfaces:
 | Harness | Surface | Crate | Launch mechanism |
 |---|---|---|---|
 | `ktest` | Kernel | [`core/ktest/`](../core/ktest/README.md) | Bootloader-loaded init replacement (`cargo xtask compose-bundle --harness ktest`) |
-| `svctest` | Services | `services/svctest/` | `svcmgr` spawns from `/config/svcmgr/services/` recipe |
+| `svctest` | Services | [`services/svctest/`](../services/svctest/README.md) | `svcmgr` spawns from `/config/svcmgr/services/` recipe |
 | `usertest` | Programs | [`services/usertest/`](../services/usertest/README.md) | `svcmgr` spawns from `/config/svcmgr/services/` recipe; drives binaries under `programs/` through their real I/O surfaces. The terminal interactive test (`cargo xtask test-terminal`) runs as a separate boot in the `usertest` CI cell; it drives the autostarted terminal through both input sources — keys over QMP through the live virtio-input driver, then the same sequence over the guest serial RX |
 
 `ktest` and `svctest` are authoritative for their own surface; the harness
@@ -118,16 +118,20 @@ sysroot/
 
 `/services/` and `/programs/` MUST NOT contain test harnesses or per-program
 testers; those live under `/tests/`. Dropping `/tests/` does not by itself
-give a non-test distro, because two kinds of test-only artifact install
-outside it. One is [`test-orphan`](../services/drivers/test-orphan/README.md),
-a test-only fault-injection driver installed under `/services/drivers/`
-until the devmgr enumeration redesign
-([#165](https://github.com/kottlerg/seraph/issues/165)) removes it. The
-other is the test fixtures the harnesses spawn, installed under
-`/programs/`: `capexhaust`, `demandpaged`, `pipefault`, `relrofault`, and
-`stackoverflow`, which `svctest` phases spawn, and `stdiotest`,
-`pipestress`, `threadchurn`, and `threadstack`, which their `usertest`
-testers drive.
+give a non-test distro, because test-only artifacts also install under
+`/services/drivers/`, `/programs/`, `/config/svcmgr/tests/`, and `/data/`.
+Under `/services/drivers/` is
+[`test-orphan`](../services/drivers/test-orphan/README.md), a test-only
+fault-injection driver installed there until the devmgr enumeration
+redesign ([#165](https://github.com/kottlerg/seraph/issues/165)) removes
+it. Under `/programs/` are the test fixtures the harnesses spawn:
+`capexhaust`, `demandpaged`, `fsbench`, `pipefault`, `relrofault`, and
+`stackoverflow`, which `svctest` phases spawn; `stdiotest`, which svctest's pipe
+phase spawns and its `usertest` tester drives; and `pipestress`, `threadchurn`,
+and `threadstack`, which their `usertest` testers drive. Under
+`/config/svcmgr/tests/` are the harness recipes (see [Gating](#gating)). Under
+`/data/` are the `svctest` data fixtures `/data/test.txt` and the
+build-synthesised `/data/svctest/large.bin` and `/data/svctest/bench.bin`.
 
 ---
 
@@ -513,10 +517,22 @@ note in full.
 [README.md](../README.md), [Kernel Entropy Subsystem](../core/kernel/docs/entropy.md),
 [core/ktest/README.md](../core/ktest/README.md), [Build System](build-system.md),
 [Console Model](console-model.md), [Project Conventions](conventions.md),
+[programs/capexhaust/README.md](../programs/capexhaust/README.md),
+[programs/demandpaged/README.md](../programs/demandpaged/README.md),
+[programs/fsbench/README.md](../programs/fsbench/README.md),
+[programs/hello/README.md](../programs/hello/README.md),
+[programs/pipefault/README.md](../programs/pipefault/README.md),
+[programs/pipestress/README.md](../programs/pipestress/README.md),
+[programs/relrofault/README.md](../programs/relrofault/README.md),
 [programs/shell/README.md](../programs/shell/README.md),
+[programs/stackoverflow/README.md](../programs/stackoverflow/README.md),
+[programs/stdiotest/README.md](../programs/stdiotest/README.md),
 [programs/terminal/README.md](../programs/terminal/README.md),
+[programs/threadchurn/README.md](../programs/threadchurn/README.md),
+[programs/threadstack/README.md](../programs/threadstack/README.md),
 [services/crasher/README.md](../services/crasher/README.md),
 [services/pwrmgr/README.md](../services/pwrmgr/README.md),
 [services/svcmgr/README.md](../services/svcmgr/README.md),
 [Restart Protocol](../services/svcmgr/docs/restart-protocol.md),
+[services/svctest/README.md](../services/svctest/README.md),
 [services/usertest/README.md](../services/usertest/README.md), [xtask/README.md](../xtask/README.md)

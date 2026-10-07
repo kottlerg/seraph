@@ -154,11 +154,14 @@ endpoint); each subsequent `SUBSTRATE` round carries one `(name, thread_cap)`
 pair for a substrate service init bootstrapped (`memmgr`, `procmgr`,
 `devmgr`, `vfsd`), and a terminal `LOGD_SOURCES` round carries the
 master-log endpoint source and a badge-0 `SEND|GRANT` source on procmgr's
-endpoint, from which svcmgr launches and restarts real logd. svcmgr — not
-init — then publishes the well-known names
-it owns into its own registry (`ipc::published_names::ROOTFS_ROOT`,
-`SVCMGR`, `DEVMGR_REGISTRY`, minted from the endowed sources) and installs
-devmgr's `/services/drivers/` cap via `devmgr_labels::SET_DRIVERS_DIR`.
+endpoint, from which svcmgr launches real logd (restart: design intent; not
+yet implemented (#262), per
+[Restart Protocol](../services/svcmgr/docs/restart-protocol.md#supervision-hierarchy)
+§ Supervision hierarchy). svcmgr — not init — then publishes the
+well-known names it owns into its own registry
+(`ipc::published_names::ROOTFS_ROOT`, `SVCMGR`, `DEVMGR_REGISTRY`, minted
+from the endowed sources) and installs devmgr's `/services/drivers/` cap
+via `devmgr_labels::SET_DRIVERS_DIR`.
 The provider names (`timed`, `pwrmgr.shutdown`, `pwrmgr.deny`) are
 published by svcmgr's provider path on each provider's launch. Recipes for
 all svcmgr-supervised services live on disk at
@@ -495,6 +498,10 @@ notification flow above.
 [Architecture Overview](architecture.md), [System Bootstrap](bootstrap.md),
 [Capability Model](capability-model.md), [Fault Handling](fault-handling.md), [Testing](testing.md),
 [Userspace Memory Model](userspace-memory-model.md),
+[programs/pipefault/README.md](../programs/pipefault/README.md),
+[programs/relrofault/README.md](../programs/relrofault/README.md),
+[programs/stackoverflow/README.md](../programs/stackoverflow/README.md),
+[programs/threadstack/README.md](../programs/threadstack/README.md),
 [services/crasher/README.md](../services/crasher/README.md),
 [init Bootstrap Stages](../services/init/docs/bootstrap.md),
 [services/logd/README.md](../services/logd/README.md),

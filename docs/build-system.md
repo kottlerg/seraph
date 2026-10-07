@@ -214,12 +214,12 @@ sysroot/
                           # xtask/src/commands/build.rs SPECS).
                           # Loaded by procmgr from the root
                           # partition via VFS at runtime.
-  tests/                  # All test artifacts: kernel-surface harness
-                          # (ktest), services-surface (svctest),
+  tests/                  # Test harnesses, per-program testers, and
+                          # harness-only fixtures: kernel-surface
+                          # harness (ktest), services-surface (svctest),
                           # programs-surface orchestrator (usertest),
-                          # and the crasher restart-path fixture.
-                          # Deleting this tree strips the system to a
-                          # non-test distro shape.
+                          # and the crasher restart-path fixture. Some
+                          # test-only artifacts install outside it.
   tests/programs/         # Per-program tester binaries discovered by
                           # the usertest orchestrator.
   config/                 # System configuration (from rootfs/)
@@ -233,6 +233,11 @@ The UEFI firmware discovers the bootloader at `EFI/BOOT/BOOT<arch>.EFI`
 (the UEFI specification's fallback boot path). The kernel and boot-loaded
 services live alongside it under `EFI/seraph/`, the Seraph vendor directory
 within the EFI partition.
+
+`tests/` holds the test harnesses, per-program testers, and harness-only
+fixtures, but test-only artifacts also install under `services/drivers/` and
+`programs/`; [testing.md § Sysroot layout](testing.md#sysroot-layout) lists
+them.
 
 Non-ESP, non-`data` directories (`services/`, `programs/`, `tests/`,
 `config/`) populate the GPT image's root partition, which userspace

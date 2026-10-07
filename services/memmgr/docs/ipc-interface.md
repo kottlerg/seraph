@@ -59,13 +59,17 @@ installed by procmgr for a process's main thread and by the runtime for
 each thread it spawns, and both set the badge to the process's memmgr
 badge. The fault endpoint is memmgr's client endpoint, so any holder of a
 badged SEND cap can also send a message labelled `FAULT_LABEL`; memmgr
-does not distinguish it from a kernel delivery. The fault badge is
-whatever value the binder passes, so memmgr's attribution of a fault to a
-process rests on its process badges being unguessable, not unforgeable: a
-client that learns another process's badge can direct memmgr to back any
-chunk of the regions that process registered (one chunk per forged
-fault). See
-[docs/fault-handling.md](../../../docs/fault-handling.md) §"Security".
+does not distinguish it from a kernel delivery, but such a message
+carries the badge of the sender's own cap, so it is attributed to the
+sender. The fault badge is whatever value the binder passes, and any
+client holding a cap to this endpoint can also bind its own thread's
+fault handler to it with an arbitrary badge (see
+[docs/fault-handling.md](../../../docs/fault-handling.md) §"Security").
+memmgr's attribution of a fault to a process therefore rests on its
+process badges being unguessable, not unforgeable: a client that learns
+another process's badge can bind its own thread with that badge and, by
+faulting, direct memmgr to back any chunk of the regions that process
+registered (one chunk per forged fault).
 
 ---
 
@@ -510,4 +514,7 @@ reply-then-death ordering is therefore enforced by the kernel.
 [Fault Handling](../../../docs/fault-handling.md),
 [Process Lifecycle](../../../docs/process-lifecycle.md),
 [Userspace Memory Model](../../../docs/userspace-memory-model.md),
+[programs/demandpaged/README.md](../../../programs/demandpaged/README.md),
+[programs/threadchurn/README.md](../../../programs/threadchurn/README.md),
+[programs/threadstack/README.md](../../../programs/threadstack/README.md),
 [services/memmgr/README.md](../README.md)

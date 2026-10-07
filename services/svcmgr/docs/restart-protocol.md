@@ -242,6 +242,7 @@ path (per
 [services/crasher/README.md](../../crasher/README.md),
 [services/logd/README.md](../../logd/README.md),
 [logd handover protocol](../../logd/docs/handover-protocol.md),
+[logd IPC interface](../../logd/docs/ipc-interface.md),
 [services/procmgr/README.md](../../procmgr/README.md),
 [services/pwrmgr/README.md](../../pwrmgr/README.md), [services/svcmgr/README.md](../README.md),
 [svcmgr IPC Interface](ipc-interface.md), [`.svc` Service Definitions](service-definitions.md)

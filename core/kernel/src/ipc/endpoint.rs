@@ -11,11 +11,13 @@
 //!
 //! ## Protocol
 //! 1. Caller: `call(ep, msg)` — if a server is waiting → transfer message,
-//!    mint reply capability, wake server, block caller on reply.
-//!    Otherwise → enqueue caller on `send_queue`.
+//!    bind the caller into the server's `reply_tcb`, wake server, block caller
+//!    on reply. Otherwise → enqueue caller on `send_queue`.
 //! 2. Server: `recv(ep)` — if a caller is waiting → dequeue, transfer message,
-//!    mint reply cap, return to server. Otherwise → block on `recv_queue`.
-//! 3. Server: `reply(reply_cap, msg)` — transfer reply, wake caller, consume cap.
+//!    bind the caller into the server's `reply_tcb`, return to server.
+//!    Otherwise → block on `recv_queue`.
+//! 3. Server: `reply(msg)` — deliver the reply to the bound caller, wake it,
+//!    clear `reply_tcb`.
 //!
 //! ## Reply capability
 //! Phase 9 uses a simple approach: the "reply cap" is stored directly in the
@@ -31,7 +33,8 @@
 //! docs/scheduling-internals.md § Lock Hierarchy). A server's `reply_tcb` is
 //! claimed by compare-exchange (`endpoint_reply`, cancel, teardown) or by an
 //! atomic swap (the `SYS_IPC_REPLY` failure path); the claim protocol is in
-//! docs/scheduling-internals.md § Cross-CPU TCB Ownership.
+//! docs/scheduling-internals.md § Cross-CPU TCB Ownership, and the swap claim
+//! in docs/ipc-internals.md § Park Dispositions and Episodes.
 
 use super::message::Message;
 use crate::sched::thread::{IpcThreadState, ThreadControlBlock, ThreadState};
@@ -67,7 +70,8 @@ pub struct EndpointState
     pub wait_set: *mut u8,
     /// Index of this endpoint's entry in `WaitSetState::members`.
     pub wait_set_member_idx: u8,
-    /// Serialises call/recv/reply across CPUs (see notification.rs for rationale).
+    /// Serialises the send/recv queues and the call/recv rendezvous; reply is
+    /// serialised by the `reply_tcb` claim, not this lock.
     pub lock: crate::sync::Spinlock,
 }
 

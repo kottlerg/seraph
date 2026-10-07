@@ -29,9 +29,11 @@ direct console paths remain as fallbacks for the life of the system.
    path. It writes the UART directly and **retains** that direct access for the
    life of the system: panics and pre-userspace diagnostics must not depend on
    userspace IPC. The kernel framebuffer renderer is similarly **retained**: it carries the
-   mirrored `kprintln!` console and the fatal `KERNEL EXCEPTION` dumps, while the panic path
-   itself is serial-only (`console::panic_write_fmt`). The kernel never becomes a client of
-   the userspace serial or framebuffer driver.
+   mirrored `kprintln!` console, including the address-free header line of a fatal
+   `KERNEL EXCEPTION` dump, while the panic path itself is serial-only
+   (`console::panic_write_fmt`). The dump's kernel-address lines also reaching the screen is
+   an open defect ([#440](https://github.com/kottlerg/seraph/issues/440)), not a design goal.
+   The kernel never becomes a client of the userspace serial or framebuffer driver.
 
    A **serial-only class** of kernel output writes the UART but skips the
    framebuffer: the spin-locking `kprintln_serial!` / `console::serial_write_fmt`
@@ -161,8 +163,10 @@ primitives, no input. The driver's IPC contract is specified in
 The kernel panic console (UART) and the kernel framebuffer renderer bypass the serial and
 framebuffer drivers for the life of the system, and neither can depend on the IPC machinery
 that the drivers require. The UART path is kept so a panic can still produce output; the
-framebuffer renderer is kept so the mirrored `kprintln!` console and the fatal
-`KERNEL EXCEPTION` dumps reach the screen. The bootloader console (UART and
+framebuffer renderer is kept so the mirrored `kprintln!` console, including the address-free
+header line of a fatal `KERNEL EXCEPTION` dump, reaches the screen (the dump's kernel-address
+lines reaching it are the open [#440](https://github.com/kottlerg/seraph/issues/440) defect,
+not a design goal). The bootloader console (UART and
 framebuffer) and init-logd's direct-UART path are fixed parts of the boot design that bypass the
 drivers only within their windows, which end at the kernel handoff and the real-logd handover
 respectively; they carry output before the drivers are reachable. All of these paths share the

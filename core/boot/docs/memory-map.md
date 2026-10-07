@@ -76,9 +76,10 @@ init (see [process-lifecycle.md](../../../docs/process-lifecycle.md) §"Init rea
   and §"Phase 3: Kernel Page Tables" step 7 for the bootloader page-table
   frames.
 - The boot-module bodies, minted by `mint_module_memory_caps` in Phase 7.
-- The init image LOAD segments, one reclaimable Memory cap per segment minted
-  in Phase 9 (see [process-lifecycle.md](../../../docs/process-lifecycle.md)
-  §"Init reap", which lists the ELF segments among init's donated caps).
+- The init image LOAD segments, one reclaimable Memory cap per `InitImage`
+  segment (a RELRO-sealed LOAD segment is split in two) minted in Phase 9. See
+  [initialization.md](../../kernel/docs/initialization.md)
+  §"Phase 9: Init Creation and Scheduler Entry".
 
 Every other `Loaded` page is permanent: the bootloader's own loaded image
 (firmware-allocated as `EfiLoaderCode` / `EfiLoaderData`; it contains the
@@ -88,6 +89,8 @@ buffer, and, on riscv64, the paging-mode probe page.
 
 The `Loaded` allocations are:
 
+- The bootloader's own loaded image (firmware-allocated as `EfiLoaderCode` /
+  `EfiLoaderData`; it contains the handoff trampoline).
 - Kernel image LOAD segments, placed in a bootloader-chosen contiguous span.
 - Kernel ELF file read buffer.
 - Init image LOAD segments, placed at any free physical address.

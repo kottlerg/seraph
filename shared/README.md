@@ -12,7 +12,7 @@ Utility crates shared across components, none of them a kernel/userspace ABI;
 | [`ipc/`](ipc/README.md) | IPC helpers — `IpcMessage` snapshot type, `ipc_call`/`recv`/`reply` wrappers, bootstrap protocol, and the `RecvGuard` receive-failure policy for blocking recv loops |
 | [`log/`](log/README.md) | System log primitives — wire-format helpers and process-global cache for the badged log cap |
 | [`mmio/`](mmio/README.md) | Architecture-specific MMIO ordering barriers for device drivers |
-| [`namespace-protocol/`](namespace-protocol/README.md) | Cap-native namespace wire format, name validation, rights composition, and `NamespaceBackend` dispatch loop shared by every namespace server |
+| [`namespace-protocol/`](namespace-protocol/README.md) | Cap-native namespace wire format, name validation, rights composition, and per-request `NamespaceBackend` dispatch used by every namespace server |
 | [`ns-client/`](ns-client/README.md) | `no_std` namespace walk helpers for holders of a vfsd namespace cap |
 | [`process-layout/`](process-layout/README.md) | Per-process bootstrap virtual-address layout for process creators |
 | [`registry/`](registry/README.md) | Fixed-capacity name→endpoint-cap registry used by supervisor services |

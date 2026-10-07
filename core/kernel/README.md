@@ -201,8 +201,12 @@ calls into this module's dispatch table, which routes to the appropriate subsyst
 implementation. See [`docs/syscalls.md`](docs/syscalls.md). The audit classifying
 every cross-boundary output (syscall, IPC, fault, exit) for kernel-virtual-address
 disclosure is in [`docs/cross-boundary-disclosure.md`](docs/cross-boundary-disclosure.md);
-it records one open kernel-VA disclosure, the x86-64 fault-message `d2` present bit
-([#443](https://github.com/kottlerg/seraph/issues/443)).
+it records one open kernel-VA disclosure among emitted values, the x86-64 fault-message
+`d2` present bit ([#443](https://github.com/kottlerg/seraph/issues/443)), and the open
+exposures through donated memory, bootloader-reclaimed frames, and mirrored console
+output ([#433](https://github.com/kottlerg/seraph/issues/433),
+[#439](https://github.com/kottlerg/seraph/issues/439),
+[#440](https://github.com/kottlerg/seraph/issues/440)).
 
 ---
 

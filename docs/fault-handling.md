@@ -107,9 +107,10 @@ capability type. The binding is per-thread kernel state: the bound endpoint and 
 - `endpoint_cap` MUST refer to an `Endpoint`, or be the null index `0` to **unbind**.
   Binding takes a reference on the endpoint object for the lifetime of the binding (see
   [Liveness](#liveness)); unbinding releases it.
-- `badge` is a caller-chosen value delivered as the fault message badge, identifying the
-  faulting thread (or its process) to the handler. It is opaque to the kernel, mirroring
-  the death-observer correlator of [Process Lifecycle](process-lifecycle.md#process-death).
+- `badge` is a caller-chosen value delivered as the fault message badge. It identifies the
+  faulting thread (or its process) only to a handler whose endpoint no other binder can
+  reach; see [Security](#security). It is opaque to the kernel, mirroring the
+  death-observer correlator of [Process Lifecycle](process-lifecycle.md#process-death).
 - `fault_class_mask` selects which fault classes this handler covers. The defined value
   is the all-classes mask; it reserves the encoding for future per-class handlers without
   a new syscall.
@@ -319,6 +320,9 @@ svcmgr service definitions carry no paging key; see
 [Syscall Interface Specification](../core/kernel/docs/syscalls.md),
 [Capability Model](capability-model.md), [IPC Design](ipc-design.md),
 [Process Lifecycle](process-lifecycle.md), [Userspace Memory Model](userspace-memory-model.md),
+[programs/demandpaged/README.md](../programs/demandpaged/README.md),
+[programs/stackoverflow/README.md](../programs/stackoverflow/README.md),
+[programs/threadstack/README.md](../programs/threadstack/README.md),
 [memmgr IPC Interface](../services/memmgr/docs/ipc-interface.md),
 [procmgr IPC Interface](../services/procmgr/docs/ipc-interface.md),
 [`.svc` Service Definitions](../services/svcmgr/docs/service-definitions.md)

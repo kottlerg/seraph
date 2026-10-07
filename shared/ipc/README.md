@@ -36,9 +36,10 @@ first-contact handshake, and the receiver rejects a mismatch. Only `ns_labels` i
 covered: its caps descend from the `vfsd_labels::GET_SYSTEM_ROOT_CAP` and `fs_labels::FS_MOUNT`
 handshakes, so the parent channel stands in for the version check. The remaining constants are
 markers that exist for the bump discipline. `STREAM_LABELS_VERSION` and `LOG_LABELS_VERSION` are
-in practice marker-only: no caller issues the `log_labels::GET_LOG_CAP` handshake, and every
-process instead receives its stream cap in `ProcessInfo.log_send_cap`. The block comment above
-the label modules in `src/lib.rs` lists which namespace falls in which category.
+in practice marker-only: no caller issues the `log_labels::GET_LOG_CAP` handshake. Every process
+that holds a stream cap has it pre-installed instead, in `ProcessInfo.log_send_cap` or, for
+init, derived by init itself. The block comment above the label modules in `src/lib.rs` lists
+which namespace falls in which category.
 
 ---
 

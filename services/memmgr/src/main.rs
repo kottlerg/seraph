@@ -1409,15 +1409,14 @@ fn handle_process_died(req: &IpcMessage, ipc_buf: *mut u64, procmgr_badge: u64)
 
 fn handle_donate_memory_caps(req: &IpcMessage, ipc_buf: *mut u64)
 {
-    // Caller (procmgr's init reap) is permanently transferring reclaimed
-    // Memory caps into memmgr's pool: the usable-RAM caps that did not fit
-    // memmgr's bootstrap round, the free remainders `MemoryAlloc` abandoned,
-    // init's ELF segments, InitInfo, stack, the bootloader/bundle reclaim
-    // ranges, the AP-trampoline frame, and boot-module ELF sources (see
-    // `services/memmgr/docs/ipc-interface.md` § Label 5). Each
-    // donated cap must carry the full pool-frame rights ([`POOL_FRAME_RIGHTS`])
-    // so memmgr can derive the R / RW / RX inner a demand fault or
-    // REQUEST_MEMORY_CAPS consumer needs and retype on their behalf.
+    // Caller (procmgr's init reap) is permanently transferring init's
+    // reclaimed Memory caps into memmgr's pool (the donated set is specified
+    // in `docs/process-lifecycle.md` § Init reap and
+    // `services/memmgr/docs/ipc-interface.md` § Label 5:
+    // `DONATE_MEMORY_CAPS`). Each donated cap must carry the full pool-frame
+    // rights ([`POOL_FRAME_RIGHTS`]) so memmgr can derive the R / RW / RX
+    // inner a demand fault or REQUEST_MEMORY_CAPS consumer needs and retype
+    // on their behalf.
     //
     // Donation is ungated: memmgr accepts it from any badged client and does
     // not check the cap's provenance, so a client that donates a cap derived
@@ -1643,7 +1642,10 @@ fn handle_delegate_aspace(req: &IpcMessage, ipc_buf: *mut u64, procmgr_badge: u6
 
 /// Service a kernel-synthesized page fault for a demand-paged process.
 ///
-/// `req.badge` is the faulting process's memmgr badge; words are
+/// `req.badge` is the value bound by `SYS_THREAD_SET_FAULT_HANDLER` (procmgr
+/// and the runtime bind the process's memmgr badge); attribution rests on
+/// badge unguessability (`services/memmgr/docs/ipc-interface.md`
+/// § Kernel-origin fault message (`FAULT_LABEL`); #459). Words are
 /// `[kind, faulting_va, access, ip]`. On a VM fault whose address lies in a
 /// registered region of a process with a delegated address space, memmgr backs
 /// the [`chunk_for`] chunk containing the faulting page — one contiguous

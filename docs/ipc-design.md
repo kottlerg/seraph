@@ -50,7 +50,8 @@ the binding. The displaced caller (a thread blocked in `call` or a fault-blocked
 then outside every guarantee the system and kernel documents state for a blocked or bound
 thread: no reply reaches it; stopping it, tearing down its CSpace or AddressSpace, or deleting
 its last Thread capability can hang the kernel or touch freed kernel memory; and restarting a
-stopped one trips a debug-build kernel assertion. This is a defect; its consequences are listed
+stopped one trips a debug-build kernel assertion, while a release build fails the call closed
+with `Interrupted` (or kills a fault-blocked thread). This is a defect; its consequences are listed
 in [#443](https://github.com/kottlerg/seraph/issues/443).
 
 ### Message Format

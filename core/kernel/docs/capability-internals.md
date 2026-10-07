@@ -569,7 +569,7 @@ stopped — it deleted the last capability to its own `CSpace`, or a concurrent 
 nothing below runs now: the object is queued for off-CPU reclaim and the whole arm re-runs from the
 deferred drain once the thread has been scheduled away. The same discipline applies to an
 `AddressSpace` reaching refcount zero. For a thread displaced from a server's pending-reply binding,
-this stop and its later reap are not memory-safe and can hang the kernel; see
+neither this stop nor its later reap is memory-safe, and the reap can hang the kernel; see
 [ipc-design.md](../../../docs/ipc-design.md#the-callreply-model),
 [#443](https://github.com/kottlerg/seraph/issues/443).
 

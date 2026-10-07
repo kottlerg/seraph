@@ -385,8 +385,8 @@ A process dies when:
   [#443](https://github.com/kottlerg/seraph/issues/443)).
 - The last capability to its `CSpace` or `AddressSpace` is deleted: the kernel stops every thread
   bound to the object (retained exit reason `EXIT_KILLED`) before reclaiming it, so the process's
-  threads cannot outlive either (for a thread displaced from a server's pending-reply binding, this
-  stop and its later reap are not memory-safe and can hang the kernel; see
+  threads cannot outlive either (for a thread displaced from a server's pending-reply binding,
+  neither this stop nor its later reap is memory-safe, and the reap can hang the kernel; see
   [IPC Design](ipc-design.md#the-callreply-model),
   [#443](https://github.com/kottlerg/seraph/issues/443)). A thread deleting the last capability to
   its own `CSpace` or `AddressSpace` is stopped by that same delete and never returns from it.
@@ -416,7 +416,7 @@ procmgr had already been woken to reap it. The kernel only *notifies*; it does n
 sibling threads at that point — they are stopped when procmgr's cap-revoke teardown below deletes
 the process's `CSpace` (every thread bound to it is stopped before its storage is reclaimed,
 wherever their thread caps are held; for a thread displaced from a server's pending-reply binding,
-this stop and its later reap are not memory-safe and can hang the kernel; see
+neither this stop nor its later reap is memory-safe, and the reap can hang the kernel; see
 [IPC Design](ipc-design.md#the-callreply-model),
 [#443](https://github.com/kottlerg/seraph/issues/443)) and reaped through their own thread caps.
 `ExitStatus::success()`/`code()` decode the reason on the consumer side. This is a Seraph-native

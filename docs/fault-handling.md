@@ -64,11 +64,10 @@ Not yet implemented (this section is narrowed as each part lands):
   faulting thread being stopped or destroyed, or the handler endpoint being destroyed (all
   implemented). The remaining trigger — the binding being cleared mid-fault — is the only
   [Kill](#delivery-resume-and-kill) path not yet wired.
-- **Displaced fault binding.** A later receive on the handler thread while a fault reply is
-  still pending overwrites the handler's reply binding (see
-  [IPC Design](ipc-design.md#the-callreply-model)). None of the paths above then resolves the
-  displaced fault-blocked thread: it is never resumed or killed. This defect is tracked in
-  [#443](https://github.com/kottlerg/seraph/issues/443).
+- **Displaced fault binding.** A later receive on the handler thread while a fault reply is still
+  pending overwrites the handler's reply binding; the displaced fault-blocked thread is outside the
+  resolutions above ([IPC Design](ipc-design.md#the-callreply-model),
+  [#443](https://github.com/kottlerg/seraph/issues/443)).
 
 ---
 
@@ -189,12 +188,12 @@ it resumes by re-executing its faulting instruction, not by returning a value.
   state preserved (or as modified by the handler; see below) and re-executes the faulting
   instruction. For a page fault whose handler has installed a satisfying mapping, the
   instruction now succeeds.
-- **Kill (cancellation).** If the binding is severed before a reply — the handler thread
-  dies, the binding is cleared (design intent; not yet implemented, #242), or the thread is
-  stopped — the faulting thread is killed, exactly as an unhandled fault. It is never resumed
-  with a spurious value. A faulting thread displaced by a later receive on its handler is not
-  killed by these triggers; this defect is tracked in
-  [#443](https://github.com/kottlerg/seraph/issues/443).
+- **Kill (cancellation).** If the binding is severed before a reply — the handler thread dies, the
+  binding is cleared (design intent; not yet implemented, #242), or the thread is stopped — the
+  faulting thread is killed, exactly as an unhandled fault. It is never resumed with a spurious
+  value. A faulting thread displaced by a later receive on its handler is outside this guarantee
+  ([IPC Design](ipc-design.md#the-callreply-model),
+  [#443](https://github.com/kottlerg/seraph/issues/443)).
 
 ### Modifying the faulting thread
 

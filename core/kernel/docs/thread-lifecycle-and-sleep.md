@@ -405,7 +405,11 @@ only by `ipc_state` at the wake site. The following actors can mutate this slot 
 domains:
 
 1. **Server in `endpoint_call`** — sets `reply_tcb = caller` under `ep.lock` by an unconditional
-   Release `store` that overwrites any binding still pending (see the Symmetry rule; #443).
+   Release `store` that overwrites any binding still pending (see the Symmetry rule; #443). If the
+   caller's commit then fails (it died/stopped concurrently), `rollback_uncommitted_call` rolls the
+   binding back under the same `ep.lock` — `compare_exchange(caller, null)` on `reply_tcb`; on a
+   win it stamps a cancelled deposit (INTERRUPTED, or KILL for a faulter) and clears
+   `wake_in_flight`.
 2. **Server in `endpoint_recv`** — dequeues a `BlockedOnSend` caller and rebinds it to
    `reply_tcb = caller` under `ep.lock` by the same unconditional store, then commits the caller's
    `BlockedOnSend → BlockedOnReply` (`ipc_state` + `blocked_on_object`) transition via
@@ -447,17 +451,18 @@ domains:
 
 **Symmetry rule:** every actor that may invalidate a client's place in the reply slot MUST claim it
 by an atomic read-modify-write that observes the bound client (never an unconditional store) so
-concurrent actors can determine whether they got there first. Actors 3 through 7 and actor 2's
-commit-failure rollback use `compare_exchange(this_client, null, ...)`. Actor 8 uses `swap(null)`:
-only the slot-owning server performs it, while it is running `SYS_IPC_REPLY`, and no publisher can
-install a different caller during that syscall (`endpoint_call` binds only a server it dequeued
-from a receive queue, and `endpoint_recv` runs only on the server itself), so a non-null result is
-as exclusive a claim as a won CAS. The publish stores of actors 1 and 2 violate this rule: they are
-unconditional, so when the server receives again while a reply is still pending they overwrite the
-binding, and the displaced caller or faulter is never resumed, interrupted, or killed; this defect
-is tracked in [#443](https://github.com/kottlerg/seraph/issues/443). The single `fault_outcome`
-writer is whichever actor wins this claim, so a fault's resume-vs-kill disposition is never decided
-by two racing actors.
+concurrent actors can determine whether they got there first. Actors 3 through 7 and the
+commit-failure rollbacks of actors 1 and 2 use `compare_exchange(this_client, null, ...)`. Actor 8
+uses `swap(null)`: only the slot-owning server performs it, while it is running `SYS_IPC_REPLY`,
+and no publisher can install a different caller during that syscall (`endpoint_call` binds only a
+server it dequeued from a receive queue, and `endpoint_recv` runs only on the server itself), so a
+non-null result is as exclusive a claim as a won CAS. The publish stores of actors 1 and 2 violate
+this rule: they are unconditional, so when the server receives again while a reply is still
+pending they overwrite the binding, and the displaced caller or faulter is outside the guarantees
+of this document ([ipc-design.md](../../../docs/ipc-design.md) § The Call/Reply Model,
+[#443](https://github.com/kottlerg/seraph/issues/443)). The single `fault_outcome` writer is
+whichever actor wins this claim, so a fault's resume-vs-kill disposition is never decided by two
+racing actors.
 
 **Invariants on the BlockedOnReply protocol:**
 

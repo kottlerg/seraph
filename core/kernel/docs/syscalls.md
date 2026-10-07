@@ -336,16 +336,13 @@ Wait for a call on an endpoint. Blocks until a caller arrives.
 - `rsi`/`a2`: badge of the incoming message (0 if unbadged)
 - `r8`/`a3`: data-word count of the delivered message
 
-The message's data words are written to the receiver's registered IPC buffer
-page, followed by the cap-transfer result block (count, then the delivered
-destination handles) at word offset `MSG_DATA_WORDS_MAX`.
-The kernel binds the caller to the receiving thread as its reply capability (the
-per-thread `reply_tcb` field); `SYS_IPC_REPLY` consumes this binding implicitly.
-A receive that delivers a message while a reply is still pending overwrites the
-binding, and the displaced caller (a thread blocked in `SYS_IPC_CALL` or a
-fault-blocked thread) is never resumed, interrupted, or killed; this defect is
-tracked in [#443](https://github.com/kottlerg/seraph/issues/443) (see
-[ipc-design.md](../../../docs/ipc-design.md) § The Call/Reply Model).
+The message's data words are written to the receiver's registered IPC buffer page, followed by the
+cap-transfer result block (count, then the delivered destination handles) at word offset
+`MSG_DATA_WORDS_MAX`. The kernel binds the caller to the receiving thread as its reply capability
+(the per-thread `reply_tcb` field); `SYS_IPC_REPLY` consumes this binding implicitly. A receive that
+delivers a message while a reply is still pending overwrites the binding; the displaced caller is
+outside the guarantees of this document ([ipc-design.md](../../../docs/ipc-design.md) § The
+Call/Reply Model, [#443](https://github.com/kottlerg/seraph/issues/443)).
 
 For a call, the badge is the value attached to the sender's endpoint capability via
 `SYS_CAP_DERIVE_BADGE`; it identifies the caller without a forgeable PID. For a
@@ -1121,11 +1118,13 @@ Stop a running or runnable thread. The thread transitions to `Stopped` state.
 
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
 
-If the thread is blocked on IPC, the block is cancelled (the blocked syscall on the
-target thread returns `Interrupted`). If the thread is running on another CPU, an
+If the thread is blocked on IPC, the block is cancelled (the blocked syscall on the target thread
+returns `Interrupted`), except for a caller displaced from a server's reply binding
+([ipc-design.md](../../../docs/ipc-design.md) § The Call/Reply Model,
+[#443](https://github.com/kottlerg/seraph/issues/443)). If the thread is running on another CPU, an
 inter-processor interrupt is sent to force it out of userspace (see
-[thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § `sys_thread_stop` Cross-CPU
-Stop Protocol).
+[thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § `sys_thread_stop` Cross-CPU Stop
+Protocol).
 
 **Capability requirement:** `thread_cap` must have Control rights.
 

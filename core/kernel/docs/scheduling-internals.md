@@ -141,9 +141,12 @@ hang). See § Thread Registry.
    claimed thread* in that window (it is still live, mid-park) has exactly one legal continuation —
    fall through to `schedule()`. Consuming the deposited payload and returning to user mode is
    forbidden; it strands the waker's run-queue link (#352). The other `reply_tcb` claims — the
-   cancel, dying-client dealloc, and commit-failure rollback `compare_exchange` — only clear
-   `wake_in_flight` and wake no one (the `BlockedOnReply` symmetry rules'
-   [actors 2-8](thread-lifecycle-and-sleep.md#blockedonreply-edge--symmetry-rules) enumerate every
+   cancel, dying-client dealloc, and commit-failure rollback `compare_exchange` — wake no one. The
+   cancel and rollback claims stamp a cancelled disposition (INTERRUPTED, or KILL for a faulter)
+   and clear `wake_in_flight`; the dying-client claim only clears `wake_in_flight` (deposits per
+   the [ipc-internals.md](ipc-internals.md#park-dispositions-and-episodes) episode table; the
+   `BlockedOnReply` symmetry rules'
+   [actors 1-8](thread-lifecycle-and-sleep.md#blockedonreply-edge--symmetry-rules) enumerate every
    claimant). The `still_waiter` rechecks (the sleep-list arming in `sys_event_recv` /
    `sys_notification_wait`) respect this: they only add a timer on the not-claimed branch and fall
    through to `schedule()` on both branches. The `endpoint_dealloc` send/recv drain instead HOLDS

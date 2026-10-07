@@ -1293,6 +1293,11 @@ takes effect immediately:
 
 If `cpu_id` names an offline CPU, the call fails with `InvalidArgument`.
 
+The call takes no reference on the target Thread and no `sched_lock`: a concurrent delete or
+revoke of the last Thread capability can free the TCB mid-call, and the affinity write races other
+CPUs' scheduler paths, so the outcomes above hold only when neither race occurs (defects tracked in
+[#443](https://github.com/kottlerg/seraph/issues/443)).
+
 **Capability requirement:** `thread_cap` MUST have Control rights.
 
 **Errors:** `InvalidCapability`, `InsufficientRights` (cap lacks Control),

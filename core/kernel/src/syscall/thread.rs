@@ -875,16 +875,19 @@ pub fn sys_thread_set_fault_handler(tf: &mut TrapFrame) -> Result<u64, SyscallEr
     // cannot be freed between publish and a faulter's load.
     if !new_ep.is_null()
     {
-        // SAFETY: new_ep is a live EndpointObject (its cap slot holds a ref).
+        // SAFETY: new_ep was a live EndpointObject at lookup. `lookup_cap`
+        // takes no reference, so a concurrent delete or revoke of the last
+        // Endpoint cap can free it before this inc_ref (#443).
         unsafe { (*new_ep).header.inc_ref() };
     }
 
     // Publish the badge first, then atomically swap the handler pointer, so a
     // faulter that observes the new handler also observes the matching badge.
     // SAFETY: target_tcb was a live TCB at lookup; both fields are atomics safe
-    // to write cross-thread. `lookup_cap` takes no reference, so a sibling
-    // thread's concurrent delete of the last Thread cap can free the TCB before
-    // these writes (the residual race lookup_cap documents; #443).
+    // to write cross-thread. `lookup_cap` takes no reference, so a concurrent
+    // delete or revoke of the last Thread cap (by a sibling thread, or by a
+    // foreign holder revoking an ancestor of the caller's cap) can free the TCB
+    // before these writes (#443).
     let old_ep = unsafe {
         (*target_tcb).fault_badge.store(badge, Ordering::Release);
         (*target_tcb).fault_handler.swap(new_ep, Ordering::AcqRel)
@@ -1225,8 +1228,9 @@ pub fn sys_thread_set_affinity(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     }
 
     // SAFETY: target_tcb was a live TCB at lookup. `lookup_cap` takes no
-    // reference, so a sibling thread's concurrent delete of the last Thread cap
-    // can free it during this block (the residual race lookup_cap documents),
+    // reference, so a concurrent delete or revoke of the last Thread cap (by a
+    // sibling thread, or by a foreign holder revoking an ancestor of the
+    // caller's cap) can free it during this block,
     // and the `cpu_affinity` write and the `preferred_cpu` / `state` reads are
     // not serialised with other CPUs' scheduler paths; both are #443 defects.
     unsafe {

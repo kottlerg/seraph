@@ -743,6 +743,9 @@ pub fn notification_send(sig: u32, bits: u64) -> Result<(), i64>
 /// register (rdx / a1). Mirrors `event_recv`; the split avoids aliasing
 /// bit-63-set bitmasks with the dispatcher's negative-Err encoding.
 ///
+/// A notification destroyed while the caller waits wakes it with `Ok(0)`
+/// rather than an error (a kernel defect tracked in #443).
+///
 /// # Errors
 /// Returns a negative `i64` error code if the notification cap is invalid or the
 /// wait is interrupted.
@@ -765,7 +768,9 @@ pub fn notification_wait(sig: u32) -> Result<u64, i64>
 ///
 /// Same register layout as [`notification_wait`]: status in the primary register,
 /// bitmask in the secondary. Timeout is notified in-band as `bits == 0`
-/// (legitimate because `notification_send` rejects zero-bit sends).
+/// (legitimate because `notification_send` rejects zero-bit sends); `Ok(0)` is
+/// also returned when the notification is destroyed while the caller waits
+/// (#443).
 ///
 /// # Errors
 /// Returns a negative `i64` error code if the notification cap is invalid or

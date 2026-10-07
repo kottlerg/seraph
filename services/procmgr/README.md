@@ -195,10 +195,10 @@ Boundaries Between memmgr and procmgr" for the full split.
 
 svcmgr monitors services and requests restarts via procmgr's IPC
 interface. svcmgr holds no process-creation capabilities: every process
-other than init's raw-bootstrap set (memmgr and procmgr) is created
-through procmgr. A raw-syscall fallback that lets svcmgr recreate
-procmgr if procmgr itself crashes is design intent; not yet implemented
-(#26) (see
+other than init (kernel-created) and init's raw-bootstrap set (memmgr and
+procmgr) is created through procmgr. A raw-syscall fallback that lets
+svcmgr recreate procmgr if procmgr itself crashes is design intent; not
+yet implemented (#26) (see
 [services/svcmgr/docs/restart-protocol.md](../svcmgr/docs/restart-protocol.md#procmgr-fallback)
 § procmgr Fallback).
 

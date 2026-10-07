@@ -82,17 +82,18 @@ The full driver lifecycle is specified in
   DMA is unconfined until IOMMU support lands (see
   [docs/device-management.md](../../docs/device-management.md#dma-safety-model)
   § DMA Safety Model and [docs/architecture.md](../../docs/architecture.md)).
-- **Per-device capabilities** — [devmgr](../devmgr/README.md) delegates the
-  minimum capability set for each device: MMIO region, optional interrupt line,
-  the service endpoint, IoPort (x86-64) where applicable, and, for drivers that
-  fetch runtime metadata (PCI drivers, the framebuffer), a badged SEND on
-  devmgr's registry-query endpoint. See
-  [docs/capability-model.md](../../docs/capability-model.md) for capability types
-  and rights.
-- **Spawning** — [devmgr](../devmgr/README.md) discovers devices (PCI
-  enumeration, firmware tables), matches them to driver binaries, and requests
-  procmgr to create driver processes. devmgr then delegates per-device
-  capabilities to the new process.
+- **Per-device capabilities** — [devmgr](../devmgr/docs/responsibilities.md#responsibilities)
+  delegates the minimum capability set for each device: MMIO region, optional
+  interrupt line, the service endpoint, IoPort (x86-64) where applicable, and, for
+  drivers that fetch runtime metadata (PCI drivers, the framebuffer), a badged SEND
+  on devmgr's
+  [registry-query endpoint](../devmgr/docs/responsibilities.md#capabilities-received).
+  See [docs/capability-model.md](../../docs/capability-model.md) for capability
+  types and rights.
+- **Spawning** — [devmgr](../devmgr/docs/responsibilities.md#responsibilities)
+  discovers devices (PCI enumeration, firmware tables), matches them to driver
+  binaries, and requests procmgr to create driver processes. devmgr then delegates
+  per-device capabilities to the new process.
 - **Communication** — drivers expose IPC endpoints for their clients (e.g. a
   block driver exposes a read/write endpoint consumed by filesystem drivers via
   vfsd; see [docs/storage.md](../../docs/storage.md)). See
@@ -129,7 +130,8 @@ The driver-authoring rules are specified in
 [docs/driver-model.md](docs/driver-model.md#adding-a-driver) § Adding a Driver. In
 summary, a driver is a std binary crate (ruststd) targeting the std-userspace
 Seraph target (see [docs/build-system.md](../../docs/build-system.md#custom-targets)),
-holds only the capabilities [devmgr](../devmgr/README.md) delegates, serves client
+holds only the capabilities
+[devmgr](../devmgr/docs/responsibilities.md#responsibilities) delegates, serves client
 requests on the service endpoint devmgr creates and delivers at spawn (devmgr mints
 client SEND caps from its registry; see
 [services/devmgr/docs/responsibilities.md](../devmgr/docs/responsibilities.md#responsibilities)

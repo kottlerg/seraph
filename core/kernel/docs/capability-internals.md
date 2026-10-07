@@ -775,9 +775,13 @@ tree write lock is sufficient to prevent concurrent modification.
 
 ## Initial CSpace Population
 
-Phases 7, 8, and 9 of initialization populate the root CSpace, which becomes init's
-CSpace. Slots are assigned sequentially from slot 1 in the order below; the counts in
-each group depend on the platform, so init must not assume specific slot numbers.
+Phases 7, 8, and 9 of initialization, per [initialization.md](initialization.md)
+([§ Phase 7](initialization.md#phase-7-capability-system),
+[§ Phase 8](initialization.md#phase-8-scheduler-and-smp-bringup),
+[§ Phase 9](initialization.md#phase-9-init-creation-and-scheduler-entry)), populate the
+root CSpace, which becomes init's CSpace. Slots are assigned sequentially from slot 1 in
+the order below; the counts in each group depend on the platform, so init must not assume
+specific slot numbers.
 
 ### Initial Slot Layout
 
@@ -794,7 +798,7 @@ each group depend on the platform, so init must not assume specific slot numbers
 | 8 | 7 | Reclaimable Memory capabilities for bootloader scratch pages (`BootInfo`, descriptor arrays, MMIO aperture array, reclaim-array page, transient page-table frames) and the bundle's non-module pages (header + entry table + pad, init ELF source body, inter-module and trailing slack — module bodies are excluded, covered by the boot-module Memory caps above) — one cap per `BootInfo.reclaim_ranges` entry not flagged `RECLAIM_FLAG_LATE` |
 | 9 | 8 | Late-reclaim Memory capabilities (one per `BootInfo.reclaim_ranges` entry flagged `RECLAIM_FLAG_LATE`: the AP trampoline page) |
 | 10 | 9 | Init's own address space capability |
-| 11 | 9 | Memory capabilities for init's ELF segments |
+| 11 | 9 | Reclaimable Memory capabilities for init's ELF segments |
 | 12 | 9 | Reclaimable Memory capabilities for the `InitInfo` pages |
 | 13 | 9 | Reclaimable Memory capabilities for init's stack pages |
 | 14 | 9 | Init's own thread capability |

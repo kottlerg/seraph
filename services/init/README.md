@@ -16,7 +16,7 @@ init/
 ├── README.md
 ├── docs/
 │   └── bootstrap.md            # Authoritative stage enumeration;
-│                                 init's side of the capability flow
+│                               # init's side of the capability flow
 └── src/
     ├── main.rs                 # _start, run() orchestration across the three stages
     ├── bootstrap.rs            # Raw memmgr / procmgr ELF-load + kernel-object setup

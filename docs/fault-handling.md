@@ -154,6 +154,9 @@ thread's behalf. Its format is a stable cross-boundary contract.
 - **Data words 1–3** — kind-specific:
   - `FAULT_KIND_VM`: faulting virtual address; access flags (bit 0 read, bit 1 write,
     bit 2 instruction fetch, bit 3 present-vs-not-present); faulting instruction pointer.
+    Bit 3 is set only on x86-64. On RISC-V it is always clear, because `scause` does not
+    encode presence, so a handler there MUST NOT read a clear bit 3 as not-present; it
+    inspects its own mappings instead.
   - `FAULT_KIND_EXCEPTION`: a **normalized exception code** (an architecture-neutral class —
     illegal instruction, breakpoint, alignment, divide, protection, … — so a handler
     dispatches without architecture knowledge; an unrecognized code is treated as the

@@ -491,22 +491,24 @@ const ISSUES_BLOCK = [
 // System-scope documents (the top-level `docs/*.md`), plus `docs/releases/README.md`,
 // which this workflow adds (the standard gives it no scope), go to every shard; a
 // component's `README.md` and `docs/*.md` go only to its own shards. The root
-// README and the top-level grouping README the component sits in go to the shard
-// in the same list, which `shard_prompt` emits under one "Design documents
-// governing this shard" heading without separating them from the authorities.
+// README and the top-level grouping README the component sits in are routing
+// documents, not authorities, so they are returned apart and `shard_prompt`
+// emits them under their own heading.
 const docs_for = (component) => {
     const top = component.split('/')[0]
-    return scope.design_docs.filter(
-        (d) =>
-            d.startsWith('docs/') || d === 'README.md' || d === top + '/README.md' ||
-            component_of(d) === component,
+    const grouping = NESTED.includes(top) ? top + '/README.md' : null
+    const routing = scope.design_docs.filter((d) => d === 'README.md' || d === grouping)
+    const authorities = scope.design_docs.filter(
+        (d) => !routing.includes(d) && (d.startsWith('docs/') || component_of(d) === component),
     )
+    return { authorities, routing }
 }
 
 function shard_prompt(shard) {
     const paths = new Set(shard.files.map((f) => f.path))
     const items = scope.changed_items.filter((i) => paths.has(i.file))
     const fixes = scope.claimed_fixes.filter((c) => paths.has(c.file))
+    const docs = docs_for(shard.component)
     return [
         SHARD_HEADER,
         '',
@@ -520,7 +522,10 @@ function shard_prompt(shard) {
         bullets(items, item_line),
         '',
         'Design documents governing this shard (read the relevant ones in full):',
-        bullets(docs_for(shard.component), doc_line),
+        bullets(docs.authorities, doc_line),
+        '',
+        'Routing documents (not authorities; for context only):',
+        bullets(docs.routing, doc_line),
         '',
         ISSUES_BLOCK,
         DELTA

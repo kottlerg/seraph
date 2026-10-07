@@ -182,9 +182,12 @@ Initial page tables are constructed for the kernel. All page table frames are
 allocated from UEFI before `ExitBootServices`. The tables map:
 
 - The kernel ELF segments at their (KASLR-biased) virtual addresses, with segment permissions
-- An identity map of the `BootInfo` structure, all boot modules, and the 64 KiB kernel
-  handoff stack the bootloader allocates (`KERNEL_STACK_PAGES`), so the kernel can read
-  them before replacing the page tables
+- A read-write, non-executable identity map of the `BootInfo` structure, all boot modules,
+  and the 64 KiB kernel handoff stack the bootloader allocates (`KERNEL_STACK_PAGES`),
+  among others, so the kernel can read them before replacing the page tables; the full
+  set is in [page-tables.md](page-tables.md#what-gets-mapped)
+- A read-execute identity map of the handoff trampoline's page or pages, so execution
+  continues across the root-table switch
 
 W^X is verified during construction: no PTE has both writable and executable bits.
 

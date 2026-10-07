@@ -51,8 +51,8 @@ Allocation Contract").
   [`docs/ipc-interface.md`](docs/ipc-interface.md) §"Label 1: `REQUEST_MEMORY_CAPS`".
 - **Per-process tracking** — maintain a per-process record of the Memory
   caps memmgr has handed out, keyed on a per-process badge (memmgr-minted at
-  procmgr's `REGISTER_PROCESS`; procmgr's own is init's bootstrap badge; see
-  [`docs/memory-pool.md`](docs/memory-pool.md) §"Per-Process Tracking").
+  procmgr's `REGISTER_PROCESS`; procmgr's own is a bootstrap badge init mints
+  for it; see [`docs/memory-pool.md`](docs/memory-pool.md) §"Per-Process Tracking").
 - **Reclamation on process death** — on `PROCESS_DIED` from procmgr,
   reclaim the dead process's memory caps into the free pool (see
   [`docs/memory-pool.md`](docs/memory-pool.md) §"Reclamation").

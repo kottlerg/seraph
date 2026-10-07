@@ -83,16 +83,15 @@ TCB used only while the thread is blocked on an IPC object. No separate allocati
       recv_tcb.reply_tcb = current_tcb (Release store)
    e. Mark recv_tcb as Ready; set result to success
    f. Release endpoint lock
-   g. Direct thread switch: if recv_tcb.priority > current_tcb.priority:
-      enqueue current_tcb, switch to recv_tcb immediately (fast path optimization)
-      else: enqueue recv_tcb, continue on current_tcb
-   h. Current thread blocks (if not switched): state = BlockedOnReply
+   g. enqueue_and_wake(recv_tcb) on its selected CPU
+   h. Current thread (committed BlockedOnReply under the endpoint lock)
+      calls the scheduler
 
 5. else (endpoint.state == Idle or SendWait):
    // Slow path: no receiver yet
    a. Enqueue current_tcb in endpoint.send_queue
    b. endpoint.state = SendWait
-   c. Store message in current_tcb.pending_send (on-stack or in-TCB buffer)
+   c. Store the message in current_tcb.ipc_msg
    d. Release endpoint lock
    e. Block current thread: state = BlockedOnSend, call scheduler
 ```
@@ -122,8 +121,9 @@ syscall on either side. Nothing is allocated on the path.
    // Fast path: a sender is waiting
    a. sender_tcb = endpoint.send_queue.dequeue()
    b. if send_queue is now empty: endpoint.state = Idle
-   c. Copy message from sender_tcb.pending_send (registers + the sender's
-      buffered data words) into the server's trap frame and IPC buffer page
+   c. Copy the staged message from sender_tcb.ipc_msg (label/counts plus the
+      data words read at call time) into the server's trap frame and IPC
+      buffer page
    d. Transfer capability slots
    e. Publish the caller binding (the server's reply capability):
       current_tcb.reply_tcb = sender_tcb (Release store)
@@ -144,20 +144,23 @@ syscall on either side. Nothing is allocated on the path.
 `SYS_IPC_REPLY` execution on the server's thread:
 
 ```
-1. caller_tcb = current_tcb.reply_tcb (Acquire load)
+1. Peek caller_tcb = current_tcb.reply_tcb (Acquire load)
    (the reply capability is this caller binding, a per-thread field outside
-   the CSpace; null means no pending reply → InvalidCapability)
-2. Read the data words and pre-validate the reply cap slots; on failure,
-   swap current_tcb.reply_tcb to null and, if it held a caller, wake that
-   caller with the IPC_REPLY_TRANSFER_FAILED label
+   the CSpace)
+2. Unless caller_tcb is BlockedOnFault (a fault reply, whose data words and
+   caps the kernel ignores): read the data words and pre-validate the reply
+   cap slots; on failure, swap current_tcb.reply_tcb to null and, if it held
+   a caller, wake that caller with the IPC_REPLY_TRANSFER_FAILED label
 3. Claim and clear the binding: CAS current_tcb.reply_tcb from caller_tcb
-   to null; a lost CAS means a concurrent canceller owns the caller's wake
+   to null; a lost CAS means a concurrent canceller owns the caller's wake;
+   a null binding or a lost CAS → InvalidCapability
 4. Stage the reply in caller_tcb.ipc_msg: label/count for the caller's
    return registers, data words for the caller to write to its own IPC
    buffer page when it resumes
-5. Transfer reply capability slots
-6. Mark caller_tcb as Ready; enqueue
-7. If caller_tcb.priority > current_tcb.priority: direct switch
+5. If caller_tcb is BlockedOnFault: skip step 6, record RESUME/KILL from
+   the label in caller_tcb.fault_outcome, stamp the episode, and go to step 7
+6. Transfer reply capability slots; stamp REPLY
+7. enqueue_and_wake(caller_tcb) on its selected CPU; return to the server
 ```
 
 ### Park Dispositions and Episodes
@@ -237,19 +240,13 @@ exactly the cancelled ones. The pre-#363 trap-frame `Interrupted` pokes are
 gone: every resume rewrites the return registers, so a poke never survived —
 the disposition is the only cancellation channel.
 
-### Direct Thread Switch (Fast Path Optimization)
+### Waking the Recipient
 
-When a synchronous IPC completes and the recipient has higher priority than the
-sender, the kernel performs a direct context switch to the recipient rather than
-going through the run queue. This eliminates a round-trip through the scheduler
-and is the primary mechanism that keeps synchronous IPC latency low.
-
-The direct switch is only valid when:
-- The recipient is on the same CPU (or will be scheduled there — determined by
-  affinity)
-- The IPC completes atomically (while the endpoint lock is held, preventing
-  concurrent modification)
-- The resulting switch is to a higher-priority thread (otherwise, queue normally)
+The kernel performs no direct thread switch on IPC. Every rendezvous and reply
+wakes the recipient through `enqueue_and_wake` on the CPU `select_target_cpu`
+chooses, after the endpoint lock is released; the run queue decides when it
+runs. The call path then parks the caller through `schedule`; the reply path
+returns to the server.
 
 ---
 
@@ -638,15 +635,14 @@ atomic instruction in the no-waiter case.
 
 ## IPC Scheduling Interaction
 
-The direct thread switch on synchronous IPC (described in the Endpoint section) is
-the primary scheduling interaction. The scheduler itself does not need to know about
-IPC — the IPC path directly manipulates TCB state and, when appropriate, calls the
-low-level context switch primitive.
+The IPC paths interact with the scheduler only through its park and wake
+primitives (`commit_blocked_under_local_lock`, `enqueue_and_wake`, `schedule`; see
+§ Waking the Recipient). The scheduler itself does not need to know about IPC.
 
 The scheduler's preemption timer does not interrupt the IPC fast path. Syscall entry
 masks interrupts, and every IPC object lock is an IRQ-disabling
 `crate::sync::Spinlock`, so the endpoint-lock critical section that performs the
-send/receive/switch runs with interrupts disabled. A timer interrupt that arrives
+send/receive runs with interrupts disabled. A timer interrupt that arrives
 meanwhile stays pending for the rest of that critical section. Syscall context
 re-enables interrupts only in preempt-disabled windows, or when the CPU returns to
 userspace or switches to the next thread, so the tick never preempts the IPC path;

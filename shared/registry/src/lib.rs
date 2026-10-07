@@ -7,8 +7,8 @@
 //!
 //! Each supervisor (svcmgr today) holds a [`Registry`] that maps
 //! short byte-string names to capability-slot indices in its own `CSpace`. Callers
-//! query via `QUERY_ENDPOINT`; the supervisor's handler resolves the name with
-//! [`Registry::lookup`] and replies with a SEND cap derived from the registered slot.
+//! query via `QUERY_ENDPOINT` (reply semantics: `services/svcmgr/docs/ipc-interface.md`
+//! § Label 4); the supervisor resolves the name with [`Registry::lookup`].
 //!
 //! Storage is statically sized (`N` entries, `NAME_MAX`-byte names) and the crate
 //! needs no allocator. A full bytewise match is

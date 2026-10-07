@@ -58,6 +58,8 @@ on RISC-V); its SchedControl band arrives from procmgr via `ProcessInfo`.
 Init exits after bootstrap; devmgr is `restart = never`, `critical = yes`,
 so its death triggers a graceful shutdown rather than re-delegation. The
 per-round list of what init delivers is specified in
+[`services/devmgr/docs/responsibilities.md`](../services/devmgr/docs/responsibilities.md)
+§ Capabilities Received; init's side of the transfer is summarized in
 [`services/init/docs/bootstrap.md`](../services/init/docs/bootstrap.md) §
 Per-stage authority transfers.
 

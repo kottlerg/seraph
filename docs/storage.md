@@ -34,7 +34,10 @@ Four system-scope invariants govern the stack:
   block driver serves only badged callers: vfsd holds a
   `MOUNT_AUTHORITY`-badged whole-disk cap minted by devmgr, and fs
   drivers hold partition-identity-badged caps the block driver mints
-  on `REGISTER_PARTITION`; unbadged callers are rejected.
+  on `REGISTER_PARTITION`; unbadged callers are rejected. vfsd as the
+  sole holder of the whole-disk cap is design intent; not yet
+  implemented: devmgr mints it on `QUERY_BLOCK_DEVICE` for any caller
+  whose registry cap carries `REGISTRY_QUERY_AUTHORITY` (#446).
   Out-of-bounds LBAs are rejected by the block driver on every
   request. See
   [`services/drivers/virtio/blk/README.md`](../services/drivers/virtio/blk/README.md).
@@ -81,9 +84,12 @@ Distribution". Badge semantics, derivation, and revocation are owned by
 
 `REGISTER_PARTITION` is rejected unless the caller's badge carries
 `MOUNT_AUTHORITY`: only the holder of the devmgr-minted whole-disk cap
-(vfsd) can mint a partition binding. The
-block driver enforces the LBA bound on every read and write against
-the caller's badge. See
+can mint a partition binding. That vfsd is the only such holder is
+design intent; not yet implemented: devmgr mints the whole-disk cap on
+`QUERY_BLOCK_DEVICE` for any caller whose registry cap carries
+`REGISTRY_QUERY_AUTHORITY`, including vfsd's (#446). The block driver
+enforces the LBA bound on every read and write against the caller's
+badge. See
 [`services/drivers/virtio/blk/README.md`](../services/drivers/virtio/blk/README.md).
 
 ---
@@ -160,8 +166,8 @@ captures the driver's root cap into the synthetic root (see
 It then auto-mounts the ESP at `/esp` and the data partition at
 `/data`. All three run before any service thread serves a request, so
 `GET_SYSTEM_ROOT_CAP` never observes an unmounted root. The runtime
-`MOUNT` label carries a `MountRole` byte (`Root` or `Data` today; other values are
-reserved for explicit and foreign-GUID mounts) and shares this resolution path.
+`MOUNT` label carries a `MountRole` byte (`Root` or `Data`; any other
+byte is rejected) and shares this resolution path.
 
 **fs driver** runs as a separate process. After `FS_MOUNT` succeeds,
 it serves the cap-native `NS_*` protocol plus the surviving
@@ -191,7 +197,8 @@ The contract between fs drivers and the block driver has three
 elements:
 
 - **Two-tier endpoint.** Whole-disk `MOUNT_AUTHORITY`-badged (vfsd
-  only) versus per-partition badged (fs drivers); unbadged callers
+  only: design intent; not yet implemented, #446) versus
+  per-partition badged (fs drivers); unbadged callers
   are rejected. The block driver distinguishes by the
   kernel-supplied caller badge.
 - **Partition-scoped LBA.** Reads and writes carry an LBA relative

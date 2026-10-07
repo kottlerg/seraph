@@ -99,12 +99,13 @@ sysroot/
 │   ├── drivers/              # device drivers (virtio-blk, virtio-input,
 │   │                         # serial, framebuffer, cmos-rtc | goldfish-rtc)
 │   └── fs/                   # filesystem drivers (fatfs)
-├── programs/                 # production and interactive program binaries
+├── programs/                 # program binaries and the test fixtures the
+│                             # harnesses spawn
 │   ├── hello
 │   ├── stdiotest
 │   └── …
-└── tests/                    # every test artifact (deletion criterion
-    │                         # for a non-test distro shape)
+└── tests/                    # test harnesses, per-program testers, and
+    │                         # harness-only fixtures
     ├── ktest                 # kernel-surface harness (bootloader-loaded)
     ├── svctest               # services-surface harness
     ├── usertest              # programs-surface orchestrator
@@ -115,12 +116,18 @@ sysroot/
         └── …
 ```
 
-`/services/`, `/programs/` MUST NOT contain test harnesses or per-program
-testers — all test artifacts live under `/tests/` so a non-test distro
-build amounts to dropping `/tests/`. The one exception is
-[`test-orphan`](../services/drivers/test-orphan/README.md), a test-only fault-injection driver
-installed under `/services/drivers/` until the devmgr enumeration redesign
-([#165](https://github.com/kottlerg/seraph/issues/165)) removes it.
+`/services/` and `/programs/` MUST NOT contain test harnesses or per-program
+testers; those live under `/tests/`. Dropping `/tests/` does not by itself
+give a non-test distro, because two kinds of test-only artifact install
+outside it. One is [`test-orphan`](../services/drivers/test-orphan/README.md),
+a test-only fault-injection driver installed under `/services/drivers/`
+until the devmgr enumeration redesign
+([#165](https://github.com/kottlerg/seraph/issues/165)) removes it. The
+other is the test fixtures the harnesses spawn, installed under
+`/programs/`: `capexhaust`, `demandpaged`, `pipefault`, `relrofault`, and
+`stackoverflow`, which `svctest` phases spawn, and `stdiotest`,
+`pipestress`, `threadchurn`, and `threadstack`, which their `usertest`
+testers drive.
 
 ---
 

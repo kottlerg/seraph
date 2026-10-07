@@ -242,13 +242,18 @@ death-auth source — see
 
 Because these slots are svcmgr-minted, `seed` and `provides` have no
 position in the round; declaring either alongside `log_sink = yes` is a
-parser error. The same svcmgr-minted round drives both the first launch
-(`cap[1]` present, history pulled from init-logd per the
-[logd handover protocol](../../logd/docs/handover-protocol.md)) and every restart
-(`cap[1] = 0`, history pull skipped) — svcmgr holds the master-log source
-for the system's life, so each (re)launched logd re-attaches a fresh RECV
-to the same endpoint object every sender already targets. `restart` and
-`critical` behave exactly as for any other service.
+parser error. The same svcmgr-minted round drives the first launch (`cap[1]`
+present, history pulled from init-logd per the
+[logd handover protocol](../../logd/docs/handover-protocol.md)). svcmgr holds
+the master-log source for the system's life, so the round is designed to also
+drive every restart (`cap[1] = 0`, history pull skipped), each relaunched logd
+re-attaching a fresh RECV to the same endpoint object every sender already
+targets, with `restart` and `critical` behaving as for any other service;
+design intent; not yet implemented (#262). Today, on a logd death svcmgr's
+death handler blocks in `log!` on the master-log endpoint with no logd
+receiving, so it reaches neither the restart nor the critical
+graceful-shutdown path (per
+[restart-protocol.md](restart-protocol.md#supervision-hierarchy)).
 
 ```
 binary    = /services/logd

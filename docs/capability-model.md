@@ -371,6 +371,13 @@ field it can trust: the value cannot be lied about on the receive path, cannot b
 changed after the fact, and is locked to whichever derivation chain the cap belongs
 to.
 
+Kernel-synthesized fault messages are the exception. Their badge is the value the binder
+passes to `SYS_THREAD_SET_FAULT_HANDLER`, not the derivation badge of any cap, and any holder
+of a cap to the endpoint can bind its own thread with an arbitrary badge. Neither the
+guarantee above nor the [verb-bit rule](#verb-bit-authority-pattern) below applies to a fault
+message's badge; see [fault-handling.md § Security](fault-handling.md#security) and
+[#459](https://github.com/kottlerg/seraph/issues/459).
+
 ### What the kernel does NOT guarantee
 
 The kernel does NOT restrict which badge *value* a caller chooses when attaching a

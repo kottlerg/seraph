@@ -23,12 +23,15 @@
 //! caller's TCB. Full derivation-tree reply caps are deferred to a future phase.
 //!
 //! ## Thread safety
-//! Each operation takes `EndpointState::lock` (`ep.lock`) itself; it serialises
-//! the send/recv queues and the call/recv rendezvous across CPUs. A server's
-//! `reply_tcb` binding is claimed by compare-exchange, so reply, cancel and
-//! teardown race to consume it exactly once. Callers MUST NOT hold a scheduler
-//! lock on entry: the wake path acquires the per-TCB `sched_lock`, which is not
-//! reentrant.
+//! `endpoint_call` and `endpoint_recv` take `EndpointState::lock` (`ep.lock`)
+//! themselves; it serialises the send/recv queues and the call/recv rendezvous.
+//! `endpoint_reply` takes no lock and serialises through the `reply_tcb` claim.
+//! `unlink_from_wait_queue` requires the caller to hold the owning endpoint's
+//! `ep.lock`. Callers enter with no scheduler lock held (lock order:
+//! docs/scheduling-internals.md § Lock Hierarchy). A server's `reply_tcb` is
+//! claimed by compare-exchange (`endpoint_reply`, cancel, teardown) or by an
+//! atomic swap (the `SYS_IPC_REPLY` failure path); the claim protocol is in
+//! docs/scheduling-internals.md § Cross-CPU TCB Ownership.
 
 use super::message::Message;
 use crate::sched::thread::{IpcThreadState, ThreadControlBlock, ThreadState};

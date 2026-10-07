@@ -22,12 +22,12 @@ bootloader *builds*, described in later sections — is:
   the chosen slide ([boot-flow.md](boot-flow.md#step-5d-apply-the-kaslr-slide)),
   so the mapped image is internally consistent.
 - An identity map, read-write and non-executable, covers the `BootInfo` page, the
-  boot-module array page, the memory-map buffer, the `MmioAperture` array page, the
-  reclaim-range array page, the handoff stack, the `InitImage` segments, the kernel
-  segments' physical frames, the kernel ELF file buffer, the bundle blob (every boot
-  module body), the framebuffer when present, and the UART MMIO page on RISC-V, so the
-  kernel can read them using physical addresses before its own direct-physical map is
-  established.
+  boot-module array page, the translated `MemoryMapEntry` array (`BootInfo.memory_map`),
+  the `MmioAperture` array page, the reclaim-range array page, the handoff stack, the
+  `InitImage` segments, the kernel segments' physical frames, the kernel ELF file buffer,
+  the bundle blob (every boot module body), the framebuffer when present, and the UART
+  MMIO page on RISC-V, so the kernel can read them using physical addresses before its
+  own direct-physical map is established.
 - The handoff trampoline's page or pages are identity-mapped read-execute, so execution
   continues across the root-table switch.
 - Nothing else is mapped; an access outside these ranges faults. The ACPI RSDP and the
@@ -249,11 +249,10 @@ continued execution are present before `satp` is written. See
 [`boot/src/arch/riscv64/paging.rs`](../src/arch/riscv64/paging.rs) for
 the asm and the full SAFETY justification.
 
-ASID 0 is used for the bootloader's tables. The kernel keeps ASID 0 for its own root
-(per the kernel entry state in [kernel-handoff.md](kernel-handoff.md)): in
+ASID 0 is used for the bootloader's tables. The kernel keeps ASID 0 for its own root: in
 [Phase 3](../../kernel/docs/initialization.md#phase-3-kernel-page-tables) its untagged
-`activate` writes `satp` with ASID 0. Once it enables ASID tagging, it assigns each
-address space an ASID on its first tagged activation (see
+`activate` writes `satp` with ASID 0, as every untagged switch does. Once it enables ASID
+tagging, it assigns each address space an ASID on its first tagged activation (see
 [Context Switch TLB Handling](../../kernel/docs/memory-internals.md#context-switch-tlb-handling)
 and [TLB Management](../../../docs/memory-model.md#tlb-management)).
 
@@ -297,4 +296,5 @@ through the standard `CapDescriptor` path rather than being orphaned as
 [Kernel Initialization Sequence](../../kernel/docs/initialization.md),
 [Memory Subsystem Internals](../../kernel/docs/memory-internals.md),
 [Memory Model](../../../docs/memory-model.md),
-[Platform Requirements](../../../docs/platform-requirements.md)
+[Platform Requirements](../../../docs/platform-requirements.md),
+[xtask/README.md](../../../xtask/README.md)

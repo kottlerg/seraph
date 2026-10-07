@@ -181,8 +181,9 @@ knobs live in `KtestConfig::DEFAULT` in [`src/cmdline.rs`](src/cmdline.rs) and a
 compile time. To flip them, edit the constant, rebuild ktest
 (`cargo xtask build --component ktest`), then re-compose the bundle
 (`cargo xtask compose-bundle --harness ktest`, per [§ Activating ktest](#activating-ktest))
-before `cargo xtask run`; a single-component build does not re-compose the bundle, so the
-previous ktest binary boots until it is re-composed.
+before `cargo xtask run`; a single-component build does not re-compose the bundle, so whatever
+bundle was last composed (the previous ktest binary, or default init after a full build) boots
+until it is re-composed.
 
 | Field | Values | Default | Description |
 |---|---|---|---|

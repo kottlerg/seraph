@@ -51,13 +51,11 @@ use syscall_abi::{MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
 //     DEVMGR_LABELS_VERSION — devmgr_labels::QUERY_BLOCK_DEVICE (vfsd ↔ devmgr)
 //     MEMMGR_LABELS_VERSION — memmgr_labels::REGISTER_PROCESS   (procmgr ↔ memmgr)
 //     SVCMGR_LABELS_VERSION — svcmgr handover endowment round 1   (init ↔ svcmgr)
-//     LOG_LABELS_VERSION    — log_labels::GET_LOG_CAP            (std process ↔ logd)
 //
 //   Implicitly covered by parent-channel handshake — the channel was opened
 //   against a cap-badge first minted by a handshake-checked namespace; the
 //   badge's presence is the version stamp, zero per-message cost.
 //     NS_LABELS_VERSION     — caps from vfsd_labels / fs_labels handshakes
-//     STREAM_LABELS_VERSION — caps from log_labels handshake
 //
 //   Marker-only — no clean parent-channel handshake exists; per-message
 //   inlining would conflict with existing label-bit usage or cost wire bytes
@@ -73,6 +71,10 @@ use syscall_abi::{MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
 //     SERIAL_LABELS_VERSION
 //     FB_LABELS_VERSION
 //     INPUT_LABELS_VERSION
+//     LOG_LABELS_VERSION    — log_labels::GET_LOG_CAP carries it, but no
+//                             caller issues that handshake
+//     STREAM_LABELS_VERSION — stream caps arrive pre-installed in
+//                             ProcessInfo.log_send_cap, not via a handshake
 
 pub const PROCMGR_LABELS_VERSION: u32 = 3;
 /// IPC labels for the process manager (`procmgr`).
@@ -488,8 +490,12 @@ pub mod memmgr_labels
     /// Permanently transfer a batch of Memory caps into memmgr's pool.
     ///
     /// The caller is procmgr's init reap, which hands over init's reclaimed
-    /// boot memory (ELF segments, `InitInfo`, stack, boot-module ELF
-    /// sources). memmgr accepts the label from any badged client today and
+    /// memory: the usable-RAM caps that did not fit memmgr's bootstrap round,
+    /// the free remainders `MemoryAlloc` abandoned, ELF segments, `InitInfo`,
+    /// stack, the bootloader/bundle reclaim ranges, the AP-trampoline frame,
+    /// and boot-module ELF sources (see `services/memmgr/docs/ipc-interface.md`
+    /// "Label 5: `DONATE_MEMORY_CAPS`" and `docs/process-lifecycle.md`
+    /// "Init reap"). memmgr accepts the label from any badged client today and
     /// does not check a donated cap's provenance; gating it to procmgr is
     /// tracked in #459.
     ///
@@ -1168,9 +1174,24 @@ pub mod fs_labels
     /// (`PAGE_SIZE - memory_data_offset`); callers iterate forward from
     /// `offset + bytes_valid` to read past those boundaries.
     pub const FS_READ_MEMORY: u64 = 7;
-    /// Filesystem-driver request to a client to release a previously-returned
-    /// page. Sent on the per-file release endpoint cap. Badge identifies the
-    /// file; `data[0]` = the release cookie naming the Memory cap to unmap.
+    /// Release of a previously-returned page, in either direction.
+    ///
+    /// Driver-to-client (cooperative eviction): sent on the per-process
+    /// release endpoint cap the client transferred on its first
+    /// [`FS_READ_MEMORY`]; `data[0]` = the release cookie naming the Memory
+    /// cap to unmap. The client unmaps it and replies [`FS_RELEASE_ACK`];
+    /// without an ack inside the watchdog window the driver hard-revokes.
+    ///
+    /// Client-to-driver (synchronous release after a read): sent on the
+    /// per-node badged cap the page was read through; `data[0]` = the
+    /// release cookie from the [`FS_READ_MEMORY`] reply. The driver revokes
+    /// the page's derived caps and frees its cache slot. Reply: empty body
+    /// on success (an unmatched cookie is a no-op success);
+    /// `fs_errors::PERMISSION_DENIED` when the badge carries no namespace
+    /// rights.
+    ///
+    /// See `services/fs/docs/fs-driver-protocol.md` "Label 8:
+    /// `FS_RELEASE_MEMORY`" for the authoritative contract.
     pub const FS_RELEASE_MEMORY: u64 = 8;
     /// Client acknowledgement of [`FS_RELEASE_MEMORY`]: synchronous reply,
     /// empty body.

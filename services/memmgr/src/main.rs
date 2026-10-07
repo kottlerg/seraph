@@ -1410,8 +1410,11 @@ fn handle_process_died(req: &IpcMessage, ipc_buf: *mut u64, procmgr_badge: u64)
 fn handle_donate_memory_caps(req: &IpcMessage, ipc_buf: *mut u64)
 {
     // Caller (procmgr's init reap) is permanently transferring reclaimed
-    // Memory caps (init's ELF segments, InitInfo, stack, boot-module ELF
-    // sources, reclaim scratch, AP trampoline) into memmgr's pool. Each
+    // Memory caps into memmgr's pool: the usable-RAM caps that did not fit
+    // memmgr's bootstrap round, the free remainders `MemoryAlloc` abandoned,
+    // init's ELF segments, InitInfo, stack, the bootloader/bundle reclaim
+    // ranges, the AP-trampoline frame, and boot-module ELF sources (see
+    // `services/memmgr/docs/ipc-interface.md` § Label 5). Each
     // donated cap must carry the full pool-frame rights ([`POOL_FRAME_RIGHTS`])
     // so memmgr can derive the R / RW / RX inner a demand fault or
     // REQUEST_MEMORY_CAPS consumer needs and retype on their behalf.

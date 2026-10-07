@@ -198,9 +198,11 @@ protocol.
 
 The syscall dispatch layer. Architecture-specific entry glue (in `arch/*/syscall.rs`)
 calls into this module's dispatch table, which routes to the appropriate subsystem
-implementation. See [`docs/syscalls.md`](docs/syscalls.md). The audit confirming no
-cross-boundary output (syscall, IPC, fault, exit) leaks a kernel virtual address is
-in [`docs/cross-boundary-disclosure.md`](docs/cross-boundary-disclosure.md).
+implementation. See [`docs/syscalls.md`](docs/syscalls.md). The audit classifying
+every cross-boundary output (syscall, IPC, fault, exit) for kernel-virtual-address
+disclosure is in [`docs/cross-boundary-disclosure.md`](docs/cross-boundary-disclosure.md);
+it records one open kernel-VA disclosure, the x86-64 fault-message `d2` present bit
+([#443](https://github.com/kottlerg/seraph/issues/443)).
 
 ---
 

@@ -166,8 +166,8 @@ protocol is in
 
 ## Implementation order
 
-ruststd is implemented before [`libc/`](../libc/README.md) (design intent; not yet
-implemented). Native Rust `std` does not go through libc; it maps directly onto Seraph
+ruststd is implemented before [`libc/`](../libc/README.md), which is design intent and not
+yet implemented. Native Rust `std` does not go through libc; it maps directly onto Seraph
 primitives.
 
 ---

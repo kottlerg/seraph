@@ -1245,9 +1245,11 @@ pub fn sys_notification_send(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 ///        are delivered *or* `timeout_ms` milliseconds have elapsed.
 ///
 /// On success returns `0` in rax/a0 and the bitmask in the secondary return
-/// register (rdx/a1). On timeout returns `0` in both registers — unambiguous
-/// because `notification_send` rejects zero-bit sends, so a legitimate wake always
-/// carries non-zero bits. The split is required because the bitmask is an
+/// register (rdx/a1). A notification wake always carries non-zero bits because
+/// `notification_send` rejects zero-bit sends. A `0` bitmask with a `0` status
+/// means the timeout elapsed, or the notification was destroyed while the caller
+/// was parked (no `Interrupted` stamp, even with `timeout_ms` = `0`; #443).
+/// The split is required because the bitmask is an
 /// unrestricted `u64`: an in-band encoding via `cast_signed` would alias
 /// bit-63-set payloads with the dispatcher's negative-Err codes. Same
 /// register layout as `sys_event_recv`; see that handler for the broader

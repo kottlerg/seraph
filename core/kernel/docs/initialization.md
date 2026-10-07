@@ -485,6 +485,15 @@ calls `sched::enter()`.
         adds it to the physical frame address at translation time
       - Apply permissions from segment.flags (Read → RO, ReadWrite → RW,
         ReadExecute → RX); W^X is enforced (ReadWrite cannot also be executable)
+   b. Mint the AddressSpace cap (MAP | READ) for init's address space into
+      the root CSpace, then a reclaimable Memory cap per init segment
+      (page-aligned base and size, full rights, `owns_memory = true`, the
+      range added to the buddy ledger by `register_owned_range`) so init can
+      donate the frames to memmgr on reap
+   c. Fill the InitInfo region (InitInfo header, CapDescriptor array) in the
+      contiguous block reserved in Phase 7, map it read-only at the chosen
+      InitInfo VA (`choose_init_layout().init_info_va`), and mint a
+      reclaimable Memory cap per mapped InitInfo page into the root CSpace
 4. Map init's user stack (inlined in `kernel_entry`):
    a. Take the INIT_STACK_PAGES (4) frames reserved from the buddy in
       Phase 7, before the user-cap drain, one at a time so each phys
@@ -504,7 +513,10 @@ calls `sched::enter()`.
       saved_state.rip (x86-64) or .ra (RISC-V) and the InitInfo VA as the arg
       forwarded to init's a0/rdi on first entry
    c. Priority: INIT_PRIORITY (30)
-   d. cspace: set to ROOT_CSPACE raw pointer (handed off at `sched::enter()` start)
+   d. Mint the Thread cap (CONTROL) for init's thread into the root CSpace
+   e. Mint the CSpace cap (INSERT | DELETE | DERIVE) for the root CSpace into
+      itself, then patch both slots into InitInfo
+   f. cspace: set to ROOT_CSPACE raw pointer (handed off at `sched::enter()` start)
 6. Enqueue the init TCB on the BSP's run queue at INIT_PRIORITY
 7. Call sched::enter() — does not return:
    a. Dequeue the highest-priority ready thread (init)
@@ -521,18 +533,20 @@ The PIE bias window, relocation rules, and init stack placement are defined in
 [userspace-memory-model.md](../../../docs/userspace-memory-model.md) § Image Placement and
 § Bootstrap Cross-Boundary VAs; the kernel-half root entries and W^X rule in
 [memory-model.md](../../../docs/memory-model.md) § Virtual Address Space Layout and § Paging;
-the reap-time donation of the stack pages in
+the reap-time donation of the segment, InitInfo, and stack pages in
 [process-lifecycle.md § Init reap](../../../docs/process-lifecycle.md#init-reap).
 
 **Implementation notes:**
-- CSpace hand-off (step 5d): `sched::enter()` calls `set_current(init_tcb)` so
+- CSpace hand-off (step 5f): `sched::enter()` calls `set_current(init_tcb)` so
   `current_tcb()` returns the init TCB during init's syscalls; init receives
   ROOT_CSPACE.
 - The x86-64 `switch_and_enter_user` function atomically switches the stack pointer
   BEFORE writing CR3. This is required because the boot stack is identity-mapped in
   PML4 entries 0–255 (the lower half), which are not copied into init's page tables.
   Any function call/return on the boot stack after the CR3 write would page-fault.
-- Init segment frames are NOT reclaimed — they remain mapped in init's address space.
+- Init segment frames stay mapped in init's address space; their reclaimable Memory
+  caps (step 3b) are donated at reap
+  ([process-lifecycle.md § Init reap](../../../docs/process-lifecycle.md#init-reap)).
 
 **Failure mode:** Allocation failure halts with a diagnostic message identifying the
 failed step. Invalid init_image (zero segment_count or zero entry_point) halts with
@@ -591,6 +605,7 @@ that CPU only; the BSP and other CPUs continue.
 [Kernel Handoff Contract](../../boot/docs/kernel-handoff.md),
 [Memory Map Translation](../../boot/docs/memory-map.md),
 [Page Tables](../../boot/docs/page-tables.md), [core/kernel/README.md](../README.md),
+[Capability Subsystem Internals](capability-internals.md),
 [Kernel Cross-Boundary Disclosure Inventory](cross-boundary-disclosure.md),
 [Kernel Entropy Subsystem](entropy.md), [Memory Subsystem Internals](memory-internals.md),
 [SMP Scheduling and Locking Invariants](scheduling-internals.md),

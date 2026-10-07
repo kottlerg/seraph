@@ -77,16 +77,20 @@ direct console paths remain as fallbacks for the life of the system.
    UART hardware authority is held only by init, whose init-logd thread uses it, and by
    devmgr, whose root I/O-port and MMIO authority it carves the driver's cap from.
 
-   real-logd is restartable (`restart = on_failure`; see
-   [services/logd/README.md](../services/logd/README.md)). svcmgr holds the
-   master-log endpoint source for the system's life, so a restarted logd
-   re-attaches a fresh RECV to the same endpoint object every sender already
-   targets; the log senders are uninterrupted across the restart and need no
-   re-derivation of their `log_send_cap`. A restarted logd re-resolves the
-   serial driver via `QUERY_SERIAL_DEVICE` and resumes serial-mediated output.
-   While logd is down, a sender's `STREAM_BYTES` queues at the kernel endpoint
-   until the restarted logd drains it; the kernel panic console remains the
-   guaranteed output path for any fault in that window.
+   real-logd is declared restartable (`restart = on_failure`; see
+   [services/logd/README.md](../services/logd/README.md)); a working logd restart is design
+   intent; not yet implemented ([#262](https://github.com/kottlerg/seraph/issues/262)). In the
+   intended model, svcmgr holds the master-log endpoint source for the system's life, so a
+   restarted logd re-attaches a fresh RECV to the same endpoint object every sender already
+   targets; the log senders are uninterrupted across the restart and need no re-derivation of
+   their `log_send_cap`. A restarted logd re-resolves the serial driver via `QUERY_SERIAL_DEVICE`
+   and resumes serial-mediated output. While logd is down, a sender's `STREAM_BYTES` queues at
+   the kernel endpoint until the restarted logd drains it; the kernel panic console remains the
+   guaranteed output path for any fault in that window. Today svcmgr's death handler blocks on
+   its own `log!` calls to the master-log endpoint before it respawns logd, so the restart never
+   happens, and procmgr rejects a restarted logd's `REGISTER_DEATH_EQ` (first-wins), per
+   [svcmgr restart protocol](../services/svcmgr/docs/restart-protocol.md) § Supervision
+   hierarchy.
 
 5. **Framebuffer-driver-mediated path** — once devmgr has spawned the
    framebuffer driver (`services/drivers/framebuffer/`), userspace
@@ -155,8 +159,10 @@ primitives, no input. The driver's IPC contract is specified in
 ## Why the direct paths remain
 
 The kernel panic console (UART) and the kernel framebuffer renderer bypass the serial and
-framebuffer drivers for the life of the system: a panic must still produce output, and it cannot
-depend on the IPC machinery that the drivers require. The bootloader console (UART and
+framebuffer drivers for the life of the system, and neither can depend on the IPC machinery
+that the drivers require. The UART path is kept so a panic can still produce output; the
+framebuffer renderer is kept so the mirrored `kprintln!` console and the fatal
+`KERNEL EXCEPTION` dumps reach the screen. The bootloader console (UART and
 framebuffer) and init-logd's direct-UART path are fixed parts of the boot design that bypass the
 drivers only within their windows, which end at the kernel handoff and the real-logd handover
 respectively; they carry output before the drivers are reachable. All of these paths share the

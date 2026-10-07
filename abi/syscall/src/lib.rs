@@ -263,9 +263,10 @@ pub const SYS_CAP_DELETE: u64 = 31;
 /// arg1 = Endpoint cap index, or `0` to **unbind**. Must refer to an
 ///        `Endpoint`. The binding takes a reference on the endpoint object
 ///        for its lifetime.
-/// arg2 = `badge` — caller-chosen value delivered as the fault message badge,
-///        identifying the faulting thread/process to the handler. Opaque to
-///        the kernel.
+/// arg2 = `badge` — caller-chosen value delivered as the fault message badge.
+///        It identifies the faulting thread/process only to a handler whose
+///        endpoint no other binder can reach (see [`FAULT_LABEL`] and
+///        `docs/fault-handling.md` § Security). Opaque to the kernel.
 /// arg3 = `fault_class_mask` — selects which fault classes this handler
 ///        covers. v1 accepts only [`FAULT_CLASS_ALL`]; the argument reserves
 ///        the encoding for future per-class handlers without a new syscall.
@@ -900,7 +901,9 @@ pub const FAULT_ACCESS_WRITE: u64 = 1 << 1;
 /// `FAULT_KIND_VM` access flag: the access was an instruction fetch.
 pub const FAULT_ACCESS_EXEC: u64 = 1 << 2;
 /// `FAULT_KIND_VM` access flag: the page was present (protection violation)
-/// rather than not-present.
+/// rather than not-present. Set only on x86-64; on RISC-V it is always clear
+/// because `scause` does not encode presence, so a handler there must not read
+/// a clear bit as not-present (it inspects its own mappings instead).
 pub const FAULT_ACCESS_PRESENT: u64 = 1 << 3;
 
 // ── Normalized exception codes (FAULT_KIND_EXCEPTION data word 1) ───────────────

@@ -154,8 +154,11 @@ fn bootstrap_caps(creator_ep: u32, ipc_buffer: *mut u8) -> (u32, u32, usize)
 
 /// Liveness probe: call `QUERY_ENDPOINT` on the svcmgr cap for a name that
 /// does not exist. A successful round-trip (any reply, including
-/// `UNKNOWN_NAME`) proves the cap is live. A crash here would indicate the
-/// seed cap was not re-injected after restart.
+/// `UNKNOWN_NAME`) proves the cap is live. A dead or stale seed makes
+/// `ipc_call` return `Err`, which is logged without the `FATAL:` prefix, so
+/// the `run-parallel` fail regex does not catch a seed that was not
+/// re-injected live after restart. TODO(#438): log the failed round-trip as
+/// `FATAL:`; deferred by maintainer decision to the work #438 tracks.
 fn probe_svcmgr(svcmgr_cap: u32, ipc_buffer: *mut u8)
 {
     // cast_ptr_alignment: IPC buffer is page-aligned (4 KiB), satisfying u64 alignment.

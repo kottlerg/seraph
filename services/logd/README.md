@@ -10,12 +10,13 @@ been draining since boot, ingests init-logd's captured history (see
 [`docs/handover-protocol.md`](docs/handover-protocol.md)), subscribes to
 procmgr's death-notification cascade, and from then on is the single owner
 of every log line emitted by every userspace process.
-It is restartable (`restart = on_failure`): svcmgr holds the master-log
-endpoint source for the system's life, so a restarted logd re-attaches a
-fresh RECV to the same endpoint object every sender already targets; only
-the one-time init-logd history pull
-([`docs/handover-protocol.md`](docs/handover-protocol.md)) is skipped on
-restart.
+It is declared restartable (`restart = on_failure`); a working restart is design
+intent; not yet implemented ([#262](https://github.com/kottlerg/seraph/issues/262); see
+[`services/svcmgr/docs/restart-protocol.md`](../svcmgr/docs/restart-protocol.md)). In the
+intended model, svcmgr holds the master-log endpoint source for the system's life, so a
+restarted logd re-attaches a fresh RECV to the same endpoint object every sender already
+targets; only the one-time init-logd history pull
+([`docs/handover-protocol.md`](docs/handover-protocol.md)) is skipped on restart.
 
 ## Role
 

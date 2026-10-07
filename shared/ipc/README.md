@@ -32,11 +32,13 @@ is bumped, per the version rule in docs/conventions.md §
 [ABI / wire-protocol versions](../../docs/conventions.md#abi--wire-protocol-versions), on any
 breaking change: a label added, removed, or repurposed, or a payload shape changed. The
 constants fall into three categories. Handshake-checked namespaces carry the version in their
-first-contact handshake, and the receiver rejects a mismatch. Implicitly covered namespaces
-(`ns_labels`, `stream_labels`) run over a channel opened against a cap badge minted by a
-handshake-checked namespace, so the badge stands in for the version check. The remaining
-constants are markers that exist for the bump discipline. The block comment above the label
-modules in `src/lib.rs` lists which namespace falls in which category.
+first-contact handshake, and the receiver rejects a mismatch. Only `ns_labels` is implicitly
+covered: its caps descend from the `vfsd_labels::GET_SYSTEM_ROOT_CAP` and `fs_labels::FS_MOUNT`
+handshakes, so the parent channel stands in for the version check. The remaining constants are
+markers that exist for the bump discipline. `STREAM_LABELS_VERSION` and `LOG_LABELS_VERSION` are
+in practice marker-only: no caller issues the `log_labels::GET_LOG_CAP` handshake, and every
+process instead receives its stream cap in `ProcessInfo.log_send_cap`. The block comment above
+the label modules in `src/lib.rs` lists which namespace falls in which category.
 
 ---
 

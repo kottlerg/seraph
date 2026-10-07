@@ -78,7 +78,7 @@ cargo xtask run [--arch x86_64|riscv64] [--gdb] [--headless] [--verbose] \
 | `--verbose` | Show all serial output; by default output is filtered until `[--------] boot:` appears |
 | `--cpus` | Number of vCPUs to expose to the guest (default: `4`; bounded by `1..=512`, the [boot-protocol](../abi/boot-protocol/README.md) `MAX_CPUS` the kernel sizes its per-CPU structures from) |
 | `--mem` | Guest memory size in MiB (default: `512`) |
-| `--riscv-mmu` | Guest RISC-V paging-mode ceiling (default: `sv48`; riscv64 only, ignored on x86_64). Sets the QEMU `svNN` CPU properties so the DTB `mmu-type` advertises the chosen ceiling; the bootloader negotiates the paging mode at boot and the kernel recovers the active mode from `satp`, per [docs/memory-model.md](../docs/memory-model.md) § RISC-V (Sv39 / Sv48 / Sv57). The default pins `sv48` because QEMU ≥ 8.0 otherwise defaults the rv64 CPU to `sv57` |
+| `--riscv-mmu` | Guest RISC-V paging-mode ceiling (default: `sv48`; riscv64 only, ignored on x86_64). Sets the QEMU `svNN` CPU properties, which cap the `satp` modes the CPU implements (and the DTB `mmu-type` QEMU authors); the bootloader negotiates the mode by DTB claim, or by `satp` write-probe alone when the firmware publishes no DTB, as under EDK2 ([core/boot/docs/page-tables.md](../core/boot/docs/page-tables.md) § Mode negotiation), and the kernel recovers the active mode from `satp`, per [docs/memory-model.md](../docs/memory-model.md) § RISC-V (Sv39 / Sv48 / Sv57). The default pins `sv48` because QEMU ≥ 8.0 otherwise defaults the rv64 CPU to `sv57` |
 
 **x86-64** selects an acceleration backend per host: KVM on Linux,
 HVF on macOS, WHPX on Windows, NVMM on NetBSD, or TCG everywhere else
@@ -103,10 +103,13 @@ CI floor catches up; see [docs/build-system.md](../docs/build-system.md)
 
 Every `run` attaches, on both architectures, the disk image as `virtio-blk-pci`, a
 `virtio-keyboard-pci` keyboard (`id=kbd0`, the device `test-terminal` injects keys into over
-QMP), a `virtio-rng-pci` boot-entropy source, and the guest UART on `-serial stdio`. A
-non-headless run adds QEMU std VGA: the q35 default adapter on x86-64, and on riscv64
-`-device VGA` with a `qemu-xhci`/`usb-kbd` pair, added only when a `gtk` or `sdl` display
-backend is available. `--headless` drops the display adapter, so no framebuffer is advertised.
+QMP), a `virtio-rng-pci` boot-entropy source, and the guest UART on `-serial stdio`. On
+x86-64 it also attaches `-device vmgenid,guid=auto`, the VMGENID generation-ID device
+([core/kernel/docs/entropy.md](../core/kernel/docs/entropy.md) § Whole-VM-snapshot detection
+(VMGENID)); QEMU's riscv64 `virt` machine has none. A non-headless run adds QEMU std VGA: the
+q35 default adapter on x86-64, and on riscv64 `-device VGA` with a `qemu-xhci`/`usb-kbd` pair,
+added only when a `gtk` or `sdl` display backend is available. `--headless` drops the display
+adapter, so no framebuffer is advertised.
 
 #### Environment variables
 
@@ -237,7 +240,9 @@ ktest's runtime options (`shutdown_policy`, `timeout_secs`, filter
 tiers, bench iteration count) bake in as compile-time defaults in
 `core/ktest/src/cmdline.rs::KtestConfig::DEFAULT` (CI-friendly:
 shutdown=Always, timeout=0, full filter, 1000 bench iters). To change
-them, edit the constant and `cargo xtask build --component ktest`; see
+them, edit the constant, run `cargo xtask build --component ktest`, then
+re-compose with `cargo xtask compose-bundle --harness ktest` (a
+single-component build does not re-compose the bundle); see
 [core/ktest/README.md](../core/ktest/README.md) § Compile-time options.
 
 ---

@@ -18,11 +18,14 @@ devmgr's responsibilities are:
 
 - **Parse firmware tables** — locate the PCI ECAM, from read-only memory
   capabilities, through the ACPI MCFG table (RSDP → XSDT → MCFG; preferred on
-  either architecture whenever an RSDP is present) or, as the fallback, the
+  either architecture whenever an RSDP is present) or, failing that, the
   Device Tree blob's `pci-host-ecam-generic` node; and serve ACPI tables to
-  pwrmgr (below). devmgr derives per-device interrupt lines from PCI
-  configuration space; resolving interrupt routing and power domains from
-  firmware tables is design intent; not yet implemented.
+  pwrmgr (below). When neither yields an ECAM, devmgr on RISC-V falls back to
+  the QEMU `virt` platform-default ECAM window (`platform_default_ecam`:
+  `0x3000_0000`, 256 MiB, buses 0..=255); on x86-64 the boot halts. devmgr
+  derives per-device interrupt lines from PCI configuration space; resolving
+  interrupt routing and power domains from firmware tables is design intent;
+  not yet implemented.
 - **Enumerate PCI devices** — reserve VA, fund the AS's page-table growth
   budget via `fund_aspace_pt_budget`, then map the ECAM MMIO region via
   `mmio_map`, read configuration space, discover devices and BARs, resolve
@@ -93,12 +96,14 @@ devmgr's responsibilities are:
 
 ## Capabilities Received
 
-devmgr receives the following capabilities during bootstrap. Init delivers them over
-the bootstrap protocol in rounds. Round 1 carries the registry endpoint, then whichever
-of the Interrupt range, RSDP, and DTB caps are present, with a presence bitmap, the
-RSDP and DTB page bases, and the DTB size in its data words. Each later round names
-its kind in `data[0]`: `APERTURE` and `ACPI_REGION` rounds carry up to four Memory
-caps each with their base/size pairs; one `MODULE` round carries the boot-bundle
+devmgr receives the following capabilities during bootstrap. Init delivers every one
+except SchedControl, which procmgr delivers in `ProcessInfo`, over the bootstrap
+protocol in rounds. Round 1 carries the registry endpoint, then whichever of the
+Interrupt range, RSDP, and DTB caps are present, with a presence bitmap, the exact
+RSDP physical address, the DTB page base, and the DTB's page-rounded size in its data
+words. Each later round names its kind in `data[0]`: `APERTURE` rounds carry up to
+four Mmio caps and `ACPI_REGION` rounds up to four Memory caps, each round with its
+base/size pairs; one `MODULE` round carries the boot-bundle
 driver images, each tagged with its module class; a cap-less `FRAMEBUFFER_INFO`
 round carries the framebuffer geometry (a zero base means no framebuffer); and the
 terminal `SVCMGR_BUNDLE` round carries the svcmgr publish cap and the arch

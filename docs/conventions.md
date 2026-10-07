@@ -295,4 +295,5 @@ Producing a release for tag `v<X>.<Y>.<Z>`:
 
 [abi/syscall/README.md](../abi/syscall/README.md), [Build System](build-system.md),
 [Documentation Standards](documentation-standards.md),
-[docs/releases/README.md](releases/README.md), [Testing](testing.md)
+[docs/releases/README.md](releases/README.md), [Testing](testing.md),
+[shared/ipc/README.md](../shared/ipc/README.md)

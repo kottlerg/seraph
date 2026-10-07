@@ -10,12 +10,15 @@
 //! defaults are picked for CI: every tier runs, the VM auto-shuts down
 //! on completion, and shutdown is immediate. To preserve QEMU for
 //! interactive inspection (or trim the tier set for a focused run),
-//! edit [`KtestConfig::DEFAULT`] and `cargo xtask build --component ktest`.
+//! edit [`KtestConfig::DEFAULT`], run `cargo xtask build --component ktest`,
+//! then `cargo xtask compose-bundle --harness ktest` so the boot bundle
+//! carries the rebuilt binary.
 
 /// When to perform system shutdown after tests complete. `Pass` and
 /// `Never` are not used by [`KtestConfig::DEFAULT`] but are the
 /// configurable surface — flipping `DEFAULT.shutdown_policy` to either
-/// value (and rebuilding ktest) is the supported operator escape hatch.
+/// value (then rebuilding ktest and recomposing the ktest bundle) is the
+/// supported operator escape hatch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[allow(dead_code)]
 pub enum ShutdownPolicy

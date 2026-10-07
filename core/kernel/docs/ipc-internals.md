@@ -79,7 +79,8 @@ TCB used only while the thread is blocked on an IPC object. No separate allocati
       sender's saved register state, data words read from the sender's IPC
       buffer page (the receiver writes them to its own page when it resumes)
    c. Transfer capability slots (see capability-internals.md)
-   d. Create reply capability in recv_tcb.reply_cap_slot
+   d. Publish the caller binding (the server's reply capability):
+      recv_tcb.reply_tcb = current_tcb (Release store)
    e. Mark recv_tcb as Ready; set result to success
    f. Release endpoint lock
    g. Direct thread switch: if recv_tcb.priority > current_tcb.priority:
@@ -124,7 +125,8 @@ syscall on either side. Nothing is allocated on the path.
    c. Copy message from sender_tcb.pending_send (registers + the sender's
       buffered data words) into the server's trap frame and IPC buffer page
    d. Transfer capability slots
-   e. Create reply capability in current_tcb.reply_cap_slot
+   e. Publish the caller binding (the server's reply capability):
+      current_tcb.reply_tcb = sender_tcb (Release store)
    f. Mark sender_tcb as BlockedOnReply (was already enqueued as BlockedOnSend)
    g. Release endpoint lock
    h. Return to server with message (no blocking)
@@ -142,17 +144,20 @@ syscall on either side. Nothing is allocated on the path.
 `SYS_IPC_REPLY` execution on the server's thread:
 
 ```
-1. Resolve reply_cap from current_tcb.reply_cap_slot
-   (the reply cap is not in the CSpace; it is in a dedicated per-thread field)
-2. Validate: reply_cap must be present and unconsumed
-3. caller_tcb = reply_cap.caller
+1. caller_tcb = current_tcb.reply_tcb (Acquire load)
+   (the reply capability is this caller binding, a per-thread field outside
+   the CSpace; null means no pending reply → InvalidCapability)
+2. Read the data words and pre-validate the reply cap slots; on failure,
+   swap current_tcb.reply_tcb to null and, if it held a caller, wake that
+   caller with the IPC_REPLY_TRANSFER_FAILED label
+3. Claim and clear the binding: CAS current_tcb.reply_tcb from caller_tcb
+   to null; a lost CAS means a concurrent canceller owns the caller's wake
 4. Stage the reply in caller_tcb.ipc_msg: label/count for the caller's
    return registers, data words for the caller to write to its own IPC
    buffer page when it resumes
 5. Transfer reply capability slots
-6. Consume (clear) current_tcb.reply_cap_slot
-7. Mark caller_tcb as Ready; enqueue
-8. If caller_tcb.priority > current_tcb.priority: direct switch
+6. Mark caller_tcb as Ready; enqueue
+7. If caller_tcb.priority > current_tcb.priority: direct switch
 ```
 
 ### Park Dispositions and Episodes
@@ -642,10 +647,12 @@ The scheduler's preemption timer does not interrupt the IPC fast path. Syscall e
 masks interrupts, and every IPC object lock is an IRQ-disabling
 `crate::sync::Spinlock`, so the endpoint-lock critical section that performs the
 send/receive/switch runs with interrupts disabled. A timer interrupt that arrives
-meanwhile stays pending until interrupts are re-enabled, which for syscall context
-is the return to userspace; kernel-mode preemption exists only at a slice expiry
-with preemption enabled (see the "Lock primitive" and "Bare spin locks" paragraphs
-of [scheduling-internals.md § Lock Hierarchy](scheduling-internals.md#lock-hierarchy)).
+meanwhile stays pending for the rest of that critical section. Syscall context
+re-enables interrupts only in preempt-disabled windows, or when the CPU returns to
+userspace or switches to the next thread, so the tick never preempts the IPC path;
+kernel-mode preemption exists only at a slice expiry with preemption enabled (see
+the "Lock primitive" and "Bare spin locks" paragraphs of
+[scheduling-internals.md § Lock Hierarchy](scheduling-internals.md#lock-hierarchy)).
 
 ---
 

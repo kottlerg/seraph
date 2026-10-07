@@ -143,8 +143,8 @@ thread's behalf. Its format is a stable cross-boundary contract.
 
 - **Label** — the reserved `FAULT_LABEL`. It proves kernel origin only on an endpoint whose
   handler hands out no `SEND`. A handler that multiplexes client traffic on the same endpoint
-  (memmgr) attributes the message by its unforgeable badge, not by the label; see
-  [Security](#security).
+  (memmgr) attributes the message by its badge, not by the label, and that attribution relies
+  on its badges being unguessable; see [Security](#security).
 - **Badge** — the bound `badge`.
 - **Data word 0** — the fault **kind**:
   - `FAULT_KIND_VM` — a virtual-memory (page) fault.
@@ -244,10 +244,22 @@ The default pager's endpoint is not such an endpoint: it is memmgr's badged clie
 and [`ProcessInfo`](process-lifecycle.md#processinfo--initinfo-handover-discipline)
 distributes it as `SEND` to every demand-paged process (`pager_endpoint_cap`). A handler that
 also serves ordinary clients on the same endpoint therefore cannot rely on the label alone: a
-client holding `SEND` can send a message bearing `FAULT_LABEL`, and the handler attributes it
-by the unforgeable badge of that client's cap, so a client can at most fabricate a fault
-against itself. The `badge` identifying the faulting thread is fixed by the binder, not by
-the message sender.
+client holding `SEND` can send a message bearing `FAULT_LABEL`, carrying the badge of that
+client's cap.
+
+The fault message badge is no stronger. It is binder-chosen: the value the binder passes to
+`SYS_THREAD_SET_FAULT_HANDLER`, not the badge of a cap the handler minted. Binding requires
+only `CONTROL` on the target thread and any `Endpoint` cap, a `SEND`-only one included; the
+kernel looks `endpoint_cap` up with `EpRights::NONE` (`core/kernel/src/syscall/thread.rs`).
+Any client holding a cap to a shared endpoint (such as memmgr's `pager_endpoint_cap`) can
+therefore bind its own thread with an arbitrary badge and have the kernel deliver a genuine
+`FAULT_LABEL` message carrying that badge. A handler that shares its endpoint with clients
+cannot attribute a fault message by badge alone; badge attribution there holds only if the
+handler's badges are secret. memmgr's attribution of a fault to a process rests on its
+process badges being unguessable (random 64-bit values minted by `mint_process_badge`): a
+client that learns another process's badge can direct memmgr to back a fault in that
+process's address space. This defect is tracked in
+[#459](https://github.com/kottlerg/seraph/issues/459).
 
 ---
 

@@ -163,10 +163,10 @@ back with the same surfaces first launch gave it.
 
 ## Supervision hierarchy
 
-svcmgr only supervises top-level services. devmgr spawns drivers (cmos /
-virtio-rtc / future block / net; per
-[devmgr/README.md](../../devmgr/README.md#responsibilities)), and vfsd
-spawns filesystem drivers (fatfs / future ext / btrfs); neither observes
+svcmgr only supervises top-level services. devmgr spawns drivers (serial /
+framebuffer / virtio-blk / virtio-input / cmos / goldfish-rtc / future net; per
+[devmgr responsibilities](../../devmgr/docs/responsibilities.md#relationship-to-drivers)),
+and vfsd spawns filesystem drivers (fatfs / future ext / btrfs); neither observes
 a child's death or restarts it (per
 [storage.md](../../../docs/storage.md#failure-and-revocation-invariants)).
 Supervision of those children by devmgr and vfsd is design intent; not yet
@@ -204,7 +204,7 @@ gain access to those caps — either via a new init→svcmgr handover round,
 or by relocating the spawn entirely into svcmgr.
 
 `timed`, `pwrmgr`, and `logd` are *not* in that set: they are
-svcmgr-launched and genuinely restartable. `timed` and `pwrmgr` hold no
+svcmgr-launched. `timed` and `pwrmgr` are genuinely restartable: they hold no
 unique source cap — each re-acquires its authority on (re)start by
 querying devmgr (`QUERY_RTC_DEVICE` for timed, per
 [timed/README.md](../../timed/README.md); `QUERY_ACPI_TABLE` +
@@ -214,7 +214,13 @@ RECV on the persistent service endpoint so cached client caps survive the
 restart. `logd` is the log sink: svcmgr holds the master-log endpoint
 source for the system's life and mints each (re)launched logd a fresh RECV
 on that persistent endpoint, so log senders' caps survive the restart (per
-[service-definitions.md](service-definitions.md#log_sink)).
+[service-definitions.md](service-definitions.md#log_sink)). A working logd
+restart is design intent; not yet implemented (#262). procmgr's
+`REGISTER_DEATH_EQ` is first-wins, so a restarted logd's registration is
+rejected and it receives no death events for slot eviction; and svcmgr's
+death handler emits blocking `log!` calls on the master-log endpoint before
+it respawns logd, so with no logd receiving, svcmgr blocks and the restart
+never happens.
 
 ---
 
@@ -232,5 +238,7 @@ path (per
 ## Summarized By
 
 [Process Lifecycle](../../../docs/process-lifecycle.md),
+[services/crasher/README.md](../../crasher/README.md),
+[services/procmgr/README.md](../../procmgr/README.md),
 [services/pwrmgr/README.md](../../pwrmgr/README.md), [services/svcmgr/README.md](../README.md),
 [svcmgr IPC Interface](ipc-interface.md), [`.svc` Service Definitions](service-definitions.md)

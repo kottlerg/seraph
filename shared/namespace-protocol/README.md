@@ -217,9 +217,9 @@ bits are defined; sixteen are reserved.
 | 1 | `READDIR` | `NS_READDIR` enumeration |
 | 2 | `STAT` | `NS_STAT` |
 | 3 | `READ` | `FS_READ` / `FS_READ_MEMORY` (file) |
-| 4 | `WRITE` | `NS_WRITE` (deferred; reserved) |
+| 4 | `WRITE` | `FS_WRITE` / `FS_WRITE_MEMORY` / `FS_TRUNCATE` (file) |
 | 5 | `EXEC` | File is executable; consumed by ELF loaders |
-| 6 | `MUTATE_DIR` | `NS_CREATE` / `NS_UNLINK` (deferred; reserved) |
+| 6 | `MUTATE_DIR` | `FS_CREATE` / `FS_REMOVE` / `FS_MKDIR` / `FS_RENAME` (directory) |
 | 7 | `ADMIN` | Visibility-gating bit |
 | 8..23 | — | Reserved; MUST be zero on derive, ignored on read |
 
@@ -310,4 +310,5 @@ describes vfsd's synthetic-root composition in detail.
 [Namespace Model](../../docs/namespace-model.md),
 [services/fs/README.md](../../services/fs/README.md),
 [Filesystem Driver Protocol](../../services/fs/docs/fs-driver-protocol.md),
-[Synthetic Root and Namespace Composition](../../services/vfsd/docs/namespace-composition.md)
+[Synthetic Root and Namespace Composition](../../services/vfsd/docs/namespace-composition.md),
+[shared/ns-client/README.md](../ns-client/README.md)

@@ -381,11 +381,15 @@ const SCOPE_PROMPT = [
         'PR diff changes, with the kind of change.',
     '- design_docs: the documents that govern the touched areas, found by walking the scope ' +
         'order `docs/documentation-standards.md` § Document Hierarchy defines: system scope ' +
-        '(the top-level `docs/*.md` and `docs/releases/README.md`), component scope ' +
-        '(`<component>/README.md`), and ' +
-        'design-authority scope (`<component>/docs/*.md`). Also list the root `README.md` and ' +
-        'the touched component\'s grouping `README.md` (its parent directory\'s) as routing ' +
-        'documents, not authorities; include every document the diff itself edits. List only ' +
+        '(the top-level `docs/*.md`), component scope (`<component>/README.md`), and ' +
+        'design-authority scope (`<component>/docs/*.md`). ' +
+        'Also list `docs/releases/README.md` with the system-scope documents: the standard ' +
+        'places it in no scope, and its § Backlinks and Change Propagation release-notes ' +
+        'exception calls it an ordinary authoritative document. ' +
+        'Also list the root `README.md` and ' +
+        'the touched component\'s grouping `README.md` (`<group>/README.md` for the top-level ' +
+        'group directory the component sits in) as routing documents, not authorities; ' +
+        'include every document the diff itself edits. List only ' +
         'paths `git ls-files` prints: a document you cannot confirm exists at the head is left ' +
         'out, since a lens reads what it is given.',
     '- claimed_fixes: ' +
@@ -484,10 +488,12 @@ const ISSUES_BLOCK = [
     bullets(scope.open_issues, (i) => '- #' + i.number + ' ' + i.title),
 ].join('\n')
 
-// System-scope documents (the top-level `docs/*.md` and `docs/releases/README.md`)
-// govern every shard; the root README and a component's grouping README are
-// passed as routing context; a component's `README.md` and `docs/*.md` govern
-// only its own shards.
+// System-scope documents (the top-level `docs/*.md`), plus `docs/releases/README.md`,
+// which this workflow adds (the standard gives it no scope), go to every shard; a
+// component's `README.md` and `docs/*.md` go only to its own shards. The root
+// README and the top-level grouping README the component sits in go to the shard
+// in the same list, which `shard_prompt` emits under one "Design documents
+// governing this shard" heading without separating them from the authorities.
 const docs_for = (component) => {
     const top = component.split('/')[0]
     return scope.design_docs.filter(

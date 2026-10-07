@@ -141,13 +141,22 @@ sentinel).
 | `caps[0]` | Per-process release-endpoint SEND, transferred only on the first `FS_READ_MEMORY` for a given (client, file) pair (see below) |
 
 The first `FS_READ_MEMORY` for a given (client, file) pair MAY carry
-the client's per-process release-endpoint SEND in `caps[0]`. The
-driver records it on the lazily-allocated `OpenFile` slot so the
-eviction worker can route cooperative
-[`FS_RELEASE_MEMORY`](#label-8-fs_release_memory) back to the client.
+the client's per-process release-endpoint SEND in `caps[0]`.
 Subsequent `FS_READ_MEMORY`s for the same pair carry no caps; clients
 that opt out of cooperative release omit the cap on every call,
 falling back to the eviction worker's hard-revoke path.
+
+The driver keeps this read-side bookkeeping (outstanding pages and the
+recorded release endpoint) in a lazily-allocated `OpenFile` slot keyed
+by node, not by (client, file) pair. Every client that opens a file
+resolves to the same node and so shares that one slot. The driver
+records `caps[0]` only from the `FS_READ_MEMORY` that allocates the
+slot, so the eviction worker routes cooperative
+[`FS_RELEASE_MEMORY`](#label-8-fs_release_memory) for any client's
+page to that first client, and a later client is in effect opted out.
+One client's [`FS_CLOSE`](#label-3-fs_close) revokes every client's
+outstanding pages on the file. This sharing is a defect, tracked in
+[#447](https://github.com/kottlerg/seraph/issues/447).
 
 **Reply (success)**
 
@@ -240,14 +249,16 @@ synchronous release after a read.
 
 ### Driver-to-client release
 
-Sent by the driver's eviction worker on the client's per-process
-release endpoint cap, recorded by the driver from `caps[0]` of the
-client's first [`FS_READ_MEMORY`](#label-7-fs_read_memory) for the
-file. Clients that delivered the SEND get the cooperative path; the
-driver waits up to 100 ms for [`FS_RELEASE_ACK`](#label-9-fs_release_ack)
-before falling through to a hard `cap_revoke` of the parent Memory
-cap. Clients that omitted the SEND (opt-out) skip straight to the
-hard-revoke path on every eviction. See
+Sent by the driver's eviction worker on the per-process release
+endpoint cap recorded in the node's `OpenFile` slot, taken from
+`caps[0]` of the [`FS_READ_MEMORY`](#label-7-fs_read_memory) that
+allocated the slot (per-node sharing, a defect tracked in
+[#447](https://github.com/kottlerg/seraph/issues/447)). Clients that
+delivered the SEND get the cooperative path; the driver waits up to
+100 ms for [`FS_RELEASE_ACK`](#label-9-fs_release_ack) before falling
+through to a hard `cap_revoke` of the parent Memory cap. Clients that
+omitted the SEND (opt-out) skip straight to the hard-revoke path on
+every eviction. See
 [`runtime/ruststd/src/sys/fs/release_handler.rs`](../../../runtime/ruststd/src/sys/fs/release_handler.rs)
 for the receive-side state machine.
 
@@ -285,6 +296,9 @@ page-cache slot.
 no outstanding page on the node (including a node with no open-file
 slot) is a no-op success.
 
+**Reply (error)**: `label = fs_errors::PERMISSION_DENIED` when the
+badge carries no namespace rights.
+
 ---
 
 ## Label 9: `FS_RELEASE_ACK`
@@ -305,9 +319,13 @@ driver's outstanding-memory-cap refcount decrements on receipt.
 
 Release driver-side bookkeeping bound to a node cap (the lazily-
 allocated per-`OpenFile` slot, outstanding `FS_READ_MEMORY` pages,
-the recorded release endpoint). The kernel-side cap is **not** freed
-here — the holder still `cap_delete`s its node cap to drop the
-kernel reference.
+the recorded release endpoint). The slot is per node and shared by
+every client of the file, so one client's `FS_CLOSE` revokes every
+client's outstanding pages on it (a defect, tracked in
+[#447](https://github.com/kottlerg/seraph/issues/447); see
+[`FS_READ_MEMORY`](#label-7-fs_read_memory)). The kernel-side cap is
+**not** freed here — the holder still `cap_delete`s its node cap to
+drop the kernel reference.
 
 **Request**
 

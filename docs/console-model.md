@@ -17,11 +17,12 @@ direct console paths remain as fallbacks for the life of the system.
    and framebuffer directly during UEFI boot, before the kernel exists. On
    RISC-V the UART base is discovered via ACPI SPCR
    (`core/boot/src/arch/riscv64/acpi_spcr.rs`), then the Device Tree, falling back to the QEMU
-   `virt` default `0x10000000`; on x86-64 it is COM1 at I/O port `0x3F8` (discovery order per
-   [Early Console § Serial Backend](../core/boot/docs/console.md#serial-backend)). The framebuffer
-   base is discovered via UEFI GOP and captured into `BootInfo.framebuffer` before
-   `ExitBootServices` — GOP's active framebuffer identity is unreachable from any later
-   component, so the bootloader is the only entity that can carry the geometry forward.
+   `virt` default `0x10000000` (discovery order per
+   [Early Console § Serial Backend](../core/boot/docs/console.md#serial-backend)); on x86-64 it
+   is COM1 at I/O port `0x3F8`. The framebuffer base is discovered via UEFI GOP and captured
+   into `BootInfo.framebuffer` before `ExitBootServices` — GOP's active framebuffer identity is
+   unreachable from any later component, so the bootloader is the only entity that can carry the
+   geometry forward.
 
 2. **Kernel early console** — `core/kernel/src/console.rs` (plus
    `core/kernel/src/framebuffer.rs`) owns `kprint!`/`kprintln!` and the panic
@@ -54,10 +55,10 @@ direct console paths remain as fallbacks for the life of the system.
    endpoint's RECV, pulls init-logd's captured history via
    `log_labels::HANDOVER_PULL`, then releases it with
    `log_labels::HANDOVER_RELEASE` — at which point init-logd self-terminates (see
-   [logd handover protocol](../services/logd/docs/handover-protocol.md)). This direct path is
-   **permanent**, not transitional: together with init's main thread, which writes the UART
-   directly until init-logd is spawned, it is the only userspace writer until real-logd takes
-   the endpoint. The handover is unconditional, so if the serial driver never
+   [logd handover protocol](../services/logd/docs/handover-protocol.md)). This direct path is a
+   fixed part of the boot design, not a stopgap: together with init's main thread, which writes
+   the UART directly until init-logd is spawned, it is the only userspace writer until real-logd
+   takes the endpoint. The handover is unconditional, so if the serial driver never
    comes up, userspace serial output after the handover is dropped (real-logd keeps the lines in
    its history ring). init-logd has no direct-framebuffer path; before the framebuffer driver is
    up, userspace output reaches only the UART.
@@ -151,17 +152,16 @@ driver, not a console daemon: no name registry, no log routing, no graphical
 primitives, no input. The driver's IPC contract is specified in
 [services/drivers/framebuffer/README.md](../services/drivers/framebuffer/README.md).
 
-## Why four permanent direct paths remain
+## Why the direct paths remain
 
-The kernel panic console (UART) and init-logd's direct-UART path both
-bypass the serial driver permanently and by design; the bootloader
-framebuffer renderer and the kernel framebuffer renderer both bypass
-the framebuffer driver in the same way. A panic, or a userspace failure
-before the driver is reachable, must still produce output; none of
-these can depend on the IPC machinery that the drivers require. They
-share the hardware with the drivers — an accepted physical aliasing,
-since the drivers are the steady-state writers and the direct paths
-fire only in early boot and failure windows.
+The kernel panic console (UART) and the kernel framebuffer renderer bypass the serial and
+framebuffer drivers for the life of the system: a panic must still produce output, and it cannot
+depend on the IPC machinery that the drivers require. The bootloader console (UART and
+framebuffer) and init-logd's direct-UART path are fixed parts of the boot design that bypass the
+drivers only within their windows, which end at the kernel handoff and the real-logd handover
+respectively; they carry output before the drivers are reachable. All of these paths share the
+hardware with the drivers — an accepted physical aliasing, since the drivers are the
+steady-state writers and the direct paths fire only in early boot and failure windows.
 
 ## Test-harness output
 

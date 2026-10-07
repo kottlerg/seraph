@@ -27,9 +27,10 @@ calls `REQUEST_MEMORY_CAPS` on it with no further setup. See
 ## Badge Discipline
 
 Every memmgr-callable message arrives over a badged endpoint cap. The
-badge is the memmgr-minted process identity established at procmgr's
-`REGISTER_PROCESS`; memmgr uses it to key the per-process tracking table
-(see [`memory-pool.md`](memory-pool.md) §"Per-Process Tracking").
+badge is the process identity memmgr mints at procmgr's `REGISTER_PROCESS`,
+or, for procmgr itself, the bootstrap badge init mints and passes in
+memmgr's bootstrap round; memmgr uses it to key the per-process tracking
+table (see [`memory-pool.md`](memory-pool.md) §"Per-Process Tracking").
 
 Two privilege classes:
 
@@ -52,12 +53,15 @@ A third, kernel-origin class is the **fault message**: when a demand-paged
 process's thread takes a page fault, the kernel (not a userspace caller)
 synthesises an IPC to memmgr's endpoint with label `FAULT_LABEL`
 (`u64::MAX - 1`) and `badge` set to the faulting process's memmgr badge.
-The binding is installed by procmgr via `SYS_THREAD_SET_FAULT_HANDLER`.
+The binding is installed via `SYS_THREAD_SET_FAULT_HANDLER`, by procmgr
+for a process's main thread and by the runtime for each thread it spawns.
 The fault endpoint is memmgr's client endpoint, so any holder of a badged
 SEND cap can also send a message labelled `FAULT_LABEL`; memmgr does not
-distinguish it from a kernel delivery. memmgr resolves every fault message
-against the sender's own badge record, so a forged fault can at most back
-a page of a region the sender itself registered. See
+distinguish it from a kernel delivery. The fault badge is whatever value
+the binder passes, so memmgr's attribution of a fault to a process rests on
+its process badges being unguessable, not unforgeable: a client that learns
+another process's badge can direct memmgr to back one chunk of a region
+that process registered. See
 [docs/fault-handling.md](../../../docs/fault-handling.md) §"Security".
 
 ---
@@ -267,10 +271,16 @@ success. Reclamation is idempotent.
 ### Label 5: `DONATE_MEMORY_CAPS`
 
 Permanently transfer Memory caps into memmgr's pool. Privilege: universal —
-the call gives memmgr RAM and takes nothing back. Used by procmgr's init
-reap to hand over init's reclaimed boot memory (ELF segments, `InitInfo`,
-stack, boot-module ELF sources). See
-[docs/process-lifecycle.md](../../../docs/process-lifecycle.md).
+memmgr accepts the label from any badged client. A client can donate a
+derivation of a Memory cap memmgr already granted it, which aliases those
+frames into the pool while the client still holds them; this defect is
+tracked in [#459](https://github.com/kottlerg/seraph/issues/459), which
+makes the label procmgr-only. Used by procmgr's init reap to hand over
+init's reclaimed memory: the usable-RAM caps that did not fit memmgr's
+bootstrap round, the free remainders `MemoryAlloc` abandoned, ELF segments,
+`InitInfo`, stack, the bootloader/bundle reclaim ranges, the AP-trampoline
+frame, and boot-module ELF sources. See
+[docs/process-lifecycle.md](../../../docs/process-lifecycle.md#init-reap) §"Init reap".
 
 **Request:**
 
@@ -455,7 +465,10 @@ after the caller's CSpace is torn down. See [`memory-pool.md`](memory-pool.md)
 Neither `RELEASE_MEMORY_CAPS` nor `PROCESS_DIED` transfers the caps it
 reclaims. `RELEASE_MEMORY_CAPS` names each region by `phys_base`, and
 `PROCESS_DIED` names the dead process by badge; memmgr deletes any cap
-transferred with either call defensively. Reclamation returns memmgr's
+transferred with either call defensively, on `PROCESS_DIED` only when the
+caller is procmgr. An unauthorized `PROCESS_DIED` replies `Unauthorized`
+without deleting the caps attached to it; this defect is tracked in
+[#459](https://github.com/kottlerg/seraph/issues/459). Reclamation returns memmgr's
 retained intermediary to the free pool; memmgr does not derive from the
 caller's cap.
 

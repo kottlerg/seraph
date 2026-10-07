@@ -12,7 +12,9 @@
 //! apertures via `mmio_split`, and splits single-IRQ caps off the root
 //! range via `irq_split` before delegating to driver processes.
 //!
-//! See `devmgr/README.md` for the full design.
+//! See `services/devmgr/docs/responsibilities.md` for devmgr's responsibilities
+//! and driver authority, and `docs/device-management.md` for the system-scope
+//! design.
 
 #![allow(clippy::cast_possible_truncation)]
 

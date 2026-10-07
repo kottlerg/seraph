@@ -180,7 +180,7 @@ Each feature is classified per architecture as one of:
 ### Opportunistic
 
 - **Svadu** — hardware A/D-bit updates (design intent; not yet implemented: the kernel pre-sets
-  the A/D bits in every leaf PTE; Svade is the required baseline).
+  A in every leaf PTE and D in every writable leaf; Svade is the required baseline).
 - **Sv57** — a larger-VA expansion above the Sv48 default; used when the
   platform advertises and the probe confirms it.
 - **Zvk vector crypto** — crypto acceleration (design intent; not yet enabled).

@@ -251,6 +251,15 @@ The step-7 timer mode selection is specified in [arch-interface.md](arch-interfa
 6. Enable interrupts (set sstatus.SIE)
 ```
 
+Within the architecture hardware path, after interrupt and per-CPU setup and before the
+syscall entry and preemption timer are configured, the BSP checks the boot-gated paging
+extensions, then enables hardware address-space tags (x86-64 PCID, RISC-V ASID) where the
+hardware provides them and allocates the per-CPU tag-state slab (`PER_CPU_TAG_STATE`), sized
+to the boot CPU count, from the buddy allocator. Where tags are absent, or too few for the
+CPU count, no slab is allocated and context switch keeps the full-flush path. The slab is a
+fixed kernel reserve allocated before the Phase 7 drain; see
+[memory-model.md](../../../docs/memory-model.md) § TLB Management.
+
 After the architecture hardware path, the BSP seeds the entropy pool from the
 firmware boot seed in `BootInfo`, the hardware RNG (health-gated where present),
 and boot-time jitter, and opens the kernel draw API; with neither a firmware
@@ -318,7 +327,10 @@ Phase 7.
    e. One SbiControl capability (RISC-V only) carrying every sanctioned SBI
       right, for init to forward sanctioned SBI extensions and attenuate
       per-consumer copies.
-   f. (Thread and process capabilities for init are added in Phase 9)
+   f. One root Interrupt range capability (Notify rights) covering every valid
+      IRQ id on the architecture (ROOT_IRQ_COUNT: 256 on x86-64, 1024 on RISC-V);
+      userspace narrows it to single-IRQ children via SYS_IRQ_SPLIT.
+   g. (Thread and process capabilities for init are added in Phase 9)
 
    Before the drain in step 3a the InitInfo block, init's INIT_STACK_PAGES
    stack frames, and the kernel page-table pool are reserved from the
@@ -346,8 +358,7 @@ The SbiControl rights are defined in
 Init's reap-time donation of the reclaim caps is described in
 [process-lifecycle.md § Init reap](../../../docs/process-lifecycle.md#init-reap), and the
 sealed buddy in
-[userspace-memory-model.md](../../../docs/userspace-memory-model.md#ownership-boundaries)
-§ Ownership Boundaries.
+[userspace-memory-model.md § Ownership Boundaries](../../../docs/userspace-memory-model.md#ownership-boundaries).
 
 **Failure mode:** Allocation failure during CSpace construction halts with
 "fatal: cannot initialise capability system".

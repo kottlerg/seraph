@@ -62,13 +62,18 @@ vfsd) whose thread cap init captured; logd is not a substrate. See init's
 
 | Field | Value |
 |---|---|
-| caps[0] | `master_log_source`: `RIGHTS_ALL` source on init's master log endpoint; svcmgr mints real-logd's master-log RECV from it on every (re)launch and the one-shot `HANDOVER_PULL` SEND on the first launch; holding it keeps the log endpoint alive across a logd crash (`0` if absent) |
+| caps[0] | `master_log_source`: `RIGHTS_ALL` source on init's master log endpoint; svcmgr mints real-logd's master-log RECV from it on every (re)launch and the first-launch handover SEND (the `HANDOVER_PULL` drain then `HANDOVER_RELEASE`; see [`log_sink`](service-definitions.md#log_sink)); holding it keeps the log endpoint alive across a logd crash (`0` if absent) |
 | caps[1] | `procmgr_death_auth_source`: badge-0 `SEND\|GRANT` source on procmgr's service endpoint; svcmgr mints real-logd's `DEATH_EQ_AUTHORITY` SEND from it per launch (`0` if absent) |
 | data[0] | `3` (`LOGD_SOURCES`) |
 
 svcmgr holds both sources for the system's life and mints real-logd's
 [`log_sink`](service-definitions.md#log_sink) bootstrap round from them on
-every (re)launch. A zero slot leaves logd unlaunchable; svcmgr continues.
+every (re)launch. svcmgr launches logd whatever the slot values; a zero slot
+reaches logd as a zero cap. Without the death-auth source, logd runs but skips
+`REGISTER_DEATH_EQ` and cannot reclaim per-sender slots. Without the
+master-log source, logd exits at startup; logd is `critical = yes` and its
+clean exit is not an `on_failure` restart, so svcmgr starts a graceful
+shutdown.
 
 svcmgr parks each substrate pair in its pending-registration table. It does **not**
 bind death-notification at endowment time — the matching `.svc`
@@ -266,4 +271,5 @@ policy + budget):
 [Device Management](../../../docs/device-management.md),
 [Process Lifecycle](../../../docs/process-lifecycle.md),
 [services/init/README.md](../../init/README.md),
-[init Bootstrap Stages](../../init/docs/bootstrap.md), [services/svcmgr/README.md](../README.md)
+[init Bootstrap Stages](../../init/docs/bootstrap.md), [services/svcmgr/README.md](../README.md),
+[shared/registry-client/README.md](../../../shared/registry-client/README.md)

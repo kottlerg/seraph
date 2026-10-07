@@ -381,9 +381,10 @@ The merge-gating rule (CI must pass green before merge) lives in
 ## Summarized By
 
 [README.md](../README.md), [ELF Loading](../core/boot/docs/elf-loading.md),
-[core/kernel/README.md](../core/kernel/README.md), [Coding Standards](coding-standards.md),
-[Platform Requirements](platform-requirements.md), [docs/releases/README.md](releases/README.md),
-[rootfs/README.md](../rootfs/README.md), [runtime/ruststd/README.md](../runtime/ruststd/README.md),
+[core/kernel/README.md](../core/kernel/README.md), [System Bootstrap](bootstrap.md),
+[Coding Standards](coding-standards.md), [Platform Requirements](platform-requirements.md),
+[docs/releases/README.md](releases/README.md), [rootfs/README.md](../rootfs/README.md),
+[runtime/ruststd/README.md](../runtime/ruststd/README.md),
 [services/drivers/README.md](../services/drivers/README.md),
 [Driver Model](../services/drivers/docs/driver-model.md),
 [`.svc` Service Definitions](../services/svcmgr/docs/service-definitions.md),

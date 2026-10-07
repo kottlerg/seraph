@@ -117,10 +117,10 @@ sysroot/
 
 `/services/`, `/programs/` MUST NOT contain test harnesses or per-program
 testers — all test artifacts live under `/tests/` so a non-test distro
-build amounts to dropping `/tests/`. The one exception is `test-orphan`, a
-test-only fault-injection driver installed under `/services/drivers/` until the
-devmgr enumeration redesign ([#165](https://github.com/kottlerg/seraph/issues/165))
-removes it.
+build amounts to dropping `/tests/`. The one exception is
+[`test-orphan`](../services/drivers/test-orphan/README.md), a test-only fault-injection driver
+installed under `/services/drivers/` until the devmgr enumeration redesign
+([#165](https://github.com/kottlerg/seraph/issues/165)) removes it.
 
 ---
 
@@ -508,6 +508,7 @@ note in full.
 [Console Model](console-model.md), [Project Conventions](conventions.md),
 [programs/shell/README.md](../programs/shell/README.md),
 [programs/terminal/README.md](../programs/terminal/README.md),
+[services/crasher/README.md](../services/crasher/README.md),
 [services/pwrmgr/README.md](../services/pwrmgr/README.md),
 [services/svcmgr/README.md](../services/svcmgr/README.md),
 [Restart Protocol](../services/svcmgr/docs/restart-protocol.md),

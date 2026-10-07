@@ -19,8 +19,9 @@ does not change.
   events dropped) and serial RX ([#291], received UART bytes forwarded
   verbatim). The keyboard is required: when `QUERY_INPUT_DEVICE` fails the
   terminal logs and exits, so a boot with no input device has no terminal.
-  `cargo xtask run` always attaches `virtio-keyboard-pci`, so a headless run
-  still has a terminal, interactive over serial.
+  `cargo xtask run` attaches a virtio keyboard on every boot (see
+  [xtask/README.md](../../xtask/README.md#attached-devices)), so a headless run still has a
+  terminal, interactive over serial.
 - **Output**: framebuffer text ([#67], primary) mirrored to serial TX ([#66],
   debug). Both share one wire format, specified in the
   [serial](../../services/drivers/serial/README.md) and

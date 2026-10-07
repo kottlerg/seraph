@@ -488,12 +488,14 @@ notification flow above.
 ## Summarized By
 
 [abi/init-protocol/README.md](../abi/init-protocol/README.md),
+[Memory Map Translation](../core/boot/docs/memory-map.md),
 [Kernel Initialization Sequence](../core/kernel/docs/initialization.md),
 [SMP Scheduling and Locking Invariants](../core/kernel/docs/scheduling-internals.md),
 [Syscall Interface Specification](../core/kernel/docs/syscalls.md),
 [Architecture Overview](architecture.md), [System Bootstrap](bootstrap.md),
 [Capability Model](capability-model.md), [Fault Handling](fault-handling.md), [Testing](testing.md),
 [Userspace Memory Model](userspace-memory-model.md),
+[services/crasher/README.md](../services/crasher/README.md),
 [init Bootstrap Stages](../services/init/docs/bootstrap.md),
 [services/logd/README.md](../services/logd/README.md),
 [logd IPC interface](../services/logd/docs/ipc-interface.md),
@@ -506,5 +508,5 @@ notification flow above.
 [svcmgr IPC Interface](../services/svcmgr/docs/ipc-interface.md),
 [Restart Protocol](../services/svcmgr/docs/restart-protocol.md),
 [`.svc` Service Definitions](../services/svcmgr/docs/service-definitions.md),
-[shared/elf/README.md](../shared/elf/README.md),
+[shared/elf/README.md](../shared/elf/README.md), [shared/log/README.md](../shared/log/README.md),
 [shared/process-layout/README.md](../shared/process-layout/README.md)

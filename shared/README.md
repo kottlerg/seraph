@@ -1,7 +1,6 @@
 # shared
 
-Utility crates shared across components, none of them a kernel/userspace ABI; crates that define
-inter-process wire formats (`ipc/`, `namespace-protocol/`) state their own stability rules, and
+Utility crates shared across components, none of them a kernel/userspace ABI;
 [abi/README.md](../abi/README.md) indexes the ABI contract crates.
 
 | Crate | Purpose |

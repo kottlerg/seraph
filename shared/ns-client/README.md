@@ -1,12 +1,20 @@
 # shared/ns-client
 
 `no_std` namespace walk helpers for any service holding a badged SEND on a vfsd namespace
-endpoint. `walk_to_file` resolves a path to a per-file cap, for example before
+endpoint.
+
+---
+
+## Behavior
+
+`walk_to_file` resolves a path to a per-file cap, for example before
 `procmgr_labels::CREATE_FROM_FILE`; `walk_to_dir` derives an attenuated subtree or cwd cap to
 install on a child through `procmgr_labels::CONFIGURE_NAMESPACE`. Both issue one `NS_LOOKUP`
 per path component, mirroring the walk in `runtime/ruststd/src/sys/fs/seraph.rs`, and send
-`requested_rights` on every hop, so the returned cap carries at most those rights; `0xFFFF`
-selects each entry's full `max_rights`.
+`requested_rights` on every hop, so the returned cap carries at most those rights. The
+sentinel `0xFFFF` requests "everything the caller is allowed", so each hop carries the
+rights the server composes from the parent cap and the entry
+([shared/namespace-protocol/README.md](../namespace-protocol/README.md) § NS_LOOKUP).
 
 ---
 

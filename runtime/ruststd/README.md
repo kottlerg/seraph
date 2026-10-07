@@ -166,8 +166,9 @@ protocol is in
 
 ## Implementation order
 
-ruststd is implemented before `libc/`. Native Rust `std` support does not
-require a POSIX layer; it maps directly onto Seraph primitives.
+ruststd is implemented before [`libc/`](../libc/README.md) (design intent; not yet
+implemented). Native Rust `std` does not go through libc; it maps directly onto Seraph
+primitives.
 
 ---
 

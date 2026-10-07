@@ -112,7 +112,10 @@ to the caller. The intermediary lets memmgr reclaim the cap on
 
 memmgr maintains a per-process table keyed on the per-process badge memmgr
 mints at procmgr's `REGISTER_PROCESS` and that is delivered with every
-`REQUEST_MEMORY_CAPS` call. Each entry records:
+`REQUEST_MEMORY_CAPS` call. procmgr's own record is keyed on the bootstrap
+badge init mints for it, and two reserved records (memmgr-self and init-self)
+hold the memmgr and init bootstrap arenas; memmgr inserts all three at boot
+and never reclaims them. Each entry records:
 
 - The badge (process identity).
 - The head of an intrusive list of the Memory cap slots memmgr has handed
@@ -266,8 +269,8 @@ discrete runs.
 
 memmgr never panics on allocation failure. The caller's response policy
 (panic, retry, fail the operation) is its own concern; for std-built
-services the heap allocator returns null and std's abort path terminates the
-faulting thread (see
+services the heap allocator returns null, std's abort path traps, and the
+terminal fault tears down the whole process (see
 [`docs/userspace-memory-model.md`](../../../docs/userspace-memory-model.md#byte-heap)
 §"Byte Heap").
 

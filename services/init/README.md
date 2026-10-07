@@ -15,7 +15,8 @@ init/
 ├── Cargo.toml                  # Workspace member; no_std binary
 ├── README.md
 ├── docs/
-│   └── bootstrap.md            # Authoritative stage enumeration + capability flow
+│   └── bootstrap.md            # Authoritative stage enumeration;
+│                                 init's side of the capability flow
 └── src/
     ├── main.rs                 # _start, run() orchestration across the three stages
     ├── bootstrap.rs            # Raw memmgr / procmgr ELF-load + kernel-object setup
@@ -73,7 +74,8 @@ Init runs three stages between `_start` and `sys_thread_exit`:
    launches the non-bootstrap services itself — `timed` and `pwrmgr`
    (providers), `terminal`, the staged test harnesses — and publishes their
    names (see [svcmgr](../svcmgr/README.md)). The per-arch RTC chip driver is
-   [devmgr](../devmgr/README.md)-spawned lazily after `SET_DRIVERS_DIR` and
+   spawned lazily by devmgr after `SET_DRIVERS_DIR` (see
+   [devmgr responsibilities](../devmgr/docs/responsibilities.md#responsibilities)) and
    resolved by [timed](../timed/README.md) via `QUERY_RTC_DEVICE`.
 
 See [docs/bootstrap.md](docs/bootstrap.md) for the authoritative

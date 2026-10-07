@@ -775,30 +775,35 @@ tree write lock is sufficient to prevent concurrent modification.
 
 ## Initial CSpace Population
 
-During Phase 7 of initialization, the root CSpace is populated as follows.
-Slot assignments are fixed by convention and communicated to init via the boot
-protocol. Init must not assume specific slot numbers — the kernel passes the
-layout via a well-known structure at the top of init's stack.
+Phases 7, 8, and 9 of initialization populate the root CSpace, which becomes init's
+CSpace. Slots are assigned sequentially from slot 1 in the order below; the counts in
+each group depend on the platform, so init must not assume specific slot numbers.
 
-### Initial Slot Layout (Tentative)
+### Initial Slot Layout
 
-| Slot | Capability |
-|---|---|
-| 0 | Null (permanent) |
-| 1 | Init's own thread capability |
-| 2 | Init's own address space capability |
-| 3 | Init's own CSpace capability |
-| 4 | SchedControl capability (band `[1, PRIORITY_MAX]`) |
-| 5..N | Memory capabilities (one per usable physical region) |
-| N+1..M | Mmio capabilities, Map and Write rights (one per `BootInfo.mmio_apertures` entry, plus one over the kernel console UART on RISC-V) |
-| M+1 | One root Interrupt range capability (every valid IRQ id on the architecture) |
-| M+2..L | Map-only Memory capabilities (one per `AcpiReclaimable` memory-map region, plus the page holding `BootInfo.acpi_rsdp` and the `BootInfo.device_tree` blob) |
-| L+1 | One root IoPort capability over the full 64K I/O port space (x86-64 only), or one SbiControl capability carrying every sanctioned SBI right (RISC-V only) |
-| L+2..Q | Memory capabilities for boot module images (raw ELF for procmgr, devmgr, etc.) |
-| Q+1..R | Reclaimable Memory capabilities for bootloader scratch pages (`BootInfo`, descriptor arrays, MMIO aperture array, reclaim-array page, transient page-table frames) and the bundle's non-module pages (header + entry table + pad, init ELF source body, inter-module and trailing slack — module bodies are excluded, covered by the boot-module Memory caps above) — one cap per `BootInfo.reclaim_ranges` entry |
+| Order | Phase | Capability |
+|---|---|---|
+| 0 | — | Null (permanent; always slot 0) |
+| 1 | 7 | Memory capabilities (one per RAM block drained from the buddy allocator; the seed block contributes only its post-reserve tail) |
+| 2 | 7 | Mmio capabilities, Map and Write rights (one over the kernel console UART on RISC-V, then one per validated `BootInfo.mmio_apertures` entry) |
+| 3 | 7 | SchedControl capability (band `[1, PRIORITY_MAX]`) |
+| 4 | 7 | One root Interrupt range capability (every valid IRQ id on the architecture) |
+| 5 | 7 | Map-only Memory capabilities (one per `AcpiReclaimable` memory-map region, up to eight, then the page holding `BootInfo.acpi_rsdp`, then the `BootInfo.device_tree` blob) |
+| 6 | 7 | One root IoPort capability over the full 64K I/O port space (x86-64 only), or one SbiControl capability carrying every sanctioned SBI right (RISC-V only) |
+| 7 | 7 | Memory capabilities for boot module images (raw ELF for procmgr, devmgr, etc.) |
+| 8 | 7 | Reclaimable Memory capabilities for bootloader scratch pages (`BootInfo`, descriptor arrays, MMIO aperture array, reclaim-array page, transient page-table frames) and the bundle's non-module pages (header + entry table + pad, init ELF source body, inter-module and trailing slack — module bodies are excluded, covered by the boot-module Memory caps above) — one cap per `BootInfo.reclaim_ranges` entry not flagged `RECLAIM_FLAG_LATE` |
+| 9 | 8 | Late-reclaim Memory capabilities (one per `BootInfo.reclaim_ranges` entry flagged `RECLAIM_FLAG_LATE`: the AP trampoline page) |
+| 10 | 9 | Init's own address space capability |
+| 11 | 9 | Memory capabilities for init's ELF segments |
+| 12 | 9 | Reclaimable Memory capabilities for the `InitInfo` pages |
+| 13 | 9 | Reclaimable Memory capabilities for init's stack pages |
+| 14 | 9 | Init's own thread capability |
+| 15 | 9 | Init's own CSpace capability |
 
-The exact slot numbers are passed to init in the `KernelHandoff` structure placed
-on init's user stack before it begins execution.
+The kernel passes the slot numbers to init in the `InitInfo` block it maps into
+init's address space (its VA is init's first argument). The `CapDescriptor` array
+lists each Phase 7 and Phase 8 slot with its type; header fields name the single
+caps and the base and count of several groups, including every Phase 9 group.
 
 ---
 

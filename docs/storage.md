@@ -73,8 +73,10 @@ kernel (phase 7) mints Mmio caps from BootInfo.mmio_apertures and the root IRQ r
 ```
 
 The kernel half (BootInfo → Mmio mint → devmgr → driver binding)
-is owned by [`device-management.md`](device-management.md). Badge
-semantics, derivation, and revocation are owned by
+is owned by [`device-management.md`](device-management.md). The
+phase-7 mint of the root IRQ range cap is owned by
+[`capability-model.md`](capability-model.md) §"Initial Capability
+Distribution". Badge semantics, derivation, and revocation are owned by
 [`capability-model.md`](capability-model.md) §"Badges".
 
 `REGISTER_PARTITION` is rejected unless the caller's badge carries

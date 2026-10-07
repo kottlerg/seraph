@@ -38,7 +38,7 @@ Each label's wire shape and error set are specified in
 | `NS_LOOKUP` / `NS_STAT` / `NS_READDIR` | no | namespace dispatch |
 | `FS_READ` | no | inline read on a file cap |
 | `FS_READ_MEMORY` | no | zero-copy read via a returned `Memory` cap |
-| `FS_RELEASE_MEMORY` | no | client-side cooperative release |
+| `FS_RELEASE_MEMORY` | no | synchronous client release of an `FS_READ_MEMORY` page (the eviction worker sends the cooperative release; fatfs does not receive it) |
 | `FS_CLOSE` | no | release per-file driver-side bookkeeping |
 | `FS_WRITE` | no | inline write on a file cap |
 | `FS_WRITE_MEMORY` | no | caller-supplied source `Memory` cap |

@@ -28,11 +28,11 @@ devmgr/
 ## Responsibilities
 
 devmgr parses firmware tables, enumerates PCI devices, binds and spawns drivers, exposes the
-device registry, brokers ACPI and shutdown hardware to pwrmgr, and handles hotplug; it is the
-sole authority for spawning device drivers. Each responsibility, the capabilities devmgr
-receives at bootstrap, and its relationship to driver processes are specified in
-[docs/responsibilities.md](docs/responsibilities.md); the system-scope design is
-[docs/device-management.md](../../docs/device-management.md).
+device registry, and brokers ACPI and shutdown hardware to pwrmgr (hotplug handling is design
+intent; not yet implemented); it is the sole authority for spawning device drivers. Each
+responsibility, the capabilities devmgr receives at bootstrap, and its relationship to driver
+processes are specified in [docs/responsibilities.md](docs/responsibilities.md); the
+system-scope design is [docs/device-management.md](../../docs/device-management.md).
 
 ---
 
@@ -54,15 +54,4 @@ receives at bootstrap, and its relationship to driver processes are specified in
 
 ## Summarized By
 
-[Capability Model](../../docs/capability-model.md),
-[Device Management](../../docs/device-management.md),
-[services/drivers/README.md](../drivers/README.md),
-[services/drivers/cmos/README.md](../drivers/cmos/README.md),
-[Driver Model](../drivers/docs/driver-model.md),
-[services/drivers/framebuffer/README.md](../drivers/framebuffer/README.md),
-[services/drivers/goldfish-rtc/README.md](../drivers/goldfish-rtc/README.md),
-[services/drivers/serial/README.md](../drivers/serial/README.md),
-[services/drivers/virtio/input/README.md](../drivers/virtio/input/README.md),
-[services/init/README.md](../init/README.md), [init Bootstrap Stages](../init/docs/bootstrap.md),
-[services/pwrmgr/README.md](../pwrmgr/README.md),
-[Restart Protocol](../svcmgr/docs/restart-protocol.md)
+None

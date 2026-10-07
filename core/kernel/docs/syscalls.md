@@ -390,9 +390,11 @@ entire bitmask (see [ipc-design.md](../../../docs/ipc-design.md) § Notification
 **Return:**
 
 - `rax`/`a0`: 0 on success; `SyscallError` on failure
-- `rdx`/`a1`: acquired bitmask on success (non-zero on notification wake; `0`
-  on timeout — unambiguous because `notification_send` rejects zero-bit sends,
-  so a real wake always carries a non-zero mask)
+- `rdx`/`a1`: acquired bitmask on success (non-zero on notification wake,
+  because `notification_send` rejects zero-bit sends; `0` when the timeout
+  elapses, or when the notification is destroyed while the caller waits, which
+  returns success with no `Interrupted` stamp, even with `timeout_ms` = `0`;
+  #443)
 
 Same register layout as `SYS_EVENT_RECV`. The split avoids aliasing
 bit-63-set bitmasks with the dispatcher's negative-Err encoding, so the
@@ -446,7 +448,9 @@ Dequeue the next entry from an event queue with optional bounded wait.
 **Return:**
 
 - `rax`/`a0`: 0 on success; `SyscallError` on failure
-- `rdx`/`a1`: dequeued payload word (valid on success)
+- `rdx`/`a1`: dequeued payload word (valid on success); a queue destroyed
+  while the caller is parked returns success with a payload of `0` that was
+  never posted (#443)
 
 **Capability requirement:** `queue_cap` must have Recv rights.
 
@@ -457,8 +461,9 @@ the caller already knows which mode it asked for. The kernel uses an
 out-of-band marker (`tcb.timed_out`) rather than an in-band
 `wakeup_value` sentinel because event-queue payloads may be any `u64`
 (0 included; see [ipc-internals.md](ipc-internals.md) § Event Queue, Recv Path)
-— contrast `SYS_NOTIFICATION_WAIT`, where `wakeup_value == 0` suffices because
-`notification_send` rejects zero-bit sends.
+— contrast `SYS_NOTIFICATION_WAIT`, where a notification wake never carries
+0 bits because `notification_send` rejects zero-bit sends, so a `0` result
+means the timeout elapsed or the notification was destroyed.
 
 ---
 
@@ -1368,7 +1373,11 @@ merely names where the thread's faults are delivered. The kernel synthesizes fau
 delivery via the binding and distributes no send capability to the endpoint, so a
 handler that hands out no `SEND` to it receives `FAULT_LABEL` only from the kernel;
 a handler that also serves clients on that endpoint attributes the message by
-badge (see [fault-handling.md](../../../docs/fault-handling.md) § Security).
+badge (see [fault-handling.md](../../../docs/fault-handling.md) § Security). The
+fault badge is binder-chosen and any `Endpoint` cap, a `SEND`-only one included,
+is enough to bind, so any holder of `Control` on some thread can deliver
+`FAULT_LABEL` messages bearing an arbitrary badge; a handler sharing its endpoint
+with clients can trust the badge only if its badges are secret.
 
 Both page faults (`FAULT_KIND_VM`) and other kernel-unresolvable ring-3 exceptions
 (`FAULT_KIND_EXCEPTION`) are routed to the bound handler; the handler dispatches on
@@ -2078,11 +2087,12 @@ intact (see [capability-internals.md](capability-internals.md) § Safe Delegatio
 
 ## Atomicity and Preemption Guarantees
 
-- **Capability transfer is all-or-nothing with the message.** The receiver gets every
-  capability the message carries or none; a capability set is never partially delivered.
-  A refusal that arises after the sender blocked delivers the message with zero
-  capabilities, and the sender keeps them (see
-  [ipc-design.md](../../../docs/ipc-design.md) § Message Format).
+- **Capability transfer is all-or-nothing at commit.** Either every capability's
+  move begins with the message or none does. A refusal that arises after the sender
+  blocked delivers the message with zero capabilities, and the sender keeps them (see
+  [ipc-design.md](../../../docs/ipc-design.md) § Message Format). The per-capability
+  outcomes of a move batched after commit are specified in
+  [capability-internals.md](capability-internals.md) § Move.
 
 - **Capability operations complete before returning.** Derivation, deletion, and
   revocation each complete fully before the syscall returns. A revocation that
@@ -2101,9 +2111,11 @@ intact (see [capability-internals.md](capability-internals.md) § Safe Delegatio
   first remote access (see [memory-internals.md](memory-internals.md) § SMP TLB Shootdown).
   Either way the end state is coherent before the access completes.
 
-- **Syscalls may be preempted.** Long-running operations (revocation traversal, SMP
-  TLB shootdowns) may be interrupted by a higher-priority runnable thread. The kernel
-  uses appropriate locks and re-checks state on resumption to ensure correctness.
+- **Syscalls are not preempted.** Syscall context runs with interrupts masked.
+  Long-running operations (revocation traversal, SMP TLB shootdown waits) proceed in
+  bounded batches or in preempt-disabled, interrupt-enabled windows, and re-check
+  state between batches (see [scheduling-internals.md](scheduling-internals.md)
+  § Lock Hierarchy).
 
 - **Blocking syscalls are interruptible.** Any syscall that can block (`SYS_IPC_CALL`,
   `SYS_IPC_RECV`, `SYS_NOTIFICATION_WAIT`, `SYS_EVENT_RECV`, `SYS_WAIT_SET_WAIT`) returns

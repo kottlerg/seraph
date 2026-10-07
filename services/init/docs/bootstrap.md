@@ -212,19 +212,23 @@ endowment (see the [svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md)).
   [Reconciliation](../../svcmgr/docs/service-definitions.md#reconciliation)).
 - Stream every reclaimable Memory cap init solely owns (ELF segments,
   user stack pages, `InitInfo` pages, the bootloader/bundle reclaim
-  ranges, the AP-trampoline memory cap, and the boot-module ELF sources)
-  to procmgr in further `REGISTER_INIT_TEARDOWN` rounds, then send
-  `INIT_TEARDOWN_DONE` (`finish_init_reap_handoff` in
-  `../src/service.rs`). The usable-RAM range (already memmgr's), the
+  ranges, the AP-trampoline memory cap, the boot-module ELF sources, the
+  usable-RAM caps that did not fit the bootstrap round, and
+  `MemoryAlloc`'s orphaned remainders) to procmgr in further
+  `REGISTER_INIT_TEARDOWN` rounds, then send `INIT_TEARDOWN_DONE`
+  (`finish_init_reap_handoff` in `../src/service.rs`). The usable-RAM
+  prefix already forwarded to memmgr (below the reap floor), the
   firmware read-only caps, and init's own bootstrap backing
   (arena-forwarded to memmgr at `finalize_memmgr`) are excluded.
 - Call `sys_thread_exit`. Procmgr's `INIT_REAP_CORRELATOR` death
-  observers, bound on both init threads by the first
+  observers are bound on both init threads by the first
   `REGISTER_INIT_TEARDOWN` round (see the
-  [procmgr IPC interface](../../procmgr/docs/ipc-interface.md)), run
-  [`init_reap::run_reap`](../../procmgr/src/init_reap.rs) only after the
-  second death, normally init-logd's once real-logd's `HANDOVER_RELEASE`
-  releases it: both Thread caps are deleted, init's `AddressSpace` is
+  [procmgr IPC interface](../../procmgr/docs/ipc-interface.md)). Each
+  init-thread death runs
+  [`init_reap::run_reap`](../../procmgr/src/init_reap.rs), which counts
+  deaths down and tears init down on the second, once
+  `INIT_TEARDOWN_DONE` has armed the reap (normally init-logd's death,
+  after real-logd's `HANDOVER_RELEASE`): both Thread caps are deleted, init's `AddressSpace` is
   revoked + deleted (its pool donations `retype_free`'d, user-page
   mappings vanish), the accumulated Memory caps are `DONATE_MEMORY_CAPS`'d to
   memmgr's pool, init's `CSpace` is revoked + deleted (cascading
@@ -292,8 +296,8 @@ enumerates init's side of it.
 [ELF Loading](../../../core/boot/docs/elf-loading.md),
 [System Bootstrap](../../../docs/bootstrap.md),
 [Device Management](../../../docs/device-management.md),
-[services/devmgr/README.md](../../devmgr/README.md), [services/init/README.md](../README.md),
-[logd IPC interface](../../logd/docs/ipc-interface.md),
+[devmgr Responsibilities and Capabilities](../../devmgr/docs/responsibilities.md),
+[services/init/README.md](../README.md), [logd IPC interface](../../logd/docs/ipc-interface.md),
 [memmgr Memory Pool](../../memmgr/docs/memory-pool.md),
 [services/procmgr/README.md](../../procmgr/README.md),
 [procmgr IPC Interface](../../procmgr/docs/ipc-interface.md),

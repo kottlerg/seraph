@@ -32,8 +32,8 @@ Two access tiers exist on this endpoint, distinguished by the kernel-supplied
 caller badge; unbadged callers are rejected:
 
 1. **Whole-disk (`MOUNT_AUTHORITY`-badged)** — minted by devmgr on
-   `QUERY_BLOCK_DEVICE` and held by vfsd. Reads are bounded only by device
-   capacity. Permitted to issue `REGISTER_PARTITION`.
+   `QUERY_BLOCK_DEVICE` and held by vfsd. Reads and writes are bounded only
+   by device capacity. Permitted to issue `REGISTER_PARTITION`.
 2. **Per-partition (partition badge, `MOUNT_AUTHORITY` clear)** — minted by
    the driver and returned in the `REGISTER_PARTITION` reply; vfsd hands them
    to filesystem drivers. The kernel rejects re-badging a badged source, so
@@ -170,14 +170,6 @@ outcome, so it never accumulates in the driver's `CSpace`.
 The notify-after-avail-update memory-ordering pair (release fence on the
 producer, the device's implicit load-acquire on the doorbell MMIO)
 matches the VirtIO 1.2 §2.9.3 driver-notification contract.
-
----
-
-## Sentinel Values
-
-Capabilities injected at driver creation time are identified by sentinel
-values in the `CapDescriptor.aux0` field, per
-[services/drivers/docs/driver-model.md](../../docs/driver-model.md).
 
 ---
 

@@ -73,22 +73,27 @@ procmgr/
   new spawn alongside procmgr's own death observer (correlator =
   process badge, equal to logd's per-sender slot key). See
   [docs/ipc-interface.md](docs/ipc-interface.md) § `REGISTER_DEATH_EQ`.
-- **Init reap** — accept init's `REGISTER_INIT_TEARDOWN` handoff at the
-  end of init's Handover stage
-  ([services/init/docs/bootstrap.md](../init/docs/bootstrap.md) § Handover) and tear
-  down init's residue. See the [Init reap](#init-reap) subsection below.
+- **Init reap** — accept init's `REGISTER_INIT_TEARDOWN` handoff during
+  init's Handover stage
+  ([services/init/docs/bootstrap.md](../init/docs/bootstrap.md) § Handover):
+  kernel-object caps before `HANDOVER_COMPLETE`, reclaimable Memory caps and
+  `INIT_TEARDOWN_DONE` after. Then tear down init's residue. See the
+  [Init reap](#init-reap) subsection below.
 
 ---
 
 ## Init reap
 
-Procmgr accepts init's `REGISTER_INIT_TEARDOWN` handoff at the end of init's Handover
-stage ([services/init/docs/bootstrap.md](../init/docs/bootstrap.md) § Handover): init's
-own `AddressSpace` / `CSpace` / `Thread` caps plus every reclaimable Memory cap. Procmgr
-binds a death-EQ observer on **both** init threads (main + init-logd) with
-`INIT_REAP_CORRELATOR` and reaps once both have exited — init-logd outlives main until
-the svcmgr-launched real-logd releases it via `HANDOVER_RELEASE` (see
-[logd handover protocol](../logd/docs/handover-protocol.md)). The reap is purely
+Procmgr accepts init's `REGISTER_INIT_TEARDOWN` handoff during init's Handover stage
+([services/init/docs/bootstrap.md](../init/docs/bootstrap.md) § Handover). The first
+round, before init signals `HANDOVER_COMPLETE`, carries init's own `AddressSpace` /
+`CSpace` / `Thread` caps, so procmgr's death observers are bound before real-logd can
+release init-logd; later rounds carry every reclaimable Memory cap, and
+`INIT_TEARDOWN_DONE` ends the handoff. Procmgr binds a death-EQ observer on **both** init
+threads (main + init-logd) with `INIT_REAP_CORRELATOR` and reaps once both have exited
+— init-logd outlives main until the svcmgr-launched real-logd releases it via
+`HANDOVER_RELEASE` (see [logd handover protocol](../logd/docs/handover-protocol.md)).
+The reap is purely
 death-driven: procmgr waits for that natural exit and never force-stops init-logd. If a
 handover never completes (real-logd crashes mid-pull or never launches), init-logd serves
 on and init's memory caps stay held until shutdown — a benign hold, not a wedge; the
@@ -189,9 +194,13 @@ Boundaries Between memmgr and procmgr" for the full split.
 ## Relationship to svcmgr
 
 svcmgr monitors services and requests restarts via procmgr's IPC
-interface. svcmgr also holds raw process-creation syscall capabilities
-as a fallback to restart procmgr itself if procmgr crashes. This is the
-only case where a process is created without going through procmgr.
+interface. svcmgr holds no process-creation capabilities: every process
+other than init's raw-bootstrap set (memmgr and procmgr) is created
+through procmgr. A raw-syscall fallback that lets svcmgr recreate
+procmgr if procmgr itself crashes is design intent; not yet implemented
+(#26) (see
+[services/svcmgr/docs/restart-protocol.md](../svcmgr/docs/restart-protocol.md#procmgr-fallback)
+§ procmgr Fallback).
 
 ---
 

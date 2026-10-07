@@ -1171,8 +1171,8 @@ fn collect_identity_regions(
 ///
 /// On x86-64, after `mov cr3` the CPU fetches the next instruction at the same
 /// virtual address; under UEFI x86-64 VA == PA, so the symbol address doubles
-/// as the physical address. On RISC-V the stub returns (0, 0) and this is a
-/// no-op.
+/// as the physical address. On RISC-V the trampoline page(s) are likewise
+/// identity-mapped RX so execution continues across the satp write.
 fn install_handoff_trampoline_mapping(
     page_table: &mut arch::current::BootPageTable,
 ) -> Result<(), BootError>

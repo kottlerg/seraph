@@ -50,8 +50,8 @@ Allocation Contract").
   cap (DMA buffers, large heap grow operations). Wire shape in
   [`docs/ipc-interface.md`](docs/ipc-interface.md) §"Label 1: `REQUEST_MEMORY_CAPS`".
 - **Per-process tracking** — maintain a per-process record of the Memory
-  caps memmgr has handed out, keyed on a memmgr-minted per-process badge
-  (issued at procmgr's `REGISTER_PROCESS`; see
+  caps memmgr has handed out, keyed on a per-process badge (memmgr-minted at
+  procmgr's `REGISTER_PROCESS`; procmgr's own is init's bootstrap badge; see
   [`docs/memory-pool.md`](docs/memory-pool.md) §"Per-Process Tracking").
 - **Reclamation on process death** — on `PROCESS_DIED` from procmgr,
   reclaim the dead process's memory caps into the free pool (see

@@ -65,7 +65,11 @@ driver, sends `FS_MOUNT` (see
 to validate the BPB, captures the driver's
 root cap into [`VfsdRootBackend`], and replies with a badged SEND on
 the new filesystem's namespace endpoint addressing its root. A mount
-on `/` is rejected (`NO_MOUNT`) once root is already mounted.
+on `/` once root is already mounted is rejected (`TABLE_FULL`) at the
+install step. The partition registration and fatfs spawn run before that
+step and are not undone, so the registration leaks and the spawned fatfs
+driver is left orphaned; see
+[#452](https://github.com/kottlerg/seraph/issues/452).
 
 When the requested role is the rootfs (`MountRole::Root`, byte `0`),
 vfsd additionally auto-mounts the EFI System Partition at `/esp` and
@@ -97,9 +101,9 @@ the arch-neutral `SERAPH_DATA` GUID.
 
 **Reply (error)**: `label = vfsd_errors::*` (`NOT_FOUND` for an
 unknown role byte or invalid path length, `NO_MOUNT` if no partition
-matches the role GUID, if duplicate-priority partitions are detected,
-or if root is already mounted, `SPAWN_FAILED`, `IO_ERROR`,
-`TABLE_FULL`).
+matches the role GUID or if duplicate-priority partitions are detected,
+`SPAWN_FAILED`, `IO_ERROR`, `TABLE_FULL` if the synthetic-root install
+fails, including when root is already mounted).
 
 Single-component mount paths only (`/`, `/<name>`). Multi-component
 paths are not surfaced through `NS_LOOKUP` and remain reachable only
@@ -124,4 +128,5 @@ via the root mount's transparent delegation.
 [Storage](../../../docs/storage.md),
 [Filesystem Driver Protocol](../../fs/docs/fs-driver-protocol.md),
 [services/init/README.md](../../init/README.md),
-[init Bootstrap Stages](../../init/docs/bootstrap.md), [services/vfsd/README.md](../README.md)
+[init Bootstrap Stages](../../init/docs/bootstrap.md), [services/vfsd/README.md](../README.md),
+[Synthetic Root and Namespace Composition](namespace-composition.md)

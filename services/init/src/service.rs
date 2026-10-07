@@ -1107,7 +1107,10 @@ fn endow_svcmgr(
     // Terminal round (LOGD_SOURCES): the reserved master-log endpoint source
     // and the badge-0 procmgr `SEND|GRANT` source. svcmgr mints real-logd's
     // bootstrap caps from these on every (re)launch. A zero slot rides if a
-    // source derive failed; svcmgr degrades (logd unlaunchable) but survives.
+    // source derive failed and reaches logd as a zero cap: without the death-auth
+    // source logd runs but cannot reclaim per-sender slots; without the master-log
+    // source logd exits at startup and, being `critical = yes` with no
+    // `on_failure` restart for a clean exit, svcmgr starts a graceful shutdown.
     let _ = serve(
         bootstrap_ep,
         child_badge,

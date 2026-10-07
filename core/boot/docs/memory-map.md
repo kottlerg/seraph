@@ -65,33 +65,43 @@ in-place, no-allocation, no-recursion implementation is preferred.
 
 Every bootloader allocation uses `EfiLoaderCode` or `EfiLoaderData` and
 therefore surfaces as `MemoryType::Loaded`. The kernel never hands
-`Loaded` regions to its buddy allocator. The bootloader-scratch subset
-recorded in `BootInfo.reclaim_ranges` is minted as reclaimable Memory caps
-in Phase 7 (the AP trampoline page is late-minted in Phase 8), and init
-donates those caps to memmgr at reap; kernel-image and init-segment pages
-are never reclaimed. See
-[initialization.md](../../kernel/docs/initialization.md) §"Phase 7: Capability System",
-and §"Phase 3: Kernel Page Tables" step 7 for the bootloader page-table
-frames. The `Loaded` allocations are:
+`Loaded` regions to its buddy allocator. Three `Loaded` sets return to the
+pool, each through reclaimable Memory caps that the kernel hands to init;
+init hands those caps to procmgr, which donates them to memmgr when it reaps
+init (see [process-lifecycle.md](../../../docs/process-lifecycle.md) §"Init reap"):
+
+- The bootloader-scratch subset recorded in `BootInfo.reclaim_ranges`, minted
+  in Phase 7 (the AP trampoline page is late-minted in Phase 8). See
+  [initialization.md](../../kernel/docs/initialization.md) §"Phase 7: Capability System",
+  and §"Phase 3: Kernel Page Tables" step 7 for the bootloader page-table
+  frames.
+- The boot-module bodies, minted by `mint_module_memory_caps` in Phase 7.
+- The init image LOAD segments, minted in Phase 9 (see
+  [initialization.md](../../kernel/docs/initialization.md)
+  §"Phase 9: Init Creation and Scheduler Entry").
+
+Every other `Loaded` page is permanent: the kernel image, the kernel handoff
+stack (kept as the BSP boot stack), the kernel ELF file read buffer, the raw
+UEFI memory-map buffer, and, on riscv64, the paging-mode probe page.
+
+The `Loaded` allocations are:
 
 - Kernel image LOAD segments, placed in a bootloader-chosen contiguous span.
+- Kernel ELF file read buffer.
 - Init image LOAD segments, placed at any free physical address.
-- Boot-module file buffers, placed at any free physical address.
+- Bundle blob: one allocation holding the bundle header and entry table,
+  every boot-module body, and the init ELF source.
 - `BootInfo` structure page.
+- `BootInfo.modules` descriptor page.
 - `MmioAperture` array page (`mmio_apertures.entries`).
-- Memory-map buffer itself.
-- Kernel handoff stack (`KERNEL_STACK_PAGES`, 64 KiB), allocated by the
-  bootloader as `EfiLoaderData`.
+- Raw UEFI memory-map buffer (the `GetMemoryMap` output).
+- Translated `MemoryMapEntry` array (`BootInfo.memory_map`).
+- Reclaim-array page (the `BootInfo.reclaim_ranges` backing).
+- AP trampoline page, when allocated.
+- Kernel handoff stack (`KERNEL_STACK_PAGES`, 64 KiB).
 - Page-table frames allocated for the initial mapping (see
   [page-tables.md](page-tables.md)).
-
-The `BootInfo.modules` descriptor page is similarly `Loaded` and is a
-`BootInfo.reclaim_ranges` entry; the module bodies get Memory caps from
-`mint_module_memory_caps`. The kernel mints both in Phase 7, before init
-exists, and hands them to init (see
-[initialization.md](../../kernel/docs/initialization.md) §"Phase 7: Capability System").
-The pages return to the pool only when init donates those caps to memmgr at
-reap (see [process-lifecycle.md](../../../docs/process-lifecycle.md) §"Init reap").
+- riscv64 only: the paging-mode probe page.
 
 ---
 

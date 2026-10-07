@@ -15,7 +15,7 @@ by [devmgr](../../devmgr/README.md) on RISC-V QEMU virt via the non-PCI simple-d
 walks to from the `LOOKUP | READ` `/services/drivers/` subtree cap
 svcmgr delivers post-handover via `devmgr_labels::SET_DRIVERS_DIR` (see
 [Device Management](../../../docs/device-management.md#driver-binary-sources)).
-[devmgr](../../devmgr/README.md#responsibilities) owns the
+[devmgr](../../devmgr/docs/responsibilities.md#responsibilities) owns the
 driver's service endpoint and mints client SEND caps on
 `devmgr_labels::QUERY_RTC_DEVICE`, each badged with
 `rtc_labels::READ_AUTHORITY`. The [`timed`](../../timed/README.md) service resolves the SEND

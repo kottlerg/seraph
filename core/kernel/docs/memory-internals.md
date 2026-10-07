@@ -387,7 +387,8 @@ donation-record mechanism.
 
 ## Summarized By
 
-[core/kernel/README.md](../README.md), [Architecture Abstraction Layer](arch-interface.md),
+[Page Tables](../../boot/docs/page-tables.md), [core/kernel/README.md](../README.md),
+[Architecture Abstraction Layer](arch-interface.md),
 [Capability Subsystem Internals](capability-internals.md),
 [Kernel Initialization Sequence](initialization.md), [IPC Subsystem Internals](ipc-internals.md),
 [SMP Scheduling and Locking Invariants](scheduling-internals.md),

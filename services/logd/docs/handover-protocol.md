@@ -123,8 +123,9 @@ replies `DONE` with `word(0) = LINE` and zero inline bytes. `DONE`
 transfers no exit semantics; init-logd keeps serving. Real-logd, on
 seeing `DONE`, returns from [`handover::pull_all`](../src/handover.rs)
 and calls [`handover::send_release`](../src/handover.rs), which issues
-`HANDOVER_RELEASE` (retried until acked). Init-logd acks, sets
-`HANDOVER_COMPLETE`, and its next loop iteration calls `sys_thread_exit`.
+`HANDOVER_RELEASE` (retried up to `MAX_RETRIES` (64) times until acked).
+Init-logd acks, sets `HANDOVER_COMPLETE`, and its next loop iteration
+calls `sys_thread_exit`.
 
 In-flight `STREAM_BYTES` sends from other processes queue at the kernel
 endpoint and are drained by real-logd once it enters its main receive
@@ -136,6 +137,7 @@ loop.
 |---|---|---|
 | `HANDOVER_PULL` IPC returns error mid-drain | A kernel IPC rendezvous race on the shared endpoint, or an invalid `log_ep_handover_send` | `pull_all` returns; logd still issues `HANDOVER_RELEASE`, so init-logd is released. At most some pre-handover history is lost. |
 | `HANDOVER_RELEASE` never delivered (cap is `0`, e.g. a logd restart; or logd never launches) | No init-logd→logd channel exists | init-logd keeps serving and procmgr never reaps init; init's memory caps stay held until shutdown — a benign hold, not a wedge. procmgr does not force-stop init-logd (see `services/procmgr/src/init_reap.rs`). |
+| `HANDOVER_RELEASE` retries exhausted (`send_release` makes `MAX_RETRIES` (64) attempts, none acknowledged) | init-logd unreachable on the handover SEND for every attempt | `send_release` returns without an ack and logd deletes `cap[1]` regardless; init-logd keeps serving and procmgr never reaps init, so init's memory caps stay held until shutdown (the same benign hold as the row above). |
 | Reply with unknown `word(0)` kind | Wire-format drift; one side built against an out-of-sync `shared/ipc` revision | Real-logd skips the chunk and continues. A bounded iteration cap (`MAX_ITERS`) in `pull_all` guarantees termination on a malformed reply stream. |
 
 ## Reference
@@ -153,4 +155,5 @@ side) and [`services/logd/src/handover.rs`](../src/handover.rs)
 [services/init/README.md](../../init/README.md),
 [init Bootstrap Stages](../../init/docs/bootstrap.md), [services/logd/README.md](../README.md),
 [logd IPC interface](ipc-interface.md), [services/procmgr/README.md](../../procmgr/README.md),
+[procmgr IPC Interface](../../procmgr/docs/ipc-interface.md),
 [`.svc` Service Definitions](../../svcmgr/docs/service-definitions.md)

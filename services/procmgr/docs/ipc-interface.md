@@ -69,7 +69,7 @@ its copies of cap[0] and cap[1] whether creation succeeds or fails.
 |---|---|
 | label | 0 (success) |
 | cap[0] | Process handle (badged endpoint identifying this process) |
-| cap[1] | Child `Thread` capability (Control right) |
+| cap[1] | Child `Thread` capability (Control and Observe rights, `RIGHTS_THREAD`) |
 
 The process handle is a badged endpoint capability. The caller uses it for the
 per-process operations — the badge identifies the process without a forgeable
@@ -88,7 +88,7 @@ stop/configure the thread.
 |---|---|---|
 | 1 | `INVALID_ELF` | No module capability was transferred |
 | 2 | `OUT_OF_MEMORY` | Creation failed: module mapping, ELF validation or loading, or kernel-object or memory-cap allocation |
-| 7 | `INVALID_ARGUMENT` | Reserved label bits `[28..32]` set, or the scheduling fields exceed the creator's band |
+| 7 | `INVALID_ARGUMENT` | Reserved label bits `[28..32]` set, or the scheduling fields violate the resolution rules below (band above the creator's ceiling, or priority above the resolved band) |
 
 **Pinned flag.** Demand paging is the default: at finalize procmgr binds every
 child's main thread fault handler to memmgr (the system pager) via
@@ -175,7 +175,7 @@ Destroy a process. Sent on the process handle with no data words or caps.
 procmgr removes the process entry, revokes and deletes the child's `Thread`,
 `CSpace`, `AddressSpace`, `ProcessInfo` Memory cap, and TLS Memory cap, deletes
 any namespace caps never consumed by `START_PROCESS`, and sends memmgr
-`PROCESS_DIED` so it reclaims every memory cap attributed to the child.
+`PROCESS_DIED` for the child's memmgr badge.
 
 **Reply:** label 0 (success), always. An unknown or already-destroyed badge is
 a no-op.
@@ -217,8 +217,11 @@ child. Sent on the process handle.
 procmgr copies each cap into the child's CSpace and writes the slots into the
 direction's `<dir>_memory_cap`, `<dir>_data_notification_cap`, and
 `<dir>_space_notification_cap` fields of the child's `ProcessInfo`, then deletes
-its own copies on success and failure alike. A spawner calls this once per piped
-direction; a later call for the same direction overwrites the earlier one.
+its own copies on success and on every failure but one: when fewer than three
+caps are attached, procmgr replies `INVALID_ARGUMENT` without deleting the
+attached caps, which stay in procmgr's CSpace (#449). A spawner calls this
+once per piped direction; a later call for the same direction overwrites the
+earlier one.
 
 **Error codes:** 2 `OUT_OF_MEMORY` (mapping or `cap_copy` failed), 4
 `INVALID_BADGE`, 5 `ALREADY_STARTED`, 7 `INVALID_ARGUMENT` (fewer than three
@@ -284,8 +287,8 @@ child `Thread` cap).
 |---|---|---|
 | 1 | `INVALID_ELF` | `file_size` is zero, or ELF validation or relocation failed |
 | 2 | `OUT_OF_MEMORY` | Memory-cap, kernel-object, or badge allocation failed |
-| 7 | `INVALID_ARGUMENT` | No file cap, reserved label bits `[28..32]` set, or the scheduling fields exceed the creator's band |
-| 10 | `IO_ERROR` | `FS_READ` against the file cap failed |
+| 7 | `INVALID_ARGUMENT` | No file cap, reserved label bits `[28..32]` set, or the scheduling fields violate the resolution rules (band above the creator's ceiling, or priority above the resolved band) |
+| 10 | `IO_ERROR` | `FS_READ` against the file cap failed; detecting a failed or zero-byte `FS_READ_MEMORY` mid-segment is design intent; not yet implemented (#449): today the segment tail stays zeroed and creation succeeds |
 | 11 | `MAP_FAILED` | Mapping failed during segment load |
 | 12 | `INSUFFICIENT_RIGHTS` | Rights derivation failed during segment load |
 
@@ -303,8 +306,8 @@ process creation and does not return it.
 
 On a create reply, procmgr transfers a badged process handle endpoint (for
 subsequent per-process operations) and a derived copy of the child's `Thread`
-capability (Control right) to the caller. procmgr retains the original caps
-for process lifecycle management.
+capability (Control and Observe rights, `RIGHTS_THREAD`) to the caller. procmgr
+retains the original caps for process lifecycle management.
 
 ---
 
@@ -327,8 +330,10 @@ entry.badge as u32)` on every live entry. From that moment onward,
 every newly spawned child (correlator = process badge).
 
 Reply: `procmgr_errors::SUCCESS` on bind, `UNAUTHORIZED` if the
-caller lacks `DEATH_EQ_AUTHORITY`, `INVALID_ARGUMENT` if no cap was
-transferred. Re-registration replaces the previous cap.
+caller lacks `DEATH_EQ_AUTHORITY` or a death EQ is already registered,
+`INVALID_ARGUMENT` if no cap was transferred. Registration is first-wins:
+procmgr deletes the cap a second registration transfers and keeps the first,
+so a restarted logd receives no death events.
 
 logd derives a `POST`-only copy from its `RECV+POST` event queue
 before sending — the kernel's cap-transfer moves the sent cap into

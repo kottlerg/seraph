@@ -6,12 +6,12 @@
 //! Fixed-capacity name→endpoint-cap registry for supervisor services.
 //!
 //! Each supervisor (svcmgr today) holds a [`Registry`] that maps
-//! short ASCII names to capability-slot indices in its own `CSpace`. Callers
-//! query via `QUERY_ENDPOINT`; the supervisor's handler calls [`Registry::lookup`]
-//! and attaches the cap to the IPC reply.
+//! short byte-string names to capability-slot indices in its own `CSpace`. Callers
+//! query via `QUERY_ENDPOINT`; the supervisor's handler resolves the name with
+//! [`Registry::lookup`] and replies with a SEND cap derived from the registered slot.
 //!
-//! Storage is statically sized (`N` entries, `NAME_MAX`-byte names) to fit the
-//! `no_std`, no-allocator constraint of current userspace. A full match is
+//! Storage is statically sized (`N` entries, `NAME_MAX`-byte names) and the crate
+//! needs no allocator. A full bytewise match is
 //! required — no prefix or glob matching.
 
 #![no_std]

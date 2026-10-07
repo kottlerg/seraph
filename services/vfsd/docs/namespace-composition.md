@@ -185,11 +185,14 @@ vfsd holds two un-badged endpoints:
 
 At startup vfsd spawns the namespace dispatcher first, then self-mounts
 root, `/esp`, and `/data`, then spawns the service threads. The
-dispatcher runs first because the `/esp` and `/data` mounts spawn fatfs
-via `CREATE_FROM_FILE`, which re-enters the namespace endpoint to
-resolve `/services/fs/fatfs`. Service threads start only after the
-self-mounts, so `GET_SYSTEM_ROOT_CAP` is never served against an
-unmounted root; if the root self-mount failed, it replies `NO_MOUNT`.
+dispatcher runs first because the `/esp` and `/data` mounts take the
+post-boot fatfs spawn path: vfsd resolves `/services/fs/fatfs` with an
+`NS_LOOKUP` walk through its own system-root cap, which re-enters the
+namespace endpoint, before handing the file cap to procmgr's
+`CREATE_FROM_FILE`. Service threads start only after the self-mounts,
+so `GET_SYSTEM_ROOT_CAP` is never served against an unmounted root; its
+reply contract, including `NO_MOUNT` when the root self-mount failed,
+is specified in [`vfs-ipc-interface.md`](vfs-ipc-interface.md).
 
 vfsd is also the owner of fs-process lifecycle: `MOUNT` spawns the
 fatfs driver via `worker_pool` (or, on the very first mount, from

@@ -395,11 +395,13 @@ only in the server's own CSpace (used internally to mint per-client badged
 copies) and in the CSpaces of trusted minters. Today these are init, which
 procmgr reaps once both its threads have exited after init's
 [Handover stage](../services/init/docs/bootstrap.md#handover) (see
-[process-lifecycle.md § Init reap](process-lifecycle.md#init-reap)), plus procmgr
-and svcmgr, which hold un-badged sources on other servers' endpoints for the
-system's lifetime to mint per-client badges. Every other client
-receives a badged cap whose badge value is chosen by the trusted minter — the
-client cannot subsequently re-badgeize it because of the set-once rule above.
+[process-lifecycle.md § Init reap](process-lifecycle.md#init-reap)), plus
+procmgr, svcmgr, devmgr, and vfsd, which hold un-badged sources on other servers'
+endpoints for the system's lifetime to mint per-client badges: devmgr on the
+driver service endpoints it creates, from which it mints the verb-bit query caps,
+and vfsd on the fs-driver endpoint it keeps for each terminal mount. Every other
+client receives a badged cap whose badge value is chosen by the trusted minter —
+the client cannot subsequently re-badgeize it because of the set-once rule above.
 
 Trying to harden a public authority-bearing badge value by making it "hard to
 guess" (long random sentinel, etc.) is obscurity, not security: the same cap_derive
@@ -413,7 +415,7 @@ Endpoints that serve a mix of unprivileged and privileged labels gate
 the privileged labels on a verb-bit in the caller's badge, rather than
 splitting across separate endpoints. By convention the high bit
 (`1u64 << 63`) is the first verb-bit. The set-once badge rules above
-mean only the server and its trusted bootstrap-time minters can set
+mean only the server and its trusted minters can set
 the verb-bit; a holder of an unprivileged cap cannot re-derive an
 authority cap. The server's dispatcher checks
 `msg.badge & VERB_BIT != 0` before servicing the privileged label and
@@ -626,7 +628,7 @@ At boot, the kernel creates init's Thread, AddressSpace, and CSpace and populate
 the CSpace with an initial set of capabilities covering all available resources.
 The kernel mints these during Phases 7–9 of
 [initialization.md](../core/kernel/docs/initialization.md#phase-7-capability-system)
-(Phase 8 mints the late-reclaim cap over the x86-64 AP trampoline page).
+(Phase 8 mints the late-reclaim cap over the AP trampoline page).
 
 - Memory capabilities for all usable physical memory
 - Mmio capabilities (Map | Write), one per `BootInfo.mmio_apertures` entry, plus one
@@ -698,9 +700,10 @@ The kernel does not provide:
 [Kernel Initialization Sequence](../core/kernel/docs/initialization.md),
 [Scheduler Internals](../core/kernel/docs/scheduler.md),
 [Syscall Interface Specification](../core/kernel/docs/syscalls.md),
-[Architecture Overview](architecture.md), [Device Management](device-management.md),
-[IPC Design](ipc-design.md), [Memory Model](memory-model.md), [Namespace Model](namespace-model.md),
-[Process Lifecycle](process-lifecycle.md),
+[Architecture Overview](architecture.md), [System Bootstrap](bootstrap.md),
+[Device Management](device-management.md), [IPC Design](ipc-design.md),
+[Memory Model](memory-model.md), [Namespace Model](namespace-model.md),
+[Process Lifecycle](process-lifecycle.md), [Storage](storage.md),
 [services/devmgr/README.md](../services/devmgr/README.md),
 [init Bootstrap Stages](../services/init/docs/bootstrap.md),
 [services/memmgr/README.md](../services/memmgr/README.md),

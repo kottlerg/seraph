@@ -1,7 +1,7 @@
 # abi
 
-Binary contract crates that cross component or privilege boundaries;
-[shared/README.md](../shared/README.md) indexes the non-contract crates.
+Binary ABI contract crates for the boot, kernel/userspace, and process-startup boundaries;
+[shared/README.md](../shared/README.md) indexes the shared utility crates.
 
 | Crate | Purpose |
 |---|---|

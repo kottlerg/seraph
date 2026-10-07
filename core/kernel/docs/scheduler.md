@@ -172,17 +172,14 @@ pub struct ThreadControlBlock
 
     // === IPC state ===
 
-    /// Single-use reply capability for the pending IPC call (if any).
-    reply_cap_slot: Option<ReplyCapability>,
+    /// Inline message buffer for in-flight IPC data (the staged message).
+    ipc_msg: Message,
 
-    /// Pending send message buffer (used while BlockedOnSend).
-    pending_send: PendingSendBuffer,
+    /// Caller bound for the implicit reply (set on receive, cleared on reply).
+    reply_tcb: AtomicPtr<ThreadControlBlock>,
 
-    /// Wakeup value (payload for notification/event wakeup).
+    /// Wakeup value (notification bits, event payload, or wait-set member badge).
     wakeup_value: u64,
-
-    /// Badge from a wait set wakeup.
-    wakeup_badge: u64,
 
     /// Intrusive IPC wait queue link.
     ipc_wait_next: Option<*mut ThreadControlBlock>,
@@ -583,6 +580,5 @@ optimisation.
 ## Summarized By
 
 [core/kernel/README.md](../README.md), [Kernel Initialization Sequence](initialization.md),
-[IPC Subsystem Internals](ipc-internals.md),
 [SMP Scheduling and Locking Invariants](scheduling-internals.md),
 [Syscall Interface Specification](syscalls.md)

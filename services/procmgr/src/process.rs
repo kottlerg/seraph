@@ -1288,11 +1288,8 @@ fn finalize_creation(
     // Demand-paged wiring (best-effort): delegate the child address space to
     // memmgr and bind the main thread's fault handler to it. A failure here
     // degrades to "no pager" (faults kill the thread) rather than failing an
-    // otherwise-complete creation. Demand paging is the system-wide default;
-    // `demand_paged` is false only when the caller set `CREATE_PINNED` (a DMA
-    // driver). init, memmgr, and procmgr are pre-pager and are never routed
-    // through this path, so they are pinned by construction. The exemption
-    // rule is in docs/fault-handling.md § Default System Pager.
+    // otherwise-complete creation. Which processes are exempt from the default
+    // pager is in docs/fault-handling.md § Default System Pager.
     if demand_paged && memmgr_send_cap != 0 && self_memmgr_ep != 0
     {
         // Hand memmgr its own copy of the child AS, keyed by the child's

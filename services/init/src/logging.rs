@@ -182,8 +182,9 @@ pub fn register_name(name: &[u8])
 
 // ── Serial output ────────────────────────────────────────────────────────────
 
-/// Direct serial output for init's pre-handover window; see
-/// `docs/console-model.md` item 3.
+/// Direct serial output for the main thread before init-logd is up, and for
+/// the log thread's setup-failure diagnostic; see `docs/console-model.md`
+/// § Ownership across the boot lifecycle (init-logd direct-UART fallback).
 pub(crate) fn serial_log(s: &str)
 {
     for &b in s.as_bytes()

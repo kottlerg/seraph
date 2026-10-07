@@ -183,7 +183,7 @@ and init looks each module up by name there.
 
 Device drivers run as unprivileged userspace processes. No driver code executes in
 kernel space. Hardware access is granted explicitly via capabilities and is fully
-revocable.
+revocable (for x86-64 port I/O, design intent; not yet implemented, #457).
 
 **MMIO**
 Physical MMIO regions are mapped into a driver’s address space under capability
@@ -192,7 +192,8 @@ control. Once mapped, drivers access registers directly without kernel mediation
 **Port I/O (x86‑64 only)**
 Drivers receive an IoPort capability for assigned port ranges. Binding this
 capability enables direct execution of port I/O instructions for those ranges.
-Access is revoked automatically when the capability is revoked (see
+Access is revoked automatically when the capability is revoked (design intent;
+not yet implemented, #457; see
 [capability-model.md](capability-model.md#ioport-x86-64-only)). RISC‑V does not
 support port I/O.
 
@@ -276,5 +277,6 @@ mode.
 
 [README.md](../README.md), [core/kernel/README.md](../core/kernel/README.md),
 [Syscall Interface Specification](../core/kernel/docs/syscalls.md),
+[runtime/libc/README.md](../runtime/libc/README.md),
 [services/drivers/README.md](../services/drivers/README.md),
 [services/netd/README.md](../services/netd/README.md)

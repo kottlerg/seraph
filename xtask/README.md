@@ -78,7 +78,7 @@ cargo xtask run [--arch x86_64|riscv64] [--gdb] [--headless] [--verbose] \
 | `--verbose` | Show all serial output; by default output is filtered until `[--------] boot:` appears |
 | `--cpus` | Number of vCPUs to expose to the guest (default: `4`; bounded by `1..=512`, the [boot-protocol](../abi/boot-protocol/README.md) `MAX_CPUS` the kernel sizes its per-CPU structures from) |
 | `--mem` | Guest memory size in MiB (default: `512`) |
-| `--riscv-mmu` | Guest RISC-V paging-mode ceiling (default: `sv48`; riscv64 only, ignored on x86_64). Sets the QEMU `svNN` CPU properties so the DTB `mmu-type` advertises the chosen ceiling; the bootloader negotiates the paging mode from that advertisement at boot (confirmed by a `satp` probe) and the kernel recovers the active mode from `satp`, per [docs/memory-model.md](../docs/memory-model.md) § RISC-V (Sv39 / Sv48 / Sv57). The default pins `sv48` because QEMU ≥ 8.0 otherwise defaults the rv64 CPU to `sv57` |
+| `--riscv-mmu` | Guest RISC-V paging-mode ceiling (default: `sv48`; riscv64 only, ignored on x86_64). Sets the QEMU `svNN` CPU properties so the DTB `mmu-type` advertises the chosen ceiling; the bootloader negotiates the paging mode at boot and the kernel recovers the active mode from `satp`, per [docs/memory-model.md](../docs/memory-model.md) § RISC-V (Sv39 / Sv48 / Sv57). The default pins `sv48` because QEMU ≥ 8.0 otherwise defaults the rv64 CPU to `sv57` |
 
 **x86-64** selects an acceleration backend per host: KVM on Linux,
 HVF on macOS, WHPX on Windows, NVMM on NetBSD, or TCG everywhere else
@@ -98,6 +98,15 @@ QEMU ≥ 8.0 (V extension); QEMU ≥ 9.1 unlocks the named `-cpu rva23s64`
 model (currently the runner uses the explicit feature string until the
 CI floor catches up; see [docs/build-system.md](../docs/build-system.md)
 § QEMU and Firmware).
+
+#### Attached devices
+
+Every `run` attaches, on both architectures, the disk image as `virtio-blk-pci`, a
+`virtio-keyboard-pci` keyboard (`id=kbd0`, the device `test-terminal` injects keys into over
+QMP), a `virtio-rng-pci` boot-entropy source, and the guest UART on `-serial stdio`. A
+non-headless run adds QEMU std VGA: the q35 default adapter on x86-64, and on riscv64
+`-device VGA` with a `qemu-xhci`/`usb-kbd` pair, added only when a `gtk` or `sdl` display
+backend is available. `--headless` drops the display adapter, so no framebuffer is advertised.
 
 #### Environment variables
 
@@ -497,4 +506,5 @@ pattern also matches legitimate prose.
 [Kernel Entropy Subsystem](../core/kernel/docs/entropy.md),
 [core/ktest/README.md](../core/ktest/README.md), [Architecture Overview](../docs/architecture.md),
 [Build System](../docs/build-system.md), [Coding Standards](../docs/coding-standards.md),
-[Testing](../docs/testing.md)
+[Testing](../docs/testing.md), [programs/terminal/README.md](../programs/terminal/README.md),
+[rootfs/README.md](../rootfs/README.md)

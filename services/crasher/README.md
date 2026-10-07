@@ -5,10 +5,12 @@ opt-in: its recipe lives in `/config/svcmgr/tests/`, is co-staged with `svctest`
 never launched on a normal boot.
 
 On every spawn it checks that the recipe surfaces (argv, env, cwd, and bootstrap seeds)
-survived, logs `<surface> ok` for each, and then faults on purpose (a NULL write) so svcmgr
-respawns it under `restart = always`. A surface that fails to round-trip, such as one dropped on
-restart, is logged with a `FATAL:` prefix, which the `run-parallel` fail regex catches to fail
-the run. The deliberate `USERSPACE FAULT` does not count as a failure.
+survived and logs `<surface> ok` for each. It then logs `alive` and probes the svcmgr seed with
+a `QUERY_ENDPOINT` for the unknown name `__probe__`, logging the reply label; any reply shows
+the cap is live. Finally it faults on purpose (a NULL write) so svcmgr respawns it under
+`restart = always`. A surface that fails to round-trip, such as one dropped on restart, is
+logged with a `FATAL:` prefix, which the `run-parallel` fail regex catches to fail the run. The
+deliberate `USERSPACE FAULT` does not count as a failure.
 
 ---
 
@@ -40,11 +42,11 @@ bootstrap round.
 
 ## Relevant Design Documents
 
-- [docs/testing.md](../../docs/testing.md): how harnesses and fixtures are staged and
-  co-staged
-- [docs/process-lifecycle.md](../../docs/process-lifecycle.md): process startup and
-  `ProcessInfo` handover
-- [Restart Protocol](../svcmgr/docs/restart-protocol.md): svcmgr restart policy
+| Document | Content |
+|---|---|
+| [docs/testing.md](../../docs/testing.md) | How harnesses and fixtures are staged and co-staged |
+| [docs/process-lifecycle.md](../../docs/process-lifecycle.md) | Process startup and `ProcessInfo` handover |
+| [Restart Protocol](../svcmgr/docs/restart-protocol.md) | svcmgr restart policy |
 
 ---
 

@@ -866,10 +866,14 @@ pub const fn encode_exit_code(code: u32) -> u64
 
 /// Reserved IPC label marking a kernel-originated fault message. Distinct so a
 /// handler can recognise a fault message. The label proves kernel origin only
-/// on an endpoint whose handler hands out no SEND; a handler that shares its
-/// endpoint with clients attributes the message by badge (see
-/// `docs/fault-handling.md` § Security). Reserved by the kernel; servers must
-/// not produce this label themselves. Chosen adjacent to
+/// on an endpoint whose handler hands out no SEND. The badge of a fault message
+/// is the value its binder chose in `SYS_THREAD_SET_FAULT_HANDLER`, not the
+/// badge of a cap the handler minted: binding needs only `CONTROL` on the
+/// thread and any cap to the endpoint, so a client holding a cap to a shared
+/// endpoint can bind its own thread with any badge. A handler that shares its
+/// endpoint with clients therefore cannot attribute a fault message by badge
+/// alone (see `docs/fault-handling.md` § Security). Reserved by the kernel;
+/// servers must not produce this label themselves. Chosen adjacent to
 /// [`IPC_REPLY_TRANSFER_FAILED`] (`u64::MAX`) in the reserved high range.
 pub const FAULT_LABEL: u64 = u64::MAX - 1;
 

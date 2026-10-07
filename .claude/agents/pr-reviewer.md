@@ -53,8 +53,11 @@ discipline below has been applied end-to-end.
    defines. Do not pre-enumerate paths; discover them from the repo as it
    exists today:
 
-   - System scope: the top-level `docs/*.md` and `docs/releases/README.md`
-     (the root `README.md` only routes to and summarizes them).
+   - System scope: the top-level `docs/*.md` (the root `README.md` only
+     routes to and summarizes them). This agent also reads
+     `docs/releases/README.md` with them: the standard places it in no
+     scope, and the release-notes exception under its § Backlinks and
+     Change Propagation calls it an ordinary authoritative document.
    - Component scope: the touched component's `README.md`.
    - Design-authority scope: the component's `docs/*.md`.
 

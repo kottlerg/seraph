@@ -24,14 +24,13 @@ use ipc::vfsd_labels;
 /// Request vfsd's system-root cap via [`vfsd_labels::GET_SYSTEM_ROOT_CAP`].
 ///
 /// Returns the badged SEND cap on vfsd's namespace endpoint addressing
-/// the synthetic root at full namespace rights, or `0` on failure. vfsd
-/// self-mounts root before any service thread serves its endpoint, so the
-/// call blocks until the root filesystem is available; vfsd replies
-/// `NO_MOUNT` (and this returns `0`, which init treats as FATAL) only when
-/// the self-mount failed. Init holds
-/// this cap as the seed from which all later tier-3 namespace-cap
-/// distribution flows (`cap_copy` for the parent-inherit default,
-/// walk-and-attenuate for sandboxed views).
+/// the synthetic root at full namespace rights, or `0` on any failure,
+/// which the caller treats as FATAL. The blocking and `NO_MOUNT` semantics
+/// are vfsd's `GET_SYSTEM_ROOT_CAP` contract; see
+/// `services/vfsd/docs/vfs-ipc-interface.md`. Init holds this cap as the
+/// seed from which all later tier-3 namespace-cap distribution flows
+/// (`cap_copy` for the parent-inherit default, walk-and-attenuate for
+/// sandboxed views).
 pub fn request_system_root(vfsd_ep: u32, ipc_buf: *mut u64) -> u32
 {
     let msg = ipc::IpcMessage::builder(vfsd_labels::GET_SYSTEM_ROOT_CAP)

@@ -71,6 +71,8 @@ use syscall_abi::{MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
 //     RTC_LABELS_VERSION
 //     TIMED_LABELS_VERSION
 //     SERIAL_LABELS_VERSION
+//     FB_LABELS_VERSION
+//     INPUT_LABELS_VERSION
 
 pub const PROCMGR_LABELS_VERSION: u32 = 3;
 /// IPC labels for the process manager (`procmgr`).
@@ -483,22 +485,30 @@ pub mod memmgr_labels
     /// it had issued to that badge, runs coalescing, and clears the
     /// per-process record. Idempotent on unknown badges.
     pub const PROCESS_DIED: u64 = 4;
-    /// Permanently transfer a Memory cap into memmgr's pool.
+    /// Permanently transfer a batch of Memory caps into memmgr's pool.
     ///
-    /// Used by init and procmgr to return boot-module Memory caps after the
-    /// loader has copied the ELF contents into the target process's
-    /// `AddressSpace`. The transferred cap (`caps[0]`) becomes part of
-    /// memmgr's free pool; subsequent `REQUEST_MEMORY_CAPS` callers may receive
-    /// pages derived from it.
+    /// The caller is procmgr's init reap, which hands over init's reclaimed
+    /// boot memory (ELF segments, `InitInfo`, stack, boot-module ELF
+    /// sources). memmgr accepts the label from any badged client today and
+    /// does not check a donated cap's provenance; gating it to procmgr is
+    /// tracked in #459.
     ///
     /// Wire format:
-    /// * `caps[0]` — the Memory cap to transfer (must carry `MemRights::RETYPE`).
+    /// * `caps[..]` — up to `MSG_CAP_SLOTS_MAX` Memory caps to donate; each
+    ///   MUST carry `WRITE`, `EXECUTE`, and `RETYPE` rights.
     ///
-    /// memmgr derives `phys_base` and `size` from the cap itself via
-    /// `cap_info`, so no caller-side bookkeeping is required. Reply is
-    /// `memmgr_errors::SUCCESS` on ingestion, `INVALID_ARGUMENT` if the
-    /// cap is missing RETYPE or the pool is full (cap is dropped on
-    /// reject).
+    /// memmgr derives `phys_base` and `size` from each cap via `cap_info`, so
+    /// no caller-side bookkeeping is required. A cap that is not a Memory cap
+    /// or lacks a required right is deleted and not counted. Each accepted cap
+    /// is owned by memmgr for the rest of its life, added to `pool_total`, and
+    /// placed in the free pool, coalescing where possible; a cap that finds no
+    /// free-pool slot stays owned and counted but is unreachable for
+    /// allocation until a later coalesce frees a slot.
+    ///
+    /// Reply: always `memmgr_errors::SUCCESS`, with `data[0]` =
+    /// `accepted_caps`, `data[1]` = `accepted_pages` (total pages across the
+    /// accepted caps), and `data[2]` = `pool_total_pages` (memmgr's owned page
+    /// count after the donation).
     pub const DONATE_MEMORY_CAPS: u64 = 5;
     /// Read-only query of the all-RAM-accounted identity. Callable from any
     /// badged cap; returns aggregate counts only — no caps, no state change.
@@ -2138,6 +2148,10 @@ pub mod blk_errors
     /// `MAP|WRITE` rights, `BLK_WRITE_FROM_MEMORY` source missing
     /// `MAP|READ` rights, smaller than `count * 512` bytes, or absent;
     /// also returned when `count` is 0 or `count * 512` exceeds `u32::MAX`.
+    /// virtio-blk does not yet check the `count * 512` multiply for
+    /// overflow: a `count` of 2^55 or more panics the driver under the dev
+    /// profile (`overflow-checks = true`) and wraps in release instead of
+    /// returning this error (#454).
     pub const INVALID_MEMORY_CAP: u64 = 5;
     /// Caller's compiled `BLK_LABELS_VERSION` does not match the receiver's.
     /// `REGISTER_PARTITION` is the handshake entry point and carries the

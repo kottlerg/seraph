@@ -336,8 +336,9 @@ access rather than up front — is a userspace-pager policy built on the
 fault-handler protocol ([Fault Handling](fault-handling.md)), not a kernel
 feature. memmgr implements it as the pager: a process reserves and
 registers a range via `std::os::seraph::register_demand_paged`, and on each
-first-touch fault memmgr backs the registered chunk containing the faulting
-page (up to `DEMAND_CHUNK_PAGES` pages).
+first-touch fault memmgr backs the chunk of the registered region that
+contains the faulting page (up to `DEMAND_CHUNK_PAGES` pages; see
+[services/memmgr/docs/ipc-interface.md](../services/memmgr/docs/ipc-interface.md)).
 
 ---
 

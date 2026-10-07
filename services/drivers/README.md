@@ -84,7 +84,9 @@ The full driver lifecycle is specified in
   § DMA Safety Model and [docs/architecture.md](../../docs/architecture.md)).
 - **Per-device capabilities** — [devmgr](../devmgr/README.md) delegates the
   minimum capability set for each device: MMIO region, optional interrupt line,
-  the service endpoint, and IoPort (x86-64) where applicable. See
+  the service endpoint, IoPort (x86-64) where applicable, and, for drivers that
+  fetch runtime metadata (PCI drivers, the framebuffer), a badged SEND on
+  devmgr's registry-query endpoint. See
   [docs/capability-model.md](../../docs/capability-model.md) for capability types
   and rights.
 - **Spawning** — [devmgr](../devmgr/README.md) discovers devices (PCI
@@ -144,9 +146,12 @@ client SEND caps from its registry; see
 | [docs/virtio-architecture.md](docs/virtio-architecture.md) | VirtIO transport abstraction and queue internals |
 | [docs/device-management.md](../../docs/device-management.md) | Driver lifecycle, DMA safety, security boundary |
 | [docs/ipc-design.md](../../docs/ipc-design.md) | IPC semantics, endpoints, message format |
+| [docs/architecture.md](../../docs/architecture.md) | Driver isolation and per-device authority |
+| [docs/build-system.md](../../docs/build-system.md) | Std-userspace target drivers build for |
 | [docs/capability-model.md](../../docs/capability-model.md) | Capability types, rights, delegation |
 | [docs/console-model.md](../../docs/console-model.md) | Console output ownership; the serial driver's place in it |
 | [docs/coding-standards.md](../../docs/coding-standards.md) | Formatting, naming, safety rules |
+| [docs/storage.md](../../docs/storage.md) | Block-driver delegation chain via vfsd |
 
 ---
 

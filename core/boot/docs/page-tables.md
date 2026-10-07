@@ -21,14 +21,17 @@ bootloader *builds*, described in later sections — is:
   bootloader has already applied the image's `RELATIVE` relocations for
   the chosen slide ([boot-flow.md](boot-flow.md#step-5d-apply-the-kaslr-slide)),
   so the mapped image is internally consistent.
-- An identity map covers the physical memory region containing the
-  `BootInfo` structure and every physical region it references
-  (memory-map buffer, `MmioAperture` array, `InitImage` segments,
-  all boot modules), so the kernel can read them using physical
-  addresses before its own direct-physical map is established.
-- The bootloader's stack in use at handoff is mapped at its current
-  virtual address, read-write, non-executable.
-- Nothing else is mapped. Any access outside these ranges faults.
+- An identity map, read-write and non-executable, covers the `BootInfo` page, the
+  boot-module array page, the memory-map buffer, the `MmioAperture` array page, the
+  reclaim-range array page, the handoff stack, the `InitImage` segments, the kernel
+  segments' physical frames, the kernel ELF file buffer, the bundle blob (every boot
+  module body), the framebuffer when present, and the UART MMIO page on RISC-V, so the
+  kernel can read them using physical addresses before its own direct-physical map is
+  established.
+- The handoff trampoline's page or pages are identity-mapped read-execute, so execution
+  continues across the root-table switch.
+- Nothing else is mapped; an access outside these ranges faults. The ACPI RSDP and the
+  device tree, which `BootInfo` references, are not mapped.
 
 The initial tables are **not** intended to be permanent. The kernel
 replaces them during
@@ -42,18 +45,22 @@ first-argument register — is specified in
 
 ## What Gets Mapped
 
-The initial page tables contain exactly three categories of mappings. Nothing else is
+The initial page tables contain the categories of mappings below. Nothing else is
 mapped; an access outside these ranges faults.
 
 **Kernel ELF segments** — each LOAD segment is mapped at its KASLR-biased virtual
 address (ELF virtual base + slide) with permissions derived from the ELF segment flags.
 This allows the kernel to execute from the first instruction.
 
-**Identity map of the boot region** — the `BootInfo` structure, the `MmioAperture`
-array, the memory map buffer, and all boot modules are identity-mapped (virtual address
-equals physical address). This allows the kernel to read them using physical addresses
-before its direct physical map is established in
+**Identity map of the boot region** — every read-write region the entry contract above
+lists is identity-mapped (virtual address equals physical address), non-executable.
+This allows the kernel to read them using physical addresses before its direct physical
+map is established in
 [Phase 3](../../kernel/docs/initialization.md#phase-3-kernel-page-tables).
+
+**Handoff trampoline** — the page or pages holding the handoff trampoline are
+identity-mapped read-execute, so the instruction fetch after the root-table switch
+resolves.
 
 **Handoff stack** — the bootloader allocates the kernel's entry stack
 (`KERNEL_STACK_PAGES`, 64 KiB) through `AllocatePages`, identity-maps it with read-write,
@@ -245,9 +252,8 @@ the asm and the full SAFETY justification.
 ASID 0 is used for the bootloader's tables. The kernel keeps ASID 0 for its own root
 (per the kernel entry state in [kernel-handoff.md](kernel-handoff.md)): in
 [Phase 3](../../kernel/docs/initialization.md#phase-3-kernel-page-tables) its untagged
-`activate` writes `satp` with ASID 0. It enables the ASID pool in
-[Phase 5](../../kernel/docs/initialization.md#phase-5-architecture-hardware-initialisation)
-and assigns each address space an ASID on its first tagged activation (see
+`activate` writes `satp` with ASID 0. Once it enables ASID tagging, it assigns each
+address space an ASID on its first tagged activation (see
 [Context Switch TLB Handling](../../kernel/docs/memory-internals.md#context-switch-tlb-handling)
 and [TLB Management](../../../docs/memory-model.md#tlb-management)).
 

@@ -27,7 +27,9 @@ override knob
 ([boot-flow.md § Step 5d](../core/boot/docs/boot-flow.md#step-5d-apply-the-kaslr-slide),
 [elf-loading.md § File Paths](../core/boot/docs/elf-loading.md#file-paths)),
 and the bootloader binary itself, installed both at `\EFI\seraph\boot.efi`
-and at the EFI fallback path. `BootInfo` carries no kernel command
+and at the EFI fallback path
+([build-system.md § Build Output: the Sysroot](build-system.md#build-output-the-sysroot)).
+`BootInfo` carries no kernel command
 line; root-partition identity comes from GPT type-GUID role discovery,
 performed by vfsd
 ([storage.md § GPT Role-GUID Discovery](storage.md#gpt-role-guid-discovery)),
@@ -58,7 +60,9 @@ set from `BootInfo.memory_map` (via the drained buddy), `mmio_apertures`,
 `kernel_mmio` (the RISC-V console UART), `acpi_rsdp`, `device_tree`,
 `modules`, and the `reclaim_ranges` entries without `RECLAIM_FLAG_LATE`,
 and populates the root CSpace that Phase 9 hands to init (see
-[initialization.md § Phase 7](../core/kernel/docs/initialization.md#phase-7-capability-system)).
+[initialization.md § Phase 7](../core/kernel/docs/initialization.md#phase-7-capability-system);
+the full initial set is enumerated in
+[capability-model.md § Initial Capability Distribution](capability-model.md#initial-capability-distribution)).
 Late reclaim ranges are minted into that CSpace in
 [Phase 8](../core/kernel/docs/initialization.md#phase-8-scheduler-and-smp-bringup).
 Downstream documents

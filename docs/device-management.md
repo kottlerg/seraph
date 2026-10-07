@@ -71,11 +71,12 @@ boundary devmgr sits inside.
 
 ### Security boundary
 
-devmgr holds only the capabilities delegated to it at bootstrap (by init, plus the
-SchedControl band procmgr delivers in its `ProcessInfo`) and the `/services/drivers/` cap
-svcmgr sends after handover (see Driver binary sources). Its authority is
-not re-delegable after bootstrap: init exits, and svcmgr treats devmgr as
-`restart = never`, `critical = yes`, so devmgr's death triggers a graceful shutdown.
+devmgr's hardware, platform, and scheduling authority is only what it receives at bootstrap
+(the platform set init delegates, plus the SchedControl band procmgr delivers in its
+`ProcessInfo`) and the `/services/drivers/` cap svcmgr sends after handover (see Driver
+binary sources). Its authority is not re-delegable after bootstrap: init exits, and svcmgr
+treats devmgr as `restart = never`, `critical = yes`, so devmgr's death triggers a graceful
+shutdown.
 
 ---
 
@@ -116,9 +117,7 @@ IOMMU topology is a userspace concern. The bootloader emits no IOMMU
 descriptor; ACPI and DTB reach userspace only as the opaque
 `BootInfo.acpi_rsdp` / `BootInfo.device_tree` physical addresses (see Raw
 Firmware Passthrough), over which the kernel mints read-only Memory caps,
-and `devmgr` is to perform the IOMMU-topology walk itself. Discovery
-specifics live in
-[`services/devmgr/docs/responsibilities.md`](../services/devmgr/docs/responsibilities.md).
+and `devmgr` is to perform the IOMMU-topology walk itself.
 
 Once implemented, for each IOMMU discovered `devmgr` will acquire an `Mmio`
 cap for that IOMMU's register range through the same aperture-carving flow
@@ -159,7 +158,7 @@ init
  ├── vfsd  (receives storage endpoint via QUERY_BLOCK_DEVICE)
  ├── ...
  └── svcmgr
-      ├── logd     (serial endpoint via QUERY_SERIAL_DEVICE)
+      ├── logd     (serial, framebuffer endpoints via QUERY_*_DEVICE)
       ├── pwrmgr   (ACPI tables + shutdown hw via QUERY_ACPI_TABLE / QUERY_SHUTDOWN_DEVICE)
       ├── timed    (RTC endpoint via QUERY_RTC_DEVICE)
       └── terminal (input, framebuffer, serial endpoints via QUERY_*_DEVICE)
@@ -214,10 +213,12 @@ specified in [`docs/storage.md`](storage.md).
 [Device Tree Parsing](../core/boot/docs/dtb.md),
 [Firmware Parsing](../core/boot/docs/firmware-parsing.md), [Architecture Overview](architecture.md),
 [Memory Model](memory-model.md), [Platform Requirements](platform-requirements.md),
-[Storage](storage.md), [services/devmgr/README.md](../services/devmgr/README.md),
+[Storage](storage.md),
+[devmgr Responsibilities and Capabilities](../services/devmgr/docs/responsibilities.md),
 [services/drivers/README.md](../services/drivers/README.md),
 [services/drivers/cmos/README.md](../services/drivers/cmos/README.md),
 [services/drivers/goldfish-rtc/README.md](../services/drivers/goldfish-rtc/README.md),
+[services/drivers/test-orphan/README.md](../services/drivers/test-orphan/README.md),
 [services/drivers/virtio/blk/README.md](../services/drivers/virtio/blk/README.md),
 [services/drivers/virtio/input/README.md](../services/drivers/virtio/input/README.md),
 [init Bootstrap Stages](../services/init/docs/bootstrap.md),

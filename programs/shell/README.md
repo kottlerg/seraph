@@ -20,7 +20,8 @@ shell/
 ├── src/main.rs                 # REPL, built-ins, external-command relay
 ├── path/                       # `shell-path` crate: pure host-tested lexical
 │                               # path resolution
-└── tester/                     # `shell-tester` crate: tier-3 per-program tester
+└── tester/                     # `shell-tester` crate: per-program tester
+                                # (docs/testing.md § Per-program tester protocol)
 ```
 
 ---
@@ -91,7 +92,7 @@ capabilities of its own.
 
 ## Testing
 
-Tier-3 per-program tester at `tester/` (crate `shell-tester`), installed to
+Per-program tester at `tester/` (crate `shell-tester`), installed to
 `/tests/programs/shell` and run by the `usertest` orchestrator. It drives the
 shell over piped stdio across two invocations — built-ins plus an external
 `/programs/hello` spawn, and an `/programs/stdiotest` run fed one line to prove

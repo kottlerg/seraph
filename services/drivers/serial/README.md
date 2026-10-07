@@ -28,10 +28,11 @@ serial/
 
 ## Endpoint
 
-[Devmgr](../../devmgr/README.md) carves the platform UART at its platform-static location
-(COM1 at I/O port `0x3F8` on x86-64; the QEMU `virt` NS16550 at `0x1000_0000` on RISC-V;
-data-driven discovery is [#165](https://github.com/kottlerg/seraph/issues/165)), spawns the
-driver via procmgr, and delegates the per-device arch authority cap — an `IoPort` on x86-64,
+[Devmgr](../../devmgr/docs/responsibilities.md#responsibilities) carves the platform UART at
+its platform-static location (COM1 at I/O port `0x3F8` on x86-64; the QEMU `virt` NS16550 at
+`0x1000_0000` on RISC-V; data-driven discovery is
+[#165](https://github.com/kottlerg/seraph/issues/165)), spawns the driver via procmgr, and
+delegates the per-device arch authority cap — an `IoPort` on x86-64,
 an `Mmio` on RISC-V — plus the UART interrupt cap (COM1 is ISA IRQ 4; the QEMU `virt` NS16550
 is PLIC source 10). The driver owns those caps end-to-end. Outside the driver, UART authority
 is held only by init (used by its init-logd thread, the permanent pre-driver boot fallback)

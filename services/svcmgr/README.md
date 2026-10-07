@@ -220,7 +220,7 @@ marked degraded and not restarted automatically. See
 |---|---|
 | [docs/architecture.md](../../docs/architecture.md) | System design, init/procmgr/svcmgr roles |
 | [docs/capability-model.md](../../docs/capability-model.md) | Capability types, verb-bit authority, revocation |
-| [docs/process-lifecycle.md](../../docs/process-lifecycle.md) | Userspace boot order, Phase 3 handover, process-death flow |
+| [docs/process-lifecycle.md](../../docs/process-lifecycle.md) | Userspace boot order, init's Handover stage, process-death flow |
 | [docs/coding-standards.md](../../docs/coding-standards.md) | Formatting, naming, safety rules |
 | [docs/documentation-standards.md](../../docs/documentation-standards.md) | Document hierarchy, authority, backlinks |
 

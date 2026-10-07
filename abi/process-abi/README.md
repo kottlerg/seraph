@@ -244,6 +244,8 @@ they are always compiled together with the consuming binary.
 
 [Process Lifecycle](../../docs/process-lifecycle.md),
 [Userspace Memory Model](../../docs/userspace-memory-model.md),
+[Filesystem Driver Protocol](../../services/fs/docs/fs-driver-protocol.md),
 [services/procmgr/README.md](../../services/procmgr/README.md),
 [svcmgr IPC Interface](../../services/svcmgr/docs/ipc-interface.md),
-[shared/process-layout/README.md](../../shared/process-layout/README.md)
+[shared/process-layout/README.md](../../shared/process-layout/README.md),
+[shared/registry-client/README.md](../../shared/registry-client/README.md)

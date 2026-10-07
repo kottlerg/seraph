@@ -23,7 +23,12 @@
 //! caller's TCB. Full derivation-tree reply caps are deferred to a future phase.
 //!
 //! ## Thread safety
-//! All operations must be called with the relevant scheduler lock held.
+//! Each operation takes `EndpointState::lock` (`ep.lock`) itself; it serialises
+//! the send/recv queues and the call/recv rendezvous across CPUs. A server's
+//! `reply_tcb` binding is claimed by compare-exchange, so reply, cancel and
+//! teardown race to consume it exactly once. Callers MUST NOT hold a scheduler
+//! lock on entry: the wake path acquires the per-TCB `sched_lock`, which is not
+//! reentrant.
 
 use super::message::Message;
 use crate::sched::thread::{IpcThreadState, ThreadControlBlock, ThreadState};
@@ -63,9 +68,14 @@ pub struct EndpointState
     pub lock: crate::sync::Spinlock,
 }
 
-// SAFETY: EndpointState is accessed only under the relevant scheduler lock.
+// SAFETY: every mutation of the raw queue pointers (`send_*`, `recv_*`) and of
+// the wait-set back-pointer fields happens under `EndpointState::lock`, and
+// `send_nonempty` is an atomic, so moving the state between CPUs exposes no
+// unsynchronised write.
 unsafe impl Send for EndpointState {}
-// SAFETY: EndpointState is accessed only under the relevant scheduler lock.
+// SAFETY: concurrent shared access writes the raw-pointer fields only under
+// `EndpointState::lock`; the lock-free readiness check
+// (`wait_set::source_is_ready`) reads only the atomic `send_nonempty`.
 unsafe impl Sync for EndpointState {}
 
 // Pins the retype-slot budget assumed by `cap::retype::dispatch_for(Endpoint)`:

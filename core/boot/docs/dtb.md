@@ -26,8 +26,8 @@ takes the first property of that name anywhere in the tree. The DTB's
 physical address is passed through unchanged in `BootInfo.device_tree`
 because device-level discovery, IOMMU topology included, is a userspace
 concern; `devmgr`'s own firmware-table parsing is specified under
-Responsibilities in
-[`services/devmgr/README.md`](../../../services/devmgr/README.md#responsibilities).
+Parse firmware tables in
+[`services/devmgr/docs/responsibilities.md`](../../../services/devmgr/docs/responsibilities.md#responsibilities).
 See [`docs/device-management.md`](../../../docs/device-management.md) for
 the system-scope IOMMU model.
 
@@ -73,7 +73,7 @@ values, `MAX_RANGES_ENTRIES = 4` for PCI `ranges`. Nodes exceeding
 these bounds truncate silently — the bootloader does not need
 exhaustive coverage, because device-level discovery is a userspace
 concern (see Responsibilities in
-[`services/devmgr/README.md`](../../../services/devmgr/README.md#responsibilities)).
+[`services/devmgr/docs/responsibilities.md`](../../../services/devmgr/docs/responsibilities.md#responsibilities)).
 
 ---
 

@@ -1409,17 +1409,20 @@ fn handle_process_died(req: &IpcMessage, ipc_buf: *mut u64, procmgr_badge: u64)
 
 fn handle_donate_memory_caps(req: &IpcMessage, ipc_buf: *mut u64)
 {
-    // Caller (init or procmgr) is permanently transferring reclaimed Memory
-    // caps (init's ELF segments, InitInfo, stack, boot-module ELF sources,
-    // reclaim scratch, AP trampoline) into memmgr's pool. Each donated cap
-    // must carry the full pool-frame rights ([`POOL_FRAME_RIGHTS`]) so memmgr
-    // can derive the R / RW / RX inner a demand fault or REQUEST_MEMORY_CAPS
-    // consumer needs and retype on their behalf.
+    // Caller (procmgr's init reap) is permanently transferring reclaimed
+    // Memory caps (init's ELF segments, InitInfo, stack, boot-module ELF
+    // sources, reclaim scratch, AP trampoline) into memmgr's pool. Each
+    // donated cap must carry the full pool-frame rights ([`POOL_FRAME_RIGHTS`])
+    // so memmgr can derive the R / RW / RX inner a demand fault or
+    // REQUEST_MEMORY_CAPS consumer needs and retype on their behalf.
     //
-    // We trust the caller (single-tenant userspace; donation is ungated: any
-    // badged SEND holder may donate, which only grows the pool) but
-    // still validate the cap shape via `cap_info` — a malformed or under-rights
-    // cap from a buggy loader should reject, not poison the pool.
+    // Donation is ungated: memmgr accepts it from any badged client and does
+    // not check the cap's provenance, so a client that donates a cap derived
+    // from its own memmgr grant puts frames memmgr has already lent out into
+    // the free pool a second time. Only procmgr's init reap should donate;
+    // gating donation is tracked in #459. memmgr validates only the cap shape
+    // via `cap_info` — a malformed or under-rights cap from a buggy loader
+    // rejects rather than poisoning the pool.
     let pool = pool_mut();
     let mut accepted_caps: u32 = 0;
     let mut accepted_pages: u64 = 0;

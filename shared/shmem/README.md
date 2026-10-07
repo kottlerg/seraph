@@ -4,9 +4,13 @@ Shared-memory byte transport for Seraph userspace, in two layers. `SharedBuffer`
 caps received from a peer contiguously at a chosen VA (`SharedBuffer::attach`, at most
 `MAX_PAGES` = 4 pages); the granting side owns allocation and release of the backing pages.
 `SpscHeader`, `SpscWriter`, and `SpscReader` form a single-producer, single-consumer byte ring
-over a `SharedBuffer`: two `AtomicU32` indices at the head of the region, then a power-of-two
-byte buffer, ordered with Acquire/Release on the indices. The crate holds only the mechanism;
-blocking and wake-up use a notification cap out of band.
+over any mapped shared region, given by its base VA (for example one attached with
+`SharedBuffer`). The region starts with an `SpscHeader`: the `head` and `tail` `AtomicU32`
+indices, ordered with Acquire/Release; the power-of-two `capacity`; and a `closed` flag that the
+first peer to drop sets (Release) and the surviving peer reads (Acquire) to tell an empty or full
+ring from a gone peer (reader EOF, writer `BrokenPipe`). `capacity` bytes of ring storage follow
+at offset `SpscHeader::SIZE`. The crate holds only the mechanism; blocking and wake-up use a
+notification cap out of band.
 
 `no_std`; builds inside std's dependency graph through the `rustc-dep-of-std` feature.
 

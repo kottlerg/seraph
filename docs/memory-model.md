@@ -299,7 +299,7 @@ Retype and pool allocation MUST be handled as fallible at every call site.
 ## Summarized By
 
 [abi/boot-protocol/README.md](../abi/boot-protocol/README.md),
-[ELF Loading](../core/boot/docs/elf-loading.md),
+[ELF Loading](../core/boot/docs/elf-loading.md), [Page Tables](../core/boot/docs/page-tables.md),
 [Architecture Abstraction Layer](../core/kernel/docs/arch-interface.md),
 [Kernel Cross-Boundary Disclosure Inventory](../core/kernel/docs/cross-boundary-disclosure.md),
 [Kernel Initialization Sequence](../core/kernel/docs/initialization.md),

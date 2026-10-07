@@ -71,19 +71,8 @@ static NEXT_BADGE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64
 
 // ── Bootstrap ──────────────────────────────────────────────────────────────
 //
-// vfsd → fatfs bootstrap plan (one round, 2 caps, 0 data words):
-//   caps[0]: block device (SEND) — partition-scoped badged cap on virtio-blk.
-//            vfsd registers the partition bound with virtio-blk before
-//            delivering this cap; fatfs reads by partition-relative LBA and
-//            virtio-blk enforces the bound per-badge.
-//   caps[1]: fatfs service endpoint (RIGHTS_ALL — receive + derive badges)
-//
-// log and procmgr endpoints arrive via `ProcessInfo`/`StartupInfo`.
-//
-// After bootstrap, vfsd probes fatfs with `FS_MOUNT`
-// (data[0] = FS_LABELS_VERSION) so the driver can check the label version,
-// validate the BPB, and report mount success/failure before vfsd replies to
-// the upstream MOUNT caller.
+// Bootstrap round and FS_MOUNT probe: see services/fs/docs/fs-driver-protocol.md
+// § Bootstrap caps and § Label 10: FS_MOUNT.
 
 struct FatCaps
 {

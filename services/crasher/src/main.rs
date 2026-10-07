@@ -5,19 +5,8 @@
 
 //! Deliberate-crash fixture validating svcmgr's restart path.
 //!
-//! Gated, opt-in: its recipe lives in `/config/svcmgr/tests/`, co-staged
-//! with svctest in CI and never launched on a normal boot. On every spawn
-//! it asserts the recipe surfaces survived — argv, env, cwd, and bootstrap
-//! seeds — logs `<surface> ok` for each, then deliberately faults (NULL
-//! write) so svcmgr respawns it under `restart = always`. A surface that
-//! fails to round-trip (notably one dropped on restart) is logged with a
-//! `FATAL:` prefix, which run-parallel's fail regex catches and fails the
-//! run; the deliberate `USERSPACE FAULT` itself is not a fail badge.
-//!
-//! Capabilities: the bootstrap round delivers the recipe's two seeds —
-//! `caps[0]` = svcmgr service endpoint, `caps[1]` = pwrmgr deny twin —
-//! re-resolved on every (re)spawn. Log and procmgr endpoints arrive via
-//! `ProcessInfo`, so they need no bootstrap round.
+//! Gating, the surface checks, the fail rules, and the capability slots are
+//! defined in `services/crasher/README.md`.
 
 use std::os::seraph::startup_info;
 use std::thread;

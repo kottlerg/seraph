@@ -92,19 +92,17 @@ until the kernel releases them via SBI HSM calls during SMP bringup
 The reference bootloader's architecture-specific handoff implementation
 lives in [`boot/src/arch/x86_64/handoff.rs`](../src/arch/x86_64/handoff.rs)
 and [`boot/src/arch/riscv64/handoff.rs`](../src/arch/riscv64/handoff.rs).
-The bootloader's page table is installed, the BootInfo pointer is
-loaded into the first-argument register, direction/interrupt flags are
-established per the contract above, and control transfers to
-`kernel_entry` via an unconditional jump that does not return.
+The bootloader's page table is installed, the stack pointer is switched to the bootloader-allocated
+handoff stack, the BootInfo pointer is loaded into the first-argument register, direction/interrupt
+flags are established per the contract above, and control transfers to `kernel_entry` via an
+unconditional jump that does not return.
 
 The bootloader-provided GDT (x86-64) remains active at entry; the kernel
 replaces it in Phase 5 (see [initialization.md](../../kernel/docs/initialization.md)
 § Phase 5). The kernel replaces the bootloader's root page table in Phase 3
-([initialization.md](../../kernel/docs/initialization.md) § Phase 3) but stays on
-ASID 0 (RISC-V) for its own context and for untagged address-space switches; only
-tagged address spaces receive nonzero ASIDs (see [page-tables.md](page-tables.md)
-§ Activation and [memory-internals.md](../../kernel/docs/memory-internals.md)
-§ Context Switch TLB Handling).
+([initialization.md](../../kernel/docs/initialization.md) § Phase 3); for ASID use
+after handoff see [page-tables.md](page-tables.md) § Activation and
+[memory-internals.md](../../kernel/docs/memory-internals.md) § Context Switch TLB Handling.
 
 ---
 

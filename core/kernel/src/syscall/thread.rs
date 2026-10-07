@@ -1246,6 +1246,12 @@ pub fn sys_thread_set_affinity(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         // `migrate_ready_thread` acquires, so the two serialise directly and it
         // does not need a preempt bracket.
         //
+        // This function takes no `sched_lock`, so the `cpu_affinity` write and
+        // the `preferred_cpu` / `state` reads race a target running on another
+        // CPU; scheduling-internals.md § Cross-CPU TCB Ownership requires
+        // cross-CPU writers of the Scheduling field group to hold the target's
+        // `sched_lock`. That defect is tracked in #443.
+        //
         // See issue #116.
         crate::percpu::preempt_disable();
         (*target_tcb).cpu_affinity = cpu_id;

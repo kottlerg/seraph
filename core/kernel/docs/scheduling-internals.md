@@ -1367,12 +1367,7 @@ bails the same way as phase 2 if the running thread is stopped meanwhile.
 Stopped threads are dead but not freed — each Thread object lives until its own
 last capability goes, and `dealloc_object(Thread)` then runs its full drain
 protocol on an already-`Exited`, off-CPU thread (the off-CPU wait itself is the
-shared `wait_until_off_cpu`). For a thread displaced from a server's
-pending-reply binding, phase 1's `cancel_ipc_block` can touch a freed server
-through its stale `blocked_on_object`, and its later drain spins in the
-wake-in-flight gate: neither the stop nor the reap is memory-safe, and either
-can hang the kernel ([ipc-design.md](../../../docs/ipc-design.md) § The
-Call/Reply Model, [#443](https://github.com/kottlerg/seraph/issues/443)). The unlocked cap lookup in
+shared `wait_until_off_cpu`). The unlocked cap lookup in
 `sys_cap_create_thread` is not a window either: after `register`, the syscall
 looks both capabilities up again and requires the same objects. A teardown
 that ran between the first lookup and the registration removed the last
@@ -1383,6 +1378,12 @@ walk. The lifecycle syscalls are not a window: `sys_thread_start` and
 refuse a target that is `Exited` under the locks (§ ThreadState
 Transitions), so a thread the walk stopped cannot be revived and linked
 behind the `current`-only phase-2 scan.
+
+For a thread displaced from a server's pending-reply binding, phase 1's `cancel_ipc_block` can touch
+a freed server through its stale `blocked_on_object`, and its later drain spins in the
+wake-in-flight gate: neither the stop nor the reap is memory-safe, and the reap can hang the kernel
+([ipc-design.md](../../../docs/ipc-design.md) § The Call/Reply Model,
+[#443](https://github.com/kottlerg/seraph/issues/443)).
 
 **Not a scheduling structure.** The registry is never read on any hot path; it
 adds one lock acquire at thread create/destroy and a walk per `CSpace` or

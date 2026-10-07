@@ -1120,11 +1120,11 @@ Stop a running or runnable thread. The thread transitions to `Stopped` state.
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
 
 If the thread is blocked on IPC, the block is cancelled (the blocked syscall on the target thread
-returns `Interrupted`). For a caller displaced from a server's pending-reply binding, the stop is
-not memory-safe (its cancel can touch a freed server), its blocked call does not return
-`Interrupted`, and its later reap can hang the kernel ([ipc-design.md](../../../docs/ipc-design.md)
-§ The Call/Reply Model, [#443](https://github.com/kottlerg/seraph/issues/443)). If the thread is
-running on another CPU, an inter-processor interrupt is sent to force it out of userspace (see
+returns `Interrupted`). This does not hold for a caller displaced from a server's pending-reply
+binding: the stop is not memory-safe, and its outcome is in
+[ipc-design.md](../../../docs/ipc-design.md) § The Call/Reply Model
+([#443](https://github.com/kottlerg/seraph/issues/443)). If the thread is running on another CPU, an
+inter-processor interrupt is sent to force it out of userspace (see
 [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § `sys_thread_stop` Cross-CPU Stop
 Protocol).
 

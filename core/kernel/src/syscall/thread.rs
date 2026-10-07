@@ -881,8 +881,10 @@ pub fn sys_thread_set_fault_handler(tf: &mut TrapFrame) -> Result<u64, SyscallEr
 
     // Publish the badge first, then atomically swap the handler pointer, so a
     // faulter that observes the new handler also observes the matching badge.
-    // SAFETY: target_tcb is kept alive by the caller's Thread cap reference;
-    // both fields are atomics safe to write cross-thread.
+    // SAFETY: target_tcb was a live TCB at lookup; both fields are atomics safe
+    // to write cross-thread. `lookup_cap` takes no reference, so a sibling
+    // thread's concurrent delete of the last Thread cap can free the TCB before
+    // these writes (the residual race lookup_cap documents; #443).
     let old_ep = unsafe {
         (*target_tcb).fault_badge.store(badge, Ordering::Release);
         (*target_tcb).fault_handler.swap(new_ep, Ordering::AcqRel)
@@ -1222,10 +1224,11 @@ pub fn sys_thread_set_affinity(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         }
     }
 
-    // SAFETY: target_tcb validated non-null and kept live by the held Thread
-    // cap. The `cpu_affinity` write and the `preferred_cpu` / `state` reads
-    // below are not serialised with other CPUs' scheduler paths (the #443
-    // defect described before the write).
+    // SAFETY: target_tcb was a live TCB at lookup. `lookup_cap` takes no
+    // reference, so a sibling thread's concurrent delete of the last Thread cap
+    // can free it during this block (the residual race lookup_cap documents),
+    // and the `cpu_affinity` write and the `preferred_cpu` / `state` reads are
+    // not serialised with other CPUs' scheduler paths; both are #443 defects.
     unsafe {
         let old_cpu = (*target_tcb).preferred_cpu as usize;
 

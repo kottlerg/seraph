@@ -235,6 +235,7 @@ The kernel does not provide:
 
 [Capability Subsystem Internals](../core/kernel/docs/capability-internals.md),
 [IPC Subsystem Internals](../core/kernel/docs/ipc-internals.md),
+[SMP Scheduling and Locking Invariants](../core/kernel/docs/scheduling-internals.md),
 [Syscall Interface Specification](../core/kernel/docs/syscalls.md),
 [Thread Lifecycle and Sleep List Invariants](../core/kernel/docs/thread-lifecycle-and-sleep.md),
 [Architecture Overview](architecture.md), [Capability Model](capability-model.md),

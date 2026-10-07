@@ -149,8 +149,11 @@ syscall on either side. Nothing is allocated on the path.
    the CSpace)
 2. Unless caller_tcb is BlockedOnFault (a fault reply, whose data words and
    caps the kernel ignores): read the data words and pre-validate the reply
-   cap slots; on failure, swap current_tcb.reply_tcb to null and, if it held
-   a caller, wake that caller with the IPC_REPLY_TRANSFER_FAILED label
+   cap slots; when caps are attached, return InvalidCapability if no caller
+   is bound (no swap), then pre-allocate the slots in the caller's CSpace
+   (resolved through the registry); on any of these failures, swap
+   current_tcb.reply_tcb to null and, if it held a caller, wake that caller
+   with the IPC_REPLY_TRANSFER_FAILED label
 3. Claim and clear the binding: CAS current_tcb.reply_tcb from caller_tcb
    to null; a lost CAS means a concurrent canceller owns the caller's wake;
    a null binding or a lost CAS → InvalidCapability
@@ -159,7 +162,9 @@ syscall on either side. Nothing is allocated on the path.
    buffer page when it resumes
 5. If caller_tcb is BlockedOnFault: skip step 6, record RESUME/KILL from
    the label in caller_tcb.fault_outcome, stamp the episode, and go to step 7
-6. Transfer reply capability slots; stamp REPLY
+6. Transfer reply capability slots; stamp REPLY. If the transfer fails after
+   the claim, deposit the IPC_REPLY_TRANSFER_FAILED reply instead, wake the
+   caller (step 7), and return the error to the server
 7. enqueue_and_wake(caller_tcb) on its selected CPU; return to the server
 ```
 

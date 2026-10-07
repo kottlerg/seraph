@@ -780,11 +780,11 @@ threads never outlive either object (see [scheduling-internals.md](scheduling-in
 Registry). **The stop includes the caller**: a thread deleting the last capability to its own
 `CSpace` or `AddressSpace` — directly, or because the deleted object's teardown cascades into it —
 is stopped by that delete and the call does not return; the object is reclaimed once the thread is
-off its CPU. The caller's own `Thread` object is treated differently, as below. For a thread
-displaced from a server's pending-reply binding, this stop, the free of its Thread object, and the
-deletion of its last Thread capability are not memory-safe and can hang the kernel
+off its CPU. For a thread displaced from a server's pending-reply binding, this stop, and the reap
+that deleting its last Thread capability starts, are not memory-safe and can hang the kernel
 ([ipc-design.md](../../../docs/ipc-design.md) § The Call/Reply Model,
-[#443](https://github.com/kottlerg/seraph/issues/443)).
+[#443](https://github.com/kottlerg/seraph/issues/443)). The caller's own `Thread` object is treated
+differently, as below.
 
 Refused for two cases, both returning `InvalidState` with the capability left in
 place: a thread may not delete the last capability to its **own running**
@@ -1120,10 +1120,11 @@ Stop a running or runnable thread. The thread transitions to `Stopped` state.
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
 
 If the thread is blocked on IPC, the block is cancelled (the blocked syscall on the target thread
-returns `Interrupted`), except for a caller displaced from a server's reply binding
-([ipc-design.md](../../../docs/ipc-design.md) § The Call/Reply Model,
-[#443](https://github.com/kottlerg/seraph/issues/443)). If the thread is running on another CPU, an
-inter-processor interrupt is sent to force it out of userspace (see
+returns `Interrupted`). For a caller displaced from a server's pending-reply binding, the stop is
+not memory-safe (its cancel can touch a freed server), its blocked call does not return
+`Interrupted`, and its later reap can hang the kernel ([ipc-design.md](../../../docs/ipc-design.md)
+§ The Call/Reply Model, [#443](https://github.com/kottlerg/seraph/issues/443)). If the thread is
+running on another CPU, an inter-processor interrupt is sent to force it out of userspace (see
 [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § `sys_thread_stop` Cross-CPU Stop
 Protocol).
 

@@ -135,7 +135,8 @@ hang). See § Thread Registry.
    `wake_in_flight` was set when `endpoint_call` / `endpoint_recv` published the binding, and
    `sys_ipc_reply` stamps the disposition and calls `enqueue_and_wake` once `endpoint_reply` has won
    the CAS. Between a claim (a source-lock claim: waiter slot cleared, payload deposited,
-   `wake_in_flight = 1`; or the `endpoint_reply` `reply_tcb` CAS) and the waker's
+   `wake_in_flight = 1`; or any `reply_tcb` claim (the `endpoint_reply`, cancel, or dealloc
+   `compare_exchange`, or the `SYS_IPC_REPLY` failure-path swap)) and the waker's
    `enqueue_and_wake`, the wake is half-complete and owned exclusively by the in-flight waker: code
    executing *as the claimed thread* in that window (it is still live, mid-park) has exactly one
    legal continuation — fall through to `schedule()`. Consuming the deposited payload and returning

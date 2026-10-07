@@ -43,9 +43,12 @@ The reply capability is valid for exactly one use; it cannot be stored, delegate
 or reused.
 
 A server that needs to delegate work may make a downstream call before replying: the pending
-reply stays bound to the receiving thread until that thread replies or receives again, and a
-later receive replaces the binding. A delegating server therefore makes its downstream call,
-which does not touch its own binding, and replies before it next receives.
+reply stays bound to the receiving thread until that thread replies, and the downstream call
+does not touch that binding. A delegating server therefore replies before it next receives.
+When a later receive delivers a message while a reply is still pending, the kernel overwrites
+the binding, and the displaced caller (a thread blocked in `call` or a fault-blocked thread)
+is never resumed, interrupted, or killed; this defect is tracked in
+[#443](https://github.com/kottlerg/seraph/issues/443).
 
 ### Message Format
 

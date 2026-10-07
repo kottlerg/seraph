@@ -373,8 +373,10 @@ re-enter the wedge it exists to avoid.
    must claim its own slot via `compare_exchange(self, null, AcqRel, Acquire)` before freeing —
    otherwise a later `endpoint_reply` / fault reply on the still-live server would load the freed
    pointer and UAF on the message-copy write. `BlockedOnFault` is handled identically (it reuses
-   `reply_tcb`). Stores to `null` outside `ep.lock` MUST use compare_exchange (never an
-   unconditional store) so a concurrent cancel cannot lose a peer client's binding.
+   `reply_tcb`). Every claim outside `ep.lock` MUST use compare_exchange (never an unconditional
+   store) so a concurrent cancel cannot lose a peer client's binding; the one exception is the
+   slot-owning server's `SYS_IPC_REPLY` failure-path `swap(null)`, per the Symmetry rule in
+   [BlockedOnReply Edge — Symmetry Rules](#blockedonreply-edge--symmetry-rules).
 
 8. **Step 13 fault-handler binding release.** A thread that *holds* a fault-handler binding
    (independent of whether it is itself fault-blocked) owns one `inc_ref` on its `fault_handler`
@@ -410,8 +412,9 @@ domains:
    that commit fails (the caller died/stopped concurrently) it rolls the binding back —
    `compare_exchange(caller, null)` on `reply_tcb`, clear `wake_in_flight` — and skips to the next
    queued sender. See invariant 4 (#289).
-3. **Server in `endpoint_reply`** — loads `reply_tcb` (Acquire), stores `null` (Release) under
-   `ep.lock`.
+3. **Server in `endpoint_reply`** — loads `reply_tcb` (Acquire), then claims it by
+   `compare_exchange(caller, null, AcqRel, Acquire)` with no lock held; on a lost race it returns
+   `None` and the winning claimant owns the wake.
 4. **Client cancel via `cancel_ipc_block`** — `compare_exchange(this_client, null, AcqRel, Acquire)`
    under the client's per-TCB `sched_lock` — not a per-CPU scheduler.lock and not `ep.lock`. The
    lock is held across a re-read of the client's `blocked_on_object` and the CAS; a dying server
@@ -435,24 +438,32 @@ domains:
    `compare_exchange(this_client, null, AcqRel, Acquire)`; on a `BlockedOnFault` win it records
    `fault_outcome = Kill`. Defensive only — forecloses a future timeout surface racing a
    reply/cancel.
+8. **Server on the `SYS_IPC_REPLY` failure path via `fail_reply_and_wake_caller`** —
+   `swap(null, AcqRel)` with no lock held. A non-null result is the episode claim: it deposits a
+   synthetic `IPC_REPLY_TRANSFER_FAILED` reply and wakes the caller. A null result means another
+   claimant already won.
 
-**Symmetry rule:** every actor that may invalidate a client's place in the reply slot MUST use
-`compare_exchange(this_client, null, ...)` (never an unconditional store) so concurrent actors can
-determine whether they got there first. The single `fault_outcome` writer is whichever actor wins
-this CAS, so a fault's resume-vs-kill disposition is never decided by two racing actors. Stores to
-`null` are only safe inside `ep.lock` because that lock ensures no other actor is concurrently
-setting a *different* non-null caller.
+**Symmetry rule:** every actor that may invalidate a client's place in the reply slot MUST claim it
+by an atomic read-modify-write that observes the bound client (never an unconditional store) so
+concurrent actors can determine whether they got there first. Every actor except actor 8 uses
+`compare_exchange(this_client, null, ...)`. Actor 8's `swap(null)` is the one exception: only the
+slot-owning server performs it, while it is running `SYS_IPC_REPLY`, and no publisher can then
+install a different caller (`endpoint_call` binds only a server it dequeued from a receive queue,
+and `endpoint_recv` runs only on the server itself), so a non-null result is as exclusive a claim as
+a won CAS. The single `fault_outcome` writer is whichever actor wins this claim, so a fault's
+resume-vs-kill disposition is never decided by two racing actors.
 
 **Invariants on the BlockedOnReply protocol:**
 
 1. The client's `blocked_on_object` is the server TCB pointer (NOT an endpoint or other source).
 2. The server is the lifetime owner of the reply slot. As long as the server is alive,
-   `endpoint_call` and `endpoint_recv` publish the slot (and roll it back on a failed commit) under
-   `ep.lock`; every claim is a `compare_exchange(client, null)` (or, on the `SYS_IPC_REPLY` failure
-   path, `fail_reply_and_wake_caller`'s `swap(null)`) taken outside `ep.lock`. `endpoint_reply`
-   takes no lock and claims by that CAS; cancel and dealloc paths claim by it because they cannot
-   acquire `ep.lock` (they don't know which endpoint this reply is for; the server may have moved
-   on to a different endpoint between the original `call` and the cancel).
+   `endpoint_call` and `endpoint_recv` publish the slot under `ep.lock`. Their commit-failure
+   rollback is itself a `compare_exchange(caller, null)` claim taken under `ep.lock`; every other
+   claim (`endpoint_reply`, cancel, dealloc, the timer arm, and the failure-path `swap(null)`) is
+   taken outside it. `endpoint_reply` takes no lock and claims by CAS; cancel and dealloc paths
+   claim by it because they cannot acquire `ep.lock` (they don't know which endpoint this reply is
+   for; the server may have moved on to a different endpoint between the original `call` and the
+   cancel).
 3. **Server-death-while-client-blocked-on-reply** is handled by actor 6 above: the dying server
    walks its `reply_tcb`, claims the bound client via compare_exchange, and wakes it with
    `Interrupted` so the client's syscall returns rather than dereferencing the freed server. The
@@ -489,7 +500,7 @@ invariants common with the global wake protocol (`RESCHEDULE_PENDING`, `non_empt
 | `tcb.sleep_deadline` (u64, plain field) | non-atomic store under source IPC lock (when waker clears) OR under no lock (when registrant sets, before `sleep_list_add`) OR under `SLEEP_LIST_LOCK` (when timer claims) | non-atomic load under `SLEEP_LIST_LOCK` (timer snapshot pass) | The deadline read by `sleep_check_wakeups` under `SLEEP_LIST_LOCK` is the load-bearing observation; later state mutations follow the snapshot-then-claim arbitration. Cross-CPU writes are serialised either by the source IPC lock (waker's clear) or by the registrant being the parking thread itself (single-writer semantics during park). |
 | `tcb.state` (enum, plain field) | non-atomic store under either every CPU's scheduler.lock (`set_state_under_all_locks`) or the TCB's own `(*tcb).sched_lock` (`commit_blocked_under_local_lock` and `enqueue_and_wake`) | non-atomic load by any CPU's scheduler under its own scheduler.lock | The state field is in the Scheduling field group per [scheduling-internals.md § Cross-CPU TCB Ownership](scheduling-internals.md#cross-cpu-tcb-ownership). The all-locks vs single-CPU split exists because `Stopped`/`Exited` writes must be visible to *every* CPU's `schedule()` skip-check, while routine `Ready ↔ Running` and `Running ↔ Blocked` writes only need to coordinate with the local scheduler that owns the run-queue link. |
 | `tcb.priority` (u8, plain field) | non-atomic store by `sys_thread_set_priority` under `(*tcb).sched_lock` | non-atomic loads, each under the TCB's own `(*tcb).sched_lock`: `dealloc_object(Thread)` and `set_state_under_all_locks` (sched_lock held outer of their all-locks region), `migrate_ready_thread`, `enqueue_and_wake`, `enqueue_ready_thread`, and `schedule()`'s requeue arm | `(*tcb).sched_lock` is the serializer: every reader and writer of this field holds it. `schedule()`'s dispatch path deliberately does NOT read `(*next).priority` (it would race the store without `next.sched_lock`); it dispatches by run-queue index, which `dequeue_highest` already validated. After the store, `sys_thread_set_priority` relocates the Ready TCB's queue entry to the new priority (`relocate_ready_priority`, under the run-queue lock); the brief link-at-old / `priority`-new window inside the `sched_lock` region is benign because consumers dispatch by queue index, not by this field. |
-| `tcb.reply_tcb` (`AtomicPtr<TCB>`) | Release on `endpoint_*` store under ep.lock; AcqRel on `compare_exchange` from cancel/client-dealloc/server-dealloc paths | Acquire on `endpoint_reply` load under ep.lock; Acquire on the server-dealloc snapshot under all sched.locks | The `compare_exchange` discipline lets non-`ep.lock`-holding actors (cancel, client dealloc, server dealloc) clear the slot only when it still references *their* TCB, so two concurrent invalidators cannot lose a third unrelated client's binding. |
+| `tcb.reply_tcb` (`AtomicPtr<TCB>`) | Release on the `endpoint_call` / `endpoint_recv` publish store under ep.lock; AcqRel on `compare_exchange` from the commit-failure rollback (under ep.lock) and from `endpoint_reply`, cancel, client-dealloc, server-dealloc, and timer paths (no ep.lock); AcqRel on `fail_reply_and_wake_caller`'s `swap` (no lock) | Acquire on `endpoint_reply`'s pre-CAS load (no lock); Acquire on the server-dealloc snapshot under all sched.locks | Every claim is an atomic read-modify-write that observes the bound client. The `compare_exchange` clears the slot only when it still references the claimant's expected TCB, so two concurrent invalidators cannot lose a third unrelated client's binding; the `swap` is safe because only the slot-owning server performs it, while no publisher can install a different caller (per the Symmetry rule). The Release publish pairs with each claimant's Acquire. |
 
 ---
 

@@ -120,8 +120,9 @@ requested size (at least 64 KiB, rounded up to whole pages) with no guard page. 
 the stack once the thread has left user mode: a demand stack through
 [`UNREGISTER_REGION`](../../services/memmgr/docs/ipc-interface.md#label-9-unregister_region)
 and release of its reservation, a heap stack through `dealloc`. A detached thread's stack is
-freed the same way when the reaper sees the kernel's death notification for that thread, or
-leaks until process exit when no reaper slot was available at spawn.
+freed the same way by the next spawn, join, or detach in the process after the kernel posts
+that thread's death, or leaks until process exit when the reaper could not register the
+thread at spawn (no death queue, no free slot, or the observer bind failed).
 
 ### Bootstrap-cross-boundary VAs
 
@@ -202,7 +203,8 @@ primitives.
 | Document | Content |
 |---|---|
 | [docs/userspace-memory-model.md](../../docs/userspace-memory-model.md) | Three-surface VA model, frame-allocation contract |
-| [docs/process-lifecycle.md](../../docs/process-lifecycle.md) | ProcessInfo handover, `memmgr_endpoint_cap` discipline |
+| [docs/process-lifecycle.md](../../docs/process-lifecycle.md) | ProcessInfo handover, `memmgr_endpoint_cap` discipline, process death |
+| [docs/fault-handling.md](../../docs/fault-handling.md) | Pager fault reply: `FAULT_REPLY_KILL` declines an unregistered guard-page fault, killing the faulting thread as an unhandled fault |
 | [docs/capability-model.md](../../docs/capability-model.md) | "Kill process" pattern: a terminal fault on any thread tears down the whole process |
 | [services/memmgr/docs/ipc-interface.md](../../services/memmgr/docs/ipc-interface.md) | Wire shape of `REQUEST_MEMORY_CAPS`/`RELEASE_MEMORY_CAPS`, `REGISTER_REGION`/`UNREGISTER_REGION` |
 | [abi/process-abi/README.md](../../abi/process-abi/README.md) | `ProcessInfo`, `StartupInfo`, `main()` signature |

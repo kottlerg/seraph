@@ -129,12 +129,11 @@ testers spawn: `capexhaust`, `demandpaged`, `fsbench`, `pipefault`, `pipestress`
 `relrofault`, `stackoverflow`, `stdiotest`, `threadchurn`, and `threadstack`. Which
 consumer spawns or drives each one is owned by
 [services/svctest/README.md § Fixtures](../services/svctest/README.md#fixtures) for
-`svctest` phases and by each fixture's own README (`programs/<name>/README.md`) for
-its per-program testers. Under `/config/svcmgr/tests/` are the harness recipes (see
-[Gating](#gating)). Under
-`/data/` are `/data/test.txt`, a fixture shared by `svctest` and the `shell`
-tester, and the build-synthesised `svctest`-only fixtures `/data/svctest/large.bin`
-and `/data/svctest/bench.bin`.
+`svctest` phases and by each program's README (`programs/<name>/README.md`) for the
+per-program tester that program ships. Under `/config/svcmgr/tests/` are the harness
+recipes (see [Gating](#gating)). Under `/data/` are `/data/test.txt`, a fixture shared
+by `svctest` and the `shell` tester, and the build-synthesised `svctest`-only fixtures
+`/data/svctest/large.bin` and `/data/svctest/bench.bin`.
 
 ---
 

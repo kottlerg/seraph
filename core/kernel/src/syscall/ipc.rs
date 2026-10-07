@@ -978,7 +978,11 @@ pub fn sys_ipc_reply(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // fault reply also avoids needlessly growing the faulter's CSpace. The
     // BlockedOnFault re-check in the `Some(caller)` arm below is the
     // authoritative dispatch; this peek only gates the skip.
-    // SAFETY: tcb validated above; reply_tcb field always valid in TCB.
+    // SAFETY: tcb validated above; reply_tcb field always valid in TCB. The
+    // `(*c).ipc_state` read precedes any reply_tcb claim, so nothing pins the
+    // caller: a concurrent dealloc of it can win the reply_tcb CAS, clear
+    // `wake_in_flight`, and free the TCB between the load and this read — a
+    // known use-after-free window (#443).
     let fault_reply = unsafe {
         let c = (*tcb).reply_tcb.load(core::sync::atomic::Ordering::Acquire);
         !c.is_null() && (*c).ipc_state == crate::sched::thread::IpcThreadState::BlockedOnFault
@@ -1035,9 +1039,14 @@ pub fn sys_ipc_reply(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 // No parked caller (cancelled by SYS_THREAD_STOP); nothing to wake.
                 return Err(SyscallError::InvalidCapability);
             }
-            // SAFETY: caller_peek non-null; magic check guards UAF in debug builds.
+            // SAFETY: caller_peek non-null; magic check flags UAF in debug builds.
+            // caller_peek is read before the reply_tcb claim and is not pinned:
+            // a concurrent dealloc of the caller can win the reply_tcb CAS and
+            // free the TCB between the load and this read (#443).
             debug_assert!(unsafe { (*caller_peek).magic } == crate::sched::thread::TCB_MAGIC);
-            // SAFETY: caller_peek is a valid TCB (the reply protocol pins it);
+            // SAFETY: caller_peek is not pinned — it is read before the
+            // reply_tcb claim, so a concurrent dealloc can free it before the
+            // `cspace_id`/`cspace_epoch` reads below, a known defect (#443);
             // the CSpace pointer is registry-resolved under the lock;
             // lock_raw/unlock_raw paired.
             let pre_res = unsafe {

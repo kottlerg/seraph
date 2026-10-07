@@ -228,6 +228,10 @@ touching `ipc_msg`; NONE is a protocol violation: debug builds assert (naming
 tid/park-episode/deposit-episode — the #352-class spurious-resume tripwire,
 also checked in `fault_dispatch`'s resume), release builds fail closed with
 `Interrupted` rather than surfacing stale `ipc_msg` bytes as a success.
+`fault_dispatch`'s resume fails closed the same way: any `fault_outcome` other
+than RESUME, a PENDING left by an unstamped wake included, kills the thread
+(the `fault_outcome` row of
+[scheduling-internals.md § Atomic Ordering Invariants](scheduling-internals.md#atomic-ordering-invariants)).
 
 **Resume (non-call parks — fail-open).** Each non-call parking syscall
 consumes the disposition via `consume_park_interrupted` before reading its

@@ -1222,7 +1222,10 @@ pub fn sys_thread_set_affinity(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         }
     }
 
-    // SAFETY: target_tcb validated non-null; field access is valid.
+    // SAFETY: target_tcb validated non-null and kept live by the held Thread
+    // cap. The `cpu_affinity` write and the `preferred_cpu` / `state` reads
+    // below are not serialised with other CPUs' scheduler paths (the #443
+    // defect described before the write).
     unsafe {
         let old_cpu = (*target_tcb).preferred_cpu as usize;
 
@@ -1247,10 +1250,12 @@ pub fn sys_thread_set_affinity(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         // does not need a preempt bracket.
         //
         // This function takes no `sched_lock`, so the `cpu_affinity` write and
-        // the `preferred_cpu` / `state` reads race a target running on another
-        // CPU; scheduling-internals.md § Cross-CPU TCB Ownership requires
-        // cross-CPU writers of the Scheduling field group to hold the target's
-        // `sched_lock`. That defect is tracked in #443.
+        // the `preferred_cpu` / `state` reads race other CPUs' scheduler paths
+        // (the load balancer's `relocate_ready_thread`, a waker's
+        // `enqueue_and_wake`, the target's own `schedule()`), which access the
+        // Scheduling field group under the target's `sched_lock`, as
+        // scheduling-internals.md § Cross-CPU TCB Ownership requires. That
+        // defect is tracked in #443.
         //
         // See issue #116.
         crate::percpu::preempt_disable();

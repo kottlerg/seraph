@@ -108,9 +108,10 @@ capability type. The binding is per-thread kernel state: the bound endpoint and 
   Binding takes a reference on the endpoint object for the lifetime of the binding (see
   [Liveness](#liveness)); unbinding releases it.
 - `badge` is a caller-chosen value delivered as the fault message badge. It identifies the
-  faulting thread (or its process) only to a handler whose endpoint no other binder can
-  reach; see [Security](#security). It is opaque to the kernel, mirroring the
-  death-observer correlator of [Process Lifecycle](process-lifecycle.md#process-death).
+  faulting thread (or its process) to the handler only if no other binder can reach the
+  endpoint, or if the handler's badges are secret; see [Security](#security). It is opaque
+  to the kernel, mirroring the death-observer correlator of
+  [Process Lifecycle](process-lifecycle.md#process-death).
 - `fault_class_mask` selects which fault classes this handler covers. The defined value
   is the all-classes mask; it reserves the encoding for future per-class handlers without
   a new syscall.

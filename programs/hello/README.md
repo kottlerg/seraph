@@ -50,7 +50,8 @@ When both checks pass it prints `[hello-tester] PASS` and exits `0`.
 
 ## svctest Use
 
-`svctest` phases use `/programs/hello` as a known-good spawn target:
+[`svctest`](../../services/svctest/README.md) phases use `/programs/hello` as a known-good
+spawn target:
 
 - `spawn_phase` (`services/svctest/src/phases/procmgr.rs`) spawns it with argv and an
   environment variable, queries its procmgr state, and waits for a clean exit.

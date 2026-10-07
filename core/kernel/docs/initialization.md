@@ -314,8 +314,9 @@ Phase 7.
    a. Memory capabilities for all usable physical memory ranges
       (one capability per contiguous usable region from the memory map)
    b. Mmio capabilities (Map | Write rights): on RISC-V, first one over the
-      kernel console UART (`BootInfo.kernel_mmio.uart_base`, outside the
-      apertures), then one per validated `BootInfo.mmio_apertures` entry.
+      kernel console UART (`BootInfo.kernel_mmio.uart_base`, or the platform
+      default when that is zero; outside the apertures), then one per
+      validated `BootInfo.mmio_apertures` entry.
       Userspace narrows these into per-device sub-caps and distributes them
       to drivers.
    c. One SchedControl capability spanning the full userspace priority range

@@ -1,10 +1,11 @@
 # capexhaust
 
-Test fixture that exhausts its own `CSpace` and then runs a guarded blocking receive loop. The
-`recv_wedge` phase of `svctest` (`services/svctest/src/phases/recv_guard.rs`) spawns it from
-`/programs/capexhaust`, waits for it to exit, and checks that it died with `EXIT_RECV_WEDGE`.
-It is not a general-purpose program: it installs under `/programs/` with the other fixtures
-the harnesses spawn, per [docs/testing.md](../../docs/testing.md#sysroot-layout).
+Test fixture that exhausts its own `CSpace`, checks memmgr's failed-grant rollback, and then runs a
+guarded blocking receive loop. The `recv_wedge` phase of
+[`svctest`](../../services/svctest/README.md) (`services/svctest/src/phases/recv_guard.rs`) spawns
+it from `/programs/capexhaust`, waits for it to exit, and checks that it died with
+`EXIT_RECV_WEDGE`. It is not a general-purpose program: it installs under `/programs/` with the
+other fixtures the harnesses spawn, per [docs/testing.md](../../docs/testing.md#sysroot-layout).
 
 ---
 
@@ -54,7 +55,10 @@ The fixture registers the log name `capexhaust` and logs these lines:
 
 | Line | When |
 |---|---|
+| `cap_create_endpoint failed` | Endpoint creation failed, before the exit with code 1 |
 | `cspace exhausted after <n> derives` | The derive loop has ended |
+| `QUERY_POOL_STATUS failed before grant attempts` | The first pool query of a window failed, before the exit with code 1 |
+| `QUERY_POOL_STATUS failed after grant attempts` | The second pool query of a window failed, before the exit with code 1 |
 | `pool churned during rollback window (attempt <i>: <before> -> <after>); retrying` | The `free_bytes` readings of one window differ |
 | `failed-grant rollback verified (free_bytes unchanged); entering recv loop` | A window's readings match |
 | `ipc_recv failing (err=<e>); backing off` | `RecvGuard` reports the first failure of a streak |

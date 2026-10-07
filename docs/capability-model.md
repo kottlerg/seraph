@@ -178,10 +178,10 @@ memory-mapped I/O. Rights:
 Without this capability a process cannot map physical addresses — it cannot
 name hardware it has not been granted access to.
 
-Revoking an Mmio capability blocks new `SYS_MMIO_MAP` calls through it but does not
-unmap mappings already established; the kernel unmapping every mapping made through
-the capability on revocation is design intent (not yet implemented — `SYS_MMIO_MAP`
-records no mapping, #457).
+Revoking an Mmio capability blocks new `SYS_MMIO_MAP` calls through its descendants but
+does not unmap mappings already established through them; the kernel unmapping every
+mapping made through those descendants on revocation is design intent (not yet
+implemented — `SYS_MMIO_MAP` records no mapping, #457).
 
 ### Thread
 

@@ -59,8 +59,9 @@ A message consists of:
   The transfer is all-or-nothing at commit: either every capability's move
   begins with the message (the sender loses access as each completes), or none
   does. A refused transfer — a source slot gone stale, repeated within the
-  message, or pinned by an in-flight revocation or move, or a sender's or
-  receiver's CSpace already torn down — never delivers a partial set. On the
+  message, or pinned by an in-flight revocation or move, a sender's or
+  receiver's CSpace already torn down, or (on the reply direction) a caller CSpace
+  that cannot supply the destination slots — never delivers a partial set. On the
   call/receive direction a refusal detectable up front rejects the sender before
   blocking; one that arises after the sender blocked does not block delivery: the
   message arrives with zero capabilities and the sender keeps its own, without

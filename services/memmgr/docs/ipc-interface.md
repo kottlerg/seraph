@@ -514,6 +514,7 @@ reply-then-death ordering is therefore enforced by the kernel.
 [Fault Handling](../../../docs/fault-handling.md),
 [Process Lifecycle](../../../docs/process-lifecycle.md),
 [Userspace Memory Model](../../../docs/userspace-memory-model.md),
+[programs/capexhaust/README.md](../../../programs/capexhaust/README.md),
 [programs/demandpaged/README.md](../../../programs/demandpaged/README.md),
 [programs/threadchurn/README.md](../../../programs/threadchurn/README.md),
 [programs/threadstack/README.md](../../../programs/threadstack/README.md),

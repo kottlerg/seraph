@@ -202,12 +202,11 @@ contiguous bytes across the boundary.
 
 ### Measured per-call cost (`fsbench`, debug builds)
 
-Source: `programs/fsbench/src/main.rs`. The bench loops 256 timed iterations
-of "seek to 0; read N bytes via the chosen path" against a 64 KiB
-fixture (`/data/svctest/bench.bin`). The inline path chunks into ≤ 504-byte
-non-straddling reads; the memory-cap path always passes a full-page buffer
-so `want > 504` forces a memory-cap call. `cycles_now()` uses `rdtsc` on
-x86_64 and `csrr cycle` on riscv64. Numbers below are `cycles_mean`.
+Source: [programs/fsbench/README.md](../../../programs/fsbench/README.md), which owns the
+method. The bench loops 256 timed iterations of "seek to 0; read N bytes via the chosen
+path" against a 64 KiB fixture (`/data/svctest/bench.bin`); the per-path buffer sizes and
+cycle sources are in that README's
+[§ Method](../../../programs/fsbench/README.md#method). Numbers below are `cycles_mean`.
 
 **x86_64 (KVM-accelerated, TSC = hardware cycles)**
 

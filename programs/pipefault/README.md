@@ -2,8 +2,8 @@
 
 Test fixture for the pipe death-bridge regression test. It writes a known prefix to a piped
 stdout, then faults on purpose before its stdio pipes are closed, so the parent can see EOF only
-through the spawner-side death bridge. It installs at `/programs/pipefault` as one of the
-fixtures `svctest` phases spawn (see
+through the spawner-side death bridge. It installs at `/programs/pipefault` as one of the fixtures
+[`svctest`](../../services/svctest/README.md) phases spawn (see
 [docs/testing.md § Sysroot layout](../../docs/testing.md#sysroot-layout)), and `svctest`'s
 `pipe_fault_eof` phase spawns it.
 

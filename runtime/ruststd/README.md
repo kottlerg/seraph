@@ -98,6 +98,23 @@ default only if the draw fails). The caller owns `mem_map`/`mem_unmap`;
 the allocator only manages VA space. See
 [§ Page Reservations](../../docs/userspace-memory-model.md#page-reservations).
 
+### Spawned-thread stacks
+
+`std::thread::spawn` gives each spawned thread its own stack, allocated by `sys/thread`. In a
+demand-paged process (`StartupInfo.pager_endpoint_cap` non-zero) the stack is a page
+reservation of one guard page below the usable pages. Only the usable pages are registered
+with memmgr through
+[`REGISTER_REGION`](../../services/memmgr/docs/ipc-interface.md#label-7-register_region), so
+memmgr backs each on first touch; the guard page stays unregistered, so an overflow faults on
+an address the pager declines and the fault is terminal for the whole process. The usable
+size is the larger of the requested stack size (at least `DEFAULT_MIN_STACK_SIZE`, 64 KiB)
+and 512 pages (2 MiB). If the reservation, the page-table funding, or the registration fails,
+or the process is not demand-paged, the stack is instead an eager byte-heap allocation of the
+requested size (at least 64 KiB, rounded up to whole pages) with no guard page. `join` frees
+the stack once the thread has left user mode: a demand stack through
+[`UNREGISTER_REGION`](../../services/memmgr/docs/ipc-interface.md#label-9-unregister_region)
+and release of its reservation, a heap stack through `dealloc`.
+
 ### Bootstrap-cross-boundary VAs
 
 `_start` reads `ProcessInfo` to learn the IPC-buffer VA, the memmgr/procmgr
@@ -178,7 +195,7 @@ primitives.
 |---|---|
 | [docs/userspace-memory-model.md](../../docs/userspace-memory-model.md) | Three-surface VA model, frame-allocation contract |
 | [docs/process-lifecycle.md](../../docs/process-lifecycle.md) | ProcessInfo handover, `memmgr_endpoint_cap` discipline |
-| [services/memmgr/docs/ipc-interface.md](../../services/memmgr/docs/ipc-interface.md) | Wire shape of `REQUEST_MEMORY_CAPS`/`RELEASE_MEMORY_CAPS` |
+| [services/memmgr/docs/ipc-interface.md](../../services/memmgr/docs/ipc-interface.md) | Wire shape of `REQUEST_MEMORY_CAPS`/`RELEASE_MEMORY_CAPS`, `REGISTER_REGION`/`UNREGISTER_REGION` |
 | [abi/process-abi/README.md](../../abi/process-abi/README.md) | `ProcessInfo`, `StartupInfo`, `main()` signature |
 
 ---
@@ -187,5 +204,6 @@ primitives.
 
 [abi/process-abi/README.md](../../abi/process-abi/README.md),
 [Namespace Model](../../docs/namespace-model.md), [Storage](../../docs/storage.md),
+[programs/threadstack/README.md](../../programs/threadstack/README.md),
 [runtime/libc/README.md](../libc/README.md),
 [`.svc` Service Definitions](../../services/svcmgr/docs/service-definitions.md)

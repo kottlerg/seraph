@@ -125,13 +125,15 @@ Under `/services/drivers/` is
 fault-injection driver installed there until the devmgr enumeration
 redesign ([#165](https://github.com/kottlerg/seraph/issues/165)) removes
 it. Under `/programs/` are the test fixtures the harnesses spawn:
-`capexhaust`, `demandpaged`, `fsbench`, `pipefault`, `relrofault`, and
-`stackoverflow`, which `svctest` phases spawn; `stdiotest`, which svctest's pipe
-phase spawns and its `usertest` tester drives; and `pipestress`, `threadchurn`,
-and `threadstack`, which their `usertest` testers drive. Under
+`capexhaust`, `demandpaged`, `fsbench`, `pipefault`, `pipestress`, `relrofault`,
+`stackoverflow`, `stdiotest`, `threadchurn`, and `threadstack`. Which consumer
+spawns or drives each one is owned by
+[services/svctest/README.md § Fixtures](../services/svctest/README.md#fixtures) for
+`svctest` phases and by each program's `usertest` tester. Under
 `/config/svcmgr/tests/` are the harness recipes (see [Gating](#gating)). Under
-`/data/` are the `svctest` data fixtures `/data/test.txt` and the
-build-synthesised `/data/svctest/large.bin` and `/data/svctest/bench.bin`.
+`/data/` are `/data/test.txt`, a fixture shared by `svctest` and the `shell`
+tester, and the build-synthesised `svctest`-only fixtures `/data/svctest/large.bin`
+and `/data/svctest/bench.bin`.
 
 ---
 

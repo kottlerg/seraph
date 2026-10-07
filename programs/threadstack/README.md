@@ -1,9 +1,14 @@
 # threadstack
 
-Test fixture for the guarded demand-paged stack that a spawned thread gets. Its per-program
-tester, `threadstack-tester`, drives it in two modes, and the `usertest` orchestrator discovers
-and runs that tester. The fixture installs at `/programs/threadstack` and the tester at
-`/tests/programs/threadstack`, per
+Test fixture for the guarded demand-paged stack that a spawned thread gets.
+
+---
+
+## Role
+
+Its per-program tester, `threadstack-tester`, drives it in two modes, and the `usertest`
+orchestrator discovers and runs that tester. The fixture installs at `/programs/threadstack`
+and the tester at `/tests/programs/threadstack`, per
 [docs/testing.md § Per-program tester protocol](../../docs/testing.md#per-program-tester-protocol).
 Both use idiomatic `std` only and handle no Seraph capabilities directly.
 
@@ -29,9 +34,10 @@ threadstack/
 
 Every process procmgr creates is demand-paged by default
 ([Fault Handling § Default System Pager](../../docs/fault-handling.md#default-system-pager)),
-so the fixture needs no opt-in: ruststd gives each thread it spawns a demand-paged stack with
-an unregistered guard page below it (an eager heap stack with no guard if that reservation
-fails), and on `join` frees that stack through memmgr's
+so the fixture needs no opt-in: each thread it spawns gets the stack that
+[ruststd § Spawned-thread stacks](../../runtime/ruststd/README.md#spawned-thread-stacks)
+specifies, a demand-paged region above an unregistered guard page that `join` frees through
+memmgr's
 [`UNREGISTER_REGION`](../../services/memmgr/docs/ipc-interface.md#label-9-unregister_region).
 
 The worker thread recurses through `recurse`, and each level fills and sums a 4096-byte
@@ -66,9 +72,9 @@ code 1, when any of these holds:
 
 - `grow`: a stdout line is `SURVIVED (BUG)`, no line is `PASS`, or the exit is not a success.
 - `guard`: a stdout line is `SURVIVED (BUG)`, no line contains `about to overflow`, the exit
-  is a success, or the exit code is below `EXIT_FAULT_BASE` (`0x1000`), the base of the
-  exit-reason ranges that
-  [Process Lifecycle § Exit reason](../../docs/process-lifecycle.md#exit-reason) defines.
+  is a success, or the exit code is below `EXIT_FAULT_BASE` (`0x1000`), the base of the Fault
+  range in [Process Lifecycle § Exit reason](../../docs/process-lifecycle.md#exit-reason) (so a
+  Fault or Killed reason passes).
 
 If both runs pass, it prints `[threadstack-tester] PASS` and exits with code 0.
 
@@ -82,6 +88,7 @@ If both runs pass, it prints `[threadstack-tester] PASS` and exits with code 0.
 | [docs/fault-handling.md](../../docs/fault-handling.md) | Demand paging as the system default; memmgr as the pager |
 | [docs/capability-model.md](../../docs/capability-model.md) | Address-space death observers and process teardown on a terminal fault |
 | [docs/process-lifecycle.md](../../docs/process-lifecycle.md) | Exit-reason ranges, including `EXIT_FAULT_BASE` |
+| [runtime/ruststd/README.md](../../runtime/ruststd/README.md) | Spawned-thread stack geometry, heap fallback, and release at `join` |
 | [memmgr IPC Interface](../../services/memmgr/docs/ipc-interface.md) | `UNREGISTER_REGION`, which frees a joined thread's guarded stack |
 
 ---

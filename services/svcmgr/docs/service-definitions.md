@@ -295,4 +295,5 @@ At `HANDOVER_COMPLETE` svcmgr scans `/config/svcmgr/services/`, parses each
 [logd handover protocol](../../logd/docs/handover-protocol.md),
 [logd IPC interface](../../logd/docs/ipc-interface.md),
 [services/pwrmgr/README.md](../../pwrmgr/README.md), [services/svcmgr/README.md](../README.md),
-[svcmgr IPC Interface](ipc-interface.md), [Restart Protocol](restart-protocol.md)
+[svcmgr IPC Interface](ipc-interface.md), [Restart Protocol](restart-protocol.md),
+[services/svctest/README.md](../../svctest/README.md)

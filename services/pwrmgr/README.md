@@ -72,10 +72,12 @@ Both labels are gated by `pwrmgr_labels::SHUTDOWN_AUTHORITY` (badge bit
    ([`provides`](../svcmgr/docs/service-definitions.md#provides)). svctest
    also seeds `pwrmgr.deny`, the negative-test twin, to assert the gate
    rejects an unauthorised cap
-   ([`provides`](../svcmgr/docs/service-definitions.md#provides)).
+   ([`provides`](../svcmgr/docs/service-definitions.md#provides);
+   [svctest Capabilities](../svctest/README.md#capabilities)).
 4. svctest, at the end of `main()` after `ALL TESTS PASSED`, sends
    `pwrmgr_labels::SHUTDOWN` through the authorised cap, per
-   [Cross-harness conventions](../../docs/testing.md#cross-harness-conventions).
+   [Cross-harness conventions](../../docs/testing.md#cross-harness-conventions)
+   and [svctest Run Sequence](../svctest/README.md#run-sequence).
    pwrmgr executes the platform shutdown sequence. QEMU exits cleanly,
    ending the staged `cargo xtask run` without a wall-clock wait.
 
@@ -146,6 +148,7 @@ between the two trees.
 | [shared/ipc/src/lib.rs](../../shared/ipc/src/lib.rs) | Authoritative IPC label and error definitions (`pwrmgr_labels`, `pwrmgr_errors`, `devmgr_labels`) |
 | [services/devmgr/README.md](../devmgr/README.md) | Hardware + ACPI authority; the `QUERY_ACPI_TABLE` / `QUERY_SHUTDOWN_DEVICE` brokers pwrmgr acquires its caps through |
 | [services/svcmgr/README.md](../svcmgr/README.md) | Launcher + supervisor; the provider path that publishes `pwrmgr.shutdown` / `pwrmgr.deny` |
+| [services/svctest/README.md](../svctest/README.md) | Services-tier harness; seeds both pwrmgr caps, asserts the deny path, and requests the terminal shutdown |
 
 ---
 
@@ -154,4 +157,5 @@ between the two trees.
 [Architecture Overview](../../docs/architecture.md),
 [init Bootstrap Stages](../init/docs/bootstrap.md),
 [Restart Protocol](../svcmgr/docs/restart-protocol.md),
-[`.svc` Service Definitions](../svcmgr/docs/service-definitions.md)
+[`.svc` Service Definitions](../svcmgr/docs/service-definitions.md),
+[services/svctest/README.md](../svctest/README.md)

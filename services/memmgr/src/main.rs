@@ -1645,11 +1645,12 @@ fn handle_delegate_aspace(req: &IpcMessage, ipc_buf: *mut u64, procmgr_badge: u6
 /// `req.badge` is the value bound by `SYS_THREAD_SET_FAULT_HANDLER` (procmgr
 /// and the runtime bind the process's memmgr badge); attribution rests on
 /// badge unguessability (`services/memmgr/docs/ipc-interface.md`
-/// § Kernel-origin fault message (`FAULT_LABEL`); #459). Words are
-/// `[kind, faulting_va, access, ip]`. On a VM fault whose address lies in a
-/// registered region of a process with a delegated address space, memmgr backs
-/// the [`chunk_for`] chunk containing the faulting page — one contiguous
-/// Memory cap mapped across up to `DEMAND_CHUNK_PAGES` pages — and replies
+/// § Badge Discipline; #459). Words are `[kind, faulting_va, access, ip]`
+/// (same document, § Kernel-origin fault message (`FAULT_LABEL`)). On a VM
+/// fault whose address lies in a registered region of a process with a
+/// delegated address space, memmgr backs the [`chunk_for`] chunk containing
+/// the faulting page — one contiguous Memory cap mapped across up to
+/// `DEMAND_CHUNK_PAGES` pages — and replies
 /// [`syscall_abi::FAULT_REPLY_RESUME`]. Backing a chunk rather than a single
 /// page bounds cap-slot consumption (one cap per chunk) so a deep demand stack
 /// cannot exhaust memmgr's `CSpace`. Every other case — non-VM fault, unknown

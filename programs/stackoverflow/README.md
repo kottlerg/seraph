@@ -1,19 +1,24 @@
 # stackoverflow
 
-Test fixture for the main-thread stack guard page. `svctest`'s `stack_overflow` phase
-(`services/svctest/src/phases/process_faults.rs`) spawns it as `/programs/stackoverflow`
-and waits for it to die. It is a pure `std` binary with no Seraph cap awareness, prints
-nothing, and has no tester of its own; `cargo xtask build` installs it under `/programs/`
-with the other fixtures the harnesses spawn, per
+Test fixture for the main-thread stack guard page. [`svctest`](../../services/svctest/README.md)'s
+`stack_overflow` phase (`services/svctest/src/phases/process_faults.rs`) spawns it as
+`/programs/stackoverflow` and waits for it to die. It is a pure `std` binary with no Seraph cap
+awareness, prints nothing, and has no tester of its own; `cargo xtask build` installs it under
+`/programs/` with the other fixtures the harnesses spawn, per
 [docs/testing.md § Sysroot layout](../../docs/testing.md#sysroot-layout).
 
-`main` recurses without bound, and each frame holds a page-sized local buffer, so the stack
-pointer descends one page per call. Once the mapped stack is exhausted, the next write lands
-in the unmapped guard page below the stack base, per
+`overflow` (called from `main`) recurses without bound, and each of its frames holds a
+page-sized local buffer, so the stack pointer descends at least one page per call. Once the
+mapped stack is exhausted, the next write lands in the unmapped guard page below the stack
+base, per
 [docs/userspace-memory-model.md § Bootstrap Cross-Boundary VAs](../../docs/userspace-memory-model.md#bootstrap-cross-boundary-vas).
-That fault is terminal, so the kernel kills the thread with a fault exit reason
-(`EXIT_FAULT_BASE + <fault code>`), per
-[docs/fault-handling.md](../../docs/fault-handling.md) and
+procmgr binds memmgr as the fixture's pager, per
+[docs/fault-handling.md § Default System Pager](../../docs/fault-handling.md#default-system-pager),
+so the fault is delivered to memmgr. The guard page lies outside every registered region, so
+memmgr replies `FAULT_REPLY_KILL` and the kernel kills the thread as an unhandled fault with
+a fault exit reason (`EXIT_FAULT_BASE + <fault code>`), per
+[docs/fault-handling.md § Delivery, Resume, and Kill](../../docs/fault-handling.md#delivery-resume-and-kill),
+[docs/fault-handling.md § Reply](../../docs/fault-handling.md#reply), and
 [docs/process-lifecycle.md § Exit reason](../../docs/process-lifecycle.md#exit-reason).
 
 ---
@@ -50,7 +55,7 @@ listing of `/programs`.
 |---|---|
 | [docs/testing.md](../../docs/testing.md) | Harness model and where test fixtures install |
 | [docs/userspace-memory-model.md](../../docs/userspace-memory-model.md) | Main-thread stack placement and the guard page below it |
-| [docs/fault-handling.md](../../docs/fault-handling.md) | Terminal faults and the fault exit reason |
+| [docs/fault-handling.md](../../docs/fault-handling.md) | Pager fault delivery, `FAULT_REPLY_KILL`, and the fault exit reason |
 | [docs/process-lifecycle.md](../../docs/process-lifecycle.md) | Exit-reason ranges and process death |
 
 ---

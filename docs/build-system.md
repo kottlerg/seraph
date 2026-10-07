@@ -235,9 +235,9 @@ services live alongside it under `EFI/seraph/`, the Seraph vendor directory
 within the EFI partition.
 
 `tests/` holds the test harnesses, per-program testers, and harness-only
-fixtures, but test-only artifacts also install under `services/drivers/` and
-`programs/`; [testing.md § Sysroot layout](testing.md#sysroot-layout) lists
-them.
+fixtures, but test-only artifacts also install under `services/drivers/`,
+`programs/`, `config/svcmgr/tests/`, and `data/`;
+[testing.md § Sysroot layout](testing.md#sysroot-layout) lists them.
 
 Non-ESP, non-`data` directories (`services/`, `programs/`, `tests/`,
 `config/`) populate the GPT image's root partition, which userspace

@@ -6,9 +6,9 @@ to prefer spreading threads across physical cores rather than packing them onto 
 
 The scheduler interacts with two subsystems:
 
-- **IPC** — IPC operations park and wake threads through `commit_blocked_under_local_lock`,
-  `enqueue_and_wake`, and `schedule`; IPC performs no direct context switch (see
-  [ipc-internals.md](ipc-internals.md) § Waking the Recipient)
+- **IPC** — IPC interacts with the scheduler only through its park and wake primitives and
+  performs no direct context switch (see
+  [ipc-internals.md § IPC Scheduling Interaction](ipc-internals.md#ipc-scheduling-interaction))
 - **Architecture layer** — context save/restore and the preemption timer are implemented
   by the arch-dispatch surface defined in [arch-interface.md](arch-interface.md)
 

@@ -63,8 +63,10 @@ the envelope `phase=<name> starting` / `phase=<name> passed`. After the last pha
 or an IPC error, is logged and svctest exits, leaving the system idle.
 
 A failing phase panics through the std panic handler; svctest then never logs
-`ALL TESTS PASSED` and never requests shutdown. A phase whose cap is absent (slot zero) logs
-the skip and returns.
+`ALL TESTS PASSED` and never requests shutdown. The `ns` phase (`caps[0]`), the pwrmgr
+cap-deny phase (`caps[2]`), and the pwrmgr shutdown phase (`caps[1]`) log the skip and return
+when their slot is zero; the devmgr orphan-teardown phase (`caps[3]`) instead fails its
+assertion.
 
 The startup phases assert the recipe's launch surface: argv is exactly `svctest run`, and env
 carries `SERAPH_TEST=1` and `SERAPH_MODE=boot`.
@@ -73,15 +75,17 @@ carries `SERAPH_TEST=1` and `SERAPH_MODE=boot`.
 
 ## Capabilities
 
-The bootstrap round from the creator endpoint delivers the recipe's seeds in this order. A
-slot the round did not fill, or every slot when there is no creator endpoint, stays zero.
+The bootstrap round from the creator endpoint delivers the recipe's seeds in this order;
+[service-definitions.md § `seed`](../svcmgr/docs/service-definitions.md#seed) defines each
+name's cap shape and the zero slot an unresolved name leaves. With no creator endpoint, every
+slot stays zero.
 
-| Slot      | Seed              | Cap                                                          |
-|-----------|-------------------|--------------------------------------------------------------|
-| `caps[0]` | `rootfs.root`     | Badged SEND on vfsd's root-filesystem namespace at its root  |
-| `caps[1]` | `pwrmgr.shutdown` | `SHUTDOWN_AUTHORITY`-badged SEND on pwrmgr's service endpoint |
-| `caps[2]` | `pwrmgr.deny`     | SEND on pwrmgr's service endpoint without that badge bit     |
-| `caps[3]` | `devmgr.registry` | `REGISTRY_QUERY_AUTHORITY`-badged SEND on devmgr's registry  |
+| Slot      | Seed              | Use in svctest                         |
+|-----------|-------------------|----------------------------------------|
+| `caps[0]` | `rootfs.root`     | `ns` phase                             |
+| `caps[1]` | `pwrmgr.shutdown` | Authority cap for the final `SHUTDOWN` |
+| `caps[2]` | `pwrmgr.deny`     | Cap-deny phase                         |
+| `caps[3]` | `devmgr.registry` | devmgr orphan-teardown phase           |
 
 `caps[2]` drives the cap-deny phase, which requires an `UNAUTHORIZED` reply to `SHUTDOWN`.
 `caps[3]` exists only for the devmgr orphan-teardown phase's `TEST_SPAWN_ORPHAN` shim
@@ -112,10 +116,11 @@ its child body and exits, and an unmatched token falls through to the normal run
 Phases spawn these programs from `/programs/`: `hello` (procmgr, pipes), `stdiotest` and
 `pipefault` (pipes), `stackoverflow` and `relrofault` (process faults), `capexhaust`
 (recv guard), `demandpaged` (pager), and `fsbench` (FS IPC). The devmgr phase has devmgr spawn
-the [`test-orphan`](../drivers/test-orphan/README.md) driver. The FS and namespace phases read
-`/data/test.txt` and the build-synthesised `/data/svctest/large.bin` and
-`/data/svctest/bench.bin`, and write their scratch files under `/data/svctest/`; the sysroot
-placement of all of these is listed in
+the [`test-orphan`](../drivers/test-orphan/README.md) driver. The FS, namespace, and procmgr
+phases read `/data/test.txt`; the FS phases also read the build-synthesised
+`/data/svctest/large.bin` and write their scratch files under `/data/svctest/`; and `fsbench`,
+spawned by the `fs_crossover_bench` phase, reads the build-synthesised
+`/data/svctest/bench.bin`. The sysroot placement of all of these is listed in
 [docs/testing.md § Sysroot layout](../../docs/testing.md#sysroot-layout).
 
 ---
@@ -134,4 +139,13 @@ placement of all of these is listed in
 
 ## Summarized By
 
-None
+[programs/capexhaust/README.md](../../programs/capexhaust/README.md),
+[programs/demandpaged/README.md](../../programs/demandpaged/README.md),
+[programs/fsbench/README.md](../../programs/fsbench/README.md),
+[programs/hello/README.md](../../programs/hello/README.md),
+[programs/pipefault/README.md](../../programs/pipefault/README.md),
+[programs/relrofault/README.md](../../programs/relrofault/README.md),
+[programs/stackoverflow/README.md](../../programs/stackoverflow/README.md),
+[programs/stdiotest/README.md](../../programs/stdiotest/README.md),
+[services/drivers/test-orphan/README.md](../drivers/test-orphan/README.md),
+[services/pwrmgr/README.md](../pwrmgr/README.md)

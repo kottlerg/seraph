@@ -77,7 +77,8 @@ init (see [process-lifecycle.md](../../../docs/process-lifecycle.md) §"Init rea
   frames.
 - The boot-module bodies, minted by `mint_module_memory_caps` in Phase 7.
 - The init image LOAD segments, one reclaimable Memory cap per `InitImage`
-  segment (a RELRO-sealed LOAD segment is split in two) minted in Phase 9. See
+  segment (Phase 9's RELRO seal splits a writable segment in two when the
+  RELRO range ends inside it) minted in Phase 9. See
   [initialization.md](../../kernel/docs/initialization.md)
   §"Phase 9: Init Creation and Scheduler Entry".
 

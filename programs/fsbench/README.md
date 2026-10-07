@@ -1,10 +1,17 @@
 # fsbench
 
-Test fixture that benchmarks the per-call cost of the two `std::fs::File` read paths: inline
-`FS_READ` and memory-cap `FS_READ_MEMORY`. The `svctest` phase `fs_crossover_bench`
-([fs_ipc.rs](../../services/svctest/src/phases/fs_ipc.rs)) spawns it from `/programs/fsbench`
-and passes when it exits cleanly; it is one of the test-only fixtures installed under
-`/programs/`, per [docs/testing.md § Sysroot layout](../../docs/testing.md#sysroot-layout).
+Test fixture that measures the cycles `std::fs::File` takes to read each of several sizes
+through its two read paths, inline `FS_READ` and memory-cap `FS_READ_MEMORY`.
+
+---
+
+## Invocation
+
+The [`svctest`](../../services/svctest/README.md) phase `fs_crossover_bench`
+([fs_ipc.rs](../../services/svctest/src/phases/fs_ipc.rs)) spawns `fsbench` from
+`/programs/fsbench` and passes when it exits cleanly; `fsbench` is one of the test-only
+fixtures installed under `/programs/`, per
+[docs/testing.md § Sysroot layout](../../docs/testing.md#sysroot-layout).
 
 ---
 
@@ -42,10 +49,11 @@ without crossing a page tail, memory cap otherwise, per
 | `inline` | At most 504 bytes, trimmed so the read ends at or before a page tail |
 | `frame` (memory cap) | A full 4096-byte page                           |
 
-For each size in 16 B, 1 KiB, 4 KiB, 16 KiB, and 64 KiB, and for each path, it seeks to
-offset 0 and reads the size in a loop: 8 untimed warm-up iterations, then 256 timed ones.
-Cycles come from `rdtsc` on x86_64 and `csrr cycle` on riscv64. A timed iteration that reads
-fewer bytes than the size panics.
+For each size in 16 B, 1 KiB, 4 KiB, 16 KiB, and 64 KiB, and for each path, it runs 8
+untimed warm-up iterations, then 256 timed ones. Each iteration seeks to offset 0 and reads the
+full size through as many `read` calls as the path's buffer needs: 130 inline or 16 memory-cap
+calls for 64 KiB. Cycles come from `rdtsc` on x86_64 and `csrr cycle` on riscv64. A timed
+iteration that reads fewer bytes than the size panics.
 
 ---
 
@@ -59,6 +67,9 @@ closes with `done`. Each result line has the form below, where `<arch>` is `x86_
 ```text
 arch=<arch> size=<bytes> path=<path> iters=256 cycles_min=<n> cycles_mean=<n> cycles_max=<n>
 ```
+
+Each `cycles_*` value is taken over the timed iterations, and one iteration covers all the
+`read` calls that one size needs, not a single call.
 
 A failed open, fixture check, seek, or read panics, so the process exits unsuccessfully and the
 `fs_crossover_bench` phase fails.
@@ -77,4 +88,4 @@ A failed open, fixture check, seek, or read panics, so the process exits unsucce
 
 ## Summarized By
 
-None
+[Filesystem Driver Protocol](../../services/fs/docs/fs-driver-protocol.md)

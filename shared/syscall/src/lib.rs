@@ -2125,8 +2125,9 @@ pub fn thread_set_affinity(thread_cap: u32, cpu_id: u32) -> Result<(), i64>
 /// `endpoint_cap` is the `Endpoint` whose receiver services this thread's
 /// kernel-unresolvable faults, or `0` to unbind. `badge` is a caller-chosen
 /// value delivered as the fault message badge; it identifies the faulting
-/// thread/process only to a handler whose endpoint no other binder can reach
-/// (see [`syscall_abi::FAULT_LABEL`] and `docs/fault-handling.md` § Security).
+/// thread/process to the handler only if no other binder can reach the
+/// endpoint, or if the handler's badges are secret (see
+/// [`syscall_abi::FAULT_LABEL`] and `docs/fault-handling.md` § Security).
 /// `fault_class_mask` selects the covered fault classes; pass
 /// [`syscall_abi::FAULT_CLASS_ALL`].
 ///

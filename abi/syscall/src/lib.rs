@@ -266,9 +266,10 @@ pub const SYS_CAP_DELETE: u64 = 31;
 ///        `Endpoint`. The binding takes a reference on the endpoint object
 ///        for its lifetime.
 /// arg2 = `badge` — caller-chosen value delivered as the fault message badge.
-///        It identifies the faulting thread/process only to a handler whose
-///        endpoint no other binder can reach (see [`FAULT_LABEL`] and
-///        `docs/fault-handling.md` § Security). Opaque to the kernel.
+///        It identifies the faulting thread/process to the handler only if
+///        no other binder can reach the endpoint, or if the handler's badges
+///        are secret (see [`FAULT_LABEL`] and `docs/fault-handling.md`
+///        § Security). Opaque to the kernel.
 /// arg3 = `fault_class_mask` — selects which fault classes this handler
 ///        covers. v1 accepts only [`FAULT_CLASS_ALL`]; the argument reserves
 ///        the encoding for future per-class handlers without a new syscall.

@@ -16,8 +16,8 @@
 //! 2. Server: `recv(ep)` — if a caller is waiting → dequeue, transfer message,
 //!    bind the caller into the server's `reply_tcb`, return to server.
 //!    Otherwise → block on `recv_queue`.
-//! 3. Server: `reply(msg)` — deliver the reply to the bound caller, wake it,
-//!    clear `reply_tcb`.
+//! 3. Server: `reply(msg)` — claim and clear `reply_tcb` by compare-exchange,
+//!    deliver the reply to the claimed caller, wake it.
 //!
 //! ## Reply capability
 //! Phase 9 uses a simple approach: the "reply cap" is stored directly in the
@@ -235,9 +235,12 @@ unsafe fn rollback_uncommitted_call(
 
 /// Attempt an IPC call on `ep` from `caller` with `msg`.
 ///
-/// Returns `Ok(woken_server)` if a receiver was waiting and was woken (caller
-/// is now blocked awaiting reply). Returns `Err(())` if no receiver was
-/// available (caller is now blocked on the send queue).
+/// Returns `Ok(server)` if a receiver was waiting. The server is dequeued and
+/// bound, and its wake is claimed by `wake_in_flight`. The caller MUST wake it
+/// with `enqueue_and_wake` after moving any caps. The calling thread is
+/// committed to `parked_state`, unless the park is refused, in which case the
+/// reply linkage is rolled back. Returns `Err(())` if no receiver was
+/// available (the calling thread is now blocked on the send queue).
 ///
 /// `parked_state` is the blocked state the caller commits when a receiver was
 /// waiting: [`IpcThreadState::BlockedOnReply`] for a normal `SYS_IPC_CALL`, or
@@ -558,9 +561,10 @@ pub unsafe fn endpoint_recv(
 
 /// Reply to the thread stored in `server.reply_tcb` with `msg`.
 ///
-/// Wakes the caller (moves it to Ready) and clears the reply target.
-/// Returns `Some(caller)` if a caller was woken, `None` if the reply target
-/// was null (i.e., server was not in a call context).
+/// Claims the reply binding (CAS `server.reply_tcb` from the bound caller to
+/// null) and stages `msg` in the caller's `ipc_msg`. Returns the claimed
+/// caller, which the syscall layer MUST wake with `enqueue_and_wake`. Returns
+/// `None` if no binding exists or a concurrent claimant won.
 ///
 /// # Safety
 /// Must be called with the scheduler lock held.

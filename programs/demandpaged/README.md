@@ -1,9 +1,9 @@
 # demandpaged
 
-Test fixture for the demand-paging pager surface. The `services/svctest` pager phases spawn it
-as `/programs/demandpaged`, one of the harness fixtures installed under `/programs/` (see
-[docs/testing.md § Sysroot layout](../../docs/testing.md#sysroot-layout)). It prints no marker
-lines and reports only through its exit status, which the spawning phase checks.
+Test fixture for the demand-paging pager surface. The [`svctest`](../../services/svctest/README.md)
+pager phases spawn it as `/programs/demandpaged`, one of the harness fixtures installed under
+`/programs/` (see [docs/testing.md § Sysroot layout](../../docs/testing.md#sysroot-layout)). It
+prints no marker lines and reports only through its exit status, which the spawning phase checks.
 
 ---
 

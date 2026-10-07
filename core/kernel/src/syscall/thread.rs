@@ -799,9 +799,8 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
 ///
 /// arg0 = Thread cap index (must have CONTROL) — the thread whose handler is set.
 /// arg1 = Endpoint cap index, or `0` to **unbind**.
-/// arg2 = binder-chosen `badge` delivered as the fault message badge; it
-///        attributes the faulter only on an endpoint no other binder can reach
-///        (see `docs/fault-handling.md` § Security).
+/// arg2 = binder-chosen `badge` delivered as the fault message badge (its
+///        attribution strength is in `docs/fault-handling.md` § Security).
 /// arg3 = `fault_class_mask`; v1 accepts only [`syscall::FAULT_CLASS_ALL`].
 ///
 /// Binding takes a reference on the endpoint object for the binding's lifetime

@@ -3,7 +3,7 @@
 Test fixture for the `PT_GNU_RELRO` enforcement test: it writes into its own `.data.rel.ro` and
 is expected to fault. It is installed at `/programs/relrofault` with the other test fixtures
 the harnesses spawn (see [docs/testing.md](../../docs/testing.md#sysroot-layout)), and
-`svctest`'s `relro_write` phase spawns it.
+[`svctest`](../../services/svctest/README.md)'s `relro_write` phase spawns it.
 
 ---
 

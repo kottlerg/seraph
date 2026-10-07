@@ -53,14 +53,15 @@ slot count with `cap_info(self_cspace, CAP_INFO_CSPACE_USED)`, takes a baseline 
 (10) trials, and samples a peak every 50 trials and once after the last. Growth from baseline
 to peak above `SLOT_SLACK` (8) fails the run.
 
-All tester output goes to stdout, prefixed `[pipestress-tester]`:
+All tester output goes to stdout. Every line except the `captured stdout:` line after a
+`FAIL` carries the `[pipestress-tester]` prefix:
 
 | Line | When |
 |---|---|
 | `<n> / 250 iterations` | Every 50 trials |
 | `slots baseline <b> peak <p> growth <g>` | After the last trial |
 | `PASS` | All trials and the slot bound passed |
-| `FAIL <reason>` | First failure, followed by a `captured stdout: <string>` line |
+| `FAIL <reason>` | First failure, followed by an unprefixed `captured stdout: <quoted string>` line (Debug-formatted) |
 
 The tester exits `1` on a reported failure; a failed spawn, read, wait, or `cap_info` call
 panics and also exits non-zero. The exit code is the verdict and the `PASS`/`FAIL` line is

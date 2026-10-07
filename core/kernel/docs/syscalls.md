@@ -778,7 +778,9 @@ Freeing a `CSpace` or an `AddressSpace` first stops every thread bound to it
 (each becomes `Exited` with retained exit reason `EXIT_KILLED`; its Thread
 object is freed when its own last capability goes), so a process's threads
 never outlive either object (see
-[scheduling-internals.md](scheduling-internals.md) § Thread Registry).
+[scheduling-internals.md](scheduling-internals.md) § Thread Registry), except a thread displaced
+from a server's pending-reply binding ([ipc-design.md](../../../docs/ipc-design.md) § The
+Call/Reply Model, [#443](https://github.com/kottlerg/seraph/issues/443)).
 **This includes the caller**: a thread deleting the last capability to its own
 `CSpace` or `AddressSpace` — directly, or because the deleted object's teardown
 cascades into it — is stopped by that delete and the call does not return; the

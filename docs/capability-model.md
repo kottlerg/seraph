@@ -676,11 +676,11 @@ own; the one thing it enforces is that a thread cannot outlive the `CSpace` or `
 bound to: when the last capability to either object is deleted, every thread bound to it is stopped
 before the object's storage is reclaimed, wherever those threads' own capabilities are held —
 including the deleting thread itself, when it holds that last capability to its own `CSpace` or
-`AddressSpace` (the delete then never returns to it). A thread displaced from a server's
-pending-reply binding by a later receive is outside this guarantee
+`AddressSpace` (the delete then never returns to it). The process's resources are reclaimed as their
+capability reference counts reach zero. A thread displaced from a server's pending-reply binding by
+a later receive is outside every guarantee of this pattern
 ([IPC Design](ipc-design.md#the-callreply-model),
-[#443](https://github.com/kottlerg/seraph/issues/443)). The process's resources are reclaimed as
-their capability reference counts reach zero.
+[#443](https://github.com/kottlerg/seraph/issues/443)).
 
 Beyond that stop, the kernel's role in death is *notification*. An
 `AddressSpace` carries a death-observer set (mirroring the per-thread death

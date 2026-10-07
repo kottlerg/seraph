@@ -47,10 +47,11 @@ reply stays bound to the receiving thread until that thread replies, and the dow
 does not touch that binding. A delegating server therefore replies before it next receives.
 When a later receive delivers a message while a reply is still pending, the kernel overwrites
 the binding. The displaced caller (a thread blocked in `call` or a fault-blocked thread) is
-then outside every guarantee the IPC, fault-handling, and thread-lifecycle documents state for
-a blocked thread: no reply reaches it, and stopping, restarting, or tearing it down can hang
-the kernel or touch freed kernel memory. This is a defect; its consequences are listed in
-[#443](https://github.com/kottlerg/seraph/issues/443).
+then outside every guarantee the system and kernel documents state for a blocked or bound
+thread: no reply reaches it; stopping it, tearing down its CSpace or AddressSpace, or deleting
+its last Thread capability can hang the kernel or touch freed kernel memory; and restarting a
+stopped one trips a debug-build kernel assertion. This is a defect; its consequences are listed
+in [#443](https://github.com/kottlerg/seraph/issues/443).
 
 ### Message Format
 

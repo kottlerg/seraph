@@ -380,12 +380,12 @@ A process dies when:
 - procmgr revokes and deletes its caps to the process's `Thread`, `CSpace`,
   and `AddressSpace` (the "kill process" pattern; see
   [`capability-model.md`](capability-model.md) §`"Kill process" pattern`).
-- The last capability to its `CSpace` or `AddressSpace` is deleted: the
-  kernel stops every thread bound to the object (retained exit reason
-  `EXIT_KILLED`) before reclaiming it, so the process's threads cannot
-  outlive either. A thread deleting the last capability to its own
-  `CSpace` or `AddressSpace` is stopped by that same delete and never
-  returns from it.
+- The last capability to its `CSpace` or `AddressSpace` is deleted: the kernel stops every thread
+  bound to the object (retained exit reason `EXIT_KILLED`) before reclaiming it, so the process's
+  threads cannot outlive either (a thread displaced from a server's pending-reply binding excepted;
+  see [IPC Design](ipc-design.md#the-callreply-model),
+  [#443](https://github.com/kottlerg/seraph/issues/443)). A thread deleting the last capability to
+  its own `CSpace` or `AddressSpace` is stopped by that same delete and never returns from it.
 - An unhandled fault terminates its threads.
 
 ### Exit reason
@@ -402,25 +402,22 @@ a fault or kill reason — defined once in `syscall_abi`:
 | `0x1000 ..= 0x1FFF` (`EXIT_FAULT_BASE + vector`) | Fault | unhandled CPU/VM fault; kernel-terminated |
 | `0x2000` (`EXIT_KILLED`) | Killed | recorded by the kernel as the retained reason of a thread stopped by its `CSpace`/`AddressSpace` teardown (that stop posts no death event; an observer bound afterwards receives the retained reason through the bind); posted by userspace (`Child::kill`) |
 
-`sys_process_exit` records the encoded reason as the calling thread's exit
-reason and posts it to that thread's death observers — a parent that bound the
-main thread (so `ExitStatus::code()` carries it) and procmgr's per-thread
-observer (which reaps the process). It is structurally identical to
-`sys_thread_exit` but with the encoded caller-supplied reason (zero for
-`exit(0)`), and schedules away immediately
-after the post; it does **not** post to the address-space death surface
-(reserved for terminal faults), because doing so on every clean exit would
-dereference the address space after procmgr had already been woken to reap it.
-The kernel only *notifies*; it does not enumerate or stop sibling threads at
-that point — they are stopped when procmgr's cap-revoke teardown below deletes
-the process's `CSpace` (every thread bound to it is stopped before its storage
-is reclaimed, wherever their thread caps are held) and reaped through their
-own thread caps. `ExitStatus::success()`/`code()`
-decode the reason on the consumer side. This is a Seraph-native encoding, not
-POSIX: codes are not 8-bit `WEXITSTATUS`-truncated and faults are native fault
-classes, not signals. See
-[`core/kernel/docs/syscalls.md`](../core/kernel/docs/syscalls.md)
-§ `SYS_PROCESS_EXIT`.
+`sys_process_exit` records the encoded reason as the calling thread's exit reason and posts it to
+that thread's death observers — a parent that bound the main thread (so `ExitStatus::code()` carries
+it) and procmgr's per-thread observer (which reaps the process). It is structurally identical to
+`sys_thread_exit` but with the encoded caller-supplied reason (zero for `exit(0)`), and schedules
+away immediately after the post; it does **not** post to the address-space death surface (reserved
+for terminal faults), because doing so on every clean exit would dereference the address space after
+procmgr had already been woken to reap it. The kernel only *notifies*; it does not enumerate or stop
+sibling threads at that point — they are stopped when procmgr's cap-revoke teardown below deletes
+the process's `CSpace` (every thread bound to it is stopped before its storage is reclaimed,
+wherever their thread caps are held, except a thread displaced from a server's pending-reply
+binding; see [IPC Design](ipc-design.md#the-callreply-model),
+[#443](https://github.com/kottlerg/seraph/issues/443)) and reaped through their own thread caps.
+`ExitStatus::success()`/`code()` decode the reason on the consumer side. This is a Seraph-native
+encoding, not POSIX: codes are not 8-bit `WEXITSTATUS`-truncated and faults are native fault
+classes, not signals. See [`core/kernel/docs/syscalls.md`](../core/kernel/docs/syscalls.md) §
+`SYS_PROCESS_EXIT`.
 
 The death-notification flow:
 

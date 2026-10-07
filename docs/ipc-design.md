@@ -46,9 +46,11 @@ A server that needs to delegate work may make a downstream call before replying:
 reply stays bound to the receiving thread until that thread replies, and the downstream call
 does not touch that binding. A delegating server therefore replies before it next receives.
 When a later receive delivers a message while a reply is still pending, the kernel overwrites
-the binding, and the displaced caller (a thread blocked in `call` or a fault-blocked thread)
-is never resumed, interrupted, or killed; this defect is tracked in
-[#443](https://github.com/kottlerg/seraph/issues/443).
+the binding: the IPC path never resumes or interrupts the displaced caller (a thread blocked
+in `call` or a fault-blocked thread), and a stop records no interrupted or kill disposition
+for it. It is still stopped when its CSpace or AddressSpace is torn down, but deleting its
+last Thread capability then spins forever in the kernel's wake-in-flight gate. This defect is
+tracked in [#443](https://github.com/kottlerg/seraph/issues/443).
 
 ### Message Format
 
@@ -176,8 +178,11 @@ a kernel-originated synchronous message, suspending the thread until the handler
 resuming it, or killing it on `FAULT_REPLY_KILL` — or the binding is severed and the thread
 is killed (severing by clearing the binding mid-fault: design intent; not yet implemented,
 #242). This reuses the call/reply machinery above — the suspended thread occupies the
-caller's role and the handler services it with the ordinary receive/reply cycle. See
-[Fault Handling](fault-handling.md).
+caller's role and the handler services it with the ordinary receive/reply cycle. The
+guarantee does not hold for a fault-blocked thread displaced by a later receive on its handler
+while its reply is still pending: no reply reaches it, as
+[§ The Call/Reply Model](#the-callreply-model) describes
+([#443](https://github.com/kottlerg/seraph/issues/443)). See [Fault Handling](fault-handling.md).
 
 ---
 

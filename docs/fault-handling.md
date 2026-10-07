@@ -64,6 +64,11 @@ Not yet implemented (this section is narrowed as each part lands):
   faulting thread being stopped or destroyed, or the handler endpoint being destroyed (all
   implemented). The remaining trigger — the binding being cleared mid-fault — is the only
   [Kill](#delivery-resume-and-kill) path not yet wired.
+- **Displaced fault binding.** A later receive on the handler thread while a fault reply is
+  still pending overwrites the handler's reply binding (see
+  [IPC Design](ipc-design.md#the-callreply-model)). None of the paths above then resolves the
+  displaced fault-blocked thread: it is never resumed or killed. This defect is tracked in
+  [#443](https://github.com/kottlerg/seraph/issues/443).
 
 ---
 
@@ -187,7 +192,9 @@ it resumes by re-executing its faulting instruction, not by returning a value.
 - **Kill (cancellation).** If the binding is severed before a reply — the handler thread
   dies, the binding is cleared (design intent; not yet implemented, #242), or the thread is
   stopped — the faulting thread is killed, exactly as an unhandled fault. It is never resumed
-  with a spurious value.
+  with a spurious value. A faulting thread displaced by a later receive on its handler is not
+  killed by these triggers; this defect is tracked in
+  [#443](https://github.com/kottlerg/seraph/issues/443).
 
 ### Modifying the faulting thread
 
@@ -217,7 +224,9 @@ The kernel ignores reply data words. The reply **label** conveys disposition:
    by the endpoint being destroyed while it is bound. The reference is released on unbind,
    rebind, or thread destruction.
 2. Handler-thread death releases any fault-blocked thread awaiting that handler, killing it
-   (the [Kill](#delivery-resume-and-kill) path).
+   (the [Kill](#delivery-resume-and-kill) path). A fault-blocked thread whose binding a later
+   receive on the handler overwrote is not released; this defect is tracked in
+   [#443](https://github.com/kottlerg/seraph/issues/443).
 3. A faulting thread blocked on a handler endpoint that has not yet received is released if
    that endpoint is destroyed.
 4. Handler death is a system-level failure. Clients block on their next fault until a

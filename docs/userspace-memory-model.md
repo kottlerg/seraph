@@ -178,11 +178,12 @@ unmapped guard page below every stack hold for all possible draws, so
 no collision checking or redraw is ever needed. The whole zone map ends
 below 2³⁸ — the smallest user half among the supported paging modes
 (riscv64 Sv39) — so one static layout is canonical under every mode on
-both architectures; that ceiling is what caps these windows at 21 bits. A creator whose entropy
-draw fails (a kernel-contract violation once the pool is seeded) logs
-and degrades to the deterministic `DEFAULT_*` addresses, which lie
-outside the windows — the test harnesses' window assertions then fail
-loudly by design. The default boot on both architectures is
+both architectures; that ceiling is what caps these windows at 21 bits.
+A creator whose entropy draw fails (a kernel-contract violation once the
+pool is seeded) logs and degrades to the deterministic `DEFAULT_*`
+addresses, which lie outside the windows, above the image window and
+just below `LAYOUT_VA_CEILING` — the test harnesses' window assertions
+then fail loudly by design. The default boot on both architectures is
 firmware-seeded through `EFI_RNG_PROTOCOL` (OVMF natively on x86_64; the
 firmware's `VirtioRngDxe` with `virtio-rng` on riscv64); a riscv64 boot
 without that device, under the EDK2 firmware the default boot uses, seeds

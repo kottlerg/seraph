@@ -114,15 +114,17 @@ the binary format. The general convention is:
   (low VA)              ┘
 ```
 
-The diagram shows the ordering convention only: each region's base is
-randomised per process within a fixed window (ASLR,
-[#39](https://github.com/kottlerg/seraph/issues/39)); the degraded fallback addresses
-lie outside these windows (see [userspace-memory-model.md](userspace-memory-model.md)
-§ Bootstrap Cross-Boundary VAs). Concrete VA management surfaces, the per-region
-randomisation windows, the frame-allocation contract, and ownership boundaries between the
-kernel, memmgr, procmgr, and `std::sys::seraph` are documented in
-[userspace-memory-model.md](userspace-memory-model.md). The userspace boot order and the
-process-creation/death flow are in [process-lifecycle.md](process-lifecycle.md).
+The diagram shows the ordering convention only: each region's base is randomised per
+process within a fixed window (ASLR, [#39](https://github.com/kottlerg/seraph/issues/39)).
+When an entropy draw fails, the byte heap, the page-reservation arena, and the program image
+fall back to their window bases, while the bootstrap VAs fall back to fixed `DEFAULT_*`
+addresses above the image window, so the ordering above does not hold for them (see
+[userspace-memory-model.md](userspace-memory-model.md) § Bootstrap Cross-Boundary VAs).
+Concrete VA management surfaces, the per-region randomisation windows, the frame-allocation
+contract, and ownership boundaries between the kernel, memmgr, procmgr, and
+`std::sys::seraph` are documented in [userspace-memory-model.md](userspace-memory-model.md).
+The userspace boot order and the process-creation/death flow are in
+[process-lifecycle.md](process-lifecycle.md).
 
 ---
 

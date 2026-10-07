@@ -84,7 +84,9 @@ On `SYSCALL`:
 8. `SYSRET` restores `rip` from `rcx`, `rflags` from `r11`, transitions to CPL 3
 
 Interrupts are disabled by `SFMASK` on `SYSCALL` entry (the `IF` bit is cleared).
-The kernel re-enables them after saving state and switching to the kernel stack.
+They stay masked for the whole syscall, except in bounded preempt-disabled,
+interrupt-enabled windows (see § Atomicity and Preemption Guarantees and
+[scheduling-internals.md](scheduling-internals.md) § Lock Hierarchy).
 
 ### RISC-V
 
@@ -339,6 +341,11 @@ page, followed by the cap-transfer result block (count, then the delivered
 destination handles) at word offset `MSG_DATA_WORDS_MAX`.
 The kernel binds the caller to the receiving thread as its reply capability (the
 per-thread `reply_tcb` field); `SYS_IPC_REPLY` consumes this binding implicitly.
+A receive that delivers a message while a reply is still pending overwrites the
+binding, and the displaced caller (a thread blocked in `SYS_IPC_CALL` or a
+fault-blocked thread) is never resumed, interrupted, or killed; this defect is
+tracked in [#443](https://github.com/kottlerg/seraph/issues/443) (see
+[ipc-design.md](../../../docs/ipc-design.md) § The Call/Reply Model).
 
 For a call, the badge is the value attached to the sender's endpoint capability via
 `SYS_CAP_DERIVE_BADGE`; it identifies the caller without a forgeable PID. For a

@@ -122,7 +122,8 @@ the stack once the thread has left user mode: a demand stack through
 and release of its reservation, a heap stack through `dealloc`. A detached thread's stack is
 freed the same way by the next spawn, join, or detach in the process after the kernel posts
 that thread's death, or leaks until process exit when the reaper could not register the
-thread at spawn (no death queue, no free slot, or the observer bind failed).
+thread at spawn (no death queue, no free slot, or the observer bind failed) or the kernel
+dropped the death post because the process's death queue (128 entries) was full.
 
 ### Bootstrap-cross-boundary VAs
 

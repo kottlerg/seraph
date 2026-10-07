@@ -312,6 +312,10 @@ pub unsafe fn endpoint_call(
             (*caller)
                 .wake_in_flight
                 .store(1, core::sync::atomic::Ordering::Release);
+            // Known defect (#443): this unconditional store overwrites any
+            // binding still pending on the server, stranding the displaced
+            // caller with wake_in_flight set and no claimant able to win its
+            // reply_tcb CAS.
             (*server)
                 .reply_tcb
                 .store(caller, core::sync::atomic::Ordering::Release);
@@ -460,6 +464,10 @@ pub unsafe fn endpoint_recv(
             (*caller)
                 .wake_in_flight
                 .store(1, core::sync::atomic::Ordering::Release);
+            // Known defect (#443): this unconditional store overwrites any
+            // binding still pending on the server (a second recv without a
+            // reply), stranding the displaced caller with wake_in_flight set
+            // and no claimant able to win its reply_tcb CAS.
             (*server)
                 .reply_tcb
                 .store(caller, core::sync::atomic::Ordering::Release);

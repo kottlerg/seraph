@@ -128,36 +128,40 @@ hang). See § Thread Registry.
    because `source → (*tcb).sched_lock → run-queue lock` is exactly the hierarchy — there is no
    `source.lock → scheduler.lock` edge to violate. The single-waiter wakers (`notification_send`,
    `event_queue_post`, `endpoint_call`'s server-wake branch, and the `event_queue_drop` /
-   `notification_dealloc` single-waiter dealloc wakes) snapshot the payload and set
-   `wake_in_flight` under the source lock, RELEASE the source lock, then call `enqueue_and_wake` —
-   releasing first bounds source-lock hold-time. `endpoint_reply` takes no source lock: its
-   exclusive claim is the `reply_tcb` `compare_exchange(client, null)`, the caller's
-   `wake_in_flight` was set when `endpoint_call` / `endpoint_recv` published the binding, and
-   `sys_ipc_reply` stamps the disposition and calls `enqueue_and_wake` once `endpoint_reply` has won
-   the CAS. Between a claim (a source-lock claim: waiter slot cleared, payload deposited,
-   `wake_in_flight = 1`; or any `reply_tcb` claim (the `endpoint_reply`, cancel, or dealloc
-   `compare_exchange`, or the `SYS_IPC_REPLY` failure-path swap)) and the waker's
-   `enqueue_and_wake`, the wake is half-complete and owned exclusively by the in-flight waker: code
-   executing *as the claimed thread* in that window (it is still live, mid-park) has exactly one
-   legal continuation — fall through to `schedule()`. Consuming the deposited payload and returning
-   to user mode is forbidden; it strands the waker's run-queue link (#352). The `still_waiter`
-   rechecks (the sleep-list arming in `sys_event_recv` / `sys_notification_wait`) respect this: they
-   only add a timer on the not-claimed branch and fall through to `schedule()` on both branches. The
-   `endpoint_dealloc` send/recv drain instead HOLDS `ep.lock` across the per-waiter
-   `enqueue_and_wake` walk (a multi-waiter drain; sound precisely because the order is canonical,
-   and `wake_in_flight = 1` per waiter blocks a racing `dealloc(waiter)` unlink from freeing a TCB
-   mid-wake). `enqueue_and_wake` dispatches its wakeup IPI only after BOTH the run-queue lock and
-   `(*tcb).sched_lock` are released (never IPI under `sched_lock`). `pull_unpinned_ready` is the one
-   site that takes `(*tcb).sched_lock` via `try_lock_raw` while already holding a run-queue lock —
-   the inverse of the canonical order; the `try` backs off on contention (a canonical holder makes
-   it fail), so it is deadlock-free, and the source CPU's run-queue lock pins the candidate so the
-   pointer cannot be freed under it. Its two run-queue locks are themselves `try_lock_raw`
-   (ascending order retained): the pull runs from every CPU's tick with interrupts disabled, and
-   blocking there lets every idle CPU queue on one victim's lock — the FIFO ticket convoy that
-   livelocked the guest system-wide under vCPU oversubscription (#375). The wait-set cascade rule is
-   unchanged in spirit: `wait_set_drop` releases its source/ws locks before reporting any
-   zero-refcount source back to `dealloc_object_one`'s cascade worklist, so the source's own dealloc
-   runs after every IPC source/ws lock has been released.
+   `notification_dealloc` single-waiter dealloc wakes) snapshot the payload and set `wake_in_flight`
+   under the source lock, RELEASE the source lock, then call `enqueue_and_wake` — releasing first
+   bounds source-lock hold-time. `endpoint_reply` takes no source lock: its exclusive claim is the
+   `reply_tcb` `compare_exchange(client, null)`, the caller's `wake_in_flight` was set when
+   `endpoint_call` / `endpoint_recv` published the binding, and `sys_ipc_reply` stamps the
+   disposition and calls `enqueue_and_wake` once `endpoint_reply` has won the CAS. Between a claim
+   (a source-lock claim: waiter slot cleared, payload deposited, `wake_in_flight = 1`; or a waking
+   `reply_tcb` claim: the `endpoint_reply`, dying-server dealloc, or sleep-list timer-arm
+   `compare_exchange`, or the `SYS_IPC_REPLY` failure-path swap) and the waker's `enqueue_and_wake`,
+   the wake is half-complete and owned exclusively by the in-flight waker: code executing *as the
+   claimed thread* in that window (it is still live, mid-park) has exactly one legal continuation —
+   fall through to `schedule()`. Consuming the deposited payload and returning to user mode is
+   forbidden; it strands the waker's run-queue link (#352). The other `reply_tcb` claims — the
+   cancel, dying-client dealloc, and commit-failure rollback `compare_exchange` — only clear
+   `wake_in_flight` and wake no one (the `BlockedOnReply` symmetry rules'
+   [actors 2-8](thread-lifecycle-and-sleep.md#blockedonreply-edge--symmetry-rules) enumerate every
+   claimant). The `still_waiter` rechecks (the sleep-list arming in `sys_event_recv` /
+   `sys_notification_wait`) respect this: they only add a timer on the not-claimed branch and fall
+   through to `schedule()` on both branches. The `endpoint_dealloc` send/recv drain instead HOLDS
+   `ep.lock` across the per-waiter `enqueue_and_wake` walk (a multi-waiter drain; sound precisely
+   because the order is canonical, and `wake_in_flight = 1` per waiter blocks a racing
+   `dealloc(waiter)` unlink from freeing a TCB mid-wake). `enqueue_and_wake` dispatches its wakeup
+   IPI only after BOTH the run-queue lock and `(*tcb).sched_lock` are released (never IPI under
+   `sched_lock`). `pull_unpinned_ready` is the one site that takes `(*tcb).sched_lock` via
+   `try_lock_raw` while already holding a run-queue lock — the inverse of the canonical order; the
+   `try` backs off on contention (a canonical holder makes it fail), so it is deadlock-free, and the
+   source CPU's run-queue lock pins the candidate so the pointer cannot be freed under it. Its two
+   run-queue locks are themselves `try_lock_raw` (ascending order retained): the pull runs from
+   every CPU's tick with interrupts disabled, and blocking there lets every idle CPU queue on one
+   victim's lock — the FIFO ticket convoy that livelocked the guest system-wide under vCPU
+   oversubscription (#375). The wait-set cascade rule is unchanged in spirit: `wait_set_drop`
+   releases its source/ws locks before reporting any zero-refcount source back to
+   `dealloc_object_one`'s cascade worklist, so the source's own dealloc runs after every IPC
+   source/ws lock has been released.
 
 6. **Derivation tree lock is ordered after IPC object locks.** `SYS_CAP_REVOKE` MUST NOT acquire IPC
    object locks while holding the derivation tree write lock — see

@@ -404,14 +404,16 @@ the handler is the "server" — so every actor below applies to fault delivery a
 only by `ipc_state` at the wake site. The following actors can mutate this slot from different lock
 domains:
 
-1. **Server in `endpoint_call`** — sets `reply_tcb = caller` under `ep.lock`.
+1. **Server in `endpoint_call`** — sets `reply_tcb = caller` under `ep.lock` by an unconditional
+   Release `store` that overwrites any binding still pending (see the Symmetry rule; #443).
 2. **Server in `endpoint_recv`** — dequeues a `BlockedOnSend` caller and rebinds it to
-   `reply_tcb = caller` under `ep.lock`, then commits the caller's `BlockedOnSend → BlockedOnReply`
-   (`ipc_state` + `blocked_on_object`) transition via `commit_reply_rebind_under_local_lock` (the
-   caller's per-TCB `sched_lock`), mirroring `endpoint_call`'s `commit_blocked_under_local_lock`. If
-   that commit fails (the caller died/stopped concurrently) it rolls the binding back —
-   `compare_exchange(caller, null)` on `reply_tcb`, clear `wake_in_flight` — and skips to the next
-   queued sender. See invariant 4 (#289).
+   `reply_tcb = caller` under `ep.lock` by the same unconditional store, then commits the caller's
+   `BlockedOnSend → BlockedOnReply` (`ipc_state` + `blocked_on_object`) transition via
+   `commit_reply_rebind_under_local_lock` (the caller's per-TCB `sched_lock`), mirroring
+   `endpoint_call`'s `commit_blocked_under_local_lock`. If that commit fails (the caller
+   died/stopped concurrently) it rolls the binding back — `compare_exchange(caller, null)` on
+   `reply_tcb`, clear `wake_in_flight` — and skips to the next queued sender. See invariant 4
+   (#289).
 3. **Server in `endpoint_reply`** — loads `reply_tcb` (Acquire), then claims it by
    `compare_exchange(caller, null, AcqRel, Acquire)` with no lock held; on a lost race it returns
    `None` and the winning claimant owns the wake.
@@ -440,18 +442,22 @@ domains:
    reply/cancel.
 8. **Server on the `SYS_IPC_REPLY` failure path via `fail_reply_and_wake_caller`** —
    `swap(null, AcqRel)` with no lock held. A non-null result is the episode claim: it deposits a
-   synthetic `IPC_REPLY_TRANSFER_FAILED` reply and wakes the caller. A null result means another
-   claimant already won.
+   synthetic `IPC_REPLY_TRANSFER_FAILED` reply and wakes the caller. A null result means no caller
+   is bound: none was published, or another claimant already won.
 
 **Symmetry rule:** every actor that may invalidate a client's place in the reply slot MUST claim it
 by an atomic read-modify-write that observes the bound client (never an unconditional store) so
-concurrent actors can determine whether they got there first. Every actor except actor 8 uses
-`compare_exchange(this_client, null, ...)`. Actor 8's `swap(null)` is the one exception: only the
-slot-owning server performs it, while it is running `SYS_IPC_REPLY`, and no publisher can then
-install a different caller (`endpoint_call` binds only a server it dequeued from a receive queue,
-and `endpoint_recv` runs only on the server itself), so a non-null result is as exclusive a claim as
-a won CAS. The single `fault_outcome` writer is whichever actor wins this claim, so a fault's
-resume-vs-kill disposition is never decided by two racing actors.
+concurrent actors can determine whether they got there first. Actors 3 through 7 and actor 2's
+commit-failure rollback use `compare_exchange(this_client, null, ...)`. Actor 8 uses `swap(null)`:
+only the slot-owning server performs it, while it is running `SYS_IPC_REPLY`, and no publisher can
+install a different caller during that syscall (`endpoint_call` binds only a server it dequeued
+from a receive queue, and `endpoint_recv` runs only on the server itself), so a non-null result is
+as exclusive a claim as a won CAS. The publish stores of actors 1 and 2 violate this rule: they are
+unconditional, so when the server receives again while a reply is still pending they overwrite the
+binding, and the displaced caller or faulter is never resumed, interrupted, or killed; this defect
+is tracked in [#443](https://github.com/kottlerg/seraph/issues/443). The single `fault_outcome`
+writer is whichever actor wins this claim, so a fault's resume-vs-kill disposition is never decided
+by two racing actors.
 
 **Invariants on the BlockedOnReply protocol:**
 
@@ -500,7 +506,7 @@ invariants common with the global wake protocol (`RESCHEDULE_PENDING`, `non_empt
 | `tcb.sleep_deadline` (u64, plain field) | non-atomic store under source IPC lock (when waker clears) OR under no lock (when registrant sets, before `sleep_list_add`) OR under `SLEEP_LIST_LOCK` (when timer claims) | non-atomic load under `SLEEP_LIST_LOCK` (timer snapshot pass) | The deadline read by `sleep_check_wakeups` under `SLEEP_LIST_LOCK` is the load-bearing observation; later state mutations follow the snapshot-then-claim arbitration. Cross-CPU writes are serialised either by the source IPC lock (waker's clear) or by the registrant being the parking thread itself (single-writer semantics during park). |
 | `tcb.state` (enum, plain field) | non-atomic store under either every CPU's scheduler.lock (`set_state_under_all_locks`) or the TCB's own `(*tcb).sched_lock` (`commit_blocked_under_local_lock` and `enqueue_and_wake`) | non-atomic load by any CPU's scheduler under its own scheduler.lock | The state field is in the Scheduling field group per [scheduling-internals.md § Cross-CPU TCB Ownership](scheduling-internals.md#cross-cpu-tcb-ownership). The all-locks vs single-CPU split exists because `Stopped`/`Exited` writes must be visible to *every* CPU's `schedule()` skip-check, while routine `Ready ↔ Running` and `Running ↔ Blocked` writes only need to coordinate with the local scheduler that owns the run-queue link. |
 | `tcb.priority` (u8, plain field) | non-atomic store by `sys_thread_set_priority` under `(*tcb).sched_lock` | non-atomic loads, each under the TCB's own `(*tcb).sched_lock`: `dealloc_object(Thread)` and `set_state_under_all_locks` (sched_lock held outer of their all-locks region), `migrate_ready_thread`, `enqueue_and_wake`, `enqueue_ready_thread`, and `schedule()`'s requeue arm | `(*tcb).sched_lock` is the serializer: every reader and writer of this field holds it. `schedule()`'s dispatch path deliberately does NOT read `(*next).priority` (it would race the store without `next.sched_lock`); it dispatches by run-queue index, which `dequeue_highest` already validated. After the store, `sys_thread_set_priority` relocates the Ready TCB's queue entry to the new priority (`relocate_ready_priority`, under the run-queue lock); the brief link-at-old / `priority`-new window inside the `sched_lock` region is benign because consumers dispatch by queue index, not by this field. |
-| `tcb.reply_tcb` (`AtomicPtr<TCB>`) | Release on the `endpoint_call` / `endpoint_recv` publish store under ep.lock; AcqRel on `compare_exchange` from the commit-failure rollback (under ep.lock) and from `endpoint_reply`, cancel, client-dealloc, server-dealloc, and timer paths (no ep.lock); AcqRel on `fail_reply_and_wake_caller`'s `swap` (no lock) | Acquire on `endpoint_reply`'s pre-CAS load (no lock); Acquire on the server-dealloc snapshot under all sched.locks | Every claim is an atomic read-modify-write that observes the bound client. The `compare_exchange` clears the slot only when it still references the claimant's expected TCB, so two concurrent invalidators cannot lose a third unrelated client's binding; the `swap` is safe because only the slot-owning server performs it, while no publisher can install a different caller (per the Symmetry rule). The Release publish pairs with each claimant's Acquire. |
+| `tcb.reply_tcb` (`AtomicPtr<TCB>`) | Release on the `endpoint_call` / `endpoint_recv` publish store under ep.lock (unconditional; it overwrites a pending binding, #443); AcqRel on `compare_exchange` from the commit-failure rollback (under ep.lock) and from `endpoint_reply`, cancel, client-dealloc, server-dealloc, and timer paths (no ep.lock); AcqRel on `fail_reply_and_wake_caller`'s `swap` (no lock) | Acquire on `endpoint_reply`'s pre-CAS load (no lock); Acquire on the server-dealloc snapshot under all sched.locks; Acquire on `sys_ipc_reply`'s fault-reply and cap-pre-allocation peeks (no lock), which read before any claim and dereference the loaded caller unpinned (#443); Relaxed on the softlockup watchdog's diagnostic load (`watchdog_decode_blocked_on`) | Every claim is an atomic read-modify-write that observes the bound client. The `compare_exchange` clears the slot only when it still references the claimant's expected TCB, so two concurrent claimants cannot clear a third unrelated client's binding; the `swap` is safe because only the slot-owning server performs it, while no publisher can install a different caller during `SYS_IPC_REPLY` (per the Symmetry rule). The publish is a plain store, not a claim: a server that receives again while a reply is pending overwrites the binding and strands the displaced caller, in violation of the Symmetry rule (#443). The Release publish pairs with each claimant's Acquire. |
 
 ---
 

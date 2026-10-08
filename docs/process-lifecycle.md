@@ -69,11 +69,13 @@ RAM into the fewest contiguous extents and places the largest at `memory_base`,
 so the first cap is the largest; consumers that take the whole range read each
 cap's size individually and do not depend on the order of the rest.
 
-Init delegates authority to downstream services by deriving intermediaries
-(the "derive twice" pattern in
-[`capability-internals.md`](../core/kernel/docs/capability-internals.md#safe-delegation-the-derive-twice-pattern))
-and handing each service the second derivation. This preserves init's ability to
-revoke if a service misbehaves before svcmgr takes over supervision. At the
+Init forwards Memory into memmgr's CSpace with the "derive twice" pattern in
+[`capability-internals.md`](../core/kernel/docs/capability-internals.md#safe-delegation-the-derive-twice-pattern):
+it keeps a full-rights intermediary and copies that, so it can revoke memmgr's copy.
+devmgr's hardware caps are single derivations of init's roots moved over IPC,
+revocable only through the root; the per-service detail is in
+[services/init/docs/bootstrap.md](../services/init/docs/bootstrap.md#per-stage-authority-transfers)
+§ Per-stage authority transfers. At the
 init-reap handoff init moves only its kernel-object caps and the reclaimable
 Memory caps it solely owns to procmgr (see "Init reap" below). The remaining
 root caps (the RAM roots of memory forwarded to memmgr, the firmware caps, and

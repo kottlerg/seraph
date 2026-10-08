@@ -82,8 +82,10 @@ pub mod kind
     pub const MODULE: u64 = 1;
     pub const APERTURE: u64 = 2;
     pub const ACPI_REGION: u64 = 3;
-    /// Round carrying svcmgr publish-authority cap + (x86) the root
-    /// `IoPort` cap copy. One-shot, always terminal.
+    /// Round carrying the svcmgr publish-authority cap and the arch
+    /// shutdown-authority cap (a full-rights `IoPort` derivation on
+    /// x86-64, a Reset + Suspend `SbiControl` derivation on RISC-V).
+    /// One-shot, always terminal.
     pub const SVCMGR_BUNDLE: u64 = 4;
     /// Round carrying bootloader-discovered framebuffer geometry
     /// (`physical_base`, `width`, `height`, `stride`, `pixel_format`).

@@ -107,7 +107,8 @@ base/size pairs; one `MODULE` round carries the boot-bundle
 driver images, each tagged with its module class; a cap-less `FRAMEBUFFER_INFO`
 round carries the framebuffer geometry (a zero base means no framebuffer); and the
 terminal `SVCMGR_BUNDLE` round carries the svcmgr publish cap and the arch
-shutdown-authority cap (root `IoPort` on x86-64, `SbiControl` on RISC-V). Init's
+shutdown-authority cap (a full-rights derivation of init's root `IoPort` on x86-64, a Reset +
+Suspend `SbiControl` derivation on RISC-V). Init's
 side of the transfer is summarized in
 [services/init/docs/bootstrap.md § Per-stage authority transfers](../../init/docs/bootstrap.md#per-stage-authority-transfers).
 See [docs/capability-model.md](../../../docs/capability-model.md) for capability type

@@ -333,7 +333,9 @@ Reply: `procmgr_errors::SUCCESS` on bind, `UNAUTHORIZED` if the
 caller lacks `DEATH_EQ_AUTHORITY` or a death EQ is already registered,
 `INVALID_ARGUMENT` if no cap was transferred. Registration is first-wins:
 procmgr deletes the cap a second registration transfers and keeps the first,
-so a restarted logd receives no death events.
+so a restarted logd receives no death events. A request refused for a missing
+`DEATH_EQ_AUTHORITY` badge keeps its transferred cap in procmgr's CSpace
+([#449](https://github.com/kottlerg/seraph/issues/449)).
 
 logd derives a `POST`-only copy from its `RECV+POST` event queue
 before sending — the kernel's cap-transfer moves the sent cap into

@@ -274,7 +274,12 @@ The kernel populates init's CSpace before transferring control (see
 | Scheduler | `SchedControl` cap |
 | Boot modules | `Memory` caps for each boot-module image inside `bootstrap.bundle` (procmgr, memmgr, devmgr, vfsd, …) — resolved by name via the `init_protocol` module-name table |
 
-Init keeps every root. Memory forwarded into memmgr's CSpace uses the
+The roots of the hardware and control authority init delegates stay in
+init's CSpace (the list is in
+[Process Lifecycle](../../../docs/process-lifecycle.md#kernel--init)
+§ Kernel → init); at the reap handoff init moves only its kernel-object
+caps and the reclaimable Memory caps it solely owns to procmgr (see
+[Handover](#handover)). Memory forwarded into memmgr's CSpace uses the
 **derive-twice** pattern documented in
 [`../../../docs/capability-model.md`](../../../docs/capability-model.md):
 init derives a full-rights intermediary from the source cap and copies
@@ -305,6 +310,7 @@ enumerates init's side of it.
 [ELF Loading](../../../core/boot/docs/elf-loading.md),
 [System Bootstrap](../../../docs/bootstrap.md),
 [Device Management](../../../docs/device-management.md),
+[Process Lifecycle](../../../docs/process-lifecycle.md),
 [devmgr Responsibilities and Capabilities](../../devmgr/docs/responsibilities.md),
 [services/init/README.md](../README.md), [logd IPC interface](../../logd/docs/ipc-interface.md),
 [memmgr Memory Pool](../../memmgr/docs/memory-pool.md),

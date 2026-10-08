@@ -367,8 +367,8 @@ mapping — no page may be simultaneously writable and executable (see
 ### Kernel Object Reference Counting
 
 Each kernel object (Endpoint, Notification, EventQueue, etc.) has an embedded reference
-count: one reference per capability slot that points to it, plus one per kernel-internal
-owner listed below:
+count over the capability slots that point to it and the kernel-internal owners that
+hold it (the principal ones are listed below):
 
 ```rust
 pub struct KernelObjectHeader
@@ -382,21 +382,30 @@ pub struct KernelObjectHeader
 }
 ```
 
-When a slot is cleared (deletion, revocation, or the teardown of the CSpace holding it)
-or a kernel-internal owner releases its reference, the reference count is decremented.
+When a slot is cleared (for example by deletion, revocation, or the teardown of the CSpace
+holding it) or a kernel-internal owner releases its reference, the reference count is
+decremented.
 When it reaches zero, the object's bytes are returned to the Memory object it was
 retyped from (`retype_free`). This is the only mechanism by which kernel objects
 are freed — there is no explicit "destroy" syscall (see
 [docs/capability-model.md](../../../docs/capability-model.md) § Auto-reclaim).
 
-The kernel-internal owners that hold a reference:
+The principal kernel-internal owners:
 
 - **Retype ancestry.** Each object retyped from a Memory object holds a reference on
   that ancestor (`header.ancestor`), released when the descendant is freed; the
   kernel's boot-minted objects hold the same reference on the SEED reserve.
 - **Page-pool donations.** A Memory object donated to an AddressSpace's or CSpace's
   page pool is referenced by the donation record until that AddressSpace or CSpace is
-  freed.
+  freed. The Memory object an AddressSpace or CSpace is created from is referenced
+  once, by donation record 0, which serves as its retype ancestry too.
+- **SEED scratch leases.** A per-thread x86-64 IOPB reserved by `sys_ioport_bind`
+  holds a reference on the SEED reserve until the thread is destroyed
+  (`alloc_seed_scratch` / `free_seed_scratch`).
+- **Kernel-lifetime pins.** The SEED reserve and the root CSpace each hold a reference
+  the kernel never releases (the SEED pin from `install_seed_memory`; the root CSpace's
+  base reference, attributed to init's TCB), and `HDR_FLAG_IS_ROOT` clamps the root
+  CSpace's count at 1, so neither is ever freed.
 - **Fault-handler binding.** `SYS_THREAD_SET_FAULT_HANDLER` takes a reference on the
   bound Endpoint, released on unbind, rebind, or thread destruction.
 - **Transient holds.** A syscall that must keep an object live across a lock-free step

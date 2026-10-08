@@ -122,7 +122,7 @@ fn main() -> !
         std::os::seraph::log!("failed to create block device endpoint");
     }
 
-    // IRQ allocator state: consume the root range cap ascending.
+    // IRQ allocator state: consume devmgr's Interrupt range cap ascending.
     let mut irq_root = IrqRootAllocator::new(caps.irq_range_cap);
 
     // Carve the UART interrupt before any PCI device IRQ. The allocator is
@@ -1218,7 +1218,7 @@ fn carve_subrange(caps: &mut caps::DevmgrCaps, phys: u64, size: u64) -> Option<u
     )
 }
 
-// ── Root Interrupt range allocator ──────────────────────────────────────────
+// ── Interrupt range allocator ───────────────────────────────────────────────
 
 struct IrqRootAllocator
 {
@@ -1420,7 +1420,7 @@ fn spawn_virtio_blk(
     false
 }
 
-/// Split a single-IRQ `Interrupt` cap for a PCI device off the root range cap.
+/// Split a single-IRQ `Interrupt` cap for a PCI device off devmgr's Interrupt range cap.
 fn acquire_single_irq_cap(pci_dev: &pci::PciDevice, irq_root: &mut IrqRootAllocator)
 -> Option<u32>
 {
@@ -2051,7 +2051,7 @@ fn carve_uart_authority(caps: &mut caps::DevmgrCaps) -> Option<u32>
     carve_subrange(caps, 0x1000_0000, 0x1000)
 }
 
-/// Isolate the UART interrupt cap from the IRQ root so the serial driver can
+/// Isolate the UART interrupt cap from devmgr's IRQ range so the serial driver can
 /// route RX wakeups to its client. COM1 is ISA IRQ 4 on x86-64; the QEMU
 /// `virt` NS16550 is PLIC source 10. Both are platform-static and hardcoded on
 /// the same basis as the UART MMIO/IoPort above, pending the data-driven
@@ -2071,7 +2071,8 @@ fn carve_uart_irq(irq_root: &mut IrqRootAllocator) -> Option<u32>
 
 /// Carve a narrow `IoPort` of `count` ports starting at `base` out of
 /// devmgr's full-rights `IoPort` cap via two `ioport_split` calls. Returns
-/// the narrow slot; the unused slabs are deleted. `cap_derive`-copies the
+/// the narrow slot; the unused slabs are deleted, except that an
+/// overflowing `base + count` leaks the derived working cap (#446). `cap_derive`-copies the
 /// source so it stays intact for further carves. `root_cap` is that
 /// full-rights cap.
 #[cfg(target_arch = "x86_64")]

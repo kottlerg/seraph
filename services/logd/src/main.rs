@@ -10,7 +10,7 @@
 //!
 //! 1. Receives via bootstrap protocol a RECV cap on the master log
 //!    endpoint, a SEND cap on the same endpoint (single-use, for the
-//!    `HANDOVER_PULL` IPC to init-logd), a SEND cap on procmgr
+//!    `HANDOVER_PULL` IPC to init-logd), a `SEND|GRANT` cap on procmgr
 //!    carrying `DEATH_EQ_AUTHORITY` (for `REGISTER_DEATH_EQ`), and a
 //!    SEND cap on devmgr's registry endpoint carrying
 //!    `REGISTRY_QUERY_AUTHORITY` (to resolve the serial driver via

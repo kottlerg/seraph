@@ -164,8 +164,7 @@ ORs bit 0 into that Notification, and the holder re-enables the line with
 
 The kernel mints one root Interrupt range capability at boot that covers every IRQ id on the
 architecture and places it in init's CSpace. Init keeps the root and hands devmgr a full-rights
-derivation, which devmgr splits single-line children with `SYS_IRQ_SPLIT` and delegates one to each
-driver.
+derivation, from which devmgr splits single-line children with `SYS_IRQ_SPLIT` for the drivers.
 
 ### Mmio
 
@@ -272,7 +271,7 @@ devmgr already brokers). The remaining sanctioned rights are carried into no
 surviving cap and are unreachable after init's reap: **Dbcn** is thrown away by design (the
 userspace serial driver owns the console; forwarding the firmware console would
 bypass the console-ownership model), and **Cppc** / **Base** / **Pmu** are simply
-not needed by any current service. devmgr serves pwrmgr a copy further narrowed to
+not needed by any current service. devmgr serves pwrmgr a derivation further narrowed to
 **Reset** only (system reset / reboot); **Suspend** is retained against a future
 power-management path but delegated to no one today. See
 [services/devmgr/docs/responsibilities.md](../services/devmgr/docs/responsibilities.md).

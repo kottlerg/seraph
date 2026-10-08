@@ -204,7 +204,7 @@ pub struct RestartRecipe
 //              RECV from it per launch, and the first-launch HANDOVER_PULL
 //              SEND); held for the system's life so it can relaunch logd
 //     caps[1]: badge-0 `SEND|GRANT` source on procmgr's service endpoint
-//              (svcmgr mints real-logd's `DEATH_EQ_AUTHORITY` SEND from it)
+//              (svcmgr mints real-logd's `DEATH_EQ_AUTHORITY` `SEND|GRANT` cap from it)
 //
 // The substrate pairs land in `pending`; `HANDOVER_COMPLETE` later
 // reconciles them against `/config/svcmgr/services/`. log and procmgr
@@ -245,7 +245,7 @@ pub struct SvcmgrCaps
     /// log endpoint object alive across a logd crash. Zero if absent.
     pub master_log_source: u32,
     /// Badge-0 `SEND|GRANT` source on procmgr's service endpoint. svcmgr mints
-    /// real-logd's `DEATH_EQ_AUTHORITY` SEND from it per launch. Zero if absent.
+    /// real-logd's `DEATH_EQ_AUTHORITY` `SEND|GRANT` cap from it per launch. Zero if absent.
     pub procmgr_death_auth_source: u32,
 }
 

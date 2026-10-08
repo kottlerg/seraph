@@ -63,7 +63,7 @@ vfsd) whose thread cap init captured; logd is not a substrate. See init's
 | Field | Value |
 |---|---|
 | caps[0] | `master_log_source`: `RIGHTS_ALL` source on init's master log endpoint; svcmgr mints real-logd's master-log RECV from it on every (re)launch and the first-launch handover SEND (the `HANDOVER_PULL` drain then `HANDOVER_RELEASE`; see [`log_sink`](service-definitions.md#log_sink)); holding it keeps the log endpoint alive across a logd crash (`0` if absent) |
-| caps[1] | `procmgr_death_auth_source`: badge-0 `SEND\|GRANT` source on procmgr's service endpoint; svcmgr mints real-logd's `DEATH_EQ_AUTHORITY` SEND from it per launch (`0` if absent) |
+| caps[1] | `procmgr_death_auth_source`: badge-0 `SEND\|GRANT` source on procmgr's service endpoint; svcmgr mints real-logd's `DEATH_EQ_AUTHORITY` `SEND\|GRANT` cap from it per launch (`0` if absent) |
 | data[0] | `3` (`LOGD_SOURCES`) |
 
 svcmgr holds both sources for the system's life and mints real-logd's

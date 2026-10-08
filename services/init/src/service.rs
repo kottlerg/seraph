@@ -975,7 +975,7 @@ pub struct SvcmgrEndowment
     /// agnostic to which process holds the RECV.
     pub master_log_source: u32,
     /// Reserved badge-0 `SEND|GRANT` source on procmgr's service endpoint.
-    /// svcmgr mints real-logd's `DEATH_EQ_AUTHORITY` SEND from it per launch
+    /// svcmgr mints real-logd's `DEATH_EQ_AUTHORITY` `SEND|GRANT` cap from it per launch
     /// (used by logd to register sender death-notifications for slot reclaim).
     pub procmgr_death_auth_source: u32,
 }
@@ -1199,7 +1199,7 @@ pub fn phase3_svcmgr_handover(
     // per-mount fatfs cap to publish.
     let master_log_source = syscall::cap_derive(log_ep, syscall::RIGHTS_ALL).unwrap_or(0);
     // Badge-0 `SEND|GRANT` source on procmgr's service endpoint; svcmgr mints
-    // logd's `DEATH_EQ_AUTHORITY` SEND from it. `GRANT` because logd's
+    // logd's `DEATH_EQ_AUTHORITY` `SEND|GRANT` cap from it. `GRANT` because logd's
     // death-EQ registration transfers a cap, which the IPC kernel gates on it.
     let procmgr_death_auth_source =
         syscall::cap_derive(procmgr_ep, syscall::RIGHTS_EP_SEND_GRANT).unwrap_or(0);

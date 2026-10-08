@@ -85,9 +85,14 @@ devmgr's responsibilities are:
   (the port pwrmgr computed from the FADT) and one over the 8042 reset port,
   or a Reset-only `SbiControl` derivation on RISC-V. On every call the caps are
   re-derived from the `IoPort` / `SbiControl` caps devmgr holds, so nothing is consumed and a
-  restarted pwrmgr re-acquires them cleanly. devmgr runs no shutdown logic;
+  restarted pwrmgr re-acquires them cleanly; a request whose PM1a port plus
+  its width overflows `u16` leaks one devmgr slot, and devmgr takes the
+  PM1a port from the caller unchecked
+  ([#446](https://github.com/kottlerg/seraph/issues/446)). devmgr runs no shutdown logic;
   it brokers the hardware, pwrmgr interprets and actuates. Both are gated on
-  `REGISTRY_QUERY_AUTHORITY`.
+  `REGISTRY_QUERY_AUTHORITY` alone, so any holder of that badge, not only
+  pwrmgr, obtains the actuator caps
+  ([#446](https://github.com/kottlerg/seraph/issues/446)).
 - **Handle hotplug** (design intent; not yet implemented) — on platforms that support it,
   receive hotplug notifications and dynamically spawn or terminate driver processes. See
   [`docs/hotplug.md`](hotplug.md).

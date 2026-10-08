@@ -102,7 +102,7 @@ pub(crate) fn assemble_boot_caps(provided_recv: u32, seeds: Vec<u32>) -> Vec<u32
 ///   * `[1]` a SEND on the same endpoint for the one-shot `HANDOVER_PULL`,
 ///     present only on the first launch — a restart has no init-logd to pull
 ///     from, so this is `0` and logd skips the history pull;
-///   * `[2]` a `DEATH_EQ_AUTHORITY` SEND on procmgr (logd registers sender
+///   * `[2]` a `DEATH_EQ_AUTHORITY` `SEND|GRANT` on procmgr (logd registers sender
 ///     death-notifications for slot reclaim) — `SEND|GRANT` because that
 ///     registration transfers a cap;
 ///   * `[3]` a `REGISTRY_QUERY_AUTHORITY` SEND on devmgr's registry (logd

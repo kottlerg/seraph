@@ -66,8 +66,9 @@ implementation detail, not ABI.
 RISC-V supports three address-translation modes on this port, negotiated at boot by the bootloader
 ([core/boot/docs/page-tables.md](../core/boot/docs/page-tables.md) § Mode negotiation); the kernel
 recovers the active mode from `satp` at entry. Sv39 is the RVA23 platform minimum, Sv48 the standing
-default in CI and development (`cargo xtask` caps the QEMU guest at Sv48 unless `--riscv-mmu`
-selects another mode, aligning with x86-64's address-space size), Sv57 a wider expansion
+default in CI and development (`cargo xtask` caps the QEMU guest at Sv48 by default, aligning with
+x86-64's address-space size; its `--riscv-mmu` flag selects another mode, per
+[xtask/README.md](../xtask/README.md)), Sv57 a wider expansion
 ([platform-requirements.md](platform-requirements.md)). One kernel binary supports all three; every
 VA-layout constant that varies with the mode is derived from it at runtime.
 

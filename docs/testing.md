@@ -97,7 +97,8 @@ sysroot/
 ├── services/                 # long-running userspace services
 │   ├── …
 │   ├── drivers/              # device drivers (virtio-blk, virtio-input,
-│   │                         # serial, framebuffer, cmos-rtc | goldfish-rtc)
+│   │                         # serial, framebuffer, cmos-rtc | goldfish-rtc,
+│   │                         # and the test-only test-orphan)
 │   └── fs/                   # filesystem drivers (fatfs)
 ├── programs/                 # program binaries and the test fixtures the
 │                             # harnesses spawn

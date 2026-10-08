@@ -78,7 +78,9 @@ init-reap handoff init moves only its kernel-object caps and the reclaimable
 Memory caps it solely owns to procmgr (see "Init reap" below). The remaining
 root caps (the RAM roots of memory forwarded to memmgr, the firmware caps, and
 the `Interrupt`, `IoPort`, `SbiControl`, `Mmio`, and elevated `SchedControl`
-roots) stay in init's CSpace and are destroyed in its teardown cascade.
+roots) stay in init's CSpace and are destroyed in its teardown cascade (design intent; not yet
+implemented: init's CSpace is the kernel-pinned root CSpace, so the cascade does not run and these
+caps stay alive, unreachable, [#443](https://github.com/kottlerg/seraph/issues/443)).
 
 ### Init → memmgr
 
@@ -195,17 +197,17 @@ it lives in a single contiguous arena Memory cap that init forwards to
 memmgr as an in-use run at bootstrap (`finalize_memmgr`), so those pages
 are already accounted in memmgr's pool and never reach the reap route.
 
-Procmgr binds a death-EQ observer on **both** init threads (main +
-init-logd) and reaps only once both have exited — init is threadless. The
-main thread exits at the end of init's Handover stage, but init-logd keeps
-serving the master log endpoint until the svcmgr-launched real-logd pulls
-its handover, so it outlives main; reclaiming init's address space while a
-thread still runs in it would fault that thread. On the last death procmgr
-tears down init's kernel objects in order (Threads → AddressSpace → donate
-Memory caps to memmgr → CSpace cascade), leaving zero init residue. The
-procmgr-side protocol is specified in
-[procmgr IPC Interface](../services/procmgr/docs/ipc-interface.md)
-§ `REGISTER_INIT_TEARDOWN` and § `INIT_TEARDOWN_DONE`.
+Procmgr binds a death-EQ observer on **both** init threads (main + init-logd) and reaps only once
+both have exited — init is threadless. The main thread exits at the end of init's Handover stage,
+but init-logd keeps serving the master log endpoint until the svcmgr-launched real-logd pulls its
+handover, so it outlives main; reclaiming init's address space while a thread still runs in it would
+fault that thread. On the last death procmgr tears down init's kernel objects in order (Threads →
+AddressSpace → donate Memory caps to memmgr → CSpace cascade), leaving zero init residue (the CSpace
+cascade is design intent; not yet implemented: init's CSpace is the kernel-pinned root CSpace, so
+procmgr's delete drops only its own reference and the caps left in it stay alive, unreachable,
+[#443](https://github.com/kottlerg/seraph/issues/443)). The procmgr-side protocol is specified in
+[procmgr IPC Interface](../services/procmgr/docs/ipc-interface.md) § `REGISTER_INIT_TEARDOWN` and §
+`INIT_TEARDOWN_DONE`.
 
 After init's reap completes, svcmgr is the resident supervisor. See
 [`services/svcmgr/README.md`](../services/svcmgr/README.md).

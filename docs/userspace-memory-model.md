@@ -118,7 +118,7 @@ communicates them via `ProcessInfo` / `InitInfo`.
 - **Thread safety.** A spinlock guards the allocator. Multi-threaded
   services share one allocator instance.
 - **`no_std` exceptions.** `init` and `memmgr` are `no_std` and have
-  no `#[global_allocator]`. They allocate frames (where applicable)
+  no byte heap (no `GlobalAlloc`). They allocate frames (where applicable)
   via direct kernel object handling at boot, not via `REQUEST_MEMORY_CAPS`.
 
 ### Page Reservations

@@ -97,8 +97,8 @@ spinlock. Races on slot content against the unlocked readers are narrowed — no
 and per-slot generation checks at the resolution sites. `lookup_cap` takes no reference on the
 object it resolves, so the object can be freed while a handler still dereferences it. An object is
 freed when its reference count reaches zero, whatever releases the last reference: a capability or
-one of the kernel-internal owners
-[§ Kernel Object Reference Counting](#kernel-object-reference-counting) lists. A split child (a
+a kernel-internal owner (the principal ones are listed in
+[§ Kernel Object Reference Counting](#kernel-object-reference-counting)). A split child (a
 `SYS_MEMORY_SPLIT` tail, or a range-split MMIO, IoPort, IRQ, or SchedControl child) is a distinct
 object linked under the original's derivation parent, so another holder's revoke of that ancestor
 can free it directly. For a same-object derivation, as in the kill-process pattern, it is the delete
@@ -405,7 +405,9 @@ The principal kernel-internal owners:
 - **Kernel-lifetime pins.** The SEED reserve and the root CSpace each hold a reference
   the kernel never releases (the SEED pin from `install_seed_memory`; the root CSpace's
   base reference, attributed to init's TCB), and `HDR_FLAG_IS_ROOT` clamps the root
-  CSpace's count at 1, so neither is ever freed.
+  CSpace's count at 1, so neither is ever freed. The root CSpace is init's CSpace, so the
+  cascade that docs/process-lifecycle.md § Init reap describes at init's reap is design
+  intent, not yet implemented ([#443](https://github.com/kottlerg/seraph/issues/443)).
 - **Fault-handler binding.** `SYS_THREAD_SET_FAULT_HANDLER` takes a reference on the
   bound Endpoint, released on unbind, rebind, or thread destruction.
 - **Transient holds.** A syscall that must keep an object live across a lock-free step

@@ -260,7 +260,9 @@ only narrows rights, never widens; there is no dedicated SBI split operation).
 
 The kernel mints the root cap once at boot, carrying every sanctioned right, into
 init's cspace. **init is reaped after bootstrap, so any right not transferred to a
-surviving service before the reap is dropped — unforwardable until the next boot.
+surviving service before the reap is dropped — unforwardable until the next boot (the cap
+stays in init's kernel-pinned CSpace, unreachable; releasing it at the reap is design intent,
+not yet implemented, [#443](https://github.com/kottlerg/seraph/issues/443)).
 This, not a kernel wall, is what bounds the live extension set.** init transfers a
 cap narrowed to **Reset** + **Suspend** to devmgr, the steady-state holder of
 platform firmware authority (it sits alongside the ACPI / MMIO / IRQ resources
@@ -300,7 +302,8 @@ boundary — that partition is userspace policy expressed through cap
 distribution. The root cap spans the full userspace range `[1, PRIORITY_MAX]`
 and is created at boot. Init splits it into the baseline band
 (`[1, sched_policy::BASELINE_PRIORITY_MAX]`, i.e. `[1, 28]`) and an elevated
-remainder (`[29, PRIORITY_MAX]`) that never leaves init and dies at its reap.
+remainder (`[29, PRIORITY_MAX]`) that never leaves init and is unreachable after its reap
+(see § SbiControl above).
 Every spawned process receives a band via `ProcessInfo.sched_control_cap`:
 procmgr fans its baseline out per child at create time — a plain `cap_copy`
 for a full-width band, or copy-then-`SYS_SCHED_SPLIT` to mint a narrowed

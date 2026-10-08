@@ -511,5 +511,6 @@ pattern also matches legitimate prose.
 [Kernel Entropy Subsystem](../core/kernel/docs/entropy.md),
 [core/ktest/README.md](../core/ktest/README.md), [Architecture Overview](../docs/architecture.md),
 [Build System](../docs/build-system.md), [Coding Standards](../docs/coding-standards.md),
-[Testing](../docs/testing.md), [programs/terminal/README.md](../programs/terminal/README.md),
+[Memory Model](../docs/memory-model.md), [Testing](../docs/testing.md),
+[programs/terminal/README.md](../programs/terminal/README.md),
 [rootfs/README.md](../rootfs/README.md)

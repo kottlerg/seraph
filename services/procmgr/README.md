@@ -85,28 +85,27 @@ procmgr/
 ## Init reap
 
 Procmgr accepts init's `REGISTER_INIT_TEARDOWN` handoff during init's Handover stage
-([services/init/docs/bootstrap.md](../init/docs/bootstrap.md) § Handover). The first
-round, before init signals `HANDOVER_COMPLETE`, carries init's own `AddressSpace` /
-`CSpace` / `Thread` caps, so procmgr's death observers are bound before real-logd can
-release init-logd; later rounds carry every reclaimable Memory cap, and
-`INIT_TEARDOWN_DONE` ends the handoff. Procmgr binds a death-EQ observer on **both** init
-threads (main + init-logd) with `INIT_REAP_CORRELATOR` and reaps once both have exited
-— init-logd outlives main until the svcmgr-launched real-logd releases it via
-`HANDOVER_RELEASE` (see [logd handover protocol](../logd/docs/handover-protocol.md)).
-The reap is purely
-death-driven: procmgr waits for that natural exit and never force-stops init-logd. If a
-handover never completes (real-logd crashes mid-pull or never launches), init-logd serves
-on and init's memory caps stay held until shutdown — a benign hold, not a wedge; the
-all-RAM-accounted identity correspondingly closes only once the handover completes. The
-reap path tears down init's kernel objects in order — Threads → AddressSpace → donate
-Memory caps to memmgr via `DONATE_MEMORY_CAPS` → CSpace cascade — leaving zero init
-residue. Implementation in [`src/init_reap.rs`](src/init_reap.rs). The two-thread,
-death-driven reap model is in
-[docs/process-lifecycle.md](../../docs/process-lifecycle.md) § Init reap; the hold when a
-handover never completes is in
-[services/logd/docs/handover-protocol.md](../logd/docs/handover-protocol.md) § Failure
-modes; the handoff protocol is in [docs/ipc-interface.md](docs/ipc-interface.md)
-§ `REGISTER_INIT_TEARDOWN` and § `INIT_TEARDOWN_DONE`.
+([services/init/docs/bootstrap.md](../init/docs/bootstrap.md) § Handover). The first round, before
+init signals `HANDOVER_COMPLETE`, carries init's own `AddressSpace` / `CSpace` / `Thread` caps, so
+procmgr's death observers are bound before real-logd can release init-logd; later rounds carry every
+reclaimable Memory cap, and `INIT_TEARDOWN_DONE` ends the handoff. Procmgr binds a death-EQ observer
+on **both** init threads (main + init-logd) with `INIT_REAP_CORRELATOR` and reaps once both have
+exited — init-logd outlives main until the svcmgr-launched real-logd releases it via
+`HANDOVER_RELEASE` (see [logd handover protocol](../logd/docs/handover-protocol.md)). The reap is
+purely death-driven: procmgr waits for that natural exit and never force-stops init-logd. If a
+handover never completes (real-logd crashes mid-pull or never launches), init-logd serves on and
+init's memory caps stay held until shutdown — a benign hold, not a wedge; the all-RAM-accounted
+identity correspondingly closes only once the handover completes. The reap path tears down init's
+kernel objects in order — Threads → AddressSpace → donate Memory caps to memmgr via
+`DONATE_MEMORY_CAPS` → CSpace cascade — leaving zero init residue (the CSpace cascade is design
+intent; not yet implemented, since init's CSpace is the kernel-pinned root CSpace; see
+[process-lifecycle.md](../../docs/process-lifecycle.md#init-reap),
+[#443](https://github.com/kottlerg/seraph/issues/443)). Implementation in
+[`src/init_reap.rs`](src/init_reap.rs). The two-thread, death-driven reap model is in
+[docs/process-lifecycle.md](../../docs/process-lifecycle.md) § Init reap; the hold when a handover
+never completes is in [services/logd/docs/handover-protocol.md](../logd/docs/handover-protocol.md) §
+Failure modes; the handoff protocol is in [docs/ipc-interface.md](docs/ipc-interface.md) §
+`REGISTER_INIT_TEARDOWN` and § `INIT_TEARDOWN_DONE`.
 
 ---
 

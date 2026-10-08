@@ -48,6 +48,13 @@
 //!                                                init's last caps;
 //!                                                none free to the
 //!                                                sealed buddy
+//!                                                (design intent:
+//!                                                init's CSpace is the
+//!                                                kernel-pinned root
+//!                                                CSpace, so the
+//!                                                delete drops only
+//!                                                procmgr's reference;
+//!                                                #443)
 //!   6. log summary
 //! ```
 
@@ -305,8 +312,10 @@ fn do_reap(state: InitReapState, memmgr_ep: u32, ipc_buf: *mut u64)
     let (donated_caps, donated_pages, pool_total) =
         donate_to_memmgr(memmgr_ep, &donate_caps, ipc_buf);
 
-    // 5. Destroy init's CSpace last. The cascade in `dealloc_object`
-    //    drops every cap init still held — endpoint SENDs and the
+    // 5. Destroy init's CSpace last. Design intent (#443): init's CSpace is
+    //    the kernel-pinned root CSpace, so this delete drops only procmgr's
+    //    reference and the cascade below does not run yet. The cascade in
+    //    `dealloc_object` drops every cap init still held — endpoint SENDs and the
     //    endpoint-slab arena Memory cap. That arena is retype-pinned and
     //    already forwarded to memmgr's pool, and every reclaimable
     //    Memory cap was donated in step 4, so no `owns_memory` cap reaches

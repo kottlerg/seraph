@@ -206,7 +206,8 @@ fault that thread. On the last death procmgr tears down init's kernel objects in
 AddressSpace → donate Memory caps to memmgr → drop its CSpace reference), leaving two init residues:
 init's CSpace with the caps init still holds, and the kernel-direct page-table nodes behind its
 bootstrap mappings. Those caps include the remaining root caps (see [Kernel → init](#kernel--init)),
-the endpoints init created, the intermediate caps it derived, and its bootstrap-arena Memory cap.
+the endpoints init created, its caps on the kernel objects it created for memmgr and procmgr, the
+intermediate caps it derived, and the bootstrap-arena Memory caps it forwarded to memmgr.
 They stay in init's CSpace, which the kernel pins (it is the root CSpace; see
 [capability-internals.md § Kernel Object Reference Counting](../core/kernel/docs/capability-internals.md#kernel-object-reference-counting)),
 so procmgr's delete drops only its own reference and they remain alive but unreachable; releasing

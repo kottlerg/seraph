@@ -352,7 +352,7 @@ Wire format:
 |---|---|
 | label | `procmgr_labels::REGISTER_INIT_TEARDOWN` (15) |
 | `data[0]` | `1` on the first round (carrying kernel-object caps); `0` on subsequent donation rounds |
-| `caps[0..]` | Round 1: 4 kernel-object caps (`AddressSpace`, `CSpace`, main `Thread`, init-logd `Thread`) — MOVED out of init's CSpace via IPC cap-transfer. Subsequent rounds: 1-4 reclaimable Memory caps per round (segments, stack, `InitInfo` pages, allocator orphans). |
+| `caps[0..]` | Round 1: 4 kernel-object caps (`AddressSpace`, `CSpace`, main `Thread`, init-logd `Thread`) — MOVED out of init's CSpace via IPC cap-transfer. Subsequent rounds: 1-4 reclaimable Memory caps per round (every reclaimable Memory cap init solely owns; the set is in [docs/process-lifecycle.md](../../../docs/process-lifecycle.md#init-reap) § Init reap). |
 
 On the first round procmgr stores the kernel-object caps and binds a death-EQ
 observer on both init threads under the same correlator:
@@ -385,7 +385,8 @@ Each death-EQ event with
 `INIT_REAP_CORRELATOR` (reserved `u32::MAX`) calls
 [`init_reap::run_reap`](../src/init_reap.rs), which counts the death (also one
 observed before `INIT_TEARDOWN_DONE` arms the reap) and, on the second, executes
-the six-step teardown (Threads → AddressSpace → DONATE_MEMORY_CAPS → CSpace → log).
+the six-step teardown (Threads → AddressSpace → DONATE_MEMORY_CAPS → drop procmgr's CSpace
+reference → log).
 init-logd normally exits last, once real-logd's `HANDOVER_RELEASE` releases it;
 procmgr never force-stops it. If the handover never completes, init-logd serves on
 and init's caps stay held until shutdown — a benign hold, not a wedge (see the

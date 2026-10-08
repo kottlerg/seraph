@@ -261,8 +261,8 @@ pub fn run_reap(memmgr_ep: u32, ipc_buf: *mut u64)
             // Both threads exited before arming. init's main thread sends
             // `INIT_TEARDOWN_DONE` before its own `thread_exit`, so main's death
             // is always post-arm and this branch is unreachable in well-formed
-            // teardown; leave the reap for the arming path rather than reaping
-            // before init has finished donating.
+            // teardown. If it is reached, the reap never runs: `handle_done`
+            // does not check `pending_deaths` (#449).
             return;
         }
         guard.take().expect("init-reap state present")
@@ -312,7 +312,7 @@ fn do_reap(state: InitReapState, memmgr_ep: u32, ipc_buf: *mut u64)
 
     // 5. Revoke and delete procmgr's cap on init's CSpace last. init's
     //    CSpace is the kernel-pinned root CSpace, so this drops only
-    //    procmgr's reference: the caps init still holds (the set is in
+    //    procmgr's reference: the caps init still holds (described in
     //    `docs/process-lifecycle.md` § Init reap) stay in it, alive but
     //    unreachable. Releasing them at the reap is design intent,
     //    not yet implemented (`docs/process-lifecycle.md` § Init reap,

@@ -295,14 +295,16 @@ pub mod procmgr_labels
     /// table, calls `sys_thread_bind_notification` on the child's
     /// main thread with this EQ as a second observer. From the
     /// registration moment onward, every newly spawned child also
-    /// receives the binding inside `finalize_creation`. Single
-    /// observer slot — re-registration replaces the previous cap.
+    /// receives the binding inside `finalize_creation`. Registration is
+    /// first-wins: a second registration has its cap deleted.
     ///
     /// Real-logd uses this to learn about sender deaths so it can
     /// evict the corresponding slot in its hash-keyed badge table.
     /// Reply is `procmgr_errors::SUCCESS` on bind, `INVALID_ARGUMENT`
-    /// if the cap is missing or wrong type, `UNAUTHORIZED` if called
-    /// over a non-privileged path (gated by badged SEND cap).
+    /// if no cap (or a zero cap) is transferred, `UNAUTHORIZED` without
+    /// the `DEATH_EQ_AUTHORITY` badge or when an EQ is already
+    /// registered (`services/procmgr/docs/ipc-interface.md`
+    /// § `REGISTER_DEATH_EQ`).
     pub const REGISTER_DEATH_EQ: u64 = 14;
 
     /// Badge bit on procmgr service caps that authorises

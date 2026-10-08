@@ -28,7 +28,7 @@ procmgr/
 │   ├── main.rs                 # _start() entry point, IPC dispatch loop
 │   ├── loader.rs               # ELF load pipeline
 │   ├── process.rs              # Per-process state, kernel-object allocation
-│   ├── init_reap.rs            # Init-reap: tears down init's residue after handover
+│   ├── init_reap.rs            # Init-reap: reaps init after handover
 │   └── arch/                   # Arch-specific helpers
 └── docs/
     └── ipc-interface.md        # procmgr IPC interface specification
@@ -77,7 +77,7 @@ procmgr/
   init's Handover stage
   ([services/init/docs/bootstrap.md](../init/docs/bootstrap.md) § Handover):
   kernel-object caps before `HANDOVER_COMPLETE`, reclaimable Memory caps and
-  `INIT_TEARDOWN_DONE` after. Then tear down init's residue. See the
+  `INIT_TEARDOWN_DONE` after. Then reap init. See the
   [Init reap](#init-reap) subsection below.
 
 ---
@@ -97,9 +97,9 @@ handover never completes (real-logd crashes mid-pull or never launches), init-lo
 init's memory caps stay held until shutdown — a benign hold, not a wedge; the all-RAM-accounted
 identity correspondingly closes only once the handover completes. The reap path tears down init's
 kernel objects in order — Threads → AddressSpace → donate Memory caps to memmgr via
-`DONATE_MEMORY_CAPS` → CSpace — leaving no init residue but two: the caps init still holds stay
-in init's CSpace, which the kernel pins (it is the root CSpace), so they remain alive but
-unreachable; releasing them at the reap is design intent, not yet implemented
+`DONATE_MEMORY_CAPS` → drop procmgr's CSpace reference — leaving two init residues: init's CSpace
+with the caps init still holds, which the kernel pins (it is the root CSpace), so they remain alive
+but unreachable; releasing them at the reap is design intent, not yet implemented
 ([#443](https://github.com/kottlerg/seraph/issues/443); see
 [process-lifecycle.md § Init reap](../../docs/process-lifecycle.md#init-reap)); and, as an
 accepted cost, the kernel-direct page-table nodes behind init's bootstrap mappings stay consumed

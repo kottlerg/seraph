@@ -231,17 +231,13 @@ endowment (see the [svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md)).
   after real-logd's `HANDOVER_RELEASE`): both Thread caps are deleted, init's `AddressSpace` is
   revoked + deleted (its pool donations `retype_free`'d, user-page
   mappings vanish), the accumulated Memory caps are `DONATE_MEMORY_CAPS`'d to
-  memmgr's pool, and init's `CSpace` is revoked + deleted. The caps
-  init still holds (the remaining root caps, the endpoints init
-  created, the intermediate caps it derived, and the retype-pinned
-  bootstrap arena already forwarded to memmgr; the set is in
-  [Process Lifecycle](../../../docs/process-lifecycle.md#init-reap)
-  § Init reap) stay in init's `CSpace`, which
+  memmgr's pool, and procmgr's cap on init's `CSpace` is revoked +
+  deleted. The caps init still holds stay in init's `CSpace`, which
   the kernel pins (it is the root CSpace), so they remain alive but
   unreachable; releasing them at the reap is design intent; not yet
   implemented ([#443](https://github.com/kottlerg/seraph/issues/443);
-  see [Process Lifecycle](../../../docs/process-lifecycle.md#init-reap)
-  § Init reap). Every reclaimable Memory cap was donated, so no
+  [Process Lifecycle](../../../docs/process-lifecycle.md#init-reap)
+  § Init reap describes those caps). Every reclaimable Memory cap was donated, so no
   `owns_memory` cap reaches its last reference and nothing frees to
   the sealed buddy. Procmgr logs a summary line. Beyond init's pinned
   `CSpace` and the caps in it, no init-related kernel object remains, except that the kernel-direct
@@ -278,12 +274,13 @@ The kernel populates init's CSpace before transferring control (see
 | Scheduler | `SchedControl` cap |
 | Boot modules | `Memory` caps for each boot-module image inside `bootstrap.bundle` (procmgr, memmgr, devmgr, vfsd, …) — resolved by name via the `init_protocol` module-name table |
 
-Init derives and transfers these to services using the
+Init keeps every root. Memory forwarded into memmgr's CSpace uses the
 **derive-twice** pattern documented in
 [`../../../docs/capability-model.md`](../../../docs/capability-model.md):
-init retains intermediary derivations (revocable) rather than the
-roots, so it can revoke a child's authority before the handover to
-svcmgr if needed (derivation-tree mechanics in
+init derives a full-rights intermediary from the source cap and copies
+that into memmgr's CSpace, keeping the intermediary. devmgr's hardware
+caps are single derivations of init's roots moved over IPC, revocable
+only through the root (derivation-tree mechanics in
 [capability internals](../../../core/kernel/docs/capability-internals.md)).
 
 ### Per-stage authority transfers

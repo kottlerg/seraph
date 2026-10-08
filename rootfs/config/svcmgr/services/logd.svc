@@ -3,7 +3,7 @@
 # svcmgr launches and supervises logd post-handover, minting its bootstrap
 # round from the reserved log-sink sources init endows: the master log
 # endpoint RECV, a first-launch SEND for the HANDOVER_PULL of init-logd's
-# boot history, a DEATH_EQ_AUTHORITY SEND on procmgr (for sender slot
+# boot history, a DEATH_EQ_AUTHORITY SEND|GRANT on procmgr (for sender slot
 # reclaim), and a devmgr.registry query cap (logd resolves the serial driver
 # via QUERY_SERIAL_DEVICE and routes output through it — it holds no UART
 # hardware). `log_sink = yes` selects this svcmgr-minted round in place of

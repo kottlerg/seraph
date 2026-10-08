@@ -217,7 +217,10 @@ The kernel mints one root IoPort capability over the full 64K port space at boot
 IoPort capabilities are not creatable at runtime. Init keeps the root and hands devmgr a full-rights
 derivation, and devmgr narrows it with `SYS_IOPORT_SPLIT` and gives each driver only its assigned
 port range (see
-[services/devmgr/docs/responsibilities.md](../services/devmgr/docs/responsibilities.md)).
+[services/devmgr/docs/responsibilities.md](../services/devmgr/docs/responsibilities.md)). devmgr's
+`QUERY_SHUTDOWN_DEVICE` also serves a caller-chosen 2-port window plus the 8042 reset port to any
+`REGISTRY_QUERY_AUTHORITY` holder, not only pwrmgr
+([#446](https://github.com/kottlerg/seraph/issues/446)).
 
 Revoking an IoPort capability removes port access from all threads it has
 been bound to; the kernel tracks bindings and updates each affected thread's IOPB
@@ -257,22 +260,21 @@ right its cap actually carries — so what userspace may do is set by which caps
 are handed out, by ordinary minimum-privilege distribution (`cap_derive`, which
 only narrows rights, never widens; there is no dedicated SBI split operation).
 
-The kernel mints the root cap once at boot, carrying every sanctioned right, into
-init's cspace. **init is reaped after bootstrap, so any right not transferred to a
-surviving service before the reap is unforwardable until the next boot: the cap stays in
-init's CSpace, which the kernel pins (it is the root CSpace), so it remains alive but
-unreachable; releasing it at the reap is design intent, not yet implemented
-([#443](https://github.com/kottlerg/seraph/issues/443); see
-[process-lifecycle.md § Init reap](process-lifecycle.md#init-reap)).
-This, not a kernel wall, is what bounds the live extension set.** init transfers a
-cap narrowed to **Reset** + **Suspend** to devmgr, the steady-state holder of
-platform firmware authority (it sits alongside the ACPI / MMIO / IRQ resources
-devmgr already brokers). The remaining sanctioned rights are carried into no
-surviving cap and are unreachable after init's reap: **Dbcn** is thrown away by design (the
-userspace serial driver owns the console; forwarding the firmware console would
-bypass the console-ownership model), and **Cppc** / **Base** / **Pmu** are simply
-not needed by any current service. devmgr serves pwrmgr a derivation further narrowed to
-**Reset** only (system reset / reboot); **Suspend** is retained against a future
+The kernel mints the root cap once at boot, carrying every sanctioned right, into init's cspace.
+**init is reaped after bootstrap, so any right not transferred to a surviving service before the
+reap is unforwardable until the next boot: the cap stays in init's CSpace, which the kernel pins (it
+is the root CSpace), so it remains alive but unreachable; releasing it at the reap is design intent,
+not yet implemented ([#443](https://github.com/kottlerg/seraph/issues/443); see
+[process-lifecycle.md § Init reap](process-lifecycle.md#init-reap)). This, not a kernel wall, is
+what bounds the live extension set.** init transfers a cap narrowed to **Reset** + **Suspend** to
+devmgr, the steady-state holder of platform firmware authority (it sits alongside the ACPI / MMIO /
+IRQ resources devmgr already brokers). The remaining sanctioned rights are carried into no surviving
+cap and are unreachable after init's reap: **Dbcn** is thrown away by design (the userspace serial
+driver owns the console; forwarding the firmware console would bypass the console-ownership model),
+and **Cppc** / **Base** / **Pmu** are simply not needed by any current service. devmgr serves pwrmgr
+a derivation further narrowed to **Reset** only (system reset / reboot), and serves it to any
+`REGISTRY_QUERY_AUTHORITY` holder, not only pwrmgr
+([#446](https://github.com/kottlerg/seraph/issues/446)); **Suspend** is retained against a future
 power-management path but delegated to no one today. See
 [services/devmgr/docs/responsibilities.md](../services/devmgr/docs/responsibilities.md).
 

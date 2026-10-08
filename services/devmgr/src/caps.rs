@@ -167,8 +167,8 @@ pub struct DevmgrCaps
 
     // Steady-state holder of the platform power-state SBI authority (RISC-V
     // only; zero on x86-64): a Reset + Suspend `SbiControl` cap from init,
-    // which is reaped. devmgr serves pwrmgr a `cap_derive` copy narrowed to
-    // Reset on `QUERY_SHUTDOWN_DEVICE`; Suspend is held against a future
+    // which is reaped. devmgr serves pwrmgr a Reset-only derivation on
+    // `QUERY_SHUTDOWN_DEVICE`; Suspend is held against a future
     // path. devmgr itself never forwards an SBI call — it only holds and
     // brokers the cap.
     #[cfg_attr(not(target_arch = "riscv64"), allow(dead_code))]

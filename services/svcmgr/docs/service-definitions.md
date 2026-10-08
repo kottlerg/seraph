@@ -176,8 +176,10 @@ seed = rootfs.root pwrmgr.shutdown pwrmgr.deny
 
 becomes `caps = [rootfs_root_send, pwrmgr_shutdown_send,
 pwrmgr_deny_send]` on the child's `bootstrap::request_round`. The
-list is truncated to `MSG_CAP_SLOTS_MAX` (currently 4) entries; any
-truncation is logged.
+list is truncated to `MSG_CAP_SLOTS_MAX` (currently 4) entries, or one fewer
+for a `provides` service, whose provider RECV takes cap[0]. A recipe with
+more than 4 seeds is logged; a provider's dropped fourth seed is not
+([#451](https://github.com/kottlerg/seraph/issues/451)).
 
 An unresolved name leaves slot `i` as `0`. Consumers that already tolerate `cap == 0 → skip`
 (e.g. svctest's pwrmgr phases, per

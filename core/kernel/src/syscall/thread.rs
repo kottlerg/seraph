@@ -806,11 +806,11 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
 /// Binding takes a reference on the endpoint object for the binding's lifetime
 /// (see `docs/fault-handling.md` § Liveness); rebinding / unbinding / thread
 /// destruction releases it.
-/// This holds only absent a race: lookup_cap takes no reference on the target
-/// Thread or the endpoint, so a concurrent delete of the last capability to
-/// either, or a revoke of an ancestor of the caller's capability by another
-/// holder, can free it mid-call (core/kernel/docs/capability-internals.md
-/// § CSpace Implementation, #443).
+/// This holds only absent a race: `lookup_cap` takes no reference on the
+/// target Thread or the endpoint, so a concurrent delete of the last
+/// capability to either, or a revoke of an ancestor of the caller's capability
+/// by another holder, can free it mid-call (`core/kernel/docs/capability-internals.md`
+/// § Storage: Hybrid Two-Level Radix, #443).
 /// Binding requires only a valid `Endpoint` cap —
 /// `CONTROL` on the thread is the authority; the endpoint cap merely names where
 /// this thread's kernel-unresolvable faults are delivered.
@@ -885,7 +885,7 @@ pub fn sys_thread_set_fault_handler(tf: &mut TrapFrame) -> Result<u64, SyscallEr
         // takes no reference, so a concurrent delete of the last Endpoint cap
         // (by a sibling thread) or a revoke of an ancestor of the caller's cap
         // (by a foreign holder) can free it before this inc_ref (#443; see
-        // capability-internals.md § CSpace Implementation).
+        // capability-internals.md § Storage: Hybrid Two-Level Radix).
         unsafe { (*new_ep).header.inc_ref() };
     }
 
@@ -896,7 +896,7 @@ pub fn sys_thread_set_fault_handler(tf: &mut TrapFrame) -> Result<u64, SyscallEr
     // delete of the last Thread cap (by a sibling thread) or a revoke of an
     // ancestor of the caller's cap (by a foreign holder) can free the TCB
     // before these writes (#443; see capability-internals.md
-    // § CSpace Implementation).
+    // § Storage: Hybrid Two-Level Radix).
     let old_ep = unsafe {
         (*target_tcb).fault_badge.store(badge, Ordering::Release);
         (*target_tcb).fault_handler.swap(new_ep, Ordering::AcqRel)
@@ -1240,7 +1240,7 @@ pub fn sys_thread_set_affinity(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // reference, so a concurrent delete of the last Thread cap (by a sibling
     // thread) or a revoke of an ancestor of the caller's cap (by a foreign
     // holder) can free it during this block (see capability-internals.md
-    // § CSpace Implementation), and the `cpu_affinity` write and the
+    // § Storage: Hybrid Two-Level Radix), and the `cpu_affinity` write and the
     // `preferred_cpu` / `state` reads are not serialised with other CPUs'
     // scheduler paths; both are #443 defects.
     unsafe {

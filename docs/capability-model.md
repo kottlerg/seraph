@@ -461,7 +461,8 @@ slot but not revocation authority over the lineage: the mover, having nulled its
 slot, no longer holds the cap, yet a `cap_revoke` on one of the cap's ancestors
 still reaches it — even across a CSpace boundary. Such a revoke frees the recipient's
 slot in the recipient's own CSpace; per-slot generation handles make the recipient's
-now-stale handle fail closed rather than alias a recycled slot (#349). (A move within
+now-stale handle fail closed rather than alias a recycled slot (#349); a syscall already
+in flight on the freed object is not covered (see [Revocation](#revocation)). (A move within
 the same CSpace likewise keeps the source's position.) To delegate a capability while
 keeping your own copy, use `SYS_CAP_COPY` instead (see [Revocation](#revocation)).
 
@@ -498,7 +499,13 @@ recipient's slot in the recipient's own CSpace. Per-slot generation handles ensu
 the recipient's now-stale handle then fails with `InvalidCapability` rather than
 aliasing a recycled slot index — the cross-CSpace stale-slot alias that was the #349
 hazard. See [capability-internals.md](../core/kernel/docs/capability-internals.md)
-§ Capability Transfer in IPC.
+§ Capability Transfer in IPC. Kernel lookups take no reference on the object they resolve,
+so while a holder's syscall still dereferences that object, a concurrent delete of the last
+capability to it, or a revoke of an ancestor of the holder's capability by another holder (as
+in the kill-process pattern), can free it under that syscall — a known kernel memory-safety
+defect (see
+[capability-internals.md](../core/kernel/docs/capability-internals.md#storage-hybrid-two-level-radix)
+§ Storage: Hybrid Two-Level Radix, [#443](https://github.com/kottlerg/seraph/issues/443)).
 
 
 ---
@@ -677,10 +684,12 @@ bound to: when the last capability to either object is deleted, every thread bou
 before the object's storage is reclaimed, wherever those threads' own capabilities are held —
 including the deleting thread itself, when it holds that last capability to its own `CSpace` or
 `AddressSpace` (the delete then never returns to it). The process's resources are reclaimed as their
-capability reference counts reach zero. For a thread displaced from a server's pending-reply binding
-by a later receive, neither these stops nor the reap that deleting its last Thread capability starts
-is memory-safe, and the reap can hang the kernel ([IPC Design](ipc-design.md#the-callreply-model),
-[#443](https://github.com/kottlerg/seraph/issues/443)).
+capability reference counts reach zero. This path has two known kernel memory-safety gaps, both
+tracked in [#443](https://github.com/kottlerg/seraph/issues/443): a thread displaced from a server's
+pending-reply binding by a later receive, whose reap can hang the kernel (see
+[IPC Design](ipc-design.md#the-callreply-model)), and a thread syscall racing the revoke on an
+object `lookup_cap` did not pin (see
+[Capability Internals](../core/kernel/docs/capability-internals.md#storage-hybrid-two-level-radix)).
 
 Beyond that stop, the kernel's role in death is *notification*. An
 `AddressSpace` carries a death-observer set (mirroring the per-thread death

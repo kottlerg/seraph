@@ -97,8 +97,12 @@ any registered CSpace's slots via registry lookup without taking its
 spinlock — see Derivation Tree below). Paths crossing the families hold
 the derivation lock outermost, then the spinlock. Races on slot content
 against the unlocked readers are narrowed — not closed — by the tag and
-per-slot generation checks at the resolution sites; the residual is
-confined to threads of the owning process racing each other.
+per-slot generation checks at the resolution sites. `lookup_cap` takes no
+reference on the object it resolves, so while a handler still dereferences
+that object, a concurrent delete of the last capability to it, or a revoke
+of an ancestor of the caller's capability by another holder (as in the
+kill-process pattern), can free it; this is a known defect tracked in
+[#443](https://github.com/kottlerg/seraph/issues/443).
 
 **Slot 0** is always null. The leaf covering slot 0 exists once the CSpace
 has grown, but the slot is permanently locked to the null capability,
@@ -568,10 +572,12 @@ can touch the derivation forest during the drain below. If the thread running th
 stopped — it deleted the last capability to its own `CSpace`, or a concurrent teardown stopped it —
 nothing below runs now: the object is queued for off-CPU reclaim and the whole arm re-runs from the
 deferred drain once the thread has been scheduled away. The same discipline applies to an
-`AddressSpace` reaching refcount zero. For a thread displaced from a server's pending-reply binding,
-neither this stop nor its later reap is memory-safe, and the reap can hang the kernel; see
-[ipc-design.md](../../../docs/ipc-design.md#the-callreply-model),
-[#443](https://github.com/kottlerg/seraph/issues/443).
+`AddressSpace` reaching refcount zero. This path has two known memory-safety gaps, both tracked in
+[#443](https://github.com/kottlerg/seraph/issues/443): a thread displaced from a server's
+pending-reply binding, whose reap can hang the kernel
+([ipc-design.md](../../../docs/ipc-design.md#the-callreply-model)), and a thread syscall racing the
+teardown on an object `lookup_cap` did not pin
+([§ Storage: Hybrid Two-Level Radix](#storage-hybrid-two-level-radix)).
 
 Every derivation link reachable from a live slot resolves: before a `CSpace`
 unregisters, its teardown drain (`drain_dying_cspace_batch`) unlinks every
@@ -866,8 +872,10 @@ and § Reply Path).
 [core/kernel/README.md](../README.md),
 [Kernel Cross-Boundary Disclosure Inventory](cross-boundary-disclosure.md),
 [IPC Subsystem Internals](ipc-internals.md), [Memory Subsystem Internals](memory-internals.md),
+[Scheduler Internals](scheduler.md),
 [SMP Scheduling and Locking Invariants](scheduling-internals.md),
 [Syscall Interface Specification](syscalls.md),
-[Capability Model](../../../docs/capability-model.md), [IPC Design](../../../docs/ipc-design.md),
+[Capability Model](../../../docs/capability-model.md),
+[Fault Handling](../../../docs/fault-handling.md), [IPC Design](../../../docs/ipc-design.md),
 [Process Lifecycle](../../../docs/process-lifecycle.md),
 [init Bootstrap Stages](../../../services/init/docs/bootstrap.md)

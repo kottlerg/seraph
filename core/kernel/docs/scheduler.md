@@ -557,6 +557,14 @@ deferring to the next enqueue ([syscalls.md](syscalls.md) § `SYS_THREAD_SET_AFF
 - **Blocked / Stopped / Created**: the new affinity takes effect on the
   next wake via `select_target_cpu`; no migration work is needed.
 
+The syscall holds no `sched_lock`, so its affinity write races other CPUs' scheduler paths
+([#443](https://github.com/kottlerg/seraph/issues/443)). `lookup_cap` takes no reference on the
+target Thread, so a concurrent delete of its last capability, or a revoke of an ancestor of the
+caller's capability by another holder, can free the TCB mid-call (see
+[capability-internals.md](capability-internals.md) § Storage: Hybrid Two-Level Radix and
+[#443](https://github.com/kottlerg/seraph/issues/443)). The outcomes above hold only absent a
+concurrent free of the TCB or a racing scheduler path.
+
 ### Soft Affinity
 
 `tcb.preferred_cpu` records the CPU the thread was last assigned to. The

@@ -379,17 +379,22 @@ A process dies when:
 - It calls `sys_thread_exit` on its last thread (a thread completing).
 - procmgr revokes and deletes its caps to the process's `Thread`, `CSpace`, and `AddressSpace` (the
   "kill process" pattern; see [`capability-model.md`](capability-model.md)
-  §`"Kill process" pattern`; for a thread displaced from a server's pending-reply binding, the
-  pattern is not memory-safe and can hang the kernel; see
-  [IPC Design](ipc-design.md#the-callreply-model),
-  [#443](https://github.com/kottlerg/seraph/issues/443)).
+  §`"Kill process" pattern`). The pattern has two known kernel memory-safety gaps, both tracked in
+  [#443](https://github.com/kottlerg/seraph/issues/443): a thread displaced from a server's
+  pending-reply binding, whose reap can hang the kernel (see
+  [IPC Design](ipc-design.md#the-callreply-model)), and a thread syscall racing the revoke on an
+  object `lookup_cap` did not pin (see
+  [Capability Internals](../core/kernel/docs/capability-internals.md#storage-hybrid-two-level-radix)).
 - The last capability to its `CSpace` or `AddressSpace` is deleted: the kernel stops every thread
   bound to the object (retained exit reason `EXIT_KILLED`) before reclaiming it, so the process's
-  threads cannot outlive either (for a thread displaced from a server's pending-reply binding,
-  neither this stop nor its later reap is memory-safe, and the reap can hang the kernel; see
-  [IPC Design](ipc-design.md#the-callreply-model),
-  [#443](https://github.com/kottlerg/seraph/issues/443)). A thread deleting the last capability to
-  its own `CSpace` or `AddressSpace` is stopped by that same delete and never returns from it.
+  threads cannot outlive either. This teardown has two known kernel memory-safety gaps, both
+  tracked in [#443](https://github.com/kottlerg/seraph/issues/443): a thread displaced from a
+  server's pending-reply binding, whose reap can hang the kernel (see
+  [IPC Design](ipc-design.md#the-callreply-model)), and a thread syscall racing the delete on an
+  object `lookup_cap` did not pin (see
+  [Capability Internals](../core/kernel/docs/capability-internals.md#storage-hybrid-two-level-radix)).
+  A thread deleting the last capability to its own `CSpace` or `AddressSpace` is stopped by that
+  same delete and never returns from it.
 - An unhandled fault terminates its threads.
 
 ### Exit reason
@@ -415,10 +420,13 @@ for terminal faults), because doing so on every clean exit would dereference the
 procmgr had already been woken to reap it. The kernel only *notifies*; it does not enumerate or stop
 sibling threads at that point — they are stopped when procmgr's cap-revoke teardown below deletes
 the process's `CSpace` (every thread bound to it is stopped before its storage is reclaimed,
-wherever their thread caps are held; for a thread displaced from a server's pending-reply binding,
-neither this stop nor its later reap is memory-safe, and the reap can hang the kernel; see
-[IPC Design](ipc-design.md#the-callreply-model),
-[#443](https://github.com/kottlerg/seraph/issues/443)) and reaped through their own thread caps.
+wherever their thread caps are held; this teardown has two known kernel memory-safety gaps, both
+tracked in [#443](https://github.com/kottlerg/seraph/issues/443): a thread displaced from a server's
+pending-reply binding, whose reap can hang the kernel (see
+[IPC Design](ipc-design.md#the-callreply-model)), and a thread syscall racing the revoke on an
+object `lookup_cap` did not pin (see
+[Capability Internals](../core/kernel/docs/capability-internals.md#storage-hybrid-two-level-radix)))
+and reaped through their own thread caps.
 `ExitStatus::success()`/`code()` decode the reason on the consumer side. This is a Seraph-native
 encoding, not POSIX: codes are not 8-bit `WEXITSTATUS`-truncated and faults are native fault
 classes, not signals. See [`core/kernel/docs/syscalls.md`](../core/kernel/docs/syscalls.md) §

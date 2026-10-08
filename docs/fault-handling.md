@@ -110,7 +110,12 @@ capability type. The binding is per-thread kernel state: the bound endpoint and 
 - `thread_cap` MUST carry `CONTROL`. It selects the thread whose handler is set.
 - `endpoint_cap` MUST refer to an `Endpoint`, or be the null index `0` to **unbind**.
   Binding takes a reference on the endpoint object for the lifetime of the binding (see
-  [Liveness](#liveness)); unbinding releases it.
+  [Liveness](#liveness)); unbinding releases it. The binding's endpoint lookup takes no
+  reference, so a concurrent delete of the last capability to the endpoint, or a revoke of an
+  ancestor of the caller's capability by another holder, can free the endpoint before that
+  reference is taken, leaving a dangling binding (a known defect tracked in
+  [#443](https://github.com/kottlerg/seraph/issues/443); see
+  [capability-internals.md § Storage: Hybrid Two-Level Radix](../core/kernel/docs/capability-internals.md#storage-hybrid-two-level-radix)).
 - `badge` is a caller-chosen value delivered as the fault message badge. It identifies the
   faulting thread (or its process) to the handler only if no other binder can reach the
   endpoint, or if the handler's badges are secret; see [Security](#security). It is opaque
@@ -221,7 +226,10 @@ The kernel ignores reply data words. The reply **label** conveys disposition:
 1. The binding holds a reference on the handler endpoint object, so a fault-blocked thread
    — which is queued on neither the endpoint's send nor receive queue — cannot be stranded
    by the endpoint being destroyed while it is bound. The reference is released on unbind,
-   rebind, or thread destruction.
+   rebind, or thread destruction. This holds only once the reference is taken: the binding's
+   unpinned endpoint lookup can leave a dangling binding (see
+   [Fault-Handler Binding](#fault-handler-binding);
+   [#443](https://github.com/kottlerg/seraph/issues/443)).
 2. Handler-thread death releases any fault-blocked thread awaiting that handler, killing it
    (the [Kill](#delivery-resume-and-kill) path). A fault-blocked thread whose binding a later
    receive on the handler overwrote is not released; this defect is tracked in

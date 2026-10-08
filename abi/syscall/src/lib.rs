@@ -191,7 +191,9 @@ pub const SYS_EVENT_POST: u64 = 5;
 ///   available"; the caller already knows which mode it asked for).
 ///
 /// On success returns `0` plus the payload in the secondary return
-/// register. Sentinel layout matches `SYS_NOTIFICATION_WAIT` (`0` = forever),
+/// register. A queue destroyed while the caller waits also returns success,
+/// with a payload of `0` that was never posted, and no `Interrupted` (#443).
+/// Sentinel layout matches `SYS_NOTIFICATION_WAIT` (`0` = forever),
 /// but event-queue payloads may be any `u64` including 0, so the kernel
 /// uses an out-of-band `tcb.timed_out` marker instead of an in-band
 /// sentinel on the payload register.

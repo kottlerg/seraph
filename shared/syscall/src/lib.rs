@@ -1833,6 +1833,9 @@ pub fn event_post(queue_cap: u32, payload: u64) -> Result<(), i64>
 /// Returns the payload word. The primary return register holds 0 on success;
 /// the payload is in the secondary return register (rdx / a1).
 ///
+/// A queue destroyed while the caller waits returns `Ok(0)`, a payload that
+/// was never posted, rather than an error (a kernel defect tracked in #443).
+///
 /// # Errors
 /// Returns a negative `i64` error code if the queue cap is invalid or the
 /// wait is interrupted.
@@ -1865,6 +1868,8 @@ pub fn event_try_recv(queue_cap: u32) -> Result<u64, i64>
 /// [`event_recv`]); `timeout_ms == u64::MAX` is a non-blocking poll (same as
 /// [`event_try_recv`]); any other value blocks for up to `timeout_ms`
 /// milliseconds, then returns `Err(-6)` (`WouldBlock`) if no post arrived.
+/// A queue destroyed while the caller waits returns `Ok(0)`, a payload that
+/// was never posted, rather than an error (a kernel defect tracked in #443).
 ///
 /// # Errors
 /// Returns `-6` (`WouldBlock`) on timeout or empty try-once, or another
@@ -2104,12 +2109,27 @@ pub fn thread_set_priority(thread_cap: u32, priority: u8, sched_cap: u32) -> Res
 /// Set a thread's CPU affinity.
 ///
 /// `cpu_id` must be a valid CPU ID or `u32::MAX` (clear affinity / any CPU).
-/// Takes effect on the thread's next enqueue. A thread already running
-/// on or queued on another CPU is not actively migrated.
+/// `thread_cap` must carry Control rights. Takes effect immediately: a Ready
+/// thread queued on another CPU is migrated to the target CPU's run queue; a
+/// Running thread on another CPU is sent a reschedule IPI and moves at its
+/// next `schedule()` entry (worst case one time slice later); a blocked,
+/// stopped, or not-yet-started thread observes the new affinity on its next
+/// wake.
+///
+/// The kernel writes the affinity without taking `sched_lock`, so the write
+/// races other CPUs' scheduler paths, and `lookup_cap` takes no reference on
+/// the object it resolves, so while the handler still dereferences the
+/// Thread, a concurrent delete of the last capability to it, or a revoke of an
+/// ancestor of the caller's capability by another holder (as in the
+/// kill-process pattern), can free it. The outcomes above hold only when
+/// neither race occurs; both are known defects tracked in #443 (see
+/// core/kernel/docs/capability-internals.md § Storage: Hybrid Two-Level
+/// Radix).
 ///
 /// # Errors
-/// Returns a negative `i64` error code if the thread cap is invalid or
-/// `cpu_id` is not a valid CPU index.
+/// Returns a negative `i64` error code: `InvalidCapability` if the thread cap
+/// is invalid, `InsufficientRights` if it lacks Control rights, or
+/// `InvalidArgument` if `cpu_id` names an offline or out-of-range CPU.
 #[inline]
 pub fn thread_set_affinity(thread_cap: u32, cpu_id: u32) -> Result<(), i64>
 {

@@ -62,9 +62,10 @@ and trips a kernel `debug_assert`; the same fault surfaces in the
 closing identity `system_ram == kernel_reserved + pool_total` checked by
 svctest.
 
-A process maps into another process's address space only through an
-AddressSpace capability delegated for that purpose: procmgr as creator at
-spawn, and memmgr as pager for the regions a client registered. Sharing
+A process maps into another process's address space only through that
+space's AddressSpace capability: the process creator at creation time (see
+[Bootstrap Cross-Boundary VAs](#bootstrap-cross-boundary-vas)), and memmgr as
+pager for the regions a client registered. Sharing
 between peers is explicit and capability-mediated: a Memory cap is sent over
 IPC and the receiver maps it into its own address space at a VA the receiver
 chose.

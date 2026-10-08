@@ -77,10 +77,7 @@ direct console paths remain as fallbacks for the life of the system.
    the log endpoint logd serves (logd deletes its seeded `log_send_cap` at
    startup so a fault cannot self-IPC into it). Outside the serial driver,
    UART hardware authority is held only by init, whose init-logd thread uses it, and by
-   devmgr, whose I/O-port and MMIO caps it carves the driver's cap from. On x86-64,
-   devmgr's `QUERY_SHUTDOWN_DEVICE` also serves a caller-chosen 2-port `IoPort` window to any
-   `REGISTRY_QUERY_AUTHORITY` holder, COM1's ports included
-   ([#446](https://github.com/kottlerg/seraph/issues/446)).
+   devmgr, whose I/O-port and MMIO caps it carves the driver's cap from.
 
    real-logd is declared restartable (`restart = on_failure`; see
    [services/logd/README.md](../services/logd/README.md)); a working logd restart is design

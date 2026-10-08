@@ -708,11 +708,14 @@ pub fn create_devmgr_with_caps(
     else if info.sbi_control_cap != 0
     {
         // RISC-V: devmgr is the steady-state holder of the platform firmware
-        // authority (init is reaped, so its root cap is dropped). Transfer only
-        // the power-state extensions — system reset (served to pwrmgr on
-        // QUERY_SHUTDOWN_DEVICE, narrowed to Reset there) and suspend (reserved
-        // for a future path). The other sanctioned SBI rights are carried into
-        // no surviving cap and are therefore dropped at init's reap.
+        // authority (init is reaped, so its root cap becomes unreachable).
+        // Transfer only the power-state extensions — system reset (served to
+        // pwrmgr on QUERY_SHUTDOWN_DEVICE, narrowed to Reset there) and suspend
+        // (reserved for a future path). The other sanctioned SBI rights are
+        // carried into no surviving cap and become unreachable at init's reap:
+        // the root cap stays alive in init's kernel-pinned root CSpace;
+        // releasing it at the reap is design intent, not yet implemented
+        // (`docs/process-lifecycle.md` § Init reap, #443).
         syscall::cap_derive(
             info.sbi_control_cap,
             syscall::RIGHTS_SBI_RESET | syscall::RIGHTS_SBI_SUSPEND,
@@ -1260,7 +1263,10 @@ pub fn phase3_svcmgr_handover(
 
 /// Send one `REGISTER_INIT_TEARDOWN` donate-only round (word 0 = 0)
 /// carrying `slots` as caps. Non-fatal on failure: init exits regardless,
-/// and any un-sent cap falls to the `CSpace` cascade.
+/// and any un-sent cap stays in init's `CSpace`, which the kernel pins (it is
+/// the root `CSpace`), so it remains alive but unreachable; releasing it at the
+/// reap is design intent, not yet implemented (`docs/process-lifecycle.md`
+/// § Init reap, #443).
 ///
 /// # Safety
 /// `ipc_buf` must be init's registered IPC buffer; `procmgr_ep` must carry
@@ -1349,9 +1355,10 @@ fn register_init_reap_objects(
 /// `CSpace`.
 ///
 /// Failures here are logged but otherwise non-fatal — init still calls
-/// `sys_thread_exit` afterward, just leaving the un-transferred caps
-/// to cascade through `CSpace` teardown to the kernel buddy on eventual
-/// cap death.
+/// `sys_thread_exit` afterward, leaving the un-transferred caps in init's
+/// `CSpace`, which the kernel pins (it is the root `CSpace`), so they remain
+/// alive but unreachable; releasing them at the reap is design intent, not yet
+/// implemented (`docs/process-lifecycle.md` § Init reap, #443).
 fn finish_init_reap_handoff(
     info: &InitInfo,
     procmgr_ep: u32,
@@ -1430,9 +1437,10 @@ fn finish_init_reap_handoff(
         }
         // The free Memory caps MemoryAlloc abandoned while carving bootstrap
         // arenas: memory_split remainders below the floor with no descriptor.
-        // Without this they would cascade into the sealed buddy at CSpace
-        // teardown and leak. They carry RETYPE + owns_memory like any RAM
-        // memory cap, so memmgr ingests them into its pool.
+        // Without this they would stay stranded in init's kernel-pinned root
+        // CSpace after the reap and leak (`docs/process-lifecycle.md` § Init
+        // reap, #443). They carry RETYPE + owns_memory like any RAM memory
+        // cap, so memmgr ingests them into its pool.
         for &slot in orphan_memory_caps
         {
             push(slot);

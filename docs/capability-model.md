@@ -260,14 +260,16 @@ only narrows rights, never widens; there is no dedicated SBI split operation).
 
 The kernel mints the root cap once at boot, carrying every sanctioned right, into
 init's cspace. **init is reaped after bootstrap, so any right not transferred to a
-surviving service before the reap is dropped — unforwardable until the next boot (the cap
-stays in init's kernel-pinned CSpace, unreachable; releasing it at the reap is design intent,
-not yet implemented, [#443](https://github.com/kottlerg/seraph/issues/443)).
+surviving service before the reap is unforwardable until the next boot: the cap stays in
+init's CSpace, which the kernel pins (it is the root CSpace), so it remains alive but
+unreachable; releasing it at the reap is design intent, not yet implemented
+([#443](https://github.com/kottlerg/seraph/issues/443); see
+[process-lifecycle.md § Init reap](process-lifecycle.md#init-reap)).
 This, not a kernel wall, is what bounds the live extension set.** init transfers a
 cap narrowed to **Reset** + **Suspend** to devmgr, the steady-state holder of
 platform firmware authority (it sits alongside the ACPI / MMIO / IRQ resources
 devmgr already brokers). The remaining sanctioned rights are carried into no
-surviving cap and die at init's reap: **Dbcn** is thrown away by design (the
+surviving cap and are unreachable after init's reap: **Dbcn** is thrown away by design (the
 userspace serial driver owns the console; forwarding the firmware console would
 bypass the console-ownership model), and **Cppc** / **Base** / **Pmu** are simply
 not needed by any current service. devmgr serves pwrmgr a copy further narrowed to

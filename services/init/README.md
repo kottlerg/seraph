@@ -96,8 +96,13 @@ transfer table.
 - Does not read a service dependency graph file at runtime (bootstrap order
   is compiled in).
 - Does not remain resident after bootstrap completes —
-  [procmgr](../procmgr/README.md) reaps init's address space, CSpace, and
-  threads after `sys_thread_exit`.
+  [procmgr](../procmgr/README.md) reaps init's address space and threads
+  after `sys_thread_exit`. The caps left in init's CSpace stay there; the
+  kernel pins that CSpace (it is the root CSpace), so they remain alive but
+  unreachable. Releasing them at the reap is design intent; not yet
+  implemented ([#443](https://github.com/kottlerg/seraph/issues/443); see
+  [docs/process-lifecycle.md](../../docs/process-lifecycle.md#init-reap)
+  § Init reap).
 
 ---
 

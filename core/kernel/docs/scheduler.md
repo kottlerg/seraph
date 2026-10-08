@@ -59,9 +59,12 @@ space is uniform; any partition into tiers is userspace policy, expressed by how
   held by init.
 - Init narrows it with `SYS_SCHED_SPLIT` into the baseline band `[1, 28]`
   (`sched_policy::BASELINE_PRIORITY_MAX` in `shared/ipc`) and an elevated
-  remainder `[29, PRIORITY_MAX]` that never leaves init and dies at its reap —
-  init's own boot thread (kernel-placed at `INIT_PRIORITY` = 30) is the only
-  occupant above the baseline.
+  remainder `[29, PRIORITY_MAX]` that never leaves init — init's own boot thread
+  (kernel-placed at `INIT_PRIORITY` = 30) is the only occupant above the
+  baseline. After init's reap the remainder stays in init's CSpace, which the
+  kernel pins (it is the root CSpace), so it remains alive but unreachable;
+  releasing it at the reap is design intent, not yet implemented (#443; see
+  [process-lifecycle.md](../../../docs/process-lifecycle.md) § Init reap).
 - Every spawned process receives a band through
   `ProcessInfo.sched_control_cap`: procmgr mints it from its baseline copy at
   create time, whole or `SYS_SCHED_SPLIT`-narrowed to the `[1, band_max]` the

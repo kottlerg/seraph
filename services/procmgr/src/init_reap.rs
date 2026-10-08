@@ -6,12 +6,14 @@
 //! Init reap-handoff: receives init's own kernel-object caps and
 //! reclaimable Memory caps in the post-Phase-3 exit IPCs, binds death-EQ
 //! observers on both init threads (main + init-logd), and once both have
-//! exited — init threadless — tears down init's
-//! `AddressSpace`/`CSpace`/`Thread` objects and donates the Memory caps to
-//! memmgr. init-logd outlives the main thread until the svcmgr-launched
-//! real-logd pulls its handover, so the reap waits for the later of the two
-//! deaths; reclaiming init's aspace/cspace while a thread still runs in them
-//! would fault it.
+//! exited — init threadless — tears down init's `AddressSpace`/`Thread`
+//! objects and donates the Memory caps to memmgr. Tearing down init's
+//! `CSpace` is design intent, not yet implemented: it is the kernel-pinned
+//! root `CSpace`, so the caps init still holds stay in it, alive but
+//! unreachable (`docs/process-lifecycle.md` § Init reap, #443). init-logd
+//! outlives the main thread until the svcmgr-launched real-logd pulls its
+//! handover, so the reap waits for the later of the two deaths; reclaiming
+//! init's aspace/cspace while a thread still runs in them would fault it.
 //!
 //! State machine (single-threaded; serialised under procmgr's
 //! `service_ep` recv loop):
@@ -44,16 +46,12 @@
 //!   2. cap_delete(main_thread)
 //!   3. cap_revoke + cap_delete(aspace)        — mappings gone
 //!   4. DONATE_MEMORY_CAPS(caps[..]) → memmgr       — safe; no aliasing
-//!   5. cap_revoke + cap_delete(cspace)        — cascade drops
-//!                                                init's last caps;
-//!                                                none free to the
-//!                                                sealed buddy
-//!                                                (design intent:
-//!                                                init's CSpace is the
-//!                                                kernel-pinned root
-//!                                                CSpace, so the
-//!                                                delete drops only
-//!                                                procmgr's reference;
+//!   5. cap_revoke + cap_delete(cspace)        — drops procmgr's
+//!                                                reference only;
+//!                                                init's caps stay in
+//!                                                the kernel-pinned
+//!                                                root CSpace (release
+//!                                                is design intent;
 //!                                                #443)
 //!   6. log summary
 //! ```
@@ -312,14 +310,15 @@ fn do_reap(state: InitReapState, memmgr_ep: u32, ipc_buf: *mut u64)
     let (donated_caps, donated_pages, pool_total) =
         donate_to_memmgr(memmgr_ep, &donate_caps, ipc_buf);
 
-    // 5. Destroy init's CSpace last. Design intent (#443): init's CSpace is
-    //    the kernel-pinned root CSpace, so this delete drops only procmgr's
-    //    reference and the cascade below does not run yet. The cascade in
-    //    `dealloc_object` drops every cap init still held — endpoint SENDs and the
-    //    endpoint-slab arena Memory cap. That arena is retype-pinned and
-    //    already forwarded to memmgr's pool, and every reclaimable
-    //    Memory cap was donated in step 4, so no `owns_memory` cap reaches
-    //    its last reference here: nothing frees to the sealed buddy.
+    // 5. Revoke and delete procmgr's cap on init's CSpace last. init's
+    //    CSpace is the kernel-pinned root CSpace, so this drops only
+    //    procmgr's reference: the caps init still holds (endpoint SENDs
+    //    and the endpoint-slab arena Memory cap) stay in it, alive but
+    //    unreachable. Releasing them at the reap is design intent, not
+    //    yet implemented (`docs/process-lifecycle.md` § Init reap, #443).
+    //    That release frees nothing to the sealed buddy: the arena is
+    //    retype-pinned and already forwarded to memmgr's pool, and every
+    //    reclaimable Memory cap was donated in step 4.
     let _ = syscall::cap_revoke_all(cspace);
     let _ = syscall::cap_delete(cspace);
 

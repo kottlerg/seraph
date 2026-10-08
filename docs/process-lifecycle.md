@@ -78,9 +78,10 @@ init-reap handoff init moves only its kernel-object caps and the reclaimable
 Memory caps it solely owns to procmgr (see "Init reap" below). The remaining
 root caps (the RAM roots of memory forwarded to memmgr, the firmware caps, and
 the `Interrupt`, `IoPort`, `SbiControl`, `Mmio`, and elevated `SchedControl`
-roots) stay in init's CSpace and are destroyed in its teardown cascade (design intent; not yet
-implemented: init's CSpace is the kernel-pinned root CSpace, so the cascade does not run and these
-caps stay alive, unreachable, [#443](https://github.com/kottlerg/seraph/issues/443)).
+roots) stay in init's CSpace, which the kernel pins (it is the root CSpace; see
+[capability-internals.md § Kernel Object Reference Counting](../core/kernel/docs/capability-internals.md#kernel-object-reference-counting)),
+so they remain alive but unreachable; releasing them at the reap is design intent, not yet
+implemented ([#443](https://github.com/kottlerg/seraph/issues/443); see [Init reap](#init-reap)).
 
 ### Init → memmgr
 
@@ -202,10 +203,15 @@ both have exited — init is threadless. The main thread exits at the end of ini
 but init-logd keeps serving the master log endpoint until the svcmgr-launched real-logd pulls its
 handover, so it outlives main; reclaiming init's address space while a thread still runs in it would
 fault that thread. On the last death procmgr tears down init's kernel objects in order (Threads →
-AddressSpace → donate Memory caps to memmgr → CSpace cascade), leaving zero init residue (the CSpace
-cascade is design intent; not yet implemented: init's CSpace is the kernel-pinned root CSpace, so
-procmgr's delete drops only its own reference and the caps left in it stay alive, unreachable,
-[#443](https://github.com/kottlerg/seraph/issues/443)). The procmgr-side protocol is specified in
+AddressSpace → donate Memory caps to memmgr → CSpace), leaving no init residue but two. The caps
+init still holds stay in init's CSpace, which the kernel pins (it is the root CSpace; see
+[capability-internals.md § Kernel Object Reference Counting](../core/kernel/docs/capability-internals.md#kernel-object-reference-counting)),
+so procmgr's delete drops only its own reference and they remain alive but unreachable; releasing
+them at the reap is design intent, not yet implemented
+([#443](https://github.com/kottlerg/seraph/issues/443)). As an accepted cost, the kernel-direct
+page-table nodes behind init's bootstrap mappings stay consumed after its AddressSpace is gone; see
+[memory-internals.md § Page Table Node Ownership](../core/kernel/docs/memory-internals.md#page-table-node-ownership).
+The procmgr-side protocol is specified in
 [procmgr IPC Interface](../services/procmgr/docs/ipc-interface.md) § `REGISTER_INIT_TEARDOWN` and §
 `INIT_TEARDOWN_DONE`.
 
@@ -493,7 +499,9 @@ notification flow above.
 
 [abi/init-protocol/README.md](../abi/init-protocol/README.md),
 [Memory Map Translation](../core/boot/docs/memory-map.md),
+[Capability Subsystem Internals](../core/kernel/docs/capability-internals.md),
 [Kernel Initialization Sequence](../core/kernel/docs/initialization.md),
+[Scheduler Internals](../core/kernel/docs/scheduler.md),
 [SMP Scheduling and Locking Invariants](../core/kernel/docs/scheduling-internals.md),
 [Syscall Interface Specification](../core/kernel/docs/syscalls.md),
 [Architecture Overview](architecture.md), [System Bootstrap](bootstrap.md),
@@ -505,6 +513,7 @@ notification flow above.
 [programs/threadstack/README.md](../programs/threadstack/README.md),
 [runtime/ruststd/README.md](../runtime/ruststd/README.md),
 [services/crasher/README.md](../services/crasher/README.md),
+[services/init/README.md](../services/init/README.md),
 [init Bootstrap Stages](../services/init/docs/bootstrap.md),
 [services/logd/README.md](../services/logd/README.md),
 [logd IPC interface](../services/logd/docs/ipc-interface.md),

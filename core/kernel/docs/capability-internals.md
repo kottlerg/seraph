@@ -406,8 +406,10 @@ The principal kernel-internal owners:
   the kernel never releases (the SEED pin from `install_seed_memory`; the root CSpace's
   base reference, attributed to init's TCB), and `HDR_FLAG_IS_ROOT` clamps the root
   CSpace's count at 1, so neither is ever freed. The root CSpace is init's CSpace, so the
-  cascade that docs/process-lifecycle.md § Init reap describes at init's reap is design
-  intent, not yet implemented ([#443](https://github.com/kottlerg/seraph/issues/443)).
+  caps init still holds at its reap stay in it, alive but unreachable; releasing them at
+  the reap is design intent, not yet implemented
+  ([#443](https://github.com/kottlerg/seraph/issues/443); see
+  [process-lifecycle.md § Init reap](../../../docs/process-lifecycle.md#init-reap)).
 - **Fault-handler binding.** `SYS_THREAD_SET_FAULT_HANDLER` takes a reference on the
   bound Endpoint, released on unbind, rebind, or thread destruction.
 - **Transient holds.** A syscall that must keep an object live across a lock-free step

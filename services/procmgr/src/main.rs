@@ -613,9 +613,12 @@ fn dispatch_death(
         if correlator == procmgr_labels::INIT_REAP_CORRELATOR
         {
             // An init thread exited. `run_reap` counts down the two init
-            // threads and, on the last exit, tears down init's
-            // AS/CSpace/Thread objects and donates its reclaimable Memory caps
-            // caps to memmgr's pool.
+            // threads and, on the last exit, tears down init's Thread and
+            // AddressSpace objects, deletes its CSpace cap, and donates its
+            // reclaimable Memory caps to memmgr's pool. The caps init still
+            // holds stay in its kernel-pinned root CSpace, alive but
+            // unreachable; releasing them at the reap is design intent, not
+            // yet implemented (`docs/process-lifecycle.md` § Init reap, #443).
             init_reap::run_reap(memmgr_ep, ipc_buf);
             continue;
         }

@@ -379,8 +379,10 @@ does not walk the tables: the wrapper returns every donation wholesale to its
 source Memory cap, which reclaims the pool-drawn nodes with it, and the root
 table goes with the create-time slab. Kernel-direct nodes are not returned to
 the kernel page-table pool by destruction; only init's bootstrap space holds
-any, nothing destroys it today, and destroying it would strand them. See
-[capability-internals.md](capability-internals.md) § Page Pools for the
+any, and procmgr destroys it at init's reap, which strands them (an accepted
+cost; see
+[process-lifecycle.md § Init reap](../../../docs/process-lifecycle.md#init-reap)).
+See [capability-internals.md](capability-internals.md) § Page Pools for the
 donation-record mechanism.
 
 ---
@@ -392,4 +394,6 @@ donation-record mechanism.
 [Capability Subsystem Internals](capability-internals.md),
 [Kernel Initialization Sequence](initialization.md), [IPC Subsystem Internals](ipc-internals.md),
 [SMP Scheduling and Locking Invariants](scheduling-internals.md),
-[Syscall Interface Specification](syscalls.md), [Memory Model](../../../docs/memory-model.md)
+[Syscall Interface Specification](syscalls.md), [Memory Model](../../../docs/memory-model.md),
+[Process Lifecycle](../../../docs/process-lifecycle.md),
+[init Bootstrap Stages](../../../services/init/docs/bootstrap.md)

@@ -376,9 +376,12 @@ pub mod sched_policy
     /// Upper bound of the baseline `SchedControl` band init delegates to
     /// the spawn chain: init splits its root `[1, 30]` cap at
     /// `BASELINE_PRIORITY_MAX + 1`, keeps the elevated remainder
-    /// (`[29, 30]`, which dies at init's reap), and hands the baseline
-    /// `[1, 28]` to memmgr and procmgr. Every band procmgr mints for a
-    /// child is a (possibly narrowed) descendant of this baseline, so no
+    /// (`[29, 30]`, which stays alive but unreachable in init's pinned
+    /// `CSpace` after its reap; releasing it there is design intent, not
+    /// yet implemented, per `docs/process-lifecycle.md` § Init reap and
+    /// #443), and hands the baseline `[1, 28]` to memmgr and procmgr.
+    /// Every band procmgr mints for a child is a (possibly narrowed)
+    /// descendant of this baseline, so no
     /// spawned process can ever reach `[29, 30]`.
     pub const BASELINE_PRIORITY_MAX: u8 = 28;
 

@@ -231,13 +231,22 @@ endowment (see the [svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md)).
   after real-logd's `HANDOVER_RELEASE`): both Thread caps are deleted, init's `AddressSpace` is
   revoked + deleted (its pool donations `retype_free`'d, user-page
   mappings vanish), the accumulated Memory caps are `DONATE_MEMORY_CAPS`'d to
-  memmgr's pool, init's `CSpace` is revoked + deleted (cascading
-  dec_ref through init's remaining caps — endpoint SENDs and the
-  retype-pinned endpoint-slab arena already forwarded to memmgr).
-  Every reclaimable Memory cap was donated, so no `owns_memory` cap
-  reaches its last reference and nothing frees to the sealed buddy.
-  Procmgr logs a summary line; no init-related kernel object
-  remains; svcmgr is the resident supervisor from this point on.
+  memmgr's pool, and init's `CSpace` is revoked + deleted. The caps
+  init still holds (endpoint SENDs and the retype-pinned endpoint-slab
+  arena already forwarded to memmgr) stay in init's `CSpace`, which
+  the kernel pins (it is the root CSpace), so they remain alive but
+  unreachable; releasing them at the reap is design intent; not yet
+  implemented ([#443](https://github.com/kottlerg/seraph/issues/443);
+  see [Process Lifecycle](../../../docs/process-lifecycle.md#init-reap)
+  § Init reap). Every reclaimable Memory cap was donated, so no
+  `owns_memory` cap reaches its last reference and nothing frees to
+  the sealed buddy. Procmgr logs a summary line. Beyond those caps,
+  no init-related kernel object remains, except that the kernel-direct
+  page-table nodes behind init's bootstrap mappings stay consumed, an
+  accepted cost (see
+  [Memory Subsystem Internals](../../../core/kernel/docs/memory-internals.md)
+  § Page Table Node Ownership). Svcmgr is the resident supervisor from
+  this point on.
 
 memmgr and procmgr are the only two processes init creates via
 raw syscalls. Every later service spawn goes through procmgr IPC.

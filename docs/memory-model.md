@@ -276,8 +276,9 @@ the caller. This applies inside the kernel as well as in userspace allocation pa
 The kernel has no heap: it runs no `GlobalAlloc`, and every kernel object —
 capability slot pages, thread control blocks, IPC endpoints and notifications,
 event queues, wait sets, address spaces, CSpaces — is carved out of a Memory
-capability by retype and returned to it when the object's last capability is
-deleted; see [capability-model.md](capability-model.md) § Auto-reclaim. The
+capability by retype and returned to it when the object's reference count
+reaches zero (its capabilities and every kernel-internal reference released); see
+[capability-model.md](capability-model.md) § Auto-reclaim. The
 kernel's own objects come from the SEED reserve pinned at the Phase 7
 handoff, after which the buddy is sealed and every page of RAM is either a
 bounded fixed kernel reserve or a userspace Memory capability. The reserves

@@ -531,12 +531,12 @@ object. The returned capability is placed in a free slot in the caller's
 CSpace. The caller receives the rights listed above; a freshly created CSpace
 capability carries no Revoke right.
 
-The kernel does not track ownership beyond the derivation tree. When an object's reference count
-reaches zero (its capabilities and every kernel-internal reference to it are released; see
+The kernel records capability lineage in the derivation tree and object lifetime in a
+per-object reference count over capabilities and kernel-internal references (see
 [capability-internals.md](../core/kernel/docs/capability-internals.md#kernel-object-reference-counting)
-§ Kernel Object Reference Counting), the kernel reclaims the object's bytes (returning them to the
-Memory cap from which the object was retyped) and frees the slot. Objects do not outlive all
-references to them.
+§ Kernel Object Reference Counting). When that count reaches zero, the kernel reclaims the
+object's bytes, returning them to the Memory cap from which the object was retyped. Objects do
+not outlive all references to them.
 
 ---
 

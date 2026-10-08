@@ -367,7 +367,8 @@ mapping — no page may be simultaneously writable and executable (see
 ### Kernel Object Reference Counting
 
 Each kernel object (Endpoint, Notification, EventQueue, etc.) has an embedded reference
-count representing the number of capability slots that point to it:
+count: one reference per capability slot that points to it, plus one per kernel-internal
+owner listed below:
 
 ```rust
 pub struct KernelObjectHeader
@@ -381,21 +382,32 @@ pub struct KernelObjectHeader
 }
 ```
 
-When a slot is cleared (deletion, revocation), the reference count is decremented.
+When a slot is cleared (deletion, revocation, or the teardown of the CSpace holding it)
+or a kernel-internal owner releases its reference, the reference count is decremented.
 When it reaches zero, the object's bytes are returned to the Memory object it was
 retyped from (`retype_free`). This is the only mechanism by which kernel objects
 are freed — there is no explicit "destroy" syscall (see
 [docs/capability-model.md](../../../docs/capability-model.md) § Auto-reclaim).
 
-The same refcount also tracks kernel-internal owners of an object. Wait-set
-membership is one such owner: `sys_wait_set_add` `inc_ref`s the source's
-header under the source's lock together with the back-pointer publication;
-`sys_wait_set_remove` and `wait_set_drop` perform the matching `dec_ref`. The
-source's state therefore outlives every wait-set member referencing it; the
-Endpoint/Notification/EventQueue dealloc arms only `debug_assert` that
-`state.wait_set` is null on entry (the invariant follows from the refcount).
-The membership protocol is in [ipc-internals.md](ipc-internals.md) § Wait Set
-Add/Remove.
+The kernel-internal owners that hold a reference:
+
+- **Retype ancestry.** Each object retyped from a Memory object holds a reference on
+  that ancestor (`header.ancestor`), released when the descendant is freed; the
+  kernel's boot-minted objects hold the same reference on the SEED reserve.
+- **Page-pool donations.** A Memory object donated to an AddressSpace's or CSpace's
+  page pool is referenced by the donation record until that AddressSpace or CSpace is
+  freed.
+- **Fault-handler binding.** `SYS_THREAD_SET_FAULT_HANDLER` takes a reference on the
+  bound Endpoint, released on unbind, rebind, or thread destruction.
+- **Transient holds.** A syscall that must keep an object live across a lock-free step
+  takes one for that step (for example `pre_grow_holding_dest`).
+- **Wait-set membership.** `sys_wait_set_add` `inc_ref`s the source's header under the
+  source's lock together with the back-pointer publication; `sys_wait_set_remove` and
+  `wait_set_drop` perform the matching `dec_ref`. The source's state therefore outlives
+  every wait-set member referencing it; the Endpoint/Notification/EventQueue dealloc arms
+  only `debug_assert` that `state.wait_set` is null on entry (the invariant follows from
+  the refcount). The membership protocol is in [ipc-internals.md](ipc-internals.md)
+  § Wait Set Add/Remove.
 
 ---
 

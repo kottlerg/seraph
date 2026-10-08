@@ -93,8 +93,8 @@ name survives the restart (see
 [Supervision hierarchy](../svcmgr/docs/restart-protocol.md#supervision-hierarchy)).
 The restarted instance re-acquires its actuator caps from devmgr on startup
 — `QUERY_SHUTDOWN_DEVICE` re-derives the actuator caps (the x86-64 I/O
-ports, or the RISC-V Reset-only `SbiControl` derivation) from the caps devmgr holds on every
-call, so nothing is consumed ([devmgr](../devmgr/docs/responsibilities.md#responsibilities)).
+ports, or the RISC-V Reset-only `SbiControl` derivation) on every call from the caps devmgr
+holds, so nothing is consumed ([devmgr](../devmgr/docs/responsibilities.md#responsibilities)).
 
 `critical = no`: a permanently-dead pwrmgr (restart budget exhausted)
 cannot power the platform off, so the graceful-shutdown-via-`pwrmgr.shutdown`

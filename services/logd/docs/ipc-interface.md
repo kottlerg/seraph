@@ -26,7 +26,7 @@ The shape mirrors the README's "Bootstrap caps" table:
 |---|---|
 | 0 | `RECV` on the master log endpoint |
 | 1 | `SEND` on the master log endpoint (single-use; carries the `HANDOVER_PULL` history drain, then the terminal `HANDOVER_RELEASE` (retried up to `MAX_RETRIES` (64) times until acked; once they are exhausted init-logd keeps serving), then `cap_delete` whatever the outcome; see [`handover-protocol.md`](handover-protocol.md)). `0` on a restart — no init-logd remains to pull from, so logd skips the history pull (restart: design intent; not yet implemented (#262)) |
-| 2 | badged `SEND` on procmgr's service endpoint carrying `DEATH_EQ_AUTHORITY` |
+| 2 | badged `SEND\|GRANT` on procmgr's service endpoint carrying `DEATH_EQ_AUTHORITY` |
 | 3 | badged `SEND` on devmgr's registry endpoint carrying `REGISTRY_QUERY_AUTHORITY` (resolves the serial driver via `QUERY_SERIAL_DEVICE` and the framebuffer driver via `QUERY_FRAMEBUFFER_DEVICE`) |
 
 Every (re)launch mints `cap[0]` fresh from svcmgr's persistent master-log

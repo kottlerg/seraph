@@ -79,7 +79,7 @@ struct BootCaps
     /// SEND cap on the master log endpoint, used only for the
     /// `HANDOVER_PULL` IPC to init-logd. Deleted after handover.
     log_ep_handover_send: u32,
-    /// SEND cap on procmgr carrying `DEATH_EQ_AUTHORITY`, used to
+    /// `SEND|GRANT` cap on procmgr carrying `DEATH_EQ_AUTHORITY`, used to
     /// call `REGISTER_DEATH_EQ`. Kept across the lifetime of
     /// real-logd in case re-registration is ever needed.
     procmgr_death_auth_send: u32,

@@ -67,7 +67,7 @@ targets; only the one-time init-logd history pull
 
 * **Per-sender slot reclamation.** logd creates an `EventQueue` and
   registers it with procmgr via `procmgr_labels::REGISTER_DEATH_EQ`
-  (authorised by the `DEATH_EQ_AUTHORITY` badged SEND cap svcmgr mints
+  (authorised by the `DEATH_EQ_AUTHORITY` badged `SEND|GRANT` cap svcmgr mints
   into logd's bootstrap round). Procmgr binds that EQ as an
   additional death observer on every existing thread and on every
   future spawn (see
@@ -112,7 +112,7 @@ and [`docs/ipc-interface.md`](docs/ipc-interface.md)):
 |---|---|
 | 0 | RECV on the master log endpoint |
 | 1 | SEND on the master log endpoint (single-use; carries the `HANDOVER_PULL` history drain, then the terminal `HANDOVER_RELEASE`, then deleted; see [`docs/handover-protocol.md`](docs/handover-protocol.md)). `0` on a restart — there is no init-logd left to pull from, so logd skips the handover (restart: design intent; not yet implemented (#262)) |
-| 2 | Badged SEND on procmgr's service endpoint carrying `DEATH_EQ_AUTHORITY` |
+| 2 | Badged `SEND\|GRANT` on procmgr's service endpoint carrying `DEATH_EQ_AUTHORITY` |
 | 3 | Badged SEND on devmgr's registry endpoint carrying `REGISTRY_QUERY_AUTHORITY` (to resolve the serial driver via `QUERY_SERIAL_DEVICE` and the framebuffer driver via `QUERY_FRAMEBUFFER_DEVICE`) |
 
 logd registers its death-EQ with procmgr before the handover pull and keeps

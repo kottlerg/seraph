@@ -503,8 +503,8 @@ fn dispatch_ipc(
 /// * `caps[0]` = `EventQueue` cap with POST right.
 ///
 /// Reply: `procmgr_errors::SUCCESS` on bind, `UNAUTHORIZED` if the
-/// caller lacks the authority badge, `INVALID_ARGUMENT` if no cap
-/// arrives.
+/// caller lacks the authority badge or a death EQ is already
+/// registered, `INVALID_ARGUMENT` if no cap (or a zero cap) arrives.
 fn handle_register_death_eq(req: &IpcMessage, ipc_buf: *mut u64, table: &mut process::ProcessTable)
 {
     if req.badge != procmgr_labels::DEATH_EQ_AUTHORITY

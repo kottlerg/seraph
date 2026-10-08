@@ -648,7 +648,7 @@ pub fn create_devmgr_with_caps(
     // root `IoPort` on x86-64 (devmgr derives narrow per-driver IoPort caps
     // from it for ISA peripherals like the CMOS RTC, and carves the PM1a +
     // 8042 ports for pwrmgr) and an `SbiControl` derivation narrowed to
-    // Reset and Suspend on RISC-V (devmgr serves a Reset-only copy to
+    // Reset and Suspend on RISC-V (devmgr serves a Reset-only derivation to
     // pwrmgr for SBI SRST). devmgr is the hardware authority; pwrmgr
     // acquires its shutdown caps from devmgr, not from init.
     // SVCMGR_BUNDLE is unconditionally the terminal round. On any

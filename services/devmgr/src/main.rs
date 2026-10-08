@@ -7,10 +7,10 @@
 //! driver binding.
 //!
 //! devmgr receives raw firmware access (ACPI RSDP / reclaimable regions,
-//! DTB blob), the root Interrupt range cap, and the MMIO aperture list
-//! from init. It parses MCFG / DTB to locate the PCI ECAM, narrows MMIO
-//! apertures via `mmio_split`, and splits single-IRQ caps off the root
-//! range via `irq_split` before delegating to driver processes.
+//! DTB blob), a full-rights derivation of the root Interrupt range cap,
+//! and the MMIO aperture list from init. It parses MCFG / DTB to locate
+//! the PCI ECAM, narrows MMIO apertures via `mmio_split`, and splits
+//! single-IRQ caps off that range via `irq_split` before delegating to driver processes.
 //!
 //! See `services/devmgr/docs/responsibilities.md` for devmgr's responsibilities
 //! and driver authority, and `docs/device-management.md` for the system-scope
@@ -2009,8 +2009,8 @@ fn test_spawn_orphan(
     Some(spawned)
 }
 
-/// Carve the COM1 `IoPort` (`0x3F8`..=`0x3FF`) out of the root
-/// `IoPort` cap.
+/// Carve the COM1 `IoPort` (`0x3F8`..=`0x3FF`) out of devmgr's
+/// full-rights `IoPort` cap.
 #[cfg(target_arch = "x86_64")]
 fn carve_uart_authority(caps: &mut caps::DevmgrCaps) -> Option<u32>
 {
@@ -2072,7 +2072,8 @@ fn carve_uart_irq(irq_root: &mut IrqRootAllocator) -> Option<u32>
 /// Carve a narrow `IoPort` of `count` ports starting at `base` out of
 /// devmgr's full-rights `IoPort` cap via two `ioport_split` calls. Returns
 /// the narrow slot; the unused slabs are deleted. `cap_derive`-copies the
-/// source so it stays intact for further carves. Mirrors init's `ioport_carve`.
+/// source so it stays intact for further carves. `root_cap` is that
+/// full-rights cap.
 #[cfg(target_arch = "x86_64")]
 fn ioport_carve(root_cap: u32, base: u16, count: u16) -> Option<u32>
 {

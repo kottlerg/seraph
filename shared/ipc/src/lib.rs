@@ -1428,7 +1428,10 @@ pub mod devmgr_labels
     ///   `SbiControl` cap (SBI SRST authority).
     ///
     /// Replies [`super::devmgr_errors::NO_DEVICE`] when the carve fails or
-    /// the platform authority cap is absent.
+    /// the platform authority cap is absent,
+    /// [`super::devmgr_errors::INVALID_REQUEST`] when the RISC-V Reset-only
+    /// derivation fails, and [`super::devmgr_errors::LABEL_VERSION_MISMATCH`]
+    /// when `data[0]` is not `DEVMGR_LABELS_VERSION`.
     pub const QUERY_SHUTDOWN_DEVICE: u64 = 8;
 
     /// Query for the keyboard/input device endpoint.

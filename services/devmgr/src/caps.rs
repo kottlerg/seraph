@@ -6,8 +6,8 @@
 //! Bootstrap cap acquisition for devmgr.
 //!
 //! Receives raw firmware-access caps and an MMIO aperture list from init,
-//! plus the root Interrupt range cap. Parsing (MCFG → ECAM, MADT/DTB →
-//! IRQ routing) happens later in `devmgr::firmware`; this module owns
+//! plus a full-rights derivation of the root Interrupt range cap. Parsing
+//! (MCFG → ECAM, MADT/DTB → IRQ routing) happens later in `devmgr::firmware`; this module owns
 //! only the IPC handshake.
 
 use std::os::seraph::StartupInfo;
@@ -152,8 +152,9 @@ pub struct DevmgrCaps
     pub driver_module_count: usize,
 
     // SEND cap on svcmgr's service endpoint with `PUBLISH_AUTHORITY`
-    // badged on. Reserved for devmgr-initiated publications; svcmgr
-    // publishes the active well-known names itself.
+    // badged on. Reserved for devmgr-initiated publications (who
+    // publishes the active names: `docs/process-lifecycle.md`
+    // § Init → remaining services).
     pub svcmgr_publish_cap: u32,
 
     // Full-rights derivation of init's root `IoPort` cap (x86-64 only;

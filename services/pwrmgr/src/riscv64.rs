@@ -6,7 +6,7 @@
 //! RISC-V platform shutdown and reboot via the SBI SRST extension.
 //!
 //! pwrmgr owns the actuation; devmgr owns the `SbiControl` authority. At
-//! startup pwrmgr asks devmgr for a copy of the cap via
+//! startup pwrmgr asks devmgr for a Reset-only derivation of it via
 //! [`devmgr_labels::QUERY_SHUTDOWN_DEVICE`], then forwards an SBI
 //! `system_reset` call through the kernel to M-mode firmware. The
 //! `SbiControl` cap gates kernel-side acceptance; pwrmgr's cap-gating

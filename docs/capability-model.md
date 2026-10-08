@@ -162,9 +162,9 @@ The holder binds a Notification to the line with `SYS_IRQ_REGISTER`; each interr
 ORs bit 0 into that Notification, and the holder re-enables the line with
 `SYS_IRQ_ACK`.
 
-The kernel mints one root Interrupt range capability at boot that covers every IRQ
-id on the architecture and places it in init's CSpace. Init hands it to devmgr,
-which splits single-line children with `SYS_IRQ_SPLIT` and delegates one to each
+The kernel mints one root Interrupt range capability at boot that covers every IRQ id on the
+architecture and places it in init's CSpace. Init keeps the root and hands devmgr a full-rights
+derivation, which devmgr splits single-line children with `SYS_IRQ_SPLIT` and delegates one to each
 driver.
 
 ### Mmio

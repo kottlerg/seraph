@@ -568,10 +568,11 @@ fn populate_child_info(
     // `sys_cap_derive_badge` rejects sources with `src_badge != 0`,
     // so the child cannot mint a parallel cap with a privileged
     // badge value (`procmgr_labels::DEATH_EQ_AUTHORITY`, etc.). The
-    // un-badged source cap stays exclusively in procmgr's own
-    // CSpace; init holds the only other un-badged copy and reaps
-    // before any non-trusted process is spawned that could
-    // theoretically exploit it. Zero when procmgr has no procmgr
+    // un-badged source cap stays in procmgr's own CSpace; outside it,
+    // init holds un-badged copies and hands svcmgr a badge-0 source at
+    // the handover, from which svcmgr mints real-logd's
+    // `DEATH_EQ_AUTHORITY` cap (`services/init/docs/bootstrap.md`
+    // § Per-stage authority transfers). Zero when procmgr has no procmgr
     // above it — e.g. procmgr itself, when init populates its
     // `ProcessInfo`.
     let procmgr_ep_in_child = if universals.procmgr_endpoint != 0

@@ -142,7 +142,7 @@ Three of the kernel's object types make up what userspace calls a process:
 - **AddressSpace** — a virtual address space with a page table root and a set of frame mappings.
   When the last capability to an AddressSpace (or a CSpace) is deleted, every thread bound to it is
   stopped (see [capability-model.md](capability-model.md#kill-process-pattern), which names this
-  path's two known kernel memory-safety gaps, tracked in
+  path's known kernel memory-safety gaps, tracked in
   [#443](https://github.com/kottlerg/seraph/issues/443)).
 - **CSpace** — a capability space: a growable array of capability slots that a thread
   uses to name kernel objects.

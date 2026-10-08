@@ -110,11 +110,9 @@ capability type. The binding is per-thread kernel state: the bound endpoint and 
 - `thread_cap` MUST carry `CONTROL`. It selects the thread whose handler is set.
 - `endpoint_cap` MUST refer to an `Endpoint`, or be the null index `0` to **unbind**.
   Binding takes a reference on the endpoint object for the lifetime of the binding (see
-  [Liveness](#liveness)); unbinding releases it. The binding's endpoint lookup takes no
-  reference, so a concurrent delete of the last capability to the endpoint, or a revoke of an
-  ancestor of the caller's capability by another holder, can free the endpoint before that
-  reference is taken, leaving a dangling binding (a known defect tracked in
-  [#443](https://github.com/kottlerg/seraph/issues/443); see
+  [Liveness](#liveness)); unbinding releases it. Neither the thread nor the endpoint lookup
+  takes a reference on its object, so neither object is pinned while the binding is written
+  (a known defect tracked in [#443](https://github.com/kottlerg/seraph/issues/443); see
   [capability-internals.md § Storage: Hybrid Two-Level Radix](../core/kernel/docs/capability-internals.md#storage-hybrid-two-level-radix)).
 - `badge` is a caller-chosen value delivered as the fault message badge. It identifies the
   faulting thread (or its process) to the handler only if no other binder can reach the

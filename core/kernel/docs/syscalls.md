@@ -780,12 +780,11 @@ threads never outlive either object (see [scheduling-internals.md](scheduling-in
 Registry). **The stop includes the caller**: a thread deleting the last capability to its own
 `CSpace` or `AddressSpace` — directly, or because the deleted object's teardown cascades into it —
 is stopped by that delete and the call does not return; the object is reclaimed once the thread is
-off its CPU. This path has two known memory-safety gaps, both tracked in
-[#443](https://github.com/kottlerg/seraph/issues/443): a thread displaced from a server's
-pending-reply binding, whose reap can hang the kernel ([ipc-design.md](../../../docs/ipc-design.md)
-§ The Call/Reply Model), and a thread syscall racing the teardown on an object `lookup_cap` did not
-pin ([capability-internals.md](capability-internals.md#storage-hybrid-two-level-radix) § Storage:
-Hybrid Two-Level Radix). The caller's own `Thread` object is treated differently, as below.
+off its CPU. This path has known kernel memory-safety gaps, tracked in
+[#443](https://github.com/kottlerg/seraph/issues/443) (see
+[ipc-design.md](../../../docs/ipc-design.md) § The Call/Reply Model and
+[capability-internals.md](capability-internals.md#storage-hybrid-two-level-radix) § Storage: Hybrid
+Two-Level Radix). The caller's own `Thread` object is treated differently, as below.
 
 Refused for two cases, both returning `InvalidState` with the capability left in
 place: a thread may not delete the last capability to its **own running**
@@ -1294,12 +1293,12 @@ takes effect immediately:
 
 If `cpu_id` names an offline CPU, the call fails with `InvalidArgument`.
 
-The call takes no `sched_lock`, so the affinity write races other CPUs' scheduler paths, and
-`lookup_cap` takes no reference on the target Thread, so a concurrent delete of the last Thread
-capability, or a revoke of an ancestor of the caller's capability by another holder, can free the
-TCB mid-call ([capability-internals.md](capability-internals.md#storage-hybrid-two-level-radix) §
-Storage: Hybrid Two-Level Radix); the outcomes above hold only when neither race occurs (defects
-tracked in [#443](https://github.com/kottlerg/seraph/issues/443)).
+The call writes `cpu_affinity` and reads the target's `preferred_cpu` and `state` without the
+target's `sched_lock`, so those accesses race other CPUs' scheduler paths, and the target Thread
+is not pinned for the call
+([capability-internals.md](capability-internals.md#storage-hybrid-two-level-radix) § Storage:
+Hybrid Two-Level Radix); the outcomes above hold only when neither race occurs (defects tracked in
+[#443](https://github.com/kottlerg/seraph/issues/443)).
 
 **Capability requirement:** `thread_cap` MUST have Control rights.
 
@@ -1387,20 +1386,19 @@ handler bound the fault is terminal. See
 
 Binding takes a reference on the endpoint object for the binding's lifetime; rebinding, unbinding,
 or thread destruction releases it (see [fault-handling.md](../../../docs/fault-handling.md) §
-Liveness). These reference and release statements hold only absent a race: `lookup_cap` takes no
-reference on the target Thread or the endpoint, so a concurrent delete of the last capability to
-either, or a revoke of an ancestor of the caller's capability by another holder, can free it
-mid-call ([capability-internals.md](capability-internals.md#storage-hybrid-two-level-radix) §
-Storage: Hybrid Two-Level Radix, [#443](https://github.com/kottlerg/seraph/issues/443)). Binding
-requires only a valid `Endpoint` cap — `Control` on the thread is the authority; the endpoint cap
-merely names where the thread's faults are delivered. The kernel synthesizes fault delivery via the
-binding and distributes no send capability to the endpoint, so a handler that hands out no `SEND` to
-it receives `FAULT_LABEL` only from the kernel; a handler that also serves clients on that endpoint
-attributes the message by badge (see [fault-handling.md](../../../docs/fault-handling.md) §
-Security). The fault badge is binder-chosen and any `Endpoint` cap, a `SEND`-only one included, is
-enough to bind, so any holder of `Control` on some thread can deliver `FAULT_LABEL` messages bearing
-an arbitrary badge; a handler sharing its endpoint with clients can trust the badge only if its
-badges are secret.
+Liveness). These reference and release statements hold only absent a race: the target Thread and
+the endpoint are not pinned for the call
+([capability-internals.md](capability-internals.md#storage-hybrid-two-level-radix) § Storage:
+Hybrid Two-Level Radix, [#443](https://github.com/kottlerg/seraph/issues/443)). Binding requires
+only a valid `Endpoint` cap — `Control` on the thread is the authority; the endpoint cap merely
+names where the thread's faults are delivered. The kernel synthesizes fault delivery via the
+binding and distributes no send capability to the endpoint, so a handler that hands out no `SEND`
+to it receives `FAULT_LABEL` only from the kernel; a handler that also serves clients on that
+endpoint attributes the message by badge (see [fault-handling.md](../../../docs/fault-handling.md)
+§ Security). The fault badge is binder-chosen and any `Endpoint` cap, a `SEND`-only one included,
+is enough to bind, so any holder of `Control` on some thread can deliver `FAULT_LABEL` messages
+bearing an arbitrary badge; a handler sharing its endpoint with clients can trust the badge only if
+its badges are secret.
 
 Both page faults (`FAULT_KIND_VM`) and other kernel-unresolvable ring-3 exceptions
 (`FAULT_KIND_EXCEPTION`) are routed to the bound handler; the handler dispatches on

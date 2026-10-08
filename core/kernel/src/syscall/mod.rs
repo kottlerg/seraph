@@ -729,12 +729,9 @@ pub(crate) unsafe fn lookup_cap<K: crate::cap::slot::CapKind>(
     // its own CSpace is stopped the same way, and the free is deferred until
     // the syscall epilogue has scheduled it away (`drain_deferred_reclaim`).
     // The unlocked tag/generation checks above narrow, but cannot close, the
-    // race against this slot being freed or recycled concurrently. lookup_cap
-    // takes no reference on the object it resolves, so while a handler still
-    // dereferences that object, a concurrent delete of the last capability to
-    // it, or a revoke of an ancestor of the caller's capability by another
-    // holder (as in the kill-process pattern), can free it; this is a known
-    // defect tracked in #443 (see core/kernel/docs/capability-internals.md
+    // race against this slot being freed or recycled concurrently.
+    // `lookup_cap` takes no reference on the object, so it is not pinned while
+    // the caller uses it (#443; see core/kernel/docs/capability-internals.md
     // § Storage: Hybrid Two-Level Radix).
     Ok(unsafe { &*(slot as *const _) })
 }

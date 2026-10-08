@@ -2116,15 +2116,8 @@ pub fn thread_set_priority(thread_cap: u32, priority: u8, sched_cap: u32) -> Res
 /// stopped, or not-yet-started thread observes the new affinity on its next
 /// wake.
 ///
-/// The kernel writes the affinity without taking `sched_lock`, so the write
-/// races other CPUs' scheduler paths, and `lookup_cap` takes no reference on
-/// the object it resolves, so while the handler still dereferences the
-/// Thread, a concurrent delete of the last capability to it, or a revoke of an
-/// ancestor of the caller's capability by another holder (as in the
-/// kill-process pattern), can free it. The outcomes above hold only when
-/// neither race occurs; both are known defects tracked in #443 (see
-/// core/kernel/docs/capability-internals.md § Storage: Hybrid Two-Level
-/// Radix).
+/// See `core/kernel/docs/syscalls.md` § `SYS_THREAD_SET_AFFINITY` for known
+/// defects (#443).
 ///
 /// # Errors
 /// Returns a negative `i64` error code: `InvalidCapability` if the thread cap

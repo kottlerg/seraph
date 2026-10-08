@@ -1252,10 +1252,9 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// and the caller gets `InvalidCapability`.
 ///
 /// Residual: from the `dec_ref` here to the caller's next touch of the
-/// destination under `DERIVATION_LOCK`, the same race stays open — the
-/// `lookup_cap` residual, confined to a sibling thread of the caller's own
-/// process (the caller holds a destination capability in its own `CSpace`,
-/// so nobody else can drop the last one).
+/// destination under `DERIVATION_LOCK`, the destination is unpinned again:
+/// `lookup_cap` takes no reference on the object, so it is not pinned for
+/// this window (#443).
 ///
 /// # Safety
 /// `dest_obj` must be the header of the live `CSpaceKernelObject` wrapping

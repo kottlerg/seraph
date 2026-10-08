@@ -99,9 +99,12 @@ the derivation lock outermost, then the spinlock. Races on slot content
 against the unlocked readers are narrowed — not closed — by the tag and
 per-slot generation checks at the resolution sites. `lookup_cap` takes no
 reference on the object it resolves, so the object can be freed while a
-handler still dereferences it. An object is freed when its last capability
-goes away: through a delete of the last capability, or through a revoke
-that removes it as a descendant. A split child (a `SYS_MEMORY_SPLIT` tail,
+handler still dereferences it. An object is freed when its reference count
+reaches zero ([§ Kernel Object Reference Counting](#kernel-object-reference-counting)):
+the last reference released may be a capability, removed by a delete or by a
+revoke that removes it as a descendant, or a kernel-internal owner, such as a
+fault-handler binding released on unbind, rebind, or thread destruction, or a
+wait-set membership. A split child (a `SYS_MEMORY_SPLIT` tail,
 or a range-split MMIO, IoPort, IRQ, or SchedControl child) is a distinct
 object linked under the original's derivation parent, so another holder's
 revoke of that ancestor can free it directly. For a same-object

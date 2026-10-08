@@ -405,8 +405,8 @@ pub unsafe fn endpoint_call(
 /// (server is now blocked on the recv queue).
 ///
 /// # Safety
-/// `ep` and `server` must be valid. Call with no scheduler lock and no
-/// `ep.lock` held.
+/// `ep` and `server` must be valid, and `server` must be the running thread.
+/// Call with no scheduler lock and no `ep.lock` held.
 #[cfg(not(test))]
 pub unsafe fn endpoint_recv(
     ep: *mut EndpointState,

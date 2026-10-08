@@ -324,21 +324,25 @@ pub mod procmgr_labels
     ///               on `cap_delete` regardless of state).
     /// Subsequent rounds (`data[0] == 0`):
     ///   `caps[0..N]` = reclaimable Memory caps (segments + stack +
-    ///                  `InitInfo` + IPC buffer + any other init-owned
-    ///                  donatable Memory cap). MOVED out of init's `CSpace`
+    ///                  `InitInfo` + any other init-owned donatable
+    ///                  Memory cap). MOVED out of init's `CSpace`
     ///                  via IPC cap-transfer; procmgr accumulates them
     ///                  for the eventual `memmgr.DONATE_MEMORY_CAPS` chunk.
     ///
     /// Procmgr binds the death-EQ on both init threads (main and
     /// init-logd) with correlator `INIT_REAP_CORRELATOR` as part of the
     /// first round, and reaps once both have exited. Each round replies
-    /// `procmgr_errors::SUCCESS`.
+    /// `procmgr_errors::SUCCESS`, or `INVALID_ARGUMENT` on the reject
+    /// arms in `services/procmgr/docs/ipc-interface.md`
+    /// § `REGISTER_INIT_TEARDOWN`.
     pub const REGISTER_INIT_TEARDOWN: u64 = 15;
 
     /// Notification end of init's reap-handoff cap stream. After this call
     /// init has no caps left to transfer; procmgr's state machine
     /// transitions to "armed", awaiting the death-EQ event. Init
-    /// calls `sys_thread_exit` immediately after this IPC replies.
+    /// calls `sys_thread_exit` immediately after this IPC replies. Replies
+    /// `INVALID_ARGUMENT` when no teardown is pending or the state machine
+    /// is already armed.
     pub const INIT_TEARDOWN_DONE: u64 = 16;
 
     /// Reserved death-notification correlator used by `REGISTER_INIT_TEARDOWN`.

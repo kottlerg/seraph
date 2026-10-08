@@ -203,9 +203,11 @@ both have exited — init is threadless. The main thread exits at the end of ini
 but init-logd keeps serving the master log endpoint until the svcmgr-launched real-logd pulls its
 handover, so it outlives main; reclaiming init's address space while a thread still runs in it would
 fault that thread. On the last death procmgr tears down init's kernel objects in order (Threads →
-AddressSpace → donate Memory caps to memmgr → CSpace), leaving two init residues: the caps init
-still holds, and the kernel-direct page-table nodes behind its bootstrap mappings. The caps stay in
-init's CSpace, which the kernel pins (it is the root CSpace; see
+AddressSpace → donate Memory caps to memmgr → drop its CSpace reference), leaving two init residues:
+init's CSpace with the caps init still holds, and the kernel-direct page-table nodes behind its
+bootstrap mappings. Those caps include the remaining root caps (see [Kernel → init](#kernel--init)),
+the endpoints init created, the intermediate caps it derived, and its bootstrap-arena Memory cap.
+They stay in init's CSpace, which the kernel pins (it is the root CSpace; see
 [capability-internals.md § Kernel Object Reference Counting](../core/kernel/docs/capability-internals.md#kernel-object-reference-counting)),
 so procmgr's delete drops only its own reference and they remain alive but unreachable; releasing
 them at the reap is design intent, not yet implemented

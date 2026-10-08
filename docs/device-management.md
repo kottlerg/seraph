@@ -53,8 +53,9 @@ binding in a running system.
 
 devmgr receives from init a platform capability set sufficient for
 enumeration and per-driver delegation (MMIO apertures, firmware-table
-Memory caps, the IRQ range, and the root `IoPort` on x86-64 or `SbiControl`
-on RISC-V); its SchedControl band arrives from procmgr via `ProcessInfo`.
+Memory caps, the IRQ range, and a full-rights derivation of the root `IoPort` on x86-64 or an
+`SbiControl` derivation narrowed to Reset and Suspend on RISC-V, the roots staying with init); its
+SchedControl band arrives from procmgr via `ProcessInfo`.
 Init exits after bootstrap; devmgr is `restart = never`, `critical = yes`,
 so its death triggers a graceful shutdown rather than re-delegation. The
 per-round list of what init delivers is specified in

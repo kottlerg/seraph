@@ -271,5 +271,7 @@ policy + budget):
 [Device Management](../../../docs/device-management.md),
 [Process Lifecycle](../../../docs/process-lifecycle.md),
 [services/init/README.md](../../init/README.md),
-[init Bootstrap Stages](../../init/docs/bootstrap.md), [services/svcmgr/README.md](../README.md),
+[init Bootstrap Stages](../../init/docs/bootstrap.md),
+[procmgr IPC Interface](../../procmgr/docs/ipc-interface.md),
+[services/svcmgr/README.md](../README.md),
 [shared/registry-client/README.md](../../../shared/registry-client/README.md)

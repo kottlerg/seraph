@@ -498,8 +498,9 @@ fn dispatch_ipc(
 ///
 /// Wire format:
 /// * `caller badge` MUST equal `procmgr_labels::DEATH_EQ_AUTHORITY`
-///   (init derives the authorised badged SEND cap and hands it
-///   exclusively to real-logd at bootstrap).
+///   (svcmgr mints the authorised badged SEND for real-logd on each
+///   launch, from the badge-0 procmgr source init hands it at the
+///   handover).
 /// * `caps[0]` = `EventQueue` cap with POST right.
 ///
 /// Reply: `procmgr_errors::SUCCESS` on bind, `UNAUTHORIZED` if the

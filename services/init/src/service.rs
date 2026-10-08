@@ -641,14 +641,15 @@ pub fn create_devmgr_with_caps(
     // caps: [svcmgr_publish_cap, arch_shutdown_cap]. The SEND-rights cap
     // on svcmgr's service endpoint is stamped with the PUBLISH_AUTHORITY
     // verb-bit in its badge so devmgr can register service caps in
-    // svcmgr's registry on init's behalf (today's only use is reserved
-    // for future devmgr publications; the active publications — `timed`,
-    // `rootfs.root`, `svcmgr`, `devmgr.registry` — are init-issued).
-    // The arch shutdown-authority cap is the root `IoPort` on x86-64
-    // (devmgr derives narrow per-driver IoPort caps from it for ISA
-    // peripherals like the CMOS RTC, and carves the PM1a + 8042 ports for
-    // pwrmgr) and `SbiControl` on RISC-V (devmgr serves a copy to pwrmgr
-    // for SBI SRST). devmgr is the hardware authority; pwrmgr acquires its
+    // svcmgr's registry (reserved for future devmgr publications; svcmgr
+    // publishes the active well-known names itself, per
+    // `services/init/docs/bootstrap.md` § Per-stage authority transfers).
+    // The arch shutdown-authority cap is a full-rights derivation of the
+    // root `IoPort` on x86-64 (devmgr derives narrow per-driver IoPort caps
+    // from it for ISA peripherals like the CMOS RTC, and carves the PM1a +
+    // 8042 ports for pwrmgr) and an `SbiControl` derivation narrowed to
+    // Reset and Suspend on RISC-V (devmgr serves a Reset-only copy to
+    // pwrmgr for SBI SRST). The roots stay in init's `CSpace`. devmgr is the hardware authority; pwrmgr acquires its
     // shutdown caps from devmgr, not from init.
     // SVCMGR_BUNDLE is unconditionally the terminal round. On any
     // preparation failure init MUST still emit a `done=true` round so

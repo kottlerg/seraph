@@ -79,8 +79,9 @@ revocable only through the root; the per-service detail is in
 init-reap handoff init moves only its kernel-object caps and the reclaimable
 Memory caps it solely owns to procmgr (see "Init reap" below). The remaining
 root caps (the RAM roots of memory forwarded to memmgr, the firmware caps, and
-the `Interrupt`, `IoPort`, `SbiControl`, `Mmio`, and elevated `SchedControl`
-roots) stay in init's CSpace, which the kernel pins (it is the root CSpace; see
+the `Interrupt`, `IoPort`, `SbiControl`, and `Mmio` roots, and both halves of the split
+`SchedControl` root: the baseline band init delegated and the elevated remainder it keeps) stay in
+init's CSpace, which the kernel pins (it is the root CSpace; see
 [capability-internals.md § Kernel Object Reference Counting](../core/kernel/docs/capability-internals.md#kernel-object-reference-counting)),
 so they remain alive but unreachable; releasing them at the reap is design intent, not yet
 implemented ([#443](https://github.com/kottlerg/seraph/issues/443); see [Init reap](#init-reap)).

@@ -531,10 +531,12 @@ object. The returned capability is placed in a free slot in the caller's
 CSpace. The caller receives the rights listed above; a freshly created CSpace
 capability carries no Revoke right.
 
-The kernel does not track ownership beyond the derivation tree. If a process destroys
-all capabilities in the derivation tree for an object — including its own — the kernel
-reclaims the object's bytes (returning them to the Memory cap from which the object
-was retyped) and frees the slot. Objects do not outlive all references to them.
+The kernel does not track ownership beyond the derivation tree. When an object's reference count
+reaches zero (its capabilities and every kernel-internal reference to it are released; see
+[capability-internals.md](../core/kernel/docs/capability-internals.md#kernel-object-reference-counting)
+§ Kernel Object Reference Counting), the kernel reclaims the object's bytes (returning them to the
+Memory cap from which the object was retyped) and frees the slot. Objects do not outlive all
+references to them.
 
 ---
 
@@ -562,8 +564,8 @@ is debited from a cap the service holds.
 
 ### Auto-reclaim
 
-When a kernel object's reference count reaches zero (every cap referring
-to it has been destroyed), the kernel reclaims its bytes back to the
+When a kernel object's reference count reaches zero (its capabilities and every
+kernel-internal reference to it are released), the kernel reclaims its bytes back to the
 Memory capability the object was retyped from. If the source Memory cap's
 own reference count then reaches zero, the reclamation cascades upward
 through the derivation chain. Process death is an instance of this

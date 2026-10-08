@@ -761,7 +761,8 @@ pub fn sys_ipc_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // SAFETY: tcb is the running caller, not yet claimable.
     unsafe { crate::sched::thread::open_park_episode(tcb) };
 
-    // SAFETY: ep_state extracted from validated Endpoint object; scheduler lock not held.
+    // SAFETY: ep_state extracted from validated Endpoint object; tcb is the
+    // running thread (current_tcb above); no scheduler lock and no ep.lock held.
     let result = unsafe { crate::ipc::endpoint::endpoint_recv(ep_state, tcb) };
 
     if let Ok((caller, msg)) = result

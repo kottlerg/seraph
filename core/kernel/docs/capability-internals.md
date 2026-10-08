@@ -86,32 +86,24 @@ that outlives a failed leaf allocation stays published — already paid for,
 it serves the next grow. Pages are never freed while the CSpace is live
 (slot indices must remain stable).
 
-**Memory ordering and lock domains:** directory and leaf pointers are
-write-once while the CSpace is live, published with Release after full
-initialisation, and read with Acquire by the lock-free lookup path
-(`lookup_cap`, `cap_info`). Mutation is split across two lock domains:
-slot occupancy, the free list, the directory, and the counters change
-only under the CSpace spinlock, while the derivation linkage of occupied
-slots changes only under the global derivation write lock (which reaches
-any registered CSpace's slots via registry lookup without taking its
-spinlock — see Derivation Tree below). Paths crossing the families hold
-the derivation lock outermost, then the spinlock. Races on slot content
-against the unlocked readers are narrowed — not closed — by the tag and
-per-slot generation checks at the resolution sites. `lookup_cap` takes no
-reference on the object it resolves, so the object can be freed while a
-handler still dereferences it. An object is freed when its reference count
-reaches zero ([§ Kernel Object Reference Counting](#kernel-object-reference-counting)):
-the last reference released may be a capability, removed by a delete or by a
-revoke that removes it as a descendant, or a kernel-internal owner, such as a
-fault-handler binding released on unbind, rebind, or thread destruction, or a
-wait-set membership. A split child (a `SYS_MEMORY_SPLIT` tail,
-or a range-split MMIO, IoPort, IRQ, or SchedControl child) is a distinct
-object linked under the original's derivation parent, so another holder's
-revoke of that ancestor can free it directly. For a same-object
-derivation, as in the kill-process pattern, it is the delete following the
-revoke that frees the object: a revoke keeps its target capability, so it
-never frees the target's own object, though it can free a descendant's.
-This is a known defect tracked in
+**Memory ordering and lock domains:** directory and leaf pointers are write-once while the CSpace is
+live, published with Release after full initialisation, and read with Acquire by the lock-free
+lookup path (`lookup_cap`, `cap_info`). Mutation is split across two lock domains: slot occupancy,
+the free list, the directory, and the counters change only under the CSpace spinlock, while the
+derivation linkage of occupied slots changes only under the global derivation write lock (which
+reaches any registered CSpace's slots via registry lookup without taking its spinlock — see
+Derivation Tree below). Paths crossing the families hold the derivation lock outermost, then the
+spinlock. Races on slot content against the unlocked readers are narrowed — not closed — by the tag
+and per-slot generation checks at the resolution sites. `lookup_cap` takes no reference on the
+object it resolves, so the object can be freed while a handler still dereferences it. An object is
+freed when its reference count reaches zero, whatever releases the last reference: a capability or
+one of the kernel-internal owners
+[§ Kernel Object Reference Counting](#kernel-object-reference-counting) lists. A split child (a
+`SYS_MEMORY_SPLIT` tail, or a range-split MMIO, IoPort, IRQ, or SchedControl child) is a distinct
+object linked under the original's derivation parent, so another holder's revoke of that ancestor
+can free it directly. For a same-object derivation, as in the kill-process pattern, it is the delete
+following the revoke that frees the object: a revoke keeps its target capability, so it never frees
+the target's own object, though it can free a descendant's. This is a known defect tracked in
 [#443](https://github.com/kottlerg/seraph/issues/443).
 
 **Slot 0** is always null. The leaf covering slot 0 exists once the CSpace

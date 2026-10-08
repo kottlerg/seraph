@@ -198,10 +198,11 @@ const _: () = assert!(core::mem::size_of::<CSpaceDirPage>() == crate::mm::PAGE_S
 /// pair with grow's Release publication, so a reader that observes a
 /// pointer observes the initialised page behind it. Races on slot
 /// *content* against such unlocked readers are narrowed — not closed — by
-/// the tag and per-slot generation checks at the resolution sites:
-/// `lookup_cap` takes no reference on the object, so it is not pinned
-/// (#443; see `core/kernel/docs/capability-internals.md` § Storage: Hybrid
-/// Two-Level Radix).
+/// the tag and per-slot generation checks at the resolution sites.
+/// Separately, `lookup_cap` takes no reference on the object, so the object
+/// is not pinned while its caller uses it
+/// (`core/kernel/docs/capability-internals.md` § Storage: Hybrid Two-Level
+/// Radix, #443).
 pub struct CSpace
 {
     id: CSpaceId,

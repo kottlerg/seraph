@@ -98,11 +98,17 @@ spinlock — see Derivation Tree below). Paths crossing the families hold
 the derivation lock outermost, then the spinlock. Races on slot content
 against the unlocked readers are narrowed — not closed — by the tag and
 per-slot generation checks at the resolution sites. `lookup_cap` takes no
-reference on the object it resolves, so a concurrent delete of the last
-capability to the object (for example the delete that follows another
-holder's revoke of an ancestor, as in the kill-process pattern; a revoke
-alone preserves its target) can free it while a handler still dereferences
-it; this is a known defect tracked in
+reference on the object it resolves, so the object can be freed while a
+handler still dereferences it. An object is freed when its last capability
+goes away: through a delete of the last capability, or through a revoke
+that removes it as a descendant. A split child (a `SYS_MEMORY_SPLIT` tail,
+or a range-split MMIO, IoPort, IRQ, or SchedControl child) is a distinct
+object linked under the original's derivation parent, so another holder's
+revoke of that ancestor can free it directly. For a same-object
+derivation, as in the kill-process pattern, it is the delete following the
+revoke that frees the object: a revoke keeps its target capability, so it
+never frees the target's own object, though it can free a descendant's.
+This is a known defect tracked in
 [#443](https://github.com/kottlerg/seraph/issues/443).
 
 **Slot 0** is always null. The leaf covering slot 0 exists once the CSpace

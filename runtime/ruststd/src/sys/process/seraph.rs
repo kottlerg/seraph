@@ -1164,9 +1164,14 @@ struct BridgeHandles {
 
 fn bridge_main(h: BridgeHandles) {
     // A `death_eq` destroyed while this wait is parked returns `Ok(0)`, not
-    // an error (a kernel defect tracked in #443); the bridge then records
-    // exit reason 0, a clean exit the child never reported, and fires every
-    // wake below as for a real death.
+    // an error (a kernel defect tracked in #443). The bridge then runs the
+    // whole death path below, as for a real death, for a child that may
+    // still be alive: it records exit reason 0, a clean exit the child never
+    // reported, sets `peer_dead` so the parent's pipe ends report EOF or
+    // `BrokenPipe`, kicks every pipe notification, and reports the death to
+    // each `RingRelease`, so a ring grant returns to memmgr once its parent
+    // end is dropped (at once for an end already dropped) while the child
+    // may still be writing through its mapping.
     let payload = match syscall::event_recv(h.death_eq) {
         Ok(p) => p,
         // `event_recv` error (`death_eq` invalid, or the wait interrupted)

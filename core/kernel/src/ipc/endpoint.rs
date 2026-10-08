@@ -253,7 +253,8 @@ unsafe fn rollback_uncommitted_call(
 /// state to transition it to.
 ///
 /// # Safety
-/// Must be called with the scheduler lock held.
+/// `ep` and `caller` must be valid, and `caller` must be the running thread.
+/// Call with no scheduler lock and no `ep.lock` held.
 #[cfg(not(test))]
 pub unsafe fn endpoint_call(
     ep: *mut EndpointState,
@@ -404,7 +405,8 @@ pub unsafe fn endpoint_call(
 /// (server is now blocked on the recv queue).
 ///
 /// # Safety
-/// Must be called with the scheduler lock held.
+/// `ep` and `server` must be valid. Call with no scheduler lock and no
+/// `ep.lock` held.
 #[cfg(not(test))]
 pub unsafe fn endpoint_recv(
     ep: *mut EndpointState,
@@ -580,7 +582,8 @@ pub unsafe fn endpoint_recv(
 /// concurrent claimant won.
 ///
 /// # Safety
-/// Must be called with the scheduler lock held.
+/// `server` must be the calling thread's valid TCB. Call with no scheduler or
+/// endpoint lock held.
 #[cfg(not(test))]
 pub unsafe fn endpoint_reply(
     server: *mut ThreadControlBlock,
@@ -646,7 +649,7 @@ pub unsafe fn endpoint_reply(
 /// Used by `SYS_THREAD_STOP` to cancel a `BlockedOnSend` or `BlockedOnRecv`.
 ///
 /// # Safety
-/// Must be called with the scheduler lock held. All pointers must be valid.
+/// Caller must hold the owning endpoint's `ep.lock`. All pointers must be valid.
 pub unsafe fn unlink_from_wait_queue(
     tcb: *mut ThreadControlBlock,
     head: &mut *mut ThreadControlBlock,

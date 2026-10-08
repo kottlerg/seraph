@@ -805,8 +805,10 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
 ///
 /// Binding takes a reference on the endpoint object for the binding's lifetime
 /// (see `docs/fault-handling.md` § Liveness); rebinding / unbinding / thread
-/// destruction releases it. `lookup_cap` takes no reference on the target
-/// Thread or the endpoint, so neither object is pinned for this call (#443).
+/// destruction releases it. This holds only absent a race: `lookup_cap` takes
+/// no reference on the target Thread or the endpoint, so neither object is
+/// pinned for this call (`core/kernel/docs/capability-internals.md` § Storage:
+/// Hybrid Two-Level Radix, #443).
 /// Binding requires only a valid `Endpoint` cap — `CONTROL` on the thread is
 /// the authority; the endpoint cap merely names where this thread's
 /// kernel-unresolvable faults are delivered.
@@ -879,7 +881,8 @@ pub fn sys_thread_set_fault_handler(tf: &mut TrapFrame) -> Result<u64, SyscallEr
     {
         // SAFETY: new_ep was a live EndpointObject at lookup. `lookup_cap`
         // takes no reference on the object, so it is not pinned for this
-        // block (#443).
+        // block (`core/kernel/docs/capability-internals.md` § Storage: Hybrid
+        // Two-Level Radix, #443).
         unsafe { (*new_ep).header.inc_ref() };
     }
 
@@ -887,7 +890,8 @@ pub fn sys_thread_set_fault_handler(tf: &mut TrapFrame) -> Result<u64, SyscallEr
     // faulter that observes the new handler also observes the matching badge.
     // SAFETY: target_tcb was a live TCB at lookup; both fields are atomics safe
     // to write cross-thread. `lookup_cap` takes no reference on the object, so
-    // it is not pinned for this block (#443).
+    // it is not pinned for this block (`core/kernel/docs/capability-internals.md`
+    // § Storage: Hybrid Two-Level Radix, #443).
     let old_ep = unsafe {
         (*target_tcb).fault_badge.store(badge, Ordering::Release);
         (*target_tcb).fault_handler.swap(new_ep, Ordering::AcqRel)
@@ -1228,9 +1232,11 @@ pub fn sys_thread_set_affinity(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     }
 
     // SAFETY: target_tcb was a live TCB at lookup. `lookup_cap` takes no
-    // reference on the object, so it is not pinned for this block, and the
-    // `cpu_affinity` write and the `preferred_cpu` / `state` reads are not
-    // serialised with other CPUs' scheduler paths; both are #443 defects.
+    // reference on the object, so it is not pinned for this block
+    // (`core/kernel/docs/capability-internals.md` § Storage: Hybrid Two-Level
+    // Radix, #443), and the `cpu_affinity` write and the `preferred_cpu` /
+    // `state` reads are not serialised with other CPUs' scheduler paths
+    // (`core/kernel/docs/syscalls.md` § SYS_THREAD_SET_AFFINITY, #443).
     unsafe {
         let old_cpu = (*target_tcb).preferred_cpu as usize;
 

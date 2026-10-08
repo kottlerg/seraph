@@ -62,9 +62,12 @@ and trips a kernel `debug_assert`; the same fault surfaces in the
 closing identity `system_ram == kernel_reserved + pool_total` checked by
 svctest.
 
-No process manipulates another process's address space. Sharing is
-explicit and capability-mediated: a Memory cap is sent over IPC and the
-receiver maps it into its own address space at a VA the receiver chose.
+A process maps into another process's address space only through an
+AddressSpace capability delegated for that purpose: procmgr as creator at
+spawn, and memmgr as pager for the regions a client registered. Sharing
+between peers is explicit and capability-mediated: a Memory cap is sent over
+IPC and the receiver maps it into its own address space at a VA the receiver
+chose.
 
 ---
 
@@ -139,7 +142,7 @@ the process via the page-reservation allocator inside `std::sys::seraph`.
   fixed 64 GiB window above `0x10_0000_0000` (24 bits of entropy; ASLR,
   [#39](https://github.com/kottlerg/seraph/issues/39)), degrading to the
   window base when the entropy draw fails. Everything placed through the
-  arena — thread stacks, MMIO, shmem, stdio/pipe rings, ELF scratch —
+  arena — demand-paged thread stacks, MMIO, shmem, stdio/pipe rings, ELF scratch —
   inherits the randomised base.
 - **Concurrency.** Reservations are independent across threads; the
   allocator serialises on a spinlock as needed.

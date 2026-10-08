@@ -58,7 +58,7 @@ seed      = rootfs.root pwrmgr.shutdown pwrmgr.deny
 | `critical` | yes | `yes` or `no`. Whether the system is viable without this service once it is permanently down. Orthogonal to `restart`. |
 | `namespace` | yes | One of `none`, `universal`, `subtree:<path>:<rights>`. |
 | `cwd` | no | Path interpreted relative to svcmgr's universal root. Forbidden when `namespace = none`. |
-| `seed` | no | Space-separated discovery-registry names, resolved positionally (cap[i] = i-th name). |
+| `seed` | no | Space-separated discovery-registry names, resolved positionally (cap[i] = i-th name; cap[i+1] for a `provides` service, see [`seed`](#seed)). |
 | `provides` | no | Space-separated `name[:auth\|:deny]` entries. svcmgr creates this service's endpoint, serves its RECV as bootstrap `cap[0]`, and publishes one badged SEND per entry into the discovery registry. See [`provides`](#provides). |
 | `log_sink` | no | `yes` or `no` (default `no`). Marks the service as the system log sink (real-logd); svcmgr mints its bootstrap round from the reserved log-sink sources init endows. Mutually exclusive with `seed` and `provides`. See [`log_sink`](#log_sink). |
 | `priority` | no | Priority level (`1..=30`) the service's initial thread is created at. Unset: procmgr's default (`sched_policy::DEFAULT_SPAWN_PRIORITY`, clamped to the band). See [`priority` / `sched_max`](#priority--sched_max). |
@@ -203,7 +203,9 @@ Well-known names are centralised in
 
 Declares the registry names a service's own endpoint is published under.
 svcmgr creates a service endpoint, serves its RECV as bootstrap `cap[0]`
-(ahead of the `seed` caps), and publishes one SEND per entry. Providers
+(ahead of the `seed` caps), and publishes one SEND per entry. If the RECV
+derive fails on a restart, svcmgr delivers the seeds shifted down into
+cap[0] ([#451](https://github.com/kottlerg/seraph/issues/451)). Providers
 launch ahead of pure consumers during reconciliation, so a provided name
 is resolvable before any consumer queries it. The endpoint persists across
 restarts (svcmgr holds the source), so a cached client cap survives a

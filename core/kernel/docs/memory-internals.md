@@ -377,11 +377,15 @@ the mapping path:
 No per-node tracking structure exists. On address-space destruction the kernel
 does not walk the tables: the wrapper returns every donation wholesale to its
 source Memory cap, which reclaims the pool-drawn nodes with it, and the root
-table goes with the create-time slab. Kernel-direct nodes are not returned to
-the kernel page-table pool by destruction; only init's bootstrap space holds
-any, and procmgr destroys it at init's reap, which strands them (an accepted
-cost; see
-[process-lifecycle.md § Init reap](../../../docs/process-lifecycle.md#init-reap)).
+table goes with the create-time slab. Kernel-direct nodes are never returned
+to the kernel page-table pool. Only init's bootstrap space holds any, and
+procmgr destroys it at init's reap (see
+[process-lifecycle.md § Init reap](../../../docs/process-lifecycle.md#init-reap)),
+so they stay consumed. This residue is an accepted cost, not a defect or
+design intent to reclaim: it is bounded by the pool seed (`POOL_SEED_PAGES`,
+64 pages), and the pool is a fixed kernel reserve accounted as
+kernel-reserved at Phase 7, so returning the nodes would make no page
+available to userspace.
 See [capability-internals.md](capability-internals.md) § Page Pools for the
 donation-record mechanism.
 
@@ -396,4 +400,5 @@ donation-record mechanism.
 [SMP Scheduling and Locking Invariants](scheduling-internals.md),
 [Syscall Interface Specification](syscalls.md), [Memory Model](../../../docs/memory-model.md),
 [Process Lifecycle](../../../docs/process-lifecycle.md),
-[init Bootstrap Stages](../../../services/init/docs/bootstrap.md)
+[init Bootstrap Stages](../../../services/init/docs/bootstrap.md),
+[services/procmgr/README.md](../../../services/procmgr/README.md)

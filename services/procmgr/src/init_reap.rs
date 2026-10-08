@@ -312,13 +312,11 @@ fn do_reap(state: InitReapState, memmgr_ep: u32, ipc_buf: *mut u64)
 
     // 5. Revoke and delete procmgr's cap on init's CSpace last. init's
     //    CSpace is the kernel-pinned root CSpace, so this drops only
-    //    procmgr's reference: the caps init still holds (endpoint SENDs
-    //    and the endpoint-slab arena Memory cap) stay in it, alive but
-    //    unreachable. Releasing them at the reap is design intent, not
-    //    yet implemented (`docs/process-lifecycle.md` § Init reap, #443).
-    //    That release frees nothing to the sealed buddy: the arena is
-    //    retype-pinned and already forwarded to memmgr's pool, and every
-    //    reclaimable Memory cap was donated in step 4.
+    //    procmgr's reference: the caps init still holds (the set is in
+    //    `docs/process-lifecycle.md` § Kernel → init) stay in it, alive
+    //    but unreachable. Releasing them at the reap is design intent,
+    //    not yet implemented (`docs/process-lifecycle.md` § Init reap,
+    //    #443).
     let _ = syscall::cap_revoke_all(cspace);
     let _ = syscall::cap_delete(cspace);
 

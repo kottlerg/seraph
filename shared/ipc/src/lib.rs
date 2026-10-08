@@ -381,8 +381,8 @@ pub mod sched_policy
     /// yet implemented, per `docs/process-lifecycle.md` § Init reap and
     /// #443), and hands the baseline `[1, 28]` to memmgr and procmgr.
     /// Every band procmgr mints for a child is a (possibly narrowed)
-    /// descendant of this baseline, so no
-    /// spawned process can ever reach `[29, 30]`.
+    /// descendant of this baseline, so no spawned process can ever reach
+    /// `[29, 30]`.
     pub const BASELINE_PRIORITY_MAX: u8 = 28;
 
     /// Priority procmgr assigns when a `CREATE_PROCESS` /

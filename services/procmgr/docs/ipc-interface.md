@@ -363,9 +363,10 @@ reap runs only after the second death. Either bind failing rejects the round wit
 `INIT_TEARDOWN_DONE` (label 16, no caps, no data words) closes the stream and arms
 the state machine.
 
-Reply: `procmgr_errors::SUCCESS` on accept, `INVALID_ARGUMENT` on
-wrong round shape (wrong cap count on round 1, or `done` before any
-round 1).
+Reply: `procmgr_errors::SUCCESS` on accept, `INVALID_ARGUMENT` when a first
+round arrives after one was already accepted, a first round carries other than
+4 caps, either death-EQ bind fails, or a donation round arrives before any first
+round. The caps a rejected round moved into procmgr's CSpace stay there.
 
 ## INIT_TEARDOWN_DONE — end-of-stream notification
 
@@ -376,7 +377,8 @@ Wire format:
 | label | `procmgr_labels::INIT_TEARDOWN_DONE` (16) |
 | caps | none |
 
-Procmgr replies `SUCCESS` then arms the state machine. Init proceeds
+Procmgr replies `SUCCESS` then arms the state machine, or `INVALID_ARGUMENT`
+when no first round was accepted or the state machine is already armed. Init proceeds
 to `sys_thread_exit` immediately (per
 [services/init/docs/bootstrap.md](../../init/docs/bootstrap.md#handover) § Handover).
 Each death-EQ event with

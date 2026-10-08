@@ -63,8 +63,9 @@ space is uniform; any partition into tiers is userspace policy, expressed by how
   (kernel-placed at `INIT_PRIORITY` = 30) is the only occupant above the
   baseline. After init's reap the remainder stays in init's CSpace, which the
   kernel pins (it is the root CSpace), so it remains alive but unreachable;
-  releasing it at the reap is design intent, not yet implemented (#443; see
-  [process-lifecycle.md](../../../docs/process-lifecycle.md) § Init reap).
+  releasing it at the reap is design intent, not yet implemented
+  ([#443](https://github.com/kottlerg/seraph/issues/443); see
+  [process-lifecycle.md § Init reap](../../../docs/process-lifecycle.md#init-reap)).
 - Every spawned process receives a band through
   `ProcessInfo.sched_control_cap`: procmgr mints it from its baseline copy at
   create time, whole or `SYS_SCHED_SPLIT`-narrowed to the `[1, band_max]` the

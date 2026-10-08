@@ -33,7 +33,7 @@ a device driver":
   extracts `PM1a_CNT_BLK` from the FADT and the `\_S5_` sleep type from the
   DSDT, then requests a narrow `IoPort` over the PM1a control port and the
   8042 reset port via `devmgr_labels::QUERY_SHUTDOWN_DEVICE`.
-- **RISC-V** — `QUERY_SHUTDOWN_DEVICE` serves a `cap_derive` copy of
+- **RISC-V** — `QUERY_SHUTDOWN_DEVICE` serves a Reset-only derivation of
   devmgr's `SbiControl` cap ([devmgr](../devmgr/docs/responsibilities.md#responsibilities)),
   which authorises forwarding `system_reset` through the kernel to M-mode
   firmware.
@@ -93,7 +93,7 @@ name survives the restart (see
 [Supervision hierarchy](../svcmgr/docs/restart-protocol.md#supervision-hierarchy)).
 The restarted instance re-acquires its actuator caps from devmgr on startup
 — `QUERY_SHUTDOWN_DEVICE` re-derives the actuator caps (the x86-64 I/O
-ports, or the RISC-V `SbiControl` copy) from devmgr's root caps on every
+ports, or the RISC-V Reset-only `SbiControl` derivation) from the caps devmgr holds on every
 call, so nothing is consumed ([devmgr](../devmgr/docs/responsibilities.md#responsibilities)).
 
 `critical = no`: a permanently-dead pwrmgr (restart budget exhausted)

@@ -21,7 +21,7 @@ const SRST_TYPE_SHUTDOWN: u64 = 0;
 const SRST_TYPE_COLD_REBOOT: u64 = 1;
 const SRST_REASON_NONE: u64 = 0;
 
-/// Resolved shutdown actuation state: a `cap_derive` copy of devmgr's
+/// Resolved shutdown actuation state: a Reset-only derivation of devmgr's
 /// `SbiControl` cap, acquired once at startup and held for pwrmgr's
 /// lifetime.
 pub struct Actuator

@@ -1061,9 +1061,9 @@ fn handle_query_acpi_table(caps: &caps::DevmgrCaps, msg: &IpcMessage, badge: u64
 /// `QUERY_SHUTDOWN_DEVICE` handler: serve pwrmgr the platform shutdown
 /// actuator caps. devmgr carves exactly what is asked for and runs no
 /// shutdown logic. x86-64: a narrow `IoPort` over the caller-supplied
-/// `PM1a` control port plus the 8042 reset port. RISC-V: a `cap_derive` copy
-/// of `SbiControl`. The caps are re-derived from the root on every call,
-/// so a pwrmgr restart re-acquires them cleanly.
+/// `PM1a` control port plus the 8042 reset port. RISC-V: a Reset-only
+/// `SbiControl` derivation. The caps are re-derived from devmgr's held
+/// caps on every call, so a pwrmgr restart re-acquires them cleanly.
 fn handle_query_shutdown_device(
     caps: &caps::DevmgrCaps,
     msg: &IpcMessage,
@@ -2017,7 +2017,7 @@ fn carve_uart_authority(caps: &mut caps::DevmgrCaps) -> Option<u32>
     ioport_carve(caps.ioport_root_cap, 0x3F8, 8)
 }
 
-/// Carve the platform RTC's hardware-authority cap out of devmgr's root
+/// Carve the platform RTC's hardware-authority cap out of devmgr's
 /// authority pool. The bases below are platform-static (legacy MC146818
 /// at ISA `0x70` on x86-64; QEMU virt goldfish-RTC at `0x101000` on
 /// RISC-V) and hardcoded here pending #165, which replaces all such
@@ -2070,9 +2070,9 @@ fn carve_uart_irq(irq_root: &mut IrqRootAllocator) -> Option<u32>
 }
 
 /// Carve a narrow `IoPort` of `count` ports starting at `base` out of
-/// the root `IoPort` cap via two `ioport_split` calls. Returns the
-/// narrow slot; the unused slabs are deleted. `cap_derive`-copies the root
-/// so it stays intact for further carves. Mirrors init's `ioport_carve`.
+/// devmgr's full-rights `IoPort` cap via two `ioport_split` calls. Returns
+/// the narrow slot; the unused slabs are deleted. `cap_derive`-copies the
+/// source so it stays intact for further carves. Mirrors init's `ioport_carve`.
 #[cfg(target_arch = "x86_64")]
 fn ioport_carve(root_cap: u32, base: u16, count: u16) -> Option<u32>
 {

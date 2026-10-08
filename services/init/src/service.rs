@@ -649,8 +649,8 @@ pub fn create_devmgr_with_caps(
     // from it for ISA peripherals like the CMOS RTC, and carves the PM1a +
     // 8042 ports for pwrmgr) and an `SbiControl` derivation narrowed to
     // Reset and Suspend on RISC-V (devmgr serves a Reset-only copy to
-    // pwrmgr for SBI SRST). The roots stay in init's `CSpace`. devmgr is the hardware authority; pwrmgr acquires its
-    // shutdown caps from devmgr, not from init.
+    // pwrmgr for SBI SRST). devmgr is the hardware authority; pwrmgr
+    // acquires its shutdown caps from devmgr, not from init.
     // SVCMGR_BUNDLE is unconditionally the terminal round. On any
     // preparation failure init MUST still emit a `done=true` round so
     // devmgr's bootstrap_rounds loop in `services/devmgr/src/caps.rs`

@@ -308,9 +308,9 @@ pub mod procmgr_labels
     pub const REGISTER_DEATH_EQ: u64 = 14;
 
     /// Badge bit on procmgr service caps that authorises
-    /// `REGISTER_DEATH_EQ`. Init derives this badged SEND cap and
-    /// hands it to real-logd at bootstrap; the un-badged or
-    /// differently-badged twins are rejected.
+    /// `REGISTER_DEATH_EQ`; un-badged or differently-badged callers are
+    /// rejected. Who holds it is in `services/procmgr/docs/ipc-interface.md`
+    /// § `REGISTER_DEATH_EQ`.
     pub const DEATH_EQ_AUTHORITY: u64 = 1u64 << 62;
 
     /// Hand init's kernel-object caps + reclaimable Memory caps to procmgr
@@ -1420,12 +1420,12 @@ pub mod devmgr_labels
     ///
     /// Reply ([`super::devmgr_errors::SUCCESS`]):
     /// - x86-64: `caps[0]` = a narrow `IoPort` over `[pm1a, pm1a+2)`
-    ///   carved from devmgr's root `IoPort`; `caps[1]` = a narrow
+    ///   carved from devmgr's full-rights `IoPort`; `caps[1]` = a narrow
     ///   `IoPort` over `[0x64, 0x65)` (8042 KBC reset, for reboot).
-    ///   Both are re-derived from the root on every call, so a pwrmgr
+    ///   Both are re-derived from it on every call, so a pwrmgr
     ///   restart re-acquires them cleanly.
-    /// - RISC-V: `caps[0]` = a `cap_derive` copy of devmgr's `SbiControl`
-    ///   cap (SBI SRST authority).
+    /// - RISC-V: `caps[0]` = a Reset-only derivation of devmgr's
+    ///   `SbiControl` cap (SBI SRST authority).
     ///
     /// Replies [`super::devmgr_errors::NO_DEVICE`] when the carve fails or
     /// the platform authority cap is absent.

@@ -214,10 +214,10 @@ A capability to a contiguous range of x86 I/O port numbers. Rights:
 - **Use** — may bind this port range to a thread, allowing that thread to execute
   `in`/`out` instructions for those ports without a syscall
 
-The kernel mints one root IoPort capability over the full 64K port space at boot
-(x86-64 only); IoPort capabilities are not creatable at runtime. Init hands devmgr a
-copy, and devmgr narrows it with `SYS_IOPORT_SPLIT` and gives each driver only its
-assigned port range (see
+The kernel mints one root IoPort capability over the full 64K port space at boot (x86-64 only);
+IoPort capabilities are not creatable at runtime. Init keeps the root and hands devmgr a full-rights
+derivation, and devmgr narrows it with `SYS_IOPORT_SPLIT` and gives each driver only its assigned
+port range (see
 [services/devmgr/docs/responsibilities.md](../services/devmgr/docs/responsibilities.md)).
 
 Revoking an IoPort capability removes port access from all threads it has

@@ -83,8 +83,8 @@ devmgr's responsibilities are:
   `QUERY_SHUTDOWN_DEVICE` carves the shutdown-actuator caps pwrmgr asks
   for — two narrow `IoPort` caps on x86-64, one over the PM1a control port
   (the port pwrmgr computed from the FADT) and one over the 8042 reset port,
-  or a `cap_derive` copy of `SbiControl` on RISC-V. The caps are re-derived
-  from devmgr's root caps on every call, so nothing is consumed and a
+  or a Reset-only `SbiControl` derivation on RISC-V. The caps are re-derived
+  from the `IoPort` / `SbiControl` caps devmgr holds on every call, so nothing is consumed and a
   restarted pwrmgr re-acquires them cleanly. devmgr runs no shutdown logic;
   it brokers the hardware, pwrmgr interprets and actuates. Both are gated on
   `REGISTRY_QUERY_AUTHORITY`.

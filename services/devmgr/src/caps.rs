@@ -152,9 +152,8 @@ pub struct DevmgrCaps
     pub driver_module_count: usize,
 
     // SEND cap on svcmgr's service endpoint with `PUBLISH_AUTHORITY`
-    // badged on. Reserved for devmgr-initiated publications; the active
-    // svcmgr publications (`timed`, `rootfs.root`, `pwrmgr.*`, `svcmgr`,
-    // `devmgr.registry`) are init-issued.
+    // badged on. Reserved for devmgr-initiated publications; svcmgr
+    // publishes the active well-known names itself.
     pub svcmgr_publish_cap: u32,
 
     // Full-rights derivation of init's root `IoPort` cap (x86-64 only;

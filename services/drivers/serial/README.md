@@ -36,7 +36,7 @@ delegates the per-device arch authority cap — an `IoPort` on x86-64,
 an `Mmio` on RISC-V — plus the UART interrupt cap (COM1 is ISA IRQ 4; the QEMU `virt` NS16550
 is PLIC source 10). The driver owns those caps end-to-end. Outside the driver, UART authority
 is held only by init (used by its init-logd thread, the direct-UART path until the real-logd
-handover) and by devmgr (the root `IoPort` / `Mmio` authority it carves the driver's cap
+handover) and by devmgr (the `IoPort` / `Mmio` caps it carves the driver's cap
 from), per [console-model.md](../../../docs/console-model.md#ownership-across-the-boot-lifecycle).
 The interrupt cap is optional: without it the driver still answers reads (RX then relies on
 the client's bounded poll) but `SERIAL_REGISTER_RX_NOTIFY` reports `REGISTER_FAILED`.

@@ -67,10 +67,12 @@ SECTIONS
         *(.dynstr)
     }
 
-    /* lld flags .dynamic/.got SHF_WRITE, so they form an RW program header
-       even though nothing writes them after the bootloader's relocation
-       pass; page alignment keeps that header 4 KiB-clean for the loader.
-       Phase 3 remaps them read-only via [__rodata_start, __rodata_end). */
+    /*
+     * lld flags .dynamic/.got SHF_WRITE, so they form an RW program header
+     * even though nothing writes them after the bootloader's relocation
+     * pass; page alignment keeps that header 4 KiB-clean for the loader.
+     * Phase 3 remaps them read-only via [__rodata_start, __rodata_end).
+     */
     .dynamic ALIGN(4K) :
     {
         *(.dynamic)

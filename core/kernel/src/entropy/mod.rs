@@ -156,7 +156,7 @@ mod imp
             pool::absorb(boot_seed);
             seeded = true;
             crate::kprintln!(
-                "entropy: seeded from firmware RNG (boot seed, {} bytes)",
+                "entropy: seeded from boot seed ({} bytes)",
                 boot_seed.len()
             );
         }

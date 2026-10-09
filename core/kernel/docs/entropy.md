@@ -222,7 +222,7 @@ own — and it hands the bootloader ACPI, not a DTB, so the QEMU-authored DTB
 through it. The default QEMU boot set therefore includes `virtio-rng-pci` on both
 arches (added for KASLR, [#252](https://github.com/kottlerg/seraph/issues/252)),
 which closes the riscv64 boot-entropy hole: the boot log shows
-`entropy: seeded from firmware RNG (boot seed, N bytes)` on riscv64. Where no such
+`entropy: seeded from boot seed (N bytes)` on riscv64. Where no such
 device is present, riscv64 falls back to jitter only — narrowed continuously at
 runtime by the timer-tick jitter hook, which feeds a fresh sample into each CPU's
 accumulator on every tick (and per device IRQ). The bootloader also keeps a DTB
@@ -340,7 +340,7 @@ continuous validator.
   fail-regex
   ([xtask/README.md § run-parallel](../../../xtask/README.md#cargo-xtask-run-parallel)),
   turning a QEMU run red on either architecture. Validated on
-  x86_64 (firmware-seeded — `entropy: seeded from firmware RNG` — since OVMF
+  x86_64 (firmware-seeded — `entropy: seeded from boot seed` — since OVMF
   implements `EFI_RNG_PROTOCOL`) and riscv64 (firmware-seeded through
   `VirtioRngDxe` with the default boot set's `virtio-rng`; jitter-only without
   it).

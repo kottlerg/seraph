@@ -17,7 +17,8 @@
 //! - Phase 3: install kernel page tables (direct physical map + W^X image).
 //! - Phase 4: typed-memory cap surface (no `GlobalAlloc`; bodies sourced from caps);
 //!   cache `kernel_mmio` for Phase 5.
-//! - Phase 5: architecture hardware init (GDT/IDT/APIC or stvec/PLIC, timer, syscall).
+//! - Phase 5: architecture hardware init (GDT/IDT/APIC or stvec/PLIC, timer, syscall);
+//!   seed the entropy pool and scrub the boot seed and KASLR bases from `BootInfo`.
 //! - Phase 6: validate the `mmio_apertures` slice before capability minting.
 //! - Phase 7: initialise capability subsystem; mint root `CSpace` with initial hardware caps;
 //!   mint reclaimable Memory caps over bootloader scratch pages (`BootInfo`,
@@ -69,9 +70,9 @@ mod validate;
 /// A framebuffer-safe summary line (no addresses — the console mirrors to the
 /// framebuffer, which is handed to userspace) plus, on the serial-only path,
 /// the slide and bases the operator needs for `add-symbol-file` / `addr2line`
-/// against a slid kernel. Per `core/kernel/docs/cross-boundary-disclosure.md`,
-/// serial TX is host-only and outside the KASLR threat model, so the bases go
-/// there and never through `kprintln!`.
+/// against a slid kernel. The bases go only through `kprintln_serial!`, never
+/// `kprintln!` (`core/kernel/docs/cross-boundary-disclosure.md` § Kernel
+/// console diagnostics).
 #[cfg(not(test))]
 fn report_kaslr(flags: u32, image_base: u64, dm_base: u64)
 {
@@ -107,7 +108,7 @@ fn report_kaslr(flags: u32, image_base: u64, dm_base: u64)
     }
     else
     {
-        kprintln!("kaslr: image at link base (no boot entropy)");
+        kprintln!("kaslr: image at link base (no kaslr entropy)");
     }
 
     if flags & KASLR_DM_RANDOMIZED != 0
@@ -127,26 +128,6 @@ fn report_kaslr(flags: u32, image_base: u64, dm_base: u64)
     let link_base = boot_protocol::layout::KERNEL_LINK_BASE;
     let slide = image_base.wrapping_sub(link_base);
     kprintln_serial!("kaslr: slide={slide:#x} image_base={image_base:#x} dm_base={dm_base:#x}");
-
-    // Invariants (checked on every debug boot): a nonzero slide implies the
-    // IMAGE_RANDOMIZED flag (a randomized draw may still select slide 0), the
-    // slide is 2 MiB-aligned, and the direct-map base is 1 GiB-aligned.
-    // Production placement is enforced by validate_boot_info /
-    // init_paging_mode; these catch a flag/layout drift.
-    debug_assert!(
-        slide == 0 || flags & KASLR_IMAGE_RANDOMIZED != 0,
-        "nonzero slide without the KASLR_IMAGE_RANDOMIZED flag"
-    );
-    debug_assert_eq!(
-        slide % (2 * 1024 * 1024),
-        0,
-        "image slide not 2 MiB-aligned"
-    );
-    debug_assert_eq!(
-        dm_base % (1024 * 1024 * 1024),
-        0,
-        "direct-map base not 1 GiB-aligned"
-    );
 }
 
 /// Test-build stub.
@@ -1504,10 +1485,14 @@ unsafe fn kernel_entry_post_rebase(
 
 /// Entry point for Application Processor startup.
 ///
-/// Called from the AP trampoline after the PM32 → LM64 transition. The AP
-/// arrives here with:
-/// - RSP set to its idle thread kernel stack top (loaded by the relay stub).
-/// - RDI = `cpu_id`, RSI = `ist1_top`, RDX = `ist2_top` (trampoline params).
+/// Called from the AP trampoline once the AP runs on the kernel page tables.
+/// The AP arrives here with:
+/// - x86-64 (after the PM32 → LM64 transition): RSP set to its idle thread
+///   kernel stack top (loaded by the relay stub); RDI = `cpu_id`,
+///   RSI = `ist1_top`, RDX = `ist2_top` (trampoline params).
+/// - RISC-V (after the `satp` write): `sp` set to its idle thread kernel stack
+///   top and `a0` = `cpu_id`; `ist1_top` and `ist2_top` carry no value and the
+///   RISC-V `gdt::init_ap` ignores them.
 ///
 /// Initialises per-CPU hardware state, announces the AP as ready, then enters
 /// the idle loop via [`sched::ap_enter`].

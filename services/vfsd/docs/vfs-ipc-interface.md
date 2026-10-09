@@ -10,21 +10,23 @@ the synthetic-root composition that backs it is described in
 
 The system-root cap is requested by init via
 [`vfsd_labels::GET_SYSTEM_ROOT_CAP`]. vfsd self-mounts root before any
-service thread starts, and replies `NO_MOUNT` to this request until
-root is mounted, so the pull blocks until the root filesystem is up
-(and fails fast — letting init FATAL — if the self-mount failed).
-Vfsd derives a fresh badged SEND on its own namespace endpoint
-addressing `NodeId::ROOT` at full namespace rights and replies with
-it. Init holds the cap as the seed for all later tier-3 namespace-cap
+service thread starts receiving, so the pull blocks until the root
+filesystem is up; if the self-mount failed, vfsd replies `NO_MOUNT`
+and init FATALs. Vfsd derives a fresh badged SEND on its own namespace
+endpoint addressing `NodeId::ROOT` at full namespace rights and replies
+with it. Init holds the cap as the seed for all later namespace-cap
 distribution; children of init receive a `cap_copy` of it via
-`procmgr_labels::CONFIGURE_NAMESPACE`. Clients consume it via
+`procmgr_labels::CONFIGURE_NAMESPACE` (see
+[services/init/docs/bootstrap.md](../../init/docs/bootstrap.md#root-acquisition)).
+Clients consume it via
 `std::os::seraph::root_dir_cap()`. Vfsd holds no namespace cap on
 procmgr's behalf — there is no boot-time push.
 
-vfsd self-mounts the Seraph root partition at `/` and the EFI System
-Partition at `/esp` at startup; additional partitions are discovered by
-their type GUID, not by a config file. Label `12` on the service endpoint
-is reserved and MUST NOT be reused for an unrelated request.
+vfsd self-mounts the Seraph root partition at `/` at startup, then mounts the EFI System
+Partition at `/esp` and the data partition at `/data` (both best-effort); additional partitions
+are discovered by their type GUID, not by a config file (see
+[docs/storage.md](../../../docs/storage.md#gpt-role-guid-discovery)).
+Label `12` on the service endpoint is reserved and MUST NOT be reused for an unrelated request.
 
 ---
 
@@ -33,7 +35,8 @@ is reserved and MUST NOT be reused for an unrelated request.
 vfsd holds the receive side of one un-badged service endpoint,
 created and delivered by init at vfsd's bootstrap (round 1, `caps[0]`).
 Init holds a badged `SEED_AUTHORITY` SEND for `GET_SYSTEM_ROOT_CAP`
-during boot; it issues no `MOUNT`, since vfsd self-mounts root.
+during boot; it issues no `MOUNT`, since vfsd self-mounts root (see
+[services/init/docs/bootstrap.md](../../init/docs/bootstrap.md#per-stage-authority-transfers)).
 
 All requests use `SYS_IPC_CALL` (synchronous call/reply). Numeric
 labels live in [`ipc::vfsd_labels`] in `shared/ipc`.
@@ -53,12 +56,20 @@ for the root role, arch-neutral for data; see
 [`services/vfsd/src/role_guids.rs`](../src/role_guids.rs)),
 looks the partition up in its parsed GPT table via
 [`gpt::lookup_partition_by_type_guid`](../gpt/src/lib.rs) (DPS-style
-priority tie-break on attribute bits 48-63; tied priorities are
-fatal), registers the partition bound with virtio-blk, spawns a fatfs
-driver, sends `FS_MOUNT` to validate the BPB, captures the driver's
+priority tie-break on attribute bits 48-63; a tie at the highest
+priority is rejected with `NO_MOUNT` (fatal only for the root
+self-mount); see [docs/storage.md](../../../docs/storage.md#gpt-role-guid-discovery)),
+registers the partition bound with virtio-blk, spawns a fatfs
+driver, sends `FS_MOUNT` (see
+[services/fs/docs/fs-driver-protocol.md](../../fs/docs/fs-driver-protocol.md))
+to validate the BPB, captures the driver's
 root cap into [`VfsdRootBackend`], and replies with a badged SEND on
 the new filesystem's namespace endpoint addressing its root. A mount
-on `/` is rejected (`NO_MOUNT`) once root is already mounted.
+on `/` once root is already mounted is rejected (`TABLE_FULL`) at the
+install step. The partition registration and fatfs spawn run before that
+step and are not undone, so the registration leaks and the spawned fatfs
+driver is left orphaned; see
+[#452](https://github.com/kottlerg/seraph/issues/452).
 
 When the requested role is the rootfs (`MountRole::Root`, byte `0`),
 vfsd additionally auto-mounts the EFI System Partition at `/esp` and
@@ -67,7 +78,8 @@ the same logic the startup self-mount uses. Both auto-mounts are
 best-effort: a missing or duplicate-priority partition logs a
 diagnostic and is skipped (leaving `/esp` / `/data` to resolve through
 the root-fs fall-through) without propagating into the root mount
-reply. The ESP is identified by the standard EFI System Partition type
+reply (see [docs/storage.md](../../../docs/storage.md#gpt-role-guid-discovery)).
+The ESP is identified by the standard EFI System Partition type
 GUID (`c12a7328-f81f-11d2-ba4b-00a0c93ec93b`); the data partition by
 the arch-neutral `SERAPH_DATA` GUID.
 
@@ -89,9 +101,9 @@ the arch-neutral `SERAPH_DATA` GUID.
 
 **Reply (error)**: `label = vfsd_errors::*` (`NOT_FOUND` for an
 unknown role byte or invalid path length, `NO_MOUNT` if no partition
-matches the role GUID, if duplicate-priority partitions are detected,
-or if root is already mounted, `SPAWN_FAILED`, `IO_ERROR`,
-`TABLE_FULL`).
+matches the role GUID or if duplicate-priority partitions are detected,
+`SPAWN_FAILED`, `IO_ERROR`, `TABLE_FULL` if the synthetic-root install
+fails, including when root is already mounted).
 
 Single-component mount paths only (`/`, `/<name>`). Multi-component
 paths are not surfaced through `NS_LOOKUP` and remain reachable only
@@ -113,4 +125,8 @@ via the root mount's transparent delegation.
 
 ## Summarized By
 
-[services/vfsd/README.md](../README.md), [docs/storage.md](../../../docs/storage.md)
+[Storage](../../../docs/storage.md),
+[Filesystem Driver Protocol](../../fs/docs/fs-driver-protocol.md),
+[services/init/README.md](../../init/README.md),
+[init Bootstrap Stages](../../init/docs/bootstrap.md), [services/vfsd/README.md](../README.md),
+[Synthetic Root and Namespace Composition](namespace-composition.md)

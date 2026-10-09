@@ -18,8 +18,8 @@ Three harnesses exercise three surfaces:
 | Harness | Surface | Crate | Launch mechanism |
 |---|---|---|---|
 | `ktest` | Kernel | [`core/ktest/`](../core/ktest/README.md) | Bootloader-loaded init replacement (`cargo xtask compose-bundle --harness ktest`) |
-| `svctest` | Services | `services/svctest/` | `svcmgr` spawns from `/config/svcmgr/services/` recipe |
-| `usertest` | Programs | [`services/usertest/`](../services/usertest/README.md) | `svcmgr` spawns from `/config/svcmgr/services/` recipe; drives binaries under `programs/` through their real I/O surfaces. Also hosts the terminal interactive test (`cargo xtask test-terminal`), which drives the autostarted terminal through both input sources — keys over QMP through the live virtio-input driver, then the same sequence over the guest serial RX |
+| `svctest` | Services | [`services/svctest/`](../services/svctest/README.md) | `svcmgr` spawns from `/config/svcmgr/services/` recipe |
+| `usertest` | Programs | [`services/usertest/`](../services/usertest/README.md) | `svcmgr` spawns from `/config/svcmgr/services/` recipe; drives binaries under `programs/` through their real I/O surfaces. The terminal interactive test (`cargo xtask test-terminal`) runs as a separate boot in the `usertest` CI cell; it drives the autostarted terminal through both input sources — keys over QMP through the live virtio-input driver, then the same sequence over the guest serial RX |
 
 `ktest` and `svctest` are authoritative for their own surface; the harness
 itself owns its phases. `usertest` is an orchestrator that runs per-program
@@ -77,10 +77,9 @@ program opt in or skip; absence is the default.
 
 - The tester binary MUST exit `0` on pass and non-zero on fail.
 - The tester binary's exit code is the authoritative verdict. Seraph propagates
-  it natively: `sys_process_exit` encodes the code into the calling thread's
-  exit reason via `syscall_abi::encode_exit_code` (codes `1..0x0FFF`, saturating),
-  which the orchestrator reads through `ExitStatus::success()`/`code()`. This is a
-  native flat encoding, not POSIX `WEXITSTATUS` — no 8-bit truncation.
+  it natively, without POSIX 8-bit truncation (see
+  [syscalls.md § `SYS_PROCESS_EXIT`](../core/kernel/docs/syscalls.md#sys_process_exit-54));
+  the orchestrator reads it through `ExitStatus::success()`/`code()`.
 - The tester SHOULD emit a final stdout line `[<name>-tester] PASS` or
   `[<name>-tester] FAIL` for log readability. The orchestrator does not
   rely on this line for the verdict.
@@ -97,27 +96,45 @@ program opt in or skip; absence is the default.
 sysroot/
 ├── services/                 # long-running userspace services
 │   ├── …
-│   ├── drivers/              # device drivers (cmos-rtc, goldfish-rtc,
-│   │                         # virtio-blk)
+│   ├── drivers/              # device drivers (virtio-blk, virtio-input,
+│   │                         # serial, framebuffer, cmos-rtc | goldfish-rtc,
+│   │                         # and the test-only test-orphan)
 │   └── fs/                   # filesystem drivers (fatfs)
-├── programs/                 # production and interactive program binaries
+├── programs/                 # program binaries and the test fixtures the
+│                             # harnesses spawn
 │   ├── hello
 │   ├── stdiotest
 │   └── …
-└── tests/                    # every test artifact (deletion criterion
-    │                         # for a non-test distro shape)
+└── tests/                    # test harnesses, per-program testers, and
+    │                         # harness-only fixtures
     ├── ktest                 # kernel-surface harness (bootloader-loaded)
     ├── svctest               # services-surface harness
     ├── usertest              # programs-surface orchestrator
+    ├── crasher               # svcmgr restart-path fixture
     └── programs/
         ├── hello             # per-program tester for /programs/hello
         ├── stdiotest         # per-program tester for /programs/stdiotest
         └── …
 ```
 
-`/services/`, `/programs/` MUST NOT contain test harnesses or per-program
-testers — all test artifacts live under `/tests/` so a non-test distro
-build amounts to dropping `/tests/`.
+`/services/` and `/programs/` MUST NOT contain test harnesses or per-program
+testers; those live under `/tests/`. Dropping `/tests/` does not by itself
+give a non-test distro, because test-only artifacts also install under
+`/services/drivers/`, `/programs/`, `/config/svcmgr/tests/`, and `/data/`.
+Under `/services/drivers/` is
+[`test-orphan`](../services/drivers/test-orphan/README.md), a test-only
+fault-injection driver installed there until the devmgr enumeration
+redesign ([#165](https://github.com/kottlerg/seraph/issues/165)) removes
+it. Under `/programs/` are the test fixtures the harnesses and per-program
+testers spawn: `capexhaust`, `demandpaged`, `fsbench`, `pipefault`, `pipestress`,
+`relrofault`, `stackoverflow`, `stdiotest`, `threadchurn`, and `threadstack`. Which
+consumer spawns or drives each one is owned by
+[services/svctest/README.md § Fixtures](../services/svctest/README.md#fixtures) for
+`svctest` phases and by each fixture's README (`programs/<name>/README.md`) for every
+per-program tester that drives it. Under `/config/svcmgr/tests/` are the harness
+recipes (see [Gating](#gating)). Under `/data/` are `/data/test.txt`, a fixture shared
+by `svctest` and the `shell` tester, and the build-synthesised `svctest`-only fixtures
+`/data/svctest/large.bin` and `/data/svctest/bench.bin`.
 
 ---
 
@@ -145,12 +162,15 @@ rootfs/config/svcmgr/
 ```
 
 To enable a harness for a boot, copy its recipe from
-`sysroot/config/svcmgr/tests/` into `sysroot/config/svcmgr/services/`
-between `cargo xtask build` and `cargo xtask run`:
+`sysroot/config/svcmgr/tests/` into `sysroot/config/svcmgr/services/` after
+`cargo xtask build`, then repack with `cargo xtask mkdisk --repack-only` before
+`cargo xtask run` (`run` boots the existing `disk.img`, and a normal `mkdisk`
+re-mirror prunes the hand-staged recipe):
 
 ```sh
 cargo xtask build
 cp sysroot/config/svcmgr/tests/svctest.svc sysroot/config/svcmgr/services/
+cargo xtask mkdisk --repack-only
 cargo xtask run
 ```
 
@@ -181,7 +201,8 @@ to one reader. So input is tested *through* the terminal.
 
 `cargo xtask test-terminal` boots QEMU with a QMP control socket, waits for the
 terminal's `terminal: READY for injection` marker, then drives both input
-sources in one boot:
+sources in one boot (command reference:
+[xtask/README.md § test-terminal](../xtask/README.md#cargo-xtask-test-terminal)):
 
 1. **Keyboard round** — inject a known key sequence via QMP `input-send-event`
    (through the live `virtio-keyboard-pci`), assert the terminal's local echo
@@ -209,9 +230,8 @@ cargo xtask test-terminal
 This is the reusable foundation for interactive tests of the terminal, the
 shell (#112), and future consumers — they reuse the runner by swapping the
 terminal's child and the expected strings. It subsumes the keysym-decode
-coverage of the former standalone input smoke test: the echoed `a` vs `A`
-proves lowercase/shifted decode, the absence of stray bytes proves
-modifier-event filtering, and Return/Backspace prove the named-key decodes. In
+coverage of the former standalone input smoke test: the echoed `help` proves
+lowercase keysym decode, and Return/Backspace prove the named-key decodes. In
 CI it runs as a second boot inside the `usertest` cell (after usertest's own
 run), rather than as a separate matrix dimension that would multiply with each
 arch.
@@ -230,11 +250,16 @@ VMGENID) drives QEMU's save/restore recipe host-side:
 2. Save the guest via QMP `migrate` to a state file; `quit` the source
    (releasing the raw disk image's write lock).
 3. Boot again with a different GUID and `-incoming exec:cat <state>`; assert
-   the kernel's `entropy: VM generation change detected` marker — the same
-   GUID compare every draw performs before producing output.
+   the kernel's `entropy: VM generation change detected` marker — printed by the
+   BSP timer tick's poll of the same live GUID (the per-draw reseed compare is
+   separate; see [core/kernel/docs/entropy.md](../core/kernel/docs/entropy.md)).
 4. Inject the terminal `help` sequence over QMP and assert the shell's output:
    the resumed guest still draws randomness and schedules normally after the
    forced reseed.
+
+See [xtask/README.md § test-vmgenid](../xtask/README.md#cargo-xtask-test-vmgenid)
+for the command and [core/kernel/docs/entropy.md](../core/kernel/docs/entropy.md)
+for the snapshot-detection design.
 
 Same boot requirements as `test-terminal` (default boot set, terminal
 autostarted); the host computes the verdict and kills QEMU. In CI it runs as
@@ -255,11 +280,15 @@ arches) drives this host-side against the ktest bundle:
    and assert the deterministic layout (slide 0, image at its link base, direct
    map at the mode floor); the KASLR-enabled image is always restored afterward.
 
+See [xtask/README.md § test-kaslr](../xtask/README.md#cargo-xtask-test-kaslr) for
+the command and [memory-model.md](memory-model.md) for the randomized layout.
+
 Requires a populated sysroot with the ktest bundle composed
-(`cargo xtask compose-bundle --harness ktest`). The `kaslr:` line is serial-only
-(never framebuffer), so the values it carries never reach userspace. In CI it runs
-as extra boots inside each `ktest` cell (both arches, both profiles), after the
-`ktest` run-parallel boot.
+(`cargo xtask compose-bundle --harness ktest`). The `kaslr:` line is emitted only
+through the kernel's serial-only console class (see
+[cross-boundary-disclosure.md § Kernel console diagnostics](../core/kernel/docs/cross-boundary-disclosure.md#kernel-console-diagnostics)).
+In CI it runs as extra boots inside each `ktest` cell (both arches, both
+profiles), after the `ktest` run-parallel boot.
 
 ### One shutdown-invoking harness per boot
 
@@ -282,10 +311,11 @@ default service set, the harness staging removes it and repacks with
 which would restore it). The terminal is exercised in its own boot
 (`test-terminal`) and runs in the real default boot.
 
-CI matrix cells follow these rules per boot. The `usertest` cell runs two
+CI matrix cells follow these rules per boot. The `usertest` cell runs its
 boots in sequence — `usertest` (via `run-parallel`, terminal dropped), then
 the terminal interactive test (via `test-terminal`) after dropping
-`usertest.svc` and repacking to restore the default boot (terminal present).
+`usertest.svc` and repacking to restore the default boot (terminal present),
+then on x86_64 the `test-vmgenid` save/restore boot pair.
 The terminal test boot has *no* shutdown-invoking harness: `test-terminal`
 computes the verdict host-side and kills QEMU itself.
 
@@ -316,7 +346,7 @@ cells automatically; variants belong to the tiers below.
 | Tier | Where | When | Coverage |
 |---|---|---|---|
 | Canonical | `build-test.yml` | every push / PR | full arch × profile × harness at the fixed defaults |
-| Burn-in | `burnin.yml` | tag push; manual dispatch on any ref | canonical cells × 20 iterations, 2-way parallel |
+| Burn-in | `burnin.yml` | tag push; manual dispatch on any ref | each canonical arch × profile × harness `run-parallel` boot × 20 iterations, 2-way parallel (no `crasher` co-staging, no host-driven `test-*` boots) |
 | Local host runs | developer host, commands below | REQUIRED for PRs touching SMP, per-CPU, IPI, scheduler-wakeup, boot, or memory-init paths | CPU-count and memory variations CI runners cannot reach |
 
 **Why local-only.** Hosted CI runners are ~4-vCPU TCG-only machines; a
@@ -347,8 +377,9 @@ cargo xtask run-parallel --arch <arch> --cpus 4 --mem 1024 --parallel 1 --runs 1
 ```
 
 PRs touching the surfaces that only matter above 256 CPUs — `core/kernel/src/mm/`,
-x86_64 AP bringup (`arch/x86_64/ap_trampoline.rs`, `arch/x86_64/gdt.rs`, the
-APIC/IPI paths in `arch/x86_64/interrupts.rs`), or per-CPU slab sizing
+x86_64 AP bringup (`core/kernel/src/arch/x86_64/ap_trampoline.rs`,
+`core/kernel/src/arch/x86_64/gdt.rs`, the APIC/IPI paths in
+`core/kernel/src/arch/x86_64/interrupts.rs`), or per-CPU slab sizing
 (`sched::alloc_zeroed_slab` and its call sites) — MUST additionally run the
 full-width x86_64 boundary below. This trigger list is deliberately narrow;
 other SMP PRs stay on the 256-vCPU mandate above.
@@ -410,17 +441,18 @@ list as the tracking Issues move):
   claimed — independent of guest memory size. The kernel image is now placed as
   one contiguous span allocated anywhere (`AllocateAnyPages`), so loading
   tolerates any firmware layout; `validate_kernel_layout` enforces the
-  relocation invariants (single offset, alignment, non-overlap, entry-in-image)
-  at load time. 128 harts now boots clean (3×, ~475 s/run at 8× hart
-  oversubscription on a 16-core host). The residual ceiling is upstream and
-  pre-bootloader: at 192, 256, and 512 harts under TCG the edk2 firmware emits
+  [relocation invariants](../core/boot/docs/elf-loading.md#elf-validation) (single
+  offset, alignment, non-overlap, entry-in-image) at load time. 128 harts now
+  boots clean (3×, ~475 s/run at 8× hart oversubscription on a 16-core host).
+  The residual ceiling is upstream and pre-bootloader: at 192, 256, and 512
+  harts under TCG the edk2 firmware emits
   no serial output at all (192: nothing in 60 min; 256/512: nothing in 20/30
   min) — an MP-init crawl that runs before Seraph's bootloader and cannot be
   addressed in-tree. High-hart cross-architecture parity is therefore
   theoretical, with real testing on hold pending faster firmware, KVM-capable
   RISC-V emulation, or real hardware.
 - Both arches, high CPU counts ([#375](https://github.com/kottlerg/seraph/issues/375),
-  fixed): the intermittent silent wedge around the `thread::load_balancer`
+  fixed): the intermittent silent wedge around the `thread::load_balancer_*`
   and `stress::double_enqueue_storm` tests was a load-balancer ticket-lock
   convoy — every idle CPU queuing interrupts-off on one victim's run-queue
   lock every tick; the pull path now try-locks and backs off. A new silent
@@ -435,7 +467,8 @@ list as the tracking Issues move):
   ≈512 at 4 GiB) and overflowed the `INIT_INFO_MAX_PAGES = 4` (16 KiB) Phase-9
   InitInfo region — independent of where the kernel image is placed.
   `drain_and_install_seed` now coalesces physically-adjacent drained blocks
-  into the fewest contiguous Memory caps before minting, so the descriptor
+  into the fewest contiguous Memory caps before minting (see
+  [process-lifecycle.md § Kernel → init](process-lifecycle.md#kernel--init)), so the descriptor
   count tracks memory-map fragmentation (a small fixed number of usable extents
   plus reservation holes), not total RAM. The Phase-9 size check now logs the
   descriptor count, page need, and `INIT_INFO_MAX_PAGES` before fatal-ing, so
@@ -447,6 +480,11 @@ list as the tracking Issues move):
 
 ## Cross-harness conventions
 
+These conventions apply to harnesses launched as svcmgr services (`svctest`,
+`usertest`); `ktest`, the init replacement, has no recipe and powers off directly
+via ACPI (x86_64) or SBI (riscv64) per `KtestConfig::DEFAULT.shutdown_policy`
+(see [core/ktest/README.md § Shutdown](../core/ktest/README.md#shutdown)).
+
 - **Completion behavior.** A harness MUST request `pwrmgr` shutdown when
   it finishes (pass or fail). This terminates the QEMU instance and lets
   CI move on. Harnesses launched as services obtain the shutdown
@@ -457,9 +495,9 @@ list as the tracking Issues move):
 - **Critical class.** A harness MUST set `critical = no`. Harness death
   MUST NOT bring down the supervisor or trip the graceful-shutdown path.
 - **Capability seeding.** A harness depends only on seeds declared in
-  its `.svc` recipe. The harness MUST log its own seed-resolution state
-  before running tests, so failures attributable to missing capabilities
-  are diagnosable.
+  its `.svc` recipe. A test that needs a seed the bootstrap round did not
+  deliver MUST log the missing seed when it skips or fails, so failures
+  attributable to missing capabilities are diagnosable.
 
 ---
 
@@ -479,11 +517,25 @@ note in full.
 
 ## Summarized By
 
-[Conventions](conventions.md), [Root README](../README.md),
-[core/ktest/README.md](../core/ktest/README.md),
-[services/svcmgr/README.md](../services/svcmgr/README.md),
-[services/usertest/README.md](../services/usertest/README.md),
-[programs/terminal/README.md](../programs/terminal/README.md),
+[README.md](../README.md), [Kernel Entropy Subsystem](../core/kernel/docs/entropy.md),
+[core/ktest/README.md](../core/ktest/README.md), [Build System](build-system.md),
+[Console Model](console-model.md), [Project Conventions](conventions.md),
+[programs/capexhaust/README.md](../programs/capexhaust/README.md),
+[programs/demandpaged/README.md](../programs/demandpaged/README.md),
+[programs/fsbench/README.md](../programs/fsbench/README.md),
+[programs/hello/README.md](../programs/hello/README.md),
+[programs/pipefault/README.md](../programs/pipefault/README.md),
+[programs/pipestress/README.md](../programs/pipestress/README.md),
+[programs/relrofault/README.md](../programs/relrofault/README.md),
 [programs/shell/README.md](../programs/shell/README.md),
-[core/kernel/docs/entropy.md](../core/kernel/docs/entropy.md),
-[xtask/README.md](../xtask/README.md)
+[programs/stackoverflow/README.md](../programs/stackoverflow/README.md),
+[programs/stdiotest/README.md](../programs/stdiotest/README.md),
+[programs/terminal/README.md](../programs/terminal/README.md),
+[programs/threadchurn/README.md](../programs/threadchurn/README.md),
+[programs/threadstack/README.md](../programs/threadstack/README.md),
+[services/crasher/README.md](../services/crasher/README.md),
+[services/pwrmgr/README.md](../services/pwrmgr/README.md),
+[services/svcmgr/README.md](../services/svcmgr/README.md),
+[Restart Protocol](../services/svcmgr/docs/restart-protocol.md),
+[services/svctest/README.md](../services/svctest/README.md),
+[services/usertest/README.md](../services/usertest/README.md), [xtask/README.md](../xtask/README.md)

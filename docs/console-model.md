@@ -9,25 +9,31 @@ mediated by per-device drivers.
 ## Ownership across the boot lifecycle
 
 Console output passes through a sequence of owners as the system comes up.
-Each owner is authoritative for its window; later owners do not retract the
-earlier ones, which remain as fallbacks.
+Each owner is authoritative for its window. The bootloader console's window ends at the
+kernel handoff, and init-logd's ends at the real-logd handover (item 3); only the kernel's
+direct console paths remain as fallbacks for the life of the system.
 
 1. **Bootloader early console** — `core/boot/src/console.rs` drives the UART
    and framebuffer directly during UEFI boot, before the kernel exists. On
    RISC-V the UART base is discovered via ACPI SPCR
-   (`core/boot/src/arch/riscv64/acpi_spcr.rs`); on x86-64 it is COM1 at I/O
-   port `0x3F8`. The framebuffer base is discovered via UEFI GOP and
-   captured into `BootInfo.framebuffer` before `ExitBootServices` — GOP's
-   active framebuffer identity is unreachable from any later component, so
-   the bootloader is the only entity that can carry the geometry forward.
+   (`core/boot/src/arch/riscv64/acpi_spcr.rs`), then the Device Tree, falling back to the QEMU
+   `virt` default `0x10000000` (discovery order per
+   [Early Console § Serial Backend](../core/boot/docs/console.md#serial-backend)); on x86-64 it
+   is COM1 at I/O port `0x3F8`. The framebuffer base is discovered via UEFI GOP and captured
+   into `BootInfo.framebuffer` before `ExitBootServices` — GOP's active framebuffer identity is
+   unreachable from any later component, so the bootloader is the only entity that can carry the
+   geometry forward.
 
 2. **Kernel early console** — `core/kernel/src/console.rs` (plus
    `core/kernel/src/framebuffer.rs`) owns `kprint!`/`kprintln!` and the panic
    path. It writes the UART directly and **retains** that direct access for the
    life of the system: panics and pre-userspace diagnostics must not depend on
-   userspace IPC. The kernel framebuffer renderer is similarly **retained**
-   as the panic console. The kernel never becomes a client of the userspace
-   serial or framebuffer driver.
+   userspace IPC. The kernel framebuffer renderer is similarly **retained**: it carries the
+   mirrored `kprintln!` console, including the address-free header line of a fatal
+   `KERNEL EXCEPTION` dump, while the panic path itself is serial-only
+   (`console::panic_write_fmt`). The dump's kernel-address lines also reaching the screen is
+   an open defect ([#440](https://github.com/kottlerg/seraph/issues/440)), not a design goal.
+   The kernel never becomes a client of the userspace serial or framebuffer driver.
 
    A **serial-only class** of kernel output writes the UART but skips the
    framebuffer: the spin-locking `kprintln_serial!` / `console::serial_write_fmt`
@@ -36,12 +42,11 @@ earlier ones, which remain as fallbacks.
    exists because `kprintln!` *mirrors* to the framebuffer, and although the
    kernel writes that framebuffer directly rather than as a driver client, the
    framebuffer memory is later handed to the userspace framebuffer driver — so
-   anything `kprintln!` draws can be read back by userspace. Secrets that must
-   not cross that boundary — the KASLR image base, direct-map base, and slide
-   ([#252](https://github.com/kottlerg/seraph/issues/252)), and every kernel
-   virtual address, since each lies in a region KASLR randomizes — go through
-   the serial-only class only. See
-   [cross-boundary-disclosure.md](../core/kernel/docs/cross-boundary-disclosure.md).
+   anything `kprintln!` draws can be read back by userspace. Which kernel output must use the
+   serial-only class, and the paths that still print kernel addresses through `kprintln!`
+   ([#440](https://github.com/kottlerg/seraph/issues/440)), are specified in
+   [core/kernel/docs/cross-boundary-disclosure.md](../core/kernel/docs/cross-boundary-disclosure.md)
+   § Kernel console diagnostics.
 
 3. **init-logd direct-UART fallback** — during early userspace boot, the
    init-logd thread (a second thread of the init process,
@@ -51,34 +56,43 @@ earlier ones, which remain as fallbacks.
    until the svcmgr-launched [real-logd](../services/logd/README.md) assumes the
    endpoint's RECV, pulls init-logd's captured history via
    `log_labels::HANDOVER_PULL`, then releases it with
-   `log_labels::HANDOVER_RELEASE` — at which point init-logd self-terminates.
-   This direct path is **permanent**, not transitional: it is the only writer
-   before the serial driver is up, and the fallback if the driver fails to come
-   up. There is no parallel init-logd direct-framebuffer path today; pre-driver
-   framebuffer writes are deferred to a future surface (see "Planned future
-   surface" in the framebuffer driver README).
+   `log_labels::HANDOVER_RELEASE` — at which point init-logd self-terminates (see
+   [logd handover protocol](../services/logd/docs/handover-protocol.md)). This direct path is a
+   fixed part of the boot design, not a stopgap: together with init's main thread, which writes
+   the UART directly until init-logd is spawned, it is the only userspace writer until real-logd
+   takes the endpoint. The handover is unconditional, so if the serial driver never
+   comes up, userspace serial output after the handover is dropped (real-logd keeps the lines in
+   its history ring). init-logd has no direct-framebuffer path; before the framebuffer driver is
+   up, userspace output reaches only the UART.
 
-4. **Serial-driver-mediated path** — once devmgr has spawned the serial driver
-   (`services/drivers/serial/`), every userspace UART writer routes bytes to it
-   via `serial_labels::SERIAL_WRITE_BYTES`. real-logd
+4. **Serial-driver-mediated path** — devmgr spawns the serial driver
+   (`services/drivers/serial/`); once init-logd has released the master log endpoint to
+   real-logd, every userspace UART writer routes bytes to it via
+   `serial_labels::SERIAL_WRITE_BYTES`. real-logd
    (`services/logd/src/main.rs`) is the primary client: svcmgr launches and
    supervises it, it resolves the driver's write endpoint through devmgr's
    `devmgr_labels::QUERY_SERIAL_DEVICE`, and it emits both received log lines
    and its own diagnostics through it — including its own panic / alloc-error
    output, routed here via a `std::os::seraph::set_panic_sink` sink rather than
    the log endpoint logd serves (logd deletes its seeded `log_send_cap` at
-   startup so a fault cannot self-IPC into it). No userspace process other than
-   the serial driver and init-logd holds UART hardware authority.
+   startup so a fault cannot self-IPC into it). Outside the serial driver,
+   UART hardware authority is held only by init, whose init-logd thread uses it, and by
+   devmgr, whose I/O-port and MMIO caps it carves the driver's cap from.
 
-   real-logd is restartable (`restart = on_failure`). svcmgr holds the
-   master-log endpoint source for the system's life, so a restarted logd
-   re-attaches a fresh RECV to the same endpoint object every sender already
-   targets; the log senders are uninterrupted across the restart and need no
-   re-derivation of their `log_send_cap`. A restarted logd re-resolves the
-   serial driver via `QUERY_SERIAL_DEVICE` and resumes serial-mediated output.
-   While logd is down, a sender's `STREAM_BYTES` queues at the kernel endpoint
-   until the restarted logd drains it; the kernel panic console remains the
-   guaranteed output path for any fault in that window.
+   real-logd is declared restartable (`restart = on_failure`; see
+   [services/logd/README.md](../services/logd/README.md)); a working logd restart is design
+   intent; not yet implemented ([#262](https://github.com/kottlerg/seraph/issues/262)). In the
+   intended model, svcmgr holds the master-log endpoint source for the system's life, so a
+   restarted logd re-attaches a fresh RECV to the same endpoint object every sender already
+   targets; the log senders are uninterrupted across the restart and need no re-derivation of
+   their `log_send_cap`. A restarted logd re-resolves the serial driver via `QUERY_SERIAL_DEVICE`
+   and resumes serial-mediated output. While logd is down, a sender's `STREAM_BYTES` queues at
+   the kernel endpoint until the restarted logd drains it; the kernel panic console remains the
+   guaranteed output path for any fault in that window. Today svcmgr's death handler blocks on
+   its own `log!` calls to the master-log endpoint before it respawns logd, so the restart never
+   happens, and procmgr rejects a restarted logd's `REGISTER_DEATH_EQ` (first-wins), per
+   [svcmgr restart protocol](../services/svcmgr/docs/restart-protocol.md) § Supervision
+   hierarchy.
 
 5. **Framebuffer-driver-mediated path** — once devmgr has spawned the
    framebuffer driver (`services/drivers/framebuffer/`), userspace
@@ -89,22 +103,25 @@ earlier ones, which remain as fallbacks.
      registry cap it already holds for the serial driver — and mirrors
      every log line it writes to serial onto the framebuffer too, so the
      steady-state userspace log stream reaches the screen as well as the
-     UART. The mirror soft-degrades to serial-only whenever the driver is
-     unresolvable (headless boot, or before it is spawned), so serial
-     stays the authoritative channel.
-   - **`programs/terminal`** (#111) resolves the framebuffer write cap via
-     `QUERY_FRAMEBUFFER_DEVICE` and renders its child's stdout — the shell
-     (#112) and anything the shell runs — to the screen, mirrored to serial.
+     UART. The framebuffer driver, when present, is spawned before svcmgr launches logd;
+     logd resolves the mirror once and, when devmgr reports no framebuffer driver (headless
+     boot), latches it off for its lifetime, so serial stays the authoritative channel.
+   - **[`programs/terminal`](../programs/terminal/README.md)** (#111) resolves the
+     framebuffer write cap via `QUERY_FRAMEBUFFER_DEVICE` and renders its child's stdout — the
+     shell (#112) and anything the shell runs — to the screen, mirrored to serial.
      This is the production console path: ordinary programs do not resolve the
      framebuffer themselves; they write stdout and the terminal relays it.
-     `programs/fb-charset` is one such program — a manual demo (a step above
+     [programs/fb-charset/README.md](../programs/fb-charset/README.md) describes one such
+     program — a manual demo (a step above
      "hello world") that prints a sample of every glyph class (ASCII, CP437
      high half, box-drawing, font-extension, ASCII fallback, and one ill-formed
      sequence so the U+FFFD glyph is reachable) to stdout for eyeballing the
      driver's rendering. It is run from the shell and is not auto-started.
 
-   A compositor / display broker arrives in a follow-up issue and resolves
-   the cap through the same name. v1 exposes two verbs — `FB_WRITE_BYTES`
+   A compositor / display broker ([#153](https://github.com/kottlerg/seraph/issues/153)) is to
+   resolve the cap through the same name. v1 exposes two verbs, specified in
+   [services/drivers/framebuffer/README.md](../services/drivers/framebuffer/README.md)
+   § Messages — `FB_WRITE_BYTES`
    (UTF-8 payloads, `\n`/`\r`/`\x08` short-circuited) and `FB_SET_ATTRS` (sticky
    24-bit foreground/background colour). The terminal owns ANSI SGR parsing
    (`ESC[…m` → `FB_SET_ATTRS`); the driver never interprets control sequences,
@@ -112,8 +129,9 @@ earlier ones, which remain as fallbacks.
    single global, shared by the terminal and logd's concurrent log mirror like
    the single cursor — a log line written while the terminal holds a non-default
    colour inherits it; per-client attribute state arrives with the compositor
-   (#153). Graphical primitives are listed under the driver README's "Planned
-   future surface".
+   (#153). Graphical primitives are listed in
+   [services/drivers/framebuffer/README.md](../services/drivers/framebuffer/README.md)
+   § Planned future surface.
 
 ## The serial driver as sole userspace UART owner
 
@@ -133,25 +151,27 @@ The framebuffer driver owns the bootloader-discovered GOP linear
 framebuffer end-to-end — an `Mmio` carved from a bootloader-
 synthesised aperture that covers
 `[physical_base, physical_base + stride * height)` (page-aligned),
-delegated by devmgr at spawn. The driver maps the entire region into its
-own address space, queries devmgr for its geometry via the generic
-`QUERY_DEVICE_INFO` path (kind `FRAMEBUFFER`), and serves
-`FB_WRITE_BYTES`. Like the serial driver it is a device driver, not a
-console daemon: no name registry, no log routing, no graphical
+delegated by devmgr at spawn. The driver queries devmgr for its geometry via the generic
+`QUERY_DEVICE_INFO` path (kind `FRAMEBUFFER`), maps the entire region into its own address
+space, and serves `FB_WRITE_BYTES` and `FB_SET_ATTRS`. Like the serial driver it is a device
+driver, not a console daemon: no name registry, no log routing, no graphical
 primitives, no input. The driver's IPC contract is specified in
 [services/drivers/framebuffer/README.md](../services/drivers/framebuffer/README.md).
 
-## Why four permanent direct paths remain
+## Why the direct paths remain
 
-The kernel panic console (UART) and init-logd's direct-UART path both
-bypass the serial driver permanently and by design; the bootloader
-framebuffer renderer and the kernel framebuffer renderer both bypass
-the framebuffer driver in the same way. A panic, or a userspace failure
-before the driver is reachable, must still produce output; none of
-these can depend on the IPC machinery that the drivers require. They
-share the hardware with the drivers — an accepted physical aliasing,
-since the drivers are the steady-state writers and the direct paths
-fire only in early boot and failure windows.
+The kernel panic console (UART) and the kernel framebuffer renderer bypass the serial and
+framebuffer drivers for the life of the system, and neither can depend on the IPC machinery
+that the drivers require. The UART path is kept so a panic can still produce output; the
+framebuffer renderer is kept so the mirrored `kprintln!` console, including the address-free
+header line of a fatal `KERNEL EXCEPTION` dump, reaches the screen (the dump's kernel-address
+lines reaching it are the open [#440](https://github.com/kottlerg/seraph/issues/440) defect,
+not a design goal). The bootloader console (UART and
+framebuffer) and init-logd's direct-UART path are fixed parts of the boot design that bypass the
+drivers only within their windows, which end at the kernel handoff and the real-logd handover
+respectively; they carry output before the drivers are reachable. All of these paths share the
+hardware with the drivers — an accepted physical aliasing, since the drivers are the
+steady-state writers and the direct paths fire only in early boot and failure windows.
 
 ## Test-harness output
 
@@ -172,22 +192,22 @@ different routes:
   harness-specific framebuffer path exists.
 
 Serial remains the authoritative marker channel: CI scrapes serial and
-runs the harnesses headless, where the framebuffer mirrors are no-ops.
+runs the harnesses headless, where the framebuffer mirrors are no-ops (see
+[docs/testing.md](testing.md)).
 
 Every framebuffer renderer — the bootloader, kernel, and ktest direct
 renderers and the userspace driver — shares one byte→glyph chain
-(`shared/text`): an incremental UTF-8 decoder feeding the CP437-reverse →
-font-extension → ASCII-fallback → `U+FFFD` resolver, so every framebuffer
+([shared/text/README.md](../shared/text/README.md)): an incremental UTF-8 decoder feeding the
+CP437-reverse → font-extension → ASCII-fallback → `U+FFFD` resolver, so every framebuffer
 surface prints the identical glyph set.
 
 ---
 
 ## Summarized By
 
-[README.md](../README.md),
-[services/drivers/README.md](../services/drivers/README.md),
-[services/drivers/serial/README.md](../services/drivers/serial/README.md),
+[Kernel Cross-Boundary Disclosure Inventory](../core/kernel/docs/cross-boundary-disclosure.md),
+[Coding Standards](coding-standards.md),
 [services/drivers/framebuffer/README.md](../services/drivers/framebuffer/README.md),
+[services/drivers/serial/README.md](../services/drivers/serial/README.md),
 [services/logd/README.md](../services/logd/README.md),
-[coding-standards.md](coding-standards.md),
-[core/kernel/docs/cross-boundary-disclosure.md](../core/kernel/docs/cross-boundary-disclosure.md)
+[shared/ansi/README.md](../shared/ansi/README.md)

@@ -74,18 +74,16 @@ enum InstallDest
     /// utilities and test programs sourced from `programs/<x>/`. Loaded
     /// by procmgr from the root partition via VFS at runtime.
     Programs,
-    /// Installed under `sysroot/tests/<install_name>` — every test
-    /// artifact (kernel-surface harness `ktest`, service-surface
-    /// `svctest`, programs-surface orchestrator `usertest`, and the
-    /// `crasher` restart-path fixture). svcmgr does not scan this path;
-    /// harness recipes live in `rootfs/config/svcmgr/tests/`. The
-    /// `/tests/` tree is the single deletion criterion for stripping the
-    /// system down to a non-test distro shape. See docs/testing.md.
+    /// Installed under `sysroot/tests/<install_name>` — the test
+    /// harnesses (kernel-surface `ktest`, service-surface `svctest`,
+    /// programs-surface orchestrator `usertest`) and the `crasher`
+    /// restart-path fixture. svcmgr does not scan this path; harness
+    /// recipes live in `rootfs/config/svcmgr/tests/`. See
+    /// docs/testing.md § Sysroot layout.
     Tests,
     /// Installed under `sysroot/tests/programs/<install_name>` —
     /// per-program tester binaries discovered by the `usertest`
-    /// orchestrator. Lives under `/tests/` so the deletion criterion
-    /// in [`Self::Tests`] removes them too. See docs/testing.md.
+    /// orchestrator. See docs/testing.md § Sysroot layout.
     TestsPrograms,
 }
 

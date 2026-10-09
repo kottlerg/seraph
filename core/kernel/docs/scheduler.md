@@ -6,8 +6,9 @@ to prefer spreading threads across physical cores rather than packing them onto 
 
 The scheduler interacts with two subsystems:
 
-- **IPC** — IPC operations may block threads, wake threads, and trigger direct context
-  switches (see [ipc-internals.md](ipc-internals.md))
+- **IPC** — IPC interacts with the scheduler only through its park and wake primitives and
+  performs no direct context switch (see
+  [ipc-internals.md § IPC Scheduling Interaction](ipc-internals.md#ipc-scheduling-interaction))
 - **Architecture layer** — context save/restore and the preemption timer are implemented
   by the arch-dispatch surface defined in [arch-interface.md](arch-interface.md)
 
@@ -30,7 +31,8 @@ time through its `SchedControl`-cap and priority arguments: with no
 (`PRIORITY_MIN` = 1); with a `SchedControl` cap, priority 0 selects the cap's
 band floor and a nonzero priority must lie within the cap's `[min, max]` band.
 Priority is changed afterwards via `SYS_THREAD_SET_PRIORITY`. The kernel does
-not implement dynamic priority adjustment or aging.
+not implement dynamic priority adjustment or aging. Both syscalls' argument and error
+contracts are in [syscalls.md](syscalls.md).
 
 The one kernel-assigned exception is init's boot thread, created at
 `INIT_PRIORITY` (= 30, the top settable level): init is the root of all
@@ -46,7 +48,8 @@ within that band. `SYS_CAP_CREATE_THREAD` applies the same rule at creation:
 placing a new thread above the floor requires a `SchedControl` cap whose band
 covers the level. There is no ambient authority — a process holding no
 `SchedControl` (or one whose band excludes the level) cannot set that priority.
-Lowering is not special-cased; every assignment is checked against the band.
+Lowering is not special-cased; every assignment is checked against the band. See
+[syscalls.md](syscalls.md) § `SYS_THREAD_SET_PRIORITY` for the band check and its errors.
 
 The kernel does **not** define a normal/elevated boundary. The numeric level
 space is uniform; any partition into tiers is userspace policy, expressed by how
@@ -56,9 +59,13 @@ space is uniform; any partition into tiers is userspace policy, expressed by how
   held by init.
 - Init narrows it with `SYS_SCHED_SPLIT` into the baseline band `[1, 28]`
   (`sched_policy::BASELINE_PRIORITY_MAX` in `shared/ipc`) and an elevated
-  remainder `[29, PRIORITY_MAX]` that never leaves init and dies at its reap —
-  init's own boot thread (kernel-placed at `INIT_PRIORITY` = 30) is the only
-  occupant above the baseline.
+  remainder `[29, PRIORITY_MAX]` that never leaves init — init's own boot thread
+  (kernel-placed at `INIT_PRIORITY` = 30) is the only occupant above the
+  baseline. After init's reap the remainder stays in init's CSpace, which the
+  kernel pins (it is the root CSpace), so it remains alive but unreachable;
+  releasing it at the reap is design intent, not yet implemented
+  ([#443](https://github.com/kottlerg/seraph/issues/443); see
+  [process-lifecycle.md § Init reap](../../../docs/process-lifecycle.md#init-reap)).
 - Every spawned process receives a band through
   `ProcessInfo.sched_control_cap`: procmgr mints it from its baseline copy at
   create time, whole or `SYS_SCHED_SPLIT`-narrowed to the `[1, band_max]` the
@@ -66,12 +73,14 @@ space is uniform; any partition into tiers is userspace policy, expressed by how
   level under its own baseline authority. The per-service level map is pure
   userspace policy — `shared/ipc`'s `sched_policy` module for the
   init/procmgr/devmgr/vfsd-assigned levels, svcmgr `.svc` recipes
-  (`priority = ...` / `sched_max = ...`) for supervised services.
+  (`priority = ...` / `sched_max = ...`) for supervised services. The mint is specified in
+  [procmgr ipc-interface.md](../../../services/procmgr/docs/ipc-interface.md) § Label 1:
+  `CREATE_PROCESS`.
 
 `SchedControl` is the sole authority; see
 [capability-model.md § SchedControl](../../../docs/capability-model.md) for the
 cap shape, `SYS_SCHED_SPLIT`-based band splitting, and delegation. `cap_derive`
-cannot shrink a band — it attenuates rights only.
+cannot shrink a band — it attenuates rights only ([syscalls.md](syscalls.md) § `SYS_CAP_DERIVE`).
 
 ### Run Queue Structure
 
@@ -168,17 +177,14 @@ pub struct ThreadControlBlock
 
     // === IPC state ===
 
-    /// Single-use reply capability for the pending IPC call (if any).
-    reply_cap_slot: Option<ReplyCapability>,
+    /// Inline message buffer for in-flight IPC data (the staged message).
+    ipc_msg: Message,
 
-    /// Pending send message buffer (used while BlockedOnSend).
-    pending_send: PendingSendBuffer,
+    /// Caller bound for the implicit reply (set on receive, cleared on reply).
+    reply_tcb: AtomicPtr<ThreadControlBlock>,
 
-    /// Wakeup value (payload for notification/event wakeup).
+    /// Wakeup value (notification bits, event payload, or wait-set member badge).
     wakeup_value: u64,
-
-    /// Badge from a wait set wakeup.
-    wakeup_badge: u64,
 
     /// Intrusive IPC wait queue link.
     ipc_wait_next: Option<*mut ThreadControlBlock>,
@@ -238,14 +244,16 @@ fields are subject to the lock hierarchy specified in that document.
 
 ### What Gets Saved and Restored
 
-On each context switch, the arch `context::switch` function saves and restores the
-minimal register set needed for correct execution:
+On each context switch, the arch `context::switch` function (see
+[arch-interface.md](arch-interface.md) § `context`) saves and restores the minimal register
+set needed for correct execution:
 
 **x86-64 (callee-saved registers):**
 - `rbx`, `rbp`, `r12`, `r13`, `r14`, `r15`
 - `rip` (return address, via the call to `context::switch`)
 - `rsp` (stack pointer)
 - The `fs_base` MSR (TLS base pointer)
+- `rflags`
 - The kernel stack pointer is stored separately in the TSS `RSP0` field
 
 Caller-saved registers (`rax`, `rcx`, `rdx`, `rsi`, `rdi`, `r8`–`r11`) are not saved
@@ -255,11 +263,19 @@ Caller-saved registers (`rax`, `rcx`, `rdx`, `rsi`, `rdi`, `r8`–`r11`) are not
 - `s0`–`s11` (saved registers)
 - `ra` (return address — `context::switch` returns here)
 - `sp` (stack pointer)
-- `tp` (thread pointer, used for TLS)
+- `a0` (argument delivered on a new kernel thread's first entry; meaningful only at
+  thread creation)
 
-The full user register file (all 31 general-purpose registers plus `sepc`, `sstatus`,
-and the floating-point state) is saved in the thread's trap frame, not in
-`SavedState`. `SavedState` holds only the kernel-mode callee-saved state.
+`tp` is not in `SavedState`: it is a per-hart kernel register that is never
+thread-switched, and the user-mode TLS pointer lives in the trap frame's `tp`.
+
+The full user register file (all 31 general-purpose registers on RISC-V, plus `sepc`
+and `sstatus`) is saved in the thread's trap frame, not in `SavedState`. `SavedState`
+holds only the kernel-mode callee-saved state. Floating-point, SIMD, and vector state
+is in neither: it lives in the TCB's extended-state area, saved eagerly by the arch
+`fpu::switch_out_save` on switch-out of a user thread and restored lazily on the
+thread's first FP/SIMD/vector instruction after it is switched back in (`#NM` on
+x86-64, the illegal-instruction trap with `sstatus.FS`/`VS` Off on RISC-V).
 
 ### Switch Sequence
 
@@ -318,7 +334,7 @@ Victim selection is mode-dependent:
 - **Loaded CPU (`my_load > 0`)** — pick a pseudo-random victim
   (splitmix-style hash of the global `LOAD_BALANCE_TICK` counter and the
   local CPU id). Skip if the victim is not significantly busier than us
-  (`their_load <= my_load + IMBALANCE_THRESHOLD`).
+  (`their_load <= my_load + LOAD_BALANCE_IMBALANCE_THRESHOLD`).
 - **Idle CPU (`my_load == 0`)** — scan all other CPUs and pull from the
   heaviest. Scanning is cheap (one Relaxed atomic load per CPU) and
   guarantees an idle CPU finds work on the first tick that sees an
@@ -334,17 +350,33 @@ pull_unpinned_ready(src, dst):
     if !try_lock(min(src, dst).scheduler.lock): return   // ascending-CPU order
     if !try_lock(max(src, dst).scheduler.lock):
         unlock(min); return
-    tcb = src.find_runnable(|t| t.cpu_affinity == AFFINITY_ANY)
+    (tcb, prio) = src.find_runnable(|t| t.cpu_affinity == AFFINITY_ANY
+                                        && t.context_saved.load(Acquire) == 1)
     if tcb is None: unlock both; return
-    src.remove_from_queue(tcb, tcb.priority)  // decrements CPU_LOAD[src]
-    dst.enqueue(tcb, tcb.priority)            // increments CPU_LOAD[dst]
-    tcb.preferred_cpu = dst
-    set_reschedule_pending_for(dst)
-    unlock both
-    wake_idle_cpu(dst)                        // always-IPI
+    if !try_lock(tcb.sched_lock): unlock both; return  // taken after run-queue locks
+    // relocate_ready_thread: revalidate under sched_lock, then move.
+    moved = false
+    if tcb.state == Ready && tcb.context_saved == 1
+       && (tcb.cpu_affinity == AFFINITY_ANY || tcb.cpu_affinity == dst):
+        src.remove_from_queue(tcb, prio)       // decrements CPU_LOAD[src]
+        dst.enqueue(tcb, prio)                 // increments CPU_LOAD[dst]
+        tcb.preferred_cpu = dst
+        set_reschedule_pending_for(dst)
+        moved = true
+    unlock tcb.sched_lock; unlock both
+    if moved: wake_idle_cpu(dst)               // always-IPI
 ```
 
-Lock order follows scheduling-internals.md § Lock Hierarchy rule 4
+The `context_saved == 1` predicate is the load-balancer liveness gate of
+[scheduling-internals.md](scheduling-internals.md) § Cross-CPU TCB Ownership step 11: a
+`Ready` thread with `context_saved == 0` is mid-handoff, still `current` on `src`, and
+relocating it would dispatch it on two CPUs at once (#314/#293). The candidate's
+`sched_lock` is try-acquired because it is taken after the run-queue locks, the reverse of
+the canonical order; a failed try defers the pull. `relocate_ready_thread` re-checks
+`Ready`, `context_saved == 1`, and affinity under that `sched_lock`, closing a
+`sys_thread_set_affinity` that races between the `find_runnable` predicate and the move.
+
+Lock order follows [scheduling-internals.md](scheduling-internals.md) § Lock Hierarchy rule 4
 (ascending CPU id), and both acquisitions are **try-locks**: the pull runs
 from every CPU's timer tick with interrupts disabled, and under a
 pinned-heavy imbalance every idle CPU converges on the same victim every
@@ -358,7 +390,7 @@ Hot-path cost per CPU per tick:
 - Idle CPU: one Relaxed load per remote CPU to find the heaviest victim.
 - Loaded CPU: one Relaxed increment + one Relaxed load for the victim.
 - Scheduler locks are try-acquired, and only when an imbalance above
-  `IMBALANCE_THRESHOLD` is observed.
+  `LOAD_BALANCE_IMBALANCE_THRESHOLD` is observed.
 
 ---
 
@@ -440,7 +472,8 @@ syscall may be preempted while the timer fires if:
 
 Spinlock-hold intervals must be short (< ~10 µs) by policy. Code that holds a
 spinlock must not call anything that blocks or takes another lock (except in defined
-lock-ordering sequences).
+lock-ordering sequences). The hold-time bound and lock ordering are specified in
+[scheduling-internals.md](scheduling-internals.md) § Lock Hierarchy.
 
 The scheduler does not preempt the kernel while a spinlock is held. Instead, a
 `preemption_pending` flag is set per-CPU; preemption occurs when the last spinlock
@@ -506,12 +539,12 @@ Hard affinity is intended for:
 ### Active migration on affinity change
 
 `SYS_THREAD_SET_AFFINITY` enforces the new affinity immediately rather than
-deferring to the next enqueue:
+deferring to the next enqueue ([syscalls.md](syscalls.md) § `SYS_THREAD_SET_AFFINITY`):
 
 - **Ready** thread queued on the old CPU: the syscall calls
   `migrate_ready_thread` which dequeues the TCB from the source CPU's run
   queue and re-enqueues it on the destination under both scheduler locks
-  (lower-numbered CPU first; see scheduling-internals.md § Lock Hierarchy
+  (lower-numbered CPU first; see [scheduling-internals.md](scheduling-internals.md) § Lock Hierarchy
   rule 4) and sends a wakeup IPI to the destination.
 - **Running** thread on a different CPU: the syscall sets the
   **source** CPU's reschedule-pending flag and sends a wakeup IPI to the
@@ -519,13 +552,21 @@ deferring to the next enqueue:
   does not call `schedule()`; the running thread observes the new
   affinity at its next entry to `schedule()` — preempt-on-slice-expiry,
   voluntary yield, or IPC block. The re-enqueue site in `schedule()`
-  checks `cpu_affinity != current_cpu` and routes the requeue cross-CPU
-  via `enqueue_and_wake` (which then sets the destination's
-  reschedule-pending flag and IPIs it) instead of doing a local enqueue.
+  checks `cpu_affinity != current_cpu` and routes the requeue cross-CPU —
+  linking the thread directly on the destination's run queue, setting its
+  reschedule-pending flag, and IPIing it — instead of doing a local enqueue
+  (see [scheduling-internals.md](scheduling-internals.md) § ThreadState Transitions).
   Worst-case latency is therefore one time slice
   (`TIME_SLICE_TICKS` × tick period), not one tick.
 - **Blocked / Stopped / Created**: the new affinity takes effect on the
   next wake via `select_target_cpu`; no migration work is needed.
+
+The syscall writes `cpu_affinity`, and reads `preferred_cpu` and `state`, without the target's
+`sched_lock`, so those accesses race other CPUs' scheduler paths
+([#443](https://github.com/kottlerg/seraph/issues/443)). `lookup_cap` does not pin the target
+Thread (see [capability-internals.md](capability-internals.md) § Storage: Hybrid Two-Level Radix
+and [#443](https://github.com/kottlerg/seraph/issues/443)). The outcomes above hold only absent
+those hazards.
 
 ### Soft Affinity
 
@@ -550,4 +591,6 @@ optimisation.
 
 ## Summarized By
 
-[kernel/README.md](../README.md)
+[core/kernel/README.md](../README.md), [Kernel Initialization Sequence](initialization.md),
+[SMP Scheduling and Locking Invariants](scheduling-internals.md),
+[Syscall Interface Specification](syscalls.md)

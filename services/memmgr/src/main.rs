@@ -1409,17 +1409,22 @@ fn handle_process_died(req: &IpcMessage, ipc_buf: *mut u64, procmgr_badge: u64)
 
 fn handle_donate_memory_caps(req: &IpcMessage, ipc_buf: *mut u64)
 {
-    // Caller (init or procmgr) is permanently transferring reclaimed Memory
-    // caps (init's ELF segments, InitInfo, stack, boot-module ELF sources,
-    // reclaim scratch, AP trampoline) into memmgr's pool. Each donated cap
-    // must carry the full pool-frame rights ([`POOL_FRAME_RIGHTS`]) so memmgr
-    // can derive the R / RW / RX inner a demand fault or REQUEST_MEMORY_CAPS
-    // consumer needs and retype on their behalf.
+    // Caller (procmgr's init reap) is permanently transferring init's
+    // reclaimed Memory caps into memmgr's pool (the donated set is specified
+    // in `docs/process-lifecycle.md` § Init reap and
+    // `services/memmgr/docs/ipc-interface.md` § Label 5:
+    // `DONATE_MEMORY_CAPS`). Each donated cap must carry the full pool-frame
+    // rights ([`POOL_FRAME_RIGHTS`]) so memmgr can derive the R / RW / RX
+    // inner a demand fault or REQUEST_MEMORY_CAPS consumer needs and retype
+    // on their behalf.
     //
-    // We trust the caller (single-tenant userspace; donation is gated by
-    // possessing a memmgr SEND cap, which only init and procmgr hold) but
-    // still validate the cap shape via `cap_info` — a malformed or under-rights
-    // cap from a buggy loader should reject, not poison the pool.
+    // Donation is ungated: memmgr accepts it from any badged client and does
+    // not check the cap's provenance, so a client that donates a cap derived
+    // from its own memmgr grant puts frames memmgr has already lent out into
+    // the free pool a second time. Only procmgr's init reap should donate;
+    // gating donation is tracked in #459. memmgr validates only the cap shape
+    // via `cap_info` — a malformed or under-rights cap from a buggy loader
+    // rejects rather than poisoning the pool.
     let pool = pool_mut();
     let mut accepted_caps: u32 = 0;
     let mut accepted_pages: u64 = 0;
@@ -1637,11 +1642,15 @@ fn handle_delegate_aspace(req: &IpcMessage, ipc_buf: *mut u64, procmgr_badge: u6
 
 /// Service a kernel-synthesized page fault for a demand-paged process.
 ///
-/// `req.badge` is the faulting process's memmgr badge; words are
-/// `[kind, faulting_va, access, ip]`. On a VM fault whose address lies in a
-/// registered region of a process with a delegated address space, memmgr backs
-/// the [`chunk_for`] chunk containing the faulting page — one contiguous
-/// Memory cap mapped across up to `DEMAND_CHUNK_PAGES` pages — and replies
+/// `req.badge` is the value bound by `SYS_THREAD_SET_FAULT_HANDLER` (procmgr
+/// and the runtime bind the process's memmgr badge); attribution rests on
+/// badge unguessability (`services/memmgr/docs/ipc-interface.md`
+/// § Badge Discipline; #459). Words are `[kind, faulting_va, access, ip]`
+/// (same document, § Kernel-origin fault message (`FAULT_LABEL`)). On a VM
+/// fault whose address lies in a registered region of a process with a
+/// delegated address space, memmgr backs the [`chunk_for`] chunk containing
+/// the faulting page — one contiguous Memory cap mapped across up to
+/// `DEMAND_CHUNK_PAGES` pages — and replies
 /// [`syscall_abi::FAULT_REPLY_RESUME`]. Backing a chunk rather than a single
 /// page bounds cap-slot consumption (one cap per chunk) so a deep demand stack
 /// cannot exhaust memmgr's `CSpace`. Every other case — non-VM fault, unknown

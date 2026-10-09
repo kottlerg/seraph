@@ -33,7 +33,7 @@ ruststd/
     ├── os/
     │   └── seraph.rs           # std::os::seraph surface (startup info, caps, cwd)
     └── sys/                    # std::sys::seraph backends, one directory per area
-        ├── alloc/              # byte heap (#[global_allocator])
+        ├── alloc/              # byte heap (GlobalAlloc for System)
         ├── args/               # std::env::args — consumes argv_env::next_field
         ├── env/                # std::env::{var,vars,…} —
         │                         consumes argv_env::{next_field,split_key_value}
@@ -57,15 +57,18 @@ chosen by the process creator and only consumed by std at `_start`. See
 [`docs/userspace-memory-model.md`](../../docs/userspace-memory-model.md) for
 the full contract.
 
-### Byte heap (`#[global_allocator]`)
+### Byte heap (`System`)
 
-`std::sys::seraph::alloc` declares the global allocator. Every `Box`, `Vec`,
+`std::sys::seraph::alloc` implements `GlobalAlloc` for std's default `System`
+allocator, so no `#[global_allocator]` override is needed. Every `Box`, `Vec`,
 `String`, and `alloc`/`std` collection allocates here. The grow path
 requests Memory caps from memmgr via `memmgr_labels::REQUEST_MEMORY_CAPS` on
 `ProcessInfo.memmgr_endpoint_cap`, mapping them at a contiguous VA above the
 heap's high-water mark with a single multi-page `mem_map` per returned cap.
 The bootstrap heap is allocated by `std::os::seraph::_start` before
-`fn main()` runs; OOM panics the thread.
+`fn main()` runs. On OOM, `GlobalAlloc::alloc` returns null and the `alloc`
+crate aborts through `handle_alloc_error`; nothing unwinds. See
+[§ Byte Heap](../../docs/userspace-memory-model.md#byte-heap).
 
 ### Page reservations
 
@@ -92,14 +95,45 @@ The arena is carved out of the process's address space on first use, at a
 base drawn per process from a fixed 64 GiB window via `SYS_GETRANDOM`
 (ASLR, [#39](https://github.com/kottlerg/seraph/issues/39); deterministic
 default only if the draw fails). The caller owns `mem_map`/`mem_unmap`;
-the allocator only manages VA space.
+the allocator only manages VA space. See
+[§ Page Reservations](../../docs/userspace-memory-model.md#page-reservations).
+
+#### Spawned-thread stacks
+
+`std::thread::spawn` gives each spawned thread its own stack, allocated by `sys/thread` as a
+consumer of the page-reservation surface above. In a demand-paged process
+(`StartupInfo.pager_endpoint_cap` non-zero) the stack is a page reservation of one guard page
+below the usable pages. Only the usable pages are registered with memmgr through
+[`REGISTER_REGION`](../../services/memmgr/docs/ipc-interface.md#label-7-register_region), so
+memmgr backs each on first touch; the guard page stays unregistered. An overflow whose first
+touch lands in the guard page faults on an address the pager declines, and the fault ends the
+whole process, per [docs/fault-handling.md § Reply](../../docs/fault-handling.md#reply),
+[docs/process-lifecycle.md § Process Death](../../docs/process-lifecycle.md#process-death), and
+[Capability Model § "Kill process" pattern](../../docs/capability-model.md#kill-process-pattern).
+The userspace targets emit no stack probes, so a frame larger than one page can skip the guard
+and write into an adjacent registered region, such as another thread's stack, which memmgr
+backs without a fault ([#445](https://github.com/kottlerg/seraph/issues/445)). The usable
+size is the larger of the requested stack size (at least `DEFAULT_MIN_STACK_SIZE`, 64 KiB)
+and 512 pages (2 MiB). If the reservation, the page-table funding, or the registration fails,
+or the process is not demand-paged, the stack is instead an eager byte-heap allocation of the
+requested size (at least 64 KiB, rounded up to whole pages) with no guard page. `join` frees
+the stack once the thread has left user mode: a demand stack through
+[`UNREGISTER_REGION`](../../services/memmgr/docs/ipc-interface.md#label-9-unregister_region)
+and release of its reservation, a heap stack through `dealloc`. A detached thread's stack is
+freed the same way by the next spawn, join, or detach in the process after the kernel posts
+that thread's death, or leaks until process exit when the reaper could not register the
+thread at spawn (no death queue, no free slot, or the observer bind failed) or the kernel
+dropped the death post because the process's death queue (128 entries) was full.
 
 ### Bootstrap-cross-boundary VAs
 
 `_start` reads `ProcessInfo` to learn the IPC-buffer VA, the memmgr/procmgr
 endpoint slots, and other parent-chosen state. It does not allocate these
-VAs — procmgr (or for init, the kernel) chose them. Subsequent foreign
-mappings go through the page-reservation allocator above.
+VAs — the process creator chose them (init for procmgr, procmgr for every
+other std-built process; see the owner column of
+[§ VA Management Surfaces](../../docs/userspace-memory-model.md#va-management-surfaces)).
+Subsequent foreign mappings go through the page-reservation allocator above. See
+[§ Bootstrap Cross-Boundary VAs](../../docs/userspace-memory-model.md#bootstrap-cross-boundary-vas).
 
 ---
 
@@ -135,10 +169,13 @@ returns `Unsupported`. A process with a non-zero root but zero cwd
 can open absolute paths only; relative paths return `Unsupported`
 until `set_current_dir` installs a cwd cap.
 
-The setter is the seraph-native cwd primitive. The upstream
-`std::env::set_current_dir` / `current_dir` currently return
-`Unsupported` because seraph lacks a `pal/` entry that bridges to the
-cap-native machinery.
+The setter is the seraph-native cwd primitive. The env-dispatch overlay
+(a patch to `library/std/src/env.rs`) bridges the upstream API to it:
+`std::env::set_current_dir` delegates to `std::os::seraph::set_current_dir`,
+which walks the root cap and installs the cwd cap and its path string
+together. `std::env::current_dir` returns the recorded path, or
+`Unsupported` until one is recorded, because the startup cwd cap carries
+no path string.
 
 `Command::spawn` defaults the child's root cap to a `cap_copy` of the
 spawner's `root_dir_cap()` (parent-inherit); explicit override via
@@ -156,8 +193,9 @@ protocol is in
 
 ## Implementation order
 
-ruststd is implemented before `libc/`. Native Rust `std` support does not
-require a POSIX layer; it maps directly onto Seraph primitives.
+ruststd is implemented before [`libc/`](../libc/README.md), which is design intent and not
+yet implemented. Native Rust `std` does not go through libc; it maps directly onto Seraph
+primitives.
 
 ---
 
@@ -166,12 +204,18 @@ require a POSIX layer; it maps directly onto Seraph primitives.
 | Document | Content |
 |---|---|
 | [docs/userspace-memory-model.md](../../docs/userspace-memory-model.md) | Three-surface VA model, frame-allocation contract |
-| [docs/process-lifecycle.md](../../docs/process-lifecycle.md) | ProcessInfo handover, `memmgr_endpoint_cap` discipline |
-| [services/memmgr/docs/ipc-interface.md](../../services/memmgr/docs/ipc-interface.md) | Wire shape of `REQUEST_MEMORY_CAPS`/`RELEASE_MEMORY_CAPS` |
+| [docs/process-lifecycle.md](../../docs/process-lifecycle.md) | ProcessInfo handover, `memmgr_endpoint_cap` discipline, process death |
+| [docs/fault-handling.md](../../docs/fault-handling.md) | Pager fault reply: `FAULT_REPLY_KILL` declines an unregistered guard-page fault, killing the faulting thread as an unhandled fault |
+| [docs/capability-model.md](../../docs/capability-model.md) | "Kill process" pattern: a terminal fault on any thread tears down the whole process |
+| [services/memmgr/docs/ipc-interface.md](../../services/memmgr/docs/ipc-interface.md) | Wire shape of `REQUEST_MEMORY_CAPS`/`RELEASE_MEMORY_CAPS`, `REGISTER_REGION`/`UNREGISTER_REGION` |
 | [abi/process-abi/README.md](../../abi/process-abi/README.md) | `ProcessInfo`, `StartupInfo`, `main()` signature |
 
 ---
 
 ## Summarized By
 
-None
+[abi/process-abi/README.md](../../abi/process-abi/README.md),
+[Namespace Model](../../docs/namespace-model.md), [Storage](../../docs/storage.md),
+[programs/threadstack/README.md](../../programs/threadstack/README.md),
+[runtime/libc/README.md](../libc/README.md),
+[`.svc` Service Definitions](../../services/svcmgr/docs/service-definitions.md)

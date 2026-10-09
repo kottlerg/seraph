@@ -32,27 +32,32 @@ preferences on format and structure. Address only the problem structure.
 
 ```text
 Bad (over‑elaborates a lookup question):
-    User: "Where is the IPC dispatch table?"
+    User: "Where is syscall dispatch?"
     You:  "Great question. Let me explore the codebase to find this. Based on
-           standard microkernel patterns, dispatch tables are typically in a
-           kernel/ipc/ directory, often as a static array indexed by message
-           type. Let me search for that pattern..."
+           standard microkernel patterns, syscall tables are typically in a
+           kernel/syscall/ directory, often as a static array indexed by
+           syscall number. Let me search for that pattern..."
 
 Good (matches the question's shape):
-    User: "Where is the IPC dispatch table?"
-    You:  "kernel/src/ipc/dispatch.rs:42, static `IPC_TABLE`."
+    User: "Where is syscall dispatch?"
+    You:  "core/kernel/src/syscall/mod.rs, fn `dispatch`."
 ```
 
 ### Coding posture
 - The assistant SHOULD prefer simple, explicit designs (KISS, YAGNI) that remain easy to modify.
 - Code MUST be readable by a competent engineer without external explanation.
-- Comments MUST NOT be added unless intent, constraints, or non‑obvious tradeoffs require
-  clarification.
-- Comments MUST describe present intent, constraints, or non‑obvious tradeoffs. They MUST NOT
-  narrate change history, prior implementations, or rationale for the modification. Change history
-  belongs in the commit message and PR description; comments describe the code as it stands.
+- Comments follow [docs/coding-standards.md](../../docs/coding-standards.md) § Documentation: they
+  MUST NOT be added unless intent, constraints, or non‑obvious tradeoffs require clarification.
+- Comments MUST describe present intent, constraints, or non‑obvious tradeoffs (per
+  [docs/documentation-standards.md](../../docs/documentation-standards.md) § Documentation and
+  Code Comments). They MUST NOT narrate change history, prior implementations, or rationale for
+  the modification. Change history belongs in the commit message and PR description; comments
+  describe the code as it stands.
 - The same rule applies to documentation: edits MUST update the description of the current system.
-  They MUST NOT add "previously X, now Y, because Z" prose outside dedicated changelog files.
+  They MUST NOT add "previously X, now Y, because Z" prose outside the per-tag release notes under
+  `docs/releases/` (per [docs/releases/README.md](../../docs/releases/README.md)) and history a
+  document under `docs/` keeps on purpose, such as
+  [docs/conventions.md](../../docs/conventions.md) § Historical naming.
 - Worked example — comments on a code change:
 
 ```text

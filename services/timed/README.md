@@ -81,4 +81,9 @@ monotonic time since.
 
 ## Summarized By
 
-None
+[Device Management](../../docs/device-management.md),
+[Process Lifecycle](../../docs/process-lifecycle.md),
+[services/drivers/cmos/README.md](../drivers/cmos/README.md),
+[services/drivers/goldfish-rtc/README.md](../drivers/goldfish-rtc/README.md),
+[services/init/README.md](../init/README.md), [init Bootstrap Stages](../init/docs/bootstrap.md),
+[Restart Protocol](../svcmgr/docs/restart-protocol.md)

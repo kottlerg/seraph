@@ -19,7 +19,7 @@ The capability subsystem comprises four components:
 
 ### Design Constraints
 
-From the design document:
+From [docs/capability-model.md](../../../docs/capability-model.md) § Capability Spaces:
 
 - O(1) lookup — descriptor-to-slot resolution on every IPC call
 - Stable indices — a descriptor never changes after assignment
@@ -68,7 +68,9 @@ slot index fits the cap handle's index field. They are established at
 implementation time and are not part of the public ABI.
 `(L1_DIRECT + L1_INDIRECT × DIR_FANOUT) × L2_SIZE` is the directory's
 structural ceiling — the only slot bound a CSpace has; capacity below it is
-whatever the owner-funded slot-page pool backs.
+whatever the owner-funded slot-page pool backs (see
+[docs/capability-model.md](../../../docs/capability-model.md) § Address-space and
+CSpace growth budgets).
 
 **Lookup is O(1):** A descriptor `d` selects leaf `d / L2_SIZE` and slot
 `d % L2_SIZE`. Leaves below `L1_DIRECT` resolve through the inline root
@@ -84,23 +86,30 @@ that outlives a failed leaf allocation stays published — already paid for,
 it serves the next grow. Pages are never freed while the CSpace is live
 (slot indices must remain stable).
 
-**Memory ordering and lock domains:** directory and leaf pointers are
-write-once while the CSpace is live, published with Release after full
-initialisation, and read with Acquire by the lock-free lookup path
-(`lookup_cap`, `cap_info`). Mutation is split across two lock domains:
-slot occupancy, the free list, the directory, and the counters change
-only under the CSpace spinlock, while the derivation linkage of occupied
-slots changes only under the global derivation write lock (which reaches
-any registered CSpace's slots via registry lookup without taking its
-spinlock — see Derivation Tree below). Paths crossing the families hold
-the derivation lock outermost, then the spinlock. Races on slot content
-against the unlocked readers are narrowed — not closed — by the tag and
-per-slot generation checks at the resolution sites; the residual is
-confined to threads of the owning process racing each other.
+**Memory ordering and lock domains:** directory and leaf pointers are write-once while the CSpace is
+live, published with Release after full initialisation, and read with Acquire by the lock-free
+lookup path (`lookup_cap`, `cap_info`). Mutation is split across two lock domains: slot occupancy,
+the free list, the directory, and the counters change only under the CSpace spinlock, while the
+derivation linkage of occupied slots changes only under the global derivation write lock (which
+reaches any registered CSpace's slots via registry lookup without taking its spinlock — see
+Derivation Tree below). Paths crossing the families hold the derivation lock outermost, then the
+spinlock. Races on slot content against the unlocked readers are narrowed — not closed — by the tag
+and per-slot generation checks at the resolution sites. `lookup_cap` takes no reference on the
+object it resolves, so the object can be freed while a handler still dereferences it. An object is
+freed when its reference count reaches zero, whatever releases the last reference: a capability or
+a kernel-internal owner (the principal ones are listed in
+[§ Kernel Object Reference Counting](#kernel-object-reference-counting)). A split child (a
+`SYS_MEMORY_SPLIT` tail, or a range-split MMIO, IoPort, IRQ, or SchedControl child) is a distinct
+object linked under the original's derivation parent, so another holder's revoke of that ancestor
+can free it directly. For a same-object derivation, as in the kill-process pattern, it is the delete
+following the revoke that frees the object: a revoke keeps its target capability, so it never frees
+the target's own object, though it can free a descendant's. This is a known defect tracked in
+[#443](https://github.com/kottlerg/seraph/issues/443).
 
 **Slot 0** is always null. The leaf covering slot 0 exists once the CSpace
 has grown, but the slot is permanently locked to the null capability,
-enforced at the lookup level.
+enforced at the lookup level (see
+[docs/capability-model.md](../../../docs/capability-model.md) § Capability Spaces).
 
 ### Free Slot Tracking
 
@@ -311,7 +320,8 @@ The `u64` `RIGHTS_*` constants in `abi/syscall` are the single source of truth
 for bit values; the kernel defines a `TypedRights<K: CapKind>` newtype per type
 (`MemRights`, `EpRights`, `NtfRights`, ...) whose constants are derived from the
 ABI values, so a rights constant of the wrong capability type cannot be passed
-to a lookup at compile time.
+to a lookup at compile time. Scoping and attenuation semantics are in
+[docs/capability-model.md](../../../docs/capability-model.md) § Rights and Attenuation.
 
 Per-type vocabularies (bit positions within each type's own space):
 
@@ -351,12 +361,14 @@ fn check_wx(rights: Rights) -> Result<(), SyscallError>
 
 A capability may carry both Write and Execute rights (representing independent
 authorities). W^X is enforced when those rights are exercised on a specific
-mapping — no page may be simultaneously writable and executable.
+mapping — no page may be simultaneously writable and executable (see
+[docs/capability-model.md](../../../docs/capability-model.md) § Memory).
 
 ### Kernel Object Reference Counting
 
 Each kernel object (Endpoint, Notification, EventQueue, etc.) has an embedded reference
-count representing the number of capability slots that point to it:
+count over the capability slots that point to it and the kernel-internal owners that
+hold it (the principal ones are listed below):
 
 ```rust
 pub struct KernelObjectHeader
@@ -370,18 +382,45 @@ pub struct KernelObjectHeader
 }
 ```
 
-When a slot is cleared (deletion, revocation), the reference count is decremented.
+When a slot is cleared (for example by deletion, revocation, or the teardown of the CSpace
+holding it) or a kernel-internal owner releases its reference, the reference count is
+decremented.
 When it reaches zero, the object's bytes are returned to the Memory object it was
 retyped from (`retype_free`). This is the only mechanism by which kernel objects
-are freed — there is no explicit "destroy" syscall.
+are freed — there is no explicit "destroy" syscall (see
+[docs/capability-model.md](../../../docs/capability-model.md) § Auto-reclaim).
 
-The same refcount also tracks kernel-internal owners of an object. Wait-set
-membership is one such owner: `sys_wait_set_add` `inc_ref`s the source's
-header under the source's lock together with the back-pointer publication;
-`sys_wait_set_remove` and `wait_set_drop` perform the matching `dec_ref`. The
-source's state therefore outlives every wait-set member referencing it; the
-Endpoint/Notification/EventQueue dealloc arms only `debug_assert` that
-`state.wait_set` is null on entry (the invariant follows from the refcount).
+The principal kernel-internal owners:
+
+- **Retype ancestry.** Each object retyped from a Memory object holds a reference on
+  that ancestor (`header.ancestor`), released when the descendant is freed; the
+  kernel's boot-minted objects hold the same reference on the SEED reserve.
+- **Page-pool donations.** A Memory object donated to an AddressSpace's or CSpace's
+  page pool is referenced by the donation record until that AddressSpace or CSpace is
+  freed. The Memory object an AddressSpace or CSpace is created from is referenced
+  once, by donation record 0, which serves as its retype ancestry too.
+- **SEED scratch leases.** A per-thread x86-64 IOPB reserved by `sys_ioport_bind`
+  holds a reference on the SEED reserve until the thread is destroyed
+  (`alloc_seed_scratch` / `free_seed_scratch`).
+- **Kernel-lifetime pins.** The SEED reserve and the root CSpace each hold a reference
+  the kernel never releases (the SEED pin from `install_seed_memory`; the root CSpace's
+  base reference, attributed to init's TCB), and `HDR_FLAG_IS_ROOT` clamps the root
+  CSpace's count at 1, so neither is ever freed. The root CSpace is init's CSpace, so the
+  caps init still holds at its reap stay in it, alive but unreachable; releasing them at
+  the reap is design intent, not yet implemented
+  ([#443](https://github.com/kottlerg/seraph/issues/443); see
+  [process-lifecycle.md § Init reap](../../../docs/process-lifecycle.md#init-reap)).
+- **Fault-handler binding.** `SYS_THREAD_SET_FAULT_HANDLER` takes a reference on the
+  bound Endpoint, released on unbind, rebind, or thread destruction.
+- **Transient holds.** A syscall that must keep an object live across a lock-free step
+  takes one for that step (for example `pre_grow_holding_dest`).
+- **Wait-set membership.** `sys_wait_set_add` `inc_ref`s the source's header under the
+  source's lock together with the back-pointer publication; `sys_wait_set_remove` and
+  `wait_set_drop` perform the matching `dec_ref`. The source's state therefore outlives
+  every wait-set member referencing it; the Endpoint/Notification/EventQueue dealloc arms
+  only `debug_assert` that `state.wait_set` is null on entry (the invariant follows from
+  the refcount). The membership protocol is in [ipc-internals.md](ipc-internals.md)
+  § Wait Set Add/Remove.
 
 ---
 
@@ -407,8 +446,9 @@ root_cap (no parent)
 
 **Transfer** (`SYS_CAP_MOVE`, IPC capability transfer) does not create a new
 derivation tree node — the destination slot takes the donor's position in the
-tree and the donor's slot becomes null (see [Move](#move) for how a large child
-list is migrated).
+tree and the donor's slot becomes null (see
+[docs/capability-model.md](../../../docs/capability-model.md) § Transfer for the
+semantics and [Move](#move) for how a large child list is migrated).
 
 **Derivation** creates a new node as a child of the source slot in the tree.
 
@@ -552,16 +592,17 @@ the slot (that ancestor's revoke clears the hoisted survivors too, since they
 remain inside its subtree).
 
 A `CSpace` reaching refcount zero first stops every thread bound to it
-(`sched::stop_threads_bound_to`, see
-[scheduling-internals.md](scheduling-internals.md) § Thread Registry): each is
-marked `Exited` and waited off every CPU before any slot page is freed, so no
-thread can be mid-syscall against the dying directory, and none of the dying
-process's own threads can touch the derivation forest during the drain below.
-If the thread running the teardown is itself stopped — it deleted the last
-capability to its own `CSpace`, or a concurrent teardown stopped it — nothing
-below runs now: the object is queued for off-CPU reclaim and the whole arm
-re-runs from the deferred drain once the thread has been scheduled away.
-The same discipline applies to an `AddressSpace` reaching refcount zero.
+(`sched::stop_threads_bound_to`, see [scheduling-internals.md](scheduling-internals.md) § Thread
+Registry): each is marked `Exited` and waited off every CPU before any slot page is freed, so no
+thread can be mid-syscall against the dying directory, and none of the dying process's own threads
+can touch the derivation forest during the drain below. If the thread running the teardown is itself
+stopped — it deleted the last capability to its own `CSpace`, or a concurrent teardown stopped it —
+nothing below runs now: the object is queued for off-CPU reclaim and the whole arm re-runs from the
+deferred drain once the thread has been scheduled away. The same discipline applies to an
+`AddressSpace` reaching refcount zero. This path has known kernel memory-safety gaps, tracked in
+[#443](https://github.com/kottlerg/seraph/issues/443) (see
+[ipc-design.md](../../../docs/ipc-design.md#the-callreply-model) § The Call/Reply Model and
+[§ Storage: Hybrid Two-Level Radix](#storage-hybrid-two-level-radix)).
 
 Every derivation link reachable from a live slot resolves: before a `CSpace`
 unregisters, its teardown drain (`drain_dying_cspace_batch`) unlinks every
@@ -695,8 +736,9 @@ derivation parent.
 ### Safe Delegation: the "Derive Twice" Pattern
 
 Revoking a capability via `SYS_CAP_REVOKE` invalidates all its descendants while
-preserving the target slot itself. To delegate authority that can later be revoked
-without losing your own access:
+preserving the target slot itself (see
+[docs/capability-model.md](../../../docs/capability-model.md) § Revocation). To
+delegate authority that can later be revoked without losing your own access:
 
 ```
 1. Hold capability C (the original).
@@ -713,6 +755,7 @@ descendants but leaves C1 itself, C, and any siblings of C1 untouched. Delegatio
 `SYS_CAP_COPY` so you keep your own access to C2 while the child holds a revocable
 copy. **IPC transfer** and `SYS_CAP_MOVE` instead hand the slot away — the sender's
 slot is freed — but the moved cap keeps its position in the derivation tree (see
+[docs/capability-model.md](../../../docs/capability-model.md) § Transfer and
 [Derivation Across Processes](#derivation-across-processes)), so it stays a
 descendant of C1 and a `SYS_CAP_REVOKE` on C1 still reaches it across the `CSpace`
 boundary. Revoking C1 frees the child's C2 slot in the child's own `CSpace`;
@@ -734,16 +777,19 @@ of cross-`CSpace` sharing keep a derivation edge across the boundary:
   free the sender's slot, but the moved cap keeps its position in the derivation
   tree — it stays a descendant of whatever it was derived from, so an ancestor's
   `cap_revoke` reaches it across the boundary. (Same-`CSpace` moves likewise keep
-  the source's position.)
+  the source's position; see
+  [docs/capability-model.md](../../../docs/capability-model.md) § Transfer.)
 - **`SYS_CAP_COPY`** keeps the new cap a derivation **child** of the source (the
   "Derive Twice" pattern above), so the source can revoke the delegated copy.
 
 In both cases a `cap_revoke` can `free_slot` the recipient's slot in its own
 `CSpace`. The handle the recipient holds carries the slot's **generation**
-(`handle = (generation << CAP_INDEX_BITS) | index`); `free_slot` bumps the
-generation, so the recipient's now-stale handle fails with `InvalidCapability`
-rather than aliasing whatever later occupies the recycled index. See the per-slot
-generation discussion under [Capability Slot](#capability-slot-capslotrs).
+(`handle = (generation << CAP_INDEX_BITS) | index`, per
+[docs/capability-model.md](../../../docs/capability-model.md) § Capability Handle
+Format); `free_slot` bumps the generation, so the recipient's now-stale handle fails
+with `InvalidCapability` rather than aliasing whatever later occupies the recycled
+index. See the per-slot generation discussion under
+[Capability Slot](#capability-slot-capslotrs).
 
 `SlotId` encodes `(cspace_id, epoch, slot_index)`. The derivation tree is resolved
 by:
@@ -761,30 +807,39 @@ tree write lock is sufficient to prevent concurrent modification.
 
 ## Initial CSpace Population
 
-During Phase 7 of initialization, the root CSpace is populated as follows.
-Slot assignments are fixed by convention and communicated to init via the boot
-protocol. Init must not assume specific slot numbers — the kernel passes the
-layout via a well-known structure at the top of init's stack.
+Phases 7, 8, and 9 of initialization, per [initialization.md](initialization.md)
+([§ Phase 7](initialization.md#phase-7-capability-system),
+[§ Phase 8](initialization.md#phase-8-scheduler-and-smp-bringup),
+[§ Phase 9](initialization.md#phase-9-init-creation-and-scheduler-entry)), populate the
+root CSpace, which becomes init's CSpace. Slots are assigned sequentially from slot 1 in
+the order below; the counts in each group depend on the platform, so init must not assume
+specific slot numbers.
 
-### Initial Slot Layout (Tentative)
+### Initial Slot Layout
 
-| Slot | Capability |
-|---|---|
-| 0 | Null (permanent) |
-| 1 | Init's own thread capability |
-| 2 | Init's own address space capability |
-| 3 | Init's own CSpace capability |
-| 4 | SchedControl capability (band `[1, PRIORITY_MAX]`) |
-| 5..N | Memory capabilities (one per usable physical region) |
-| N+1..M | MMIO region capabilities (one per MmioRange / PciEcam entry) |
-| M+1..K | Interrupt capabilities (one per IrqLine entry) |
-| K+1..L | Read-only Memory capabilities (one per PlatformTable entry) |
-| L+1..P | IoPort capabilities (one per IoPort entry; x86-64 only) |
-| P+1..Q | Memory capabilities for boot module images (raw ELF for procmgr, devmgr, etc.) |
-| Q+1..R | Reclaimable Memory capabilities for bootloader scratch pages (`BootInfo`, descriptor arrays, MMIO aperture array, reclaim-array page, transient page-table frames) and the bundle's non-module pages (header + entry table + pad, init ELF source body, inter-module and trailing slack — module bodies are excluded, covered by the boot-module Memory caps above) — one cap per `BootInfo.reclaim_ranges` entry |
+| Order | Phase | Capability |
+|---|---|---|
+| 0 | — | Null (permanent; always slot 0) |
+| 1 | 7 | Memory capabilities (one per RAM block drained from the buddy allocator; the seed block contributes only its post-reserve tail) |
+| 2 | 7 | Mmio capabilities, Map and Write rights (one over the kernel console UART on RISC-V, then one per validated `BootInfo.mmio_apertures` entry) |
+| 3 | 7 | SchedControl capability (band `[1, PRIORITY_MAX]`) |
+| 4 | 7 | One root Interrupt range capability (every valid IRQ id on the architecture) |
+| 5 | 7 | Map-only Memory capabilities (one per `AcpiReclaimable` memory-map region, up to eight, then the page holding `BootInfo.acpi_rsdp`, then the `BootInfo.device_tree` blob) |
+| 6 | 7 | One root IoPort capability over the full 64K I/O port space (x86-64 only), or one SbiControl capability carrying every sanctioned SBI right (RISC-V only) |
+| 7 | 7 | Memory capabilities for boot module images (raw ELF for procmgr, devmgr, etc.) |
+| 8 | 7 | Reclaimable Memory capabilities for bootloader scratch pages (`BootInfo`, descriptor arrays, MMIO aperture array, reclaim-array page, transient page-table frames) and the bundle's non-module pages (header + entry table + pad, init ELF source body, inter-module and trailing slack — module bodies are excluded, covered by the boot-module Memory caps above) — one cap per `BootInfo.reclaim_ranges` entry not flagged `RECLAIM_FLAG_LATE` |
+| 9 | 8 | Late-reclaim Memory capabilities (one per `BootInfo.reclaim_ranges` entry flagged `RECLAIM_FLAG_LATE`: the AP trampoline page) |
+| 10 | 9 | Init's own address space capability |
+| 11 | 9 | Reclaimable Memory capabilities for init's ELF segments |
+| 12 | 9 | Reclaimable Memory capabilities for the `InitInfo` pages |
+| 13 | 9 | Reclaimable Memory capabilities for init's stack pages |
+| 14 | 9 | Init's own thread capability |
+| 15 | 9 | Init's own CSpace capability |
 
-The exact slot numbers are passed to init in the `KernelHandoff` structure placed
-on init's user stack before it begins execution.
+The kernel passes the slot numbers to init in the `InitInfo` block it maps into
+init's address space (its VA is init's first argument). The `CapDescriptor` array
+lists each Phase 7 and Phase 8 slot with its type; header fields name the single
+caps and the base and count of several groups, including every Phase 9 group.
 
 ---
 
@@ -819,25 +874,33 @@ IPC capability transfer is normally cross-`CSpace` (sender and receiver in
 distinct processes); two threads sharing one `CSpace` can transfer between
 themselves, the lock pair collapsing to a single acquisition. The transferred
 cap keeps its position in the derivation tree, so it remains reachable by a
-`cap_revoke` on one of its ancestors; per-slot generation handles make the
-receiver's handle fail closed if such a revoke frees the
-receiver's slot (#349). A move that finishes in the first hold is atomic against
-revocation; one that needs further batches is protected by the in-flight pins
-and stays revocation-complete between holds (see [Move](#move)).
+`cap_revoke` on one of its ancestors (see
+[docs/capability-model.md](../../../docs/capability-model.md) § Revocation);
+per-slot generation handles make the receiver's handle fail closed if such a revoke
+frees the receiver's slot (#349). A move that finishes in the first hold is atomic
+against revocation; one that needs further batches is protected by the in-flight
+pins and stays revocation-complete between holds (see [Move](#move)).
 
 Reply capabilities are not part of the derivation tree — they are single-use,
-cannot be derived, and are not tracked for revocation. A reply capability is not
-a `CapTag` variant; it is an implicit per-thread mechanism created by the kernel
-at `SYS_IPC_RECV` time and stored in a per-thread slot, outside the process
-CSpace. The kernel clears the per-thread reply slot after `SYS_IPC_REPLY`.
+cannot be derived, and are not tracked for revocation (see
+[docs/ipc-design.md](../../../docs/ipc-design.md) § The Call/Reply Model). A reply
+capability is not a `CapTag` variant; it is an implicit per-thread mechanism
+created by the kernel at `SYS_IPC_RECV` time and stored in a per-thread slot,
+outside the process CSpace. The kernel clears the per-thread reply slot after
+`SYS_IPC_REPLY` (see [ipc-internals.md](ipc-internals.md) § Receive Path (Server)
+and § Reply Path).
 
 ---
 
 ## Summarized By
 
-[kernel/README.md](../README.md),
-[docs/capability-model.md](../../../docs/capability-model.md),
-[docs/ipc-design.md](../../../docs/ipc-design.md),
-[kernel/docs/syscalls.md](syscalls.md),
-[kernel/docs/memory-internals.md](memory-internals.md),
-[kernel/docs/cross-boundary-disclosure.md](cross-boundary-disclosure.md)
+[core/kernel/README.md](../README.md),
+[Kernel Cross-Boundary Disclosure Inventory](cross-boundary-disclosure.md),
+[IPC Subsystem Internals](ipc-internals.md), [Memory Subsystem Internals](memory-internals.md),
+[Scheduler Internals](scheduler.md),
+[SMP Scheduling and Locking Invariants](scheduling-internals.md),
+[Syscall Interface Specification](syscalls.md),
+[Capability Model](../../../docs/capability-model.md),
+[Fault Handling](../../../docs/fault-handling.md), [IPC Design](../../../docs/ipc-design.md),
+[Process Lifecycle](../../../docs/process-lifecycle.md),
+[init Bootstrap Stages](../../../services/init/docs/bootstrap.md)

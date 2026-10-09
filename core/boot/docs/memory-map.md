@@ -64,36 +64,58 @@ in-place, no-allocation, no-recursion implementation is preferred.
 ## Allocation-Class Classification
 
 Every bootloader allocation uses `EfiLoaderCode` or `EfiLoaderData` and
-therefore surfaces as `MemoryType::Loaded`. The kernel treats `Loaded`
-regions as in-use until it explicitly reclaims them in Phase 3 (kernel
-page-table replacement). Specifically:
+therefore surfaces as `MemoryType::Loaded`. The kernel never hands
+`Loaded` regions to its buddy allocator. Three `Loaded` sets return to the
+pool, each through reclaimable Memory caps that the kernel hands to init;
+init hands those caps to procmgr, which donates them to memmgr when it reaps
+init (see [process-lifecycle.md](../../../docs/process-lifecycle.md) §"Init reap"):
 
+- The bootloader-scratch subset recorded in `BootInfo.reclaim_ranges`, minted
+  in Phase 7 (the AP trampoline page is late-minted in Phase 8). See
+  [initialization.md](../../kernel/docs/initialization.md) §"Phase 7: Capability System",
+  and §"Phase 3: Kernel Page Tables" step 7 for the bootloader page-table
+  frames.
+- The boot-module bodies, minted by `mint_module_memory_caps` in Phase 7.
+- The init image LOAD segments, one reclaimable Memory cap per `InitImage`
+  segment (Phase 9's RELRO seal splits a writable segment in two when the
+  RELRO range ends inside it) minted in Phase 9. See
+  [initialization.md](../../kernel/docs/initialization.md)
+  §"Phase 9: Init Creation and Scheduler Entry".
+
+Every other `Loaded` page is permanent: the bootloader's own loaded image
+(firmware-allocated as `EfiLoaderCode` / `EfiLoaderData`; it contains the
+handoff trampoline), the kernel image, the kernel handoff stack (kept as the
+BSP boot stack), the kernel ELF file read buffer, the raw UEFI memory-map
+buffer, and, on riscv64, the paging-mode probe page.
+
+The `Loaded` allocations are:
+
+- The bootloader's own loaded image (firmware-allocated as `EfiLoaderCode` /
+  `EfiLoaderData`; it contains the handoff trampoline).
 - Kernel image LOAD segments, placed in a bootloader-chosen contiguous span.
+- Kernel ELF file read buffer.
 - Init image LOAD segments, placed at any free physical address.
-- Boot-module file buffers, placed at any free physical address.
+- Bundle blob: one allocation holding the bundle header and entry table,
+  every boot-module body, and the init ELF source.
 - `BootInfo` structure page.
+- `BootInfo.modules` descriptor page.
 - `MmioAperture` array page (`mmio_apertures.entries`).
-- Memory-map buffer itself.
-- Bootloader stack region (mapped by UEFI at boot; classified by
-  firmware, not by the bootloader).
+- Raw UEFI memory-map buffer (the `GetMemoryMap` output).
+- Translated `MemoryMapEntry` array (`BootInfo.memory_map`).
+- Reclaim-array page (the `BootInfo.reclaim_ranges` backing).
+- AP trampoline page, when allocated.
+- Kernel handoff stack (`KERNEL_STACK_PAGES`, 64 KiB).
 - Page-table frames allocated for the initial mapping (see
   [page-tables.md](page-tables.md)).
-
-The `BootInfo.modules` slice and its backing page are similarly
-`Loaded`; the kernel only reclaims them after init has copied whatever
-is needed.
+- riscv64 only: the paging-mode probe page.
 
 ---
 
 ## Sizing the Map Buffer
 
-The UEFI map query is racy with allocation: each `AllocatePages` call
-can grow the map by one entry. The buffer size is taken from the
-first, size-query call and padded with extra slack for the map-buffer
-allocation itself. The exact slack constant is internal to
-[`boot/src/memory_map.rs`](../src/memory_map.rs); it is sized so the
-post-allocation map fits without reallocation under every supported
-firmware implementation.
+The acquisition sequence that sizes and fills the map buffer, including
+its slack margin, is owned by
+[uefi-environment.md](uefi-environment.md) §"Memory Map Acquisition".
 
 ---
 
@@ -107,7 +129,8 @@ kernel-MMIO regions above it form the direct-map ceiling
 1 GiB-aligned in the gap between the mode's kernel-half floor and the kernel
 image. The kernel re-derives the same ceiling from the same helper at Phase 3
 to guard the mapping, so bootloader and kernel cannot disagree. See
-[boot-flow.md](boot-flow.md) step 9 and `core/kernel/docs/initialization.md`.
+[boot-flow.md](boot-flow.md) step 9 and [initialization.md](../../kernel/docs/initialization.md)
+§"Phase 3: Kernel Page Tables".
 
 ## What Lives Elsewhere
 
@@ -124,4 +147,4 @@ to guard the mapping, so bootloader and kernel cannot disagree. See
 
 ## Summarized By
 
-[boot/README.md](../README.md)
+[Boot Flow](boot-flow.md), [UEFI Environment](uefi-environment.md)

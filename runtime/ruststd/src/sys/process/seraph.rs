@@ -1029,7 +1029,10 @@ impl Process {
             b.exit_reason.load(Ordering::Acquire)
         } else {
             // Non-piped: `wait` consumes the kernel's death post on
-            // `death_eq` directly. No bridge thread allocated.
+            // `death_eq` directly. No bridge thread allocated. A `death_eq`
+            // destroyed while `wait` is parked returns `Ok(0)`, not an error
+            // (a kernel defect tracked in #443), so `wait` caches and returns
+            // `ExitStatus(0)` for a death that was never reported.
             syscall::event_recv(self.death_eq)
                 .map_err(|_| io::Error::other("event_recv on child death queue failed"))?
         };
@@ -1160,10 +1163,19 @@ struct BridgeHandles {
 }
 
 fn bridge_main(h: BridgeHandles) {
+    // A `death_eq` destroyed while this wait is parked returns `Ok(0)`, not
+    // an error (a kernel defect tracked in #443). The bridge then runs the
+    // whole death path below, as for a real death, for a child that may
+    // still be alive: it records exit reason 0, a clean exit the child never
+    // reported, sets `peer_dead` so the parent's pipe ends report EOF or
+    // `BrokenPipe`, kicks every pipe notification, and reports the death to
+    // each `RingRelease`, so a ring grant returns to memmgr once its parent
+    // end is dropped (at once for an end already dropped) while the child
+    // may still be writing through its mapping.
     let payload = match syscall::event_recv(h.death_eq) {
         Ok(p) => p,
-        // event_recv error => death_eq is gone (cap_revoke from a
-        // misbehaving spawner) — nothing to do, exit cleanly.
+        // `event_recv` error (`death_eq` invalid, or the wait interrupted)
+        // — nothing to do, exit without firing any wakes.
         Err(_) => return,
     };
     if payload == BRIDGE_SENTINEL_DROP {

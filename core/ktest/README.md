@@ -175,11 +175,15 @@ Defined in `src/main.rs` (the `spawn::` items in `src/spawn.rs`):
 
 ## Compile-time options
 
-The boot protocol carries no kernel command line; ktest's runtime
-knobs live in `KtestConfig::DEFAULT` in
-[`src/cmdline.rs`](src/cmdline.rs) and are baked in at compile time.
-Editing the constant and rebuilding ktest (`cargo xtask build -p
-ktest`) is the canonical way to flip them.
+The boot protocol carries no kernel command line
+([core/boot/README.md](../boot/README.md) § What the Bootloader Does Not Do); ktest's runtime
+knobs live in `KtestConfig::DEFAULT` in [`src/cmdline.rs`](src/cmdline.rs) and are baked in at
+compile time. To flip them, edit the constant, rebuild ktest
+(`cargo xtask build --component ktest`), then re-compose the bundle
+(`cargo xtask compose-bundle --harness ktest`, per [§ Activating ktest](#activating-ktest))
+before `cargo xtask run`; a single-component build does not re-compose the bundle, so whatever
+bundle was last composed (the previous ktest binary, or default init after a full build) boots
+until it is re-composed.
 
 | Field | Values | Default | Description |
 |---|---|---|---|
@@ -191,7 +195,7 @@ ktest`) is the canonical way to flip them.
 The defaults are picked for CI: every tier runs, the VM exits cleanly
 on completion, and no human-watch grace period is added. To keep QEMU
 open after a local interactive run, set `shutdown_policy:
-ShutdownPolicy::Never` and rebuild.
+ShutdownPolicy::Never` and rebuild and re-compose as above.
 
 ### Shutdown
 
@@ -214,4 +218,5 @@ narrower-scope run is produced.
 
 ## Summarized By
 
-[docs/testing.md](../../docs/testing.md)
+[System Bootstrap](../../docs/bootstrap.md), [Build System](../../docs/build-system.md),
+[Testing](../../docs/testing.md), [xtask/README.md](../../xtask/README.md)

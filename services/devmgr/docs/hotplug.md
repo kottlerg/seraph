@@ -8,4 +8,4 @@ devices.
 
 ## Summarized By
 
-[devmgr/README.md](../README.md)
+[devmgr Responsibilities and Capabilities](responsibilities.md)

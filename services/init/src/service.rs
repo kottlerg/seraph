@@ -641,15 +641,16 @@ pub fn create_devmgr_with_caps(
     // caps: [svcmgr_publish_cap, arch_shutdown_cap]. The SEND-rights cap
     // on svcmgr's service endpoint is stamped with the PUBLISH_AUTHORITY
     // verb-bit in its badge so devmgr can register service caps in
-    // svcmgr's registry on init's behalf (today's only use is reserved
-    // for future devmgr publications; the active publications — `timed`,
-    // `rootfs.root`, `svcmgr`, `devmgr.registry` — are init-issued).
-    // The arch shutdown-authority cap is the root `IoPort` on x86-64
-    // (devmgr derives narrow per-driver IoPort caps from it for ISA
-    // peripherals like the CMOS RTC, and carves the PM1a + 8042 ports for
-    // pwrmgr) and `SbiControl` on RISC-V (devmgr serves a copy to pwrmgr
-    // for SBI SRST). devmgr is the hardware authority; pwrmgr acquires its
-    // shutdown caps from devmgr, not from init.
+    // svcmgr's registry (reserved for future devmgr publications; svcmgr
+    // publishes the active well-known names itself, per
+    // `services/init/docs/bootstrap.md` § Per-stage authority transfers).
+    // The arch shutdown-authority cap is a full-rights derivation of the
+    // root `IoPort` on x86-64 (devmgr derives narrow per-driver IoPort caps
+    // from it for ISA peripherals like the CMOS RTC, and carves the PM1a +
+    // 8042 ports for pwrmgr) and an `SbiControl` derivation narrowed to
+    // Reset and Suspend on RISC-V (devmgr serves a Reset-only derivation to
+    // pwrmgr for SBI SRST). devmgr is the hardware authority; pwrmgr
+    // acquires its shutdown caps from devmgr, not from init.
     // SVCMGR_BUNDLE is unconditionally the terminal round. On any
     // preparation failure init MUST still emit a `done=true` round so
     // devmgr's bootstrap_rounds loop in `services/devmgr/src/caps.rs`
@@ -708,11 +709,14 @@ pub fn create_devmgr_with_caps(
     else if info.sbi_control_cap != 0
     {
         // RISC-V: devmgr is the steady-state holder of the platform firmware
-        // authority (init is reaped, so its root cap is dropped). Transfer only
-        // the power-state extensions — system reset (served to pwrmgr on
-        // QUERY_SHUTDOWN_DEVICE, narrowed to Reset there) and suspend (reserved
-        // for a future path). The other sanctioned SBI rights are carried into
-        // no surviving cap and are therefore dropped at init's reap.
+        // authority (init is reaped, so its root cap becomes unreachable).
+        // Transfer only the power-state extensions — system reset (served to
+        // pwrmgr on QUERY_SHUTDOWN_DEVICE, narrowed to Reset there) and suspend
+        // (reserved for a future path). The other sanctioned SBI rights are
+        // carried into no surviving cap and become unreachable at init's reap:
+        // the root cap stays alive in init's kernel-pinned root CSpace;
+        // releasing it at the reap is design intent, not yet implemented
+        // (`docs/process-lifecycle.md` § Init reap, #443).
         syscall::cap_derive(
             info.sbi_control_cap,
             syscall::RIGHTS_SBI_RESET | syscall::RIGHTS_SBI_SUSPEND,
@@ -971,7 +975,7 @@ pub struct SvcmgrEndowment
     /// agnostic to which process holds the RECV.
     pub master_log_source: u32,
     /// Reserved badge-0 `SEND|GRANT` source on procmgr's service endpoint.
-    /// svcmgr mints real-logd's `DEATH_EQ_AUTHORITY` SEND from it per launch
+    /// svcmgr mints real-logd's `DEATH_EQ_AUTHORITY` `SEND|GRANT` cap from it per launch
     /// (used by logd to register sender death-notifications for slot reclaim).
     pub procmgr_death_auth_source: u32,
 }
@@ -1107,7 +1111,10 @@ fn endow_svcmgr(
     // Terminal round (LOGD_SOURCES): the reserved master-log endpoint source
     // and the badge-0 procmgr `SEND|GRANT` source. svcmgr mints real-logd's
     // bootstrap caps from these on every (re)launch. A zero slot rides if a
-    // source derive failed; svcmgr degrades (logd unlaunchable) but survives.
+    // source derive failed and reaches logd as a zero cap: without the death-auth
+    // source logd runs but cannot reclaim per-sender slots; without the master-log
+    // source logd exits at startup and, being `critical = yes` with no
+    // `on_failure` restart for a clean exit, svcmgr starts a graceful shutdown.
     let _ = serve(
         bootstrap_ep,
         child_badge,
@@ -1192,7 +1199,7 @@ pub fn phase3_svcmgr_handover(
     // per-mount fatfs cap to publish.
     let master_log_source = syscall::cap_derive(log_ep, syscall::RIGHTS_ALL).unwrap_or(0);
     // Badge-0 `SEND|GRANT` source on procmgr's service endpoint; svcmgr mints
-    // logd's `DEATH_EQ_AUTHORITY` SEND from it. `GRANT` because logd's
+    // logd's `DEATH_EQ_AUTHORITY` `SEND|GRANT` cap from it. `GRANT` because logd's
     // death-EQ registration transfers a cap, which the IPC kernel gates on it.
     let procmgr_death_auth_source =
         syscall::cap_derive(procmgr_ep, syscall::RIGHTS_EP_SEND_GRANT).unwrap_or(0);
@@ -1257,7 +1264,10 @@ pub fn phase3_svcmgr_handover(
 
 /// Send one `REGISTER_INIT_TEARDOWN` donate-only round (word 0 = 0)
 /// carrying `slots` as caps. Non-fatal on failure: init exits regardless,
-/// and any un-sent cap falls to the `CSpace` cascade.
+/// and any un-sent cap stays in init's `CSpace`, which the kernel pins (it is
+/// the root `CSpace`), so it remains alive but unreachable; releasing it at the
+/// reap is design intent, not yet implemented (`docs/process-lifecycle.md`
+/// § Init reap, #443).
 ///
 /// # Safety
 /// `ipc_buf` must be init's registered IPC buffer; `procmgr_ep` must carry
@@ -1346,9 +1356,10 @@ fn register_init_reap_objects(
 /// `CSpace`.
 ///
 /// Failures here are logged but otherwise non-fatal — init still calls
-/// `sys_thread_exit` afterward, just leaving the un-transferred caps
-/// to cascade through `CSpace` teardown to the kernel buddy on eventual
-/// cap death.
+/// `sys_thread_exit` afterward, leaving the un-transferred caps in init's
+/// `CSpace`, which the kernel pins (it is the root `CSpace`), so they remain
+/// alive but unreachable; releasing them at the reap is design intent, not yet
+/// implemented (`docs/process-lifecycle.md` § Init reap, #443).
 fn finish_init_reap_handoff(
     info: &InitInfo,
     procmgr_ep: u32,
@@ -1427,9 +1438,10 @@ fn finish_init_reap_handoff(
         }
         // The free Memory caps MemoryAlloc abandoned while carving bootstrap
         // arenas: memory_split remainders below the floor with no descriptor.
-        // Without this they would cascade into the sealed buddy at CSpace
-        // teardown and leak. They carry RETYPE + owns_memory like any RAM
-        // memory cap, so memmgr ingests them into its pool.
+        // Without this they would stay stranded in init's kernel-pinned root
+        // CSpace after the reap and leak (`docs/process-lifecycle.md` § Init
+        // reap, #443). They carry RETYPE + owns_memory like any RAM memory
+        // cap, so memmgr ingests them into its pool.
         for &slot in orphan_memory_caps
         {
             push(slot);

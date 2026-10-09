@@ -31,9 +31,9 @@
 //! The free list is intrusive: each free page's first 8 bytes (accessed
 //! via the direct physical map) hold the next-PA pointer, or 0 for the
 //! tail. `alloc_pt_page` pops, zeros the page, and returns the PA. Pages
-//! are never returned: in practice only init's bootstrap space draws on the
-//! pool, nothing destroys it today, and a reclaiming unmap leaves
-//! kernel-direct tables in place.
+//! are never returned; `core/kernel/docs/memory-internals.md` § Page Table
+//! Node Ownership states why the nodes behind init's bootstrap space stay
+//! consumed after its reap.
 
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 

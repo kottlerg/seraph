@@ -62,9 +62,10 @@ endpoint dispatches in two stages, from `vfsd::namespace_loop`:
 1. **Local-child match.** [`VfsdRootBackend::lookup`] walks the
    parent node's child list. A match on a *terminal* child returns
    an [`EntryTarget::External`] view carrying the driver's unbadged
-   endpoint and the peer root node; the namespace-protocol crate mints
-   a fresh `cap_derive_badge` on that endpoint carrying the composed
-   `parent_rights ∩ entry.max_rights ∩ caller_requested` rights. The
+   endpoint and the peer root node; the namespace-protocol crate
+   ([`shared/namespace-protocol/README.md`](../../../shared/namespace-protocol/README.md)
+   § NS_LOOKUP) mints a fresh `cap_derive_badge` on that endpoint carrying the
+   composed `parent_rights ∩ entry.max_rights ∩ caller_requested` rights. The
    reply cap belongs to the underlying filesystem driver's namespace
    endpoint; subsequent walks bypass vfsd entirely. A match on a
    *synthetic intermediate* child returns an [`EntryTarget::Local`]
@@ -85,12 +86,15 @@ endpoint dispatches in two stages, from `vfsd::namespace_loop`:
    travels back unchanged. This is required because the fall-through
    cap was minted by vfsd's own walk and carries full namespace
    rights — the receiving fs driver composes its returned rights
-   against the destination cap's badge, so without the repack the
-   caller's attenuation would be discarded. Repacking preserves the
-   `docs/namespace-model.md` § "Walking" invariant
-   (walk-monotonic-attenuation) across mount boundaries: a child cap
-   minted at the fs driver carries at most the caller's parent
-   rights, intersected with the entry's `max_rights` ceiling.
+   against the destination cap's badge
+   ([`shared/namespace-protocol/README.md`](../../../shared/namespace-protocol/README.md)
+   § NS_LOOKUP), so without the repack the
+   caller's attenuation would be discarded. Repacking keeps walking
+   monotonically attenuating across mount boundaries, as
+   [`docs/namespace-model.md`](../../../docs/namespace-model.md#cross-server-entries)
+   § Cross-server entries requires of a forwarder: a child cap minted
+   at the fs driver carries at most the caller's parent rights,
+   intersected with the entry's `max_rights` ceiling.
 
    The fall-through preserves the namespace-model rule that root-fs
    entries remain reachable unless explicitly shadowed by a
@@ -126,11 +130,17 @@ backend then retains the driver's **unbadged** namespace endpoint
 Every `NS_LOOKUP` that crosses the mount mints a *fresh* badged SEND on
 that endpoint carrying the composed
 `parent_rights ∩ entry.max_rights ∩ caller_requested` rights (the
-[`EntryTarget::External`] arm of `handle_lookup`). Storing the unbadged
+[`EntryTarget::External`] arm of `handle_lookup`; see
+[`shared/namespace-protocol/README.md`](../../../shared/namespace-protocol/README.md)
+§ NS_LOOKUP). Storing the unbadged
 endpoint — rather than a pre-badged root cap — is what carries
-attenuation across the mount boundary: a node cap's rights live in its
+attenuation across the mount boundary
+([`docs/namespace-model.md`](../../../docs/namespace-model.md#cross-server-entries)
+§ Cross-server entries): a node cap's rights live in its
 badge, and the kernel forbids re-badging an already-badged cap
-(`SYS_CAP_DERIVE_BADGE` rejects a badged source), so a stored badged cap
+(`SYS_CAP_DERIVE_BADGE` rejects a badged source; see
+[`docs/capability-model.md`](../../../docs/capability-model.md#kernel-guarantees)
+§ Kernel guarantees), so a stored badged cap
 could only ever be `cap_derive`-copied at its original full rights,
 laundering authority. The root mount is the exception — its
 `fallthrough_cap` is a *badged* SEND on the root fs (see fall-through
@@ -173,6 +183,17 @@ vfsd holds two un-badged endpoints:
   issues via `cap_derive_badge` (the synthetic root cap, plus a
   fresh cap per synthetic intermediate descent).
 
+At startup vfsd spawns the namespace dispatcher first, then self-mounts
+root, `/esp`, and `/data`, then spawns the service threads. The
+dispatcher runs first because the `/esp` and `/data` mounts take the
+post-boot fatfs spawn path: vfsd resolves `/services/fs/fatfs` with an
+`NS_LOOKUP` walk through its own system-root cap, which re-enters the
+namespace endpoint, before handing the file cap to procmgr's
+`CREATE_FROM_FILE`. Service threads start only after the self-mounts,
+so `GET_SYSTEM_ROOT_CAP` is never served against an unmounted root; its
+reply contract, including `NO_MOUNT` when the root self-mount failed,
+is specified in [`vfs-ipc-interface.md`](vfs-ipc-interface.md).
+
 vfsd is also the owner of fs-process lifecycle: `MOUNT` spawns the
 fatfs driver via `worker_pool` (or, on the very first mount, from
 the boot module). The first-mount `CREATE_PROCESS` is permanent and
@@ -210,4 +231,5 @@ seeing different roots) and `cap_revoke`-driven unmount.
 
 ## Summarized By
 
-[services/vfsd/README.md](../README.md), [docs/storage.md](../../../docs/storage.md)
+[Storage](../../../docs/storage.md), [services/fs/README.md](../../fs/README.md),
+[services/vfsd/README.md](../README.md)

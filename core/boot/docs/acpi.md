@@ -16,7 +16,7 @@ MCFG, and (RISC-V only) SPCR. Every other XSDT-linked table (FADT,
 SSDT, DSDT, BERT, EINJ, DMAR, …) is left untouched; its address
 remains reachable from the RSDP via the passthrough
 `BootInfo.acpi_rsdp` pointer, and any userspace component that needs
-it re-parses the tree itself.
+it re-parses the tree itself (see [firmware-parsing.md](firmware-parsing.md)).
 
 SPCR is consumed only on RISC-V and only for the UART base address:
 once by the pre-Step-1 serial-init path (see [console.md](console.md))
@@ -27,7 +27,8 @@ discovery.
 
 The bootloader does **not** evaluate AML. It reads static table fields
 only; ACPI namespace evaluation, `_CRS`/`_HID`/`_PRT` resolution, device
-binding, and IOMMU-topology discovery are userspace concerns.
+binding, and IOMMU-topology discovery are userspace concerns; see
+[firmware-parsing.md](firmware-parsing.md) §"Parsing Depth".
 
 ---
 
@@ -48,10 +49,10 @@ The XSDT pointer at RSDP offset 24 is the authoritative table root; the
 |---|---|---|
 | MADT | `"APIC"` | `BootInfo.cpu_count` / `cpu_ids` via LAPIC (type 0), Local x2APIC (type 9, 32-bit IDs), and RINTC (type 0x18). On x86-64: `BootInfo.kernel_mmio` LAPIC base (MADT header + type-5 override) and IOAPIC entries (type 1). On RISC-V: `BootInfo.kernel_mmio.plic_base` / `plic_size` from the first PLIC entry (type 0x1B). Aperture seeds for LAPIC, IOAPIC, and RISC-V PLIC. |
 | MCFG | `"MCFG"` | Aperture seeds for each ECAM window and the derived 32-bit / 64-bit PCI BAR windows (QEMU-layout heuristic; see `firmware-parsing.md` for the real-hardware `_CRS` note). |
-| SPCR | `"SPCR"` | RISC-V only: `BootInfo.kernel_mmio.uart_base` (from the Generic Address Structure when the address-space identifier is MMIO). `uart_size` is set to the ns16550a conventional 0x100 (SPCR does not carry a region size; if DTB also advertises the UART, DTB's explicit `reg` size overrides). The pre-Step-1 serial-init path uses the same walk to pick up a UART base for early diagnostics. |
+| SPCR | `"SPCR"` | RISC-V only: `BootInfo.kernel_mmio.uart_base` (from the Generic Address Structure when the address-space identifier is MMIO). `uart_size` is set to the ns16550a conventional 0x100 (SPCR does not carry a region size; if DTB also advertises the UART, DTB's explicit `reg` size overrides). The pre-Step-1 serial-init path uses the same walk to pick up a UART base for early diagnostics (see [console.md](console.md)). |
 
 Every other signature is ignored by the bootloader. Userspace consumes
-the remaining ACPI tree via `BootInfo.acpi_rsdp`.
+the remaining ACPI tree via `BootInfo.acpi_rsdp`; see [firmware-parsing.md](firmware-parsing.md).
 
 ---
 
@@ -63,8 +64,10 @@ Malformed tables are skipped, not fatal:
 - Unknown MADT / MCFG entry types are silently skipped.
 
 A warning is logged on hard failure; the bootloader proceeds with
-whatever it successfully extracted and lets the kernel fall back to its
-compile-time defaults for any zero fields.
+whatever it successfully extracted. The kernel falls back to its compile-time defaults
+for any zero MMIO base field, but a zero riscv64 `timebase_freq` or a missing `hart_caps`
+bit (both filled by the RHCT walk) halts the kernel at Phase 5 (see
+[boot-flow.md](boot-flow.md) §"Step 9").
 
 ---
 
@@ -85,4 +88,4 @@ compile-time defaults for any zero fields.
 
 ## Summarized By
 
-[boot/README.md](../README.md)
+[Early Console](console.md), [Firmware Parsing](firmware-parsing.md)

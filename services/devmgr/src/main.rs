@@ -7,12 +7,14 @@
 //! driver binding.
 //!
 //! devmgr receives raw firmware access (ACPI RSDP / reclaimable regions,
-//! DTB blob), the root Interrupt range cap, and the MMIO aperture list
-//! from init. It parses MCFG / DTB to locate the PCI ECAM, narrows MMIO
-//! apertures via `mmio_split`, and splits single-IRQ caps off the root
-//! range via `irq_split` before delegating to driver processes.
+//! DTB blob), a full-rights derivation of the root Interrupt range cap,
+//! and the MMIO aperture list from init. It parses MCFG / DTB to locate
+//! the PCI ECAM, narrows MMIO apertures via `mmio_split`, and splits
+//! single-IRQ caps off that range via `irq_split` before delegating to driver processes.
 //!
-//! See `devmgr/README.md` for the full design.
+//! See `services/devmgr/docs/responsibilities.md` for devmgr's responsibilities
+//! and driver authority, and `docs/device-management.md` for the system-scope
+//! design.
 
 #![allow(clippy::cast_possible_truncation)]
 
@@ -120,7 +122,7 @@ fn main() -> !
         std::os::seraph::log!("failed to create block device endpoint");
     }
 
-    // IRQ allocator state: consume the root range cap ascending.
+    // IRQ allocator state: consume devmgr's Interrupt range cap ascending.
     let mut irq_root = IrqRootAllocator::new(caps.irq_range_cap);
 
     // Carve the UART interrupt before any PCI device IRQ. The allocator is
@@ -1059,9 +1061,9 @@ fn handle_query_acpi_table(caps: &caps::DevmgrCaps, msg: &IpcMessage, badge: u64
 /// `QUERY_SHUTDOWN_DEVICE` handler: serve pwrmgr the platform shutdown
 /// actuator caps. devmgr carves exactly what is asked for and runs no
 /// shutdown logic. x86-64: a narrow `IoPort` over the caller-supplied
-/// `PM1a` control port plus the 8042 reset port. RISC-V: a `cap_derive` copy
-/// of `SbiControl`. The caps are re-derived from the root on every call,
-/// so a pwrmgr restart re-acquires them cleanly.
+/// `PM1a` control port plus the 8042 reset port. RISC-V: a Reset-only
+/// `SbiControl` derivation. The caps are re-derived from devmgr's held
+/// caps on every call, so a pwrmgr restart re-acquires them cleanly.
 fn handle_query_shutdown_device(
     caps: &caps::DevmgrCaps,
     msg: &IpcMessage,
@@ -1216,7 +1218,7 @@ fn carve_subrange(caps: &mut caps::DevmgrCaps, phys: u64, size: u64) -> Option<u
     )
 }
 
-// ── Root Interrupt range allocator ──────────────────────────────────────────
+// ── Interrupt range allocator ───────────────────────────────────────────────
 
 struct IrqRootAllocator
 {
@@ -1418,7 +1420,7 @@ fn spawn_virtio_blk(
     false
 }
 
-/// Split a single-IRQ `Interrupt` cap for a PCI device off the root range cap.
+/// Split a single-IRQ `Interrupt` cap for a PCI device off devmgr's Interrupt range cap.
 fn acquire_single_irq_cap(pci_dev: &pci::PciDevice, irq_root: &mut IrqRootAllocator)
 -> Option<u32>
 {
@@ -2007,15 +2009,15 @@ fn test_spawn_orphan(
     Some(spawned)
 }
 
-/// Carve the COM1 `IoPort` (`0x3F8`..=`0x3FF`) out of the root
-/// `IoPort` cap.
+/// Carve the COM1 `IoPort` (`0x3F8`..=`0x3FF`) out of devmgr's
+/// full-rights `IoPort` cap.
 #[cfg(target_arch = "x86_64")]
 fn carve_uart_authority(caps: &mut caps::DevmgrCaps) -> Option<u32>
 {
     ioport_carve(caps.ioport_root_cap, 0x3F8, 8)
 }
 
-/// Carve the platform RTC's hardware-authority cap out of devmgr's root
+/// Carve the platform RTC's hardware-authority cap out of devmgr's
 /// authority pool. The bases below are platform-static (legacy MC146818
 /// at ISA `0x70` on x86-64; QEMU virt goldfish-RTC at `0x101000` on
 /// RISC-V) and hardcoded here pending #165, which replaces all such
@@ -2049,7 +2051,7 @@ fn carve_uart_authority(caps: &mut caps::DevmgrCaps) -> Option<u32>
     carve_subrange(caps, 0x1000_0000, 0x1000)
 }
 
-/// Isolate the UART interrupt cap from the IRQ root so the serial driver can
+/// Isolate the UART interrupt cap from devmgr's IRQ range so the serial driver can
 /// route RX wakeups to its client. COM1 is ISA IRQ 4 on x86-64; the QEMU
 /// `virt` NS16550 is PLIC source 10. Both are platform-static and hardcoded on
 /// the same basis as the UART MMIO/IoPort above, pending the data-driven
@@ -2068,9 +2070,11 @@ fn carve_uart_irq(irq_root: &mut IrqRootAllocator) -> Option<u32>
 }
 
 /// Carve a narrow `IoPort` of `count` ports starting at `base` out of
-/// the root `IoPort` cap via two `ioport_split` calls. Returns the
-/// narrow slot; the unused slabs are deleted. `cap_derive`-copies the root
-/// so it stays intact for further carves. Mirrors init's `ioport_carve`.
+/// devmgr's full-rights `IoPort` cap via two `ioport_split` calls. Returns
+/// the narrow slot; the unused slabs are deleted, except that an
+/// overflowing `base + count` leaks the derived working cap (#446). `cap_derive`-copies the
+/// source so it stays intact for further carves. `root_cap` is that
+/// full-rights cap.
 #[cfg(target_arch = "x86_64")]
 fn ioport_carve(root_cap: u32, base: u16, count: u16) -> Option<u32>
 {

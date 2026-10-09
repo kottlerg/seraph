@@ -4,7 +4,9 @@ Binary boot protocol contract between the bootloader and the kernel.
 
 Defines `BootInfo` and all associated types passed from the bootloader to the
 kernel entry point. Includes the `BOOT_PROTOCOL_VERSION` constant; the kernel
-halts at entry if the bootloader's version does not match.
+halts at entry if the bootloader's version does not match (see
+[core/kernel/docs/initialization.md](../../core/kernel/docs/initialization.md)
+§ Phase 0: Entry Validation).
 
 **Constraints:** `no_std`, `#[repr(C)]` for all types, no dependencies outside
 `core`. Changes that alter `BootInfo` layout or the CPU entry contract MUST
@@ -45,7 +47,8 @@ A compliant bootloader MUST, before jumping to the kernel entry point:
 - Zero BSS segments.
 - Respect ELF segment permissions (readable, writable, executable) when
   establishing initial page table entries; never map any region as both
-  writable and executable (W^X).
+  writable and executable (W^X; see
+  [docs/memory-model.md](../../docs/memory-model.md) § W^X Enforcement).
 - Obtain the final UEFI memory map after all allocations are complete.
 - Call `ExitBootServices` successfully before jumping to the kernel.
 - Populate every field of `BootInfo` per the per-field semantics in
@@ -61,7 +64,6 @@ A compliant bootloader MUST, before jumping to the kernel entry point:
 A compliant bootloader MUST NOT:
 
 - Leave UEFI boot services active at kernel entry.
-- Map any region as both writable and executable.
 - Assume anything about the kernel's internal layout beyond the ELF
   headers.
 - Include in `BootInfo.mmio_apertures` any region that is inaccessible
@@ -71,27 +73,7 @@ A compliant bootloader MUST NOT:
 
 ## Summarized By
 
-[abi/README.md](../README.md),
 [core/boot/README.md](../../core/boot/README.md),
-[core/boot/docs/firmware-parsing.md](../../core/boot/docs/firmware-parsing.md),
-[core/boot/docs/elf-loading.md](../../core/boot/docs/elf-loading.md),
-[core/boot/docs/uefi-environment.md](../../core/boot/docs/uefi-environment.md),
-[core/boot/docs/boot-flow.md](../../core/boot/docs/boot-flow.md),
-[core/boot/docs/kernel-handoff.md](../../core/boot/docs/kernel-handoff.md),
-[core/boot/docs/memory-map.md](../../core/boot/docs/memory-map.md),
-[core/boot/docs/console.md](../../core/boot/docs/console.md),
-[xtask/README.md](../../xtask/README.md),
-[docs/bootstrap.md](../../docs/bootstrap.md),
-[docs/build-system.md](../../docs/build-system.md),
-[docs/architecture.md](../../docs/architecture.md),
-[docs/memory-model.md](../../docs/memory-model.md),
-[docs/device-management.md](../../docs/device-management.md),
-[core/kernel/README.md](../../core/kernel/README.md),
-[core/kernel/docs/initialization.md](../../core/kernel/docs/initialization.md),
-[core/kernel/docs/syscalls.md](../../core/kernel/docs/syscalls.md),
-[core/kernel/docs/entropy.md](../../core/kernel/docs/entropy.md),
-[services/init/README.md](../../services/init/README.md),
-[services/procmgr/README.md](../../services/procmgr/README.md),
-[services/devmgr/README.md](../../services/devmgr/README.md),
-[shared/elf/README.md](../../shared/elf/README.md),
-[abi/init-protocol/README.md](../init-protocol/README.md)
+[Firmware Parsing](../../core/boot/docs/firmware-parsing.md),
+[Kernel Handoff Contract](../../core/boot/docs/kernel-handoff.md),
+[Build System](../../docs/build-system.md)

@@ -11,19 +11,30 @@
 //!
 //! ## Protocol
 //! 1. Caller: `call(ep, msg)` — if a server is waiting → transfer message,
-//!    mint reply capability, wake server, block caller on reply.
-//!    Otherwise → enqueue caller on `send_queue`.
+//!    bind the caller into the server's `reply_tcb`, wake server, block caller
+//!    on reply. Otherwise → enqueue caller on `send_queue`.
 //! 2. Server: `recv(ep)` — if a caller is waiting → dequeue, transfer message,
-//!    mint reply cap, return to server. Otherwise → block on `recv_queue`.
-//! 3. Server: `reply(reply_cap, msg)` — transfer reply, wake caller, consume cap.
+//!    bind the caller into the server's `reply_tcb`, return to server.
+//!    Otherwise → block on `recv_queue`.
+//! 3. Server: `reply(msg)` — claim and clear `reply_tcb` by compare-exchange,
+//!    deliver the reply to the claimed caller, wake it.
 //!
 //! ## Reply capability
 //! Phase 9 uses a simple approach: the "reply cap" is stored directly in the
-//! caller's TCB (`reply_tcb` field). The server's `reply_cap_slot` points at the
+//! server's TCB (`reply_tcb` field). The server's `reply_tcb` points at the
 //! caller's TCB. Full derivation-tree reply caps are deferred to a future phase.
 //!
 //! ## Thread safety
-//! All operations must be called with the relevant scheduler lock held.
+//! `endpoint_call` and `endpoint_recv` take `EndpointState::lock` (`ep.lock`)
+//! themselves; it serialises the send/recv queues and the call/recv rendezvous.
+//! `endpoint_reply` takes no lock and serialises through the `reply_tcb` claim.
+//! `unlink_from_wait_queue` requires the caller to hold the owning endpoint's
+//! `ep.lock`. Callers enter with no scheduler lock held (lock order:
+//! docs/scheduling-internals.md § Lock Hierarchy). A server's `reply_tcb` is
+//! claimed by compare-exchange (`endpoint_reply`, cancel, teardown) or by an
+//! atomic swap (the `SYS_IPC_REPLY` failure path); the claim protocol is in
+//! docs/scheduling-internals.md § Cross-CPU TCB Ownership, and the swap claim
+//! in docs/ipc-internals.md § Park Dispositions and Episodes.
 
 use super::message::Message;
 use crate::sched::thread::{IpcThreadState, ThreadControlBlock, ThreadState};
@@ -59,13 +70,19 @@ pub struct EndpointState
     pub wait_set: *mut u8,
     /// Index of this endpoint's entry in `WaitSetState::members`.
     pub wait_set_member_idx: u8,
-    /// Serialises call/recv/reply across CPUs (see notification.rs for rationale).
+    /// Serialises the send/recv queues and the call/recv rendezvous; reply is
+    /// serialised by the `reply_tcb` claim, not this lock.
     pub lock: crate::sync::Spinlock,
 }
 
-// SAFETY: EndpointState is accessed only under the relevant scheduler lock.
+// SAFETY: every mutation of the raw queue pointers (`send_*`, `recv_*`) and of
+// the wait-set back-pointer fields happens under `EndpointState::lock`, and
+// `send_nonempty` is an atomic, so moving the state between CPUs exposes no
+// unsynchronised write.
 unsafe impl Send for EndpointState {}
-// SAFETY: EndpointState is accessed only under the relevant scheduler lock.
+// SAFETY: concurrent shared access writes the raw-pointer fields only under
+// `EndpointState::lock`; the lock-free readiness check
+// (`wait_set::source_is_ready`) reads only the atomic `send_nonempty`.
 unsafe impl Sync for EndpointState {}
 
 // Pins the retype-slot budget assumed by `cap::retype::dispatch_for(Endpoint)`:
@@ -218,9 +235,14 @@ unsafe fn rollback_uncommitted_call(
 
 /// Attempt an IPC call on `ep` from `caller` with `msg`.
 ///
-/// Returns `Ok(woken_server)` if a receiver was waiting and was woken (caller
-/// is now blocked awaiting reply). Returns `Err(())` if no receiver was
-/// available (caller is now blocked on the send queue).
+/// Returns `Ok(server)` if a receiver was waiting. The server is dequeued and
+/// bound, and its wake is claimed by `wake_in_flight`. The caller MUST wake it
+/// with `enqueue_and_wake` after moving any caps. The calling thread is
+/// committed to `parked_state`, unless the park is refused, in which case the
+/// reply linkage is rolled back. Returns `Err(())` if no receiver was
+/// available: the calling thread is committed `BlockedOnSend` on the send
+/// queue, unless the park is refused, in which case it is unlinked and the
+/// call is stamped cancelled.
 ///
 /// `parked_state` is the blocked state the caller commits when a receiver was
 /// waiting: [`IpcThreadState::BlockedOnReply`] for a normal `SYS_IPC_CALL`, or
@@ -231,7 +253,8 @@ unsafe fn rollback_uncommitted_call(
 /// state to transition it to.
 ///
 /// # Safety
-/// Must be called with the scheduler lock held.
+/// `ep` and `caller` must be valid, and `caller` must be the running thread.
+/// Call with no scheduler lock and no `ep.lock` held.
 #[cfg(not(test))]
 pub unsafe fn endpoint_call(
     ep: *mut EndpointState,
@@ -290,6 +313,10 @@ pub unsafe fn endpoint_call(
             (*caller)
                 .wake_in_flight
                 .store(1, core::sync::atomic::Ordering::Release);
+            // Known defect (#443): this unconditional store overwrites any
+            // binding still pending on the server, stranding the displaced
+            // caller with wake_in_flight set and no claimant able to win its
+            // reply_tcb CAS.
             (*server)
                 .reply_tcb
                 .store(caller, core::sync::atomic::Ordering::Release);
@@ -378,7 +405,8 @@ pub unsafe fn endpoint_call(
 /// (server is now blocked on the recv queue).
 ///
 /// # Safety
-/// Must be called with the scheduler lock held.
+/// `ep` and `server` must be valid, and `server` must be the running thread.
+/// Call with no scheduler lock and no `ep.lock` held.
 #[cfg(not(test))]
 pub unsafe fn endpoint_recv(
     ep: *mut EndpointState,
@@ -438,6 +466,10 @@ pub unsafe fn endpoint_recv(
             (*caller)
                 .wake_in_flight
                 .store(1, core::sync::atomic::Ordering::Release);
+            // Known defect (#443): this unconditional store overwrites any
+            // binding still pending on the server (a second recv without a
+            // reply), stranding the displaced caller with wake_in_flight set
+            // and no claimant able to win its reply_tcb CAS.
             (*server)
                 .reply_tcb
                 .store(caller, core::sync::atomic::Ordering::Release);
@@ -541,12 +573,17 @@ pub unsafe fn endpoint_recv(
 
 /// Reply to the thread stored in `server.reply_tcb` with `msg`.
 ///
-/// Wakes the caller (moves it to Ready) and clears the reply target.
-/// Returns `Some(caller)` if a caller was woken, `None` if the reply target
-/// was null (i.e., server was not in a call context).
+/// Claims the reply binding (CAS `server.reply_tcb` from the bound caller to
+/// null) and stages `msg` in the caller's `ipc_msg`. Returns the claimed
+/// caller; the CAS win makes the syscall layer the episode's sole depositor,
+/// so it MUST finish the deposit (cap results), stamp the disposition (REPLY,
+/// or `fault_outcome` and the episode for a `BlockedOnFault` caller), and then
+/// wake it with `enqueue_and_wake`. Returns `None` if no binding exists or a
+/// concurrent claimant won.
 ///
 /// # Safety
-/// Must be called with the scheduler lock held.
+/// `server` must be the calling thread's valid TCB. Call with no scheduler or
+/// endpoint lock held.
 #[cfg(not(test))]
 pub unsafe fn endpoint_reply(
     server: *mut ThreadControlBlock,
@@ -612,7 +649,7 @@ pub unsafe fn endpoint_reply(
 /// Used by `SYS_THREAD_STOP` to cancel a `BlockedOnSend` or `BlockedOnRecv`.
 ///
 /// # Safety
-/// Must be called with the scheduler lock held. All pointers must be valid.
+/// Caller must hold the owning endpoint's `ep.lock`. All pointers must be valid.
 pub unsafe fn unlink_from_wait_queue(
     tcb: *mut ThreadControlBlock,
     head: &mut *mut ThreadControlBlock,

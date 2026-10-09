@@ -6,8 +6,8 @@
 //! Bootstrap cap acquisition for devmgr.
 //!
 //! Receives raw firmware-access caps and an MMIO aperture list from init,
-//! plus the root Interrupt range cap. Parsing (MCFG → ECAM, MADT/DTB →
-//! IRQ routing) happens later in `devmgr::firmware`; this module owns
+//! plus a full-rights derivation of the root Interrupt range cap. Parsing
+//! (MCFG → ECAM, MADT/DTB → IRQ routing) happens later in `devmgr::firmware`; this module owns
 //! only the IPC handshake.
 
 use std::os::seraph::StartupInfo;
@@ -82,8 +82,10 @@ pub mod kind
     pub const MODULE: u64 = 1;
     pub const APERTURE: u64 = 2;
     pub const ACPI_REGION: u64 = 3;
-    /// Round carrying svcmgr publish-authority cap + (x86) the root
-    /// `IoPort` cap copy. One-shot, always terminal.
+    /// Round carrying the svcmgr publish-authority cap and the arch
+    /// shutdown-authority cap (a full-rights `IoPort` derivation on
+    /// x86-64, a Reset + Suspend `SbiControl` derivation on RISC-V).
+    /// One-shot, always terminal.
     pub const SVCMGR_BUNDLE: u64 = 4;
     /// Round carrying bootloader-discovered framebuffer geometry
     /// (`physical_base`, `width`, `height`, `stride`, `pixel_format`).
@@ -150,12 +152,13 @@ pub struct DevmgrCaps
     pub driver_module_count: usize,
 
     // SEND cap on svcmgr's service endpoint with `PUBLISH_AUTHORITY`
-    // badged on. Reserved for devmgr-initiated publications; the active
-    // svcmgr publications (`timed`, `rootfs.root`, `pwrmgr.*`, `svcmgr`,
-    // `devmgr.registry`) are init-issued.
+    // badged on. Reserved for devmgr-initiated publications (who
+    // publishes the active names: `docs/process-lifecycle.md`
+    // § Init → remaining services).
     pub svcmgr_publish_cap: u32,
 
-    // Copy of init's root `IoPort` cap (x86-64 only; zero on RISC-V).
+    // Full-rights derivation of init's root `IoPort` cap (x86-64 only;
+    // zero on RISC-V).
     // devmgr derives per-driver narrow copies for ISA peripherals
     // (CMOS RTC at ports 0x70-0x71; COM1 at 0x3F8-0x3FF for serial) and,
     // on `QUERY_SHUTDOWN_DEVICE`, the PM1a + 8042-reset ports for pwrmgr.
@@ -164,8 +167,8 @@ pub struct DevmgrCaps
 
     // Steady-state holder of the platform power-state SBI authority (RISC-V
     // only; zero on x86-64): a Reset + Suspend `SbiControl` cap from init,
-    // which is reaped. devmgr serves pwrmgr a `cap_derive` copy narrowed to
-    // Reset on `QUERY_SHUTDOWN_DEVICE`; Suspend is held against a future
+    // which is reaped. devmgr serves pwrmgr a Reset-only derivation on
+    // `QUERY_SHUTDOWN_DEVICE`; Suspend is held against a future
     // path. devmgr itself never forwards an SBI call — it only holds and
     // brokers the cap.
     #[cfg_attr(not(target_arch = "riscv64"), allow(dead_code))]
@@ -419,8 +422,9 @@ fn bootstrap_rounds(creator: u32, ipc_buf: *mut u64, caps: &mut DevmgrCaps) -> O
                 // caps[0] = svcmgr publish-authority cap (always present;
                 //           a zero slot indicates init's derive failed and
                 //           is treated as a bootstrap fatal).
-                // caps[1] = arch shutdown-authority cap: root IoPort
-                //           on x86-64, SbiControl on RISC-V. Same slot
+                // caps[1] = arch shutdown-authority cap: full-rights
+                //           IoPort derivation on x86-64, Reset+Suspend
+                //           SbiControl derivation on RISC-V. Same slot
                 //           either way; the receiver routes it by arch.
                 if round.cap_count < 1 || round.caps[0] == 0
                 {

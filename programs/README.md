@@ -1,23 +1,23 @@
 # programs
 
-General-purpose userspace applications and utilities. These are
-applications, not services — they have no special privileges beyond
-what their capabilities grant. They interact with the system through
-the IPC interfaces exposed by vfs, net, and other services.
-
----
-
-## Source Layout
+General-purpose userspace applications, utilities, and the test fixtures the harnesses spawn.
 
 | Crate | Purpose |
 |---|---|
-| `fsbench` | `FS_READ` vs `FS_READ_FRAME` crossover benchmark. |
-| `hello` | Tier-2 hello-world; std-only, no Seraph cap awareness. |
-| `pipefault` | Piped-stdio fault fixture for the pipe death-bridge regression test. |
-| `pipestress` | Spawn-exit-drain stress fixture for the pipe EOF-drain regression test. |
-| `shell` | Minimal interactive shell; the child of `terminal`. |
-| `stackoverflow` | Stack-overflow fixture for the `PROCESS_STACK_GUARD_VA` regression test. |
-| `stdiotest` | Tier-2 stdin↔stdout proof. |
+| [`capexhaust/`](capexhaust/README.md) | CSpace-exhaustion fixture for the recv-wedge regression test |
+| [`demandpaged/`](demandpaged/README.md) | Demand-paging fixture for the svctest pager phase |
+| [`fb-charset/`](fb-charset/README.md) | Framebuffer character-set demo program |
+| [`fsbench/`](fsbench/README.md) | `FS_READ` vs `FS_READ_MEMORY` crossover benchmark |
+| [`hello/`](hello/README.md) | Hello-world program; std-only, no Seraph cap awareness |
+| [`pipefault/`](pipefault/README.md) | Piped-stdio fault fixture for the pipe death-bridge regression test |
+| [`pipestress/`](pipestress/README.md) | Spawn-exit-drain stress fixture for the pipe EOF-drain regression test |
+| [`relrofault/`](relrofault/README.md) | RELRO write fixture for the `PT_GNU_RELRO` enforcement test |
+| [`shell/`](shell/README.md) | Minimal interactive shell; the child of `terminal` |
+| [`stackoverflow/`](stackoverflow/README.md) | Stack-overflow fixture for the stack guard-page regression test |
+| [`stdiotest/`](stdiotest/README.md) | Stdin↔stdout proof |
+| [`terminal/`](terminal/README.md) | Terminal: relays a byte stream between hardware drivers and a child's stdio |
+| [`threadchurn/`](threadchurn/README.md) | CSpace-slot and memmgr-pool reclaim fixture for the usertest `threadchurn` tester |
+| [`threadstack/`](threadstack/README.md) | Guarded demand-stack fixture for the usertest `threadstack` tester |
 
 ---
 

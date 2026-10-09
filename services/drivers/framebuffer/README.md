@@ -5,8 +5,9 @@ linear-framebuffer MMIO end-to-end and exposes a byte-write IPC plus an
 `FB_SET_ATTRS` colour-attribute IPC.
 Payload bytes are interpreted as UTF-8: the driver carries a `text::Utf8Decoder`
 across calls (so a multi-byte sequence may straddle two payloads), then
-resolves each codepoint via CP437 reverse → font-extension → ASCII-fallback
-→ `U+FFFD`, blitting one or more 9×20 glyphs from `shared/font`. The kernel
+resolves each codepoint via [`shared/text`](../../../shared/text/README.md): CP437 reverse →
+font-extension → ASCII-fallback → `U+FFFD`, blitting one or more 9×20 glyphs from
+`shared/font`. The kernel
 framebuffer renderer (`core/kernel/src/framebuffer.rs`) remains the early-
 boot / panic console fallback — see
 [docs/console-model.md](../../../docs/console-model.md).
@@ -38,15 +39,16 @@ seed for `[physical_base, physical_base + stride * height)` plus the
 (`abi/init-protocol`'s v8 addition). The framebuffer's authoritative
 identity dies with UEFI `ExitBootServices` (only GOP knows it pre-exit),
 so the bootloader is the only entity that can carry this information to
-userspace.
+userspace (see [docs/console-model.md](../../../docs/console-model.md)).
 
 Devmgr spawns the driver via the `simple-device` path with a round-2
 badged SEND on its registry endpoint so the driver can fetch its
 geometry via `QUERY_DEVICE_INFO` (generic kind/version/bytes payload
 schema, shared with virtio).
 
-Clients obtain a write cap through devmgr, not svcmgr: a framebuffer is a
-device, not a service. Devmgr answers
+Clients obtain a write cap through
+[devmgr](../../devmgr/docs/responsibilities.md#responsibilities), not svcmgr: a framebuffer
+is a device, not a service. Devmgr answers
 [`devmgr_labels::QUERY_FRAMEBUFFER_DEVICE`] by minting a
 [`fb_labels::WRITE_AUTHORITY`]-badged `SEND_GRANT` cap on the driver's
 service endpoint, mirroring the `QUERY_SERIAL_DEVICE` flow. The caller's
@@ -71,10 +73,11 @@ The driver feeds each byte to its `text::Utf8Decoder`:
 * `\n` advances to the start of the next line (scrolling if at the
   bottom); `\r` returns the cursor to column 0; `\x08` (backspace) moves
   the cursor back one column (clamped at column 0). All three bypass the
-  decoder. The terminal pairs `\x08` with an overwriting space for a
-  destructive backspace.
+  decoder. The terminal ([programs/terminal](../../../programs/terminal/README.md))
+  pairs `\x08` with an overwriting space for a destructive backspace.
 * Other bytes drive the decoder; on a completed codepoint the driver
-  calls `text::render_codepoint`, which dispatches in order:
+  calls `text::render_codepoint` ([`shared/text`](../../../shared/text/README.md)), which
+  dispatches in order:
   CP437 reverse (`font::FONT_9X20`) → font-extension table
   (`font::FONT_9X20_EXT`) → ASCII fallback (multi-byte substitutes such
   as `©` → `(C)`) → `U+FFFD` replacement glyph (slot 0 of the extension
@@ -98,7 +101,8 @@ There is one decoder per driver process, alongside the single cursor.
 |---|---|
 | label | `0` (`SUCCESS`) or `2` (`UNKNOWN_OPCODE`) |
 
-The driver's UTF-8 / font output is exercised by `programs/fb-charset`, a
+The driver's UTF-8 / font output is exercised by
+[`programs/fb-charset`](../../../programs/fb-charset/README.md), a
 manual demo run from the shell — it prints a representative sample of every
 glyph class to stdout, which `programs/terminal` relays to this driver. It is
 no longer auto-started.
@@ -110,7 +114,7 @@ rendering. The pair is sticky driver state: an `FB_SET_ATTRS` applies to every
 following write until the next one. `clear` and `scroll` fill with the current
 background. Colours are 24-bit truecolour; the driver renders the bytes it is
 handed and holds no palette — mapping the 16 ANSI SGR colours to RGB is the
-terminal's job (`shared/ansi`).
+terminal's job ([`shared/ansi`](../../../shared/ansi/README.md)).
 
 The default (never set) is full-white-on-black, matching the pre-colour
 monochrome output, so callers that never send `FB_SET_ATTRS` — logd's
@@ -170,4 +174,8 @@ and mode-set are deferred to a follow-up issue when a real consumer
 
 ## Summarized By
 
-[docs/console-model.md](../../../docs/console-model.md)
+[Console Model](../../../docs/console-model.md),
+[programs/fb-charset/README.md](../../../programs/fb-charset/README.md),
+[programs/terminal/README.md](../../../programs/terminal/README.md),
+[shared/ansi/README.md](../../../shared/ansi/README.md),
+[shared/text/README.md](../../../shared/text/README.md)

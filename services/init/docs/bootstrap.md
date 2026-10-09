@@ -43,7 +43,8 @@ process creation to procmgr IPC.
   init's main thread: it covers the console across the init→svcmgr
   handover and svcmgr's reconcile, until the svcmgr-launched
   real-logd pulls its captured history via `HANDOVER_PULL` and
-  init-logd self-terminates (see [Handover](#handover)).
+  init-logd self-terminates (see [Handover](#handover) and the
+  [logd handover protocol](../../logd/docs/handover-protocol.md)).
 - Bootstrap memmgr via raw `cap_create_aspace` / `cap_create_cspace`
   / `cap_create_thread`, ELF-load it from the `memmgr` bundle
   entry, prepare its `ProcessInfo` page, and configure its main
@@ -81,20 +82,26 @@ process creation to procmgr IPC.
 
 ### Root acquisition
 
-vfsd self-mounts the root partition at `/` (and the ESP at `/esp`) on
-its own startup, identifying partitions by GPT type-GUID
-(`boot_protocol::role_guids::SERAPH_ROOT_<arch>`). Init issues no
-`MOUNT`; its only contribution is the seed-cap pull, which doubles as
-init's wait-for-root barrier.
+vfsd self-mounts the root partition at `/` on its own startup, then
+mounts the ESP at `/esp` and the data partition at `/data` (both
+best-effort), identifying partitions by GPT type-GUID
+(`boot_protocol::role_guids::SERAPH_ROOT_<arch>`; see
+[Storage](../../../docs/storage.md)). Init issues no `MOUNT`; its only
+contribution is the seed-cap pull, which doubles as init's
+wait-for-root barrier.
 
 - Pull the seed system-root cap via `GET_SYSTEM_ROOT_CAP`
-  (`mount::request_system_root`). vfsd replies `NO_MOUNT` until it has
-  mounted root, so the call blocks until the root filesystem is up; a
-  zero return is FATAL. The success reply is a badged SEND on vfsd's
+  (`mount::request_system_root`; protocol in the
+  [vfsd service interface](../../vfsd/docs/vfs-ipc-interface.md)).
+  vfsd self-mounts root before any service thread serves its endpoint,
+  so the call blocks until the root filesystem is up. vfsd replies
+  `NO_MOUNT` only when the self-mount failed; init treats the resulting
+  zero cap as FATAL. The success reply is a badged SEND on vfsd's
   namespace endpoint at the synthetic root with full namespace rights
   — every later child receives a `cap_copy` of it via
-  `procmgr_labels::CONFIGURE_NAMESPACE`, and svcmgr derives the
-  published `rootfs.root` SEND from it.
+  `procmgr_labels::CONFIGURE_NAMESPACE`, and init derives the
+  `rootfs.root` SEND from it for svcmgr's endowment, which svcmgr
+  publishes as-is.
 - real-logd is a svcmgr-launched service, not an init responsibility.
   init-logd continues to serve the master log endpoint and write
   serial directly; svcmgr brings up real-logd post-handover from the
@@ -109,9 +116,13 @@ init's wait-for-root barrier.
 
 `service::phase3_svcmgr_handover` (in `../src/service.rs`, called
 from `../src/main.rs`) loads svcmgr, serves it the handover endowment,
-signals handover, and hands init's own kernel objects to procmgr for
-reaping. svcmgr — not init — publishes the well-known caps, registers
-services, and talks to devmgr, all from the endowment.
+moves init's kernel-object caps to procmgr (the first
+`REGISTER_INIT_TEARDOWN` round, which binds procmgr's death observers),
+signals `HANDOVER_COMPLETE`, streams init's reclaimable Memory caps to
+procmgr in later `REGISTER_INIT_TEARDOWN` rounds, sends
+`INIT_TEARDOWN_DONE`, and exits. svcmgr — not init — publishes the
+well-known caps, registers services, and talks to devmgr, all from the
+endowment (see the [svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md)).
 
 - Spawn svcmgr from `/services/svcmgr` with the `Universal` namespace
   policy (`create_svcmgr_from_file`), then serve it the handover
@@ -122,32 +133,36 @@ services, and talks to devmgr, all from the endowment.
     `rootfs.root`) and a badge-0 `SEND|GRANT` source on
     `devmgr_registry_ep` (svcmgr mints the `REGISTRY_QUERY_AUTHORITY`
     `devmgr.registry` publish cap and the `DRIVERS_DIR_AUTHORITY`
-    `SET_DRIVERS_DIR` cap from it). `data[1]` carries
+    `SET_DRIVERS_DIR` cap from it; see
+    [Publish authority](../../svcmgr/docs/ipc-interface.md#publish-authority)). `data[1]` carries
     `SVCMGR_LABELS_VERSION`. An absent source rides as a zero slot.
   - **Rounds 2..N (`SUBSTRATE`)** — one `(name, thread_cap)` per
     init-bootstrapped substrate service: `memmgr`, `procmgr`, `devmgr`,
     `vfsd`. svcmgr parks them and binds death-notification on
     each at reconciliation, pairing against the matching `<name>.svc`
     recipe in `/config/svcmgr/services/` — see
-    [`../../svcmgr/docs/service-definitions.md`](../../svcmgr/docs/service-definitions.md).
+    [`../../svcmgr/docs/service-definitions.md`](../../svcmgr/docs/service-definitions.md)
+    and [Death notification](../../svcmgr/docs/ipc-interface.md#death-notification).
     logd is not among them: it is a svcmgr-launched service (from the
     `LOGD_SOURCES` round below), not a parked substrate.
   - **Terminal round (`LOGD_SOURCES`)** — the two reserved log-sink
     source caps svcmgr holds for the system's lifetime so it can
-    launch + supervise + restart real-logd any number of times:
-    `master_log_source`, a `RIGHTS_ALL` derive of init's master log
+    launch and supervise real-logd (restart: design intent; not yet
+    implemented (#262)): `master_log_source`, a `RIGHTS_ALL` derive of init's master log
     endpoint (svcmgr mints real-logd's master-log RECV from it on every
     (re)launch, plus the one-shot `HANDOVER_PULL` SEND on the first
-    launch), and `procmgr_death_auth_source`, a badge-0
+    launch; see [`log_sink`](../../svcmgr/docs/service-definitions.md#log_sink)), and
+    `procmgr_death_auth_source`, a badge-0
     `RIGHTS_EP_SEND_GRANT` derive of procmgr's service endpoint (svcmgr
-    mints real-logd's `DEATH_EQ_AUTHORITY` SEND from it for per-sender
+    mints real-logd's `DEATH_EQ_AUTHORITY` `SEND|GRANT` cap from it for per-sender
     death-EQ registration). Holding `master_log_source` keeps the log
     endpoint object alive across a logd crash, so log senders are
-    agnostic to which process holds the RECV. An absent source rides as
+    agnostic to which process holds the RECV (per
+    [`log_sink`](../../svcmgr/docs/service-definitions.md#log_sink)). An absent source rides as
     a zero slot.
 - After draining the endowment, **svcmgr** (not init) publishes the
   well-known names it owns into its own registry and installs devmgr's
-  drivers dir:
+  drivers dir (see the [svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md)):
   - `rootfs.root` — the endowed `SEND` on the root filesystem's
     namespace endpoint (FS-driver-agnostic by design).
   - `svcmgr` — un-badged SEND on svcmgr's own service endpoint.
@@ -165,55 +180,78 @@ services, and talks to devmgr, all from the endowment.
     devmgr-registry source. Devmgr replies SUCCESS *before* any spawn
     work, then walks the per-arch RTC name and spawns the driver between
     its `ipc_reply` and next `ipc_recv` (procmgr `CREATE_FROM_FILE` —
-    the binary lives on the rootfs, not in the boot bundle). Best-effort:
+    the binary lives on the rootfs, not in the boot bundle; see
+    [Driver binary sources](../../../docs/device-management.md#driver-binary-sources)). Best-effort:
     a failure leaves the system without a wallclock — timed degrades to
-    `WALL_CLOCK_UNAVAILABLE`.
+    `WALL_CLOCK_UNAVAILABLE` (see [timed](../../timed/README.md)).
 
   `pwrmgr.shutdown`, `pwrmgr.deny`, and `timed` are published by
-  svcmgr's provider path on each provider's launch. Name constants are
+  svcmgr's provider path on each provider's launch (see
+  [`provides`](../../svcmgr/docs/service-definitions.md#provides)). Name constants are
   centralised in `ipc::published_names`.
 - The wallclock chain and pwrmgr are **not** spawned by init. `timed`
   and `pwrmgr` are svcmgr-launched providers (`timed.svc` / `pwrmgr.svc`),
   brought up post-handover; each resolves its authority from devmgr at
-  startup (`QUERY_RTC_DEVICE` for timed; `QUERY_ACPI_TABLE` +
-  `QUERY_SHUTDOWN_DEVICE` for pwrmgr). The RTC chip driver (cmos-rtc on
+  startup (`QUERY_RTC_DEVICE` for [timed](../../timed/README.md);
+  `QUERY_ACPI_TABLE` + `QUERY_SHUTDOWN_DEVICE` for
+  [pwrmgr](../../pwrmgr/README.md)). The RTC chip driver (cmos-rtc on
   x86-64, goldfish-rtc on RISC-V) is spawned by devmgr from
-  `/services/drivers/<chip>` after svcmgr's `SET_DRIVERS_DIR` handshake.
+  `/services/drivers/<chip>` after svcmgr's `SET_DRIVERS_DIR` handshake
+  (see [Driver binary sources](../../../docs/device-management.md#driver-binary-sources)).
+- Move init's kernel-object caps (`AddressSpace`, `CSpace`, main
+  `Thread`, init-logd `Thread`) to procmgr in the first
+  `REGISTER_INIT_TEARDOWN` round (`register_init_reap_objects` in
+  `../src/service.rs`). IPC cap-transfer MOVES the caps, so they leave
+  init's CSpace while the objects keep backing init's running threads.
+  This round runs before `HANDOVER_COMPLETE` so procmgr's death
+  observers are bound before real-logd can release init-logd.
 - Notification `HANDOVER_COMPLETE`. svcmgr scans `/config/svcmgr/services/`,
-  reconciles the parked substrate against the recipes, and launches any
-  defined-but-unparked services (`timed`, `pwrmgr`, staged harnesses)
-  from disk.
-- Hand init's kernel-object caps (`AddressSpace`, `CSpace`, main
-  `Thread`, init-logd `Thread`) and every reclaimable Memory cap it
-  solely owns (ELF segments, user stack pages, `InitInfo` pages, the
-  bootloader/bundle reclaim ranges, the AP-trampoline memory cap, and the
-  boot-module ELF sources) to procmgr via
-  `REGISTER_INIT_TEARDOWN` (`handoff_to_procmgr_reap` in
-  `../src/service.rs`). IPC
-  cap-transfer MOVES the caps, so they leave init's CSpace. The
-  usable-RAM range (already memmgr's), the firmware read-only caps,
-  and init's own bootstrap backing (arena-forwarded to memmgr at
-  `finalize_memmgr`) are excluded.
-- Call `sys_thread_exit`. Procmgr's
-  death-EQ observer (bound on init's main thread with
-  `INIT_REAP_CORRELATOR`) fires and runs
-  [`init_reap::run_reap`](../../procmgr/src/init_reap.rs): both
-  Thread caps are deleted, init's `AddressSpace` is revoked +
-  deleted (its pool donations `retype_free`'d, user-page mappings
-  vanish), the accumulated Memory caps are `DONATE_MEMORY_CAPS`'d to
-  memmgr's pool, init's `CSpace` is revoked + deleted (cascading
-  dec_ref through init's remaining caps — endpoint SENDs and the
-  retype-pinned endpoint-slab arena already forwarded to memmgr).
-  Every reclaimable Memory cap was donated, so no `owns_memory` cap
-  reaches its last reference and nothing frees to the sealed buddy.
-  Procmgr logs a summary line; no init-related kernel object
-  remains; svcmgr is the resident supervisor from this point on.
+  reconciles the parked substrate against the recipes, and launches the
+  defined-but-unparked services (`logd`, `timed`, `pwrmgr`, `terminal`,
+  staged harnesses) from disk (see
+  [Reconciliation](../../svcmgr/docs/service-definitions.md#reconciliation)).
+- Stream every reclaimable Memory cap init solely owns (ELF segments,
+  user stack pages, `InitInfo` pages, the bootloader/bundle reclaim
+  ranges, the AP-trampoline memory cap, the boot-module ELF sources, the
+  usable-RAM caps that did not fit the bootstrap round, and
+  `MemoryAlloc`'s orphaned remainders) to procmgr in further
+  `REGISTER_INIT_TEARDOWN` rounds, then send `INIT_TEARDOWN_DONE`
+  (`finish_init_reap_handoff` in `../src/service.rs`). The usable-RAM
+  prefix already forwarded to memmgr (below the reap floor), the
+  firmware read-only caps, and init's own bootstrap backing
+  (arena-forwarded to memmgr at `finalize_memmgr`) are excluded.
+- Call `sys_thread_exit`. Procmgr's `INIT_REAP_CORRELATOR` death
+  observers are bound on both init threads by the first
+  `REGISTER_INIT_TEARDOWN` round (see the
+  [procmgr IPC interface](../../procmgr/docs/ipc-interface.md)). Each
+  init-thread death runs
+  [`init_reap::run_reap`](../../procmgr/src/init_reap.rs), which counts
+  deaths down and tears init down on the second, once
+  `INIT_TEARDOWN_DONE` has armed the reap (normally init-logd's death,
+  after real-logd's `HANDOVER_RELEASE`): both Thread caps are deleted, init's `AddressSpace` is
+  revoked + deleted (its pool donations `retype_free`'d, user-page
+  mappings vanish), the accumulated Memory caps are `DONATE_MEMORY_CAPS`'d to
+  memmgr's pool, and procmgr's cap on init's `CSpace` is revoked +
+  deleted. The caps init still holds stay in init's `CSpace`, which
+  the kernel pins (it is the root CSpace), so they remain alive but
+  unreachable; releasing them at the reap is design intent; not yet
+  implemented ([#443](https://github.com/kottlerg/seraph/issues/443);
+  [Process Lifecycle](../../../docs/process-lifecycle.md#init-reap)
+  § Init reap describes those caps). Every reclaimable Memory cap was donated, so no
+  `owns_memory` cap reaches its last reference and nothing frees to
+  the sealed buddy. Procmgr logs a summary line. Beyond init's pinned
+  `CSpace` and the caps in it, no init-related kernel object remains, except that the kernel-direct
+  page-table nodes behind init's bootstrap mappings stay consumed, an
+  accepted cost (see
+  [Memory Subsystem Internals](../../../core/kernel/docs/memory-internals.md)
+  § Page Table Node Ownership). Svcmgr is the resident supervisor from
+  this point on.
 
 memmgr and procmgr are the only two processes init creates via
 raw syscalls. Every later service spawn goes through procmgr IPC.
 After the raw bootstrap completes, the only `no_std` userspace
-services in the running system are init and memmgr; everything
-else is std-built.
+services in the running system are init and
+[memmgr](../../memmgr/README.md); everything else is std-built.
 
 ---
 
@@ -221,8 +259,8 @@ else is std-built.
 
 ### Initial CSpace at `_start`
 
-The kernel populates init's CSpace before transferring control. Init
-holds:
+The kernel populates init's CSpace before transferring control (see
+[Capability Model](../../../docs/capability-model.md)). Init holds:
 
 | Class | Content |
 |---|---|
@@ -236,26 +274,48 @@ holds:
 | Scheduler | `SchedControl` cap |
 | Boot modules | `Memory` caps for each boot-module image inside `bootstrap.bundle` (procmgr, memmgr, devmgr, vfsd, …) — resolved by name via the `init_protocol` module-name table |
 
-Init derives and transfers these to services using the
+The roots of the hardware and control authority init delegates stay in
+init's CSpace (the list is in
+[Process Lifecycle](../../../docs/process-lifecycle.md#kernel--init)
+§ Kernel → init); at the reap handoff init moves only its kernel-object
+caps and the reclaimable Memory caps it solely owns to procmgr (see
+[Handover](#handover)). Memory forwarded into memmgr's CSpace uses the
 **derive-twice** pattern documented in
 [`../../../docs/capability-model.md`](../../../docs/capability-model.md):
-init retains intermediary derivations (revocable) rather than the
-roots, so it can revoke a child's authority before the handover to
-svcmgr if needed.
+init derives a full-rights intermediary from the source cap and copies
+that into memmgr's CSpace, keeping the intermediary. devmgr's hardware
+caps are single derivations of init's roots moved over IPC, revocable
+only through the root (derivation-tree mechanics in
+[capability internals](../../../core/kernel/docs/capability-internals.md)).
 
 ### Per-stage authority transfers
+
+The system-wide capability flow across these stages is owned by
+[Process Lifecycle](../../../docs/process-lifecycle.md); the table below
+enumerates init's side of it.
 
 | Stage | Recipient | Authority transferred |
 |---|---|---|
 | Raw bootstrap | memmgr | RAM `Memory` cap pool (every Memory cap not consumed by init/procmgr setup) |
 | Raw bootstrap | procmgr | memmgr SEND cap, log endpoint SEND, svcmgr service endpoint SEND, boot-module `Memory` caps for downstream `CREATE_PROCESS` |
-| Raw bootstrap | devmgr | MMIO apertures, Interrupt range, ACPI/DTB Memory caps; root `IoPort` (x86-64) / `SbiControl` (RISC-V) via the terminal `SVCMGR_BUNDLE` round — the hardware + shutdown authority devmgr brokers to drivers and to pwrmgr |
+| Raw bootstrap | devmgr | MMIO apertures, Interrupt range, ACPI/DTB Memory caps; a full-rights `IoPort` derivation (x86-64) or an `SbiControl` derivation narrowed to Reset and Suspend (RISC-V) via the terminal `SVCMGR_BUNDLE` round, the roots staying with init — the hardware + shutdown authority [devmgr](../../devmgr/docs/responsibilities.md#capabilities-received) brokers to drivers and to pwrmgr |
 | Raw bootstrap | vfsd | `SEED_AUTHORITY`-badged SEND on vfsd's own service endpoint (gates `GET_SYSTEM_ROOT_CAP`). vfsd self-mounts root, so init issues no `MOUNT` and keeps no FS access of its own. |
-| Handover | svcmgr | `Universal` namespace seed (full `system_root_cap`) installed via `procmgr_labels::CONFIGURE_NAMESPACE` before `START_PROCESS`; then the handover endowment over the bootstrap protocol — round 1 (`CAPS`): full-rights SEND on its own service + bootstrap endpoints, a `SEND` on the root filesystem namespace endpoint (svcmgr publishes as `rootfs.root`) and a badge-0 `SEND\|GRANT` source on `devmgr_registry_ep` (svcmgr mints the `devmgr.registry` publish cap and the `SET_DRIVERS_DIR` cap); rounds 2..N (`SUBSTRATE`): one `(name, thread_cap)` per substrate service for death-supervision binding; terminal round (`LOGD_SOURCES`): a `RIGHTS_ALL` master-log endpoint source and a badge-0 `SEND\|GRANT` procmgr source, both reserved for the system's lifetime so svcmgr can launch + supervise + restart real-logd (minting its master-log RECV, first-launch `HANDOVER_PULL` SEND, and `DEATH_EQ_AUTHORITY` SEND per launch). svcmgr publishes all well-known names itself, sends `SET_DRIVERS_DIR` from these sources, and launches real-logd; init publishes nothing and does not talk to devmgr. |
+| Handover | svcmgr | `Universal` namespace seed (full `system_root_cap`) installed via `procmgr_labels::CONFIGURE_NAMESPACE` before `START_PROCESS`; then the handover endowment over the bootstrap protocol — round 1 (`CAPS`): full-rights (`RIGHTS_ALL`, incl. RECV) caps on its own service + bootstrap endpoints, a `SEND` on the root filesystem namespace endpoint (svcmgr publishes as `rootfs.root`) and a badge-0 `SEND\|GRANT` source on `devmgr_registry_ep` (svcmgr mints the `devmgr.registry` publish cap and the `SET_DRIVERS_DIR` cap); rounds 2..N (`SUBSTRATE`): one `(name, thread_cap)` per substrate service for death-supervision binding; terminal round (`LOGD_SOURCES`): a `RIGHTS_ALL` master-log endpoint source and a badge-0 `SEND\|GRANT` procmgr source, both reserved for the system's lifetime so svcmgr can launch and supervise real-logd, minting its master-log RECV, first-launch `HANDOVER_PULL` SEND, and `DEATH_EQ_AUTHORITY` `SEND\|GRANT` cap per launch (restart: design intent; not yet implemented, #262). svcmgr publishes all well-known names itself, sends `SET_DRIVERS_DIR` from these sources, and launches real-logd; init publishes nothing and does not talk to devmgr (see the [svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md)). |
 | Reap | procmgr | Init's `AddressSpace`, `CSpace`, main `Thread`, init-logd `Thread`, every reclaimable Memory cap it solely owns (ELF segments, user stack, `InitInfo` pages, bootloader/bundle reclaim ranges, AP-trampoline memory cap, boot-module ELF sources) |
 
 ---
 
 ## Summarized By
 
-[init/README.md](../README.md), [docs/bootstrap.md](../../../docs/bootstrap.md)
+[ELF Loading](../../../core/boot/docs/elf-loading.md),
+[System Bootstrap](../../../docs/bootstrap.md),
+[Device Management](../../../docs/device-management.md),
+[Process Lifecycle](../../../docs/process-lifecycle.md),
+[devmgr Responsibilities and Capabilities](../../devmgr/docs/responsibilities.md),
+[services/init/README.md](../README.md), [logd IPC interface](../../logd/docs/ipc-interface.md),
+[memmgr Memory Pool](../../memmgr/docs/memory-pool.md),
+[services/procmgr/README.md](../../procmgr/README.md),
+[procmgr IPC Interface](../../procmgr/docs/ipc-interface.md),
+[svcmgr IPC Interface](../../svcmgr/docs/ipc-interface.md),
+[Restart Protocol](../../svcmgr/docs/restart-protocol.md),
+[vfsd Service Interface](../../vfsd/docs/vfs-ipc-interface.md)

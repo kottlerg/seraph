@@ -15,7 +15,8 @@ EventQueue via a WaitSet.
 
 A SEND on the same endpoint (without the [`PUBLISH_AUTHORITY`](#publish-authority)
 verb bit) is delivered to every process via
-`ProcessInfo.service_registry_cap` so userspace consumers can
+[`ProcessInfo.service_registry_cap`](../../../abi/process-abi/README.md#processinfo)
+so userspace consumers can
 `QUERY_ENDPOINT` for published names.
 
 ---
@@ -45,9 +46,10 @@ svcmgr mints the `devmgr.registry` publish cap
 (`DRIVERS_DIR_AUTHORITY`) from caps[3]. A version mismatch in `data[1]`
 aborts bootstrap (svcmgr exits).
 
-**Rounds 2..N — `SUBSTRATE` (`data[0] = 2`; the final round is terminal):**
+**Rounds 2..N — `SUBSTRATE` (`data[0] = 2`, not terminal):**
 one per init-bootstrapped substrate service (memmgr, procmgr, devmgr,
-vfsd, logd).
+vfsd) whose thread cap init captured; logd is not a substrate. See init's
+[Handover](../../init/docs/bootstrap.md#handover) stage.
 
 | Field | Value |
 |---|---|
@@ -56,7 +58,24 @@ vfsd, logd).
 | data[1] | `name_len` (byte length of the service name) |
 | data[2..] | service name bytes packed LE into `u64` words (≤ 32 bytes) |
 
-svcmgr parks each pair in its pending-registration table. It does **not**
+**Final round — `LOGD_SOURCES` (`data[0] = 3`, terminal):**
+
+| Field | Value |
+|---|---|
+| caps[0] | `master_log_source`: `RIGHTS_ALL` source on init's master log endpoint; svcmgr mints real-logd's master-log RECV from it on every (re)launch and the first-launch handover SEND (the `HANDOVER_PULL` drain then `HANDOVER_RELEASE`; see [`log_sink`](service-definitions.md#log_sink)); holding it keeps the log endpoint alive across a logd crash (`0` if absent) |
+| caps[1] | `procmgr_death_auth_source`: badge-0 `SEND\|GRANT` source on procmgr's service endpoint; svcmgr mints real-logd's `DEATH_EQ_AUTHORITY` `SEND\|GRANT` cap from it per launch (`0` if absent) |
+| data[0] | `3` (`LOGD_SOURCES`) |
+
+svcmgr holds both sources for the system's life and mints real-logd's
+[`log_sink`](service-definitions.md#log_sink) bootstrap round from them on
+every (re)launch. svcmgr launches logd whatever the slot values; a zero slot
+reaches logd as a zero cap. Without the death-auth source, logd runs but skips
+`REGISTER_DEATH_EQ` and cannot reclaim per-sender slots. Without the
+master-log source, logd exits at startup; logd is `critical = yes` and its
+clean exit is not an `on_failure` restart, so svcmgr starts a graceful
+shutdown.
+
+svcmgr parks each substrate pair in its pending-registration table. It does **not**
 bind death-notification at endowment time — the matching `.svc`
 definition is paired at reconciliation, on
 [`HANDOVER_COMPLETE`](#label-2-handover_complete). After draining the
@@ -183,7 +202,8 @@ WaitSet has two members: the service endpoint (badge 0) and the
 deaths queue (badge 1).
 
 When a thread exits (clean or fault), the kernel posts
-`(correlator << 32) | exit_reason` to `deaths_eq`. svcmgr drains the
+`(correlator << 32) | exit_reason` to `deaths_eq` (see
+[restart-protocol.md](restart-protocol.md#death-detection)). svcmgr drains the
 queue and routes each payload to its `ServiceEntry` via the
 correlator, then dispatches through
 [`restart::handle_death`](../src/restart.rs).
@@ -193,7 +213,12 @@ Exit reason encoding:
 | Value | Meaning |
 |---|---|
 | `0` | clean exit (`SYS_THREAD_EXIT`) |
-| `EXIT_FAULT_BASE..` | fault (exception vector / scause + base) |
+| `1..=0x0FFF` | voluntary exit code |
+| `0x1000..=0x1FFF` (`EXIT_FAULT_BASE + vector`) | fault (exception vector / scause + base) |
+| `0x2000` (`EXIT_KILLED`) | killed |
+
+The full space is defined in
+[process-lifecycle.md](../../../docs/process-lifecycle.md#exit-reason).
 
 ---
 
@@ -243,4 +268,10 @@ policy + budget):
 
 ## Summarized By
 
-[svcmgr/README.md](../README.md)
+[Device Management](../../../docs/device-management.md),
+[Process Lifecycle](../../../docs/process-lifecycle.md),
+[services/init/README.md](../../init/README.md),
+[init Bootstrap Stages](../../init/docs/bootstrap.md),
+[procmgr IPC Interface](../../procmgr/docs/ipc-interface.md),
+[services/svcmgr/README.md](../README.md),
+[shared/registry-client/README.md](../../../shared/registry-client/README.md)

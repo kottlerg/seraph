@@ -8,12 +8,14 @@ five parts of `BootInfo`:
 2. `kernel_mmio` — the arch-specific MMIO register bases the kernel
    itself consumes (LAPIC / IOAPIC on x86-64 via ACPI MADT; PLIC / UART
    on RISC-V via ACPI MADT + SPCR, with any fields left zero by ACPI
-   filled from the DTB), plus the riscv64 hart facts carried in the same
-   struct (`timebase_freq`, `hart_caps`). Not a capability surface.
+   filled from the DTB; see [acpi.md](acpi.md)), plus the riscv64 hart
+   facts carried in the same struct (`timebase_freq`, `hart_caps`). Not a
+   capability surface.
 3. `mmio_apertures` — a short list of coarse `{phys_base, size}` MMIO
    regions, used as seeds into the final aperture list that is merged
    with the UEFI memory map's MMIO classifications. The kernel mints
-   one `Mmio` capability per aperture entry.
+   one `Mmio` capability per aperture entry (see
+   [initialization.md](../../kernel/docs/initialization.md#phase-7-capability-system)).
 4. `boot_entropy_seed` / `boot_entropy_len` — the DTB `/chosen/rng-seed`
    fallback, consulted only when `EFI_RNG_PROTOCOL` yields no seed
    (DTB-only; see [boot-flow.md](boot-flow.md) step 5c).
@@ -25,7 +27,8 @@ The bootloader does **not** emit per-device capabilities, interrupt
 descriptors, PCI ECAM descriptors, or firmware-table read-only caps.
 Device-level work lives in userspace, which re-parses ACPI / DTB from
 the passthrough addresses in `BootInfo.acpi_rsdp` and
-`BootInfo.device_tree`.
+`BootInfo.device_tree` (see
+[device-management.md](../../../docs/device-management.md#raw-firmware-passthrough)).
 
 Detailed per-parser invariants — ACPI table-walk and DTB-walk specifics —
 are owned by [acpi.md](acpi.md) and [dtb.md](dtb.md). This document covers
@@ -102,7 +105,8 @@ Apertures are coarse but **not indiscriminate**: regions classified as
 `EfiRuntimeServices*`, `EfiACPIMemoryNVS`, or `EfiReserved` are omitted
 from the aperture list unless a firmware-table or framebuffer seed names
 them explicitly. Userspace therefore never receives capabilities that
-cover firmware-exclusive state.
+cover firmware-exclusive state (see
+[abi/boot-protocol](../../../abi/boot-protocol/README.md#contract-for-a-compliant-bootloader)).
 
 ---
 
@@ -123,10 +127,14 @@ The bootloader's firmware parsing is deliberately narrow. It does not:
 All of these are `devmgr`'s responsibility. The bootloader produces the
 minimum set of coarse descriptors the kernel needs to mint initial
 capabilities; per-device assignment is a userspace concern re-derived
-from the ACPI/DTB passthrough addresses in `BootInfo`.
+from the ACPI/DTB passthrough addresses in `BootInfo` (see
+[device-management.md](../../../docs/device-management.md#raw-firmware-passthrough)).
 
 ---
 
 ## Summarized By
 
-[boot/README.md](../README.md), [boot-flow.md](boot-flow.md)
+[core/boot/README.md](../README.md), [ACPI Parsing](acpi.md), [Boot Flow](boot-flow.md),
+[Device Tree Parsing](dtb.md), [UEFI Environment](uefi-environment.md),
+[Device Management](../../../docs/device-management.md),
+[services/drivers/goldfish-rtc/README.md](../../../services/drivers/goldfish-rtc/README.md)

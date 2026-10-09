@@ -1,9 +1,12 @@
 # Kernel Cross-Boundary Disclosure Inventory
 
 Enumerates every value the kernel emits across the user/kernel boundary and
-classifies it, establishing that no kernel virtual address or kernel pointer
+classifies it toward the goal that no kernel virtual address or kernel pointer
 escapes to userspace — a prerequisite for kernel address-space layout
-randomization (KASLR).
+randomization (KASLR). Known open disclosures: the x86-64 fault-message present
+bit ([#443](https://github.com/kottlerg/seraph/issues/443)), mirrored console
+diagnostics ([#440](https://github.com/kottlerg/seraph/issues/440)), and unzeroed
+bootloader frames ([#439](https://github.com/kottlerg/seraph/issues/439)).
 
 ---
 
@@ -12,8 +15,11 @@ randomization (KASLR).
 KASLR randomizes the kernel's virtual base. A single kernel virtual address (VA),
 kernel pointer, or value derived from one that reaches userspace defeats base
 randomization. This inventory audits the kernel's complete output surface and
-records, per surface, why it carries no kernel VA. It is the standing reference
-the coding-standards rule "Cross-Boundary Data Hygiene"
+records, per surface, why it carries no kernel VA or, for each known open
+disclosure ([#443](https://github.com/kottlerg/seraph/issues/443),
+[#439](https://github.com/kottlerg/seraph/issues/439),
+[#440](https://github.com/kottlerg/seraph/issues/440)), what it leaks. It is the
+standing reference the coding-standards rule "Cross-Boundary Data Hygiene"
 ([docs/coding-standards.md](../../../docs/coding-standards.md)) requires every new
 cross-boundary output to be added to.
 
@@ -25,8 +31,10 @@ distinct, narrower concern handled in "Physical-address surfaces" below.
 Each surface is classified as one of:
 
 - **(a) kernel VA / pointer** — a kernel virtual address, kernel pointer, or value
-  derived from one. A leak. **None found** among emitted values; kernel state
-  kept in donated memory is a separate surface, below.
+  derived from one. A leak. **One found** among emitted values: the x86-64
+  fault-message `d2` present bit (see the fault-message note below;
+  [#443](https://github.com/kottlerg/seraph/issues/443)); kernel state kept in donated
+  memory is a separate surface, below.
 - **(b) userspace VA** — an address in the caller's own (or a delegate's) address
   space. The caller already owns it; not a disclosure.
 - **(c) opaque / randomized** — a kernel-minted identifier that is unguessable
@@ -59,7 +67,7 @@ is in [docs/syscalls.md](syscalls.md).
 | `SYS_IPC_BUFFER_SET` → status only (validates user-half, page-aligned VA) | `syscall::sys_ipc_buffer_set` | (no output) |
 | Cap split / create / derive handlers → opaque cap handles | `mem::sys_memory_split`, `hw::sys_mmio_split`, `cap::sys_cap_derive` | c |
 | IPC `Message` label / badge / data[] / cap_slots[] | `ipc::message::Message`, `ipc::{read_ipc_buf, write_ipc_buf, write_cap_results}` | b/c |
-| Fault message `kind` / `d1` / `d2` / `ip` (user VA or hardware code) + label / badge | `ipc::fault::FaultInfo`, `redirect_user_page_fault`, `redirect_user_exception`, `fault_info_for` | b/d |
+| Fault message `kind` / `d1` / `d2` / `ip` (user VA or hardware code) + label / badge | `ipc::fault::FaultInfo`, `redirect_user_page_fault`, `redirect_user_exception`, `fault_info_for` | b/d; **a** on x86-64 ([#443](https://github.com/kottlerg/seraph/issues/443)) |
 | Exit / death reason encoding + death payload `(correlator << 32) \| reason` | `syscall::encode_exit_code`, `EXIT_*` constants, `sched::post_one_death_event` | c/d |
 | Thread ID (random CSPRNG correlator; no `tid → TCB` table; never returned as data) | `sched::alloc_thread_id` | c |
 | `CSpaceId` (registry index, never returned to userspace); capability badges (caller-chosen) | `cap::alloc_cspace_id`, `cap::slot::CapabilitySlot::badge` | c |
@@ -72,14 +80,25 @@ Notes on the non-obvious entries:
   (`syscall_abi::unpack_cap_handles`, generation-validated by
   `ipc::prevalidate_transfer_slots` before any move), and freshly
   re-derived destination handles outbound. Both directions expose only
-  values the owning process already holds or is being granted.
-- **Fault messages** source `d1`/`ip` from the live user `TrapFrame` — the faulting
-  user address and user instruction pointer. The forwarded/readable `TrapFrame`
-  holds only user-mode register state (no kernel stack pointer, kernel return
-  address, or `CR3`/`satp`); the write path re-validates through
-  `sanitize_for_user_resume`.
-- **Thread IDs** are random per `sched::alloc_thread_id` (issue #248) — a monotonic
-  id would leak thread creation counts/rates wherever logged. They are diagnostic
+  values the owning process already holds or is being granted; see
+  [syscalls.md](syscalls.md) § Capability Handles.
+- **Fault messages** carry, for `FAULT_KIND_VM`, the user faulting address in `d1`
+  (`CR2` on x86-64, `stval` on RISC-V), access flags in `d2`, and the user instruction
+  pointer from the `TrapFrame` in `ip`; for `FAULT_KIND_EXCEPTION`, a normalized
+  exception code in `d1` and an architecture code (x86-64 error code, RISC-V `stval`)
+  in `d2` ([docs/fault-handling.md](../../../docs/fault-handling.md) § Fault Message).
+  On x86-64, `d2` is a KASLR disclosure (class **a**): `redirect_user_page_fault` sets
+  `FAULT_ACCESS_PRESENT` from the hardware `#PF` P bit even when the user-chosen `CR2`
+  is a kernel-half address, and the kernel half is mapped supervisor-only in every user
+  address space, so a process bound as its own fault handler can probe whether a kernel
+  VA is mapped; closing it is [#443](https://github.com/kottlerg/seraph/issues/443).
+  RISC-V never sets the bit. No other word carries a kernel VA or a value derived from
+  one. The forwarded/readable `TrapFrame` holds only user-mode register state (no kernel
+  stack pointer, kernel return address, or `CR3`/`satp`); the write path re-validates
+  through `sanitize_for_user_resume`.
+- **Thread IDs** are random per `sched::alloc_thread_id` (issue #248;
+  [scheduling-internals.md](scheduling-internals.md) § Cross-CPU TCB Ownership) — a
+  monotonic id would leak thread creation counts/rates wherever logged. They are diagnostic
   correlators only and never cross the boundary as syscall data.
 - **`SYS_SBI_CALL`** forwards caller-supplied arguments to M-mode firmware and
   returns the firmware result; neither the arguments the kernel forwards nor the
@@ -98,8 +117,9 @@ Notes on the non-obvious entries:
 Three surfaces emit real addresses. All are **physical**, not kernel virtual:
 
 - `SYS_ASPACE_QUERY` (`sysinfo::sys_aspace_query`) returns the leaf physical address
-  backing a *user* page, gated on an `AddressSpace` capability with the `READ` right.
-  The intermediate page-table addresses traversed during the walk are not returned.
+  backing a *user* page, gated on an `AddressSpace` capability with the `READ` right
+  ([syscalls.md](syscalls.md) § `SYS_ASPACE_QUERY` (41)). The intermediate page-table
+  addresses traversed during the walk are not returned.
 - `CAP_INFO_MEMORY_PHYS_BASE` (`cap::sys_cap_info`) returns `MemoryObject::base`, the
   physical base of a Memory object the caller holds a capability to. memmgr depends
   on it to track region contiguity.
@@ -114,14 +134,16 @@ are fixed-by-contract disclosures, not leaks.
 
 **Resolved for the KASLR work ([#252](https://github.com/kottlerg/seraph/issues/252)):**
 KASLR draws the direct-map base from the boot-entropy source at 1 GiB granularity
-(≈17–26 bits on x86-64 / Sv48 / Sv57, ≈8 bits on a near-full Sv39 half), independently
-of any physical address. A leaked physical address therefore does **not** reveal the
-phys→virt offset — recovering the direct-map base from a physical address would require
-also knowing that page's virtual address, which these surfaces do not disclose. So
-`SYS_ASPACE_QUERY` and `CAP_INFO_MEMORY_PHYS_BASE` remain fixed-by-contract disclosures,
-not KASLR leaks. (`kernel_physical_base` is likewise a physical value and unaffected;
-the kernel scrubs the *virtual* KASLR bases — `kernel_virtual_base`, `direct_map_base` —
-from the donated `BootInfo` page after consuming them.)
+(≈17–26 bits on x86-64 / Sv48 / Sv57, ≈8 bits on a near-full Sv39 half; see
+[docs/memory-model.md](../../../docs/memory-model.md) § Virtual Address Space Layout),
+independently of any physical address. A leaked physical address therefore does **not**
+reveal the phys→virt offset — recovering the direct-map base from a physical address
+would require also knowing that page's virtual address, which these surfaces do not
+disclose. So `SYS_ASPACE_QUERY` and `CAP_INFO_MEMORY_PHYS_BASE` remain fixed-by-contract
+disclosures, not KASLR leaks. (`kernel_physical_base` is likewise a physical value and
+unaffected; the kernel scrubs the *virtual* KASLR bases — `kernel_virtual_base`,
+`direct_map_base` — from the donated `BootInfo` page after consuming them; see
+[initialization.md](initialization.md) § Phase 5.)
 
 ## Kernel state in donated memory
 
@@ -139,7 +161,8 @@ source-object pointers) — plus the retype allocator's free-list links (offsets
 into the region, not addresses). The holder of the donating capability is
 trusted not to map what it has retyped away; the kernel does not yet enforce
 that boundary ([#433](https://github.com/kottlerg/seraph/issues/433)). Until
-it does, the class (a) claim holds only under that trust.
+it does, the claim that no kernel object state in donated memory reaches
+userspace holds only under that trust.
 
 Memory the bootloader used is a related surface, whether it is donated
 through `reclaim_ranges` or returned by the memory map as usable and drained
@@ -163,17 +186,20 @@ directly and never becomes a client of the userspace serial or framebuffer drive
 and no IPC channel delivers kernel log output to a userspace process as data. The
 always-on `USERSPACE FAULT` serial dumps print the faulting thread's *own* user
 registers, not kernel addresses. Every kernel VA lies in one of the two regions KASLR
-randomizes (the image or the direct map), so kernel-pointer console output is governed
-by the serial-only rule below; it must not be routed to any userspace-reachable IPC or
-log channel.
+randomizes (the image or the direct map; see
+[docs/memory-model.md](../../../docs/memory-model.md) § Virtual Address Space Layout), so
+kernel-pointer console output is governed by the serial-only rule below; it must not be
+routed to any userspace-reachable IPC or log channel.
 
 **KASLR values are serial-only.** The randomized kernel image base, direct-map base,
 and slide, and any kernel virtual address derived from them (an image VA or a
 direct-map VA), are secrets whose disclosure defeats KASLR. `kprintln!` mirrors to the
 framebuffer, and although the kernel writes that framebuffer directly (not as a driver
-client), the framebuffer *memory* is later handed to the userspace framebuffer driver,
-which can read the pixels back — so a KASLR value printed via `kprintln!` becomes
-userspace-recoverable. These values must be emitted **only** via the serial-only sinks
+client), the framebuffer *memory* is later handed to the userspace framebuffer driver
+([docs/console-model.md](../../../docs/console-model.md) § The framebuffer driver as sole
+userspace framebuffer owner), which can read the pixels back — so a KASLR value printed
+via `kprintln!` becomes userspace-recoverable. These values must be emitted **only** via
+the serial-only sinks
 (`kprintln_serial!` / `console::serial_write_fmt`; on the panic and NMI paths the
 lock-bypassing `console::panic_write_fmt` and `kprintln_nmi!` /
 `console::nmi_write_fmt`), never `kprintln!`, and never through any IPC or log channel.
@@ -203,4 +229,8 @@ identifier observed across the boundary is drawn from the entropy root
 
 ## Summarized By
 
-[Kernel](../README.md)
+[core/kernel/README.md](../README.md), [Capability Subsystem Internals](capability-internals.md),
+[Kernel Initialization Sequence](initialization.md),
+[SMP Scheduling and Locking Invariants](scheduling-internals.md),
+[Console Model](../../../docs/console-model.md),
+[Device Management](../../../docs/device-management.md), [Testing](../../../docs/testing.md)

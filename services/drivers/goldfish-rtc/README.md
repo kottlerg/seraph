@@ -10,13 +10,15 @@ fixed physical address `0x101000`. It returns wall-clock time as a
 register reads.
 
 Installed to `/services/drivers/goldfish-rtc` on the rootfs. Spawned
-by devmgr on RISC-V QEMU virt via the non-PCI simple-device path,
+by [devmgr](../../devmgr/README.md) on RISC-V QEMU virt via the non-PCI simple-device path,
 `procmgr_labels::CREATE_FROM_FILE` against a vfsd file SEND devmgr
-walks to from the `/services/drivers/` subtree cap init delivers
-post-vfsd-mount via `devmgr_labels::SET_DRIVERS_DIR`. devmgr owns the
+walks to from the `LOOKUP | READ` `/services/drivers/` subtree cap
+svcmgr delivers post-handover via `devmgr_labels::SET_DRIVERS_DIR` (see
+[Device Management](../../../docs/device-management.md#driver-binary-sources)).
+[devmgr](../../devmgr/docs/responsibilities.md#responsibilities) owns the
 driver's service endpoint and mints client SEND caps on
 `devmgr_labels::QUERY_RTC_DEVICE`, each badged with
-`rtc_labels::READ_AUTHORITY`. The `timed` service resolves the SEND
+`rtc_labels::READ_AUTHORITY`. The [`timed`](../../timed/README.md) service resolves the SEND
 once at startup to seed its wall-clock offset.
 
 ---
@@ -85,12 +87,14 @@ On seraph's RISC-V boot path (EDK2 + QEMU `virt`) the Goldfish RTC
 is **not discoverable** at runtime:
 
 - EDK2 consumes the DTB and does not re-publish it via a UEFI
-  configuration table on the build seraph targets, so the kernel's
-  DTB parser sees nothing.
+  configuration table on the build seraph targets, so the bootloader
+  finds no `EFI_DTB_TABLE_GUID` entry and `BootInfo.device_tree` is
+  zero; neither the bootloader's DTB pass nor devmgr sees a DTB (see
+  [Firmware Parsing](../../../core/boot/docs/firmware-parsing.md#architecture-dispatch)).
 - EDK2 does not emit an ACPI entry for the Goldfish RTC (no
   standard `_HID`).
 
-The driver therefore depends on the kernel boot path unconditionally
+The driver therefore depends on the bootloader unconditionally
 seeding `(0x101000, 0x1000)` as a platform aperture (mirroring the
 unconditional PCI-ECAM seed that exists for the same firmware-
 discovery reason; see `core/boot/src/arch/riscv64/mod.rs`). devmgr

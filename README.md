@@ -12,7 +12,7 @@ memory management, and capabilities); drivers, filesystems, and services
 live in userspace. Capabilities are the sole access control mechanism.
 Seraph defines its own native system interfaces, not a POSIX surface
 or any other OS's ABI. Userspace reaches them through standard language
-runtimes (`ruststd` and `libc`).
+runtimes (`ruststd`; `libc` is design intent, not yet implemented).
 
 ## Goals
 
@@ -29,15 +29,18 @@ see there for the authoritative statement.
 
 | Directory | Purpose |
 |---|---|
-| `abi/` | Stable cross-boundary contracts |
-| `core/` | Core OS: bootloader, kernel, and the kernel-validation harness (ktest) |
+| `.cargo/` | Cargo configuration: the `cargo xtask` alias, the custom-target search path, and per-target rustflags |
+| `.claude/` | Assistant operating instructions, agents, and workflows (outside the documentation hierarchy) |
+| `.github/` | CI workflows and Issue and PR templates (outside the documentation hierarchy) |
+| [`abi/`](abi/README.md) | Stable cross-boundary contracts |
+| [`core/`](core/README.md) | Core OS: bootloader, kernel, and the kernel-validation harness (ktest) |
 | `docs/` | Architecture and design documentation |
-| `programs/` | General-purpose userspace applications and utilities |
-| `rootfs/` | System files installed into the sysroot during builds (config files, etc) |
-| `runtime/` | Language runtime layers consumed by userspace (libc, ruststd) |
-| `services/` | Userspace OS processes: managers, drivers, filesystems, daemons |
-| `shared/` | Shared utility crates |
-| `xtask/` | Build task runner (`cargo xtask`); custom target JSON specs under `xtask/targets/` |
+| [`programs/`](programs/README.md) | General-purpose userspace applications, utilities, and the test fixtures the harnesses spawn |
+| [`rootfs/`](rootfs/README.md) | System files installed into the sysroot during builds (config files, etc) |
+| [`runtime/`](runtime/README.md) | Language runtime layers consumed by userspace (ruststd; libc is design intent, not yet implemented) |
+| [`services/`](services/README.md) | Userspace OS processes: managers, drivers, filesystems, daemons |
+| [`shared/`](shared/README.md) | Shared utility crates |
+| [`xtask/`](xtask/README.md) | Build task runner (`cargo xtask`); custom target JSON specs under `xtask/targets/` |
 
 ## Usage
 
@@ -56,11 +59,12 @@ cargo xtask run                              # launch existing sysroot under QEM
 cargo xtask run --gdb                        # pause at start; GDB on :1234
 cargo xtask test                             # run host-side workspace tests
 cargo xtask lint-docs                        # check docs and source-header rules
-cargo xtask clean [--all]                    # remove sysroot/ (and target/ with --all)
+cargo xtask clean [--all]                    # remove sysroot/ and disk.img (target/ with --all)
 ```
 
-Testing spans host-side `cargo xtask test` plus in-tree QEMU harnesses
-(`ktest`, `svctest`, `usertest`); the default boot is interactive and runs
+Testing spans host-side `cargo xtask test`, in-tree QEMU harnesses
+(`ktest`, `svctest`, `usertest`), and host-driven boot tests (`test-kaslr`,
+`test-vmgenid`, `test-terminal`); the default boot is interactive and runs
 no harness. See [docs/testing.md](docs/testing.md) for the full model.
 
 ---
@@ -103,4 +107,5 @@ Overall project design documents live in [`docs/`](docs/):
 - [Release Notes](docs/releases/README.md) — per-tag notes catalogue, naming,
   source-of-truth discipline, workflow integration
 
-Each component contains a `README.md` that references the design docs relevant to that module.
+Each component's `README.md` references the design docs relevant to that component
+(see [Documentation Standards](docs/documentation-standards.md#required-structure)).

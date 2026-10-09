@@ -218,7 +218,7 @@ pub struct RestartCtx
     /// the first-launch `HANDOVER_PULL` SEND) from it on every (re)launch.
     pub master_log_source: u32,
     /// Badge-0 `SEND|GRANT` source on procmgr's service endpoint. svcmgr mints
-    /// real-logd's `DEATH_EQ_AUTHORITY` SEND from it.
+    /// real-logd's `DEATH_EQ_AUTHORITY` `SEND|GRANT` cap from it.
     pub procmgr_death_auth_source: u32,
     /// Badge-0 `SEND|GRANT` source on devmgr's registry endpoint. svcmgr mints
     /// real-logd's `REGISTRY_QUERY_AUTHORITY` query cap from it.

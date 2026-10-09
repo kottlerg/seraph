@@ -2,7 +2,8 @@
 
 The bootloader establishes minimal initial page tables before kernel handoff: enough
 for the kernel to execute at its ELF virtual addresses and read `BootInfo` before its
-own page tables are ready. The kernel replaces them during Phase 3.
+own page tables are ready. The kernel replaces them during
+[Phase 3](../../kernel/docs/initialization.md#phase-3-kernel-page-tables).
 
 All page table frames MUST be allocated via `AllocatePages` before `ExitBootServices`;
 no page table allocation occurs after the firmware exits.
@@ -18,18 +19,24 @@ bootloader *builds*, described in later sections — is:
   (text, rodata, data, bss; ELF virtual base + slide), with page
   permissions matching each segment's ELF flags (W^X enforced). The
   bootloader has already applied the image's `RELATIVE` relocations for
-  the chosen slide, so the mapped image is internally consistent.
-- An identity map covers the physical memory region containing the
-  `BootInfo` structure and every physical region it references
-  (memory-map buffer, `MmioAperture` array, `InitImage` segments,
-  all boot modules), so the kernel can read them using physical
-  addresses before its own direct-physical map is established.
-- The bootloader's stack in use at handoff is mapped at its current
-  virtual address, read-write, non-executable.
-- Nothing else is mapped. Any access outside these ranges faults.
+  the chosen slide ([boot-flow.md](boot-flow.md#step-5d-apply-the-kaslr-slide)),
+  so the mapped image is internally consistent.
+- An identity map, read-write and non-executable, covers the `BootInfo` page, the
+  boot-module array page, the translated `MemoryMapEntry` array (`BootInfo.memory_map`),
+  the `MmioAperture` array page, the reclaim-range array page, the handoff stack, the
+  `InitImage` segments, the kernel segments' physical frames, the kernel ELF file buffer,
+  the bundle blob (every boot module body), the framebuffer when present, and the UART
+  MMIO page on RISC-V, so the kernel can read them using physical addresses before its
+  own direct-physical map is established.
+- The handoff trampoline's page or pages are identity-mapped read-execute, so execution
+  continues across the root-table switch.
+- Nothing else is mapped; an access outside these ranges faults. The ACPI RSDP and the
+  device tree, which `BootInfo` references, are not mapped.
 
 The initial tables are **not** intended to be permanent. The kernel
-replaces them during Phase 3. The CPU state at the moment of jump —
+replaces them during
+[Phase 3](../../kernel/docs/initialization.md#phase-3-kernel-page-tables).
+The CPU state at the moment of jump —
 paging bit set, interrupts disabled, BootInfo pointer in the
 first-argument register — is specified in
 [kernel-handoff.md](kernel-handoff.md).
@@ -38,23 +45,27 @@ first-argument register — is specified in
 
 ## What Gets Mapped
 
-The initial page tables contain exactly three categories of mappings. Nothing else is
+The initial page tables contain the categories of mappings below. Nothing else is
 mapped; an access outside these ranges faults.
 
 **Kernel ELF segments** — each LOAD segment is mapped at its KASLR-biased virtual
 address (ELF virtual base + slide) with permissions derived from the ELF segment flags.
 This allows the kernel to execute from the first instruction.
 
-**Identity map of the boot region** — the `BootInfo` structure, the `MmioAperture`
-array, the memory map buffer, and all boot modules are identity-mapped (virtual address
-equals physical address). This allows the kernel to read them using physical addresses
-before its direct physical map is established in Phase 3.
+**Identity map of the boot region** — every read-write region the entry contract above
+lists is identity-mapped (virtual address equals physical address), non-executable.
+This allows the kernel to read them using physical addresses before its direct physical
+map is established in
+[Phase 3](../../kernel/docs/initialization.md#phase-3-kernel-page-tables).
 
-**Bootloader stack** — the stack in use at the point of kernel handoff is mapped at
-its current virtual address. On x86-64 and RISC-V, the stack is allocated by UEFI
-and its virtual address equals its physical address (UEFI runs with a 1:1 mapping
-or a well-defined identity region). The stack mapping uses read-write, non-executable
-permissions.
+**Handoff trampoline** — the page or pages holding the handoff trampoline are
+identity-mapped read-execute, so the instruction fetch after the root-table switch
+resolves.
+
+**Handoff stack** — the bootloader allocates the kernel's entry stack
+(`KERNEL_STACK_PAGES`, 64 KiB) through `AllocatePages`, identity-maps it with read-write,
+non-executable permissions, and switches the stack pointer to it in the
+[handoff sequence](kernel-handoff.md#handoff-sequence) before jumping to the kernel.
 
 The UEFI firmware's own page tables (before `ExitBootServices`) already contain a
 full 1:1 mapping of physical memory. After `ExitBootServices`, those page tables are
@@ -238,10 +249,12 @@ continued execution are present before `satp` is written. See
 [`boot/src/arch/riscv64/paging.rs`](../src/arch/riscv64/paging.rs) for
 the asm and the full SAFETY justification.
 
-ASID 0 is used for the bootloader's tables. The kernel uses ASID 0 for
-its own initial context (per the boot protocol's description of kernel
-entry state) and reassigns ASIDs when it brings up its own page table
-management in Phase 3.
+ASID 0 is used for the bootloader's tables. The kernel keeps ASID 0 for its own root: in
+[Phase 3](../../kernel/docs/initialization.md#phase-3-kernel-page-tables) its untagged
+`activate` writes `satp` with ASID 0, as every untagged switch does. Once it enables ASID
+tagging, it assigns each address space an ASID on its first tagged activation (see
+[Context Switch TLB Handling](../../kernel/docs/memory-internals.md#context-switch-tlb-handling)
+and [TLB Management](../../../docs/memory-model.md#tlb-management)).
 
 ---
 
@@ -265,11 +278,13 @@ mapping that reaches the kernel is a security defect, not just a policy violatio
 Each arch-specific `BootPageTable` records the physical address of every
 frame it allocates from `AllocatePages` — the root table and every
 intermediate table allocated during `map` — in an inline `frame_log`.
-After step 8, step 9 reads this log via the trait method
+After [step 8](boot-flow.md#step-8-exitbootservices),
+[step 9](boot-flow.md#step-9-populate-bootinfo) reads this log via the trait method
 `PageTableBuilder::allocated_frames` and appends one
 `boot_protocol::ReclaimRange` per frame to `BootInfo.reclaim_ranges`.
 The kernel mints reclaimable Memory caps over the recorded frames during
-Phase 7 (`cap::mint_reclaim_memory_caps`), so they flow into userspace
+[Phase 7](../../kernel/docs/initialization.md#phase-7-capability-system)
+(`cap::mint_reclaim_memory_caps`), so they flow into userspace
 through the standard `CapDescriptor` path rather than being orphaned as
 `MemoryType::Loaded` pages outside the buddy.
 
@@ -277,4 +292,9 @@ through the standard `CapDescriptor` path rather than being orphaned as
 
 ## Summarized By
 
-[boot/README.md](../README.md)
+[core/boot/README.md](../README.md), [Boot Flow](boot-flow.md), [ELF Loading](elf-loading.md),
+[Kernel Initialization Sequence](../../kernel/docs/initialization.md),
+[Memory Subsystem Internals](../../kernel/docs/memory-internals.md),
+[Memory Model](../../../docs/memory-model.md),
+[Platform Requirements](../../../docs/platform-requirements.md),
+[xtask/README.md](../../../xtask/README.md)

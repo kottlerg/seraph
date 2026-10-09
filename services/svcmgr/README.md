@@ -1,13 +1,14 @@
 # svcmgr
 
 Service supervisor and discovery registry. Started by init before
-init exits; runs for the lifetime of the system. svcmgr is a
+init exits; runs for the lifetime of the system (boot order in
+[docs/process-lifecycle.md](../../docs/process-lifecycle.md)). svcmgr is a
 self-driven process: it spawns into an already-running system (root
 mounted; vfsd, procmgr, devmgr, fs/block drivers up), reads service
 *definitions* from `/config/svcmgr/services/`, and reconciles them
 against the substrate registrations init delivers in the handover
 endowment to either supervise the running instance or launch a fresh
-one.
+one ([docs/service-definitions.md](docs/service-definitions.md) § Reconciliation).
 
 svcmgr also owns the system-wide discovery registry: it publishes the
 well-known names it owns (`rootfs.root`, `svcmgr`, `devmgr.registry`,
@@ -15,12 +16,13 @@ and each provider's `provides` names like `pwrmgr.shutdown` / `timed`)
 into the registry itself — from the source caps init endows it with at
 handover, and from each provider's launch — and consumers resolve them
 via `QUERY_ENDPOINT` (or transparently through their `.svc` `seed = ...`
-line at launch time).
+line at launch time). The endowment and registry wire format are in
+[docs/ipc-interface.md](docs/ipc-interface.md).
 
-svcmgr also holds raw process-creation syscall capabilities as a
-documented future fallback to restart procmgr if procmgr itself
-crashes. This is the only service that can create a process without
-going through procmgr.
+A raw-syscall fallback that lets svcmgr recreate procmgr if procmgr
+itself crashes is design intent; not yet implemented (#26); svcmgr holds no
+process-creation capabilities today
+([docs/restart-protocol.md](docs/restart-protocol.md) § procmgr Fallback).
 
 ---
 
@@ -40,12 +42,12 @@ svcmgr/
 │   │                              # start_process, apply_namespace_policy),
 │   │                              # death handling, DeathOutcome
 │   ├── definitions/
-│   │   ├── mod.rs                 # Definition struct + RestartPolicy /
-│   │   │                          # NamespaceShape enums
-│   │   ├── parse.rs               # `.svc` key=value parser
+│   │   ├── mod.rs                 # On-disk definitions; re-exports svc-defs
 │   │   ├── launch.rs              # First-launch path
 │   │   └── reconcile.rs           # PendingRegistration + reconcile_and_launch
 │   └── arch/                      # Per-arch halt() entry
+├── svc-defs/                      # `svcmgr-defs` crate: host-tested `.svc`
+│                                  # Definition types and parser
 └── docs/
     ├── ipc-interface.md           # handover endowment, HANDOVER_COMPLETE,
     │                              # PUBLISH_ENDPOINT / QUERY_ENDPOINT
@@ -62,52 +64,66 @@ svcmgr/
 - **Handover endowment** — drain init's bootstrap-round endowment in
   [`service::bootstrap_caps`](src/service.rs): svcmgr's own endpoints,
   the publish-role source caps (`rootfs.root` SEND, devmgr-registry
-  `SEND|GRANT` source), and one `(name, thread_cap)` round per substrate
-  service init bootstrapped before svcmgr existed. Recipes (binary,
-  argv, env, restart policy, criticality, namespace shape, seed names)
-  live on disk, not on the wire — see
-  [docs/service-definitions.md](docs/service-definitions.md).
+  `SEND|GRANT` source), one `(name, thread_cap)` round per substrate
+  service init bootstrapped before svcmgr existed, and a terminal
+  `LOGD_SOURCES` round carrying the two log-sink source caps svcmgr holds
+  for the system's lifetime (the master-log source and a badge-0
+  `SEND|GRANT` death-auth source on procmgr's service endpoint). Recipes
+  (binary, argv, env, restart policy, criticality, namespace shape, seed
+  names) live on disk, not on the wire — see
+  [docs/service-definitions.md](docs/service-definitions.md). The round
+  layout is specified in
+  [docs/ipc-interface.md](docs/ipc-interface.md#handover-endowment-bootstrap-rounds).
 - **Reconciliation** — at `HANDOVER_COMPLETE` scan
   `/config/svcmgr/services/`, parse each `<name>.svc`, and pair it
   with the pending-registration table (substrate pairs parked from the
   endowment). Three outcomes: `bind only` (parked AND defined),
   `launching` (defined only), `registered without definition`
-  (parked AND no recipe → hard error).
+  (parked AND no recipe → hard error). See
+  [docs/service-definitions.md](docs/service-definitions.md) § Reconciliation.
 - **Launch** — for `defined only` services, spawn via the shared
   primitives in [`restart.rs`](src/restart.rs)
   (`walk_and_create_from_file`, `apply_namespace_policy`,
-  `start_process`) and serve the seed bootstrap round.
+  `start_process`) and serve the seed bootstrap round
+  ([docs/restart-protocol.md](docs/restart-protocol.md) § Shared spawn primitives).
 - **Health monitoring** — bind every supervised service's main
   thread to one shared `deaths_eq` with `correlator =
-  service_index`. Detect crashes via async notifications.
+  service_index`. Detect crashes via async notifications
+  ([docs/restart-protocol.md](docs/restart-protocol.md) § Death detection).
 - **Restart management** — on detected crash, route through
   [`restart::handle_death`](src/restart.rs); shared spawn primitives
   re-spawn the service from the recorded recipe. The `.svc` file is the
   single source of truth for both launch and restart — fixed fields on
   `ServiceEntry`, the heap-backed argv/env/cwd/seed on a parallel
-  `RestartRecipe` — so a restart reproduces the first-launch surfaces.
+  `RestartRecipe` — so a restart reproduces the first-launch surfaces
+  ([docs/restart-protocol.md](docs/restart-protocol.md) § Recipe storage).
   Whether a service restarts is decided by its `restart` policy + budget
-  alone; `critical` is orthogonal (see graceful shutdown below).
+  alone; `critical` is orthogonal (see graceful shutdown below and
+  [docs/restart-protocol.md](docs/restart-protocol.md) § Decision tree).
 - **Discovery registry** — svcmgr publishes the names it owns directly
   (internal `registry.publish`); `PUBLISH_ENDPOINT` is the external
   write-API (reserved for a future devmgr publisher) and `QUERY_ENDPOINT`
   the lookup, served on the per-process SEND seeded into
-  `ProcessInfo.service_registry_cap`.
+  `ProcessInfo.service_registry_cap` ([docs/ipc-interface.md](docs/ipc-interface.md) § Messages).
 - **Graceful shutdown** — when a `critical = yes` service is permanently
   down (restart not attempted or budget exhausted), resolve
   `ipc::published_names::PWRMGR_SHUTDOWN` from the registry and issue
-  `pwrmgr_labels::SHUTDOWN`.
+  `pwrmgr_labels::SHUTDOWN` ([docs/restart-protocol.md](docs/restart-protocol.md) § Decision tree).
 
 ---
 
 ## Namespace authority
 
-Init spawns svcmgr with the **universal** `system_root_cap`.
+Init spawns svcmgr with the **universal** `system_root_cap`
+([docs/process-lifecycle.md](../../docs/process-lifecycle.md) § Init → remaining services).
 svcmgr reads `/config/svcmgr/services/*.svc` directly via `std::fs`,
 walks the recipe's `binary` path for first-launch, and applies per-service
 namespace attenuation from each `.svc` `namespace = ...` line via
-`procmgr_labels::CONFIGURE_NAMESPACE`. Restart-time attenuation reads
-the same `ServiceEntry`-stored policy that reconcile installed.
+`procmgr_labels::CONFIGURE_NAMESPACE`
+([docs/service-definitions.md](docs/service-definitions.md) § `namespace`).
+Restart-time attenuation reads the same `ServiceEntry`-stored policy that
+reconcile installed ([docs/restart-protocol.md](docs/restart-protocol.md)
+§ Recipe storage).
 
 svcmgr scans only `/config/svcmgr/services/`. The sibling directory
 `/config/svcmgr/tests/` holds opt-in test-harness recipes; svcmgr never
@@ -152,7 +168,9 @@ svcmgr publishes every well-known name into its own registry — there is
 no init-side `PUBLISH_ENDPOINT` traffic. The first three are published in
 `main()` right after the endowment is drained, from the source caps init
 endows svcmgr with at handover; the provider names are published on each
-provider's launch path. Names are FS-driver- and platform-agnostic by
+provider's launch path from its `provides` line
+([docs/service-definitions.md](docs/service-definitions.md) § `provides`). Names are
+FS-driver- and platform-agnostic by
 design; consumers resolve them through their `.svc` `seed = ...` lines or
 via direct `QUERY_ENDPOINT` calls. The handover endowment and
 `PUBLISH_ENDPOINT` / `QUERY_ENDPOINT` wire format are specified in
@@ -163,9 +181,9 @@ via direct `QUERY_ENDPOINT` calls. The handover endowment and
 | `rootfs.root` | svcmgr (endowed `rootfs.root` SEND) | badged SEND on the root filesystem's namespace endpoint at its root directory |
 | `svcmgr` | svcmgr (its own service ep) | un-badged SEND on svcmgr's own service endpoint |
 | `devmgr.registry` | svcmgr (minted from the endowed devmgr-registry source) | `REGISTRY_QUERY_AUTHORITY`-badged SEND on devmgr's registry endpoint |
-| `pwrmgr.shutdown` | svcmgr (`pwrmgr.svc` provider) | `SHUTDOWN_AUTHORITY`-badged SEND on pwrmgr's service endpoint |
-| `pwrmgr.deny` | svcmgr (`pwrmgr.svc` provider) | no-authority SEND on pwrmgr's service endpoint (negative-test twin) |
-| `timed` | svcmgr (`timed.svc` provider) | SEND on timed's service endpoint |
+| `pwrmgr.shutdown` | svcmgr (`pwrmgr.svc` [provider](docs/service-definitions.md)) | `SHUTDOWN_AUTHORITY`-badged SEND on pwrmgr's service endpoint |
+| `pwrmgr.deny` | svcmgr (`pwrmgr.svc` [provider](docs/service-definitions.md)) | no-authority SEND on pwrmgr's service endpoint (negative-test twin) |
+| `timed` | svcmgr (`timed.svc` [provider](docs/service-definitions.md)) | SEND on timed's service endpoint |
 
 Centralised name constants live in `ipc::published_names`.
 
@@ -175,7 +193,8 @@ Centralised name constants live in `ipc::published_names`.
 
 `critical` is binary (`yes` / `no`) and orthogonal to `restart`: it
 governs only what happens once a service is permanently down, not
-whether it restarts. A `critical = yes` service triggers a graceful
+whether it restarts ([docs/service-definitions.md](docs/service-definitions.md)
+§ `critical`). A `critical = yes` service triggers a graceful
 shutdown via pwrmgr on permanent death (restart not attempted, or budget
 exhausted); a `critical = no` service is logged and the system continues
 degraded. Edge case: pwrmgr itself cannot trigger shutdown on its own
@@ -201,7 +220,7 @@ marked degraded and not restarted automatically. See
 |---|---|
 | [docs/architecture.md](../../docs/architecture.md) | System design, init/procmgr/svcmgr roles |
 | [docs/capability-model.md](../../docs/capability-model.md) | Capability types, verb-bit authority, revocation |
-| [docs/process-lifecycle.md](../../docs/process-lifecycle.md) | Userspace boot order, Phase 3 handover, process-death flow |
+| [docs/process-lifecycle.md](../../docs/process-lifecycle.md) | Userspace boot order, init's Handover stage, process-death flow |
 | [docs/coding-standards.md](../../docs/coding-standards.md) | Formatting, naming, safety rules |
 | [docs/documentation-standards.md](../../docs/documentation-standards.md) | Document hierarchy, authority, backlinks |
 
@@ -209,5 +228,6 @@ marked degraded and not restarted automatically. See
 
 ## Summarized By
 
-[Architecture Overview](../../docs/architecture.md), [System Bootstrap](../../docs/bootstrap.md),
-[Process Lifecycle](../../docs/process-lifecycle.md), [Testing](../../docs/testing.md)
+[Architecture Overview](../../docs/architecture.md),
+[Process Lifecycle](../../docs/process-lifecycle.md), [Testing](../../docs/testing.md),
+[services/init/README.md](../init/README.md)

@@ -23,10 +23,6 @@ calling convention.
 
 ## Summarized By
 
-[abi/README.md](../README.md),
-[core/kernel/docs/syscalls.md](../../core/kernel/docs/syscalls.md),
-[docs/build-system.md](../../docs/build-system.md),
-[services/procmgr/docs/ipc-interface.md](../../services/procmgr/docs/ipc-interface.md),
-[shared/syscall/README.md](../../shared/syscall/README.md),
-[core/kernel/docs/capability-internals.md](../../core/kernel/docs/capability-internals.md),
-[services/fs/docs/fs-driver-protocol.md](../../services/fs/docs/fs-driver-protocol.md)
+[Syscall Interface Specification](../../core/kernel/docs/syscalls.md),
+[Build System](../../docs/build-system.md),
+[shared/syscall/README.md](../../shared/syscall/README.md)

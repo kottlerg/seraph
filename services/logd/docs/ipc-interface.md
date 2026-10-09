@@ -3,9 +3,12 @@
 logd is the receive-side of the master log endpoint. It does not
 publish a separate service endpoint; every userspace sender already
 holds a badged SEND cap on the log endpoint (seeded by procmgr at
-spawn time, or installed by init for itself / procmgr-self). The
-labels documented below are the ones logd's receive loop dispatches
-on.
+spawn time, per [`docs/process-lifecycle.md`](../../../docs/process-lifecycle.md)
+§ ProcessInfo / InitInfo Handover Discipline, or installed by init for
+itself / procmgr-self, per
+[`services/init/docs/bootstrap.md`](../../init/docs/bootstrap.md) § Raw
+bootstrap). The labels documented below are the ones logd's receive
+loop dispatches on.
 
 logd additionally calls procmgr's
 [`procmgr_labels::REGISTER_DEATH_EQ`](../../procmgr/docs/ipc-interface.md)
@@ -22,15 +25,23 @@ The shape mirrors the README's "Bootstrap caps" table:
 | Index | Cap |
 |---|---|
 | 0 | `RECV` on the master log endpoint |
-| 1 | `SEND` on the master log endpoint (single-use; `HANDOVER_PULL` only). `0` on a restart — no init-logd remains to pull from, so logd skips the history pull |
-| 2 | badged `SEND` on procmgr's service endpoint carrying `DEATH_EQ_AUTHORITY` |
+| 1 | `SEND` on the master log endpoint (single-use; carries the `HANDOVER_PULL` history drain, then the terminal `HANDOVER_RELEASE` (retried up to `MAX_RETRIES` (64) times until acked; once they are exhausted init-logd keeps serving), then `cap_delete` whatever the outcome; see [`handover-protocol.md`](handover-protocol.md)). `0` on a restart — no init-logd remains to pull from, so logd skips the history pull (restart: design intent; not yet implemented (#262)) |
+| 2 | badged `SEND\|GRANT` on procmgr's service endpoint carrying `DEATH_EQ_AUTHORITY` |
 | 3 | badged `SEND` on devmgr's registry endpoint carrying `REGISTRY_QUERY_AUTHORITY` (resolves the serial driver via `QUERY_SERIAL_DEVICE` and the framebuffer driver via `QUERY_FRAMEBUFFER_DEVICE`) |
 
 Every (re)launch mints `cap[0]` fresh from svcmgr's persistent master-log
 source, so a restarted logd re-attaches its RECV to the same endpoint
 object every sender already targets. Only `cap[1]` differs across the two
 paths: present on the first launch (one-shot history pull from init-logd),
-`0` on a restart (history pull skipped, fresh table served).
+`0` on a restart (history pull skipped, fresh table served). A working
+logd restart is design intent; not yet implemented (#262), per svcmgr's
+[`restart-protocol.md`](../../svcmgr/docs/restart-protocol.md#supervision-hierarchy)
+§ Supervision hierarchy.
+
+logd keeps `cap[0]`, the procmgr `cap[2]` (retained after `REGISTER_DEATH_EQ`), and the
+devmgr-registry `cap[3]` for its lifetime, using `cap[3]` to resolve and cache the serial
+driver's write endpoint and, when a framebuffer driver is present, the framebuffer driver's;
+`cap[1]` is deleted after the handover release.
 
 ## Endpoint
 
@@ -38,7 +49,7 @@ paths: present on the first launch (one-shot history pull from init-logd),
 |---|---|---|
 | logd's main thread | `RECV` | drains the endpoint via `ipc_recv` inside the wait-set loop |
 | every userspace sender | `SEND` (badged) | `STREAM_BYTES`, `STREAM_REGISTER_NAME` |
-| real-logd on its first launch | `SEND` (un-badged) | single-use `HANDOVER_PULL` to init-logd; deleted immediately after `DONE`. Absent (`cap[1] = 0`) on a restart |
+| real-logd on its first launch | `SEND` (un-badged) | single-use `HANDOVER_PULL` drain to init-logd, then `HANDOVER_RELEASE` (retried up to `MAX_RETRIES` (64) times until acked), then deleted via `cap_delete` whether or not it was acked. Absent (`cap[1] = 0`) on a restart (design intent; not yet implemented (#262)) |
 
 ## Labels accepted
 
@@ -53,6 +64,10 @@ line, emitted as `[sec.usfrac] [name] <line>\r\n` to the serial
 driver (`SERIAL_WRITE_BYTES`) and mirrored to the framebuffer driver
 (`FB_WRITE_BYTES`) when one is present, then appended to the slot's
 history ring.
+
+The history ring holds `PER_SLOT_HISTORY` (16) completed lines per slot (see
+[`slot.rs`](../src/slot.rs)); appending to a full ring drops its oldest line (FIFO). The ring
+has no read surface. TODO: a query IPC that reads the history ring.
 
 Lines exceeding `LINE_BUF_SIZE` (256 bytes) flush without a
 trailing `\n` to keep the per-line attribution visible. Senders
@@ -85,13 +100,14 @@ unreachable; init-logd is the only intended target.
 
 ### `log_labels::GET_LOG_CAP` (12) — legacy
 
-Pre-pivot discovery path. Reserved in the label table for backward
+Legacy discovery label. Reserved in the label table for backward
 compatibility but no caller in the current codebase issues it
 (every spawn receives a pre-installed badged SEND cap in
-`ProcessInfo.log_send_cap`). logd replies empty if it ever
+`ProcessInfo.log_send_cap`, per
+[`docs/process-lifecycle.md`](../../../docs/process-lifecycle.md) § ProcessInfo / InitInfo
+Handover Discipline). logd replies empty if it ever
 arrives, so an out-of-tree v0 caller fails closed without crashing
-logd. A follow-up PR removes the label entirely once the
-pre-pivot discovery path is gone for good.
+logd.
 
 ## Wait-set
 
@@ -121,7 +137,7 @@ Procmgr installs the second binding inside
 [`finalize_creation`](../../procmgr/src/process.rs) when its
 `LOGD_DEATH_EQ` static is non-zero, AND retroactively across every
 existing process table entry when logd's
-`REGISTER_DEATH_EQ` IPC arrives. Children spawned before logd
+[`REGISTER_DEATH_EQ`](../../procmgr/docs/ipc-interface.md) IPC arrives. Children spawned before logd
 registers see only the first binding until the retroactive bind
 catches them up.
 
@@ -134,4 +150,4 @@ already-evicted badges.
 
 ## Summarized By
 
-[logd/README.md](../README.md)
+[services/logd/README.md](../README.md)

@@ -24,15 +24,17 @@ which firmware exposes which entropy source is documented in
 [boot-flow.md](boot-flow.md). The `rng-seed` reader is a flat scan that
 takes the first property of that name anywhere in the tree. The DTB's
 physical address is passed through unchanged in `BootInfo.device_tree`
-so `devmgr` can perform its own complete walk — including IOMMU-topology
-discovery, which is exclusively a userspace concern. See
-[`docs/device-management.md`](../../../docs/device-management.md) for
+because device-level discovery, IOMMU topology included, is a userspace
+concern; `devmgr`'s own firmware-table parsing is specified under
+Parse firmware tables in
+[`services/devmgr/docs/responsibilities.md`](../../../services/devmgr/docs/responsibilities.md#responsibilities).
+See [`docs/device-management.md`](../../../docs/device-management.md) for
 the system-scope IOMMU model.
 
 The bootloader does **not** resolve `interrupt-map` tables, complex
 `ranges` translations, phandle graphs, or node-tree semantics beyond a
 flat walk. Driver binding and property-evaluation logic belong to
-`devmgr`.
+`devmgr` (see [`docs/device-management.md`](../../../docs/device-management.md)).
 
 ---
 
@@ -69,7 +71,9 @@ Walker limits: `MAX_DEPTH = 8` for node nesting, `MAX_REG_ENTRIES = 8`
 for `reg` tuples per node, `MAX_IRQ_ENTRIES = 4` for `interrupts`
 values, `MAX_RANGES_ENTRIES = 4` for PCI `ranges`. Nodes exceeding
 these bounds truncate silently — the bootloader does not need
-exhaustive coverage; `devmgr` re-parses the full DTB.
+exhaustive coverage, because device-level discovery is a userspace
+concern (see Responsibilities in
+[`services/devmgr/docs/responsibilities.md`](../../../services/devmgr/docs/responsibilities.md#responsibilities)).
 
 ---
 
@@ -81,7 +85,7 @@ contributes its first `reg` entry as an `MmioAperture` seed; PCI host
 bridges additionally contribute their MMIO `ranges` windows. Unknown
 `compatible` strings are skipped
 without warning; `devmgr` is responsible for identifying every other
-device.
+device (see [`docs/device-management.md`](../../../docs/device-management.md)).
 
 PCI host bridges match `pci-host-ecam-generic`.
 A node's raw `interrupts` values are collected alongside its `reg`
@@ -117,4 +121,4 @@ bootloader never halts on a DTB parse error.
 
 ## Summarized By
 
-[boot/README.md](../README.md), [boot-flow.md](boot-flow.md)
+[Boot Flow](boot-flow.md), [Early Console](console.md)

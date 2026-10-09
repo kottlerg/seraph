@@ -799,14 +799,19 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
 ///
 /// arg0 = Thread cap index (must have CONTROL) — the thread whose handler is set.
 /// arg1 = Endpoint cap index, or `0` to **unbind**.
-/// arg2 = `badge` delivered in the fault message identifying the faulting thread.
+/// arg2 = binder-chosen `badge` delivered as the fault message badge (its
+///        attribution strength is in `docs/fault-handling.md` § Security).
 /// arg3 = `fault_class_mask`; v1 accepts only [`syscall::FAULT_CLASS_ALL`].
 ///
 /// Binding takes a reference on the endpoint object for the binding's lifetime
 /// (see `docs/fault-handling.md` § Liveness); rebinding / unbinding / thread
-/// destruction releases it. Binding requires only a valid `Endpoint` cap —
-/// `CONTROL` on the thread is the authority; the endpoint cap merely names where
-/// this thread's kernel-unresolvable faults are delivered.
+/// destruction releases it. This holds only absent a race: `lookup_cap` takes
+/// no reference on the target Thread or the endpoint, so neither object is
+/// pinned for this call (`core/kernel/docs/capability-internals.md` § Storage:
+/// Hybrid Two-Level Radix, #443).
+/// Binding requires only a valid `Endpoint` cap — `CONTROL` on the thread is
+/// the authority; the endpoint cap merely names where this thread's
+/// kernel-unresolvable faults are delivered.
 ///
 /// Returns 0 on success.
 #[cfg(not(test))]
@@ -874,14 +879,19 @@ pub fn sys_thread_set_fault_handler(tf: &mut TrapFrame) -> Result<u64, SyscallEr
     // cannot be freed between publish and a faulter's load.
     if !new_ep.is_null()
     {
-        // SAFETY: new_ep is a live EndpointObject (its cap slot holds a ref).
+        // SAFETY: new_ep was a live EndpointObject at lookup. `lookup_cap`
+        // takes no reference on the object, so it is not pinned for this
+        // block (`core/kernel/docs/capability-internals.md` § Storage: Hybrid
+        // Two-Level Radix, #443).
         unsafe { (*new_ep).header.inc_ref() };
     }
 
     // Publish the badge first, then atomically swap the handler pointer, so a
     // faulter that observes the new handler also observes the matching badge.
-    // SAFETY: target_tcb is kept alive by the caller's Thread cap reference;
-    // both fields are atomics safe to write cross-thread.
+    // SAFETY: target_tcb was a live TCB at lookup; both fields are atomics safe
+    // to write cross-thread. `lookup_cap` takes no reference on the object, so
+    // it is not pinned for this block (`core/kernel/docs/capability-internals.md`
+    // § Storage: Hybrid Two-Level Radix, #443).
     let old_ep = unsafe {
         (*target_tcb).fault_badge.store(badge, Ordering::Release);
         (*target_tcb).fault_handler.swap(new_ep, Ordering::AcqRel)
@@ -1221,7 +1231,12 @@ pub fn sys_thread_set_affinity(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         }
     }
 
-    // SAFETY: target_tcb validated non-null; field access is valid.
+    // SAFETY: target_tcb was a live TCB at lookup. `lookup_cap` takes no
+    // reference on the object, so it is not pinned for this block
+    // (`core/kernel/docs/capability-internals.md` § Storage: Hybrid Two-Level
+    // Radix, #443), and the `cpu_affinity` write and the `preferred_cpu` /
+    // `state` reads are not serialised with other CPUs' scheduler paths
+    // (`core/kernel/docs/syscalls.md` § SYS_THREAD_SET_AFFINITY, #443).
     unsafe {
         let old_cpu = (*target_tcb).preferred_cpu as usize;
 
@@ -1244,6 +1259,14 @@ pub fn sys_thread_set_affinity(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         // (outer) across its `state` read and `priority` write, the same lock
         // `migrate_ready_thread` acquires, so the two serialise directly and it
         // does not need a preempt bracket.
+        //
+        // This function takes no `sched_lock`, so the `cpu_affinity` write and
+        // the `preferred_cpu` / `state` reads race other CPUs' scheduler paths
+        // (the load balancer's `relocate_ready_thread`, a waker's
+        // `enqueue_and_wake`, the target's own `schedule()`), which access the
+        // Scheduling field group under the target's `sched_lock`, as
+        // scheduling-internals.md § Cross-CPU TCB Ownership requires. That
+        // defect is tracked in #443.
         //
         // See issue #116.
         crate::percpu::preempt_disable();

@@ -498,13 +498,13 @@ fn dispatch_ipc(
 ///
 /// Wire format:
 /// * `caller badge` MUST equal `procmgr_labels::DEATH_EQ_AUTHORITY`
-///   (init derives the authorised badged SEND cap and hands it
-///   exclusively to real-logd at bootstrap).
+///   (who holds it is in `services/procmgr/docs/ipc-interface.md`
+///   § `REGISTER_DEATH_EQ`).
 /// * `caps[0]` = `EventQueue` cap with POST right.
 ///
 /// Reply: `procmgr_errors::SUCCESS` on bind, `UNAUTHORIZED` if the
-/// caller lacks the authority badge, `INVALID_ARGUMENT` if no cap
-/// arrives.
+/// caller lacks the authority badge or a death EQ is already
+/// registered, `INVALID_ARGUMENT` if no cap (or a zero cap) arrives.
 fn handle_register_death_eq(req: &IpcMessage, ipc_buf: *mut u64, table: &mut process::ProcessTable)
 {
     if req.badge != procmgr_labels::DEATH_EQ_AUTHORITY
@@ -613,9 +613,12 @@ fn dispatch_death(
         if correlator == procmgr_labels::INIT_REAP_CORRELATOR
         {
             // An init thread exited. `run_reap` counts down the two init
-            // threads and, on the last exit, tears down init's
-            // AS/CSpace/Thread objects and donates its reclaimable Memory caps
-            // caps to memmgr's pool.
+            // threads and, on the last exit, tears down init's Thread and
+            // AddressSpace objects, deletes its CSpace cap, and donates its
+            // reclaimable Memory caps to memmgr's pool. The caps init still
+            // holds stay in its kernel-pinned root CSpace, alive but
+            // unreachable; releasing them at the reap is design intent, not
+            // yet implemented (`docs/process-lifecycle.md` § Init reap, #443).
             init_reap::run_reap(memmgr_ep, ipc_buf);
             continue;
         }

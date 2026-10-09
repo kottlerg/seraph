@@ -63,18 +63,20 @@ firmware. Discovery runs in
 1. **ACPI SPCR** — scan the UEFI configuration table for
    `EFI_ACPI_20_TABLE_GUID`; if present, walk RSDP → XSDT and match the
    `SPCR` signature. Take the UART base from the SPCR Generic Address
-   Structure when its address-space identifier is MMIO.
+   Structure when its address-space identifier is MMIO (see [acpi.md](acpi.md)).
 2. **Device Tree** — if SPCR did not yield an address, scan the
    configuration table for `EFI_DTB_TABLE_GUID`; if present, walk the FDT
-   for a node with `compatible = ns16550a` and take the first `reg` entry.
+   for a node with `compatible = ns16550a` and take the first `reg` entry
+   (see [dtb.md](dtb.md)).
 3. **Fallback** — the QEMU virt convention at `0x10000000` is the last
    resort. This keeps the bootloader functional on bare-QEMU-like
    environments that advertise neither table.
 
-SPCR is the one ACPI table consumed outside Step 5's firmware-parsing
-path; the pre-Step-1 order is load-bearing because every later step wants
-diagnostics and every subsequent ACPI walk would itself want to emit
-diagnostics if something went wrong.
+SPCR is the one ACPI table consumed outside the firmware-parsing path
+(steps 5 and 9 of [boot-flow.md](boot-flow.md); see [acpi.md](acpi.md)); the
+pre-Step-1 order is load-bearing because every later step wants diagnostics and
+every subsequent ACPI walk would itself want to emit diagnostics if something
+went wrong.
 
 ---
 
@@ -82,23 +84,24 @@ diagnostics if something went wrong.
 
 ### Best-Effort Discovery
 
-`EFI_GRAPHICS_OUTPUT_PROTOCOL` is optional. Its absence — headless
-systems, some virtual-machine configurations, serial-only platforms — is
-a valid configuration, not an error. The bootloader's `FramebufferInfo`
+`EFI_GRAPHICS_OUTPUT_PROTOCOL` is optional ([uefi-environment.md](uefi-environment.md)).
+Its absence — headless systems, some virtual-machine configurations,
+serial-only platforms — is a valid configuration, not an error. The bootloader's `FramebufferInfo`
 field is zeroed in that case (`physical_base == 0`), which is the
 boot-protocol contract's notification for "no framebuffer present". Neither
 the bootloader nor the kernel treats this as failure.
 
-GOP query runs in Step 1 of the boot sequence; the result feeds both the
-on-screen early-boot messages and the `BootInfo.framebuffer` handoff
-field.
+GOP query runs in Step 1 of the boot sequence ([boot-flow.md](boot-flow.md)); the
+result feeds both the on-screen early-boot messages and the
+`BootInfo.framebuffer` handoff field.
 
 ### Glyph Rendering
 
 The font is the `9×20` bitmap array exposed by
-[`shared/font/`](../../../shared/font/): 256 glyphs, each stored as a
-flat `[u16; 5120]` with `FONT_9X20[N * 20 + R]` yielding scanline `R`
-of glyph `N`. Bits 15–7 of each scanline are the 9 pixels, MSB first.
+[`shared/font/`](../../../shared/font/): 256 glyphs stored in one flat
+`[u16; 5120]` array (20 scanlines per glyph), with `FONT_9X20[N * 20 + R]`
+yielding scanline `R` of glyph `N`. Bits 15–7 of each scanline are the 9
+pixels, MSB first (see [`shared/font/README.md`](../../../shared/font/README.md)).
 
 The writer tracks a character-cell cursor. Its operations:
 - Advance on each glyph (wrap on `max_cols`, scroll on `max_rows`).
@@ -152,4 +155,5 @@ all is a userspace policy decision, not a bootloader concern.
 
 ## Summarized By
 
-[boot/README.md](../README.md)
+[ACPI Parsing](acpi.md), [UEFI Environment](uefi-environment.md),
+[Console Model](../../../docs/console-model.md)

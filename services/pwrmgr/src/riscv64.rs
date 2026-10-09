@@ -6,7 +6,7 @@
 //! RISC-V platform shutdown and reboot via the SBI SRST extension.
 //!
 //! pwrmgr owns the actuation; devmgr owns the `SbiControl` authority. At
-//! startup pwrmgr asks devmgr for a copy of the cap via
+//! startup pwrmgr asks devmgr for a Reset-only derivation of it via
 //! [`devmgr_labels::QUERY_SHUTDOWN_DEVICE`], then forwards an SBI
 //! `system_reset` call through the kernel to M-mode firmware. The
 //! `SbiControl` cap gates kernel-side acceptance; pwrmgr's cap-gating
@@ -18,10 +18,10 @@ use ipc::devmgr_labels;
 const SBI_EXT_SRST: u64 = 0x5352_5354; // "SRST" in ASCII.
 const SBI_SRST_RESET: u64 = 0; // function 0: system_reset
 const SRST_TYPE_SHUTDOWN: u64 = 0;
-const SRST_TYPE_COLD_REBOOT: u64 = 2;
+const SRST_TYPE_COLD_REBOOT: u64 = 1;
 const SRST_REASON_NONE: u64 = 0;
 
-/// Resolved shutdown actuation state: a `cap_derive` copy of devmgr's
+/// Resolved shutdown actuation state: a Reset-only derivation of devmgr's
 /// `SbiControl` cap, acquired once at startup and held for pwrmgr's
 /// lifetime.
 pub struct Actuator

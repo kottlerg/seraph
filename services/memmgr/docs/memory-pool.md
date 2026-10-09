@@ -15,20 +15,29 @@ usable physical-RAM extent: it coalesces physically-adjacent drained buddy
 blocks before minting, so the cap count tracks memory-map fragmentation, not
 total RAM (see
 [`docs/capability-model.md`](../../../docs/capability-model.md) §"Initial
-Capability Distribution"). Memory cap sizes vary — they reflect the firmware
-memory map and may span many MiB each. Init copies the entire RAM
-range into memmgr's CSpace via the derive-twice pattern, then transfers
-the slot range `(memory_base, memory_count)` to memmgr in a
-single bootstrap IPC round.
+Capability Distribution" and
+[`docs/userspace-memory-model.md`](../../../docs/userspace-memory-model.md#ownership-boundaries)
+§"Ownership Boundaries"). Memory cap sizes vary — they reflect the firmware
+memory map and may span many MiB each. Init copies the RAM caps left after its
+own bootstrap allocations into memmgr's CSpace via the derive-twice pattern, as
+many as one bootstrap IPC round carries, forwards the memmgr/procmgr/init
+bootstrap arenas as in-use runs, and transfers the slot range
+`(memory_base, memory_count)` to memmgr in that round; the remaining RAM caps
+join the pool through the init-reap donation below (see
+[`docs/process-lifecycle.md`](../../../docs/process-lifecycle.md#init--memmgr)
+§"Init → memmgr").
 
 memmgr does not split the ingested memory caps eagerly. The free pool retains
 each ingested cap at its native size; splitting happens on the
 allocation path via `memory_split`, and coalescing reverses the split on
 the free path.
 
-Beyond the bootstrap pool, memmgr also receives reclaimed frames at init's reap
-(`DONATE_MEMORY_CAPS`: init's ELF segments, InitInfo, stack, boot-module ELF
-sources, reclaim scratch, AP trampoline). Both entry points feed the same free
+Beyond the bootstrap pool, memmgr also receives RAM at init's reap
+(`DONATE_MEMORY_CAPS`: RAM caps beyond the bootstrap round, init's
+`MemoryAlloc` leftovers, init's ELF segments, InitInfo, stack, boot-module ELF
+sources, reclaim scratch, AP trampoline; see
+[`services/init/docs/bootstrap.md`](../../init/docs/bootstrap.md#handover)
+§"Handover"). Both entry points feed the same free
 pool, so every pool frame is uniform anonymous RAM: a consumer may map any of
 it read-only, read-write, or read-execute (W^X still enforced at map time).
 This requires each pool frame's Memory cap to carry **WRITE, EXECUTE, and
@@ -36,7 +45,9 @@ RETYPE** rights — memmgr derives the R/RW/RX inner from the pooled outer on
 demand and `cap_derive` only narrows rights, so a frame whose outer lacks WRITE
 (or EXECUTE) cannot satisfy a writable (or executable) map and would fail the
 consumer's fault. The kernel mints every donatable RAM cap with these rights
-(rights gate derivation, not the live mapping); memmgr enforces the invariant at
+(rights gate derivation, not the live mapping; see
+[`docs/capability-model.md`](../../../docs/capability-model.md#memory) §"Memory");
+memmgr enforces the invariant at
 both ingest and donation, rejecting (or, for the bootstrap pool, panicking on) a
 frame that lacks them so a mint-rights regression fails loudly rather than
 surfacing as an intermittent consumer fault.
@@ -99,9 +110,12 @@ to the caller. The intermediary lets memmgr reclaim the cap on
 
 ## Per-Process Tracking
 
-memmgr maintains a per-process table keyed on the procmgr-minted badge
-delivered with every `REQUEST_MEMORY_CAPS` call (and established at
-`REGISTER_PROCESS`). Each entry records:
+memmgr maintains a per-process table keyed on the per-process badge memmgr
+mints at procmgr's `REGISTER_PROCESS` and that is delivered with every
+`REQUEST_MEMORY_CAPS` call. procmgr's own record is keyed on the bootstrap
+badge init mints for it, and two reserved records (memmgr-self and init-self)
+hold the memmgr and init bootstrap arenas; memmgr inserts all three at boot
+and never reclaims them. Each entry records:
 
 - The badge (process identity).
 - The head of an intrusive list of the Memory cap slots memmgr has handed
@@ -187,16 +201,20 @@ release is idempotent (a racing join-plus-reaper double-release is harmless).
 The caller must have deleted every object retyped from the region first;
 releasing a still-retyped region is correctness-safe (the kernel refuses to
 re-hand-out live bytes) but the run is only re-grantable whole — its retype
-bump pointer blocks `memory_split` — until the retype is freed.
+bump pointer blocks `memory_split`, per
+[`core/kernel/docs/syscalls.md`](../../../core/kernel/docs/syscalls.md#sys_memory_split-33)
+§"`SYS_MEMORY_SPLIT`" — until the retype is freed.
 
 `UNREGISTER_REGION` from a live process is the mid-life counterpart for a
-demand-paged region: memmgr removes the region node, and for each frame it
-backed inside that region **actively unmaps** the page from the delegated
-child `AddressSpace` (the process is still alive, so the mapping must be
-removed before the frame returns to the pool), inserts the cap back into the
-pool, frees the node, and coalesces the freed runs with their physical
-neighbours. Frames the caller mapped itself are left untouched. This is the
-reclamation path the ruststd guarded-stack consumer uses on `join()`.
+demand-paged region: memmgr removes the region node and **actively unmaps** the
+whole region span from the delegated child `AddressSpace` in one
+`mem_unmap_reclaim` call, which also returns the emptied page tables to that
+address space's page-table budget (the process is still alive, so the mappings
+must be removed before the frames return to the pool). It then inserts each
+backing frame's cap back into the pool, frees the frame nodes, and coalesces
+the freed runs with their physical neighbours. Frames the caller mapped itself
+are left untouched. This is the reclamation path the ruststd guarded-stack
+consumer uses on `join()`.
 
 ---
 
@@ -208,10 +226,11 @@ cap. Eligibility:
 
 - Both caps are present in the free pool.
 - The physical-base addresses are adjacent (`base_a + size_a == base_b`).
-- The kernel's `memory_merge` (or equivalent) accepts the operation —
-  the caps must share a common ancestor in the derivation tree, which
-  the original boot-time ingest guarantees for caps derived from the
-  same `BootInfo` Memory cap.
+- The kernel's `memory_merge` accepts the operation (see
+  [`core/kernel/docs/syscalls.md`](../../../core/kernel/docs/syscalls.md#sys_memory_merge-50)
+  §"`SYS_MEMORY_MERGE`"): the caps must be derivation siblings with identical
+  rights, the tail must be virgin (never retyped or sub-allocated), and neither
+  may have derivation children.
 
 Coalescing runs explicitly after every reclamation — `PROCESS_DIED`,
 `RELEASE_MEMORY_CAPS`, and `UNREGISTER_REGION` alike — so a freed run rejoins
@@ -226,14 +245,16 @@ consuming memmgr's CSpace even while its RAM footprint stays bounded. The
 per-insert push still folds opportunistically when the array is full; the
 explicit pass is what holds the steady state under churn that never fills it. A
 "dirty" released run — one whose source `MemoryObject` kept its retype bump
-pointer advanced — declines `memory_merge` (the kernel requires a virgin tail)
-and stays a discrete, re-grantable-whole run. Coalescing cost scales with the
-live run count, which best-fit and this pass jointly keep small, so the
+pointer advanced — declines `memory_merge` (the kernel requires a virgin tail;
+see [`core/kernel/docs/syscalls.md`](../../../core/kernel/docs/syscalls.md#sys_memory_merge-50)
+§"`SYS_MEMORY_MERGE`") and stays a discrete, re-grantable-whole run. Coalescing
+cost scales with the live run count, which best-fit and this pass jointly keep small, so the
 per-reclamation merge is negligible.
 
-Coalescing across boot-time ingest boundaries (between two distinct
-`BootInfo` Memory caps) is not attempted — those caps have no common
-derivation ancestor.
+memmgr does not pre-filter for eligibility: it sorts the free runs by physical
+base and attempts `memory_merge` on every adjacent pair, and the kernel declines
+any pair that fails the preconditions above. A declined pair stays as two
+discrete runs.
 
 ---
 
@@ -248,8 +269,10 @@ derivation ancestor.
 
 memmgr never panics on allocation failure. The caller's response policy
 (panic, retry, fail the operation) is its own concern; for std-built
-services the heap allocator returns null and the std panic handler
-exits the thread, matching today's behaviour.
+services the heap allocator returns null, std's abort path traps, and the
+terminal fault tears down the whole process (see
+[`docs/userspace-memory-model.md`](../../../docs/userspace-memory-model.md#byte-heap)
+§"Byte Heap").
 
 ---
 
@@ -281,4 +304,5 @@ exits the thread, matching today's behaviour.
 
 ## Summarized By
 
-[memmgr/README.md](../README.md)
+[Process Lifecycle](../../../docs/process-lifecycle.md), [services/memmgr/README.md](../README.md),
+[memmgr IPC Interface](ipc-interface.md)

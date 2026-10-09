@@ -24,7 +24,9 @@ nonces, keys): forward secrecy holds across the kernel/userspace boundary, not
 only within the kernel. The userspace path adds no authority-bearing surface —
 `SYS_GETRANDOM` is ambient and draw-only; it injects no entropy — and per-call
 length is capped (`MAX_GETRANDOM_LEN`) so a draw never holds interrupts off for
-an unbounded window. Because userspace keeps no RNG state, two processes (or a
+an unbounded window
+([syscalls.md § `SYS_GETRANDOM`](syscalls.md#sys_getrandom-55)).
+Because userspace keeps no RNG state, two processes (or a
 forked/cloned address space) cannot share or duplicate a seed: each diverges
 from its first draw by independently advancing the generator. Whole-VM-snapshot
 reuse — a resumed snapshot replaying pool and per-CPU generator state, so two
@@ -232,7 +234,8 @@ describes; it is inactive under QEMU+EDK2.
 The KASLR draw is kept **separate** from the pool seed: the bootloader draws an
 independent 16-byte `EFI_RNG_PROTOCOL` word for the image slide / direct-map base,
 so the pool seed never reveals the KASLR layout and vice versa (a DTB fallback
-splits its single seed non-overlapping for the same reason).
+splits its single seed non-overlapping for the same reason); see
+[boot-flow.md § Step 5c](../../boot/docs/boot-flow.md#step-5c-boot-entropy-seed).
 
 The first *consumer* draw is decoupled from the boot scrape: the Phase 5/8
 self-test capture is each generator's first draw and necessarily seeds from
@@ -287,11 +290,14 @@ Kernel-internal production consumers are the structural-unguessability hardening
 correlators (`sched::alloc_thread_id`) draw via `next_u32` — and ASLR (#39):
 `mm::address_space::choose_init_layout` draws init's `InitInfo` VA and stack
 placement via `fill_bytes` on its first call, and Phase 9's PIE rebase draws
-init's image load bias the same way (both Phase 9, boot thread). All run after
+init's image load bias the same way (both Phase 9, boot thread; see
+[initialization.md § Phase 9](initialization.md#phase-9-init-creation-and-scheduler-entry)).
+All run after
 Phase 5 seeding and never in interrupt context. Userspace ASLR (the
 per-process bootstrap-layout, image-bias, heap-base, and reservation-arena
 draws in procmgr/init/`std::sys::seraph`) consumes the same generators through
-`SYS_GETRANDOM`. Without a firmware boot seed (a riscv64 boot without
+`SYS_GETRANDOM` (see [docs/userspace-memory-model.md](../../../docs/userspace-memory-model.md)).
+Without a firmware boot seed (a riscv64 boot without
 `virtio-rng`, #393) the pool seeds from timing jitter alone and those draws
 carry the boot-entropy-hole caveat above. The boot self-test is the API's
 continuous validator.
@@ -331,7 +337,9 @@ continuous validator.
   is non-trivial, samples are pairwise distinct (per-CPU independence), and the
   aggregate bit balance is sane. The result prints as `entropy: SELFTEST PASS`
   or `entropy: SELFTEST FAIL`; the FAIL marker is matched by the run-parallel
-  fail-regex, turning a QEMU run red on either architecture. Validated on
+  fail-regex
+  ([xtask/README.md § run-parallel](../../../xtask/README.md#cargo-xtask-run-parallel)),
+  turning a QEMU run red on either architecture. Validated on
   x86_64 (firmware-seeded — `entropy: seeded from firmware RNG` — since OVMF
   implements `EFI_RNG_PROTOCOL`) and riscv64 (firmware-seeded through
   `VirtioRngDxe` with the default boot set's `virtio-rng`; jitter-only without
@@ -353,12 +361,10 @@ continuous validator.
 
 ## Summarized By
 
-[Kernel](../README.md), [docs/syscalls.md](syscalls.md),
-[docs/arch-interface.md](arch-interface.md),
-[docs/initialization.md](initialization.md),
-[boot/docs/boot-flow.md](../../boot/docs/boot-flow.md),
-[docs/testing.md](../../../docs/testing.md),
-[docs/platform-requirements.md](../../../docs/platform-requirements.md),
-[docs/userspace-memory-model.md](../../../docs/userspace-memory-model.md),
-[docs/cross-boundary-disclosure.md](cross-boundary-disclosure.md),
+[Boot Flow](../../boot/docs/boot-flow.md), [core/kernel/README.md](../README.md),
+[Architecture Abstraction Layer](arch-interface.md),
+[Kernel Initialization Sequence](initialization.md), [Syscall Interface Specification](syscalls.md),
+[Platform Requirements](../../../docs/platform-requirements.md),
+[Testing](../../../docs/testing.md),
+[Userspace Memory Model](../../../docs/userspace-memory-model.md),
 [xtask/README.md](../../../xtask/README.md)

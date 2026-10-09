@@ -4,6 +4,37 @@ Build task runner for Seraph, invoked as `cargo xtask <command>`.
 
 ---
 
+## Source Layout
+
+```
+xtask/
+├── Cargo.toml
+├── README.md
+├── src/
+│   ├── main.rs                 # Entry point; dispatches CliCommand
+│   ├── cli.rs                  # Clap derive structs for every subcommand
+│   ├── context.rs              # Resolved workspace and build-output paths
+│   ├── arch.rs                 # Supported architectures and per-arch constants
+│   ├── accel.rs                # Per-host QEMU acceleration-backend selection
+│   ├── bundle.rs               # Bootloader bundle composition (MODULES table)
+│   ├── disk.rs                 # GPT disk-image construction from the sysroot
+│   ├── firmware.rs             # Host-side discovery of QEMU pflash firmware
+│   ├── fs_compat.rs            # Portable file-materialisation helpers
+│   ├── qemu.rs                 # Shared QEMU argv construction
+│   ├── qmp.rs                  # Minimal QMP client for the QMP-driven tests
+│   ├── rust_src.rs             # In-project toolchain sysroot with the ruststd overlay
+│   ├── sysroot.rs              # Sysroot arch checks and the rootfs/ mirror
+│   ├── util.rs                 # Step printing, command execution, tool lookup
+│   ├── commands/               # One module per subcommand (build, run, run_parallel,
+│   │                           #   mkdisk, compose_bundle, clean, test, test_kaslr,
+│   │                           #   test_terminal, test_vmgenid, lint_docs)
+│   └── term/                   # Host-terminal adapters for the QEMU launch pipeline
+├── targets/                    # Custom target JSON specs (see targets/README.md)
+└── wrapper-shim/               # rustc / clippy-driver dispatch shim (see Sub-crates)
+```
+
+---
+
 ## Commands
 
 ### `cargo xtask build`
@@ -23,7 +54,8 @@ cargo xtask build [--arch x86_64|riscv64] [--release] \
 | `--debug` | (none) | Emit debuginfo (`debug=2`, `opt-level=1`) for the named component(s) only, e.g. `--debug kernel,procmgr`; applies within the active profile. See [Build Profiles](../docs/build-system.md#build-profiles). |
 
 The sysroot is architecture-specific. Building for a different arch than the
-existing sysroot is an error — run `cargo xtask clean` first.
+existing sysroot is an error — run `cargo xtask clean` first (per
+[docs/build-system.md](../docs/build-system.md) § Build Output: the Sysroot).
 
 ---
 
@@ -41,18 +73,19 @@ cargo xtask run [--arch x86_64|riscv64] [--gdb] [--headless] [--verbose] \
 | Option | Description |
 |---|---|
 | `--arch` | Target architecture (default: `x86_64`) |
-| `--gdb` | Start QEMU with a GDB server on localhost:1234; QEMU pauses at startup. Userspace binaries are PIE with a per-spawn randomized base (ASLR, #39): take the bias from the creator's log line (procmgr `spawn image bias=0x…`, init `init: <svc> image bias=0x…`, kernel `init: PIE bias=0x…`) and load symbols with `add-symbol-file <binary> -o <bias>` |
+| `--gdb` | Start QEMU with a GDB server on localhost:1234; QEMU pauses at startup. Userspace binaries are PIE with a per-spawn randomized base (ASLR, #39; see [docs/userspace-memory-model.md](../docs/userspace-memory-model.md) § Image Placement): take the bias from the creator's log line (procmgr `spawn image bias=0x…`, init `init: <svc> image bias=0x…`, kernel `init: PIE bias=0x…`) and load symbols with `add-symbol-file <binary> -o <bias>` |
 | `--headless` | Run without a display window (`-display none`) |
 | `--verbose` | Show all serial output; by default output is filtered until `[--------] boot:` appears |
 | `--cpus` | Number of vCPUs to expose to the guest (default: `4`; bounded by `1..=512`, the [boot-protocol](../abi/boot-protocol/README.md) `MAX_CPUS` the kernel sizes its per-CPU structures from) |
 | `--mem` | Guest memory size in MiB (default: `512`) |
-| `--riscv-mmu` | Guest RISC-V paging-mode ceiling (default: `sv48`; riscv64 only, ignored on x86_64). Sets the QEMU `svNN` CPU properties so the DTB `mmu-type` advertises the chosen ceiling; the kernel negotiates the highest advertised mode it supports at boot. The default pins `sv48` because QEMU ≥ 8.0 otherwise defaults the rv64 CPU to `sv57` |
+| `--riscv-mmu` | Guest RISC-V paging-mode ceiling (default: `sv48`; riscv64 only, ignored on x86_64). Sets the QEMU `svNN` CPU properties, which cap the `satp` modes the CPU implements (and the DTB `mmu-type` QEMU authors); the bootloader takes the DTB `mmu-type` as the candidate (Sv57 when the firmware publishes no DTB, as under EDK2) and confirms it with a `satp` write-probe that falls back to the next-narrower mode ([core/boot/docs/page-tables.md](../core/boot/docs/page-tables.md) § Mode negotiation), and the kernel recovers the active mode from `satp`, per [docs/memory-model.md](../docs/memory-model.md) § RISC-V (Sv39 / Sv48 / Sv57). The default pins `sv48` because QEMU ≥ 8.0 otherwise defaults the rv64 CPU to `sv57` |
 
 **x86-64** selects an acceleration backend per host: KVM on Linux,
 HVF on macOS, WHPX on Windows, NVMM on NetBSD, or TCG everywhere else
 (see `SERAPH_ACCEL` below to override). KVM/HVF hosts must advertise
 x86-64-v3 (AVX2/BMI2/FMA — Haswell+ / Excavator+) because the userspace
-target is pinned to that psABI level; TCG mode uses
+target is pinned to that psABI level
+([docs/build-system.md](../docs/build-system.md) § Custom Targets); TCG mode uses
 `-cpu max,migratable=no` which emulates the same baseline. Requires
 OVMF firmware (`dnf install edk2-ovmf` / `apt install ovmf` /
 `pacman -S edk2-ovmf` / Homebrew `brew install qemu` /
@@ -63,7 +96,20 @@ automatically by QEMU's `virt` machine). Requires edk2 RISC-V firmware
 (`dnf install edk2-riscv64` / `apt install qemu-efi-riscv64`) and
 QEMU ≥ 8.0 (V extension); QEMU ≥ 9.1 unlocks the named `-cpu rva23s64`
 model (currently the runner uses the explicit feature string until the
-CI floor catches up).
+CI floor catches up; see [docs/build-system.md](../docs/build-system.md)
+§ QEMU and Firmware).
+
+#### Attached devices
+
+Every `run` attaches, on both architectures, the disk image as `virtio-blk-pci`, a
+`virtio-keyboard-pci` keyboard (`id=kbd0`, the device `test-terminal` injects keys into over
+QMP), a `virtio-rng-pci` boot-entropy source, and the guest UART on `-serial stdio`. On
+x86-64 it also attaches `-device vmgenid,guid=auto`, the VMGENID generation-ID device
+([core/kernel/docs/entropy.md](../core/kernel/docs/entropy.md) § Whole-VM-snapshot detection
+(VMGENID)); QEMU's riscv64 `virt` machine has none. A non-headless run adds QEMU std VGA: the
+q35 default adapter on x86-64, and on riscv64 `-device VGA` with a `qemu-xhci`/`usb-kbd` pair,
+added only when a `gtk` or `sdl` display backend is available. `--headless` drops the display
+adapter, so no framebuffer is advertised.
 
 #### Environment variables
 
@@ -107,7 +153,8 @@ hand-staged sysroot that diverges from `rootfs/` — e.g. a test recipe
 copied from `sysroot/config/svcmgr/tests/` into
 `sysroot/config/svcmgr/services/` — use `--repack-only`, which skips the
 re-mirror and packs the sysroot exactly as it stands (a plain repack would
-prune the hand-added recipe).
+prune the hand-added recipe). The mirror rules are owned by
+[rootfs/README.md](../rootfs/README.md).
 
 `mkdisk` does **not** author `sysroot/EFI/seraph/bootstrap.bundle` — it
 fails if the bundle is missing. The bundle is composed by
@@ -123,7 +170,8 @@ unconditionally — there is no flag to toggle it. vfsd auto-mounts it at
 `/data`; the data tree lives only on this partition, not on root.
 (vfsd's fall-through would also serve `/data` from a root-fs directory,
 so a dedicated partition is a disk-authoring choice — the in-tree image
-uses the partition.) This applies to `build`, `mkdisk`, and
+uses the partition, per [docs/storage.md](../docs/storage.md) § GPT Role-GUID Discovery.)
+This applies to `build`, `mkdisk`, and
 `compose-bundle` alike.
 
 ```
@@ -134,7 +182,7 @@ cargo xtask mkdisk [--arch x86_64|riscv64] [--repack-only] [--no-kaslr]
 |---|---|---|
 | `--arch` | `x86_64` | Target architecture — must match the existing sysroot's arch tag |
 | `--repack-only` | `false` | Skip the `rootfs/` re-mirror and pack the sysroot as it stands — preserves a hand-staged service set the authoritative mirror would otherwise reconcile |
-| `--no-kaslr` | `false` | Stage the `\EFI\seraph\nokaslr` override knob so the bootloader boots the kernel at its deterministic (un-randomized) layout, for GDB / symbolization; omit to remove the knob and re-enable KASLR |
+| `--no-kaslr` | `false` | Stage the `\EFI\seraph\nokaslr` override knob so the bootloader boots the kernel at its deterministic (un-randomized) layout ([core/boot/docs/boot-flow.md](../core/boot/docs/boot-flow.md) § Step 5d: Apply the KASLR Slide), for GDB / symbolization; omit to remove the knob and re-enable KASLR |
 
 Example — stage `svctest` and run it (`--repack-only` keeps the hand-added
 recipe; a plain repack would prune it):
@@ -192,13 +240,16 @@ ktest's runtime options (`shutdown_policy`, `timeout_secs`, filter
 tiers, bench iteration count) bake in as compile-time defaults in
 `core/ktest/src/cmdline.rs::KtestConfig::DEFAULT` (CI-friendly:
 shutdown=Always, timeout=0, full filter, 1000 bench iters). To change
-them, edit the constant and `cargo xtask build --component ktest`.
+them, edit the constant, run `cargo xtask build --component ktest`, then
+re-compose with `cargo xtask compose-bundle --harness ktest` (a
+single-component build does not re-compose the bundle); see
+[core/ktest/README.md](../core/ktest/README.md) § Compile-time options.
 
 ---
 
 ### `cargo xtask clean`
 
-Remove the sysroot (and optionally `target/`).
+Remove the sysroot and the disk image `disk.img` (and optionally `target/`).
 
 ```
 cargo xtask clean [--all]
@@ -267,14 +318,15 @@ The default `--fail` regex matches the cross-harness terminal marker
 kernel's own death markers: `KERNEL EXCEPTION` and `FATAL:` for a hardware trap,
 `PANIC at` or `PANIC:` for a Rust `panic!`, `=== WATCHDOG` for a scheduler
 wedge-detector dump, and `entropy: SELFTEST FAIL` for a kernel entropy self-test
-failure, so a crash classifies `FAIL` rather than `HANG`. The benign `USERSPACE
-FAULT` path matches none of these. Override with a never-matching pattern (for
-example `'$.^'`) to disable.
+failure ([core/kernel/docs/entropy.md](../core/kernel/docs/entropy.md) § Testing), so a crash
+classifies `FAIL` rather than `HANG`. The benign `USERSPACE FAULT` path matches none of these.
+Override with a never-matching pattern (for example `'$.^'`) to disable.
 
 **Mode-agnostic**: xtask does not know about ktest, svctest, or any other
 rootfs configuration. Pass/fail markers come from the invoker. The default
-`--pass` works for both modes because they emit the same terminal marker.
-Override for other configurations:
+`--pass` works for both modes because they emit the same terminal marker
+([docs/testing.md](../docs/testing.md) § Reporting marker). Override for other
+configurations:
 
 ```sh
 # Default (works for ktest or svctest)
@@ -326,7 +378,8 @@ subsumes the former standalone keyboard smoke test: the echoed `help` proves
 keysym decode, and Return/Backspace prove the named-key decodes.
 
 A pure runner — it neither builds nor stages. `terminal.svc` is in the default
-boot set, so the terminal autostarts; just build and repack:
+boot set, so the terminal autostarts
+([programs/terminal/README.md](../programs/terminal/README.md) § Scope); just build and repack:
 
 ```sh
 cargo xtask build
@@ -391,7 +444,7 @@ See [docs/testing.md](../docs/testing.md) for the harness model and
 ### `cargo xtask lint-docs`
 
 Check the mechanical documentation and source-header rules. Runs in CI's
-`host-tests` job.
+`host-tests` job ([docs/build-system.md](../docs/build-system.md) § Continuous Integration).
 
 ```
 cargo xtask lint-docs
@@ -405,18 +458,18 @@ the pre-merge review's.
 | Rule | Level | Check |
 |---|---|---|
 | `md-columns` | error | Every line of a tracked `.md` fits the column limit in [docs/coding-standards.md](../docs/coding-standards.md) § Markdown, with the exemptions that section lists (table rows; single link, image, badge, or URL constructs; YAML front matter). |
-| `src-header` | error | Every tracked `.rs`, `.ld`, `.S`, `.sh`: the SPDX line first (after a shebang in `.sh`; on line 2, after `/*`, in a block-comment `.ld`); exactly one blank line, then the path line; for Rust, exactly one blank line, then the `//!` block before any `#![` attribute, per § File Headers. |
+| `src-header` | error | Every tracked `.rs`, `.ld`, `.S`, `.sh`: the SPDX line first (after a shebang in `.sh`; on line 2, after `/*`, in a block-comment `.ld`); exactly one blank line, then the path line; for Rust, exactly one blank line, then the `//!` block before any `#![` attribute, per [docs/coding-standards.md](../docs/coding-standards.md) § File Headers. |
 | `md-summarized-by` | error | Every authoritative document ends with `---` and a `## Summarized By` section holding `None` or a non-empty list of links, each resolving to a path inside the repository (no external URL, in-page-only anchor, or `..` past the root), per [docs/documentation-standards.md](../docs/documentation-standards.md) § Backlinks and Change Propagation. |
-| `md-backlink-forward` | warning | Every `## Summarized By` entry names a tracked document that links this one. |
-| `md-reachable` | warning | Every authoritative document is reachable by links from the root `README.md`; each component README links every document in its own `docs/`. |
+| `md-backlink-forward` | error | Every `## Summarized By` entry names a tracked document that links this one. |
+| `md-reachable` | error | Every authoritative document is reachable by links from the root `README.md`; the root README links every `docs/*.md` and every other README links each document in its own `docs/`, per [docs/documentation-standards.md](../docs/documentation-standards.md) § Discoverability and Linking. |
 | `md-bare-cite` | warning | A `(see <name>.md)` citation outside link syntax. |
 
 The lint treats as authoritative every tracked `.md` except the root `README.md`, `.claude/`,
 `.github/`, and the per-tag release notes and template under `docs/releases/`: the documents
 [docs/documentation-standards.md](../docs/documentation-standards.md) § Document Hierarchy
 defines, with the release-notes exception of § Backlinks and Change Propagation. Warning-level
-rules are reported and counted but do not fail the command; they become errors as Issue #438's
-audit lands.
+rules are reported and counted but do not fail the command; `md-bare-cite` is one because its
+pattern also matches legitimate prose.
 
 ---
 
@@ -425,6 +478,21 @@ audit lands.
 | Sub-crate | Purpose |
 |---|---|
 | [wrapper-shim/](wrapper-shim/README.md) | Tiny native binary installed into the seraph toolchain mirror as both `rustc` and `ws-clippy`. Dispatches by argv[0] basename to exec the real rustc / clippy-driver with overlay-aware `--sysroot` flags. Built by `cargo xtask build` as part of StdUser builds; never invoked directly. |
+
+---
+
+## Relevant Design Documents
+
+| Document | Content |
+|---|---|
+| [docs/build-system.md](../docs/build-system.md) | Toolchain, workspace layout, custom targets, sysroot, CI workflows |
+| [docs/memory-model.md](../docs/memory-model.md) | Randomized kernel layout `test-kaslr` checks; RISC-V paging-mode ceiling behind `--riscv-mmu` |
+| [docs/userspace-memory-model.md](../docs/userspace-memory-model.md) | PIE image placement and the per-spawn ASLR bias used with `--gdb` |
+| [docs/storage.md](../docs/storage.md) | GPT role-GUID discovery of the data partition the disk image carries |
+| [docs/testing.md](../docs/testing.md) | Harnesses, markers, and the host-driven boot tests the test commands run |
+| [docs/coding-standards.md](../docs/coding-standards.md) | Lints `build` enforces; the Markdown and file-header rules `lint-docs` checks |
+| [docs/documentation-standards.md](../docs/documentation-standards.md) | Document hierarchy and backlink rules `lint-docs` checks |
+| [targets/README.md](targets/README.md) | Custom target specs |
 
 ---
 
@@ -439,11 +507,10 @@ audit lands.
 
 ## Summarized By
 
-[README.md](../README.md), [docs/build-system.md](../docs/build-system.md),
-[docs/testing.md](../docs/testing.md),
-[core/kernel/docs/entropy.md](../core/kernel/docs/entropy.md),
-[core/ktest/README.md](../core/ktest/README.md),
-[core/boot/README.md](../core/boot/README.md),
-[core/boot/docs/riscv-uefi-boot.md](../core/boot/docs/riscv-uefi-boot.md),
-[docs/architecture.md](../docs/architecture.md),
-[programs/terminal/README.md](../programs/terminal/README.md)
+[README.md](../README.md), [RISC-V UEFI Boot](../core/boot/docs/riscv-uefi-boot.md),
+[Kernel Entropy Subsystem](../core/kernel/docs/entropy.md),
+[core/ktest/README.md](../core/ktest/README.md), [Architecture Overview](../docs/architecture.md),
+[Build System](../docs/build-system.md), [Coding Standards](../docs/coding-standards.md),
+[Memory Model](../docs/memory-model.md), [Testing](../docs/testing.md),
+[programs/terminal/README.md](../programs/terminal/README.md),
+[rootfs/README.md](../rootfs/README.md)

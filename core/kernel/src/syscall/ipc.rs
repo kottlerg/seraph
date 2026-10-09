@@ -761,7 +761,8 @@ pub fn sys_ipc_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // SAFETY: tcb is the running caller, not yet claimable.
     unsafe { crate::sched::thread::open_park_episode(tcb) };
 
-    // SAFETY: ep_state extracted from validated Endpoint object; scheduler lock not held.
+    // SAFETY: ep_state extracted from validated Endpoint object; tcb is the
+    // running thread (current_tcb above); no scheduler lock and no ep.lock held.
     let result = unsafe { crate::ipc::endpoint::endpoint_recv(ep_state, tcb) };
 
     if let Ok((caller, msg)) = result
@@ -978,7 +979,11 @@ pub fn sys_ipc_reply(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // fault reply also avoids needlessly growing the faulter's CSpace. The
     // BlockedOnFault re-check in the `Some(caller)` arm below is the
     // authoritative dispatch; this peek only gates the skip.
-    // SAFETY: tcb validated above; reply_tcb field always valid in TCB.
+    // SAFETY: tcb validated above; reply_tcb field always valid in TCB. The
+    // `(*c).ipc_state` read precedes any reply_tcb claim, so nothing pins the
+    // caller: a concurrent dealloc of it can win the reply_tcb CAS, clear
+    // `wake_in_flight`, and free the TCB between the load and this read — a
+    // known use-after-free window (#443).
     let fault_reply = unsafe {
         let c = (*tcb).reply_tcb.load(core::sync::atomic::Ordering::Acquire);
         !c.is_null() && (*c).ipc_state == crate::sched::thread::IpcThreadState::BlockedOnFault
@@ -1035,9 +1040,14 @@ pub fn sys_ipc_reply(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 // No parked caller (cancelled by SYS_THREAD_STOP); nothing to wake.
                 return Err(SyscallError::InvalidCapability);
             }
-            // SAFETY: caller_peek non-null; magic check guards UAF in debug builds.
+            // SAFETY: caller_peek non-null; magic check flags UAF in debug builds.
+            // caller_peek is read before the reply_tcb claim and is not pinned:
+            // a concurrent dealloc of the caller can win the reply_tcb CAS and
+            // free the TCB between the load and this read (#443).
             debug_assert!(unsafe { (*caller_peek).magic } == crate::sched::thread::TCB_MAGIC);
-            // SAFETY: caller_peek is a valid TCB (the reply protocol pins it);
+            // SAFETY: caller_peek is not pinned — it is read before the
+            // reply_tcb claim, so a concurrent dealloc can free it before the
+            // `cspace_id`/`cspace_epoch` reads below, a known defect (#443);
             // the CSpace pointer is registry-resolved under the lock;
             // lock_raw/unlock_raw paired.
             let pre_res = unsafe {
@@ -1245,9 +1255,11 @@ pub fn sys_notification_send(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 ///        are delivered *or* `timeout_ms` milliseconds have elapsed.
 ///
 /// On success returns `0` in rax/a0 and the bitmask in the secondary return
-/// register (rdx/a1). On timeout returns `0` in both registers — unambiguous
-/// because `notification_send` rejects zero-bit sends, so a legitimate wake always
-/// carries non-zero bits. The split is required because the bitmask is an
+/// register (rdx/a1). A notification wake always carries non-zero bits because
+/// `notification_send` rejects zero-bit sends. A `0` bitmask with a `0` status
+/// means the timeout elapsed, or the notification was destroyed while the caller
+/// was parked (no `Interrupted` stamp, even with `timeout_ms` = `0`; #443).
+/// The split is required because the bitmask is an
 /// unrestricted `u64`: an in-band encoding via `cast_signed` would alias
 /// bit-63-set payloads with the dispatcher's negative-Err codes. Same
 /// register layout as `sys_event_recv`; see that handler for the broader

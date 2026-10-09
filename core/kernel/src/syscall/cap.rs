@@ -1251,11 +1251,11 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// reference dropped here is the last: the destination's teardown runs here
 /// and the caller gets `InvalidCapability`.
 ///
-/// Residual: from the `dec_ref` here to the caller's next touch of the
-/// destination under `DERIVATION_LOCK`, the same race stays open — the
-/// `lookup_cap` residual, confined to a sibling thread of the caller's own
-/// process (the caller holds a destination capability in its own `CSpace`,
-/// so nobody else can drop the last one).
+/// Residual: `lookup_cap` takes no reference on the object, so it is not
+/// pinned for the window from the `dec_ref` here to the caller's next touch
+/// of the destination under `DERIVATION_LOCK`
+/// (`core/kernel/docs/capability-internals.md` § Storage: Hybrid Two-Level
+/// Radix, #443).
 ///
 /// # Safety
 /// `dest_obj` must be the header of the live `CSpaceKernelObject` wrapping
@@ -1432,7 +1432,10 @@ pub fn sys_cap_copy(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     {
         // May run the destination's teardown if its last capability went
         // meanwhile (see pre_grow_holding_dest).
-        // SAFETY: dest_obj is the live wrapper resolved above; no lock held.
+        // SAFETY: dest_obj was the live wrapper at lookup; no lock held.
+        // `lookup_cap` takes no reference on the object, so it is not pinned
+        // for this block (`core/kernel/docs/capability-internals.md`
+        // § Storage: Hybrid Two-Level Radix, #443).
         unsafe { pre_grow_holding_dest(dest_obj, dest_cs_ptr, dest_slot_idx)? };
     }
 

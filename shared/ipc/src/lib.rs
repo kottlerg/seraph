@@ -51,13 +51,11 @@ use syscall_abi::{MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
 //     DEVMGR_LABELS_VERSION — devmgr_labels::QUERY_BLOCK_DEVICE (vfsd ↔ devmgr)
 //     MEMMGR_LABELS_VERSION — memmgr_labels::REGISTER_PROCESS   (procmgr ↔ memmgr)
 //     SVCMGR_LABELS_VERSION — svcmgr handover endowment round 1   (init ↔ svcmgr)
-//     LOG_LABELS_VERSION    — log_labels::GET_LOG_CAP            (std process ↔ logd)
 //
 //   Implicitly covered by parent-channel handshake — the channel was opened
 //   against a cap-badge first minted by a handshake-checked namespace; the
 //   badge's presence is the version stamp, zero per-message cost.
 //     NS_LABELS_VERSION     — caps from vfsd_labels / fs_labels handshakes
-//     STREAM_LABELS_VERSION — caps from log_labels handshake
 //
 //   Marker-only — no clean parent-channel handshake exists; per-message
 //   inlining would conflict with existing label-bit usage or cost wire bytes
@@ -71,6 +69,13 @@ use syscall_abi::{MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
 //     RTC_LABELS_VERSION
 //     TIMED_LABELS_VERSION
 //     SERIAL_LABELS_VERSION
+//     FB_LABELS_VERSION
+//     INPUT_LABELS_VERSION
+//     LOG_LABELS_VERSION    — log_labels::GET_LOG_CAP carries it, but no
+//                             caller issues that handshake
+//     STREAM_LABELS_VERSION — stream caps arrive pre-installed in
+//                             ProcessInfo.log_send_cap (init derives its
+//                             own), not via a handshake
 
 pub const PROCMGR_LABELS_VERSION: u32 = 3;
 /// IPC labels for the process manager (`procmgr`).
@@ -290,20 +295,22 @@ pub mod procmgr_labels
     /// table, calls `sys_thread_bind_notification` on the child's
     /// main thread with this EQ as a second observer. From the
     /// registration moment onward, every newly spawned child also
-    /// receives the binding inside `finalize_creation`. Single
-    /// observer slot — re-registration replaces the previous cap.
+    /// receives the binding inside `finalize_creation`. Registration is
+    /// first-wins: a second registration has its cap deleted.
     ///
     /// Real-logd uses this to learn about sender deaths so it can
     /// evict the corresponding slot in its hash-keyed badge table.
     /// Reply is `procmgr_errors::SUCCESS` on bind, `INVALID_ARGUMENT`
-    /// if the cap is missing or wrong type, `UNAUTHORIZED` if called
-    /// over a non-privileged path (gated by badged SEND cap).
+    /// if no cap (or a zero cap) is transferred, `UNAUTHORIZED` without
+    /// the `DEATH_EQ_AUTHORITY` badge or when an EQ is already
+    /// registered (`services/procmgr/docs/ipc-interface.md`
+    /// § `REGISTER_DEATH_EQ`).
     pub const REGISTER_DEATH_EQ: u64 = 14;
 
     /// Badge bit on procmgr service caps that authorises
-    /// `REGISTER_DEATH_EQ`. Init derives this badged SEND cap and
-    /// hands it to real-logd at bootstrap; the un-badged or
-    /// differently-badged twins are rejected.
+    /// `REGISTER_DEATH_EQ`; un-badged or differently-badged callers are
+    /// rejected. Who holds it is in `services/procmgr/docs/ipc-interface.md`
+    /// § `REGISTER_DEATH_EQ`.
     pub const DEATH_EQ_AUTHORITY: u64 = 1u64 << 62;
 
     /// Hand init's kernel-object caps + reclaimable Memory caps to procmgr
@@ -319,21 +326,25 @@ pub mod procmgr_labels
     ///               on `cap_delete` regardless of state).
     /// Subsequent rounds (`data[0] == 0`):
     ///   `caps[0..N]` = reclaimable Memory caps (segments + stack +
-    ///                  `InitInfo` + IPC buffer + any other init-owned
-    ///                  donatable Memory cap). MOVED out of init's `CSpace`
+    ///                  `InitInfo` + any other init-owned donatable
+    ///                  Memory cap). MOVED out of init's `CSpace`
     ///                  via IPC cap-transfer; procmgr accumulates them
     ///                  for the eventual `memmgr.DONATE_MEMORY_CAPS` chunk.
     ///
     /// Procmgr binds the death-EQ on both init threads (main and
     /// init-logd) with correlator `INIT_REAP_CORRELATOR` as part of the
     /// first round, and reaps once both have exited. Each round replies
-    /// `procmgr_errors::SUCCESS`.
+    /// `procmgr_errors::SUCCESS`, or `INVALID_ARGUMENT` on the reject
+    /// arms in `services/procmgr/docs/ipc-interface.md`
+    /// § `REGISTER_INIT_TEARDOWN`.
     pub const REGISTER_INIT_TEARDOWN: u64 = 15;
 
     /// Notification end of init's reap-handoff cap stream. After this call
     /// init has no caps left to transfer; procmgr's state machine
     /// transitions to "armed", awaiting the death-EQ event. Init
-    /// calls `sys_thread_exit` immediately after this IPC replies.
+    /// calls `sys_thread_exit` immediately after this IPC replies. Replies
+    /// `INVALID_ARGUMENT` when no teardown is pending or the state machine
+    /// is already armed.
     pub const INIT_TEARDOWN_DONE: u64 = 16;
 
     /// Reserved death-notification correlator used by `REGISTER_INIT_TEARDOWN`.
@@ -371,10 +382,13 @@ pub mod sched_policy
     /// Upper bound of the baseline `SchedControl` band init delegates to
     /// the spawn chain: init splits its root `[1, 30]` cap at
     /// `BASELINE_PRIORITY_MAX + 1`, keeps the elevated remainder
-    /// (`[29, 30]`, which dies at init's reap), and hands the baseline
-    /// `[1, 28]` to memmgr and procmgr. Every band procmgr mints for a
-    /// child is a (possibly narrowed) descendant of this baseline, so no
-    /// spawned process can ever reach `[29, 30]`.
+    /// (`[29, 30]`, which stays alive but unreachable in init's pinned
+    /// `CSpace` after its reap; releasing it there is design intent, not
+    /// yet implemented, per `docs/process-lifecycle.md` § Init reap and
+    /// #443), and hands the baseline `[1, 28]` to memmgr and procmgr.
+    /// Every band procmgr mints for a child is a (possibly narrowed)
+    /// descendant of this baseline, so no spawned process can ever reach
+    /// `[29, 30]`.
     pub const BASELINE_PRIORITY_MAX: u8 = 28;
 
     /// Priority procmgr assigns when a `CREATE_PROCESS` /
@@ -478,27 +492,36 @@ pub mod memmgr_labels
     /// identifying the new process. Procmgr installs the returned cap in
     /// the new process's `ProcessInfo.memmgr_endpoint_cap`.
     pub const REGISTER_PROCESS: u64 = 3;
-    /// Procmgr-only: notification process death. The transferred cap (`caps[0]`)
-    /// carries the dead process's badge; memmgr reclaims every Memory cap
+    /// Procmgr-only: notify process death. `data[0]` carries the dead process's
+    /// memmgr badge (no cap is required); memmgr reclaims every Memory cap
     /// it had issued to that badge, runs coalescing, and clears the
     /// per-process record. Idempotent on unknown badges.
     pub const PROCESS_DIED: u64 = 4;
-    /// Permanently transfer a Memory cap into memmgr's pool.
+    /// Permanently transfer a batch of Memory caps into memmgr's pool.
     ///
-    /// Used by init and procmgr to return boot-module Memory caps after the
-    /// loader has copied the ELF contents into the target process's
-    /// `AddressSpace`. The transferred cap (`caps[0]`) becomes part of
-    /// memmgr's free pool; subsequent `REQUEST_MEMORY_CAPS` callers may receive
-    /// pages derived from it.
+    /// The caller is procmgr's init reap (donated set:
+    /// `docs/process-lifecycle.md` "Init reap"; contract:
+    /// `services/memmgr/docs/ipc-interface.md` "Label 5:
+    /// `DONATE_MEMORY_CAPS`"). memmgr accepts the label from any badged
+    /// client today and does not check a donated cap's provenance; gating it
+    /// to procmgr is tracked in #459.
     ///
     /// Wire format:
-    /// * `caps[0]` — the Memory cap to transfer (must carry `MemRights::RETYPE`).
+    /// * `caps[..]` — up to `MSG_CAP_SLOTS_MAX` Memory caps to donate; each
+    ///   MUST carry `WRITE`, `EXECUTE`, and `RETYPE` rights.
     ///
-    /// memmgr derives `phys_base` and `size` from the cap itself via
-    /// `cap_info`, so no caller-side bookkeeping is required. Reply is
-    /// `memmgr_errors::SUCCESS` on ingestion, `INVALID_ARGUMENT` if the
-    /// cap is missing RETYPE or the pool is full (cap is dropped on
-    /// reject).
+    /// memmgr derives `phys_base` and `size` from each cap via `cap_info`, so
+    /// no caller-side bookkeeping is required. A cap that is not a Memory cap
+    /// or lacks a required right is deleted and not counted. Each accepted cap
+    /// is owned by memmgr for the rest of its life, added to `pool_total`, and
+    /// placed in the free pool, coalescing where possible; a cap that finds no
+    /// free-pool slot stays owned and counted but is unreachable for
+    /// allocation until a later coalesce frees a slot.
+    ///
+    /// Reply: always `memmgr_errors::SUCCESS`, with `data[0]` =
+    /// `accepted_caps`, `data[1]` = `accepted_pages` (total pages across the
+    /// accepted caps), and `data[2]` = `pool_total_pages` (memmgr's owned page
+    /// count after the donation).
     pub const DONATE_MEMORY_CAPS: u64 = 5;
     /// Read-only query of the all-RAM-accounted identity. Callable from any
     /// badged cap; returns aggregate counts only — no caps, no state change.
@@ -1158,9 +1181,25 @@ pub mod fs_labels
     /// (`PAGE_SIZE - memory_data_offset`); callers iterate forward from
     /// `offset + bytes_valid` to read past those boundaries.
     pub const FS_READ_MEMORY: u64 = 7;
-    /// Filesystem-driver request to a client to release a previously-returned
-    /// page. Sent on the per-file release endpoint cap. Badge identifies the
-    /// file; `data[0]` = the release cookie naming the Memory cap to unmap.
+    /// Release of a previously-returned page, in either direction.
+    ///
+    /// Driver-to-client (cooperative eviction): sent on the release endpoint
+    /// cap recorded in the node's open-file slot, taken from `caps[0]` of
+    /// the [`FS_READ_MEMORY`] that allocated the slot (shared per node, not
+    /// per client; tracked in #447); `data[0]` = the release cookie naming
+    /// the Memory cap to unmap. The client unmaps it and replies [`FS_RELEASE_ACK`];
+    /// without an ack inside the watchdog window the driver hard-revokes.
+    ///
+    /// Client-to-driver (synchronous release after a read): sent on the
+    /// per-node badged cap the page was read through; `data[0]` = the
+    /// release cookie from the [`FS_READ_MEMORY`] reply. The driver revokes
+    /// the page's derived caps and frees its cache slot. Reply: empty body
+    /// on success (an unmatched cookie is a no-op success);
+    /// `fs_errors::PERMISSION_DENIED` when the badge carries no namespace
+    /// rights.
+    ///
+    /// See `services/fs/docs/fs-driver-protocol.md` "Label 8:
+    /// `FS_RELEASE_MEMORY`" for the authoritative contract.
     pub const FS_RELEASE_MEMORY: u64 = 8;
     /// Client acknowledgement of [`FS_RELEASE_MEMORY`]: synchronous reply,
     /// empty body.
@@ -1381,15 +1420,18 @@ pub mod devmgr_labels
     ///
     /// Reply ([`super::devmgr_errors::SUCCESS`]):
     /// - x86-64: `caps[0]` = a narrow `IoPort` over `[pm1a, pm1a+2)`
-    ///   carved from devmgr's root `IoPort`; `caps[1]` = a narrow
+    ///   carved from devmgr's full-rights `IoPort`; `caps[1]` = a narrow
     ///   `IoPort` over `[0x64, 0x65)` (8042 KBC reset, for reboot).
-    ///   Both are re-derived from the root on every call, so a pwrmgr
+    ///   Both are re-derived from it on every call, so a pwrmgr
     ///   restart re-acquires them cleanly.
-    /// - RISC-V: `caps[0]` = a `cap_derive` copy of devmgr's `SbiControl`
-    ///   cap (SBI SRST authority).
+    /// - RISC-V: `caps[0]` = a Reset-only derivation of devmgr's
+    ///   `SbiControl` cap (SBI SRST authority).
     ///
     /// Replies [`super::devmgr_errors::NO_DEVICE`] when the carve fails or
-    /// the platform authority cap is absent.
+    /// the platform authority cap is absent,
+    /// [`super::devmgr_errors::INVALID_REQUEST`] when the RISC-V Reset-only
+    /// derivation fails, and [`super::devmgr_errors::LABEL_VERSION_MISMATCH`]
+    /// when `data[0]` is not `DEVMGR_LABELS_VERSION`.
     pub const QUERY_SHUTDOWN_DEVICE: u64 = 8;
 
     /// Query for the keyboard/input device endpoint.
@@ -2136,7 +2178,12 @@ pub mod blk_errors
     pub const REGISTER_REJECTED: u64 = 4;
     /// Memory cap rejected: `BLK_READ_INTO_MEMORY` target missing
     /// `MAP|WRITE` rights, `BLK_WRITE_FROM_MEMORY` source missing
-    /// `MAP|READ` rights, sized other than one page, or absent.
+    /// `MAP|READ` rights, smaller than `count * 512` bytes, or absent;
+    /// also returned when `count` is 0 or `count * 512` exceeds `u32::MAX`.
+    /// virtio-blk does not yet check the `count * 512` multiply for
+    /// overflow: a `count` of 2^55 or more panics the driver under the dev
+    /// profile (`overflow-checks = true`) and wraps in release instead of
+    /// returning this error (#454).
     pub const INVALID_MEMORY_CAP: u64 = 5;
     /// Caller's compiled `BLK_LABELS_VERSION` does not match the receiver's.
     /// `REGISTER_PARTITION` is the handshake entry point and carries the

@@ -57,6 +57,9 @@ instruction is used in a loop to handle spurious wakeups.
    baseline runs (see docs/platform-requirements.md)
 ```
 
+The step-4 gate and the baseline it enforces are defined in
+[platform-requirements.md](../../../docs/platform-requirements.md) § Boot-Time Feature Gate.
+
 The early console is allocation-free and output-only.
 
 **Failure mode:** If no output device is found, initialisation continues silently.
@@ -96,6 +99,9 @@ has accepted the platform.
 6. For each candidate range, call BuddyAllocator::add_region(phys_start, phys_end)
 7. Emit: total usable RAM in MiB
 ```
+
+`MAX_ORDER` and the per-CPU boot slab sizing it accommodates are specified in
+[memory-internals.md](memory-internals.md) § Buddy Allocator.
 
 The buddy allocator MUST be initialized from a static buffer or boot stack, not
 from itself.
@@ -148,6 +154,13 @@ has no heap (see Phase 4).
    framebuffer-mirrored console)
 ```
 
+The direct-map page sizes, the kernel-half floor, and the KASLR placement of the direct map
+are defined in [memory-model.md](../../../docs/memory-model.md) § Virtual Address Space Layout
+and § Paging. The bootloader page table retired in step 7 is described in
+[page-tables.md](../../boot/docs/page-tables.md), and the scratch pages and bundle layout
+reclaimed alongside it in [boot-flow.md](../../boot/docs/boot-flow.md). The step-8 disclosure
+rule is recorded in [cross-boundary-disclosure.md](cross-boundary-disclosure.md).
+
 After this phase, the kernel can access any physical frame at `direct_map_base() + phys`.
 All kernel pointers derived from physical addresses use this translation.
 
@@ -175,6 +188,10 @@ Emit "fatal: cannot build kernel page tables (OOM)" and halt.
    per-CPU state and idle stacks, and the entropy subsystem's per-CPU CSPRNGs,
    central pool, jitter accumulators, and self-test sample slab (see entropy.md)
 ```
+
+Retype-based kernel object memory, which replaces a kernel heap, is specified in
+[memory-internals.md](memory-internals.md) § Kernel Object Memory; the entropy
+subsystem's per-CPU state is described in [entropy.md](entropy.md).
 
 **Failure mode:** a failed per-CPU storage allocation halts the kernel.
 
@@ -216,6 +233,9 @@ Architecture-specific hardware initialization; x86-64 and RISC-V diverge here.
 8. Enable interrupts (STI)
 ```
 
+The step-7 timer mode selection is specified in [arch-interface.md](arch-interface.md)
+§ `timer`.
+
 ### RISC-V
 
 ```
@@ -230,6 +250,15 @@ Architecture-specific hardware initialization; x86-64 and RISC-V diverge here.
    timebase; halts if Sstc or the timebase was not discovered
 6. Enable interrupts (set sstatus.SIE)
 ```
+
+Within the architecture hardware path, after interrupt and per-CPU setup and before the
+syscall entry and preemption timer are configured, the BSP checks the boot-gated paging
+extensions, then enables hardware address-space tags (x86-64 PCID, RISC-V ASID) where the
+hardware provides them and allocates the per-CPU tag-state slab (`PER_CPU_TAG_STATE`), sized
+to the boot CPU count, from the buddy allocator. Where tags are absent, or too few for the
+CPU count, no slab is allocated and context switch keeps the full-flush path. The slab is a
+fixed kernel reserve allocated before the Phase 7 drain; see
+[memory-model.md](../../../docs/memory-model.md) § TLB Management.
 
 After the architecture hardware path, the BSP seeds the entropy pool from the
 firmware boot seed in `BootInfo`, the hardware RNG (health-gated where present),
@@ -284,21 +313,32 @@ Phase 7.
 3. Populate the root CSpace with initial capabilities:
    a. Memory capabilities for all usable physical memory ranges
       (one capability per contiguous usable region from the memory map)
-   b. One Mmio capability (Map | Write rights) per validated
-      `BootInfo.mmio_apertures` entry. Userspace narrows these into
-      per-device sub-caps and distributes them to drivers.
-   c. One root IoPort capability (x86-64 only, Use rights) covering
-      the full 64K I/O port space; init subdivides for services that
-      need port I/O.
-   d. One SchedControl capability spanning the full userspace priority range
+   b. Mmio capabilities (Map | Write rights): on RISC-V, first one over the
+      kernel console UART (`BootInfo.kernel_mmio.uart_base`, or the platform
+      default when that is zero; outside the apertures), then one per
+      validated `BootInfo.mmio_apertures` entry.
+      Userspace narrows these into per-device sub-caps and distributes them
+      to drivers.
+   c. One SchedControl capability spanning the full userspace priority range
       `[1, PRIORITY_MAX]` — holding it (plus its band) authorises setting thread
       priorities within that band. Init splits it into a baseline band and an
       elevated remainder and delegates copies per policy (see
       [capability-model.md § SchedControl](../../../docs/capability-model.md))
-   e. One SbiControl capability (RISC-V only) carrying every sanctioned SBI
-      right, for init to forward sanctioned SBI extensions and attenuate
-      per-consumer copies.
-   f. (Thread and process capabilities for init are added in Phase 9)
+   d. One root Interrupt range capability (Notify rights) covering every valid
+      IRQ id on the architecture (ROOT_IRQ_COUNT: 256 on x86-64, 1024 on RISC-V);
+      userspace narrows it to single-IRQ children via SYS_IRQ_SPLIT.
+   e. Map-only Memory capabilities over firmware tables (not retypable, not
+      buddy-backed): one per `AcpiReclaimable` memory-map region (up to
+      eight), then the page holding `BootInfo.acpi_rsdp`, then the
+      `BootInfo.device_tree` blob.
+   f. One root IoPort capability (x86-64 only, Use rights) covering the full
+      64K I/O port space, which init subdivides for services that need port
+      I/O; or one SbiControl capability (RISC-V only) carrying every
+      sanctioned SBI right, for init to forward sanctioned SBI extensions and
+      attenuate per-consumer copies.
+   g. Memory capabilities for the boot module images, via
+      `cap::mint_module_memory_caps` (one per `BootInfo.modules` entry).
+   h. (Thread and process capabilities for init are added in Phase 9)
 
    Before the drain in step 3a the InitInfo block, init's INIT_STACK_PAGES
    stack frames, and the kernel page-table pool are reserved from the
@@ -321,6 +361,13 @@ Phase 7.
 6. Emit: "capability system initialised, N slots populated"
 ```
 
+The SbiControl rights are defined in
+[capability-model.md § SbiControl](../../../docs/capability-model.md#sbicontrol-risc-v-only).
+Init's reap-time donation of the reclaim caps is described in
+[process-lifecycle.md § Init reap](../../../docs/process-lifecycle.md#init-reap), and the
+sealed buddy in
+[userspace-memory-model.md § Ownership Boundaries](../../../docs/userspace-memory-model.md#ownership-boundaries).
+
 **Failure mode:** Allocation failure during CSpace construction halts with
 "fatal: cannot initialise capability system".
 
@@ -331,6 +378,8 @@ MMIO aperture array, reclaim-array page, transient page-table frames)
 and the bundle's non-module pages (header + entry table + 4 KiB pad,
 init ELF source body, inter-module and trailing slack — module bodies
 are excluded because `mint_module_memory_caps` already covers them).
+The scratch pages and bundle layout are described in
+[boot-flow.md](../../boot/docs/boot-flow.md).
 
 ---
 
@@ -339,7 +388,8 @@ are excluded because `mint_module_memory_caps` already covers them).
 ```
 1. Initialise per-CPU run queues:
    - NUM_PRIORITY_LEVELS priority queues per CPU (e.g. 32 levels)
-   - Each queue is an intrusive doubly-linked list of TCBs
+   - Each queue is an intrusive singly-linked FIFO of TCBs (head/tail,
+     linked through run_queue_next)
 2. For each CPU (including the BSP):
    a. Use the idle kernel stack pre-allocated at per-CPU storage init
       (Phase 4); read its top from the IDLE_STACK_TOPS slab
@@ -368,6 +418,10 @@ are excluded because `mint_module_memory_caps` already covers them).
    cspace_layout so init sees the cap through the standard CSpace
    handoff in Phase 9.
 ```
+
+The run-queue structure, idle priority, and idle-thread loop are specified in
+[scheduler.md](scheduler.md) § Run Queue Structure and § Idle Thread; the step-5
+self-test in [entropy.md](entropy.md) § Boot wiring and lifecycle.
 
 The AP SIPI trampoline page is flagged `RECLAIM_FLAG_LATE` in
 `BootInfo.reclaim_ranges`. `cap::mint_reclaim_memory_caps` skips it in
@@ -439,6 +493,15 @@ calls `sched::enter()`.
         adds it to the physical frame address at translation time
       - Apply permissions from segment.flags (Read → RO, ReadWrite → RW,
         ReadExecute → RX); W^X is enforced (ReadWrite cannot also be executable)
+   b. Mint the AddressSpace cap (MAP | READ) for init's address space into
+      the root CSpace, then a reclaimable Memory cap per init segment
+      (page-aligned base and size, full rights, `owns_memory = true`, the
+      range added to the buddy ledger by `register_owned_range`) so init can
+      donate the frames to memmgr on reap
+   c. Fill the InitInfo region (InitInfo header, CapDescriptor array) in the
+      contiguous block reserved in Phase 7, map it read-only at the chosen
+      InitInfo VA (`choose_init_layout().init_info_va`), and mint a
+      reclaimable Memory cap per mapped InitInfo page into the root CSpace
 4. Map init's user stack (inlined in `kernel_entry`):
    a. Take the INIT_STACK_PAGES (4) frames reserved from the buddy in
       Phase 7, before the user-cap drain, one at a time so each phys
@@ -458,7 +521,10 @@ calls `sched::enter()`.
       saved_state.rip (x86-64) or .ra (RISC-V) and the InitInfo VA as the arg
       forwarded to init's a0/rdi on first entry
    c. Priority: INIT_PRIORITY (30)
-   d. cspace: set to ROOT_CSPACE raw pointer (handed off at `sched::enter()` start)
+   d. Mint the Thread cap (CONTROL) for init's thread into the root CSpace
+   e. Mint the CSpace cap (INSERT | DELETE | DERIVE) for the root CSpace into
+      itself, then patch both slots into InitInfo
+   f. cspace: set to ROOT_CSPACE raw pointer (handed off at `sched::enter()` start)
 6. Enqueue the init TCB on the BSP's run queue at INIT_PRIORITY
 7. Call sched::enter() — does not return:
    a. Dequeue the highest-priority ready thread (init)
@@ -471,15 +537,24 @@ calls `sched::enter()`.
       then return_to_user(tf_ptr) — restores registers and executes sret
 ```
 
+The PIE bias window, relocation rules, and init stack placement are defined in
+[userspace-memory-model.md](../../../docs/userspace-memory-model.md) § Image Placement and
+§ Bootstrap Cross-Boundary VAs; the kernel-half root entries and W^X rule in
+[memory-model.md](../../../docs/memory-model.md) § Virtual Address Space Layout and § Paging;
+the reap-time donation of the segment, InitInfo, and stack pages in
+[process-lifecycle.md § Init reap](../../../docs/process-lifecycle.md#init-reap).
+
 **Implementation notes:**
-- CSpace hand-off (step 5d): `sched::enter()` calls `set_current(init_tcb)` so
+- CSpace hand-off (step 5f): `sched::enter()` calls `set_current(init_tcb)` so
   `current_tcb()` returns the init TCB during init's syscalls; init receives
   ROOT_CSPACE.
 - The x86-64 `switch_and_enter_user` function atomically switches the stack pointer
   BEFORE writing CR3. This is required because the boot stack is identity-mapped in
   PML4 entries 0–255 (the lower half), which are not copied into init's page tables.
   Any function call/return on the boot stack after the CR3 write would page-fault.
-- Init segment frames are NOT reclaimed — they remain mapped in init's address space.
+- Init segment frames stay mapped in init's address space; their reclaimable Memory
+  caps (step 3b) are donated at reap
+  ([process-lifecycle.md § Init reap](../../../docs/process-lifecycle.md#init-reap)).
 
 **Failure mode:** Allocation failure halts with a diagnostic message identifying the
 failed step. Invalid init_image (zero segment_count or zero entry_point) halts with
@@ -532,9 +607,19 @@ that CPU only; the BSP and other CPUs continue.
 
 ## Summarized By
 
-[kernel/README.md](../README.md), [docs/bootstrap.md](../../../docs/bootstrap.md),
-[docs/memory-model.md](../../../docs/memory-model.md),
-[docs/userspace-memory-model.md](../../../docs/userspace-memory-model.md),
-[cross-boundary-disclosure.md](cross-boundary-disclosure.md),
-[boot/docs/boot-flow.md](../../boot/docs/boot-flow.md),
-[boot/docs/memory-map.md](../../boot/docs/memory-map.md)
+[abi/boot-protocol/README.md](../../../abi/boot-protocol/README.md),
+[Boot Flow](../../boot/docs/boot-flow.md), [ELF Loading](../../boot/docs/elf-loading.md),
+[Firmware Parsing](../../boot/docs/firmware-parsing.md),
+[Kernel Handoff Contract](../../boot/docs/kernel-handoff.md),
+[Memory Map Translation](../../boot/docs/memory-map.md),
+[Page Tables](../../boot/docs/page-tables.md), [core/kernel/README.md](../README.md),
+[Capability Subsystem Internals](capability-internals.md),
+[Kernel Cross-Boundary Disclosure Inventory](cross-boundary-disclosure.md),
+[Kernel Entropy Subsystem](entropy.md), [Memory Subsystem Internals](memory-internals.md),
+[SMP Scheduling and Locking Invariants](scheduling-internals.md),
+[System Bootstrap](../../../docs/bootstrap.md),
+[Capability Model](../../../docs/capability-model.md),
+[Device Management](../../../docs/device-management.md),
+[Memory Model](../../../docs/memory-model.md),
+[Userspace Memory Model](../../../docs/userspace-memory-model.md),
+[shared/elf/README.md](../../../shared/elf/README.md)

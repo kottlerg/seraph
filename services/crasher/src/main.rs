@@ -5,19 +5,8 @@
 
 //! Deliberate-crash fixture validating svcmgr's restart path.
 //!
-//! Gated, opt-in: its recipe lives in `/config/svcmgr/tests/`, co-staged
-//! with svctest in CI and never launched on a normal boot. On every spawn
-//! it asserts the recipe surfaces survived — argv, env, cwd, and bootstrap
-//! seeds — logs `<surface> ok` for each, then deliberately faults (NULL
-//! write) so svcmgr respawns it under `restart = always`. A surface that
-//! fails to round-trip (notably one dropped on restart) is logged with a
-//! `FATAL:` prefix, which run-parallel's fail regex catches and fails the
-//! run; the deliberate `USERSPACE FAULT` itself is not a fail badge.
-//!
-//! Capabilities: the bootstrap round delivers the recipe's two seeds —
-//! `caps[0]` = svcmgr service endpoint, `caps[1]` = pwrmgr deny twin —
-//! re-resolved on every (re)spawn. Log and procmgr endpoints arrive via
-//! `ProcessInfo`, so they need no bootstrap round.
+//! Gating, the surface checks, the fail rules, and the capability slots are
+//! defined in `services/crasher/README.md`.
 
 use std::os::seraph::startup_info;
 use std::thread;
@@ -165,8 +154,13 @@ fn bootstrap_caps(creator_ep: u32, ipc_buffer: *mut u8) -> (u32, u32, usize)
 
 /// Liveness probe: call `QUERY_ENDPOINT` on the svcmgr cap for a name that
 /// does not exist. A successful round-trip (any reply, including
-/// `UNKNOWN_NAME`) proves the cap is live. A crash here would indicate the
-/// seed cap was not re-injected after restart.
+/// `UNKNOWN_NAME`) proves the cap is live. A dead or stale seed makes
+/// `ipc_call` return `Err`, which is logged without the `FATAL:` prefix, so
+/// the default `--fail` regex of `cargo xtask run-parallel`
+/// (xtask/README.md § `cargo xtask run-parallel`) does not catch a seed that
+/// was not re-injected live after restart. TODO(#438): log the failed
+/// round-trip as `FATAL:`; deferred by maintainer decision to the work #438
+/// tracks.
 fn probe_svcmgr(svcmgr_cap: u32, ipc_buffer: *mut u8)
 {
     // cast_ptr_alignment: IPC buffer is page-aligned (4 KiB), satisfying u64 alignment.

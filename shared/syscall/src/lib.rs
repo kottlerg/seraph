@@ -743,6 +743,9 @@ pub fn notification_send(sig: u32, bits: u64) -> Result<(), i64>
 /// register (rdx / a1). Mirrors `event_recv`; the split avoids aliasing
 /// bit-63-set bitmasks with the dispatcher's negative-Err encoding.
 ///
+/// A notification destroyed while the caller waits wakes it with `Ok(0)`
+/// rather than an error (a kernel defect tracked in #443).
+///
 /// # Errors
 /// Returns a negative `i64` error code if the notification cap is invalid or the
 /// wait is interrupted.
@@ -765,7 +768,9 @@ pub fn notification_wait(sig: u32) -> Result<u64, i64>
 ///
 /// Same register layout as [`notification_wait`]: status in the primary register,
 /// bitmask in the secondary. Timeout is notified in-band as `bits == 0`
-/// (legitimate because `notification_send` rejects zero-bit sends).
+/// (legitimate because `notification_send` rejects zero-bit sends); `Ok(0)` is
+/// also returned when the notification is destroyed while the caller waits
+/// (#443).
 ///
 /// # Errors
 /// Returns a negative `i64` error code if the notification cap is invalid or
@@ -1828,6 +1833,9 @@ pub fn event_post(queue_cap: u32, payload: u64) -> Result<(), i64>
 /// Returns the payload word. The primary return register holds 0 on success;
 /// the payload is in the secondary return register (rdx / a1).
 ///
+/// A queue destroyed while the caller waits returns `Ok(0)`, a payload that
+/// was never posted, rather than an error (a kernel defect tracked in #443).
+///
 /// # Errors
 /// Returns a negative `i64` error code if the queue cap is invalid or the
 /// wait is interrupted.
@@ -1860,6 +1868,8 @@ pub fn event_try_recv(queue_cap: u32) -> Result<u64, i64>
 /// [`event_recv`]); `timeout_ms == u64::MAX` is a non-blocking poll (same as
 /// [`event_try_recv`]); any other value blocks for up to `timeout_ms`
 /// milliseconds, then returns `Err(-6)` (`WouldBlock`) if no post arrived.
+/// A queue destroyed while the caller waits returns `Ok(0)`, a payload that
+/// was never posted, rather than an error (a kernel defect tracked in #443).
 ///
 /// # Errors
 /// Returns `-6` (`WouldBlock`) on timeout or empty try-once, or another
@@ -2099,12 +2109,20 @@ pub fn thread_set_priority(thread_cap: u32, priority: u8, sched_cap: u32) -> Res
 /// Set a thread's CPU affinity.
 ///
 /// `cpu_id` must be a valid CPU ID or `u32::MAX` (clear affinity / any CPU).
-/// Takes effect on the thread's next enqueue. A thread already running
-/// on or queued on another CPU is not actively migrated.
+/// `thread_cap` must carry Control rights. Takes effect immediately: a Ready
+/// thread queued on another CPU is migrated to the target CPU's run queue; a
+/// Running thread on another CPU is sent a reschedule IPI and moves at its
+/// next `schedule()` entry (worst case one time slice later); a blocked,
+/// stopped, or not-yet-started thread observes the new affinity on its next
+/// wake.
+///
+/// See `core/kernel/docs/syscalls.md` § `SYS_THREAD_SET_AFFINITY` for known
+/// defects (#443).
 ///
 /// # Errors
-/// Returns a negative `i64` error code if the thread cap is invalid or
-/// `cpu_id` is not a valid CPU index.
+/// Returns a negative `i64` error code: `InvalidCapability` if the thread cap
+/// is invalid, `InsufficientRights` if it lacks Control rights, or
+/// `InvalidArgument` if `cpu_id` names an offline or out-of-range CPU.
 #[inline]
 pub fn thread_set_affinity(thread_cap: u32, cpu_id: u32) -> Result<(), i64>
 {
@@ -2123,9 +2141,13 @@ pub fn thread_set_affinity(thread_cap: u32, cpu_id: u32) -> Result<(), i64>
 /// Bind (or clear) a thread's per-thread fault-handler endpoint.
 ///
 /// `endpoint_cap` is the `Endpoint` whose receiver services this thread's
-/// kernel-unresolvable faults, or `0` to unbind. `badge` is delivered as the
-/// fault message badge to identify the faulting thread. `fault_class_mask`
-/// selects the covered fault classes; pass [`syscall_abi::FAULT_CLASS_ALL`].
+/// kernel-unresolvable faults, or `0` to unbind. `badge` is a caller-chosen
+/// value delivered as the fault message badge; it identifies the faulting
+/// thread/process to the handler only if no other binder can reach the
+/// endpoint, or if the handler's badges are secret (see
+/// [`syscall_abi::FAULT_LABEL`] and `docs/fault-handling.md` § Security).
+/// `fault_class_mask` selects the covered fault classes; pass
+/// [`syscall_abi::FAULT_CLASS_ALL`].
 ///
 /// Requires `CONTROL` on `thread_cap`. See `docs/fault-handling.md`.
 ///

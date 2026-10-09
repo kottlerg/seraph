@@ -31,10 +31,11 @@ discipline below has been applied end-to-end.
     changed since `since`; verify each claimed fix for your files against
     the code, and report: every claimed fix not actually made; every finding
     in the changed hunks; any correctness, soundness, safety, or contract
-    defect anywhere in the file. A standards, doc-drift, coverage, or style
-    finding the delta did not introduce is out of bound; a statement the
-    delta made stale, or a test the delta's new code lacks, is one the delta
-    introduced wherever it anchors.
+    defect anywhere in the file. Per `docs/conventions.md` § Branch and PR
+    Workflow, a standards, doc-drift, coverage, or style finding the delta
+    did not introduce is out of bound; a statement the delta made stale, or
+    a test the delta's new code lacks, is one the delta introduced wherever
+    it anchors.
 
     A lens prompt (call sites, design documents, cross-boundary surfaces,
     regression) names one concern over the whole diff instead of shard
@@ -48,12 +49,17 @@ discipline below has been applied end-to-end.
 3. For every file in the diff, read the **whole file**, not just the hunks.
 
 4. Identify the binding authority for the touched surface by walking the
-   project's documented scope order. Do not pre-enumerate paths; discover
-   them from the repo as it exists today:
+   scope order `docs/documentation-standards.md` § Document Hierarchy
+   defines. Do not pre-enumerate paths; discover them from the repo as it
+   exists today:
 
-   - System scope: the repo root `README.md` and the top-level `docs/` tree.
+   - System scope: the top-level `docs/*.md` (the root `README.md` only
+     routes to and summarizes them). This agent also reads
+     `docs/releases/README.md` with them: the standard places it in no
+     scope, and the release-notes exception under its § Backlinks and
+     Change Propagation calls it an ordinary authoritative document.
    - Component scope: the touched component's `README.md`.
-   - Component design scope: any `docs/*.md` the component README links.
+   - Design-authority scope: the component's `docs/*.md`.
 
    Read what is relevant to what the diff touches. If a system-scope design
    doc governs the touched area, read it in full and treat its model as
@@ -70,9 +76,9 @@ discipline below has been applied end-to-end.
    - If the touched area sits under a system-scope design doc, check the
      diff against the model that doc defines.
 
-6. Evaluate. The project's principles (root `README.md` Goals,
-   `docs/architecture.md`), coding standards, and documentation standards
-   are **binding**, not advisory — `.claude/CLAUDE.md` says so explicitly.
+6. Evaluate. The project's principles (`docs/architecture.md`, which the
+   root `README.md` Goals summarize), coding standards, and documentation
+   standards are **binding**, not advisory — `.claude/CLAUDE.md` says so explicitly.
    On the review surface (`docs/conventions.md` § Branch and PR Workflow),
    treat any drift from them as a blocking issue, on par with a correctness
    bug; drift the surface definition excludes you still report, marked out
@@ -123,7 +129,8 @@ or documented promise broken; `standards`: a binding standard's rule;
 test; `style`: readability and naming), whether the diff `introduced` it
 (in `delta` mode, whether the delta did), whether it is a
 `must_violation` of a binding standard, whether it is `in_bound` (on the
-review surface as if no open Issue named the work; a correctness,
+review surface `docs/conventions.md` § Branch and PR Workflow defines,
+judged as if no open Issue named the work; a correctness,
 soundness, safety, or contract defect in a touched file is; in a delta
 run, a standards, doc-drift, coverage, or style finding only when the
 delta introduced it), the `issue` that names it when one does (the
@@ -134,8 +141,9 @@ workflow computes the verdict from the entries.
 **In prose mode the final line MUST be exactly one of:** `READY TO MERGE`,
 `BLOCKING ISSUES`, `NON-BLOCKING ISSUES ONLY`. Any in-bound Critical item
 or MUST violation forces `BLOCKING ISSUES`; out-of-bound findings are
-listed, each naming the Issue that records it (the open Issue that already
-names the work, else the audit Issue), and do not affect the line.
+listed, each naming the Issue that records it per `docs/conventions.md`
+§ Branch and PR Workflow (the open Issue that already names the work, else
+the audit Issue), and do not affect the line.
 
 ## Tool discipline
 

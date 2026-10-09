@@ -21,7 +21,9 @@ driver dispatches incoming requests by their badge shape:
 - `badge == 0` — service-level request from vfsd (only `FS_MOUNT`
   today).
 - `badge != 0` carrying namespace rights in bits 40..64 — node-cap
-  request. Per-node opcodes (`NS_*`, `FS_READ`, `FS_READ_MEMORY`,
+  request (badge layout per
+  [`shared/namespace-protocol/README.md`](../../../shared/namespace-protocol/README.md)
+  § Badge shape). Per-node opcodes (`NS_*`, `FS_READ`, `FS_READ_MEMORY`,
   `FS_RELEASE_MEMORY`, `FS_CLOSE`) are dispatched by label.
 
 ---
@@ -35,10 +37,11 @@ A filesystem driver exposes one IPC endpoint, used as both:
 - the un-badged **namespace endpoint** routed through
   [`namespace_protocol::dispatch_request`] for `NS_*` dispatch.
 
-The receive-side cap is injected into the driver's CSpace at two-
-phase process creation. The same endpoint is also the kernel-
-derivation parent for every node cap the driver ever issues via
-`cap_derive_badge`.
+vfsd delivers the endpoint cap (all rights: receive and badge
+derivation) in the driver's bootstrap round; see
+[Bootstrap caps](#bootstrap-caps). The same endpoint is also the
+kernel-derivation parent for every node cap the driver ever issues
+via `cap_derive_badge`.
 
 Numeric label values live in [`ipc::fs_labels`] (this document) and
 [`ipc::ns_labels`] (namespace-protocol document).
@@ -57,15 +60,17 @@ its block device endpoint and reply success or a typed error.
 | Field | Value |
 |---|---|
 | `label` | `10` |
-| body | empty |
+| `data[0]` | Caller's `ipc::FS_LABELS_VERSION` |
 
 **Reply (success)**: `label = 0`, empty body.
 
-**Reply (error)**: `label = ipc::fs_errors::*` (e.g. `IO_ERROR`,
-`NOT_FOUND` for a malformed BPB).
+**Reply (error)**: `label = ipc::fs_errors::*`:
+`LABEL_VERSION_MISMATCH` when `data[0]` differs from the driver's
+`FS_LABELS_VERSION` (checked before the BPB is read), else e.g.
+`IO_ERROR`, or `NOT_FOUND` for a malformed BPB.
 
-The block device endpoint arrives in the driver's CSpace at creation
-time; see [Bootstrap caps](#bootstrap-caps).
+The block device endpoint arrives in the driver's bootstrap round;
+see [Bootstrap caps](#bootstrap-caps).
 
 ---
 
@@ -109,9 +114,11 @@ Memory-cap read. The driver returns a single-page Memory cap with
 attenuated rights (`MAP|READ`) covering the cached page that contains
 the requested byte. The client maps the memory cap, reads up to
 `bytes_valid` bytes starting at `memory_data_offset`, then releases
-the page either synchronously after the read or in response to a
-driver-initiated [`FS_RELEASE_MEMORY`](#label-8-fs_release_memory)
-arriving on the per-process release endpoint.
+the page either synchronously after the read, by sending
+[`FS_RELEASE_MEMORY`](#client-to-driver-release) on the node cap, or
+in response to a driver-initiated
+[`FS_RELEASE_MEMORY`](#driver-to-client-release) arriving on the
+per-process release endpoint.
 
 The request `offset` has no alignment requirement; the driver reports
 where the file's content for `offset` lives within the returned memory cap
@@ -134,13 +141,22 @@ sentinel).
 | `caps[0]` | Per-process release-endpoint SEND, transferred only on the first `FS_READ_MEMORY` for a given (client, file) pair (see below) |
 
 The first `FS_READ_MEMORY` for a given (client, file) pair MAY carry
-the client's per-process release-endpoint SEND in `caps[0]`. The
-driver records it on the lazily-allocated `OpenFile` slot so the
-eviction worker can route cooperative
-[`FS_RELEASE_MEMORY`](#label-8-fs_release_memory) back to the client.
+the client's per-process release-endpoint SEND in `caps[0]`.
 Subsequent `FS_READ_MEMORY`s for the same pair carry no caps; clients
 that opt out of cooperative release omit the cap on every call,
 falling back to the eviction worker's hard-revoke path.
+
+The driver keeps this read-side bookkeeping (outstanding pages and the
+recorded release endpoint) in a lazily-allocated `OpenFile` slot keyed
+by node, not by (client, file) pair. Every client that opens a file
+resolves to the same node and so shares that one slot. The driver
+records `caps[0]` only from the `FS_READ_MEMORY` that allocates the
+slot, so the eviction worker routes cooperative
+[`FS_RELEASE_MEMORY`](#label-8-fs_release_memory) for any client's
+page to that first client, and a later client is in effect opted out.
+One client's [`FS_CLOSE`](#label-3-fs_close) revokes every client's
+outstanding pages on the file. This sharing is a defect, tracked in
+[#447](https://github.com/kottlerg/seraph/issues/447).
 
 **Reply (success)**
 
@@ -186,12 +202,11 @@ contiguous bytes across the boundary.
 
 ### Measured per-call cost (`fsbench`, debug builds)
 
-Source: `programs/fsbench/src/main.rs`. The bench loops 256 timed iterations
-of "seek to 0; read N bytes via the chosen path" against a 64 KiB
-fixture (`/data/svctest/bench.bin`). The inline path chunks into ≤ 504-byte
-non-straddling reads; the memory-cap path always passes a full-page buffer
-so `want > 504` forces a memory-cap call. `cycles_now()` uses `rdtsc` on
-x86_64 and `csrr cycle` on riscv64. Numbers below are `cycles_mean`.
+Source: [programs/fsbench/README.md](../../../programs/fsbench/README.md), which owns the
+method. The bench loops 256 timed iterations of "seek to 0; read N bytes via the chosen
+path" against a 64 KiB fixture (`/data/svctest/bench.bin`); the per-path buffer sizes and
+cycle sources are in that README's
+[§ Method](../../../programs/fsbench/README.md#method). Numbers below are `cycles_mean`.
 
 **x86_64 (KVM-accelerated, TSC = hardware cycles)**
 
@@ -200,8 +215,8 @@ x86_64 and `csrr cycle` on riscv64. Numbers below are `cycles_mean`.
 | 16       | 1            | 61 426        | 1           | 123 139      |
 | 1 024    | 3            | 236 906       | 1           | 130 553      |
 | 4 096    | 9            | 938 019       | 1           | 244 221      |
-| 16 384   | 33           | 3 780 641     | 4           | 1 000 699    |
-| 65 536   | 130          | 15 347 991    | 16          | 3 987 730    |
+| 16 384   | 36           | 3 780 641     | 4           | 1 000 699    |
+| 65 536   | 144          | 15 347 991    | 16          | 3 987 730    |
 
 **riscv64 (TCG-emulated, `cycle` CSR via `scounteren.CY`)**
 
@@ -210,8 +225,8 @@ x86_64 and `csrr cycle` on riscv64. Numbers below are `cycles_mean`.
 | 16       | 1            | 548 333       | 1           | 1 232 195    |
 | 1 024    | 3            | 2 131 616     | 1           | 1 383 683    |
 | 4 096    | 9            | 8 205 397     | 1           | 2 389 154    |
-| 16 384   | 33           | 33 249 701    | 4           | 9 735 094    |
-| 65 536   | 130          | 134 748 016   | 16          | 39 159 872   |
+| 16 384   | 36           | 33 249 701    | 4           | 9 735 094    |
+| 65 536   | 144          | 134 748 016   | 16          | 39 159 872   |
 
 **Reading the table:** the single-call inline cost is consistently
 ≈ 0.5× the single-call memory-cap cost on both architectures. Once the
@@ -227,15 +242,22 @@ TCG (no KVM); the *ratio* between paths is what informs the policy.
 
 ## Label 8: `FS_RELEASE_MEMORY`
 
-Driver-to-client request to release a previously-returned Memory cap.
-Sent by the driver's eviction worker on the client's per-process
-release endpoint cap, recorded by the driver from `caps[0]` of the
-client's first [`FS_READ_MEMORY`](#label-7-fs_read_memory) for the
-file. Clients that delivered the SEND get the cooperative path; the
-driver waits up to 100 ms for [`FS_RELEASE_ACK`](#label-9-fs_release_ack)
-before falling through to a hard `cap_revoke` of the parent Memory
-cap. Clients that omitted the SEND (opt-out) skip straight to the
-hard-revoke path on every eviction. See
+Release of a previously-returned Memory cap, in either direction:
+driver-to-client for cooperative eviction, and client-to-driver for
+synchronous release after a read.
+
+### Driver-to-client release
+
+Sent by the driver's eviction worker on the per-process release
+endpoint cap recorded in the node's `OpenFile` slot, taken from
+`caps[0]` of the [`FS_READ_MEMORY`](#label-7-fs_read_memory) that
+allocated the slot (per-node sharing, a defect tracked in
+[#447](https://github.com/kottlerg/seraph/issues/447)). Clients that
+delivered the SEND get the cooperative path; the driver waits up to
+100 ms for [`FS_RELEASE_ACK`](#label-9-fs_release_ack) before falling
+through to a hard `cap_revoke` of the parent Memory cap. Clients that
+omitted the SEND (opt-out) skip straight to the hard-revoke path on
+every eviction. See
 [`runtime/ruststd/src/sys/fs/release_handler.rs`](../../../runtime/ruststd/src/sys/fs/release_handler.rs)
 for the receive-side state machine.
 
@@ -250,6 +272,31 @@ The client unmaps the matching Memory cap and replies with
 [`FS_RELEASE_ACK`](#label-9-fs_release_ack). If the client does not
 acknowledge within the cooperative-release watchdog window (100 ms),
 the driver `cap_revoke`s the parent Memory cap.
+
+### Client-to-driver release
+
+Sent by the client on the per-node badged cap the page was read
+through, once it has finished reading the page; the client then tears
+down its local mapping. No release endpoint and no
+[`FS_RELEASE_ACK`](#label-9-fs_release_ack) are involved.
+
+**Request**
+
+| Field | Value |
+|---|---|
+| `label` | `8` |
+| `data[0]` | Release cookie from the [`FS_READ_MEMORY`](#label-7-fs_read_memory) reply |
+
+The driver revokes every cap derived from the matching outstanding
+page's parent Memory cap, deletes that parent, and releases the
+page-cache slot.
+
+**Reply (success)**: `label = 0`, empty body. A cookie that matches
+no outstanding page on the node (including a node with no open-file
+slot) is a no-op success.
+
+**Reply (error)**: `label = fs_errors::PERMISSION_DENIED` when the
+badge carries no namespace rights.
 
 ---
 
@@ -271,9 +318,13 @@ driver's outstanding-memory-cap refcount decrements on receipt.
 
 Release driver-side bookkeeping bound to a node cap (the lazily-
 allocated per-`OpenFile` slot, outstanding `FS_READ_MEMORY` pages,
-the recorded release endpoint). The kernel-side cap is **not** freed
-here — the holder still `cap_delete`s its node cap to drop the
-kernel reference.
+the recorded release endpoint). The slot is per node and shared by
+every client of the file, so one client's `FS_CLOSE` revokes every
+client's outstanding pages on it (a defect, tracked in
+[#447](https://github.com/kottlerg/seraph/issues/447); see
+[`FS_READ_MEMORY`](#label-7-fs_read_memory)). The kernel-side cap is
+**not** freed here — the holder still `cap_delete`s its node cap to
+drop the kernel reference.
 
 **Request**
 
@@ -412,8 +463,11 @@ directory cap with `MUTATE_DIR`.
 
 Cross-directory rename is deferred: servers cannot introspect the
 badge packed in a received cap, so a second-directory cap cannot
-resolve to a `NodeId`. A future Issue may add a wire shape that
-conveys the destination directory's `NodeId` explicitly.
+resolve to a `NodeId`. Supporting it needs either a kernel-level
+`cap_info` selector that reports a cap's badge or a wire shape that
+conveys the destination directory's `NodeId` out-of-band (design
+intent; not yet implemented). Tracked as
+[Issue #89](https://github.com/kottlerg/seraph/issues/89).
 
 `FS_RENAME` is not atomic — see
 [`services/fs/fat/docs/crash-safety.md`](../fat/docs/crash-safety.md)
@@ -460,25 +514,30 @@ at this index" by reply label.
 
 ## Bootstrap caps
 
-A filesystem driver receives the following caps in its CSpace at
-two-phase process creation, identified by sentinel values in the
-`CapDescriptor.aux0` field:
+A filesystem driver obtains its service-specific caps in a single
+`ipc::bootstrap` round: at startup it calls
+`ipc::bootstrap::request_round` on its `creator_endpoint`, and vfsd
+replies with one round marked done, carrying two caps and zero data
+words:
 
-| Sentinel | Meaning |
+| Slot | Cap |
 |---|---|
-| `0xFFFF_FFFF_FFFF_FFFF` | Log endpoint |
-| `0xFFFF_FFFF_FFFF_FFFE` | Service endpoint (Receive-side) |
-| `0xFFFF_FFFF_FFFF_FFFD` | Block device endpoint (Send-side, partition-scoped) |
-| `0x0000_0000_0000_0000` (aux0 and aux1 both zero) | procmgr endpoint |
+| `caps[0]` | Block device endpoint (SEND, partition-scoped badge on virtio-blk) |
+| `caps[1]` | Driver service endpoint (all rights: receive and badge derivation) |
 
-All sentinels use `CapType::Memory` as the discriminant — the actual
-kernel object is an Endpoint, but the `CapType` field is overloaded
-for sentinel identification.
+A round with fewer than two caps, or not marked done, is a bootstrap
+failure and the driver exits. The log and procmgr endpoints are not
+part of this round; the driver takes them from `ProcessInfo` (exposed
+to `main` as `StartupInfo`), per
+[abi/process-abi/README.md](../../../abi/process-abi/README.md)
+§ ProcessInfo.
 
 The block device endpoint is partition-scoped: vfsd registers the
 partition bound with virtio-blk before delivering this cap, so the
 driver reads by partition-relative LBA and virtio-blk enforces the
 bound on every `BLK_READ_INTO_MEMORY`. See
+[`services/vfsd/docs/vfs-ipc-interface.md`](../../vfsd/docs/vfs-ipc-interface.md)
+§ Label 10: `MOUNT` for the registration step and
 [`services/drivers/virtio/blk/README.md`](../../drivers/virtio/blk/README.md).
 
 ---
@@ -497,5 +556,8 @@ bound on every `BLK_READ_INTO_MEMORY`. See
 
 ## Summarized By
 
+[Storage](../../../docs/storage.md),
+[programs/fsbench/README.md](../../../programs/fsbench/README.md),
 [services/fs/README.md](../README.md), [services/fs/fat/README.md](../fat/README.md),
-[docs/storage.md](../../../docs/storage.md)
+[services/vfsd/README.md](../../vfsd/README.md),
+[vfsd Service Interface](../../vfsd/docs/vfs-ipc-interface.md)

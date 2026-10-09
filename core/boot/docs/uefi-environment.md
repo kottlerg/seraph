@@ -35,7 +35,8 @@ GOP does not offer the target mode, the active mode is left unchanged.
 
 `EFI_CONFIGURATION_TABLE` entries are needed for firmware table parsing: on x86-64
 the ACPI `EFI_ACPI_20_TABLE_GUID` entry locates the RSDP; on RISC-V the
-`EFI_DTB_TABLE_GUID` entry locates the Device Tree blob.
+`EFI_DTB_TABLE_GUID` entry locates the Device Tree blob. The parsing itself is specified in
+[firmware-parsing.md](firmware-parsing.md).
 
 ---
 
@@ -59,7 +60,8 @@ The bootloader carries only two ESP path constants —
 `\EFI\seraph\kernel` and `\EFI\seraph\bootstrap.bundle` — both
 hardcoded in [`boot/src/main.rs`](../src/main.rs). There is no on-disk
 boot configuration file; the bundle is the single composed artifact
-that carries init plus every userspace module the system needs. The
+that carries init plus every userspace module the system needs (see
+[elf-loading.md](elf-loading.md) for how its entries are loaded). The
 bundle format itself is specified in
 [`abi/boot-protocol/src/bundle.rs`](../../../abi/boot-protocol/src/bundle.rs).
 
@@ -76,16 +78,16 @@ segments, boot-module buffers, page-table frames, the `BootInfo` structure, the
 `MmioAperture` array, the memory map buffer, and the `MemoryMapEntry` array. The kernel
 image is placed as one contiguous span and its base recorded in
 `BootInfo.kernel_physical_base`, so kernel placement tolerates any firmware memory
-layout.
+layout; see [elf-loading.md](elf-loading.md) for the placement sequence.
 
 **`AllocateMaxAddress`** — the firmware selects a free range with a physical base at or
 below a bound. Used only by the x86-64 AP-startup trampoline, whose SIPI vector must
-reside below 1 MiB.
+reside below 1 MiB; see [boot-flow.md](boot-flow.md) for the trampoline-page step.
 
 All allocation uses memory type `EfiLoaderData`. UEFI memory map entries for
 `EfiLoaderData` regions translate to `MemoryType::Loaded` in the boot protocol,
 notifying to the kernel that these regions are in use and must not be reused until
-explicitly reclaimed.
+explicitly reclaimed; [memory-map.md](memory-map.md) owns the full translation policy.
 
 There is no deallocation path before `ExitBootServices`. Memory is allocated once
 and used; the bootloader does not implement a heap. UEFI boot services terminate
@@ -234,4 +236,5 @@ message, are emitted after the exit call.
 
 ## Summarized By
 
-[boot/README.md](../README.md)
+[core/boot/README.md](../README.md), [Boot Flow](boot-flow.md), [Early Console](console.md),
+[ELF Loading](elf-loading.md), [Memory Map Translation](memory-map.md)

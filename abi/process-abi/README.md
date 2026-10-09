@@ -69,7 +69,8 @@ field groups rather than mirroring every field, so the two cannot drift. As of
   ABI constants.
 - **Demand-paging pager** (v18, #34; default-on v19, #225) — `pager_endpoint_cap`,
   `pager_badge`. The `Endpoint` cap + badge of the process's pager (memmgr).
-  Demand paging is the system-wide default, so these are nonzero for ordinary
+  Demand paging is the system-wide default (see
+  [docs/fault-handling.md](../../docs/fault-handling.md)), so these are nonzero for ordinary
   processes and zero only for pinned ones (`procmgr_labels::CREATE_PINNED`, e.g.
   DMA drivers) and the pre-pager bootstrap. procmgr binds the main thread's fault
   handler to this endpoint at creation, and the runtime inherits it onto every
@@ -87,7 +88,7 @@ protocol on `creator_endpoint_cap`, not through `ProcessInfo`.
 
 | Slot | Content |
 |---|---|
-| 0 | Null (permanently invalid, per capability model) |
+| 0 | Null (permanently invalid, per [capability model](../../docs/capability-model.md)) |
 | `self_thread_cap` | Thread capability (Control) |
 | `self_aspace_cap` | AddressSpace capability |
 | `self_cspace_cap` | CSpace capability |
@@ -138,18 +139,18 @@ safety net.
 `_start()` is provided by three distinct runtimes, chosen by build profile:
 
 - **std-built services** — `std::os::seraph::_start` (shipped via the
-  `ruststd/` overlay) takes the `ProcessInfo` page address as its argument
-  (entry register), reads `ProcessInfo`, registers the IPC buffer,
+  [`ruststd/`](../../runtime/ruststd/README.md) overlay) takes the `ProcessInfo` page
+  address as its argument (entry register), reads `ProcessInfo`, registers the IPC buffer,
   bootstraps the heap against the `memmgr_endpoint` delivered in
   `ProcessInfo`, then jumps to `lang_start` → user `fn main`. procmgr
   is itself a std-built service and follows this path.
-- **memmgr** — bespoke `core`-only `_start` and panic handler. memmgr
-  cannot heap-bootstrap against itself (it owns the frame pool) and
-  uses no `alloc` collections. It is the only std-less process spawned
-  by init via raw syscalls besides init itself.
+- **[memmgr](../../services/memmgr/README.md)** — bespoke `core`-only `_start` and panic
+  handler. memmgr cannot heap-bootstrap against itself (it owns the frame pool) and
+  uses no `alloc` collections. It is the only std-less process init spawns via raw
+  syscalls.
 - **init / ktest** — bespoke `_start` entries that consume `InitInfo`
-  (defined in `abi/init-protocol`) rather than `ProcessInfo`, because the
-  kernel — not procmgr — is their producer. The kernel chooses the
+  (defined in [`abi/init-protocol`](../init-protocol/README.md)) rather than `ProcessInfo`,
+  because the kernel — not procmgr — is their producer. The kernel chooses the
   `InitInfo` page address and delivers it in the entry register, as procmgr
   does for `ProcessInfo`.
 
@@ -171,9 +172,9 @@ happen).
 | Contains parent endpoint | No (init has no parent) | Yes |
 | `main()` signature | Same (`&StartupInfo`) | Same (`&StartupInfo`) |
 
-Init-protocol is a kernel-internal concern — it carries the full initial CSpace
-layout including platform resources that only init needs. Process-abi carries
-only what a single service or application requires.
+[Init-protocol](../init-protocol/README.md) is the kernel-to-init contract: it carries the
+full initial CSpace layout, including platform resources only init needs. Process-abi
+carries only what a single service or application requires.
 
 The `CapDescriptor` type SHOULD be shared between the two crates (via a common
 dependency or identical definition) to avoid divergence.
@@ -233,6 +234,7 @@ they are always compiled together with the consuming binary.
 | [docs/ipc-design.md](../../docs/ipc-design.md) | IPC buffer, message format, endpoints |
 | [docs/architecture.md](../../docs/architecture.md) | Bootstrap sequence, memmgr/procmgr roles |
 | [docs/process-lifecycle.md](../../docs/process-lifecycle.md) | Userspace boot order, ProcessInfo handover, memmgr/procmgr authority split |
+| [docs/fault-handling.md](../../docs/fault-handling.md) | Demand-paging default, pager binding, CREATE_PINNED exemption |
 | [abi/init-protocol](../init-protocol/README.md) | Kernel-to-init handover contract |
 | [services/memmgr/README.md](../../services/memmgr/README.md) | Producer of `memmgr_endpoint_cap` (via procmgr-issued REGISTER_PROCESS) |
 
@@ -240,4 +242,10 @@ they are always compiled together with the consuming binary.
 
 ## Summarized By
 
-[process-layout/README.md](../../shared/process-layout/README.md)
+[Process Lifecycle](../../docs/process-lifecycle.md),
+[Userspace Memory Model](../../docs/userspace-memory-model.md),
+[Filesystem Driver Protocol](../../services/fs/docs/fs-driver-protocol.md),
+[services/procmgr/README.md](../../services/procmgr/README.md),
+[svcmgr IPC Interface](../../services/svcmgr/docs/ipc-interface.md),
+[shared/process-layout/README.md](../../shared/process-layout/README.md),
+[shared/registry-client/README.md](../../shared/registry-client/README.md)

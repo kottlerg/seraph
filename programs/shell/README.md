@@ -11,12 +11,27 @@ The terminal renders no prompt, so the shell owns the `$ ` prompt.
 
 ---
 
+## Source Layout
+
+```
+shell/
+├── Cargo.toml
+├── README.md
+├── src/main.rs                 # REPL, built-ins, external-command relay
+├── path/                       # `shell-path` crate: pure host-tested lexical
+│                               # path resolution
+└── tester/                     # `shell-tester` crate: per-program tester
+                                # (docs/testing.md § Per-program tester protocol)
+```
+
+---
+
 ## v0.0.1 scope
 
 - **Prompt**: `$ ` written (and flushed) before each line is read.
 - **Built-ins**:
   - `help` — list the built-ins.
-  - `exit` — exit the shell (the terminal respawns it).
+  - `exit` — exit the shell (the [terminal](../terminal/README.md) respawns it).
   - `echo <args...>` — print the arguments separated by single spaces.
   - `pwd` — print the working directory.
   - `cd <path>` — change directory.
@@ -48,17 +63,15 @@ blocked stdin read cannot be cancelled, so a child that never reads stdin (e.g.
 
 ### Placement relative to a real shell
 
-The shell occupies bash's *role* — the interactive REPL child of the terminal
-that spawns and reaps its own children — but over a different I/O substrate. A
-Unix shell does **not** relay stdin: the shell and its children share one kernel
-TTY, and the kernel routes input to the foreground process group (job control).
-Seraph has no shared tty and no job control yet ([#29]); the terminal relays to
-exactly one pipe (the shell's stdin) and is oblivious to grandchildren. So the
-shell forwarding stdin to its child is the *interim* substitute for the
-shared-tty / foreground-group model — not a bash-faithful mechanism. The
-Unix-faithful design (the terminal re-pointing input at the foreground
-grandchild) is [#29] job control, deliberately deferred. Layering
-(shell → `ruststd` → IPC) mirrors shell → libc → syscalls; the shell holds no
+The shell occupies bash's *role* — the interactive REPL child of the terminal that spawns and reaps
+its own children — but over a different I/O substrate. A Unix shell does **not** relay stdin: the
+shell and its children share one kernel TTY, and the kernel routes input to the foreground process
+group (job control). Seraph has no shared tty and no job control yet ([#29]); the
+[terminal](../terminal/README.md) relays to exactly one pipe (the shell's stdin) and is oblivious to
+grandchildren. So the shell forwarding stdin to its child is the *interim* substitute for the
+shared-tty / foreground-group model — not a bash-faithful mechanism. The Unix-faithful design (the
+terminal re-pointing input at the foreground grandchild) is [#29] job control, deliberately
+deferred. Layering (shell → `ruststd` → IPC) mirrors shell → libc → syscalls; the shell holds no
 capabilities of its own.
 
 ## Known limitations
@@ -79,7 +92,7 @@ capabilities of its own.
 
 ## Testing
 
-Tier-3 per-program tester at `tester/` (crate `shell-tester`), installed to
+Per-program tester at `tester/` (crate `shell-tester`), installed to
 `/tests/programs/shell` and run by the `usertest` orchestrator. It drives the
 shell over piped stdio across two invocations — built-ins plus an external
 `/programs/hello` spawn, and an `/programs/stdiotest` run fed one line to prove
@@ -102,4 +115,4 @@ path (the `$ ` prompt rendered via the terminal) is covered by
 
 ## Summarized By
 
-None
+[programs/stdiotest/README.md](../stdiotest/README.md)

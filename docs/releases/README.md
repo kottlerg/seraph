@@ -26,8 +26,9 @@ tag's release notes.
 
 - The notes file MUST exist at the tagged commit. The release workflow's
   `preflight` job aborts the run before any image is built if the file is
-  missing or does not follow `TEMPLATE.md`'s structure; the publish step
-  re-checks existence before `gh release create --notes-file`.
+  missing or lacks any of `TEMPLATE.md`'s `##` section headings as a whole
+  line; the publish step re-checks existence before
+  `gh release create --notes-file`.
 - New release notes MUST be authored by copying `TEMPLATE.md` and filling
   every section. Non-template structure introduces inconsistency across
   releases.
@@ -37,17 +38,19 @@ tag's release notes.
 ## Workflow Integration
 
 The release workflow at `.github/workflows/release.yml` is the sole
-mechanism for creating GitHub Releases. It triggers on tag push matching
-`v*.*.*`. A `preflight` job first verifies that the workspace version in
-the root `Cargo.toml` matches the tag and that `docs/releases/<tag>.md`
-exists and follows `TEMPLATE.md`'s structure. The workflow then builds
-release-profile disk images for every supported architecture, compresses
-them with `zstd -19`, and creates a draft Release whose body is the
-contents of `docs/releases/<tag>.md`.
+mechanism for creating GitHub Releases. Its triggers and jobs are defined in
+[build-system.md](../build-system.md#continuous-integration): it runs on tag
+push matching `v*.*.*`, or on manual dispatch against such a tag ref (its
+jobs refuse branch refs). A `preflight` job first verifies that the
+workspace version matches the tag and that the notes file passes the check
+in [§ Source of Truth](#source-of-truth). The workflow then builds
+release-profile disk images per architecture, compresses them with zstd,
+generates `SHA256SUMS`, and creates a draft GitHub Release whose body is
+`docs/releases/<tag>.md`.
 
 The draft is published manually by the maintainer after verifying the
 burn-in workflow at `.github/workflows/burnin.yml` completed successfully
-on the same tag.
+on the same tag (per [conventions.md](../conventions.md#release-production)).
 
 ## Post-Publish Edits
 
@@ -71,5 +74,5 @@ are immutable; the title, body, and asset list are mutable.
 
 ## Summarized By
 
-[README.md](../../README.md), [conventions.md](../conventions.md),
-[build-system.md](../build-system.md)
+[Build System](../build-system.md), [Project Conventions](../conventions.md),
+[Documentation Standards](../documentation-standards.md)

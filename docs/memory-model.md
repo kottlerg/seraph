@@ -49,26 +49,28 @@ Kernel space is divided into regions:
 ```
 
 The physical memory direct map gives the kernel a virtual address for every physical
-page. Large pages (2 MiB) are used where alignment allows.
+page. The RAM portion is mapped with 2 MiB large pages; a framebuffer or kernel MMIO
+region above the RAM ceiling gets 4 KiB pages.
 
 Both the kernel image base and the direct-map base are randomized at boot behind
 the boot-entropy source (KASLR,
 [#252](https://github.com/kottlerg/seraph/issues/252)): the image slides within
 the top 2 GiB at 2 MiB granularity, and the direct map is placed at a 1 GiB-aligned
-base at or above the kernel-half floor, below the image. With no boot entropy the
-layout falls back to the fixed defaults shown above. Exact region boundaries are an
+base at or above the kernel-half floor, below the image. With no boot entropy, or with
+the bootloader's `nokaslr` override knob present, the layout falls back to the fixed
+defaults shown above. Exact region boundaries are an
 implementation detail, not ABI.
 
 ### RISC-V (Sv39 / Sv48 / Sv57)
 
-RISC-V supports three address-translation modes on this port, negotiated at
-boot: the bootloader reads the DTB `mmu-type` claim, confirms it with a
-`satp` write-probe (falling back mode by mode), and the kernel recovers the
-active mode from `satp` at entry. Sv39 is the RVA23 platform minimum, Sv48
-the standing default (aligning with x86-64's address-space size), Sv57 a
-wider expansion ([platform-requirements.md](platform-requirements.md)). One
-kernel binary supports all three; every VA-layout constant that varies with
-the mode is derived from it at runtime.
+RISC-V supports three address-translation modes on this port, negotiated at boot by the bootloader
+([core/boot/docs/page-tables.md](../core/boot/docs/page-tables.md) § Mode negotiation); the kernel
+recovers the active mode from `satp` at entry. Sv39 is the RVA23 platform minimum, Sv48 the standing
+default in CI and development (`cargo xtask` caps the QEMU guest at Sv48 by default, aligning with
+x86-64's address-space size; its `--riscv-mmu` flag selects another mode, per
+[xtask/README.md](../xtask/README.md)), Sv57 a wider expansion
+([platform-requirements.md](platform-requirements.md)). One kernel binary supports all three; every
+VA-layout constant that varies with the mode is derived from it at runtime.
 
 Each mode mirrors the x86-64 structure — a canonical split with userspace in
 the lower half and the kernel in the upper half, whose base is root page-table
@@ -85,8 +87,10 @@ entry 256 in every mode:
 The physical direct map is placed at a 1 GiB-aligned base at or above the active
 mode's kernel-half base (randomized per boot, KASLR); the kernel image slides
 within the top 2 GiB, canonical in every mode. Under Sv39 the kernel half is
-256 GiB total, capping direct-mappable RAM at 254 GiB — the kernel refuses to boot
-beyond that rather than overlap the image mapping, and a near-full Sv39 half narrows
+256 GiB total, so the direct map cannot exceed 254 GiB without overlapping the image
+window, and the kernel refuses to boot rather than overlap (the Phase-3 boot page-table
+pool, `BOOT_TABLE_POOL_SIZE`, independently limits direct-mapped RAM to about 248 GiB in
+every mode); a near-full Sv39 half narrows
 the direct-map randomization window (falling back to the kernel-half floor when
 fewer than two 1 GiB slots remain).
 All fixed userspace-layout zones sit below 2^38, the smallest user half, so
@@ -95,28 +99,30 @@ one static userspace layout is canonical in every mode
 
 ### Userspace Layout
 
-Each process address space begins empty. The program loader (running in userspace)
-maps segments as directed by the binary format. The general convention is:
+Each process address space begins empty. The process creator (the kernel for init,
+init for memmgr and procmgr, procmgr for everything else) maps segments as directed by
+the binary format. The general convention is:
 
 ```
-  (user VA ceiling)  ┐
-                     │  Stack (grows downward)
-                     │  (guard page below stack)
-                     │
-                     │  Shared mappings / mmap region
-                     │
-                     │  Heap (grows upward)
-  (low VA)           ┘  Program image (text, rodata, data, bss)
+  2^38 (layout ceiling) ┐
+                        │  Program image (PIE load-bias window)
+                        │  Main-thread stack (guard page below), handover page,
+                        │    IPC buffer, main-thread TLS
+                        │  Page-reservation arena (foreign mappings)
+                        │  Byte heap (grows upward)
+  (low VA)              ┘
 ```
 
-The diagram shows the ordering convention only: each region's base is
-randomised per process within a fixed window (ASLR,
-[#39](https://github.com/kottlerg/seraph/issues/39)). Concrete VA management
-surfaces, the per-region randomisation windows, the frame-allocation
+The diagram shows the ordering convention only: each region's base is randomised per
+process within a fixed window (ASLR, [#39](https://github.com/kottlerg/seraph/issues/39)).
+When an entropy draw fails, the byte heap, the page-reservation arena, and the program image
+fall back to their window bases, while the bootstrap VAs fall back to fixed `DEFAULT_*`
+addresses above the image window, so the ordering above does not hold for them (see
+[userspace-memory-model.md](userspace-memory-model.md) § Bootstrap Cross-Boundary VAs).
+Concrete VA management surfaces, the per-region randomisation windows, the frame-allocation
 contract, and ownership boundaries between the kernel, memmgr, procmgr, and
-`std::sys::seraph` are documented in
-[userspace-memory-model.md](userspace-memory-model.md). The userspace boot
-order and the process-creation/death flow are in
+`std::sys::seraph` are documented in [userspace-memory-model.md](userspace-memory-model.md).
+The userspace boot order and the process-creation/death flow are in
 [process-lifecycle.md](process-lifecycle.md).
 
 ---
@@ -129,20 +135,21 @@ The base page size is 4 KiB on both architectures. The kernel direct map is buil
 from 2 MiB large pages (x86-64) / megapages (RISC-V); the randomized direct-map base
 is 1 GiB-aligned, which preserves the 2 MiB VA≡PA congruence these leaves require and
 reserves the natural granule for a future 1 GiB gigapage direct map (not used today).
-Large pages are also used for large contiguous device mappings.
 
 Userspace mappings use 4 KiB pages by default. Large page support for userspace is
 a future optimisation. On RISC-V, uncacheable (MMIO) user mappings additionally use
 the Svnapot 64 KiB contiguity hint where a mapping produces an eligible aligned,
 physically-contiguous group of 4 KiB leaves — a TLB-reach optimisation that keeps
-4 KiB granularity at the API (see the kernel memory-internals document).
+4 KiB granularity at the API (see
+[memory-internals.md](../core/kernel/docs/memory-internals.md) § NAPOT Contiguity (RISC-V)).
 
 ### W^X Enforcement
 
-No page is simultaneously writable and executable. This is enforced at the page table
-level using the NX bit (x86-64) and the equivalent execute permission control on
-RISC-V. The kernel image itself follows W^X: text is executable but not writable;
-data is writable but not executable.
+No page is simultaneously writable and executable, with one boot-time exception: the AP
+trampoline page is identity-mapped read/write/execute from Phase 3 until SMP bringup
+retires it in Phase 8. This is enforced at the page table level using the NX bit (x86-64)
+and the equivalent execute permission control on RISC-V. The kernel image itself follows
+W^X: text is executable but not writable; data is writable but not executable.
 
 On x86-64, kernel-side W^X additionally depends on `CR0.WP` (supervisor write-protect);
 without it a ring-0 write would bypass a read-only page permission. `CR0.WP` is required by
@@ -154,9 +161,10 @@ Address-space tags (x86-64 PCID, RISC-V ASID) are required by the platform basel
 ([platform-requirements.md](platform-requirements.md)). The kernel assigns a tag per address space
 so a context switch loads the outgoing space's page-table root **without** flushing the TLB —
 cached translations survive across switches. A switch between threads that share an address space
-requires no TLB operation either way. On RISC-V a hart without ASID support is refused at boot; on
-x86-64 the kernel retains a full-flush fallback for emulated environments that do not implement
-PCID.
+requires no TLB operation either way. On RISC-V a hart with a zero-width ASID field is refused at
+boot. On both architectures the kernel keeps a full-flush fallback, used on x86-64 where PCID is
+absent (emulated environments) and wherever the tag field is too narrow to provide more usable
+tags than CPUs.
 
 Eliding the per-switch flush requires keeping tagged entries coherent without it. Two
 generation counters do this:
@@ -167,10 +175,10 @@ generation counters do this:
   is the cross-CPU invalidation-before-reissue guarantee, so a finite tag pool can be
   recycled safely — on exhaustion the least-recently-claimed tag whose owner is not active
   on any CPU is evicted.
-- Each address space carries a TLB generation bumped on every unmap or permission
-  narrowing. A CPU that was switched away when the change happened flushes the tag on its
-  next reactivation if its synced generation lags; CPUs currently running the space are
-  reached directly by the SMP shootdown.
+- Each address space carries a TLB generation bumped on every unmap, remap to a different
+  frame, or permission narrowing. A CPU that was switched away when the change happened
+  flushes the tag on its next reactivation if its synced generation lags; CPUs currently
+  running the space are reached directly by the SMP shootdown.
 
 Tag 0 is reserved for the kernel/idle context and the full-flush fallback and is never
 assigned to a user space. Single-address invalidation after a mapping change uses `invlpg`
@@ -180,8 +188,10 @@ spaces still invalidates the right translation. Multi-page range invalidation ba
 per-address invalidations: on RISC-V the Svinval sequence (`sfence.w.inval`, a `sinval.vma`
 per page, `sfence.inval.ir`) pays the fence cost once per batch; on x86-64 the same surface
 degenerates to an `invlpg` loop. Spans larger than a small ceiling fall back to a full
-flush, which is cheaper than per-page invalidation at that size. Cross-CPU invalidation
-uses the SMP shootdown protocol described in the kernel memory-internals document.
+flush, which is cheaper than per-page invalidation at that size (see
+[memory-internals.md](../core/kernel/docs/memory-internals.md) § TLB Management). Cross-CPU
+invalidation uses the SMP shootdown protocol described in
+[memory-internals.md](../core/kernel/docs/memory-internals.md) § SMP TLB Shootdown.
 
 The `CAP_INFO_TLB_ELIDED` / `CAP_INFO_TLB_PERFORMED` `cap_info` selectors expose system-wide
 counts of context switches that elided versus performed the flush — the
@@ -196,8 +206,10 @@ prevents the kernel from executing userspace pages; SMAP prevents the kernel fro
 writing userspace memory except through designated safe copy routines. Together these
 mitigate a class of privilege escalation exploits.
 
-RISC-V enforces equivalent isolation through the PMP (Physical Memory Protection)
-unit and the `SUM` bit in `sstatus`, which controls supervisor access to user pages.
+On RISC-V, S-mode can never execute from user (U=1) pages, and the kernel keeps
+`sstatus.SUM` clear except inside its user-copy routines, so supervisor loads and stores
+to user pages fault. PMP is established by M-mode firmware and protects firmware memory,
+not user pages.
 
 ---
 
@@ -206,10 +218,11 @@ unit and the `SUM` bit in `sstatus`, which controls supervisor access to user pa
 ### Boot-Time Memory Map
 
 At boot, the bootloader provides a memory map via the `BootInfo` structure
-(see [`abi/boot-protocol/`](../abi/boot-protocol/)) describing which physical address ranges
-are usable RAM, reserved, or used by firmware. The kernel parses this map during early
-initialisation before the frame allocator is active. Memory used by the kernel image,
-boot modules, and reserved regions is marked unavailable.
+(see [abi/boot-protocol/README.md](../abi/boot-protocol/README.md); type classification in
+[core/boot/docs/memory-map.md](../core/boot/docs/memory-map.md)) describing which physical
+address ranges are usable RAM, reserved, or used by firmware. The kernel parses this map and
+populates the buddy allocator in Phase 2, excluding the frames the boot payload occupies; see
+[initialization.md](../core/kernel/docs/initialization.md) § Phase 2.
 
 ### Bootloader Scratch Reclamation
 
@@ -218,7 +231,7 @@ Pages the bootloader allocated for its own scratch use are recorded in
 init's CSpace by the kernel-initialisation reclaim-minting steps. See
 [`core/kernel/docs/initialization.md`](../core/kernel/docs/initialization.md)
 Phase 7 (standard reclaim mint) and Phase 8 (`RECLAIM_FLAG_LATE`
-late-mint for the AP SIPI trampoline page) for the authoritative
+late-mint for the AP trampoline page) for the authoritative
 mechanism.
 
 ### Buddy Allocator
@@ -230,15 +243,18 @@ adjacent "buddy" block if that buddy is also free, recursively coalescing up to 
 maximum order.
 
 Properties:
-- O(log n) allocation and deallocation
+- Allocation and coalescing bounded by `MAX_ORDER` levels (per-level cost in
+  [memory-internals.md](../core/kernel/docs/memory-internals.md) § Allocation and
+  Deallocation Properties)
 - Bounded external fragmentation
 - Internal fragmentation bounded at 50%
 
 The allocator manages a single zone covering all usable RAM. Physical-address-range
 constraints (e.g. DMA-accessible memory below a certain physical address) are not a
-kernel concern: DMA isolation and placement are handled in userspace by devmgr and
-the memory authority (see [architecture.md](architecture.md) and
-[device-management.md](device-management.md)).
+kernel concern: DMA placement and isolation belong to devmgr and the memory authority
+in userspace (see [architecture.md](architecture.md)). IOMMU-based DMA isolation
+by devmgr is design intent; not yet implemented, so DMA currently runs unconfined
+(see [device-management.md](device-management.md) § DMA Safety Model).
 
 Physical frame 0 (the zero page) is excluded from the allocator. The page-table and
 CSpace growth pools use a physical address of 0 as their free-list "empty" sentinel,
@@ -259,14 +275,16 @@ the caller. This applies inside the kernel as well as in userspace allocation pa
 The kernel has no heap: it runs no `GlobalAlloc`, and every kernel object —
 capability slot pages, thread control blocks, IPC endpoints and notifications,
 event queues, wait sets, address spaces, CSpaces — is carved out of a Memory
-capability by retype and returned to it when the object's last capability is
-deleted; see [capability-model.md](capability-model.md) § Auto-reclaim. The
+capability by retype and returned to it when the object's reference count
+reaches zero (its capabilities and every kernel-internal reference released); see
+[capability-model.md](capability-model.md) § Auto-reclaim. The
 kernel's own objects come from the SEED reserve pinned at the Phase 7
 handoff, after which the buddy is sealed and every page of RAM is either a
-bounded fixed kernel reserve or a userspace Memory capability; the reserves
-and their order are in
-[initialization.md](../core/kernel/docs/initialization.md) § Phase 4 and
-§ Phase 7.
+bounded fixed kernel reserve or a userspace Memory capability. The reserves
+are the Phase 4 per-CPU storage, the Phase 5 per-CPU tag-state slab, and the
+Phase 7 contributors, in the order
+[initialization.md](../core/kernel/docs/initialization.md) § Phase 4,
+§ Phase 5, and § Phase 7 give.
 
 Address spaces and CSpaces additionally own a pool that their page tables or
 slot pages come from, carved from a Memory capability with the object and grown
@@ -282,8 +300,11 @@ Retype and pool allocation MUST be handled as fallible at every call site.
 
 ## Summarized By
 
-[README.md](../README.md), [Architecture Overview](architecture.md),
-[xtask/README.md](../xtask/README.md),
+[abi/boot-protocol/README.md](../abi/boot-protocol/README.md),
+[ELF Loading](../core/boot/docs/elf-loading.md), [Page Tables](../core/boot/docs/page-tables.md),
+[Architecture Abstraction Layer](../core/kernel/docs/arch-interface.md),
+[Kernel Cross-Boundary Disclosure Inventory](../core/kernel/docs/cross-boundary-disclosure.md),
+[Kernel Initialization Sequence](../core/kernel/docs/initialization.md),
 [Memory Subsystem Internals](../core/kernel/docs/memory-internals.md),
-[kernel/README.md](../core/kernel/README.md), [boot/README.md](../core/boot/README.md),
-[Platform Requirements](platform-requirements.md)
+[Architecture Overview](architecture.md), [Platform Requirements](platform-requirements.md),
+[xtask/README.md](../xtask/README.md)

@@ -19,16 +19,18 @@ For all subsequent processes, procmgr is the chooser: it calls
 `REGISTER_PROCESS` (below) before spawning a child, receives a badged
 SEND cap on memmgr's endpoint, and installs that cap into the child's
 `ProcessInfo.memmgr_endpoint_cap`. The child's std heap-bootstrap path
-calls `REQUEST_MEMORY_CAPS` on it with no further setup.
+calls `REQUEST_MEMORY_CAPS` on it with no further setup. See
+[docs/process-lifecycle.md](../../../docs/process-lifecycle.md) §"Steady-State Process Creation".
 
 ---
 
 ## Badge Discipline
 
 Every memmgr-callable message arrives over a badged endpoint cap. The
-badge is the procmgr-minted process identity established at
-`REGISTER_PROCESS`; memmgr uses it to key the per-process tracking table
-(see [`memory-pool.md`](memory-pool.md) §"Per-Process Tracking").
+badge is the process identity memmgr mints at procmgr's `REGISTER_PROCESS`,
+or, for procmgr itself, the bootstrap badge init mints and passes in
+memmgr's bootstrap round; memmgr uses it to key the per-process tracking
+table (see [`memory-pool.md`](memory-pool.md) §"Per-Process Tracking").
 
 Two privilege classes:
 
@@ -37,22 +39,37 @@ Two privilege classes:
   to procmgr at procmgr's bootstrap round. memmgr identifies this cap by
   badge and rejects procmgr-only calls received over any other badged cap.
 - **Universal** labels (`REQUEST_MEMORY_CAPS`, `RELEASE_MEMORY_CAPS`,
-  `REGISTER_REGION`, `UNREGISTER_REGION`) are callable over any badged cap,
-  including those memmgr returned from `REGISTER_PROCESS`. `REGISTER_REGION`
-  and `UNREGISTER_REGION` are attributed to the caller by its own badge.
+  `DONATE_MEMORY_CAPS`, `QUERY_POOL_STATUS`, `REGISTER_REGION`,
+  `UNREGISTER_REGION`) are callable over any badged cap, including those
+  memmgr returned from `REGISTER_PROCESS`. `REGISTER_REGION` and
+  `UNREGISTER_REGION` are attributed to the caller by its own badge.
 
-Badges cannot be forged: they are minted by `cap_derive_badge` only
+The badge on an ordinary IPC message is the badge of the sender's cap,
+and it cannot be forged: badges are minted by `cap_derive_badge` only
 under the kernel's derivation rules, and procmgr is the only process
-that holds memmgr's procmgr-only cap.
+that holds memmgr's procmgr-only cap. See
+[docs/capability-model.md](../../../docs/capability-model.md) §"Badges".
+The fault-message badge is the exception, covered below.
 
 A third, kernel-origin class is the **fault message**: when a demand-paged
-process's thread takes a page fault, the kernel (not a userspace caller)
-synthesises an IPC to memmgr's endpoint with label `FAULT_LABEL`
-(`u64::MAX - 1`) and `badge` set to the faulting process's memmgr badge.
-Userspace cannot forge it — no SEND cap to the fault delivery is
-distributed; the binding is installed by procmgr via
-`SYS_THREAD_SET_FAULT_HANDLER` and the kernel owns the send. See
-[docs/fault-handling.md](../../../docs/fault-handling.md).
+process's thread takes a page fault, the kernel synthesises an IPC to
+memmgr's endpoint with label `FAULT_LABEL` (`u64::MAX - 1`) and `badge`
+set to the value bound by `SYS_THREAD_SET_FAULT_HANDLER`. The binding is
+installed by procmgr for a process's main thread and by the runtime for
+each thread it spawns, and both set the badge to the process's memmgr
+badge. The fault endpoint is memmgr's client endpoint, so any holder of a
+badged SEND cap can also send a message labelled `FAULT_LABEL`; memmgr
+does not distinguish it from a kernel delivery, but such a message
+carries the badge of the sender's own cap, so it is attributed to the
+sender. The fault badge is whatever value the binder passes, and any
+client holding a cap to this endpoint can also bind its own thread's
+fault handler to it with an arbitrary badge (see
+[docs/fault-handling.md](../../../docs/fault-handling.md) §"Security").
+memmgr's attribution of a fault to a process therefore rests on its
+process badges being unguessable, not unforgeable: a client that learns
+another process's badge can bind its own thread with that badge and, by
+faulting, direct memmgr to back any chunk of the regions that process
+registered (one chunk per forged fault).
 
 ---
 
@@ -100,8 +117,9 @@ The `phys_base_for_cap_i` field is the host physical address of the
 first page of the i-th returned cap. It is what DMA-issuing drivers
 program into device transports (VirtIO PCI rings, e.g.). DMA isolation,
 when present, is established through devmgr-managed IOMMU policy
-outside the kernel surface; memmgr exposes only the addresses, not the
-isolation policy.
+outside the kernel surface (see
+[docs/device-management.md](../../../docs/device-management.md) §"DMA Safety Model");
+memmgr exposes only the addresses, not the isolation policy.
 
 There is no fixed ceiling on `returned_cap_count` other than the IPC
 reply-side cap-slot limit (see [`docs/ipc-design.md`](../../../docs/ipc-design.md)).
@@ -169,7 +187,8 @@ Bases that match no outstanding grant are ignored — release is idempotent,
 so a racing double-release (join plus reaper) is harmless. The caller MUST
 have already deleted every kernel object retyped from the region; releasing
 a region with a live retype is correctness-safe (the kernel refuses to
-re-hand-out live bytes) but strands the run until that retype is freed.
+re-hand-out live bytes) but strands the run until that retype is freed. See
+[`memory-pool.md`](memory-pool.md) §"Reclamation".
 
 ### Label 3: `REGISTER_PROCESS`
 
@@ -218,7 +237,8 @@ the eventual `PROCESS_DIED`.
 
 Procmgr signals process death. memmgr looks up the per-process tracking
 entry by badge, reclaims every Memory cap memmgr has issued to that
-process, and runs coalescing. Privilege: procmgr-only.
+process, and runs coalescing (see [`memory-pool.md`](memory-pool.md) §"Reclamation").
+Privilege: procmgr-only.
 
 **Request:**
 
@@ -254,6 +274,44 @@ IPC. Idempotent on stale badges (already-reaped or never-registered).
 
 `PROCESS_DIED` for an unknown badge is not an error — memmgr returns
 success. Reclamation is idempotent.
+
+### Label 5: `DONATE_MEMORY_CAPS`
+
+Permanently transfer Memory caps into memmgr's pool. Privilege: universal —
+memmgr accepts the label from any badged client. A client can donate a
+derivation of a Memory cap memmgr already granted it, which aliases those
+frames into the pool while the client still holds them; this defect is
+tracked in [#459](https://github.com/kottlerg/seraph/issues/459), which
+makes the label procmgr-only. Used by procmgr's init reap to hand over
+init's reclaimed memory: the usable-RAM caps that did not fit memmgr's
+bootstrap round, the free remainders `MemoryAlloc` abandoned, ELF segments,
+`InitInfo`, stack, the bootloader/bundle reclaim ranges, the AP-trampoline
+frame, and boot-module ELF sources. See
+[docs/process-lifecycle.md](../../../docs/process-lifecycle.md#init-reap) §"Init reap".
+
+**Request:**
+
+| Field | Value |
+|---|---|
+| label | 5 |
+| cap[..] | Memory caps to donate; each MUST carry WRITE, EXECUTE, and RETYPE rights |
+
+**Reply (success):**
+
+| Field | Value |
+|---|---|
+| label | 0 (success) |
+| data[0] | `accepted_caps` — number of transferred caps memmgr accepted |
+| data[1] | `accepted_pages` — total pages across the accepted caps |
+| data[2] | `pool_total_pages` — memmgr's owned page count after the donation |
+
+The reply is always success. memmgr validates each cap with `cap_info`; a
+cap that is not a Memory cap or lacks a required right is deleted and not
+counted. Each accepted cap is owned by memmgr for the rest of its life: it
+is added to `pool_total` (see Label 6) and placed in the free pool,
+coalescing where possible. A donated cap that finds no free-pool slot stays
+owned and counted but is unreachable for allocation until a later coalesce
+frees a slot.
 
 ### Label 6: `QUERY_POOL_STATUS`
 
@@ -313,7 +371,8 @@ lazily on fault, and only once procmgr has delegated this process's
 
 Per-process region and frame counts are bounded by RAM (the self-hosted
 node arena), not by a fixed constant; `Quota` therefore signals genuine RAM
-exhaustion, not a per-process ceiling.
+exhaustion, not a per-process ceiling. See [`memory-pool.md`](memory-pool.md)
+§"Metadata Arena".
 
 ### Label 8: `DELEGATE_ASPACE`
 
@@ -361,8 +420,11 @@ memmgr finds the exact-match region and tears the whole span down in one
 `mem_unmap_reclaim` call against the caller's delegated `AddressSpace`: the
 kernel clears the span's leaf PTEs and returns the now-empty intermediate page
 tables to that address space's PT growth budget (observable via
-`CAP_INFO_ASPACE_PT_BUDGET`) under a single coarse TLB shootdown. memmgr then
-returns each backing frame to the free pool and frees the region. The region
+`CAP_INFO_ASPACE_PT_BUDGET`; see
+[docs/capability-model.md](../../../docs/capability-model.md)
+§"Address-space and CSpace growth budgets") under a single coarse TLB shootdown.
+memmgr then returns each backing frame to the free pool and frees the region (see
+[`memory-pool.md`](memory-pool.md) §"Reclamation"). The region
 occupies its own VA surface, so the span unmap touches only frames memmgr
 backed on fault; frames the caller mapped itself (e.g. `REQUEST_MEMORY_CAPS`
 grants) live on a disjoint surface and are untouched. The frames return to the
@@ -380,8 +442,9 @@ pool as on `PROCESS_DIED`, so the all-RAM-accounted identity is unaffected.
 
 Not a callable label. When a demand-paged process's thread takes a page
 fault the kernel cannot resolve, it synthesises an IPC to memmgr's
-endpoint with label `FAULT_LABEL` (`u64::MAX - 1`), `badge` = the faulting
-process's memmgr badge, and data words `[kind, faulting_va, access, ip]`
+endpoint with label `FAULT_LABEL` (`u64::MAX - 1`), `badge` = the value
+bound by `SYS_THREAD_SET_FAULT_HANDLER` (which procmgr and the runtime set
+to the process's memmgr badge), and data words `[kind, faulting_va, access, ip]`
 (see [docs/fault-handling.md](../../../docs/fault-handling.md)). For a
 `FAULT_KIND_VM` fault whose `faulting_va` lies in a registered region of a
 process with a delegated address space, memmgr backs the contiguous chunk of
@@ -404,12 +467,18 @@ from a free run to the process record; they were already owned).
 Every Memory cap memmgr returns is a derive-twice copy: memmgr retains
 an intermediary in its own CSpace, the caller receives the second
 derivation. This guarantees memmgr can reclaim on `PROCESS_DIED` even
-after the caller's CSpace is torn down.
+after the caller's CSpace is torn down. See [`memory-pool.md`](memory-pool.md)
+§"Allocation".
 
-`RELEASE_MEMORY_CAPS` and `PROCESS_DIED` move caps out of the caller's
-CSpace via IPC transfer; the caller's slots become null. memmgr does
-not derive further from received caps — it inserts the underlying
-intermediary back into the free pool.
+Neither `RELEASE_MEMORY_CAPS` nor `PROCESS_DIED` transfers the caps it
+reclaims. `RELEASE_MEMORY_CAPS` names each region by `phys_base`, and
+`PROCESS_DIED` names the dead process by badge; memmgr deletes any cap
+transferred with either call defensively, on `PROCESS_DIED` only when the
+caller is procmgr. An unauthorized `PROCESS_DIED` replies `Unauthorized`
+without deleting the caps attached to it; this defect is tracked in
+[#459](https://github.com/kottlerg/seraph/issues/459). Reclamation returns memmgr's
+retained intermediary to the free pool; memmgr does not derive from the
+caller's cap.
 
 ---
 
@@ -441,4 +510,14 @@ reply-then-death ordering is therefore enforced by the kernel.
 
 ## Summarized By
 
-[memmgr/README.md](../README.md)
+[Device Management](../../../docs/device-management.md),
+[Fault Handling](../../../docs/fault-handling.md),
+[Process Lifecycle](../../../docs/process-lifecycle.md),
+[Userspace Memory Model](../../../docs/userspace-memory-model.md),
+[programs/capexhaust/README.md](../../../programs/capexhaust/README.md),
+[programs/demandpaged/README.md](../../../programs/demandpaged/README.md),
+[programs/stackoverflow/README.md](../../../programs/stackoverflow/README.md),
+[programs/threadchurn/README.md](../../../programs/threadchurn/README.md),
+[programs/threadstack/README.md](../../../programs/threadstack/README.md),
+[runtime/ruststd/README.md](../../../runtime/ruststd/README.md),
+[services/memmgr/README.md](../README.md)

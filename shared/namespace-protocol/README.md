@@ -1,11 +1,12 @@
 # namespace-protocol
 
-Wire-format specification, name validation, rights composition, and IPC
-dispatch loop shared by every Seraph namespace server. Filesystem
-drivers (`fs/fat`, future `fs/ext4`, future `tmpfs`) and composing
-servers (`vfsd`'s synthetic root) embed this crate; they implement
-[`NamespaceBackend`] for their storage layer and the crate owns every
-security-relevant code path.
+Wire-format specification, name validation, rights composition, and
+per-request dispatch (`dispatch_request`) that every Seraph namespace
+server calls from its own receive loop. Filesystem drivers (`fs/fat`,
+future `fs/ext4`, future `tmpfs`) and composing servers (`vfsd`'s
+synthetic root) embed this crate; they implement [`NamespaceBackend`]
+for their storage layer and the crate owns every security-relevant
+code path.
 
 ---
 
@@ -27,7 +28,8 @@ README implements it.
 
 All requests and replies follow the [`ipc::IpcMessage`] shape: a 64-bit
 label, an inline data buffer of up to 64 `u64` words, and up to four
-capability slots. Numeric label values live in [`ipc::ns_labels`] in
+capability slots ([docs/ipc-design.md](../../docs/ipc-design.md)
+§ Message Format). Numeric label values live in [`ipc::ns_labels`] in
 `shared/ipc`.
 
 | Opcode | Label | Direction | Purpose |
@@ -36,8 +38,8 @@ capability slots. Numeric label values live in [`ipc::ns_labels`] in
 | 21 | `NS_STAT` | client → server | Attribute snapshot for the addressed node |
 | 22 | `NS_READDIR` | client → server | Enumerate one entry of a directory by index |
 
-The label's low 16 bits carry the opcode; the high 16 bits carry an
-opcode-defined header (today: name length for `NS_LOOKUP`).
+Label bits 0..16 carry the opcode; bits 16..32 carry an opcode-defined
+header (today: name length for `NS_LOOKUP`); bits 32..64 are zero.
 
 Error replies use the matching [`NsError`] discriminant value as the
 reply label; success replies use label `0`.
@@ -47,8 +49,9 @@ reply label; success replies use label `0`.
 ## Badge shape
 
 Every node capability is a badged SEND on a server's namespace
-endpoint. The badge is opaque to the kernel; servers decode it on
-every request. Layout (low-to-high):
+endpoint ([docs/namespace-model.md](../../docs/namespace-model.md)
+§ Node Capabilities). The badge is opaque to the kernel; servers decode
+it on every request. Layout (low-to-high):
 
 | Bits | Field | Meaning |
 |---:|---|---|
@@ -71,8 +74,8 @@ badge.
 
 | Field | Value |
 |---|---|
-| `label` low 16 bits | `20` |
-| `label` high 16 bits | `name_len` (1..=255) |
+| `label` bits 0..16 | `20` |
+| `label` bits 16..32 | `name_len` (1..=255) |
 | `data[0]` | Caller-requested rights (low 24 bits; sentinel `0xFFFF` requests "everything I am allowed") |
 | `data[1..]` | Name bytes packed little-endian, `name_len` bytes total |
 | `caps` | empty |
@@ -97,9 +100,11 @@ The server MUST:
 3. Resolve `(parent_node, name)` via [`NamespaceBackend::lookup`].
 4. Reject with `NotFound` for hidden entries per the rule
    `parent_rights & entry.visible_requires == entry.visible_requires`.
-   Hidden and absent MUST be indistinguishable to the caller.
+   Hidden and absent MUST be indistinguishable to the caller
+   ([docs/namespace-model.md](../../docs/namespace-model.md) § Per-Entry Rights and Visibility).
 5. Compute returned rights as
-   `parent_rights ∩ entry.max_rights ∩ caller_requested`.
+   `parent_rights ∩ entry.max_rights ∩ caller_requested`
+   ([docs/namespace-model.md](../../docs/namespace-model.md) § Per-Entry Rights and Visibility).
 6. Mint the child cap carrying the returned rights via
    `cap_derive_badge`: for [`EntryTarget::Local`], on the server's own
    namespace endpoint at the entry's `NodeId`; for
@@ -107,8 +112,9 @@ The server MUST:
    entries), on the peer server's namespace endpoint at the peer node.
    External mints afresh from the peer's *unbadged* endpoint — rather
    than copying a stored cap — because the kernel forbids re-badging an
-   already-badged cap, so attenuation can only cross the boundary by a
-   fresh mint.
+   already-badged cap ([docs/capability-model.md](../../docs/capability-model.md)
+   § Badges), so attenuation can only cross the boundary by a fresh mint
+   ([docs/namespace-model.md](../../docs/namespace-model.md) § Cross-server entries).
 
 The dispatch crate's [`dispatch_request`] enforces all of the above;
 backends own only the storage lookup.
@@ -146,7 +152,8 @@ lacks the `STAT` rights bit.
 
 Enumerate one directory entry by zero-based index. Clients iterate by
 incrementing the index until the reply label is `END_OF_DIR`. Hidden
-entries (per the visibility rule above) MUST be skipped without
+entries (per the visibility rule above and [docs/namespace-model.md](../../docs/namespace-model.md)
+§ Per-Entry Rights and Visibility) MUST be skipped without
 contributing to the index.
 
 **Request**
@@ -189,10 +196,10 @@ A name accepted by `NS_LOOKUP` MUST satisfy [`validate_name`]:
 - MUST NOT contain `/` (0x2F) or `\0` (0x00).
 - MUST NOT be `.` or `..`.
 
-Path resolution is client-side: a multi-component name is one
-`NS_LOOKUP` per component against the cap returned by the previous
-step. There is no `..` operation; walking up requires a separately-
-held parent cap.
+Path resolution is client-side ([docs/namespace-model.md](../../docs/namespace-model.md)
+§ Walking): a multi-component name is one `NS_LOOKUP` per component
+against the cap returned by the previous step. There is no `..`
+operation; walking up requires a separately-held parent cap.
 
 Backends MAY further restrict (reserved words, on-disk encoding
 limits, case-sensitivity rules); such restrictions surface as
@@ -210,16 +217,17 @@ bits are defined; sixteen are reserved.
 | 0 | `LOOKUP` | `NS_LOOKUP` into this directory |
 | 1 | `READDIR` | `NS_READDIR` enumeration |
 | 2 | `STAT` | `NS_STAT` |
-| 3 | `READ` | `NS_READ` / `NS_READ_MEMORY` (file) |
-| 4 | `WRITE` | `NS_WRITE` (deferred; reserved) |
+| 3 | `READ` | `FS_READ` / `FS_READ_MEMORY` (file) |
+| 4 | `WRITE` | `FS_WRITE` / `FS_WRITE_MEMORY` / `FS_TRUNCATE` (file) |
 | 5 | `EXEC` | File is executable; consumed by ELF loaders |
-| 6 | `MUTATE_DIR` | `NS_CREATE` / `NS_UNLINK` (deferred; reserved) |
+| 6 | `MUTATE_DIR` | `FS_CREATE` / `FS_REMOVE` / `FS_MKDIR` / `FS_RENAME` (directory) |
 | 7 | `ADMIN` | Visibility-gating bit |
 | 8..23 | — | Reserved; MUST be zero on derive, ignored on read |
 
 Every node cap is a `SEND` cap from the kernel's perspective; the
 rights mask above is opaque to the kernel and inspected only by the
-server. Rights MUST narrow on every walk; the dispatch crate enforces
+server. Rights MUST narrow on every walk ([docs/namespace-model.md](../../docs/namespace-model.md)
+§ Namespace Rights); the dispatch crate enforces
 this through the intersection at step 5 of `NS_LOOKUP`.
 
 ---
@@ -279,8 +287,8 @@ A server MAY return entries whose target lies on a different server's
 namespace endpoint ([`EntryTarget::External`]). `NS_LOOKUP` mints a
 fresh cap on that peer endpoint carrying the composed rights
 (`parent_rights ∩ entry.max_rights ∩ caller_requested`), and subsequent
-operations bypass the composing server. This is how filesystem mounting
-works:
+operations bypass the composing server ([docs/namespace-model.md](../../docs/namespace-model.md)
+§ Cross-server entries). This is how filesystem mounting works:
 [`services/vfsd/docs/namespace-composition.md`](../../services/vfsd/docs/namespace-composition.md)
 describes vfsd's synthetic-root composition in detail.
 
@@ -300,8 +308,8 @@ describes vfsd's synthetic-root composition in detail.
 
 ## Summarized By
 
-[services/vfsd/README.md](../../services/vfsd/README.md),
+[Namespace Model](../../docs/namespace-model.md),
 [services/fs/README.md](../../services/fs/README.md),
-[services/fs/docs/fs-driver-protocol.md](../../services/fs/docs/fs-driver-protocol.md),
-[services/vfsd/docs/namespace-composition.md](../../services/vfsd/docs/namespace-composition.md),
-[services/vfsd/docs/vfs-ipc-interface.md](../../services/vfsd/docs/vfs-ipc-interface.md)
+[Filesystem Driver Protocol](../../services/fs/docs/fs-driver-protocol.md),
+[Synthetic Root and Namespace Composition](../../services/vfsd/docs/namespace-composition.md),
+[shared/ns-client/README.md](../ns-client/README.md)

@@ -2898,6 +2898,9 @@ unsafe fn scan_bound_current(
 /// `dealloc_object(Thread)` then runs its full drain on an already-Exited,
 /// off-CPU thread. A stopped server's reply-bound client is released by
 /// that later drain, exactly as for a server stopped by `SYS_THREAD_STOP`.
+/// For a thread displaced from a server's pending-reply binding, neither the
+/// stop nor the later drain is memory-safe (docs/scheduling-internals.md
+/// § Thread Registry, #443).
 ///
 /// Returns `true` if the running thread has itself been stopped — it was
 /// bound to this object, or a concurrent teardown on another CPU stopped it

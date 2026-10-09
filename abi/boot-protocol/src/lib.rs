@@ -910,8 +910,8 @@ pub struct BootInfo
     /// randomization was skipped when it was. When entropy was available, an
     /// `ET_EXEC` image is pinned at the link base with its source bits set and
     /// [`KASLR_IMAGE_RANDOMIZED`] clear; the direct-map bits still apply. Zero
-    /// means an entirely un-randomized layout (no boot entropy and no override
-    /// knob).
+    /// means an entirely un-randomized layout (no KASLR entropy and no override
+    /// knob); a pool seed may still be present in `boot_entropy_seed`.
     pub kaslr_flags: u32,
 }
 

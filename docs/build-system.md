@@ -386,6 +386,7 @@ The merge-gating rule (CI must pass green before merge) lives in
 ## Summarized By
 
 [README.md](../README.md), [ELF Loading](../core/boot/docs/elf-loading.md),
+[RISC-V UEFI Boot](../core/boot/docs/riscv-uefi-boot.md),
 [core/kernel/README.md](../core/kernel/README.md), [System Bootstrap](bootstrap.md),
 [Coding Standards](coding-standards.md), [Platform Requirements](platform-requirements.md),
 [docs/releases/README.md](releases/README.md), [rootfs/README.md](../rootfs/README.md),

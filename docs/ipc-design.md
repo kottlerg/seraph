@@ -44,8 +44,8 @@ or reused.
 
 A server that needs to delegate work may make a downstream call before replying: the pending reply
 stays bound to the receiving thread until that thread replies, and the downstream call does not
-touch that binding. A delegating server therefore replies before it next receives. When a later
-receive delivers a message while a reply is still pending, the kernel overwrites the binding. The
+touch that binding. A delegating server therefore replies before it next receives. When the kernel
+binds a new caller while a reply is still pending, it overwrites the binding. The
 displaced caller (a thread blocked in `call` or a fault-blocked thread) is then outside every
 guarantee the system and kernel documents state for a blocked or bound thread: no reply reaches it;
 stopping it, tearing down its CSpace or AddressSpace, or deleting its last Thread capability can

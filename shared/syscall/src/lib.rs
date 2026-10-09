@@ -1437,7 +1437,8 @@ pub fn thread_start(thread_cap: u32) -> Result<(), i64>
 ///   intersection of this mask and the source cap's rights — pass `RIGHTS_ALL`
 ///   to copy with the same rights as the source.
 ///
-/// Returns the slot index in the destination `CSpace`.
+/// Returns the capability handle (slot index plus generation) in the destination
+/// `CSpace`.
 ///
 /// # Errors
 /// Returns a negative `i64` error code if either cap is invalid, the caller
@@ -2179,9 +2180,9 @@ pub fn thread_set_fault_handler(
 
 /// Copy the register state of a stopped thread into `buf`.
 ///
-/// The thread must be in `Stopped` state. `buf` must be at least
-/// `size_of::<TrapFrame>()` bytes (architecture-defined). Returns the number
-/// of bytes written on success.
+/// The thread must be `Stopped` or fault-blocked awaiting a fault-handler
+/// reply. `buf` must be at least `size_of::<TrapFrame>()` bytes
+/// (architecture-defined). Returns the number of bytes written on success.
 ///
 /// # Safety
 /// `buf` must be valid for `buf_size` bytes of writes.
@@ -2209,16 +2210,21 @@ pub fn thread_read_regs(thread_cap: u32, buf: *mut u8, buf_size: usize) -> Resul
 
 /// Write register state from `buf` into a stopped thread.
 ///
-/// The thread must be in `Stopped` state. `buf` must contain a complete
-/// `TrapFrame` (`buf_size >= size_of::<TrapFrame>()`). The kernel validates
-/// that no privilege bits are set before applying the registers.
+/// The thread must be `Stopped` or fault-blocked awaiting a fault-handler
+/// reply. `buf` must contain a complete `TrapFrame`
+/// (`buf_size >= size_of::<TrapFrame>()`). The kernel sanitizes the frame per
+/// architecture before applying it (`core/kernel/docs/arch-interface.md`
+/// § `trap_frame` — `arch::current::trap_frame`); on RISC-V `sstatus` is
+/// applied as supplied (#443).
 ///
 /// # Safety
 /// `buf` must be valid for `buf_size` bytes of reads.
 ///
 /// # Errors
 /// Returns a negative `i64` error code if the thread cap is invalid, the
-/// thread is not stopped, `buf_size` is too small, or privilege bits are set.
+/// thread is neither stopped nor fault-blocked, `buf_size` is too small, or
+/// the instruction pointer (on x86-64, also the stack pointer) is not a user
+/// address.
 #[inline]
 pub fn thread_write_regs(thread_cap: u32, buf: *const u8, buf_size: usize) -> Result<(), i64>
 {

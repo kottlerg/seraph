@@ -240,7 +240,7 @@ pub const SYS_THREAD_CONFIGURE: u64 = 23;
 ///        (slot 0 is permanently null, so it is a safe "kernel picks" sentinel).
 /// arg3 = rights mask (subset of source rights).
 ///
-/// Returns the destination slot index.
+/// Returns the destination capability handle (slot index plus generation).
 pub const SYS_CAP_COPY: u64 = 24;
 /// Capability: move a slot (destroying the source).
 pub const SYS_CAP_MOVE: u64 = 25;

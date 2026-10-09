@@ -1,8 +1,9 @@
 # Scheduler Internals
 
 The Seraph kernel scheduler is preemptive, priority-based, and SMP-aware. Scheduling
-policy is minimal: the highest-priority runnable thread runs. SMT topology is used
-to prefer spreading threads across physical cores rather than packing them onto one.
+policy is minimal: the highest-priority runnable thread runs. Using SMT topology to spread
+threads across physical cores rather than packing them onto one is design intent, not yet
+implemented ([#267](https://github.com/kottlerg/seraph/issues/267)).
 
 The scheduler interacts with two subsystems:
 
@@ -67,7 +68,8 @@ space is uniform; any partition into tiers is userspace policy, expressed by how
   ([#443](https://github.com/kottlerg/seraph/issues/443); see
   [process-lifecycle.md § Init reap](../../../docs/process-lifecycle.md#init-reap)).
 - Every spawned process receives a band through
-  `ProcessInfo.sched_control_cap`: procmgr mints it from its baseline copy at
+  `ProcessInfo.sched_control_cap`. Init hands memmgr and procmgr each a copy of the
+  baseline, and procmgr mints every other process's band from its copy at
   create time, whole or `SYS_SCHED_SPLIT`-narrowed to the `[1, band_max]` the
   spawner requested, and creates the child's initial thread at the requested
   level under its own baseline authority. The per-service level map is pure
@@ -94,7 +96,7 @@ pub struct PerCpuScheduler
 
     /// Bitmask with one bit set per non-empty priority level.
     /// Allows O(1) selection of the highest non-empty priority.
-    non_empty: u32,
+    non_empty: AtomicU32,
 
     /// Currently running TCB on this CPU.
     current: *mut ThreadControlBlock,
@@ -104,6 +106,9 @@ pub struct PerCpuScheduler
 
     /// Lock protecting this struct. Held briefly during enqueue/dequeue.
     lock: Spinlock,
+
+    /// Run-queue load counter; read via current_load() by the load balancer and select_target_cpu.
+    load: AtomicU32,
 }
 
 struct RunQueue
@@ -114,8 +119,8 @@ struct RunQueue
 ```
 
 The `non_empty` bitmask enables O(1) selection of the highest-priority non-empty
-queue: `31 - non_empty.leading_zeros()` on x86-64 (using `BSR`), or
-`31 - non_empty.leading_zeros()` on RISC-V. Enqueue sets the corresponding bit;
+queue: `31 - non_empty.leading_zeros()` (`PerCpuScheduler::dequeue_highest`), the same
+expression on both architectures. Enqueue sets the corresponding bit;
 dequeue clears it if the queue becomes empty.
 
 ### Time Slice Policy
@@ -126,9 +131,10 @@ slice counter. When the counter reaches zero, the thread is preempted. The time
 slice duration and timer period are implementation constants, not part of the ABI.
 
 Time slices are equal across all priority levels. Priority determines which thread
-runs next, not how much time each thread gets relative to others. A high-priority
-thread that runs continuously will consume its full time slice before yielding to a
-lower-priority thread (unless blocked).
+runs next, not how much time each thread gets relative to others. Slice expiry rotates a
+thread only among runnable threads at its own level: a higher-priority thread that never
+blocks is re-picked at every expiry, and a lower-priority thread on that CPU runs only once
+it blocks (or after the load balancer moves the lower thread elsewhere).
 
 Within a priority level, threads share the CPU in round-robin order (FIFO queue
 drained cyclically).
@@ -150,7 +156,12 @@ pick_next(cpu):
 
 ## Thread Control Block
 
-The TCB is the kernel's per-thread state. It is allocated from the `tcb_cache` slab.
+The TCB is the kernel's per-thread state. A thread's TCB lives in its Thread slab, which
+`SYS_CAP_CREATE_THREAD` retypes from the caller's Memory capability (boot code carves init's
+thread from the SEED reserve): the kernel stack, then the page holding the `ThreadObject` and
+TCB, then the extended-state area (see
+[memory-internals.md § Kernel Stack Allocation](memory-internals.md#kernel-stack-allocation)).
+Idle threads' TCBs live in a per-CPU array allocated at boot.
 
 ```rust
 pub struct ThreadControlBlock
@@ -180,7 +191,8 @@ pub struct ThreadControlBlock
     /// Inline message buffer for in-flight IPC data (the staged message).
     ipc_msg: Message,
 
-    /// Caller bound for the implicit reply (set on receive, cleared on reply).
+    /// Caller bound for the implicit reply (published at the call/recv rendezvous;
+    /// cleared by the reply or by a cancel, dealloc, or rollback claim).
     reply_tcb: AtomicPtr<ThreadControlBlock>,
 
     /// Wakeup value (notification bits, event payload, or wait-set member badge).
@@ -195,20 +207,20 @@ pub struct ThreadControlBlock
     saved_state: arch::current::context::SavedState,
 
     /// Kernel stack top (used to restore RSP0/kernel SP on context switch).
-    kernel_stack_top: VirtAddr,
+    kernel_stack_top: u64,
 
     /// Address space this thread runs in.
     address_space: *mut AddressSpace,
 
     // === Capability reference ===
 
-    /// CSpace bound to this thread (set via sys_thread_configure).
+    /// CSpace bound to this thread (set at SYS_CAP_CREATE_THREAD).
     cspace: *mut CSpace,
 
     // === Identity ===
 
     /// Unique thread identifier.
-    thread_id: ThreadId,
+    thread_id: u32,
 }
 ```
 
@@ -230,9 +242,13 @@ Created ──(SYS_THREAD_START)──► Ready ──(scheduled)──► Runni
                                   ▼
                                 Ready
 
-Running ──(SYS_THREAD_STOP)──► Stopped
-Running ──(SYS_THREAD_EXIT)──► Exited (TCB freed)
+Running / Ready / Blocked ──(SYS_THREAD_STOP)──► Stopped ──(SYS_THREAD_START)──► Ready
+Running ──(SYS_THREAD_EXIT)──► Exited (TCB freed when its last Thread capability is deleted)
 ```
+
+Per-syscall transitions are specified in
+[thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md#lifecycle-state-machine)
+§ Lifecycle State Machine.
 
 State transitions are governed by the per-field-group ownership rules in
 [scheduling-internals.md](scheduling-internals.md). Cross-CPU writes to TCB
@@ -283,8 +299,9 @@ x86-64, the illegal-instruction trap with `sstatus.FS`/`VS` Off on RISC-V).
 context_switch(current_tcb, next_tcb):
     // 1. Update the kernel trap stack pointer so the next privilege-level
     //    transition (syscall, interrupt, or exception) lands on next_tcb's stack.
-    //    x86-64: writes TSS.RSP0 and SYSCALL_KERNEL_RSP.
-    //    RISC-V: writes sscratch (read by trap_entry to switch from user stack).
+    //    x86-64: writes TSS.RSP0 and PerCpuData::kernel_rsp (the SYSCALL entry stack).
+    //    RISC-V: writes PerCpuData::kernel_rsp (read by trap_entry to switch from the
+    //    user stack). A kernel/idle thread passes 0.
     arch::current::cpu::set_kernel_trap_stack(next_tcb.kernel_stack_top)
 
     // 2. Switch address space if different.
@@ -293,10 +310,12 @@ context_switch(current_tcb, next_tcb):
         // Update active_cpus on both address spaces (for TLB shootdown tracking)
 
     // 3. Perform the register-level switch.
-    //    Saves current callee-saved registers, restores next's, returns into next_tcb.
+    //    Saves current callee-saved registers, publishes context_saved = 1 once the
+    //    save is committed, restores next's, returns into next_tcb.
     arch::current::context::switch(
         &mut current_tcb.saved_state,
         &next_tcb.saved_state,
+        &current_tcb.context_saved,
     )
     // Execution continues in next_tcb from here.
 ```
@@ -314,20 +333,20 @@ cache-friendly — a thread's TCB is typically hot in CPU N's caches.
 
 ### Thread Assignment
 
-When a new thread is created (`SYS_CAP_CREATE_THREAD`):
-
-- If `cpu_affinity` is `AFFINITY_ANY`, the kernel assigns it to the CPU with the
-  lowest total thread count (a simple load metric)
-- If `cpu_affinity` specifies a CPU, the thread is assigned there unconditionally
-
-The assignment is recorded in `tcb.preferred_cpu` and used for subsequent wakeups.
+`SYS_CAP_CREATE_THREAD` takes no affinity argument: every thread is created with
+`cpu_affinity = AFFINITY_ANY` and `preferred_cpu = 0`. `SYS_THREAD_START` places it via
+`select_target_cpu`. A hard affinity set by `SYS_THREAD_SET_AFFINITY` before the start wins
+unconditionally. Otherwise the thread stays on `preferred_cpu` if that CPU's load
+(`current_load()`) is within `LOAD_BALANCE_IMBALANCE_THRESHOLD` of the least-loaded CPU's,
+and goes to the least-loaded CPU if not. The placement is recorded in `tcb.preferred_cpu`
+and used for subsequent wakeups.
 
 ### Load Balancing
 
 A pull-based balancer runs on every CPU's `timer_tick` (see
-`sched::try_pull_balance`). It consumes the per-CPU `CPU_LOAD` counters
-maintained by `enqueue` / `dequeue_highest` / `remove_from_queue` and
-migrates at most one `Ready` thread per tick per CPU.
+`sched::try_pull_balance`). It consumes each CPU's run-queue load counter
+(`PerCpuScheduler::current_load()`, maintained by `enqueue` / `dequeue_highest` /
+`remove_from_queue`) and migrates at most one `Ready` thread per tick per CPU.
 
 Victim selection is mode-dependent:
 
@@ -342,8 +361,8 @@ Victim selection is mode-dependent:
   probabilistically and on small topologies sometimes wastes many ticks
   before picking the busy CPU.
 
-Migration uses the shared `sched::migrate_ready_thread`-style helper
-`pull_unpinned_ready(src_cpu, dst_cpu)`:
+Migration goes through `pull_unpinned_ready(src_cpu, dst_cpu)`, which shares the
+validate-then-move core `relocate_ready_thread` with `migrate_ready_thread`:
 
 ```
 pull_unpinned_ready(src, dst):
@@ -358,8 +377,8 @@ pull_unpinned_ready(src, dst):
     moved = false
     if tcb.state == Ready && tcb.context_saved == 1
        && (tcb.cpu_affinity == AFFINITY_ANY || tcb.cpu_affinity == dst):
-        src.remove_from_queue(tcb, prio)       // decrements CPU_LOAD[src]
-        dst.enqueue(tcb, prio)                 // increments CPU_LOAD[dst]
+        src.remove_from_queue(tcb, prio)       // decrements src's load counter
+        dst.enqueue(tcb, prio)                 // increments dst's load counter
         tcb.preferred_cpu = dst
         set_reschedule_pending_for(dst)
         moved = true
@@ -373,8 +392,12 @@ The `context_saved == 1` predicate is the load-balancer liveness gate of
 relocating it would dispatch it on two CPUs at once (#314/#293). The candidate's
 `sched_lock` is try-acquired because it is taken after the run-queue locks, the reverse of
 the canonical order; a failed try defers the pull. `relocate_ready_thread` re-checks
-`Ready`, `context_saved == 1`, and affinity under that `sched_lock`, closing a
-`sys_thread_set_affinity` that races between the `find_runnable` predicate and the move.
+`Ready`, `context_saved == 1`, and affinity under that `sched_lock`. This narrows, but does
+not close, a race with `sys_thread_set_affinity` between the `find_runnable` predicate and
+the move. That syscall writes `cpu_affinity` without the target's `sched_lock`
+([#443](https://github.com/kottlerg/seraph/issues/443)), so a pin landing after the re-check
+can leave the thread linked, and dispatched, on `dst` until its next `schedule()`
+cross-affinity requeue.
 
 Lock order follows [scheduling-internals.md](scheduling-internals.md) § Lock Hierarchy rule 4
 (ascending CPU id), and both acquisitions are **try-locks**: the pull runs
@@ -397,13 +420,17 @@ Hot-path cost per CPU per tick:
 ## SMT Awareness
 
 On systems with Simultaneous Multi-Threading (Hyper-Threading on Intel, SMT on AMD),
-multiple logical CPUs share physical execution resources on the same core. The
-scheduler is aware of this topology.
+multiple logical CPUs share physical execution resources on the same core.
+
+SMT topology awareness is design intent, not yet implemented
+([#267](https://github.com/kottlerg/seraph/issues/267)). The kernel records no physical-core
+or sibling topology, and `try_pull_balance` and `select_target_cpu` place threads by per-CPU
+`current_load()` alone. The subsections below describe the intended design.
 
 ### Topology Detection
 
-Physical core membership is detected at boot via CPUID (x86-64 extended topology leaf)
-or the device tree (RISC-V). Each `PerCpuData` records:
+Physical core membership would be detected at boot via CPUID (x86-64 extended topology
+leaf) or the device tree (RISC-V). Each `PerCpuData` would record:
 
 ```rust
 struct PerCpuData
@@ -416,8 +443,8 @@ struct PerCpuData
 
 ### Scheduling Preference
 
-The load balancer prefers to spread threads across distinct physical cores rather than
-filling one core's SMT siblings:
+The load balancer would prefer to spread threads across distinct physical cores rather
+than filling one core's SMT siblings:
 
 ```
 when assigning a new thread to a CPU:
@@ -425,11 +452,11 @@ when assigning a new thread to a CPU:
     over a CPU that is a SMT sibling of a running thread
 ```
 
-This preference is soft — if all physical cores are occupied, threads are distributed
-across SMT siblings. The preference is implemented as a tie-break in the load metric
-rather than as a hard constraint.
+This preference would be soft — if all physical cores are occupied, threads would be
+distributed across SMT siblings. The preference would be implemented as a tie-break in the
+load metric rather than as a hard constraint.
 
-SMT awareness has no effect on the scheduler's correctness — it is a performance
+SMT awareness would have no effect on the scheduler's correctness — it is a performance
 optimisation to avoid resource sharing between threads that could otherwise run
 independently.
 
@@ -439,45 +466,43 @@ independently.
 
 ### Timer-Driven Preemption
 
-The preemption timer (configured in Phase 5 of initialization) fires at the
-configured periodic interval on each CPU. The timer interrupt handler:
+The preemption timer (started on the BSP in
+[Phase 5](initialization.md#phase-5-architecture-hardware-initialisation) and on each AP
+during its [Phase 8](initialization.md#phase-8-scheduler-and-smp-bringup) startup) fires at
+the configured periodic interval on each CPU. The tick handler, `timer_tick`, runs:
 
 ```
-timer_interrupt_handler():
-    current_tcb.slice_remaining -= 1
-    if current_tcb.slice_remaining == 0:
-        current_tcb.slice_remaining = TIME_SLICE_TICKS
-        // Check if a higher or equal-priority thread is waiting
-        if any_runnable_at_or_above(current_tcb.priority):
-            enqueue(current_tcb, current_tcb.priority)
-            next = pick_next(current_cpu)
-            context_switch(current_tcb, next)
-    // else: continue current thread
+timer_tick():
+    if current.slice_remaining == 0:          // idle thread
+        try_pull_balance(cpu); return
+    current.slice_remaining -= 1
+    if current.slice_remaining == 0:
+        current.slice_remaining = TIME_SLICE_TICKS
+        try_pull_balance(cpu)
+        if preemption_disabled(): return      // see § Kernel-Mode Preemption Points
+        schedule(requeue_current = true)      // requeue at its level's tail, then dequeue_highest
+    else:
+        try_pull_balance(cpu)
 ```
 
-The preemption check is: "is there anyone else ready to run at this priority or
-higher?" If yes, the current thread is re-enqueued and another is picked. If not,
-the thread continues without preemption even if its time slice expired.
+On slice expiry the current thread goes back to the tail of its priority's FIFO, and
+`dequeue_highest` picks the next thread. If no other thread at its priority or higher is
+queued, the current thread is reselected and keeps running with no context switch, even
+though its slice expired.
 
 This ensures that a thread at a unique highest priority is never preempted needlessly
 — only when a peer or superior competitor exists.
 
 ### Kernel-Mode Preemption Points
 
-The kernel is preemptible in most kernel-mode execution paths. A thread executing a
-syscall may be preempted while the timer fires if:
-
-- No spinlock is held
-- No interrupt-disabled section is active
-
-Spinlock-hold intervals must be short (< ~10 µs) by policy. Code that holds a
-spinlock must not call anything that blocks or takes another lock (except in defined
-lock-ordering sequences). The hold-time bound and lock ordering are specified in
-[scheduling-internals.md](scheduling-internals.md) § Lock Hierarchy.
-
-The scheduler does not preempt the kernel while a spinlock is held. Instead, a
-`preemption_pending` flag is set per-CPU; preemption occurs when the last spinlock
-is released.
+Syscall context is not preemptible. Syscall entry masks interrupts, and they stay masked
+for the whole syscall except in bounded preempt-disabled, interrupt-enabled windows. When
+`timer_tick` reaches a slice expiry while `percpu::preemption_disabled()` holds, it resets
+the slice and skips the switch, and the thread is rescheduled at its next slice expiry.
+Kernel-mode preemption therefore happens only at a slice expiry with preemption enabled.
+The model, the spinlock hold-time bound, and lock ordering are specified in the
+"Lock primitive" and "Bare spin locks" paragraphs of
+[scheduling-internals.md § Lock Hierarchy](scheduling-internals.md#lock-hierarchy).
 
 ---
 
@@ -485,26 +510,21 @@ is released.
 
 Each CPU has one idle thread (priority 0) that runs when no other thread is ready.
 
-```rust
-fn idle_thread_entry(cpu_id: u64) -> !
-{
-    loop
-    {
-        // Check for pending work before halting, to avoid a race where
-        // a wakeup IPI arrives between the check and the halt instruction.
-        if has_runnable_threads(cpu_id)
-        {
-            schedule();
-        }
-        // Halt until the next interrupt (timer or IPI).
-        arch::current::cpu::halt_until_interrupt();
-    }
-}
-```
+Each iteration of `idle_thread_entry` first drains this CPU's deferred-reclaim queue
+(`cap::object::drain_deferred_reclaim`) with interrupts enabled. It then masks interrupts
+and checks `take_reschedule_pending` and `has_runnable` together. If either is set, it
+re-enables interrupts and calls `schedule(true)` when the run queue has work, then loops.
+Otherwise it halts through the atomic enable-and-halt `arch::current::cpu::halt_until_interrupt`.
+Masking before the check means a wake IPI that lands between the check and the halt stays
+pending and ends the halt. The protocol is specified in
+[scheduling-internals.md](scheduling-internals.md#wake-protocol-invariants) § Wake Protocol
+Invariants.
 
-The idle thread is the only thread that cannot be preempted by the timer (its time
-slice counter is not decremented — priority 0 is handled specially). It yields
-voluntarily via the `schedule()` call when work becomes available.
+The timer never preempts the idle thread. Its `slice_remaining` is fixed at 0, and
+`timer_tick` returns before the decrement for a zero slice; the check keys on the zero
+slice, not on priority 0. Because its time slice is permanently zero, the timer never
+deschedules it inside a teardown wait. The idle thread yields voluntarily via
+`schedule(true)` when its run queue has work.
 
 ---
 
@@ -515,8 +535,11 @@ adds significant complexity for a benefit that only applies to mutex-based share
 state, which Seraph avoids by design (message passing preferred over shared memory).
 
 The primary locking primitive in the kernel is a spinlock, not a blocking mutex.
-Spinlocks do not cause priority inversion — the waiting thread spins rather than
-blocking. Spinlock-hold intervals are bounded by policy.
+Spinlocks do not cause priority inversion: no context that holds one can be descheduled, so
+a waiter spins only for the holder's bounded hold time, never behind a preempted holder.
+Spinlock-hold intervals are bounded by policy
+([scheduling-internals.md § Lock Hierarchy](scheduling-internals.md#lock-hierarchy),
+"Lock primitive").
 
 If priority inversion is observed in practice at the userspace IPC level (a
 high-priority thread blocked waiting for a low-priority server), the correct fix is
@@ -530,7 +553,9 @@ to use a higher-priority server thread, not to add kernel priority inheritance.
 
 `tcb.cpu_affinity != AFFINITY_ANY` specifies a single CPU the thread must run on.
 Wakeups always enqueue the thread on the specified CPU's run queue. If the
-specified CPU is offline, `SYS_CAP_CREATE_THREAD` fails with `InvalidArgument`.
+specified CPU id is not below `CPU_COUNT`, `SYS_THREAD_SET_AFFINITY` fails with
+`InvalidArgument`. `SYS_CAP_CREATE_THREAD` takes no affinity and creates every thread with
+`cpu_affinity = AFFINITY_ANY`.
 
 Hard affinity is intended for:
 - Interrupt-handling threads that must run on specific CPUs (NUMA, IRQ affinity)
@@ -538,14 +563,18 @@ Hard affinity is intended for:
 
 ### Active migration on affinity change
 
-`SYS_THREAD_SET_AFFINITY` enforces the new affinity immediately rather than
-deferring to the next enqueue ([syscalls.md](syscalls.md) § `SYS_THREAD_SET_AFFINITY`):
+`SYS_THREAD_SET_AFFINITY` starts the migration during the call rather than leaving it to the
+next enqueue ([syscalls.md](syscalls.md) § `SYS_THREAD_SET_AFFINITY`). Clearing to
+`AFFINITY_ANY`, or naming the CPU in the thread's `preferred_cpu`, does no migration work.
+Otherwise, by target state:
 
 - **Ready** thread queued on the old CPU: the syscall calls
-  `migrate_ready_thread` which dequeues the TCB from the source CPU's run
-  queue and re-enqueues it on the destination under both scheduler locks
-  (lower-numbered CPU first; see [scheduling-internals.md](scheduling-internals.md) § Lock Hierarchy
-  rule 4) and sends a wakeup IPI to the destination.
+  `migrate_ready_thread`. It takes the target's `sched_lock` and then both scheduler locks
+  (lower-numbered CPU first; see [scheduling-internals.md](scheduling-internals.md) § Lock
+  Hierarchy rule 4) and revalidates `Ready`, `context_saved == 1`, and the affinity under
+  them (`relocate_ready_thread`). It then moves the TCB from the source CPU's run queue to
+  the destination's and, on a committed move, sends a wakeup IPI to the destination. A lost
+  race leaves the thread where it is.
 - **Running** thread on a different CPU: the syscall sets the
   **source** CPU's reschedule-pending flag and sends a wakeup IPI to the
   **source** CPU (where the thread is currently running). The IPI itself

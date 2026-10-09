@@ -33,20 +33,20 @@ kernel/
 │   │   ├── mod.rs              # Re-exports the active arch module
 │   │   ├── x86_64/             # x86-64 implementation
 │   │   │   ├── mod.rs
-│   │   │   ├── paging.rs       # Page table management (PML4/PML3/PML2/PML1)
+│   │   │   ├── paging.rs       # Page table management (PML4/PDPT/PD/PT)
 │   │   │   ├── context.rs      # Thread context save/restore, context switch
 │   │   │   ├── trap_frame.rs   # Trap/syscall frame: user register snapshot
-│   │   │   ├── interrupts.rs   # IDT, exception handlers, APIC
-│   │   │   ├── idt.rs          # Interrupt Descriptor Table
+│   │   │   ├── interrupts.rs   # Phase 5 interrupt init, local APIC (xAPIC/x2APIC), IPIs
+│   │   │   ├── idt.rs          # IDT, ISR stubs, exception and IRQ handlers
 │   │   │   ├── ioapic.rs       # I/O APIC driver
 │   │   │   ├── timer.rs        # TSC-deadline / periodic-APIC timer for preemption
 │   │   │   ├── syscall.rs      # SYSCALL/SYSRET entry glue
-│   │   │   ├── cpu.rs          # CPUID, topology, per-CPU state (GDT/TSS)
+│   │   │   ├── cpu.rs          # CPUID, CR4/MSRs, SMEP/SMAP/PCID, baseline gate, per-CPU GS base
 │   │   │   ├── gdt.rs          # Global Descriptor Table and TSS
 │   │   │   ├── fpu.rs          # Extended-state (x87/SSE/AVX) control
 │   │   │   ├── ap_trampoline.rs # AP SIPI startup trampoline
 │   │   │   ├── platform.rs     # Bootloader-discovered hardware accessors
-│   │   │   ├── console.rs      # Early framebuffer/serial output
+│   │   │   ├── console.rs      # Early serial (COM1 16550, I/O-port) output
 │   │   │   └── entropy.rs      # Hardware RNG (RDSEED/RDRAND) + cycle counter
 │   │   └── riscv64/            # RISC-V implementation
 │   │       ├── mod.rs
@@ -57,13 +57,13 @@ kernel/
 │   │       ├── idt.rs          # IDT stub
 │   │       ├── sbi.rs          # Generic SBI ecall forwarding
 │   │       ├── timer.rs        # Sstc (stimecmp) timer for preemption
-│   │       ├── syscall.rs      # ECALL entry glue
-│   │       ├── cpu.rs          # Hart ID, topology, per-hart state
+│   │       ├── syscall.rs      # No-op syscall init; ecall is routed by interrupts.rs trap_dispatch
+│   │       ├── cpu.rs          # Baseline gate, ASID probe, tp per-hart pointer, user copy
 │   │       ├── gdt.rs          # GDT stub
 │   │       ├── fpu.rs          # Extended-state (F/D/V) control
 │   │       ├── ap_trampoline.rs # AP startup trampoline (SBI HSM hart_start)
 │   │       ├── platform.rs     # Bootloader-discovered hardware accessors
-│   │       ├── console.rs      # Early SBI console / framebuffer output
+│   │       ├── console.rs      # Early serial (ns16550 MMIO UART) output
 │   │       └── entropy.rs      # No S-mode hardware RNG; cycle counter for jitter
 │   ├── mm/                     # Memory management subsystem
 │   │   ├── mod.rs
@@ -196,9 +196,11 @@ protocol.
 
 ### `syscall/`
 
-The syscall dispatch layer. Architecture-specific entry glue (in `arch/*/syscall.rs`)
-calls into this module's dispatch table, which routes to the appropriate subsystem
-implementation. See [`docs/syscalls.md`](docs/syscalls.md). The audit classifying
+The syscall dispatch layer. The architecture entry path (`syscall_entry` in
+`arch/x86_64/syscall.rs`; on riscv64 the `stvec` trap handler `trap_dispatch` in
+`arch/riscv64/interrupts.rs`, for a U-mode `ecall`) calls `syscall::dispatch`, which
+matches the syscall number to the subsystem handler.
+See [`docs/syscalls.md`](docs/syscalls.md). The audit classifying
 every cross-boundary output (syscall, IPC, fault, exit) for kernel-virtual-address
 disclosure is in [`docs/cross-boundary-disclosure.md`](docs/cross-boundary-disclosure.md);
 it records one open kernel-VA disclosure among emitted values, the x86-64 fault-message
@@ -226,8 +228,10 @@ x86-64). See [docs/build-system.md](../../docs/build-system.md) § Custom Target
 toolchain and target configuration.
 
 `build.rs` selects the appropriate linker script from `linker/` based on the active
-target. Linker scripts place sections at the intended virtual addresses and establish
-the higher-half layout described in [docs/memory-model.md](../../docs/memory-model.md).
+target. Linker scripts link the static-PIE image at `KERNEL_VBASE`, the zero-bias
+higher-half origin of the layout described in
+[docs/memory-model.md](../../docs/memory-model.md); the bootloader chooses the KASLR load
+bias and applies the `RELATIVE` relocations before handoff.
 
 ---
 
@@ -240,19 +244,21 @@ high-level dependency order:
 ```
 boot info validation
     └─► early console (arch)
-            └─► buddy allocator (mm)
-                    └─► kernel page tables (arch + mm)
-                            └─► typed-memory cap surface (cap)
-                                    └─► arch hardware init (arch)
-                                            └─► platform resource validation
-                                                    └─► capability system (cap)
-                                                    └─► scheduler (sched)
-                                                            └─► SMP bringup (arch + sched)
-                                                                    └─► init thread (cap, mm, sched)
+        └─► buddy allocator (mm)
+            └─► kernel page tables (arch + mm)
+                └─► typed-memory cap surface (cap)
+                    └─► arch hardware init (arch)
+                        └─► platform resource validation
+                            └─► capability system (cap)
+                                └─► scheduler (sched)
+                                    └─► SMP bringup (arch + sched)
+                                        └─► init thread (cap, mm, sched)
 ```
 
-The kernel creates init's AddressSpace, CSpace, and Thread directly from the
-`init_image` segments in `BootInfo` — no ELF parsing occurs in the kernel.
+Phase 9 creates init's AddressSpace and Thread from the `init_image` segments in `BootInfo`
+and hands init the root CSpace built in Phase 7. The kernel parses no ELF headers: the
+bootloader locates init's segments and `.rela.dyn` table, and the kernel only applies its
+`RELATIVE` relocations (`mm/init_reloc.rs`).
 
 Each arrow means "requires the item above to be complete". Nothing in this chain is
 reversible; a phase failure halts the boot except where the phase's failure mode in
@@ -264,13 +270,13 @@ reversible; a phase failure halts the boot except where the phase's failure mode
 
 The kernel entry point is `kernel_entry()` in `src/main.rs`. Its calling convention
 and the CPU state guaranteed at entry are specified in
-[`boot/docs/kernel-handoff.md`](../boot/docs/kernel-handoff.md); the
+[`core/boot/docs/kernel-handoff.md`](../boot/docs/kernel-handoff.md); the
 `BootInfo` layout is owned by the
 [`abi/boot-protocol/`](../../abi/boot-protocol/) crate.
 
 The entry point is `#[unsafe(no_mangle)] pub extern "C"` and marked `-> !`. It receives a
-single argument: a `*const BootInfo` pointer whose physical address is in `rdi`
-(x86-64) or `a0` (RISC-V) per the boot protocol.
+single argument: a `*const BootInfo` holding the structure's physical address, passed in
+`rdi` (x86-64) or `a0` (RISC-V) per the boot protocol.
 
 ---
 
@@ -283,7 +289,7 @@ single argument: a `*const BootInfo` pointer whose physical address is in `rdi`
 | [docs/ipc-design.md](../../docs/ipc-design.md) | IPC semantics and message format |
 | [docs/capability-model.md](../../docs/capability-model.md) | Capability types, rights, revocation |
 | [abi/boot-protocol/](../../abi/boot-protocol/) | `BootInfo` structure, `BOOT_PROTOCOL_VERSION` |
-| [boot/docs/kernel-handoff.md](../boot/docs/kernel-handoff.md) | CPU state and register contents at kernel entry |
+| [core/boot/docs/kernel-handoff.md](../boot/docs/kernel-handoff.md) | CPU state and register contents at kernel entry |
 | [docs/build-system.md](../../docs/build-system.md) | Toolchain, custom kernel target specifications |
 | [docs/coding-standards.md](../../docs/coding-standards.md) | Formatting, naming, safety rules |
 

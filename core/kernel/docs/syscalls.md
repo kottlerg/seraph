@@ -33,15 +33,18 @@ Seraph uses the `SYSCALL`/`SYSRET` instructions on x86-64.
 | `rcx` | Clobbered by `SYSCALL` (holds return address); not an argument register |
 | `r11` | Clobbered by `SYSCALL` (holds saved rflags); not an argument register |
 
-All other registers are preserved across a syscall. The callee-saved set matches the
-System V AMD64 ABI (`rbx`, `rbp`, `r12`–`r15`).
+All other registers are preserved across a syscall, except the extra return registers
+the IPC calls name (`r9` for `SYS_IPC_CALL`; `rsi` and `r8` for `SYS_IPC_RECV`). The
+callee-saved set matches the System V AMD64 ABI (`rbx`, `rbp`, `r12`–`r15`).
 
 **Return values:**
 
 - `rax`: primary return value. On error, `rax` holds a negative `SyscallError` code.
   On success, `rax` holds the non-negative result (or zero if the call has no result).
-- `rdx`: secondary return value, used by calls that return two values (e.g. `ipc_recv`
-  returns both a label and a word count). Zero if unused.
+- `rdx`: secondary return value (e.g. the label from `ipc_recv`, the acquired bits from
+  `notification_wait`). A call with no secondary result leaves `rdx` unchanged. The IPC
+  calls also return values in `rsi`, `r8` and `r9`: see § `SYS_IPC_CALL` (0) and
+  § `SYS_IPC_RECV` (2).
 
 **Errno convention:** The kernel returns the error code directly in `rax` as a
 negative `i64`. There is no `errno` global — callers check the sign of `rax`.
@@ -61,8 +64,10 @@ Seraph uses the `ECALL` instruction on RISC-V. The trap handler in `stvec` dispa
 | `a4` | Argument 4 |
 | `a5` | Argument 5 |
 
-All other registers are preserved. Callee-saved registers are `s0`–`s11`, `sp`, `ra`
-(matching the RISC-V calling convention).
+All other registers are preserved, except the extra return registers the IPC calls name
+(`a2` for `SYS_IPC_CALL`; `a2` and `a3` for `SYS_IPC_RECV`). Callee-saved registers are
+`s0`–`s11` and `sp` (matching the RISC-V calling convention); the kernel also restores
+`ra`.
 
 **Return values:** `a0` is the primary return value (negative on error). `a1` is the
 secondary return value where applicable.
@@ -76,9 +81,13 @@ secondary return value where applicable.
 On `SYSCALL`:
 1. `rcx` ← `rip` (return address); `r11` ← `rflags`
 2. Transition to CPL 0 with kernel code segment
-3. `rsp` ← kernel stack pointer from `RSP0` in the TSS (per-CPU)
+3. The `syscall_entry` stub saves the user `rsp` to `PerCpuData::user_rsp` and loads
+   `rsp` from `PerCpuData::kernel_rsp` (per-CPU, GS-relative); `SYSCALL` itself does not
+   change `rsp`, and TSS `RSP0` serves only interrupt and exception entry
 4. Kernel saves the user register file (including `rcx` and `r11`) onto the kernel stack
-5. Kernel calls `syscall::dispatch(nr=rax, args=[rdi, rsi, rdx, r10, r8, r9])`
+5. Kernel calls `syscall::dispatch(tf)` with a pointer to the saved `TrapFrame`;
+   `dispatch` reads the number from `rax` and arguments 0–5 from `rdi`, `rsi`, `rdx`,
+   `r10`, `r8`, `r9`
 6. Kernel writes return values into the saved register frame
 7. Kernel restores the user register file
 8. `SYSRET` restores `rip` from `rcx`, `rflags` from `r11`, transitions to CPL 3
@@ -91,16 +100,20 @@ interrupt-enabled windows (see § Atomicity and Preemption Guarantees and
 ### RISC-V
 
 On `ECALL` from U-mode:
-1. `sepc` ← `pc` + 4 (return address past the ecall instruction)
+1. `sepc` ← `pc` (address of the `ecall` instruction)
 2. `sstatus.SPP` ← 0 (was U-mode); `sstatus.SPIE` ← `sstatus.SIE`; `sstatus.SIE` ← 0
 3. Execution jumps to `stvec` (the kernel trap handler)
 4. Trap handler saves the full user register file to the per-thread trap frame
 5. Trap handler checks `scause` — if it is an ecall from U-mode, routes to syscall path
-6. Kernel calls `syscall::dispatch(nr=a7, args=[a0..a5])`
-7. Kernel writes return values into the saved register frame (`a0`, `a1`)
-8. Kernel restores the user register file
-9. `SRET` restores `pc` from `sepc`, restores `sstatus.SIE` from `sstatus.SPIE`,
-   returns to U-mode (`sstatus.SPP` = 0)
+6. Kernel calls `syscall::dispatch(tf)` with a pointer to the saved `TrapFrame`;
+   `dispatch` reads the number from `a7` and arguments 0–5 from `a0`–`a5`
+7. Kernel advances the saved `sepc` by 4, past the `ecall`, unless dispatch rewrote it
+   (`SYS_THREAD_WRITE_REGS`)
+8. Kernel writes return values into the saved register frame (`a0`, `a1`, and for the
+   IPC calls `a2`/`a3`)
+9. Kernel restores the user register file
+10. `SRET` restores `pc` from `sepc`, restores `sstatus.SIE` from `sstatus.SPIE`,
+    returns to U-mode (`sstatus.SPP` = 0)
 
 ---
 
@@ -109,7 +122,7 @@ On `ECALL` from U-mode:
 **Authoritative source:** `abi/syscall/src/lib.rs` — the constants defined there
 are the single source of truth. This table must match that file exactly.
 
-Syscall numbers are stable ABI. A new syscall takes the next free number. While
+Syscall numbers are ABI. A new syscall takes the next free number. While
 the ABI is pre-1.0 (unstable), a number left vacant by a removed syscall may be
 reclaimed for a new one, but a number in active use is never reassigned.
 
@@ -165,6 +178,7 @@ is the single source of truth. This block must match it exactly.
 /// On success the return value is `>= 0`. On error it is one of these
 /// negative values. Userspace wrappers check `rax < 0` to detect errors.
 #[repr(i64)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SyscallError
 {
     /// Syscall number is not valid.
@@ -251,10 +265,12 @@ pointer is dereferenced (see [ipc-design.md](../../../docs/ipc-design.md) § Mes
 when the message carries capabilities.
 
 **Errors:** `InvalidCapability` (also: a cap slot is stale or Null),
-`InsufficientRights`, `InvalidArgument` (bad count, a cap slot repeated in one
+`InsufficientRights`, `InvalidArgument` (a cap slot repeated in one
 message, or `data_count` > 0 with no IPC buffer page registered),
 `InvalidAddress` (registered IPC buffer page unmapped), `InvalidState` (a cap
-slot is pinned by an in-flight `SYS_CAP_REVOKE` or `SYS_CAP_MOVE`), `Interrupted`. Cap-slot
+slot is pinned by an in-flight `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, or IPC capability
+transfer), `Interrupted`. A `data_count` or `cap_count` above `MSG_DATA_WORDS_MAX` /
+`MSG_CAP_SLOTS_MAX` is clamped to the maximum, not rejected. Cap-slot
 problems are rejected before the caller blocks; a refusal that arises only
 afterwards degrades to delivery with zero caps (the caller keeps its
 capabilities; see [ipc-design.md](../../../docs/ipc-design.md) § Message Format).
@@ -271,7 +287,7 @@ its derivation parent.
 
 ### `SYS_IPC_REPLY` (1)
 
-Send a reply to the caller that issued the most recent `SYS_IPC_RECV` on this thread.
+Send a reply to the caller bound to this thread by its most recent `SYS_IPC_RECV`.
 
 **Arguments:**
 
@@ -293,8 +309,11 @@ The reply capability is implicit — it is the caller binding held in the callin
 thread (`reply_tcb`, a per-thread field outside the CSpace, set at `SYS_IPC_RECV`
 time; see [capability-internals.md](capability-internals.md) § Capability Transfer
 in IPC). It is consumed by this syscall whether it succeeds or fails. If no reply
-capability is present (i.e. this thread did not receive a call), the syscall
-returns `InvalidCapability`.
+capability is present (this thread holds no pending caller: it received none, or the
+caller was cancelled), the syscall returns `InvalidCapability`, unless a payload or cap
+check fails first: `data_count` > 0 with no IPC buffer page registered returns
+`InvalidArgument`, an unmapped IPC buffer page `InvalidAddress`, and an invalid reply
+cap slot its own error.
 
 Data words follow the same rules as `SYS_IPC_CALL`: when `data_count` > 0
 they are read from this thread's registered IPC buffer page and written to
@@ -304,12 +323,13 @@ the original caller's IPC buffer page.
 (`reply_tcb`).
 
 **Errors:** `InvalidCapability` (no pending reply, or a reply cap slot went
-stale), `InvalidArgument` (also: a cap slot repeated in one reply, or
+stale), `InvalidArgument` (a cap slot repeated in one reply, or
 `data_count` > 0 with no IPC buffer page registered), `InvalidAddress`
 (registered IPC buffer page unmapped), `InvalidState` (a reply cap slot is
-pinned by an in-flight `SYS_CAP_REVOKE` or `SYS_CAP_MOVE`), `QuotaExceeded` (caller's CSpace
+pinned by an in-flight `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, or IPC capability transfer),
+`QuotaExceeded` (caller's CSpace
 directory structurally full for reply cap transfer), `OutOfMemory`
-(slot-page pool exhausted), `Interrupted`. Every payload or cap failure while
+(slot-page pool exhausted). Every payload or cap failure while
 a caller is pending — the data-path errors above included — consumes the
 pending reply and wakes the caller with the `IPC_REPLY_TRANSFER_FAILED` label
 and zero caps while the server receives the error (see
@@ -339,8 +359,8 @@ Wait for a call on an endpoint. Blocks until a caller arrives.
 The message's data words are written to the receiver's registered IPC buffer page, followed by the
 cap-transfer result block (count, then the delivered destination handles) at word offset
 `MSG_DATA_WORDS_MAX`. The kernel binds the caller to the receiving thread as its reply capability
-(the per-thread `reply_tcb` field); `SYS_IPC_REPLY` consumes this binding implicitly. A receive that
-delivers a message while a reply is still pending overwrites the binding; the displaced caller is
+(the per-thread `reply_tcb` field); `SYS_IPC_REPLY` consumes this binding implicitly. Binding a new
+caller while a reply is still pending overwrites the binding; the displaced caller is
 outside the guarantees of this document ([ipc-design.md](../../../docs/ipc-design.md) § The
 Call/Reply Model, [#443](https://github.com/kottlerg/seraph/issues/443)).
 
@@ -354,9 +374,12 @@ passed to `SYS_THREAD_SET_FAULT_HANDLER`, not a derived-cap badge (see
 **Capability requirement:** `endpoint_cap` must have Receive rights.
 
 **Errors:** `InvalidCapability`, `InsufficientRights`, `QuotaExceeded` (server's CSpace
-directory structurally full for an incoming cap transfer), `OutOfMemory` (slot-page pool exhausted),
+directory cannot supply `MSG_CAP_SLOTS_MAX` free slots), `OutOfMemory` (slot-page pool
+exhausted) — both checked before the receive parks, whether or not a message carries caps
+(see [ipc-design.md](../../../docs/ipc-design.md) § Receive-Failure Policy),
 `Interrupted`. If an already-queued sender's cap transfer is refused (a source
-slot went stale or is pinned by an in-flight `SYS_CAP_REVOKE` or `SYS_CAP_MOVE`), the message is
+slot went stale or is pinned by an in-flight `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, or IPC
+capability transfer), the message is
 still delivered — with zero caps; the sender keeps its capabilities (see
 [ipc-design.md](../../../docs/ipc-design.md) § Message Format).
 
@@ -393,13 +416,14 @@ entire bitmask (see [ipc-design.md](../../../docs/ipc-design.md) § Notification
 | # | Name | Description |
 |---|---|---|
 | 0 | `notification_cap` | Notification capability with Wait rights |
-| 1 | `timeout_ms` | `0` = block indefinitely; `>0` = wake after at most `timeout_ms` ms |
+| 1 | `timeout_ms` | `0` = block indefinitely; `>0` = return with a zero bitmask once `timeout_ms` ms have elapsed (at timer-tick granularity); if the kernel sleep list is full (`MAX_SLEEPING` entries), the timeout is dropped and the wait is indefinite |
 
 **Return:**
 
 - `rax`/`a0`: 0 on success; `SyscallError` on failure
 - `rdx`/`a1`: acquired bitmask on success (non-zero on notification wake,
-  because `notification_send` rejects zero-bit sends; `0` when the timeout
+  because a waiter is woken only with a non-zero bitmask (`SYS_NOTIFICATION_SEND`
+  rejects zero-bit sends); `0` when the timeout
   elapses, or when the notification is destroyed while the caller waits, which
   returns success with no `Interrupted` stamp, even with `timeout_ms` = `0`;
   #443)
@@ -445,13 +469,14 @@ Dequeue the next entry from an event queue with optional bounded wait.
 | 0 | `queue_cap`  | Event queue capability with Recv rights                 |
 | 1 | `timeout_ms` | Wait policy: see sentinels below                        |
 
-`timeout_ms` sentinels (matches `SYS_NOTIFICATION_WAIT`):
+`timeout_ms` sentinels (`0` matches `SYS_NOTIFICATION_WAIT`; the `u64::MAX` try-once mode
+is specific to `SYS_EVENT_RECV`):
 
 | Value             | Behaviour                                                       |
 |-------------------|-----------------------------------------------------------------|
 | `0`               | Block forever until a post arrives                              |
 | `u64::MAX`        | Non-blocking try-once; return `WouldBlock` if empty             |
-| `1 ..= MAX-1`     | Block until post arrives or `timeout_ms` ms elapse              |
+| `1 ..= MAX-1`     | Block until post arrives or `timeout_ms` ms elapse; if the kernel sleep list is full (`MAX_SLEEPING` entries), the timeout is dropped and the wait is indefinite |
 
 **Return:**
 
@@ -470,7 +495,7 @@ out-of-band marker (`tcb.timed_out`) rather than an in-band
 `wakeup_value` sentinel because event-queue payloads may be any `u64`
 (0 included; see [ipc-internals.md](ipc-internals.md) § Event Queue, Recv Path)
 — contrast `SYS_NOTIFICATION_WAIT`, where a notification wake never carries
-0 bits because `notification_send` rejects zero-bit sends, so a `0` result
+0 bits because `SYS_NOTIFICATION_SEND` rejects zero-bit sends, so a `0` result
 means the timeout elapsed or the notification was destroyed.
 
 ---
@@ -491,6 +516,8 @@ still means "no capability". Range-split syscalls return their two child handles
 in the primary and secondary return registers (never packed into one word). See
 [capability-model.md](../../../docs/capability-model.md) § Capability Handle
 Format.
+
+---
 
 ## Capability Syscalls
 
@@ -520,7 +547,7 @@ Send + Receive + Grant rights.
 ### `SYS_CAP_CREATE_NOTIFICATION` (8)
 
 Retype a Memory capability into a new notification object. Returns a capability with
-Notification + Wait rights.
+Notify + Wait rights.
 
 **Arguments:**
 
@@ -554,7 +581,8 @@ Retype a Memory capability into a new event queue with a fixed capacity.
 
 **Capability requirement:** `memory_cap` must have Retype rights.
 
-**Errors:** `InvalidArgument` (capacity 0 or exceeds maximum), `InvalidCapability`,
+**Errors:** `InvalidArgument` (the low 32 bits of `capacity`, the only bits the kernel
+reads, are 0 or exceed `EVENT_QUEUE_MAX_CAPACITY`), `InvalidCapability`,
 `InsufficientRights` (source Memory cap lacks Retype), `OutOfMemory` (Memory cap region
 or slot-page pool exhausted), `QuotaExceeded` (caller's CSpace directory structurally full).
 
@@ -638,6 +666,38 @@ target lacks Map), `OutOfMemory` (Memory cap region or slot-page pool exhausted)
 
 ---
 
+### `SYS_CAP_CREATE_CSPACE` (12)
+
+Retype a Memory capability into a new, empty CSpace (create-mode), or donate carved
+pages to an existing CSpace's slot-page pool (augment-mode).
+
+**Arguments:**
+
+| # | Name | Description |
+|---|---|---|
+| 0 | `memory_cap` | Memory capability (Retype rights) the CSpace slab is carved from |
+| 1 | `augment_cap` | `0` for create-mode; otherwise a CSpace cap (Insert rights) whose slot-page pool receives the carved pages |
+| 2 | `init_pages` | Pages to carve (create-mode: page 0 is the wrapper and pages `1..init_pages` seed the slot-page pool; augment-mode: every page goes to the target's pool, less a record page where one is opened) |
+| 3 | — | Reserved (formerly `max_slots`); MUST be `0` in both modes, else `InvalidArgument` |
+
+**Return:** `rax`/`a0`: create-mode — new CSpace capability (Insert + Delete + Derive
+rights); augment-mode — `0`. `SyscallError` on failure.
+
+Augment-mode donations are unbounded in count, with the same bookkeeping as
+`SYS_CAP_CREATE_ASPACE`: once per record page a donation's first page is kept by
+the kernel and only `init_pages − 1` pages reach the pool (see
+[capability-internals.md](capability-internals.md) § Donation Records).
+
+**Capability requirements:** `memory_cap` (Retype); in augment-mode, `augment_cap` (Insert).
+
+**Errors:** `InvalidArgument` (`init_pages` 0 or overflow, or arg 3 non-zero),
+`InvalidCapability`, `InsufficientRights` (source Memory cap lacks Retype, or augment
+target lacks Insert), `OutOfMemory` (Memory cap region or slot-page pool exhausted, or,
+in create-mode, the kernel's 4096-entry CSpace id namespace exhausted),
+`QuotaExceeded` (caller's CSpace directory structurally full).
+
+---
+
 ### `SYS_CAP_CREATE_WAIT_SET` (13)
 
 Retype a Memory capability into a new wait set.
@@ -680,12 +740,13 @@ derivation is recorded in the global derivation tree for revocation tracking.
 The source is revalidated under the derivation lock before the new slot is
 linked beneath it (see [capability-internals.md](capability-internals.md)
 § Global Derivation Lock): a source a concurrent delete, move, or revoke freed
-meanwhile fails with `InvalidCapability`, and one with a `SYS_CAP_REVOKE` in
-flight with `InvalidState`, rather than leaving the new capability an unlinked
-derivation root.
+meanwhile fails with `InvalidCapability`, and one with a `SYS_CAP_REVOKE`,
+`SYS_CAP_MOVE`, or IPC capability transfer in flight with `InvalidState`, rather than
+leaving the new capability an unlinked derivation root.
 
 **Errors:** `InvalidCapability` (source invalid, null, or freed meanwhile),
-`InvalidState` (a `SYS_CAP_REVOKE` or `SYS_CAP_MOVE` is in flight on the source), `OutOfMemory`
+`InvalidState` (a `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, or IPC capability transfer is in
+flight on the source), `OutOfMemory`
 (slot-page pool exhausted), `QuotaExceeded` (caller's CSpace directory
 structurally full).
 
@@ -702,7 +763,7 @@ Derive a new capability with an attached badge value.
 | # | Name | Description |
 |---|---|---|
 | 0 | `source_cap` | Source capability descriptor |
-| 1 | `rights_mask` | Rights bitmask for the derived capability (subset of source) |
+| 1 | `rights_mask` | Rights bitmask for the derived capability (ANDed with the source's rights, as for `SYS_CAP_DERIVE`) |
 | 2 | `badge` | Badge value to attach (must be non-zero) |
 
 **Return:** `rax`/`a0`: new capability descriptor on success; `SyscallError` on failure.
@@ -724,7 +785,8 @@ under the derivation lock: as for `SYS_CAP_DERIVE`.
 
 **Errors:** `InvalidArgument` (badge is zero or source already badged),
 `InvalidCapability` (source invalid, null, or freed meanwhile), `InvalidState` (a
-`SYS_CAP_REVOKE` or `SYS_CAP_MOVE` is in flight on the source), `OutOfMemory`
+`SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, or IPC capability transfer is in flight on the
+source), `OutOfMemory`
 (slot-page pool exhausted), `QuotaExceeded` (caller's CSpace directory
 structurally full).
 
@@ -753,10 +815,10 @@ and the range splits on the target slot (and IPC transfer of it) are refused wit
 destination slots the same way (see
 [capability-internals.md](capability-internals.md) § Revocation Algorithm).
 
-**Errors:** `InvalidCapability`; `InvalidState` (another revoke, or a move, is
-already in flight on this slot, or a corrupted derivation link was found — the revoke is
-incomplete and the dangling chain was cut); `Interrupted` (liveness backstop:
-sustained concurrent derivation kept extending the subtree — everything revoked
+**Errors:** `InvalidCapability`; `InvalidState` (another revoke, a move, or an IPC
+capability transfer is already in flight on this slot, or a corrupted derivation link
+was found — the revoke is incomplete and the dangling chain was cut); `Interrupted`
+(liveness backstop: sustained concurrent derivation kept extending the subtree — everything revoked
 so far stays revoked; retry to continue).
 
 ---
@@ -780,17 +842,20 @@ threads never outlive either object (see [scheduling-internals.md](scheduling-in
 Registry). **The stop includes the caller**: a thread deleting the last capability to its own
 `CSpace` or `AddressSpace` — directly, or because the deleted object's teardown cascades into it —
 is stopped by that delete and the call does not return; the object is reclaimed once the thread is
-off its CPU. This path has known kernel memory-safety gaps, tracked in
+off its CPU. This path, and deleting the last capability to a thread displaced from a server's
+pending-reply binding (whose reap can touch freed kernel memory or hang the kernel, so the call
+may never return), have known kernel memory-safety gaps, tracked in
 [#443](https://github.com/kottlerg/seraph/issues/443) (see
 [ipc-design.md](../../../docs/ipc-design.md) § The Call/Reply Model and
 [capability-internals.md](capability-internals.md#storage-hybrid-two-level-radix) § Storage: Hybrid
 Two-Level Radix). The caller's own `Thread` object is treated differently, as below.
 
 Refused for two cases, both returning `InvalidState` with the capability left in
-place: a thread may not delete the last capability to its **own running**
-`Thread` object (always an aliased/stale-cap bug — it would tear the calling
-thread down mid-syscall; the object is reclaimed normally when a different
-thread later releases it), and a slot with a `SYS_CAP_REVOKE` or `SYS_CAP_MOVE`
+place: a thread may not delete any capability to its **own running**
+`Thread` object, last reference or not (always an aliased/stale-cap bug — deleting
+the last one would tear the calling thread down mid-syscall; the object is reclaimed
+normally when a different thread later releases it), and a slot with a
+`SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, or IPC capability transfer
 in flight may not be deleted until that operation completes.
 
 Capabilities derived from the deleted slot are re-linked under its own derivation parent, so
@@ -865,7 +930,8 @@ This fails with `WxViolation` if the memory cap has both WRITE and EXECUTE right
 
 **Errors:** `InvalidAddress` (unaligned `virt`, non-canonical address, or mapping
 range leaves the user half), `InvalidArgument` (zero page count, size/offset overflow,
-or offset beyond frame), `InvalidCapability`, `InsufficientRights` (requested prot
+or `offset_pages` + `page_count` past the end of the memory cap's region),
+`InvalidCapability`, `InsufficientRights` (requested prot
 exceeds cap rights), `WxViolation` (both WRITE and EXECUTE requested), `OutOfMemory`
 (page table allocation failure).
 
@@ -939,7 +1005,7 @@ inserted in the caller's CSpace.
 | # | Name | Description |
 |---|---|---|
 | 0 | `memory_cap` | Memory capability to split (Map rights) |
-| 1 | `split_offset` | Byte offset of the split: page-aligned, `> 0`, `< size`, and at or above the next page boundary above the cap's highest live retype offset |
+| 1 | `split_offset` | Byte offset of the split: page-aligned, `> 0`, `< size`, and at or above the cap's retype bump offset rounded up to a page boundary |
 | 2 | — | Reserved |
 
 **Return:** `rax`/`a0`: capability descriptor for the tail
@@ -1068,7 +1134,10 @@ capability is consumed and its slot freed.
 
 The two capabilities must be derivation siblings with identical rights, be physically
 contiguous (`parent.base + parent.size == tail.base`), and the tail must be virgin
-(never retyped or sub-allocated). Neither may have derivation children.
+(no live retypes: its retype bump cursor is at its base and its `available_bytes` equals
+its size when it carries `RETYPE`, zero otherwise; a tail whose retyped objects have all
+been freed qualifies). Both must carry the same memory-ownership flag, and neither may
+have derivation children.
 
 **Capability requirements:** `parent_cap` (Map), `tail_cap` (Map); rights must match.
 
@@ -1078,8 +1147,9 @@ object is touched and the tail is unlinked and freed (see
 cap a concurrent delete freed meanwhile fails with `InvalidCapability`, and one
 with a `SYS_CAP_REVOKE` or `SYS_CAP_MOVE` in flight with `InvalidState`.
 
-**Errors:** `InvalidArgument` (same slot/object, rights mismatch, not contiguous, tail
-not virgin, not siblings, or either has children), `InvalidCapability`,
+**Errors:** `InvalidArgument` (same slot/object, rights mismatch, ownership-flag
+mismatch, not contiguous, tail not virgin, not siblings, or either has children),
+`InvalidCapability`,
 `InvalidState` (per above), `InsufficientRights` (either cap lacks Map).
 
 ---
@@ -1088,7 +1158,8 @@ not virgin, not siblings, or either has children), `InvalidCapability`,
 
 ### `SYS_THREAD_START` (19)
 
-Transition a thread from `Created` state to `Ready` and enqueue it for scheduling.
+Transition a thread from `Created` (first start) or `Stopped` (resume) to `Ready` and
+enqueue it for scheduling.
 
 **Arguments:**
 
@@ -1119,8 +1190,12 @@ Stop a running or runnable thread. The thread transitions to `Stopped` state.
 
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
 
-If the thread is blocked on IPC, the block is cancelled (the blocked syscall on the target thread
-returns `Interrupted`). This does not hold for a caller displaced from a server's pending-reply
+If the thread is blocked in a syscall (IPC or `SYS_THREAD_SLEEP`), the block is cancelled, and when
+the thread is restarted the blocked syscall returns `Interrupted` (a wake that won the race against
+the stop is delivered instead). A fault-blocked thread, whether awaiting delivery to its fault
+handler or a reply from it, has its fault cancelled and is killed when restarted, as for an
+unhandled fault (see [fault-handling.md](../../../docs/fault-handling.md) § Delivery, Resume, and
+Kill). This does not hold for a caller displaced from a server's pending-reply
 binding: the stop is not memory-safe, and its outcome is in
 [ipc-design.md](../../../docs/ipc-design.md) § The Call/Reply Model
 ([#443](https://github.com/kottlerg/seraph/issues/443)). If the thread is running on another CPU, an
@@ -1131,8 +1206,8 @@ Protocol).
 **Capability requirement:** `thread_cap` must have Control rights.
 
 **Errors:** `InvalidCapability`, `InsufficientRights` (cap lacks Control),
-`InvalidState` (thread already stopped or exited, including one killed by an object
-teardown concurrently with the call).
+`InvalidState` (thread not yet started, already stopped, or exited, including one killed
+by an object teardown concurrently with the call).
 
 ---
 
@@ -1144,7 +1219,8 @@ Voluntarily yield the remainder of the current thread's time slice.
 
 **Return:** `rax`/`a0`: always 0.
 
-The calling thread remains `Ready` and is re-enqueued at its current priority. No
+The calling thread moves from `Running` to `Ready` and is re-enqueued at its current
+priority. No
 capability is required — this syscall acts on the calling thread implicitly.
 
 **Errors:** None (this syscall cannot fail).
@@ -1170,14 +1246,16 @@ with a code, use `SYS_PROCESS_EXIT`.
 
 Exit the calling process with a voluntary exit code (the `std::process::exit` /
 `main`-return path). The kernel encodes `code` via `syscall_abi::encode_exit_code`
-into the exit-reason space (`0` clean, `1..0x0FFF` saturating; disjoint from the
-fault range `0x1000+`; see [process-lifecycle.md](../../../docs/process-lifecycle.md)
-§ Exit reason), records it as the calling thread's exit reason, and posts
+into the exit-reason space (`0` clean, `1..=0x0FFF` verbatim with larger codes saturating
+to `0x0FFF`; disjoint from the fault range `0x1000..=0x1FFF`; see
+[process-lifecycle.md](../../../docs/process-lifecycle.md) § Exit reason), records it as
+the calling thread's exit reason, and posts
 it to that thread's death observers — a parent that bound the main thread (so
 `ExitStatus::code()` carries it) and procmgr's per-thread observer (which reaps
-the process). Structurally identical to `SYS_THREAD_EXIT` but with a non-zero
-reason; it does not post to the address-space death surface (reserved for
-terminal faults). Sibling threads are reaped by procmgr's cap-revoke teardown;
+the process). Structurally identical to `SYS_THREAD_EXIT` but with the encoded
+caller-supplied reason (zero for a `code` of `0`); it does not post to the
+address-space death surface (reserved for terminal faults). Sibling threads are reaped
+by procmgr's cap-revoke teardown;
 the kernel does not enumerate or stop them here (see
 [process-lifecycle.md](../../../docs/process-lifecycle.md) § Process Death).
 
@@ -1202,7 +1280,7 @@ Change a thread's scheduling priority after creation.
 | # | Name | Description |
 |---|---|---|
 | 0 | `thread_cap` | Thread capability (Control rights): selects *which* thread |
-| 1 | `priority` | New priority (1–`PRIORITY_MAX`) |
+| 1 | `priority` | New priority (1–`PRIORITY_MAX`); the kernel reads only the low 8 bits of the register |
 | 2 | `sched_cap` | `SchedControl` capability whose `[min, max]` band covers `priority`: governs *which level*. Always required |
 
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
@@ -1221,9 +1299,9 @@ effect at the next scheduler invocation.
 **Capability requirements:** `thread_cap` (Control rights); `sched_cap` (a
 `SchedControl` whose band covers `priority`).
 
-**Errors:** `InvalidCapability` (no valid `SchedControl` at `sched_cap`),
-`InsufficientRights` (band does not cover `priority`), `InvalidArgument`
-(priority 0, priority 31, or out of range).
+**Errors:** `InvalidCapability` (bad `thread_cap`, or no valid `SchedControl` at
+`sched_cap`), `InsufficientRights` (`thread_cap` lacks Control, or band does not cover
+`priority`), `InvalidArgument` (priority 0, priority 31, or out of range).
 
 ---
 
@@ -1238,7 +1316,7 @@ bands. Mirrors the range-split shape of `SYS_IRQ_SPLIT` / `SYS_MMIO_SPLIT` /
 | # | Name | Description |
 |---|---|---|
 | 0 | `sched_cap` | `SchedControl` capability to split |
-| 1 | `split_at` | Lowest priority level of the upper child; must satisfy `min < split_at <= max` on the cap being split |
+| 1 | `split_at` | Lowest priority level of the upper child; must satisfy `min < split_at <= max` on the cap being split; the kernel reads only the low 8 bits of the register |
 
 **Return:**
 
@@ -1324,15 +1402,17 @@ Read the full register state of a stopped thread into a caller-supplied buffer.
 The thread MUST be in `Stopped` state, or fault-blocked awaiting a fault-handler
 reply (`BlockedOnFault`) — the latter lets a bound fault handler inspect the
 faulting registers (see [`docs/fault-handling.md`](../../../docs/fault-handling.md)).
-The buffer receives an architecture-defined register file structure (layout
-published in the kernel ABI headers). If `buf_size` is smaller than the required
+The buffer receives the kernel's architecture-specific `TrapFrame`
+(`core/kernel/src/arch/x86_64/trap_frame.rs`, `core/kernel/src/arch/riscv64/trap_frame.rs`);
+its layout is not published in an ABI crate. If `buf_size` is smaller than the required
 size, the call fails with `InvalidArgument`.
 
 **Capability requirement:** `thread_cap` MUST have Observe rights.
 
 **Errors:** `InvalidCapability`, `InsufficientRights` (cap lacks Observe), `InvalidState`
 (thread neither stopped nor fault-blocked), `InvalidArgument` (buffer too small or
-invalid pointer).
+null pointer), `InvalidAddress` (buffer not wholly in the user half, or not mapped
+writable).
 
 ---
 
@@ -1353,15 +1433,19 @@ Write register state into a stopped thread from a caller-supplied buffer.
 The thread MUST be in `Stopped` state, or fault-blocked awaiting a fault-handler
 reply (`BlockedOnFault`) — the latter lets a bound fault handler advance the PC
 or otherwise edit the faulting thread before replying (see
-[`docs/fault-handling.md`](../../../docs/fault-handling.md)). The kernel validates
-that the register values are safe (e.g. the instruction pointer is in a canonical
-range; privilege bits cannot be set).
+[`docs/fault-handling.md`](../../../docs/fault-handling.md)). The kernel sanitizes
+the frame per architecture ([arch-interface.md](arch-interface.md) § `trap_frame` —
+`arch::current::trap_frame`): a non-user instruction pointer (on x86-64, also a non-user
+stack pointer) is rejected with `InvalidArgument`; x86-64 forces ring-3 selectors and
+clears privileged RFLAGS bits; RISC-V applies `sstatus` as supplied, so a supplied SPP or
+SUM bit reaches hardware on resume ([#443](https://github.com/kottlerg/seraph/issues/443)).
 
 **Capability requirement:** `thread_cap` MUST have Control rights.
 
 **Errors:** `InvalidCapability`, `InsufficientRights` (cap lacks Control), `InvalidState`
-(thread neither stopped nor fault-blocked), `InvalidArgument` (buffer wrong size, invalid
-pointer, or illegal register values).
+(thread neither stopped nor fault-blocked), `InvalidArgument` (buffer smaller than the
+register file, null pointer, or illegal register values), `InvalidAddress` (buffer not
+wholly in the user half, or not mapped readable).
 
 ---
 
@@ -1476,8 +1560,9 @@ Add an IPC primitive to a wait set.
 The `badge` is chosen by the caller to identify the source in a subsequent
 `SYS_WAIT_SET_WAIT` result. The kernel does not interpret it.
 
-**Capability requirements:** `wait_set_cap` (Modify), `source_cap` (at least one of
-Receive/Wait/Recv rights on the source).
+**Capability requirements:** `wait_set_cap` (Modify), `source_cap` (the receive-side
+right matching its type: Receive on an Endpoint, Wait on a Notification, Recv on an
+EventQueue).
 
 **Errors:** `InvalidCapability`, `InsufficientRights` (wait set lacks Modify, or source
 lacks Receive/Wait/Recv), `InvalidArgument` (wait set full, or source already in a wait set).
@@ -1546,8 +1631,10 @@ interrupt controller.
 
 The kernel masks the interrupt line before delivering the notification to the driver
 (see [docs/architecture.md](../../../docs/architecture.md) — Driver Model). The driver
-must call `SYS_IRQ_ACK` to re-enable the line. Calling `SYS_IRQ_ACK` without a
-prior interrupt delivery has no effect.
+must call `SYS_IRQ_ACK` to re-enable the line. `SYS_IRQ_REGISTER` leaves the line
+masked, so the driver's first `SYS_IRQ_ACK` after registering is what enables delivery;
+`SYS_IRQ_ACK` unmasks the line unconditionally, whether or not an interrupt has been
+delivered since the last acknowledgement.
 
 **Capability requirement:** `irq_cap` MUST be a valid interrupt capability for the
 specific line.
@@ -1603,9 +1690,10 @@ Permission Bitmap (IOPB).
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
 
 Multiple bindings may be made to the same thread, each authorising a different port
-range. When `ioport_cap` is revoked, port access is removed from all threads it has
-been bound to; access is always revocable (design intent; not yet implemented —
-revocation does not yet withdraw bound IOPB access, #457; see
+range. Revoking `ioport_cap` is intended to remove port access from every thread bound
+through its descendants; the revoked capability itself is preserved, so bindings made
+through it remain (design intent; not yet implemented — `SYS_IOPORT_BIND` records no
+binding and revocation does not withdraw bound IOPB access, #457; see
 [capability-model.md](../../../docs/capability-model.md) § IoPort (x86-64 only)).
 
 **Capability requirements:** `thread_cap` (Control rights), `ioport_cap` (Use rights).
@@ -1718,37 +1806,6 @@ stack so the first scheduler switch enters user mode at `entry`.
 
 ---
 
-### `SYS_CAP_CREATE_CSPACE` (12)
-
-Retype a Memory capability into a new, empty CSpace (create-mode), or donate carved
-pages to an existing CSpace's slot-page pool (augment-mode).
-
-**Arguments:**
-
-| # | Name | Description |
-|---|---|---|
-| 0 | `memory_cap` | Memory capability (Retype rights) the CSpace slab is carved from |
-| 1 | `augment_cap` | `0` for create-mode; otherwise a CSpace cap (Insert rights) whose slot-page pool receives the carved pages |
-| 2 | `init_pages` | Pages to carve (page 0 is the wrapper; pages `1..init_pages` seed the slot-page pool) |
-| 3 | — | Reserved (formerly `max_slots`); MUST be `0` in both modes, else `InvalidArgument` |
-
-**Return:** `rax`/`a0`: create-mode — new CSpace capability (Insert + Delete + Derive
-rights); augment-mode — `0`. `SyscallError` on failure.
-
-Augment-mode donations are unbounded in count, with the same bookkeeping as
-`SYS_CAP_CREATE_ASPACE`: once per record page a donation's first page is kept by
-the kernel and only `init_pages − 1` pages reach the pool (see
-[capability-internals.md](capability-internals.md) § Donation Records).
-
-**Capability requirements:** `memory_cap` (Retype); in augment-mode, `augment_cap` (Insert).
-
-**Errors:** `InvalidArgument` (`init_pages` 0 or overflow, or arg 3 non-zero),
-`InvalidCapability`, `InsufficientRights` (source Memory cap lacks Retype, or augment
-target lacks Insert), `OutOfMemory` (Memory cap region or slot-page pool exhausted),
-`QuotaExceeded` (caller's CSpace directory structurally full).
-
----
-
 ## Cross-CSpace Syscalls
 
 ### `SYS_CAP_COPY` (24)
@@ -1763,17 +1820,18 @@ derivation tree node (child of the source slot).
 | 0 | `src_cap` | Capability to copy (source slot in caller's CSpace) |
 | 1 | `dst_cspace_cap` | Target CSpace capability (Insert rights) |
 | 2 | `dst_slot` | Destination slot index in the target CSpace, or `0` to let the kernel allocate a free slot (slot 0 is permanently null, so it is a safe "kernel picks" sentinel) |
-| 3 | `rights_mask` | Rights for the copy (must be subset of source rights) |
+| 3 | `rights_mask` | Rights for the copy; the effective rights are `rights_mask & source_rights` (bits the source lacks are silently masked off, not rejected) |
 
-**Return:** `rax`/`a0`: the destination slot index on success; `SyscallError` on
-failure.
+**Return:** `rax`/`a0`: the destination capability handle (slot index plus generation) on
+success; `SyscallError` on failure.
 
 The copy is a derivation (child of `src_cap` in the tree). Both the original and
 the copy remain valid. With `dst_slot == 0` the kernel auto-allocates a free
 slot (and returns it); with a non-zero `dst_slot` the cap is placed at that
 caller-chosen index — the path init uses to populate well-known slots in new
 service CSpaces before starting their threads. This caller-chosen-slot mode
-absorbed the former `SYS_CAP_INSERT` (slot 32, now reserved).
+absorbed the former `SYS_CAP_INSERT`, whose number 32 `SYS_THREAD_SET_FAULT_HANDLER` now
+reuses.
 
 A high explicit `dst_slot` materialises every intermediate leaf page up to
 its own, drawn from the destination's slot-page pool (donor-funded, in
@@ -1785,7 +1843,8 @@ grow — stay behind as ordinary free capacity, and the pool pages they
 consumed stay spent (see [capability-internals.md](capability-internals.md) § Storage:
 Hybrid Two-Level Radix).
 
-**Capability requirements:** `src_cap` (at least one right), `dst_cspace_cap` (Insert).
+**Capability requirements:** `src_cap` (any non-null capability; no right is checked),
+`dst_cspace_cap` (Insert).
 
 The source is revalidated under the derivation lock before the copy is linked
 beneath it (see [capability-internals.md](capability-internals.md) § Global
@@ -1834,7 +1893,7 @@ for any other slot.
 |---|---|---|
 | 0 | `src_cap` | Capability to move (source slot in caller's CSpace) |
 | 1 | `dst_cspace_cap` | Target CSpace capability (Insert rights) |
-| 2 | `dst_slot` | Destination slot index in the target CSpace |
+| 2 | `dst_slot` | Destination slot index in the target CSpace, or `0` to let the kernel allocate a free slot |
 
 **Return:** `rax`/`a0`: the destination capability handle on success;
 `SyscallError` on failure.
@@ -1878,7 +1937,8 @@ Translate a user virtual address to its mapped physical address.
 
 **Errors:**
 - `InvalidAddress` — `virt` is not page-aligned, outside the user half
-  (`>= 0x0000_8000_0000_0000`), or not currently mapped.
+  (at or above `user_va_top`: `1 << 47` on x86-64; on riscv64 the active paging mode's
+  boundary, `1 << 38` / `1 << 47` / `1 << 56`), or not currently mapped.
 - `InvalidCapability` — cap slot is null, wrong type, or the object is gone.
 - `InsufficientRights` — cap does not have the `READ` right.
 
@@ -1960,7 +2020,7 @@ Query a scalar system value. Returns a single `u64` in `rax`/`a0` — no buffer 
 | # | Name | Description |
 |---|---|---|
 | 0 | `info_type` | Which value to query (see `SystemInfoType` below) |
-| 1 | _(unused)_ | Must be 0 |
+| 1 | _(unused)_ | Ignored by the kernel; the `shared/syscall` wrapper passes 0 |
 
 **Return:** `rax`/`a0`: the queried value on success; negative `SyscallError` on failure.
 
@@ -2031,7 +2091,7 @@ Forward a sanctioned SBI firmware call to M-mode on RISC-V, gated by a per-exten
 **Return:** `rax`/`a0`: the SBI call's return value on success; `SyscallError` on
 failure. A nonzero SBI firmware error collapses to `NotSupported`.
 
-Only a fixed set of extensions is forwardable (e.g. SRST, SUSP, CPPC, BASE, DBCN, PMU);
+Only a fixed set of six extensions is forwardable (SRST, SUSP, CPPC, BASE, DBCN, PMU);
 each maps to a distinct `SbiControl` right. Extensions outside that set are rejected
 (see [capability-model.md](../../../docs/capability-model.md) § SbiControl (RISC-V only)).
 
@@ -2047,7 +2107,7 @@ each maps to a distinct `SbiControl` right. Extensions outside that set are reje
 ### `SYS_GETRANDOM` (55)
 
 Fill a user buffer with CSPRNG-quality random bytes drawn from the kernel
-entropy pool (see [docs/entropy.md](entropy.md)). Each call draws fresh from the
+entropy pool (see [entropy.md](entropy.md)). Each call draws fresh from the
 kernel's per-CPU forward-secure generator; userspace holds no generator state.
 
 **Arguments:**
@@ -2067,11 +2127,11 @@ name no object and confer no authority; the call is draw-only and injects no
 entropy.
 
 **Errors:** `InvalidArgument` (`len > MAX_GETRANDOM_LEN`); `InvalidAddress`
-(null buffer, or a span not wholly within the user half); `WouldBlock` (pool not
-yet seeded — unreachable in practice).
+(null buffer, a span not wholly within the user half, or a span that is unmapped or
+read-only); `WouldBlock` (pool not yet seeded — unreachable in practice).
 
-Larger buffers are filled by looping in `MAX_GETRANDOM_LEN`-byte chunks, which
-bounds the per-call interrupt-off window of the kernel draw (see
+Callers fill larger buffers by looping in `MAX_GETRANDOM_LEN`-byte chunks; the per-call
+cap bounds the per-call interrupt-off window of the kernel draw (see
 [entropy.md](entropy.md) § Draw API and consumers).
 
 ---
@@ -2115,17 +2175,18 @@ intact (see [capability-internals.md](capability-internals.md) § Safe Delegatio
   outcomes of a move batched after commit are specified in
   [capability-internals.md](capability-internals.md) § Move.
 
-- **Capability operations complete before returning.** Derivation, deletion, and
-  revocation each complete fully before the syscall returns. A revocation that
-  affects capabilities in other processes completes before `SYS_CAP_REVOKE`
-  returns; a large revocation proceeds in bounded batches, so other CPUs can
-  observe not-yet-revoked descendants (still usable) mid-syscall — the fully
-  revoked state is guaranteed only at return (see
+- **Capability operations complete before a successful return.** Derivation, deletion, and
+  revocation each complete fully before the syscall returns success; the `Interrupted` and
+  `InvalidState` returns of `SYS_CAP_DELETE` and `SYS_CAP_REVOKE` leave the work partially
+  done (see those sections). A revocation that affects capabilities in other processes
+  completes before `SYS_CAP_REVOKE` returns success; a large revocation proceeds in bounded
+  batches, so other CPUs can observe not-yet-revoked descendants (still usable) mid-syscall —
+  the fully revoked state is guaranteed only at a successful return (see
   [capability-internals.md](capability-internals.md) § Revocation Algorithm).
 
 - **Memory mapping operations are atomic with respect to the address space.** After
-  `SYS_MEM_MAP` or `SYS_MEM_UNMAP` returns, every CPU observes the updated mapping on
-  its next access. Rewrites that could leave a dangerous stale entry (unmap,
+  `SYS_MEM_MAP`, `SYS_MEM_UNMAP`, or `SYS_MEM_PROTECT` returns, every CPU observes the
+  updated mapping on its next access. Rewrites that could leave a dangerous stale entry (unmap,
   permission narrowing, frame replacement) complete a synchronous cross-CPU TLB
   shootdown before returning; fresh maps and permission widenings instead rely on the
   page-fault handler's spurious-fault retry, which re-walks the live page table on
@@ -2139,8 +2200,12 @@ intact (see [capability-internals.md](capability-internals.md) § Safe Delegatio
   § Lock Hierarchy).
 
 - **Blocking syscalls are interruptible.** Any syscall that can block (`SYS_IPC_CALL`,
-  `SYS_IPC_RECV`, `SYS_NOTIFICATION_WAIT`, `SYS_EVENT_RECV`, `SYS_WAIT_SET_WAIT`) returns
-  `Interrupted` if the calling thread is stopped via `SYS_THREAD_STOP`.
+  `SYS_IPC_RECV`, `SYS_NOTIFICATION_WAIT`, `SYS_EVENT_RECV`, `SYS_WAIT_SET_WAIT`,
+  `SYS_THREAD_SLEEP`) returns `Interrupted` if the calling thread is stopped via
+  `SYS_THREAD_STOP`. This does not hold for a `SYS_IPC_CALL` caller displaced from a server's
+  pending-reply binding (see § `SYS_THREAD_STOP` and
+  [ipc-design.md](../../../docs/ipc-design.md) § The Call/Reply Model,
+  [#443](https://github.com/kottlerg/seraph/issues/443)).
 
 ---
 

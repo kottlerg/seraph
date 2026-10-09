@@ -10,7 +10,7 @@ hardware-source health gating, and a boot-time power-on self-test.
 
 This subsystem is the kernel's sole source of randomness, for both
 kernel-internal consumers and the userspace `SYS_GETRANDOM` syscall (see
-[docs/syscalls.md](syscalls.md)). Kernel consumers call `fill_bytes` directly;
+[core/kernel/docs/syscalls.md](syscalls.md)). Kernel consumers call `fill_bytes` directly;
 userspace draws through the syscall, which fills the caller's buffer from the
 same per-CPU generators. Userspace holds **no** generator state of its own — every
 draw advances the kernel generator — so the two surfaces share the per-CPU
@@ -115,7 +115,10 @@ answer; the permutation against the FIPS-202 zero-state vector (see Testing).
   across a blocking operation.
 - The raw pool is never exposed. Callers either `absorb` into it or `draw_seed`
   from it; consumer-facing output comes only from the per-CPU generators.
-- A `SEEDED` flag gates draws: `draw_seed` is valid only after `mark_seeded`.
+- A `SEEDED` flag (`mark_seeded` / `is_seeded`) records that the pool holds its initial
+  seed. `draw_seed` does not consult it; `fill_bytes` debug-asserts it, and the
+  `SYS_GETRANDOM` handler and the Phase 9 init-layout and image-bias draws check
+  `is_seeded` before drawing.
 - Both operations exist in blocking and non-spinning forms (`try_absorb`,
   `try_draw_seed`, built on `Spinlock::try_lock_raw`). Mandatory reseeds use
   the blocking forms (short, bounded critical sections); the frequent
@@ -148,8 +151,9 @@ The reseed policy is a pure, host-tested decision function
   (`jitter::collect` — the staging words, the sample count, and the
   instantaneous cycle counter, so every contribution carries fresh timing),
   draws `RESEED_BYTES` (32 — a 256-bit reseed) of fresh seed material, and
-  absorbs it; the seed buffer is then zeroed. A mandatory reseed triggered by
-  a GUID change additionally absorbs the new GUID into the pool first.
+  absorbs it; the seed buffer is then zeroed. Whenever VMGENID detection is
+  armed, every mandatory reseed additionally absorbs the live GUID into the pool
+  after the jitter fold and before the seed draw.
 - The draw interval bounds how much output depends on any single seed without
   making the reseed cost (a pool lock plus permutations) a per-draw expense;
   the time budget bounds it in wall-clock terms and is the riscv64
@@ -206,9 +210,10 @@ At boot, runtime jitter has not yet accumulated. `seed_pool_from_sources` mixes:
 
 1. The firmware boot seed where the bootloader supplied one, absorbed directly
    (it is already conditioned).
-2. The hardware RNG where present, drawn under a fresh health monitor up to a
-   bounded number of words (margin for RDSEED retries), absorbed only while the
-   source has not failed.
+2. The hardware RNG where present, drawn word by word under a fresh health
+   monitor until the 1024-byte startup run passes (128 words), a health test
+   fails, or the source returns no word (each `hw_rng_u64` call retries
+   internally), absorbed only while the source has not failed.
 3. A boot jitter scrape: cycle-counter samples taken across intervening pool
    work, whose microarchitectural timing perturbs successive reads.
 
@@ -220,7 +225,8 @@ own — and it hands the bootloader ACPI, not a DTB, so the QEMU-authored DTB
 `/chosen/rng-seed` never reaches the bootloader either — but the firmware's
 `VirtioRngDxe` driver binds a `virtio-rng` device and exposes `EFI_RNG_PROTOCOL`
 through it. The default QEMU boot set therefore includes `virtio-rng-pci` on both
-arches (added for KASLR, [#252](https://github.com/kottlerg/seraph/issues/252)),
+arches (added for KASLR, [#252](https://github.com/kottlerg/seraph/issues/252))
+([xtask/README.md § Attached devices](../../../xtask/README.md#attached-devices)),
 which closes the riscv64 boot-entropy hole: the boot log shows
 `entropy: seeded from boot seed (N bytes)` on riscv64. Where no such
 device is present, riscv64 falls back to jitter only — narrowed continuously at
@@ -239,11 +245,17 @@ splits its single seed non-overlapping for the same reason); see
 
 The first *consumer* draw is decoupled from the boot scrape: the Phase 5/8
 self-test capture is each generator's first draw and necessarily seeds from
-the boot-time pool (scrape-dominated on riscv64), so the capture is followed
-by marking the generator stale (`CpuRng::mark_stale`). The first real
-consumer draw — Phase 9 ASLR on the BSP, typically seconds later — then
-performs a mandatory reseed carrying the tick/IRQ jitter accrued in between,
-rather than riding the 64-sample scrape.
+the boot-time pool (scrape-dominated on a jitter-only boot, such as riscv64
+without `virtio-rng`), so the capture is followed by marking the generator
+stale (`CpuRng::mark_stale`). On the BSP the first real consumer draw is
+Phase 8 idle-thread creation (`sched::alloc_thread_id` via `next_u32`),
+milliseconds after Phase 5. Its mandatory reseed folds an accumulator that
+holds no tick samples yet (`timer_tick` returns before sampling while the BSP
+boot transient is active, from Phase 4 until `sched::enter`), so it adds only
+the instantaneous cycle counter `jitter::collect` reads; the Phase 9 ASLR
+draws then come from that state. An AP's first consumer draw follows
+`sched::enter`, so its mandatory reseed carries the tick/IRQ jitter accrued
+since its capture.
 
 The riscv64 *runtime* hardware-RNG path — a virtio-rng/hwrng device owned by a
 userspace driver, the mechanism the RISC-V design intends for lower privilege
@@ -268,9 +280,11 @@ byte-wise:
   the source is `trusted`.
 
 On any failure the source is permanently distrusted (`failed`) and the
-subsystem proceeds on jitter alone. Because the hardware RNG is never the sole
-input, a source that passes startup but later degrades still cannot by itself
-determine pool output.
+subsystem proceeds without it (on the firmware boot seed, where present, and
+jitter). The hardware RNG is drawn only during this Phase 5 startup run
+(`seed_pool_from_sources` stops at the word that completes startup), so the
+continuous tests see no post-startup output; because it is never the sole
+input, its output cannot by itself determine pool output.
 
 These tests gate the *raw* hardware RNG only. The boot seed is a pre-conditioned
 DRBG output (`EFI_RNG_PROTOCOL`) or the firmware-supplied bytes of the DTB
@@ -299,8 +313,8 @@ draws in procmgr/init/`std::sys::seraph`) consumes the same generators through
 `SYS_GETRANDOM` (see [docs/userspace-memory-model.md](../../../docs/userspace-memory-model.md)).
 Without a firmware boot seed (a riscv64 boot without
 `virtio-rng`, #393) the pool seeds from timing jitter alone and those draws
-carry the boot-entropy-hole caveat above. The boot self-test is the API's
-continuous validator.
+carry the boot-entropy-hole caveat above. The power-on self-test (§ Testing)
+validates the API once per boot.
 
 ## Boot wiring and lifecycle
 
@@ -328,10 +342,10 @@ continuous validator.
   a multi-block squeeze; sponge determinism, seed-sensitivity, fill advancement,
   and forward-secrecy erasure; health-test cutoffs and stuck/biased-source
   trips; the full reseed-policy decision matrix (boundaries included); and the
-  bootloader's VGIA scanner. The permutation, sponge, and reseed policy are
-  pure and host-testable; the pool, per-CPU generators, jitter, VMGENID
-  consumer, and draw API are hardware-coupled and built only for the kernel
-  target.
+  bootloader's VGIA scanner. The permutation, sponge, health tests, and reseed
+  policy are pure and host-testable; the pool, per-CPU generators, jitter,
+  VMGENID consumer, self-test, and draw API are hardware-coupled and built only
+  for the kernel target.
 - **In-kernel power-on self-test**: each CPU captures a sample from its own
   generator as it comes online; after SMP bringup the BSP asserts every sample
   is non-trivial, samples are pairwise distinct (per-CPU independence), and the

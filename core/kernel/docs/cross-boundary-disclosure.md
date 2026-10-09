@@ -4,9 +4,12 @@ Enumerates every value the kernel emits across the user/kernel boundary and
 classifies it toward the goal that no kernel virtual address or kernel pointer
 escapes to userspace — a prerequisite for kernel address-space layout
 randomization (KASLR). Known open disclosures: the x86-64 fault-message present
-bit ([#443](https://github.com/kottlerg/seraph/issues/443)), mirrored console
-diagnostics ([#440](https://github.com/kottlerg/seraph/issues/440)), and unzeroed
-bootloader frames ([#439](https://github.com/kottlerg/seraph/issues/439)).
+bit ([#443](https://github.com/kottlerg/seraph/issues/443)), the unpinned
+`SYS_THREAD_READ_REGS` trap-frame copy under a concurrent last-cap delete
+([#443](https://github.com/kottlerg/seraph/issues/443)), kernel state in donated
+memory that the donor can still map ([#433](https://github.com/kottlerg/seraph/issues/433)),
+mirrored console diagnostics ([#440](https://github.com/kottlerg/seraph/issues/440)), and
+unzeroed bootloader frames ([#439](https://github.com/kottlerg/seraph/issues/439)).
 
 ---
 
@@ -16,7 +19,9 @@ KASLR randomizes the kernel's virtual base. A single kernel virtual address (VA)
 kernel pointer, or value derived from one that reaches userspace defeats base
 randomization. This inventory audits the kernel's complete output surface and
 records, per surface, why it carries no kernel VA or, for each known open
-disclosure ([#443](https://github.com/kottlerg/seraph/issues/443),
+disclosure ([#443](https://github.com/kottlerg/seraph/issues/443), including the
+unpinned `SYS_THREAD_READ_REGS` trap-frame copy,
+[#433](https://github.com/kottlerg/seraph/issues/433),
 [#439](https://github.com/kottlerg/seraph/issues/439),
 [#440](https://github.com/kottlerg/seraph/issues/440)), what it leaks. It is the
 standing reference the coding-standards rule "Cross-Boundary Data Hygiene"
@@ -49,27 +54,28 @@ Each surface is classified as one of:
 
 Every syscall returns `Result<u64, SyscallError>` marshalled into a single return
 register (`rax` on x86-64, `a0` on RISC-V) by `TrapFrame::set_return`; multi-value
-IPC returns use the `set_ipc_*` family. No handler returns a raw pointer: the
+returns (IPC, the notification / event-queue / wait-set waits, and the split handlers'
+second cap handle) use the `set_ipc_*` family. No handler returns a raw pointer: the
 return type is uniformly integer, and the only address-valued returns are physical
 (class **e**). The dispatch table is `syscall::dispatch`; the full numbered table
-is in [docs/syscalls.md](syscalls.md).
+is in [core/kernel/docs/syscalls.md](syscalls.md).
 
 | Surface | Anchor (stable identifier) | Class |
 |---|---|---|
 | Syscall return convention; no raw-pointer return path | `syscall::dispatch`, `TrapFrame::set_return` | b/c/d |
-| `SYS_CAP_INFO` tag/rights (rights half is type-scoped, interpreted via the tag in the high half), thread-state, TLB / cspace / memory counts | `cap::sys_cap_info` | c/d |
+| `SYS_CAP_INFO` tag/rights (rights half is type-scoped, interpreted via the tag in the high half), thread-state, TLB / cspace / memory / address-space page-table budget counts, memory has-retype flag | `cap::sys_cap_info` | c/d |
 | `CAP_INFO_MEMORY_PHYS_BASE` → `MemoryObject::base` | `cap::sys_cap_info`, `cap::object::MemoryObject` | **e** |
-| `SYS_SYSTEM_INFO` (version, cpu count, page size, elapsed µs, current cpu) | `sysinfo::sys_system_info` | c/d |
+| `SYS_SYSTEM_INFO` (kernel and boot-protocol versions, cpu count, page size, elapsed µs, current cpu) | `sysinfo::sys_system_info` | c/d |
 | `SYS_ASPACE_QUERY` → leaf physical address of a user page | `sysinfo::sys_aspace_query`, `AddressSpace::query_page` | **e** |
-| `SYS_THREAD_READ_REGS` / `WRITE_REGS` → target thread's user `TrapFrame` | `thread::sys_thread_read_regs`, `TrapFrame::sanitize_for_user_resume` | b/d |
+| `SYS_THREAD_READ_REGS` / `WRITE_REGS` → target thread's user `TrapFrame` | `thread::sys_thread_read_regs`, `TrapFrame::sanitize_for_user_resume` | b/d; freed kernel memory under a concurrent last-cap delete ([#443](https://github.com/kottlerg/seraph/issues/443)) |
 | `SYS_GETRANDOM` → random bytes into a user buffer + byte count | `entropy::sys_getrandom` | d |
-| `SYS_SBI_CALL` → firmware `sbiret.value` + error code (RISC-V; args caller-supplied) | `sbi::sys_sbi_call` | d |
+| `SYS_SBI_CALL` → firmware `sbiret.value` on success, `NotSupported` on any firmware error (RISC-V; args caller-supplied) | `sbi::sys_sbi_call` | d |
 | `SYS_IPC_BUFFER_SET` → status only (validates user-half, page-aligned VA) | `syscall::sys_ipc_buffer_set` | (no output) |
 | Cap split / create / derive handlers → opaque cap handles | `mem::sys_memory_split`, `hw::sys_mmio_split`, `cap::sys_cap_derive` | c |
 | IPC `Message` label / badge / data[] / cap_slots[] | `ipc::message::Message`, `ipc::{read_ipc_buf, write_ipc_buf, write_cap_results}` | b/c |
 | Fault message `kind` / `d1` / `d2` / `ip` (user VA or hardware code) + label / badge | `ipc::fault::FaultInfo`, `redirect_user_page_fault`, `redirect_user_exception`, `fault_info_for` | b/d; **a** on x86-64 ([#443](https://github.com/kottlerg/seraph/issues/443)) |
 | Exit / death reason encoding + death payload `(correlator << 32) \| reason` | `syscall::encode_exit_code`, `EXIT_*` constants, `sched::post_one_death_event` | c/d |
-| Thread ID (random CSPRNG correlator; no `tid → TCB` table; never returned as data) | `sched::alloc_thread_id` | c |
+| Thread ID (random CSPRNG correlator for every thread but init, whose ID is the fixed value 1; no `tid → TCB` table; never returned as data) | `sched::alloc_thread_id` | c/d |
 | `CSpaceId` (registry index, never returned to userspace); capability badges (caller-chosen) | `cap::alloc_cspace_id`, `cap::slot::CapabilitySlot::badge` | c |
 | Boot-time `InitInfo` handover — kernel writes a read-only struct into init's mapped region | `init_protocol::InitInfo`, `init_protocol::CapDescriptor` | b/c/d/e |
 
@@ -95,8 +101,13 @@ Notes on the non-obvious entries:
   RISC-V never sets the bit. No other word carries a kernel VA or a value derived from
   one. The forwarded/readable `TrapFrame` holds only user-mode register state (no kernel
   stack pointer, kernel return address, or `CR3`/`satp`); the write path re-validates
-  through `sanitize_for_user_resume`.
-- **Thread IDs** are random per `sched::alloc_thread_id` (issue #248;
+  through `sanitize_for_user_resume`. `sys_thread_read_regs` does not pin the TCB it
+  resolves through `lookup_cap`, so a sibling's concurrent delete or revoke of the last
+  Thread capability can free the thread slab while `copy_to_user` reads its trap frame,
+  and freed or reused kernel memory reaches the caller; closing it is
+  [#443](https://github.com/kottlerg/seraph/issues/443).
+- **Thread IDs** are random per `sched::alloc_thread_id`, except init's, which is the
+  fixed value 1 (class **d**) (issue #248;
   [scheduling-internals.md](scheduling-internals.md) § Cross-CPU TCB Ownership) — a
   monotonic id would leak thread creation counts/rates wherever logged. They are diagnostic
   correlators only and never cross the boundary as syscall data.
@@ -104,8 +115,12 @@ Notes on the non-obvious entries:
   returns the firmware result; neither the arguments the kernel forwards nor the
   value it returns is kernel-derived.
 - **`InitInfo` handover** is the boot-time kernel→init struct written into a
-  read-only region the kernel maps at the fixed *user* VA `INIT_INFO_VADDR`
-  (class **b** — a userspace address by ABI contract). Its `*_cap` / `*_base`
+  read-only region the kernel maps at a per-boot user VA (`InitLayout::init_info_va`,
+  drawn by `mm::address_space::choose_init_layout` from `INIT_INFO_WINDOW`, with
+  `DEFAULT_INIT_INFO_VA` as the unseeded fallback) and passes to init in its first
+  argument register (class **b**, a userspace address; see
+  [docs/userspace-memory-model.md](../../../docs/userspace-memory-model.md) § Bootstrap
+  Cross-Boundary VAs). Its `*_cap` / `*_base`
   fields are CSpace slot indices (**c**); versions, counts, and byte-size
   accounting facts including `kernel_reserved_bytes` are quantities, not
   addresses (**d**); the only addresses it carries are physical — each
@@ -129,7 +144,7 @@ Three surfaces emit real addresses. All are **physical**, not kernel virtual:
   capability to.
 
 A physical address does not reveal the kernel's randomized virtual base, and each is
-gated behind a capability the caller already holds, so neither defeats KASLR. They
+gated behind a capability the caller already holds, so none defeats KASLR. They
 are fixed-by-contract disclosures, not leaks.
 
 **Resolved for the KASLR work ([#252](https://github.com/kottlerg/seraph/issues/252)):**
@@ -178,15 +193,17 @@ layout; closing that is
 
 ## Kernel console diagnostics
 
-The kernel's `kprint!` / `kprintln!` macros (`console.rs`) and the register-dump,
-watchdog, and `KERNEL EXCEPTION` paths do format kernel pointers (`{:p}`, `{:#x}`).
-These are **not** a userspace-readable data channel: per the console-model contract
-([docs/console-model.md](../../../docs/console-model.md)), the kernel writes the UART
-directly and never becomes a client of the userspace serial or framebuffer driver,
-and no IPC channel delivers kernel log output to a userspace process as data. The
+The kernel's `kprint!` / `kprintln!` macros (`core/kernel/src/console.rs`) and the
+register-dump, watchdog, and `KERNEL EXCEPTION` paths do format kernel pointers (`{:p}`,
+`{:#x}`). No IPC channel delivers kernel log output to a userspace process as data, but
+`kprintln!` mirrors to the framebuffer, whose memory userspace can read back; only the
+serial-only class ([docs/console-model.md](../../../docs/console-model.md) § Ownership
+across the boot lifecycle) is not userspace-readable. The
 always-on `USERSPACE FAULT` serial dumps print the faulting thread's *own* user
-registers, not kernel addresses. Every kernel VA lies in one of the two regions KASLR
-randomizes (the image or the direct map; see
+registers, not kernel addresses. Every kernel VA outside the low-VA identity mappings
+(the boot-stack mapping and, until Phase 8, the AP trampoline page, whose VAs equal
+their physical addresses) lies in one of the two regions KASLR randomizes (the image
+or the direct map; see
 [docs/memory-model.md](../../../docs/memory-model.md) § Virtual Address Space Layout), so
 kernel-pointer console output is governed by the serial-only rule below; it must not be
 routed to any userspace-reachable IPC or log channel.
@@ -204,8 +221,9 @@ the serial-only sinks
 lock-bypassing `console::panic_write_fmt` and `kprintln_nmi!` /
 `console::nmi_write_fmt`), never `kprintln!`, and never through any IPC or log channel.
 The panic handler's backtrace and the x86-64 NMI backtrace print their kernel addresses
-through those two sinks. The Phase-1 KASLR report prints an address-free status
-line via `kprintln!` and the slide/bases only via `kprintln_serial!`; the Phase-9
+through those two sinks. The Phase-1 KASLR report prints address-free status
+lines (one for the image, one for the direct map) via `kprintln!` and the slide/bases
+only via `kprintln_serial!`; the Phase-9
 init-thread report prints the thread id and priority on one `kprintln!` line and init's
 kernel stack top (a direct-map VA) on a separate `kprintln_serial!` line; the
 bootloader's console (which also mirrors to the framebuffer) prints only the opaque

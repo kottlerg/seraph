@@ -32,7 +32,7 @@ order-`n` block contains 2^n contiguous 4 KiB pages.
 Free-block metadata lives in fixed-size static arrays inside the allocator
 struct, not in the free pages themselves: the bootloader identity-maps only
 specific regions (`BootInfo`, modules, stack, memory map buffer; see
-[boot/docs/page-tables.md](../../boot/docs/page-tables.md) § What Gets Mapped), so
+[core/boot/docs/page-tables.md](../../boot/docs/page-tables.md) § What Gets Mapped), so
 free RAM is not generally writable when the allocator initialises in Phase 2.
 
 ```rust
@@ -46,7 +46,7 @@ pub struct BuddyAllocator
     free_lists: [u16; MAX_ORDER + 1],
     /// Head of the unused-slot pool chain.
     pool_head: u16,
-    // ... counters and the Phase-7 seal flag
+    // ... the pool-init flag, page counters, and the Phase-7 seal flag
 }
 ```
 
@@ -67,9 +67,11 @@ than the boot.
 ### Zone Management
 
 The allocator manages a single zone: one `BuddyAllocator` instance covering all
-usable RAM. It has no zone concept; physical-address-range constraints (e.g.
-DMA reachability) are handled by the userspace memory authority after the
-Phase-7 handoff, per [docs/memory-model.md](../../../docs/memory-model.md) § Buddy Allocator.
+usable RAM. It has no zone concept. Physical-address-range constraints (e.g.
+DMA reachability) are not a kernel concern; they belong to devmgr and the
+userspace memory authority, per [docs/memory-model.md](../../../docs/memory-model.md) § Buddy
+Allocator. Physical-range allocation is design intent, not yet implemented: memmgr's only
+allocation flag is `REQUIRE_CONTIGUOUS`.
 
 ### Allocation and Deallocation Properties
 
@@ -87,10 +89,9 @@ order's free-list length. Coalescing eliminates long-term fragmentation.
 
 ### Thread Safety
 
-The allocator is protected by a single spinlock. Allocation on the kernel hot path
-should be infrequent enough that contention is not a concern. If profiling reveals
-lock contention, per-CPU free lists (magazines) can be layered on top without
-changing the core algorithm.
+The allocator is protected by a single spinlock (`FRAME_ALLOC_LOCK`, taken by
+`mm::with_frame_allocator`). It serves boot only: the Phase 7 drain empties it and `seal`
+closes it, so no runtime path allocates from it and contention is not a concern.
 
 ---
 
@@ -102,13 +103,17 @@ The kernel runs no heap and no `GlobalAlloc`
 queues, wait sets, address spaces, CSpaces, and Memory objects themselves — is
 carved out of a Memory capability by retype: the body is constructed in place
 at the offset the retype allocator returns, its header records the source, and
-the bytes go back to that source when the object's last capability is deleted
-(see [capability-internals.md](capability-internals.md) § Kernel Object
-Reference Counting). The kernel's own objects are retyped from the SEED
+the bytes go back to that source when the object's reference count reaches zero,
+whether a capability (deleted, or removed by a revoke) or a kernel-internal owner
+releases the last reference (see [capability-internals.md](capability-internals.md)
+§ Kernel Object Reference Counting). The kernel's own objects are retyped from the SEED
 reserve, pinned at the Phase 7 handoff from the front of the largest block
 drained from the buddy allocator
-([initialization.md](initialization.md) § Phase 7: Capability System); userspace
-objects come from the capability a `cap_create_*` syscall names. Address spaces and CSpaces
+([initialization.md](initialization.md) § Phase 7: Capability System); the wrapper bodies
+of split-derived caps (the `sys_memory_split` tail and the MMIO, IRQ, I/O-port and
+SchedControl split children) and per-thread IOPB leases are also carved from SEED at
+runtime; every other userspace object comes from the capability a `cap_create_*` syscall
+names. Address spaces and CSpaces
 additionally own a page pool for their page tables and slot pages
 ([capability-internals.md](capability-internals.md) § Page Pools).
 
@@ -141,6 +146,9 @@ pub struct AddressSpace
     /// interrupts (shootdown needs IF=1 to deliver IPIs); preemption is held off
     /// by the caller.
     pt_lock: AtomicBool,
+
+    // ... hardware tag state (`tag`, `tag_gen`, `tlb_gen`) and the
+    // terminal-fault observer state (`death_observers`, `death_lock`, ...)
 }
 ```
 
@@ -148,19 +156,24 @@ pub struct AddressSpace
 
 1. **Creation** (`SYS_CAP_CREATE_ASPACE`): carve a slab from the source
    Memory cap; page 0 holds the wrapper object and the in-place `AddressSpace`,
-   page 1 the zeroed root page table with the kernel higher half mapped (shared
-   across all address spaces via a shared PML4/root entry), and the remaining
+   page 1 the zeroed root page table with the kernel higher half mapped (root
+   entries 256–511 copied from the active root, so every address space shares the
+   kernel's lower-level tables), and the remaining
    pages seed the page-table pool.
 
 2. **Use**: threads reference the `AddressSpace` via their TCB. When scheduled, the
-   scheduler calls `arch::current::paging::activate(root_phys)` to switch the hardware
-   page table.
+   scheduler calls `AddressSpace::activate` to switch the hardware page table (see
+   Context Switch TLB Handling below).
 
 3. **Modification** (`SYS_MEM_MAP`, `SYS_MEM_UNMAP`, `SYS_MEM_PROTECT`): acquire
-   `pt_lock`, call `arch::current::paging::map_user_page`/`unmap_user_page`/
-   `protect_user_page`, then perform TLB management (see TLB Management section below).
+   `pt_lock`, call `arch::current::paging::map_user_page_pooled` (`map_user_page` for
+   a space with no recorded donation) / `unmap_user_page` (`unmap_user_region_pooled`
+   for a `MEM_UNMAP_RECLAIM_PTS` unmap) / `protect_user_page`, then perform TLB
+   management (see TLB Management section below).
 
-4. **Destruction**: when the last capability to the address space is deleted, every
+4. **Destruction**: when the address space's reference count reaches zero (see
+   [capability-internals.md](capability-internals.md) § Kernel Object Reference
+   Counting), every
    donation to its page-table pool — the create-time slab included, with the root
    table and the `AddressSpace` itself — is returned to its source Memory cap
    wholesale (see Page Table Node Ownership below and
@@ -178,12 +191,15 @@ is established by mapping the same memory capability into multiple address space
 
 Local invalidation primitives live in the per-architecture paging modules:
 `arch::current::paging::flush_page` invalidates a single VA on the current CPU
-(`invlpg` / `sfence.vma <va>`), and `flush_tlb_all` invalidates all non-global entries
-(CR3 reload / `sfence.vma zero, zero`). When tagging is active, `flush_page_tagged` and
-`flush_tag` invalidate a single VA or a whole tag for an arbitrary PCID/ASID (`invpcid` /
-`sfence.vma <va>, <asid>` and `sfence.vma zero, <asid>`), independent of the tag currently
-loaded. Cross-CPU invalidation is the shootdown protocol in `mm/tlb_shootdown.rs`. The tag
-allocator and per-address-space tag state live in `mm/tag_allocator.rs`; see
+(`invlpg` / `sfence.vma <va>`), and `flush_tlb_all` drops the current CPU's cached
+translations (a CR3 reload, which invalidates the non-global entries of the loaded PCID /
+`sfence.vma zero, zero`, which invalidates every entry). When tagging is active,
+`flush_page_tagged` and `flush_tag` invalidate a single VA or a whole tag for an arbitrary
+PCID/ASID (`invpcid` / `sfence.vma <va>, <asid>` and `sfence.vma zero, <asid>`),
+independent of the tag currently loaded. Cross-CPU invalidation is the shootdown protocol
+in `mm/tlb_shootdown.rs`. The tag pool and the per-CPU tag state live in
+`mm/tag_allocator.rs`; each address space's own tag state (`tag`, `tag_gen`, `tlb_gen`) is
+in its `AddressSpace`; see
 [docs/memory-model.md](../../../docs/memory-model.md) for the model.
 
 Multi-page ranges use the batched-invalidation window (`inval_batch_begin`, per-page
@@ -237,9 +253,10 @@ load-bearing barrier (paired with fences in the unmap and eviction paths) that c
 switch-away races. Where tagging is unavailable — no hardware tags, or a tag field too
 narrow to provide more usable tags than CPUs — `activate` uses the full-flush path
 `arch::current::paging::activate(root_phys)` (CR3 write with `CR4.PCIDE` clear / `satp`
-ASID 0 + `sfence.vma`) on every switch. When tagging is enabled the pool can never be
-exhausted (the allocator keeps more usable tags than CPUs, and at most one space per CPU is
-active), so a claim always succeeds and no user space ever runs untagged. Threads sharing an
+ASID 0 + `sfence.vma`) on every switch. When tagging is enabled a claim always succeeds: a
+full pool evicts the least-recently-claimed tag not active on any CPU, and because the
+allocator keeps more usable tags than CPUs and at most one space per CPU is active, such a
+tag always exists, so no user space ever runs untagged. Threads sharing an
 address space require no TLB operation on switch
 ([docs/memory-model.md](../../../docs/memory-model.md) § TLB Management). The per-CPU
 elided/performed flush counts are summed by the `CAP_INFO_TLB_*` `cap_info` selectors.
@@ -250,7 +267,10 @@ When a mapping is modified in an address space that has active threads on other 
 stale TLB entries on those CPUs may need invalidation. The leaf PTE is edited under
 the per-address-space `pt_lock`, which is then **released before** any cross-CPU
 work: holding it across the IPI ack-wait would serialize every concurrent map/unmap
-on the address space behind cross-CPU latency.
+on the address space behind cross-CPU latency. Region teardown (`unmap_region_pooled`) is
+the exception: it holds `pt_lock` across its one coarse shootdown so that no CPU can reuse
+a just-freed page-table frame before every TLB and paging-structure cache is clean; the
+contended `pt_lock` path enables interrupts, so a waiting CPU still acks the IPI.
 
 The shootdown itself is lock-free — there is no global shootdown lock and no IPI
 payload. Each CPU owns a request slot. The initiator publishes `(root, virt, pages, tag)`
@@ -268,8 +288,10 @@ into its own slot, sets the pending bit of each target CPU, then sends the IPI:
 A target services the slot only once it observes its own pending bit set, so it never
 reads a half-published request; it invalidates the named VA — or, for a range request
 (`pages > 1`), each page of the span inside one batched-invalidation window — for `tag`
-(so a CPU that has since switched to another space still flushes the right translation)
-and clears its bit. Range flushes from every slot matched in one service pass share a
+when the request carries one (so a CPU that has since switched to another space still
+flushes the right translation; region teardown's range and full-flush requests carry
+`tag == 0` and rely on its `tlb_gen` bump for any CPU that switched away) and clears its
+bit. Range flushes from every slot matched in one service pass share a
 single window, and **every acknowledgement is deferred until the window closes**: a queued
 `sinval.vma` is architecturally complete only when the closing `sfence.inval.ir` retires,
 so acking earlier would let the initiator proceed against a translation the target can
@@ -305,21 +327,16 @@ The direct physical map is set up during Phase 3 of initialization
 usable physical memory. The kernel uses `phys_to_virt` and `virt_to_phys` helpers:
 
 ```rust
-/// Convert a physical address to a kernel virtual address via the direct map.
-/// The physical address must be within usable physical RAM.
-pub fn phys_to_virt(phys: PhysAddr) -> VirtAddr
+/// Convert a physical address to its direct-map virtual address.
+pub fn phys_to_virt(phys: u64) -> u64
 {
-    // direct_map_base() + phys is within the direct physical map region,
-    // which is mapped for all usable RAM during Phase 3 initialization.
-    VirtAddr(direct_map_base() + phys.0)
+    direct_map_base() + phys
 }
 
-/// Convert a kernel virtual address in the direct map to its physical address.
-/// The virtual address must be within the direct physical map region.
-pub fn virt_to_phys(virt: VirtAddr) -> PhysAddr
+/// Convert a direct-map virtual address back to a physical address.
+pub fn virt_to_phys(virt: u64) -> u64
 {
-    debug_assert!(virt.0 >= direct_map_base());
-    PhysAddr(virt.0 - direct_map_base())
+    virt - direct_map_base()
 }
 ```
 
@@ -349,8 +366,9 @@ exist:
   Thread slab — stack, then the page holding the `ThreadObject` and TCB, then
   the per-thread FPU/SIMD save area — which `SYS_CAP_CREATE_THREAD` carves from
   the caller's Memory capability, and boot code carves from the SEED reserve
-  for init's own thread; the slab returns to that capability when the thread's
-  last capability is deleted.
+  for init's own thread; the slab returns to its source when the thread's
+  reference count reaches zero (see [capability-internals.md](capability-internals.md)
+  § Kernel Object Reference Counting).
 
 ---
 
@@ -380,7 +398,7 @@ source Memory cap, which reclaims the pool-drawn nodes with it, and the root
 table goes with the create-time slab. Kernel-direct nodes are never returned
 to the kernel page-table pool. Only init's bootstrap space holds any, and
 procmgr destroys it at init's reap (see
-[process-lifecycle.md § Init reap](../../../docs/process-lifecycle.md#init-reap)),
+[docs/process-lifecycle.md § Init reap](../../../docs/process-lifecycle.md#init-reap)),
 so they stay consumed. This residue is an accepted cost, not a defect or
 design intent to reclaim: it is bounded by the pool seed (`POOL_SEED_PAGES`,
 64 pages), and the pool is a fixed kernel reserve accounted as

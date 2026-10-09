@@ -67,16 +67,15 @@ static SPINNER_ARGS: spawn::ArgBlock<SpinnerArgs, MAX_PINNED> = spawn::ArgBlock:
 /// `cap_delete` never has to reap a running thread.
 static EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 
-/// Worker entry: notification "ready" with this worker's unique bit, then
+/// Worker entry: `notification_send` this worker's unique bit on `ready`, then
 /// loop yielding until the parent sets `EXIT_REQUESTED`. On exit,
 /// notify the parent's `done_slot` with the same unique bit so the
 /// parent knows it's safe to `cap_delete`.
 ///
-/// `arg`: address of this worker's [`SpinnerArgs`]. Unique bits matter: the
-/// kernel's notification cap is a 64-bit OR-accumulator,
-/// so if all workers sent the same bit (`0x1`), N concurrent
-/// `notification_send`s collapse to one wakeup and the parent's `notification_wait`
-/// loop hangs on the second iteration.
+/// `arg`: address of this worker's [`SpinnerArgs`]. Each worker sends a unique
+/// bit: notification bits coalesce (see docs/ipc-design.md § Notifications), so
+/// identical bits from N workers would wake the parent's `notification_wait` loop
+/// once and hang it on the second iteration.
 fn shootdown_spinner_entry(arg: u64) -> !
 {
     // SAFETY: `arg` is the entry the bench published for this worker.
@@ -96,7 +95,8 @@ fn shootdown_spinner_entry(arg: u64) -> !
     thread_exit()
 }
 
-#[allow(clippy::too_many_lines)] // setup + measure loop + cooperative teardown.
+// too_many_lines: setup + measure loop + cooperative teardown form one sequence.
+#[allow(clippy::too_many_lines)]
 pub(super) fn bench_tlb_shootdown(ctx: &crate::TestContext, iters: u32)
 {
     const BENCH_VA: u64 = 0x1_6200_0000;
@@ -104,7 +104,8 @@ pub(super) fn bench_tlb_shootdown(ctx: &crate::TestContext, iters: u32)
     // Print the header up front so failures in the spawn / notification_wait /
     // measure loop are bisectable on the boot log instead of looking
     // like the bench never ran. Min/mean/max are logged after teardown
-    // if the measure loop made progress.
+    // whenever `iters > 0`, including after a loop that broke early (the mean
+    // divides by `iters`, not the completed count; #444).
     log_bench_header("tlb_shootdown_unmap", iters);
 
     let cpus = system_info(SystemInfoType::CpuCount as u64).unwrap_or(1);
@@ -187,9 +188,8 @@ pub(super) fn bench_tlb_shootdown(ctx: &crate::TestContext, iters: u32)
     crate::log_u64("ktest: bench  pinned_workers=", spawned as u64);
 
     // Wait for every spawned child's unique ready-bit (saturate then drop
-    // the loop). Single-shot notification_wait would race when N workers post
-    // identical bits concurrently — the kernel OR-accumulates and only
-    // wakes the parent once. Each worker sends `1 << i` instead.
+    // the loop). Identical bits from N workers would coalesce into one
+    // wakeup (docs/ipc-design.md § Notifications), so each worker sends `1 << i`.
     if spawned > 0
     {
         let all_ready = (1u64 << spawned) - 1;
@@ -296,16 +296,13 @@ fn teardown(
 // ── Concurrent-initiator variant ───────────────────────────────────────────────
 //
 // `bench_tlb_shootdown` above measures a single initiator (CPU 0) shooting down
-// `N` passive holders — the per-shootdown *hold* cost (IPI send + ack wait),
-// which scales with target count. This variant instead makes *every* pinned
-// worker an initiator: each loops map/unmap on its own VA and times both its
-// own `mem_map` (a fresh map, whose remote shootdown the operation-class
-// elision skips) and its own `mem_unmap` (synchronous shootdown). With `W`
-// concurrent initiators each publishing into its own
-// per-CPU request slot, the only residual cross-initiator cost is the
-// same-address-space `pt_lock` and the ack tail, so the concurrent mean tracks
-// the single-initiator mean. This bench is the regression guard for that parity:
-// a change that reintroduced system-wide shootdown serialization (the issue #188
+// `N` passive holders. This variant makes every pinned worker an initiator: each
+// loops map/unmap on its own VA and times its own `mem_map` (a Fresh rewrite)
+// and `mem_unmap` (a synchronous shootdown); the shootdown protocol and which
+// rewrites skip it are specified in core/kernel/docs/memory-internals.md § SMP
+// TLB Shootdown. Under that design the concurrent mean tracks the
+// single-initiator mean; this bench is the regression guard for that parity: a
+// change that reintroduced system-wide shootdown serialization (the issue #188
 // bottleneck) would show up as the concurrent mean diverging above
 // `bench_tlb_shootdown` at the same CPU count.
 //
@@ -315,7 +312,8 @@ fn teardown(
 
 /// Distinct VA base for the concurrent bench (clear of `BENCH_VA`).
 const CONC_VA_BASE: u64 = 0x1_6400_0000;
-/// Per-worker VA stride (16-page spacing; matches the stress test).
+/// Per-worker VA stride (16-page spacing; matches `VA_STRIDE` in
+/// `core/ktest/src/stress/concurrent_map_unmap.rs`).
 const CONC_VA_STRIDE: u64 = 0x1_0000;
 
 // Worker ceiling reuses `MAX_PINNED` so the thread/cspace arrays share the
@@ -355,10 +353,11 @@ static CONC_LAT_MAX: AtomicU64 = AtomicU64::new(0);
 static CONC_LAT_SUM: AtomicU64 = AtomicU64::new(0);
 static CONC_LAT_CNT: AtomicU64 = AtomicU64::new(0);
 
-/// Shared per-map latency accumulators (cycles). Each loop map is a *fresh* map
-/// (the VA was just unmapped), whose remote shootdown the operation-class
-/// elision skips — so this mean drops to ~bare-syscall cost while the unmap mean
-/// above still carries the synchronous shootdown. The gap is the elision win.
+/// Shared per-map latency accumulators (cycles). Each loop map is a Fresh
+/// rewrite (the VA was just unmapped), which skips the remote shootdown (see
+/// core/kernel/docs/memory-internals.md § SMP TLB Shootdown) — so this mean
+/// drops to ~bare-syscall cost while the unmap mean above still carries the
+/// synchronous shootdown.
 static CONC_MAP_MIN: AtomicU64 = AtomicU64::new(u64::MAX);
 static CONC_MAP_MAX: AtomicU64 = AtomicU64::new(0);
 static CONC_MAP_SUM: AtomicU64 = AtomicU64::new(0);
@@ -390,8 +389,8 @@ fn conc_map_fold(d: u64)
 /// [`ConcArgs`].
 ///
 /// Each worker sends its unique `1 << bit_index` on both `ready` and `done`;
-/// the kernel notification cap OR-accumulates, so identical bits from concurrent
-/// workers would collapse to one wakeup and hang the parent's wait loop.
+/// notification bits coalesce (see docs/ipc-design.md § Notifications), so
+/// identical bits from concurrent workers would hang the parent's wait loop.
 fn conc_worker_entry(arg: u64) -> !
 {
     // SAFETY: `arg` is the entry the bench published for this worker.
@@ -416,8 +415,8 @@ fn conc_worker_entry(arg: u64) -> !
 
     for _ in 0..iters
     {
-        // Time the map — a fresh map (the VA is unmapped at loop top), whose
-        // remote shootdown the operation-class elision skips.
+        // Time the map — a Fresh rewrite (the VA is unmapped at loop top); see
+        // core/kernel/docs/memory-internals.md § SMP TLB Shootdown.
         let m0 = cycles_now();
         let mr = syscall::mem_map(memory, aspace, va, 0, 1, syscall::MAP_WRITABLE);
         let m1 = cycles_now();
@@ -444,7 +443,8 @@ fn conc_worker_entry(arg: u64) -> !
 }
 
 /// Concurrent-initiator TLB-shootdown latency bench (see module note above).
-#[allow(clippy::too_many_lines)] // setup + ready/go barrier + cooperative teardown.
+// too_many_lines: setup + ready/go barrier + cooperative teardown form one sequence.
+#[allow(clippy::too_many_lines)]
 pub(super) fn bench_tlb_shootdown_concurrent(ctx: &crate::TestContext, iters: u32)
 {
     log_bench_header("tlb_shootdown_concurrent", iters);
@@ -542,7 +542,8 @@ pub(super) fn bench_tlb_shootdown_concurrent(ctx: &crate::TestContext, iters: u3
         // SAFETY: bench tier runs sequentially; this is the only use of
         // CONC_STACKS[i].
         let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(CONC_STACKS[i]) });
-        // i < allocated ≤ want ≤ cpus-1, so CPU index i+1 is online.
+        // cast_possible_truncation: i < allocated ≤ MAX_PINNED (7), so i + 1 fits in
+        // u32; i < want ≤ cpus-1, so CPU index i+1 is online.
         #[allow(clippy::cast_possible_truncation)]
         let cpu = (i + 1) as u32;
         // SAFETY: worker `i` has not been started yet; each is started once.

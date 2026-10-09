@@ -20,7 +20,7 @@
 //!
 //! The intent is to validate that each step leaves the thread in the correct
 //! state for the next step — not to test each syscall in isolation (that is
-//! the job of unit/thread.rs).
+//! the job of `core/ktest/src/unit/thread.rs`).
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -42,7 +42,8 @@ const IP_OFFSET: usize = 248;
 
 static mut CHILD_STACK: ChildStack = ChildStack::ZERO;
 
-/// Cap slot for `phase2_entry` (see unit/thread.rs for the rationale).
+/// Cap slot for `phase2_entry` (see `PHASE2_SIG` in `core/ktest/src/unit/thread.rs`
+/// for the rationale).
 static PHASE2_SIG: AtomicU32 = AtomicU32::new(0);
 
 pub fn run(ctx: &TestContext) -> TestResult
@@ -112,11 +113,10 @@ pub fn run(ctx: &TestContext) -> TestResult
         return Err("integration::thread_lifecycle: phase2_entry did not send 0x2");
     }
 
-    // ── Steps 8–9: Set priority and affinity on the (now exited) thread cap. ──
+    // ── Steps 8–9: Set priority and affinity on a fresh thread. ────────────────
     //
-    // The thread cap is still valid even after the thread exits; the kernel
-    // allows these operations on any Thread object. Create a fresh thread just
-    // to test these without depending on child exit timing.
+    // A fresh, never-started thread is created so these checks do not depend on
+    // the child's exit timing.
     let cs2 = cap_create_cspace(ctx.memory_base, 0, 4)
         .map_err(|_| "integration::thread_lifecycle: cap_create_cspace (step 8) failed")?;
     let th2 = cap_create_thread(ctx.memory_base, ctx.aspace_cap, cs2, 0, 0)

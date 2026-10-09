@@ -21,8 +21,9 @@
 //!   3. The child resumes in the recovery routine — never re-executing the
 //!      illegal instruction — and signals success.
 //!
-//! A mechanism that only routed page faults would leave the child killed before
-//! any fault message arrived, tripping the bounded `notification_wait`.
+//! A mechanism that only routed page faults would kill the child without
+//! sending a fault message, leaving the harness blocked in the unbounded
+//! `ipc_recv`, so the run hangs rather than passing.
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -139,7 +140,9 @@ pub fn run(ctx: &TestContext) -> TestResult
 fn fault_child(_arg: u64) -> !
 {
     // SAFETY: a deliberately illegal instruction. The bound handler resumes this
-    // thread at recovery_child, so control never returns here.
+    // thread at recovery_child, so control never returns here. It clobbers no
+    // registers and assumes only user-mode execution: the trap never returns to
+    // this frame.
     unsafe {
         #[cfg(target_arch = "x86_64")]
         core::arch::asm!("ud2");

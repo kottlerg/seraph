@@ -12,10 +12,13 @@
 //! binding the full 64K I/O port space at startup.
 //!
 //! Once `ioport_bind` succeeds for a thread, the IOPB grant for those
-//! ports is per-thread state that outlives the cap itself (see
-//! `core/kernel/src/sched/thread.rs::TCB::iopb`), so narrow caps
-//! produced here may be freely consumed afterwards (e.g. by Tier-1
-//! unit tests that exercise `ioport_split`) without disturbing the
+//! ports lives in per-thread state
+//! (`core/kernel/src/sched/thread.rs::ThreadControlBlock::iopb`) and is not
+//! withdrawn when the cap is later consumed or revoked: revocation does not
+//! yet withdraw bound IOPB access (#457; intended semantics in
+//! [capability-model.md](../../../docs/capability-model.md) § `IoPort` (x86-64 only)).
+//! Narrow caps produced here are therefore consumed afterwards (e.g. by
+//! Tier-1 unit tests that exercise `ioport_split`) without losing the
 //! established permission.
 
 use init_protocol::{CapType, InitInfo};
@@ -141,6 +144,9 @@ fn find_root(info: &InitInfo) -> Option<(u32, u32, u32)>
 {
     let base = core::ptr::from_ref::<InitInfo>(info).cast::<u8>();
     // SAFETY: cap_descriptors_offset and _count are set by the kernel.
+    // cast_ptr_alignment: `cap_descriptors_offset` is `size_of::<InitInfo>()`,
+    // which abi/init-protocol asserts is a multiple of 8, the alignment
+    // `CapDescriptor` requires.
     #[allow(clippy::cast_ptr_alignment)]
     let descs = unsafe {
         core::slice::from_raw_parts(
@@ -158,8 +164,12 @@ fn find_root(info: &InitInfo) -> Option<(u32, u32, u32)>
             // (`core/kernel/src/cap/mod.rs`); the aux1 == 0 branch is
             // defensive against a future change that adopts the in-object
             // `IoPortObject.size == 0` encoding at this surface.
+            // cast_possible_truncation: aux0 of an IoPort descriptor is a port
+            // base, at most 0xFFFF.
             #[allow(clippy::cast_possible_truncation)]
             let base_u32 = d.aux0 as u32;
+            // cast_possible_truncation: aux1 of an IoPort descriptor is a port
+            // count, at most 0x10000.
             #[allow(clippy::cast_possible_truncation)]
             let size_u32 = if d.aux1 == 0 { 0x10000 } else { d.aux1 as u32 };
             return Some((d.slot, base_u32, base_u32 + size_u32));

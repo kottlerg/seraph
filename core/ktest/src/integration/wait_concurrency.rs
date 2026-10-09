@@ -16,7 +16,8 @@
 //! This tests that:
 //!   - The wait set correctly identifies which source woke it.
 //!   - Blocking wake-up via a child thread works end-to-end.
-//!   - `wait_set_remove` prevents the removed source from waking the set.
+//!   - After `wait_set_remove`, the set still wakes on its remaining member and
+//!     returns that member's badge.
 
 use syscall::{
     cap_copy, cap_create_notification, cap_delete, event_post, event_queue_create, event_recv,

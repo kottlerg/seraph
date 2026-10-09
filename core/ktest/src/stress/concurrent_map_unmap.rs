@@ -19,7 +19,9 @@ use crate::{ChildStack, TestContext, TestResult, spawn};
 const NUM_CHILDREN: usize = 16;
 const MAP_ITERATIONS: usize = 1000;
 
-// Each child owns one bit of the 64-bit `done` notification word.
+// Each child owns one bit of the `done` word below bit 32 (bit 32 is the
+// error indicator), so the encoding holds for NUM_CHILDREN <= 32; this
+// assert admits up to 64.
 const _: () = assert!(NUM_CHILDREN <= 64);
 
 /// Per-child arguments, handed to `mapper_entry` by address.
@@ -89,8 +91,8 @@ pub fn run(ctx: &TestContext) -> TestResult
             )
         };
 
-        // Set the VA for this child via a static. Children read it from
-        // a shared array indexed by child_memory slot (deterministic mapping).
+        // Publish this child's VA in VA_PER_CHILD[i]; the child recovers `i`
+        // from its done_bit (`trailing_zeros`).
         VA_PER_CHILD[i].store(va, core::sync::atomic::Ordering::Release);
 
         // SAFETY: Each child uses a distinct stack index.
@@ -124,7 +126,11 @@ pub fn run(ctx: &TestContext) -> TestResult
     {
         cap_delete(threads[i]).ok();
         cap_delete(cspaces[i]).ok();
-        // SAFETY: memory_caps are from pool and unmapped by children.
+        // SAFETY: memory_caps are from the pool. A child that reports success
+        // has unmapped its VA; a child that reports failure after a
+        // successful mem_map may leave its frame mapped, in which case this
+        // free does not meet frame_pool::free's unmapped precondition (the
+        // test then fails via child_failed).
         unsafe { crate::frame_pool::free(memory_caps[i]) };
     }
     cap_delete(done).ok();
@@ -138,13 +144,10 @@ pub fn run(ctx: &TestContext) -> TestResult
 
 /// Per-child VA, set by parent before starting each child.
 static VA_PER_CHILD: [core::sync::atomic::AtomicU64; NUM_CHILDREN] = {
-    // const-fn loop is unstable in stable Rust; use a const block + manual
-    // population via array-init-by-fn idiom.
+    // AtomicU64 is not Copy, so the repeat expression needs an inline const block.
     [const { core::sync::atomic::AtomicU64::new(0) }; NUM_CHILDREN]
 };
 
-// cast_possible_truncation: slot indices are kernel cap slots < 2^32.
-#[allow(clippy::cast_possible_truncation)]
 fn mapper_entry(arg: u64) -> !
 {
     // SAFETY: `arg` is the entry `run` published for this child.
@@ -168,11 +171,10 @@ fn mapper_entry(arg: u64) -> !
             thread_exit();
         }
 
-        // Verify the mapping exists via aspace_query (non-destructive).
-        // We do NOT write through the new VA because pool frames are
-        // backed by ktest's BSS segment — the physical page is already
-        // mapped in BSS, so writing via the stress VA would corrupt
-        // ktest's own statics.
+        // Verify the mapping exists via aspace_query (non-destructive). The
+        // test exercises page-table map/unmap only and never touches the
+        // frame's contents; pool frames are carved from a RAM cap, not from
+        // ktest's image (core/ktest/src/frame_pool.rs).
         if syscall::aspace_query(aspace, va).is_err()
         {
             notification_send(done_slot, done_bit | (1 << 32)).ok();

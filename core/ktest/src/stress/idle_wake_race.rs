@@ -38,8 +38,8 @@ use crate::{ChildStack, TestContext, TestResult};
 /// Number of wake round trips per test run.
 ///
 /// High enough to reliably catch a race that only manifests under a small
-/// timing window; low enough to run in well under a second on a healthy
-/// kernel (each iteration is sub-millisecond).
+/// timing window; each iteration is one sub-millisecond round trip, and the
+/// run's measured total is logged as `total_us`.
 const ITERATIONS: u32 = 50_000;
 
 /// Per-iteration latency threshold for the reported `outliers` metric, in
@@ -174,12 +174,14 @@ fn elapsed_us() -> u64
     system_info(SystemInfoType::ElapsedUs as u64).unwrap_or(0)
 }
 
-/// Worker entry point. Notifications readiness, then loops acking each GO until
-/// bit 0x2 is seen (quit notification).
+/// Worker entry point. Signals readiness on `c2p`, then loops acking each GO
+/// until bit 0x2 (quit) is seen.
 ///
-/// The `notification_wait` on `p2c` is the per-iteration park: the kernel moves
-/// this TCB to the notification's wait list and the hosting CPU enters the
-/// scheduler's idle path on the next tick.
+/// The `notification_wait` on `p2c` is the per-iteration park: the kernel records
+/// this TCB as the notification's waiter, commits it `Blocked`, and calls
+/// `schedule()`, so the hosting CPU switches to its idle thread immediately.
+// cast_possible_truncation: the argument is the child's p2c cap slot, which
+// `run` widened from a u32.
 #[allow(clippy::cast_possible_truncation)]
 fn worker_entry(p2c_slot: u64) -> !
 {
@@ -187,7 +189,7 @@ fn worker_entry(p2c_slot: u64) -> !
     let c2p = unsafe { CHILD_C2P_SLOT };
     let p2c = p2c_slot as u32;
 
-    // Notification readiness.
+    // Signal readiness.
     notification_send(c2p, BIT_ACK).ok();
 
     while let Ok(bits) = notification_wait(p2c)

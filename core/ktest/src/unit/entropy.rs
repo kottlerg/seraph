@@ -11,7 +11,7 @@ use syscall_abi::SyscallError;
 /// A canonical user-half virtual address that ktest never maps.
 const UNMAPPED_USER_VA: u64 = 0x3E_3000_0000;
 
-/// Safe test VA (1 GiB), well above ktest's load address and stack. Mapped and
+/// Safe test VA (5 GiB), well above ktest's load address and stack. Mapped and
 /// unmapped within a single test, so it is free between tests.
 const RO_TEST_VA: u64 = 0x1_4000_0000;
 
@@ -94,10 +94,11 @@ pub fn getrandom_over_max_len_invalid_arg(_ctx: &TestContext) -> TestResult
 }
 
 /// 300 sequential draws stay non-zero and pairwise-distinct across the
-/// generator's 256-draw reseed interval (#395). When the calling thread stays
-/// on one CPU this crosses that CPU's opportunistic reseed; the assertion
-/// holds regardless of placement (a forward-secure CSPRNG never repeats an
-/// 8-byte draw back-to-back except with probability 2⁻⁶⁴).
+/// generator's draw-count reseed interval (`core/kernel/docs/entropy.md` § Per-CPU
+/// CSPRNG and reseed policy; #395). When the calling thread stays on one CPU
+/// this crosses that CPU's opportunistic reseed; the assertion holds regardless
+/// of placement (a forward-secure CSPRNG never repeats an 8-byte draw
+/// back-to-back except with probability 2⁻⁶⁴).
 pub fn getrandom_reseed_interval_stream(_ctx: &TestContext) -> TestResult
 {
     let mut prev = [0u8; 8];

@@ -17,8 +17,8 @@
 //!      reads the value back to confirm the store landed, and signals success.
 //!
 //! Contrast with `fault_kills_thread.rs` (no handler bound ⇒ the same fault is
-//! terminal). A mis-wired resume path would hang the bounded `notification_wait`
-//! rather than completing.
+//! terminal). A mis-wired resume path would leave the harness blocked in the
+//! unbounded `notification_wait`, hanging the run rather than completing.
 
 use ipc::IpcMessage;
 use syscall::{
@@ -143,7 +143,8 @@ fn fault_child(child_sig: u64) -> !
     let readback = unsafe { p.read_volatile() };
     if readback == SENTINEL
     {
-        // cast_possible_truncation: child_sig is a cap slot index passed as u64.
+        // cast_possible_truncation: child_sig is the u32 cap handle `run` zero-
+        // extended into the u64 entry argument.
         #[allow(clippy::cast_possible_truncation)]
         syscall::notification_send(child_sig as u32, 1).ok();
     }

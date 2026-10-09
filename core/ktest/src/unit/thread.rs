@@ -39,7 +39,7 @@ use crate::{ChildStack, TestContext, TestResult};
 const RIGHTS_NOTIFY: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
 const RIGHTS_WAIT: u64 = syscall_abi::RIGHTS_NTF_WAIT;
 
-// Expected TrapFrame size per architecture (kernel/src/arch/*/trap_frame.rs).
+// Expected TrapFrame size per architecture (core/kernel/src/arch/*/trap_frame.rs).
 #[cfg(target_arch = "x86_64")]
 const TRAP_FRAME_BYTES: u64 = 168;
 #[cfg(target_arch = "riscv64")]
@@ -51,7 +51,9 @@ const IP_OFFSET: usize = 120; // TrapFrame.rip
 #[cfg(target_arch = "riscv64")]
 const IP_OFFSET: usize = 248; // TrapFrame.sepc
 
-// Child stacks — one per test that spawns a child, to avoid aliasing.
+// Child stacks for started children, to avoid aliasing. A stack is reused
+// only after its previous child is stopped and its Thread cap deleted
+// (`stop_again_invalid_state` and `write_regs_resume` share STACK_WRITE_REGS).
 static mut STACK_CONFIGURE: ChildStack = ChildStack::ZERO;
 static mut STACK_STOP_REGS: ChildStack = ChildStack::ZERO;
 static mut STACK_WRITE_REGS: ChildStack = ChildStack::ZERO;
@@ -78,13 +80,14 @@ static mut STACK_BALANCE_SPINNERS: [ChildStack; BALANCE_MAX_SPINNERS] = [
 /// every iteration; the parent reads this to detect migration.
 static MIGRATE_OBSERVED_CPU: AtomicU32 = AtomicU32::new(u32::MAX);
 
-/// Notifications the migration spinner to exit cleanly once the parent has
+/// Tells the migration spinner to exit cleanly once the parent has
 /// observed the migration.
 static MIGRATE_SHOULD_EXIT: AtomicU32 = AtomicU32::new(0);
 
+/// Capacity of the load-balancer spinner arrays.
+const BALANCE_MAX_SPINNERS: usize = 8;
 /// Per-spinner observed CPU index. Indexed by spinner id (0..N). Used by
 /// the load-balancer tests. `u32::MAX` indicates "spinner has not run yet".
-const BALANCE_MAX_SPINNERS: usize = 8;
 static BALANCE_OBSERVED_CPU: [AtomicU32; BALANCE_MAX_SPINNERS] = [
     AtomicU32::new(u32::MAX),
     AtomicU32::new(u32::MAX),
@@ -230,8 +233,9 @@ pub fn stop_again_invalid_state(ctx: &TestContext) -> TestResult
     let child_block = cap_copy(block, child.cs, RIGHTS_WAIT)
         .map_err(|_| "cap_copy (block) for double-stop test failed")?;
 
-    // Tests run sequentially; STACK_STOP_REGS contents are stale but the child
-    // from the previous test is stopped. Using STACK_WRITE_REGS for safety.
+    // Shares STACK_WRITE_REGS with `write_regs_resume`; tests run sequentially
+    // and each child is stopped and its Thread cap deleted before the next
+    // test starts, so the stack is never live in two threads.
     let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_WRITE_REGS));
     let blocker_arg = (u64::from(child_ready) << 32) | u64::from(child_block);
     crate::spawn::configure_and_start(&child, blocker_entry, stack_top, blocker_arg)
@@ -336,8 +340,9 @@ pub fn set_priority_in_band(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
-/// Setting any priority without a `SchedControl` cap fails — there is no ambient
-/// priority authority. (`sched_idx = 0` holds no `SchedControl`.)
+/// Setting any priority without a `SchedControl` cap fails
+/// (`core/kernel/docs/scheduler.md` § Priority Authority). (`sched_idx = 0`
+/// holds no `SchedControl`.)
 pub fn set_priority_no_cap_err(ctx: &TestContext) -> TestResult
 {
     let child = crate::spawn::new_child(ctx)
@@ -706,8 +711,7 @@ pub fn configure_running_thread_err(ctx: &TestContext) -> TestResult
 
 /// `thread_set_priority(th, 0, 0)` must return `InvalidArgument`.
 ///
-/// Priority 0 is reserved for the idle thread and cannot be assigned to
-/// a userspace thread.
+/// Priority 0 is reserved (`core/kernel/docs/scheduler.md` § Priority Levels).
 pub fn set_priority_zero_err(ctx: &TestContext) -> TestResult
 {
     let child = crate::spawn::new_child(ctx)
@@ -726,7 +730,7 @@ pub fn set_priority_zero_err(ctx: &TestContext) -> TestResult
 
 /// `thread_set_priority(th, 31, 0)` must return `InvalidArgument`.
 ///
-/// Priority 31 is reserved and may not be assigned to any thread.
+/// Priority 31 is reserved (`core/kernel/docs/scheduler.md` § Priority Levels).
 pub fn set_priority_31_err(ctx: &TestContext) -> TestResult
 {
     let child = crate::spawn::new_child(ctx)
@@ -835,7 +839,7 @@ pub fn affinity_migrate_ready_queued(ctx: &TestContext) -> TestResult
     }
 
     // Pin the harness to CPU 0 and yield to force migration there. The
-    // affinity-recheck branch of `schedule()` (`sched/mod.rs` re-enqueue
+    // affinity-recheck branch of `schedule()` (`core/kernel/src/sched/mod.rs` re-enqueue
     // path) routes the yielding parent cross-CPU to CPU 0; when `yield`
     // returns, the parent is running on CPU 0.
     thread_set_affinity(ctx.thread_cap, 0)
@@ -891,12 +895,10 @@ fn affinity_migrate_ready_queued_body(ctx: &TestContext) -> TestResult
     // Block on the notification: parent leaves CPU 0, CPU 1 runs T which reports
     // its actual CPU id back through the notification bits. `report_cpu_entry`
     // encodes the CPU id as `1u64.wrapping_shl(cpu)` (always non-zero by
-    // the modulo-64 shift semantics) so any missed wake — including a
-    // `cpu == 0` report from an unexpected stale-CPU run — surfaces as a
-    // deterministic test FAIL instead of a HANG. `notification_send(sig, 0)`
-    // would be rejected and the parent would park indefinitely (see
-    // issue #116). The 5 s timeout is a defensive backstop against any
-    // other missed-wake mode.
+    // the modulo-64 shift semantics), so a `cpu == 0` report from a stale-CPU
+    // run is delivered and fails as a wrong-CPU result rather than looking like
+    // the timeout; a zero-bit send would be rejected by `notification_send`.
+    // The 5 s timeout catches any missed wake.
     let bits = notification_wait_timeout(sig, 5_000)
         .map_err(|_| "notification_wait for affinity_migrate_ready_queued failed")?;
     if bits == 0
@@ -914,17 +916,14 @@ fn affinity_migrate_ready_queued_body(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
-/// `thread_set_affinity` causes a Running thread on a different CPU to
-/// migrate within one tick.
+/// `thread_set_affinity` migrates a thread Running on a different CPU.
 ///
 /// Spawns T pinned to CPU 1 with a tight `CurrentCpu` read loop that publishes
-/// its observed CPU into `MIGRATE_OBSERVED_CPU`. The parent runs on CPU 0,
-/// waits until T is observed on CPU 1, then calls
-/// `thread_set_affinity(T, 0)`. The Running-elsewhere path in
-/// `sys_thread_set_affinity` sends a reschedule IPI to CPU 1; CPU 1's
-/// `schedule()` re-enqueue site sees `cpu_affinity != current_cpu` and
-/// routes T cross-CPU to CPU 0. The parent waits for `MIGRATE_OBSERVED_CPU`
-/// to flip to 0.
+/// its observed CPU into `MIGRATE_OBSERVED_CPU`. The parent waits until T is
+/// observed on CPU 1, calls `thread_set_affinity(T, 0)`, and waits for
+/// `MIGRATE_OBSERVED_CPU` to flip to 0. The Running-elsewhere migration path
+/// and its one-time-slice latency bound are in `core/kernel/docs/scheduler.md`
+/// § Active migration on affinity change.
 ///
 /// Requires SMP; skips otherwise.
 pub fn affinity_migrate_running(ctx: &TestContext) -> TestResult
@@ -1008,6 +1007,7 @@ pub fn affinity_migrate_running(ctx: &TestContext) -> TestResult
 ///
 /// Each spinner publishes its current CPU into `BALANCE_OBSERVED_CPU[i]`
 /// on every loop iteration and exits when `BALANCE_SHOULD_EXIT` is set.
+// cast_possible_truncation: spinner indices are < BALANCE_MAX_SPINNERS, so every cast fits.
 #[allow(clippy::cast_possible_truncation)]
 fn balance_spawn_spinners(
     ctx: &TestContext,
@@ -1056,7 +1056,7 @@ fn balance_spawn_spinners(
 }
 
 /// Helper: tear down the spinners spawned by `balance_spawn_spinners`.
-/// Notifications exit, drains each thread's `notification_send`, and deletes the caps.
+/// Signals exit, drains each spinner's `notification_send`, and deletes the caps.
 fn balance_teardown(triples: &[(u32, u32, u32); BALANCE_MAX_SPINNERS], n: usize) -> TestResult
 {
     BALANCE_SHOULD_EXIT.store(1, Ordering::Relaxed);
@@ -1078,8 +1078,9 @@ fn balance_teardown(triples: &[(u32, u32, u32); BALANCE_MAX_SPINNERS], n: usize)
 /// A skewed workload (every thread initially queued on CPU 0) gets
 /// redistributed across all CPUs by the periodic load balancer.
 ///
-/// Spawns N = `cpu_count` spinners with hard affinity to CPU 0 (forcing
-/// them onto CPU 0's run queue), then relaxes affinity to `AFFINITY_ANY`.
+/// Spawns N = min(`cpu_count`, `BALANCE_MAX_SPINNERS`) spinners with hard
+/// affinity to CPU 0 (forcing them onto CPU 0's run queue), then relaxes
+/// affinity to `AFFINITY_ANY`.
 /// After a few ticks the balancer pulls work into the under-loaded CPUs,
 /// so at least two distinct CPUs should be observed across the
 /// `BALANCE_OBSERVED_CPU` array.
@@ -1101,17 +1102,13 @@ pub fn load_balancer_redistributes_skewed(ctx: &TestContext) -> TestResult
     // `u32::MAX` is the AFFINITY_ANY sentinel (see SYS_THREAD_SET_AFFINITY).
     let triples = balance_spawn_spinners(ctx, n, 0, u32::MAX)?;
 
-    // Sleep in short increments so the parent is BLOCKED — that
-    // takes parent's CPU out of the spinner queue entirely and lets idle
-    // CPUs (which carry the pull-balancer in their timer_tick) do their
-    // job. Without this, parent's tight yield loop hogs CPU 0 long
-    // enough that on slow QEMU instances the balancer never gets a turn.
+    // Sleep in short increments so the parent is Blocked and off CPU 0's run
+    // queue, leaving the spinners and the idle CPUs' per-tick pull balancer
+    // (core/kernel/docs/scheduler.md § Load Balancing) unimpeded.
     //
-    // 250 × 4 ms = 1 s total budget. Pull-balance is probabilistic
-    // (random victim selection); a one-second budget makes the chance
-    // of NOT seeing any migration vanishingly small while keeping the
-    // test fast in the common case (PASS fires on the first observed
-    // migration, which is usually < 50 ms).
+    // 250 × 4 ms = 1 s total budget, ample for an idle CPU's heaviest-CPU
+    // scan to pull a spinner while keeping the test fast in the common case
+    // (PASS fires on the first observed migration).
     let mut converged = false;
     for _ in 0..250
     {
@@ -1139,9 +1136,9 @@ pub fn load_balancer_redistributes_skewed(ctx: &TestContext) -> TestResult
 
 /// Pinned threads (hard affinity) are NEVER migrated by the load balancer.
 ///
-/// Spawns N pinned threads on CPU 0 and runs the test for a few ticks. The
-/// balancer's `find_runnable` predicate filters out `cpu_affinity != AFFINITY_ANY`,
-/// so every spinner MUST report CPU 0 throughout the test.
+/// Spawns N pinned threads on CPU 0 and runs the test for a few ticks. Pinned
+/// threads are never migrated by the balancer (`core/kernel/docs/scheduler.md`
+/// § Load Balancing), so every spinner MUST report CPU 0 throughout the test.
 ///
 /// Requires SMP; skips otherwise.
 pub fn load_balancer_skips_pinned(ctx: &TestContext) -> TestResult
@@ -1180,14 +1177,13 @@ pub fn load_balancer_skips_pinned(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
-// ── Phase D scheduler correctness tests ───────────────────────────────────────
+// ── Affinity placement tests ──────────────────────────────────────────────────
 
 /// Thread with explicit CPU affinity starts and executes successfully.
 ///
-/// Phase D routes threads to their affinity CPU via `select_target_cpu`.
-/// This test verifies that threads with affinity set to CPU 1 can start,
-/// execute, and notification back to the parent. This confirms basic Phase D
-/// affinity routing without requiring a `CurrentCpu` syscall variant.
+/// Hard affinity routes a thread to the named CPU via `select_target_cpu`.
+/// This test verifies that a thread with affinity set to CPU 1 can start,
+/// execute, and signal back to the parent.
 ///
 /// Skips if only one CPU is online (requires SMP).
 pub fn affinity_respected(ctx: &TestContext) -> TestResult
@@ -1233,15 +1229,12 @@ pub fn affinity_respected(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
-/// Thread with default affinity (`AFFINITY_ANY`) defaults to CPU 0 (BSP).
+/// A thread left at the default affinity (`AFFINITY_ANY`) starts and signals back.
 ///
-/// Phase D uses a simple routing policy: `AFFINITY_ANY` threads are assigned
-/// to CPU 0 (the bootstrap processor). Phase F will change this to load-balance
-/// across all CPUs. This test verifies the Phase D behavior by creating a thread
-/// with `AFFINITY_ANY`, then checking it starts and signals back. Since we cannot
-/// query the current CPU ID from userspace without a `CurrentCpu` syscall variant,
-/// this test indirectly validates default affinity by confirming the thread runs
-/// successfully (which it will only do if it was enqueued on a valid CPU).
+/// Placement of an `AFFINITY_ANY` thread follows
+/// `core/kernel/docs/scheduler.md` § Thread Assignment and § Soft Affinity; this
+/// test does not check which CPU is chosen, only that the thread is enqueued on
+/// a valid CPU, runs, and signals `0xBEEF`.
 ///
 /// Skips if only one CPU is online (requires SMP).
 pub fn default_affinity_bsp(ctx: &TestContext) -> TestResult
@@ -1263,7 +1256,7 @@ pub fn default_affinity_bsp(ctx: &TestContext) -> TestResult
         .map_err(|_| "cap_copy for default_affinity_bsp failed")?;
 
     // Do NOT set affinity — leave it at default (AFFINITY_ANY).
-    // Phase D should route this to CPU 0.
+    // Placement follows core/kernel/docs/scheduler.md § Thread Assignment.
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_DEFAULT_AFFINITY));
     crate::spawn::configure_and_start(&child, sender_entry, stack_top, u64::from(child_sig))
@@ -1287,8 +1280,8 @@ pub fn default_affinity_bsp(ctx: &TestContext) -> TestResult
 
 /// Affinity test sender: sends 0xC1A1 and exits.
 ///
-/// Used by [`affinity_bind_cpu1`] — the child is bound to CPU 1 and confirms
-/// it ran by notifying back.
+/// Used by [`affinity_bind_cpu1`] and [`affinity_respected`] — the child is
+/// bound to CPU 1 and confirms it ran by notifying back.
 // cast_possible_truncation: sig_slot is a kernel cap slot index, guaranteed < 2^32.
 #[allow(clippy::cast_possible_truncation)]
 fn affinity_sender_entry(sig_slot: u64) -> !
@@ -1342,11 +1335,10 @@ fn blocker_entry(arg: u64) -> !
 /// the raw integer. Raw encoding fails when `cpu == 0`: `notification_send`
 /// rejects zero-bit sends with `InvalidArgument` (see
 /// `sys_notification_send` in `core/kernel/src/syscall/ipc.rs`), the child silently exits,
-/// and the parent's `notification_wait` parks indefinitely — manifesting as the
-/// all-CPUs-idle stall in issue #116. The bit-per-CPU encoding is always
-/// non-zero for any valid CPU id, so the wake always lands; a stale-CPU
-/// run shows up as a deterministic test FAIL ("not landed on CPU 1")
-/// instead of a HANG.
+/// and the parent sees only its `notification_wait_timeout` expiry. The
+/// bit-per-CPU encoding is always non-zero for any valid CPU id, so the wake
+/// always lands; a stale-CPU run fails as "Ready-thread migration did not
+/// land on CPU 1" instead of as a timeout.
 // cast_possible_truncation: cap slot indices and CPU ids fit comfortably in u32.
 #[allow(clippy::cast_possible_truncation)]
 fn report_cpu_entry(sig_slot: u64) -> !
@@ -1492,7 +1484,7 @@ pub fn bind_notification_fires_on_exit(ctx: &TestContext) -> TestResult
     let payload =
         event_recv(eq).map_err(|_| "thread::bind_notification_fires_on_exit: event_recv failed")?;
 
-    // The kernel packs the correlator into the high 32 bits of the payload.
+    // Payload layout: core/kernel/docs/syscalls.md § SYS_THREAD_BIND_NOTIFICATION.
     let observed = (payload >> 32) as u32;
     if observed != CORRELATOR
     {

@@ -7,9 +7,9 @@
 //!
 //! These run the crate's own known-answer vectors on the live target so the
 //! primitives are validated under QEMU on both `x86_64` and `riscv64`, not only
-//! by host `cargo test`. The vector tables and assertions live in `shared/crypto`
-//! (`run_sha512_kats` / `run_ed25519_kats`); this module is a thin on-target
-//! entry point so host and on-target runs exercise identical logic.
+//! by the host-side `cargo xtask test` run. The vector tables and assertions
+//! live in `shared/crypto` (`run_sha512_kats` / `run_ed25519_kats`); this
+//! module is a thin on-target entry point so host and on-target runs exercise identical logic.
 
 use crate::{TestContext, TestResult};
 

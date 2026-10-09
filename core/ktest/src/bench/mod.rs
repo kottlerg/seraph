@@ -5,13 +5,15 @@
 
 //! Tier 3 — Benchmarks / profiling.
 //!
-//! Rule (durable, mirrors `unit/mod.rs`):
+//! Rule (mirrors `core/ktest/src/unit/mod.rs`; see `core/ktest/README.md`
+//! § Tier 3):
 //!
 //! > **One file per kernel surface measured. New surface ⇒ new file.**
 //!
-//! Each benchmark runs an operation N times and logs min/mean/max cycle counts
-//! to the kernel serial console. No PASS/FAIL verdict is produced; the numbers
-//! are for human inspection and regression tracking.
+//! Each benchmark runs an operation up to N times and logs its cycle counts
+//! (min/mean/max per iteration for most; `context_switch` logs cycles per
+//! switch) through `crate::log`/`crate::log_u64`. No PASS/FAIL verdict is
+//! produced; the numbers are for human inspection and regression tracking.
 //!
 //! # Cycle counter access
 //!
@@ -28,7 +30,9 @@
 //! 1. If the surface already has a file (e.g. `mm.rs`), add a `fn bench_<name>`
 //!    to that file. Otherwise create a sibling file under `bench/`.
 //! 2. Use `super::cycles_now()` to bracket the measured operation
-//!    per-iteration; track min/mean/max via `super::log_bench_header()`.
+//!    per-iteration and accumulate min/mean/max locally, then print the
+//!    header with `super::log_bench_header()` and the three values with
+//!    `crate::log_u64`.
 //! 3. Call it from `run_all` below.
 
 mod cap;
@@ -87,7 +91,7 @@ pub(super) fn cycles_now() -> u64
     }
 }
 
-/// Log benchmark results with configurable N.
+/// Log the benchmark header line `ktest: bench  <name>  N=<n>`.
 pub(super) fn log_bench_header(name: &str, n: u32)
 {
     // Build "ktest: bench  <name>  N=<n>" string.
@@ -120,6 +124,7 @@ pub(super) fn log_bench_header(name: &str, n: u32)
     {
         while val > 0
         {
+            // cast_possible_truncation: val % 10 is < 10, which always fits in u8.
             #[allow(clippy::cast_possible_truncation)]
             let d = (val % 10) as u8;
             digits[dlen] = b'0' + d;

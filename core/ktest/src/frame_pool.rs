@@ -27,11 +27,11 @@
 //!
 //! ```ignore
 //! // In main(), before running tests:
-//! unsafe { frame_pool::init(aspace_cap) };
+//! unsafe { frame_pool::init(info) };
 //!
 //! // In a test:
 //! let frame = frame_pool::alloc().ok_or("frame pool exhausted")?;
-//! mem_map(frame, aspace_cap, va, 0, 1)?;
+//! mem_map(frame, aspace_cap, va, 0, 1, syscall::MAP_WRITABLE)?;
 //! // ... test logic ...
 //! mem_unmap(aspace_cap, va, 1)?;
 //! unsafe { frame_pool::free(frame) };
@@ -61,10 +61,12 @@ const PAGE_SIZE: u64 = 0x1000;
 fn descriptors(info: &InitInfo) -> &[CapDescriptor]
 {
     let base = core::ptr::from_ref::<InitInfo>(info).cast::<u8>();
-    // SAFETY: kernel populates `cap_descriptors_offset` and
+    // SAFETY: the kernel populates `cap_descriptors_offset` and
     // `cap_descriptor_count` to describe a valid array inside the same
-    // read-only InitInfo page. CapDescriptor is repr(C) starting with a u32,
-    // and the offset lands at the 4-byte-aligned end of InitInfo.
+    // read-only InitInfo region.
+    // cast_ptr_alignment: `cap_descriptors_offset` is `size_of::<InitInfo>()`,
+    // which abi/init-protocol asserts is a multiple of 8, the alignment the
+    // `u64` fields of `CapDescriptor` require.
     #[allow(clippy::cast_ptr_alignment)]
     unsafe {
         let ptr = base
@@ -75,7 +77,7 @@ fn descriptors(info: &InitInfo) -> &[CapDescriptor]
 }
 
 /// Return the byte size of the Memory cap occupying `slot`, or `None` if no
-/// Frame descriptor matches.
+/// Memory descriptor matches.
 fn find_frame_size(info: &InitInfo, slot: u32) -> Option<u64>
 {
     for d in descriptors(info)
@@ -95,7 +97,8 @@ static POOL_AVAILABLE: AtomicU64 = AtomicU64::new(0);
 
 /// Memory capability slots (indices into init's `CSpace`).
 ///
-/// Initialized once at startup by splitting segment frames.
+/// Initialized once at startup by splitting the tail carved off the first RAM
+/// Memory cap into single-page caps.
 static mut POOL_SLOTS: [u32; POOL_SIZE] = [0; POOL_SIZE];
 
 /// Number of frames in the pool (set during init).
@@ -117,7 +120,7 @@ unsafe fn split_frame_recursive(memory_cap: u32, count: &mut usize)
         return;
     }
 
-    // Option-D memory_split: `memory_cap` shrinks in place to one page; the
+    // memory_split: `memory_cap` shrinks in place to one page; the
     // returned slot is the new tail covering the remainder. Store the
     // (now-single-page) original in the pool, then recurse on the tail.
     match syscall::memory_split(memory_cap, PAGE_SIZE)

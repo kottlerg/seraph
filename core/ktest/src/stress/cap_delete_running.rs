@@ -6,18 +6,11 @@
 //! Stress test: `cap_delete` a Thread cap while the thread is still running.
 //!
 //! Children spin in pure userspace (no syscalls back to the kernel). The
-//! parent then deletes each child's Thread cap. The kernel must:
-//!
-//!   * mark the thread `Exited` under all scheduler locks so no `schedule()`
-//!     re-enqueues it,
-//!   * remove the TCB from whichever per-CPU queue it was on,
-//!   * if the TCB is still `sched.current` on some CPU, spin until that CPU
-//!     context-switches away (timer tick on the running CPU does this),
-//!   * unlink the TCB from any IPC waiter list (none here — pure spinner),
-//!   * free the kernel stack and the TCB itself.
-//!
-//! Without that handling the TCB would be freed while a CPU still held it
-//! in `sched.current`, causing a use-after-free on the next context switch.
+//! parent then deletes each child's Thread cap while it runs, exercising the
+//! teardown of a TCB that may still be `current` on some CPU (the drain
+//! protocol in core/kernel/docs/thread-lifecycle-and-sleep.md § `dealloc_object(Thread)`
+//! Drain Protocol). A broken drain frees the TCB while a CPU still runs it,
+//! causing a use-after-free on the next context switch.
 
 use syscall::{cap_delete, thread_sleep};
 

@@ -11,10 +11,9 @@
 //! invariants — interleavings between retype-consume and dealloc-reclaim
 //! must not corrupt free-list links or double-debit `available_bytes`.
 //!
-//! Pass criterion: every iteration of every child returns Ok, the child
-//! count of successful cycles equals `NUM_WORKERS * ITERS_PER_WORKER`,
-//! and the source cap's `available_bytes` returns to its pre-stress
-//! baseline at the end.
+//! Pass criterion: every child completes all `ITERS_PER_WORKER` cycles and sets
+//! its done bit (it exits without the bit on the first failed cycle), and the
+//! source cap's `available_bytes` returns to its pre-stress baseline at the end.
 
 use syscall::{
     cap_copy, cap_create_cspace, cap_create_endpoint, cap_create_thread, cap_delete, cap_info,
@@ -134,8 +133,10 @@ pub fn run(ctx: &TestContext) -> TestResult
         return Err("stress::retype_concurrent: available_bytes did not return to baseline");
     }
 
-    // Worker reports failure via NOT setting its bit — so seeing all bits
-    // already implies every worker completed without an internal Err.
+    // The collect loop above exits only once every bit is set, so this check
+    // cannot fail: a worker that hits an internal Err exits without its bit and
+    // the parent stays blocked in that loop, where the run's timeout reports
+    // the hang.
     if done_bits & ALL_BITS != ALL_BITS
     {
         return Err("stress::retype_concurrent: not every worker reported done");
@@ -164,7 +165,8 @@ fn worker_entry(arg: u64) -> !
         }
         else
         {
-            // Refusing to set the done bit signals failure to the parent.
+            // Exiting without the done bit leaves the parent blocked in its
+            // collect loop; the run's timeout reports that hang.
             thread_exit();
         }
     }

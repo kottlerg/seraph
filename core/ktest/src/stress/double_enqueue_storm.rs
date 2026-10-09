@@ -5,17 +5,16 @@
 
 //! Stress: regression test for the run-queue double-link guard (issue #244).
 //!
-//! The "Ready ⇒ linked on exactly one queue" invariant is enforced at the
-//! `PerCpuScheduler::enqueue` chokepoint: a TCB already linked on a run queue
-//! must never be re-linked (that would self-cycle the intrusive list,
-//! `tail.next = Some(tail)` — the `head=tail=tcb` corruption #244 reported).
-//! Debug builds panic via the `RunQueue::enqueue` tripwire (naming the racing
-//! call sites through the `last_enqueue` breadcrumb); release builds skip the
-//! redundant link.
+//! Guards the run-queue single-link invariant enforced at the
+//! `PerCpuScheduler::enqueue` chokepoint (see
+//! [scheduling-internals.md](../../../kernel/docs/scheduling-internals.md)
+//! § `ThreadState` Transitions, "Enqueue-chokepoint enforcement"); in debug builds
+//! a double-link panics at that chokepoint's `queued_on` guard, naming the prior
+//! link via the `last_enqueue` breadcrumb.
 //!
 //! This test exercises that chokepoint under the dense, concurrent scheduler
 //! transitions most likely to drive a double-link, so a regression that
-//! reintroduces one trips the debug tripwire here:
+//! reintroduces one trips that debug guard here:
 //!
 //!   * **Phase 1 — wake + churn storm.** Each worker parks on its own
 //!     notification; the controller storms `notification_send` (the wake that
@@ -33,9 +32,10 @@
 //!     `BlockedOnNotification` waiter-unlink + wake-in-flight gate.
 //!
 //! Pass criterion is structural: the harness boots clean to
-//! `[ktest] ALL TESTS PASSED`. A reintroduced double-link trips the
-//! `RunQueue::enqueue` tripwire (debug builds), reported as FAIL with the
-//! racing call sites named via the `last_enqueue` breadcrumb.
+//! `[ktest] ALL TESTS PASSED`. A reintroduced double-link panics the kernel
+//! at the `PerCpuScheduler::enqueue` `queued_on` guard (debug builds), naming
+//! the prior link's call site via the `last_enqueue` breadcrumb, so the pass
+//! marker never appears.
 //!
 //! Requires ≥ 2 CPUs for the cross-CPU windows; on UP it still exercises the
 //! local wake + churn + dealloc paths (workers run only during the
@@ -54,9 +54,9 @@ use crate::{ChildStack, TestContext, TestResult, spawn};
 const NUM_WORKERS: usize = 32;
 
 /// Wake + churn cycles in Phase 1. Each cycle issues one wake + one priority
-/// write per worker; 600 cycles is a few hundred thousand scheduler
-/// transitions exercising the enqueue chokepoint, well under a second on a
-/// healthy kernel.
+/// write per worker; 600 cycles issue 19,200 wakes and 19,200 priority writes
+/// (plus 4,800 affinity flips) against the enqueue chokepoint, well under a
+/// second on a healthy kernel.
 const CYCLES: usize = 600;
 
 /// Notification bit the controller wakes workers with (any non-zero value;
@@ -105,9 +105,8 @@ pub fn run(ctx: &TestContext) -> TestResult
     //
     // Each cycle wakes every worker (enqueue_and_wake) and rewrites its
     // priority (remove-and-re-enqueue of the queue entry: a preferred_cpu-hinted
-    // single run-queue lock, or the all-CPU walk on a hint miss — #380). Affinity
-    // flips
-    // every 4 cycles relocate the queue entry across CPUs via
+    // single run-queue lock, or the all-CPU walk on a hint miss — #380).
+    // Affinity flips every 4 cycles relocate the queue entry across CPUs via
     // migrate_ready_thread / the cross-CPU outgoing branch — so a wake can land
     // on a TCB mid-relocation, the transient window the #244 class lives in.
     for cycle in 0..CYCLES
@@ -168,6 +167,7 @@ fn worker_entry(notif_slot: u64) -> !
 {
     // notification_wait returns on each wake; loop forever re-parking. A delete
     // while parked unblocks via the dealloc waiter-unlink rather than a return.
+    // cast_possible_truncation: notif_slot is the u32 cap slot `run` widened with u64::from.
     #[allow(clippy::cast_possible_truncation)]
     let notif = notif_slot as u32;
     loop

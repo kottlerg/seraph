@@ -29,7 +29,7 @@ use syscall_abi::{
 
 use crate::{TestContext, TestResult};
 
-// CapTag discriminants (kernel/src/cap/slot.rs). Keep in sync with the
+// CapTag discriminants (core/kernel/src/cap/slot.rs `CapTag`). Keep in sync with the
 // `#[repr(u8)]` enum.
 const TAG_MEMORY: u8 = 1;
 const TAG_ADDRESS_SPACE: u8 = 2;
@@ -49,6 +49,7 @@ fn unpack_tag_rights(value: u64) -> (u8, u32)
     // truncating only the deliberately-zero upper bits.
     #[allow(clippy::cast_possible_truncation)]
     let tag = (value >> 32) as u8;
+    // The low 32 bits are the rights bitmask; the cast drops only the tag half.
     #[allow(clippy::cast_possible_truncation)]
     let rights = value as u32;
     (tag, rights)
@@ -172,15 +173,14 @@ pub fn memory_fields(_ctx: &TestContext) -> TestResult
 /// Every usable-RAM Memory cap minted by the kernel at Phase 7
 /// (`core/kernel/src/cap/mod.rs`) carries `MemRights::RETYPE`. The bit must
 /// propagate through the cap-routing graph (kernel → init → memmgr →
-/// child via `REQUEST_FRAMES`) so memmgr's consumers can retype frames
-/// into kernel objects under the typed-memory contract.
+/// child via `REQUEST_MEMORY_CAPS`) so memmgr's consumers can retype frames
+/// into kernel objects (see docs/capability-model.md § Typed Memory).
 ///
 /// ktest is loaded as init and so receives the RAM Memory caps directly
-/// at slots `info.memory_base..+memory_count`. These are the
-/// caps the kernel actually stamps with RETYPE; segment-derived Memory
-/// caps (the BSS-derived `frame_pool` slots used elsewhere in this file)
-/// are intentionally minted *without* RETYPE since they back ELF pages,
-/// not retypable RAM.
+/// at slots `info.memory_base..+memory_count`. This test reads the cap at
+/// `ctx.memory_base`: the head of the first RAM cap, which
+/// `frame_pool::init` leaves in place after carving the pool's single-page
+/// frames off its tail.
 pub fn memory_caps_carry_retype_right(ctx: &TestContext) -> TestResult
 {
     let memory = ctx.memory_base;
@@ -352,7 +352,9 @@ fn bound_creation_masks(ctx: &TestContext) -> TestResult
 /// `capacity == 3 × 56`, `used == 0`, and `budget == 3` pages. Inserting
 /// one cap draws the first slot page from the pool, so capacity settles at
 /// `3 × 56 − 1` (slot 0 reserved) with `used == 1`. An augment-mode
-/// donation of 2 pages raises capacity by `2 × 56`.
+/// donation of 2 pages raises capacity by `2 × 56`. The page and slot
+/// arithmetic follows core/kernel/docs/capability-internals.md § Page Pools,
+/// § Representation, and § Storage: Hybrid Two-Level Radix.
 pub fn cspace_fields(ctx: &TestContext) -> TestResult
 {
     const PAGE_SIZE: u64 = 4096;
@@ -421,7 +423,8 @@ pub fn cspace_fields(ctx: &TestContext) -> TestResult
 
 // ── Negative paths ───────────────────────────────────────────────────────────
 
-/// `cap_info(0, _)` returns `InvalidCapability` — slot 0 is permanently null.
+/// `cap_info(0, _)` returns `InvalidCapability` — slot 0 is permanently null
+/// (docs/capability-model.md § Capability Spaces).
 pub fn null_slot_invalid(_ctx: &TestContext) -> TestResult
 {
     let err = cap_info(0, CAP_INFO_TAG_RIGHTS);
@@ -489,13 +492,14 @@ pub fn unknown_field_invalid_arg(ctx: &TestContext) -> TestResult
 // CapTag values are kept aligned with the kernel; if the enum gains a new
 // variant the constants above need updating in lockstep.
 const _: () = {
-    // Static cross-checks (shake out typos at compile time).
+    // Restates each constant's literal; this does not check the values
+    // against core/kernel/src/cap/slot.rs `CapTag`, which is kept in sync by hand.
     assert!(TAG_MEMORY == 1);
     assert!(TAG_ADDRESS_SPACE == 2);
     assert!(TAG_SIGNAL == 4);
     assert!(TAG_CSPACE == 9);
 };
 
-// Keep the unused constant from being optimised out when the test list does
-// not currently exercise an explicit CSpace tag check via TAG_RIGHTS.
+// `TAG_CSPACE` is not read by any test; this item and the assertion block
+// above are its only references.
 const _: u8 = TAG_CSPACE;

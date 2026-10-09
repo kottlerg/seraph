@@ -8,7 +8,7 @@
 //! Most ktest scenarios spawn a child thread in a fresh `CSpace`, copy one
 //! or two caps into that `CSpace`, then configure-and-start the thread. The
 //! `cap_create_cspace + cap_create_thread + thread_configure + thread_start`
-//! plumbing is mechanical and identical across ~25 sites. This module
+//! plumbing is mechanical and identical across most of those sites. This module
 //! wraps it so each test reads as scenario, not boilerplate.
 //!
 //! Use [`new_child`] to mint the (`CSpace`, Thread) pair, do any `cap_copy`
@@ -93,8 +93,8 @@ pub unsafe fn child_args<T: Copy>(arg: u64) -> T
 ///
 /// Caller is responsible for deleting both caps when the child has exited
 /// (typically via `notification_wait`-based handshake). Either order is
-/// safe: deleting `cs` first stops a still-live child (the kernel stops
-/// every thread bound to a `CSpace` before reclaiming it); deleting `th`
+/// safe: deleting `cs` first stops a still-live child
+/// (`core/kernel/docs/scheduling-internals.md` § Thread Registry); deleting `th`
 /// first is the tidy order, since the exited thread's object goes at once.
 pub struct SpawnedChild
 {
@@ -113,8 +113,8 @@ pub fn new_child(ctx: &TestContext) -> Result<SpawnedChild, &'static str>
 }
 
 /// Like [`new_child`] but creates the thread at `priority` under
-/// `sched_cap`'s band (`(0, 0)` = floor; `priority == 0` with a cap =
-/// the cap's band floor).
+/// `sched_cap`'s band (the `sched_cap`/`priority` rules are in
+/// `core/kernel/docs/syscalls.md` § `SYS_CAP_CREATE_THREAD`).
 pub fn new_child_at(
     ctx: &TestContext,
     sched_cap: u32,
@@ -135,8 +135,8 @@ pub fn new_child_at(
 
 /// Configure `child` to enter `entry(arg)` on `stack_top` and start it.
 ///
-/// `entry` is the typical `extern "C" fn(u64) -> !` shape used by all
-/// existing ktest children.
+/// `entry` is a Rust-ABI `fn(u64) -> !`; its address is the entry point
+/// passed to `thread_configure`.
 pub fn configure_and_start(
     child: &SpawnedChild,
     entry: fn(u64) -> !,
@@ -178,7 +178,8 @@ pub fn wait_until_exited(thread: u32, max_polls: u32) -> Result<u64, &'static st
     {
         let packed = syscall::cap_info(thread, syscall_abi::CAP_INFO_THREAD_STATE)
             .map_err(|_| "spawn::wait_until_exited: cap_info(THREAD_STATE) failed")?;
-        // cast_possible_truncation: 8-bit state in the high word, 32-bit reason low.
+        // cast_possible_truncation: the u32 state code fills the high 32 bits, so
+        // `packed >> 32` fits in u32.
         #[allow(clippy::cast_possible_truncation)]
         if (packed >> 32) as u32 == syscall_abi::THREAD_STATE_EXITED
         {

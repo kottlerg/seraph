@@ -5,44 +5,54 @@
 
 //! Tier 1 tests for memory management syscalls.
 //!
-//! Covers: `SYS_MEMORY_SPLIT`, `SYS_MEM_MAP`, `SYS_MEM_UNMAP`,
+//! Covers: `SYS_MEMORY_SPLIT`, `SYS_MEMORY_MERGE`, `SYS_MEM_MAP`, `SYS_MEM_UNMAP`,
 //! `SYS_MEM_PROTECT`, `SYS_ASPACE_QUERY`.
 //!
-//! Memory cap layout after `aspace_cap` (as provided by the kernel/bootloader):
-//!   `aspace_cap + 1` — TEXT segment Memory cap
-//!   `aspace_cap + 2` — RODATA segment Memory cap
-//!   `aspace_cap + 3` — BSS/DATA segment Memory cap
+//! Memory cap layout after `aspace_cap`: the kernel mints one segment Memory
+//! cap per init LOAD segment at Phase 9, in program-header order
+//! (`core/kernel/docs/initialization.md` § Phase 9: Init Creation and Scheduler
+//! Entry). For ktest's image:
+//!   `aspace_cap + 1` — RODATA segment (R) Memory cap
+//!   `aspace_cap + 2` — TEXT segment (RX) Memory cap
+//!   `aspace_cap + 3` — RELRO segment (`.data.rel.ro`, `.dynamic`, `.got`) Memory cap
+//!   `aspace_cap + 4` — DATA/BSS segment (RW) Memory cap
 //!
-//! Every segment cap carries full rights (`MAP|READ|WRITE|EXECUTE|RETYPE`): the
-//! kernel mints all RAM frames uniformly so they flow into memmgr's pool as
-//! general RAM at init reap. Page-table protection (R/RW/RX) is applied at map
-//! time by `map_segment`, independent of cap rights.
+//! Every segment cap carries full Memory rights (`MAP|WRITE|EXECUTE|RETYPE`);
+//! the page-table protection of ktest's own segments is independent of cap
+//! rights (see `core/kernel/docs/initialization.md` § Phase 9: Init Creation and
+//! Scheduler Entry).
 //!
-//! Segment Memory caps own their physical memory (the kernel mints them with
-//! `owns_memory=true` so the init-reap donation cascade can return them to
-//! memmgr). Tests therefore MUST NOT `cap_delete` or otherwise dec-ref a
+//! Segment Memory caps own their physical memory (`owns_memory = true`; see
+//! `core/kernel/docs/initialization.md` § Phase 9: Init Creation and Scheduler
+//! Entry). Tests therefore MUST NOT `cap_delete` or otherwise dec-ref a
 //! segment cap (or a tail derived from one) while the segment is still
 //! mapped in ktest's own address space — the dealloc would buddy-free phys
 //! pages still referenced by live PTEs and silently alias future allocations.
-//! Split/merge/delete exercises operate on pool-allocated frames; segments
-//! are read-only test surfaces for `mem_map` / `mem_protect`.
+//! Split-boundary and delete exercises operate on pool-allocated frames.
+//! `memory_split_merge` splits a segment cap and restores it through
+//! `memory_merge` only (never `cap_delete`), and `init_segment_caps_aligned`
+//! maps segment caps read-only through `mem_map`.
 
 use syscall::{MAP_READ, MAP_WRITABLE, aspace_query, mem_map, mem_unmap};
 
 use crate::{TestContext, TestResult};
 
-/// Safe test virtual address: 1 GiB. Well above ktest's load address and stack.
-/// Used consistently across mm tests to avoid mapping conflicts.
+/// Test virtual address: 5 GiB. Below ktest's PIE image, `InitInfo`, and stack
+/// windows (`IMAGE_WINDOW`, `INIT_INFO_WINDOW`, `INIT_STACK_GUARD_WINDOW` in
+/// `shared/process-layout`), so it overlaps no ktest mapping. Used consistently
+/// across mm tests to avoid mapping conflicts.
 const TEST_VA: u64 = 0x1_4000_0000;
 
 // ── SYS_MEMORY_SPLIT / SYS_MEMORY_MERGE ─────────────────────────────────────────
 
-/// Split-merge round-trip on the RODATA segment cap (Option D semantics).
+/// Split-merge round-trip on the TEXT segment cap (`aspace_cap + 2`; the
+/// local is named `rodata_cap`), using the in-place-shrink split semantics of
+/// `sys_memory_split`.
 ///
 /// Validates the full inverse relationship between `memory_split` and
 /// `memory_merge`:
 ///
-/// 1. Splitting RODATA at one page shrinks the parent slot in place to a
+/// 1. Splitting the TEXT segment cap at one page shrinks the parent slot in place to a
 ///    single page and returns a new tail slot covering the remainder.
 /// 2. Merging in the wrong order (tail, parent) is rejected — the
 ///    contiguity check requires `parent.base + parent.size == tail.base`.
@@ -85,9 +95,9 @@ pub fn memory_split_merge(ctx: &TestContext) -> TestResult
         return Err("re-split returned parent slot for tail");
     }
 
-    // Restore RODATA to its original size via merge. Using `cap_delete`
+    // Restore the TEXT segment cap to its original size via merge. Using `cap_delete`
     // here would dec-ref a Memory cap whose phys range is still mapped at
-    // RODATA's segment VA; the dealloc path would buddy-free pages live
+    // the TEXT segment's VA; the dealloc path would buddy-free pages live
     // in ktest's own page tables.
     syscall::memory_merge(rodata_cap, tail2).map_err(|_| "final memory_merge failed")?;
     Ok(())
@@ -123,9 +133,9 @@ pub fn mem_map_unmap(ctx: &TestContext) -> TestResult
 
 /// `mem_protect` changes permission flags on an existing mapping.
 ///
-/// Maps a frame page, sets it to read-only (prot = 0: no WRITE, no EXECUTE),
-/// then unmaps. Verifying that a write actually faults requires a userspace
-/// fault handler (deferred).
+/// Maps a frame page and sets it read-only (prot = 0: no WRITE, no EXECUTE);
+/// `FrameGuard`'s drop unmaps it. The test checks only that `mem_protect`
+/// succeeds; it does not write to the page to observe the resulting fault.
 pub fn mem_protect(ctx: &TestContext) -> TestResult
 {
     let mut memory_cap = crate::frame_pool::FrameGuard::new(ctx.aspace_cap)
@@ -500,7 +510,8 @@ pub fn memory_split_at_end_err(_ctx: &TestContext) -> TestResult
 /// `size` to userspace, even when the underlying ELF segment has a sub-page
 /// `p_vaddr` (i.e. the ktest binary contains a non-empty `.data` section).
 ///
-/// Maps each segment cap's first page read-only at `SEG_PROBE_VA` and queries
+/// Maps the first page of each of the first three segment caps (RODATA,
+/// TEXT, RELRO) read-only at `SEG_PROBE_VA` and queries
 /// the resulting physical address. The kernel `debug_assert!`s page alignment
 /// inside `PageTableEntry::new_page`, so a misaligned cap would panic before
 /// the query returns. `aspace_query` returning a page-aligned PA confirms the
@@ -513,8 +524,10 @@ pub fn memory_split_at_end_err(_ctx: &TestContext) -> TestResult
 pub fn init_segment_caps_aligned(ctx: &TestContext) -> TestResult
 {
     const SEG_PROBE_VA: u64 = 0x1_4300_0000;
-    // Phase 9 mints exactly three segments per init binary: TEXT, RODATA,
-    // BSS/DATA. The cap slots sit contiguously starting at `aspace_cap + 1`.
+    // Phase 9 mints one Memory cap per init LOAD segment, in contiguous slots
+    // from `aspace_cap + 1`. ktest's image has four (RODATA, TEXT, RELRO,
+    // DATA/BSS); this loop probes only the first three, so the DATA/BSS cap
+    // at `aspace_cap + 4` is not probed.
     const SEG_COUNT: u32 = 3;
 
     for i in 0..SEG_COUNT

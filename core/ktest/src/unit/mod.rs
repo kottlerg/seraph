@@ -15,16 +15,15 @@
 //! subsystem is added. Files stay scoped; they don't grow unboundedly
 //! because each is one surface.
 //!
-//! Every kernel syscall must have at least one positive-path test here
-//! plus its most important negative paths (wrong rights, invalid
-//! arguments, wrong object state).
+//! Per-syscall coverage requirement: see [core/ktest/README.md](../../README.md) § Tier 1 —
+//! `src/unit/`.
 //!
 //! Files:
 //! - `cap.rs`      — capability creation, copy, move, insert, derive, revoke, delete
 //! - `cap_info.rs` — read-only capability state inspection (`SYS_CAP_INFO`)
 //! - `retype.rs`   — retype primitive: aspace/cspace augment (unbounded donations), PT
 //!   budget, kernel PT pool
-//! - `mm.rs`       — memory map/unmap/protect, memory split, address space query
+//! - `mm.rs`       — memory map/unmap/protect, memory split and merge, address space query
 //! - `entropy.rs`  — userspace randomness (`SYS_GETRANDOM`), incl. the user-copy
 //!   fault-recovery regression (unmapped or read-only buffer ⇒ `InvalidAddress`,
 //!   not panic)

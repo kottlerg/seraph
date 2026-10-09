@@ -1187,8 +1187,6 @@ pub fn acknowledge(irq: u32)
 /// # Safety
 /// - `target_hart_id` must be a valid hart ID of an online hart
 /// - Caller must ensure the TLB shootdown protocol state is set up correctly
-// Used by TLB shootdown implementation.
-#[allow(dead_code)]
 pub unsafe fn send_tlb_shootdown_ipi(target_hart_id: u32)
 {
     // SAFETY: caller guarantees the target hart is online (this function's

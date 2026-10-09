@@ -942,7 +942,7 @@ pub fn dispatch_for(object_type: ObjectType, size_arg: u64) -> Option<DispatchEn
         // Notification: 24 wrapper + NotificationState (40 B) = 64 B, budgeted as
         // the literal 120 → BIN_128. Unlike the Endpoint arm, the budget is not
         // computed from size_of, and no const assertion pins wrapper +
-        // NotificationState within BIN_128 (#438).
+        // NotificationState within BIN_128 (#460).
         ObjectType::Notification => Some(DispatchEntry {
             raw_bytes: 120,
             split: false,

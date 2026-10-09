@@ -260,7 +260,7 @@ pub fn tss_desc(tss_addr: u64) -> (u64, u64)
     // Use TssWithIopb size so the descriptor covers the IOPB region.
     // Under cfg(test) the limit is the literal 8296 (104 + 8192 + 1 - 1)
     // instead of `size_of::<TssWithIopb>() - 1`; `TssWithIopb` is defined in
-    // test builds too, so the literal only duplicates the size (#438).
+    // test builds too, so the literal only duplicates the size (#460).
     #[cfg(not(test))]
     let limit: u64 = (core::mem::size_of::<TssWithIopb>() as u64) - 1;
     #[cfg(test)]

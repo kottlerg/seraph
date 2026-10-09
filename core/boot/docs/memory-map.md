@@ -89,7 +89,9 @@ Every other `Loaded` page is permanent: the bootloader's own loaded image
 (firmware-allocated as `EfiLoaderCode` / `EfiLoaderData`; it contains the
 handoff trampoline), the kernel image, the kernel handoff stack (kept as the
 BSP boot stack), the kernel ELF file read buffer, the raw UEFI memory-map
-buffer, and, on riscv64, the paging-mode probe page.
+buffer, and, on riscv64, the paging-mode probe page. The read buffer and the raw map
+buffer are dead once consumed; freeing or reclaiming them is
+[#442](https://github.com/kottlerg/seraph/issues/442).
 
 The `Loaded` allocations are:
 

@@ -34,9 +34,6 @@ pub fn bsp_tss_ptr() -> u64
 /// No preconditions — the body is empty. The `unsafe` qualifier exists only to
 /// match the x86-64 surface signature.
 #[cfg(not(test))]
-// unused_variables: inert — every parameter is `_`-prefixed to mirror the x86-64
-// `gdt::init_ap` signature, so the lint does not fire (#438).
-#[allow(unused_variables)]
 pub unsafe fn init_ap(_cpu_id: u32, _rsp0: u64, _ist1_top: u64, _ist2_top: u64) {}
 
 /// Load the per-thread IOPB into the TSS — no-op on RISC-V.

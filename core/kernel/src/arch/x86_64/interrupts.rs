@@ -471,9 +471,6 @@ unsafe fn send_sipi(target_apic_id: u32, vector: u8)
 /// # Safety
 /// - `target_apic_id` must be a valid APIC ID of an online CPU
 /// - Caller must ensure the TLB shootdown protocol state is set up correctly
-// dead_code: does not fire: `mm::tlb_shootdown::shootdown` calls this function, so the
-// suppression is redundant (recorded on #438).
-#[allow(dead_code)]
 #[cfg(not(test))]
 pub unsafe fn send_tlb_shootdown_ipi(target_apic_id: u32)
 {

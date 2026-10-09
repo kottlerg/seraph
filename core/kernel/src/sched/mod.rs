@@ -2256,9 +2256,6 @@ pub(crate) fn alloc_zeroed_slab<T>(
 /// never called; this stub satisfies the call site without requiring access to
 /// arch-specific types that are unavailable on the host.
 #[cfg(test)]
-// unused_variables: host-test stub; its parameter is unused
-// (already `_`-prefixed, so this suppression is redundant).
-#[allow(unused_variables)]
 pub fn init(_cpu_count: u32) -> u32
 {
     0
@@ -3121,9 +3118,6 @@ pub unsafe fn commit_blocked_under_local_lock(
 
 /// Test stub.
 #[cfg(test)]
-// unused_variables: host-test stub; its parameters are unused
-// (already `_`-prefixed, so this suppression is redundant).
-#[allow(unused_variables)]
 pub unsafe fn commit_blocked_under_local_lock(
     _tcb: *mut ThreadControlBlock,
     _ipc: thread::IpcThreadState,
@@ -3195,9 +3189,6 @@ pub unsafe fn commit_reply_rebind_under_local_lock(
 
 /// Test stub.
 #[cfg(test)]
-// unused_variables: host-test stub; its parameters are unused
-// (already `_`-prefixed, so this suppression is redundant).
-#[allow(unused_variables)]
 pub unsafe fn commit_reply_rebind_under_local_lock(
     _tcb: *mut ThreadControlBlock,
     _ipc: thread::IpcThreadState,
@@ -3225,9 +3216,6 @@ pub unsafe fn prod_remote_cpu(target_cpu: usize)
 
 /// Test stub.
 #[cfg(test)]
-// unused_variables: host-test stub; its parameter is unused
-// (already `_`-prefixed, so this suppression is redundant).
-#[allow(unused_variables)]
 pub unsafe fn prod_remote_cpu(_target_cpu: usize) {}
 
 /// Spin until `tcb` is `current` on no CPU and its register save is published
@@ -3346,9 +3334,6 @@ pub unsafe fn await_descheduled(tcb: *mut thread::ThreadControlBlock)
 
 /// Test stub.
 #[cfg(test)]
-// unused_variables: host-test stub; its parameter is unused
-// (already `_`-prefixed, so this suppression is redundant).
-#[allow(unused_variables)]
 pub unsafe fn await_descheduled(_tcb: *mut thread::ThreadControlBlock) {}
 
 /// Migrate a `Ready` thread from `src_cpu`'s run queue onto `dst_cpu`'s
@@ -3562,9 +3547,6 @@ unsafe fn relocate_ready_thread(
 
 /// Test stub.
 #[cfg(test)]
-// unused_variables: host-test stub; its parameters are unused
-// (already `_`-prefixed, so this suppression is redundant).
-#[allow(unused_variables)]
 pub unsafe fn migrate_ready_thread(
     _tcb: *mut thread::ThreadControlBlock,
     _src_cpu: usize,
@@ -3695,9 +3677,6 @@ pub unsafe fn relocate_ready_priority(
 
 /// Test stub.
 #[cfg(test)]
-// unused_variables: host-test stub; its parameters are unused
-// (already `_`-prefixed, so this suppression is redundant).
-#[allow(unused_variables)]
 pub unsafe fn relocate_ready_priority(
     _tcb: *mut thread::ThreadControlBlock,
     _old_prio: u8,
@@ -3815,9 +3794,6 @@ unsafe fn try_pull_balance(this_cpu: usize)
 
 /// Test stub.
 #[cfg(test)]
-// unused_variables: host-test stub; its parameter is unused
-// (already `_`-prefixed, so this suppression is redundant).
-#[allow(unused_variables)]
 unsafe fn try_pull_balance(_this_cpu: usize) {}
 
 /// Locate the first unpinned Ready thread on `src_cpu`'s run queues and
@@ -3967,9 +3943,6 @@ unsafe fn pull_unpinned_ready(src_cpu: usize, dst_cpu: usize)
 
 /// Test stub.
 #[cfg(test)]
-// unused_variables: host-test stub; its parameters are unused
-// (already `_`-prefixed, so this suppression is redundant).
-#[allow(unused_variables)]
 unsafe fn pull_unpinned_ready(_src_cpu: usize, _dst_cpu: usize) {}
 
 /// Make a not-live thread `Ready` and link it on `target_cpu`'s run queue,
@@ -4119,9 +4092,6 @@ pub unsafe fn enqueue_and_wake(tcb: *mut ThreadControlBlock, target_cpu: usize)
 
 /// Test stub for `enqueue_and_wake` (no-op in test mode).
 #[cfg(test)]
-// unused_variables: host-test stub; its parameters are unused
-// (already `_`-prefixed, so this suppression is redundant).
-#[allow(unused_variables)]
 pub unsafe fn enqueue_and_wake(_tcb: *mut ThreadControlBlock, _target_cpu: usize) {}
 
 /// Make `tcb` `Ready` and link it on `target_cpu`'s run queue, under the
@@ -4215,9 +4185,6 @@ pub unsafe fn enqueue_ready_thread(tcb: *mut ThreadControlBlock, target_cpu: usi
 
 /// Test stub for `enqueue_ready_thread` (no-op in test mode).
 #[cfg(test)]
-// unused_variables: host-test stub; its parameters are unused
-// (already `_`-prefixed, so this suppression is redundant).
-#[allow(unused_variables)]
 pub unsafe fn enqueue_ready_thread(_tcb: *mut ThreadControlBlock, _target_cpu: usize) -> bool
 {
     true
@@ -4388,9 +4355,6 @@ unsafe fn wake_idle_cpu(target_cpu: usize)
 
 /// Test stub for `wake_idle_cpu` (no-op in test mode).
 #[cfg(test)]
-// unused_variables: host-test stub; its parameter is unused
-// (already `_`-prefixed, so this suppression is redundant).
-#[allow(unused_variables)]
 unsafe fn wake_idle_cpu(_target_cpu: usize) {}
 
 // ── schedule ──────────────────────────────────────────────────────────────────

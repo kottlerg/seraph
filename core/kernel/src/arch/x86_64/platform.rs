@@ -149,7 +149,7 @@ mod tests
     fn ioapics_into_synthesises_default_when_empty()
     {
         // Empty: asserts nothing and does not cover `ioapics_into`'s fallback
-        // (#438). No host test writes `KERNEL_MMIO_CELL`; `kernel_mmio()` reads
+        // (#460). No host test writes `KERNEL_MMIO_CELL`; `kernel_mmio()` reads
         // `KernelMmio::zero()` here.
     }
 }

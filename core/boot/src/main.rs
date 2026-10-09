@@ -117,7 +117,7 @@ struct UefiContext
 ///
 /// The read buffer is unused once `load_kernel` has copied the segments
 /// out, but it is never freed or recorded in `BootInfo.reclaim_ranges`, so it
-/// stays a permanent `Loaded` page (`core/boot/docs/memory-map.md`; #438). It
+/// stays a permanent `Loaded` page (`core/boot/docs/memory-map.md`; #442). It
 /// is identity-mapped in the handoff tables per
 /// `core/boot/docs/page-tables.md` § Contract at Kernel Entry.
 struct KernelLoad
@@ -1151,7 +1151,7 @@ fn collect_identity_regions(
         push(seg.phys_addr, (seg.size + 4095) & !4095);
     }
     // Kernel ELF file read buffer: a permanent `Loaded` page, never freed or
-    // reclaimed (core/boot/docs/memory-map.md; #438), identity-mapped per
+    // reclaimed (core/boot/docs/memory-map.md; #442), identity-mapped per
     // core/boot/docs/page-tables.md § Contract at Kernel Entry.
     push(kernel.buf_phys, (kernel.buf_pages as u64) * 4096);
     // Bundle blob: one allocation covers every module body and the init
@@ -1361,7 +1361,7 @@ unsafe fn step9_populate_boot_info(
     // § Step 9 lists for `reclaim_ranges` (the AP trampoline entry flagged
     // `RECLAIM_FLAG_LATE`), with the reclaim-array page itself recorded last.
     // The kernel ELF read buffer and the raw UEFI memory-map buffer are not
-    // recorded and stay permanent (core/boot/docs/memory-map.md; #438).
+    // recorded and stay permanent (core/boot/docs/memory-map.md; #442).
     // SAFETY: reclaim_array_phys is a valid 4 KiB allocation; we treat it as
     // a fixed-size array of MAX_RECLAIM_RANGES entries (256 × 16 B = 4 KiB).
     let reclaim_ranges: &mut [ReclaimRange; MAX_RECLAIM_RANGES] =

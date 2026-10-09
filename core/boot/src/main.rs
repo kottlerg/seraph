@@ -5,10 +5,10 @@
 
 //! Seraph UEFI bootloader — ten-step boot sequence orchestrator.
 //!
-//! Loads the kernel ELF and init module from the ESP, establishes initial
-//! page tables with W^X enforcement, discovers firmware table addresses,
-//! exits UEFI boot services, populates `BootInfo`, and jumps to the kernel
-//! entry point. See `core/boot/docs/boot-flow.md` for the step-by-step design.
+//! Loads the kernel ELF and the bootstrap bundle (init plus boot modules) from
+//! the ESP, establishes initial page tables with W^X enforcement, discovers
+//! firmware table addresses, exits UEFI boot services, populates `BootInfo`,
+//! and jumps to the kernel entry point. See `core/boot/docs/boot-flow.md` for the step-by-step design.
 
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(not(test), no_main)]
@@ -1412,7 +1412,7 @@ unsafe fn step9_populate_boot_info(
     // Module-covered pages are accounted exclusively by
     // `cap::mint_module_memory_caps`; carving around them keeps the
     // `register_owned_range` ledger entries disjoint and avoids the
-    // double-count / double-free trap that motivated PR #138 commit 6.
+    // double-count / double-free trap a page in both would cause.
     let bundle_end = bundle.phys + (bundle.pages as u64) * 4096;
     let mut bundle_cursor = bundle.phys;
     for module in &mods.modules[..mods.count]
@@ -1429,6 +1429,8 @@ unsafe fn step9_populate_boot_info(
         );
         if bundle_cursor < module_base
         {
+            // The gap lies inside the bundle allocation, and no UEFI allocation
+            // reaches u32::MAX pages (16 TiB), so the cast is exact.
             #[allow(clippy::cast_possible_truncation)]
             let gap_pages = ((module_base - bundle_cursor) / 4096) as u32;
             push_reclaim(bundle_cursor, gap_pages, 0);
@@ -1437,6 +1439,7 @@ unsafe fn step9_populate_boot_info(
     }
     if bundle_cursor < bundle_end
     {
+        // The tail lies inside the bundle allocation (see the gap cast above).
         #[allow(clippy::cast_possible_truncation)]
         let tail_pages = ((bundle_end - bundle_cursor) / 4096) as u32;
         push_reclaim(bundle_cursor, tail_pages, 0);
@@ -1601,7 +1604,7 @@ unsafe fn step10_handoff(
 #[cfg(test)]
 mod tests
 {
-    use super::{BootEntropy, ElfKind, KaslrOverride, choose_kaslr_layout};
+    use super::{BootEntropy, ElfKind, KaslrOverride, choose_kaslr_layout, scrub};
     use boot_protocol::{KASLR_DISABLED_BY_KNOB, KASLR_ENTROPY_FW_RNG, KASLR_IMAGE_RANDOMIZED};
 
     const IMAGE: u64 = 8 << 20;
@@ -1674,5 +1677,20 @@ mod tests
         assert!(d.randomize_dm);
         assert_eq!(d.dm_rand, e.kaslr[1]);
         assert_eq!(d.flags, KASLR_ENTROPY_FW_RNG);
+    }
+
+    #[test]
+    fn scrub_zeroes_every_byte()
+    {
+        let mut secret = [0xA5u8; 32];
+        scrub(&mut secret);
+        assert_eq!(secret, [0u8; 32]);
+    }
+
+    #[test]
+    fn scrub_accepts_an_empty_slice()
+    {
+        let mut empty: [u8; 0] = [];
+        scrub(&mut empty);
     }
 }

@@ -132,6 +132,7 @@ pub unsafe fn derive_mmio_apertures(
         size: 0,
     }; SCRATCH];
     let mut n: usize = 0;
+    let mut dropped = false;
 
     // Collect MMIO-class descriptors from the UEFI map.
     let mut offset: usize = 0;
@@ -149,13 +150,20 @@ pub unsafe fn derive_mmio_apertures(
 
         let is_mmio = desc.memory_type == EFI_MEMORY_MAPPED_IO
             || desc.memory_type == EFI_MEMORY_MAPPED_IO_PORT_SPACE;
-        if is_mmio && n < SCRATCH
+        if is_mmio
         {
-            buf[n] = MmioAperture {
-                phys_base: desc.physical_start,
-                size: desc.number_of_pages * 4096,
-            };
-            n += 1;
+            if n < SCRATCH
+            {
+                buf[n] = MmioAperture {
+                    phys_base: desc.physical_start,
+                    size: desc.number_of_pages * 4096,
+                };
+                n += 1;
+            }
+            else
+            {
+                dropped = true;
+            }
         }
     }
 
@@ -170,6 +178,10 @@ pub unsafe fn derive_mmio_apertures(
         {
             buf[n] = *s;
             n += 1;
+        }
+        else
+        {
+            dropped = true;
         }
     }
 
@@ -214,12 +226,16 @@ pub unsafe fn derive_mmio_apertures(
             };
             out_count += 1;
         }
+        else
+        {
+            dropped = true;
+        }
         i = j;
     }
 
-    if out_count >= out.len()
+    if dropped
     {
-        bprintln!("[--------] boot: MMIO apertures: > MAX_APERTURES after merge; truncated");
+        bprintln!("[--------] boot: MMIO apertures: surplus over MAX_APERTURES dropped");
     }
 
     out_count

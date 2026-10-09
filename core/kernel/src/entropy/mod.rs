@@ -7,8 +7,9 @@
 //!
 //! Provides the kernel-internal source of randomness: a multi-source entropy
 //! pool feeding per-CPU forward-secure generators, with a small draw API for
-//! in-kernel consumers such as ASLR, handle randomization, and crypto
-//! key/nonce generation. A boot-time self-test exercises the draw path on
+//! in-kernel consumers (ASLR and identifier randomization) and the userspace
+//! `SYS_GETRANDOM` syscall (`core/kernel/docs/entropy.md` § Draw API and
+//! consumers). A boot-time self-test exercises the draw path on
 //! every CPU. The design and threat model are specified in
 //! `core/kernel/docs/entropy.md`.
 //!
@@ -20,10 +21,13 @@
 //! - [`reseed_policy`] — pure reseed decision function.
 //! - [`jitter`] — per-CPU interrupt-time jitter accumulator.
 //! - [`vmgenid`] — VM Generation ID snapshot-resume detector.
+//! - [`health`] — NIST SP 800-90B continuous health tests gating the hardware RNG.
+//! - [`selftest`] — boot-time power-on self-test of the per-CPU generators.
 //!
-//! The permutation, sponge, and reseed policy are pure and host-testable; the
-//! pool, per-CPU generators, jitter source, VMGENID detector, and draw API
-//! are hardware-coupled and compiled only for the kernel target.
+//! The permutation, sponge, health tests, and reseed policy are pure and
+//! host-testable; the pool, per-CPU generators, jitter source, VMGENID
+//! detector, self-test, and draw API are hardware-coupled and compiled only
+//! for the kernel target.
 
 pub mod health;
 pub mod keccak;
@@ -95,8 +99,8 @@ mod imp
     /// the firmware (empty when no source produced one; see
     /// `core/kernel/docs/entropy.md`).
     /// `vmgenid_paddr` is the VMGENID GUID physical address (zero when absent);
-    /// arming it before `mark_seeded` guarantees no draw precedes snapshot
-    /// detection.
+    /// it is armed before `mark_seeded` per `core/kernel/docs/entropy.md`
+    /// § Boot wiring and lifecycle.
     pub fn init(boot_seed: &[u8], vmgenid_paddr: u64)
     {
         seed_pool_from_sources(boot_seed);
@@ -115,10 +119,9 @@ mod imp
     }
 
     /// Mark the calling CPU's generator stale so its next fill performs a
-    /// mandatory reseed. The self-test capture above is that generator's
-    /// first draw, so it seeds from the scrape-dominated boot-time pool;
-    /// staleness makes the first *consumer* draw reseed with the runtime
-    /// jitter accrued in between.
+    /// mandatory reseed, decoupling the first consumer draw from the boot-time
+    /// pool the self-test capture drew from (`core/kernel/docs/entropy.md`
+    /// § Boot-time entropy).
     fn mark_stale_current_cpu()
     {
         // SAFETY: as in `fill_bytes` — disabling interrupts pins this CPU and
@@ -135,12 +138,10 @@ mod imp
         }
     }
 
-    /// Mix every available entropy source into the pool.
-    ///
-    /// The firmware boot seed (where the bootloader supplied one) and the hardware
-    /// RNG (where present, health-gated) are mixed *with* boot-time jitter — never
-    /// trusted alone. With neither a firmware seed nor a hardware RNG this degrades
-    /// to jitter only.
+    /// Mix every available entropy source into the pool: the firmware boot seed
+    /// (where supplied), the health-gated hardware RNG (where present), then the
+    /// boot jitter scrape. Source mixing and degradation are specified in
+    /// `core/kernel/docs/entropy.md` § Boot-time entropy.
     fn seed_pool_from_sources(boot_seed: &[u8])
     {
         use crate::arch::current::entropy as hw;
@@ -155,10 +156,7 @@ mod imp
         {
             pool::absorb(boot_seed);
             seeded = true;
-            crate::kprintln!(
-                "entropy: seeded from boot seed ({} bytes)",
-                boot_seed.len()
-            );
+            crate::kprintln!("entropy: seeded from boot seed ({} bytes)", boot_seed.len());
         }
 
         let hw_available = hw::hw_rng_available();
@@ -209,9 +207,9 @@ mod imp
 
     /// Absorb cycle-counter samples taken across intervening pool work. The
     /// microarchitectural timing of each absorb perturbs successive reads — a
-    /// weak source, but distinct from the hardware RNG. This is the documented
-    /// boot-time entropy hole, narrowed continuously at runtime by the
-    /// timer-tick jitter hook.
+    /// weak source, but distinct from the firmware seed and the hardware RNG.
+    /// Where it is the only source, the result is the boot-entropy hole
+    /// `core/kernel/docs/entropy.md` § Boot-time entropy describes.
     fn boot_jitter_scrape()
     {
         for _ in 0..64

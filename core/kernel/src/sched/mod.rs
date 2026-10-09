@@ -5,14 +5,11 @@
 
 //! Kernel scheduler — per-CPU state, idle threads, init launch, and context switching.
 //!
-//! Phase 8 allocates a kernel stack and idle TCB for each CPU.
+//! Phase 4 allocates each CPU's idle kernel stack; Phase 8 builds each CPU's idle TCB on it.
 //! Phase 9 adds `enter()`, which dequeues the init thread, builds its initial
-//! user-mode [`TrapFrame`], activates its address space, and calls
-//! `return_to_user` to start init running. `schedule()` provides preemptive
+//! user-mode [`TrapFrame`], and calls `first_entry_to_user`, which loads init's
+//! address space and enters user mode. `schedule()` provides preemptive
 //! context switching; timer preemption decrements `slice_remaining` per tick.
-//!
-//! # Deferred work
-//! - Cross-CPU load balancing and thread migration.
 
 // cast_possible_truncation: usize→u32 CPU index and u64→usize address bounded by MAX_CPUS.
 #![allow(clippy::cast_possible_truncation)]
@@ -157,9 +154,8 @@ const fn idle_stack_order() -> usize
     o
 }
 
-/// Number of CPUs initialised by `sched::init`.
-///
-/// Written once during boot by `init`, then read by `SYS_SYSTEM_INFO(CpuCount)`.
+/// Number of CPUs, published once during boot by `init_storage` (Phase 4) and read lock-free
+/// by the scheduler, the IPI paths, and `SYS_SYSTEM_INFO(CpuCount)`.
 pub static CPU_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 // ── Reschedule-pending flag ──────────────────────────────────────────────────
@@ -167,18 +163,12 @@ pub static CPU_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::Atomic
 /// Per-CPU reschedule-pending bitmask, sized to support up to `MAX_CPUS`
 /// CPUs as a vector of `AtomicU64` words.
 ///
-/// Load-bearing for the idle-wake primitive. Set producer-side in
-/// `enqueue_and_wake` before the wake notification (IPI) is sent. Consumed by the
-/// target CPU's idle loop with interrupts disabled, paired with
-/// `halt_until_interrupt`:
+/// Set by producers before the wake IPI and consumed by the idle loop with
+/// interrupts masked; the protocol and its ordering are specified in
+/// core/kernel/docs/scheduling-internals.md § Wake Protocol Invariants.
 ///
-/// - Producer: enqueue (under lock) → `set_reschedule_pending_for(target)` →
-///   unlock → `wake_idle_cpu(target)`.
-/// - Consumer (target CPU, idle loop): disable interrupts → check flag +
-///   run queue → if either set, clear flag and dispatch; else
-///   `halt_until_interrupt` (atomic enable+halt).
-///
-/// This closes the "window B" race: a wake notification that races between the
+/// This closes the check-to-halt window (core/kernel/docs/scheduling-internals.md
+/// § Wake Protocol Invariants, invariant 2): a wake notification that races between the
 /// consumer's check and its halt lands either as an observed flag (via
 /// `take_reschedule_pending`) or as a pending interrupt that
 /// `halt_until_interrupt` wakes on atomically.
@@ -210,7 +200,7 @@ pub fn take_reschedule_pending(cpu: usize) -> bool
 //
 // Detects "every CPU stalled in kernel mode" and dumps per-CPU TCB state.
 // Mechanism, cost, and limitations are specified in
-// docs/scheduling-internals.md § Softlockup Watchdog.
+// core/kernel/docs/scheduling-internals.md § Softlockup Watchdog.
 
 const WATCHDOG_THRESHOLD_TICKS: u64 = 3_000; // ~3 s at the observed ~1 ms BSP tick.
 
@@ -239,9 +229,8 @@ static WATCHDOG_FIRED: core::sync::atomic::AtomicBool = core::sync::atomic::Atom
 
 /// Claim the global once-only watchdog dump latch. The first detector to trip
 /// — all-idle softlockup, owed-wake, or a heartbeat check on any CPU — wins.
-/// One dump per boot keeps the serial log readable, prevents a dump storm when
-/// many CPUs detect the same stall, and the first dump is the uncontaminated
-/// evidence.
+/// See core/kernel/docs/scheduling-internals.md § Softlockup Watchdog for the
+/// once-per-boot rationale.
 #[cfg(not(test))]
 fn watchdog_claim_dump() -> bool
 {
@@ -266,26 +255,15 @@ const DETECTOR_SCAN_INTERVAL_TICKS: u64 = 512;
 /// owed-wake rules use it as-is (they ride the BSP's own scan cadence, which
 /// self-stretches under host starvation).
 ///
-/// Sized above the slowest legitimate single-syscall CPU occupancy observed:
-/// on a slow TCG CI runner a debug-build aperture-mapping syscall held the
-/// BSP just past 2 s with interrupts off (#376 CI), so 2 s false-positived.
-/// A real wedge persists indefinitely — the grace costs only detection
-/// latency. Linux's softlockup default is 10 s for the same reason.
+/// Sizing rationale: core/kernel/docs/scheduling-internals.md § Softlockup
+/// Watchdog.
 #[cfg(not(test))]
 const WEDGE_GRACE_SECONDS: u64 = 8;
 
 /// Staleness threshold for the cross-CPU heartbeat checks, in timer ticks.
 ///
-/// Heartbeats are stamped in wall time (`current_tick`), but a vCPU's tick
-/// service rate degrades with guest width when the host is oversubscribed:
-/// the validation envelope runs 512 vCPUs on a 16-core host (32×), where any
-/// single vCPU — BSP included — legitimately goes seconds without a timer
-/// interrupt (the #376 512-vCPU runs observed a healthy BSP 2 s stale, with
-/// ~7% aggregate tick delivery). Scale the base grace with CPU count so the
-/// false-positive rate stays low across the envelope, stepping at multiples
-/// of 128 CPUs: <256 CPUs → 8 s, 256..384 → 16 s, 512 → 32 s. A genuinely
-/// wedged CPU exceeds any finite threshold, so the scaling costs only
-/// detection latency on wide guests.
+/// Scales `WEDGE_GRACE_SECONDS` with CPU count in steps of 128 CPUs, as
+/// specified in core/kernel/docs/scheduling-internals.md § Softlockup Watchdog.
 #[cfg(not(test))]
 fn heartbeat_stall_ticks(tps: u64) -> u64
 {
@@ -689,17 +667,12 @@ unsafe fn is_idle_tcb(tcb: *const thread::ThreadControlBlock) -> bool
     core::ptr::eq(tcb, idle)
 }
 
-/// Invariant tripwire for the bare spin locks (docs/scheduling-internals.md
-/// § Lock Hierarchy, "Bare spin locks"): a hold taken from a syscall with
-/// interrupts enabled and preemption enabled can be descheduled by the tick
-/// while held, and every later waiter then spins forever with interrupts
-/// masked. Called before each acquisition of a lock of kind `kind`; reports
-/// the first violation per kind once per boot, naming the thread, syscall,
-/// and call site, and a debug build then halts. Exempt: boot, before this
-/// CPU has dispatched a thread, and the idle thread — it runs its deferred
-/// reclaim with interrupts enabled and preemption enabled, which is sound
-/// only because its time slice is permanently zero, so `timer_tick` never
-/// reaches `schedule()` for it (asserted here).
+/// Invariant tripwire for the bare spin locks
+/// (core/kernel/docs/scheduling-internals.md § Lock Hierarchy, "Bare spin
+/// locks"). Called before each acquisition of a lock of kind `kind`; reports the
+/// first violation per kind once per boot, naming the thread, syscall, and call
+/// site, and a debug build then halts. Boot, a CPU with no dispatched thread, and
+/// the idle thread (whose zero slice is asserted here) are exempt.
 #[cfg(not(test))]
 pub fn check_lock_hold_preemptible(kind: LockKind, site: &core::panic::Location<'_>)
 {
@@ -796,15 +769,9 @@ fn watchdog_tick_and_check()
         }
     }
 
-    // A synchronous TLB shootdown legitimately holds every participating CPU
-    // (initiator preempt-disabled in the ack-wait; others spinning in pt_lock
-    // or their own shootdown) until all remote CPUs ack. Under heavy
-    // oversubscription that round-trip can exceed this 3 s threshold while
-    // still making progress. The shootdown owns its own bounded escalation
-    // (NMI backtrace at 0.75 s, panic at 5 s — see arch wait_for_ack) and is
-    // the authoritative detector for a genuinely stuck IPI, so defer to it
-    // rather than emit a misleading softlockup dump. A non-shootdown stall
-    // re-checks on the next tick once the shootdown drains.
+    // Defer to an in-flight TLB shootdown, whose own ladder is the authoritative
+    // detector (core/kernel/docs/scheduling-internals.md § Softlockup Watchdog,
+    // § IPI Watchdog Ladder).
     if crate::mm::tlb_shootdown::any_pending()
     {
         return;
@@ -822,25 +789,11 @@ fn watchdog_tick_and_check()
 /// wake is provably owed but never arrived — the lost-wakeup wedge signature
 /// (#375). Three rules, each on plain TCB scalar reads only (no IPC-object
 /// dereference: unlike the dump's `blocked_on` decode, this runs on a LIVE
-/// system where a blocking object can be freed concurrently):
+/// system where a blocking object can be freed concurrently).
 ///
-/// 1. expired deadline — `sleep_deadline != 0` and past the grace window;
-///    legitimate sleepers are claimed (deadline cleared) within one BSP tick.
-/// 2. `wake_in_flight` stuck — a waker claimed the thread but its
-///    `enqueue_and_wake` never completed. Normally clears in microseconds.
-///    `BlockedOnReply`/`BlockedOnFault` are exempt: those states hold
-///    `wake_in_flight = 1` from block entry to reply as the dealloc gate
-///    (#160), so the flag is steady-state there, not an in-flight wake — a
-///    client parked in a long blocking RPC (e.g. a console read held by its
-///    server until input arrives) would otherwise fire this rule after the
-///    grace window on every idle boot.
-/// 3. `wake_pending` while `Blocked` — a coalesced wake survived a park
-///    commit that should have consumed it.
-///
-/// Rule 1 is debounced by its grace window; rules 2 and 3 must additionally
-/// persist across two consecutive scans (~0.5 s apart) so a legitimately
-/// mid-wake observation cannot false-positive. Indefinite waits (endpoint
-/// recv loops, reply waits) match no rule and never fire.
+/// The rules, their exemptions, and their debouncing are specified in
+/// core/kernel/docs/scheduling-internals.md § Softlockup Watchdog (owed-wake
+/// detector).
 #[cfg(not(test))]
 fn owed_wake_scan()
 {
@@ -1033,6 +986,9 @@ fn bsp_stall_check(own_heartbeat: u64)
 /// in interrupt context; shared structures are read benign-racily or via
 /// try-lock so a wedged lock holder cannot deadlock the dump.
 #[cfg(not(test))]
+// too_many_lines: one linear dump sequence (per-CPU lines, lock state, sleep list,
+// registry walk) sharing the stalled-system read discipline; splitting it would
+// scatter that discipline across helpers.
 #[allow(clippy::too_many_lines)]
 fn watchdog_dump(reason: &str)
 {
@@ -1383,8 +1339,7 @@ fn watchdog_dump(reason: &str)
 /// blocking object is read without its lock (the kernel is wedged).
 #[cfg(not(test))]
 // cast_ptr_alignment: blocked_on_object is stored as *mut u8 but always points
-// at a properly-aligned IPC object whose concrete type is named by ipc_state;
-// the same allow covers the parallel casts in dealloc_object's unlink arm.
+// at a properly-aligned IPC object whose concrete type is named by ipc_state.
 #[allow(clippy::cast_ptr_alignment)]
 unsafe fn watchdog_decode_blocked_on(t: *mut ThreadControlBlock)
 {
@@ -1475,7 +1430,7 @@ unsafe fn watchdog_decode_blocked_on(t: *mut ThreadControlBlock)
 
 /// Set by `init_storage` (Phase 4), cleared by `sched::enter` (Phase 9).
 /// `timer_tick` returns immediately while set.
-/// See docs/scheduling-internals.md § BSP Boot Transient.
+/// See core/kernel/docs/scheduling-internals.md § BSP Boot Transient.
 pub static BOOT_TRANSIENT_ACTIVE: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
@@ -1505,7 +1460,7 @@ static mut SLEEP_COUNT: usize = 0;
 /// Scratch buffer holding the TCBs `sleep_check_wakeups` collects between
 /// dropping `SLEEP_LIST_LOCK` and waking them.
 ///
-/// Off-stack via the CPU0-static idiom of docs/scheduling-internals.md
+/// Off-stack via the CPU0-static idiom of core/kernel/docs/scheduling-internals.md
 /// § Off-Stack Scratch for Ceiling-Sized Arrays: a `[_; MAX_SLEEPING]` frame in
 /// `timer_tick` (which inlines `sleep_check_wakeups`) would overrun the timer
 /// ISR's borrowed kernel stack. `sleep_check_wakeups` runs only on CPU0 (see
@@ -1542,7 +1497,7 @@ static mut EXPIRED_SCRATCH: [ExpiredWaiter; MAX_SLEEPING] = [ExpiredWaiter::EMPT
 /// `sleep_deadline` set and state = Blocked.
 ///
 /// Returns `Err(())` at capacity; the caller MUST roll back the park.
-/// See docs/thread-lifecycle-and-sleep.md § Sleep List Invariants.
+/// See core/kernel/docs/thread-lifecycle-and-sleep.md § Sleep List Invariants.
 #[cfg(not(test))]
 pub fn sleep_list_add(tcb: *mut ThreadControlBlock) -> Result<(), ()>
 {
@@ -1566,9 +1521,11 @@ pub fn sleep_list_add(tcb: *mut ThreadControlBlock) -> Result<(), ()>
     result
 }
 
-/// Remove a thread from the sleep list if present. Called by `notification_send`
-/// when waking a waiter that was registered with a timeout, so the timer
-/// path does not later try to double-wake it.
+/// Remove a thread from the sleep list if present. Called by every path that
+/// claims or tears down a timed waiter before its deadline fires
+/// (`notification_send`, `event_queue_post`, `event_queue_drop`,
+/// `cancel_ipc_block`, and the `dealloc_object` teardown), so the timer path does
+/// not later try to double-wake it or read a freed TCB.
 ///
 /// Returns `true` if the thread was on the list and was removed.
 #[cfg(not(test))]
@@ -1610,7 +1567,7 @@ pub fn sleep_list_remove(tcb: *mut ThreadControlBlock) -> bool
 /// concurrent `notification_send` by taking `sig.lock` and checking whether we
 /// are still registered as the waiter before claiming the wake.
 // too_many_lines: flat dispatch over every claimable `IpcThreadState`
-// (notification, event queue, reply, plain sleep); each arm is independent and
+// (notification, event queue, reply, fault, plain sleep); each arm is independent and
 // short, and splitting would require duplicating the SLEEP_LIST snapshot
 // plumbing.
 #[allow(clippy::too_many_lines)]
@@ -1958,19 +1915,8 @@ pub fn alloc_thread_id() -> u32
 /// each iteration disables interrupts, checks `take_reschedule_pending`
 /// and `has_runnable` together, and halts atomically if neither is set.
 ///
-/// Correctness sketch — for every producer `enqueue_and_wake(T)` racing
-/// with this loop on CPU T:
-/// - If the flag-set or the enqueue becomes visible before the check:
-///   observed, dispatched immediately.
-/// - If the flag-set happens after the check but before the halt:
-///   interrupts are disabled, so the subsequent IPI is held pending at
-///   the halt boundary; `halt_until_interrupt` wakes atomically, the loop
-///   iterates, observes the flag, dispatches.
-/// - If the notification arrives during the halt: standard halt wake; loop
-///   iterates, observes the flag, dispatches.
-///
-/// No reliance on timer-tick recovery. See `RESCHEDULE_PENDING` doc and
-/// `halt_until_interrupt` on each arch.
+/// Correctness against racing producers is specified in
+/// core/kernel/docs/scheduling-internals.md § Wake Protocol Invariants.
 ///
 /// `_cpu_id` — logical CPU index (0-based).
 fn idle_thread_entry(_cpu_id: u64) -> !
@@ -2006,7 +1952,7 @@ fn idle_thread_entry(_cpu_id: u64) -> !
             // Step 2: atomic check of flag + run queue. Idle state is not
             // published; the wake protocol always sends a reschedule IPI
             // rather than consulting a per-CPU idle mask.
-            // See docs/scheduling-internals.md.
+            // See core/kernel/docs/scheduling-internals.md § Wake Protocol Invariants.
             let pending = take_reschedule_pending(cpu);
             // SAFETY: scheduler slot is initialised for this CPU.
             let has_work = unsafe { (*scheduler_ptr(cpu)).has_runnable() };
@@ -2156,7 +2102,7 @@ pub fn init(cpu_count: u32) -> u32
             );
         }
 
-        // 4. Register in per-CPU scheduler.
+        // Register in per-CPU scheduler.
         // SAFETY: single-threaded boot; the per-cpu Scheduler slot is
         // exclusively owned during init.
         unsafe {
@@ -2169,8 +2115,9 @@ pub fn init(cpu_count: u32) -> u32
     cpu_count
 }
 
-/// Allocate the per-CPU storage slabs (schedulers, idle TCBs, x86 AP
-/// TSS/GDT/IST) sized to `cpu_count`, publish `CPU_COUNT`, and arm the BSP
+/// Allocate the per-CPU storage slabs sized to `cpu_count` (schedulers, idle
+/// TCBs, idle kernel stacks and their tops, watchdog ticks, per-CPU arch data,
+/// and the x86 AP GDT/TSS/IST tables), publish `CPU_COUNT`, and arm the BSP
 /// boot transient. Must run before Phase 5 (timer arm) so that the timer
 /// ISR's first read of `SCHEDULERS_PTR` is non-null.
 ///
@@ -2194,6 +2141,7 @@ pub fn init_storage(cpu_count: u32, allocator: &mut BuddyAllocator)
 
 /// Test stub for `init_storage`.
 #[cfg(test)]
+// unused_variables: host-test stub; it ignores its parameters.
 #[allow(unused_variables)]
 pub fn init_storage(cpu_count: u32, allocator: &mut crate::mm::BuddyAllocator) {}
 
@@ -2308,6 +2256,8 @@ pub(crate) fn alloc_zeroed_slab<T>(
 /// never called; this stub satisfies the call site without requiring access to
 /// arch-specific types that are unavailable on the host.
 #[cfg(test)]
+// unused_variables: host-test stub; its parameter is unused
+// (already `_`-prefixed, so this suppression is redundant).
 #[allow(unused_variables)]
 pub fn init(_cpu_count: u32) -> u32
 {
@@ -2343,7 +2293,7 @@ pub fn ap_enter(cpu_id: u32) -> !
 /// for loading into the trampoline parameters and TSS RSP0.
 ///
 /// # Safety
-/// `cpu_id` must be < [`MAX_CPUS`] and `sched::init` must have been called
+/// `cpu_id` must be < `CPU_COUNT` and `sched::init` must have been called
 /// for this CPU.
 #[cfg(not(test))]
 pub unsafe fn idle_stack_top_for(cpu_id: usize) -> u64
@@ -2358,8 +2308,8 @@ pub unsafe fn idle_stack_top_for(cpu_id: usize) -> u64
 /// Return a reference to the scheduler for CPU `id`.
 ///
 /// # Safety
-/// The caller must ensure `id < MAX_CPUS` and that `init` has been called for
-/// this CPU. No concurrent mutable access may occur without holding the
+/// The caller must ensure `id < CPU_COUNT` (an out-of-range `id` panics) and that `init` has
+/// been called for this CPU. No concurrent mutable access may occur without holding the
 /// scheduler lock (Phase 9+).
 #[cfg(not(test))]
 pub unsafe fn scheduler_for(id: usize) -> &'static mut PerCpuScheduler
@@ -2379,7 +2329,7 @@ pub unsafe fn scheduler_for(id: usize) -> &'static mut PerCpuScheduler
 /// Returns [`StateCommit::Committed`] with the CPU whose `current == tcb`
 /// (if any), so `sys_thread_stop` can prod-and-drain a remote Running
 /// target. Cost: up to `MAX_CPUS` spinlock acquires; for lifecycle syscalls
-/// only, not hot paths. See docs/scheduling-internals.md § Cross-CPU TCB
+/// only, not hot paths. See core/kernel/docs/scheduling-internals.md § Cross-CPU TCB
 /// Ownership.
 ///
 /// `Exited` is terminal: if `tcb` is already `Exited` when the locks are
@@ -2390,15 +2340,9 @@ pub unsafe fn scheduler_for(id: usize) -> &'static mut PerCpuScheduler
 /// revive the thread as `Ready`, pass the teardown's `current`-only scan,
 /// and later run it against reclaimed storage.
 ///
-/// When `new_state` is `Stopped` or `Exited`, also scans every CPU's run
-/// queue at `tcb.priority` and removes any lingering entry. Closes the
-/// Ready→Stopped→Ready double-enqueue race (issue #117): a thread
-/// transitioning Ready→Stopped would otherwise leave a stale entry on its
-/// source CPU's queue for the dispatch-side skip loop to drain. A subsequent
-/// Stopped→Ready + enqueue could race that drain and produce two list
-/// entries for the same TCB, corrupting the intrusive `run_queue_next`
-/// chain. Draining the entry here keeps the run-queue invariant
-/// "Ready iff linked into exactly one queue".
+/// When `new_state` is `Stopped` or `Exited`, also removes any run-queue entry
+/// at `tcb.priority` on every CPU (core/kernel/docs/scheduling-internals.md
+/// § `ThreadState` Transitions, "Stopped/Exited drain").
 ///
 /// # Safety
 /// `tcb` must be a valid TCB pointer.
@@ -2445,10 +2389,11 @@ unsafe fn commit_state_under_all_locks(
 
     // Acquire (*tcb).sched_lock FIRST (outermost): the lifecycle Stopped/Exited
     // write must serialise with schedule()'s dispatch flip and with
-    // enqueue_and_wake/commit on the SAME per-TCB lock (the other half of STEP
-    // 4's data-race fix). Then all CPU locks ascending (the drain + current scan
-    // run under them). Order tcb.sched_lock → CPU locks matches schedule()'s
-    // current.sched_lock → CPU lock, so no ABBA.
+    // enqueue_and_wake/commit on the SAME per-TCB lock
+    // (core/kernel/docs/scheduling-internals.md § Lock Hierarchy, rule 4). Then all
+    // CPU locks ascending (the drain + current scan run under them). Order
+    // tcb.sched_lock → CPU locks matches schedule()'s current.sched_lock → CPU
+    // lock, so no ABBA.
     // SAFETY: tcb validated by caller; lock_raw paired with the release below.
     let tcb_sched_saved = unsafe { (*tcb).sched_lock.lock_raw() };
 
@@ -2490,7 +2435,8 @@ unsafe fn commit_state_under_all_locks(
 
         // Drain stale run-queue entries on Stopped/Exited transitions. The
         // remove is best-effort: if the TCB isn't linked, it's a no-op. See
-        // docs/scheduling-internals.md § Stopped/Exited drain.
+        // core/kernel/docs/scheduling-internals.md § ThreadState Transitions,
+        // "Stopped/Exited drain".
         if matches!(
             new_state,
             thread::ThreadState::Stopped | thread::ThreadState::Exited
@@ -2770,7 +2716,7 @@ unsafe fn mark_bound_threads(
             // is terminal, so a positive read is final, and a negative read
             // is re-decided under the full lock set by
             // `exit_under_all_locks`, which refuses an exited thread
-            // (docs/scheduling-internals.md § Cross-CPU TCB Ownership).
+            // (core/kernel/docs/scheduling-internals.md § Cross-CPU TCB Ownership).
             if !bound(tcb) || (*tcb).state == thread::ThreadState::Exited
             {
                 return;
@@ -2899,7 +2845,7 @@ unsafe fn scan_bound_current(
 /// off-CPU thread. A stopped server's reply-bound client is released by
 /// that later drain, exactly as for a server stopped by `SYS_THREAD_STOP`.
 /// For a thread displaced from a server's pending-reply binding, neither the
-/// stop nor the later drain is memory-safe (docs/scheduling-internals.md
+/// stop nor the later drain is memory-safe (core/kernel/docs/scheduling-internals.md
 /// § Thread Registry, #443).
 ///
 /// Returns `true` if the running thread has itself been stopped — it was
@@ -3060,7 +3006,7 @@ pub enum ParkCommit
 /// Refuses to park in two cases, distinguished so a rollback can stamp the
 /// cancelled episode without clobbering a genuine deposit (the
 /// post-`schedule()` outcome remains state-driven — see
-/// docs/sched-ipc-redesign.md §2.1):
+/// core/kernel/docs/sched-ipc-redesign.md § 2.1):
 /// - [`ParkCommit::RefusedStop`]: a concurrent stop/exit already won (`state`
 ///   is `Stopped`/`Exited`/…); the thread is then drained by `schedule()`.
 /// - [`ParkCommit::RefusedWake`]: `wake_pending` is set — a waker raced ahead,
@@ -3081,7 +3027,7 @@ pub enum ParkCommit
 /// exit leaks the waker's link (#352). The only sanctioned exception is a
 /// parker that un-commits under `sched_lock` while provably untargetable by
 /// any waker — `sys_thread_sleep`'s sleep-list-capacity rollback, which
-/// registered with no wake source. See docs/scheduling-internals.md § Lock
+/// registered with no wake source. See core/kernel/docs/scheduling-internals.md § Lock
 /// Hierarchy.
 ///
 /// # Safety
@@ -3109,7 +3055,8 @@ pub unsafe fn commit_blocked_under_local_lock(
                 {
                     // A wake raced ahead and coalesced; refuse to park and
                     // consume it so the resume path delivers the deposited
-                    // payload (resume model is DEPOSIT — see sched-ipc-redesign.md §2.1).
+                    // payload (resume model is DEPOSIT — see
+                    // core/kernel/docs/sched-ipc-redesign.md § 2.1).
                     (*tcb).wake_pending = false;
                     ParkCommit::RefusedWake
                 }
@@ -3123,7 +3070,8 @@ pub unsafe fn commit_blocked_under_local_lock(
                     // not-live-and-unlinked contract. Relaxed read is sound
                     // under the held sched_lock — every -1 → >=0 writer is
                     // excluded by classification or by holding this same lock
-                    // (see scheduling-internals.md § Atomics, queued_on row).
+                    // (see core/kernel/docs/scheduling-internals.md § Atomic Ordering
+                    // Invariants, queued_on row).
                     #[cfg(debug_assertions)]
                     {
                         let linked_at =
@@ -3173,6 +3121,8 @@ pub unsafe fn commit_blocked_under_local_lock(
 
 /// Test stub.
 #[cfg(test)]
+// unused_variables: host-test stub; its parameters are unused
+// (already `_`-prefixed, so this suppression is redundant).
 #[allow(unused_variables)]
 pub unsafe fn commit_blocked_under_local_lock(
     _tcb: *mut ThreadControlBlock,
@@ -3199,8 +3149,10 @@ pub unsafe fn commit_blocked_under_local_lock(
 ///
 /// Returns `true` if the rebind committed (caller still `Blocked`); `false` if a
 /// concurrent stop/exit already won, in which case the caller MUST tear down the
-/// reply binding it published (clear the server's `reply_tcb` and the caller's
-/// `wake_in_flight`) and skip this dead sender.
+/// reply binding it published: CAS the server's `reply_tcb` from the caller back
+/// to null and, on a win, stamp the cancelled deposit (`stamp_cancelled_deposit`:
+/// INTERRUPTED, or KILL for a fault sender) before clearing the caller's
+/// `wake_in_flight`; then skip this dead sender.
 ///
 /// # Safety
 /// `tcb` must be a valid, send-queue-dequeued `Blocked` TCB; `blocked_on` must be
@@ -3243,6 +3195,8 @@ pub unsafe fn commit_reply_rebind_under_local_lock(
 
 /// Test stub.
 #[cfg(test)]
+// unused_variables: host-test stub; its parameters are unused
+// (already `_`-prefixed, so this suppression is redundant).
 #[allow(unused_variables)]
 pub unsafe fn commit_reply_rebind_under_local_lock(
     _tcb: *mut ThreadControlBlock,
@@ -3271,6 +3225,8 @@ pub unsafe fn prod_remote_cpu(target_cpu: usize)
 
 /// Test stub.
 #[cfg(test)]
+// unused_variables: host-test stub; its parameter is unused
+// (already `_`-prefixed, so this suppression is redundant).
 #[allow(unused_variables)]
 pub unsafe fn prod_remote_cpu(_target_cpu: usize) {}
 
@@ -3280,8 +3236,8 @@ pub unsafe fn prod_remote_cpu(_target_cpu: usize) {}
 ///
 /// This is the "wait until the target has provably switched away on every CPU
 /// and committed its register file" barrier that `dealloc_object(Thread)`
-/// (`cap/object.rs`, the #207 free-gate) and `sys_thread_stop`'s drain already
-/// depend on. `sys_thread_start` reuses it before force-linking a resumed
+/// (`core/kernel/src/cap/object.rs`, the #207 free-gate) and `sys_thread_stop`'s drain
+/// already depend on. `sys_thread_start` reuses it before force-linking a resumed
 /// thread: a thread stopped while Running may still be `current`/executing on a
 /// remote CPU, and `enqueue_ready_thread` would otherwise dispatch it on a
 /// second CPU while it still runs on the first (the cross-CPU double-dispatch of
@@ -3390,6 +3346,8 @@ pub unsafe fn await_descheduled(tcb: *mut thread::ThreadControlBlock)
 
 /// Test stub.
 #[cfg(test)]
+// unused_variables: host-test stub; its parameter is unused
+// (already `_`-prefixed, so this suppression is redundant).
 #[allow(unused_variables)]
 pub unsafe fn await_descheduled(_tcb: *mut thread::ThreadControlBlock) {}
 
@@ -3401,7 +3359,7 @@ pub unsafe fn await_descheduled(_tcb: *mut thread::ThreadControlBlock) {}
 /// or no longer located on `src_cpu` — another CPU won the race.
 ///
 /// Lock discipline: both scheduler locks are acquired in **ascending
-/// CPU-id order** (`docs/scheduling-internals.md` § Lock Hierarchy
+/// CPU-id order** (`core/kernel/docs/scheduling-internals.md` § Lock Hierarchy
 /// rule 4) to prevent ABBA deadlock against the load balancer or any
 /// other multi-lock holder. The destination's `set_reschedule_pending`
 /// is published before the unlocks; the wake IPI is sent after both
@@ -3410,7 +3368,9 @@ pub unsafe fn await_descheduled(_tcb: *mut thread::ThreadControlBlock) {}
 /// Used by:
 /// - `sys_thread_set_affinity` (active migration of an already-queued
 ///   thread).
-/// - The periodic cross-CPU load balancer.
+///
+/// The load balancer does not call it: `pull_unpinned_ready` takes the locks in
+/// the inverse, try-lock order and calls `relocate_ready_thread` directly.
 ///
 /// # Safety
 /// - `tcb` must be a valid [`ThreadControlBlock`] pointer.
@@ -3435,11 +3395,11 @@ pub unsafe fn migrate_ready_thread(
         return false;
     }
 
-    // No pre-lock FPU flush: switch_out_save on the source CPU eagerly
-    // XSAVEs the live regs into the TCB's extended-state area inside the
-    // source's scheduler-lock critical section, so by the time `tcb` is
-    // observable here as Ready on src_cpu, its area is canonical and any
-    // destination CPU's `#NM` XRSTOR will see the correct bytes.
+    // No pre-lock FPU flush: the source CPU's `switch_out_save` XSAVEs the live
+    // regs into the TCB's extended-state area before its `switch()` publishes
+    // `context_saved = 1` (Release), and `relocate_ready_thread` moves only a
+    // `context_saved == 1` thread, so the area is canonical and any destination
+    // CPU's `#NM` XRSTOR sees the correct bytes.
 
     let (lo, hi) = if src_cpu < dst_cpu
     {
@@ -3461,7 +3421,7 @@ pub unsafe fn migrate_ready_thread(
     // though `tcb` may currently be Running on a third CPU (its dispatch flip
     // holds the same lock), and writing `preferred_cpu` under it keeps that field
     // consistent with every other writer. Lock order: source IPC → sched_lock →
-    // per-CPU run-queue (docs/sched-ipc-redesign.md §2).
+    // per-CPU run-queue (core/kernel/docs/sched-ipc-redesign.md § 2).
     // SAFETY: tcb valid by caller contract; lock_raw paired with unlock below.
     let tcb_sched_saved = unsafe { (*tcb).sched_lock.lock_raw() };
     // SAFETY: lock_raw/unlock_raw paired below.
@@ -3512,11 +3472,11 @@ pub unsafe fn migrate_ready_thread(
 ///   mid-handoff (woken while still `current`/live on its source CPU, not yet
 ///   switched away); relocating it would dispatch it on two CPUs at once
 ///   (#314/#293). `cs == 1` proves it switched out and is `current` nowhere.
-/// - hard `cpu_affinity` permits `dst_cpu`. This gate closes the load-balancer
-///   affinity violation: `pull_unpinned_ready`'s `find_runnable` predicate reads
-///   `cpu_affinity` *advisorily* under the run-queue lock, so a concurrent
-///   `sys_thread_set_affinity` can pin the thread away from `dst_cpu` between the
-///   predicate and here. Re-reading affinity under `sched_lock` honours the pin.
+/// - hard `cpu_affinity` permits `dst_cpu`. `pull_unpinned_ready`'s
+///   `find_runnable` predicate reads `cpu_affinity` advisorily under the run-queue
+///   lock; this re-read under `sched_lock` narrows the window in which a concurrent
+///   `sys_thread_set_affinity` pins the thread away from `dst_cpu`, but does not
+///   close it while that writer takes no `sched_lock` (#443).
 ///
 /// `remove_from_queue(src, priority)` is the authoritative "located on src at
 /// `priority`" check; it fails (benign no-op) if the thread moved or is in the
@@ -3564,7 +3524,7 @@ unsafe fn relocate_ready_thread(
         return false;
     }
 
-    // G3: the relocation only proceeds for a Ready candidate.
+    // The relocation only proceeds for a Ready candidate.
     debug_assert!(state == thread::ThreadState::Ready);
     // SAFETY: both run-queue locks held; tcb pinned by them. `remove_from_queue`
     // is the authoritative located-on-src check at `priority`.
@@ -3586,7 +3546,7 @@ unsafe fn relocate_ready_thread(
         // SAFETY: tcb valid; sched_lock + both run-queue locks held.
         unsafe { (*tcb).preferred_cpu = dst_cpu as u32 };
     }
-    // G4: the relocated thread is linked on dst at exactly `priority` (a stale
+    // The relocated thread is linked on dst at exactly `priority` (a stale
     // tag here would mean a double-relocate left an inconsistent link).
     // SAFETY: tcb valid; queued_on read under the held run-queue locks.
     let linked_at = unsafe { (*tcb).queued_on.load(Ordering::Relaxed) };
@@ -3602,6 +3562,8 @@ unsafe fn relocate_ready_thread(
 
 /// Test stub.
 #[cfg(test)]
+// unused_variables: host-test stub; its parameters are unused
+// (already `_`-prefixed, so this suppression is redundant).
 #[allow(unused_variables)]
 pub unsafe fn migrate_ready_thread(
     _tcb: *mut thread::ThreadControlBlock,
@@ -3690,6 +3652,8 @@ pub unsafe fn relocate_ready_priority(
     }
 
     let mut located: Option<usize> = None;
+    // needless_range_loop: `cpu` indexes the per-CPU scheduler slab through
+    // `scheduler_for`, not a slice.
     #[allow(clippy::needless_range_loop)]
     for cpu in 0..cpu_count
     {
@@ -3731,6 +3695,8 @@ pub unsafe fn relocate_ready_priority(
 
 /// Test stub.
 #[cfg(test)]
+// unused_variables: host-test stub; its parameters are unused
+// (already `_`-prefixed, so this suppression is redundant).
 #[allow(unused_variables)]
 pub unsafe fn relocate_ready_priority(
     _tcb: *mut thread::ThreadControlBlock,
@@ -3849,6 +3815,8 @@ unsafe fn try_pull_balance(this_cpu: usize)
 
 /// Test stub.
 #[cfg(test)]
+// unused_variables: host-test stub; its parameter is unused
+// (already `_`-prefixed, so this suppression is redundant).
 #[allow(unused_variables)]
 unsafe fn try_pull_balance(_this_cpu: usize) {}
 
@@ -3916,12 +3884,11 @@ unsafe fn pull_unpinned_ready(src_cpu: usize, dst_cpu: usize)
         return;
     };
 
-    // No skip-owner predicate is needed: after eager switch_out_save, a
-    // Ready thread can never be any CPU's `fpu_owner`. Ownership is
-    // installed only by `nm_handler`, which runs exclusively on Running
-    // threads; the matching `switch_out_save` clears ownership before
-    // the thread re-enters the Ready state. So every Ready candidate's
-    // XSAVE area is already canonical and safe to pull.
+    // No skip-owner predicate is needed: `switch_out_save` clears this CPU's
+    // `fpu_owner` and XSAVEs the live regs before `switch()` publishes
+    // `context_saved = 1`, and the predicate below takes only
+    // `context_saved == 1` threads, so every candidate's XSAVE area is canonical
+    // and safe to pull.
     // Only steal a FULLY-SAVED Ready thread (`context_saved == 1`). A
     // Ready-but-`context_saved == 0` candidate is mid-handoff: it was woken
     // (e.g. a fast IPC reply) while still `current`/live on `src_cpu` and has
@@ -3976,9 +3943,10 @@ unsafe fn pull_unpinned_ready(src_cpu: usize, dst_cpu: usize)
     // `find_runnable` located it at (NOT a re-read of (*tcb).priority): that is
     // the level `remove_from_queue` needs, and the src run-queue lock held since
     // the predicate pins it against a concurrent `sys_thread_set_priority`. The
-    // affinity gate inside `relocate_ready_thread` closes the load-balancer
-    // affinity violation the advisory `find_runnable` predicate cannot — a
-    // `sys_thread_set_affinity` racing between the predicate and here.
+    // affinity gate inside `relocate_ready_thread` re-reads `cpu_affinity` under
+    // the candidate's `sched_lock`, narrowing the race with a
+    // `sys_thread_set_affinity` between the predicate and here; the race stays
+    // open while that writer takes no `sched_lock` (#443).
     // SAFETY: sched_lock + both run-queue locks held.
     let moved = unsafe { relocate_ready_thread(tcb, src_cpu, dst_cpu, priority) };
 
@@ -3999,31 +3967,22 @@ unsafe fn pull_unpinned_ready(src_cpu: usize, dst_cpu: usize)
 
 /// Test stub.
 #[cfg(test)]
+// unused_variables: host-test stub; its parameters are unused
+// (already `_`-prefixed, so this suppression is redundant).
 #[allow(unused_variables)]
 unsafe fn pull_unpinned_ready(_src_cpu: usize, _dst_cpu: usize) {}
 
 /// Make a not-live thread `Ready` and link it on `target_cpu`'s run queue,
 /// waking that CPU if idle — the cross-CPU wake primitive (IPC, IRQ, timer).
 ///
-/// Acquires the per-TCB `sched_lock` (the authoritative serializer for the
-/// Scheduling field group) FIRST, then classifies `state` under it — the
-/// "enqueue requires not-live" gate that closes the cross-CPU double-link /
-/// double-dispatch class:
-/// - `Running`: the thread is live (mid-park, or a duplicate of a wake it
-///   already consumed). Record `wake_pending` and coalesce — never link a live
-///   thread; its `commit_blocked` sees the flag and refuses to park, delivering
-///   the payload the waker already deposited (see docs/sched-ipc-redesign.md §2.1).
-/// - `Ready`: already linked; coalesce (a Ready coalesce is only ever a
-///   same-event duplicate, so dropping it is lost-wake-safe; do not set
-///   `wake_pending`).
-/// - `Stopped`/`Exited`: a concurrent stop/dealloc won; abort.
-/// - `Blocked`/`Created`: not live — make `Ready` and link under the target
-///   run-queue lock (`sched_lock` outer → run-queue lock inner).
+/// Acquires the per-TCB `sched_lock` first and classifies `state` under it, as
+/// specified in core/kernel/docs/scheduling-internals.md § Wake Protocol
+/// Invariants (producer side).
 ///
 /// `target_cpu` is a placement hint (from `select_target_cpu`); exclusivity is
 /// decided by `state` under `sched_lock`, not by the CPU choice. Priority is
-/// read under the run-queue lock so a concurrent `sys_thread_set_priority`
-/// (all-CPU-locks, ascending) serialises against the link.
+/// read under `sched_lock`, which `sys_thread_set_priority` also holds across
+/// its priority write, so the link serialises against a concurrent priority change.
 ///
 /// Every exit path clears `wake_in_flight` so a waiting `dealloc_object(Thread)`
 /// can proceed.
@@ -4041,19 +4000,18 @@ pub unsafe fn enqueue_and_wake(tcb: *mut ThreadControlBlock, target_cpu: usize)
         crate::kprintln!("enqueue_and_wake: target_cpu={target_cpu} >= MAX_CPUS, tid={tid}");
     }
 
-    // No pre-lock FPU flush: a thread being woken from Blocked/Stopped/
-    // Created has already passed through `switch_out_save` on its prior
-    // CPU's reschedule, which eagerly XSAVE'd any live regs into the
-    // TCB's area before unlocking that CPU's scheduler lock. The wake-
-    // side Acquire of the target CPU's scheduler lock therefore observes
-    // a canonical area; the next `#NM` on the destination CPU XRSTORs
-    // the correct bytes.
+    // No pre-lock FPU flush: the woken thread's prior CPU XSAVEs any live regs in
+    // `switch_out_save` before its `switch()` publishes `context_saved = 1`
+    // (Release), and the dispatching CPU's `schedule()` spins on that flag
+    // (Acquire) before switching in, so the next `#NM` on the destination CPU
+    // XRSTORs the correct bytes.
 
     // Acquire the per-TCB sched_lock FIRST: it is the authoritative serializer
     // for the Scheduling field group, so the live/not-live classification below
     // is mutually exclusive with the dispatcher's Ready→Running flip and the
-    // parker's Running→Blocked commit (closing roots (a)/(b)/(c)). Lock order:
-    // sched_lock (outer) → per-CPU run-queue lock (inner).
+    // parker's Running→Blocked commit (closing the three structural roots of
+    // core/kernel/docs/sched-ipc-redesign.md § 1). Lock order: sched_lock (outer)
+    // → per-CPU run-queue lock (inner).
     // SAFETY: tcb valid; lock_raw paired with an unlock_raw on every path below.
     let sched_saved = unsafe { (*tcb).sched_lock.lock_raw() };
 
@@ -4063,9 +4021,9 @@ pub unsafe fn enqueue_and_wake(tcb: *mut ThreadControlBlock, target_cpu: usize)
     {
         // Live (executing): mid-park or a duplicate of a consumed wake. Record
         // the wake under sched_lock so commit_blocked refuses to park and the
-        // resume path delivers the already-deposited payload (§2.1); coalesce —
-        // never link a live thread (the dispatcher holds this same lock to mark
-        // it Running).
+        // resume path delivers the already-deposited payload
+        // (core/kernel/docs/sched-ipc-redesign.md § 2.1); coalesce — never link a
+        // live thread (the dispatcher holds this same lock to mark it Running).
         thread::ThreadState::Running =>
         {
             // SAFETY: wake_pending / wake_in_flight written under sched_lock.
@@ -4133,7 +4091,8 @@ pub unsafe fn enqueue_and_wake(tcb: *mut ThreadControlBlock, target_cpu: usize)
     }
 
     // Release-ordered: the unlock publishes the enqueue + flag to any CPU
-    // observing the bit. See docs/scheduling-internals.md § Wake Protocol.
+    // observing the bit. See core/kernel/docs/scheduling-internals.md § Wake Protocol
+    // Invariants.
     set_reschedule_pending_for(target_cpu);
 
     // Wake committed: Ready and enqueued. Clear the wake-in-flight gate so a
@@ -4160,6 +4119,8 @@ pub unsafe fn enqueue_and_wake(tcb: *mut ThreadControlBlock, target_cpu: usize)
 
 /// Test stub for `enqueue_and_wake` (no-op in test mode).
 #[cfg(test)]
+// unused_variables: host-test stub; its parameters are unused
+// (already `_`-prefixed, so this suppression is redundant).
 #[allow(unused_variables)]
 pub unsafe fn enqueue_and_wake(_tcb: *mut ThreadControlBlock, _target_cpu: usize) {}
 
@@ -4254,6 +4215,8 @@ pub unsafe fn enqueue_ready_thread(tcb: *mut ThreadControlBlock, target_cpu: usi
 
 /// Test stub for `enqueue_ready_thread` (no-op in test mode).
 #[cfg(test)]
+// unused_variables: host-test stub; its parameters are unused
+// (already `_`-prefixed, so this suppression is redundant).
 #[allow(unused_variables)]
 pub unsafe fn enqueue_ready_thread(_tcb: *mut ThreadControlBlock, _target_cpu: usize) -> bool
 {
@@ -4263,29 +4226,12 @@ pub unsafe fn enqueue_ready_thread(_tcb: *mut ThreadControlBlock, _target_cpu: u
 /// Select target CPU for enqueueing a thread based on affinity, soft
 /// affinity (cache warmth), and load.
 ///
-/// Policy, in priority order:
-/// 1. **Hard affinity** (`cpu_affinity != AFFINITY_ANY`): return that CPU.
-/// 2. **Save-window pinning** (`context_saved == 0`): pin to
-///    `preferred_cpu` to avoid the cross-CPU `schedule()` spin against
-///    the source CPU's still-in-flight context save.
-/// 3. **Sticky preferred CPU**: scan all CPUs for `min_load`; if
-///    `preferred_cpu`'s load is within
-///    [`LOAD_BALANCE_IMBALANCE_THRESHOLD`] of `min_load`, return
-///    `preferred_cpu`. Cache-warmth bias matching the documented soft-
-///    affinity intent (`core/kernel/docs/scheduler.md` § Soft Affinity)
-///    and the same hysteresis the pull balancer applies before deciding
-///    an imbalance is real (`try_pull_balance`,
-///    `LOAD_BALANCE_IMBALANCE_THRESHOLD` site). Closes the per-wake CPU-
-///    bouncing pathology that starves a thread inside a busy multi-CPU
-///    runqueue (issue #128: `cap_revoke` parent vs. spinner flood).
-/// 4. **Min load**: return the least-loaded CPU.
+/// The policy (hard affinity, save-window pin, sticky preferred CPU, min load) is
+/// specified in core/kernel/docs/scheduling-internals.md § Wake Protocol
+/// Invariants, "Target CPU selection".
 ///
 /// # Safety
 /// `tcb` must be a valid pointer to an initialized [`ThreadControlBlock`].
-// needless_range_loop: we must use indexing because the scheduler slab is
-// reached through scheduler_ptr(cpu); iter/enumerate would require unsafe
-// pointer-arithmetic plumbing that is less clear than indexed bounds checking.
-#[allow(clippy::needless_range_loop)]
 #[cfg(not(test))]
 pub unsafe fn select_target_cpu(tcb: *mut ThreadControlBlock) -> usize
 {
@@ -4298,17 +4244,9 @@ pub unsafe fn select_target_cpu(tcb: *mut ThreadControlBlock) -> usize
 /// `cpu_affinity` names it (affinity is a correctness constraint that overrides
 /// the placement hint) or it is the only CPU.
 ///
-/// `dealloc_object(Thread)`'s deferred reply-wake passes `exclude =
-/// Some(dealloc_cpu)`. That CPU is wedged in a preempt-disabled UAF gate, NOT in
-/// `schedule()`, so the save-window pin's deadlock-avoidance rationale does not
-/// apply to it: pinning a `context_saved == 0` woken client there would strand
-/// it on a CPU that cannot re-enter the scheduler until the dealloc returns —
-/// which it cannot do while that client is the only runnable thread (#351). When
-/// the pin / sticky / min-load choice would land on `exclude`, fall back to the
-/// least-loaded non-excluded CPU. A peer dispatches the `cs == 0` client safely:
-/// `schedule()` waits on the publication barrier (`context_saved` Acquire spin)
-/// before the register switch, so a peer never loads a not-yet-saved register
-/// file.
+/// `dealloc_object(Thread)`'s deferred reply-wake passes `exclude = Some(dealloc_cpu)`;
+/// the rationale is in core/kernel/docs/scheduling-internals.md § Wake Protocol
+/// Invariants, "Target CPU selection".
 ///
 /// # Safety
 /// `tcb` must be a valid pointer to an initialized [`ThreadControlBlock`].
@@ -4400,7 +4338,7 @@ pub unsafe fn select_target_cpu_excluding(
         return exclude.unwrap_or(0);
     }
 
-    // G2: the exclusion holds for the load-scan result (affinity / single-CPU
+    // The exclusion holds for the load-scan result (affinity / single-CPU
     // overrides returned earlier).
     debug_assert!(
         Some(min_cpu) != exclude,
@@ -4411,6 +4349,7 @@ pub unsafe fn select_target_cpu_excluding(
 
 /// Test stub for `select_target_cpu` (always returns CPU 0).
 #[cfg(test)]
+// unused_variables: host-test stub; it ignores `tcb` and always returns CPU 0.
 #[allow(unused_variables)]
 pub unsafe fn select_target_cpu(tcb: *mut ThreadControlBlock) -> usize
 {
@@ -4418,7 +4357,7 @@ pub unsafe fn select_target_cpu(tcb: *mut ThreadControlBlock) -> usize
 }
 
 /// Send a wakeup IPI to `target_cpu`. Always sent (except for self) per
-/// the wake-protocol invariant in docs/scheduling-internals.md
+/// the wake-protocol invariant in core/kernel/docs/scheduling-internals.md
 /// § Wake Protocol Invariants — predicating on a per-CPU "is idle" hint
 /// is a missed-wakeup race against the target's halt boundary.
 ///
@@ -4449,6 +4388,8 @@ unsafe fn wake_idle_cpu(target_cpu: usize)
 
 /// Test stub for `wake_idle_cpu` (no-op in test mode).
 #[cfg(test)]
+// unused_variables: host-test stub; its parameter is unused
+// (already `_`-prefixed, so this suppression is redundant).
 #[allow(unused_variables)]
 unsafe fn wake_idle_cpu(_target_cpu: usize) {}
 
@@ -4478,11 +4419,11 @@ unsafe fn wake_idle_cpu(_target_cpu: usize) {}
 ///
 /// # Safety
 /// Must be called from within a kernel context (interrupt handler or syscall
-/// handler) with a valid kernel stack. Interrupts are disabled on entry by
-/// `sched.lock.lock_raw` (which saves and clears IF/SIE) and restored by
-/// `restore_interrupts_from(saved_flags)` after `switch()` returns;
-/// `release_lock_only` between them advances the lock ticket without
-/// touching interrupt state.
+/// handler) with a valid kernel stack. Interrupts are disabled on entry by the
+/// first `lock_raw` (`current.sched_lock`, or the CPU lock when there is no
+/// `current`) and restored by `restore_interrupts_from` with that lock's saved
+/// flags after `switch()` returns; `release_lock_only` between them advances the
+/// lock tickets without touching interrupt state.
 // too_many_lines: schedule() is the core scheduler critical path; splitting would
 // introduce indirection that obscures the single logical context-switch sequence.
 #[allow(clippy::too_many_lines)]
@@ -4546,7 +4487,7 @@ pub unsafe fn schedule(requeue_current: bool)
     // when the caller asks OR when `current` is already runnable (`Running` /
     // `Ready`), and only ever park a `current` that is genuinely still `Blocked`.
     //
-    // Two guards keep this sound:
+    // Three guards keep this sound:
     //   * Never requeue a thread a concurrent path has committed to `Exited`
     //     (dealloc) or `Stopped` under all-CPU locks — re-marking it `Ready` and
     //     linking it would leave a dangling run-queue entry over a TCB that
@@ -4558,15 +4499,8 @@ pub unsafe fn schedule(requeue_current: bool)
     //     (`queued_on >= 0`): re-enqueuing double-links it (the `queued_on`
     //     single-link guard's tripwire — #289). Leave it where the waker placed
     //     it; the next-thread selection below picks it up.
-    //   * Never requeue a `current` that has committed to a voluntary block
-    //     (`Blocked`) but not yet reached its own `schedule(false)`. A timer
-    //     preemption in that window calls `schedule(true)` (`requeue_current =
-    //     true`), which would otherwise re-mark the parking thread `Ready` and
-    //     enqueue it — racing the pending `enqueue_and_wake` into a `queued_on`
-    //     double-enqueue (#299). `cur_state` is read under `current.sched_lock`
-    //     (held from the top of `schedule()`), so the `Blocked` observation is
-    //     authoritative, not a racy heuristic; park it instead and let the
-    //     deposited wake redispatch it (the resume-DEPOSIT model, §2.1).
+    //   * Never requeue a `Blocked` `current` (core/kernel/docs/scheduling-internals.md
+    //     § ThreadState Transitions, "Voluntary-block window").
     if !current.is_null()
     {
         // SAFETY: current is a valid TCB set by enter() or a previous schedule();
@@ -4609,7 +4543,7 @@ pub unsafe fn schedule(requeue_current: bool)
                 if cross_cpu
                 {
                     // Publication-protocol requirement (see
-                    // docs/scheduling-internals.md § Cross-CPU TCB
+                    // core/kernel/docs/scheduling-internals.md § Cross-CPU TCB
                     // Ownership): clear `context_saved` BEFORE the cross-CPU
                     // enqueue so the destination's Acquire spin holds until
                     // this CPU's `switch()` commits the saved register
@@ -4675,7 +4609,7 @@ pub unsafe fn schedule(requeue_current: bool)
                     // Leaving it stale lets a preferred_cpu-keyed path (wake
                     // routing, migrate) dispatch this thread on another CPU while
                     // it is still linked here — the residual cross-CPU
-                    // double-dispatch (docs/sched-ipc-redesign.md §3). Written
+                    // double-dispatch (core/kernel/docs/sched-ipc-redesign.md § 3). Written
                     // only on the created link (#359); a skip is unreachable
                     // here (`!already_queued` read under the held sched_lock).
                     let linked = sched.enqueue(current, prio);
@@ -4739,7 +4673,7 @@ pub unsafe fn schedule(requeue_current: bool)
                 (*current).state = ThreadState::Running;
                 // Still running on THIS CPU: keep preferred_cpu authoritative
                 // (the re-mark, like the local requeue above, must not leave it
-                // stale — docs/sched-ipc-redesign.md §3).
+                // stale — core/kernel/docs/sched-ipc-redesign.md § 3).
                 (*current).preferred_cpu = cpu as u32;
                 // A running thread carries no pending park-wake (see the
                 // dispatch flip below).
@@ -4859,7 +4793,7 @@ pub unsafe fn schedule(requeue_current: bool)
                 // wake_pending so a stale flag can never survive into a later,
                 // unrelated commit_blocked (defensive — the `Running` coalesce
                 // that sets it is currently unreachable; see
-                // docs/sched-ipc-redesign.md §2.1).
+                // core/kernel/docs/sched-ipc-redesign.md § 2.1).
                 let was_pending = (*next).wake_pending;
                 (*next).wake_pending = false;
                 (was_pending, (*next).thread_id)
@@ -4982,13 +4916,9 @@ pub unsafe fn schedule(requeue_current: bool)
             // space setup is visible before marking active for TLB shootdown purposes.
             (*nxt_as).mark_active_on_cpu(cpu);
 
-            // Activate (load CR3/satp) only if satp actually changed.
-            // When returning from idle to the same address space, satp
-            // may still hold the kernel root (from case (b) above on a
-            // previous switch). In that case a full activate is required.
-            // But when satp already matches (e.g., idle transition didn't
-            // change satp, or switching between two different user ASes),
-            // the sfence.vma inside activate is essential.
+            // Activate (load CR3/satp) unconditionally: satp may still hold the
+            // kernel root from a previous case-(b) switch, and
+            // `AddressSpace::activate` owns the TLB-flush decision.
             (*nxt_as).activate();
         }
     }
@@ -5023,19 +4953,23 @@ pub unsafe fn schedule(requeue_current: bool)
     // - RISC-V: lazy via `sstatus.FS/VS` dirty tracking. switch_out_save
     //   reads FS/VS and saves to the area only on Dirty; switch_in_restore
     //   is a no-op (the trap path's `lazy_restore_fp_v` reloads on first use).
-    // Both calls no-op for kernel-only / idle threads (extended.area is null).
+    // For kernel-only / idle threads (extended.area is null) nothing is saved
+    // or restored; on x86-64 both calls still arm CR0.TS, which such a thread
+    // never trips.
     if !current.is_null()
     {
-        // SAFETY: ring-0 with interrupts disabled and the scheduler lock
-        // held; arch fpu::switch_out_save honours the per-arch lazy discipline.
+        // SAFETY: ring-0 with interrupts disabled (release_lock_only dropped the
+        // scheduler locks and left interrupts masked); arch fpu::switch_out_save
+        // honours the per-arch lazy discipline.
         unsafe {
             crate::arch::current::fpu::switch_out_save(current);
         }
     }
     if !next.is_null()
     {
-        // SAFETY: ring-0 with interrupts disabled and the scheduler lock
-        // held; arch fpu::switch_in_restore honours the per-arch lazy discipline.
+        // SAFETY: ring-0 with interrupts disabled (release_lock_only dropped the
+        // scheduler locks and left interrupts masked); arch fpu::switch_in_restore
+        // honours the per-arch lazy discipline.
         unsafe {
             crate::arch::current::fpu::switch_in_restore(next);
         }
@@ -5267,8 +5201,10 @@ pub unsafe fn post_aspace_death_notification(
 
 /// Timer interrupt handler: decrement current thread's time slice.
 ///
-/// If the slice expires, mark the thread for rescheduling. This function is
-/// called from the timer interrupt handler on each CPU independently.
+/// When the slice expires, call `schedule(true)` unless preemption is disabled.
+/// Also runs the BSP sleep-list and watchdog checks and the per-CPU load
+/// balancer. This function is called from the timer interrupt handler on each
+/// CPU independently.
 ///
 /// # Safety
 /// Must be called from interrupt context on the local CPU only.
@@ -5276,7 +5212,7 @@ pub unsafe fn post_aspace_death_notification(
 pub unsafe fn timer_tick()
 {
     // BSP boot transient: bail before touching scheduler state.
-    // See docs/scheduling-internals.md § BSP Boot Transient.
+    // See core/kernel/docs/scheduling-internals.md § BSP Boot Transient.
     if BOOT_TRANSIENT_ACTIVE.load(core::sync::atomic::Ordering::Acquire)
     {
         return;
@@ -5324,7 +5260,7 @@ pub unsafe fn timer_tick()
 
     let current = sched.current;
 
-    // If no current thread or slice already expired, nothing to do
+    // No current thread: nothing to do.
     if current.is_null()
     {
         // SAFETY: Paired with lock_raw above
@@ -5332,8 +5268,10 @@ pub unsafe fn timer_tick()
         return;
     }
 
-    // SAFETY: current is a valid TCB pointer set by schedule();
-    // magic, slice_remaining are always valid to read.
+    // undocumented_unsafe_blocks: the unsafe block sits inside debug_assert!'s
+    // condition, where the lint does not see this SAFETY comment.
+    // SAFETY: current is a valid TCB pointer set by schedule(); magic is always
+    // valid to read.
     #[allow(clippy::undocumented_unsafe_blocks)]
     {
         debug_assert!(
@@ -5391,17 +5329,8 @@ pub unsafe fn timer_tick()
         // The thread will be rescheduled normally on its next timer expiry.
         if crate::percpu::preemption_disabled()
         {
-            // The suppressed dispatch means schedule() cannot stamp this CPU
-            // non-idle, yet `current` is provably non-idle here (idle threads
-            // hold slice_remaining = 0 and returned above) and taking timer
-            // ticks — live, not stalled. Without the stamp, a sustained
-            // map/unmap storm whose shootdown ack-waits keep every CPU
-            // preemption-disabled across its slice expiries starves all
-            // stamps and false-fires the all-idle detector; the dump's
-            // serial output then stalls shootdown acks and cascades into
-            // the NMI escalation. A genuinely wedged preemption-disabled
-            // spin remains covered by the shootdown's own bounded
-            // escalation (see wait_for_ack).
+            // A live, preemption-disabled `current` still counts as non-idle
+            // (core/kernel/docs/scheduling-internals.md § Softlockup Watchdog).
             watchdog_mark_non_idle(cpu);
         }
         else
@@ -5452,8 +5381,8 @@ pub(crate) unsafe extern "C" fn user_thread_trampoline() -> !
     let tcb = unsafe { crate::syscall::current_tcb() };
     // SAFETY: tcb is a valid TCB pointer; trap_frame was set by sys_thread_configure and points
     // to a valid, initialized TrapFrame. The initial RSP for this function is set below the
-    // TrapFrame (see sys_cap_create_thread: trampoline_rsp = kstack_top - tf_size - TRAMPOLINE_FRAME)
-    // so this C function's stack frame does not overlap the TrapFrame.
+    // TrapFrame (see sys_cap_create_thread: trampoline_rsp = kstack_top - tf_size -
+    // TRAMPOLINE_FRAME_SIZE) so this C function's stack frame does not overlap the TrapFrame.
     unsafe { crate::arch::current::context::return_to_user((*tcb).trap_frame) }
 }
 
@@ -5462,9 +5391,9 @@ pub(crate) unsafe extern "C" fn user_thread_trampoline() -> !
 /// Start executing the highest-priority ready thread and never return.
 ///
 /// Called once at the end of kernel boot after the init TCB has been enqueued.
-/// Dequeues the init thread, activates its address space, sets TSS RSP0 /
-/// `SYSCALL_KERNEL_RSP`, builds an initial user-mode [`TrapFrame`] on its kernel
-/// stack, and calls `return_to_user`.
+/// Dequeues the init thread, sets the kernel trap stack (`set_kernel_trap_stack`),
+/// builds an initial user-mode [`TrapFrame`] on its kernel stack, and calls
+/// `first_entry_to_user`, which loads init's address space and enters user mode.
 ///
 /// # Panics
 /// Calls `crate::fatal` if the run queue is empty (init TCB not enqueued).
@@ -5529,7 +5458,8 @@ pub fn enter() -> !
     let tf_ptr: *mut TrapFrame = (kernel_stack_top - tf_size) as *mut _;
 
     // Zero the frame then populate the user-mode entry fields via TrapFrame
-    // methods (arch-specific field names are hidden inside trap_frame.rs).
+    // methods (arch-specific field names are hidden inside
+    // core/kernel/src/arch/{x86_64,riscv64}/trap_frame.rs).
     // SAFETY: tf_ptr is within the allocated kernel stack (kernel_stack_top - tf_size);
     // init_tcb is a valid TCB; saved_state and TrapFrame methods ensure correct field access.
     unsafe {
@@ -5562,7 +5492,8 @@ pub fn enter() -> !
     }
 
     // End the BSP boot transient (Phase 9): timer_tick now performs
-    // normal preemption. See docs/scheduling-internals.md § BSP Boot Transient.
+    // normal preemption. See core/kernel/docs/scheduling-internals.md § BSP Boot
+    // Transient.
     BOOT_TRANSIENT_ACTIVE.store(false, core::sync::atomic::Ordering::Release);
 
     crate::kprintln!("sched: enter - handing control to init");

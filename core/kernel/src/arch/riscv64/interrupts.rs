@@ -8,15 +8,21 @@
 //! Sets up the supervisor-mode trap infrastructure:
 //! 1. Installs `trap_entry` in `stvec` (direct mode).
 //! 2. Clears `sstatus.SIE`, `sstatus.SPP`, `sstatus.SUM` for a clean initial state.
-//! 3. Enables `sie.SEIP` (external) and `sie.STIP` (timer) bits.
+//! 3. Enables `sie.SSIP` (IPIs), `sie.STIP` (timer), and `sie.SEIP` (external) bits.
 //! 4. Initialises the PLIC: sets all source priorities to 1 and the hart 0
 //!    S-mode threshold to 0 (accept all above-threshold interrupts).
 //!
 //! The trap vector dispatches:
+//! - Software interrupt (scause = 1 | MSB) → `handle_software_interrupt` (TLB shootdown /
+//!   wakeup)
 //! - Timer interrupt (scause = 5 | MSB) → `timer::handle_tick()`
-//! - External interrupt (scause = 9 | MSB) → PLIC claim → dispatch → PLIC complete
-//! - U-mode ecall (scause = 8) → `syscall::syscall_stub()`
-//! - All other exceptions → print diagnostics + `fatal()`
+//! - External interrupt (scause = 9 | MSB) → PLIC claim → `dispatch_external` (completes
+//!   via `acknowledge`)
+//! - U-mode illegal instruction on an F/D/V opcode (scause = 2) → lazy FP/V restore
+//! - U-mode ecall (scause = 8) → `crate::syscall::dispatch`
+//! - Other U-mode exceptions → spurious-TLB retry, the bound fault handler, or thread
+//!   termination
+//! - Other S-mode exceptions → `copy_user` fixup, else diagnostics + `fatal()`
 //!
 //! # PLIC layout
 //! Base physical address is supplied by the bootloader through
@@ -28,10 +34,12 @@
 //! - Claim/Complete:    base + `0x20_1004`.
 //!
 //! # Modification notes
-//! - To add a new device IRQ: enable its PLIC source in the enable register
-//!   and add a case in `dispatch_external`.
-//! - To support additional harts: pass the hart ID and update the PLIC
-//!   context register offsets (context = hart*2 + 1 for S-mode).
+//! - Device IRQs need no per-device code here: `route_device_irq` enables (and masks) the
+//!   source on the BSP context, and `dispatch_external` forwards every claimed source to
+//!   `crate::irq::dispatch_device_irq`.
+//! - PLIC contexts are computed from `current_cpu()` (S-mode context = cpu*2 + 1), which
+//!   equals the hart-id numbering only where logical index and hart id coincide (#443);
+//!   device IRQs are enabled on the BSP context only (`BSP_S_CTX_ENABLE_BASE`).
 
 use super::trap_frame::TrapFrame;
 use crate::mm::paging::phys_to_virt;
@@ -43,7 +51,8 @@ const PLIC_PRIORITY_BASE: u64 = 0x0000;
 
 /// Compute the PLIC enable register base for the current hart's S-mode context.
 ///
-/// PLIC context = `hart_id * 2 + 1` (S-mode context for each hart).
+/// PLIC context = `current_cpu() * 2 + 1`: the logical CPU index stands in for the hart id,
+/// which is correct only where the two coincide (#443).
 /// Enable base = PLIC base + 0x2000 + context * 0x80.
 ///
 /// Used only for per-hart cleanup at boot. Runtime device-IRQ routing is
@@ -65,14 +74,17 @@ const fn plic_enable_base_for(hart: u32) -> u64
     0x2000 + (hart as u64 * 2 + 1) * 0x80
 }
 
-/// PLIC S-mode enable-bits base for hart 0 (the BSP).
+/// PLIC S-mode enable-bits base for hart 0, used as the BSP's context; this assumes the
+/// BSP is hart 0, which the boot protocol does not guarantee (#443).
 ///
 /// All device IRQs are routed to the BSP's S-mode context — a single known
 /// hart — so that only one hart takes the trap and there is no thundering-
 /// herd claim race between multiple harts for the same source.
 const BSP_S_CTX_ENABLE_BASE: u64 = plic_enable_base_for(0);
 
-/// Compute the PLIC threshold register offset for the current hart's S-mode context.
+/// Compute the PLIC threshold register offset for the S-mode context numbered by the
+/// current logical CPU index (`current_cpu() * 2 + 1`; equals this hart's context only
+/// where the logical index equals the hart id, #443).
 fn plic_threshold_offset() -> u64
 {
     let ctx = u64::from(super::cpu::current_cpu()) * 2 + 1;
@@ -87,8 +99,8 @@ fn plic_claim_complete_offset() -> u64
 
 /// Conservative cap on the PLIC source number the kernel programs. The
 /// RISC-V PLIC spec admits up to 1023 sources; every targeted platform
-/// exposes far fewer, and the buddy-walked enable bitmap stays cheap at this
-/// bound.
+/// exposes far fewer, and the boot-time priority and enable-word loops stay cheap at
+/// this bound.
 const PLIC_NUM_SOURCES: u32 = 127;
 
 // ── PLIC access helpers ───────────────────────────────────────────────────────
@@ -101,6 +113,11 @@ fn plic_read(offset: u64) -> u32
     unsafe { core::ptr::read_volatile(vaddr as *const u32) }
 }
 
+/// Write `val` to the PLIC register at `offset`, then order it before later MMIO stores.
+///
+/// # Safety
+/// The direct physical map must be active and `offset` must lie inside the PLIC register
+/// window.
 unsafe fn plic_write(offset: u64, val: u32)
 {
     let vaddr = phys_to_virt(super::platform::plic_base() + offset);
@@ -124,17 +141,23 @@ unsafe fn plic_write(offset: u64, val: u32)
 ///
 /// ## Stack switching invariant
 ///
-/// `sscratch` encodes the current privilege:
+/// `sscratch` encodes the trap source:
 /// - S-mode: `sscratch = 0`
-/// - U-mode: `sscratch = kernel stack top for the current thread`
+/// - U-mode: `sscratch = &PER_CPU[cpu]` (this hart's `PerCpuData`)
 ///
-/// On U-mode trap entry the handler atomically reads the kernel stack top
-/// from `sscratch` (via `csrrw t0, sscratch, t0`) and switches to it before
-/// building the [`TrapFrame`]. On exit, `sscratch` is reloaded with the
-/// kernel stack top before `sret` returns to U-mode.
+/// On U-mode trap entry the handler swaps `t0` with `sscratch` (`csrrw t0, sscratch, t0`),
+/// installs the per-CPU pointer in `tp`, loads the kernel stack top from
+/// `PerCpuData::kernel_rsp` (written by `cpu::set_kernel_trap_stack`), and switches to it
+/// before building the [`TrapFrame`]. On a return to U-mode, `sscratch` is re-armed with
+/// `tp` (`&PER_CPU`) before `sret`.
 ///
-/// `sscratch` must be initialised to the initial thread's kernel stack top
-/// before the first `sret` to U-mode (done in `sched::enter`).
+/// `context::return_to_user` arms `sscratch` the same way before the first `sret` to U-mode.
+///
+/// # Safety
+/// Installed only in `stvec` by `install_trap_vector`; never called from Rust. Requires
+/// `sscratch = 0` while in S-mode and `&PER_CPU` while in U-mode, `tp = &PER_CPU` in
+/// S-mode, and `PerCpuData::kernel_rsp` set to the running thread's kernel stack top
+/// before any return to U-mode.
 // too_many_lines: trap_entry is a single naked-asm block; the register
 // save/restore sequence cannot be meaningfully split.
 #[allow(clippy::too_many_lines)]
@@ -142,11 +165,11 @@ unsafe fn plic_write(offset: u64, val: u32)
 #[unsafe(naked)]
 unsafe extern "C" fn trap_entry()
 {
-    // Frame layout: 35 × 8 = 280 bytes (verified by test below).
+    // Frame layout: 35 × 8 = 280 bytes (size asserted in `trap_frame::tests`).
     // Offsets: x1=0, x2=8, x3=16, x4=24, x5=32, …, x31=240,
-    //          sepc=248, scause=256, stval=264.
+    //          sepc=248, scause=256, stval=264, sstatus=272.
     //
-    // sscratch convention (new):
+    // sscratch convention:
     //   S-mode: sscratch = 0   (trap from S-mode, stack is already the kernel stack)
     //   U-mode: sscratch = &PER_CPU[cpu_id]   (tp value, always non-zero)
     //
@@ -265,7 +288,8 @@ unsafe extern "C" fn trap_entry()
 
         // ── Restore sscratch and tp (privilege-dependent) ────────────────────────
         // Check sstatus.SPP (bit 8): 0 = return to U-mode, 1 = return to S-mode.
-        // Now reads from the restored sstatus, not the stale CSR.
+        // Reads the sstatus restored above (the trap context's SPP), not the CSR value
+        // left by dispatch.
         "csrr t0, sstatus",
         "srli t0, t0, 8",
         "andi t0, t0, 1",
@@ -325,9 +349,6 @@ unsafe extern "C" fn trap_entry()
     );
 }
 
-/// Dispatch a trap to the appropriate handler.
-///
-/// `scause` bit 63 set = interrupt; clear = exception.
 /// TLB shootdown / wakeup IPI handler.
 ///
 /// Services any per-CPU shootdown request that names this hart (flush + ack),
@@ -363,13 +384,10 @@ fn handle_software_interrupt()
         crate::mm::tlb_shootdown::service_shootdowns(hart_id);
     }
 
-    // Wakeup IPIs carry no handler work beyond the hardware-mandated SSIP
-    // acknowledgement (performed above via `clear_sip_ssip`). The
-    // reschedule-pending flag is set producer-side in `enqueue_and_wake`, so
-    // the handler does not need to touch it here. The IPI's purpose is purely
-    // to break the target hart out of `wfi`; correctness of the wake is the
-    // producer-side flag plus the atomic check-and-halt in the idle loop. See
-    // `kernel/src/sched/mod.rs` `RESCHEDULE_PENDING` doc.
+    // Wakeup IPIs carry no handler work beyond the SSIP acknowledgement above; the wake's
+    // correctness rests on the producer-side `RESCHEDULE_PENDING` set in `enqueue_and_wake`
+    // and the idle loop's check-and-halt (core/kernel/docs/scheduling-internals.md § Wake
+    // Protocol Invariants).
 }
 
 /// Clear the supervisor software interrupt pending bit (SIP.SSIP).
@@ -393,6 +411,8 @@ unsafe fn clear_sip_ssip()
 ///
 /// Called with interrupts disabled (sstatus.SIE is cleared on trap entry).
 #[cfg(not(test))]
+// too_many_lines: trap_dispatch is the single scause dispatch for every interrupt and
+// exception class; its arms share the decoded cause and the live frame.
 #[allow(clippy::too_many_lines)]
 extern "C" fn trap_dispatch(frame: &mut TrapFrame)
 {
@@ -417,12 +437,9 @@ extern "C" fn trap_dispatch(frame: &mut TrapFrame)
                 // which writes the PLIC claim/complete register. Do NOT write it
                 // again here.
                 //
-                // `plic_enable` enables the source on every hart's S-mode
-                // context, so multiple harts may take this trap concurrently.
-                // PLIC claim is atomic: only the first hart reads a non-zero
-                // IRQ id; concurrent readers see 0 and fall through without
-                // dispatching. This is the standard PLIC thundering-herd
-                // behaviour and is safe.
+                // `plic_enable` enables sources only on the BSP's S-mode context,
+                // so only the BSP takes this trap; a claim that reads 0 (no source
+                // pending for this context) dispatches nothing.
                 let irq = plic_read(plic_claim_complete_offset());
                 if irq != 0
                 {
@@ -504,12 +521,11 @@ extern "C" fn trap_dispatch(frame: &mut TrapFrame)
         // Check if the fault came from U-mode (SPP bit 8 = 0) or S-mode (SPP = 1).
         let is_userspace = (sstatus_val & (1 << 8)) == 0;
 
-        // Spurious stale-TLB retry: a U-mode page fault (instruction=12,
-        // load=13, store/AMO=15) whose faulting address is already mapped with
-        // sufficient permissions in the live tables is a stale TLB entry (e.g.
-        // after a remote map/widen whose shootdown was elided). Flush it
-        // locally and re-execute the instruction (sepc not advanced) instead
-        // of killing the thread. Genuine faults fall through to the kill path.
+        // Spurious stale-TLB retry: a U-mode page fault (instruction=12, load=13, store/AMO=15)
+        // that the live tables already satisfy is a stale entry from an elided shootdown
+        // (core/kernel/docs/memory-internals.md § SMP TLB Shootdown). Flush it locally and
+        // re-execute the instruction (sepc not advanced); genuine faults fall through to the
+        // kill path.
         if is_userspace && matches!(cause_code, 12 | 13 | 15)
         {
             let write = cause_code == 15;
@@ -579,7 +595,7 @@ extern "C" fn trap_dispatch(frame: &mut TrapFrame)
             if !tcb.is_null()
             {
                 // Commit Exited under all-CPU scheduler.locks. See
-                // docs/thread-lifecycle-and-sleep.md § Lifecycle State Machine.
+                // core/kernel/docs/thread-lifecycle-and-sleep.md § Lifecycle State Machine.
                 // The reason (EXIT_FAULT_BASE + cause_code; EXIT_FAULT_BASE =
                 // 0x1000, matching syscall_abi::EXIT_FAULT_BASE) is written in
                 // the same hold. A refusal means a teardown already committed
@@ -589,7 +605,8 @@ extern "C" fn trap_dispatch(frame: &mut TrapFrame)
                 let _ = unsafe { crate::sched::exit_under_all_locks(tcb, 0x1000 + cause_code) };
 
                 // Post death notification if bound (exit_reason = EXIT_FAULT_BASE + cause_code).
-                // SAFETY: tcb is valid; post_death_notification handles null check.
+                // SAFETY: tcb validated non-null; exit_under_all_locks has marked it Exited and no
+                // sched_lock is held.
                 unsafe {
                     crate::sched::post_death_notification(tcb, 0x1000 + cause_code);
                 }
@@ -727,9 +744,10 @@ fn normalize_riscv_exception(cause: u64) -> u64
 /// handler-modified sepc), `false` if the fault is terminal (the handler declined
 /// or the binding was severed).
 ///
-/// RISC-V already uses a single [`TrapFrame`] for every kernel entry, so — unlike
-/// x86-64 — no frame copy is needed: `(*tcb).trap_frame` is pointed at the live
-/// trap `frame` for the duration of the block, so the handler's
+/// RISC-V uses a single [`TrapFrame`] for every kernel entry, so — as on x86-64
+/// (`arch::x86_64::idt::redirect_user_fault`) — no frame copy is needed:
+/// `(*tcb).trap_frame` is pointed at the live trap `frame` for the duration of the block,
+/// so the handler's
 /// `SYS_THREAD_READ_REGS` / `SYS_THREAD_WRITE_REGS` read and edit the faulting
 /// registers in place, and `sret` restores the same frame on resume.
 ///
@@ -769,11 +787,11 @@ unsafe fn redirect_user_fault(
 /// Device IRQs are routed to a single hart (the BSP). Routing to one hart
 /// avoids the PLIC thundering-herd: with N harts all enabled for the same
 /// source, each trap fires on all N, N-1 of them lose the claim race
-/// (`plic_claim` returns 0), and the redundant traps waste cycles on every
-/// hart. Pinning to a single context
+/// (the claim read of `plic_claim_complete_offset` returns 0), and the redundant traps
+/// waste cycles on every hart. Pinning to a single context
 /// makes IRQ delivery deterministic. This matches the `x86_64` side, which
 /// programs every IOAPIC redirection entry for destination LAPIC ID 0 (see
-/// `arch/x86_64/ioapic.rs::route`).
+/// `core/kernel/src/arch/x86_64/ioapic.rs` (`ioapic::route`)).
 ///
 /// TODO: per-IRQ affinity. When the system grows multiple high-rate IRQ
 /// sources (additional block devices, a NIC, more than one virtio queue
@@ -783,7 +801,7 @@ unsafe fn redirect_user_fault(
 /// rebalancer. The downstream `dispatch_device_irq` path is already
 /// hart-agnostic (`acknowledge` uses `current_cpu`), so only the enable-bit
 /// placement here needs to change. Same TODO applies to
-/// `arch/x86_64/ioapic.rs::route`.
+/// `core/kernel/src/arch/x86_64/ioapic.rs` (`ioapic::route`).
 #[cfg(not(test))]
 pub fn plic_enable(source: u32)
 {
@@ -853,6 +871,9 @@ pub unsafe fn route_device_irq(irq: u32)
 }
 
 /// No-op test stub.
+///
+/// # Safety
+/// No preconditions; `unsafe` only for signature parity with the non-test item.
 #[cfg(test)]
 pub unsafe fn route_device_irq(_irq: u32) {}
 
@@ -875,9 +896,10 @@ fn dispatch_external(irq: u32)
 
 // ── Public interface ──────────────────────────────────────────────────────────
 
-/// Initialise trap handling and the PLIC.
+/// Install `trap_entry` in this hart's `stvec` (direct mode).
 ///
-/// Must be called once during Phase 5 from a single-threaded context.
+/// `stvec` is per-hart: the BSP calls this from `init` (Phase 5), and each AP calls it from
+/// `kernel_entry_ap` (through `idt::load` and `init_ap`).
 ///
 /// # Safety
 /// Must execute in supervisor mode with the direct physical map active.
@@ -898,11 +920,15 @@ pub unsafe fn install_trap_vector()
 }
 
 /// No-op stub for host tests.
+///
+/// # Safety
+/// No preconditions; `unsafe` only for signature parity with the non-test item.
 #[cfg(test)]
 pub unsafe fn install_trap_vector() {}
 
 /// Initialise supervisor trap infrastructure for the BSP.
 ///
+/// # Safety
 /// Must execute in supervisor mode with the direct physical map active.
 #[cfg(not(test))]
 pub unsafe fn init()
@@ -927,7 +953,8 @@ pub unsafe fn init()
     // Clear sstatus.SIE (bit 1), sstatus.SPP (bit 8), sstatus.SUM (bit 18).
     // SIE: global interrupt enable — starts disabled, timer::init() enables it.
     // SPP: previous privilege (0 = U-mode return target).
-    // SUM: permit S-mode to access U-mode pages (not needed; keep disabled).
+    // SUM: clear outside the user-copy routines, which open their own window
+    // (docs/memory-model.md § Kernel Isolation — SMEP and SMAP).
     // SAFETY: csrc sstatus is a privileged S-mode instruction that clears the
     // masked bits and touches no memory; caller ensures S-mode. `nomem` is
     // omitted as for `cpu::disable_interrupts`.
@@ -1069,11 +1096,15 @@ pub unsafe fn init_ap()
 }
 
 /// No-op stub for host tests.
+///
+/// # Safety
+/// No preconditions; `unsafe` only for signature parity with the non-test item.
 #[cfg(test)]
 pub unsafe fn init_ap() {}
 
 /// Disable supervisor interrupts. Returns previous SIE state.
-#[allow(dead_code)] // Required by arch interface: kernel/docs/arch-interface.md
+// dead_code: required by the arch interface (core/kernel/docs/arch-interface.md § `interrupts`).
+#[allow(dead_code)]
 pub fn disable() -> bool
 {
     let prev: u64;
@@ -1109,7 +1140,8 @@ pub unsafe fn enable()
 }
 
 /// Return `true` if supervisor interrupts are currently enabled.
-#[allow(dead_code)] // Required by arch interface: kernel/docs/arch-interface.md
+// dead_code: required by the arch interface (core/kernel/docs/arch-interface.md § `interrupts`).
+#[allow(dead_code)]
 pub fn are_enabled() -> bool
 {
     let sstatus: u64;
@@ -1143,9 +1175,9 @@ pub fn acknowledge(irq: u32)
 /// Send a TLB shootdown IPI to a target hart via SBI IPI.
 ///
 /// Sends a supervisor software interrupt to the target hart. The
-/// software-interrupt handler (scause=1) on the target services any
-/// shootdown request naming it: executes sfence.vma, clears its pending
-/// bit, and clears SSIP.
+/// software-interrupt handler (scause=1) on the target clears SSIP, then services every
+/// shootdown request naming it per core/kernel/docs/memory-internals.md § SMP TLB
+/// Shootdown (flush, then clear its bit in `pending_cpus`).
 ///
 /// Note: this uses SBI IPI (not RFENCE) because RFENCE is a blocking
 /// firmware call that performs the flush internally without generating a
@@ -1220,7 +1252,8 @@ unsafe fn sbi_send_ipi_to(target_hart_id: u32)
 ///
 /// # Safety
 /// Arch-dispatch parity only; never invoked on RISC-V in practice.
-#[allow(dead_code)] // Arch-dispatch parity with x86_64; no caller on RISC-V.
+// dead_code: arch-dispatch parity with x86_64; no caller on RISC-V.
+#[allow(dead_code)]
 #[cfg(not(test))]
 pub unsafe fn send_nmi_to(_target_hart_id: u32)
 {
@@ -1231,7 +1264,7 @@ pub unsafe fn send_nmi_to(_target_hart_id: u32)
 ///
 /// Identical shape to the x86-64 counterpart so shared call sites (e.g.
 /// `mm::tlb_shootdown::shootdown`) compile on both arches; see the
-/// x86-64 `IpiWaitCtx` rustdoc in `arch/x86_64/interrupts.rs` for the
+/// x86-64 `IpiWaitCtx` rustdoc in `core/kernel/src/arch/x86_64/interrupts.rs` for the
 /// per-field semantics (`op_name` and `target_cpu` are diagnostic-only;
 /// `resend` is called once at Phase B to re-emit the IPI to whichever
 /// targets are still unacked).
@@ -1242,17 +1275,13 @@ pub struct IpiWaitCtx<'a>
     pub resend: &'a dyn Fn(),
 }
 
-/// TSC-bounded synchronous-IPI ack wait. RISC-V has no S-mode NMI
-/// surface, so Phase C degrades to a single logged warning before
-/// Phase D panics. Phases:
-/// - **A** (0 → ~250 ms): spin while `cond()` reports unacked.
-/// - **B** (250 ms → ~750 ms): resend once.
-/// - **C** (750 ms → ~5 s): emit a single warning log (no NMI).
-/// - **D** (>5 s): panic.
+/// Wall-clock-bounded synchronous-IPI ack wait (`timer::elapsed_us`), escalating through
+/// the four phases of core/kernel/docs/scheduling-internals.md § IPI Watchdog Ladder.
+/// RISC-V has no S-mode NMI surface, so Phase C is a single logged warning.
 ///
 /// # Safety
-/// Must run at S-mode with preemption disabled and `sstatus.SIE = 1`.
-/// `cond` MUST be side-effect-free beyond the atomic loads needed.
+/// The calling envelope of core/kernel/docs/scheduling-internals.md § IPI Watchdog
+/// Ladder: S-mode, preemption disabled, `sstatus.SIE = 1`, and a side-effect-free `cond`.
 #[cfg(not(test))]
 pub unsafe fn wait_for_ack(mut cond: impl FnMut() -> bool, ctx: &IpiWaitCtx<'_>)
 {

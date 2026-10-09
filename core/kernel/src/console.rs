@@ -10,9 +10,8 @@
 //! the kernel is single-threaded during early boot and never runs concurrent
 //! code before SMP is initialized.
 //!
-//! Unlike the bootloader console, the kernel is a native ELF, so `core::fmt`
-//! trait objects and vtable dispatch work on all architectures. The macros
-//! accept full format arguments.
+//! The kernel is a native ELF, so `core::fmt` trait objects and vtable dispatch
+//! work on all architectures. The macros accept full format arguments.
 //!
 //! This is the early/panic console and is retained permanently; steady-state
 //! userspace serial output is owned by the userspace serial driver. See
@@ -28,8 +27,9 @@ use boot_protocol::BootInfo;
 /// Spinlock protecting `CONSOLE`. Acquired by every `console_write_fmt` call
 /// so concurrent writes from multiple CPUs (SMP) do not race on the
 /// framebuffer cursor position. Uses a plain `AtomicBool` (test-and-set) rather
-/// than the ticket `Spinlock` to avoid disabling interrupts — callers may already
-/// be in an interrupt handler, and timer ISRs do not call `kprintln!`.
+/// than the ticket `Spinlock`, so acquiring it does not disable interrupts;
+/// interrupt-context callers acquire it the same way (the softlockup watchdog
+/// dump runs from `timer_tick` and prints through `kprintln!`).
 ///
 /// Two non-acquiring exceptions exist for crash and NMI paths where
 /// spin-waiting would deadlock against a halted or interrupted lock-
@@ -179,8 +179,9 @@ pub unsafe fn console_write_fmt(args: core::fmt::Arguments)
 /// Write a formatted string to the serial port only.
 ///
 /// Acquires `CONSOLE_LOCK` normally (spin-waits) but writes only to serial,
-/// skipping the framebuffer. Used for userspace fault diagnostics that should
-/// not overwrite whatever is on the display.
+/// skipping the framebuffer. This is the serial-only sink behind `kprintln_serial!`, used
+/// for kernel virtual addresses, KASLR-derived values, and userspace fault diagnostics;
+/// see `core/kernel/docs/cross-boundary-disclosure.md` § Kernel console diagnostics.
 ///
 /// # Safety
 /// `console::init` must have been called before this function.
@@ -287,7 +288,8 @@ pub unsafe fn panic_write_fmt(args: core::fmt::Arguments)
 /// `console::init` must have been called before this function. Safe
 /// to call from inside an NMI handler regardless of whether
 /// `CONSOLE_LOCK` is held by the interrupted code.
-#[allow(dead_code)] // Only called by the x86-64 NMI handler; RISC-V has no S-mode NMI surface.
+// dead_code: only the x86-64 NMI handler calls this; RISC-V has no S-mode NMI surface.
+#[allow(dead_code)]
 #[cfg(not(test))]
 pub unsafe fn nmi_write_fmt(args: core::fmt::Arguments)
 {
@@ -470,7 +472,7 @@ pub fn print_serial_timestamp() {}
 macro_rules! kprint {
     ($($arg:tt)*) => {{
         // Capture format_args! outside the unsafe block to avoid expanding
-        // metavariables inside unsafe (clippy::macro_metavariable_expr_dep).
+        // metavariables inside unsafe (clippy::macro_metavars_in_unsafe).
         let _args = format_args!($($arg)*);
         // SAFETY: console is initialized before any macro usage.
         unsafe {
@@ -481,7 +483,9 @@ macro_rules! kprint {
 
 /// Print a formatted string to serial only (no framebuffer).
 ///
-/// Used for userspace fault diagnostics that should not disturb the display.
+/// The serial-only path for kernel virtual addresses and other KASLR-derived values,
+/// and for userspace fault diagnostics; see
+/// `core/kernel/docs/cross-boundary-disclosure.md` § Kernel console diagnostics.
 #[macro_export]
 macro_rules! kprint_serial {
     ($($arg:tt)*) => {{
@@ -496,7 +500,9 @@ macro_rules! kprint_serial {
 /// Print a formatted string followed by `\n` to serial only.
 ///
 /// Prepends a `[S.NNNNNN] kernel: ` timestamp prefix (via serial only).
-/// Used for userspace fault diagnostics.
+/// The serial-only path for kernel virtual addresses and other KASLR-derived values,
+/// and for userspace fault diagnostics; see
+/// `core/kernel/docs/cross-boundary-disclosure.md` § Kernel console diagnostics.
 #[macro_export]
 macro_rules! kprintln_serial {
     () => {

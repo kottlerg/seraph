@@ -5,17 +5,12 @@
 
 //! Per-CPU CSPRNG.
 //!
-//! One forward-secure generator per CPU, reseeded from the central pool. Each
-//! instance is touched only by its owning CPU under interrupt-disabled
-//! exclusivity (see the draw API in [`super`]), so it needs no lock.
+//! One forward-secure generator per CPU, reseeded from the central pool and
+//! touched only by its owning CPU (see the draw API in [`super`]); the reseed
+//! decision is [`super::reseed_policy::decide`].
 //!
-//! Reseed policy lives in [`super::reseed_policy`]: mandatory reseeds
-//! (first use, VMGENID generation change, overdue time budget) block on the
-//! pool lock; opportunistic reseeds (draw interval, time budget) use the
-//! non-spinning pool path and defer one draw under contention. Each reseed
-//! folds any accumulated per-CPU jitter into the pool, draws fresh seed
-//! material, and absorbs it. Forward secrecy across draws is provided by the
-//! sponge's per-fill erasure.
+//! Design: [entropy.md](../../docs/entropy.md) § Per-CPU CSPRNG and reseed
+//! policy.
 
 use super::reseed_policy::{self, Action};
 use super::sponge::Prng;
@@ -53,9 +48,9 @@ impl CpuRng
     }
 
     /// Force a mandatory reseed on the next fill. Used after the boot
-    /// self-test capture, whose draw seeds the generator from the
-    /// scrape-dominated boot-time pool: the first consumer draw then reseeds
-    /// with the runtime jitter accrued in between.
+    /// self-test capture, whose draw seeds the generator from the boot-time
+    /// pool: the first consumer draw then reseeds with the runtime jitter
+    /// accrued in between (see entropy.md § Boot-time entropy).
     pub fn mark_stale(&mut self)
     {
         self.seeded = false;
@@ -78,8 +73,9 @@ impl CpuRng
         self.finish_reseed(guid, now_us);
     }
 
-    /// Non-spinning reseed; `false` = pool lock contended, nothing changed —
-    /// the caller draws from current state and retries next draw.
+    /// Non-spinning reseed; `false` = pool lock contended and the generator is
+    /// unchanged (a jitter fold may already have landed in the pool) — the
+    /// caller draws from current state and retries next draw.
     fn try_reseed(&mut self, cpu: usize, guid: Option<[u8; 16]>, now_us: u64) -> bool
     {
         if !jitter::try_contribute_to_pool(cpu)

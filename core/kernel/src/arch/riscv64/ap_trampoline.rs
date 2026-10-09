@@ -107,9 +107,9 @@ pub unsafe fn sbi_hart_start(hart_id: u64, start_pa: u64, opaque: u64) -> bool
 
 // ── Trampoline machine code ───────────────────────────────────────────────────
 
-// The trampoline is assembled by the linker into a dedicated section so the
-// assembler produces correct RISC-V machine code. The BSP copies these bytes
-// to the physical trampoline page before sending hart_start.
+// The trampoline is written as `global_asm!` in a dedicated section so the
+// assembler, not hand-encoded bytes, produces the RISC-V machine code. The BSP
+// copies these bytes to the physical trampoline page before sending hart_start.
 core::arch::global_asm!(
     ".section .text.rv_ap_trampoline, \"ax\"",
     ".global _rv_ap_trampoline",

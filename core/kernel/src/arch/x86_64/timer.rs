@@ -8,7 +8,7 @@
 //!
 //! The mode is decided once on the BSP during [`init`] and mirrored by every
 //! AP. TSC-deadline is classified Opportunistic by
-//! [platform-requirements.md](../../../../docs/platform-requirements.md):
+//! [platform-requirements.md](../../../../../docs/platform-requirements.md):
 //! the periodic fallback stays because the QEMU TCG emulator used for
 //! continuous integration does not expose the CPUID bit. Neither mode
 //! requires x2APIC — the LVT mode bits exist in both xAPIC and x2APIC
@@ -40,8 +40,10 @@
 //! - To get higher resolution (periodic mode): reduce divide ratio and
 //!   recalculate.
 
-// cast_possible_truncation: APIC timer counts fit in u32; TIMER_VECTOR fits in u32.
-// cast_lossless: u32→u64 conversions in TSC math are lossless.
+// cast_possible_truncation: the APIC initial count fits the 32-bit register;
+// the PIT reload value (~11 932) fits u16 and is written as two u8 halves.
+// cast_lossless: u32→u64 widening in TSC/APIC math and the u8 TIMER_VECTOR
+// widened to u32 are lossless.
 // inline_always: read_tsc is a tiny asm stub; always-inline is appropriate here.
 #![allow(
     clippy::cast_possible_truncation,
@@ -94,7 +96,8 @@ const PIT_HZ: u64 = 1_193_182;
 
 // ── Tick state ────────────────────────────────────────────────────────────────
 
-/// Raw APIC hardware ticks per second (computed during calibration).
+/// APIC timer count rate in ticks per second at the divide-by-16 setting
+/// (computed during calibration).
 /// Used for initial-count computation; NOT the interrupt rate.
 static APIC_TICKS_PER_SEC: AtomicU64 = AtomicU64::new(0);
 
@@ -108,8 +111,10 @@ static INTERRUPT_RATE: AtomicU64 = AtomicU64::new(0);
 static TSC_DEADLINE_MODE: AtomicBool = AtomicBool::new(false);
 
 /// Tick period in TSC ticks (TSC-deadline mode). Computed on the BSP from
-/// the PIT-calibrated `TSC_PER_US`; valid on every core because the
-/// platform floor requires an invariant, uniform-rate TSC.
+/// the PIT-calibrated `TSC_PER_US` and reused on every core, relying on the
+/// invariant TSC required by
+/// [platform-requirements.md](../../../../../docs/platform-requirements.md)
+/// § x86-64 Classification.
 static PERIOD_TSC_TICKS: AtomicU64 = AtomicU64::new(0);
 
 // ── High-resolution time state ────────────────────────────────────────────────
@@ -210,11 +215,13 @@ unsafe fn inb(port: u16) -> u8
 
 /// Calibrate the APIC timer using the 8254 PIT as the reference.
 ///
-/// Programs PIT channel 2 for `pit_ticks` counts (~= `pit_ms` ms), starts
-/// the APIC timer at full count with divide-by-16, spins until PIT expires,
-/// then returns the number of APIC ticks that elapsed.
+/// Programs PIT channel 2 for `pit_counts` counts (`PIT_CALIBRATION_MS`,
+/// ~10 ms), starts the APIC timer at full count with divide-by-16, spins
+/// until the PIT expires, and records `TSC_PER_US` and `BOOT_TSC` from the
+/// same window.
 ///
-/// Returns `(apic_ticks_per_pit_interval, pit_ms)`.
+/// Returns APIC timer ticks per second at divide-by-16 (the 10 ms sample
+/// scaled by 100).
 #[cfg(not(test))]
 unsafe fn calibrate_apic_timer() -> u64
 {
@@ -223,11 +230,12 @@ unsafe fn calibrate_apic_timer() -> u64
     // PIT counts for 10 ms.
     let pit_counts = (PIT_HZ * PIT_CALIBRATION_MS / 1000) as u16;
 
-    // Gate channel 2: clear bit 0 (disable gate), keep bit 1.
+    // Clear bit 1 of port 0x61 (speaker data enable); bit 0 (channel 2
+    // gate) is left as found.
     // SAFETY: port I/O at ring 0.
     unsafe {
         let gate = inb(PIT_GATE);
-        outb(PIT_GATE, gate & 0xFD); // gate off
+        outb(PIT_GATE, gate & 0xFD); // speaker data off; gate bit unchanged
     }
 
     // Program PIT channel 2: mode 0 (interrupt on terminal count), binary.
@@ -334,8 +342,9 @@ pub unsafe fn init(period_us: u64)
     else
     {
         // Compute initial count for the requested period.
-        // Formula: initial_count = tps * period_us / 1_000_000 / divide_ratio.
-        // divide_ratio = 16 (DIVIDE_BY_16).
+        // Formula: initial_count = tps * period_us / 1_000_000. `tps` was
+        // measured with DIVIDE_BY_16 already applied, so no further division
+        // by the divide ratio is needed.
         let initial_count = (tps * period_us / 1_000_000).max(1);
 
         // Configure APIC timer: periodic mode, vector TIMER_VECTOR.
@@ -443,7 +452,8 @@ pub fn delay_us(us: u64)
 #[cfg(test)]
 pub fn delay_us(_us: u64) {}
 
-/// Timer ISR body — called from the naked stub in `idt.rs`.
+/// Timer ISR body — called from `irq_dispatch` in `idt.rs`, which the naked
+/// `common_irq_trampoline` invokes for the timer vector.
 ///
 /// In TSC-deadline mode, re-arms the (one-shot) deadline first; periodic
 /// mode reloads in hardware. Then sends EOI and calls the scheduler tick,
@@ -466,7 +476,8 @@ pub extern "C" fn timer_isr()
             );
         }
     }
-    // EOI must be sent before calling schedule() to avoid masking the APIC.
+    // EOI must be sent before `crate::sched::timer_tick()` (which may switch
+    // away) to avoid masking the APIC.
     interrupts::acknowledge(TIMER_VECTOR as u32);
     // SAFETY: called from interrupt handler on a valid kernel stack.
     unsafe {
@@ -479,7 +490,8 @@ pub extern "C" fn timer_isr()
 /// Derived from the TSC so that sleep deadlines and userspace
 /// `Instant::now()` (which reads `elapsed_us` via `SYS_SYSTEM_INFO`) share
 /// a single counter.
-#[allow(dead_code)] // Required by arch interface: kernel/docs/arch-interface.md
+// Required by the arch interface: core/kernel/docs/arch-interface.md § `timer`.
+#[allow(dead_code)]
 #[cfg(not(test))]
 pub fn current_tick() -> u64
 {
@@ -504,7 +516,8 @@ pub fn current_tick() -> u64
 }
 
 /// Return the timer interrupt rate (interrupts per second, matching `current_tick()`).
-#[allow(dead_code)] // Required by arch interface: kernel/docs/arch-interface.md
+// Required by the arch interface: core/kernel/docs/arch-interface.md § `timer`.
+#[allow(dead_code)]
 pub fn ticks_per_second() -> u64
 {
     INTERRUPT_RATE.load(Ordering::Relaxed)
@@ -589,8 +602,8 @@ mod tests
     {
         // Mode field bits 18:17 = 0b10.
         assert_eq!(LVT_TIMER_TSC_DEADLINE, 1 << 18);
-        // The two mode encodings must not overlap bit-wise, or a mode
-        // switch could leave a stale mode bit set.
+        // The two mode encodings differ in bits 18:17. (`init`/`init_ap` write
+        // the whole LVT register, so no mode bit survives a mode change.)
         assert_eq!(LVT_TIMER_TSC_DEADLINE & LVT_TIMER_PERIODIC, 0);
     }
 

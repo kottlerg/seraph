@@ -10,9 +10,8 @@
 //! number, calls the appropriate handler, and writes the return value back.
 //!
 //! # Syscall ABI
-//! - x86-64: number in `rax`; args in `rdi`/`rsi`/`rdx`/`r10`/`r8`/`r9`;
-//!   return value in `rax`.
-//! - RISC-V: number in `a7`; args in `a0`–`a5`; return value in `a0`.
+//! The registers carrying the syscall number, arguments, and return value are
+//! defined in core/kernel/docs/syscalls.md § Calling Convention.
 //!
 //! # Adding new syscalls
 //! 1. Add the constant to `abi/syscall/src/lib.rs`.
@@ -48,11 +47,6 @@ use syscall::{
     SYS_THREAD_STOP, SYS_THREAD_WRITE_REGS, SYS_THREAD_YIELD, SYS_WAIT_SET_ADD,
     SYS_WAIT_SET_REMOVE, SYS_WAIT_SET_WAIT,
 };
-
-// ── TrapFrame accessor shims ──────────────────────────────────────────────────
-// `TrapFrame::syscall_nr`, `::set_return`, and `::arg` are defined as methods
-// on `TrapFrame` in each arch's `trap_frame.rs`. Callers (ipc.rs etc.) use
-// `tf.arg(n)` directly.
 
 // ── Syscall dispatch ──────────────────────────────────────────────────────────
 
@@ -155,18 +149,11 @@ pub unsafe fn dispatch(tf: *mut TrapFrame)
 
     tf.set_return(ret_val);
 
-    // Self-teardown epilogue (#341). A handler may have deleted the last
-    // capability to the running thread's own Thread object, CSpace, or
-    // AddressSpace (SYS_CAP_DELETE / SYS_CAP_REVOKE, directly or through a
-    // teardown cascade), or a concurrent teardown may have stopped this
-    // thread while the handler ran: either way it is `Exited` in place and
-    // must never return to userspace. A live thread first drains objects
-    // deferred earlier on this CPU, from a context where their dead threads
-    // are provably off-CPU. The drain's CSpace/AddressSpace arms wait on
-    // other CPUs with interrupts enabled, so a teardown can stop this thread
-    // meanwhile: the `Exited` check runs after the drain as well. An `Exited`
-    // thread reschedules away; any object whose free it deferred is reclaimed
-    // by the next drain on this CPU.
+    // Self-teardown epilogue (#341): a live thread drains this CPU's
+    // deferred-reclaim stack; a thread found `Exited` (before or after the drain)
+    // reschedules away and never returns to userspace. Protocol and invariants:
+    // core/kernel/docs/thread-lifecycle-and-sleep.md § Self-teardown (the caller
+    // is the freed thread).
     // SAFETY: syscall context on the caller's kernel stack with interrupts
     // disabled (the drain re-enables them only with preemption disabled), so
     // this CPU and its `current` are stable across both checks.
@@ -194,8 +181,8 @@ pub unsafe fn dispatch(tf: *mut TrapFrame)
 // ── Thread syscall handlers ───────────────────────────────────────────────────
 
 /// `SYS_THREAD_YIELD` (21): voluntarily yield the CPU.
-// unnecessary_wraps: all dispatch arms must return Result<u64, SyscallError>; signature is fixed.
 #[cfg(not(test))]
+// unnecessary_wraps: all dispatch arms must return Result<u64, SyscallError>; signature is fixed.
 #[allow(clippy::unnecessary_wraps)]
 fn sys_yield(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
@@ -212,9 +199,10 @@ fn sys_yield(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// Marks the current thread as `Exited` and calls `schedule()` to switch
 /// to the next runnable thread. The exited thread is never re-enqueued.
 ///
-/// Note: full resource cleanup (freeing kernel stack, TCB, `CSpace` entries)
-/// requires a process-manager teardown path that does not yet exist. For now
-/// the TCB is abandoned in place — it will not be scheduled again.
+/// This stops only the calling thread. Its TCB, kernel stack, and `CSpace`
+/// entries are reclaimed by procmgr's cap-revoke teardown once it observes the
+/// death, when the last capability to the thread is deleted (see
+/// docs/process-lifecycle.md § Process Death).
 #[cfg(not(test))]
 fn sys_exit(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
@@ -256,20 +244,18 @@ fn sys_exit(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// posts it to the calling thread's death observers — a parent that bound the
 /// main thread (so `ExitStatus::code()` carries it) and procmgr's per-thread
 /// observer (which reaps the process). Structurally identical to [`sys_exit`]
-/// but with a non-zero reason; in particular it schedules away immediately
+/// but with the encoded caller-supplied reason (zero for `exit(0)`); in
+/// particular it schedules away immediately
 /// after the post, with no further dereference of the thread or its address
 /// space, so it cannot race procmgr's cap-revoke teardown.
 ///
-/// It does NOT post to the address-space death-observer surface (reserved for
-/// terminal faults): doing so on every clean exit dereferences the address
-/// space after the thread post has already woken procmgr to reap, and procmgr's
-/// teardown can unmap the dying process while this thread is still on-CPU. The
-/// thread observer alone covers the single-threaded process model; whole-process
-/// exit from a non-main thread is not yet modelled.
+/// It does NOT post to the address-space death-observer surface, which is
+/// reserved for terminal faults (rationale: docs/process-lifecycle.md § Exit
+/// reason). Whole-process exit from a non-main thread is not yet modelled.
 ///
-/// Like [`sys_exit`], this stops only the calling thread; sibling threads are
-/// reaped by procmgr's cap-revoke teardown once it observes the death. Full
-/// resource cleanup is procmgr-driven and not performed here.
+/// Like [`sys_exit`], this stops only the calling thread; sibling threads and
+/// the process's resources are torn down by procmgr (see
+/// docs/process-lifecycle.md § Process Death, including the #443 gaps).
 #[cfg(not(test))]
 // cast_possible_truncation: arg0 carries a u32 exit code zero-extended to u64
 // by the `process_exit` wrapper; truncating back to u32 is the intended decode.
@@ -389,10 +375,12 @@ fn sys_thread_sleep(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     {
         // Sleep list at capacity. Roll back the Blocked commit: sys_thread_sleep
         // has no IPC source to fall back on; the only honest answer is to surface
-        // the failure to userspace. See docs/thread-lifecycle-and-sleep.md
-        // § Sleep List Invariants. No IPC source binding and no waker targets a
-        // sleeping thread before sleep_list_add, so the thread is still Blocked
-        // here; restore Running under sched_lock.
+        // the failure to userspace. See core/kernel/docs/thread-lifecycle-and-sleep.md
+        // § Sleep List Invariants.
+        // A concurrent stop or teardown can commit Stopped or Exited between
+        // the Blocked commit and here (core/kernel/docs/thread-lifecycle-and-sleep.md
+        // § `sys_thread_sleep` and the Plain-Sleep Path), so Running is
+        // restored under sched_lock only if the thread is still Blocked.
         // The successful commit_blocked above cleared context_saved = 0; this
         // rollback leaves the thread Running with cs = 0, which is intentional
         // and benign — cs = 0 truthfully means "live registers authoritative"
@@ -417,9 +405,10 @@ fn sys_thread_sleep(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         crate::sched::schedule(false);
     }
 
-    // On resume, either timer_tick's sleep-list claim woke us (success) or a
-    // cancellation claim (`cancel_ipc_block`'s sleep-list-remove win) stamped
-    // the park INTERRUPTED.
+    // On resume, either timer_tick's sleep-list claim woke us (success) or
+    // `cancel_ipc_block` stamped the park INTERRUPTED (unconditionally for a
+    // plain sleeper; see core/kernel/docs/thread-lifecycle-and-sleep.md
+    // § `sys_thread_sleep` and the Plain-Sleep Path).
     // SAFETY: tcb still valid after resume.
     if unsafe { crate::sched::thread::consume_park_interrupted(tcb) }
     {
@@ -440,7 +429,7 @@ fn sys_thread_sleep(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// When the target thread exits or faults, the kernel posts
 /// `(correlator as u64) << 32 | (exit_reason & 0xFFFF_FFFF)` to the bound
 /// `EventQueue`. Passing `correlator = 0` makes the payload equal to the
-/// exit reason (the pre-multi-bind behaviour).
+/// exit reason.
 ///
 /// Binding onto a thread that has *already* exited posts the retained
 /// `exit_reason` to the `EventQueue` immediately. The bind serialises on the
@@ -454,6 +443,8 @@ fn sys_thread_sleep(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// per-thread observer array is full (only reachable while the thread is
 /// still live — a bind onto an already-exited thread consumes no slot).
 #[cfg(not(test))]
+// cast_possible_truncation: cap handles and the correlator are u32 by ABI
+// contract; the truncation discards any upper bits a caller sets.
 #[allow(clippy::cast_possible_truncation)]
 fn sys_thread_bind_notification(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
@@ -564,7 +555,8 @@ fn sys_thread_bind_notification(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// arg2 = caller-chosen `correlator` (opaque routing tag).
 ///
 /// On a terminal fault by any thread in the address space (no handler bound,
-/// or handler replied `KILL`), the kernel posts the fault class to each bound
+/// or handler replied `KILL`), the kernel posts the terminal-fault reason
+/// (with the observer's correlator in the high 32 bits) to each bound
 /// observer. The kernel only notifies; it never enumerates or terminates
 /// threads, and normal `thread_exit` does NOT fire these observers.
 ///
@@ -574,6 +566,8 @@ fn sys_thread_bind_notification(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// not miss the fault. Returns `OutOfMemory` if the per-address-space observer
 /// array is full (only reachable before the first fault).
 #[cfg(not(test))]
+// cast_possible_truncation: cap handles and the correlator are u32 by ABI
+// contract; the truncation discards any upper bits a caller sets.
 #[allow(clippy::cast_possible_truncation)]
 fn sys_aspace_bind_notification(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
@@ -672,9 +666,10 @@ pub(crate) unsafe fn current_tcb() -> *mut crate::sched::thread::ThreadControlBl
 ///
 /// `handle` is the encoded value userspace passes: slot index in the low
 /// [`syscall::CAP_INDEX_BITS`] bits, per-slot generation in the high bits. This
-/// is the single chokepoint for resolving a user-supplied handle; raw-index
-/// resolvers in `cap.rs` (`cap_copy`/`derive`/`delete`/`revoke`/`move`/`info`)
-/// must decode and generation-check themselves.
+/// is the single chokepoint for resolving a user-supplied handle; the
+/// raw-resolution handlers in `cap.rs`, `mem.rs`, and `ipc.rs` must decode and
+/// generation-check themselves (see core/kernel/docs/capability-internals.md
+/// § Per-Slot Generation).
 ///
 /// The expected slot tag is fixed by the required-rights argument's type:
 /// `required_rights: TypedRights<K>` selects `K::TAG`, so a rights constant of
@@ -687,6 +682,13 @@ pub(crate) unsafe fn current_tcb() -> *mut crate::sched::thread::ThreadControlBl
 /// - Generation mismatch (stale handle to a recycled slot) →
 ///   [`SyscallError::InvalidCapability`] (#349).
 /// - Insufficient rights → [`SyscallError::InsufficientRights`].
+///
+/// # Safety
+/// `cspace` must be null or the calling thread's own live `CSpace`, and the
+/// call must run in syscall context on that thread. The returned slot and the
+/// object it names are not pinned: a concurrent delete or revoke can free or
+/// recycle them while the caller still uses them (#443; see
+/// core/kernel/docs/capability-internals.md § Storage: Hybrid Two-Level Radix).
 #[cfg(not(test))]
 pub(crate) unsafe fn lookup_cap<K: crate::cap::slot::CapKind>(
     cspace: *mut crate::cap::cspace::CSpace,
@@ -769,9 +771,8 @@ fn sys_ipc_buffer_set(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     Ok(0)
 }
 
-// Host unit test for the kernel-owned exit-code encoding. Lives here because
-// the ABI crate that defines `encode_exit_code` builds `no_std` with
-// `test = false`; the kernel is the encoder's authority and runs host tests.
+// Host unit tests for the exit-code encoding (`syscall::encode_exit_code`)
+// that `sys_process_exit` applies to the caller's exit code.
 #[cfg(test)]
 mod exit_code_tests
 {

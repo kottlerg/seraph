@@ -75,11 +75,12 @@ pub enum MoveStep
     /// torn down) while the source is still live — the source keeps the
     /// capability and whatever children remained under it.
     Lost(SyscallError),
-    /// The liveness backstop tripped (`MAX_REPARENT_BATCHES`): a concurrent
-    /// deriver kept extending the source's child list. Both slots stay
-    /// live and unpinned, the destination a derived child of the source —
-    /// the same shape `SYS_CAP_COPY` produces — so nothing leaves any
-    /// ancestor's reach, and a revoke on the source reclaims it.
+    /// The liveness backstop tripped (`MAX_REPARENT_BATCHES`): the source's
+    /// child list kept growing (deriving from the pinned source is refused, but
+    /// deleting one of its children promotes that child's children to it; see
+    /// capability-internals.md § Move). Both slots stay live and unpinned, the
+    /// destination a derived child of the source — the shape `SYS_CAP_COPY`
+    /// produces — so a revoke on the source reclaims it.
     Abandoned
     {
         handle: u32
@@ -185,9 +186,8 @@ unsafe fn stage_move(
             }
         };
 
-    // Two slots name the object until the source is freed; the destination
-    // holds its own reference so an ancestor's revoke freeing either slot
-    // between batches drops exactly the reference that slot held.
+    // The destination takes its own object reference while both slots name
+    // the object (capability-internals.md § Move).
     // SAFETY: object is the live header the source slot holds.
     unsafe { object.as_ref().inc_ref() };
 
@@ -286,9 +286,10 @@ unsafe fn drive_batch(mv: &CapMove, batches: &mut u32, backstop: u32) -> MoveSte
         (false, false) => MoveStep::Lost(SyscallError::InvalidCapability),
         (false, true) =>
         {
-            // Whoever freed the source (an ancestor's revoke, after
-            // hoisting the destination out from under it) dropped the
-            // reference it held; the destination is the capability now.
+            // Whoever freed the source — an ancestor's revoke (after hoisting the
+            // destination out from under it) or the teardown of the source's
+            // `CSpace` (which left the destination a root) — dropped the reference
+            // it held; the destination is the capability now.
             // SAFETY: caller contract; dst resolved live.
             unsafe { unpin(mv.dst) };
             MoveStep::Done {
@@ -331,10 +332,9 @@ unsafe fn drive_batch(mv: &CapMove, batches: &mut u32, backstop: u32) -> MoveSte
 ///
 /// A `Thread`, `CSpace`, or `AddressSpace` whose last reference goes here
 /// is queued for this CPU's deferred reclaim (drained at the next syscall
-/// epilogue or idle loop) rather than torn down in place: its teardown
-/// stops bound threads and waits on other CPUs, which must not run inside
-/// IPC delivery, and may stop the running thread itself. Every other type
-/// frees in place.
+/// epilogue or idle loop) rather than torn down in place, and may be bound
+/// to the running thread (see capability-internals.md § Move). Every other
+/// type frees in place.
 ///
 /// # Safety
 ///
@@ -419,11 +419,12 @@ unsafe fn move_cap_step(mv: &CapMove, src_lock: SourceLock) -> MoveStep
         take_source_position(mv);
         free_source(mv, src_lock)
     };
-    // Guard, unreachable by construction: the source resolved through the
-    // registry under this hold (the caller's validation, or `live`), so it
-    // resolves for the free. Kept so the `Done` contract stays true should
-    // a caller ever validate the source another way — a source whose CSpace
-    // has unregistered keeps its slot for that teardown's cascade to release.
+    // Guard: a source whose `CSpace` no longer resolves in the registry
+    // keeps its slot for that teardown's cascade to release, and `Done` then
+    // reports no reference. IPC transfer and the later batches (`live`)
+    // resolved the source through the registry under this hold;
+    // `SYS_CAP_MOVE`'s first hold validated it through the caller's `CSpace`
+    // pointer.
     MoveStep::Done {
         handle: mv.handle,
         release: freed.then_some(mv.object),
@@ -477,8 +478,9 @@ unsafe fn take_source_position(mv: &CapMove)
 }
 
 /// Free the source slot; the free path resets its links, pin, and
-/// generation. Lock order: `DERIVATION_LOCK` → `cspace.lock`. Returns
-/// whether the slot was freed — `false` when its `CSpace` no longer
+/// generation. Takes the source `CSpace` lock under `DERIVATION_LOCK`
+/// (scheduling-internals.md § Lock Hierarchy) unless the caller holds it.
+/// Returns whether the slot was freed — `false` when its `CSpace` no longer
 /// resolves, in which case the slot and the reference it holds belong to
 /// that `CSpace`'s teardown.
 ///

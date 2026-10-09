@@ -5,7 +5,8 @@
 
 //! IPC syscall handlers.
 //!
-//! All handlers look up the target capability in the current thread's `CSpace`,
+//! Every handler except `sys_ipc_reply` (which acts on the caller binding in
+//! `reply_tcb`) looks up the target capability in the current thread's `CSpace`,
 //! call the corresponding IPC kernel function, and enqueue/dequeue threads
 //! via the scheduler as needed.
 //!
@@ -59,8 +60,8 @@ unsafe fn read_ipc_buf(
     // buffer unmapped after SYS_IPC_BUFFER_SET returns InvalidAddress instead of
     // faulting the kernel.
     // SAFETY: dst holds MSG_DATA_WORDS_MAX words, so it is valid for n*8 bytes; buf
-    //         is the user source span (validated non-zero / page-aligned at
-    //         registration).
+    //         is the user source span (non-zero per the check above; page-aligned
+    //         and in the user half per SYS_IPC_BUFFER_SET).
     unsafe {
         crate::uaccess::copy_from_user(
             dst.as_mut_ptr().cast::<u8>(),
@@ -206,24 +207,13 @@ fn prevalidate_transfer_slots(cs: &CSpace, handles: &[u32]) -> Result<(), Syscal
 /// null/invalid, repeated within the same message, pinned by an in-flight
 /// revoke or move (`CapabilitySlot::pinned`), or the destination is full
 /// (`pre_allocate` fails), returns an error and no caps are transferred.
-/// Both `CSpace`s are resolved through the registry under `DERIVATION_LOCK`
-/// from the identity stamped in each TCB (`cspace_id`/`cspace_epoch`), and
-/// the validation and pre-allocation run under the same hold, immediately
-/// before the moves: a `CSpace` a teardown has unregistered resolves to
-/// nothing, and one still registered stays allocated for the hold, since
-/// unregistration happens under this lock and the storage is released only
-/// after it.
-///
-/// Each move then runs to completion through `cap::transfer` — inside the
-/// first lock hold for a cap with at most `MAX_REPARENT_EDITS` children,
-/// otherwise in further batches with the locks released in between (both
-/// slots pinned meanwhile, both revalidated through the registry before
-/// each batch). A cap whose slots are both freed during those batches (an
-/// ancestor's revoke) or whose destination is freed (the receiver's `CSpace`
-/// torn down — the sender then keeps the capability) is delivered as handle
-/// 0 (the permanently null slot); one whose migration trips the liveness
-/// backstop is delivered live, with the sender's slot surviving as its
-/// derivation parent.
+/// Validation, destination pre-allocation, and the first batch of every
+/// move run under one `DERIVATION_LOCK` hold with both `CSpace`s resolved
+/// through the registry from each TCB's `cspace_id`/`cspace_epoch`; moves
+/// that need further batches are driven by `move_cap_drive` after the
+/// locks drop. Registry resolution, batching, and the handle each
+/// degraded move delivers follow core/kernel/docs/capability-internals.md
+/// § Capability Transfer in IPC and § Move.
 ///
 /// On success, writes the destination cap handles to `dst_handles_out` and
 /// returns the number of caps transferred. The caller is responsible for
@@ -565,7 +555,9 @@ pub fn sys_ipc_call(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     }
 
     // Populate cap_slots in the message (the caller's full cap handles).
-    // The actual cap move happens in sys_ipc_recv after delivery.
+    // The cap move runs after rendezvous: in `deliver_call_caps` below when a
+    // server was already waiting, or in `sys_ipc_recv`'s immediate-delivery
+    // path when this caller queues on the send queue.
     if cap_count > 0
     {
         let handles = syscall::unpack_cap_handles(cap_packed_lo, cap_packed_hi, cap_count);
@@ -581,7 +573,11 @@ pub fn sys_ipc_call(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // SAFETY: tcb is the running caller.
     unsafe { open_call_episode(tcb) };
 
-    // SAFETY: ep_state is valid; scheduler lock not held.
+    // SAFETY: ep_state was a live Endpoint at lookup, but `lookup_cap` takes
+    // no reference, so the endpoint is not pinned across endpoint_call
+    // (core/kernel/docs/capability-internals.md § Storage: Hybrid Two-Level
+    // Radix, #443); tcb is the running thread (current_tcb above); no
+    // scheduler lock and no ep.lock held.
     let result = unsafe {
         crate::ipc::endpoint::endpoint_call(
             ep_state,
@@ -634,7 +630,8 @@ pub fn sys_ipc_call(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     let reply_label = unsafe { (*tcb).ipc_msg.label };
     // SAFETY: tcb still valid; ipc_msg.data_count set by replier.
     let reply_count = unsafe { (*tcb).ipc_msg.data_count };
-    // SAFETY: tcb still valid; ipc_buffer is immutable after thread creation.
+    // SAFETY: tcb still valid; ipc_buffer is written only by this thread's own
+    // SYS_IPC_BUFFER_SET, so it cannot change during this syscall.
     let reply_buf = unsafe { (*tcb).ipc_buffer };
 
     if reply_count > 0
@@ -738,13 +735,12 @@ pub fn sys_ipc_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // Pre-allocate server's CSpace for the worst-case incoming cap_count
     // (`MSG_CAP_SLOTS_MAX`) before either delivery path can transition any
-    // IPC state. `endpoint_recv` flips the caller from BlockedOnSend to
-    // BlockedOnReply on the immediate-delivery path; a later cap-transfer
-    // OOM would leave the caller stuck in BlockedOnReply with no message
-    // ever reaching the server. By pre-growing the destination here, the
-    // immediate-delivery cap transfer cannot OOM, and the resumed-recv path
-    // gets the same guarantee modulo the existing race window covered by
-    // `transfer_caps`'s inner pre_allocate.
+    // IPC state. A cap-transfer failure on either path degrades to zero-cap
+    // delivery (the sender keeps its caps), so pre-growing the destination
+    // here keeps OOM from silently dropping a message's caps: the
+    // immediate-delivery transfer cannot OOM, and the resumed-recv path
+    // (`deliver_call_caps`) gets the same guarantee modulo the window in which
+    // `transfer_caps`'s locked pre_allocate can still fail.
     // SAFETY: cspace_ptr validated above; lock_raw/unlock_raw paired.
     unsafe {
         let saved = (*cspace_ptr).lock.lock_raw();
@@ -761,8 +757,11 @@ pub fn sys_ipc_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // SAFETY: tcb is the running caller, not yet claimable.
     unsafe { crate::sched::thread::open_park_episode(tcb) };
 
-    // SAFETY: ep_state extracted from validated Endpoint object; tcb is the
-    // running thread (current_tcb above); no scheduler lock and no ep.lock held.
+    // SAFETY: ep_state was a live Endpoint at lookup, but `lookup_cap` takes
+    // no reference, so the endpoint is not pinned across endpoint_recv
+    // (core/kernel/docs/capability-internals.md § Storage: Hybrid Two-Level
+    // Radix, #443); tcb is the running thread (current_tcb above); no
+    // scheduler lock and no ep.lock held.
     let result = unsafe { crate::ipc::endpoint::endpoint_recv(ep_state, tcb) };
 
     if let Ok((caller, msg)) = result
@@ -847,7 +846,8 @@ pub fn sys_ipc_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // of `sys_ipc_call`.
     // SAFETY: tcb validated above; ipc_msg populated by endpoint_call on wakeup.
     let msg = unsafe { (*tcb).ipc_msg };
-    // SAFETY: tcb validated above; ipc_buffer is immutable.
+    // SAFETY: tcb validated above; ipc_buffer is written only by this thread's
+    // own SYS_IPC_BUFFER_SET, so it cannot change during this syscall.
     let server_buf = unsafe { (*tcb).ipc_buffer };
 
     // Always write the cap_count word (including the zero-cap case) so a prior
@@ -1021,23 +1021,21 @@ pub fn sys_ipc_reply(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             msg.cap_slots = handles;
             msg.cap_count = cap_count;
 
-            // Pre-allocate caller's CSpace destination slots before transitioning
-            // its state. `endpoint_reply` atomically moves the caller from
-            // BlockedOnReply to Ready and clears (*server).reply_tcb; if cap
-            // transfer were to fail after that, the caller would be Ready but
-            // never enqueued and unreachable by cancel_ipc_block. Pre-allocating
-            // here guarantees the post-`endpoint_reply` cap move cannot OOM;
-            // `transfer_caps` pre-allocates again under the locks it moves
-            // under, so a slot consumed meanwhile is still covered. The
-            // caller is parked and holds no reference on its CSpace, so it is
-            // resolved through the registry under DERIVATION_LOCK (see
-            // `transfer_caps`) rather than dereferenced from the TCB.
+            // Pre-allocate the caller's CSpace destination slots before claiming it.
+            // `endpoint_reply` claims and clears `(*server).reply_tcb` by CAS; after
+            // that claim no canceller can reach the caller, so a cap-transfer failure
+            // after it must wake the caller with the synthetic transfer-failed reply
+            // (below). Pre-allocating here keeps OOM out of that post-claim transfer;
+            // `transfer_caps` pre-allocates again under the locks it moves under, so a
+            // slot consumed meanwhile is still caught. The caller's CSpace is resolved
+            // through the registry (core/kernel/docs/capability-internals.md § Move).
             // SAFETY: tcb validated above; reply_tcb field always valid in TCB.
             let caller_peek =
                 unsafe { (*tcb).reply_tcb.load(core::sync::atomic::Ordering::Acquire) };
             if caller_peek.is_null()
             {
-                // No parked caller (cancelled by SYS_THREAD_STOP); nothing to wake.
+                // No caller is bound (none pending, or a canceller already claimed it);
+                // nothing to wake.
                 return Err(SyscallError::InvalidCapability);
             }
             // SAFETY: caller_peek non-null; magic check flags UAF in debug builds.
@@ -1081,7 +1079,8 @@ pub fn sys_ipc_reply(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         }
     }
 
-    // SAFETY: tcb validated above; endpoint_reply operates on reply_tcb field.
+    // SAFETY: tcb is the calling thread's valid TCB (current_tcb above); no
+    // scheduler or endpoint lock is held here.
     let result = unsafe { crate::ipc::endpoint::endpoint_reply(tcb, &msg) };
 
     match result
@@ -1310,7 +1309,7 @@ pub fn sys_notification_wait(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // `sig.waiter == tcb` first: a concurrent notification_send may have woken
     // us already; arming unconditionally would leave a stale entry that
     // hijacks a later unrelated notification_wait. See
-    // docs/thread-lifecycle-and-sleep.md § Sleep List Invariants rule 8.
+    // core/kernel/docs/thread-lifecycle-and-sleep.md § Sleep List Invariants rule 8.
     if timeout_ms != 0
     {
         let tps = crate::arch::current::timer::ticks_per_second();
@@ -1364,9 +1363,10 @@ pub fn sys_notification_wait(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         return Err(SyscallError::Interrupted);
     }
 
-    // On resume, either `notification_send` stored delivered bits in wakeup_value,
-    // or the timer path cleared wakeup_value to 0 (timeout). Both paths
-    // clear `sleep_deadline` as part of claiming the wake.
+    // On resume, `notification_send` stored delivered bits in wakeup_value,
+    // the timer path cleared it to 0 (timeout), or the Notification dealloc
+    // path woke us with 0 and no INTERRUPTED stamp (#443). All three clear
+    // `sleep_deadline` as part of claiming the wake.
     // SAFETY: tcb still valid after resume; wakeup_value set by the waker.
     let bits = unsafe { (*tcb).wakeup_value };
     // SAFETY: tcb validated above.
@@ -1385,8 +1385,7 @@ pub fn sys_notification_wait(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// arg1 = payload word to enqueue.
 ///
 /// Returns `SyscallError::QueueFull` if the queue is at capacity.
-/// Returns `SyscallError::InvalidArgument` if bits == 0 is not a constraint
-/// (any u64 payload including 0 is valid for event queues).
+/// Any `u64` payload, 0 included, is valid; there is no zero-payload check.
 #[cfg(not(test))]
 pub fn sys_event_post(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
@@ -1444,7 +1443,7 @@ pub fn sys_event_post(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 ///        - `0` blocks indefinitely until a post arrives.
 ///        - `u64::MAX` is non-blocking try-once: returns `WouldBlock`
 ///          immediately if the queue is empty. Never parks the caller —
-///          a pure peek under the queue lock via `event_queue_try_recv`;
+///          a single dequeue attempt under the queue lock via `event_queue_try_recv`;
 ///          the caller is never registered as a waiter and never enters
 ///          the scheduler.
 ///        - `1 .. u64::MAX-1` blocks until a post arrives or the timeout
@@ -1453,11 +1452,12 @@ pub fn sys_event_post(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 ///          mean "no payload available").
 ///
 /// On success returns `0` in rax/a0 and the payload in the secondary return
-/// register (rdx/a1). The disambiguation between "data wake" and "timer
-/// wake" uses `tcb.timed_out` rather than an in-band sentinel on
-/// `wakeup_value`, because event payloads may be any `u64` including 0
-/// (contrast `sys_notification_wait`, where `wakeup_value == 0` works because
-/// `notification_send` rejects zero-bit sends).
+/// register (rdx/a1). A timeout is told apart from a data wake by
+/// `tcb.timed_out`, not by an in-band `wakeup_value` sentinel. A queue
+/// destroyed while the caller is parked returns success with a payload of 0
+/// that was never posted (#443). See core/kernel/docs/syscalls.md
+/// § `SYS_EVENT_RECV` (6) for the contract and the contrast with
+/// `SYS_NOTIFICATION_WAIT`.
 #[cfg(not(test))]
 pub fn sys_event_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
@@ -1486,7 +1486,7 @@ pub fn sys_event_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         (*eq_obj).state
     };
 
-    // Non-blocking try-once: a pure ring peek under eq.lock. A non-blocking
+    // Non-blocking try-once: a single ring dequeue under eq.lock. A non-blocking
     // poll must never make the caller wakeable: no `eq.waiter` publish, no
     // `Blocked` commit, no `schedule()` (#352).
     if timeout_ms == u64::MAX
@@ -1522,7 +1522,7 @@ pub fn sys_event_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // through `schedule()` below). Arm the sleep timer for a bounded wait.
 
     // Bounded wait: arm the sleep-list timer. Same waiter-recheck rule as
-    // sys_notification_wait — see docs/thread-lifecycle-and-sleep.md
+    // sys_notification_wait — see core/kernel/docs/thread-lifecycle-and-sleep.md
     // § Sleep List Invariants rule 8.
     if timeout_ms != 0
     {
@@ -1577,9 +1577,10 @@ pub fn sys_event_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         return Err(SyscallError::Interrupted);
     }
 
-    // On resume, exactly one of two outcomes: `event_queue_post` stored a
-    // payload in `wakeup_value`, or the sleep-list timer arm set
-    // `timed_out = true`. Both paths clear `sleep_deadline`.
+    // On resume, `event_queue_post` stored a payload in `wakeup_value`, the
+    // sleep-list timer set `timed_out = true`, or `event_queue_drop` (queue
+    // destroyed) left `wakeup_value = 0` with `timed_out` false, which returns
+    // as a successful payload of 0 (#443). All three clear `sleep_deadline`.
     // SAFETY: tcb still valid after resume.
     let (payload, timed_out) = unsafe {
         let p = (*tcb).wakeup_value;
@@ -1609,10 +1610,10 @@ pub fn sys_event_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 ///
 /// Returns `SyscallError::InvalidArgument` if the wait set is full
 /// or the source is already registered in a wait set.
+#[cfg(not(test))]
 // too_many_lines: this function performs a single logical operation (cap resolution + wait set
 // registration) that requires dispatching over three source types; splitting it would
 // obscure the all-or-nothing atomicity contract.
-#[cfg(not(test))]
 #[allow(clippy::too_many_lines)]
 pub fn sys_wait_set_add(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
@@ -1732,13 +1733,13 @@ pub fn sys_wait_set_add(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // INNER — see WaitSetState::lock for the ordering rationale), the
     // back-pointer write, and the +1 inc_ref on the source's header must
     // all be atomic from the source's perspective. Otherwise notification_send
-    // / event_post / endpoint_call could read a partially-installed
+    // / event_queue_post / endpoint_call could read a partially-installed
     // back-pointer and call into waitset_notify with an unregistered
     // member, or skip the notify when the source is in fact ready.
     //
     // SAFETY: source_ptr extracted from validated cap; member_idx returned
-    // from waitset_add. Lock acquired and released for each branch; the
-    // helper closure cannot be used here because the source types differ
+    // from waitset_add. Lock acquired and released for each branch; a shared
+    // helper is not used because the source types differ
     // and the field accesses do not share a trait.
     let member_idx_result = unsafe {
         match source_tag
@@ -1844,6 +1845,9 @@ pub fn sys_wait_set_add(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// Clears the back-pointer on the source. Stale entries for the removed
 /// member are silently skipped by subsequent `SYS_WAIT_SET_WAIT` calls.
 #[cfg(not(test))]
+// too_many_lines: a single logical operation (cap resolution + wait set
+// unregistration) dispatched over three source types under each source's
+// lock; splitting it would separate the back-pointer clear from its dec_ref.
 #[allow(clippy::too_many_lines)]
 pub fn sys_wait_set_remove(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {

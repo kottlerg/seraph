@@ -5,17 +5,10 @@
 
 //! Forward-secure duplex PRNG over Keccak-f[1600].
 //!
-//! [`Prng`] is a sponge in duplex mode: [`Prng::absorb`] injects entropy by
-//! folding it into the rate and permuting; [`Prng::fill`] squeezes output and
-//! then erases it for forward secrecy. The 512-bit capacity (never output) is
-//! the perpetual secret that carries state forward, giving 256-bit security.
-//!
-//! Forward secrecy (fast key erasure): after squeezing, [`Prng::fill`] zeroes
-//! the just-exposed rate region and permutes once more. The permutation is
-//! invertible, so the extra permute alone would not hide the output — zeroing
-//! the rate first is what makes the returned bytes unrecoverable from the
-//! post-fill state. A later full-state compromise therefore cannot reproduce
-//! previously drawn bytes.
+//! [`Prng`] is a sponge in duplex mode: [`Prng::absorb`] injects entropy;
+//! [`Prng::fill`] squeezes output and then erases it (fast key erasure). The
+//! construction and its forward-secrecy argument are specified in
+//! [entropy.md](../../docs/entropy.md) § Keccak duplex construction.
 
 use super::keccak::{LANES, keccak_f1600};
 

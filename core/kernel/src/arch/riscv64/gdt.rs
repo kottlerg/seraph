@@ -12,8 +12,10 @@
 //! `tss_ptr` in `PerCpuData` is unused on RISC-V; this returns 0.
 
 /// I/O Permission Bitmap size. Zero on RISC-V (no I/O port space).
-// dead_code: IOPB_SIZE is used by x86_64 but not riscv64; it must exist here
-// to satisfy the shared arch interface without conditional compilation at call sites.
+// dead_code: part of the shared arch surface; on riscv64 `gdt::IOPB_SIZE`
+// is referenced only by `syscall::hw::sys_ioport_bind` (non-test builds,
+// unreachable past its `HAS_IO_PORTS` gate) and by the IOPB stub
+// signatures in this file.
 #[allow(dead_code)]
 pub const IOPB_SIZE: usize = 0;
 
@@ -27,7 +29,13 @@ pub fn bsp_tss_ptr() -> u64
 ///
 /// RISC-V has no GDT or TSS. This no-op exists so that `kernel_entry_ap`
 /// compiles unchanged on both x86-64 and RISC-V. All arguments are ignored.
+///
+/// # Safety
+/// No preconditions — the body is empty. The `unsafe` qualifier exists only to
+/// match the x86-64 surface signature.
 #[cfg(not(test))]
+// unused_variables: inert — every parameter is `_`-prefixed to mirror the x86-64
+// `gdt::init_ap` signature, so the lint does not fire (#438).
 #[allow(unused_variables)]
 pub unsafe fn init_ap(_cpu_id: u32, _rsp0: u64, _ist1_top: u64, _ist2_top: u64) {}
 

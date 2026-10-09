@@ -10,9 +10,10 @@
 //!   is mapped R/W- via 2 MiB large pages, so any physical address is
 //!   accessible as `direct_map_base() + phys`.
 //! - **Kernel image** at `BootInfo::kernel_virtual_base`, a KASLR-randomized
-//!   base in the top 2 GiB (`0xFFFF_FFFF_8000_0000` is the no-entropy
-//!   fallback; see `docs/memory-model.md`): `.text` as R-X, `.rodata` as R--,
-//!   `.data`+`.bss` as RW- (W^X enforced per section).
+//!   base in the top 2 GiB (`0xFFFF_FFFF_8000_0000`, the link base, when the
+//!   slide is 0; see core/boot/docs/boot-flow.md § Step 5d: Apply the KASLR
+//!   Slide): `.text` as R-X, `.rodata` as R--, `.data`+`.bss` as RW- (W^X
+//!   enforced per section).
 //!
 //! The boot stack's identity mapping is preserved so the CPU has a valid
 //! stack immediately after `activate`. The framebuffer and arch kernel MMIO
@@ -27,15 +28,17 @@
 //! allocated frame requires a virtual address — but the bootloader only
 //! identity-maps specific regions, not all RAM. To avoid this chicken-and-egg
 //! problem, a fixed array of [`BOOT_TABLE_POOL_SIZE`] × 4 KiB frames is placed
-//! in `.bss` (zeroed, no binary bloat). Their virtual addresses are known at
-//! compile time; their physical addresses are derived from the kernel VA/PA
-//! offset in [`BootInfo`].
+//! in `.bss` (zeroed, no binary bloat). It lies inside the kernel image the
+//! bootloader already mapped (at its KASLR-slid link address), so its virtual
+//! addresses are usable immediately; their physical addresses are derived from
+//! the kernel VA/PA offset in [`BootInfo`].
 //!
 //! 256 frames (1 MiB) supports direct-mapping ≈ 248 GiB of RAM. Systems that
 //! exceed this limit halt with a clear fatal message.
 
-// cast_possible_truncation: u64→usize page table index arithmetic; addresses bounded by canonical VA.
-// cast_lossless: u32→u64 widening in page count arithmetic.
+// cast_possible_truncation: u64→usize memory-map entry count; 64-bit targets
+// only, so the cast is exact.
+// cast_lossless: u32→u64 widening of the framebuffer stride × height byte count.
 // inline_always: phys_to_virt/virt_to_phys are called on every memory access path; always-inline
 //   avoids call overhead in these hot helpers.
 #![allow(
@@ -86,9 +89,10 @@ pub fn kernel_pml4_pa() -> u64
 /// Base virtual address of the direct physical map.
 ///
 /// Every physical address `phys` is accessible at `direct_map_base() + phys`
-/// after Phase 3 completes. The region starts at root entry 256 (the kernel
-/// half). Constant on x86-64; on riscv64 it is the active paging mode's
-/// kernel-half base, published at kernel entry — a single relaxed load.
+/// after Phase 3 completes. The base is a per-boot, KASLR-chosen, 1 GiB-aligned
+/// address at or above the paging mode's kernel-half floor, published once at
+/// kernel entry by `init_paging_mode`; reading it is a single relaxed load (see
+/// core/kernel/docs/memory-internals.md § Direct Physical Map Access).
 #[cfg(not(test))]
 #[inline(always)]
 pub fn direct_map_base() -> u64
@@ -96,7 +100,8 @@ pub fn direct_map_base() -> u64
     arch_paging::direct_map_base()
 }
 
-/// Test stub: the x86-64 / Sv48 base, matching the host-test default mode.
+/// Test stub: the 4-level / Sv48 kernel-half floor, matching the arch layers'
+/// host-test default for `DIRECT_MAP_BASE_VAL`.
 #[cfg(test)]
 #[inline(always)]
 pub fn direct_map_base() -> u64
@@ -132,7 +137,8 @@ pub enum PagingError
     /// Increase [`BOOT_TABLE_POOL_SIZE`] and rebuild, or reduce the amount of
     /// RAM being direct-mapped.
     OutOfFrames,
-    /// The target virtual address is not mapped (used by protect/unmap walks).
+    /// The target virtual address is not mapped (returned by the protect walk,
+    /// `AddressSpace::protect_page`).
     NotMapped,
 }
 
@@ -141,14 +147,15 @@ pub enum PagingError
 /// On x86-64, `readable` has no effect (all present pages are readable);
 /// it is included for cross-architecture symmetry with RISC-V which
 /// has an explicit R bit.
-// more_than_3_bools: PageFlags is a cross-arch PTE flag set; each bool is a distinct
+// struct_excessive_bools: PageFlags is a cross-arch PTE flag set; each bool is a distinct
 // architectural attribute. A bitfield enum would need extra decode logic at every call site.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Copy, Debug)]
 pub struct PageFlags
 {
     /// Page is readable (relevant on RISC-V; has no dedicated bit on x86-64).
-    // allow: x86-64 ignores this field; it is used by riscv64/paging.rs.
+    // allow: x86-64 ignores this field; it is read by
+    // core/kernel/src/arch/riscv64/paging.rs (`PageTableEntry::new_page`).
     #[allow(dead_code)]
     pub readable: bool,
     /// Page is writable.
@@ -167,11 +174,9 @@ pub struct PageFlags
 /// How a leaf-PTE rewrite changed an existing mapping, used to decide whether a
 /// cross-CPU TLB shootdown is required once the new PTE is committed.
 ///
-/// A remote CPU may hold a cached translation for the affected VA. Whether that
-/// stale entry can cause a *correctness* violation — versus at worst a
-/// re-walkable spurious fault the page-fault handler resolves against the live
-/// PTE — decides whether the synchronous shootdown can be elided. The arch
-/// mapping primitives classify the rewrite; `mm::address_space` acts on it.
+/// The arch mapping primitives classify the rewrite; `mm::address_space` acts on
+/// it. Which outcomes may elide the remote shootdown, and why, is defined in
+/// core/kernel/docs/memory-internals.md § SMP TLB Shootdown.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MapOutcome
 {
@@ -185,10 +190,9 @@ pub enum MapOutcome
     /// A prior mapping existed; the rewrite keeps the same frame and only
     /// *widens* permissions (new rights ⊇ prior).
     ///
-    /// A remote CPU's stale, narrower entry can at worst raise a spurious fault
-    /// on the newly-granted access; the handler re-walks the live PTE, sees the
-    /// access is now permitted, and retries. No remote shootdown is required;
-    /// the local flush still runs so the initiating CPU sees the new rights.
+    /// No remote shootdown is required (core/kernel/docs/memory-internals.md
+    /// § SMP TLB Shootdown); the local flush still runs so the initiating CPU sees
+    /// the new rights.
     Widen,
     /// A prior mapping existed and the rewrite can leave a *dangerous* stale
     /// entry on a remote CPU — a different frame (use-after-free / stale data)
@@ -259,8 +263,8 @@ impl PoolState
     /// Pool physical base is derived from `BOOT_TABLE_POOL`'s virtual address
     /// and the kernel VA/PA offset supplied by the bootloader.
     ///
-    /// # Safety
-    /// Must be called from a single-threaded context (boot, before SMP).
+    /// Call once, during single-threaded boot: every `PoolState` built from
+    /// `BootInfo` starts at frame 0 and hands out the same `BOOT_TABLE_POOL` frames.
     // similar_names: pool_va_base and pool_pa_base are the VA and PA of the same pool region.
     #[cfg(not(test))]
     #[allow(clippy::similar_names)]
@@ -338,9 +342,11 @@ impl PoolState
 /// physical addresses can be in the hundreds-of-GiB range, which would
 /// require far more page table frames than the boot pool provides.
 ///
-/// MMIO ranges above the RAM ceiling are mapped on demand by device drivers
-/// in later phases. The framebuffer, if it falls above this ceiling, is
-/// handled separately by `map_framebuffer_if_needed`.
+/// Kernel-internal MMIO above the RAM ceiling and a framebuffer above it are
+/// mapped separately by `init_kernel_page_tables` (the arch
+/// `collect_mmio_direct_map_regions` set) and `map_framebuffer_if_needed`;
+/// device MMIO reaches userspace drivers as MMIO capabilities
+/// (docs/device-management.md), never through the direct map.
 ///
 /// Returns 0 if the map contains no RAM entries.
 pub fn compute_max_physical_address(info: &BootInfo) -> u64
@@ -380,8 +386,9 @@ unsafe extern "C" {
 /// - Kernel sections are mapped with W^X permissions.
 /// - The boot stack remains accessible at its current virtual address.
 ///
-/// `_alloc` is reserved for future phases that will allocate kernel objects
-/// from the buddy allocator after page tables are active.
+/// `_alloc` is unused: every frame this function needs comes from the static
+/// boot pool ([`BOOT_TABLE_POOL_SIZE`]); later phases reach the buddy
+/// allocator through their own handles.
 ///
 /// # Errors
 /// `PagingError::OutOfFrames` if the 256-frame BSS pool is exhausted.
@@ -429,13 +436,11 @@ pub fn init_kernel_page_tables(
     let max_phys_rounded = (max_phys + LARGE_PAGE_SIZE - 1) & !(LARGE_PAGE_SIZE - 1);
 
     let dm_base = direct_map_base();
-    // Everything this function maps at `dm_base + phys` — RAM, a high
-    // framebuffer, the kernel MMIO windows — must end at or below the
-    // kernel image base. The shared ceiling keeps this guard on the same
-    // arithmetic the bootloader's KASLR window selection and the Phase-0
-    // validator use; the margin is mode-dependent — under Sv39 the kernel
-    // half is 256 GiB total — so fail with a diagnostic rather than
-    // silently overlapping the image mapping.
+    // Re-check, on the shared `boot_protocol::direct_map_ceiling`, that the
+    // direct map ends at or below the kernel image base; fail with a diagnostic
+    // rather than overlap the image mapping (core/kernel/docs/initialization.md
+    // § Phase 3: Kernel Page Tables; Sv39 margin: docs/memory-model.md § RISC-V
+    // (Sv39 / Sv48 / Sv57)).
     {
         // SAFETY: Phase 0 validated the memory map; identity-mapped at this
         // point (pre-activate).
@@ -480,9 +485,10 @@ pub fn init_kernel_page_tables(
 
     // ── Architecture-specific MMIO regions ────────────────────────────────────
     // Ask the arch layer which kernel-internal MMIO regions need to be mapped
-    // (xAPIC + I/O APIC bases on x86-64; nothing on RISC-V where PLIC/UART live
-    // inside the RAM range). Bases come from `BootInfo.kernel_mmio` directly
-    // because the per-CPU cache is not yet populated at Phase 3.
+    // (xAPIC + I/O APIC bases on x86-64; nothing on RISC-V, where the PLIC and
+    // UART sit below the RAM ceiling and are covered by the large-page direct
+    // map). Bases come from `BootInfo.kernel_mmio` directly because
+    // `crate::platform::capture_kernel_mmio` does not run until Phase 4.
     let mut mmio_regions = [(0u64, 0u64); 16];
     let mmio_count = crate::arch::current::platform::collect_mmio_direct_map_regions(
         &info.kernel_mmio,
@@ -515,8 +521,9 @@ pub fn init_kernel_page_tables(
     // Map the AP trampoline page at its physical address as a 4 KiB identity
     // page (VA = PA). Both arches need this: on x86-64 the AP enables paging
     // (writes CR3 = kernel PML4) during the PM32 → LM64 transition and must
-    // keep fetching trampoline instructions at their PA before the first far
-    // jmp to a kernel-VA target; on RISC-V the trampoline executes
+    // keep fetching trampoline instructions at their PA through the LM64 relay
+    // stub until its `jmp rax` reaches the kernel-VA entry; on RISC-V the
+    // trampoline executes
     // `csrw satp` and the next instructions (sfence.vma, mv sp, jr) likewise
     // execute at the trampoline PA before the final `jr` lands at
     // `kernel_entry_ap`'s kernel virtual address.
@@ -752,7 +759,9 @@ mod tests
     /// Valid only while `entries` is live in the caller's scope.
     fn boot_info_with_map(entries: &[MemoryMapEntry]) -> BootInfo
     {
-        // SAFETY: entries is valid for the duration of the test scope.
+        // SAFETY: every BootInfo field is an integer, a raw pointer, or a fieldless
+        // enum with a 0 discriminant (`SegmentFlags::Read`, `PixelFormat::Rgbx8`), so
+        // the all-zero bit pattern is a valid BootInfo; `entries` outlives `info`.
         let mut info = unsafe { core::mem::zeroed::<BootInfo>() };
         info.memory_map = MemoryMapSlice {
             entries: entries.as_ptr(),
@@ -812,9 +821,9 @@ mod tests
     }
 
     /// `Reserved` entries (e.g. 64-bit PCIe MMIO windows reported by UEFI
-    /// firmware) must not inflate `max_phys`, otherwise the frame allocator
-    /// sizes its bitmap for an aperture that holds no usable RAM and
-    /// exhausts the metadata pool.
+    /// firmware) must not inflate `max_phys`, otherwise Phase 3 would direct-map
+    /// the aperture with 2 MiB pages and exhaust the boot page-table pool
+    /// ([`BOOT_TABLE_POOL_SIZE`]).
     #[test]
     fn max_phys_reserved_entries_are_excluded()
     {

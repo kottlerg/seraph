@@ -75,13 +75,15 @@ pub fn ioapics_into(out: &mut [IoApicEntry]) -> &[IoApicEntry]
     &out[..n]
 }
 
-/// UART physical base for Phase 1 console init.
+/// UART physical base passed to `serial_init` by `crate::console::init`
+/// (Phase 1).
 ///
 /// x86-64 console uses the COM1 I/O port (`0x3F8`), not MMIO, so this always
-/// returns 0. Present for symmetry with the RISC-V variant; the top-level
-/// console module dispatches on the result to decide whether `rebase_serial`
-/// is meaningful.
-#[allow(clippy::trivially_copy_pass_by_ref)] // Symmetry with riscv64.
+/// returns 0 and the x86-64 `serial_init` ignores it. Present for symmetry
+/// with the RISC-V variant.
+// Takes `&KernelMmio` to match the riscv64 `uart_base_for_boot_info` that
+// `crate::console::init` calls on both architectures.
+#[allow(clippy::trivially_copy_pass_by_ref)]
 #[must_use]
 pub fn uart_base_for_boot_info(_km: &KernelMmio) -> u64
 {
@@ -146,7 +148,8 @@ mod tests
     #[test]
     fn ioapics_into_synthesises_default_when_empty()
     {
-        // This test would need a way to set the kernel_mmio cache. Skip
-        // since the cache is process-global and other tests touch it.
+        // Empty: asserts nothing and does not cover `ioapics_into`'s fallback
+        // (#438). No host test writes `KERNEL_MMIO_CELL`; `kernel_mmio()` reads
+        // `KernelMmio::zero()` here.
     }
 }

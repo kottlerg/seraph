@@ -31,8 +31,8 @@ use syscall::SyscallError;
 ///   1. under `DERIVATION_LOCK`, revalidates the original, inserts both
 ///      children into the caller's `CSpace` (`cspace.lock` nested) and links
 ///      each under the original's derivation parent — in the same hold, so
-///      no child is ever reachable but unlinked (a sibling's `SYS_CAP_MOVE`
-///      would carry an unlinked child out of the grantor's revoke reach);
+///      no child is ever reachable but unlinked (see
+///      `core/kernel/docs/capability-internals.md` § Revocation Algorithm);
 ///      either insert failing rolls back (a body is deallocated only once
 ///      nothing references it);
 ///   2. reparents the original's children to that parent in
@@ -43,23 +43,15 @@ use syscall::SyscallError;
 ///   3. frees the original slot and drops its object reference.
 ///
 /// The original was looked up without the derivation lock, so it is
-/// revalidated under the lock before every batch and before it is consumed:
-/// the slot must still hold `orig_obj_ptr` under `tag` with the handle's
-/// generation and no revoke in flight. Otherwise a sibling thread deleted
-/// (or deleted and recycled) it meanwhile; consuming the slot would then free
-/// an unrelated cap and release the original's object twice, so the split
-/// rolls both children back and fails with `InvalidState`. A concurrent
-/// deriver extending the original's child list faster than one batch per
-/// hold trips the `MAX_REPARENT_BATCHES` backstop (`Interrupted`, children
-/// rolled back). On either failure the original's children that earlier
-/// batches already moved stay under its parent, so the surviving original
-/// no longer holds revoke authority over them (`syscalls.md`,
-/// `SYS_MMIO_SPLIT`).
+/// revalidated under the lock (`Original::revalidate`) before every batch and
+/// before it is consumed. The failure semantics (`InvalidState`,
+/// `Interrupted`, and the children earlier batches already moved) are defined
+/// in `core/kernel/docs/syscalls.md` § `SYS_MMIO_SPLIT` and
+/// `core/kernel/docs/capability-internals.md` § Revocation Algorithm.
 ///
 /// Returns the two encoded child handles `(handle1, handle2)` (generation +
-/// index each), captured under the insert's own `cspace.lock` hold so a
-/// child deleted and its slot refilled by a sibling before the split returns
-/// yields a handle that no longer resolves, never a handle to the refill.
+/// index each), minted under the insert's own `cspace.lock` hold (see
+/// `core/kernel/docs/capability-internals.md` § Revocation Algorithm).
 /// The caller delivers `handle1` in the primary return register and
 /// `handle2` in the secondary — never packed into one word, so a high
 /// generation cannot set the sign bit of an `i64` return (#349).
@@ -159,9 +151,9 @@ pub(crate) unsafe fn install_split_children(
             Revalidated::Live { parent: p } => parent = p,
             Revalidated::Gone =>
             {
-                // Deleted, recycled, or under revoke meanwhile: consuming
-                // the slot would free an unrelated cap and release the
-                // original's object twice.
+                // Deleted or recycled meanwhile (consuming the slot would free an
+                // unrelated cap and release the original's object twice), or pinned
+                // by a revoke or move in flight (see `CapabilitySlot::pinned`).
                 // SAFETY: as above.
                 unsafe { rollback_children(caller_cspace, cspace_id, child1, child2) };
                 return Err(SyscallError::InvalidState);
@@ -177,7 +169,8 @@ pub(crate) unsafe fn install_split_children(
     // would let a concurrent derive re-link a child under the
     // still-handle-valid original, stranding it as a dangling parent link.
     // SAFETY: caller_cspace validated; orig_idx within CSpace bounds;
-    // cspace.lock nests inside DERIVATION_LOCK per the documented order.
+    // cspace.lock nests inside DERIVATION_LOCK
+    // (core/kernel/docs/scheduling-internals.md § Lock Hierarchy).
     unsafe {
         let saved = (*caller_cspace).lock.lock_raw();
         (*caller_cspace).free_slot(orig_idx);
@@ -194,11 +187,9 @@ pub(crate) unsafe fn install_split_children(
         unsafe { dealloc_object(orig_obj_ptr) };
     }
 
-    // Both handles were minted under the insert's lock hold (#349), so a
-    // child a sibling deleted meanwhile yields a handle that no longer
-    // resolves, exactly as if it had been deleted after the split returned;
-    // re-reading the slot here could instead hand back a live handle to
-    // whatever cap now occupies the recycled slot.
+    // Return the handles minted under the insert's lock hold (#349), never a
+    // re-read of the slot (core/kernel/docs/capability-internals.md
+    // § Revocation Algorithm).
     Ok((child1.handle, child2.handle))
 }
 
@@ -216,7 +207,8 @@ struct Original
 #[derive(Clone, Copy)]
 enum Revalidated
 {
-    /// Deleted, recycled, or under revoke since the lookup.
+    /// Deleted, recycled, or pinned by a revoke or move in flight since the
+    /// lookup (`CapabilitySlot::pinned`).
     Gone,
     /// Still the cap that was looked up; its derivation parent (`None` for
     /// a root).
@@ -229,7 +221,7 @@ enum Revalidated
 impl Original
 {
     /// Whether `cspace`'s slot still holds this cap under the looked-up
-    /// generation with no revoke in flight.
+    /// generation with no revoke or move in flight (`CapabilitySlot::pinned`).
     ///
     /// # Safety
     ///
@@ -385,7 +377,7 @@ impl InsertedChild
 /// `child1_ptr`/`child2_ptr` must be freshly-allocated refcount-1 bodies of
 /// tag `tag` not yet inserted anywhere. Caller must hold `DERIVATION_LOCK`
 /// write lock: the slot1 rollback runs under it, and `cspace.lock` nests
-/// inside it per the documented order.
+/// inside it (`core/kernel/docs/scheduling-internals.md` § Lock Hierarchy).
 unsafe fn insert_children(
     caller_cspace: *mut CSpace,
     cspace_id: CSpaceId,
@@ -428,7 +420,8 @@ unsafe fn insert_children(
     }
     .map_err(|e| {
         // Undo slot1: child1_ptr was inserted (reachable only via slot1);
-        // child2_ptr was passed to the failing insert_cap and never stored.
+        // child2_ptr was passed to the failing insert_cap_slot_and_handle and
+        // never stored.
         // SAFETY: caller_cspace validated; DERIVATION_LOCK held by the
         // caller, so the occupied-to-free transition stays atomic against
         // derivation-side occupancy gates (see `resolve_slot_mut`).
@@ -488,7 +481,8 @@ unsafe fn rollback_child(
     // SAFETY: DERIVATION_LOCK held.
     unsafe { unlink_node(child_id) };
     // SAFETY: caller_cspace validated; cspace.lock nests inside
-    // DERIVATION_LOCK per the documented order; lock_raw/unlock_raw paired.
+    // DERIVATION_LOCK (core/kernel/docs/scheduling-internals.md
+    // § Lock Hierarchy); lock_raw/unlock_raw paired.
     unsafe {
         let saved = (*caller_cspace).lock.lock_raw();
         (*caller_cspace).free_slot(slot.get());

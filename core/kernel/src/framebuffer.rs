@@ -12,9 +12,10 @@
 //! fallback → `U+FFFD`) is shared with the userspace driver through
 //! `shared/text::render_codepoint`.
 //!
-//! Userspace gains its own framebuffer driver at
-//! `services/drivers/framebuffer/`; this kernel renderer remains the
-//! early-boot / panic console fallback (see `docs/console-model.md`).
+//! Userspace has its own framebuffer driver at
+//! `services/drivers/framebuffer/`; this kernel renderer is retained for the
+//! life of the system and carries the mirrored `kprintln!` console (the panic
+//! path is serial-only); see `docs/console-model.md`.
 
 use boot_protocol::{FramebufferInfo, PixelFormat};
 use font::{GLYPH_HEIGHT, GLYPH_WIDTH};

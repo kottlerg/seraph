@@ -6,7 +6,7 @@
 //! RISC-V 64-bit trap frame — full user-mode register snapshot.
 //!
 //! [`TrapFrame`] is saved/restored by the supervisor trap handler on every
-//! U-mode → S-mode transition (ecall, exception, or timer interrupt).
+//! U-mode → S-mode transition (ecall, exception, or interrupt).
 //!
 //! ## Layout (280 bytes)
 //!
@@ -18,12 +18,8 @@
 //!
 //! ## RISC-V ecall argument mapping
 //!
-//! | Field | Role when used as ecall  |
-//! |-------|--------------------------|
-//! | `a7`  | Syscall number           |
-//! | `a0`  | Argument 0; return value |
-//! | `a1`  | Argument 1               |
-//! | `a2`–`a5` | Arguments 2–5       |
+//! The ecall register roles are defined in `core/kernel/docs/syscalls.md`
+//! § Calling Convention (RISC-V); the accessors below implement them.
 
 /// Full user-mode register snapshot for RISC-V 64-bit.
 ///
@@ -93,8 +89,8 @@ impl TrapFrame
     /// Write the primary syscall return value (a0).
     pub fn set_return(&mut self, val: i64)
     {
-        // cast_sign_loss: intentional — negative error codes are sign-extended
-        // in the i64 return value and must be reinterpreted as u64 by the caller.
+        // Negative error codes are stored as their two's-complement bit pattern;
+        // userspace reads `a0` back as i64.
         self.a0 = val.cast_unsigned();
     }
 
@@ -171,7 +167,8 @@ impl TrapFrame
 
     /// Set the thread-local-storage pointer (`tp`, x4) in the frame.
     ///
-    /// `return_to_user` restores `tp` from this field on every U-mode entry,
+    /// `return_to_user` and the `trap_entry` U-mode return path both restore `tp`
+    /// from this field on every U-mode entry,
     /// so this is the canonical per-thread TLS storage on RISC-V. Pass 0 for
     /// a thread that does not use TLS.
     pub fn set_tls_base(&mut self, tls_base: u64)
@@ -188,7 +185,9 @@ impl TrapFrame
 
     /// Validate and sanitize a user-supplied register snapshot before it is
     /// resumed in user mode: reject a non-user `sepc` and clear the
-    /// kernel-internal trap-cause fields.
+    /// kernel-internal trap-cause fields. `sstatus` is left as supplied, and
+    /// the `trap_entry` epilogue restores it, so a supplied SPP or SUM bit
+    /// reaches hardware when a fault-blocked thread resumes (#443).
     ///
     /// Returns `Err(())` if `sepc` is not a user address; the caller maps this
     /// to `SyscallError::InvalidArgument`.

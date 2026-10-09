@@ -15,19 +15,12 @@
 //!
 //! # Coherence model
 //!
-//! Two generation counters keep tagged TLBs coherent without flushing on every
-//! switch (see the `AddressSpace` field docs and `AddressSpace::activate`):
+//! Each claim stamps the claiming space's `tag_gen` with a unique `alloc_gen`, and each
+//! space's `tlb_gen` tracks its Replace-class rewrites. Together they keep tagged TLBs
+//! coherent without a per-switch flush, as defined in docs/memory-model.md § TLB
+//! Management (see also `AddressSpace::activate`).
 //!
-//! - `alloc_gen` is a global monotonic counter; each claim stamps the claiming
-//!   space's `tag_gen` with a unique value. A CPU records, per tag, the
-//!   `tag_gen` it last synced; when it loads a tag whose recorded `tag_gen`
-//!   differs, the tag was reissued to a different space and the CPU flushes it.
-//!   This is the cross-CPU invalidation-before-reissue guarantee.
-//! - `tlb_gen` (per space) is bumped on every unmap / permission-narrow; a CPU
-//!   that was switched away flushes the tag on reactivation if its synced value
-//!   lags.
-//!
-//! # Concurrency (INV-1 / INV-4)
+//! # Concurrency
 //!
 //! `AddressSpace.tag` is written only by the owner's own claim or by eviction,
 //! both under `TAG_POOL_LOCK`. While eviction holds the lock it is the *sole*
@@ -230,7 +223,7 @@ mod glue
     }
 
     /// Whether tagged TLBs are active. When `false`, `activate` uses the
-    /// full-flush fallback and behaves exactly as the untagged kernel did.
+    /// full-flush fallback on every address-space switch.
     #[inline]
     pub fn tagging_enabled() -> bool
     {
@@ -247,7 +240,8 @@ mod glue
     // ── Per-CPU tag state ───────────────────────────────────────────────────────
 
     /// Per-CPU, per-tag synchronisation record. Written only by the owning CPU
-    /// in its own `activate`, so plain (non-atomic) access is correct.
+    /// (in `AddressSpace::activate`, and on x86-64 in `first_entry_to_user`), so
+    /// plain (non-atomic) access is correct.
     #[repr(C)]
     pub struct TagState
     {
@@ -318,20 +312,17 @@ mod glue
     /// Call once on the BSP, before any AP runs a user thread. `hw_tags` is the
     /// hardware tag count (`1 << PCID/ASID width`), clamped to [`TAG_CAP`].
     ///
-    /// Tagging is enabled only when the **usable** tag count (`n - 1`; tag 0 is
-    /// reserved) strictly exceeds `cpu_count`. This is load-bearing for
-    /// correctness, not just efficiency: at most `cpu_count` tags are active at
-    /// any instant, so `usable > cpu_count` guarantees a free-or-inactive tag
-    /// always exists and [`claim`] never has to run a user space untagged. A
-    /// user space under tag 0 while another CPU runs it under a real tag would
-    /// mix tags across the space and miss a shootdown. Where the hardware tag
-    /// field is too narrow (e.g. a 1-bit RISC-V ASID), tagging stays disabled
-    /// and the full-flush fallback remains in effect.
+    /// Tagging is enabled only when the usable tag count (`n - 1`; tag 0 is
+    /// reserved) strictly exceeds `cpu_count`, so [`claim`] never runs a user space
+    /// untagged (core/kernel/docs/memory-internals.md § Context Switch TLB
+    /// Handling). Where the hardware tag field is too narrow (e.g. a 1-bit RISC-V
+    /// ASID), tagging stays disabled and the full-flush fallback remains in effect.
     ///
     /// # Safety
-    /// Must run once on the BSP after the frame allocator is live (Phase 5),
-    /// before any CPU performs a tagged activate. `allocator` must be the live
-    /// frame allocator (exclusive access during this call).
+    /// Must run once on the BSP during Phase 5 (core/kernel/docs/initialization.md
+    /// § Phase 5: Architecture Hardware Initialisation), before any CPU performs a
+    /// tagged activate. `allocator` must be the live frame allocator (exclusive
+    /// access during this call).
     pub unsafe fn enable(
         hw_tags: usize,
         cpu_count: usize,
@@ -399,14 +390,12 @@ mod glue
             }
 
             // Pool full: evict the least-recently-claimed space whose tag is not
-            // currently active on any CPU (INV-4). The enablement gate keeps the
-            // usable tag count strictly above `cpu_count`, and active spaces are
-            // bounded by the CPU count, so an inactive in-use tag always exists.
-            // claim therefore never returns 0 when tagging is enabled — no user
-            // space ever runs untagged. The outer loop retries the scan to ride
-            // out the transient case where a candidate activates between
-            // selection and the active check (the least-recently-claimed tag is
-            // almost always inactive, so the first pass succeeds in practice).
+            // currently active on any CPU. The enablement gate in [`enable`] guarantees
+            // such a tag exists (core/kernel/docs/memory-internals.md § Context Switch
+            // TLB Handling). The outer loop retries the scan to ride out a candidate
+            // activating between selection and the active check (the least-recently-
+            // claimed tag is almost always inactive, so the first pass succeeds in
+            // practice).
             let mut spins = 0u64;
             loop
             {
@@ -414,7 +403,7 @@ mod glue
                 while let Some((victim_tag, victim_at)) = pool.oldest_used_above(floor)
                 {
                     let victim = pool.owners[victim_tag as usize] as *const AddressSpace;
-                    // INV-1: under the pool lock we are the sole writer of any tag.
+                    // Under the pool lock this path is the sole writer of any space's `tag`.
                     // SAFETY: the victim is a live AddressSpace — its tag was
                     // claimed under this lock and free_tag() (called before the
                     // space is dropped) also takes this lock, so the pointer is
@@ -422,9 +411,10 @@ mod glue
                     unsafe {
                         (*victim).tag.store(0, Ordering::Release);
                     }
-                    // INV-3 eviction-race Dekker: the revoke (store) is ordered
-                    // before the active-mask read (load), pairing with activate's
-                    // fence.
+                    // Eviction-side half of the Dekker exclusion with `AddressSpace::activate`
+                    // (core/kernel/docs/memory-internals.md § Context Switch TLB Handling): the
+                    // revoke (store) is ordered before the active-mask read (load), pairing with
+                    // activate's fence.
                     core::sync::atomic::fence(Ordering::SeqCst);
                     // SAFETY: victim is a live AddressSpace (see above).
                     let active_empty = unsafe { (*victim).active_cpu_mask().is_empty() };
@@ -441,8 +431,8 @@ mod glue
                     }
 
                     // Victim is (or just became) active and may be running this
-                    // tag. Restore its claim (sole writer, INV-1) and try the
-                    // next-oldest. A transient tag-0 window on a *consistently*
+                    // tag. Restore its claim (this path is the sole writer under the pool lock)
+                    // and try the next-oldest. A transient tag-0 window on a *consistently*
                     // tagged active space is harmless: its shootdowns degrade to
                     // current-PCID invalidation, which is correct because all its
                     // active CPUs share the same loaded tag.

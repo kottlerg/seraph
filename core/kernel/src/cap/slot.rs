@@ -16,9 +16,8 @@
 //! [`CapabilitySlot::set_next_free`] / [`CapabilitySlot::next_free`] and
 //! [`CapabilitySlot::set_prev_free_link`] / [`CapabilitySlot::prev_free`]
 //! to encode/decode; do not read the fields directly on a free slot. The
-//! `epoch` field of the encoded `SlotId` is the free-list sentinel value
-//! `0` and MUST NOT appear in any live derivation link — derivation links
-//! carry the registry epoch that was current when they were stamped.
+//! encoded `SlotId` carries the free-list sentinel epoch `0` (see
+//! core/kernel/docs/capability-internals.md § Free Slot Tracking).
 //!
 //! ## Size derivation
 //!
@@ -45,21 +44,22 @@ pub type CSpaceId = u32;
 /// a valid derivation target. This gives `Option<SlotId>` the same 12-byte
 /// size as `SlotId` itself via niche optimization.
 ///
-/// `epoch` is the generation counter from the `CSpace` registry at the time
-/// this `SlotId` was stamped. Once `CSpaceId` recycling is enabled (see
-/// #137), `lookup_cspace` compares the stamped epoch to the registry's
-/// current epoch and fails fast on mismatch, so a stale `SlotId` referring
-/// to a freed `CSpace` cannot mis-target a recycled tenant. The reserved
-/// value `epoch == 0` is the free-list sentinel; it appears only in the
-/// intrusive next-free encoding stored in a `CapTag::Null` slot's
-/// `deriv_parent` and MUST NOT appear in any live derivation link.
+/// `epoch` is the `CSpace` registry epoch current when this `SlotId` was
+/// stamped. `lookup_cspace` compares it to the registry's current epoch and
+/// fails on mismatch, so a stale `SlotId` referring to a freed `CSpace`
+/// cannot mis-target a recycled id (see
+/// core/kernel/docs/capability-internals.md § Representation).
+///
+/// Epoch `0` is the free-list sentinel, carried by the intrusive
+/// next-free and previous-free encodings in a `CapTag::Null` slot (see
+/// core/kernel/docs/capability-internals.md § Free Slot Tracking).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SlotId
 {
     /// The `CSpace` this slot belongs to.
     pub cspace_id: CSpaceId,
-    /// Registry generation counter stamped at construction. Compared on
-    /// `lookup_cspace` once recycling is enabled.
+    /// Registry generation counter stamped at construction. Compared by
+    /// `lookup_cspace`.
     pub epoch: u32,
     /// Slot index within that `CSpace`. Never zero.
     pub index: NonZeroU32,
@@ -67,15 +67,11 @@ pub struct SlotId
 
 impl SlotId
 {
-    /// Construct a `SlotId` with epoch `0`.
+    /// Construct a `SlotId` with epoch `0`, the free-list sentinel.
     ///
-    /// Used by call sites that do not yet thread a real registry epoch
-    /// through. While `CSpaceId` recycling remains gated (no `free_cspace_id`
-    /// has run, so every live entry has epoch `1`+ when registered), every
-    /// site still works against a registry that ignores the supplied epoch
-    /// on `lookup_cspace`. Sites that need to stamp a `SlotId` with the
-    /// registry's current value should use [`Self::with_epoch`] together
-    /// with `cap::registry_epoch`.
+    /// No registry entry carries epoch `0`, so `lookup_cspace` never resolves
+    /// a `SlotId` built this way. Derivation-link sites use [`Self::current`]
+    /// or [`Self::with_epoch`] with `cap::registry_epoch`.
     ///
     /// Callers holding a raw `u32` must first convert via [`NonZeroU32::new`]
     /// and route the `None` case through their subsystem's error channel
@@ -108,8 +104,8 @@ impl SlotId
     /// Callers must hold a proof that the cspace is currently live (e.g.
     /// they just resolved a slot in it, or it is the caller's own cspace).
     /// If the registry has already retired this id, `registry_epoch`
-    /// returns the bumped value and the `SlotId` stamps with that — but
-    /// the caller's proof-of-life should make that case impossible.
+    /// returns the epoch `free_cspace_id` redrew, and the `SlotId` stamps with
+    /// that, but the caller's proof-of-life should make that case impossible.
     pub fn current(cspace_id: CSpaceId, index: NonZeroU32) -> Self
     {
         Self::with_epoch(cspace_id, crate::cap::registry_epoch(cspace_id), index)
@@ -123,8 +119,10 @@ impl SlotId
 /// `Null` means the slot is empty. All other variants correspond to a specific
 /// kernel object type with its own rights and operations.
 ///
-/// To add a new type: append a variant here and handle it in `cspace.rs`
-/// (`insert_cap`) and the relevant object creation path.
+/// To add a new type: append a variant here, define its rights space with
+/// `define_typed_rights!` below, and mint it from the relevant object
+/// creation path (`CSpace::insert_cap` in core/kernel/src/cap/cspace.rs stores
+/// any tag unchanged).
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CapTag
@@ -167,9 +165,11 @@ pub enum CapTag
 /// slot's `CapTag` selects which type's rights space interprets them (every
 /// type numbers its bits from 0 in its own full-width space). `Rights` itself
 /// names no bits — typed constants live on the per-type [`TypedRights`]
-/// aliases ([`MemRights`], [`EpRights`], …). Rights can only be attenuated
-/// (removed) during derivation, never added; the AND-mask attenuation is
-/// bitwise-uniform and needs no type dispatch.
+/// aliases ([`MemRights`], [`EpRights`], …).
+///
+/// Attenuation semantics are defined in docs/capability-model.md § Rights
+/// and Attenuation; the AND-mask attenuation is bitwise-uniform and needs
+/// no type dispatch.
 ///
 /// To add a new right: define its `u64` constant in `abi/syscall` (the single
 /// source of truth for bit values) and list it in the owning type's
@@ -351,12 +351,9 @@ define_typed_rights! {
         WRITE = syscall::RIGHTS_MEM_WRITE;
         /// Authority to create executable mappings from this memory.
         EXECUTE = syscall::RIGHTS_MEM_EXECUTE;
-        /// Authority to retype this Memory cap's region into kernel objects.
-        ///
-        /// Stamped on RAM Memory caps minted from the buddy allocator at boot
-        /// and on boot-module / init-segment caps (donated into memmgr's pool
-        /// at init's reap). Firmware-table Memory caps never hold this bit.
-        /// Every retype-consuming syscall requires it.
+        /// Authority to retype this Memory cap's region into kernel objects;
+        /// every retype-consuming syscall requires it. Which boot-minted caps
+        /// carry it is defined in docs/capability-model.md § Memory.
         RETYPE = syscall::RIGHTS_MEM_RETYPE;
     }
 }
@@ -492,14 +489,10 @@ define_typed_rights! {
     /// Rights-space marker for `SbiControl` capabilities.
     ///
     /// One right per sanctioned SBI extension (RISC-V only). `sys_sbi_call`
-    /// maps an extension ID to the right it requires; an extension with no
-    /// right here is absent from the vocabulary and can never be forwarded,
-    /// regardless of cap. Only the extensions the kernel manages internally
-    /// (TIME/IPI/RFENCE/HSM) are deliberately omitted — forwarding them would
-    /// break a kernel invariant (scheduling, TLB coherence, hart lifecycle).
-    /// Extensions that are merely undesirable for our userspace (DBCN, PMU)
-    /// are sanctioned here and withheld by cap distribution, not by the
-    /// kernel. See `docs/capability-model.md`.
+    /// maps an extension ID to the right it requires. Every extension without a
+    /// right here, including the ones the kernel manages internally, can never
+    /// be forwarded. The kernel floor and the distribution policy are defined in
+    /// docs/capability-model.md § `SbiControl` (RISC-V only).
     SbiControlCap, SbiRights, SbiControl
     {
         /// May forward the SBI System Reset (SRST) extension to firmware.
@@ -521,10 +514,9 @@ define_typed_rights! {
 
 /// Return `true` if `rights` has both `WRITE` and `EXECUTE` set.
 ///
-/// Used to enforce W^X at mapping time: no page may be simultaneously
-/// writable and executable. A capability may carry both WRITE and EXECUTE
-/// rights (representing independent authorities); this check applies when
-/// those rights are exercised on a specific mapping.
+/// Test-only predicate. The mapping paths (`sys_mem_map`, `sys_mem_protect`
+/// in core/kernel/src/syscall/mem.rs) enforce W^X inline and do not call it;
+/// the W^X rule is defined in docs/capability-model.md § Memory.
 #[cfg(test)]
 pub fn violates_wx(rights: Rights) -> bool
 {
@@ -556,11 +548,12 @@ pub fn violates_wx(rights: Rights) -> bool
 /// ```
 ///
 /// Each `Option<SlotId>` derivation pointer is 12 bytes (3 × u32, niche on
-/// `index: NonZeroU32`). Without explicit `pad`, `#[repr(C)]` would insert 2
-/// bytes before `rights` (to satisfy 4-byte alignment) and 6 bytes before
-/// `badge` (8-byte alignment); the 3-byte pad absorbs both gaps. The struct
-/// alignment is 8 (from `badge` and `object`); 72 is already a multiple of 8
-/// so no trailing pad is required.
+/// `index: NonZeroU32`). `#[repr(C)]` would insert 3 bytes of implicit
+/// padding after `tag` to align `rights` to offset 4; the explicit `pad`
+/// names those bytes so they can carry the free-list marker, the per-slot
+/// generation, and the in-flight pin. The struct alignment is 8 (from
+/// `badge` and `object`); 72 is already a multiple of 8, so no trailing pad
+/// is required.
 #[repr(C)]
 pub struct CapabilitySlot
 {
@@ -594,16 +587,20 @@ pub struct CapabilitySlot
     pub deriv_prev_sibling: Option<SlotId>,
 }
 
-// SAFETY: CapabilitySlot holds NonNull pointers to kernel objects. During boot
-// the kernel is single-threaded; after SMP, CSpace access is protected by the
-// CSpace lock. Marking Send+Sync enables use in statics.
+// SAFETY: CapabilitySlot holds NonNull pointers to kernel objects. Writers
+// are serialised by two lock domains: slot occupancy by the CSpace spinlock,
+// derivation links by DERIVATION_LOCK. `lookup_cap` and `cap_info` read slots
+// lock-free; the tag and generation checks narrow, but do not close, the race
+// against a concurrent free (#443; see core/kernel/docs/capability-internals.md
+// § Storage: Hybrid Two-Level Radix).
 unsafe impl Send for CapabilitySlot {}
-// SAFETY: CapabilitySlot is accessed only under CSpace lock; no Sync violation.
+// SAFETY: see the Send impl above; shared access follows the same lock domains
+// and the same unclosed lock-free-reader race (#443).
 unsafe impl Sync for CapabilitySlot {}
 
-// The 72-byte layout is a cross-boundary contract and is what makes 56 slots
-// fit a 4 KiB CSpacePage. The per-slot generation lives in the spare `pad[1]`
-// and must not grow the slot.
+// The 72-byte size is what lets `L2_SIZE` (56) slots fit a 4 KiB `CSpacePage`
+// (see core/kernel/docs/capability-internals.md § Representation). The
+// per-slot generation lives in the spare `pad[1]` and must not grow the slot.
 const _: () = assert!(core::mem::size_of::<CapabilitySlot>() == 72);
 
 /// Value stamped into `CapabilitySlot::pad[0]` while a Null slot is linked on a
@@ -688,18 +685,11 @@ impl CapabilitySlot
     /// `SYS_CAP_MOVE` / IPC capability transfer on its source and
     /// destination.
     ///
-    /// While set, `SYS_CAP_DELETE`, `SYS_CAP_MOVE`, `SYS_CAP_COPY`,
-    /// `SYS_CAP_DERIVE`, `SYS_CAP_DERIVE_BADGE`, the memory and range
-    /// splits, `SYS_MEMORY_MERGE`, a further `SYS_CAP_REVOKE`, and IPC
-    /// capability transfer refuse to act on the slot with `InvalidState`:
-    /// deleting or moving a revoke root between batches would promote its
-    /// temporarily hoisted survivors and permanently sever intermediate
-    /// revocation edges, and any of those operations on a slot mid-move
-    /// would tear the migration (see the revocation algorithm and § Move in
-    /// `capability-internals.md`). Read and written only under
-    /// `DERIVATION_LOCK`. A slot freed while pinned sheds the marker on the
-    /// free path — [`set_next_free`](Self::set_next_free) zeroes `pad[2]`
-    /// when threading the slot onto the free list.
+    /// The operations that refuse a pinned slot, and why, are defined in
+    /// core/kernel/docs/capability-internals.md § Revocation Algorithm and
+    /// § Move. Read and written only under `DERIVATION_LOCK`.
+    /// [`set_next_free`](Self::set_next_free) zeroes `pad[2]`, so a slot freed
+    /// while pinned does not carry the pin to its next occupant.
     pub fn pinned(&self) -> bool
     {
         self.pad[2] != 0
@@ -729,9 +719,8 @@ impl CapabilitySlot
     /// non-zero invariant is encoded in the argument type.
     ///
     /// `cspace_id` and `epoch` in the encoded `SlotId` are sentinel zeros —
-    /// the free-list reader only consults `index`. A live derivation link is
-    /// always stamped with the registry's non-zero epoch, so `epoch == 0`
-    /// unambiguously distinguishes the two encodings.
+    /// the free-list reader only consults `index` (see
+    /// core/kernel/docs/capability-internals.md § Free Slot Tracking).
     ///
     /// Stamps the [`FREE_LIST_MARKER`] into `pad[0]` so [`is_on_free_list`]
     /// can recognise this slot as a free-list member regardless of whether it
@@ -973,7 +962,8 @@ mod tests
         s.set_next_free(None);
         assert!(s.is_on_free_list());
 
-        // clear() (the allocate-on-pop path) drops the marker.
+        // clear() drops the marker (as does clear_keep_generation, the
+        // allocate-on-pop path).
         s.clear();
         assert!(!s.is_on_free_list());
     }

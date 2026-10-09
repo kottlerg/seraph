@@ -9,7 +9,8 @@
 //! - A 256-entry IDT in BSS.
 //! - Naked ISR stubs for exception vectors 0–31 (macro-generated).
 //! - Stubs for the APIC timer (vector 32) and spurious (vector 255).
-//! - A common exception handler that prints diagnostics and halts.
+//! - A common terminal exception path that kills the faulting thread
+//!   (userspace fault) or prints diagnostics and halts (kernel fault).
 //!
 //! Every ring-3 entry at which a thread can be stopped (exception, `#PF`, NMI,
 //! and ring-3 IRQ) builds the one canonical [`TrapFrame`] on the kernel stack via
@@ -25,12 +26,17 @@
 //! - Vector 2  (NMI):          IST2
 //!
 //! # Modification notes
-//! - To register a device IRQ: add a new stub (or reuse a range), call
-//!   `set_gate` with the target vector, and implement the handler function.
-//! - To change IST assignments: update the `IST` argument in the `isr_stub!`
-//!   invocation and ensure the matching IST stack is configured in the TSS.
+//! - To register a device IRQ: add a `device_irq_stub!` for the vector, install
+//!   it with `set(vector, stub, 0)` in `init()`, and extend the device range in
+//!   `irq_dispatch` to cover it.
+//! - To change IST assignments: change the `ist` argument of that vector's
+//!   `set(vector, stub, ist)` call in `init()` and ensure the matching IST stack
+//!   is configured in the TSS. (The `ist = ...` argument of `isr_stub!` is not
+//!   used by its expansion.)
 
-// cast_possible_truncation: usize→u16 IDT descriptor size calculations; bounded by descriptor count.
+// cast_possible_truncation: every narrowing cast here is bounded — the IDTR limit
+// (256 * 16 - 1 fits u16), the masked/shifted handler-offset splits in
+// `IdtEntry::new`, and the `33..=55` vector-to-GSI cast in `irq_dispatch`.
 #![allow(clippy::cast_possible_truncation)]
 
 use super::gdt::KERNEL_CS;
@@ -117,8 +123,8 @@ struct Idtr
 // exception/#PF/NMI, and ring-3 IRQ — lands on the one canonical `TrapFrame`
 // (the userspace register ABI). The fault redirect points `tcb->trap_frame` at
 // the live on-stack frame directly (symmetric with
-// riscv64/interrupts.rs::redirect_user_fault), so there is no second frame type
-// and no copy.
+// core/kernel/src/arch/riscv64/interrupts.rs::redirect_user_fault), so there is no
+// second frame type and no copy.
 //
 // The CPU + each stub leave a uniform stub frame on entry to a trampoline
 // (S = rsp at the trampoline label):
@@ -321,7 +327,7 @@ unsafe extern "C" fn common_exception_handler(
         {
             // Commit Exited under all-CPU scheduler.locks so a concurrent
             // dealloc observes a coherent state. See
-            // docs/thread-lifecycle-and-sleep.md § Lifecycle State Machine.
+            // core/kernel/docs/thread-lifecycle-and-sleep.md § Lifecycle State Machine.
             // The reason (EXIT_FAULT_BASE + vector; EXIT_FAULT_BASE = 0x1000,
             // matching syscall_abi::EXIT_FAULT_BASE) is written in the same
             // hold. A refusal means a teardown already committed
@@ -526,7 +532,7 @@ fn dump_x86_regs_console(f: &TrapFrame)
 /// Generate a naked ISR stub for `$vector`.
 ///
 /// If `$has_error_code` is `false`, the stub pushes a dummy 0 before the
-/// vector so the stack frame is uniform for `common_exception_handler`.
+/// vector so the stack frame is uniform for `common_exception_trampoline`.
 ///
 /// Stack on entry to the common handler (from RSP downward):
 /// ```text
@@ -597,7 +603,7 @@ unsafe extern "C" fn common_exception_trampoline()
 isr_stub!(isr0, 0, has_error_code = false, ist = 0);
 isr_stub!(isr1, 1, has_error_code = false, ist = 0);
 // NMI (vector 2) uses ipi_nmi_backtrace_stub instead of the generic
-// isr_stub! — see the dedicated stub above.
+// isr_stub! — see `ipi_nmi_backtrace_stub` below.
 isr_stub!(isr3, 3, has_error_code = false, ist = 0);
 isr_stub!(isr4, 4, has_error_code = false, ist = 0);
 isr_stub!(isr5, 5, has_error_code = false, ist = 0);
@@ -629,15 +635,13 @@ isr_stub!(isr29, 29, has_error_code = true, ist = 0);
 isr_stub!(isr30, 30, has_error_code = true, ist = 0);
 isr_stub!(isr31, 31, has_error_code = false, ist = 0);
 
-// ── Timer and spurious stubs ──────────────────────────────────────────────────
-
 // ── Shared IRQ trampoline ─────────────────────────────────────────────────────
 
 /// Route a device/timer/IPI interrupt by its IDT vector to the existing handler.
 ///
 /// Called from [`common_irq_trampoline`] with the stub-pushed vector. Each
 /// handler performs its own EOI; this only dispatches. The device range carries
-/// the GSI as `vector - 33` (the GSI indexes `IRQ_TABLE`; see `irq.rs`).
+/// the GSI as `vector - 33` (the GSI indexes `IRQ_TABLE`; see `core/kernel/src/irq.rs`).
 #[cfg(not(test))]
 extern "C" fn irq_dispatch(vector: u64)
 {
@@ -673,9 +677,9 @@ extern "C" fn irq_dispatch(vector: u64)
 ///   all GPRs are restored from the frame, not from the implicit call-chain
 ///   preservation.
 /// - **Ring-0 origin** (the kernel/idle was interrupted): the interrupted context
-///   carries no user state (any in-flight user state lives in the thread's syscall
-///   frame), so only caller-clobbered registers are saved, matching the legacy
-///   minimal path.
+///   carries no user state (any in-flight user state lives in the `TrapFrame`
+///   built at the thread's ring-3 entry), so only caller-clobbered registers are
+///   saved.
 ///
 /// Each stub enters via `push 0; push <vector>; jmp` — the two-word prologue keeps
 /// the `call` 16-byte aligned (identical parity to the exception stubs).
@@ -731,8 +735,9 @@ unsafe extern "C" fn common_irq_trampoline()
 /// `dispatch_device_irq` handles masking, notification delivery, and EOI.
 ///
 /// # Modification notes
-/// - To add more GSIs: `device_irq_stub!(isr_devN, 33+N)` then
-///   `set(33+N, isr_devN, 0)` in `init()`.
+/// - To add more GSIs: `device_irq_stub!(isr_devN, 33+N)`, then
+///   `set(33+N, isr_devN, 0)` in `init()`, then widen the `33..=55` device arm
+///   in `irq_dispatch` to include `33+N`.
 macro_rules! device_irq_stub {
     ($name:ident, $vector:literal) => {
         #[cfg(not(test))]
@@ -778,8 +783,9 @@ device_irq_stub!(isr_dev22, 55);
 ///
 /// Pushes the `placeholder + vector` prologue and jumps to
 /// [`common_irq_trampoline`], which (ring-3 origin) builds the [`TrapFrame`] and
-/// routes to `timer::timer_isr` via [`irq_dispatch`] — `timer_isr` increments the
-/// tick counter, sends EOI, and may preempt.
+/// routes to `timer::timer_isr` via [`irq_dispatch`] — `timer_isr` re-arms the
+/// TSC deadline (deadline mode), sends EOI, and calls `sched::timer_tick`, which
+/// may preempt.
 #[cfg(not(test))]
 #[unsafe(naked)]
 pub unsafe extern "C" fn isr_timer()
@@ -805,15 +811,9 @@ unsafe extern "C" fn isr_spurious()
 /// `#NM` (Device Not Available, vector 7) handler stub.
 ///
 /// `#NM` fires when CR0.TS = 1 and a user thread executes an x87/SSE/AVX
-/// instruction — the kernel's lazy-trap notification that this thread is about
-/// to touch extended state. The handler clears CR0.TS and returns; the
-/// trapping instruction is re-executed by hardware and proceeds normally.
-///
-/// In a later commit this handler additionally XRSTORs the thread's saved
-/// XSAVE area when the TCB's dirty flag is set; for now the area does not
-/// exist yet, so the trapping thread sees zeroed/FINIT-equivalent state.
-/// Today no kernel or userspace code emits FP/SIMD, so the handler is
-/// installed but dormant.
+/// instruction. The stub saves the caller-saved GPRs around a call to
+/// [`nm_handler`], which performs the lazy save/restore and ownership hand-off,
+/// and then `iretq`s, so hardware re-executes the trapping instruction.
 #[cfg(not(test))]
 #[unsafe(naked)]
 unsafe extern "C" fn isr_nm()
@@ -939,11 +939,12 @@ extern "C" fn nm_handler()
 ///
 /// Builds the canonical [`TrapFrame`] (`tf_build_asm`; the hardware already
 /// pushed the error code, this stub pushes the vector), calls
-/// [`page_fault_handler`], then — reached only when the fault was a resolved
-/// spurious stale-TLB fault — writes back the unmodified register state and
-/// `iretq`s (`tf_resume_asm`), re-executing the faulting instruction. For every
-/// genuine fault the handler diverges (`common_exception_handler` never returns)
-/// and the resume tail is dead.
+/// [`page_fault_handler`], then — reached when the fault was a resolved spurious
+/// stale-TLB fault, a userspace fault a bound handler resolved, or a kernel
+/// `copy_user` fault redirected to its fixup — writes back the (possibly edited)
+/// register state and `iretq`s (`tf_resume_asm`). For every terminal fault the
+/// handler diverges (`common_exception_handler` never returns) and the resume
+/// tail is dead.
 #[cfg(not(test))]
 #[unsafe(naked)]
 unsafe extern "C" fn isr_page_fault()
@@ -968,8 +969,10 @@ unsafe extern "C" fn isr_page_fault()
 /// access is a stale-TLB *spurious* fault — the live page tables already
 /// satisfy it (e.g. after a remote map/widen whose shootdown was elided). Such
 /// faults are resolved by a local `invlpg` and a return-to-retry; the stub's
-/// `iretq` re-executes the faulting instruction. Every other fault (genuine
-/// userspace fault, or any kernel fault) is handed to
+/// `iretq` re-executes the faulting instruction. A genuine userspace fault whose
+/// thread has a bound fault handler is redirected to it
+/// ([`redirect_user_page_fault`]); a kernel fault inside the `copy_user` region is
+/// redirected to its fixup. Every other fault is handed to
 /// [`common_exception_handler`], which never returns.
 #[cfg(not(test))]
 extern "C" fn page_fault_handler(tf: *mut TrapFrame, error_code: u64)
@@ -1033,9 +1036,9 @@ extern "C" fn page_fault_handler(tf: *mut TrapFrame, error_code: u64)
     // In-kernel user-copy fault recovery: a fault taken at CPL 0 whose RIP lies in
     // the `copy_user` faultable region is an unmapped or read-only user buffer.
     // Redirect to the fixup — which closes the SMAP window and returns an error
-    // sentinel — instead of panicking. Genuine userspace faults already returned
-    // above; their RIP is never inside the kernel copy region, so this is a no-op
-    // for them.
+    // sentinel — instead of panicking. A userspace fault that reaches here (no
+    // handler, or handler declined) has a RIP outside the kernel copy region, so
+    // this is a no-op for it.
     // SAFETY: tf is valid; rip is read-only here.
     if let Some(fixup) = super::cpu::user_copy_fixup(unsafe { (*tf).rip })
     {
@@ -1169,7 +1172,7 @@ fn normalize_x86_exception(vector: u64) -> u64
 /// descheduled. The handler's `SYS_THREAD_READ_REGS` / `SYS_THREAD_WRITE_REGS`
 /// see and edit the live frame; on resume the trampoline's `tf_resume_asm`
 /// writes any edits back into the iret frame. Symmetric with
-/// `riscv64/interrupts.rs::redirect_user_fault`.
+/// `core/kernel/src/arch/riscv64/interrupts.rs::redirect_user_fault`.
 ///
 /// # Safety
 /// `tcb` is the current user thread and has a bound handler; `frame` is the live

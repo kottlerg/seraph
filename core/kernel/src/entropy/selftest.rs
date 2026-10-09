@@ -9,9 +9,8 @@
 //! BSP during `init`, APs during AP entry). After SMP bringup the BSP runs the
 //! checks over the CPUs that captured: every sample is non-trivial, samples are
 //! pairwise distinct (per-CPU independence), and the aggregate bit balance is
-//! sane. The result is printed as `entropy: SELFTEST PASS`/`FAIL`; the FAIL
-//! marker is matched by the run-parallel fail-regex, so a broken RNG turns a
-//! QEMU run red on both architectures.
+//! sane. The result is printed as `entropy: SELFTEST PASS`/`FAIL`; how the FAIL
+//! marker gates a run is specified in `core/kernel/docs/entropy.md` § Testing.
 
 use core::sync::atomic::{AtomicPtr, Ordering};
 
@@ -20,9 +19,11 @@ use crate::mm::BuddyAllocator;
 /// Bytes captured per CPU.
 const SAMPLE: usize = 32;
 
-/// One CPU's self-test row. `captured` separates a CPU that came online and drew
-/// a sample from one that never did (e.g. an AP that failed to start, which boot
-/// tolerates): an uncaptured row is skipped, not scored as a failure.
+/// One CPU's self-test row. `captured` marks a row whose CPU drew its sample.
+/// Every CPU the boot reported captures before the BSP runs the checks (a CPU
+/// that cannot be started halts the boot; see
+/// `core/kernel/docs/initialization.md` § Phase 8), so an uncaptured row is a
+/// defensive case: it is skipped, not scored as a failure.
 #[repr(C)]
 struct Sample
 {
@@ -77,8 +78,9 @@ pub fn run(cpu_count: usize)
     // this barrier-ordered read.
     let samples = unsafe { core::slice::from_raw_parts(base, cpu_count) };
 
-    // Score only CPUs that came online and captured a sample; an uncaptured row
-    // (an AP that never started) is skipped rather than treated as a failure.
+    // Score only rows that captured a sample; an uncaptured row (defensive: every
+    // CPU the boot reported has captured by now, per Sample) is skipped rather
+    // than treated as a failure.
     let mut set_bits: u64 = 0;
     let mut online = 0usize;
     for (cpu, s) in samples.iter().enumerate()

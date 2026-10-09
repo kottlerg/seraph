@@ -5,9 +5,12 @@
 
 //! x86-64 four-level (PML4 → PDPT → PD → PT) page table operations.
 //!
-//! All page table frames must come from the BSS-resident pool supplied via
-//! [`PoolState`]. Physical addresses of pool frames convert to virtual
-//! addresses with the kernel VA/PA offset embedded in `PoolState`.
+//! [`map_page`] and [`map_large_page`] (kernel page-table construction) draw
+//! intermediate frames from the BSS-resident boot pool supplied via
+//! [`PoolState`], whose physical addresses convert to virtual addresses with
+//! the kernel VA/PA offset embedded in `PoolState`. The user-mapping functions
+//! draw them from `crate::mm::kernel_pt_pool` ([`map_user_page`]) or the
+//! address space's growth pool ([`map_user_page_pooled`]).
 //!
 //! # Index layout (48-bit canonical VA)
 //! - Bits \[47:39\] → PML4 index  (512 entries × 512 GiB each)
@@ -29,18 +32,20 @@ const PRESENT: u64 = 1 << 0;
 const WRITABLE: u64 = 1 << 1;
 /// Page Write-Through — used with PCD to select strong uncacheable memory type.
 const PWT: u64 = 1 << 3;
-/// Page Cache Disable — set to force uncacheable mapping (e.g., MMIO).
-/// When combined with PWT (UC-), or used alone per PAT, gives strong UC.
+/// Page Cache Disable — with PWT clear it selects UC- (PAT entry 2); combined
+/// with PWT it selects strong UC (PAT entry 3) under the power-on default PAT,
+/// which the kernel does not reprogram.
 const PCD: u64 = 1 << 4;
 /// Page Size (PS) — set in a PDE/PDPTE to make it a large-page leaf.
 const LARGE_PAGE: u64 = 1 << 7;
 /// No-Execute — blocks instruction fetch; requires `IA32_EFER.NXE` = 1.
 const NO_EXECUTE: u64 = 1 << 63;
-/// Software bit (AVL, ignored by hardware in every entry type) set in a
-/// table-pointer entry whose table frame came from the address space's own
-/// page-table pool (`user_walk_or_alloc_pooled`). A reclaiming unmap frees
-/// an empty table to that pool only when its parent entry carries this bit;
-/// tables from `kernel_pt_pool` (the kernel-direct `map_page` path) do not.
+/// Software bit (AVL, ignored by hardware in every entry type) that
+/// `user_walk_or_alloc_pooled` sets in a table-pointer entry whose table frame
+/// came from the address space's own page-table pool; `unmap_user_region_pooled`
+/// gates reclamation on it. See
+/// [memory-internals.md](../../../docs/memory-internals.md) § Page Table Node
+/// Ownership.
 const POOLED_TABLE: u64 = 1 << 9;
 /// Mask extracting the physical page number from bits \[51:12\].
 const PHYS_MASK: u64 = 0x000F_FFFF_FFFF_F000;
@@ -89,8 +94,9 @@ impl PageTableEntry
         }
         if flags.uncacheable
         {
-            // PCD|PWT selects the strong uncacheable (UC) memory type,
-            // regardless of PAT configuration. Required for MMIO mappings.
+            // PCD|PWT selects PAT entry 3, the strong uncacheable (UC) memory type
+            // under the power-on default PAT (the kernel does not reprogram
+            // IA32_PAT). Required for MMIO mappings.
             bits |= PCD | PWT;
         }
         Self(bits)
@@ -168,7 +174,9 @@ pub fn pt_index(va: u64) -> usize
 /// pool frame. No other mutable reference to the same frame may exist.
 unsafe fn table_at(frame_va: u64) -> &'static mut [PageTableEntry; 512]
 {
-    // SAFETY: frame_va is a valid direct-map VA; page table frame allocated and aligned.
+    // SAFETY: per the caller contract, frame_va is the VA (direct-map or boot-pool)
+    // of a valid, writable, 4 KiB-aligned page-table frame with no other live
+    // mutable reference.
     unsafe { &mut *(frame_va as *mut [PageTableEntry; 512]) }
 }
 
@@ -189,19 +197,23 @@ pub fn map_page(
     pool: &mut PoolState,
 ) -> Result<(), PagingError>
 {
-    // SAFETY: root_va is direct-map VA of valid user PML4; table entries validated before dereference.
+    // SAFETY: root_va is the boot-pool VA of the kernel PML4 under construction
+    // (caller's contract); child tables are reached only through present entries.
     let pml4 = unsafe { table_at(root_va) };
     let pdpt_pa = walk_or_alloc(&mut pml4[pml4_index(virt)], pool)?;
 
-    // SAFETY: direct map active; phys + DIRECT_MAP_BASE yields valid kernel VA.
+    // SAFETY: the entry is present and points at a boot-pool frame;
+    // PoolState::phys_to_virt yields its BSS-resident kernel VA.
     let pdpt = unsafe { table_at(pool.phys_to_virt(pdpt_pa)) };
     let pd_pa = walk_or_alloc(&mut pdpt[pdpt_index(virt)], pool)?;
 
-    // SAFETY: direct map active; phys + DIRECT_MAP_BASE yields valid kernel VA.
+    // SAFETY: the entry is present and points at a boot-pool frame;
+    // PoolState::phys_to_virt yields its BSS-resident kernel VA.
     let pd = unsafe { table_at(pool.phys_to_virt(pd_pa)) };
     let pt_pa = walk_or_alloc(&mut pd[pd_index(virt)], pool)?;
 
-    // SAFETY: direct map active; phys + DIRECT_MAP_BASE yields valid kernel VA.
+    // SAFETY: the entry is present and points at a boot-pool frame;
+    // PoolState::phys_to_virt yields its BSS-resident kernel VA.
     let pt = unsafe { table_at(pool.phys_to_virt(pt_pa)) };
     pt[pt_index(virt)] = PageTableEntry::new_page(phys, flags);
     Ok(())
@@ -222,15 +234,18 @@ pub fn map_large_page(
     pool: &mut PoolState,
 ) -> Result<(), PagingError>
 {
-    // SAFETY: root_va is direct-map VA of valid user PML4; table entries validated before dereference.
+    // SAFETY: root_va is the boot-pool VA of the kernel PML4 under construction
+    // (caller's contract); child tables are reached only through present entries.
     let pml4 = unsafe { table_at(root_va) };
     let pdpt_pa = walk_or_alloc(&mut pml4[pml4_index(virt)], pool)?;
 
-    // SAFETY: direct map active; phys + DIRECT_MAP_BASE yields valid kernel VA.
+    // SAFETY: the entry is present and points at a boot-pool frame;
+    // PoolState::phys_to_virt yields its BSS-resident kernel VA.
     let pdpt = unsafe { table_at(pool.phys_to_virt(pdpt_pa)) };
     let pd_pa = walk_or_alloc(&mut pdpt[pdpt_index(virt)], pool)?;
 
-    // SAFETY: direct map active; phys + DIRECT_MAP_BASE yields valid kernel VA.
+    // SAFETY: the entry is present and points at a boot-pool frame;
+    // PoolState::phys_to_virt yields its BSS-resident kernel VA.
     let pd = unsafe { table_at(pool.phys_to_virt(pd_pa)) };
     pd[pd_index(virt)] = PageTableEntry::new_large_page(phys, flags);
     Ok(())
@@ -257,9 +272,11 @@ fn walk_or_alloc(entry: &mut PageTableEntry, pool: &mut PoolState) -> Result<u64
 }
 
 // ── Hardware operations ───────────────────────────────────────────────────────
-// These functions use privileged instructions. They are excluded from unit
-// test builds (they compile fine on x86-64 hosts but must never be called
-// from user-space tests; the cfg gate prevents accidental invocation).
+// Most functions below use privileged instructions and are gated
+// `#[cfg(not(test))]` (with `#[cfg(test)]` stubs where host tests need the
+// symbol); the direct-map base accessors, `user_va_top`, and
+// `read_stack_pointer` also build in test builds and must not be called from
+// host tests that would execute their asm.
 
 /// Kernel-half floor: PML4 entry 256, the direct map's lowest legal base
 /// and its deterministic default when the bootloader does not randomize.
@@ -432,8 +449,10 @@ pub unsafe fn verify_paging_extensions() {}
 /// because bit 63 of a PTE is "reserved" when NXE = 0.
 ///
 /// # Safety
-/// Must execute at privilege level 0. Does not check CPUID; NX is mandatory
-/// on the x86_64-v3 baseline this kernel targets.
+/// Must execute at privilege level 0. Does not check CPUID: NX is a required
+/// feature gated by `cpu::verify_baseline` (see
+/// [platform-requirements.md](../../../../../docs/platform-requirements.md)
+/// § x86-64 Classification).
 #[cfg(not(test))]
 pub unsafe fn enable_nx()
 {
@@ -496,9 +515,8 @@ pub fn read_stack_pointer() -> u64
 /// into the caller (`kernel_entry`), it freely hoists any RSP-relative
 /// local-address materialisation (`lea reg, [rsp + imm]`) to *before*
 /// the rebase, producing a stale low-VA pointer the kernel page tables
-/// do not cover. The next dereference page-faults. The exact same
-/// hazard was hit on RISC-V in PR #138 (Phase 6 ktest fault); this
-/// arch had the same lying-options shape and is fixed pre-emptively.
+/// do not cover. The next dereference page-faults. riscv64's
+/// `rebase_boot_stack` has the same hazard and the same fix.
 ///
 /// `#[inline(never)]` is the fix: an opaque function call is an
 /// optimisation barrier the scheduler cannot move ops across, so every
@@ -618,9 +636,9 @@ fn user_walk_or_alloc(entry: &mut PageTableEntry) -> Result<u64, ()>
 /// an `AddressSpaceObject`'s growth pool instead of the kernel page-table
 /// pool.
 ///
-/// Each new PT page debits the AS's `pt_growth_budget_bytes`. Exhaustion
-/// returns `Err(())`; the caller surfaces this as `SyscallError::OutOfMemory`
-/// so userspace can refill via augment-mode `cap_create_aspace`.
+/// Each new PT page is charged to the AS's growth budget; exhaustion returns
+/// `Err(())` (see [capability-model.md](../../../../../docs/capability-model.md)
+/// § Address-space and `CSpace` growth budgets).
 ///
 /// # Safety
 /// Same contract as [`map_user_page`]. `aso` must be the wrapper paired
@@ -840,7 +858,9 @@ pub unsafe fn inval_batch_end() {}
 /// PTE and calls `flush_page`.
 ///
 /// Intermediate page table frames are left in place even if they become
-/// empty. Full teardown is deferred until address space destruction.
+/// empty; the reclaiming span path is [`unmap_user_region_pooled`] (see
+/// [memory-internals.md](../../../docs/memory-internals.md) § Page Table Node
+/// Ownership).
 ///
 /// # Safety
 /// `root_virt` must be the direct-map virtual address of a valid 4 KiB PML4
@@ -906,10 +926,11 @@ fn table_is_empty(table: &[PageTableEntry; 512]) -> bool
 /// they are skipped (never descended, never freed), so a table holding one is
 /// never seen as empty. The root PML4 frame is never freed.
 ///
-/// Issues no TLB flush: the caller performs one coarse TLB +
-/// paging-structure-cache shootdown for the whole span and holds `pt_lock`
-/// across it, so a freed frame cannot be popped and reused before every CPU is
-/// coherent.
+/// Issues no TLB flush: the caller (`AddressSpace::unmap_region_pooled`)
+/// invalidates the span's TLB and paging-structure-cache entries on every CPU
+/// running the space while holding `pt_lock`, so a freed frame cannot be popped
+/// and reused before every CPU is coherent (see
+/// [memory-internals.md](../../../docs/memory-internals.md) § TLB Management).
 ///
 /// # Safety
 /// `root_virt` must be the direct-map VA of a valid 4 KiB PML4 frame, `aso`
@@ -1222,11 +1243,9 @@ pub unsafe fn translate_user_page(root_virt: u64, virt: u64) -> Option<(u64, u64
 /// Classify a leaf-PTE rewrite (`prior` → `new`) into a
 /// [`MapOutcome`](crate::mm::paging::MapOutcome) for shootdown elision.
 ///
-/// `prior`/`new` are raw x86-64 leaf PTE bits (`new` is presumed present). A
-/// not-present `prior` is a fresh map; a same-frame rights *widening* needs only
-/// the spurious-fault retry; any frame change or rights *narrowing* strands a
-/// dangerous stale entry and must shoot down. See [`MapOutcome`] for the full
-/// argument.
+/// `prior`/`new` are raw x86-64 leaf PTE bits (`new` is presumed present). The
+/// classes and why each is safe are defined in
+/// [memory-internals.md](../../../docs/memory-internals.md) § SMP TLB Shootdown.
 fn classify_user_map(prior: u64, new: u64) -> crate::mm::paging::MapOutcome
 {
     use crate::mm::paging::MapOutcome;
@@ -1298,9 +1317,11 @@ fn pte_permits_user_access(pte: u64, write: bool, instr: bool) -> bool
 /// access — meaning the fault must be a stale TLB entry the CPU resolves on
 /// retry after a local `invlpg`. Returns `false` for any genuine fault
 /// (unmapped, or the live mapping still forbids the access); the caller then
-/// kills the faulting thread. Because a `true` result requires the live PTE to
-/// grant the access (and x86 updates A/D in hardware), the retried instruction
-/// is guaranteed to make progress — no retry counter is needed.
+/// delivers the fault to the thread's fault handler or, with none bound, kills
+/// the thread (see [fault-handling.md](../../../../../docs/fault-handling.md)).
+/// Because a `true` result requires the live PTE to grant the access (and x86
+/// updates A/D in hardware), the retried instruction is guaranteed to make
+/// progress — no retry counter is needed.
 ///
 /// # Safety
 /// Must run at ring 0 in the faulting thread's context, i.e. before CR3 has
@@ -1482,7 +1503,7 @@ mod tests
     #[test]
     fn pt_index_extracts_bits_20_to_12()
     {
-        // VA = 0x0000_0000_0012_3456: bits [20:12] = 0x123 = 291
+        // VA = 0x0000_0000_0012_3000: bits [20:12] = 0x123 = 291
         assert_eq!(pt_index(0x0000_0000_0012_3000), 0x123);
     }
 

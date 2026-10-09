@@ -5,28 +5,22 @@
 
 //! Kernel-internal intermediate page-table frame pool.
 //!
-//! Backs the unconditional `map_user_page` PT-growth path
-//! ([`crate::mm::address_space::AddressSpace::map_page`]). The sole
-//! consumer in a real boot is the kernel-side Phase-9 bootstrap that
-//! builds init's (or ktest's) boot address space — ELF segments, stack,
-//! and `InitInfo` — which calls `map_page` directly, before any userspace
-//! runs. `sys_mmio_map` / `sys_mem_map` also fall back here, but only for
-//! an address space with no recorded donation; every address space the
-//! boot actually creates records its create-time slab (`boot_retype_aspace`
-//! for the boot AS, `sys_cap_create_aspace` for services), so those
-//! syscalls take the pooled path and fund their own intermediate PT pages
-//! from the AS's own growth pool. The fallback is the safety net for the
-//! donation-less case, not a routine path.
+//! Backs the kernel-direct `map_user_page` PT-growth path
+//! ([`crate::mm::address_space::AddressSpace::map_page`]). Which mappings
+//! draw from this pool (the Phase-9 bootstrap maps of init's or ktest's
+//! boot address space, and the `sys_mem_map` / `sys_mmio_map` fallback for
+//! an address space with no recorded donation) is defined in
+//! `core/kernel/docs/memory-internals.md` § Page Table Node Ownership.
 //!
 //! Pages are seeded once during Phase 7 — `POOL_SEED_PAGES` allocated from the
 //! pristine buddy before the user-cap drain — threaded onto an intrusive
 //! single-linked free list, and consumed without further buddy traffic.
 //!
-//! Backs the architectural invariant from `crate::kernel_entry`: PT
-//! frames for the `map_user_page` path trace to a single cap-managed
-//! surface (the seed of this pool). It is one of the kernel's named fixed
-//! reserves (see `crate::cap::kernel_reserve_pages`); every other page of RAM
-//! is drained for userspace, so the post-handoff buddy is left empty.
+//! The pool is one of the kernel's named fixed reserves (see
+//! `crate::cap::kernel_reserve_pages`), seeded from the buddy before the
+//! Phase-7 drain; the reserve-then-drain handoff that leaves the
+//! post-handoff buddy empty is defined in `docs/userspace-memory-model.md`
+//! § Ownership Boundaries.
 //!
 //! The free list is intrusive: each free page's first 8 bytes (accessed
 //! via the direct physical map) hold the next-PA pointer, or 0 for the
@@ -43,18 +37,21 @@ use crate::mm::paging::phys_to_virt;
 /// Head of the free list, or 0 when empty.
 static mut FREE_LIST_HEAD: u64 = 0;
 
-/// Remaining page count. Diagnostic + ledger accounting; not a soft cap.
+/// Remaining page count. Diagnostic only (reported after the Phase-7 seed);
+/// not a soft cap.
 static REMAINING: AtomicUsize = AtomicUsize::new(0);
 
-/// Spinlock guarding `FREE_LIST_HEAD`. Ordered after the buddy lock —
-/// `init` (the only buddy holder) drops the buddy lock between
-/// `alloc(0)` calls before touching the pool head, so the two locks are
-/// never held simultaneously.
+/// Spinlock guarding `FREE_LIST_HEAD`. Its place in the lock order (inside
+/// `pt_lock` on the kernel-direct page-table path) is defined in
+/// `core/kernel/docs/scheduling-internals.md` § Lock Hierarchy. `init`
+/// writes the head without it during single-threaded Phase 7, outside the
+/// buddy lock.
 static LOCK: AtomicBool = AtomicBool::new(false);
 
-/// Acquire the pool lock. A contended wait is recorded in the calling CPU's
-/// lock-wait breadcrumb for the softlockup watchdog; the uncontended path
-/// records nothing.
+/// Acquire the pool lock, a bare spin lock: the acquisition check and the
+/// contended-wait breadcrumb are defined in
+/// `core/kernel/docs/scheduling-internals.md` § Lock Hierarchy ("Bare spin
+/// locks") and § Softlockup Watchdog.
 #[cfg(not(test))]
 #[track_caller]
 fn acquire()
@@ -173,12 +170,14 @@ pub(crate) fn remaining_pages() -> usize
 #[allow(dead_code)]
 pub(crate) unsafe fn init(_seed_pages: usize) {}
 #[cfg(test)]
+// dead_code: host tests have no buddy or direct map, so no test calls this stub.
 #[allow(dead_code)]
 pub(crate) fn alloc_pt_page() -> Option<u64>
 {
     None
 }
 #[cfg(test)]
+// dead_code: host tests have no buddy or direct map, so no test calls this stub.
 #[allow(dead_code)]
 pub(crate) fn remaining_pages() -> usize
 {

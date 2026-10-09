@@ -13,8 +13,8 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use boot_protocol::KernelMmio;
 
-/// Default ns16550-compatible UART physical base. Matches the RISC-V Platform
-/// Spec reference layout and every UEFI-on-RISC-V firmware observed in this
+/// Default ns16550-compatible UART physical base. Matches the QEMU `virt`
+/// machine layout and every UEFI-on-RISC-V firmware observed in this
 /// project's test set.
 const DEFAULT_UART_BASE: u64 = 0x1000_0000;
 
@@ -28,13 +28,15 @@ const DEFAULT_PLIC_BASE: u64 = 0x0C00_0000;
 /// Default PLIC MMIO window size when the bootloader did not report one.
 /// 4 MiB covers the priority + per-context enable + threshold + claim/complete
 /// ranges defined by the RISC-V PLIC spec.
-#[allow(dead_code)] // Exposed via plic_size(); no current in-tree caller.
+// Read only by `plic_size`, which has no current in-tree caller.
+#[allow(dead_code)]
 const DEFAULT_PLIC_SIZE: u64 = 0x0040_0000;
 
 static CACHED_UART_BASE: AtomicU64 = AtomicU64::new(0);
 static CACHED_UART_SIZE: AtomicU64 = AtomicU64::new(0);
 static CACHED_PLIC_BASE: AtomicU64 = AtomicU64::new(0);
-#[allow(dead_code)] // Exposed via plic_size(); no current in-tree caller.
+// Read only by `plic_size`, which has no current in-tree caller.
+#[allow(dead_code)]
 static CACHED_PLIC_SIZE: AtomicU64 = AtomicU64::new(0);
 
 fn page_round_up(n: u64) -> u64
@@ -123,7 +125,9 @@ pub fn plic_base() -> u64
 }
 
 /// PLIC MMIO window size, page-rounded.
-#[allow(dead_code)] // Part of the arch interface; no current in-tree caller.
+// Arch-private accessor for the bootloader-reported PLIC window size; no
+// current in-tree caller.
+#[allow(dead_code)]
 #[must_use]
 pub fn plic_size() -> u64
 {

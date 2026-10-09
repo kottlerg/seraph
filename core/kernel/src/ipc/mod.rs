@@ -12,7 +12,8 @@
 //! - [`notification`]: bitmask-based asynchronous notification (OR bits / wait).
 //! - [`event_queue`]: ordered, non-coalescing ring buffer with a single waiter.
 //! - [`wait_set`]: multiplexed blocking on any combination of the above.
-//! - [`message`]: the `Message` struct transferred through both mechanisms.
+//! - [`message`]: the `Message` struct carried by endpoint call/reply and
+//!   fault delivery.
 
 pub mod endpoint;
 pub mod event_queue;

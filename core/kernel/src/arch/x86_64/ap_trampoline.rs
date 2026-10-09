@@ -23,8 +23,9 @@
 //! 0x046  Padding
 //! 0x048  GDT (32 bytes, 4 entries): null, code32, code64, data
 //! 0x068  AP params (40 bytes): pml4_phys, cpu_id, stack_top, entry_fn, ist1_top, ist2_top
-//! 0x090  PM32 code (95 bytes): set segs, COM1 diag, enable PAE/LME/PG, far-jmp to LM64
-//! 0x0DD  Padding
+//! 0x090  PM32 code (95 bytes): set segs, load CR3, enable PAE/LME/NXE/PG/WP,
+//!        far-jmp to LM64 (0xA3–0xB4 are NOP padding)
+//! 0x0EF  Padding
 //! 0x0F8  LM64 far-jmp target (6 B): [u32: AP_PAGE+0x100, u16: 0x10] — BSP-patched
 //! 0x0FE  Padding
 //! 0x100  LM64 relay stub (28 bytes): load RSP/args from params, jump to entry_fn
@@ -33,15 +34,20 @@
 //! ## BSP patching
 //! Before sending SIPI, the BSP calls [`setup_trampoline`] (once) and then
 //! [`setup_ap_params`] (per AP). Both write through the kernel's direct physical
-//! map at `DIRECT_MAP_BASE + AP_PAGE`.
+//! map at `paging::direct_map_base() + AP_PAGE`.
 //!
 //! ## Adding / modifying
 //! - To pass more per-AP arguments: extend the params area (0x68–0x8F) and
 //!   update the LM64 relay stub encoding and `setup_ap_params`.
 //! - If the trampoline binary changes, recompute byte offsets carefully and
-//!   update `TRAMP_PATCH_*` constants. The host-side tests verify all offsets.
+//!   update `TRAMP_PATCH_*` constants. The host-side tests check the template's
+//!   fixed bytes at hard-coded offsets; they do not reference the `TRAMP_PATCH_*`
+//!   constants, so a moved patch site is not caught by them.
 
-// cast_possible_truncation: u64→u32 trampoline vector shift; value < 256 by design.
+// cast_possible_truncation: the one site not covered by an item-level allow is
+// `kernel_pml4_pa() as u32` in `start_ap`, which feeds the trampoline's 32-bit
+// `mov cr3, eax`; the kernel root table sits in kernel BSS at the bootloader-chosen
+// physical base, and nothing in this module checks that it lies below 4 GiB.
 #![allow(clippy::cast_possible_truncation)]
 
 // ── Trampoline byte offsets ───────────────────────────────────────────────────
@@ -55,7 +61,9 @@ pub const TRAMP_PATCH_RM_FAR_JMP: usize = 0x20;
 pub const TRAMP_PATCH_GDTR: usize = 0x40;
 
 /// Offset of the GDT within the trampoline page (four 8-byte descriptors).
-#[allow(dead_code)] // Documented layout constant; used as a reference even if not accessed directly
+// dead_code: TRAMP_GDT_OFFSET names the GDT offset the module layout table documents;
+// no code reads it (TRAMPOLINE_TEMPLATE and the tests use the literal 0x48).
+#[allow(dead_code)]
 pub const TRAMP_GDT_OFFSET: usize = 0x48;
 
 /// Byte offset of AP startup parameters within the trampoline page.
@@ -66,13 +74,13 @@ pub const TRAMP_GDT_OFFSET: usize = 0x48;
 /// +4  cpu_id:    u32   — logical CPU index for this AP
 /// +8  stack_top: u64   — kernel stack top (loaded into RSP before jumping)
 /// +16 entry_fn:  u64   — virtual address of kernel_entry_ap
-/// +24 ist1_top:  u64   — IST1 stack top (NMI handler)
-/// +32 ist2_top:  u64   — IST2 stack top (double-fault handler)
+/// +24 ist1_top:  u64   — IST1 stack top (double-fault handler)
+/// +32 ist2_top:  u64   — IST2 stack top (NMI handler)
 /// ```
 pub const TRAMP_PARAMS: usize = 0x68;
 
 /// Offset of the `imm32` in `MOV ESP, imm32` (PM32 code), patched with
-/// `AP_PAGE + 0xC0` (temporary stack for PM32 code).
+/// `AP_PAGE + 0x200` (temporary stack for PM32 code).
 pub const TRAMP_PATCH_PM32_STACK: usize = 0x9F;
 
 /// Offset of the 6-byte far-jmp target used by PM32 code to enter LM64.
@@ -177,7 +185,8 @@ const TRAMPOLINE_TEMPLATE: [u8; 0x11C] = {
         t[i] = rm[i];
         i += 1;
     }
-    // 0x18..0x1F: zero padding — far-jmp target written by setup_trampoline
+    // 0x18..0x1F: zero padding. 0x20..0x25: real-mode far-jmp target, written by
+    // setup_trampoline. 0x26..0x3F: zero padding.
 
     // ── GDTR limit (0x40–0x41): constant 0x001F ───────────────────────────────
     // GDT has 4 entries × 8 bytes = 32 bytes; limit = 32 − 1 = 31 = 0x1F.
@@ -228,11 +237,10 @@ const TRAMPOLINE_TEMPLATE: [u8; 0x11C] = {
     // 8E E8                mov gs, ax
     // 8E D0                mov ss, ax
     // BC 00 00 00 00        mov esp, <AP_PAGE+0x200>  ; imm32 at +0x9F, BSP-patched
-    //                                                 ; Must be above 0x11B (end of all
-    //                                                 ; trampoline code) — the `call +0`
-    //                                                 ; push goes to ESP-4; if ESP ≤ 0xC0
-    //                                                 ; this overwrites PM32 code bytes.
-    // [0xA3–0xB4: 18 NOPs — reserved for future diagnostics]
+    //                                                 ; Must leave ESP-4..ESP-1 clear of
+    //                                                 ; the trampoline bytes (0x00–0x11B):
+    //                                                 ; the `call +0` push writes there.
+    // [0xA3–0xB4: 18 NOPs — padding that keeps the following PM32 bytes at fixed offsets]
     // E8 00 00 00 00        call +0                   ; push EIP of next instr
     // 5B                   pop ebx                   ; EBX = AP_PAGE + offset
     // 81 E3 00 F0 FF FF     and ebx, 0xFFFFF000       ; EBX = AP_PAGE
@@ -260,7 +268,7 @@ const TRAMPOLINE_TEMPLATE: [u8; 0x11C] = {
         0x8E, 0xE8, // mov gs, ax
         0x8E, 0xD0, // mov ss, ax
         0xBC, 0x00, 0x00, 0x00, 0x00, // mov esp, imm32  (0x9E; imm32 at 0x9F)
-        // ── 18 NOPs (0xA3–0xB4): reserved slot, preserves call +0 offset ──────
+        // ── 18 NOPs (0xA3–0xB4): padding; keeps the following PM32 bytes at fixed offsets ──
         0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, // 9 NOPs
         0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, // 9 NOPs
         // ─────────────────────────────────────────────────────────────────────
@@ -295,7 +303,7 @@ const TRAMPOLINE_TEMPLATE: [u8; 0x11C] = {
     t[0xFC] = 0x10;
     t[0xFD] = 0x00;
 
-    // ── LM64 relay stub (0x100–0x113) ────────────────────────────────────────
+    // ── LM64 relay stub (0x100–0x11B) ────────────────────────────────────────
     //
     // Entered at VA=AP_PAGE+0x100 (identity-mapped). Loads stack and args from
     // the params area (RIP-relative), then jumps to entry_fn in high VA space.
@@ -330,11 +338,12 @@ const TRAMPOLINE_TEMPLATE: [u8; 0x11C] = {
 
 // ── Helper: write a u32 at a byte offset within the direct-mapped trampoline ──
 
-/// Write a little-endian `u32` at byte `offset` within the direct-mapped
-/// trampoline page at `tramp_virt` (= `DIRECT_MAP_BASE + ap_trampoline_phys`).
+/// Write a little-endian `u32` at byte `offset` from `tramp_virt`, a direct-map
+/// address inside the trampoline page (`paging::direct_map_base() + ap_trampoline_phys`,
+/// or the parameter block within it).
 ///
 /// Always writes byte-by-byte to handle unaligned offsets (e.g. the GDTR base
-/// at page offset 0x42). This is boot code run once; byte writes are fine.
+/// at page offset 0x42). This is boot-time code; byte writes are fine.
 ///
 /// # Safety
 /// `tramp_virt` must be a valid writable virtual address within the direct map.
@@ -371,6 +380,9 @@ unsafe fn write_u16(tramp_virt: u64, offset: usize, val: u16)
 }
 
 /// Write a little-endian `u64` at byte `offset`.
+///
+/// # Safety
+/// `tramp_virt` must be a valid writable virtual address within the direct map.
 #[cfg(not(test))]
 unsafe fn write_u64(tramp_virt: u64, offset: usize, val: u64)
 {
@@ -406,7 +418,8 @@ pub unsafe fn setup_trampoline(ap_trampoline_phys: u64)
     let virt = super::paging::direct_map_base() + ap_page;
 
     // Copy the fixed template.
-    // SAFETY: virt is within the direct map (Phase 3 active); 0x114 < 4096 bytes.
+    // SAFETY: virt is within the direct map (Phase 3 active);
+    // TRAMPOLINE_TEMPLATE.len() (0x11C) < 4096 bytes.
     unsafe {
         core::ptr::copy_nonoverlapping(
             TRAMPOLINE_TEMPLATE.as_ptr(),
@@ -463,8 +476,8 @@ pub unsafe fn setup_trampoline(ap_trampoline_phys: u64)
 /// - `pml4_phys`: physical address of the kernel root page table.
 /// - `stack_top`: kernel stack top for this AP's idle thread.
 /// - `entry_fn`: virtual address of `kernel_entry_ap` to jump to.
-/// - `ist1_top`: IST1 stack top (NMI).
-/// - `ist2_top`: IST2 stack top (double-fault).
+/// - `ist1_top`: IST1 stack top (double-fault).
+/// - `ist2_top`: IST2 stack top (NMI).
 ///
 /// # Safety
 /// Phase 3 must be active. `setup_trampoline` must have been called first.
@@ -493,14 +506,14 @@ pub unsafe fn setup_ap_params(
     }
 }
 
-/// Start one AP: allocate IST stacks, write params, send INIT+SIPI.
+/// Start one AP: carve its IST stacks from the per-CPU slab, write params, send INIT+SIPI.
 ///
 /// Returns `true` unconditionally — SIPI delivery success is detected via
 /// `APS_READY` after this call.
 ///
 /// # Parameters
 /// - `trampoline_pa`: physical address of the trampoline page (from `BootInfo`).
-/// - `cpu_idx`: logical CPU index (1-based) for this AP.
+/// - `cpu_idx`: logical CPU index for this AP (≥ 1; index 0 is the BSP).
 /// - `apic_id`: local APIC ID of the target AP.
 /// - `entry_fn`: virtual address of `kernel_entry_ap`.
 /// - `stack_top`: kernel idle-thread stack top for this AP.
@@ -508,7 +521,7 @@ pub unsafe fn setup_ap_params(
 /// # Safety
 /// - [`setup_trampoline`] must have been called.
 /// - Phase 3–8 must be active (direct map, IDT, scheduler state).
-/// - `cpu_idx` must be `< MAX_CPUS` (asserted in debug).
+/// - `cpu_idx` must be `< CPU_COUNT` (the IST slab's size; asserted in debug).
 #[cfg(not(test))]
 pub unsafe fn start_ap(
     trampoline_pa: u64,
@@ -522,14 +535,14 @@ pub unsafe fn start_ap(
     debug_assert!(cpu_idx < cpu_count);
 
     // Carve this AP's IST stacks out of the dynamic per-CPU slab.
-    // SAFETY: cpu_idx < CPU_COUNT asserted; the AP_IST_STACKS slot for this
-    // CPU is exclusively owned by this AP for the kernel's lifetime.
+    // The slab slot for this CPU is exclusively owned by this AP for the kernel's lifetime.
     let ist_slab_base = AP_IST_STACKS_PTR.load(core::sync::atomic::Ordering::Acquire);
     debug_assert!(
         !ist_slab_base.is_null(),
         "start_ap: AP_IST_STACKS_PTR not initialised"
     );
-    // SAFETY: cpu_idx < CPU_COUNT asserted; IST slab covers cpu_count entries.
+    // SAFETY: cpu_idx < CPU_COUNT (caller's contract; debug-asserted above); the IST
+    // slab covers cpu_count entries.
     let ist_base = unsafe { ist_slab_base.add(cpu_idx as usize) } as u64;
     let ist1_top = ist_base + 8192;
     let ist2_top = ist_base + 16384;

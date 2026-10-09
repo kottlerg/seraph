@@ -5,13 +5,10 @@
 
 //! Userspace randomness syscall handler.
 //!
-//! `SYS_GETRANDOM` (55) fills a user buffer with CSPRNG-quality bytes drawn
-//! from the kernel entropy subsystem (see `core/kernel/docs/entropy.md`). It is
-//! ambient — it requires no capability, exactly like `SYS_SYSTEM_INFO` — because
-//! random bytes name no object and confer no authority. Userspace holds no
-//! generator state of its own: every draw advances the kernel's per-CPU
-//! forward-secure generator, so the surface inherits the kernel's forward
-//! secrecy and is prediction- and clone-safe by construction.
+//! `SYS_GETRANDOM` (55) fills a user buffer with CSPRNG bytes from the kernel
+//! entropy subsystem. The call contract is in `core/kernel/docs/syscalls.md`
+//! § `SYS_GETRANDOM` (55); why an ambient draw from the shared per-CPU
+//! generators is safe is in `core/kernel/docs/entropy.md` § Scope and threat model.
 
 use crate::arch::current::trap_frame::TrapFrame;
 use syscall::{MAX_GETRANDOM_LEN, SyscallError};
@@ -67,7 +64,7 @@ pub fn sys_getrandom(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // Draw into a kernel buffer *before* the user copy: the draw disables/
     // re-enables interrupts internally, which must not happen inside the SMAP/SUM
-    // access window that `copy_to_user` opens. Mirrors `sys_thread_read_regs`.
+    // access window that `copy_to_user` opens.
     let mut scratch = [0u8; MAX_GETRANDOM_LEN];
     crate::entropy::fill_bytes(&mut scratch[..len]);
 

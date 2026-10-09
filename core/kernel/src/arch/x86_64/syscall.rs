@@ -3,7 +3,8 @@
 
 // core/kernel/src/arch/x86_64/syscall.rs
 
-//! SYSCALL/SYSRET MSR setup and entry stub for x86-64 (Phase 9).
+//! SYSCALL/SYSRET MSR setup and entry stub for x86-64 (configured in Phase 5;
+//! see [initialization.md](../../../docs/initialization.md) § Phase 5).
 //!
 //! Configures the MSRs required by the SYSCALL instruction:
 //!
@@ -19,9 +20,10 @@
 //! On SYSCALL: hardware saves RIP→RCX, RFLAGS→R11, applies SFMASK.
 //! RSP and segment registers are NOT changed by the hardware.
 //!
-//! We save R11 (user RFLAGS) to `SYSCALL_SCRATCH` immediately, use R11 to
-//! shuttle user RSP to `SYSCALL_USER_RSP`, switch to `SYSCALL_KERNEL_RSP`,
-//! then rebuild R11 from the scratch before saving the full `TrapFrame.`
+//! We save R11 (user RFLAGS) to `PerCpuData::scratch` (`gs:[24]`) immediately,
+//! use R11 to shuttle user RSP to `PerCpuData::user_rsp` (`gs:[16]`), switch to
+//! `PerCpuData::kernel_rsp` (`gs:[8]`), then rebuild R11 from the scratch slot
+//! before saving the full `TrapFrame`.
 //!
 //! ## Per-CPU layout (`PerCpuData` GS-relative offsets)
 //! - `gs:[8]`  (`PERCPU_KERNEL_RSP_OFFSET`) — kernel RSP loaded at entry
@@ -75,7 +77,7 @@ pub unsafe fn set_kernel_rsp(rsp: u64)
 
 // ── syscall_entry ─────────────────────────────────────────────────────────────
 
-/// SYSCALL entry stub (Phase 9).
+/// SYSCALL entry stub (installed in `IA32_LSTAR` by [`init`]).
 ///
 /// On SYSCALL hardware saves: RIP→RCX, RFLAGS→R11. Does NOT change RSP.
 /// This stub:
@@ -135,7 +137,7 @@ unsafe extern "C" fn syscall_entry()
         "mov [rsp + 136], r11",     // rsp    = user RSP
         "mov qword ptr [rsp + 144], 0x23", // cs = USER_CS
         "mov qword ptr [rsp + 152], 0x1b", // ss = USER_DS
-        "mov qword ptr [rsp + 160], 0",    // fs_base (Phase 9: zero)
+        "mov qword ptr [rsp + 160], 0",    // fs_base: unused (TLS base is SavedState.fs_base)
 
         // ── Phase 3: dispatch ─────────────────────────────────────────────
         "mov rdi, rsp",             // arg0 = *mut TrapFrame

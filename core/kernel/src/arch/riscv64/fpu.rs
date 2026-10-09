@@ -33,9 +33,9 @@ const SSTATUS_VS_MASK: u64 = 0x3 << 9;
 /// Force `sstatus.FS = sstatus.VS = 00 (Off)` for the current hart.
 ///
 /// After this returns, any U-mode F/D or V instruction raises an
-/// illegal-instruction trap (`scause = 2`). Kernel code remains soft-float
-/// (RV64IMAC target) and never touches F/D/V, so the kernel side itself
-/// never trips the trap.
+/// illegal-instruction trap (`scause = 2`). The kernel never executes F/D/V
+/// (soft-float target; see `docs/build-system.md` § Custom Targets), so the
+/// kernel side itself never trips the trap.
 ///
 /// Must be called once per hart at early init (BSP and each AP) before any
 /// userspace runs.
@@ -66,13 +66,11 @@ pub unsafe fn enable_fpu_vector() {}
 /// Promote `sstatus.FS` and `sstatus.VS` from 00 (Off) to 01 (Initial) so the
 /// next FP/V instruction executes without re-trapping.
 ///
-/// Called from the illegal-instruction trap handler on first user F/D/V
-/// touch. csrs only sets bits; from the Off boot invariant the bit-13 and
-/// bit-9 sets transition both fields to Initial. Once the user code writes
-/// an F or V register the hardware advances the field to Dirty.
-///
-/// Adding XRSTOR-equivalent restore of a per-thread save area is deferred
-/// to the commit that introduces TCB extended state.
+/// Called by [`lazy_restore_fp_v`] on the illegal-instruction trap path at the
+/// first user F/D/V touch. csrs only sets bits; from the Off boot invariant the
+/// bit-13 and bit-9 sets move both fields to Initial. Once the user code writes
+/// an F or V register, the hardware advances the field to Dirty. The per-thread
+/// save-area restore happens in [`lazy_restore_fp_v`] after this returns.
 ///
 /// # Safety
 /// Must execute in supervisor mode.
@@ -165,8 +163,9 @@ pub fn is_fp_or_v_opcode(insn: u64) -> bool
 /// verifies this by checking the field is `Dirty`.
 ///
 /// # Safety
-/// Must execute in supervisor mode. `area` must point at a per-thread
-/// F/D save area allocated by [`alloc_area`]. `sstatus.FS` must be non-Off.
+/// Must execute in supervisor mode. `area` must point at the thread's
+/// per-thread F/D save area (page 5 of its Thread retype slot, zeroed by
+/// `sys_cap_create_thread`). `sstatus.FS` must be non-Off.
 #[cfg(not(test))]
 #[inline]
 unsafe fn save_fp_to(area: *mut u8)
@@ -229,8 +228,8 @@ unsafe fn save_fp_to(area: *mut u8)
 /// # Safety
 /// Must execute in supervisor mode. `area` must point at a per-thread
 /// F/D save area previously written by [`save_fp_to`] or zero-initialised
-/// by [`alloc_area`] (the zeroed area restores to f0..f31 = 0.0 and
-/// fcsr = 0, matching the architected initial FP state).
+/// at thread creation (`sys_cap_create_thread`; the zeroed area restores to
+/// f0..f31 = 0.0 and fcsr = 0, matching the architected initial FP state).
 #[cfg(not(test))]
 #[inline]
 unsafe fn restore_fp_from(area: *const u8)
@@ -383,7 +382,9 @@ pub unsafe fn switch_in_restore(_tcb: *mut crate::sched::thread::ThreadControlBl
 /// state (otherwise the frame restore would clobber the promotion and the
 /// trapping instruction would re-trap forever).
 ///
-/// The V restore is skipped when `vlenb` is zero (V missing on this CPU).
+/// The V restore is skipped when [`vlenb`] is zero, which holds only before
+/// [`cache_vlenb`] runs at BSP init (a hart without V halts there; see
+/// `docs/platform-requirements.md` § riscv64 Classification).
 ///
 /// # Safety
 /// Must execute in supervisor mode from the illegal-instruction trap path.
@@ -433,8 +434,8 @@ pub unsafe fn lazy_restore_fp_v(_area: *const u8, _frame: &mut super::trap_frame
 // ── V (Vector) state save / restore ───────────────────────────────────────────
 
 /// Cached value of CSR `vlenb` (vector length in bytes), populated at boot
-/// by [`cache_vlenb`]. Zero before that call, notifying "V missing or not
-/// yet probed" and disabling V save/restore in the lazy-trap path.
+/// by [`cache_vlenb`]. Zero only before that call, meaning not yet probed;
+/// the lazy-trap path then skips V save/restore.
 static VLENB: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Cap on supported `vlenb`. With 304 bytes of F/D + V-header prefix and
@@ -443,8 +444,10 @@ static VLENB: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new
 /// every realistic RVA23-class implementation as of writing.
 const MAX_VLENB: u64 = 64;
 
-/// Return the cached `vlenb`. Returns 0 before [`cache_vlenb`] runs at
-/// boot, or on systems whose V extension is absent.
+/// Return the cached `vlenb`. Returns 0 only before [`cache_vlenb`] runs at
+/// boot; a hart without V halts in [`cache_vlenb`].
+// dead_code: `vlenb` is read only by the non-test `lazy_restore_fp_v`; the `#[cfg(test)]` stub
+// of `lazy_restore_fp_v` does not reference it.
 #[allow(dead_code)]
 pub fn vlenb() -> u64
 {
@@ -457,9 +460,9 @@ pub fn vlenb() -> u64
 /// temporarily promotes VS to Initial, reads `vlenb`, then restores
 /// VS = Off.
 ///
-/// Halts via [`crate::fatal`] if `vlenb` is zero (V missing — the cap
-/// boot invariant requires V on RISC-V) or exceeds [`MAX_VLENB`] (a
-/// kernel-side build-time limit on save-area size).
+/// Halts via [`crate::fatal`] if `vlenb` is zero or exceeds [`MAX_VLENB`]
+/// (the Vector requirement and `vlenb` ceiling are defined in
+/// `docs/platform-requirements.md` § riscv64 Classification).
 ///
 /// # Safety
 /// Must execute in supervisor mode.
@@ -634,14 +637,14 @@ mod tests
     fn fp_v_arith_load_store_opcodes()
     {
         assert!(is_fp_or_v_opcode(0x0000_3007)); // fld f0, 0(x0)   (LOAD-FP)
-        assert!(is_fp_or_v_opcode(0x0000_30a7)); // fsd f0, 0(x1)   (STORE-FP)
+        assert!(is_fp_or_v_opcode(0x0000_30a7)); // fsd f0, 1(x0)   (STORE-FP)
         assert!(is_fp_or_v_opcode(0x0000_70d7)); // OP-V (vsetvl[i]/arith)
     }
 
     #[test]
     fn vector_csr_reads_are_fp_v()
     {
-        // The exact encoding that killed vfsd (run 132): `csrr a1, vlenb`.
+        // `csrr a1, vlenb`, as emitted by autovectorised userspace `memcpy`.
         assert!(is_fp_or_v_opcode(0xc220_25f3));
         // csrr x0, vl / vtype.
         assert!(is_fp_or_v_opcode(0xc200_2073)); // vl    (0xC20)

@@ -17,8 +17,8 @@
 //! the object in place at the returned offset, and stores the source
 //! `MemoryObject`'s header pointer in `header.ancestor` so dealloc can
 //! reclaim the bytes back to the source cap. Init's bootstrap state
-//! (root `CSpace`, init's own `AddressSpace`/`Thread`/`CSpace`) and the
-//! Phase-7 boot-time identity wrappers are retyped from the SEED reserve
+//! (the root `CSpace`, which is init's `CSpace`, and init's `AddressSpace`
+//! and `Thread`) and the Phase-7 boot-time identity wrappers are retyped from the SEED reserve
 //! (`boot_retype_*`, `mint_phase7_body`) and carry the SEED ancestor.
 //!
 //! Deallocation: read `header.obj_type` from the raw pointer, drop the
@@ -32,7 +32,7 @@
 //! by its inline `CSpace` — fitting one page, a `RecordPage` fitting one
 //! page, and its records starting at `RECORD_PAGE_HEADER`. The header and
 //! sub-page object sizes the retype bins depend on are asserted in
-//! `cap/retype.rs`.
+//! `core/kernel/src/cap/retype.rs`.
 
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
@@ -66,9 +66,10 @@ pub enum ObjectType
 
 /// Common header at offset 0 of every kernel object.
 ///
-/// The `ref_count` tracks how many capability slots reference this object.
-/// When `dec_ref` returns 0, the object has no remaining references and
-/// `dealloc_object` frees it, dispatching on `obj_type`.
+/// `ref_count` counts the capability slots and the kernel-internal owners
+/// that hold this object (see core/kernel/docs/capability-internals.md
+/// § Kernel Object Reference Counting). When `dec_ref` returns 0, no holder
+/// remains and `dealloc_object` frees it, dispatching on `obj_type`.
 ///
 /// `ancestor` is a direct pointer to the `MemoryObject`'s header from which
 /// this object was retyped. Auto-reclaim consults this on `dec_ref → 0` to
@@ -80,7 +81,7 @@ pub enum ObjectType
 /// — the `MemoryObject` itself stays alive via the refcount bump that retype
 /// performs, but the slot index becomes `Null` as soon as `cap_delete` runs
 /// on the source. Reclaim must reach the live object regardless of slot
-/// state. `SYS_CAP_INFO` exposes ancestor lineage if introspection needs it.
+/// state. No syscall exposes the ancestor.
 ///
 /// `#[repr(C)]` with size 16 B, alignment 8. All concrete object structs
 /// place this as their first field so pointer casts are safe.
@@ -94,7 +95,9 @@ pub struct KernelObjectHeader
     /// Lifecycle flags. See `HDR_FLAG_*` constants. Currently only used to
     /// mark the boot root `CSpace` as undestroyable.
     pub flags: u8,
-    // Padding to reach 8-byte alignment for the ancestor pointer below.
+    // Padding to reach 8-byte alignment for the ancestor pointer below. Public
+    // because mint sites outside this module build the header by struct literal;
+    // the underscore marks it as carrying no value.
     #[allow(clippy::pub_underscore_fields)]
     pub _pad: [u8; 2],
     /// Pointer to the `MemoryObject`'s header this object was retyped from;
@@ -153,8 +156,10 @@ impl KernelObjectHeader
         }
     }
 
-    /// Increment the reference count. Call when a new capability slot is
-    /// derived pointing to this object.
+    /// Increment the reference count. Call when a capability slot or a
+    /// kernel-internal owner takes a reference to this object (see
+    /// core/kernel/docs/capability-internals.md § Kernel Object Reference
+    /// Counting).
     pub fn inc_ref(&self)
     {
         self.ref_count.fetch_add(1, Ordering::Relaxed);
@@ -162,8 +167,10 @@ impl KernelObjectHeader
 
     /// Decrement the reference count and return the new value.
     ///
-    /// Returns 0 when the object has no remaining capability references; the
-    /// caller is responsible for freeing the object at that point.
+    /// Returns 0 when no capability slot or kernel-internal owner still holds
+    /// the object (see core/kernel/docs/capability-internals.md § Kernel Object
+    /// Reference Counting); the caller is responsible for freeing the object at
+    /// that point.
     ///
     /// Headers carrying [`HDR_FLAG_IS_ROOT`] (the boot root `CSpace`) clamp
     /// at 1 via a CAS loop: when the current count is 1 the operation is a
@@ -239,20 +246,20 @@ pub struct MemoryObject
     pub size: u64,
     /// Bytes still available to retype into kernel objects, or to map.
     ///
-    /// Initialised to `size` for RAM caps minted at boot with `MemRights::RETYPE`.
-    /// Set to `0` for firmware-table / boot-module / init-segment Memory caps
-    /// (those caps don't carry RETYPE rights and never participate in retype
-    /// or auto-reclaim — their `available_bytes` is informational only).
+    /// Initialised to `size` for every Memory cap minted with `MemRights::RETYPE`:
+    /// RAM, boot-module, init-segment, `InitInfo`/stack, and reclaimed boot-scratch
+    /// caps. Set to `0` for firmware-table caps (ACPI regions, RSDP, DTB), which
+    /// mint without `Retype` (docs/capability-model.md § Memory) and never take
+    /// part in retype or auto-reclaim.
     /// `retype_allocate` debits this; `dealloc_object` auto-reclaim credits
     /// it back.
     pub available_bytes: AtomicU64,
     /// `true` if this Memory cap is responsible for returning `[base, base + size)`
-    /// to the buddy allocator on final destruction. Buddy-backed Memory caps set
-    /// this at creation. Caps over non-buddy-managed physical memory (MMIO
-    /// regions, firmware tables, boot modules, boot-loaded ELF segments)
-    /// leave it `false`.
+    /// to the buddy allocator on final destruction. Buddy-backed RAM caps and the
+    /// boot-module, init-segment, `InitInfo`/stack, and reclaim-range caps set it at
+    /// creation. Firmware-table caps (ACPI regions, RSDP, DTB) leave it `false`.
     ///
-    /// `sys_memory_split` (Option D) leaves the parent's flag intact; the new
+    /// `sys_memory_split` leaves the parent's flag intact; the new
     /// tail child inherits the parent's `owns_memory` so each half buddy-frees
     /// its own `[base, base+size)` range on dealloc. `sys_memory_merge`
     /// clears the absorbed tail's flag (so only the parent — which now
@@ -275,8 +282,8 @@ pub struct MemoryObject
     /// Read-locked by `sys_mem_map` and `cap::retype::retype_allocate`
     /// across the validate-and-commit sequence. Write-locked by
     /// `sys_memory_split` and `sys_memory_merge` while the cap's region is
-    /// mutated. Lock order against `DERIVATION_LOCK`: derivation-lock outer,
-    /// frame-lock inner.
+    /// mutated. Lock order: see core/kernel/docs/scheduling-internals.md
+    /// § Lock Hierarchy, "Bare spin locks".
     pub lock: AtomicU32,
 }
 
@@ -413,9 +420,12 @@ pub struct MmioObject
     pub base: u64,
     /// Size of the MMIO region in bytes.
     pub size: u64,
-    /// Flags from the platform resource entry (bit 0: write-combine).
+    /// Flags word; always `0` today (boot mints set `0`, `sys_mmio_split` copies
+    /// the parent's value, and no mapping path reads it).
     pub flags: u32,
-    // Explicit padding to preserve repr(C) layout.
+    // Explicit padding to preserve repr(C) layout. Public because the boot mint
+    // and split sites build this object by struct literal; the underscore marks
+    // it as carrying no value.
     #[allow(clippy::pub_underscore_fields)]
     pub _pad: u32,
 }
@@ -442,9 +452,12 @@ pub struct IoPortObject
     pub header: KernelObjectHeader,
     /// First port number in the range.
     pub base: u16,
-    /// Number of consecutive ports.
+    /// Number of consecutive ports; `0` encodes the full 65536-port space
+    /// (the root cap), which a `u16` cannot hold.
     pub size: u16,
-    // Explicit padding to preserve repr(C) layout.
+    // Explicit padding to preserve repr(C) layout. Public because the boot mint
+    // and split sites build this object by struct literal; the underscore marks
+    // it as carrying no value.
     #[allow(clippy::pub_underscore_fields)]
     pub _pad: u32,
 }
@@ -489,8 +502,9 @@ pub struct ThreadObject
     pub tcb: *mut crate::sched::thread::ThreadControlBlock,
     /// Intrusive link for the per-CPU deferred self-teardown reclaim stack
     /// ([`drain_deferred_reclaim`]). Non-null only while this object sits on
-    /// that stack — between a thread deleting the last capability to its own
-    /// `Thread` object and the off-CPU completion of that free. Null otherwise.
+    /// that stack — between the push (a self-teardown of the running thread's
+    /// own `Thread` object, or `cap::transfer::release_moved_object` dropping
+    /// its last reference) and the off-CPU completion of that free. Null otherwise.
     /// Written only by the owning CPU.
     pub deferred_next: *mut KernelObjectHeader,
 }
@@ -576,7 +590,8 @@ impl DonationRecord
 }
 
 /// Pages `PagePool::seed_pages` pushes per pool-lock hold. The pool lock is a
-/// bare spin lock (scheduling-internals.md § Bare spin locks), and a hold
+/// bare spin lock (scheduling-internals.md § Lock Hierarchy, "Bare spin
+/// locks"), and a hold
 /// proportional to a caller-chosen donation size would be unbounded; batching
 /// keeps every hold to this many pushes. The interrupts-off window of the
 /// syscall that seeds a donation is the sum of its batches, `init_pages`
@@ -883,12 +898,8 @@ impl PagePool
     /// first so record 0 (whose donation holds the page) goes last; then the
     /// inline records, snapshotted up front, with record 0 (the create-time
     /// slab that holds the owner and this pool) last. The walk is linear in the
-    /// donation count and runs to completion in whichever context drops the
-    /// last reference: the deleting syscall, with interrupts masked, or —
-    /// for an owner handed to the deferred-reclaim stack — the next syscall
-    /// epilogue on that CPU or the idle thread's drain; an owner that
-    /// donated finely pays for it at teardown (see capability-internals §
-    /// Page Pools).
+    /// donation count; its context and cost are in
+    /// core/kernel/docs/capability-internals.md § Teardown.
     ///
     /// # Safety
     /// The owner is being torn down at refcount 0: no other reference to
@@ -957,7 +968,9 @@ pub struct AddressSpaceObject
     pub address_space: *mut crate::mm::address_space::AddressSpace,
     /// Bytes available to back new intermediate page-table pages on `mem_map`.
     ///
-    /// Seeded at retype time from the source Memory cap's `available_bytes`.
+    /// Starts at `0`; credited with the pool pages each donation seeds — the
+    /// create-time slab's pool pages, then each augment-mode donation (see
+    /// `PagePool::add_donation`).
     /// Refilled via augment-mode on `SYS_CAP_CREATE_ASPACE`
     /// (`cap_create_aspace(memory_cap, target_aspace_cap)`). `mem_map` returns
     /// `OutOfMemory` if a new PT page is needed but the budget is exhausted.
@@ -969,7 +982,9 @@ pub struct AddressSpaceObject
     /// ([`drain_deferred_reclaim`]). Non-null only while this object sits on
     /// that stack: the thread that dropped its last capability was itself
     /// bound to it (or was stopped by a concurrent teardown while freeing
-    /// it), so the free completes off-CPU. Written only by the owning CPU.
+    /// it), or a batched capability move dropped its last reference
+    /// (`cap::transfer::release_moved_object`), so the free completes
+    /// off-CPU. Written only by the owning CPU.
     pub deferred_next: *mut KernelObjectHeader,
 }
 
@@ -989,7 +1004,9 @@ pub struct CSpaceKernelObject
     pub cspace: *mut crate::cap::cspace::CSpace,
     /// Bytes available to back new slot pages when the `CSpace` grows.
     ///
-    /// Seeded at retype time from the source Memory cap's `available_bytes`.
+    /// Starts at `0`; credited with the pool pages each donation seeds — the
+    /// create-time slab's pool pages, then each augment-mode donation (see
+    /// `PagePool::add_donation`).
     /// Refilled via augment-mode on `SYS_CAP_CREATE_CSPACE`
     /// (`cap_create_cspace(memory_cap, target_cspace_cap)`).
     /// `CSpace::grow` returns `OutOfMemory` if a new slot page is needed but the
@@ -1231,7 +1248,8 @@ impl CSpaceKernelObject
 pub struct EndpointObject
 {
     pub header: KernelObjectHeader,
-    /// Pointer to the endpoint's mutable state, inline at `wrapper + 8` in
+    /// Pointer to the endpoint's mutable state, inline at
+    /// `wrapper + size_of::<EndpointObject>()` (24) in
     /// the same retype slot.
     pub state: *mut crate::ipc::endpoint::EndpointState,
 }
@@ -1277,7 +1295,8 @@ unsafe impl Sync for EventQueueObject {}
 
 /// Kernel object for a wait set (`WaitSet` capability).
 ///
-/// `WaitSetState` is the ~480-byte body holding member slots and the ready
+/// `WaitSetState` is the body (at most 440 bytes, asserted in
+/// `ipc/wait_set.rs`) holding member slots and the ready
 /// ring; it lives inline immediately after the 24-byte wrapper within a single
 /// `BIN_512` retype slot.
 #[repr(C)]
@@ -1534,8 +1553,9 @@ unsafe fn defer_self_teardown(ptr: NonNull<KernelObjectHeader>, what: &str)
 /// - No capability slot may reference the object: its reference count is 0,
 ///   or it is a fresh body that was never published (a range split's
 ///   rollback frees such bodies at their initial count of 1).
-/// - Must NOT be called with `DERIVATION_LOCK` held, since freeing complex
-///   objects (Thread, `AddressSpace`) may acquire the frame-allocator lock.
+/// - Must NOT be called with `DERIVATION_LOCK` held: the `CSpaceObj` arm
+///   takes that (non-recursive) lock for its batched derivation drain, and
+///   the Memory arm takes the frame-allocator lock.
 ///
 /// # Cascade handling
 ///
@@ -1606,6 +1626,8 @@ pub unsafe fn dealloc_object(ptr: core::ptr::NonNull<KernelObjectHeader>)
 // concrete type's alignment even when stored as KernelObjectHeader*.
 // too_many_lines: structural dispatch over all object types; splitting further
 // would obscure the type hierarchy without reducing complexity.
+// items_after_statements: each arm imports the retype helpers it uses beside
+// that use, after the arm's own statements.
 #[allow(
     clippy::cast_ptr_alignment,
     clippy::too_many_lines,
@@ -1674,13 +1696,12 @@ unsafe fn dealloc_object_one(
         ObjectType::Memory =>
         {
             // Return buddy-backed physical memory before freeing the Rust
-            // object. `owns_memory` is false for MMIO / firmware / boot
-            // module / init-segment caps (the physical memory is not part
-            // of the buddy pool at all) and for split originals (ownership
-            // was atomically transferred to the children). This is the buddy's
-            // only reverse path; post-handoff the buddy is sealed (every
-            // `owns_memory` cap lives permanently in memmgr's pool), so a live
-            // free here trips the seal — see `buddy::free_range`.
+            // object. `owns_memory` is false only for firmware-table caps (ACPI
+            // regions, RSDP, DTB), whose memory is not in the buddy, and for a
+            // tail absorbed by `sys_memory_merge`. This is the buddy's only reverse
+            // path; post-handoff the buddy is sealed (every `owns_memory` cap lives
+            // permanently in memmgr's pool), so a live free here trips the seal —
+            // see `buddy::free_range`.
             // SAFETY: ptr points to a live MemoryObject; single-owner access
             // since refcount reached zero at the call site.
             let (base, size, owned) = unsafe {
@@ -1714,7 +1735,8 @@ unsafe fn dealloc_object_one(
             // Memory cap). Drop in place, return the body bytes to the
             // seed's per-Memory allocator, drop the retype-time lease.
             use crate::cap::retype::retype_free;
-            // SAFETY: ancestor_ptr non-null per debug_assert and 4b invariant.
+            // SAFETY: ancestor_ptr is non-null: every production object is
+            // retype-backed (`KernelObjectHeader::ancestor`).
             let ancestor_memory = unsafe { &*ancestor_ptr.cast::<MemoryObject>() };
             let body_phys = crate::mm::paging::virt_to_phys(ptr.as_ptr() as u64);
             let offset = body_phys - ancestor_memory.base;
@@ -1741,7 +1763,8 @@ unsafe fn dealloc_object_one(
                 "Mmio: every production cap is retype-backed (Phase-7 SEED, sys_mmio_split SEED)"
             );
             use crate::cap::retype::retype_free;
-            // SAFETY: ancestor_ptr non-null per debug_assert and 4b invariant.
+            // SAFETY: ancestor_ptr is non-null: every production object is
+            // retype-backed (`KernelObjectHeader::ancestor`).
             let ancestor_memory = unsafe { &*ancestor_ptr.cast::<MemoryObject>() };
             let body_phys = crate::mm::paging::virt_to_phys(ptr.as_ptr() as u64);
             let offset = body_phys - ancestor_memory.base;
@@ -1773,8 +1796,9 @@ unsafe fn dealloc_object_one(
             // have no routing-table footprint to clean up.
             if count == 1
             {
-                // SAFETY: single-CPU; disable interrupts to serialise with
-                //         dispatch_device_irq (interrupt context).
+                // SAFETY: the routing entry is an atomic pointer (irq.rs § Thread
+                //         safety); disabling interrupts orders the unregister against
+                //         this CPU's dispatch_device_irq.
                 unsafe {
                     let saved = crate::arch::current::cpu::save_and_disable_interrupts();
                     crate::irq::unregister(start);
@@ -1789,7 +1813,8 @@ unsafe fn dealloc_object_one(
                 "Interrupt: every production cap is retype-backed (Phase-7 SEED, sys_irq_split SEED)"
             );
             use crate::cap::retype::retype_free;
-            // SAFETY: ancestor_ptr non-null per 4b invariant.
+            // SAFETY: ancestor_ptr is non-null: every production object is
+            // retype-backed (`KernelObjectHeader::ancestor`).
             let ancestor_memory = unsafe { &*ancestor_ptr.cast::<MemoryObject>() };
             let body_phys = crate::mm::paging::virt_to_phys(ptr.as_ptr() as u64);
             let offset = body_phys - ancestor_memory.base;
@@ -1816,7 +1841,8 @@ unsafe fn dealloc_object_one(
                 "IoPort: every production cap is retype-backed (Phase-7 SEED)"
             );
             use crate::cap::retype::retype_free;
-            // SAFETY: ancestor_ptr non-null per 4b invariant.
+            // SAFETY: ancestor_ptr is non-null: every production object is
+            // retype-backed (`KernelObjectHeader::ancestor`).
             let ancestor_memory = unsafe { &*ancestor_ptr.cast::<MemoryObject>() };
             let body_phys = crate::mm::paging::virt_to_phys(ptr.as_ptr() as u64);
             let offset = body_phys - ancestor_memory.base;
@@ -1843,7 +1869,8 @@ unsafe fn dealloc_object_one(
                 "SchedControl: every production cap is retype-backed (Phase-7 SEED)"
             );
             use crate::cap::retype::retype_free;
-            // SAFETY: ancestor_ptr non-null per 4b invariant.
+            // SAFETY: ancestor_ptr is non-null: every production object is
+            // retype-backed (`KernelObjectHeader::ancestor`).
             let ancestor_memory = unsafe { &*ancestor_ptr.cast::<MemoryObject>() };
             let body_phys = crate::mm::paging::virt_to_phys(ptr.as_ptr() as u64);
             let offset = body_phys - ancestor_memory.base;
@@ -1870,7 +1897,8 @@ unsafe fn dealloc_object_one(
                 "SbiControl: every production cap is retype-backed (Phase-7 SEED)"
             );
             use crate::cap::retype::retype_free;
-            // SAFETY: ancestor_ptr non-null per 4b invariant.
+            // SAFETY: ancestor_ptr is non-null: every production object is
+            // retype-backed (`KernelObjectHeader::ancestor`).
             let ancestor_memory = unsafe { &*ancestor_ptr.cast::<MemoryObject>() };
             let body_phys = crate::mm::paging::virt_to_phys(ptr.as_ptr() as u64);
             let offset = body_phys - ancestor_memory.base;
@@ -1899,9 +1927,13 @@ unsafe fn dealloc_object_one(
             let obj = unsafe { &*(ptr.as_ptr().cast::<ThreadObject>()) };
             let tcb = obj.tcb;
 
-            // Self-teardown guard (#341): a thread that deletes the last
-            // capability to its OWN Thread object reaches here as the running
-            // thread on this CPU. The drain gate below spins until `tcb` is no
+            // Self-teardown guard (#341): a dealloc of the running thread's own
+            // Thread object (a self-targeting SYS_CAP_REVOKE, a teardown cascade, or
+            // the deferred reclaim of an object a batched move dropped; SYS_CAP_DELETE
+            // refuses a direct self thread-cap delete) cannot pass the drain gate
+            // below; see core/kernel/docs/thread-lifecycle-and-sleep.md
+            // § Self-teardown (the caller is the freed thread).
+            // The drain gate below spins until `tcb` is no
             // longer `current` on any CPU — impossible for the running thread on
             // its own CPU (the spin runs with preemption disabled, so it never
             // reschedules), which wedges the CPU. Instead mark `Exited` + drain
@@ -1951,27 +1983,13 @@ unsafe fn dealloc_object_one(
 
             if !tcb.is_null()
             {
-                // Remove the TCB from the scheduler's run queue before freeing.
-                // Without this, the scheduler could dequeue a freed TCB pointer
-                // after this cap_delete completes — a use-after-free that
-                // corrupts the slab and/or causes a hang when the scheduler
-                // tries to context-switch to garbage state.
-                //
-                // Must use preferred_cpu (where the thread was last scheduled),
-                // NOT select_target_cpu (which load-balances and may return a
-                // completely different CPU). The TCB is only in the scheduler
-                // of the CPU where it was last enqueued.
-                //
-                // If the thread is still sched.current on its CPU (actively
-                // running or mid-context-switch), we must wait for the context
-                // Drain protocol per docs/thread-lifecycle-and-sleep.md
-                // § dealloc_object(Thread) Drain Protocol: lock every CPU
-                // (preferred_cpu is racy with concurrent enqueue_and_wake),
-                // commit Exited, drain queues, snapshot any reply-bound
-                // client for wake outside the all-locks region. The wake's
-                // target CPU is NOT snapshotted here: it is recomputed at the
-                // deferred wake site below, under the client's up-to-date state
-                // and excluding this (dealloc) CPU (#351).
+                // Remove the TCB from every run queue before freeing, so no scheduler
+                // can dequeue a freed TCB after this dealloc completes. Drain protocol
+                // per core/kernel/docs/thread-lifecycle-and-sleep.md
+                // § `dealloc_object(Thread)` Drain Protocol: lock every CPU, commit
+                // Exited, drain queues, and snapshot any reply-bound client for a wake
+                // outside the all-locks region; the wake's target CPU is recomputed at
+                // the deferred wake site below (#351).
                 let server_reply_wake: Option<*mut crate::sched::thread::ThreadControlBlock>;
                 // needless_range_loop: explicit indexing reads clearer for the
                 // parallel scheduler_for(cpu) accesses across all CPUs.
@@ -1984,13 +2002,11 @@ unsafe fn dealloc_object_one(
                         .load(core::sync::atomic::Ordering::Relaxed)
                         as usize;
 
-                    // Acquire (*tcb).sched_lock FIRST (outermost) so the Exited
-                    // write serialises with schedule()'s dispatch flip and
-                    // enqueue_and_wake/commit on the SAME per-TCB lock (STEP 4/5
-                    // data-race fix). Released right after the CPU locks below,
-                    // BEFORE the UAF gate (which re-enables interrupts and where a
-                    // CPU switching away from `tcb` needs tcb.sched_lock). Order
-                    // tcb.sched_lock → CPU locks matches schedule(), so no ABBA.
+                    // Acquire (*tcb).sched_lock first (outermost) so the Exited write
+                    // serialises with schedule()'s dispatch flip and enqueue_and_wake on the
+                    // same per-TCB lock; released right after the CPU locks below, before the
+                    // UAF gate. Order per core/kernel/docs/scheduling-internals.md § Lock
+                    // Hierarchy rule 4.
                     let tcb_sched_saved = (*tcb).sched_lock.lock_raw();
 
                     // Acquire all scheduler locks in ascending CPU order to
@@ -2019,20 +2035,11 @@ unsafe fn dealloc_object_one(
                         crate::sched::scheduler_for(cpu).remove_from_queue(tcb, prio);
                     }
 
-                    // A dying server orphans any reply-bound client. Claim the
-                    // reply slot (CAS) and DEFER the wake past the all-locks
-                    // release: deposit the resume disposition now, but leave the
-                    // client Blocked and route it through the GATED
-                    // enqueue_and_wake below. The client's Scheduling-group fields
-                    // (state/ipc_state/blocked_on_object) are written ONLY by
-                    // enqueue_and_wake under the CLIENT's own sched_lock — never
-                    // here under the server's locks. Writing `state = Ready` here
-                    // was the residual #284: a concurrent dealloc(client) marks the
-                    // client Exited under the client's sched_lock, racing this
-                    // unsynchronised Ready write, and the old enqueue_ready_thread
-                    // then linked the Exited-and-being-freed client → freed-but-
-                    // linked run-queue corruption / torn dispatch. The gated
-                    // enqueue_and_wake instead observes Exited and aborts the link.
+                    // A dying server orphans any reply-bound client: claim the reply slot
+                    // (CAS), deposit only the resume disposition, and leave the client
+                    // Blocked for the gated enqueue_and_wake below, per
+                    // core/kernel/docs/thread-lifecycle-and-sleep.md § `dealloc_object(Thread)`
+                    // Drain Protocol, step 5.
                     server_reply_wake = {
                         use core::sync::atomic::Ordering;
                         let bound = (*tcb).reply_tcb.load(Ordering::Acquire);
@@ -2134,19 +2141,11 @@ unsafe fn dealloc_object_one(
                 // until here and is cleared on every enqueue_and_wake exit path.
                 if let Some(bound) = server_reply_wake
                 {
-                    // #317 predecessor-of-free null: clear the claimed client's
-                    // `blocked_on_object` (which still points at THIS dying server,
-                    // `tcb`) under the CLIENT's sched_lock, BEFORE enqueue_and_wake.
-                    // This is the strict predecessor of retype_free that the
-                    // cancel_ipc_block / dealloc(client) CLOSURE LEMMA relies on: a
-                    // withdrawer reading `blocked_on == server` under the client
-                    // sched_lock thereby proves the server is not yet freed. It MUST
-                    // run here, while `bound` is still pinned by wake_in_flight = 1
-                    // (set at the claim above): for an Exited `bound` (a concurrent
-                    // dealloc(client) won the reap) enqueue_and_wake takes its Exited
-                    // arm and does NOT null blocked_on, and clearing wake_in_flight
-                    // there would unblock that dealloc(client) to retype_free `bound`
-                    // — so the null must precede the wake. Only the client's
+                    // Null the claimed client's `blocked_on_object` (still naming this dying
+                    // server) under the client's sched_lock, before enqueue_and_wake and while
+                    // wake_in_flight still pins `bound`: the CLOSURE LEMMA of
+                    // core/kernel/docs/scheduling-internals.md § Cross-CPU TCB Ownership.
+                    // Only the client's
                     // sched_lock is taken (the server's was released with the all-CPU
                     // locks above), so there is no two-TCB-sched_lock nesting.
                     // SAFETY: bound kept valid by wake_in_flight = 1 above.
@@ -2174,7 +2173,7 @@ unsafe fn dealloc_object_one(
                     // select_target_cpu_excluding is lock-free.
                     let bcpu =
                         unsafe { crate::sched::select_target_cpu_excluding(bound, Some(this_cpu)) };
-                    // G1: the reply-wake is never self-pinned to the wedged
+                    // The reply-wake is never self-pinned to the wedged
                     // dealloc CPU unless hard affinity names it or it is the only
                     // CPU.
                     debug_assert!(
@@ -2479,7 +2478,8 @@ unsafe fn dealloc_object_one(
                 (crate::sched::KERNEL_STACK_PAGES as u64 + 2) * crate::mm::PAGE_SIZE as u64,
                 |e| e.raw_bytes,
             );
-            // SAFETY: ancestor_ptr non-null per 4b invariant.
+            // SAFETY: ancestor_ptr is non-null: every production object is
+            // retype-backed (`KernelObjectHeader::ancestor`).
             let ancestor_memory = unsafe { &*ancestor_ptr.cast::<MemoryObject>() };
             // The wrapper sits one full page above the slot's base,
             // immediately after the kstack pages.
@@ -2790,20 +2790,18 @@ unsafe fn dealloc_object_one(
                      refcount invariant broken"
                 );
 
-                // Drain blocked senders and receivers with a zero return value.
-                // They will wake up and resume from sys_ipc_call / sys_ipc_recv,
-                // reading a zero-length message (effectively an ObjectGone hint).
-                // TODO: set TrapFrame return to SyscallError::ObjectGone when
-                // a proper per-thread wakeup error path is added.
+                // Drain blocked senders and receivers: senders resume INTERRUPTED (a
+                // queued fault sender KILL), receivers INTERRUPTED
+                // (core/kernel/docs/ipc-internals.md § Park Dispositions and Episodes).
                 // SAFETY: state validated non-null. The drain runs under ep.lock:
                 // a concurrent dealloc(waiter) BlockedOnSend/Recv unlink takes the
                 // same lock, so it cannot mutate these queues or free a waiter
                 // mid-walk, and the per-waiter wake_in_flight = 1 set here (the
                 // #160 discipline) makes any dealloc(waiter) that already left the
                 // queue wait at its wake-in-flight gate for our enqueue_and_wake
-                // rather than free the TCB under it. Lock order ep.lock (source) →
-                // sched_lock → run-queue lock is canonical, so holding ep.lock
-                // across enqueue_and_wake is deadlock-free.
+                // rather than free the TCB under it. Holding ep.lock across
+                // enqueue_and_wake follows core/kernel/docs/scheduling-internals.md § Lock
+                // Hierarchy rule 1.
                 unsafe {
                     let ep = &mut *state;
                     let saved = ep.lock.lock_raw();
@@ -2877,7 +2875,8 @@ unsafe fn dealloc_object_one(
             );
             // Wrapper + state live in-place inside the ancestor Memory cap's
             // region. Drop in place, return the slot to the per-Memory
-            // allocator, then dec_ref the ancestor — recursing if it hits zero.
+            // allocator, then dec_ref the ancestor — cascading through the
+            // worklist if it hits zero.
             use crate::cap::retype::{dispatch_for, retype_free};
             // dispatch_for is total over the kernel's retypable types; the
             // Endpoint arm always returns Some. Unwrap-or-fall-through with
@@ -2916,16 +2915,16 @@ unsafe fn dealloc_object_one(
             // Return the bytes to the per-Memory allocator.
             retype_free(ancestor_memory, offset, raw_bytes);
 
-            // Drop the retype-time refcount lease. If this Memory cap has no
-            // remaining slots and no descendants, recurse to free the cap
-            // itself; the recursion is bounded by ancestor depth.
+            // Drop the retype-time refcount lease. If this was the Memory cap's last
+            // reference, push it onto the cascade worklist; dealloc_object frees it on
+            // a later iteration (the Memory arm returns its buddy pages).
             let ancestor_nn =
                 // SAFETY: ancestor_ptr is non-null per debug_assert.
                 unsafe { core::ptr::NonNull::new_unchecked(ancestor_ptr) };
             let new_rc = ancestor_memory.header.dec_ref();
             if new_rc == 0
             {
-                // SAFETY: refcount reached 0; recursion handles the Memory
+                // SAFETY: refcount reached 0; the worklist runs the Memory
                 // arm above (which frees the buddy pages).
                 push_ancestor(worklist, head, ancestor_nn);
             }
@@ -2965,9 +2964,8 @@ unsafe fn dealloc_object_one(
                      refcount invariant broken"
                 );
 
-                // Wake a blocked waiter with wakeup_value = 0.
-                // TODO: return SyscallError::ObjectGone when a proper wakeup
-                // error path is available in sys_notification_wait.
+                // Wake a blocked waiter with wakeup_value = 0 and no Interrupted stamp:
+                // its SYS_NOTIFICATION_WAIT returns success with no bits (#443).
                 // SAFETY: state validated non-null. Claim the waiter under sig.lock
                 // — the #160 discipline notification_send uses — so a concurrent
                 // dealloc(waiter) BlockedOnNotification unlink (which takes sig.lock
@@ -3035,14 +3033,15 @@ unsafe fn dealloc_object_one(
 
             retype_free(ancestor_memory, offset, raw_bytes);
 
-            // Drop the retype-time refcount lease; recurse on full release.
+            // Drop the retype-time refcount lease; on full release, queue the Memory
+            // cap on the cascade worklist.
             let ancestor_nn =
                 // SAFETY: ancestor_ptr non-null.
                 unsafe { core::ptr::NonNull::new_unchecked(ancestor_ptr) };
             let new_rc = ancestor_memory.header.dec_ref();
             if new_rc == 0
             {
-                // SAFETY: refcount reached 0; recurse to free the Memory cap.
+                // SAFETY: refcount reached 0; queue the Memory cap on the cascade worklist.
                 push_ancestor(worklist, head, ancestor_nn);
             }
         }
@@ -3082,7 +3081,9 @@ unsafe fn dealloc_object_one(
                      refcount invariant broken"
                 );
 
-                // Wake any blocked waiter with `ObjectGone`. The inline
+                // Wake any blocked waiter with a zero payload and no Interrupted stamp:
+                // its SYS_EVENT_RECV returns success with a payload of 0 that was never
+                // posted (#443). The inline
                 // ring is part of this slot and gets reclaimed below
                 // alongside the wrapper + state via `retype_free`.
                 // SAFETY: state non-null and live.
@@ -3184,7 +3185,8 @@ unsafe fn dealloc_object_one(
 
 // ── CSpace teardown helpers ──────────────────────────────────────────────────
 
-/// Maximum derivation-link edits per `DERIVATION_LOCK` hold while draining
+/// Maximum drain steps (slots visited plus derivation-link edits) per
+/// `DERIVATION_LOCK` hold while draining
 /// a dying `CSpace` (mirrors `MAX_REVOKE_EDITS`): teardown of an
 /// arbitrarily large donor-funded `CSpace` releases the global lock
 /// between batches, so concurrent derivation traffic never stalls behind
@@ -3220,9 +3222,10 @@ const MAX_DRAIN_EDITS: usize = 256;
 /// cyclic chain instead of spinning. Work can still arrive between holds
 /// — the `CSpace` stays registered until the final batch, so a foreign
 /// `SYS_CAP_DELETE` of a slot whose parent is a dying slot reparents that
-/// slot's children into the dying slot, and a surviving thread of the
-/// owning process can derive out of the dying `CSpace` via its TCB
-/// pointer or have an in-flight `ipc_recv` delivery land caps into it.
+/// slot's children into the dying slot, and a capability transfer that
+/// committed to a receiver there before that receiver was stopped can land
+/// caps into it (every bound thread is stopped before the drain, so none
+/// derives out of it).
 /// Each such event adds at most one reparent batch of work while the
 /// drain removes a batch per hold, so the loop is bounded by lock
 /// contention rather than by a constant, and it carries no batch backstop
@@ -3231,11 +3234,11 @@ const MAX_DRAIN_EDITS: usize = 256;
 /// deleting, which stalls the deleting thread, not the system. Links
 /// wired behind the cursor dangle once the `CSpace` unregisters and
 /// surface downstream as dead-link truncation, in the drain's own
-/// containment or `revoke_subtree_batch`'s — contained, and in the
-/// owning-process case reachable only by the dying process harming
-/// itself. The end state otherwise matches the previous whole-drain
-/// design: no slot anywhere references the dying `CSpace`, which is the
-/// invariant `free_cspace_id` recycling relies on.
+/// containment or `revoke_subtree_batch`'s — contained (see
+/// core/kernel/docs/capability-internals.md § Revocation Algorithm).
+/// Apart from those links, the end state is that no slot anywhere
+/// references the dying `CSpace`, which is the invariant `free_cspace_id`
+/// recycling relies on.
 ///
 /// Returns `true` once the whole `CSpace` is drained; `false` when the
 /// step budget ran out (call again — the cursor resumes at the same

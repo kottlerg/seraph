@@ -7,11 +7,13 @@
 //! the thread's bound fault-handler endpoint and block until it is resolved.
 //!
 //! This is the shared, architecture-independent core of the fault-handler
-//! protocol (`docs/fault-handling.md`). The architecture fault handlers (x86-64
-//! `#PF`, RISC-V page-fault traps) marshal their register frame into the
-//! canonical [`TrapFrame`] the handler will read/edit, then call
-//! [`fault_dispatch`]; the disposition it returns tells the arch handler
-//! whether to resume (re-execute the faulting instruction) or kill.
+//! protocol (`docs/fault-handling.md`). The architecture trap handlers (x86-64
+//! `#PF` and the other user exception vectors; RISC-V page-fault and other
+//! U-mode exception causes) build a [`FaultInfo`] of kind `FAULT_KIND_VM` or
+//! `FAULT_KIND_EXCEPTION`, marshal their register frame into the canonical
+//! [`TrapFrame`] the handler will read/edit, then call [`fault_dispatch`]; the
+//! disposition it returns tells the arch handler whether to resume
+//! (re-execute the faulting instruction) or kill.
 //!
 //! Delivery reuses the synchronous-IPC machinery: the faulting thread takes the
 //! caller role (parked in [`IpcThreadState::BlockedOnFault`] rather than
@@ -112,8 +114,8 @@ pub unsafe fn fault_dispatch(tcb: *mut ThreadControlBlock, info: &FaultInfo) -> 
         (*tcb).in_fault_delivery = true;
         // Open the park episode (the fault protocol's disposition stays in
         // fault_outcome; the episode counter is the shared debug
-        // spurious-resume tripwire — see ipc-internals.md § Reply Disposition
-        // and Park Episodes).
+        // spurious-resume tripwire; see core/kernel/docs/ipc-internals.md
+        // § Park Dispositions and Episodes).
         #[cfg(debug_assertions)]
         (*tcb).park_episode.fetch_add(1, Ordering::Relaxed);
     }
@@ -126,9 +128,11 @@ pub unsafe fn fault_dispatch(tcb: *mut ThreadControlBlock, info: &FaultInfo) -> 
     msg.data[3] = info.ip;
     msg.data_count = 4;
 
-    // SAFETY: ep_state is a valid EndpointState; no scheduler lock held. The
-    // BlockedOnFault parked-state diverges from a normal call only in the
-    // committed IpcThreadState; the reply linkage is identical.
+    // SAFETY: ep_state is a valid EndpointState (the binding's inc_ref keeps it
+    // live); tcb is the current CPU's running thread (this fn's contract); no
+    // scheduler or IPC lock is held (# Preconditions). The BlockedOnFault
+    // parked-state diverges from a normal call only in the committed
+    // IpcThreadState; the reply linkage is identical.
     let result = unsafe {
         crate::ipc::endpoint::endpoint_call(ep_state, tcb, &msg, IpcThreadState::BlockedOnFault)
     };

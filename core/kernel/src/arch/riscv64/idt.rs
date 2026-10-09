@@ -7,8 +7,9 @@
 //!
 //! RISC-V has no IDT. The equivalent mechanism is the `stvec` CSR, which
 //! holds the trap vector base address. `load()` reinstalls `stvec` on the
-//! current hart — the RISC-V counterpart to `lidt` — and must be called on
-//! every hart (BSP and each AP) during per-hart hardware init.
+//! current hart — the RISC-V counterpart to `lidt`. `stvec` is per-hart: the
+//! BSP writes it in `interrupts::init()`, and each AP calls `load()` from
+//! `kernel_entry_ap`.
 
 /// Install the kernel trap vector on the current hart.
 ///
@@ -28,5 +29,8 @@ pub unsafe fn load()
 }
 
 /// No-op stub for host tests (no hardware available).
+///
+/// # Safety
+/// No preconditions — the body is empty.
 #[cfg(test)]
 pub unsafe fn load() {}

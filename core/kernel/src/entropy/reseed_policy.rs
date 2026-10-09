@@ -9,17 +9,10 @@
 //! tries. Pure and host-testable; the per-CPU generator supplies its
 //! bookkeeping and acts on the returned [`Action`].
 //!
-//! Two tiers:
-//! - **Mandatory** reseeds block on the pool lock. They are the correctness
-//!   tier: a never-seeded generator must not emit output, a VMGENID change
-//!   means the whole VM state (pool and generator included) may be a replayed
-//!   snapshot, and a generator far past its time budget must not keep
-//!   deferring forever under sustained pool-lock contention.
-//! - **Opportunistic** reseeds are hygiene: the draw-count interval and the
-//!   time budget bound how much output depends on any single seed. They use
-//!   the non-spinning pool path and defer one draw when the lock is
-//!   contended, so a tight-loop consumer cannot amplify cross-CPU
-//!   interrupts-off tail latency on the pool leaf lock.
+//! Two tiers: **Mandatory** reseeds use the blocking pool path;
+//! **Opportunistic** reseeds use the non-spinning path and defer one draw on
+//! contention. The triggers and their rationale are specified in
+//! [entropy.md](../../docs/entropy.md) § Per-CPU CSPRNG and reseed policy.
 
 /// Draws between reseeds. Bounds how much output depends on any single seed
 /// without making reseeding (a pool lock + permutations) a per-draw cost.

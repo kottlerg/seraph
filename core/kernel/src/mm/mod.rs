@@ -47,15 +47,14 @@ pub fn user_va_top() -> u64
 /// Physical frame allocator, populated during Phase 2.
 ///
 /// Stored as a crate-level static to avoid placing a ~41 KiB struct on the
-/// kernel's 64 KiB boot stack. Access is single-threaded during boot; SMP
-/// is not yet active.
+/// kernel's 64 KiB boot stack. Phases 2-5 reach it through a direct `&mut`
+/// on the single boot thread, before SMP bringup; every later access goes
+/// through `with_frame_allocator`.
 ///
 /// # Safety
 ///
 /// Accessed only from the single boot thread before SMP is enabled, or
 /// through `with_frame_allocator` after Phase 2.
-// SAFETY: accessed only from the single boot thread before SMP is enabled,
-// or through with_frame_allocator after Phase 2.
 pub(crate) static mut FRAME_ALLOCATOR: BuddyAllocator = BuddyAllocator::new();
 
 /// Spin-lock protecting all access to `FRAME_ALLOCATOR`.
@@ -93,9 +92,11 @@ fn release_frame_alloc_lock()
 /// Call `f` with exclusive access to the frame allocator.
 ///
 /// Acquires `FRAME_ALLOC_LOCK`, grants `f` a mutable reference to
-/// `FRAME_ALLOCATOR`, then releases the lock. Use this for direct frame
-/// allocation (kernel stack allocation, page table frame allocation) from
-/// syscall handlers or runtime kernel code.
+/// `FRAME_ALLOCATOR`, then releases the lock. Its callers are boot-time
+/// reservations, owned-range ledger registration, and diagnostics; after the
+/// Phase-7 seal the buddy allocates nothing, and the `owns_memory` dealloc
+/// `free_range` is a tripwire (docs/userspace-memory-model.md § Ownership
+/// Boundaries).
 ///
 /// # Safety
 ///

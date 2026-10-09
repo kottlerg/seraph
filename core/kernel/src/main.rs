@@ -10,23 +10,9 @@
 //! CPU-state contract and the `abi/boot-protocol` crate for the `BootInfo`
 //! layout.
 //!
-//! Initialization phases implemented here:
-//! - Phase 0: validate `BootInfo` (pre-console; halts silently on failure).
-//! - Phase 1: initialize early console (serial + framebuffer); emit startup banner.
-//! - Phase 2: parse memory map, populate buddy frame allocator.
-//! - Phase 3: install kernel page tables (direct physical map + W^X image).
-//! - Phase 4: typed-memory cap surface (no `GlobalAlloc`; bodies sourced from caps);
-//!   cache `kernel_mmio` for Phase 5.
-//! - Phase 5: architecture hardware init (GDT/IDT/APIC or stvec/PLIC, timer, syscall);
-//!   seed the entropy pool and scrub the boot seed and KASLR bases from `BootInfo`.
-//! - Phase 6: validate the `mmio_apertures` slice before capability minting.
-//! - Phase 7: initialise capability subsystem; mint root `CSpace` with initial hardware caps;
-//!   mint reclaimable Memory caps over bootloader scratch pages (`BootInfo`,
-//!   descriptor arrays, transient PT frames) so they flow to userspace via the
-//!   standard `CapDescriptor` path.
-//! - Phase 8: initialise per-CPU scheduler state and idle threads, start APs,
-//!   and retire the AP trampoline identity mapping into a reclaimable Memory cap.
-//! - Phase 9: create init process address space + TCB; hand off root `CSpace`; enter user mode.
+//! Runs boot phases 0 to 9 as `core/kernel/docs/initialization.md` defines them
+//! (`kernel_entry` through the boot-stack rebase, then `kernel_entry_post_rebase`),
+//! ending in `sched::enter`.
 
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(not(test), no_main)]
@@ -144,15 +130,12 @@ fn report_kaslr(_flags: u32, _image_base: u64, _dm_base: u64) {}
 // obscure the sequential phase structure without reducing actual complexity.
 // not_unsafe_ptr_arg_deref: boot_info is validated (null + alignment) before deref;
 // the function is `extern "C"` and cannot be marked unsafe per the ABI contract.
-// needless_range_loop/cast_possible_truncation: cpu_idx loop uses the index directly
-// as both slice index and CPU ID; Seraph never has > 2^32 CPUs.
-// similar_names: the boot_cpu_count/boot_cpu_ids and kaslr_image_base/kaslr_dm_base
-// pairs are the BootInfo field names; renaming them would hide the correspondence.
+// similar_names: boot_cpu_count/boot_cpu_ids and kaslr_image_base/kaslr_dm_base
+// copy the BootInfo cpu_count/cpu_ids and kernel_virtual_base/direct_map_base
+// pairs; the shared prefix keeps that provenance visible.
 #[allow(
     clippy::too_many_lines,
     clippy::not_unsafe_ptr_arg_deref,
-    clippy::needless_range_loop,
-    clippy::cast_possible_truncation,
     clippy::similar_names
 )]
 #[unsafe(no_mangle)]
@@ -320,10 +303,12 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
 /// from the boot thread, and never returns.
 // too_many_arguments: the boot state read out of BootInfo before Phase 3 must
 // cross the `#[inline(never)]` boundary as explicit arguments.
-// too_many_lines, cast_possible_truncation, needless_range_loop, similar_names:
-// the same rationale as `kernel_entry`, whose body this continues.
+// too_many_lines, similar_names: the same rationale as `kernel_entry`, whose
+// body this continues.
+// needless_range_loop/cast_possible_truncation: the AP-startup loop uses
+// cpu_idx directly as both slice index and CPU ID; Seraph never has > 2^32 CPUs.
 // large_types_passed_by_value: boot_cpu_ids ([u32; 512] = 2 KiB) and init_image
-// (272 B) cross the by-value/by-reference threshold. The `#[inline(never)]`
+// (304 B) cross the by-value/by-reference threshold. The `#[inline(never)]`
 // boundary is what defeats the cross-rebase hoist; the by-value signature is
 // incidental — the ABI passes both via hidden-pointer and emits an explicit
 // memcpy into the callee's stack frame either way. Single boot-path copy;
@@ -376,13 +361,10 @@ unsafe fn kernel_entry_post_rebase(
     // memory machinery is ready as soon as `SEED_MEMORY` is installed in
     // Phase 7.
     //
-    // Note on bootloader page table frame reclamation:
-    // Bootloader transient page-table frames are now recorded in
-    // `BootInfo.reclaim_ranges` (boot protocol v7) and minted into init's
-    // CSpace by `cap::mint_reclaim_memory_caps`. The remaining un-reclaimed
-    // category is `BOOT_TABLE_POOL` (BSS array): part of the kernel image,
-    // cannot be freed to buddy; the unused portion (~750 KiB) is acceptable
-    // waste.
+    // Bootloader transient page-table frames are reclaimed through
+    // `BootInfo.reclaim_ranges` (core/kernel/docs/initialization.md § Phase 3
+    // and § Phase 7). `BOOT_TABLE_POOL` (BSS array) is part of the kernel image
+    // and cannot be freed to buddy; its unused portion is accepted waste.
     kprintln!("Phase 4: Typed-Memory Cap Surface (no kernel heap)");
 
     // Cache `BootInfo.kernel_mmio` so Phase 5 arch hardware init can read
@@ -391,11 +373,11 @@ unsafe fn kernel_entry_post_rebase(
     // SAFETY: single-threaded boot; called exactly once, after Phase 3.
     unsafe { platform::capture_kernel_mmio(boot_info_phys) };
 
-    // Allocate per-CPU storage slabs (SCHEDULERS, IDLE_TCBS, AP TSS/GDT/IST
-    // on x86) sized to boot_cpu_count. Must precede Phase 5: timer::init
-    // arms the BSP timer, and timer_tick reads the scheduler slab via
-    // CPU_COUNT + SCHEDULERS_PTR. Replaces the prior MAX_CPUS-sized BSS
-    // tables with dynamically sized allocations.
+    // Allocate the per-CPU storage slabs (`sched::init_storage`: scheduler,
+    // idle TCB and idle-stack slabs, idle stacks, PerCpuData and APIC IDs, and
+    // the x86-64 AP GDT/TSS/IST tables) sized to boot_cpu_count. Must precede
+    // Phase 5: timer::init arms the BSP timer, and timer_tick reads the
+    // scheduler slab via CPU_COUNT + SCHEDULERS_PTR.
     sched::init_storage(boot_cpu_count, allocator);
 
     // Allocate entropy subsystem storage (per-CPU CSPRNGs, jitter accumulators,
@@ -486,13 +468,11 @@ unsafe fn kernel_entry_post_rebase(
             entropy::init(&seed[..n], vmgenid_paddr);
         }
 
-        // Scrub the KASLR/entropy secrets once consumed. The BootInfo page is a
-        // reclaim range donated to userspace at Phase 7 (memmgr re-hands its
-        // frames without zeroing), so none of them may survive there. The pool
-        // retains the entropy — the seed itself is secret (it feeds key/nonce
-        // generation), and the randomized kernel image and direct-map bases
-        // defeat KASLR if disclosed. All Phase-3 consumers of the two bases
-        // have run; later phases read only layout-free BootInfo fields.
+        // Scrub the boot seed, its length, and the two KASLR bases once consumed:
+        // the BootInfo page is a Phase-7 reclaim range donated to userspace
+        // (core/kernel/docs/cross-boundary-disclosure.md § Kernel state in donated
+        // memory). All Phase-3 consumers of the two bases have run; later phases
+        // read only layout-free BootInfo fields.
         // SAFETY: as above. Volatile stores so the scrub of this donated page
         // cannot be elided as a dead store.
         unsafe {
@@ -534,8 +514,9 @@ unsafe fn kernel_entry_post_rebase(
     // ── Phase 8: scheduler ────────────────────────────────────────────────────
     // Initialise per-CPU scheduler state and create idle threads.
     // cpu_count from BootInfo (populated by bootloader from ACPI MADT / DTB).
-    // APs are not yet started; sched::init allocates idle threads for all CPUs
-    // so AP startup can call sched::ap_enter without re-allocating.
+    // APs are not yet started; sched::init initialises an idle TCB for every CPU
+    // in the per-CPU storage allocated in Phase 4, so AP startup can call
+    // sched::ap_enter without allocating.
     kprintln!("Phase 8: Scheduler and SMP Bringup");
     let cpu_count = sched::init(boot_cpu_count);
     kprintln!(
@@ -544,16 +525,10 @@ unsafe fn kernel_entry_post_rebase(
         if cpu_count == 1 { "" } else { "s" }
     );
 
-    // SMP startup brings every AP online using the per-CPU idle threads
-    // `sched::init` just allocated. APs depend only on Phase 5/8 state
-    // (interrupts, percpu, scheduler idle threads); they never touch
-    // init's AS or any Phase-9 state. Each architecture implements
-    // `ap_trampoline::setup_trampoline` and `ap_trampoline::start_ap`
-    // behind the `arch::current` facade. APs enter their idle loops
-    // and increment `APS_READY`; the BSP's Acquire load on `APS_READY`
-    // doubles as the barrier guaranteeing every AP has jumped from the
-    // trampoline page to its kernel-VA entry, making the physical page
-    // safe to retire from the identity map immediately below.
+    // SMP startup brings every AP online on the idle threads `sched::init` just
+    // initialised, through `ap_trampoline::setup_trampoline` / `start_ap` behind
+    // the `arch::current` facade; the APS_READY dependency and barrier rules are
+    // in core/kernel/docs/initialization.md § Phase 8.
     #[cfg(not(test))]
     {
         let ap_count = (boot_cpu_count - 1) as usize;
@@ -571,7 +546,8 @@ unsafe fn kernel_entry_post_rebase(
 
                 // Copy/patch the trampoline code into the physical page.
                 // SAFETY: direct physical map active (Phase 3); trampoline_pa
-                // from BootInfo points to bootloader-allocated RWX page <1 MiB.
+                // from BootInfo points to the bootloader-allocated trampoline page
+                // (below 1 MiB on x86-64; any 4 KiB frame on RISC-V).
                 unsafe {
                     arch::current::ap_trampoline::setup_trampoline(trampoline_pa);
                 }
@@ -624,14 +600,9 @@ unsafe fn kernel_entry_post_rebase(
     #[cfg(not(test))]
     entropy::selftest::run(cpu_count as usize);
 
-    // With every AP executing at kernel virtual addresses, the low-VA
-    // identity-RWX mapping at `trampoline_pa` (installed in Phase 3 on
-    // both arches; required for the post-`csrw satp` / post-CR3-write
-    // instructions inside the trampoline to fetch correctly) is no
-    // longer reachable by any code path. Tear it down with a TLB
-    // shootdown across all online CPUs, then mint a reclaimable Memory
-    // cap over the page so it reaches init via the standard
-    // `CapDescriptor` walk.
+    // With every AP executing at kernel virtual addresses, retire the low-VA
+    // identity mapping at `trampoline_pa` (TLB shootdown), zero the page, and
+    // mint its late-reclaim Memory cap (core/kernel/docs/initialization.md § Phase 8).
     #[cfg(not(test))]
     if trampoline_pa != 0
     {
@@ -653,11 +624,9 @@ unsafe fn kernel_entry_post_rebase(
                 core::ptr::write_volatile(page.add(i), 0);
             }
         }
-        // Re-resolve `BootInfo` through the direct physical map. The
-        // original `info` reference points to the bootloader's
-        // identity-mapped VA, which Phase 3 unmapped; reading through it
-        // here would page-fault. (Phase 7's `cap::init_capability_system`
-        // does the same translation when called with `boot_info_phys`.)
+        // Re-resolve `BootInfo` through the direct physical map; Phase 3 left
+        // no identity mapping of it. (Phase 7's `cap::init_capability_system`
+        // does the same translation from `boot_info_phys`.)
         // SAFETY: direct map covers all RAM since Phase 3; boot_info
         // physical address validated in Phase 0.
         let info_dm = unsafe { &*(mm::paging::phys_to_virt(boot_info_phys) as *const BootInfo) };
@@ -739,9 +708,9 @@ unsafe fn kernel_entry_post_rebase(
         }
 
         // Insert an AddressSpace cap for init's own address space into the root
-        // CSpace, followed by Memory caps for each init segment. These are needed
-        // so init can create child threads bound to its own address space and map
-        // its code pages into child processes once a process manager is available.
+        // CSpace (so init can create threads bound to it), followed by a reclaimable
+        // Memory cap per init segment, which init donates to memmgr's pool at reap
+        // (docs/process-lifecycle.md § Init reap).
         let (init_aspace_cap_slot, segment_memory_base, segment_memory_count) = {
             use cap::object::{KernelObjectHeader, MemoryObject, ObjectType};
             use cap::slot::{AsRights, MemRights};
@@ -758,11 +727,12 @@ unsafe fn kernel_entry_post_rebase(
             // Memory caps for each init segment (phys base + size + permissions).
             // Minted reclaimable: full byte ledger + `owns_memory = true` +
             // `register_owned_range` so init's reap-handoff donation
-            // (`procmgr.REGISTER_INIT_TEARDOWN` → `memmgr.DONATE_FRAMES`)
+            // (`procmgr.REGISTER_INIT_TEARDOWN` → `memmgr.DONATE_MEMORY_CAPS`)
             // routes these pages into memmgr's pool. The segments live in EFI
-            // LoaderData (not in the buddy free list at boot — see `mm/init.rs`
-            // exclusion list), so `register_owned_range` accounts for them in
-            // the buddy's `total_pages` ledger. memmgr holds the cap from then
+            // LoaderData (not in the buddy free list at boot — see
+            // `core/kernel/src/mm/init.rs` `collect_exclusions`), so
+            // `register_owned_range` accounts for them in the buddy's
+            // `total_pages` ledger. memmgr holds the cap from then
             // on; the post-handoff buddy is sealed, so the `dealloc_object` →
             // `free_range` path is a tripwire, not an expected reclaim.
             let seg_count = init_image.segment_count as usize;
@@ -779,7 +749,7 @@ unsafe fn kernel_entry_post_rebase(
                 // `map_segment` above, so a writable cap cannot widen a running
                 // segment. A narrower cap donates a non-writable frame that
                 // fails downstream writable maps. Mirrors the boot-module and
-                // reclaim-scratch mints (`cap/mod.rs`).
+                // reclaim-scratch mints (`core/kernel/src/cap/mod.rs`).
                 let rights =
                     MemRights::MAP | MemRights::WRITE | MemRights::EXECUTE | MemRights::RETYPE;
                 // The bootloader encodes the ELF in-page offset into
@@ -794,7 +764,7 @@ unsafe fn kernel_entry_post_rebase(
                 let in_page_off = seg.phys_addr & page_mask;
                 let size_aligned = (in_page_off + seg.size + page_mask) & !page_mask;
                 // SAFETY: segment phys range is disjoint from buddy
-                // free list (excluded in `mm/init.rs::collect_exclusions`)
+                // free list (excluded in `core/kernel/src/mm/init.rs` `collect_exclusions`)
                 // and from boot module ranges; single-threaded boot.
                 unsafe {
                     crate::mm::with_frame_allocator(|alloc| {
@@ -836,7 +806,8 @@ unsafe fn kernel_entry_post_rebase(
         // init's address space starting at the chosen InitInfo VA. Each backing page
         // also gets a reclaimable Memory cap minted into init's CSpace so the
         // pages flow into memmgr's pool through init's reap-handoff donate
-        // path (see `services/init/src/service.rs` end-of-phase-3).
+        // path (`register_init_reap_objects` in `services/init/src/service.rs`,
+        // init's Handover stage per services/init/docs/bootstrap.md).
         let info_page_virt = {
             use cap::object::{KernelObjectHeader, MemoryObject, ObjectType};
             use cap::slot::MemRights;
@@ -927,7 +898,9 @@ unsafe fn kernel_entry_post_rebase(
             // enforced above, so it fits within the reserved extent.
             let block_phys = cap::take_init_info_block_phys();
             let block_virt = mm::paging::phys_to_virt(block_phys) as *mut u8;
-            // SAFETY: just allocated; valid for block_pages * PAGE_SIZE bytes.
+            // SAFETY: block_phys is the InitInfo block reserved at Phase 7
+            // (INIT_INFO_MAX_PAGES contiguous pages, kernel-owned); block_pages <=
+            // INIT_INFO_MAX_PAGES, so the range is valid through the direct map.
             unsafe {
                 core::ptr::write_bytes(block_virt, 0, block_pages * mm::PAGE_SIZE);
             }
@@ -1082,12 +1055,10 @@ unsafe fn kernel_entry_post_rebase(
         };
 
         // Map init's user stack (INIT_STACK_PAGES pages below the chosen stack
-        // top) and mint a reclaimable Memory cap for each backing page. Inlined
-        // (rather than calling `map_stack`) so we capture each phys address
-        // for cap minting; `register_owned_range` accounts for the pages in
-        // the buddy's `total_pages` ledger. The caps route to memmgr via reap;
-        // post-handoff the buddy is sealed, so the dealloc `free_range` path
-        // is a tripwire, not an expected reclaim.
+        // top) from the frames reserved at Phase 7, and mint a reclaimable Memory
+        // cap for each backing page; the frames are already in the buddy's
+        // `total_pages` ledger. The caps reach memmgr at init's reap
+        // (docs/process-lifecycle.md § Init reap).
         let (init_stack_memory_base, init_stack_memory_count) = {
             use cap::object::{KernelObjectHeader, MemoryObject, ObjectType};
             use cap::slot::MemRights;
@@ -1201,14 +1172,12 @@ unsafe fn kernel_entry_post_rebase(
             cap::owns_memory_minted_bytes() / 1024,
         );
 
-        // Every page Phase 8/9 consumes was pre-reserved before the Phase-7
-        // drain, which then took 100% of the remainder, so the post-handoff
-        // buddy is empty: every page of RAM is either a named kernel
-        // reservation or minted to userspace. The reap-time reverse path has
-        // not run yet, so any nonzero free count here is a Phase-7 reservation
-        // or drain bug. debug_assert, not assert: a stray free page wastes RAM
-        // but keeps the all-RAM-accounted identity sound (kernel_reserved is
-        // its complement), so it must not brick a release boot; CI's debug
+        // Every page Phase 8/9 consumes was reserved before the Phase-7 drain, so
+        // the post-handoff buddy is empty (docs/userspace-memory-model.md § Ownership
+        // Boundaries). The reap-time reverse path has not run yet, so any nonzero
+        // free count here is a Phase-7 reservation or drain bug. debug_assert, not
+        // assert: a stray free page wastes RAM but keeps kernel_reserved (its
+        // complement) sound, so it must not brick a release boot; CI's debug
         // matrix enforces it.
         let buddy_free = crate::mm::with_frame_allocator(|alloc| alloc.free_page_count());
         kprintln!("init: post-handoff buddy free={buddy_free} pages");
@@ -1219,7 +1188,7 @@ unsafe fn kernel_entry_post_rebase(
 
         // Retype a 6-page slab from SEED_MEMORY for init's Thread:
         //   pages 0..3 — kernel stack (KERNEL_STACK_PAGES = 4 = 16 KiB)
-        //   page 4   — ThreadObject (24 B) followed by ThreadControlBlock
+        //   page 4   — ThreadObject (32 B) followed by ThreadControlBlock
         //   page 5   — per-thread FPU/SIMD/V save area
         // Mirrors the layout established in `sys_cap_create_thread`.
         // items_after_statements: the constant is documented by the comment
@@ -1442,18 +1411,11 @@ unsafe fn kernel_entry_post_rebase(
         kprintln_serial!("init: kernel stack top={init_kstack_top:#x}");
 
         // ── Boot-handover ledger ────────────────────────────────────────────
-        // Sum MemoryObject.available_bytes across every Memory cap in init's
-        // CSpace plus SEED's residual reserve. After Phase 7 installs
-        // SEED_MEMORY, SEED is the kernel's ongoing body source for
-        // split-derived wrappers and per-thread IOPB pages; printing both
-        // makes the invariant
-        //
-        //   total_RAM == kernel_static_image_size + Σ per-CPU kstack pages
-        //                + SEED_available + Σ caps_available
-        //                + bootloader-loaded modules
-        //
-        // observable byte-for-byte: the kernel allocates nothing outside the
-        // typed-memory paths.
+        // Report MemoryObject.available_bytes summed across every Memory cap in
+        // init's CSpace, SEED's residual reserve (the kernel's ongoing body source
+        // for split-derived wrappers and per-thread IOPB pages), and the per-CPU
+        // kernel stacks. The RAM accounting identity is defined in
+        // docs/userspace-memory-model.md § Ownership Boundaries.
         // SAFETY: init_cspace_ptr is the root CSpace, single-threaded boot.
         let cap_available_bytes = unsafe { cap::sum_memory_available_bytes(&*init_cspace_ptr) };
         let seed_available_bytes = cap::seed_memory_ref()
@@ -1579,10 +1541,10 @@ pub extern "C" fn kernel_entry_ap(cpu_id: u32, ist1_top: u64, ist2_top: u64) -> 
     // lazily from the pool (already seeded in Phase 5) on this first draw.
     entropy::init_ap();
 
-    // 6. Notification BSP that this AP is ready.
+    // 7. Notify the BSP that this AP is ready.
     APS_READY.fetch_add(1, Ordering::Release);
 
-    // 7. Enter idle loop (never returns).
+    // 8. Enter idle loop (never returns).
     sched::ap_enter(cpu_id)
 }
 
@@ -1678,14 +1640,12 @@ static PANIC_DUMP_READY: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
 /// Best-effort panic context: CPU, current thread, the in-flight syscall, and a
-/// kernel-text stack scan. The in-flight syscall is the load-bearing line for
-/// issue #316: a torn-context (#314) makes a syscall execute with garbage
-/// register args, which reach a stdlib precondition (`slice::get_unchecked`) and
-/// panic — this dump shows the syscall + args, pinning kernel-side corruption vs
-/// a deterministic kernel bug. Serial-only / lock-bypassing, mirroring the panic
-/// banner. Skips entirely until the per-CPU subsystem is initialized
-/// (`PANIC_DUMP_READY`); after that every read is null-checked or stack-bounded,
-/// so the dump cannot fault.
+/// kernel-text stack scan. The in-flight syscall line shows the syscall number
+/// and arguments, separating a panic reached from corrupted syscall register
+/// arguments from a deterministic kernel bug. Serial-only / lock-bypassing,
+/// mirroring the panic banner. Skips entirely until the per-CPU subsystem is
+/// initialized (`PANIC_DUMP_READY`); after that every read is null-checked or
+/// stack-bounded, so the dump cannot fault.
 ///
 /// # Safety
 /// Called only from the panic handler.
@@ -1740,8 +1700,9 @@ unsafe fn panic_context_dump()
 
 /// Scan the current kernel stack for words in the kernel `.text` range and print
 /// them as probable return addresses (resolve offline with addr2line against the
-/// kernel ELF). Frame pointers are not forced (dev `opt-level=1` / release
-/// `opt-level="s"`), so this is a heuristic scan, not an exact unwind. Bounded by
+/// kernel ELF). Frame pointers are not forced (opt-level = 2 in both profiles;
+/// opt-level = 1 under `cargo xtask build --debug kernel`), so this is a heuristic
+/// scan, not an exact unwind. Bounded by
 /// `stack_top` (the thread's kernel-stack base) and a hard cap, and read-only, so
 /// it cannot fault during the panic.
 ///
@@ -1818,9 +1779,7 @@ fn panic(info: &PanicInfo) -> !
         }
     }
     // Best-effort context: CPU, current thread, the in-flight syscall, and a
-    // kernel-text stack scan. A torn-context (#314) makes a syscall execute with
-    // garbage register args that reach a stdlib precondition (e.g.
-    // slice::get_unchecked) — this dump pins the kernel call site #316 needs.
+    // kernel-text stack scan (see `panic_context_dump`).
     // SAFETY: panic path; every read inside is bounded / null-checked.
     unsafe {
         panic_context_dump();

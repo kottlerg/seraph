@@ -6,11 +6,8 @@
 //! Minimal Flattened Device Tree (FDT/DTB) parser.
 //!
 //! Reads in-place from the DTB blob (identity-mapped by UEFI). No allocation.
-//! Assumes `#address-cells = 2` and `#size-cells = 2`, which is standard for
-//! RISC-V QEMU virt. All header fields and tokens are big-endian.
-//!
-//! Error handling: malformed nodes are skipped; partial results are returned.
-//! Fatal errors (bad magic, out-of-range offsets) return `None` / zero count.
+//! All header fields and tokens are big-endian. Cell-size assumptions, header
+//! validation, and error handling are specified in `core/boot/docs/dtb.md`.
 //!
 //! # Surface
 //! - [`parse_cpu_count`]: enumerate RISC-V hart IDs from the `/cpus` node.
@@ -53,7 +50,9 @@ const FDT_BEGIN_NODE: u32 = 1;
 const FDT_END_NODE: u32 = 2;
 const FDT_PROP: u32 = 3;
 const FDT_NOP: u32 = 4;
-#[allow(dead_code)] // Used as a sentinel that collapses into the `_ => break` arm.
+// FDT_END is named only by the test FdtBuilder; the walkers reach it, like any unknown token,
+// through the `_ => break` arm.
+#[allow(dead_code)]
 const FDT_END: u32 = 9;
 
 /// Maximum FDT node nesting depth supported by the walker.
@@ -415,7 +414,7 @@ impl Fdt
 
     /// Call `f` for each node whose `compatible` property contains `compat`.
     ///
-    /// Only called from `arch/riscv64/serial.rs`; on x86-64 the DTB parser
+    /// Only called from `core/boot/src/arch/riscv64/serial.rs`; on x86-64 the DTB parser
     /// is still compiled but no caller for this helper exists.
     #[allow(dead_code)]
     pub fn for_each_compatible<F: FnMut(&FdtNode)>(&self, compat: &[u8], mut f: F)
@@ -548,8 +547,8 @@ impl Fdt
                     if name == b"compatible"
                     {
                         let data = self.struct_slice(data_off, prop_len);
-                        // "riscv" appears as a standalone compatible string in CPU nodes,
-                        // or as a prefix in strings like "riscv,sv48". Match either.
+                        // CPU nodes carry "riscv" as one exact entry of their compatible
+                        // list; prop_contains matches whole entries only.
                         if prop_contains(data, b"riscv")
                         {
                             state.is_riscv_cpu = true;
@@ -647,7 +646,7 @@ impl Fdt
     /// node tracking suffices. Accepts the spec's u32 cell and, defensively,
     /// a u64 encoding.
     ///
-    /// Only called via [`parse_hart_caps`] from `arch/riscv64`; on x86-64
+    /// Only called via [`parse_hart_caps`] from [`crate::arch::riscv64`]; on x86-64
     /// the DTB parser is still compiled but no caller exists.
     #[allow(dead_code)]
     pub fn timebase_frequency(&self) -> u64
@@ -854,10 +853,10 @@ fn read_be64(buf: &[u8]) -> u64
 /// so the `reg` property is a single big-endian u32 hart ID.
 ///
 /// The generic [`Fdt::walk_compatible`] assumes `#address-cells=2`, so this
-/// function contains its own property reader for the u32 `reg` field.
+/// function uses [`Fdt::walk_cpu_nodes`], which reads the u32 `reg` field.
 ///
 /// Returns `(0, [0; MAX_CPUS])` if no CPU nodes are found or DTB is invalid
-/// — the caller falls back to ACPI or single-CPU operation. Harts beyond
+/// — the caller (consulted only when ACPI is absent) then defaults to a single CPU. Harts beyond
 /// [`MAX_CPUS`] are dropped with a diagnostic.
 ///
 /// # Safety
@@ -875,8 +874,8 @@ pub unsafe fn parse_cpu_count(dtb_addr: u64) -> (u32, [u32; MAX_CPUS])
     let mut count: u32 = 0;
     let mut truncated = false;
 
-    // Walk nodes compatible with "riscv". Each CPU node will have this as
-    // a (prefix) compatible string. We extract reg as a single BE u32.
+    // Walk enabled CPU nodes (an exact "riscv" compatible entry); walk_cpu_nodes
+    // supplies each node's reg as a single BE u32 hart ID.
     // MAX_CPUS fits in u32.
     #[allow(clippy::cast_possible_truncation)]
     let max_cpus_u32 = MAX_CPUS as u32;
@@ -912,7 +911,7 @@ pub unsafe fn parse_cpu_count(dtb_addr: u64) -> (u32, [u32; MAX_CPUS])
 ///
 /// Returns `(0, 0)` if the DTB is invalid.
 ///
-/// Only called from `arch/riscv64`; on x86-64 the DTB parser is still
+/// Only called from [`crate::arch::riscv64`]; on x86-64 the DTB parser is still
 /// compiled but no caller exists.
 ///
 /// # Safety
@@ -949,7 +948,7 @@ pub unsafe fn parse_hart_caps(dtb_addr: u64) -> (u64, u64)
 /// `None` when no CPU node advertises a recognized S-mode translation mode —
 /// the caller then probes from its own maximum downward.
 ///
-/// Only called from `arch/riscv64`; on x86-64 the DTB parser is still
+/// Only called from [`crate::arch::riscv64`]; on x86-64 the DTB parser is still
 /// compiled but no caller exists.
 ///
 /// # Safety
@@ -979,7 +978,7 @@ pub unsafe fn parse_boot_cpu_mmu_type(dtb_addr: u64, boot_hart_id: u64) -> Optio
     boot_hart_mode.or(widest)
 }
 
-// ── Aperture seeder (protocol v6) ────────────────────────────────────────────
+// ── Aperture seeder ──────────────────────────────────────────────────────────
 
 /// Walk the DTB and collect MMIO extents into `out` for aperture seeding.
 ///
@@ -1019,8 +1018,8 @@ pub unsafe fn parse_aperture_seed(dtb_addr: u64, out: &mut [MmioAperture]) -> us
 
     let mut n: usize = 0;
 
-    // Helper closure factory for each compatible string that contributes
-    // its first `reg` entry.
+    // Push a node's first `reg` entry as an aperture seed when its size is
+    // non-zero; shared by every compatible string below.
     let push_first_reg = |out: &mut [MmioAperture], n: &mut usize, node: &FdtNode| {
         if *n < out.len() && node.reg_count > 0 && node.reg_entries[0].1 > 0
         {
@@ -1082,8 +1081,7 @@ pub unsafe fn parse_aperture_seed(dtb_addr: u64, out: &mut [MmioAperture]) -> us
 /// reader is a secondary fallback for firmware that delivers a DTB; which
 /// firmware exposes which boot-entropy source is documented in
 /// `core/boot/docs/boot-flow.md`. The property bytes are zeroed in place
-/// because the same blob is later handed to userspace via
-/// `BootInfo.device_tree`; the seed must not outlive its consumption.
+/// per `core/boot/docs/dtb.md` § Scope.
 ///
 /// # Safety
 /// `dtb_addr` must be 0 or the physical address of a valid, identity-mapped

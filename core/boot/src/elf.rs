@@ -19,7 +19,10 @@
 //!   identity-map a page without a second copy.
 //! - Pre-parse init's segments into the [`InitImage`] ABI surface so the
 //!   kernel never needs an ELF parser.
-//! - Load opaque boot modules as flat binaries (no ELF parsing).
+//!
+//! Boot modules are not loaded here: `main.rs::step4_parse_bundle` exposes
+//! them in place inside the bundle allocation
+//! (`core/boot/docs/elf-loading.md` § Boot Module Loading).
 //!
 //! W^X is enforced for both images; where each segment kind is rejected is
 //! in `core/boot/docs/elf-loading.md` § LOAD Segment Processing.
@@ -105,15 +108,9 @@ struct KernelSpan
     span_bytes: u64,
 }
 
-/// Validate the kernel `PT_LOAD` layout and compute its physical span.
-///
-/// The kernel image is placed as a single contiguous span at a dynamically
-/// chosen physical base (issue #377: a fixed `p_paddr` collides with
-/// hart-scaled firmware allocations). That relocation is sound only if the
-/// segments form one linearly-offset, page-aligned, non-overlapping block: the
-/// kernel maps every page at `pa = va - link_virt + span_base`
-/// (`map_kernel_image`), and the per-segment copy below places each segment by
-/// the same offset. These checks guarantee both hold.
+/// Validate the kernel `PT_LOAD` layout against the placement ruleset owned by
+/// `core/boot/docs/elf-loading.md` § ELF Validation, and compute its physical
+/// span (issue #377 motivated dynamic placement).
 ///
 /// # Errors
 ///
@@ -442,12 +439,13 @@ pub unsafe fn relocate_kernel(
 
 /// Parse and load a userspace init ELF into physical memory.
 ///
-/// Unlike [`load_kernel`], the init ELF is a regular userspace executable whose
-/// `p_paddr` values are in low memory already occupied by UEFI. Each LOAD
-/// segment is allocated at any available physical address via `AllocateAnyPages`,
-/// then the data is copied in. The resulting [`InitImage`] records both the
-/// physical allocation address and the virtual address from the ELF so the
-/// kernel can build init's page tables without parsing the ELF itself.
+/// Like [`load_kernel`], the init ELF is placed via `AllocateAnyPages` (init is
+/// a regular userspace executable whose `p_paddr` values are in low memory
+/// already occupied by UEFI); unlike the kernel's single contiguous span, each
+/// LOAD segment is allocated independently, then the data is copied in. The
+/// resulting [`InitImage`] records both the physical allocation address and the
+/// virtual address from the ELF so the kernel can build init's page tables
+/// without parsing the ELF itself.
 ///
 /// The in-page byte offset of `p_vaddr` is preserved in `phys_addr` so the
 /// kernel can identity-map a page without a second copy step:
@@ -569,8 +567,9 @@ pub unsafe fn load_init(
 
     // PIE init (#39): pre-locate the `.rela.dyn` table and resolve its
     // physical address through the loaded segment bytes, so the kernel can
-    // apply the relocations without an ELF parser. The bias itself is the
-    // kernel's choice — the bootloader has no entropy source on riscv64.
+    // apply the relocations without an ELF parser. The kernel, not the
+    // bootloader, draws the load bias (core/boot/docs/elf-loading.md § Init
+    // ELF Loading; core/kernel/src/mm/init_reloc.rs).
     // The `PT_GNU_RELRO` span rides along (unbiased link VAs) so the kernel
     // can map the covered pages read-only after relocation.
     let (flags, rela_phys, rela_size, relro_vaddr, relro_size) = match kind

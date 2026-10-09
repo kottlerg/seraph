@@ -7,7 +7,7 @@ during the boot sequence) is owned by
 this document owns the translation policy and the invariants the kernel
 can rely on at handoff.
 
-The implementation lives in [`boot/src/memory_map.rs`](../src/memory_map.rs).
+The implementation lives in [`core/boot/src/memory_map.rs`](../src/memory_map.rs).
 
 ---
 
@@ -17,8 +17,8 @@ The implementation lives in [`boot/src/memory_map.rs`](../src/memory_map.rs).
 |---|---|---|
 | `EfiConventionalMemory` | `Usable` | Free RAM. |
 | `EfiBootServicesCode` / `EfiBootServicesData` | `Usable` | No longer in use after `ExitBootServices`. |
-| `EfiLoaderCode` / `EfiLoaderData` | `Loaded` | Every bootloader allocation (kernel image, modules, init segments, `BootInfo`, `mmio_apertures` page, memory-map buffer, stack). |
-| `EfiACPIReclaimMemory` | `AcpiReclaimable` | Reclaimable by the kernel after `devmgr` has finished firmware parsing. |
+| `EfiLoaderCode` / `EfiLoaderData` | `Loaded` | Every bootloader allocation and the bootloader's own loaded image (enumerated in § Allocation-Class Classification). |
+| `EfiACPIReclaimMemory` | `AcpiReclaimable` | Firmware tables; exposed to userspace as Map-only Memory caps in Phase 7 and never reclaimed. |
 | `EfiACPIMemoryNVS` | `Reserved` | Firmware-reserved. |
 | `EfiRuntimeServicesCode` / `EfiRuntimeServicesData` | `Reserved` | Seraph does not use UEFI runtime services; treat as off-limits. |
 | `EfiMemoryMappedIO` / `EfiMemoryMappedIOPortSpace` | `Reserved` | Device space, not RAM. |
@@ -27,9 +27,9 @@ The implementation lives in [`boot/src/memory_map.rs`](../src/memory_map.rs).
 
 `EfiBootServices*` → `Usable` is deliberate: those regions are dead
 after `ExitBootServices` and represent the largest usable reclaim on a
-typical system. `EfiRuntimeServices*` → `Reserved` prevents accidental
-reclamation of firmware code that remains mapped in the identity region
-even though Seraph does not call into it.
+typical system. `EfiRuntimeServices*` → `Reserved` keeps firmware runtime
+code and data out of every allocator and reclaim path even though Seraph never
+calls into it.
 
 ---
 
@@ -43,12 +43,15 @@ re-validation.
 
 Contiguous same-type UEFI entries are **not** coalesced by the
 bootloader. The translated array mirrors the UEFI descriptor sequence
-1:1 (after sorting); any consolidation of adjacent regions into a single
-larger entry is left to the kernel if it wants a denser representation.
+1:1 (after sorting) up to the capacity of the `MemoryMapEntry` array
+(`MEM_MAP_ENTRY_PAGES` pages, about 680 entries); `translate_memory_map` drops
+descriptors beyond it without a diagnostic; any consolidation of adjacent
+regions into a single larger entry is left to the kernel if it wants a denser
+representation.
 
-Bootloader allocations made between the memory-map query and
-`ExitBootServices` are already accounted for by the UEFI-side map
-refresh; the retry path in
+The bootloader makes no allocation after the final memory-map query; a
+firmware allocation in the window before `ExitBootServices` invalidates the
+map key, and the retry path in
 [uefi-environment.md](uefi-environment.md) §"ExitBootServices" ensures
 the map key and the map body agree at exit time.
 
@@ -92,7 +95,8 @@ The `Loaded` allocations are:
 
 - The bootloader's own loaded image (firmware-allocated as `EfiLoaderCode` /
   `EfiLoaderData`; it contains the handoff trampoline).
-- Kernel image LOAD segments, placed in a bootloader-chosen contiguous span.
+- Kernel image LOAD segments, placed in one contiguous `AllocateAnyPages` span at a
+  firmware-chosen address.
 - Kernel ELF file read buffer.
 - Init image LOAD segments, placed at any free physical address.
 - Bundle blob: one allocation holding the bundle header and entry table,
@@ -125,12 +129,16 @@ Step 9 selects the KASLR direct-map base from this translated map: the highest
 RAM address (`boot_protocol::layout::max_ram_address` over the `Usable` /
 `Loaded` / `AcpiReclaimable` / `Persistent` entries) plus any framebuffer /
 kernel-MMIO regions above it form the direct-map ceiling
-(`boot_protocol::layout::direct_map_ceiling`), and the base is drawn
-1 GiB-aligned in the gap between the mode's kernel-half floor and the kernel
-image. The kernel re-derives the same ceiling from the same helper at Phase 3
-to guard the mapping, so bootloader and kernel cannot disagree. See
+(`boot_protocol::layout::direct_map_ceiling`), and, when KASLR entropy is
+present and the `nokaslr` knob is absent, the base is drawn 1 GiB-aligned in
+the gap between the mode's kernel-half floor and the kernel image (less the
+ceiling and `DIRECT_MAP_GUARD`); otherwise, or when that gap holds fewer than
+two slots, the base is the kernel-half floor. The kernel re-derives the same
+ceiling from the same helper at Phase 3 to guard the mapping, so bootloader
+and kernel cannot disagree. See
 [boot-flow.md](boot-flow.md) step 9 and [initialization.md](../../kernel/docs/initialization.md)
-§"Phase 3: Kernel Page Tables".
+§"Phase 3: Kernel Page Tables". The direct-map placement rule is owned by
+[memory-model.md](../../../docs/memory-model.md) § Virtual Address Space Layout.
 
 ## What Lives Elsewhere
 

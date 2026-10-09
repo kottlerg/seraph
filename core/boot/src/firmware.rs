@@ -15,7 +15,8 @@ use crate::uefi::{EFI_ACPI_20_TABLE_GUID, EFI_DTB_TABLE_GUID, EfiSystemTable, fi
 /// Physical addresses of firmware tables discovered from the UEFI configuration table.
 pub struct FirmwareInfo
 {
-    /// Physical address of the ACPI RSDP (x86-64). Zero if not present.
+    /// Physical address of the ACPI RSDP (either architecture; see
+    /// `core/boot/docs/firmware-parsing.md`). Zero if not present.
     pub acpi_rsdp: u64,
     /// Physical address of the Device Tree blob (RISC-V). Zero if not present.
     pub device_tree: u64,

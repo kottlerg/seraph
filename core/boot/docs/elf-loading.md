@@ -16,8 +16,9 @@ Partition: kernel ELF, init ELF, and boot modules.
   interpret their content; what they are is init's concern.
 
 All loading occurs before `ExitBootServices`. W^X is enforced for the kernel and
-init ELFs at load time: any `PT_LOAD` segment with both write and execute permissions
-is a fatal error.
+init ELFs before handoff: any `PT_LOAD` segment with both write and execute permissions
+is a fatal error (init at load time, the kernel when its page tables are built; see
+§ LOAD Segment Processing).
 
 ---
 
@@ -25,7 +26,7 @@ is a fatal error.
 
 Files are opened via `EFI_SIMPLE_FILE_SYSTEM_PROTOCOL` on the ESP volume. The
 bootloader carries three hardcoded ESP path constants in
-[`boot/src/main.rs`](../src/main.rs) (see
+[`core/boot/src/main.rs`](../src/main.rs) (see
 [uefi-environment.md](uefi-environment.md)):
 
 | File | Hardcoded ESP path |
@@ -48,15 +49,15 @@ change.
 ## ELF Validation
 
 ELF-header and program-header *format* validation is performed by the shared ELF crate;
-the ruleset (magic, class, data encoding, version, type, machine, program-header
-geometry) is owned by
-[`shared/elf/README.md`](../../../shared/elf/README.md). Any
+the ruleset (minimum size, magic, class, data encoding, version, type, machine,
+program-header entry size and count) is implemented by `elf::validate_executable` in
+[`shared/elf`](../../../shared/elf/README.md). Any
 `elf::ElfError` returned by the shared crate is surfaced by the bootloader as
 [`BootError::InvalidElf`](../src/error.rs).
 
 The kernel image carries an additional *placement* ruleset enforced by the bootloader
-(`validate_kernel_layout` in [`boot/src/elf.rs`](../src/elf.rs)), because the image is
-relocated to a dynamically chosen physical base and the relocation is sound only if it
+(`validate_kernel_layout` in [`core/boot/src/elf.rs`](../src/elf.rs)), because the image
+is relocated to a dynamically chosen physical base and the relocation is sound only if it
 holds: every `PT_LOAD` segment is 4 KiB-aligned in both `p_vaddr` and `p_paddr`, all
 segments share one `p_vaddr → p_paddr` offset, no two segments' physical ranges overlap,
 and the entry point lies within a `PT_LOAD` segment. A violation is surfaced as
@@ -89,33 +90,36 @@ Once [`shared/elf`](../../../shared/elf/README.md) has yielded the validated
 `PT_LOAD` program-header array, the bootloader layers UEFI-specific placement
 on each segment:
 
-1. Enforce W^X: a segment with both `PF_W` and `PF_X` is rejected and surfaced
-   as [`BootError::WxViolation`](../src/error.rs): a kernel segment by the
-   page-table builder when its first page is mapped, an init segment by
-   `init_segment_flags` during `load_init`, before any frame is allocated for
-   that segment.
+1. Enforce W^X (init ELF): `init_segment_flags` rejects a segment with both `PF_W`
+   and `PF_X` during `load_init`, before any frame is allocated for that segment,
+   and surfaces it as [`BootError::WxViolation`](../src/error.rs).
 2. Allocate physical frames via `AllocatePages`, classified `EfiLoaderData`:
    - **Kernel ELF** — one `AllocateAnyPages` span covering the whole image at
      any free physical base; each segment is copied to
      `span_base + (p_paddr - link_phys)`, preserving the ELF's relative
      offsets. The chosen base is recorded in `BootInfo.kernel_physical_base`.
    - **Init ELF** — `AllocateAnyPages` per segment, preserving the in-page
-     byte offset of `p_vaddr` so the kernel can identity-map each segment
-     without a second copy.
+     byte offset of `p_vaddr` so the kernel can map each segment's pages at its
+     virtual address onto the allocated frames without a second copy.
 3. Copy `p_filesz` bytes from the file into the allocated region.
 4. Zero the BSS tail (`p_memsz - p_filesz` bytes).
 
 The page-table builder ([page-tables.md](page-tables.md)) consumes the
-recorded `(phys_base, virt_base, size, flags)` per segment. Every mapping
-is implicitly readable; only the writable / executable bits come from
+recorded `(phys_base, virt_base, size, writable, executable)` of each kernel segment
+(`LoadedSegment`); init segments are identity-mapped read/write for the handoff and their
+permissions reach the kernel as `InitSegment.flags` (§ Init ELF Loading). A kernel segment
+with both `PF_W` and `PF_X` is not rejected by `load_kernel`; the page-table builder's `map`
+rejects it with `BootError::WxViolation` before touching any table
+([Boot Flow § Step 6](boot-flow.md#step-6-allocate-and-build-page-tables)). Every kernel
+mapping is implicitly readable; only the writable / executable bits come from
 `p_flags`:
 
 | `p_flags` | Page table flags |
 |---|---|
 | `PF_R` (only) | Readable |
-| `PF_R | PF_W` | Readable, Writable |
-| `PF_R | PF_X` | Readable, Executable |
-| `PF_R | PF_W | PF_X` | Rejected (`WxViolation`) |
+| `PF_R \| PF_W` | Readable, Writable |
+| `PF_R \| PF_X` | Readable, Executable |
+| `PF_R \| PF_W \| PF_X` | Rejected (`WxViolation`) |
 
 A pure BSS segment (`p_filesz == 0`, `p_memsz > 0`) incurs no file read;
 the entire allocation is produced by step 4.
@@ -140,16 +144,19 @@ image, init segments are allocated via `AllocateAnyPages` (init is a userspace E
 whose `p_paddr` values fall in low memory already occupied by UEFI firmware). Unlike
 the kernel — placed as one contiguous span — each init segment is allocated
 independently and the in-page byte offset of `p_vaddr` is preserved, so the kernel
-can identity-map each segment without a second copy.
+can map each segment's pages at its virtual address onto the allocated frames without a
+second copy.
 
 ```
 For each PT_LOAD segment:
 1. Reject PF_W | PF_X with BootError::WxViolation; derive flags otherwise.
 2. AllocatePages(AllocateAnyPages, EfiLoaderData, page_count, &phys_base).
-   page_count = ceil(p_memsz / PAGE_SIZE).
-3. Copy p_filesz bytes from file offset p_offset into phys_base.
-4. Zero the BSS tail: memset(phys_base + p_filesz, 0, p_memsz - p_filesz).
-5. Record an InitSegment { phys_addr, virt_addr: p_vaddr, size: p_memsz, flags }.
+   page_count = ceil(((p_vaddr mod PAGE_SIZE) + p_memsz) / PAGE_SIZE).
+3. Copy p_filesz bytes from file offset p_offset into phys_base + (p_vaddr mod PAGE_SIZE).
+4. Zero the BSS tail:
+   memset(phys_base + (p_vaddr mod PAGE_SIZE) + p_filesz, 0, p_memsz - p_filesz).
+5. Record an InitSegment { phys_addr: phys_base + (p_vaddr mod PAGE_SIZE),
+   virt_addr: p_vaddr, size: p_memsz, flags }.
 ```
 
 `flags` is derived from `p_flags`: a segment with both `PF_W` and `PF_X` is
@@ -182,11 +189,13 @@ whose dynamic section describes any other relocation format
 
 Boot modules are flat binary images for early userspace services (e.g.
 procmgr, devmgr). The bootloader does not open per-module files —
-every module body is already inside the bundle that step 2 loads. Per
+every module body is already inside the bundle that
+[Boot Flow § Step 2](boot-flow.md#step-2-load-bootstrap-bundle) loads. Per
 module, the bootloader's bundle walker:
 
 ```
-1. Iterate bundle entry headers from `boot_protocol::bundle::parse_header`.
+1. Validate the bundle header with `boot_protocol::bundle::parse_header`,
+   then read each of its `entry_count` entry headers with `bundle::entry_at`.
 2. Skip the entry literally named "init" (that body becomes init's
    ELF source, parsed separately).
 3. For every other entry, record a `BootModule { name, physical_base,
@@ -199,8 +208,9 @@ Bundle bodies are 4 KiB-aligned per `BODY_ALIGNMENT`, so
 `physical_base` is page-aligned and a downstream consumer that needs
 a page-rounded allocation (the kernel's `mint_module_memory_caps`,
 which rounds `size` up to the next page boundary for the Memory cap)
-does not need to copy or relocate bytes. Init receives the module
-slice via its initial `CSpace`
+does not need to copy or relocate bytes. Init receives a `Memory`
+cap for each module in its initial `CSpace`, resolved by name through
+`InitInfo::module_names`
 ([init bootstrap.md](../../../services/init/docs/bootstrap.md#initial-cspace-at-_start))
 and is responsible for validating and starting each service.
 

@@ -72,9 +72,8 @@ pub trait PageTableBuilder: Sized
     /// tables (the root frame and every intermediate frame allocated during
     /// [`map`][Self::map]).
     ///
-    /// The bootloader records these in `BootInfo.reclaim_ranges` so the kernel
-    /// can mint reclaimable Memory caps over them once Phase 3 has installed the
-    /// kernel's own page tables and the bootloader's transient tables are dead.
+    /// Step 9 records these in `BootInfo.reclaim_ranges`; see
+    /// `core/boot/docs/page-tables.md` § Page Table Frame Tracking.
     fn allocated_frames(&self) -> &[u64];
 }
 
@@ -96,8 +95,9 @@ fn map_err(e: MapError) -> BootError
 ///
 /// # Errors
 /// Returns [`BootError::OutOfMemory`] if page table frame allocation fails,
-/// or [`BootError::WxViolation`] if a segment has both W and X (should not
-/// happen if ELF loading already checked, but enforced again here).
+/// or [`BootError::WxViolation`] if a kernel segment has both W and X; this
+/// is where kernel-image W^X is enforced (see
+/// `core/boot/docs/elf-loading.md` § LOAD Segment Processing).
 pub fn build_initial_tables(
     bs: *mut crate::uefi::EfiBootServices,
     kernel: &KernelInfo,
@@ -119,8 +119,8 @@ pub fn build_initial_tables(
     }
 
     // Identity-map all boot regions as readable+writable, non-executable.
-    // These regions (BootInfo, modules, stack, memory map buffer) must be
-    // accessible to the kernel before it establishes its own page tables.
+    // The region set is the identity map that core/boot/docs/page-tables.md
+    // § Contract at Kernel Entry defines; collect_identity_regions builds it.
     for &(phys, size) in identity_regions
     {
         if size == 0

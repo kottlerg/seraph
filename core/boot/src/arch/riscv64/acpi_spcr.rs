@@ -5,15 +5,13 @@
 
 //! Shared ACPI SPCR walker for the RISC-V UART base.
 //!
-//! Two callers on RISC-V consume this: the pre-Step-1 serial-init path
-//! in [`crate::arch::riscv64::serial`] (needs a UART base so early
-//! diagnostics work), and the Step-5 `kernel_mmio` extractor in
-//! [`super::acpi_kernel_mmio`] (records the same base into
-//! [`KernelMmio::uart_base`](boot_protocol::KernelMmio)).
+//! Its two callers, [`super::serial`] and [`super::acpi_kernel_mmio`], are
+//! the SPCR consumers listed in [`core/boot/docs/acpi.md` § Scope](../../../docs/acpi.md#scope).
 //!
-//! The generic ACPI table-walk primitives (RSDP/XSDT validation, byte
-//! readers, `phys_slice`) live in [`crate::acpi`]; only the SPCR
-//! layout constants and the SPCR-specific scan are here.
+//! The byte readers, `phys_slice`, and the RSDP/SDT layout constants come
+//! from [`crate::acpi`]. `find_spcr_base` carries its own RSDP → XSDT walk
+//! rather than calling `crate::acpi::find_acpi_table`, followed by the
+//! SPCR-specific Generic Address Structure read.
 
 use crate::acpi::{
     RSDP_OFF_REVISION, RSDP_OFF_XSDT, RSDP_SIG, SDT_HDR_LEN, SDT_OFF_LENGTH, SDT_OFF_SIGNATURE,

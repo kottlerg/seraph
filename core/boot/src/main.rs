@@ -115,9 +115,11 @@ struct UefiContext
 
 /// Kernel ELF load result: the parsed info and the read-buffer allocation.
 ///
-/// The read buffer is kept identity-mapped until `ExitBootServices` because
-/// UEFI retains the allocation; the kernel itself does not need it after that
-/// (segments are already copied).
+/// The read buffer is unused once `load_kernel` has copied the segments
+/// out, but it is never freed or recorded in `BootInfo.reclaim_ranges`, so it
+/// stays a permanent `Loaded` page (`core/boot/docs/memory-map.md`; #438). It
+/// is identity-mapped in the handoff tables per
+/// `core/boot/docs/page-tables.md` § Contract at Kernel Entry.
 struct KernelLoad
 {
     info: KernelInfo,
@@ -254,15 +256,19 @@ struct BootAllocations
 
 /// UEFI application entry point.
 ///
-/// UEFI firmware calls this function after loading and relocating the
-/// bootloader image. Delegates immediately to [`boot_sequence`] and prints
-/// a fatal error message before halting if the sequence fails.
+/// On x86-64 UEFI firmware calls this function after loading and relocating
+/// the bootloader image; on RISC-V the `_start` trampoline in
+/// `core/boot/src/arch/riscv64/header.S` applies the image's relocations and
+/// tail-calls it (see `core/boot/docs/riscv-uefi-boot.md`). Delegates
+/// immediately to [`boot_sequence`] and prints a fatal error message before
+/// halting if the sequence fails.
 ///
 /// Returns a `usize` (UEFI `EFI_STATUS`) to satisfy the UEFI ABI, but in
 /// practice never returns — the boot sequence either jumps to the kernel or
 /// halts on error.
 // UEFI entry point — must be a public non-unsafe `extern "efiapi"` function per the UEFI spec;
-// the raw-pointer parameters are validated before first deref inside the unsafe blocks below.
+// the raw-pointer parameters are the firmware-supplied image handle and system table, trusted
+// per the UEFI calling contract and passed only to the unsafe callees below.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 #[unsafe(no_mangle)]
 pub extern "efiapi" fn efi_main(image: EfiHandle, st: *mut EfiSystemTable) -> usize
@@ -365,14 +371,12 @@ unsafe fn boot_sequence(image: EfiHandle, st: *mut EfiSystemTable) -> Result<!, 
             &page_table,
         );
     }
-    // Scrub every bootloader-held copy of the KASLR entropy words: the slide is
-    // applied and the direct-map base chosen, so neither the source draw
-    // (`boot_entropy.kaslr`) nor the `dm_rand` copy that step 9 consumed
-    // (`kaslr.dm_rand`) may linger in BootServicesData that is later reclaimed
-    // to userspace. The pool seed is already in BootInfo (step 9 copies it
-    // into the page in place), which the kernel scrubs after absorbing it;
-    // this local is the bootloader's only other copy, since step 5c writes
-    // into it directly and scrubs its own byte buffers.
+    // Scrub the bootloader's own copies of the KASLR entropy words
+    // (`boot_entropy.kaslr`, and the `kaslr.dm_rand` copy step 9 consumed) and
+    // of the pool seed; the BootInfo copy is the kernel's to scrub, and step 5c
+    // scrubs its own byte buffers. The rest of the UEFI stack still reaches
+    // userspace unzeroed (core/kernel/docs/cross-boundary-disclosure.md § Kernel
+    // state in donated memory, #439).
     scrub(&mut boot_entropy.seed);
     // SAFETY: all are live locals; volatile so the stores are not elided as
     // dead ahead of the values going out of scope.
@@ -610,6 +614,7 @@ unsafe fn step4_parse_bundle(
         // already bounds-checked offset+size against `bytes.len()`.
         #[allow(clippy::cast_possible_truncation)]
         let body_start = entry.offset as usize;
+        // usize is 64-bit on every UEFI target Seraph supports, so the size cast is exact.
         #[allow(clippy::cast_possible_truncation)]
         let body_end = body_start + entry.size as usize;
         if body_end > bytes.len()
@@ -969,7 +974,7 @@ fn choose_kaslr_layout(
     {
         // A PIE takes the drawn slide (KASLR_IMAGE_RANDOMIZED marks the draw,
         // whichever slot it selected); an ET_EXEC kernel cannot slide
-        // (elf-loading.md § ELF Validation) and stays at the link base with
+        // (core/boot/docs/elf-loading.md § ELF Validation) and stays at the link base with
         // only the source bits set.
         let (slide, image_flag) = match kind
         {
@@ -1031,9 +1036,9 @@ unsafe fn nokaslr_override(ctx: &UefiContext) -> KaslrOverride
 // ── Step 6: Allocate boot structures and build page tables ──────────────────
 
 /// Allocate the fixed pre-exit scratch pages (`BootInfo` page, modules
-/// descriptor page, memory-map page, aperture page, stack, reclaim-ranges
-/// page), accumulate the identity-map region list, build initial page
-/// tables, and install the x86-64 handoff-trampoline mapping.
+/// descriptor page, memory-map entry pages, aperture page, stack,
+/// reclaim-ranges page), accumulate the identity-map region list, build initial
+/// page tables, and install the handoff-trampoline mapping.
 ///
 /// # Safety
 /// `ctx.bs` must be valid pre-exit; all addresses in `kernel`, `init`, and
@@ -1102,9 +1107,10 @@ unsafe fn step6_allocate_and_build_page_tables(
 /// Fill `out` with all physical regions that must be identity-mapped so the
 /// kernel can access them before establishing its own page tables. Returns
 /// the number of filled entries; silently caps at [`MAX_IDENTITY_REGIONS`].
-// Each parameter names a distinct origin of an identity-mapped region
-// (kernel, init, modules, bundle, framebuffer, UART, fixed allocations);
-// bundling them further hides where a region came from.
+// Each used parameter names a distinct origin of an identity-mapped region
+// (kernel, init, bundle, framebuffer, UART, fixed allocations); `_mods` is
+// unused because module bodies lie inside the bundle mapping. Bundling them
+// further hides where a region came from.
 #[allow(clippy::too_many_arguments)]
 fn collect_identity_regions(
     allocs: &BootAllocations,
@@ -1144,7 +1150,9 @@ fn collect_identity_regions(
         let seg = &init.image.segments[i];
         push(seg.phys_addr, (seg.size + 4095) & !4095);
     }
-    // Kernel file read buffer (UEFI retains the allocation until ExitBootServices).
+    // Kernel ELF file read buffer: a permanent `Loaded` page, never freed or
+    // reclaimed (core/boot/docs/memory-map.md; #438), identity-mapped per
+    // core/boot/docs/page-tables.md § Contract at Kernel Entry.
     push(kernel.buf_phys, (kernel.buf_pages as u64) * 4096);
     // Bundle blob: one allocation covers every module body and the init
     // ELF source bytes. Map once.
@@ -1249,9 +1257,10 @@ unsafe fn step8_exit_boot_services(
 /// # Safety
 /// All physical allocations named in `allocs` must remain identity-mapped and
 /// writable. `uefi_map` must be the exited-boot memory map from step 7.
-// BootInfo population is the fan-in point for every earlier step: config,
-// kernel, init, modules, firmware, cpu topology, framebuffer, boot
-// allocations, and the memory map all contribute distinct fields. Bundling
+// BootInfo population is the fan-in point for every earlier step: bundle,
+// kernel, init, modules, firmware, cpu topology, boot entropy, KASLR
+// decision, framebuffer, boot allocations, the memory map, and the page-table
+// frame list all contribute distinct fields. Bundling
 // them would only rename the argument list into an ad-hoc struct. The
 // too_many_lines allowance covers the inline reclaim-array build below,
 // which sits between aperture derivation and the BootInfo write.
@@ -1278,7 +1287,7 @@ unsafe fn step9_populate_boot_info(
     for (i, &module) in mods.modules.iter().enumerate().take(mods.count)
     {
         // SAFETY: modules_phys is a 4096-byte allocation; count ≤ MAX_MODULES (16)
-        // so 16 × 16-byte BootModule entries fit.
+        // so 16 × 48-byte BootModule entries (768 bytes) fit.
         unsafe { core::ptr::write(modules_ptr.add(i), module) };
     }
 
@@ -1347,11 +1356,12 @@ unsafe fn step9_populate_boot_info(
     };
     bprintln!("[--------] boot: MMIO apertures: {aperture_count} derived");
 
-    // Build the reclaim-after-Phase-7 array in the dedicated 4 KiB page at
-    // `allocs.reclaim_array_phys`. AP trampoline is handled by kernel-side
-    // late reclaim after SMP bringup (see `mint_late_reclaim_memory_caps`);
-    // every other bootloader scratch page lands here. The reclaim-array page
-    // is itself recorded as the final entry so the kernel reclaims it last.
+    // Build `BootInfo.reclaim_ranges` in the dedicated 4 KiB page at
+    // `allocs.reclaim_array_phys`: the scratch pages core/boot/docs/boot-flow.md
+    // § Step 9 lists for `reclaim_ranges` (the AP trampoline entry flagged
+    // `RECLAIM_FLAG_LATE`), with the reclaim-array page itself recorded last.
+    // The kernel ELF read buffer and the raw UEFI memory-map buffer are not
+    // recorded and stay permanent (core/boot/docs/memory-map.md; #438).
     // SAFETY: reclaim_array_phys is a valid 4 KiB allocation; we treat it as
     // a fixed-size array of MAX_RECLAIM_RANGES entries (256 × 16 B = 4 KiB).
     let reclaim_ranges: &mut [ReclaimRange; MAX_RECLAIM_RANGES] =
@@ -1386,8 +1396,7 @@ unsafe fn step9_populate_boot_info(
     };
     push_reclaim(allocs.boot_info_phys, 1, 0);
     push_reclaim(allocs.modules_phys, 1, 0);
-    // MEM_MAP_ENTRY_PAGES and reclaim_len (bounded by MAX_RECLAIM_RANGES) are
-    // both small compile-time constants well within u32 range.
+    // MEM_MAP_ENTRY_PAGES is a small compile-time constant well within u32 range.
     #[allow(clippy::cast_possible_truncation)]
     {
         push_reclaim(allocs.mem_entries_phys, MEM_MAP_ENTRY_PAGES as u32, 0);
@@ -1409,10 +1418,8 @@ unsafe fn step9_populate_boot_info(
     // `load_init` copied segments out into separate allocations during
     // step 4), and any inter-module or trailing slack pages.
     //
-    // Module-covered pages are accounted exclusively by
-    // `cap::mint_module_memory_caps`; carving around them keeps the
-    // `register_owned_range` ledger entries disjoint and avoids the
-    // double-count / double-free trap a page in both would cause.
+    // Module bodies are minted separately and are skipped here
+    // (core/boot/docs/boot-flow.md § Step 9: Populate BootInfo, `reclaim_ranges`).
     let bundle_end = bundle.phys + (bundle.pages as u64) * 4096;
     let mut bundle_cursor = bundle.phys;
     for module in &mods.modules[..mods.count]
@@ -1444,10 +1451,9 @@ unsafe fn step9_populate_boot_info(
         let tail_pages = ((bundle_end - bundle_cursor) / 4096) as u32;
         push_reclaim(bundle_cursor, tail_pages, 0);
     }
-    // AP SIPI trampoline page: kernel mints this through the late-reclaim
-    // pass once SMP bringup completes and `mm::paging::unmap_identity_page`
-    // has retired the low-VA identity mapping (installed on both arches by
-    // the arch-neutral kernel page-table builder).
+    // AP trampoline page: flagged `RECLAIM_FLAG_LATE`; the kernel mints it after
+    // SMP bringup (core/kernel/docs/initialization.md § Phase 8: Scheduler and
+    // SMP Bringup).
     if allocs.ap_trampoline_phys != 0
     {
         push_reclaim(allocs.ap_trampoline_phys, 1, RECLAIM_FLAG_LATE);
@@ -1468,8 +1474,9 @@ unsafe fn step9_populate_boot_info(
 
     // Direct-map base (KASLR): the paging mode's kernel-half floor, or a
     // 1 GiB-aligned random base below the (already-biased) kernel image when
-    // step 5d had entropy. Uses the same shared ceiling the kernel's Phase-3
-    // guard and Phase-0 validator use, over the translated map produced above.
+    // step 5d set `randomize_dm` (entropy present, no nokaslr knob). Uses the
+    // same shared ceiling the kernel's Phase-3 guard and Phase-0 validator use,
+    // over the translated map produced above.
     let floor = arch::current::default_direct_map_base();
     let image_base = kernel.info.virtual_base;
     let (direct_map_base, kaslr_flags) = if kaslr.randomize_dm
@@ -1493,10 +1500,9 @@ unsafe fn step9_populate_boot_info(
     {
         (floor, kaslr.flags)
     };
-    // Only the flags are printed here — the console mirrors to the
-    // framebuffer, which is handed to userspace, so the slide / base values
-    // (KASLR secrets) never go through it. The kernel prints them over the
-    // serial-only path.
+    // Only the opaque flags are printed: the bootloader console mirrors to the
+    // framebuffer (core/kernel/docs/cross-boundary-disclosure.md § Kernel
+    // console diagnostics, "KASLR values are serial-only").
     bprintln!("[--------] boot: kaslr flags={kaslr_flags:#x}");
 
     // Write the populated BootInfo.

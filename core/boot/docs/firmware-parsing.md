@@ -10,10 +10,14 @@ five parts of `BootInfo`:
    on RISC-V via ACPI MADT + SPCR, with any fields left zero by ACPI
    filled from the DTB; see [acpi.md](acpi.md)), plus the riscv64 hart
    facts carried in the same struct (`timebase_freq`, `hart_caps`). Not a
-   capability surface.
-3. `mmio_apertures` — a short list of coarse `{phys_base, size}` MMIO
-   regions, used as seeds into the final aperture list that is merged
-   with the UEFI memory map's MMIO classifications. The kernel mints
+   capability surface, except on RISC-V, where the kernel mints one
+   additional `Mmio` capability over the console UART range (`uart_base` /
+   `uart_size`), which lies outside every aperture (see
+   [docs/capability-model.md](../../../docs/capability-model.md#initial-capability-distribution)).
+3. `mmio_apertures` — firmware parsing contributes coarse `{phys_base, size}`
+   MMIO seed regions, which are merged with the UEFI memory map's MMIO
+   classifications into the final aperture list this field carries (see
+   [`mmio_apertures` construction](#mmio_apertures-construction)). The kernel mints
    one `Mmio` capability per aperture entry (see
    [initialization.md](../../kernel/docs/initialization.md#phase-7-capability-system)).
 4. `boot_entropy_seed` / `boot_entropy_len` — the DTB `/chosen/rng-seed`
@@ -46,9 +50,10 @@ Firmware table location is obtained from `EFI_CONFIGURATION_TABLE`:
 | `EFI_DTB_TABLE_GUID` | `device_tree` | RISC-V firmware that installs the FDT table (not QEMU+EDK2, which publishes ACPI only) |
 
 The configuration table is a flat array (`SystemTable->NumberOfTableEntries`
-entries, each a `(GUID, pointer)` pair). The bootloader scans the entire
-array unconditionally for both GUIDs, recording the physical address of
-each found table in the appropriate `BootInfo` field. If a GUID is
+entries, each a `(GUID, pointer)` pair). The bootloader scans the array
+unconditionally for each GUID, stopping at the first matching entry, and
+records the physical address of each found table in the appropriate
+`BootInfo` field. If a GUID is
 absent, its field is zeroed.
 
 Both fields may be non-zero on a platform that exposes both ACPI and a
@@ -78,21 +83,22 @@ This document covers only the cross-parser coordination: dispatch
 
 The aperture list delivered in `BootInfo.mmio_apertures` is assembled
 after `ExitBootServices` by
-[`boot/src/memory_map.rs::derive_mmio_apertures`](../src/memory_map.rs):
+[`core/boot/src/memory_map.rs::derive_mmio_apertures`](../src/memory_map.rs):
 
 1. Collect `EfiMemoryMappedIO` and `EfiMemoryMappedIOPortSpace`
    descriptors from the raw UEFI memory map.
 2. Union with the seeds produced by
-   [`boot/src/acpi.rs::parse_aperture_seed`](../src/acpi.rs) and
-   [`boot/src/dtb.rs::parse_aperture_seed`](../src/dtb.rs) for every
+   [`core/boot/src/acpi.rs::parse_aperture_seed`](../src/acpi.rs) and
+   [`core/boot/src/dtb.rs::parse_aperture_seed`](../src/dtb.rs) for every
    firmware source that is present, and with the GOP framebuffer, which
-   UEFI reports as `EfiReservedMemoryType` and only the bootloader can
+   UEFI typically reports as `EfiReservedMemoryType` and only the bootloader can
    carry past `ExitBootServices`.
 3. Sort by `phys_base`.
 4. Merge adjacent and overlapping entries into a minimal non-overlapping
    list.
 5. Cap at `MAX_APERTURES` (16, [`abi/boot-protocol`](../../../abi/boot-protocol/src/lib.rs));
-   surplus is dropped with a diagnostic.
+   surplus, and any entry collected in steps 1–2 beyond the `MAX_APERTURES` × 4
+   scratch buffer, is dropped with a diagnostic.
 
 The UEFI memory map on every currently-targeted host is the primary
 source; firmware-table seeds cover the regions the UEFI map often
@@ -102,8 +108,8 @@ PLIC / ECAM / BAR windows).
 ### Firmware exclusion
 
 Apertures are coarse but **not indiscriminate**: regions classified as
-`EfiRuntimeServices*`, `EfiACPIMemoryNVS`, or `EfiReserved` are omitted
-from the aperture list unless a firmware-table or framebuffer seed names
+`EfiRuntimeServices*`, `EfiACPIMemoryNVS`, or `EfiReservedMemoryType` are
+omitted from the aperture list unless a firmware-table or framebuffer seed names
 them explicitly. Userspace therefore never receives capabilities that
 cover firmware-exclusive state (see
 [abi/boot-protocol](../../../abi/boot-protocol/README.md#contract-for-a-compliant-bootloader)).

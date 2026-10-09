@@ -10,8 +10,10 @@
 //! includes both x86-64 (primary source) and RISC-V platforms booted under
 //! UEFI firmware that publishes ACPI tables (e.g. QEMU+EDK2 virt).
 //!
-//! Error handling: malformed tables log a warning and return partial results.
-//! Only ACPI 2.0+ (XSDT-based) is supported; ACPI 1.0 (RSDT-only) is skipped.
+//! Malformed tables and ACPI 1.0 (RSDT-only) systems yield empty or
+//! partial results without a diagnostic; see
+//! [`core/boot/docs/acpi.md`](../docs/acpi.md) § Error Handling and
+//! § Revision Gating.
 //!
 //! # Surface
 //! - [`parse_cpu_topology`]: MADT walk producing `BootInfo.cpu_count` and
@@ -325,14 +327,19 @@ pub(crate) unsafe fn parse_vmgenid_paddr(rsdp_addr: u64) -> u64
 // Node array: each node is {type(u16), length(u16), revision(u16), payload}.
 //  Type 0 (ISA string node): {isa_len(u16), isa[isa_len] (null-terminated)}.
 //  Type 0xFFFF (hart info node): per-hart offsets into the shared nodes.
+// dead_code: consumed only by the riscv64-only RHCT walker; the module is compiled on every arch.
 #[allow(dead_code)]
 const RHCT_OFF_TIMEBASE: usize = 40;
+// dead_code: consumed only by the riscv64-only RHCT walker; the module is compiled on every arch.
 #[allow(dead_code)]
 const RHCT_OFF_NODE_COUNT: usize = 48;
+// dead_code: consumed only by the riscv64-only RHCT walker; the module is compiled on every arch.
 #[allow(dead_code)]
 const RHCT_OFF_NODE_OFFSET: usize = 52;
+// dead_code: consumed only by the riscv64-only RHCT walker; the module is compiled on every arch.
 #[allow(dead_code)]
 const RHCT_NODE_HDR_LEN: usize = 6;
+// dead_code: consumed only by the riscv64-only RHCT walker; the module is compiled on every arch.
 #[allow(dead_code)]
 const RHCT_NODE_TYPE_ISA_STRING: u16 = 0;
 
@@ -344,7 +351,9 @@ const RHCT_NODE_TYPE_ISA_STRING: u16 = 0;
 /// strings into shared nodes referenced by the per-hart hart-info nodes;
 /// requiring each extension in every ISA-string node is the conservative
 /// reading and avoids the hart-info offset indirection.
-#[allow(dead_code)] // riscv64-only caller; module compiled on every arch.
+// dead_code: the only non-test caller is `parse_hart_caps`, itself called only from
+// core/boot/src/arch/riscv64/acpi_kernel_mmio.rs; the module is compiled on every arch.
+#[allow(dead_code)]
 fn parse_rhct(table: &[u8]) -> (u64, u64)
 {
     let timebase = read_u64(table, RHCT_OFF_TIMEBASE);
@@ -399,7 +408,9 @@ fn parse_rhct(table: &[u8]) -> (u64, u64)
 /// # Safety
 /// `rsdp_addr` must be zero or the physical address of a valid,
 /// identity-mapped ACPI RSDP whose referenced tables are identity-mapped.
-#[allow(dead_code)] // riscv64-only caller; module compiled on every arch.
+// dead_code: the only caller is core/boot/src/arch/riscv64/acpi_kernel_mmio.rs;
+// the module is compiled on every arch.
+#[allow(dead_code)]
 pub unsafe fn parse_hart_caps(rsdp_addr: u64) -> (u64, u64)
 {
     // SAFETY: caller contract.
@@ -424,6 +435,8 @@ pub unsafe fn parse_hart_caps(rsdp_addr: u64) -> (u64, u64)
 ///
 /// Parses MADT entry types:
 /// - Type 0 (Processor Local APIC, x86-64): enabled if `flags & 1 || flags & 2`.
+/// - Type 9 (Processor Local x2APIC, x86-64, 32-bit IDs): enabled if
+///   `flags & 1 || flags & 2`.
 /// - Type 0x18 (RISC-V INTC, RINTC): enabled if `flags & 1`.
 ///
 /// If the firmware reports more than [`MAX_CPUS`] enabled CPUs, the surplus
@@ -630,7 +643,7 @@ fn parse_madt_topology(
     (cpu_count, bsp_id, cpu_ids)
 }
 
-// ── Aperture seeder (protocol v6) ────────────────────────────────────────────
+// ── Aperture seeder ──────────────────────────────────────────────────────────
 
 /// MADT entry type 5 — `LocalApicAddressOverride` (overrides the 32-bit
 /// `LocalApicAddress` in the MADT header with a 64-bit value).
@@ -647,6 +660,9 @@ pub(crate) const MADT_TYPE_LAPIC_OVERRIDE: u8 = 5;
 ///   RISC-V platforms that expose ACPI such as QEMU+EDK2 virt).
 /// - Each MCFG ECAM window, plus a 32-bit and 64-bit PCI MMIO aperture
 ///   placed by a QEMU q35 / virt layout heuristic (ECAM-base-dependent).
+/// - The arch's platform defaults from
+///   `crate::arch::current::default_pci_apertures` (empty on x86-64),
+///   appended once the RSDP and XSDT validate.
 ///
 /// Callable unconditionally on every supported architecture; a zero
 /// `rsdp_addr` (no ACPI) is a fast no-op that returns 0. The caller
@@ -842,8 +858,9 @@ pub unsafe fn parse_aperture_seed(rsdp_addr: u64, out: &mut [MmioAperture]) -> u
     // EDK2 shipped with Ubuntu's `qemu-efi-riscv64` package observed on
     // `ubuntu-latest` GitHub runners). When MCFG is absent the loop above
     // produces no PCI apertures, but devmgr still needs a frame covering
-    // ECAM. Append the arch-defined defaults unconditionally; any overlap
-    // with MCFG-derived entries is collapsed by
+    // ECAM. Append the arch-defined defaults whenever the RSDP and XSDT
+    // validate (the early returns above skip them when ACPI is absent or
+    // malformed); any overlap with MCFG-derived entries is collapsed by
     // `derive_mmio_apertures`'s merge pass.
     for &(base, size) in crate::arch::current::default_pci_apertures()
     {

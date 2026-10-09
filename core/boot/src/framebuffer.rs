@@ -92,7 +92,9 @@ impl FramebufferWriter
             b'\n' =>
             {
                 self.decoder.reset();
-                // SAFETY: framebuffer base/pitch validated during init; scroll writes within bounds.
+                // SAFETY: the framebuffer region is valid and writable per
+                // `FramebufferWriter::new`'s caller contract; scroll writes stay within
+                // `stride * height`.
                 unsafe {
                     self.newline();
                 }
@@ -129,7 +131,9 @@ impl FramebufferWriter
         self.row += 1;
         if self.row >= self.max_rows
         {
-            // SAFETY: framebuffer base/pitch validated during init; scroll writes within bounds.
+            // SAFETY: the framebuffer region is valid and writable per
+            // `FramebufferWriter::new`'s caller contract; scroll writes stay within
+            // `stride * height`.
             unsafe {
                 self.scroll();
             }
@@ -226,7 +230,9 @@ impl FramebufferWriter
         self.col += 1;
         if self.col >= self.max_cols
         {
-            // SAFETY: framebuffer base/pitch validated during init; wrap writes within bounds.
+            // SAFETY: the framebuffer region is valid and writable per
+            // `FramebufferWriter::new`'s caller contract; scroll writes stay within
+            // `stride * height`.
             unsafe {
                 self.newline();
             }

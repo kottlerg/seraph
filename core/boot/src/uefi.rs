@@ -7,11 +7,15 @@
 //!
 //! All UEFI types are hand-written `#[repr(C)]` structures — no external crate
 //! is used. Function pointer types use `extern "efiapi"`, which resolves to the
-//! Microsoft x64 ABI on x86-64 and the standard lp64d calling convention on
-//! RISC-V, matching the UEFI specification for each architecture.
+//! Microsoft x64 ABI on x86-64 and to the target's C ABI on RISC-V (lp64 for
+//! the soft-float `riscv64imac-seraph-uefi` target; no UEFI call made here
+//! passes floating-point arguments).
 //!
-//! Public wrapper functions return `Result<T, BootError>` and encapsulate all
-//! raw pointer manipulation behind documented `// SAFETY:` contracts.
+//! Fallible public wrappers return `Result<T, BootError>`; best-effort lookups
+//! (`query_gop`, `find_config_table`) return `Option`, and
+//! `connect_all_controllers` ignores per-handle failures and returns nothing.
+//! All of them keep raw pointer manipulation behind documented `// SAFETY:`
+//! contracts.
 
 use crate::error::BootError;
 use boot_protocol::FramebufferInfo;
@@ -26,16 +30,15 @@ pub type EfiBool = u8;
 pub const EFI_SUCCESS: EfiStatus = 0;
 pub const EFI_BUFFER_TOO_SMALL: EfiStatus = 0x8000_0000_0000_0005;
 pub const EFI_INVALID_PARAMETER: EfiStatus = 0x8000_0000_0000_0002;
-#[allow(dead_code)] // Defined for completeness; not all EFI error codes are used in every boot path.
+// Defined for completeness against the UEFI status-code table; no boot path
+// currently checks for it.
+#[allow(dead_code)]
 pub const EFI_NOT_FOUND: EfiStatus = 0x8000_0000_0000_000E;
 
 /// Allocate pages at any available physical address.
 pub const ALLOCATE_ANY_PAGES: u32 = 0;
-/// Allocate pages at or below a specified maximum physical address.
-///
-/// Used by the x86-64 arch module to reserve a < 1 MiB page for the AP
-/// SIPI trampoline. Public because the x86-64 helper in
-/// `arch::current::allocate_ap_trampoline` lives in a different module.
+/// Allocate pages at or below a specified maximum physical address
+/// (`AllocateMaxAddress`). Referenced only by [`allocate_pages_max_addr`].
 pub const ALLOCATE_MAX_ADDRESS: u32 = 1;
 
 /// Memory type used for all bootloader allocations.
@@ -160,7 +163,10 @@ pub struct EfiSystemTable
     pub configuration_table: *mut EfiConfigurationTable,
 }
 
-/// UEFI Simple Text Output Protocol, used to print boot messages.
+/// UEFI Simple Text Output Protocol (`ConOut`) layout, typed so
+/// `EfiSystemTable::con_out` has its real shape. The bootloader never calls it;
+/// boot output goes through the console backends (see
+/// [`core/boot/docs/uefi-environment.md`](../docs/uefi-environment.md) § Console Output).
 #[repr(C)]
 pub struct EfiSimpleTextOutput
 {
@@ -187,12 +193,15 @@ pub const EFI_LOADER_CODE: u32 = 1;
 // EFI_LOADER_DATA is 2, shared with the allocation constant above.
 pub const EFI_BOOT_SERVICES_CODE: u32 = 3;
 pub const EFI_BOOT_SERVICES_DATA: u32 = 4;
-// Defined for completeness — used by memory_map translation logic that matches on all types.
+// Defined for completeness; the translation maps these types through its
+// wildcard `Reserved` arm, and only the memory_map host tests name them.
 #[allow(dead_code)]
 pub const EFI_RUNTIME_SERVICES_CODE: u32 = 5;
+// Defined for completeness; named only by the memory_map host tests.
 #[allow(dead_code)]
 pub const EFI_RUNTIME_SERVICES_DATA: u32 = 6;
 pub const EFI_ACPI_RECLAIM_MEMORY: u32 = 9;
+// Defined for completeness; named only by the memory_map host tests.
 #[allow(dead_code)]
 pub const EFI_ACPI_MEMORY_NVS: u32 = 10;
 pub const EFI_MEMORY_MAPPED_IO: u32 = 11;
@@ -618,9 +627,11 @@ pub unsafe fn file_size(file: *mut EfiFileProtocol) -> Result<u64, BootError>
         return Err(BootError::UefiError(status));
     }
 
-    // SAFETY: buf starts with EfiFileInfo, which is correctly laid out.
-    // cast_ptr_alignment: the stack buffer is not guaranteed 8-byte aligned; EfiFileInfo
-    // fields are accessed individually through the reference, which the compiler handles.
+    // SAFETY: (unsound, #442) `get_info` filled `buf` with an `EfiFileInfo`
+    // prefix, but `buf` is a `[u8; N]` with alignment 1, so this reference is
+    // misaligned (undefined behaviour) whenever the stack slot is not 8-aligned.
+    // cast_ptr_alignment: the lint flags that real misalignment; it is suppressed
+    // pending the fix tracked in #442, not because the rule is inapplicable.
     #[allow(clippy::cast_ptr_alignment)]
     let info = unsafe { &*(buf.as_ptr().cast::<EfiFileInfo>()) };
     Ok(info.file_size)
@@ -680,8 +691,9 @@ pub unsafe fn allocate_pages(bs: *mut EfiBootServices, count: usize) -> Result<u
 /// Allocate `count` pages at or below `max_phys` physical address.
 ///
 /// Uses `AllocateMaxAddress` UEFI policy: the allocator picks any available
-/// pages with physical base ≤ `max_phys`. `max_phys` is an in-out parameter;
-/// on success it holds the actual allocated physical base.
+/// pages with physical base ≤ `max_phys`. The firmware's `Memory` argument is
+/// in-out: it is seeded with `max_phys`, and on success it holds the allocated
+/// physical base, which this function returns.
 ///
 /// This is the arch-neutral UEFI wrapper. The only current caller is
 /// x86-64's `arch::current::allocate_ap_trampoline`, whose SIPI-vector
@@ -691,7 +703,8 @@ pub unsafe fn allocate_pages(bs: *mut EfiBootServices, count: usize) -> Result<u
 ///
 /// # Safety
 /// `bs` must be valid boot services.
-#[allow(dead_code)] // Used only by x86-64 arch::current::allocate_ap_trampoline.
+// Used only by x86-64 `arch::current::allocate_ap_trampoline`; dead on riscv64.
+#[allow(dead_code)]
 pub unsafe fn allocate_pages_max_addr(
     bs: *mut EfiBootServices,
     max_phys: u64,
@@ -715,16 +728,11 @@ pub unsafe fn allocate_pages_max_addr(
     Ok(addr)
 }
 
-/// Query the UEFI memory map.
-///
-/// Allocates the map buffer from `AllocatePages` (which invalidates any prior
-/// map key). Returns the buffer address, map size, map key, and descriptor size.
-/// The caller must use this as the final allocation before `ExitBootServices`.
-///
-/// Sizes the buffer with 16 entries of slack beyond the reported requirement.
-/// The buffer allocation itself adds at least one descriptor; the extra margin
-/// also absorbs further growth seen when `exit_boot_services` re-queries under
-/// contention (see [`exit_boot_services`]).
+/// Query the UEFI memory map into a freshly allocated buffer sized with 16
+/// descriptors of slack. Returns the buffer address and capacity, map size,
+/// map key, and descriptor size. The acquisition protocol (key invalidation,
+/// final-allocation ordering, slack sizing) is specified in
+/// [`core/boot/docs/uefi-environment.md`](../docs/uefi-environment.md) § Memory Map Acquisition.
 ///
 /// # Safety
 /// `bs` must be valid boot services.
@@ -789,15 +797,10 @@ pub unsafe fn get_memory_map(bs: *mut EfiBootServices) -> Result<MemoryMapResult
     })
 }
 
-/// Maximum number of `ExitBootServices` attempts before giving up.
-///
-/// UEFI may invalidate the map key between `GetMemoryMap` and `ExitBootServices`
-/// when a firmware event allocates memory in that window; the call then returns
-/// `EFI_INVALID_PARAMETER`. Under host CPU contention (parallel QEMU/OVMF) the
-/// vCPU can be descheduled in that window repeatedly, so the invalidation can
-/// recur across consecutive attempts. A bounded loop retries until a tight
-/// `GetMemoryMap`→`ExitBootServices` pair lands without an intervening
-/// allocation.
+/// Maximum number of `ExitBootServices` attempts before giving up. The
+/// stale-key failure this bounds, and why one retry is insufficient, are
+/// specified in
+/// [`core/boot/docs/uefi-environment.md`](../docs/uefi-environment.md) § `ExitBootServices`.
 ///
 /// The observed two-attempt failure rate (≈0.2–1.7%) implies a per-attempt
 /// failure probability of roughly 0.045–0.13; 16 attempts drive the residual
@@ -812,10 +815,9 @@ const EXIT_BOOT_SERVICES_MAX_ATTEMPTS: u32 = 16;
 /// After a successful call, UEFI boot services are permanently unavailable.
 /// No UEFI calls may be made after this function returns `Ok(())`.
 ///
-/// Each retry re-queries the map into the existing buffer (no new allocation,
-/// which would invalidate the key again) to obtain a fresh key. The re-query
-/// passes the allocated buffer capacity, so it tolerates a map that grew since
-/// the previous query.
+/// The retry protocol (re-query into the existing buffer at its full
+/// capacity, then retry) is specified in
+/// [`core/boot/docs/uefi-environment.md`](../docs/uefi-environment.md) § `ExitBootServices`.
 ///
 /// # Safety
 /// `bs` must be valid boot services. `image` must be a valid image handle.
@@ -848,11 +850,8 @@ pub unsafe fn exit_boot_services(
             return Err(BootError::ExitBootServicesFailed);
         }
 
-        // Stale key: re-query the map using the existing buffer (no new
-        // allocation). map_size is reset to the full buffer capacity each
-        // iteration because GetMemoryMap overwrites it with the smaller actual
-        // size on success; passing the prior actual size could fail with
-        // EFI_BUFFER_TOO_SMALL if the map grew under contention.
+        // Stale key: re-query per the retry protocol in the rustdoc above;
+        // `map_size` is reset to `buffer_size` because GetMemoryMap overwrote it.
         let mut descriptor_size: usize = map.descriptor_size;
         let mut descriptor_version: u32 = 0;
         let mut map_size = map.buffer_size;
@@ -877,15 +876,11 @@ pub unsafe fn exit_boot_services(
     }
 }
 
-/// Framebuffer resolution the bootloader requests from GOP at boot.
-///
-/// Both architectures acquire the framebuffer through the same UEFI GOP path,
-/// so issuing one `SetMode` request here gives a consistent framebuffer — and
-/// QEMU window — size across x86-64 and RISC-V, independent of firmware or
-/// QEMU-version defaults. 1280x720 (720p) is present in both arches' std VGA
-/// GOP mode table (`QemuVideoDxe`). When a firmware does not offer it,
-/// `set_target_mode` leaves the active mode untouched and boot proceeds at
-/// whatever resolution firmware selected.
+/// Framebuffer resolution the bootloader requests from GOP at boot; the
+/// fixed-mode policy is specified in
+/// [`core/boot/docs/uefi-environment.md`](../docs/uefi-environment.md) § UEFI Protocol Usage.
+/// 1280x720 (720p) is present in both arches' std VGA GOP mode table
+/// (`QemuVideoDxe`).
 const TARGET_FB_WIDTH: u32 = 1280;
 const TARGET_FB_HEIGHT: u32 = 720;
 
@@ -998,8 +993,9 @@ unsafe fn set_target_mode(bs: *mut EfiBootServices, gop: *mut EfiGraphicsOutputP
 /// are skipped, as are `PixelBitMask` (format 2) layouts other than the standard
 /// 8bpc RGBX / BGRX masks (see `classify_pixel_format`).
 ///
-/// Returns `None` if no usable GOP handle exists. This is not an error — the boot
-/// proceeds with `framebuffer.physical_base == 0`.
+/// Returns `None` if no usable GOP handle exists; the meaning of an absent
+/// framebuffer is specified in
+/// [`core/boot/docs/console.md`](../docs/console.md) § Best-Effort Discovery.
 ///
 /// # Safety
 /// `bs` must be valid boot services.

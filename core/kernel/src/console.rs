@@ -24,12 +24,15 @@ use crate::framebuffer::FramebufferWriter;
 use crate::mm::paging::phys_to_virt;
 use boot_protocol::BootInfo;
 
-/// Spinlock protecting `CONSOLE`. Acquired by every `console_write_fmt` call
-/// so concurrent writes from multiple CPUs (SMP) do not race on the
-/// framebuffer cursor position. Uses a plain `AtomicBool` (test-and-set) rather
-/// than the ticket `Spinlock`, so acquiring it does not disable interrupts;
-/// interrupt-context callers acquire it the same way (the softlockup watchdog
-/// dump runs from `timer_tick` and prints through `kprintln!`).
+/// Spinlock protecting `CONSOLE`. Acquired by every `console_write_fmt` and
+/// `serial_write_fmt` call so concurrent writes from multiple CPUs (SMP) do not
+/// race on the framebuffer cursor position. Uses a plain `AtomicBool`
+/// (test-and-set) rather than the ticket `Spinlock`, so acquiring it does not
+/// disable interrupts, and process-context code can hold it with interrupts
+/// enabled. Interrupt-context callers spin on it the same way: `timer_tick`
+/// prints through `kprintln!` (the vmgenid log, the BSP stall check, and the
+/// softlockup watchdog dump). A tick that prints on a CPU whose interrupted
+/// code holds the lock spins forever on it; this is a known defect (#443).
 ///
 /// Two non-acquiring exceptions exist for crash and NMI paths where
 /// spin-waiting would deadlock against a halted or interrupted lock-
@@ -153,7 +156,8 @@ pub unsafe fn rebase_framebuffer(fb_phys: u64)
 ///
 /// Serialised via `CONSOLE_LOCK` so concurrent calls from multiple CPUs
 /// (after SMP bringup) do not race on the framebuffer cursor state.
-/// Each call acquires the lock, writes, then releases.
+/// Each call acquires the lock, writes, then releases, without disabling
+/// interrupts; see `CONSOLE_LOCK` for the interrupt-context deadlock (#443).
 ///
 /// # Safety
 /// `console::init` must have been called before this function.
@@ -178,7 +182,8 @@ pub unsafe fn console_write_fmt(args: core::fmt::Arguments)
 
 /// Write a formatted string to the serial port only.
 ///
-/// Acquires `CONSOLE_LOCK` normally (spin-waits) but writes only to serial,
+/// Acquires `CONSOLE_LOCK` as `console_write_fmt` does (spin-waits, does not
+/// disable interrupts; see `CONSOLE_LOCK` for #443) but writes only to serial,
 /// skipping the framebuffer. This is the serial-only sink behind `kprintln_serial!`, used
 /// for kernel virtual addresses, KASLR-derived values, and userspace fault diagnostics;
 /// see `core/kernel/docs/cross-boundary-disclosure.md` § Kernel console diagnostics.

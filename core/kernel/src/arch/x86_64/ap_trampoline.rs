@@ -60,12 +60,6 @@ pub const TRAMP_PATCH_RM_FAR_JMP: usize = 0x20;
 /// Layout: [u16: GDT limit = 0x001F, u32: GDT linear base = `AP_PAGE+0x48`].
 pub const TRAMP_PATCH_GDTR: usize = 0x40;
 
-/// Offset of the GDT within the trampoline page (four 8-byte descriptors).
-// dead_code: TRAMP_GDT_OFFSET names the GDT offset the module layout table documents;
-// no code reads it (TRAMPOLINE_TEMPLATE and the tests use the literal 0x48).
-#[allow(dead_code)]
-pub const TRAMP_GDT_OFFSET: usize = 0x48;
-
 /// Byte offset of AP startup parameters within the trampoline page.
 ///
 /// Layout (40 bytes):

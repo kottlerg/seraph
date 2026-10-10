@@ -193,6 +193,10 @@ mod imp
             }
             else
             {
+                // The subsystem proceeds on the firmware boot seed, where one
+                // was absorbed above, and jitter (core/kernel/docs/entropy.md
+                // § Health tests). This line names jitter alone even when the
+                // boot seed was absorbed, misreporting the sources (#443).
                 crate::kprintln!("entropy: hardware RNG not trusted; using jitter only");
             }
         }

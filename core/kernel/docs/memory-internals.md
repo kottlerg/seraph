@@ -70,8 +70,7 @@ The allocator manages a single zone: one `BuddyAllocator` instance covering all
 usable RAM. It has no zone concept. Physical-address-range constraints (e.g.
 DMA reachability) are not a kernel concern; they belong to devmgr and the
 userspace memory authority, per [docs/memory-model.md](../../../docs/memory-model.md) § Buddy
-Allocator. Physical-range allocation is design intent, not yet implemented: memmgr's only
-allocation flag is `REQUIRE_CONTIGUOUS`.
+Allocator.
 
 ### Allocation and Deallocation Properties
 
@@ -90,8 +89,9 @@ order's free-list length. Coalescing eliminates long-term fragmentation.
 ### Thread Safety
 
 The allocator is protected by a single spinlock (`FRAME_ALLOC_LOCK`, taken by
-`mm::with_frame_allocator`). It serves boot only: the Phase 7 drain empties it and `seal`
-closes it, so no runtime path allocates from it and contention is not a concern.
+`mm::with_frame_allocator`). It serves boot only: the Phase 7 drain empties it, and `seal`
+arms a debug tripwire on later frees, so no runtime path allocates from it and contention is
+not a concern.
 
 ---
 
@@ -270,7 +270,10 @@ work: holding it across the IPI ack-wait would serialize every concurrent map/un
 on the address space behind cross-CPU latency. Region teardown (`unmap_region_pooled`) is
 the exception: it holds `pt_lock` across its one coarse shootdown so that no CPU can reuse
 a just-freed page-table frame before every TLB and paging-structure cache is clean; the
-contended `pt_lock` path enables interrupts, so a waiting CPU still acks the IPI.
+contended `pt_lock` path enables interrupts, so a waiting CPU still acks the IPI. Known
+defect (#443): on RISC-V a ranged teardown (at most `RANGE_FLUSH_CEILING_PAGES`) invalidates
+per VA with `sinval.vma va, zero`, which covers only leaf entries, so a hart can keep a cached
+non-leaf entry naming a freed page-table frame.
 
 The shootdown itself is lock-free — there is no global shootdown lock and no IPI
 payload. Each CPU owns a request slot. The initiator publishes `(root, virt, pages, tag)`

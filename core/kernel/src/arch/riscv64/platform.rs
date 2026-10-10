@@ -28,15 +28,11 @@ const DEFAULT_PLIC_BASE: u64 = 0x0C00_0000;
 /// Default PLIC MMIO window size when the bootloader did not report one.
 /// 4 MiB covers the priority + per-context enable + threshold + claim/complete
 /// ranges defined by the RISC-V PLIC spec.
-// Read only by `plic_size`, which has no current in-tree caller.
-#[allow(dead_code)]
 const DEFAULT_PLIC_SIZE: u64 = 0x0040_0000;
 
 static CACHED_UART_BASE: AtomicU64 = AtomicU64::new(0);
 static CACHED_UART_SIZE: AtomicU64 = AtomicU64::new(0);
 static CACHED_PLIC_BASE: AtomicU64 = AtomicU64::new(0);
-// Read only by `plic_size`, which has no current in-tree caller.
-#[allow(dead_code)]
 static CACHED_PLIC_SIZE: AtomicU64 = AtomicU64::new(0);
 
 fn page_round_up(n: u64) -> u64

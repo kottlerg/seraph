@@ -309,7 +309,8 @@ pub unsafe extern "C" fn return_to_user(tf: *const super::trap_frame::TrapFrame)
 /// # Safety
 /// `aspace` must be a valid `AddressSpace` already marked active on this CPU.
 /// Otherwise the [`switch_and_enter_user`] contract: TSS RSP0 and
-/// `SYSCALL_KERNEL_RSP` must already be set to init's `kernel_stack_top`.
+/// `PerCpuData::kernel_rsp` (set via `syscall::set_kernel_rsp`) must already be
+/// set to init's `kernel_stack_top`.
 #[cfg(not(test))]
 pub unsafe fn first_entry_to_user(
     aspace: *const crate::mm::address_space::AddressSpace,
@@ -345,7 +346,8 @@ pub unsafe fn first_entry_to_user(
     };
 
     // SAFETY: cr3 is a valid CR3 value (PML4 root + optional PCID, bit 63 clear);
-    // tf satisfies switch_and_enter_user's contract; TSS RSP0 / SYSCALL_KERNEL_RSP set.
+    // tf satisfies switch_and_enter_user's contract; TSS RSP0 and
+    // PerCpuData::kernel_rsp are set (caller's contract).
     unsafe { switch_and_enter_user(cr3, tf) }
 }
 
@@ -353,9 +355,10 @@ pub unsafe fn first_entry_to_user(
 
 /// Atomically switch page tables and enter user mode for the first time.
 ///
-/// Performs the CR3 write and the boot-stack-to-kernel-stack switch as a
-/// single uninterruptible sequence so no Rust call/return occurs on the boot
-/// stack after CR3 is written.
+/// Moves RSP to init's direct-mapped kernel stack, writes CR3 (root plus any
+/// PCID composed by `first_entry_to_user`), and builds the `iretq` frame on
+/// that stack. The rebased boot stack also lies in the direct map, which every
+/// user address space shares, so the ordering is not needed to keep it mapped.
 ///
 /// # Parameters
 /// - `cr3` (rdi): the CR3 value to load — init's PML4 root, optionally OR'd with
@@ -369,8 +372,8 @@ pub unsafe fn first_entry_to_user(
 ///   `CR4.PCIDE` set.
 /// - `tf` must point to a `TrapFrame` on the direct-mapped init kernel stack,
 ///   with `rip`, `rsp`, `cs`, `ss`, and `rflags` set for user-mode entry.
-/// - TSS RSP0 and `SYSCALL_KERNEL_RSP` must be set to init's `kernel_stack_top`
-///   before this call.
+/// - TSS RSP0 and `PerCpuData::kernel_rsp` (set via `syscall::set_kernel_rsp`)
+///   must be set to init's `kernel_stack_top` before this call.
 #[cfg(not(test))]
 #[unsafe(naked)]
 pub unsafe extern "C" fn switch_and_enter_user(

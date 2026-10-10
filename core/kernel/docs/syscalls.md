@@ -107,10 +107,10 @@ On `ECALL` from U-mode:
 5. Trap handler checks `scause` — if it is an ecall from U-mode, routes to syscall path
 6. Kernel calls `syscall::dispatch(tf)` with a pointer to the saved `TrapFrame`;
    `dispatch` reads the number from `a7` and arguments 0–5 from `a0`–`a5`
-7. Kernel advances the saved `sepc` by 4, past the `ecall`, unless dispatch rewrote it
-   (`SYS_THREAD_WRITE_REGS`)
-8. Kernel writes return values into the saved register frame (`a0`, `a1`, and for the
-   IPC calls `a2`/`a3`)
+7. `dispatch` writes return values into the saved register frame (`a0`, `a1`, and for
+   the IPC calls `a2`/`a3`)
+8. After `dispatch` returns, the trap handler advances the saved `sepc` by 4, past the
+   `ecall`, unless dispatch rewrote it (`SYS_THREAD_WRITE_REGS`)
 9. Kernel restores the user register file
 10. `SRET` restores `pc` from `sepc`, restores `sstatus.SIE` from `sstatus.SPIE`,
     returns to U-mode (`sstatus.SPP` = 0)
@@ -421,12 +421,11 @@ entire bitmask (see [ipc-design.md](../../../docs/ipc-design.md) § Notification
 **Return:**
 
 - `rax`/`a0`: 0 on success; `SyscallError` on failure
-- `rdx`/`a1`: acquired bitmask on success (non-zero on notification wake,
-  because a waiter is woken only with a non-zero bitmask (`SYS_NOTIFICATION_SEND`
-  rejects zero-bit sends); `0` when the timeout
-  elapses, or when the notification is destroyed while the caller waits, which
-  returns success with no `Interrupted` stamp, even with `timeout_ms` = `0`;
-  #443)
+- `rdx`/`a1`: acquired bitmask on success. A notification wake always carries a
+  non-zero bitmask, because `SYS_NOTIFICATION_SEND` rejects zero-bit sends. The
+  bitmask is `0` when the timeout elapses, or when the notification is destroyed
+  while the caller waits; the latter returns success with no `Interrupted` stamp,
+  even with `timeout_ms` = `0` ([#443](https://github.com/kottlerg/seraph/issues/443)).
 
 Same register layout as `SYS_EVENT_RECV`. The split avoids aliasing
 bit-63-set bitmasks with the dispatcher's negative-Err encoding, so the
@@ -1022,7 +1021,8 @@ The parent is revalidated under the derivation lock before its object is
 touched and the tail is linked beside it (see
 [capability-internals.md](capability-internals.md) § Global Derivation Lock): a
 parent a concurrent delete freed meanwhile fails with `InvalidCapability`, and
-one with a `SYS_CAP_REVOKE` or `SYS_CAP_MOVE` in flight with `InvalidState`.
+one with a `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, or IPC capability transfer in flight
+with `InvalidState`.
 
 **Capability requirement:** `memory_cap` must have Map rights.
 
@@ -1145,7 +1145,8 @@ Both capabilities are revalidated under the derivation lock before either
 object is touched and the tail is unlinked and freed (see
 [capability-internals.md](capability-internals.md) § Global Derivation Lock): a
 cap a concurrent delete freed meanwhile fails with `InvalidCapability`, and one
-with a `SYS_CAP_REVOKE` or `SYS_CAP_MOVE` in flight with `InvalidState`.
+with a `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, or IPC capability transfer in flight with
+`InvalidState`.
 
 **Errors:** `InvalidArgument` (same slot/object, rights mismatch, ownership-flag
 mismatch, not contiguous, tail not virgin, not siblings, or either has children),
@@ -1198,10 +1199,11 @@ unhandled fault (see [fault-handling.md](../../../docs/fault-handling.md) § Del
 Kill). This does not hold for a caller displaced from a server's pending-reply
 binding: the stop is not memory-safe, and its outcome is in
 [ipc-design.md](../../../docs/ipc-design.md) § The Call/Reply Model
-([#443](https://github.com/kottlerg/seraph/issues/443)). If the thread is running on another CPU, an
-inter-processor interrupt is sent to force it out of userspace (see
-[thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § `sys_thread_stop` Cross-CPU Stop
-Protocol).
+([#443](https://github.com/kottlerg/seraph/issues/443)). If the thread is running on another CPU,
+the call interrupts that CPU and waits until it deschedules the thread at its next `schedule()`
+entry, at most one time slice later; the interrupt does not itself force the thread out of
+userspace (see [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § `sys_thread_stop`
+Cross-CPU Stop Protocol).
 
 **Capability requirement:** `thread_cap` must have Control rights.
 
@@ -1404,8 +1406,9 @@ reply (`BlockedOnFault`) — the latter lets a bound fault handler inspect the
 faulting registers (see [`docs/fault-handling.md`](../../../docs/fault-handling.md)).
 The buffer receives the kernel's architecture-specific `TrapFrame`
 (`core/kernel/src/arch/x86_64/trap_frame.rs`, `core/kernel/src/arch/riscv64/trap_frame.rs`);
-its layout is not published in an ABI crate. If `buf_size` is smaller than the required
-size, the call fails with `InvalidArgument`.
+its layout is not published in an ABI crate, so userspace consumers hard-code its size and
+field offsets ([#443](https://github.com/kottlerg/seraph/issues/443)). If `buf_size` is smaller
+than the required size, the call fails with `InvalidArgument`.
 
 **Capability requirement:** `thread_cap` MUST have Observe rights.
 
@@ -1849,16 +1852,17 @@ Hybrid Two-Level Radix).
 The source is revalidated under the derivation lock before the copy is linked
 beneath it (see [capability-internals.md](capability-internals.md) § Global
 Derivation Lock): a source a concurrent delete, move, or revoke freed meanwhile
-fails with `InvalidCapability`, and one with a `SYS_CAP_REVOKE` or
-`SYS_CAP_MOVE` in flight with `InvalidState`. With a non-zero `dst_slot`, if
-every other reference to the
-destination CSpace goes while the call is backing the leaves up to that index,
-the call reclaims that CSpace and fails with `InvalidCapability`; a caller bound
-to it is stopped and the call never returns (see
-[capability-model.md](../../../docs/capability-model.md) § "Kill process" pattern).
+fails with `InvalidCapability`, and one with a `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`,
+or IPC capability transfer in flight with `InvalidState`. With a non-zero
+`dst_slot`, if every other reference to the destination CSpace goes while the call
+is backing the leaves up to that index, the call reclaims that CSpace and fails
+with `InvalidCapability`; a caller bound to it is stopped and the call never
+returns (see [capability-model.md](../../../docs/capability-model.md) § "Kill
+process" pattern).
 
-**Errors:** `InvalidCapability`, `InvalidState` (a `SYS_CAP_REVOKE` or `SYS_CAP_MOVE` is in flight
-on the source), `InsufficientRights` (dst CSpace lacks Insert), `InvalidArgument`
+**Errors:** `InvalidCapability`, `InvalidState` (a `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, or IPC
+capability transfer is in flight on the source), `InsufficientRights` (dst CSpace lacks Insert),
+`InvalidArgument`
 (dst_slot occupied or out of range), `OutOfMemory` (slot-page pool exhausted),
 `QuotaExceeded` (dst CSpace directory structurally full).
 
@@ -1910,9 +1914,10 @@ and the call never returns (see
 capability while the move was in flight), `InsufficientRights` (dst CSpace
 lacks Insert), `InvalidArgument` (dst_slot occupied or out of range),
 `OutOfMemory` (slot-page pool exhausted), `QuotaExceeded` (dst CSpace directory
-structurally full), `InvalidState` (a `SYS_CAP_REVOKE` or another
-`SYS_CAP_MOVE` is in flight on the source slot; or the destination slot was
-freed while the move was in flight — the source keeps the capability),
+structurally full), `InvalidState` (a `SYS_CAP_REVOKE`, another
+`SYS_CAP_MOVE`, or an IPC capability transfer is in flight on the source slot;
+or the destination slot was freed while the move was in flight — the source keeps
+the capability),
 `Interrupted` (liveness backstop, per above).
 
 ---

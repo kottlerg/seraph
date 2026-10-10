@@ -53,12 +53,13 @@ mod validate;
 
 /// Report the KASLR layout at Phase 1.
 ///
-/// A framebuffer-safe summary line (no addresses — the console mirrors to the
-/// framebuffer, which is handed to userspace) plus, on the serial-only path,
-/// the slide and bases the operator needs for `add-symbol-file` / `addr2line`
-/// against a slid kernel. The bases go only through `kprintln_serial!`, never
-/// `kprintln!` (`core/kernel/docs/cross-boundary-disclosure.md` § Kernel
-/// console diagnostics).
+/// Two framebuffer-safe status lines (image and direct map; no addresses — the
+/// console mirrors to the framebuffer, which is handed to userspace) plus, on
+/// the serial-only path, the slide and bases the operator needs for
+/// `add-symbol-file` / `addr2line` against a slid kernel. The bases go only
+/// through `kprintln_serial!`, never `kprintln!`
+/// (`core/kernel/docs/cross-boundary-disclosure.md` § Kernel console
+/// diagnostics).
 #[cfg(not(test))]
 fn report_kaslr(flags: u32, image_base: u64, dm_base: u64)
 {
@@ -305,8 +306,16 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
 // cross the `#[inline(never)]` boundary as explicit arguments.
 // too_many_lines, similar_names: the same rationale as `kernel_entry`, whose
 // body this continues.
-// needless_range_loop/cast_possible_truncation: the AP-startup loop uses
-// cpu_idx directly as both slice index and CPU ID; Seraph never has > 2^32 CPUs.
+// needless_range_loop: each indexed loop runs to a validated count narrower
+// than the fixed-capacity array it indexes, and keeps the index in view: the
+// AP-startup loop uses cpu_idx as both slice index and CPU ID; the init-segment
+// Memory-cap loop (i < segment_count) and the InitInfo Memory-cap loop
+// (pg < info_pages) test the index for the first slot; the init-segment map
+// loop takes the same i < segment_count form as the cap loop after it.
+// cast_possible_truncation: every usize -> u32 cast is of a bounded value:
+// cpu_idx < boot_cpu_count (a u32); seg_count is segment_count (a u32) widened;
+// desc_count and info_pages are bounded by the INIT_INFO_MAX_PAGES check
+// (fatal past it); size_of::<InitInfo>() and STACK_PAGES are small constants.
 // large_types_passed_by_value: boot_cpu_ids ([u32; 512] = 2 KiB) and init_image
 // (304 B) cross the by-value/by-reference threshold. The `#[inline(never)]`
 // boundary is what defeats the cross-rebase hoist; the by-value signature is
@@ -374,10 +383,11 @@ unsafe fn kernel_entry_post_rebase(
     unsafe { platform::capture_kernel_mmio(boot_info_phys) };
 
     // Allocate the per-CPU storage slabs (`sched::init_storage`: scheduler,
-    // idle TCB and idle-stack slabs, idle stacks, PerCpuData and APIC IDs, and
-    // the x86-64 AP GDT/TSS/IST tables) sized to boot_cpu_count. Must precede
-    // Phase 5: timer::init arms the BSP timer, and timer_tick reads the
-    // scheduler slab via CPU_COUNT + SCHEDULERS_PTR.
+    // idle TCB and idle-stack slabs, idle stacks, watchdog ticks, PerCpuData and
+    // APIC IDs, and the x86-64 AP GDT/TSS/IST tables and NMI-backtrace storage)
+    // sized to boot_cpu_count. Must precede Phase 5: timer::init arms the BSP
+    // timer, and timer_tick reads the scheduler slab via CPU_COUNT +
+    // SCHEDULERS_PTR.
     sched::init_storage(boot_cpu_count, allocator);
 
     // Allocate entropy subsystem storage (per-CPU CSPRNGs, jitter accumulators,
@@ -557,8 +567,10 @@ unsafe fn kernel_entry_post_rebase(
                 for cpu_idx in 1..=ap_count
                 {
                     let hw_id = boot_cpu_ids[cpu_idx];
-                    // SAFETY: idle threads allocated in Phase 8 for all CPUs;
-                    // cpu_idx < boot_cpu_count validated by loop bound.
+                    // SAFETY: the idle stacks and their tops slab come from
+                    // Phase 4 storage (sched::init_storage), and the idle TCBs
+                    // were initialised in Phase 8 (sched::init);
+                    // cpu_idx < boot_cpu_count by the loop bound.
                     let stack_top = unsafe { sched::idle_stack_top_for(cpu_idx) };
 
                     // Arch-specific: write params + send SIPI / SBI hart_start.
@@ -607,8 +619,9 @@ unsafe fn kernel_entry_post_rebase(
     if trampoline_pa != 0
     {
         // SAFETY: the Acquire wait above observed `APS_READY` reach the AP
-        // count, so no AP is still inside the trampoline page; preempt
-        // discipline is handled by `unmap_identity_page` internally.
+        // count, so no AP is still inside the trampoline page; this boot
+        // path runs on the BSP before `sched::enter`, so it cannot migrate between
+        // harts during the call (the riscv64 implementation's precondition).
         unsafe {
             mm::paging::unmap_identity_page(trampoline_pa);
         }
@@ -899,8 +912,10 @@ unsafe fn kernel_entry_post_rebase(
             let block_phys = cap::take_init_info_block_phys();
             let block_virt = mm::paging::phys_to_virt(block_phys) as *mut u8;
             // SAFETY: block_phys is the InitInfo block reserved at Phase 7
-            // (INIT_INFO_MAX_PAGES contiguous pages, kernel-owned); block_pages <=
-            // INIT_INFO_MAX_PAGES, so the range is valid through the direct map.
+            // (cap::reserve_init_backing: 2^INIT_INFO_RESERVE_ORDER contiguous
+            // pages, kernel-owned); block_pages = next_power_of_two(info_pages)
+            // <= next_power_of_two(INIT_INFO_MAX_PAGES), which is that extent, so
+            // the range is valid through the direct map.
             unsafe {
                 core::ptr::write_bytes(block_virt, 0, block_pages * mm::PAGE_SIZE);
             }
@@ -1470,7 +1485,9 @@ pub extern "C" fn kernel_entry_ap(cpu_id: u32, ist1_top: u64, ist2_top: u64) -> 
     //    Must come before percpu::init_ap because lgdt reloads all segment
     //    registers (including GS ← null selector), which resets the GS
     //    shadow-register base to 0. percpu::init_ap reinstalls it afterward.
-    // SAFETY: idle threads allocated in Phase 8 (BSP); cpu_id in valid range.
+    // SAFETY: the idle stacks and IDLE_STACK_TOPS slab were allocated in Phase 4
+    // (BSP, sched::init_storage) and the idle TCBs initialised in Phase 8
+    // (sched::init); cpu_id < CPU_COUNT.
     let idle_stack_top = unsafe { sched::idle_stack_top_for(cpu_id as usize) };
     // SAFETY: per-CPU storage allocated in Phase 4 (BSP), from which init_ap
     // takes this AP's GDT+TSS; called once per AP during startup;

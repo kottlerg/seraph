@@ -18,7 +18,7 @@
 //! [`THREAD_REGISTRY_LOCK`] sits above every IPC-source, `SLEEP_LIST_LOCK`,
 //! `sched_lock`, and run-queue lock; its ordering and the rule that it is never
 //! held while waiting on another CPU's progress are specified in
-//! core/kernel/docs/scheduling-internals.md § Lock Hierarchy, rule 3a.
+//! core/kernel/docs/scheduling-internals.md § Lock Hierarchy, rule 3.
 //!
 //! Neither walk is length-bounded — a registry holds as many threads as
 //! memory backs. A list corrupted into a cycle is detected by a

@@ -24,8 +24,11 @@ Every function in the dispatch surface MUST be defined on every supported archit
 ([coding-standards.md](../../../docs/coding-standards.md) §C). The per-architecture build
 checks completeness for every surface item that architecture-neutral code calls: if one is
 missing on the target being compiled, its `arch::current::…` call fails to resolve and the
-build breaks. Items with no neutral caller (`MIN_IRQ_ID`, `MAX_IRQ_ID`, `timer::delay_us`,
-`cpu::current_id`) are not checked this way.
+build breaks. Items with no neutral caller are not checked this way: `MIN_IRQ_ID`,
+`MAX_IRQ_ID`, `interrupts::disable`, `timer::delay_us`, `cpu::current_id`,
+`cpu::user_copy_fixup`, `paging::user_fault_is_spurious`, and
+`TrapFrame::set_ipc_return_with_badge`. Of these, `timer::delay_us`, `cpu::user_copy_fixup`, and
+`paging::user_fault_is_spurious` are called only by arch-internal code; the rest have no caller.
 
 ---
 
@@ -61,14 +64,11 @@ pub mod current;
 ```
 
 The sections below document the **cross-architecture contract surface** — the functions,
-types, and module-level constants architecture-neutral code depends on. Some submodules are
-mostly arch-private support code (`gdt`, `idt`, `ioapic`/`sbi`, `fpu`, `platform`,
-`ap_trampoline`) whose internals are not part of the contract. The items neutral code does
-call from them are contract surface and are listed in the module-level section below:
-`gdt::{load_iopb, permit_port_range_u32, IOPB_SIZE, init_ap, bsp_tss_ptr}`, `idt::load`,
-`fpu::{switch_out_save, switch_in_restore}`,
-`platform::{console_mmio, uart_base_for_boot_info, collect_mmio_direct_map_regions}`, and
-`ap_trampoline::{setup_trampoline, start_ap}`. The `gdt` entry points are no-ops on RISC-V.
+types, and module-level constants architecture-neutral code depends on, plus the items every
+architecture defines without a neutral caller (listed above). Some submodules are mostly
+arch-private support code (`gdt`, `idt`, `ioapic`/`sbi`, `fpu`, `platform`, `ap_trampoline`)
+whose internals are not part of the contract; the items neutral code calls from them are
+listed, with their signatures, in § Module-level constants and free functions.
 
 Addresses cross this boundary as raw `u64`. Page-permission and page-table-rewrite types
 (`PageFlags`, `MapOutcome`, `PagingError`) are architecture-neutral and defined in
@@ -90,11 +90,12 @@ Layout.
 ```rust
 /// Install `root_phys` as the active page table for the current CPU with a full
 /// TLB flush: x86-64 writes CR3 with PCID 0 (flushing PCID 0's entries); RISC-V
-/// writes `satp` with ASID 0 and executes `sfence.vma`. This is the untagged
-/// fallback path, used when hardware tagging is disabled (and on an unreachable
-/// defensive branch should `tag_allocator::claim` return tag 0); the tagged
-/// context-switch path uses `activate_tagged` (below),
-/// driven by `AddressSpace::activate`. See docs/memory-model.md.
+/// writes `satp` with ASID 0 and executes `sfence.vma`. It installs the kernel
+/// page table during boot setup, before tagging exists. On the
+/// `AddressSpace::activate` path it is the untagged fallback, used when hardware
+/// tagging is disabled (and on an unreachable defensive branch should
+/// `tag_allocator::claim` return tag 0); the tagged context-switch path uses
+/// `activate_tagged` (below). See docs/memory-model.md.
 ///
 /// # Safety
 /// `root_phys` must be a valid page-table root mapping current code, stack, and
@@ -218,8 +219,8 @@ pub unsafe fn flush_tag(tag: u16);
 /// a bracket only pays for itself across multiple addresses.
 pub unsafe fn inval_batch_begin();
 
-/// Invalidate `virt` across all tags inside an open window (RISC-V
-/// `sinval.vma virt, zero`; x86-64 `invlpg`).
+/// Invalidate `virt` inside an open window (RISC-V `sinval.vma virt, zero`:
+/// every ASID; x86-64 `invlpg`: the loaded PCID and global entries).
 pub unsafe fn inval_page(virt: u64);
 
 /// Invalidate `virt` within `tag` inside an open window (RISC-V
@@ -344,13 +345,14 @@ pub unsafe extern "C" fn switch(
 
 /// Activate `aspace` and enter user mode for the first time via the trap frame
 /// `tf`. Does not return. Tags the entry when tagging is enabled, so init does
-/// not run its first quantum untagged. On x86-64 the CR3 write and stack switch
-/// stay atomic with `iretq` (the boot stack is absent from user address spaces),
-/// so the tag bookkeeping runs in Rust beforehand and the composed CR3 (root +
-/// PCID) is handed to the naked switch; on RISC-V the boot stack lives in the
-/// direct map, so this routes through `AddressSpace::activate` (tagged `satp`
-/// write + generation check) then `sret`. `aspace` must already be marked active
-/// on this CPU, and `set_kernel_trap_stack` must have been called first.
+/// not run its first quantum untagged. On both architectures the rebased boot
+/// stack lies in the direct map, which every user address space shares. On
+/// x86-64 the tag bookkeeping runs in Rust and the composed CR3 (root + PCID) is
+/// handed to the naked `switch_and_enter_user`, which moves the stack pointer to
+/// init's kernel stack, writes CR3, and builds the `iretq` frame there; on
+/// RISC-V this routes through `AddressSpace::activate` (tagged `satp` write +
+/// generation check) then `sret`. `aspace` must already be marked active on this
+/// CPU, and `set_kernel_trap_stack` must have been called first.
 pub unsafe fn first_entry_to_user(aspace: *const AddressSpace, tf: *const TrapFrame) -> !;
 
 /// Return from a trap to userspace, restoring full user register state from `tf`.
@@ -465,8 +467,9 @@ storage is architecture-managed (GS-base on x86-64; the `tp` register on RISC-V,
 `sscratch` holding the per-CPU pointer while in U-mode).
 
 ```rust
-/// Hardware CPU identity: the local APIC id on x86-64. No in-tree caller; the
-/// RISC-V implementation returns 0 on every hart, not the hart id (#443).
+/// Hardware CPU identity: the initial (8-bit, CPUID leaf 1) APIC id on x86-64,
+/// the hart id on RISC-V. No in-tree caller; the RISC-V implementation returns 0
+/// on every hart (#443).
 pub fn current_id() -> u32;
 /// The 0-based logical CPU index used by arch-neutral code (`PerCpuData::cpu_id`).
 pub fn current_cpu() -> u32;
@@ -592,7 +595,8 @@ impl TrapFrame {
     /// Validate and sanitize a user-supplied register snapshot before resuming
     /// it in user mode. x86-64 rejects a non-user `rip` or `rsp`, forces ring-3
     /// selectors, and clears RFLAGS privilege bits; RISC-V rejects a non-user
-    /// `sepc`, clears `scause`/`stval`, and leaves `sp` and `sstatus` as supplied.
+    /// `sepc`, clears `scause`/`stval`, and leaves `sp` and `sstatus` as supplied,
+    /// so a supplied SPP or SUM bit reaches hardware on resume (#443).
     /// `Err(())` maps to `SyscallError::InvalidArgument`.
     pub fn sanitize_for_user_resume(&mut self) -> Result<(), ()>;
 
@@ -748,8 +752,8 @@ pub unsafe fn ap_trampoline::start_ap(
 - Hardware RNG and cycle-counter access (RDSEED/RDRAND/TSC vs the `time` CSR)
 - SMP bringup (INIT/SIPI on x86-64; SBI HSM on RISC-V)
 
-**Architecture-neutral** (lives outside `arch/`: `mm/`, `cap/`, `ipc/`, `sched/`, `syscall/`, and
-`main.rs`):
+**Architecture-neutral** (lives outside `arch/`, for example in `mm/`, `cap/`, `ipc/`, `sched/`,
+and `syscall/`):
 
 - Buddy allocator algorithm
 - Retype allocator and the page pools behind address spaces and CSpaces
@@ -770,9 +774,9 @@ pub unsafe fn ap_trampoline::start_ap(
 A new architecture port MUST:
 
 1. Create `core/kernel/src/arch/<arch>/` with the module files listed above
-2. Define every function in the dispatch surface — a missing surface function fails to
-   resolve at its `arch::current::…` call site and breaks the build, which is the
-   completeness check
+2. Define every function in the dispatch surface — the build catches a missing item only
+   where neutral code calls it; check by hand the items the preamble lists as having no
+   neutral caller
 3. Add a custom target JSON in `xtask/targets/`
 4. Add a linker script in `core/kernel/linker/`
 5. Add the `#[cfg]` branch in `core/kernel/src/arch/mod.rs`

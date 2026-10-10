@@ -290,11 +290,6 @@ pub unsafe fn init() {}
 
 // ── APIC ID and ICR ───────────────────────────────────────────────────────────
 
-/// Local APIC ID register offset.
-// dead_code: `APIC_ID` is read only by `lapic_id`, which has no in-tree caller and is absent
-// from the cfg(test) build.
-#[allow(dead_code)]
-const APIC_ID: usize = 0x20;
 /// Interrupt Command Register low word (bits 31:0).
 const APIC_ICR_LOW: usize = 0x300;
 /// Interrupt Command Register high word (bits 63:32).
@@ -360,27 +355,6 @@ pub fn nmi_backtrace_request(cpu: usize) -> Option<&'static core::sync::atomic::
 /// ICR delivery-mode + level encoding for an NMI IPI (`delivery_mode`=4 = NMI,
 /// level=assert, trigger=edge, `dest_shorthand`=none, vector=0/ignored).
 const ICR_NMI: u32 = 0x0000_4400;
-
-/// Read this CPU's local APIC ID.
-///
-/// xAPIC packs the 8-bit ID in bits [31:24] of the APIC ID register; x2APIC
-/// exposes the full 32-bit ID with no shift.
-// dead_code: `lapic_id` has no in-tree caller; it is an x86-64-private helper, not part of the
-// arch interface (core/kernel/docs/arch-interface.md § `interrupts`).
-#[allow(dead_code)]
-#[cfg(not(test))]
-pub fn lapic_id() -> u32
-{
-    let raw = apic_read(APIC_ID);
-    if x2apic_enabled() { raw } else { raw >> 24 }
-}
-
-/// No-op test stub.
-#[cfg(test)]
-pub fn lapic_id() -> u32
-{
-    0
-}
 
 /// Issue one ICR command targeting hardware APIC ID `dest`.
 ///
@@ -705,7 +679,7 @@ pub unsafe fn enable()
 }
 
 /// Return `true` if the interrupt flag (IF) is set in RFLAGS.
-// dead_code: required by the arch interface (core/kernel/docs/arch-interface.md § `interrupts`).
+// dead_code: sole caller sched::check_lock_hold_preemptible is cfg(not(test)); dead in host tests.
 #[allow(dead_code)]
 pub fn are_enabled() -> bool
 {
@@ -773,11 +747,17 @@ pub fn unmask(_irq: u32) {}
 /// masked at the I/O APIC. The driver unmasks via `SYS_IRQ_ACK` once it has
 /// registered a handler.
 ///
+/// Known defect (#443): neither this function nor `sys_irq_register` checks
+/// `irq` against the stubbed range. Only GSIs 0-22 (vectors 33-55) have IDT
+/// gates; GSI 23 and up routes to a vector with no gate, GSIs 217, 218 and 222
+/// land on the TLB-shootdown, wakeup and spurious vectors, and from GSI 223 the
+/// `u8` add overflows (a panic in debug builds, a wrap into exception vectors
+/// 0-31 in release builds).
+///
 /// # Safety
 /// Must be called after Phase 5 init (IOAPIC initialised) with a valid GSI.
-// cast_possible_truncation: a GSI is < 256 (`ROOT_IRQ_COUNT`), so `irq as u8` is exact. The
-// vector sum `DEVICE_VECTOR_BASE + irq` fits u8 only for GSI <= 222, and only GSIs 0-22
-// (vectors 33-55) have IDT stubs (`idt::irq_dispatch`); no range check guards higher GSIs.
+// cast_possible_truncation: a GSI is < 256 (`ROOT_IRQ_COUNT`), so `irq as u8` is exact; the
+// vector add that follows is unchecked (#443, see above).
 #[allow(clippy::cast_possible_truncation)]
 #[cfg(not(test))]
 pub unsafe fn route_device_irq(irq: u32)

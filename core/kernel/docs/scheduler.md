@@ -1,9 +1,12 @@
 # Scheduler Internals
 
 The Seraph kernel scheduler is preemptive, priority-based, and SMP-aware. Scheduling
-policy is minimal: the highest-priority runnable thread runs. Using SMT topology to spread
-threads across physical cores rather than packing them onto one is design intent, not yet
-implemented ([#267](https://github.com/kottlerg/seraph/issues/267)).
+policy is minimal: whenever a CPU schedules (block, yield, slice expiry, or idle wake), it
+selects its highest-priority runnable thread. A wake does not preempt a running thread, so a
+newly runnable higher-priority thread waits until the running thread blocks or yields or its
+slice expires. Using SMT topology to spread threads across physical cores rather than
+packing them onto one is design intent, not yet implemented
+([#267](https://github.com/kottlerg/seraph/issues/267)).
 
 The scheduler interacts with two subsystems:
 
@@ -131,10 +134,11 @@ slice counter. When the counter reaches zero, the thread is preempted. The time
 slice duration and timer period are implementation constants, not part of the ABI.
 
 Time slices are equal across all priority levels. Priority determines which thread
-runs next, not how much time each thread gets relative to others. Slice expiry rotates a
-thread only among runnable threads at its own level: a higher-priority thread that never
-blocks is re-picked at every expiry, and a lower-priority thread on that CPU runs only once
-it blocks (or after the load balancer moves the lower thread elsewhere).
+runs next, not how much time each thread gets relative to others. Slice expiry never hands
+the CPU to a lower level: the expiring thread is requeued at its level's tail and the highest
+non-empty level runs next. A thread that never blocks keeps any lower-priority thread on its
+CPU from running until the higher-priority thread blocks or the load balancer moves the
+lower-priority thread elsewhere.
 
 Within a priority level, threads share the CPU in round-robin order (FIFO queue
 drained cyclically).
@@ -500,9 +504,9 @@ for the whole syscall except in bounded preempt-disabled, interrupt-enabled wind
 `timer_tick` reaches a slice expiry while `percpu::preemption_disabled()` holds, it resets
 the slice and skips the switch, and the thread is rescheduled at its next slice expiry.
 Kernel-mode preemption therefore happens only at a slice expiry with preemption enabled.
-The model, the spinlock hold-time bound, and lock ordering are specified in the
-"Lock primitive" and "Bare spin locks" paragraphs of
-[scheduling-internals.md § Lock Hierarchy](scheduling-internals.md#lock-hierarchy).
+The model, the spinlock hold-time bound, and lock ordering are specified in
+[scheduling-internals.md § Lock Hierarchy](scheduling-internals.md#lock-hierarchy) (its
+numbered ordering rules and the "Lock primitive" and "Bare spin locks" paragraphs).
 
 ---
 

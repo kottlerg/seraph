@@ -11,7 +11,7 @@ IMPLEMENTED in #292, the structural fix to the recurring cross-CPU TCB-lifecycle
 behind #116 #117 #128 #144 #160 #207 #225 #244 #282 #289 #284. The authoritative, binding
 invariants live in [scheduling-internals.md](scheduling-internals.md); this document records
 WHY the per-TCB `sched_lock` design was chosen and HOW it was migrated, and is retained for
-the code comments that cite its rationale sections (`§2`, `§2.1`, `§3`).
+the code comments that cite its rationale sections (`§1`, `§2`, `§2.1`, `§3`).
 
 ## 0. History — why this is the SECOND design in this doc
 
@@ -179,13 +179,18 @@ which the `enqueue_and_wake` gate and its callers preserve:
    the three endpoint sites (binding rule: [scheduling-internals.md](scheduling-internals.md)
    § Lock Hierarchy).
 
-`wake_pending` is set only by a waker that finds its target `Running`, and no current
-waker reaches that arm. The source-lock-serialized parkers (notification/event/waitset,
-and the endpoint send/recv queues) commit `Blocked` under the source lock before any
-waker can claim them. The reply wake takes no source lock (`endpoint_reply` claims by
-the `reply_tcb` CAS; [scheduling-internals.md](scheduling-internals.md) § Lock Hierarchy
-rule 5), but the server can reach the binding only after the caller's `Blocked` commit
-under `ep.lock`, so it never sets `wake_pending` either.
+`wake_pending` is set only by a waker that finds its target `Running`, which a waker
+serialized with the parker by the source lock never does: the source-lock-serialized
+parkers (notification/event/waitset, and the endpoint send/recv queues) commit `Blocked`
+under the source lock before any waker can claim them. The reply wake takes no source lock
+(its claimants win the `reply_tcb` CAS; [scheduling-internals.md](scheduling-internals.md)
+§ Lock Hierarchy rule 5). `endpoint_reply` reaches the binding only after the caller's
+`Blocked` commit under `ep.lock`, but the dying-server reply-bound wake in
+`dealloc_object(Thread)` does not take `ep.lock`: it can claim `reply_tcb` between
+`endpoint_call`'s `reply_tcb` publish and its park commit, find the caller still
+`Running`, and set `wake_pending`. The caller's commit then returns `RefusedWake` and
+`endpoint_call` rolls the call back. That wake is the current waker that reaches the
+`Running` arm.
 
 **Why a `Ready` coalesce can always be dropped (the linchpin for
 `enqueue_and_wake`'s `Ready` arm).** The register-waiter → `commit_blocked` sequence runs entirely
@@ -199,8 +204,8 @@ Therefore a thread a waker observes as `Ready` is ALWAYS an already-woken thread
 duplicate — never a wake-before-park case ([scheduling-internals.md](scheduling-internals.md)
 § Lock Hierarchy). Dropping it loses nothing, and there
 is no "preempted-mid-registration" window that would require `wake_pending` on
-the `Ready` arm. (`Running` keeps `wake_pending` purely as the belt-and-
-suspenders net for any future waker that is not source-lock-serialized.)
+the `Ready` arm. (`Running` keeps `wake_pending` as the net for a waker that is not
+source-lock-serialized, today the dying-server reply-bound wake above.)
 
 ## 3. What the implementation does (the migration, ordered as it landed)
 
@@ -432,8 +437,12 @@ server while `cancel` stalled was a latent use-after-free (#317). #317 is closed
 now runs under the client's `sched_lock`, gated by a `blocked_on_object == server` re-read,
 and `dealloc_object(Thread)` on the server nulls a claimed client's `blocked_on_object`
 under that same lock before the free ([scheduling-internals.md](scheduling-internals.md)
-§ Lock Hierarchy rule 7). The lower-frequency cross-CPU lost-wake / torn-context tail that
-survived this redesign's burn-in (#314, with #316) is also closed.
+§ Lock Hierarchy rule 7). That gating closes the race only for the client the server's
+binding currently names: a caller displaced from that binding by a later receive keeps
+`blocked_on_object == server`, the server's dealloc never nulls it, and the CAS can still
+dereference a freed server ([#443](https://github.com/kottlerg/seraph/issues/443)). The
+lower-frequency cross-CPU lost-wake / torn-context tail that survived this redesign's
+burn-in (#314, with #316) is also closed.
 
 ---
 

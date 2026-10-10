@@ -511,14 +511,14 @@ const ROOT_CSPACE_INIT_PAGES: u64 =
 ///
 /// Today's footprint on `x86_64` is ~150 KB:
 /// ~15 KB for sub-page cap-identity bodies (bin-128 slots: one RAM
-/// `MemoryObject` per coalesced drained extent (see [`coalesce_ram_blocks`]) +
-/// 10 `Mmio` wrappers + 1 `Interrupt` + 1
-/// `IoPort` + 1 `SchedControl` + 2 ACPI Memory caps + 6 module Memory caps +
-/// 3 init-segment Memory caps + 1 seed-tail Memory cap, plus the seed's own
-/// `RetypeAllocator` metadata), plus ~130 KB for init's bootstrap state
-/// (one [`AddressSpaceObject`] slab — wrapper page + root PT + PT growth
-/// pool, one [`CSpaceKernelObject`] slab — wrapper page + slot-page pool,
-/// one [`ThreadObject`] slab — kernel stack + wrapper/TCB).
+/// `MemoryObject` per coalesced drained extent, the seed tail included (see
+/// [`coalesce_ram_blocks`]) + 10 `Mmio` wrappers + 1 `Interrupt` + 1 `IoPort` +
+/// 1 `SchedControl` + 2 ACPI Memory caps + 6 module Memory caps + 3
+/// init-segment Memory caps, plus the seed's own `RetypeAllocator` metadata),
+/// plus ~130 KB for init's bootstrap state (one [`AddressSpaceObject`] slab —
+/// wrapper page + root PT + PT growth pool, one [`CSpaceKernelObject`] slab —
+/// wrapper page + slot-page pool, one [`ThreadObject`] slab — kernel stack +
+/// wrapper/TCB).
 /// `SEED_RESERVE_BYTES` is sized at 512 KB — generous headroom so future
 /// cap types and longer module lists land without revisiting the constant.
 ///
@@ -786,8 +786,8 @@ pub(crate) fn init_stack_phys(i: usize) -> u64
 /// MUST run before any [`mint_phase7_body`] / [`boot_retype_aspace`] /
 /// [`boot_retype_cspace`] call against the seed, before Phase 9's
 /// `retype_allocate` of init's Thread slab, and before any `map_user_page`
-/// consumer (the kernel PT pool
-/// must be live before Phase 9's init bootstrap maps run).
+/// consumer (the kernel PT pool must be live before Phase 9's init bootstrap
+/// maps run).
 ///
 /// # Safety
 /// Single-threaded Phase 7. Buddy active.
@@ -1508,11 +1508,7 @@ fn populate_cspace(
     // Initialised to 0, the value reported when no RAM Memory cap is minted;
     // both builds overwrite `memory_base` at their first mint
     // (`if memory_count == 0`) and increment `memory_count` per mint.
-    #[allow(unused_assignments)]
     let mut memory_base: u32 = 0;
-    // unused_assignments: same rationale as `memory_base` above — the initial 0
-    // is the value reported when no RAM cap is minted.
-    #[allow(unused_assignments)]
     let mut memory_count: u32 = 0;
 
     #[cfg(not(test))]
@@ -2067,12 +2063,11 @@ fn mint_module_memory_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &m
         // Register the module's pages as managed-but-not-free so the buddy's
         // `total_pages` ledger accounts for them (they are excluded from the
         // free list — `mm::init::collect_usable_ranges` in core/kernel/src/mm/init.rs
-        // filters loaded regions). These caps route
-        // to memmgr via reap and are not destroyed in the kernel; the
-        // post-handoff buddy is sealed, so the dealloc `free_range` path is a
-        // tripwire, not a routine reclaim. Idempotent at boot since module
-        // page ranges are disjoint. Production-only: `with_frame_allocator` is
-        // `cfg(not(test))`.
+        // filters loaded regions). These caps route to memmgr via reap and are
+        // not destroyed in the kernel; the post-handoff buddy is sealed, so the
+        // dealloc `free_range` path is a tripwire, not a routine reclaim.
+        // Idempotent at boot since module page ranges are disjoint.
+        // Production-only: `with_frame_allocator` is `cfg(not(test))`.
         #[cfg(not(test))]
         // SAFETY: module pages were not added via `add_region`
         // (core/kernel/src/mm/init.rs `collect_usable_ranges` excludes loaded
@@ -2090,8 +2085,8 @@ fn mint_module_memory_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &m
             // Boot module pages are reclaimable: full byte ledger so the
             // pages can flow through `memmgr_labels::DONATE_MEMORY_CAPS` into
             // memmgr's pool at init's reap (docs/process-lifecycle.md § Init reap)
-            // once the loader (init or procmgr) has copied
-            // the ELF contents into the target process's AddressSpace.
+            // once the loader (init or procmgr) has copied the ELF contents into
+            // the target process's AddressSpace.
             available_bytes: core::sync::atomic::AtomicU64::new(rounded_size),
             // Reclaimable: `owns_memory` marks this cap as the pages' owner. It
             // routes to memmgr via init's reap and is never destroyed; a
@@ -2151,13 +2146,13 @@ fn mint_module_memory_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &m
 /// module bodies are excluded because [`mint_module_memory_caps`]
 /// covers them) — and mints one reclaimable `MemoryObject`
 /// cap per range with `owns_memory = true` and the full byte ledger.
-/// Each cap is inserted into the root `CSpace` and a matching
-/// `CapDescriptor` entry pushed into [`CSPACE_LAYOUT_DESCRIPTORS`] (counted by
-/// `layout.descriptor_count`), so the cap
-/// reaches init through the standard descriptor-table walk in the same
-/// shape boot-module caps take. init routes each cap to memmgr via reap;
-/// the post-handoff buddy is sealed, so the `dealloc_object` → `free_range`
-/// path is a tripwire for a leaked cap, not a routine reclaim.
+/// Each cap is inserted into the root `CSpace` and a matching `CapDescriptor`
+/// entry pushed into [`CSPACE_LAYOUT_DESCRIPTORS`] (counted by
+/// `layout.descriptor_count`), so the cap reaches init through the standard
+/// descriptor-table walk in the same shape boot-module caps take. init routes
+/// each cap to memmgr via reap; the post-handoff buddy is sealed, so the
+/// `dealloc_object` → `free_range` path is a tripwire for a leaked cap, not a
+/// routine reclaim.
 ///
 /// Entries marked [`boot_protocol::RECLAIM_FLAG_LATE`] are skipped here
 /// and minted later by [`mint_late_reclaim_memory_caps`] after SMP
@@ -2173,9 +2168,8 @@ fn mint_module_memory_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &m
 /// `reclaim_memory_base` / `reclaim_memory_count` pair on [`CSpaceLayout`]
 /// because reclaim caps carry no per-index meaning — unlike boot
 /// modules, which init resolves by name through [`CSpaceLayout::module_names`],
-/// reclaim caps are a homogeneous
-/// pool and userspace inspects each `CapDescriptor.aux0`/`aux1` to
-/// learn the underlying physical range.
+/// reclaim caps are a homogeneous pool and userspace inspects each
+/// `CapDescriptor.aux0`/`aux1` to learn the underlying physical range.
 fn mint_reclaim_memory_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &mut CSpaceLayout)
 {
     mint_reclaim_pass(cspace, boot_info, layout, false, "reclaim");

@@ -527,8 +527,9 @@ pub struct ThreadControlBlock
     /// Virtual address of the top of this thread's kernel stack.
     /// On every switch-in of a user thread `schedule()` publishes it through
     /// `arch::current::cpu::set_kernel_trap_stack` (TSS RSP0 and
-    /// `SYSCALL_KERNEL_RSP` on x86-64; `PerCpuData::kernel_rsp` on RISC-V, where
-    /// `sscratch` holds the per-CPU pointer); a kernel thread publishes 0.
+    /// `PerCpuData::kernel_rsp` via `syscall::set_kernel_rsp` on x86-64;
+    /// `PerCpuData::kernel_rsp` on RISC-V, where `sscratch` holds the per-CPU pointer);
+    /// a kernel thread publishes 0.
     pub kernel_stack_top: u64,
 
     /// Pointer to the user `TrapFrame` on the kernel stack (null for kernel threads).
@@ -598,10 +599,11 @@ pub struct ThreadControlBlock
     /// On context switch, if non-null, this bitmap is copied into the TSS
     /// IOPB region so `in`/`out` instructions work for this thread.
     ///
-    // TODO: When an IoPort cap (or ancestor) is revoked, the relevant bits must
-    // be re-denied in this bitmap and reloaded into the TSS if this thread is
-    // currently running (#457). Deferred because it requires tracking which
-    // threads hold which IoPort bindings.
+    // TODO: When the IoPort cap a binding was made through is deleted (including
+    // by revocation of an ancestor), the relevant bits must be re-denied in this
+    // bitmap and reloaded into the TSS if this thread is currently running
+    // (#457). Deferred because it requires tracking which threads hold which
+    // IoPort bindings.
     pub iopb: *mut [u8; crate::arch::current::IOPB_SIZE],
 
     // === IPC block cancellation ===

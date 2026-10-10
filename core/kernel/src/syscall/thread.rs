@@ -328,8 +328,9 @@ pub fn sys_thread_stop(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         }
         else if let Some(run_cpu) = running_on
         {
-            // Cross-CPU drain: IPI forces the remote into schedule() so
-            // sys_thread_read_regs sees a fresh trap_frame.
+            // Cross-CPU drain: the wakeup IPI only nudges the remote CPU (its
+            // handler sends EOI and returns); the spin below waits for the
+            // remote's next `schedule()` entry to deschedule the target.
             let current_cpu = crate::arch::current::cpu::current_cpu() as usize;
             if run_cpu != current_cpu
             {
@@ -1417,8 +1418,9 @@ pub fn sys_thread_read_regs(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 ///
 /// The thread must be Stopped, or fault-blocked awaiting a fault-handler reply
 /// (`BlockedOnFault`; see `docs/fault-handling.md` § Modifying the faulting
-/// thread). The kernel validates register values for safety (no privilege
-/// escalation) before writing. Returns 0 on success.
+/// thread). The kernel sanitizes the frame per architecture
+/// (`core/kernel/docs/arch-interface.md` § `trap_frame` — `arch::current::trap_frame`)
+/// before writing; RISC-V applies `sstatus` as supplied (#443). Returns 0 on success.
 #[cfg(not(test))]
 pub fn sys_thread_write_regs(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {

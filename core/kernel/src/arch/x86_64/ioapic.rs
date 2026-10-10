@@ -219,9 +219,11 @@ pub unsafe fn init()
 ///
 /// TODO: per-IRQ affinity. Every GSI is delivered to local APIC ID 0 (destination field = 0),
 /// the BSP only when the BSP's APIC ID is 0. With several IRQ sources (virtio-blk, virtio-input,
-/// serial) one CPU takes every device trap. Replace the hard-coded destination with a per-GSI
-/// selector (round-robin, user-supplied affinity, or a rebalancer). Mirror the matching change
-/// on RISC-V (`plic_enable` in `core/kernel/src/arch/riscv64/interrupts.rs`).
+/// serial) one CPU takes every device trap. Deferred because only one of those sources
+/// (virtio-blk) is high-rate; the concentration becomes a trap bottleneck once several
+/// high-rate sources exist (more block devices, a NIC). Replace the hard-coded destination with
+/// a per-GSI selector (round-robin, user-supplied affinity, or a rebalancer). Mirror the
+/// matching change on RISC-V (`plic_enable` in `core/kernel/src/arch/riscv64/interrupts.rs`).
 ///
 /// # Safety
 /// Must only be called after [`init`].

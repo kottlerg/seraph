@@ -304,11 +304,11 @@ pub struct NotificationState
 5. if waiter is Some(tcb):
    a. delivered = bits.swap(0, Ordering::Relaxed)
    b. if delivered == 0: release sig.lock; return None
-      (a concurrent notification_wait consumed our bits between steps 1
-       and 4 with its locked swap; the current sig.waiter is a *new*
-       waiter who must NOT be touched, else they receive wakeup_value=0
-       — a spurious wake, since sys_notification_send rejects 0-bit
-       sends before step 1)
+      (a concurrent notification_wait or another sender's slow-path swap
+       consumed our bits between steps 1 and 4 with its locked swap; the
+       current sig.waiter is a *new* waiter who must NOT be touched, else
+       they receive wakeup_value=0 — a spurious wake, since
+       sys_notification_send rejects 0-bit sends before step 1)
    c. waiter = None; tcb.wake_in_flight = 1; has_observer = (wait_set != null)
    d. tcb.wakeup_value = delivered
    e. if tcb.sleep_deadline != 0: sleep_list_remove(tcb); clear deadline
@@ -354,7 +354,7 @@ bit-63-set bitmasks with negative-Err codes.
 
 ---
 
-## Event Queue (`ipc/event_queue.rs`)
+## Event Queue (`core/kernel/src/ipc/event_queue.rs`)
 
 ### Object Structure
 
@@ -384,10 +384,10 @@ entries laid out **inline within the same retype slot** that holds the
 `EventQueueState` (layout: `cap::retype::event_queue_raw_bytes` and
 `EVENT_QUEUE_RING_OFFSET`; see
 [memory-internals.md § Kernel Object Memory](memory-internals.md#kernel-object-memory-capretypers)).
-The one-slot gap between
-`write_idx` and `read_idx` (used to distinguish full from empty) is internal;
-the user observes exactly N usable slots. The ring is reclaimed wholesale with
-the wrapper on `dealloc_object(EventQueue)`.
+Full and empty are detected from `count` (also the lockless wait-set readiness
+witness), not from the gap between `write_idx` and `read_idx`; the spare slot
+is unused and the user observes exactly N usable slots. The ring is reclaimed
+wholesale with the wrapper on `dealloc_object(EventQueue)`.
 
 ### Post Path
 
@@ -408,9 +408,10 @@ the wrapper on `dealloc_object(EventQueue)`.
 6. Release eq.lock
 ```
 
-The ring has `capacity + 1` slots internally (one-slot-gap full detection);
-the user observes exactly N usable slots as requested. `count` tracks
-occupancy and doubles as the lockless wait-set level-readiness witness.
+The ring has `capacity + 1` slots internally; full and empty are detected from
+`count`, not the index gap, and the user observes exactly N usable slots as
+requested. `count` tracks occupancy and doubles as the lockless wait-set
+level-readiness witness.
 
 ### Recv Path
 
@@ -460,7 +461,7 @@ path — sequential, not nested, so no cycle.
 
 ---
 
-## Wait Set (`ipc/wait_set.rs`)
+## Wait Set (`core/kernel/src/ipc/wait_set.rs`)
 
 ### Object Structure
 
@@ -563,7 +564,9 @@ waitset_notify(wait_set, member_idx):
    c. Release lock
 5. schedule(); on resume:
    if consume_park_interrupted(tcb) -> return Interrupted,
-   else                            -> return wakeup_value (the badge)
+   else                            -> return wakeup_value (the ready
+                                      member's badge, or 0 when the wait
+                                      set is destroyed while parked)
 ```
 
 **Why step 3 exists, and its memory-ordering requirement.** Readiness
@@ -656,8 +659,9 @@ delivery, consumer-side atomic check-and-halt — is specified in
 [scheduling-internals.md § Wake Protocol Invariants](scheduling-internals.md#wake-protocol-invariants).
 The single-waiter IPC wakers invoke `enqueue_and_wake` after releasing their source
 IPC lock. `waitset_notify` wakes after releasing `ws.lock` while its caller still
-holds the source lock, and the `endpoint_dealloc` drain holds `ep.lock` across its
-walk. [scheduling-internals.md § Lock Hierarchy](scheduling-internals.md#lock-hierarchy)
+holds the source lock, and the `dealloc_object_one` Endpoint-arm send/recv drain
+holds `ep.lock` across its walk.
+[scheduling-internals.md § Lock Hierarchy](scheduling-internals.md#lock-hierarchy)
 rule 5 permits both.
 
 ### Lock-Free Notification Fast Path

@@ -568,7 +568,10 @@ pub unsafe fn waitset_remove(ws: *mut WaitSetState, source_ptr: *mut u8) -> Resu
 ///
 /// Clears back-pointers on all registered sources so they stop notifying,
 /// then `dec_ref`s the +1 cap-level reference that wait-set membership held
-/// on each source. Finally wakes any blocked waiter.
+/// on each source. Finally wakes any blocked waiter with `wakeup_value` 0
+/// and no `PARK_DISPOSITION_INTERRUPTED` stamp, so its `SYS_WAIT_SET_WAIT`
+/// returns success with badge 0, indistinguishable from a ready member
+/// registered with badge 0 (a defect; #443).
 ///
 /// Returns the set of source headers whose `dec_ref` returned 0 (i.e. the
 /// member's +1 was the last cap-level reference). The caller — the `WaitSet`
@@ -658,8 +661,10 @@ pub unsafe fn wait_set_drop(
     {
         let waiter = ws_ref.waiter;
         ws_ref.waiter = core::ptr::null_mut();
-        // SAFETY: waiter is a valid TCB; wakeup_value=0 = drop semantics.
-        // Claim for wake under ws.lock (#160).
+        // SAFETY: waiter is a valid TCB. Claim for wake under ws.lock (#160).
+        // No INTERRUPTED stamp is set, so the waiter's SYS_WAIT_SET_WAIT
+        // returns success with badge 0 though no source became ready (a
+        // defect; #443).
         let target_cpu = unsafe {
             (*waiter).wakeup_value = 0;
             (*waiter)

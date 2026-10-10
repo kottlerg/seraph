@@ -3,8 +3,9 @@
 
 // core/kernel/src/arch/x86_64/syscall.rs
 
-//! SYSCALL/SYSRET MSR setup and entry stub for x86-64 (configured in Phase 5;
-//! see [initialization.md](../../../docs/initialization.md) § Phase 5).
+//! SYSCALL/SYSRET MSR setup and entry stub for x86-64 (configured on the BSP in
+//! Phase 5 and on each AP during Phase 8 bring-up; see
+//! [initialization.md](../../../docs/initialization.md) § Phase 5 and § Phase 8).
 //!
 //! Configures the MSRs required by the SYSCALL instruction:
 //!

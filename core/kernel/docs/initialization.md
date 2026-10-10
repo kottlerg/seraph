@@ -35,7 +35,9 @@ layout) that Phase 0 depends on, see
 9. Validate direct_map_base: in the kernel half and 1 GiB-aligned
 10. Validate that the direct map (direct_map_base + boot_protocol::direct_map_ceiling) ends
     at or below kernel_virtual_base
-11. arch::current::paging::init_paging_mode: halt if direct_map_base is below the active
+11. Validate that a slid image (kernel_virtual_base above KERNEL_LINK_BASE) carries
+    KASLR_IMAGE_RANDOMIZED in kaslr_flags
+12. arch::current::paging::init_paging_mode: halt if direct_map_base is below the active
     paging mode's kernel-half base (RISC-V: also if satp names no supported mode), then
     publish direct_map_base
 ```
@@ -46,9 +48,9 @@ Phase 0 produces no output; the console is not available until Phase 1.
 disabled, then `hlt` (x86-64) or `wfi` (RISC-V) runs in a loop, so a spurious wakeup halts
 again.
 
-**Completion criterion:** `boot_info` pointer is valid, `version` matches, and the KASLR
-layout (image base, direct-map base, no overlap) is accepted and published by
-`init_paging_mode`.
+**Completion criterion:** `boot_info` pointer is valid, `version` matches, the KASLR layout
+(image base, direct-map base, no overlap) is accepted by `validate_boot_info` and
+`init_paging_mode`, and `init_paging_mode` has published the direct-map base.
 
 ---
 
@@ -287,12 +289,13 @@ The step-7 timer mode selection is specified in [arch-interface.md](arch-interfa
 
 Within the architecture hardware path, after interrupt and per-CPU setup and before the
 syscall entry and preemption timer are configured, the BSP checks the boot-gated paging
-extensions, then enables hardware address-space tags (x86-64 PCID where present, RISC-V
-ASID, whose absence is fatal) and allocates the per-CPU tag-state slab (`PER_CPU_TAG_STATE`),
-sized to the boot CPU count, from the buddy allocator. Where PCID is absent (x86-64), or the
-tags are too few for the CPU count (either architecture), no slab is allocated and context
-switch keeps the full-flush path; a RISC-V hart without ASIDs is refused. The slab is a
-fixed kernel reserve allocated before the Phase 7 drain; see
+extensions, then enables hardware address-space tags (x86-64 PCID with INVPCID where present,
+RISC-V ASID, whose absence is fatal) and allocates the per-CPU tag-state slab
+(`PER_CPU_TAG_STATE`), sized to the boot CPU count, from the buddy allocator. Where
+PCID/INVPCID is absent (x86-64), or the tags are too few for the CPU count (either
+architecture), no slab is allocated and context switch keeps the full-flush path; a RISC-V
+hart without ASIDs is refused. The slab is a fixed kernel reserve allocated before the
+Phase 7 drain; see
 [memory-model.md](../../../docs/memory-model.md) § TLB Management.
 
 After the architecture hardware path, the BSP seeds the entropy pool from the
@@ -488,13 +491,14 @@ pool, scheduler idle threads); they never touch init's address space or any Phas
 state, so SMP bringup completes within Phase 8 and the trampoline page
 is reclaim-safe by the time Phase 9 consumes `cspace_layout`.
 
-**Failure mode:** Phase 8 allocates nothing: the scheduler slab, the idle TCB slab, and the
-idle stacks come from the Phase 4 per-CPU storage, and a failure to allocate them halts in
-Phase 4. A rejected `start_ap` (riscv64, where
-SBI reports a hart it cannot start), or a zero `BootInfo.ap_trampoline_page`
-with more than one CPU listed, is fatal: every CPU the boot reported is
-assumed online from Phase 8 on (IPI targets, scheduler placement, affinity),
-so a CPU that cannot be started halts the boot with a descriptive message.
+**Failure mode:** Phase 8 allocates nothing from the buddy: the scheduler slab, the idle TCB
+slab, and the idle stacks come from the Phase 4 per-CPU storage, and a failure to allocate
+them halts in Phase 4. Step 7 retypes the late-reclaim Memory cap's body from `SEED_MEMORY`
+and inserts the cap into the root CSpace; a SEED or CSpace failure there halts through
+`fatal`. A rejected `start_ap` (riscv64, where SBI reports a hart it cannot start), or a zero
+`BootInfo.ap_trampoline_page` with more than one CPU listed, is fatal: every CPU the boot
+reported is assumed online from Phase 8 on (IPI targets, scheduler placement, affinity), so a
+CPU that cannot be started halts the boot with a descriptive message.
 A started CPU that never announces itself leaves the BSP waiting at
 `APS_READY` on either architecture; on x86-64 that wait is the only signal,
 since SIPI delivery is unacknowledged and `start_ap` cannot report a failure.
@@ -650,12 +654,12 @@ that CPU only; the BSP and other CPUs continue.
 | 0 | Validate BootInfo version | Silent halt |
 | 1 | Early console; platform feature gate | Halt: missing required baseline feature (no console is non-fatal) |
 | 2 | Buddy allocator from memory map | Halt: no usable RAM |
-| 3 | Kernel page tables + direct map | Halt: OOM during PT construction |
+| 3 | Kernel page tables + direct map | Halt: BOOT_TABLE_POOL exhausted; direct map would overlap the kernel image window |
 | 4 | Typed-memory cap surface; per-CPU storage | Halt: per-CPU storage allocation failed |
 | 5 | CPU hardware (IDT/GDT/TSS/stvec); seed entropy pool | Halt: hardware initialisation failure |
-| 6 | Platform resource validation | Halt if entries pointer is null with non-zero count; bad entries skipped |
+| 6 | Platform resource validation | Halt: null entries with non-zero count, or entries slice outside Usable/Loaded memory; bad entries skipped, entries beyond MAX_MMIO_APERTURES dropped |
 | 7 | Capability system + root CSpace | Halt: OOM |
-| 8 | Scheduler + idle threads, SMP bringup, AP trampoline reclaim, entropy self-test | Halt: rejected start_ap (riscv64); zero ap_trampoline_page with more than one CPU listed. A started CPU that never announces itself leaves the BSP waiting (x86-64 cannot detect this earlier: SIPI is unacknowledged); an entropy self-test FAIL is printed and the boot continues |
+| 8 | Scheduler + idle threads, SMP bringup, AP trampoline reclaim, entropy self-test | Halt: rejected start_ap (riscv64); zero ap_trampoline_page with more than one CPU listed; late-reclaim cap mint failure (SEED / CSpace). A started CPU that never announces itself leaves the BSP waiting (x86-64 cannot detect this earlier: SIPI is unacknowledged); an entropy self-test FAIL is printed and the boot continues |
 | 9 | Init creation + scheduler entry (user mode) | Halt: invalid InitImage or OOM |
 
 ---

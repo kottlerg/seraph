@@ -758,8 +758,6 @@ fn watchdog_tick_and_check()
     }
 
     // All CPUs must have last_dispatch older than threshold.
-    // needless_range_loop: parallel scheduler_for(cpu) below.
-    #[allow(clippy::needless_range_loop)]
     for cpu in 0..cpu_count
     {
         let last = last_non_idle_tick(cpu).load(core::sync::atomic::Ordering::Relaxed);
@@ -1457,15 +1455,6 @@ static mut SLEEP_LIST: [*mut ThreadControlBlock; MAX_SLEEPING] =
 #[cfg(not(test))]
 static mut SLEEP_COUNT: usize = 0;
 
-/// Scratch buffer holding the TCBs `sleep_check_wakeups` collects between
-/// dropping `SLEEP_LIST_LOCK` and waking them.
-///
-/// Off-stack via the CPU0-static idiom of core/kernel/docs/scheduling-internals.md
-/// § Off-Stack Scratch for Ceiling-Sized Arrays: a `[_; MAX_SLEEPING]` frame in
-/// `timer_tick` (which inlines `sleep_check_wakeups`) would overrun the timer
-/// ISR's borrowed kernel stack. `sleep_check_wakeups` runs only on CPU0 (see
-/// `timer_tick`'s `cpu == 0` gate) behind an interrupt gate (IF=0), so it is
-/// non-reentrant and this single buffer needs no lock of its own.
 /// One expired sleeper, snapshotted under `SLEEP_LIST_LOCK` at pop. The
 /// per-entry claim loop dispatches off this snapshot rather than re-reading the
 /// TCB, so a concurrent `dealloc_object(Thread)` that frees the TCB after the
@@ -1490,6 +1479,15 @@ impl ExpiredWaiter
     };
 }
 
+/// Scratch buffer holding the TCBs `sleep_check_wakeups` collects between
+/// dropping `SLEEP_LIST_LOCK` and waking them.
+///
+/// Off-stack via the CPU0-static idiom of core/kernel/docs/scheduling-internals.md
+/// § Off-Stack Scratch for Ceiling-Sized Arrays: a `[_; MAX_SLEEPING]` frame in
+/// `timer_tick` (which inlines `sleep_check_wakeups`) would overrun the timer
+/// ISR's borrowed kernel stack. `sleep_check_wakeups` runs only on CPU0 (see
+/// `timer_tick`'s `cpu == 0` gate) behind an interrupt gate (IF=0), so it is
+/// non-reentrant and this single buffer needs no lock of its own.
 #[cfg(not(test))]
 static mut EXPIRED_SCRATCH: [ExpiredWaiter; MAX_SLEEPING] = [ExpiredWaiter::EMPTY; MAX_SLEEPING];
 
@@ -2439,10 +2437,6 @@ unsafe fn commit_state_under_all_locks(
             thread::ThreadState::Stopped | thread::ThreadState::Exited
         )
         {
-            // needless_range_loop: `cpu` indexes the per-CPU scheduler slab
-            // through `scheduler_for`, not a slice — there is no iterator to
-            // prefer.
-            #[allow(clippy::needless_range_loop)]
             for cpu in 0..cpu_count
             {
                 // SAFETY: cpu < cpu_count; lock held; tcb valid.
@@ -3200,9 +3194,10 @@ pub unsafe fn commit_reply_rebind_under_local_lock(
 
 /// Send a wakeup IPI to `target_cpu` without enqueueing anything.
 ///
-/// Used by `sys_thread_stop` to force a remote Running target to trap
-/// into kernel and run `schedule()`, which then drains the Stopped TCB
-/// via the skip-loop.
+/// Used by `sys_thread_stop` to nudge the CPU running a Stopped target. The
+/// wakeup IPI handler only acknowledges the interrupt and does not call
+/// `schedule()`; the target leaves that CPU at its next `schedule()` entry
+/// (slice expiry, syscall epilogue, or block).
 ///
 /// # Safety
 /// `target_cpu` must be a valid online CPU index (< `CPU_COUNT`). Self-IPI
@@ -3236,7 +3231,7 @@ pub unsafe fn prod_remote_cpu(_target_cpu: usize) {}
 /// owning CPU deschedules it WITHOUT re-linking it onto a run queue. The scan
 /// and spins take each per-CPU `scheduler.lock` one at a time and hold no lock
 /// across the wait; they run preempt-disabled with interrupts ENABLED (the #207
-/// envelope) so an inbound TLB/FPU IPI to this CPU stays serviceable.
+/// envelope) so an inbound TLB-shootdown IPI to this CPU stays serviceable.
 ///
 /// # Safety
 /// `tcb` must be a valid [`ThreadControlBlock`] pointer.
@@ -3249,7 +3244,7 @@ pub unsafe fn await_descheduled(tcb: *mut thread::ThreadControlBlock)
     let me = crate::arch::current::cpu::current_cpu() as usize;
 
     // #207 spin envelope: preempt-disabled, interrupts enabled. We enter at
-    // IF=0 (syscall); spinning at IF=0 would block an inbound TLB/FPU shootdown
+    // IF=0 (syscall); spinning at IF=0 would block an inbound TLB-shootdown
     // IPI targeted at this CPU and deadlock its initiator. Enabling IF keeps it
     // serviceable while `preempt_disable` pins us so the scheduler cannot
     // migrate us mid-drain. Mirrors `dealloc_object(Thread)` and the stop drain.
@@ -3634,9 +3629,6 @@ pub unsafe fn relocate_ready_priority(
     }
 
     let mut located: Option<usize> = None;
-    // needless_range_loop: `cpu` indexes the per-CPU scheduler slab through
-    // `scheduler_for`, not a slice.
-    #[allow(clippy::needless_range_loop)]
     for cpu in 0..cpu_count
     {
         // SAFETY: cpu < cpu_count; scheduler slab initialised by init().
@@ -3962,7 +3954,7 @@ unsafe fn pull_unpinned_ready(_src_cpu: usize, _dst_cpu: usize) {}
 ///
 /// # Safety
 /// - `tcb` must be a valid [`ThreadControlBlock`] pointer
-/// - `target_cpu` must be < [`MAX_CPUS`] and initialized by `sched::init`
+/// - `target_cpu` must be < [`CPU_COUNT`] and initialized by `sched::init`
 #[cfg(not(test))]
 pub unsafe fn enqueue_and_wake(tcb: *mut ThreadControlBlock, target_cpu: usize)
 {
@@ -4086,7 +4078,7 @@ pub unsafe fn enqueue_and_wake(tcb: *mut ThreadControlBlock, target_cpu: usize)
         (*tcb).sched_lock.unlock_raw(sched_saved);
     }
 
-    // SAFETY: target_cpu is validated < MAX_CPUS by scheduler_for.
+    // SAFETY: target_cpu is validated < CPU_COUNT by scheduler_for.
     unsafe { wake_idle_cpu(target_cpu) };
 }
 
@@ -4117,7 +4109,7 @@ pub unsafe fn enqueue_and_wake(_tcb: *mut ThreadControlBlock, _target_cpu: usize
 /// # Safety
 /// - `tcb` must be a valid [`ThreadControlBlock`] pointer, not live or linked on
 ///   any CPU.
-/// - `target_cpu` must be < [`MAX_CPUS`] and initialized by `sched::init`.
+/// - `target_cpu` must be < [`CPU_COUNT`] and initialized by `sched::init`.
 /// - The caller must hold no run-queue lock.
 #[cfg(not(test))]
 pub unsafe fn enqueue_ready_thread(tcb: *mut ThreadControlBlock, target_cpu: usize) -> bool
@@ -4178,7 +4170,7 @@ pub unsafe fn enqueue_ready_thread(tcb: *mut ThreadControlBlock, target_cpu: usi
         (*tcb).sched_lock.unlock_raw(sched_saved);
     }
 
-    // SAFETY: target_cpu validated < MAX_CPUS by scheduler_for.
+    // SAFETY: target_cpu validated < CPU_COUNT by scheduler_for.
     unsafe { wake_idle_cpu(target_cpu) };
     true
 }
@@ -4217,9 +4209,6 @@ pub unsafe fn select_target_cpu(tcb: *mut ThreadControlBlock) -> usize
 ///
 /// # Safety
 /// `tcb` must be a valid pointer to an initialized [`ThreadControlBlock`].
-// needless_range_loop: the scheduler slab is reached via scheduler_ptr(cpu);
-// indexed bounds checking is clearer than iter/enumerate pointer plumbing.
-#[allow(clippy::needless_range_loop)]
 #[cfg(not(test))]
 pub unsafe fn select_target_cpu_excluding(
     tcb: *mut ThreadControlBlock,
@@ -4756,7 +4745,8 @@ pub unsafe fn schedule(requeue_current: bool)
                 // A running thread has no outstanding park-wake to honour; clear
                 // wake_pending so a stale flag can never survive into a later,
                 // unrelated commit_blocked (defensive — the `Running` coalesce
-                // that sets it is currently unreachable; see
+                // that sets it is reached by the dying-server reply-bound wake in
+                // dealloc_object(Thread), which the caller's commit consumes; see
                 // core/kernel/docs/sched-ipc-redesign.md § 2.1).
                 let was_pending = (*next).wake_pending;
                 (*next).wake_pending = false;
@@ -4800,7 +4790,7 @@ pub unsafe fn schedule(requeue_current: bool)
     // transition (interrupt, exception, or syscall) lands on the correct
     // kernel stack for the incoming thread.
     //
-    // On x86-64: writes TSS RSP0 + SYSCALL_KERNEL_RSP.
+    // On x86-64: writes TSS RSP0 + PerCpuData::kernel_rsp.
     // On RISC-V: writes PerCpuData::kernel_rsp (offset 8 from tp); sscratch
     //   is set to &PER_CPU by return_to_user just before sret, so trap_entry
     //   can detect U-mode (sscratch != 0) and recover tp.
@@ -4923,8 +4913,10 @@ pub unsafe fn schedule(requeue_current: bool)
     if !current.is_null()
     {
         // SAFETY: ring-0 with interrupts disabled (release_lock_only dropped the
-        // scheduler locks and left interrupts masked); arch fpu::switch_out_save
-        // honours the per-arch lazy discipline.
+        // scheduler locks and left interrupts masked); this call precedes the
+        // `switch()` below that publishes `current`'s `context_saved = 1`
+        // (Release), the edge that orders the area's writes before any other
+        // CPU's Acquire of `context_saved`.
         unsafe {
             crate::arch::current::fpu::switch_out_save(current);
         }
@@ -5232,14 +5224,11 @@ pub unsafe fn timer_tick()
         return;
     }
 
-    // undocumented_unsafe_blocks: the unsafe block sits inside debug_assert!'s
-    // condition, where the lint does not see this SAFETY comment.
     // SAFETY: current is a valid TCB pointer set by schedule(); magic is always
     // valid to read.
-    #[allow(clippy::undocumented_unsafe_blocks)]
-    {
+    unsafe {
         debug_assert!(
-            unsafe { (*current).magic == thread::TCB_MAGIC },
+            (*current).magic == thread::TCB_MAGIC,
             "timer_tick: current TCB magic corrupt on cpu {cpu}"
         );
     }
@@ -5407,7 +5396,7 @@ pub fn enter() -> !
 
     // Set the kernel trap stack pointer before entering user mode so the first
     // ring-3 → ring-0 transition lands on the correct kernel stack.
-    // On x86-64: writes TSS RSP0 + SYSCALL_KERNEL_RSP.
+    // On x86-64: writes TSS RSP0 + PerCpuData::kernel_rsp.
     // On RISC-V: writes PerCpuData::kernel_rsp (offset 8 from tp); trap_entry
     //   loads this to locate the kernel stack on U-mode entry.  sscratch is set
     //   to &PER_CPU by return_to_user just before sret.

@@ -2159,15 +2159,18 @@ unsafe fn dealloc_object_one(
                     }
                     // Recompute the wake target HERE (post-gates), under the
                     // client's current state, EXCLUDING this dealloc CPU. This
-                    // CPU is wedged in the preempt-disabled UAF gates above, not
-                    // in schedule(), so it cannot dispatch a client linked onto
-                    // it — the save-window pin would strand a `context_saved==0`
-                    // client here (#351). A peer dispatches it safely via the
-                    // schedule() publication-barrier spin. Recomputing at wake
-                    // time (rather than snapshotting under the all-CPU locks
-                    // above) also closes the double-enqueue straddle: the target
-                    // reflects the state at link time, not two unbounded spins
-                    // earlier (#289).
+                    // CPU stays inside this teardown through the wake-in-flight
+                    // gate below, not in schedule(), so it cannot dispatch a
+                    // client linked onto it — the save-window pin would strand a
+                    // `context_saved==0` client here (#351; step 10 of
+                    // core/kernel/docs/thread-lifecycle-and-sleep.md
+                    // § `dealloc_object(Thread)` Drain Protocol). A peer
+                    // dispatches it safely via the schedule()
+                    // publication-barrier spin. Recomputing at wake time (rather
+                    // than snapshotting under the all-CPU locks above) also
+                    // closes the double-enqueue straddle: the target reflects
+                    // the state at link time, not two unbounded spins earlier
+                    // (#289).
                     let this_cpu = crate::arch::current::cpu::current_cpu() as usize;
                     // SAFETY: bound kept valid by wake_in_flight = 1 above;
                     // select_target_cpu_excluding is lock-free.

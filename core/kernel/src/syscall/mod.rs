@@ -371,6 +371,17 @@ fn sys_thread_sleep(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         }
     }
 
+    // The add does not re-check that the park is still armed, a known defect
+    // (#443). A `cancel_ipc_block` (from `sys_thread_stop` or
+    // `stop_threads_bound_to`) that lands between the Blocked commit above and
+    // this add finds no entry to remove, clears `sleep_deadline`, and stamps the
+    // park INTERRUPTED; the add then inserts a stale entry with deadline 0 for a
+    // Stopped thread, breaking § Sleep List Invariants 2 and 3 of
+    // core/kernel/docs/thread-lifecycle-and-sleep.md. If the thread is restarted
+    // and parks again before the next tick, `sleep_check_wakeups` pops the stale
+    // entry as expired and claims the new park: a notification or event-queue
+    // wait without a timeout wakes with value 0, and an endpoint or wait-set park
+    // takes the plain-sleep arm and is made Ready while still on its wait queue.
     if crate::sched::sleep_list_add(tcb).is_err()
     {
         // Sleep list at capacity. Roll back the Blocked commit: sys_thread_sleep

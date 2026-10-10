@@ -6,8 +6,10 @@
 //! Capability creation and manipulation syscall handlers.
 //!
 //! Creation handlers retype a Memory cap into a kernel object and insert a
-//! cap to it into the caller's `CSpace`, returning the new cap handle; the
-//! remaining handlers copy, derive, move, delete, revoke, and inspect caps.
+//! cap to it into the caller's `CSpace`, returning the new cap handle (the
+//! address-space and `CSpace` augment modes instead donate pages to an
+//! existing object and return 0); the remaining handlers copy, derive,
+//! move, delete, revoke, and inspect caps.
 //!
 //! # Adding a new capability creation syscall
 //! 1. Look the source Memory cap up with `RETYPE` and carve the object's
@@ -1353,8 +1355,8 @@ fn pre_grow_for_explicit_slot(
 
 /// `SYS_CAP_COPY` (24): copy a capability into another `CSpace.`
 ///
-/// arg0 = source slot index (in caller's `CSpace`).
-/// arg1 = destination `CSpace` cap index (in caller's `CSpace`; must have INSERT).
+/// arg0 = source capability handle (in caller's `CSpace`; generation-checked).
+/// arg1 = destination `CSpace` capability handle (in caller's `CSpace`; must have INSERT).
 /// arg2 = destination slot index in the target `CSpace`, or `0` to let the
 ///        kernel allocate a free slot. Slot 0 is permanently null, so it is a
 ///        safe "kernel picks" sentinel.
@@ -2740,8 +2742,8 @@ pub fn sys_cap_info(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 return Err(SyscallError::InvalidArgument);
             }
             // SAFETY: tag confirmed Thread; header at offset 0 of ThreadObject.
-            // cast_ptr_alignment: the wrapper (constructed in place at a size-class-aligned
-            // retype offset, so 8-byte aligned) holds the header at offset 0.
+            // cast_ptr_alignment: the ThreadObject sits at the page-aligned start of page
+            // KERNEL_STACK_PAGES of the Thread retype slot; header at offset 0.
             #[allow(clippy::cast_ptr_alignment)]
             let thr_obj = unsafe { &*(obj.as_ptr().cast::<ThreadObject>()) };
             let target_tcb = thr_obj.tcb;

@@ -7,7 +7,7 @@
 //!
 //! Every handler except `sys_ipc_reply` (which acts on the caller binding in
 //! `reply_tcb`) looks up the target capability in the current thread's `CSpace`,
-//! call the corresponding IPC kernel function, and enqueue/dequeue threads
+//! calls the corresponding IPC kernel function, and enqueues/dequeues threads
 //! via the scheduler as needed.
 //!
 //! Data words (up to `MSG_DATA_WORDS_MAX`) are read from / written to the
@@ -737,10 +737,12 @@ pub fn sys_ipc_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // (`MSG_CAP_SLOTS_MAX`) before either delivery path can transition any
     // IPC state. A cap-transfer failure on either path degrades to zero-cap
     // delivery (the sender keeps its caps), so pre-growing the destination
-    // here keeps OOM from silently dropping a message's caps: the
-    // immediate-delivery transfer cannot OOM, and the resumed-recv path
-    // (`deliver_call_caps`) gets the same guarantee modulo the window in which
-    // `transfer_caps`'s locked pre_allocate can still fail.
+    // here makes OOM unlikely on both the immediate-delivery path and the
+    // resumed-recv path (`deliver_call_caps`). `pre_allocate` reserves
+    // nothing and the CSpace lock is dropped before `endpoint_recv`, so a
+    // slot consumed by a sibling thread sharing this CSpace before
+    // `transfer_caps`'s locked `pre_allocate` still fails the transfer,
+    // which degrades to zero-cap delivery.
     // SAFETY: cspace_ptr validated above; lock_raw/unlock_raw paired.
     unsafe {
         let saved = (*cspace_ptr).lock.lock_raw();
@@ -771,14 +773,14 @@ pub fn sys_ipc_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         let server_buf = unsafe { (*tcb).ipc_buffer };
 
         // Transfer caps from caller to server (if any). The pre_allocate
-        // above guarantees the destination has the worst-case headroom. A
-        // failure here (a source cap gone stale, or pinned by an in-flight
-        // revoke) is post-commit — endpoint_recv already dequeued the
-        // sender and rebound it BlockedOnReply — so the message MUST still
-        // be delivered: degrade to zero caps (the transfer fails
-        // atomically, so the sender keeps its caps) rather than losing the
-        // consumed message and stranding the sender, mirroring
-        // `deliver_call_caps`.
+        // above makes a destination OOM unlikely but does not reserve the
+        // headroom. A failure here (a source cap gone stale or pinned by an
+        // in-flight revoke, or a destination OOM) is post-commit —
+        // endpoint_recv already dequeued the sender and rebound it
+        // BlockedOnReply — so the message MUST still be delivered: degrade
+        // to zero caps (the transfer fails atomically, so the sender keeps
+        // its caps) rather than losing the consumed message and stranding
+        // the sender, mirroring `deliver_call_caps`.
         let mut transferred: usize = 0;
         let mut dst_handles = [0u32; MSG_CAP_SLOTS_MAX];
         if msg.cap_count > 0
@@ -1739,8 +1741,8 @@ pub fn sys_wait_set_add(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     //
     // SAFETY: source_ptr extracted from validated cap; member_idx returned
     // from waitset_add. Lock acquired and released for each branch; a shared
-    // helper is not used because the source types differ
-    // and the field accesses do not share a trait.
+    // helper is not used because the source types differ and the field
+    // accesses do not share a trait.
     let member_idx_result = unsafe {
         match source_tag
         {
@@ -1955,9 +1957,12 @@ pub fn sys_wait_set_remove(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // Hold source.lock outer for waitset_remove (ws.lock INNER), the
     // back-pointer clear, and the dec_ref of the wait-set's +1 reference,
-    // mirroring the lock order in sys_wait_set_add. The caller still holds
-    // their own cap to the source, so dec_ref cannot drop the refcount to
-    // zero here — debug_assert verifies the invariant.
+    // mirroring the lock order in sys_wait_set_add. The source cap is
+    // resolved without pinning it, so a concurrent delete or ancestor revoke
+    // can release it mid-call and this dec_ref can then drain the refcount
+    // to zero; the debug_assert catches that, and the source is not
+    // reclaimed (known defect, #443; core/kernel/docs/ipc-internals.md
+    // § Wait Set Add/Remove).
     //
     // SAFETY: source_ptr extracted from validated cap.
     let remove_result = unsafe {

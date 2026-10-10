@@ -143,8 +143,9 @@ pub unsafe fn notification_send(
 
         if delivered == 0
         {
-            // A concurrent notification_wait (its locked swap) already consumed our
-            // bits; the current sig.waiter is a new waiter and must not be touched
+            // A concurrent notification_wait or another sender's slow-path swap (each
+            // a locked swap) already consumed our bits; the current sig.waiter is a
+            // new waiter and must not be touched
             // (see core/kernel/docs/ipc-internals.md § Send Path step 5b).
             None
         }

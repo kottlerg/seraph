@@ -26,7 +26,9 @@
 //! The PIT output is readable on port 0x61 (bit 5: channel 2 output). The
 //! same window also calibrates the TSC (`TSC_PER_US`), which both
 //! `elapsed_us()` and TSC-deadline arming consume — so the PIT is used
-//! exactly once, at boot, in either mode.
+//! exactly once, at boot, in either mode. The windows coincide only when the
+//! channel-2 gate is clear on entry; calibration leaves a gate firmware set
+//! as found, and the PIT window then starts early (known defect, #443).
 //!
 //! # Timer ISR
 //! The ISR re-arms the deadline (TSC-deadline mode only; periodic mode
@@ -218,7 +220,9 @@ unsafe fn inb(port: u16) -> u8
 /// Programs PIT channel 2 for `pit_counts` counts (`PIT_CALIBRATION_MS`,
 /// ~10 ms), starts the APIC timer at full count with divide-by-16, spins
 /// until the PIT expires, and records `TSC_PER_US` and `BOOT_TSC` from the
-/// same window.
+/// same window. The channel-2 gate is left as found, so when firmware left it
+/// set the PIT window starts before the APIC and TSC windows and both rates
+/// read low (known defect, #443).
 ///
 /// Returns APIC timer ticks per second at divide-by-16 (the 10 ms sample
 /// scaled by 100).
@@ -231,7 +235,10 @@ unsafe fn calibrate_apic_timer() -> u64
     let pit_counts = (PIT_HZ * PIT_CALIBRATION_MS / 1000) as u16;
 
     // Clear bit 1 of port 0x61 (speaker data enable); bit 0 (channel 2
-    // gate) is left as found.
+    // gate) is left as found. If firmware left the gate set, mode-0 counting
+    // starts when the count below is written, before the APIC timer and
+    // `tsc_start`, so both calibrated rates read low by that skew (known
+    // defect, #443).
     // SAFETY: port I/O at ring 0.
     unsafe {
         let gate = inb(PIT_GATE);
@@ -254,9 +261,11 @@ unsafe fn calibrate_apic_timer() -> u64
         apic_write(APIC_TIMER_INITIAL, 0xFFFF_FFFF);
     }
 
-    // Enable PIT channel 2 gate (bit 0 of port 0x61).
-    // Read TSC immediately before starting the gate so the measurement window
-    // starts as close to gate-enable as possible.
+    // Set PIT channel 2 gate (bit 0 of port 0x61). When the gate was clear,
+    // setting it starts the countdown, and reading the TSC immediately before
+    // starts the measurement window as close to gate-enable as possible. When
+    // the gate was already set, the write is a no-op and the PIT window began
+    // at the count load above (known defect, #443).
     let tsc_start = read_tsc();
     // SAFETY: port 0x61 (PIT gate control) is standard legacy hardware; ring 0 I/O access.
     unsafe {
@@ -490,8 +499,6 @@ pub extern "C" fn timer_isr()
 /// Derived from the TSC so that sleep deadlines and userspace
 /// `Instant::now()` (which reads `elapsed_us` via `SYS_SYSTEM_INFO`) share
 /// a single counter.
-// Required by the arch interface: core/kernel/docs/arch-interface.md § `timer`.
-#[allow(dead_code)]
 #[cfg(not(test))]
 pub fn current_tick() -> u64
 {
@@ -516,7 +523,8 @@ pub fn current_tick() -> u64
 }
 
 /// Return the timer interrupt rate (interrupts per second, matching `current_tick()`).
-// Required by the arch interface: core/kernel/docs/arch-interface.md § `timer`.
+// dead_code: every caller is cfg(not(test)), so the function is unused in
+// host test builds.
 #[allow(dead_code)]
 pub fn ticks_per_second() -> u64
 {

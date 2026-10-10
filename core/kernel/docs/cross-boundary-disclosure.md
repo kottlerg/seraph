@@ -36,10 +36,11 @@ distinct, narrower concern handled in "Physical-address surfaces" below.
 Each surface is classified as one of:
 
 - **(a) kernel VA / pointer** — a kernel virtual address, kernel pointer, or value
-  derived from one. A leak. **One found** among emitted values: the x86-64
-  fault-message `d2` present bit (see the fault-message note below;
-  [#443](https://github.com/kottlerg/seraph/issues/443)); kernel state kept in donated
-  memory is a separate surface, below.
+  derived from one. A leak. **Two found** among emitted values: the x86-64
+  fault-message `d2` present bit and the unpinned `SYS_THREAD_READ_REGS` trap-frame
+  copy, which can hand freed or reused kernel memory to the caller (see the
+  fault-message note below; [#443](https://github.com/kottlerg/seraph/issues/443));
+  kernel state kept in donated memory is a separate surface, below.
 - **(b) userspace VA** — an address in the caller's own (or a delegate's) address
   space. The caller already owns it; not a disclosure.
 - **(c) opaque / randomized** — a kernel-minted identifier that is unguessable
@@ -67,7 +68,7 @@ is in [core/kernel/docs/syscalls.md](syscalls.md).
 | `CAP_INFO_MEMORY_PHYS_BASE` → `MemoryObject::base` | `cap::sys_cap_info`, `cap::object::MemoryObject` | **e** |
 | `SYS_SYSTEM_INFO` (kernel and boot-protocol versions, cpu count, page size, elapsed µs, current cpu) | `sysinfo::sys_system_info` | c/d |
 | `SYS_ASPACE_QUERY` → leaf physical address of a user page | `sysinfo::sys_aspace_query`, `AddressSpace::query_page` | **e** |
-| `SYS_THREAD_READ_REGS` / `WRITE_REGS` → target thread's user `TrapFrame` | `thread::sys_thread_read_regs`, `TrapFrame::sanitize_for_user_resume` | b/d; freed kernel memory under a concurrent last-cap delete ([#443](https://github.com/kottlerg/seraph/issues/443)) |
+| `SYS_THREAD_READ_REGS` / `WRITE_REGS` → target thread's user `TrapFrame` | `thread::sys_thread_read_regs`, `TrapFrame::sanitize_for_user_resume` | b/d; **a** under a concurrent last-cap delete ([#443](https://github.com/kottlerg/seraph/issues/443)) |
 | `SYS_GETRANDOM` → random bytes into a user buffer + byte count | `entropy::sys_getrandom` | d |
 | `SYS_SBI_CALL` → firmware `sbiret.value` on success, `NotSupported` on any firmware error (RISC-V; args caller-supplied) | `sbi::sys_sbi_call` | d |
 | `SYS_IPC_BUFFER_SET` → status only (validates user-half, page-aligned VA) | `syscall::sys_ipc_buffer_set` | (no output) |

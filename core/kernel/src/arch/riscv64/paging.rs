@@ -5,8 +5,11 @@
 
 //! RISC-V page table operations, parameterized over the active paging mode.
 //!
-//! Mirrors the x86-64 interface. All page table frames come from the
-//! BSS-resident pool supplied via [`PoolState`].
+//! Mirrors the x86-64 interface. [`map_page`] and [`map_large_page`] (kernel
+//! page-table construction) draw intermediate frames from the BSS-resident
+//! boot pool supplied via [`PoolState`]. The user-mapping functions draw them
+//! from `crate::mm::kernel_pt_pool` ([`map_user_page`]) or the address space's
+//! growth pool ([`map_user_page_pooled`]).
 //!
 //! # Index layout
 //! The mode negotiated at boot ([`PagingMode`]: Sv39, Sv48, or Sv57) fixes
@@ -1067,10 +1070,14 @@ fn table_is_empty(table: &[PageTableEntry; 512]) -> bool
 /// never freed.
 ///
 /// Issues no TLB flush: the caller (`AddressSpace::unmap_region_pooled`)
-/// performs one invalidation for the whole span (the batched per-page window
-/// up to `RANGE_FLUSH_CEILING_PAGES`, a full flush above) and holds `pt_lock`
-/// across it, so a freed frame cannot be popped and reused before every hart
-/// is coherent.
+/// performs one invalidation for the whole span and holds `pt_lock` across
+/// it, so a freed frame cannot be popped and reused before every hart is
+/// coherent. When this returns a non-zero count, that invalidation must be a
+/// full `rs1 = x0` fence on every hart (`flush_tlb_all` locally, the
+/// full-flush shootdown remotely): a per-VA `sfence.vma` or `sinval.vma`
+/// invalidates only leaf translations for that VA, so cached non-leaf entries
+/// pointing at a freed table survive it. The batched per-page window (up to
+/// `RANGE_FLUSH_CEILING_PAGES`) suffices only for a span that freed no table.
 ///
 /// # Safety
 /// `root_virt` must be the direct-map VA of a valid 4 KiB root frame, `aso`
@@ -1190,8 +1197,12 @@ unsafe fn unmap_span(
 /// # Safety
 /// Must execute in S-mode after Phase 3 installed the kernel root. `pa` must be
 /// 4 KiB-aligned, and no thread (BSP or AP) may execute code on or reference
-/// data inside the page after this returns. Callable with preemption enabled:
-/// the routine disables preemption around the remote shootdown itself.
+/// data inside the page after this returns. The caller must not migrate
+/// between harts during the call: the local flush and the `current_cpu()` read
+/// that excludes this hart from the shootdown precede the routine's own
+/// `preempt_disable()`, which covers only the remote shootdown. The sole
+/// caller, the Phase 8 boot path, runs on the BSP before `sched::enter` and
+/// cannot migrate.
 #[cfg(not(test))]
 // similar_names: root_va and root_pa are a VA/PA pair — the similarity is
 // intentional and follows the pattern used elsewhere in this file.

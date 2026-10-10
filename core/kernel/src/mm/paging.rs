@@ -568,7 +568,8 @@ pub fn init_kernel_page_tables(
 /// # Safety
 /// `pa` must be 4 KiB-aligned. No thread (BSP or AP) may execute code on
 /// or reference data inside the page after this returns. Caller need not
-/// hold any lock; the routine handles preempt/shootdown discipline.
+/// hold any lock, but must not migrate between CPUs during the call (the
+/// riscv64 implementation reads the current hart before disabling preemption).
 #[cfg(not(test))]
 pub unsafe fn unmap_identity_page(pa: u64)
 {

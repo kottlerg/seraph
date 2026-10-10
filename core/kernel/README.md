@@ -12,7 +12,7 @@ this boundary.
 ## Source Layout
 
 ```
-kernel/
+core/kernel/
 ├── Cargo.toml                  # Workspace member; no_std crate
 ├── build.rs                    # Linker script selection per target
 ├── linker/
@@ -203,10 +203,11 @@ matches the syscall number to the subsystem handler.
 See [`docs/syscalls.md`](docs/syscalls.md). The audit classifying
 every cross-boundary output (syscall, IPC, fault, exit) for kernel-virtual-address
 disclosure is in [`docs/cross-boundary-disclosure.md`](docs/cross-boundary-disclosure.md);
-it records one open kernel-VA disclosure among emitted values, the x86-64 fault-message
-`d2` present bit ([#443](https://github.com/kottlerg/seraph/issues/443)), and the open
-exposures through donated memory, bootloader-reclaimed frames, and mirrored console
-output ([#433](https://github.com/kottlerg/seraph/issues/433),
+it records the open disclosures: the x86-64 fault-message `d2` present bit and the
+unpinned `SYS_THREAD_READ_REGS` trap-frame copy under a concurrent last-cap delete
+([#443](https://github.com/kottlerg/seraph/issues/443)), and the exposures through
+donated memory, bootloader-reclaimed frames, and mirrored console output
+([#433](https://github.com/kottlerg/seraph/issues/433),
 [#439](https://github.com/kottlerg/seraph/issues/439),
 [#440](https://github.com/kottlerg/seraph/issues/440)).
 
@@ -231,7 +232,8 @@ toolchain and target configuration.
 target. Linker scripts link the static-PIE image at `KERNEL_VBASE`, the zero-bias
 higher-half origin of the layout described in
 [docs/memory-model.md](../../docs/memory-model.md); the bootloader chooses the KASLR load
-bias and applies the `RELATIVE` relocations before handoff.
+bias and applies the `RELATIVE` relocations before handoff (see
+[core/boot/docs/elf-loading.md](../boot/docs/elf-loading.md#elf-validation)).
 
 ---
 

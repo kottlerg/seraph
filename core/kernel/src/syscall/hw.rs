@@ -344,7 +344,8 @@ pub fn sys_mmio_map(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// On first bind, an 8 KiB per-thread IOPB bitmap is carved from the SEED
 /// Memory cap and all ports are denied (0xFF). The requested range bits are
 /// then cleared (0 = allowed). On context switch the bitmap is copied into
-/// the TSS IOPB region.
+/// the TSS IOPB region. The allocate-and-edit takes no lock on the target, so
+/// concurrent binds on one thread from different CPUs race (Issue #443).
 ///
 /// On RISC-V: always returns `NotSupported` (no I/O port concept).
 ///
@@ -411,12 +412,19 @@ pub fn sys_ioport_bind(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         // Allocate per-thread IOPB on first bind. Sourced from the kernel
         // SEED Memory cap; freed back to SEED on thread dealloc via the
         // Thread arm of `dealloc_object`.
-        // SAFETY: target_tcb validated non-null; iopb field always valid.
+        // The null check, the install, and the bit edits below take no lock
+        // on the target. Two binds on the same target from different CPUs can
+        // both see null and both allocate; the later store overwrites the
+        // earlier one, leaking a SEED scratch block and dropping the permits
+        // of a bind that returned Ok (defect, Issue #443).
+        // SAFETY: target_tcb validated non-null; iopb is null or a pointer
+        // installed by a prior bind. The read is unsynchronized (Issue #443).
         if unsafe { (*target_tcb).iopb.is_null() }
         {
             let raw = crate::cap::retype::alloc_seed_scratch(gdt::IOPB_SIZE as u64)?;
             // SAFETY: raw points at a freshly-carved IOPB-sized block in
-            // SEED's region; not aliased; we own it for the IOPB's lifetime.
+            // SEED's region, not aliased. The unlocked store can overwrite a
+            // block a concurrent bind installed (Issue #443).
             unsafe {
                 core::ptr::write_bytes(raw, 0xFFu8, gdt::IOPB_SIZE);
                 // cast_ptr_alignment: `[u8; IOPB_SIZE]` has alignment 1, so any

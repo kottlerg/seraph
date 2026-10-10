@@ -1140,8 +1140,6 @@ pub unsafe fn enable()
 }
 
 /// Return `true` if supervisor interrupts are currently enabled.
-// dead_code: required by the arch interface (core/kernel/docs/arch-interface.md § `interrupts`).
-#[allow(dead_code)]
 pub fn are_enabled() -> bool
 {
     let sstatus: u64;

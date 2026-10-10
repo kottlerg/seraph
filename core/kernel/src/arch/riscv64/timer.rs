@@ -239,8 +239,6 @@ pub fn handle_tick()
 /// Derived from the `time` CSR so that sleep deadlines and userspace
 /// `Instant::now()` (which reads `elapsed_us` via `SYS_SYSTEM_INFO`) share
 /// a single counter. Returns `0` if `init()` has not yet been called.
-// Required by the arch interface (core/kernel/docs/arch-interface.md § `timer`).
-#[allow(dead_code)]
 #[cfg(not(test))]
 pub fn current_tick() -> u64
 {
@@ -265,8 +263,6 @@ pub fn current_tick() -> u64
 }
 
 /// Return the configured number of ticks per second.
-// Required by the arch interface (core/kernel/docs/arch-interface.md § `timer`).
-#[allow(dead_code)]
 pub fn ticks_per_second() -> u64
 {
     TICKS_PER_SEC.load(Ordering::Relaxed)

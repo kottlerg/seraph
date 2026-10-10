@@ -9,7 +9,9 @@
 //! CR0.TS (lazy-trap discipline gate), XSETBV/XCR0 setup, per-CPU XSAVE
 //! enablement performed at boot, and the save/restore primitives consumed by
 //! the `#NM` handler and the context-switch path. The per-thread XSAVE area is
-//! carved by the thread-create path (`syscall::cap::sys_cap_create_thread`).
+//! the last page of the thread's slab, carved by the thread-create path
+//! (`syscall::cap::sys_cap_create_thread`) and, for init's thread, by boot code
+//! (`kernel_entry_post_rebase`).
 //!
 //! ## Eager-save, lazy-restore discipline
 //!
@@ -21,7 +23,7 @@
 //!   trap-free.
 //!
 //! The other two combinations are forbidden at rest; each appears only as a
-//! transient inside one code path and is unobservable from outside it:
+//! transient inside the code paths below and is unobservable from outside them:
 //!
 //! - `(CR0.TS=0, fpu_owner=null)` **inside `nm_handler`** (`idt::nm_handler`)
 //!   between the `cr0_clear_ts()` that arms the live registers for XSAVE /
@@ -34,9 +36,9 @@
 //!   `cr0_set_ts()` that re-arms the lazy trap after XSAVE and the store that
 //!   clears `fpu_owner` (its defensive null-area path instead holds
 //!   `(CR0.TS=0, fpu_owner=null)` between clearing the slot and re-arming TS).
-//!   Called inside the scheduler-lock critical section with `IF=0`; the
-//!   Release on the subsequent lock unlock is what publishes the area to
-//!   peer CPUs.
+//!   Called with `IF=0` after the scheduler locks are dropped; the outgoing
+//!   thread's `switch()` then publishes `context_saved = 1` (Release), which
+//!   is what publishes the area to peer CPUs.
 //!
 //! [`switch_out_save`] eagerly XSAVEs the live regs into T's TCB area
 //! and clears `fpu_owner` whenever this CPU still owns the outgoing
@@ -150,12 +152,14 @@ const XCR0_V3: u64 = XCR0_X87 | XCR0_SSE | XCR0_AVX;
 /// initialisation.
 static XSAVE_AREA_SIZE: AtomicUsize = AtomicUsize::new(0);
 
-/// Return the XSAVE area size for the currently-enabled XCR0 components.
+/// Return the XSAVE area size reported by CPUID.0Dh:0.ECX: the size for every
+/// supported component, an upper bound on the size for the components enabled
+/// in XCR0 (CPUID.0Dh:0.EBX).
 ///
 /// Returns 0 before [`enable_xsave`] has run on the BSP.
 // dead_code: no caller; the per-thread XSAVE area is a fixed PAGE_SIZE page
-// carved by `syscall::cap::sys_cap_create_thread`, which does not consult this
-// size.
+// carved by `syscall::cap::sys_cap_create_thread` and, for init's thread, by
+// `kernel_entry_post_rebase`, neither of which consults this size.
 #[allow(dead_code)]
 pub fn xsave_area_size() -> usize
 {
@@ -239,7 +243,9 @@ pub unsafe fn enable_xsave()
 /// Save the live x87/SSE/AVX state of the executing CPU into `area`.
 ///
 /// `area` must be 64-byte aligned and point at a writable XSAVE buffer of
-/// at least [`xsave_area_size`] bytes. The component-mask passed in
+/// at least the XCR0-enabled size (CPUID.0Dh:0.EBX) bytes, which XSAVE never
+/// writes past; [`xsave_area_size`] is an upper bound on that size, not the
+/// requirement. The component-mask passed in
 /// `EDX:EAX = 0xFFFF_FFFF_FFFF_FFFF` instructs XSAVE to write every
 /// component XCR0 currently enables; hardware intersects with XCR0, so
 /// the actual written set is exactly the OS-enabled components.
@@ -319,10 +325,11 @@ pub unsafe fn restore_from(area: *const u8)
 /// live regs.
 ///
 /// # Safety
-/// Must execute at ring 0 with interrupts disabled, inside the scheduler
-/// lock's critical section so its writes happen-before the
-/// destination CPU's matching Acquire on the same scheduler lock. `tcb`
-/// must be a valid TCB pointer.
+/// Must execute at ring 0 with interrupts disabled, before the outgoing
+/// thread's `switch()` publishes `context_saved = 1` (Release). That store is
+/// the publication edge: it orders the XSAVE into `tcb`'s extended-state area
+/// before any other CPU's Acquire of `context_saved`. `tcb` must be a valid
+/// TCB pointer.
 #[cfg(not(test))]
 #[inline]
 pub unsafe fn switch_out_save(tcb: *mut crate::sched::thread::ThreadControlBlock)

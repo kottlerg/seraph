@@ -80,10 +80,8 @@ pub fn ioapics_into(out: &mut [IoApicEntry]) -> &[IoApicEntry]
 ///
 /// x86-64 console uses the COM1 I/O port (`0x3F8`), not MMIO, so this always
 /// returns 0 and the x86-64 `serial_init` ignores it. Present for symmetry
-/// with the RISC-V variant.
-// Takes `&KernelMmio` to match the riscv64 `uart_base_for_boot_info` that
-// `crate::console::init` calls on both architectures.
-#[allow(clippy::trivially_copy_pass_by_ref)]
+/// with the RISC-V variant: it takes `&KernelMmio` to match the riscv64
+/// signature that `crate::console::init` calls on both architectures.
 #[must_use]
 pub fn uart_base_for_boot_info(_km: &KernelMmio) -> u64
 {

@@ -93,34 +93,23 @@ claims against concurrent IPC sources via the relevant source IPC lock (Notifica
 
 6. **Snapshot-then-claim arbitration.** Under `SLEEP_LIST_LOCK` the timer pops each expired entry
    into `expired[..n]`, snapshots its `(ipc_state, blocked_on_object)` (the TCB is provably alive
-   there, since `dealloc_object(Thread)` removes its entry under the same lock before freeing,
-   except through the stale plain-sleep entry
-   ([#443](https://github.com/kottlerg/seraph/issues/443); see
-   [`sys_thread_sleep` and the Plain-Sleep Path](#sys_thread_sleep-and-the-plain-sleep-path))),
+   there, since `dealloc_object(Thread)` removes its entry under the same lock before freeing),
    and for a plain sleeper (`ipc_state == None`) sets `wake_in_flight = 1`. It then releases the
    lock and dispatches each entry off the snapshot, never dereferencing the TCB to choose an arm:
    - `BlockedOnNotification` / `BlockedOnEventQueue`: take the source lock; claim iff
      `(*src).waiter == tcb`.
    - `BlockedOnReply` / `BlockedOnFault` (defensive — neither is ever placed on the sleep list
-     today, since IPC call/reply and fault delivery take no timeout, except through the stale
-     plain-sleep entry ([#443](https://github.com/kottlerg/seraph/issues/443); see
-     [`sys_thread_sleep` and the Plain-Sleep Path](#sys_thread_sleep-and-the-plain-sleep-path))):
-     `compare_exchange` the server/handler `reply_tcb` from `tcb` to null; claim iff won.
-     Forecloses a future timeout surface letting the `default` arm mis-claim a reply/fault waiter
-     and race a concurrent reply/cancel into a double-wake, except through the stale plain-sleep
-     entry ([#443](https://github.com/kottlerg/seraph/issues/443); see
-     [`sys_thread_sleep` and the Plain-Sleep Path](#sys_thread_sleep-and-the-plain-sleep-path)).
-     `BlockedOnFault` additionally records `fault_outcome = Kill` on a win (a timeout is a
-     cancellation).
-   - default (plain sleep, `None`): claim unconditionally; no concurrent waker, except through the
-     stale plain-sleep entry ([#443](https://github.com/kottlerg/seraph/issues/443); see
-     [`sys_thread_sleep` and the Plain-Sleep Path](#sys_thread_sleep-and-the-plain-sleep-path)).
+     today, since IPC call/reply and fault delivery take no timeout): `compare_exchange` the
+     server/handler `reply_tcb` from `tcb` to null; claim iff won. Forecloses a future timeout
+     surface letting the `default` arm mis-claim a reply/fault waiter and race a concurrent
+     reply/cancel into a double-wake. `BlockedOnFault` additionally records
+     `fault_outcome = Kill` on a win (a timeout is a cancellation).
+   - default (plain sleep, `None`): claim unconditionally; no concurrent waker.
 
    The snapshot is read without the source lock; the `waiter == tcb` (or `reply_tcb` CAS) check
    under the source lock / on the atomic is the authoritative arbitration (stale snapshot = benign
-   skip, except through the stale plain-sleep entry
-   ([#443](https://github.com/kottlerg/seraph/issues/443); see
-   [`sys_thread_sleep` and the Plain-Sleep Path](#sys_thread_sleep-and-the-plain-sleep-path))).
+   skip). This invariant holds except for the lifetime gaps recorded on
+   [#443](https://github.com/kottlerg/seraph/issues/443).
 
 7. **Wake-side `sleep_list_remove` MUST be inside the source IPC lock and MUST precede clearing
    `sleep_deadline = 0`** (the #117 order: clearing first leaves an entry whose
@@ -328,8 +317,8 @@ stated explicitly.
     popped a plain-sleep (None) entry set wake_in_flight = 1 at pop. A timed
     notification or event-queue entry's arm claims, and sets the flag, only
     under the source lock, so it either claimed before step 11's unlink or
-    finds the waiter cleared and skips. The #443 stale entry's endpoint and
-    wait-set snapshots carry no pin; see the Plain-Sleep Path below.
+    finds the waiter cleared and skips, except for the lifetime gaps #443
+    records.
 15. Wake-in-flight gate (#160): spin until tcb.wake_in_flight.load(Acquire) == 0,
     with preempt_disable and interrupts enabled as in the context_saved gate,
     so a waker's pending enqueue_and_wake (or a cancel/dealloc CAS win that

@@ -392,6 +392,8 @@ These race fixes are independent of the lock and landed in the same migration
   win, and the per-entry claim never dereferences a possibly-freed TCB to choose
   its arm (correct by construction, not by timing;
   [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § Sleep List Invariants).
+  Both halves hold except for the lifetime gaps recorded on
+  [#443](https://github.com/kottlerg/seraph/issues/443).
 - **Stop vs shootdown:** `sys_thread_stop`'s cross-CPU drain spin
   (`core/kernel/src/syscall/thread.rs`) ran at IF=0 and could deadlock against an in-flight TLB
   shootdown; it now runs under `preempt_disable` + IF-enabled (the #207 pattern

@@ -24,10 +24,10 @@
 //! hardware.
 //!
 //! SFMASK masks only IF, so the user's RFLAGS.AC, TF, DF, NT and IOPL reach
-//! ring 0 unchanged, and the stub executes neither `clac` nor `cld`. A
-//! user-set AC leaves SMAP unenforced for explicit kernel accesses until the
-//! first `copy_user` clears it; a user-set TF raises `#DB` in ring 0 while the
-//! stub still runs on the user RSP (`#DB` has no IST); a user-set DF reverses
+//! ring 0 unchanged, and the stub executes neither `clac` nor `cld`. The
+//! resulting SMAP gap is defined in `docs/memory-model.md` § Kernel Isolation —
+//! SMEP and SMAP. A user-set TF raises `#DB` in ring 0 while the stub still
+//! runs on the user RSP (`#DB` has no IST); a user-set DF reverses
 //! compiler-generated string operations in kernel code and the `rep movsb` in
 //! `copy_user` (`cpu.rs`), so a user copy writes or reads kernel memory below
 //! the kernel-side buffer. This is a known defect (#443).

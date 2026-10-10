@@ -2383,13 +2383,12 @@ unsafe fn dealloc_object_one(
                 // entry, it set wake_in_flight = 1 at pop (under the same lock); a
                 // timed notification/event-queue arm claims and sets the flag only
                 // under the source lock, so it either claimed before the step-11
-                // unlink above or finds the waiter cleared and skips. Either way the
-                // gate below waits for any claimed wake to commit before the free.
-                // The stale plain-sleep entry is the exception (#443; see
-                // thread-lifecycle-and-sleep.md, the Plain-Sleep Path). Placed
-                // OUTSIDE the all-locks region — no sched.lock → SLEEP_LIST_LOCK
-                // order edge (the timer takes SLEEP_LIST_LOCK first, then releases
-                // it before any sched_lock).
+                // unlink above or finds the waiter cleared and skips, and the gate
+                // below waits for any claimed wake to commit before the free, except
+                // for the lifetime gaps #443 records. Placed OUTSIDE the all-locks
+                // region — no sched.lock → SLEEP_LIST_LOCK order edge (the timer
+                // takes SLEEP_LIST_LOCK first, then releases it before any
+                // sched_lock).
                 crate::sched::sleep_list_remove(tcb);
 
                 // Wake-in-flight gate (#160): a waker that popped this thread
@@ -2400,7 +2399,8 @@ unsafe fn dealloc_object_one(
                 // such waker released it, so this load cannot miss the set.
                 // Spin until the in-flight wake commits, so `retype_free` below
                 // cannot free the TCB out from under the waker's pending
-                // `enqueue_and_wake` (the residual #117/#160 use-after-free).
+                // `enqueue_and_wake` (the residual #117/#160 use-after-free),
+                // except for the lifetime gaps #443 records.
                 // Interrupts enabled + preemption disabled, mirroring the
                 // `context_saved` gate above, so the spin does not block
                 // incoming IPIs (FPU flush / TLB shootdown).

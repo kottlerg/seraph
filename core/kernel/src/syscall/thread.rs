@@ -248,9 +248,11 @@ unsafe fn commit_stopped(
 /// the restart outcome: the blocked syscall returns `Interrupted`, and a fault-blocked
 /// thread is killed). This does not hold for a caller displaced from a server's
 /// pending-reply binding: that stop is not memory-safe, and its outcome is in
-/// `docs/ipc-design.md` § The Call/Reply Model (#443). If the thread is Created,
-/// Stopped, or Exited (including one that exits before the locked commit), returns
-/// `InvalidState`. A thread may stop itself (arg0 refers to the calling thread).
+/// `docs/ipc-design.md` § The Call/Reply Model (#443). Nor does it hold for a park the
+/// target commits after the unlocked state read: that block is not cancelled (#443;
+/// see the comment at the read). If the thread is Created, Stopped, or Exited
+/// (including one that exits before the locked commit), returns `InvalidState`. A thread
+/// may stop itself (arg0 refers to the calling thread).
 ///
 /// Returns 0 on success.
 #[cfg(not(test))]
@@ -292,6 +294,11 @@ pub fn sys_thread_stop(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // SAFETY: target_tcb validated non-null; state field always valid.
     unsafe {
+        // Unlocked read: the cancel decision below is not re-checked under `sched_lock`.
+        // A `Running` target on another CPU that commits a park (`Running` → `Blocked`)
+        // before `commit_stopped` takes its `sched_lock` has `Stopped` written over the
+        // fresh `Blocked` with no `cancel_ipc_block` (#443; see
+        // core/kernel/docs/thread-lifecycle-and-sleep.md § Lifecycle State Machine).
         let state = (*target_tcb).state;
 
         match state

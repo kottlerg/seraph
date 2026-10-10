@@ -1587,7 +1587,8 @@ pub fn sleep_check_wakeups()
     // SAFETY: lock serialises all sleep list access.
     let saved = unsafe { SLEEP_LIST_LOCK.lock_raw() };
 
-    // SAFETY: single-writer access under lock.
+    // SAFETY: single-writer access under lock; each listed TCB is alive under
+    // the lock, except for the lifetime gaps #443 records.
     unsafe {
         let mut i = 0;
         while i < SLEEP_COUNT
@@ -1596,10 +1597,11 @@ pub fn sleep_check_wakeups()
             if !tcb.is_null() && (*tcb).sleep_deadline <= now
             {
                 // Snapshot the binding under SLEEP_LIST_LOCK, where the TCB is
-                // provably alive: dealloc_object(Thread) removes its entry from
-                // this list under the same lock before freeing. The claim loop
-                // below dispatches off this snapshot and never dereferences the
-                // TCB to choose its arm.
+                // alive because dealloc_object(Thread) removes its entry from
+                // this list under the same lock before freeing, except for the
+                // lifetime gaps #443 records. The claim loop below dispatches
+                // off this snapshot and never dereferences the TCB to choose
+                // its arm.
                 let ipc_state = (*tcb).ipc_state;
                 let blocked_on = (*tcb).blocked_on_object;
                 // A plain sleeper (no IPC source object) has no competing waker,
@@ -1654,8 +1656,9 @@ pub fn sleep_check_wakeups()
         // SLEEP_LIST_LOCK), NOT a fresh (*tcb) read: a concurrent
         // dealloc_object(Thread) may have freed the TCB once the lock was dropped,
         // so dispatching off a live dereference here would be a use-after-free.
-        // The matching source object (blocked_on) is independently refcounted and
-        // remains valid; the no-claim arms below touch only it, never the TCB.
+        // The no-claim arms below touch only the source object (blocked_on),
+        // never the TCB; the wait takes no reference on that object, and its
+        // validity here holds except for the lifetime gaps #443 records.
 
         let claimed = match ipc_state
         {
@@ -1663,15 +1666,16 @@ pub fn sleep_check_wakeups()
                 if !blocked_on.is_null() =>
             {
                 // SAFETY: BlockedOnNotification implies blocked_on_object is a
-                // valid *mut NotificationState (see `ipc::notification::notification_wait`).
+                // *mut NotificationState (see `ipc::notification::notification_wait`).
                 // The kernel allocator guarantees NotificationState alignment;
                 // the cast_ptr_alignment lint is suppressed here because
                 // the pointer is type-erased as *mut u8 in the TCB to
                 // break a circular module import.
                 #[allow(clippy::cast_ptr_alignment)]
                 let sig_state = blocked_on.cast::<crate::ipc::notification::NotificationState>();
-                // SAFETY: sig_state is valid for the duration of the wait;
-                // lock serialises against notification_send.
+                // SAFETY: sig_state is valid for the duration of the wait, except
+                // for the lifetime gaps #443 records; lock serialises against
+                // notification_send.
                 let saved_sig = unsafe { (*sig_state).lock.lock_raw() };
                 // SAFETY: same as above.
                 let we_win = unsafe { (*sig_state).waiter } == tcb;
@@ -1707,13 +1711,14 @@ pub fn sleep_check_wakeups()
             crate::sched::thread::IpcThreadState::BlockedOnEventQueue if !blocked_on.is_null() =>
             {
                 // SAFETY: BlockedOnEventQueue implies blocked_on_object is
-                // a valid *mut EventQueueState (see
+                // a *mut EventQueueState (see
                 // `ipc::event_queue::event_queue_recv`). cast_ptr_alignment
                 // suppressed for the same reason as the notification arm above.
                 #[allow(clippy::cast_ptr_alignment)]
                 let eq_state = blocked_on.cast::<crate::ipc::event_queue::EventQueueState>();
-                // SAFETY: eq_state is valid for the duration of the wait;
-                // lock serialises against event_queue_post. Lock order:
+                // SAFETY: eq_state is valid for the duration of the wait, except
+                // for the lifetime gaps #443 records; lock serialises against
+                // event_queue_post. Lock order:
                 // SLEEP_LIST_LOCK was already released above; we now take
                 // eq.lock alone — no cycle (post path is eq.lock →
                 // SLEEP_LIST_LOCK).
@@ -1758,9 +1763,8 @@ pub fn sleep_check_wakeups()
                 // `BlockedOnReply` TCB to the sleep list (the IPC
                 // call/recv path does not accept a timeout — see
                 // `sys_ipc_call` and `sys_ipc_recv` in
-                // `core/kernel/src/syscall/ipc.rs`), except via the #443
-                // stale plain-sleep entry,
-                // core/kernel/docs/thread-lifecycle-and-sleep.md. If a future timeout
+                // `core/kernel/src/syscall/ipc.rs`), except through the
+                // lifetime gaps #443 records. If a future timeout
                 // surface is introduced, the `_` fall-through below
                 // would treat a `BlockedOnReply` waiter as a plain sleep
                 // and claim the wake unconditionally, racing with a
@@ -1778,14 +1782,14 @@ pub fn sleep_check_wakeups()
                 // Defect (#443): the CAS holds no client `sched_lock` and does
                 // not re-read `blocked_on_object`, so it lacks the closure-lemma
                 // gate (scheduling-internals.md § Cross-CPU TCB Ownership), yet
-                // the #443 stale plain-sleep entry reaches this arm.
+                // the lifetime gaps #443 records reach this arm.
                 //
                 // cast_ptr_alignment suppressed for the same reason as the
                 // notification arm above.
                 #[allow(clippy::cast_ptr_alignment)]
                 let server = blocked_on.cast::<crate::sched::thread::ThreadControlBlock>();
-                // SAFETY: server is a valid TCB pointer, except in the #443 gap
-                // noted above; reply_tcb is AtomicPtr.
+                // SAFETY: server is a valid TCB pointer, except for the lifetime
+                // gaps #443 records; reply_tcb is AtomicPtr.
                 let we_win = unsafe {
                     (*server)
                         .reply_tcb
@@ -1820,9 +1824,8 @@ pub fn sleep_check_wakeups()
             crate::sched::thread::IpcThreadState::BlockedOnFault if !blocked_on.is_null() =>
             {
                 // Defensive: fault delivery never arms the sleep list, so this
-                // arm is currently unreachable, except via the #443 stale
-                // plain-sleep entry, core/kernel/docs/thread-lifecycle-and-sleep.md.
-                // It forecloses the same hazard the
+                // arm is currently unreachable, except through the lifetime gaps
+                // #443 records. It forecloses the same hazard the
                 // BlockedOnReply arm documents — were a fault-timeout surface ever
                 // added, the `_` fall-through would treat a BlockedOnFault waiter
                 // as a plain sleep and claim it unconditionally, racing a
@@ -1833,14 +1836,14 @@ pub fn sleep_check_wakeups()
                 //
                 // Defect (#443): as in the BlockedOnReply arm, this CAS lacks the
                 // closure-lemma gate (no client `sched_lock`, no
-                // `blocked_on_object` re-read) and is reachable via the #443
-                // stale plain-sleep entry.
+                // `blocked_on_object` re-read) and is reachable through the
+                // lifetime gaps #443 records.
                 //
                 // cast_ptr_alignment suppressed as in the notification arm above.
                 #[allow(clippy::cast_ptr_alignment)]
                 let server = blocked_on.cast::<crate::sched::thread::ThreadControlBlock>();
-                // SAFETY: server is a valid TCB pointer, except in the #443 gap
-                // noted above; reply_tcb is AtomicPtr.
+                // SAFETY: server is a valid TCB pointer, except for the lifetime
+                // gaps #443 records; reply_tcb is AtomicPtr.
                 let we_win = unsafe {
                     (*server)
                         .reply_tcb
@@ -1871,18 +1874,14 @@ pub fn sleep_check_wakeups()
 
             _ =>
             {
-                // Plain sleep (ipc_state None): the timer is the only waker. This
-                // arm is also reachable for the endpoint and wait-set snapshots
-                // (BlockedOnSend, BlockedOnRecv, BlockedOnWaitSet), which have no
-                // explicit arm above, popped via the #443 stale plain-sleep entry,
-                // core/kernel/docs/thread-lifecycle-and-sleep.md. For None we
-                // claimed it under SLEEP_LIST_LOCK at pop (wake_in_flight = 1), so
-                // a concurrent dealloc(tcb) is gated and tcb is still valid. The
-                // stale-entry endpoint and wait-set snapshots carry no pop-time
-                // wake_in_flight pin, so that premise does not hold for them, and
-                // this unconditional claim also races the source's waker (#443).
+                // Plain sleep (ipc_state None): the timer is the only waker. For
+                // None we claimed it under SLEEP_LIST_LOCK at pop (wake_in_flight
+                // = 1), so a concurrent dealloc(tcb) is gated and tcb is still
+                // valid. Any other snapshot reaches this arm only through the
+                // lifetime gaps #443 records, where this unconditional claim
+                // does not hold.
                 // SAFETY: tcb valid per the wake-in-flight claim at pop, except
-                // for the #443 stale-entry snapshots noted above.
+                // for the lifetime gaps #443 records.
                 unsafe {
                     (*tcb).sleep_deadline = 0;
                 }
@@ -1895,9 +1894,8 @@ pub fn sleep_check_wakeups()
             // SAFETY: tcb is kept valid by wake_in_flight = 1 (set at the claim
             // above — at pop for plain sleep, under the source lock for the IPC
             // arms, or at block entry for reply/fault), so a concurrent
-            // dealloc(tcb) waits at its gate rather than freeing it; except for
-            // the unpinned `_`-arm snapshots of the #443 stale plain-sleep entry
-            // noted above.
+            // dealloc(tcb) waits at its gate rather than freeing it, except for
+            // the lifetime gaps #443 records.
             // enqueue_and_wake reads state under sched_lock and either links a
             // still-Blocked thread or, if dealloc already marked it Exited, aborts
             // the link — both clear wake_in_flight, releasing that gate.
@@ -1905,10 +1903,10 @@ pub fn sleep_check_wakeups()
             // select_target_cpu, like every other wake path: it honours a hard
             // affinity changed mid-sleep (raw preferred_cpu would not) and
             // applies the save-window pin for a cs == 0 waker race.
-            // SAFETY: tcb valid (wake-in-flight gated).
+            // SAFETY: tcb valid (wake-in-flight gated, except as above).
             let cpu = unsafe { select_target_cpu(tcb) };
-            // SAFETY: tcb valid (wake-in-flight gated); enqueue_and_wake commits
-            // the transition by state.
+            // SAFETY: tcb valid (wake-in-flight gated, except as above);
+            // enqueue_and_wake commits the transition by state.
             unsafe { enqueue_and_wake(tcb, cpu) };
         }
     }

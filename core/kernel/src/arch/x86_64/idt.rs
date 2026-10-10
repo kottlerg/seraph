@@ -187,12 +187,12 @@ macro_rules! tf_build_asm {
 }
 
 /// Naked-asm fragment: write the (possibly handler-edited) `TrapFrame`
-/// CPU-state back into the stub frame, restore all GPRs from the frame, drop the
-/// frame + stub prologue, and `iretq`. Inverse of `tf_build_asm`; rsp on entry
-/// = `TrapFrame` base, on exit (`iretq`) the stub frame's hardware iret words are
-/// at the top of stack. `rax` is the copy scratch, then restored from the frame.
+/// CPU-state back into the stub frame, restore all GPRs from the frame, and drop
+/// the frame + stub prologue. Inverse of `tf_build_asm`; rsp on entry =
+/// `TrapFrame` base, on exit the stub frame's hardware iret words are at the top
+/// of stack. `rax` is the copy scratch, then restored from the frame.
 #[cfg(not(test))]
-macro_rules! tf_resume_asm {
+macro_rules! tf_restore_asm {
     () => {
         concat!(
             "mov rax, [rsp + 120]\n", // rip
@@ -221,6 +221,104 @@ macro_rules! tf_resume_asm {
             "mov r14, [rsp + 104]\n",
             "mov r15, [rsp + 112]\n",
             "add rsp, 184\n", // drop frame (168) + vector + error_code (16)
+        )
+    };
+}
+
+/// Naked-asm fragment: [`tf_restore_asm`], then the ring-3 GS exit
+/// ([`exit_swapgs_asm`], keyed on the iret frame's CS at `[rsp + 8]`), then
+/// `iretq`. The return tail of every trampoline that entered through
+/// [`entry_swapgs_asm`].
+#[cfg(not(test))]
+macro_rules! tf_resume_asm {
+    () => {
+        concat!(tf_restore_asm!(), exit_swapgs_asm!("8"), "iretq\n")
+    };
+}
+
+/// Naked-asm fragment run first in a trampoline, before any GS-relative access:
+/// swap to the kernel GS base when the interrupted context was ring 3 (the saved
+/// CS at `[rsp + $cs]` has a non-zero RPL), then clear DF and AC so kernel code
+/// runs with the string-instruction direction and SMAP enforcement it expects,
+/// whatever the interrupted context set.
+///
+/// While user code runs the kernel's per-CPU pointer lives in
+/// `IA32_KERNEL_GS_BASE` (see `syscall.rs` § Entry contract). A stub that can
+/// arrive between a ring-3 entry and its `swapgs` (NMI, `#MC`, `#DF`, `#DB`)
+/// cannot trust the saved CS and uses [`paranoid_entry_asm`] instead.
+#[cfg(not(test))]
+macro_rules! entry_swapgs_asm {
+    ($cs:literal) => {
+        concat!(
+            "test byte ptr [rsp + ",
+            $cs,
+            "], 0x3\n",
+            "jz 81f\n",
+            "swapgs\n",
+            "81:\n",
+            "cld\n",
+            "clac\n",
+        )
+    };
+}
+
+/// Naked-asm fragment run last before `iretq`: disable interrupts, then swap back
+/// to the user GS base when returning to ring 3 (the iret frame's CS at
+/// `[rsp + $cs]` has a non-zero RPL). Interrupts stay off from the swap to the
+/// `iretq` (which restores the interrupted context's IF), so no stub can enter
+/// with a ring-0 frame on the user GS base.
+#[cfg(not(test))]
+macro_rules! exit_swapgs_asm {
+    ($cs:literal) => {
+        concat!(
+            "cli\n",
+            "test byte ptr [rsp + ",
+            $cs,
+            "], 0x3\n",
+            "jz 82f\n",
+            "swapgs\n",
+            "82:\n",
+        )
+    };
+}
+
+/// Naked-asm fragment for stubs that can arrive between a ring-3 entry and its
+/// `swapgs` (NMI, `#MC`, `#DF`, `#DB`). Runs after [`tf_build_asm`] (the
+/// registers it clobbers are saved). Decides from the active GS base rather than
+/// the saved CS: a user GS base comes only from a flat GDT descriptor (base 0)
+/// and is never a kernel-half address, so a clear sign bit in `IA32_GS_BASE`
+/// means the user base is active. Swaps if so and records it in `r12`
+/// (callee-saved across the handler call) for [`paranoid_exit_asm`].
+#[cfg(not(test))]
+macro_rules! paranoid_entry_asm {
+    () => {
+        concat!(
+            "cld\n",
+            "clac\n",
+            "mov ecx, 0xC0000101\n", // IA32_GS_BASE
+            "rdmsr\n",
+            "xor r12d, r12d\n",
+            "test edx, edx\n",
+            "js 83f\n",
+            "swapgs\n",
+            "mov r12d, 1\n",
+            "83:\n",
+        )
+    };
+}
+
+/// Naked-asm fragment: undo [`paranoid_entry_asm`]'s swap (if it swapped), then
+/// restore the frame and `iretq`.
+#[cfg(not(test))]
+macro_rules! paranoid_exit_asm {
+    () => {
+        concat!(
+            "cli\n",
+            "test r12, r12\n",
+            "jz 84f\n",
+            "swapgs\n",
+            "84:\n",
+            tf_restore_asm!(),
             "iretq\n",
         )
     };
@@ -580,6 +678,7 @@ unsafe extern "C" fn common_exception_trampoline()
 {
     core::arch::naked_asm!(
         concat!(
+            entry_swapgs_asm!("24"),
             tf_build_asm!(),
             "mov rdi, rsp\n",          // arg0 = *mut TrapFrame
             "mov rsi, [rsp + 168]\n",  // arg1 = vector
@@ -591,11 +690,62 @@ unsafe extern "C" fn common_exception_trampoline()
     );
 }
 
+/// [`common_exception_trampoline`] for the vectors that can arrive between a
+/// ring-3 entry and its `swapgs` (`#DB`, `#DF`, `#MC`): identical except that the
+/// GS swap is decided by [`paranoid_entry_asm`] / [`paranoid_exit_asm`].
+#[cfg(not(test))]
+#[unsafe(naked)]
+unsafe extern "C" fn paranoid_exception_trampoline()
+{
+    core::arch::naked_asm!(
+        concat!(
+            tf_build_asm!(),
+            paranoid_entry_asm!(),
+            "mov rdi, rsp\n",          // arg0 = *mut TrapFrame
+            "mov rsi, [rsp + 168]\n",  // arg1 = vector
+            "mov rdx, [rsp + 176]\n",  // arg2 = error_code
+            "call {handler}\n",
+            paranoid_exit_asm!(),
+        ),
+        handler = sym exception_handler,
+    );
+}
+
+/// Generate a naked ISR stub that enters through
+/// [`paranoid_exception_trampoline`]; otherwise as [`isr_stub`].
+macro_rules! paranoid_isr_stub {
+    ($name:ident, $vector:expr, has_error_code = false) => {
+        #[cfg(not(test))]
+        #[unsafe(naked)]
+        unsafe extern "C" fn $name()
+        {
+            core::arch::naked_asm!(
+                "push 0",                     // dummy error code
+                concat!("push ", $vector),    // vector number
+                "jmp {handler}",
+                handler = sym paranoid_exception_trampoline,
+            );
+        }
+    };
+    ($name:ident, $vector:expr, has_error_code = true) => {
+        #[cfg(not(test))]
+        #[unsafe(naked)]
+        unsafe extern "C" fn $name()
+        {
+            core::arch::naked_asm!(
+                concat!("push ", $vector), // vector number (error code already on stack)
+                "jmp {handler}",
+                handler = sym paranoid_exception_trampoline,
+            );
+        }
+    };
+}
+
 // ── Exception stubs ───────────────────────────────────────────────────────────
 // Vectors with hardware error codes: 8, 10, 11, 12, 13, 14, 17, 21, 29, 30.
 
 isr_stub!(isr0, 0, has_error_code = false, ist = 0);
-isr_stub!(isr1, 1, has_error_code = false, ist = 0);
+paranoid_isr_stub!(isr1, 1, has_error_code = false); // #DB
 // NMI (vector 2) uses ipi_nmi_backtrace_stub instead of the generic
 // isr_stub! — see the dedicated stub above.
 isr_stub!(isr3, 3, has_error_code = false, ist = 0);
@@ -603,7 +753,7 @@ isr_stub!(isr4, 4, has_error_code = false, ist = 0);
 isr_stub!(isr5, 5, has_error_code = false, ist = 0);
 isr_stub!(isr6, 6, has_error_code = false, ist = 0);
 // Vector 7 (#NM) has a dedicated handler — see `isr_nm` below.
-isr_stub!(isr8, 8, has_error_code = true, ist = 1); // Double Fault — IST1
+paranoid_isr_stub!(isr8, 8, has_error_code = true); // Double Fault — IST1
 isr_stub!(isr9, 9, has_error_code = false, ist = 0);
 isr_stub!(isr10, 10, has_error_code = true, ist = 0);
 isr_stub!(isr11, 11, has_error_code = true, ist = 0);
@@ -614,7 +764,7 @@ isr_stub!(isr13, 13, has_error_code = true, ist = 0);
 isr_stub!(isr15, 15, has_error_code = false, ist = 0);
 isr_stub!(isr16, 16, has_error_code = false, ist = 0);
 isr_stub!(isr17, 17, has_error_code = true, ist = 0);
-isr_stub!(isr18, 18, has_error_code = false, ist = 0);
+paranoid_isr_stub!(isr18, 18, has_error_code = false); // #MC
 isr_stub!(isr19, 19, has_error_code = false, ist = 0);
 isr_stub!(isr20, 20, has_error_code = false, ist = 0);
 isr_stub!(isr21, 21, has_error_code = true, ist = 0);
@@ -685,9 +835,12 @@ unsafe extern "C" fn common_irq_trampoline()
 {
     core::arch::naked_asm!(
         concat!(
+            "cld\n",
+            "clac\n",
             "test byte ptr [rsp + 24], 0x3\n", // saved CS RPL; 0 => ring 0
             "jz 2f\n",
             // ── ring-3: build TrapFrame, dispatch, frame-authoritative return ──
+            "swapgs\n", // kernel GS base (see `entry_swapgs_asm`)
             tf_build_asm!(),
             "mov rdi, [rsp + 168]\n", // arg0 = vector
             "call {dispatch}\n",
@@ -819,6 +972,8 @@ unsafe extern "C" fn isr_spurious()
 unsafe extern "C" fn isr_nm()
 {
     core::arch::naked_asm!(
+        // Hardware frame: [rsp] = rip, [rsp + 8] = cs.
+        entry_swapgs_asm!("8"),
         "push rax",
         "push rcx",
         "push rdx",
@@ -838,6 +993,7 @@ unsafe extern "C" fn isr_nm()
         "pop rdx",
         "pop rcx",
         "pop rax",
+        exit_swapgs_asm!("8"),
         "iretq",
         handler = sym nm_handler,
     );
@@ -951,6 +1107,7 @@ unsafe extern "C" fn isr_page_fault()
     core::arch::naked_asm!(
         concat!(
             "push 14\n", // vector (hardware already pushed the error code)
+            entry_swapgs_asm!("24"),
             tf_build_asm!(),
             "mov rdi, rsp\n",          // arg0 = *mut TrapFrame
             "mov rsi, [rsp + 176]\n",  // arg1 = error_code (vector is implicit 14)
@@ -1238,11 +1395,12 @@ unsafe extern "C" fn ipi_nmi_backtrace_stub()
             "push 0\n", // placeholder (NMI has no error code)
             "push 2\n", // vector
             tf_build_asm!(),
+            paranoid_entry_asm!(),
             "mov rdi, rsp\n",         // arg0 = *mut TrapFrame
             "mov rsi, [rsp + 168]\n", // arg1 = vector (= 2)
             "mov rdx, [rsp + 176]\n", // arg2 = error_code (= placeholder 0)
             "call {handler}\n",
-            tf_resume_asm!(),
+            paranoid_exit_asm!(),
         ),
         handler = sym ipi_nmi_backtrace_handler,
     );

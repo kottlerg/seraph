@@ -317,6 +317,10 @@ pub unsafe extern "C" fn return_to_user(tf: *const super::trap_frame::TrapFrame)
         "mov r14, [rdi + 104]",
         "mov r15, [rdi + 112]",
         "mov rdi, [rdi + 40]", // restore rdi last (was TrapFrame pointer)
+        // User GS base back in place for ring 3, with interrupts off until the
+        // iretq restores the user's IF (see `syscall.rs` § Entry contract).
+        "cli",
+        "swapgs",
         "iretq",
     );
 }
@@ -455,6 +459,10 @@ pub unsafe extern "C" fn switch_and_enter_user(
         "mov r15, [rsi + 112]",
         "mov rdi, [rsi + 40]", // restore rdi before rsi
         "mov rsi, [rsi + 32]", // restore rsi last (was TrapFrame pointer)
+        // User GS base back in place for ring 3, with interrupts off until the
+        // iretq restores the user's IF (see `syscall.rs` § Entry contract).
+        "cli",
+        "swapgs",
         "iretq",
     );
 }

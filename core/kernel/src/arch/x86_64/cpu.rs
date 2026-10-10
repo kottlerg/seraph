@@ -127,7 +127,8 @@ pub unsafe fn write_msr(msr: u32, val: u64)
 // inside the copy redirects to `__copy_user_fixup` (which executes `clac` and
 // returns a non-zero sentinel) instead of panicking. See `crate::uaccess` for
 // the typed `copy_to_user`/`copy_from_user` wrappers and `idt::page_fault_handler`
-// for the fixup hook. The DF=0 ABI invariant makes `rep movsb` copy forward.
+// for the fixup hook. Every kernel entry clears DF (SFMASK on SYSCALL, `cld`
+// in the IDT stubs), so `rep movsb` copies forward.
 #[cfg(not(test))]
 core::arch::global_asm!(
     ".section .text.copy_user, \"ax\"",
@@ -487,11 +488,17 @@ pub fn current_id() -> u32
 /// MSR address for `IA32_GS_BASE` — the canonical GS segment base.
 const IA32_GS_BASE: u32 = 0xC000_0101;
 
+/// MSR address for `IA32_KERNEL_GS_BASE` — the base `swapgs` exchanges with
+/// `IA32_GS_BASE`.
+const IA32_KERNEL_GS_BASE: u32 = 0xC000_0102;
+
 /// Install `addr` as the per-CPU data pointer for the current CPU.
 ///
 /// Writes `addr` to `IA32_GS_BASE` (MSR `0xC000_0101`) so that
 /// GS-relative loads (`gs:[offset]`) reach the `PerCpuData` entry for
-/// this CPU. Must be called from Phase 5 (BSP) and `kernel_entry_ap`
+/// this CPU, and 0 to `IA32_KERNEL_GS_BASE`: the user GS base every ring-3
+/// entry and exit exchanges with the kernel's (`swapgs`; see `syscall.rs`
+/// § Entry contract). Must be called from Phase 5 (BSP) and `kernel_entry_ap`
 /// (each AP) before any GS-relative access occurs.
 ///
 /// # Safety
@@ -503,6 +510,7 @@ pub unsafe fn install_percpu(addr: u64)
     // SAFETY: IA32_GS_BASE is a valid MSR on all x86-64 CPUs; ring 0.
     unsafe {
         write_msr(IA32_GS_BASE, addr);
+        write_msr(IA32_KERNEL_GS_BASE, 0);
     }
 }
 

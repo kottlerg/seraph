@@ -203,8 +203,10 @@ On x86-64, SMEP (Supervisor Mode Execution Prevention) and SMAP (Supervisor Mode
 Access Prevention) are required by the platform baseline
 ([platform-requirements.md](platform-requirements.md)) and enabled unconditionally. SMEP
 prevents the kernel from executing userspace pages; SMAP prevents the kernel from reading or
-writing userspace memory except through designated safe copy routines. Together these
-mitigate a class of privilege escalation exploits.
+writing userspace memory except through designated safe copy routines. Every kernel entry
+clears RFLAGS.AC (SYSCALL's flag mask; `clac` in the interrupt and exception stubs), so a
+user-set AC cannot lift SMAP in ring 0. Together these mitigate a class of privilege
+escalation exploits.
 
 On RISC-V, S-mode can never execute from user (U=1) pages, and the kernel keeps
 `sstatus.SUM` clear except inside its user-copy routines, so supervisor loads and stores

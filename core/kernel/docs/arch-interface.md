@@ -408,7 +408,8 @@ pub unsafe fn init();
 ## `cpu` — `arch::current::cpu`
 
 CPU identification, per-CPU storage, kernel-stack setup, and interrupt save/restore. Per-CPU
-storage is architecture-managed (GS-base on x86-64; `sscratch` on RISC-V).
+storage is architecture-managed (GS-base on x86-64, exchanged with the user GS base by `swapgs`
+on every ring-3 entry and exit; `sscratch` on RISC-V).
 
 ```rust
 /// Hardware and logical CPU identity (APIC id / hart id, and the 0-based logical

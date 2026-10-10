@@ -523,8 +523,9 @@ pub fn current_tick() -> u64
 }
 
 /// Return the timer interrupt rate (interrupts per second, matching `current_tick()`).
-// dead_code: every caller is cfg(not(test)), so the function is unused in
-// host test builds.
+// dead_code: every caller (in sched and syscall) is gated cfg(not(test)), so the
+// function has no caller when the kernel crate is compiled with cfg(test) for the
+// host unit tests that `cargo xtask test` runs.
 #[allow(dead_code)]
 pub fn ticks_per_second() -> u64
 {

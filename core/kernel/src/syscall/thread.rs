@@ -329,7 +329,7 @@ pub fn sys_thread_stop(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         else if let Some(run_cpu) = running_on
         {
             // Cross-CPU drain: the wakeup IPI only nudges the remote CPU (its
-            // handler sends EOI and returns); the spin below waits for the
+            // handler acknowledges the interrupt and returns); the spin below waits for the
             // remote's next `schedule()` entry to deschedule the target.
             let current_cpu = crate::arch::current::cpu::current_cpu() as usize;
             if run_cpu != current_cpu

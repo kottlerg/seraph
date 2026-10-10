@@ -3197,7 +3197,7 @@ pub unsafe fn commit_reply_rebind_under_local_lock(
 /// Used by `sys_thread_stop` to nudge the CPU running a Stopped target. The
 /// wakeup IPI handler only acknowledges the interrupt and does not call
 /// `schedule()`; the target leaves that CPU at its next `schedule()` entry
-/// (slice expiry, syscall epilogue, or block).
+/// (slice expiry, a yield, or a refused park).
 ///
 /// # Safety
 /// `target_cpu` must be a valid online CPU index (< `CPU_COUNT`). Self-IPI

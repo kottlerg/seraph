@@ -739,10 +739,10 @@ pub fn sys_ipc_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // delivery (the sender keeps its caps), so pre-growing the destination
     // here makes OOM unlikely on both the immediate-delivery path and the
     // resumed-recv path (`deliver_call_caps`). `pre_allocate` reserves
-    // nothing and the CSpace lock is dropped before `endpoint_recv`, so a
-    // slot consumed by a sibling thread sharing this CSpace before
-    // `transfer_caps`'s locked `pre_allocate` still fails the transfer,
-    // which degrades to zero-cap delivery.
+    // nothing and the CSpace lock is dropped before `endpoint_recv`, so
+    // slots consumed by a sibling thread sharing this CSpace force
+    // `transfer_caps`'s locked `pre_allocate` to grow again, and a failure
+    // of that grow fails the transfer, which degrades to zero-cap delivery.
     // SAFETY: cspace_ptr validated above; lock_raw/unlock_raw paired.
     unsafe {
         let saved = (*cspace_ptr).lock.lock_raw();

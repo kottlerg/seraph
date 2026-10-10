@@ -390,8 +390,9 @@ pub fn run(ctx: &TestContext) -> TestResult
     // Diagnostic only — do not gate on `observed_cpu`: this test checks FP
     // state, which must be intact whichever CPU the child resumes on. The
     // flip above applies on wake through `select_target_cpu` (the Blocked
-    // path), and no test gates on the CPU that path lands on; only the
-    // Ready-queued migration path is gated, by
-    // core/ktest/src/unit/thread.rs::affinity_migrate_ready_queued.
+    // path), and no test gates on the CPU that path lands on; the
+    // Ready-queued and Running migration paths are gated, by
+    // core/ktest/src/unit/thread.rs::affinity_migrate_ready_queued and
+    // ::affinity_migrate_running.
     Ok(())
 }

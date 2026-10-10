@@ -143,10 +143,12 @@ pub unsafe fn root_cspace_mut() -> Option<&'static mut CSpace>
 /// IDs are recycled via the [`CSPACE_FREE_LIST`] free list once
 /// [`free_cspace_id`] runs at the end of a `CSpace`'s `dealloc_object` pass,
 /// so this is a live-count bound, not a cumulative-ever bound. Per-id epochs
-/// in [`CSPACE_REGISTRY`], randomized on recycle, make any stale `SlotId`
-/// resolution fail fast on epoch mismatch, so recycling cannot mis-target a
-/// recycled tenant. The pre-unregister derivation drain (`dealloc_object`
-/// for `CSpaceObj`) additionally scrubs the back-links in steady state.
+/// in [`CSPACE_REGISTRY`], randomized on recycle, make a stale `SlotId`
+/// resolution fail fast on epoch mismatch, except with probability ~2⁻³² per
+/// intervening recycle; that residual is accepted (see
+/// `core/kernel/docs/capability-internals.md` § Representation). The
+/// pre-unregister derivation drain (`dealloc_object` for `CSpaceObj`)
+/// additionally scrubs the back-links in steady state.
 ///
 /// Live-count peaks in ktest stress sit in the low hundreds; 4096 gives
 /// 10–40× headroom. The registry (4096 × 16 B = 64 KiB) plus the free list
@@ -165,8 +167,10 @@ static HIGH_WATER_CSPACE_ID: AtomicU32 = AtomicU32::new(0);
 /// `ptr` is the live `CSpace` pointer or null when the slot is vacant.
 /// `epoch` is a generation tag randomized each time an id is freed
 /// (see [`free_cspace_id`]); a `SlotId` stamped with a stale epoch fails
-/// resolution at [`lookup_cspace`] so a recycled id cannot alias a foreign
-/// derivation link into the new tenant.
+/// resolution at [`lookup_cspace`], except with probability ~2⁻³² per
+/// intervening recycle, so a recycled id does not alias a foreign derivation
+/// link into the new tenant beyond that accepted residual (see
+/// `core/kernel/docs/capability-internals.md` § Representation).
 ///
 /// `align(16)` colocates `ptr` and `epoch` on the same cache line and leaves
 /// room for a future 16-byte CAS if contention warrants it.
@@ -1625,8 +1629,9 @@ fn populate_cspace(
     //
     // On RISC-V the kernel's UART MMIO range is advertised via
     // `BootInfo.kernel_mmio.uart_base` rather than the coarse aperture
-    // list (the ns16550 UART sits outside both the PLIC aperture and the
-    // PCIe apertures on every supported platform). Synthesise an extra
+    // list. The UART range can also lie inside an aperture (the boot
+    // loader's riscv64 platform defaults and DTB `ns16550a` seeds cover it),
+    // so this cap may overlap an aperture cap. Synthesise an extra
     // Mmio cap here so userspace init has a cap for it — init's
     // serial scan looks for the Mmio descriptor containing its fixed
     // `UART_PHYS` (services/init/src/arch/riscv64/mod.rs).

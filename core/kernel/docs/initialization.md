@@ -367,7 +367,7 @@ Phase 7.
       block contributing only its tail past SEED_RESERVE_BYTES
    b. Mmio capabilities (Map | Write rights): on RISC-V, first one over the
       kernel console UART (`BootInfo.kernel_mmio.uart_base`, or the platform
-      default when that is zero; outside the apertures), then one per
+      default when that is zero; the range can also lie inside an aperture), then one per
       validated `BootInfo.mmio_apertures` entry.
       Userspace narrows these into per-device sub-caps and distributes them
       to drivers.

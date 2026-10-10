@@ -385,8 +385,10 @@ entries laid out **inline within the same retype slot** that holds the
 `EVENT_QUEUE_RING_OFFSET`; see
 [memory-internals.md § Kernel Object Memory](memory-internals.md#kernel-object-memory-capretypers)).
 Full and empty are detected from `count` (also the lockless wait-set readiness
-witness), not from the gap between `write_idx` and `read_idx`; the spare slot
-is unused and the user observes exactly N usable slots. The ring is reclaimed
+witness), not from the gap between `write_idx` and `read_idx`. Both indices
+advance modulo N+1, so every slot is written in rotation, but at most N slots
+are occupied at any time (the extra slot is never needed for full/empty
+detection) and the user observes exactly N usable slots. The ring is reclaimed
 wholesale with the wrapper on `dealloc_object(EventQueue)`.
 
 ### Post Path
@@ -566,7 +568,8 @@ waitset_notify(wait_set, member_idx):
    if consume_park_interrupted(tcb) -> return Interrupted,
    else                            -> return wakeup_value (the ready
                                       member's badge, or 0 when the wait
-                                      set is destroyed while parked)
+                                      set is destroyed while parked, a
+                                      defect (#443))
 ```
 
 **Why step 3 exists, and its memory-ordering requirement.** Readiness
@@ -658,11 +661,11 @@ The wake protocol — producer-side enqueue plus RESCHEDULE_PENDING set, IPI
 delivery, consumer-side atomic check-and-halt — is specified in
 [scheduling-internals.md § Wake Protocol Invariants](scheduling-internals.md#wake-protocol-invariants).
 The single-waiter IPC wakers invoke `enqueue_and_wake` after releasing their source
-IPC lock. `waitset_notify` wakes after releasing `ws.lock` while its caller still
-holds the source lock, and the `dealloc_object_one` Endpoint-arm send/recv drain
-holds `ep.lock` across its walk.
+IPC lock. `waitset_notify` and `waitset_add`'s ready-at-add wake run after releasing
+`ws.lock` while the source lock is still held, and the `dealloc_object_one`
+Endpoint-arm send/recv drain holds `ep.lock` across its walk.
 [scheduling-internals.md § Lock Hierarchy](scheduling-internals.md#lock-hierarchy)
-rule 5 permits both.
+rule 5 permits all three.
 
 ### Lock-Free Notification Fast Path
 

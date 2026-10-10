@@ -15,11 +15,20 @@
 //!     - bits [63:48] = 0x0010: SYSRET64 gives CS=(0x10+16)|3=0x23 (user),
 //!       SS=(0x10+8)|3=0x1B (user DS).
 //! - `IA32_LSTAR` — 64-bit entry point (`syscall_entry`).
-//! - `IA32_SFMASK` — clears RFLAGS.IF on entry.
+//! - `IA32_SFMASK` — clears RFLAGS.IF on entry, and no other RFLAGS bit (see
+//!   § Entry contract).
 //!
 //! ## Entry contract
 //! On SYSCALL: hardware saves RIP→RCX, RFLAGS→R11, applies SFMASK.
 //! RSP and segment registers are NOT changed by the hardware.
+//!
+//! SFMASK masks only IF, so the user's RFLAGS.AC, TF, DF, NT and IOPL reach
+//! ring 0 unchanged, and the stub executes neither `clac` nor `cld`. A
+//! user-set AC leaves SMAP unenforced for explicit kernel accesses until the
+//! first `copy_user` clears it; a user-set TF raises `#DB` in ring 0 while the
+//! stub still runs on the user RSP (`#DB` has no IST); a user-set DF reverses
+//! compiler-generated string operations in kernel code. This is a known
+//! defect (#443).
 //!
 //! We save R11 (user RFLAGS) to `PerCpuData::scratch` (`gs:[24]`) immediately,
 //! use R11 to shuttle user RSP to `PerCpuData::user_rsp` (`gs:[16]`), switch to
@@ -42,6 +51,8 @@ const IA32_LSTAR: u32 = 0xC000_0082;
 const IA32_SFMASK: u32 = 0xC000_0084;
 
 const EFER_SCE: u64 = 1 << 0;
+/// SFMASK value: clears RFLAGS.IF only. AC, TF, DF, NT and IOPL are not
+/// masked, a known defect (#443; see the module § Entry contract).
 const SFMASK_CLEAR_IF: u64 = 1 << 9;
 
 /// STAR value:
@@ -89,6 +100,10 @@ pub unsafe fn set_kernel_rsp(rsp: u64)
 /// 5. Saves all GPRs and CPU-state fields into the frame.
 /// 6. Calls `crate::syscall::dispatch`.
 /// 7. Restores registers and executes `sysretq`.
+///
+/// Steps 1 and 2 run on the user RSP, and no step clears RFLAGS.AC or DF, so
+/// the user's AC, TF and DF stay in effect in ring 0 (a known defect, #443;
+/// see the module § Entry contract).
 ///
 /// GS-base must point to a valid `PerCpuData` (installed by `percpu::init_bsp`
 /// in Phase 5) before any user thread executes a SYSCALL.
@@ -174,7 +189,8 @@ unsafe extern "C" fn syscall_entry()
 
 /// Configure the SYSCALL/SYSRET mechanism.
 ///
-/// Enables SYSCALL in EFER, programs STAR/LSTAR/SFMASK.
+/// Enables SYSCALL in EFER, programs STAR/LSTAR/SFMASK. SFMASK clears only
+/// RFLAGS.IF (a known defect, #443; see the module § Entry contract).
 ///
 /// # Safety
 /// Ring 0. GDT must have the Seraph layout before this call.

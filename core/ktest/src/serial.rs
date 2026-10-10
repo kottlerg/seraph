@@ -48,8 +48,8 @@ fn descriptors(info: &InitInfo) -> &[CapDescriptor]
 
 /// Scan the `CapDescriptor` array for a cap matching `wanted_type` and
 /// `wanted_aux0`. Returns the `CSpace` slot index if found.
-// Used on RISC-V (Mmio lookup), not on x86-64, so the lint fires only there.
-#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+// dead_code: the only caller is the riscv64 Mmio lookup, so x86-64 builds never use it.
+#[allow(dead_code)]
 fn find_cap(info: &InitInfo, wanted_type: CapType, wanted_aux0: u64) -> Option<u32>
 {
     for d in descriptors(info)

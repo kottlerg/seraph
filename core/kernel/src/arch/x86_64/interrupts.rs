@@ -749,10 +749,10 @@ pub fn unmask(_irq: u32) {}
 ///
 /// Known defect (#443): neither this function nor `sys_irq_register` checks
 /// `irq` against the stubbed range. Only GSIs 0-22 (vectors 33-55) have IDT
-/// gates; GSI 23 and up routes to a vector with no gate, GSIs 217, 218 and 222
-/// land on the TLB-shootdown, wakeup and spurious vectors, and from GSI 223 the
-/// `u8` add overflows (a panic in debug builds, a wrap into exception vectors
-/// 0-31 in release builds).
+/// gates; GSIs 23-216 and 219-221 route to vectors with no gate, GSIs 217, 218
+/// and 222 land on the TLB-shootdown, wakeup and spurious vectors, and from GSI
+/// 223 the `u8` add overflows (a panic in debug builds; in release builds GSIs
+/// 223-254 wrap to exception vectors 0-31 and GSI 255 to the timer vector 32).
 ///
 /// # Safety
 /// Must be called after Phase 5 init (IOAPIC initialised) with a valid GSI.

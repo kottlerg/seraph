@@ -353,7 +353,7 @@ pub unsafe fn first_entry_to_user(
 
 // ── switch_and_enter_user ─────────────────────────────────────────────────────
 
-/// Atomically switch page tables and enter user mode for the first time.
+/// Switch page tables and enter user mode for the first time.
 ///
 /// Moves RSP to init's direct-mapped kernel stack, writes CR3 (root plus any
 /// PCID composed by `first_entry_to_user`), and builds the `iretq` frame on
@@ -387,10 +387,10 @@ pub unsafe extern "C" fn switch_and_enter_user(
     //   r8=56, r9=64, r10=72, r11=80, r12=88, r13=96, r14=104, r15=112,
     //   rip=120, rflags=128, rsp=136, cs=144, ss=152, fs_base=160
     core::arch::naked_asm!(
-        // 1. Switch RSP to just below the TrapFrame on init's kernel stack.
-        //    Must happen BEFORE the CR3 write so the RSP is in the direct map
-        //    (accessible from init's page tables) when we next need the stack.
-        //    iretq frame (5 × 8 = 40 bytes) will sit at [rsi-40, rsi-1].
+        // 1. Switch RSP to just below the TrapFrame on init's kernel stack,
+        //    where the iretq frame (5 × 8 = 40 bytes) is built at [rsi-40, rsi-1].
+        //    The rebased boot stack is direct-mapped too, so this order does not
+        //    keep the stack mapped across the CR3 write.
         "mov rsp, rsi",
         // 2. Switch page tables. RSP now points to the direct-mapped init
         //    kernel stack, which is covered by the copied kernel-upper entries.

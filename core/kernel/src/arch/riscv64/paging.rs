@@ -1071,13 +1071,17 @@ fn table_is_empty(table: &[PageTableEntry; 512]) -> bool
 ///
 /// Issues no TLB flush: the caller (`AddressSpace::unmap_region_pooled`)
 /// performs one invalidation for the whole span and holds `pt_lock` across
-/// it, so a freed frame cannot be popped and reused before every hart is
-/// coherent. When this returns a non-zero count, that invalidation must be a
+/// it, so a freed frame cannot be popped and reused before that invalidation
+/// completes. When this returns a non-zero count, that invalidation must be a
 /// full `rs1 = x0` fence on every hart (`flush_tlb_all` locally, the
 /// full-flush shootdown remotely): a per-VA `sfence.vma` or `sinval.vma`
 /// invalidates only leaf translations for that VA, so cached non-leaf entries
 /// pointing at a freed table survive it. The batched per-page window (up to
 /// `RANGE_FLUSH_CEILING_PAGES`) suffices only for a span that freed no table.
+/// Known defect (#443): the caller does not yet meet this requirement; it
+/// issues the per-page window for every span at or under
+/// `RANGE_FLUSH_CEILING_PAGES` whatever this returns, so a hart can keep a
+/// cached non-leaf entry naming a freed table after the frame is reused.
 ///
 /// # Safety
 /// `root_virt` must be the direct-map VA of a valid 4 KiB root frame, `aso`

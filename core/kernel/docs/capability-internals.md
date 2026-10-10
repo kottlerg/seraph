@@ -256,14 +256,13 @@ tag, and a slot index: `{cspace_id: u32, epoch: u32, index: NonZeroU32}`
 `NonZeroU32` index). This allows derivation tree traversal across CSpace
 boundaries without holding per-CSpace locks longer than necessary, and lets
 `lookup_cspace(id, expected_epoch)` fail fast when a CSpace's id has been
-recycled — a stale `SlotId` stamped with the pre-recycle epoch fails fast
-except with probability ~2⁻³² per intervening recycle. As of #248 the epoch is
-a random non-zero value redrawn on each recycle (not a monotonic counter); the
-equality check is unaffected, and the random redraw excludes the prior value
-so an immediately-recycled `SlotId` always fails fast. A `SlotId` stale across
-several recycles can match a later random epoch with probability ~2⁻³² per
-recycle; this residual is accepted because the capability, not the `SlotId`,
-is the authority. See #137 for the recycling allocator design.
+recycled. As of #248 the epoch is a random non-zero value redrawn on each
+recycle (not a monotonic counter); the equality check is unaffected, and the
+random redraw excludes the prior value so an immediately-recycled `SlotId`
+always fails fast. A `SlotId` stale across several recycles can match a later
+random epoch with probability ~2⁻³² per recycle; this residual is accepted
+because the capability, not the `SlotId`, is the authority. See #137 for the
+recycling allocator design.
 
 ### Per-Slot Generation
 

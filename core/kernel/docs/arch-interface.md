@@ -707,7 +707,7 @@ pub unsafe fn fpu::switch_out_save(tcb: *mut ThreadControlBlock);
 pub unsafe fn fpu::switch_in_restore(tcb: *mut ThreadControlBlock);
 
 /// Physical (base, size) of a boot console UART needing a dedicated `Mmio`
-/// capability at Phase 7: `Some` on RISC-V (ns16550, outside the aperture list);
+/// capability at Phase 7: `Some` on RISC-V (ns16550, which may also lie inside an aperture);
 /// `None` on x86-64 (legacy I/O-port COM1).
 pub fn platform::console_mmio() -> Option<(u64, u64)>;
 /// UART physical base for Phase 1 console init: the discovered UART base (or a

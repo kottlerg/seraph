@@ -259,7 +259,8 @@ pub unsafe fn enable_xsave()
 /// # Safety
 /// Must execute at ring 0 with CR0.TS clear. `area` must satisfy the alignment
 /// and size requirements above. Called from `switch_out_save` (interrupts
-/// disabled, scheduler lock held) and from the `#NM` handler (interrupts
+/// disabled, after the scheduler locks are dropped and before `switch()`
+/// publishes `context_saved`) and from the `#NM` handler (interrupts
 /// disabled, preemption disabled).
 #[cfg(not(test))]
 #[inline]

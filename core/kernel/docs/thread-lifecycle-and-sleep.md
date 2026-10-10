@@ -104,8 +104,13 @@ claims against concurrent IPC sources via the relevant source IPC lock (Notifica
      surface letting the `default` arm mis-claim a reply/fault waiter and race a concurrent
      reply/cancel into a double-wake. `BlockedOnFault` additionally records `fault_outcome = Kill`
      on a win (a timeout is a cancellation).
-   - default (plain sleep, `None`): claim unconditionally; no concurrent waker. A stale entry
-     that `sys_thread_sleep` adds after a stop's cancel is claimed here too (invariant 2).
+   - default (plain sleep, `None`; also reached by a re-parked IPC waiter through a stale entry,
+     [#443](https://github.com/kottlerg/seraph/issues/443)): claim unconditionally; no concurrent
+     waker. A stale entry that `sys_thread_sleep` adds after a stop's cancel is claimed here while
+     the thread is still `Stopped` (invariant 2). If the thread restarts and parks again first,
+     the entry claims the new park through the arm its `ipc_state` selects: a notification or
+     event-queue wait is woken with value 0, and an endpoint or wait-set park takes this arm and
+     is linked `Ready` while still on its wait queue.
 
    The snapshot is read without the source lock; the `waiter == tcb` (or `reply_tcb` CAS) check
    under the source lock / on the atomic is the authoritative arbitration (stale snapshot = benign
@@ -191,7 +196,7 @@ the handler uses for the target's `state` write.
 | `sys_thread_start` (first start) | `Created` | `Ready` | calling CPU | `await_descheduled(target)` (drains the target off every CPU's `current` and waits `context_saved == 1`; a never-dispatched `Created` thread is `current` nowhere, so this returns immediately), then `set_state_under_all_locks(target, Ready)`, then `enqueue_ready_thread(target_cpu)`. The all-locks write closes the dealloc race: a concurrent `dealloc_object(Thread)` on another CPU cannot free the TCB between the state write and the link. `enqueue_ready_thread` (not `enqueue_and_wake`) is used because the gated wake would coalesce an already-`Ready` thread and silently drop the link (see [scheduling-internals.md § ThreadState Transitions](scheduling-internals.md#threadstate-transitions)). Both the commit and the link refuse an `Exited` target (`StateCommit::RefusedExited` / `false`): the syscall's state precheck ran without a lock, and an object teardown or an exit on another CPU may have ended the thread since; the syscall then returns `InvalidArgument` and nothing is linked. |
 | `sys_thread_start` (resume from stop) | `Stopped` | `Ready` | calling CPU | Same as first-start, but the `await_descheduled` drain is load-bearing here: a thread stopped while Running may still be `current`/executing on a remote CPU. The drain runs while the target is still `Stopped` (a state `schedule()`'s requeue denylist rejects, so the owning CPU deschedules it without re-linking), and only then commits `Ready` and force-links it — otherwise `enqueue_ready_thread` would dispatch a still-live thread on a second CPU (the cross-CPU double-dispatch of #314/#293). The kernel uses `sys_thread_start` for both first-start and resume; this overload is intentional and `Stopped → Ready` is a permitted transition. |
 | `sys_thread_stop` (running self) | `Running` | `Stopped` | calling CPU = running CPU | `set_state_under_all_locks(target, Stopped)`, then `schedule(false)` immediately yields. `schedule()`'s requeue arm never re-enqueues a `Stopped` current thread. |
-| `sys_thread_stop` (running remote) | `Running` | `Stopped` | calling CPU ≠ running CPU | `set_state_under_all_locks(target, Stopped)` returns `StateCommit::Committed(Some(run_cpu))`; the syscall handler then calls `prod_remote_cpu(run_cpu)` (a wakeup IPI whose handler only acknowledges it; it does not force `schedule()`) and bounded-spins until `sched_remote.current != target_tcb` or the target is no longer `Stopped` (a concurrent `sys_thread_start` overtook the stop). The spin ends at the remote CPU's next `schedule()` entry: slice expiry, the target's next syscall epilogue (`running_thread_stopped`), or a block. That entry also rewrites the target's `trap_frame`, so `sys_thread_read_regs` observes the registers of the descheduling kernel entry. |
+| `sys_thread_stop` (running remote) | `Running` | `Stopped` | calling CPU ≠ running CPU | `set_state_under_all_locks(target, Stopped)` returns `StateCommit::Committed(Some(run_cpu))`; the syscall handler then calls `prod_remote_cpu(run_cpu)` (a wakeup IPI whose handler only acknowledges it; it does not force `schedule()`) and bounded-spins until `sched_remote.current != target_tcb` or the target is no longer `Stopped` (a concurrent `sys_thread_start` overtook the stop). The spin ends at the remote CPU's next `schedule()` entry: slice expiry (the requeue denylist drops the `Stopped` current), a `SYS_THREAD_YIELD`, or a park whose commit returns `ParkCommit::RefusedStop`. That entry also rewrites the target's `trap_frame`, so `sys_thread_read_regs` observes the registers of the descheduling kernel entry. The syscall epilogue does not deschedule a `Stopped` thread, because `running_thread_stopped` tests `Exited` only; a non-blocking syscall returns the target to userspace. |
 | `sys_thread_stop` (Ready, on a run queue) | `Ready` | `Stopped` | calling CPU | `set_state_under_all_locks(target, Stopped)`, which also removes the TCB from every CPU's run queue inside the all-locks region (#117); the `schedule()` skip-loop is defence in depth only. |
 | `sys_thread_stop` (Blocked) | `Blocked` | `Stopped` | calling CPU | `cancel_ipc_block(target)` first (acquires the source IPC lock matching `tcb.ipc_state` and unlinks the waiter), then `set_state_under_all_locks(target, Stopped)`. |
 | `sys_thread_stop` (Created or Exited or Stopped) | `*` | `*` | calling CPU | n/a — returns `InvalidState`. No state write. An `Exited` target observed only at the locked commit (the thread died between the unlocked precheck and `set_state_under_all_locks`) is refused there with the same `InvalidState`. |
@@ -626,12 +631,17 @@ Episodes.
    that window the sleeper's `sleep_list_add` runs after the cancel and inserts an entry with
    `sleep_deadline == 0` for a thread the stop then commits `Stopped`, against Sleep List
    invariants 2 and 3 ([#443](https://github.com/kottlerg/seraph/issues/443)). The next BSP tick
-   pops that entry as expired and claims it through the plain arm; `enqueue_and_wake` coalesces
-   the claim while the thread stays `Stopped`, but a thread restarted before that tick can take a
-   stray wake. A timer claim racing the cancel resolves to `Interrupted` (honest for a sleep whose
-   deadline elapsed concurrently with a stop). A stop that instead wins against the park commit
-   (`ParkCommit::RefusedStop`) makes `sys_thread_sleep` deschedule in place and return
-   `Interrupted` directly.
+   pops that entry as expired. While the thread is still `Stopped`, the plain arm claims it and
+   `enqueue_and_wake` coalesces the claim. For a thread restarted before that tick, the pop acts
+   on the `ipc_state` snapshotted there: an untimed notification wait returns 0 bits; an
+   event-queue recv returns `WouldBlock`; an endpoint or wait-set park takes the plain arm and is
+   made `Ready` while still on its wait queue; a pending `ipc_call` returns `Interrupted`; a
+   fault-blocked thread is killed; and a thread still `Running` takes the plain arm, whose
+   `enqueue_and_wake` records `wake_pending`, so its next park is refused and returns at once (a
+   `sys_thread_sleep` returns `Ok(0)`). A timer claim racing the cancel resolves to `Interrupted`
+   (honest for a sleep whose deadline elapsed concurrently with a stop). A stop that instead wins
+   against the park commit (`ParkCommit::RefusedStop`) makes `sys_thread_sleep` deschedule in
+   place and return `Interrupted` directly.
 
 ---
 
@@ -662,9 +672,10 @@ The handler then drains the target.
 5. **Cross-CPU drain.** If `running_on = Some(run_cpu)` and `run_cpu != current_cpu`:
    - `prod_remote_cpu(run_cpu)` — sends a wakeup IPI. The IPI interrupts the remote CPU, but its
      handler only acknowledges it and does not call `schedule()`, so the target keeps running
-     until that CPU's next `schedule()` entry: slice expiry (up to `TIME_SLICE_TICKS` ticks), the
-     target's next syscall epilogue (`running_thread_stopped`), or a block. The drain spin's
-     latency is therefore bounded by one time slice.
+     until that CPU's next `schedule()` entry: slice expiry (up to `TIME_SLICE_TICKS` ticks), a
+     `SYS_THREAD_YIELD`, or a park whose commit returns `ParkCommit::RefusedStop`. The syscall
+     epilogue does not deschedule a `Stopped` thread (`running_thread_stopped` tests `Exited`
+     only). The drain spin's latency is therefore bounded by one time slice.
    - Bounded spin until `sched_remote.current != target_tcb` **or** the target is no longer
      `Stopped`. The remote CPU's `schedule()` declines to requeue the `Stopped` target (requeue
      denylist) and switches to either the next ready thread or its idle TCB; once that switch
@@ -679,9 +690,10 @@ The handler then drains the target.
 **Invariants:**
 
 1. The drain spin's exit condition in step 5 is what guarantees `sys_thread_read_regs` sees a
-   fresh `trap_frame`: the remote CPU can deschedule the target only through a kernel entry (timer,
-   syscall, or block) and a `schedule()`, and that entry rewrites the frame. The IPI is a nudge,
-   not a correctness requirement; after its acknowledgement the target resumes the interrupted code.
+   fresh `trap_frame`: the remote CPU can deschedule the target only through a kernel entry (a
+   timer tick at slice expiry, or a syscall that yields or parks) and a `schedule()`, and that
+   entry rewrites the frame. The IPI is a nudge, not a correctness requirement; after its
+   acknowledgement the target resumes the interrupted code.
 2. For Ready targets on a remote run queue, no IPI is needed: the all-locks `Stopped` commit
    unlinks the TCB from every CPU's run queue.
 3. The bounded spin in step 5 holds NO lock; it acquires `sched_remote.lock` briefly per iteration

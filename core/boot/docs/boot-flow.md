@@ -19,8 +19,9 @@ here; detailed implementation is in the referenced document.
 `efi_main` receives an `EFI_HANDLE image_handle` and a pointer to the UEFI system
 table. Before step 1, `efi_main` discovers the serial UART (`arch::current::pre_serial_init`;
 a no-op on x86-64) and initializes the serial console. Step 1 then locates the protocols
-needed for the rest of the boot, connecting every controller first so firmware binds
-drivers such as virtio-gpu to GOP:
+needed for the rest of the boot: it opens the loaded-image and file-system protocols,
+then connects every controller so firmware binds drivers such as virtio-gpu to GOP, and
+only then queries GOP:
 
 - `EFI_LOADED_IMAGE_PROTOCOL` — to find the device handle for the boot volume
 - `EFI_SIMPLE_FILE_SYSTEM_PROTOCOL` — to open the EFI System Partition filesystem
@@ -94,9 +95,8 @@ bootloader synthesises a
 record directly — there is no per-module allocation or copy because the
 bundle bodies are already 4096-byte aligned within the bundle allocation.
 The bootloader does not inspect module content; what each module does
-and in what order init spawns them is init's concern, and init
-identifies modules by name (the kernel copies each `BootModule.name` into
-`InitInfo::module_names`) rather than by ordinal position. Typical
+and in what order init spawns them is init's concern
+([elf-loading.md § Boot Module Loading](elf-loading.md#boot-module-loading)). Typical
 modules: procmgr, memmgr, devmgr, vfsd, virtio-blk, serial, framebuffer,
 fatfs (the authoritative list is `xtask/src/bundle.rs::MODULES`).
 
@@ -198,7 +198,7 @@ allocated from UEFI before `ExitBootServices`. The tables map:
 - A read-execute identity map of the handoff trampoline's page or pages, so execution
   continues across the root-table switch
 
-W^X is verified during construction: no PTE has both writable and executable bits.
+W^X is verified during construction: no leaf PTE has both writable and executable permissions.
 
 Detail: [page-tables.md](page-tables.md)
 
@@ -295,7 +295,8 @@ the kernel has consumed them.
 ## Summarized By
 
 [core/boot/README.md](../README.md), [ACPI Parsing](acpi.md), [Early Console](console.md),
-[ELF Loading](elf-loading.md), [Firmware Parsing](firmware-parsing.md),
+[Device Tree Parsing](dtb.md), [ELF Loading](elf-loading.md),
+[Firmware Parsing](firmware-parsing.md),
 [Memory Map Translation](memory-map.md), [Page Tables](page-tables.md),
 [UEFI Environment](uefi-environment.md), [Kernel Entropy Subsystem](../../kernel/docs/entropy.md),
 [Kernel Initialization Sequence](../../kernel/docs/initialization.md),

@@ -8,7 +8,8 @@ Partition: kernel ELF, init ELF, and boot modules.
 ## Categories
 
 - **Kernel ELF** — fully validated and loaded as a single contiguous span at a
-  bootloader-chosen physical base, preserving the ELF's relative segment offsets.
+  firmware-chosen physical base (`AllocateAnyPages`), preserving the ELF's relative segment
+  offsets.
 - **Init ELF** — fully validated and ELF-parsed; segments allocated at any available
   physical address. Result is an `InitImage` passed to the kernel in `BootInfo.init_image`.
 - **Boot modules** — opaque flat binaries loaded verbatim into physical memory and
@@ -50,8 +51,8 @@ change.
 
 ELF-header and program-header *format* validation is performed by the shared ELF crate;
 the ruleset (minimum size, magic, class, data encoding, version, type, machine,
-program-header entry size and count) is implemented by `elf::validate_executable` in
-[`shared/elf`](../../../shared/elf/README.md). Any
+program-header entry size and count, and program-header table bounds) is implemented by
+`elf::validate_executable` in [`shared/elf`](../../../shared/elf/README.md). Any
 `elf::ElfError` returned by the shared crate is surfaced by the bootloader as
 [`BootError::InvalidElf`](../src/error.rs).
 
@@ -70,8 +71,9 @@ during load — `RELATIVE`-only, every target inside the load span — and `relo
 applies it (`*target = slide + addend`) through the copied span before the page tables
 are built, then biases `KernelInfo`'s virtual base and entry by the KASLR slide
 ([boot-flow.md](boot-flow.md#step-5d-apply-the-kaslr-slide)). The slide is 2 MiB-aligned
-within the top-2 GiB window (0 when there is no boot entropy or the `nokaslr` knob is
-present; see [memory-model.md](../../../docs/memory-model.md#virtual-address-space-layout)).
+within the top-2 GiB window (0 when there is no KASLR entropy, the `nokaslr` knob is
+present, or the kernel is `ET_EXEC`; see
+[memory-model.md](../../../docs/memory-model.md#virtual-address-space-layout)).
 The dynamic-linking sections lld emits under `-pie` (`.rela.dyn`, `.dynamic`, `.got`, …)
 are placed inside the image's read-only region by the kernel linker scripts, so they keep
 the single-linear-offset invariant above and Phase 3 maps them read-only
@@ -232,7 +234,8 @@ ordinal ([init bootstrap.md](../../../services/init/docs/bootstrap.md#initial-cs
 ## Summarized By
 
 [core/boot/README.md](../README.md), [Boot Flow](boot-flow.md), [Page Tables](page-tables.md),
-[UEFI Environment](uefi-environment.md), [System Bootstrap](../../../docs/bootstrap.md),
+[UEFI Environment](uefi-environment.md), [core/kernel/README.md](../../kernel/README.md),
+[System Bootstrap](../../../docs/bootstrap.md),
 [Testing](../../../docs/testing.md),
 [Userspace Memory Model](../../../docs/userspace-memory-model.md),
 [shared/elf/README.md](../../../shared/elf/README.md)

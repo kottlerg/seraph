@@ -30,10 +30,6 @@ pub type EfiBool = u8;
 pub const EFI_SUCCESS: EfiStatus = 0;
 pub const EFI_BUFFER_TOO_SMALL: EfiStatus = 0x8000_0000_0000_0005;
 pub const EFI_INVALID_PARAMETER: EfiStatus = 0x8000_0000_0000_0002;
-// Defined for completeness against the UEFI status-code table; no boot path
-// currently checks for it.
-#[allow(dead_code)]
-pub const EFI_NOT_FOUND: EfiStatus = 0x8000_0000_0000_000E;
 
 /// Allocate pages at any available physical address.
 pub const ALLOCATE_ANY_PAGES: u32 = 0;
@@ -163,9 +159,11 @@ pub struct EfiSystemTable
     pub configuration_table: *mut EfiConfigurationTable,
 }
 
-/// UEFI Simple Text Output Protocol (`ConOut`) layout, typed so
-/// `EfiSystemTable::con_out` has its real shape. The bootloader never calls it;
-/// boot output goes through the console backends (see
+/// Leading function-pointer prefix of the UEFI Simple Text Output Protocol
+/// (`ConOut`): `Reset`, `OutputString`, and the protocol's seven further function
+/// pointers as padding; the trailing `Mode` pointer is omitted. The bootloader
+/// never dereferences `EfiSystemTable::con_out`; boot output goes through the
+/// console backends (see
 /// [`core/boot/docs/uefi-environment.md`](../docs/uefi-environment.md) § Console Output).
 #[repr(C)]
 pub struct EfiSimpleTextOutput

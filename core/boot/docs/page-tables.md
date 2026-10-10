@@ -27,7 +27,9 @@ bootloader *builds*, described in later sections — is:
   `InitImage` segments, the kernel segments' physical frames, the kernel ELF file buffer,
   the bundle blob (every boot module body), the framebuffer when present, and the UART
   MMIO page on RISC-V, so the kernel can read them using physical addresses before its
-  own direct-physical map is established.
+  own direct-physical map is established. An `InitImage` segment whose `p_vaddr` in-page offset
+  plus its size crosses one more page boundary than its size alone has its last page left unmapped
+  (defect, [#442](https://github.com/kottlerg/seraph/issues/442)).
 - The handoff trampoline's page or pages are identity-mapped read-execute, so execution
   continues across the root-table switch.
 - Nothing else is mapped; an access outside these ranges faults. The ACPI RSDP and the

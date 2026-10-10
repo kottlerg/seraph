@@ -18,7 +18,7 @@ The implementation lives in [`core/boot/src/memory_map.rs`](../src/memory_map.rs
 | `EfiConventionalMemory` | `Usable` | Free RAM. |
 | `EfiBootServicesCode` / `EfiBootServicesData` | `Usable` | No longer in use after `ExitBootServices`. |
 | `EfiLoaderCode` / `EfiLoaderData` | `Loaded` | Every bootloader allocation and the bootloader's own loaded image (enumerated in § Allocation-Class Classification). |
-| `EfiACPIReclaimMemory` | `AcpiReclaimable` | Firmware tables; exposed to userspace as Map-only Memory caps in Phase 7 and never reclaimed. |
+| `EfiACPIReclaimMemory` | `AcpiReclaimable` | Firmware tables; exposed to userspace read-only as Map-only Memory caps (up to eight regions) and never returned to the allocator; see [initialization.md § Phase 7](../../kernel/docs/initialization.md#phase-7-capability-system). |
 | `EfiACPIMemoryNVS` | `Reserved` | Firmware-reserved. |
 | `EfiRuntimeServicesCode` / `EfiRuntimeServicesData` | `Reserved` | Seraph does not use UEFI runtime services; treat as off-limits. |
 | `EfiMemoryMappedIO` / `EfiMemoryMappedIOPortSpace` | `Reserved` | Device space, not RAM. |

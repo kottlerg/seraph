@@ -225,7 +225,9 @@ pub unsafe fn derive_mmio_apertures(
 
     if dropped
     {
-        bprintln!("[--------] boot: MMIO apertures: surplus over MAX_APERTURES dropped");
+        bprintln!(
+            "[--------] boot: MMIO apertures: entries dropped (scratch buffer or MAX_APERTURES cap)"
+        );
     }
 
     out_count
@@ -238,14 +240,17 @@ mod tests
 {
     use core::mem::size_of;
 
-    use super::{insertion_sort_memory_map, translate_memory_map, translate_memory_type};
+    use super::{
+        derive_mmio_apertures, insertion_sort_memory_map, translate_memory_map,
+        translate_memory_type,
+    };
     use crate::uefi::{
         EFI_ACPI_MEMORY_NVS, EFI_ACPI_RECLAIM_MEMORY, EFI_BOOT_SERVICES_CODE,
         EFI_BOOT_SERVICES_DATA, EFI_CONVENTIONAL_MEMORY, EFI_LOADER_CODE, EFI_LOADER_DATA,
         EFI_MEMORY_MAPPED_IO, EFI_MEMORY_MAPPED_IO_PORT_SPACE, EFI_PERSISTENT_MEMORY,
         EFI_RUNTIME_SERVICES_CODE, EFI_RUNTIME_SERVICES_DATA, EfiMemoryDescriptor, MemoryMapResult,
     };
-    use boot_protocol::{MemoryMapEntry, MemoryType};
+    use boot_protocol::{MAX_APERTURES, MemoryMapEntry, MemoryType, MmioAperture};
 
     // ── translate_memory_type ─────────────────────────────────────────────────
 
@@ -530,7 +535,8 @@ mod tests
         let stride = size_of::<EfiMemoryDescriptor>() + 8;
         // Allocate one stride-sized slot, zeroed, then write the descriptor at
         // the start of that slot. The trailing 8 bytes remain zero (padding).
-        let mut buf = vec![0u8; stride];
+        // `u64` storage gives the buffer the descriptor's 8-byte alignment.
+        let mut buf = vec![0u64; stride / 8];
         let desc = EfiMemoryDescriptor {
             memory_type: EFI_PERSISTENT_MEMORY,
             physical_start: 0x4000,
@@ -538,11 +544,9 @@ mod tests
             number_of_pages: 4,
             attribute: 0,
         };
-        // SAFETY: buf has stride >= size_of::<EfiMemoryDescriptor>() bytes. Vec<u8>
-        // guarantees only 1-byte alignment while EfiMemoryDescriptor needs 8; this
-        // relies on the host allocator returning 8-byte-aligned blocks. We write
-        // one descriptor.
-        unsafe { core::ptr::write(buf.as_mut_ptr() as *mut EfiMemoryDescriptor, desc) };
+        // SAFETY: buf holds stride >= size_of::<EfiMemoryDescriptor>() bytes and,
+        // as `u64` storage, is 8-byte aligned, which EfiMemoryDescriptor needs.
+        unsafe { core::ptr::write(buf.as_mut_ptr().cast::<EfiMemoryDescriptor>(), desc) };
         let uefi_map = MemoryMapResult {
             buffer_phys: buf.as_ptr() as u64,
             buffer_size: stride,
@@ -561,6 +565,89 @@ mod tests
         assert_eq!(out[0].memory_type, MemoryType::Persistent);
         assert_eq!(out[0].physical_base, 0x4000);
         assert_eq!(out[0].size, 4 * 4096);
+    }
+    // ── derive_mmio_apertures ─────────────────────────────────────────────────
+
+    fn mmio_desc(physical_start: u64, number_of_pages: u64) -> EfiMemoryDescriptor
+    {
+        EfiMemoryDescriptor {
+            memory_type: EFI_MEMORY_MAPPED_IO,
+            physical_start,
+            virtual_start: 0,
+            number_of_pages,
+            attribute: 0,
+        }
+    }
+
+    /// Run `derive_mmio_apertures` over `descs` and `seed`; return the output.
+    fn run_derive(descs: &[EfiMemoryDescriptor], seed: &[MmioAperture]) -> Vec<MmioAperture>
+    {
+        let stride = size_of::<EfiMemoryDescriptor>();
+        let uefi_map = MemoryMapResult {
+            buffer_phys: descs.as_ptr() as u64,
+            buffer_size: descs.len() * stride,
+            map_size: descs.len() * stride,
+            map_key: 0,
+            descriptor_size: stride,
+        };
+        let mut out = [MmioAperture {
+            phys_base: 0,
+            size: 0,
+        }; MAX_APERTURES];
+        // SAFETY: `descs` is a live, aligned descriptor array covering `map_size`.
+        let n = unsafe { derive_mmio_apertures(&uefi_map, seed, &mut out) };
+        out[..n].to_vec()
+    }
+
+    #[test]
+    fn overlapping_and_adjacent_apertures_merge()
+    {
+        let descs = [mmio_desc(0x1000_0000, 1), mmio_desc(0x1000_1000, 1)];
+        let seed = [MmioAperture {
+            phys_base: 0x1000_0800,
+            size: 0x1000,
+        }];
+        let out = run_derive(&descs, &seed);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].phys_base, 0x1000_0000);
+        assert_eq!(out[0].size, 0x2000);
+    }
+
+    #[test]
+    fn zero_size_seed_is_ignored()
+    {
+        let seed = [MmioAperture {
+            phys_base: 0x2000_0000,
+            size: 0,
+        }];
+        assert!(run_derive(&[], &seed).is_empty());
+    }
+
+    #[test]
+    fn exactly_max_apertures_disjoint_are_all_kept()
+    {
+        let descs: Vec<_> = (0..MAX_APERTURES as u64)
+            .map(|i| mmio_desc(0x1000_0000 + i * 0x10_0000, 1))
+            .collect();
+        let out = run_derive(&descs, &[]);
+        assert_eq!(out.len(), MAX_APERTURES);
+    }
+
+    #[test]
+    fn surplus_over_max_apertures_keeps_the_lowest_bases()
+    {
+        // Listed highest first, so the cap must apply after the sort.
+        let descs: Vec<_> = (0..=MAX_APERTURES as u64)
+            .rev()
+            .map(|i| mmio_desc(0x1000_0000 + i * 0x10_0000, 1))
+            .collect();
+        let out = run_derive(&descs, &[]);
+        assert_eq!(out.len(), MAX_APERTURES);
+        assert_eq!(out[0].phys_base, 0x1000_0000);
+        assert_eq!(
+            out[MAX_APERTURES - 1].phys_base,
+            0x1000_0000 + (MAX_APERTURES as u64 - 1) * 0x10_0000
+        );
     }
 }
 

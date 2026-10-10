@@ -319,7 +319,8 @@ pub(crate) unsafe fn parse_vmgenid_paddr(rsdp_addr: u64) -> u64
 //
 // Only the riscv64 arch extractor calls this walker; the module is compiled
 // on every architecture (arch dispatch happens at the caller), so the whole
-// section is dead code on x86-64 — hence the per-item allows.
+// section is dead code on x86-64. The single allow on `parse_hart_caps` covers
+// it: rustc treats an allowed item as live, and with it everything it reaches.
 
 // RHCT layout after the 36-byte SDT header:
 //  36: flags(u32)  40: time_base_frequency(u64)
@@ -327,20 +328,10 @@ pub(crate) unsafe fn parse_vmgenid_paddr(rsdp_addr: u64) -> u64
 // Node array: each node is {type(u16), length(u16), revision(u16), payload}.
 //  Type 0 (ISA string node): {isa_len(u16), isa[isa_len] (null-terminated)}.
 //  Type 0xFFFF (hart info node): per-hart offsets into the shared nodes.
-// dead_code: consumed only by the riscv64-only RHCT walker; the module is compiled on every arch.
-#[allow(dead_code)]
 const RHCT_OFF_TIMEBASE: usize = 40;
-// dead_code: consumed only by the riscv64-only RHCT walker; the module is compiled on every arch.
-#[allow(dead_code)]
 const RHCT_OFF_NODE_COUNT: usize = 48;
-// dead_code: consumed only by the riscv64-only RHCT walker; the module is compiled on every arch.
-#[allow(dead_code)]
 const RHCT_OFF_NODE_OFFSET: usize = 52;
-// dead_code: consumed only by the riscv64-only RHCT walker; the module is compiled on every arch.
-#[allow(dead_code)]
 const RHCT_NODE_HDR_LEN: usize = 6;
-// dead_code: consumed only by the riscv64-only RHCT walker; the module is compiled on every arch.
-#[allow(dead_code)]
 const RHCT_NODE_TYPE_ISA_STRING: u16 = 0;
 
 /// Parse an RHCT table body: return `(time_base_frequency, hart_caps)`.
@@ -351,9 +342,6 @@ const RHCT_NODE_TYPE_ISA_STRING: u16 = 0;
 /// strings into shared nodes referenced by the per-hart hart-info nodes;
 /// requiring each extension in every ISA-string node is the conservative
 /// reading and avoids the hart-info offset indirection.
-// dead_code: the only non-test caller is `parse_hart_caps`, itself called only from
-// core/boot/src/arch/riscv64/acpi_kernel_mmio.rs; the module is compiled on every arch.
-#[allow(dead_code)]
 fn parse_rhct(table: &[u8]) -> (u64, u64)
 {
     let timebase = read_u64(table, RHCT_OFF_TIMEBASE);

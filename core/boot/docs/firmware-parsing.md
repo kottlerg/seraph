@@ -12,7 +12,8 @@ five parts of `BootInfo`:
    facts carried in the same struct (`timebase_freq`, `hart_caps`). Not a
    capability surface, except on RISC-V, where the kernel mints one
    additional `Mmio` capability over the console UART range (`uart_base` /
-   `uart_size`), which lies outside every aperture (see
+   `uart_size`); the ACPI seeds do not cover the UART, while the DTB seeds
+   can also include it as an aperture (see
    [docs/capability-model.md](../../../docs/capability-model.md#initial-capability-distribution)).
 3. `mmio_apertures` — firmware parsing contributes coarse `{phys_base, size}`
    MMIO seed regions, which are merged with the UEFI memory map's MMIO
@@ -92,13 +93,15 @@ after `ExitBootServices` by
    [`core/boot/src/dtb.rs::parse_aperture_seed`](../src/dtb.rs) for every
    firmware source that is present, and with the GOP framebuffer, which
    UEFI typically reports as `EfiReservedMemoryType` and only the bootloader can
-   carry past `ExitBootServices`.
+   carry past `ExitBootServices`. Seeds beyond the `MAX_APERTURE_SEEDS` (64)
+   seed buffer, the framebuffer seed included, are dropped without a diagnostic.
 3. Sort by `phys_base`.
 4. Merge adjacent and overlapping entries into a minimal non-overlapping
    list.
 5. Cap at `MAX_APERTURES` (16, [`abi/boot-protocol`](../../../abi/boot-protocol/src/lib.rs));
-   surplus, and any entry collected in steps 1–2 beyond the `MAX_APERTURES` × 4
-   scratch buffer, is dropped with a diagnostic.
+   surplus, and any entry collected in steps 1–2 beyond the
+   `derive_mmio_apertures` scratch buffer (`MAX_APERTURES` × 4), is dropped with a
+   diagnostic.
 
 The UEFI memory map on every currently-targeted host is the primary
 source; firmware-table seeds cover the regions the UEFI map often

@@ -67,8 +67,8 @@ rather than proceed with a mismatched structure (see
 | Stack | Valid; at least 64 KiB available |
 | `rdi` | Physical address of `BootInfo` structure |
 | Floating point | Not initialised; kernel must not use SSE/AVX before enabling |
-| GDT | The UEFI firmware's GDT, left loaded by the bootloader (which installs none); kernel replaces it during early initialisation ([initialization.md](../../kernel/docs/initialization.md) §"Phase 5: Architecture Hardware Initialisation") |
-| IDT | Not installed by the bootloader: IDTR still references the UEFI firmware's table, which the kernel must not rely on; interrupts must remain disabled until the kernel installs its own |
+| GDT | UEFI firmware's (bootloader installs none); kernel replaces it in Phase 5 |
+| IDT | Firmware's IDTR; not to be relied on; interrupts stay disabled until the kernel installs its own |
 
 ### RISC-V (RV64IMAC, soft-float)
 
@@ -98,12 +98,13 @@ handoff stack, the BootInfo pointer is loaded into the first-argument register, 
 flags are established per the contract above, and control transfers to `kernel_entry` via an
 unconditional jump that does not return.
 
-The UEFI firmware's GDT (x86-64), which the bootloader leaves loaded, remains active at
-entry; the kernel
-replaces it in Phase 5 (see [initialization.md](../../kernel/docs/initialization.md)
-§ Phase 5). The kernel replaces the bootloader's root page table in Phase 3
-([initialization.md](../../kernel/docs/initialization.md) § Phase 3); for ASID use
-after handoff see [page-tables.md](page-tables.md) § Activation and
+The UEFI firmware's GDT (x86-64), which the bootloader leaves loaded because it installs none,
+remains active at entry; the kernel replaces it in Phase 5 (see
+[initialization.md](../../kernel/docs/initialization.md) § Phase 5). IDTR likewise still references
+the firmware's IDT, which the kernel must not rely on; interrupts stay disabled until the kernel
+installs its own. The kernel replaces the bootloader's root page table in Phase 3
+([initialization.md](../../kernel/docs/initialization.md) § Phase 3); for ASID use after handoff see
+[page-tables.md](page-tables.md) § Activation and
 [memory-internals.md](../../kernel/docs/memory-internals.md) § Context Switch TLB Handling.
 
 ---

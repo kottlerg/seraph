@@ -72,10 +72,10 @@ RISC-V platform targeted. Nodes that override these with different
 values are parsed as if the defaults applied; any resulting
 misinterpretation is bounded (the node's `reg` entries become garbage; a
 garbage first entry with non-zero size still becomes an `MmioAperture`
-seed and, for a PLIC or UART node, the corresponding `kernel_mmio`
-base). Full cell-inheritance support belongs to `devmgr` (design intent,
-not yet implemented: devmgr's DTB reader likewise assumes
-`#address-cells = 2` and `#size-cells = 2`).
+seed, and for a PLIC or UART node the garbage first entry becomes the
+corresponding `kernel_mmio` base). Full cell-inheritance support belongs
+to `devmgr` (design intent, not yet implemented: devmgr's DTB reader
+likewise assumes `#address-cells = 2` and `#size-cells = 2`).
 
 Walker limits: `MAX_DEPTH = 8` for node nesting, `MAX_REG_ENTRIES = 8`
 for `reg` tuples per node, `MAX_IRQ_ENTRIES = 4` for `interrupts`

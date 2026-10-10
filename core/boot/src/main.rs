@@ -342,7 +342,6 @@ unsafe fn boot_sequence(image: EfiHandle, st: *mut EfiSystemTable) -> Result<!, 
             &bundle_load,
             &kernel,
             &init,
-            &mods,
             ap_trampoline_phys,
         )?
     };
@@ -1041,14 +1040,13 @@ unsafe fn nokaslr_override(ctx: &UefiContext) -> KaslrOverride
 /// page tables, and install the handoff-trampoline mapping.
 ///
 /// # Safety
-/// `ctx.bs` must be valid pre-exit; all addresses in `kernel`, `init`, and
-/// `mods` must come from their respective `step3`/`step4*` outputs.
+/// `ctx.bs` must be valid pre-exit; all addresses in `kernel` and `init` must
+/// come from their respective `step3`/`step4*` outputs.
 unsafe fn step6_allocate_and_build_page_tables(
     ctx: &UefiContext,
     bundle: &BundleLoad,
     kernel: &KernelLoad,
     init: &InitLoad,
-    mods: &ModulesLoad,
     ap_trampoline_phys: u64,
 ) -> Result<(BootAllocations, arch::current::BootPageTable), BootError>
 {
@@ -1090,7 +1088,6 @@ unsafe fn step6_allocate_and_build_page_tables(
         bundle,
         kernel,
         init,
-        mods,
         &ctx.framebuffer,
         arch::current::uart_mmio_region(),
         &mut identity_regions,
@@ -1107,17 +1104,13 @@ unsafe fn step6_allocate_and_build_page_tables(
 /// Fill `out` with all physical regions that must be identity-mapped so the
 /// kernel can access them before establishing its own page tables. Returns
 /// the number of filled entries; silently caps at [`MAX_IDENTITY_REGIONS`].
-// Each used parameter names a distinct origin of an identity-mapped region
-// (kernel, init, bundle, framebuffer, UART, fixed allocations); `_mods` is
-// unused because module bodies lie inside the bundle mapping. Bundling them
-// further hides where a region came from.
-#[allow(clippy::too_many_arguments)]
+/// Module bodies lie inside the bundle mapping, so modules need no region of
+/// their own.
 fn collect_identity_regions(
     allocs: &BootAllocations,
     bundle: &BundleLoad,
     kernel: &KernelLoad,
     init: &InitLoad,
-    _mods: &ModulesLoad,
     framebuffer: &FramebufferInfo,
     uart_base: u64,
     out: &mut [(u64, u64); MAX_IDENTITY_REGIONS],
@@ -1145,6 +1138,10 @@ fn collect_identity_regions(
     push(allocs.stack_phys, (KERNEL_STACK_PAGES as u64) * 4096);
     // Init segments — segment bodies live in their own UEFI allocations,
     // produced by `load_init` against the bundle slice for the `init` entry.
+    // Each region spans `size` rounded up to whole pages from the page holding
+    // `phys_addr`, which carries the `p_vaddr` in-page offset; when that offset
+    // plus `size` crosses one more page boundary than `size` alone, the
+    // segment's last page is left unmapped (defect, #442).
     for i in 0..(init.image.segment_count as usize)
     {
         let seg = &init.image.segments[i];

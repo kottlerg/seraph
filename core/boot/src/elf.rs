@@ -15,8 +15,9 @@
 //!   its ELF-relative offset within the span, so kernel placement tolerates
 //!   any firmware memory layout.
 //! - For init: place segments at any available physical address while
-//!   preserving the in-page byte offset of `p_vaddr`, so the kernel can
-//!   identity-map a page without a second copy.
+//!   preserving the in-page byte offset of `p_vaddr`, so the kernel can map
+//!   each page at its virtual address onto the allocated frame without a
+//!   second copy.
 //! - Pre-parse init's segments into the [`InitImage`] ABI surface so the
 //!   kernel never needs an ELF parser.
 //!
@@ -448,7 +449,8 @@ pub unsafe fn relocate_kernel(
 /// without parsing the ELF itself.
 ///
 /// The in-page byte offset of `p_vaddr` is preserved in `phys_addr` so the
-/// kernel can identity-map a page without a second copy step:
+/// kernel can map each page at its virtual address onto the allocated frame
+/// without a second copy step:
 ///   `InitSegment.phys_addr = phys_base + (p_vaddr & 0xFFF)`
 ///   `InitSegment.virt_addr = p_vaddr`
 ///

@@ -645,10 +645,6 @@ impl Fdt
     /// where present, carry the same value), so a flat property scan without
     /// node tracking suffices. Accepts the spec's u32 cell and, defensively,
     /// a u64 encoding.
-    ///
-    /// Only called via [`parse_hart_caps`] from [`crate::arch::riscv64`]; on x86-64
-    /// the DTB parser is still compiled but no caller exists.
-    #[allow(dead_code)]
     pub fn timebase_frequency(&self) -> u64
     {
         let mut off: u32 = 0;
@@ -911,11 +907,10 @@ pub unsafe fn parse_cpu_count(dtb_addr: u64) -> (u32, [u32; MAX_CPUS])
 ///
 /// Returns `(0, 0)` if the DTB is invalid.
 ///
-/// Only called from [`crate::arch::riscv64`]; on x86-64 the DTB parser is still
-/// compiled but no caller exists.
-///
 /// # Safety
 /// `dtb_addr` must be the physical address of a valid, identity-mapped FDT.
+// dead_code: the only caller is core/boot/src/arch/riscv64/dtb_kernel_mmio.rs;
+// the module is compiled on every arch.
 #[allow(dead_code)]
 pub unsafe fn parse_hart_caps(dtb_addr: u64) -> (u64, u64)
 {
@@ -948,11 +943,10 @@ pub unsafe fn parse_hart_caps(dtb_addr: u64) -> (u64, u64)
 /// `None` when no CPU node advertises a recognized S-mode translation mode —
 /// the caller then probes from its own maximum downward.
 ///
-/// Only called from [`crate::arch::riscv64`]; on x86-64 the DTB parser is still
-/// compiled but no caller exists.
-///
 /// # Safety
 /// `dtb_addr` must be the physical address of a valid, identity-mapped FDT.
+// dead_code: the only caller is core/boot/src/arch/riscv64/paging.rs;
+// the module is compiled on every arch.
 #[allow(dead_code)]
 pub unsafe fn parse_boot_cpu_mmu_type(dtb_addr: u64, boot_hart_id: u64) -> Option<PagingMode>
 {

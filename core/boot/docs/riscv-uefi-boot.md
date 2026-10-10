@@ -156,7 +156,7 @@ consults at runtime. `ENTRY(_start)` selects the entry symbol. The script is the
 authoritative layout description; this section and the header-layout diagram above describe
 it.
 
-The key symbols exported by the linker script for use in `header.S`:
+The key symbols `header.S` uses; the linker script exports all but `pecoff_header_start`:
 
 | Symbol | Meaning |
 |---|---|
@@ -166,7 +166,7 @@ The key symbols exported by the linker script for use in `header.S`:
 | `_reloc_start` | Start of the `.reloc` section; base-relocation VirtualAddress |
 | `_reloc_end` | End of the `.reloc` section |
 | `_image_end` | End of the entire image; used for `SizeOfImage` |
-| `pecoff_header_start` | Byte 0 of the image. It is defined in `header.S` at the start of `.pecoff_header`, which the linker script places at 0, not exported by the linker script. Its runtime address equals the load bias |
+| `pecoff_header_start` | Byte 0 of the image; defined in `header.S` at the start of `.pecoff_header`, which the linker script places at 0. Its runtime address equals the load bias |
 
 ---
 

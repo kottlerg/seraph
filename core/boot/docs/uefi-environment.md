@@ -20,7 +20,7 @@ acquisition, `ExitBootServices`, and error handling.
 | `EFI_GET_MEMORY_MAP` | `BootServices->GetMemoryMap` | Query physical memory layout | Yes |
 | `EFI_ALLOCATE_PAGES` | `BootServices->AllocatePages` | Allocate physical memory for all loaded data | Yes |
 | `EFI_CONFIGURATION_TABLE` | `SystemTable->ConfigurationTable` | Locate the ACPI RSDP and/or Device Tree blob (both GUIDs searched on both architectures) | No (each table optional) |
-| `EFI_RNG_PROTOCOL` | `LocateProtocol` | Draw the 32-byte entropy-pool seed and an independent 16-byte KASLR word (step 5c) | No |
+| `EFI_RNG_PROTOCOL` | `LocateProtocol` | Draw the 32-byte entropy-pool seed and an independent 16-byte KASLR draw (two words; step 5c) | No |
 | `EFI_RISCV_BOOT_PROTOCOL` | `LocateProtocol` | Read the boot hart ID (RISC-V only; 0 when absent) | No |
 | All handles | `LocateHandleBuffer(AllHandles)` + `ConnectController` | Bind drivers (e.g. virtio-gpu to GOP) not auto-connected during BDS, before the GOP query | No |
 
@@ -76,8 +76,7 @@ bundle format itself is specified in
 ## Memory Allocation Strategy
 
 All bootloader-owned allocation before `ExitBootServices` goes through `AllocatePages`. Two
-allocation
-modes are used:
+allocation modes are used:
 
 **`AllocateAnyPages`** — the firmware selects a free physical page range. Used for
 everything whose absolute address does not matter: the bundle buffer (boot modules are
@@ -85,10 +84,9 @@ referenced in place inside it), the kernel file buffer and kernel image span, in
 segments, page-table frames (and, on RISC-V, the paging-mode probe root and the AP trampoline
 page), the `BootInfo` page, the module descriptor array, the `MemoryMapEntry` array, the
 `MmioAperture` array, the kernel stack, the reclaim-range array, and the memory map buffer.
-The kernel
-image is placed as one contiguous span and its base recorded in
-`BootInfo.kernel_physical_base`, so kernel placement tolerates any firmware memory
-layout; see [elf-loading.md](elf-loading.md) for the placement sequence.
+The kernel image is placed as one contiguous span and its base recorded in
+`BootInfo.kernel_physical_base`, so kernel placement tolerates any firmware memory layout; see
+[elf-loading.md](elf-loading.md) for the placement sequence.
 
 **`AllocateMaxAddress`** — the firmware selects a free range with a physical base at or
 below a bound. Used only by the x86-64 AP-startup trampoline, whose SIPI vector must
@@ -198,15 +196,19 @@ The bootloader performs no allocation-dependent operations after `ExitBootServic
 
 ## Error Handling Strategy
 
-Every `BootError` is fatal. A few optional resources degrade instead of failing: an absent
-GOP (headless), an absent or failing `EFI_RNG_PROTOCOL` (DTB `/chosen/rng-seed` fallback, else
-no seed and the deterministic layout), and a failed AP-trampoline allocation (logged as a
-warning). There is no recovery path for a `BootError`, no retry beyond the bounded
-`ExitBootServices` retry loop described above, and no fallback configuration.
+Every `BootError` that reaches `efi_main` is fatal. Two sites consume a `BootError` instead of
+returning it: a failed open of `\EFI\seraph\nokaslr` reads as an absent knob (step 5d), and a
+failed AP-trampoline allocation is logged as a warning (step 5b). Optional resources degrade
+instead of failing: an absent GOP leaves the system headless; an absent `EFI_RNG_PROTOCOL` or a
+failed pool draw falls back to the DTB `/chosen/rng-seed` (else no seed and the deterministic
+layout); and a failed KASLR draw after a successful pool draw, or a DTB seed under 24 bytes,
+keeps the pool seed and uses the deterministic layout. There is no recovery path for a
+`BootError`, no retry beyond the bounded `ExitBootServices` retry loop described above, and no
+fallback configuration.
 
 ### BootError Type
 
-Every fatal error is a `BootError`, returned as `Result<T, BootError>`,
+Every fatal error returned through `Result` is a `BootError` (`Result<T, BootError>`),
 defined in [`core/boot/src/error.rs`](../src/error.rs). The variant set covers
 protocol-location failure, UEFI status-code propagation, ESP file-not-found,
 ELF validation failure, W^X violation, allocation failure, `ExitBootServices`

@@ -46,6 +46,7 @@
 //! - `aspace_fault_notification_late_bind.rs` — an aspace terminal-fault observer bound after the space already faulted still receives the retained reason
 //! - `ipc_call_interrupted_stop_start.rs` — a client stopped while parked in `ipc_call` (send-queued and awaiting-reply) restarts to `Interrupted`, never a stale reply (#361)
 //! - `park_interrupted_stop_start.rs` — a thread stopped while parked in any non-call blocking syscall (notification/event/recv/wait-set/sleep) restarts to `Interrupted`, never a stale deposit (#363)
+//! - `syscall_rflags_hardening.rs` — (x86-64) user-set DF and TF and a reloaded user GS base do not reach the kernel across a SYSCALL
 
 pub mod aspace_fault_notification_late_bind;
 pub mod cap_delegation_chain;
@@ -72,6 +73,8 @@ pub mod retype_reclaim;
 pub mod retype_subpage_clobber;
 pub mod sbi_gating;
 pub mod shared_memory_two_aspaces;
+#[cfg(target_arch = "x86_64")]
+pub mod syscall_rflags_hardening;
 pub mod thread_lifecycle;
 pub mod tlb_coherency;
 pub mod tlb_widen_retry;
@@ -119,6 +122,11 @@ pub fn run_all(ctx: &TestContext)
         cap_delegation_chain::run(ctx)
     );
     run_integration_test!("integration::sbi_gating", sbi_gating::run(ctx));
+    #[cfg(target_arch = "x86_64")]
+    run_integration_test!(
+        "integration::syscall_rflags_hardening",
+        syscall_rflags_hardening::run(ctx)
+    );
     run_integration_test!("integration::tlb_coherency", tlb_coherency::run(ctx));
     run_integration_test!("integration::retype_reclaim", retype_reclaim::run(ctx));
     run_integration_test!(

@@ -13,15 +13,25 @@
 //!     - bits [63:48] = 0x0010: SYSRET64 gives CS=(0x10+16)|3=0x23 (user),
 //!       SS=(0x10+8)|3=0x1B (user DS).
 //! - `IA32_LSTAR` — 64-bit entry point (`syscall_entry`).
-//! - `IA32_SFMASK` — clears RFLAGS.IF on entry.
+//! - `IA32_SFMASK` — clears RFLAGS IF, TF, DF, AC, NT and IOPL on entry.
 //!
 //! ## Entry contract
-//! On SYSCALL: hardware saves RIP→RCX, RFLAGS→R11, applies SFMASK.
-//! RSP and segment registers are NOT changed by the hardware.
+//! On SYSCALL: hardware saves RIP→RCX, RFLAGS→R11, and clears the RFLAGS bits
+//! in SFMASK, so the kernel runs with IF, TF, DF and AC clear whatever the user
+//! set (AC clear keeps SMAP enforced; DF clear is the string-instruction
+//! direction `copy_user` relies on). RSP and segment registers are NOT changed
+//! by the hardware.
 //!
-//! We save R11 (user RFLAGS) to `SYSCALL_SCRATCH` immediately, use R11 to
-//! shuttle user RSP to `SYSCALL_USER_RSP`, switch to `SYSCALL_KERNEL_RSP`,
-//! then rebuild R11 from the scratch before saving the full `TrapFrame.`
+//! The stub's first instruction is `swapgs`: while user code runs, the per-CPU
+//! pointer lives in `IA32_KERNEL_GS_BASE` and the active GS base is the user's,
+//! which a ring-3 segment load can change. After the swap the kernel's per-CPU
+//! base is active, and the exit path swaps back (with interrupts disabled)
+//! immediately before `sysretq`.
+//!
+//! We save R11 (user RFLAGS) to `PerCpuData::scratch` (`gs:[24]`) immediately,
+//! use R11 to shuttle user RSP to `PerCpuData::user_rsp` (`gs:[16]`), switch to
+//! `PerCpuData::kernel_rsp` (`gs:[8]`), then rebuild R11 from the scratch slot
+//! before saving the full `TrapFrame`.
 //!
 //! ## Per-CPU layout (`PerCpuData` GS-relative offsets)
 //! - `gs:[8]`  (`PERCPU_KERNEL_RSP_OFFSET`) — kernel RSP loaded at entry
@@ -39,7 +49,18 @@ const IA32_LSTAR: u32 = 0xC000_0082;
 const IA32_SFMASK: u32 = 0xC000_0084;
 
 const EFER_SCE: u64 = 1 << 0;
-const SFMASK_CLEAR_IF: u64 = 1 << 9;
+
+const RFLAGS_TF: u64 = 1 << 8;
+const RFLAGS_IF: u64 = 1 << 9;
+const RFLAGS_DF: u64 = 1 << 10;
+const RFLAGS_IOPL: u64 = 3 << 12;
+const RFLAGS_NT: u64 = 1 << 14;
+const RFLAGS_AC: u64 = 1 << 18;
+
+/// RFLAGS bits SYSCALL clears on entry: interrupts stay off until the kernel
+/// enables them, and no user-set trap, direction, alignment-check (SMAP
+/// override), nested-task or I/O-privilege bit reaches ring 0.
+const SFMASK_VALUE: u64 = RFLAGS_IF | RFLAGS_TF | RFLAGS_DF | RFLAGS_AC | RFLAGS_NT | RFLAGS_IOPL;
 
 /// STAR value:
 /// - bits [47:32] = 0x0008: SYSCALL → CS=0x08 (kernel), SS=0x10.
@@ -79,13 +100,15 @@ pub unsafe fn set_kernel_rsp(rsp: u64)
 ///
 /// On SYSCALL hardware saves: RIP→RCX, RFLAGS→R11. Does NOT change RSP.
 /// This stub:
+/// 0. Swaps to the kernel GS base (`swapgs`).
 /// 1. Saves R11 (user RFLAGS) to `gs:[24]` (`PerCpuData::scratch`).
 /// 2. Saves user RSP (via R11) to `gs:[16]` (`PerCpuData::user_rsp`).
 /// 3. Switches to `gs:[8]` (`PerCpuData::kernel_rsp`).
 /// 4. Allocates a 168-byte [`TrapFrame`] on the kernel stack.
 /// 5. Saves all GPRs and CPU-state fields into the frame.
 /// 6. Calls `crate::syscall::dispatch`.
-/// 7. Restores registers and executes `sysretq`.
+/// 7. Restores registers, disables interrupts, swaps back to the user GS base,
+///    and executes `sysretq`.
 ///
 /// GS-base must point to a valid `PerCpuData` (installed by `percpu::init_bsp`
 /// in Phase 5) before any user thread executes a SYSCALL.
@@ -100,7 +123,8 @@ unsafe extern "C" fn syscall_entry()
     //
     // PerCpuData GS offsets: kernel_rsp=gs:[8], user_rsp=gs:[16], scratch=gs:[24]
     core::arch::naked_asm!(
-        // ── Phase 1: stack switch (use R11 as scratch, restore later) ─────
+        // ── Phase 1: kernel GS base, then stack switch ────────────────────
+        "swapgs",
         // Save user RFLAGS (R11) to PerCpuData::scratch before repurposing R11.
         "mov gs:[24], r11",
         // Use R11 to carry user RSP to PerCpuData::user_rsp, then switch stacks.
@@ -160,7 +184,11 @@ unsafe extern "C" fn syscall_entry()
         "mov r15, [rsp + 112]",
         // Switch to user RSP last (TrapFrame still on kernel stack until here).
         "mov rsp, [rsp + 136]",     // rsp = user RSP
-
+        // No interrupt may arrive between the swap and sysretq: its stub would
+        // see a ring-0 frame and run on the user GS base. sysretq restores the
+        // user's IF from R11.
+        "cli",
+        "swapgs",
         "sysretq",
 
         dispatch = sym crate::syscall::dispatch,
@@ -184,7 +212,7 @@ pub unsafe fn init()
         cpu::write_msr(IA32_EFER, efer | EFER_SCE);
         cpu::write_msr(IA32_STAR, STAR_VALUE);
         cpu::write_msr(IA32_LSTAR, syscall_entry as *const () as u64);
-        cpu::write_msr(IA32_SFMASK, SFMASK_CLEAR_IF);
+        cpu::write_msr(IA32_SFMASK, SFMASK_VALUE);
     }
 }
 
@@ -213,9 +241,10 @@ mod tests
     }
 
     #[test]
-    fn sfmask_clears_if_only()
+    fn sfmask_clears_every_user_controlled_privileged_flag()
     {
-        assert_eq!(SFMASK_CLEAR_IF, 1 << 9);
+        // IF (9), TF (8), DF (10), AC (18), NT (14), IOPL (12-13).
+        assert_eq!(SFMASK_VALUE, 0x0004_7700);
     }
 
     #[test]

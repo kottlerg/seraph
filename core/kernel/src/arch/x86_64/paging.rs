@@ -684,6 +684,12 @@ fn user_walk_or_alloc_pooled(
     Ok(frame_pa)
 }
 
+/// Whether a per-VA invalidation ([`flush_page`], [`inval_page`]) also drops the
+/// paging-structure-cache entries that name a freed intermediate table. True on
+/// x86-64: `invlpg` invalidates every paging-structure-cache entry of the current
+/// PCID.
+pub const VA_INVAL_DROPS_TABLE_CACHES: bool = true;
+
 /// Flush the TLB entry for a single page at `virt` using `invlpg`.
 ///
 /// Must be called after modifying or clearing a leaf PTE so the CPU stops

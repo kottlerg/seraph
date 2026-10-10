@@ -866,6 +866,13 @@ fn rv_walk_or_alloc_pooled(
     Ok(frame_pa)
 }
 
+/// Whether a per-VA invalidation ([`flush_page`], [`inval_page`]) also drops the
+/// cached non-leaf entries that name a freed intermediate table. False on
+/// RISC-V: an `sfence.vma`/`sinval.vma` with `rs1 != x0` is only required to
+/// invalidate leaf entries for that address, so freeing a table frame needs an
+/// `rs1 = x0` fence.
+pub const VA_INVAL_DROPS_TABLE_CACHES: bool = false;
+
 /// Flush the TLB entry for a single virtual address using `sfence.vma addr`.
 ///
 /// # Safety

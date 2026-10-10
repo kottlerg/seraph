@@ -1871,11 +1871,18 @@ pub fn sleep_check_wakeups()
 
             _ =>
             {
-                // Plain sleep — the timer is the only waker (reachable only for
-                // ipc_state None; the IPC-bound states have explicit arms above).
-                // We claimed it under SLEEP_LIST_LOCK at pop (wake_in_flight = 1),
+                // Plain sleep — the timer is the only waker. Reachable for
+                // ipc_state None, and also for the endpoint and wait-set
+                // snapshots (BlockedOnSend, BlockedOnRecv, BlockedOnWaitSet), which
+                // have no explicit arm above, popped via the #443 stale plain-sleep
+                // entry, core/kernel/docs/thread-lifecycle-and-sleep.md. For None
+                // we claimed it under SLEEP_LIST_LOCK at pop (wake_in_flight = 1),
                 // so a concurrent dealloc(tcb) is gated and tcb is still valid.
-                // SAFETY: tcb valid per the wake-in-flight claim at pop.
+                // The stale-entry endpoint and wait-set snapshots carry no
+                // pop-time wake_in_flight pin, so that premise does not hold for
+                // them (#443).
+                // SAFETY: tcb valid per the wake-in-flight claim at pop, except
+                // for the #443 stale-entry snapshots noted above.
                 unsafe {
                     (*tcb).sleep_deadline = 0;
                 }
@@ -1888,7 +1895,9 @@ pub fn sleep_check_wakeups()
             // SAFETY: tcb is kept valid by wake_in_flight = 1 (set at the claim
             // above — at pop for plain sleep, under the source lock for the IPC
             // arms, or at block entry for reply/fault), so a concurrent
-            // dealloc(tcb) waits at its gate rather than freeing it.
+            // dealloc(tcb) waits at its gate rather than freeing it; except for
+            // the unpinned `_`-arm snapshots of the #443 stale plain-sleep entry
+            // noted above.
             // enqueue_and_wake reads state under sched_lock and either links a
             // still-Blocked thread or, if dealloc already marked it Exited, aborts
             // the link — both clear wake_in_flight, releasing that gate.
@@ -4005,8 +4014,10 @@ pub unsafe fn enqueue_and_wake(tcb: *mut ThreadControlBlock, target_cpu: usize)
         // Live (executing): mid-park or a duplicate of a consumed wake. Record
         // the wake under sched_lock so commit_blocked refuses to park and the
         // resume path delivers the already-deposited payload
-        // (core/kernel/docs/sched-ipc-redesign.md § 2.1); coalesce — never link a
-        // live thread (the dispatcher holds this same lock to mark it Running).
+        // (core/kernel/docs/sched-ipc-redesign.md § 2.1), except via the #443
+        // stale plain-sleep entry, core/kernel/docs/thread-lifecycle-and-sleep.md;
+        // coalesce — never link a live thread (the dispatcher holds this same
+        // lock to mark it Running).
         thread::ThreadState::Running =>
         {
             // SAFETY: wake_pending / wake_in_flight written under sched_lock.

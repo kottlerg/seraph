@@ -446,9 +446,9 @@ const MAX_VLENB: u64 = 64;
 
 /// Return the cached `vlenb`. Returns 0 only before [`cache_vlenb`] runs at
 /// boot; a hart without V halts in [`cache_vlenb`].
-// dead_code: `vlenb` is read only by the non-test `lazy_restore_fp_v`; the `#[cfg(test)]` stub
-// of `lazy_restore_fp_v` does not reference it.
-#[allow(dead_code)]
+// dead_code fires only under `test`: `vlenb` is read only by the non-test `lazy_restore_fp_v`;
+// the `#[cfg(test)]` stub of `lazy_restore_fp_v` does not reference it.
+#[cfg_attr(test, allow(dead_code))]
 pub fn vlenb() -> u64
 {
     VLENB.load(core::sync::atomic::Ordering::Relaxed)

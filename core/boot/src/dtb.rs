@@ -50,9 +50,9 @@ const FDT_BEGIN_NODE: u32 = 1;
 const FDT_END_NODE: u32 = 2;
 const FDT_PROP: u32 = 3;
 const FDT_NOP: u32 = 4;
-// FDT_END is named only by the test FdtBuilder; the walkers reach it, like any unknown token,
-// through the `_ => break` arm.
-#[allow(dead_code)]
+// `FDT_END` is named only by the test `FdtBuilder`, so `dead_code` fires only in non-test
+// builds; the walkers reach it, like any unknown token, through the `_ => break` arm.
+#[cfg_attr(not(test), allow(dead_code))]
 const FDT_END: u32 = 9;
 
 /// Maximum FDT node nesting depth supported by the walker.

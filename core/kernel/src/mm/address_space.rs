@@ -204,23 +204,23 @@ pub struct AddressSpace
     /// (by the owner's own claim or by eviction); read lock-free by `activate`.
     // dead_code: the tag fields are accessed only on `#[cfg(not(test))]` paths
     // (activate / shootdown / destroy), so host-test builds see them as unread.
-    #[allow(dead_code)]
+    #[cfg_attr(test, allow(dead_code))]
     pub(crate) tag: AtomicU16,
     /// The global allocator generation stamped when this space claimed its
     /// current `tag`. Globally unique per claim; distinguishes this space's
     /// claim on a tag from any later space that reuses the same tag value, so a
     /// per-CPU generation check flushes a tag before its first use under a new
     /// owner.
-    // dead_code: like `tag`, read only on `#[cfg(not(test))]` paths.
-    #[allow(dead_code)]
+    // dead_code: like `tag`, read only on `#[cfg(not(test))]` paths; unread in host-test builds.
+    #[cfg_attr(test, allow(dead_code))]
     pub(crate) tag_gen: AtomicU64,
     /// Bumped (when tagging is enabled) on every Replace-class modification
     /// (unmap, remap to a different frame, permission narrow).
     /// A CPU switched away from this space compares its last-synced value
     /// against this on reactivation and flushes the tag if it lags, catching
     /// unmaps it missed while it was elsewhere.
-    // dead_code: like `tag`, read only on `#[cfg(not(test))]` paths.
-    #[allow(dead_code)]
+    // dead_code: like `tag`, read only on `#[cfg(not(test))]` paths; unread in host-test builds.
+    #[cfg_attr(test, allow(dead_code))]
     pub(crate) tlb_gen: AtomicU64,
     /// Observers to notify when a thread in this address space takes a
     /// terminal fault, each pairing an `EventQueueState` post target with a

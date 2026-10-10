@@ -417,7 +417,7 @@ entire bitmask (see [ipc-design.md](../../../docs/ipc-design.md) § Notification
 | # | Name | Description |
 |---|---|---|
 | 0 | `notification_cap` | Notification capability with Wait rights |
-| 1 | `timeout_ms` | `0` = block indefinitely; `>0` = return with a zero bitmask once `timeout_ms` ms have elapsed (at timer-tick granularity); if the kernel sleep list is full (`MAX_SLEEPING` entries), the timeout is dropped and the wait is indefinite |
+| 1 | `timeout_ms` | `0` = block indefinitely, except through the stale plain-sleep entry ([#443](https://github.com/kottlerg/seraph/issues/443); see [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § `sys_thread_sleep` and the Plain-Sleep Path); `>0` = return with a zero bitmask once `timeout_ms` ms have elapsed (at timer-tick granularity); if the kernel sleep list is full (`MAX_SLEEPING` entries), the timeout is dropped and the wait is indefinite |
 
 **Return:**
 

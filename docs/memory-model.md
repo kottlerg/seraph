@@ -204,10 +204,11 @@ Access Prevention) are required by the platform baseline
 ([platform-requirements.md](platform-requirements.md)) and enabled unconditionally. SMEP
 prevents the kernel from executing userspace pages; SMAP prevents the kernel from reading or
 writing userspace memory except through designated safe copy routines. Together these
-mitigate a class of privilege escalation exploits. SMAP enforcement has one gap: `IA32_SFMASK`
-does not clear RFLAGS.AC and the syscall entry stub runs no `clac`, so a user-set AC leaves
-SMAP unenforced for explicit kernel accesses until the first user copy clears it (a defect,
-[#443](https://github.com/kottlerg/seraph/issues/443)).
+mitigate a class of privilege escalation exploits. SMAP enforcement has a gap at every ring-3
+kernel entry: on SYSCALL, `IA32_SFMASK` does not clear RFLAGS.AC and the syscall entry stub
+runs no `clac`; on an interrupt or exception taken from ring 3, delivery does not clear AC and
+the IDT entry stubs run no `clac`. A user-set AC therefore leaves SMAP unenforced for explicit
+kernel accesses (a defect, [#443](https://github.com/kottlerg/seraph/issues/443)).
 
 On RISC-V, S-mode can never execute from user (U=1) pages, and the kernel keeps
 `sstatus.SUM` clear except inside its user-copy routines, so supervisor loads and stores

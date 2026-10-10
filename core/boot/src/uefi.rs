@@ -192,15 +192,18 @@ pub const EFI_LOADER_CODE: u32 = 1;
 pub const EFI_BOOT_SERVICES_CODE: u32 = 3;
 pub const EFI_BOOT_SERVICES_DATA: u32 = 4;
 // Defined for completeness; the translation maps these types through its
-// wildcard `Reserved` arm, and only the memory_map host tests name them.
-#[allow(dead_code)]
+// wildcard `Reserved` arm, and only the memory_map host tests name them, so
+// `dead_code` fires only in non-test builds.
+#[cfg_attr(not(test), allow(dead_code))]
 pub const EFI_RUNTIME_SERVICES_CODE: u32 = 5;
-// Defined for completeness; named only by the memory_map host tests.
-#[allow(dead_code)]
+// Defined for completeness; named only by the memory_map host tests, so
+// `dead_code` fires only in non-test builds.
+#[cfg_attr(not(test), allow(dead_code))]
 pub const EFI_RUNTIME_SERVICES_DATA: u32 = 6;
 pub const EFI_ACPI_RECLAIM_MEMORY: u32 = 9;
-// Defined for completeness; named only by the memory_map host tests.
-#[allow(dead_code)]
+// Defined for completeness; named only by the memory_map host tests, so
+// `dead_code` fires only in non-test builds.
+#[cfg_attr(not(test), allow(dead_code))]
 pub const EFI_ACPI_MEMORY_NVS: u32 = 10;
 pub const EFI_MEMORY_MAPPED_IO: u32 = 11;
 pub const EFI_MEMORY_MAPPED_IO_PORT_SPACE: u32 = 12;

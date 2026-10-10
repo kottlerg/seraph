@@ -121,8 +121,9 @@ impl DerivationLock
     /// lock, and lock-free readers resolve one slot by handle without
     /// traversing the tree (core/kernel/docs/capability-internals.md § Global
     /// Derivation Lock).
-    // Only the host tests take the read side; no kernel path does.
-    #[allow(dead_code)]
+    // dead_code: only the host tests take the read side and no kernel path
+    // does, so the lint fires in non-test kernel builds alone.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn read_lock(&self)
     {
         loop
@@ -142,8 +143,9 @@ impl DerivationLock
     }
 
     /// Release a shared read lock previously acquired with [`read_lock`].
-    // Only the host tests take the read side; no kernel path does.
-    #[allow(dead_code)]
+    // dead_code: only the host tests take the read side and no kernel path
+    // does, so the lint fires in non-test kernel builds alone.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn read_unlock(&self)
     {
         self.state.fetch_sub(1, Ordering::Release);

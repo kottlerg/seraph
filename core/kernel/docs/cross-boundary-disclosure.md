@@ -6,8 +6,10 @@ escapes to userspace — a prerequisite for kernel address-space layout
 randomization (KASLR). Known open disclosures: the x86-64 fault-message present
 bit ([#443](https://github.com/kottlerg/seraph/issues/443)), the unpinned
 `SYS_THREAD_READ_REGS` trap-frame copy under a concurrent last-cap delete
-([#443](https://github.com/kottlerg/seraph/issues/443)), kernel state in donated
-memory that the donor can still map ([#433](https://github.com/kottlerg/seraph/issues/433)),
+([#443](https://github.com/kottlerg/seraph/issues/443)), the x86-64 `#DB` exception frame, which
+carries a kernel RIP, pushed to user memory when ring 3 enters SYSCALL with RFLAGS.TF and AC
+set ([#443](https://github.com/kottlerg/seraph/issues/443)), kernel state in donated memory that the
+donor can still map ([#433](https://github.com/kottlerg/seraph/issues/433)),
 mirrored console diagnostics ([#440](https://github.com/kottlerg/seraph/issues/440)), and
 unzeroed bootloader frames ([#439](https://github.com/kottlerg/seraph/issues/439)).
 
@@ -36,11 +38,14 @@ distinct, narrower concern handled in "Physical-address surfaces" below.
 Each surface is classified as one of:
 
 - **(a) kernel VA / pointer** — a kernel virtual address, kernel pointer, or value
-  derived from one. A leak. **Two found** among emitted values: the x86-64
-  fault-message `d2` present bit and the unpinned `SYS_THREAD_READ_REGS` trap-frame
+  derived from one. A leak. **Three found** among emitted values: the x86-64
+  fault-message `d2` present bit, the unpinned `SYS_THREAD_READ_REGS` trap-frame
   copy, which can hand freed or reused kernel memory to the caller (see the
-  fault-message note below; [#443](https://github.com/kottlerg/seraph/issues/443));
-  kernel state kept in donated memory is a separate surface, below.
+  fault-message note below), and the x86-64 `#DB` exception frame, with its kernel
+  RIP, that a SYSCALL entered with RFLAGS.TF and AC set pushes to user memory (see
+  `core/kernel/src/arch/x86_64/syscall.rs` § Entry contract)
+  ([#443](https://github.com/kottlerg/seraph/issues/443)); kernel state kept in donated memory is a
+  separate surface, below.
 - **(b) userspace VA** — an address in the caller's own (or a delegate's) address
   space. The caller already owns it; not a disclosure.
 - **(c) opaque / randomized** — a kernel-minted identifier that is unguessable

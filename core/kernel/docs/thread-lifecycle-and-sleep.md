@@ -104,15 +104,20 @@ claims against concurrent IPC sources via the relevant source IPC lock (Notifica
      [`sys_thread_sleep` and the Plain-Sleep Path](#sys_thread_sleep-and-the-plain-sleep-path))):
      `compare_exchange` the server/handler `reply_tcb` from `tcb` to null; claim iff won.
      Forecloses a future timeout surface letting the `default` arm mis-claim a reply/fault waiter
-     and race a concurrent reply/cancel into a double-wake. `BlockedOnFault` additionally records
-     `fault_outcome = Kill` on a win (a timeout is a cancellation).
+     and race a concurrent reply/cancel into a double-wake, except through the stale plain-sleep
+     entry ([#443](https://github.com/kottlerg/seraph/issues/443); see
+     [`sys_thread_sleep` and the Plain-Sleep Path](#sys_thread_sleep-and-the-plain-sleep-path)).
+     `BlockedOnFault` additionally records `fault_outcome = Kill` on a win (a timeout is a
+     cancellation).
    - default (plain sleep, `None`): claim unconditionally; no concurrent waker, except through the
      stale plain-sleep entry ([#443](https://github.com/kottlerg/seraph/issues/443); see
      [`sys_thread_sleep` and the Plain-Sleep Path](#sys_thread_sleep-and-the-plain-sleep-path)).
 
    The snapshot is read without the source lock; the `waiter == tcb` (or `reply_tcb` CAS) check
    under the source lock / on the atomic is the authoritative arbitration (stale snapshot = benign
-   skip).
+   skip, except through the stale plain-sleep entry
+   ([#443](https://github.com/kottlerg/seraph/issues/443); see
+   [`sys_thread_sleep` and the Plain-Sleep Path](#sys_thread_sleep-and-the-plain-sleep-path))).
 
 7. **Wake-side `sleep_list_remove` MUST be inside the source IPC lock and MUST precede clearing
    `sleep_deadline = 0`** (the #117 order: clearing first leaves an entry whose
@@ -317,7 +322,8 @@ stated explicitly.
     Done after the step-11 unlink so the endpoint dealloc cannot observe this
     thread still on its send queue.
 14. sleep_list_remove(tcb) (outside the all-locks region; a timer that already
-    popped the entry set wake_in_flight = 1 at pop).
+    popped the entry set wake_in_flight = 1 at pop, except via the #443 stale
+    plain-sleep entry; see the Plain-Sleep Path below).
 15. Wake-in-flight gate (#160): spin until tcb.wake_in_flight.load(Acquire) == 0,
     with preempt_disable and interrupts enabled as in the context_saved gate,
     so a waker's pending enqueue_and_wake (or a cancel/dealloc CAS win that
@@ -513,8 +519,11 @@ domains:
    plain-sleep entry ([#443](https://github.com/kottlerg/seraph/issues/443); see
    [`sys_thread_sleep` and the Plain-Sleep Path](#sys_thread_sleep-and-the-plain-sleep-path))),
    `compare_exchange(this_client, null, AcqRel, Acquire)`; on a `BlockedOnFault` win it records
-   `fault_outcome = Kill`. Defensive only — forecloses a future timeout surface racing a
-   reply/cancel.
+   `fault_outcome = Kill`. Defensive — forecloses a future timeout surface racing a reply/cancel
+   — except through the stale plain-sleep entry
+   ([#443](https://github.com/kottlerg/seraph/issues/443); see
+   [`sys_thread_sleep` and the Plain-Sleep Path](#sys_thread_sleep-and-the-plain-sleep-path)),
+   which reaches this CAS without actor 4's client-`sched_lock` re-read of `blocked_on_object`.
 8. **Server on the `SYS_IPC_REPLY` failure path via `fail_reply_and_wake_caller`** —
    `swap(null, AcqRel)` with no lock held. A non-null result is the episode claim: it deposits a
    synthetic `IPC_REPLY_TRANSFER_FAILED` reply and wakes the caller. A null result means no caller
@@ -637,10 +646,19 @@ Episodes.
    invariants 2 and 3 ([#443](https://github.com/kottlerg/seraph/issues/443)). A later BSP tick
    pops that entry, at the first tick at which the TCB's `sleep_deadline` is 0 or has expired.
    While the thread is still `Stopped`, the plain arm claims it and `enqueue_and_wake` coalesces
-   the claim. Once the thread has restarted, the pop may instead act on whatever park the thread
-   is in by then, through whichever `sleep_check_wakeups` arm the snapshotted `ipc_state` selects:
-   among other effects, a spurious wake, an `Interrupted` return, or a kill. #443 records the
-   arm-by-arm effects. A timer claim racing the cancel resolves to `Interrupted`
+   the claim. Once the thread has restarted, any `sleep_check_wakeups` arm may act on whatever
+   park or run state the thread is in by then, through whichever arm the snapshotted `ipc_state`
+   selects: among other effects, a spurious or premature wake, an `Interrupted` return, a kill, or
+   a recorded `wake_pending` on a `Running` thread that delivers no payload. A thread still
+   `Running` at the pop takes the plain arm, whose `enqueue_and_wake` records `wake_pending`; that
+   refuses the thread's next park unless a `schedule()` pass clears it first. A `Ready` thread
+   coalesces the claim silently. An endpoint or wait-set snapshot (`BlockedOnSend`,
+   `BlockedOnRecv`, `BlockedOnWaitSet`) falls through to the default arm with no pop-time
+   `wake_in_flight` pin, so its unconditional claim races both the source's waker and
+   `dealloc_object(Thread)`. A reply or fault snapshot reaches the `reply_tcb` CAS of Symmetry
+   actor 7 without the closure-lemma gate, so a server freed between the pop and the CAS is
+   dereferenced after free. #443 records the arm-by-arm effects and the use-after-free windows.
+   A timer claim racing the cancel resolves to `Interrupted`
    (honest for a sleep whose deadline elapsed concurrently with a stop). A stop that instead wins
    against the park commit (`ParkCommit::RefusedStop`) makes `sys_thread_sleep` deschedule in
    place and return `Interrupted` directly.

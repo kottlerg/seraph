@@ -32,9 +32,14 @@
 //! `copy_user` (`cpu.rs`), so a user copy writes or reads kernel memory below
 //! the kernel-side buffer. This is a known defect (#443).
 //!
-//! The `#DB` exception-frame push is an implicit supervisor access, which SMAP
-//! blocks whatever AC holds, so a TF-raised `#DB` taken on a user RSP faults to
-//! `#DF` rather than writing the frame to user memory (Intel SDM Vol. 3 § 4.6).
+//! The `#DB` exception-frame push at CPL 0 is an explicit supervisor-mode
+//! access (Intel SDM Vol. 3A § 4.6 counts only GDT, LDT, IDT and TSS accesses
+//! as implicit), so AC governs it. With a user-set AC and TF, SMAP does not
+//! block the push: the frame, which carries a kernel RIP, and the `#DB`
+//! handler's stack land in user memory. A user RSP holding a mapped kernel
+//! address takes no fault, and the push writes kernel memory. Only a
+//! non-canonical or unmapped RSP, or a user RSP with AC clear (SMAP-protected),
+//! faults to `#DF`. This is part of the same known defect (#443).
 //!
 //! The stub executes no `swapgs`: the kernel holds its per-CPU pointer in the
 //! GS base and never swaps it, so a ring-3 `mov gs` with the user selector

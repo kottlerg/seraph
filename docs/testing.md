@@ -424,7 +424,7 @@ documentation or comments only, and the pre-merge review's audit MUST check
 that against the diff.
 
 **Behaviour-neutral changes.** The local host runs above exercise what the
-built code does. Besides comment lines, only the kinds of change listed here
+built code does. Besides Markdown and comment lines, only the kinds of change listed here
 are behaviour-neutral, and only they leave a trigger path untouched:
 
 - adding, removing, or re-justifying a lint suppression (`#[allow(...)]`,
@@ -433,18 +433,21 @@ are behaviour-neutral, and only they leave a trigger path untouched:
   `cargo xtask test` runs);
 - the text of a log or diagnostic message that no harness marker and no
   `xtask` pattern (the `--fail` regex, a `test-*` command's match) matches;
-- deleting an item (function, constant, parameter) that nothing uses, which
-  the build on both architectures confirms: a remaining use fails to compile.
+- deleting a function, constant, type, or static that no Rust code, assembly,
+  or linker script references and that carries none of `#[no_mangle]`,
+  `#[used]`, `#[link_section]`, an `extern` ABI, or a trait-method role; a
+  remaining Rust use fails to compile on both architectures.
 
 Any other change on a trigger path, including a code change believed
 equivalent, counts as touching it
 and MUST run that path's local host runs. A behaviour-neutral delta is exempt
 only from this section's local host runs: it MUST still pass the baseline
-validation (`cargo xtask build`, then a `cargo xtask run` boot to the terminal
-pass marker, on both architectures) and the CI gate; a suppression change can
-fail the clippy build. The PR body MUST name each such change and state why no
-local host run is owed, and the pre-merge review's audit MUST check that
-against the diff.
+validation (`cargo xtask build`, then a `cargo xtask run` boot of ktest or a
+staged harness to its `[<harness>] ALL TESTS PASSED` marker, per
+[Reporting marker](#reporting-marker), on both architectures) and the CI gate;
+a suppression change can fail the clippy build. The PR body MUST name each
+such change and state why no local host run is owed, and the pre-merge
+review's audit MUST check that against the diff.
 
 **Known boundaries**, established empirically (QEMU 11.0.1; update this
 list as the tracking Issues move):

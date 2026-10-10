@@ -459,8 +459,13 @@ formatter behavior MUST:
 Blanket or module-wide suppressions are forbidden without explicit justification.
 
 A suppression whose lint fires only in some build configurations (for example host test
-builds, where an item's only callers are compiled out) is valid; its rationale names the
-configuration in which the lint fires.
+builds, where an item's only callers are compiled out) is permitted; its rationale MUST name
+the configuration in which the lint fires. Where § C permits that configuration's predicate
+(for example `test`), the suppression MUST be gated on it, either with
+`#[cfg_attr(<predicate>, allow(...))]` or by sitting on an item that is itself gated on the
+predicate. Where § C forbids the predicate at the site (a `target_arch` predicate outside an
+arch-module declaration site), an unconditional item-level suppression is the narrowest
+permitted form.
 
 ```rust
 // `capacity` is part of the public contract on all target architectures; the

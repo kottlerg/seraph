@@ -17,8 +17,9 @@ Closes #<issue>
 
 ## Validation
 <validated head; for a documentation-only or comment-only delta since it, say so; for each
-behaviour-neutral change on a trigger path (docs/testing.md § Coverage tiers), name it and why no
-local host run is owed>
+trigger path the diff touches (docs/testing.md § Coverage tiers), the local host runs made and the
+head they ran at; for each behaviour-neutral change on a trigger path, name it and why no local
+host run is owed>
 
 ## Notes
 <design tradeoffs; follow-ups filed as Issues; anything reviewers should see>

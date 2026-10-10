@@ -260,8 +260,10 @@ gives the PR-level linear view.
 - Edit via `gh pr edit <N> --body "$(cat <<'EOF' …EOF)"` or the web UI.
 - Every PR body MUST state the validated head in its `## Validation`
   section; for a documentation-only or comment-only delta since that head,
-  it MUST say so, and for a behaviour-neutral change on a trigger path it
-  MUST name each such change and state why no local host run is owed (see
+  it MUST say so; for each trigger path the diff touches it MUST report the
+  local host runs that path requires and the commit they ran at; and for a
+  behaviour-neutral change on a trigger path it MUST name each such change
+  and state why no local host run is owed (see
   [testing.md](testing.md#coverage-tiers)).
 
 ## CI Gating

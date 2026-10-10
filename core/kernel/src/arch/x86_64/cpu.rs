@@ -126,7 +126,8 @@ pub unsafe fn write_msr(msr: u32, val: u64)
 // inside the copy redirects to `__copy_user_fixup` (which executes `clac` and
 // returns a non-zero sentinel) instead of panicking. See `crate::uaccess` for
 // the typed `copy_to_user`/`copy_from_user` wrappers and `idt::page_fault_handler`
-// for the fixup hook. The DF=0 ABI invariant makes `rep movsb` copy forward.
+// for the fixup hook. The DF=0 ABI invariant makes `rep movsb` copy forward;
+// syscall entry does not establish it (a known defect, #443; see `syscall.rs`).
 #[cfg(not(test))]
 core::arch::global_asm!(
     ".section .text.copy_user, \"ax\"",

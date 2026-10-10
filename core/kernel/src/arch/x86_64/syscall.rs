@@ -20,15 +20,26 @@
 //!
 //! ## Entry contract
 //! On SYSCALL: hardware saves RIP→RCX, RFLAGS→R11, applies SFMASK.
-//! RSP and segment registers are NOT changed by the hardware.
+//! It loads CS and SS from STAR; RSP, DS, ES, FS and GS are NOT changed by the
+//! hardware.
 //!
 //! SFMASK masks only IF, so the user's RFLAGS.AC, TF, DF, NT and IOPL reach
 //! ring 0 unchanged, and the stub executes neither `clac` nor `cld`. A
 //! user-set AC leaves SMAP unenforced for explicit kernel accesses until the
 //! first `copy_user` clears it; a user-set TF raises `#DB` in ring 0 while the
 //! stub still runs on the user RSP (`#DB` has no IST); a user-set DF reverses
-//! compiler-generated string operations in kernel code. This is a known
-//! defect (#443).
+//! compiler-generated string operations in kernel code and the `rep movsb` in
+//! `copy_user` (`cpu.rs`), so a user copy writes or reads kernel memory below
+//! the kernel-side buffer. This is a known defect (#443).
+//!
+//! The `#DB` exception-frame push is an implicit supervisor access, which SMAP
+//! blocks whatever AC holds, so a TF-raised `#DB` taken on a user RSP faults to
+//! `#DF` rather than writing the frame to user memory (Intel SDM Vol. 3 § 4.6).
+//!
+//! The stub executes no `swapgs`: the kernel holds its per-CPU pointer in the
+//! GS base and never swaps it, so a ring-3 `mov gs` with the user selector
+//! reloads the GS base that the stub's `gs:[...]` accesses and every later
+//! per-CPU access use. This is a known defect (#443).
 //!
 //! We save R11 (user RFLAGS) to `PerCpuData::scratch` (`gs:[24]`) immediately,
 //! use R11 to shuttle user RSP to `PerCpuData::user_rsp` (`gs:[16]`), switch to
@@ -106,7 +117,8 @@ pub unsafe fn set_kernel_rsp(rsp: u64)
 /// see the module § Entry contract).
 ///
 /// GS-base must point to a valid `PerCpuData` (installed by `percpu::init_bsp`
-/// in Phase 5) before any user thread executes a SYSCALL.
+/// in Phase 5) before any user thread executes a SYSCALL. Ring 3 can reload
+/// it (a known defect, #443; see the module § Entry contract).
 #[cfg(not(test))]
 #[unsafe(naked)]
 unsafe extern "C" fn syscall_entry()

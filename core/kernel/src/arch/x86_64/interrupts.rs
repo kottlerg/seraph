@@ -680,7 +680,7 @@ pub unsafe fn enable()
 
 /// Return `true` if the interrupt flag (IF) is set in RFLAGS.
 // dead_code: sole caller sched::check_lock_hold_preemptible is cfg(not(test)); dead in host tests.
-#[allow(dead_code)]
+#[cfg_attr(test, allow(dead_code))]
 pub fn are_enabled() -> bool
 {
     let rflags: u64;

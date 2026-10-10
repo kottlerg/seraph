@@ -526,7 +526,7 @@ pub fn current_tick() -> u64
 // dead_code: every caller (in sched and syscall) is gated cfg(not(test)), so the
 // function has no caller when the kernel crate is compiled with cfg(test) for the
 // host unit tests that `cargo xtask test` runs.
-#[allow(dead_code)]
+#[cfg_attr(test, allow(dead_code))]
 pub fn ticks_per_second() -> u64
 {
     INTERRUPT_RATE.load(Ordering::Relaxed)

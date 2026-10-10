@@ -1758,7 +1758,9 @@ pub fn sleep_check_wakeups()
                 // `BlockedOnReply` TCB to the sleep list (the IPC
                 // call/recv path does not accept a timeout — see
                 // `sys_ipc_call` and `sys_ipc_recv` in
-                // `core/kernel/src/syscall/ipc.rs`). If a future timeout
+                // `core/kernel/src/syscall/ipc.rs`), except via the #443
+                // stale plain-sleep entry,
+                // core/kernel/docs/thread-lifecycle-and-sleep.md. If a future timeout
                 // surface is introduced, the `_` fall-through below
                 // would treat a `BlockedOnReply` waiter as a plain sleep
                 // and claim the wake unconditionally, racing with a
@@ -1772,11 +1774,18 @@ pub fn sleep_check_wakeups()
                 // success means we claim the wake, failure means the
                 // server/cancel/dealloc beat us. Lock order: SLEEP_LIST_LOCK
                 // was released above; this is a lock-free atomic.
+                //
+                // Defect (#443): the CAS holds no client `sched_lock` and does
+                // not re-read `blocked_on_object`, so it lacks the closure-lemma
+                // gate (scheduling-internals.md § Cross-CPU TCB Ownership), yet
+                // the #443 stale plain-sleep entry reaches this arm.
+                //
                 // cast_ptr_alignment suppressed for the same reason as the
                 // notification arm above.
                 #[allow(clippy::cast_ptr_alignment)]
                 let server = blocked_on.cast::<crate::sched::thread::ThreadControlBlock>();
-                // SAFETY: server is a valid TCB pointer; reply_tcb is AtomicPtr.
+                // SAFETY: server is a valid TCB pointer, except in the #443 gap
+                // noted above; reply_tcb is AtomicPtr.
                 let we_win = unsafe {
                     (*server)
                         .reply_tcb
@@ -1811,7 +1820,9 @@ pub fn sleep_check_wakeups()
             crate::sched::thread::IpcThreadState::BlockedOnFault if !blocked_on.is_null() =>
             {
                 // Defensive: fault delivery never arms the sleep list, so this
-                // arm is currently unreachable. It forecloses the same hazard the
+                // arm is currently unreachable, except via the #443 stale
+                // plain-sleep entry, core/kernel/docs/thread-lifecycle-and-sleep.md.
+                // It forecloses the same hazard the
                 // BlockedOnReply arm documents — were a fault-timeout surface ever
                 // added, the `_` fall-through would treat a BlockedOnFault waiter
                 // as a plain sleep and claim it unconditionally, racing a
@@ -1819,10 +1830,17 @@ pub fn sleep_check_wakeups()
                 // handler (server) TCB; CAS its reply_tcb the same way every other
                 // reply-side writer does; on win, a timeout is a cancellation, so
                 // mark the disposition Kill.
+                //
+                // Defect (#443): as in the BlockedOnReply arm, this CAS lacks the
+                // closure-lemma gate (no client `sched_lock`, no
+                // `blocked_on_object` re-read) and is reachable via the #443
+                // stale plain-sleep entry.
+                //
                 // cast_ptr_alignment suppressed as in the notification arm above.
                 #[allow(clippy::cast_ptr_alignment)]
                 let server = blocked_on.cast::<crate::sched::thread::ThreadControlBlock>();
-                // SAFETY: server is a valid TCB pointer; reply_tcb is AtomicPtr.
+                // SAFETY: server is a valid TCB pointer, except in the #443 gap
+                // noted above; reply_tcb is AtomicPtr.
                 let we_win = unsafe {
                     (*server)
                         .reply_tcb
@@ -4746,7 +4764,9 @@ pub unsafe fn schedule(requeue_current: bool)
                 // wake_pending so a stale flag can never survive into a later,
                 // unrelated commit_blocked (defensive — the `Running` coalesce
                 // that sets it is reached by the dying-server reply-bound wake in
-                // dealloc_object(Thread), which the caller's commit consumes; see
+                // dealloc_object(Thread), which the caller's commit consumes, and
+                // via the #443 stale plain-sleep entry,
+                // core/kernel/docs/thread-lifecycle-and-sleep.md; see
                 // core/kernel/docs/sched-ipc-redesign.md § 2.1).
                 let was_pending = (*next).wake_pending;
                 (*next).wake_pending = false;

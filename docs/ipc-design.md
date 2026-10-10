@@ -145,9 +145,11 @@ is otherwise O(1) and non-blocking.
 Events are not coalesced. "Process A exited, then process B exited" is preserved
 as two distinct entries in order.
 
-**Receipt:** The receiver waits on the queue and receives the next available entry.
-If multiple entries are available, subsequent receives return them in order without
-blocking.
+**Receipt:** The receiver waits on the queue and receives the next available entry, except
+through the stale plain-sleep entry ([#443](https://github.com/kottlerg/seraph/issues/443); see
+[thread-lifecycle-and-sleep.md](../core/kernel/docs/thread-lifecycle-and-sleep.md#sys_thread_sleep-and-the-plain-sleep-path)
+§ `sys_thread_sleep` and the Plain-Sleep Path). If multiple entries are available, subsequent
+receives return them in order without blocking.
 
 Event queues are appropriate for: process lifecycle events (exit, notification delivery),
 anything where ordering or count of events matters, and cases where coalescing would
@@ -182,8 +184,11 @@ resuming it, or killing it on `FAULT_REPLY_KILL` — or the binding is severed a
 is killed (severing by clearing the binding mid-fault: design intent; not yet implemented,
 #242). This reuses the call/reply machinery above — the suspended thread occupies the
 caller's role and the handler services it with the ordinary receive/reply cycle. The
-guarantee does not hold for a fault-blocked thread displaced by a later receive on its handler
-while its reply is still pending, as
+guarantee holds except through the stale plain-sleep entry
+([#443](https://github.com/kottlerg/seraph/issues/443); see
+[thread-lifecycle-and-sleep.md](../core/kernel/docs/thread-lifecycle-and-sleep.md#sys_thread_sleep-and-the-plain-sleep-path)
+§ `sys_thread_sleep` and the Plain-Sleep Path), and does not hold for a fault-blocked thread
+displaced by a later receive on its handler while its reply is still pending, as
 [§ The Call/Reply Model](#the-callreply-model) describes
 ([#443](https://github.com/kottlerg/seraph/issues/443)). See [Fault Handling](fault-handling.md).
 

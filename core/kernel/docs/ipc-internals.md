@@ -207,7 +207,7 @@ same `(*tcb).sched_lock`, which carries it to the refusing parker (see
 | `cancel_ipc_block` BlockedOnReply / BlockedOnFault arms | `reply_tcb` CAS | episode + INTERRUPTED / episode + KILL |
 | `cancel_ipc_block` BlockedOnSend arm | send-queue unlink win under `ep.lock` (a lost unlink hands the episode to the racing rebind chain) | episode + INTERRUPTED (faulter: episode + KILL; the faulter's KILL is written even when the unlink is lost, overwriting a racing handler's RESUME — a defect, #443) |
 | `dealloc_object(Thread)` reply-bound wake | `reply_tcb` CAS under all-CPU locks | episode + INTERRUPTED (faulter: episode + KILL) |
-| sleep-list timer BlockedOnReply / BlockedOnFault arms (defensive, unreachable today) | `reply_tcb` CAS | episode + INTERRUPTED / episode + KILL |
+| sleep-list timer BlockedOnReply / BlockedOnFault arms (defensive, unreachable today except through the stale plain-sleep entry ([#443](https://github.com/kottlerg/seraph/issues/443); see [thread-lifecycle-and-sleep.md § `sys_thread_sleep` and the Plain-Sleep Path](thread-lifecycle-and-sleep.md#sys_thread_sleep-and-the-plain-sleep-path))) | `reply_tcb` CAS | episode + INTERRUPTED / episode + KILL |
 | `endpoint_call` rendezvous commit-fail teardown | teardown `reply_tcb` CAS win | episode + INTERRUPTED / KILL — without it a legitimate stop→start resume has no deposit |
 | `endpoint_call` send-queue commit-fail teardown | `ep.lock` held continuously from link to unlink | episode + INTERRUPTED / KILL |
 | `endpoint_recv` rebind-fail teardown | teardown `reply_tcb` CAS win (stamped before the wake-in-flight release — a dying caller's dealloc may free the TCB after it) | episode + INTERRUPTED / KILL |

@@ -41,8 +41,11 @@ fn page_round_up(n: u64) -> u64
 }
 
 /// Physical `(base, size)` of the boot console UART that needs a dedicated
-/// `Mmio` capability minted at Phase 7. On RISC-V the `ns16550` UART sits outside
-/// the coarse aperture list, so it is surfaced here for init.
+/// `Mmio` capability minted at Phase 7. On RISC-V the `ns16550` UART is reported
+/// through `BootInfo.kernel_mmio` rather than the coarse aperture list; its range
+/// may also lie inside an aperture, in which case this cap overlaps an aperture
+/// cap. It is surfaced here so init's serial scan finds a dedicated `Mmio`
+/// descriptor for it.
 // unnecessary_wraps: the Option is part of the cross-arch contract — x86-64's
 // `console_mmio` returns None (its console is a legacy I/O-port UART).
 #[allow(clippy::unnecessary_wraps)]

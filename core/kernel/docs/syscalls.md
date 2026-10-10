@@ -377,11 +377,12 @@ passed to `SYS_THREAD_SET_FAULT_HANDLER`, not a derived-cap badge (see
 directory cannot supply `MSG_CAP_SLOTS_MAX` free slots), `OutOfMemory` (slot-page pool
 exhausted) — both checked before the receive parks, whether or not a message carries caps
 (see [ipc-design.md](../../../docs/ipc-design.md) § Receive-Failure Policy),
-`Interrupted`. If an already-queued sender's cap transfer is refused (a source
-slot went stale or is pinned by an in-flight `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, or IPC
-capability transfer), the message is
-still delivered — with zero caps; the sender keeps its capabilities (see
-[ipc-design.md](../../../docs/ipc-design.md) § Message Format).
+`Interrupted`. If an already-queued sender's cap transfer is refused (a source slot went stale
+or is pinned by an in-flight `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, or IPC capability transfer, or
+the server's CSpace cannot supply the destination slots, which the pre-park grow makes unlikely
+but does not reserve), the message is still delivered — with zero caps; the sender keeps its
+capabilities (see [ipc-design.md](../../../docs/ipc-design.md) § Message Format and
+§ Receive-Failure Policy).
 
 ---
 
@@ -473,7 +474,7 @@ is specific to `SYS_EVENT_RECV`):
 
 | Value             | Behaviour                                                       |
 |-------------------|-----------------------------------------------------------------|
-| `0`               | Block forever until a post arrives                              |
+| `0`               | Block forever until a post arrives, except through the stale plain-sleep entry ([#443](https://github.com/kottlerg/seraph/issues/443); see [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § `sys_thread_sleep` and the Plain-Sleep Path) |
 | `u64::MAX`        | Non-blocking try-once; return `WouldBlock` if empty             |
 | `1 ..= MAX-1`     | Block until post arrives or `timeout_ms` ms elapse; if the kernel sleep list is full (`MAX_SLEEPING` entries), the timeout is dropped and the wait is indefinite |
 
@@ -1504,7 +1505,10 @@ the fault kind and replies `FAULT_REPLY_KILL` for kinds it does not handle (see
 
 ### `SYS_THREAD_SLEEP` (46)
 
-Block the calling thread for a bounded duration. The timer wakes it at the deadline.
+Block the calling thread for a bounded duration. The timer wakes it at the deadline, except
+through the stale plain-sleep entry ([#443](https://github.com/kottlerg/seraph/issues/443); see
+[thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § `sys_thread_sleep` and the
+Plain-Sleep Path).
 
 **Arguments:**
 

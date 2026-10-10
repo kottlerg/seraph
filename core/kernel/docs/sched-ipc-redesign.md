@@ -157,9 +157,12 @@ The refuse-to-park is therefore lost-wake-safe ONLY via this invariant chain,
 which the `enqueue_and_wake` gate and its callers preserve:
 1. Every `enqueue_and_wake` caller deposits its payload BEFORE calling
    `enqueue_and_wake`. So `wake_pending` set ⇒ payload already deposited — no
-   spurious-zero/garbage wake. (`wake_pending` is set inside `enqueue_and_wake`,
-   strictly after the upstream deposit — made under the source lock, or, for the reply
-   wake, after the `reply_tcb` CAS win.)
+   spurious-zero/garbage wake — except through the stale plain-sleep entry
+   ([#443](https://github.com/kottlerg/seraph/issues/443); see
+   [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § `sys_thread_sleep` and the
+   Plain-Sleep Path). (`wake_pending` is set inside `enqueue_and_wake`, strictly after the
+   upstream deposit — made under the source lock, or, for the reply wake, after the
+   `reply_tcb` CAS win.)
 2. Refuse-to-park leaves `state==Running`. `commit_blocked_under_local_lock` returns a
    three-valued `ParkCommit` (`Committed`, `RefusedWake`, `RefusedStop`), and each caller's
    rollback branches on the variant: a `RefusedStop` rollback stamps the episode
@@ -190,7 +193,10 @@ under the source lock before any waker can claim them. The reply wake takes no s
 `endpoint_call`'s `reply_tcb` publish and its park commit, find the caller still
 `Running`, and set `wake_pending`. The caller's commit then returns `RefusedWake` and
 `endpoint_call` rolls the call back. That wake is the current waker that reaches the
-`Running` arm.
+`Running` arm, except through the stale plain-sleep entry
+([#443](https://github.com/kottlerg/seraph/issues/443); see
+[thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § `sys_thread_sleep` and the
+Plain-Sleep Path).
 
 **Why a `Ready` coalesce can always be dropped (the linchpin for
 `enqueue_and_wake`'s `Ready` arm).** The register-waiter → `commit_blocked` sequence runs entirely
@@ -205,7 +211,10 @@ duplicate — never a wake-before-park case ([scheduling-internals.md](schedulin
 § Lock Hierarchy). Dropping it loses nothing, and there
 is no "preempted-mid-registration" window that would require `wake_pending` on
 the `Ready` arm. (`Running` keeps `wake_pending` as the net for a waker that is not
-source-lock-serialized, today the dying-server reply-bound wake above.)
+source-lock-serialized, today the dying-server reply-bound wake above, except through the
+stale plain-sleep entry ([#443](https://github.com/kottlerg/seraph/issues/443); see
+[thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § `sys_thread_sleep` and the
+Plain-Sleep Path).)
 
 ## 3. What the implementation does (the migration, ordered as it landed)
 
@@ -245,7 +254,10 @@ each change; the binding statement of the resulting invariants is
   - `Stopped|Exited` → clear `wake_in_flight`, return (a stop/dealloc won).
   - `Running` → set `wake_pending`, clear `wake_in_flight`, return. The
     wake-before-park net: the thread is mid-park; its `commit_blocked` sees the
-    flag and refuses. Safe per §2.1 (the payload was deposited upstream).
+    flag and refuses. Safe per §2.1: the payload was deposited upstream, except through the
+    stale plain-sleep entry ([#443](https://github.com/kottlerg/seraph/issues/443); see
+    [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § `sys_thread_sleep` and the
+    Plain-Sleep Path).
   - `Ready` → clear `wake_in_flight`, return (coalesce; do NOT set
     `wake_pending`). The thread is already linked, will be dispatched, and will
     consume the deposited payload; a `Ready` coalesce is only ever a same-event

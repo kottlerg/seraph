@@ -423,6 +423,22 @@ the PR body MUST state the validated head and that the delta is
 documentation or comments only, and the pre-merge review's audit MUST check
 that against the diff.
 
+**Behaviour-neutral changes.** The local host runs above exercise what the
+built code does, so a trigger path counts as touched only when the delta
+changes that behaviour on it. Besides comment lines, these do not count:
+
+- adding, removing, or re-justifying a lint suppression (`#[allow(...)]`,
+  `#[expect(...)]`) and its rationale;
+- code compiled only under `#[cfg(test)]` (host tests, which
+  `cargo xtask test` runs);
+- the text of a log or diagnostic message that no harness marker and no
+  `xtask` pattern (the `--fail` regex, a `test-*` command's match) matches.
+
+Such a delta still needs `cargo xtask build` on both architectures, since a
+suppression change can fail the clippy build, and the CI gate. The PR body
+names each such change and states why no local host run is owed; the
+pre-merge review's audit checks that against the diff.
+
 **Known boundaries**, established empirically (QEMU 11.0.1; update this
 list as the tracking Issues move):
 

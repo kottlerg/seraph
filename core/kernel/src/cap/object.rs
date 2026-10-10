@@ -2379,9 +2379,14 @@ unsafe fn dealloc_object_one(
                 // without removing it would let the next timer tick dereference the
                 // freed pointer in sleep_check_wakeups. The remove races that pop
                 // under SLEEP_LIST_LOCK: if we win, the entry is gone and no timer
-                // wake fires; if the timer already popped it, the timer set
-                // wake_in_flight = 1 at pop (under the same lock), so the gate
-                // below waits for that wake to commit before the free. Placed
+                // wake fires. If the timer already popped a plain-sleep (None)
+                // entry, it set wake_in_flight = 1 at pop (under the same lock); a
+                // timed notification/event-queue arm claims and sets the flag only
+                // under the source lock, so it either claimed before the step-11
+                // unlink above or finds the waiter cleared and skips. Either way the
+                // gate below waits for any claimed wake to commit before the free.
+                // The stale plain-sleep entry is the exception (#443; see
+                // thread-lifecycle-and-sleep.md, the Plain-Sleep Path). Placed
                 // OUTSIDE the all-locks region — no sched.lock → SLEEP_LIST_LOCK
                 // order edge (the timer takes SLEEP_LIST_LOCK first, then releases
                 // it before any sched_lock).

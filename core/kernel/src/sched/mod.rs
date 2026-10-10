@@ -1871,16 +1871,16 @@ pub fn sleep_check_wakeups()
 
             _ =>
             {
-                // Plain sleep — the timer is the only waker. Reachable for
-                // ipc_state None, and also for the endpoint and wait-set
-                // snapshots (BlockedOnSend, BlockedOnRecv, BlockedOnWaitSet), which
-                // have no explicit arm above, popped via the #443 stale plain-sleep
-                // entry, core/kernel/docs/thread-lifecycle-and-sleep.md. For None
-                // we claimed it under SLEEP_LIST_LOCK at pop (wake_in_flight = 1),
-                // so a concurrent dealloc(tcb) is gated and tcb is still valid.
-                // The stale-entry endpoint and wait-set snapshots carry no
-                // pop-time wake_in_flight pin, so that premise does not hold for
-                // them (#443).
+                // Plain sleep (ipc_state None): the timer is the only waker. This
+                // arm is also reachable for the endpoint and wait-set snapshots
+                // (BlockedOnSend, BlockedOnRecv, BlockedOnWaitSet), which have no
+                // explicit arm above, popped via the #443 stale plain-sleep entry,
+                // core/kernel/docs/thread-lifecycle-and-sleep.md. For None we
+                // claimed it under SLEEP_LIST_LOCK at pop (wake_in_flight = 1), so
+                // a concurrent dealloc(tcb) is gated and tcb is still valid. The
+                // stale-entry endpoint and wait-set snapshots carry no pop-time
+                // wake_in_flight pin, so that premise does not hold for them, and
+                // this unconditional claim also races the source's waker (#443).
                 // SAFETY: tcb valid per the wake-in-flight claim at pop, except
                 // for the #443 stale-entry snapshots noted above.
                 unsafe {

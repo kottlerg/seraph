@@ -93,7 +93,10 @@ claims against concurrent IPC sources via the relevant source IPC lock (Notifica
 
 6. **Snapshot-then-claim arbitration.** Under `SLEEP_LIST_LOCK` the timer pops each expired entry
    into `expired[..n]`, snapshots its `(ipc_state, blocked_on_object)` (the TCB is provably alive
-   there, since `dealloc_object(Thread)` removes its entry under the same lock before freeing),
+   there, since `dealloc_object(Thread)` removes its entry under the same lock before freeing,
+   except through the stale plain-sleep entry
+   ([#443](https://github.com/kottlerg/seraph/issues/443); see
+   [`sys_thread_sleep` and the Plain-Sleep Path](#sys_thread_sleep-and-the-plain-sleep-path))),
    and for a plain sleeper (`ipc_state == None`) sets `wake_in_flight = 1`. It then releases the
    lock and dispatches each entry off the snapshot, never dereferencing the TCB to choose an arm:
    - `BlockedOnNotification` / `BlockedOnEventQueue`: take the source lock; claim iff
@@ -321,9 +324,12 @@ stated explicitly.
     worklist (step 20's mechanism) rather than recursing into dealloc_object.
     Done after the step-11 unlink so the endpoint dealloc cannot observe this
     thread still on its send queue.
-14. sleep_list_remove(tcb) (outside the all-locks region; a timer that already
-    popped the entry set wake_in_flight = 1 at pop, except via the #443 stale
-    plain-sleep entry; see the Plain-Sleep Path below).
+14. sleep_list_remove(tcb) (outside the all-locks region). A timer that already
+    popped a plain-sleep (None) entry set wake_in_flight = 1 at pop. A timed
+    notification or event-queue entry's arm claims, and sets the flag, only
+    under the source lock, so it either claimed before step 11's unlink or
+    finds the waiter cleared and skips. The #443 stale entry's endpoint and
+    wait-set snapshots carry no pin; see the Plain-Sleep Path below.
 15. Wake-in-flight gate (#160): spin until tcb.wake_in_flight.load(Acquire) == 0,
     with preempt_disable and interrupts enabled as in the context_saved gate,
     so a waker's pending enqueue_and_wake (or a cancel/dealloc CAS win that
@@ -657,8 +663,11 @@ Episodes.
    `wake_in_flight` pin, so its unconditional claim races both the source's waker and
    `dealloc_object(Thread)`. A reply or fault snapshot reaches the `reply_tcb` CAS of Symmetry
    actor 7 without the closure-lemma gate, so a server freed between the pop and the CAS is
-   dereferenced after free. #443 records the arm-by-arm effects and the use-after-free windows.
-   A timer claim racing the cancel resolves to `Interrupted`
+   dereferenced after free. A restarted thread that parks again with a timeout adds a second
+   entry beside the stale one; a `dealloc_object(Thread)` while both are listed removes only one
+   through its single `sleep_list_remove`, so a later pop of the other dereferences the freed TCB.
+   #443 records the arm-by-arm effects and the use-after-free windows, this duplicate-entry window
+   among them. A timer claim racing the cancel resolves to `Interrupted`
    (honest for a sleep whose deadline elapsed concurrently with a stop). A stop that instead wins
    against the park commit (`ParkCommit::RefusedStop`) makes `sys_thread_sleep` deschedule in
    place and return `Interrupted` directly.

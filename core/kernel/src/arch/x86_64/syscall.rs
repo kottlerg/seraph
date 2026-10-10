@@ -33,13 +33,16 @@
 //! the kernel-side buffer. This is a known defect (#443).
 //!
 //! The `#DB` exception-frame push at CPL 0 is an explicit supervisor-mode
-//! access (Intel SDM Vol. 3A § 4.6 counts only GDT, LDT, IDT and TSS accesses
-//! as implicit), so AC governs it. With a user-set AC and TF, SMAP does not
-//! block the push: the frame, which carries a kernel RIP, and the `#DB`
-//! handler's stack land in user memory. A user RSP holding a mapped kernel
-//! address takes no fault, and the push writes kernel memory. Only a
-//! non-canonical or unmapped RSP, or a user RSP with AC clear (SMAP-protected),
-//! faults to `#DF`. This is part of the same known defect (#443).
+//! access, so AC governs it: Intel SDM Vol. 3A § 4.6 gives GDT, LDT, IDT and
+//! TSS accesses as its examples of implicit accesses, and a stack push during
+//! event delivery is not among them. A user-set TF therefore makes the push,
+//! and the `#DB` handler's stack, land where the user RSP points. A writable
+//! kernel address takes no fault, nor does a writable user page while AC is
+//! set; a non-canonical, unmapped or read-only (CR0.WP) RSP, or a user page
+//! with AC clear, faults to `#DF`. The SMAP gap is defined in
+//! `docs/memory-model.md` § Kernel Isolation — SMEP and SMAP, and the kernel
+//! RIP the frame discloses in `core/kernel/docs/cross-boundary-disclosure.md`
+//! § Classification. This is part of the same known defect (#443).
 //!
 //! The stub executes no `swapgs`: the kernel holds its per-CPU pointer in the
 //! GS base and never swaps it, so a ring-3 `mov gs` with the user selector

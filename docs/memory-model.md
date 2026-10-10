@@ -208,7 +208,8 @@ mitigate a class of privilege escalation exploits. SMAP enforcement has a gap at
 kernel entry: on SYSCALL, `IA32_SFMASK` does not clear RFLAGS.AC and the syscall entry stub
 runs no `clac`; on an interrupt or exception taken from ring 3, delivery does not clear AC and
 the IDT entry stubs run no `clac`. A user-set AC therefore leaves SMAP unenforced for explicit
-kernel accesses (a defect, [#443](https://github.com/kottlerg/seraph/issues/443)).
+kernel accesses on that entry until the first user copy's `clac` clears it (a defect,
+[#443](https://github.com/kottlerg/seraph/issues/443)).
 
 On RISC-V, S-mode can never execute from user (U=1) pages, and the kernel keeps
 `sstatus.SUM` clear except inside its user-copy routines, so supervisor loads and stores

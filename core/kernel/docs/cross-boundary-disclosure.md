@@ -6,12 +6,14 @@ escapes to userspace — a prerequisite for kernel address-space layout
 randomization (KASLR). Known open disclosures: the x86-64 fault-message present
 bit ([#443](https://github.com/kottlerg/seraph/issues/443)), the unpinned
 `SYS_THREAD_READ_REGS` trap-frame copy under a concurrent last-cap delete
-([#443](https://github.com/kottlerg/seraph/issues/443)), the x86-64 `#DB` exception frame, which
-carries a kernel RIP, pushed to user memory when ring 3 enters SYSCALL with RFLAGS.TF and AC
-set ([#443](https://github.com/kottlerg/seraph/issues/443)), kernel state in donated memory that the
-donor can still map ([#433](https://github.com/kottlerg/seraph/issues/433)),
-mirrored console diagnostics ([#440](https://github.com/kottlerg/seraph/issues/440)), and
-unzeroed bootloader frames ([#439](https://github.com/kottlerg/seraph/issues/439)).
+([#443](https://github.com/kottlerg/seraph/issues/443)), the x86-64 `#DB` exception
+frame (with its kernel RIP) and the `#DB` handler's stack (kernel return addresses
+and pointers), pushed to user memory when ring 3 enters SYSCALL with RFLAGS.TF and
+AC set ([#443](https://github.com/kottlerg/seraph/issues/443)), kernel state in
+donated memory that the donor can still map
+([#433](https://github.com/kottlerg/seraph/issues/433)), mirrored console diagnostics
+([#440](https://github.com/kottlerg/seraph/issues/440)), and unzeroed bootloader
+frames ([#439](https://github.com/kottlerg/seraph/issues/439)).
 
 ---
 
@@ -22,7 +24,8 @@ kernel pointer, or value derived from one that reaches userspace defeats base
 randomization. This inventory audits the kernel's complete output surface and
 records, per surface, why it carries no kernel VA or, for each known open
 disclosure ([#443](https://github.com/kottlerg/seraph/issues/443), including the
-unpinned `SYS_THREAD_READ_REGS` trap-frame copy,
+unpinned `SYS_THREAD_READ_REGS` trap-frame copy and the x86-64 `#DB` exception-frame
+and handler-stack push,
 [#433](https://github.com/kottlerg/seraph/issues/433),
 [#439](https://github.com/kottlerg/seraph/issues/439),
 [#440](https://github.com/kottlerg/seraph/issues/440)), what it leaks. It is the
@@ -41,8 +44,9 @@ Each surface is classified as one of:
   derived from one. A leak. **Three found** among emitted values: the x86-64
   fault-message `d2` present bit, the unpinned `SYS_THREAD_READ_REGS` trap-frame
   copy, which can hand freed or reused kernel memory to the caller (see the
-  fault-message note below), and the x86-64 `#DB` exception frame, with its kernel
-  RIP, that a SYSCALL entered with RFLAGS.TF and AC set pushes to user memory (see
+  fault-message note below), and the x86-64 `#DB` exception frame (with its kernel
+  RIP) and the `#DB` handler's stack (kernel return addresses and pointers), which
+  a SYSCALL entered with RFLAGS.TF and AC set pushes to user memory (see
   `core/kernel/src/arch/x86_64/syscall.rs` § Entry contract)
   ([#443](https://github.com/kottlerg/seraph/issues/443)); kernel state kept in donated memory is a
   separate surface, below.
@@ -80,6 +84,7 @@ is in [core/kernel/docs/syscalls.md](syscalls.md).
 | Cap split / create / derive handlers → opaque cap handles | `mem::sys_memory_split`, `hw::sys_mmio_split`, `cap::sys_cap_derive` | c |
 | IPC `Message` label / badge / data[] / cap_slots[] | `ipc::message::Message`, `ipc::{read_ipc_buf, write_ipc_buf, write_cap_results}` | b/c |
 | Fault message `kind` / `d1` / `d2` / `ip` (user VA or hardware code) + label / badge | `ipc::fault::FaultInfo`, `redirect_user_page_fault`, `redirect_user_exception`, `fault_info_for` | b/d; **a** on x86-64 ([#443](https://github.com/kottlerg/seraph/issues/443)) |
+| x86-64 `#DB` exception frame (kernel RIP) and `#DB` handler stack (kernel return addresses and pointers), pushed at the user RSP when ring 3 enters SYSCALL with RFLAGS.TF and AC set | `arch::x86_64::syscall::syscall_entry` (§ Entry contract), `SFMASK_CLEAR_IF` | **a** ([#443](https://github.com/kottlerg/seraph/issues/443)) |
 | Exit / death reason encoding + death payload `(correlator << 32) \| reason` | `syscall::encode_exit_code`, `EXIT_*` constants, `sched::post_one_death_event` | c/d |
 | Thread ID (random CSPRNG correlator for every thread but init, whose ID is the fixed value 1; no `tid → TCB` table; never returned as data) | `sched::alloc_thread_id` | c/d |
 | `CSpaceId` (registry index, never returned to userspace); capability badges (caller-chosen) | `cap::alloc_cspace_id`, `cap::slot::CapabilitySlot::badge` | c |

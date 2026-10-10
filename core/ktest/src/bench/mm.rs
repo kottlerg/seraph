@@ -63,8 +63,8 @@ pub(super) fn bench_mem_map_unmap(ctx: &crate::TestContext, iters: u32)
     }
 }
 
-/// Benchmark: alternate `mem_protect(READ)` and `mem_protect(READ|WRITE)`
-/// on a pre-mapped page. Measures the cost of one round-trip permission
+/// Benchmark: alternate `mem_protect(MAP_READONLY)` and
+/// `mem_protect(MAP_WRITABLE)` on a pre-mapped page. Measures the cost of one round-trip permission
 /// flip — relevant for any future mmap-like userspace API.
 pub(super) fn bench_mem_protect(ctx: &crate::TestContext, iters: u32)
 {

@@ -5,13 +5,10 @@
 
 //! RISC-V hardware entropy primitives.
 //!
-//! No S-mode-accessible hardware RNG is exposed: the `Zkr` `seed` CSR is
-//! M-mode-owned (`mseccfg.SSEED`) and unavailable to S-mode under default
-//! `OpenSBI`, and there is no standard SBI entropy call. [`hw_rng_available`] is
-//! therefore `false` — this in-kernel arch path provides no hardware RNG by
-//! design. Early-boot entropy arrives as the conditioned firmware seed the
-//! bootloader passes in `BootInfo`; its sources and the degradation to jitter
-//! are documented in `core/kernel/docs/entropy.md`.
+//! No S-mode hardware RNG is available on riscv64, so [`hw_rng_available`] is
+//! `false`; the reason, the firmware boot seed that replaces it, and the
+//! degradation to jitter are documented in `core/kernel/docs/entropy.md`
+//! § Sources and graceful degradation (S-mode hardware entropy: #393).
 //!
 //! The raw cycle counter (the `time` CSR, always S-mode readable) feeds jitter
 //! sampling. Same `arch::current` entropy contract as the x86-64 counterpart.

@@ -9,8 +9,9 @@
 //! the ACPI signatures, extracts `PM1a_CNT_BLK` and `SLP_TYPa`, then writes
 //! the shutdown command to the `PM1a` control register.
 //!
-//! All ACPI parsing happens in userspace — the kernel and bootloader are not
-//! involved beyond providing Memory caps for the firmware table regions.
+//! ktest parses the tables itself over the `AcpiReclaimable` Memory caps
+//! the kernel mints (see `docs/device-management.md` § Raw Firmware
+//! Passthrough).
 //!
 //! I/O port permission for `PM1a_CNT_BLK` is obtained at shutdown time via
 //! `ioport::bind_port_range`, which carves a narrow `IoPort` cap
@@ -33,7 +34,7 @@ const FADT_OFF_DSDT: usize = 40;
 const FADT_OFF_PM1A_CNT_BLK: usize = 64;
 const FADT_OFF_X_DSDT: usize = 140;
 
-/// Attempt ACPI S5 shutdown. Logs progress and does not return on success.
+/// Attempt ACPI S5 shutdown. Does not return on success.
 ///
 /// On failure (missing caps, unparseable tables), logs a warning and returns
 /// so the caller can fall through to `thread_exit()`.
@@ -96,11 +97,15 @@ fn locate_fadt_fields(info: &InitInfo) -> Option<(u16, u64)>
     let table_vaddr = ACPI_MAP_BASE + (region_phys & 0xFFF) + table_off as u64;
     // SAFETY: region was just mapped by find_table_in_acpi_regions; FADT
     // header is at table_vaddr; offsets 64 and 140 are within ACPI 6.x size.
+    // cast_possible_truncation: PM1a_CNT_BLK is an x86 I/O port address, at
+    // most 0xFFFF; the upper 16 bits of the 32-bit field are zero.
     #[allow(clippy::cast_possible_truncation)]
     let pm1a = unsafe { read_u32_at(table_vaddr, FADT_OFF_PM1A_CNT_BLK) } as u16;
     // SAFETY: same mapping.
     let dsdt32 = unsafe { read_u32_at(table_vaddr, FADT_OFF_DSDT) };
-    // SAFETY: same mapping; FADT minimum size in ACPI 6.x is 244 bytes.
+    // SAFETY: same mapping; X_DSDT (offset 140, 8 bytes) lies inside the
+    // ACPI 2.0+ FADT layout (244 bytes; 276 in ACPI 6.x). The FADT length
+    // field is not checked against the mapped region.
     let dsdt64 = unsafe { read_u64_at(table_vaddr, FADT_OFF_X_DSDT) };
     let dsdt_phys = if dsdt64 != 0
     {
@@ -268,8 +273,9 @@ fn scan_dsdt_for_s5(dsdt_data: u64, dsdt_len: usize) -> Option<u16>
         }
 
         // The AML encoding before _S5_ may include a NameOp (0x08) prefix.
-        // Check if the byte before _S5_ is 0x08 (NameOp); if so, _S5_ is a
-        // named object. The PackageOp follows the name.
+        // The bytes before _S5_ (an optional NameOp 0x08 and root prefix) are
+        // not inspected; any _S5_ immediately followed by PackageOp (0x12)
+        // is accepted.
         //
         // Encoding: [NameOp(08)] _S5_ PackageOp(12) PkgLength NumElements elem0...
         // Or:       _S5_ PackageOp(12) PkgLength NumElements elem0...
@@ -312,8 +318,8 @@ fn scan_dsdt_for_s5(dsdt_data: u64, dsdt_len: usize) -> Option<u16>
             // ZeroOp (0x00) and OneOp (0x01) are AML integer constants.
             0x00 => Some(0),
             0x01 => Some(1),
-            // Raw byte values 2-255 don't exist as AML opcodes in this position.
-            // Some ACPI implementations omit the BytePrefix for small values.
+            // Any other lead byte (DWordPrefix, QWordPrefix, OnesOp, or a bare value
+            // emitted without BytePrefix) is not decoded; no SLP_TYPa is returned.
             _ => None,
         };
     }

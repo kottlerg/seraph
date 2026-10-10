@@ -10,10 +10,11 @@ enumeration, binding, and policy live in `devmgr`.
 
 The kernel consumes `BootInfo.mmio_apertures` during Phase 7 of
 initialization and mints one `Mmio` capability per entry; on RISC-V it mints one more for
-the console UART range `BootInfo.kernel_mmio` names, which lies outside every aperture.
+the console UART range `BootInfo.kernel_mmio` names, which may also lie inside an aperture.
 These apertures, the arch-specific `BootInfo.kernel_mmio`, and the framebuffer description
-are the only device descriptors the bootloader produces. Firmware parsing (ACPI / DTB table
-walking) is a userspace concern; the kernel's TCB contains no parser.
+are the only device descriptors the bootloader produces. Device-level firmware parsing
+(enumerating devices from ACPI / DTB) is a userspace concern, and the kernel contains no
+parser.
 
 The kernel mints these capabilities in
 [`core/kernel/docs/initialization.md`](../core/kernel/docs/initialization.md) § Phase 7:

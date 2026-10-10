@@ -103,7 +103,8 @@ a kernel-internal owner (the principal ones are listed in
 object linked under the original's derivation parent, so another holder's revoke of that ancestor
 can free it directly. For a same-object derivation, as in the kill-process pattern, it is the delete
 following the revoke that frees the object: a revoke keeps its target capability, so it never frees
-the target's own object, though it can free a descendant's. This is a known defect tracked in
+the target's own object, though it can free a descendant's. That a handler can dereference an
+object freed under it is a known kernel memory-safety defect tracked in
 [#443](https://github.com/kottlerg/seraph/issues/443).
 
 **Slot 0** is always null. The leaf covering slot 0 exists once the CSpace
@@ -196,23 +197,19 @@ donations is unbounded. The cascade's other re-entry, one frame per nested
 `CSpace` whose last reference the dying one held, is unbounded in depth;
 bounding it is [#435](https://github.com/kottlerg/seraph/issues/435).
 
-The walk costs one `retype_free` per donation, holds no lock across records
-(each return takes only its ancestor's cap lock, so unlike a `CSpace`'s
-derivation drain it is not batched), and runs to completion in whichever
-context drops the last reference: the deleting syscall, with interrupts
-masked on that CPU; or, when the owner is handed to the per-CPU
-deferred-reclaim stack — a thread deleting an object it is itself bound to,
-or the batched capability move releasing any `CSpace` or `AddressSpace` —
-the next syscall epilogue on that CPU, with interrupts masked, or the idle
-thread's drain, with interrupts enabled
-([scheduling-internals.md](scheduling-internals.md) § Bare spin locks). So
-an owner's teardown latency scales with how finely it donated, and can land
-on an unrelated thread's syscall: the same memory donated as single pages
-costs one return per page. The standard runtime's map retry donates one page
-per page-table shortfall (its budget top-up donates the shortfall in one
-call), so a process's count is of the order of its page-table page count,
-one per 2 MiB of mapped span. Bounding the walk, and the seeding of one
-donation, within a syscall is
+The walk costs one `retype_free` per donation, holds no lock across records (each return takes only
+its ancestor's locks, the Memory object's read lock and its retype-allocator lock, so unlike a
+`CSpace`'s derivation drain it is not batched), and runs to completion in whichever context drops
+the last reference: the deleting syscall, with interrupts masked on that CPU; or, when the owner is
+handed to the per-CPU deferred-reclaim stack — a thread deleting an object it is itself bound to, or
+the batched capability move releasing any `CSpace` or `AddressSpace` — the next syscall epilogue on
+that CPU, with interrupts masked, or the idle thread's drain, with interrupts enabled
+([scheduling-internals.md](scheduling-internals.md) § Lock Hierarchy, "Bare spin locks"). So an
+owner's teardown latency scales with how finely it donated, and can land on an unrelated thread's
+syscall: the same memory donated as single pages costs one return per page. The standard runtime's
+map retry donates one page per page-table shortfall (its budget top-up donates the shortfall in one
+call), so a process's count is of the order of its page-table page count, one per 2 MiB of mapped
+span. Bounding the walk, and the seeding of one donation, within a syscall is
 [#434](https://github.com/kottlerg/seraph/issues/434).
 
 ---
@@ -227,6 +224,10 @@ pub struct CapabilitySlot
     /// Discriminant identifying the kind of capability (or Null).
     tag: CapTag,
 
+    /// pad[0] = free-list marker, pad[1] = per-slot generation,
+    /// pad[2] = in-flight pin.
+    pad: [u8; 3],
+
     /// Rights bitmask for this slot. Interpretation is tag-dependent.
     rights: Rights,
 
@@ -236,7 +237,7 @@ pub struct CapabilitySlot
 
     /// Pointer to the kernel object this capability refers to.
     /// Null when tag == CapTag::Null.
-    object: Option<NonNull<KernelObject>>,
+    object: Option<NonNull<KernelObjectHeader>>,
 
     /// Derivation tree pointers (intrusive linked list).
     deriv_parent: Option<SlotId>,
@@ -247,7 +248,7 @@ pub struct CapabilitySlot
 ```
 
 The slot is 72 bytes (`#[repr(C)]`). 56 slots per CSpace page = 4032 bytes, fitting
-in a 4096-byte slab bin with 64 B of tail slack.
+one 4096-byte pool page with 64 B of tail slack.
 
 `SlotId` is a global identifier combining a CSpace ID, an epoch generation
 tag, and a slot index: `{cspace_id: u32, epoch: u32, index: NonZeroU32}`
@@ -255,38 +256,36 @@ tag, and a slot index: `{cspace_id: u32, epoch: u32, index: NonZeroU32}`
 `NonZeroU32` index). This allows derivation tree traversal across CSpace
 boundaries without holding per-CSpace locks longer than necessary, and lets
 `lookup_cspace(id, expected_epoch)` fail fast when a CSpace's id has been
-recycled — a stale `SlotId` stamped with the pre-recycle epoch cannot
-mis-target the new tenant. As of #248 the epoch is a random non-zero value
-redrawn on each recycle (not a monotonic counter); the equality check is
-unaffected, and the random redraw excludes the prior value so an
-immediately-recycled `SlotId` always fails fast. See #137 for the recycling
-allocator design.
+recycled. As of #248 the epoch is a random non-zero value redrawn on each
+recycle (not a monotonic counter); the equality check is unaffected, and the
+random redraw excludes the prior value so an immediately-recycled `SlotId`
+always fails fast. A `SlotId` stale across several recycles can match a later
+random epoch with probability ~2⁻³² per recycle; this residual is accepted
+because the capability, not the `SlotId`, is the authority. See #137 for the
+recycling allocator design.
 
 ### Per-Slot Generation
 
-Each slot carries an 8-bit **generation** counter (in the spare `pad[1]` byte,
-keeping the slot at 72 bytes). `CSpace::free_slot` increments it every time the
-slot is recycled. The generation is encoded into the capability handle userspace
-receives — `handle = (generation << CAP_INDEX_BITS) | index` (see
-[capability-model.md](../../../docs/capability-model.md) § Capability Handle
-Format) — and `lookup_cap`, together with the raw-resolution handlers in
-`cap.rs` / `mem.rs` / `ipc.rs`, rejects a handle whose generation no longer
-matches the slot's, returning `InvalidCapability`. This is the #349 fix: a stale
-handle that reaches a recycled slot — including a slot a cross-`CSpace` revoke
-freed out from under its holder — fails closed instead of aliasing the new
-occupant. A never-recycled slot has generation 0, so its handle equals the bare
-index — the backward-compatibility hinge that lets long-lived boot caps keep
-their historical handle values.
+Each slot carries an 8-bit **generation** counter (in `pad[1]`, keeping the slot at 72 bytes).
+`CSpace::free_slot` increments it every time the slot is recycled. The generation is encoded into
+the capability handle userspace receives — `handle = (generation << CAP_INDEX_BITS) | index` (see
+[capability-model.md](../../../docs/capability-model.md) § Capability Handle Format) — and
+`lookup_cap`, together with the raw-resolution paths in `syscall/cap.rs` (whose
+`revalidate_src_under_lock` `syscall/mem.rs` reuses), `syscall/ipc.rs`, `cap/transfer.rs`, and
+`cap/split.rs`, rejects a handle whose generation no longer matches the slot's, returning
+`InvalidCapability`. This is the #349 fix: a stale handle that reaches a recycled slot — including a
+slot a cross-`CSpace` revoke freed out from under its holder — fails closed instead of aliasing the
+new occupant. A never-recycled slot has generation 0, so its handle equals the bare index — the
+backward-compatibility hinge that lets long-lived boot caps keep their historical handle values.
 
-The generation is distinct from `SlotId.epoch` (the per-`CSpace`-registry
-counter) and from the `pad[0]` free-list marker. It must survive the
-free→reallocate transition: `free_slot` bumps it *before* threading the slot onto
-the free list, `set_next_free` preserves `pad[1]`, and `allocate_slot` clears the
-slot with `clear_keep_generation` (which keeps `pad[1]`). The 8-bit counter wraps
-after 256 recycles of one index — a bounded ABA window: on wrap a replayed handle
-is no better protected than under the pre-generation scheme, and no worse. The
-generation byte `pad[1]` plus the spare `pad[2]` leave a one-step widening to a
-16-bit generation if churn ever makes 256 marginal.
+The generation is distinct from `SlotId.epoch` (the `CSpace` registry epoch, a random value redrawn
+each time the id is recycled) and from the `pad[0]` free-list marker. It must survive the
+free→reallocate transition: `free_slot` bumps it *before* threading the slot onto the free list,
+`set_next_free` preserves `pad[1]`, and `allocate_slot` clears the slot with `clear_keep_generation`
+(which keeps `pad[1]`). The 8-bit counter wraps after 256 recycles of one index — a bounded ABA
+window: on wrap a replayed handle is no better protected than under the pre-generation scheme, and
+no worse. No pad byte is spare (`pad[2]` holds the in-flight pin), so widening the generation past 8
+bits would need a byte reclaimed elsewhere in the 72-byte layout.
 
 ### Capability Tags
 
@@ -305,7 +304,7 @@ pub enum CapTag
     Thread        = 8,
     CSpace        = 9,   // capability space; explicit kernel object
     WaitSet       = 10,
-    IoPort        = 11,  // x86-64 only; created at boot from platform_resources
+    IoPort        = 11,  // x86-64 only; Phase 7 mints one root cap over the full 64K port space
     SchedControl  = 12,  // priority-band authority; carries [min, max], no rights bit
     SbiControl    = 13,  // SBI forwarding authority (RISC-V only)
 }
@@ -344,20 +343,11 @@ SbiControl    RESET=0 SUSPEND=1 CPPC=2 BASE=3 DBCN=4 PMU=5
 Rights are checked at every syscall that uses a capability. The check is a single
 bitwise AND: `(slot.rights & required) == required`.
 
-W^X enforcement at mapping time (`mem_map`, `mem_protect`):
-
-```rust
-fn check_wx(rights: Rights) -> Result<(), SyscallError>
-{
-    if rights.contains((MemRights::WRITE | MemRights::EXECUTE).erase())
-    {
-        Err(SyscallError::WxViolation)
-    } else
-    {
-        Ok(())
-    }
-}
-```
+W^X is enforced at mapping time. `sys_mem_map` takes the mapping's writable and executable
+flags from the requested protection bits, each of which must be backed by the Memory cap's
+Write or Execute right, or from those rights when no bits are given. `sys_mem_protect`
+takes them from the new protection bits. Either syscall returns `WxViolation` when both
+flags are set.
 
 A capability may carry both Write and Execute rights (representing independent
 authorities). W^X is enforced when those rights are exercised on a specific
@@ -382,12 +372,12 @@ pub struct KernelObjectHeader
 }
 ```
 
-When a slot is cleared (for example by deletion, revocation, or the teardown of the CSpace
-holding it) or a kernel-internal owner releases its reference, the reference count is
-decremented.
-When it reaches zero, the object's bytes are returned to the Memory object it was
-retyped from (`retype_free`). This is the only mechanism by which kernel objects
-are freed — there is no explicit "destroy" syscall (see
+When a slot is cleared (for example by deletion, revocation, or the teardown of the CSpace holding
+it) or a kernel-internal owner releases its reference, the reference count is decremented. When it
+reaches zero, the object's bytes are returned to the Memory object it was retyped from
+(`retype_free`). Apart from a never-published body that a failed split or a failed
+`SYS_CAP_CREATE_*` insert rolls back at its initial count, this is the only mechanism by which
+kernel objects are freed — there is no explicit "destroy" syscall (see
 [docs/capability-model.md](../../../docs/capability-model.md) § Auto-reclaim).
 
 The principal kernel-internal owners:
@@ -428,10 +418,11 @@ The principal kernel-internal owners:
 
 ### Structure
 
-The derivation tree is a forest of trees — one tree per root capability (objects
-created via `SYS_CAP_CREATE_*`). The tree is stored intrinsically in the capability
-slots themselves (the `deriv_parent`, `deriv_first_child`, `deriv_next_sibling`,
-`deriv_prev_sibling` fields), so no external tree allocation is needed.
+The derivation tree is a forest of trees — one tree per root capability, a slot with no
+derivation parent. `SYS_CAP_CREATE_*` and the boot population create roots, and a delete, a
+split, or a `CSpace` teardown can leave a slot without a parent. The tree is stored
+intrinsically in the capability slots themselves (the `deriv_parent`, `deriv_first_child`,
+`deriv_next_sibling`, `deriv_prev_sibling` fields), so no external tree allocation is needed.
 
 This is an intrusive N-ary tree using child-sibling representation:
 
@@ -465,10 +456,10 @@ rely on the tag and generation checks described above.
 The source of a copy or derive, the parent of a memory split, and both caps of
 a memory merge are looked up unlocked, so each of those paths revalidates them
 under the write lock — same tag-bearing occupancy, same generation, same
-object, no revoke in flight — before touching the object or editing the tree.
+object, no revoke or move in flight — before touching the object or editing the tree.
 Every occupied→free transition holds the lock, so a slot that revalidates stays
 live (and stays the link's parent) for the rest of the hold. A slot freed
-meanwhile fails the call with `InvalidCapability` (a revoke in flight on it,
+meanwhile fails the call with `InvalidCapability` (a revoke or move in flight on it,
 `InvalidState`); the alternative — `link_child` dropping the link under a freed
 parent — would leave the new capability a derivation root outside every
 ancestor's revoke reach, and a merge would free a recycled tail index.
@@ -482,11 +473,8 @@ descheduled — syscall context with interrupts masked, a preempt-disabled
 window, or the idle thread's deferred reclaim, whose time slice is permanently
 zero — and a holder never parks (see
 [scheduling-internals.md](scheduling-internals.md) § Lock Hierarchy, "Bare spin
-locks", for the contexts, the invariant each rests on, and the full order:
-derivation lock, then the `MemoryObject` write locks of a split or merge, then
-the SEED read lock of a retype, then the `CSpace` spinlock, then a wrapper pool
-lock; the kernel page-table pool lock sits in a separate chain under
-`pt_lock`). The lock records its write holder's CPU, thread, syscall, and call
+locks", for the contexts, the invariant each rests on, and the order in which these
+locks nest). The lock records its write holder's CPU, thread, syscall, and call
 site, and a CPU spinning for it records a lock-wait breadcrumb; the softlockup
 watchdog dump prints both.
 
@@ -553,9 +541,10 @@ re-linked in O(1), the lock released between batches, and a
 `MAX_REPARENT_BATCHES` backstop against a concurrent deriver — because a
 slot can have been derived from up to the structural ceiling of every
 CSpace. The consumed slot is revalidated under the lock before every batch
-(tag and handle generation, no revoke in flight; the splits additionally
-check it still holds the object that was looked up, since their lookup ran
-without the lock): a concurrent revoke starting on it stops the delete with
+(tag and handle generation, no revoke or move in flight; after its first batch the delete
+also checks that the slot still holds the object it captured, and the splits check the
+looked-up object from the first hold, since their lookup ran without the lock): a
+concurrent revoke starting on it stops the delete with
 `InvalidState` and children already moved stay under the parent, a
 concurrent delete finishing it first turns the delete into a success and a
 split into `InvalidState` with both children rolled back. The split's own
@@ -572,8 +561,8 @@ is released would instead return a live handle to the refill.
 
 Because hoisting destroys intermediate parent→child edges as the flattening
 proceeds, the root is pinned for the whole multi-batch operation with the
-**in-flight pin** (`CapabilitySlot::pinned`, stored in the slot's spare pad
-byte, read and written only under the derivation write lock; a move pins its
+**in-flight pin** (`CapabilitySlot::pinned`, stored in `pad[2]`, read and written
+only under the derivation write lock; a move pins its
 source and destination the same way — see [Move](#move)). `SYS_CAP_DELETE`,
 `SYS_CAP_MOVE`, `SYS_CAP_COPY`, `SYS_CAP_DERIVE`, `SYS_CAP_DERIVE_BADGE`,
 `SYS_MEMORY_SPLIT`, `SYS_MEMORY_MERGE`, the range splits, and a further
@@ -635,28 +624,30 @@ For well-behaved systems, derivation trees are shallow (a server derives a
 capability for a client; the client rarely re-derives). Deep trees or large
 revocations do not appear on latency-sensitive paths.
 
-**Locking during revocation:** While the write lock is held, all other capability
-operations on the affected slots are blocked. This is safe because revocation is
-intentionally a strong operation — the revoker is asserting that no further access
-to the capability is valid. A revocation larger than one batch is not atomic
-against readers: between batches, unrevoked descendants remain usable until their
-batch frees them, and hoisting is visible — surviving descendants may temporarily
-appear as direct children of the root (still descendants of it and of every
-ancestor above it, so ancestor revocation reach is preserved). When the syscall
-returns successfully with the root still live, the root is childless.
+**Locking during revocation:** While the write lock is held, every other operation that takes the
+derivation lock (copy, derive, the splits, merge, move, IPC transfer, the reply path's destination
+pre-allocation, delete, revoke, the teardown drain) waits. Lock-free capability use is not blocked;
+once a slot is freed, the tag and generation checks fence it. This is safe because revocation is
+intentionally a strong operation — the revoker is asserting that no further access to the capability
+is valid. A revocation larger than one batch is not atomic against readers: between batches,
+unrevoked descendants remain usable until their batch frees them, and hoisting is visible —
+surviving descendants may temporarily appear as direct children of the root (still descendants of it
+and of every ancestor above it, so ancestor revocation reach is preserved). When the syscall returns
+successfully with the root still live, the root is childless.
 
-**Deferred IPC cleanup:** The derivation tree write lock is ordered after IPC object
-locks (see lock ordering in [ipc-internals.md](ipc-internals.md)). Therefore,
-`SYS_CAP_REVOKE` must not acquire IPC object locks while holding the derivation tree
-write lock. Revocation collects a set of IPC objects needing cleanup (e.g. endpoints
-that have a revoked capability in their send queue), releases the write lock, then
-acquires individual IPC object locks to perform cleanup.
+**Deallocation outside the lock:** The derivation tree lock and the source IPC locks are
+separate outer roots of the lock hierarchy (see
+[scheduling-internals.md](scheduling-internals.md) § Lock Hierarchy). `SYS_CAP_REVOKE` acquires
+no IPC object lock while it holds the derivation tree write lock. Each batch collects the
+objects of the slots it freed and releases the write lock. It then `dec_ref`s each object and
+deallocates any that reach zero (`dealloc_revoked`); `dealloc_object` takes whatever IPC object
+locks that object's teardown needs.
 
 ### Move
 
 `SYS_CAP_MOVE` and IPC capability transfer relocate an occupied slot to a
 fresh slot — auto-allocated or, for the syscall, caller-chosen — in the same
-or another `CSpace` (`cap/transfer.rs`). The destination takes the source's
+or another `CSpace` (`core/kernel/src/cap/transfer.rs`). The destination takes the source's
 exact position in the tree: its parent, its siblings, and every one of its
 children are repointed onto the new slot, and the source is freed. The child
 walk is the unbounded part — a slot can have been derived from up to the
@@ -770,7 +761,10 @@ crosses a `CSpace` boundary, revoking a source's subtree frees a slot in a forei
 `CSpace` that the recipient still legitimately holds — and because cap handles
 recycle slot indices, that freed index would then alias an unrelated live object.
 
-Per-slot generation handles make cross-`CSpace` capability sharing safe. Both forms
+Per-slot generation handles keep a stale handle from aliasing a recycled slot after a
+cross-`CSpace` revoke. A syscall already in flight on the object is not covered
+([#443](https://github.com/kottlerg/seraph/issues/443); see
+[§ Storage: Hybrid Two-Level Radix](#storage-hybrid-two-level-radix)). Both forms
 of cross-`CSpace` sharing keep a derivation edge across the boundary:
 
 - **IPC capability transfer / `SYS_CAP_MOVE`** hand the cap to the recipient and
@@ -791,13 +785,15 @@ with `InvalidCapability` rather than aliasing whatever later occupies the recycl
 index. See the per-slot generation discussion under
 [Capability Slot](#capability-slot-capslotrs).
 
-`SlotId` encodes `(cspace_id, epoch, slot_index)`. The derivation tree is resolved
+`SlotId` encodes `(cspace_id, epoch, index)`. The derivation tree is resolved
 by:
 
 ```
 resolve(slot_id):
-    cspace = cspace_table[slot_id.cspace_id]  // O(1) from global table
-    return cspace.slot(slot_id.index)         // O(1) lookup (two or three levels)
+    // O(1) registry lookup; none if unregistered or the epoch is stale
+    cspace = lookup_cspace(slot_id.cspace_id, slot_id.epoch)
+    slot = cspace.slot(slot_id.index)        // O(1) lookup (two or three levels)
+    return none if slot is Null, else slot   // occupancy gate (resolve_slot_mut)
 ```
 
 Resolution does not require holding a lock on the target `CSpace` — the derivation
@@ -837,7 +833,8 @@ specific slot numbers.
 | 15 | 9 | Init's own CSpace capability |
 
 The kernel passes the slot numbers to init in the `InitInfo` block it maps into
-init's address space (its VA is init's first argument). The `CapDescriptor` array
+init's address space (its VA is init's first argument; see
+[abi/init-protocol/README.md](../../../abi/init-protocol/README.md)). The `CapDescriptor` array
 lists each Phase 7 and Phase 8 slot with its type; header fields name the single
 caps and the base and count of several groups, including every Phase 9 group.
 
@@ -845,10 +842,12 @@ caps and the base and count of several groups, including every Phase 9 group.
 
 ## Capability Transfer in IPC
 
-IPC capability transfer (via `SYS_IPC_CALL` and `SYS_IPC_REPLY` capability slots)
-begins the move of all of a message's capabilities or of none of them —
-all-or-nothing at commit; a refused transfer does not block message delivery
-(see [docs/ipc-design.md](../../../docs/ipc-design.md) § Message Format). Each
+IPC capability transfer (via `SYS_IPC_CALL` and `SYS_IPC_REPLY` capability slots) begins the move of
+all of a message's capabilities or of none of them — all-or-nothing at commit. A refusal detectable
+before the caller blocks fails the `SYS_IPC_CALL`; one that arises after the caller blocked delivers
+the message with zero capabilities, the sender keeping its own; a refused `SYS_IPC_REPLY` transfer
+returns the error to the server and wakes the caller with the `IPC_REPLY_TRANSFER_FAILED` reply in
+place of the server's (see [docs/ipc-design.md](../../../docs/ipc-design.md) § Message Format). Each
 capability is relocated by the batched move described under [Move](#move):
 
 ```
@@ -881,13 +880,15 @@ frees the receiver's slot (#349). A move that finishes in the first hold is atom
 against revocation; one that needs further batches is protected by the in-flight
 pins and stays revocation-complete between holds (see [Move](#move)).
 
-Reply capabilities are not part of the derivation tree — they are single-use,
-cannot be derived, and are not tracked for revocation (see
-[docs/ipc-design.md](../../../docs/ipc-design.md) § The Call/Reply Model). A reply
-capability is not a `CapTag` variant; it is an implicit per-thread mechanism
-created by the kernel at `SYS_IPC_RECV` time and stored in a per-thread slot,
-outside the process CSpace. The kernel clears the per-thread reply slot after
-`SYS_IPC_REPLY` (see [ipc-internals.md](ipc-internals.md) § Receive Path (Server)
+Reply capabilities are not part of the derivation tree — they are single-use, cannot be derived, and
+are not tracked for revocation (see [docs/ipc-design.md](../../../docs/ipc-design.md) § The
+Call/Reply Model). A reply capability is not a `CapTag` variant; it is an implicit per-thread
+binding outside the process CSpace: the receiving thread's `reply_tcb` field, which the kernel
+points at the caller when a call and a receive rendezvous — in `SYS_IPC_CALL` when the server is
+already waiting, in `SYS_IPC_RECV` when the caller is, or in kernel fault delivery
+(`core/kernel/src/ipc/fault.rs`), which takes the caller role. `SYS_IPC_REPLY` claims and clears the
+binding by compare-exchange before waking the caller (see
+[core/kernel/docs/ipc-internals.md](ipc-internals.md) § Call Path (Sender), § Receive Path (Server),
 and § Reply Path).
 
 ---

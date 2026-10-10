@@ -5,14 +5,15 @@ the first userspace instruction of init. The sequence is divided into numbered p
 each with a completion criterion and a defined failure mode.
 
 A phase failure halts the kernel with a diagnostic message unless the phase's
-failure mode states otherwise: a headless boot continues (§ Phase 1), a bad
-aperture entry is skipped (§ Phase 6), an entropy self-test FAIL is reported
-and the boot continues, and a started CPU that never announces itself leaves
-the BSP waiting at `APS_READY` (both § Phase 8).
+failure mode states otherwise: Phase 0 halts silently (no console yet), a headless boot
+continues (§ Phase 1), a bad aperture entry is skipped and valid entries beyond
+`MAX_MMIO_APERTURES` are dropped (§ Phase 6), an entropy self-test FAIL is reported and the
+boot continues, and a started CPU that never announces itself leaves the BSP waiting at
+`APS_READY` (both § Phase 8).
 
 For the boot protocol contract (CPU state and register contents, BootInfo
 layout) that Phase 0 depends on, see
-[`boot/docs/kernel-handoff.md`](../../boot/docs/kernel-handoff.md) and the
+[`core/boot/docs/kernel-handoff.md`](../../boot/docs/kernel-handoff.md) and the
 [`abi/boot-protocol/`](../../../abi/boot-protocol/) crate.
 
 ---
@@ -29,14 +30,27 @@ layout) that Phase 0 depends on, see
 5. Validate memory_map.count > 0 and memory_map.entries is non-null
 6. Validate init_image.segment_count > 0 (init must have at least one segment)
 7. Validate init_image.entry_point != 0
+8. Validate kernel_virtual_base: at or an IMAGE_SLIDE_ALIGN multiple above KERNEL_LINK_BASE,
+   and kernel_virtual_base + kernel_size does not wrap
+9. Validate direct_map_base: in the kernel half and 1 GiB-aligned
+10. Validate that the direct map (direct_map_base + boot_protocol::direct_map_ceiling) ends
+    at or below kernel_virtual_base
+11. Validate that a slid image (kernel_virtual_base above KERNEL_LINK_BASE) carries
+    KASLR_IMAGE_RANDOMIZED in kaslr_flags
+12. arch::current::paging::init_paging_mode: halt if direct_map_base is below the active
+    paging mode's kernel-half base (RISC-V: also if satp names no supported mode), then
+    publish direct_map_base
 ```
 
-No output before step 1 succeeds; console is not yet available.
+Phase 0 produces no output; the console is not available until Phase 1.
 
-**Failure mode:** Infinite halt (`loop {}` / `wfi` loop). On x86-64, the halt
-instruction is used in a loop to handle spurious wakeups.
+**Failure mode:** Infinite halt via `arch::current::cpu::halt_loop`: interrupts are
+disabled, then `hlt` (x86-64) or `wfi` (RISC-V) runs in a loop, so a spurious wakeup halts
+again.
 
-**Completion criterion:** `boot_info` pointer is valid and `version` matches.
+**Completion criterion:** `boot_info` pointer is valid, `version` matches, the KASLR layout
+(image base, direct-map base, no overlap) is accepted by `validate_boot_info` and
+`init_paging_mode`, and `init_paging_mode` has published the direct-map base.
 
 ---
 
@@ -47,17 +61,18 @@ instruction is used in a loop to handle spurious wakeups.
    - x86-64: checks boot_info.framebuffer.physical_base; if non-zero,
      initialises a simple pixel-writing framebuffer console;
      also attempts to initialise a COM1 serial port at 115200 8N1
-   - RISC-V: uses SBI console (sbi_console_putchar) as fallback;
+   - RISC-V: initialises the ns16550 UART over MMIO at BootInfo.kernel_mmio.uart_base
+     (the platform default when zero), rebased to the direct map after Phase 3;
      framebuffer initialisation same as x86-64 if present
-2. Emit a startup banner identifying the kernel and the protocol version
-3. Emit: CPU architecture identifier and core count if detectable at this stage
-4. Report the KASLR layout, then run the platform feature gate
+2. Emit a startup banner with the kernel version (KERNEL_VERSION) and architecture name
+   (ARCH_NAME), then the boot protocol version
+3. Report the KASLR layout, then run the platform feature gate
    (arch::current::cpu::verify_baseline): refuse hardware missing a required
    baseline feature with a diagnostic, before any subsystem that assumes the
-   baseline runs (see docs/platform-requirements.md)
+   baseline runs
 ```
 
-The step-4 gate and the baseline it enforces are defined in
+The step-3 gate and the baseline it enforces are defined in
 [platform-requirements.md](../../../docs/platform-requirements.md) § Boot-Time Feature Gate.
 
 The early console is allocation-free and output-only.
@@ -85,19 +100,20 @@ has accepted the platform.
       (boot_info.kernel_physical_base .. kernel_physical_base + kernel_size)
    b. Frames containing init segments
       (boot_info.init_image.segments[i].phys_addr + size for each i)
-   bb. Frames containing boot modules
+   c. Frames containing boot modules
       (boot_info.modules.entries[i].physical_base + size for each i)
-   c. Frames containing the BootInfo structure itself
-   d. Frames containing the bootloader's page tables (if identifiable)
-4. Determine buddy allocator order range:
-   - Minimum order: 0 (one 4 KiB page)
-   - Maximum order: implementation constant `MAX_ORDER` = 11 (2048 pages =
-     8 MiB), sized so the largest per-CPU boot slab at `MAX_CPUS` fits one
-     block (see memory-internals.md)
-5. Call mm::buddy::BuddyAllocator::new(max_order) — static storage, using
-   only the bootloader-provided stack
-6. For each candidate range, call BuddyAllocator::add_region(phys_start, phys_end)
-7. Emit: total usable RAM in MiB
+   d. Frames containing the BootInfo structure itself
+   e. The AP trampoline page (boot_info.ap_trampoline_page, when non-zero)
+   f. The DTB blob pages (boot_info.device_tree, sized by the FDT totalsize, when valid)
+   Exclusions are rounded outward to page boundaries.
+4. The buddy allocator is the static mm::FRAME_ALLOCATOR, built at compile time by the
+   const BuddyAllocator::new(); orders run from 0 (one 4 KiB page) to the compile-time
+   constant `MAX_ORDER` = 11 (2048 pages = 8 MiB), sized so the largest per-CPU boot slab
+   at `MAX_CPUS` fits one block
+5. For each candidate range, call BuddyAllocator::add_region(phys_start, phys_end)
+6. Emit the merged memory map and a DRAM summary (usable, loaded, firmware-reserved,
+   ACPI-reclaimable, plus persistent and MMIO-window totals when present) in scaled
+   KiB/MiB/GiB units (mm::init::print_memory_map)
 ```
 
 `MAX_ORDER` and the per-CPU boot slab sizing it accommodates are specified in
@@ -110,7 +126,7 @@ from itself.
 has no heap (see Phase 4).
 
 **Failure mode:** If total usable RAM is zero after exclusions, halt with message
-"fatal: no usable physical memory". This indicates a corrupt memory map.
+"FATAL: no usable physical memory after exclusions". This indicates a corrupt memory map.
 
 **Completion criterion:** `BuddyAllocator` is initialised and reports usable frames.
 
@@ -119,15 +135,19 @@ has no heap (see Phase 4).
 ## Phase 3: Kernel Page Tables
 
 ```
-1. Allocate a root page table frame via BuddyAllocator::alloc(order=0)
+1. Allocate a root page table frame from the BSS `BOOT_TABLE_POOL` (BOOT_TABLE_POOL_SIZE =
+   256 frames); every Phase 3 page-table frame comes from this pool, not the buddy allocator
 2. Zero the frame
 3. Map the kernel image at its virtual addresses:
    - Text segment: readable, executable, not writable
    - Rodata segment: readable, not writable, not executable
    - Data/BSS segment: readable, writable, not executable
-   (Segment addresses from ELF headers, sizes from BootInfo)
+   (Section bounds from the linker-script symbols __text_start..__bss_end; physical
+   addresses from the BootInfo kernel_virtual_base / kernel_physical_base offset; 4 KiB pages)
 4. Map the direct physical map:
-   - For each usable physical range: map at direct_map_base() + phys_addr
+   - Map [0, max RAM address) rounded up to 2 MiB — the top of every Usable, Loaded,
+     AcpiReclaimable, and Persistent entry, holes included (boot_protocol::max_ram_address)
+     — at direct_map_base() + phys
    - Use 2 MiB large pages (megapages on RISC-V); 1 GiB gigapages are not used
    - Permissions: readable, writable, not executable
    direct_map_base() is the runtime KASLR-chosen base from BootInfo — a
@@ -137,7 +157,13 @@ has no heap (see Phase 4).
    the whole direct map (RAM plus any framebuffer / kernel MMIO above the RAM
    ceiling — the shared boot_protocol::direct_map_ceiling) ends at or below
    the kernel image base; overlap is fatal.
-5. Map the BootInfo structure and boot modules (needed until they are consumed)
+5. Map the remaining boot-time windows: a 64 KiB identity window (VA == PA) around the boot
+   stack pointer, used until the stack is rebased onto the direct map right after
+   activation; the framebuffer at direct_map_base() + phys when it lies above the RAM
+   ceiling; the arch kernel MMIO regions above that ceiling (xAPIC and I/O APIC on x86-64;
+   none on RISC-V); and the AP trampoline page as a 4 KiB RWX identity page, retired in
+   Phase 8. BootInfo and boot modules are not mapped: after activation the kernel reaches
+   them through the direct map.
 6. Install the new page table:
    arch::current::paging::activate(root_phys)
 7. The bootloader page table is no longer referenced; its frames are
@@ -164,8 +190,10 @@ rule is recorded in [cross-boundary-disclosure.md](cross-boundary-disclosure.md)
 After this phase, the kernel can access any physical frame at `direct_map_base() + phys`.
 All kernel pointers derived from physical addresses use this translation.
 
-**Failure mode:** Frame allocation failure during page table construction is fatal.
-Emit "fatal: cannot build kernel page tables (OOM)" and halt.
+**Failure mode:** Exhausting `BOOT_TABLE_POOL` during page table construction is fatal:
+"FATAL: Phase 3: boot page table pool exhausted (RAM > 248 GiB?)". A direct map that would
+overlap the kernel image window halts with
+"FATAL: Phase 3: direct map would overlap the kernel image window".
 
 **Completion criterion:** The kernel is executing with its own page tables active.
 
@@ -176,7 +204,7 @@ Emit "fatal: cannot build kernel page tables (OOM)" and halt.
 ```
 1. No kernel heap is set up: the kernel runs no `GlobalAlloc`, and every
    kernel-object body is carved out of a Memory capability by retype
-   (`cap/retype.rs`) — the SEED reserve for the kernel's own objects from
+   (`core/kernel/src/cap/retype.rs`) — the SEED reserve for the kernel's own objects from
    Phase 7 on, a caller-supplied capability at each `cap_create_*` syscall.
    The phase carries no setup cost; the machinery is live once `SEED_MEMORY`
    is installed in Phase 7.
@@ -184,9 +212,12 @@ Emit "fatal: cannot build kernel page tables (OOM)" and halt.
 3. Cache the bootloader-discovered kernel MMIO bases from `BootInfo` for
    Phase 5 (`platform::capture_kernel_mmio`)
 4. Allocate per-CPU subsystem storage from the buddy allocator while it still
-   holds large contiguous blocks (before the Phase-7 user-cap drain): scheduler
-   per-CPU state and idle stacks, and the entropy subsystem's per-CPU CSPRNGs,
-   central pool, jitter accumulators, and self-test sample slab (see entropy.md)
+   holds large contiguous blocks (before the Phase-7 user-cap drain): the scheduler
+   slabs (per-CPU schedulers, idle TCBs, idle-stack tops plus one idle kernel stack per
+   CPU, watchdog ticks), the PerCpuData and APIC-ID slabs, and on x86-64 the per-AP
+   GDT/TSS, IST stacks, and NMI-backtrace storage (`sched::init_storage`); then the
+   entropy subsystem's per-CPU CSPRNGs, central pool, jitter accumulators, and
+   self-test sample slab (`entropy::init_storage`)
 ```
 
 Retype-based kernel object memory, which replaces a kernel heap, is specified in
@@ -207,28 +238,29 @@ Architecture-specific hardware initialization; x86-64 and RISC-V diverge here.
 ### x86-64
 
 ```
-1. Construct and install a permanent GDT:
+1. Enable SMEP and SMAP in CR4 (fatal if CPUID lacks either; both are required and
+   already gated in Phase 1)
+2. Enable XSAVE (x87 | SSE | AVX in XCR0) and set CR0.TS for lazy FPU/SIMD save-restore
+3. Construct and install the permanent GDT and the BSP's TSS:
    - Null descriptor (index 0)
    - Kernel code segment (64-bit, DPL 0)
    - Kernel data segment (DPL 0)
    - User data segment (DPL 3)
    - User code segment (64-bit, DPL 3)
    - TSS descriptor (per CPU)
-2. For each CPU, construct a TSS:
-   - RSP0: kernel stack pointer for privilege transitions
-   - IST1..IST7: interrupt stack table entries (for NMI, double fault, etc.)
-3. Construct and install the IDT:
-   - Exception handlers for vectors 0–31 (divide error, page fault, etc.)
-   - APIC timer vector (preemption)
-   - Spurious interrupt vector
-   - Syscall vector (though SYSCALL/SYSRET bypasses the IDT)
-4. Enable SMEP and SMAP in CR4 if CPUID reports support
-5. Configure SYSCALL/SYSRET:
-   - Write kernel entry point to LSTAR MSR
-   - Write segment selectors to STAR MSR
-   - Write SFMASK to clear IF on entry
-6. Initialise the local APIC on the BSP
-7. Configure the preemption timer (period from scheduler policy):
+   - BSP TSS: RSP0 = the current kernel stack pointer; IST1 = double-fault stack,
+     IST2 = NMI stack (carved from BSS BSP_IST_STACKS)
+   Each AP installs its own GDT/TSS from the Phase 4 per-AP storage when it starts in
+   Phase 8.
+4. Construct and install the IDT:
+   - Exception handlers for vectors 0–31 (double fault on IST1, NMI on IST2)
+   - APIC timer vector (32) and spurious vector (255)
+   - TLB-shootdown (250) and wakeup (251) IPI vectors
+   - Device IRQ vectors 33–55 (I/O APIC GSIs 0–22)
+5. Switch to x2APIC mode where CPUID advertises it, software-enable the BSP local APIC
+   with every LVT masked, and mask every I/O APIC entry
+6. Configure SYSCALL/SYSRET: set EFER.SCE; write LSTAR, STAR, SFMASK (clears IF on entry)
+7. Configure the preemption timer at a fixed 1 ms period (`timer::init(1_000)`):
    TSC-deadline mode where CPUID advertises it, periodic APIC timer otherwise
 8. Enable interrupts (STI)
 ```
@@ -239,25 +271,31 @@ The step-7 timer mode selection is specified in [arch-interface.md](arch-interfa
 ### RISC-V
 
 ```
-1. Write trap handler address to stvec (direct mode)
+1. Write trap handler address to stvec (direct mode) and clear sscratch
 2. Configure sstatus:
-   - Clear SIE (interrupts remain disabled until scheduler starts)
+   - Clear SIE (interrupts stay disabled until timer::init sets SIE at the end of this phase)
    - Clear SPP (so sret returns to U-mode by default)
    - Clear SUM (no supervisor access to user pages)
-3. Enable SEIP, STIP in sie (external and timer interrupt enables)
-4. Initialise PLIC for this hart: configure priorities and enables
-5. Arm stimecmp (Sstc) for the initial tick, using the bootloader-discovered
+   - Set FS and VS Off for lazy FPU/vector save-restore and cache vlenb (halts without
+     the V extension)
+3. Enable SSIP, STIP, SEIP in sie (software-IPI, timer, and external interrupt enables)
+4. Grant U-mode the cycle counter (scounteren.CY)
+5. Initialise the PLIC for the BSP context: priority 1 for every source, all enables
+   cleared, threshold 0
+6. Arm stimecmp (Sstc) for the initial tick, using the bootloader-discovered
    timebase; halts if Sstc or the timebase was not discovered
-6. Enable interrupts (set sstatus.SIE)
+7. Enable interrupts (set sstatus.SIE)
 ```
 
 Within the architecture hardware path, after interrupt and per-CPU setup and before the
 syscall entry and preemption timer are configured, the BSP checks the boot-gated paging
-extensions, then enables hardware address-space tags (x86-64 PCID, RISC-V ASID) where the
-hardware provides them and allocates the per-CPU tag-state slab (`PER_CPU_TAG_STATE`), sized
-to the boot CPU count, from the buddy allocator. Where tags are absent, or too few for the
-CPU count, no slab is allocated and context switch keeps the full-flush path. The slab is a
-fixed kernel reserve allocated before the Phase 7 drain; see
+extensions, then enables hardware address-space tags (x86-64 PCID with INVPCID where present,
+RISC-V ASID, whose absence is fatal) and allocates the per-CPU tag-state slab
+(`PER_CPU_TAG_STATE`), sized to the boot CPU count, from the buddy allocator. Where
+PCID/INVPCID is absent (x86-64), or the tags are too few for the CPU count (either
+architecture), no slab is allocated and context switch keeps the full-flush path; a RISC-V
+hart without ASIDs is refused. The slab is a fixed kernel reserve allocated before the
+Phase 7 drain; see
 [memory-model.md](../../../docs/memory-model.md) § TLB Management.
 
 After the architecture hardware path, the BSP seeds the entropy pool from the
@@ -269,7 +307,11 @@ seed, its length, and the two KASLR bases from that page (a Phase-7 reclaim
 range). See [entropy.md](entropy.md).
 
 **Failure mode:** Hardware initialisation failures halt with a descriptive
-message. The required-feature baseline itself is checked in Phase 1.
+message. The x86-64 required-feature baseline is checked in Phase 1. On RISC-V, Phase 1
+gates only the SBI HSM extension; the Vector extension, the ASID-tagged TLB, Sstc and the
+timebase, and the Svpbmt/Svinval/Svnapot paging extensions are refused here, at their
+initialization sites
+([platform-requirements.md](../../../docs/platform-requirements.md) § Boot-Time Feature Gate).
 
 **Completion criterion:** Interrupts are enabled, the preemption timer is running,
 and the syscall entry mechanism is installed.
@@ -291,11 +333,16 @@ Validates `mmio_apertures` before Phase 7 mints capabilities from it
    - Verify phys_base is page-aligned; skip with warning if not.
    - Verify size > 0 and size is page-aligned; skip with warning if not.
    - Verify phys_base + size does not wrap u64; skip with warning if not.
-5. Emit: "mmio apertures: N validated (M skipped)".
+   - Accept at most MAX_MMIO_APERTURES (64) valid entries; any further valid entry is
+     dropped and counted.
+5. Emit: "mmio apertures: N validated (M skipped)", or "mmio apertures: N validated
+   (M skipped, D dropped — exceeded MAX_MMIO_APERTURES)" when entries were dropped.
 ```
 
-**Failure mode:** Null `entries` when `count > 0`: halt with "fatal:
-mmio_apertures.entries is null with non-zero count". Individual bad
+**Failure mode:** Null `entries` when `count > 0` halts with
+"FATAL: Phase 6: mmio_apertures.entries is null with non-zero count"; an entries slice not
+wholly inside Usable/Loaded memory halts with
+"FATAL: Phase 6: mmio_apertures slice falls outside Usable/Loaded memory". Individual bad
 entries: emit a warning and skip.
 
 **Completion criterion:** The validated aperture list is available to
@@ -306,16 +353,21 @@ Phase 7.
 ## Phase 7: Capability System
 
 ```
-1. Initialise the global derivation tree (initially empty)
-2. Allocate the root CSpace:
-   - Initial capacity: ROOT_CSPACE_INITIAL_SLOTS (e.g. 1024 slots)
+1. Reserve init's Phase 9 backing (the InitInfo block and INIT_STACK_PAGES stack frames)
+   and seed the kernel page-table pool from the pristine buddy, then drain the remaining
+   buddy RAM, seal the buddy, and install SEED_MEMORY over the front SEED_RESERVE_BYTES of
+   the largest drained block (`cap::drain_and_install_seed`)
+2. Boot-retype the root CSpace from SEED_MEMORY (`boot_retype_cspace`, ROOT_CSPACE_INIT_PAGES
+   pages: one wrapper page plus a slot-page pool holding at least
+   ROOT_CSPACE_INIT_SLOT_CAPACITY = 1536 slots) and register it as CSpace id 0:
    - Slot 0 is permanently null
 3. Populate the root CSpace with initial capabilities:
-   a. Memory capabilities for all usable physical memory ranges
-      (one capability per contiguous usable region from the memory map)
+   a. Memory capabilities for the RAM drained from the buddy allocator in step 1: one per
+      contiguous extent after physically adjacent drained blocks are coalesced, the seed
+      block contributing only its tail past SEED_RESERVE_BYTES
    b. Mmio capabilities (Map | Write rights): on RISC-V, first one over the
       kernel console UART (`BootInfo.kernel_mmio.uart_base`, or the platform
-      default when that is zero; outside the apertures), then one per
+      default when that is zero; the range can also lie inside an aperture), then one per
       validated `BootInfo.mmio_apertures` entry.
       Userspace narrows these into per-device sub-caps and distributes them
       to drivers.
@@ -338,13 +390,11 @@ Phase 7.
       attenuate per-consumer copies.
    g. Memory capabilities for the boot module images, via
       `cap::mint_module_memory_caps` (one per `BootInfo.modules` entry).
-   h. (Thread and process capabilities for init are added in Phase 9)
+   h. (Init's AddressSpace, Thread, and CSpace capabilities and the Memory capabilities
+      for its segments, InitInfo pages, and stack pages are added in Phase 9)
 
-   Before the drain in step 3a the InitInfo block, init's INIT_STACK_PAGES
-   stack frames, and the kernel page-table pool are reserved from the
-   pristine buddy; the drain then takes the remainder, and the SEED reserve
-   is pinned out of the front of the largest drained block. Phase 9
-   therefore consumes only pages already accounted as kernel-reserved.
+   Because step 1 reserves Phase 9's backing before the drain takes the
+   remainder, Phase 9 consumes only pages already accounted as kernel-reserved.
 4. Mint reclaimable Memory caps from `BootInfo.reclaim_ranges` via
    `cap::mint_reclaim_memory_caps`:
    - One cap per range with `owns_memory = true` and full byte ledger;
@@ -368,8 +418,9 @@ Init's reap-time donation of the reclaim caps is described in
 sealed buddy in
 [userspace-memory-model.md § Ownership Boundaries](../../../docs/userspace-memory-model.md#ownership-boundaries).
 
-**Failure mode:** Allocation failure during CSpace construction halts with
-"fatal: cannot initialise capability system".
+**Failure mode:** An allocation or insertion failure during CSpace construction halts
+through `fatal` with a message naming the failed site (for example "Phase 7: cannot allocate
+Mmio capability for aperture").
 
 **Completion criterion:** Root CSpace exists and contains capabilities for all
 boot-provided hardware resources, including the reclaimable Memory caps
@@ -386,29 +437,31 @@ The scratch pages and bundle layout are described in
 ## Phase 8: Scheduler and SMP Bringup
 
 ```
-1. Initialise per-CPU run queues:
-   - NUM_PRIORITY_LEVELS priority queues per CPU (e.g. 32 levels)
-   - Each queue is an intrusive singly-linked FIFO of TCBs (head/tail,
-     linked through run_queue_next)
+1. Use the per-CPU run queues initialised with the scheduler slab in Phase 4:
+   NUM_PRIORITY_LEVELS (32) queues per CPU, each an intrusive singly-linked FIFO of TCBs
+   (head/tail, linked through run_queue_next)
 2. For each CPU (including the BSP):
    a. Use the idle kernel stack pre-allocated at per-CPU storage init
       (Phase 4); read its top from the IDLE_STACK_TOPS slab
-   b. Allocate and initialise an idle TCB:
+   b. Initialise the CPU's idle TCB in place in its slot of the IDLE_TCBS slab (allocated in
+      Phase 4):
       - Priority: IDLE_PRIORITY (lowest, reserved; never preempted)
-      - Entry: arch::current::context::new_state(idle_entry, stack_top, cpu_id, false)
+      - Entry: arch::current::context::new_state(idle_thread_entry, stack_top, cpu_id, false)
       - Idle thread entry calls cpu::halt_until_interrupt() in a loop,
         checking for pending work before each halt
-   c. Set the per-CPU current_thread pointer to the idle TCB
+   c. Register the idle TCB as the CPU scheduler's idle and current thread (set_idle,
+      set_current)
 3. Emit: "scheduler initialised, N CPUs"
 4. For each AP listed in BootInfo.cpu_ids[1..cpu_count]:
    a. Patch per-AP startup parameters into the trampoline page
    b. Send SIPI (x86-64) / SBI HSM hart_start (RISC-V)
-   c. Wait for APS_READY.fetch_add(1) before launching the next AP
+   c. Spin on an Acquire load of APS_READY until it reaches this AP's index (the AP
+      increments it with a Release fetch_add once online) before launching the next AP
       (the Acquire load doubles as the barrier guaranteeing the AP has
       jumped from the trampoline page to its kernel-VA entry)
 5. Run the entropy power-on self-test across all online CPUs: each CPU captured
    a sample from its generator during bringup, and the BSP now checks per-CPU
-   independence and basic sanity, printing PASS/FAIL (see entropy.md).
+   independence and basic sanity, printing PASS/FAIL.
 6. Tear down the low-VA identity mapping at the trampoline PA via
    mm::paging::unmap_identity_page (TLB shootdown to all other CPUs), then
    zero the page through the direct map: its parameter block carried the
@@ -424,29 +477,34 @@ The run-queue structure, idle priority, and idle-thread loop are specified in
 self-test in [entropy.md](entropy.md) § Boot wiring and lifecycle.
 
 The AP SIPI trampoline page is flagged `RECLAIM_FLAG_LATE` in
-`BootInfo.reclaim_ranges`. `cap::mint_reclaim_memory_caps` skips it in
-Phase 7; this phase mints it after SMP bringup completes and
-`mm::paging::unmap_identity_page` retires the low-VA identity-RWX
+`BootInfo.reclaim_ranges` ([boot-flow.md](../../boot/docs/boot-flow.md) § Step 9: Populate
+BootInfo). `cap::mint_reclaim_memory_caps` skips it in Phase 7; this phase mints it
+after SMP bringup completes and `mm::paging::unmap_identity_page` retires the low-VA identity-RWX
 mapping. (Both arches install this identity mapping in Phase 3 — the
 trampoline must remain executable at its PA while PC walks the
 post-`csrw satp` / post-CR3-write instructions.) The late-mint
 completes before Phase 9 consumes `cspace_layout`, so the descriptor
 still flows through the standard CSpace handoff.
 
-APs depend only on Phase 5/8 state (interrupts, percpu, scheduler
-idle threads); they never touch init's address space or any Phase-9
+APs depend only on Phase 3–8 state (direct map, per-CPU storage, interrupts, the entropy
+pool, scheduler idle threads); they never touch init's address space or any Phase-9
 state, so SMP bringup completes within Phase 8 and the trampoline page
 is reclaim-safe by the time Phase 9 consumes `cspace_layout`.
 
-**Failure mode:** Allocation failure for any idle stack or TCB halts with
-"fatal: cannot initialise scheduler". A rejected `start_ap` (riscv64, where
-SBI reports a hart it cannot start), or a zero `BootInfo.ap_trampoline_page`
-with more than one CPU listed, is fatal: every CPU the boot reported is
-assumed online from Phase 8 on (IPI targets, scheduler placement, affinity),
-so a CPU that cannot be started halts the boot with a descriptive message.
+**Failure mode:** Phase 8 allocates nothing from the buddy: the scheduler slab, the idle TCB
+slab, and the idle stacks come from the Phase 4 per-CPU storage, and a failure to allocate
+them halts in Phase 4. Step 7 retypes the late-reclaim Memory cap's body from `SEED_MEMORY`
+and inserts the cap into the root CSpace; a SEED or CSpace failure there halts through
+`fatal`. A rejected `start_ap` (riscv64, where SBI reports a hart it cannot start), or a zero
+`BootInfo.ap_trampoline_page` with more than one CPU listed, is fatal: every CPU the boot
+reported is assumed online from Phase 8 on (IPI targets, scheduler placement, affinity), so a
+CPU that cannot be started halts the boot with a descriptive message.
 A started CPU that never announces itself leaves the BSP waiting at
 `APS_READY` on either architecture; on x86-64 that wait is the only signal,
 since SIPI delivery is unacknowledged and `start_ap` cannot report a failure.
+An AP that provides fewer hardware TLB tags than the BSP configured halts itself with
+"AP provides fewer hardware TLB tags than the BSP configured" before announcing itself,
+which leaves the BSP waiting at `APS_READY`.
 An entropy self-test FAIL (step 5) is printed and the boot continues; the
 marker is matched by the `run-parallel` fail regex, which turns a QEMU run red
 (see [entropy.md](entropy.md) § Testing).
@@ -469,8 +527,8 @@ calls `sched::enter()`.
 1. Validate boot_info.init_image:
    a. Verify segment_count > 0
    b. Verify entry_point != 0
-   c. PIE rebase (INIT_IMAGE_FLAG_PIE set — every init image since the
-      #39 target flip): draw the load bias from the entropy pool
+   c. PIE rebase (INIT_IMAGE_FLAG_PIE set — the userspace targets link init as a static
+      PIE, #39): draw the load bias from the entropy pool
       (process_layout::choose_image_bias; window base if unseeded),
       validate the biased span (validate_image_placement), apply the
       .rela.dyn RELATIVE relocations through the direct map
@@ -502,7 +560,7 @@ calls `sched::enter()`.
       contiguous block reserved in Phase 7, map it read-only at the chosen
       InitInfo VA (`choose_init_layout().init_info_va`), and mint a
       reclaimable Memory cap per mapped InitInfo page into the root CSpace
-4. Map init's user stack (inlined in `kernel_entry`):
+4. Map init's user stack (inlined in `kernel_entry_post_rebase`):
    a. Take the INIT_STACK_PAGES (4) frames reserved from the buddy in
       Phase 7, before the user-cap drain, one at a time so each phys
       address is captured for the reclaim Memory cap minted alongside it
@@ -524,17 +582,22 @@ calls `sched::enter()`.
    d. Mint the Thread cap (CONTROL) for init's thread into the root CSpace
    e. Mint the CSpace cap (INSERT | DELETE | DERIVE) for the root CSpace into
       itself, then patch both slots into InitInfo
-   f. cspace: set to ROOT_CSPACE raw pointer (handed off at `sched::enter()` start)
+   f. cspace: take the root CSpace pointer with `cap::take_root_cspace` (which clears
+      ROOT_CSPACE) and store it, with its id and registry epoch, in the init TCB
 6. Enqueue the init TCB on the BSP's run queue at INIT_PRIORITY
 7. Call sched::enter() — does not return:
    a. Dequeue the highest-priority ready thread (init)
    b. Build an initial user-mode TrapFrame on init's kernel stack:
       rip/sepc=entry_point, rsp/sp=chosen init stack top, cs=USER_CS, ss=USER_DS,
       rflags=0x202 (IF=1)
-   c. x86-64: call switch_and_enter_user(root_phys, tf_ptr) — atomically
-      switches RSP to init's kernel stack, writes CR3, builds iretq frame, iretq
-   d. RISC-V: activate init's address space (satp write + sfence.vma),
-      then return_to_user(tf_ptr) — restores registers and executes sret
+   c. x86-64: `first_entry_to_user` composes the CR3 value (init's root, OR'd with its
+      claimed PCID when tagging is enabled) and calls switch_and_enter_user(cr3, tf_ptr),
+      which switches RSP to init's kernel stack, writes CR3, builds the iretq frame, and
+      executes iretq
+   d. RISC-V: `first_entry_to_user` activates init's address space (`AddressSpace::activate`:
+      a satp write, ASID-tagged when tagging is enabled, with a flush only when the per-CPU
+      generation check requires one), then calls return_to_user(tf_ptr), which restores
+      registers and executes sret
 ```
 
 The PIE bias window, relocation rules, and init stack placement are defined in
@@ -546,12 +609,12 @@ the reap-time donation of the segment, InitInfo, and stack pages in
 
 **Implementation notes:**
 - CSpace hand-off (step 5f): `sched::enter()` calls `set_current(init_tcb)` so
-  `current_tcb()` returns the init TCB during init's syscalls; init receives
-  ROOT_CSPACE.
-- The x86-64 `switch_and_enter_user` function atomically switches the stack pointer
-  BEFORE writing CR3. This is required because the boot stack is identity-mapped in
-  PML4 entries 0–255 (the lower half), which are not copied into init's page tables.
-  Any function call/return on the boot stack after the CR3 write would page-fault.
+  `current_tcb()` returns the init TCB during init's syscalls; init's TCB holds the former
+  root CSpace (step 5f).
+- The x86-64 `switch_and_enter_user` function switches the stack pointer to init's kernel
+  stack before writing CR3 and builds the `iretq` frame there. The boot stack was rebased
+  onto the direct map in Phase 3 (`rebase_boot_stack`), and init's page tables share that
+  mapping through the copied kernel root entries 256–511.
 - Init segment frames stay mapped in init's address space; their reclaimable Memory
   caps (step 3b) are donated at reap
   ([process-lifecycle.md § Init reap](../../../docs/process-lifecycle.md#init-reap)).
@@ -569,19 +632,15 @@ failed step. Invalid init_image (zero segment_count or zero entry_point) halts w
 At any phase, if the kernel cannot continue:
 
 ```rust
-fn fatal(msg: &str) -> !
+pub(crate) fn fatal(msg: &str) -> !
 {
-    // Disable interrupts to prevent re-entrant failure handling.
-    arch::current::interrupts::disable();
-    console::panic_write_fmt(format_args!("KERNEL FATAL: {msg}\n"));
-    loop
-    {
-        // Halt until the next interrupt (hlt on x86-64; wfi on RISC-V).
-        // Interrupts are left disabled — this CPU is not taking further work.
-        arch::current::cpu::halt_until_interrupt();
-    }
+    kprintln!("FATAL: {}", msg);
+    arch::current::cpu::halt_loop();
 }
 ```
+
+`halt_loop` disables interrupts and halts the calling CPU permanently (`hlt` on x86-64,
+`wfi` on RISC-V).
 
 Secondary CPU failures after Phase 9 (user-mode entry) are handled by `fatal()` on
 that CPU only; the BSP and other CPUs continue.
@@ -595,12 +654,12 @@ that CPU only; the BSP and other CPUs continue.
 | 0 | Validate BootInfo version | Silent halt |
 | 1 | Early console; platform feature gate | Halt: missing required baseline feature (no console is non-fatal) |
 | 2 | Buddy allocator from memory map | Halt: no usable RAM |
-| 3 | Kernel page tables + direct map | Halt: OOM during PT construction |
+| 3 | Kernel page tables + direct map | Halt: BOOT_TABLE_POOL exhausted; direct map would overlap the kernel image window |
 | 4 | Typed-memory cap surface; per-CPU storage | Halt: per-CPU storage allocation failed |
 | 5 | CPU hardware (IDT/GDT/TSS/stvec); seed entropy pool | Halt: hardware initialisation failure |
-| 6 | Platform resource validation | Halt if entries pointer is null with non-zero count; bad entries skipped |
+| 6 | Platform resource validation | Halt: null entries with non-zero count, or entries slice outside Usable/Loaded memory; bad entries skipped, entries beyond MAX_MMIO_APERTURES dropped |
 | 7 | Capability system + root CSpace | Halt: OOM |
-| 8 | Scheduler + idle threads, SMP bringup, AP trampoline reclaim, entropy self-test | Halt: OOM (idle stack/TCB); rejected start_ap (riscv64); zero ap_trampoline_page with more than one CPU listed. A started CPU that never announces itself leaves the BSP waiting (x86-64 cannot detect this earlier: SIPI is unacknowledged); an entropy self-test FAIL is printed and the boot continues |
+| 8 | Scheduler + idle threads, SMP bringup, AP trampoline reclaim, entropy self-test | Halt: rejected start_ap (riscv64); zero ap_trampoline_page with more than one CPU listed; late-reclaim cap mint failure (SEED / CSpace). A started CPU that never announces itself leaves the BSP waiting (x86-64 cannot detect this earlier: SIPI is unacknowledged); an entropy self-test FAIL is printed and the boot continues |
 | 9 | Init creation + scheduler entry (user mode) | Halt: invalid InitImage or OOM |
 
 ---
@@ -608,7 +667,8 @@ that CPU only; the BSP and other CPUs continue.
 ## Summarized By
 
 [abi/boot-protocol/README.md](../../../abi/boot-protocol/README.md),
-[Boot Flow](../../boot/docs/boot-flow.md), [ELF Loading](../../boot/docs/elf-loading.md),
+[core/boot/README.md](../../boot/README.md), [Boot Flow](../../boot/docs/boot-flow.md),
+[ELF Loading](../../boot/docs/elf-loading.md),
 [Firmware Parsing](../../boot/docs/firmware-parsing.md),
 [Kernel Handoff Contract](../../boot/docs/kernel-handoff.md),
 [Memory Map Translation](../../boot/docs/memory-map.md),

@@ -5,10 +5,10 @@
 
 //! x86-64 4-level (PML4) page table construction for the bootloader.
 //!
-//! Builds the minimal initial page tables needed for kernel handoff.
-//! All intermediate frames are allocated via UEFI `AllocatePages` before
-//! `ExitBootServices`. W^X is enforced: any mapping with both writable and
-//! executable flags returns [`MapError::WxViolation`].
+//! Builds the minimal initial page tables needed for kernel handoff. Frame
+//! allocation and W^X enforcement follow `core/boot/docs/page-tables.md`
+//! (preamble and § W^X Enforcement); `map` reports a W^X request as
+//! [`MapError::WxViolation`].
 
 use crate::paging::{MapError, PageFlags, PageTableBuilder};
 
@@ -27,14 +27,13 @@ const TABLE_ENTRIES: usize = 512;
 
 /// Capacity of the page-table frame log used for post-handoff reclamation.
 ///
-/// Sized to cover the root PML4 plus every intermediate frame allocated
-/// during identity mapping of kernel, init, modules, framebuffer, and
-/// file-read buffers. Empirically a six-module seraph boot uses ~75
-/// frames; this cap provides ~50% headroom. The reclaim array's backing
-/// page in `BootInfo` holds up to `MAX_RECLAIM_RANGES` (256) entries, so
-/// this cap is the binding limit; `alloc_table` returns `None` once
-/// exhausted, propagating as `BootError::OutOfMemory` — diagnose by
-/// bumping this constant rather than silently truncating.
+/// Covers the root PML4 plus every intermediate frame `map` allocates for the
+/// mappings `core/boot/docs/page-tables.md` § Contract at Kernel Entry lists.
+/// The reclaim array's backing page in `BootInfo` holds up to
+/// `boot_protocol::MAX_RECLAIM_RANGES` (256) entries, so this cap is the
+/// binding limit; `alloc_table` returns `None` once exhausted, propagating as
+/// `BootError::OutOfMemory` — diagnose by bumping this constant rather than
+/// silently truncating.
 const FRAME_LOG_CAP: usize = 128;
 
 /// x86-64 4-level page table builder.
@@ -48,9 +47,9 @@ pub struct BootPageTable
     /// UEFI boot services pointer for frame allocation.
     bs: *mut crate::uefi::EfiBootServices,
     /// Physical addresses of every frame allocated for this builder's tables
-    /// (root + every intermediate frame). Recorded in `BootInfo.reclaim_ranges`
-    /// so the kernel can reclaim them once Phase 3 has installed its own
-    /// page tables.
+    /// (root + every intermediate frame), appended to `BootInfo.reclaim_ranges`
+    /// for kernel reclamation per `core/boot/docs/page-tables.md` § Page Table
+    /// Frame Tracking.
     frame_log: [u64; FRAME_LOG_CAP],
     /// Number of valid entries in [`Self::frame_log`].
     frame_log_len: usize,
@@ -89,8 +88,8 @@ impl PageTableBuilder for BootPageTable
             return Err(MapError::WxViolation);
         }
 
-        // Round size up to a page boundary so callers with non-aligned sizes are
-        // handled safely. Well-behaved callers always pass aligned sizes.
+        // Round size up to a page boundary: kernel segments arrive with their
+        // unaligned ELF p_memsz (`build_initial_tables` in core/boot/src/paging.rs).
         let aligned_size = (size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
 
         let mut offset: u64 = 0;

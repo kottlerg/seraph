@@ -6,12 +6,10 @@
 //! Integration: an address-space terminal-fault observer bound *after* a thread
 //! in that space already faulted still receives the retained fault reason.
 //!
-//! The address-space analogue of `death_notification_late_bind`. When a thread
-//! terminal-faults, `post_aspace_death_notification` records the reason on the
-//! `AddressSpace`, and `sys_aspace_bind_notification` serialises on the space's
-//! `death_lock`: a bind onto an already-faulted space delivers the retained
-//! reason instead of dropping it — closing the bind-after-fault window for an
-//! observer bound after the space was running.
+//! The address-space analogue of `death_notification_late_bind`: it exercises
+//! the retained-reason delivery of `core/kernel/docs/syscalls.md`
+//! § `SYS_ASPACE_BIND_NOTIFICATION` (kernel side: `post_aspace_death_notification`
+//! and `AddressSpace::bind_or_retained`).
 //!
 //! Isolation: the faulting thread runs in a *dedicated* address space (not the
 //! test's), so recording its terminal fault never touches shared state. The
@@ -63,7 +61,8 @@ pub fn run(ctx: &TestContext) -> TestResult
     {
         let packed = cap_info(thread, CAP_INFO_THREAD_STATE)
             .map_err(|_| "aspace_fault_notification_late_bind: cap_info(THREAD_STATE) failed")?;
-        // cast_possible_truncation: 8-bit state in the high word, 32-bit reason low.
+        // cast_possible_truncation: the high word is the 32-bit state code
+        // (`CAP_INFO_THREAD_STATE`), so `packed >> 32` fits in u32.
         #[allow(clippy::cast_possible_truncation)]
         let state = (packed >> 32) as u32;
         if state == THREAD_STATE_EXITED
@@ -83,8 +82,9 @@ pub fn run(ctx: &TestContext) -> TestResult
         return Err("aspace_fault_notification_late_bind: thread did not terminal-fault");
     }
 
-    // Bind an aspace observer AFTER the fault; the kernel delivers the retained
-    // reason synchronously inside the bind syscall.
+    // Bind an aspace observer AFTER the fault; the retained reason must already
+    // be queued when the bind returns (core/kernel/docs/syscalls.md
+    // § `SYS_ASPACE_BIND_NOTIFICATION`).
     let eq = event_queue_create(ctx.memory_base, 4)
         .map_err(|_| "aspace_fault_notification_late_bind: event_queue_create failed")?;
     aspace_bind_notification(aspace, eq, CORR)

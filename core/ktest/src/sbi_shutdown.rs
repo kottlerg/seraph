@@ -24,7 +24,9 @@ const SRST_REASON_NONE: u64 = 0;
 
 /// Attempt SBI SRST shutdown. Does not return on success.
 ///
-/// On failure (missing cap, SBI not supported), logs a warning and returns.
+/// With no `SbiControl` cap, logs a warning and returns. If the SRST call
+/// returns (the firmware lacks SRST or refused the reset), halts without
+/// logging.
 pub fn shutdown(info: &InitInfo)
 {
     let sbi_cap = info.sbi_control_cap;

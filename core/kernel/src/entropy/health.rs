@@ -3,21 +3,11 @@
 
 // core/kernel/src/entropy/health.rs
 
-//! Continuous health tests for the hardware RNG (NIST SP 800-90B §4.4).
-//!
-//! Samples are processed byte-wise through the Repetition Count Test (RCT,
-//! §4.4.1) and the Adaptive Proportion Test (APT, §4.4.2) to catch a noise
-//! source that goes stuck or grossly biased. Per §4.3, the source is not
-//! trusted until [`STARTUP_BYTES`] bytes have passed both tests. On any
-//! failure the source is permanently distrusted and the subsystem falls back
-//! to jitter — the hardware RNG is never the sole input regardless.
-//!
-//! Cutoffs assume a conservative assessed min-entropy of [`ASSESSED_H`]
-//! bits/byte. RCT uses the spec formula `C = 1 + ceil(-log2(α)/H)` with
-//! α = 2⁻³⁰. APT uses the spec's windowed mechanism with a conservative cutoff
-//! (a single value dominating ¾ of the window): trivially tripped by a stuck or
-//! near-stuck source, with negligible false-positive on a uniform source
-//! (expected count W·2⁻ᴴ, many σ below the cutoff).
+//! Continuous health tests for the hardware RNG (NIST SP 800-90B §4.4):
+//! the Repetition Count Test (§4.4.1), the Adaptive Proportion Test
+//! (§4.4.2), and the §4.3 startup gate, applied byte-wise. Cutoffs, startup
+//! length, and the failure policy: [entropy.md](../../docs/entropy.md)
+//! § Health tests (hardware RNG gating).
 
 /// Conservative assessed min-entropy per byte from the hardware source.
 const ASSESSED_H: u32 = 1;

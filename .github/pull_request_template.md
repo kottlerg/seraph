@@ -16,7 +16,10 @@ Closes #<issue>
 - [ ] additional component-specific checks: <…>
 
 ## Validation
-<validated head; for a documentation-only or comment-only delta since it, say so>
+<validated head; for a documentation-only or comment-only delta since it, say so; for each
+trigger path the diff touches (docs/testing.md § Coverage tiers), the local host runs made and the
+commit they ran at; for each behaviour-neutral change on a trigger path, name it and why no local
+host run is owed>
 
 ## Notes
 <design tradeoffs; follow-ups filed as Issues; anything reviewers should see>

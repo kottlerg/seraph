@@ -8,8 +8,9 @@
 //! Covers: `SYS_CAP_CREATE_WAIT_SET`, `SYS_WAIT_SET_ADD`,
 //! `SYS_WAIT_SET_REMOVE`, `SYS_WAIT_SET_WAIT`.
 //!
-//! Tests cover immediate return (source already ready) and blocking return
-//! (child thread fires source while we wait). The remove test verifies that
+//! Tests cover immediate return (source signalled before the wait) and
+//! cross-thread return (a child thread signals the source; the parent blocks
+//! unless the unpinned child signals first). The remove test verifies that
 //! only the remaining member can wake the wait set after removal.
 
 use syscall::{
@@ -28,8 +29,9 @@ static mut CHILD_STACK: ChildStack = ChildStack::ZERO;
 
 // ── wait_set_add (notification, immediate wake) ────────────────────────────────────
 
-/// Adding a notification with pre-set bits to a wait set causes `wait_set_wait`
-/// to return immediately with the correct badge.
+/// Signalling a notification already registered in a wait set causes
+/// `wait_set_wait` to return immediately with the member's badge (the send
+/// queues the member on the wait set's ready ring).
 pub fn add_notification_immediate(ctx: &TestContext) -> TestResult
 {
     let ws = wait_set_create(ctx.memory_base).map_err(|_| "wait_set_create failed")?;
@@ -57,8 +59,9 @@ pub fn add_notification_immediate(ctx: &TestContext) -> TestResult
 
 // ── wait_set_add (event queue, immediate wake) ────────────────────────────────
 
-/// Adding an event queue with a pre-posted entry causes `wait_set_wait`
-/// to return immediately with the correct badge.
+/// Posting to an event queue already registered in a wait set causes
+/// `wait_set_wait` to return immediately with the member's badge (the post
+/// queues the member on the wait set's ready ring).
 pub fn add_queue_immediate(ctx: &TestContext) -> TestResult
 {
     let ws =
@@ -91,7 +94,9 @@ pub fn add_queue_immediate(ctx: &TestContext) -> TestResult
 
 // ── wait_set_wait (blocking) ──────────────────────────────────────────────────
 
-/// `wait_set_wait` blocks until a child thread fires a registered notification.
+/// A child thread signals a registered notification and `wait_set_wait` returns
+/// its badge: the parent blocks if it waits first, or, if the unpinned child runs
+/// first on another CPU, returns the badge already queued on the ready ring.
 pub fn blocking_wait(ctx: &TestContext) -> TestResult
 {
     let ws =
@@ -173,12 +178,10 @@ pub fn remove(ctx: &TestContext) -> TestResult
 
 // ── Source pin via wait-set membership (refcount invariant) ──────────────────
 
-/// Wait-set membership holds a +1 cap-level reference on the source. Dropping
-/// the only user-held cap to a notification that is already in a wait set must not
-/// reclaim the notification state — the wait set still references it. A subsequent
-/// `wait_set_wait` must observe the previously-sent bits and return the
-/// member's badge. Dropping the wait-set cap then cascades the source's
-/// reclaim through `wait_set_drop`.
+/// Dropping the only user-held cap to a notification that is a wait-set member
+/// leaves it live: a later `wait_set_wait` returns the member's badge, and
+/// dropping the wait-set cap then reclaims the notification. The membership
+/// reference rule is in core/kernel/docs/ipc-internals.md § Wait Set Add/Remove.
 pub fn source_notification_pinned_by_member(ctx: &TestContext) -> TestResult
 {
     let ws = wait_set_create(ctx.memory_base).map_err(|_| "wait_set_create failed")?;
@@ -188,12 +191,13 @@ pub fn source_notification_pinned_by_member(ctx: &TestContext) -> TestResult
     wait_set_add(ws, sig, 31).map_err(|_| "wait_set_add(sig) failed")?;
     notification_send(sig, 0xCAFE).map_err(|_| "notification_send before drop failed")?;
 
-    // Drop the only user-held cap to the notification while a wait-set member still
-    // references it. The +1 from membership must keep the NotificationState alive.
+    // Drop the only user-held cap to the notification while it is a wait-set
+    // member (membership reference: core/kernel/docs/ipc-internals.md § Wait Set
+    // Add/Remove).
     cap_delete(sig).map_err(|_| "cap_delete(sig) while member-bound failed")?;
 
-    // The notification state should still be live: wait_set_wait observes the
-    // previously-stored bits via the level-state self-heal loop.
+    // `wait_set_wait` returns the member's badge, which the `notification_send`
+    // above queued on the wait set's ready ring.
     let tok = wait_set_wait(ws).map_err(|_| "wait_set_wait after sig cap drop failed")?;
     if tok != 31
     {
@@ -205,9 +209,9 @@ pub fn source_notification_pinned_by_member(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
-/// Symmetric to `source_notification_pinned_by_member` for `EventQueue`. Posting an
-/// entry before dropping the cap ensures the queue is "ready" so the
-/// post-drop `wait_set_wait` can observe its live state.
+/// Symmetric to `source_notification_pinned_by_member` for `EventQueue`: the
+/// `event_post` before the cap drop queues the member on the wait set's ready
+/// ring, so the post-drop `wait_set_wait` returns its badge.
 pub fn source_eventqueue_pinned_by_member(ctx: &TestContext) -> TestResult
 {
     let ws = wait_set_create(ctx.memory_base).map_err(|_| "wait_set_create failed")?;
@@ -239,7 +243,8 @@ pub fn source_endpoint_pinned_by_member(ctx: &TestContext) -> TestResult
 
     wait_set_add(ws, ep, 19).map_err(|_| "wait_set_add(ep) failed")?;
 
-    // +1 from membership keeps EndpointState alive across this cap drop.
+    // Drop the only user-held cap to the endpoint while it is a wait-set member
+    // (membership reference: core/kernel/docs/ipc-internals.md § Wait Set Add/Remove).
     cap_delete(ep).map_err(|_| "cap_delete(ep) while member-bound failed")?;
 
     // Cascade-reclaims the endpoint state through wait_set_drop's dec_ref.

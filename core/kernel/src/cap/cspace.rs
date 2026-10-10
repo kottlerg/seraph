@@ -5,32 +5,25 @@
 
 //! Capability space implementation.
 //!
-//! A [`CSpace`] is a hybrid two-level radix of [`CapabilitySlot`]s. The
-//! inline root holds `L1_DIRECT` pointers to leaf [`CSpacePage`]s (the
-//! direct region, the first `L1_DIRECT × L2_SIZE` slots) plus
-//! `L1_INDIRECT` pointers to pool-allocated [`CSpaceDirPage`]s of
-//! `DIR_FANOUT` leaf pointers each (the indirect region). Lookup is O(1):
-//! two dereferences in the direct region, three in the indirect. Capacity
-//! is bounded only by the pool pages the owner has donated (see Growth
-//! below) and the structural ceiling, [`MAX_SLOTS_STRUCTURAL`].
+//! A [`CSpace`] is a hybrid two-level radix of [`CapabilitySlot`]s: an inline
+//! root of leaf [`CSpacePage`] pointers (`direct`) plus pool-allocated
+//! [`CSpaceDirPage`]s (`indirect`), capped at [`MAX_SLOTS_STRUCTURAL`]. The
+//! layout, lookup cost, and capacity bounds are specified in
+//! core/kernel/docs/capability-internals.md § Storage: Hybrid Two-Level Radix
+//! and docs/capability-model.md § Address-space and `CSpace` growth budgets.
 //!
 //! ## Free list
 //!
-//! Freed slots are tracked via an intrusive doubly-linked list encoded in
-//! each slot's `deriv_parent` (successor) and `deriv_first_child`
-//! (predecessor) fields (see `slot.rs`). Slot 0 is permanently null and is
-//! never placed on the free list.
+//! Freed slots sit on an intrusive doubly-linked free list encoded in the
+//! slots themselves (core/kernel/src/cap/slot.rs, `CapabilitySlot::set_next_free`);
+//! see core/kernel/docs/capability-internals.md § Free Slot Tracking.
 //!
 //! ## Growth
 //!
-//! Leaves are allocated on demand by [`CSpace::grow`], strictly in index
-//! order behind the `next_leaf` cursor — allocated leaves are always the
-//! contiguous range `0..next_leaf`, so grow is O(1). The first leaf skips
-//! slot 0 (always null); every other leaf contributes all [`L2_SIZE`] slots
-//! to the free list. A grow into the indirect region first materialises the
-//! covering directory page from the same pool; a directory page that
-//! outlives a failed leaf allocation stays published — already paid for, it
-//! serves the next grow.
+//! Leaves are allocated on demand by [`CSpace::grow`] behind the `next_leaf`
+//! cursor; growth order and the indirect-region directory pages are specified
+//! in core/kernel/docs/capability-internals.md § Storage: Hybrid Two-Level
+//! Radix.
 
 // cast_possible_truncation: usize→u32 slot index bounded by MAX_SLOTS_STRUCTURAL.
 #![allow(clippy::cast_possible_truncation)]
@@ -52,8 +45,9 @@ use super::slot::{CSpaceId, CapTag, CapabilitySlot, Rights};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-/// Slots per `CSpace` page (56 × 72 B = 4032 B, fits in a 4096-byte slab bin
-/// with 64 B of tail slack).
+/// Slots per `CSpace` leaf page (56 × 72 B = 4032 B, fitting one 4 KiB pool
+/// page); see core/kernel/docs/capability-internals.md § Storage: Hybrid
+/// Two-Level Radix for the sizing constraints.
 pub const L2_SIZE: usize = 56;
 
 /// Inline root pointers to leaf pages (the direct region).
@@ -89,14 +83,13 @@ const _: () = assert!(MAX_LEAVES <= u32::MAX as usize);
 #[derive(Debug, PartialEq, Eq)]
 pub enum CapError
 {
-    /// The directory is full: every leaf up to `MAX_LEAVES` is populated
-    /// and no free slot remains. A structural ceiling derived from the
-    /// directory shape and the cap-handle index width; donating memory
-    /// cannot lift it.
+    /// The directory is full: every leaf up to `MAX_LEAVES` is populated and no
+    /// free slot remains (the structural ceiling; see docs/capability-model.md
+    /// § Address-space and `CSpace` growth budgets).
     OutOfSlots,
-    /// The slot-page pool was exhausted while growing. Refillable: donate
-    /// pages via augment-mode `cap_create_cspace`. (Host-test heap path:
-    /// heap allocation failed.)
+    /// The slot-page pool was exhausted while growing (see
+    /// docs/capability-model.md § Address-space and `CSpace` growth budgets).
+    /// (Host-test heap path: heap allocation failed.)
     PoolExhausted,
     /// The provided slot index is out of range or unmapped.
     InvalidIndex,
@@ -105,9 +98,9 @@ pub enum CapError
 }
 
 /// The one canonical `CapError` → `SyscallError` mapping. Every syscall-path
-/// consumer routes through this so the pool-exhausted (refillable,
-/// `OutOfMemory`) vs structural-ceiling (hard, `QuotaExceeded`) distinction
-/// reaches userspace uniformly (#366).
+/// consumer routes through this so the two `CSpace` growth bounds
+/// (docs/capability-model.md § Address-space and `CSpace` growth budgets)
+/// reach userspace uniformly (#366).
 impl From<CapError> for syscall::SyscallError
 {
     fn from(e: CapError) -> Self
@@ -137,7 +130,7 @@ struct CSpacePage
 // CSpacePage MUST fit in a single 4 KiB page — `alloc_slot_page` returns
 // `PAGE_SIZE`-aligned bytes and the kernel casts that to `*mut CSpacePage`
 // expecting one struct per allocation. A regression that grows
-// `CapabilitySlot` beyond the headroom would overflow the slab silently;
+// `CapabilitySlot` beyond the headroom would overflow the pool page silently;
 // the assertion makes that a build error.
 const _: () = assert!(
     core::mem::size_of::<CSpacePage>() <= crate::mm::PAGE_SIZE,
@@ -173,36 +166,12 @@ const _: () = assert!(core::mem::size_of::<CSpaceDirPage>() == crate::mm::PAGE_S
 ///
 /// ## Concurrency and memory ordering
 ///
-/// Two lock domains guard disjoint field families:
-///
-/// - **`CSpace` spinlock** — slot occupancy (tag, rights, badge, object,
-///   the `pad` markers), the free list (including the `deriv_*` fields'
-///   free-list reuse on Null slots), the directory pointers, and the
-///   counters. Syscall paths mutate these through a lock holder's
-///   `&mut self`.
-/// - **`DERIVATION_LOCK`** — the derivation linkage (`deriv_*`) of
-///   *occupied* slots, reached from the derivation code via registry
-///   lookup without taking this spinlock (see
-///   `derivation::resolve_slot_mut`). Paths that move a slot between the
-///   families (free, revoke-collect, teardown) hold `DERIVATION_LOCK`
-///   outermost, then this spinlock.
-///
-/// Both domains reach slots through raw `CSpace` pointers with short,
-/// per-slot borrows never held across a foreign-slot access.
-///
-/// Directory and leaf pointers are **write-once while the `CSpace` is
-/// live**: [`grow`][Self::grow] publishes each fully-initialised page with
-/// a Release store, and no page is freed, moved, or replaced before
-/// refcount-0 teardown. [`slot`][Self::slot] therefore supports lock-free
-/// readers (`lookup_cap`, `cap_info`): its Acquire loads at each level
-/// pair with grow's Release publication, so a reader that observes a
-/// pointer observes the initialised page behind it. Races on slot
-/// *content* against such unlocked readers are narrowed — not closed — by
-/// the tag and per-slot generation checks at the resolution sites.
-/// Separately, `lookup_cap` takes no reference on the object, so the object
-/// is not pinned while its caller uses it
-/// (`core/kernel/docs/capability-internals.md` § Storage: Hybrid Two-Level
-/// Radix, #443).
+/// State is split between the `CSpace` spinlock and `DERIVATION_LOCK`;
+/// directory and leaf pointers are write-once and Release-published by
+/// [`grow`][Self::grow], so [`slot`][Self::slot] serves lock-free readers
+/// (`lookup_cap`, `cap_info`). `lookup_cap` takes no reference on the object,
+/// a known defect (#443). The full contract is in
+/// core/kernel/docs/capability-internals.md § Storage: Hybrid Two-Level Radix.
 pub struct CSpace
 {
     id: CSpaceId,
@@ -411,12 +380,11 @@ impl CSpace
 
     /// Grow the `CSpace` by one leaf page.
     ///
-    /// Materialises leaf `next_leaf`, threads all its slots onto the free
-    /// list, publishes it, and advances the cursor. Slot 0 in the first
-    /// leaf is skipped. A grow into the indirect region first materialises
-    /// the covering directory page from the same pool; if the subsequent
-    /// leaf allocation fails, the directory page stays published — already
-    /// paid for, it serves the next grow.
+    /// Materialises leaf `next_leaf` (and, in the indirect region, its covering
+    /// directory page), threads its slots onto the free list, publishes it, and
+    /// advances the cursor; slot 0 in the first leaf is skipped. Failure behaviour
+    /// follows core/kernel/docs/capability-internals.md § Storage: Hybrid
+    /// Two-Level Radix.
     fn grow(&mut self) -> Result<(), CapError>
     {
         let leaf_idx = self.next_leaf as usize;
@@ -610,10 +578,10 @@ impl CSpace
     /// `max_leaves` leaves in this call. Returns `Ok(true)` once the
     /// covering leaf exists. Lets the explicit-placement syscall path
     /// pre-grow in bounded batches under only this `CSpace`'s lock,
-    /// keeping each interrupts-off hold constant-sized. An `index` beyond
-    /// the structural ceiling is clamped to the last leaf: the caller
-    /// rejects such an index up front (`pages_to_cover`), so the clamp
-    /// only keeps this function total.
+    /// keeping each interrupts-off hold constant-sized.
+    /// An `index` beyond the structural ceiling is clamped to the last leaf: the
+    /// caller never passes one (`pages_to_cover` reports zero pages for it, and
+    /// `insert_cap_at` rejects it), so the clamp only keeps this function total.
     pub(crate) fn grow_toward(&mut self, index: u32, max_leaves: usize) -> Result<bool, CapError>
     {
         let target_leaf = (index as usize / L2_SIZE).min(MAX_LEAVES - 1);
@@ -640,14 +608,9 @@ impl CSpace
     /// occupied-to-free transitions being excluded while it holds that
     /// lock.
     ///
-    /// Rejects a double-free of any slot: [`CapabilitySlot::is_on_free_list`]
-    /// is true for every slot currently linked on the list (head, interior, or
-    /// tail), so re-freeing one is detected and dropped. Pushing an already-on-
-    /// list slot would splice it in a second time, creating a cycle the next
-    /// `allocate_slot` would walk into — handing out an occupied slot. A Null
-    /// tag alone is not enough to detect this (`allocate_slot` clears the slot
-    /// on pop, so a freshly-allocated, not-yet-populated slot is also Null);
-    /// the free-list marker is the discriminator.
+    /// Rejects a double-free of any slot (head, interior, or tail) via
+    /// [`CapabilitySlot::is_on_free_list`]; see
+    /// core/kernel/docs/capability-internals.md § Free Slot Tracking.
     pub fn free_slot(&mut self, index: u32)
     {
         let Some(nz_index) = NonZeroU32::new(index)
@@ -800,11 +763,9 @@ impl CSpace
     ///
     /// Returns `true` if the index was found and removed, `false` if not on the list.
     ///
-    /// O(1): the free list is doubly linked (successor in `deriv_parent`,
-    /// predecessor in `deriv_first_child`), so the splice reads the target's
-    /// two neighbours directly. Callers (`insert_cap_at` explicit
-    /// placement) run under the `CSpace` spinlock with interrupts disabled,
-    /// which is why a list walk is not acceptable here.
+    /// O(1) through the predecessor link (see
+    /// core/kernel/docs/capability-internals.md § Free Slot Tracking). Called by
+    /// `insert_cap_at` explicit placement under the `CSpace` spinlock.
     pub fn remove_from_free_list(&mut self, target: u32) -> bool
     {
         let Some(target_nz) = NonZeroU32::new(target)
@@ -1270,7 +1231,7 @@ mod tests
     #[test]
     fn structural_ceiling_returns_out_of_slots()
     {
-        // Filling all 3.6M slots is not host-viable (~270 MiB of pages);
+        // Filling all 3.6M slots is not host-viable (~257 MiB of pages);
         // force the grow cursor to the ceiling instead — with an empty free
         // list, the next allocation's grow must fail with the structural
         // OutOfSlots, not PoolExhausted.

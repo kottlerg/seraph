@@ -7,12 +7,14 @@
 //!
 //! # Adding new thread syscalls
 //! 1. Add a `pub fn sys_thread_*` here.
-//! 2. Add the syscall constant import to `syscall/mod.rs`.
-//! 3. Add a dispatch arm to `syscall/mod.rs`.
+//! 2. Add the syscall constant import to `core/kernel/src/syscall/mod.rs`.
+//! 3. Add a dispatch arm to `core/kernel/src/syscall/mod.rs`.
 //! 4. Add a userspace wrapper to `shared/syscall/src/lib.rs`.
 
-// cast_possible_truncation: u64→u32/usize casts extract cap indices and field values
-// from 64-bit trap frame args. Seraph is 64-bit only; all values fit in the target type.
+// cast_possible_truncation: u64→u32/u8 casts keep the low bits of 64-bit
+// trap-frame args (cap indices, CPU IDs, priority levels, split points); bits
+// above the target width are discarded, not rejected, and validation runs on
+// the narrowed value. u64→usize casts are lossless (Seraph is 64-bit only).
 #![allow(clippy::cast_possible_truncation)]
 
 use crate::arch::current::trap_frame::TrapFrame;
@@ -123,12 +125,15 @@ pub fn sys_thread_configure(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     Ok(0)
 }
 
-/// `SYS_THREAD_START` (19): move a configured thread from Created to Ready.
+/// `SYS_THREAD_START` (19): move a configured thread from Created (first start)
+/// or Stopped (resume) to Ready.
 ///
 /// arg0 = Thread cap index (must have CONTROL).
 ///
 /// The thread must have been configured via `SYS_THREAD_CONFIGURE` first
-/// (`trap_frame` must be non-null). Enqueues the thread on the BSP scheduler.
+/// (`trap_frame` must be non-null). Commits `Ready` and links the thread on the
+/// CPU `select_target_cpu` chooses (see
+/// `core/kernel/docs/thread-lifecycle-and-sleep.md` § Lifecycle State Machine).
 ///
 /// Returns 0 on success.
 #[cfg(not(test))]
@@ -182,20 +187,13 @@ pub fn sys_thread_start(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             return Err(SyscallError::InvalidArgument);
         }
 
-        // A thread stopped while Running may still be `current` and physically
-        // executing on a remote CPU (a SYS_THREAD_STOP drain and this resume can
-        // race). Force-linking it via enqueue_ready_thread while it is still live
-        // there would dispatch it on a second CPU — the cross-CPU double-dispatch
-        // behind #314/#293. Drain it off every CPU's `current` (and wait for its
-        // register save to publish) BEFORE committing Ready: while it is still
-        // Stopped/Created the owning CPU's schedule() requeue denylist drops it
-        // without re-linking, so the drain leaves it not-`current` and (for a
-        // single start) unlinked. The same barrier dealloc_object(Thread) (#207)
-        // and sys_thread_stop use. A Created (never-dispatched) thread is
-        // `current` nowhere, so first-start returns from the drain immediately.
+        // Drain the target off every CPU's `current` before committing Ready, so the
+        // force-link below cannot double-dispatch a still-live resumed thread; see
+        // core/kernel/docs/thread-lifecycle-and-sleep.md § Lifecycle State Machine
+        // (row `sys_thread_start (resume from stop)`).
         crate::sched::await_descheduled(target_tcb);
         // All-CPU lock commit closes the cross-CPU dealloc race; see
-        // docs/thread-lifecycle-and-sleep.md § Lifecycle State Machine. The
+        // core/kernel/docs/thread-lifecycle-and-sleep.md § Lifecycle State Machine. The
         // target is now not-`current` and unlinked, so the force-link below
         // establishes enqueue_ready_thread's not-live precondition. Both the
         // commit and the link refuse an `Exited` target: the state read above
@@ -246,9 +244,15 @@ unsafe fn commit_stopped(
 ///
 /// arg0 = Thread cap index (must have CONTROL).
 ///
-/// Cancels any pending IPC block (the stopped thread's blocked syscall returns
-/// `Interrupted`). If the thread is already Stopped or Exited, returns
-/// `InvalidState`. A thread may stop itself (arg0 refers to the calling thread).
+/// Cancels any pending block (see `core/kernel/docs/syscalls.md` § `SYS_THREAD_STOP` for
+/// the restart outcome: the blocked syscall returns `Interrupted`, and a fault-blocked
+/// thread is killed). This does not hold for a caller displaced from a server's
+/// pending-reply binding: that stop is not memory-safe, and its outcome is in
+/// `docs/ipc-design.md` § The Call/Reply Model (#443). Nor does it hold for a park the
+/// target commits after the unlocked state read: that block is not cancelled (#443;
+/// see the comment at the read). If the thread is Created, Stopped, or Exited
+/// (including one that exits before the locked commit), returns `InvalidState`. A thread
+/// may stop itself (arg0 refers to the calling thread).
 ///
 /// Returns 0 on success.
 #[cfg(not(test))]
@@ -290,6 +294,11 @@ pub fn sys_thread_stop(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // SAFETY: target_tcb validated non-null; state field always valid.
     unsafe {
+        // Unlocked read: the cancel decision below is not re-checked under `sched_lock`.
+        // A `Running` target on another CPU that commits a park (`Running` → `Blocked`)
+        // before `commit_stopped` takes its `sched_lock` has `Stopped` written over the
+        // fresh `Blocked` with no `cancel_ipc_block` (#443; see
+        // core/kernel/docs/thread-lifecycle-and-sleep.md § Lifecycle State Machine).
         let state = (*target_tcb).state;
 
         match state
@@ -315,7 +324,7 @@ pub fn sys_thread_stop(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             }
         }
 
-        // See docs/thread-lifecycle-and-sleep.md § Lifecycle State Machine
+        // See core/kernel/docs/thread-lifecycle-and-sleep.md § Lifecycle State Machine
         // (sys_thread_stop rows); an `Exited` target is refused (terminal).
         let running_on = commit_stopped(target_tcb)?;
 
@@ -326,8 +335,9 @@ pub fn sys_thread_stop(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         }
         else if let Some(run_cpu) = running_on
         {
-            // Cross-CPU drain: IPI forces the remote into schedule() so
-            // sys_thread_read_regs sees a fresh trap_frame.
+            // Cross-CPU drain: the wakeup IPI only nudges the remote CPU (its
+            // handler acknowledges the interrupt and returns); the spin below waits for the
+            // remote's next `schedule()` entry to deschedule the target.
             let current_cpu = crate::arch::current::cpu::current_cpu() as usize;
             if run_cpu != current_cpu
             {
@@ -337,13 +347,10 @@ pub fn sys_thread_stop(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 let sched_remote = crate::sched::scheduler_for(run_cpu);
                 let spin_start = crate::arch::current::timer::current_tick();
                 let mut warned = false;
-                // The drain spins until the remote CPU deschedules `target_tcb`.
-                // This syscall runs with IF=0; spinning at IF=0 would block an
-                // inbound TLB-shootdown IPI targeted at this CPU and deadlock it
-                // (the initiator spins for our ACK with IF enabled). Enable
-                // interrupts across the spin and disable preemption so the
-                // scheduler cannot migrate us mid-drain — the #207 pattern
-                // dealloc's UAF gate uses.
+                // The drain spins until the remote CPU deschedules `target_tcb`, with
+                // preemption disabled and interrupts enabled per
+                // core/kernel/docs/thread-lifecycle-and-sleep.md § `sys_thread_stop` Cross-CPU
+                // Stop Protocol (invariant 3).
                 crate::percpu::preempt_disable();
                 // SAFETY: ring 0; restored after the spin below.
                 let drain_saved_int = crate::arch::current::cpu::save_and_disable_interrupts();
@@ -352,13 +359,10 @@ pub fn sys_thread_stop(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 while {
                     let s = sched_remote.lock.lock_raw();
                     let still_current = sched_remote.current == target_tcb;
-                    // A concurrent sys_thread_start may resume the target out of
-                    // Stopped (last-writer-wins). The bounded-spin invariant
-                    // assumes the target stays in schedule()'s requeue denylist
-                    // (Stopped); once it is no longer Stopped the stop was
-                    // overtaken and the re-dispatched target may never
-                    // deschedule. Read state under the same lock
-                    // set_state_under_all_locks holds, then bail.
+                    // Bail if a concurrent sys_thread_start resumed the target out of Stopped;
+                    // read under the same lock set_state_under_all_locks holds (see
+                    // core/kernel/docs/thread-lifecycle-and-sleep.md § `sys_thread_stop` Cross-CPU
+                    // Stop Protocol, step 5).
                     let still_stopped = (*target_tcb).state == ThreadState::Stopped;
                     sched_remote.lock.unlock_raw(s);
                     still_current && still_stopped
@@ -373,6 +377,9 @@ pub fn sys_thread_stop(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                         {
                             warned = true;
                             // SAFETY: target_tcb validated above; cur read racily for diagnostic.
+                            // unused_unsafe: this block is nested inside sys_thread_stop's
+                            // enclosing `unsafe` block, so the inner `unsafe` is redundant; it
+                            // is kept to scope the SAFETY contract to the racy diagnostic reads.
                             #[allow(unused_unsafe)]
                             unsafe {
                                 let tid = (*target_tcb).thread_id;
@@ -457,7 +464,7 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
     // sched_lock snapshot above is already released; lock order source IPC →
     // sched_lock means the two are never nested) and unlinks this thread from the
     // source's waiter / queue, racing any concurrent waker for the binding under
-    // that same source lock. See docs/scheduling-internals.md § Lock Hierarchy.
+    // that same source lock. See core/kernel/docs/scheduling-internals.md § Lock Hierarchy.
     match ipc_state
     {
         IpcThreadState::BlockedOnSend =>
@@ -546,24 +553,20 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
 
         IpcThreadState::BlockedOnReply =>
         {
-            // blocked_on is the server TCB. The reply_tcb CAS dereferences the
-            // server, which a concurrent dealloc(server) could free (#317). Guard
-            // it: hold THIS client's sched_lock across a `blocked_on_object` re-read
-            // and the CAS. dealloc(server) nulls a claimed client's blocked_on under
-            // that same client sched_lock strictly before retype_free, so observing
-            // `blocked_on == server` under the lock proves the server is not yet
-            // freed (CLOSURE LEMMA — docs/scheduling-internals.md § Cross-CPU TCB
-            // Ownership). A Blocked client's blocked_on can only transition
-            // server→null (a waker), never server→server2, so the re-read suffices.
-            // Only this client's sched_lock is held; the reply_tcb CAS on the server
-            // is wait-free, so the "one TCB sched_lock at a time" rule holds.
+            // blocked_on is the server TCB. The reply_tcb CAS dereferences it under
+            // this client's sched_lock, gated by a blocked_on_object re-read, per the
+            // CLOSURE LEMMA (core/kernel/docs/scheduling-internals.md § Cross-CPU TCB
+            // Ownership, #317). The lemma does not cover a client displaced from the
+            // server's reply binding: its blocked_on can still name a freed server, so
+            // this CAS can touch freed memory (core/kernel/docs/scheduling-internals.md
+            // § Thread Registry, #443).
             if !blocked_on.is_null()
             {
                 // cast_ptr_alignment: blocked_on_object stores type-erased pointer; original allocation guarantees alignment.
                 #[allow(clippy::cast_ptr_alignment)]
                 let server = blocked_on.cast::<crate::sched::thread::ThreadControlBlock>();
-                // SAFETY: tcb valid; sched_lock paired with unlock below. server is
-                // pinned alive for the CAS by the blocked_on re-read under this lock.
+                // SAFETY: tcb valid; sched_lock paired with unlock below. server is live for
+                // the CAS by the CLOSURE LEMMA except for a displaced client (#443; see above).
                 unsafe {
                     let saved = (*tcb).sched_lock.lock_raw();
                     if (*tcb).state == crate::sched::thread::ThreadState::Blocked
@@ -616,9 +619,9 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
                 // cast_ptr_alignment: blocked_on_object stores type-erased pointer; original allocation guarantees alignment.
                 #[allow(clippy::cast_ptr_alignment)]
                 let server = blocked_on.cast::<crate::sched::thread::ThreadControlBlock>();
-                // SAFETY: tcb valid; sched_lock paired with unlock. server is pinned
-                // alive for the CAS by the blocked_on re-read under this lock (#317,
-                // CLOSURE LEMMA — mirrors the BlockedOnReply arm above).
+                // SAFETY: tcb valid; sched_lock paired with unlock. server is live for the CAS
+                // by the CLOSURE LEMMA (#317; mirrors the BlockedOnReply arm above) except for
+                // a faulter displaced from the handler's reply binding (#443).
                 unsafe {
                     let saved = (*tcb).sched_lock.lock_raw();
                     if (*tcb).state == crate::sched::thread::ThreadState::Blocked
@@ -741,8 +744,9 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
     }
 
     // If the thread was parked with a timeout (notification-wait or event-recv
-    // with `timeout_ms != 0`), it is also on the global sleep list. Drop
-    // the entry now so a later timer tick does not dereference a freed TCB.
+    // with `timeout_ms != 0`, or a plain `SYS_THREAD_SLEEP`), it is also on the
+    // global sleep list. Drop the entry now so a later timer tick does not
+    // dereference a freed TCB.
     //
     // ORDER (issue #117): call `sleep_list_remove` BEFORE clearing
     // `sleep_deadline`. The timer path (`sleep_check_wakeups`) treats
@@ -997,7 +1001,7 @@ pub fn sys_thread_set_priority(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // `priority`, `state`, and the run-queue link are in the Scheduling field
     // group, whose authoritative serializer is the per-TCB `sched_lock`
-    // (docs/scheduling-internals.md § Cross-CPU TCB Ownership). Hold it across
+    // (core/kernel/docs/scheduling-internals.md § Cross-CPU TCB Ownership). Hold it across
     // the `state` read, the `priority` write, and the relocate so they cannot
     // race `enqueue_and_wake` / `commit_blocked` / `schedule`, which write the
     // same fields under the same lock. `sched_lock` — not the run-queue locks —
@@ -1178,7 +1182,13 @@ pub fn sys_sched_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 ///   re-enqueue cross-CPU to the new target. Worst-case latency is
 ///   one time slice.
 /// - **Blocked / Stopped / Created**: the new affinity takes effect on
-///   the next `enqueue_and_wake` via `select_target_cpu`.
+///   the next enqueue (`enqueue_and_wake` on wake, `sys_thread_start` on
+///   start or resume), both routed via `select_target_cpu`.
+///
+/// The handler takes no `sched_lock` and `lookup_cap` takes no reference on the
+/// target, so these outcomes hold only absent a concurrent free of the TCB or a
+/// racing scheduler path (`core/kernel/docs/syscalls.md` §
+/// `SYS_THREAD_SET_AFFINITY`, #443).
 ///
 /// Returns 0 on success.
 #[cfg(not(test))]
@@ -1240,35 +1250,12 @@ pub fn sys_thread_set_affinity(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     unsafe {
         let old_cpu = (*target_tcb).preferred_cpu as usize;
 
-        // Pin preemption across the `cpu_affinity` write and the matching
-        // state-read + action that follows. Defense-in-depth: the current
-        // syscall-entry discipline keeps IF=0 / SIE=0 throughout the
-        // handler body (no path inside re-enables interrupts — only
-        // spinlock save/restore — so a local timer tick cannot fire
-        // here), but if a future syscall path were to enable interrupts
-        // mid-handler, a timer-driven `schedule()` between the
-        // `cpu_affinity` store and the matching `migrate_ready_thread`
-        // call would dispatch the Ready target locally — `schedule()`'s
-        // skip loop checks state but not `cpu_affinity` on the incoming
-        // dispatched thread (see scheduling-internals.md § Cross-CPU TCB
-        // Ownership). Mirrors the load-bearing pattern in `schedule()`'s
-        // cross-CPU re-enqueue branch (`core/kernel/src/sched/mod.rs`), where
-        // the inter-lock window IS visible to interrupts.
-        //
-        // `sys_thread_set_priority` above holds the per-TCB `sched_lock`
-        // (outer) across its `state` read and `priority` write, the same lock
-        // `migrate_ready_thread` acquires, so the two serialise directly and it
-        // does not need a preempt bracket.
-        //
-        // This function takes no `sched_lock`, so the `cpu_affinity` write and
-        // the `preferred_cpu` / `state` reads race other CPUs' scheduler paths
-        // (the load balancer's `relocate_ready_thread`, a waker's
-        // `enqueue_and_wake`, the target's own `schedule()`), which access the
-        // Scheduling field group under the target's `sched_lock`, as
-        // scheduling-internals.md § Cross-CPU TCB Ownership requires. That
-        // defect is tracked in #443.
-        //
-        // See issue #116.
+        // Pin preemption across the `cpu_affinity` write and the state-read + action
+        // that follows, as core/kernel/docs/scheduling-internals.md § Cross-CPU TCB
+        // Ownership (`cpu_affinity` enforcement invariant, #116) requires. This
+        // function takes no `sched_lock`, so these accesses race other CPUs'
+        // scheduler paths (core/kernel/docs/syscalls.md § SYS_THREAD_SET_AFFINITY,
+        // #443).
         crate::percpu::preempt_disable();
         (*target_tcb).cpu_affinity = cpu_id;
 
@@ -1286,9 +1273,10 @@ pub fn sys_thread_set_affinity(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             return Ok(0);
         }
 
-        // preferred_cpu is bounded by select_target_cpu (writes always come
-        // from enqueue_and_wake or schedule(); both clamp to CPU_COUNT). A
-        // higher value indicates a corrupted TCB, which we ignore here.
+        // preferred_cpu is only ever written with an in-range CPU index (by
+        // enqueue_and_wake, enqueue_ready_thread, schedule(), and the relocate /
+        // migrate paths). A value >= CPU_COUNT indicates a corrupted TCB, which we
+        // ignore here.
         let cpu_count = crate::sched::CPU_COUNT.load(Ordering::Relaxed) as usize;
         if old_cpu >= cpu_count
         {
@@ -1309,8 +1297,9 @@ pub fn sys_thread_set_affinity(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             ThreadState::Running =>
             {
                 // The Running thread's CPU sees the affinity change at its
-                // next schedule() entry (see sched/mod.rs schedule() re-enqueue
-                // path). Nudging that CPU bounds the latency to one IPI.
+                // next schedule() entry (see core/kernel/src/sched/mod.rs schedule() re-enqueue
+                // path). The IPI does not itself call schedule(), so that entry comes at
+                // worst one time slice later.
                 crate::sched::set_reschedule_pending_for(old_cpu);
                 crate::sched::prod_remote_cpu(old_cpu);
             }
@@ -1326,14 +1315,17 @@ pub fn sys_thread_set_affinity(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     Ok(0)
 }
 
-/// `SYS_THREAD_READ_REGS` (39): read register state of a stopped thread.
+/// `SYS_THREAD_READ_REGS` (39): read register state of a stopped or fault-blocked
+/// thread.
 ///
 /// arg0 = Thread cap index (must have OBSERVE).
 /// arg1 = Pointer to caller-supplied buffer (user VA).
 /// arg2 = Size of the buffer in bytes.
 ///
-/// The thread must be in Stopped state. Copies the full `TrapFrame` to the
-/// caller's buffer. Returns the number of bytes written on success.
+/// The thread must be Stopped, or fault-blocked awaiting a fault-handler reply
+/// (`BlockedOnFault`; see `docs/fault-handling.md` § Modifying the faulting
+/// thread). Copies the full `TrapFrame` to the caller's buffer. Returns the
+/// number of bytes written on success.
 #[cfg(not(test))]
 pub fn sys_thread_read_regs(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
@@ -1424,14 +1416,18 @@ pub fn sys_thread_read_regs(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     Ok(copy_size as u64)
 }
 
-/// `SYS_THREAD_WRITE_REGS` (40): write register state into a stopped thread.
+/// `SYS_THREAD_WRITE_REGS` (40): write register state into a stopped or
+/// fault-blocked thread.
 ///
 /// arg0 = Thread cap index (must have CONTROL).
 /// arg1 = Pointer to register-file buffer in caller's address space.
 /// arg2 = Size of the buffer in bytes.
 ///
-/// The thread must be in Stopped state. The kernel validates register values
-/// for safety (no privilege escalation) before writing. Returns 0 on success.
+/// The thread must be Stopped, or fault-blocked awaiting a fault-handler reply
+/// (`BlockedOnFault`; see `docs/fault-handling.md` § Modifying the faulting
+/// thread). The kernel sanitizes the frame per architecture
+/// (`core/kernel/docs/arch-interface.md` § `trap_frame` — `arch::current::trap_frame`)
+/// before writing; RISC-V applies `sstatus` as supplied (#443). Returns 0 on success.
 #[cfg(not(test))]
 pub fn sys_thread_write_regs(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
@@ -1538,15 +1534,15 @@ pub fn sys_thread_write_regs(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 }
 
 /// Validate and sanitize a user-supplied `TrapFrame` before writing it into a
-/// thread. Enforces that no privilege bits are set and instruction/stack
-/// pointers are in the canonical user address range.
+/// thread, per architecture (`core/kernel/docs/arch-interface.md` § `trap_frame`
+/// — `arch::current::trap_frame`); RISC-V applies `sstatus` as supplied (#443).
 ///
 /// Mutates `regs` in place to force safe segment/flag values.
 ///
 /// # Adding new checks
 /// Add per-field validation in the per-arch `TrapFrame::sanitize_for_user_resume`
-/// implementations (`arch/<target>/trap_frame.rs`). Use `InvalidArgument` for
-/// bad user data (not a kernel invariant violation).
+/// implementations (`core/kernel/src/arch/<target>/trap_frame.rs`). Use
+/// `InvalidArgument` for bad user data (not a kernel invariant violation).
 #[cfg(not(test))]
 fn validate_write_regs(
     regs: &mut crate::arch::current::trap_frame::TrapFrame,

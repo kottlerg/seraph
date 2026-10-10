@@ -6,10 +6,10 @@
 //! Keccak-f[1600] permutation (FIPS 202).
 //!
 //! The single cryptographic primitive underlying the entropy subsystem. The
-//! sponge layer in [`super::sponge`] builds the SHAKE256 XOF and the
-//! forward-secure duplex PRNG on top of this permutation, so correctness here
-//! is load-bearing for the whole subsystem and is anchored by known-answer
-//! tests (raw zero-state vector and `SHAKE256("")`).
+//! sponge layer in [`super::sponge`] builds the forward-secure duplex PRNG on
+//! top of this permutation (its plumbing is anchored by a test-only SHAKE256),
+//! so correctness here is load-bearing for the whole subsystem and is anchored
+//! by known-answer tests (raw zero-state vector and `SHAKE256("")`).
 //!
 //! The implementation is the canonical compact form (24 rounds; θ, ρ, π, χ, ι).
 //! State lanes are 64-bit, addressed `lane(x, y) = state[x + 5*y]`, with bytes

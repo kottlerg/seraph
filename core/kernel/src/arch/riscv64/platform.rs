@@ -13,8 +13,8 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use boot_protocol::KernelMmio;
 
-/// Default ns16550-compatible UART physical base. Matches the RISC-V Platform
-/// Spec reference layout and every UEFI-on-RISC-V firmware observed in this
+/// Default ns16550-compatible UART physical base. Matches the QEMU `virt`
+/// machine layout and every UEFI-on-RISC-V firmware observed in this
 /// project's test set.
 const DEFAULT_UART_BASE: u64 = 0x1000_0000;
 
@@ -28,13 +28,11 @@ const DEFAULT_PLIC_BASE: u64 = 0x0C00_0000;
 /// Default PLIC MMIO window size when the bootloader did not report one.
 /// 4 MiB covers the priority + per-context enable + threshold + claim/complete
 /// ranges defined by the RISC-V PLIC spec.
-#[allow(dead_code)] // Exposed via plic_size(); no current in-tree caller.
 const DEFAULT_PLIC_SIZE: u64 = 0x0040_0000;
 
 static CACHED_UART_BASE: AtomicU64 = AtomicU64::new(0);
 static CACHED_UART_SIZE: AtomicU64 = AtomicU64::new(0);
 static CACHED_PLIC_BASE: AtomicU64 = AtomicU64::new(0);
-#[allow(dead_code)] // Exposed via plic_size(); no current in-tree caller.
 static CACHED_PLIC_SIZE: AtomicU64 = AtomicU64::new(0);
 
 fn page_round_up(n: u64) -> u64
@@ -43,8 +41,11 @@ fn page_round_up(n: u64) -> u64
 }
 
 /// Physical `(base, size)` of the boot console UART that needs a dedicated
-/// `Mmio` capability minted at Phase 7. On RISC-V the `ns16550` UART sits outside
-/// the coarse aperture list, so it is surfaced here for init.
+/// `Mmio` capability minted at Phase 7. On RISC-V the `ns16550` UART is reported
+/// through `BootInfo.kernel_mmio` rather than the coarse aperture list; its range
+/// may also lie inside an aperture, in which case this cap overlaps an aperture
+/// cap. It is surfaced here so init's serial scan finds a dedicated `Mmio`
+/// descriptor for it.
 // unnecessary_wraps: the Option is part of the cross-arch contract — x86-64's
 // `console_mmio` returns None (its console is a legacy I/O-port UART).
 #[allow(clippy::unnecessary_wraps)]
@@ -123,7 +124,9 @@ pub fn plic_base() -> u64
 }
 
 /// PLIC MMIO window size, page-rounded.
-#[allow(dead_code)] // Part of the arch interface; no current in-tree caller.
+// Arch-private accessor for the bootloader-reported PLIC window size; no
+// current in-tree caller.
+#[allow(dead_code)]
 #[must_use]
 pub fn plic_size() -> u64
 {

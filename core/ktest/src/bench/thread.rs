@@ -81,7 +81,8 @@ pub(super) fn bench_thread_lifecycle(ctx: &crate::TestContext, iters: u32)
     cap_delete(done).ok();
 
     log_bench_header("thread_lifecycle", n);
-    // Guard against no successful iteration so we don't log u64::MAX min.
+    // The `checked_div(completed)` below guards against no successful
+    // iteration, so a u64::MAX min is never logged.
     let _ = n64;
     if let Some(mean) = total.checked_div(completed)
     {
@@ -99,7 +100,7 @@ static mut BENCH_CTXSWITCH_STACK: ChildStack = ChildStack::ZERO;
 static BENCH_CTXSWITCH_ITERS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Child entry: ping-pong via `thread_yield` for `BENCH_CTXSWITCH_ITERS`
-/// iterations, then notification `done_slot` and exit.
+/// iterations, then send on the `done_slot` notification and exit.
 fn ctxswitch_child_entry(done_slot: u64) -> !
 {
     let n = BENCH_CTXSWITCH_ITERS.load(core::sync::atomic::Ordering::Acquire);
@@ -114,12 +115,13 @@ fn ctxswitch_child_entry(done_slot: u64) -> !
 }
 
 /// Benchmark: context-switch latency via parent/child `thread_yield`
-/// ping-pong, both threads pinned to CPU 0 so the test measures real
-/// context-switch cost (not just yield-and-return-to-same-thread).
+/// ping-pong. The child is pinned to CPU 0; the parent (ktest's init
+/// thread) is not pinned, so the ping-pong measures a real context switch
+/// only while the parent also runs on CPU 0.
 ///
 /// The yield ping-pong requires the child at the parent's own level
-/// (`INIT_PRIORITY`) — yield only round-robins within a priority level — so
-/// the child is created at that level via the root `SchedControl` band.
+/// (`INIT_PRIORITY`; see `core/kernel/docs/scheduler.md` § Time Slice Policy),
+/// so the child is created at that level via the root `SchedControl` band.
 /// Skipped when the initial cap set has no `SchedControl` cap.
 ///
 /// Cost-per-switch = total wall cycles / (2 * N) — each iteration is two
@@ -191,16 +193,13 @@ pub(super) fn bench_context_switch(ctx: &crate::TestContext, iters: u32)
         crate::log_u64("ktest: bench  cycles_per_switch=", per);
     }
 
-    // Tagged-TLB intrinsic metric. These are cumulative system-wide counts of
-    // context-switch activations that elided the TLB flush versus performed it
-    // (tag reissue, switched-away unmap catch-up, or fallback). This is the
-    // emulation-independent notification: QEMU TCG does not model TLB-refill timing,
-    // so cycles_per_switch above is not a faithful cost measure, but these
-    // counters reflect intrinsic behaviour. A working optimization shows elided
-    // dominating; both are 0 when the hardware lacks tagging (full-flush path).
-    // The parent⇄child ping-pong above shares an address space, so it adds no
-    // tagged activations of its own; the totals reflect every cross-space and
-    // post-block re-activation since boot.
+    // Tagged-TLB flush counters: cumulative system-wide elided/performed
+    // context-switch activations (see docs/memory-model.md § TLB Management;
+    // both are 0 without hardware tagging). QEMU TCG does not model
+    // TLB-refill timing, so cycles_per_switch above is not a faithful cost
+    // measure. The parent⇄child ping-pong above shares an address space, so it
+    // adds no tagged activations of its own; the totals reflect every
+    // cross-space and post-block re-activation since boot.
     let elided = syscall::cap_info(ctx.memory_base, syscall_abi::CAP_INFO_TLB_ELIDED).unwrap_or(0);
     let performed =
         syscall::cap_info(ctx.memory_base, syscall_abi::CAP_INFO_TLB_PERFORMED).unwrap_or(0);

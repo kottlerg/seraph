@@ -21,7 +21,7 @@ this address after establishing the CPU state described below.
 Signature:
 
 ```rust
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !;
 ```
 
@@ -49,7 +49,8 @@ calling convention is an ABI break and MUST accompany a
 The `BootInfo` type and all its fields are defined in the
 [`abi/boot-protocol`](../../../abi/boot-protocol/) crate. The kernel must
 validate `BootInfo.version == BOOT_PROTOCOL_VERSION` on entry and halt
-rather than proceed with a mismatched structure.
+rather than proceed with a mismatched structure (see
+[initialization.md](../../kernel/docs/initialization.md) § Phase 0: Entry Validation).
 
 ---
 
@@ -66,8 +67,8 @@ rather than proceed with a mismatched structure.
 | Stack | Valid; at least 64 KiB available |
 | `rdi` | Physical address of `BootInfo` structure |
 | Floating point | Not initialised; kernel must not use SSE/AVX before enabling |
-| GDT | Bootloader-provided; kernel replaces it during early initialisation ([initialization.md](../../kernel/docs/initialization.md) §"Phase 5: Architecture Hardware Initialisation") |
-| IDT | Not loaded; interrupts must remain disabled until the kernel installs its own |
+| GDT | UEFI firmware's (bootloader installs none); kernel replaces it in Phase 5 |
+| IDT | Firmware's IDTR; not to be relied on; interrupts stay disabled until the kernel installs its own |
 
 ### RISC-V (RV64IMAC, soft-float)
 
@@ -78,11 +79,11 @@ rather than proceed with a mismatched structure.
 | MMU | Enabled under the negotiated paging mode (Sv39/Sv48/Sv57, recoverable from `satp.MODE`); kernel mapped at intended virtual addresses |
 | Stack | Valid; at least 64 KiB available |
 | `a0` | Physical address of `BootInfo` structure |
-| `a1` | Hart ID of the booting hart (obtained via `EFI_RISCV_BOOT_PROTOCOL`) |
+| `a1` | Hart ID of the booting hart (obtained via `EFI_RISCV_BOOT_PROTOCOL`; 0 when the protocol is absent or its call fails) |
 | Floating point | Not initialised |
 
-Secondary harts remain in the UEFI firmware's spin loop or halted state
-until the kernel releases them via SBI HSM calls during SMP bringup
+Secondary harts remain stopped under the SBI firmware's Hart State Management (HSM)
+extension until the kernel starts them with SBI HSM `hart_start` during SMP bringup
 ([initialization.md](../../kernel/docs/initialization.md) §"Phase 8: Scheduler and SMP Bringup").
 
 ---
@@ -90,18 +91,20 @@ until the kernel releases them via SBI HSM calls during SMP bringup
 ## Handoff Sequence
 
 The reference bootloader's architecture-specific handoff implementation
-lives in [`boot/src/arch/x86_64/handoff.rs`](../src/arch/x86_64/handoff.rs)
-and [`boot/src/arch/riscv64/handoff.rs`](../src/arch/riscv64/handoff.rs).
+lives in [`core/boot/src/arch/x86_64/handoff.rs`](../src/arch/x86_64/handoff.rs)
+and [`core/boot/src/arch/riscv64/handoff.rs`](../src/arch/riscv64/handoff.rs).
 The bootloader's page table is installed, the stack pointer is switched to the bootloader-allocated
 handoff stack, the BootInfo pointer is loaded into the first-argument register, direction/interrupt
 flags are established per the contract above, and control transfers to `kernel_entry` via an
 unconditional jump that does not return.
 
-The bootloader-provided GDT (x86-64) remains active at entry; the kernel
-replaces it in Phase 5 (see [initialization.md](../../kernel/docs/initialization.md)
-§ Phase 5). The kernel replaces the bootloader's root page table in Phase 3
-([initialization.md](../../kernel/docs/initialization.md) § Phase 3); for ASID use
-after handoff see [page-tables.md](page-tables.md) § Activation and
+The UEFI firmware's GDT (x86-64), which the bootloader leaves loaded because it installs none,
+remains active at entry; the kernel replaces it in Phase 5 (see
+[initialization.md](../../kernel/docs/initialization.md) § Phase 5). IDTR likewise still references
+the firmware's IDT, which the kernel must not rely on; interrupts stay disabled until the kernel
+installs its own. The kernel replaces the bootloader's root page table in Phase 3
+([initialization.md](../../kernel/docs/initialization.md) § Phase 3); for ASID use after handoff see
+[page-tables.md](page-tables.md) § Activation and
 [memory-internals.md](../../kernel/docs/memory-internals.md) § Context Switch TLB Handling.
 
 ---
@@ -112,8 +115,8 @@ after handoff see [page-tables.md](page-tables.md) § Activation and
   format, memory-map sort/overlap rules, and every other ABI-level
   invariant are owned by the
   [`abi/boot-protocol`](../../../abi/boot-protocol/) crate; see its
-  [`src/lib.rs`](../../../abi/boot-protocol/src/lib.rs) and
-  [`README.md`](../../../abi/boot-protocol/README.md).
+  [`abi/boot-protocol/src/lib.rs`](../../../abi/boot-protocol/src/lib.rs) and
+  [`abi/boot-protocol/README.md`](../../../abi/boot-protocol/README.md).
 - The ten-step boot sequence that leads up to handoff is owned by
   [boot-flow.md](boot-flow.md).
 - The page-table state at entry (what pages are mapped, with which

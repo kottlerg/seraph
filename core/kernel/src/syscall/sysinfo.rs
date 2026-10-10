@@ -23,8 +23,7 @@ use syscall::SyscallError;
 pub fn sys_system_info(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
     // Match on the raw discriminant rather than converting to the enum —
-    // keeps the handler independent of any TryFrom impl and matches the
-    // pattern used by other handlers (e.g. cap create).
+    // keeps the handler independent of any TryFrom impl.
     match tf.arg(0)
     {
         0 =>
@@ -79,8 +78,8 @@ pub fn sys_system_info(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// Returns `InvalidAddress` if the virtual address is not mapped or
 /// fails the alignment/range checks.
 #[cfg(not(test))]
-// cast_possible_truncation: capability slot indices are u32 by ABI contract;
-// tf.arg() returns u64 but the upper 32 bits are always zero for slot args.
+// cast_possible_truncation: capability handles are u32 by ABI contract; the
+// truncation discards any upper 32 bits a caller sets.
 #[allow(clippy::cast_possible_truncation)]
 pub fn sys_aspace_query(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {

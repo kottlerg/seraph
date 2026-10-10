@@ -62,7 +62,10 @@ Not yet implemented (this section is narrowed as each part lands):
   faults; it does not yet actively cancel a fault already in flight on the affected thread.
   An in-flight fault is still resolved by the handler's reply, handler-thread death, the
   faulting thread being stopped or destroyed, or the handler endpoint being destroyed (all
-  implemented). The remaining trigger — the binding being cleared mid-fault — is the only
+  implemented), except through the stale plain-sleep entry
+  ([#443](https://github.com/kottlerg/seraph/issues/443); see
+  [thread-lifecycle-and-sleep.md § `sys_thread_sleep` and the Plain-Sleep Path](../core/kernel/docs/thread-lifecycle-and-sleep.md#sys_thread_sleep-and-the-plain-sleep-path)).
+  The remaining trigger — the binding being cleared mid-fault — is the only
   [Kill](#delivery-resume-and-kill) path not yet wired.
 - **Displaced fault binding.** A later receive on the handler thread while a fault reply is still
   pending overwrites the handler's reply binding; the displaced fault-blocked thread is outside the

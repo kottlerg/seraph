@@ -17,8 +17,9 @@
 //! and the next wake double-linked it (the #352 panic), or the stale link was
 //! dispatched and resumed the poller's park prematurely (the #352 spawn-failure
 //! variant). The fix makes try-once a pure ring peek (`event_queue_try_recv`)
-//! that never registers a waiter; this cell hammers the exact geometry to keep
-//! it that way.
+//! that never registers a waiter (the rule is
+//! `core/kernel/docs/scheduling-internals.md` § Lock Hierarchy, rule 8); this
+//! cell hammers the exact geometry to keep it that way.
 //!
 //! ## How this exercises it
 //!
@@ -46,7 +47,8 @@
 //! 2. `notification_wait(gate)` returns zero/wrong bits — the stale link was
 //!    dispatched by CPU 0's own `schedule()` (the unconditional next==current
 //!    re-mark sets `Running` with no state check) and resumed the wait before
-//!    any send deposited bits: the variant-B premature-resume shape.
+//!    any send deposited bits: the premature-resume (spawn-failure) shape of
+//!    #352.
 //! 3. Payload-conservation or drain/empty assert — a lost or duplicated wake.
 //! 4. Hang — softlockup watchdog / harness timeout (kernel-raised).
 //!

@@ -6,24 +6,23 @@
 //! Integration: a client stopped while parked in `ipc_call` and then
 //! restarted returns `Interrupted` — never a stale-`ipc_msg` "reply" (#361).
 //!
-//! `cancel_ipc_block` deposits the cancelled disposition when a stop lands on
-//! a parked caller; the caller's resume consumes it instead of reading
-//! `ipc_msg` unconditionally. Both park states a `sys_ipc_call` episode can
-//! be cancelled in are exercised:
+//! A stop that lands on a parked caller deposits the Interrupted
+//! disposition, which the caller's resume consumes (see
+//! `core/kernel/docs/ipc-internals.md` § Park Dispositions and Episodes). Both
+//! park states a `sys_ipc_call` episode can be cancelled in are exercised:
 //!
 //!   1. **`BlockedOnSend`** — the client calls an endpoint with no receiver and
-//!      parks on the send queue; the stop's claim is the send-queue unlink
-//!      under `ep.lock`.
+//!      parks on the send queue.
 //!   2. **`BlockedOnReply`** — a server `ipc_recv`s the client (rebinding it to
-//!      awaiting-reply), announces the armed window, and never replies; the
-//!      stop's claim is the `reply_tcb` CAS on the server.
+//!      awaiting-reply), announces the armed window, and never replies.
 //!
 //! In each phase the controller stops the parked client, restarts it, and the
 //! client itself asserts `ipc_call == Err(Interrupted)` — raising an OK bit
 //! on the contract or a BAD bit on any other result (the pre-#361 behavior
 //! was a rax=0 "success" carrying stale `ipc_msg` bytes).
 //!
-//! Runs on a single CPU (the children are timer-preempted peers).
+//! Needs no SMP: the children are unpinned, and on a single CPU they run as
+//! timer-preempted peers.
 
 use ipc::IpcMessage;
 use syscall::{

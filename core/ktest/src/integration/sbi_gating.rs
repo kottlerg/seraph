@@ -5,16 +5,14 @@
 
 //! Integration: `SYS_SBI_CALL` extension gating (RISC-V).
 //!
-//! Verifies the two layers of the `SbiControl` gate without triggering an
-//! actual firmware action (the only sanctioned extension wired to a side effect
-//! here, SRST, would reset the machine):
+//! Verifies the two layers of the `SbiControl` gate defined in
+//! [capability-model.md](../../../../docs/capability-model.md) § `SbiControl` (RISC-V only),
+//! without triggering an actual firmware action (SRST would reset the machine):
 //!
-//! 1. **Kernel floor** — a kernel-managed extension (no right in the vocabulary)
-//!    is rejected with `InvalidArgument` regardless of cap, even when the cap
-//!    holds every sanctioned right. Covered for TIME and HSM.
-//! 2. **Per-extension rights** — a sanctioned extension (SRST) is rejected with
-//!    `InsufficientRights` when the cap lacks its right (`SBI_RESET`). The
-//!    rejection happens before forwarding, so no reset occurs.
+//! 1. **Kernel floor** — TIME and HSM are rejected even when the cap holds
+//!    every sanctioned right.
+//! 2. **Per-extension rights** — SRST through a cap derived without `SBI_RESET`
+//!    is rejected, so no reset occurs.
 //!
 //! The positive SRST path (cap holds `SBI_RESET`) is exercised by the harness's
 //! own `sbi_shutdown` at end of run.
@@ -76,6 +74,8 @@ pub fn run(ctx: &TestContext) -> TestResult
 /// SBI does not exist on this architecture; nothing to gate. Signature matches
 /// the RISC-V arm so `run_integration_test!` registers uniformly.
 #[cfg(not(target_arch = "riscv64"))]
+// unnecessary_wraps: the signature matches the riscv64 `run` so
+// `run_integration_test!` registers both arms uniformly.
 #[allow(clippy::unnecessary_wraps)]
 pub fn run(_ctx: &TestContext) -> TestResult
 {

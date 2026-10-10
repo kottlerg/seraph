@@ -12,8 +12,10 @@
 //! Two rounds, one child thread each in its own `CSpace`. In the first the
 //! server is already blocked in recv when the child calls (the call-direction
 //! transfer); in the second the child calls first and the server receives a
-//! queued sender (the receive-direction transfer, whose sender is parked
-//! while its `CSpace` is held across the batches). The child:
+//! queued sender (the receive-direction transfer, whose sender stays parked
+//! `BlockedOnReply` across the batches; its `CSpace` is not held but
+//! re-resolved through the registry before each batch, per
+//! `core/kernel/docs/capability-internals.md` § Move). The child:
 //!   1. Derives `CHILDREN` caps from its notification cap, one of them with
 //!      a grandchild, then calls the endpoint passing the parent cap.
 //!   2. After the reply, deletes the child that has the grandchild: the

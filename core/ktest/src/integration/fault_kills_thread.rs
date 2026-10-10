@@ -5,11 +5,13 @@
 
 //! Integration: a genuine userspace page fault still kills the thread.
 //!
-//! The kernel's page-fault handler classifies a fault before acting: a stale
-//! TLB entry whose live mapping already satisfies the access is retried, while
-//! a *genuine* fault (the address is not mapped, or the live mapping forbids
-//! the access) terminates the faulting thread. This test exercises the second
-//! half on the real fault path:
+//! A page fault whose live mapping already satisfies the access is retried
+//! as spurious ([memory-internals.md](../../../kernel/docs/memory-internals.md)
+//! § SMP TLB Shootdown); a genuine fault goes to the thread's bound fault
+//! handler or, with none bound, terminates the thread
+//! ([fault-handling.md](../../../../docs/fault-handling.md) § Mechanism Overview).
+//! This test's child has no handler bound, so it exercises the terminal case on
+//! the real fault path:
 //!
 //!   1. A child thread stores to a deliberately-unmapped user address.
 //!   2. The parent polls the child's kernel-authoritative lifecycle state via
@@ -58,8 +60,9 @@ pub fn run(ctx: &TestContext) -> TestResult
     {
         let packed = cap_info(child.th, CAP_INFO_THREAD_STATE)
             .map_err(|_| "integration::fault_kills_thread: cap_info(THREAD_STATE) failed")?;
-        // cast_possible_truncation: the kernel packs an 8-bit state code in the
-        // high word and a 32-bit exit reason in the low word.
+        // cast_possible_truncation: `packed >> 32` is the `u32` state code the
+        // kernel places in the high word (`syscall_abi::CAP_INFO_THREAD_STATE`), so
+        // the cast is lossless.
         #[allow(clippy::cast_possible_truncation)]
         let state = (packed >> 32) as u32;
         if state == THREAD_STATE_EXITED

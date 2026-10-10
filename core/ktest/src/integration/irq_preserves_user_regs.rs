@@ -6,9 +6,9 @@
 //! Tier 2 integration: a ring-3 thread's callee-saved registers survive a timer
 //! preemption via the frame-authoritative IRQ path.
 //!
-//! On x86-64 every ring-3 IRQ (including the APIC timer) now builds the canonical
+//! On x86-64 every ring-3 IRQ (including the APIC timer) builds the canonical
 //! `TrapFrame` on entry and restores all GPRs from it on exit (see
-//! `arch/x86_64/idt.rs::common_irq_trampoline`), rather than relying on the Rust
+//! `core/kernel/src/arch/x86_64/idt.rs::common_irq_trampoline`), rather than relying on the Rust
 //! call chain to preserve user callee-saved registers across a preemption. RISC-V
 //! has always built one `TrapFrame` per trap. This test pins two spinners to the
 //! same CPU so the timer round-robins them: each loads a *distinct* sentinel into

@@ -25,20 +25,22 @@
 //! `pin` is the intra-IOAPIC pin number; the global GSI is `gsi_base + pin`.
 //!
 //! # Vector assignment
-//! GSI `n` is assigned to IDT vector `DEVICE_VECTOR_BASE + n` (33 + n). This
-//! keeps the mapping trivial and avoids a vector allocator.
+//! GSI `n` is assigned to IDT vector `DEVICE_VECTOR_BASE + n` (33 + n), which keeps the mapping
+//! trivial and avoids a vector allocator. Only GSIs 0-22 (vectors 33-55) have IDT stubs and
+//! are dispatched (`idt::irq_dispatch`); the sum overflows `u8` for GSI >= 223.
 //!
 //! # Limitations / deferred work
 //!
 //! - **No MSI/MSI-X support.** Required for modern `PCIe` devices.
 //!
-//! - **Edge-triggered, active-high only.** Level-triggered and active-low
-//!   sources (some legacy ISA IRQs via PCI interrupt routing) are not handled.
-//!   Add `flags` parsing from the `InterruptObject` when needed.
+//! - **Edge-triggered, active-high only.** Level-triggered and active-low sources (PCI `INTx`
+//!   lines, MADT interrupt-source overrides) are not handled; no trigger/polarity information
+//!   reaches the kernel (`InterruptObject` carries only `start` and `count`).
 //!
 //! # Modification notes
-//! - To add a new GSI: `route(gsi, DEVICE_VECTOR_BASE + gsi as u8)` then
-//!   `unmask(gsi)` after registering a notification handler.
+//! - Every GSI is routed by `interrupts::route_device_irq` (from `SYS_IRQ_REGISTER`) and
+//!   unmasked by `interrupts::unmask` (from `SYS_IRQ_ACK`); a GSI above 22 additionally needs
+//!   an IDT stub and a wider device arm in `idt::irq_dispatch`.
 //! - To support level-triggered IRQs: set bit 15 (level-sensitive) and
 //!   bit 13 (active-low polarity) in the redirection entry low dword.
 
@@ -215,12 +217,13 @@ pub unsafe fn init()
 /// The entry is programmed masked; call [`unmask`] when ready to receive.
 /// Uses edge-triggered, active-high, fixed delivery to LAPIC 0.
 ///
-/// TODO: per-IRQ affinity. Every GSI is currently pinned to the BSP LAPIC
-/// (destination field = 0). At the current scale this is fine — one block
-/// device, one IRQ — but with multiple high-rate sources the BSP becomes
-/// the trap bottleneck. Replace the hard-coded destination with a per-GSI
-/// selector (round-robin, user-supplied affinity, or a rebalancer). Mirror
-/// the matching change on RISC-V (`arch/riscv64/interrupts.rs::plic_enable`).
+/// TODO: per-IRQ affinity. Every GSI is delivered to local APIC ID 0 (destination field = 0),
+/// the BSP only when the BSP's APIC ID is 0. With several IRQ sources (virtio-blk, virtio-input,
+/// serial) one CPU takes every device trap. Deferred because only one of those sources
+/// (virtio-blk) is high-rate; the concentration becomes a trap bottleneck once several
+/// high-rate sources exist (more block devices, a NIC). Replace the hard-coded destination with
+/// a per-GSI selector (round-robin, user-supplied affinity, or a rebalancer). Mirror the
+/// matching change on RISC-V (`plic_enable` in `core/kernel/src/arch/riscv64/interrupts.rs`).
 ///
 /// # Safety
 /// Must only be called after [`init`].
@@ -261,7 +264,9 @@ pub unsafe fn mask(gsi: u32)
     let reg = 0x10 + 2 * pin;
     // SAFETY: caller ensures init() has completed; reading current entry.
     let current = unsafe { ioapic_read(base, reg) };
-    // SAFETY: setting mask bit; serializes with IRQ dispatch.
+    // SAFETY: init() has completed; setting the mask bit is architecture-defined. No lock guards
+    // the IOREGSEL/IOWIN pair, so a concurrent `unmask`/`route` on another CPU can interleave
+    // with this read-modify-write.
     unsafe {
         ioapic_write(base, reg, current | REDIR_MASK);
     }

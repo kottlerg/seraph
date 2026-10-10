@@ -19,7 +19,9 @@ use crate::{ChildStack, TestContext, TestResult, spawn};
 const NUM_CHILDREN: usize = 16;
 const MAP_ITERATIONS: usize = 1000;
 
-// Each child owns one bit of the 64-bit `done` notification word.
+// Each child owns one bit of the `done` word below bit 32 (bit 32 is the
+// error indicator), so the encoding holds for NUM_CHILDREN <= 32; this
+// assert admits up to 64.
 const _: () = assert!(NUM_CHILDREN <= 64);
 
 /// Per-child arguments, handed to `mapper_entry` by address.
@@ -49,7 +51,10 @@ pub fn run(ctx: &TestContext) -> TestResult
     let done = cap_create_notification(ctx.memory_base)
         .map_err(|_| "concurrent_map_unmap: create done failed")?;
 
-    // Allocate frames from pool for each child.
+    // Allocate frames from pool for each child. Every `?` early return
+    // below skips the cleanup at the end of `run`: it leaks the pool frames
+    // already allocated and, past the first spawn, leaves the children
+    // already started running with their threads and CSpaces (#444).
     let mut memory_caps = [0u32; NUM_CHILDREN];
     for memory_cap in &mut memory_caps
     {
@@ -89,8 +94,8 @@ pub fn run(ctx: &TestContext) -> TestResult
             )
         };
 
-        // Set the VA for this child via a static. Children read it from
-        // a shared array indexed by child_memory slot (deterministic mapping).
+        // Publish this child's VA in VA_PER_CHILD[i]; the child recovers `i`
+        // from its done_bit (`trailing_zeros`).
         VA_PER_CHILD[i].store(va, core::sync::atomic::Ordering::Release);
 
         // SAFETY: Each child uses a distinct stack index.
@@ -124,7 +129,13 @@ pub fn run(ctx: &TestContext) -> TestResult
     {
         cap_delete(threads[i]).ok();
         cap_delete(cspaces[i]).ok();
-        // SAFETY: memory_caps are from pool and unmapped by children.
+        // SAFETY: `memory_caps` are from the pool. A child that reports
+        // success has unmapped its VA, so `frame_pool::free`'s unmapped
+        // precondition holds for its frame. A child that exits on a failed
+        // `aspace_query` or `mem_unmap` leaves its frame mapped at its stress
+        // VA, and nothing here unmaps it: on that path this free breaks the
+        // precondition and a later `alloc` can hand out a frame that is still
+        // mapped (#444). The test still fails via `child_failed`.
         unsafe { crate::frame_pool::free(memory_caps[i]) };
     }
     cap_delete(done).ok();
@@ -138,13 +149,10 @@ pub fn run(ctx: &TestContext) -> TestResult
 
 /// Per-child VA, set by parent before starting each child.
 static VA_PER_CHILD: [core::sync::atomic::AtomicU64; NUM_CHILDREN] = {
-    // const-fn loop is unstable in stable Rust; use a const block + manual
-    // population via array-init-by-fn idiom.
+    // AtomicU64 is not Copy, so the repeat expression needs an inline const block.
     [const { core::sync::atomic::AtomicU64::new(0) }; NUM_CHILDREN]
 };
 
-// cast_possible_truncation: slot indices are kernel cap slots < 2^32.
-#[allow(clippy::cast_possible_truncation)]
 fn mapper_entry(arg: u64) -> !
 {
     // SAFETY: `arg` is the entry `run` published for this child.
@@ -168,11 +176,10 @@ fn mapper_entry(arg: u64) -> !
             thread_exit();
         }
 
-        // Verify the mapping exists via aspace_query (non-destructive).
-        // We do NOT write through the new VA because pool frames are
-        // backed by ktest's BSS segment — the physical page is already
-        // mapped in BSS, so writing via the stress VA would corrupt
-        // ktest's own statics.
+        // Verify the mapping exists via aspace_query (non-destructive). The
+        // test exercises page-table map/unmap only and never touches the
+        // frame's contents; pool frames are carved from a RAM cap, not from
+        // ktest's image (core/ktest/src/frame_pool.rs).
         if syscall::aspace_query(aspace, va).is_err()
         {
             notification_send(done_slot, done_bit | (1 << 32)).ok();

@@ -82,6 +82,25 @@ claims.
    or when the body claims the whole PR is documentation-only and the PR
    diff is not.
 
+   Local host runs: `docs/testing.md` § Coverage tiers owns the trigger
+   paths, the runs each requires, and the behaviour-neutral categories
+   (its Behaviour-neutral changes paragraph); `docs/conventions.md`
+   § PR-body checklist discipline owns what the body reports. For each
+   change the PR diff makes on a trigger path, other than Markdown and
+   comment lines as defined above (build-embedded text counts as build
+   input), the body MUST report every local host run that section requires
+   for that path (the runs its narrow trigger lists add included), each
+   with the commit it ran at, or name the change and the behaviour-neutral
+   category it falls under, and the diff MUST bear that category out. Every
+   such change on that trigger path after a reported run's commit
+   (`git diff <run commit> <head>` on that path) MUST be behaviour-neutral
+   and named in the body. FAIL when a trigger-path change has neither, when
+   a trigger-path change not named behaviour-neutral lacks a reported run
+   that section requires for its path, when a reported run names no commit,
+   when a later change on that path is not named behaviour-neutral, or when
+   a change named behaviour-neutral falls under no category that paragraph
+   lists.
+
 10. PR-body claims: the body's prose (Summary, Notes, and any section
     the template does not define) against the diff. Every file, argument,
     behaviour, or number the body describes as changed by this PR MUST exist

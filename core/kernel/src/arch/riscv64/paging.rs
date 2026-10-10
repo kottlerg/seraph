@@ -5,8 +5,11 @@
 
 //! RISC-V page table operations, parameterized over the active paging mode.
 //!
-//! Mirrors the x86-64 interface. All page table frames come from the
-//! BSS-resident pool supplied via [`PoolState`].
+//! Mirrors the x86-64 interface. [`map_page`] and [`map_large_page`] (kernel
+//! page-table construction) draw intermediate frames from the BSS-resident
+//! boot pool supplied via [`PoolState`]. The user-mapping functions draw them
+//! from `crate::mm::kernel_pt_pool` ([`map_user_page`]) or the address space's
+//! growth pool ([`map_user_page_pooled`]).
 //!
 //! # Index layout
 //! The mode negotiated at boot ([`PagingMode`]: Sv39, Sv48, or Sv57) fixes
@@ -24,9 +27,10 @@
 //! Non-leaf: V=1, R=0, W=0, X=0. Leaf: V=1, at least one of R/W/X set.
 //! A megapage (2 MiB) is a leaf installed at level 1 in every mode.
 //!
-//! Svpbmt, Svinval, and Svnapot are RVA23-required and asserted by
-//! [`verify_paging_extensions`] at boot; the code paths below use them
-//! unconditionally.
+//! Svpbmt, Svinval, and Svnapot are asserted by [`verify_paging_extensions`]
+//! at boot (required per
+//! [platform-requirements.md](../../../../../docs/platform-requirements.md));
+//! the code paths below use them unconditionally.
 
 use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
@@ -247,14 +251,11 @@ impl PageTableEntry
 }
 
 // ── NAPOT contiguity (Svnapot) ────────────────────────────────────────────────
-// A 64 KiB NAPOT translation is 16 consecutive, identically-attributed 4 KiB
-// leaves whose PPNs are contiguous from a 64 KiB-aligned base: each of the 16
-// PTEs carries N=1 and the size encoding ppn[3:0]=0b1000, and hardware may
-// cache the whole group as one TLB entry. Promotion is applied only to
-// uncacheable (PBMT=IO) user mappings — the MMIO map path is the one producer
-// of eligible phys-contiguous runs — and is a pure hint: every reader below
-// decodes both shapes. A 16-slot group is index-aligned, so it never crosses
-// an L0 table.
+// 64 KiB Svnapot groups: 16 index-aligned 4 KiB leaves carrying N=1 and
+// ppn[3:0]=0b1000. Eligibility, the no-flush and demote-before-divergence
+// invariants, and the reader rules are in core/kernel/docs/memory-internals.md
+// § NAPOT Contiguity (RISC-V). A 16-slot group is index-aligned, so it never
+// crosses an L0 table.
 
 /// Svnapot N bit: this leaf is one member of a NAPOT group.
 const NAPOT: u64 = 1 << 63;
@@ -283,11 +284,8 @@ fn leaf_phys(pte: PageTableEntry, virt: u64) -> u64
 /// non-PPN bits and PPNs contiguous from a 64 KiB-aligned base. Otherwise
 /// leaves the table untouched.
 ///
-/// Needs no TLB flush: the NAPOT encoding translates every VA in the group
-/// identically to the 16 per-page PTEs it replaces, so a cached
-/// pre-promotion entry is benignly stale. Each slot rewrite is a single
-/// aligned u64 store, so a concurrent lock-free reader (the spurious-fault
-/// walk) sees either shape — both translate its VA identically.
+/// Needs no TLB flush, per [memory-internals.md](../../../docs/memory-internals.md)
+/// § NAPOT Contiguity (RISC-V).
 fn try_promote_napot_64k(l0: &mut [PageTableEntry; 512], virt: u64)
 {
     let start = vpn_index(0, virt) & !(NAPOT_64K_PAGES - 1);
@@ -325,14 +323,9 @@ fn try_promote_napot_64k(l0: &mut [PageTableEntry; 512], virt: u64)
 /// (clear N, rewrite each slot's true `ppn[3:0]`). No-op when the slot is
 /// not a NAPOT member.
 ///
-/// Demotion itself needs no flush — every intermediate state translates
-/// identically (same single-store argument as promotion). The caller's
-/// subsequent invalidation of the VA it is about to modify also kills any
-/// cached 64 KiB entry: an `sfence.vma`/`sinval.vma` naming any address
-/// inside a NAPOT range must invalidate a cached translation covering it.
-/// Writers MUST demote before making any slot of a group diverge —
-/// partially zeroing or narrowing inside a live NAPOT group would leave
-/// siblings whose cached group entry still translates the modified VA.
+/// Demotion needs no flush of its own, and every writer must demote before a
+/// slot of the group diverges; both invariants are in
+/// [memory-internals.md](../../../docs/memory-internals.md) § NAPOT Contiguity (RISC-V).
 fn demote_napot_64k(l0: &mut [PageTableEntry; 512], virt: u64)
 {
     let start = vpn_index(0, virt) & !(NAPOT_64K_PAGES - 1);
@@ -508,8 +501,10 @@ fn walk_or_alloc(entry: &mut PageTableEntry, pool: &mut PoolState) -> Result<u64
 ///
 /// Used when transitioning to idle where stale user TLB entries are harmless
 /// (kernel code only touches kernel-mapped addresses). The caller is
-/// responsible for ensuring the next user-mode transition does a proper
-/// `activate()` which includes `sfence.vma`.
+/// responsible for ensuring the next user-mode transition goes through
+/// `AddressSpace::activate`, which either flushes ([`activate`], untagged) or
+/// loads the space under its own ASID ([`activate_tagged`], with the generation
+/// check), so a stale user entry is never used.
 ///
 /// # Safety
 /// `root_phys` must be a valid page table root with correct kernel mappings.
@@ -585,7 +580,7 @@ pub unsafe fn activate_tagged(root_phys: u64, tag: u16)
 /// width. The BSP uses the returned count to seed the tag pool.
 ///
 /// ASID-tagged TLBs are required by the platform baseline
-/// ([platform-requirements.md](../../../../docs/platform-requirements.md)); a
+/// ([platform-requirements.md](../../../../../docs/platform-requirements.md)); a
 /// hart with a zero-width `satp` ASID field is refused here. The check lives
 /// here, not in `cpu::verify_baseline`, because `satp` cannot be safely probed
 /// before the kernel page tables are active.
@@ -605,6 +600,10 @@ pub unsafe fn enable_tagged_tlb() -> usize
 }
 
 /// No-op on RISC-V: the XN/NX mechanism is always available via PTE X bit.
+///
+/// # Safety
+/// No preconditions: the body is empty; the `unsafe` qualifier matches the
+/// x86-64 surface.
 #[cfg(not(test))]
 pub unsafe fn enable_nx() {}
 
@@ -617,7 +616,7 @@ pub unsafe fn enable_nx() {}
 /// firmware-table parse, so a BSP-only check covers the machine. After
 /// this gate the paging code uses the three extensions unconditionally,
 /// per the subsystem-gate policy in
-/// [platform-requirements.md](../../../../docs/platform-requirements.md).
+/// [platform-requirements.md](../../../../../docs/platform-requirements.md).
 ///
 /// Must be called after `platform::capture_kernel_mmio()` and before the
 /// first userspace mapping or TLB shootdown.
@@ -671,22 +670,16 @@ pub fn read_stack_pointer() -> u64
 /// the base of a direct physical map that covers all of physical RAM.
 ///
 /// # Codegen invariant — `#[inline(never)]` plus no `options(nostack)`
-/// This `asm!` block rewrites `sp` from the identity-mapped value to
-/// its direct-map alias. Rust inline asm cannot list `sp` as an output
-/// (it's a reserved register), so LLVM has no way to learn that this
-/// asm modifies `sp`. If LLVM inlines this function into the caller,
-/// it freely hoists any sp-relative local-address materialisation
-/// (`add reg, sp, imm`) to *before* the rebase, producing a stale
-/// low-VA pointer that page-faults on next dereference (PR #138 hit
-/// this in `kernel_entry`'s Phase 6 body — sepc=0xffffffff8000d972,
-/// stval=0x9ddc0f58 on CI's riscv64 release ktest).
-///
-/// `#[inline(never)]` is the fix: an opaque function call is an
-/// optimisation barrier the scheduler cannot move ops across, so every
-/// sp-derived expression in the caller materialises on the correct
-/// side of the rebase. Dropping `options(nostack)` is belt-and-braces
-/// in case a future revision re-inlines this — `nostack` would still
-/// be a factual lie about the body.
+/// This `asm!` block rewrites `sp` to its direct-map alias. Rust inline asm
+/// cannot list `sp` as an output (it is a reserved register), so LLVM cannot
+/// learn that this asm modifies `sp`, and may hoist sp-relative address
+/// materialisation (`add reg, sp, imm`) in the caller to before the rebase,
+/// producing a stale low-VA pointer. `#[inline(never)]` keeps the rebase an
+/// opaque call; the caller additionally runs every post-rebase phase through
+/// the `#[inline(never)]` `kernel_entry_post_rebase` boundary, which keeps
+/// sp-derived values on the correct side of the rebase (see the comment at the
+/// call in `kernel_entry`). Omitting `options(nostack)` keeps the asm's
+/// declared contract truthful: the body modifies `sp`.
 #[cfg(not(test))]
 #[inline(never)]
 pub unsafe fn rebase_boot_stack(direct_map_base: u64)
@@ -703,6 +696,10 @@ pub unsafe fn rebase_boot_stack(direct_map_base: u64)
 }
 
 /// No-op test stub.
+///
+/// # Safety
+/// No preconditions: the body is empty; the signature matches the S-mode
+/// implementation.
 #[cfg(test)]
 pub unsafe fn rebase_boot_stack(_direct_map_base: u64) {}
 
@@ -1037,8 +1034,7 @@ pub unsafe fn unmap_user_page(root_virt: u64, virt: u64)
     {
         return;
     };
-    // Demote-first: zeroing one slot of a live NAPOT group would leave
-    // siblings whose cached group entry still translates this VA.
+    // Demote-first (core/kernel/docs/memory-internals.md § NAPOT Contiguity (RISC-V)).
     if l0[vpn_index(0, virt)].0 & NAPOT != 0
     {
         demote_napot_64k(l0, virt);
@@ -1059,7 +1055,7 @@ fn table_is_empty(table: &[PageTableEntry; 512]) -> bool
 
 /// Unmap every 4 KiB leaf in `[virt_base, virt_base + page_count*4 KiB)` and
 /// reclaim each intermediate table the cleared span leaves empty back to
-/// `aso`'s page-table growth pool. Returns the number of L0/L1/L2 frames freed.
+/// `aso`'s page-table growth pool. Returns the number of non-root table frames freed.
 ///
 /// Walks from the root to the leaf level over the span, clearing in-range
 /// leaf PTEs. A table is freed only when it is fully empty afterwards **and**
@@ -1073,9 +1069,19 @@ fn table_is_empty(table: &[PageTableEntry; 512]) -> bool
 /// freed), so a table holding one is never seen as empty. The root frame is
 /// never freed.
 ///
-/// Issues no TLB flush: the caller performs one coarse `sfence.vma` shootdown
-/// for the whole span and holds `pt_lock` across it, so a freed frame cannot be
-/// popped and reused before every hart is coherent.
+/// Issues no TLB flush: the caller (`AddressSpace::unmap_region_pooled`)
+/// performs one invalidation for the whole span and holds `pt_lock` across
+/// it, so a freed frame cannot be popped and reused before that invalidation
+/// completes. When this returns a non-zero count, that invalidation must be a
+/// full `rs1 = x0` fence on every hart (`flush_tlb_all` locally, the
+/// full-flush shootdown remotely): a per-VA `sfence.vma` or `sinval.vma`
+/// invalidates only leaf translations for that VA, so cached non-leaf entries
+/// pointing at a freed table survive it. The batched per-page window (up to
+/// `RANGE_FLUSH_CEILING_PAGES`) suffices only for a span that freed no table.
+/// Known defect (#443): the caller does not yet meet this requirement; it
+/// issues the per-page window for every span at or under
+/// `RANGE_FLUSH_CEILING_PAGES` whatever this returns, so a hart can keep a
+/// cached non-leaf entry naming a freed table after the frame is reused.
 ///
 /// # Safety
 /// `root_virt` must be the direct-map VA of a valid 4 KiB root frame, `aso`
@@ -1134,11 +1140,8 @@ unsafe fn unmap_span(
         let mut va = lo;
         while va < hi
         {
-            // Demote-first: a span edge can cut through a NAPOT group;
-            // zeroing only the in-span members of a live group would leave
-            // out-of-span siblings whose cached 64 KiB entry still
-            // translates the zeroed VAs. The caller's span-wide flush
-            // covers the demoted members it modifies.
+            // Demote-first: a span edge can cut through a NAPOT group
+            // (core/kernel/docs/memory-internals.md § NAPOT Contiguity (RISC-V)).
             if table[vpn_index(0, va)].0 & NAPOT != 0
             {
                 demote_napot_64k(table, va);
@@ -1185,18 +1188,28 @@ unsafe fn unmap_span(
 /// would corrupt unrelated memory). Issues a local `sfence.vma pa, x0`,
 /// then broadcasts a TLB shootdown to every other online hart.
 ///
-/// The kernel installs this identity mapping in Phase 3 (arch-neutral
-/// `mm/paging.rs`) so the AP trampoline page can execute the four
-/// instructions after `csrw satp` (sfence.vma, mv sp, jr) while PC is
-/// still inside the trampoline at its physical address. Once the AP has
+/// The kernel installs this identity mapping in Phase 3
+/// (`crate::mm::paging::init_kernel_page_tables`) so the AP trampoline page can
+/// execute the three instructions after `csrw satp` (sfence.vma, mv sp, jr)
+/// while PC is still inside the trampoline at its physical address. Once the AP has
 /// reached its kernel-VA entry, the mapping is no longer needed.
 ///
 /// Intermediate tables are NOT freed — they may host other low-VA
 /// mappings (notably the boot-stack identity mapping installed by
-/// `map_boot_stack` in `mm/paging.rs`, and any future low-PA identity entries).
+/// `crate::mm::paging::map_boot_stack`, and any future low-PA identity entries).
+///
+/// # Safety
+/// Must execute in S-mode after Phase 3 installed the kernel root. `pa` must be
+/// 4 KiB-aligned, and no thread (BSP or AP) may execute code on or reference
+/// data inside the page after this returns. The caller must not migrate
+/// between harts during the call: the local flush and the `current_cpu()` read
+/// that excludes this hart from the shootdown precede the routine's own
+/// `preempt_disable()`, which covers only the remote shootdown. The sole
+/// caller, the Phase 8 boot path, runs on the BSP before `sched::enter` and
+/// cannot migrate.
+#[cfg(not(test))]
 // similar_names: root_va and root_pa are a VA/PA pair — the similarity is
 // intentional and follows the pattern used elsewhere in this file.
-#[cfg(not(test))]
 #[allow(clippy::similar_names)]
 pub unsafe fn unmap_identity_page(pa: u64)
 {
@@ -1270,10 +1283,9 @@ pub unsafe fn protect_user_page(
     // contract); its reachable child frames are live PT-pool frames.
     let l0 = unsafe { descend_existing(root_virt, virt, top, 0, phys_to_virt) }
         .ok_or(PagingError::NotMapped)?;
-    // Demote-first: a rights change on one slot of a NAPOT group must not
-    // leave the other 15 members claiming a group that no longer exists.
-    // The demoted per-page PTE carries the same rights and PA, so the
-    // classification below is unaffected.
+    // Demote-first (core/kernel/docs/memory-internals.md § NAPOT Contiguity
+    // (RISC-V)). The demoted per-page PTE carries the same rights and PA, so
+    // the classification below is unaffected.
     if l0[vpn_index(0, virt)].0 & NAPOT != 0
     {
         demote_napot_64k(l0, virt);
@@ -1339,8 +1351,10 @@ pub unsafe fn translate_user_page(root_virt: u64, virt: u64) -> Option<(u64, u64
 /// `prior`/`new` are raw leaf PTE bits (`new` is presumed valid). A not-
 /// valid `prior` is a fresh map; a same-frame rights *widening* needs only the
 /// spurious-fault retry; any frame change or rights *narrowing* strands a
-/// dangerous stale entry and must shoot down. See [`MapOutcome`] for the full
-/// argument.
+/// dangerous stale entry and must shoot down. See
+/// [`MapOutcome`](crate::mm::paging::MapOutcome) and
+/// [memory-internals.md](../../../docs/memory-internals.md) § SMP TLB Shootdown
+/// for the full argument.
 fn classify_user_map(prior: u64, new: u64) -> crate::mm::paging::MapOutcome
 {
     use crate::mm::paging::MapOutcome;
@@ -1417,7 +1431,8 @@ fn pte_permits_user_access(pte: u64, write: bool, instr: bool) -> bool
 /// access — meaning the fault must be a stale TLB entry the hart resolves on
 /// retry after a local `sfence.vma`. Returns `false` for any genuine fault
 /// (unmapped, or the live mapping still forbids the access); the caller then
-/// kills the faulting thread. A `true` result requires the live PTE to grant
+/// delivers it as a genuine fault per [fault-handling.md](../../../../../docs/fault-handling.md).
+/// A `true` result requires the live PTE to grant
 /// the access, and [`PageTableEntry::new_page`] pre-sets A (and D for writable
 /// leaves), so the retried instruction cannot re-fault on an A/D update even
 /// without Svadu — no retry counter is needed.

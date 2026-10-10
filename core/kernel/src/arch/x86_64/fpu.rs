@@ -7,9 +7,11 @@
 //!
 //! Concentrates the unsafe surface for FPU/SIMD state management:
 //! CR0.TS (lazy-trap discipline gate), XSETBV/XCR0 setup, per-CPU XSAVE
-//! enablement performed at boot, the per-thread XSAVE area allocation,
-//! and the save/restore primitives consumed by the `#NM` handler and the
-//! context-switch path.
+//! enablement performed at boot, and the save/restore primitives consumed by
+//! the `#NM` handler and the context-switch path. The per-thread XSAVE area is
+//! the last page of the thread's slab, carved by the thread-create path
+//! (`syscall::cap::sys_cap_create_thread`) and, for init's thread, by boot code
+//! (`kernel_entry_post_rebase`).
 //!
 //! ## Eager-save, lazy-restore discipline
 //!
@@ -20,48 +22,37 @@
 //! - `(CR0.TS=0, fpu_owner=T)`    — T owns the live regs; FP runs
 //!   trap-free.
 //!
-//! `(CR0.TS=0, fpu_owner=null)` is the forbidden at-rest state; it
-//! appears as a transient inside two code paths and is unobservable
-//! from outside each:
+//! The other two combinations are forbidden at rest; each appears only as a
+//! transient inside the code paths below and is unobservable from outside them:
 //!
-//! - **Inside `nm_handler`** (`idt.rs::nm_handler`) between the
-//!   `cr0_clear_ts()` that arms the live registers for XSAVE / XRSTOR
-//!   and the final `fpu_owner.store(tcb, Release)`. Preemption is
+//! - `(CR0.TS=0, fpu_owner=null)` **inside `nm_handler`** (`idt::nm_handler`)
+//!   between the `cr0_clear_ts()` that arms the live registers for XSAVE /
+//!   XRSTOR and the final `fpu_owner.store(tcb, Release)`. Preemption is
 //!   disabled across the handler body, the CPU enters from a hardware
 //!   trap with `IF=0`, and the only architectural interrupt class that
 //!   can fire (NMI) does not touch FPU state — so no other code on this
-//!   CPU observes the transient. No other CPU writes this CPU's owner
-//!   slot.
-//! - **Inside `switch_out_save`** between the `cr0_clear_ts()` that
-//!   arms the live registers for XSAVE and the `cr0_set_ts()` that
-//!   re-arms the lazy trap. Called inside the scheduler-lock critical
-//!   section with `IF=0`; the Release on the subsequent lock unlock is
-//!   what publishes the area to peer CPUs.
-//!
-//! The state `(CR0.TS=1, fpu_owner=T)` never appears under this
-//! discipline: `nm_handler` clears CR0.TS *before* writing the owner
-//! slot, and `switch_out_save` clears the owner slot only after
-//! re-arming `CR0.TS=1`.
+//!   CPU observes the transient. No other CPU writes this CPU's owner slot.
+//! - `(CR0.TS=1, fpu_owner=T)` **inside `switch_out_save`** between the
+//!   `cr0_set_ts()` that re-arms the lazy trap after XSAVE and the store that
+//!   clears `fpu_owner` (its defensive null-area path instead holds
+//!   `(CR0.TS=0, fpu_owner=null)` between clearing the slot and re-arming TS).
+//!   Called with `IF=0` after the scheduler locks are dropped; the outgoing
+//!   thread's `switch()` then publishes `context_saved = 1` (Release), which
+//!   is what publishes the area to peer CPUs.
 //!
 //! [`switch_out_save`] eagerly XSAVEs the live regs into T's TCB area
 //! and clears `fpu_owner` whenever this CPU still owns the outgoing
 //! thread, then arms `CR0.TS=1`. [`switch_in_restore`] just sets
 //! `CR0.TS=1`; the first FP op by the incoming thread traps to `#NM`
-//! (`idt.rs::nm_handler`), which XRSTORs the thread's area and installs
-//! it as the new `fpu_owner`. Migration therefore needs no cross-CPU
-//! coordination: by the time T is observable as Ready on any other CPU's
-//! run queue, T's TCB area is canonical (the source CPU saved it on its
-//! own switch-out, inside the scheduler-lock critical section whose
-//! Release on unlock the destination's Acquire on lock pairs with).
+//! (`idt::nm_handler`), which XRSTORs the thread's area and installs
+//! it as the new `fpu_owner`. The resulting migration guarantee (no cross-CPU
+//! FPU coordination) is specified in core/kernel/docs/scheduling-internals.md
+//! § IPI Taxonomy.
 //!
-//! This pattern matches seL4, NetBSD, OpenBSD, and Linux post-2018
-//! (commit `bf15a8cf8`, which retired lazy-save after CVE-2018-3665
-//! made the optimisation unsafe to keep defending). It is NOT the
-//! eager-save-eager-restore of commit `190c3da`: restore stays lazy via
-//! `#NM` — only save is eager. The cost is one XSAVE per switch-out of
-//! an FP-touching thread (~300-600 cycles on x86-64-v3), paid in
-//! exchange for deleting the cross-CPU migration-steal IPI and its
-//! synchronous ack-wait (the source of issue #108).
+//! Only save is eager; restore stays lazy via `#NM`. The cost is one XSAVE per
+//! switch-out of a thread that owns the live FP state; in exchange no cross-CPU
+//! FPU flush IPI is needed (core/kernel/docs/scheduling-internals.md § IPI
+//! Taxonomy).
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -116,8 +107,10 @@ pub unsafe fn cr0_set_ts()
 
 /// Clear CR0.TS so x87/SSE/AVX instructions execute without trapping.
 ///
-/// Called from the `#NM` handler after restoring (or initialising) the
-/// current thread's extended state.
+/// Called before XSAVE/XRSTOR, which raise `#NM` while CR0.TS=1: by the `#NM`
+/// handler before saving the previous owner and restoring the trapping
+/// thread's state, and by [`switch_out_save`] before saving the outgoing
+/// thread's state.
 ///
 /// # Safety
 /// Must execute at ring 0. Caller is responsible for ensuring the live
@@ -151,16 +144,23 @@ const XCR0_SSE: u64 = 1 << 1;
 const XCR0_AVX: u64 = 1 << 2;
 const XCR0_V3: u64 = XCR0_X87 | XCR0_SSE | XCR0_AVX;
 
-/// Size (bytes) of the XSAVE area required for the components in XCR0.
+/// XSAVE area size (bytes) reported by CPUID.0Dh:0.ECX: the size for every
+/// component the CPU supports, an upper bound on the size for the components
+/// enabled in XCR0 (CPUID.0Dh:0.EBX).
 ///
-/// Populated at boot by [`enable_xsave`] from CPUID.0Dh:0.ECX. Zero before
-/// initialisation. Per-CPU values are guaranteed to agree by the v3 contract.
+/// Written by [`enable_xsave`] on each CPU (last writer wins); zero before
+/// initialisation.
 static XSAVE_AREA_SIZE: AtomicUsize = AtomicUsize::new(0);
 
-/// Return the XSAVE area size for the currently-enabled XCR0 components.
+/// Return the XSAVE area size reported by CPUID.0Dh:0.ECX: the size for every
+/// supported component, an upper bound on the size for the components enabled
+/// in XCR0 (CPUID.0Dh:0.EBX).
 ///
 /// Returns 0 before [`enable_xsave`] has run on the BSP.
-#[allow(dead_code)] // Consumed by the per-thread XSAVE area allocator in a later commit.
+// dead_code: no caller; the per-thread XSAVE area is a fixed PAGE_SIZE page
+// carved by `syscall::cap::sys_cap_create_thread` and, for init's thread, by
+// `kernel_entry_post_rebase`, neither of which consults this size.
+#[allow(dead_code)]
 pub fn xsave_area_size() -> usize
 {
     XSAVE_AREA_SIZE.load(Ordering::Relaxed)
@@ -190,17 +190,18 @@ unsafe fn xsetbv(xcr: u32, val: u64)
 
 /// Enable XSAVE and the x87+SSE+AVX component set in XCR0.
 ///
-/// Must be called once per CPU during early init, after the IDT is loaded so
-/// any fault during CR4/XCR0 setup is catchable. Fatal if the CPU does not
-/// support XSAVE (CPUID.01H:ECX bit 26) — the kernel targets x86-64-v3 which
-/// requires it.
+/// Must be called once per CPU during early init. On the BSP it runs from
+/// `interrupts::init` before the IDT is loaded (a CR4/XCR0 fault there is not
+/// catchable); on each AP (`interrupts::init_ap`) the IDT is already loaded.
+/// Fatal if the CPU does not support XSAVE (CPUID.01H:ECX bit 26) — the kernel
+/// targets x86-64-v3 which requires it.
 ///
-/// After this returns, [`xsave_area_size`] reports the size required to save
-/// the current XCR0 component set, and [`cr0_set_ts`] / [`cr0_clear_ts`] can
-/// be used to arm and disarm the `#NM` lazy-trap discipline.
+/// After this returns, [`xsave_area_size`] reports an XSAVE area size large
+/// enough for every supported component (CPUID.0Dh:0.ECX), and [`cr0_set_ts`] /
+/// [`cr0_clear_ts`] can be used to arm and disarm the `#NM` lazy-trap discipline.
 ///
 /// # Safety
-/// Must execute at ring 0 with the IDT loaded.
+/// Must execute at ring 0 during per-CPU early init.
 #[cfg(not(test))]
 pub unsafe fn enable_xsave()
 {
@@ -232,8 +233,9 @@ pub unsafe fn enable_xsave()
         xsetbv(0, XCR0_V3);
     }
 
-    // Record XSAVE area size for the active component set. CPUID.0Dh:0.ECX
-    // is the max enabled state size for the current XCR0.
+    // Record the XSAVE area size. CPUID.0Dh:0.ECX is the size for every
+    // component the CPU supports (an upper bound on the XCR0-enabled size,
+    // which is EBX).
     let (_eax, _ebx, ecx, _edx) = super::cpu::cpuid(0xD);
     XSAVE_AREA_SIZE.store(ecx as usize, Ordering::Relaxed);
 }
@@ -241,7 +243,9 @@ pub unsafe fn enable_xsave()
 /// Save the live x87/SSE/AVX state of the executing CPU into `area`.
 ///
 /// `area` must be 64-byte aligned and point at a writable XSAVE buffer of
-/// at least [`xsave_area_size`] bytes. The component-mask passed in
+/// at least the XCR0-enabled size (CPUID.0Dh:0.EBX) bytes, which XSAVE never
+/// writes past; [`xsave_area_size`] is an upper bound on that size, not the
+/// requirement. The component-mask passed in
 /// `EDX:EAX = 0xFFFF_FFFF_FFFF_FFFF` instructs XSAVE to write every
 /// component XCR0 currently enables; hardware intersects with XCR0, so
 /// the actual written set is exactly the OS-enabled components.
@@ -253,9 +257,11 @@ pub unsafe fn enable_xsave()
 /// on every implementation (hardware, KVM, TCG).
 ///
 /// # Safety
-/// Must execute at ring 0. `area` must satisfy the alignment and size
-/// requirements above. Called from the context-switch path with
-/// interrupts disabled and the scheduler lock held.
+/// Must execute at ring 0 with CR0.TS clear. `area` must satisfy the alignment
+/// and size requirements above. Called from `switch_out_save` (interrupts
+/// disabled, after the scheduler locks are dropped and before `switch()`
+/// publishes `context_saved`) and from the `#NM` handler (interrupts
+/// disabled, preemption disabled).
 #[cfg(not(test))]
 #[inline]
 pub unsafe fn save_to(area: *mut u8)
@@ -313,18 +319,18 @@ pub unsafe fn restore_from(area: *const u8)
 /// `tcb`'s extended-state area, if any, is canonical and safe for any
 /// other CPU to XRSTOR from on first FP use.
 ///
-/// Hot-path cost: one Acquire load of `fpu_owner` plus an early return
-/// for kernel-only / idle threads (whose `extended.area` is null) and
-/// for threads that have not touched FP since their last switch-in (no
-/// matching `#NM` ran, so this CPU's owner slot still names someone
-/// else or null). The XSAVE+TS+null-store path runs only when this CPU
-/// genuinely holds `tcb`'s live regs.
+/// Hot-path cost: one Acquire load of `fpu_owner` and a CR0.TS re-arm for
+/// threads this CPU's owner slot does not name (kernel-only / idle threads, and
+/// threads that have not touched FP since their last switch-in). The
+/// XSAVE+TS+null-store path runs only when this CPU genuinely holds `tcb`'s
+/// live regs.
 ///
 /// # Safety
-/// Must execute at ring 0 with interrupts disabled, inside the scheduler
-/// lock's critical section so its writes happen-before the
-/// destination CPU's matching Acquire on the same scheduler lock. `tcb`
-/// must be a valid TCB pointer.
+/// Must execute at ring 0 with interrupts disabled, before the outgoing
+/// thread's `switch()` publishes `context_saved = 1` (Release). That store is
+/// the publication edge: it orders the XSAVE into `tcb`'s extended-state area
+/// before any other CPU's Acquire of `context_saved`. `tcb` must be a valid
+/// TCB pointer.
 #[cfg(not(test))]
 #[inline]
 pub unsafe fn switch_out_save(tcb: *mut crate::sched::thread::ThreadControlBlock)

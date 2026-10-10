@@ -17,8 +17,10 @@
 //! **x86-64**: the `IA32_GS_BASE` MSR is set to `per_cpu_ptr(cpu_id)` so that
 //! GS-relative addressing (`gs:[offset]`) reaches the current CPU's data
 //! without a memory indirection or lock. The `PERCPU_*_OFFSET` constants
-//! must match the `#[repr(C)]` field layout exactly — they are used in
-//! the `syscall_entry` naked-asm stub.
+//! must match the `#[repr(C)]` field layout exactly — x86-64 assembly
+//! (`syscall::syscall_entry`, `syscall::set_kernel_rsp`, `cpu::current_cpu`,
+//! `gdt::set_rsp0`, `gdt::load_iopb`) addresses the fields at the literal
+//! offsets these constants mirror.
 //!
 //! **RISC-V**: the `tp` (thread pointer) register is set to `per_cpu_ptr(cpu_id)`.
 //! `current_cpu()` dereferences `tp` to read `cpu_id`.
@@ -36,9 +38,10 @@
 //! | `PERCPU_FPU_OWNER_OFFSET` | 48 | `fpu_owner` |
 //!
 //! ## Adding new fields
-//! Append fields at the end of the struct. Update the constant table above,
-//! add a test in the `tests` module, and update any assembly that addresses
-//! the struct by offset.
+//! Append fields at the end of the struct. If assembly reads the field, add
+//! its `PERCPU_*_OFFSET` constant, a row in the table above, and an
+//! `offset_of!` line in `tests::percpu_offsets_match_asm_constants`, and update
+//! that assembly; otherwise update only the size assertion in that test.
 
 use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
@@ -60,10 +63,9 @@ static CPU_APIC_IDS_PTR: AtomicPtr<u32> = AtomicPtr::new(core::ptr::null_mut());
 /// Initialize the CPU-to-APIC-ID mapping from `BootInfo::cpu_ids`.
 ///
 /// Must be called once during boot before any SMP operations that require
-/// sending IPIs to specific CPUs. Accepts a slice rather than a fixed-size
-/// array; [`MAX_CPUS`] now matches the boot protocol's `BootInfo::cpu_ids`
-/// length, so the `min` below is a defensive bound that drops nothing in
-/// practice.
+/// sending IPIs to specific CPUs. Copies the first `CPU_COUNT` entries of
+/// `cpu_ids` (the caller passes the full `BootInfo::cpu_ids` array) into the
+/// `CPU_COUNT`-sized slab; the `min` also bounds the copy by the slice length.
 ///
 /// # Safety
 /// Single-threaded boot phase; must be called before SMP is active.
@@ -89,7 +91,8 @@ pub unsafe fn init_apic_ids(cpu_ids: &[u32])
 /// Returns the APIC/hart ID that can be used as the target for an IPI.
 ///
 /// # Safety
-/// `cpu` must be < [`MAX_CPUS`] and [`init_apic_ids`] must have been called.
+/// `cpu` must be < `CPU_COUNT` (the slab holds `CPU_COUNT` entries and the
+/// body does not check the bound; #443), and [`init_apic_ids`] must have been called.
 #[cfg(not(test))]
 pub unsafe fn apic_id_for(cpu: usize) -> u32
 {
@@ -106,7 +109,8 @@ pub unsafe fn apic_id_for(cpu: usize) -> u32
 // ── Field offsets (must match #[repr(C)] layout) ──────────────────────────────
 
 /// Byte offset of `PerCpuData::cpu_id`. GS-relative: `gs:[0]`.
-// Used by the syscall_entry naked-asm stub (assembly references by numeric offset).
+// Read as `gs:[0]` by the x86-64 `cpu::current_cpu` inline asm (assembly references
+// by numeric offset).
 #[allow(dead_code)]
 pub const PERCPU_CPU_ID_OFFSET: usize = 0;
 /// Byte offset of `PerCpuData::kernel_rsp`. GS-relative: `gs:[8]`.
@@ -122,11 +126,13 @@ pub const PERCPU_USER_RSP_OFFSET: usize = 16;
 #[allow(dead_code)]
 pub const PERCPU_SCRATCH_OFFSET: usize = 24;
 /// Byte offset of `PerCpuData::tss_ptr`. GS-relative: `gs:[32]`.
-// Used by the syscall_entry naked-asm stub (assembly references by numeric offset).
+// Read as `gs:[32]` by the x86-64 `gdt::set_rsp0` and `gdt::load_iopb` inline asm
+// (assembly references by numeric offset).
 #[allow(dead_code)]
 pub const PERCPU_TSS_PTR_OFFSET: usize = 32;
 /// Byte offset of `PerCpuData::preempt_count`. GS-relative: `gs:[40]`.
-// Not accessed from assembly; used by preempt_disable/preempt_enable.
+// Not accessed from assembly or referenced by any code (`preempt_disable`/`preempt_enable`
+// reach the field by name); included for layout discipline.
 #[allow(dead_code)]
 pub const PERCPU_PREEMPT_COUNT_OFFSET: usize = 40;
 /// Byte offset of `PerCpuData::fpu_owner`. GS-relative: `gs:[48]`.
@@ -158,7 +164,8 @@ pub struct PerCpuData
     /// repurposed to carry user RSP to `user_rsp`.
     pub scratch: u64,
     /// x86-64: virtual address of this CPU's TSS. Used by `set_rsp0`
-    /// to locate the TSS without a global variable. Zero until Phase 5 init.
+    /// to locate the TSS without a global variable. Zero until `init_bsp`
+    /// (BSP, Phase 5) or `gdt::init_ap` (each AP, from `kernel_entry_ap`) sets it.
     pub tss_ptr: u64,
     /// Preemption-disable depth counter. When > 0, `timer_tick()` skips
     /// calling `schedule()`, preventing context switches during critical
@@ -170,12 +177,10 @@ pub struct PerCpuData
     /// registers (null if none). Written by the `#NM` handler (installs
     /// ownership on first FP use) and by `switch_out_save` (clears
     /// ownership when this CPU's outgoing thread was the owner, after
-    /// eager XSAVE). The on-CPU invariant is the one-way implication
-    /// `(CR0.TS=0) ⇒ (fpu_owner != null)`; the forbidden state is
-    /// `(CR0.TS=0, fpu_owner=null)`. The states `(TS=1, owner=null)`
-    /// and `(TS=0, owner=T)` are the two at-rest states; see
-    /// `arch/x86_64/fpu.rs` module docs. Unused on RISC-V (lazy via
-    /// `sstatus.FS/VS`).
+    /// eager XSAVE). The CR0.TS / owner discipline is specified in the
+    /// `core/kernel/src/arch/x86_64/fpu.rs` module docs. Unused on RISC-V, which
+    /// tracks F/D/V state through `sstatus.FS/VS` (saved on switch-out when Dirty,
+    /// restored lazily on the illegal-instruction trap).
     pub fpu_owner: AtomicPtr<ThreadControlBlock>,
     /// Count of context-switch activations on this CPU that loaded a tagged
     /// address space **without** flushing (the tagged-TLB optimization firing).
@@ -183,7 +188,8 @@ pub struct PerCpuData
     /// `CAP_INFO_TLB_*` diagnostic.
     pub ctxsw_flush_elided: AtomicU64,
     /// Count of context-switch activations on this CPU that performed a flush
-    /// (tag reissue, switched-away unmap catch-up, or pool-exhaustion fallback).
+    /// (tag reissue or switched-away unmap catch-up; see
+    /// `core/kernel/docs/memory-internals.md` § TLB Management).
     pub ctxsw_flush_performed: AtomicU64,
 }
 
@@ -209,10 +215,11 @@ impl PerCpuData
 
 // ── Global per-CPU array ──────────────────────────────────────────────────────
 
-/// One `PerCpuData` per potential CPU, indexed by logical CPU ID.
+/// Base of the `CPU_COUNT`-entry `PerCpuData` slab published by
+/// [`init_storage`] (Phase 4), indexed by logical CPU ID via [`per_cpu_ptr`].
 ///
-/// Only `[0..cpu_count]` entries are initialised. Entry 0 is set up by
-/// [`init_bsp`] during Phase 5; AP entries are set up in SMP startup.
+/// Entry 0 is set up by [`init_bsp`] during Phase 5; AP entries by
+/// [`init_ap`] from `kernel_entry_ap` during SMP startup.
 ///
 /// # Safety
 /// Each entry is written exclusively by its owning CPU during init and
@@ -275,7 +282,8 @@ pub fn per_cpu_ptr(cpu: usize) -> *mut PerCpuData
 /// Initialise per-CPU state for the BSP (logical CPU 0) and install the
 /// architecture-specific access register (GS-base on x86-64, `tp` on RISC-V).
 ///
-/// Called from Phase 5 (`kernel_entry`) after per-CPU storage is allocated (Phase 4).
+/// Called from Phase 5 (`kernel_entry_post_rebase`) after per-CPU storage is allocated
+/// (Phase 4).
 /// Must be called before any code that reads [`current_cpu`].
 ///
 /// # Safety
@@ -285,7 +293,7 @@ pub fn per_cpu_ptr(cpu: usize) -> *mut PerCpuData
 pub unsafe fn init_bsp()
 {
     let ptr = per_cpu_ptr(0);
-    // SAFETY: single-threaded boot phase; no concurrent access to PER_CPU[0].
+    // SAFETY: single-threaded boot phase; no concurrent access to `per_cpu_ptr(0)`'s entry.
     unsafe {
         (*ptr).cpu_id = 0;
         // Store BSP TSS pointer so set_rsp0() can find the TSS via GS-relative
@@ -301,16 +309,19 @@ pub unsafe fn init_bsp()
 /// Initialise per-CPU state for an AP (logical CPU `cpu_id`) and install the
 /// architecture-specific access register.
 ///
-/// Called from `kernel_entry_ap` during SMP startup AP startup.
+/// Called from `kernel_entry_ap` during SMP startup.
 ///
 /// # Safety
 /// Must execute at ring 0 / S-mode on the AP being initialised.
-/// `cpu_id` must be < `MAX_CPUS` and `PER_CPU[cpu_id]` must not yet be in use.
+/// `cpu_id` must be < `CPU_COUNT` (the slab holds `CPU_COUNT` entries and the
+/// body does not check the bound; #443), and `per_cpu_ptr(cpu_id)`'s entry
+/// must not yet be in use.
 #[cfg(not(test))]
 pub unsafe fn init_ap(cpu_id: u32)
 {
     let ptr = per_cpu_ptr(cpu_id as usize);
-    // SAFETY: AP init; no concurrent access to PER_CPU[cpu_id] during AP startup.
+    // SAFETY: AP init; no concurrent access to `per_cpu_ptr(cpu_id)`'s entry during AP
+    // startup.
     unsafe {
         (*ptr).cpu_id = cpu_id;
     }
@@ -371,16 +382,14 @@ pub fn preemption_disabled() -> bool
 
 /// Return a reference to CPU `cpu`'s FPU owner slot.
 ///
-/// Called from the local `#NM` handler (`idt.rs::nm_handler`) and
-/// `switch_out_save`. After eager save-on-switch-out eliminated the
-/// migration-steal IPI and the dealloc-time sweep, every caller
-/// resolves `cpu == current_cpu()`; the slot reference form is kept
-/// for symmetry with the rest of the `PER_CPU` accessors.
+/// Called from the x86-64 `#NM` handler (`idt::nm_handler`) and
+/// `fpu::switch_out_save`; both pass `current_cpu()`.
 ///
 /// # Safety
-/// `cpu` must be < [`MAX_CPUS`]. The returned reference is `'static` because
-/// `PER_CPU` outlives any conceivable caller; concurrent access is safe via
-/// the [`AtomicPtr`] interior mutability.
+/// `cpu` must be < `CPU_COUNT`; the function is a safe `fn` and does not check
+/// the bound, so an out-of-range `cpu` is undefined behaviour (#443). The
+/// returned reference is `'static` because the per-CPU slab is never freed;
+/// concurrent access is safe via the [`AtomicPtr`] interior mutability.
 // dead_code: consumed only by arch/x86_64 (lazy-FPU owner cache + #NM handler);
 // present unconditionally so no architecture cfg-gate is needed here. RISC-V
 // uses eager FS/VS-dirty FPU tracking and never reads this slot.
@@ -446,8 +455,9 @@ mod tests
     use super::*;
     use core::mem::offset_of;
 
-    // ABI contract: the syscall entry/exit and context-switch assembly reads PerCpuData
-    // fields by these constant offsets (PERCPU_*_OFFSET). The struct layout and the
+    // ABI contract: x86-64 assembly (`syscall::syscall_entry`, `syscall::set_kernel_rsp`,
+    // `cpu::current_cpu`, `gdt::set_rsp0`, `gdt::load_iopb`) reads PerCpuData fields at the
+    // literal offsets the PERCPU_*_OFFSET constants mirror. The struct layout and the
     // constants MUST agree or the asm touches the wrong field. Size is pinned because the
     // tagged-TLB counters are appended after the asm-referenced fields; a size change
     // would mean something was inserted ahead of them.

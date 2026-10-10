@@ -63,7 +63,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     // ── Phase 1: priority churn ± affinity flips. ────────────────────────
     //
-    // Hazard 2 surface: an affinity-driven migration to a different CPU's
+    // Surface: an affinity-driven migration to a different CPU's
     // queue, racing the priority-change's locate-and-relocate sequence.
     //
     // Affinity flips run every 4 cycles — dense enough to exercise the
@@ -96,7 +96,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     // ── Phase 2: dealloc racing a remote-running, priority-churned target. ─
     //
-    // Hazard 1 surface: dealloc reads priority under all-CPU locks and
+    // Stale-link surface: dealloc reads priority under all-CPU locks and
     // calls remove_from_queue per CPU; a concurrent set_priority that
     // changes the priority field without relocating the queue entry would
     // leave a stale link the dealloc misses.

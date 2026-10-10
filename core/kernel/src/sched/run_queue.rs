@@ -9,14 +9,15 @@
 //! non-empty queues for O(1) highest-priority selection, and pointers to the
 //! currently running and idle TCBs.
 //!
-//! Locking. The `lock` field is a real `Spinlock<()>` that disables
+//! Locking. The `lock` field is a `crate::sync::Spinlock` that disables
 //! interrupts while held, preventing timer-driven deadlock. Acquire before
 //! any `enqueue`, `dequeue_highest`, `remove_from_queue`, `find_runnable`,
 //! or `set_current` call.
 //!
-//! Cross-CPU migration goes through `sched::migrate_ready_thread` (used by
-//! `sys_thread_set_affinity` and the periodic load balancer); see
-//! `docs/scheduling-internals.md` § Lock Hierarchy rule 4 for the
+//! Cross-CPU migration goes through `sched::relocate_ready_thread`, called by
+//! `sched::migrate_ready_thread` (`sys_thread_set_affinity`) and
+//! `sched::pull_unpinned_ready` (the periodic load balancer); see
+//! `core/kernel/docs/scheduling-internals.md` § Lock Hierarchy rule 4 for the
 //! ascending-CPU-order rule that applies whenever two scheduler locks are
 //! held simultaneously.
 
@@ -199,12 +200,9 @@ pub struct PerCpuScheduler
     /// Bitmask: bit N is set iff `queues[N]` is non-empty.
     /// Enables O(1) selection of the highest non-empty priority queue.
     ///
-    /// Atomic so the idle loop can read it without acquiring the lock.
-    /// On RISC-V (RVWMO), a plain `u32` written by CPU A under a lock
-    /// is not guaranteed visible to CPU B's lockless read — the Release
-    /// on unlock only orders A's stores; B needs an Acquire load on
-    /// the same variable to synchronize. Using `AtomicU32` with Acquire
-    /// in `has_runnable()` closes this gap.
+    /// Atomic so the idle loop can read it without acquiring the lock; the
+    /// Release/Acquire pairing is specified in
+    /// core/kernel/docs/scheduling-internals.md § Atomic Ordering Invariants.
     non_empty: AtomicU32,
 
     /// Currently executing TCB on this CPU (non-null after `init`).
@@ -219,8 +217,9 @@ pub struct PerCpuScheduler
     /// The lock disables interrupts while held, preventing timer-driven deadlock.
     pub lock: crate::sync::Spinlock,
 
-    /// Approximate load counter (number of Ready + Running threads on this
-    /// CPU). Relaxed-updated; advisory for load balancing. Lives in the
+    /// Approximate load counter (number of threads linked on this CPU's run
+    /// queues; the running thread is not counted). Relaxed-updated; advisory
+    /// for load balancing. Lives in the
     /// scheduler rather than a `MAX_CPUS`-wide global so it scales with the
     /// CPU count.
     load: AtomicU32,
@@ -231,41 +230,40 @@ pub struct PerCpuScheduler
     /// read back at the matching `unlock_raw`. Written only under this
     /// scheduler's own lock, so
     /// it needs no atomicity. Off-stack per the per-CPU-field idiom of
-    /// docs/scheduling-internals.md § Off-Stack Scratch for Ceiling-Sized Arrays.
+    /// core/kernel/docs/scheduling-internals.md § Off-Stack Scratch for Ceiling-Sized Arrays.
     pub saved_lock_flags: u64,
 
-    /// Head of this CPU's deferred reclaim stack (#341). Holds objects whose
-    /// free could not complete on the thread that dropped their last
-    /// capability: a `Thread` object deleted by its own thread (the inline
-    /// `dealloc_object` drain gate cannot run for the running thread on its
-    /// own CPU), or a `CSpace` / `AddressSpace` whose teardown stopped the
-    /// running thread itself. Each is freed off-CPU by
-    /// `crate::cap::object::drain_deferred_reclaim`. Typed opaquely (`*mut
-    /// u8`, really `*mut cap::object::KernelObjectHeader`) to avoid a
-    /// sched→cap layering edge; the object module owns the cast and the
+    /// Head of this CPU's deferred reclaim stack (#341): objects whose free
+    /// `crate::cap::object::push_deferred_reclaim` defers (its rustdoc lists the
+    /// producers: self-teardowns and `cap::transfer::release_moved_object`),
+    /// completed later by `crate::cap::object::drain_deferred_reclaim`. Typed
+    /// opaquely (`*mut u8`, really `*mut cap::object::KernelObjectHeader`) to
+    /// avoid a sched→cap layering edge; the object module owns the cast and the
     /// per-type intrusive link field.
     pub deferred_reclaim_head: core::sync::atomic::AtomicPtr<u8>,
 }
 
-// SAFETY: scheduler is protected by `lock` (Phase 9+) and only accessed
-// from the owning CPU in Phase 8 (single-threaded boot).
+// SAFETY: a scheduler's run queue is accessed under its `lock` once APs are
+// started (core/kernel/docs/initialization.md § Phase 8: Scheduler and SMP
+// Bringup); before that only the boot CPU touches the scheduler slab.
 unsafe impl Send for PerCpuScheduler {}
 // SAFETY: PerCpuScheduler is protected by lock and per-CPU isolation; no Sync violation.
 unsafe impl Sync for PerCpuScheduler {}
 
-// RunQueue does not implement Copy/Clone, so we cannot derive Default or use
-// array repeat syntax. Provide a manual const constructor instead.
+// `PerCpuScheduler::new` builds `queues` by repeating the `const Q` item, which
+// needs no `Copy`; the `Copy`/`Clone` impls on `RunQueue` below are unused.
 impl PerCpuScheduler
 {
     /// Construct an uninitialized (zeroed) scheduler state.
     ///
-    /// `init()` in `sched/mod.rs` populates `current` and `idle` before use.
+    /// `init()` in `core/kernel/src/sched/mod.rs` populates `current` and `idle` before use.
     pub const fn new() -> Self
     {
-        // Manually expand the 32-element array because `RunQueue` is not Copy.
+        // The 32-element array repeats the `const Q` item by hand.
         // If NUM_PRIORITY_LEVELS changes, update this list accordingly.
-        // TODO: switch to `[const { RunQueue::new() }; N]` once that syntax
-        // stabilises in the kernel's MSRV.
+        // TODO: switch to `[const { RunQueue::new() }; NUM_PRIORITY_LEVELS]`;
+        // the kernel already compiles that syntax (e.g. `crate::irq`), so
+        // nothing blocks the switch.
         const Q: RunQueue = RunQueue::new();
         Self {
             queues: [
@@ -287,10 +285,10 @@ impl PerCpuScheduler
     /// Sets bit `priority` in `non_empty` and increments the load counter.
     ///
     /// Enforces the "Ready ⇒ linked on exactly one queue" invariant at this
-    /// chokepoint (issue #244): a `tcb` already linked on a run queue is a
-    /// double-link that would self-cycle the intrusive list. Debug builds panic
-    /// (the `RunQueue::enqueue` tripwire); release builds skip the redundant
-    /// link. See the guard below.
+    /// chokepoint (core/kernel/docs/scheduling-internals.md § `ThreadState`
+    /// Transitions, Enqueue-chokepoint enforcement): if `tcb` is already linked
+    /// (`queued_on >= 0`), debug builds panic in the guard below and release
+    /// builds skip the redundant link.
     ///
     /// Returns `true` iff this call created the link. A `false` return is the
     /// release-mode skip: `tcb` survives linked wherever its prior enqueue
@@ -307,6 +305,9 @@ impl PerCpuScheduler
         let p = priority as usize;
         // Debug: detect use-after-free via magic cookie.
         // SAFETY: tcb is guaranteed valid by the caller; magic and thread_id are always readable.
+        // undocumented_unsafe_blocks: the unsafe blocks sit inside `debug_assert!`
+        // arguments, where no per-block SAFETY comment can be placed; the comment
+        // above covers both.
         #[allow(clippy::undocumented_unsafe_blocks)]
         {
             debug_assert!(
@@ -320,34 +321,29 @@ impl PerCpuScheduler
             "priority {p} out of range [0, {NUM_PRIORITY_LEVELS})"
         );
 
-        // Global single-link guard (issue #244, residual gap hit by #289).
-        // `queued_on` holds the priority this TCB is currently linked at, or -1
-        // when unlinked; it is written only under the owning scheduler.lock, so
-        // a `>= 0` value means `tcb` is already linked on some CPU's run queue
-        // and re-linking would corrupt the intrusive list. Unlike the old
-        // `run_queue_next`/tail check this also catches a TCB that is the sole
-        // element of a *different* priority queue or *another CPU's* queue —
-        // exactly the case #289 reproduced. In debug, panic naming the prior
-        // link's breadcrumb; in release, skip the redundant link losslessly
-        // (`tcb` is already Ready and queued, so it is dispatched from where it
-        // sits — no wake is lost, and the `false` return keeps the caller from
-        // retargeting `preferred_cpu` away from that surviving link). Checked
-        // before `increment_load` so a skipped link leaves the load counter
-        // exact.
-        // SAFETY: tcb is valid; the caller holds this scheduler's lock, so
-        // queued_on is stable for this read.
+        // Global single-link guard (#244/#289); the `queued_on` tag, the debug
+        // panic, and the lossless release skip are specified in
+        // core/kernel/docs/scheduling-internals.md § ThreadState Transitions
+        // (Enqueue-chokepoint enforcement). The `false` return keeps the caller
+        // from retargeting `preferred_cpu` away from the surviving link (#359).
+        // SAFETY: tcb is valid (caller contract). `queued_on` is atomic, so this
+        // Relaxed read is well-defined even when `tcb` is linked on another CPU
+        // whose lock this caller does not hold; see
+        // core/kernel/docs/scheduling-internals.md § Atomic Ordering Invariants.
         let prior_link = unsafe { (*tcb).queued_on.load(Ordering::Relaxed) };
         if prior_link >= 0
         {
             #[cfg(debug_assertions)]
-            // SAFETY: tcb valid; fields stable under the owning scheduler.lock.
+            // SAFETY: tcb valid; diagnostic reads. `state`, `cpu_affinity`, and
+            // `last_enqueue` are stable under the caller-held `(*tcb).sched_lock`,
+            // `context_saved` is atomic, and `thread_id` is immutable.
             unsafe {
                 let tid = (*tcb).thread_id;
                 let prior = (*tcb).last_enqueue;
                 // Surface the state/cs/affinity of the doubly-linked TCB and the
                 // current link CPU: a residual #289/#351 double-link is driven
                 // by a Blocked-while-linked or self-pinned (cs==0) condition, not
-                // just the bare queued_on tag (G5).
+                // just the bare queued_on tag.
                 let state = (*tcb).state;
                 let cs = (*tcb).context_saved.load(Ordering::Relaxed);
                 let aff = (*tcb).cpu_affinity;
@@ -386,10 +382,9 @@ impl PerCpuScheduler
                 preferred_cpu: (*tcb).preferred_cpu,
             });
         }
-        // Release: publishes the queue write and the increment_load store to any
-        // CPU that observes this bit via Acquire in `has_runnable`. The idle
-        // loop relies on this: it is lockless, so the Acquire load of
-        // `non_empty` is the only synchronisation edge with cross-CPU enqueues.
+        // Release: publishes the queue write and the increment_load store to the
+        // lockless `has_runnable` Acquire (core/kernel/docs/scheduling-internals.md
+        // § Atomic Ordering Invariants).
         self.non_empty.fetch_or(1 << p, Ordering::Release);
         true
     }
@@ -400,14 +395,9 @@ impl PerCpuScheduler
     /// Clears the `non_empty` bit if the queue at that priority becomes empty.
     /// Decrements load counter when a non-idle thread is dequeued.
     ///
-    /// This local dispatch path MUST NOT gate on `context_saved`: the owning CPU
-    /// is the only dispatcher that can advance a mid-handoff (`cs == 0`,
-    /// woken-while-current) thread back to `cs == 1`. The cross-CPU load balancer
-    /// (`pull_unpinned_ready` / `migrate_ready_thread`) deliberately skips
-    /// `cs == 0` candidates to avoid cross-CPU double-dispatch (#314/#293); if
-    /// this path skipped them too, such a thread would become permanently
-    /// un-dispatchable — a lost wake. See `docs/scheduling-internals.md`
-    /// § `context_saved` protocol.
+    /// Does not gate on `context_saved`, per
+    /// `core/kernel/docs/scheduling-internals.md` § Cross-CPU TCB Ownership
+    /// (`context_saved` protocol, step 11).
     pub fn dequeue_highest(&mut self) -> *mut ThreadControlBlock
     {
         let ne = self.non_empty.load(Ordering::Relaxed);
@@ -430,6 +420,8 @@ impl PerCpuScheduler
         };
         // Debug: detect use-after-free via magic cookie.
         // SAFETY: tcb is from the run queue; magic field is always readable on valid TCB.
+        // undocumented_unsafe_blocks: the unsafe block sits inside a `debug_assert!`
+        // argument, where no per-block SAFETY comment can be placed.
         #[allow(clippy::undocumented_unsafe_blocks)]
         {
             debug_assert!(
@@ -483,8 +475,10 @@ impl PerCpuScheduler
 
     /// Remove `tcb` from its priority queue. No-op if not found.
     ///
-    /// Used by `dealloc_object(Thread)`, `relocate_ready_priority`, and
-    /// `migrate_ready_thread` to relocate or destroy a queued thread. The
+    /// Used by `dealloc_object(Thread)`, `set_state_under_all_locks`,
+    /// `relocate_ready_priority`, and `relocate_ready_thread` (for
+    /// `migrate_ready_thread` and `pull_unpinned_ready`) to relocate or destroy
+    /// a queued thread. The
     /// boolean return is the authoritative "located here" check: it identifies
     /// the home scheduler for a `preferred_cpu` hint hit (one lock) and, on a
     /// miss, inside the all-CPU-locks walk (`relocate_ready_priority` re-enqueues
@@ -585,11 +579,11 @@ impl PerCpuScheduler
     }
 }
 
-// RunQueue needs Copy+Clone for the const array construction in sched::init_schedulers.
+// No code copies or clones a `RunQueue` (`PerCpuScheduler::new` repeats the
+// `const Q` item); these impls are not load-bearing.
 impl Copy for RunQueue {}
-// expl_impl_clone_on_copy: clone delegates to copy (*self) since RunQueue is Copy;
-// explicit impl is required because #[derive(Clone)] cannot be used on a struct
-// that is assembled as a const value and then assigned in a static array.
+// expl_impl_clone_on_copy: `clone` delegates to `Copy` (`*self`); a
+// `#[derive(Clone, Copy)]` would be equivalent, and no code clones a `RunQueue`.
 #[allow(clippy::expl_impl_clone_on_copy)]
 impl Clone for RunQueue
 {
@@ -610,7 +604,7 @@ mod tests
     /// Allocate a zero-initialized TCB for tests with magic cookie set.
     ///
     /// SAFETY: only `run_queue_next`, `queued_on`, `last_enqueue`, `ipc_state`,
-    /// `preferred_cpu`, and `magic` are accessed by RunQueue/PerCpuScheduler;
+    /// `preferred_cpu`, `thread_id`, and `magic` are accessed by RunQueue/PerCpuScheduler;
     /// all other TCB fields remain zero/null. The debug-only `last_enqueue:
     /// Option<EnqueueBreadcrumb>` field zeroes to `None` via the null-pointer
     /// niche of its `&'static Location`, so the tripwire reads a valid `None`.
@@ -641,7 +635,7 @@ mod tests
         assert!(sched.enqueue(pb, 0));
         assert!(sched.enqueue(pc, 0));
 
-        // idle must be set so dequeue_highest doesn't read a null pointer.
+        // idle must be set so the empty-queue dequeue returns a known pointer.
         sched.set_idle(pa);
 
         assert_eq!(sched.dequeue_highest(), pa);
@@ -832,11 +826,11 @@ mod tests
         assert_eq!(sched.dequeue_highest(), pc);
     }
 
-    // The debug double-enqueue panic arm is not host-testable: the workspace
-    // builds with `panic = "abort"`, so `#[should_panic]` cannot observe it.
-    // The release skip arm (`false` return) is equally unobservable here (host
-    // tests compile with debug_assertions). Both arms are covered by the
-    // two-arch ktest stress suite.
+    // The debug double-enqueue panic arm has no host test (host test builds
+    // unwind, so `#[should_panic]` could observe it). The release skip arm
+    // (`false` return) is unobservable here (host tests compile with
+    // debug_assertions). Both arms are exercised by the two-arch ktest stress
+    // suite.
 
     #[test]
     fn remove_then_enqueue_returns_true()

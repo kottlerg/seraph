@@ -10,12 +10,12 @@
 //! (`InitImage.rela_phys` / `rela_size`); Phase 9 draws the load bias and
 //! calls [`apply`] before mapping the biased segments. Each record's target
 //! is resolved through the original (unbiased) segment table and written
-//! through the direct physical map. Anything unresolvable — a
-//! non-`RELATIVE` record, a target outside every writable segment — is a
-//! fatal boot error: an unrelocated init is corrupt, not degraded.
-//! [`apply_relro`] then flips the relro-covered writable segments to
-//! read-only so the relocated GOT / `.data.rel.ro` pages are sealed before
-//! init runs.
+//! through the direct physical map; [`apply_relro`] then flips the
+//! relro-covered writable segments to read-only. The relocation and RELRO
+//! rules are defined in docs/userspace-memory-model.md § Image Placement,
+//! and the Phase 9 sequence, including the fatal handling of an
+//! unresolvable record, in core/kernel/docs/initialization.md § Phase 9:
+//! Init Creation and Scheduler Entry.
 
 use boot_protocol::{INIT_MAX_SEGMENTS, InitSegment, SegmentFlags};
 
@@ -28,7 +28,9 @@ use boot_protocol::{INIT_MAX_SEGMENTS, InitSegment, SegmentFlags};
 ///
 /// # Errors
 ///
-/// A static description when a split would exceed `INIT_MAX_SEGMENTS`.
+/// A static description when the biased RELRO range, a segment end, or a
+/// split tail's physical address overflows `u64`, or when a split would
+/// exceed `INIT_MAX_SEGMENTS`.
 pub fn apply_relro(
     segments: &mut [InitSegment; INIT_MAX_SEGMENTS],
     count: &mut u32,
@@ -92,8 +94,8 @@ pub fn apply_relro(
 
 /// Resolve a relocation target (unbiased link VA) to its physical address
 /// through the loaded segments. The whole 8-byte target must lie inside a
-/// `ReadWrite` segment — `RELATIVE` targets live in data; a text or rodata
-/// target means a malformed or hostile image.
+/// `ReadWrite` segment (rule in docs/userspace-memory-model.md § Image
+/// Placement).
 fn resolve_target(segments: &[InitSegment], offset: u64) -> Option<u64>
 {
     let end = offset.checked_add(8)?;
@@ -152,8 +154,10 @@ pub fn apply(
             .ok_or("Phase 9: init relocation target outside writable segments")?;
         let value = bias.wrapping_add(rela.addend.cast_unsigned());
         // SAFETY: resolve_target bounds the 8-byte write inside a loaded RW
-        // segment; the direct map covers it; single-threaded Phase 9. The
-        // target need not be 8-aligned in principle, hence write_unaligned.
+        // segment; the direct map covers it; the boot thread is the only writer of
+        // init's frames (APs idle from Phase 8 and never touch Phase-9 state, per
+        // core/kernel/docs/initialization.md § Phase 8). The target need not be
+        // 8-aligned in principle, hence write_unaligned.
         unsafe {
             core::ptr::write_unaligned(crate::mm::paging::phys_to_virt(phys) as *mut u64, value);
         }

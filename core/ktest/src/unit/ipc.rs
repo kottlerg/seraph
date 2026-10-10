@@ -8,10 +8,12 @@
 //! Covers: `SYS_IPC_CALL`, `SYS_IPC_REPLY`, `SYS_IPC_RECV`,
 //! `SYS_IPC_BUFFER_SET`.
 //!
-//! `SYS_IPC_BUFFER_SET` is tested implicitly — it is called once in `run()`
-//! before any tests execute, and any IPC test failure would surface a missing
-//! or broken buffer. A dedicated unit test would interfere with the global
-//! registration, so it is not tested in isolation here.
+//! `SYS_IPC_BUFFER_SET`'s success path is tested implicitly: `run()` registers
+//! the harness thread's buffer before any test executes and each child entry
+//! registers its own, so any IPC test failure would surface a missing or broken
+//! registration. Only the rejection path is tested directly
+//! (`ipc_buffer_misaligned_err`); re-registering the harness thread's buffer
+//! would disturb the global registration.
 //!
 //! The round-trip test spawns a child thread as the "caller" and uses the main
 //! ktest thread as the "server". The child calls the endpoint, the server
@@ -46,7 +48,8 @@ static mut FOUR_CAPS_STACK: ChildStack = ChildStack::ZERO;
 
 /// Arguments of the cap-transfer children (`cap_xfer`, `four_caps`,
 /// `recv_oom`), handed to their entries by address; `memory` carries RETYPE
-/// so the child can mint the transferred objects.
+/// so the child can mint notifications: the transferred objects, or for
+/// `recv_oom` the fillers that exhaust its `CSpace`.
 #[derive(Clone, Copy)]
 struct XferArgs
 {
@@ -95,7 +98,7 @@ static REPLY_OOM_ARGS: ArgBlock<ReplyOomArgs, 1> = ArgBlock::new(ReplyOomArgs {
 /// The child sends label 0xCAFE. The server verifies the label and replies
 /// with label 0xBEEF. The child verifies the reply label and signals done.
 ///
-/// A separate sync notification (`done_sig`) lets the server wait for the child to
+/// A separate sync notification (`notify`) lets the server wait for the child to
 /// complete its post-reply verification before the test returns.
 pub fn call_reply_recv(ctx: &TestContext) -> TestResult
 {
@@ -154,7 +157,7 @@ pub fn call_reply_recv(ctx: &TestContext) -> TestResult
 /// Tests the send-queue path: caller blocks on the endpoint BEFORE the server
 /// calls `ipc_recv`.
 ///
-/// The server yields once after starting the child. This lets the child run,
+/// The server sleeps for one tick after starting the child. This lets the child run,
 /// call `ipc_call`, and block on the send queue before the server calls
 /// `ipc_recv`.  (Contrast with `call_reply_recv`, where the server blocks first
 /// and tests the recv-queue path.)
@@ -360,7 +363,7 @@ pub fn call_with_cap_transfer(ctx: &TestContext) -> TestResult
         return Err("ipc_recv returned wrong label for cap_xfer test");
     }
 
-    // Transferred cap slot indices are snapshotted onto the returned message.
+    // Delivered destination cap handles are snapshotted onto the returned message.
     if msg.caps().len() != 1
     {
         return Err("expected 1 transferred cap, got different count");
@@ -506,8 +509,8 @@ fn caller_entry(arg: u64) -> !
     let ep_slot = (arg & 0xFFFF_FFFF) as u32;
     let notify_slot = (arg >> 32) as u32;
 
-    // Register the shared IPC buffer for this child thread. Each thread has its
-    // own IPC buffer pointer in its TCB; the child must register before calling.
+    // Register the shared IPC buffer for this child thread; registration is
+    // per-thread (core/kernel/docs/syscalls.md § `SYS_IPC_BUFFER_SET`).
     let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
     if syscall::ipc_buffer_set(buf_addr).is_err()
     {
@@ -583,8 +586,8 @@ fn data_caller_entry(arg: u64) -> !
     let ep_slot = (arg & 0xFFFF_FFFF) as u32;
     let done_slot = (arg >> 32) as u32;
 
-    // Register the shared IPC buffer for this child thread. Each thread has its
-    // own IPC buffer pointer in its TCB; the child must register before calling.
+    // Register the shared IPC buffer for this child thread; registration is
+    // per-thread (core/kernel/docs/syscalls.md § `SYS_IPC_BUFFER_SET`).
     let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
     if syscall::ipc_buffer_set(buf_addr).is_err()
     {
@@ -677,14 +680,13 @@ fn badge_caller_entry(arg: u64) -> !
 /// logging helper, or any other IPC issued before the caller consumes the
 /// received data) cannot clobber it.
 ///
-/// Without the snapshot wrapper, the IPC buffer would be caller-visible
-/// state across the post-recv / pre-read window: a `println!` between recv
-/// and the word read would scribble `STREAM_BYTES` over the received
-/// payload. The snapshot wrapper eliminates that window at the type
-/// level. This test locks the invariant in: receive a message with known
-/// words, scribble garbage directly over the IPC buffer (the worst case
-/// of any nested IPC activity), then verify the message's view is
-/// unchanged.
+/// Without the snapshot, the IPC buffer would be caller-visible state across
+/// the post-recv / pre-read window: any IPC issued in that window (in a
+/// ruststd process, a `println!` sending `STREAM_BYTES` on its log stream)
+/// would overwrite the received payload. This test locks the snapshot
+/// contract (`ipc::IpcMessage`) in: receive a message with known words,
+/// scribble garbage directly over the IPC buffer (the worst case of any
+/// nested IPC activity), then verify the message's view is unchanged.
 pub fn recv_snapshot_survives_buffer_clobber(ctx: &TestContext) -> TestResult
 {
     let ep = cap_create_endpoint(ctx.memory_base)
@@ -717,11 +719,11 @@ pub fn recv_snapshot_survives_buffer_clobber(ctx: &TestContext) -> TestResult
         return Err("snapshot test: received fewer than 2 data words");
     }
 
-    // Simulate any nested IPC activity between recv and read. A real
-    // `println!` here would issue a `SYS_IPC_CALL` that the kernel serves
-    // by overwriting the same buffer page. We skip the orchestration and
-    // directly scribble garbage over every data slot — a strictly worse
-    // case than any real IPC would produce.
+    // Simulate any nested IPC activity between recv and read: an IPC issued
+    // here (e.g. a ruststd `println!` in a userspace process) would rewrite
+    // the same buffer page. We skip the orchestration and directly scribble
+    // garbage over every data slot — a strictly worse case than any real IPC
+    // would produce.
     for i in 0..syscall_abi::MSG_DATA_WORDS_MAX
     {
         // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer; i is
@@ -792,12 +794,9 @@ fn snapshot_caller_entry(arg: u64) -> !
 /// label, knows its in-flight call cannot be replied to, and surfaces a
 /// graceful failure to its own caller.
 ///
-/// Without the kernel fix, the failed reply leaves `(*server).reply_tcb`
-/// pointing at the caller and the caller `BlockedOnReply` indefinitely;
-/// any subsequent `ipc_recv` on the server's endpoint overwrites
-/// `reply_tcb` with the next caller, orphaning the original — eventually
-/// every active call chain that touches a cap-replying server collapses
-/// into a system-wide IPC stall.
+/// The reply-failure wake this test pins is specified in
+/// core/kernel/docs/syscalls.md § `SYS_IPC_REPLY` and docs/ipc-design.md
+/// § Message Format.
 pub fn reply_oom_wakes_caller_with_transfer_failed(ctx: &TestContext) -> TestResult
 {
     let ep = cap_create_endpoint(ctx.memory_base)
@@ -816,7 +815,8 @@ pub fn reply_oom_wakes_caller_with_transfer_failed(ctx: &TestContext) -> TestRes
     // that pre_allocate(1) on the reply path fails. With no quota, the
     // exhausted pool surfaces as the refillable OutOfMemory. The tiny
     // pool shape is part of the test contract, so this site bypasses
-    // `spawn::new_child` per the convention documented in `spawn.rs`.
+    // `spawn::new_child` per the convention documented in
+    // `crate::spawn::new_child_at`.
     let child_cs = cap_create_cspace(ctx.memory_base, 0, 2)
         .map_err(|_| "cap_create_cspace for reply_oom test failed")?;
     let child_ep = cap_copy(ep, child_cs, RIGHTS_EP_SEND_GRANT)
@@ -861,8 +861,9 @@ pub fn reply_oom_wakes_caller_with_transfer_failed(ctx: &TestContext) -> TestRes
         return Err("reply_oom: child reported failure filling its CSpace");
     }
 
-    // Receive the child's call. No caps in the incoming message, so the
-    // server-side `pre_allocate(MSG_CAP_SLOTS_MAX)` succeeds.
+    // Receive the child's call. The server's own `CSpace` has headroom, so
+    // `sys_ipc_recv`'s worst-case `pre_allocate(MSG_CAP_SLOTS_MAX)` succeeds;
+    // only the child's `CSpace` is exhausted.
     // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
     let msg = unsafe { ipc::ipc_recv(ep, ctx.ipc_buf) }
         .map_err(|_| "ipc_recv for reply_oom test failed")?;
@@ -973,10 +974,10 @@ fn reply_oom_caller_entry(arg: u64) -> !
 /// `sys_ipc_call` rejects a message naming a stale cap handle, before the
 /// caller blocks.
 ///
-/// The transfer words carry full 32-bit handles (index + generation), so a
-/// handle held across a free/reallocate of its slot must fail closed with
-/// `InvalidCapability` — never silently transmit the slot's current
-/// occupant (#349).
+/// Pins the stale-handle rejection of core/kernel/docs/syscalls.md
+/// § `SYS_IPC_CALL` (handle format: docs/capability-model.md § Capability
+/// Handle Format): the call fails with `InvalidCapability` and the recycled
+/// slot's occupant is untouched.
 pub fn call_stale_cap_handle_rejected(ctx: &TestContext) -> TestResult
 {
     let ep = cap_create_endpoint(ctx.memory_base)
@@ -984,8 +985,9 @@ pub fn call_stale_cap_handle_rejected(ctx: &TestContext) -> TestResult
     let victim = cap_create_notification(ctx.memory_base)
         .map_err(|_| "cap_create_notification(victim) for stale_cap test failed")?;
     cap_delete(victim).map_err(|_| "cap_delete(victim) for stale_cap test failed")?;
-    // The freed slot is the free-list head, so the next create recycles it
-    // with a bumped generation; `victim` is now a stale handle to the
+    // The next create recycles the freed slot with a bumped generation
+    // (core/kernel/docs/capability-internals.md § Free Slot Tracking and
+    // § Per-Slot Generation); `victim` is now a stale handle to the
     // occupant's slot.
     let occupant = cap_create_notification(ctx.memory_base)
         .map_err(|_| "cap_create_notification(occupant) for stale_cap test failed")?;
@@ -1220,9 +1222,9 @@ pub fn reply_stale_cap_handle_rejected(ctx: &TestContext) -> TestResult
 /// An IPC call transferring `MSG_CAP_SLOTS_MAX` (4) capabilities delivers
 /// all four intact.
 ///
-/// Caps 0/1 travel in the low packed word and caps 2/3 in the high word;
-/// this pins the two-word field arithmetic on both sides of the wire (the
-/// lo/hi boundary is the one place sender and kernel could disagree).
+/// Exercises both packed cap-handle words (layout: core/kernel/docs/syscalls.md
+/// § `SYS_IPC_CALL`); the lo/hi boundary is the one place sender and kernel
+/// could disagree.
 pub fn call_four_caps_transfer(ctx: &TestContext) -> TestResult
 {
     let ep = cap_create_endpoint(ctx.memory_base)
@@ -1348,11 +1350,8 @@ fn four_caps_caller_entry(arg: u64) -> !
 /// IPC participant. The victim's exhausted single-page slot pool is the
 /// binding limit here, so the error is the refillable `OutOfMemory`.
 ///
-/// Verifies the symmetric pre-allocation hoisted to the top of
-/// `sys_ipc_recv`. The victim thread fills its own `CSpace`, then issues
-/// `ipc_recv`. With the fix the syscall fails immediately; without the
-/// fix the victim would either block on the recv queue or hit the bug
-/// only when caps actually arrive.
+/// The victim thread fills its own `CSpace`, then issues `ipc_recv`, which
+/// must fail immediately per docs/ipc-design.md § Receive-Failure Policy.
 pub fn recv_oom_returns_cleanly(ctx: &TestContext) -> TestResult
 {
     let ep = cap_create_endpoint(ctx.memory_base)
@@ -1363,7 +1362,7 @@ pub fn recv_oom_returns_cleanly(ctx: &TestContext) -> TestResult
     // A single-pool-page cspace (55 usable slots) is part of the test
     // contract: the victim fills it to provoke the recv-side cap-xfer
     // OOM. Bypasses `spawn::new_child` per the convention documented in
-    // `spawn.rs`.
+    // `crate::spawn::new_child_at`.
     let victim_cs = cap_create_cspace(ctx.memory_base, 0, 2)
         .map_err(|_| "cap_create_cspace for recv_oom test failed")?;
     let victim_ep = cap_copy(ep, victim_cs, syscall_abi::RIGHTS_EP_RECEIVE)
@@ -1411,8 +1410,8 @@ pub fn recv_oom_returns_cleanly(ctx: &TestContext) -> TestResult
 }
 
 /// Victim for `recv_oom_returns_cleanly`: fills its `CSpace` then issues
-/// `ipc_recv`. Reports `0xDEAD` if the syscall returns `OutOfMemory`
-/// (post-fix behavior), `0xBAD` otherwise.
+/// `ipc_recv`. Reports `0xDEAD` if the syscall returns `OutOfMemory`,
+/// `0xBAD` otherwise.
 fn recv_oom_victim_entry(arg: u64) -> !
 {
     // SAFETY: `arg` is the entry the test published for this victim.

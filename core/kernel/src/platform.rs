@@ -3,17 +3,15 @@
 
 // core/kernel/src/platform.rs
 
-//! Phase 6: platform resource validation.
+//! Platform resources from `BootInfo`: the `kernel_mmio` cache and MMIO-aperture validation.
 //!
-//! Reads the coarse `mmio_apertures` slice from [`BootInfo`] and validates
-//! it before Phase 7 mints capabilities from it. Also stashes the
-//! arch-specific `kernel_mmio` descriptor in the module-local cache so
-//! later kernel code can read it; no current arch code does, but the
-//! bootloader always produces the field.
+//! [`capture_kernel_mmio`] caches `BootInfo.kernel_mmio` during Phase 4; Phase 5 arch hardware
+//! init and later arch code (interrupt-controller and UART bases, the riscv64 timebase and hart
+//! capabilities) read it through [`kernel_mmio`]. [`validate_mmio_apertures`] validates the
+//! coarse `mmio_apertures` slice during Phase 6, before Phase 7 mints capabilities from it.
 //!
-//! Validation on the replacement ABI is intentionally minimal: each aperture
-//! must be page-aligned, non-zero, and its slice pointer must lie within
-//! Usable or Loaded memory.
+//! The Phase 6 checks and failure modes are specified in
+//! `core/kernel/docs/initialization.md` § Phase 6.
 
 // cast_possible_truncation: u64→usize address arithmetic bounded by platform memory layout.
 #![allow(clippy::cast_possible_truncation)]
@@ -111,7 +109,6 @@ static mut VALIDATED_APERTURES: [MmioAperture; MAX_MMIO_APERTURES] = {
 /// # Safety
 /// Must be called exactly once during Phase 6, single-threaded.
 #[cfg(not(test))]
-#[allow(clippy::missing_safety_doc)]
 pub unsafe fn validate_mmio_apertures(boot_info_phys: u64) -> &'static [MmioAperture]
 {
     // SAFETY: boot_info_phys was validated in Phase 0; the direct physical map
@@ -128,10 +125,12 @@ pub unsafe fn validate_mmio_apertures(boot_info_phys: u64) -> &'static [MmioAper
     &arr_ref[..count]
 }
 
-/// Test stub. `kernel_entry` is built in test mode but never executed; this
-/// satisfies the call-site type without exercising any of the production
-/// validation/storage path.
+/// Host-test stub. The only call site, `kernel_entry_post_rebase`, is
+/// `#[cfg(not(test))]`, so nothing calls this in test builds; it returns an
+/// empty slice without exercising the production validation/storage path.
 #[cfg(test)]
+// missing_safety_doc: host-test stub; the production `validate_mmio_apertures` carries the
+// `# Safety` contract.
 #[allow(clippy::missing_safety_doc)]
 pub unsafe fn validate_mmio_apertures(_boot_info_phys: u64) -> &'static [MmioAperture]
 {

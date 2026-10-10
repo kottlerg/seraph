@@ -194,12 +194,13 @@ is design intent; not yet implemented, #457; see
 [capability-model.md](capability-model.md#mmio)).
 
 **Port I/O (x86‑64 only)**
-Drivers receive an IoPort capability for assigned port ranges. Binding this
-capability enables direct execution of port I/O instructions for those ranges.
-Access is revoked automatically when the capability is revoked (design intent;
-not yet implemented, #457; see
-[capability-model.md](capability-model.md#ioport-x86-64-only)). RISC‑V does not
-support port I/O.
+Drivers receive an IoPort capability for assigned port ranges. Binding an IoPort
+capability to a thread enables direct execution of port I/O instructions for those
+ranges. Revoking an IoPort capability is intended to withdraw port access from every
+thread bound through its descendants; the revoked capability itself is preserved, so
+bindings made through it remain (withdrawal on revocation is design intent; not yet
+implemented, #457; see [capability-model.md](capability-model.md#ioport-x86-64-only)).
+RISC‑V does not support port I/O.
 
 **DMA**
 DMA isolation is exclusively a userspace concern. devmgr discovers IOMMU

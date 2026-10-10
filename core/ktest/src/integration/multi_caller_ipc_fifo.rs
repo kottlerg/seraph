@@ -10,10 +10,11 @@
 //!
 //! ## Approach
 //!
-//! Start callers A (label=1), B (label=2), C (label=3) one at a time, yielding
-//! the CPU between each start. Each caller's entry point immediately calls
-//! `ipc_call`, so after one yield it is blocked on the send queue.  The server
-//! then calls `ipc_recv` three times and verifies the label sequence 1 → 2 → 3.
+//! Start callers A (label=1), B (label=2), C (label=3) one at a time, sleeping
+//! 1 ms between each start so the floor-priority caller runs. Each caller's entry
+//! point immediately calls `ipc_call`, so after the sleep it is blocked on the
+//! send queue.  The server then calls `ipc_recv` three times and verifies the
+//! label sequence 1 → 2 → 3.
 //!
 //! Each caller ORs a distinct bit into the shared `done` notification after receiving
 //! its reply; the server waits for all three bits before returning.

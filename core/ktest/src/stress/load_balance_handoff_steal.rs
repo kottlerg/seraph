@@ -9,22 +9,11 @@
 //!
 //! ## The hazard
 //!
-//! A thread that runs `ipc_call` on its CPU commits `BlockedOnReply` and clears
-//! `context_saved = 0` in `commit_blocked_under_local_lock`, but is **still
-//! physically `current`** on that CPU until it reaches its own `schedule()`. A
-//! fast `ipc_reply` from a server on another CPU then `enqueue_and_wake`s the
-//! caller `Ready` on its `preferred_cpu` (the same CPU, since `cs == 0` pins to
-//! preferred) — now `Ready`+linked while still `current`. A legitimate
-//! transient: the owning CPU's `schedule()` re-dispatches it.
-//!
-//! Pre-#330 the load balancer (`pull_unpinned_ready`, run on every timer tick)
-//! stole such a thread — `find_runnable` checked only `cpu_affinity ==
-//! AFFINITY_ANY`, never liveness — and linked it on an idle CPU, whose dispatch
-//! marked it `Running` while the source CPU still owned it: cross-CPU
-//! double-dispatch (torn context / double-enqueue). The fix gates
-//! `pull_unpinned_ready` and `migrate_ready_thread` on `context_saved == 1`
-//! (published by `switch()` only after the register save, so a `Ready`+`cs==1`
-//! thread is `current` nowhere). See `core/kernel/src/sched/mod.rs`.
+//! The wake-before-deschedule transient (a caller `Ready`+linked while still
+//! `current`) and the load-balancer liveness gate that closes it are specified
+//! in `core/kernel/docs/scheduling-internals.md` § Cross-CPU TCB Ownership
+//! (step 11). Before #330, `pull_unpinned_ready` could steal such a thread onto
+//! an idle CPU and double-dispatch it; this test arms that steal.
 //!
 //! ## How this exercises it
 //!
@@ -118,7 +107,7 @@ const MIGRATION_GUARD_MAX_CPUS: u64 = 32;
 /// Notification NOTIFY right — what a client needs to `notification_send`.
 const RIGHTS_SIGNAL: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
 
-/// A page-aligned 4 KiB IPC buffer page (`MSG_DATA_WORDS_MAX`-wide, like ktest's
+/// A page-aligned 4 KiB IPC buffer page (512 `u64` words, the same shape as ktest's
 /// own `IPC_BUF`). One per concurrent child: clients and servers issue IPC
 /// simultaneously on different CPUs, so they must not share a page (that would
 /// be a data race in the *test*, not the kernel bug under test — see
@@ -396,7 +385,8 @@ fn server_entry(arg: u64) -> !
 }
 
 /// Sample the CPU the calling thread is on as a one-hot `u32` mask bit, or 0 if
-/// the query fails. CPU index is masked to 0..32 (ktest runs ≤ a handful).
+/// the query fails. The CPU index is masked mod 32, so indices above 31 alias;
+/// `run` asserts the migration guard only at `cpus <= MIGRATION_GUARD_MAX_CPUS`.
 // cast_possible_truncation: the masked CPU index is < 32.
 #[allow(clippy::cast_possible_truncation)]
 fn sample_cpu_bit() -> u32

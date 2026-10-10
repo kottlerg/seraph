@@ -5,9 +5,11 @@
 
 //! Bootloader error type.
 //!
-//! All fallible operations in the bootloader return `Result<T, BootError>`.
-//! Every error is fatal; the top-level handler in `main.rs` prints the message
-//! and halts. There is no recovery path.
+//! Fallible boot-sequence operations return `Result<T, BootError>`. An error
+//! that reaches the top-level handler in `main.rs` is printed by
+//! [`fatal_error`] and the bootloader halts; a caller that treats a failure
+//! as optional (the `\EFI\seraph\nokaslr` knob lookup, where a failed open
+//! means the knob is absent) handles it locally.
 
 use crate::bprintln;
 
@@ -28,7 +30,7 @@ pub enum BootError
     /// A required file was not found on the ESP.
     FileNotFound(&'static str),
 
-    /// The kernel ELF failed validation.
+    /// The kernel or init ELF failed validation.
     InvalidElf(&'static str),
 
     /// An ELF segment has both writable and executable permissions (W^X violation).
@@ -37,12 +39,14 @@ pub enum BootError
     /// A physical memory allocation failed.
     OutOfMemory,
 
-    /// `ExitBootServices` failed even after the bounded retry loop, each attempt
-    /// refreshing the map key from the existing buffer.
+    /// `ExitBootServices` failed: a non-stale-key status, a failed map-key
+    /// re-query, or a stale key on every one of the bounded retry attempts
+    /// (`uefi::exit_boot_services`).
     ExitBootServicesFailed,
 
-    /// The bootstrap.bundle file is missing, malformed, or violates an
-    /// internal invariant (no `init` entry, duplicate names, etc.).
+    /// The bootstrap.bundle file is empty, malformed, or violates an
+    /// internal invariant (no `init` entry, duplicate names, etc.). A missing
+    /// file surfaces as [`BootError::FileNotFound`].
     ///
     /// The `&'static str` payload describes the specific bundle error.
     InvalidBundle(&'static str),
@@ -241,10 +245,11 @@ use core::panic::PanicInfo;
 #[panic_handler]
 fn panic(info: &PanicInfo) -> !
 {
-    // The bootloader is a static-PIE with relocations applied at entry, so
-    // core::fmt now works; print the full PanicInfo (location + message). The
-    // message was previously omitted because the unrelocated fmt pointer tables
-    // would fault.
+    // Image relocations are applied before any Rust code runs (by the firmware
+    // PE loader on x86-64; by the `_start` self-relocation loop on riscv64, per
+    // core/boot/docs/riscv-uefi-boot.md § Relocation: static-PIE
+    // self-relocation), so core::fmt is safe here: print the full PanicInfo
+    // (location + message).
     bprintln!("SERAPH BOOT PANIC: {info}");
     loop
     {

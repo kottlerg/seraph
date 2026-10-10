@@ -22,7 +22,7 @@ approach (following Linux `arch/riscv/kernel/efi-header.S`):
 
 ## PE/COFF Header Layout
 
-The header is defined in [`boot/src/arch/riscv64/header.S`](../src/arch/riscv64/header.S).
+The header is defined in [`core/boot/src/arch/riscv64/header.S`](../src/arch/riscv64/header.S).
 All offsets are relative to `pecoff_header_start`, which the linker places at
 address 0 in the final binary (image base = 0 for an EFI application; UEFI
 relocates it to a free region).
@@ -66,7 +66,7 @@ Offset   Size   Content
                   VirtualAddress   = RVA of _reloc_start
                   SizeOfRawData    = 8 (one empty block, header only)
                   Characteristics  = 0x42000040 (initialised data, discardable, readable)
-0x1C0   ~1600   Padding to 0x1000 (page boundary)
+0x1C0   0xE40   Padding to 0x1000 (page boundary)
 0x1000   —      .text section: entry trampoline (_start) + compiled Rust code
                   only (RX); ends at the _etext page boundary
   ...    —      .data section: .rodata / .data.rel.ro, the .dynamic / .rela.dyn
@@ -88,13 +88,15 @@ The `Characteristics` field in the COFF file header is `0x020E`:
 The entry trampoline is placed at `_start`, which is at `RVA 0x1000` — the
 `AddressOfEntryPoint` in the PE32+ optional header.
 
-`_start` tail-calls `efi_main`. RISC-V UEFI uses the lp64d calling
-convention; `a0` holds the image handle and `a1` the system table
-pointer, matching the `extern "efiapi"` declaration of `efi_main` on
-RISC-V. The `tail` pseudo-instruction expands to a PC-relative far jump
-using a temporary register and does not save `ra`, so control passes to
-`efi_main` as if UEFI had called it directly. See
-[`boot/src/arch/riscv64/header.S`](../src/arch/riscv64/header.S) for the
+After the self-relocation loop (see
+[Relocation: static-PIE self-relocation](#relocation-static-pie-self-relocation)), `_start`
+tail-calls `efi_main`. RISC-V UEFI passes the image handle in `a0` and the system-table
+pointer in `a1`. These integer argument registers are the same under the firmware's lp64d
+convention and the bootloader target's soft-float lp64 ABI (`llvm-abiname: "lp64"`), so they
+match the `extern "efiapi"` declaration of `efi_main`. The `tail` pseudo-instruction
+expands to a PC-relative far jump using a temporary register and does not save `ra`, so
+control passes to `efi_main` as if UEFI had called it directly. See
+[`core/boot/src/arch/riscv64/header.S`](../src/arch/riscv64/header.S) for the
 asm.
 
 ---
@@ -130,14 +132,14 @@ The PE `.reloc` section is retained but left as a single empty block
 checks for a `.reloc` section before loading an image at a non-preferred
 base; an empty block satisfies that check (valid per the PE/COFF
 specification) while the real fixups are applied by the self-relocation
-loop. See [`boot/src/arch/riscv64/header.S`](../src/arch/riscv64/header.S)
+loop. See [`core/boot/src/arch/riscv64/header.S`](../src/arch/riscv64/header.S)
 for the asm.
 
 ---
 
 ## Linker Script
 
-[`boot/linker/riscv64-uefi.ld`](../linker/riscv64-uefi.ld) controls the
+[`core/boot/linker/riscv64-uefi.ld`](../linker/riscv64-uefi.ld) controls the
 layout of the flat binary. It places `.pecoff_header` at output offset
 `0x0`, pins `.text` at `0x1000` (aligned to the PE32+ section
 granularity) with `_start` as the first symbol and **code only**, then
@@ -148,42 +150,45 @@ section: `.rodata` / `.data.rel.ro` (relocation targets), the `.dynamic`
 placed after `_etext` precisely so EDK2 maps them RW and the
 self-relocation loop can write the fixups. The script emits the empty
 `.reloc` section for UEFI to find, and discards `.eh_frame`, `.note.*`,
-`.comment`, and the dynamic-linking metadata (`.interp` / `.dynsym` /
-`.dynstr` / hash tables) that a self-relocating static-PIE never consults
-at runtime. `ENTRY(_start)` selects the entry symbol. The script is the
-authoritative layout description — do not duplicate it here.
+`.comment`, `.riscv.attributes`, and the dynamic-linking metadata (`.interp` / `.dynsym` /
+`.dynstr` / `.hash` / `.gnu.hash` / `.gnu.version*`) that a self-relocating static-PIE never
+consults at runtime. `ENTRY(_start)` selects the entry symbol. The script is the
+authoritative layout description; this section and the header-layout diagram above describe
+it.
 
-The key symbols exported by the linker script for use in `header.S`:
+The key symbols `header.S` uses; the linker script exports all but `pecoff_header_start`:
 
 | Symbol | Meaning |
 |---|---|
 | `_start` | First byte of the entry trampoline; also `AddressOfEntryPoint` RVA |
 | `_etext` | End of the `.text` section; used to compute `SizeOfCode` |
+| `_ebss` | End of `.bss`, the end of the writable `.data` PE section; used for `SizeOfInitializedData` and the `.data` section's `VirtualSize` / `SizeOfRawData` |
 | `__rela_dyn_start` / `__rela_dyn_end` | Bound the `.rela.dyn` array walked by the self-relocation loop |
 | `_reloc_start` | Start of the `.reloc` section; base-relocation VirtualAddress |
 | `_reloc_end` | End of the `.reloc` section |
 | `_image_end` | End of the entire image; used for `SizeOfImage` |
-| `pecoff_header_start` | Byte 0 of the image; runtime address equals the load bias |
+| `pecoff_header_start` | Byte 0 of the image; defined in `header.S` at the start of `.pecoff_header`, which the linker script places at 0. Its runtime address equals the load bias |
 
 ---
 
 ## Custom Target JSON
 
 The RISC-V bootloader uses a custom Cargo target specification,
-`targets/riscv64imac-seraph-uefi.json`. Key differences from the kernel target
-(`riscv64imac-seraph-none.json`):
+[`xtask/targets/riscv64imac-seraph-uefi.json`](../../../xtask/targets/riscv64imac-seraph-uefi.json).
+Key differences from the kernel target, defined in
+[`xtask/targets/riscv64imac-seraph-none.json`](../../../xtask/targets/riscv64imac-seraph-none.json),
+follow. Both set `os: "none"`, `llvm-target: "riscv64-unknown-none-elf"`,
+`relocation-model: "pic"` (static-PIE), `code-model: "medium"`, `llvm-abiname: "lp64"`,
+`linker: "rust-lld"`, and `linker-flavor: "ld.lld"`. They differ in:
 
 | Field | UEFI bootloader | Kernel |
 |---|---|---|
-| `os` | `"uefi"` | `"none"` |
-| `llvm-target` | `"riscv64"` | `"riscv64"` |
-| `relocation-model` | `"pic"` | `"static"` |
-| `code-model` | `"medium"` | `"medium"` |
-| `disable-redzone` | `true` | `true` |
-| `features` | `"+m,+a,+c"` (RV64IMAC) | `"+m,+a,+c"` (RV64IMAC) |
-| `linker` | `"rust-lld"` | `"rust-lld"` |
-| `linker-flavor` | `"ld.lld"` | `"ld.lld"` |
-| `pre-link-args` | custom linker script | custom linker script |
+| `features` | `"+m,+a,+c"` (RV64IMAC) | `"+m,+a,+c,+svinval,+svpbmt,+svnapot"` |
+| `pre-link-args` (`ld.lld`) | `--gc-sections -pie --no-dynamic-linker -z notext -z norelro -Bsymbolic` | `--gc-sections -pie --no-dynamic-linker -Bsymbolic -z max-page-size=4096` |
+| Linker script | `-Tcore/boot/linker/riscv64-uefi.ld`, from the `[target.riscv64imac-seraph-uefi]` rustflags in `.cargo/config.toml` | chosen by `core/kernel/build.rs` |
+
+The kernel target's properties and rationale are owned by
+[docs/build-system.md § Custom Targets](../../../docs/build-system.md#custom-targets).
 
 The `relocation-model: "pic"` setting (with `-pie`,
 `position-independent-executables`, and `static-position-independent-executables`)
@@ -208,12 +213,15 @@ Internally the pipeline runs in three steps:
 2. `llvm-objcopy -O binary` strips all ELF structure and emits only the
    section data in load-address order. Byte 0 of the output is the MZ
    signature from `.pecoff_header`; byte `0x1000` is the entry trampoline.
-3. The resulting `seraph-boot.efi` is staged to `\EFI\seraph\` on the ESP.
+3. `llvm-objcopy` writes the flat binary to `EFI/seraph/boot.efi` in the sysroot's ESP tree,
+   and xtask copies it to the UEFI fallback path `EFI/BOOT/BOOTRISCV64.EFI`, per
+   [docs/build-system.md § Build Output: the Sysroot](../../../docs/build-system.md#build-output-the-sysroot).
 
 The intermediate ELF is not a usable UEFI image — UEFI does not
-understand ELF headers — but it shares a symbol table with the flat
-binary, so GDB / LLDB can set symbolic breakpoints against the ELF even
-though UEFI loads the flat binary. See [xtask/README.md](../../../xtask/README.md)
+understand ELF headers — but its symbols carry the same image-relative addresses as the flat
+binary's layout (the flat binary itself has no symbol table), so GDB / LLDB can set symbolic
+breakpoints from the ELF, offset by the runtime load bias, even though UEFI loads the flat
+binary. See [xtask/README.md](../../../xtask/README.md)
 for the authoritative command surface; the steps above are descriptive,
 not a manual recipe.
 

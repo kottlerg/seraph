@@ -19,7 +19,9 @@
 //! so the layout `user_ds(0x18), user_cs(0x20)` is required for SYSRET.
 //!
 //! IST stacks for double-fault (IST1) and NMI (IST2) are passed in by the
-//! caller as kernel-direct-map virtual addresses backed by static BSS.
+//! caller: the BSP's are carved from the `BSP_IST_STACKS` static in
+//! `interrupts`, and each AP's from the `AP_IST_STACKS` buddy slab in
+//! `ap_trampoline`.
 //!
 //! # Modification notes
 //! - To add a new ring-3 segment: insert it after `user_cs` and before the TSS
@@ -111,10 +113,10 @@ const _: () = assert!(
     "AP_TSS at MAX_CPUS exceeds the largest buddy block; raise MAX_ORDER"
 );
 
-/// The extended TSS + IOPB, in BSS so it is zero-initialised.
-///
-/// The IOPB starts zero (all ports permitted!) until `init()` fills it with
-/// 0xFF. Boot code must call `init()` before any user thread runs.
+/// The BSP's extended TSS + IOPB. Its static initializer fills the IOPB and
+/// terminator with 0xFF (all ports denied) and sets `iopb_offset` to 104;
+/// `init()` sets RSP0/IST1/IST2 and loads it. Boot code must call `init()`
+/// before any user thread runs.
 ///
 /// `static mut` is only written during single-threaded boot init or with
 /// interrupts disabled during context switch.
@@ -146,15 +148,16 @@ static mut TSS: TssWithIopb = TssWithIopb {
 static mut GDT: [u64; 7] = [0u64; 7];
 
 /// Base pointer for the dynamically-sized per-CPU `[TssWithIopb; cpu_count]`
-/// array. Allocated by [`init_ap_storage`] from the buddy in `sched::init`,
-/// before AP bringup. Slot `cpu_id` is the AP with that id; slot 0 is unused
+/// array. Allocated by [`init_ap_storage`] from the buddy in `sched::init_storage`
+/// (Phase 4), before AP bringup. Slot `cpu_id` is the AP with that id; slot 0 is unused
 /// (BSP has its own [`TSS`] static).
 ///
-/// Each entry is ~8 KiB; sized at `boot_cpu_count` rather than `MAX_CPUS`
-/// recovers ~516 KiB on a 4-CPU host (vs. the prior `MAX_CPUS=64` BSS).
+/// Each entry is ~8 KiB; the slab is sized to the boot CPU count
+/// (`init_ap_storage`'s `cpu_count`) rather than `MAX_CPUS`.
 ///
-/// Stored as a raw `*mut`; written only during single-threaded AP bringup
-/// (`init_ap`) or with interrupts disabled during context switch.
+/// Stored as an `AtomicPtr` set once by [`init_ap_storage`]. Slab entries are
+/// written by `init_ap_storage` and by `init_ap` during single-threaded boot,
+/// and afterwards by `set_rsp0` / `load_iopb` with interrupts disabled.
 #[cfg(not(test))]
 static AP_TSS_PTR: core::sync::atomic::AtomicPtr<TssWithIopb> =
     core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
@@ -166,7 +169,8 @@ static AP_GDT_PTR: core::sync::atomic::AtomicPtr<[u64; 7]> =
     core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
 
 /// Allocate the per-CPU AP TSS and GDT slabs sized to `cpu_count`. Called
-/// from `sched::init`, before any AP startup. Each slab is page-aligned and
+/// from `sched::init_storage` (Phase 4, via `init_ap_percpu_storage`), before
+/// any AP startup. Each slab is page-aligned and
 /// zero-filled; `init_ap` overwrites the relevant fields per AP.
 ///
 /// The IOPB region of every TSS is then filled with `0xFF` so all I/O-port
@@ -254,8 +258,9 @@ pub fn data_desc_64(dpl: u8) -> u64
 pub fn tss_desc(tss_addr: u64) -> (u64, u64)
 {
     // Use TssWithIopb size so the descriptor covers the IOPB region.
-    // During tests TssWithIopb is not defined; use a fixed value of 8296
-    // (104 + 8192 + 1 - 1) for test coverage of the encoding logic.
+    // Under cfg(test) the limit is the literal 8296 (104 + 8192 + 1 - 1)
+    // instead of `size_of::<TssWithIopb>() - 1`; `TssWithIopb` is defined in
+    // test builds too, so the literal only duplicates the size (#460).
     #[cfg(not(test))]
     let limit: u64 = (core::mem::size_of::<TssWithIopb>() as u64) - 1;
     #[cfg(test)]
@@ -390,7 +395,7 @@ pub unsafe fn init(kernel_stack_top: u64, ist1_top: u64, ist2_top: u64)
 
 /// Return the virtual address of the BSP's static TSS.
 ///
-/// Used by `percpu::init_bsp()` to populate `PER_CPU[0].tss_ptr` so that
+/// Used by `percpu::init_bsp()` to populate `(*per_cpu_ptr(0)).tss_ptr` so that
 /// `set_rsp0` can locate the TSS via the GS-relative pointer regardless of
 /// which CPU is executing.
 #[cfg(not(test))]
@@ -401,7 +406,7 @@ pub fn bsp_tss_ptr() -> u64
 
 /// Update the ring-0 RSP stored in the current CPU's TSS.
 ///
-/// Reads `PER_CPU[current_cpu].tss_ptr` via `gs:[32]` (`PERCPU_TSS_PTR_OFFSET`)
+/// Reads the current CPU's `PerCpuData::tss_ptr` via `gs:[32]` (`PERCPU_TSS_PTR_OFFSET`)
 /// to locate the TSS without a global lookup. Safe to call after
 /// `percpu::init_bsp()` / `percpu::init_ap()` installs GS-base.
 ///
@@ -409,7 +414,8 @@ pub fn bsp_tss_ptr() -> u64
 ///
 /// # Safety
 /// Must be called at ring 0. GS-base must point to a valid `PerCpuData` with
-/// `tss_ptr` set (i.e., after Phase 5 init for this CPU).
+/// `tss_ptr` set (by `percpu::init_bsp` on the BSP in Phase 5, by `init_ap`
+/// on an AP during Phase 8 bringup).
 #[cfg(not(test))]
 pub unsafe fn set_rsp0(stack_top: u64)
 {
@@ -431,19 +437,20 @@ pub unsafe fn set_rsp0(stack_top: u64)
 /// Initialise and load a per-CPU GDT and TSS for an AP (Application Processor).
 ///
 /// Configures the dynamic per-CPU `TssWithIopb` and `[u64; 7]` GDT slots
-/// (allocated by [`init_ap_storage`] in `sched::init`) with the same layout
+/// (allocated by [`init_ap_storage`] in `sched::init_storage`) with the same layout
 /// as the BSP's static GDT, loads them via `lgdt` + `ltr`, and stores the
-/// TSS pointer in `PER_CPU[cpu_id].tss_ptr`.
+/// TSS pointer in `(*per_cpu_ptr(cpu_id)).tss_ptr`.
 ///
-/// Called from `kernel_entry_ap` during AP startup, after GS-base is
-/// installed. The BSP calls `gdt::init()` (static [`GDT`] / [`TSS`]) — this
-/// function is only for APs.
+/// Called from `kernel_entry_ap` during AP startup, before `percpu::init_ap`
+/// installs GS-base (the segment reload here zeroes the GS base). The BSP
+/// calls `gdt::init()` (static [`GDT`] / [`TSS`]) — this function is only for APs.
 ///
 /// # Safety
 /// Must execute at ring 0 on the AP being initialised. `cpu_id` must be <
-/// `CPU_COUNT`. [`init_ap_storage`] must have been called from `sched::init`.
-/// `percpu::init_ap(cpu_id)` must have been called first so GS-base and
-/// `PER_CPU[cpu_id].tss_ptr` are writable.
+/// `CPU_COUNT`. [`init_ap_storage`] must have been called from `sched::init_storage`.
+/// `percpu::init_storage` must have run so `(*per_cpu_ptr(cpu_id)).tss_ptr`
+/// is writable; `percpu::init_ap(cpu_id)` runs after this function and
+/// reinstalls GS-base.
 #[cfg(not(test))]
 pub unsafe fn init_ap(cpu_id: u32, rsp0: u64, ist1_top: u64, ist2_top: u64)
 {
@@ -484,8 +491,8 @@ pub unsafe fn init_ap(cpu_id: u32, rsp0: u64, ist1_top: u64, ist2_top: u64)
                 iopb_offset: core::mem::size_of::<Tss>() as u16,
             },
         );
-        // The IOPB and terminator are pre-initialised in the static
-        // initializer (0xFF / 0xFF). Re-deny on every init in case a prior
+        // The IOPB and terminator are pre-filled with 0xFF by
+        // `init_ap_storage`. Re-deny on every init in case a prior
         // owner had granted ports — caller invariant says cpu_id is
         // exclusively owned, but explicit reset keeps the contract local.
         let iopb = core::ptr::addr_of_mut!((*tss_ptr_mut).iopb);
@@ -531,7 +538,7 @@ pub unsafe fn init_ap(cpu_id: u32, rsp0: u64, ist1_top: u64, ist2_top: u64)
     // Reload CS via a far return into the kernel code segment.
     // SAFETY: KERNEL_CS references a valid GDT entry just loaded; far return
     // executed at ring 0 with valid stack and return address.
-    // See bsp_install_gdt above for why `nostack` is intentionally absent.
+    // See `init` for why `nostack` is intentionally absent.
     unsafe {
         core::arch::asm!(
             "push {cs}",
@@ -564,7 +571,7 @@ pub unsafe fn init_ap(cpu_id: u32, rsp0: u64, ist1_top: u64, ist2_top: u64)
     // Load the TSS selector.
     // SAFETY: ltr is a privileged x86 instruction; TSS_SEL references a valid
     // 128-bit TSS descriptor in the GDT just loaded; executed at ring 0.
-    // See bsp_install_gdt above for why `nomem` is intentionally absent.
+    // See `init` for why `nomem` is intentionally absent.
     unsafe {
         core::arch::asm!(
             "ltr {0:x}",
@@ -589,7 +596,8 @@ pub unsafe fn init_ap(cpu_id: u32, rsp0: u64, ist1_top: u64, ist2_top: u64)
 /// If `iopb` is `Some`, the bitmap is copied from the thread's per-thread IOPB.
 /// If `None`, the bitmap is filled with 0xFF (all ports denied).
 ///
-/// Call on every context switch to a user thread that has bound I/O port ranges.
+/// Called on every context switch (with `None` when the incoming thread has
+/// no port bindings) and by the I/O-port bind syscall when it binds the calling thread.
 ///
 /// # Safety
 /// Must be called with interrupts disabled or from a single-CPU context.

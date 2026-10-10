@@ -11,14 +11,18 @@
 //! `init` entry decides which binary the bootloader hands off to.
 //! Receives the same initial capability set that init would, then:
 //!
-//! 1. **Tier 1** (`unit/`)        — exercises every kernel syscall in isolation.
+//! 1. **Tier 1** (`unit/`)        — exercises the kernel syscalls in isolation
+//!    (exceptions listed in `core/ktest/README.md` § Tier 1).
 //! 2. **Tier 2** (`integration/`) — cross-subsystem scenario tests.
-//! 3. **Tier 3** (`bench/`)       — cycle-accurate benchmarks (`rdtsc` / `csrr cycle`).
+//! 3. **Tier S** (`stress/`)      — stress and race tests.
+//! 4. **Tier 3** (`bench/`)       — cycle-accurate benchmarks (`rdtsc` / `csrr cycle`).
 //!
-//! Results are printed directly to the serial console via hardware I/O.
-//! Each test prints `PASS` or `FAIL`. A summary follows. ktest then exits.
+//! Results are printed to the serial console via hardware I/O and to the
+//! framebuffer. Each test logs a start line, then `PASS` or `FAIL`. A summary
+//! and the terminal marker follow; ktest then shuts the machine down per
+//! `KtestConfig::DEFAULT.shutdown_policy`, or exits its thread.
 //!
-//! See `ktest/README.md` for the full test structure and output format.
+//! See `core/ktest/README.md` for the full test structure and output format.
 
 #![no_std]
 #![no_main]
@@ -126,8 +130,10 @@ macro_rules! run_integration_test {
 
 /// Context passed to all test functions.
 ///
-/// Carries the two resources that many tests need: the ktest `AddressSpace` cap
-/// and the IPC buffer pointer. Pass by shared reference to test functions.
+/// Carries the boot-provided resources tests need: ktest's own `AddressSpace`,
+/// `CSpace` and `Thread` caps, the first RAM Memory cap, the `SbiControl` and
+/// `SchedControl` caps, the IPC buffer pointer, and the `InitInfo` VA. Pass by
+/// shared reference to test functions.
 pub struct TestContext
 {
     /// ktest's own `AddressSpace` capability slot, provided by the kernel.
@@ -164,8 +170,8 @@ pub struct TestContext
     /// Phase 7. ktest is loaded as init and inherits the RAM Memory caps
     /// directly (the same caps init forwards to memmgr). Used by tests
     /// that need to inspect the rights/state of an actual RAM cap; the
-    /// `frame_pool` slots elsewhere are derived from a segment cap and
-    /// therefore lack the RETYPE right.
+    /// `frame_pool` slots are single-page frames split from this cap's tail,
+    /// leaving its head at `memory_base`.
     pub memory_base: u32,
 
     /// RISC-V SBI control cap (slot index), kernel-minted in init's
@@ -194,7 +200,8 @@ pub struct TestContext
 ///
 /// Each test file that needs a child thread declares its own static stack so
 /// stacks never alias across concurrent (or sequential) test boundaries.
-#[allow(dead_code)] // Field is CPU stack memory; only the hardware stack pointer accesses it, not Rust code.
+// Field is CPU stack memory; only the hardware stack pointer accesses it, not Rust code.
+#[allow(dead_code)]
 #[repr(align(16))]
 pub struct ChildStack([u8; 16384]);
 
@@ -248,15 +255,15 @@ pub extern "C" fn _start(info_ptr: u64) -> !
 /// from memmgr; ktest has no memmgr, so it draws on the kernel-minted RAM caps it
 /// inherits as init.
 ///
-/// `sys_mmio_map` and `sys_mem_map` into ktest's retype-backed boot AS draw
-/// intermediate PT pages from that AS's own pool, not the fixed kernel reserve.
+/// Mappings into ktest's boot AS draw intermediate page tables from that AS's
+/// own pool (`core/kernel/docs/memory-internals.md` § Page Table Node Ownership).
 /// The seeded `INIT_ASPACE_PAGES` pool sizes init's own bootstrap footprint;
 /// ktest additionally maps the framebuffer and serial MMIO and runs the
 /// `mem_map` suite against this AS, so it needs a modest top-up. Source the
 /// slabs from spare RAM caps — every inherited RAM cap except `memory_base`,
-/// which `frame_pool` and the retype-heavy tests draw from. The kernel
-/// coalesces drained RAM and places the largest extent at `memory_base`,
-/// leaving the smaller extents as spares, so accumulate across several
+/// which `frame_pool` and the retype-heavy tests draw from. The RAM caps
+/// after `memory_base` are the smaller extents (`docs/process-lifecycle.md`
+/// § Kernel → init), leaving them as spares, so accumulate across several
 /// augments. Best-effort: a partial top-up still helps; failures surface in the
 /// tests.
 fn fund_boot_aspace_pt(info: &init_protocol::InitInfo)
@@ -422,9 +429,9 @@ fn run(info_ptr: u64) -> !
         // chardev) the chardev's last-buffer flush is not synchronous
         // with the VM exit, and without this delay `run-parallel`'s
         // pass-marker regex intermittently misses the terminal line.
-        // 100 ms is much more than the chardev's typical flush latency
-        // and is invisible against `KtestConfig::DEFAULT.timeout_secs`
-        // (which the operator controls separately).
+        // 100 ms is much more than the chardev's typical flush latency;
+        // the operator-set `KtestConfig::DEFAULT.timeout_secs` wait (zero by
+        // default) is separate and precedes it.
         wait_us(100_000);
         #[cfg(target_arch = "x86_64")]
         acpi_shutdown::shutdown(info);
@@ -432,7 +439,7 @@ fn run(info_ptr: u64) -> !
         sbi_shutdown::shutdown(info);
 
         // Shutdown failed; fall through to thread_exit.
-        log("ktest: shutdown failed, halting");
+        log("ktest: shutdown failed, exiting harness thread");
     }
 
     syscall::thread_exit()
@@ -661,8 +668,9 @@ pub fn halt() -> !
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> !
 {
-    // Only the main thread has IOPB access for serial output. Child threads
-    // that panic must not call log (outb would GP-fault without IOPB).
-    // Exit the thread instead.
+    // On x86-64 only the main thread holds the COM1 I/O-port binding, so a
+    // child that called log would fault on outb. The handler cannot tell the
+    // main thread from a child, so it exits the thread without logging on
+    // every architecture.
     syscall::thread_exit()
 }

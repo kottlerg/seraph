@@ -6,7 +6,9 @@
 //! Integration: a fault handler edits the faulting thread's registers, then
 //! resumes it at a new instruction pointer.
 //!
-//! Proves two protocol guarantees beyond the plain pager round-trip:
+//! Proves two protocol guarantees beyond the plain pager round-trip (owned by
+//! `docs/fault-handling.md` § Delivery, Resume, and Kill and § Modifying the
+//! faulting thread):
 //!   1. `SYS_THREAD_READ_REGS` / `SYS_THREAD_WRITE_REGS` operate on a thread
 //!      that is fault-blocked (`Blocked` + `BlockedOnFault`), not only `Stopped`.
 //!   2. A `FAULT_REPLY_RESUME` after a register edit resumes the thread from the

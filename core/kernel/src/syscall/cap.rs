@@ -5,8 +5,11 @@
 
 //! Capability creation and manipulation syscall handlers.
 //!
-//! Allocates kernel objects and inserts them into a `CSpace`.
-//! Returns a slot index on success.
+//! Creation handlers retype a Memory cap into a kernel object and insert a
+//! cap to it into the caller's `CSpace`, returning the new cap handle (the
+//! address-space and `CSpace` augment modes instead donate pages to an
+//! existing object and return 0); the remaining handlers copy, derive,
+//! move, delete, revoke, and inspect caps.
 //!
 //! # Adding a new capability creation syscall
 //! 1. Look the source Memory cap up with `RETYPE` and carve the object's
@@ -72,24 +75,15 @@ unsafe fn resolve_src_cap(
 }
 
 /// Revalidate `handle`'s slot under `DERIVATION_LOCK` before its object is
-/// touched or the tree is edited around it — the source of a copy or
-/// derive, the parent of a memory split, both caps of a memory merge: same
-/// tag-bearing occupancy, same generation, same `object`, no revoke in
-/// flight. The unlocked resolution that produced `object` may have raced a
-/// delete, move, or revoke batch that freed the slot (and possibly the
-/// object): `link_child` drops a link under a freed parent, so a copy or
-/// derive would publish a derivation root outside every ancestor's revoke
-/// reach; the memory syscalls would dereference a freed wrapper, and the
-/// merge would free a recycled tail index holding an unrelated live cap.
-/// Every occupied→free transition holds the lock, so a slot that matches
-/// here stays live — and stays the link's parent — for the rest of the
-/// hold.
+/// touched or the tree is edited around it: same tag-bearing occupancy, same
+/// generation, same `object`, no pin in flight
+/// (`core/kernel/docs/capability-internals.md` § Global Derivation Lock).
 ///
 /// # Errors
 ///
 /// `InvalidCapability` when the slot no longer holds the resolved cap;
-/// `InvalidState` when a revoke is in flight on it (transient — retry after
-/// the revoke completes).
+/// `InvalidState` when a revoke or move is in flight on it (transient — retry
+/// after that operation completes).
 ///
 /// # Safety
 ///
@@ -146,7 +140,7 @@ unsafe fn release_src_ref(object: core::ptr::NonNull<crate::cap::object::KernelO
 ///
 /// On success, the wrapper + `EndpointState` are constructed in place inside
 /// the source Memory cap's region; a cap with `SEND | RECEIVE | GRANT` rights
-/// is inserted into the caller's `CSpace`; returns the slot index.
+/// is inserted into the caller's `CSpace`; returns the new cap handle.
 ///
 /// On `dec_ref → 0`, auto-reclaim returns the bytes to the source Memory cap
 /// via [`crate::cap::object::dealloc_object`] consulting `header.ancestor`.
@@ -270,7 +264,7 @@ pub fn sys_cap_create_endpoint(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 ///
 /// On success, the wrapper + `NotificationState` are constructed in place inside
 /// the source Memory cap's region; a cap with `NOTIFY | WAIT` rights is
-/// inserted into the caller's `CSpace`; returns the slot index.
+/// inserted into the caller's `CSpace`; returns the new cap handle.
 ///
 /// Auto-reclaim (`dec_ref → 0`) consults `header.ancestor` and credits bytes
 /// back to the source Memory cap.
@@ -395,15 +389,15 @@ pub fn sys_cap_create_notification(tf: &mut TrapFrame) -> Result<u64, SyscallErr
 /// `CSpace`. `CONTROL` lets the creator register terminal-fault death
 /// observers on the address space via `SYS_ASPACE_BIND_NOTIFICATION`;
 /// derived copies handed to other components (e.g. memmgr) drop it via
-/// the `cap_derive` rights mask. Returns the new slot index.
+/// the `cap_derive` rights mask. Returns the new cap handle.
 ///
 /// Augment-mode: seeds the carved pages onto the target AS's PT growth pool
-/// and credits `pt_growth_budget_bytes` with the pages seeded. Once the
-/// pool's inline donation records are full, one donation per record page
-/// keeps its first page as the kernel's donation bookkeeping and seeds
-/// `init_pages - 1` (see `PagePool::add_donation`), so a one-page donation can
-/// leave the budget unchanged. Returns `0` on success.
+/// and credits `pt_growth_budget_bytes` with the pages seeded (record-page
+/// bookkeeping: `core/kernel/docs/capability-internals.md` § Donation Records).
+/// Returns `0` on success.
 #[cfg(not(test))]
+// too_many_lines: create and augment modes share the source-cap resolution
+// and carve; each mode's construction and rollback read in sequence.
 #[allow(clippy::too_many_lines)]
 pub fn sys_cap_create_aspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
@@ -486,6 +480,7 @@ pub fn sys_cap_create_aspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             return Err(SyscallError::InvalidCapability);
         };
         // SAFETY: tag confirmed AddressSpace.
+        // cast_ptr_alignment: header is at offset 0 of the page-aligned AddressSpaceObject.
         #[allow(clippy::cast_ptr_alignment)]
         let target_aso = unsafe { &*target_aso_nn.as_ptr().cast::<AddressSpaceObject>() };
 
@@ -647,11 +642,13 @@ pub fn sys_cap_create_aspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 ///   [`CSpace::grow`](crate::cap::cspace::CSpace::grow) when the directory
 ///   needs another 56-slot leaf.
 ///
-/// Create-mode returns the new `CSpace` slot index. Augment-mode seeds the
+/// Create-mode returns the new `CSpace` cap handle. Augment-mode seeds the
 /// carved pages onto the slot-page pool and credits the budget with the
-/// pages seeded — one donation per record page keeps its first page as the
-/// kernel's donation bookkeeping (see `PagePool::add_donation`) — and returns 0.
+/// pages seeded (record-page bookkeeping: `core/kernel/docs/capability-internals.md`
+/// § Donation Records) and returns 0.
 #[cfg(not(test))]
+// too_many_lines: create and augment modes share the source-cap resolution
+// and carve; each failure arm's rollback reads beside its step.
 #[allow(clippy::too_many_lines)]
 pub fn sys_cap_create_cspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
@@ -731,6 +728,7 @@ pub fn sys_cap_create_cspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             return Err(SyscallError::InvalidCapability);
         };
         // SAFETY: tag confirmed CSpace.
+        // cast_ptr_alignment: header is at offset 0 of the page-aligned CSpaceKernelObject.
         #[allow(clippy::cast_ptr_alignment)]
         let target_kobj = unsafe { &*target_kobj_nn.as_ptr().cast::<CSpaceKernelObject>() };
 
@@ -905,16 +903,15 @@ pub fn sys_cap_create_cspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// arg3 = `SchedControl` cap index, or 0.
 /// arg4 = initial priority, or 0.
 ///
-/// Creation priority: with arg3 = 0, arg4 must also be 0 and the thread is
-/// created at `PRIORITY_MIN` — floor-only creation needs no scheduling
-/// authority. With a `SchedControl` cap, arg4 = 0 selects the cap's band
-/// floor (`min`); a nonzero arg4 must lie within the cap's `[min, max]`
-/// band. There is no ambient priority authority above the floor.
+/// Creation priority rules (floor without a `SchedControl` cap, band-checked
+/// with one): `core/kernel/docs/syscalls.md` § `SYS_CAP_CREATE_THREAD`.
 ///
 /// Allocates a kernel stack and a TCB in `Created` state, bound to the
 /// provided address space and `CSpace`. Inserts a cap with `CONTROL | OBSERVE`
-/// rights into the caller's `CSpace`. Returns the Thread cap slot index.
+/// rights into the caller's `CSpace`. Returns the Thread cap handle.
 #[cfg(not(test))]
+// too_many_lines: the TCB is constructed field by field in place, and the
+// registration, revalidation, and rollback must stay in one sequence.
 #[allow(clippy::too_many_lines)]
 pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
@@ -980,6 +977,7 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         use crate::cap::object::AddressSpaceObject;
         let obj = as_object.ok_or(SyscallError::InvalidCapability)?;
         // SAFETY: cap tag confirmed AddressSpace; object pointer is valid.
+        // cast_ptr_alignment: header is at offset 0 of the page-aligned AddressSpaceObject.
         #[allow(clippy::cast_ptr_alignment)]
         let as_obj = unsafe { &*(obj.as_ptr().cast::<AddressSpaceObject>()) };
         as_obj.address_space
@@ -993,6 +991,7 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         use crate::cap::object::CSpaceKernelObject;
         let obj = cs_object.ok_or(SyscallError::InvalidCapability)?;
         // SAFETY: cap tag confirmed CSpace; object pointer is valid.
+        // cast_ptr_alignment: header is at offset 0 of the page-aligned CSpaceKernelObject.
         #[allow(clippy::cast_ptr_alignment)]
         let cs_obj = unsafe { &*(obj.as_ptr().cast::<CSpaceKernelObject>()) };
         cs_obj.cspace
@@ -1020,9 +1019,9 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         // SAFETY: caller_cspace validated non-null above.
         let sched_slot = unsafe { super::lookup_cap(caller_cspace, sched_idx, SchedRights::NONE) }?;
         let sched_obj = sched_slot.object.ok_or(SyscallError::InvalidCapability)?;
+        // SAFETY: tag confirmed SchedControl; pointer is a valid SchedControlObject.
         // cast_ptr_alignment: header at offset 0 of SchedControlObject; allocator
         // guarantees alignment.
-        // SAFETY: tag confirmed SchedControl; pointer is a valid SchedControlObject.
         #[allow(clippy::cast_ptr_alignment)]
         let sched = unsafe { &*(sched_obj.as_ptr().cast::<SchedControlObject>()) };
         if priority_arg == 0
@@ -1035,8 +1034,8 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             {
                 return Err(SyscallError::InvalidArgument);
             }
-            #[allow(clippy::cast_possible_truncation)]
             // cast_possible_truncation: bounded by PRIORITY_MAX above.
+            #[allow(clippy::cast_possible_truncation)]
             let priority = priority_arg as u8;
             if priority < sched.min || priority > sched.max
             {
@@ -1048,7 +1047,7 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // Reserve the 6-page slot from the source Memory cap. Layout:
     //   pages 0..3 (16 KiB) — kstack
-    //   page 4              — ThreadObject (24 B) followed by TCB
+    //   page 4              — ThreadObject followed by TCB (at size_of::<ThreadObject>())
     //   page 5              — per-thread FPU/SIMD/V save area
     let entry = dispatch_for(ObjectType::Thread, 0).ok_or(SyscallError::InvalidArgument)?;
     debug_assert_eq!(
@@ -1189,7 +1188,8 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // snapshotted above (the pointer bound into the TCB, not the slot, which
     // could have been recycled through a full generation cycle) proves it
     // outlived the registration — and any teardown starting now finds this
-    // thread in the walk (docs/capability-model.md, process termination).
+    // thread in the walk (docs/capability-model.md § "Kill process" pattern;
+    // core/kernel/docs/scheduling-internals.md § Thread Registry).
     // SAFETY: caller_cspace validated non-null above.
     let bound = unsafe {
         super::lookup_cap(caller_cspace, as_idx, AsRights::MAP).is_ok_and(|s| s.object == as_object)
@@ -1227,7 +1227,7 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             // from the registry (an object teardown walking it meanwhile saw
             // a `Created` thread and marked it `Exited`, which is harmless
             // here), drop both in-place objects, return the slot bytes (all
-            // 5 pages) to the ancestor cap, and undo the lease bump.
+            // KERNEL_STACK_PAGES + 2 pages) to the ancestor cap, and undo the lease bump.
             // SAFETY: tcb and wrapper were just constructed in place above;
             // the registry is the only structure that has observed the TCB.
             unsafe {
@@ -1355,12 +1355,13 @@ fn pre_grow_for_explicit_slot(
 
 /// `SYS_CAP_COPY` (24): copy a capability into another `CSpace.`
 ///
-/// arg0 = source slot index (in caller's `CSpace`).
-/// arg1 = destination `CSpace` cap index (in caller's `CSpace`; must have INSERT).
+/// arg0 = source capability handle (in caller's `CSpace`; generation-checked).
+/// arg1 = destination `CSpace` capability handle (in caller's `CSpace`; must have INSERT).
 /// arg2 = destination slot index in the target `CSpace`, or `0` to let the
 ///        kernel allocate a free slot. Slot 0 is permanently null, so it is a
 ///        safe "kernel picks" sentinel.
-/// arg3 = rights mask for the new slot (must be a subset of source rights).
+/// arg3 = rights mask for the new slot (intersected with the source rights;
+///        bits the source lacks are dropped).
 ///
 /// Copies the source capability's kernel object into the destination `CSpace`
 /// with the requested (attenuated) rights, increments the object's reference
@@ -1369,7 +1370,7 @@ fn pre_grow_for_explicit_slot(
 /// otherwise the cap is placed at the caller-chosen index — init populates
 /// well-known slots in child `CSpaces` this way.
 ///
-/// Returns the destination slot index.
+/// Returns the destination capability handle (slot index plus generation).
 #[cfg(not(test))]
 pub fn sys_cap_copy(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
@@ -1420,7 +1421,7 @@ pub fn sys_cap_copy(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     let dest_cs_id = unsafe { (*dest_cs_ptr).id() };
 
     // Fail fast on an invalid or stale source before the pre-grow spends
-    // pool pages that stay spent (`syscalls.md`, SYS_CAP_COPY); the source
+    // pool pages that stay spent (`core/kernel/docs/syscalls.md` § SYS_CAP_COPY); the source
     // is resolved again below, right before its reference is taken.
     // SAFETY: caller_cspace validated non-null above.
     unsafe { resolve_src_cap(caller_cspace, src_handle)? };
@@ -1545,13 +1546,13 @@ pub fn sys_cap_copy(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// `SYS_CAP_DERIVE` (14): attenuate a capability within the caller's own `CSpace.`
 ///
 /// arg0 = source slot index (caller's `CSpace`).
-/// arg1 = rights mask (must be a subset of source rights).
+/// arg1 = rights mask (intersected with the source rights; bits the source lacks are dropped).
 ///
 /// Creates a new slot in the caller's `CSpace` with the attenuated rights, wired
 /// as a child of the source in the derivation tree. Unlike `SYS_CAP_COPY`, the
 /// destination is always the caller's own `CSpace`, and no `CSpace` cap is required.
 ///
-/// Returns the new slot index.
+/// Returns the new cap handle.
 #[cfg(not(test))]
 pub fn sys_cap_derive(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
@@ -1653,7 +1654,7 @@ pub fn sys_cap_derive(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// `SYS_CAP_DERIVE_BADGE` (48): derive a capability with a badge attached.
 ///
 /// arg0 = source slot index (caller's `CSpace`).
-/// arg1 = rights mask (must be a subset of source rights).
+/// arg1 = rights mask (intersected with the source rights; bits the source lacks are dropped).
 /// arg2 = badge value (must be non-zero; source must have badge == 0).
 ///
 /// Creates a new slot with the attenuated rights and the specified badge.
@@ -1661,7 +1662,7 @@ pub fn sys_cap_derive(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// the badge (via `SYS_CAP_DERIVE`), but setting a new badge on an already-
 /// badged cap returns `InvalidArgument`.
 ///
-/// Returns the new slot index.
+/// Returns the new cap handle.
 #[cfg(not(test))]
 pub fn sys_cap_derive_badge(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
@@ -1866,12 +1867,9 @@ unsafe fn resolve_delete_target(
             {
                 return Err(Ok(0));
             }
-            // A revoke or move is mid-flight on this slot (see
-            // `CapabilitySlot::pinned`): deleting a revoke root between
-            // batches would promote its temporarily hoisted survivors and
-            // sever intermediate revocation edges; deleting a move's source
-            // or destination would tear the migration. Transient — retry
-            // after the operation completes.
+            // A revoke or move is mid-flight on this slot (`CapabilitySlot::pinned`;
+            // `core/kernel/docs/capability-internals.md` § Revocation Algorithm).
+            // Transient — retry after the operation completes.
             if slot.pinned()
             {
                 return Err(Err(SyscallError::InvalidState));
@@ -1898,17 +1896,9 @@ unsafe fn resolve_delete_target(
 /// from the grandparent), unlinks the slot from the derivation tree, clears it,
 /// and `dec_refs` the kernel object. If refcount reaches 0, frees the object.
 ///
-/// The reparenting runs in `MAX_REPARENT_EDITS` batches with the derivation
-/// lock released in between (a slot can have arbitrarily many children); the
-/// slot is revalidated (generation and object) before every batch. Between
-/// batches it stays live with its remaining children still under it, so a
-/// concurrent revoke starting on it stops this delete with `InvalidState`
-/// (children already moved stay under the parent — still inside every
-/// ancestor's subtree) and a concurrent delete — or move — that frees the
-/// slot first makes this call return success (the generation, or the object
-/// behind a wrapped generation, no longer matches; nothing is released here).
-/// `MAX_REPARENT_BATCHES` bounds a concurrent-deriver livelock with
-/// `Interrupted`.
+/// The reparenting runs in `MAX_REPARENT_EDITS` batches bounded by
+/// `MAX_REPARENT_BATCHES`; the concurrency contract and the refusals are
+/// specified in `core/kernel/docs/syscalls.md` § `SYS_CAP_DELETE`.
 ///
 /// Idempotent: deleting a Null slot returns success.
 #[cfg(not(test))]
@@ -1960,14 +1950,11 @@ pub fn sys_cap_delete(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             };
         expected = Some(obj_ptr);
 
-        // #341: refuse to delete the last capability to the RUNNING thread's own
-        // Thread object. This is always an aliased/stale-cap bug — std's
-        // `Process::drop` deletes a child's `thread_cap` whose slot was reused for
-        // the running (waiter) thread after the child was reaped. Completing the
-        // delete tears the running thread down mid-syscall and orphans whatever it
-        // was driving (the shell hangs). Refuse here, before the dec-ref/dealloc:
-        // the cap stays and is reclaimed normally when a DIFFERENT thread later
-        // joins/reaps this one. Logged once so the userspace site is symbolisable.
+        // #341: refuse to delete any capability to the running thread's own Thread
+        // object (core/kernel/docs/syscalls.md § SYS_CAP_DELETE): a last-cap delete
+        // would tear the running thread down mid-syscall. Refuse here, before the
+        // dec-ref/dealloc; the cap stays and is reclaimed normally when a different
+        // thread later releases it. Logged once so the userspace site is symbolisable.
         // SAFETY: obj_ptr is a live KernelObjectHeader (slot confirmed live above);
         // tcb is the validated caller.
         if unsafe {
@@ -2008,7 +1995,7 @@ pub fn sys_cap_delete(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         // SAFETY: caller_cspace validated; slot confirmed live above. Take the
         // cspace lock strictly inside DERIVATION_LOCK so the freelist mutation
         // cannot tear against a concurrent SYS_CAP_CREATE_* on the same cspace.
-        // Lock order: DERIVATION_LOCK → cspace.lock (matches transfer_caps).
+        // Lock order per `core/kernel/docs/scheduling-internals.md` § Lock Hierarchy.
         unsafe {
             let saved = (*caller_cspace).lock.lock_raw();
             (*caller_cspace).free_slot(slot_idx);
@@ -2047,7 +2034,7 @@ pub fn sys_cap_delete(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 ///
 /// - `InvalidCapability` — the handle names no live slot, or its generation
 ///   is stale.
-/// - `InvalidState` — another revoke is already in flight on this slot; or a
+/// - `InvalidState` — another revoke, or a move, is already in flight on this slot; or a
 ///   corrupted derivation link was found (the dangling chain was truncated
 ///   and the revoke is incomplete).
 /// - `Interrupted` — the liveness backstop tripped: sustained concurrent
@@ -2079,21 +2066,16 @@ pub fn sys_cap_revoke(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     let root = crate::cap::slot::SlotId::current(cspace_id, slot_idx_nz);
 
     // Revoke the subtree in batches of up to MAX_REVOKE_EDITS constant-time
-    // tree edits (see the revocation algorithm in capability-internals.md).
+    // tree edits (`core/kernel/docs/capability-internals.md` § Revocation Algorithm).
     // Per batch: revalidate the root and run one batch under the lock, then
     // snapshot the dealloc list to a stack-local array so the lock is
     // released before calling `dealloc_object` (which may acquire the frame
     // allocator and other inner locks — see the safety doc on
     // `dealloc_object`).
     //
-    // The root is pinned (`CapabilitySlot::pinned`) for the whole
-    // multi-batch operation so SYS_CAP_DELETE / SYS_CAP_MOVE / IPC transfer
-    // cannot act on it between batches — that would promote the temporarily
-    // hoisted survivors and permanently sever intermediate revocation
-    // edges. The pin is cleared under the lock on every exit path —
-    // completion, dead-link error, and the Interrupted backstop alike — so
-    // it cannot leak. A root freed mid-revoke sheds the pin on the free
-    // path (`set_next_free` zeroes it).
+    // The root is pinned (`CapabilitySlot::pinned`) for the whole multi-batch
+    // operation and unpinned under the lock on every exit path
+    // (`core/kernel/docs/capability-internals.md` § Revocation Algorithm).
     let mut snapshot: [Option<core::ptr::NonNull<crate::cap::object::KernelObjectHeader>>;
         crate::cap::derivation::MAX_REVOKE_EDITS] =
         [None; crate::cap::derivation::MAX_REVOKE_EDITS];
@@ -2349,14 +2331,17 @@ pub fn sys_cap_move(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             // pre_grow_for_explicit_slot), the destination wrapper held
             // across it. May run the destination's teardown if its last
             // capability went meanwhile (see pre_grow_holding_dest).
-            // SAFETY: dest_obj is the live wrapper resolved above; no lock held.
+            // SAFETY: dest_obj was the live wrapper at lookup; no lock held.
+            // `lookup_cap` takes no reference on the object, so it is not pinned
+            // for this block (`core/kernel/docs/capability-internals.md`
+            // § Storage: Hybrid Two-Level Radix, #443).
             unsafe { pre_grow_holding_dest(dest_obj, dest_cs_ptr, dest_idx)? };
             Some(idx)
         }
     };
 
-    // Lock order: DERIVATION_LOCK → cspace.lock(s), the pair in pointer
-    // address order (matches transfer_caps). Both CSpace locks are held so
+    // Lock order per `core/kernel/docs/scheduling-internals.md` § Lock Hierarchy
+    // (the CSpace pair via `lock_cspace_pair`). Both CSpace locks are held so
     // the freelist mutations of the insert and the single-batch free cannot
     // tear against a concurrent SYS_CAP_CREATE_*.
     crate::cap::DERIVATION_LOCK.write_lock();
@@ -2398,13 +2383,15 @@ pub fn sys_cap_move(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     }
 }
 
-/// `SYS_CAP_CREATE_EVENT_Q` (9): create a new `EventQueue` object.
+/// `SYS_CAP_CREATE_EVENT_Q` (9): retype a Memory cap into a new `EventQueue`.
 ///
-/// arg0 = capacity (`1..=EVENT_QUEUE_MAX_CAPACITY`).
+/// arg0 = Memory-cap slot (must carry `MemRights::RETYPE`).
+/// arg1 = capacity (`1..=EVENT_QUEUE_MAX_CAPACITY`).
 ///
-/// Allocates `EventQueueState` (with its ring buffer) and `EventQueueObject`,
-/// inserts a cap with `POST | RECV` rights into the caller's `CSpace.`
-/// Returns the slot index in rax/a0.
+/// Constructs the `EventQueueObject` wrapper, its `EventQueueState`, and the
+/// inline ring in place inside the source Memory cap's region, inserts a cap
+/// with `POST | RECV` rights into the caller's `CSpace`, and returns the new
+/// cap handle.
 #[cfg(not(test))]
 pub fn sys_cap_create_event_queue(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
@@ -2519,7 +2506,7 @@ pub fn sys_cap_create_event_queue(tf: &mut TrapFrame) -> Result<u64, SyscallErro
 /// `SYS_CAP_CREATE_WAIT_SET` (13): retype a Memory cap into a new `WaitSet`.
 ///
 /// arg0 = Memory-cap slot. The Memory cap MUST carry `MemRights::RETYPE` and have
-/// at least `dispatch_for(WaitSet, 0).raw_bytes` (504) of `available_bytes`.
+/// at least `dispatch_for(WaitSet, 0).raw_bytes` of `available_bytes`.
 #[cfg(not(test))]
 pub fn sys_cap_create_wait_set(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
@@ -2621,18 +2608,10 @@ pub fn sys_cap_create_wait_set(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// `SYS_SYSTEM_INFO`.
 ///
 /// # Field selectors
-/// - [`syscall::CAP_INFO_TAG_RIGHTS`] — universal; returns
-///   `((tag as u8 as u64) << 32) | (rights.0 as u64)`.
-/// - [`syscall::CAP_INFO_MEMORY_SIZE`] / `_AVAILABLE` / `_HAS_RETYPE` —
-///   require `CapTag::Memory`.
-/// - [`syscall::CAP_INFO_ASPACE_PT_BUDGET`] — requires `CapTag::AddressSpace`.
-/// - [`syscall::CAP_INFO_CSPACE_CAPACITY`] / `_USED` / `_BUDGET` —
-///   require `CapTag::CSpace`.
-///
-/// # Errors
-/// - [`SyscallError::InvalidCapability`] if the slot is null or out of range.
-/// - [`SyscallError::InvalidArgument`] if the selector is unknown or
-///   tag-specific and the slot's tag does not match.
+/// The selectors are the `syscall::CAP_INFO_*` constants; each constant's
+/// rustdoc in `abi/syscall` gives its tag requirement and packing, and
+/// `core/kernel/docs/syscalls.md` § `SYS_CAP_INFO` gives the call's contract
+/// and errors.
 ///
 /// This handler does not gate on rights — holding the slot is sufficient to
 /// inspect its state. No mutation occurs.
@@ -2729,6 +2708,8 @@ pub fn sys_cap_info(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 return Err(SyscallError::InvalidArgument);
             }
             // SAFETY: tag confirmed Memory.
+            // cast_ptr_alignment: the wrapper (constructed in place at a size-class-aligned
+            // retype offset, so 8-byte aligned) holds the header at offset 0.
             #[allow(clippy::cast_ptr_alignment)]
             let memory = unsafe { &*(obj.as_ptr().cast::<MemoryObject>()) };
             Ok(memory.available_bytes.load(Ordering::Acquire))
@@ -2748,6 +2729,8 @@ pub fn sys_cap_info(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 return Err(SyscallError::InvalidArgument);
             }
             // SAFETY: tag confirmed Memory.
+            // cast_ptr_alignment: the wrapper (constructed in place at a size-class-aligned
+            // retype offset, so 8-byte aligned) holds the header at offset 0.
             #[allow(clippy::cast_ptr_alignment)]
             let memory = unsafe { &*(obj.as_ptr().cast::<MemoryObject>()) };
             Ok(memory.base)
@@ -2759,6 +2742,8 @@ pub fn sys_cap_info(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 return Err(SyscallError::InvalidArgument);
             }
             // SAFETY: tag confirmed Thread; header at offset 0 of ThreadObject.
+            // cast_ptr_alignment: the ThreadObject sits at the page-aligned start of page
+            // KERNEL_STACK_PAGES of the Thread retype slot; header at offset 0.
             #[allow(clippy::cast_ptr_alignment)]
             let thr_obj = unsafe { &*(obj.as_ptr().cast::<ThreadObject>()) };
             let target_tcb = thr_obj.tcb;
@@ -2778,8 +2763,10 @@ pub fn sys_cap_info(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             let sched = unsafe { crate::sched::scheduler_for(cpu) };
             // SAFETY: lock_raw / unlock_raw paired below.
             let saved = unsafe { sched.lock.lock_raw() };
-            // SAFETY: target_tcb came from a Thread cap; lifetime extends to
-            // cap_revoke / cap_delete which we do not race here.
+            // SAFETY: target_tcb came from a Thread cap resolved without taking a
+            // reference, so a sibling's concurrent delete of the last Thread cap can
+            // free it before this read (`core/kernel/docs/capability-internals.md`
+            // § Storage: Hybrid Two-Level Radix, #443).
             let (state, exit_reason) = unsafe { ((*target_tcb).state, (*target_tcb).exit_reason) };
             // SAFETY: paired with lock_raw above.
             unsafe { sched.lock.unlock_raw(saved) };
@@ -2802,6 +2789,8 @@ pub fn sys_cap_info(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 return Err(SyscallError::InvalidArgument);
             }
             // SAFETY: tag confirmed AddressSpace.
+            // cast_ptr_alignment: the wrapper (constructed in place at a size-class-aligned
+            // retype offset, so 8-byte aligned) holds the header at offset 0.
             #[allow(clippy::cast_ptr_alignment)]
             let as_obj = unsafe { &*(obj.as_ptr().cast::<AddressSpaceObject>()) };
             Ok(as_obj.pt_growth_budget_bytes.load(Ordering::Acquire))
@@ -2813,6 +2802,8 @@ pub fn sys_cap_info(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 return Err(SyscallError::InvalidArgument);
             }
             // SAFETY: tag confirmed CSpace; header at offset 0 of CSpaceKernelObject.
+            // cast_ptr_alignment: the wrapper (constructed in place at a size-class-aligned
+            // retype offset, so 8-byte aligned) holds the header at offset 0.
             #[allow(clippy::cast_ptr_alignment)]
             let cs_obj = unsafe { &*(obj.as_ptr().cast::<CSpaceKernelObject>()) };
             let target = cs_obj.cspace;
@@ -2852,6 +2843,8 @@ pub fn sys_cap_info(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 return Err(SyscallError::InvalidArgument);
             }
             // SAFETY: tag confirmed CSpace.
+            // cast_ptr_alignment: the wrapper (constructed in place at a size-class-aligned
+            // retype offset, so 8-byte aligned) holds the header at offset 0.
             #[allow(clippy::cast_ptr_alignment)]
             let cs_obj = unsafe { &*(obj.as_ptr().cast::<CSpaceKernelObject>()) };
             let target = cs_obj.cspace;
@@ -2877,6 +2870,8 @@ pub fn sys_cap_info(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 return Err(SyscallError::InvalidArgument);
             }
             // SAFETY: tag confirmed CSpace.
+            // cast_ptr_alignment: the wrapper (constructed in place at a size-class-aligned
+            // retype offset, so 8-byte aligned) holds the header at offset 0.
             #[allow(clippy::cast_ptr_alignment)]
             let cs_obj = unsafe { &*(obj.as_ptr().cast::<CSpaceKernelObject>()) };
             Ok(cs_obj.cspace_growth_budget_bytes.load(Ordering::Acquire))

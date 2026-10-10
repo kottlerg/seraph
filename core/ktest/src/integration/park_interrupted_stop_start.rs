@@ -7,10 +7,11 @@
 //! syscall and then restarted returns `Interrupted` — never a stale wake
 //! deposit surfaced as success (#363).
 //!
-//! `cancel_ipc_block` stamps the park episode `INTERRUPTED` at each arm's
-//! exclusive claim; the restarted thread's resume consumes the stamp instead
-//! of reading `wakeup_value`/`ipc_msg` unconditionally. One phase per parking
-//! surface:
+//! The stop/restart contract under test is defined in
+//! [thread-lifecycle-and-sleep.md](../../../kernel/docs/thread-lifecycle-and-sleep.md)
+//! § `sys_thread_stop` Cross-CPU Stop Protocol and
+//! [ipc-internals.md](../../../kernel/docs/ipc-internals.md) § Park Dispositions and
+//! Episodes. One phase per parking surface:
 //!
 //!   1. **`notification_wait`** — pre-#363 a cancelled wait surfaced a 0-bits
 //!      "success". Includes a post-restart sanity wait proving the cancel left
@@ -28,7 +29,8 @@
 //! child itself asserts the `Interrupted` contract — raising an OK bit on the
 //! contract or a BAD bit on any other result.
 //!
-//! Runs on a single CPU (the children are timer-preempted peers).
+//! The children run unpinned at the floor priority, below the controller;
+//! `drive` therefore settles with a wall-clock sleep rather than a yield.
 
 use syscall::{
     RIGHTS_ALL, cap_copy, cap_create_endpoint, cap_create_notification, cap_delete,
@@ -40,8 +42,9 @@ use syscall_abi::{RIGHTS_EP_RECEIVE, SyscallError};
 
 use crate::{ChildStack, TestContext, TestResult, spawn};
 
-/// Notification NOTIFY and WAIT rights.
+/// Notification NOTIFY right (the child's `done` sends).
 const RIGHTS_SIGNAL: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
+/// Notification WAIT right (the child's parked waits on its source notification).
 const RIGHTS_WAIT: u64 = syscall_abi::RIGHTS_NTF_WAIT;
 
 /// Phase 1 (`notification_wait`) bits; OK2/BAD2 carry the post-restart sanity
@@ -330,7 +333,8 @@ fn is_interrupted(e: i64) -> bool
     e == SyscallError::Interrupted as i64
 }
 
-// cast_possible_truncation: packed fields are cap slot indices < 2^16.
+// cast_possible_truncation: each half is masked or shifted to 32 bits before
+// its cast, so neither cast drops set bits.
 #[allow(clippy::cast_possible_truncation)]
 fn unpack(arg: u64) -> (u32, u32)
 {

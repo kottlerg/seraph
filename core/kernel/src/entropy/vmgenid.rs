@@ -12,18 +12,17 @@
 //! identical streams until a reseed; the GUID is the detection channel that
 //! forces that reseed before any post-resume output.
 //!
-//! Detection is per-draw and per-CPU: each generator compares the live GUID
-//! against the one it last reseeded under ([`read_guid`] is a 16-byte
-//! volatile read through the direct map) and treats a mismatch as a
-//! mandatory reseed. No cross-CPU state exists — the GUID in guest RAM *is*
-//! the shared authority. The BSP timer tick additionally polls the GUID
-//! purely for observability ([`poll_log`]); it shares nothing with the draw
-//! path and takes no locks.
+//! Detection is per-draw and per-CPU through [`read_guid`] (a 16-byte
+//! volatile read through the direct map); the detection model is specified
+//! in [entropy.md](../../docs/entropy.md) § Whole-VM-snapshot detection (VMGENID).
+//! The BSP timer tick additionally polls the GUID purely for observability
+//! ([`poll_log`]); the draw path never depends on it, and it takes no lock
+//! except the console lock when logging a change.
 //!
 //! The GUID's physical address is discovered by the bootloader (QEMU VMGENID
-//! SSDT scan; see `boot-protocol` v13) and is zero when absent — riscv64
-//! today, or non-QEMU hosts. Absence degrades to the time-budget reseed
-//! bound in [`super::reseed_policy`].
+//! SSDT scan; see `abi/boot-protocol` v13, `BootInfo.vmgenid_paddr`) and is
+//! zero when absent — riscv64 today, or non-QEMU hosts. Absence degrades to
+//! the time-budget reseed bound in [`super::reseed_policy`].
 
 use core::sync::atomic::{AtomicU64, Ordering};
 

@@ -3,7 +3,7 @@
 
 // core/kernel/src/mm/address_space.rs
 
-//! User-mode address space management (Phase 9).
+//! User-mode address space management.
 //!
 //! An [`AddressSpace`] owns one root page table (PML4 on x86-64, the
 //! negotiated-mode root on RISC-V). Intermediate page table frames are
@@ -27,39 +27,23 @@
 //!
 //! ## Concurrency
 //!
-//! Page table modifications (`map_page`, `unmap_page`, `protect_page`) edit the
-//! leaf PTE under the per-address-space `pt_lock`, then RELEASE `pt_lock`
-//! before issuing the synchronous TLB shootdown ([`shootdown_remote`]). Holding
-//! `pt_lock` across the shootdown's cross-CPU IPI ack-wait would serialize every
-//! concurrent map/unmap on the address space behind that latency — a convoy /
-//! priority-inversion under load. The committed PTE plus the immutable
-//! `root_phys` are all the shootdown reads, so it runs without `pt_lock`.
-//!
-//! The shootdown itself is lock-free — each CPU publishes into its own request
-//! slot — so `pt_lock` nests with no shootdown lock. The only lock the PTE edit
-//! nests under `pt_lock` is the PT-frame source: the wrapper's pool lock on
-//! the pooled path, the kernel page-table pool lock on the kernel-direct path.
-//!
-//! ## Operation-class shootdown elision
-//!
-//! The remote shootdown is issued only when the leaf-PTE rewrite can strand a
-//! *dangerous* stale entry on another CPU. The arch mapping primitives classify
-//! each rewrite as a [`MapOutcome`](crate::mm::paging::MapOutcome):
-//!
-//! - **Fresh map** (no prior mapping) and **permission widen** (same frame, new
-//!   rights ⊇ prior) skip the remote shootdown. No remote CPU can hold a stale
-//!   entry that grants more than the live PTE, so the worst case is a spurious
-//!   fault the page-fault handler resolves against the live PTE and retries.
-//! - **Replace** (different frame, or a permission *narrow*) keeps the
-//!   synchronous shootdown: a stale entry would alias a freed/reused frame or
-//!   cache over-broad rights — a correctness violation the retry cannot mask.
-//!
-//! `unmap_page` is always a Replace-equivalent and stays synchronous. The local
-//! flush runs unconditionally regardless of class.
+//! The per-page edits (`map_page`, `unmap_page`, `protect_page`) edit the leaf
+//! PTE under the per-address-space `pt_lock` and release it before the remote
+//! shootdown ([`shootdown_remote`]); the shootdown is skipped for Fresh and Widen
+//! rewrites ([`MapOutcome`](crate::mm::paging::MapOutcome)). Region teardown
+//! ([`unmap_region_pooled`](AddressSpace::unmap_region_pooled)) is the exception:
+//! it holds `pt_lock` across its one coarse shootdown, so that no CPU can reuse a
+//! just-freed page-table frame before every TLB and paging-structure cache is
+//! clean (known defect, #443: a riscv64 ranged teardown leaves cached non-leaf
+//! entries in place). The protocol and the classification are defined in
+//! `core/kernel/docs/memory-internals.md` § SMP TLB Shootdown. The only lock that
+//! nests under `pt_lock` is the PT-frame source: the wrapper's pool lock on the
+//! pooled path, the kernel page-table pool lock on the kernel-direct path. The
+//! local flush runs unconditionally regardless of class.
 //!
 //! Fresh/Widen safety rests on the spurious-fault retry (Widen) and on x86-64 not
 //! caching not-present entries (Fresh) — not on the context-switch TLB flush — so
-//! it is unaffected by a future PCID/ASID-tagged regime.
+//! it holds unchanged under PCID/ASID tagging.
 //!
 //! `pt_lock` does NOT disable interrupts (shootdown needs them enabled).
 //! `preempt_disable()` is held across the whole edit-then-shootdown sequence:
@@ -67,9 +51,6 @@
 //! mapping is fully TLB-coherent before the operation returns.
 //!
 //! [`shootdown_remote`]: AddressSpace::shootdown_remote
-
-// cast_possible_truncation: u64→usize page count arithmetic; bounded by address space size.
-#![allow(clippy::cast_possible_truncation)]
 
 use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 
@@ -108,10 +89,10 @@ pub struct InitLayout
 }
 
 /// Cached init layout for this boot. `init_info_va == 0` means not yet drawn
-/// (a real `InitInfo` VA is never 0). Init is a singleton, and two boot phases
-/// read its layout — the `InitInfo` mapping in Phase 9 and the user trap-frame
-/// build in `sched::enter` — so the random draw is made once and cached to
-/// keep both readers in agreement.
+/// (a real `InitInfo` VA is never 0). Init is a singleton, and two Phase 9
+/// readers use its layout — `kernel_entry` (the `InitInfo` and stack mappings
+/// and init's entry argument) and the user trap-frame build in `sched::enter` —
+/// so the random draw is made once and cached to keep both readers in agreement.
 static INIT_LAYOUT_INFO_VA: AtomicU64 = AtomicU64::new(0);
 static INIT_LAYOUT_STACK_TOP: AtomicU64 = AtomicU64::new(0);
 
@@ -194,9 +175,10 @@ pub fn choose_init_layout() -> InitLayout
 ///
 /// Owns the physical frame of the root page table. Intermediate frames
 /// allocated during mapping are tracked implicitly through the page table
-/// structure; they are returned to the per-AS pool on region teardown
-/// ([`unmap_region_pooled`](Self::unmap_region_pooled)) and reclaimed wholesale
-/// at address-space death.
+/// structure; their source and reclaim (pool-drawn nodes return to the per-AS
+/// pool via [`unmap_region_pooled`](Self::unmap_region_pooled) and with the
+/// donations at destruction, kernel-pool nodes are never returned) are
+/// defined in `core/kernel/docs/memory-internals.md` § Page Table Node Ownership.
 pub struct AddressSpace
 {
     /// Physical address of the root page table frame (PML4 / RISC-V root).
@@ -222,33 +204,31 @@ pub struct AddressSpace
     /// (by the owner's own claim or by eviction); read lock-free by `activate`.
     // dead_code: the tag fields are accessed only on `#[cfg(not(test))]` paths
     // (activate / shootdown / destroy), so host-test builds see them as unread.
-    #[allow(dead_code)]
+    #[cfg_attr(test, allow(dead_code))]
     pub(crate) tag: AtomicU16,
     /// The global allocator generation stamped when this space claimed its
     /// current `tag`. Globally unique per claim; distinguishes this space's
     /// claim on a tag from any later space that reuses the same tag value, so a
     /// per-CPU generation check flushes a tag before its first use under a new
     /// owner.
-    #[allow(dead_code)] // see `tag`
+    // dead_code: like `tag`, read only on `#[cfg(not(test))]` paths; unread in host-test builds.
+    #[cfg_attr(test, allow(dead_code))]
     pub(crate) tag_gen: AtomicU64,
-    /// Bumped on every Replace-class modification (`unmap`, permission narrow).
+    /// Bumped (when tagging is enabled) on every Replace-class modification
+    /// (unmap, remap to a different frame, permission narrow).
     /// A CPU switched away from this space compares its last-synced value
     /// against this on reactivation and flushes the tag if it lags, catching
     /// unmaps it missed while it was elsewhere.
-    #[allow(dead_code)] // see `tag`
+    // dead_code: like `tag`, read only on `#[cfg(not(test))]` paths; unread in host-test builds.
+    #[cfg_attr(test, allow(dead_code))]
     pub(crate) tlb_gen: AtomicU64,
     /// Observers to notify when a thread in this address space takes a
-    /// *terminal* fault (no handler bound, or handler replied `KILL`).
-    ///
-    /// Mirrors the per-thread `ThreadControlBlock::death_observers` set: each
-    /// observer pairs an `EventQueueState` post target with a caller-chosen
-    /// `correlator`, and the kernel posts the packed payload
-    /// `(correlator as u64) << 32 | (exit_reason & 0xFFFF_FFFF)` on a terminal
-    /// fault. procmgr binds one at process creation so a worker thread's fatal
-    /// fault drives the process teardown cascade; the kernel only *notifies*,
-    /// it never enumerates or terminates threads. Normal `thread_exit` does
-    /// NOT post to these observers. Entries past `death_observer_count` are
-    /// invalid.
+    /// terminal fault, each pairing an `EventQueueState` post target with a
+    /// caller-chosen `correlator` (mirroring
+    /// `ThreadControlBlock::death_observers`). Semantics are defined in
+    /// `docs/capability-model.md` § "Kill process" pattern and
+    /// `core/kernel/docs/syscalls.md` § `SYS_ASPACE_BIND_NOTIFICATION`. Entries
+    /// past `death_observer_count` are invalid.
     death_observers:
         [crate::sched::thread::DeathObserver; crate::sched::thread::MAX_DEATH_OBSERVERS],
     /// Number of populated entries in `death_observers`
@@ -358,22 +338,21 @@ impl AddressSpace
     fn shootdown_remote(&self, virt: u64)
     {
         // This is the Replace-class path (unmap / frame-replace / permission
-        // narrow). Reading `self.tag` is safe without the pool lock: the current
-        // CPU is running this space (it is performing the modification), so the
-        // space is active and cannot be selected as an eviction victim, so its
-        // tag is stable here.
+        // narrow). `self.tag` is read without the pool lock, before the tlb_gen
+        // bump and the active-CPU snapshot below, and the caller need not be
+        // running this space (cross-AS edits by procmgr / memmgr), so the read
+        // can race eviction. Whether a concurrent eviction and re-activation can
+        // make the request carry a revoked tag to a CPU in the snapshot is an
+        // open question recorded on #443 (core/kernel/docs/memory-internals.md
+        // § SMP TLB Shootdown).
         let tag = self.tag.load(Ordering::Acquire);
 
         if crate::mm::tag_allocator::tagging_enabled()
         {
-            // Bump the per-space TLB generation so a CPU that was switched away
-            // (and is therefore NOT in active_cpus, so gets no IPI below) flushes
-            // this tag on its next reactivation. The SeqCst fence is the A-side
-            // of the INV-3 unmap-race Dekker: it orders the bump before the
-            // active-CPU snapshot, pairing with the fence in `activate`. Together
-            // they guarantee that for any CPU caching this space, either it is in
-            // the snapshot (gets an IPI) or it observes the bumped tlb_gen on
-            // reactivation. Never neither.
+            // Bump the per-space TLB generation, then fence before the active-CPU
+            // snapshot: the initiator side of the tlb_gen / active_cpus Dekker
+            // exclusion with the fence in `activate` (see
+            // core/kernel/docs/memory-internals.md § SMP TLB Shootdown).
             self.tlb_gen.fetch_add(1, Ordering::Release);
             core::sync::atomic::fence(Ordering::SeqCst);
         }
@@ -395,9 +374,11 @@ impl AddressSpace
     /// Allocate a fresh user address space backed by a caller-supplied root
     /// page-table frame.
     ///
-    /// Used by the typed-memory retype path (`sys_cap_create_aspace`): the
-    /// caller pops a page from the `AddressSpaceObject`'s growth pool and
-    /// passes its physical address here. This function:
+    /// Used by both typed-memory creation paths (`sys_cap_create_aspace` and the
+    /// Phase 9 `boot_retype_aspace`): the caller passes page 1 of the
+    /// create-time slab (page 0 is the wrapper page, the rest seed the
+    /// page-table pool; see `core/kernel/docs/memory-internals.md` § Lifecycle).
+    /// This function:
     /// 1. Zeroes the frame.
     /// 2. Copies the kernel-half PT entries (indices 256-511) from the
     ///    currently active root.
@@ -484,6 +465,9 @@ impl AddressSpace
     /// `this` must be a valid `AddressSpace` pointer. The caller must NOT hold
     /// `death_lock`.
     #[cfg(not(test))]
+    // cast_possible_truncation: the usize→u8 `death_observer_count` store is
+    // bounded by `MAX_DEATH_OBSERVERS`, checked immediately before it.
+    #[allow(clippy::cast_possible_truncation)]
     pub unsafe fn bind_or_retained(
         this: *mut Self,
         eq: *mut crate::ipc::event_queue::EventQueueState,
@@ -560,18 +544,21 @@ impl AddressSpace
     /// Acquires `pt_lock`, draws missing intermediate page-table frames
     /// from [`crate::mm::kernel_pt_pool`] (seeded at Phase 7), flushes the local
     /// TLB, and sends remote TLB shootdown IPIs only when the rewrite can strand
-    /// a dangerous stale entry (see the module's elision note). A fresh map into
+    /// a dangerous stale entry (see the module's Concurrency note and
+    /// `core/kernel/docs/memory-internals.md` § SMP TLB Shootdown). A fresh map into
     /// a previously-unmapped VA skips the remote shootdown.
     ///
     /// Used by:
-    /// - [`map_segment`](Self::map_segment) and direct kernel callers
-    ///   (Phase 9 init bootstrap, `sys_mmio_map` for legacy MMIO mappings)
-    ///   — PT pages come from `kernel_pt_pool`.
-    /// - For userspace `sys_mem_map` against a retype-backed AS, see
+    /// - [`map_segment`](Self::map_segment) and the Phase 9 init bootstrap
+    ///   (image, `InitInfo`, stack), and by `sys_mem_map` / `sys_mmio_map` for an
+    ///   address space with no recorded donation — PT pages come from
+    ///   `kernel_pt_pool`.
+    /// - Address spaces with a recorded donation go through
     ///   [`map_page_pooled`](Self::map_page_pooled).
     ///
     /// # Safety
-    /// `virt` must be in the user half (< `0x8000_0000_0000`). `phys` must be
+    /// `virt` must be in the user half of the active paging mode (see
+    /// `docs/memory-model.md` § Virtual Address Space Layout). `phys` must be
     /// a valid 4 KiB-aligned physical address.
     #[cfg(not(test))]
     pub unsafe fn map_page(
@@ -589,7 +576,7 @@ impl AddressSpace
         // Intermediate page table frames are drawn from
         // `mm::kernel_pt_pool` (seeded once at Phase 7 with `POOL_SEED_PAGES`
         // from the pristine buddy). No buddy lock is taken on this path; the
-        // shootdown below is the only inter-CPU synchronisation cost.
+        // pool lock nests under `pt_lock` (see the module's Concurrency note).
         // SAFETY: contract passed to caller; root_virt is valid; virt is
         // in user range; phys is a valid 4 KiB-aligned physical address.
         let Ok(outcome) = (unsafe { map_user_page(self.root_virt, virt, phys, flags) })
@@ -686,6 +673,10 @@ impl AddressSpace
     /// # Safety
     /// `segment` must be a valid, bootloader-provided `InitSegment`.
     #[cfg(not(test))]
+    // cast_possible_truncation: the u64→usize in-page offset (at most 0xFFF) and
+    // segment size (an init ELF segment, bounded by the user address-space size)
+    // feed the page-count arithmetic.
+    #[allow(clippy::cast_possible_truncation)]
     pub unsafe fn map_segment(&self, segment: &InitSegment) -> Result<(), ()>
     {
         let flags = match segment.flags
@@ -785,8 +776,10 @@ impl AddressSpace
     ///
     /// Drives `SYS_MEM_UNMAP` with `MEM_UNMAP_RECLAIM_PTS` (memmgr region
     /// teardown). Unlike the per-page [`unmap_page`](Self::unmap_page), it tears
-    /// the whole span down under a single `pt_lock` hold and a single coarse TLB
-    /// + paging-structure-cache shootdown.
+    /// the whole span down under a single `pt_lock` hold and a single coarse
+    /// shootdown. Known defect (#443): on riscv64 a span at or under
+    /// `RANGE_FLUSH_CEILING_PAGES` is invalidated per VA only, which leaves
+    /// cached non-leaf entries for the freed intermediate tables in place.
     ///
     /// `aso` MUST wrap *this* `AddressSpace`; `sys_mem_unmap` enforces this by
     /// resolving both from the same capability.
@@ -823,24 +816,23 @@ impl AddressSpace
         // (the per-VA `unmap_page` drops the lock first for throughput; here it
         // must stay held). A freed PT frame is poppable only via `alloc_pt_page`,
         // which runs under THIS `pt_lock`, so no other CPU reuses a just-freed
-        // frame until we release — by then every CPU's TLB + paging-structure
-        // cache is clean. The contended `pt_lock` path enables interrupts while
-        // spinning, so a remote CPU waiting on this lock still services and acks
-        // our IPI: no deadlock.
-        // INV-3 Dekker A-side: bump tlb_gen and fence BEFORE snapshotting
-        // active_cpus (the same order as `shootdown_remote`). This guarantees
-        // that for any CPU caching this space, either it is in the snapshot
-        // below (gets the IPI) or it observes the bumped tlb_gen on its next
-        // reactivation (flushes the tag then). Snapshotting first would leave a
-        // CPU that activates concurrently in neither cover. The same argument
-        // covers both invalidation shapes below: spans at or under
-        // RANGE_FLUSH_CEILING_PAGES issue an untagged per-page range flush
-        // (batched: riscv64 Svinval bracket), larger spans a full flush. The
-        // untagged range is as correct as the untagged full flush — a remote
-        // target still has this space's tag loaded, and per-VA invalidation
-        // covers the paging-structure caches for the freed intermediate frames
-        // on both architectures (invlpg / sfence-family VA forms invalidate
-        // non-leaf entries for that VA too).
+        // frame until we release. A full flush, and on x86-64 a per-VA invlpg,
+        // also clears paging-structure-cache entries; the riscv64 per-VA range
+        // below does not (see the defect note that follows). The contended
+        // `pt_lock` path enables interrupts while spinning, so a remote CPU
+        // waiting on this lock still services and acks our IPI: no deadlock.
+        // Initiator side of the tlb_gen / active_cpus Dekker exclusion (see
+        // core/kernel/docs/memory-internals.md § SMP TLB Shootdown): bump tlb_gen
+        // and fence BEFORE snapshotting active_cpus, the same order as
+        // `shootdown_remote`; snapshotting first would leave a CPU that
+        // activates concurrently in neither cover. Spans at or under
+        // `RANGE_FLUSH_CEILING_PAGES` issue an untagged per-page range flush
+        // (batched: riscv64 Svinval bracket), larger spans a full flush.
+        // Known defect (#443): on riscv64 the per-VA form
+        // (`sinval.vma va, zero`) invalidates only cached leaf entries, so a
+        // hart can keep a cached non-leaf entry naming an intermediate table
+        // frame freed above after `pt_lock` is released and the frame is
+        // reused; x86-64 invlpg does clear the paging-structure caches.
         if crate::mm::tag_allocator::tagging_enabled()
         {
             self.tlb_gen.fetch_add(1, Ordering::Release);
@@ -860,8 +852,8 @@ impl AddressSpace
                     inval_batch_begin, inval_batch_end, inval_page,
                 };
                 // SAFETY: ring 0 / S-mode; per-VA invalidations bracketed by
-                // the batch window; clears TLB + PS-cache entries for every
-                // VA in the span.
+                // the batch window; clears the TLB entries for every VA in the
+                // span (riscv64: leaf entries only; see the #443 note above).
                 unsafe {
                     inval_batch_begin();
                     for i in 0..page_count
@@ -885,8 +877,8 @@ impl AddressSpace
             {
                 // SAFETY: root_phys is a valid root; remote excludes current;
                 // preempt is held and pt_lock no-pop invariant holds; tag 0 is
-                // the untagged path (see the INV-3 block above for why that is
-                // sufficient here).
+                // the untagged path (riscv64 targets clear leaf entries only;
+                // see the #443 note above).
                 unsafe {
                     crate::mm::tlb_shootdown::shootdown_range(
                         self.root_phys,
@@ -918,7 +910,9 @@ impl AddressSpace
     ///
     /// Returns `Err(PagingError::NotMapped)` if `virt` is not mapped.
     /// Caller is responsible for W^X and rights validation before calling.
-    /// Invalidates TLB entries on all CPUs where this address space is active.
+    /// Flushes the local TLB; a permission narrow also shoots down every other
+    /// CPU where this address space is active, while a widen skips the remote
+    /// shootdown (`core/kernel/docs/memory-internals.md` § SMP TLB Shootdown).
     ///
     /// # Safety
     /// `virt` must be in the user half and currently mapped.
@@ -998,8 +992,9 @@ impl AddressSpace
     ///
     /// The caller (scheduler / first user entry) MUST have marked this CPU
     /// active on this space (`mark_active_on_cpu`) before calling, both so the
-    /// space cannot be selected as its own eviction victim and so the INV-3
-    /// fence below has an active-bit store to order against.
+    /// space cannot be selected as its own eviction victim and so the Dekker
+    /// fence below has an active-bit store to order against (see
+    /// `core/kernel/docs/memory-internals.md` § Context Switch TLB Handling).
     ///
     /// # Safety
     /// Must be called at ring 0 / S-mode. After this call, all virtual
@@ -1019,12 +1014,14 @@ impl AddressSpace
             return;
         }
 
-        // INV-3: the scheduler published this CPU's active bit (Release) before
-        // calling. This fence orders that store before the tag/generation reads
-        // below, forming the B-side of the unmap and eviction Dekker exclusions
-        // (paired with the SeqCst fences in `unmap_page`/`protect_page` and in
-        // `tag_allocator::claim`'s eviction). Without it a CPU could miss an
-        // unmap that did not IPI it and later run a stale tagged translation.
+        // The scheduler published this CPU's active bit (Release) before calling.
+        // This fence orders that store before the tag/generation reads below,
+        // forming the activate side of the unmap and eviction Dekker exclusions
+        // (paired with the SeqCst fences in `shootdown_remote`,
+        // `unmap_region_pooled`, and `tag_allocator::claim`'s eviction; see
+        // core/kernel/docs/memory-internals.md § SMP TLB Shootdown). Without it a
+        // CPU could miss an unmap that did not IPI it and later run a stale
+        // tagged translation.
         core::sync::atomic::fence(Ordering::SeqCst);
 
         let mut tag = self.tag.load(Ordering::Acquire);

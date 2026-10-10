@@ -222,9 +222,10 @@ port range (see
 `REGISTRY_QUERY_AUTHORITY` holder, not only pwrmgr
 ([#446](https://github.com/kottlerg/seraph/issues/446)).
 
-Revoking an IoPort capability removes port access from all threads it has
-been bound to; the kernel tracks bindings and updates each affected thread's IOPB
-in the TSS on revocation (design intent; not yet implemented — `SYS_IOPORT_BIND`
+Revoking an IoPort capability is intended to remove port access from every thread
+bound through its descendants (the revoked capability itself is preserved, per
+[Revocation](#revocation)); the kernel tracking bindings and updating each affected
+thread's IOPB in the TSS on revocation is design intent (not yet implemented — `SYS_IOPORT_BIND`
 records no binding and revocation does not withdraw bound IOPB access, #457).
 
 ### SbiControl (RISC-V only)
@@ -723,6 +724,7 @@ The kernel does not provide:
 ## Summarized By
 
 [abi/process-abi/README.md](../abi/process-abi/README.md),
+[Firmware Parsing](../core/boot/docs/firmware-parsing.md),
 [Capability Subsystem Internals](../core/kernel/docs/capability-internals.md),
 [Kernel Initialization Sequence](../core/kernel/docs/initialization.md),
 [Scheduler Internals](../core/kernel/docs/scheduler.md),

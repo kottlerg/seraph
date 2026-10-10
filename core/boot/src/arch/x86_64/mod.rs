@@ -37,8 +37,8 @@ pub const EXPECTED_ELF_MACHINE: u16 = EM_X86_64;
 
 /// Reserve a 4 KiB page for the AP startup trampoline.
 ///
-/// On x86-64 the SIPI vector encodes the real-mode start address in
-/// bits `[19:12]` of the IPI ICR, so the page MUST live below 1 MiB.
+/// On x86-64 the 8-bit SIPI vector (ICR[7:0]) supplies bits `[19:12]` of
+/// the real-mode start address, so the page MUST live below 1 MiB.
 /// Returns `None` if no qualifying page can be reserved; the kernel's
 /// response is in `core/kernel/docs/initialization.md` § Phase 8.
 ///
@@ -50,7 +50,8 @@ pub unsafe fn allocate_ap_trampoline(bs: *mut EfiBootServices) -> Option<u64>
     unsafe { allocate_pages_max_addr(bs, 0xFFFFF, 1).ok() }
 }
 
-/// No-op on x86-64: the UART is already initialized by the serial module.
+/// No-op on x86-64: COM1 sits at the fixed I/O port `0x3F8`, so there is no
+/// UART base to discover before `serial_init`.
 ///
 /// # Safety
 /// `_st` is unused; the function is safe to call at any point.
@@ -120,8 +121,8 @@ pub unsafe fn discover_boot_hart_id(_st: *mut EfiSystemTable) -> u64
 /// codegen modes, so it is preserved with a push/pop pair. `nostack` is
 /// intentionally absent: the push/pop has net-zero RSP delta but
 /// transiently writes [RSP-8], latent only because the bootloader target
-/// is `x86_64-unknown-uefi` (MS x64 ABI, no red zone). Mirrors the
-/// kernel-side `cpu::cpuid` discipline.
+/// is `x86_64-unknown-uefi` (MS x64 ABI, no red zone). The kernel-side
+/// `cpu::cpuid` instead uses the `core::arch::x86_64::__cpuid_count` intrinsic.
 #[cfg(not(test))]
 fn cpuid(leaf: u32, subleaf: u32) -> (u32, u32, u32, u32)
 {
@@ -172,6 +173,7 @@ pub fn bsp_hardware_id(_boot_hart_id: u64) -> u32
     (ebx >> 24) & 0xFF
 }
 
+/// Host-test stand-in for the CPUID path; returns a fixed BSP id of 0.
 #[cfg(test)]
 pub fn bsp_hardware_id(_boot_hart_id: u64) -> u32
 {
@@ -207,6 +209,7 @@ pub fn max_phys_addr_bits() -> u8
     if bits == 0 { 36 } else { bits }
 }
 
+/// Host-test stand-in for the CPUID path; returns the common 48-bit MAXPHYADDR.
 #[cfg(test)]
 pub fn max_phys_addr_bits() -> u8
 {

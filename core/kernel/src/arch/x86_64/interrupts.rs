@@ -6,14 +6,18 @@
 //! x86-64 interrupt controller (xAPIC / x2APIC) and Phase 5 interrupt
 //! initialisation.
 //!
-//! Orchestrates GDT, IDT, SMEP/SMAP, and the local APIC in the correct order:
+//! Orchestrates SMEP/SMAP, XSAVE, GDT, IDT, the local APIC, and the I/O APIC in this order
+//! (numbers match the inline step comments in [`init`]):
 //!
 //! 1. Enable SMEP + SMAP (fatal if CPU lacks support).
+//!    1a. Enable XSAVE and set CR0.TS for lazy FPU/SIMD restore.
 //! 2. Carve IST stacks (2 × 8 KiB) out of the [`BSP_IST_STACKS`] BSS array.
 //! 3. Load GDT + TSS with the IST stack pointers.
 //! 4. Load IDT.
+//!    4a. Switch to x2APIC mode when CPUID.01H:ECX[21] advertises it.
 //! 5. Software-enable the local APIC: set SVR bit 8, spurious vector 255.
 //! 6. Mask all LVT entries.
+//! 7. Initialise the I/O APICs (`ioapic::init`): read pin counts, mask every entry.
 //!
 //! Interrupts are **not** enabled here; `timer::init()` enables them after the
 //! APIC timer is calibrated and configured.
@@ -32,8 +36,11 @@
 //!   (separate hardware) is unaffected and stays MMIO.
 //!
 //! # Modification notes
-//! - To handle a new device IRQ: call `register_handler(vec, handler)` and
-//!   call `unmask(vec)`. Full routing is deferred to a later phase.
+//! - Device IRQs are routed generically: `SYS_IRQ_REGISTER` (`syscall::hw::sys_irq_register`)
+//!   records the Notification via `irq::register` and calls [`route_device_irq`], which installs
+//!   the I/O APIC entry masked; `SYS_IRQ_ACK` (`syscall::hw::sys_irq_ack`) calls [`unmask`].
+//!   Only GSIs 0-22 (vectors 33-55) have IDT stubs; serving a higher GSI needs a
+//!   `device_irq_stub!` entry and a wider device arm in `idt::irq_dispatch`.
 
 // cast_possible_truncation: u64→usize/u8 APIC address arithmetic; bounded by APIC layout.
 // cast_lossless: u8→u32 vector casts are always widening.
@@ -70,8 +77,8 @@ const IST_STACK_SIZE: usize = 8192;
 
 /// BSP IST stacks, in BSS. The BSP installs these at Phase-5 init.
 ///
-/// Two stacks: IST1 for double-fault, IST2 for NMI. AP IST stacks live in
-/// [`crate::arch::x86_64::ap_trampoline::AP_IST_STACKS`].
+/// Two stacks: IST1 for double-fault, IST2 for NMI. AP IST stacks live in the per-CPU slab
+/// allocated by [`crate::arch::x86_64::ap_trampoline::init_ap_ist_storage`].
 ///
 /// `static mut` is written only at single-threaded boot init.
 #[cfg(not(test))]
@@ -259,7 +266,7 @@ pub unsafe fn init()
 
     // 6. Mask all LVT entries to prevent unexpected interrupts before the
     //    timer is configured.
-    // SAFETY: Local APIC MMIO base is valid kernel mapping; LVT mask writes are architecture-defined.
+    // SAFETY: direct map / x2APIC MSRs active; LVT mask writes are architecture-defined.
     unsafe {
         apic_write(APIC_LVT_TIMER, LVT_MASK);
         apic_write(APIC_LVT_LINT0, LVT_MASK);
@@ -283,9 +290,6 @@ pub unsafe fn init() {}
 
 // ── APIC ID and ICR ───────────────────────────────────────────────────────────
 
-/// Local APIC ID register offset.
-#[allow(dead_code)] // Used by lapic_id(), which is part of the arch interface for future SMP use.
-const APIC_ID: usize = 0x20;
 /// Interrupt Command Register low word (bits 31:0).
 const APIC_ICR_LOW: usize = 0x300;
 /// Interrupt Command Register high word (bits 63:32).
@@ -304,24 +308,18 @@ pub const IPI_VECTOR_TLB_SHOOTDOWN: u8 = 250;
 /// IPI vector for waking idle CPUs.
 pub const IPI_VECTOR_WAKEUP: u8 = 251;
 
-/// Per-CPU "dump backtrace from your NMI handler" request flag, set by the
-/// synchronous-IPI watchdog before raising a vector-2 NMI at the stuck
-/// target CPU. The target's NMI handler reads it, dumps the saved
-/// `TrapFrame` to serial, and clears the flag. A hardware NMI with
-/// the flag clear falls through to the existing fatal path.
-///
-/// Single-bit publication, no caller-side ordering beyond Release/Acquire
-/// (the NMI itself is a serialising event for the target).
-/// Base pointer for the per-CPU `[AtomicBool; cpu_count]` request slab,
-/// allocated by [`init_nmi_backtrace_storage`] before AP bringup. Sized to
-/// `cpu_count` rather than `MAX_CPUS` so it scales with the CPU count.
+/// Base pointer for the per-CPU `[AtomicBool; cpu_count]` NMI-backtrace request slab,
+/// allocated by [`init_nmi_backtrace_storage`] before AP bringup and read through
+/// [`nmi_backtrace_request`]. Sized to `cpu_count` rather than `MAX_CPUS`. The flag
+/// protocol is specified in core/kernel/docs/scheduling-internals.md
+/// § `ipi_nmi_backtrace_stub` / `ipi_nmi_backtrace_handler`.
 #[cfg(not(test))]
 static NMI_BACKTRACE_PTR: core::sync::atomic::AtomicPtr<core::sync::atomic::AtomicBool> =
     core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
 
 /// Allocate the per-CPU NMI-backtrace request slab sized to `cpu_count`,
-/// zero-filled (each `AtomicBool` starts `false`). Called from
-/// `sched::init_per_cpu_storage` before AP bringup.
+/// zero-filled (each `AtomicBool` starts `false`). Called from [`super::init_ap_percpu_storage`]
+/// (reached from `sched::init_per_cpu_storage` in Phase 4), before AP bringup.
 #[cfg(not(test))]
 pub fn init_nmi_backtrace_storage(cpu_count: usize, allocator: &mut crate::mm::BuddyAllocator)
 {
@@ -358,25 +356,6 @@ pub fn nmi_backtrace_request(cpu: usize) -> Option<&'static core::sync::atomic::
 /// level=assert, trigger=edge, `dest_shorthand`=none, vector=0/ignored).
 const ICR_NMI: u32 = 0x0000_4400;
 
-/// Read this CPU's local APIC ID.
-///
-/// xAPIC packs the 8-bit ID in bits [31:24] of the APIC ID register; x2APIC
-/// exposes the full 32-bit ID with no shift.
-#[allow(dead_code)] // Part of the arch interface; will be used by future SMP topology code.
-#[cfg(not(test))]
-pub fn lapic_id() -> u32
-{
-    let raw = apic_read(APIC_ID);
-    if x2apic_enabled() { raw } else { raw >> 24 }
-}
-
-/// No-op test stub.
-#[cfg(test)]
-pub fn lapic_id() -> u32
-{
-    0
-}
-
 /// Issue one ICR command targeting hardware APIC ID `dest`.
 ///
 /// xAPIC mode writes `ICR_HIGH` (destination) then `ICR_LOW` (command); x2APIC
@@ -409,14 +388,9 @@ unsafe fn apic_send_icr(dest: u32, cmd: u32)
     }
 }
 
-/// Spin until the ICR delivery status bit clears (IPI accepted by hardware).
-///
-/// The bit clears within microseconds on a healthy LAPIC; 1M iterations
-/// is far beyond any architectural timing. Exhaustion indicates a
-/// hardware-level fault (stuck APIC, emulator bug) rather than a
-/// schedulable race, so we fatal rather than return a status no caller
-/// could act on. x2APIC has no delivery-status bit (the ICR
-/// MSR write is not pipelined), so the wait is skipped in that mode.
+/// Spin until the ICR delivery status bit clears (IPI accepted by hardware); a no-op in x2APIC
+/// mode, which has no delivery-status bit. Iteration bound and fatal policy:
+/// core/kernel/docs/scheduling-internals.md § `wait_icr_idle` discipline.
 #[cfg(not(test))]
 unsafe fn wait_icr_idle()
 {
@@ -471,8 +445,6 @@ unsafe fn send_sipi(target_apic_id: u32, vector: u8)
 /// # Safety
 /// - `target_apic_id` must be a valid APIC ID of an online CPU
 /// - Caller must ensure the TLB shootdown protocol state is set up correctly
-// Used by TLB shootdown implementation.
-#[allow(dead_code)]
 #[cfg(not(test))]
 pub unsafe fn send_tlb_shootdown_ipi(target_apic_id: u32)
 {
@@ -506,11 +478,9 @@ pub unsafe fn send_wakeup_ipi(target_apic_id: u32)
     }
 }
 
-/// Send an NMI (vector 2) to a target CPU. Used by the synchronous-IPI
-/// watchdog at Phase C to coax a backtrace dump from a CPU that has not
-/// acknowledged a sync IPI. The receiver's vector-2 handler consults
-/// the per-CPU `nmi_backtrace_request` flag to distinguish a watchdog ping
-/// from a real hardware NMI.
+/// Send an NMI (vector 2) to a target CPU. Used by the synchronous-IPI watchdog's Phase C
+/// (core/kernel/docs/scheduling-internals.md § IPI Watchdog Ladder and
+/// § `ipi_nmi_backtrace_stub` / `ipi_nmi_backtrace_handler`).
 ///
 /// # Safety
 /// `target_apic_id` must be a valid APIC ID of an online CPU.
@@ -527,14 +497,9 @@ pub unsafe fn send_nmi_to(target_apic_id: u32)
 
 // ── Synchronous-IPI watchdog ──────────────────────────────────────────────────
 
-/// Context passed to [`wait_for_ack`] by every synchronous IPI sender.
-///
-/// `op_name` and `target_cpu` are diagnostic-only (printed in the
-/// watchdog dump and panic message). `resend` is called once at Phase B
-/// to re-emit the IPI to whichever targets are still unacked; for a
-/// broadcast operation like TLB shootdown the closure should fan out to
-/// every CPU whose acknowledgement bit is still set, not the full
-/// original mask.
+/// Context passed to [`wait_for_ack`] by every synchronous IPI sender: `op_name` and
+/// `target_cpu` are diagnostic, `resend` re-emits the IPI at Phase B. Field semantics are
+/// specified in core/kernel/docs/scheduling-internals.md § IPI Watchdog Ladder.
 pub struct IpiWaitCtx<'a>
 {
     pub op_name: &'static str,
@@ -542,25 +507,13 @@ pub struct IpiWaitCtx<'a>
     pub resend: &'a dyn Fn(),
 }
 
-/// TSC-bounded synchronous-IPI ack wait with re-send and NMI-backtrace
-/// escalation. Phases (wall-clock via `timer::elapsed_us`):
-/// - **A** (0 → ~250 ms): spin while `cond()` reports unacked.
-/// - **B** (250 ms → ~750 ms): at the boundary, call `ctx.resend()` once,
-///   then continue spinning. Recovers from a dropped IPI under
-///   emulators with non-deterministic LAPIC delivery.
-/// - **C** (750 ms → ~5 s): at the boundary, set
-///   the `nmi_backtrace_request` flag for `ctx.target_cpu` and send a vector-2
-///   NMI to that CPU. The receiver's handler dumps its
-///   `TrapFrame` to serial so a subsequent panic is diagnosable.
-/// - **D** (>5 s): print the context and fatal.
+/// TSC-bounded synchronous-IPI ack wait with re-send and NMI-backtrace escalation. The phase
+/// ladder (A-D) is specified in core/kernel/docs/scheduling-internals.md § IPI Watchdog Ladder.
 ///
 /// # Safety
-/// Must be called at ring 0 with preemption disabled and `IF=1` — the
-/// same envelope `mm::tlb_shootdown::shootdown` establishes. The caller
-/// is responsible for the surrounding interrupt-state save / restore.
-///
-/// `cond` MUST be free of side effects beyond the atomic loads needed
-/// to inspect the pending state; it is invoked many times per spin.
+/// Ring 0, inside the call envelope (preemption disabled, `IF=1`, side-effect-free `cond`) that
+/// core/kernel/docs/scheduling-internals.md § IPI Watchdog Ladder specifies; the caller saves
+/// and restores the surrounding interrupt state.
 #[cfg(not(test))]
 pub unsafe fn wait_for_ack(mut cond: impl FnMut() -> bool, ctx: &IpiWaitCtx<'_>)
 {
@@ -689,7 +642,9 @@ pub unsafe fn init_ap() {}
 /// Disable interrupts and return the previous IF state.
 ///
 /// Returns `true` if interrupts were enabled before the call.
-#[allow(dead_code)] // Required by arch interface: kernel/docs/arch-interface.md
+// dead_code: required by the arch interface (core/kernel/docs/arch-interface.md § `interrupts`);
+// no in-tree caller.
+#[allow(dead_code)]
 pub fn disable() -> bool
 {
     let rflags: u64;
@@ -724,7 +679,8 @@ pub unsafe fn enable()
 }
 
 /// Return `true` if the interrupt flag (IF) is set in RFLAGS.
-#[allow(dead_code)] // Required by arch interface: kernel/docs/arch-interface.md
+// dead_code: sole caller sched::check_lock_hold_preemptible is cfg(not(test)); dead in host tests.
+#[cfg_attr(test, allow(dead_code))]
 pub fn are_enabled() -> bool
 {
     let rflags: u64;
@@ -758,10 +714,8 @@ pub fn acknowledge(_irq: u32)
 #[cfg(test)]
 pub fn acknowledge(_irq: u32) {}
 
-/// Mask (disable delivery of) GSI `irq` at the I/O APIC.
-///
-/// # Safety
-/// Must be called after Phase 5 init (IOAPIC initialised).
+/// Mask (disable delivery of) GSI `irq` at the I/O APIC; a no-op for a GSI no
+/// discovered I/O APIC owns, including every GSI before Phase 5 init.
 #[cfg(not(test))]
 pub fn mask(irq: u32)
 {
@@ -773,14 +727,11 @@ pub fn mask(irq: u32)
 #[cfg(test)]
 pub fn mask(_irq: u32) {}
 
-/// Unmask (enable delivery of) GSI `irq` at the I/O APIC.
-///
-/// Call after `SYS_IRQ_REGISTER` routes the GSI and after `SYS_IRQ_ACK`
-/// re-enables delivery following interrupt handling.
-///
-/// # Safety
-/// Must be called after Phase 5 init and after the GSI has been routed
-/// via [`ioapic::route`].
+/// Unmask (enable delivery of) GSI `irq` at the I/O APIC. Called by `SYS_IRQ_ACK`
+/// (`syscall::hw::sys_irq_ack`) to re-enable delivery after the driver has serviced the
+/// interrupt. The GSI is expected to have been routed by [`route_device_irq`]
+/// (`SYS_IRQ_REGISTER`); `sys_irq_ack` does not check this, and an unrouted entry still holds
+/// the vector-0 value [`super::ioapic::init`] programmed.
 #[cfg(not(test))]
 pub fn unmask(irq: u32)
 {
@@ -796,10 +747,17 @@ pub fn unmask(_irq: u32) {}
 /// masked at the I/O APIC. The driver unmasks via `SYS_IRQ_ACK` once it has
 /// registered a handler.
 ///
+/// Known defect (#443): neither this function nor `sys_irq_register` checks
+/// `irq` against the stubbed range. Only GSIs 0-22 (vectors 33-55) have IDT
+/// gates; GSIs 23-216 and 219-221 route to vectors with no gate, GSIs 217, 218
+/// and 222 land on the TLB-shootdown, wakeup and spurious vectors, and from GSI
+/// 223 the `u8` add overflows (a panic in debug builds; in release builds GSIs
+/// 223-254 wrap to exception vectors 0-31 and GSI 255 to the timer vector 32).
+///
 /// # Safety
 /// Must be called after Phase 5 init (IOAPIC initialised) with a valid GSI.
-// cast_possible_truncation: device GSIs are < 256, so the u32→u8 narrowing of
-// the vector offset is exact.
+// cast_possible_truncation: a GSI is < 256 (`ROOT_IRQ_COUNT`), so `irq as u8` is exact; the
+// vector add that follows is unchecked (#443, see above).
 #[allow(clippy::cast_possible_truncation)]
 #[cfg(not(test))]
 pub unsafe fn route_device_irq(irq: u32)

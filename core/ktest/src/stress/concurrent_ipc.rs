@@ -94,8 +94,9 @@ pub fn run(ctx: &TestContext) -> TestResult
             let msg = unsafe { ipc::ipc_recv(ep, ctx.ipc_buf) }
                 .map_err(|_| "concurrent_ipc: ipc_recv failed")?;
             let idx = msg.label;
-            // cast_possible_truncation: idx is bounded by NUM_CALLERS which
-            // fits in usize on every target ktest supports.
+            // cast_possible_truncation: usize is 64 bits on every ktest target
+            // (x86_64, riscv64), so the u64 label widens losslessly; the range
+            // check follows.
             #[allow(clippy::cast_possible_truncation)]
             let idx_us = idx as usize;
             if idx == 0 || idx_us > NUM_CALLERS

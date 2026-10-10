@@ -15,7 +15,7 @@
 //! `KernelMmio::timebase_freq`. Sstc support, likewise discovered per hart,
 //! is carried in `KernelMmio::hart_caps`. [`init`] refuses to boot when
 //! either is missing: Sstc is RVA23-mandated and classified Required by
-//! [platform-requirements.md](../../../../docs/platform-requirements.md),
+//! [platform-requirements.md](../../../../../docs/platform-requirements.md),
 //! and there is no compiled-in timebase fallback.
 
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -25,14 +25,15 @@ use super::interrupts;
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 /// `stimecmp` CSR number (Sstc extension). Written by CSR number because the
-/// kernel's target feature set (`+m,+a,+c`) does not enable the Sstc
-/// mnemonics in the assembler.
+/// kernel's target feature set (`xtask/targets/riscv64imac-seraph-none.json`) does
+/// not include Sstc, so the assembler lacks the Sstc mnemonics.
 #[cfg(not(test))]
 const CSR_STIMECMP: u16 = 0x14D;
 
 // ── Tick state ────────────────────────────────────────────────────────────────
 
-/// Number of timer ticks per period; returned by [`ticks_per_second`].
+/// Scheduler ticks (timer periods) per second, `1_000_000 / period_us`;
+/// returned by [`ticks_per_second`].
 static TICKS_PER_SEC: AtomicU64 = AtomicU64::new(0);
 
 /// Ticks per period (stored to rearm the timer on each interrupt).
@@ -119,7 +120,8 @@ fn ticks_to_us(ticks: u64, freq: u64) -> u64
 /// supervisor interrupts (`sstatus.SIE`). Refuses to boot — with a
 /// diagnostic — on hardware without Sstc or without a discovered timebase,
 /// per the subsystem-gate policy in
-/// [platform-requirements.md](../../../../docs/platform-requirements.md).
+/// [platform-requirements.md](../../../../../docs/platform-requirements.md)
+/// § Boot-Time Feature Gate.
 ///
 /// Must be called after `interrupts::init()` and after
 /// `platform::capture_kernel_mmio()`.
@@ -237,7 +239,6 @@ pub fn handle_tick()
 /// Derived from the `time` CSR so that sleep deadlines and userspace
 /// `Instant::now()` (which reads `elapsed_us` via `SYS_SYSTEM_INFO`) share
 /// a single counter. Returns `0` if `init()` has not yet been called.
-#[allow(dead_code)] // Required by arch interface: kernel/docs/arch-interface.md
 #[cfg(not(test))]
 pub fn current_tick() -> u64
 {
@@ -262,7 +263,6 @@ pub fn current_tick() -> u64
 }
 
 /// Return the configured number of ticks per second.
-#[allow(dead_code)] // Required by arch interface: kernel/docs/arch-interface.md
 pub fn ticks_per_second() -> u64
 {
     TICKS_PER_SEC.load(Ordering::Relaxed)
@@ -289,7 +289,9 @@ pub fn elapsed_us() -> Option<u64>
 ///
 /// Requires [`init`] to have run (the discovered timebase converts µs to
 /// ticks); there is no pre-init fallback because no pre-init caller exists.
-#[allow(dead_code)] // Required by arch interface: kernel/docs/arch-interface.md
+// Required by the arch interface (core/kernel/docs/arch-interface.md § `timer`);
+// no riscv64 caller exists.
+#[allow(dead_code)]
 #[cfg(not(test))]
 pub fn delay_us(us: u64)
 {
@@ -303,7 +305,8 @@ pub fn delay_us(us: u64)
 }
 
 /// No-op test stub.
-#[allow(dead_code)] // Required by arch interface: kernel/docs/arch-interface.md
+// Test stub of an arch-interface item (core/kernel/docs/arch-interface.md § `timer`).
+#[allow(dead_code)]
 #[cfg(test)]
 pub fn delay_us(_us: u64) {}
 

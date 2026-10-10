@@ -19,7 +19,7 @@
 /// Kernel-mode callee-saved register state for one thread.
 ///
 /// On each context switch only this minimal set is saved/restored (see
-/// `docs/scheduler.md` — "What Gets Saved and Restored"). Caller-saved
+/// `core/kernel/docs/scheduler.md` § What Gets Saved and Restored). Caller-saved
 /// registers are the calling code's responsibility per the System V AMD64 ABI.
 ///
 /// ## Field offsets (used by assembly in `switch`)
@@ -108,20 +108,17 @@ pub fn align_initial_stack(sp: u64) -> u64
 ///
 /// `entry`     — virtual address of the thread's entry function.
 /// `stack_top` — top of the thread's kernel stack (RSP starts here).
-/// `arg`       — first argument; stashed in `rbx` (delivered to entry by
-///               the switch stub when the thread first runs).
+/// `arg`       — first argument; stashed in `rbx`. `switch` only restores `rbx`;
+///               `sched::enter` reads it back via [`SavedState::user_arg`] for
+///               init, and the idle entry ignores it.
 /// `is_user`   — selects the initial RFLAGS (interrupt-enable) for the first
 ///               dispatch; see below.
 pub fn new_state(entry: u64, stack_top: u64, arg: u64, is_user: bool) -> SavedState
 {
-    // A user thread's first dispatch runs `user_thread_trampoline` →
-    // `return_to_user` in ring 0; its `iretq` restores the user RFLAGS (IF=1,
-    // set by `init_user` = 0x202) from the TrapFrame. The kernel-side
-    // trampoline itself MUST run with IF=0: with IF=1 a timer can preempt the
-    // half-built trampoline frame deep on the kstack, and the convoluted
-    // resume path corrupts a return address → kernel `#PF` at RIP=0 (#160).
-    // RISC-V already runs this trampoline with SIE masked; this matches it.
-    // Kernel threads (idle) have no trampoline and need IF=1 to wake from `hlt`.
+    // User threads start with IF=0 (0x002) so the first-dispatch trampoline runs
+    // interrupts-masked; kernel threads (idle) start with IF=1 (0x200) to wake from
+    // `hlt`. See core/kernel/docs/scheduling-internals.md § Cross-CPU TCB Ownership
+    // (first-dispatch trampoline, #160).
     let rflags = if is_user { 0x002 } else { 0x200 };
     SavedState {
         rip: entry,
@@ -144,12 +141,10 @@ pub fn new_state(entry: u64, stack_top: u64, arg: u64, is_user: bool) -> SavedSt
 /// Both pointers must be valid, aligned `SavedState` values. The caller
 /// must have already released the scheduler lock (`schedule()` calls
 /// `sched.lock.release_lock_only()` before invoking `switch()`) and must
-/// have interrupts disabled. `save_flag` is written to `1` after every
-/// store into `*current` completes — it is the cross-CPU publication
-/// barrier for both remote dispatch (which loads `next.saved_state` after
-/// observing the flag) and `dealloc_object(Thread)` (which spins on it
-/// before `retype_free`). See `core/kernel/docs/scheduling-internals.md`
-/// § Cross-CPU TCB Ownership.
+/// have interrupts disabled. `save_flag` is the outgoing thread's `context_saved`;
+/// `switch` writes `1` to it after every store into `*current` completes (a null
+/// pointer skips the write). Its cross-CPU protocol is
+/// `core/kernel/docs/scheduling-internals.md` § Cross-CPU TCB Ownership.
 #[cfg(not(test))]
 #[unsafe(naked)]
 pub unsafe extern "C" fn switch(
@@ -194,24 +189,9 @@ pub unsafe extern "C" fn switch(
         "or  rax, rdx",
         "mov [rdi + 64], rax", // saved_state.fs_base
         // ── Restore next thread ───────────────────────────────────────────
-        // #117 ordering invariant: `context_saved = 1` AND `popfq` (which
-        // restores `next.rflags`, re-enabling IF if the next thread had
-        // IF=1) must BOTH happen AFTER `mov rsp, [rsi + 8]`. Doing either
-        // earlier opens a fatal window:
-        //   (a) `popfq` before the rsp swap re-enables interrupts while
-        //       this CPU is still on the OUTGOING thread's kernel stack,
-        //       so any trap taken here pushes its iretq frame to the
-        //       outgoing kstack.
-        //   (b) Publishing `current.context_saved = 1` before the rsp
-        //       swap makes the outgoing TCB visible to peer CPUs as
-        //       "safe to dispatch" while this CPU is still using its
-        //       kstack. A peer that dispatches `current` will execute
-        //       its own `mov rsp, [rsi + 8]` onto the same outgoing
-        //       kstack — two CPUs sharing a kstack.
-        // Together (a) and (b) let a peer overwrite the iretq frame the
-        // trap in (a) pushed, so iretq on this CPU returns to a wild RIP
-        // — observed in stress::concurrent_ipc as a kernel #PF at RIP=0.
-        // Keep the publication and `popfq` below the rsp swap.
+        // #117 ordering invariant: the `context_saved = 1` publication and `popfq` MUST
+        // both stay below the rsp swap (`mov rsp, [rsi + 8]`); see
+        // core/kernel/docs/scheduling-internals.md § Cross-CPU TCB Ownership.
         // Restore fs_base into IA32_FS_BASE before any register the wrmsr
         // clobbers (rcx/rdx/rax) is finalised for the jump.
         "mov rax, [rsi + 64]",
@@ -227,8 +207,8 @@ pub unsafe extern "C" fn switch(
         "mov rbx, [rsi + 16]",
         "mov rsp, [rsi + 8]", // restore stack pointer — now on next's kstack
         // Publish context_saved = 1 only AFTER the rsp swap (see ordering
-        // note above). The null check covers the boot path where
-        // save_flag is null (initial entry).
+        // note above). A null save_flag skips the publication; `schedule()`, the
+        // only caller, always passes a non-null flag.
         "test r11, r11",
         "jz 1f",
         "mov dword ptr [r11], 1", // *save_flag = 1
@@ -252,12 +232,10 @@ pub unsafe extern "C" fn switch(
 /// kernel stack from the corresponding `tf` fields, restores all GPRs, then
 /// executes `iretq`. Never returns.
 ///
-/// Call sequence for first user-mode entry:
-/// 1. Set TSS RSP0 to init's `kernel_stack_top` (via `gdt::set_rsp0`).
-/// 2. Set `SYSCALL_KERNEL_RSP` to init's `kernel_stack_top`.
-/// 3. Build a zeroed [`TrapFrame`] on init's kernel stack with the desired
-///    `rip`, `rsp` (user stack top), `cs`, `ss`, and `rflags`.
-/// 4. Call `return_to_user(tf_ptr)`.
+/// Called by `sched::user_thread_trampoline` on a user thread's first dispatch,
+/// on that thread's kernel stack after `schedule()` has activated its address
+/// space and set the kernel trap stack. Init's first entry goes through
+/// [`first_entry_to_user`] instead.
 ///
 /// # Safety
 /// `tf` must point to a valid [`TrapFrame`] on the kernel stack for the
@@ -267,26 +245,20 @@ pub unsafe extern "C" fn switch(
 pub unsafe extern "C" fn return_to_user(tf: *const super::trap_frame::TrapFrame) -> !
 {
     // rdi = tf (*const TrapFrame)
-    // TrapFrame field offsets (from trap_frame.rs):
+    // TrapFrame field offsets (core/kernel/src/arch/x86_64/trap_frame.rs `TrapFrame`):
     //   rax=0, rbx=8, rcx=16, rdx=24, rsi=32, rdi=40, rbp=48,
     //   r8=56, r9=64, r10=72, r11=80, r12=88, r13=96, r14=104, r15=112,
     //   rip=120, rflags=128, rsp=136, cs=144, ss=152, fs_base=160
     core::arch::naked_asm!(
-        // Switch RSP to just below the TrapFrame before building the iretq
-        // frame. This is necessary because:
-        //
-        // 1. The caller's RSP may point to the boot stack (identity-mapped in
-        //    the kernel's lower PML4 half, not copied into user address spaces).
-        //    After activate() switches CR3, that stack is inaccessible.
-        //
-        // 2. If RSP were near kernel_stack_top (above the TrapFrame), the five
-        //    pushes below would overwrite TrapFrame fields before they are read
-        //    (e.g., the CS field at kst-24 gets clobbered by the RSP push).
+        // Switch RSP to the TrapFrame base before building the iretq frame: if RSP
+        // were near kernel_stack_top (above the TrapFrame), the five pushes below
+        // would overwrite TrapFrame fields before they are read (e.g., the CS field
+        // at kst-24 gets clobbered by the RFLAGS push).
         //
         // Setting RSP = tf_ptr (= rdi) places the iretq frame at
         // [tf_ptr-40, tf_ptr-1], entirely below the TrapFrame, which is safe
         // because the TrapFrame occupies [tf_ptr, tf_ptr+167].
-        // tf_ptr is on init's kernel stack (direct map), accessible after CR3.
+        // tf_ptr is on the dispatched thread's kernel stack (direct map).
         "lea rsp, [rdi]",
         // Build the iretq frame on the current kernel stack.
         // iretq pops (low → high address): RIP, CS, RFLAGS, RSP, SS.
@@ -327,20 +299,18 @@ pub unsafe extern "C" fn return_to_user(tf: *const super::trap_frame::TrapFrame)
 /// time.
 ///
 /// Architecture-neutral entry point for `sched::enter`. The CR3 write happens
-/// inside the naked [`switch_and_enter_user`] because the boot stack (identity-
-/// mapped, PML4 0–255) vanishes after the switch, so `AddressSpace::activate`
-/// cannot run between the CR3 write and `iretq` — its `ret` would fault on the
-/// gone boot stack. Instead this does the tagged bookkeeping (claim a tag,
-/// record the per-CPU sync) in Rust here, on the still-mapped boot stack, then
-/// hands the composed CR3 value (root | PCID) to the naked switch. With tagging
+/// inside the naked [`switch_and_enter_user`], after RSP moves to init's
+/// direct-mapped kernel stack, so the iretq frame is built on that stack. This
+/// does the tagged bookkeeping (claim a tag, record the per-CPU sync) in Rust
+/// here, on the boot stack, then hands the composed CR3 value (root | PCID) to
+/// the naked switch. With tagging
 /// disabled it passes the bare root (a full-flush CR3 load).
 ///
 /// # Safety
 /// `aspace` must be a valid `AddressSpace` already marked active on this CPU.
 /// Otherwise the [`switch_and_enter_user`] contract: TSS RSP0 and
-/// `SYSCALL_KERNEL_RSP` must already be set to init's `kernel_stack_top`.
-///
-/// [`AddressSpace::activate`]: crate::mm::address_space::AddressSpace::activate
+/// `PerCpuData::kernel_rsp` (set via `syscall::set_kernel_rsp`) must already be
+/// set to init's `kernel_stack_top`.
 #[cfg(not(test))]
 pub unsafe fn first_entry_to_user(
     aspace: *const crate::mm::address_space::AddressSpace,
@@ -376,20 +346,19 @@ pub unsafe fn first_entry_to_user(
     };
 
     // SAFETY: cr3 is a valid CR3 value (PML4 root + optional PCID, bit 63 clear);
-    // tf satisfies switch_and_enter_user's contract; TSS RSP0 / SYSCALL_KERNEL_RSP set.
+    // tf satisfies switch_and_enter_user's contract; TSS RSP0 and
+    // PerCpuData::kernel_rsp are set (caller's contract).
     unsafe { switch_and_enter_user(cr3, tf) }
 }
 
 // ── switch_and_enter_user ─────────────────────────────────────────────────────
 
-/// Atomically switch page tables and enter user mode for the first time.
+/// Switch page tables and enter user mode for the first time.
 ///
-/// Performs the CR3 write and the boot-stack-to-kernel-stack switch as a
-/// single uninterruptible sequence so no Rust call/return occurs on the boot
-/// stack after CR3 is written. Doing these as separate Rust calls would cause
-/// a page fault when `activate()` tries to `ret` (the boot stack's identity
-/// mapping lives in PML4 entry 0–255, which is not copied into user address
-/// spaces).
+/// Moves RSP to init's direct-mapped kernel stack, writes CR3 (root plus any
+/// PCID composed by `first_entry_to_user`), and builds the `iretq` frame on
+/// that stack. The rebased boot stack also lies in the direct map, which every
+/// user address space shares, so the ordering is not needed to keep it mapped.
 ///
 /// # Parameters
 /// - `cr3` (rdi): the CR3 value to load — init's PML4 root, optionally OR'd with
@@ -403,8 +372,8 @@ pub unsafe fn first_entry_to_user(
 ///   `CR4.PCIDE` set.
 /// - `tf` must point to a `TrapFrame` on the direct-mapped init kernel stack,
 ///   with `rip`, `rsp`, `cs`, `ss`, and `rflags` set for user-mode entry.
-/// - TSS RSP0 and `SYSCALL_KERNEL_RSP` must be set to init's `kernel_stack_top`
-///   before this call.
+/// - TSS RSP0 and `PerCpuData::kernel_rsp` (set via `syscall::set_kernel_rsp`)
+///   must be set to init's `kernel_stack_top` before this call.
 #[cfg(not(test))]
 #[unsafe(naked)]
 pub unsafe extern "C" fn switch_and_enter_user(
@@ -413,18 +382,17 @@ pub unsafe extern "C" fn switch_and_enter_user(
 ) -> !
 {
     // rdi = cr3 value, rsi = tf (*const TrapFrame)
-    // TrapFrame field offsets (from trap_frame.rs):
+    // TrapFrame field offsets (core/kernel/src/arch/x86_64/trap_frame.rs `TrapFrame`):
     //   rax=0, rbx=8, rcx=16, rdx=24, rsi=32, rdi=40, rbp=48,
     //   r8=56, r9=64, r10=72, r11=80, r12=88, r13=96, r14=104, r15=112,
     //   rip=120, rflags=128, rsp=136, cs=144, ss=152, fs_base=160
     core::arch::naked_asm!(
-        // 1. Switch RSP to just below the TrapFrame on init's kernel stack.
-        //    Must happen BEFORE the CR3 write so the RSP is in the direct map
-        //    (accessible from init's page tables) when we next need the stack.
-        //    iretq frame (5 × 8 = 40 bytes) will sit at [rsi-40, rsi-1].
+        // 1. Switch RSP to just below the TrapFrame on init's kernel stack,
+        //    where the iretq frame (5 × 8 = 40 bytes) is built at [rsi-40, rsi-1].
+        //    The rebased boot stack is direct-mapped too, so this order does not
+        //    keep the stack mapped across the CR3 write.
         "mov rsp, rsi",
-        // 2. Switch page tables.  After this instruction the boot stack's
-        //    identity mapping is gone; RSP now points to the direct-mapped init
+        // 2. Switch page tables. RSP now points to the direct-mapped init
         //    kernel stack, which is covered by the copied kernel-upper entries.
         "mov cr3, rdi",
         // 3. Build iretq frame below TrapFrame (RSP = tf_ptr = rsi).

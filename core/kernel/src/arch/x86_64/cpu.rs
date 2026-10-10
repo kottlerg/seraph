@@ -3,18 +3,17 @@
 
 // core/kernel/src/arch/x86_64/cpu.rs
 
-//! x86-64 CPU control primitives.
+//! x86-64 CPU control primitives: CPUID, CR4 and MSR access, the fault-recoverable
+//! user-copy routine, SMEP/SMAP and PCID enablement, the boot-time baseline feature
+//! gate, per-CPU GS-base install and lookup, the kernel trap stack, and interrupt
+//! control and halt.
 //!
-//! # Phase 5 additions
-//! - `cpuid` — execute CPUID with a given leaf.
-//! - `read_cr4` / `write_cr4` — CR4 access.
-//! - `read_msr` / `write_msr` — MSR access.
-//! - `enable_smep_smap` — verify CPUID support and set CR4 bits 20+21.
-//! - `halt_until_interrupt` — `sti; hlt` (allows timer to fire).
-//! - `current_id` — return LAPIC ID from CPUID.01H.
-//!
-//! All privileged instructions are guarded with `#[cfg(not(test))]` so unit
-//! tests can run on the host without requiring kernel privilege.
+//! `current_stack_pointer`, the CR4/MSR accessors, `copy_user`, `user_copy_fixup`, the
+//! enable routines, `verify_baseline`, `install_percpu`, and the trap-stack and interrupt
+//! save/restore primitives are built only under `#[cfg(not(test))]` (`copy_user` and
+//! `verify_baseline` have host stubs). `cpuid`, `current_id`, `current_cpu` (which
+//! returns 0 under test), `halt_until_interrupt`, `disable_interrupts`, and `halt_loop`
+//! are also built for host tests.
 
 // ── CPUID ─────────────────────────────────────────────────────────────────────
 
@@ -127,7 +126,8 @@ pub unsafe fn write_msr(msr: u32, val: u64)
 // inside the copy redirects to `__copy_user_fixup` (which executes `clac` and
 // returns a non-zero sentinel) instead of panicking. See `crate::uaccess` for
 // the typed `copy_to_user`/`copy_from_user` wrappers and `idt::page_fault_handler`
-// for the fixup hook. The DF=0 ABI invariant makes `rep movsb` copy forward.
+// for the fixup hook. The DF=0 ABI invariant makes `rep movsb` copy forward;
+// syscall entry does not establish it (a known defect, #443; see `syscall.rs`).
 #[cfg(not(test))]
 core::arch::global_asm!(
     ".section .text.copy_user, \"ax\"",
@@ -221,9 +221,11 @@ pub fn user_copy_fixup(pc: u64) -> Option<u64>
 /// both.
 ///
 /// # Safety
-/// Must execute at ring 0. May only be called after the IDT is loaded so that
-/// a CR4 write fault is catchable (in practice both features are mandatory
-/// on the x86_64-v3 baseline this kernel targets).
+/// Must execute at ring 0. On the BSP it runs from `interrupts::init` before the
+/// IDT is loaded, so a CR4 write fault there is not catchable; on each AP
+/// (`interrupts::init_ap`) the IDT is already loaded. Both features are required by
+/// [platform-requirements.md](../../../../../docs/platform-requirements.md) § x86-64
+/// Classification and are checked by `verify_baseline` before this runs on the BSP.
 // similar_names: smep_present and smap_present are distinct CPU security features.
 #[cfg(not(test))]
 #[allow(clippy::similar_names)]
@@ -258,9 +260,10 @@ pub unsafe fn enable_smep_smap()
 /// single-address and single-context invalidation. Returns `true` if both
 /// features are present and `CR4.PCIDE` was set, `false` otherwise.
 ///
-/// Unlike [`enable_smep_smap`], absence is **not** fatal — tagging is an
-/// optimization, not a security requirement, and the kernel falls back to
-/// full-flush context switches.
+/// Unlike [`enable_smep_smap`], absence is **not** fatal: PCID/INVPCID are
+/// required but deliberately not gated
+/// ([platform-requirements.md](../../../../../docs/platform-requirements.md) § Boot-Time
+/// Feature Gate); without them the kernel uses full-flush context switches.
 ///
 /// Per Intel SDM Vol. 3A §4.10.1, `CR3[11:0]` must be 0 at the moment
 /// `CR4.PCIDE` is set to 1, or the `MOV CR4` `#GP`s. At the call site (Phase 5
@@ -310,13 +313,13 @@ pub unsafe fn enable_pcid() -> bool
 ///
 /// Checks the required CPUID-detectable features that every supported run
 /// environment provides (see
-/// [platform-requirements.md](../../../../docs/platform-requirements.md)) and
+/// [platform-requirements.md](../../../../../docs/platform-requirements.md)) and
 /// halts via [`crate::fatal`] naming the first missing feature, rather than
 /// faulting obscurely later. A few required features are deliberately excluded
-/// — see the note on the check table below. Also sets `CR0.WP`, without which
-/// ring-0 writes would bypass read-only page permissions and the kernel's own
-/// W^X would be unenforced on this CPU (UEFI may hand the BSP off with `CR0.WP`
-/// clear; the AP trampoline already sets it).
+/// — see the note on the check table below. Also sets `CR0.WP` (required per
+/// [platform-requirements.md](../../../../../docs/platform-requirements.md) § x86-64
+/// Classification); UEFI may hand the BSP off with `CR0.WP` clear, and the AP
+/// trampoline already sets it.
 ///
 /// # Safety
 /// Must execute at ring 0 during early boot, after the console is live so the
@@ -336,13 +339,8 @@ pub unsafe fn verify_baseline()
     let ext = cpuid(0x8000_0001); // ext.2 = ECX, ext.3 = EDX
 
     // (feature present, diagnostic). The kernel halts naming the first absent one.
-    //
-    // Some required platform features (see docs/platform-requirements.md) are
-    // deliberately not gated here because the emulator used for CI/dev (QEMU
-    // TCG) cannot provide them, and the kernel already degrades correctly:
-    // invariant TSC (a frequency-stability guarantee; the kernel calibrates the
-    // TSC against the PIT), PCID/INVPCID tagged TLBs (the kernel keeps a
-    // full-flush fallback), and the vendor-specific in-silicon mitigations.
+    // Required features deliberately not gated here, and why, are listed in
+    // docs/platform-requirements.md § Boot-Time Feature Gate.
     let checks: [(bool, &str); 19] = [
         // x86-64-v3 instruction baseline.
         (
@@ -456,9 +454,9 @@ pub unsafe fn verify_baseline() {}
 /// Per Intel SDM Vol. 2B (STI): when `STI` is immediately followed by `HLT`,
 /// the processor delays interrupt recognition until after `HLT` begins
 /// execution. The pair is therefore atomic: no interrupt is lost between
-/// the enable and the halt. A producer that raises a wake notification (IPI)
-/// between the idle loop's flag check and this call will find the notification
-/// pending in the local APIC at `HLT`, waking it immediately.
+/// the enable and the halt; the wake protocol this guarantees is specified in
+/// [scheduling-internals.md](../../../docs/scheduling-internals.md) § Wake Protocol
+/// Invariants.
 ///
 /// `nomem` is intentionally omitted so the compiler may not reorder
 /// preceding atomic loads across this call.
@@ -471,11 +469,13 @@ pub fn halt_until_interrupt()
     }
 }
 
-/// Return the local APIC ID of the current CPU (from CPUID.01H:EBX[31:24]).
+/// Return the initial APIC ID of the executing CPU (`CPUID.01H:EBX[31:24]`).
 ///
-/// Phase 5 only starts the BSP (Bootstrap Processor); this returns 0 on a
-/// single-CPU system.
-#[allow(dead_code)] // Required by arch interface: kernel/docs/arch-interface.md
+/// The field is 8 bits wide: an x2APIC ID above 255 is truncated (the full ID is
+/// in CPUID leaf 0x0B).
+// dead_code: part of the arch interface (core/kernel/docs/arch-interface.md
+// § `cpu`); no arch-neutral caller exists yet.
+#[allow(dead_code)]
 pub fn current_id() -> u32
 {
     let (_eax, ebx, _ecx, _edx) = cpuid(1);
@@ -541,7 +541,8 @@ pub fn current_cpu() -> u32
 /// Set the kernel stack pointer used when a trap fires from U-mode.
 ///
 /// On x86-64 this requires two writes: TSS RSP0 (for hardware interrupt/
-/// exception entry) and `SYSCALL_KERNEL_RSP` (for the `SYSCALL` fast path).
+/// exception entry) and `PerCpuData::kernel_rsp` via `syscall::set_kernel_rsp`
+/// (for the `SYSCALL` fast path).
 /// Must be called on every context switch to a user thread.
 ///
 /// # Safety
@@ -627,7 +628,8 @@ pub unsafe fn disable_interrupts()
 /// an uncontrolled jump; interrupts remain disabled.
 pub fn halt_loop() -> !
 {
-    // SAFETY: cli disables interrupts; hlt is safe to execute at any privilege level.
+    // SAFETY: kernel code runs at ring 0, where cli and hlt are permitted; cli
+    // masks interrupts so the hlt loop below halts permanently.
     unsafe {
         disable_interrupts();
     }

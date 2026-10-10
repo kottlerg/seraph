@@ -6,8 +6,9 @@
 //! Tier 1 tests for capability syscalls.
 //!
 //! Covers: `SYS_CAP_CREATE_*`, `SYS_CAP_COPY` (both auto-allocate and
-//! explicit-slot paths), `SYS_CAP_MOVE`, `SYS_CAP_DERIVE`, `SYS_CAP_REVOKE`,
-//! `SYS_CAP_DELETE`.
+//! explicit-slot paths), `SYS_CAP_MOVE`, `SYS_CAP_DERIVE`, `SYS_CAP_DERIVE_BADGE`,
+//! `SYS_CAP_REVOKE`, `SYS_CAP_DELETE`, and `CSpace` teardown (batched drain,
+//! bound-thread stop).
 //!
 //! Each function tests one syscall or one distinct behaviour. Tests clean up
 //! caps they create where convenient, but leaks are acceptable — ktest exits
@@ -27,8 +28,7 @@ static mut TEARDOWN_BATCH_STACK: ChildStack = ChildStack::ZERO;
 static mut STOP_BLOCKED_STACK: ChildStack = ChildStack::ZERO;
 static mut STOP_SPINNING_STACK: ChildStack = ChildStack::ZERO;
 
-// Rights bit constants (from kernel/src/cap/slot.rs).
-// Notification NOTIFY (send) / WAIT (receive-block); endpoint SEND / GRANT.
+// Notification NOTIFY (send) right, from syscall_abi (abi/syscall).
 const RIGHTS_NOTIFY: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
 
 // ── SYS_CAP_CREATE_NOTIFICATION ────────────────────────────────────────────────────
@@ -54,7 +54,7 @@ pub fn create_endpoint(ctx: &TestContext) -> TestResult
 
 // ── SYS_CAP_CREATE_EVENT_Q ───────────────────────────────────────────────────
 
-/// `cap_create_event_q` (via `event_queue_create`) returns a usable slot.
+/// `SYS_CAP_CREATE_EVENT_Q` (via `event_queue_create`) returns a usable slot.
 pub fn create_event_q(ctx: &TestContext) -> TestResult
 {
     let slot = event_queue_create(ctx.memory_base, 8).map_err(|_| "event_queue_create failed")?;
@@ -88,7 +88,8 @@ pub fn create_aspace(ctx: &TestContext) -> TestResult
 pub fn create_thread(ctx: &TestContext) -> TestResult
 {
     // Thread needs both an address space and a cspace to be bound to.
-    // `spawn::new_child` mints both via `cap_create_cspace` + `cap_create_thread`.
+    // `spawn::new_child` mints a `CSpace` (`cap_create_cspace`) and a thread
+    // (`cap_create_thread`) bound to that `CSpace` and to ktest's own address space.
     let child = crate::spawn::new_child(ctx).map_err(|_| "spawn::new_child failed")?;
     cap_delete(child.th).map_err(|_| "cap_delete thread failed")?;
     cap_delete(child.cs).map_err(|_| "cap_delete cspace failed")?;
@@ -116,9 +117,9 @@ fn cap_create_wait_set(memory_cap: u32) -> Result<u32, i64>
 
 /// `cap_copy` places a copy of a cap into another `CSpace`.
 ///
-/// The copy is verified to be independently usable (`notification_send` still works
-/// on the source; the destination `CSpace` is deleted as cleanup, which drops
-/// all caps inside it).
+/// The source stays usable after the copy (`notification_send` on it still
+/// succeeds); the copy itself is not exercised, and deleting the destination
+/// `CSpace` as cleanup drops it.
 pub fn copy(ctx: &TestContext) -> TestResult
 {
     let sig = cap_create_notification(ctx.memory_base)
@@ -207,19 +208,14 @@ pub fn derive_attenuation(ctx: &TestContext) -> TestResult
     notification_send(derived, 0x1).map_err(|_| "notification_send on derived cap failed")?;
 
     // Derived cap cannot wait — InsufficientRights (-3).
-    // We call notification_wait on a cap that has no bits set AND no WAIT right.
+    // The send above left bit 0x1 pending on the shared notification, but
+    // `sys_notification_wait` checks the WAIT right before it reads pending
+    // bits, so the call fails without blocking or consuming them.
     // The kernel should reject with InsufficientRights before blocking.
     let wait_err = syscall::notification_wait(derived);
     if wait_err != Err(SyscallError::InsufficientRights as i64)
     {
-        // If the kernel returns a different error (or somehow succeeds),
-        // something is wrong with rights enforcement.
-        // Note: if notification bits were set (from our send above), the kernel might
-        // return them before checking rights. Clear is fine for this test since
-        // notification_send ORs bits and notification_wait clears them — after send(0x1) and
-        // then a wait, the bits are consumed. The next wait on derived must fail.
-        // ... actually notification_wait on a cap with WAIT right AND bits set would
-        // succeed. But derived has NO WAIT right, so kernel checks rights first.
+        // A different error, or a success, means rights enforcement is broken.
         return Err(
             "notification_wait on NOTIFY-only derived cap did not return InsufficientRights",
         );
@@ -332,8 +328,8 @@ pub fn delete_intermediate_keeps_grandchildren_revocable(ctx: &TestContext) -> T
 /// `cap_revoke` clears subtrees larger than one revoke batch — wide, deep,
 /// and bushy shapes — and the freed slots return to the `CSpace`.
 ///
-/// The revoke batch bound (see `MAX_REVOKE_EDITS` in the kernel's
-/// capability-internals design doc) must be invisible to callers. Each of
+/// The revoke batch bound (`MAX_REVOKE_EDITS`; core/kernel/docs/capability-internals.md
+/// § Revocation Algorithm) must be invisible to callers. Each of
 /// the three shapes exceeds one batch: a 600-child fan-out, a 300-deep
 /// derive chain, and a bushy 4×100 two-level tree whose second level
 /// straddles the batch boundary. Probes cover head, middle, and tail
@@ -443,7 +439,7 @@ pub fn revoke_large_subtree(ctx: &TestContext) -> TestResult
 }
 
 /// `cap_move` relocates a cap with more children than one reparent batch
-/// (`MAX_REPARENT_EDITS` in the kernel's capability-internals design doc),
+/// (`MAX_REPARENT_EDITS`; core/kernel/docs/capability-internals.md § Move),
 /// through both destination modes, and every child follows: a child deleted
 /// afterwards hands its own child to the moved slot, and a revoke on the
 /// moved slot clears them all.
@@ -640,7 +636,8 @@ pub fn insert_out_of_bounds_err(ctx: &TestContext) -> TestResult
     let dest_cs = cap_create_cspace(ctx.memory_base, 0, 4)
         .map_err(|_| "create_cspace for insert_oob test failed")?;
 
-    // Slot 99999 is beyond any cspace capacity.
+    // Slot 99999 is below the structural ceiling but past every leaf this
+    // 4-page `CSpace`'s pool can back, so the insert fails (`OutOfMemory`).
     let err = cap_insert(sig, dest_cs, 99999, syscall::RIGHTS_ALL);
     if err.is_ok()
     {
@@ -706,7 +703,8 @@ pub fn revoke_null_slot_err(ctx: &TestContext) -> TestResult
 
 // ── SYS_CAP_CREATE_EVENT_Q negative ──────────────────────────────────────────
 
-/// `event_queue_create(0)` must return `InvalidArgument` (capacity must be 1-4096).
+/// `event_queue_create(0)` must return `InvalidArgument` (capacity bounds per
+/// core/kernel/docs/syscalls.md § `SYS_CAP_CREATE_EVENT_QUEUE`).
 pub fn create_event_q_zero_capacity_err(ctx: &TestContext) -> TestResult
 {
     let err = event_queue_create(ctx.memory_base, 0);
@@ -717,7 +715,8 @@ pub fn create_event_q_zero_capacity_err(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
-/// `event_queue_create(4097)` must return `InvalidArgument` (max capacity is 4096).
+/// `event_queue_create(EVENT_QUEUE_MAX_CAPACITY + 1)` must return
+/// `InvalidArgument` (see core/kernel/docs/syscalls.md § `SYS_CAP_CREATE_EVENT_QUEUE`).
 pub fn create_event_q_over_max_err(ctx: &TestContext) -> TestResult
 {
     let err = event_queue_create(ctx.memory_base, 4097);
@@ -739,7 +738,7 @@ pub fn derive_badge(ctx: &TestContext) -> TestResult
     let badged =
         cap_derive_badge(ep, syscall::RIGHTS_ALL, 42).map_err(|_| "cap_derive_badge failed")?;
 
-    // The badged cap is usable (it's a valid endpoint derivative).
+    // Deleting the badged cap confirms the derive produced a valid slot.
     cap_delete(badged).map_err(|_| "cap_delete badged cap failed")?;
     cap_delete(ep).map_err(|_| "cap_delete ep after derive_badge test failed")?;
     Ok(())
@@ -782,7 +781,8 @@ pub fn derive_badge_rebadge_err(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
-/// `cap_derive` from a badged cap inherits the badge (verified via IPC delivery).
+/// `cap_derive` from a badged cap succeeds. Badge inheritance
+/// (core/kernel/docs/syscalls.md § `SYS_CAP_DERIVE_BADGE`) is not observed here.
 pub fn derive_inherits_badge(ctx: &TestContext) -> TestResult
 {
     let ep = cap_create_endpoint(ctx.memory_base)
@@ -795,7 +795,8 @@ pub fn derive_inherits_badge(ctx: &TestContext) -> TestResult
     let derived =
         cap_derive(badged, syscall::RIGHTS_ALL).map_err(|_| "cap_derive from badged failed")?;
 
-    // We can't directly inspect the badge without IPC, but verify the cap is usable.
+    // The badge is not observable without IPC; deleting the derived cap
+    // confirms only that the derive produced a valid slot.
     cap_delete(derived).map_err(|_| "cap_delete derived failed")?;
     cap_delete(badged).map_err(|_| "cap_delete badged failed")?;
     cap_delete(ep).map_err(|_| "cap_delete ep after inherit test failed")?;
@@ -821,8 +822,8 @@ pub fn derive_badge_on_notification(ctx: &TestContext) -> TestResult
 }
 
 /// Derives the [`cspace_teardown_multibatch`] child performs: wider than one
-/// reparent batch (`MAX_REPARENT_EDITS`), so the dying child list is drained
-/// in several holds.
+/// drain batch (`MAX_DRAIN_EDITS`), so the dying child list is drained in
+/// several holds.
 const TEARDOWN_BATCH_DERIVES: u64 = 300;
 
 /// Tearing down a `CSpace` whose derivation state spans multiple drain
@@ -958,8 +959,9 @@ fn check_stop_observers(ctx: &TestContext, thread: u32, early: u32) -> TestResul
 /// it before the slot pages are reclaimed: a child blocked in
 /// `notification_wait` and a child spinning on `thread_yield` both report
 /// `Exited` afterwards, their objects reclaim through the thread cap alone,
-/// and the parent's Memory cap returns to baseline. Deleting the `CSpace`
-/// before the thread is exactly the order the spawn helper used to forbid.
+/// and the parent's Memory cap returns to baseline. Deleting the `CSpace` before
+/// the thread is the order `spawn::SpawnedChild` documents as stopping a still-live
+/// child.
 /// A death observer bound before the stop receives nothing from the
 /// teardown; one bound afterwards receives `EXIT_KILLED` through the bind,
 /// once.

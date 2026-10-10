@@ -6,7 +6,7 @@
 //! Direct serial output for ktest.
 //!
 //! Drives the serial port from userspace using capabilities received via the
-//! init protocol, eliminating the need for `SYS_DEBUG_LOG`.
+//! init protocol; the kernel offers no debug-print syscall.
 //!
 //! - **x86-64**: COM1 (I/O port 0x3F8) via `IoPort` cap + `ioport_bind`.
 //! - **RISC-V**: MMIO 16550 (`0x1000_0000`) via `Mmio` cap + `mmio_map`.
@@ -31,10 +31,12 @@ fn descriptors(info: &InitInfo) -> &[CapDescriptor]
     // SAFETY: cap_descriptors_offset is set by the kernel to point within the
     // same read-only page; the descriptor array contains cap_descriptor_count
     // valid entries. The offset is aligned to CapDescriptor's alignment (the
-    // kernel writes it at size_of::<InitInfo>(), which is 4-byte aligned and
-    // CapDescriptor is repr(C) starting with a u32).
-    // cast_ptr_alignment: InitInfo is 4-byte aligned and CapDescriptor array
-    // immediately follows it at a 4-byte-aligned offset.
+    // kernel writes it at size_of::<InitInfo>(), a multiple of InitInfo's
+    // 8-byte alignment from the page-aligned base, which satisfies
+    // CapDescriptor's 8-byte alignment (aux0: u64)).
+    // cast_ptr_alignment: the array starts size_of::<InitInfo>() (a multiple of
+    // 8) past the page-aligned InitInfo base, meeting CapDescriptor's 8-byte
+    // alignment.
     #[allow(clippy::cast_ptr_alignment)]
     unsafe {
         let ptr = base
@@ -46,7 +48,8 @@ fn descriptors(info: &InitInfo) -> &[CapDescriptor]
 
 /// Scan the `CapDescriptor` array for a cap matching `wanted_type` and
 /// `wanted_aux0`. Returns the `CSpace` slot index if found.
-#[allow(dead_code)] // Used on RISC-V (Mmio lookup), not on x86-64.
+// dead_code: the only caller is the riscv64 Mmio lookup, so x86-64 builds never use it.
+#[allow(dead_code)]
 fn find_cap(info: &InitInfo, wanted_type: CapType, wanted_aux0: u64) -> Option<u32>
 {
     for d in descriptors(info)

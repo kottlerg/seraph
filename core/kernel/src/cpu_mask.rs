@@ -149,9 +149,11 @@ impl Iterator for CpuMaskIter
 /// A concurrently-updated set of CPU indices in `[0, MAX_CPUS)`.
 ///
 /// Each word is updated independently; whole-set [`store`](Self::store) and
-/// [`snapshot`](Self::snapshot) are not atomic across words, which matches
-/// every use here — the only cross-word readers (shootdown ack-poll, watchdog)
-/// observe a monotonically draining set and re-read until it is empty.
+/// [`snapshot`](Self::snapshot) are not atomic across words. Every reader needs only
+/// per-CPU atomicity: the shootdown ack-poll and the watchdog's `any_pending` re-read a
+/// draining set until it is empty, and the shootdown-target snapshot of an address
+/// space's active-CPU set relies, per CPU, on the `tlb_gen` check (see
+/// [memory-internals.md § SMP TLB Shootdown](../docs/memory-internals.md#smp-tlb-shootdown)).
 pub struct AtomicCpuMask
 {
     words: [AtomicU64; CPU_MASK_WORDS],

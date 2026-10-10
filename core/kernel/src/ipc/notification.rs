@@ -10,13 +10,18 @@
 //! zero bits set, it blocks until a sender delivers bits.
 //!
 //! # Blocking semantics
-//! Only one thread may wait on a notification at a time (single-waiter invariant).
-//! The waiter is woken immediately if bits are already set when it calls wait.
+//! The object has one waiter slot, and the kernel does not enforce a single
+//! waiter: a second `notification_wait` replaces the registered waiter, and
+//! neither a send nor its timeout then wakes the displaced one (#443). A waiter
+//! that finds bits already set returns them without blocking.
 //!
 //! # Thread safety
-//! All fields are `#[cfg(not(test))]` to keep the struct out of host tests.
-//! Access is serialised by the caller holding the relevant CSpace/scheduler
-//! lock in kernel builds.
+//! `waiter`, `wait_set`, and `wait_set_member_idx` are mutated only under the
+//! per-object `lock`. `bits` and `has_observer` are atomics that
+//! `notification_send`'s fast path reads and writes without the lock, ordered
+//! by the `SeqCst` fence pair in
+//! `core/kernel/docs/scheduling-internals.md` § Atomic Ordering Invariants.
+//! Callers hold no lock.
 //!
 //! # Adding multi-waiter support
 //! Replace `waiter` with an intrusive queue of TCBs and wake all of them
@@ -26,12 +31,12 @@ use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use crate::sched::thread::ThreadControlBlock;
 
-// ── NotificationObject ───────────────────────────────────────────────────────────────
+// ── NotificationState ────────────────────────────────────────────────────────────────
 
 /// Kernel object backing a Notification capability.
 ///
 /// Constructed in place in a retype slot of a Memory capability. The `KernelObjectHeader` is
-/// NOT included here; it lives in `cap::object::NotificationKernelObject` which
+/// NOT included here; it lives in `cap::object::NotificationObject`, which
 /// wraps this struct.
 pub struct NotificationState
 {
@@ -40,8 +45,8 @@ pub struct NotificationState
     /// The single thread blocked waiting for a non-zero bitmask, or null.
     pub waiter: *mut ThreadControlBlock,
     /// Opaque pointer to the `WaitSetState` this notification is registered with,
-    /// or null if not in any wait set. Type-erased to avoid a circular import.
-    /// Cast to `*mut WaitSetState` only inside `wait_set.rs`.
+    /// or null if not in any wait set. Cast back to `*mut WaitSetState` only in
+    /// `crate::ipc::wait_set::waitset_notify`.
     pub wait_set: *mut u8,
     /// Index of this notification's entry in `WaitSetState::members`.
     pub wait_set_member_idx: u8,
@@ -60,9 +65,13 @@ pub struct NotificationState
     pub lock: crate::sync::Spinlock,
 }
 
-// SAFETY: NotificationState is accessed only under the relevant scheduler lock.
+// SAFETY: `waiter`, `wait_set`, and `wait_set_member_idx` are accessed only
+// under `lock`; `bits` and `has_observer` are atomics ordered across CPUs by
+// the SeqCst fence pair in `notification_send` / `notification_wait`.
 unsafe impl Send for NotificationState {}
-// SAFETY: NotificationState is accessed only under the relevant scheduler lock; no Sync violation.
+// SAFETY: `waiter`, `wait_set`, and `wait_set_member_idx` are accessed only
+// under `lock`; `bits` and `has_observer` are atomics ordered across CPUs by
+// the SeqCst fence pair in `notification_send` / `notification_wait`.
 unsafe impl Sync for NotificationState {}
 
 impl NotificationState
@@ -85,16 +94,18 @@ impl NotificationState
 
 /// Deliver `bits` to `sig`.
 ///
-/// ORs the given bits into the notification bitmask. If a thread is currently
-/// blocked waiting, wakes it (moves it to Ready state) and clears `waiter`.
+/// ORs the given bits into the notification bitmask. If a thread is blocked
+/// waiting and the swap finds non-zero bits, claims it: deposits the bits in
+/// its `wakeup_value`, clears `waiter`, and removes any sleep-list timeout.
+/// If the swap finds zero bits (a concurrent wait consumed them), the waiter
+/// is left in place.
 ///
 /// Returns `Some(*mut TCB)` if a thread was woken (caller must enqueue it).
 ///
 /// # Lock-free fast path
-/// When `has_observer` is zero (no waiter, no wait set), the bits are OR'd
-/// atomically and the function returns without acquiring the lock. A `SeqCst`
-/// fence between the OR and the flag check forms one half of a Dekker-style
-/// pair with `notification_wait`, preventing lost wakeups on RVWMO.
+/// When `has_observer` is zero the bits are OR'd and the function returns
+/// without the lock; the fence pairing is specified in
+/// `core/kernel/docs/scheduling-internals.md` § Atomic Ordering Invariants.
 ///
 /// # Safety
 /// `sig` must be a valid pointer to a live `NotificationState`.
@@ -111,10 +122,8 @@ pub unsafe fn notification_send(
     // are already in place.
     sig.bits.fetch_or(bits, Ordering::Relaxed);
 
-    // Dekker fence: ensures our OR is visible before we read has_observer.
-    // Pairs with the SeqCst fence in notification_wait (between setting
-    // has_observer and swapping bits). Guarantees at least one side observes
-    // the other's store, preventing lost wakeups on RVWMO.
+    // Dekker fence (send half); see core/kernel/docs/scheduling-internals.md
+    // § Atomic Ordering Invariants.
     core::sync::atomic::fence(Ordering::SeqCst);
 
     // Fast path: no one is watching — nothing to wake or notify.
@@ -134,11 +143,10 @@ pub unsafe fn notification_send(
 
         if delivered == 0
         {
-            // A concurrent fast-path notification_wait already consumed our
-            // bits. The current sig.waiter is a *new* waiter; do NOT
-            // touch it (delivering wakeup_value=0 would be a spurious
-            // wake, since notification_send rejects 0-bit sends). See
-            // ipc-internals.md § Send Path.
+            // A concurrent notification_wait or another sender's slow-path swap (each
+            // a locked swap) already consumed our bits; the current sig.waiter is a
+            // new waiter and must not be touched
+            // (see core/kernel/docs/ipc-internals.md § Send Path step 5b).
             None
         }
         else
@@ -149,7 +157,7 @@ pub unsafe fn notification_send(
             // dealloc_object(Thread) takes sig.lock in its unlink path and then
             // spins on this flag, so it cannot free `waiter` in the window
             // between this pop and the caller's enqueue_and_wake. Cleared by
-            // enqueue_and_wake. See docs/scheduling-internals.md
+            // enqueue_and_wake. See core/kernel/docs/scheduling-internals.md
             // § Cross-CPU TCB Ownership.
             // SAFETY: waiter is the valid TCB just dequeued from sig.waiter.
             unsafe {
@@ -166,12 +174,9 @@ pub unsafe fn notification_send(
                 (*waiter).wakeup_value = delivered;
             }
             // If the waiter was registered with a `SYS_NOTIFICATION_WAIT` timeout, it
-            // is also on the global sleep list. Remove it here so the timer
-            // path will not try to double-wake this thread. We hold `sig.lock`;
-            // `sleep_list_remove` acquires `SLEEP_LIST_LOCK` internally
-            // (lock order: sig.lock → SLEEP_LIST_LOCK; the timer path takes
-            // SLEEP_LIST_LOCK first, releases it, and only then reaches for
-            // sig.lock — so no circular wait).
+            // is also on the sleep list; remove it under sig.lock so the timer path
+            // cannot double-wake it (lock order per
+            // core/kernel/docs/thread-lifecycle-and-sleep.md § Sleep List Invariants rule 1).
             //
             // ORDER (issue #117): call `sleep_list_remove` BEFORE clearing
             // `sleep_deadline`. The timer path (`sleep_check_wakeups`) walks
@@ -216,15 +221,14 @@ pub unsafe fn notification_send(
 /// Wait for at least one bit in `sig` to be set.
 ///
 /// Reads and clears the bitmask atomically. If the result is non-zero,
-/// returns `Ok(bits)` immediately (no blocking). If zero, stores `caller`
-/// as the waiter, sets its state to `Blocked`, and returns `Err(())` —
-/// the caller must then call the scheduler to yield the CPU.
+/// returns `Ok(bits)` immediately (no blocking). If zero, registers `caller`
+/// as the waiter and commits the park; a refused commit rolls the waiter back.
+/// Either way returns `Err(())` and the caller must then call the scheduler.
 ///
 /// # Dekker ordering
-/// Under the lock, the waiter is registered and `has_observer` is set
-/// **before** the bits swap. A `SeqCst` fence between these steps pairs with
-/// the fence in `notification_send` to guarantee: if `notification_send`'s fast path
-/// sees `has_observer == 0`, then this swap will see the `ORed` bits.
+/// The waiter is registered and `has_observer` set before the bits swap; the
+/// fence pairing with `notification_send` is specified in
+/// `core/kernel/docs/scheduling-internals.md` § Atomic Ordering Invariants.
 ///
 /// # Safety
 /// `sig` and `caller` must be valid pointers.
@@ -240,11 +244,9 @@ pub unsafe fn notification_wait(
     // SAFETY: lock serialises send/wait; paired with unlock_raw below.
     let saved = unsafe { sig.lock.lock_raw() };
 
-    // Clear context_saved BEFORE making the thread visible as a waiter.
-    // Without this, a remote CPU that wakes and schedules this thread can
-    // see the stale context_saved==1 from the previous switch-in and load
-    // a stale SavedState before the original CPU has called schedule() to
-    // save the real register state — causing two CPUs to share one stack.
+    // Pre-clear context_saved before publishing the waiter slot; see
+    // core/kernel/docs/scheduling-internals.md § Atomic Ordering Invariants
+    // (`context_saved`) and § Cross-CPU TCB Ownership.
     // SAFETY: caller TCB is valid; context_saved is AtomicU32.
     unsafe {
         (*caller)
@@ -252,11 +254,9 @@ pub unsafe fn notification_wait(
             .store(0, core::sync::atomic::Ordering::Relaxed);
     }
 
-    // Register the waiter and mark the notification as observed. This must happen
-    // before the bits swap so that a concurrent notification_send that bypasses
-    // the lock (fast path) will either:
-    //   (a) see has_observer==1 → take the slow path and wake us, OR
-    //   (b) have its OR visible to our swap below (we get the bits).
+    // Register the waiter and set has_observer before the bits swap (Dekker
+    // wait half); see core/kernel/docs/scheduling-internals.md § Atomic Ordering
+    // Invariants.
     sig.waiter = caller;
     sig.has_observer.store(1, Ordering::Relaxed);
 
@@ -294,12 +294,9 @@ pub unsafe fn notification_wait(
     };
     if committed != crate::sched::ParkCommit::Committed
     {
-        // Refused park; roll back the waiter slot. sig.lock has been held
-        // across publish/commit/rollback, so no waker ever saw the slot — the
-        // rollback owns the episode. A stop-won refusal stamps it INTERRUPTED
-        // so the restarted thread's resume reports the cancellation instead
-        // of a fabricated 0-bits success; a coalesced-wake refusal leaves the
-        // deposit for the resume to deliver.
+        // Refused park; roll back the waiter slot (sig.lock held since publish).
+        // Stamping per core/kernel/docs/ipc-internals.md § Park Dispositions and
+        // Episodes (refused-commit rollbacks).
         sig.waiter = core::ptr::null_mut();
         sig.has_observer
             .store(u8::from(!sig.wait_set.is_null()), Ordering::Relaxed);
@@ -326,7 +323,6 @@ pub unsafe fn notification_wait(
     Err(())
 }
 
-// Import IpcThreadState here to avoid a circular import; it lives in thread.rs.
 use crate::sched::thread::IpcThreadState;
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

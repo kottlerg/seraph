@@ -15,9 +15,10 @@
 //! via `SYS_IRQ_ACK` after handling.
 //!
 //! # Thread safety
-//! The routing table uses atomic pointers with Release/Acquire ordering for
-//! SMP-safe registration and dispatch. `dispatch_device_irq` runs in interrupt
-//! context and cannot spin on locks; atomic loads provide lock-free access.
+//! The routing table uses atomic pointers with Release/Acquire ordering, so
+//! registration and the interrupt-context lookup in `dispatch_device_irq` are
+//! lock-free. Delivery itself (`notification_send`, `sched::enqueue_and_wake`)
+//! takes the notification's and the scheduler's spinlocks with interrupts disabled.
 //!
 //! # Modification notes
 //! - To support multiple notifications per IRQ line (e.g. shared interrupts): replace
@@ -78,8 +79,9 @@ static IRQ_TABLE: [IrqRoute; MAX_IRQ] = {
 pub unsafe fn register(irq: u32, notification: *mut NotificationState)
 {
     debug_assert!((irq as usize) < MAX_IRQ, "irq out of range");
-    // SAFETY: index is bounds-checked by debug_assert; Release ordering ensures
-    // the stored pointer becomes visible to all CPUs that Acquire-load it.
+    // Release ordering makes the stored pointer visible to every CPU that
+    // Acquire-loads it. An out-of-range `irq` panics at the index (the
+    // debug_assert reports it first in debug builds).
     IRQ_TABLE[irq as usize]
         .notification
         .store(notification, Ordering::Release);
@@ -93,8 +95,9 @@ pub unsafe fn register(irq: u32, notification: *mut NotificationState)
 pub unsafe fn unregister(irq: u32)
 {
     debug_assert!((irq as usize) < MAX_IRQ, "irq out of range");
-    // SAFETY: index is bounds-checked by debug_assert; Release ordering ensures
-    // the null write becomes visible to all CPUs.
+    // Release ordering makes the null write visible to every CPU that
+    // Acquire-loads it. An out-of-range `irq` panics at the index (the
+    // debug_assert reports it first in debug builds).
     IRQ_TABLE[irq as usize]
         .notification
         .store(null_mut(), Ordering::Release);
@@ -137,10 +140,11 @@ pub unsafe fn unregister_notification(notification: *mut NotificationState)
 /// Flow:
 /// 1. Mask the IRQ at the controller (prevents re-entry until ACK).
 /// 2. OR notification bit 0 into the registered notification.
-/// 3. If a waiter was unblocked, enqueue it on the scheduler.
-/// 4. Acknowledge at the controller (send EOI / PLIC complete).
+/// 3. Acknowledge at the controller (send EOI / PLIC complete).
+/// 4. If a waiter was unblocked, enqueue it on the scheduler.
 ///
-/// If no notification is registered, the IRQ is silently dropped (masked; no ACK).
+/// If no notification is registered, the IRQ is masked, acknowledged at the
+/// controller, and dropped.
 ///
 /// # Safety
 /// Must only be called from interrupt context with interrupts disabled.
@@ -179,8 +183,8 @@ pub unsafe fn dispatch_device_irq(irq: u32)
     // is slow to ACK. The driver calls SYS_IRQ_ACK to unmask.
     crate::arch::current::interrupts::mask(irq);
 
-    // Deliver one notification bit into the notification. Bit 0 is used for
-    // single-IRQ-per-notification registration (the standard case).
+    // Deliver notification bit 0: `SYS_IRQ_REGISTER` takes no bit argument,
+    // so every registered line signals bit 0.
     // SAFETY: sig_ptr is valid and non-null; interrupts are disabled.
     let woken = unsafe { crate::ipc::notification::notification_send(sig_ptr, 1) };
 

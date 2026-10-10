@@ -81,7 +81,9 @@ pub fn run(ctx: &TestContext) -> TestResult
 fn fault_child(_arg: u64) -> !
 {
     // SAFETY: a deliberately illegal instruction; with no handler bound the
-    // kernel terminates this thread before control returns here.
+    // kernel terminates this thread before control returns here. It clobbers
+    // no registers and assumes only user-mode execution: the trap never
+    // returns to this frame.
     unsafe {
         #[cfg(target_arch = "x86_64")]
         core::arch::asm!("ud2");

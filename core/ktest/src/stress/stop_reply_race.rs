@@ -20,10 +20,12 @@
 //!     CASes `reply_tcb`, defers the bound client's wake past the all-locks
 //!     window, then `retype_free`s the server TCB.
 //!
-//! Pre-#317 the stop-path CAS was unguarded against the concurrent free, so a
-//! `thread_stop(client)` that lost the timing read (or wrote) the server TCB
-//! *after* `cap_delete(server)` freed it — a cross-CPU use-after-free that
-//! tripped the magic-cookie debug-assert / `#PF` / double-enqueue tripwire.
+//! The stop-path `reply_tcb` CAS dereferences the server TCB that a concurrent
+//! `cap_delete(server)` frees; the guard that keeps that CAS on live memory
+//! (#317) is specified in
+//! [scheduling-internals.md](../../../kernel/docs/scheduling-internals.md)
+//! § Cross-CPU TCB Ownership (Stop-path UAF — CLOSURE LEMMA). A regression is
+//! a cross-CPU use-after-free of the server TCB.
 //!
 //! ## How this exercises it
 //!
@@ -81,12 +83,14 @@ const BIT_SERVER_ARMED: u64 = 1 << 0;
 /// the server's death rather than stopped). Not gated on — see module docs.
 const BIT_CLIENT_WOKE: u64 = 1 << 1;
 
-/// Bound on the server's post-recv busy-spin, keeping the server TCB live for a
-/// short window after it signals armed so the controller's race lands while the
-/// TCB still exists.
+/// Bound on the server's post-recv busy-spin before it exits without replying.
+/// The spin does not keep the TCB alive: `thread_exit` only commits `Exited`
+/// and leaves `reply_tcb` bound, so the server TCB's storage persists until the
+/// controller's `cap_delete(server.th)` and the race always lands on an
+/// allocated TCB.
 const SERVER_SPIN: u32 = 200;
 
-/// A page-aligned 4 KiB IPC buffer page (`MSG_DATA_WORDS_MAX`-wide, like
+/// A page-aligned 4 KiB IPC buffer page (512 `u64` words, the same shape as
 /// ktest's own `IPC_BUF`). One per concurrent child.
 ///
 /// The server and client run concurrently on different CPUs and each issues
@@ -196,8 +200,9 @@ pub fn run(ctx: &TestContext) -> TestResult
         }
         armed_cycles += 1;
 
-        // A little more wall time so the server is at/just-past recv and into
-        // its short busy-spin (TCB still live) when the race fires.
+        // A little more wall time so the server has finished recv and exited
+        // without replying: its TCB stays allocated (Exited, `reply_tcb` still
+        // bound to the client) until the `cap_delete(server.th)` below.
         let _ = thread_sleep(1);
 
         // ── The race. ───────────────────────────────────────────────────────
@@ -286,8 +291,9 @@ fn server_entry(arg: u64) -> !
         notification_send(done_slot, BIT_SERVER_ARMED).ok();
     }
 
-    // Stay alive a short, bounded window so the controller's race lands while
-    // this TCB still exists, then die without replying.
+    // Spin a short, bounded window, then die without replying. The TCB stays
+    // allocated (Exited, `reply_tcb` bound) until the controller's
+    // `cap_delete(server.th)`, which is the free the stop path races.
     for _ in 0..SERVER_SPIN
     {
         core::hint::spin_loop();

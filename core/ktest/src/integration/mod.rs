@@ -22,7 +22,8 @@
 //! - `cap_transfer.rs`           — capability rights through an IPC endpoint round-trip
 //! - `cap_transfer_large.rs`     — IPC transfer of a cap with a multi-batch child list
 //! - `wait_concurrency.rs`       — wait set with simultaneous notification and queue sources
-//! - `memory_lifecycle.rs`       — memory split → map → protect → unmap with state checks
+//! - `memory_lifecycle.rs`       — pool-frame map → protect → unmap with `aspace_query`
+//!   state checks
 //! - `multi_caller_ipc_fifo.rs`  — endpoint send-queue FIFO ordering with three concurrent callers
 //! - `cap_delegation_chain.rs`   — multi-level rights attenuation and cascaded revocation
 //! - `tlb_coherency.rs`          — map/unmap cycles across CPUs exercising TLB shootdown
@@ -46,6 +47,8 @@
 //! - `aspace_fault_notification_late_bind.rs` — an aspace terminal-fault observer bound after the space already faulted still receives the retained reason
 //! - `ipc_call_interrupted_stop_start.rs` — a client stopped while parked in `ipc_call` (send-queued and awaiting-reply) restarts to `Interrupted`, never a stale reply (#361)
 //! - `park_interrupted_stop_start.rs` — a thread stopped while parked in any non-call blocking syscall (notification/event/recv/wait-set/sleep) restarts to `Interrupted`, never a stale deposit (#363)
+//! - `sbi_gating.rs`             — `SYS_SBI_CALL` extension gating: kernel-managed extensions and
+//!   SRST without `SBI_RESET` are rejected before forwarding (RISC-V; no-op on `x86_64`)
 
 pub mod aspace_fault_notification_late_bind;
 pub mod cap_delegation_chain;

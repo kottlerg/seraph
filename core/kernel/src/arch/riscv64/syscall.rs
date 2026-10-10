@@ -3,7 +3,7 @@
 
 // core/kernel/src/arch/riscv64/syscall.rs
 
-//! RISC-V ecall (syscall) entry point (Phase 9).
+//! RISC-V ecall (syscall) entry point (Phase 5).
 //!
 //! On RISC-V, userspace system calls are issued with the `ecall` instruction.
 //! The trap is routed through the `stvec` handler installed by `interrupts::init`,

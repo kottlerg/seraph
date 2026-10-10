@@ -483,9 +483,9 @@ unsafe fn push_page_block(alloc: &RetypeAllocator, memory: &MemoryObject, offset
 ///
 /// `bytes` is the *raw* requested size; it is rounded up to the next size
 /// class internally. The actual bytes debited from `available_bytes` is the
-/// rounded value. Sub-page allocations are size-class-aligned but not
-/// page-aligned; page-aligned allocations are always page-aligned within
-/// the cap.
+/// rounded value. Sub-page allocations are `BIN_128`-aligned (a `BIN_512`
+/// slot is not necessarily 512-aligned) and not page-aligned; page-aligned
+/// allocations are always page-aligned within the cap.
 ///
 /// Returns `Err(SyscallError::OutOfMemory)` if the cap doesn't have enough
 /// room. Caller must validate `tag == Memory && rights.contains(RETYPE)`
@@ -597,8 +597,8 @@ pub fn retype_allocate(memory: &MemoryObject, bytes: u64) -> Result<u64, Syscall
             cursor += BIN_128;
             remaining -= BIN_128;
         }
-        // Any tail < BIN_128 is unreachable from the free lists. Bounded by
-        // 127 bytes per first-page-aligned bump event per cap.
+        // The bump cursor is always a `BIN_128` multiple (every class size and
+        // every rollback target is), so the pad divides exactly into bins.
     }
 
     alloc.bump_offset.store(new_bump, Ordering::Release);
@@ -609,8 +609,9 @@ pub fn retype_allocate(memory: &MemoryObject, bytes: u64) -> Result<u64, Syscall
 
 /// Read the current bump offset against `memory`.
 ///
-/// Used by `sys_memory_split` to enforce the Option D invariant that a
-/// split offset cannot land below the highest live retype.
+/// Used by `sys_memory_split` to reject a split offset below the page-rounded
+/// bump (live retypes occupy `[0, bump)`), and by `sys_memory_merge` to require
+/// a virgin tail; see `core/kernel/docs/syscalls.md` § `SYS_MEMORY_SPLIT` (33).
 ///
 /// # Safety
 ///
@@ -663,14 +664,11 @@ pub fn retype_free(memory: &MemoryObject, offset: u64, bytes: u64)
     alloc.lock();
 
     // Bump rollback when the freed block sits at the top of the allocator's
-    // bump frontier: the freed range is contiguous with `bump_offset`, no
-    // live retype lives above it, so we can shrink the bump back to `offset`.
-    // This keeps `sys_memory_split` usable on caps that have been retyped and
-    // then freed — without it, a Memory cap that was once the source for a
-    // `cap_create_aspace` slab can never again be split into smaller pieces,
-    // even after the AS is dealloc'd. (The allocator's free list still
-    // services future retypes either way; this rollback only affects what
-    // the *split* primitive sees.)
+    // bump frontier: no live retype lives above it, so the bump shrinks back to
+    // `offset`. This lets `sys_memory_split` carve the freed top while lower
+    // retypes stay live (the drain-reset below covers the fully-drained case).
+    // The rollback does not cascade past freed slots below the new frontier;
+    // those stay on the free lists.
     let bump = alloc.bump_offset.load(Ordering::Relaxed);
     if offset + need == bump
     {
@@ -725,11 +723,14 @@ pub fn retype_free(memory: &MemoryObject, offset: u64, bytes: u64)
 /// the returned pointer can be cast back to `*mut T` by the dealloc path via
 /// `header.obj_type` dispatch.
 ///
-/// Used by `cap::populate_cspace` and `mint_module_memory_caps` (Phase 7) and
-/// by `core/kernel/src/main.rs` (Phase 9, init segment Memory caps).
+/// Called only through `cap::mint_phase7_body`, which serves
+/// `cap::populate_cspace`, `mint_module_memory_caps`, and the reclaim mints
+/// (`mint_reclaim_memory_caps` at Phase 7, `mint_late_reclaim_memory_caps` at
+/// the end of Phase 8), and `kernel_entry_post_rebase` in
+/// `core/kernel/src/main.rs` (Phase 9, init segment Memory caps).
 ///
-/// Calls [`crate::fatal`] on `OutOfMemory` — Phase 7 boot-time mints cannot
-/// recover from a too-small seed.
+/// Calls [`crate::fatal`] on any `retype_allocate` error — a boot-time mint
+/// cannot recover from a too-small seed.
 #[cfg(not(test))]
 #[track_caller]
 pub fn boot_retype_body<T>(seed: &MemoryObject, body: T) -> NonNull<KernelObjectHeader>
@@ -754,9 +755,11 @@ pub fn boot_retype_body<T>(seed: &MemoryObject, body: T) -> NonNull<KernelObject
 /// cap, write `body` in place, bump SEED's refcount, and return a pointer
 /// suitable for `CSpace::insert_cap`.
 ///
-/// SEED is the only kernel-internal Memory cap; it backs the wrapper bodies
-/// of split-derived caps (`sys_mmio_split`, `sys_irq_split`, the tail of
-/// `sys_memory_split`) and lazy per-thread state (`sys_iopb_set`'s IOPB).
+/// SEED is the only kernel-internal Memory cap; through this function it backs
+/// the wrapper bodies of split-derived caps (`sys_mmio_split`, `sys_irq_split`,
+/// `sys_ioport_split`, `sys_sched_split`, and the tail of `sys_memory_split`).
+/// Opaque non-cap SEED state (the per-thread IOPB bound by `sys_ioport_bind`)
+/// goes through [`alloc_seed_scratch`] instead.
 /// All callers debit `SEED.available_bytes`; runtime exhaustion returns
 /// `OutOfMemory` to the syscall surface (unlike [`boot_retype_body`] which
 /// fatals).
@@ -843,10 +846,9 @@ pub fn free_seed_scratch(ptr: *mut u8, bytes: u64)
 
     // Skip both `retype_free` and `dec_ref` on a corrupt pointer: feeding a bogus
     // offset to the allocator would corrupt SEED, and a lone `dec_ref` would
-    // unbalance the lease refcount. The lease is leaked instead — SEED is
-    // statically pinned (initial refcount 1 + Phase-7 pin), so the imbalance is
-    // inert. This turns the former underflow panic/wrap into a logged,
-    // survivable anomaly.
+    // unbalance the lease refcount. The lease is leaked and the anomaly logged;
+    // SEED is statically pinned (initial refcount 1 + Phase-7 pin), so the
+    // imbalance is inert.
     match seed_scratch_offset(phys, seed.base, seed.size, bytes)
     {
         Some(offset) =>
@@ -919,8 +921,8 @@ pub const EVENT_QUEUE_RING_OFFSET: u64 = EVENT_QUEUE_WRAPPER_BYTES + EVENT_QUEUE
 /// Look up the byte cost and allocation mode for a given `ObjectType`.
 ///
 /// `size_arg` is the variable-size argument (capacity for `EventQueue`,
-/// page count for `Memory`, initial growth-budget pages for `AddressSpace`
-/// / `CSpace`). Pass `0` for fixed-size types.
+/// page count for `Memory`, total pages carved — the syscall's `init_pages` —
+/// for `AddressSpace` / `CSpace`). Pass `0` for fixed-size types.
 ///
 /// Returns `None` for object types that cannot be retyped (`Memory` is
 /// retypable; `Mmio`/`Interrupt`/`IoPort`/`SchedControl`/
@@ -937,23 +939,27 @@ pub fn dispatch_for(object_type: ObjectType, size_arg: u64) -> Option<DispatchEn
             raw_bytes: 24 + core::mem::size_of::<crate::ipc::endpoint::EndpointState>() as u64,
             split: false,
         }),
-        // Notification: 24 wrapper + 96 NotificationState = 120 → BIN_128.
+        // Notification: 24 wrapper + NotificationState (40 B) = 64 B, budgeted as
+        // the literal 120 → BIN_128. Unlike the Endpoint arm, the budget is not
+        // computed from size_of, and no const assertion pins wrapper +
+        // NotificationState within BIN_128 (#460).
         ObjectType::Notification => Some(DispatchEntry {
             raw_bytes: 120,
             split: false,
         }),
-        // WaitSet: 24 wrapper + ~440 WaitSetState (16 × 24 B niche-packed
-        // members + ready ring + bookkeeping). Rounds to BIN_512.
+        // WaitSet: 24 wrapper + 440 (the asserted upper bound on WaitSetState)
+        // → BIN_512; sizing per core/kernel/docs/ipc-internals.md § Wait Set,
+        // pinned by the const assertion in core/kernel/src/ipc/wait_set.rs.
         ObjectType::WaitSet => Some(DispatchEntry {
             raw_bytes: 24 + 440,
             split: false,
         }),
-        // EventQueue: 24 wrapper + EventQueueState (≈ 56 B) + (size_arg + 1)
-        // u64 ring slots, all inline in the retype slot. Sub-page in-place
-        // for small rings; page-aligned split when the total exceeds the
+        // EventQueue: 24 wrapper + EventQueueState (56 B, EVENT_QUEUE_STATE_BYTES)
+        // + (size_arg + 1) u64 ring slots, all inline in the retype slot. Sub-page
+        // in-place for small rings; page-aligned split when the total exceeds the
         // 512 B sub-page bin. The exact byte count here must match the
-        // construction layout in `sys_cap_create_event_queue` and the
-        // reclaim arithmetic in `dealloc_object`'s EventQueue arm.
+        // construction layout in `sys_cap_create_event_queue` and the reclaim
+        // arithmetic in `dealloc_object_one`'s EventQueue arm.
         ObjectType::EventQueue =>
         {
             let raw_bytes = event_queue_raw_bytes(size_arg);
@@ -964,28 +970,19 @@ pub fn dispatch_for(object_type: ObjectType, size_arg: u64) -> Option<DispatchEn
         }
         // Thread: KERNEL_STACK_PAGES kstack pages + 1 page holding the
         // ThreadObject wrapper and the TCB + 1 page for the per-thread
-        // FPU/SIMD/V save area. Layout: pages 0..N are kstack
+        // extended-state save area. Layout: pages 0..N are kstack
         // (kstack_top = base + N*PAGE_SIZE); page N holds wrapper + TCB;
-        // page N+1 is the XSAVE / F-D save area. The construction site
-        // `sys_cap_create_thread` asserts equality against this dispatch
-        // entry.
+        // page N+1 is the save area (XSAVE on x86-64; F/D and V on RISC-V).
+        // The construction site `sys_cap_create_thread` debug-asserts equality
+        // against this dispatch entry.
         ObjectType::Thread => Some(DispatchEntry {
             raw_bytes: (crate::sched::KERNEL_STACK_PAGES as u64 + 2) * PAGE_SIZE as u64,
             split: true,
         }),
-        // AddressSpace and CSpace are both kernel-half growable objects.
-        // Page 0 of the slab is the wrapper page: the wrapper struct
-        // (`AddressSpaceObject` / `CSpaceKernelObject`) and the inner
-        // `AddressSpace` / `CSpace` are constructed in place there
-        // (`sys_cap_create_aspace` / `sys_cap_create_cspace`); the
-        // remaining pages go onto the wrapper's growth pool.
-        //
-        // For AddressSpace, page 1 is the root page table and pages
-        // 2..size_arg form the initial PT growth pool; the syscall verifies
-        // the minimum `size_arg`.
-        //
-        // For CSpace, pages 1..size_arg seed the slot-page pool;
-        // CSpace::grow consumes them on demand.
+        // AddressSpace and CSpace: `size_arg` pages, page-aligned. The slab layout
+        // in create-mode and augment-mode is specified in
+        // core/kernel/docs/syscalls.md § `SYS_CAP_CREATE_ASPACE` (11) and
+        // § `SYS_CAP_CREATE_CSPACE` (12); the syscalls construct it.
         //
         // `size_arg.checked_mul` rejects pathological sizes (caller-supplied
         // u64) that would otherwise wrap into a small `raw_bytes`.
@@ -993,7 +990,9 @@ pub fn dispatch_for(object_type: ObjectType, size_arg: u64) -> Option<DispatchEn
             raw_bytes: size_arg.checked_mul(PAGE_SIZE as u64)?,
             split: true,
         }),
-        // Memory retype: subsumes today's memory_split. size_arg is page count.
+        // Memory: `size_arg` pages, page-aligned. No syscall currently retypes a
+        // Memory cap through this entry; `sys_memory_split` carves Memory caps on
+        // its own path.
         ObjectType::Memory => Some(DispatchEntry {
             raw_bytes: size_arg.saturating_mul(PAGE_SIZE as u64),
             split: true,

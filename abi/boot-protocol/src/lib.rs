@@ -110,11 +110,14 @@ pub use layout::{collect_mmio_direct_map_regions, direct_map_ceiling, max_ram_ad
 ///     (whole-VM-snapshot resume).
 /// v14: Added `direct_map_base: u64` and `kaslr_flags: u32` (KASLR, #252).
 ///     The bootloader chooses the direct-map virtual base (the paging
-///     mode's kernel-half base, randomized when boot entropy is available)
-///     and records which layout dimensions were randomized and from which
-///     entropy source in `kaslr_flags`. `kernel_virtual_base` /
-///     `init_image.entry_point` semantics are unchanged but may now carry
-///     a KASLR-biased kernel image base. The shared layout helpers
+///     mode's kernel-half base, randomized when KASLR entropy is available
+///     and the `nokaslr` override knob is absent) and records which layout
+///     dimensions were randomized and from which entropy source in
+///     `kaslr_flags`. `kernel_virtual_base` / `init_image.entry_point` may
+///     carry a KASLR-biased kernel image base; a `kernel_virtual_base`
+///     above [`layout::KERNEL_LINK_BASE`] MUST carry
+///     [`KASLR_IMAGE_RANDOMIZED`], and the kernel halts at Phase 0
+///     otherwise. The shared layout helpers
 ///     ([`max_ram_address`], [`direct_map_ceiling`],
 ///     [`collect_mmio_direct_map_regions`]) keep the bootloader's window
 ///     selection and the kernel's Phase-3 guard on identical arithmetic.
@@ -151,7 +154,7 @@ pub enum MemoryType
     /// firmware-exclusive regions via this enum; MMIO intended for driver
     /// use is delivered separately via [`MmioApertureSlice`].
     Reserved = 2,
-    /// ACPI reclaimable after userspace firmware parsing (devmgr) is complete.
+    /// Firmware (ACPI) tables; exposed to userspace read-only and never returned to the allocator.
     ///
     /// Subsumes `EfiACPIReclaimMemory`.
     AcpiReclaimable = 3,
@@ -751,7 +754,12 @@ pub struct BootInfo
 
     /// Physical base address of the loaded kernel image.
     pub kernel_physical_base: u64,
-    /// ELF virtual base address of the kernel image.
+    /// ELF virtual base address of the kernel image: [`layout::KERNEL_LINK_BASE`]
+    /// plus a slide that is a multiple of [`layout::IMAGE_SLIDE_ALIGN`].
+    ///
+    /// A nonzero slide MUST be a KASLR draw reported with
+    /// [`KASLR_IMAGE_RANDOMIZED`]; the kernel validates both at Phase 0 and
+    /// halts otherwise (`core/kernel/docs/initialization.md` § Phase 0).
     pub kernel_virtual_base: u64,
     /// Total span of the kernel ELF LOAD segments in bytes.
     pub kernel_size: u64,
@@ -898,8 +906,10 @@ pub struct BootInfo
     /// Always populated: the active paging mode's kernel-half base by
     /// default, or a 1 GiB-aligned randomized base within
     /// `[mode kernel-half base, kernel_virtual_base - guard -
-    /// direct-map ceiling]` when boot entropy is available
-    /// ([`KASLR_DM_RANDOMIZED`]). The kernel validates the value against
+    /// direct-map ceiling]` when KASLR entropy is available and the
+    /// `nokaslr` knob is absent ([`KASLR_DM_RANDOMIZED`]; the kernel-half
+    /// base with [`KASLR_DM_WINDOW_LIMITED`] when that window holds fewer
+    /// than two slots). The kernel validates the value against
     /// the active mode and [`direct_map_ceiling`] before publishing it;
     /// like `kernel_virtual_base` it is a KASLR secret, scrubbed from this
     /// donated page once the kernel has consumed it (Phase 5).
@@ -907,19 +917,22 @@ pub struct BootInfo
 
     /// KASLR status flags (`KASLR_*` bits): which layout dimensions were
     /// randomized, which entropy source fed the draw, and why
-    /// randomization was skipped when it was. When entropy was available, an
-    /// `ET_EXEC` image is pinned at the link base with its source bits set and
-    /// [`KASLR_IMAGE_RANDOMIZED`] clear; the direct-map bits still apply. Zero
-    /// means an entirely un-randomized layout (no boot entropy and no override
-    /// knob).
+    /// randomization was skipped when it was. When KASLR entropy was available,
+    /// an `ET_EXEC` image is pinned at the link base with its source bits set
+    /// and [`KASLR_IMAGE_RANDOMIZED`] clear; the direct-map bits still apply. Zero
+    /// means an entirely un-randomized layout (no KASLR entropy and no override
+    /// knob); a pool seed may still be present in `boot_entropy_seed`.
     pub kaslr_flags: u32,
 }
 
 // ── KASLR flags (protocol version 14) ────────────────────────────────────────
 
-/// `kaslr_flags` bit 0: the kernel image slide was drawn from boot entropy
-/// (a PIE with entropy; the draw may select slide 0 by chance). Clear for an
-/// `ET_EXEC` image, the override knob, and no entropy.
+/// `kaslr_flags` bit 0: the kernel image slide was drawn from the KASLR
+/// entropy (a PIE with KASLR entropy; the draw may select slide 0 by chance).
+/// Clear for an `ET_EXEC` image, the override knob, and no KASLR entropy.
+/// A compliant bootloader MUST set this bit whenever `kernel_virtual_base`
+/// differs from [`layout::KERNEL_LINK_BASE`] (a nonzero slide is taken only
+/// from a KASLR draw); the kernel halts at Phase 0 otherwise.
 pub const KASLR_IMAGE_RANDOMIZED: u32 = 1 << 0;
 
 /// `kaslr_flags` bit 1: the direct-map base was randomly drawn from a window

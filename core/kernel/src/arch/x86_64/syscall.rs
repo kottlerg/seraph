@@ -3,7 +3,9 @@
 
 // core/kernel/src/arch/x86_64/syscall.rs
 
-//! SYSCALL/SYSRET MSR setup and entry stub for x86-64 (Phase 9).
+//! SYSCALL/SYSRET MSR setup and entry stub for x86-64 (configured on the BSP in
+//! Phase 5 and on each AP during Phase 8 bring-up; see
+//! [initialization.md](../../../docs/initialization.md) § Phase 5 and § Phase 8).
 //!
 //! Configures the MSRs required by the SYSCALL instruction:
 //!
@@ -13,15 +15,44 @@
 //!     - bits [63:48] = 0x0010: SYSRET64 gives CS=(0x10+16)|3=0x23 (user),
 //!       SS=(0x10+8)|3=0x1B (user DS).
 //! - `IA32_LSTAR` — 64-bit entry point (`syscall_entry`).
-//! - `IA32_SFMASK` — clears RFLAGS.IF on entry.
+//! - `IA32_SFMASK` — clears RFLAGS.IF on entry, and no other RFLAGS bit (see
+//!   § Entry contract).
 //!
 //! ## Entry contract
 //! On SYSCALL: hardware saves RIP→RCX, RFLAGS→R11, applies SFMASK.
-//! RSP and segment registers are NOT changed by the hardware.
+//! It loads CS and SS from STAR; RSP, DS, ES, FS and GS are NOT changed by the
+//! hardware.
 //!
-//! We save R11 (user RFLAGS) to `SYSCALL_SCRATCH` immediately, use R11 to
-//! shuttle user RSP to `SYSCALL_USER_RSP`, switch to `SYSCALL_KERNEL_RSP`,
-//! then rebuild R11 from the scratch before saving the full `TrapFrame.`
+//! SFMASK masks only IF, so the user's RFLAGS.AC, TF, DF, NT and IOPL reach
+//! ring 0 unchanged, and the stub executes neither `clac` nor `cld`. The
+//! resulting SMAP gap is defined in `docs/memory-model.md` § Kernel Isolation —
+//! SMEP and SMAP. A user-set TF raises `#DB` in ring 0 while the stub still
+//! runs on the user RSP (`#DB` has no IST); a user-set DF reverses
+//! compiler-generated string operations in kernel code and the `rep movsb` in
+//! `copy_user` (`cpu.rs`), so a user copy writes or reads kernel memory below
+//! the kernel-side buffer. This is a known defect (#443).
+//!
+//! The `#DB` exception-frame push at CPL 0 is an explicit supervisor-mode
+//! access, so AC governs it: Intel SDM Vol. 3A § 4.6 gives GDT, LDT, IDT and
+//! TSS accesses as its examples of implicit accesses, and a stack push during
+//! event delivery is not among them. A user-set TF therefore makes the push,
+//! and the `#DB` handler's stack, land where the user RSP points. A writable
+//! kernel address takes no fault, nor does a writable user page while AC is
+//! set; a non-canonical, unmapped or read-only (CR0.WP) RSP, or a user page
+//! with AC clear, faults to `#DF`. The SMAP gap is defined in
+//! `docs/memory-model.md` § Kernel Isolation — SMEP and SMAP, and the kernel
+//! RIP the frame discloses in `core/kernel/docs/cross-boundary-disclosure.md`
+//! § Classification. This is part of the same known defect (#443).
+//!
+//! The stub executes no `swapgs`: the kernel holds its per-CPU pointer in the
+//! GS base and never swaps it, so a ring-3 `mov gs` with the user selector
+//! reloads the GS base that the stub's `gs:[...]` accesses and every later
+//! per-CPU access use. This is a known defect (#443).
+//!
+//! We save R11 (user RFLAGS) to `PerCpuData::scratch` (`gs:[24]`) immediately,
+//! use R11 to shuttle user RSP to `PerCpuData::user_rsp` (`gs:[16]`), switch to
+//! `PerCpuData::kernel_rsp` (`gs:[8]`), then rebuild R11 from the scratch slot
+//! before saving the full `TrapFrame`.
 //!
 //! ## Per-CPU layout (`PerCpuData` GS-relative offsets)
 //! - `gs:[8]`  (`PERCPU_KERNEL_RSP_OFFSET`) — kernel RSP loaded at entry
@@ -39,6 +70,8 @@ const IA32_LSTAR: u32 = 0xC000_0082;
 const IA32_SFMASK: u32 = 0xC000_0084;
 
 const EFER_SCE: u64 = 1 << 0;
+/// SFMASK value: clears RFLAGS.IF only. AC, TF, DF, NT and IOPL are not
+/// masked, a known defect (#443; see the module § Entry contract).
 const SFMASK_CLEAR_IF: u64 = 1 << 9;
 
 /// STAR value:
@@ -75,7 +108,7 @@ pub unsafe fn set_kernel_rsp(rsp: u64)
 
 // ── syscall_entry ─────────────────────────────────────────────────────────────
 
-/// SYSCALL entry stub (Phase 9).
+/// SYSCALL entry stub (installed in `IA32_LSTAR` by [`init`]).
 ///
 /// On SYSCALL hardware saves: RIP→RCX, RFLAGS→R11. Does NOT change RSP.
 /// This stub:
@@ -87,8 +120,13 @@ pub unsafe fn set_kernel_rsp(rsp: u64)
 /// 6. Calls `crate::syscall::dispatch`.
 /// 7. Restores registers and executes `sysretq`.
 ///
+/// Steps 1 and 2 run on the user RSP, and no step clears RFLAGS.AC or DF, so
+/// the user's AC, TF and DF stay in effect in ring 0 (a known defect, #443;
+/// see the module § Entry contract).
+///
 /// GS-base must point to a valid `PerCpuData` (installed by `percpu::init_bsp`
-/// in Phase 5) before any user thread executes a SYSCALL.
+/// in Phase 5) before any user thread executes a SYSCALL. Ring 3 can reload
+/// it (a known defect, #443; see the module § Entry contract).
 #[cfg(not(test))]
 #[unsafe(naked)]
 unsafe extern "C" fn syscall_entry()
@@ -135,7 +173,7 @@ unsafe extern "C" fn syscall_entry()
         "mov [rsp + 136], r11",     // rsp    = user RSP
         "mov qword ptr [rsp + 144], 0x23", // cs = USER_CS
         "mov qword ptr [rsp + 152], 0x1b", // ss = USER_DS
-        "mov qword ptr [rsp + 160], 0",    // fs_base (Phase 9: zero)
+        "mov qword ptr [rsp + 160], 0",    // fs_base: unused (TLS base is SavedState.fs_base)
 
         // ── Phase 3: dispatch ─────────────────────────────────────────────
         "mov rdi, rsp",             // arg0 = *mut TrapFrame
@@ -171,7 +209,8 @@ unsafe extern "C" fn syscall_entry()
 
 /// Configure the SYSCALL/SYSRET mechanism.
 ///
-/// Enables SYSCALL in EFER, programs STAR/LSTAR/SFMASK.
+/// Enables SYSCALL in EFER, programs STAR/LSTAR/SFMASK. SFMASK clears only
+/// RFLAGS.IF (a known defect, #443; see the module § Entry contract).
 ///
 /// # Safety
 /// Ring 0. GDT must have the Seraph layout before this call.

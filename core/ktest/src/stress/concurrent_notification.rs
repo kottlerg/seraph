@@ -94,8 +94,8 @@ pub fn run(ctx: &TestContext) -> TestResult
     }
 
     // Wait for all senders to report done. Each child ORs a unique bit into
-    // `done`, so we wait until every `NUM_SENDERS` bit is set (one blocking
-    // wait suffices since the last child to finish will set the final bit).
+    // `done`; each wait returns and clears the bits accumulated since the
+    // previous one, so the loop ORs them until every `NUM_SENDERS` bit is set.
     let mut done_bits: u64 = 0;
     while done_bits != ALL_BITS
     {

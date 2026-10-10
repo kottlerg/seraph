@@ -44,8 +44,8 @@ or reused.
 
 A server that needs to delegate work may make a downstream call before replying: the pending reply
 stays bound to the receiving thread until that thread replies, and the downstream call does not
-touch that binding. A delegating server therefore replies before it next receives. When a later
-receive delivers a message while a reply is still pending, the kernel overwrites the binding. The
+touch that binding. A delegating server therefore replies before it next receives. When the kernel
+binds a new caller while a reply is still pending, it overwrites the binding. The
 displaced caller (a thread blocked in `call` or a fault-blocked thread) is then outside every
 guarantee the system and kernel documents state for a blocked or bound thread: no reply reaches it;
 stopping it, tearing down its CSpace or AddressSpace, or deleting its last Thread capability can
@@ -145,9 +145,11 @@ is otherwise O(1) and non-blocking.
 Events are not coalesced. "Process A exited, then process B exited" is preserved
 as two distinct entries in order.
 
-**Receipt:** The receiver waits on the queue and receives the next available entry.
-If multiple entries are available, subsequent receives return them in order without
-blocking.
+**Receipt:** The receiver waits on the queue and receives the next available entry, except
+through the stale plain-sleep entry ([#443](https://github.com/kottlerg/seraph/issues/443); see
+[thread-lifecycle-and-sleep.md](../core/kernel/docs/thread-lifecycle-and-sleep.md#sys_thread_sleep-and-the-plain-sleep-path)
+§ `sys_thread_sleep` and the Plain-Sleep Path). If multiple entries are available, subsequent
+receives return them in order without blocking.
 
 Event queues are appropriate for: process lifecycle events (exit, notification delivery),
 anything where ordering or count of events matters, and cases where coalescing would
@@ -182,8 +184,11 @@ resuming it, or killing it on `FAULT_REPLY_KILL` — or the binding is severed a
 is killed (severing by clearing the binding mid-fault: design intent; not yet implemented,
 #242). This reuses the call/reply machinery above — the suspended thread occupies the
 caller's role and the handler services it with the ordinary receive/reply cycle. The
-guarantee does not hold for a fault-blocked thread displaced by a later receive on its handler
-while its reply is still pending, as
+guarantee holds except through the stale plain-sleep entry
+([#443](https://github.com/kottlerg/seraph/issues/443); see
+[thread-lifecycle-and-sleep.md](../core/kernel/docs/thread-lifecycle-and-sleep.md#sys_thread_sleep-and-the-plain-sleep-path)
+§ `sys_thread_sleep` and the Plain-Sleep Path), and does not hold for a fault-blocked thread
+displaced by a later receive on its handler while its reply is still pending, as
 [§ The Call/Reply Model](#the-callreply-model) describes
 ([#443](https://github.com/kottlerg/seraph/issues/443)). See [Fault Handling](fault-handling.md).
 
@@ -191,11 +196,13 @@ while its reply is still pending, as
 
 ## Receive-Failure Policy
 
-`SYS_IPC_RECV` pre-allocates worst-case capability-slot headroom (`MSG_CAP_SLOTS_MAX`) in the
-receiver's CSpace before parking, so capability transfer on the immediate-delivery path cannot
-fail mid-handshake. The consequence: a receiver whose CSpace cannot provide that headroom fails
-the receive *before* blocking. A structural-ceiling failure is not transient — an unguarded
-`loop { ipc_recv }` retries at syscall rate, indefinitely.
+`SYS_IPC_RECV` grows the receiver's CSpace to `MSG_CAP_SLOTS_MAX` free slots before parking,
+which makes a destination OOM on delivery unlikely but reserves nothing: a slot a sibling thread
+sharing the CSpace consumes in between can still fail the transfer after the sender is
+committed, and the message is then delivered with zero capabilities, per
+[§ Message Format](#message-format). The consequence: a receiver whose CSpace cannot grow to
+that headroom fails the receive *before* blocking. A structural-ceiling failure is not
+transient — an unguarded `loop { ipc_recv }` retries at syscall rate, indefinitely.
 
 Two mechanisms make the condition diagnosable:
 

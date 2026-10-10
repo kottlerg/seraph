@@ -9,7 +9,7 @@
 //! (id 0) populated with initial capabilities for all boot-provided hardware
 //! resources:
 //!
-//! - Usable physical memory → [`CapTag::Memory`] caps (MAP | WRITE | EXECUTE)
+//! - Usable physical memory → [`CapTag::Memory`] caps (MAP | WRITE | EXECUTE | RETYPE)
 //! - MMIO apertures (coarse non-RAM ranges from the boot protocol)
 //!   → [`CapTag::Mmio`] caps (MAP | WRITE)
 //! - One root [`CapTag::Interrupt`] range cap covering every valid IRQ id
@@ -22,8 +22,8 @@
 //! - One [`CapTag::SbiControl`] cap on RISC-V (all sanctioned SBI rights)
 //!
 //! The populated `CSpace` is stored in [`ROOT_CSPACE`] until Phase 9 hands it
-//! to the init process. Boot module ELF images get their own RO Memory caps
-//! in [`mint_module_memory_caps`].
+//! to the init process. Boot module ELF images get their own full-rights, reclaimable
+//! Memory caps in [`mint_module_memory_caps`] (see `docs/capability-model.md` § Memory).
 
 // cast_possible_truncation: u64→usize/u32/u16 capability field extractions bounded by capability space.
 #![allow(clippy::cast_possible_truncation)]
@@ -48,18 +48,21 @@ pub mod slot;
 pub mod split;
 pub mod transfer;
 
-// Re-exports for convenience. Many are consumed by future phases; suppress the
-// unused lint rather than removing symbols that future code will reference.
+// unused_imports: convenience re-exports of the cap subsystem's public types;
+// not every symbol has an in-crate consumer.
 #[allow(unused_imports)]
 pub use cspace::{CSpace, CapError, L2_SIZE};
+// unused_imports: same rationale as the `cspace` re-export above.
 #[allow(unused_imports)]
 pub use derivation::DERIVATION_LOCK;
+// unused_imports: same rationale as the `cspace` re-export above.
 #[allow(unused_imports)]
 pub use object::{
     AddressSpaceObject, CSpaceKernelObject, EndpointObject, InterruptObject, IoPortObject,
     KernelObjectHeader, MemoryObject, MmioObject, NotificationObject, ObjectType, SbiControlObject,
     SchedControlObject, ThreadObject,
 };
+// unused_imports: same rationale as the `cspace` re-export above.
 #[allow(unused_imports)]
 pub use slot::{
     AsRights, CSpaceId, CapKind, CapTag, CapabilitySlot, CsRights, EpRights, EqRights,
@@ -140,10 +143,12 @@ pub unsafe fn root_cspace_mut() -> Option<&'static mut CSpace>
 /// IDs are recycled via the [`CSPACE_FREE_LIST`] free list once
 /// [`free_cspace_id`] runs at the end of a `CSpace`'s `dealloc_object` pass,
 /// so this is a live-count bound, not a cumulative-ever bound. Per-id epochs
-/// in [`CSPACE_REGISTRY`], randomized on recycle, make any stale `SlotId`
-/// resolution fail fast on epoch mismatch, so recycling cannot mis-target a
-/// recycled tenant. The pre-unregister derivation drain (`dealloc_object`
-/// for `CSpaceObj`) additionally scrubs the back-links in steady state.
+/// in [`CSPACE_REGISTRY`], randomized on recycle, make a stale `SlotId`
+/// resolution fail fast on epoch mismatch, except with probability ~2⁻³² per
+/// intervening recycle; that residual is accepted (see
+/// `core/kernel/docs/capability-internals.md` § Representation). The
+/// pre-unregister derivation drain (`dealloc_object` for `CSpaceObj`)
+/// additionally scrubs the back-links in steady state.
 ///
 /// Live-count peaks in ktest stress sit in the low hundreds; 4096 gives
 /// 10–40× headroom. The registry (4096 × 16 B = 64 KiB) plus the free list
@@ -162,8 +167,10 @@ static HIGH_WATER_CSPACE_ID: AtomicU32 = AtomicU32::new(0);
 /// `ptr` is the live `CSpace` pointer or null when the slot is vacant.
 /// `epoch` is a generation tag randomized each time an id is freed
 /// (see [`free_cspace_id`]); a `SlotId` stamped with a stale epoch fails
-/// resolution at [`lookup_cspace`] so a recycled id cannot alias a foreign
-/// derivation link into the new tenant.
+/// resolution at [`lookup_cspace`], except with probability ~2⁻³² per
+/// intervening recycle, so a recycled id does not alias a foreign derivation
+/// link into the new tenant beyond that accepted residual (see
+/// `core/kernel/docs/capability-internals.md` § Representation).
 ///
 /// `align(16)` colocates `ptr` and `epoch` on the same cache line and leaves
 /// room for a future 16-byte CAS if contention warrants it.
@@ -355,13 +362,9 @@ pub fn unregister_cspace(id: CSpaceId)
 /// value fails resolution at [`lookup_cspace`], and the epoch carries no
 /// monotonic information that would leak recycle counts or rates.
 ///
-/// Excluding the current value guarantees an immediately-recycled `SlotId`
-/// always fails fast (ties to #174). A `SlotId` stale across *multiple*
-/// recycles can alias a later random epoch with probability ~2⁻³² per
-/// recycle — an accepted defense-in-depth trade for the eliminated
-/// enumeration leak (the capability, not the `SlotId`, is the authority).
-/// Unlike the former monotonic scheme there is no wrap point, so ids recycle
-/// indefinitely with no leak.
+/// The epoch-recycle design (random non-zero redraw excluding the prior
+/// value) is specified in `core/kernel/docs/capability-internals.md`
+/// § Representation.
 ///
 /// Asserts `id != 0`: the root `CSpace`'s id is reserved for kernel
 /// lifetime; the `HDR_FLAG_IS_ROOT` clamp in `dec_ref` should already make
@@ -491,7 +494,7 @@ pub fn sum_memory_available_bytes(cspace: &cspace::CSpace) -> u64
 /// `CSpace` whose occupancy peaks at boot and is bounded in steady state.
 /// Growth past the seeded pool returns the refillable `OutOfMemory`; init
 /// owns the shortfall and can refill via augment-mode `cap_create_cspace`
-/// against its own `CSpace` cap (`ProcessInfo.cspace_cap`).
+/// against its own `CSpace` cap (`InitInfo.cspace_cap`).
 #[cfg(not(test))]
 const ROOT_CSPACE_INIT_SLOT_CAPACITY: u64 = 1536;
 
@@ -511,14 +514,15 @@ const ROOT_CSPACE_INIT_PAGES: u64 =
 /// every initial cap-identity body.
 ///
 /// Today's footprint on `x86_64` is ~150 KB:
-/// ~15 KB for sub-page cap-identity bodies (≈ 110 bin-128 slots: 91 other
-/// RAM `MemoryObject`s + 10 `Mmio` wrappers + 1 `Interrupt` + 1
-/// `IoPort` + 1 `SchedControl` + 2 ACPI Memory caps + 6 module Memory caps +
-/// 3 init-segment Memory caps + 1 seed-tail Memory cap, plus the seed's own
-/// `RetypeAllocator` metadata), plus ~130 KB for init's bootstrap state
-/// (one [`AddressSpaceObject`] slab — wrapper page + root PT + PT growth
-/// pool, one [`CSpaceKernelObject`] slab — wrapper page + slot-page pool,
-/// one [`ThreadObject`] slab — kernel stack + wrapper/TCB).
+/// ~15 KB for sub-page cap-identity bodies (bin-128 slots: one RAM
+/// `MemoryObject` per coalesced drained extent, the seed tail included (see
+/// [`coalesce_ram_blocks`]) + 10 `Mmio` wrappers + 1 `Interrupt` + 1 `IoPort` +
+/// 1 `SchedControl` + 2 ACPI Memory caps + 6 module Memory caps + 3
+/// init-segment Memory caps, plus the seed's own `RetypeAllocator` metadata),
+/// plus ~130 KB for init's bootstrap state (one [`AddressSpaceObject`] slab —
+/// wrapper page + root PT + PT growth pool, one [`CSpaceKernelObject`] slab —
+/// wrapper page + slot-page pool, one [`ThreadObject`] slab — kernel stack +
+/// wrapper/TCB).
 /// `SEED_RESERVE_BYTES` is sized at 512 KB — generous headroom so future
 /// cap types and longer module lists land without revisiting the constant.
 ///
@@ -545,12 +549,11 @@ const SEED_RESERVE_BYTES: u64 = 512 * 1024;
 /// RAM via the seed-tail cap, which is virgin (`bump_offset = 0`) and
 /// behaves like every other RAM Memory cap.
 ///
-/// Pinned with a `+1` refcount in [`install_seed_memory`] so dealloc never
-/// fires against this static. The static's initial `ref_count = 1`
-/// represents that pin; every retyped descendant body adds another
-/// reference; reclaim of every descendant drops back to `1`, which is
-/// non-zero — `dec_ref` returns `1`, `dealloc_object` is never invoked,
-/// and the BSS storage stays valid for the lifetime of the kernel.
+/// Pinned by two references that are never released: the static's initial
+/// `ref_count = 1` and the `+1` added in [`install_seed_memory`]. Every retyped
+/// descendant body adds another reference; reclaim of every descendant drops
+/// back to `2`, which is non-zero — `dealloc_object` is never invoked, and the
+/// BSS storage stays valid for the lifetime of the kernel.
 ///
 /// Single-threaded boot context permits `static mut`; `addr_of(_mut)!`
 /// access patterns sidestep the `static_mut_refs` lint.
@@ -685,7 +688,8 @@ pub(crate) const POOL_SEED_PAGES: usize = 64;
 /// Every other page of RAM is drained for userspace and routes to memmgr's
 /// pool, leaving the post-handoff buddy fully empty. This value is a Phase-7
 /// diagnostic; the authoritative `kernel_reserved` is the complement of the
-/// `owns_memory` ledger computed at Phase 9 (`main.rs`).
+/// `owns_memory` ledger computed at Phase 9 (`core/kernel/src/main.rs`, from
+/// [`owns_memory_minted_bytes`]).
 #[cfg(not(test))]
 pub(crate) fn kernel_reserve_pages() -> usize
 {
@@ -784,9 +788,10 @@ pub(crate) fn init_stack_phys(i: usize) -> u64
 /// on the kernel-side Phase-9 bootstrap maps.
 ///
 /// MUST run before any [`mint_phase7_body`] / [`boot_retype_aspace`] /
-/// [`boot_retype_cspace`] / `boot_retype_thread_slab` call against the
-/// seed, and before any `map_user_page` consumer (the kernel PT pool
-/// must be live before Phase 9's init bootstrap maps run).
+/// [`boot_retype_cspace`] call against the seed, before Phase 9's
+/// `retype_allocate` of init's Thread slab, and before any `map_user_page`
+/// consumer (the kernel PT pool must be live before Phase 9's init bootstrap
+/// maps run).
 ///
 /// # Safety
 /// Single-threaded Phase 7. Buddy active.
@@ -987,8 +992,12 @@ fn coalesce_ram_blocks(blocks: &mut [RamBlock]) -> usize
 ///
 /// `init_pages` MUST be `>= 2`. Calls [`crate::fatal`] on retype-allocator
 /// exhaustion (boot cannot recover).
+///
+/// # Safety
+///
+/// Single-threaded boot (Phase 9). `seed` must be the SEED installed by
+/// [`drain_and_install_seed`]; `init_pages >= 2`.
 #[cfg(not(test))]
-#[allow(clippy::missing_safety_doc)]
 pub(crate) unsafe fn boot_retype_aspace(
     seed: &object::MemoryObject,
     init_pages: u64,
@@ -1087,8 +1096,13 @@ pub(crate) unsafe fn boot_retype_aspace(
 ///
 /// `init_pages` MUST be `>= 1`. Calls [`crate::fatal`] on retype-allocator
 /// exhaustion.
+///
+/// # Safety
+///
+/// Single-threaded Phase 7. `seed` must be the SEED installed by
+/// [`drain_and_install_seed`]; `init_pages >= 1`; `id` freshly allocated by
+/// [`alloc_cspace_id`] and not yet registered.
 #[cfg(not(test))]
-#[allow(clippy::missing_safety_doc)]
 pub(crate) unsafe fn boot_retype_cspace(
     seed: &object::MemoryObject,
     init_pages: u64,
@@ -1194,8 +1208,6 @@ pub(crate) fn mint_phase7_body<T>(body: T) -> NonNull<object::KernelObjectHeader
     }
 }
 
-// ── Phase 7 entry point ───────────────────────────────────────────────────────
-
 // ── CSpace layout ────────────────────────────────────────────────────────────
 
 /// Describes the `CSpace` slot layout after Phase 7 population.
@@ -1208,16 +1220,17 @@ pub struct CSpaceLayout
     pub memory_base: u32,
     /// Number of usable memory `Memory` capabilities.
     pub memory_count: u32,
-    /// First slot index of hardware resource capabilities (MMIO, IRQ, I/O port, firmware tables).
+    /// First slot index of the `Mmio` capabilities (RISC-V console UART, then
+    /// one per validated aperture).
     pub hw_cap_base: u32,
-    /// Number of hardware resource capabilities.
+    /// Number of `Mmio` capabilities.
     pub hw_cap_count: u32,
     /// Slot index of the `SchedControl` capability.
     pub sched_control_slot: u32,
     /// Slot index of the `SbiControl` capability (RISC-V only; 0 on x86-64).
     pub sbi_control_slot: u32,
-    /// Slot index of the root `Interrupt` range capability. Zero if no
-    /// valid range could be determined at boot.
+    /// Slot index of the root `Interrupt` range capability (always minted,
+    /// covering `ROOT_IRQ_COUNT` ids).
     pub irq_range_slot: u32,
     /// Slot index of the RO `Memory` cap covering the ACPI RSDP page.
     /// Zero if `BootInfo.acpi_rsdp` is zero.
@@ -1269,7 +1282,6 @@ pub const CSPACE_LAYOUT_MAX_DESCRIPTORS: usize = 4096 + boot_protocol::MAX_RECLA
 /// the kernel never re-reads this buffer.
 #[cfg(not(test))]
 pub static mut CSPACE_LAYOUT_DESCRIPTORS: [CapDescriptor; CSPACE_LAYOUT_MAX_DESCRIPTORS] = {
-    #[allow(clippy::declare_interior_mutable_const)]
     const VACANT: CapDescriptor = CapDescriptor {
         slot: 0,
         cap_type: init_protocol::CapType::Memory,
@@ -1301,7 +1313,6 @@ pub static mut CSPACE_LAYOUT_DESCRIPTORS: [CapDescriptor; CSPACE_LAYOUT_MAX_DESC
 /// `populate_cspace`, `mint_module_memory_caps`, and
 /// `mint_reclaim_memory_caps` writers that produced `layout`.
 /// Single-threaded boot guarantees no concurrent writer.
-#[allow(clippy::missing_safety_doc)]
 pub unsafe fn descriptors(layout: &CSpaceLayout) -> &'static [CapDescriptor]
 {
     debug_assert!(layout.descriptor_count <= CSPACE_LAYOUT_MAX_DESCRIPTORS);
@@ -1363,10 +1374,8 @@ fn push_descriptor(count: &mut usize, desc: CapDescriptor)
 /// Returns a [`CSpaceLayout`] describing the slot ranges populated. Calls
 /// [`crate::fatal`] on any allocation failure.
 ///
-/// # Safety
-///
-/// Must be called exactly once, single-threaded, after Phase 4 (per-CPU storage allocated)
-/// and Phase 3 (direct map active).
+/// Preconditions: called exactly once, single-threaded, after Phase 4
+/// (per-CPU storage allocated) and Phase 3 (direct map active).
 pub fn init_capability_system(mmio_apertures: &[MmioAperture], boot_info_phys: u64)
 -> CSpaceLayout
 {
@@ -1494,22 +1503,16 @@ fn populate_cspace(
     // buffer; this counter tracks how many have been written.
     let mut desc_count: usize = 0;
 
-    // Usable physical memory → Memory caps with MAP | WRITE | EXECUTE.
-    // Init is root authority; it holds the full right set for each Memory cap.
-    // W^X is enforced at mapping time — no page can be simultaneously
-    // writable and executable — but the cap carries both rights so init
-    // can derive attenuated sub-caps (MAP|WRITE for data, MAP|EXECUTE
-    // for code) when loading processes.
+    // Usable physical memory → Memory caps with MAP | WRITE | EXECUTE | RETYPE
+    // (rights policy and the mapping-time W^X rule: docs/capability-model.md § Memory).
     //
     // Memory caps are allocated FROM the buddy allocator so the same
     // physical pages are not double-booked between the kernel's internal
     // frame pool and userspace capabilities.
-    // Initialised to 0 so the test build (which uses an `if count == 0`
-    // guard inside its mmap loop to capture the first slot) compiles; the
-    // production build overwrites both before any read.
-    #[allow(unused_assignments)]
+    // Initialised to 0, the value reported when no RAM Memory cap is minted;
+    // both builds overwrite `memory_base` at their first mint
+    // (`if memory_count == 0`) and increment `memory_count` per mint.
     let mut memory_base: u32 = 0;
-    #[allow(unused_assignments)]
     let mut memory_count: u32 = 0;
 
     #[cfg(not(test))]
@@ -1530,10 +1533,12 @@ fn populate_cspace(
                 // Full retypable budget: this cap covers virgin RAM. The
                 // seed's ledger only debits for the MemoryObject body bytes.
                 available_bytes: core::sync::atomic::AtomicU64::new(cap_size),
-                // Buddy-backed: responsible for freeing its (disjoint) range
-                // on final destruction. The seed's own SEED_RESERVE_BYTES
-                // prefix is owned by the pinned SEED_MEMORY and never returns
-                // to the buddy.
+                // Drained RAM: `owns_memory` marks this cap as the range's owner.
+                // It routes to memmgr, which never destroys it; a free into the
+                // sealed buddy is an accounting violation
+                // (docs/userspace-memory-model.md § Ownership Boundaries). The
+                // seed's own SEED_RESERVE_BYTES prefix is owned by the pinned
+                // SEED_MEMORY.
                 owns_memory: core::sync::atomic::AtomicBool::new(true),
                 allocator: crate::cap::retype::RetypeAllocator::new_inline(),
                 lock: core::sync::atomic::AtomicU32::new(0),
@@ -1624,10 +1629,12 @@ fn populate_cspace(
     //
     // On RISC-V the kernel's UART MMIO range is advertised via
     // `BootInfo.kernel_mmio.uart_base` rather than the coarse aperture
-    // list (the ns16550 UART sits outside both the PLIC aperture and the
-    // PCIe apertures on every supported platform). Synthesise an extra
+    // list. The UART range can also lie inside an aperture (the boot
+    // loader's riscv64 platform defaults and DTB `ns16550a` seeds cover it),
+    // so this cap may overlap an aperture cap. Synthesise an extra
     // Mmio cap here so userspace init has a cap for it — init's
-    // serial scan looks for any aperture containing the resolved UART base.
+    // serial scan looks for the Mmio descriptor containing its fixed
+    // `UART_PHYS` (services/init/src/arch/riscv64/mod.rs).
     let mut hw_cap_base: u32 = 0;
     let mut hw_cap_count: u32 = 0;
 
@@ -2020,8 +2027,10 @@ fn read_dtb_totalsize(phys: u64) -> Option<u64>
 
 /// Mint `Memory` capabilities for boot modules into the root `CSpace`.
 ///
-/// Each boot module (raw ELF image for an early service) gets a read-only
-/// Memory cap. The kernel additionally publishes a name → slot mapping in
+/// Each boot module (raw ELF image for an early service) gets a full-rights,
+/// reclaimable Memory cap (`owns_memory = true`, full byte ledger), per
+/// `docs/capability-model.md` § Memory; loaders map the ELF source read-only.
+/// The kernel additionally publishes a name → slot mapping in
 /// [`CSpaceLayout::module_names`] so init can match modules by their
 /// bundle entry identifier instead of relying on ordinal position.
 ///
@@ -2058,15 +2067,16 @@ fn mint_module_memory_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &m
 
         // Register the module's pages as managed-but-not-free so the buddy's
         // `total_pages` ledger accounts for them (they are excluded from the
-        // free list — `mm/init.rs` filters loaded regions). These caps route
-        // to memmgr via reap and are not destroyed in the kernel; the
-        // post-handoff buddy is sealed, so the dealloc `free_range` path is a
-        // tripwire, not a routine reclaim. Idempotent at boot since module
-        // page ranges are disjoint. Production-only: `with_frame_allocator` is
-        // `cfg(not(test))`.
+        // free list — `mm::init::collect_usable_ranges` in core/kernel/src/mm/init.rs
+        // filters loaded regions). These caps route to memmgr via reap and are
+        // not destroyed in the kernel; the post-handoff buddy is sealed, so the
+        // dealloc `free_range` path is a tripwire, not a routine reclaim.
+        // Idempotent at boot since module page ranges are disjoint.
+        // Production-only: `with_frame_allocator` is `cfg(not(test))`.
         #[cfg(not(test))]
         // SAFETY: module pages were not added via `add_region`
-        // (`mm/init.rs` excludes loaded regions); single-threaded boot.
+        // (core/kernel/src/mm/init.rs `collect_usable_ranges` excludes loaded
+        // regions); single-threaded boot.
         unsafe {
             crate::mm::with_frame_allocator(|alloc| {
                 alloc.register_owned_range(aligned_base, rounded_size);
@@ -2078,14 +2088,15 @@ fn mint_module_memory_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &m
             base: aligned_base,
             size: rounded_size,
             // Boot module pages are reclaimable: full byte ledger so the
-            // pages can flow through `memmgr_labels::DONATE_FRAMES` into
-            // memmgr's pool once the loader (init or procmgr) has copied
-            // the ELF contents into the target process's AddressSpace.
+            // pages can flow through `memmgr_labels::DONATE_MEMORY_CAPS` into
+            // memmgr's pool at init's reap (docs/process-lifecycle.md § Init reap)
+            // once the loader (init or procmgr) has copied the ELF contents into
+            // the target process's AddressSpace.
             available_bytes: core::sync::atomic::AtomicU64::new(rounded_size),
-            // Reclaimable: when this cap's last refcount drops, the pages
-            // are returned to the buddy via `dealloc_object`. In normal
-            // operation memmgr never destroys the cap (it ingests it into
-            // its pool); this is a safety net.
+            // Reclaimable: `owns_memory` marks this cap as the pages' owner. It
+            // routes to memmgr via init's reap and is never destroyed; a
+            // `dealloc_object` free into the sealed buddy is an accounting
+            // violation (docs/userspace-memory-model.md § Ownership Boundaries).
             owns_memory: core::sync::atomic::AtomicBool::new(true),
             allocator: crate::cap::retype::RetypeAllocator::new_inline(),
             lock: core::sync::atomic::AtomicU32::new(0),
@@ -2140,12 +2151,13 @@ fn mint_module_memory_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &m
 /// module bodies are excluded because [`mint_module_memory_caps`]
 /// covers them) — and mints one reclaimable `MemoryObject`
 /// cap per range with `owns_memory = true` and the full byte ledger.
-/// Each cap is inserted into the root `CSpace` and a matching
-/// `CapDescriptor` entry pushed into `layout.descriptors`, so the cap
-/// reaches init through the standard descriptor-table walk in the same
-/// shape boot-module caps take. init routes each cap to memmgr via reap;
-/// the post-handoff buddy is sealed, so the `dealloc_object` → `free_range`
-/// path is a tripwire for a leaked cap, not a routine reclaim.
+/// Each cap is inserted into the root `CSpace` and a matching `CapDescriptor`
+/// entry pushed into [`CSPACE_LAYOUT_DESCRIPTORS`] (counted by
+/// `layout.descriptor_count`), so the cap reaches init through the standard
+/// descriptor-table walk in the same shape boot-module caps take. init routes
+/// each cap to memmgr via reap; the post-handoff buddy is sealed, so the
+/// `dealloc_object` → `free_range` path is a tripwire for a leaked cap, not a
+/// routine reclaim.
 ///
 /// Entries marked [`boot_protocol::RECLAIM_FLAG_LATE`] are skipped here
 /// and minted later by [`mint_late_reclaim_memory_caps`] after SMP
@@ -2160,9 +2172,9 @@ fn mint_module_memory_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &m
 /// the descriptor table to discover the caps. There is no dedicated
 /// `reclaim_memory_base` / `reclaim_memory_count` pair on [`CSpaceLayout`]
 /// because reclaim caps carry no per-index meaning — unlike boot
-/// modules where slot N == module N, reclaim caps are a homogeneous
-/// pool and userspace inspects each `CapDescriptor.aux0`/`aux1` to
-/// learn the underlying physical range.
+/// modules, which init resolves by name through [`CSpaceLayout::module_names`],
+/// reclaim caps are a homogeneous pool and userspace inspects each
+/// `CapDescriptor.aux0`/`aux1` to learn the underlying physical range.
 fn mint_reclaim_memory_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &mut CSpaceLayout)
 {
     mint_reclaim_pass(cspace, boot_info, layout, false, "reclaim");
@@ -2317,11 +2329,10 @@ fn mint_reclaim_pass(
             header: KernelObjectHeader::with_ancestor(ObjectType::Memory, seed_header_nn()),
             base: phys_base,
             size: size_bytes,
-            // Reclaim pages carry the full byte ledger and `owns_memory = true`
-            // so the buddy ledger is balanced when the cap is eventually
-            // destroyed — matching the boot-module precedent above. Routing
-            // beyond init's CSpace (donate-to-memmgr vs cascade-to-buddy) is
-            // a userspace policy decision; the kernel only delivers the cap.
+            // Reclaim pages carry the full byte ledger and `owns_memory = true`,
+            // matching the boot-module caps above; init donates every reclaim
+            // cap to memmgr at reap and the sealed buddy receives none
+            // (core/kernel/docs/initialization.md § Phase 7).
             available_bytes: core::sync::atomic::AtomicU64::new(size_bytes),
             owns_memory: core::sync::atomic::AtomicBool::new(true),
             allocator: crate::cap::retype::RetypeAllocator::new_inline(),
@@ -2375,8 +2386,8 @@ fn mint_reclaim_pass(
 /// # Safety contract
 ///
 /// `T` must be `#[repr(C)]` with `KernelObjectHeader` as its first field
-/// (offset 0). Dropping the returned pointer requires reconstructing the
-/// original `Box<T>` based on `header.obj_type` (future phases).
+/// (offset 0). The test build never drops the returned pointer: every
+/// test-path kernel object is leaked.
 #[cfg(test)]
 fn nonnull_from_box<T>(b: Box<T>) -> NonNull<KernelObjectHeader>
 {
@@ -2576,8 +2587,8 @@ mod tests
     /// `CSpaceId` reserved for the recycle test below. `CSPACE_REGISTRY` is a
     /// process-wide static and `cargo test` runs tests concurrently, so every
     /// host `#[test]` that registers a `CSpace` directly — this one and the
-    /// derivation-tree tests in `cap/derivation.rs`, which use the `31xx`
-    /// block — picks an id unique to that test; nothing enforces it. A high
+    /// derivation-tree tests in `core/kernel/src/cap/derivation.rs`, which use
+    /// the `31xx` block — picks an id unique to that test; nothing enforces it. A high
     /// id keeps this one clear of that block.
     const RECYCLE_TEST_ID: CSpaceId = (MAX_CSPACES as u32) - 1;
 

@@ -9,18 +9,11 @@
 //!
 //! ## The hazard
 //!
-//! `sys_thread_stop` on a `Running` remote target commits `Stopped` under all
-//! CPU locks, then *drains* the target off the owning CPU's `current` (a
-//! cross-CPU spin). The drain's termination rests on the target staying in a
-//! state `schedule()`'s requeue denylist rejects (`Stopped`), so the owning CPU
-//! deschedules it without re-linking. A concurrent `sys_thread_start` breaks
-//! that: it resumes the target out of `Stopped` (last-writer-wins) and
-//! re-dispatches it onto its pinned CPU, where a sole runnable spinner never
-//! leaves `current`. Without a `state == Stopped` re-check the drain spins
-//! forever — two CONTROL-cap holders racing stop/start wedge a CPU
-//! (`thread.rs::sys_thread_stop`; see
-//! `docs/thread-lifecycle-and-sleep.md § sys_thread_stop Cross-CPU Stop
-//! Protocol`).
+//! A concurrent `sys_thread_start` that resumes the target out of `Stopped`
+//! while `sys_thread_stop`'s cross-CPU drain spins must not wedge the drain;
+//! the invariant and its `state == Stopped` re-check are specified in
+//! core/kernel/docs/thread-lifecycle-and-sleep.md § `sys_thread_stop` Cross-CPU
+//! Stop Protocol (core/kernel/src/syscall/thread.rs `sys_thread_stop`).
 //!
 //! ## How this exercises it
 //!
@@ -29,20 +22,21 @@
 //!     its CPU.
 //!   * STOPPER issues `thread_stop(victim)` — opening the cross-CPU drain.
 //!   * STARTER issues `thread_start(victim)` — the resume that, when it lands
-//!     during the drain, re-dispatches the victim and (pre-fix) wedges the
-//!     stopper.
+//!     during the drain, re-dispatches the victim and (without the drain's
+//!     `state == Stopped` re-check) wedges the stopper.
 //!
 //! STOPPER and STARTER are released at the same instant by a shared-memory
 //! barrier (the [`RELEASE`] `AtomicU32`), so the resume overlaps the drain.
 //! The resume also drives `sys_thread_start`'s `await_descheduled`
-//! resume-from-stop path (the #330 fix) on every armed cycle, a smoke check of
-//! that code.
+//! resume-from-stop path (the #314/#293 drain) on every cycle where the stop
+//! commits first, a smoke check of that code.
 //!
-//! This cell does **not** reproduce the #330 cross-CPU double-dispatch: the
+//! This cell does **not** reproduce the #314/#293 cross-CPU double-dispatch: the
 //! resume force-links onto the victim's *own* CPU (`select_target_cpu` returns
-//! the hard-affinity / save-window-pinned CPU), and the all-CPU-locks
-//! discipline closes the force-link-while-`current` window. It targets the
-//! sibling liveness invariant of the stop drain instead.
+//! the hard-affinity / save-window-pinned CPU), and `sys_thread_start`'s
+//! `await_descheduled` drain closes the force-link-while-`current` window
+//! (core/kernel/docs/thread-lifecycle-and-sleep.md § Lifecycle State Machine).
+//! It targets the sibling liveness invariant of the stop drain instead.
 //!
 //! ## Anti-vacuous guard
 //!
@@ -55,18 +49,19 @@
 //! CYCLES`. As with `stop_reply_race`, this proves the armable setup, not the
 //! exact wedging sub-interleaving — a regression surfaces as a kernel hang
 //! (the stopper's `thread_stop` never returns, so `BIT_STOP_DONE` never
-//! arrives; every CPU goes idle and the softlockup watchdog fires), not as a
-//! test assertion.
+//! arrives; the victim CPU keeps running the resumed spinner, so the harness
+//! timeout reports the hang), not as a test assertion.
 //!
 //! ## Pass criterion
 //!
 //! Needs **≥ 3 CPUs**: the three roles must occupy three distinct cores so the
 //! stop is a real cross-CPU drain (stopper ≠ victim) and the resume runs
-//! concurrently with it (starter ≠ stopper). On the post-fix kernel the
-//! harness boots clean to `[ktest] ALL TESTS PASSED`. Reverting the drain's
-//! `state == Stopped` re-check wedges the stopper and the run hangs (the
-//! softlockup watchdog / harness timeout reports it) — raised by the kernel,
-//! not by this test.
+//! concurrently with it (starter ≠ stopper). With the drain's
+//! `state == Stopped` re-check in place the harness boots clean to
+//! `[ktest] ALL TESTS PASSED`. Reverting the drain's `state == Stopped`
+//! re-check wedges the stopper and the run hangs (the harness timeout reports
+//! it; the drain's `sys_thread_stop spin >100ms` diagnostic names the target)
+//! — raised by the kernel, not by this test.
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -223,7 +218,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 
         // Wait for both racing syscalls to return. If a regression wedges the
         // stopper's thread_stop drain, BIT_STOP_DONE never arrives and the run
-        // hangs (softlockup watchdog / harness timeout) — the FAIL signal.
+        // hangs (the harness timeout reports it) — the FAIL signal.
         while acc & ALL_DONE != ALL_DONE
         {
             let bits = notification_wait(done)

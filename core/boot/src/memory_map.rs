@@ -566,6 +566,7 @@ mod tests
         assert_eq!(out[0].physical_base, 0x4000);
         assert_eq!(out[0].size, 4 * 4096);
     }
+
     // ── derive_mmio_apertures ─────────────────────────────────────────────────
 
     fn mmio_desc(physical_start: u64, number_of_pages: u64) -> EfiMemoryDescriptor

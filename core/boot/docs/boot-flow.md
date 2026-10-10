@@ -296,9 +296,9 @@ the kernel has consumed them.
 
 [core/boot/README.md](../README.md), [ACPI Parsing](acpi.md), [Early Console](console.md),
 [Device Tree Parsing](dtb.md), [ELF Loading](elf-loading.md),
-[Firmware Parsing](firmware-parsing.md),
-[Memory Map Translation](memory-map.md), [Page Tables](page-tables.md),
-[UEFI Environment](uefi-environment.md), [Kernel Entropy Subsystem](../../kernel/docs/entropy.md),
+[Firmware Parsing](firmware-parsing.md), [Memory Map Translation](memory-map.md),
+[Page Tables](page-tables.md), [UEFI Environment](uefi-environment.md),
+[Kernel Entropy Subsystem](../../kernel/docs/entropy.md),
 [Kernel Initialization Sequence](../../kernel/docs/initialization.md),
 [Architecture Overview](../../../docs/architecture.md),
 [System Bootstrap](../../../docs/bootstrap.md), [xtask/README.md](../../../xtask/README.md)

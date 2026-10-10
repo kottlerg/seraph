@@ -12,8 +12,9 @@ five parts of `BootInfo`:
    facts carried in the same struct (`timebase_freq`, `hart_caps`). Not a
    capability surface, except on RISC-V, where the kernel mints one
    additional `Mmio` capability over the console UART range (`uart_base` /
-   `uart_size`); the ACPI seeds do not cover the UART, while the DTB seeds
-   can also include it as an aperture (see
+   `uart_size`). That range can also lie inside an aperture: the ACPI
+   seeder's arch defaults (`default_pci_apertures`) cover the QEMU virt UART
+   page, and the DTB seeder adds any `ns16550a` node's first `reg` entry (see
    [docs/capability-model.md](../../../docs/capability-model.md#initial-capability-distribution)).
 3. `mmio_apertures` — firmware parsing contributes coarse `{phys_base, size}`
    MMIO seed regions, which are merged with the UEFI memory map's MMIO

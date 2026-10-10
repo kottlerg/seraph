@@ -183,7 +183,8 @@ pub unsafe fn allocate_ap_trampoline(bs: *mut EfiBootServices) -> Option<u64>
 }
 
 /// QEMU virt RISC-V default MMIO apertures: PCI ECAM + 32-bit + 64-bit
-/// PCI windows, plus the Goldfish RTC register page at `0x101000`.
+/// PCI windows, plus the ns16550a UART register page at `0x1000_0000` and
+/// the Goldfish RTC register page at `0x101000`.
 ///
 /// Seeded unconditionally because EDK2 on the seraph boot path neither
 /// re-publishes the DTB via a UEFI configuration table nor emits ACPI

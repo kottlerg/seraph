@@ -197,14 +197,15 @@ The bootloader performs no allocation-dependent operations after `ExitBootServic
 ## Error Handling Strategy
 
 Every `BootError` that reaches `efi_main` is fatal. Two sites consume a `BootError` instead of
-returning it: a failed open of `\EFI\seraph\nokaslr` reads as an absent knob (step 5d), and a
-failed AP-trampoline allocation is logged as a warning (step 5b). Optional resources degrade
-instead of failing: an absent GOP leaves the system headless; an absent `EFI_RNG_PROTOCOL` or a
-failed pool draw falls back to the DTB `/chosen/rng-seed` (else no seed and the deterministic
-layout); and a failed KASLR draw after a successful pool draw, or a DTB seed under 24 bytes,
-keeps the pool seed and uses the deterministic layout. There is no recovery path for a
-`BootError`, no retry beyond the bounded `ExitBootServices` retry loop described above, and no
-fallback configuration.
+returning it: a failed open of `\EFI\seraph\nokaslr` reads as an absent knob
+([boot-flow.md § Step 5d](boot-flow.md#step-5d-apply-the-kaslr-slide)), and a failed
+AP-trampoline allocation is logged as a warning and records zero
+([boot-flow.md § Step 5b](boot-flow.md#step-5b-allocate-the-ap-trampoline-page)). Optional
+resources degrade instead of failing: an absent GOP leaves the system headless, and an absent or
+failing entropy source falls back as
+[boot-flow.md § Step 5c](boot-flow.md#step-5c-boot-entropy-seed) describes. There is no recovery
+path for a `BootError` that reaches `efi_main`, no retry beyond the bounded `ExitBootServices`
+retry loop described above, and no fallback configuration.
 
 ### BootError Type
 

@@ -162,6 +162,7 @@ The key symbols `header.S` uses; the linker script exports all but `pecoff_heade
 |---|---|
 | `_start` | First byte of the entry trampoline; also `AddressOfEntryPoint` RVA |
 | `_etext` | End of the `.text` section; used to compute `SizeOfCode` |
+| `_ebss` | End of `.bss`, the end of the writable `.data` PE section; used for `SizeOfInitializedData` and the `.data` section's `VirtualSize` / `SizeOfRawData` |
 | `__rela_dyn_start` / `__rela_dyn_end` | Bound the `.rela.dyn` array walked by the self-relocation loop |
 | `_reloc_start` | Start of the `.reloc` section; base-relocation VirtualAddress |
 | `_reloc_end` | End of the `.reloc` section |

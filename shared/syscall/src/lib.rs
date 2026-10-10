@@ -1678,8 +1678,8 @@ pub fn cap_move(src_cap: u32, dest_cspace_cap: u32, dest_index: u32) -> Result<u
 ///
 /// The kernel returns the inserted capability's handle (slot index plus
 /// generation), but this wrapper discards it and returns `Ok(())` (#443). The
-/// bare `dest_index` names the inserted capability only when the destination
-/// slot was never recycled (generation 0); after recycling, a later call that
+/// bare `dest_index` names the inserted capability only while the destination
+/// slot's generation is 0; once a recycle has advanced it, a later call that
 /// passes the bare `dest_index` fails with `InvalidCapability`.
 ///
 /// # Errors

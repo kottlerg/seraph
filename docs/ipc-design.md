@@ -191,11 +191,13 @@ while its reply is still pending, as
 
 ## Receive-Failure Policy
 
-`SYS_IPC_RECV` pre-allocates worst-case capability-slot headroom (`MSG_CAP_SLOTS_MAX`) in the
-receiver's CSpace before parking, so capability transfer on the immediate-delivery path cannot
-fail mid-handshake. The consequence: a receiver whose CSpace cannot provide that headroom fails
-the receive *before* blocking. A structural-ceiling failure is not transient — an unguarded
-`loop { ipc_recv }` retries at syscall rate, indefinitely.
+`SYS_IPC_RECV` grows the receiver's CSpace to `MSG_CAP_SLOTS_MAX` free slots before parking,
+which makes a destination OOM on delivery unlikely but reserves nothing: a slot a sibling thread
+sharing the CSpace consumes in between can still fail the transfer after the sender is
+committed, and the message is then delivered with zero capabilities, per
+[§ Message Format](#message-format). The consequence: a receiver whose CSpace cannot grow to
+that headroom fails the receive *before* blocking. A structural-ceiling failure is not
+transient — an unguarded `loop { ipc_recv }` retries at syscall rate, indefinitely.
 
 Two mechanisms make the condition diagnosable:
 

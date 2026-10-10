@@ -194,7 +194,10 @@ brackets are no-ops and the per-page calls are `invlpg` / INVPCID. The single-VA
 primitives stay `sfence.vma` — for one address a bracket is three instructions instead of
 one. Region teardown (`unmap_region_pooled`) uses the window for spans up to
 `RANGE_FLUSH_CEILING_PAGES` (32) and the coarse full flush above that, where one working-set
-refill is cheaper than per-page walks.
+refill is cheaper than per-page walks. A span that frees an intermediate table takes the full
+flush on RISC-V whatever its size: a VA-form fence need only drop leaf entries, so it would
+leave a cached non-leaf entry naming the freed frame (`invlpg` drops the paging-structure
+caches, so x86-64 keeps the window; `paging::VA_INVAL_DROPS_TABLE_CACHES`).
 
 ### NAPOT Contiguity (RISC-V)
 

@@ -186,6 +186,13 @@ pub unsafe fn flush_page(virt: u64);
 /// (x86-64 CR3 reload; RISC-V `sfence.vma zero, zero`).
 pub unsafe fn flush_tlb_all();
 
+/// Whether the per-VA invalidations (`flush_page`, `inval_page`) also drop the
+/// cached paging-structure entries that name a freed intermediate table
+/// (x86-64 `true`: `invlpg`; RISC-V `false`: a VA-form fence is only required to
+/// invalidate leaf entries). Region teardown that frees tables uses the full
+/// flush where this is `false`.
+pub const VA_INVAL_DROPS_TABLE_CACHES: bool;
+
 /// Install `root_phys` as the active page table under hardware address-space
 /// tag `tag` (x86-64 PCID / RISC-V ASID) **without** flushing the TLB, so the
 /// outgoing space's cached translations survive (x86-64 sets CR3 bit 63 with

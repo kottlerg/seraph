@@ -9,7 +9,7 @@
 //! are silent on failure — the caller halts the CPU immediately. No output is
 //! produced here because the serial port has not been initialized yet.
 
-use boot_protocol::{BOOT_PROTOCOL_VERSION, BootInfo, layout};
+use boot_protocol::{BOOT_PROTOCOL_VERSION, BootInfo, KASLR_IMAGE_RANDOMIZED, layout};
 
 /// Validate the boot info pointer received from the bootloader.
 ///
@@ -25,6 +25,8 @@ use boot_protocol::{BOOT_PROTOCOL_VERSION, BootInfo, layout};
 /// 8. `direct_map_base` in the kernel half and 1 GiB-aligned.
 /// 9. Direct map (per [`layout::direct_map_ceiling`]) ends at or below
 ///    `kernel_virtual_base`.
+/// 10. A slid image (`kernel_virtual_base` above the link base) carries
+///     `KASLR_IMAGE_RANDOMIZED` in `kaslr_flags`.
 ///
 /// Returns `true` if all checks pass, `false` on the first failure.
 ///
@@ -110,5 +112,73 @@ pub unsafe fn validate_boot_info(boot_info: *const BootInfo) -> bool
         return false;
     }
 
+    // 10. A nonzero slide is reported as a randomized image.
+    if kvb != layout::KERNEL_LINK_BASE && info.kaslr_flags & KASLR_IMAGE_RANDOMIZED == 0
+    {
+        return false;
+    }
+
     true
+}
+
+#[cfg(test)]
+mod tests
+{
+    use super::validate_boot_info;
+    use boot_protocol::{
+        BOOT_PROTOCOL_VERSION, BootInfo, KASLR_IMAGE_RANDOMIZED, MemoryMapEntry, MemoryType, layout,
+    };
+
+    const SLIDE: u64 = 4 * layout::IMAGE_SLIDE_ALIGN;
+
+    /// A `BootInfo` that passes every check, over the one-entry map `ram`.
+    fn valid(ram: &[MemoryMapEntry; 1]) -> BootInfo
+    {
+        // SAFETY: every `BootInfo` field is an integer, a raw pointer, an
+        // array of those, or a `repr(u32)` enum with a 0 variant, so the
+        // all-zero bit pattern is a valid value.
+        let mut info: BootInfo = unsafe { core::mem::zeroed() };
+        info.version = BOOT_PROTOCOL_VERSION;
+        info.memory_map.entries = ram.as_ptr();
+        info.memory_map.count = 1;
+        info.init_image.segment_count = 1;
+        info.init_image.entry_point = 0x40_0000;
+        info.kernel_virtual_base = layout::KERNEL_LINK_BASE;
+        info.kernel_size = 0x20_0000;
+        info.direct_map_base = 0xFFFF_8000_0000_0000;
+        info
+    }
+
+    const RAM: [MemoryMapEntry; 1] = [MemoryMapEntry {
+        physical_base: 0,
+        size: 0x4000_0000,
+        memory_type: MemoryType::Usable,
+    }];
+
+    #[test]
+    fn unslid_image_without_randomized_flag_is_accepted()
+    {
+        let info = valid(&RAM);
+        // SAFETY: `info` is a live, aligned `BootInfo` over a live map.
+        assert!(unsafe { validate_boot_info(&raw const info) });
+    }
+
+    #[test]
+    fn slid_image_without_randomized_flag_is_rejected()
+    {
+        let mut info = valid(&RAM);
+        info.kernel_virtual_base = layout::KERNEL_LINK_BASE + SLIDE;
+        // SAFETY: as above.
+        assert!(!unsafe { validate_boot_info(&raw const info) });
+    }
+
+    #[test]
+    fn slid_image_with_randomized_flag_is_accepted()
+    {
+        let mut info = valid(&RAM);
+        info.kernel_virtual_base = layout::KERNEL_LINK_BASE + SLIDE;
+        info.kaslr_flags = KASLR_IMAGE_RANDOMIZED;
+        // SAFETY: as above.
+        assert!(unsafe { validate_boot_info(&raw const info) });
+    }
 }

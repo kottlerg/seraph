@@ -800,9 +800,12 @@ pub unsafe fn parse_aperture_seed(rsdp_addr: u64, out: &mut [MmioAperture]) -> u
                     // through the host bridge's `_CRS`, which the
                     // bootloader does not evaluate (no AML interpreter).
                     // We seed via an ECAM-base heuristic:
-                    //   ECAM < 2 GiB ⇒ QEMU virt (RISC-V): both windows
-                    //     at stable QEMU-defined offsets, `[1 GiB, 2 GiB)`
-                    //     and `[16 GiB, 32 GiB)`.
+                    //   ECAM < 2 GiB ⇒ QEMU virt (RISC-V): 32-bit window
+                    //     `[1 GiB, 2 GiB)`, fixed by QEMU; 64-bit window
+                    //     `[16 GiB, 32 GiB)`, which is QEMU's 64-bit window
+                    //     only for guests with at most about 14 GiB of RAM,
+                    //     because QEMU rounds the window base up past the
+                    //     end of RAM.
                     //   ECAM ≥ 2 GiB ⇒ q35 (x86-64): 32-bit window
                     //     below ECAM; 64-bit window `[4 GiB, 1<<MAXPHYADDR)`
                     //     so it covers wherever firmware places it

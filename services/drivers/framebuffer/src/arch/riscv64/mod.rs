@@ -24,9 +24,9 @@ pub fn fb_mmio_init(self_aspace: u32, mmio_cap: u32, total_pages: u64) -> Option
     {
         return None;
     }
-    // The kernel ignores the reserved `flags` argument: the mapping is
-    // writable because the `Mmio` cap carries the Write right, and the
-    // kernel applies uncacheable attributes to every page of the mapping.
-    syscall::mmio_map(self_aspace, mmio_cap, base_va, 0x2).ok()?;
+    // `flags` is reserved and the kernel ignores it, so this passes 0: the
+    // mapping is writable because the `Mmio` cap carries the Write right,
+    // and the kernel applies uncacheable attributes to every page of it.
+    syscall::mmio_map(self_aspace, mmio_cap, base_va, 0).ok()?;
     Some(base_va as *mut u8)
 }

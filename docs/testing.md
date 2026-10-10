@@ -432,10 +432,12 @@ are behaviour-neutral, and only they leave a trigger path untouched:
 - code compiled only under `#[cfg(test)]` (host tests, which
   `cargo xtask test` runs);
 - the text of a log or diagnostic message that no harness marker and no
-  `xtask` pattern (the `--fail` regex, a `test-*` command's match) matches.
+  `xtask` pattern (the `--fail` regex, a `test-*` command's match) matches;
+- deleting an item (function, constant, parameter) that nothing uses, which
+  the build on both architectures confirms: a remaining use fails to compile.
 
 Any other change on a trigger path, including a code change believed
-equivalent such as deleting an item with no callers, counts as touching it
+equivalent, counts as touching it
 and MUST run that path's local host runs. A behaviour-neutral delta is exempt
 only from this section's local host runs: it MUST still pass the baseline
 validation (`cargo xtask build`, then a `cargo xtask run` boot to the terminal

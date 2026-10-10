@@ -234,11 +234,13 @@ pub const SYS_THREAD_EXIT: u64 = 22;
 pub const SYS_THREAD_CONFIGURE: u64 = 23;
 /// Capability: copy a slot into another `CSpace`.
 ///
-/// arg0 = source slot index (caller's `CSpace`).
-/// arg1 = destination `CSpace` cap index (must have INSERT right).
+/// arg0 = source capability handle (caller's `CSpace`; generation-checked).
+/// arg1 = destination `CSpace` capability handle (must have INSERT right).
 /// arg2 = destination slot index, or `0` to let the kernel allocate a free slot
 ///        (slot 0 is permanently null, so it is a safe "kernel picks" sentinel).
-/// arg3 = rights mask (subset of source rights).
+///        This is the only bare placement index; it is not generation-checked.
+/// arg3 = rights mask; the effective rights are `rights_mask & source rights`
+///        (bits the source lacks are dropped, not rejected).
 ///
 /// Returns the destination capability handle (slot index plus generation).
 pub const SYS_CAP_COPY: u64 = 24;

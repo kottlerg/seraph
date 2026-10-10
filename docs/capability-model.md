@@ -724,6 +724,7 @@ The kernel does not provide:
 ## Summarized By
 
 [abi/process-abi/README.md](../abi/process-abi/README.md),
+[Firmware Parsing](../core/boot/docs/firmware-parsing.md),
 [Capability Subsystem Internals](../core/kernel/docs/capability-internals.md),
 [Kernel Initialization Sequence](../core/kernel/docs/initialization.md),
 [Scheduler Internals](../core/kernel/docs/scheduler.md),

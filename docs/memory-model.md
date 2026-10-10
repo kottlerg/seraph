@@ -252,9 +252,11 @@ Properties:
 The allocator manages a single zone covering all usable RAM. Physical-address-range
 constraints (e.g. DMA-accessible memory below a certain physical address) are not a
 kernel concern: DMA placement and isolation belong to devmgr and the memory authority
-in userspace (see [architecture.md](architecture.md)). IOMMU-based DMA isolation
-by devmgr is design intent; not yet implemented, so DMA currently runs unconfined
-(see [device-management.md](device-management.md) § DMA Safety Model).
+in userspace (see [architecture.md](architecture.md)). Physical-range (DMA-reachable)
+placement by the userspace memory authority is design intent; not yet implemented:
+memmgr's only allocation flag is `REQUIRE_CONTIGUOUS`. IOMMU-based DMA isolation by
+devmgr is design intent; not yet implemented, so DMA currently runs unconfined (see
+[device-management.md](device-management.md) § DMA Safety Model).
 
 Physical frame 0 (the zero page) is excluded from the allocator. The page-table and
 CSpace growth pools use a physical address of 0 as their free-list "empty" sentinel,
@@ -304,6 +306,7 @@ Retype and pool allocation MUST be handled as fallible at every call site.
 [ELF Loading](../core/boot/docs/elf-loading.md),
 [Memory Map Translation](../core/boot/docs/memory-map.md),
 [Page Tables](../core/boot/docs/page-tables.md),
+[core/kernel/README.md](../core/kernel/README.md),
 [Architecture Abstraction Layer](../core/kernel/docs/arch-interface.md),
 [Kernel Cross-Boundary Disclosure Inventory](../core/kernel/docs/cross-boundary-disclosure.md),
 [Kernel Initialization Sequence](../core/kernel/docs/initialization.md),

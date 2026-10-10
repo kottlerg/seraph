@@ -45,7 +45,7 @@ nothing matches, slot 0 of `FONT_9X20_EXT` (`U+FFFD`) is emitted.
 |---|---|
 | [`services/drivers/framebuffer`](../../services/drivers/framebuffer/README.md) | Owns one `Utf8Decoder` in its service loop; dispatches every assembled codepoint via `render_codepoint`. |
 | `core/kernel` | Early-boot / panic framebuffer console (`core/kernel/src/framebuffer.rs`). |
-| `core/boot` | UEFI bootloader pre-`ExitBootServices` framebuffer console (`core/boot/src/framebuffer.rs`). |
+| `core/boot` | UEFI bootloader framebuffer console, rendering diagnostics up to kernel handoff (`core/boot/src/framebuffer.rs`). |
 | `core/ktest` | ktest harness direct framebuffer output (`core/ktest/src/framebuffer.rs`). |
 
 Each consumer holds its own `Utf8Decoder` and feeds bytes through the
@@ -70,6 +70,7 @@ GPL-2.0-only for code. The bitmap data the crate resolves into lives in
 
 ## Summarized By
 
+[Early Console](../../core/boot/docs/console.md),
 [Console Model](../../docs/console-model.md),
 [programs/fb-charset/README.md](../../programs/fb-charset/README.md),
 [services/drivers/framebuffer/README.md](../../services/drivers/framebuffer/README.md)

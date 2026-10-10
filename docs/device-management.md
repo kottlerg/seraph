@@ -13,9 +13,8 @@ initialization and mints one `Mmio` capability per entry; on RISC-V it mints one
 the console UART range `BootInfo.kernel_mmio` names, which lies outside every aperture.
 These apertures, the arch-specific `BootInfo.kernel_mmio`, and the framebuffer description
 are the only device descriptors the bootloader produces. Device-level firmware parsing
-(enumerating devices from ACPI / DTB) is a userspace concern; the bootloader's narrow table
-walks are specified in [core/boot/docs/firmware-parsing.md](../core/boot/docs/firmware-parsing.md),
-and the kernel contains no parser.
+(enumerating devices from ACPI / DTB) is a userspace concern, and the kernel contains no
+parser.
 
 The kernel mints these capabilities in
 [`core/kernel/docs/initialization.md`](../core/kernel/docs/initialization.md) § Phase 7:

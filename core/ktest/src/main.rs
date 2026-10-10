@@ -11,7 +11,8 @@
 //! `init` entry decides which binary the bootloader hands off to.
 //! Receives the same initial capability set that init would, then:
 //!
-//! 1. **Tier 1** (`unit/`)        — exercises every kernel syscall in isolation.
+//! 1. **Tier 1** (`unit/`)        — exercises the kernel syscalls in isolation
+//!    (exceptions listed in `core/ktest/README.md` § Tier 1).
 //! 2. **Tier 2** (`integration/`) — cross-subsystem scenario tests.
 //! 3. **Tier S** (`stress/`)      — stress and race tests.
 //! 4. **Tier 3** (`bench/`)       — cycle-accurate benchmarks (`rdtsc` / `csrr cycle`).
@@ -438,7 +439,7 @@ fn run(info_ptr: u64) -> !
         sbi_shutdown::shutdown(info);
 
         // Shutdown failed; fall through to thread_exit.
-        log("ktest: shutdown failed, halting");
+        log("ktest: shutdown failed, exiting harness thread");
     }
 
     syscall::thread_exit()

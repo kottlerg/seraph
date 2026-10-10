@@ -59,12 +59,14 @@ codifies a "one file per surface/scenario/race" rule at the top of its
 
 ### Tier 1 — `src/unit/`
 
-Per-syscall isolation tests. Every kernel syscall except `SYS_ASPACE_BIND_NOTIFICATION`
-and `SYS_PROCESS_EXIT` (exercised in Tier 2 by `aspace_fault_notification_late_bind.rs`
-and `death_notification_late_bind.rs`) has at least one positive-path
+Per-syscall isolation tests. Every kernel syscall except `SYS_ASPACE_BIND_NOTIFICATION`,
+`SYS_PROCESS_EXIT`, and `SYS_THREAD_SET_FAULT_HANDLER` has at least one positive-path
 test and the most important negative paths (wrong rights, invalid arguments,
-wrong object state). Files are grouped by kernel subsystem, mirroring the
-kernel's own source layout.
+wrong object state). Those three are exercised in Tier 2, by
+`aspace_fault_notification_late_bind.rs`, by `death_notification_late_bind.rs`, and by
+`fault_pager_roundtrip.rs`, `fault_resume_modifies_pc.rs`, `fault_handler_declines_kills.rs`,
+and `fault_exception_redirect.rs` respectively. Files are grouped by kernel subsystem,
+mirroring the kernel's own source layout.
 
 | File | Syscalls / behaviour exercised |
 |---|---|
@@ -99,7 +101,7 @@ concurrent notification and queue events.
 | `cap_transfer.rs` | Cap rights flow through an IPC endpoint round-trip |
 | `cap_transfer_large.rs` | IPC transfer of a cap with a multi-batch child list, both directions |
 | `wait_concurrency.rs` | Wait set with concurrent notification + queue sources |
-| `memory_lifecycle.rs` | Memory split → map → protect → unmap with aspace\_query at each step |
+| `memory_lifecycle.rs` | Pool-frame map → protect → unmap, with `aspace_query` after the map and after the unmap |
 | `multi_caller_ipc_fifo.rs` | Three concurrent IPC callers verify FIFO send-queue ordering |
 | `cap_delegation_chain.rs` | Multi-level rights attenuation and cascaded revocation |
 | `tlb_coherency.rs` | Map/unmap cycles across CPUs to exercise TLB shootdown |

@@ -52,8 +52,10 @@ const IP_OFFSET: usize = 120; // TrapFrame.rip
 const IP_OFFSET: usize = 248; // TrapFrame.sepc
 
 // Child stacks for started children, to avoid aliasing. A stack is reused
-// only after its previous child is stopped and its Thread cap deleted
-// (`stop_again_invalid_state` and `write_regs_resume` share STACK_WRITE_REGS).
+// only after its previous child has stopped or exited on the passing path:
+// `stop_again_invalid_state` and `write_regs_resume` share STACK_WRITE_REGS
+// (each child is stopped), and `load_balancer_redistributes_skewed` and
+// `load_balancer_skips_pinned` share STACK_BALANCE_SPINNERS (each spinner exits).
 static mut STACK_CONFIGURE: ChildStack = ChildStack::ZERO;
 static mut STACK_STOP_REGS: ChildStack = ChildStack::ZERO;
 static mut STACK_WRITE_REGS: ChildStack = ChildStack::ZERO;
@@ -234,8 +236,8 @@ pub fn stop_again_invalid_state(ctx: &TestContext) -> TestResult
         .map_err(|_| "cap_copy (block) for double-stop test failed")?;
 
     // Shares STACK_WRITE_REGS with `write_regs_resume`; tests run sequentially
-    // and each child is stopped and its Thread cap deleted before the next
-    // test starts, so the stack is never live in two threads.
+    // and, on the passing path, each child is stopped before the next test
+    // starts, so the stack is never live in two threads.
     let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_WRITE_REGS));
     let blocker_arg = (u64::from(child_ready) << 32) | u64::from(child_block);
     crate::spawn::configure_and_start(&child, blocker_entry, stack_top, blocker_arg)
@@ -1007,8 +1009,6 @@ pub fn affinity_migrate_running(ctx: &TestContext) -> TestResult
 ///
 /// Each spinner publishes its current CPU into `BALANCE_OBSERVED_CPU[i]`
 /// on every loop iteration and exits when `BALANCE_SHOULD_EXIT` is set.
-// cast_possible_truncation: spinner indices are < BALANCE_MAX_SPINNERS, so every cast fits.
-#[allow(clippy::cast_possible_truncation)]
 fn balance_spawn_spinners(
     ctx: &TestContext,
     n: usize,
@@ -1237,42 +1237,42 @@ pub fn affinity_respected(ctx: &TestContext) -> TestResult
 /// a valid CPU, runs, and signals `0xBEEF`.
 ///
 /// Skips if only one CPU is online (requires SMP).
-pub fn default_affinity_bsp(ctx: &TestContext) -> TestResult
+pub fn default_affinity_runs(ctx: &TestContext) -> TestResult
 {
     // Skip if CPU 1 does not exist.
     let cpus =
         system_info(SystemInfoType::CpuCount as u64).map_err(|_| "system_info(CpuCount) failed")?;
     if cpus < 2
     {
-        crate::log("ktest: thread::default_affinity_bsp SKIP (requires SMP)");
+        crate::log("ktest: thread::default_affinity_runs SKIP (requires SMP)");
         return Ok(());
     }
 
     let sig = cap_create_notification(ctx.memory_base)
-        .map_err(|_| "create_notification for default_affinity_bsp failed")?;
+        .map_err(|_| "create_notification for default_affinity_runs failed")?;
     let child = crate::spawn::new_child(ctx)
-        .map_err(|_| "thread::default_affinity_bsp: spawn::new_child failed")?;
+        .map_err(|_| "thread::default_affinity_runs: spawn::new_child failed")?;
     let child_sig = cap_copy(sig, child.cs, RIGHTS_NOTIFY)
-        .map_err(|_| "cap_copy for default_affinity_bsp failed")?;
+        .map_err(|_| "cap_copy for default_affinity_runs failed")?;
 
     // Do NOT set affinity — leave it at default (AFFINITY_ANY).
     // Placement follows core/kernel/docs/scheduler.md § Thread Assignment.
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_DEFAULT_AFFINITY));
     crate::spawn::configure_and_start(&child, sender_entry, stack_top, u64::from(child_sig))
-        .map_err(|_| "thread::default_affinity_bsp: configure_and_start failed")?;
+        .map_err(|_| "thread::default_affinity_runs: configure_and_start failed")?;
 
     // If the thread successfully signals back, default affinity routing worked.
     let bits =
-        notification_wait(sig).map_err(|_| "notification_wait for default_affinity_bsp failed")?;
+        notification_wait(sig).map_err(|_| "notification_wait for default_affinity_runs failed")?;
     if bits != 0xBEEF
     {
         return Err("default affinity thread did not send expected bits (expected 0xBEEF)");
     }
 
-    cap_delete(child.th).map_err(|_| "cap_delete th after default_affinity_bsp failed")?;
-    cap_delete(sig).map_err(|_| "cap_delete sig after default_affinity_bsp failed")?;
-    cap_delete(child.cs).map_err(|_| "cap_delete cs after default_affinity_bsp failed")?;
+    cap_delete(child.th).map_err(|_| "cap_delete th after default_affinity_runs failed")?;
+    cap_delete(sig).map_err(|_| "cap_delete sig after default_affinity_runs failed")?;
+    cap_delete(child.cs).map_err(|_| "cap_delete cs after default_affinity_runs failed")?;
     Ok(())
 }
 

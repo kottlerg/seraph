@@ -103,8 +103,8 @@ pub(super) fn bench_tlb_shootdown(ctx: &crate::TestContext, iters: u32)
 
     // Print the header up front so failures in the spawn / notification_wait /
     // measure loop are bisectable on the boot log instead of looking
-    // like the bench never ran. Min/mean/max are logged after teardown
-    // whenever `iters > 0`, including after a loop that broke early (the mean
+    // like the bench never ran. Min/mean/max are logged after the measure loop
+    // runs with `iters > 0`, including after a loop that broke early (the mean
     // divides by `iters`, not the completed count; #444).
     log_bench_header("tlb_shootdown_unmap", iters);
 
@@ -597,8 +597,6 @@ pub(super) fn bench_tlb_shootdown_concurrent(ctx: &crate::TestContext, iters: u3
         // VA still mapped, and frame_pool::free requires the frame unmapped.
         // mem_unmap is idempotent, so this is a no-op for the normal path and
         // for frames whose worker never spawned.
-        // cast_possible_truncation: i < allocated ≤ MAX_PINNED.
-        #[allow(clippy::cast_possible_truncation)]
         let va = CONC_VA_BASE + (i as u64) * CONC_VA_STRIDE;
         let _ = syscall::mem_unmap(ctx.aspace_cap, va, 1);
         // SAFETY: frame is from the pool and now unmapped (above).

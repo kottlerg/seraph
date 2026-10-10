@@ -124,8 +124,6 @@ pub(super) fn log_bench_header(name: &str, n: u32)
     {
         while val > 0
         {
-            // cast_possible_truncation: val % 10 is < 10, which always fits in u8.
-            #[allow(clippy::cast_possible_truncation)]
             let d = (val % 10) as u8;
             digits[dlen] = b'0' + d;
             val /= 10;

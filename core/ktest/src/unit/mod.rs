@@ -521,8 +521,8 @@ pub fn run_all(ctx: &TestContext)
         thread::affinity_respected(ctx)
     );
     run_test!(
-        "thread::default_affinity_bsp",
-        thread::default_affinity_bsp(ctx)
+        "thread::default_affinity_runs",
+        thread::default_affinity_runs(ctx)
     );
     run_test!(
         "thread::affinity_migrate_ready_queued",

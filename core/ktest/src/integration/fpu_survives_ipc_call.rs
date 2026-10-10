@@ -7,19 +7,19 @@
 //! round-trip across CPU migration.
 //!
 //! Mirrors `core/ktest/src/unit/fpu.rs::preempt_isolation_cross_cpu` but
-//! substitutes an IPC call/reply for the notification rendezvous. The child issues `SYS_IPC_CALL`
-//! directly via inline asm so no Rust function boundary clobbers the live
-//! FP register file between "load pattern" and "capture pattern
-//! post-migration"; this is the only ktest call site that exercises the
-//! `SYS_IPC_CALL` register ABI without going through `shared/ipc`'s
-//! wrappers.
+//! substitutes an IPC call/reply for the notification rendezvous. The
+//! child issues `SYS_IPC_CALL` directly via inline asm so no Rust function
+//! boundary clobbers the live FP register file between "load pattern" and
+//! "capture pattern post-migration"; this is the only ktest call site that
+//! exercises the `SYS_IPC_CALL` register ABI without going through
+//! `shared/ipc`'s wrappers.
 //!
 //! Coverage: the kernel's eager-save / lazy-restore path is already
-//! exercised by `core/ktest/src/unit/fpu.rs::preempt_isolation_cross_cpu` via the notification
-//! rendezvous. This file adds the IPC-dispatch path — `sys_ipc_call`'s
-//! endpoint-block branch into the scheduler, and `sys_ipc_reply`'s wake —
-//! so a future IPC fast-path optimisation that skipped `switch_out_save`
-//! would surface here. Requires SMP; skips on UP.
+//! exercised by `core/ktest/src/unit/fpu.rs::preempt_isolation_cross_cpu`
+//! via the notification rendezvous. This file adds the IPC-dispatch path —
+//! `sys_ipc_call`'s endpoint-block branch into the scheduler, and
+//! `sys_ipc_reply`'s wake — so a future IPC fast-path optimisation that
+//! skipped `switch_out_save` would surface here. Requires SMP; skips on UP.
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -388,8 +388,10 @@ pub fn run(ctx: &TestContext) -> TestResult
         return Err("FP register file corrupted across SYS_IPC_CALL round-trip");
     }
     // Diagnostic only — do not gate on `observed_cpu`: this test checks FP
-    // state, which must be intact whichever CPU the child resumes on; strict
-    // affinity enforcement is covered by
+    // state, which must be intact whichever CPU the child resumes on. The
+    // flip above applies on wake through `select_target_cpu` (the Blocked
+    // path), and no test gates on the CPU that path lands on; only the
+    // Ready-queued migration path is gated, by
     // core/ktest/src/unit/thread.rs::affinity_migrate_ready_queued.
     Ok(())
 }

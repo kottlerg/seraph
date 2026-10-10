@@ -51,7 +51,10 @@ pub fn run(ctx: &TestContext) -> TestResult
     let done = cap_create_notification(ctx.memory_base)
         .map_err(|_| "concurrent_map_unmap: create done failed")?;
 
-    // Allocate frames from pool for each child.
+    // Allocate frames from pool for each child. Every `?` early return
+    // below skips the cleanup at the end of `run`: it leaks the pool frames
+    // already allocated and, past the first spawn, leaves the children
+    // already started running with their threads and CSpaces (#444).
     let mut memory_caps = [0u32; NUM_CHILDREN];
     for memory_cap in &mut memory_caps
     {
@@ -126,11 +129,13 @@ pub fn run(ctx: &TestContext) -> TestResult
     {
         cap_delete(threads[i]).ok();
         cap_delete(cspaces[i]).ok();
-        // SAFETY: memory_caps are from the pool. A child that reports success
-        // has unmapped its VA; a child that reports failure after a
-        // successful mem_map may leave its frame mapped, in which case this
-        // free does not meet frame_pool::free's unmapped precondition (the
-        // test then fails via child_failed).
+        // SAFETY: `memory_caps` are from the pool. A child that reports
+        // success has unmapped its VA, so `frame_pool::free`'s unmapped
+        // precondition holds for its frame. A child that exits on a failed
+        // `aspace_query` or `mem_unmap` leaves its frame mapped at its stress
+        // VA, and nothing here unmaps it: on that path this free breaks the
+        // precondition and a later `alloc` can hand out a frame that is still
+        // mapped (#444). The test still fails via `child_failed`.
         unsafe { crate::frame_pool::free(memory_caps[i]) };
     }
     cap_delete(done).ok();

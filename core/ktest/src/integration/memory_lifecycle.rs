@@ -24,10 +24,10 @@ pub fn run(ctx: &TestContext) -> TestResult
 {
     // ── 1. Allocate two frames from the pool. ────────────────────────────────
     //
-    // Pool frames are single-page (`frame_pool::init` splits the first RAM
-    // Memory cap into one-page frames), so there is no page boundary to
-    // `memory_split` at. Instead, allocate two frames to test
-    // map/unmap/protect without consuming segments.
+    // Pool frames are single-page (`frame_pool::init` splits a tail carved
+    // off the first RAM Memory cap into one-page frames), so there is no page
+    // boundary to `memory_split` at. Instead, allocate two frames to test
+    // map/unmap/protect.
     let mut memory_a = crate::frame_pool::FrameGuard::new(ctx.aspace_cap)
         .ok_or("integration::memory_lifecycle: frame pool exhausted (a)")?;
     let memory_b = crate::frame_pool::FrameGuard::new(ctx.aspace_cap)

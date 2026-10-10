@@ -29,7 +29,7 @@ pub enum ShutdownPolicy
     Always,
     /// Shut down only if all tests passed.
     Pass,
-    /// Never shut down (halt in place).
+    /// Never shut down; the harness thread exits after printing results.
     Never,
 }
 

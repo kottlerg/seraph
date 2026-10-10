@@ -82,6 +82,16 @@ claims.
    or when the body claims the whole PR is documentation-only and the PR
    diff is not.
 
+   Local host runs: `docs/testing.md` § Coverage tiers owns the trigger
+   paths, the runs each requires, and the behaviour-neutral categories
+   (its Behaviour-neutral changes paragraph). For each change the PR diff
+   makes on a trigger path, other than comment lines, the body MUST report
+   the local host run that section requires, or name the change and the
+   behaviour-neutral category it falls under, and the diff MUST bear that
+   category out. FAIL when a trigger-path change has neither, or when a
+   change named behaviour-neutral falls under no category that paragraph
+   lists.
+
 10. PR-body claims: the body's prose (Summary, Notes, and any section
     the template does not define) against the diff. Every file, argument,
     behaviour, or number the body describes as changed by this PR MUST exist

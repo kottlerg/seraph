@@ -424,8 +424,8 @@ documentation or comments only, and the pre-merge review's audit MUST check
 that against the diff.
 
 **Behaviour-neutral changes.** The local host runs above exercise what the
-built code does, so a trigger path counts as touched only when the delta
-changes that behaviour on it. Besides comment lines, these do not count:
+built code does. Besides comment lines, only the kinds of change listed here
+are behaviour-neutral, and only they leave a trigger path untouched:
 
 - adding, removing, or re-justifying a lint suppression (`#[allow(...)]`,
   `#[expect(...)]`) and its rationale;
@@ -434,10 +434,15 @@ changes that behaviour on it. Besides comment lines, these do not count:
 - the text of a log or diagnostic message that no harness marker and no
   `xtask` pattern (the `--fail` regex, a `test-*` command's match) matches.
 
-Such a delta still needs `cargo xtask build` on both architectures, since a
-suppression change can fail the clippy build, and the CI gate. The PR body
-names each such change and states why no local host run is owed; the
-pre-merge review's audit checks that against the diff.
+Any other change on a trigger path, including a code change believed
+equivalent such as deleting an item with no callers, counts as touching it
+and MUST run that path's local host runs. A behaviour-neutral delta is exempt
+only from this section's local host runs: it MUST still pass the baseline
+validation (`cargo xtask build`, then a `cargo xtask run` boot to the terminal
+pass marker, on both architectures) and the CI gate; a suppression change can
+fail the clippy build. The PR body MUST name each such change and state why no
+local host run is owed, and the pre-merge review's audit MUST check that
+against the diff.
 
 **Known boundaries**, established empirically (QEMU 11.0.1; update this
 list as the tracking Issues move):

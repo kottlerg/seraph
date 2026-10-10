@@ -458,6 +458,10 @@ formatter behavior MUST:
 
 Blanket or module-wide suppressions are forbidden without explicit justification.
 
+A suppression whose lint fires only in some build configurations (for example host test
+builds, where an item's only callers are compiled out) is valid; its rationale names the
+configuration in which the lint fires.
+
 ```rust
 // `capacity` is part of the public contract on all target architectures; the
 // field is unused on x86_64 but MUST NOT be removed.

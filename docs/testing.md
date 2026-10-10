@@ -427,8 +427,8 @@ that against the diff.
 built code does. Besides Markdown and comment lines, only the kinds of change listed here
 are behaviour-neutral, and only they leave a trigger path untouched:
 
-- adding, removing, or re-justifying a lint suppression (`#[allow(...)]`,
-  `#[expect(...)]`) and its rationale;
+- adding, removing, narrowing, or re-justifying a lint suppression (`#[allow(...)]`,
+  `#[expect(...)]`, `#[cfg_attr(<predicate>, allow(...))]`) and its rationale;
 - code compiled only under `#[cfg(test)]` (host tests, which
   `cargo xtask test` runs);
 - the text of a log or diagnostic message that no harness marker and no

@@ -363,8 +363,9 @@ macro_rules! paranoid_exit_asm {
 /// originated in the kernel, diagnostics are printed and the system halts.
 ///
 /// # Safety
-/// `tf` must point to a valid [`TrapFrame`] on the current stack; `vector` and
-/// `error_code` are the trap metadata from the stub frame.
+/// `tf` must point to a valid user-or-kernel [`TrapFrame`] on the current kernel
+/// stack; `vector` and `error_code` classify the fault (taken from the stub
+/// frame, or synthesized by `syscall_entry` for a non-canonical return RIP).
 #[cfg(not(test))]
 pub(super) unsafe extern "C" fn common_exception_handler(
     tf: *const TrapFrame,
@@ -372,7 +373,8 @@ pub(super) unsafe extern "C" fn common_exception_handler(
     error_code: u64,
 ) -> !
 {
-    // SAFETY: tf is valid — constructed by the entry trampoline on this stack.
+    // SAFETY: tf is valid per this function's contract — built on this kernel
+    // stack by an exception trampoline or by syscall_entry's register save.
     let f = unsafe { &*tf };
     // Read CR2 (faulting address) for page faults (vector 14).
     let cr2: u64 = if vector == 14
@@ -888,6 +890,7 @@ unsafe extern "C" fn common_irq_trampoline()
             tf_resume_asm!(),
             // ── ring-0: minimal save (no user state) ──
             "2:\n",
+            "lfence\n", // ring-0 path of the swap decision (see `entry_swapgs_asm`)
             "push rax\n",
             "push rcx\n",
             "push rdx\n",

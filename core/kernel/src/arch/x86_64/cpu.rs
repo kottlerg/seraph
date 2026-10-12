@@ -232,9 +232,9 @@ const CR4_FSGSBASE: u64 = 1 << 16;
 /// both.
 ///
 /// # Safety
-/// Must execute at ring 0. May only be called after the IDT is loaded so that
-/// a CR4 write fault is catchable (in practice both features are mandatory
-/// on the x86_64-v3 baseline this kernel targets).
+/// Must execute at ring 0. The IDT need not be loaded: CPUID gates both bits
+/// this sets and `CR4.FSGSBASE` is only cleared, so the CR4 write cannot fault,
+/// and the BSP calls this before `idt::init`.
 // similar_names: smep_present and smap_present are distinct CPU security features.
 #[cfg(not(test))]
 #[allow(clippy::similar_names)]

@@ -743,12 +743,10 @@ pub fn notification_send(sig: u32, bits: u64) -> Result<(), i64>
 /// register (rdx / a1). Mirrors `event_recv`; the split avoids aliasing
 /// bit-63-set bitmasks with the dispatcher's negative-Err encoding.
 ///
-/// A notification destroyed while the caller waits wakes it with `Ok(0)`
-/// rather than an error (a kernel defect tracked in #443).
-///
 /// # Errors
-/// Returns a negative `i64` error code if the notification cap is invalid or the
-/// wait is interrupted.
+/// Returns a negative `i64` error code if the notification cap is invalid, or
+/// `Interrupted` if the caller is stopped while waiting or the notification is
+/// destroyed under it.
 #[inline]
 pub fn notification_wait(sig: u32) -> Result<u64, i64>
 {
@@ -768,13 +766,12 @@ pub fn notification_wait(sig: u32) -> Result<u64, i64>
 ///
 /// Same register layout as [`notification_wait`]: status in the primary register,
 /// bitmask in the secondary. Timeout is notified in-band as `bits == 0`
-/// (legitimate because `notification_send` rejects zero-bit sends); `Ok(0)` is
-/// also returned when the notification is destroyed while the caller waits
-/// (#443).
+/// (legitimate because `notification_send` rejects zero-bit sends).
 ///
 /// # Errors
-/// Returns a negative `i64` error code if the notification cap is invalid or
-/// the wait is interrupted.
+/// Returns a negative `i64` error code if the notification cap is invalid, or
+/// `Interrupted` if the caller is stopped while waiting or the notification is
+/// destroyed under it.
 #[inline]
 pub fn notification_wait_timeout(sig: u32, timeout_ms: u64) -> Result<u64, i64>
 {
@@ -1841,12 +1838,10 @@ pub fn event_post(queue_cap: u32, payload: u64) -> Result<(), i64>
 /// Returns the payload word. The primary return register holds 0 on success;
 /// the payload is in the secondary return register (rdx / a1).
 ///
-/// A queue destroyed while the caller waits returns `Ok(0)`, a payload that
-/// was never posted, rather than an error (a kernel defect tracked in #443).
-///
 /// # Errors
-/// Returns a negative `i64` error code if the queue cap is invalid or the
-/// wait is interrupted.
+/// Returns a negative `i64` error code if the queue cap is invalid, or
+/// `Interrupted` if the caller is stopped while waiting or the queue is
+/// destroyed under it.
 #[inline]
 pub fn event_recv(queue_cap: u32) -> Result<u64, i64>
 {
@@ -1876,12 +1871,11 @@ pub fn event_try_recv(queue_cap: u32) -> Result<u64, i64>
 /// [`event_recv`]); `timeout_ms == u64::MAX` is a non-blocking poll (same as
 /// [`event_try_recv`]); any other value blocks for up to `timeout_ms`
 /// milliseconds, then returns `Err(-6)` (`WouldBlock`) if no post arrived.
-/// A queue destroyed while the caller waits returns `Ok(0)`, a payload that
-/// was never posted, rather than an error (a kernel defect tracked in #443).
 ///
 /// # Errors
-/// Returns `-6` (`WouldBlock`) on timeout or empty try-once, or another
-/// negative `i64` error code on invalid cap.
+/// Returns `-6` (`WouldBlock`) on timeout or empty try-once, `Interrupted` if
+/// the caller is stopped while waiting or the queue is destroyed under it, or
+/// another negative `i64` error code on invalid cap.
 #[inline]
 pub fn event_recv_timeout(queue_cap: u32, timeout_ms: u64) -> Result<u64, i64>
 {
@@ -1969,8 +1963,9 @@ pub fn wait_set_remove(ws_cap: u32, source_cap: u32) -> Result<(), i64>
 /// If multiple sources are ready, each call returns one badge without re-blocking.
 ///
 /// # Errors
-/// Returns a negative `i64` error code if the wait set cap is invalid or
-/// the wait is interrupted.
+/// Returns a negative `i64` error code if the wait set cap is invalid, or
+/// `Interrupted` if the caller is stopped while waiting or the wait set is
+/// destroyed under it.
 #[inline]
 pub fn wait_set_wait(ws_cap: u32) -> Result<u64, i64>
 {

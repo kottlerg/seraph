@@ -412,9 +412,7 @@ entire bitmask (see [ipc-design.md](../../../docs/ipc-design.md) § Notification
 - `rax`/`a0`: 0 on success; `SyscallError` on failure
 - `rdx`/`a1`: acquired bitmask on success (non-zero on notification wake,
   because `notification_send` rejects zero-bit sends; `0` when the timeout
-  elapses, or when the notification is destroyed while the caller waits, which
-  returns success with no `Interrupted` stamp, even with `timeout_ms` = `0`;
-  #443)
+  elapses)
 
 Same register layout as `SYS_EVENT_RECV`. The split avoids aliasing
 bit-63-set bitmasks with the dispatcher's negative-Err encoding, so the
@@ -422,7 +420,8 @@ full 64-bit bitmask range is usable.
 
 **Capability requirement:** `notification_cap` must have Wait rights.
 
-**Errors:** `InvalidCapability`, `InsufficientRights`, `Interrupted`.
+**Errors:** `InvalidCapability`, `InsufficientRights`, `Interrupted` (the caller was stopped, or
+the notification was destroyed while the caller waited).
 
 ---
 
@@ -468,13 +467,12 @@ Dequeue the next entry from an event queue with optional bounded wait.
 **Return:**
 
 - `rax`/`a0`: 0 on success; `SyscallError` on failure
-- `rdx`/`a1`: dequeued payload word (valid on success); a queue destroyed
-  while the caller is parked returns success with a payload of `0` that was
-  never posted (#443)
+- `rdx`/`a1`: dequeued payload word (valid on success)
 
 **Capability requirement:** `queue_cap` must have Recv rights.
 
-**Errors:** `InvalidCapability`, `InsufficientRights`, `WouldBlock`, `Interrupted`.
+**Errors:** `InvalidCapability`, `InsufficientRights`, `WouldBlock`, `Interrupted` (the caller was
+stopped, or the queue was destroyed while the caller was parked).
 
 `WouldBlock` covers both the try-once-empty case and the timer-fired case;
 the caller already knows which mode it asked for. The kernel uses an
@@ -483,7 +481,7 @@ out-of-band marker (`tcb.timed_out`) rather than an in-band
 (0 included; see [ipc-internals.md](ipc-internals.md) § Event Queue, Recv Path)
 — contrast `SYS_NOTIFICATION_WAIT`, where a notification wake never carries
 0 bits because `notification_send` rejects zero-bit sends, so a `0` result
-means the timeout elapsed or the notification was destroyed.
+means the timeout elapsed.
 
 ---
 
@@ -1131,8 +1129,11 @@ Stop a running or runnable thread. The thread transitions to `Stopped` state.
 
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
 
-If the thread is blocked on IPC, the block is cancelled (the blocked syscall on the target thread
-returns `Interrupted`). This does not hold for a caller displaced from a server's pending-reply
+If the thread is blocked (on IPC or in `SYS_THREAD_SLEEP`), the block is cancelled (the blocked
+syscall on the target thread returns `Interrupted`); a target that blocks while the stop is in
+progress is cancelled the same way, never left registered as a waiter (see
+[thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § `sys_thread_stop` Cross-CPU Stop
+Protocol). This does not hold for a caller displaced from a server's pending-reply
 binding: the stop is not memory-safe, and its outcome is in
 [ipc-design.md](../../../docs/ipc-design.md) § The Call/Reply Model
 ([#443](https://github.com/kottlerg/seraph/issues/443)). If the thread is running on another CPU, an
@@ -1537,7 +1538,8 @@ are ready simultaneously, subsequent calls return them without blocking (see
 
 **Capability requirement:** `wait_set_cap` must have Wait rights.
 
-**Errors:** `InvalidCapability`, `InsufficientRights` (cap lacks Wait), `Interrupted`.
+**Errors:** `InvalidCapability`, `InsufficientRights` (cap lacks Wait), `Interrupted` (the caller
+was stopped, or the wait set was destroyed while the caller waited).
 
 ---
 
@@ -2154,8 +2156,11 @@ intact (see [capability-internals.md](capability-internals.md) § Safe Delegatio
   § Lock Hierarchy).
 
 - **Blocking syscalls are interruptible.** Any syscall that can block (`SYS_IPC_CALL`,
-  `SYS_IPC_RECV`, `SYS_NOTIFICATION_WAIT`, `SYS_EVENT_RECV`, `SYS_WAIT_SET_WAIT`) returns
-  `Interrupted` if the calling thread is stopped via `SYS_THREAD_STOP`.
+  `SYS_IPC_RECV`, `SYS_NOTIFICATION_WAIT`, `SYS_EVENT_RECV`, `SYS_WAIT_SET_WAIT`,
+  `SYS_THREAD_SLEEP`) returns `Interrupted` if the calling thread is stopped via
+  `SYS_THREAD_STOP`. `SYS_IPC_CALL` and `SYS_IPC_RECV` queued on an endpoint,
+  `SYS_NOTIFICATION_WAIT`, `SYS_EVENT_RECV`, and `SYS_WAIT_SET_WAIT` also return `Interrupted`
+  when the object waited on is destroyed under the caller.
 
 ---
 

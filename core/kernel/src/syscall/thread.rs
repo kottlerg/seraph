@@ -237,12 +237,13 @@ pub fn sys_thread_start(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     Ok(0)
 }
 
-/// Commit `Stopped` for `tcb` under the all-locks discipline, returning the
-/// CPU running it (if any). An `Exited` target is terminal and refused with
-/// `InvalidState`.
+/// Commit `Stopped` for `tcb` over any park it holds, cancelling that park
+/// (`commit_cancelling_park`), and return the CPU running it (if any). An
+/// `Exited` target is terminal and refused with `InvalidState`.
 ///
 /// # Safety
-/// `tcb` must be a valid TCB pointer.
+/// `tcb` must be a valid TCB pointer; the caller holds no scheduler or IPC
+/// source lock.
 #[cfg(not(test))]
 unsafe fn commit_stopped(
     tcb: *mut crate::sched::thread::ThreadControlBlock,
@@ -250,7 +251,7 @@ unsafe fn commit_stopped(
 {
     use crate::sched::thread::ThreadState;
     // SAFETY: caller contract.
-    match unsafe { crate::sched::set_state_under_all_locks(tcb, ThreadState::Stopped) }
+    match unsafe { crate::sched::commit_cancelling_park(tcb, ThreadState::Stopped, None) }
     {
         crate::sched::StateCommit::Committed(running_on) => Ok(running_on),
         crate::sched::StateCommit::RefusedExited => Err(SyscallError::InvalidState),
@@ -305,33 +306,22 @@ pub fn sys_thread_stop(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // SAFETY: target_tcb validated non-null; state field always valid.
     unsafe {
-        let state = (*target_tcb).state;
-
-        match state
+        // Unlocked precheck for the InvalidState answer only; the commit
+        // re-decides under the target's sched_lock.
+        if matches!(
+            (*target_tcb).state,
+            ThreadState::Created | ThreadState::Exited | ThreadState::Stopped
+        )
         {
-            ThreadState::Created | ThreadState::Exited | ThreadState::Stopped =>
-            {
-                return Err(SyscallError::InvalidState);
-            }
-
-            ThreadState::Blocked =>
-            {
-                // Cancel the IPC block: unlink the thread from whatever it is
-                // blocked on and stamp the park episode Interrupted so the
-                // restarted thread's resume takes the error path.
-                cancel_ipc_block(target_tcb);
-            }
-
-            ThreadState::Ready | ThreadState::Running =>
-            {
-                // No source-side cleanup; the all-locks Stopped write
-                // below + the scheduler skip-loop + the cross-CPU IPI
-                // (Running case) drain the target.
-            }
+            return Err(SyscallError::InvalidState);
         }
 
-        // See docs/thread-lifecycle-and-sleep.md § Lifecycle State Machine
-        // (sys_thread_stop rows); an `Exited` target is refused (terminal).
+        // Cancel any park (the stopped thread's blocked syscall returns
+        // Interrupted on restart) and commit Stopped over it; a Ready or
+        // Running target is drained by the all-locks write, the scheduler
+        // skip-loop, and the cross-CPU IPI below. See
+        // docs/thread-lifecycle-and-sleep.md § `sys_thread_stop` Cross-CPU Stop
+        // Protocol; an `Exited` target is refused (terminal).
         let running_on = commit_stopped(target_tcb)?;
 
         // If stopping self (Running → Stopped): yield so another thread runs.
@@ -427,11 +417,16 @@ pub fn sys_thread_stop(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 ///
 /// [`PARK_DISPOSITION_INTERRUPTED`]: crate::sched::thread::PARK_DISPOSITION_INTERRUPTED
 ///
+/// A plain sleep is cancelled through `sleep_list_remove`, and a timed IPC
+/// wait's sleep-list entry is removed with its waiter slot under the source
+/// lock (docs/thread-lifecycle-and-sleep.md § Sleep List Invariants).
+///
 /// # Safety
 /// `tcb` must be a valid TCB. The caller MUST NOT hold the target's `sched_lock`
 /// or any per-CPU scheduler lock: this function acquires `tcb.sched_lock` itself
 /// for the binding read-and-clear, and per-source IPC locks for the unlink (lock
-/// order: source IPC → `sched_lock`, so the two are never held together). The
+/// order: source IPC → `sched_lock`, so the two are never held together;
+/// `SLEEP_LIST_LOCK` nests inside either as a leaf). The
 /// caller MAY hold `THREAD_REGISTRY_LOCK` (ordered before every lock taken
 /// here; the object-teardown walk does), which keeps `tcb` from being freed
 /// meanwhile.
@@ -455,11 +450,27 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
     // nothing to cancel, so return without touching the source or the episode.
     // sched_lock is released before any per-source IPC lock is taken below (lock
     // order is source IPC → sched_lock, so the two are never held together).
-    // SAFETY: tcb validated by caller; fields read/written under sched_lock.
+    //
+    // A plain sleeper (Blocked, ipc_state None) is cancelled here, under
+    // sched_lock so the park cannot change underneath: sleep_list_remove clears
+    // the deadline with the entry, and a `true` return is the episode claim —
+    // the deadline was still pending (listed, or committed but not yet added,
+    // whose add then refuses). The timer pop clears the deadline under the same
+    // lock, so a pop that won leaves the episode to its wake. Its claim deposits
+    // nothing, so a cancellation stamp is the only deposit.
+    // SAFETY: tcb validated by caller; fields read/written under sched_lock;
+    // SLEEP_LIST_LOCK is a leaf, nested under sched_lock.
     let (ipc_state, blocked_on) = unsafe {
         let saved = (*tcb).sched_lock.lock_raw();
         let snap = ((*tcb).ipc_state, (*tcb).blocked_on_object);
         let blocked = (*tcb).state == crate::sched::thread::ThreadState::Blocked;
+        if blocked && snap.0 == IpcThreadState::None && crate::sched::sleep_list_remove(tcb)
+        {
+            crate::sched::thread::stamp_park_deposit(
+                tcb,
+                crate::sched::thread::PARK_DISPOSITION_INTERRUPTED,
+            );
+        }
         (*tcb).sched_lock.unlock_raw(saved);
         if !blocked
         {
@@ -691,6 +702,15 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
                             u8::from(!(*sig).wait_set.is_null()),
                             core::sync::atomic::Ordering::Relaxed,
                         );
+                        // A timed wait's entry goes with the waiter slot,
+                        // under sig.lock, as at every waiter-slot claim.
+                        if (*tcb)
+                            .sleep_deadline
+                            .load(core::sync::atomic::Ordering::Relaxed)
+                            != 0
+                        {
+                            crate::sched::sleep_list_remove(tcb);
+                        }
                         crate::sched::thread::stamp_park_deposit(
                             tcb,
                             crate::sched::thread::PARK_DISPOSITION_INTERRUPTED,
@@ -716,6 +736,15 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
                     if core::ptr::eq((*eq).waiter, tcb)
                     {
                         (*eq).waiter = core::ptr::null_mut();
+                        // A timed wait's entry goes with the waiter slot,
+                        // under eq.lock, as at every waiter-slot claim.
+                        if (*tcb)
+                            .sleep_deadline
+                            .load(core::sync::atomic::Ordering::Relaxed)
+                            != 0
+                        {
+                            crate::sched::sleep_list_remove(tcb);
+                        }
                         crate::sched::thread::stamp_park_deposit(
                             tcb,
                             crate::sched::thread::PARK_DISPOSITION_INTERRUPTED,
@@ -753,42 +782,6 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
 
         IpcThreadState::None =>
         {}
-    }
-
-    // If the thread was parked with a timeout (notification-wait or event-recv
-    // with `timeout_ms != 0`), it is also on the global sleep list. Drop
-    // the entry now so a later timer tick does not dereference a freed TCB.
-    //
-    // ORDER (issue #117): call `sleep_list_remove` BEFORE clearing
-    // `sleep_deadline`. The timer path (`sleep_check_wakeups`) treats
-    // `sleep_deadline <= now` as expired; clearing the deadline first
-    // would let the timer claim a wake that this cancel path is delivering.
-    // SAFETY: tcb is valid; sleep_list_remove is safe to call when the
-    // thread is not registered (returns without effect).
-    unsafe {
-        if (*tcb).sleep_deadline != 0
-        {
-            crate::sched::sleep_list_remove(tcb);
-            (*tcb).sleep_deadline = 0;
-            // A plain sleeper (no IPC source) has no competing depositor at
-            // all — the timer's claim deposits nothing — so the Blocked
-            // snapshot above is claim enough: stamp unconditionally rather
-            // than gating on the remove win. This covers the commit→add
-            // window (the entry may not exist yet for sleep_list_remove to
-            // win; the sleeper's restart must still see the cancellation,
-            // not a fabricated Ok). A timer claim racing this cancel
-            // resolves to Interrupted — honest for a sleep whose deadline
-            // elapsed concurrently with a stop. Timed IPC parks already
-            // stamped at their waiter-slot claim above; their entry removal
-            // here is bookkeeping only.
-            if matches!(ipc_state, IpcThreadState::None)
-            {
-                crate::sched::thread::stamp_park_deposit(
-                    tcb,
-                    crate::sched::thread::PARK_DISPOSITION_INTERRUPTED,
-                );
-            }
-        }
     }
 
     // Clear the binding under sched_lock, but only if the thread is still Blocked

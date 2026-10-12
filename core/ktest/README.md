@@ -28,9 +28,17 @@ authoring discipline.
 ## Test structure
 
 Tests are organised across four tiers (three plus the opt-in stress
-tier). Each tier lives in its own source directory; each directory
-codifies a "one file per surface/scenario/race" rule at the top of its
-`mod.rs`.
+tier). Each tier lives in its own source directory, except that a tier's
+architecture-specific scenarios live under `src/arch/<arch>/`; each tier
+directory codifies a "one file per surface/scenario/race" rule at the top
+of its `mod.rs`, and the same rule applies under `src/arch/<arch>/`.
+
+`src/arch/` is ktest's arch-dispatch surface: one module per architecture,
+selected by `target_arch` in `src/arch/mod.rs`, each exposing the same
+entry points. A tier's `run_all` reaches its architecture-specific
+scenarios through them (Tier 2 through `crate::arch::run_integration`).
+Some older arch-gated items elsewhere in ktest, such as
+`integration/sbi_gating.rs`, have not moved behind `src/arch/` yet (#460).
 
 ### Tier 1 — `src/unit/`
 
@@ -77,7 +85,12 @@ concurrent notification and queue events.
 | `priority_preemption.rs` | Higher-priority runnable thread preempts a CPU-bound lower-priority spinner within a wall-clock budget |
 | `shared_memory_two_aspaces.rs` | One Memory cap mapped into two `AddressSpace` caps; `aspace_query` returns identical phys backing in both |
 | `cap_move_into_fresh_cspace_then_ipc.rs` | `cap_move` an endpoint into a child cspace; the child IPC-calls through its local slot; parent receives via a sibling cap |
-| `arch/x86_64/syscall_rflags_hardening.rs` | (x86-64 only) A user-set DF and TF, and a GS base reloaded from the user selector, do not reach the kernel across a SYSCALL |
+
+Architecture-specific Tier 2 scenarios live under `src/arch/<arch>/` and run through
+`crate::arch::run_integration`. On x86-64, `src/arch/x86_64/syscall_rflags_hardening.rs`
+checks that a user-set DF and TF, and a GS base reloaded from the user selector, do not reach
+the kernel across a SYSCALL, and `src/arch/x86_64/configure_wrapped_stack.rs` checks that
+`thread_configure` refuses a stack top the entry alignment wraps below zero.
 
 ### Tier S — `src/stress/`
 

@@ -1535,11 +1535,23 @@ pub fn configure_non_user_address_err(ctx: &TestContext) -> TestResult
     let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_CONFIGURE_NON_USER));
     let entry = blocker_entry as *const () as u64;
 
-    let results = [
-        thread_configure(child.th, UPPER_HALF, stack_top, 0),
-        thread_configure(child.th, NON_CANONICAL, stack_top, 0),
-        thread_configure(child.th, entry, UPPER_HALF, 0),
-        syscall::thread_configure_with_tls(child.th, entry, stack_top, 0, NON_CANONICAL),
+    let cases = [
+        (
+            thread_configure(child.th, UPPER_HALF, stack_top, 0),
+            "upper-half entry",
+        ),
+        (
+            thread_configure(child.th, NON_CANONICAL, stack_top, 0),
+            "non-canonical entry",
+        ),
+        (
+            thread_configure(child.th, entry, UPPER_HALF, 0),
+            "upper-half stack",
+        ),
+        (
+            syscall::thread_configure_with_tls(child.th, entry, stack_top, 0, NON_CANONICAL),
+            "non-canonical TLS base",
+        ),
     ];
 
     cap_delete(child.th)
@@ -1547,11 +1559,14 @@ pub fn configure_non_user_address_err(ctx: &TestContext) -> TestResult
     cap_delete(child.cs)
         .map_err(|_| "cap_delete cs after configure_non_user_address_err failed")?;
 
-    if results
-        .iter()
-        .any(|r| *r != Err(SyscallError::InvalidArgument as i64))
+    for (result, case) in cases
     {
-        return Err("thread_configure with a non-user entry, stack or TLS base was not refused");
+        if result != Err(SyscallError::InvalidArgument as i64)
+        {
+            crate::log("ktest: thread::configure_non_user_address_err: not refused:");
+            crate::log(case);
+            return Err("thread_configure with a non-user address was not refused");
+        }
     }
     Ok(())
 }

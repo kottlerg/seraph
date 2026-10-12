@@ -5,8 +5,11 @@
 
 //! RISC-V ktest code.
 //!
-//! The RISC-V-specific `integration::sbi_gating` scenario still sits in
-//! `integration/` behind its own `target_arch` gates; moving it here is #460.
+//! TODO: move the RISC-V-specific `integration::sbi_gating` scenario, which still
+//! sits in `integration/` behind its own `target_arch` gates, behind this module.
+//! Deferred because the move is a ktest code-quality cleanup that changes no test
+//! coverage; it is tracked, with the other arch-gated ktest items outside
+//! `crate::arch`, on #460.
 
 use crate::TestContext;
 

@@ -1,0 +1,210 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 2026 George Kottler <mail@kottlerg.com>
+
+// core/ktest/src/stress/timed_wait_source_delete.rs
+
+//! Stress: destroy a notification or event queue while a timed waiter's
+//! deadline expires on it, so the timer's claim and the source's dealloc
+//! overlap.
+//!
+//! ## The hazard
+//!
+//! The timer pops an expired timed waiter under `SLEEP_LIST_LOCK`, drops the
+//! lock, then locks the waiter's source through the pointer it snapshotted
+//! at the pop, which holds no reference. A source whose last capability is
+//! deleted in between would be freed under the timer. The source's dealloc
+//! therefore waits out any timer batch that popped one of its waiters
+//! (`sleep_wakeups_quiesce`; core/kernel/docs/thread-lifecycle-and-sleep.md
+//! § Sleep List Invariants, invariant 9).
+//!
+//! ## How this exercises it
+//!
+//! Each cycle parks a waiter on a copy of a fresh source with a 1 ms timeout,
+//! re-arming on every timeout, and the controller — pinned off CPU 0, where
+//! the timer runs — destroys the source (revoke the copy, delete the
+//! original) after a sleep and a varying spin, so the delete lands around the
+//! waiter's deadlines. Half the cycles use a notification, half an event
+//! queue. The tripwires are the kernel's (a freed source's lock or waiter
+//! slot touched by the timer). The test itself fails if the waiter's loop
+//! ends on anything but `Interrupted` (destroyed under it) or
+//! `InvalidCapability` (its copy was gone before it re-armed), or if no
+//! destroy ever landed on a parked waiter (the race never armed).
+//!
+//! Needs **≥ 2 CPUs** (the destroy must run concurrently with CPU 0's timer).
+
+use core::sync::atomic::{AtomicU64, Ordering};
+
+use syscall::{
+    RIGHTS_ALL, cap_copy, cap_create_notification, cap_delete, cap_revoke, event_queue_create,
+    event_recv_timeout, notification_send, notification_wait, notification_wait_timeout,
+    system_info, thread_exit, thread_set_affinity, thread_sleep,
+};
+use syscall_abi::{SyscallError, SystemInfoType};
+
+use crate::{ChildStack, TestContext, TestResult, spawn};
+
+/// Source-destroy cycles (half notification, half event queue).
+const CYCLES: u32 = 200;
+
+/// Notification NOTIFY right — what a child needs to `notification_send`.
+const RIGHTS_SIGNAL: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
+
+/// Waiter raises this before its first wait, and one of the verdict bits when
+/// its loop ends.
+const BIT_READY: u64 = 1 << 0;
+const BIT_INTERRUPTED: u64 = 1 << 1;
+const BIT_GONE: u64 = 1 << 2;
+const BIT_BAD: u64 = 1 << 3;
+const VERDICT: u64 = BIT_INTERRUPTED | BIT_GONE | BIT_BAD;
+
+/// Waiter wait-loop timeout: short, so deadlines expire throughout a cycle.
+const WAIT_MS: u64 = 1;
+
+/// Cycles whose waiter was destroyed while parked.
+static INTERRUPTED: AtomicU64 = AtomicU64::new(0);
+
+pub fn run(ctx: &TestContext) -> TestResult
+{
+    let cpus = system_info(SystemInfoType::CpuCount as u64)
+        .map_err(|_| "stress::timed_wait_source_delete: system_info(CpuCount) failed")?;
+    if cpus < 2
+    {
+        crate::log("ktest: stress::timed_wait_source_delete SKIP (need 2+ CPUs)");
+        return Ok(());
+    }
+    INTERRUPTED.store(0, Ordering::Relaxed);
+    thread_set_affinity(ctx.thread_cap, 1)
+        .map_err(|_| "stress::timed_wait_source_delete: pin controller failed")?;
+    let result = cycles(ctx, u32::try_from(cpus).unwrap_or(2));
+    let restore = thread_set_affinity(ctx.thread_cap, u32::MAX)
+        .map_err(|_| "stress::timed_wait_source_delete: restore controller affinity failed");
+    result?;
+    restore?;
+
+    let interrupted = INTERRUPTED.load(Ordering::Relaxed);
+    crate::log_u64(
+        "ktest: stress::timed_wait_source_delete interrupted=",
+        interrupted,
+    );
+    if interrupted == 0
+    {
+        return Err("stress::timed_wait_source_delete: no destroy landed on a parked waiter");
+    }
+    Ok(())
+}
+
+fn cycles(ctx: &TestContext, cpus: u32) -> TestResult
+{
+    let done = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "stress::timed_wait_source_delete: create done failed")?;
+    for cycle in 0..CYCLES
+    {
+        let is_queue = cycle & 1 == 1;
+        let source = if is_queue
+        {
+            event_queue_create(ctx.memory_base, 4)
+        }
+        else
+        {
+            cap_create_notification(ctx.memory_base)
+        }
+        .map_err(|_| "stress::timed_wait_source_delete: create source failed")?;
+
+        let child = spawn::new_child(ctx)
+            .map_err(|_| "stress::timed_wait_source_delete: spawn waiter failed")?;
+        let c_source = cap_copy(source, child.cs, RIGHTS_ALL)
+            .map_err(|_| "stress::timed_wait_source_delete: cap_copy source failed")?;
+        let c_done = cap_copy(done, child.cs, RIGHTS_SIGNAL)
+            .map_err(|_| "stress::timed_wait_source_delete: cap_copy done failed")?;
+        let entry: fn(u64) -> ! = if is_queue { queue_waiter } else { notif_waiter };
+        // SAFETY: stack index 0 is this test's only live child; each cycle's
+        // waiter is reaped before the next starts.
+        let stack = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[0]) });
+        // The waiter alternates between CPU 0, which runs the timer, and a
+        // CPU other than the controller's 1 (CPU 0 again on a 2-CPU run).
+        let waiter_cpu = if (cycle >> 1) & 1 == 0 { 0 } else { 2 % cpus };
+        spawn::configure_and_start_pinned(
+            &child,
+            entry,
+            stack,
+            u64::from(c_source) | (u64::from(c_done) << 32),
+            waiter_cpu,
+        )
+        .map_err(|_| "stress::timed_wait_source_delete: start waiter failed")?;
+
+        let mut acc = 0u64;
+        while acc & BIT_READY == 0
+        {
+            acc |= notification_wait(done)
+                .map_err(|_| "stress::timed_wait_source_delete: wait ready failed")?;
+        }
+        let _ = thread_sleep(WAIT_MS);
+        for _ in 0..(cycle.wrapping_mul(2_654_435_761) >> 18)
+        {
+            core::hint::spin_loop();
+        }
+        cap_revoke(source).map_err(|_| "stress::timed_wait_source_delete: revoke failed")?;
+        cap_delete(source).map_err(|_| "stress::timed_wait_source_delete: delete failed")?;
+
+        while acc & VERDICT == 0
+        {
+            acc |= notification_wait(done)
+                .map_err(|_| "stress::timed_wait_source_delete: wait verdict failed")?;
+        }
+        cap_delete(child.th).map_err(|_| "stress::timed_wait_source_delete: reap thread failed")?;
+        cap_delete(child.cs).map_err(|_| "stress::timed_wait_source_delete: reap cspace failed")?;
+        if acc & BIT_BAD != 0
+        {
+            return Err(
+                "stress::timed_wait_source_delete: a timed wait on a destroyed source ended in \
+                 neither Interrupted nor InvalidCapability",
+            );
+        }
+        if acc & BIT_INTERRUPTED != 0
+        {
+            INTERRUPTED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    cap_delete(done).map_err(|_| "stress::timed_wait_source_delete: del done failed")?;
+    Ok(())
+}
+
+// cast_possible_truncation: packed fields are 32-bit cap handles.
+#[allow(clippy::cast_possible_truncation)]
+fn unpack(arg: u64) -> (u32, u32)
+{
+    ((arg & 0xFFFF_FFFF) as u32, (arg >> 32) as u32)
+}
+
+/// Re-arm the timed wait until it ends in an error; report which.
+fn wait_loop(done: u32, mut wait: impl FnMut() -> Result<u64, i64>) -> !
+{
+    notification_send(done, BIT_READY).ok();
+    let bit = loop
+    {
+        match wait()
+        {
+            Ok(_) =>
+            {}
+            Err(e) if e == SyscallError::WouldBlock as i64 =>
+            {}
+            Err(e) if e == SyscallError::Interrupted as i64 => break BIT_INTERRUPTED,
+            Err(e) if e == SyscallError::InvalidCapability as i64 => break BIT_GONE,
+            Err(_) => break BIT_BAD,
+        }
+    };
+    notification_send(done, bit).ok();
+    thread_exit()
+}
+
+fn notif_waiter(arg: u64) -> !
+{
+    let (sig, done) = unpack(arg);
+    wait_loop(done, || notification_wait_timeout(sig, WAIT_MS))
+}
+
+fn queue_waiter(arg: u64) -> !
+{
+    let (eq, done) = unpack(arg);
+    wait_loop(done, || event_recv_timeout(eq, WAIT_MS))
+}

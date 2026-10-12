@@ -963,8 +963,11 @@ iteration cap is far beyond any architectural timing; exhaustion indicates a har
 ### `ipi_nmi_backtrace_stub` / `ipi_nmi_backtrace_handler`
 
 The x86-64 IDT registers a dedicated stub at vector 2 (IST=2 per the NMI ABI) that builds the
-canonical `TrapFrame`, calls a returning handler, then writes back and `iretq`s. The handler reads
-the per-CPU request flag returned by `nmi_backtrace_request(cpu)`:
+canonical `TrapFrame`, switches to the kernel GS base when the user base is active (decided from the
+sign bit of `IA32_GS_BASE`, not the saved CS, since an NMI can arrive between a ring-3 entry and its
+`swapgs`), and calls a returning handler; on return it disables interrupts, swaps back if it
+swapped, then writes back and `iretq`s. The handler reads the per-CPU request flag returned by
+`nmi_backtrace_request(cpu)`:
 - **Set** (watchdog-requested): dump the saved frame to serial and return; the stub's `iretq`
   resumes the interrupted code.
 - **Clear** (real hardware NMI): tail-call `common_exception_handler` which never returns — the

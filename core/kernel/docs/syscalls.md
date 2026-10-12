@@ -74,19 +74,33 @@ secondary return value where applicable.
 ### x86-64
 
 On `SYSCALL`:
-1. `rcx` ← `rip` (return address); `r11` ← `rflags`
+1. `rcx` ← `rip` (return address); `r11` ← `rflags`; the `rflags` bits in `SFMASK`
+   are cleared
 2. Transition to CPL 0 with kernel code segment
-3. `rsp` ← kernel stack pointer from `RSP0` in the TSS (per-CPU)
-4. Kernel saves the user register file (including `rcx` and `r11`) onto the kernel stack
-5. Kernel calls `syscall::dispatch(nr=rax, args=[rdi, rsi, rdx, r10, r8, r9])`
-6. Kernel writes return values into the saved register frame
-7. Kernel restores the user register file
-8. `SYSRET` restores `rip` from `rcx`, `rflags` from `r11`, transitions to CPL 3
+3. The entry stub's first instruction is `swapgs`: the kernel per-CPU GS base becomes
+   active and the user GS base moves to `IA32_KERNEL_GS_BASE`
+4. `rsp` ← the per-CPU kernel stack pointer (`PerCpuData::kernel_rsp`, read through GS)
+5. Kernel saves the user register file (including `rcx` and `r11`) onto the kernel stack
+6. Kernel calls `syscall::dispatch(nr=rax, args=[rdi, rsi, rdx, r10, r8, r9])`
+7. Kernel writes return values into the saved register frame
+8. Kernel restores the user register file and switches to the user `rsp`
+9. `cli; swapgs`: the user GS base is back in place, with interrupts off until `SYSRET`
+   restores the user's `IF`
+10. `SYSRET` restores `rip` from `rcx`, `rflags` from `r11`, transitions to CPL 3
 
-Interrupts are disabled by `SFMASK` on `SYSCALL` entry (the `IF` bit is cleared).
-They stay masked for the whole syscall, except in bounded preempt-disabled,
-interrupt-enabled windows (see § Atomicity and Preemption Guarantees and
-[scheduling-internals.md](scheduling-internals.md) § Lock Hierarchy).
+A return `rip` with any of bits 63:47 set is never passed to `SYSRET`, which would
+fault in ring 0 on the user stack: the kernel terminates the thread as for an
+unhandled user `#GP` (vector 13). The GS-base exchange on every ring-3 entry and exit
+is a platform fact (see
+[platform-requirements.md](../../../docs/platform-requirements.md) § x86-64
+Classification).
+
+`SFMASK` clears `IF`, `TF`, `DF`, `AC`, `NT` and `IOPL` on `SYSCALL` entry, whatever
+the user set: interrupts stay off until the kernel enables them, `DF` clear is the
+string-instruction direction `copy_user` relies on, and `AC` clear keeps SMAP
+enforced. Interrupts stay masked for the whole syscall, except in bounded
+preempt-disabled, interrupt-enabled windows (see § Atomicity and Preemption Guarantees
+and [scheduling-internals.md](scheduling-internals.md) § Lock Hierarchy).
 
 ### RISC-V
 
@@ -1714,7 +1728,8 @@ stack so the first scheduler switch enters user mode at `entry`.
 **Capability requirement:** `thread_cap` must have Control rights.
 
 **Errors:** `InvalidCapability`, `InsufficientRights` (cap lacks Control),
-`InvalidArgument` (thread not in the Created state).
+`InvalidArgument` (thread not in the Created state, `entry` at or above the user VA top,
+or `stack_top` above it).
 
 ---
 

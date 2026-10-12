@@ -137,10 +137,12 @@ Each feature is classified per architecture as one of:
 
 - **AVX-512 / x86-64-v4** — server-class; never required, never depended upon.
 - **LA57 (5-level paging)** — the kernel uses 4-level paging.
-- **1 GiB huge pages, global pages (`PGE`), `FSGSBASE`, MTRR reprogramming, HPET, the legacy
-  8259 PIC** — not used. (The kernel installs its per-CPU pointer through the GS-base MSRs and
-  exchanges it with the user GS base by `swapgs` on every ring-3 entry and exit; it relies on
-  firmware's default PAT and leaves the 8259 masked.)
+- **1 GiB huge pages, global pages (`PGE`), MTRR reprogramming, HPET, the legacy 8259 PIC** —
+  not used. (The kernel relies on firmware's default PAT and leaves the 8259 masked.)
+- **`FSGSBASE`** — kept disabled: the kernel clears `CR4.FSGSBASE` on every CPU. It installs
+  its per-CPU pointer through the GS-base MSRs and exchanges it with the user GS base by
+  `swapgs` on every ring-3 entry and exit that runs kernel code (the spurious-interrupt stub
+  runs only `iretq`), and that discipline depends on ring 3 being unable to write its GS base.
 - **Legacy BIOS / multiboot** — boot is UEFI-only.
 - **Secure Boot, TPM, RTC** — not boot dependencies.
 

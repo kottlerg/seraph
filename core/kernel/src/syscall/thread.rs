@@ -32,7 +32,10 @@ use syscall::SyscallError;
 /// user-mode `TrapFrame` on the thread's kernel stack. The thread is not enqueued;
 /// call `SYS_THREAD_START` to start it.
 ///
-/// Returns 0 on success.
+/// Returns 0 on success. Returns `InvalidArgument` if the thread is not in
+/// `Created` state, if `entry >= user_va_top()`, if the stack pointer (as passed
+/// or after alignment) lies above `user_va_top()`, or if the TLS base is
+/// `>= user_va_top()`.
 #[cfg(not(test))]
 pub fn sys_thread_configure(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
@@ -81,6 +84,18 @@ pub fn sys_thread_configure(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // Thread must be in Created state to configure.
     // SAFETY: target_tcb validated non-null; state field always valid.
     if unsafe { (*target_tcb).state } != ThreadState::Created
+    {
+        return Err(SyscallError::InvalidArgument);
+    }
+
+    // The entry point, the aligned stack pointer and the TLS base must be user
+    // addresses: the thread's first return to user mode resumes at the entry on
+    // that stack. On x86-64 an `iretq` to a non-canonical RIP faults in ring 0
+    // after the GS swap back to the user base, and a non-canonical TLS base makes
+    // the context switch's `wrmsr` to `IA32_FS_BASE` #GP in ring 0, on the kernel
+    // GS base, on the first switch into the thread.
+    let user_top = crate::mm::user_va_top();
+    if entry >= user_top || tf.arg(2) > user_top || stack_ptr > user_top || tls_base >= user_top
     {
         return Err(SyscallError::InvalidArgument);
     }

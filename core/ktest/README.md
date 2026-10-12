@@ -28,9 +28,18 @@ authoring discipline.
 ## Test structure
 
 Tests are organised across four tiers (three plus the opt-in stress
-tier). Each tier lives in its own source directory; each directory
-codifies a "one file per surface/scenario/race" rule at the top of its
-`mod.rs`.
+tier). Each tier lives in its own source directory, which codifies a
+"one file per surface/scenario/race" rule at the top of its `mod.rs`,
+except its architecture-only tests, which live under `src/arch/<arch>/`
+(see below).
+
+`src/arch/` is ktest's arch-dispatch surface: one module per architecture,
+selected by `target_arch` in `src/arch/mod.rs`, each exposing the same
+entry points. Tier 1 reaches the tests behind it through
+`crate::arch::run_unit` and Tier 2 through `crate::arch::run_integration`.
+Per-arch helpers and branches inside arch-neutral tests, and other arch-specific
+items elsewhere in ktest, are still gated in place with `#[cfg(target_arch)]`;
+#460 lists them.
 
 ### Tier 1 — `src/unit/`
 
@@ -51,10 +60,16 @@ kernel's own source layout.
 | `ipc.rs` | `SYS_IPC_CALL`, `SYS_IPC_REPLY`, `SYS_IPC_RECV`, `SYS_IPC_BUFFER_SET` |
 | `thread.rs` | `SYS_THREAD_START/STOP/YIELD/EXIT/CONFIGURE/SET_PRIORITY/SET_AFFINITY/READ_REGS/WRITE_REGS/SLEEP/BIND_NOTIFICATION` |
 | `fpu.rs` | FPU / SIMD / V extended-state isolation across preemption and cross-CPU migration |
-| `hw.rs` | `SYS_MMIO_MAP`, `SYS_MMIO_SPLIT`, `SYS_IRQ_REGISTER/ACK`, `SYS_IRQ_SPLIT`, `SYS_IOPORT_BIND`, `SYS_IOPORT_SPLIT`, `SYS_SBI_CALL` |
+| `hw.rs` | `SYS_MMIO_MAP`, `SYS_MMIO_SPLIT`, `SYS_IRQ_REGISTER/ACK`, `SYS_IRQ_SPLIT`, `SYS_IOPORT_BIND`, `SYS_IOPORT_SPLIT` (`SYS_SBI_CALL` is under `src/arch/<arch>/`) |
 | `sysinfo.rs` | `SYS_SYSTEM_INFO` |
 
 Adding a new syscall means adding a section in the appropriate file here.
+
+Architecture-only Tier 1 tests live under `src/arch/<arch>/` and run through
+`crate::arch::run_unit`. On x86-64, `src/arch/x86_64/configure_wrapped_stack.rs` checks that
+`thread_configure` refuses a stack top the entry alignment wraps below zero. Each
+architecture's `sbi_call.rs` holds its `SYS_SBI_CALL` test: the call reaches the SBI firmware
+on RISC-V and returns `NotSupported` on x86-64.
 
 ### Tier 2 — `src/integration/`
 
@@ -77,6 +92,13 @@ concurrent notification and queue events.
 | `priority_preemption.rs` | Higher-priority runnable thread preempts a CPU-bound lower-priority spinner within a wall-clock budget |
 | `shared_memory_two_aspaces.rs` | One Memory cap mapped into two `AddressSpace` caps; `aspace_query` returns identical phys backing in both |
 | `cap_move_into_fresh_cspace_then_ipc.rs` | `cap_move` an endpoint into a child cspace; the child IPC-calls through its local slot; parent receives via a sibling cap |
+
+Architecture-only Tier 2 scenarios live under `src/arch/<arch>/` and run through
+`crate::arch::run_integration`. On x86-64, `src/arch/x86_64/syscall_rflags_hardening.rs`
+checks that a user-set DF and TF, and a GS base reloaded from the user selector, do not reach
+the kernel across a SYSCALL. On RISC-V, `src/arch/riscv64/sbi_gating.rs` checks that
+`SYS_SBI_CALL` refuses kernel-reserved SBI extensions and sanctioned ones the cap lacks the
+right for.
 
 ### Tier S — `src/stress/`
 

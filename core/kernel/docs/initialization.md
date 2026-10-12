@@ -222,11 +222,12 @@ Architecture-specific hardware initialization; x86-64 and RISC-V diverge here.
    - APIC timer vector (preemption)
    - Spurious interrupt vector
    - Syscall vector (though SYSCALL/SYSRET bypasses the IDT)
-4. Enable SMEP and SMAP in CR4 if CPUID reports support
+4. Enable SMEP and SMAP in CR4 (required; boot halts if CPUID lacks either);
+   clear CR4.FSGSBASE
 5. Configure SYSCALL/SYSRET:
    - Write kernel entry point to LSTAR MSR
    - Write segment selectors to STAR MSR
-   - Write SFMASK to clear IF on entry
+   - Write SFMASK to clear IF, TF, DF, AC, NT and IOPL on entry
 6. Initialise the local APIC on the BSP
 7. Configure the preemption timer (period from scheduler policy):
    TSC-deadline mode where CPUID advertises it, periodic APIC timer otherwise
@@ -234,7 +235,12 @@ Architecture-specific hardware initialization; x86-64 and RISC-V diverge here.
 ```
 
 The step-7 timer mode selection is specified in [arch-interface.md](arch-interface.md)
-§ `timer`.
+§ `timer`. SMEP and SMAP are required and enabled unconditionally, and SFMASK clears the
+user-controlled RFLAGS bits, AC among them, per
+[memory-model.md](../../../docs/memory-model.md) § Kernel Isolation — SMEP and SMAP. After
+step 3, the BSP's per-CPU install writes its per-CPU pointer to `IA32_GS_BASE` and 0 to
+`IA32_KERNEL_GS_BASE`; `swapgs` exchanges the two on every ring-3 entry and exit that runs
+kernel code, per [arch-interface.md](arch-interface.md) § `cpu`.
 
 ### RISC-V
 
@@ -532,7 +538,9 @@ calls `sched::enter()`.
       rip/sepc=entry_point, rsp/sp=chosen init stack top, cs=USER_CS, ss=USER_DS,
       rflags=0x202 (IF=1)
    c. x86-64: call switch_and_enter_user(root_phys, tf_ptr) — atomically
-      switches RSP to init's kernel stack, writes CR3, builds iretq frame, iretq
+      switches RSP to init's kernel stack, writes CR3, builds iretq frame, cli;
+      swapgs (user GS base active, per-CPU pointer parked in IA32_KERNEL_GS_BASE),
+      iretq
    d. RISC-V: activate init's address space (satp write + sfence.vma),
       then return_to_user(tf_ptr) — restores registers and executes sret
 ```

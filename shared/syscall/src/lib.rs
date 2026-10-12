@@ -1370,8 +1370,12 @@ pub fn sched_split(sched_cap: u32, split_at: u8) -> Result<(u32, u32), i64>
 /// thread needs a preset thread-local-storage pointer.
 ///
 /// # Errors
-/// Returns a negative `i64` error code if the thread cap is invalid or the
-/// thread is not in `Created` state.
+/// Returns a negative `i64` error code: `InvalidCapability` if the thread cap
+/// is invalid, `InsufficientRights` if it lacks Control rights, or
+/// `InvalidArgument` if the thread is not in `Created` state, `entry` is at or
+/// above the user VA top, or `stack_ptr`, as passed or after rounding to the
+/// entry ABI's stack alignment, is above it (`core/kernel/docs/arch-interface.md`
+/// § `context` gives each architecture's `align_initial_stack`).
 #[inline]
 pub fn thread_configure(thread_cap: u32, entry: u64, stack_ptr: u64, arg: u64) -> Result<(), i64>
 {
@@ -1384,8 +1388,12 @@ pub fn thread_configure(thread_cap: u32, entry: u64, stack_ptr: u64, arg: u64) -
 /// the thread first runs. Pass `0` for a thread that does not use TLS.
 ///
 /// # Errors
-/// Returns a negative `i64` error code if the thread cap is invalid or the
-/// thread is not in `Created` state.
+/// Returns a negative `i64` error code: `InvalidCapability` if the thread cap
+/// is invalid, `InsufficientRights` if it lacks Control rights, or
+/// `InvalidArgument` if the thread is not in `Created` state, `entry` or
+/// `tls_base` is at or above the user VA top, or `stack_ptr`, as passed or
+/// after rounding to the entry ABI's stack alignment, is above it (see
+/// [`thread_configure`]).
 #[inline]
 pub fn thread_configure_with_tls(
     thread_cap: u32,

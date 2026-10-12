@@ -186,6 +186,13 @@ pub unsafe fn flush_page(virt: u64);
 /// (x86-64 CR3 reload; RISC-V `sfence.vma zero, zero`).
 pub unsafe fn flush_tlb_all();
 
+/// Whether the per-VA invalidations (`flush_page`, `inval_page`) also drop the
+/// cached paging-structure entries that name a freed intermediate table
+/// (x86-64 `true`: `invlpg`; RISC-V `false`: a VA-form fence is only required to
+/// invalidate leaf entries). Region teardown that frees tables uses the full
+/// flush where this is `false`.
+pub const VA_INVAL_DROPS_TABLE_CACHES: bool;
+
 /// Install `root_phys` as the active page table under hardware address-space
 /// tag `tag` (x86-64 PCID / RISC-V ASID) **without** flushing the TLB, so the
 /// outgoing space's cached translations survive (x86-64 sets CR3 bit 63 with
@@ -281,7 +288,8 @@ pub fn new_state(entry: u64, stack_top: u64, arg: u64, is_user: bool) -> SavedSt
 pub fn seed_tls_base(saved: &mut SavedState, tls_base: u64);
 
 /// Round a user-supplied stack pointer to the entry point's `extern "C"` ABI
-/// alignment (x86-64 SysV `rsp ≡ 8 (mod 16)`; RISC-V LP64D `sp ≡ 0 (mod 16)`).
+/// alignment (x86-64 SysV `rsp ≡ 8 (mod 16)`: `(sp & !0xF) - 8`, wrapping for
+/// `sp` below 16; RISC-V LP64D `sp ≡ 0 (mod 16)`: `sp & !0xF`).
 pub fn align_initial_stack(sp: u64) -> u64;
 
 /// Switch from `current` to `next`, saving callee-saved registers into `current`
@@ -394,7 +402,9 @@ pub fn delay_us(us: u64);
 
 Architecture-specific syscall entry/return glue. Shared code does not call into this beyond
 initialisation; the arch entry stub saves user state, calls `crate::syscall::dispatch`,
-restores state, and returns to userspace.
+restores state, and returns to userspace (on x86-64 a non-canonical return RIP is never passed
+to `sysretq`; the thread is terminated as for an unhandled user `#GP`, per
+[syscalls.md](syscalls.md) § Syscall Entry and Exit).
 
 ```rust
 /// Install the syscall entry handler on the current CPU. x86-64 writes LSTAR /
@@ -408,7 +418,15 @@ pub unsafe fn init();
 ## `cpu` — `arch::current::cpu`
 
 CPU identification, per-CPU storage, kernel-stack setup, and interrupt save/restore. Per-CPU
-storage is architecture-managed (GS-base on x86-64; `sscratch` on RISC-V).
+storage is architecture-managed (GS-base on x86-64, exchanged with the user GS base by `swapgs`
+on every ring-3 entry and exit that runs kernel code; the spurious-interrupt stub, vector 255,
+runs only `iretq` and touches no GS state; `sscratch` on RISC-V). With `FSGSBASE` disabled
+(`cpu::enable_smep_smap` clears `CR4.FSGSBASE` on every CPU), ring 3 can set its GS base only
+through a selector load, whose GDT descriptor base is 0, so a user GS base is never a kernel-half
+address. The paranoid entry (NMI, `#DB`, `#DF`, `#MC`) cannot trust the saved CS and tells the
+bases apart by that: a clear sign bit in `IA32_GS_BASE` means the user base is active. The
+CS-keyed stubs do not depend on it. `FSGSBASE` is classified unsupported in
+[platform-requirements.md](../../../docs/platform-requirements.md) § x86-64 Classification.
 
 ```rust
 /// Hardware and logical CPU identity (APIC id / hart id, and the 0-based logical
@@ -671,4 +689,5 @@ equally clearly.
 [core/kernel/README.md](../README.md), [Kernel Entropy Subsystem](entropy.md),
 [Kernel Initialization Sequence](initialization.md), [Scheduler Internals](scheduler.md),
 [SMP Scheduling and Locking Invariants](scheduling-internals.md),
-[Syscall Interface Specification](syscalls.md)
+[Syscall Interface Specification](syscalls.md),
+[Platform Requirements](../../../docs/platform-requirements.md)

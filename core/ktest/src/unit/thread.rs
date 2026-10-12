@@ -56,6 +56,7 @@ static mut STACK_CONFIGURE: ChildStack = ChildStack::ZERO;
 static mut STACK_STOP_REGS: ChildStack = ChildStack::ZERO;
 static mut STACK_WRITE_REGS: ChildStack = ChildStack::ZERO;
 static mut STACK_CONFIGURE_ERR: ChildStack = ChildStack::ZERO;
+static mut STACK_CONFIGURE_NON_USER: ChildStack = ChildStack::ZERO;
 static mut STACK_SPLIT_ROLLBACK: ChildStack = ChildStack::ZERO;
 static mut STACK_AFFINITY_CPU1: ChildStack = ChildStack::ZERO;
 static mut STACK_AFFINITY_RESPECTED: ChildStack = ChildStack::ZERO;
@@ -1513,6 +1514,59 @@ pub fn bind_notification_invalid_cap_err(_ctx: &TestContext) -> TestResult
     if err != Err(SyscallError::InvalidCapability as i64)
     {
         return Err("thread::bind_notification_invalid_cap_err: did not return InvalidCapability");
+    }
+    Ok(())
+}
+
+/// `thread_configure` rejects an entry point, stack or TLS base outside the user
+/// half with `InvalidArgument`: the thread's first return to user mode resumes at
+/// the entry on that stack, and the TLS base is loaded into the thread's
+/// architectural TLS register.
+pub fn configure_non_user_address_err(ctx: &TestContext) -> TestResult
+{
+    /// At or above the user top in every supported paging mode (RISC-V Sv57's is
+    /// `1 << 56`), and non-canonical under x86-64 4-level paging.
+    const NON_CANONICAL: u64 = 1 << 56;
+    /// In the upper half: outside user space in every supported paging mode.
+    const UPPER_HALF: u64 = 1 << 63;
+
+    let child = crate::spawn::new_child(ctx)
+        .map_err(|_| "thread::configure_non_user_address_err: spawn::new_child failed")?;
+    let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_CONFIGURE_NON_USER));
+    let entry = blocker_entry as *const () as u64;
+
+    let cases = [
+        (
+            thread_configure(child.th, UPPER_HALF, stack_top, 0),
+            "upper-half entry",
+        ),
+        (
+            thread_configure(child.th, NON_CANONICAL, stack_top, 0),
+            "non-canonical entry",
+        ),
+        (
+            thread_configure(child.th, entry, UPPER_HALF, 0),
+            "upper-half stack",
+        ),
+        (
+            syscall::thread_configure_with_tls(child.th, entry, stack_top, 0, NON_CANONICAL),
+            "non-canonical TLS base",
+        ),
+    ];
+
+    cap_delete(child.th)
+        .map_err(|_| "cap_delete th after configure_non_user_address_err failed")?;
+    cap_delete(child.cs)
+        .map_err(|_| "cap_delete cs after configure_non_user_address_err failed")?;
+
+    for (result, case) in cases
+    {
+        if result != Err(SyscallError::InvalidArgument as i64)
+        {
+            crate::log("ktest: thread::configure_non_user_address_err: not refused:");
+            crate::log(case);
+            return Err("thread_configure with a non-user address was not refused");
+        }
     }
     Ok(())
 }

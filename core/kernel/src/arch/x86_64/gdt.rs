@@ -18,8 +18,9 @@
 //!   CS = STAR[63:48]+16, SS = STAR[63:48]+8
 //! so the layout `user_ds(0x18), user_cs(0x20)` is required for SYSRET.
 //!
-//! IST stacks for double-fault (IST1) and NMI (IST2) are passed in by the
-//! caller as kernel-direct-map virtual addresses backed by static BSS.
+//! IST stacks for double-fault and machine-check (IST1) and NMI (IST2) are
+//! passed in by the caller as kernel-direct-map virtual addresses backed by
+//! static BSS.
 //!
 //! # Modification notes
 //! - To add a new ring-3 segment: insert it after `user_cs` and before the TSS
@@ -62,7 +63,7 @@ pub struct Tss
     _rsp1: u64,
     _rsp2: u64,
     _reserved1: u64,
-    /// IST1 — used by the double-fault gate.
+    /// IST1 — used by the double-fault and machine-check gates.
     pub ist1: u64,
     /// IST2 — used by the NMI gate.
     pub ist2: u64,
@@ -278,7 +279,8 @@ pub fn tss_desc(tss_addr: u64) -> (u64, u64)
 ///
 /// Called once during boot. Parameters:
 /// - `kernel_stack_top`: initial RSP0 (ring-0 stack top for TSS).
-/// - `ist1_top`: top of the 8 KiB double-fault IST stack.
+/// - `ist1_top`: top of the 8 KiB IST stack shared by the double-fault and
+///   machine-check gates.
 /// - `ist2_top`: top of the 8 KiB NMI IST stack.
 ///
 /// # Safety

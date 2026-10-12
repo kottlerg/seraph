@@ -16,9 +16,11 @@
 //!
 //! **x86-64**: the `IA32_GS_BASE` MSR is set to `per_cpu_ptr(cpu_id)` so that
 //! GS-relative addressing (`gs:[offset]`) reaches the current CPU's data
-//! without a memory indirection or lock. The `PERCPU_*_OFFSET` constants
-//! must match the `#[repr(C)]` field layout exactly — they are used in
-//! the `syscall_entry` naked-asm stub.
+//! without a memory indirection or lock. While ring 3 runs, the pointer is in
+//! `IA32_KERNEL_GS_BASE`, and each entry path `swapgs`es before any `gs:`
+//! access (see `arch/x86_64/syscall.rs` § Entry contract). The
+//! `PERCPU_*_OFFSET` constants must match the `#[repr(C)]` field layout
+//! exactly — they are used in the `syscall_entry` naked-asm stub.
 //!
 //! **RISC-V**: the `tp` (thread pointer) register is set to `per_cpu_ptr(cpu_id)`.
 //! `current_cpu()` dereferences `tp` to read `cpu_id`.

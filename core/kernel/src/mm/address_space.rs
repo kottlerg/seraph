@@ -836,18 +836,20 @@ impl AddressSpace
         // covers both invalidation shapes below: spans at or under
         // RANGE_FLUSH_CEILING_PAGES issue an untagged per-page range flush
         // (batched: riscv64 Svinval bracket), larger spans a full flush. The
-        // untagged range is as correct as the untagged full flush — a remote
-        // target still has this space's tag loaded, and per-VA invalidation
-        // covers the paging-structure caches for the freed intermediate frames
-        // on both architectures (invlpg / sfence-family VA forms invalidate
-        // non-leaf entries for that VA too).
+        // range form is used only when it also clears the paging-structure
+        // caches for any table frame the teardown freed: always where a per-VA
+        // invalidation drops them (`VA_INVAL_DROPS_TABLE_CACHES`, x86-64
+        // `invlpg`), otherwise only when no table was freed. A RISC-V VA-form
+        // fence need only drop leaf entries, so a freed table frame there takes
+        // the full flush.
         if crate::mm::tag_allocator::tagging_enabled()
         {
             self.tlb_gen.fetch_add(1, Ordering::Release);
             core::sync::atomic::fence(Ordering::SeqCst);
         }
         let current = crate::arch::current::cpu::current_cpu() as usize;
-        let ranged = page_count <= crate::mm::tlb_shootdown::RANGE_FLUSH_CEILING_PAGES;
+        let ranged = page_count <= crate::mm::tlb_shootdown::RANGE_FLUSH_CEILING_PAGES
+            && (freed == 0 || crate::arch::current::paging::VA_INVAL_DROPS_TABLE_CACHES);
         // Only CPUs that run this AS cache its translations — the kernel edits
         // these page tables through the direct map, never by loading this root.
         // The caller is normally memmgr, which does not run the target AS, so

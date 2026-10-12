@@ -34,7 +34,7 @@
 //! - `ipc.rs`      — IPC call, reply, recv, buffer set
 //! - `thread.rs`   — thread lifecycle, register read/write, priority, affinity, sleep, `bind_notification`
 //! - `fpu.rs`      — FPU / SIMD / V extended-state isolation across preemption and cross-CPU migration
-//! - `hw.rs`       — MMIO, IRQ, I/O ports, SBI
+//! - `hw.rs`       — MMIO, IRQ, I/O ports (`SYS_SBI_CALL` is under `src/arch/<arch>/`)
 //! - `sysinfo.rs`  — system info queries and debug log
 //! - `crypto.rs`   — shared `crypto` crate KATs (SHA-512, Ed25519 verify),
 //!   run on-target so the primitives are validated on both arches (not a
@@ -42,6 +42,8 @@
 //! - `init_layout.rs` — kernel Phase 9 ASLR draws (#39): `InitInfo` VA,
 //!   init stack, and PIE image-base window membership, asserted on ktest's
 //!   own layout and load base
+//! - Architecture-only tests live behind `crate::arch` (`run_unit`); per-arch
+//!   helpers and branches inside the tests above are still gated in place (#460).
 
 pub mod cap;
 pub mod cap_info;
@@ -506,6 +508,10 @@ pub fn run_all(ctx: &TestContext)
         thread::configure_running_thread_err(ctx)
     );
     run_test!(
+        "thread::configure_non_user_address_err",
+        thread::configure_non_user_address_err(ctx)
+    );
+    run_test!(
         "thread::set_priority_zero_err",
         thread::set_priority_zero_err(ctx)
     );
@@ -577,16 +583,9 @@ pub fn run_all(ctx: &TestContext)
     );
     run_test!("hw::ioport_bind", hw::ioport_bind(ctx));
     run_test!("hw::ioport_split", hw::ioport_split(ctx));
-    #[cfg(target_arch = "riscv64")]
-    run_test!(
-        "hw::sbi_call_get_spec_version",
-        hw::sbi_call_get_spec_version(ctx)
-    );
-    #[cfg(target_arch = "x86_64")]
-    run_test!(
-        "hw::sbi_call_not_supported_x86_64",
-        hw::sbi_call_not_supported_x86_64(ctx)
-    );
+
+    // ── Architecture-specific tests (thread configure, SBI call) ──────────────
+    crate::arch::run_unit(ctx);
 
     // ── System info syscalls ──────────────────────────────────────────────────
     run_test!("sysinfo::kernel_version", sysinfo::kernel_version(ctx));

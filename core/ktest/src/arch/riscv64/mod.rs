@@ -8,13 +8,12 @@
 //! Tier 1 tests:
 //! - `sbi_call.rs` — `SYS_SBI_CALL` reaches the SBI firmware
 //!
-//! TODO: move the RISC-V-specific `integration::sbi_gating` scenario, which still
-//! sits in `integration/` behind its own `target_arch` gates, behind this module.
-//! Deferred because the move is a ktest code-quality cleanup that changes no test
-//! coverage; it is tracked, with the other arch-gated ktest items outside
-//! `crate::arch`, on #460.
+//! Tier 2 scenarios:
+//! - `sbi_gating.rs` — `SYS_SBI_CALL` refuses kernel-reserved extensions and
+//!   sanctioned ones the cap lacks the right for
 
 mod sbi_call;
+mod sbi_gating;
 
 use crate::TestContext;
 
@@ -29,6 +28,8 @@ pub fn run_unit(ctx: &TestContext)
     );
 }
 
-/// Run every RISC-V-specific Tier 2 scenario that lives behind this module
-/// (none yet; see the module doc).
-pub fn run_integration(_ctx: &TestContext) {}
+/// Run every RISC-V-specific Tier 2 integration scenario.
+pub fn run_integration(ctx: &TestContext)
+{
+    crate::run_integration_test!("integration::sbi_gating", sbi_gating::run(ctx));
+}

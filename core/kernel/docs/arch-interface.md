@@ -288,7 +288,8 @@ pub fn new_state(entry: u64, stack_top: u64, arg: u64, is_user: bool) -> SavedSt
 pub fn seed_tls_base(saved: &mut SavedState, tls_base: u64);
 
 /// Round a user-supplied stack pointer to the entry point's `extern "C"` ABI
-/// alignment (x86-64 SysV `rsp ≡ 8 (mod 16)`; RISC-V LP64D `sp ≡ 0 (mod 16)`).
+/// alignment (x86-64 SysV `rsp ≡ 8 (mod 16)`: `(sp & !0xF) - 8`, wrapping for
+/// `sp` below 16; RISC-V LP64D `sp ≡ 0 (mod 16)`: `sp & !0xF`).
 pub fn align_initial_stack(sp: u64) -> u64;
 
 /// Switch from `current` to `next`, saving callee-saved registers into `current`

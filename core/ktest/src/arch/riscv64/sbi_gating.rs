@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// core/ktest/src/integration/sbi_gating.rs
+// core/ktest/src/arch/riscv64/sbi_gating.rs
 
-//! Integration: `SYS_SBI_CALL` extension gating (RISC-V).
+//! Tier 2 (RISC-V): `SYS_SBI_CALL` extension gating.
 //!
 //! Verifies the two layers of the `SbiControl` gate without triggering an
 //! actual firmware action (the only sanctioned extension wired to a side effect
@@ -19,26 +19,22 @@
 //! The positive SRST path (cap holds `SBI_RESET`) is exercised by the harness's
 //! own `sbi_shutdown` at end of run.
 
+use syscall::{cap_delete, cap_derive, sbi_call};
+use syscall_abi::SyscallError;
+
 use crate::{TestContext, TestResult};
 
 /// SBI Timer extension ID (kernel-reserved: scheduler timer).
-#[cfg(target_arch = "riscv64")]
 const SBI_EXT_TIME: u64 = 0x5449_4D45;
 
 /// SBI Hart State Management extension ID (kernel-reserved: hart lifecycle).
-#[cfg(target_arch = "riscv64")]
 const SBI_EXT_HSM: u64 = 0x0048_534D;
 
 /// SBI System Reset extension ID (sanctioned, requires `SBI_RESET`).
-#[cfg(target_arch = "riscv64")]
 const SBI_EXT_SRST: u64 = 0x5352_5354;
 
-#[cfg(target_arch = "riscv64")]
 pub fn run(ctx: &TestContext) -> TestResult
 {
-    use syscall::{cap_delete, cap_derive, sbi_call};
-    use syscall_abi::SyscallError;
-
     crate::log("sbi_gating: starting");
 
     if ctx.sbi_control_cap == 0
@@ -70,14 +66,5 @@ pub fn run(ctx: &TestContext) -> TestResult
         return Err("sbi_gating: SRST without SBI_RESET should fail with InsufficientRights");
     }
 
-    Ok(())
-}
-
-/// SBI does not exist on this architecture; nothing to gate. Signature matches
-/// the RISC-V arm so `run_integration_test!` registers uniformly.
-#[cfg(not(target_arch = "riscv64"))]
-#[allow(clippy::unnecessary_wraps)]
-pub fn run(_ctx: &TestContext) -> TestResult
-{
     Ok(())
 }

@@ -417,7 +417,7 @@ pub struct ThreadControlBlock
     ///
     /// Keyed on the TCB itself, not on whichever run queue happens to link it:
     /// the owning lock of `{state, ipc_state, queued_on, run_queue_next,
-    /// preferred_cpu, blocked_on_object, wake_pending}` is always this lock,
+    /// preferred_cpu, blocked_on_object, wake_pending, park_seq}` is always this lock,
     /// regardless of which CPU the TCB is on. This is what collapses the
     /// positional-ownership race class — two CPUs can no longer pick two
     /// different locks for one TCB. Lock order: source IPC lock → `sched_lock`
@@ -441,6 +441,16 @@ pub struct ThreadControlBlock
     /// docs/scheduling-internals.md § Softlockup Watchdog); never gates
     /// control flow.
     pub park_started_tick: u64,
+
+    /// Park-binding generation: advanced under [`sched_lock`](Self::sched_lock)
+    /// by every commit that publishes a new `Blocked` binding
+    /// (`commit_blocked_under_local_lock`, `commit_reply_rebind_under_local_lock`).
+    /// A stop or teardown snapshots it with `state`, cancels the park it saw,
+    /// and commits only if it is unchanged, so it never writes `Stopped` or
+    /// `Exited` over a park it did not cancel. Only ever accessed under
+    /// `sched_lock`. See docs/thread-lifecycle-and-sleep.md § `sys_thread_stop`
+    /// Cross-CPU Stop Protocol.
+    pub park_seq: u32,
 
     // === IPC state ===
     /// Current IPC blocking reason (None when not blocked on IPC).
@@ -678,8 +688,13 @@ pub struct ThreadControlBlock
     pub exit_reason: u64,
 
     // === Sleep ===
-    /// Tick deadline for `SYS_THREAD_SLEEP`. 0 = not sleeping.
-    pub sleep_deadline: u64,
+    /// Tick deadline of this thread's pending sleep-list entry (a plain
+    /// `SYS_THREAD_SLEEP` or a timed IPC wait); 0 = none. Set by the parker
+    /// before its `sleep_list_add`; cleared only under `SLEEP_LIST_LOCK`, by
+    /// the timer pop or `sleep_list_remove`, together with the entry. Atomic
+    /// because waker prechecks read it under a source lock, not that lock.
+    /// See docs/thread-lifecycle-and-sleep.md § Sleep List Invariants.
+    pub sleep_deadline: core::sync::atomic::AtomicU64,
 
     // === FPU / SIMD / Vector extended state ===
     /// Per-thread XSAVE area pointer for the FPU/SIMD/V eager-save /

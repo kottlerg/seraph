@@ -166,28 +166,20 @@ pub unsafe fn notification_send(
                 (*waiter).wakeup_value = delivered;
             }
             // If the waiter was registered with a `SYS_NOTIFICATION_WAIT` timeout, it
-            // is also on the global sleep list. Remove it here so the timer
-            // path will not try to double-wake this thread. We hold `sig.lock`;
-            // `sleep_list_remove` acquires `SLEEP_LIST_LOCK` internally
-            // (lock order: sig.lock → SLEEP_LIST_LOCK; the timer path takes
-            // SLEEP_LIST_LOCK first, releases it, and only then reaches for
-            // sig.lock — so no circular wait).
-            //
-            // ORDER (issue #117): call `sleep_list_remove` BEFORE clearing
-            // `sleep_deadline`. The timer path (`sleep_check_wakeups`) walks
-            // `SLEEP_LIST` under `SLEEP_LIST_LOCK` and considers an entry
-            // expired when `(*tcb).sleep_deadline <= now`. Clearing the
-            // deadline first creates a window where the entry is still on
-            // the list with `deadline == 0 <= now`, making the timer claim a
-            // wake that this `notification_send` is concurrently delivering →
-            // double-`enqueue_and_wake` of the waiter and a corrupted run
-            // queue (intrusive-list self-cycle).
+            // is also on the global sleep list. Remove it here, with the
+            // waiter slot, so the timer path will not try to double-wake this
+            // thread and no entry outlives the binding. We hold `sig.lock`;
+            // `sleep_list_remove` acquires `SLEEP_LIST_LOCK` internally and
+            // clears the deadline with the entry (lock order: sig.lock →
+            // SLEEP_LIST_LOCK; the timer path takes SLEEP_LIST_LOCK first,
+            // releases it, and only then reaches for sig.lock — so no circular
+            // wait). A deadline of 0 under sig.lock means no entry: the waiter
+            // arms under sig.lock, and every removal clears both together.
             // SAFETY: waiter is the TCB we just dequeued from sig.waiter.
             unsafe {
-                if (*waiter).sleep_deadline != 0
+                if (*waiter).sleep_deadline.load(Ordering::Relaxed) != 0
                 {
                     crate::sched::sleep_list_remove(waiter);
-                    (*waiter).sleep_deadline = 0;
                 }
             }
             Some(waiter)

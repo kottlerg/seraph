@@ -1,0 +1,175 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 2026 George Kottler <mail@kottlerg.com>
+
+// core/ktest/src/stress/stop_sleep_window.rs
+
+//! Stress: stop and restart a thread in a tight `thread_sleep` loop, so the
+//! stop lands in every part of the plain-sleep path — before the park
+//! commit, between the commit and `sleep_list_add`, while listed, and while
+//! the timer claims the wake.
+//!
+//! ## The hazard
+//!
+//! `sys_thread_sleep` commits `Blocked` and then adds the sleep-list entry.
+//! A stop between the two must cancel the sleep without leaving an entry: a
+//! stale entry for a stopped (and later restarted) thread would be popped by
+//! a later tick, mis-wake whatever the thread is then doing, and give it a
+//! second entry when it sleeps again, which a `dealloc_object(Thread)`
+//! removing one entry would leave behind for a freed TCB. The fix makes
+//! `sleep_list_remove` clear the deadline with the entry under
+//! `SLEEP_LIST_LOCK` and the add refuse a cleared deadline
+//! (core/kernel/docs/thread-lifecycle-and-sleep.md § Sleep List Invariants).
+//!
+//! ## How this exercises it
+//!
+//! A sleeper pinned to one CPU loops `thread_sleep(1)` and tallies each
+//! result. The controller, pinned to another CPU, stops and restarts it
+//! [`CYCLES`] times with a varying spin between the pair, then lets it exit.
+//! The tripwires are the kernel's debug assertions (CI debug cells run them):
+//! a listed TCB with a zero deadline at the pop, a duplicate add, a popped
+//! binding that no timed park arms, and the wake-in-flight and run-queue
+//! single-link checks. The test itself fails if a sleep returned anything but
+//! `Ok` or `Interrupted`, or if no stop ever cancelled a sleep (the race never
+//! armed).
+//!
+//! Needs **≥ 2 CPUs** (the stop must run concurrently with the sleep path).
+
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+use syscall::{
+    cap_copy, cap_create_notification, cap_delete, notification_send, notification_wait,
+    system_info, thread_exit, thread_set_affinity, thread_sleep, thread_start, thread_stop,
+};
+use syscall_abi::{SyscallError, SystemInfoType};
+
+use crate::{ChildStack, TestContext, TestResult, spawn};
+
+/// Stop/start pairs to issue against the sleeper.
+const CYCLES: u32 = 2000;
+
+/// Notification NOTIFY right — what a child needs to `notification_send`.
+const RIGHTS_SIGNAL: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
+
+/// Sleeper raises this once it is looping, and again on exit.
+const BIT_RUNNING: u64 = 1 << 0;
+const BIT_EXITED: u64 = 1 << 1;
+
+/// Set by the controller to end the sleeper's loop.
+static QUIT: AtomicU32 = AtomicU32::new(0);
+/// Sleeper tallies: `Ok`, `Interrupted`, anything else.
+static SLEPT: AtomicU64 = AtomicU64::new(0);
+static INTERRUPTED: AtomicU64 = AtomicU64::new(0);
+static BAD: AtomicU64 = AtomicU64::new(0);
+
+pub fn run(ctx: &TestContext) -> TestResult
+{
+    let cpus = system_info(SystemInfoType::CpuCount as u64)
+        .map_err(|_| "stress::stop_sleep_window: system_info(CpuCount) failed")?;
+    if cpus < 2
+    {
+        crate::log("ktest: stress::stop_sleep_window SKIP (need 2+ CPUs)");
+        return Ok(());
+    }
+
+    QUIT.store(0, Ordering::Release);
+    SLEPT.store(0, Ordering::Relaxed);
+    INTERRUPTED.store(0, Ordering::Relaxed);
+    BAD.store(0, Ordering::Relaxed);
+
+    let done = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "stress::stop_sleep_window: create done failed")?;
+    let child =
+        spawn::new_child(ctx).map_err(|_| "stress::stop_sleep_window: spawn sleeper failed")?;
+    let c_done = cap_copy(done, child.cs, RIGHTS_SIGNAL)
+        .map_err(|_| "stress::stop_sleep_window: cap_copy done failed")?;
+    // SAFETY: stack index 0 is this test's only child; stress tests run
+    // sequentially.
+    let stack = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[0]) });
+    spawn::configure_and_start_pinned(&child, sleeper_entry, stack, u64::from(c_done), 1)
+        .map_err(|_| "stress::stop_sleep_window: start sleeper failed")?;
+    thread_set_affinity(ctx.thread_cap, 0)
+        .map_err(|_| "stress::stop_sleep_window: pin controller failed")?;
+
+    let mut acc = 0u64;
+    while acc & BIT_RUNNING == 0
+    {
+        acc |= notification_wait(done)
+            .map_err(|_| "stress::stop_sleep_window: wait running failed")?;
+    }
+
+    let mut result = Ok(());
+    for cycle in 0..CYCLES
+    {
+        // Vary the stop's phase against the sleep loop: 0 to 4095 spins
+        // (a multiplicative hash of the cycle) before each pair.
+        for _ in 0..(cycle.wrapping_mul(2_654_435_761) >> 20)
+        {
+            core::hint::spin_loop();
+        }
+        if thread_stop(child.th).is_err()
+        {
+            result = Err("stress::stop_sleep_window: thread_stop failed");
+            break;
+        }
+        if thread_start(child.th).is_err()
+        {
+            result = Err("stress::stop_sleep_window: thread_start failed");
+            break;
+        }
+    }
+
+    QUIT.store(1, Ordering::Release);
+    while acc & BIT_EXITED == 0
+    {
+        acc |=
+            notification_wait(done).map_err(|_| "stress::stop_sleep_window: wait exit failed")?;
+    }
+    let restore = thread_set_affinity(ctx.thread_cap, u32::MAX)
+        .map_err(|_| "stress::stop_sleep_window: restore controller affinity failed");
+    cap_delete(child.th).map_err(|_| "stress::stop_sleep_window: reap thread failed")?;
+    cap_delete(child.cs).map_err(|_| "stress::stop_sleep_window: reap cspace failed")?;
+    cap_delete(done).map_err(|_| "stress::stop_sleep_window: del done failed")?;
+    result?;
+    restore?;
+
+    crate::log_u64(
+        "ktest: stress::stop_sleep_window slept=",
+        SLEPT.load(Ordering::Relaxed),
+    );
+    crate::log_u64(
+        "ktest: stress::stop_sleep_window interrupted=",
+        INTERRUPTED.load(Ordering::Relaxed),
+    );
+    if BAD.load(Ordering::Relaxed) != 0
+    {
+        return Err("stress::stop_sleep_window: thread_sleep returned neither Ok nor Interrupted");
+    }
+    if INTERRUPTED.load(Ordering::Relaxed) == 0
+    {
+        return Err("stress::stop_sleep_window: no stop ever cancelled a sleep (never armed)");
+    }
+    Ok(())
+}
+
+/// Sleeper: `thread_sleep(1)` until told to quit, tallying each result.
+// cast_possible_truncation: the argument is a 32-bit cap handle.
+#[allow(clippy::cast_possible_truncation)]
+fn sleeper_entry(arg: u64) -> !
+{
+    let done = arg as u32;
+    notification_send(done, BIT_RUNNING).ok();
+    while QUIT.load(Ordering::Acquire) == 0
+    {
+        match thread_sleep(1)
+        {
+            Ok(()) => SLEPT.fetch_add(1, Ordering::Relaxed),
+            Err(e) if e == SyscallError::Interrupted as i64 =>
+            {
+                INTERRUPTED.fetch_add(1, Ordering::Relaxed)
+            }
+            Err(_) => BAD.fetch_add(1, Ordering::Relaxed),
+        };
+    }
+    notification_send(done, BIT_EXITED).ok();
+    thread_exit()
+}

@@ -46,6 +46,8 @@
 //! - `aspace_fault_notification_late_bind.rs` — an aspace terminal-fault observer bound after the space already faulted still receives the retained reason
 //! - `ipc_call_interrupted_stop_start.rs` — a client stopped while parked in `ipc_call` (send-queued and awaiting-reply) restarts to `Interrupted`, never a stale reply (#361)
 //! - `park_interrupted_stop_start.rs` — a thread stopped while parked in any non-call blocking syscall (notification/event/recv/wait-set/sleep) restarts to `Interrupted`, never a stale deposit (#363)
+//! - `destroyed_source_interrupts.rs` — a waiter on a notification, event queue, or wait set
+//!   destroyed under it returns `Interrupted`, never a fabricated success
 //! - Architecture-only scenarios live behind `crate::arch` (`run_integration`);
 //!   per-arch helpers and branches inside the scenarios above are still gated in
 //!   place (#460).
@@ -58,6 +60,7 @@ pub mod cap_transfer;
 pub mod cap_transfer_large;
 pub mod cross_cspace_revoke_no_alias;
 pub mod death_notification_late_bind;
+pub mod destroyed_source_interrupts;
 pub mod fault_exception_no_handler_kills;
 pub mod fault_exception_redirect;
 pub mod fault_handler_declines_kills;
@@ -115,6 +118,10 @@ pub fn run_all(ctx: &TestContext)
     run_integration_test!(
         "integration::park_interrupted_stop_start",
         park_interrupted_stop_start::run(ctx)
+    );
+    run_integration_test!(
+        "integration::destroyed_source_interrupts",
+        destroyed_source_interrupts::run(ctx)
     );
     run_integration_test!(
         "integration::cap_delegation_chain",

@@ -37,9 +37,13 @@ mod load_balance_handoff_steal;
 mod priority_dealloc_race;
 mod retype_concurrent;
 mod split_delete_race;
+mod stop_park_race;
 mod stop_reply_race;
 mod stop_resume_race;
+mod stop_sleep_window;
 mod thread_churn;
+mod timed_wait_source_delete;
+mod timed_waiter_thread_delete;
 
 use crate::{ChildStack, TestContext, run_integration_test};
 
@@ -81,6 +85,16 @@ pub fn run_all(ctx: &TestContext)
     );
     run_integration_test!("stress::stop_reply_race", stop_reply_race::run(ctx));
     run_integration_test!("stress::stop_resume_race", stop_resume_race::run(ctx));
+    run_integration_test!("stress::stop_sleep_window", stop_sleep_window::run(ctx));
+    run_integration_test!("stress::stop_park_race", stop_park_race::run(ctx));
+    run_integration_test!(
+        "stress::timed_wait_source_delete",
+        timed_wait_source_delete::run(ctx)
+    );
+    run_integration_test!(
+        "stress::timed_waiter_thread_delete",
+        timed_waiter_thread_delete::run(ctx)
+    );
     run_integration_test!(
         "stress::double_enqueue_storm",
         double_enqueue_storm::run(ctx)

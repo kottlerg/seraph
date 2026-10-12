@@ -91,9 +91,7 @@ On `SYSCALL`:
 A return `rip` with any of bits 63:47 set is never passed to `SYSRET`, which would
 fault in ring 0 on the user stack: the kernel terminates the thread as for an
 unhandled user `#GP` (vector 13). The GS-base exchange on every ring-3 entry and exit
-is a platform fact (see
-[platform-requirements.md](../../../docs/platform-requirements.md) § x86-64
-Classification).
+follows [arch-interface.md](arch-interface.md) § `cpu`.
 
 `SFMASK` clears `IF`, `TF`, `DF`, `AC`, `NT` and `IOPL` on `SYSCALL` entry, whatever
 the user set: interrupts stay off until the kernel enables them, `DF` clear is the
@@ -1728,8 +1726,8 @@ stack so the first scheduler switch enters user mode at `entry`.
 **Capability requirement:** `thread_cap` must have Control rights.
 
 **Errors:** `InvalidCapability`, `InsufficientRights` (cap lacks Control),
-`InvalidArgument` (thread not in the Created state, `entry` at or above the user VA top,
-or `stack_top` above it).
+`InvalidArgument` (thread not in the Created state, `entry` or `tls_base` at or above the
+user VA top, or `stack_top` above it).
 
 ---
 

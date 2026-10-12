@@ -401,7 +401,9 @@ pub fn delay_us(us: u64);
 
 Architecture-specific syscall entry/return glue. Shared code does not call into this beyond
 initialisation; the arch entry stub saves user state, calls `crate::syscall::dispatch`,
-restores state, and returns to userspace.
+restores state, and returns to userspace (on x86-64 a non-canonical return RIP is never passed
+to `sysretq`; the thread is terminated as for an unhandled user `#GP`, per
+[syscalls.md](syscalls.md) § Syscall Entry and Exit).
 
 ```rust
 /// Install the syscall entry handler on the current CPU. x86-64 writes LSTAR /
@@ -417,7 +419,10 @@ pub unsafe fn init();
 CPU identification, per-CPU storage, kernel-stack setup, and interrupt save/restore. Per-CPU
 storage is architecture-managed (GS-base on x86-64, exchanged with the user GS base by `swapgs`
 on every ring-3 entry and exit that runs kernel code; the spurious-interrupt stub, vector 255,
-runs only `iretq` and touches no GS state; `sscratch` on RISC-V).
+runs only `iretq` and touches no GS state; `sscratch` on RISC-V). The `swapgs` discipline
+depends on ring 3 being unable to write its GS base, which is why `FSGSBASE` stays disabled
+(per [platform-requirements.md](../../../docs/platform-requirements.md) § x86-64
+Classification).
 
 ```rust
 /// Hardware and logical CPU identity (APIC id / hart id, and the 0-based logical
@@ -680,4 +685,5 @@ equally clearly.
 [core/kernel/README.md](../README.md), [Kernel Entropy Subsystem](entropy.md),
 [Kernel Initialization Sequence](initialization.md), [Scheduler Internals](scheduler.md),
 [SMP Scheduling and Locking Invariants](scheduling-internals.md),
-[Syscall Interface Specification](syscalls.md)
+[Syscall Interface Specification](syscalls.md),
+[Platform Requirements](../../../docs/platform-requirements.md)

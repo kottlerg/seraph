@@ -214,8 +214,18 @@ pub fn user_copy_fixup(pc: u64) -> Option<u64>
 
 // ── SMEP / SMAP ───────────────────────────────────────────────────────────────
 
+/// `CR4.FSGSBASE` (bit 16): enables the ring-3 `wrgsbase`/`wrfsbase`
+/// instructions.
+const CR4_FSGSBASE: u64 = 1 << 16;
+
 /// Enable Supervisor Mode Execution Prevention (SMEP) and Supervisor Mode
-/// Access Prevention (SMAP) by setting CR4 bits 20 and 21.
+/// Access Prevention (SMAP) by setting CR4 bits 20 and 21, and clear
+/// `CR4.FSGSBASE`, which firmware may have left set.
+///
+/// With FSGSBASE off, ring 3 can change its GS base only by loading a GDT
+/// selector, whose base is 0, so a user GS base is never a kernel-half address;
+/// the paranoid NMI/`#MC`/`#DF`/`#DB` entry (`idt.rs` `paranoid_entry_asm`)
+/// relies on that to tell the user GS base from the kernel's.
 ///
 /// Checks CPUID.07H:EBX bit 7 (SMEP) and bit 20 (SMAP). Halts with a fatal
 /// message if either feature is absent, because the security model requires
@@ -246,7 +256,7 @@ pub unsafe fn enable_smep_smap()
     let cr4 = read_cr4();
     // SAFETY: CPUID confirmed both features are present; new CR4 value is valid.
     unsafe {
-        write_cr4(cr4 | (1 << 20) | (1 << 21));
+        write_cr4((cr4 & !CR4_FSGSBASE) | (1 << 20) | (1 << 21));
     }
 }
 

@@ -85,6 +85,15 @@ pub fn sys_thread_configure(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         return Err(SyscallError::InvalidArgument);
     }
 
+    // The entry point and stack must be user addresses: the thread's first return
+    // to user mode resumes there, and on x86-64 an `iretq` to a non-canonical RIP
+    // faults in ring 0 after the GS swap back to the user base.
+    let user_top = crate::mm::user_va_top();
+    if entry >= user_top || tf.arg(2) > user_top
+    {
+        return Err(SyscallError::InvalidArgument);
+    }
+
     // SAFETY: target_tcb validated non-null; kernel_stack_top set at creation.
     let kstack_top = unsafe { (*target_tcb).kernel_stack_top };
 

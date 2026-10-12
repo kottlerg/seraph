@@ -13,8 +13,21 @@
 //!
 //! Every ring-3 entry at which a thread can be stopped (exception, `#PF`, NMI,
 //! and ring-3 IRQ) builds the one canonical [`TrapFrame`] on the kernel stack via
-//! `tf_build_asm`/`tf_resume_asm`; the fault redirect points `tcb->trap_frame`
-//! at that live frame with no copy. See the "Unified entry frame" section.
+//! `tf_build_asm` and writes it back on exit via `tf_restore_asm` (inside
+//! `tf_resume_asm` for the normal stubs, `paranoid_exit_asm` for the paranoid
+//! ones); the fault redirect points `tcb->trap_frame` at that live frame with no
+//! copy. See the "Unified entry frame" section.
+//!
+//! # Entry and exit discipline
+//! Every stub that runs kernel code clears DF and AC (`cld`, `clac`) on entry and
+//! runs that code on the kernel GS base. The normal stubs swap GS when the saved
+//! CS is ring 3 (`entry_swapgs_asm` / `exit_swapgs_asm`, and the ring-3 path of
+//! `common_irq_trampoline`). The paranoid stubs (NMI, `#DB`, `#DF`, `#MC`) can
+//! arrive between a ring-3 entry and its `swapgs`, so they decide the swap from
+//! `IA32_GS_BASE` instead (`paranoid_entry_asm` / `paranoid_exit_asm`). Every
+//! entry-side swap decision is followed by `lfence`. The spurious-interrupt stub
+//! (vector 255) runs only `iretq`: it executes no kernel code and touches no GS
+//! state.
 //!
 //! # Exception vector groups
 //! Vectors with a hardware-pushed error code: 8, 10, 11, 12, 13, 14, 17, 21, 29, 30.
@@ -22,6 +35,7 @@
 //!
 //! # IST assignments
 //! - Vector 8  (Double Fault): IST1
+//! - Vector 18 (Machine Check): IST1
 //! - Vector 2  (NMI):          IST2
 //!
 //! # Modification notes
@@ -240,7 +254,10 @@ macro_rules! tf_resume_asm {
 /// swap to the kernel GS base when the interrupted context was ring 3 (the saved
 /// CS at `[rsp + $cs]` has a non-zero RPL), then clear DF and AC so kernel code
 /// runs with the string-instruction direction and SMAP enforcement it expects,
-/// whatever the interrupted context set.
+/// whatever the interrupted context set. The `lfence` after the conditional swap
+/// keeps a mispredicted branch from running later GS-relative loads
+/// speculatively on the wrong base (the SWAPGS speculation pattern,
+/// CVE-2019-1125).
 ///
 /// While user code runs the kernel's per-CPU pointer lives in
 /// `IA32_KERNEL_GS_BASE` (see `syscall.rs` § Entry contract). A stub that can
@@ -256,6 +273,7 @@ macro_rules! entry_swapgs_asm {
             "jz 81f\n",
             "swapgs\n",
             "81:\n",
+            "lfence\n",
             "cld\n",
             "clac\n",
         )
@@ -265,8 +283,14 @@ macro_rules! entry_swapgs_asm {
 /// Naked-asm fragment run last before `iretq`: disable interrupts, then swap back
 /// to the user GS base when returning to ring 3 (the iret frame's CS at
 /// `[rsp + $cs]` has a non-zero RPL). Interrupts stay off from the swap to the
-/// `iretq` (which restores the interrupted context's IF), so no stub can enter
-/// with a ring-0 frame on the user GS base.
+/// `iretq` (which restores the interrupted context's IF), and the `iretq` itself
+/// does not fault: every ring-3 return carries a canonical user RIP and RSP
+/// (`sys_thread_configure` rejects a non-user entry or stack,
+/// `SYS_THREAD_WRITE_REGS` sanitizes the frame via
+/// `TrapFrame::sanitize_for_user_resume`, and `syscall_entry` diverts a
+/// non-canonical return RIP to a user `#GP` instead of `sysretq`) and kernel-set
+/// CS and SS selectors. So no stub can enter with a ring-0 frame on the user GS
+/// base.
 #[cfg(not(test))]
 macro_rules! exit_swapgs_asm {
     ($cs:literal) => {
@@ -286,8 +310,9 @@ macro_rules! exit_swapgs_asm {
 /// `swapgs` (NMI, `#MC`, `#DF`, `#DB`). Runs after [`tf_build_asm`] (the
 /// registers it clobbers are saved). Decides from the active GS base rather than
 /// the saved CS: a user GS base comes only from a flat GDT descriptor (base 0)
-/// and is never a kernel-half address, so a clear sign bit in `IA32_GS_BASE`
-/// means the user base is active. Swaps if so and records it in `r12`
+/// and is never a kernel-half address (`cpu::enable_smep_smap` keeps
+/// `CR4.FSGSBASE` clear on every CPU, so ring 3 has no `wrgsbase`), so a clear
+/// sign bit in `IA32_GS_BASE` means the user base is active. Swaps if so and records it in `r12`
 /// (callee-saved across the handler call) for [`paranoid_exit_asm`].
 #[cfg(not(test))]
 macro_rules! paranoid_entry_asm {
@@ -303,6 +328,7 @@ macro_rules! paranoid_entry_asm {
             "swapgs\n",
             "mov r12d, 1\n",
             "83:\n",
+            "lfence\n", // see `entry_swapgs_asm`
         )
     };
 }
@@ -328,7 +354,9 @@ macro_rules! paranoid_exit_asm {
 
 /// The terminal exception path: a fault that no fault handler resolved. Invoked
 /// (and never returned from) by [`exception_handler`], [`page_fault_handler`],
-/// and the NMI handler once they determine the fault is unrecoverable.
+/// and the NMI handler once they determine the fault is unrecoverable, and by
+/// `syscall_entry` (as a user `#GP`) for a non-canonical return RIP that
+/// `sysretq` would fault on in ring 0.
 ///
 /// If the fault originated in userspace (CPL != 0), the faulting thread is
 /// terminated and a death notification is posted (if bound). If the fault
@@ -338,7 +366,7 @@ macro_rules! paranoid_exit_asm {
 /// `tf` must point to a valid [`TrapFrame`] on the current stack; `vector` and
 /// `error_code` are the trap metadata from the stub frame.
 #[cfg(not(test))]
-unsafe extern "C" fn common_exception_handler(
+pub(super) unsafe extern "C" fn common_exception_handler(
     tf: *const TrapFrame,
     vector: u64,
     error_code: u64,
@@ -470,8 +498,9 @@ unsafe extern "C" fn common_exception_handler(
 }
 
 /// Generic exception dispatch for vectors routed through
-/// [`common_exception_trampoline`] (every ring-3-reachable vector except `#PF`,
-/// `#NM`, and NMI, which have dedicated stubs).
+/// [`common_exception_trampoline`] or [`paranoid_exception_trampoline`] (every
+/// ring-3-reachable vector except `#PF`, `#NM`, and NMI, which have dedicated
+/// stubs; `#DB`, `#DF`, and `#MC` take the paranoid trampoline).
 ///
 /// A userspace exception whose thread has a bound fault handler is redirected to
 /// it ([`redirect_user_exception`]); on a resume reply this returns and the
@@ -488,12 +517,13 @@ unsafe extern "C" fn common_exception_handler(
 #[cfg(not(test))]
 extern "C" fn exception_handler(tf: *mut TrapFrame, vector: u64, error_code: u64)
 {
-    // SAFETY: tf is constructed by common_exception_trampoline on this stack.
+    // SAFETY: tf is constructed by common_exception_trampoline or
+    // paranoid_exception_trampoline on this stack.
     let f = unsafe { &*tf };
     let from_user = (f.cs & 3) != 0;
-    // #DF (8) and #MC (18) are non-restartable aborts; #DF additionally runs on a
-    // dedicated IST stack that is not re-entrant across the reschedule a redirect
-    // performs. They are never delivered to a resumable handler — always terminal.
+    // #DF (8) and #MC (18) are non-restartable aborts; both run on the IST1 stack,
+    // which is not re-entrant across the reschedule a redirect performs. They are
+    // never delivered to a resumable handler — always terminal.
     let redirectable = vector != 8 && vector != 18;
     if from_user && redirectable
     {
@@ -693,6 +723,12 @@ unsafe extern "C" fn common_exception_trampoline()
 /// [`common_exception_trampoline`] for the vectors that can arrive between a
 /// ring-3 entry and its `swapgs` (`#DB`, `#DF`, `#MC`): identical except that the
 /// GS swap is decided by [`paranoid_entry_asm`] / [`paranoid_exit_asm`].
+///
+/// # Safety
+/// Reached only as the jump target of a [`paranoid_isr_stub`] stub, with the
+/// vector and error-code words pushed above a hardware interrupt frame; never
+/// called directly. The GS decision requires that no user GS base is a
+/// kernel-half address (see [`paranoid_entry_asm`]).
 #[cfg(not(test))]
 #[unsafe(naked)]
 unsafe extern "C" fn paranoid_exception_trampoline()
@@ -713,6 +749,10 @@ unsafe extern "C" fn paranoid_exception_trampoline()
 
 /// Generate a naked ISR stub that enters through
 /// [`paranoid_exception_trampoline`]; otherwise as [`isr_stub`].
+///
+/// The generated `unsafe extern "C" fn` is an IDT gate target only: it is never
+/// called, and its contract is the hardware interrupt frame it is entered with
+/// (`# Safety` of [`paranoid_exception_trampoline`]).
 macro_rules! paranoid_isr_stub {
     ($name:ident, $vector:expr, has_error_code = false) => {
         #[cfg(not(test))]
@@ -841,6 +881,7 @@ unsafe extern "C" fn common_irq_trampoline()
             "jz 2f\n",
             // ── ring-3: build TrapFrame, dispatch, frame-authoritative return ──
             "swapgs\n", // kernel GS base (see `entry_swapgs_asm`)
+            "lfence\n",
             tf_build_asm!(),
             "mov rdi, [rsp + 168]\n", // arg0 = vector
             "call {dispatch}\n",
@@ -1324,7 +1365,8 @@ fn normalize_x86_exception(vector: u64) -> u64
 /// (and thus the frame) is preserved across the block: the context switch saves
 /// and restores the kernel rsp, so the pointer stays valid while the faulter is
 /// descheduled. The handler's `SYS_THREAD_READ_REGS` / `SYS_THREAD_WRITE_REGS`
-/// see and edit the live frame; on resume the trampoline's `tf_resume_asm`
+/// see and edit the live frame; on resume the trampoline's restore tail
+/// (`tf_restore_asm`, reached through `tf_resume_asm` or `paranoid_exit_asm`)
 /// writes any edits back into the iret frame. Symmetric with
 /// `riscv64/interrupts.rs::redirect_user_fault`.
 ///
@@ -1380,8 +1422,13 @@ unsafe extern "C" fn ipi_tlb_shootdown_stub()
 ///
 /// Builds the canonical [`TrapFrame`] (`tf_build_asm`) — unconditionally, since
 /// an NMI backtraces whatever ran (kernel or user) and the long-mode iret frame is
-/// always present — calls the returning [`ipi_nmi_backtrace_handler`], then writes
-/// back and `iretq`s (`tf_resume_asm`). The handler decides at runtime whether
+/// always present — then enters through [`paranoid_entry_asm`]: an NMI can arrive
+/// between a ring-3 entry and its `swapgs`, so the GS swap is decided from
+/// `IA32_GS_BASE` rather than the saved CS, and whether it swapped is kept in
+/// `r12` (callee-saved) across the call. It calls the returning
+/// [`ipi_nmi_backtrace_handler`], then exits through [`paranoid_exit_asm`], which
+/// undoes the swap, writes the frame back (`tf_restore_asm`), and `iretq`s. The
+/// handler decides at runtime whether
 /// the NMI is a watchdog backtrace request (returns normally → iretq fires) or a
 /// real hardware NMI (falls through to `common_exception_handler` which never
 /// returns — the resume tail is unreachable in that case). The two-word
@@ -1566,7 +1613,9 @@ pub unsafe fn init()
     set(15, isr15, 0);
     set(16, isr16, 0);
     set(17, isr17, 0);
-    set(18, isr18, 0);
+    // #MC shares IST1 with #DF: both are terminal in ring 0, and an IST stack
+    // keeps a machine check in the SYSCALL entry window off the user RSP.
+    set(18, isr18, 1);
     set(19, isr19, 0);
     set(20, isr20, 0);
     set(21, isr21, 0);

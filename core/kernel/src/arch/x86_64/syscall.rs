@@ -28,6 +28,10 @@
 //! base is active, and the exit path swaps back (with interrupts disabled)
 //! immediately before `sysretq`.
 //!
+//! A return RIP with any of bits 63:47 set is never returned to with `sysretq`,
+//! which would fault in ring 0 after the swap; the thread is terminated as for
+//! an unhandled user #GP.
+//!
 //! We save R11 (user RFLAGS) to `PerCpuData::scratch` (`gs:[24]`) immediately,
 //! use R11 to shuttle user RSP to `PerCpuData::user_rsp` (`gs:[16]`), switch to
 //! `PerCpuData::kernel_rsp` (`gs:[8]`), then rebuild R11 from the scratch slot
@@ -166,6 +170,13 @@ unsafe extern "C" fn syscall_entry()
         "call {dispatch}",
 
         // ── Phase 4: restore registers for sysretq ────────────────────────
+        // sysretq raises #GP in ring 0, on the user RSP and after the GS swap,
+        // when RCX is not canonical. A syscall from the last bytes of the user
+        // half returns to exactly such an address, so a return RIP with any of
+        // bits 63:47 set is terminated as a user #GP instead.
+        "mov rax, [rsp + 120]",
+        "shr rax, 47",
+        "jnz 3f",
         // sysretq: RIP←RCX, RFLAGS←R11, RSP stays as set.
         "mov rax, [rsp +   0]",     // return value (dispatch set tf.rax)
         "mov rbx, [rsp +   8]",
@@ -191,7 +202,17 @@ unsafe extern "C" fn syscall_entry()
         "swapgs",
         "sysretq",
 
+        // Non-canonical return RIP: terminate the thread as for an unhandled
+        // user #GP (vector 13). Diverges.
+        "3:",
+        "mov rdi, rsp",             // arg0 = *const TrapFrame (the user frame)
+        "mov esi, 13",              // arg1 = vector (#GP)
+        "xor edx, edx",             // arg2 = error_code
+        "call {terminate}",
+        "ud2",
+
         dispatch = sym crate::syscall::dispatch,
+        terminate = sym super::idt::common_exception_handler,
     );
 }
 

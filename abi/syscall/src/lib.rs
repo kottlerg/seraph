@@ -170,9 +170,9 @@ pub const SYS_NOTIFICATION_SEND: u64 = 3;
 /// On success returns `0` in the primary return register and the bitmask
 /// in the secondary register (rdx / a1). A notification wake always carries
 /// non-zero bits, because `notification_send` rejects zero-bit sends. A `0`
-/// bitmask with a `0` status means the timeout elapsed, or the notification
-/// was destroyed while the caller waited; the latter returns no
-/// `Interrupted`, even with `timeout_ms = 0` (#443). The split avoids
+/// bitmask with a `0` status means the timeout elapsed. A stop of the
+/// caller, or the destruction of the notification under it, returns
+/// `Interrupted`. The split avoids
 /// aliasing bit-63-set bitmasks with the dispatcher's negative-Err
 /// encoding — the full 64-bit bitmask range is usable. Same register
 /// layout as `SYS_EVENT_RECV`.
@@ -191,9 +191,8 @@ pub const SYS_EVENT_POST: u64 = 5;
 ///   available"; the caller already knows which mode it asked for).
 ///
 /// On success returns `0` plus the payload in the secondary return
-/// register. A queue destroyed while the caller waits also returns success,
-/// with a payload of `0` that was never posted, and no `Interrupted` (#443).
-/// Sentinel layout matches `SYS_NOTIFICATION_WAIT` (`0` = forever),
+/// register. A stop of the caller, or the destruction of the queue under
+/// it, returns `Interrupted`. Sentinel layout matches `SYS_NOTIFICATION_WAIT` (`0` = forever),
 /// but event-queue payloads may be any `u64` including 0, so the kernel
 /// uses an out-of-band `tcb.timed_out` marker instead of an in-band
 /// sentinel on the payload register.

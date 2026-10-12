@@ -159,21 +159,17 @@ pub unsafe fn event_queue_post(
                 .store(1, core::sync::atomic::Ordering::Release);
         }
         // If the waiter was registered with a `SYS_EVENT_RECV` timeout, it
-        // is also on the global sleep list. Remove it here so the timer
-        // path will not try to double-wake this thread. We hold `eq.lock`;
-        // `sleep_list_remove` acquires `SLEEP_LIST_LOCK` internally
-        // (lock order: eq.lock → SLEEP_LIST_LOCK; the timer path takes
-        // SLEEP_LIST_LOCK first, releases it, and only then reaches for
-        // eq.lock — so no circular wait).
-        //
-        // ORDER (issue #117): call `sleep_list_remove` BEFORE clearing
-        // `sleep_deadline`. See `notification_send` for the race description.
+        // is also on the global sleep list. Remove it here, with the waiter
+        // slot; see `notification_send` for the lock order and why a 0
+        // deadline under the source lock means no entry.
         // SAFETY: waiter is the TCB we just dequeued from eq.waiter.
         unsafe {
-            if (*waiter).sleep_deadline != 0
+            if (*waiter)
+                .sleep_deadline
+                .load(core::sync::atomic::Ordering::Relaxed)
+                != 0
             {
                 crate::sched::sleep_list_remove(waiter);
-                (*waiter).sleep_deadline = 0;
             }
         }
         // SAFETY: paired with lock_raw above.
@@ -333,12 +329,17 @@ pub unsafe fn event_queue_recv(
     Err(())
 }
 
-/// Wake any thread blocked on `eq` with a zero payload (`ObjectGone`).
+/// Wake any thread blocked on `eq` with its park stamped
+/// [`PARK_DISPOSITION_INTERRUPTED`], so its `SYS_EVENT_RECV` returns
+/// `Interrupted`.
 ///
 /// Called from `dealloc_object` when the `EventQueue` cap's ref count
 /// hits zero. The ring buffer lives inline in the surrounding retype
 /// slot and is reclaimed by the caller via `retype_free`; there is
-/// nothing for this function to deallocate.
+/// nothing for this function to deallocate. The caller then runs
+/// `sleep_wakeups_quiesce` before the free.
+///
+/// [`PARK_DISPOSITION_INTERRUPTED`]: crate::sched::thread::PARK_DISPOSITION_INTERRUPTED
 ///
 /// # Safety
 /// `eq` must be a valid pointer to a live `EventQueueState`. Acquires `eq.lock`
@@ -366,14 +367,20 @@ pub unsafe fn event_queue_drop(eq: *mut EventQueueState)
             (*waiter)
                 .wake_in_flight
                 .store(1, core::sync::atomic::Ordering::Release);
-            // A timed waiter is also on the sleep list; drop the entry under
-            // eq.lock (the #117 remove-before-clear order) so the timer can
-            // neither double-wake it nor hijack a later unrelated park via
-            // the stale entry. Mirrors event_queue_post's claim.
-            if (*waiter).sleep_deadline != 0
+            // The waiter-slot clear is the episode claim: the destroyed
+            // source cancels the wait.
+            crate::sched::thread::stamp_park_deposit(
+                waiter,
+                crate::sched::thread::PARK_DISPOSITION_INTERRUPTED,
+            );
+            // A timed waiter is also on the sleep list; drop the entry with
+            // the waiter slot under eq.lock, as event_queue_post does.
+            if (*waiter)
+                .sleep_deadline
+                .load(core::sync::atomic::Ordering::Relaxed)
+                != 0
             {
                 crate::sched::sleep_list_remove(waiter);
-                (*waiter).sleep_deadline = 0;
             }
         }
     }

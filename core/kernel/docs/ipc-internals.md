@@ -210,14 +210,16 @@ same `(*tcb).sched_lock`, which carries it to the refusing parker (see
 | `cancel_ipc_block` BlockedOnReply / BlockedOnFault arms | `reply_tcb` CAS | episode + INTERRUPTED / episode + KILL |
 | `cancel_ipc_block` BlockedOnSend arm | send-queue unlink win under `ep.lock` (a lost unlink hands the episode to the racing rebind chain) | episode + INTERRUPTED (faulter: episode + KILL) |
 | `dealloc_object(Thread)` reply-bound wake | `reply_tcb` CAS under all-CPU locks | episode + INTERRUPTED (faulter: episode + KILL) |
-| sleep-list timer BlockedOnReply / BlockedOnFault arms (defensive, unreachable today) | `reply_tcb` CAS | episode + INTERRUPTED / episode + KILL |
 | `endpoint_call` rendezvous commit-fail teardown | teardown `reply_tcb` CAS win | episode + INTERRUPTED / KILL — without it a legitimate stop→start resume has no deposit |
 | `endpoint_call` send-queue commit-fail teardown | `ep.lock` held continuously from link to unlink | episode + INTERRUPTED / KILL |
 | `endpoint_recv` rebind-fail teardown | teardown `reply_tcb` CAS win (stamped before the wake-in-flight release — a dying caller's dealloc may free the TCB after it) | episode + INTERRUPTED / KILL |
 | `dealloc_object(Thread)` dying-client detach arms | `reply_tcb` CAS | **no stamp** — the claimed thread is the one being freed; it never resumes |
 | `cancel_ipc_block` BlockedOnRecv arm | recv-queue unlink win under `ep.lock` (a lost unlink means a caller already deposited into `ipc_msg`; that delivery stands) | INTERRUPTED |
 | `cancel_ipc_block` BlockedOnNotification / EventQueue / WaitSet arms | waiter-slot clear under the source lock (every genuine waker claims under the same lock) | INTERRUPTED |
-| `cancel_ipc_block` plain-sleep cleanup | the Blocked + `ipc_state == None` snapshot itself — a plain sleeper has no competing depositor (the timer's claim deposits nothing), and gating on the `sleep_list_remove` win would miss the commit→add window | INTERRUPTED |
+| `cancel_ipc_block` plain-sleep cleanup | `sleep_list_remove` returning `true` under the target's `sched_lock` (the deadline was still pending; the timer pop clears it under the same `SLEEP_LIST_LOCK`, and a commit→add window cancel makes the later add refuse) | INTERRUPTED |
+| `dealloc_object(Notification)` waiter wake | waiter-slot clear under `sig.lock` | INTERRUPTED |
+| `event_queue_drop` (`dealloc_object(EventQueue)`) waiter wake | waiter-slot clear under `eq.lock` | INTERRUPTED |
+| `wait_set_drop` (`dealloc_object(WaitSet)`) waiter wake | waiter-slot clear under `ws.lock` | INTERRUPTED |
 | `dealloc_object(Endpoint)` send-queue drain | whole-queue detach under `ep.lock` | episode + INTERRUPTED (faulter: episode + KILL) |
 | `dealloc_object(Endpoint)` recv-queue drain | whole-queue detach under `ep.lock` | INTERRUPTED |
 | park-helper refused-commit rollbacks (`notification_wait`, `event_queue_recv`, `waitset_wait`, `endpoint_recv`) | source lock held continuously from publish to rollback — no waker ever saw the slot | INTERRUPTED on `ParkCommit::RefusedStop` only; a `RefusedWake` rollback must leave the coalesced deposit deliverable |
@@ -309,7 +311,8 @@ pub struct NotificationState
        wake, since 0-bit sends are rejected at step 1)
    c. waiter = None; has_observer = (wait_set != null)
    d. tcb.wakeup_value = delivered
-   e. if tcb.sleep_deadline != 0: clear it and sleep_list_remove(tcb)
+   e. if tcb.sleep_deadline != 0: sleep_list_remove(tcb) (clears the
+      deadline with the entry)
    f. Release sig.lock
    g. enqueue_and_wake(tcb, target_cpu)        // outside the lock
 6. else if wait_set is Some(ws): waitset_notify(ws); release; return None
@@ -340,8 +343,10 @@ behaviour (per [docs/ipc-design.md § Notifications](../../../docs/ipc-design.md
 6. waiter = current_tcb
 7. Release waiter_lock
 8. Block current thread; return when woken
-9. On wakeup: the sender has already performed bits.swap(0) and stored the
-   result in current_tcb.wakeup_value;
+9. On wakeup: if the park is INTERRUPTED (a stop, or the notification
+   destroyed under the waiter), return Interrupted. Otherwise the sender has
+   already performed bits.swap(0) and stored the result in
+   current_tcb.wakeup_value (0 for a timer wake);
    tf.set_ipc_return(primary = 0, secondary = wakeup_value); return Ok(0)
 ```
 
@@ -395,7 +400,8 @@ the wrapper on `dealloc_object(EventQueue)`.
 2. if waiter is Some(tcb):
    // Deliver directly, bypassing the ring
    a. waiter = None; tcb.wakeup_value = payload; tcb.wake_in_flight = 1
-   b. if tcb.sleep_deadline != 0: sleep_list_remove(tcb); clear deadline
+   b. if tcb.sleep_deadline != 0: sleep_list_remove(tcb) (clears the
+      deadline with the entry)
    c. Release eq.lock
    d. Syscall handler: select_target_cpu + enqueue_and_wake(tcb)
 3. if count >= capacity:
@@ -434,8 +440,10 @@ occupancy and doubles as the lockless wait-set level-readiness witness.
    re-acquire eq.lock; if still eq.waiter, set sleep_deadline and
    sleep_list_add(tcb); release eq.lock
 6. schedule(); on resume:
-   if tcb.timed_out -> return WouldBlock,
-   else             -> return payload from wakeup_value
+   if the park is INTERRUPTED -> return Interrupted (a stop, or the queue
+                                 destroyed under the waiter),
+   else if tcb.timed_out      -> return WouldBlock,
+   else                       -> return payload from wakeup_value
 ```
 
 The try-once mode never takes the park path, per
@@ -554,7 +562,9 @@ waitset_notify(wait_set, member_idx):
 4. else:
    a. waiter = current_tcb
    b. Release lock
-   c. Block current thread; return wakeup_value when woken
+   c. Block current thread; when woken, return Interrupted if the park is
+      INTERRUPTED (a stop, or the wait set destroyed under the waiter), else
+      return wakeup_value
 ```
 
 **Why step 3 exists, and its memory-ordering requirement.** Readiness
@@ -599,7 +609,9 @@ caller still holds a cap to the source while issuing the syscall, so this
 When the wait set itself is dropped (last cap released), `wait_set_drop`
 clears every member's back-pointer and `dec_ref`s each source's header; any
 source whose refcount reaches zero at that point is reclaimed via the
-standard `dealloc_object` cascade. The source's dealloc arm therefore never
+standard `dealloc_object` cascade. A parked waiter is woken with its park
+stamped INTERRUPTED (§ Park Dispositions and Episodes), so its
+`SYS_WAIT_SET_WAIT` returns `Interrupted`. The source's dealloc arm therefore never
 runs while a wait-set member references it; each source's dealloc arm
 carries a `debug_assert!(state.wait_set.is_null())` invariant check (refcount
 ownership per § Kernel Object Reference Counting in

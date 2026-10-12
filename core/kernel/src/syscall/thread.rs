@@ -90,9 +90,10 @@ pub fn sys_thread_configure(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // The entry point, the aligned stack pointer and the TLS base must be user
     // addresses: the thread's first return to user mode resumes at the entry on
-    // that stack, and on x86-64 an `iretq` to a non-canonical RIP faults in ring 0
-    // after the GS swap back to the user base, as does loading a non-canonical
-    // TLS base into IA32_FS_BASE on the first switch into the thread.
+    // that stack. On x86-64 an `iretq` to a non-canonical RIP faults in ring 0
+    // after the GS swap back to the user base, and a non-canonical TLS base makes
+    // the context switch's `wrmsr` to `IA32_FS_BASE` #GP in ring 0, on the kernel
+    // GS base, on the first switch into the thread.
     let user_top = crate::mm::user_va_top();
     if entry >= user_top || tf.arg(2) > user_top || stack_ptr > user_top || tls_base >= user_top
     {

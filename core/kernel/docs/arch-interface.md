@@ -419,10 +419,13 @@ pub unsafe fn init();
 CPU identification, per-CPU storage, kernel-stack setup, and interrupt save/restore. Per-CPU
 storage is architecture-managed (GS-base on x86-64, exchanged with the user GS base by `swapgs`
 on every ring-3 entry and exit that runs kernel code; the spurious-interrupt stub, vector 255,
-runs only `iretq` and touches no GS state; `sscratch` on RISC-V). The `swapgs` discipline
-depends on ring 3 being unable to write its GS base, which is why `FSGSBASE` stays disabled
-(per [platform-requirements.md](../../../docs/platform-requirements.md) § x86-64
-Classification).
+runs only `iretq` and touches no GS state; `sscratch` on RISC-V). With `FSGSBASE` disabled
+(`cpu::enable_smep_smap` clears `CR4.FSGSBASE` on every CPU), ring 3 can set its GS base only
+through a selector load, whose GDT descriptor base is 0, so a user GS base is never a kernel-half
+address. The paranoid entry (NMI, `#DB`, `#DF`, `#MC`) cannot trust the saved CS and tells the
+bases apart by that: a clear sign bit in `IA32_GS_BASE` means the user base is active. The
+CS-keyed stubs do not depend on it. `FSGSBASE` is classified unsupported in
+[platform-requirements.md](../../../docs/platform-requirements.md) § x86-64 Classification.
 
 ```rust
 /// Hardware and logical CPU identity (APIC id / hart id, and the 0-based logical

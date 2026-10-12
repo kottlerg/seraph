@@ -1727,7 +1727,9 @@ stack so the first scheduler switch enters user mode at `entry`.
 
 **Errors:** `InvalidCapability`, `InsufficientRights` (cap lacks Control),
 `InvalidArgument` (thread not in the Created state, `entry` or `tls_base` at or above the
-user VA top, or `stack_top` above it).
+user VA top, or `stack_top`, as passed or after rounding to the entry ABI's alignment, above
+it; on x86-64 the rounding is `(stack_top & !0xF) - 8`, so a `stack_top` below 16 wraps
+above it).
 
 ---
 

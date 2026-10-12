@@ -1373,7 +1373,10 @@ pub fn sched_split(sched_cap: u32, split_at: u8) -> Result<(u32, u32), i64>
 /// Returns a negative `i64` error code: `InvalidCapability` if the thread cap
 /// is invalid, `InsufficientRights` if it lacks Control rights, or
 /// `InvalidArgument` if the thread is not in `Created` state, `entry` is at or
-/// above the user VA top, or `stack_ptr` is above it.
+/// above the user VA top, or `stack_ptr`, as passed or after rounding to the
+/// entry ABI's stack alignment, is above it. On x86-64 the rounding is
+/// `(stack_ptr & !0xF) - 8`, so a `stack_ptr` below 16 wraps above it and is
+/// refused.
 #[inline]
 pub fn thread_configure(thread_cap: u32, entry: u64, stack_ptr: u64, arg: u64) -> Result<(), i64>
 {
@@ -1389,7 +1392,10 @@ pub fn thread_configure(thread_cap: u32, entry: u64, stack_ptr: u64, arg: u64) -
 /// Returns a negative `i64` error code: `InvalidCapability` if the thread cap
 /// is invalid, `InsufficientRights` if it lacks Control rights, or
 /// `InvalidArgument` if the thread is not in `Created` state, `entry` or
-/// `tls_base` is at or above the user VA top, or `stack_ptr` is above it.
+/// `tls_base` is at or above the user VA top, or `stack_ptr`, as passed or
+/// after rounding to the entry ABI's stack alignment, is above it. On x86-64
+/// the rounding is `(stack_ptr & !0xF) - 8`, so a `stack_ptr` below 16 wraps
+/// above it and is refused.
 #[inline]
 pub fn thread_configure_with_tls(
     thread_cap: u32,

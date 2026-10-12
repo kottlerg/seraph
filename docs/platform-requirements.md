@@ -140,8 +140,9 @@ Each feature is classified per architecture as one of:
 - **1 GiB huge pages, global pages (`PGE`), MTRR reprogramming, HPET, the legacy 8259 PIC** —
   not used. (The kernel relies on firmware's default PAT and leaves the 8259 masked.)
 - **`FSGSBASE`** — kept disabled: the kernel clears `CR4.FSGSBASE` on every CPU, because its
-  `swapgs` discipline depends on ring 3 being unable to write its GS base (see
-  [arch-interface.md](../core/kernel/docs/arch-interface.md) § `cpu`).
+  paranoid NMI / `#DB` / `#DF` / `#MC` entry depends on ring 3 being unable to set a
+  kernel-half GS base; without `FSGSBASE` ring 3 can change it only by loading a GDT selector,
+  whose base is 0 (see [arch-interface.md](../core/kernel/docs/arch-interface.md) § `cpu`).
 - **Legacy BIOS / multiboot** — boot is UEFI-only.
 - **Secure Boot, TPM, RTC** — not boot dependencies.
 

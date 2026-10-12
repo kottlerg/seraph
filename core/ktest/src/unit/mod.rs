@@ -42,6 +42,7 @@
 //! - `init_layout.rs` — kernel Phase 9 ASLR draws (#39): `InitInfo` VA,
 //!   init stack, and PIE image-base window membership, asserted on ktest's
 //!   own layout and load base
+//! - Architecture-specific tests live behind `crate::arch` (`run_unit`).
 
 pub mod cap;
 pub mod cap_info;
@@ -509,6 +510,7 @@ pub fn run_all(ctx: &TestContext)
         "thread::configure_non_user_address_err",
         thread::configure_non_user_address_err(ctx)
     );
+    crate::arch::run_unit(ctx);
     run_test!(
         "thread::set_priority_zero_err",
         thread::set_priority_zero_err(ctx)

@@ -28,17 +28,15 @@ authoring discipline.
 ## Test structure
 
 Tests are organised across four tiers (three plus the opt-in stress
-tier). Each tier lives in its own source directory, except that a tier's
-architecture-specific scenarios live under `src/arch/<arch>/`; each tier
-directory codifies a "one file per surface/scenario/race" rule at the top
-of its `mod.rs`, and the same rule applies under `src/arch/<arch>/`.
+tier). Each tier lives in its own source directory, which codifies a
+"one file per surface/scenario/race" rule at the top of its `mod.rs`.
 
 `src/arch/` is ktest's arch-dispatch surface: one module per architecture,
 selected by `target_arch` in `src/arch/mod.rs`, each exposing the same
-entry points. A tier's `run_all` reaches its architecture-specific
-scenarios through them (Tier 2 through `crate::arch::run_integration`).
-Some older arch-gated items elsewhere in ktest, such as
-`integration/sbi_gating.rs`, have not moved behind `src/arch/` yet (#460).
+entry points. Tier 1 reaches the tests behind it through
+`crate::arch::run_unit` and Tier 2 through `crate::arch::run_integration`.
+Other arch-specific items in every tier are still gated in place with
+`#[cfg(target_arch)]`; #460 lists them.
 
 ### Tier 1 — `src/unit/`
 
@@ -63,6 +61,10 @@ kernel's own source layout.
 | `sysinfo.rs` | `SYS_SYSTEM_INFO` |
 
 Adding a new syscall means adding a section in the appropriate file here.
+
+Architecture-specific Tier 1 tests live under `src/arch/<arch>/` and run through
+`crate::arch::run_unit`. On x86-64, `src/arch/x86_64/configure_wrapped_stack.rs` checks that
+`thread_configure` refuses a stack top the entry alignment wraps below zero.
 
 ### Tier 2 — `src/integration/`
 
@@ -89,8 +91,7 @@ concurrent notification and queue events.
 Architecture-specific Tier 2 scenarios live under `src/arch/<arch>/` and run through
 `crate::arch::run_integration`. On x86-64, `src/arch/x86_64/syscall_rflags_hardening.rs`
 checks that a user-set DF and TF, and a GS base reloaded from the user selector, do not reach
-the kernel across a SYSCALL, and `src/arch/x86_64/configure_wrapped_stack.rs` checks that
-`thread_configure` refuses a stack top the entry alignment wraps below zero.
+the kernel across a SYSCALL.
 
 ### Tier S — `src/stress/`
 

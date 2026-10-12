@@ -3,7 +3,7 @@
 
 // core/ktest/src/arch/x86_64/configure_wrapped_stack.rs
 
-//! Integration (x86-64): `thread_configure` refuses a stack pointer that leaves
+//! Tier 1 (x86-64): `thread_configure` refuses a stack pointer that leaves
 //! the user half only after the entry ABI's alignment.
 //!
 //! The kernel rounds the initial stack pointer to the x86-64 `extern "C"` entry

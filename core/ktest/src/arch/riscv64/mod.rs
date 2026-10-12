@@ -13,6 +13,10 @@
 
 use crate::TestContext;
 
+/// Run every RISC-V-specific Tier 1 test (none: the RISC-V entry alignment,
+/// `sp & !0xF`, rounds down without wrapping, so the raw stack check covers it).
+pub fn run_unit(_ctx: &TestContext) {}
+
 /// Run every RISC-V-specific Tier 2 scenario that lives behind this module
 /// (none yet; see the module doc).
 pub fn run_integration(_ctx: &TestContext) {}

@@ -506,6 +506,10 @@ pub fn run_all(ctx: &TestContext)
         thread::configure_running_thread_err(ctx)
     );
     run_test!(
+        "thread::configure_non_user_address_err",
+        thread::configure_non_user_address_err(ctx)
+    );
+    run_test!(
         "thread::set_priority_zero_err",
         thread::set_priority_zero_err(ctx)
     );

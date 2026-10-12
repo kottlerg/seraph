@@ -77,6 +77,7 @@ concurrent notification and queue events.
 | `priority_preemption.rs` | Higher-priority runnable thread preempts a CPU-bound lower-priority spinner within a wall-clock budget |
 | `shared_memory_two_aspaces.rs` | One Memory cap mapped into two `AddressSpace` caps; `aspace_query` returns identical phys backing in both |
 | `cap_move_into_fresh_cspace_then_ipc.rs` | `cap_move` an endpoint into a child cspace; the child IPC-calls through its local slot; parent receives via a sibling cap |
+| `arch/x86_64/syscall_rflags_hardening.rs` | (x86-64 only) A user-set DF and TF, and a GS base reloaded from the user selector, do not reach the kernel across a SYSCALL |
 
 ### Tier S — `src/stress/`
 

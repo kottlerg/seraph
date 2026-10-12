@@ -1516,3 +1516,34 @@ pub fn bind_notification_invalid_cap_err(_ctx: &TestContext) -> TestResult
     }
     Ok(())
 }
+
+/// `thread_configure` rejects an entry point or stack outside the user half with
+/// `InvalidArgument`: the thread's first return to user mode resumes there.
+pub fn configure_non_user_address_err(ctx: &TestContext) -> TestResult
+{
+    /// A kernel-half address on both architectures.
+    const KERNEL_ADDR: u64 = 0xFFFF_8000_0000_0000;
+
+    let child = crate::spawn::new_child(ctx)
+        .map_err(|_| "thread::configure_non_user_address_err: spawn::new_child failed")?;
+    let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_CONFIGURE_ERR));
+    let entry = blocker_entry as *const () as u64;
+
+    let bad_entry = thread_configure(child.th, KERNEL_ADDR, stack_top, 0);
+    let bad_stack = thread_configure(child.th, entry, KERNEL_ADDR, 0);
+
+    cap_delete(child.th)
+        .map_err(|_| "cap_delete th after configure_non_user_address_err failed")?;
+    cap_delete(child.cs)
+        .map_err(|_| "cap_delete cs after configure_non_user_address_err failed")?;
+
+    if bad_entry != Err(SyscallError::InvalidArgument as i64)
+    {
+        return Err("thread_configure with a kernel-half entry did not return InvalidArgument");
+    }
+    if bad_stack != Err(SyscallError::InvalidArgument as i64)
+    {
+        return Err("thread_configure with a kernel-half stack did not return InvalidArgument");
+    }
+    Ok(())
+}

@@ -46,7 +46,9 @@
 //! - `aspace_fault_notification_late_bind.rs` — an aspace terminal-fault observer bound after the space already faulted still receives the retained reason
 //! - `ipc_call_interrupted_stop_start.rs` — a client stopped while parked in `ipc_call` (send-queued and awaiting-reply) restarts to `Interrupted`, never a stale reply (#361)
 //! - `park_interrupted_stop_start.rs` — a thread stopped while parked in any non-call blocking syscall (notification/event/recv/wait-set/sleep) restarts to `Interrupted`, never a stale deposit (#363)
-//! - Architecture-specific scenarios live behind `crate::arch` (`run_integration`).
+//! - Architecture-only scenarios live behind `crate::arch` (`run_integration`),
+//!   except `sbi_gating.rs`; it and the per-arch helpers and branches inside the
+//!   scenarios above are still gated in place (#460).
 
 pub mod aspace_fault_notification_late_bind;
 pub mod cap_delegation_chain;

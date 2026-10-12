@@ -29,13 +29,15 @@ authoring discipline.
 
 Tests are organised across four tiers (three plus the opt-in stress
 tier). Each tier lives in its own source directory, which codifies a
-"one file per surface/scenario/race" rule at the top of its `mod.rs`.
+"one file per surface/scenario/race" rule at the top of its `mod.rs`,
+except its architecture-specific tests, which live under `src/arch/<arch>/`
+(see below).
 
 `src/arch/` is ktest's arch-dispatch surface: one module per architecture,
 selected by `target_arch` in `src/arch/mod.rs`, each exposing the same
 entry points. Tier 1 reaches the tests behind it through
 `crate::arch::run_unit` and Tier 2 through `crate::arch::run_integration`.
-Other arch-specific items in every tier are still gated in place with
+Other arch-specific items elsewhere in ktest are still gated in place with
 `#[cfg(target_arch)]`; #460 lists them.
 
 ### Tier 1 — `src/unit/`
@@ -57,14 +59,16 @@ kernel's own source layout.
 | `ipc.rs` | `SYS_IPC_CALL`, `SYS_IPC_REPLY`, `SYS_IPC_RECV`, `SYS_IPC_BUFFER_SET` |
 | `thread.rs` | `SYS_THREAD_START/STOP/YIELD/EXIT/CONFIGURE/SET_PRIORITY/SET_AFFINITY/READ_REGS/WRITE_REGS/SLEEP/BIND_NOTIFICATION` |
 | `fpu.rs` | FPU / SIMD / V extended-state isolation across preemption and cross-CPU migration |
-| `hw.rs` | `SYS_MMIO_MAP`, `SYS_MMIO_SPLIT`, `SYS_IRQ_REGISTER/ACK`, `SYS_IRQ_SPLIT`, `SYS_IOPORT_BIND`, `SYS_IOPORT_SPLIT`, `SYS_SBI_CALL` |
+| `hw.rs` | `SYS_MMIO_MAP`, `SYS_MMIO_SPLIT`, `SYS_IRQ_REGISTER/ACK`, `SYS_IRQ_SPLIT`, `SYS_IOPORT_BIND`, `SYS_IOPORT_SPLIT` (`SYS_SBI_CALL` is under `src/arch/<arch>/`) |
 | `sysinfo.rs` | `SYS_SYSTEM_INFO` |
 
 Adding a new syscall means adding a section in the appropriate file here.
 
 Architecture-specific Tier 1 tests live under `src/arch/<arch>/` and run through
 `crate::arch::run_unit`. On x86-64, `src/arch/x86_64/configure_wrapped_stack.rs` checks that
-`thread_configure` refuses a stack top the entry alignment wraps below zero.
+`thread_configure` refuses a stack top the entry alignment wraps below zero. Each
+architecture's `sbi_call.rs` holds its `SYS_SBI_CALL` test: the call reaches the SBI firmware
+on RISC-V and returns `NotSupported` on x86-64.
 
 ### Tier 2 — `src/integration/`
 

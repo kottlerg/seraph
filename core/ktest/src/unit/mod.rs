@@ -42,7 +42,8 @@
 //! - `init_layout.rs` — kernel Phase 9 ASLR draws (#39): `InitInfo` VA,
 //!   init stack, and PIE image-base window membership, asserted on ktest's
 //!   own layout and load base
-//! - Architecture-specific tests live behind `crate::arch` (`run_unit`).
+//! - Architecture-only tests live behind `crate::arch` (`run_unit`); per-arch
+//!   helpers and branches inside the tests above are still gated in place (#460).
 
 pub mod cap;
 pub mod cap_info;
@@ -583,16 +584,6 @@ pub fn run_all(ctx: &TestContext)
     );
     run_test!("hw::ioport_bind", hw::ioport_bind(ctx));
     run_test!("hw::ioport_split", hw::ioport_split(ctx));
-    #[cfg(target_arch = "riscv64")]
-    run_test!(
-        "hw::sbi_call_get_spec_version",
-        hw::sbi_call_get_spec_version(ctx)
-    );
-    #[cfg(target_arch = "x86_64")]
-    run_test!(
-        "hw::sbi_call_not_supported_x86_64",
-        hw::sbi_call_not_supported_x86_64(ctx)
-    );
 
     // ── System info syscalls ──────────────────────────────────────────────────
     run_test!("sysinfo::kernel_version", sysinfo::kernel_version(ctx));

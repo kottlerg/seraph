@@ -8,12 +8,14 @@
 //! Tier 1 tests:
 //! - `configure_wrapped_stack.rs` — `thread_configure` refuses a stack top the
 //!   entry alignment wraps below zero
+//! - `sbi_call.rs` — `SYS_SBI_CALL` returns `NotSupported`
 //!
 //! Tier 2 scenarios:
 //! - `syscall_rflags_hardening.rs` — user-set DF and TF and a reloaded user GS
 //!   base do not reach the kernel across a SYSCALL
 
 mod configure_wrapped_stack;
+mod sbi_call;
 mod syscall_rflags_hardening;
 
 use crate::TestContext;
@@ -24,6 +26,10 @@ pub fn run_unit(ctx: &TestContext)
     crate::run_test!(
         "thread::configure_wrapped_stack_err",
         configure_wrapped_stack::run(ctx)
+    );
+    crate::run_test!(
+        "hw::sbi_call_not_supported_x86_64",
+        sbi_call::not_supported(ctx)
     );
 }
 

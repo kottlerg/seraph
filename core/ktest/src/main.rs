@@ -71,7 +71,8 @@ pub static FAIL_COUNT: AtomicUsize = AtomicUsize::new(0);
 ///
 /// To add a new unit test: write a function returning `TestResult`, then
 /// call `run_test!("subsystem::test_name", fn_name(ctx))` in the relevant
-/// `run_all` function.
+/// `run_all` function. An architecture-specific unit test goes under
+/// `src/arch/<arch>/` and is registered from that module's `run_unit`.
 #[macro_export]
 macro_rules! run_test {
     ($name:literal, $body:expr) => {{

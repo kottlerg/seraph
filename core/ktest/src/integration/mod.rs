@@ -46,9 +46,8 @@
 //! - `aspace_fault_notification_late_bind.rs` — an aspace terminal-fault observer bound after the space already faulted still receives the retained reason
 //! - `ipc_call_interrupted_stop_start.rs` — a client stopped while parked in `ipc_call` (send-queued and awaiting-reply) restarts to `Interrupted`, never a stale reply (#361)
 //! - `park_interrupted_stop_start.rs` — a thread stopped while parked in any non-call blocking syscall (notification/event/recv/wait-set/sleep) restarts to `Interrupted`, never a stale deposit (#363)
-//! - `arch/` — architecture-specific scenarios, one module per architecture (see `arch/mod.rs`)
+//! - Architecture-specific scenarios live behind `crate::arch` (`run_integration`).
 
-pub mod arch;
 pub mod aspace_fault_notification_late_bind;
 pub mod cap_delegation_chain;
 pub mod cap_generation_stale_handle;
@@ -121,7 +120,7 @@ pub fn run_all(ctx: &TestContext)
         cap_delegation_chain::run(ctx)
     );
     run_integration_test!("integration::sbi_gating", sbi_gating::run(ctx));
-    arch::run_all(ctx);
+    crate::arch::run_integration(ctx);
     run_integration_test!("integration::tlb_coherency", tlb_coherency::run(ctx));
     run_integration_test!("integration::retype_reclaim", retype_reclaim::run(ctx));
     run_integration_test!(

@@ -26,6 +26,7 @@
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+mod arch;
 mod bench;
 mod cmdline;
 mod frame_pool;

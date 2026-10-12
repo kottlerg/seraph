@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// core/ktest/src/integration/arch/x86_64/syscall_rflags_hardening.rs
+// core/ktest/src/arch/x86_64/syscall_rflags_hardening.rs
 
 //! Integration (x86-64): user-controlled RFLAGS bits and the user GS base do not
 //! reach the kernel across a SYSCALL.

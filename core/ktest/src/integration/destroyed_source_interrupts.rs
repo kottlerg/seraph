@@ -64,14 +64,14 @@ enum Source
 
 pub fn run(ctx: &TestContext) -> TestResult
 {
-    for (wait, name) in [
+    for (source, name) in [
         (Source::Notification, "notification_wait"),
         (Source::NotificationTimed, "notification_wait_timeout"),
         (Source::EventQueue, "event_recv"),
         (Source::WaitSet, "wait_set_wait"),
     ]
     {
-        run_phase(ctx, wait).inspect_err(|_| {
+        run_phase(ctx, source).inspect_err(|_| {
             crate::log("ktest: integration::destroyed_source_interrupts failing phase:");
             crate::log(name);
         })?;
@@ -79,66 +79,21 @@ pub fn run(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
-/// Create the phase's source, park a child on a copy of it, destroy the
-/// source, and take the child's verdict.
-fn run_phase(ctx: &TestContext, wait: Source) -> TestResult
+/// Park a child on a copy of a fresh `source`, destroy the source, and take
+/// the child's verdict.
+fn run_phase(ctx: &TestContext, source: Source) -> TestResult
 {
     let done = cap_create_notification(ctx.memory_base)
         .map_err(|_| "integration::destroyed_source_interrupts: create done failed")?;
-    let source = match wait
-    {
-        Source::Notification | Source::NotificationTimed =>
-        {
-            cap_create_notification(ctx.memory_base)
-        }
-        Source::EventQueue => event_queue_create(ctx.memory_base, 4),
-        Source::WaitSet => wait_set_create(ctx.memory_base),
-    }
-    .map_err(|_| "integration::destroyed_source_interrupts: create source failed")?;
-    // A wait set with a member that never fires: the waiter parks on the set.
-    let member = if matches!(wait, Source::WaitSet)
-    {
-        let m = cap_create_notification(ctx.memory_base)
-            .map_err(|_| "integration::destroyed_source_interrupts: create member failed")?;
-        wait_set_add(source, m, 0x5E7)
-            .map_err(|_| "integration::destroyed_source_interrupts: wait_set_add failed")?;
-        Some(m)
-    }
-    else
-    {
-        None
-    };
-
-    let child = spawn::new_child(ctx)
-        .map_err(|_| "integration::destroyed_source_interrupts: spawn child failed")?;
-    let c_source = cap_copy(source, child.cs, RIGHTS_ALL)
-        .map_err(|_| "integration::destroyed_source_interrupts: cap_copy source failed")?;
-    let c_done = cap_copy(done, child.cs, RIGHTS_SIGNAL)
-        .map_err(|_| "integration::destroyed_source_interrupts: cap_copy done failed")?;
-    let entry: fn(u64) -> ! = match wait
-    {
-        Source::Notification => notif_entry,
-        Source::NotificationTimed => notif_timed_entry,
-        Source::EventQueue => event_entry,
-        Source::WaitSet => waitset_entry,
-    };
-    // Phases run sequentially and each child exits before the next spawn, so
-    // the shared stack has exactly one live user.
-    let stack = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
-    spawn::configure_and_start(
-        &child,
-        entry,
-        stack,
-        u64::from(c_source) | (u64::from(c_done) << 32),
-    )
-    .map_err(|_| "integration::destroyed_source_interrupts: start child failed")?;
+    let (object, member) = create_source(ctx, source)?;
+    let child = start_child(ctx, source, object, done)?;
 
     let mut acc = wait_for(done, 0, BIT_READY)?;
     let _ = thread_sleep(SETTLE_SLEEP_MS);
-    // Revoke deletes the child's copy (a derivation child of `source`); the
+    // Revoke deletes the child's copy (a derivation child of `object`); the
     // delete then drops the last reference and runs the dealloc wake.
-    cap_revoke(source).map_err(|_| "integration::destroyed_source_interrupts: revoke failed")?;
-    cap_delete(source).map_err(|_| "integration::destroyed_source_interrupts: delete failed")?;
+    cap_revoke(object).map_err(|_| "integration::destroyed_source_interrupts: revoke failed")?;
+    cap_delete(object).map_err(|_| "integration::destroyed_source_interrupts: delete failed")?;
     acc = wait_for(done, acc, BIT_OK | BIT_BAD)?;
 
     cap_delete(child.th)
@@ -159,6 +114,65 @@ fn run_phase(ctx: &TestContext, wait: Source) -> TestResult
         );
     }
     Ok(())
+}
+
+/// Create the phase's object; a wait set gets one member that never fires,
+/// returned so it can be deleted after the set.
+fn create_source(ctx: &TestContext, source: Source) -> Result<(u32, Option<u32>), &'static str>
+{
+    let object = match source
+    {
+        Source::Notification | Source::NotificationTimed =>
+        {
+            cap_create_notification(ctx.memory_base)
+        }
+        Source::EventQueue => event_queue_create(ctx.memory_base, 4),
+        Source::WaitSet => wait_set_create(ctx.memory_base),
+    }
+    .map_err(|_| "integration::destroyed_source_interrupts: create source failed")?;
+    if !matches!(source, Source::WaitSet)
+    {
+        return Ok((object, None));
+    }
+    let member = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "integration::destroyed_source_interrupts: create member failed")?;
+    wait_set_add(object, member, 0x5E7)
+        .map_err(|_| "integration::destroyed_source_interrupts: wait_set_add failed")?;
+    Ok((object, Some(member)))
+}
+
+/// Start the phase's child waiting on a copy of `object`.
+fn start_child(
+    ctx: &TestContext,
+    source: Source,
+    object: u32,
+    done: u32,
+) -> Result<spawn::SpawnedChild, &'static str>
+{
+    let child = spawn::new_child(ctx)
+        .map_err(|_| "integration::destroyed_source_interrupts: spawn child failed")?;
+    let c_object = cap_copy(object, child.cs, RIGHTS_ALL)
+        .map_err(|_| "integration::destroyed_source_interrupts: cap_copy source failed")?;
+    let c_done = cap_copy(done, child.cs, RIGHTS_SIGNAL)
+        .map_err(|_| "integration::destroyed_source_interrupts: cap_copy done failed")?;
+    let entry: fn(u64) -> ! = match source
+    {
+        Source::Notification => notif_entry,
+        Source::NotificationTimed => notif_timed_entry,
+        Source::EventQueue => event_entry,
+        Source::WaitSet => waitset_entry,
+    };
+    // Phases run sequentially and each child is reaped (its thread deleted)
+    // before the next spawn, so the shared stack has one live user.
+    let stack = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
+    spawn::configure_and_start(
+        &child,
+        entry,
+        stack,
+        u64::from(c_object) | (u64::from(c_done) << 32),
+    )
+    .map_err(|_| "integration::destroyed_source_interrupts: start child failed")?;
+    Ok(child)
 }
 
 /// Accumulate `done` bits onto `acc` until any bit of `mask` is present.

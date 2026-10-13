@@ -1117,7 +1117,7 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 sched_lock: crate::sync::Spinlock::new(),
                 wake_pending: false,
                 park_started_tick: 0,
-                park_seq: 0,
+                park_seq: core::sync::atomic::AtomicU32::new(0),
                 ipc_state: IpcThreadState::None,
                 ipc_msg: Message::default(),
                 reply_tcb: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),

@@ -1257,8 +1257,9 @@ pub fn sys_notification_send(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// On success returns `0` in rax/a0 and the bitmask in the secondary return
 /// register (rdx/a1). A notification wake always carries non-zero bits because
 /// `notification_send` rejects zero-bit sends. A `0` bitmask with a `0` status
-/// means the timeout elapsed. A stop of the caller, or the destruction of the
-/// notification while the caller is parked, returns `Interrupted`.
+/// means the timeout elapsed. A stop of the caller, the destruction of the
+/// notification while the caller is parked, or a later wait by another
+/// thread (which displaces this one), returns `Interrupted`.
 /// The split is required because the bitmask is an
 /// unrestricted `u64`: an in-band encoding via `cast_signed` would alias
 /// bit-63-set payloads with the dispatcher's negative-Err codes. Same
@@ -1326,27 +1327,29 @@ pub fn sys_notification_wait(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                     .sleep_deadline
                     .store(deadline, core::sync::atomic::Ordering::Relaxed);
             }
-            match crate::sched::sleep_list_add(tcb)
+            // SAFETY: tcb is the running caller.
+            let added = unsafe { crate::sched::sleep_list_add(tcb) };
+            // Every canceller clears the deadline only after claiming the
+            // waiter slot under sig.lock, which this arm holds with the slot
+            // still naming tcb.
+            debug_assert!(
+                added != Err(crate::sched::SleepAddError::Cancelled),
+                "notification_wait: timed arm cancelled under sig.lock"
+            );
+            if added == Err(crate::sched::SleepAddError::Full)
             {
-                // Cancelled: a canceller cleared the deadline; it claims the
-                // waiter slot too, so the wait needs no timeout.
-                Ok(()) | Err(crate::sched::SleepAddError::Cancelled) =>
-                {}
-                Err(crate::sched::SleepAddError::Full) =>
-                {
-                    // Sleep list full: fall back to indefinite wait — the IPC
-                    // source can still wake us, only the timeout is lost.
-                    crate::kprintln!(
-                        "kernel: sleep_list capacity reached ({}); notification_wait \
-                         falling back to indefinite wait",
-                        crate::sched::MAX_SLEEPING,
-                    );
-                    // SAFETY: tcb valid; sig.lock held.
-                    unsafe {
-                        (*tcb)
-                            .sleep_deadline
-                            .store(0, core::sync::atomic::Ordering::Relaxed);
-                    }
+                // Sleep list full: fall back to indefinite wait — the IPC
+                // source can still wake us, only the timeout is lost.
+                crate::kprintln!(
+                    "kernel: sleep_list capacity reached ({}); notification_wait \
+                     falling back to indefinite wait",
+                    crate::sched::MAX_SLEEPING,
+                );
+                // SAFETY: tcb valid; sig.lock held.
+                unsafe {
+                    (*tcb)
+                        .sleep_deadline
+                        .store(0, core::sync::atomic::Ordering::Relaxed);
                 }
             }
         }
@@ -1469,7 +1472,8 @@ pub fn sys_event_post(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// (contrast `sys_notification_wait`, where `wakeup_value == 0` works because
 /// `notification_send` rejects zero-bit sends). A stop of the caller, or the
 /// destruction of the event queue while the caller is parked, returns
-/// `Interrupted`.
+/// `Interrupted`, as does a later blocking receive by another thread, which
+/// displaces this one (the try-once form never waits).
 #[cfg(not(test))]
 pub fn sys_event_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
@@ -1551,26 +1555,28 @@ pub fn sys_event_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                     .sleep_deadline
                     .store(deadline, core::sync::atomic::Ordering::Relaxed);
             }
-            match crate::sched::sleep_list_add(tcb)
+            // SAFETY: tcb is the running caller.
+            let added = unsafe { crate::sched::sleep_list_add(tcb) };
+            // Every canceller clears the deadline only after claiming the
+            // waiter slot under eq.lock, which this arm holds with the slot
+            // still naming tcb.
+            debug_assert!(
+                added != Err(crate::sched::SleepAddError::Cancelled),
+                "event_recv: timed arm cancelled under eq.lock"
+            );
+            if added == Err(crate::sched::SleepAddError::Full)
             {
-                // Cancelled: a canceller cleared the deadline; it claims the
-                // waiter slot too, so the wait needs no timeout.
-                Ok(()) | Err(crate::sched::SleepAddError::Cancelled) =>
-                {}
-                Err(crate::sched::SleepAddError::Full) =>
-                {
-                    // Sleep list full: fall back to indefinite wait.
-                    crate::kprintln!(
-                        "kernel: sleep_list capacity reached ({}); event_recv \
-                         falling back to indefinite wait",
-                        crate::sched::MAX_SLEEPING,
-                    );
-                    // SAFETY: tcb valid; eq.lock held.
-                    unsafe {
-                        (*tcb)
-                            .sleep_deadline
-                            .store(0, core::sync::atomic::Ordering::Relaxed);
-                    }
+                // Sleep list full: fall back to indefinite wait.
+                crate::kprintln!(
+                    "kernel: sleep_list capacity reached ({}); event_recv \
+                     falling back to indefinite wait",
+                    crate::sched::MAX_SLEEPING,
+                );
+                // SAFETY: tcb valid; eq.lock held.
+                unsafe {
+                    (*tcb)
+                        .sleep_deadline
+                        .store(0, core::sync::atomic::Ordering::Relaxed);
                 }
             }
         }
@@ -2062,7 +2068,8 @@ pub fn sys_wait_set_remove(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// `SYS_WAIT_SET_ADD` time is returned in the secondary return register
 /// (rdx on x86-64, a1 on RISC-V). The caller then reads from the identified
 /// source normally. A stop of the caller, or the destruction of the wait set
-/// while the caller is parked, returns `Interrupted`.
+/// while the caller is parked, returns `Interrupted`, as does a later wait by
+/// another thread, which displaces this one.
 #[cfg(not(test))]
 pub fn sys_wait_set_wait(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
@@ -2106,7 +2113,6 @@ pub fn sys_wait_set_wait(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         tf.set_ipc_return(0, badge);
         return Ok(0);
     }
-    // else: No source ready; thread is Blocked. Yield CPU.
 
     // SAFETY: scheduler initialized; called from syscall context.
     unsafe {

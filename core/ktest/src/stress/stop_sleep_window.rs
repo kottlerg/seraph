@@ -22,15 +22,16 @@
 //!
 //! ## How this exercises it
 //!
-//! A sleeper pinned to one CPU loops `thread_sleep(1)` and tallies each
-//! result. The controller, pinned to another CPU, stops and restarts it
-//! [`CYCLES`] times with a varying spin between the pair, then lets it exit.
-//! The tripwires are the kernel's debug assertions (CI debug cells run them):
-//! a listed TCB with a zero deadline at the pop, a duplicate add, a popped
-//! binding that no timed park arms, and the wake-in-flight and run-queue
-//! single-link checks. The test itself fails if a sleep returned anything but
-//! `Ok` or `Interrupted`, or if no stop ever cancelled a sleep (the race never
-//! armed).
+//! A sleeper pinned to CPU 0 — the CPU whose timer tick pops and claims
+//! expired sleepers — loops `thread_sleep(1)` and tallies each result. The
+//! controller, pinned to CPU 1, stops and restarts it [`CYCLES`] times with a
+//! varying spin between pairs, so stops also land between the timer's pop
+//! and its wake. The tripwires are the kernel's debug assertions (CI debug
+//! cells run them): a listed TCB with a zero deadline at the pop, a
+//! duplicate add, a popped binding that no timed park arms, and the
+//! wake-in-flight and run-queue single-link checks. The test itself fails
+//! if a sleep returned anything but `Ok` or `Interrupted`, or if no stop
+//! ever cancelled a sleep (the race never armed).
 //!
 //! Needs **≥ 2 CPUs** (the stop must run concurrently with the sleep path).
 
@@ -50,8 +51,9 @@ const CYCLES: u32 = 2000;
 /// Notification NOTIFY right — what a child needs to `notification_send`.
 const RIGHTS_SIGNAL: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
 
-/// Sleeper raises this once it is looping, and again on exit.
+/// Sleeper raises this once it is looping.
 const BIT_RUNNING: u64 = 1 << 0;
+/// Sleeper raises this when it leaves its loop.
 const BIT_EXITED: u64 = 1 << 1;
 
 /// Set by the controller to end the sleeper's loop.
@@ -76,59 +78,11 @@ pub fn run(ctx: &TestContext) -> TestResult
     INTERRUPTED.store(0, Ordering::Relaxed);
     BAD.store(0, Ordering::Relaxed);
 
-    let done = cap_create_notification(ctx.memory_base)
-        .map_err(|_| "stress::stop_sleep_window: create done failed")?;
-    let child =
-        spawn::new_child(ctx).map_err(|_| "stress::stop_sleep_window: spawn sleeper failed")?;
-    let c_done = cap_copy(done, child.cs, RIGHTS_SIGNAL)
-        .map_err(|_| "stress::stop_sleep_window: cap_copy done failed")?;
-    // SAFETY: stack index 0 is this test's only child; stress tests run
-    // sequentially.
-    let stack = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[0]) });
-    spawn::configure_and_start_pinned(&child, sleeper_entry, stack, u64::from(c_done), 1)
-        .map_err(|_| "stress::stop_sleep_window: start sleeper failed")?;
-    thread_set_affinity(ctx.thread_cap, 0)
+    thread_set_affinity(ctx.thread_cap, 1)
         .map_err(|_| "stress::stop_sleep_window: pin controller failed")?;
-
-    let mut acc = 0u64;
-    while acc & BIT_RUNNING == 0
-    {
-        acc |= notification_wait(done)
-            .map_err(|_| "stress::stop_sleep_window: wait running failed")?;
-    }
-
-    let mut result = Ok(());
-    for cycle in 0..CYCLES
-    {
-        // Vary the stop's phase against the sleep loop: 0 to 4095 spins
-        // (a multiplicative hash of the cycle) before each pair.
-        for _ in 0..(cycle.wrapping_mul(2_654_435_761) >> 20)
-        {
-            core::hint::spin_loop();
-        }
-        if thread_stop(child.th).is_err()
-        {
-            result = Err("stress::stop_sleep_window: thread_stop failed");
-            break;
-        }
-        if thread_start(child.th).is_err()
-        {
-            result = Err("stress::stop_sleep_window: thread_start failed");
-            break;
-        }
-    }
-
-    QUIT.store(1, Ordering::Release);
-    while acc & BIT_EXITED == 0
-    {
-        acc |=
-            notification_wait(done).map_err(|_| "stress::stop_sleep_window: wait exit failed")?;
-    }
+    let result = with_sleeper(ctx);
     let restore = thread_set_affinity(ctx.thread_cap, u32::MAX)
         .map_err(|_| "stress::stop_sleep_window: restore controller affinity failed");
-    cap_delete(child.th).map_err(|_| "stress::stop_sleep_window: reap thread failed")?;
-    cap_delete(child.cs).map_err(|_| "stress::stop_sleep_window: reap cspace failed")?;
-    cap_delete(done).map_err(|_| "stress::stop_sleep_window: del done failed")?;
     result?;
     restore?;
 
@@ -147,6 +101,66 @@ pub fn run(ctx: &TestContext) -> TestResult
     if INTERRUPTED.load(Ordering::Relaxed) == 0
     {
         return Err("stress::stop_sleep_window: no stop ever cancelled a sleep (never armed)");
+    }
+    Ok(())
+}
+
+/// Start the sleeper, run the stop/start storm, and always reap the sleeper
+/// and its notification, whatever the storm's outcome.
+fn with_sleeper(ctx: &TestContext) -> TestResult
+{
+    let done = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "stress::stop_sleep_window: create done failed")?;
+    let Ok(child) = spawn::new_child(ctx)
+    else
+    {
+        let _ = cap_delete(done);
+        return Err("stress::stop_sleep_window: spawn sleeper failed");
+    };
+    let result = start_and_storm(&child, done);
+    // Deleting the thread stops it wherever it is, so the shared stack is
+    // free for the next test even when the storm failed.
+    let reaped = [cap_delete(child.th), cap_delete(child.cs), cap_delete(done)]
+        .into_iter()
+        .collect::<Result<(), i64>>();
+    result?;
+    reaped.map_err(|_| "stress::stop_sleep_window: reap failed")
+}
+
+fn start_and_storm(child: &spawn::SpawnedChild, done: u32) -> TestResult
+{
+    let c_done = cap_copy(done, child.cs, RIGHTS_SIGNAL)
+        .map_err(|_| "stress::stop_sleep_window: cap_copy done failed")?;
+    // SAFETY: stack index 0 is this test's only child; stress tests run
+    // sequentially and the child is deleted before this test returns.
+    let stack = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[0]) });
+    spawn::configure_and_start_pinned(child, sleeper_entry, stack, u64::from(c_done), 0)
+        .map_err(|_| "stress::stop_sleep_window: start sleeper failed")?;
+
+    let mut acc = 0u64;
+    while acc & BIT_RUNNING == 0
+    {
+        acc |= notification_wait(done)
+            .map_err(|_| "stress::stop_sleep_window: wait running failed")?;
+    }
+
+    for cycle in 0..CYCLES
+    {
+        // Vary the stop's phase against the sleep loop: 0 to 4095 spins
+        // (a multiplicative hash of the cycle) before each pair.
+        for _ in 0..(cycle.wrapping_mul(2_654_435_761) >> 20)
+        {
+            core::hint::spin_loop();
+        }
+        thread_stop(child.th).map_err(|_| "stress::stop_sleep_window: thread_stop failed")?;
+        thread_start(child.th).map_err(|_| "stress::stop_sleep_window: thread_start failed")?;
+    }
+
+    QUIT.store(1, Ordering::Release);
+    while acc & BIT_EXITED == 0
+    {
+        acc |=
+            notification_wait(done).map_err(|_| "stress::stop_sleep_window: wait exit failed")?;
     }
     Ok(())
 }

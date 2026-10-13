@@ -447,10 +447,12 @@ pub struct ThreadControlBlock
     /// (`commit_blocked_under_local_lock`, `commit_reply_rebind_under_local_lock`).
     /// A stop or teardown snapshots it with `state`, cancels the park it saw,
     /// and commits only if it is unchanged, so it never writes `Stopped` or
-    /// `Exited` over a park it did not cancel. Only ever accessed under
-    /// `sched_lock`. See docs/thread-lifecycle-and-sleep.md § `sys_thread_stop`
-    /// Cross-CPU Stop Protocol.
-    pub park_seq: u32,
+    /// `Exited` over a park it did not cancel (docs/thread-lifecycle-and-sleep.md
+    /// § `sys_thread_stop` Cross-CPU Stop Protocol). The timer snapshots it at a
+    /// sleep-list pop and claims only the park it popped (§ Sleep List
+    /// Invariants). Atomic (Relaxed) for those lock-free readers; every write
+    /// holds `sched_lock`.
+    pub park_seq: core::sync::atomic::AtomicU32,
 
     // === IPC state ===
     /// Current IPC blocking reason (None when not blocked on IPC).
@@ -673,7 +675,8 @@ pub struct ThreadControlBlock
 
     /// Exit reason recorded by the kernel at the moment this thread became
     /// `Exited`, under the same all-locks hold as that commit
-    /// (`exit_under_all_locks`): by `sys_thread_exit` (clean exit, value `0`),
+    /// (`exit_under_all_locks`, or `commit_cancelling_park` for object
+    /// teardown): by `sys_thread_exit` (clean exit, value `0`),
     /// by `sys_process_exit` (`encode_exit_code(arg0)`, a voluntary code in
     /// `[0, EXIT_FAULT_BASE)`), by the architecture fault handlers (value
     /// `EXIT_FAULT_BASE + vector`) before they call `post_death_notification`,
@@ -690,9 +693,10 @@ pub struct ThreadControlBlock
     // === Sleep ===
     /// Tick deadline of this thread's pending sleep-list entry (a plain
     /// `SYS_THREAD_SLEEP` or a timed IPC wait); 0 = none. Set by the parker
-    /// before its `sleep_list_add`; cleared only under `SLEEP_LIST_LOCK`, by
-    /// the timer pop or `sleep_list_remove`, together with the entry. Atomic
-    /// because waker prechecks read it under a source lock, not that lock.
+    /// before its `sleep_list_add`; cleared under `SLEEP_LIST_LOCK`, by the
+    /// timer pop or `sleep_list_remove`, together with the entry, or by the
+    /// parker's own rollback of a deadline it never listed. Atomic because
+    /// waker prechecks read it under a source lock, not that lock.
     /// See docs/thread-lifecycle-and-sleep.md § Sleep List Invariants.
     pub sleep_deadline: core::sync::atomic::AtomicU64,
 

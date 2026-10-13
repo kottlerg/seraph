@@ -209,8 +209,10 @@ pub enum SyscallError
     /// The target object is not in the required state for this operation
     /// (e.g. thread not `Stopped` for `read_regs`/`write_regs`).
     InvalidState = -15,
-    /// A blocking operation was cancelled because the thread was stopped.
-    /// The stopped thread sees this as the return value of its blocked syscall.
+    /// A blocking operation was cancelled: the thread was stopped, the object
+    /// it was blocked on was destroyed, or another thread's wait displaced it
+    /// from a single-waiter object. The thread sees this as the return value
+    /// of its blocked syscall.
     Interrupted = -16,
     /// A structural per-object ceiling was reached (e.g. a `CSpace`'s
     /// directory is full). Unlike `OutOfMemory`, donating memory (augment
@@ -420,8 +422,9 @@ full 64-bit bitmask range is usable.
 
 **Capability requirement:** `notification_cap` must have Wait rights.
 
-**Errors:** `InvalidCapability`, `InsufficientRights`, `Interrupted` (the caller was stopped, or
-the notification was destroyed while the caller waited).
+**Errors:** `InvalidCapability`, `InsufficientRights`, `Interrupted` (the caller was stopped, the
+notification was destroyed while the caller waited, or a later wait by another thread displaced
+the caller — the notification takes one waiter).
 
 ---
 
@@ -472,7 +475,8 @@ Dequeue the next entry from an event queue with optional bounded wait.
 **Capability requirement:** `queue_cap` must have Recv rights.
 
 **Errors:** `InvalidCapability`, `InsufficientRights`, `WouldBlock`, `Interrupted` (the caller was
-stopped, or the queue was destroyed while the caller was parked).
+stopped, the queue was destroyed while the caller was parked, or a later blocking receive by
+another thread displaced the caller — the queue takes one waiter).
 
 `WouldBlock` covers both the try-once-empty case and the timer-fired case;
 the caller already knows which mode it asked for. The kernel uses an
@@ -1130,8 +1134,9 @@ Stop a running or runnable thread. The thread transitions to `Stopped` state.
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
 
 If the thread is blocked (on IPC or in `SYS_THREAD_SLEEP`), the block is cancelled (the blocked
-syscall on the target thread returns `Interrupted`); a target that blocks while the stop is in
-progress is cancelled the same way, never left registered as a waiter (see
+syscall on the target thread returns `Interrupted`, unless a genuine waker or the sleep timer
+claimed the wake first); a target that blocks while the stop is in progress is cancelled the same
+way, never left registered as a waiter (see
 [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § `sys_thread_stop` Cross-CPU Stop
 Protocol). This does not hold for a caller displaced from a server's pending-reply
 binding: the stop is not memory-safe, and its outcome is in
@@ -1144,8 +1149,9 @@ Protocol).
 **Capability requirement:** `thread_cap` must have Control rights.
 
 **Errors:** `InvalidCapability`, `InsufficientRights` (cap lacks Control),
-`InvalidState` (thread already stopped or exited, including one killed by an object
-teardown concurrently with the call).
+`InvalidState` (thread not yet started, already stopped, or exited when the call reads it,
+including one killed by an object teardown concurrently with the call; two concurrent stops of one
+running thread can both succeed).
 
 ---
 
@@ -1539,7 +1545,8 @@ are ready simultaneously, subsequent calls return them without blocking (see
 **Capability requirement:** `wait_set_cap` must have Wait rights.
 
 **Errors:** `InvalidCapability`, `InsufficientRights` (cap lacks Wait), `Interrupted` (the caller
-was stopped, or the wait set was destroyed while the caller waited).
+was stopped, the wait set was destroyed while the caller waited, or a later wait by another thread
+displaced the caller — the set takes one waiter).
 
 ---
 
@@ -2158,9 +2165,11 @@ intact (see [capability-internals.md](capability-internals.md) § Safe Delegatio
 - **Blocking syscalls are interruptible.** Any syscall that can block (`SYS_IPC_CALL`,
   `SYS_IPC_RECV`, `SYS_NOTIFICATION_WAIT`, `SYS_EVENT_RECV`, `SYS_WAIT_SET_WAIT`,
   `SYS_THREAD_SLEEP`) returns `Interrupted` if the calling thread is stopped via
-  `SYS_THREAD_STOP`. `SYS_IPC_CALL` and `SYS_IPC_RECV` queued on an endpoint,
+  `SYS_THREAD_STOP`, unless its wake (a delivery, or a sleep's elapsed deadline) was claimed
+  first. `SYS_IPC_CALL` and `SYS_IPC_RECV` queued on an endpoint,
   `SYS_NOTIFICATION_WAIT`, `SYS_EVENT_RECV`, and `SYS_WAIT_SET_WAIT` also return `Interrupted`
-  when the object waited on is destroyed under the caller.
+  when the object waited on is destroyed under the caller; the last three also when another
+  thread's wait on the same object displaces the caller.
 
 ---
 

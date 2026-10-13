@@ -391,7 +391,8 @@ fn sys_thread_sleep(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         }
     }
 
-    match crate::sched::sleep_list_add(tcb)
+    // SAFETY: tcb is this CPU's running thread.
+    match unsafe { crate::sched::sleep_list_add(tcb) }
     {
         Ok(()) | Err(crate::sched::SleepAddError::Cancelled) =>
         {

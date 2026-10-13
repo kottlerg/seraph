@@ -1536,6 +1536,11 @@ unsafe fn defer_self_teardown(ptr: NonNull<KernelObjectHeader>, what: &str)
 ///   rollback frees such bodies at their initial count of 1).
 /// - Must NOT be called with `DERIVATION_LOCK` held, since freeing complex
 ///   objects (Thread, `AddressSpace`) may acquire the frame-allocator lock.
+/// - Must NOT be called with any IPC source, per-TCB `sched_lock`, per-CPU
+///   scheduler, or sleep-list lock held: the Thread, Notification, and
+///   `EventQueue` arms spin, with interrupts enabled, until work on other
+///   CPUs that takes those locks finishes (the Thread drain gates, and
+///   `sched::sleep_wakeups_quiesce`).
 ///
 /// # Cascade handling
 ///
@@ -2190,23 +2195,13 @@ unsafe fn dealloc_object_one(
                     unsafe { crate::sched::enqueue_and_wake(bound, bcpu) };
                 }
 
-                // Remove this thread from the global sleep list before the IPC
-                // unlink below and the wake-in-flight gate. A plain sleeper
-                // (sys_thread_sleep) or a timed IPC waiter sits on the list as a
-                // raw TCB pointer; freeing without removing it would let the next
-                // timer tick dereference the freed pointer in sleep_check_wakeups.
-                // The thread is Exited and off every CPU, so no add can follow.
-                // The remove races the pop under SLEEP_LIST_LOCK: if we win, the
-                // entry is gone and no timer wake fires; if the timer already
-                // popped it, its pop-time snapshot still holds the full binding
-                // (the unlink below has not run), so it claims a plain sleeper at
-                // the pop (wake_in_flight = 1 under the same lock) and a timed
-                // waiter only under the source lock the unlink below also takes;
-                // the gate below waits for either claim's wake. Placed OUTSIDE the
-                // all-locks region — no sched.lock → SLEEP_LIST_LOCK order edge
-                // (the timer takes SLEEP_LIST_LOCK first, then releases it before
-                // any sched_lock).
-                crate::sched::sleep_list_remove(tcb);
+                // Drop any sleep-list entry before the IPC unlink, so a timer pop
+                // that wins the race still sees the full binding. Outside the
+                // all-locks region (no sched.lock → SLEEP_LIST_LOCK edge). See
+                // docs/thread-lifecycle-and-sleep.md § `dealloc_object(Thread)`
+                // Drain Protocol, step 11.
+                // SAFETY: tcb is valid (not yet freed).
+                unsafe { crate::sched::sleep_list_remove(tcb) };
 
                 // Unlink this thread from any IPC object it's blocked on.
                 // Without this, a notification/endpoint/event_queue retains a
@@ -2422,6 +2417,13 @@ unsafe fn dealloc_object_one(
                 // SAFETY: wake_saved_int from save_and_disable_interrupts above.
                 unsafe { crate::arch::current::cpu::restore_interrupts(wake_saved_int) };
                 crate::percpu::preempt_enable();
+
+                // A timer batch that popped this thread keeps its pointer, with no
+                // reference, until it finishes: wait it out before the free (its
+                // claim compares the waiter slot by address). See
+                // docs/thread-lifecycle-and-sleep.md § Sleep List Invariants,
+                // invariant 9.
+                crate::sched::sleep_wakeups_quiesce();
 
                 // Release the per-thread IOPB to SEED if one was bound via
                 // `sys_ioport_bind` (x86-64 only). RISC-V threads never set this

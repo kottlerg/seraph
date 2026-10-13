@@ -220,6 +220,7 @@ same `(*tcb).sched_lock`, which carries it to the refusing parker (see
 | `dealloc_object(Notification)` waiter wake | waiter-slot clear under `sig.lock` | INTERRUPTED |
 | `event_queue_drop` (`dealloc_object(EventQueue)`) waiter wake | waiter-slot clear under `eq.lock` | INTERRUPTED |
 | `wait_set_drop` (`dealloc_object(WaitSet)`) waiter wake | waiter-slot clear under `ws.lock` | INTERRUPTED |
+| displacing wait (`notification_wait`, `event_queue_recv`, `waitset_wait` via `claim_displaced_waiter`) | waiter-slot replacement under the source lock | INTERRUPTED |
 | `dealloc_object(Endpoint)` send-queue drain | whole-queue detach under `ep.lock` | episode + INTERRUPTED (faulter: episode + KILL) |
 | `dealloc_object(Endpoint)` recv-queue drain | whole-queue detach under `ep.lock` | INTERRUPTED |
 | park-helper refused-commit rollbacks (`notification_wait`, `event_queue_recv`, `waitset_wait`, `endpoint_recv`) | source lock held continuously from publish to rollback — no waker ever saw the slot | INTERRUPTED on `ParkCommit::RefusedStop` only; a `RefusedWake` rollback must leave the coalesced deposit deliverable |
@@ -333,7 +334,9 @@ behaviour (per [docs/ipc-design.md § Notifications](../../../docs/ipc-design.md
 2. if acquired != 0:
    // Bits were set; return immediately without blocking
    tf.set_ipc_return(primary = 0, secondary = acquired); return Ok(0)
-3. Acquire waiter_lock
+3. Acquire waiter_lock; if waiter is already set (another thread waits),
+   claim it (claim_displaced_waiter: stamp INTERRUPTED, drop its sleep
+   entry) and clear the slot; it is woken after the release below
 4. Re-check: acquired = bits.swap(0, Ordering::Acquire)
    // Must re-check after acquiring lock to prevent lost-wakeup race:
    // a sender may have set bits between step 1 and step 3
@@ -425,7 +428,9 @@ occupancy and doubles as the lockless wait-set level-readiness witness.
    // Acquire eq.lock; pop the ring head if count > 0, else release and
    // return WouldBlock. Never registers eq.waiter; the caller is never
    // wakeable and never enters the scheduler.
-2. Acquire eq.lock (event_queue_recv)
+2. Acquire eq.lock (event_queue_recv); if waiter is already set (another
+   thread waits), claim it as displaced (stamp INTERRUPTED, drop its sleep
+   entry) and clear the slot; it is woken once eq.lock is released
 3. if count > 0:
    a. payload = ring[read_idx]; read_idx = (read_idx + 1) % (capacity + 1)
    b. count -= 1 (Release)
@@ -552,7 +557,9 @@ waitset_notify(wait_set, member_idx):
 `SYS_WAIT_SET_WAIT`:
 
 ```
-1. Acquire lock
+1. Acquire lock; if waiter is already set (another thread waits), claim it
+   as displaced (stamp INTERRUPTED) and clear the slot; it is woken once the
+   lock is released
 2. while ready_ring is non-empty:
    a. member_idx = ready_ring.pop()
    b. if members[member_idx] is vacant (removed): skip it
@@ -609,13 +616,15 @@ caller still holds a cap to the source while issuing the syscall, so this
 When the wait set itself is dropped (last cap released), `wait_set_drop`
 clears every member's back-pointer and `dec_ref`s each source's header; any
 source whose refcount reaches zero at that point is reclaimed via the
-standard `dealloc_object` cascade. A parked waiter is woken with its park
-stamped INTERRUPTED (§ Park Dispositions and Episodes), so its
-`SYS_WAIT_SET_WAIT` returns `Interrupted`. The source's dealloc arm therefore never
+standard `dealloc_object` cascade. The source's dealloc arm therefore never
 runs while a wait-set member references it; each source's dealloc arm
 carries a `debug_assert!(state.wait_set.is_null())` invariant check (refcount
 ownership per § Kernel Object Reference Counting in
 [capability-internals.md](capability-internals.md#kernel-object-reference-counting)).
+
+A waiter parked on the dropped wait set is woken with its park stamped
+INTERRUPTED (§ Park Dispositions and Episodes), so its `SYS_WAIT_SET_WAIT`
+returns `Interrupted`.
 
 ### Multiple Ready Sources
 

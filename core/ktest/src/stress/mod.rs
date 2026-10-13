@@ -42,6 +42,7 @@ mod stop_reply_race;
 mod stop_resume_race;
 mod stop_sleep_window;
 mod thread_churn;
+mod timed_wait_reuse;
 mod timed_wait_source_delete;
 mod timed_waiter_thread_delete;
 
@@ -95,6 +96,7 @@ pub fn run_all(ctx: &TestContext)
         "stress::timed_waiter_thread_delete",
         timed_waiter_thread_delete::run(ctx)
     );
+    run_integration_test!("stress::timed_wait_reuse", timed_wait_reuse::run(ctx));
     run_integration_test!(
         "stress::double_enqueue_storm",
         double_enqueue_storm::run(ctx)

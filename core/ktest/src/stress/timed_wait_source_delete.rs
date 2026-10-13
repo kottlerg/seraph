@@ -121,23 +121,22 @@ fn cycles(ctx: &TestContext, cpus: u32) -> Result<u64, &'static str>
 /// interrupted.
 fn one_cycle(ctx: &TestContext, done: u32, cycle: u32, cpus: u32) -> Result<bool, &'static str>
 {
-    let is_queue = cycle & 1 == 1;
-    let source = if is_queue
+    let (source, entry): (_, fn(u64) -> !) = if cycle & 1 == 1
     {
-        event_queue_create(ctx.memory_base, 4)
+        (event_queue_create(ctx.memory_base, 4), queue_waiter)
     }
     else
     {
-        cap_create_notification(ctx.memory_base)
-    }
-    .map_err(|_| "stress::timed_wait_source_delete: create source failed")?;
+        (cap_create_notification(ctx.memory_base), notif_waiter)
+    };
+    let source = source.map_err(|_| "stress::timed_wait_source_delete: create source failed")?;
     let Ok(child) = spawn::new_child(ctx)
     else
     {
         let _ = cap_delete(source);
         return Err("stress::timed_wait_source_delete: spawn waiter failed");
     };
-    let verdict = race(&child, source, done, cycle, cpus, is_queue);
+    let verdict = race(&child, entry, source, done, cycle, cpus);
     // Deleting the thread stops it wherever it is, so the next cycle's
     // waiter can reuse the stack even when this one failed.
     let reaped = [cap_delete(child.th), cap_delete(child.cs)]
@@ -164,22 +163,22 @@ fn one_cycle(ctx: &TestContext, done: u32, cycle: u32, cpus: u32) -> Result<bool
     Ok(acc & BIT_INTERRUPTED != 0)
 }
 
-/// Start the waiter on a copy of `source`, destroy `source` around its
-/// deadlines, and return the waiter's verdict bits.
+/// Start the waiter (`entry`, matching the source's kind) on a copy of
+/// `source`, destroy `source` around its deadlines, and return the waiter's
+/// verdict bits.
 fn race(
     child: &spawn::SpawnedChild,
+    entry: fn(u64) -> !,
     source: u32,
     done: u32,
     cycle: u32,
     cpus: u32,
-    is_queue: bool,
 ) -> Result<u64, &'static str>
 {
     let c_source = cap_copy(source, child.cs, RIGHTS_ALL)
         .map_err(|_| "stress::timed_wait_source_delete: cap_copy source failed")?;
     let c_done = cap_copy(done, child.cs, RIGHTS_SIGNAL)
         .map_err(|_| "stress::timed_wait_source_delete: cap_copy done failed")?;
-    let entry: fn(u64) -> ! = if is_queue { queue_waiter } else { notif_waiter };
     // SAFETY: stack index 0 is this test's only live child; each cycle's
     // waiter is deleted before the next starts.
     let stack = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[0]) });

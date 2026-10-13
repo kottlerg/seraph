@@ -959,11 +959,13 @@ struct Bridge {
     /// Bridge → `wait` rendezvous. Bridge `notification_send`s once after
     /// publishing `exit_reason`; `wait` `notification_wait`s.
     completion_notification: u32,
-    /// Bridge thread handle. Taken by `wait` (after completion fires)
-    /// or `Drop` (after sentinel post).
+    /// Bridge thread handle. Taken by `wait` (after completion fires), by
+    /// `try_wait` (after seeing `peer_dead`), or by `Drop` (after sentinel
+    /// post).
     handle: Option<JoinHandle<()>>,
     /// Exit reason published by the bridge before raising
-    /// `completion_notification`. Read by `wait` after the wake.
+    /// `completion_notification`. Read by `wait` after the wake and by
+    /// `try_wait` after seeing `peer_dead`.
     exit_reason: Arc<AtomicU64>,
     /// Set by the bridge (Release) after publishing `exit_reason`; polled by
     /// `try_wait`, which must not block.
@@ -1109,9 +1111,8 @@ impl Drop for Process {
 
 // ── Death bridge ───────────────────────────────────────────────────────────
 //
-// One thread per piped spawn (the bridge runs unconditionally — even
-// non-piped children benefit from the `completion_notification` rendezvous,
-// and the per-pipe arrays are simply empty). Receives the kernel's
+// One thread per piped spawn; non-piped spawns have no bridge, and `wait`
+// consumes `death_eq` directly. Receives the kernel's
 // death notification on `death_eq` and translates it into:
 //   * `peer_dead.store(true)` — fired on every child death, clean exit
 //     included. Every parent-side `Pipe` checks this atom before each

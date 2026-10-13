@@ -459,9 +459,9 @@ pub struct ProcessInfo
     //   * `space_notification` — reader kicks writer after consuming bytes;
     //                      writer awaits this when the ring is full.
     //
-    // Both processes hold caps to both notifications (kernel notification objects do
-    // not distinguish send/wait rights at the cap level). At most one side
-    // blocks on each notification at any given moment.
+    // Both processes hold caps to both notifications, with Notify and Wait
+    // rights. At most one side blocks on each notification at any given
+    // moment.
     //
     // Zero in any slot means the corresponding notification is not attached;
     // the AnonPipe peer treats `notification_wait` as a no-op and falls back

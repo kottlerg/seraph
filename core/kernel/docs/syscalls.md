@@ -207,7 +207,8 @@ pub enum SyscallError
     QueueFull = -13,
     // -14 retired (`DmaUnsafe`, removed with `SYS_DMA_GRANT`); never reuse.
     /// The target object is not in the required state for this operation
-    /// (e.g. thread not `Stopped` for `read_regs`/`write_regs`).
+    /// (e.g. thread not `Stopped` for `read_regs`/`write_regs`, or a wait set
+    /// another thread already waits on).
     InvalidState = -15,
     /// A blocking operation was cancelled: the thread was stopped, or the
     /// object it was blocked on was destroyed. The thread sees this as the
@@ -377,8 +378,9 @@ still delivered — with zero caps; the sender keeps its capabilities (see
 
 ### `SYS_NOTIFICATION_SEND` (3)
 
-OR bits into a notification object. Non-blocking; wakes the waiter if one is present
-(see [ipc-design.md](../../../docs/ipc-design.md) § Notifications).
+OR bits into a notification object. Non-blocking; if threads are waiting, wakes the
+longest-waiting one with every pending bit (see `SYS_NOTIFICATION_WAIT` and
+[ipc-design.md](../../../docs/ipc-design.md) § Notifications).
 
 **Arguments:**
 
@@ -425,7 +427,8 @@ full 64-bit bitmask range is usable.
 notification was destroyed while the caller waited).
 
 Several threads may wait on one notification. They queue in arrival order, and each delivery wakes
-the longest-waiting one with every pending bit.
+the longest-waiting one with every pending bit. A wait that enters while bits are pending takes
+them at once, ahead of any queued waiter.
 
 ---
 
@@ -1143,7 +1146,11 @@ way, never left registered as a waiter (see
 Protocol). This does not hold for a caller displaced from a server's pending-reply
 binding: the stop is not memory-safe, and its outcome is in
 [ipc-design.md](../../../docs/ipc-design.md) § The Call/Reply Model
-([#443](https://github.com/kottlerg/seraph/issues/443)). If the thread is running on another CPU, an
+([#443](https://github.com/kottlerg/seraph/issues/443)). Nor is a stop of a thread waiting on a
+notification, event queue, or wait set whose last capability is deleted concurrently: the cancel
+can lock the object after it is freed
+([#443](https://github.com/kottlerg/seraph/issues/443) § Source pointer held past its free). If the
+thread is running on another CPU, an
 inter-processor interrupt is sent to force it out of userspace (see
 [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § `sys_thread_stop` Cross-CPU Stop
 Protocol).
@@ -1451,7 +1458,8 @@ Block the calling thread for a bounded duration. The timer wakes it at the deadl
 No capability is required — this syscall acts on the calling thread implicitly.
 
 **Errors:** `InvalidCapability` (no current thread), `OutOfMemory` (kernel sleep list at
-capacity), `Interrupted` (the thread was stopped before or during the sleep).
+capacity), `Interrupted` (the thread was stopped before or during the sleep, unless the timer had
+already claimed its elapsed deadline).
 
 ---
 
@@ -1546,9 +1554,10 @@ are ready simultaneously, subsequent calls return them without blocking (see
 
 **Capability requirement:** `wait_set_cap` must have Wait rights.
 
-**Errors:** `InvalidCapability`, `InsufficientRights` (cap lacks Wait), `Interrupted` (the caller
-was stopped, or the wait set was destroyed while the caller waited). Blocked waiters queue in
-arrival order; each ready member wakes the longest-waiting one.
+**Errors:** `InvalidCapability`, `InsufficientRights` (cap lacks Wait), `InvalidState` (another
+thread already waits on the set; the caller does not wait — a wait set takes one waiter, any number
+of member sources), `Interrupted` (the caller was stopped, or the wait set was destroyed while the
+caller waited).
 
 ---
 

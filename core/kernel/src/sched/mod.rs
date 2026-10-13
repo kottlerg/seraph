@@ -374,6 +374,9 @@ pub const SPIN_SITE_DEALLOC_AS_ACTIVE: u32 = 5;
 /// batch that may have snapshotted the dying source or TCB finishes
 /// dispatching ([`sleep_wakeups_quiesce`]).
 pub const SPIN_SITE_DEALLOC_TIMER_DISPATCH: u32 = 6;
+/// `sys_thread_start` owed-wake gate: spinning until a waker that claimed the
+/// stopped thread's park clears `wake_in_flight` ([`await_owed_wake`]).
+pub const SPIN_SITE_START_WAKE_IN_FLIGHT: u32 = 7;
 
 /// Per-CPU breadcrumb naming the bounded protocol-spin a CPU is currently
 /// executing, for the softlockup watchdog. A wedged CPU (no non-idle dispatch
@@ -383,9 +386,9 @@ pub const SPIN_SITE_DEALLOC_TIMER_DISPATCH: u32 = 6;
 /// The reporting sites are the three `dealloc_object(Thread)` gates (the
 /// first of which `stop_threads_bound_to`'s phase-2 spin shares), the
 /// `dealloc_object(AddressSpace)` root-free gate, the timer-dispatch gate the
-/// Notification, `EventQueue`, and Thread dealloc arms share, and the
-/// `schedule()`
-/// context-saved dispatch barrier — the protocol spins that can wedge a CPU
+/// Notification, `EventQueue`, and Thread dealloc arms share, the
+/// `sys_thread_start` owed-wake gate, and the `schedule()` context-saved
+/// dispatch barrier — the protocol spins that can wedge a CPU
 /// silently (the `sys_thread_stop` drain carries its own overlong-duration
 /// warning). Diagnostic-only — never gates control flow.
 #[cfg(not(test))]
@@ -428,6 +431,7 @@ fn spin_site_name(site: u32) -> &'static str
         SPIN_SITE_SCHED_CONTEXT_SAVED => "schedule:context-saved",
         SPIN_SITE_DEALLOC_AS_ACTIVE => "dealloc:as-active",
         SPIN_SITE_DEALLOC_TIMER_DISPATCH => "dealloc:timer-dispatch",
+        SPIN_SITE_START_WAKE_IN_FLIGHT => "start:wake-in-flight",
         _ => "none",
     }
 }
@@ -1284,8 +1288,9 @@ fn watchdog_dump(reason: &str)
     // waiter parked on an IPC object, or a `Ready` thread stranded in a run
     // queue that a wedged CPU never dispatched (the `mask` bit is set but no
     // dispatch happens). For `Blocked` threads the `blocked_on` decode says
-    // whether the blocking object still names the waiter (no wake issued) or
-    // holds data with a cleared slot (a wake deposited but never linked); for
+    // whether the blocking object still queues the thread (no wake issued) or
+    // holds data while it is no longer queued (a wake deposited but never
+    // linked); for
     // `Ready`/`Stopped` threads the scheduling fields say why a runnable thread
     // is neither dispatched locally nor stolen (`context_saved`/`queued_on`/
     // affinity / save-window pin).
@@ -1381,24 +1386,6 @@ fn watchdog_dump(reason: &str)
     crate::kprintln!("=== END WATCHDOG ===");
 }
 
-/// Node bound on the watchdog's lock-free waiter-queue walk: far above any
-/// real queue, low enough that a queue mutated or corrupted under the walk
-/// cannot hang the dump.
-#[cfg(not(test))]
-const WATCHDOG_QUEUE_WALK: usize = 4096;
-
-/// `"true"`, `"false"`, or `"?"` (walk bound hit) for a watchdog queue probe.
-#[cfg(not(test))]
-fn queued_label(probe: Option<bool>) -> &'static str
-{
-    match probe
-    {
-        Some(true) => "true",
-        Some(false) => "false",
-        None => "?",
-    }
-}
-
 /// Decode and print the IPC object a `Blocked` thread is parked on, for the
 /// softlockup watchdog dump. The telling field is whether the object still
 /// queues `t` as a waiter (the wake was never issued) or has dequeued it /
@@ -1407,8 +1394,10 @@ fn queued_label(probe: Option<bool>) -> &'static str
 ///
 /// # Safety
 /// `t` is a registry-walked TCB pointer held stable by the registry lock. All
-/// reads are benign-racy diagnostics: the blocking object is read without its
-/// lock, and the waiter-queue probe is bounded (`WaitQueue::contains_racy`).
+/// reads are benign-racy diagnostics. The blocking object is read without its
+/// lock, and nothing pins it, so its scalar fields may be stale; no pointer
+/// read from it is followed. The waiter-queue probe reads only `t`'s queue tag
+/// (`WaitQueue::tags_racy`).
 #[cfg(not(test))]
 // cast_ptr_alignment: blocked_on_object is stored as *mut u8 but always points
 // at a properly-aligned IPC object whose concrete type is named by ipc_state;
@@ -1431,11 +1420,11 @@ unsafe fn watchdog_decode_blocked_on(t: *mut ThreadControlBlock)
         {
             let eq = blocked_on.cast::<crate::ipc::event_queue::EventQueueState>();
             // SAFETY: ipc_state classifies blocked_on as an EventQueueState;
-            // the waiter-queue walk is the bounded lock-free probe, its TCBs
-            // kept mapped by the held registry lock (contains_racy's contract).
+            // the queue probe takes the queue's address without reading it and
+            // reads t's tag, t being kept mapped by the held registry lock.
             let (queued, count, capacity) = unsafe {
                 (
-                    queued_label((*eq).waiters.contains_racy(t, WATCHDOG_QUEUE_WALK)),
+                    crate::ipc::WaitQueue::tags_racy(core::ptr::addr_of!((*eq).waiters), t),
                     (*eq).count.load(Ordering::Relaxed),
                     (*eq).capacity,
                 )
@@ -1453,7 +1442,7 @@ unsafe fn watchdog_decode_blocked_on(t: *mut ThreadControlBlock)
             // SAFETY: as for the event-queue arm, for a NotificationState.
             let (queued, bits) = unsafe {
                 (
-                    queued_label((*sig).waiters.contains_racy(t, WATCHDOG_QUEUE_WALK)),
+                    crate::ipc::WaitQueue::tags_racy(core::ptr::addr_of!((*sig).waiters), t),
                     (*sig).bits.load(Ordering::Relaxed),
                 )
             };
@@ -1490,7 +1479,7 @@ unsafe fn watchdog_decode_blocked_on(t: *mut ThreadControlBlock)
             let ws = blocked_on.cast::<crate::ipc::wait_set::WaitSetState>();
             // SAFETY: as for the event-queue arm, for a WaitSetState.
             let queued =
-                queued_label(unsafe { (*ws).waiters.contains_racy(t, WATCHDOG_QUEUE_WALK) });
+                unsafe { crate::ipc::WaitQueue::tags_racy(core::ptr::addr_of!((*ws).waiters), t) };
             crate::kprintln!("      waitset: queued={}", queued);
         }
         IpcThreadState::None =>
@@ -1889,10 +1878,10 @@ pub fn sleep_check_wakeups()
                 // Claim only the park that was popped: the queue may hold the
                 // same TCB again in a later wait (claimed by a sender and
                 // re-parked since the pop), whose park_seq differs. The queue
-                // and park_seq are both written under sig.lock, so the reads are
-                // stable here, and tcb is alive while queued.
-                // SAFETY: same as above; tcb is dereferenced only once found
-                // queued.
+                // tag and park_seq are both written under sig.lock, so the
+                // reads are stable here.
+                // SAFETY: as above; tcb, too, is kept alive by the dispatch
+                // sequence (its Thread dealloc quiesces this batch).
                 let we_win = unsafe {
                     (*sig_state).waiters.remove_if(tcb, |t| {
                         (*t).park_seq.load(core::sync::atomic::Ordering::Relaxed) == park_seq
@@ -1934,9 +1923,9 @@ pub fn sleep_check_wakeups()
                 // path is eq.lock → SLEEP_LIST_LOCK).
                 let saved_eq = unsafe { (*eq_state).lock.lock_raw() };
                 // Claim only the park that was popped (see the notification
-                // arm); the queue and park_seq are written under eq.lock.
-                // SAFETY: same as above; tcb is dereferenced only once found
-                // queued.
+                // arm); the queue tag and park_seq are written under eq.lock.
+                // SAFETY: as above; tcb, too, is kept alive by the dispatch
+                // sequence.
                 let we_win = unsafe {
                     (*eq_state).waiters.remove_if(tcb, |t| {
                         (*t).park_seq.load(core::sync::atomic::Ordering::Relaxed) == park_seq
@@ -2185,6 +2174,8 @@ pub fn init(cpu_count: u32) -> u32
                     #[cfg(debug_assertions)]
                     deposit_episode: core::sync::atomic::AtomicU32::new(0),
                     ipc_wait_next: None,
+                    ipc_wait_prev: core::ptr::null_mut(),
+                    ipc_wait_queue: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
                     fault_handler: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
                     fault_badge: core::sync::atomic::AtomicU64::new(0),
                     fault_outcome: core::sync::atomic::AtomicU8::new(0),
@@ -3557,6 +3548,66 @@ pub unsafe fn await_descheduled(tcb: *mut thread::ThreadControlBlock)
 #[allow(unused_variables)]
 pub unsafe fn await_descheduled(_tcb: *mut thread::ThreadControlBlock) {}
 
+/// Spin until no waker owes the stopped `tcb` a wake. A waker claims a park
+/// under its source lock (`wake_in_flight = 1`, the waiter removed from the
+/// source's queue) and links the thread later, in `enqueue_and_wake`; a stop
+/// that lost the race for the park commits `Stopped` in between. Restarting
+/// the thread before that wake lands would let it run, park again, and then
+/// be linked `Ready` by the late wake while still queued on its new source.
+/// `sys_thread_start` therefore runs this after [`await_descheduled`] and
+/// before committing `Ready`; the late wake then finds `Stopped` and aborts.
+///
+/// The pin is first read under `tcb`'s `sched_lock`, which orders it after
+/// every claim of the stopped park: such a claim released its source lock
+/// before the stop's cancel (or the thread's own park rollback) took it, and
+/// that path then committed or descheduled under `sched_lock`. A thread that
+/// is `Stopped`, off every CPU, and on no queue cannot be claimed again, so
+/// once the pin reads 0 it stays 0 until the restart. The spin runs
+/// preempt-disabled with interrupts enabled (the #207 envelope); spin site
+/// `start:wake-in-flight`.
+///
+/// # Safety
+/// `tcb` must be a valid [`ThreadControlBlock`] pointer that the caller has
+/// passed through [`await_descheduled`]; the caller holds no lock.
+#[cfg(not(test))]
+pub unsafe fn await_owed_wake(tcb: *mut thread::ThreadControlBlock)
+{
+    use core::sync::atomic::Ordering;
+
+    // SAFETY: tcb valid per contract; lock_raw paired with unlock_raw.
+    let owed = unsafe {
+        let saved = (*tcb).sched_lock.lock_raw();
+        let pin = (*tcb).wake_in_flight.load(Ordering::Relaxed);
+        (*tcb).sched_lock.unlock_raw(saved);
+        pin != 0
+    };
+    if !owed
+    {
+        return;
+    }
+    crate::percpu::preempt_disable();
+    // SAFETY: ring 0; restored below.
+    let saved_int = unsafe { crate::arch::current::cpu::save_and_disable_interrupts() };
+    // SAFETY: ring 0; IDT loaded; preempt disabled.
+    unsafe { crate::arch::current::interrupts::enable() };
+    spin_site_enter(SPIN_SITE_START_WAKE_IN_FLIGHT);
+    // SAFETY: tcb valid; enqueue_and_wake clears the pin with Release on every
+    // path.
+    while unsafe { (*tcb).wake_in_flight.load(Ordering::Acquire) } != 0
+    {
+        core::hint::spin_loop();
+    }
+    spin_site_exit();
+    // SAFETY: saved_int from save_and_disable_interrupts above.
+    unsafe { crate::arch::current::cpu::restore_interrupts(saved_int) };
+    crate::percpu::preempt_enable();
+}
+
+/// Test stub.
+#[cfg(test)]
+#[allow(unused_variables)]
+pub unsafe fn await_owed_wake(_tcb: *mut thread::ThreadControlBlock) {}
+
 /// Migrate a `Ready` thread from `src_cpu`'s run queue onto `dst_cpu`'s
 /// run queue.
 ///
@@ -4345,7 +4396,8 @@ pub unsafe fn enqueue_and_wake(_tcb: *mut ThreadControlBlock, _target_cpu: usize
 ///
 /// Lock order: `(*tcb).sched_lock` (outer) → target run-queue lock (inner), then
 /// `wake_idle_cpu` after both are released — identical to `enqueue_and_wake`'s
-/// link path. Clears `wake_pending` and `wake_in_flight`.
+/// link path. Clears `wake_pending`; `wake_in_flight` is already 0 (the
+/// caller ran [`await_owed_wake`]).
 ///
 /// # Safety
 /// - `tcb` must be a valid [`ThreadControlBlock`] pointer, not live or linked on
@@ -4394,14 +4446,18 @@ pub unsafe fn enqueue_ready_thread(tcb: *mut ThreadControlBlock, target_cpu: usi
 
     set_reschedule_pending_for(target_cpu);
 
-    // Clear the wake-in-flight gate defensively so a waiting dealloc may proceed
-    // (deliberate placements do not set it, but keep the invariant uniform).
+    // The caller waited out any owed wake (`await_owed_wake`), and no waker can
+    // claim a thread that is off every CPU and on no queue.
     // SAFETY: tcb valid; locks held.
-    unsafe {
+    let owed = unsafe {
         (*tcb)
             .wake_in_flight
-            .store(0, core::sync::atomic::Ordering::Release);
-    }
+            .load(core::sync::atomic::Ordering::Relaxed)
+    };
+    debug_assert_eq!(
+        owed, 0,
+        "enqueue_ready_thread: a waker still owes this thread a wake"
+    );
 
     // Release inner (run-queue) then outer (sched_lock); never IPI under
     // sched_lock.

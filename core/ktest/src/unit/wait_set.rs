@@ -8,23 +8,36 @@
 //! Covers: `SYS_CAP_CREATE_WAIT_SET`, `SYS_WAIT_SET_ADD`,
 //! `SYS_WAIT_SET_REMOVE`, `SYS_WAIT_SET_WAIT`.
 //!
-//! Tests cover immediate return (source already ready) and blocking return
-//! (child thread fires source while we wait). The remove test verifies that
-//! only the remaining member can wake the wait set after removal.
+//! Tests cover immediate return (source already ready), blocking return
+//! (child thread fires source while we wait), and the refusal of a second
+//! concurrent waiter. The remove test verifies that only the remaining member
+//! can wake the wait set after removal.
 
 use syscall::{
-    cap_copy, cap_create_endpoint, cap_create_notification, cap_delete, event_post,
-    event_queue_create, event_recv, notification_send, notification_wait, thread_exit,
-    wait_set_add, wait_set_create, wait_set_remove, wait_set_wait,
+    RIGHTS_ALL, cap_copy, cap_create_endpoint, cap_create_notification, cap_delete, event_post,
+    event_queue_create, event_recv, notification_send, notification_wait,
+    notification_wait_timeout, thread_exit, thread_sleep, wait_set_add, wait_set_create,
+    wait_set_remove, wait_set_wait,
 };
+use syscall_abi::SyscallError;
 
 use crate::{ChildStack, TestContext, TestResult};
 
 // Notification right only (no WAIT). Children only send on notifications.
 const RIGHTS_NOTIFY: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
 
-// Child stack for the blocking_wait test.
+// Child stack for the blocking_wait and occupied_wait_refused tests (each
+// reaps its child before returning).
 static mut CHILD_STACK: ChildStack = ChildStack::ZERO;
+
+/// `occupied_wait_refused` child's `done` bits: parked, and its wait's verdict.
+const BIT_READY: u64 = 1 << 0;
+const BIT_OK: u64 = 1 << 1;
+const BIT_BAD: u64 = 1 << 2;
+const OCCUPIED_BADGE: u64 = 9;
+/// Settle after READY so the child provably parks; bound on each report.
+const SETTLE_SLEEP_MS: u64 = 20;
+const REPORT_MS: u64 = 1000;
 
 // ── wait_set_add (notification, immediate wake) ────────────────────────────────────
 
@@ -131,6 +144,102 @@ pub fn blocking_wait(ctx: &TestContext) -> TestResult
     cap_delete(child.cs).map_err(|_| "cap_delete cs after blocking test failed")?;
     cap_delete(ws).map_err(|_| "cap_delete ws after blocking test failed")?;
     Ok(())
+}
+
+// ── wait_set_wait (occupied set) ──────────────────────────────────────────────
+
+/// While a child waits on a wait set, a second `wait_set_wait` returns
+/// `InvalidState` at once and the child's wait is unaffected: a member fire
+/// still reaches it.
+pub fn occupied_wait_refused(ctx: &TestContext) -> TestResult
+{
+    let ws = wait_set_create(ctx.memory_base).map_err(|_| "wait_set_create for occupied failed")?;
+    let sig = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "cap_create_notification (member) for occupied failed")?;
+    let done = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "cap_create_notification (done) for occupied failed")?;
+    wait_set_add(ws, sig, OCCUPIED_BADGE).map_err(|_| "wait_set_add for occupied failed")?;
+
+    let child = crate::spawn::new_child(ctx).map_err(|_| "spawn::new_child for occupied failed")?;
+    let result = occupied_with_child(&child, ws, sig, done);
+    // Deleting the thread tears the child down wherever it is, so the stack is
+    // free even when the test failed with the child still parked.
+    let teardown = [
+        cap_delete(child.th),
+        cap_delete(child.cs),
+        cap_delete(ws),
+        cap_delete(sig),
+        cap_delete(done),
+    ]
+    .into_iter()
+    .collect::<Result<(), i64>>()
+    .map_err(|_| "cap_delete after occupied test failed");
+    result.and(teardown)
+}
+
+/// Park the child on `ws`, check the refusal, then release the child.
+fn occupied_with_child(
+    child: &crate::spawn::SpawnedChild,
+    ws: u32,
+    sig: u32,
+    done: u32,
+) -> TestResult
+{
+    let c_ws = cap_copy(ws, child.cs, RIGHTS_ALL).map_err(|_| "cap_copy ws for occupied failed")?;
+    let c_done =
+        cap_copy(done, child.cs, RIGHTS_NOTIFY).map_err(|_| "cap_copy done for occupied failed")?;
+    let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
+    crate::spawn::configure_and_start(
+        child,
+        occupied_waiter_entry,
+        stack_top,
+        u64::from(c_ws) | (u64::from(c_done) << 32),
+    )
+    .map_err(|_| "configure_and_start for occupied failed")?;
+    let mut acc = collect(done, 0, BIT_READY)?;
+    thread_sleep(SETTLE_SLEEP_MS).map_err(|_| "settle sleep for occupied failed")?;
+
+    match wait_set_wait(ws)
+    {
+        Err(e) if e == SyscallError::InvalidState as i64 =>
+        {}
+        Ok(_) => return Err("a second wait_set_wait on an occupied set returned a badge"),
+        Err(_) =>
+        {
+            return Err(
+                "a second wait_set_wait on an occupied set returned a non-InvalidState error",
+            );
+        }
+    }
+    if acc & (BIT_OK | BIT_BAD) != 0
+    {
+        return Err("the parked wait set waiter returned before any member fired");
+    }
+
+    notification_send(sig, 0x1).map_err(|_| "notification_send for occupied failed")?;
+    acc = collect(done, acc, BIT_OK | BIT_BAD)?;
+    if acc & BIT_BAD != 0
+    {
+        return Err("the parked wait set waiter did not receive the member's badge");
+    }
+    Ok(())
+}
+
+/// Accumulate `done` bits onto `acc` until any bit of `mask` is present,
+/// failing when a [`REPORT_MS`] wait passes with nothing new.
+fn collect(done: u32, mut acc: u64, mask: u64) -> Result<u64, &'static str>
+{
+    while acc & mask == 0
+    {
+        let bits = notification_wait_timeout(done, REPORT_MS)
+            .map_err(|_| "notification_wait_timeout on done for occupied failed")?;
+        if bits == 0
+        {
+            return Err("the wait set waiter did not report in time");
+        }
+        acc |= bits;
+    }
+    Ok(acc)
 }
 
 // ── SYS_WAIT_SET_REMOVE ───────────────────────────────────────────────────────
@@ -254,5 +363,25 @@ pub fn source_endpoint_pinned_by_member(ctx: &TestContext) -> TestResult
 fn sender_entry(sig_slot: u64) -> !
 {
     notification_send(sig_slot as u32, 0xBEEF).ok();
+    thread_exit()
+}
+
+/// Raise READY, wait once on the set, and report whether it returned the
+/// member's badge.
+// cast_possible_truncation: packed fields are 32-bit cap handles.
+#[allow(clippy::cast_possible_truncation)]
+fn occupied_waiter_entry(arg: u64) -> !
+{
+    let (ws, done) = ((arg & 0xFFFF_FFFF) as u32, (arg >> 32) as u32);
+    notification_send(done, BIT_READY).ok();
+    let bit = if wait_set_wait(ws) == Ok(OCCUPIED_BADGE)
+    {
+        BIT_OK
+    }
+    else
+    {
+        BIT_BAD
+    };
+    notification_send(done, bit).ok();
     thread_exit()
 }

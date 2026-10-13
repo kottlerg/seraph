@@ -520,9 +520,11 @@ pub enum SyscallError
     /// (e.g. thread not `Stopped` for `read_regs`/`write_regs`, or a wait set
     /// another thread already waits on).
     InvalidState = -15,
-    /// A blocking operation was cancelled: the thread was stopped, or the
-    /// object it was blocked on was destroyed. The thread sees this as the
-    /// return value of its blocked syscall.
+    /// A blocking operation was cancelled (the thread was stopped, or the
+    /// object it was blocked on was destroyed; the thread sees this as the
+    /// return value of its blocked syscall), or a batched capability
+    /// operation (revoke, move, a range split) reached its liveness backstop;
+    /// a retry continues from the remaining work.
     Interrupted = -16,
     /// A structural per-object ceiling was reached (e.g. a `CSpace`'s
     /// directory is full). Unlike `OutOfMemory`, donating memory (augment

@@ -25,7 +25,7 @@
 //! original) after a sleep and a varying spin, so the delete lands around the
 //! waiter's deadlines. Half the cycles use a notification, half an event
 //! queue. The tripwires are the kernel's (a freed source's lock or waiter
-//! slot touched by the timer). The test itself fails if a wait returns
+//! queue touched by the timer). The test itself fails if a wait returns
 //! anything but a timeout (`Ok(0)` for a notification, `WouldBlock` for a
 //! queue — nothing is ever sent or posted), `Interrupted` (destroyed under
 //! it), or `InvalidCapability` (its copy was gone before it re-armed), or if

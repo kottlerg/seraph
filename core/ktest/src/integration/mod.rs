@@ -46,10 +46,11 @@
 //! - `aspace_fault_notification_late_bind.rs` — an aspace terminal-fault observer bound after the space already faulted still receives the retained reason
 //! - `ipc_call_interrupted_stop_start.rs` — a client stopped while parked in `ipc_call` (send-queued and awaiting-reply) restarts to `Interrupted`, never a stale reply (#361)
 //! - `park_interrupted_stop_start.rs` — a thread stopped while parked in any non-call blocking syscall (notification/event/recv/wait-set/sleep) restarts to `Interrupted`, never a stale deposit (#363)
-//! - `destroyed_source_interrupts.rs` — a waiter on a notification, event queue, or wait set
+//! - `destroyed_source_interrupts.rs` — every waiter on a notification, event queue, or wait set
 //!   destroyed under it returns `Interrupted`, never a fabricated success
-//! - `queued_waiters_fifo.rs` — threads waiting on one notification, event queue, or wait set
-//!   queue in arrival order; each delivery wakes the longest-waiting one
+//! - `queued_waiters_fifo.rs` — threads waiting on one notification or event queue are woken in
+//!   arrival order, one per delivery, including after a timed waiter expires at the head or the
+//!   tail
 //! - Architecture-only scenarios live behind `crate::arch` (`run_integration`);
 //!   per-arch helpers and branches inside the scenarios above are still gated in
 //!   place (#460).

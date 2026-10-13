@@ -60,9 +60,13 @@ pub struct NotificationState
     pub lock: crate::sync::Spinlock,
 }
 
-// SAFETY: NotificationState is accessed only under the relevant scheduler lock.
+// SAFETY: the waiter queue and the wait-set back-pointer fields are read and
+// written only under `lock`; `bits` and `has_observer` are atomics used under
+// the Dekker protocol documented on `has_observer`. Moving the state between
+// CPUs therefore exposes no unsynchronised write.
 unsafe impl Send for NotificationState {}
-// SAFETY: NotificationState is accessed only under the relevant scheduler lock; no Sync violation.
+// SAFETY: as for Send: shared access touches the non-atomic fields only under
+// `lock`, and the lock-free fast path reads and writes only the atomics.
 unsafe impl Sync for NotificationState {}
 
 impl NotificationState
@@ -200,8 +204,10 @@ pub unsafe fn notification_send(
 ///
 /// Reads and clears the bitmask atomically. If the result is non-zero,
 /// returns `Ok(bits)` immediately (no blocking). If zero, stores `caller`
-/// at the tail of the waiters, sets its state to `Blocked`, and returns
-/// `Err(())` — the caller must then call the scheduler to yield the CPU.
+/// at the tail of the waiters, sets its state to `Blocked`, arms a non-zero
+/// `deadline` (a timed wait) on the sleep list in the same critical section,
+/// and returns `Err(())` — the caller must then call the scheduler to yield
+/// the CPU.
 ///
 /// # Dekker ordering
 /// Under the lock, the waiter is registered and `has_observer` is set
@@ -215,6 +221,7 @@ pub unsafe fn notification_send(
 pub unsafe fn notification_wait(
     sig: *mut NotificationState,
     caller: *mut ThreadControlBlock,
+    deadline: u64,
 ) -> Result<u64, ()>
 {
     // SAFETY: caller guarantees sig is valid.
@@ -303,6 +310,11 @@ pub unsafe fn notification_wait(
                 .context_saved
                 .store(1, core::sync::atomic::Ordering::Relaxed);
         }
+    }
+    else if deadline != 0
+    {
+        // SAFETY: caller committed Blocked; sig.lock held since the push.
+        unsafe { crate::ipc::arm_timed_park(caller, deadline, "notification_wait") };
     }
 
     // SAFETY: paired with lock_raw above.

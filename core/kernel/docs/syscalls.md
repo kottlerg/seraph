@@ -1107,7 +1107,11 @@ not virgin, not siblings, or either has children), `InvalidCapability`,
 
 ### `SYS_THREAD_START` (19)
 
-Transition a thread from `Created` state to `Ready` and enqueue it for scheduling.
+Transition a thread from `Created` or `Stopped` state to `Ready` and enqueue it for scheduling.
+A stopped thread whose blocked syscall a waker claimed before the stop is restarted only once that
+waker's wake has landed, so the resumed syscall returns the delivered result (see
+[thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § `sys_thread_stop` Cross-CPU Stop
+Protocol, invariant 4).
 
 **Arguments:**
 
@@ -1555,8 +1559,8 @@ are ready simultaneously, subsequent calls return them without blocking (see
 **Capability requirement:** `wait_set_cap` must have Wait rights.
 
 **Errors:** `InvalidCapability`, `InsufficientRights` (cap lacks Wait), `InvalidState` (another
-thread already waits on the set; the caller does not wait — a wait set takes one waiter, any number
-of member sources), `Interrupted` (the caller was stopped, or the wait set was destroyed while the
+thread already waits on the set; the caller does not wait — a wait set takes one waiter at a
+time), `Interrupted` (the caller was stopped, or the wait set was destroyed while the
 caller waited).
 
 ---

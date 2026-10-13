@@ -55,6 +55,9 @@ const PARK_FOREVER_MS: u64 = 600_000;
 /// before the source is destroyed (see `park_interrupted_stop_start`).
 const SETTLE_SLEEP_MS: u64 = 20;
 
+/// Bound on each controller wait for a child's report.
+const REPORT_MS: u64 = 1000;
+
 static mut CHILD_STACKS: [ChildStack; MAX_CHILDREN] = [ChildStack::ZERO; MAX_CHILDREN];
 
 /// A child's argument: its copy of the source, its `done` copy, and the
@@ -101,7 +104,8 @@ pub fn run(ctx: &TestContext) -> TestResult
 }
 
 /// Park the phase's children on copies of a fresh `source`, destroy the
-/// source, and take every child's verdict.
+/// source, and take every child's verdict; reap everything whatever the
+/// outcome.
 fn run_phase(ctx: &TestContext, source: Source) -> TestResult
 {
     let count = match source
@@ -111,40 +115,78 @@ fn run_phase(ctx: &TestContext, source: Source) -> TestResult
     };
     let done = cap_create_notification(ctx.memory_base)
         .map_err(|_| "integration::destroyed_source_interrupts: create done failed")?;
-    let (object, member) = create_source(ctx, source)?;
-
+    let (object, member) = match create_source(ctx, source)
+    {
+        Ok(created) => created,
+        Err(e) =>
+        {
+            let _ = cap_delete(done);
+            return Err(e);
+        }
+    };
+    let mut object = Some(object);
     let mut children: [Option<spawn::SpawnedChild>; MAX_CHILDREN] = [None, None];
+    let result = park_and_destroy(ctx, source, count, &mut object, done, &mut children);
+
+    // Deleting a thread tears the child down wherever it is, so a failed
+    // phase leaves no child parked on a stack the next phase reuses.
+    let mut reaped = true;
+    if let Some(obj) = object
+    {
+        reaped &= cap_revoke(obj).is_ok();
+        reaped &= cap_delete(obj).is_ok();
+    }
+    for child in children.iter().flatten()
+    {
+        reaped &= cap_delete(child.th).is_ok();
+        reaped &= cap_delete(child.cs).is_ok();
+    }
+    if let Some(m) = member
+    {
+        reaped &= cap_delete(m).is_ok();
+    }
+    reaped &= cap_delete(done).is_ok();
+    result?;
+    if reaped
+    {
+        Ok(())
+    }
+    else
+    {
+        Err("integration::destroyed_source_interrupts: teardown failed")
+    }
+}
+
+/// Start `count` children parked on `object`, destroy it (taking it out of
+/// `object`), and check every child's verdict.
+fn park_and_destroy(
+    ctx: &TestContext,
+    source: Source,
+    count: usize,
+    object: &mut Option<u32>,
+    done: u32,
+    children: &mut [Option<spawn::SpawnedChild>; MAX_CHILDREN],
+) -> TestResult
+{
+    let obj = object.ok_or("integration::destroyed_source_interrupts: no source")?;
     let mut acc = 0;
     for (index, slot) in children.iter_mut().enumerate().take(count)
     {
-        *slot = Some(start_child(ctx, source, object, done, index)?);
+        start_child(ctx, source, obj, done, index, slot)?;
         acc = wait_for(done, acc, BIT_READY << shift(index))?;
         thread_sleep(SETTLE_SLEEP_MS)
             .map_err(|_| "integration::destroyed_source_interrupts: settle sleep failed")?;
     }
-    // Revoke deletes the children's copies (derivation children of
-    // `object`); the delete then drops the last reference and runs the
-    // dealloc wake.
-    cap_revoke(object).map_err(|_| "integration::destroyed_source_interrupts: revoke failed")?;
-    cap_delete(object).map_err(|_| "integration::destroyed_source_interrupts: delete failed")?;
+    // Revoke deletes the children's copies (derivation children of the
+    // source); the delete then drops the last reference and runs the dealloc
+    // wake.
+    *object = None;
+    cap_revoke(obj).map_err(|_| "integration::destroyed_source_interrupts: revoke failed")?;
+    cap_delete(obj).map_err(|_| "integration::destroyed_source_interrupts: delete failed")?;
     for index in 0..count
     {
         acc = wait_for(done, acc, (BIT_OK | BIT_BAD) << shift(index))?;
     }
-
-    for child in children.iter().flatten()
-    {
-        cap_delete(child.th)
-            .map_err(|_| "integration::destroyed_source_interrupts: reap child thread failed")?;
-        cap_delete(child.cs)
-            .map_err(|_| "integration::destroyed_source_interrupts: reap child cspace failed")?;
-    }
-    if let Some(m) = member
-    {
-        cap_delete(m).map_err(|_| "integration::destroyed_source_interrupts: del member failed")?;
-    }
-    cap_delete(done).map_err(|_| "integration::destroyed_source_interrupts: del done failed")?;
-
     if (0..count).any(|index| acc & (BIT_BAD << shift(index)) != 0)
     {
         return Err(
@@ -189,17 +231,21 @@ fn shift(index: usize) -> u32
     index * CHILD_SHIFT
 }
 
-/// Start child `index` waiting on a copy of `object`.
+/// Start child `index` waiting on a copy of `object`, storing it in `slot`
+/// before anything can fail so the phase's teardown reaps it.
 fn start_child(
     ctx: &TestContext,
     source: Source,
     object: u32,
     done: u32,
     index: usize,
-) -> Result<spawn::SpawnedChild, &'static str>
+    slot: &mut Option<spawn::SpawnedChild>,
+) -> TestResult
 {
-    let child = spawn::new_child(ctx)
-        .map_err(|_| "integration::destroyed_source_interrupts: spawn child failed")?;
+    let child = slot.insert(
+        spawn::new_child(ctx)
+            .map_err(|_| "integration::destroyed_source_interrupts: spawn child failed")?,
+    );
     let c_object = cap_copy(object, child.cs, RIGHTS_ALL)
         .map_err(|_| "integration::destroyed_source_interrupts: cap_copy source failed")?;
     let c_done = cap_copy(done, child.cs, RIGHTS_SIGNAL)
@@ -226,18 +272,25 @@ fn start_child(
     };
     // SAFETY: stack `index` is this child's; reaped before the next phase.
     let stack = ChildStack::top(unsafe { core::ptr::addr_of!(CHILD_STACKS[index]) });
-    spawn::configure_and_start(&child, entry, stack, arg)
-        .map_err(|_| "integration::destroyed_source_interrupts: start child failed")?;
-    Ok(child)
+    spawn::configure_and_start(child, entry, stack, arg)
+        .map_err(|_| "integration::destroyed_source_interrupts: start child failed")
 }
 
-/// Accumulate `done` bits onto `acc` until any bit of `mask` is present.
+/// Accumulate `done` bits onto `acc` until any bit of `mask` is present,
+/// failing once a [`REPORT_MS`] wait passes with nothing new (a child that
+/// never parked, or a waiter the destroy never woke).
 fn wait_for(done: u32, mut acc: u64, mask: u64) -> Result<u64, &'static str>
 {
     while acc & mask == 0
     {
-        acc |= notification_wait(done)
-            .map_err(|_| "integration::destroyed_source_interrupts: notification_wait failed")?;
+        let bits = notification_wait_timeout(done, REPORT_MS).map_err(
+            |_| "integration::destroyed_source_interrupts: notification_wait_timeout failed",
+        )?;
+        if bits == 0
+        {
+            return Err("integration::destroyed_source_interrupts: a child never reported");
+        }
+        acc |= bits;
     }
     Ok(acc)
 }

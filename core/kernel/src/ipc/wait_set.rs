@@ -480,9 +480,10 @@ pub unsafe fn waitset_wait(
 /// pushes to `ready_ring` immediately.
 ///
 /// # Safety
-/// Must be called with the scheduler lock held.
-/// `source_ptr` must be a valid pointer to the source's state struct.
-/// The caller is responsible for setting the source's `wait_set` back-pointer.
+/// `ws` and `source_ptr` (the source's state struct) must be valid. The caller
+/// holds the source's lock, which is outer to the `ws.lock` taken here, and no
+/// scheduler lock (a ready-at-add wake runs under the source lock). The caller
+/// is responsible for setting the source's `wait_set` back-pointer.
 #[cfg(not(test))]
 pub unsafe fn waitset_add(
     ws: *mut WaitSetState,
@@ -557,7 +558,8 @@ pub unsafe fn waitset_add(
 /// Returns `Ok(())` if found, `Err(())` if not present.
 ///
 /// # Safety
-/// Must be called with the scheduler lock held.
+/// `ws` must be valid. The caller holds the source's lock, which is outer to
+/// the `ws.lock` taken here, and no scheduler lock.
 #[cfg(not(test))]
 pub unsafe fn waitset_remove(ws: *mut WaitSetState, source_ptr: *mut u8) -> Result<(), ()>
 {
@@ -668,14 +670,13 @@ pub unsafe fn wait_set_drop(
         }
     }
 
-    // Step 2: under ws.lock, claim the blocked waiter with its park stamped
-    // INTERRUPTED (the destroyed wait set cancels the wait; `SYS_WAIT_SET_WAIT`
-    // returns Interrupted); wake it after the unlock per § Lock Hierarchy
-    // rule 5.
+    // Step 2: under ws.lock, claim and wake the blocked waiter with its park
+    // stamped INTERRUPTED (the destroyed wait set cancels the wait;
+    // `SYS_WAIT_SET_WAIT` returns Interrupted).
     // SAFETY: lock owned by ws; matched unlock_raw below.
     let saved = unsafe { ws_ref.lock.lock_raw() };
-    // SAFETY: ws.lock held.
-    let detached = unsafe { crate::ipc::interrupt_all_waiters(&mut ws_ref.waiters) };
+    // SAFETY: ws.lock held; no scheduler or sleep-list lock held.
+    unsafe { crate::ipc::interrupt_all_waiters(&mut ws_ref.waiters) };
     for slot in &mut ws_ref.members
     {
         *slot = WaitSetMember::vacant();
@@ -683,8 +684,6 @@ pub unsafe fn wait_set_drop(
     ws_ref.member_count = 0;
     // SAFETY: paired with lock_raw above.
     unsafe { ws_ref.lock.unlock_raw(saved) };
-    // SAFETY: claimed above; no lock held.
-    unsafe { detached.wake() };
 
     zeroed
 }

@@ -171,11 +171,11 @@ pub const SYS_NOTIFICATION_SEND: u64 = 3;
 /// in the secondary register (rdx / a1). A notification wake always carries
 /// non-zero bits, because `notification_send` rejects zero-bit sends. A `0`
 /// bitmask with a `0` status means the timeout elapsed. A stop of the
-/// caller, or the destruction of the notification under it, returns
-/// `Interrupted`. The split avoids
-/// aliasing bit-63-set bitmasks with the dispatcher's negative-Err
-/// encoding — the full 64-bit bitmask range is usable. Same register
-/// layout as `SYS_EVENT_RECV`.
+/// caller, the destruction of the notification under it, or a later wait by
+/// another thread (which displaces it) returns `Interrupted`.
+/// The split avoids aliasing bit-63-set bitmasks with the dispatcher's
+/// negative-Err encoding — the full 64-bit bitmask range is usable. Same
+/// register layout as `SYS_EVENT_RECV`.
 pub const SYS_NOTIFICATION_WAIT: u64 = 4;
 /// `EventQueue`: post an entry.
 pub const SYS_EVENT_POST: u64 = 5;
@@ -192,10 +192,11 @@ pub const SYS_EVENT_POST: u64 = 5;
 ///
 /// On success returns `0` plus the payload in the secondary return
 /// register. A stop of the caller, or the destruction of the queue under
-/// it, returns `Interrupted`. Sentinel layout matches `SYS_NOTIFICATION_WAIT` (`0` = forever),
-/// but event-queue payloads may be any `u64` including 0, so the kernel
-/// uses an out-of-band `tcb.timed_out` marker instead of an in-band
-/// sentinel on the payload register.
+/// it, or a later blocking receive by another thread (which displaces it),
+/// returns `Interrupted`. Sentinel layout matches `SYS_NOTIFICATION_WAIT`
+/// (`0` = forever), but event-queue payloads may be any `u64` including 0,
+/// so the kernel uses an out-of-band `tcb.timed_out` marker instead of an
+/// in-band sentinel on the payload register.
 pub const SYS_EVENT_RECV: u64 = 6;
 /// Capability: create an `Endpoint` object.
 pub const SYS_CAP_CREATE_ENDPOINT: u64 = 7;
@@ -247,7 +248,8 @@ pub const SYS_CAP_MOVE: u64 = 25;
 pub const SYS_WAIT_SET_ADD: u64 = 26;
 /// `WaitSet`: remove a member.
 pub const SYS_WAIT_SET_REMOVE: u64 = 27;
-/// `WaitSet`: wait for any member to become ready.
+/// `WaitSet`: wait for any member to become ready. A later wait by another
+/// thread displaces the waiter, whose wait returns `Interrupted`.
 pub const SYS_WAIT_SET_WAIT: u64 = 28;
 /// IRQ: acknowledge a delivered interrupt.
 pub const SYS_IRQ_ACK: u64 = 29;
@@ -515,8 +517,10 @@ pub enum SyscallError
     /// The target object is not in the required state for this operation
     /// (e.g. thread not `Stopped` for `read_regs`/`write_regs`).
     InvalidState = -15,
-    /// A blocking operation was cancelled because the thread was stopped.
-    /// The stopped thread sees this as the return value of its blocked syscall.
+    /// A blocking operation was cancelled: the thread was stopped, the object
+    /// it was blocked on was destroyed, or another thread's wait displaced it
+    /// from a single-waiter object. The thread sees this as the return value
+    /// of its blocked syscall.
     Interrupted = -16,
     /// A structural per-object ceiling was reached (e.g. a `CSpace`'s
     /// directory is full). Unlike `OutOfMemory`, donating memory (augment

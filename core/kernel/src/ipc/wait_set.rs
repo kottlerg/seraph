@@ -348,6 +348,8 @@ pub unsafe fn waitset_notify(ws_opaque: *mut u8, member_idx: u8)
 
 /// Block `caller` until any member becomes ready, or return the next pending badge.
 ///
+/// - A thread already waiting is displaced first: its wait returns
+///   `Interrupted` (single-waiter invariant).
 /// - If the ready ring is non-empty, pops and returns `Ok(badge)` without blocking.
 /// - If empty, sets `caller` as waiter and returns `Err(())`.
 ///   The syscall handler calls `schedule()`, then reads `caller.wakeup_value`.
@@ -368,10 +370,25 @@ pub unsafe fn waitset_wait(
     // SAFETY: lock is owned by ws; matched unlock_raw on every return path.
     let saved = unsafe { ws.lock.lock_raw() };
 
+    // Displace any waiter: claimed under ws.lock (the slot is cleared
+    // here and rewritten below if the caller parks), woken after the unlock.
+    let displaced = ws.waiter;
+    if !displaced.is_null()
+    {
+        ws.waiter = core::ptr::null_mut();
+        // SAFETY: displaced is the parked waiter the slot named; ws.lock held.
+        unsafe { crate::ipc::claim_displaced_waiter(displaced) };
+    }
+
     if let Some(badge) = ws.pop_ready()
     {
         // SAFETY: paired with lock_raw above.
         unsafe { ws.lock.unlock_raw(saved) };
+        if !displaced.is_null()
+        {
+            // SAFETY: claimed above; no lock held.
+            unsafe { crate::ipc::wake_displaced_waiter(displaced) };
+        }
         return Ok(badge);
     }
 
@@ -400,6 +417,11 @@ pub unsafe fn waitset_wait(
         {
             // SAFETY: paired with lock_raw above.
             unsafe { ws.lock.unlock_raw(saved) };
+            if !displaced.is_null()
+            {
+                // SAFETY: claimed above; no lock held.
+                unsafe { crate::ipc::wake_displaced_waiter(displaced) };
+            }
             return Ok(badge);
         }
     }
@@ -450,6 +472,11 @@ pub unsafe fn waitset_wait(
     }
     // SAFETY: paired with lock_raw above.
     unsafe { ws.lock.unlock_raw(saved) };
+    if !displaced.is_null()
+    {
+        // SAFETY: claimed above; no lock held.
+        unsafe { crate::ipc::wake_displaced_waiter(displaced) };
+    }
     Err(())
 }
 

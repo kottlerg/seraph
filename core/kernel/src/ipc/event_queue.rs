@@ -7,7 +7,8 @@
 //!
 //! An event queue holds a fixed-capacity ring of `u64` payloads. Senders
 //! append entries (non-blocking; `QueueFull` if full). A single receiver
-//! dequeues in FIFO order, blocking if empty.
+//! dequeues in FIFO order, blocking if empty; a receive while another thread
+//! waits displaces it, and the displaced receive returns `Interrupted`.
 //!
 //! # Capacity
 //! The ring has `capacity + 1` slots internally (one-slot-gap full-detection).
@@ -158,10 +159,9 @@ pub unsafe fn event_queue_post(
                 .wake_in_flight
                 .store(1, core::sync::atomic::Ordering::Release);
         }
-        // If the waiter was registered with a `SYS_EVENT_RECV` timeout, it
-        // is also on the global sleep list. Remove it here, with the waiter
-        // slot; see `notification_send` for the lock order and why a 0
-        // deadline under the source lock means no entry.
+        // A timed waiter's sleep-list entry goes with the waiter slot, under
+        // eq.lock (docs/thread-lifecycle-and-sleep.md § Sleep List Invariants,
+        // invariant 7).
         // SAFETY: waiter is the TCB we just dequeued from eq.waiter.
         unsafe {
             if (*waiter)
@@ -254,9 +254,11 @@ pub unsafe fn event_queue_try_recv(eq: *mut EventQueueState) -> Option<u64>
 
 /// Dequeue the next entry from the event queue.
 ///
+/// - A thread already waiting is displaced first: its receive returns
+///   `Interrupted` (single-waiter invariant).
 /// - If an entry is available, returns `Ok(payload)`.
-/// - If empty, sets `caller` as the waiter and returns `Err(())`.
-///   Syscall handler must call `schedule()` then read `wakeup_value`.
+/// - If empty, sets `caller` as the waiter and returns `Err(())`. Syscall
+///   handler must call `schedule()` then read `wakeup_value`.
 ///
 /// # Safety
 /// `eq` and `caller` must be valid pointers; acquires `eq.lock` internally —
@@ -273,10 +275,25 @@ pub unsafe fn event_queue_recv(
     // SAFETY: lock serialises post/recv; paired with unlock_raw below.
     let saved = unsafe { eq.lock.lock_raw() };
 
+    // Displace any waiter: claimed under eq.lock (the slot is cleared
+    // here and rewritten below if the caller parks), woken after the unlock.
+    let displaced = eq.waiter;
+    if !displaced.is_null()
+    {
+        eq.waiter = core::ptr::null_mut();
+        // SAFETY: displaced is the parked waiter the slot named; eq.lock held.
+        unsafe { crate::ipc::claim_displaced_waiter(displaced) };
+    }
+
     if let Some(payload) = pop_entry_locked(eq)
     {
         // SAFETY: paired with lock_raw above.
         unsafe { eq.lock.unlock_raw(saved) };
+        if !displaced.is_null()
+        {
+            // SAFETY: claimed above; no lock held.
+            unsafe { crate::ipc::wake_displaced_waiter(displaced) };
+        }
         return Ok(payload);
     }
 
@@ -326,6 +343,11 @@ pub unsafe fn event_queue_recv(
     }
     // SAFETY: paired with lock_raw above.
     unsafe { eq.lock.unlock_raw(saved) };
+    if !displaced.is_null()
+    {
+        // SAFETY: claimed above; no lock held.
+        unsafe { crate::ipc::wake_displaced_waiter(displaced) };
+    }
     Err(())
 }
 

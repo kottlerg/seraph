@@ -745,8 +745,8 @@ pub fn notification_send(sig: u32, bits: u64) -> Result<(), i64>
 ///
 /// # Errors
 /// Returns a negative `i64` error code if the notification cap is invalid, or
-/// `Interrupted` if the caller is stopped while waiting or the notification is
-/// destroyed under it.
+/// `-16` (`Interrupted`) if the caller is stopped while waiting, the
+/// notification is destroyed under it, or another thread's wait displaces it.
 #[inline]
 pub fn notification_wait(sig: u32) -> Result<u64, i64>
 {
@@ -770,8 +770,8 @@ pub fn notification_wait(sig: u32) -> Result<u64, i64>
 ///
 /// # Errors
 /// Returns a negative `i64` error code if the notification cap is invalid, or
-/// `Interrupted` if the caller is stopped while waiting or the notification is
-/// destroyed under it.
+/// `-16` (`Interrupted`) if the caller is stopped while waiting, the
+/// notification is destroyed under it, or another thread's wait displaces it.
 #[inline]
 pub fn notification_wait_timeout(sig: u32, timeout_ms: u64) -> Result<u64, i64>
 {
@@ -1839,9 +1839,9 @@ pub fn event_post(queue_cap: u32, payload: u64) -> Result<(), i64>
 /// the payload is in the secondary return register (rdx / a1).
 ///
 /// # Errors
-/// Returns a negative `i64` error code if the queue cap is invalid, or
-/// `Interrupted` if the caller is stopped while waiting or the queue is
-/// destroyed under it.
+/// Returns a negative `i64` error code if the queue cap is invalid, or `-16`
+/// (`Interrupted`) if the caller is stopped while waiting, the queue is
+/// destroyed under it, or another thread's receive displaces it.
 #[inline]
 pub fn event_recv(queue_cap: u32) -> Result<u64, i64>
 {
@@ -1873,9 +1873,10 @@ pub fn event_try_recv(queue_cap: u32) -> Result<u64, i64>
 /// milliseconds, then returns `Err(-6)` (`WouldBlock`) if no post arrived.
 ///
 /// # Errors
-/// Returns `-6` (`WouldBlock`) on timeout or empty try-once, `Interrupted` if
-/// the caller is stopped while waiting or the queue is destroyed under it, or
-/// another negative `i64` error code on invalid cap.
+/// Returns `-6` (`WouldBlock`) on timeout or empty try-once; `-16`
+/// (`Interrupted`) if the caller is stopped while waiting, the queue is
+/// destroyed under it, or another thread's receive displaces it; or another
+/// negative `i64` error code on invalid cap.
 #[inline]
 pub fn event_recv_timeout(queue_cap: u32, timeout_ms: u64) -> Result<u64, i64>
 {
@@ -1964,8 +1965,8 @@ pub fn wait_set_remove(ws_cap: u32, source_cap: u32) -> Result<(), i64>
 ///
 /// # Errors
 /// Returns a negative `i64` error code if the wait set cap is invalid, or
-/// `Interrupted` if the caller is stopped while waiting or the wait set is
-/// destroyed under it.
+/// `-16` (`Interrupted`) if the caller is stopped while waiting, the wait set
+/// is destroyed under it, or another thread's wait displaces it.
 #[inline]
 pub fn wait_set_wait(ws_cap: u32) -> Result<u64, i64>
 {
@@ -2067,11 +2068,15 @@ pub fn ioport_bind(thread_cap: u32, ioport_cap: u32) -> Result<(), i64>
 
 /// Stop a running, ready, or blocked thread. The thread transitions to `Stopped`.
 ///
-/// If the thread was blocked on IPC, the blocking syscall returns `Interrupted`.
-/// A thread may stop itself (pass its own thread cap).
+/// If the thread was blocked (on IPC or in [`thread_sleep`]), or blocks while
+/// the stop is in progress, the blocking syscall returns `Interrupted` once
+/// the thread is restarted, unless its wake was claimed first. A thread may
+/// stop itself (pass its own thread cap).
 ///
 /// # Errors
-/// Returns a negative `i64` error code if the thread cap is invalid.
+/// Returns a negative `i64` error code if the thread cap is invalid or lacks
+/// Control rights, or `-15` (`InvalidState`) if the thread is not yet
+/// started, already stopped, or exited.
 #[inline]
 pub fn thread_stop(thread_cap: u32) -> Result<(), i64>
 {
@@ -2354,7 +2359,9 @@ pub fn sbi_call(
 /// the deadline expires.
 ///
 /// # Errors
-/// Returns a negative `i64` error code on failure.
+/// Returns `-16` (`Interrupted`) if the thread is stopped before or during
+/// the sleep (and restarted), `-8` (`OutOfMemory`) if the kernel's sleep list
+/// is full, or another negative `i64` error code on failure.
 #[inline]
 pub fn thread_sleep(ms: u64) -> Result<(), i64>
 {

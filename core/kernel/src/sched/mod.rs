@@ -1382,7 +1382,7 @@ fn watchdog_dump(reason: &str)
 
 /// Decode and print the IPC object a `Blocked` thread is parked on, for the
 /// softlockup watchdog dump. The telling field is whether the object still
-/// names `t` as its waiter (the wake was never issued) or has been cleared /
+/// queues `t` as a waiter (the wake was never issued) or has dequeued it /
 /// carries data while `t` is still `Blocked` (the wake was lost between the
 /// waker's deposit and the run-queue link) — the #351 lost-wakeup signature.
 ///
@@ -1412,16 +1412,16 @@ unsafe fn watchdog_decode_blocked_on(t: *mut ThreadControlBlock)
         {
             let eq = blocked_on.cast::<crate::ipc::event_queue::EventQueueState>();
             // SAFETY: ipc_state classifies blocked_on as an EventQueueState.
-            let (waiter_is_self, count, capacity) = unsafe {
+            let (queued, count, capacity) = unsafe {
                 (
-                    core::ptr::eq((*eq).waiter, t),
+                    (*eq).waiters.contains(t),
                     (*eq).count.load(Ordering::Relaxed),
                     (*eq).capacity,
                 )
             };
             crate::kprintln!(
-                "      eq: waiter_is_self={} count={} capacity={}",
-                waiter_is_self,
+                "      eq: queued={} count={} capacity={}",
+                queued,
                 count,
                 capacity
             );
@@ -1430,17 +1430,13 @@ unsafe fn watchdog_decode_blocked_on(t: *mut ThreadControlBlock)
         {
             let sig = blocked_on.cast::<crate::ipc::notification::NotificationState>();
             // SAFETY: ipc_state classifies blocked_on as a NotificationState.
-            let (waiter_is_self, bits) = unsafe {
+            let (queued, bits) = unsafe {
                 (
-                    core::ptr::eq((*sig).waiter, t),
+                    (*sig).waiters.contains(t),
                     (*sig).bits.load(Ordering::Relaxed),
                 )
             };
-            crate::kprintln!(
-                "      notif: waiter_is_self={} bits=0x{:x}",
-                waiter_is_self,
-                bits
-            );
+            crate::kprintln!("      notif: queued={} bits=0x{:x}", queued, bits);
         }
         IpcThreadState::BlockedOnReply | IpcThreadState::BlockedOnFault =>
         {
@@ -1472,8 +1468,8 @@ unsafe fn watchdog_decode_blocked_on(t: *mut ThreadControlBlock)
         {
             let ws = blocked_on.cast::<crate::ipc::wait_set::WaitSetState>();
             // SAFETY: ipc_state classifies blocked_on as a WaitSetState.
-            let waiter_is_self = unsafe { core::ptr::eq((*ws).waiter, t) };
-            crate::kprintln!("      waitset: waiter_is_self={}", waiter_is_self);
+            let queued = unsafe { (*ws).waiters.contains(t) };
+            crate::kprintln!("      waitset: queued={}", queued);
         }
         IpcThreadState::None =>
         {}
@@ -1722,10 +1718,10 @@ pub fn sleep_wakeups_quiesce()
 /// A popped entry is a plain sleeper (`ipc_state == None`), claimed at the
 /// pop, or a timed notification / event-queue waiter, which the timer
 /// arbitrates against the source's other wakers under the source lock: it
-/// claims only while it is still the source's registered waiter. Every other
-/// waiter-slot claimer removes the entry under that source lock, so no other
-/// binding can be popped (docs/thread-lifecycle-and-sleep.md § Sleep List
-/// Invariants).
+/// claims only while the thread is still queued there in the popped park.
+/// Every other waiter claimer removes the entry under that source lock, so no
+/// other binding can be popped (docs/thread-lifecycle-and-sleep.md § Sleep
+/// List Invariants).
 // too_many_lines: flat dispatch over every claimable `IpcThreadState`
 // (notification, event queue, plain sleep); each arm is independent and
 // short, and splitting would require duplicating the SLEEP_LIST snapshot
@@ -1867,37 +1863,31 @@ pub fn sleep_check_wakeups()
                 // dealloc quiesces this batch); lock serialises against
                 // notification_send.
                 let saved_sig = unsafe { (*sig_state).lock.lock_raw() };
-                // Claim only the park that was popped: the waiter slot may name
-                // the same TCB again in a later wait (claimed by a sender and
-                // re-parked since the pop), whose park_seq differs. The slot is
-                // published and park_seq advanced under sig.lock, so both reads
-                // are stable here, and tcb is alive while the slot names it.
-                // SAFETY: same as above.
+                // Claim only the park that was popped: the queue may hold the
+                // same TCB again in a later wait (claimed by a sender and
+                // re-parked since the pop), whose park_seq differs. The queue
+                // and park_seq are both written under sig.lock, so the reads are
+                // stable here, and tcb is alive while queued.
+                // SAFETY: same as above; tcb is dereferenced only once found
+                // queued.
                 let we_win = unsafe {
-                    (*sig_state).waiter == tcb
+                    (*sig_state).waiters.contains(tcb)
                         && (*tcb).park_seq.load(core::sync::atomic::Ordering::Relaxed) == park_seq
                 };
                 if we_win
                 {
-                    // SAFETY: we hold sig.lock and sig.waiter == tcb, so a
-                    // dealloc(tcb) BlockedOnNotification unlink (which needs
-                    // sig.lock to clear the waiter) cannot have freed tcb yet.
-                    // Claim it for wake under sig.lock: set wake_in_flight = 1
-                    // before the TCB writes so a concurrent dealloc(tcb) waits at
-                    // its gate (#160); cleared by enqueue_and_wake. wakeup_value=0
-                    // is the timeout marker (notification_send rejects 0-bit
-                    // sends). State/ipc_state/blocked_on are committed by
-                    // enqueue_and_wake under sched.lock.
+                    // Claim it for wake under sig.lock: removing it from the
+                    // queue is the claim, and wake_in_flight = 1 makes a
+                    // concurrent dealloc(tcb) (whose unlink needs sig.lock) wait
+                    // at its gate (#160); cleared by enqueue_and_wake.
+                    // wakeup_value = 0 is the timeout marker (notification_send
+                    // rejects 0-bit sends). State/ipc_state/blocked_on are
+                    // committed by enqueue_and_wake under sched.lock.
+                    // SAFETY: tcb is queued on sig_state; sig.lock held.
                     unsafe {
-                        (*tcb)
-                            .wake_in_flight
-                            .store(1, core::sync::atomic::Ordering::Release);
-                        (*sig_state).waiter = core::ptr::null_mut();
-                        (*sig_state).has_observer.store(
-                            u8::from(!(*sig_state).wait_set.is_null()),
-                            core::sync::atomic::Ordering::Relaxed,
-                        );
-                        (*tcb).wakeup_value = 0;
+                        (*sig_state).waiters.remove(tcb);
+                        crate::ipc::claim_waiter(tcb, 0);
+                        (*sig_state).refresh_observer();
                     }
                 }
                 // SAFETY: paired with lock_raw above.
@@ -1920,29 +1910,23 @@ pub fn sleep_check_wakeups()
                 // path is eq.lock → SLEEP_LIST_LOCK).
                 let saved_eq = unsafe { (*eq_state).lock.lock_raw() };
                 // Claim only the park that was popped (see the notification
-                // arm); the slot and park_seq are written under eq.lock.
-                // SAFETY: same as above.
+                // arm); the queue and park_seq are written under eq.lock.
+                // SAFETY: same as above; tcb is dereferenced only once found
+                // queued.
                 let we_win = unsafe {
-                    (*eq_state).waiter == tcb
+                    (*eq_state).waiters.contains(tcb)
                         && (*tcb).park_seq.load(core::sync::atomic::Ordering::Relaxed) == park_seq
                 };
                 if we_win
                 {
-                    // SAFETY: we hold eq.lock and eq.waiter == tcb, so a
-                    // dealloc(tcb) BlockedOnEventQueue unlink (which needs eq.lock
-                    // to clear the waiter) cannot have freed tcb yet. Claim it for
-                    // wake under eq.lock: set wake_in_flight = 1 before the TCB
-                    // writes so a concurrent dealloc(tcb) waits at its gate (#160);
-                    // cleared by enqueue_and_wake. Event payloads can be any u64
-                    // (including 0); `timed_out` is the out-of-band timeout marker,
-                    // read-and-cleared by sys_event_recv on resume. State/etc.
-                    // committed by enqueue_and_wake.
+                    // Claim it for wake under eq.lock, as in the notification
+                    // arm. Event payloads can be any u64 (including 0);
+                    // `timed_out` is the out-of-band timeout marker,
+                    // read-and-cleared by sys_event_recv on resume.
+                    // SAFETY: tcb is queued on eq_state; eq.lock held.
                     unsafe {
-                        (*tcb)
-                            .wake_in_flight
-                            .store(1, core::sync::atomic::Ordering::Release);
-                        (*eq_state).waiter = core::ptr::null_mut();
-                        (*tcb).wakeup_value = 0;
+                        (*eq_state).waiters.remove(tcb);
+                        crate::ipc::claim_waiter(tcb, 0);
                         (*tcb).timed_out = true;
                     }
                 }

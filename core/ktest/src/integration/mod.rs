@@ -48,8 +48,8 @@
 //! - `park_interrupted_stop_start.rs` — a thread stopped while parked in any non-call blocking syscall (notification/event/recv/wait-set/sleep) restarts to `Interrupted`, never a stale deposit (#363)
 //! - `destroyed_source_interrupts.rs` — a waiter on a notification, event queue, or wait set
 //!   destroyed under it returns `Interrupted`, never a fabricated success
-//! - `second_waiter_displaces.rs` — a second thread's wait on a notification, event queue, or
-//!   wait set displaces the parked one, whose wait returns `Interrupted`
+//! - `queued_waiters_fifo.rs` — threads waiting on one notification, event queue, or wait set
+//!   queue in arrival order; each delivery wakes the longest-waiting one
 //! - Architecture-only scenarios live behind `crate::arch` (`run_integration`);
 //!   per-arch helpers and branches inside the scenarios above are still gated in
 //!   place (#460).
@@ -76,9 +76,9 @@ pub mod memory_lifecycle;
 pub mod multi_caller_ipc_fifo;
 pub mod park_interrupted_stop_start;
 pub mod priority_preemption;
+pub mod queued_waiters_fifo;
 pub mod retype_reclaim;
 pub mod retype_subpage_clobber;
-pub mod second_waiter_displaces;
 pub mod shared_memory_two_aspaces;
 pub mod thread_lifecycle;
 pub mod tlb_coherency;
@@ -127,8 +127,8 @@ pub fn run_all(ctx: &TestContext)
         destroyed_source_interrupts::run(ctx)
     );
     run_integration_test!(
-        "integration::second_waiter_displaces",
-        second_waiter_displaces::run(ctx)
+        "integration::queued_waiters_fifo",
+        queued_waiters_fifo::run(ctx)
     );
     run_integration_test!(
         "integration::cap_delegation_chain",

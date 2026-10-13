@@ -460,9 +460,8 @@ pub struct ProcessInfo
     //                      writer awaits this when the ring is full.
     //
     // Both processes hold caps to both notifications (kernel notification objects do
-    // not distinguish send/wait rights at the cap level). Single-waiter
-    // invariant holds because at most one side blocks on each notification at
-    // any given moment.
+    // not distinguish send/wait rights at the cap level). At most one side
+    // blocks on each notification at any given moment.
     //
     // Zero in any slot means the corresponding notification is not attached;
     // the AnonPipe peer treats `notification_wait` as a no-op and falls back

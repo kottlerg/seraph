@@ -209,10 +209,9 @@ pub enum SyscallError
     /// The target object is not in the required state for this operation
     /// (e.g. thread not `Stopped` for `read_regs`/`write_regs`).
     InvalidState = -15,
-    /// A blocking operation was cancelled: the thread was stopped, the object
-    /// it was blocked on was destroyed, or another thread's wait displaced it
-    /// from a single-waiter object. The thread sees this as the return value
-    /// of its blocked syscall.
+    /// A blocking operation was cancelled: the thread was stopped, or the
+    /// object it was blocked on was destroyed. The thread sees this as the
+    /// return value of its blocked syscall.
     Interrupted = -16,
     /// A structural per-object ceiling was reached (e.g. a `CSpace`'s
     /// directory is full). Unlike `OutOfMemory`, donating memory (augment
@@ -422,9 +421,11 @@ full 64-bit bitmask range is usable.
 
 **Capability requirement:** `notification_cap` must have Wait rights.
 
-**Errors:** `InvalidCapability`, `InsufficientRights`, `Interrupted` (the caller was stopped, the
-notification was destroyed while the caller waited, or a later wait by another thread displaced
-the caller — the notification takes one waiter).
+**Errors:** `InvalidCapability`, `InsufficientRights`, `Interrupted` (the caller was stopped, or the
+notification was destroyed while the caller waited).
+
+Several threads may wait on one notification. They queue in arrival order, and each delivery wakes
+the longest-waiting one with every pending bit.
 
 ---
 
@@ -475,8 +476,9 @@ Dequeue the next entry from an event queue with optional bounded wait.
 **Capability requirement:** `queue_cap` must have Recv rights.
 
 **Errors:** `InvalidCapability`, `InsufficientRights`, `WouldBlock`, `Interrupted` (the caller was
-stopped, the queue was destroyed while the caller was parked, or a later blocking receive by
-another thread displaced the caller — the queue takes one waiter).
+stopped, or the queue was destroyed while the caller was parked).
+
+Blocked receivers queue in arrival order; each post wakes the longest-waiting one.
 
 `WouldBlock` covers both the try-once-empty case and the timer-fired case;
 the caller already knows which mode it asked for. The kernel uses an
@@ -1545,8 +1547,8 @@ are ready simultaneously, subsequent calls return them without blocking (see
 **Capability requirement:** `wait_set_cap` must have Wait rights.
 
 **Errors:** `InvalidCapability`, `InsufficientRights` (cap lacks Wait), `Interrupted` (the caller
-was stopped, the wait set was destroyed while the caller waited, or a later wait by another thread
-displaced the caller — the set takes one waiter).
+was stopped, or the wait set was destroyed while the caller waited). Blocked waiters queue in
+arrival order; each ready member wakes the longest-waiting one.
 
 ---
 
@@ -2168,8 +2170,7 @@ intact (see [capability-internals.md](capability-internals.md) § Safe Delegatio
   `SYS_THREAD_STOP`, unless its wake (a delivery, or a sleep's elapsed deadline) was claimed
   first. `SYS_IPC_CALL` and `SYS_IPC_RECV` queued on an endpoint,
   `SYS_NOTIFICATION_WAIT`, `SYS_EVENT_RECV`, and `SYS_WAIT_SET_WAIT` also return `Interrupted`
-  when the object waited on is destroyed under the caller; the last three also when another
-  thread's wait on the same object displaces the caller.
+  when the object waited on is destroyed under the caller.
 
 ---
 

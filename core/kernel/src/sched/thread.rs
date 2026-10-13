@@ -366,10 +366,12 @@ pub unsafe fn consume_park_interrupted(tcb: *mut ThreadControlBlock) -> bool
 /// Per-thread kernel state.
 ///
 /// # Safety invariant
-/// `run_queue_next` and `ipc_wait_next` are raw intrusive pointers. They are
-/// only valid when the TCB is on a run queue or IPC wait queue respectively.
-/// `run_queue_next` is serialised by the owning CPU's `PerCpuScheduler` lock,
-/// `ipc_wait_next` by the lock of the IPC source whose queue links the TCB.
+/// `run_queue_next`, `ipc_wait_next` and `ipc_wait_prev` are raw intrusive
+/// pointers. They are only valid when the TCB is on a run queue or IPC wait
+/// queue respectively. `run_queue_next` is serialised by the owning CPU's
+/// `PerCpuScheduler` lock; `ipc_wait_next`, `ipc_wait_prev` and the
+/// `ipc_wait_queue` tag by the lock of the IPC source whose queue links the
+/// TCB (the tag is also read racily by the softlockup watchdog).
 #[repr(C)]
 pub struct ThreadControlBlock
 {
@@ -491,8 +493,19 @@ pub struct ThreadControlBlock
     #[cfg(debug_assertions)]
     pub deposit_episode: core::sync::atomic::AtomicU32,
 
-    /// Intrusive IPC wait-queue link.
+    /// Intrusive IPC wait-queue link: the successor on an endpoint queue, or
+    /// on an [`ipc::WaitQueue`](crate::ipc::WaitQueue).
     pub ipc_wait_next: Option<*mut ThreadControlBlock>,
+
+    /// Predecessor on an [`ipc::WaitQueue`](crate::ipc::WaitQueue) (null off
+    /// one; endpoint queues do not use it).
+    pub ipc_wait_prev: *mut ThreadControlBlock,
+
+    /// The [`ipc::WaitQueue`](crate::ipc::WaitQueue) linking this TCB, or
+    /// null. Written under that queue's source lock; it names a queue only
+    /// while the TCB is on it, so a holder of one source lock can test
+    /// membership of its own queue without walking it.
+    pub ipc_wait_queue: core::sync::atomic::AtomicPtr<crate::ipc::WaitQueue>,
 
     // === Fault-handler binding ===
     /// Bound fault-handler endpoint object (`null` = none). Kernel-unresolvable

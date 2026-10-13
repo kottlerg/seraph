@@ -1129,6 +1129,8 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 #[cfg(debug_assertions)]
                 deposit_episode: core::sync::atomic::AtomicU32::new(0),
                 ipc_wait_next: None,
+                ipc_wait_prev: core::ptr::null_mut(),
+                ipc_wait_queue: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
                 fault_handler: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
                 fault_badge: core::sync::atomic::AtomicU64::new(0),
                 fault_outcome: core::sync::atomic::AtomicU8::new(0),

@@ -230,10 +230,10 @@ shared/ipc policy block.
 
 ## Kernel Role
 
-The kernel delivers messages, manages endpoint queuing and the waiter queues of notifications
-and event queues, and transfers capability references all-or-nothing with messages (see
-§ Message Format). It has no opinion on
-message content, service protocols, or what capabilities mean to the receiving process.
+The kernel delivers messages, manages endpoint queuing and the waiters of notifications, event
+queues, and wait sets, and transfers capability references all-or-nothing with messages (see
+§ Message Format). It has no opinion on message content, service protocols, or what capabilities
+mean to the receiving process.
 
 The kernel does not provide:
 - Service discovery — endpoint capabilities are delegated by init or a parent

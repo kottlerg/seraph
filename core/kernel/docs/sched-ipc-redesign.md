@@ -159,7 +159,7 @@ which the `enqueue_and_wake` gate and its callers preserve:
    both the stop/exit and the refuse-to-park case because the post-`schedule()`
    outcome is **state-driven**, not return-value-driven.
 3. Each primitive's `!committed` rollback MUST NOT clobber the deposited field
-   (it may clear only the waiter slot + restore `context_saved`). This holds for
+   (it may clear only the waiter-queue entry + restore `context_saved`). This holds for
    every primitive — `notification_wait`, `event_queue_recv`, `waitset_wait`, and
    the three endpoint sites (binding rule: [scheduling-internals.md](scheduling-internals.md)
    § Lock Hierarchy).
@@ -178,7 +178,7 @@ parking CPU cannot be preempted into `Ready` mid-registration — a thread goes
 it is a pending-but-unparked waiter; and (2) a remote waker needs that same
 source lock, so it can only run after the parker has committed `Blocked`.
 Therefore a thread a waker observes as `Ready` is ALWAYS an already-woken thread
-(its waiter slot was cleared by the wake that made it `Ready`), i.e. a stale
+(its waiter-queue entry was removed by the wake that made it `Ready`), i.e. a stale
 duplicate — never a wake-before-park case ([scheduling-internals.md](scheduling-internals.md)
 § Lock Hierarchy). Dropping it loses nothing, and there
 is no "preempted-mid-registration" window that would require `wake_pending` on

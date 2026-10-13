@@ -1299,65 +1299,25 @@ pub fn sys_notification_wait(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // SAFETY: tcb is the running caller, not yet claimable.
     unsafe { crate::sched::thread::open_park_episode(tcb) };
 
+    // A timed wait is armed on the sleep list inside notification_wait's
+    // sig.lock critical section, so the syscall never locks the notification
+    // again once the caller is a claimable waiter.
+    let deadline = if timeout_ms == 0
+    {
+        0
+    }
+    else
+    {
+        crate::sched::sleep_deadline_after_ms(timeout_ms)
+    };
     // SAFETY: sig_state extracted from validated Notification object.
-    let result = unsafe { crate::ipc::notification::notification_wait(sig_state, tcb) };
+    let result = unsafe { crate::ipc::notification::notification_wait(sig_state, tcb, deadline) };
 
     if let Ok(bits) = result
     {
         // Bits were already set; deliver bitmask in secondary register.
         tf.set_ipc_return(0, bits);
         return Ok(0);
-    }
-
-    // For a timed wait, arm the sleep list. Re-acquire sig.lock and check
-    // that `tcb` is still queued first: a concurrent notification_send may
-    // have woken us already; arming unconditionally would leave a stale entry
-    // that hijacks a later unrelated notification_wait. See
-    // docs/thread-lifecycle-and-sleep.md § Sleep List Invariants rule 8.
-    if timeout_ms != 0
-    {
-        let deadline = crate::sched::sleep_deadline_after_ms(timeout_ms);
-        // SAFETY: sig_state validated above; lock_raw paired with unlock_raw.
-        let saved = unsafe { (*sig_state).lock.lock_raw() };
-        // SAFETY: sig_state valid; sig.lock held, so the waiter queue and every
-        // TCB on it are stable.
-        let still_waiter = unsafe { (*sig_state).waiters.contains(tcb) };
-        if still_waiter
-        {
-            // SAFETY: tcb valid; sig.lock held excludes notification_send wake.
-            unsafe {
-                (*tcb)
-                    .sleep_deadline
-                    .store(deadline, core::sync::atomic::Ordering::Relaxed);
-            }
-            // SAFETY: tcb is the running caller.
-            let added = unsafe { crate::sched::sleep_list_add(tcb) };
-            // Every canceller clears the deadline only after claiming the
-            // waiter under sig.lock, which this arm holds with tcb still
-            // queued.
-            debug_assert!(
-                added != Err(crate::sched::SleepAddError::Cancelled),
-                "notification_wait: timed arm cancelled under sig.lock"
-            );
-            if added == Err(crate::sched::SleepAddError::Full)
-            {
-                // Sleep list full: fall back to indefinite wait — the IPC
-                // source can still wake us, only the timeout is lost.
-                crate::kprintln!(
-                    "kernel: sleep_list capacity reached ({}); notification_wait \
-                     falling back to indefinite wait",
-                    crate::sched::MAX_SLEEPING,
-                );
-                // SAFETY: tcb valid; sig.lock held.
-                unsafe {
-                    (*tcb)
-                        .sleep_deadline
-                        .store(0, core::sync::atomic::Ordering::Relaxed);
-                }
-            }
-        }
-        // SAFETY: paired with lock_raw above.
-        unsafe { (*sig_state).lock.unlock_raw(saved) };
     }
 
     // Yield CPU.
@@ -1526,8 +1486,19 @@ pub fn sys_event_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // SAFETY: tcb is the running caller, not yet claimable.
     unsafe { crate::sched::thread::open_park_episode(tcb) };
 
+    // A bounded wait is armed on the sleep list inside event_queue_recv's
+    // eq.lock critical section, so the syscall never locks the queue again
+    // once the caller is a claimable waiter.
+    let deadline = if timeout_ms == 0
+    {
+        0
+    }
+    else
+    {
+        crate::sched::sleep_deadline_after_ms(timeout_ms)
+    };
     // SAFETY: eq_state extracted from validated EventQueue object.
-    let result = unsafe { crate::ipc::event_queue::event_queue_recv(eq_state, tcb) };
+    let result = unsafe { crate::ipc::event_queue::event_queue_recv(eq_state, tcb, deadline) };
 
     if let Ok(payload) = result
     {
@@ -1538,55 +1509,7 @@ pub fn sys_event_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // Queue was empty; `event_queue_recv` queued `tcb` on `eq.waiters` (or a
     // stop/wake_pending refusal rolled the park back — both outcomes resolve
-    // through `schedule()` below). Arm the sleep timer for a bounded wait.
-
-    // Bounded wait: arm the sleep-list timer. Same waiter-recheck rule as
-    // sys_notification_wait — see docs/thread-lifecycle-and-sleep.md
-    // § Sleep List Invariants rule 8.
-    if timeout_ms != 0
-    {
-        let deadline = crate::sched::sleep_deadline_after_ms(timeout_ms);
-        // SAFETY: eq_state validated above; lock_raw paired with unlock_raw.
-        let saved = unsafe { (*eq_state).lock.lock_raw() };
-        // SAFETY: eq_state valid; eq.lock held, so the waiter queue and every
-        // TCB on it are stable.
-        let still_waiter = unsafe { (*eq_state).waiters.contains(tcb) };
-        if still_waiter
-        {
-            // SAFETY: tcb valid; eq.lock held excludes event_queue_post wake.
-            unsafe {
-                (*tcb)
-                    .sleep_deadline
-                    .store(deadline, core::sync::atomic::Ordering::Relaxed);
-            }
-            // SAFETY: tcb is the running caller.
-            let added = unsafe { crate::sched::sleep_list_add(tcb) };
-            // Every canceller clears the deadline only after claiming the
-            // waiter under eq.lock, which this arm holds with tcb still
-            // queued.
-            debug_assert!(
-                added != Err(crate::sched::SleepAddError::Cancelled),
-                "event_recv: timed arm cancelled under eq.lock"
-            );
-            if added == Err(crate::sched::SleepAddError::Full)
-            {
-                // Sleep list full: fall back to indefinite wait.
-                crate::kprintln!(
-                    "kernel: sleep_list capacity reached ({}); event_recv \
-                     falling back to indefinite wait",
-                    crate::sched::MAX_SLEEPING,
-                );
-                // SAFETY: tcb valid; eq.lock held.
-                unsafe {
-                    (*tcb)
-                        .sleep_deadline
-                        .store(0, core::sync::atomic::Ordering::Relaxed);
-                }
-            }
-        }
-        // SAFETY: paired with lock_raw above.
-        unsafe { (*eq_state).lock.unlock_raw(saved) };
-    }
+    // through `schedule()` below).
 
     // Yield CPU.
     // SAFETY: scheduler initialized; called from syscall context.

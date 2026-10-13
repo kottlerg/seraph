@@ -1963,9 +1963,9 @@ pub fn wait_set_remove(ws_cap: u32, source_cap: u32) -> Result<(), i64>
 /// If multiple sources are ready, each call returns one badge without re-blocking.
 ///
 /// # Errors
-/// Returns a negative `i64` error code if the wait set cap is invalid; `-15`
-/// (`InvalidState`) if another thread already waits on the set (a wait set
-/// takes one waiter); `-16` (`Interrupted`) if the caller is stopped while
+/// Returns a negative `i64` error code if the wait set cap is invalid or lacks
+/// Wait rights; `-15` (`InvalidState`) if another thread already waits on the
+/// set (a wait set takes one waiter); `-16` (`Interrupted`) if the caller is stopped while
 /// waiting or the wait set is destroyed under it.
 #[inline]
 pub fn wait_set_wait(ws_cap: u32) -> Result<u64, i64>

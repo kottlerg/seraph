@@ -209,6 +209,12 @@ pub fn sys_thread_start(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         // and sys_thread_stop use. A Created (never-dispatched) thread is
         // `current` nowhere, so first-start returns from the drain immediately.
         crate::sched::await_descheduled(target_tcb);
+        // A waker that claimed the stopped park may not have linked it yet;
+        // let its wake land on the Stopped thread (and abort) before the
+        // restart, or it would link a later park. See
+        // docs/thread-lifecycle-and-sleep.md § `sys_thread_stop` Cross-CPU
+        // Stop Protocol.
+        crate::sched::await_owed_wake(target_tcb);
         // All-CPU lock commit closes the cross-CPU dealloc race; see
         // docs/thread-lifecycle-and-sleep.md § Lifecycle State Machine. The
         // target is now not-`current` and unlinked, so the force-link below

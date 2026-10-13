@@ -30,7 +30,7 @@
 //!   not panic)
 //! - `notification.rs`   — notification send and wait (blocking and timeout)
 //! - `event.rs`    — event queue post and receive (blocking, try, timeout)
-//! - `wait_set.rs` — wait set add, remove, wait
+//! - `wait_set.rs` — wait set add, remove, wait, and the occupied-set refusal
 //! - `ipc.rs`      — IPC call, reply, recv, buffer set
 //! - `thread.rs`   — thread lifecycle, register read/write, priority, affinity, sleep, `bind_notification`
 //! - `fpu.rs`      — FPU / SIMD / V extended-state isolation across preemption and cross-CPU migration
@@ -391,6 +391,10 @@ pub fn run_all(ctx: &TestContext)
         wait_set::add_queue_immediate(ctx)
     );
     run_test!("wait_set::blocking_wait", wait_set::blocking_wait(ctx));
+    run_test!(
+        "wait_set::occupied_wait_refused",
+        wait_set::occupied_wait_refused(ctx)
+    );
     run_test!("wait_set::remove", wait_set::remove(ctx));
     run_test!(
         "wait_set::source_notification_pinned_by_member",

@@ -370,9 +370,9 @@ pub const SPIN_SITE_SCHED_CONTEXT_SAVED: u32 = 4;
 /// `dealloc_object(AddressSpace)` root-free gate: spinning until no CPU has
 /// the dying address space loaded (`active_cpus` empty).
 pub const SPIN_SITE_DEALLOC_AS_ACTIVE: u32 = 5;
-/// Notification / `EventQueue` dealloc gate: spinning until the timer batch
-/// that may have snapshotted the dying source finishes dispatching
-/// ([`sleep_wakeups_quiesce`]).
+/// Notification / `EventQueue` / Thread dealloc gate: spinning until the timer
+/// batch that may have snapshotted the dying source or TCB finishes
+/// dispatching ([`sleep_wakeups_quiesce`]).
 pub const SPIN_SITE_DEALLOC_TIMER_DISPATCH: u32 = 6;
 
 /// Per-CPU breadcrumb naming the bounded protocol-spin a CPU is currently
@@ -382,8 +382,9 @@ pub const SPIN_SITE_DEALLOC_TIMER_DISPATCH: u32 = 6;
 /// Set on gate entry, cleared on exit; [`SPIN_SITE_NONE`] when not spinning.
 /// The reporting sites are the three `dealloc_object(Thread)` gates (the
 /// first of which `stop_threads_bound_to`'s phase-2 spin shares), the
-/// `dealloc_object(AddressSpace)` root-free gate, the Notification and
-/// `EventQueue` timer-dispatch gate, and the `schedule()`
+/// `dealloc_object(AddressSpace)` root-free gate, the timer-dispatch gate the
+/// Notification, `EventQueue`, and Thread dealloc arms share, and the
+/// `schedule()`
 /// context-saved dispatch barrier — the protocol spins that can wedge a CPU
 /// silently (the `sys_thread_stop` drain carries its own overlong-duration
 /// warning). Diagnostic-only — never gates control flow.
@@ -1380,6 +1381,24 @@ fn watchdog_dump(reason: &str)
     crate::kprintln!("=== END WATCHDOG ===");
 }
 
+/// Node bound on the watchdog's lock-free waiter-queue walk: far above any
+/// real queue, low enough that a queue mutated or corrupted under the walk
+/// cannot hang the dump.
+#[cfg(not(test))]
+const WATCHDOG_QUEUE_WALK: usize = 4096;
+
+/// `"true"`, `"false"`, or `"?"` (walk bound hit) for a watchdog queue probe.
+#[cfg(not(test))]
+fn queued_label(probe: Option<bool>) -> &'static str
+{
+    match probe
+    {
+        Some(true) => "true",
+        Some(false) => "false",
+        None => "?",
+    }
+}
+
 /// Decode and print the IPC object a `Blocked` thread is parked on, for the
 /// softlockup watchdog dump. The telling field is whether the object still
 /// queues `t` as a waiter (the wake was never issued) or has dequeued it /
@@ -1388,8 +1407,8 @@ fn watchdog_dump(reason: &str)
 ///
 /// # Safety
 /// `t` is a registry-walked TCB pointer held stable by the registry lock. All
-/// reads are benign-racy by the watchdog's already-stalled contract; the
-/// blocking object is read without its lock (the kernel is wedged).
+/// reads are benign-racy diagnostics: the blocking object is read without its
+/// lock, and the waiter-queue probe is bounded (`WaitQueue::contains_racy`).
 #[cfg(not(test))]
 // cast_ptr_alignment: blocked_on_object is stored as *mut u8 but always points
 // at a properly-aligned IPC object whose concrete type is named by ipc_state;
@@ -1411,10 +1430,12 @@ unsafe fn watchdog_decode_blocked_on(t: *mut ThreadControlBlock)
         IpcThreadState::BlockedOnEventQueue =>
         {
             let eq = blocked_on.cast::<crate::ipc::event_queue::EventQueueState>();
-            // SAFETY: ipc_state classifies blocked_on as an EventQueueState.
+            // SAFETY: ipc_state classifies blocked_on as an EventQueueState;
+            // the waiter-queue walk is the bounded lock-free probe, its TCBs
+            // kept mapped by the held registry lock (contains_racy's contract).
             let (queued, count, capacity) = unsafe {
                 (
-                    (*eq).waiters.contains(t),
+                    queued_label((*eq).waiters.contains_racy(t, WATCHDOG_QUEUE_WALK)),
                     (*eq).count.load(Ordering::Relaxed),
                     (*eq).capacity,
                 )
@@ -1429,10 +1450,10 @@ unsafe fn watchdog_decode_blocked_on(t: *mut ThreadControlBlock)
         IpcThreadState::BlockedOnNotification =>
         {
             let sig = blocked_on.cast::<crate::ipc::notification::NotificationState>();
-            // SAFETY: ipc_state classifies blocked_on as a NotificationState.
+            // SAFETY: as for the event-queue arm, for a NotificationState.
             let (queued, bits) = unsafe {
                 (
-                    (*sig).waiters.contains(t),
+                    queued_label((*sig).waiters.contains_racy(t, WATCHDOG_QUEUE_WALK)),
                     (*sig).bits.load(Ordering::Relaxed),
                 )
             };
@@ -1467,8 +1488,9 @@ unsafe fn watchdog_decode_blocked_on(t: *mut ThreadControlBlock)
         IpcThreadState::BlockedOnWaitSet =>
         {
             let ws = blocked_on.cast::<crate::ipc::wait_set::WaitSetState>();
-            // SAFETY: ipc_state classifies blocked_on as a WaitSetState.
-            let queued = unsafe { (*ws).waiters.contains(t) };
+            // SAFETY: as for the event-queue arm, for a WaitSetState.
+            let queued =
+                queued_label(unsafe { (*ws).waiters.contains_racy(t, WATCHDOG_QUEUE_WALK) });
             crate::kprintln!("      waitset: queued={}", queued);
         }
         IpcThreadState::None =>
@@ -1511,8 +1533,9 @@ static mut SLEEP_COUNT: usize = 0;
 /// One expired sleeper, snapshotted under `SLEEP_LIST_LOCK` at pop. The
 /// per-entry claim loop dispatches off this snapshot rather than re-reading the
 /// TCB, so a concurrent `dealloc_object(Thread)` that frees the TCB after the
-/// lock is dropped is never observed as a torn binding (it cannot be observed at
-/// all on the no-claim paths, which never dereference the TCB).
+/// lock is dropped is never observed as a torn binding. The timed IPC arms read
+/// the TCB only while the source lock shows it queued, and the other no-claim
+/// paths never dereference it.
 #[cfg(not(test))]
 #[derive(Clone, Copy)]
 struct ExpiredWaiter
@@ -1871,8 +1894,9 @@ pub fn sleep_check_wakeups()
                 // SAFETY: same as above; tcb is dereferenced only once found
                 // queued.
                 let we_win = unsafe {
-                    (*sig_state).waiters.contains(tcb)
-                        && (*tcb).park_seq.load(core::sync::atomic::Ordering::Relaxed) == park_seq
+                    (*sig_state).waiters.remove_if(tcb, |t| {
+                        (*t).park_seq.load(core::sync::atomic::Ordering::Relaxed) == park_seq
+                    })
                 };
                 if we_win
                 {
@@ -1883,9 +1907,9 @@ pub fn sleep_check_wakeups()
                     // wakeup_value = 0 is the timeout marker (notification_send
                     // rejects 0-bit sends). State/ipc_state/blocked_on are
                     // committed by enqueue_and_wake under sched.lock.
-                    // SAFETY: tcb is queued on sig_state; sig.lock held.
+                    // SAFETY: tcb was just removed from sig_state's queue;
+                    // sig.lock held.
                     unsafe {
-                        (*sig_state).waiters.remove(tcb);
                         crate::ipc::claim_waiter(tcb, 0);
                         (*sig_state).refresh_observer();
                     }
@@ -1914,8 +1938,9 @@ pub fn sleep_check_wakeups()
                 // SAFETY: same as above; tcb is dereferenced only once found
                 // queued.
                 let we_win = unsafe {
-                    (*eq_state).waiters.contains(tcb)
-                        && (*tcb).park_seq.load(core::sync::atomic::Ordering::Relaxed) == park_seq
+                    (*eq_state).waiters.remove_if(tcb, |t| {
+                        (*t).park_seq.load(core::sync::atomic::Ordering::Relaxed) == park_seq
+                    })
                 };
                 if we_win
                 {
@@ -1923,9 +1948,9 @@ pub fn sleep_check_wakeups()
                     // arm. Event payloads can be any u64 (including 0);
                     // `timed_out` is the out-of-band timeout marker,
                     // read-and-cleared by sys_event_recv on resume.
-                    // SAFETY: tcb is queued on eq_state; eq.lock held.
+                    // SAFETY: tcb was just removed from eq_state's queue;
+                    // eq.lock held.
                     unsafe {
-                        (*eq_state).waiters.remove(tcb);
                         crate::ipc::claim_waiter(tcb, 0);
                         (*tcb).timed_out = true;
                     }
@@ -2466,11 +2491,12 @@ pub unsafe fn set_state_under_all_locks(
 /// Mark `tcb` `Exited` with `exit_reason` recorded under the same all-locks
 /// hold as the state write — the commit of the thread's own exit and fault
 /// paths (the object-teardown walk records `EXIT_KILLED` through
-/// [`commit_cancelling_park`], with the same refusal rule). A refused commit (the thread is already `Exited`) writes neither, so the
-/// reason recorded by the commit that won survives; an exit path whose
-/// commit lost still posts its own reason (no death walk posts
-/// `EXIT_KILLED`; a bind after the stop delivers it), so a thread killed
-/// mid-exit carries `EXIT_KILLED` only as its retained reason.
+/// [`commit_cancelling_park`], with the same refusal rule). A refused commit
+/// (the thread is already `Exited`) writes neither, so the reason recorded by
+/// the commit that won survives; an exit path whose commit lost still posts
+/// its own reason (no death walk posts `EXIT_KILLED`; a bind after the stop
+/// delivers it), so a thread killed mid-exit carries `EXIT_KILLED` only as
+/// its retained reason.
 ///
 /// # Safety
 /// As for [`set_state_under_all_locks`].
@@ -3018,8 +3044,8 @@ unsafe fn scan_bound_current(
 /// is marked `Exited` under the all-locks discipline with `EXIT_KILLED`
 /// recorded as its retained exit reason in the same hold, the commit retried
 /// until no park was committed since the cancel ([`commit_cancelling_park`],
-/// draining every run queue); CPUs found
-/// running one are recorded. Phase 2, with the registry released — a CPU
+/// draining every run queue); CPUs found running one are recorded. Phase 2,
+/// with the registry released — a CPU
 /// spinning on the registry lock inside `register` cannot deschedule, so it
 /// must not be waited for while the lock is held — prods those CPUs and
 /// spins until no CPU other than this one has a bound thread as `current`.

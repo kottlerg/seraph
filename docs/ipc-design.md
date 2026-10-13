@@ -119,14 +119,17 @@ A notification is a kernel object containing a single machine word used as a bit
 bit represents a distinct event type, defined by the service using the notification.
 
 **Delivery:** The sender ORs one or more bits into the notification word. This is O(1) and
-never blocks. If the receiver is already waiting, it is woken immediately. If not,
-the bits accumulate until the receiver next waits.
+never blocks. If receivers are already waiting, the one that has waited longest is woken with
+every pending bit. If not, the bits accumulate until a receiver next waits.
 
 **Coalescing:** Setting an already-set bit is idempotent.
 
 **Receipt:** The receiver waits on the notification object and receives the full bitmask,
 which is atomically cleared on read. The receiver then inspects each set bit and
-acts accordingly.
+acts accordingly. Several threads may wait on one notification; they queue in arrival order and
+each delivery wakes one of them. Destroying the notification wakes every waiter with
+`Interrupted`. See
+[syscalls.md § `SYS_NOTIFICATION_WAIT`](../core/kernel/docs/syscalls.md#sys_notification_wait-4).
 
 Notifications are appropriate for: hardware interrupt delivery, timer expiry, IPC endpoint
 readiness, DMA completion, and any event where what matters is that something happened,
@@ -147,7 +150,9 @@ as two distinct entries in order.
 
 **Receipt:** The receiver waits on the queue and receives the next available entry.
 If multiple entries are available, subsequent receives return them in order without
-blocking.
+blocking. Blocked receivers queue in arrival order, and each posted entry goes to the one that
+has waited longest. Destroying the queue wakes every waiter with `Interrupted`. See
+[syscalls.md § `SYS_EVENT_RECV`](../core/kernel/docs/syscalls.md#sys_event_recv-6).
 
 Event queues are appropriate for: process lifecycle events (exit, notification delivery),
 anything where ordering or count of events matters, and cases where coalescing would
@@ -158,8 +163,11 @@ cause correctness problems.
 ## Waiting on Multiple Sources
 
 A **wait set** aggregates any combination of endpoints, notifications, and event queues.
-A process waits on the set and is woken when any member becomes ready; the result
-identifies which source triggered the wake.
+A thread waits on the set and is woken when any member becomes ready; the result
+identifies which source triggered the wake. A wait set takes one waiting thread at a time: a
+second thread's wait on the same set is refused with `InvalidState`. Destroying the set wakes
+its waiter with `Interrupted`. See
+[syscalls.md § `SYS_WAIT_SET_WAIT`](../core/kernel/docs/syscalls.md#sys_wait_set_wait-28).
 
 ---
 
@@ -222,8 +230,9 @@ shared/ipc policy block.
 
 ## Kernel Role
 
-The kernel delivers messages, manages endpoint queuing, and transfers capability
-references all-or-nothing with messages (see § Message Format). It has no opinion on
+The kernel delivers messages, manages endpoint queuing and the waiter queues of notifications
+and event queues, and transfers capability references all-or-nothing with messages (see
+§ Message Format). It has no opinion on
 message content, service protocols, or what capabilities mean to the receiving process.
 
 The kernel does not provide:

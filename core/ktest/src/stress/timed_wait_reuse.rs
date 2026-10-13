@@ -9,28 +9,28 @@
 //!
 //! ## The hazard
 //!
-//! The timer pops an expired timed waiter under `SLEEP_LIST_LOCK` and claims
-//! it later, under the source lock, if the source still names that thread
-//! as its waiter. In between, a sender can claim the popped wait, and the
-//! woken thread can park again on the same source — this time untimed. The
-//! slot then names the same thread, so a claim keyed only on the slot would
-//! time out a wait that has no deadline: a notification wait returning 0
-//! bits, or an event receive returning `WouldBlock`. The timer therefore
-//! also compares the thread's park generation (`park_seq`) with the one it
-//! popped (core/kernel/docs/thread-lifecycle-and-sleep.md § Sleep List
-//! Invariants, invariant 6).
+//! Between the timer's pop of an expired timed waiter and its claim, a
+//! sender can claim the timed wait, and the woken thread can queue an
+//! untimed wait on the same source. A timer claim of that untimed wait
+//! would time out a wait with no deadline: a notification wait returning 0
+//! bits, or an event receive returning `WouldBlock`. The claim rule that
+//! excludes it is core/kernel/docs/thread-lifecycle-and-sleep.md § Sleep
+//! List Invariants, invariant 6.
 //!
 //! ## How this exercises it
 //!
 //! A waiter loops: a 1 ms timed wait, then an untimed wait, on one source —
 //! a notification on even cycles, an event queue on odd ones. The
 //! controller, pinned off CPU 0 (where the timer runs), delivers during the
-//! timed wait, at once or after about 1 ms, so the delivery and the deadline
-//! race; it then releases the untimed wait with a second delivery if the
+//! timed wait either at once or, in late rounds, after a busy-wait swept
+//! across the deadline (see [`LATE_MIN_US`]), so the delivery and the
+//! deadline race; it then releases the untimed wait with a second delivery if the
 //! waiter has not returned. The waiter runs on a third CPU when there is
 //! one, so it can re-park while CPU 0 is still between the pop and the claim.
-//! The test fails if an untimed wait returns anything but a delivery, or if
-//! no timed wait ever ended in a delivery (the race never armed).
+//! The test fails if a timed wait returns anything but a delivery or a
+//! timeout, if an untimed wait returns anything but a delivery, or if, for
+//! either source, no late-delivery round's timed wait ended in a delivery
+//! (the race never armed on that source).
 //!
 //! Needs **≥ 2 CPUs**.
 
@@ -41,7 +41,7 @@ use syscall::{
     event_recv, event_recv_timeout, notification_send, notification_wait,
     notification_wait_timeout, system_info, thread_exit, thread_set_affinity, thread_sleep,
 };
-use syscall_abi::SystemInfoType;
+use syscall_abi::{SyscallError, SystemInfoType};
 
 use crate::{ChildStack, TestContext, TestResult, spawn};
 
@@ -50,6 +50,14 @@ const CYCLES: u32 = 400;
 
 /// The waiter's timed wait.
 const WAIT_MS: u64 = 1;
+
+/// A late round's delivery comes this many microseconds after the waiter
+/// enters its timed wait, swept per round over [`LATE_SPAN_US`]. The wait
+/// ends at the first timer tick after its deadline, so the sweep spans the
+/// deadline and about two ticks past it. A sleep would wake the controller
+/// on that same tick, after the timer's claim, and never race it.
+const LATE_MIN_US: u64 = WAIT_MS * 1000 / 2;
+const LATE_SPAN_US: u64 = WAIT_MS * 1000 * 5 / 2;
 
 /// Controller spins this many rounds for the untimed wait's result before
 /// releasing it with a second delivery.
@@ -61,10 +69,27 @@ static TIMED: AtomicU32 = AtomicU32::new(0);
 static FINISHED: AtomicU32 = AtomicU32::new(0);
 /// Controller → waiter: the last cycle the controller has finished with.
 static ACKED: AtomicU32 = AtomicU32::new(0);
-/// Waiter's results for the cycle in `FINISHED`: whether the timed wait
-/// ended in a delivery, and whether the untimed one did.
-static TIMED_DELIVERED: AtomicU32 = AtomicU32::new(0);
+/// Waiter's results for the cycle in `FINISHED`: how the timed wait ended
+/// (a `TIMED_*` value), and whether the untimed one ended in a delivery.
+static TIMED_RESULT: AtomicU32 = AtomicU32::new(TIMED_BAD);
 static UNTIMED_OK: AtomicU32 = AtomicU32::new(0);
+
+const TIMED_DELIVERY: u32 = 0;
+const TIMED_TIMEOUT: u32 = 1;
+const TIMED_BAD: u32 = 2;
+
+/// Source index of a cycle: the notification on even cycles, the event
+/// queue on odd ones.
+const NOTIFICATION: usize = 0;
+const QUEUE: usize = 1;
+
+/// Late-delivery rounds' timed-wait outcomes, per source index.
+#[derive(Default)]
+struct Tally
+{
+    delivered: [u64; 2],
+    timed_out: [u64; 2],
+}
 
 pub fn run(ctx: &TestContext) -> TestResult
 {
@@ -84,24 +109,45 @@ pub fn run(ctx: &TestContext) -> TestResult
     let result = with_waiter(ctx, u32::try_from(2 % cpus).unwrap_or(0));
     let restore = thread_set_affinity(ctx.thread_cap, u32::MAX)
         .map_err(|_| "stress::timed_wait_reuse: restore controller affinity failed");
-    let delivered = result?;
+    let tally = result?;
     restore?;
 
     crate::log_u64(
-        "ktest: stress::timed_wait_reuse timed deliveries=",
-        delivered,
+        "ktest: stress::timed_wait_reuse notification late deliveries=",
+        tally.delivered[NOTIFICATION],
     );
-    if delivered == 0
+    crate::log_u64(
+        "ktest: stress::timed_wait_reuse notification late timeouts=",
+        tally.timed_out[NOTIFICATION],
+    );
+    crate::log_u64(
+        "ktest: stress::timed_wait_reuse event queue late deliveries=",
+        tally.delivered[QUEUE],
+    );
+    crate::log_u64(
+        "ktest: stress::timed_wait_reuse event queue late timeouts=",
+        tally.timed_out[QUEUE],
+    );
+    if tally.delivered[NOTIFICATION] == 0
     {
-        return Err("stress::timed_wait_reuse: no timed wait ended in a delivery (never armed)");
+        return Err(
+            "stress::timed_wait_reuse: no late notification timed wait ended in a delivery \
+             (never armed)",
+        );
+    }
+    if tally.delivered[QUEUE] == 0
+    {
+        return Err(
+            "stress::timed_wait_reuse: no late event queue timed wait ended in a delivery \
+             (never armed)",
+        );
     }
     Ok(())
 }
 
 /// Create the two sources and the waiter, run every cycle, and delete them
-/// all whatever the outcome. Returns how many timed waits ended in a
-/// delivery.
-fn with_waiter(ctx: &TestContext, waiter_cpu: u32) -> Result<u64, &'static str>
+/// all whatever the outcome. Returns the late rounds' tally.
+fn with_waiter(ctx: &TestContext, waiter_cpu: u32) -> Result<Tally, &'static str>
 {
     let sig = cap_create_notification(ctx.memory_base)
         .map_err(|_| "stress::timed_wait_reuse: create notification failed")?;
@@ -123,10 +169,10 @@ fn with_waiter(ctx: &TestContext, waiter_cpu: u32) -> Result<u64, &'static str>
     }
     ok &= cap_delete(eq).is_ok();
     ok &= cap_delete(sig).is_ok();
-    let delivered = result?;
+    let tally = result?;
     if ok
     {
-        Ok(delivered)
+        Ok(tally)
     }
     else
     {
@@ -161,12 +207,14 @@ fn start_waiter(
     .map_err(|_| "stress::timed_wait_reuse: start waiter failed")
 }
 
-/// Drive every cycle; returns how many timed waits ended in a delivery.
-fn cycles(sig: u32, eq: u32) -> Result<u64, &'static str>
+/// Drive every cycle; returns the late rounds' tally.
+fn cycles(sig: u32, eq: u32) -> Result<Tally, &'static str>
 {
-    let mut delivered = 0u64;
+    let mut tally = Tally::default();
     for cycle in 1..=CYCLES
     {
+        let source = if cycle & 1 == 0 { NOTIFICATION } else { QUEUE };
+        let late = cycle & 2 != 0;
         let deliver = |value: u64| {
             if cycle & 1 == 0
             {
@@ -181,12 +229,12 @@ fn cycles(sig: u32, eq: u32) -> Result<u64, &'static str>
         {
             core::hint::spin_loop();
         }
-        // Odd rounds of each source deliver at once; the others wait about
-        // the waiter's timeout, plus a varying spin, so the two race.
-        if cycle & 2 != 0
+        if late
         {
-            let _ = thread_sleep(WAIT_MS);
-            for _ in 0..(cycle.wrapping_mul(2_654_435_761) >> 20)
+            let delay_us =
+                LATE_MIN_US + u64::from(cycle.wrapping_mul(2_654_435_761)) % LATE_SPAN_US;
+            let until = elapsed_us() + delay_us;
+            while elapsed_us() < until
             {
                 core::hint::spin_loop();
             }
@@ -211,18 +259,50 @@ fn cycles(sig: u32, eq: u32) -> Result<u64, &'static str>
             let _ = thread_sleep(1);
         }
         let untimed_ok = UNTIMED_OK.load(Ordering::Acquire) != 0;
-        delivered += u64::from(TIMED_DELIVERED.load(Ordering::Acquire));
+        let timed = TIMED_RESULT.load(Ordering::Acquire);
         ACKED.store(cycle, Ordering::Release);
+        match timed
+        {
+            TIMED_DELIVERY if late => tally.delivered[source] += 1,
+            TIMED_TIMEOUT if late => tally.timed_out[source] += 1,
+            TIMED_DELIVERY | TIMED_TIMEOUT =>
+            {}
+            _ if source == NOTIFICATION =>
+            {
+                return Err(
+                    "stress::timed_wait_reuse: a timed notification wait returned an error",
+                );
+            }
+            _ =>
+            {
+                return Err("stress::timed_wait_reuse: a timed event queue wait returned an error");
+            }
+        }
+        if !untimed_ok && source == NOTIFICATION
+        {
+            return Err(
+                "stress::timed_wait_reuse: an untimed notification wait returned a timeout or \
+                 error",
+            );
+        }
         if !untimed_ok
         {
-            return Err("stress::timed_wait_reuse: an untimed wait returned a timeout or error");
+            return Err(
+                "stress::timed_wait_reuse: an untimed event queue wait returned a timeout or \
+                 error",
+            );
         }
     }
-    Ok(delivered)
+    Ok(tally)
+}
+
+fn elapsed_us() -> u64
+{
+    system_info(SystemInfoType::ElapsedUs as u64).unwrap_or(0)
 }
 
 /// Waiter: per cycle, a timed wait then an untimed wait on the cycle's
-/// source; publishes whether each ended in a delivery.
+/// source; publishes how each ended.
 // cast_possible_truncation: packed fields are 32-bit cap handles.
 #[allow(clippy::cast_possible_truncation)]
 fn waiter_entry(arg: u64) -> !
@@ -238,18 +318,25 @@ fn waiter_entry(arg: u64) -> !
         TIMED.store(cycle, Ordering::Release);
         let (timed, untimed) = if cycle & 1 == 0
         {
-            let t = notification_wait_timeout(sig, WAIT_MS);
-            (
-                matches!(t, Ok(bits) if bits != 0),
-                matches!(notification_wait(sig), Ok(b) if b != 0),
-            )
+            let timed = match notification_wait_timeout(sig, WAIT_MS)
+            {
+                Ok(0) => TIMED_TIMEOUT,
+                Ok(_) => TIMED_DELIVERY,
+                Err(_) => TIMED_BAD,
+            };
+            (timed, matches!(notification_wait(sig), Ok(b) if b != 0))
         }
         else
         {
-            let t = event_recv_timeout(eq, WAIT_MS);
-            (t.is_ok(), event_recv(eq).is_ok())
+            let timed = match event_recv_timeout(eq, WAIT_MS)
+            {
+                Ok(_) => TIMED_DELIVERY,
+                Err(e) if e == SyscallError::WouldBlock as i64 => TIMED_TIMEOUT,
+                Err(_) => TIMED_BAD,
+            };
+            (timed, event_recv(eq).is_ok())
         };
-        TIMED_DELIVERED.store(u32::from(timed), Ordering::Release);
+        TIMED_RESULT.store(timed, Ordering::Release);
         UNTIMED_OK.store(u32::from(untimed), Ordering::Release);
         FINISHED.store(cycle, Ordering::Release);
     }

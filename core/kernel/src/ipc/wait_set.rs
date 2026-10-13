@@ -36,7 +36,8 @@
 //! wrapper header that carries the refcount.
 //!
 //! # Thread safety
-//! All operations must be called with the scheduler lock held.
+//! Every operation serialises on the set's own `lock`; a notifying source's
+//! lock is outer to it (see [`WaitSetState::lock`]).
 //!
 //! # Extending member capacity
 //! Increase `WAIT_SET_MAX_MEMBERS` and the fixed-size arrays. `WAIT_SET_MAX_MEMBERS`
@@ -159,13 +160,13 @@ impl WaitSetMember
 ///
 /// Sized to fit, together with the 24 B `WaitSetObject` wrapper, inside
 /// the 512 B retype bin (≈ 440 B: 16 × 24 B members, plus ready ring,
-/// waiter pointer, and bookkeeping). The cap-create path constructs
+/// waiter-queue tail, and bookkeeping). The cap-create path constructs
 /// both objects in place inside the source `Memory` cap's region;
 /// nothing else is allocated.
 pub struct WaitSetState
 {
     /// Per-`WaitSetState` spinlock. Serialises every mutation of the
-    /// fields below — `members`, `ready_ring`, `waiter`, and the read/write
+    /// fields below — `members`, `ready_ring`, `waiters`, and the read/write
     /// pointers. Acquired by `waitset_wait`, `waitset_notify`,
     /// `waitset_add`, `waitset_remove`, and `wait_set_drop`.
     ///
@@ -197,8 +198,10 @@ pub struct WaitSetState
     pub ready_head: u8,
     /// Write pointer into `ready_ring` (next index to push).
     pub ready_tail: u8,
-    /// Threads blocked on `sys_wait_set_wait`, in arrival order; a ready
-    /// member wakes the head.
+    /// The thread blocked on `sys_wait_set_wait`, if any. At most one: a wait
+    /// while another thread waits is refused (`WaitSetPending::Occupied`).
+    /// Held as a [`WaitQueue`](crate::ipc::WaitQueue) so its claims share the
+    /// notification and event-queue code.
     pub waiters: crate::ipc::WaitQueue,
 }
 
@@ -325,12 +328,11 @@ pub unsafe fn waitset_notify(ws_opaque: *mut u8, member_idx: u8)
     // BlockedOnWaitSet unlink takes ws.lock and spins on wake_in_flight
     // (#160), cleared by enqueue_and_wake.
     // SAFETY: ws.lock held; the popped waiter is a valid parked TCB.
-    let target_cpu = unsafe {
+    let (waiter, target_cpu) = unsafe {
         let waiter = ws.waiters.pop();
         crate::ipc::claim_waiter(waiter, badge);
         (waiter, crate::sched::select_target_cpu(waiter))
     };
-    let (waiter, target_cpu) = target_cpu;
 
     // SAFETY: paired with lock_raw above.
     unsafe { ws.lock.unlock_raw(saved) };
@@ -339,10 +341,25 @@ pub unsafe fn waitset_notify(ws_opaque: *mut u8, member_idx: u8)
     unsafe { crate::sched::enqueue_and_wake(waiter, target_cpu) };
 }
 
+/// Why [`waitset_wait`] returned without a badge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WaitSetPending
+{
+    /// The caller went through the park commit (committed, or refused and
+    /// rolled back); it must reach `schedule()` and then read its deposit.
+    Parked,
+    /// Another thread already waits on the set; the caller did not park and
+    /// the syscall returns `InvalidState`.
+    Occupied,
+}
+
 /// Block `caller` until any member becomes ready, or return the next pending badge.
 ///
+/// - If another thread already waits on the set, returns
+///   `Err(WaitSetPending::Occupied)` without parking: a wait set takes one
+///   waiter (any number of member sources).
 /// - If the ready ring is non-empty, pops and returns `Ok(badge)` without blocking.
-/// - If empty, queues `caller` at the tail of the waiters and returns `Err(())`.
+/// - If empty, makes `caller` the waiter and returns `Err(WaitSetPending::Parked)`.
 ///   The syscall handler calls `schedule()`, then reads `caller.wakeup_value`.
 ///
 /// # Safety
@@ -352,7 +369,7 @@ pub unsafe fn waitset_notify(ws_opaque: *mut u8, member_idx: u8)
 pub unsafe fn waitset_wait(
     ws: *mut WaitSetState,
     caller: *mut ThreadControlBlock,
-) -> Result<u64, ()>
+) -> Result<u64, WaitSetPending>
 {
     // SAFETY: caller guarantees ws is valid for &mut access for the
     // duration of this call (the cap holding ws remains alive).
@@ -360,6 +377,13 @@ pub unsafe fn waitset_wait(
 
     // SAFETY: lock is owned by ws; matched unlock_raw on every return path.
     let saved = unsafe { ws.lock.lock_raw() };
+
+    if !ws.waiters.is_empty()
+    {
+        // SAFETY: paired with lock_raw above.
+        unsafe { ws.lock.unlock_raw(saved) };
+        return Err(WaitSetPending::Occupied);
+    }
 
     if let Some(badge) = ws.pop_ready()
     {
@@ -445,7 +469,7 @@ pub unsafe fn waitset_wait(
     }
     // SAFETY: paired with lock_raw above.
     unsafe { ws.lock.unlock_raw(saved) };
-    Err(())
+    Err(WaitSetPending::Parked)
 }
 
 /// Register a source in the wait set.
@@ -644,14 +668,14 @@ pub unsafe fn wait_set_drop(
         }
     }
 
-    // Step 2: under ws.lock, wake every blocked waiter with its park stamped
+    // Step 2: under ws.lock, claim the blocked waiter with its park stamped
     // INTERRUPTED (the destroyed wait set cancels the wait; `SYS_WAIT_SET_WAIT`
-    // returns Interrupted), holding the lock across the wakes as the endpoint
-    // drain does (ws.lock → sched_lock → run-queue lock is canonical).
+    // returns Interrupted); wake it after the unlock per § Lock Hierarchy
+    // rule 5.
     // SAFETY: lock owned by ws; matched unlock_raw below.
     let saved = unsafe { ws_ref.lock.lock_raw() };
     // SAFETY: ws.lock held.
-    unsafe { crate::ipc::interrupt_all_waiters(&mut ws_ref.waiters) };
+    let detached = unsafe { crate::ipc::interrupt_all_waiters(&mut ws_ref.waiters) };
     for slot in &mut ws_ref.members
     {
         *slot = WaitSetMember::vacant();
@@ -659,6 +683,8 @@ pub unsafe fn wait_set_drop(
     ws_ref.member_count = 0;
     // SAFETY: paired with lock_raw above.
     unsafe { ws_ref.lock.unlock_raw(saved) };
+    // SAFETY: claimed above; no lock held.
+    unsafe { detached.wake() };
 
     zeroed
 }

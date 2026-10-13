@@ -15,7 +15,7 @@ This document is the authoritative reference consulted before any change that to
   `sys_thread_set_priority`, `sys_exit`, `sys_thread_sleep`, `cancel_ipc_block`.
 - `core/kernel/src/cap/object.rs` — the `ObjectType::Thread` arm of `dealloc_object_one`, and the
   sleep-list removal and timer quiesce in its Notification and EventQueue arms.
-- The waiter-slot claimers' sleep-list removal: `notification_send`, `event_queue_post`,
+- The waiter claimers' sleep-list removal: `notification_send`, `event_queue_post`,
   `event_queue_drop` (`core/kernel/src/ipc/`).
 - The fault handlers in `core/kernel/src/arch/{x86_64/idt.rs,riscv64/interrupts.rs}` that drive
   thread-fault exits.
@@ -49,7 +49,7 @@ In scope:
 - `core/kernel/src/syscall/{thread,mod}.rs` — lifecycle syscalls and `cancel_ipc_block`.
 - `core/kernel/src/cap/object.rs` — `ObjectType::Thread` arm of `dealloc_object_one`; the sleep-list
   removal and timer quiesce of the Notification and EventQueue arms.
-- `core/kernel/src/ipc/{notification,event_queue}.rs` — the waiter-slot claimers' sleep-list
+- `core/kernel/src/ipc/{notification,event_queue}.rs` — the waiter claimers' sleep-list
   removal.
 - `core/kernel/src/arch/{x86_64/idt.rs,riscv64/interrupts.rs}` — fault → Exited transition.
 
@@ -102,30 +102,31 @@ claims against concurrent IPC sources via the relevant source IPC lock (Notifica
    `sleep_deadline`, releases the lock, then dispatches on the snapshot:
    - `None` (plain sleep): claimed at the pop — `wake_in_flight = 1` under `SLEEP_LIST_LOCK` — since
      no other waker competes.
-   - `BlockedOnNotification` / `BlockedOnEventQueue`: take the source lock; claim iff
-     `(*src).waiter == tcb` and the TCB's `park_seq` still equals the snapshot. The generation
-     check rejects a later wait of the same thread on the same source (a sender claimed the
-     popped park and the thread parked again before the timer took the lock): the slot names the
-     TCB again, but `park_seq` advanced at that park's commit, which runs under the same source
-     lock. The TCB is read only while the slot names it, and written only once the claim is won.
+   - `BlockedOnNotification` / `BlockedOnEventQueue`: take the source lock; claim iff the TCB is
+     still in the source's waiter queue and its `park_seq` still equals the snapshot. The generation
+     check rejects a later wait of the same thread on the same source (a sender claimed the popped
+     park and the thread queued again before the timer took the lock): the TCB is queued again, but
+     `park_seq` advanced at that park's commit, which runs under the same source lock. The TCB is
+     read only while queued, and written only once the claim is won.
    - any other binding: never claimed and never dereferenced (invariant 2 makes it unreachable).
 
-7. **Every waiter-slot claim removes the entry under the source lock.** `notification_send`,
-   `event_queue_post`, `cancel_ipc_block`, the Notification and EventQueue dealloc wakes, and a
-   displacing wait clear the waiter slot and call `sleep_list_remove` in the same source-lock
-   critical section; the timer pops the entry before its own claim. A wait on a source that already
-   has a waiter displaces it through the same claim (`claim_displaced_waiter`: the displaced wait
-   returns `Interrupted`), so no waiter is ever left parked on a slot that no longer names it. So an
-   entry bound to a source exists only while that source names the TCB as its waiter. A deadline of
-   0 read under the source lock means no entry (the parker arms under that lock, and every removal
-   clears both together), so the wakers skip the remove for an untimed wait.
+7. **Every waiter claim removes the entry under the source lock.** A notification, event queue, or
+   wait set keeps its blocked threads in a FIFO (`WaitQueue`), and a waiter is claimed by removing
+   it from that queue under the source lock. `notification_send`, `event_queue_post`,
+   `cancel_ipc_block`, and the Notification and EventQueue dealloc wakes call `sleep_list_remove`
+   in the same source-lock critical section as that removal (`claim_waiter`); the timer pops the
+   entry before its own claim. So an entry bound to a source exists only while that source still
+   queues the TCB. A deadline of 0 read under the source lock means no entry (the parker arms under
+   that lock, and every removal clears both together), so the wakers skip the remove for an untimed
+   wait.
 
-8. **`sleep_list_add` from a parking syscall MUST re-acquire the source IPC lock and verify
-   `(*src).waiter == tcb` before arming.** Without the recheck, a wake firing in the window between
-   the IPC primitive releasing its source lock and the syscall arming the deadline leaves the TCB on
-   the sleep list with stale state. The next unrelated `notification_wait` / `event_recv` on this
-   TCB is then hijacked by `sleep_check_wakeups`, delivering `wakeup_value = 0` instead of real
-   bits/payload. See `sys_notification_wait` and `sys_event_recv`.
+8. **`sleep_list_add` from a parking syscall MUST re-acquire the source IPC lock and verify the
+   TCB is still queued there before arming.** Without the recheck, a wake firing in the window
+   between the IPC primitive releasing its source lock and the syscall arming the deadline leaves
+   the TCB on the sleep list with stale state. The next unrelated `notification_wait` /
+   `event_recv` on this TCB is then hijacked by `sleep_check_wakeups`, delivering
+   `wakeup_value = 0` instead of real bits/payload. See `sys_notification_wait` and
+   `sys_event_recv`.
 
 9. **A source or TCB outlives every batch that popped it.** The timer's arms use the pop-time
    source and TCB pointers, which hold no reference. A batch advances `TIMER_DISPATCH_SEQ` to odd
@@ -167,16 +168,16 @@ contrast `sys_notification_wait` whose `wakeup_value == 0` is unambiguous becaus
    - `sleep_check_wakeups` BlockedOnEventQueue arm writes `wakeup_value = 0`, sets
      `timed_out = true`, sets state = Ready, releases `eq.lock`.
 
-   The `(*eq).waiter == tcb` arbitration under `eq.lock` (with the timer's `park_seq` check, Sleep
-   List Invariant 6) ensures exactly one of these paths fires per park. The reader can then trust
-   that `timed_out == true` ⇔ "no payload" and `timed_out == false` ⇔ "wakeup_value is the payload"
-   (which may legitimately be zero).
+   The removal of the TCB from `eq`'s waiter queue under `eq.lock` (with the timer's `park_seq`
+   check, Sleep List Invariant 6) ensures exactly one of these paths fires per park. The reader can
+   then trust that `timed_out == true` ⇔ "no payload" and `timed_out == false` ⇔ "wakeup_value is
+   the payload" (which may legitimately be zero).
 
 4. **No third writer.** The cancellers — `cancel_ipc_block` and the queue's destruction
    (`event_queue_drop`) — MUST NOT touch `timed_out`. A cancelled wait returns `Interrupted`, not
-   "timed out": the canceller stamps the park episode `INTERRUPTED` at its waiter-slot claim, and
-   the resuming syscall consumes that disposition *before* the
-   `timed_out`/`wakeup_value` read (clearing both in the interrupted branch — see
+   "timed out": the canceller stamps the park episode `INTERRUPTED` at its waiter claim, and the
+   resuming syscall consumes that disposition *before* the `timed_out`/`wakeup_value` read (clearing
+   both in the interrupted branch — see
    [ipc-internals.md § Park Dispositions and Episodes](ipc-internals.md#park-dispositions-and-episodes)).
    Additional writers would race the reader and break the mutual-exclusion invariant.
 
@@ -283,12 +284,12 @@ stated explicitly.
 11. sleep_list_remove(tcb) — tcb is Exited and off every CPU, so no add can
     follow, and a timer pop that won the race still holds the full binding
     (Sleep List Invariant 6). Then acquire the source IPC lock for tcb's
-    blocked_on_object (if any) and unlink tcb from the source's wait queue /
-    waiter slot. Branches:
+    blocked_on_object (if any) and unlink tcb from the source's wait or
+    waiter queue. Branches:
       - BlockedOnSend / BlockedOnRecv: ep.lock; unlink_from_wait_queue.
-      - BlockedOnNotification: sig.lock; clear waiter if it == tcb.
-      - BlockedOnEventQueue: eq.lock; clear waiter if it == tcb.
-      - BlockedOnWaitSet: ws.lock; clear waiter if it == tcb.
+      - BlockedOnNotification: sig.lock; remove tcb from the waiter queue.
+      - BlockedOnEventQueue: eq.lock; remove tcb from the waiter queue.
+      - BlockedOnWaitSet: ws.lock; remove tcb from the waiter queue.
       - BlockedOnReply: blocked_on_object is the *server* TCB; mirror
                         cancel_ipc_block — compare_exchange
                         (*server).reply_tcb from tcb to null with AcqRel /

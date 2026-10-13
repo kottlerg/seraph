@@ -745,8 +745,8 @@ pub fn notification_send(sig: u32, bits: u64) -> Result<(), i64>
 ///
 /// # Errors
 /// Returns a negative `i64` error code if the notification cap is invalid, or
-/// `-16` (`Interrupted`) if the caller is stopped while waiting, the
-/// notification is destroyed under it, or another thread's wait displaces it.
+/// `-16` (`Interrupted`) if the caller is stopped while waiting or the
+/// notification is destroyed under it.
 #[inline]
 pub fn notification_wait(sig: u32) -> Result<u64, i64>
 {
@@ -770,8 +770,8 @@ pub fn notification_wait(sig: u32) -> Result<u64, i64>
 ///
 /// # Errors
 /// Returns a negative `i64` error code if the notification cap is invalid, or
-/// `-16` (`Interrupted`) if the caller is stopped while waiting, the
-/// notification is destroyed under it, or another thread's wait displaces it.
+/// `-16` (`Interrupted`) if the caller is stopped while waiting or the
+/// notification is destroyed under it.
 #[inline]
 pub fn notification_wait_timeout(sig: u32, timeout_ms: u64) -> Result<u64, i64>
 {
@@ -1840,8 +1840,8 @@ pub fn event_post(queue_cap: u32, payload: u64) -> Result<(), i64>
 ///
 /// # Errors
 /// Returns a negative `i64` error code if the queue cap is invalid, or `-16`
-/// (`Interrupted`) if the caller is stopped while waiting, the queue is
-/// destroyed under it, or another thread's receive displaces it.
+/// (`Interrupted`) if the caller is stopped while waiting or the queue is
+/// destroyed under it.
 #[inline]
 pub fn event_recv(queue_cap: u32) -> Result<u64, i64>
 {
@@ -1874,9 +1874,8 @@ pub fn event_try_recv(queue_cap: u32) -> Result<u64, i64>
 ///
 /// # Errors
 /// Returns `-6` (`WouldBlock`) on timeout or empty try-once; `-16`
-/// (`Interrupted`) if the caller is stopped while waiting, the queue is
-/// destroyed under it, or another thread's receive displaces it; or another
-/// negative `i64` error code on invalid cap.
+/// (`Interrupted`) if the caller is stopped while waiting or the queue is
+/// destroyed under it; or another negative `i64` error code on invalid cap.
 #[inline]
 pub fn event_recv_timeout(queue_cap: u32, timeout_ms: u64) -> Result<u64, i64>
 {
@@ -1965,8 +1964,8 @@ pub fn wait_set_remove(ws_cap: u32, source_cap: u32) -> Result<(), i64>
 ///
 /// # Errors
 /// Returns a negative `i64` error code if the wait set cap is invalid, or
-/// `-16` (`Interrupted`) if the caller is stopped while waiting, the wait set
-/// is destroyed under it, or another thread's wait displaces it.
+/// `-16` (`Interrupted`) if the caller is stopped while waiting or the wait
+/// set is destroyed under it.
 #[inline]
 pub fn wait_set_wait(ws_cap: u32) -> Result<u64, i64>
 {

@@ -7,22 +7,24 @@
 //! returns `Interrupted` when that object is destroyed under it — never a
 //! success carrying a payload nobody sent.
 //!
-//! The source's dealloc wake claims the parked waiter under the source lock
-//! and stamps its park episode `INTERRUPTED`; the waiter's resume consumes
-//! the stamp before reading `wakeup_value`. One phase per source:
+//! The source's dealloc wake claims every queued waiter under the source lock
+//! and stamps its park episode `INTERRUPTED`; each waiter's resume consumes
+//! the stamp before reading `wakeup_value`. One phase per source, with two
+//! queued waiters on a notification or event queue and one on a wait set
+//! (which refuses a second):
 //!
 //!   1. **`notification_wait`** (untimed).
 //!   2. **`notification_wait_timeout`** — a timed waiter is also on the sleep
-//!      list; the dealloc removes that entry with the waiter slot.
+//!      list; the dealloc removes those entries with the queue.
 //!   3. **`event_recv`** (untimed).
 //!   4. **`wait_set_wait`** — the wait set itself is destroyed, not a member.
 //!
-//! The child waits on a copy of the source. The controller frees the object
-//! by revoking its own capability (the copy is its derivation child) and
-//! then deleting it; the child, raising an OK bit on `Interrupted` or a BAD
-//! bit on any other result, is the verdict.
+//! Each child waits on a copy of the source. The controller frees the object
+//! by revoking its own capability (the copies are its derivation children)
+//! and then deleting it; each child, raising an OK bit on `Interrupted` or a
+//! BAD bit on any other result, is the verdict.
 //!
-//! Runs on a single CPU (the child is a timer-preempted peer).
+//! Runs on a single CPU (the children are timer-preempted peers).
 
 use syscall::{
     RIGHTS_ALL, cap_copy, cap_create_notification, cap_delete, cap_revoke, event_queue_create,
@@ -36,12 +38,15 @@ use crate::{ChildStack, TestContext, TestResult, spawn};
 /// Notification NOTIFY right — what a child needs to `notification_send`.
 const RIGHTS_SIGNAL: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
 
-/// Child raises this just before it parks.
+/// Per-child `done` bits; child `i`'s are shifted by `i * CHILD_SHIFT`.
+/// Raised just before the child parks.
 const BIT_READY: u64 = 1 << 0;
-/// Child raises this when its wait returned `Interrupted`.
+/// Raised when the wait returned `Interrupted`.
 const BIT_OK: u64 = 1 << 1;
-/// Child raises this on any other result.
+/// Raised on any other result.
 const BIT_BAD: u64 = 1 << 2;
+const CHILD_SHIFT: u32 = 3;
+const MAX_CHILDREN: usize = 2;
 
 /// A timed wait that never elapses on its own within the test.
 const PARK_FOREVER_MS: u64 = 600_000;
@@ -50,7 +55,23 @@ const PARK_FOREVER_MS: u64 = 600_000;
 /// before the source is destroyed (see `park_interrupted_stop_start`).
 const SETTLE_SLEEP_MS: u64 = 20;
 
-static mut CHILD_STACK: ChildStack = ChildStack::ZERO;
+static mut CHILD_STACKS: [ChildStack; MAX_CHILDREN] = [ChildStack::ZERO; MAX_CHILDREN];
+
+/// A child's argument: its copy of the source, its `done` copy, and the
+/// shift of its `done` bits.
+#[derive(Clone, Copy)]
+struct ChildArgs
+{
+    source_cap: u32,
+    done: u32,
+    shift: u32,
+}
+
+static CHILD_ARGS: spawn::ArgBlock<ChildArgs, MAX_CHILDREN> = spawn::ArgBlock::new(ChildArgs {
+    source_cap: 0,
+    done: 0,
+    shift: 0,
+});
 
 /// Which source a phase's child waits on, and how.
 #[derive(Clone, Copy)]
@@ -79,34 +100,52 @@ pub fn run(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
-/// Park a child on a copy of a fresh `source`, destroy the source, and take
-/// the child's verdict.
+/// Park the phase's children on copies of a fresh `source`, destroy the
+/// source, and take every child's verdict.
 fn run_phase(ctx: &TestContext, source: Source) -> TestResult
 {
+    let count = match source
+    {
+        Source::WaitSet => 1,
+        _ => MAX_CHILDREN,
+    };
     let done = cap_create_notification(ctx.memory_base)
         .map_err(|_| "integration::destroyed_source_interrupts: create done failed")?;
     let (object, member) = create_source(ctx, source)?;
-    let child = start_child(ctx, source, object, done)?;
 
-    let mut acc = wait_for(done, 0, BIT_READY)?;
-    let _ = thread_sleep(SETTLE_SLEEP_MS);
-    // Revoke deletes the child's copy (a derivation child of `object`); the
-    // delete then drops the last reference and runs the dealloc wake.
+    let mut children: [Option<spawn::SpawnedChild>; MAX_CHILDREN] = [None, None];
+    let mut acc = 0;
+    for (index, slot) in children.iter_mut().enumerate().take(count)
+    {
+        *slot = Some(start_child(ctx, source, object, done, index)?);
+        acc = wait_for(done, acc, BIT_READY << shift(index))?;
+        thread_sleep(SETTLE_SLEEP_MS)
+            .map_err(|_| "integration::destroyed_source_interrupts: settle sleep failed")?;
+    }
+    // Revoke deletes the children's copies (derivation children of
+    // `object`); the delete then drops the last reference and runs the
+    // dealloc wake.
     cap_revoke(object).map_err(|_| "integration::destroyed_source_interrupts: revoke failed")?;
     cap_delete(object).map_err(|_| "integration::destroyed_source_interrupts: delete failed")?;
-    acc = wait_for(done, acc, BIT_OK | BIT_BAD)?;
+    for index in 0..count
+    {
+        acc = wait_for(done, acc, (BIT_OK | BIT_BAD) << shift(index))?;
+    }
 
-    cap_delete(child.th)
-        .map_err(|_| "integration::destroyed_source_interrupts: reap child thread failed")?;
-    cap_delete(child.cs)
-        .map_err(|_| "integration::destroyed_source_interrupts: reap child cspace failed")?;
+    for child in children.iter().flatten()
+    {
+        cap_delete(child.th)
+            .map_err(|_| "integration::destroyed_source_interrupts: reap child thread failed")?;
+        cap_delete(child.cs)
+            .map_err(|_| "integration::destroyed_source_interrupts: reap child cspace failed")?;
+    }
     if let Some(m) = member
     {
         cap_delete(m).map_err(|_| "integration::destroyed_source_interrupts: del member failed")?;
     }
     cap_delete(done).map_err(|_| "integration::destroyed_source_interrupts: del done failed")?;
 
-    if acc & BIT_BAD != 0
+    if (0..count).any(|index| acc & (BIT_BAD << shift(index)) != 0)
     {
         return Err(
             "integration::destroyed_source_interrupts: a wait on a destroyed source returned \
@@ -141,12 +180,22 @@ fn create_source(ctx: &TestContext, source: Source) -> Result<(u32, Option<u32>)
     Ok((object, Some(member)))
 }
 
-/// Start the phase's child waiting on a copy of `object`.
+/// The shift of child `index`'s `done` bits.
+fn shift(index: usize) -> u32
+{
+    // cast_possible_truncation: index < MAX_CHILDREN.
+    #[allow(clippy::cast_possible_truncation)]
+    let index = index as u32;
+    index * CHILD_SHIFT
+}
+
+/// Start child `index` waiting on a copy of `object`.
 fn start_child(
     ctx: &TestContext,
     source: Source,
     object: u32,
     done: u32,
+    index: usize,
 ) -> Result<spawn::SpawnedChild, &'static str>
 {
     let child = spawn::new_child(ctx)
@@ -162,16 +211,23 @@ fn start_child(
         Source::EventQueue => event_entry,
         Source::WaitSet => waitset_entry,
     };
-    // Phases run sequentially and each child is reaped (its thread deleted)
-    // before the next spawn, so the shared stack has one live user.
-    let stack = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
-    spawn::configure_and_start(
-        &child,
-        entry,
-        stack,
-        u64::from(c_object) | (u64::from(c_done) << 32),
-    )
-    .map_err(|_| "integration::destroyed_source_interrupts: start child failed")?;
+    // SAFETY: entry `index` belongs to this child alone; phases run
+    // sequentially and each phase's children are reaped before the next
+    // phase publishes.
+    let arg = unsafe {
+        CHILD_ARGS.publish(
+            index,
+            ChildArgs {
+                source_cap: c_object,
+                done: c_done,
+                shift: shift(index),
+            },
+        )
+    };
+    // SAFETY: stack `index` is this child's; reaped before the next phase.
+    let stack = ChildStack::top(unsafe { core::ptr::addr_of!(CHILD_STACKS[index]) });
+    spawn::configure_and_start(&child, entry, stack, arg)
+        .map_err(|_| "integration::destroyed_source_interrupts: start child failed")?;
     Ok(child)
 }
 
@@ -186,49 +242,41 @@ fn wait_for(done: u32, mut acc: u64, mask: u64) -> Result<u64, &'static str>
     Ok(acc)
 }
 
-// cast_possible_truncation: packed fields are 32-bit cap handles.
-#[allow(clippy::cast_possible_truncation)]
-fn unpack(arg: u64) -> (u32, u32)
+/// Raise READY, wait once, report the verdict on `done`, and exit.
+fn park_and_report(arg: u64, wait: fn(u32) -> Result<u64, i64>) -> !
 {
-    ((arg & 0xFFFF_FFFF) as u32, (arg >> 32) as u32)
-}
-
-/// Report the wait's verdict on `done` and exit.
-fn finish(done: u32, result: Result<u64, i64>) -> !
-{
-    let bit = match result
+    // SAFETY: `arg` is the entry `start_child` published for this child.
+    let ChildArgs {
+        source_cap,
+        done,
+        shift,
+    } = unsafe { spawn::child_args(arg) };
+    notification_send(done, BIT_READY << shift).ok();
+    let bit = match wait(source_cap)
     {
         Err(e) if e == SyscallError::Interrupted as i64 => BIT_OK,
         _ => BIT_BAD,
     };
-    notification_send(done, bit).ok();
+    notification_send(done, bit << shift).ok();
     thread_exit()
 }
 
 fn notif_entry(arg: u64) -> !
 {
-    let (sig, done) = unpack(arg);
-    notification_send(done, BIT_READY).ok();
-    finish(done, notification_wait(sig))
+    park_and_report(arg, notification_wait)
 }
 
 fn notif_timed_entry(arg: u64) -> !
 {
-    let (sig, done) = unpack(arg);
-    notification_send(done, BIT_READY).ok();
-    finish(done, notification_wait_timeout(sig, PARK_FOREVER_MS))
+    park_and_report(arg, |sig| notification_wait_timeout(sig, PARK_FOREVER_MS))
 }
 
 fn event_entry(arg: u64) -> !
 {
-    let (eq, done) = unpack(arg);
-    notification_send(done, BIT_READY).ok();
-    finish(done, event_recv(eq))
+    park_and_report(arg, event_recv)
 }
 
 fn waitset_entry(arg: u64) -> !
 {
-    let (ws, done) = unpack(arg);
-    notification_send(done, BIT_READY).ok();
-    finish(done, wait_set_wait(ws))
+    park_and_report(arg, wait_set_wait)
 }

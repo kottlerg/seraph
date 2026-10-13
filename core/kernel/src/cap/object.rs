@@ -2967,14 +2967,17 @@ unsafe fn dealloc_object_one(
                 // claimed under sig.lock — the #160 discipline notification_send
                 // uses — so a concurrent dealloc(waiter) BlockedOnNotification
                 // unlink (which takes sig.lock and spins on wake_in_flight)
-                // cannot free a TCB before its enqueue_and_wake commits.
-                // SAFETY: state validated non-null; sig.lock held across the
-                // claims and wakes (sig.lock → sched_lock is canonical).
+                // cannot free a TCB before its enqueue_and_wake commits; the
+                // wakes run once sig.lock is released.
+                // SAFETY: state validated non-null; the claims run under
+                // sig.lock and the wakes with no lock held.
                 unsafe {
                     let sig = &mut *state;
                     let saved = sig.lock.lock_raw();
-                    crate::ipc::interrupt_all_waiters(&mut sig.waiters);
+                    let detached = crate::ipc::interrupt_all_waiters(&mut sig.waiters);
+                    sig.refresh_observer();
                     sig.lock.unlock_raw(saved);
+                    detached.wake();
                 }
 
                 // A timer batch that popped a timed waiter of this notification

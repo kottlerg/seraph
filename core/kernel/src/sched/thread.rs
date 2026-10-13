@@ -368,7 +368,8 @@ pub unsafe fn consume_park_interrupted(tcb: *mut ThreadControlBlock) -> bool
 /// # Safety invariant
 /// `run_queue_next` and `ipc_wait_next` are raw intrusive pointers. They are
 /// only valid when the TCB is on a run queue or IPC wait queue respectively.
-/// Access is serialised by the owning CPU's `PerCpuScheduler` lock.
+/// `run_queue_next` is serialised by the owning CPU's `PerCpuScheduler` lock,
+/// `ipc_wait_next` by the lock of the IPC source whose queue links the TCB.
 #[repr(C)]
 pub struct ThreadControlBlock
 {
@@ -450,8 +451,9 @@ pub struct ThreadControlBlock
     /// `Exited` over a park it did not cancel (docs/thread-lifecycle-and-sleep.md
     /// § `sys_thread_stop` Cross-CPU Stop Protocol). The timer snapshots it at a
     /// sleep-list pop and claims only the park it popped (§ Sleep List
-    /// Invariants). Atomic (Relaxed) for those lock-free readers; every write
-    /// holds `sched_lock`.
+    /// Invariants). Atomic (Relaxed) because the timer reads it under
+    /// `SLEEP_LIST_LOCK` or the source lock rather than `sched_lock`; every
+    /// write holds `sched_lock`.
     pub park_seq: core::sync::atomic::AtomicU32,
 
     // === IPC state ===

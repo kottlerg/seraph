@@ -221,9 +221,10 @@ each change; the binding statement of the resulting invariants is
   - `Ready` → clear `wake_in_flight`, return (coalesce; do NOT set
     `wake_pending`). The thread is already linked, will be dispatched, and will
     consume the deposited payload; a `Ready` coalesce is only ever a same-event
-    duplicate (single-waiter-slot ⇒ a distinct event cannot target an
-    already-woken thread). Setting `wake_pending` here would risk a spurious
-    refuse-to-park on the thread's NEXT block.
+    duplicate (a claim removes the thread from its source's wait queue ⇒ a
+    distinct event cannot target an already-woken thread). Setting
+    `wake_pending` here would risk a spurious refuse-to-park on the thread's
+    NEXT block.
   - `Blocked|Created` → link: acquire the target run-queue lock (`sched_lock`
     outer → CPU lock inner), set `Ready`/`ipc_state`/`preferred_cpu`, clear
     `wake_pending` (defensive), `sched.enqueue` (the `queued_on` guard intact),

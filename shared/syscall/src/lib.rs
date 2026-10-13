@@ -1963,9 +1963,10 @@ pub fn wait_set_remove(ws_cap: u32, source_cap: u32) -> Result<(), i64>
 /// If multiple sources are ready, each call returns one badge without re-blocking.
 ///
 /// # Errors
-/// Returns a negative `i64` error code if the wait set cap is invalid, or
-/// `-16` (`Interrupted`) if the caller is stopped while waiting or the wait
-/// set is destroyed under it.
+/// Returns a negative `i64` error code if the wait set cap is invalid; `-15`
+/// (`InvalidState`) if another thread already waits on the set (a wait set
+/// takes one waiter); `-16` (`Interrupted`) if the caller is stopped while
+/// waiting or the wait set is destroyed under it.
 #[inline]
 pub fn wait_set_wait(ws_cap: u32) -> Result<u64, i64>
 {
@@ -2069,8 +2070,9 @@ pub fn ioport_bind(thread_cap: u32, ioport_cap: u32) -> Result<(), i64>
 ///
 /// If the thread was blocked (on IPC or in [`thread_sleep`]), or blocks while
 /// the stop is in progress, the blocking syscall returns `Interrupted` once
-/// the thread is restarted, unless its wake was claimed first. A thread may
-/// stop itself (pass its own thread cap).
+/// the thread is restarted, unless its wake was claimed first. The kernel's
+/// known exceptions (#443) are listed in `core/kernel/docs/syscalls.md`
+/// § `SYS_THREAD_STOP`. A thread may stop itself (pass its own thread cap).
 ///
 /// # Errors
 /// Returns a negative `i64` error code if the thread cap is invalid or lacks

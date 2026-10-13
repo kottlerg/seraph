@@ -16,8 +16,6 @@
 //!
 //! # Thread safety
 //! All operations serialise internally on `eq.lock`; callers must not hold it.
-//!
-//! # Adding features
 
 use crate::sched::thread::{IpcThreadState, ThreadControlBlock};
 
@@ -120,7 +118,7 @@ impl EventQueueState
 /// - If the queue is full, returns `Err(())`.
 ///   Syscall handler maps this to `SyscallError::QueueFull`.
 ///
-/// Between this function's waiter claim (slot cleared, payload deposited,
+/// Between this function's waiter claim (head waiter dequeued, payload deposited,
 /// `wake_in_flight = 1`) and the caller's post-unlock `enqueue_and_wake`, the
 /// wake is half-complete and owned exclusively by the in-flight waker. Code
 /// executing *as the claimed thread* in that window (it is still live,
@@ -337,14 +335,16 @@ pub unsafe fn event_queue_drop(eq: *mut EventQueueState)
     // SAFETY: eq is a valid pointer.
     let eq = unsafe { &mut *eq };
 
-    // Claim and wake every waiter under eq.lock — the #160 discipline
-    // event_queue_post uses — so a concurrent dealloc(waiter)
-    // BlockedOnEventQueue unlink (which takes eq.lock and spins on
-    // wake_in_flight) cannot free a TCB before its enqueue_and_wake commits.
+    // Claim every waiter under eq.lock — the #160 discipline event_queue_post
+    // uses — so a concurrent dealloc(waiter) BlockedOnEventQueue unlink (which
+    // takes eq.lock and spins on wake_in_flight) cannot free a TCB before its
+    // enqueue_and_wake commits; wake them once eq.lock is released.
     // SAFETY: lock_raw paired with unlock_raw below.
     let saved = unsafe { eq.lock.lock_raw() };
     // SAFETY: eq.lock held.
-    unsafe { crate::ipc::interrupt_all_waiters(&mut eq.waiters) };
+    let detached = unsafe { crate::ipc::interrupt_all_waiters(&mut eq.waiters) };
     // SAFETY: paired with lock_raw above.
     unsafe { eq.lock.unlock_raw(saved) };
+    // SAFETY: claimed above; no lock held.
+    unsafe { detached.wake() };
 }

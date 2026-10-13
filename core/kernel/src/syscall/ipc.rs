@@ -1258,14 +1258,15 @@ pub fn sys_notification_send(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// register (rdx/a1). A notification wake always carries non-zero bits because
 /// `notification_send` rejects zero-bit sends. A `0` bitmask with a `0` status
 /// means the timeout elapsed. A stop of the caller, or the destruction of the
-/// notification while the caller is parked, returns `Interrupted`. Several
-/// threads may wait; they queue in arrival order and each delivery wakes the
-/// longest-waiting one.
-/// The split is required because the bitmask is an
-/// unrestricted `u64`: an in-band encoding via `cast_signed` would alias
-/// bit-63-set payloads with the dispatcher's negative-Err codes. Same
-/// register layout as `sys_event_recv`; see that handler for the broader
-/// pattern.
+/// notification while the caller is parked, returns `Interrupted`. The split
+/// is required because the bitmask is an unrestricted `u64`: an in-band
+/// encoding via `cast_signed` would alias bit-63-set payloads with the
+/// dispatcher's negative-Err codes. Same register layout as `sys_event_recv`;
+/// see that handler for the broader pattern.
+///
+/// Several threads may wait; they queue in arrival order and each delivery
+/// wakes the longest-waiting one (a wait that enters while bits are pending
+/// takes them at once).
 #[cfg(not(test))]
 pub fn sys_notification_wait(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
@@ -1318,7 +1319,8 @@ pub fn sys_notification_wait(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         let deadline = crate::sched::sleep_deadline_after_ms(timeout_ms);
         // SAFETY: sig_state validated above; lock_raw paired with unlock_raw.
         let saved = unsafe { (*sig_state).lock.lock_raw() };
-        // SAFETY: sig_state valid; lock held — waiter field is stable.
+        // SAFETY: sig_state valid; sig.lock held, so the waiter queue and every
+        // TCB on it are stable.
         let still_waiter = unsafe { (*sig_state).waiters.contains(tcb) };
         if still_waiter
         {
@@ -1546,7 +1548,8 @@ pub fn sys_event_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         let deadline = crate::sched::sleep_deadline_after_ms(timeout_ms);
         // SAFETY: eq_state validated above; lock_raw paired with unlock_raw.
         let saved = unsafe { (*eq_state).lock.lock_raw() };
-        // SAFETY: eq_state valid; lock held — waiter field is stable.
+        // SAFETY: eq_state valid; eq.lock held, so the waiter queue and every
+        // TCB on it are stable.
         let still_waiter = unsafe { (*eq_state).waiters.contains(tcb) };
         if still_waiter
         {
@@ -2066,8 +2069,9 @@ pub fn sys_wait_set_remove(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// `SYS_WAIT_SET_ADD` time is returned in the secondary return register
 /// (rdx on x86-64, a1 on RISC-V). The caller then reads from the identified
 /// source normally. A stop of the caller, or the destruction of the wait set
-/// while the caller is parked, returns `Interrupted`. Waiters queue in arrival
-/// order and each ready member wakes the longest-waiting one.
+/// while the caller is parked, returns `Interrupted`. A wait set takes one
+/// waiter: a wait while another thread waits on the set returns `InvalidState`
+/// at once.
 #[cfg(not(test))]
 pub fn sys_wait_set_wait(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
@@ -2105,11 +2109,21 @@ pub fn sys_wait_set_wait(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // SAFETY: ws_state valid; scheduler lock not held.
     let result = unsafe { crate::ipc::wait_set::waitset_wait(ws_state, tcb) };
 
-    if let Ok(badge) = result
+    match result
     {
-        // A source was already ready; return its badge.
-        tf.set_ipc_return(0, badge);
-        return Ok(0);
+        Ok(badge) =>
+        {
+            // A source was already ready; return its badge.
+            tf.set_ipc_return(0, badge);
+            return Ok(0);
+        }
+        // Another thread waits on this set; this caller never parked.
+        Err(crate::ipc::wait_set::WaitSetPending::Occupied) =>
+        {
+            return Err(SyscallError::InvalidState);
+        }
+        Err(crate::ipc::wait_set::WaitSetPending::Parked) =>
+        {}
     }
 
     // SAFETY: scheduler initialized; called from syscall context.

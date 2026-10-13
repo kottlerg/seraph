@@ -27,12 +27,13 @@ pub struct Endpoint
     /// State of the endpoint.
     state: EndpointState,
 
-    /// Threads waiting to send (callers blocked in SYS_IPC_CALL).
-    send_queue: WaitQueue,
+    /// Threads waiting to send (callers blocked in SYS_IPC_CALL), FIFO.
+    send_head: *mut ThreadControlBlock,
+    send_tail: *mut ThreadControlBlock,
 
-    /// Thread waiting to receive (server blocked in SYS_IPC_RECV).
-    /// At most one thread may wait to receive at a time.
-    recv_waiter: Option<*mut ThreadControlBlock>,
+    /// Threads waiting to receive (servers blocked in SYS_IPC_RECV), FIFO.
+    recv_head: *mut ThreadControlBlock,
+    recv_tail: *mut ThreadControlBlock,
 
     /// Reference count (from KernelObjectHeader).
     header: KernelObjectHeader,
@@ -50,19 +51,17 @@ enum EndpointState
 }
 ```
 
-### Wait Queue
+### Wait Queues
 
-```rust
-struct WaitQueue
-{
-    /// Intrusive FIFO queue of TCB pointers. Threads are served in arrival order.
-    head: Option<*mut ThreadControlBlock>,
-    tail: Option<*mut ThreadControlBlock>,
-}
-```
+Every blocked thread is linked into its object's queue through `tcb.ipc_wait_next` — an
+intrusive pointer field in the TCB used only while the thread is blocked on an IPC object (a
+blocked thread waits on one object, so one link suffices). No separate allocation. Threads are
+served in arrival order.
 
-Threads are linked through `tcb.ipc_wait_next` — an intrusive pointer field in the
-TCB used only while the thread is blocked on an IPC object. No separate allocation.
+- An endpoint keeps a linear send queue and a linear receive queue, each a head and tail pointer.
+- A notification, event queue, or wait set keeps an `ipc::WaitQueue`: a circular list storing only
+  its tail (the head is the tail's successor), so it is pointer-sized and `push`/`pop` are O(1);
+  `remove` and `contains` walk it. A wait set holds at most one waiter (§ Wait Path).
 
 ### Call Path (Sender)
 
@@ -74,7 +73,7 @@ TCB used only while the thread is blocked on an IPC object. No separate allocati
 3. Acquire endpoint lock
 4. if endpoint.state == RecvWait:
    // Fast path: receiver is already waiting
-   a. recv_tcb = endpoint.recv_waiter
+   a. recv_tcb = head of the endpoint's recv queue (dequeued)
    b. Stage the message in recv_tcb.ipc_msg: label/counts/badge from the
       sender's saved register state, data words read from the sender's IPC
       buffer page (the receiver writes them to its own page when it resumes)
@@ -133,7 +132,7 @@ syscall on either side. Nothing is allocated on the path.
 
 4. else (endpoint.state == Idle):
    // Slow path: no sender yet
-   a. endpoint.recv_waiter = current_tcb
+   a. append current_tcb to the endpoint's recv queue
    b. endpoint.state = RecvWait
    c. Release endpoint lock
    d. Block current thread: state = BlockedOnRecv, call scheduler
@@ -179,16 +178,14 @@ below); the non-call parking surfaces (`sys_notification_wait`,
 `sys_event_recv`, `sys_ipc_recv`, `sys_wait_set_wait`, `sys_thread_sleep`)
 use the disposition only as a cancellation channel (fail-open, below).
 
-**Episode start (ownership window).** Every parking syscall resets
-`park_disposition = NONE` *before* its source-side registration publishes any
-claimable state (`reply_tcb`, a wait-queue link, a waiter slot, or the
-Blocked commit for a plain sleep) — `sys_ipc_call` via `open_call_episode`
-(which also bumps `park_episode`), the non-call surfaces via
-`open_park_episode` (no bump: their genuine wakers deliberately do not stamp,
-so the open/stamp counter pairing holds only for call/fault episodes). Until
-that publication the parking thread exclusively owns its wake fields, so the
-reset cannot race a deposit. `fault_dispatch` bumps the episode the same way
-next to its `fault_outcome = Pending` reset.
+**Episode start (ownership window).** Every parking syscall resets `park_disposition = NONE`
+*before* its source-side registration publishes any claimable state (`reply_tcb`, a wait-queue link
+— an endpoint queue or a source's waiter queue — or the Blocked commit for a plain sleep) —
+`sys_ipc_call` via `open_call_episode` (which also bumps `park_episode`), the non-call surfaces via
+`open_park_episode` (no bump: their genuine wakers deliberately do not stamp, so the open/stamp
+counter pairing holds only for call/fault episodes). Until that publication the parking thread
+exclusively owns its wake fields, so the reset cannot race a deposit. `fault_dispatch` bumps the
+episode the same way next to its `fault_outcome = Pending` reset.
 
 **Claim-then-stamp rule.** A site may stamp the episode only after winning
 the episode's exclusive wake claim. Per the DEPOSIT model (rule 8 /
@@ -222,7 +219,7 @@ same `(*tcb).sched_lock`, which carries it to the refusing parker (see
 | `wait_set_drop` (`dealloc_object(WaitSet)`) wake of every waiter | removal from the waiter queue under `ws.lock` | INTERRUPTED |
 | `dealloc_object(Endpoint)` send-queue drain | whole-queue detach under `ep.lock` | episode + INTERRUPTED (faulter: episode + KILL) |
 | `dealloc_object(Endpoint)` recv-queue drain | whole-queue detach under `ep.lock` | INTERRUPTED |
-| park-helper refused-commit rollbacks (`notification_wait`, `event_queue_recv`, `waitset_wait`, `endpoint_recv`) | source lock held continuously from publish to rollback — no waker ever saw the slot | INTERRUPTED on `ParkCommit::RefusedStop` only; a `RefusedWake` rollback must leave the coalesced deposit deliverable |
+| park-helper refused-commit rollbacks (`notification_wait`, `event_queue_recv`, `waitset_wait`, `endpoint_recv`) | source lock held continuously from publish to rollback — no waker ever saw the queued entry | INTERRUPTED on `ParkCommit::RefusedStop` only; a `RefusedWake` rollback must leave the coalesced deposit deliverable |
 
 **Resume (call/fault episodes — fail-closed).** `sys_ipc_call` consumes the
 disposition: REPLY reads `ipc_msg`; INTERRUPTED returns `Interrupted` without
@@ -315,8 +312,8 @@ pub struct NotificationState
    d. claim_waiter(tcb, delivered): wake_in_flight = 1,
       tcb.wakeup_value = delivered, and if tcb.sleep_deadline != 0
       sleep_list_remove(tcb) (clears the deadline with the entry)
-   f. Release sig.lock
-   g. enqueue_and_wake(tcb, target_cpu)        // outside the lock
+   e. Release sig.lock
+   f. enqueue_and_wake(tcb, target_cpu)        // outside the lock
 6. else if wait_set is Some(ws): waitset_notify(ws); release; return None
 7. else: release; return None                  // observer disappeared
 ```
@@ -490,7 +487,8 @@ pub struct WaitSetState
     ready_head: u8,
     ready_tail: u8,
 
-    /// Threads blocked in SYS_WAIT_SET_WAIT, in arrival order.
+    /// The thread blocked in SYS_WAIT_SET_WAIT, if any (at most one; a second
+    /// wait is refused). A WaitQueue so its claims share the source code.
     waiters: WaitQueue,
 }
 
@@ -553,7 +551,8 @@ waitset_notify(wait_set, member_idx):
 `SYS_WAIT_SET_WAIT`:
 
 ```
-1. Acquire lock
+1. Acquire lock; if a thread already waits, Release lock and return
+   InvalidState (a wait set takes one waiter)
 2. while ready_ring is non-empty:
    a. member_idx = ready_ring.pop()
    b. if members[member_idx] is vacant (removed): skip it
@@ -561,7 +560,7 @@ waitset_notify(wait_set, member_idx):
 3. Level-readiness self-heal: for each member, if source_is_ready(source)
    right now, Release lock and return its badge.
 4. else:
-   a. waiters.push(current_tcb) (the tail)
+   a. waiters.push(current_tcb)
    b. Release lock
    c. Block current thread; when woken, return Interrupted if the park is
       INTERRUPTED (a stop, or the wait set destroyed under the waiter), else
@@ -649,8 +648,10 @@ The capability-revocation deferred-cleanup pattern remains specified in
 The wake protocol — producer-side enqueue plus RESCHEDULE_PENDING set, IPI
 delivery, consumer-side atomic check-and-halt — is specified in
 [scheduling-internals.md § Wake Protocol Invariants](scheduling-internals.md#wake-protocol-invariants).
-IPC primitives invoke `enqueue_and_wake` after releasing their source IPC lock
-per [§ Lock Hierarchy rule 5](scheduling-internals.md#lock-hierarchy).
+IPC primitives invoke `enqueue_and_wake` after releasing their source IPC lock — the
+Notification, EventQueue, and WaitSet destroy wakes too, through `DetachedWaiters::wake` —
+except the endpoint dealloc drain, which holds `ep.lock` across its walk; both are per
+[§ Lock Hierarchy rule 5](scheduling-internals.md#lock-hierarchy).
 
 ### Lock-Free Notification Fast Path
 

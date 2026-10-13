@@ -726,7 +726,11 @@ keeping the capability and its remaining children). When the freed source
 slot's reference was the last one to a `Thread`, `CSpace`, or
 `AddressSpace`, the object goes to the CPU's deferred reclaim rather than
 being torn down in place — a teardown stops bound threads and waits on
-other CPUs, which must not happen inside IPC delivery. A capability whose
+other CPUs' scheduling, which must not happen inside IPC delivery. Other
+types are freed in place; a Notification or `EventQueue` may first wait for
+the timer's in-flight wakeup batch (`sched::sleep_wakeups_quiesce`), a
+bounded wait that needs only that no IPC, scheduler, or sleep-list lock is
+held, as at every move's release. A capability whose
 source and destination an ancestor's revoke both freed mid-transfer, or
 whose destination went with the receiver's `CSpace` (the sender then keeps
 it), is delivered as handle 0 (the permanently null slot); one that trips

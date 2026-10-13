@@ -17,10 +17,9 @@
 //! waiter with `Interrupted`.
 //!
 //! # Thread safety
-//! All fields are `#[cfg(not(test))]` to keep the struct out of host tests.
-//! Access is serialised by the caller holding the relevant CSpace/scheduler
-//! lock in kernel builds.
-//!
+//! `lock` serialises the waiter queue and the slow send/wait paths; `bits` and
+//! `has_observer` follow the lock-free Dekker protocol described on
+//! `has_observer`.
 
 use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 

@@ -35,13 +35,13 @@
 //! - IPC call: `Ok` with the server's reply label, or `Interrupted`;
 //! - sleep: `Ok` or `Interrupted`.
 //!
-//! Anything else fails the test, as does a run in which no stop cancelled a
-//! park (the race never armed). The kernel's debug assertions (the
+//! Anything else fails the test, as does a kind for which no stop cancelled a
+//! park (the race never armed for it). The kernel's debug assertions (the
 //! spurious-resume tripwire, the pop-time sleep-list checks) are tripwires too.
 //!
 //! Needs **≥ 2 CPUs**.
 
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use ipc::IpcMessage;
 use syscall::{
@@ -85,9 +85,6 @@ static RESULT: AtomicU32 = AtomicU32::new(0);
 /// `ACKED == CYCLES`, so it never runs ahead of the race it is part of.
 static ACKED: AtomicU32 = AtomicU32::new(0);
 
-/// Total `Interrupted` results across kinds.
-static INTERRUPTED: AtomicU64 = AtomicU64::new(0);
-
 /// IPC buffers for the call peer and the server (one live user each).
 #[repr(C, align(4096))]
 struct IpcBufPage([u64; 512]);
@@ -114,70 +111,126 @@ pub fn run(ctx: &TestContext) -> TestResult
         crate::log("ktest: stress::stop_park_race SKIP (need 2+ CPUs)");
         return Ok(());
     }
-    INTERRUPTED.store(0, Ordering::Relaxed);
     thread_set_affinity(ctx.thread_cap, 0)
         .map_err(|_| "stress::stop_park_race: pin controller failed")?;
     let server_cpu = u32::try_from(2 % cpus).unwrap_or(0);
-    let mut result = Ok(());
-    for kind in [Kind::Notification, Kind::Call, Kind::Sleep]
-    {
-        result = phase(ctx, kind, server_cpu);
-        if result.is_err()
-        {
-            break;
-        }
-    }
+    let result = all_phases(ctx, server_cpu);
     let restore = thread_set_affinity(ctx.thread_cap, u32::MAX)
         .map_err(|_| "stress::stop_park_race: restore controller affinity failed");
     result?;
-    restore?;
+    restore
+}
 
-    let interrupted = INTERRUPTED.load(Ordering::Relaxed);
-    crate::log_u64("ktest: stress::stop_park_race interrupted=", interrupted);
-    if interrupted == 0
+/// Run one phase per kind; each must see at least one cancelled park.
+fn all_phases(ctx: &TestContext, server_cpu: u32) -> TestResult
+{
+    for (kind, label, never_armed) in [
+        (
+            Kind::Notification,
+            "ktest: stress::stop_park_race notification interrupted=",
+            "stress::stop_park_race: no stop cancelled a notification wait (never armed)",
+        ),
+        (
+            Kind::Call,
+            "ktest: stress::stop_park_race call interrupted=",
+            "stress::stop_park_race: no stop cancelled an IPC call (never armed)",
+        ),
+        (
+            Kind::Sleep,
+            "ktest: stress::stop_park_race sleep interrupted=",
+            "stress::stop_park_race: no stop cancelled a sleep (never armed)",
+        ),
+    ]
     {
-        return Err("stress::stop_park_race: no stop ever cancelled a park (never armed)");
+        let interrupted = phase(ctx, kind, server_cpu)?;
+        crate::log_u64(label, interrupted);
+        if interrupted == 0
+        {
+            return Err(never_armed);
+        }
     }
     Ok(())
 }
 
-/// Run [`CYCLES`] stop/start races against one peer of `kind`.
-fn phase(ctx: &TestContext, kind: Kind, server_cpu: u32) -> TestResult
+/// The peer's source and, for the IPC kind, the server answering it.
+struct PhaseObjects
+{
+    source: Option<u32>,
+    server: Option<spawn::SpawnedChild>,
+}
+
+/// Run [`CYCLES`] stop/start races against one peer of `kind`; returns how
+/// many ended `Interrupted`. Everything the phase created is deleted on
+/// every path, the race's own error taking precedence.
+fn phase(ctx: &TestContext, kind: Kind, server_cpu: u32) -> Result<u64, &'static str>
 {
     PARKING.store(0, Ordering::Release);
     FINISHED.store(0, Ordering::Release);
     ACKED.store(0, Ordering::Release);
 
-    // The peer's source: a notification, or an endpoint a server answers.
-    let source = match kind
-    {
-        Kind::Notification => cap_create_notification(ctx.memory_base).map(Some),
-        Kind::Call => cap_create_endpoint(ctx.memory_base).map(Some),
-        Kind::Sleep => Ok(None),
-    }
-    .map_err(|_| "stress::stop_park_race: create source failed")?;
+    let mut objects = PhaseObjects {
+        source: None,
+        server: None,
+    };
+    let mut peer = None;
+    let result = setup(ctx, kind, server_cpu, &mut objects, &mut peer).and_then(|()| {
+        let peer_th = peer.as_ref().map_or(0, |p: &spawn::SpawnedChild| p.th);
+        let mut interrupted = 0u64;
+        for cycle in 1..=CYCLES
+        {
+            if race_once(kind, peer_th, objects.source, cycle)?
+            {
+                interrupted += 1;
+            }
+        }
+        Ok(interrupted)
+    });
+    let torn_down = teardown(peer.as_ref(), &objects);
+    let interrupted = result?;
+    torn_down.map(|()| interrupted)
+}
 
-    let server = if kind == Kind::Call
+/// Create the phase's source (and server), then start the peer pinned to
+/// CPU 1. Each created object is recorded before the next step so the
+/// teardown sees it whatever fails.
+fn setup(
+    ctx: &TestContext,
+    kind: Kind,
+    server_cpu: u32,
+    objects: &mut PhaseObjects,
+    peer: &mut Option<spawn::SpawnedChild>,
+) -> TestResult
+{
+    objects.source = match kind
     {
-        let ep = source.unwrap_or(0);
+        Kind::Notification => Some(
+            cap_create_notification(ctx.memory_base)
+                .map_err(|_| "stress::stop_park_race: create notification failed")?,
+        ),
+        Kind::Call => Some(
+            cap_create_endpoint(ctx.memory_base)
+                .map_err(|_| "stress::stop_park_race: create endpoint failed")?,
+        ),
+        Kind::Sleep => None,
+    };
+    if kind == Kind::Call
+    {
+        let ep = objects.source.unwrap_or(0);
         let s = spawn::new_child(ctx).map_err(|_| "stress::stop_park_race: spawn server failed")?;
+        let s = objects.server.insert(s);
         let s_ep = cap_copy(ep, s.cs, RIGHTS_ALL)
             .map_err(|_| "stress::stop_park_race: cap_copy server ep failed")?;
         // SAFETY: stack index 1 is the server's; phases run sequentially.
         let stack = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[1]) });
-        spawn::configure_and_start_pinned(&s, server_entry, stack, u64::from(s_ep), server_cpu)
+        spawn::configure_and_start_pinned(s, server_entry, stack, u64::from(s_ep), server_cpu)
             .map_err(|_| "stress::stop_park_race: start server failed")?;
-        Some(s)
     }
-    else
-    {
-        None
-    };
 
-    let peer = spawn::new_child(ctx).map_err(|_| "stress::stop_park_race: spawn peer failed")?;
-    let p_source = match source
+    let p = spawn::new_child(ctx).map_err(|_| "stress::stop_park_race: spawn peer failed")?;
+    let p = peer.insert(p);
+    let p_source = match objects.source
     {
-        Some(src) => cap_copy(src, peer.cs, RIGHTS_ALL)
+        Some(src) => cap_copy(src, p.cs, RIGHTS_ALL)
             .map_err(|_| "stress::stop_park_race: cap_copy peer source failed")?,
         None => 0,
     };
@@ -189,36 +242,38 @@ fn phase(ctx: &TestContext, kind: Kind, server_cpu: u32) -> TestResult
     };
     // SAFETY: stack index 0 is the peer's; phases run sequentially.
     let stack = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[0]) });
-    spawn::configure_and_start_pinned(&peer, entry, stack, u64::from(p_source), 1)
-        .map_err(|_| "stress::stop_park_race: start peer failed")?;
+    spawn::configure_and_start_pinned(p, entry, stack, u64::from(p_source), 1)
+        .map_err(|_| "stress::stop_park_race: start peer failed")
+}
 
-    let mut result = Ok(());
-    for cycle in 1..=CYCLES
+/// Delete the peer, the server, and the source. Deleting a thread stops it
+/// wherever it is, so the stacks are free for the next phase.
+fn teardown(peer: Option<&spawn::SpawnedChild>, objects: &PhaseObjects) -> TestResult
+{
+    let mut ok = true;
+    for child in peer.into_iter().chain(objects.server.as_ref())
     {
-        result = race_once(kind, peer.th, source, cycle);
-        if result.is_err()
-        {
-            break;
-        }
+        ok &= cap_delete(child.th).is_ok();
+        ok &= cap_delete(child.cs).is_ok();
     }
-
-    cap_delete(peer.th).map_err(|_| "stress::stop_park_race: reap peer thread failed")?;
-    cap_delete(peer.cs).map_err(|_| "stress::stop_park_race: reap peer cspace failed")?;
-    if let Some(s) = server
+    if let Some(src) = objects.source
     {
-        cap_delete(s.th).map_err(|_| "stress::stop_park_race: reap server thread failed")?;
-        cap_delete(s.cs).map_err(|_| "stress::stop_park_race: reap server cspace failed")?;
+        ok &= cap_delete(src).is_ok();
     }
-    if let Some(src) = source
+    if ok
     {
-        cap_delete(src).map_err(|_| "stress::stop_park_race: del source failed")?;
+        Ok(())
     }
-    result
+    else
+    {
+        Err("stress::stop_park_race: teardown failed")
+    }
 }
 
 /// One race: wait for the peer to approach its park, stop and restart it,
-/// release it if the stop missed, and check its result.
-fn race_once(kind: Kind, peer: u32, source: Option<u32>, cycle: u32) -> TestResult
+/// release it if the stop missed, and check its result. Returns whether the
+/// park ended `Interrupted`.
+fn race_once(kind: Kind, peer: u32, source: Option<u32>, cycle: u32) -> Result<bool, &'static str>
 {
     while PARKING.load(Ordering::Acquire) != cycle
     {
@@ -257,12 +312,8 @@ fn race_once(kind: Kind, peer: u32, source: Option<u32>, cycle: u32) -> TestResu
     ACKED.store(cycle, Ordering::Release);
     match result
     {
-        RESULT_GENUINE => Ok(()),
-        RESULT_INTERRUPTED =>
-        {
-            INTERRUPTED.fetch_add(1, Ordering::Relaxed);
-            Ok(())
-        }
+        RESULT_GENUINE => Ok(false),
+        RESULT_INTERRUPTED => Ok(true),
         _ => Err(
             "stress::stop_park_race: a stopped park returned neither its genuine result \
                   nor Interrupted",

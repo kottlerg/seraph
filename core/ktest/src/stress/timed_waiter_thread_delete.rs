@@ -73,37 +73,38 @@ fn cycles(ctx: &TestContext, cpus: u32) -> TestResult
 {
     let sig = cap_create_notification(ctx.memory_base)
         .map_err(|_| "stress::timed_waiter_thread_delete: create notification failed")?;
-    let eq = event_queue_create(ctx.memory_base, 4)
-        .map_err(|_| "stress::timed_waiter_thread_delete: create event queue failed")?;
+    let Ok(eq) = event_queue_create(ctx.memory_base, 4)
+    else
+    {
+        let _ = cap_delete(sig);
+        return Err("stress::timed_waiter_thread_delete: create event queue failed");
+    };
+    let mut result = Ok(());
     for cycle in 0..CYCLES
     {
-        let child = spawn::new_child(ctx)
-            .map_err(|_| "stress::timed_waiter_thread_delete: spawn waiter failed")?;
-        let (entry, source): (fn(u64) -> !, u32) = match cycle % 3
+        result = one_cycle(ctx, cycle, cpus, sig, eq);
+        if result.is_err()
         {
-            0 => (sleep_waiter, 0),
-            1 => (notif_waiter, sig),
-            _ => (queue_waiter, eq),
-        };
-        let c_source = if source == 0
-        {
-            0
+            break;
         }
-        else
-        {
-            cap_copy(source, child.cs, RIGHTS_ALL)
-                .map_err(|_| "stress::timed_waiter_thread_delete: cap_copy source failed")?
-        };
-        LOOPS.store(0, Ordering::Release);
-        // SAFETY: stack index 0 is this test's only live child; each cycle's
-        // waiter is deleted (and off every CPU) before the next starts.
-        let stack = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[0]) });
-        // The waiter alternates between CPU 0, which runs the timer, and a
-        // CPU other than the controller's 1 (CPU 0 again on a 2-CPU run).
-        let waiter_cpu = if (cycle / 3) & 1 == 0 { 0 } else { 2 % cpus };
-        spawn::configure_and_start_pinned(&child, entry, stack, u64::from(c_source), waiter_cpu)
-            .map_err(|_| "stress::timed_waiter_thread_delete: start waiter failed")?;
+    }
+    let deleted = [cap_delete(eq), cap_delete(sig)]
+        .into_iter()
+        .collect::<Result<(), i64>>();
+    result?;
+    deleted.map_err(|_| "stress::timed_waiter_thread_delete: del sources failed")
+}
 
+/// One cycle: start a timed waiter, then delete its last Thread cap around
+/// its deadlines. The waiter is deleted on every path, so the stack is free
+/// for the next cycle.
+fn one_cycle(ctx: &TestContext, cycle: u32, cpus: u32, sig: u32, eq: u32) -> TestResult
+{
+    let child = spawn::new_child(ctx)
+        .map_err(|_| "stress::timed_waiter_thread_delete: spawn waiter failed")?;
+    let started = start_waiter(&child, cycle, cpus, sig, eq);
+    if started.is_ok()
+    {
         while LOOPS.load(Ordering::Acquire) == 0
         {
             let _ = thread_sleep(1);
@@ -113,16 +114,45 @@ fn cycles(ctx: &TestContext, cpus: u32) -> TestResult
         {
             core::hint::spin_loop();
         }
-        // The waiter holds no capability to its own thread, so this is the
-        // last one: the dealloc stops the waiter wherever it is.
-        cap_delete(child.th)
-            .map_err(|_| "stress::timed_waiter_thread_delete: delete thread failed")?;
-        cap_delete(child.cs)
-            .map_err(|_| "stress::timed_waiter_thread_delete: reap cspace failed")?;
     }
-    cap_delete(eq).map_err(|_| "stress::timed_waiter_thread_delete: del event queue failed")?;
-    cap_delete(sig).map_err(|_| "stress::timed_waiter_thread_delete: del notification failed")?;
-    Ok(())
+    // The waiter holds no capability to its own thread, so this is the last
+    // one: the dealloc stops the waiter wherever it is.
+    let reaped = [cap_delete(child.th), cap_delete(child.cs)]
+        .into_iter()
+        .collect::<Result<(), i64>>();
+    started?;
+    reaped.map_err(|_| "stress::timed_waiter_thread_delete: delete waiter failed")
+}
+
+/// Configure and start this cycle's waiter: a plain sleeper, a timed
+/// notification waiter, or a timed event-queue waiter, by cycle.
+fn start_waiter(child: &spawn::SpawnedChild, cycle: u32, cpus: u32, sig: u32, eq: u32)
+-> TestResult
+{
+    let (entry, source): (fn(u64) -> !, u32) = match cycle % 3
+    {
+        0 => (sleep_waiter, 0),
+        1 => (notif_waiter, sig),
+        _ => (queue_waiter, eq),
+    };
+    let c_source = if source == 0
+    {
+        0
+    }
+    else
+    {
+        cap_copy(source, child.cs, RIGHTS_ALL)
+            .map_err(|_| "stress::timed_waiter_thread_delete: cap_copy source failed")?
+    };
+    LOOPS.store(0, Ordering::Release);
+    // SAFETY: stack index 0 is this test's only live child; each cycle's
+    // waiter is deleted (and off every CPU) before the next starts.
+    let stack = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[0]) });
+    // The waiter alternates between CPU 0, which runs the timer, and a CPU
+    // other than the controller's 1 (CPU 0 again on a 2-CPU run).
+    let waiter_cpu = if (cycle / 3) & 1 == 0 { 0 } else { 2 % cpus };
+    spawn::configure_and_start_pinned(child, entry, stack, u64::from(c_source), waiter_cpu)
+        .map_err(|_| "stress::timed_waiter_thread_delete: start waiter failed")
 }
 
 /// Count a started wait, then run it; loop until deleted.

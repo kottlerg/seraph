@@ -1512,15 +1512,6 @@ static mut SLEEP_LIST: [*mut ThreadControlBlock; MAX_SLEEPING] =
 #[cfg(not(test))]
 static mut SLEEP_COUNT: usize = 0;
 
-/// Scratch buffer holding the TCBs `sleep_check_wakeups` collects between
-/// dropping `SLEEP_LIST_LOCK` and waking them.
-///
-/// Off-stack via the CPU0-static idiom of docs/scheduling-internals.md
-/// § Off-Stack Scratch for Ceiling-Sized Arrays: a `[_; MAX_SLEEPING]` frame in
-/// `timer_tick` (which inlines `sleep_check_wakeups`) would overrun the timer
-/// ISR's borrowed kernel stack. `sleep_check_wakeups` runs only on CPU0 (see
-/// `timer_tick`'s `cpu == 0` gate) behind an interrupt gate (IF=0), so it is
-/// non-reentrant and this single buffer needs no lock of its own.
 /// One expired sleeper, snapshotted under `SLEEP_LIST_LOCK` at pop. The
 /// per-entry claim loop dispatches off this snapshot rather than re-reading the
 /// TCB, so a concurrent `dealloc_object(Thread)` that frees the TCB after the
@@ -1533,6 +1524,8 @@ struct ExpiredWaiter
     tcb: *mut ThreadControlBlock,
     ipc_state: thread::IpcThreadState,
     blocked_on: *mut u8,
+    /// `park_seq` of the popped park: a timed-wait claim requires it unchanged.
+    park_seq: u32,
 }
 
 #[cfg(not(test))]
@@ -1542,9 +1535,19 @@ impl ExpiredWaiter
         tcb: core::ptr::null_mut(),
         ipc_state: thread::IpcThreadState::None,
         blocked_on: core::ptr::null_mut(),
+        park_seq: 0,
     };
 }
 
+/// Scratch buffer holding the TCBs `sleep_check_wakeups` collects between
+/// dropping `SLEEP_LIST_LOCK` and waking them.
+///
+/// Off-stack via the CPU0-static idiom of docs/scheduling-internals.md
+/// § Off-Stack Scratch for Ceiling-Sized Arrays: a `[_; MAX_SLEEPING]` frame in
+/// `timer_tick` (which inlines `sleep_check_wakeups`) would overrun the timer
+/// ISR's borrowed kernel stack. `sleep_check_wakeups` runs only on CPU0 (see
+/// `timer_tick`'s `cpu == 0` gate) behind an interrupt gate (IF=0), so it is
+/// non-reentrant and this single buffer needs no lock of its own.
 #[cfg(not(test))]
 static mut EXPIRED_SCRATCH: [ExpiredWaiter; MAX_SLEEPING] = [ExpiredWaiter::EMPTY; MAX_SLEEPING];
 
@@ -1586,8 +1589,11 @@ pub fn sleep_deadline_after_ms(ms: u64) -> u64
 /// MUST roll back or degrade the park. A TCB already listed keeps its single
 /// entry, which carries the deadline the caller just wrote.
 /// See docs/thread-lifecycle-and-sleep.md § Sleep List Invariants.
+///
+/// # Safety
+/// `tcb` must point to a live TCB: the running parker's own.
 #[cfg(not(test))]
-pub fn sleep_list_add(tcb: *mut ThreadControlBlock) -> Result<(), SleepAddError>
+pub unsafe fn sleep_list_add(tcb: *mut ThreadControlBlock) -> Result<(), SleepAddError>
 {
     // SAFETY: lock serialises all sleep list access.
     let saved = unsafe { SLEEP_LIST_LOCK.lock_raw() };
@@ -1635,8 +1641,11 @@ pub fn sleep_list_add(tcb: *mut ThreadControlBlock) -> Result<(), SleepAddError>
 /// timer pop clears the deadline under the same lock, so exactly one of the
 /// pop and this call observes it non-zero.
 /// See docs/thread-lifecycle-and-sleep.md § Sleep List Invariants.
+///
+/// # Safety
+/// `tcb` must point to a live TCB (kept alive by the caller's lock or claim).
 #[cfg(not(test))]
-pub fn sleep_list_remove(tcb: *mut ThreadControlBlock) -> bool
+pub unsafe fn sleep_list_remove(tcb: *mut ThreadControlBlock) -> bool
 {
     // SAFETY: lock serialises all sleep list access.
     let saved = unsafe { SLEEP_LIST_LOCK.lock_raw() };
@@ -1666,27 +1675,22 @@ pub fn sleep_list_remove(tcb: *mut ThreadControlBlock) -> bool
     pending
 }
 
-/// Wait until no timer batch that popped an entry before this call is still
-/// dispatching.
+/// Wait until every timer batch whose pop preceded this call has finished
+/// dispatching — the gate the Notification, `EventQueue`, and Thread dealloc
+/// arms pass before freeing an object a batch may still hold from its pop
+/// (docs/thread-lifecycle-and-sleep.md § Sleep List Invariants, invariant 9).
 ///
-/// The Notification and `EventQueue` dealloc arms call this after claiming
-/// the source's waiter (which removes that waiter's entry under the source
-/// lock) and before freeing the source: a batch that popped the waiter
-/// earlier holds the source pointer from its pop-time snapshot, with no
-/// reference, until it releases the source lock. Taking and releasing
-/// `SLEEP_LIST_LOCK` orders this call after every such pop; an odd sequence
-/// then names the batch still in flight. No later batch can snapshot the
-/// source: no entry bound to it remains.
-///
-/// The spin runs with interrupts enabled and preemption disabled, as the
-/// `dealloc_object(Thread)` gates do. The caller MUST NOT hold any IPC
-/// source, scheduler, or sleep-list lock (the batch takes source locks).
+/// Spins with interrupts enabled and preemption disabled. The caller MUST
+/// NOT hold any IPC source, scheduler, or sleep-list lock (the batch takes
+/// source and scheduler locks).
 #[cfg(not(test))]
 pub fn sleep_wakeups_quiesce()
 {
     // SAFETY: lock serialises all sleep list access; paired below.
     let saved = unsafe { SLEEP_LIST_LOCK.lock_raw() };
-    let seq = TIMER_DISPATCH_SEQ.load(core::sync::atomic::Ordering::Relaxed);
+    // Acquire: an even value returns at once, so it must order the batch's
+    // last access (its Release increment) before the caller's free.
+    let seq = TIMER_DISPATCH_SEQ.load(core::sync::atomic::Ordering::Acquire);
     // SAFETY: paired with lock_raw above.
     unsafe { SLEEP_LIST_LOCK.unlock_raw(saved) };
     if seq & 1 == 0
@@ -1768,6 +1772,7 @@ pub fn sleep_check_wakeups()
                 // TCB to choose its arm.
                 let ipc_state = (*tcb).ipc_state;
                 let blocked_on = (*tcb).blocked_on_object;
+                let park_seq = (*tcb).park_seq.load(core::sync::atomic::Ordering::Relaxed);
                 debug_assert!(
                     matches!(ipc_state, thread::IpcThreadState::None)
                         || (matches!(
@@ -1803,6 +1808,7 @@ pub fn sleep_check_wakeups()
                     tcb,
                     ipc_state,
                     blocked_on,
+                    park_seq,
                 };
                 n += 1;
                 // Remove from list by swapping with last entry.
@@ -1834,6 +1840,7 @@ pub fn sleep_check_wakeups()
         tcb,
         ipc_state,
         blocked_on,
+        park_seq,
     } in expired.iter().take(n)
     {
         // ipc_state/blocked_on are the pop-time snapshot (taken under
@@ -1860,8 +1867,16 @@ pub fn sleep_check_wakeups()
                 // dealloc quiesces this batch); lock serialises against
                 // notification_send.
                 let saved_sig = unsafe { (*sig_state).lock.lock_raw() };
+                // Claim only the park that was popped: the waiter slot may name
+                // the same TCB again in a later wait (claimed by a sender and
+                // re-parked since the pop), whose park_seq differs. The slot is
+                // published and park_seq advanced under sig.lock, so both reads
+                // are stable here, and tcb is alive while the slot names it.
                 // SAFETY: same as above.
-                let we_win = unsafe { (*sig_state).waiter } == tcb;
+                let we_win = unsafe {
+                    (*sig_state).waiter == tcb
+                        && (*tcb).park_seq.load(core::sync::atomic::Ordering::Relaxed) == park_seq
+                };
                 if we_win
                 {
                     // SAFETY: we hold sig.lock and sig.waiter == tcb, so a
@@ -1904,8 +1919,13 @@ pub fn sleep_check_wakeups()
                 // released above; we now take eq.lock alone — no cycle (post
                 // path is eq.lock → SLEEP_LIST_LOCK).
                 let saved_eq = unsafe { (*eq_state).lock.lock_raw() };
+                // Claim only the park that was popped (see the notification
+                // arm); the slot and park_seq are written under eq.lock.
                 // SAFETY: same as above.
-                let we_win = unsafe { (*eq_state).waiter } == tcb;
+                let we_win = unsafe {
+                    (*eq_state).waiter == tcb
+                        && (*tcb).park_seq.load(core::sync::atomic::Ordering::Relaxed) == park_seq
+                };
                 if we_win
                 {
                     // SAFETY: we hold eq.lock and eq.waiter == tcb, so a
@@ -2144,7 +2164,7 @@ pub fn init(cpu_count: u32) -> u32
                     sched_lock: crate::sync::Spinlock::new(),
                     wake_pending: false,
                     park_started_tick: 0,
-                    park_seq: 0,
+                    park_seq: core::sync::atomic::AtomicU32::new(0),
                     ipc_state: IpcThreadState::None,
                     ipc_msg: crate::ipc::message::Message::default(),
                     reply_tcb: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
@@ -2449,16 +2469,20 @@ pub unsafe fn set_state_under_all_locks(
     new_state: thread::ThreadState,
 ) -> StateCommit
 {
-    // SAFETY: caller contract; no expected park generation, so the commit
-    // always resolves.
-    unsafe { commit_state_under_all_locks(tcb, new_state, None, None) }
-        .unwrap_or(StateCommit::RefusedExited)
+    // SAFETY: caller contract.
+    let commit = unsafe { commit_state_under_all_locks(tcb, new_state, None, None) };
+    // Without an expected park generation the commit always resolves.
+    debug_assert!(
+        commit.is_some(),
+        "set_state_under_all_locks: unresolved commit"
+    );
+    commit.unwrap_or(StateCommit::RefusedExited)
 }
 
 /// Mark `tcb` `Exited` with `exit_reason` recorded under the same all-locks
-/// hold as the state write — every exit path's commit: the thread's own
-/// exit and fault paths, and the object-teardown walk (`EXIT_KILLED`). A
-/// refused commit (the thread is already `Exited`) writes neither, so the
+/// hold as the state write — the commit of the thread's own exit and fault
+/// paths (the object-teardown walk records `EXIT_KILLED` through
+/// [`commit_cancelling_park`], with the same refusal rule). A refused commit (the thread is already `Exited`) writes neither, so the
 /// reason recorded by the commit that won survives; an exit path whose
 /// commit lost still posts its own reason (no death walk posts
 /// `EXIT_KILLED`; a bind after the stop delivers it), so a thread killed
@@ -2469,12 +2493,13 @@ pub unsafe fn set_state_under_all_locks(
 #[cfg(not(test))]
 pub unsafe fn exit_under_all_locks(tcb: *mut ThreadControlBlock, exit_reason: u64) -> StateCommit
 {
-    // SAFETY: caller contract; no expected park generation, so the commit
-    // always resolves.
-    unsafe {
+    // SAFETY: caller contract.
+    let commit = unsafe {
         commit_state_under_all_locks(tcb, thread::ThreadState::Exited, Some(exit_reason), None)
-    }
-    .unwrap_or(StateCommit::RefusedExited)
+    };
+    // Without an expected park generation the commit always resolves.
+    debug_assert!(commit.is_some(), "exit_under_all_locks: unresolved commit");
+    commit.unwrap_or(StateCommit::RefusedExited)
 }
 
 /// Commit `Stopped` (or `Exited` with `exit_reason`) over whatever park the
@@ -2488,6 +2513,11 @@ pub unsafe fn exit_under_all_locks(tcb: *mut ThreadControlBlock, exit_reason: u6
 /// pass is retried and that park is cancelled too: the commit never writes
 /// over a park it did not cancel. See docs/thread-lifecycle-and-sleep.md
 /// § `sys_thread_stop` Cross-CPU Stop Protocol.
+///
+/// Returns [`StateCommit::Committed`] with the CPU whose `current` is the
+/// thread (`None` when it runs nowhere), or [`StateCommit::RefusedExited`]
+/// when the thread is already `Exited` (nothing written; `exit_reason` too is
+/// left as the winning commit recorded it).
 ///
 /// # Safety
 /// `tcb` must be a valid TCB pointer. The caller MUST NOT hold the target's
@@ -2506,7 +2536,10 @@ pub unsafe fn commit_cancelling_park(
         // under sched_lock, their writers' lock.
         let (state, seq) = unsafe {
             let saved = (*tcb).sched_lock.lock_raw();
-            let snap = ((*tcb).state, (*tcb).park_seq);
+            let snap = (
+                (*tcb).state,
+                (*tcb).park_seq.load(core::sync::atomic::Ordering::Relaxed),
+            );
             (*tcb).sched_lock.unlock_raw(saved);
             snap
         };
@@ -2572,7 +2605,9 @@ unsafe fn commit_state_under_all_locks(
     let (exited, park_changed) = unsafe {
         (
             (*tcb).state == thread::ThreadState::Exited,
-            expected_park_seq.is_some_and(|seq| seq != (*tcb).park_seq),
+            expected_park_seq.is_some_and(|seq| {
+                seq != (*tcb).park_seq.load(core::sync::atomic::Ordering::Relaxed)
+            }),
         )
     };
     let mut running_on: Option<usize> = None;
@@ -2880,7 +2915,7 @@ unsafe fn mark_bound_threads(
             // `state` is read without `sched_lock` here and below: `Exited`
             // is terminal, so a positive read is final, and a negative read
             // is re-decided under the full lock set by
-            // `exit_under_all_locks`, which refuses an exited thread
+            // `commit_cancelling_park`, which refuses an exited thread
             // (docs/scheduling-internals.md § Cross-CPU TCB Ownership).
             if !bound(tcb) || (*tcb).state == thread::ThreadState::Exited
             {
@@ -2995,10 +3030,11 @@ unsafe fn scan_bound_current(
 /// `bound`, before the object's storage is reclaimed.
 ///
 /// Phase 1 ([`mark_bound_threads`]) walks the thread registry under its
-/// lock: each bound thread not already `Exited` has any IPC block cancelled
-/// and is marked `Exited` under the all-locks discipline with `EXIT_KILLED`
-/// recorded as its retained exit reason in the same hold
-/// (`exit_under_all_locks`, draining every run queue); CPUs found
+/// lock: each bound thread not already `Exited` has any park cancelled and
+/// is marked `Exited` under the all-locks discipline with `EXIT_KILLED`
+/// recorded as its retained exit reason in the same hold, the commit retried
+/// until no park was committed since the cancel ([`commit_cancelling_park`],
+/// draining every run queue); CPUs found
 /// running one are recorded. Phase 2, with the registry released — a CPU
 /// spinning on the registry lock inside `register` cannot deschedule, so it
 /// must not be waited for while the lock is held — prods those CPUs and
@@ -3252,7 +3288,9 @@ pub unsafe fn commit_blocked_under_local_lock(
                     (*tcb).state = thread::ThreadState::Blocked;
                     (*tcb).ipc_state = ipc;
                     (*tcb).blocked_on_object = blocked_on;
-                    (*tcb).park_seq = (*tcb).park_seq.wrapping_add(1);
+                    (*tcb)
+                        .park_seq
+                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                     // Diagnostic stamp for the owed-wake detector; written
                     // under sched_lock like the rest of the Scheduling group.
                     (*tcb).park_started_tick = crate::arch::current::timer::current_tick();
@@ -3339,7 +3377,9 @@ pub unsafe fn commit_reply_rebind_under_local_lock(
             unsafe {
                 (*tcb).ipc_state = ipc;
                 (*tcb).blocked_on_object = blocked_on;
-                (*tcb).park_seq = (*tcb).park_seq.wrapping_add(1);
+                (*tcb)
+                    .park_seq
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             }
             true
         }

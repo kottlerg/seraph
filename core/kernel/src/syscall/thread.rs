@@ -262,11 +262,20 @@ unsafe fn commit_stopped(
 ///
 /// arg0 = Thread cap index (must have CONTROL).
 ///
-/// Cancels any pending IPC block (the stopped thread's blocked syscall returns
-/// `Interrupted`). If the thread is already Stopped or Exited, returns
-/// `InvalidState`. A thread may stop itself (arg0 refers to the calling thread).
+/// Cancels any park — an IPC wait or a `SYS_THREAD_SLEEP` — including one the
+/// target commits while the stop is in progress: the stopped thread's blocked
+/// syscall returns `Interrupted` on restart, unless a genuine waker or the
+/// sleep timer claimed the wake first. A thread may stop itself (arg0 refers
+/// to the calling thread).
 ///
 /// Returns 0 on success.
+///
+/// # Errors
+/// - `InvalidCapability`: no current thread, or arg0 names no Thread cap.
+/// - `InsufficientRights`: the cap lacks CONTROL.
+/// - `InvalidState`: the target is `Created`, `Stopped`, or `Exited` when the
+///   call reads it, or exits before the commit. Two concurrent stops of one
+///   running thread can both succeed.
 #[cfg(not(test))]
 pub fn sys_thread_stop(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
@@ -306,8 +315,9 @@ pub fn sys_thread_stop(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // SAFETY: target_tcb validated non-null; state field always valid.
     unsafe {
-        // Unlocked precheck for the InvalidState answer only; the commit
-        // re-decides under the target's sched_lock.
+        // Unlocked precheck for the InvalidState answer; the commit
+        // re-decides only `Exited`, so a stop racing another stop writes
+        // Stopped again and both succeed.
         if matches!(
             (*target_tcb).state,
             ThreadState::Created | ThreadState::Exited | ThreadState::Stopped
@@ -426,7 +436,8 @@ pub fn sys_thread_stop(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// or any per-CPU scheduler lock: this function acquires `tcb.sched_lock` itself
 /// for the binding read-and-clear, and per-source IPC locks for the unlink (lock
 /// order: source IPC → `sched_lock`, so the two are never held together;
-/// `SLEEP_LIST_LOCK` nests inside either as a leaf). The
+/// `SLEEP_LIST_LOCK` nests inside either as a leaf), so it MUST NOT hold any
+/// IPC source lock or `SLEEP_LIST_LOCK` either. The
 /// caller MAY hold `THREAD_REGISTRY_LOCK` (ordered before every lock taken
 /// here; the object-teardown walk does), which keeps `tcb` from being freed
 /// meanwhile.

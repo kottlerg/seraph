@@ -48,6 +48,8 @@
 //! - `park_interrupted_stop_start.rs` — a thread stopped while parked in any non-call blocking syscall (notification/event/recv/wait-set/sleep) restarts to `Interrupted`, never a stale deposit (#363)
 //! - `destroyed_source_interrupts.rs` — a waiter on a notification, event queue, or wait set
 //!   destroyed under it returns `Interrupted`, never a fabricated success
+//! - `second_waiter_displaces.rs` — a second thread's wait on a notification, event queue, or
+//!   wait set displaces the parked one, whose wait returns `Interrupted`
 //! - Architecture-only scenarios live behind `crate::arch` (`run_integration`);
 //!   per-arch helpers and branches inside the scenarios above are still gated in
 //!   place (#460).
@@ -76,6 +78,7 @@ pub mod park_interrupted_stop_start;
 pub mod priority_preemption;
 pub mod retype_reclaim;
 pub mod retype_subpage_clobber;
+pub mod second_waiter_displaces;
 pub mod shared_memory_two_aspaces;
 pub mod thread_lifecycle;
 pub mod tlb_coherency;
@@ -122,6 +125,10 @@ pub fn run_all(ctx: &TestContext)
     run_integration_test!(
         "integration::destroyed_source_interrupts",
         destroyed_source_interrupts::run(ctx)
+    );
+    run_integration_test!(
+        "integration::second_waiter_displaces",
+        second_waiter_displaces::run(ctx)
     );
     run_integration_test!(
         "integration::cap_delegation_chain",

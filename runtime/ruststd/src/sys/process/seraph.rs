@@ -615,7 +615,7 @@ impl Command {
                     completion_notification,
                     pipe_notifications,
                     exit_reason: exit_reason.clone(),
-                    peer_dead,
+                    peer_dead: peer_dead.clone(),
                 };
                 let handle = crate::thread::Builder::new()
                     .name(crate::string::String::from("seraph-deathbridge"))
@@ -627,6 +627,7 @@ impl Command {
                     completion_notification,
                     handle: Some(handle),
                     exit_reason,
+                    peer_dead,
                 })
             })();
             match bridge_setup {
@@ -964,6 +965,9 @@ struct Bridge {
     /// Exit reason published by the bridge before raising
     /// `completion_notification`. Read by `wait` after the wake.
     exit_reason: Arc<AtomicU64>,
+    /// Set by the bridge (Release) after publishing `exit_reason`; polled by
+    /// `try_wait`, which must not block.
+    peer_dead: Arc<AtomicBool>,
 }
 
 pub struct Process {
@@ -1045,23 +1049,17 @@ impl Process {
             return Ok(Some(cached));
         }
         let reason = if let Some(b) = self.bridge.as_mut() {
-            // `notification_wait_timeout(_, 0)` returns immediately. Non-zero
-            // wakeup_value means the bridge published `exit_reason` and
-            // raised `completion_notification`; zero means "nothing pending".
-            match syscall::notification_wait_timeout(b.completion_notification, 0) {
-                Ok(bits) if bits != 0 => {
-                    if let Some(h) = b.handle.take() {
-                        let _ = h.join();
-                    }
-                    b.exit_reason.load(Ordering::Acquire)
-                }
-                Ok(_) => return Ok(None),
-                Err(_) => {
-                    return Err(io::Error::other(
-                        "notification_wait_timeout on completion_notification failed",
-                    ));
-                }
+            // A blocking wait would stall here (a 0 timeout waits forever),
+            // so poll the death flag the bridge sets after `exit_reason`.
+            if !b.peer_dead.load(Ordering::Acquire) {
+                return Ok(None);
             }
+            // The bridge's remaining work (pipe kicks, ring releases, the
+            // completion send) is bounded; join it before reporting.
+            if let Some(h) = b.handle.take() {
+                let _ = h.join();
+            }
+            b.exit_reason.load(Ordering::Acquire)
         } else {
             // Non-piped: `event_try_recv` returns `WouldBlock` (-6) if
             // the kernel hasn't posted yet.

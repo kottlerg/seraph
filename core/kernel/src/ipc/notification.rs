@@ -10,8 +10,11 @@
 //! zero bits set, it blocks until a sender delivers bits.
 //!
 //! # Blocking semantics
-//! Only one thread may wait on a notification at a time (single-waiter invariant).
-//! The waiter is woken immediately if bits are already set when it calls wait.
+//! Only one thread waits on a notification at a time (single-waiter invariant):
+//! a wait while another thread waits displaces it, and the displaced wait
+//! returns `Interrupted` (`claim_displaced_waiter`), so no thread stays parked
+//! on a slot that no longer names it. The waiter is woken immediately if bits
+//! are already set when it calls wait.
 //!
 //! # Thread safety
 //! All fields are `#[cfg(not(test))]` to keep the struct out of host tests.
@@ -165,16 +168,9 @@ pub unsafe fn notification_send(
                 );
                 (*waiter).wakeup_value = delivered;
             }
-            // If the waiter was registered with a `SYS_NOTIFICATION_WAIT` timeout, it
-            // is also on the global sleep list. Remove it here, with the
-            // waiter slot, so the timer path will not try to double-wake this
-            // thread and no entry outlives the binding. We hold `sig.lock`;
-            // `sleep_list_remove` acquires `SLEEP_LIST_LOCK` internally and
-            // clears the deadline with the entry (lock order: sig.lock →
-            // SLEEP_LIST_LOCK; the timer path takes SLEEP_LIST_LOCK first,
-            // releases it, and only then reaches for sig.lock — so no circular
-            // wait). A deadline of 0 under sig.lock means no entry: the waiter
-            // arms under sig.lock, and every removal clears both together.
+            // A timed waiter's sleep-list entry goes with the waiter slot,
+            // under sig.lock (docs/thread-lifecycle-and-sleep.md § Sleep List
+            // Invariants, invariant 7).
             // SAFETY: waiter is the TCB we just dequeued from sig.waiter.
             unsafe {
                 if (*waiter).sleep_deadline.load(Ordering::Relaxed) != 0
@@ -209,8 +205,9 @@ pub unsafe fn notification_send(
 ///
 /// Reads and clears the bitmask atomically. If the result is non-zero,
 /// returns `Ok(bits)` immediately (no blocking). If zero, stores `caller`
-/// as the waiter, sets its state to `Blocked`, and returns `Err(())` —
-/// the caller must then call the scheduler to yield the CPU.
+/// as the waiter, sets its state to `Blocked`, and returns `Err(())` — the
+/// caller must then call the scheduler to yield the CPU. A thread already
+/// waiting is displaced first: its wait returns `Interrupted`.
 ///
 /// # Dekker ordering
 /// Under the lock, the waiter is registered and `has_observer` is set
@@ -231,6 +228,16 @@ pub unsafe fn notification_wait(
 
     // SAFETY: lock serialises send/wait; paired with unlock_raw below.
     let saved = unsafe { sig.lock.lock_raw() };
+
+    // Displace any waiter: claimed under sig.lock (the slot is overwritten
+    // below), woken after the unlock.
+    let displaced = sig.waiter;
+    if !displaced.is_null()
+    {
+        sig.waiter = core::ptr::null_mut();
+        // SAFETY: displaced is the parked waiter the slot named; sig.lock held.
+        unsafe { crate::ipc::claim_displaced_waiter(displaced) };
+    }
 
     // Clear context_saved BEFORE making the thread visible as a waiter.
     // Without this, a remote CPU that wakes and schedules this thread can
@@ -272,6 +279,11 @@ pub unsafe fn notification_wait(
         }
         // SAFETY: paired with lock_raw above.
         unsafe { sig.lock.unlock_raw(saved) };
+        if !displaced.is_null()
+        {
+            // SAFETY: claimed above; no lock held.
+            unsafe { crate::ipc::wake_displaced_waiter(displaced) };
+        }
         return Ok(bits);
     }
 
@@ -315,6 +327,11 @@ pub unsafe fn notification_wait(
 
     // SAFETY: paired with lock_raw above.
     unsafe { sig.lock.unlock_raw(saved) };
+    if !displaced.is_null()
+    {
+        // SAFETY: claimed above; no lock held.
+        unsafe { crate::ipc::wake_displaced_waiter(displaced) };
+    }
     Err(())
 }
 

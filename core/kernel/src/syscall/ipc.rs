@@ -1257,9 +1257,10 @@ pub fn sys_notification_send(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// On success returns `0` in rax/a0 and the bitmask in the secondary return
 /// register (rdx/a1). A notification wake always carries non-zero bits because
 /// `notification_send` rejects zero-bit sends. A `0` bitmask with a `0` status
-/// means the timeout elapsed. A stop of the caller, the destruction of the
-/// notification while the caller is parked, or a later wait by another
-/// thread (which displaces this one), returns `Interrupted`.
+/// means the timeout elapsed. A stop of the caller, or the destruction of the
+/// notification while the caller is parked, returns `Interrupted`. Several
+/// threads may wait; they queue in arrival order and each delivery wakes the
+/// longest-waiting one.
 /// The split is required because the bitmask is an
 /// unrestricted `u64`: an in-band encoding via `cast_signed` would alias
 /// bit-63-set payloads with the dispatcher's negative-Err codes. Same
@@ -1293,7 +1294,7 @@ pub fn sys_notification_wait(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         (*sig_obj).state
     };
 
-    // Open the park episode before the waiter slot can publish.
+    // Open the park episode before the caller can be queued as a waiter.
     // SAFETY: tcb is the running caller, not yet claimable.
     unsafe { crate::sched::thread::open_park_episode(tcb) };
 
@@ -1308,9 +1309,9 @@ pub fn sys_notification_wait(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     }
 
     // For a timed wait, arm the sleep list. Re-acquire sig.lock and check
-    // `sig.waiter == tcb` first: a concurrent notification_send may have woken
-    // us already; arming unconditionally would leave a stale entry that
-    // hijacks a later unrelated notification_wait. See
+    // that `tcb` is still queued first: a concurrent notification_send may
+    // have woken us already; arming unconditionally would leave a stale entry
+    // that hijacks a later unrelated notification_wait. See
     // docs/thread-lifecycle-and-sleep.md § Sleep List Invariants rule 8.
     if timeout_ms != 0
     {
@@ -1318,7 +1319,7 @@ pub fn sys_notification_wait(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         // SAFETY: sig_state validated above; lock_raw paired with unlock_raw.
         let saved = unsafe { (*sig_state).lock.lock_raw() };
         // SAFETY: sig_state valid; lock held — waiter field is stable.
-        let still_waiter = unsafe { (*sig_state).waiter } == tcb;
+        let still_waiter = unsafe { (*sig_state).waiters.contains(tcb) };
         if still_waiter
         {
             // SAFETY: tcb valid; sig.lock held excludes notification_send wake.
@@ -1330,8 +1331,8 @@ pub fn sys_notification_wait(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             // SAFETY: tcb is the running caller.
             let added = unsafe { crate::sched::sleep_list_add(tcb) };
             // Every canceller clears the deadline only after claiming the
-            // waiter slot under sig.lock, which this arm holds with the slot
-            // still naming tcb.
+            // waiter under sig.lock, which this arm holds with tcb still
+            // queued.
             debug_assert!(
                 added != Err(crate::sched::SleepAddError::Cancelled),
                 "notification_wait: timed arm cancelled under sig.lock"
@@ -1472,8 +1473,8 @@ pub fn sys_event_post(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// (contrast `sys_notification_wait`, where `wakeup_value == 0` works because
 /// `notification_send` rejects zero-bit sends). A stop of the caller, or the
 /// destruction of the event queue while the caller is parked, returns
-/// `Interrupted`, as does a later blocking receive by another thread, which
-/// displaces this one (the try-once form never waits).
+/// `Interrupted`. Blocked receivers queue in arrival order and each post wakes
+/// the longest-waiting one (the try-once form never waits).
 #[cfg(not(test))]
 pub fn sys_event_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
@@ -1503,7 +1504,7 @@ pub fn sys_event_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     };
 
     // Non-blocking try-once: a pure ring peek under eq.lock. A non-blocking
-    // poll must never make the caller wakeable: no `eq.waiter` publish, no
+    // poll must never make the caller wakeable: no `eq.waiters` publish, no
     // `Blocked` commit, no `schedule()` (#352).
     if timeout_ms == u64::MAX
     {
@@ -1519,7 +1520,7 @@ pub fn sys_event_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         };
     }
 
-    // Open the park episode before the waiter slot can publish.
+    // Open the park episode before the caller can be queued as a waiter.
     // SAFETY: tcb is the running caller, not yet claimable.
     unsafe { crate::sched::thread::open_park_episode(tcb) };
 
@@ -1533,7 +1534,7 @@ pub fn sys_event_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         return Ok(0);
     }
 
-    // Queue was empty; `event_queue_recv` parked `tcb` as `eq.waiter` (or a
+    // Queue was empty; `event_queue_recv` queued `tcb` on `eq.waiters` (or a
     // stop/wake_pending refusal rolled the park back — both outcomes resolve
     // through `schedule()` below). Arm the sleep timer for a bounded wait.
 
@@ -1546,7 +1547,7 @@ pub fn sys_event_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         // SAFETY: eq_state validated above; lock_raw paired with unlock_raw.
         let saved = unsafe { (*eq_state).lock.lock_raw() };
         // SAFETY: eq_state valid; lock held — waiter field is stable.
-        let still_waiter = unsafe { (*eq_state).waiter } == tcb;
+        let still_waiter = unsafe { (*eq_state).waiters.contains(tcb) };
         if still_waiter
         {
             // SAFETY: tcb valid; eq.lock held excludes event_queue_post wake.
@@ -1558,8 +1559,8 @@ pub fn sys_event_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             // SAFETY: tcb is the running caller.
             let added = unsafe { crate::sched::sleep_list_add(tcb) };
             // Every canceller clears the deadline only after claiming the
-            // waiter slot under eq.lock, which this arm holds with the slot
-            // still naming tcb.
+            // waiter under eq.lock, which this arm holds with tcb still
+            // queued.
             debug_assert!(
                 added != Err(crate::sched::SleepAddError::Cancelled),
                 "event_recv: timed arm cancelled under eq.lock"
@@ -2018,11 +2019,8 @@ pub fn sys_wait_set_remove(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 {
                     (*sig).wait_set = core::ptr::null_mut();
                     (*sig).wait_set_member_idx = 0;
-                    // Update has_observer: keep 1 only if a direct waiter is still registered.
-                    (*sig).has_observer.store(
-                        u8::from(!(*sig).waiter.is_null()),
-                        core::sync::atomic::Ordering::Relaxed,
-                    );
+                    // Keep has_observer set only while a direct waiter is queued.
+                    (*sig).refresh_observer();
                     let remaining = (*source_header).dec_ref();
                     debug_assert!(
                         remaining > 0,
@@ -2068,8 +2066,8 @@ pub fn sys_wait_set_remove(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// `SYS_WAIT_SET_ADD` time is returned in the secondary return register
 /// (rdx on x86-64, a1 on RISC-V). The caller then reads from the identified
 /// source normally. A stop of the caller, or the destruction of the wait set
-/// while the caller is parked, returns `Interrupted`, as does a later wait by
-/// another thread, which displaces this one.
+/// while the caller is parked, returns `Interrupted`. Waiters queue in arrival
+/// order and each ready member wakes the longest-waiting one.
 #[cfg(not(test))]
 pub fn sys_wait_set_wait(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
@@ -2100,7 +2098,7 @@ pub fn sys_wait_set_wait(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         (*ws_obj).state
     };
 
-    // Open the park episode before the waiter slot can publish.
+    // Open the park episode before the caller can be queued as a waiter.
     // SAFETY: tcb is the running caller, not yet claimable.
     unsafe { crate::sched::thread::open_park_episode(tcb) };
 

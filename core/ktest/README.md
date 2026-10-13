@@ -93,7 +93,7 @@ concurrent notification and queue events.
 | `shared_memory_two_aspaces.rs` | One Memory cap mapped into two `AddressSpace` caps; `aspace_query` returns identical phys backing in both |
 | `cap_move_into_fresh_cspace_then_ipc.rs` | `cap_move` an endpoint into a child cspace; the child IPC-calls through its local slot; parent receives via a sibling cap |
 | `destroyed_source_interrupts.rs` | A waiter parked on a notification (untimed and timed), an event queue, or a wait set destroyed under it returns `Interrupted`, never a fabricated success |
-| `second_waiter_displaces.rs` | A second thread's wait on a notification, event queue, or wait set displaces the parked waiter, whose wait returns `Interrupted`; the new waiter receives the next delivery |
+| `queued_waiters_fifo.rs` | Two threads waiting on one notification, event queue, or wait set queue in arrival order: the first delivery wakes the first waiter only, the second delivery the second |
 
 Architecture-only Tier 2 scenarios live under `src/arch/<arch>/` and run through
 `crate::arch::run_integration`. On x86-64, `src/arch/x86_64/syscall_rflags_hardening.rs`

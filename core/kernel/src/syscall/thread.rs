@@ -428,7 +428,7 @@ pub fn sys_thread_stop(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// [`PARK_DISPOSITION_INTERRUPTED`]: crate::sched::thread::PARK_DISPOSITION_INTERRUPTED
 ///
 /// A plain sleep is cancelled through `sleep_list_remove`, and a timed IPC
-/// wait's sleep-list entry is removed with its waiter slot under the source
+/// wait's sleep-list entry is removed with its queue entry under the source
 /// lock (docs/thread-lifecycle-and-sleep.md § Sleep List Invariants).
 ///
 /// # Safety
@@ -700,21 +700,18 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
                 // SAFETY: blocked_on is a valid NotificationState ptr.
                 unsafe {
                     let saved = (*sig).lock.lock_raw();
-                    // Claim = the waiter-slot clear under sig.lock (every genuine
-                    // waker claims under the same lock). A lost race means the
-                    // waker's deposit stands; the resume delivers it (fail-open).
-                    if core::ptr::eq((*sig).waiter, tcb)
+                    // Claim = the removal from the waiter queue under sig.lock
+                    // (every genuine waker claims under the same lock). A lost
+                    // race means the waker's deposit stands; the resume
+                    // delivers it (fail-open).
+                    if (*sig).waiters.remove(tcb)
                     {
-                        (*sig).waiter = core::ptr::null_mut();
                         // Re-derive the observer flag like every other
-                        // waiter-clear site; leaving it set would pin all
+                        // waiter-removal site; leaving it set would pin all
                         // future sends onto the slow path.
-                        (*sig).has_observer.store(
-                            u8::from(!(*sig).wait_set.is_null()),
-                            core::sync::atomic::Ordering::Relaxed,
-                        );
-                        // A timed wait's entry goes with the waiter slot,
-                        // under sig.lock, as at every waiter-slot claim.
+                        (*sig).refresh_observer();
+                        // A timed wait's entry goes with the waiter, under
+                        // sig.lock, as at every waiter claim.
                         if (*tcb)
                             .sleep_deadline
                             .load(core::sync::atomic::Ordering::Relaxed)
@@ -742,13 +739,13 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
                 // SAFETY: blocked_on is a valid EventQueueState ptr.
                 unsafe {
                     let saved = (*eq).lock.lock_raw();
-                    // Claim = the waiter-slot clear under eq.lock; a lost race
-                    // means a genuine wake's deposit stands (fail-open).
-                    if core::ptr::eq((*eq).waiter, tcb)
+                    // Claim = the removal from the waiter queue under eq.lock; a
+                    // lost race means a genuine wake's deposit stands
+                    // (fail-open).
+                    if (*eq).waiters.remove(tcb)
                     {
-                        (*eq).waiter = core::ptr::null_mut();
-                        // A timed wait's entry goes with the waiter slot,
-                        // under eq.lock, as at every waiter-slot claim.
+                        // A timed wait's entry goes with the waiter, under
+                        // eq.lock, as at every waiter claim.
                         if (*tcb)
                             .sleep_deadline
                             .load(core::sync::atomic::Ordering::Relaxed)
@@ -776,11 +773,11 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
                 // SAFETY: blocked_on is a valid WaitSetState ptr.
                 unsafe {
                     let saved = (*ws).lock.lock_raw();
-                    // Claim = the waiter-slot clear under ws.lock; a lost race
-                    // means a genuine wake's deposit stands (fail-open).
-                    if core::ptr::eq((*ws).waiter, tcb)
+                    // Claim = the removal from the waiter queue under ws.lock;
+                    // a lost race means a genuine wake's deposit stands
+                    // (fail-open).
+                    if (*ws).waiters.remove(tcb)
                     {
-                        (*ws).waiter = core::ptr::null_mut();
                         crate::sched::thread::stamp_park_deposit(
                             tcb,
                             crate::sched::thread::PARK_DISPOSITION_INTERRUPTED,

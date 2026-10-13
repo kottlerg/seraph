@@ -2223,9 +2223,9 @@ unsafe fn dealloc_object_one(
                                     .cast::<crate::ipc::notification::NotificationState>();
                                 // SAFETY: sig is valid; lock serialises with notification_send.
                                 let saved = (*sig).lock.lock_raw();
-                                if (*sig).waiter == tcb
+                                if (*sig).waiters.remove(tcb)
                                 {
-                                    (*sig).waiter = core::ptr::null_mut();
+                                    (*sig).refresh_observer();
                                 }
                                 (*sig).lock.unlock_raw(saved);
                             }
@@ -2265,10 +2265,7 @@ unsafe fn dealloc_object_one(
                                     blocked_obj.cast::<crate::ipc::event_queue::EventQueueState>();
                                 // SAFETY: eq is valid; lock serialises with event_queue ops.
                                 let saved = (*eq).lock.lock_raw();
-                                if (*eq).waiter == tcb
-                                {
-                                    (*eq).waiter = core::ptr::null_mut();
-                                }
+                                (*eq).waiters.remove(tcb);
                                 (*eq).lock.unlock_raw(saved);
                             }
                             IpcThreadState::BlockedOnWaitSet =>
@@ -2276,10 +2273,7 @@ unsafe fn dealloc_object_one(
                                 let ws = blocked_obj.cast::<crate::ipc::wait_set::WaitSetState>();
                                 // SAFETY: ws is valid; lock serialises with waitset ops.
                                 let saved = (*ws).lock.lock_raw();
-                                if (*ws).waiter == tcb
-                                {
-                                    (*ws).waiter = core::ptr::null_mut();
-                                }
+                                (*ws).waiters.remove(tcb);
                                 (*ws).lock.unlock_raw(saved);
                             }
                             IpcThreadState::BlockedOnReply =>
@@ -2420,7 +2414,7 @@ unsafe fn dealloc_object_one(
 
                 // A timer batch that popped this thread keeps its pointer, with no
                 // reference, until it finishes: wait it out before the free (its
-                // claim compares the waiter slot by address). See
+                // claim finds the waiter by address). See
                 // docs/thread-lifecycle-and-sleep.md § Sleep List Invariants,
                 // invariant 9.
                 crate::sched::sleep_wakeups_quiesce();
@@ -2969,49 +2963,18 @@ unsafe fn dealloc_object_one(
                      refcount invariant broken"
                 );
 
-                // Wake a blocked waiter with its park stamped Interrupted.
-                // SAFETY: state validated non-null. Claim the waiter under sig.lock
-                // — the #160 discipline notification_send uses — so a concurrent
-                // dealloc(waiter) BlockedOnNotification unlink (which takes sig.lock
-                // and spins on wake_in_flight) cannot free the TCB before our
-                // enqueue_and_wake commits.
+                // Wake every blocked waiter with its park stamped Interrupted,
+                // claimed under sig.lock — the #160 discipline notification_send
+                // uses — so a concurrent dealloc(waiter) BlockedOnNotification
+                // unlink (which takes sig.lock and spins on wake_in_flight)
+                // cannot free a TCB before its enqueue_and_wake commits.
+                // SAFETY: state validated non-null; sig.lock held across the
+                // claims and wakes (sig.lock → sched_lock is canonical).
                 unsafe {
                     let sig = &mut *state;
                     let saved = sig.lock.lock_raw();
-                    let waiter = sig.waiter;
-                    if !waiter.is_null()
-                    {
-                        sig.waiter = core::ptr::null_mut();
-                        // State transitions committed by enqueue_and_wake. Claim
-                        // for wake under sig.lock (#160); cleared by
-                        // enqueue_and_wake. The waiter-slot clear is the episode
-                        // claim: the destroyed source cancels the wait, so
-                        // SYS_NOTIFICATION_WAIT returns Interrupted.
-                        (*waiter).wakeup_value = 0;
-                        (*waiter)
-                            .wake_in_flight
-                            .store(1, core::sync::atomic::Ordering::Release);
-                        crate::sched::thread::stamp_park_deposit(
-                            waiter,
-                            crate::sched::thread::PARK_DISPOSITION_INTERRUPTED,
-                        );
-                        // A timed waiter is also on the sleep list; drop the
-                        // entry with the waiter slot under sig.lock, as
-                        // notification_send does.
-                        if (*waiter)
-                            .sleep_deadline
-                            .load(core::sync::atomic::Ordering::Relaxed)
-                            != 0
-                        {
-                            crate::sched::sleep_list_remove(waiter);
-                        }
-                    }
+                    crate::ipc::interrupt_all_waiters(&mut sig.waiters);
                     sig.lock.unlock_raw(saved);
-                    if !waiter.is_null()
-                    {
-                        let target_cpu = crate::sched::select_target_cpu(waiter);
-                        crate::sched::enqueue_and_wake(waiter, target_cpu);
-                    }
                 }
 
                 // A timer batch that popped a timed waiter of this notification
@@ -3096,7 +3059,7 @@ unsafe fn dealloc_object_one(
                      refcount invariant broken"
                 );
 
-                // Wake any blocked waiter with its park stamped Interrupted.
+                // Wake every blocked waiter with its park stamped Interrupted.
                 // The inline ring is part of this slot and gets reclaimed
                 // below alongside the wrapper + state via `retype_free`.
                 // SAFETY: state non-null and live.

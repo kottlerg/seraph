@@ -215,12 +215,11 @@ same `(*tcb).sched_lock`, which carries it to the refusing parker (see
 | `endpoint_recv` rebind-fail teardown | teardown `reply_tcb` CAS win (stamped before the wake-in-flight release — a dying caller's dealloc may free the TCB after it) | episode + INTERRUPTED / KILL |
 | `dealloc_object(Thread)` dying-client detach arms | `reply_tcb` CAS | **no stamp** — the claimed thread is the one being freed; it never resumes |
 | `cancel_ipc_block` BlockedOnRecv arm | recv-queue unlink win under `ep.lock` (a lost unlink means a caller already deposited into `ipc_msg`; that delivery stands) | INTERRUPTED |
-| `cancel_ipc_block` BlockedOnNotification / EventQueue / WaitSet arms | waiter-slot clear under the source lock (every genuine waker claims under the same lock) | INTERRUPTED |
+| `cancel_ipc_block` BlockedOnNotification / EventQueue / WaitSet arms | removal from the source's waiter queue under the source lock (every genuine waker claims under the same lock) | INTERRUPTED |
 | `cancel_ipc_block` plain-sleep cleanup | `sleep_list_remove` returning `true` under the target's `sched_lock` (the deadline was still pending; the timer pop clears it under the same `SLEEP_LIST_LOCK`, and a commit→add window cancel makes the later add refuse) | INTERRUPTED |
-| `dealloc_object(Notification)` waiter wake | waiter-slot clear under `sig.lock` | INTERRUPTED |
-| `event_queue_drop` (`dealloc_object(EventQueue)`) waiter wake | waiter-slot clear under `eq.lock` | INTERRUPTED |
-| `wait_set_drop` (`dealloc_object(WaitSet)`) waiter wake | waiter-slot clear under `ws.lock` | INTERRUPTED |
-| displacing wait (`notification_wait`, `event_queue_recv`, `waitset_wait` via `claim_displaced_waiter`) | waiter-slot replacement under the source lock | INTERRUPTED |
+| `dealloc_object(Notification)` wake of every waiter (`interrupt_all_waiters`) | removal from the waiter queue under `sig.lock` | INTERRUPTED |
+| `event_queue_drop` (`dealloc_object(EventQueue)`) wake of every waiter | removal from the waiter queue under `eq.lock` | INTERRUPTED |
+| `wait_set_drop` (`dealloc_object(WaitSet)`) wake of every waiter | removal from the waiter queue under `ws.lock` | INTERRUPTED |
 | `dealloc_object(Endpoint)` send-queue drain | whole-queue detach under `ep.lock` | episode + INTERRUPTED (faulter: episode + KILL) |
 | `dealloc_object(Endpoint)` recv-queue drain | whole-queue detach under `ep.lock` | INTERRUPTED |
 | park-helper refused-commit rollbacks (`notification_wait`, `event_queue_recv`, `waitset_wait`, `endpoint_recv`) | source lock held continuously from publish to rollback — no waker ever saw the slot | INTERRUPTED on `ParkCommit::RefusedStop` only; a `RefusedWake` rollback must leave the coalesced deposit deliverable |
@@ -276,9 +275,10 @@ pub struct NotificationState
     /// Atomic bitmask: set bits represent pending events.
     pub bits: AtomicU64,
 
-    /// Waiter waiting in SYS_NOTIFICATION_WAIT, or null.
+    /// Threads waiting in SYS_NOTIFICATION_WAIT, in arrival order (a FIFO
+    /// chained through each TCB's ipc_wait_next; only the head is stored).
     /// Protected by `lock` (see scheduling-internals.md § Lock Hierarchy).
-    pub waiter: *mut ThreadControlBlock,
+    pub waiters: WaitQueue,
 
     /// Optional wait-set back-pointer (null if not in any wait set).
     pub wait_set: *mut u8,
@@ -289,7 +289,7 @@ pub struct NotificationState
     /// is documented in scheduling-internals.md § Atomic Ordering Invariants.
     pub has_observer: AtomicU8,
 
-    /// Spinlock serialising slow-path send/wait and waiter-slot mutations.
+    /// Spinlock serialising slow-path send/wait and waiter-queue mutations.
     pub lock: Spinlock,
 }
 ```
@@ -303,17 +303,18 @@ pub struct NotificationState
 2. SeqCst fence (Dekker pair with notification_wait)
 3. if has_observer == 0: return None      // lock-free fast path
 4. Acquire sig.lock
-5. if waiter is Some(tcb):
+5. if waiters is non-empty:
    a. delivered = bits.swap(0, Ordering::Relaxed)
    b. if delivered == 0: release sig.lock; return None
       (a fast-path notification_wait between steps 1 and 4 consumed our
-       bits; the current sig.waiter is a *new* waiter who must NOT
-       be touched, else they receive wakeup_value=0 — a spurious
-       wake, since 0-bit sends are rejected at step 1)
-   c. waiter = None; has_observer = (wait_set != null)
-   d. tcb.wakeup_value = delivered
-   e. if tcb.sleep_deadline != 0: sleep_list_remove(tcb) (clears the
-      deadline with the entry)
+       bits; the queued waiters are *new* waiters who must NOT be
+       touched, else one receives wakeup_value=0 — a spurious wake,
+       since 0-bit sends are rejected at step 1)
+   c. tcb = waiters.pop() (the longest-waiting thread);
+      has_observer = (waiters non-empty || wait_set != null)
+   d. claim_waiter(tcb, delivered): wake_in_flight = 1,
+      tcb.wakeup_value = delivered, and if tcb.sleep_deadline != 0
+      sleep_list_remove(tcb) (clears the deadline with the entry)
    f. Release sig.lock
    g. enqueue_and_wake(tcb, target_cpu)        // outside the lock
 6. else if wait_set is Some(ws): waitset_notify(ws); release; return None
@@ -329,22 +330,18 @@ behaviour (per [docs/ipc-design.md § Notifications](../../../docs/ipc-design.md
 `SYS_NOTIFICATION_WAIT`:
 
 ```
-1. acquired = bits.swap(0, Ordering::Acquire)
-   // Atomically read and clear all bits
-2. if acquired != 0:
-   // Bits were set; return immediately without blocking
-   tf.set_ipc_return(primary = 0, secondary = acquired); return Ok(0)
-3. Acquire waiter_lock; if waiter is already set (another thread waits),
-   claim it (claim_displaced_waiter: stamp INTERRUPTED, drop its sleep
-   entry) and clear the slot; it is woken after the release below
-4. Re-check: acquired = bits.swap(0, Ordering::Acquire)
-   // Must re-check after acquiring lock to prevent lost-wakeup race:
-   // a sender may have set bits between step 1 and step 3
+1. Acquire sig.lock; context_saved = 0
+2. waiters.push(current_tcb) (the tail); has_observer = 1
+3. SeqCst fence (Dekker pair with notification_send)
+4. acquired = bits.swap(0, Ordering::Relaxed)
 5. if acquired != 0:
-   Release waiter_lock;
+   // Bits were set; undo the registration and return without blocking
+   waiters.remove(current_tcb); recompute has_observer; context_saved = 1
+   Release sig.lock;
    tf.set_ipc_return(primary = 0, secondary = acquired); return Ok(0)
-6. waiter = current_tcb
-7. Release waiter_lock
+6. commit_blocked_under_local_lock(tcb, BlockedOnNotification, sig)
+   (a refusal dequeues the caller again, under the same sig.lock hold)
+7. Release sig.lock
 8. Block current thread; return when woken
 9. On wakeup: if the park is INTERRUPTED (a stop, or the notification
    destroyed under the waiter), return Interrupted. Otherwise the sender has
@@ -379,8 +376,8 @@ pub struct EventQueueState
     /// Read index (consumer position, modulo capacity).
     pub read_idx: u32,
 
-    /// Waiter blocked in SYS_EVENT_RECV, or null.
-    pub waiter: *mut ThreadControlBlock,
+    /// Receivers blocked in SYS_EVENT_RECV, in arrival order.
+    pub waiters: WaitQueue,
 
     // ... additional bookkeeping fields ...
 }
@@ -400,11 +397,12 @@ the wrapper on `dealloc_object(EventQueue)`.
 
 ```
 1. Acquire eq.lock
-2. if waiter is Some(tcb):
-   // Deliver directly, bypassing the ring
-   a. waiter = None; tcb.wakeup_value = payload; tcb.wake_in_flight = 1
-   b. if tcb.sleep_deadline != 0: sleep_list_remove(tcb) (clears the
-      deadline with the entry)
+2. if waiters is non-empty:
+   // Deliver directly to the longest-waiting receiver, bypassing the ring
+   a. tcb = waiters.pop()
+   b. claim_waiter(tcb, payload): wake_in_flight = 1,
+      tcb.wakeup_value = payload, and if tcb.sleep_deadline != 0
+      sleep_list_remove(tcb) (clears the deadline with the entry)
    c. Release eq.lock
    d. Syscall handler: select_target_cpu + enqueue_and_wake(tcb)
 3. if count >= capacity:
@@ -426,23 +424,21 @@ occupancy and doubles as the lockless wait-set level-readiness witness.
 1. if timeout_ms == u64::MAX:
    // Non-blocking try-once: a pure peek (event_queue_try_recv).
    // Acquire eq.lock; pop the ring head if count > 0, else release and
-   // return WouldBlock. Never registers eq.waiter; the caller is never
+   // return WouldBlock. Never queues the caller; the caller is never
    // wakeable and never enters the scheduler.
-2. Acquire eq.lock (event_queue_recv); if waiter is already set (another
-   thread waits), claim it as displaced (stamp INTERRUPTED, drop its sleep
-   entry) and clear the slot; it is woken once eq.lock is released
+2. Acquire eq.lock (event_queue_recv)
 3. if count > 0:
    a. payload = ring[read_idx]; read_idx = (read_idx + 1) % (capacity + 1)
    b. count -= 1 (Release)
    c. Release eq.lock; return payload
 4. else, still under eq.lock:
-   // Park the caller as eq.waiter
-   a. context_saved = 0; waiter = current_tcb
+   // Queue the caller at the tail of eq.waiters
+   a. context_saved = 0; waiters.push(current_tcb)
    b. commit_blocked_under_local_lock(tcb, BlockedOnEventQueue)
-      (eq.lock outer -> sched_lock inner; a refusal rolls the waiter back)
+      (eq.lock outer -> sched_lock inner; a refusal dequeues the caller)
    c. Release eq.lock
 5. if timeout_ms in 1..=MAX-1:
-   re-acquire eq.lock; if still eq.waiter, set sleep_deadline and
+   re-acquire eq.lock; if still queued on eq.waiters, set sleep_deadline and
    sleep_list_add(tcb); release eq.lock
 6. schedule(); on resume:
    if the park is INTERRUPTED -> return Interrupted (a stop, or the queue
@@ -494,8 +490,8 @@ pub struct WaitSetState
     ready_head: u8,
     ready_tail: u8,
 
-    /// Single thread blocked in SYS_WAIT_SET_WAIT, or null.
-    waiter: *mut ThreadControlBlock,
+    /// Threads blocked in SYS_WAIT_SET_WAIT, in arrival order.
+    waiters: WaitQueue,
 }
 
 struct WaitSetMember
@@ -542,9 +538,9 @@ endpoint, a notification has bits set, an event is posted), it calls into the wa
 ```
 waitset_notify(wait_set, member_idx):
     Acquire wait_set.lock
-    if waiter is non-null (tcb):
-        waiter = null
-        tcb.wakeup_value = members[member_idx].badge
+    if waiters is non-empty:
+        tcb = waiters.pop()            // the longest-waiting thread
+        claim_waiter(tcb, members[member_idx].badge)
         Release lock
         enqueue_and_wake(tcb)
     else:
@@ -557,9 +553,7 @@ waitset_notify(wait_set, member_idx):
 `SYS_WAIT_SET_WAIT`:
 
 ```
-1. Acquire lock; if waiter is already set (another thread waits), claim it
-   as displaced (stamp INTERRUPTED) and clear the slot; it is woken once the
-   lock is released
+1. Acquire lock
 2. while ready_ring is non-empty:
    a. member_idx = ready_ring.pop()
    b. if members[member_idx] is vacant (removed): skip it
@@ -567,7 +561,7 @@ waitset_notify(wait_set, member_idx):
 3. Level-readiness self-heal: for each member, if source_is_ready(source)
    right now, Release lock and return its badge.
 4. else:
-   a. waiter = current_tcb
+   a. waiters.push(current_tcb) (the tail)
    b. Release lock
    c. Block current thread; when woken, return Interrupted if the park is
       INTERRUPTED (a stop, or the wait set destroyed under the waiter), else
@@ -622,7 +616,7 @@ carries a `debug_assert!(state.wait_set.is_null())` invariant check (refcount
 ownership per § Kernel Object Reference Counting in
 [capability-internals.md](capability-internals.md#kernel-object-reference-counting)).
 
-A waiter parked on the dropped wait set is woken with its park stamped
+Every waiter parked on the dropped wait set is woken with its park stamped
 INTERRUPTED (§ Park Dispositions and Episodes), so its `SYS_WAIT_SET_WAIT`
 returns `Interrupted`.
 

@@ -237,9 +237,10 @@ pub unsafe fn event_queue_try_recv(eq: *mut EventQueueState) -> Option<u64>
 /// Dequeue the next entry from the event queue.
 ///
 /// - If an entry is available, returns `Ok(payload)`.
-/// - If empty, queues `caller` at the tail of the waiters and returns
-///   `Err(())`. Syscall handler must call `schedule()` then read
-///   `wakeup_value`.
+/// - If empty, queues `caller` at the tail of the waiters, arms a non-zero
+///   `deadline` (a timed wait) on the sleep list in the same critical
+///   section, and returns `Err(())`. Syscall handler must call `schedule()`
+///   then read `wakeup_value`.
 ///
 /// # Safety
 /// `eq` and `caller` must be valid pointers; acquires `eq.lock` internally —
@@ -248,6 +249,7 @@ pub unsafe fn event_queue_try_recv(eq: *mut EventQueueState) -> Option<u64>
 pub unsafe fn event_queue_recv(
     eq: *mut EventQueueState,
     caller: *mut ThreadControlBlock,
+    deadline: u64,
 ) -> Result<u64, ()>
 {
     // SAFETY: caller guarantees eq is valid.
@@ -309,6 +311,11 @@ pub unsafe fn event_queue_recv(
                 .store(1, core::sync::atomic::Ordering::Relaxed);
         }
     }
+    else if deadline != 0
+    {
+        // SAFETY: caller committed Blocked; eq.lock held since the push.
+        unsafe { crate::ipc::arm_timed_park(caller, deadline, "event_recv") };
+    }
     // SAFETY: paired with lock_raw above.
     unsafe { eq.lock.unlock_raw(saved) };
     Err(())
@@ -335,16 +342,14 @@ pub unsafe fn event_queue_drop(eq: *mut EventQueueState)
     // SAFETY: eq is a valid pointer.
     let eq = unsafe { &mut *eq };
 
-    // Claim every waiter under eq.lock — the #160 discipline event_queue_post
-    // uses — so a concurrent dealloc(waiter) BlockedOnEventQueue unlink (which
-    // takes eq.lock and spins on wake_in_flight) cannot free a TCB before its
-    // enqueue_and_wake commits; wake them once eq.lock is released.
+    // Claim and wake every waiter under eq.lock — the #160 discipline
+    // event_queue_post uses — so a concurrent dealloc(waiter)
+    // BlockedOnEventQueue unlink (which takes eq.lock and spins on
+    // wake_in_flight) cannot free a TCB before its enqueue_and_wake commits.
     // SAFETY: lock_raw paired with unlock_raw below.
     let saved = unsafe { eq.lock.lock_raw() };
-    // SAFETY: eq.lock held.
-    let detached = unsafe { crate::ipc::interrupt_all_waiters(&mut eq.waiters) };
+    // SAFETY: eq.lock held; no scheduler or sleep-list lock held.
+    unsafe { crate::ipc::interrupt_all_waiters(&mut eq.waiters) };
     // SAFETY: paired with lock_raw above.
     unsafe { eq.lock.unlock_raw(saved) };
-    // SAFETY: claimed above; no lock held.
-    unsafe { detached.wake() };
 }

@@ -56,7 +56,7 @@ kernel's own source layout.
 | `mm.rs` | `SYS_MEM_MAP/UNMAP/PROTECT`, `SYS_MEMORY_SPLIT`, `SYS_ASPACE_QUERY` |
 | `notification.rs` | `SYS_NOTIFICATION_SEND`, `SYS_NOTIFICATION_WAIT` (blocking and `notification_wait_timeout`) |
 | `event.rs` | `SYS_EVENT_POST`, `SYS_EVENT_RECV` (blocking, `try_recv`, timeout) |
-| `wait_set.rs` | `SYS_WAIT_SET_ADD/REMOVE/WAIT` |
+| `wait_set.rs` | `SYS_WAIT_SET_ADD/REMOVE/WAIT`, including a second concurrent `wait_set_wait` refused with `InvalidState` |
 | `ipc.rs` | `SYS_IPC_CALL`, `SYS_IPC_REPLY`, `SYS_IPC_RECV`, `SYS_IPC_BUFFER_SET` |
 | `thread.rs` | `SYS_THREAD_START/STOP/YIELD/EXIT/CONFIGURE/SET_PRIORITY/SET_AFFINITY/READ_REGS/WRITE_REGS/SLEEP/BIND_NOTIFICATION` |
 | `fpu.rs` | FPU / SIMD / V extended-state isolation across preemption and cross-CPU migration |
@@ -93,7 +93,7 @@ concurrent notification and queue events.
 | `shared_memory_two_aspaces.rs` | One Memory cap mapped into two `AddressSpace` caps; `aspace_query` returns identical phys backing in both |
 | `cap_move_into_fresh_cspace_then_ipc.rs` | `cap_move` an endpoint into a child cspace; the child IPC-calls through its local slot; parent receives via a sibling cap |
 | `destroyed_source_interrupts.rs` | Every waiter parked on a notification (two untimed or two timed), an event queue (two), or a wait set (one) destroyed under it returns `Interrupted`, never a fabricated success |
-| `queued_waiters_fifo.rs` | Two threads waiting on one notification or event queue queue in arrival order: each delivery wakes the longest waiter only, and a queued waiter whose timed wait expires (at the head or the tail) leaves the other waiting for the next delivery; a second concurrent `wait_set_wait` returns `InvalidState` |
+| `queued_waiters_fifo.rs` | Two threads waiting on one notification or event queue are woken in arrival order: each delivery wakes the longest waiter only, and a queued waiter whose timed wait expires (at the head or the tail) leaves the other waiting for the next delivery |
 
 Architecture-only Tier 2 scenarios live under `src/arch/<arch>/` and run through
 `crate::arch::run_integration`. On x86-64, `src/arch/x86_64/syscall_rflags_hardening.rs`
@@ -133,6 +133,7 @@ mirrors that ceiling (64 × 16 KiB child-stack BSS = 1 MiB).
 | `stop_reply_race.rs` | Race `thread_stop` on a reply-blocked client against `cap_delete` of the server it is parked on (#317 cross-CPU UAF) | `CYCLES=300` |
 | `stop_resume_race.rs` | Race `thread_stop` against a concurrent `thread_start` (resume) on a `Running` pinned victim across three CPUs (stop-drain liveness) | `CYCLES=256` |
 | `stop_sleep_window.rs` | Stop and restart a thread looping `thread_sleep(1)` on the timer CPU, so stops land around the park commit, the sleep-list add, and the timer's claim; each sleep returns `Ok` or `Interrupted` | `CYCLES=2000` |
+| `stop_owed_wake.rs` | Stop and restart a notification waiter while a sender keeps claiming its wait; every wait returns bits or `Interrupted`, both occur, and the kernel's wait-queue and owed-wake assertions hold | `CYCLES=2000` |
 | `stop_park_race.rs` | Stop and restart a peer entering a notification wait, an IPC call, or a sleep; each park returns its genuine result or `Interrupted`, and every kind sees a cancellation | `CYCLES=150`, `SLEEP_MS=2` |
 | `timed_wait_source_delete.rs` | Destroy a notification or event queue around a timed waiter's deadlines; each wait ends in a timeout, `Interrupted`, or `InvalidCapability` | `CYCLES=200`, `WAIT_MS=1` |
 | `timed_waiter_thread_delete.rs` | Delete a timed waiter's last Thread cap around its deadlines (plain sleep, notification, event queue) | `CYCLES=192`, `WAIT_MS=1` |

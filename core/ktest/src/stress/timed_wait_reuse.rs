@@ -24,13 +24,18 @@
 //! controller, pinned off CPU 0 (where the timer runs), delivers during the
 //! timed wait either at once or, in late rounds, after a busy-wait swept
 //! across the deadline (see [`LATE_MIN_US`]), so the delivery and the
-//! deadline race; it then releases the untimed wait with a second delivery if the
-//! waiter has not returned. The waiter runs on a third CPU when there is
-//! one, so it can re-park while CPU 0 is still between the pop and the claim.
+//! timer's claim race; it then releases the untimed wait with a second
+//! delivery if the waiter has not returned. The waiter runs on a third CPU
+//! when there is one, so it can re-park while CPU 0 is still between the pop
+//! and the claim.
+//!
 //! The test fails if a timed wait returns anything but a delivery or a
 //! timeout, if an untimed wait returns anything but a delivery, or if, for
-//! either source, no late-delivery round's timed wait ended in a delivery
-//! (the race never armed on that source).
+//! either source, the late rounds did not end in both deliveries and
+//! timeouts. Userspace cannot see whether a round landed between the pop and
+//! the claim; seeing both outcomes proves the sweep crossed the timer's claim
+//! point, so its finely spaced rounds near that point are the ones that race
+//! it.
 //!
 //! Needs **≥ 2 CPUs**.
 
@@ -52,12 +57,12 @@ const CYCLES: u32 = 400;
 const WAIT_MS: u64 = 1;
 
 /// A late round's delivery comes this many microseconds after the waiter
-/// enters its timed wait, swept per round over [`LATE_SPAN_US`]. The wait
-/// ends at the first timer tick after its deadline, so the sweep spans the
-/// deadline and about two ticks past it. A sleep would wake the controller
-/// on that same tick, after the timer's claim, and never race it.
+/// enters its timed wait, swept per round over [`LATE_SPAN_US`]: from half
+/// the timeout before the deadline to half after it, across the timer's
+/// claim. A busy-wait, because a sleep would wake the controller on the
+/// timer's own tick, after the claim, and never race it.
 const LATE_MIN_US: u64 = WAIT_MS * 1000 / 2;
-const LATE_SPAN_US: u64 = WAIT_MS * 1000 * 5 / 2;
+const LATE_SPAN_US: u64 = WAIT_MS * 1000;
 
 /// Controller spins this many rounds for the untimed wait's result before
 /// releasing it with a second delivery.
@@ -128,18 +133,18 @@ pub fn run(ctx: &TestContext) -> TestResult
         "ktest: stress::timed_wait_reuse event queue late timeouts=",
         tally.timed_out[QUEUE],
     );
-    if tally.delivered[NOTIFICATION] == 0
+    if tally.delivered[NOTIFICATION] == 0 || tally.timed_out[NOTIFICATION] == 0
     {
         return Err(
-            "stress::timed_wait_reuse: no late notification timed wait ended in a delivery \
-             (never armed)",
+            "stress::timed_wait_reuse: the late notification rounds did not see both a \
+             delivery and a timeout (never armed)",
         );
     }
-    if tally.delivered[QUEUE] == 0
+    if tally.delivered[QUEUE] == 0 || tally.timed_out[QUEUE] == 0
     {
         return Err(
-            "stress::timed_wait_reuse: no late event queue timed wait ended in a delivery \
-             (never armed)",
+            "stress::timed_wait_reuse: the late event queue rounds did not see both a \
+             delivery and a timeout (never armed)",
         );
     }
     Ok(())
@@ -216,7 +221,7 @@ fn cycles(sig: u32, eq: u32) -> Result<Tally, &'static str>
         let source = if cycle & 1 == 0 { NOTIFICATION } else { QUEUE };
         let late = cycle & 2 != 0;
         let deliver = |value: u64| {
-            if cycle & 1 == 0
+            if source == NOTIFICATION
             {
                 notification_send(sig, value)
             }
@@ -231,74 +236,93 @@ fn cycles(sig: u32, eq: u32) -> Result<Tally, &'static str>
         }
         if late
         {
-            let delay_us =
-                LATE_MIN_US + u64::from(cycle.wrapping_mul(2_654_435_761)) % LATE_SPAN_US;
-            let until = elapsed_us() + delay_us;
-            while elapsed_us() < until
-            {
-                core::hint::spin_loop();
-            }
+            late_delay(cycle)?;
         }
         deliver(1).map_err(|_| "stress::timed_wait_reuse: delivery failed")?;
-
-        let mut spins = 0u32;
-        let mut released = false;
-        while FINISHED.load(Ordering::Acquire) != cycle
-        {
-            if spins < RESULT_SPINS
-            {
-                spins += 1;
-                core::hint::spin_loop();
-                continue;
-            }
-            if !released
-            {
-                deliver(2).map_err(|_| "stress::timed_wait_reuse: release failed")?;
-                released = true;
-            }
-            let _ = thread_sleep(1);
-        }
+        await_results(cycle, deliver)?;
         let untimed_ok = UNTIMED_OK.load(Ordering::Acquire) != 0;
         let timed = TIMED_RESULT.load(Ordering::Acquire);
         ACKED.store(cycle, Ordering::Release);
-        match timed
-        {
-            TIMED_DELIVERY if late => tally.delivered[source] += 1,
-            TIMED_TIMEOUT if late => tally.timed_out[source] += 1,
-            TIMED_DELIVERY | TIMED_TIMEOUT =>
-            {}
-            _ if source == NOTIFICATION =>
-            {
-                return Err(
-                    "stress::timed_wait_reuse: a timed notification wait returned an error",
-                );
-            }
-            _ =>
-            {
-                return Err("stress::timed_wait_reuse: a timed event queue wait returned an error");
-            }
-        }
-        if !untimed_ok && source == NOTIFICATION
-        {
-            return Err(
-                "stress::timed_wait_reuse: an untimed notification wait returned a timeout or \
-                 error",
-            );
-        }
-        if !untimed_ok
-        {
-            return Err(
-                "stress::timed_wait_reuse: an untimed event queue wait returned a timeout or \
-                 error",
-            );
-        }
+        record(&mut tally, source, late, timed, untimed_ok)?;
     }
     Ok(tally)
 }
 
-fn elapsed_us() -> u64
+/// Busy-wait a late round's delivery delay, swept per cycle across the
+/// deadline.
+fn late_delay(cycle: u32) -> TestResult
 {
-    system_info(SystemInfoType::ElapsedUs as u64).unwrap_or(0)
+    let delay_us = LATE_MIN_US + u64::from(cycle.wrapping_mul(2_654_435_761)) % LATE_SPAN_US;
+    let until = elapsed_us()? + delay_us;
+    while elapsed_us()? < until
+    {
+        core::hint::spin_loop();
+    }
+    Ok(())
+}
+
+/// Wait for the waiter to publish `cycle`'s results, releasing its untimed
+/// wait with a second delivery if it has not returned after
+/// [`RESULT_SPINS`].
+fn await_results(cycle: u32, deliver: impl Fn(u64) -> Result<(), i64>) -> TestResult
+{
+    let mut spins = 0u32;
+    let mut released = false;
+    while FINISHED.load(Ordering::Acquire) != cycle
+    {
+        if spins < RESULT_SPINS
+        {
+            spins += 1;
+            core::hint::spin_loop();
+            continue;
+        }
+        if !released
+        {
+            deliver(2).map_err(|_| "stress::timed_wait_reuse: release failed")?;
+            released = true;
+        }
+        let _ = thread_sleep(1);
+    }
+    Ok(())
+}
+
+/// Check one cycle's results and count a late round's timed outcome.
+fn record(tally: &mut Tally, source: usize, late: bool, timed: u32, untimed_ok: bool)
+-> TestResult
+{
+    let notification = source == NOTIFICATION;
+    match timed
+    {
+        TIMED_DELIVERY if late => tally.delivered[source] += 1,
+        TIMED_TIMEOUT if late => tally.timed_out[source] += 1,
+        TIMED_DELIVERY | TIMED_TIMEOUT =>
+        {}
+        _ if notification =>
+        {
+            return Err("stress::timed_wait_reuse: a timed notification wait returned an error");
+        }
+        _ =>
+        {
+            return Err("stress::timed_wait_reuse: a timed event queue wait returned an error");
+        }
+    }
+    match (untimed_ok, notification)
+    {
+        (true, _) => Ok(()),
+        (false, true) => Err(
+            "stress::timed_wait_reuse: an untimed notification wait returned a timeout or error",
+        ),
+        (false, false) =>
+        {
+            Err("stress::timed_wait_reuse: an untimed event queue wait returned a timeout or error")
+        }
+    }
+}
+
+fn elapsed_us() -> Result<u64, &'static str>
+{
+    system_info(SystemInfoType::ElapsedUs as u64)
+        .map_err(|_| "stress::timed_wait_reuse: system_info(ElapsedUs) failed")
 }
 
 /// Waiter: per cycle, a timed wait then an untimed wait on the cycle's

@@ -3,9 +3,8 @@
 
 // core/ktest/src/integration/queued_waiters_fifo.rs
 
-//! Integration: threads waiting on one notification or event queue queue in
-//! arrival order, and each delivery wakes the longest-waiting one; a second
-//! concurrent waiter on a wait set is refused.
+//! Integration: threads waiting on one notification or event queue are woken
+//! in arrival order, one per delivery.
 //!
 //! ruststd's lock primitives block every contender on one notification and
 //! depend on each delivery waking one parked contender. For the notification
@@ -18,10 +17,6 @@
 //!   3. **Tail expires** — A parks untimed, then B with a short timeout; after
 //!      B's wait times out, a delivery must reach A.
 //!
-//! A wait set has one waiter at a time: while A is parked, B's
-//! `wait_set_wait` returns `InvalidState` at once, and a member fire then
-//! reaches A.
-//!
 //! Every controller wait is bounded, so a wrong order fails instead of
 //! hanging; teardown destroys the object first, interrupting any child still
 //! parked. Runs on a single CPU (the children are timer-preempted peers).
@@ -29,8 +24,7 @@
 use syscall::{
     RIGHTS_ALL, cap_copy, cap_create_notification, cap_delete, cap_revoke, event_post,
     event_queue_create, event_recv, event_recv_timeout, notification_send, notification_wait,
-    notification_wait_timeout, thread_exit, thread_sleep, wait_set_add, wait_set_create,
-    wait_set_wait,
+    notification_wait_timeout, thread_exit, thread_sleep,
 };
 use syscall_abi::SyscallError;
 
@@ -49,17 +43,15 @@ const BIT_BAD: u64 = 1 << 2;
 const BITS_RETURNED: u64 = BIT_OK | BIT_BAD;
 const B_SHIFT: u32 = 3;
 
-/// The two deliveries, in order (the wait set fires one member whose badge
-/// is [`BADGE`]).
+/// The two deliveries, in order.
 const FIRST: u64 = 0x0A;
 const SECOND: u64 = 0x0B;
-const BADGE: u64 = 0x005E_C00D;
 
 /// Wall-clock settle after READY so a child provably reaches its park, and
 /// how long a parked child is given to (wrongly) return.
 const SETTLE_SLEEP_MS: u64 = 20;
 /// A timed child's timeout; long enough for the other child to park behind
-/// or ahead of it first.
+/// or ahead of it first ([`head_expires`] checks that it did).
 const EXPIRE_MS: u64 = 100;
 /// Bound on each controller wait for a child's report.
 const REPORT_MS: u64 = 1000;
@@ -72,7 +64,6 @@ enum Kind
 {
     Notification,
     EventQueue,
-    WaitSet,
 }
 
 /// The phase's two children, in the order they park.
@@ -120,7 +111,6 @@ enum Expect
 {
     Delivery(u64),
     TimedOut,
-    Refused,
 }
 
 /// A child's argument; `timeout_ms == 0` waits untimed.
@@ -141,14 +131,14 @@ static CHILD_ARGS: spawn::ArgBlock<ChildArgs, 2> = spawn::ArgBlock::new(ChildArg
     kind: Kind::Notification,
     waiter: Waiter::A,
     timeout_ms: 0,
-    expect: Expect::Refused,
+    expect: Expect::TimedOut,
 });
 
 type Script = fn(&mut Phase, &TestContext) -> TestResult;
 
 pub fn run(ctx: &TestContext) -> TestResult
 {
-    let phases: [(Kind, Script, &str); 7] = [
+    let phases: [(Kind, Script, &str); 6] = [
         (Kind::Notification, fifo, "notification fifo"),
         (
             Kind::Notification,
@@ -163,7 +153,6 @@ pub fn run(ctx: &TestContext) -> TestResult
         (Kind::EventQueue, fifo, "event queue fifo"),
         (Kind::EventQueue, head_expires, "event queue head expires"),
         (Kind::EventQueue, tail_expires, "event queue tail expires"),
-        (Kind::WaitSet, wait_set_refusal, "wait set refusal"),
     ];
     for (kind, script, name) in phases
     {
@@ -200,6 +189,14 @@ fn head_expires(p: &mut Phase, ctx: &TestContext) -> TestResult
 {
     p.start(ctx, Waiter::A, EXPIRE_MS, Expect::TimedOut)?;
     p.start(ctx, Waiter::B, 0, Expect::Delivery(FIRST))?;
+    // A must still be queued ahead of B, or its expiry leaves an empty queue.
+    if p.returned(Waiter::A)
+    {
+        return Err(
+            "integration::queued_waiters_fifo: waiter A expired before waiter B queued \
+             (raise EXPIRE_MS)",
+        );
+    }
     p.expect_returned(Waiter::A)?;
     p.expect_parked(Waiter::B)?;
     p.deliver(FIRST)?;
@@ -216,24 +213,12 @@ fn tail_expires(p: &mut Phase, ctx: &TestContext) -> TestResult
     p.expect_returned(Waiter::A)
 }
 
-fn wait_set_refusal(p: &mut Phase, ctx: &TestContext) -> TestResult
-{
-    p.start(ctx, Waiter::A, 0, Expect::Delivery(BADGE))?;
-    p.start(ctx, Waiter::B, 0, Expect::Refused)?;
-    p.expect_returned(Waiter::B)?;
-    p.expect_parked(Waiter::A)?;
-    p.deliver(FIRST)?;
-    p.expect_returned(Waiter::A)
-}
-
 /// One phase's object, `done` notification, children, and the `done` bits
 /// accumulated so far.
 struct Phase
 {
     kind: Kind,
     obj_cap: u32,
-    /// The wait set's one member, fired to deliver.
-    member: Option<u32>,
     done: u32,
     children: [Option<spawn::SpawnedChild>; 2],
     acc: u64,
@@ -249,25 +234,16 @@ impl Phase
         {
             Kind::Notification => cap_create_notification(ctx.memory_base),
             Kind::EventQueue => event_queue_create(ctx.memory_base, 4),
-            Kind::WaitSet => wait_set_create(ctx.memory_base),
-        }
-        .map_err(|_| "integration::queued_waiters_fifo: create object failed")?;
-        let member = match kind
+        };
+        let Ok(obj_cap) = obj_cap
+        else
         {
-            Kind::WaitSet =>
-            {
-                let member = cap_create_notification(ctx.memory_base)
-                    .map_err(|_| "integration::queued_waiters_fifo: create member failed")?;
-                wait_set_add(obj_cap, member, BADGE)
-                    .map_err(|_| "integration::queued_waiters_fifo: wait_set_add failed")?;
-                Some(member)
-            }
-            _ => None,
+            let _ = cap_delete(done);
+            return Err("integration::queued_waiters_fifo: create object failed");
         };
         Ok(Self {
             kind,
             obj_cap,
-            member,
             done,
             children: [None, None],
             acc: 0,
@@ -323,17 +299,21 @@ impl Phase
             .map_err(|_| "integration::queued_waiters_fifo: settle sleep failed")
     }
 
-    /// Deliver once: notification bits, an event payload, or a member fire.
+    /// Deliver once: notification bits or an event payload.
     fn deliver(&self, value: u64) -> TestResult
     {
-        match (self.kind, self.member)
+        match self.kind
         {
-            (Kind::Notification, _) => notification_send(self.obj_cap, value),
-            (Kind::EventQueue, _) => event_post(self.obj_cap, value),
-            (Kind::WaitSet, Some(member)) => notification_send(member, value),
-            (Kind::WaitSet, None) => return Err("integration::queued_waiters_fifo: no member"),
+            Kind::Notification => notification_send(self.obj_cap, value),
+            Kind::EventQueue => event_post(self.obj_cap, value),
         }
         .map_err(|_| "integration::queued_waiters_fifo: delivery failed")
+    }
+
+    /// Whether `waiter`'s wait has returned, from the bits collected so far.
+    fn returned(&self, waiter: Waiter) -> bool
+    {
+        self.acc & waiter.bits(BITS_RETURNED) != 0
     }
 
     /// `waiter`'s wait must return, with the result it expects, within the
@@ -405,11 +385,6 @@ impl Phase
             cap_delete(child.cs)
                 .map_err(|_| "integration::queued_waiters_fifo: reap child cspace failed")?;
         }
-        if let Some(member) = self.member
-        {
-            cap_delete(member)
-                .map_err(|_| "integration::queued_waiters_fifo: del member failed")?;
-        }
         cap_delete(self.done).map_err(|_| "integration::queued_waiters_fifo: del done failed")
     }
 }
@@ -433,14 +408,12 @@ fn child_entry(arg: u64) -> !
         (Kind::Notification, ms) => notification_wait_timeout(obj_cap, ms),
         (Kind::EventQueue, 0) => event_recv(obj_cap),
         (Kind::EventQueue, ms) => event_recv_timeout(obj_cap, ms),
-        (Kind::WaitSet, _) => wait_set_wait(obj_cap),
     };
     let ok = match (expect, kind, result)
     {
         (Expect::Delivery(value), _, Ok(got)) => got == value,
         (Expect::TimedOut, Kind::Notification, Ok(bits)) => bits == 0,
         (Expect::TimedOut, Kind::EventQueue, Err(e)) => e == SyscallError::WouldBlock as i64,
-        (Expect::Refused, _, Err(e)) => e == SyscallError::InvalidState as i64,
         _ => false,
     };
     let bit = if ok { BIT_OK } else { BIT_BAD };

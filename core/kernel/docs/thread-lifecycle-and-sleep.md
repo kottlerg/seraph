@@ -15,10 +15,11 @@ This document is the authoritative reference consulted before any change that to
   `sys_thread_set_priority`, `sys_exit`, `sys_thread_sleep`, `cancel_ipc_block`.
 - `core/kernel/src/cap/object.rs` — the `ObjectType::Thread` arm of `dealloc_object_one`, and the
   sleep-list removal and timer quiesce in its Notification and EventQueue arms.
-- `core/kernel/src/ipc/mod.rs` — `WaitQueue`, and the waiter claims that drop a sleep-list
-  entry: `claim_waiter` (called by `notification_send`, `event_queue_post`, `waitset_notify`, and
-  the timer's timed-wait arms) and `interrupt_all_waiters` (called by the Notification dealloc arm,
-  `event_queue_drop`, and `wait_set_drop`).
+- `core/kernel/src/ipc/mod.rs` — `WaitQueue`, `arm_timed_park` (called by `notification_wait`
+  and `event_queue_recv`), and the waiter claims that drop a sleep-list entry: `claim_waiter`
+  (called by `notification_send`, `event_queue_post`, `waitset_notify`, `waitset_add`, the timer's
+  timed-wait arms, and `interrupt_all_waiters`) and `interrupt_all_waiters` (called by the
+  Notification dealloc arm, `event_queue_drop`, and `wait_set_drop`).
 - The fault handlers in `core/kernel/src/arch/{x86_64/idt.rs,riscv64/interrupts.rs}` that drive
   thread-fault exits.
 
@@ -108,8 +109,9 @@ claims against concurrent IPC sources via the relevant source IPC lock (Notifica
      still in the source's waiter queue and its `park_seq` still equals the snapshot. The generation
      check rejects a later wait of the same thread on the same source (a sender claimed the popped
      park and the thread queued again before the timer took the lock): the TCB is queued again, but
-     `park_seq` advanced at that park's commit, which runs under the same source lock. The TCB is
-     read only while queued, and written only once the claim is won.
+     `park_seq` advanced at that park's commit, which runs under the same source lock. Membership
+     is the TCB's `ipc_wait_queue` tag (the TCB outlives the batch, invariant 9); the TCB is written
+     only once the claim is won.
    - any other binding: never claimed and never dereferenced (invariant 2 makes it unreachable).
 
 7. **Every waiter claim removes the entry under the source lock.** A notification or event queue
@@ -122,13 +124,14 @@ claims against concurrent IPC sources via the relevant source IPC lock (Notifica
    read under the source lock means no entry (the parker arms under that lock, and every removal
    clears both together), so the wakers skip the remove for an untimed wait.
 
-8. **`sleep_list_add` from a parking syscall MUST re-acquire the source IPC lock and verify the
-   TCB is still queued there before arming.** Without the recheck, a wake firing in the window
-   between the IPC primitive releasing its source lock and the syscall arming the deadline leaves
-   the TCB on the sleep list with stale state. The next unrelated `notification_wait` /
-   `event_recv` on this TCB is then hijacked by `sleep_check_wakeups`, delivering
-   `wakeup_value = 0` instead of real bits/payload. See `sys_notification_wait` and
-   `sys_event_recv`.
+8. **A timed park arms its sleep-list entry in the source-lock critical section that queues and
+   commits it.** `notification_wait` and `event_queue_recv` take the deadline and call
+   `arm_timed_park` after a committed park, before releasing the source lock, so no waker can
+   claim the TCB before its entry exists, and the syscall never locks the source again once the
+   caller is claimable (a later lock through the unpinned capability could reach a source freed by
+   a concurrent last-cap delete). An entry armed after a claim would outlive the wait it timed and
+   hijack the TCB's next unrelated `notification_wait` / `event_recv`, delivering
+   `wakeup_value = 0` instead of real bits or payload.
 
 9. **A source or TCB outlives every batch that popped it.** The timer's arms use the pop-time
    source and TCB pointers, which hold no reference. A batch advances `TIMER_DISPATCH_SEQ` to odd
@@ -197,7 +200,7 @@ the handler uses for the target's `state` write.
 | `sys_cap_create_thread` | (uninit) | `Created` | calling CPU | none — TCB not yet visible to schedulers; written in-place during construction. |
 | `sys_thread_configure` | `Created` | `Created` | calling CPU | does NOT touch `state`; mutates `trap_frame` and `saved_state.fs_base`. Target MUST be `Created`. |
 | `sys_thread_start` (first start) | `Created` | `Ready` | calling CPU | `await_descheduled(target)` (drains the target off every CPU's `current` and waits `context_saved == 1`; a never-dispatched `Created` thread is `current` nowhere, so this returns immediately), then `set_state_under_all_locks(target, Ready)`, then `enqueue_ready_thread(target_cpu)`. The all-locks write closes the dealloc race: a concurrent `dealloc_object(Thread)` on another CPU cannot free the TCB between the state write and the link. `enqueue_ready_thread` (not `enqueue_and_wake`) is used because the gated wake would coalesce an already-`Ready` thread and silently drop the link (see [scheduling-internals.md § ThreadState Transitions](scheduling-internals.md#threadstate-transitions)). Both the commit and the link refuse an `Exited` target (`StateCommit::RefusedExited` / `false`): the syscall's state precheck ran without a lock, and an object teardown or an exit on another CPU may have ended the thread since; the syscall then returns `InvalidArgument` and nothing is linked. |
-| `sys_thread_start` (resume from stop) | `Stopped` | `Ready` | calling CPU | Same as first-start, but the `await_descheduled` drain is load-bearing here: a thread stopped while Running may still be `current`/executing on a remote CPU. The drain runs while the target is still `Stopped` (a state `schedule()`'s requeue denylist rejects, so the owning CPU deschedules it without re-linking), and only then commits `Ready` and force-links it — otherwise `enqueue_ready_thread` would dispatch a still-live thread on a second CPU (the cross-CPU double-dispatch of #314/#293). The kernel uses `sys_thread_start` for both first-start and resume; this overload is intentional and `Stopped → Ready` is a permitted transition. |
+| `sys_thread_start` (resume from stop) | `Stopped` | `Ready` | calling CPU | Same as first-start, but the `await_descheduled` drain is load-bearing here: a thread stopped while Running may still be `current`/executing on a remote CPU. The drain runs while the target is still `Stopped` (a state `schedule()`'s requeue denylist rejects, so the owning CPU deschedules it without re-linking), and only then commits `Ready` and force-links it — otherwise `enqueue_ready_thread` would dispatch a still-live thread on a second CPU (the cross-CPU double-dispatch of #314/#293). Between the drain and the commit, `await_owed_wake` waits for a waker that claimed the stopped park to finish its `enqueue_and_wake` (see [`sys_thread_stop` Cross-CPU Stop Protocol](#sys_thread_stop-cross-cpu-stop-protocol), invariant 4). The kernel uses `sys_thread_start` for both first-start and resume; this overload is intentional and `Stopped → Ready` is a permitted transition. |
 | `sys_thread_stop` (running self) | `Running` | `Stopped` | calling CPU = running CPU | `commit_cancelling_park(target, Stopped, None)`, then `schedule(false)` immediately yields. The skip-loop in `schedule()` never re-enqueues a `Stopped` TCB. |
 | `sys_thread_stop` (running remote) | `Running` | `Stopped` | calling CPU ≠ running CPU | `commit_cancelling_park(target, Stopped, None)` returns `StateCommit::Committed(Some(run_cpu))`; the syscall handler then calls `prod_remote_cpu(run_cpu)` (sends an IPI so the target traps into kernel and runs `schedule()`) and bounded-spins until `sched_remote.current != target_tcb` or the target is no longer `Stopped` (a concurrent `sys_thread_start` overtook the stop). The IPI is required for `sys_thread_read_regs` to observe a fresh `trap_frame` snapshot rather than stale registers from the target's previous kernel entry. |
 | `sys_thread_stop` (Ready, on a run queue) | `Ready` | `Stopped` | calling CPU | `commit_cancelling_park(target, Stopped, None)`. The `schedule()` skip-loop drains the stale Ready entry on the next dequeue. |
@@ -639,7 +642,10 @@ The handler then drains the target.
 
    So `Stopped` is never written over a park that was not cancelled: a stop never leaves a
    `Stopped` thread registered as a source's waiter or on the sleep list. The object-teardown stop
-   (`stop_threads_bound_to`) commits `Exited` through the same loop.
+   (`stop_threads_bound_to`) commits `Exited` through the same loop. A park that a waker claimed
+   first (removed from the queue, `wake_in_flight = 1`) is not cancelled; the stop commits over it
+   and the waker's later `enqueue_and_wake` aborts on `Stopped`, leaving the deposit for the
+   resume (invariant 4).
 3. **Self-stop fast path.** If the target is the calling thread, call `schedule(false)` immediately.
    The skip-loop in `schedule()` never re-enqueues a `Stopped` TCB.
 4. **Cross-CPU drain.** If `running_on = Some(run_cpu)` and `run_cpu != current_cpu`:
@@ -672,6 +678,15 @@ The handler then drains the target.
    discipline of drain-protocol steps 8-9: spinning with interrupts disabled would block an
    inbound TLB-shootdown IPI targeted at this CPU and deadlock it. The spin terminates as soon as
    the remote deschedules the target or a concurrent `sys_thread_start` resumes it.
+4. **A restart waits out an owed wake.** A waker that claimed the stopped park may still be between
+   its claim and its `enqueue_and_wake`. `sys_thread_start` runs `await_owed_wake` after
+   `await_descheduled` and before its `Ready` commit: it reads `wake_in_flight` under the target's
+   `sched_lock` (ordered after the claim, whose source lock the stop's cancel or the thread's own
+   park rollback took before committing or descheduling) and, if set, spins until the waker clears
+   it (preemption disabled, interrupts enabled; spin site `start:wake-in-flight`). A `Stopped`
+   thread that is off every CPU and on no queue cannot be claimed again, so the late wake always
+   lands on `Stopped` and aborts. Without the gate the restarted thread could run, park again, and
+   be linked `Ready` by that wake while still queued on its new source.
 
 ---
 

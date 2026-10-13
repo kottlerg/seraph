@@ -1020,8 +1020,8 @@ impl Process {
         }
         let reason = if let Some(b) = self.bridge.as_mut() {
             // Bridge raises `completion_notification` exactly once after
-            // publishing `exit_reason`. Loop on zero-bit wakes
-            // (e.g. spurious / timeout) until real bits arrive.
+            // publishing `exit_reason`. An untimed wait always returns
+            // non-zero bits; the zero-bit retry is defensive.
             loop {
                 let bits = syscall::notification_wait(b.completion_notification)
                     .map_err(|_| io::Error::other("notification_wait on completion_notification failed"))?;

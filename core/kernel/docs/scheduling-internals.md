@@ -134,10 +134,9 @@ hang). See § Thread Registry.
    `event_queue_post`, `waitset_notify`, and `endpoint_call`'s server-wake branch) dequeue the head
    waiter, deposit the payload and set `wake_in_flight` under the source lock, RELEASE the source
    lock, then call `enqueue_and_wake` — releasing first bounds source-lock hold-time
-   (`waitset_notify` releases `ws.lock` while the notifying source's lock stays held as its outer
-   lock, which rule 2 orders). The Notification, EventQueue, and WaitSet destroy wakes do the same
-   for every waiter: `interrupt_all_waiters` claims them all under the source lock and
-   `DetachedWaiters::wake` runs once it is released. `endpoint_reply` takes no source lock: its
+   (`waitset_notify` and `waitset_add`'s ready-at-add wake release `ws.lock` while the notifying or
+   registering source's lock stays held as its outer lock, which rule 2 orders).
+   `endpoint_reply` takes no source lock: its
    exclusive claim is the `reply_tcb` `compare_exchange(client, null)`, the caller's
    `wake_in_flight` was set when `endpoint_call` / `endpoint_recv` published the binding, and
    `sys_ipc_reply` stamps the disposition and calls `enqueue_and_wake` once `endpoint_reply` has won
@@ -147,19 +146,26 @@ hang). See § Thread Registry.
    the wake is half-complete and owned exclusively by the in-flight waker: code executing *as the
    claimed thread* in that window (it is still live, mid-park) has exactly one legal continuation —
    fall through to `schedule()`. Consuming the deposited payload and returning to user mode is
-   forbidden; it strands the waker's run-queue link (#352). The other `reply_tcb` claims — the
+   forbidden; it strands the waker's run-queue link (#352). Nor may a restart resume it: a stop
+   that loses the park to the claim commits `Stopped` over the claimed park, and `sys_thread_start`
+   waits for the waker's `enqueue_and_wake` to clear `wake_in_flight` (`await_owed_wake`) before
+   committing `Ready`, so the late wake aborts on `Stopped` instead of linking a later park; see
+   [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md#sys_thread_stop-cross-cpu-stop-protocol)
+   § `sys_thread_stop` Cross-CPU Stop Protocol, invariant 4. The other `reply_tcb` claims — the
    cancel, dying-client dealloc, and commit-failure rollback `compare_exchange` — wake no one. The
    cancel and rollback claims stamp a cancelled disposition (INTERRUPTED, or KILL for a faulter) and
    clear `wake_in_flight`; the dying-client claim only clears `wake_in_flight` (deposits per the
    [ipc-internals.md](ipc-internals.md#park-dispositions-and-episodes) episode table; the
    `BlockedOnReply` symmetry rules'
    [actors 1-7](thread-lifecycle-and-sleep.md#blockedonreply-edge--symmetry-rules) enumerate every
-   claimant). The `still_waiter` rechecks (the sleep-list arming in `sys_event_recv` /
-   `sys_notification_wait`) respect this: they only add a timer on the not-claimed branch and fall
-   through to `schedule()` on both branches. The `endpoint_dealloc` send/recv drain instead HOLDS
-   `ep.lock` across the per-waiter `enqueue_and_wake` walk (a multi-waiter drain; sound precisely
-   because the order is canonical, and `wake_in_flight = 1` per waiter blocks a racing
-   `dealloc(waiter)` unlink from freeing a TCB mid-wake). `enqueue_and_wake` dispatches its wakeup
+   claimant). A timed notification or event-queue wait arms its sleep-list entry inside the
+   source-lock critical section that commits its park (`arm_timed_park`), before any waker can
+   claim it. The multi-waiter drains — the `endpoint_dealloc` send/recv drain and the Notification,
+   EventQueue, and WaitSet destroy wakes (`interrupt_all_waiters`) — instead HOLD the source lock
+   across the per-waiter `enqueue_and_wake` walk (sound precisely because the order is canonical,
+   and `wake_in_flight = 1` per waiter blocks a racing `dealloc(waiter)` unlink from freeing a TCB
+   mid-wake); a drain holds the lock for one bounded wake per queued waiter, once, at the source's
+   destruction. `enqueue_and_wake` dispatches its wakeup
    IPI only after BOTH the run-queue lock and `(*tcb).sched_lock` are released (never IPI under
    `sched_lock`). `pull_unpinned_ready` is the one site that takes `(*tcb).sched_lock` via
    `try_lock_raw` while already holding a run-queue lock — the inverse of the canonical order; the
@@ -533,7 +539,7 @@ commit, or under the remote run-queue lock the stop protocol documents — and
 | Field group | Fields | Owning lock | Cross-CPU access rule |
 |---|---|---|---|
 | **Scheduling** | `state`, `ipc_state`, `queued_on`, `run_queue_next`, `preferred_cpu`, `blocked_on_object`, `wake_pending`, `park_seq` (plus `priority`, `slice_remaining`, `cpu_affinity`) | `(*tcb).sched_lock` — the single authoritative serializer, keyed on the TCB pointer (NOT positional). The same lock owns the group regardless of which CPU's run queue currently links the TCB, or whether it is linked at all. | Cross-CPU writers MUST acquire `(*tcb).sched_lock`. The per-CPU `scheduler.lock` is held *under* `sched_lock` only for the run-queue list structure (the intrusive `run_queue_next` link, `queued_on` tag, head/tail/`non_empty`/load); it no longer owns `state`. `wake_pending` is part of this group and is a plain `bool` accessed only under `sched_lock` (the lock-serialized wake-before-park refuse-to-park flag). `park_seq`, the park-binding generation, is an `AtomicU32`: every write holds `sched_lock`, and its Relaxed readers hold `sched_lock` (the stop protocol), `SLEEP_LIST_LOCK` (the timer pop), or the source lock (the timer claim) — see [thread-lifecycle-and-sleep.md § Atomic Ordering for Sleep List and Lifecycle](thread-lifecycle-and-sleep.md#atomic-ordering-for-sleep-list-and-lifecycle). |
-| **IPC blocking** | `ipc_state`, `blocked_on_object` (committed under `sched_lock`; arbitrated under the source lock), `ipc_msg`, `ipc_wait_next`, `wakeup_value`, `timed_out` | For the `(ipc_state, blocked_on_object)` pair, both `(*tcb).sched_lock` (the commit / clear in `commit_blocked_under_local_lock` / `commit_reply_rebind_under_local_lock` / `enqueue_and_wake` / `cancel_ipc_block`'s snapshot) AND the source IPC lock matching `ipc_state` (the waiter-queue arbitration). The remaining fields (`ipc_msg`, `ipc_wait_next`, `wakeup_value`, `timed_out`) are owned by the source IPC lock alone. | A cross-CPU writer of the `(ipc_state, blocked_on_object)` pair MUST hold `sched_lock`; a writer of the source's waiter queue/`ipc_wait_next` or the wakeup payload MUST hold the matching source lock; reads from another CPU MUST do the same. The two locks are never nested (order is source → `sched_lock`, but each commit/clear takes them disjointly). |
+| **IPC blocking** | `ipc_state`, `blocked_on_object` (committed under `sched_lock`; arbitrated under the source lock), `ipc_msg`, `ipc_wait_next`, `ipc_wait_prev`, `ipc_wait_queue`, `wakeup_value`, `timed_out` | For the `(ipc_state, blocked_on_object)` pair, both `(*tcb).sched_lock` (the commit / clear in `commit_blocked_under_local_lock` / `commit_reply_rebind_under_local_lock` / `enqueue_and_wake` / `cancel_ipc_block`'s snapshot) AND the source IPC lock matching `ipc_state` (the waiter-queue arbitration). The remaining fields (`ipc_msg`, the queue links `ipc_wait_next` / `ipc_wait_prev`, the queue tag `ipc_wait_queue`, `wakeup_value`, `timed_out`) are owned by the source IPC lock alone. | A cross-CPU writer of the `(ipc_state, blocked_on_object)` pair MUST hold `sched_lock`; a writer of the source's waiter queue, a TCB's queue links or tag, or the wakeup payload MUST hold the matching source lock; reads from another CPU MUST do the same, except the softlockup watchdog's diagnostic read of the atomic `ipc_wait_queue` tag. The two locks are never nested (order is source → `sched_lock`, but each commit/clear takes them disjointly). |
 | **Reply slot** | `reply_tcb` | `AtomicPtr<ThreadControlBlock>`; lock-free with `Acquire`/`Release` ordering, and `compare_exchange` for cancel. | `endpoint_call` and `endpoint_recv` set it (and their commit-fail teardowns clear it) under `ep.lock`; `endpoint_reply` takes no lock and claims it by `compare_exchange(client, null)`; `fail_reply_and_wake_caller` (the `SYS_IPC_REPLY` failure path) claims it by `swap(null)` (see [ipc-internals.md § Park Dispositions and Episodes](ipc-internals.md#park-dispositions-and-episodes)); cancel/dealloc paths on a remote CPU use `compare_exchange(client, null)` so they never clobber a different client's binding. `reply_tcb` is the one TCB field with no single owning lock — multiple lock domains write it (`endpoint_call` / `endpoint_recv` under `ep.lock`; the `endpoint_reply` CAS, which also serves the fault reply, and the `fail_reply_and_wake_caller` swap under no lock; the `cancel_ipc_block` `BlockedOnReply`/`BlockedOnFault` CAS and the `dealloc_object(Thread)` dying-client arms under the client's `sched_lock`; the `dealloc_object(Thread)` dying-server reply-bound CAS under the server's `sched_lock` and all-CPU scheduler locks), which is why it is atomic. The fault redirection (`BlockedOnFault`) reuses this slot identically: `fault_dispatch` parks the faulter exactly as a caller, so every CAS claimant arbitrates over the same slot. **The binding must be published consistently with the `(ipc_state, blocked_on_object)` pair `dealloc_object(Thread)` uses to find and clear it (#289):** `endpoint_call` commits that pair under `(*tcb).sched_lock` via `commit_blocked_under_local_lock`; the `BlockedOnSend → BlockedOnReply` rebind in `endpoint_recv` does the same via `commit_reply_rebind_under_local_lock`, serialising with dealloc's `Exited` mark on the shared per-TCB `sched_lock` (dealloc takes `sched_lock` outer before its all-CPU locks). If the caller died concurrently the commit fails and `endpoint_recv` tears the binding down (CAS `reply_tcb` back to null; on a win, stamp the cancelled deposit — INTERRUPTED, or KILL for a faulter — then clear `wake_in_flight`) before skipping the dead sender — without this, dealloc reads a stale `BlockedOnSend` state, takes the wrong unlink arm, and leaves a dangling `reply_tcb` that fires against the freed/reused slot (#289 use-after-free / double-enqueue; #284 TCB-field corruption). **Stop-path UAF (#317) — CLOSURE LEMMA:** the client-side `reply_tcb` CAS (`cancel_ipc_block`, and `dealloc_object(Thread)`'s own `BlockedOnReply`/`BlockedOnFault` client arms) dereferences the *server*, which `dealloc_object(Thread)` on the server may concurrently `retype_free`. The CAS therefore runs under the *client's* `(*tcb).sched_lock` gated by a `blocked_on_object == server` re-read, and `dealloc_object(Thread)` on the server nulls a claimed client's `blocked_on_object` under that same client `sched_lock` *strictly before* `retype_free` (and before clearing the client's `wake_in_flight`, so an Exited client cannot be freed first). Hence observing `blocked_on == server` under the client lock witnesses the server is not yet freed, and the CAS dereferences live memory; the symmetric `endpoint_reply → client` deref stays pinned by the client's `wake_in_flight` as before. No new atomic — `reply_tcb`'s `Release`-publish / `AcqRel`-CAS / `Acquire`-load pairing is unchanged; this is a lock-scope tightening of the existing rules. `sleep_check_wakeups` has no reply/fault arm: no syscall arms a reply/fault waiter on the sleep list (no timeout surface), and a timer claim of one would need the same client-`sched_lock`-held re-read + CAS. |
 | **Context save/restore** | `saved_state`, `kernel_stack_top`, `trap_frame`, `context_saved` | Owning-CPU's scheduler.lock for read; the running CPU writes `saved_state` during `context::switch` (no lock; write is serialised with the next reader by `context_saved` Acquire/Release). | A remote CPU dequeueing this TCB MUST spin-wait on `context_saved` (Acquire load) before reading any other context field. |
 | **Address-space / capability** | `address_space`, `cspace`, `iopb` | Set once at create-time / configure-time; treated as read-only after `sys_thread_start`. | No cross-CPU write is permitted; reads need no lock. |
@@ -1059,8 +1065,7 @@ The kernel does not auto-cascade IPC unblock on process exit. The contract:
      send and receive queues and wakes every queued thread. Senders are stamped INTERRUPTED (a
      queued fault sender is stamped KILL); receivers are stamped INTERRUPTED.
    - `dealloc_object` Notification arm (`core/kernel/src/cap/object.rs`): under the notification
-     lock, claims every queued waiter, stamped INTERRUPTED, and wakes them once the lock is
-     released.
+     lock, claims and wakes every queued waiter, stamped INTERRUPTED.
 
    These dispositions are listed in [ipc-internals.md](ipc-internals.md) § Park Dispositions and
    Episodes.

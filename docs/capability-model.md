@@ -692,7 +692,6 @@ including the deleting thread itself, when it holds that last capability to its 
 `AddressSpace` (the delete then never returns to it). The process's resources are reclaimed as their
 capability reference counts reach zero. This path has known kernel memory-safety gaps, tracked in
 [#443](https://github.com/kottlerg/seraph/issues/443) (see
-[IPC Design](ipc-design.md#the-callreply-model) § The Call/Reply Model,
 [capability-internals.md](../core/kernel/docs/capability-internals.md#storage-hybrid-two-level-radix)
 § Storage: Hybrid Two-Level Radix,
 [thread-lifecycle-and-sleep.md](../core/kernel/docs/thread-lifecycle-and-sleep.md#dealloc_objectthread-drain-protocol)

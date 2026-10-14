@@ -1416,15 +1416,17 @@ pub fn thread_configure_with_tls(
     if ret < 0 { Err(ret) } else { Ok(()) }
 }
 
-/// Move a configured thread from `Created` to `Ready` (enqueue it).
+/// Move a configured `Created` thread, or a `Stopped` one (resume), to
+/// `Ready` (enqueue it).
 ///
 /// The thread must have been configured via [`thread_configure`] first.
 ///
 /// # Errors
 /// Returns a negative `i64` error code if the thread cap is invalid, the
-/// thread has not been configured yet, or it is not `Created`/`Stopped` —
-/// including a thread that exited, or was killed by an object teardown,
-/// between the check and the locked commit (`InvalidArgument`).
+/// thread has not been configured yet, or it is not `Created`/`Stopped` under
+/// the locked commit — including one a concurrent start already resumed, or
+/// one that exited or was killed by an object teardown after the first check
+/// (`InvalidArgument`).
 #[inline]
 pub fn thread_start(thread_cap: u32) -> Result<(), i64>
 {
@@ -1965,8 +1967,8 @@ pub fn wait_set_remove(ws_cap: u32, source_cap: u32) -> Result<(), i64>
 /// # Errors
 /// Returns a negative `i64` error code if the wait set cap is invalid or lacks
 /// Wait rights; `-15` (`InvalidState`) if another thread already waits on the
-/// set (a wait set takes one waiter); `-16` (`Interrupted`) if the caller is stopped while
-/// waiting or the wait set is destroyed under it.
+/// set (a wait set takes one waiter); `-16` (`Interrupted`) if the caller is
+/// stopped while waiting or the wait set is destroyed under it.
 #[inline]
 pub fn wait_set_wait(ws_cap: u32) -> Result<u64, i64>
 {

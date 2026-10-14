@@ -403,8 +403,11 @@ A process dies when:
 
 The kill-process pattern and the `CSpace`/`AddressSpace` teardown have known kernel memory-safety
 gaps, tracked in [#443](https://github.com/kottlerg/seraph/issues/443) (see
-[IPC Design](ipc-design.md#the-callreply-model) and
-[Capability Internals](../core/kernel/docs/capability-internals.md#storage-hybrid-two-level-radix)).
+[Capability Internals](../core/kernel/docs/capability-internals.md#storage-hybrid-two-level-radix)
+§ Storage: Hybrid Two-Level Radix,
+[thread-lifecycle-and-sleep.md](../core/kernel/docs/thread-lifecycle-and-sleep.md#dealloc_objectthread-drain-protocol)
+§ `dealloc_object(Thread)` Drain Protocol, step 11, and
+[syscalls.md](../core/kernel/docs/syscalls.md#sys_thread_stop-20) § `SYS_THREAD_STOP`).
 
 ### Exit reason
 

@@ -210,9 +210,12 @@ pub enum SyscallError
     /// (e.g. thread not `Stopped` for `read_regs`/`write_regs`, or a wait set
     /// another thread already waits on).
     InvalidState = -15,
-    /// A blocking operation was cancelled: the thread was stopped, or the
-    /// object it was blocked on was destroyed. The thread sees this as the
-    /// return value of its blocked syscall.
+    /// A blocking operation was cancelled: the thread was stopped, the object
+    /// it was blocked on was destroyed, or, for a call, the server received
+    /// again without replying. The thread sees this as the return value of its
+    /// blocked syscall. Batched capability operations (revoke, delete, move, a
+    /// range split) also return it at their liveness backstop; each syscall's
+    /// Errors entry in core/kernel/docs/syscalls.md states what a retry does.
     Interrupted = -16,
     /// A structural per-object ceiling was reached (e.g. a `CSpace`'s
     /// directory is full). Unlike `OutOfMemory`, donating memory (augment
@@ -268,7 +271,9 @@ when the message carries capabilities.
 `InsufficientRights`, `InvalidArgument` (bad count, a cap slot repeated in one
 message, or `data_count` > 0 with no IPC buffer page registered),
 `InvalidAddress` (registered IPC buffer page unmapped), `InvalidState` (a cap
-slot is pinned by an in-flight `SYS_CAP_REVOKE` or `SYS_CAP_MOVE`), `Interrupted`. Cap-slot
+slot is pinned by an in-flight `SYS_CAP_REVOKE` or `SYS_CAP_MOVE`), `Interrupted` (the call was
+cancelled while blocked, including by the receiving thread receiving again before it replied; see
+`SYS_IPC_RECV`). Cap-slot
 problems are rejected before the caller blocks; a refusal that arises only
 afterwards degrades to delivery with zero caps (the caller keeps its
 capabilities; see [ipc-design.md](../../../docs/ipc-design.md) § Message Format).
@@ -353,10 +358,11 @@ Wait for a call on an endpoint. Blocks until a caller arrives.
 The message's data words are written to the receiver's registered IPC buffer page, followed by the
 cap-transfer result block (count, then the delivered destination handles) at word offset
 `MSG_DATA_WORDS_MAX`. The kernel binds the caller to the receiving thread as its reply capability
-(the per-thread `reply_tcb` field); `SYS_IPC_REPLY` consumes this binding implicitly. A receive that
-delivers a message while a reply is still pending overwrites the binding; the displaced caller is
-outside the guarantees of this document ([ipc-design.md](../../../docs/ipc-design.md) § The
-Call/Reply Model, [#443](https://github.com/kottlerg/seraph/issues/443)).
+(the per-thread `reply_tcb` field); `SYS_IPC_REPLY` consumes this binding implicitly. A receive
+issued while a reply is still pending first releases the pending caller: its `SYS_IPC_CALL` returns
+`Interrupted`, and a fault-blocked caller is killed as for any cancelled fault episode. The binding
+is therefore never overwritten ([ipc-design.md](../../../docs/ipc-design.md) § The Call/Reply
+Model).
 
 For a call, the badge is the value attached to the sender's endpoint capability via
 `SYS_CAP_DERIVE_BADGE`; it identifies the caller without a forgeable PID. For a
@@ -801,9 +807,11 @@ Registry). **The stop includes the caller**: a thread deleting the last capabili
 is stopped by that delete and the call does not return; the object is reclaimed once the thread is
 off its CPU. This path has known kernel memory-safety gaps, tracked in
 [#443](https://github.com/kottlerg/seraph/issues/443) (see
-[ipc-design.md](../../../docs/ipc-design.md) § The Call/Reply Model and
 [capability-internals.md](capability-internals.md#storage-hybrid-two-level-radix) § Storage: Hybrid
-Two-Level Radix). The caller's own `Thread` object is treated differently, as below.
+Two-Level Radix and
+[thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md#dealloc_objectthread-drain-protocol)
+§ `dealloc_object(Thread)` Drain Protocol, step 11). The caller's own `Thread` object is treated
+differently, as below.
 
 Refused for two cases, both returning `InvalidState` with the capability left in
 place: a thread may not delete the last capability to its **own running**
@@ -1124,9 +1132,11 @@ Protocol, invariant 4).
 **Capability requirement:** `thread_cap` must have Control rights.
 
 **Errors:** `InvalidCapability`, `InsufficientRights` (cap lacks Control),
-`InvalidArgument` (thread not in Created/Stopped state — including one that exited or
-was killed by an object teardown between the check and the locked commit — or not yet
-configured).
+`InvalidArgument` (thread not in Created/Stopped state under the locked commit — including one a
+concurrent start already resumed, or one that exited or was killed by an object teardown after the
+first check — or not yet configured). Of concurrent starts of one stopped thread, exactly one
+succeeds. A start that a concurrent `SYS_THREAD_STOP` overtakes after its commit succeeds and
+leaves the thread `Stopped`.
 
 ---
 
@@ -1147,10 +1157,7 @@ syscall on the target thread returns `Interrupted`, unless a genuine waker or th
 claimed the wake first); a target that blocks while the stop is in progress is cancelled the same
 way, never left registered as a waiter (see
 [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § `sys_thread_stop` Cross-CPU Stop
-Protocol). This does not hold for a caller displaced from a server's pending-reply
-binding: the stop is not memory-safe, and its outcome is in
-[ipc-design.md](../../../docs/ipc-design.md) § The Call/Reply Model
-([#443](https://github.com/kottlerg/seraph/issues/443)). Nor is a stop of a thread waiting on a
+Protocol). This does not hold for a stop of a thread waiting on a
 notification, event queue, or wait set whose last capability is deleted concurrently: the cancel
 can lock the object after it is freed
 ([#443](https://github.com/kottlerg/seraph/issues/443) § Source pointer held past its free). If the
@@ -2211,7 +2218,8 @@ source of truth.
 [Kernel Entropy Subsystem](entropy.md), [IPC Subsystem Internals](ipc-internals.md),
 [Scheduler Internals](scheduler.md),
 [SMP Scheduling and Locking Invariants](scheduling-internals.md),
-[IPC Design](../../../docs/ipc-design.md), [Process Lifecycle](../../../docs/process-lifecycle.md),
+[Capability Model](../../../docs/capability-model.md), [IPC Design](../../../docs/ipc-design.md),
+[Process Lifecycle](../../../docs/process-lifecycle.md),
 [Testing](../../../docs/testing.md),
 [services/drivers/serial/README.md](../../../services/drivers/serial/README.md),
 [memmgr Memory Pool](../../../services/memmgr/docs/memory-pool.md),

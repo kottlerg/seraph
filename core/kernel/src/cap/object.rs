@@ -2963,12 +2963,13 @@ unsafe fn dealloc_object_one(
                      refcount invariant broken"
                 );
 
-                // Wake every blocked waiter with its park stamped Interrupted,
-                // claimed and woken under sig.lock — the #160 discipline
-                // notification_send uses — so a concurrent dealloc(waiter)
-                // BlockedOnNotification unlink (which takes sig.lock and spins
-                // on wake_in_flight) cannot free a TCB before its
-                // enqueue_and_wake commits.
+                // Wake every blocked waiter with its park stamped Interrupted.
+                // Each is claimed under sig.lock, as notification_send claims
+                // (#160), and, as a multi-waiter drain, also woken under it
+                // (docs/scheduling-internals.md § Lock Hierarchy rule 5), so a
+                // concurrent dealloc(waiter) BlockedOnNotification unlink
+                // (which takes sig.lock and spins on wake_in_flight) cannot
+                // free a TCB before its enqueue_and_wake commits.
                 // SAFETY: state validated non-null; sig.lock held across the
                 // claims and wakes, with no scheduler or sleep-list lock held.
                 unsafe {

@@ -370,8 +370,10 @@ pub unsafe fn consume_park_interrupted(tcb: *mut ThreadControlBlock) -> bool
 /// pointers. They are only valid when the TCB is on a run queue or IPC wait
 /// queue respectively. `run_queue_next` is serialised by the owning CPU's
 /// `PerCpuScheduler` lock; `ipc_wait_next`, `ipc_wait_prev` and the
-/// `ipc_wait_queue` tag by the lock of the IPC source whose queue links the
-/// TCB (the tag is also read racily by the softlockup watchdog).
+/// `ipc_wait_queue` tag are written under the lock of the IPC source whose
+/// queue links the TCB. Any source-lock holder may read the tag to test
+/// membership in its own queue (see [`crate::ipc::WaitQueue`]); the softlockup
+/// watchdog also reads it without a lock.
 #[repr(C)]
 pub struct ThreadControlBlock
 {
@@ -457,6 +459,14 @@ pub struct ThreadControlBlock
     /// `SLEEP_LIST_LOCK` or the source lock rather than `sched_lock`; every
     /// write holds `sched_lock`.
     pub park_seq: core::sync::atomic::AtomicU32,
+
+    /// Start generation: advanced under [`sched_lock`](Self::sched_lock) by
+    /// each `SYS_THREAD_START` `Ready` commit (`start_under_all_locks`). The
+    /// start then links the thread only if the generation is unchanged and the
+    /// thread still `Ready`, so a stop (and any restart) landing between its
+    /// commit and its link supersedes it instead of being overwritten by a
+    /// second link (`enqueue_ready_thread`).
+    pub start_seq: u32,
 
     // === IPC state ===
     /// Current IPC blocking reason (None when not blocked on IPC).
@@ -654,14 +664,22 @@ pub struct ThreadControlBlock
     /// on RISC-V RVWMO.
     pub context_saved: core::sync::atomic::AtomicU32,
 
-    /// Set to 1 by a waker that has popped this thread from a wait object
-    /// (notification, endpoint, event queue, or wait set) under that object's lock
-    /// but has not yet called `enqueue_and_wake`; cleared to 0 by
-    /// `enqueue_and_wake`.
-    /// `dealloc_object(Thread)` spins on this (Acquire) after its wait-object
-    /// unlink and before `retype_free`, so a thread popped for wake cannot be
-    /// freed out from under the in-flight wake. This is the wake-side analogue
-    /// of `context_saved` (the switch-side gate). See
+    /// The owed-wake pin: 1 while some path holds a claim on this thread's
+    /// park whose `enqueue_and_wake` has not yet run.
+    ///
+    /// Set by a waker that claims the thread from a wait object (notification,
+    /// endpoint, event queue, or wait set) under that object's lock, and by
+    /// `endpoint_call` / `endpoint_recv` before they publish a reply binding
+    /// to it. Cleared by `enqueue_and_wake` when the owed wake lands, or, for a
+    /// reply binding no wake will follow, by the path whose `reply_tcb` CAS
+    /// tore the binding down (`cancel_ipc_block`, the endpoint park rollbacks,
+    /// the `dealloc_object(Thread)` detach).
+    ///
+    /// Two paths spin on it (Acquire): `dealloc_object(Thread)` after its
+    /// wait-object unlink and before `retype_free`, so a thread claimed for
+    /// wake is not freed under the in-flight wake (the wake-side analogue of
+    /// `context_saved`); and `sched::await_owed_wake` in `SYS_THREAD_START`,
+    /// so a restart does not race a late wake. See
     /// `docs/scheduling-internals.md` § Cross-CPU TCB Ownership.
     pub wake_in_flight: core::sync::atomic::AtomicU32,
 

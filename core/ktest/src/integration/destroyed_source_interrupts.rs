@@ -179,10 +179,11 @@ fn park_and_destroy(
     }
     // Revoke deletes the children's copies (derivation children of the
     // source); the delete then drops the last reference and runs the dealloc
-    // wake.
-    *object = None;
+    // wake. `object` keeps the cap until the delete succeeds, so a failure
+    // leaves it to the phase's teardown.
     cap_revoke(obj).map_err(|_| "integration::destroyed_source_interrupts: revoke failed")?;
     cap_delete(obj).map_err(|_| "integration::destroyed_source_interrupts: delete failed")?;
+    *object = None;
     for index in 0..count
     {
         acc = wait_for(done, acc, (BIT_OK | BIT_BAD) << shift(index))?;
@@ -215,10 +216,18 @@ fn create_source(ctx: &TestContext, source: Source) -> Result<(u32, Option<u32>)
     {
         return Ok((object, None));
     }
-    let member = cap_create_notification(ctx.memory_base)
-        .map_err(|_| "integration::destroyed_source_interrupts: create member failed")?;
-    wait_set_add(object, member, 0x5E7)
-        .map_err(|_| "integration::destroyed_source_interrupts: wait_set_add failed")?;
+    let Ok(member) = cap_create_notification(ctx.memory_base)
+    else
+    {
+        let _ = cap_delete(object);
+        return Err("integration::destroyed_source_interrupts: create member failed");
+    };
+    if wait_set_add(object, member, 0x5E7).is_err()
+    {
+        let _ = cap_delete(object);
+        let _ = cap_delete(member);
+        return Err("integration::destroyed_source_interrupts: wait_set_add failed");
+    }
     Ok((object, Some(member)))
 }
 

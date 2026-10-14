@@ -48,6 +48,9 @@
 //! - `park_interrupted_stop_start.rs` — a thread stopped while parked in any non-call blocking syscall (notification/event/recv/wait-set/sleep) restarts to `Interrupted`, never a stale deposit (#363)
 //! - `destroyed_source_interrupts.rs` — every waiter on a notification, event queue, or wait set
 //!   destroyed under it returns `Interrupted`, never a fabricated success
+//! - `reply_binding_displaced.rs` — a server's second receive without a reply releases the first
+//!   caller with `Interrupted`; the second call completes, and the released caller stops and
+//!   restarts
 //! - `queued_waiters_fifo.rs` — threads waiting on one notification or event queue are woken in
 //!   arrival order, one per delivery, including after a timed waiter expires at the head or the
 //!   tail
@@ -78,6 +81,7 @@ pub mod multi_caller_ipc_fifo;
 pub mod park_interrupted_stop_start;
 pub mod priority_preemption;
 pub mod queued_waiters_fifo;
+pub mod reply_binding_displaced;
 pub mod retype_reclaim;
 pub mod retype_subpage_clobber;
 pub mod shared_memory_two_aspaces;
@@ -93,6 +97,8 @@ use crate::run_integration_test;
 ///
 /// To add a new scenario: implement it in a new file in this directory, declare
 /// it with `pub mod` above, then add a `run_integration_test!` call here.
+// too_many_lines: run_all is a flat dispatch table; splitting it adds no clarity.
+#[allow(clippy::too_many_lines)]
 pub fn run_all(ctx: &TestContext)
 {
     run_integration_test!("integration::thread_lifecycle", thread_lifecycle::run(ctx));
@@ -122,6 +128,10 @@ pub fn run_all(ctx: &TestContext)
     run_integration_test!(
         "integration::park_interrupted_stop_start",
         park_interrupted_stop_start::run(ctx)
+    );
+    run_integration_test!(
+        "integration::reply_binding_displaced",
+        reply_binding_displaced::run(ctx)
     );
     run_integration_test!(
         "integration::destroyed_source_interrupts",

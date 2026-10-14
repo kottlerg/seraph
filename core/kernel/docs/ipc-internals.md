@@ -74,21 +74,31 @@ one set of links suffices). No separate allocation. Threads are served in arriva
    b. Stage the message in recv_tcb.ipc_msg: label/counts/badge from the
       sender's saved register state, data words read from the sender's IPC
       buffer page (the receiver writes them to its own page when it resumes)
-   c. Transfer capability slots (see capability-internals.md)
-   d. Publish the caller binding (the server's reply capability):
-      recv_tcb.reply_tcb = current_tcb (Release store)
-   e. Mark recv_tcb as Ready; set result to success
-   f. Release endpoint lock
+   c. Claim recv_tcb for its wake (wake_in_flight = 1) and publish the
+      caller binding (the server's reply capability):
+      recv_tcb.reply_tcb = current_tcb (Release store into an empty slot;
+      the server's receive released any earlier binding)
+   d. commit_blocked_under_local_lock(current_tcb, BlockedOnReply or
+      BlockedOnFault, recv_tcb); on a refusal, roll the binding back
+      (rollback_uncommitted_call)
+   e. Release endpoint lock
+   f. Transfer capability slots (see capability-internals.md)
    g. enqueue_and_wake(recv_tcb) on its selected CPU
-   h. Current thread (committed BlockedOnReply under the endpoint lock)
-      calls the scheduler
+   h. Committed: call the scheduler. Refused: return through the
+      disposition
 
 5. else (no receiver yet):
-   // Slow path
-   a. Append current_tcb to the endpoint's send queue (send_nonempty = 1)
-   b. Store the message in current_tcb.ipc_msg
-   c. Release endpoint lock
-   d. Block current thread: state = BlockedOnSend, call scheduler
+   // Slow path, all under the endpoint lock until step e
+   a. Store the message in current_tcb.ipc_msg
+   b. Append current_tcb to the endpoint's send queue (send_nonempty = 1)
+   c. commit_blocked_under_local_lock(current_tcb, BlockedOnSend, ep);
+      on a refusal, unlink current_tcb from the send queue and stamp the
+      call cancelled (INTERRUPTED, or KILL for a fault delivery)
+   d. If the park committed and made the send queue non-empty, notify the
+      endpoint's wait set (waitset_notify)
+   e. Release endpoint lock
+   f. Committed: call the scheduler. Refused: return through the
+      disposition
 ```
 
 **Message copy:** The label, counts, badge, and packed cap handles travel in
@@ -111,26 +121,39 @@ syscall on either side. Nothing is allocated on the path.
 
 ```
 1. Resolve endpoint_cap → verify Receive rights
-2. Acquire endpoint lock
-3. if the send queue is non-empty:
+2. Release an unreplied caller (release_unreplied_caller, no lock held):
+   swap current_tcb.reply_tcb to null; if it held a caller bound by an
+   earlier receive the server never replied to, stamp that caller's call
+   cancelled (INTERRUPTED, or KILL for a fault-blocked caller) and
+   enqueue_and_wake it. The binding published below therefore never
+   overwrites another.
+3. Acquire endpoint lock
+4. if the send queue is non-empty:
    // Fast path: a sender is waiting
    a. sender_tcb = head of the send queue (dequeued)
    b. if the send queue is now empty: send_nonempty = 0
-   c. Copy the staged message from sender_tcb.ipc_msg (label/counts plus the
-      data words read at call time) into the server's trap frame and IPC
-      buffer page
-   d. Transfer capability slots
-   e. Publish the caller binding (the server's reply capability):
+   c. Claim sender_tcb for the reply wake (wake_in_flight = 1), then publish
+      the caller binding (the server's reply capability):
       current_tcb.reply_tcb = sender_tcb (Release store)
-   f. Mark sender_tcb as BlockedOnReply (was already enqueued as BlockedOnSend)
-   g. Release endpoint lock
-   h. Return to server with message (no blocking)
+   d. commit_reply_rebind_under_local_lock(sender_tcb, BlockedOnReply or
+      BlockedOnFault); if the sender died or was stopped meanwhile, CAS the
+      binding back to null, stamp the sender cancelled on a win, and retry
+      from a with the next sender
+   e. Release endpoint lock
+   f. Copy the staged message from sender_tcb.ipc_msg (label/counts plus the
+      data words read at call time) into the server's trap frame and IPC
+      buffer page, and transfer capability slots
+   g. Return to server with message (no blocking)
 
-4. else (no sender yet):
-   // Slow path
-   a. append current_tcb to the endpoint's recv queue
-   b. Release endpoint lock
-   c. Block current thread: state = BlockedOnRecv, call scheduler
+5. else (no sender yet):
+   // Slow path, all under the endpoint lock until step c
+   a. Append current_tcb to the endpoint's recv queue
+   b. commit_blocked_under_local_lock(current_tcb, BlockedOnRecv, ep); on a
+      refusal, unlink current_tcb from the recv queue, and stamp INTERRUPTED
+      if the refusal was a stop (RefusedStop)
+   c. Release endpoint lock
+   d. Committed: call the scheduler. Refused: return through the
+      disposition
 ```
 
 ### Reply Path
@@ -452,7 +475,8 @@ arbitrates against `event_queue_post` and wins; cleared by the resuming
 syscall (protocol per
 [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md#timed_out-cross-cpu-protocol)).
 
-Lock order: `eq.lock → SLEEP_LIST_LOCK` (post path), per
+Lock order: `eq.lock → SLEEP_LIST_LOCK` (the post, the timed-recv arm, and the cancel and destroy
+claims), per
 [scheduling-internals.md § Lock Hierarchy](scheduling-internals.md#lock-hierarchy) rule 3.
 `SLEEP_LIST_LOCK` is released before `eq.lock` is taken on the timer
 path — sequential, not nested, so no cycle.
@@ -558,10 +582,13 @@ waitset_notify(wait_set, member_idx):
    right now, Release lock and return its badge.
 4. else:
    a. waiters.push(current_tcb)
-   b. Release lock
-   c. Block current thread; when woken, return Interrupted if the park is
-      INTERRUPTED (a stop, or the wait set destroyed under the waiter), else
-      return wakeup_value
+   b. commit_blocked_under_local_lock(current_tcb, BlockedOnWaitSet, ws);
+      on a refusal, remove current_tcb from waiters, and stamp INTERRUPTED
+      if the refusal was a stop (RefusedStop)
+   c. Release lock
+   d. Committed: call the scheduler. When woken (or refused), return
+      Interrupted if the park is INTERRUPTED (a stop, or the wait set
+      destroyed under the waiter), else return wakeup_value
 ```
 
 **Why step 3 exists, and its memory-ordering requirement.** Readiness

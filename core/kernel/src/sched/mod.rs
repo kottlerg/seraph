@@ -1290,10 +1290,9 @@ fn watchdog_dump(reason: &str)
     // dispatch happens). For `Blocked` threads the `blocked_on` decode says
     // whether the blocking object still queues the thread (no wake issued) or
     // holds data while it is no longer queued (a wake deposited but never
-    // linked); for
-    // `Ready`/`Stopped` threads the scheduling fields say why a runnable thread
-    // is neither dispatched locally nor stolen (`context_saved`/`queued_on`/
-    // affinity / save-window pin).
+    // linked); for `Ready`/`Stopped` threads the scheduling fields say why a
+    // runnable thread is neither dispatched locally nor stolen
+    // (`context_saved`/`queued_on`/affinity / save-window pin).
     crate::kprintln!("  NON-RUNNING REGISTERED THREADS:");
     // Defined outside the `try_for_each` call so the `kprintln!` expansions are
     // not lexically inside the `unsafe` wrapping that call (which would flag
@@ -1520,11 +1519,11 @@ static mut SLEEP_LIST: [*mut ThreadControlBlock; MAX_SLEEPING] =
 static mut SLEEP_COUNT: usize = 0;
 
 /// One expired sleeper, snapshotted under `SLEEP_LIST_LOCK` at pop. The
-/// per-entry claim loop dispatches off this snapshot rather than re-reading the
-/// TCB, so a concurrent `dealloc_object(Thread)` that frees the TCB after the
-/// lock is dropped is never observed as a torn binding. The timed IPC arms read
-/// the TCB only while the source lock shows it queued, and the other no-claim
-/// paths never dereference it.
+/// per-entry claim loop dispatches off this snapshot rather than re-reading
+/// the TCB's binding, which may have changed since the pop. The timed IPC arms
+/// read the TCB's wait-queue tag and `park_seq` under the snapshotted source's
+/// lock; the TCB stays allocated because `dealloc_object(Thread)` waits in
+/// [`sleep_wakeups_quiesce`] for the batch to end before the free.
 #[cfg(not(test))]
 #[derive(Clone, Copy)]
 struct ExpiredWaiter
@@ -1852,11 +1851,11 @@ pub fn sleep_check_wakeups()
     } in expired.iter().take(n)
     {
         // ipc_state/blocked_on are the pop-time snapshot (taken under
-        // SLEEP_LIST_LOCK), NOT a fresh (*tcb) read: a concurrent
-        // dealloc_object(Thread) may have freed the TCB once the lock was dropped,
-        // so dispatching off a live dereference here would be a use-after-free.
-        // The source object (blocked_on) is held alive by the dispatch sequence:
-        // its dealloc waits in sleep_wakeups_quiesce until this batch ends.
+        // SLEEP_LIST_LOCK), not a fresh (*tcb) read: the live binding may have
+        // changed since, and each arm's claim decides against the snapshot.
+        // The TCB and the source object (blocked_on) are both held alive by the
+        // dispatch sequence: their deallocs wait in sleep_wakeups_quiesce until
+        // this batch ends.
 
         let claimed = match ipc_state
         {
@@ -2163,6 +2162,7 @@ pub fn init(cpu_count: u32) -> u32
                     wake_pending: false,
                     park_started_tick: 0,
                     park_seq: core::sync::atomic::AtomicU32::new(0),
+                    start_seq: 0,
                     ipc_state: IpcThreadState::None,
                     ipc_msg: crate::ipc::message::Message::default(),
                     reply_tcb: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
@@ -2470,13 +2470,37 @@ pub unsafe fn set_state_under_all_locks(
 ) -> StateCommit
 {
     // SAFETY: caller contract.
-    let commit = unsafe { commit_state_under_all_locks(tcb, new_state, None, None) };
+    let commit = unsafe { commit_state_under_all_locks(tcb, new_state, None, None, None) };
     // Without an expected park generation the commit always resolves.
     debug_assert!(
         commit.is_some(),
         "set_state_under_all_locks: unresolved commit"
     );
     commit.unwrap_or(StateCommit::RefusedExited)
+}
+
+/// Commit `tcb` `Ready` for `SYS_THREAD_START` only if it is still `Created`
+/// or `Stopped` under the all-locks hold, returning the start generation the
+/// commit advanced (`start_seq`) for [`enqueue_ready_thread`]. The syscall
+/// reads the state without a lock, so a concurrent start may already have
+/// resumed the thread, and it may since have parked; overwriting that
+/// `Blocked` with `Ready` would let the force-link put a thread still on a
+/// wait queue on a run queue too. Returns `None` without writing in that case
+/// (the thread is not `Created`/`Stopped`, or is `Exited`).
+///
+/// # Safety
+/// As for [`set_state_under_all_locks`].
+#[cfg(not(test))]
+pub unsafe fn start_under_all_locks(tcb: *mut ThreadControlBlock) -> Option<u32>
+{
+    let mut seq = 0;
+    // SAFETY: caller contract.
+    let commit = unsafe {
+        commit_state_under_all_locks(tcb, thread::ThreadState::Ready, None, None, Some(&mut seq))
+    };
+    // Without an expected park generation the commit always resolves.
+    debug_assert!(commit.is_some(), "start_under_all_locks: unresolved commit");
+    matches!(commit, Some(StateCommit::Committed(_))).then_some(seq)
 }
 
 /// Mark `tcb` `Exited` with `exit_reason` recorded under the same all-locks
@@ -2496,7 +2520,13 @@ pub unsafe fn exit_under_all_locks(tcb: *mut ThreadControlBlock, exit_reason: u6
 {
     // SAFETY: caller contract.
     let commit = unsafe {
-        commit_state_under_all_locks(tcb, thread::ThreadState::Exited, Some(exit_reason), None)
+        commit_state_under_all_locks(
+            tcb,
+            thread::ThreadState::Exited,
+            Some(exit_reason),
+            None,
+            None,
+        )
     };
     // Without an expected park generation the commit always resolves.
     debug_assert!(commit.is_some(), "exit_under_all_locks: unresolved commit");
@@ -2551,7 +2581,7 @@ pub unsafe fn commit_cancelling_park(
         }
         // SAFETY: caller contract.
         let commit =
-            unsafe { commit_state_under_all_locks(tcb, new_state, exit_reason, Some(seq)) };
+            unsafe { commit_state_under_all_locks(tcb, new_state, exit_reason, Some(seq), None) };
         if let Some(commit) = commit
         {
             return commit;
@@ -2564,7 +2594,10 @@ pub unsafe fn commit_cancelling_park(
 ///
 /// With `expected_park_seq`, returns `None` without writing when the TCB's
 /// `park_seq` differs under the locks (a park committed after the caller's
-/// snapshot); otherwise always `Some`.
+/// snapshot); otherwise always `Some`. With `start` (a `SYS_THREAD_START`
+/// commit), refuses ([`StateCommit::RefusedState`]) a TCB that is neither
+/// `Created` nor `Stopped` under the locks, and on a commit advances the TCB's
+/// `start_seq` and stores the new value through `start`.
 ///
 /// # Safety
 /// As for [`set_state_under_all_locks`].
@@ -2574,6 +2607,7 @@ unsafe fn commit_state_under_all_locks(
     new_state: thread::ThreadState,
     exit_reason: Option<u64>,
     expected_park_seq: Option<u32>,
+    start: Option<&mut u32>,
 ) -> Option<StateCommit>
 {
     let cpu_count = CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
@@ -2603,16 +2637,21 @@ unsafe fn commit_state_under_all_locks(
     // every writer of `state` on this path holds. `park_seq` is written only
     // under the held sched_lock.
     // SAFETY: tcb validated by caller; state and park_seq fields always valid.
-    let (exited, park_changed) = unsafe {
+    let (exited, park_changed, wrong_state) = unsafe {
         (
             (*tcb).state == thread::ThreadState::Exited,
             expected_park_seq.is_some_and(|seq| {
                 seq != (*tcb).park_seq.load(core::sync::atomic::Ordering::Relaxed)
             }),
+            start.is_some()
+                && !matches!(
+                    (*tcb).state,
+                    thread::ThreadState::Created | thread::ThreadState::Stopped
+                ),
         )
     };
     let mut running_on: Option<usize> = None;
-    if !exited && !park_changed
+    if !exited && !park_changed && !wrong_state
     {
         // Write the state and snapshot priority under all locks so the queue
         // drain below sees a value coherent with the state we just published.
@@ -2626,6 +2665,11 @@ unsafe fn commit_state_under_all_locks(
             if let Some(reason) = exit_reason
             {
                 (*tcb).exit_reason = reason;
+            }
+            if let Some(seq) = start
+            {
+                (*tcb).start_seq = (*tcb).start_seq.wrapping_add(1);
+                *seq = (*tcb).start_seq;
             }
             (*tcb).state = new_state;
             (*tcb).priority
@@ -2687,6 +2731,10 @@ unsafe fn commit_state_under_all_locks(
     {
         None
     }
+    else if wrong_state
+    {
+        Some(StateCommit::RefusedState)
+    }
     else
     {
         Some(StateCommit::Committed(running_on))
@@ -2705,6 +2753,9 @@ pub enum StateCommit
     Committed(Option<usize>),
     /// Nothing was written: the thread is `Exited`, which is terminal.
     RefusedExited,
+    /// Nothing was written: a [`start_under_all_locks`] commit found the
+    /// thread neither `Created` nor `Stopped`.
+    RefusedState,
 }
 
 /// Wait until `tcb` has left every CPU and its in-flight register save has
@@ -3047,9 +3098,6 @@ unsafe fn scan_bound_current(
 /// `dealloc_object(Thread)` then runs its full drain on an already-Exited,
 /// off-CPU thread. A stopped server's reply-bound client is released by
 /// that later drain, exactly as for a server stopped by `SYS_THREAD_STOP`.
-/// For a thread displaced from a server's pending-reply binding, neither the
-/// stop nor the later drain is memory-safe (docs/scheduling-internals.md
-/// § Thread Registry, #443).
 ///
 /// Returns `true` if the running thread has itself been stopped — it was
 /// bound to this object, or a concurrent teardown on another CPU stopped it
@@ -3175,6 +3223,13 @@ pub unsafe fn wait_until_aspace_inactive(
     unsafe { crate::arch::current::cpu::restore_interrupts(saved_int) };
     crate::percpu::preempt_enable();
     completed
+}
+
+/// Test stub.
+#[cfg(test)]
+pub unsafe fn start_under_all_locks(_tcb: *mut ThreadControlBlock) -> Option<u32>
+{
+    Some(0)
 }
 
 /// Test stub.
@@ -3605,7 +3660,6 @@ pub unsafe fn await_owed_wake(tcb: *mut thread::ThreadControlBlock)
 
 /// Test stub.
 #[cfg(test)]
-#[allow(unused_variables)]
 pub unsafe fn await_owed_wake(_tcb: *mut thread::ThreadControlBlock) {}
 
 /// Migrate a `Ready` thread from `src_cpu`'s run queue onto `dst_cpu`'s
@@ -4389,10 +4443,14 @@ pub unsafe fn enqueue_and_wake(_tcb: *mut ThreadControlBlock, _target_cpu: usize
 /// `enqueue_and_wake` would be wrong: the thread is already `Ready`, which
 /// the gate coalesces — dropping it from every run queue.
 ///
-/// Returns `false` without writing or linking if the thread is `Exited`
-/// under `sched_lock`: an object teardown or an exit on another CPU can mark
-/// it between the caller's own state commit and this link, and `Exited` is
-/// terminal (see [`set_state_under_all_locks`]).
+/// `start_seq` is the generation the caller's [`start_under_all_locks`]
+/// commit returned. The link is made only if, under `sched_lock`, the thread
+/// is still `Ready` at that generation; otherwise the commit was superseded
+/// between commit and link and nothing is written or linked:
+/// [`ReadyLink::Exited`] if an object teardown or an exit on another CPU
+/// marked it `Exited` (terminal; see [`set_state_under_all_locks`]), else
+/// [`ReadyLink::Superseded`] (a stop, and possibly a restart that owns its own
+/// link, came between).
 ///
 /// Lock order: `(*tcb).sched_lock` (outer) → target run-queue lock (inner), then
 /// `wake_idle_cpu` after both are released — identical to `enqueue_and_wake`'s
@@ -4400,21 +4458,36 @@ pub unsafe fn enqueue_and_wake(_tcb: *mut ThreadControlBlock, _target_cpu: usize
 /// caller ran [`await_owed_wake`]).
 ///
 /// # Safety
-/// - `tcb` must be a valid [`ThreadControlBlock`] pointer, not live or linked on
-///   any CPU.
+/// - `tcb` must be a valid [`ThreadControlBlock`] pointer. While it is `Ready`
+///   at `start_seq` it is not live or linked on any CPU (the caller drained it
+///   before its commit, and only a later commit can link it); in any other
+///   state this function touches nothing.
 /// - `target_cpu` must be < [`MAX_CPUS`] and initialized by `sched::init`.
 /// - The caller must hold no run-queue lock.
 #[cfg(not(test))]
-pub unsafe fn enqueue_ready_thread(tcb: *mut ThreadControlBlock, target_cpu: usize) -> bool
+pub unsafe fn enqueue_ready_thread(
+    tcb: *mut ThreadControlBlock,
+    target_cpu: usize,
+    start_seq: u32,
+) -> ReadyLink
 {
     // SAFETY: tcb valid; sched_lock (outer) paired with unlock below.
     let sched_saved = unsafe { (*tcb).sched_lock.lock_raw() };
-    // SAFETY: state read under sched_lock, which every lifecycle writer holds.
-    if unsafe { (*tcb).state } == thread::ThreadState::Exited
+    // SAFETY: state and start_seq read under sched_lock, which every lifecycle
+    // writer holds.
+    let refusal = unsafe {
+        match (*tcb).state
+        {
+            thread::ThreadState::Exited => Some(ReadyLink::Exited),
+            thread::ThreadState::Ready if (*tcb).start_seq == start_seq => None,
+            _ => Some(ReadyLink::Superseded),
+        }
+    };
+    if let Some(refusal) = refusal
     {
         // SAFETY: paired with the lock_raw above.
         unsafe { (*tcb).sched_lock.unlock_raw(sched_saved) };
-        return false;
+        return refusal;
     }
     // SAFETY: caller guarantees target_cpu is initialized.
     let sched = unsafe { scheduler_for(target_cpu) };
@@ -4469,15 +4542,31 @@ pub unsafe fn enqueue_ready_thread(tcb: *mut ThreadControlBlock, target_cpu: usi
 
     // SAFETY: target_cpu validated < MAX_CPUS by scheduler_for.
     unsafe { wake_idle_cpu(target_cpu) };
-    true
+    ReadyLink::Linked
+}
+
+/// Outcome of [`enqueue_ready_thread`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ReadyLink
+{
+    /// The thread is `Ready` and linked on the target run queue.
+    Linked,
+    /// Nothing linked: a stop (and possibly a restart, which links the thread
+    /// itself) superseded the caller's start commit.
+    Superseded,
+    /// Nothing linked: the thread is `Exited`.
+    Exited,
 }
 
 /// Test stub for `enqueue_ready_thread` (no-op in test mode).
 #[cfg(test)]
-#[allow(unused_variables)]
-pub unsafe fn enqueue_ready_thread(_tcb: *mut ThreadControlBlock, _target_cpu: usize) -> bool
+pub unsafe fn enqueue_ready_thread(
+    _tcb: *mut ThreadControlBlock,
+    _target_cpu: usize,
+    _start_seq: u32,
+) -> ReadyLink
 {
-    true
+    ReadyLink::Linked
 }
 
 /// Select target CPU for enqueueing a thread based on affinity, soft

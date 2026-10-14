@@ -218,23 +218,25 @@ pub fn sys_thread_start(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         // All-CPU lock commit closes the cross-CPU dealloc race; see
         // docs/thread-lifecycle-and-sleep.md § Lifecycle State Machine. The
         // target is now not-`current` and unlinked, so the force-link below
-        // establishes enqueue_ready_thread's not-live precondition. Both the
-        // commit and the link refuse an `Exited` target: the state read above
-        // ran without a lock, and an object teardown (or an exit the target
-        // reached through a concurrent start) may have ended the thread since.
-        // Reviving it would let it run against reclaimed storage.
-        if matches!(
-            crate::sched::set_state_under_all_locks(target_tcb, ThreadState::Ready),
-            crate::sched::StateCommit::RefusedExited
-        )
+        // establishes enqueue_ready_thread's not-live precondition. The state
+        // read above ran without a lock: a concurrent start may have resumed
+        // the target (which may since have parked), or an object teardown or
+        // exit may have ended it. The commit therefore re-checks `Created` or
+        // `Stopped` under the locks and refuses otherwise.
+        let Some(start_seq) = crate::sched::start_under_all_locks(target_tcb)
+        else
         {
             return Err(SyscallError::InvalidArgument);
-        }
+        };
         // Route to correct CPU based on affinity. The thread is already Ready
         // (committed above), so use enqueue_ready_thread to link it: the gated
         // enqueue_and_wake would coalesce an already-Ready thread and drop it.
+        // The link is made only if this commit is still current: a concurrent
+        // stop (and any restart, which links the thread itself) may have
+        // superseded it, and the start then took effect and was stopped.
         let target_cpu = crate::sched::select_target_cpu(target_tcb);
-        if !crate::sched::enqueue_ready_thread(target_tcb, target_cpu)
+        if crate::sched::enqueue_ready_thread(target_tcb, target_cpu, start_seq)
+            == crate::sched::ReadyLink::Exited
         {
             return Err(SyscallError::InvalidArgument);
         }
@@ -260,7 +262,12 @@ unsafe fn commit_stopped(
     match unsafe { crate::sched::commit_cancelling_park(tcb, ThreadState::Stopped, None) }
     {
         crate::sched::StateCommit::Committed(running_on) => Ok(running_on),
-        crate::sched::StateCommit::RefusedExited => Err(SyscallError::InvalidState),
+        // RefusedState answers an expected-state predicate, which a stop
+        // commit does not pass.
+        crate::sched::StateCommit::RefusedExited | crate::sched::StateCommit::RefusedState =>
+        {
+            Err(SyscallError::InvalidState)
+        }
     }
 }
 

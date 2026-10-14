@@ -44,16 +44,11 @@ or reused.
 
 A server that needs to delegate work may make a downstream call before replying: the pending reply
 stays bound to the receiving thread until that thread replies, and the downstream call does not
-touch that binding. A delegating server therefore replies before it next receives. When a later
-receive delivers a message while a reply is still pending, the kernel overwrites the binding. The
-displaced caller (a thread blocked in `call` or a fault-blocked thread) is then outside every
-guarantee the system and kernel documents state for a blocked or bound thread: no reply reaches it;
-stopping it, tearing down its CSpace or AddressSpace, or deleting its last Thread capability can
-hang the kernel or touch freed kernel memory; and restarting a stopped one trips a debug-build
-kernel assertion, while a release build fails the call closed with `Interrupted` (or kills a
-fault-blocked thread), per the fail-closed resume rule in
-[ipc-internals.md](../core/kernel/docs/ipc-internals.md#park-dispositions-and-episodes). This is a
-defect; its consequences are listed in [#443](https://github.com/kottlerg/seraph/issues/443).
+touch that binding. A delegating server therefore replies before it next receives. A receive
+issued while a reply is still pending first releases the pending caller, so a binding is never
+overwritten: a thread blocked in `call` returns `Interrupted`, and a fault-blocked thread is killed,
+as for any cancelled call or fault episode (the mechanism is in
+[ipc-internals.md](../core/kernel/docs/ipc-internals.md#receive-path-server)).
 
 ### Message Format
 
@@ -189,11 +184,8 @@ a kernel-originated synchronous message, suspending the thread until the handler
 resuming it, or killing it on `FAULT_REPLY_KILL` — or the binding is severed and the thread
 is killed (severing by clearing the binding mid-fault: design intent; not yet implemented,
 #242). This reuses the call/reply machinery above — the suspended thread occupies the
-caller's role and the handler services it with the ordinary receive/reply cycle. The
-guarantee does not hold for a fault-blocked thread displaced by a later receive on its handler
-while its reply is still pending, as
-[§ The Call/Reply Model](#the-callreply-model) describes
-([#443](https://github.com/kottlerg/seraph/issues/443)). See [Fault Handling](fault-handling.md).
+caller's role and the handler services it with the ordinary receive/reply cycle. See
+[Fault Handling](fault-handling.md).
 
 ---
 
@@ -246,11 +238,9 @@ The kernel does not provide:
 
 [Capability Subsystem Internals](../core/kernel/docs/capability-internals.md),
 [IPC Subsystem Internals](../core/kernel/docs/ipc-internals.md),
-[SMP Scheduling and Locking Invariants](../core/kernel/docs/scheduling-internals.md),
 [Syscall Interface Specification](../core/kernel/docs/syscalls.md),
-[Thread Lifecycle and Sleep List Invariants](../core/kernel/docs/thread-lifecycle-and-sleep.md),
 [Architecture Overview](architecture.md), [Capability Model](capability-model.md),
-[Fault Handling](fault-handling.md), [Process Lifecycle](process-lifecycle.md),
+[Fault Handling](fault-handling.md),
 [programs/capexhaust/README.md](../programs/capexhaust/README.md),
 [procmgr IPC Interface](../services/procmgr/docs/ipc-interface.md),
 [shared/namespace-protocol/README.md](../shared/namespace-protocol/README.md)

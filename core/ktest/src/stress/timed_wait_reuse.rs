@@ -57,10 +57,13 @@ const CYCLES: u32 = 400;
 const WAIT_MS: u64 = 1;
 
 /// A late round's delivery comes this many microseconds after the waiter
-/// enters its timed wait, swept per round over [`LATE_SPAN_US`]: from half
-/// the timeout before the deadline to half after it, across the timer's
-/// claim. A busy-wait, because a sleep would wake the controller on the
-/// timer's own tick, after the claim, and never race it.
+/// enters its timed wait, swept per round over [`LATE_SPAN_US`]. The kernel
+/// rounds the deadline to a 1 ms tick boundary, `WAIT_MS - 1` to `WAIT_MS` ms
+/// after entry, and the timer claims the wait on the first CPU 0 tick at or
+/// after it, so the claim lands `WAIT_MS - 1` to `WAIT_MS + 1` ms after entry;
+/// the sweep covers the middle of that window. A busy-wait, because a sleep
+/// would wake the controller on the timer's own tick, after the claim, and
+/// never race it.
 const LATE_MIN_US: u64 = WAIT_MS * 1000 / 2;
 const LATE_SPAN_US: u64 = WAIT_MS * 1000;
 
@@ -243,7 +246,18 @@ fn cycles(sig: u32, eq: u32) -> Result<Tally, &'static str>
         let untimed_ok = UNTIMED_OK.load(Ordering::Acquire) != 0;
         let timed = TIMED_RESULT.load(Ordering::Acquire);
         ACKED.store(cycle, Ordering::Release);
-        record(&mut tally, source, late, timed, untimed_ok)?;
+        let timed = check(source, timed, untimed_ok)?;
+        if late
+        {
+            if timed == TIMED_DELIVERY
+            {
+                tally.delivered[source] += 1;
+            }
+            else
+            {
+                tally.timed_out[source] += 1;
+            }
+        }
     }
     Ok(tally)
 }
@@ -286,15 +300,13 @@ fn await_results(cycle: u32, deliver: impl Fn(u64) -> Result<(), i64>) -> TestRe
     Ok(())
 }
 
-/// Check one cycle's results and count a late round's timed outcome.
-fn record(tally: &mut Tally, source: usize, late: bool, timed: u32, untimed_ok: bool)
--> TestResult
+/// Check one cycle's results; returns the timed outcome, `TIMED_DELIVERY` or
+/// `TIMED_TIMEOUT`.
+fn check(source: usize, timed: u32, untimed_ok: bool) -> Result<u32, &'static str>
 {
     let notification = source == NOTIFICATION;
     match timed
     {
-        TIMED_DELIVERY if late => tally.delivered[source] += 1,
-        TIMED_TIMEOUT if late => tally.timed_out[source] += 1,
         TIMED_DELIVERY | TIMED_TIMEOUT =>
         {}
         _ if notification =>
@@ -308,7 +320,7 @@ fn record(tally: &mut Tally, source: usize, late: bool, timed: u32, untimed_ok: 
     }
     match (untimed_ok, notification)
     {
-        (true, _) => Ok(()),
+        (true, _) => Ok(timed),
         (false, true) => Err(
             "stress::timed_wait_reuse: an untimed notification wait returned a timeout or error",
         ),

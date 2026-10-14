@@ -230,8 +230,9 @@ Created ──(SYS_THREAD_START)──► Ready ──(scheduled)──► Runni
                                   ▼
                                 Ready
 
-Running ──(SYS_THREAD_STOP)──► Stopped
-Running ──(SYS_THREAD_EXIT)──► Exited (TCB freed)
+Running / Ready / Blocked ──(SYS_THREAD_STOP)──► Stopped
+Stopped ──(SYS_THREAD_START)──► Ready
+Running ──(SYS_THREAD_EXIT)──► Exited (TCB freed when its last capability is deleted)
 ```
 
 State transitions are governed by the per-field-group ownership rules in

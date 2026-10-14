@@ -72,6 +72,7 @@ use ipc::{procmgr_errors, procmgr_labels};
 const BRIDGE_SENTINEL_DROP: u64 = u64::MAX;
 
 use syscall::EXIT_KILLED;
+use syscall_abi::SyscallError;
 
 // ── Stdio ───────────────────────────────────────────────────────────────────
 
@@ -1021,12 +1022,18 @@ impl Process {
         let reason = if let Some(b) = self.bridge.as_mut() {
             // Bridge raises `completion_notification` exactly once after
             // publishing `exit_reason`. An untimed wait always returns
-            // non-zero bits; the zero-bit retry is defensive.
+            // non-zero bits; the zero-bit retry is defensive. `Interrupted`
+            // (this thread was stopped and restarted) waits again.
             loop {
-                let bits = syscall::notification_wait(b.completion_notification)
-                    .map_err(|_| io::Error::other("notification_wait on completion_notification failed"))?;
-                if bits != 0 {
-                    break;
+                match syscall::notification_wait(b.completion_notification) {
+                    Ok(0) => {}
+                    Ok(_) => break,
+                    Err(e) if e == SyscallError::Interrupted as i64 => {}
+                    Err(_) => {
+                        return Err(io::Error::other(
+                            "notification_wait on completion_notification failed",
+                        ));
+                    }
                 }
             }
             if let Some(h) = b.handle.take() {
@@ -1035,11 +1042,19 @@ impl Process {
             b.exit_reason.load(Ordering::Acquire)
         } else {
             // Non-piped: `wait` consumes the kernel's death post on
-            // `death_eq` directly. No bridge thread allocated. A `death_eq`
-            // destroyed while `wait` is parked returns `Interrupted`, an
-            // error here.
-            syscall::event_recv(self.death_eq)
-                .map_err(|_| io::Error::other("event_recv on child death queue failed"))?
+            // `death_eq` directly. No bridge thread allocated. `Interrupted`
+            // (this thread was stopped and restarted, or `death_eq` was
+            // destroyed under the wait) waits again; a destroyed queue then
+            // fails the next receive.
+            loop {
+                match syscall::event_recv(self.death_eq) {
+                    Ok(reason) => break reason,
+                    Err(e) if e == SyscallError::Interrupted as i64 => {}
+                    Err(_) => {
+                        return Err(io::Error::other("event_recv on child death queue failed"));
+                    }
+                }
+            }
         };
         let status = ExitStatus(reason);
         self.exit_status = Some(status);
@@ -1161,12 +1176,16 @@ struct BridgeHandles {
 }
 
 fn bridge_main(h: BridgeHandles) {
-    let payload = match syscall::event_recv(h.death_eq) {
-        Ok(p) => p,
-        // `event_recv` error (`death_eq` invalid, or the wait interrupted:
-        // a stop, or `death_eq` destroyed under it) — nothing to do, exit
-        // without firing any wakes.
-        Err(_) => return,
+    let payload = loop {
+        match syscall::event_recv(h.death_eq) {
+            Ok(p) => break p,
+            // A stop and restart of this thread, or `death_eq` destroyed
+            // under the wait; a destroyed queue fails the next receive.
+            Err(e) if e == SyscallError::Interrupted as i64 => {}
+            // `death_eq` invalid — nothing to do, exit without firing any
+            // wakes.
+            Err(_) => return,
+        }
     };
     if payload == BRIDGE_SENTINEL_DROP {
         // Spawner is dropping the Process; do not fire any wakes.

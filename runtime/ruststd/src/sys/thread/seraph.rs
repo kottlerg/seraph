@@ -31,7 +31,7 @@ use crate::num::NonZero;
 use crate::thread::ThreadInit;
 use crate::time::Duration;
 
-use syscall_abi::{FAULT_CLASS_ALL, PAGE_SIZE};
+use syscall_abi::{FAULT_CLASS_ALL, PAGE_SIZE, SyscallError};
 
 /// Default minimum stack size. Matches the upstream unsupported-PAL value.
 pub const DEFAULT_MIN_STACK_SIZE: usize = 64 * 1024;
@@ -428,9 +428,24 @@ impl Thread {
         // without spinning since the child has already exited), and frees the
         // memory. A spurious early wake only makes the cap delete briefly spin
         // in the kernel drain protocol — correct, never a use-after-free.
-        let _ = syscall::notification_wait(res.done_notification);
-        // SAFETY: the child has left user-mode (it signalled done_notification).
-        unsafe { res.reclaim() };
+        // `Interrupted` (this thread was stopped and restarted) and a zero-bit
+        // return wait again: the child may still be running. Any other error
+        // means the private done-notification cap is gone and no wait can
+        // succeed; the child's resources are then leaked, not reclaimed under
+        // a child that may still be in user mode.
+        let signalled = loop {
+            match syscall::notification_wait(res.done_notification) {
+                Ok(0) => {}
+                Ok(_) => break true,
+                Err(e) if e == SyscallError::Interrupted as i64 => {}
+                Err(_) => break false,
+            }
+        };
+        if signalled {
+            // SAFETY: the child has left user-mode (it signalled
+            // done_notification).
+            unsafe { res.reclaim() };
+        }
 
         // Release this thread's reaper slot so its (eventual) death-post is a
         // no-op, then opportunistically reap any detached threads that have died.

@@ -22,10 +22,13 @@ use crate::sched::thread::ThreadControlBlock;
 /// free), storing only its tail, so the queue is pointer-sized and the source
 /// states keep their retype sizes. Each queued TCB's `ipc_wait_queue` tag
 /// names the queue, so every operation, membership tests included, is O(1)
-/// and touches only the TCBs it links or unlinks. Every access holds the
-/// owning source's lock, except the watchdog's [`tags_racy`](Self::tags_racy)
-/// read of a TCB's tag. A delivery wakes the head; destroying the source
-/// wakes every waiter.
+/// and touches only the TCBs it links or unlinks. A queue's links, and the tag
+/// of each TCB it links, are written only under the owning source's lock. A
+/// holder of any source lock may read a TCB's tag to test membership in that
+/// lock's own queue, even while the TCB is linked on another queue: no other
+/// holder of that lock writes the tag to that queue's address. The watchdog's
+/// [`tags_racy`](Self::tags_racy) read is the only read without a lock. A
+/// delivery wakes the head; destroying the source wakes every waiter.
 ///
 /// A queue must not move while a thread is on it: the tags hold its address.
 pub struct WaitQueue

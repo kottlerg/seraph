@@ -26,16 +26,24 @@ use crate::{ChildStack, TestContext, TestResult};
 // Notification right only (no WAIT). Children only send on notifications.
 const RIGHTS_NOTIFY: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
 
-// Child stack for the blocking_wait and occupied_wait_refused tests (each
-// reaps its child before returning).
+// Child stack for the blocking_wait test.
 static mut CHILD_STACK: ChildStack = ChildStack::ZERO;
 
-/// `occupied_wait_refused` child's `done` bits: parked, and its wait's verdict.
+// Child stacks for occupied_wait_refused's parked waiter (0) and refused
+// waiter (1). The test deletes both children on every path, so a failed run
+// leaves no thread on either stack.
+static mut OCCUPIED_STACKS: [ChildStack; 2] = [ChildStack::ZERO; 2];
+
+/// `occupied_wait_refused`'s `done` bits: the parked waiter is about to park,
+/// and its wait's verdict; the refused waiter's verdict.
 const BIT_READY: u64 = 1 << 0;
 const BIT_OK: u64 = 1 << 1;
 const BIT_BAD: u64 = 1 << 2;
+const BIT_REFUSED: u64 = 1 << 3;
+const BIT_NOT_REFUSED: u64 = 1 << 4;
 const OCCUPIED_BADGE: u64 = 9;
-/// Settle after READY so the child provably parks; bound on each report.
+/// Settle after READY so the parked waiter provably parks, and after the
+/// refusal so a wake it caused is seen; bound on each report.
 const SETTLE_SLEEP_MS: u64 = 20;
 const REPORT_MS: u64 = 1000;
 
@@ -148,69 +156,83 @@ pub fn blocking_wait(ctx: &TestContext) -> TestResult
 
 // ── wait_set_wait (occupied set) ──────────────────────────────────────────────
 
-/// While a child waits on a wait set, a second `wait_set_wait` returns
-/// `InvalidState` at once and the child's wait is unaffected: a member fire
-/// still reaches it.
-pub fn occupied_wait_refused(ctx: &TestContext) -> TestResult
+/// The caps and children `occupied_wait_refused` creates; each is deleted on
+/// every path.
+#[derive(Default)]
+struct Occupied
 {
-    let ws = wait_set_create(ctx.memory_base).map_err(|_| "wait_set_create for occupied failed")?;
-    let sig = cap_create_notification(ctx.memory_base)
-        .map_err(|_| "cap_create_notification (member) for occupied failed")?;
-    let done = cap_create_notification(ctx.memory_base)
-        .map_err(|_| "cap_create_notification (done) for occupied failed")?;
-    wait_set_add(ws, sig, OCCUPIED_BADGE).map_err(|_| "wait_set_add for occupied failed")?;
-
-    let child = crate::spawn::new_child(ctx).map_err(|_| "spawn::new_child for occupied failed")?;
-    let result = occupied_with_child(&child, ws, sig, done);
-    // Deleting the thread tears the child down wherever it is, so the stack is
-    // free even when the test failed with the child still parked.
-    let teardown = [
-        cap_delete(child.th),
-        cap_delete(child.cs),
-        cap_delete(ws),
-        cap_delete(sig),
-        cap_delete(done),
-    ]
-    .into_iter()
-    .collect::<Result<(), i64>>()
-    .map_err(|_| "cap_delete after occupied test failed");
-    result.and(teardown)
+    ws: Option<u32>,
+    sig: Option<u32>,
+    done: Option<u32>,
+    parked: Option<crate::spawn::SpawnedChild>,
+    refused: Option<crate::spawn::SpawnedChild>,
 }
 
-/// Park the child on `ws`, check the refusal, then release the child.
-fn occupied_with_child(
-    child: &crate::spawn::SpawnedChild,
-    ws: u32,
-    sig: u32,
-    done: u32,
-) -> TestResult
+/// While a child waits on a wait set, a second child's `wait_set_wait`
+/// returns `InvalidState` at once and the first child's wait is unaffected:
+/// it does not return, and a member fire still reaches it.
+pub fn occupied_wait_refused(ctx: &TestContext) -> TestResult
 {
-    let c_ws = cap_copy(ws, child.cs, RIGHTS_ALL).map_err(|_| "cap_copy ws for occupied failed")?;
-    let c_done =
-        cap_copy(done, child.cs, RIGHTS_NOTIFY).map_err(|_| "cap_copy done for occupied failed")?;
-    let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
-    crate::spawn::configure_and_start(
-        child,
-        occupied_waiter_entry,
-        stack_top,
-        u64::from(c_ws) | (u64::from(c_done) << 32),
-    )
-    .map_err(|_| "configure_and_start for occupied failed")?;
+    let mut o = Occupied::default();
+    let result = occupied_run(ctx, &mut o);
+    // Deleting a thread tears the child down wherever it is, so the stacks
+    // are free even when the test failed with a child still parked.
+    let mut ok = true;
+    for child in [o.parked, o.refused].iter().flatten()
+    {
+        ok &= cap_delete(child.th).is_ok();
+        ok &= cap_delete(child.cs).is_ok();
+    }
+    for cap in [o.ws, o.sig, o.done].into_iter().flatten()
+    {
+        ok &= cap_delete(cap).is_ok();
+    }
+    result?;
+    if ok
+    {
+        Ok(())
+    }
+    else
+    {
+        Err("cap_delete after occupied test failed")
+    }
+}
+
+/// Create the set, its member, and `done`; park the first child on the set;
+/// have the second child's wait refused; then release the first child.
+fn occupied_run(ctx: &TestContext, o: &mut Occupied) -> TestResult
+{
+    let ws = *o.ws.insert(
+        wait_set_create(ctx.memory_base).map_err(|_| "wait_set_create for occupied failed")?,
+    );
+    let sig = *o.sig.insert(
+        cap_create_notification(ctx.memory_base)
+            .map_err(|_| "cap_create_notification (member) for occupied failed")?,
+    );
+    let done = *o.done.insert(
+        cap_create_notification(ctx.memory_base)
+            .map_err(|_| "cap_create_notification (done) for occupied failed")?,
+    );
+    wait_set_add(ws, sig, OCCUPIED_BADGE).map_err(|_| "wait_set_add for occupied failed")?;
+
+    let parked = o
+        .parked
+        .insert(crate::spawn::new_child(ctx).map_err(|_| "spawn::new_child for occupied failed")?);
+    start_occupied_child(parked, 0, occupied_waiter_entry, ws, done)?;
     let mut acc = collect(done, 0, BIT_READY)?;
     thread_sleep(SETTLE_SLEEP_MS).map_err(|_| "settle sleep for occupied failed")?;
 
-    match wait_set_wait(ws)
+    let refused = o
+        .refused
+        .insert(crate::spawn::new_child(ctx).map_err(|_| "spawn::new_child for occupied failed")?);
+    start_occupied_child(refused, 1, refused_waiter_entry, ws, done)?;
+    acc = collect(done, acc, BIT_REFUSED | BIT_NOT_REFUSED)?;
+    if acc & BIT_NOT_REFUSED != 0
     {
-        Err(e) if e == SyscallError::InvalidState as i64 =>
-        {}
-        Ok(_) => return Err("a second wait_set_wait on an occupied set returned a badge"),
-        Err(_) =>
-        {
-            return Err(
-                "a second wait_set_wait on an occupied set returned a non-InvalidState error",
-            );
-        }
+        return Err("a second wait_set_wait on an occupied set was not refused with InvalidState");
     }
+    acc |= notification_wait_timeout(done, SETTLE_SLEEP_MS)
+        .map_err(|_| "notification_wait_timeout on done for occupied failed")?;
     if acc & (BIT_OK | BIT_BAD) != 0
     {
         return Err("the parked wait set waiter returned before any member fired");
@@ -223,6 +245,31 @@ fn occupied_with_child(
         return Err("the parked wait set waiter did not receive the member's badge");
     }
     Ok(())
+}
+
+/// Start `child` at `entry` on occupied stack `stack`, passing it copies of
+/// `ws` and `done`.
+fn start_occupied_child(
+    child: &crate::spawn::SpawnedChild,
+    stack: usize,
+    entry: fn(u64) -> !,
+    ws: u32,
+    done: u32,
+) -> TestResult
+{
+    let c_ws = cap_copy(ws, child.cs, RIGHTS_ALL).map_err(|_| "cap_copy ws for occupied failed")?;
+    let c_done =
+        cap_copy(done, child.cs, RIGHTS_NOTIFY).map_err(|_| "cap_copy done for occupied failed")?;
+    // SAFETY: each occupied stack belongs to one of this test's two children,
+    // which the test deletes before returning; unit tests run sequentially.
+    let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(OCCUPIED_STACKS[stack]) });
+    crate::spawn::configure_and_start(
+        child,
+        entry,
+        stack_top,
+        u64::from(c_ws) | (u64::from(c_done) << 32),
+    )
+    .map_err(|_| "configure_and_start for occupied failed")
 }
 
 /// Accumulate `done` bits onto `acc` until any bit of `mask` is present,
@@ -381,6 +428,25 @@ fn occupied_waiter_entry(arg: u64) -> !
     else
     {
         BIT_BAD
+    };
+    notification_send(done, bit).ok();
+    thread_exit()
+}
+
+/// Wait once on the occupied set and report whether the wait was refused
+/// with `InvalidState`.
+// cast_possible_truncation: packed fields are 32-bit cap handles.
+#[allow(clippy::cast_possible_truncation)]
+fn refused_waiter_entry(arg: u64) -> !
+{
+    let (ws, done) = ((arg & 0xFFFF_FFFF) as u32, (arg >> 32) as u32);
+    let bit = if wait_set_wait(ws) == Err(SyscallError::InvalidState as i64)
+    {
+        BIT_REFUSED
+    }
+    else
+    {
+        BIT_NOT_REFUSED
     };
     notification_send(done, bit).ok();
     thread_exit()

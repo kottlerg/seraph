@@ -342,10 +342,12 @@ pub unsafe fn event_queue_drop(eq: *mut EventQueueState)
     // SAFETY: eq is a valid pointer.
     let eq = unsafe { &mut *eq };
 
-    // Claim and wake every waiter under eq.lock — the #160 discipline
-    // event_queue_post uses — so a concurrent dealloc(waiter)
-    // BlockedOnEventQueue unlink (which takes eq.lock and spins on
-    // wake_in_flight) cannot free a TCB before its enqueue_and_wake commits.
+    // Claim every waiter under eq.lock, as event_queue_post claims (#160),
+    // and, as a multi-waiter drain, wake it under the lock too
+    // (docs/scheduling-internals.md § Lock Hierarchy rule 5), so a concurrent
+    // dealloc(waiter) BlockedOnEventQueue unlink (which takes eq.lock and
+    // spins on wake_in_flight) cannot free a TCB before its enqueue_and_wake
+    // commits.
     // SAFETY: lock_raw paired with unlock_raw below.
     let saved = unsafe { eq.lock.lock_raw() };
     // SAFETY: eq.lock held; no scheduler or sleep-list lock held.

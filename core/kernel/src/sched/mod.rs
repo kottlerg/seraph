@@ -375,7 +375,8 @@ pub const SPIN_SITE_DEALLOC_AS_ACTIVE: u32 = 5;
 /// dispatching ([`sleep_wakeups_quiesce`]).
 pub const SPIN_SITE_DEALLOC_TIMER_DISPATCH: u32 = 6;
 /// `sys_thread_start` owed-wake gate: spinning until a waker that claimed the
-/// stopped thread's park clears `wake_in_flight` ([`await_owed_wake`]).
+/// stopped thread's park clears `wake_in_flight` ([`await_owed_wake`], run by
+/// [`start_under_all_locks`]).
 pub const SPIN_SITE_START_WAKE_IN_FLIGHT: u32 = 7;
 
 /// Per-CPU breadcrumb naming the bounded protocol-spin a CPU is currently
@@ -2480,27 +2481,73 @@ pub unsafe fn set_state_under_all_locks(
 }
 
 /// Commit `tcb` `Ready` for `SYS_THREAD_START` only if it is still `Created`
-/// or `Stopped` under the all-locks hold, returning the start generation the
-/// commit advanced (`start_seq`) for [`enqueue_ready_thread`]. The syscall
-/// reads the state without a lock, so a concurrent start may already have
-/// resumed the thread, and it may since have parked; overwriting that
-/// `Blocked` with `Ready` would let the force-link put a thread still on a
-/// wait queue on a run queue too. Returns `None` without writing in that case
-/// (the thread is not `Created`/`Stopped`, or is `Exited`).
+/// or `Stopped`, with no wake owed to it, under the all-locks hold, returning
+/// the start generation the commit advanced (`start_seq`) for
+/// [`enqueue_ready_thread`].
+///
+/// The syscall reads the state without a lock, so a concurrent start may
+/// already have resumed the thread, and it may since have parked; overwriting
+/// that `Blocked` with `Ready` would let the force-link put a thread still on
+/// a wait queue on a run queue too. Returns `None` without writing in that
+/// case (the thread is not `Created`/`Stopped`, or is `Exited`).
+///
+/// Before each commit attempt the thread is drained off every CPU
+/// ([`await_descheduled`]) and any owed wake is waited out
+/// ([`await_owed_wake`]); the commit then re-checks both under its locks
+/// ([`start_ready_to_link`]). A concurrent start and stop can cycle the thread
+/// through a run, a park and a waker's claim after the waits, leaving it
+/// `Stopped` but still `current` on a CPU or with a fresh wake owed; that
+/// commit is refused and the waits run again.
 ///
 /// # Safety
-/// As for [`set_state_under_all_locks`].
+/// As for [`set_state_under_all_locks`], and the caller must hold no lock.
 #[cfg(not(test))]
 pub unsafe fn start_under_all_locks(tcb: *mut ThreadControlBlock) -> Option<u32>
 {
-    let mut seq = 0;
-    // SAFETY: caller contract.
-    let commit = unsafe {
-        commit_state_under_all_locks(tcb, thread::ThreadState::Ready, None, None, Some(&mut seq))
-    };
-    // Without an expected park generation the commit always resolves.
-    debug_assert!(commit.is_some(), "start_under_all_locks: unresolved commit");
-    matches!(commit, Some(StateCommit::Committed(_))).then_some(seq)
+    loop
+    {
+        // The drain requires a denylisted target; a concurrent start may have
+        // resumed this one since the caller's check or the last attempt.
+        // SAFETY: tcb valid per caller contract; state is written under
+        // sched_lock.
+        let startable = unsafe {
+            let saved = (*tcb).sched_lock.lock_raw();
+            let state = (*tcb).state;
+            (*tcb).sched_lock.unlock_raw(saved);
+            matches!(
+                state,
+                thread::ThreadState::Created | thread::ThreadState::Stopped
+            )
+        };
+        if !startable
+        {
+            return None;
+        }
+        // SAFETY: caller contract.
+        unsafe {
+            await_descheduled(tcb);
+            await_owed_wake(tcb);
+        }
+        let mut seq = 0;
+        // SAFETY: caller contract.
+        let commit = unsafe {
+            commit_state_under_all_locks(
+                tcb,
+                thread::ThreadState::Ready,
+                None,
+                None,
+                Some(&mut seq),
+            )
+        };
+        match commit
+        {
+            Some(StateCommit::Committed(_)) => return Some(seq),
+            Some(_) => return None,
+            // The thread ran, or a wake became owed, after the waits; retry.
+            None =>
+            {}
+        }
+    }
 }
 
 /// Mark `tcb` `Exited` with `exit_reason` recorded under the same all-locks
@@ -2589,6 +2636,30 @@ pub unsafe fn commit_cancelling_park(
     }
 }
 
+/// Whether a `Stopped` or `Created` `tcb` may be committed `Ready` and linked
+/// by a start: it is `current` on no CPU, its last register save has
+/// published (`context_saved`), and no waker owes it a wake
+/// (`wake_in_flight`). The start's earlier waits ([`await_descheduled`],
+/// [`await_owed_wake`]) establish these, but a concurrent start and stop can
+/// cycle the thread through a run, a park and a claim between those waits and
+/// the commit, so the commit re-reads them here.
+///
+/// # Safety
+/// `tcb` must be valid, and the caller must hold `tcb`'s `sched_lock` and
+/// every CPU's scheduler lock (`current` is written under its CPU's lock).
+#[cfg(not(test))]
+unsafe fn start_ready_to_link(tcb: *mut ThreadControlBlock, cpu_count: usize) -> bool
+{
+    use core::sync::atomic::Ordering;
+    // SAFETY: tcb valid; the pin and save flag are atomics.
+    let settled = unsafe {
+        (*tcb).wake_in_flight.load(Ordering::Relaxed) == 0
+            && (*tcb).context_saved.load(Ordering::Acquire) != 0
+    };
+    // SAFETY: every CPU lock is held per contract; cpu < cpu_count.
+    settled && (0..cpu_count).all(|cpu| unsafe { scheduler_for(cpu).current } != tcb)
+}
+
 /// Shared body of [`set_state_under_all_locks`], [`exit_under_all_locks`],
 /// and [`commit_cancelling_park`].
 ///
@@ -2596,8 +2667,10 @@ pub unsafe fn commit_cancelling_park(
 /// `park_seq` differs under the locks (a park committed after the caller's
 /// snapshot); otherwise always `Some`. With `start` (a `SYS_THREAD_START`
 /// commit), refuses ([`StateCommit::RefusedState`]) a TCB that is neither
-/// `Created` nor `Stopped` under the locks, and on a commit advances the TCB's
-/// `start_seq` and stores the new value through `start`.
+/// `Created` nor `Stopped` under the locks, returns `None` without writing
+/// while the TCB is not yet safe to link ([`start_ready_to_link`]), and on a
+/// commit advances the TCB's `start_seq` and stores the new value through
+/// `start`.
 ///
 /// # Safety
 /// As for [`set_state_under_all_locks`].
@@ -2642,7 +2715,12 @@ unsafe fn commit_state_under_all_locks(
             (*tcb).state == thread::ThreadState::Exited,
             expected_park_seq.is_some_and(|seq| {
                 seq != (*tcb).park_seq.load(core::sync::atomic::Ordering::Relaxed)
-            }),
+            }) || (start.is_some()
+                && matches!(
+                    (*tcb).state,
+                    thread::ThreadState::Created | thread::ThreadState::Stopped
+                )
+                && !start_ready_to_link(tcb, cpu_count)),
             start.is_some()
                 && !matches!(
                     (*tcb).state,
@@ -3609,15 +3687,17 @@ pub unsafe fn await_descheduled(_tcb: *mut thread::ThreadControlBlock) {}
 /// that lost the race for the park commits `Stopped` in between. Restarting
 /// the thread before that wake lands would let it run, park again, and then
 /// be linked `Ready` by the late wake while still queued on its new source.
-/// `sys_thread_start` therefore runs this after [`await_descheduled`] and
-/// before committing `Ready`; the late wake then finds `Stopped` and aborts.
+/// [`start_under_all_locks`] therefore runs this before each attempt to
+/// commit `Ready`; the late wake then finds `Stopped` and aborts.
 ///
 /// The pin is first read under `tcb`'s `sched_lock`, which orders it after
 /// every claim of the stopped park: such a claim released its source lock
 /// before the stop's cancel (or the thread's own park rollback) took it, and
 /// that path then committed or descheduled under `sched_lock`. A thread that
 /// is `Stopped`, off every CPU, and on no queue cannot be claimed again, so
-/// once the pin reads 0 it stays 0 until the restart. The spin runs
+/// once the pin reads 0 it stays 0 until a restart — this one, or a
+/// concurrent one that lets the thread park and be claimed again, which is
+/// why the commit re-checks the pin under its locks. The spin runs
 /// preempt-disabled with interrupts enabled (the #207 envelope); spin site
 /// `start:wake-in-flight`.
 ///
@@ -3657,10 +3737,6 @@ pub unsafe fn await_owed_wake(tcb: *mut thread::ThreadControlBlock)
     unsafe { crate::arch::current::cpu::restore_interrupts(saved_int) };
     crate::percpu::preempt_enable();
 }
-
-/// Test stub.
-#[cfg(test)]
-pub unsafe fn await_owed_wake(_tcb: *mut thread::ThreadControlBlock) {}
 
 /// Migrate a `Ready` thread from `src_cpu`'s run queue onto `dst_cpu`'s
 /// run queue.
@@ -4455,7 +4531,8 @@ pub unsafe fn enqueue_and_wake(_tcb: *mut ThreadControlBlock, _target_cpu: usize
 /// Lock order: `(*tcb).sched_lock` (outer) → target run-queue lock (inner), then
 /// `wake_idle_cpu` after both are released — identical to `enqueue_and_wake`'s
 /// link path. Clears `wake_pending`; `wake_in_flight` is already 0 (the
-/// caller ran [`await_owed_wake`]).
+/// caller's commit found it 0 under its locks, and a thread still `Ready` at
+/// that `start_seq` has not run since, so nothing can have claimed it).
 ///
 /// # Safety
 /// - `tcb` must be a valid [`ThreadControlBlock`] pointer. While it is `Ready`
@@ -4519,8 +4596,8 @@ pub unsafe fn enqueue_ready_thread(
 
     set_reschedule_pending_for(target_cpu);
 
-    // The caller waited out any owed wake (`await_owed_wake`), and no waker can
-    // claim a thread that is off every CPU and on no queue.
+    // The commit found no wake owed under its locks, and a thread still Ready
+    // at that start_seq has not run since: no waker can have claimed it.
     // SAFETY: tcb valid; locks held.
     let owed = unsafe {
         (*tcb)

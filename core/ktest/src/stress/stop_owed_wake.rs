@@ -4,9 +4,9 @@
 // core/ktest/src/stress/stop_owed_wake.rs
 
 //! Stress: stop and restart a notification waiter while a sender keeps
-//! claiming its wait and a second thread races every restart, so a restart
-//! can land between a sender's claim and its wake, and two restarts can land
-//! on one stop.
+//! claiming its wait, then again while a second thread races every restart,
+//! so a restart can land between a sender's claim and its wake, and two
+//! restarts can land on one stop.
 //!
 //! ## The hazard
 //!
@@ -29,20 +29,22 @@
 //! ## How this exercises it
 //!
 //! A waiter loops `notification_wait` on one notification; a sender on
-//! another CPU loops `notification_send` on it; the controller stops and
-//! restarts the waiter [`CYCLES`] times with a varying spin between, while a
-//! starter on a further CPU loops `thread_start` on the waiter. A wait must
-//! return delivered bits or `Interrupted`; a send must succeed; a start must
-//! succeed or return `InvalidArgument` (another start won, or the waiter was
-//! not stopped). The kernel's debug assertions are the tripwires for the
-//! hazards themselves: a TCB pushed onto a wait queue it is already on, a
-//! restart with a wake still owed, and a park committed while linked on a run
-//! queue. The test also fails if, during the rounds, no stop cancelled a
-//! wait or no wait received a delivery (the race never armed).
+//! another CPU loops `notification_send` on it. The controller stops and
+//! restarts the waiter [`CYCLES`] times with a varying spin between, in two
+//! phases: alone, then while a starter on a further CPU loops `thread_start`
+//! on the waiter. A wait must return delivered bits or `Interrupted`; a send
+//! must succeed; a start must succeed or return `InvalidArgument` (another
+//! start won, or the waiter was not stopped). The kernel's debug assertions
+//! are the tripwires for the hazards themselves: a TCB pushed onto a wait
+//! queue it is already on, a restart with a wake still owed, and a park
+//! committed while linked on a run queue. The test also fails if the race
+//! never armed: if, in the first phase, no stop cancelled a wait or no wait
+//! received a delivery, or, in the second, the starter never won a restart
+//! or the controller never lost one.
 //!
 //! Needs **≥ 2 CPUs**.
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use syscall::{
     RIGHTS_ALL, cap_copy, cap_create_notification, cap_delete, notification_send,
@@ -53,7 +55,7 @@ use syscall_abi::{SyscallError, SystemInfoType};
 
 use crate::{ChildStack, TestContext, TestResult, spawn};
 
-/// Stop/start rounds.
+/// Stop/start rounds per phase.
 const CYCLES: u32 = 2000;
 
 /// Bound on the controller's wait for every child to exit, in 1 ms sleeps.
@@ -64,20 +66,32 @@ const CHILDREN: usize = 3;
 
 /// Set by the controller once the rounds are done; every child exits.
 static QUIT: AtomicU32 = AtomicU32::new(0);
+/// Set by the controller for the second phase; the starter races it then.
+static RACE: AtomicU32 = AtomicU32::new(0);
+/// Restarts the starter won.
+static STARTER_WINS: AtomicU32 = AtomicU32::new(0);
 /// Children that have exited.
 static EXITED: AtomicU32 = AtomicU32::new(0);
 /// The waiter's tallies: waits that returned bits or `Interrupted`.
 static DELIVERED: AtomicU32 = AtomicU32::new(0);
 static INTERRUPTED: AtomicU32 = AtomicU32::new(0);
 /// Waits that returned neither, failed sends, and starts that returned an
-/// error other than `InvalidArgument`.
-static BAD: AtomicU32 = AtomicU32::new(0);
+/// error other than `InvalidArgument`, each with the last such result (a
+/// wait's bits or error, or a start's error) for the failure report.
+static BAD_WAITS: AtomicU32 = AtomicU32::new(0);
+static BAD_WAIT_RESULT: AtomicU64 = AtomicU64::new(0);
+static BAD_SENDS: AtomicU32 = AtomicU32::new(0);
+static BAD_STARTS: AtomicU32 = AtomicU32::new(0);
+static BAD_START_RESULT: AtomicU64 = AtomicU64::new(0);
 
-/// What the rounds saw before the controller set [`QUIT`].
+/// What the rounds saw: the waits of the first phase, and the restarts won
+/// and lost in the second.
 struct Armed
 {
     delivered: u32,
     interrupted: u32,
+    starter_wins: u32,
+    controller_losses: u32,
 }
 
 pub fn run(ctx: &TestContext) -> TestResult
@@ -89,7 +103,17 @@ pub fn run(ctx: &TestContext) -> TestResult
         crate::log("ktest: stress::stop_owed_wake SKIP (need 2+ CPUs)");
         return Ok(());
     }
-    for counter in [&QUIT, &EXITED, &DELIVERED, &INTERRUPTED, &BAD]
+    for counter in [
+        &QUIT,
+        &RACE,
+        &STARTER_WINS,
+        &EXITED,
+        &DELIVERED,
+        &INTERRUPTED,
+        &BAD_WAITS,
+        &BAD_SENDS,
+        &BAD_STARTS,
+    ]
     {
         counter.store(0, Ordering::Release);
     }
@@ -111,22 +135,58 @@ pub fn run(ctx: &TestContext) -> TestResult
         "ktest: stress::stop_owed_wake interrupted=",
         u64::from(armed.interrupted),
     );
-    if BAD.load(Ordering::Acquire) != 0
-    {
-        return Err(
-            "stress::stop_owed_wake: a wait returned neither bits nor Interrupted, a send \
-             failed, or a start failed other than with InvalidArgument",
-        );
-    }
+    check_bad(
+        &BAD_WAITS,
+        Some(&BAD_WAIT_RESULT),
+        "stress::stop_owed_wake: a wait returned neither bits nor Interrupted",
+    )?;
+    check_bad(&BAD_SENDS, None, "stress::stop_owed_wake: a send failed")?;
+    check_bad(
+        &BAD_STARTS,
+        Some(&BAD_START_RESULT),
+        "stress::stop_owed_wake: a start failed other than with InvalidArgument",
+    )?;
+    crate::log_u64(
+        "ktest: stress::stop_owed_wake starter_wins=",
+        u64::from(armed.starter_wins),
+    );
+    crate::log_u64(
+        "ktest: stress::stop_owed_wake controller_losses=",
+        u64::from(armed.controller_losses),
+    );
     if armed.delivered == 0
     {
-        return Err("stress::stop_owed_wake: no wait received a delivery during the rounds");
+        return Err("stress::stop_owed_wake: no wait received a delivery in the first phase");
     }
     if armed.interrupted == 0
     {
-        return Err("stress::stop_owed_wake: no stop interrupted a wait during the rounds");
+        return Err("stress::stop_owed_wake: no stop interrupted a wait in the first phase");
+    }
+    if armed.starter_wins == 0 || armed.controller_losses == 0
+    {
+        return Err("stress::stop_owed_wake: the starter and the controller never raced a restart");
     }
     Ok(())
+}
+
+/// Fail with `message` if `count` is non-zero, logging the count and, when
+/// recorded, the last offending result.
+fn check_bad(count: &AtomicU32, last: Option<&AtomicU64>, message: &'static str) -> TestResult
+{
+    let n = count.load(Ordering::Acquire);
+    if n == 0
+    {
+        return Ok(());
+    }
+    crate::log_u64("ktest: stress::stop_owed_wake bad count=", u64::from(n));
+    if let Some(last) = last
+    {
+        crate::log_u64(
+            "ktest: stress::stop_owed_wake last bad result=",
+            last.load(Ordering::Acquire),
+        );
+    }
+    Err(message)
 }
 
 /// Create the notification and the children (the waiter, the sender, and the
@@ -141,14 +201,20 @@ fn with_children(ctx: &TestContext, cpus: [u32; CHILDREN]) -> Result<Armed, &'st
         let waiter = children[0]
             .as_ref()
             .ok_or("stress::stop_owed_wake: no waiter")?;
-        let rounds = rounds(waiter.th);
-        let armed = Armed {
-            delivered: DELIVERED.load(Ordering::Acquire),
-            interrupted: INTERRUPTED.load(Ordering::Acquire),
-        };
+        let alone = rounds(waiter.th);
+        let delivered = DELIVERED.load(Ordering::Acquire);
+        let interrupted = INTERRUPTED.load(Ordering::Acquire);
+        RACE.store(1, Ordering::Release);
+        let raced = alone.and_then(|_| rounds(waiter.th));
         QUIT.store(1, Ordering::Release);
         let exited = await_exit(sig);
-        rounds.and(exited).map(|()| armed)
+        let controller_losses = raced?;
+        exited.map(|()| Armed {
+            delivered,
+            interrupted,
+            starter_wins: STARTER_WINS.load(Ordering::Acquire),
+            controller_losses,
+        })
     });
     // Deleting a thread tears the child down wherever it is, so the stacks
     // are free for the next test even when a round failed.
@@ -211,23 +277,27 @@ fn start(
     Ok(())
 }
 
-/// Stop and restart the waiter [`CYCLES`] times. A restart that returns
-/// `InvalidArgument` lost to the starter's.
-fn rounds(waiter_th: u32) -> TestResult
+/// Stop and restart the waiter [`CYCLES`] times; returns how many restarts
+/// returned `InvalidArgument` (lost to the starter's).
+fn rounds(waiter_th: u32) -> Result<u32, &'static str>
 {
+    let mut lost = 0;
     for cycle in 0..CYCLES
     {
         thread_stop(waiter_th).map_err(|_| "stress::stop_owed_wake: thread_stop failed")?;
-        if thread_start(waiter_th).is_err_and(|e| e != SyscallError::InvalidArgument as i64)
+        match thread_start(waiter_th)
         {
-            return Err("stress::stop_owed_wake: thread_start failed");
+            Ok(()) =>
+            {}
+            Err(e) if e == SyscallError::InvalidArgument as i64 => lost += 1,
+            Err(_) => return Err("stress::stop_owed_wake: thread_start failed"),
         }
         for _ in 0..(cycle.wrapping_mul(2_654_435_761) >> 22)
         {
             core::hint::spin_loop();
         }
     }
-    Ok(())
+    Ok(lost)
 }
 
 /// Wait for every child to exit, waking the waiter until it does.
@@ -253,13 +323,25 @@ fn waiter_entry(arg: u64) -> !
     let sig = arg as u32;
     while QUIT.load(Ordering::Acquire) == 0
     {
-        let counter = match notification_wait(sig)
+        match notification_wait(sig)
         {
-            Ok(bits) if bits != 0 => &DELIVERED,
-            Err(e) if e == SyscallError::Interrupted as i64 => &INTERRUPTED,
-            _ => &BAD,
-        };
-        counter.fetch_add(1, Ordering::AcqRel);
+            Ok(bits) if bits != 0 =>
+            {
+                DELIVERED.fetch_add(1, Ordering::AcqRel);
+            }
+            Err(e) if e == SyscallError::Interrupted as i64 =>
+            {
+                INTERRUPTED.fetch_add(1, Ordering::AcqRel);
+            }
+            other =>
+            {
+                // cast_sign_loss: the raw result word is only logged.
+                #[allow(clippy::cast_sign_loss)]
+                let word = other.unwrap_or_else(|e| e as u64);
+                BAD_WAIT_RESULT.store(word, Ordering::Release);
+                BAD_WAITS.fetch_add(1, Ordering::AcqRel);
+            }
+        }
     }
     EXITED.fetch_add(1, Ordering::AcqRel);
     thread_exit()
@@ -275,7 +357,7 @@ fn sender_entry(arg: u64) -> !
     {
         if notification_send(sig, 1).is_err()
         {
-            BAD.fetch_add(1, Ordering::AcqRel);
+            BAD_SENDS.fetch_add(1, Ordering::AcqRel);
         }
         for _ in 0..64
         {
@@ -295,9 +377,23 @@ fn starter_entry(arg: u64) -> !
     let waiter_th = arg as u32;
     while QUIT.load(Ordering::Acquire) == 0
     {
-        if thread_start(waiter_th).is_err_and(|e| e != SyscallError::InvalidArgument as i64)
+        if RACE.load(Ordering::Acquire) == 0
         {
-            BAD.fetch_add(1, Ordering::AcqRel);
+            core::hint::spin_loop();
+            continue;
+        }
+        let started = thread_start(waiter_th);
+        if started.is_ok()
+        {
+            STARTER_WINS.fetch_add(1, Ordering::AcqRel);
+        }
+        if let Err(e) = started
+            && e != SyscallError::InvalidArgument as i64
+        {
+            // cast_sign_loss: the raw error word is only logged.
+            #[allow(clippy::cast_sign_loss)]
+            BAD_START_RESULT.store(e as u64, Ordering::Release);
+            BAD_STARTS.fetch_add(1, Ordering::AcqRel);
         }
     }
     EXITED.fetch_add(1, Ordering::AcqRel);

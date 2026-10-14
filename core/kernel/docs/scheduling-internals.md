@@ -150,8 +150,10 @@ hang). See § Thread Registry.
    fall through to `schedule()`. Consuming the deposited payload and returning to user mode is
    forbidden; it strands the waker's run-queue link (#352). Nor may a restart resume it: a stop
    that loses the park to the claim commits `Stopped` over the claimed park, and `sys_thread_start`
-   waits for the waker's `enqueue_and_wake` to clear `wake_in_flight` (`await_owed_wake`) before
-   committing `Ready`, so the late wake aborts on `Stopped` instead of linking a later park; see
+   waits for the waker's `enqueue_and_wake` to clear `wake_in_flight` (`await_owed_wake`) and
+   commits `Ready` only if the pin is still clear under the commit's locks
+   (`start_under_all_locks`), so the late wake aborts on `Stopped` instead of linking a later park;
+   see
    [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md#sys_thread_stop-cross-cpu-stop-protocol)
    § `sys_thread_stop` Cross-CPU Stop Protocol, invariant 4. The other `reply_tcb` claims — the
    cancel, dying-client dealloc, and commit-failure rollback `compare_exchange` — wake no one. The

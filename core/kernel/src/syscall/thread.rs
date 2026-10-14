@@ -198,31 +198,20 @@ pub fn sys_thread_start(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         }
 
         // A thread stopped while Running may still be `current` and physically
-        // executing on a remote CPU (a SYS_THREAD_STOP drain and this resume can
-        // race). Force-linking it via enqueue_ready_thread while it is still live
-        // there would dispatch it on a second CPU — the cross-CPU double-dispatch
-        // behind #314/#293. Drain it off every CPU's `current` (and wait for its
-        // register save to publish) BEFORE committing Ready: while it is still
-        // Stopped/Created the owning CPU's schedule() requeue denylist drops it
-        // without re-linking, so the drain leaves it not-`current` and (for a
-        // single start) unlinked. The same barrier dealloc_object(Thread) (#207)
-        // and sys_thread_stop use. A Created (never-dispatched) thread is
-        // `current` nowhere, so first-start returns from the drain immediately.
-        crate::sched::await_descheduled(target_tcb);
-        // A waker that claimed the stopped park may not have linked it yet;
-        // let its wake land on the Stopped thread (and abort) before the
-        // restart, or it would link a later park. See
-        // docs/thread-lifecycle-and-sleep.md § `sys_thread_stop` Cross-CPU
-        // Stop Protocol.
-        crate::sched::await_owed_wake(target_tcb);
-        // All-CPU lock commit closes the cross-CPU dealloc race; see
-        // docs/thread-lifecycle-and-sleep.md § Lifecycle State Machine. The
-        // target is now not-`current` and unlinked, so the force-link below
-        // establishes enqueue_ready_thread's not-live precondition. The state
-        // read above ran without a lock: a concurrent start may have resumed
-        // the target (which may since have parked), or an object teardown or
-        // exit may have ended it. The commit therefore re-checks `Created` or
-        // `Stopped` under the locks and refuses otherwise.
+        // executing on a remote CPU, and a waker that claimed its stopped park
+        // may not have linked it yet. Force-linking it while it is still live
+        // there would dispatch it on a second CPU (the cross-CPU double-dispatch
+        // behind #314/#293), and linking it before the owed wake lands would let
+        // that wake link a later park. start_under_all_locks therefore drains it
+        // off every CPU (await_descheduled), waits out any owed wake
+        // (await_owed_wake), and commits `Ready` only if, under the all-CPU
+        // locks, the target is still `Created` or `Stopped`, off every CPU, and
+        // owed no wake — re-draining when a concurrent start and stop cycled it
+        // meanwhile. The state read above ran without a lock: a concurrent start
+        // may have resumed the target (which may since have parked), or an
+        // object teardown or exit may have ended it; the commit refuses both.
+        // See docs/thread-lifecycle-and-sleep.md § Lifecycle State Machine and
+        // § `sys_thread_stop` Cross-CPU Stop Protocol.
         let Some(start_seq) = crate::sched::start_under_all_locks(target_tcb)
         else
         {

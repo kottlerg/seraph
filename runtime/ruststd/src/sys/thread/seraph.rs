@@ -11,9 +11,10 @@
 //! buffers are page-aligned heap allocations. Join synchronises on a
 //! Notification cap; the child thread signals just before calling
 //! SYS_THREAD_EXIT, and join then reclaims the child's kernel object, caps, and
-//! heap/VA resources. A detached handle (dropped without join) hands its
-//! resources to the in-module `reaper`, which reclaims them once the child's
-//! kernel death notification lands (see the `reaper` module).
+//! heap/VA resources. A detached handle (dropped without join), or a join whose
+//! wait fails for a reason other than `Interrupted`, hands its resources to the
+//! in-module `reaper`, which reclaims them once the child's kernel death
+//! notification lands (see the `reaper` module).
 //!
 //! Native ELF TLS is live: `SYS_THREAD_CONFIGURE` accepts `tls_base`, the
 //! kernel context switch saves/restores `IA32_FS_BASE` (x86-64) / `tp`
@@ -431,8 +432,10 @@ impl Thread {
         // `Interrupted` (this thread was stopped and restarted) and a zero-bit
         // return wait again: the child may still be running. Any other error
         // means the private done-notification cap is gone and no wait can
-        // succeed; the child's resources are then leaked, not reclaimed under
-        // a child that may still be in user mode.
+        // succeed; the child is then handed to the reaper as if detached, so
+        // its kernel death notification reclaims it, rather than reclaimed
+        // under a child that may still be in user mode. Without a reaper slot
+        // its resources are leaked until process death.
         let signalled = loop {
             match syscall::notification_wait(res.done_notification) {
                 Ok(0) => {}
@@ -445,13 +448,25 @@ impl Thread {
             // SAFETY: the child has left user-mode (it signalled
             // done_notification).
             unsafe { res.reclaim() };
+            // Release this thread's reaper slot so its (eventual) death-post
+            // is a no-op.
+            if let Some((slot, generation)) = reaper {
+                reaper::release(slot, generation);
+            }
+        } else {
+            match reaper {
+                Some((slot, generation)) => {
+                    if let Some(res) = reaper::detach(slot, generation, res) {
+                        // SAFETY: the child already exited (its death-post was
+                        // observed while still Reserved); reclaiming now is
+                        // safe.
+                        unsafe { res.reclaim() };
+                    }
+                }
+                None => core::mem::forget(res),
+            }
         }
-
-        // Release this thread's reaper slot so its (eventual) death-post is a
-        // no-op, then opportunistically reap any detached threads that have died.
-        if let Some((slot, generation)) = reaper {
-            reaper::release(slot, generation);
-        }
+        // Opportunistically reap any detached threads that have died.
         reaper::sweep();
     }
 }
@@ -873,11 +888,21 @@ pub fn set_name(_name: &CStr) {
 }
 
 pub fn sleep(dur: Duration) {
-    // Round up sub-ms durations to 1 ms so short sleeps still yield.
-    let mut ms = dur.as_millis();
-    if ms == 0 && !dur.is_zero() {
-        ms = 1;
+    // A stop and restart of this thread ends a sleep early with `Interrupted`;
+    // sleep again for whatever remains of `dur`. Any other error ends the
+    // sleep early, as `sleep` has no way to report it.
+    let start = crate::time::Instant::now();
+    let mut left = dur;
+    loop {
+        // Round up to whole ms so a sub-ms sleep (or remainder) still sleeps.
+        let ms = u64::try_from(left.as_nanos().div_ceil(1_000_000)).unwrap_or(u64::MAX);
+        match syscall::thread_sleep(ms) {
+            Err(e) if e == SyscallError::Interrupted as i64 => {}
+            _ => return,
+        }
+        match dur.checked_sub(start.elapsed()) {
+            Some(rest) if !rest.is_zero() => left = rest,
+            _ => return,
+        }
     }
-    let ms = u64::try_from(ms).unwrap_or(u64::MAX);
-    let _ = syscall::thread_sleep(ms);
 }

@@ -525,7 +525,8 @@ pub enum SyscallError
     /// again without replying. The thread sees this as the return value of its
     /// blocked syscall. Batched capability operations (revoke, delete, move, a
     /// range split) also return it at their liveness backstop; each syscall's
-    /// Errors entry in core/kernel/docs/syscalls.md states what a retry does.
+    /// entry in core/kernel/docs/syscalls.md gives the state the backstop
+    /// leaves.
     Interrupted = -16,
     /// A structural per-object ceiling was reached (e.g. a `CSpace`'s
     /// directory is full). Unlike `OutOfMemory`, donating memory (augment

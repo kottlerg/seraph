@@ -465,7 +465,8 @@ pub struct ThreadControlBlock
     /// start then links the thread only if the generation is unchanged and the
     /// thread still `Ready`, so a stop (and any restart) landing between its
     /// commit and its link supersedes it instead of being overwritten by a
-    /// second link (`enqueue_ready_thread`).
+    /// second link (`enqueue_ready_thread`). A plain `u32`, like
+    /// `wake_pending`: every read and write holds `sched_lock`.
     pub start_seq: u32,
 
     // === IPC state ===
@@ -678,8 +679,9 @@ pub struct ThreadControlBlock
     /// Two paths spin on it (Acquire): `dealloc_object(Thread)` after its
     /// wait-object unlink and before `retype_free`, so a thread claimed for
     /// wake is not freed under the in-flight wake (the wake-side analogue of
-    /// `context_saved`); and `sched::await_owed_wake` in `SYS_THREAD_START`,
-    /// so a restart does not race a late wake. See
+    /// `context_saved`); and the settle loop of `SYS_THREAD_START`
+    /// (`sched::start_under_all_locks`), so a restart does not race a late
+    /// wake. See
     /// `docs/scheduling-internals.md` § Cross-CPU TCB Ownership.
     pub wake_in_flight: core::sync::atomic::AtomicU32,
 

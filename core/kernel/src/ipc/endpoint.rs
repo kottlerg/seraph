@@ -296,8 +296,9 @@ pub unsafe fn endpoint_call(
             (*server).ipc_msg = *msg;
             // Clear context_saved BEFORE the caller becomes wakeable. Every
             // reply-wake claimant reaches the caller through `reply_tcb`
-            // (endpoint_reply, dealloc's BlockedOnReply detach,
-            // cancel_ipc_block, the sleep-list timer arm), Acquire-loading it.
+            // (endpoint_reply, dealloc's BlockedOnReply detach and server arm,
+            // cancel_ipc_block, the SYS_IPC_REPLY failure-path swap, and the
+            // receive-entry release_unreplied_caller swap), Acquire-loading it.
             // Ordering this Relaxed clear before the `reply_tcb` Release makes
             // the Release carry it, so no claimant can observe the stale
             // context_saved==1 left by the caller's previous switch-in and
@@ -409,9 +410,10 @@ pub unsafe fn endpoint_call(
 /// Release the caller still bound to `server` by an earlier receive that was
 /// never replied to.
 ///
-/// The swap of `reply_tcb` to null is the episode claim, competing with
-/// `endpoint_reply`, cancellation, teardown and the timer as any reply-slot
-/// claim does. On a win the caller's call fails with `Interrupted`, or a
+/// The swap of `reply_tcb` to null is the episode claim, competing as any
+/// reply-slot claim does with `cancel_ipc_block`, the `dealloc_object(Thread)`
+/// client and server arms, and the commit-failure rollbacks (`endpoint_reply`
+/// and the `SYS_IPC_REPLY` failure-path swap run only on this thread). On a win the caller's call fails with `Interrupted`, or a
 /// fault-blocked caller is killed, and the caller is woken; the
 /// `wake_in_flight` pin set at bind keeps it alive until that wake clears it.
 ///
@@ -652,9 +654,8 @@ pub unsafe fn endpoint_reply(
     {
         return None;
     }
-    // CAS-claim the reply slot: `cancel_ipc_block`, the
-    // `dealloc_object_one(Thread)` reply-bound waker, and the timer
-    // `BlockedOnReply` arm in `sleep_check_wakeups` all CAS this slot
+    // CAS-claim the reply slot: `cancel_ipc_block` and the
+    // `dealloc_object_one(Thread)` client and server arms CAS this slot
     // independently of `ep.lock`. A plain load+store would let one of
     // them clear `reply_tcb` between our load and store while we still
     // proceed to wake `caller` — yielding two `enqueue_and_wake` calls
@@ -672,8 +673,8 @@ pub unsafe fn endpoint_reply(
             .is_err()
     }
     {
-        // A concurrent canceller / dealloc / timer already cleared the
-        // slot; they own the wake (and the client may already be
+        // A concurrent `cancel_ipc_block` or dealloc arm already cleared
+        // the slot; it owns the wake (and the client may already be
         // Stopped or Exited).
         return None;
     }

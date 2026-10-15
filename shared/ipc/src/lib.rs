@@ -2574,6 +2574,10 @@ pub unsafe fn ipc_call(ep: u32, msg: &IpcMessage, ipc_buf: *mut u64) -> Result<I
 /// [`IpcMessage`] before returning. After return the IPC buffer is scratch
 /// — nested IPC between `ipc_recv` and reading the message is safe.
 ///
+/// A reply still pending from an earlier receive is released first: that
+/// caller's `ipc_call` returns `Interrupted`, and a fault-blocked caller is
+/// killed. A server therefore replies before it receives again.
+///
 /// # Safety
 /// `ipc_buf` must point to the caller thread's 4 KiB-aligned IPC buffer
 /// page as registered via `syscall::ipc_buffer_set`.

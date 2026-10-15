@@ -234,12 +234,14 @@ each change; the binding statement of the resulting invariants is
   Because the gate coalesces `Ready`, a caller that *deliberately* sets
   `state=Ready` before linking (a placement it owns, not a wake) cannot go
   through `enqueue_and_wake` — it would silently fail to link. The deliberate
-  `→Ready` placer is `enqueue_ready_thread(tcb, target_cpu, start_seq)`: `enqueue_and_wake`'s
-  link tail WITHOUT the gate (force `Ready` + link under `sched_lock` → run-queue
-  lock, clear `wake_pending`, IPI). Its sole live caller is `sys_thread_start`
-  (first-start / resume), whose commit waits out any owed wake
-  (`sched::await_owed_wake`) and re-checks it under its locks, so the link
-  debug-asserts that `wake_in_flight` is 0 rather than clearing it. The IPC
+  `→Ready` placer is `enqueue_ready_thread(tcb, target_cpu, start_seq)`:
+  `enqueue_and_wake`'s link tail without the coalescing gate — it links a thread
+  already `Ready`, but only one still `Ready` at the commit's `start_seq` (else
+  `Superseded`/`Exited`, nothing written), under `sched_lock` → run-queue lock,
+  clearing `wake_pending`, then IPIs. Its sole live caller is `sys_thread_start`
+  (first-start / resume), whose settle loop waits out any owed wake and whose
+  commit re-checks it under its locks, so the link debug-asserts that
+  `wake_in_flight` is 0 rather than clearing it. The IPC
   primitives instead pass a `Blocked` thread and defer the `Blocked→Ready` flip
   to `enqueue_and_wake` (`sleep_check_wakeups` likewise — its stale "transitioned to Ready" comments
   were corrected). `schedule()`'s cross-affinity requeue and the

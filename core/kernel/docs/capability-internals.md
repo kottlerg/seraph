@@ -601,9 +601,10 @@ nothing below runs now: the object is queued for off-CPU reclaim and the whole a
 deferred drain once the thread has been scheduled away. The same discipline applies to an
 `AddressSpace` reaching refcount zero. This path has known kernel memory-safety gaps, tracked in
 [#443](https://github.com/kottlerg/seraph/issues/443) (see
-[§ Storage: Hybrid Two-Level Radix](#storage-hybrid-two-level-radix) and
+[§ Storage: Hybrid Two-Level Radix](#storage-hybrid-two-level-radix),
 [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md#dealloc_objectthread-drain-protocol)
-§ `dealloc_object(Thread)` Drain Protocol, step 11).
+§ `dealloc_object(Thread)` Drain Protocol, step 11, and
+[syscalls.md](syscalls.md#sys_thread_stop-20) § `SYS_THREAD_STOP`).
 
 Every derivation link reachable from a live slot resolves: before a `CSpace`
 unregisters, its teardown drain (`drain_dying_cspace_batch`) unlinks every

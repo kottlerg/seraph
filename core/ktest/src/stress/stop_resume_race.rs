@@ -34,9 +34,9 @@
 //!
 //! STOPPER and STARTER are released at the same instant by a shared-memory
 //! barrier (the [`RELEASE`] `AtomicU32`), so the resume overlaps the drain.
-//! The resume also drives `sys_thread_start`'s `await_descheduled`
-//! resume-from-stop path (the #330 fix) on every armed cycle, a smoke check of
-//! that code.
+//! The resume also drives the drain in `sys_thread_start`'s settle loop
+//! (`start_under_all_locks`, the #330 fix) on every armed cycle, a smoke check
+//! of that code.
 //!
 //! This cell does **not** reproduce the #330 cross-CPU double-dispatch: the
 //! resume force-links onto the victim's *own* CPU (`select_target_cpu` returns

@@ -60,9 +60,10 @@ Not yet implemented (this section is narrowed as each part lands):
 
 - **Active unbind/rebind cancellation.** Clearing or rebinding a handler governs *future*
   faults; it does not yet actively cancel a fault already in flight on the affected thread.
-  An in-flight fault is still resolved by the handler's reply, handler-thread death, the
-  faulting thread being stopped or destroyed, or the handler endpoint being destroyed (all
-  implemented). The remaining trigger — the binding being cleared mid-fault — is the only
+  An in-flight fault is still resolved by the handler's reply, handler-thread death, a later
+  receive on the handler thread while the fault reply is pending, the faulting thread being
+  stopped or destroyed, or the handler endpoint being destroyed (all implemented). The
+  remaining trigger — the binding being cleared mid-fault — is the only
   [Kill](#delivery-resume-and-kill) path not yet wired.
 
 ---
@@ -225,7 +226,9 @@ The kernel ignores reply data words. The reply **label** conveys disposition:
    [#443](https://github.com/kottlerg/seraph/issues/443)).
 2. Handler-thread death releases any fault-blocked thread awaiting that handler, killing it
    (the [Kill](#delivery-resume-and-kill) path), as does a later receive on the handler thread
-   while that thread's fault reply is still pending.
+   while the fault-blocked thread's reply is still pending (a receive that passes its capability
+   and headroom checks; see [IPC Design](ipc-design.md#the-callreply-model) § The Call/Reply
+   Model).
 3. A faulting thread blocked on a handler endpoint that has not yet received is released if
    that endpoint is destroyed.
 4. Handler death is a system-level failure. Clients block on their next fault until a

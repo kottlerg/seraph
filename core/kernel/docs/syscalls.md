@@ -215,7 +215,8 @@ pub enum SyscallError
     /// again without replying. The thread sees this as the return value of its
     /// blocked syscall. Batched capability operations (revoke, delete, move, a
     /// range split) also return it at their liveness backstop; each syscall's
-    /// Errors entry in core/kernel/docs/syscalls.md states what a retry does.
+    /// entry in core/kernel/docs/syscalls.md gives the state the backstop
+    /// leaves.
     Interrupted = -16,
     /// A structural per-object ceiling was reached (e.g. a `CSpace`'s
     /// directory is full). Unlike `OutOfMemory`, donating memory (augment
@@ -359,10 +360,11 @@ The message's data words are written to the receiver's registered IPC buffer pag
 cap-transfer result block (count, then the delivered destination handles) at word offset
 `MSG_DATA_WORDS_MAX`. The kernel binds the caller to the receiving thread as its reply capability
 (the per-thread `reply_tcb` field); `SYS_IPC_REPLY` consumes this binding implicitly. A receive
-issued while a reply is still pending first releases the pending caller: its `SYS_IPC_CALL` returns
-`Interrupted`, and a fault-blocked caller is killed as for any cancelled fault episode. The binding
-is therefore never overwritten ([ipc-design.md](../../../docs/ipc-design.md) § The Call/Reply
-Model).
+that passes its capability check and cap-slot pre-allocation while a reply is still pending first
+releases the pending caller (a receive refused before then leaves the binding): its
+`SYS_IPC_CALL` returns `Interrupted`, and a fault-blocked caller is killed as for any cancelled
+fault episode. The binding is therefore never overwritten
+([ipc-design.md](../../../docs/ipc-design.md) § The Call/Reply Model).
 
 For a call, the badge is the value attached to the sender's endpoint capability via
 `SYS_CAP_DERIVE_BADGE`; it identifies the caller without a forgeable PID. For a
@@ -1132,11 +1134,12 @@ Protocol, invariant 4).
 **Capability requirement:** `thread_cap` must have Control rights.
 
 **Errors:** `InvalidCapability`, `InsufficientRights` (cap lacks Control),
-`InvalidArgument` (thread not in Created/Stopped state under the locked commit — including one a
-concurrent start already resumed, or one that exited or was killed by an object teardown after the
-first check — or not yet configured). Of concurrent starts of one stopped thread, exactly one
-succeeds. A start that a concurrent `SYS_THREAD_STOP` overtakes after its commit succeeds and
-leaves the thread `Stopped`.
+`InvalidArgument` (the target is the caller, is not yet configured, or is not in Created/Stopped
+state under the locked commit — including one a concurrent start already resumed, or one that
+exited or was killed by an object teardown after the first check), `Interrupted` (the caller was
+itself stopped while the start waited for the target to leave its CPU or for an owed wake). Of
+concurrent starts of one stopped thread, exactly one succeeds. A start that a concurrent
+`SYS_THREAD_STOP` overtakes after its commit succeeds and leaves the thread `Stopped`.
 
 ---
 
@@ -2190,7 +2193,8 @@ intact (see [capability-internals.md](capability-internals.md) § Safe Delegatio
   `SYS_THREAD_STOP`, unless its wake (a delivery, or a sleep's elapsed deadline) was claimed
   first. `SYS_IPC_CALL` and `SYS_IPC_RECV` queued on an endpoint,
   `SYS_NOTIFICATION_WAIT`, `SYS_EVENT_RECV`, and `SYS_WAIT_SET_WAIT` also return `Interrupted`
-  when the object waited on is destroyed under the caller.
+  when the object waited on is destroyed under the caller, and `SYS_IPC_CALL` returns it when the
+  receiving thread receives again before replying.
 
 ---
 
@@ -2214,6 +2218,7 @@ source of truth.
 ## Summarized By
 
 [core/kernel/README.md](../README.md), [Architecture Abstraction Layer](arch-interface.md),
+[Capability Subsystem Internals](capability-internals.md),
 [Kernel Cross-Boundary Disclosure Inventory](cross-boundary-disclosure.md),
 [Kernel Entropy Subsystem](entropy.md), [IPC Subsystem Internals](ipc-internals.md),
 [Scheduler Internals](scheduler.md),

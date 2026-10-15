@@ -1230,8 +1230,9 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             // this TCB and no IPC object has a back-pointer to it. Unlink it
             // from the registry (an object teardown walking it meanwhile saw
             // a `Created` thread and marked it `Exited`, which is harmless
-            // here), drop both in-place objects, return the slot bytes (all
-            // 5 pages) to the ancestor cap, and undo the lease bump.
+            // here), drop both in-place objects, return the slot bytes (the
+            // whole slot, entry.raw_bytes) to the ancestor cap, and undo the
+            // lease bump.
             // SAFETY: tcb and wrapper were just constructed in place above;
             // the registry is the only structure that has observed the TCB.
             unsafe {

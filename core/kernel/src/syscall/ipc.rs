@@ -705,6 +705,9 @@ fn log_recv_preallocate_failure(
 ///
 /// arg0 = endpoint cap index.
 ///
+/// First releases a caller still bound by an earlier receive this thread never
+/// replied to (its call returns `Interrupted`; a fault-blocked caller is
+/// killed), once the capability check and the cap-slot pre-allocation pass.
 /// Blocks server until a caller sends. On return, the message label and data
 /// words are available in return registers and the server's IPC buffer.
 /// If the message carried capabilities, their delivered handles in the server's

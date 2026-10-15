@@ -45,9 +45,10 @@ or reused.
 A server that needs to delegate work may make a downstream call before replying: the pending reply
 stays bound to the receiving thread until that thread replies, and the downstream call does not
 touch that binding. A delegating server therefore replies before it next receives. A receive
-issued while a reply is still pending first releases the pending caller, so a binding is never
-overwritten: a thread blocked in `call` returns `Interrupted`, and a fault-blocked thread is killed,
-as for any cancelled call or fault episode (the mechanism is in
+that passes its capability and headroom checks while a reply is still pending first releases the
+pending caller, so a binding is never overwritten: a thread blocked in `call` returns
+`Interrupted`, and a fault-blocked thread is killed, as for any cancelled call or fault episode. A
+receive refused by those checks leaves the binding in place (the mechanism is in
 [ipc-internals.md](../core/kernel/docs/ipc-internals.md#receive-path-server)).
 
 ### Message Format

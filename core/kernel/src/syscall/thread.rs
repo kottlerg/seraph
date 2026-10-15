@@ -138,14 +138,25 @@ pub fn sys_thread_configure(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     Ok(0)
 }
 
-/// `SYS_THREAD_START` (19): move a configured thread from Created to Ready.
+/// `SYS_THREAD_START` (19): move a configured `Created` thread, or a
+/// `Stopped` one (resume), to `Ready` and link it on the CPU
+/// `select_target_cpu` chooses.
 ///
 /// arg0 = Thread cap index (must have CONTROL).
 ///
 /// The thread must have been configured via `SYS_THREAD_CONFIGURE` first
-/// (`trap_frame` must be non-null). Enqueues the thread on the BSP scheduler.
+/// (`trap_frame` must be non-null). Returns 0 on success, including a start
+/// that a concurrent `SYS_THREAD_STOP` overtakes after its commit (the thread
+/// is then left `Stopped`, unlinked).
 ///
-/// Returns 0 on success.
+/// # Errors
+/// - `InvalidCapability`: the cap is invalid or not a Thread.
+/// - `InsufficientRights`: the cap lacks CONTROL.
+/// - `InvalidArgument`: the target is the caller, is not configured, or is not
+///   `Created`/`Stopped` when the start commits (a concurrent start resumed it,
+///   or it exited or was killed).
+/// - `Interrupted`: the caller was itself stopped while the start waited for
+///   the target to settle.
 #[cfg(not(test))]
 pub fn sys_thread_start(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
@@ -197,25 +208,26 @@ pub fn sys_thread_start(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             return Err(SyscallError::InvalidArgument);
         }
 
-        // A thread stopped while Running may still be `current` and physically
-        // executing on a remote CPU, and a waker that claimed its stopped park
-        // may not have linked it yet. Force-linking it while it is still live
-        // there would dispatch it on a second CPU (the cross-CPU double-dispatch
-        // behind #314/#293), and linking it before the owed wake lands would let
-        // that wake link a later park. start_under_all_locks therefore drains it
-        // off every CPU (await_descheduled), waits out any owed wake
-        // (await_owed_wake), and commits `Ready` only if, under the all-CPU
-        // locks, the target is still `Created` or `Stopped`, off every CPU, and
-        // owed no wake — re-draining when a concurrent start and stop cycled it
-        // meanwhile. The state read above ran without a lock: a concurrent start
-        // may have resumed the target (which may since have parked), or an
-        // object teardown or exit may have ended it; the commit refuses both.
-        // See docs/thread-lifecycle-and-sleep.md § Lifecycle State Machine and
-        // § `sys_thread_stop` Cross-CPU Stop Protocol.
-        let Some(start_seq) = crate::sched::start_under_all_locks(target_tcb)
-        else
+        // A thread stopped while Running may still be `current` on a remote
+        // CPU, or owed a wake by a waker that claimed its park before the stop;
+        // start_under_all_locks waits for both to settle and commits `Ready`
+        // under the all-CPU locks only if the target is still `Created` or
+        // `Stopped`, off every CPU, and owed no wake (see
+        // docs/thread-lifecycle-and-sleep.md § Lifecycle State Machine and
+        // § `sys_thread_stop` Cross-CPU Stop Protocol). The state read above
+        // ran without a lock: a concurrent start may have resumed the target,
+        // or a teardown or exit ended it, and the commit then refuses. A
+        // thread cannot start itself: it is running, and a stop landing while
+        // it waited would leave it waiting for its own deschedule.
+        if core::ptr::eq(target_tcb, caller_tcb)
         {
             return Err(SyscallError::InvalidArgument);
+        }
+        let start_seq = match crate::sched::start_under_all_locks(target_tcb, caller_tcb)
+        {
+            crate::sched::StartCommit::Committed(seq) => seq,
+            crate::sched::StartCommit::Refused => return Err(SyscallError::InvalidArgument),
+            crate::sched::StartCommit::CallerStopped => return Err(SyscallError::Interrupted),
         };
         // Route to correct CPU based on affinity. The thread is already Ready
         // (committed above), so use enqueue_ready_thread to link it: the gated

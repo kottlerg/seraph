@@ -74,10 +74,11 @@ one set of links suffices). No separate allocation. Threads are served in arriva
    b. Stage the message in recv_tcb.ipc_msg: label/counts/badge from the
       sender's saved register state, data words read from the sender's IPC
       buffer page (the receiver writes them to its own page when it resumes)
-   c. Claim recv_tcb for its wake (wake_in_flight = 1) and publish the
-      caller binding (the server's reply capability):
+   c. Pin current_tcb for its eventual reply wake (wake_in_flight = 1),
+      publish the caller binding (the server's reply capability):
       recv_tcb.reply_tcb = current_tcb (Release store into an empty slot;
-      the server's receive released any earlier binding)
+      the server's receive released any earlier binding), then claim
+      recv_tcb for its wake (recv_tcb.wake_in_flight = 1)
    d. commit_blocked_under_local_lock(current_tcb, BlockedOnReply or
       BlockedOnFault, recv_tcb); on a refusal, roll the binding back
       (rollback_uncommitted_call)
@@ -120,7 +121,9 @@ syscall on either side. Nothing is allocated on the path.
 `SYS_IPC_RECV` execution on the server's thread:
 
 ```
-1. Resolve endpoint_cap → verify Receive rights
+1. Resolve endpoint_cap → verify Receive rights, and pre-allocate the
+   worst-case cap-slot headroom in the server's CSpace; a failure returns
+   here and leaves any earlier binding in place
 2. Release an unreplied caller (release_unreplied_caller, no lock held):
    swap current_tcb.reply_tcb to null; if it held a caller bound by an
    earlier receive the server never replied to, stamp that caller's call
@@ -222,6 +225,7 @@ same `(*tcb).sched_lock`, which carries it to the refusing parker (see
 | `sys_ipc_reply` cap-transfer refusal arm (`deposit_transfer_failed_reply`) | same CAS | episode + REPLY (the synthetic `IPC_REPLY_TRANSFER_FAILED` message replaces the staged reply wholesale; the server receives the transfer error) |
 | `sys_ipc_reply` fault-RESUME arm | same CAS | episode only (`fault_outcome` carries RESUME/KILL) |
 | `fail_reply_and_wake_caller` (via `deposit_transfer_failed_reply`) | `reply_tcb.swap(null)` non-null | episode + REPLY (synthetic failure reply) |
+| `release_unreplied_caller` (`SYS_IPC_RECV` entry, a caller bound by an earlier unreplied receive) | `reply_tcb.swap(null)` non-null | episode + INTERRUPTED (faulter: episode + KILL) |
 | `cancel_ipc_block` BlockedOnReply / BlockedOnFault arms | `reply_tcb` CAS | episode + INTERRUPTED / episode + KILL |
 | `cancel_ipc_block` BlockedOnSend arm | send-queue unlink win under `ep.lock` (a lost unlink hands the episode to the racing rebind chain) | episode + INTERRUPTED (faulter: episode + KILL) |
 | `dealloc_object(Thread)` reply-bound wake | `reply_tcb` CAS under all-CPU locks | episode + INTERRUPTED (faulter: episode + KILL) |
@@ -273,9 +277,11 @@ The kernel performs no direct thread switch on IPC. Every call rendezvous and
 every reply wakes the recipient through `enqueue_and_wake` on the CPU
 `select_target_cpu` chooses, after the endpoint lock is released (call) or the
 `reply_tcb` claim is won (reply, which takes no endpoint lock); the run queue
-decides when it runs. A receive that finds a waiting sender wakes no thread:
-the server continues and the sender stays parked awaiting the reply
-(`BlockedOnReply`, or `BlockedOnFault` for a fault sender). The call path then
+decides when it runs. A receive first wakes any caller it releases from an
+earlier unreplied binding (its call returns `Interrupted`, or a faulter is
+killed; § Receive Path step 2). Beyond that, a receive that finds a waiting
+sender wakes no thread: the server continues and the sender stays parked
+awaiting the reply (`BlockedOnReply`, or `BlockedOnFault` for a fault sender). The call path then
 parks the caller through `schedule`; the reply path returns to the server.
 
 ---

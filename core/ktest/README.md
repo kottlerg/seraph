@@ -27,11 +27,11 @@ authoring discipline.
 
 ## Test structure
 
-Tests are organised across four tiers (three plus the opt-in stress
-tier). Each tier lives in its own source directory, which codifies a
-"one file per surface/scenario/race" rule at the top of its `mod.rs`,
-except its architecture-only tests, which live under `src/arch/<arch>/`
-(see below).
+Tests are organised across four tiers (unit, integration, stress, and
+benchmark), all run on every boot by default. Each tier lives in its own
+source directory, which codifies a "one file per surface/scenario/race"
+rule at the top of its `mod.rs`, except its architecture-only tests,
+which live under `src/arch/<arch>/` (see below).
 
 `src/arch/` is ktest's arch-dispatch surface: one module per architecture,
 selected by `target_arch` in `src/arch/mod.rs`, each exposing the same
@@ -73,7 +73,8 @@ on RISC-V and returns `NotSupported` on x86-64.
 
 ### Tier 2 — `src/integration/`
 
-Cross-subsystem scenario tests that exercise realistic multi-syscall workflows.
+Cross-subsystem scenario tests that exercise realistic multi-syscall workflows, listed in
+`integration/mod.rs` dispatch order.
 These catch bugs that unit tests miss — e.g. capability rights surviving an IPC
 transfer, thread state after stop+write_regs+resume, wait set ordering under
 concurrent notification and queue events.
@@ -81,20 +82,36 @@ concurrent notification and queue events.
 | File | Scenario |
 |---|---|
 | `thread_lifecycle.rs` | Full thread lifecycle: create → configure → start → stop → read\_regs → write\_regs → resume → exit |
+| `death_notification_late_bind.rs` | A death observer bound after the thread already died still receives the retained exit reason |
+| `aspace_fault_notification_late_bind.rs` | An address-space terminal-fault observer bound after a thread in that space already faulted still receives the retained fault reason |
 | `cap_transfer.rs` | Cap rights flow through an IPC endpoint round-trip |
 | `cap_transfer_large.rs` | IPC transfer of a cap with a multi-batch child list, both directions |
 | `wait_concurrency.rs` | Wait set with concurrent notification + queue sources |
 | `memory_lifecycle.rs` | Memory split → map → protect → unmap with aspace\_query at each step |
 | `multi_caller_ipc_fifo.rs` | Three concurrent IPC callers verify FIFO send-queue ordering |
+| `ipc_call_interrupted_stop_start.rs` | A client stopped while parked in `ipc_call` and then restarted returns `Interrupted`, never a stale reply (#361) |
+| `park_interrupted_stop_start.rs` | A thread stopped while parked in any non-call blocking syscall and then restarted returns `Interrupted`, never a stale wake deposit (#363) |
+| `reply_binding_displaced.rs` | A server that receives again without replying releases the caller its earlier receive bound: a released `ipc_call` returns `Interrupted` and the released caller stops and restarts; a released fault-blocked thread is killed with the fault exit reason; the later receive's caller gets its reply |
+| `destroyed_source_interrupts.rs` | Every waiter parked on a notification (two untimed or two timed), an event queue (two), or a wait set (one) destroyed under it returns `Interrupted`, never a fabricated success |
+| `queued_waiters_fifo.rs` | Two threads waiting on one notification or event queue are woken in arrival order: each delivery wakes the longest waiter only, and a queued waiter whose timed wait expires (at the head or the tail) leaves the other waiting for the next delivery |
 | `cap_delegation_chain.rs` | Multi-level rights attenuation and cascaded revocation |
-| `tlb_coherency.rs` | Map/unmap cycles across CPUs to exercise TLB shootdown |
+| `tlb_coherency.rs` | Map/unmap cycles across CPUs to exercise TLB shootdown, then the same with `mem_unmap_reclaim` |
 | `retype_reclaim.rs` | Auto-reclaim invariant for every retypable kernel object |
+| `retype_subpage_clobber.rs` | The retype sub-page allocator never dereferences a free-list link clobbered through a userspace mapping of the cap region |
 | `priority_preemption.rs` | Higher-priority runnable thread preempts a CPU-bound lower-priority spinner within a wall-clock budget |
 | `shared_memory_two_aspaces.rs` | One Memory cap mapped into two `AddressSpace` caps; `aspace_query` returns identical phys backing in both |
 | `cap_move_into_fresh_cspace_then_ipc.rs` | `cap_move` an endpoint into a child cspace; the child IPC-calls through its local slot; parent receives via a sibling cap |
-| `reply_binding_displaced.rs` | A server that receives a second call without replying to the first releases the first caller, whose `ipc_call` returns `Interrupted`; the second call gets its reply, and the released caller stops and restarts |
-| `destroyed_source_interrupts.rs` | Every waiter parked on a notification (two untimed or two timed), an event queue (two), or a wait set (one) destroyed under it returns `Interrupted`, never a fabricated success |
-| `queued_waiters_fifo.rs` | Two threads waiting on one notification or event queue are woken in arrival order: each delivery wakes the longest waiter only, and a queued waiter whose timed wait expires (at the head or the tail) leaves the other waiting for the next delivery |
+| `cross_cspace_revoke_no_alias.rs` | A cross-`CSpace` `cap_revoke` does not let a recipient's stale handle alias a recycled slot (#349) |
+| `cap_generation_stale_handle.rs` | A same-`CSpace` stale cap handle fails closed after its slot is freed and recycled (#349) |
+| `fpu_survives_ipc_call.rs` | The FPU register file survives a raw `SYS_IPC_CALL` round-trip across CPU migration |
+| `fault_kills_thread.rs` | A genuine userspace page fault kills the thread |
+| `fault_pager_roundtrip.rs` | A userspace pager resolves a page fault and resumes the thread |
+| `fault_resume_modifies_pc.rs` | A fault handler edits the fault-blocked thread's registers and resumes it at a new instruction pointer |
+| `fault_handler_declines_kills.rs` | A fault handler replying `FAULT_REPLY_KILL` terminates the faulting thread as an unhandled fault |
+| `fault_exception_redirect.rs` | A non-page-fault CPU exception is redirected to a bound fault handler, which resumes the thread at a new instruction pointer |
+| `fault_exception_no_handler_kills.rs` | A non-page-fault CPU exception with no handler bound is terminal |
+| `irq_preserves_user_regs.rs` | A ring-3 thread's callee-saved registers survive a timer preemption through the frame-authoritative IRQ path |
+| `tlb_widen_retry.rs` | A permission widen that elides its TLB shootdown still lets a remote CPU's stale-TLB write complete through the spurious-fault retry |
 
 Architecture-only Tier 2 scenarios live under `src/arch/<arch>/` and run through
 `crate::arch::run_integration`. On x86-64, `src/arch/x86_64/syscall_rflags_hardening.rs`
@@ -106,15 +123,16 @@ right for.
 ### Tier S — `src/stress/`
 
 Stress and torture tests that exercise race conditions, resource exhaustion, deep
-capability trees, and concurrent operations. **Not run by default**; enable with
-`ktest.filter=stress` (see [Command line options](#command-line-options)).
+capability trees, and concurrent operations. They run on every boot under
+`KtestConfig::DEFAULT` (`run_stress: true`); see [Compile-time options](#compile-time-options)
+to turn the tier off.
 
 Order matches `stress/mod.rs` dispatch order.
 
 Concurrency knobs ramp every per-test worker count to the `u64` notification-
 bitmask ceiling (64 workers) and iteration counts 5-10× higher than a
-trivial smoke-test would need. The point is that one full
-`ktest.filter=stress` boot exercises enough contention to surface latent
+trivial smoke-test would need. The point is that one ktest boot
+exercises enough contention to surface latent
 races, rather than needing tens of repeat runs to flake-mine. The
 `u64` width caps per-test workers at 64; lifting that would require
 re-encoding the per-worker bookkeeping from a bitmask to an atomic-
@@ -135,7 +153,7 @@ mirrors that ceiling (64 × 16 KiB child-stack BSS = 1 MiB).
 | `stop_resume_race.rs` | Race `thread_stop` against a concurrent `thread_start` (resume) on a `Running` pinned victim across three CPUs (stop-drain liveness) | `CYCLES=256` |
 | `stop_sleep_window.rs` | Stop and restart a thread looping `thread_sleep(1)` on the timer CPU, so stops land around the park commit, the sleep-list add, and the timer's claim; each sleep returns `Ok` or `Interrupted` | `CYCLES=2000` |
 | `stop_park_race.rs` | Stop and restart a peer entering a notification wait, an IPC call, or a sleep; each park returns its genuine result or `Interrupted`, and every kind sees a cancellation | `CYCLES=150`, `SLEEP_MS=2` |
-| `stop_owed_wake.rs` | Stop and restart a notification waiter while a sender keeps claiming its wait, alone and then with a starter racing every restart; every wait returns bits or `Interrupted` and both occur, every start succeeds or returns `InvalidArgument` and both the starter and the controller win some, and the kernel's wait-queue and owed-wake assertions hold | `CYCLES=2000` per phase |
+| `stop_owed_wake.rs` | Stop and restart a notification waiter while a sender keeps claiming its wait, alone and then (4+ CPUs) with a starter racing every restart; every wait returns bits or `Interrupted` and both occur; every start succeeds or returns `InvalidArgument`, none returns `InvalidArgument` while the controller is alone, and with the starter racing it wins some restarts and its wins equal the controller's losses (one committed start per stop); the kernel's wait-queue and owed-wake assertions hold | `CYCLES=2000` per phase |
 | `timed_wait_source_delete.rs` | Destroy a notification or event queue around a timed waiter's deadlines; each wait ends in a timeout, `Interrupted`, or `InvalidCapability` | `CYCLES=200`, `WAIT_MS=1` |
 | `timed_waiter_thread_delete.rs` | Delete a timed waiter's last Thread cap around its deadlines (plain sleep, notification, event queue) | `CYCLES=192`, `WAIT_MS=1` |
 | `timed_wait_reuse.rs` | A timed wait claimed by a delivery at its deadline, followed by an untimed wait on the same source: the untimed wait never returns a timeout | `CYCLES=400`, `WAIT_MS=1` |
@@ -219,9 +237,12 @@ until it is re-composed.
 | Field | Values | Default | Description |
 |---|---|---|---|
 | `shutdown_policy` | `Always`, `Pass`, `Never` | `Always` | When to shut down the system after tests complete |
-| `timeout_secs` | `u64` | `0` | Seconds to wait before shutdown (allows reading output) |
-| `filter` | bitmask of `TIER_UNIT | TIER_INTEGRATION | TIER_STRESS | TIER_BENCH` | all four | Which tiers to run |
-| `bench_iters` | `u64` | `1000` | Number of iterations per benchmark |
+| `timeout_secs` | `u32` | `0` | Seconds to wait before shutdown (allows reading output) |
+| `run_unit` | `bool` | `true` | Run Tier 1 (`src/unit/`) |
+| `run_integration` | `bool` | `true` | Run Tier 2 (`src/integration/`) |
+| `run_stress` | `bool` | `true` | Run Tier S (`src/stress/`) |
+| `run_bench` | `bool` | `true` | Run Tier 3 (`src/bench/`) |
+| `bench_iters` | `u32` | `1000` | Number of iterations per benchmark |
 
 The defaults are picked for CI: every tier runs, the VM exits cleanly
 on completion, and no human-watch grace period is added. To keep QEMU
@@ -237,13 +258,11 @@ ShutdownPolicy::Never` and rebuild and re-compose as above.
 On x86-64 shutdown uses ACPI S5 (parsed from FADT/DSDT in userspace).
 On RISC-V shutdown uses SBI SRST via the `SYS_SBI_CALL` syscall.
 
-### Tier filter
+### Tier selection
 
-The filter is a bitmask of `TIER_UNIT`, `TIER_INTEGRATION`,
-`TIER_STRESS`, `TIER_BENCH`. The default value
-(`TIER_UNIT | TIER_INTEGRATION | TIER_STRESS | TIER_BENCH`) runs
-every tier. Trimming the mask before recompiling is how a
-narrower-scope run is produced.
+Each tier has its own flag (`run_unit`, `run_integration`, `run_stress`,
+`run_bench`), all `true` by default, so every tier runs. Clearing flags
+before recompiling is how a narrower-scope run is produced.
 
 ---
 

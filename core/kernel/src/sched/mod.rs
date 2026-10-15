@@ -374,10 +374,9 @@ pub const SPIN_SITE_DEALLOC_AS_ACTIVE: u32 = 5;
 /// batch that may have snapshotted the dying source or TCB finishes
 /// dispatching ([`sleep_wakeups_quiesce`]).
 pub const SPIN_SITE_DEALLOC_TIMER_DISPATCH: u32 = 6;
-/// `sys_thread_start` owed-wake gate: spinning until a waker that claimed the
-/// stopped thread's park clears `wake_in_flight` ([`await_owed_wake`], run by
-/// [`start_under_all_locks`]).
-pub const SPIN_SITE_START_WAKE_IN_FLIGHT: u32 = 7;
+/// `sys_thread_start` settle loop ([`start_under_all_locks`]): spinning until
+/// the target is off every CPU, its save published, and no wake is owed.
+pub const SPIN_SITE_START_SETTLE: u32 = 7;
 
 /// Per-CPU breadcrumb naming the bounded protocol-spin a CPU is currently
 /// executing, for the softlockup watchdog. A wedged CPU (no non-idle dispatch
@@ -432,7 +431,7 @@ fn spin_site_name(site: u32) -> &'static str
         SPIN_SITE_SCHED_CONTEXT_SAVED => "schedule:context-saved",
         SPIN_SITE_DEALLOC_AS_ACTIVE => "dealloc:as-active",
         SPIN_SITE_DEALLOC_TIMER_DISPATCH => "dealloc:timer-dispatch",
-        SPIN_SITE_START_WAKE_IN_FLIGHT => "start:wake-in-flight",
+        SPIN_SITE_START_SETTLE => "start:settle",
         _ => "none",
     }
 }
@@ -1956,8 +1955,9 @@ pub fn sleep_check_wakeups()
 
             // No other binding is ever listed (asserted at pop): the parks that
             // arm a timeout are the three above, and every claimer of their
-            // source removes the entry under the source lock. Never claim and
-            // never dereference the TCB here: nothing pins it.
+            // source removes the entry under the source lock. Never claim
+            // here: no wake_in_flight pin and no source lock arbitrates such a
+            // binding, so a claim could race its real waker.
             _ => false,
         };
 
@@ -2480,56 +2480,123 @@ pub unsafe fn set_state_under_all_locks(
     commit.unwrap_or(StateCommit::RefusedExited)
 }
 
-/// Commit `tcb` `Ready` for `SYS_THREAD_START` only if it is still `Created`
-/// or `Stopped`, with no wake owed to it, under the all-locks hold, returning
-/// the start generation the commit advanced (`start_seq`) for
+/// Outcome of [`start_under_all_locks`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StartCommit
+{
+    /// The thread is committed `Ready`; the payload is the start generation
+    /// (`start_seq`) [`enqueue_ready_thread`] must see.
+    Committed(u32),
+    /// Nothing was written: the thread is not `Created`/`Stopped` (a
+    /// concurrent start resumed it, or it is `Exited`).
+    Refused,
+    /// Nothing was written: the calling thread was itself stopped (or killed)
+    /// while the start waited for the target to settle.
+    CallerStopped,
+}
+
+/// Commit `tcb` `Ready` for `SYS_THREAD_START` once it is safe to link,
+/// returning the start generation the commit advanced (`start_seq`) for
 /// [`enqueue_ready_thread`].
 ///
-/// The syscall reads the state without a lock, so a concurrent start may
-/// already have resumed the thread, and it may since have parked; overwriting
-/// that `Blocked` with `Ready` would let the force-link put a thread still on
-/// a wait queue on a run queue too. Returns `None` without writing in that
-/// case (the thread is not `Created`/`Stopped`, or is `Exited`).
+/// A thread stopped while running may still be `current` on a remote CPU, or
+/// still owed a wake by a waker that claimed its park before the stop; linking
+/// it then would dispatch it on a second CPU (#314/#293), or let the late wake
+/// link a later park. Each pass of the settle loop therefore reads the
+/// target's state, its owed-wake pin (`wake_in_flight`) and its save flag
+/// (`context_saved`) under its `sched_lock`, scans every CPU's `current`, and
+/// commits only when all four are settled; the commit re-checks them under
+/// the all-CPU locks ([`start_ready_to_link`]), since a concurrent start and
+/// stop can cycle the thread through a run, a park and a claim between a pass
+/// and the commit. A CPU still running the target is prodded into
+/// `schedule()`, where the `Stopped` target's requeue denylist drops it.
 ///
-/// Before each commit attempt the thread is drained off every CPU
-/// ([`await_descheduled`]) and any owed wake is waited out
-/// ([`await_owed_wake`]); the commit then re-checks both under its locks
-/// ([`start_ready_to_link`]). A concurrent start and stop can cycle the thread
-/// through a run, a park and a waker's claim after the waits, leaving it
-/// `Stopped` but still `current` on a CPU or with a fresh wake owed; that
-/// commit is refused and the waits run again.
+/// The loop ends without writing when the target is no longer `Created` or
+/// `Stopped` ([`StartCommit::Refused`]: a concurrent start resumed it, or it
+/// is `Exited`), and when the calling thread is itself stopped
+/// ([`StartCommit::CallerStopped`]), so a start never spins on a thread that
+/// is running again, and never blocks the stop of its own caller. It runs
+/// preempt-disabled with interrupts enabled (the #207 envelope); spin site
+/// `start:settle`.
 ///
 /// # Safety
-/// As for [`set_state_under_all_locks`], and the caller must hold no lock.
+/// `tcb` must be a valid TCB other than the calling thread's, and the caller
+/// (`caller`, the running thread) must hold no lock.
 #[cfg(not(test))]
-pub unsafe fn start_under_all_locks(tcb: *mut ThreadControlBlock) -> Option<u32>
+pub unsafe fn start_under_all_locks(
+    tcb: *mut ThreadControlBlock,
+    caller: *mut ThreadControlBlock,
+) -> StartCommit
 {
-    loop
+    use core::sync::atomic::Ordering;
+
+    let cpu_count = CPU_COUNT.load(Ordering::Relaxed) as usize;
+    crate::percpu::preempt_disable();
+    // SAFETY: ring 0; restored below.
+    let saved_int = unsafe { crate::arch::current::cpu::save_and_disable_interrupts() };
+    // SAFETY: ring 0; IDT loaded; preempt disabled.
+    unsafe { crate::arch::current::interrupts::enable() };
+    spin_site_enter(SPIN_SITE_START_SETTLE);
+    let mut prodded: Option<usize> = None;
+    let outcome = loop
     {
-        // The drain requires a denylisted target; a concurrent start may have
-        // resumed this one since the caller's check or the last attempt.
-        // SAFETY: tcb valid per caller contract; state is written under
-        // sched_lock.
-        let startable = unsafe {
-            let saved = (*tcb).sched_lock.lock_raw();
-            let state = (*tcb).state;
-            (*tcb).sched_lock.unlock_raw(saved);
-            matches!(
-                state,
-                thread::ThreadState::Created | thread::ThreadState::Stopped
-            )
-        };
-        if !startable
+        // SAFETY: caller is the running thread; a stop commits its state
+        // under every scheduler lock, and the volatile read re-reads it on
+        // each pass.
+        let caller_state = unsafe { core::ptr::read_volatile(&raw const (*caller).state) };
+        if matches!(
+            caller_state,
+            thread::ThreadState::Stopped | thread::ThreadState::Exited
+        )
         {
-            return None;
+            break StartCommit::CallerStopped;
         }
-        // SAFETY: caller contract.
-        unsafe {
-            await_descheduled(tcb);
-            await_owed_wake(tcb);
+        // SAFETY: tcb valid per contract; state is written under sched_lock,
+        // and the pin and save flag are atomics.
+        let (state, owed, saved) = unsafe {
+            let f = (*tcb).sched_lock.lock_raw();
+            let snap = (
+                (*tcb).state,
+                (*tcb).wake_in_flight.load(Ordering::Relaxed) != 0,
+                (*tcb).context_saved.load(Ordering::Acquire) != 0,
+            );
+            (*tcb).sched_lock.unlock_raw(f);
+            snap
+        };
+        if !matches!(
+            state,
+            thread::ThreadState::Created | thread::ThreadState::Stopped
+        )
+        {
+            break StartCommit::Refused;
+        }
+        // SAFETY: cpu < cpu_count; each CPU lock is taken alone.
+        let running_on = (0..cpu_count).find(|&cpu| unsafe {
+            let sched = scheduler_for(cpu);
+            let f = sched.lock.lock_raw();
+            let is_current = sched.current == tcb;
+            sched.lock.unlock_raw(f);
+            is_current
+        });
+        if let Some(cpu) = running_on
+        {
+            if prodded != Some(cpu)
+            {
+                // SAFETY: cpu < cpu_count; the caller is running here, so a
+                // `Stopped` target current elsewhere is on a remote CPU.
+                unsafe { prod_remote_cpu(cpu) };
+                prodded = Some(cpu);
+            }
+            core::hint::spin_loop();
+            continue;
+        }
+        if owed || !saved
+        {
+            core::hint::spin_loop();
+            continue;
         }
         let mut seq = 0;
-        // SAFETY: caller contract.
+        // SAFETY: tcb valid; no lock held.
         let commit = unsafe {
             commit_state_under_all_locks(
                 tcb,
@@ -2541,13 +2608,18 @@ pub unsafe fn start_under_all_locks(tcb: *mut ThreadControlBlock) -> Option<u32>
         };
         match commit
         {
-            Some(StateCommit::Committed(_)) => return Some(seq),
-            Some(_) => return None,
-            // The thread ran, or a wake became owed, after the waits; retry.
+            Some(StateCommit::Committed(_)) => break StartCommit::Committed(seq),
+            Some(_) => break StartCommit::Refused,
+            // Unsettled again under the locks; take another pass.
             None =>
             {}
         }
-    }
+    };
+    spin_site_exit();
+    // SAFETY: saved_int from save_and_disable_interrupts above.
+    unsafe { crate::arch::current::cpu::restore_interrupts(saved_int) };
+    crate::percpu::preempt_enable();
+    outcome
 }
 
 /// Mark `tcb` `Exited` with `exit_reason` recorded under the same all-locks
@@ -2639,10 +2711,10 @@ pub unsafe fn commit_cancelling_park(
 /// Whether a `Stopped` or `Created` `tcb` may be committed `Ready` and linked
 /// by a start: it is `current` on no CPU, its last register save has
 /// published (`context_saved`), and no waker owes it a wake
-/// (`wake_in_flight`). The start's earlier waits ([`await_descheduled`],
-/// [`await_owed_wake`]) establish these, but a concurrent start and stop can
-/// cycle the thread through a run, a park and a claim between those waits and
-/// the commit, so the commit re-reads them here.
+/// (`wake_in_flight`). The settle loop of [`start_under_all_locks`] waits
+/// for these, but a concurrent start and stop can cycle the thread through a
+/// run, a park and a claim between a pass and the commit, so the commit
+/// re-reads them here.
 ///
 /// # Safety
 /// `tcb` must be valid, and the caller must hold `tcb`'s `sched_lock` and
@@ -2661,7 +2733,7 @@ unsafe fn start_ready_to_link(tcb: *mut ThreadControlBlock, cpu_count: usize) ->
 }
 
 /// Shared body of [`set_state_under_all_locks`], [`exit_under_all_locks`],
-/// and [`commit_cancelling_park`].
+/// [`commit_cancelling_park`], and [`start_under_all_locks`].
 ///
 /// With `expected_park_seq`, returns `None` without writing when the TCB's
 /// `park_seq` differs under the locks (a park committed after the caller's
@@ -2710,26 +2782,22 @@ unsafe fn commit_state_under_all_locks(
     // every writer of `state` on this path holds. `park_seq` is written only
     // under the held sched_lock.
     // SAFETY: tcb validated by caller; state and park_seq fields always valid.
-    let (exited, park_changed, wrong_state) = unsafe {
+    let (exited, park_changed, wrong_state, start_unsettled) = unsafe {
+        let startable = matches!(
+            (*tcb).state,
+            thread::ThreadState::Created | thread::ThreadState::Stopped
+        );
         (
             (*tcb).state == thread::ThreadState::Exited,
             expected_park_seq.is_some_and(|seq| {
                 seq != (*tcb).park_seq.load(core::sync::atomic::Ordering::Relaxed)
-            }) || (start.is_some()
-                && matches!(
-                    (*tcb).state,
-                    thread::ThreadState::Created | thread::ThreadState::Stopped
-                )
-                && !start_ready_to_link(tcb, cpu_count)),
-            start.is_some()
-                && !matches!(
-                    (*tcb).state,
-                    thread::ThreadState::Created | thread::ThreadState::Stopped
-                ),
+            }),
+            start.is_some() && !startable,
+            start.is_some() && startable && !start_ready_to_link(tcb, cpu_count),
         )
     };
     let mut running_on: Option<usize> = None;
-    if !exited && !park_changed && !wrong_state
+    if !exited && !park_changed && !wrong_state && !start_unsettled
     {
         // Write the state and snapshot priority under all locks so the queue
         // drain below sees a value coherent with the state we just published.
@@ -2805,7 +2873,7 @@ unsafe fn commit_state_under_all_locks(
     {
         Some(StateCommit::RefusedExited)
     }
-    else if park_changed
+    else if park_changed || start_unsettled
     {
         None
     }
@@ -3305,9 +3373,12 @@ pub unsafe fn wait_until_aspace_inactive(
 
 /// Test stub.
 #[cfg(test)]
-pub unsafe fn start_under_all_locks(_tcb: *mut ThreadControlBlock) -> Option<u32>
+pub unsafe fn start_under_all_locks(
+    _tcb: *mut ThreadControlBlock,
+    _caller: *mut ThreadControlBlock,
+) -> StartCommit
 {
-    Some(0)
+    StartCommit::Committed(0)
 }
 
 /// Test stub.
@@ -3561,182 +3632,6 @@ pub unsafe fn prod_remote_cpu(target_cpu: usize)
 #[cfg(test)]
 #[allow(unused_variables)]
 pub unsafe fn prod_remote_cpu(_target_cpu: usize) {}
-
-/// Spin until `tcb` is `current` on no CPU and its register save is published
-/// (`context_saved == 1`), prodding the owning remote CPU so it reaches
-/// `schedule()` promptly.
-///
-/// This is the "wait until the target has provably switched away on every CPU
-/// and committed its register file" barrier that `dealloc_object(Thread)`
-/// (`cap/object.rs`, the #207 free-gate) and `sys_thread_stop`'s drain already
-/// depend on. `sys_thread_start` reuses it before force-linking a resumed
-/// thread: a thread stopped while Running may still be `current`/executing on a
-/// remote CPU, and `enqueue_ready_thread` would otherwise dispatch it on a
-/// second CPU while it still runs on the first (the cross-CPU double-dispatch of
-/// #314/#293).
-///
-/// The caller MUST hold no scheduler lock and MUST have left `tcb` in a state
-/// `schedule()`'s requeue denylist rejects (`Stopped`/`Exited`/`Created`) so the
-/// owning CPU deschedules it WITHOUT re-linking it onto a run queue. The scan
-/// and spins take each per-CPU `scheduler.lock` one at a time and hold no lock
-/// across the wait; they run preempt-disabled with interrupts ENABLED (the #207
-/// envelope) so an inbound TLB/FPU IPI to this CPU stays serviceable.
-///
-/// # Safety
-/// `tcb` must be a valid [`ThreadControlBlock`] pointer.
-#[cfg(not(test))]
-pub unsafe fn await_descheduled(tcb: *mut thread::ThreadControlBlock)
-{
-    use core::sync::atomic::Ordering;
-
-    let cpu_count = CPU_COUNT.load(Ordering::Relaxed) as usize;
-    let me = crate::arch::current::cpu::current_cpu() as usize;
-
-    // #207 spin envelope: preempt-disabled, interrupts enabled. We enter at
-    // IF=0 (syscall); spinning at IF=0 would block an inbound TLB/FPU shootdown
-    // IPI targeted at this CPU and deadlock its initiator. Enabling IF keeps it
-    // serviceable while `preempt_disable` pins us so the scheduler cannot
-    // migrate us mid-drain. Mirrors `dealloc_object(Thread)` and the stop drain.
-    crate::percpu::preempt_disable();
-    // SAFETY: ring 0; restored below.
-    let saved_int = unsafe { crate::arch::current::cpu::save_and_disable_interrupts() };
-    // SAFETY: ring 0; IDT loaded; preempt disabled.
-    unsafe { crate::arch::current::interrupts::enable() };
-
-    // Step 1: not `current` on any CPU. Find the (at most one) CPU still naming
-    // `tcb` as current, prod it into `schedule()`, and spin on just that CPU's
-    // lock until it switches away; then re-scan. The target is denylisted, so
-    // the owning CPU drops it without re-linking — once a full scan is clean no
-    // CPU can re-install it.
-    loop
-    {
-        let run_cpu = 'scan: {
-            for cpu in 0..cpu_count
-            {
-                // SAFETY: cpu < cpu_count; scheduler slab initialised by init().
-                let s = unsafe { scheduler_for(cpu) };
-                // SAFETY: lock_raw/unlock_raw paired; no other lock held across.
-                let is_cur = unsafe {
-                    let f = s.lock.lock_raw();
-                    let c = s.current == tcb;
-                    s.lock.unlock_raw(f);
-                    c
-                };
-                if is_cur
-                {
-                    break 'scan Some(cpu);
-                }
-            }
-            None
-        };
-        let Some(run_cpu) = run_cpu
-        else
-        {
-            break;
-        };
-        // The target is Created/Stopped and the caller is the Running thread, so
-        // the target can never be `current` on the calling CPU; the prod always
-        // targets a remote. The assert fails loudly if a future change breaks
-        // that invariant (a self-`current` target would spin forever below).
-        debug_assert!(
-            run_cpu != me,
-            "await_descheduled: target is current on the calling CPU"
-        );
-        if run_cpu != me
-        {
-            // SAFETY: run_cpu < cpu_count.
-            unsafe { prod_remote_cpu(run_cpu) };
-        }
-        // SAFETY: run_cpu < cpu_count.
-        let sched = unsafe { scheduler_for(run_cpu) };
-        // SAFETY: lock_raw/unlock_raw paired; no other lock held across the spin.
-        while unsafe {
-            let f = sched.lock.lock_raw();
-            let still_current = sched.current == tcb;
-            sched.lock.unlock_raw(f);
-            still_current
-        }
-        {
-            core::hint::spin_loop();
-        }
-    }
-
-    // Step 2: register save published. The owning CPU's `switch()` stores
-    // `context_saved = 1` (Release) after saving `tcb`; pair with an Acquire
-    // load here. A Created/never-run thread inits `context_saved = 1`, so this
-    // is immediate on the first-start path.
-    // SAFETY: tcb valid; context_saved is AtomicU32.
-    while unsafe { (*tcb).context_saved.load(Ordering::Acquire) } == 0
-    {
-        core::hint::spin_loop();
-    }
-
-    // SAFETY: saved_int from save_and_disable_interrupts above.
-    unsafe { crate::arch::current::cpu::restore_interrupts(saved_int) };
-    crate::percpu::preempt_enable();
-}
-
-/// Test stub.
-#[cfg(test)]
-#[allow(unused_variables)]
-pub unsafe fn await_descheduled(_tcb: *mut thread::ThreadControlBlock) {}
-
-/// Spin until no waker owes the stopped `tcb` a wake. A waker claims a park
-/// under its source lock (`wake_in_flight = 1`, the waiter removed from the
-/// source's queue) and links the thread later, in `enqueue_and_wake`; a stop
-/// that lost the race for the park commits `Stopped` in between. Restarting
-/// the thread before that wake lands would let it run, park again, and then
-/// be linked `Ready` by the late wake while still queued on its new source.
-/// [`start_under_all_locks`] therefore runs this before each attempt to
-/// commit `Ready`; the late wake then finds `Stopped` and aborts.
-///
-/// The pin is first read under `tcb`'s `sched_lock`, which orders it after
-/// every claim of the stopped park: such a claim released its source lock
-/// before the stop's cancel (or the thread's own park rollback) took it, and
-/// that path then committed or descheduled under `sched_lock`. A thread that
-/// is `Stopped`, off every CPU, and on no queue cannot be claimed again, so
-/// once the pin reads 0 it stays 0 until a restart — this one, or a
-/// concurrent one that lets the thread park and be claimed again, which is
-/// why the commit re-checks the pin under its locks. The spin runs
-/// preempt-disabled with interrupts enabled (the #207 envelope); spin site
-/// `start:wake-in-flight`.
-///
-/// # Safety
-/// `tcb` must be a valid [`ThreadControlBlock`] pointer that the caller has
-/// passed through [`await_descheduled`]; the caller holds no lock.
-#[cfg(not(test))]
-pub unsafe fn await_owed_wake(tcb: *mut thread::ThreadControlBlock)
-{
-    use core::sync::atomic::Ordering;
-
-    // SAFETY: tcb valid per contract; lock_raw paired with unlock_raw.
-    let owed = unsafe {
-        let saved = (*tcb).sched_lock.lock_raw();
-        let pin = (*tcb).wake_in_flight.load(Ordering::Relaxed);
-        (*tcb).sched_lock.unlock_raw(saved);
-        pin != 0
-    };
-    if !owed
-    {
-        return;
-    }
-    crate::percpu::preempt_disable();
-    // SAFETY: ring 0; restored below.
-    let saved_int = unsafe { crate::arch::current::cpu::save_and_disable_interrupts() };
-    // SAFETY: ring 0; IDT loaded; preempt disabled.
-    unsafe { crate::arch::current::interrupts::enable() };
-    spin_site_enter(SPIN_SITE_START_WAKE_IN_FLIGHT);
-    // SAFETY: tcb valid; enqueue_and_wake clears the pin with Release on every
-    // path.
-    while unsafe { (*tcb).wake_in_flight.load(Ordering::Acquire) } != 0
-    {
-        core::hint::spin_loop();
-    }
-    spin_site_exit();
-    // SAFETY: saved_int from save_and_disable_interrupts above.
-    unsafe { crate::arch::current::cpu::restore_interrupts(saved_int) };
-    crate::percpu::preempt_enable();
-}
 
 /// Migrate a `Ready` thread from `src_cpu`'s run queue onto `dst_cpu`'s
 /// run queue.
@@ -4511,10 +4406,11 @@ pub unsafe fn enqueue_and_wake(_tcb: *mut ThreadControlBlock, _target_cpu: usize
 /// Make `tcb` `Ready` and link it on `target_cpu`'s run queue, under the
 /// per-TCB `sched_lock` — the DELIBERATE-placement primitive.
 ///
-/// Unlike [`enqueue_and_wake`], this does NOT classify `state` beyond the
-/// terminal check: it forces the `→Ready` transition and links. Use it only
-/// when the caller owns the transition and has established the thread is not
-/// live on any CPU — today only `sys_thread_start` (first start and resume,
+/// Unlike [`enqueue_and_wake`], this skips the wake gate's state
+/// classification: it links a thread that is already `Ready`, provided it is
+/// still `Ready` at the caller's `start_seq` (below). Use it only when the
+/// caller owns the transition and has established the thread is not live on
+/// any CPU — today only `sys_thread_start` (first start and resume,
 /// `Created`/`Stopped` → run). Routing that through the gated
 /// `enqueue_and_wake` would be wrong: the thread is already `Ready`, which
 /// the gate coalesces — dropping it from every run queue.

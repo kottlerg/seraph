@@ -203,9 +203,9 @@ impl TableExt for ProcessTable
     /// `direction` is one of `ipc::procmgr_labels::PIPE_DIR_STDIN`,
     /// `PIPE_DIR_STDOUT`, `PIPE_DIR_STDERR`. The three caps are
     /// `cap_copy`'d into the child's `CSpace` with `RIGHTS_MEM_MAP_RW` for
-    /// the memory cap and `RIGHTS_ALL` for the two notifications (notification objects
-    /// don't currently distinguish send/wait at the cap-rights level —
-    /// each peer holds a full cap and uses send or wait as appropriate).
+    /// the memory cap and `RIGHTS_ALL` for the two notifications: each peer
+    /// both kicks and awaits each notification, so it needs Notify and Wait
+    /// rights (`abi/process-abi` `ProcessInfo` pipe fields).
     /// The resulting slot indices are written into the matching
     /// `<dir>_memory_cap` / `<dir>_data_notification_cap` /
     /// `<dir>_space_notification_cap` fields of the child's `ProcessInfo`.

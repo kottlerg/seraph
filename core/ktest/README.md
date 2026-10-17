@@ -38,10 +38,12 @@ selected by `target_arch` in `src/arch/mod.rs`, each exposing the same
 entry points and constants. Tier 1 reaches the tests behind it through
 `crate::arch::run_unit` and Tier 2 through `crate::arch::run_integration`;
 arch-neutral tests take the vector a not-present user store faults with
-from `crate::arch::PAGE_FAULT_STORE_VECTOR`.
+from `crate::arch::PAGE_FAULT_STORE_VECTOR`, and the kernel `TrapFrame`'s
+size and instruction-pointer offset from `crate::arch::TRAP_FRAME_BYTES` and
+`crate::arch::IP_OFFSET`.
 Per-arch helpers and branches inside arch-neutral tests, and other arch-specific
 items elsewhere in ktest, are still gated in place with `#[cfg(target_arch)]`;
-#460 lists them.
+#460 tracks the move.
 
 ### Tier 1 — `src/unit/`
 
@@ -158,6 +160,7 @@ in `stress/mod.rs` mirrors that ceiling (64 × 16 KiB child-stack BSS = 1 MiB).
 | `stop_sleep_window.rs` | Stop and restart a thread looping `thread_sleep(1)` on the timer CPU, so stops land around the park commit, the sleep-list add, and the timer's claim; each sleep returns `Ok` or `Interrupted` | `CYCLES=2000` |
 | `stop_park_race.rs` | Stop and restart a peer entering a notification wait, an IPC call, or a sleep; each park returns its genuine result or `Interrupted`, and every kind sees a cancellation | `CYCLES=150`, `SLEEP_MS=2` |
 | `stop_owed_wake.rs` | Stop and restart a notification waiter while a sender keeps claiming its wait (each round waits, bounded by `ENTRY_WAIT_US`, for the restarted waiter to enter a wait), alone and then (4+ CPUs) with a starter racing every restart, itself stopped and restarted by the controller every `STARTER_STOP_PERIOD` rounds; every wait returns bits or `Interrupted` and both occur; every start succeeds or returns `InvalidArgument` (or, for the starter's, `Interrupted`, tallied but not required), none returns `InvalidArgument` while the controller is alone, and with the starter racing it wins some restarts and its wins equal the controller's losses (one committed start per stop, none from an interrupted start); the kernel's wait-queue and owed-wake assertions hold | `CYCLES=2000` per phase, `STARTER_STOP_PERIOD=16` |
+| `stop_fault_sender.rs` | Stop and restart a thread faulting in a loop while its fault handler, after a varying delay, dequeues each fault, maps the page, and replies `RESUME` (the faulter unmaps it and faults again), so stops land on the send-queued fault around the handler's dequeue; a stop that cancels a fault before a reply claims it kills the faulter by design (the controller checks the fault exit reason, syncs the handler, and respawns it), but every `RESUME` reply that returned `Ok` must be honoured: the completed faults equal the `Ok` replies, every death carries the fault exit reason, no map, unmap, or receive fails, and both a cancelled fault and a survived in-flight stop occur (#443) | `CYCLES=1000` |
 | `timed_wait_source_delete.rs` | Destroy a notification or event queue around a timed waiter's deadlines; each wait ends in a timeout, `Interrupted`, or `InvalidCapability` | `CYCLES=200`, `WAIT_MS=1` |
 | `timed_waiter_thread_delete.rs` | Delete a timed waiter's last Thread cap around its deadlines (plain sleep, notification, event queue) | `CYCLES=192`, `WAIT_MS=1` |
 | `timed_wait_reuse.rs` | A timed wait claimed by a delivery at its deadline, followed by an untimed wait on the same source: the untimed wait never returns a timeout | `CYCLES=400`, `WAIT_MS=1` |
@@ -220,11 +223,11 @@ Defined in `src/main.rs` (the `spawn::` items in `src/spawn.rs`):
   holds at most two 32-bit capability handles (as halves); anything more
   goes through an `ArgBlock`. Narrower packings truncate the handle's
   generation byte.
-- `spawn::wait_until_exited(thread, max_polls)` /
-  `spawn::wait_memory_baseline(memory, baseline, max_polls)` — poll a
-  thread's `CAP_INFO_THREAD_STATE` until it reports `Exited`, or a Memory
-  cap's available bytes until they return to a baseline; the way a test
-  observes a deferred (off-CPU) reclaim completing.
+- `spawn::is_exited(thread)` / `spawn::wait_until_exited(thread, max_polls)` /
+  `spawn::wait_memory_baseline(memory, baseline, max_polls)` — probe once
+  whether a thread's `CAP_INFO_THREAD_STATE` reports `Exited`, poll it until
+  it does, or poll a Memory cap's available bytes until they return to a
+  baseline; the way a test observes a deferred (off-CPU) reclaim completing.
 
 ## Compile-time options
 

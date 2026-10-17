@@ -165,7 +165,7 @@ embedded in the endpoint capability.
 | 3 | (none) | `thread_configure_with_tls` failed |
 | 4 | `INVALID_BADGE` | No process with the given badge exists |
 | 5 | `ALREADY_STARTED` | Process was already started |
-| 6 | (none) | `thread_start` failed |
+| 6 | (none) | `thread_start` failed with an error other than `Interrupted`, which procmgr retries |
 
 Codes 3 and 6 are raw values with no `procmgr_errors` constant.
 

@@ -179,8 +179,9 @@ call `fill_bytes`; userspace draws from the same generators through
 
 IPC kernel objects: endpoints for synchronous call/reply, notifications for coalescing async
 notification, event queues for ordered async notification, and wait sets for
-multiplexed waiting. Notifications and event queues queue their blocked waiters FIFO through
-`ipc::WaitQueue` in `mod.rs`, which also holds the shared waiter claims and timed-park arming.
+multiplexed waiting. Notifications, event queues, and wait sets (which hold at most one) queue
+their blocked waiters through `ipc::WaitQueue` in `mod.rs`, which also holds the shared waiter
+claims and timed-park arming.
 See [`docs/ipc-internals.md`](docs/ipc-internals.md).
 
 ### `sched/`

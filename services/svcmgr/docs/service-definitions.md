@@ -52,8 +52,8 @@ seed      = rootfs.root pwrmgr.shutdown pwrmgr.deny
 | Key | Required | Value |
 |---|---|---|
 | `binary` | yes | Absolute path under svcmgr's root. Walked from `system_root_cap` at launch / restart. |
-| `argv` | no | Space-separated badges. Becomes NUL-separated, NUL-terminated bytes on the wire. |
-| `env` | no | Space-separated `KEY=VAL` badges. Same NUL packing as `argv`. |
+| `argv` | no | Space-separated badges. Becomes NUL-separated, NUL-terminated bytes on the wire. Bounded; see [`argv` / `env`](#argv--env). |
+| `env` | no | Space-separated `KEY=VAL` badges. Same NUL packing and bounds as `argv`. |
 | `restart` | yes | One of `never`, `on_failure`, `always`. |
 | `critical` | yes | `yes` or `no`. Whether the system is viable without this service once it is permanently down. Orthogonal to `restart`. |
 | `namespace` | yes | One of `none`, `universal`, `subtree:<path>:<rights>`. |
@@ -70,6 +70,21 @@ svcmgr-launched service is demand-paged. A pinned opt-out
 (`procmgr_labels::CREATE_PINNED`) exists for DMA drivers, which devmgr spawns — not svcmgr.
 A declarative paging key here is a reserved future extension, to be added only when the
 first pinned svcmgr-launched service exists.
+
+## `argv` / `env`
+
+Both lists are packed as NUL-separated, NUL-terminated bytes into svcmgr's
+`CREATE_FROM_FILE` message to procmgr (see
+[procmgr's IPC interface](../../procmgr/docs/ipc-interface.md)) and replayed
+on every restart. The parser rejects a recipe whose packing would not fit
+that message, applying the limits `std::process::Command` applies to its own
+spawns:
+
+* each blob is at most `ipc::ARGS_BLOB_MAX` (256) bytes, counting one NUL
+  per token, and holds at most 255 tokens (the label's 8-bit count fields);
+* together, the message body — one file-size word, the argv words, one
+  env-length word, and the env words — is at most `MSG_DATA_WORDS_MAX` (64)
+  eight-byte words, so argv and env cannot both fill `ARGS_BLOB_MAX`.
 
 ## `restart`
 

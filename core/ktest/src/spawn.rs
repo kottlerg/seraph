@@ -168,31 +168,60 @@ pub fn configure_and_start_pinned(
     Ok(())
 }
 
-/// Whether `thread` (a Thread cap with OBSERVE) reports `Exited`: the state
-/// in the high word of its `CAP_INFO_THREAD_STATE`.
-pub fn is_exited(thread: u32) -> Result<bool, &'static str>
+/// One `cap_info(CAP_INFO_THREAD_STATE)` on `thread`, decoded into its
+/// `(state, exit_reason)` pair: the `THREAD_STATE_*` code from the high word
+/// and the retained exit reason from the low word, read together under one
+/// scheduler-lock snapshot so the pair is coherent.
+///
+/// `cap_info` checks no right, so the only refusal is a handle that does
+/// not name a live Thread cap in the caller's `CSpace`: an empty or stale
+/// slot, or a cap of another type.
+fn thread_state(thread: u32) -> Result<(u32, u64), &'static str>
 {
     let packed = syscall::cap_info(thread, syscall_abi::CAP_INFO_THREAD_STATE)
-        .map_err(|_| "spawn::is_exited: cap_info(THREAD_STATE) failed")?;
+        .map_err(|_| "spawn::thread_state: cap_info(THREAD_STATE) failed")?;
     // cast_possible_truncation: 8-bit state in the high word, 32-bit reason low.
     #[allow(clippy::cast_possible_truncation)]
     let state = (packed >> 32) as u32;
+    Ok((state, packed & 0xFFFF_FFFF))
+}
+
+/// One-shot probe: whether `thread` reports `Exited` in its
+/// `CAP_INFO_THREAD_STATE`. One syscall; a test that must also read the exit
+/// reason uses [`wait_until_exited`], which does not re-query.
+///
+/// # Errors
+///
+/// `cap_info` refused `thread`: the handle names no live Thread cap in the
+/// caller's `CSpace` (an empty or stale slot, or a cap of another type).
+/// `cap_info` checks no right, so any Thread cap suffices.
+pub fn is_exited(thread: u32) -> Result<bool, &'static str>
+{
+    let (state, _) = thread_state(thread)?;
     Ok(state == syscall_abi::THREAD_STATE_EXITED)
 }
 
-/// Poll `thread` (a Thread cap with OBSERVE) at 1 ms intervals until
-/// [`is_exited`] reports it; returns its retained exit reason, the low word
-/// of its `CAP_INFO_THREAD_STATE`. Fails after `max_polls` polls.
+/// Poll `thread` at 1 ms intervals until it reports `Exited`; returns its
+/// retained exit reason, the low word of the same `CAP_INFO_THREAD_STATE`
+/// snapshot that reported the state, so the exit path makes one syscall.
+///
+/// # Errors
+///
+/// - `cap_info` refused `thread`: the handle names no live Thread cap in
+///   the caller's `CSpace` (an empty or stale slot, or a cap of another
+///   type). `cap_info` checks no right, so any Thread cap suffices.
+/// - `thread` was not `Exited` after `max_polls` polls (about `max_polls`
+///   ms, one `thread_sleep(1)` between polls); the bound a test relies on to
+///   fail instead of hang when its child never dies.
 pub fn wait_until_exited(thread: u32, max_polls: u32) -> Result<u64, &'static str>
 {
     let mut polls = 0;
     loop
     {
-        if is_exited(thread)?
+        let (state, reason) = thread_state(thread)?;
+        if state == syscall_abi::THREAD_STATE_EXITED
         {
-            let packed = syscall::cap_info(thread, syscall_abi::CAP_INFO_THREAD_STATE)
-                .map_err(|_| "spawn::wait_until_exited: cap_info(THREAD_STATE) failed")?;
-            return Ok(packed & 0xFFFF_FFFF);
+            return Ok(reason);
         }
         polls += 1;
         if polls >= max_polls

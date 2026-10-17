@@ -30,6 +30,7 @@ use syscall::{
 };
 use syscall_abi::{SyscallError, SystemInfoType};
 
+use crate::arch::{IP_OFFSET, TRAP_FRAME_BYTES};
 use crate::{ChildStack, TestContext, TestResult};
 
 // Notification NOTIFY / WAIT rights. Tests that pin a child in notification_wait give
@@ -38,18 +39,6 @@ use crate::{ChildStack, TestContext, TestResult};
 // parent has registered as the waiter.
 const RIGHTS_NOTIFY: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
 const RIGHTS_WAIT: u64 = syscall_abi::RIGHTS_NTF_WAIT;
-
-// Expected TrapFrame size per architecture (kernel/src/arch/*/trap_frame.rs).
-#[cfg(target_arch = "x86_64")]
-const TRAP_FRAME_BYTES: u64 = 168;
-#[cfg(target_arch = "riscv64")]
-const TRAP_FRAME_BYTES: u64 = 280;
-
-// Byte offset of the instruction pointer within TrapFrame.
-#[cfg(target_arch = "x86_64")]
-const IP_OFFSET: usize = 120; // TrapFrame.rip
-#[cfg(target_arch = "riscv64")]
-const IP_OFFSET: usize = 248; // TrapFrame.sepc
 
 // Child stacks — one per test that spawns a child, to avoid aliasing.
 static mut STACK_CONFIGURE: ChildStack = ChildStack::ZERO;

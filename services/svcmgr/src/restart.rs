@@ -23,6 +23,7 @@ use crate::definitions::launch::{
 };
 use crate::service::{MAX_RESTARTS, POLICY_ALWAYS, POLICY_ON_FAILURE, RestartRecipe, ServiceEntry};
 use ipc::{IpcMessage, procmgr_labels};
+use syscall_abi::MSG_DATA_WORDS_MAX;
 
 /// Outcome of [`handle_death`], routed by the caller (`dispatch_deaths`
 /// in `main.rs`) to either continue, log degradation, or initiate a
@@ -84,8 +85,12 @@ pub struct StartupBlobs<'a>
 }
 
 /// Walk svcmgr's root for `path`, then call procmgr `CREATE_FROM_FILE`.
-/// Returns the freshly created (suspended) process. Caller is
-/// responsible for `CONFIGURE_NAMESPACE`, bootstrap delivery, and
+/// Returns the freshly created (suspended) process, or `None` (logged) when
+/// the walk or the create fails, or when `blobs` would not fit the
+/// `CREATE_FROM_FILE` message (`MSG_DATA_WORDS_MAX` words) — the `.svc`
+/// parser already rejects such a recipe, so this is a backstop that keeps an
+/// oversize blob from reaching the message builder's bound assertion. Caller
+/// is responsible for `CONFIGURE_NAMESPACE`, bootstrap delivery, and
 /// `START_PROCESS`.
 ///
 /// `path` is interpreted relative to svcmgr's own `root_dir_cap`
@@ -112,6 +117,24 @@ pub fn walk_and_create_from_file(
     ipc_buf: *mut u64,
 ) -> Option<CreatedProcess>
 {
+    // word layout matches the procmgr `CREATE_FROM_FILE` wire layout:
+    //   word 0:           file_size
+    //   words 1..1+argv_w: argv blob (NUL-separated, NUL-terminated)
+    //   word  1+argv_w:   env_bytes
+    //   words ...:        env blob
+    let argv_bytes = blobs.argv.len();
+    let argv_words = argv_bytes.div_ceil(8);
+    let env_bytes = blobs.env.len();
+    let env_words = env_bytes.div_ceil(8);
+    let data_count = 1 + argv_words + 1 + env_words;
+    if data_count > MSG_DATA_WORDS_MAX
+    {
+        std::os::seraph::log!(
+            "create: {path:?} argv/env need {data_count} words, limit {MSG_DATA_WORDS_MAX}"
+        );
+        return None;
+    }
+
     let (child_badge, badged_creator) = mint_child_creator(bootstrap_ep)?;
 
     let root_cap = std::os::seraph::root_dir_cap();
@@ -132,26 +155,15 @@ pub fn walk_and_create_from_file(
         }
     };
 
-    let argv_bytes = blobs.argv.len();
-    let argv_words = argv_bytes.div_ceil(8);
-    let env_bytes = blobs.env.len();
-    let env_words = env_bytes.div_ceil(8);
-
     let label = procmgr_labels::CREATE_FROM_FILE
         | procmgr_labels::create_sched_bits(priority, sched_max)
         | ((argv_bytes as u64) << 32)
         | (u64::from(blobs.argv_count) << 48)
         | (u64::from(blobs.env_count) << 56);
 
-    // word layout matches the procmgr `CREATE_FROM_FILE` wire layout:
-    //   word 0:           file_size
-    //   words 1..1+argv_w: argv blob (NUL-separated, NUL-terminated)
-    //   word  1+argv_w:   env_bytes
-    //   words ...:        env blob
     let argv_word_offset: usize = 1;
     let env_len_word_offset = argv_word_offset + argv_words;
     let env_blob_word_offset = env_len_word_offset + 1;
-    let data_count = 1 + argv_words + 1 + env_words;
 
     let mut builder = IpcMessage::builder(label).word(0, file_size);
     if argv_bytes > 0

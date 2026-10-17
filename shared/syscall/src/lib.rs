@@ -627,14 +627,16 @@ pub fn ipc_buffer_set(virt: u64) -> Result<(), i64>
 /// Returns a negative `i64` error code, per `SYS_IPC_CALL` in
 /// `core/kernel/docs/syscalls.md`: `InvalidCapability` (`ep` is not a live
 /// Endpoint cap, or a cap slot is stale or Null), `InsufficientRights` (`ep`
-/// lacks Send, or Grant on a cap-bearing call), `InvalidArgument` (bad
-/// count, a cap slot repeated in one message, or `data_count > 0` with no
-/// IPC buffer page registered), `InvalidAddress` (the registered IPC buffer
-/// page is unmapped), `InvalidState` (a cap slot is pinned by an in-flight
+/// lacks Send, or Grant on a cap-bearing call), `InvalidArgument` (a cap
+/// slot repeated in one message, or `data_count > 0` with no IPC buffer page
+/// registered), `InvalidAddress` (the registered IPC buffer page is
+/// unmapped), `InvalidState` (a cap slot is pinned by an in-flight
 /// `SYS_CAP_REVOKE` or `SYS_CAP_MOVE`), or `Interrupted` (the call was
 /// cancelled while blocked, including by the receiver receiving again before
-/// it replied). Cap-slot problems are rejected before the caller blocks; a
-/// refusal arising only afterwards delivers the message with zero caps.
+/// it replied). A `data_count` above `MSG_DATA_WORDS_MAX` or a `cap_count`
+/// above `MSG_CAP_SLOTS_MAX` is clamped to the maximum, not rejected.
+/// Cap-slot problems are rejected before the caller blocks; a refusal
+/// arising only afterwards delivers the message with zero caps.
 #[doc(hidden)]
 #[inline]
 pub fn raw_ipc_call(
@@ -720,15 +722,17 @@ pub fn raw_ipc_recv(ep: u32) -> Result<(u64, u64, usize), i64>
 /// # Errors
 /// Returns a negative `i64` error code, per `SYS_IPC_REPLY` in
 /// `core/kernel/docs/syscalls.md`: `InvalidCapability` (no pending reply, or
-/// a reply cap slot is stale or Null), `InvalidArgument` (bad count, a cap
-/// slot repeated in the reply, or `data_count > 0` with no IPC buffer page
+/// a reply cap slot is stale or Null), `InvalidArgument` (a cap slot
+/// repeated in the reply, or `data_count > 0` with no IPC buffer page
 /// registered), `InvalidAddress` (the registered IPC buffer page is
 /// unmapped), `InvalidState` (a reply cap slot is pinned by an in-flight
-/// `SYS_CAP_REVOKE` or `SYS_CAP_MOVE`), `QuotaExceeded` / `OutOfMemory` (the
-/// caller's `CSpace` cannot accept the reply caps), or `Interrupted`. An
-/// error consumes the pending reply: a caller that was pending has already
-/// been woken with the `IPC_REPLY_TRANSFER_FAILED` label, so the reply must
-/// not be retried.
+/// `SYS_CAP_REVOKE` or `SYS_CAP_MOVE`), or `QuotaExceeded` / `OutOfMemory`
+/// (the caller's `CSpace` cannot accept the reply caps). The reply never
+/// blocks, so it never returns `Interrupted`. A `data_count` above
+/// `MSG_DATA_WORDS_MAX` or a `cap_count` above `MSG_CAP_SLOTS_MAX` is clamped
+/// to the maximum, not rejected. An error consumes the pending reply: a
+/// caller that was pending has already been woken with the
+/// `IPC_REPLY_TRANSFER_FAILED` label, so the reply must not be retried.
 #[doc(hidden)]
 #[inline]
 pub fn raw_ipc_reply(
@@ -780,9 +784,9 @@ pub fn notification_send(sig: u32, bits: u64) -> Result<(), i64>
 /// bit-63-set bitmasks with the dispatcher's negative-Err encoding.
 ///
 /// # Errors
-/// Returns a negative `i64` error code if the notification cap is invalid, or
-/// `-16` (`Interrupted`) if the caller is stopped while waiting or the
-/// notification is destroyed under it.
+/// Returns a negative `i64` error code if the notification cap is invalid or
+/// lacks Wait rights; `-16` (`Interrupted`) if the caller is stopped while
+/// waiting or the notification is destroyed under it.
 #[inline]
 pub fn notification_wait(sig: u32) -> Result<u64, i64>
 {
@@ -805,9 +809,9 @@ pub fn notification_wait(sig: u32) -> Result<u64, i64>
 /// (legitimate because `notification_send` rejects zero-bit sends).
 ///
 /// # Errors
-/// Returns a negative `i64` error code if the notification cap is invalid, or
-/// `-16` (`Interrupted`) if the caller is stopped while waiting or the
-/// notification is destroyed under it.
+/// Returns a negative `i64` error code if the notification cap is invalid or
+/// lacks Wait rights; `-16` (`Interrupted`) if the caller is stopped while
+/// waiting or the notification is destroyed under it.
 #[inline]
 pub fn notification_wait_timeout(sig: u32, timeout_ms: u64) -> Result<u64, i64>
 {
@@ -1882,9 +1886,9 @@ pub fn event_post(queue_cap: u32, payload: u64) -> Result<(), i64>
 /// the payload is in the secondary return register (rdx / a1).
 ///
 /// # Errors
-/// Returns a negative `i64` error code if the queue cap is invalid, or `-16`
-/// (`Interrupted`) if the caller is stopped while waiting or the queue is
-/// destroyed under it.
+/// Returns a negative `i64` error code if the queue cap is invalid or lacks
+/// Recv rights; `-16` (`Interrupted`) if the caller is stopped while waiting
+/// or the queue is destroyed under it.
 #[inline]
 pub fn event_recv(queue_cap: u32) -> Result<u64, i64>
 {
@@ -1918,7 +1922,8 @@ pub fn event_try_recv(queue_cap: u32) -> Result<u64, i64>
 /// # Errors
 /// Returns `-6` (`WouldBlock`) on timeout or empty try-once; `-16`
 /// (`Interrupted`) if the caller is stopped while waiting or the queue is
-/// destroyed under it; or another negative `i64` error code on invalid cap.
+/// destroyed under it; or another negative `i64` error code if the queue cap
+/// is invalid or lacks Recv rights.
 #[inline]
 pub fn event_recv_timeout(queue_cap: u32, timeout_ms: u64) -> Result<u64, i64>
 {

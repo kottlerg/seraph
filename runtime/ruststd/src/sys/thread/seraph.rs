@@ -914,7 +914,8 @@ pub fn sleep(dur: Duration) {
     // `OutOfMemory`. `sleep` cannot report either and must never sleep less
     // than `dur`, so every error retries for whatever remains; an error other
     // than `Interrupted` yields first so a full sleep list can drain rather
-    // than spinning on the syscall. Only a kernel-completed sleep returns.
+    // than spinning on the syscall. The loop returns once the kernel
+    // completes a sleep, or once `dur` has elapsed across the retries.
     let start = crate::time::Instant::now();
     let mut left = dur;
     loop {

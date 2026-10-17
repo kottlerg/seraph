@@ -22,6 +22,14 @@ use crate::TestContext;
 /// the thread.
 pub const PAGE_FAULT_STORE_VECTOR: u64 = 15;
 
+/// Size of the kernel `TrapFrame` (`core/kernel/src/arch/riscv64/trap_frame.rs`):
+/// the byte count `thread_read_regs` returns.
+pub const TRAP_FRAME_BYTES: u64 = 280;
+
+/// Byte offset of the instruction pointer (`sepc`) in the kernel `TrapFrame`:
+/// the field a register-file edit redirects.
+pub const IP_OFFSET: usize = 248;
+
 /// Run every RISC-V-specific Tier 1 test. x86-64's wrapped-stack probe has no
 /// RISC-V counterpart: the RISC-V entry alignment, `sp & !0xF`, rounds down
 /// without wrapping, so the raw stack check covers it.

@@ -96,7 +96,7 @@ kernel/
 │   │   ├── health.rs           # NIST SP 800-90B health tests (RCT/APT)
 │   │   └── selftest.rs         # Boot-time power-on self-test
 │   ├── ipc/                    # IPC subsystem
-│   │   ├── mod.rs
+│   │   ├── mod.rs              # Shared waiter queue (WaitQueue), claims, timed-park arming
 │   │   ├── endpoint.rs         # Endpoint object: wait queues, state machine
 │   │   ├── notification.rs     # Notification object: atomic bitmask
 │   │   ├── event_queue.rs      # Event queue: ring buffer
@@ -179,7 +179,10 @@ call `fill_bytes`; userspace draws from the same generators through
 
 IPC kernel objects: endpoints for synchronous call/reply, notifications for coalescing async
 notification, event queues for ordered async notification, and wait sets for
-multiplexed waiting. See [`docs/ipc-internals.md`](docs/ipc-internals.md).
+multiplexed waiting. Notifications, event queues, and wait sets (which hold at most one) queue
+their blocked waiters through `ipc::WaitQueue` in `mod.rs`, which also holds the shared waiter
+claims and timed-park arming.
+See [`docs/ipc-internals.md`](docs/ipc-internals.md).
 
 ### `sched/`
 

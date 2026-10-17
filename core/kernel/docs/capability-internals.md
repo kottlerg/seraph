@@ -601,8 +601,10 @@ nothing below runs now: the object is queued for off-CPU reclaim and the whole a
 deferred drain once the thread has been scheduled away. The same discipline applies to an
 `AddressSpace` reaching refcount zero. This path has known kernel memory-safety gaps, tracked in
 [#443](https://github.com/kottlerg/seraph/issues/443) (see
-[ipc-design.md](../../../docs/ipc-design.md#the-callreply-model) § The Call/Reply Model and
-[§ Storage: Hybrid Two-Level Radix](#storage-hybrid-two-level-radix)).
+[§ Storage: Hybrid Two-Level Radix](#storage-hybrid-two-level-radix),
+[thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md#dealloc_objectthread-drain-protocol)
+§ `dealloc_object(Thread)` Drain Protocol, step 11, and
+[syscalls.md](syscalls.md#sys_thread_stop-20) § `SYS_THREAD_STOP`).
 
 Every derivation link reachable from a live slot resolves: before a `CSpace`
 unregisters, its teardown drain (`drain_dying_cspace_batch`) unlinks every
@@ -726,7 +728,11 @@ keeping the capability and its remaining children). When the freed source
 slot's reference was the last one to a `Thread`, `CSpace`, or
 `AddressSpace`, the object goes to the CPU's deferred reclaim rather than
 being torn down in place — a teardown stops bound threads and waits on
-other CPUs, which must not happen inside IPC delivery. A capability whose
+other CPUs' scheduling, which must not happen inside IPC delivery. Other
+types are freed in place; a Notification or `EventQueue` may first wait for
+the timer's in-flight wakeup batch (`sched::sleep_wakeups_quiesce`), a
+bounded wait that needs only that no IPC, scheduler, or sleep-list lock is
+held, as at every move's release. A capability whose
 source and destination an ancestor's revoke both freed mid-transfer, or
 whose destination went with the receiver's `CSpace` (the sender then keeps
 it), is delivered as handle 0 (the permanently null slot); one that trips
@@ -886,9 +892,12 @@ cannot be derived, and are not tracked for revocation (see
 [docs/ipc-design.md](../../../docs/ipc-design.md) § The Call/Reply Model). A reply
 capability is not a `CapTag` variant; it is an implicit per-thread mechanism
 created by the kernel at `SYS_IPC_RECV` time and stored in a per-thread slot,
-outside the process CSpace. The kernel clears the per-thread reply slot after
-`SYS_IPC_REPLY` (see [ipc-internals.md](ipc-internals.md) § Receive Path (Server)
-and § Reply Path).
+outside the process CSpace. The kernel clears the per-thread reply slot when
+`SYS_IPC_REPLY` consumes it, at the thread's next `SYS_IPC_RECV` that passes its
+capability check and cap-slot pre-allocation, which releases the unreplied caller, or
+when a stop (`cancel_ipc_block`) or a teardown claims the bound caller (see
+[ipc-internals.md](ipc-internals.md) § Receive Path (Server) and § Reply Path, and
+[thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § BlockedOnReply Edge).
 
 ---
 

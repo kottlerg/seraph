@@ -170,12 +170,14 @@ pub const SYS_NOTIFICATION_SEND: u64 = 3;
 /// On success returns `0` in the primary return register and the bitmask
 /// in the secondary register (rdx / a1). A notification wake always carries
 /// non-zero bits, because `notification_send` rejects zero-bit sends. A `0`
-/// bitmask with a `0` status means the timeout elapsed, or the notification
-/// was destroyed while the caller waited; the latter returns no
-/// `Interrupted`, even with `timeout_ms = 0` (#443). The split avoids
-/// aliasing bit-63-set bitmasks with the dispatcher's negative-Err
-/// encoding — the full 64-bit bitmask range is usable. Same register
-/// layout as `SYS_EVENT_RECV`.
+/// bitmask with a `0` status means the timeout elapsed. A stop of the
+/// caller, or the destruction of the notification under it, returns
+/// `Interrupted`. Several threads may wait; they queue in arrival order and
+/// each delivery wakes the longest-waiting one with every pending bit (a
+/// wait that enters while bits are pending takes them at once).
+/// The split avoids aliasing bit-63-set bitmasks with the dispatcher's
+/// negative-Err encoding — the full 64-bit bitmask range is usable. Same
+/// register layout as `SYS_EVENT_RECV`.
 pub const SYS_NOTIFICATION_WAIT: u64 = 4;
 /// `EventQueue`: post an entry.
 pub const SYS_EVENT_POST: u64 = 5;
@@ -191,12 +193,12 @@ pub const SYS_EVENT_POST: u64 = 5;
 ///   available"; the caller already knows which mode it asked for).
 ///
 /// On success returns `0` plus the payload in the secondary return
-/// register. A queue destroyed while the caller waits also returns success,
-/// with a payload of `0` that was never posted, and no `Interrupted` (#443).
-/// Sentinel layout matches `SYS_NOTIFICATION_WAIT` (`0` = forever),
-/// but event-queue payloads may be any `u64` including 0, so the kernel
-/// uses an out-of-band `tcb.timed_out` marker instead of an in-band
-/// sentinel on the payload register.
+/// register. A stop of the caller, or the destruction of the queue under
+/// it, returns `Interrupted`. Blocked receivers queue in arrival order and
+/// each post wakes the longest-waiting one. Sentinel layout matches
+/// `SYS_NOTIFICATION_WAIT` (`0` = forever), but event-queue payloads may be
+/// any `u64` including 0, so the kernel uses an out-of-band `tcb.timed_out`
+/// marker instead of an in-band sentinel on the payload register.
 pub const SYS_EVENT_RECV: u64 = 6;
 /// Capability: create an `Endpoint` object.
 pub const SYS_CAP_CREATE_ENDPOINT: u64 = 7;
@@ -248,7 +250,8 @@ pub const SYS_CAP_MOVE: u64 = 25;
 pub const SYS_WAIT_SET_ADD: u64 = 26;
 /// `WaitSet`: remove a member.
 pub const SYS_WAIT_SET_REMOVE: u64 = 27;
-/// `WaitSet`: wait for any member to become ready.
+/// `WaitSet`: wait for any member to become ready. A wait set takes one
+/// waiting thread: a wait while another thread waits returns `InvalidState`.
 pub const SYS_WAIT_SET_WAIT: u64 = 28;
 /// IRQ: acknowledge a delivered interrupt.
 pub const SYS_IRQ_ACK: u64 = 29;
@@ -514,10 +517,17 @@ pub enum SyscallError
     QueueFull = -13,
     // -14 retired (`DmaUnsafe`, removed with `SYS_DMA_GRANT`); never reuse.
     /// The target object is not in the required state for this operation
-    /// (e.g. thread not `Stopped` for `read_regs`/`write_regs`).
+    /// (e.g. thread not `Stopped` for `read_regs`/`write_regs`, or a wait set
+    /// another thread already waits on).
     InvalidState = -15,
-    /// A blocking operation was cancelled because the thread was stopped.
-    /// The stopped thread sees this as the return value of its blocked syscall.
+    /// A blocking operation was cancelled: the thread was stopped, the object
+    /// it was blocked on was destroyed, or, for a call, the server received
+    /// again without replying. The thread sees this as the return value of its
+    /// blocked syscall. `SYS_THREAD_START` also returns it when its caller is
+    /// stopped while the start waits for the target to settle (nothing is
+    /// started). Batched capability operations (revoke, delete, move, a range
+    /// split) also return it at their liveness backstop; each syscall's entry
+    /// in core/kernel/docs/syscalls.md gives the state the backstop leaves.
     Interrupted = -16,
     /// A structural per-object ceiling was reached (e.g. a `CSpace`'s
     /// directory is full). Unlike `OutOfMemory`, donating memory (augment

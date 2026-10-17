@@ -373,8 +373,9 @@ pub struct ProcessInfo
     // NUL-terminated UTF-8 strings. `args_offset == 0` OR `args_count ==
     // 0` means "no argv delivered".
     //
-    // Argv is bounded by what fits in the remainder of the ProcessInfo
-    // page after the fixed struct. Procmgr rejects oversized blobs.
+    // The page remainder after the fixed struct is where the blob lives,
+    // not its limit; the bound is the create-request wire contract in
+    // `services/procmgr/docs/ipc-interface.md` § CREATE_PROCESS.
     /// Byte offset from the `ProcessInfo` page base where the argv blob
     /// begins. 0 when no argv was provided.
     pub args_offset: u32,
@@ -391,7 +392,8 @@ pub struct ProcessInfo
     // argv blob, between `env_offset` and `env_offset + env_bytes`. The
     // blob is a concatenation of `env_count` NUL-terminated UTF-8 strings,
     // each of shape `KEY=VALUE`. `env_offset == 0` OR `env_count == 0`
-    // means "no env delivered". Same page-remainder bound as argv.
+    // means "no env delivered". The bound is the same wire contract as
+    // argv's.
     /// Byte offset from the `ProcessInfo` page base where the env blob
     /// begins. 0 when no env was provided.
     pub env_offset: u32,
@@ -459,10 +461,9 @@ pub struct ProcessInfo
     //   * `space_notification` — reader kicks writer after consuming bytes;
     //                      writer awaits this when the ring is full.
     //
-    // Both processes hold caps to both notifications (kernel notification objects do
-    // not distinguish send/wait rights at the cap level). Single-waiter
-    // invariant holds because at most one side blocks on each notification at
-    // any given moment.
+    // Both processes hold caps to both notifications, with Notify and Wait
+    // rights. At most one side blocks on each notification at any given
+    // moment.
     //
     // Zero in any slot means the corresponding notification is not attached;
     // the AnonPipe peer treats `notification_wait` as a no-op and falls back

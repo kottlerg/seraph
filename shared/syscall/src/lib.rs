@@ -77,6 +77,13 @@ pub use syscall_abi::{
 // ── Raw syscall entry ─────────────────────────────────────────────────────────
 
 /// Issue a syscall with up to 2 arguments. Returns the primary return value.
+///
+/// # Safety
+///
+/// `nr` must be a syscall number the kernel defines and `a0`..`a1` that
+/// call's arguments in the order `core/kernel/docs/syscalls.md` gives; a
+/// pointer argument must be valid for the access the call's contract
+/// specifies. The kernel ABI's register clobbers are declared in the asm.
 #[cfg(target_arch = "x86_64")]
 // inline_always: syscall wrapper contains inline asm; must inline to call site.
 // cast_possible_wrap: u64 syscall number reinterpreted as i64 register value; bit pattern preserved.
@@ -103,6 +110,14 @@ unsafe fn syscall2(nr: u64, a0: u64, a1: u64) -> i64
     ret
 }
 
+/// Issue a syscall with up to 2 arguments. Returns the primary return value.
+///
+/// # Safety
+///
+/// `nr` must be a syscall number the kernel defines and `a0`..`a1` that
+/// call's arguments in the order `core/kernel/docs/syscalls.md` gives; a
+/// pointer argument must be valid for the access the call's contract
+/// specifies. The kernel ABI's register clobbers are declared in the asm.
 #[cfg(target_arch = "riscv64")]
 // inline_always: syscall wrapper contains inline asm; must inline to call site.
 // cast_possible_wrap: u64 arg reinterpreted as i64 register value; bit pattern preserved.
@@ -127,6 +142,13 @@ unsafe fn syscall2(nr: u64, a0: u64, a1: u64) -> i64
 }
 
 /// Issue a syscall with up to 4 arguments.
+///
+/// # Safety
+///
+/// `nr` must be a syscall number the kernel defines and `a0`..`a3` that
+/// call's arguments in the order `core/kernel/docs/syscalls.md` gives; a
+/// pointer argument must be valid for the access the call's contract
+/// specifies. The kernel ABI's register clobbers are declared in the asm.
 #[cfg(target_arch = "x86_64")]
 // inline_always: syscall wrapper contains inline asm; must inline to call site.
 // cast_possible_wrap: u64 syscall number reinterpreted as i64 register value; bit pattern preserved.
@@ -154,6 +176,14 @@ unsafe fn syscall4(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64
     ret
 }
 
+/// Issue a syscall with up to 4 arguments.
+///
+/// # Safety
+///
+/// `nr` must be a syscall number the kernel defines and `a0`..`a3` that
+/// call's arguments in the order `core/kernel/docs/syscalls.md` gives; a
+/// pointer argument must be valid for the access the call's contract
+/// specifies. The kernel ABI's register clobbers are declared in the asm.
 #[cfg(target_arch = "riscv64")]
 // inline_always: syscall wrapper contains inline asm; must inline to call site.
 // cast_possible_wrap: u64 arg reinterpreted as i64 register value; bit pattern preserved.
@@ -180,6 +210,13 @@ unsafe fn syscall4(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64
 }
 
 /// Issue a syscall with up to 5 arguments. Returns the primary return value.
+///
+/// # Safety
+///
+/// `nr` must be a syscall number the kernel defines and `a0`..`a4` that
+/// call's arguments in the order `core/kernel/docs/syscalls.md` gives; a
+/// pointer argument must be valid for the access the call's contract
+/// specifies. The kernel ABI's register clobbers are declared in the asm.
 #[cfg(target_arch = "x86_64")]
 // inline_always: syscall wrapper contains inline asm; must inline to call site.
 // cast_possible_wrap: u64 syscall number reinterpreted as i64 register value; bit pattern preserved.
@@ -208,6 +245,14 @@ unsafe fn syscall5(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> i64
     ret
 }
 
+/// Issue a syscall with up to 5 arguments. Returns the primary return value.
+///
+/// # Safety
+///
+/// `nr` must be a syscall number the kernel defines and `a0`..`a4` that
+/// call's arguments in the order `core/kernel/docs/syscalls.md` gives; a
+/// pointer argument must be valid for the access the call's contract
+/// specifies. The kernel ABI's register clobbers are declared in the asm.
 #[cfg(target_arch = "riscv64")]
 // inline_always: syscall wrapper contains inline asm; must inline to call site.
 // cast_possible_wrap: u64 arg reinterpreted as i64 register value; bit pattern preserved.
@@ -235,6 +280,13 @@ unsafe fn syscall5(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> i64
 }
 
 /// Issue a syscall with up to 3 arguments.
+///
+/// # Safety
+///
+/// `nr` must be a syscall number the kernel defines and `a0`..`a2` that
+/// call's arguments in the order `core/kernel/docs/syscalls.md` gives; a
+/// pointer argument must be valid for the access the call's contract
+/// specifies. The kernel ABI's register clobbers are declared in the asm.
 #[cfg(target_arch = "x86_64")]
 // inline_always: syscall wrapper contains inline asm; must inline to call site.
 // cast_possible_wrap: u64 syscall number reinterpreted as i64 register value; bit pattern preserved.
@@ -261,6 +313,14 @@ unsafe fn syscall3(nr: u64, a0: u64, a1: u64, a2: u64) -> i64
     ret
 }
 
+/// Issue a syscall with up to 3 arguments.
+///
+/// # Safety
+///
+/// `nr` must be a syscall number the kernel defines and `a0`..`a2` that
+/// call's arguments in the order `core/kernel/docs/syscalls.md` gives; a
+/// pointer argument must be valid for the access the call's contract
+/// specifies. The kernel ABI's register clobbers are declared in the asm.
 #[cfg(target_arch = "riscv64")]
 // inline_always: syscall wrapper contains inline asm; must inline to call site.
 // cast_possible_wrap: u64 arg reinterpreted as i64 register value; bit pattern preserved.
@@ -290,6 +350,13 @@ unsafe fn syscall3(nr: u64, a0: u64, a1: u64, a2: u64) -> i64
 /// r9 is marked clobbered because `SYS_IPC_CALL`'s kernel handler writes
 /// `reply_word_count` into r9 via `set_ipc_call_return`; even though this
 /// wrapper does not read r9, LLVM must not assume r9 is preserved.
+///
+/// # Safety
+///
+/// `nr` must be a syscall number the kernel defines and `a0`..`a4` that
+/// call's arguments in the order `core/kernel/docs/syscalls.md` gives; a
+/// pointer argument must be valid for the access the call's contract
+/// specifies. The kernel ABI's register clobbers are declared in the asm.
 #[cfg(target_arch = "x86_64")]
 // inline_always: syscall wrapper contains inline asm; must inline to call site.
 // cast_possible_wrap: u64 syscall number reinterpreted as i64 register value; bit pattern preserved.
@@ -321,6 +388,14 @@ unsafe fn syscall5_ret2(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) ->
     (ret, secondary)
 }
 
+/// Issue a syscall with up to 5 arguments. Returns (primary, secondary).
+///
+/// # Safety
+///
+/// `nr` must be a syscall number the kernel defines and `a0`..`a4` that
+/// call's arguments in the order `core/kernel/docs/syscalls.md` gives; a
+/// pointer argument must be valid for the access the call's contract
+/// specifies. The kernel ABI's register clobbers are declared in the asm.
 #[cfg(target_arch = "riscv64")]
 // inline_always: syscall wrapper contains inline asm; must inline to call site.
 // cast_possible_wrap: u64 arg reinterpreted as i64 register value; bit pattern preserved.
@@ -354,6 +429,13 @@ unsafe fn syscall5_ret2(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) ->
 /// Issue a syscall with 1 argument. Returns (primary, secondary, tertiary, quaternary).
 ///
 /// Used by `ipc_recv` to retrieve `(ret, label, badge, word_count)`.
+///
+/// # Safety
+///
+/// `nr` must be a syscall number the kernel defines and `a0` that call's
+/// argument per `core/kernel/docs/syscalls.md`; a pointer argument must be
+/// valid for the access the call's contract specifies. The kernel ABI's
+/// register clobbers are declared in the asm.
 #[cfg(target_arch = "x86_64")]
 // inline_always: syscall wrapper contains inline asm; must inline to call site.
 // cast_possible_wrap: u64 syscall number reinterpreted as i64 register value; bit pattern preserved.
@@ -385,6 +467,16 @@ unsafe fn syscall1_ret4(nr: u64, a0: u64) -> (i64, u64, u64, u64)
     (ret, secondary, tertiary, quaternary)
 }
 
+/// Issue a syscall with 1 argument. Returns (primary, secondary, tertiary, quaternary).
+///
+/// Used by `ipc_recv` to retrieve `(ret, label, badge, word_count)`.
+///
+/// # Safety
+///
+/// `nr` must be a syscall number the kernel defines and `a0` that call's
+/// argument per `core/kernel/docs/syscalls.md`; a pointer argument must be
+/// valid for the access the call's contract specifies. The kernel ABI's
+/// register clobbers are declared in the asm.
 #[cfg(target_arch = "riscv64")]
 // inline_always: syscall wrapper contains inline asm; must inline to call site.
 // cast_possible_wrap: u64 arg reinterpreted as i64 register value; bit pattern preserved.
@@ -416,6 +508,13 @@ unsafe fn syscall1_ret4(nr: u64, a0: u64) -> (i64, u64, u64, u64)
 /// Issue a syscall with 6 arguments; read back 3 return values.
 ///
 /// Used by `raw_ipc_call` to retrieve `(ret, reply_label, reply_word_count)`.
+///
+/// # Safety
+///
+/// `nr` must be a syscall number the kernel defines and `a0`..`a5` that
+/// call's arguments in the order `core/kernel/docs/syscalls.md` gives; a
+/// pointer argument must be valid for the access the call's contract
+/// specifies. The kernel ABI's register clobbers are declared in the asm.
 #[cfg(target_arch = "x86_64")]
 // inline_always: syscall wrapper contains inline asm; must inline to call site.
 // cast_possible_wrap: u64 syscall number reinterpreted as i64 register value; bit pattern preserved.
@@ -456,6 +555,16 @@ unsafe fn syscall6_ret3(
     (ret, secondary, tertiary)
 }
 
+/// Issue a syscall with 6 arguments; read back 3 return values.
+///
+/// Used by `raw_ipc_call` to retrieve `(ret, reply_label, reply_word_count)`.
+///
+/// # Safety
+///
+/// `nr` must be a syscall number the kernel defines and `a0`..`a5` that
+/// call's arguments in the order `core/kernel/docs/syscalls.md` gives; a
+/// pointer argument must be valid for the access the call's contract
+/// specifies. The kernel ABI's register clobbers are declared in the asm.
 #[cfg(target_arch = "riscv64")]
 // inline_always: syscall wrapper contains inline asm; must inline to call site.
 // cast_possible_wrap: u64 arg reinterpreted as i64 register value; bit pattern preserved.
@@ -494,6 +603,13 @@ unsafe fn syscall6_ret3(
 }
 
 /// Issue a syscall with 6 arguments. Returns the primary return value.
+///
+/// # Safety
+///
+/// `nr` must be a syscall number the kernel defines and `a0`..`a5` that
+/// call's arguments in the order `core/kernel/docs/syscalls.md` gives; a
+/// pointer argument must be valid for the access the call's contract
+/// specifies. The kernel ABI's register clobbers are declared in the asm.
 #[cfg(target_arch = "x86_64")]
 // inline_always: syscall wrapper contains inline asm; must inline to call site.
 // cast_possible_wrap: u64 syscall number reinterpreted as i64 register value; bit pattern preserved.
@@ -523,6 +639,14 @@ unsafe fn syscall6(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64
     ret
 }
 
+/// Issue a syscall with 6 arguments. Returns the primary return value.
+///
+/// # Safety
+///
+/// `nr` must be a syscall number the kernel defines and `a0`..`a5` that
+/// call's arguments in the order `core/kernel/docs/syscalls.md` gives; a
+/// pointer argument must be valid for the access the call's contract
+/// specifies. The kernel ABI's register clobbers are declared in the asm.
 #[cfg(target_arch = "riscv64")]
 // inline_always: syscall wrapper contains inline asm; must inline to call site.
 // cast_possible_wrap: u64 arg reinterpreted as i64 register value; bit pattern preserved.
@@ -622,6 +746,21 @@ pub fn ipc_buffer_set(virt: u64) -> Result<(), i64>
 /// entry point.
 ///
 /// Returns `(reply_label, reply_word_count)` on success.
+///
+/// # Errors
+/// Returns a negative `i64` error code, per `SYS_IPC_CALL` in
+/// `core/kernel/docs/syscalls.md`: `InvalidCapability` (`ep` is not a live
+/// Endpoint cap, or a cap slot is stale or Null), `InsufficientRights` (`ep`
+/// lacks Send, or Grant on a cap-bearing call), `InvalidArgument` (a cap
+/// slot repeated in one message, or `data_count > 0` with no IPC buffer page
+/// registered), `InvalidAddress` (the registered IPC buffer page is
+/// unmapped), `InvalidState` (a cap slot is pinned by an in-flight
+/// `SYS_CAP_REVOKE` or `SYS_CAP_MOVE`), or `Interrupted` (the call was
+/// cancelled while blocked, including by the receiver receiving again before
+/// it replied). A `data_count` above `MSG_DATA_WORDS_MAX` or a `cap_count`
+/// above `MSG_CAP_SLOTS_MAX` is clamped to the maximum, not rejected.
+/// Cap-slot problems are rejected before the caller blocks; a refusal
+/// arising only afterwards delivers the message with zero caps.
 #[doc(hidden)]
 #[inline]
 pub fn raw_ipc_call(
@@ -670,6 +809,16 @@ pub fn raw_ipc_call(
 /// entry point.
 ///
 /// Returns `(label, badge, word_count)` on success.
+///
+/// # Errors
+/// Returns a negative `i64` error code, per `SYS_IPC_RECV` in
+/// `core/kernel/docs/syscalls.md`: `InvalidCapability` (`ep` is not a live
+/// Endpoint cap), `InsufficientRights` (`ep` lacks Receive), `QuotaExceeded`
+/// (this thread's `CSpace` directory is structurally full for an incoming
+/// cap transfer), `OutOfMemory` (the `CSpace` slot-page pool is exhausted),
+/// or `Interrupted` (this thread was stopped, or the endpoint destroyed,
+/// while the receive was blocked). The first four refuse the receive before
+/// any pending reply is released.
 #[doc(hidden)]
 #[inline]
 pub fn raw_ipc_recv(ep: u32) -> Result<(u64, u64, usize), i64>
@@ -693,6 +842,21 @@ pub fn raw_ipc_recv(ep: u32) -> Result<(u64, u64, usize), i64>
 
 /// Raw `SYS_IPC_REPLY`. Intended for `shared/ipc`'s `IpcMessage`-snapshot
 /// wrapper; other callers should use that higher-level entry point.
+///
+/// # Errors
+/// Returns a negative `i64` error code, per `SYS_IPC_REPLY` in
+/// `core/kernel/docs/syscalls.md`: `InvalidCapability` (no pending reply, or
+/// a reply cap slot is stale or Null), `InvalidArgument` (a cap slot
+/// repeated in the reply, or `data_count > 0` with no IPC buffer page
+/// registered), `InvalidAddress` (the registered IPC buffer page is
+/// unmapped), `InvalidState` (a reply cap slot is pinned by an in-flight
+/// `SYS_CAP_REVOKE` or `SYS_CAP_MOVE`), or `QuotaExceeded` / `OutOfMemory`
+/// (the caller's `CSpace` cannot accept the reply caps). The reply never
+/// blocks, so it never returns `Interrupted`. A `data_count` above
+/// `MSG_DATA_WORDS_MAX` or a `cap_count` above `MSG_CAP_SLOTS_MAX` is clamped
+/// to the maximum, not rejected. An error consumes the pending reply: a
+/// caller that was pending has already been woken with the
+/// `IPC_REPLY_TRANSFER_FAILED` label, so the reply must not be retried.
 #[doc(hidden)]
 #[inline]
 pub fn raw_ipc_reply(
@@ -743,12 +907,10 @@ pub fn notification_send(sig: u32, bits: u64) -> Result<(), i64>
 /// register (rdx / a1). Mirrors `event_recv`; the split avoids aliasing
 /// bit-63-set bitmasks with the dispatcher's negative-Err encoding.
 ///
-/// A notification destroyed while the caller waits wakes it with `Ok(0)`
-/// rather than an error (a kernel defect tracked in #443).
-///
 /// # Errors
-/// Returns a negative `i64` error code if the notification cap is invalid or the
-/// wait is interrupted.
+/// Returns a negative `i64` error code if the notification cap is invalid or
+/// lacks Wait rights; `-16` (`Interrupted`) if the caller is stopped while
+/// waiting or the notification is destroyed under it.
 #[inline]
 pub fn notification_wait(sig: u32) -> Result<u64, i64>
 {
@@ -768,13 +930,12 @@ pub fn notification_wait(sig: u32) -> Result<u64, i64>
 ///
 /// Same register layout as [`notification_wait`]: status in the primary register,
 /// bitmask in the secondary. Timeout is notified in-band as `bits == 0`
-/// (legitimate because `notification_send` rejects zero-bit sends); `Ok(0)` is
-/// also returned when the notification is destroyed while the caller waits
-/// (#443).
+/// (legitimate because `notification_send` rejects zero-bit sends).
 ///
 /// # Errors
 /// Returns a negative `i64` error code if the notification cap is invalid or
-/// the wait is interrupted.
+/// lacks Wait rights; `-16` (`Interrupted`) if the caller is stopped while
+/// waiting or the notification is destroyed under it.
 #[inline]
 pub fn notification_wait_timeout(sig: u32, timeout_ms: u64) -> Result<u64, i64>
 {
@@ -1419,15 +1580,22 @@ pub fn thread_configure_with_tls(
     if ret < 0 { Err(ret) } else { Ok(()) }
 }
 
-/// Move a configured thread from `Created` to `Ready` (enqueue it).
+/// Move a configured `Created` thread, or a `Stopped` one (resume), to
+/// `Ready` (enqueue it).
 ///
 /// The thread must have been configured via [`thread_configure`] first.
 ///
 /// # Errors
-/// Returns a negative `i64` error code if the thread cap is invalid, the
-/// thread has not been configured yet, or it is not `Created`/`Stopped` —
-/// including a thread that exited, or was killed by an object teardown,
-/// between the check and the locked commit (`InvalidArgument`).
+/// Returns a negative `i64` error code if the thread cap is invalid
+/// (`InvalidCapability`) or lacks Control rights (`InsufficientRights`); if
+/// the thread has not been configured yet, is the calling thread itself, or
+/// is not `Created`/`Stopped` under the locked commit — including one a
+/// concurrent start already resumed, or one that exited or was killed by an
+/// object teardown after the first check (`InvalidArgument`); or `-16`
+/// (`Interrupted`) if the calling thread is stopped while the start waits for
+/// the target to leave its CPU or for an owed wake: the caller is descheduled
+/// in place and sees `Interrupted` once restarted; nothing was started and a
+/// retry is safe.
 #[inline]
 pub fn thread_start(thread_cap: u32) -> Result<(), i64>
 {
@@ -1841,12 +2009,10 @@ pub fn event_post(queue_cap: u32, payload: u64) -> Result<(), i64>
 /// Returns the payload word. The primary return register holds 0 on success;
 /// the payload is in the secondary return register (rdx / a1).
 ///
-/// A queue destroyed while the caller waits returns `Ok(0)`, a payload that
-/// was never posted, rather than an error (a kernel defect tracked in #443).
-///
 /// # Errors
-/// Returns a negative `i64` error code if the queue cap is invalid or the
-/// wait is interrupted.
+/// Returns a negative `i64` error code if the queue cap is invalid or lacks
+/// Recv rights; `-16` (`Interrupted`) if the caller is stopped while waiting
+/// or the queue is destroyed under it.
 #[inline]
 pub fn event_recv(queue_cap: u32) -> Result<u64, i64>
 {
@@ -1876,12 +2042,12 @@ pub fn event_try_recv(queue_cap: u32) -> Result<u64, i64>
 /// [`event_recv`]); `timeout_ms == u64::MAX` is a non-blocking poll (same as
 /// [`event_try_recv`]); any other value blocks for up to `timeout_ms`
 /// milliseconds, then returns `Err(-6)` (`WouldBlock`) if no post arrived.
-/// A queue destroyed while the caller waits returns `Ok(0)`, a payload that
-/// was never posted, rather than an error (a kernel defect tracked in #443).
 ///
 /// # Errors
-/// Returns `-6` (`WouldBlock`) on timeout or empty try-once, or another
-/// negative `i64` error code on invalid cap.
+/// Returns `-6` (`WouldBlock`) on timeout or empty try-once; `-16`
+/// (`Interrupted`) if the caller is stopped while waiting or the queue is
+/// destroyed under it; or another negative `i64` error code if the queue cap
+/// is invalid or lacks Recv rights.
 #[inline]
 pub fn event_recv_timeout(queue_cap: u32, timeout_ms: u64) -> Result<u64, i64>
 {
@@ -1969,8 +2135,10 @@ pub fn wait_set_remove(ws_cap: u32, source_cap: u32) -> Result<(), i64>
 /// If multiple sources are ready, each call returns one badge without re-blocking.
 ///
 /// # Errors
-/// Returns a negative `i64` error code if the wait set cap is invalid or
-/// the wait is interrupted.
+/// Returns a negative `i64` error code if the wait set cap is invalid or lacks
+/// Wait rights; `-15` (`InvalidState`) if another thread already waits on the
+/// set (a wait set takes one waiter); `-16` (`Interrupted`) if the caller is
+/// stopped while waiting or the wait set is destroyed under it.
 #[inline]
 pub fn wait_set_wait(ws_cap: u32) -> Result<u64, i64>
 {
@@ -2072,11 +2240,16 @@ pub fn ioport_bind(thread_cap: u32, ioport_cap: u32) -> Result<(), i64>
 
 /// Stop a running, ready, or blocked thread. The thread transitions to `Stopped`.
 ///
-/// If the thread was blocked on IPC, the blocking syscall returns `Interrupted`.
-/// A thread may stop itself (pass its own thread cap).
+/// If the thread was blocked (on IPC or in [`thread_sleep`]), or blocks while
+/// the stop is in progress, the blocking syscall returns `Interrupted` once
+/// the thread is restarted, unless its wake was claimed first. The kernel's
+/// known exceptions (#443) are listed in `core/kernel/docs/syscalls.md`
+/// § `SYS_THREAD_STOP`. A thread may stop itself (pass its own thread cap).
 ///
 /// # Errors
-/// Returns a negative `i64` error code if the thread cap is invalid.
+/// Returns a negative `i64` error code if the thread cap is invalid or lacks
+/// Control rights, or `-15` (`InvalidState`) if the thread is not yet
+/// started, already stopped, or exited.
 #[inline]
 pub fn thread_stop(thread_cap: u32) -> Result<(), i64>
 {
@@ -2359,7 +2532,9 @@ pub fn sbi_call(
 /// the deadline expires.
 ///
 /// # Errors
-/// Returns a negative `i64` error code on failure.
+/// Returns `-16` (`Interrupted`) if the thread is stopped before or during
+/// the sleep (and restarted), `-8` (`OutOfMemory`) if the kernel's sleep list
+/// is full, or another negative `i64` error code on failure.
 #[inline]
 pub fn thread_sleep(ms: u64) -> Result<(), i64>
 {

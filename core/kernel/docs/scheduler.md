@@ -180,14 +180,19 @@ pub struct ThreadControlBlock
     /// Inline message buffer for in-flight IPC data (the staged message).
     ipc_msg: Message,
 
-    /// Caller bound for the implicit reply (set on receive, cleared on reply).
+    /// Caller bound by the last receive (consumed by the reply, released at the
+    /// next receive, or cleared by a cancel or dealloc claim).
     reply_tcb: AtomicPtr<ThreadControlBlock>,
 
     /// Wakeup value (notification bits, event payload, or wait-set member badge).
     wakeup_value: u64,
 
-    /// Intrusive IPC wait queue link.
+    /// Intrusive IPC wait queue links (endpoints link `ipc_wait_next` only;
+    /// notifications, event queues and wait sets link both ways through
+    /// `ipc::WaitQueue` and tag the queue in `ipc_wait_queue`).
     ipc_wait_next: Option<*mut ThreadControlBlock>,
+    ipc_wait_prev: *mut ThreadControlBlock,
+    ipc_wait_queue: AtomicPtr<WaitQueue>,
 
     // === Context ===
 
@@ -230,8 +235,9 @@ Created ──(SYS_THREAD_START)──► Ready ──(scheduled)──► Runni
                                   ▼
                                 Ready
 
-Running ──(SYS_THREAD_STOP)──► Stopped
-Running ──(SYS_THREAD_EXIT)──► Exited (TCB freed)
+Running / Ready / Blocked ──(SYS_THREAD_STOP)──► Stopped
+Stopped ──(SYS_THREAD_START)──► Ready
+Running ──(SYS_THREAD_EXIT)──► Exited (TCB freed when its last capability is deleted)
 ```
 
 State transitions are governed by the per-field-group ownership rules in

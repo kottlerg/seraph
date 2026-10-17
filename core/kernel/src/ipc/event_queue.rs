@@ -6,8 +6,9 @@
 //! Event queue IPC — ordered, non-coalescing ring buffer.
 //!
 //! An event queue holds a fixed-capacity ring of `u64` payloads. Senders
-//! append entries (non-blocking; `QueueFull` if full). A single receiver
-//! dequeues in FIFO order, blocking if empty.
+//! append entries (non-blocking; `QueueFull` if full). Receivers dequeue in
+//! FIFO order, blocking if empty; blocked receivers queue in arrival order
+//! ([`WaitQueue`](crate::ipc::WaitQueue)) and each post wakes the head.
 //!
 //! # Capacity
 //! The ring has `capacity + 1` slots internally (one-slot-gap full-detection).
@@ -15,9 +16,6 @@
 //!
 //! # Thread safety
 //! All operations serialise internally on `eq.lock`; callers must not hold it.
-//!
-//! # Adding features
-//! - Multiple receivers: replace `waiter` with an intrusive TCB queue.
 
 use crate::sched::thread::{IpcThreadState, ThreadControlBlock};
 
@@ -54,8 +52,9 @@ pub struct EventQueueState
     pub write_idx: u32,
     /// Read index into `ring` (next slot to read).
     pub read_idx: u32,
-    /// Single thread blocked waiting for an entry, or null.
-    pub waiter: *mut ThreadControlBlock,
+    /// Threads blocked waiting for an entry, in arrival order. Protected by
+    /// `lock`.
+    pub waiters: crate::ipc::WaitQueue,
     /// Opaque pointer to the `WaitSetState` this queue is registered with,
     /// or null. Type-erased to avoid a circular import; cast only in `wait_set.rs`.
     pub wait_set: *mut u8,
@@ -100,7 +99,7 @@ impl EventQueueState
             count: core::sync::atomic::AtomicU32::new(0),
             write_idx: 0,
             read_idx: 0,
-            waiter: core::ptr::null_mut(),
+            waiters: crate::ipc::WaitQueue::new(),
             wait_set: core::ptr::null_mut(),
             wait_set_member_idx: 0,
             lock: crate::sync::Spinlock::new(),
@@ -119,7 +118,7 @@ impl EventQueueState
 /// - If the queue is full, returns `Err(())`.
 ///   Syscall handler maps this to `SyscallError::QueueFull`.
 ///
-/// Between this function's waiter claim (slot cleared, payload deposited,
+/// Between this function's waiter claim (head waiter dequeued, payload deposited,
 /// `wake_in_flight = 1`) and the caller's post-unlock `enqueue_and_wake`, the
 /// wake is half-complete and owned exclusively by the in-flight waker. Code
 /// executing *as the claimed thread* in that window (it is still live,
@@ -143,39 +142,18 @@ pub unsafe fn event_queue_post(
     // SAFETY: lock serialises post/recv; paired with unlock_raw below.
     let saved = unsafe { eq.lock.lock_raw() };
 
-    // If a waiter is blocked, deliver directly without touching the ring.
-    if !eq.waiter.is_null()
+    // If receivers are blocked, deliver directly to the head without touching
+    // the ring.
+    if !eq.waiters.is_empty()
     {
-        let waiter = eq.waiter;
-        eq.waiter = core::ptr::null_mut();
-        // SAFETY: waiter is a valid TCB placed by event_queue_recv.
-        unsafe {
-            (*waiter).wakeup_value = payload;
-            // Claim for wake under eq.lock; dealloc's BlockedOnEventQueue
-            // unlink takes eq.lock and spins on this flag (#160). Cleared by
-            // enqueue_and_wake.
-            (*waiter)
-                .wake_in_flight
-                .store(1, core::sync::atomic::Ordering::Release);
-        }
-        // If the waiter was registered with a `SYS_EVENT_RECV` timeout, it
-        // is also on the global sleep list. Remove it here so the timer
-        // path will not try to double-wake this thread. We hold `eq.lock`;
-        // `sleep_list_remove` acquires `SLEEP_LIST_LOCK` internally
-        // (lock order: eq.lock → SLEEP_LIST_LOCK; the timer path takes
-        // SLEEP_LIST_LOCK first, releases it, and only then reaches for
-        // eq.lock — so no circular wait).
-        //
-        // ORDER (issue #117): call `sleep_list_remove` BEFORE clearing
-        // `sleep_deadline`. See `notification_send` for the race description.
-        // SAFETY: waiter is the TCB we just dequeued from eq.waiter.
-        unsafe {
-            if (*waiter).sleep_deadline != 0
-            {
-                crate::sched::sleep_list_remove(waiter);
-                (*waiter).sleep_deadline = 0;
-            }
-        }
+        // SAFETY: eq.lock held.
+        let waiter = unsafe { eq.waiters.pop() };
+        // Claim for wake under eq.lock: dealloc's BlockedOnEventQueue unlink
+        // takes eq.lock and spins on wake_in_flight (#160); a timed waiter's
+        // sleep-list entry goes with it (docs/thread-lifecycle-and-sleep.md
+        // § Sleep List Invariants, invariant 7).
+        // SAFETY: waiter is the valid TCB just removed from the queue.
+        unsafe { crate::ipc::claim_waiter(waiter, payload) };
         // SAFETY: paired with lock_raw above.
         unsafe { eq.lock.unlock_raw(saved) };
         return Ok(Some(waiter));
@@ -259,8 +237,10 @@ pub unsafe fn event_queue_try_recv(eq: *mut EventQueueState) -> Option<u64>
 /// Dequeue the next entry from the event queue.
 ///
 /// - If an entry is available, returns `Ok(payload)`.
-/// - If empty, sets `caller` as the waiter and returns `Err(())`.
-///   Syscall handler must call `schedule()` then read `wakeup_value`.
+/// - If empty, queues `caller` at the tail of the waiters, arms a non-zero
+///   `deadline` (a timed wait) on the sleep list in the same critical
+///   section, and returns `Err(())`. Syscall handler must call `schedule()`
+///   then read `wakeup_value`.
 ///
 /// # Safety
 /// `eq` and `caller` must be valid pointers; acquires `eq.lock` internally —
@@ -269,6 +249,7 @@ pub unsafe fn event_queue_try_recv(eq: *mut EventQueueState) -> Option<u64>
 pub unsafe fn event_queue_recv(
     eq: *mut EventQueueState,
     caller: *mut ThreadControlBlock,
+    deadline: u64,
 ) -> Result<u64, ()>
 {
     // SAFETY: caller guarantees eq is valid.
@@ -294,7 +275,8 @@ pub unsafe fn event_queue_recv(
             .context_saved
             .store(0, core::sync::atomic::Ordering::Relaxed);
     }
-    eq.waiter = caller;
+    // SAFETY: caller is a valid TCB on no queue; eq.lock held.
+    unsafe { eq.waiters.push(caller) };
     let blocked_on = core::ptr::addr_of_mut!(*eq).cast::<u8>();
     // SAFETY: caller is a valid TCB; eq.lock excludes other waiter writes.
     let committed = unsafe {
@@ -306,11 +288,12 @@ pub unsafe fn event_queue_recv(
     };
     if committed != crate::sched::ParkCommit::Committed
     {
-        // Refused park; roll back the waiter slot. eq.lock has been held
+        // Refused park; dequeue the caller again. eq.lock has been held
         // across publish/commit/rollback, so the rollback owns the episode.
         // A stop-won refusal stamps INTERRUPTED; a coalesced-wake refusal
         // leaves the deposit for the resume to deliver.
-        eq.waiter = core::ptr::null_mut();
+        // SAFETY: caller was pushed above; eq.lock held throughout.
+        unsafe { eq.waiters.remove(caller) };
         if committed == crate::sched::ParkCommit::RefusedStop
         {
             // SAFETY: caller is a valid TCB; episode owned per the above.
@@ -328,65 +311,47 @@ pub unsafe fn event_queue_recv(
                 .store(1, core::sync::atomic::Ordering::Relaxed);
         }
     }
+    else if deadline != 0
+    {
+        // SAFETY: caller committed Blocked; eq.lock held since the push.
+        unsafe { crate::ipc::arm_timed_park(caller, deadline, "event_recv") };
+    }
     // SAFETY: paired with lock_raw above.
     unsafe { eq.lock.unlock_raw(saved) };
     Err(())
 }
 
-/// Wake any thread blocked on `eq` with a zero payload (`ObjectGone`).
+/// Wake every thread blocked on `eq` with its park stamped
+/// [`PARK_DISPOSITION_INTERRUPTED`], so its `SYS_EVENT_RECV` returns
+/// `Interrupted`.
 ///
 /// Called from `dealloc_object` when the `EventQueue` cap's ref count
 /// hits zero. The ring buffer lives inline in the surrounding retype
 /// slot and is reclaimed by the caller via `retype_free`; there is
-/// nothing for this function to deallocate.
+/// nothing for this function to deallocate. The caller then runs
+/// `sleep_wakeups_quiesce` before the free.
+///
+/// [`PARK_DISPOSITION_INTERRUPTED`]: crate::sched::thread::PARK_DISPOSITION_INTERRUPTED
 ///
 /// # Safety
 /// `eq` must be a valid pointer to a live `EventQueueState`. Acquires `eq.lock`
-/// internally to claim the waiter; the caller MUST NOT hold it.
+/// internally to claim the waiters; the caller MUST NOT hold it.
 #[cfg(not(test))]
 pub unsafe fn event_queue_drop(eq: *mut EventQueueState)
 {
     // SAFETY: eq is a valid pointer.
     let eq = unsafe { &mut *eq };
 
-    // Claim the waiter under eq.lock — the #160 discipline event_queue_post
-    // uses — so a concurrent dealloc(waiter) BlockedOnEventQueue unlink (which
-    // takes eq.lock and spins on wake_in_flight) cannot free the TCB before our
-    // enqueue_and_wake commits.
+    // Claim every waiter under eq.lock, as event_queue_post claims (#160),
+    // and, as a multi-waiter drain, wake it under the lock too
+    // (docs/scheduling-internals.md § Lock Hierarchy rule 5), so a concurrent
+    // dealloc(waiter) BlockedOnEventQueue unlink (which takes eq.lock and
+    // spins on wake_in_flight) cannot free a TCB before its enqueue_and_wake
+    // commits.
     // SAFETY: lock_raw paired with unlock_raw below.
     let saved = unsafe { eq.lock.lock_raw() };
-    let waiter = eq.waiter;
-    if !waiter.is_null()
-    {
-        eq.waiter = core::ptr::null_mut();
-        // SAFETY: waiter is a valid TCB.
-        unsafe {
-            (*waiter).wakeup_value = 0;
-            // Claim for wake under eq.lock (#160). Cleared by enqueue_and_wake.
-            (*waiter)
-                .wake_in_flight
-                .store(1, core::sync::atomic::Ordering::Release);
-            // A timed waiter is also on the sleep list; drop the entry under
-            // eq.lock (the #117 remove-before-clear order) so the timer can
-            // neither double-wake it nor hijack a later unrelated park via
-            // the stale entry. Mirrors event_queue_post's claim.
-            if (*waiter).sleep_deadline != 0
-            {
-                crate::sched::sleep_list_remove(waiter);
-                (*waiter).sleep_deadline = 0;
-            }
-        }
-    }
+    // SAFETY: eq.lock held; no scheduler or sleep-list lock held.
+    unsafe { crate::ipc::interrupt_all_waiters(&mut eq.waiters) };
     // SAFETY: paired with lock_raw above.
     unsafe { eq.lock.unlock_raw(saved) };
-
-    if !waiter.is_null()
-    {
-        // SAFETY: waiter kept valid by wake_in_flight = 1 above; enqueue_and_wake
-        // commits the Blocked→Ready transition under the waiter's sched_lock.
-        unsafe {
-            let target_cpu = crate::sched::select_target_cpu(waiter);
-            crate::sched::enqueue_and_wake(waiter, target_cpu);
-        }
-    }
 }

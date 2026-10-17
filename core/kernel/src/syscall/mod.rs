@@ -322,9 +322,7 @@ fn sys_thread_sleep(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         return Ok(0);
     }
 
-    let tps = crate::arch::current::timer::ticks_per_second();
-    let now = crate::arch::current::timer::current_tick();
-    let deadline = now.saturating_add(ms.saturating_mul(tps) / 1000);
+    let deadline = crate::sched::sleep_deadline_after_ms(ms);
 
     // SAFETY: current_tcb() returns this CPU's running thread.
     let tcb = unsafe { current_tcb() };
@@ -337,10 +335,14 @@ fn sys_thread_sleep(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // SAFETY: tcb is the running caller, not yet claimable.
     unsafe { crate::sched::thread::open_park_episode(tcb) };
 
-    // SAFETY: tcb validated non-null; sleep_deadline read by the timer path only
-    // after sleep_list_add below.
+    // Set before the park commit: from the commit on, a cancellation
+    // (`cancel_ipc_block` under sched_lock) can clear it, and the add below
+    // then refuses.
+    // SAFETY: tcb validated non-null.
     unsafe {
-        (*tcb).sleep_deadline = deadline;
+        (*tcb)
+            .sleep_deadline
+            .store(deadline, core::sync::atomic::Ordering::Relaxed);
     }
 
     // Commit Running→Blocked under the per-TCB sched_lock (the authoritative
@@ -363,9 +365,11 @@ fn sys_thread_sleep(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         {
             // Stray coalesced wake; no sleep-list entry was added and the
             // thread stays runnable — report the (zero-length) sleep done.
-            // SAFETY: tcb valid.
+            // SAFETY: tcb valid; never parked, so no canceller targets it.
             unsafe {
-                (*tcb).sleep_deadline = 0;
+                (*tcb)
+                    .sleep_deadline
+                    .store(0, core::sync::atomic::Ordering::Relaxed);
             }
             return Ok(0);
         }
@@ -378,38 +382,55 @@ fn sys_thread_sleep(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             // SAFETY: tcb valid; no sleep-list entry was added. schedule is
             // called from syscall context on a valid kernel stack.
             unsafe {
-                (*tcb).sleep_deadline = 0;
+                (*tcb)
+                    .sleep_deadline
+                    .store(0, core::sync::atomic::Ordering::Relaxed);
                 crate::sched::schedule(false);
             }
             return Err(SyscallError::Interrupted);
         }
     }
 
-    if crate::sched::sleep_list_add(tcb).is_err()
+    // SAFETY: tcb is this CPU's running thread.
+    match unsafe { crate::sched::sleep_list_add(tcb) }
     {
-        // Sleep list at capacity. Roll back the Blocked commit: sys_thread_sleep
-        // has no IPC source to fall back on; the only honest answer is to surface
-        // the failure to userspace. See docs/thread-lifecycle-and-sleep.md
-        // § Sleep List Invariants. No IPC source binding and no waker targets a
-        // sleeping thread before sleep_list_add, so the thread is still Blocked
-        // here; restore Running under sched_lock.
-        // The successful commit_blocked above cleared context_saved = 0; this
-        // rollback leaves the thread Running with cs = 0, which is intentional
-        // and benign — cs = 0 truthfully means "live registers authoritative"
-        // for a still-`current`, never-switched-out thread, no path dispatches a
-        // not-linked `current` thread cross-CPU, and the next switch-out
-        // republishes cs = 1. Do NOT "restore" cs = 1 here.
-        // SAFETY: tcb valid; restoring before any schedule().
-        unsafe {
-            let saved = (*tcb).sched_lock.lock_raw();
-            if (*tcb).state == crate::sched::thread::ThreadState::Blocked
-            {
-                (*tcb).state = crate::sched::thread::ThreadState::Running;
-            }
-            (*tcb).sleep_deadline = 0;
-            (*tcb).sched_lock.unlock_raw(saved);
+        Ok(()) | Err(crate::sched::SleepAddError::Cancelled) =>
+        {
+            // Cancelled: a stop or teardown cancelled the park between the
+            // commit and the add, stamped it INTERRUPTED, and commits Stopped
+            // or Exited; schedule() below deschedules the thread and the
+            // resume takes that stamp.
         }
-        return Err(SyscallError::OutOfMemory);
+        Err(crate::sched::SleepAddError::Full) =>
+        {
+            // Sleep list at capacity. Roll back the Blocked commit:
+            // sys_thread_sleep has no IPC source to fall back on; the only
+            // honest answer is to surface the failure to userspace. See
+            // docs/thread-lifecycle-and-sleep.md § Sleep List Invariants. No
+            // waker targets a plain sleeper, so the thread is still Blocked
+            // unless a canceller won (it then commits Stopped or Exited over
+            // the restored Running); restore Running under sched_lock.
+            // The successful commit_blocked above cleared context_saved = 0;
+            // this rollback leaves the thread Running with cs = 0, which is
+            // intentional and benign — cs = 0 truthfully means "live registers
+            // authoritative" for a still-`current`, never-switched-out thread,
+            // no path dispatches a not-linked `current` thread cross-CPU, and
+            // the next switch-out republishes cs = 1. Do NOT "restore" cs = 1
+            // here.
+            // SAFETY: tcb valid; restoring before any schedule().
+            unsafe {
+                let saved = (*tcb).sched_lock.lock_raw();
+                if (*tcb).state == crate::sched::thread::ThreadState::Blocked
+                {
+                    (*tcb).state = crate::sched::thread::ThreadState::Running;
+                }
+                (*tcb)
+                    .sleep_deadline
+                    .store(0, core::sync::atomic::Ordering::Relaxed);
+                (*tcb).sched_lock.unlock_raw(saved);
+            }
+            return Err(SyscallError::OutOfMemory);
+        }
     }
 
     // SAFETY: called from syscall handler on valid kernel stack.
@@ -418,8 +439,8 @@ fn sys_thread_sleep(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     }
 
     // On resume, either timer_tick's sleep-list claim woke us (success) or a
-    // cancellation claim (`cancel_ipc_block`'s sleep-list-remove win) stamped
-    // the park INTERRUPTED.
+    // cancellation claim (`cancel_ipc_block`'s `sleep_list_remove` returning
+    // true) stamped the park INTERRUPTED.
     // SAFETY: tcb still valid after resume.
     if unsafe { crate::sched::thread::consume_park_interrupted(tcb) }
     {
@@ -687,6 +708,13 @@ pub(crate) unsafe fn current_tcb() -> *mut crate::sched::thread::ThreadControlBl
 /// - Generation mismatch (stale handle to a recycled slot) →
 ///   [`SyscallError::InvalidCapability`] (#349).
 /// - Insufficient rights → [`SyscallError::InsufficientRights`].
+///
+/// # Safety
+/// `cspace` must be null or point at a live `CSpace`. The returned reference
+/// borrows the slot, not the object it names: nothing pins that object past
+/// the lookup, so a caller that dereferences the object across a point where
+/// another thread may delete its last capability reads freed memory
+/// (#443 § Unpinned capability lookup).
 #[cfg(not(test))]
 pub(crate) unsafe fn lookup_cap<K: crate::cap::slot::CapKind>(
     cspace: *mut crate::cap::cspace::CSpace,

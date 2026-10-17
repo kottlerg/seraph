@@ -34,10 +34,9 @@
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use syscall::{
-    MAP_READ, MAP_WRITABLE, cap_delete, cap_info, mem_map, mem_protect, mem_unmap, system_info,
-    thread_sleep,
+    MAP_READ, MAP_WRITABLE, cap_delete, mem_map, mem_protect, mem_unmap, system_info, thread_sleep,
 };
-use syscall_abi::{CAP_INFO_THREAD_STATE, SystemInfoType, THREAD_STATE_EXITED};
+use syscall_abi::SystemInfoType;
 
 use crate::{ChildStack, TestContext, TestResult};
 
@@ -111,10 +110,10 @@ pub fn run(ctx: &TestContext) -> TestResult
     PHASE.store(PHASE_MAPPED, Ordering::Release);
 
     // Wait for the child to cache the read-only entry on CPU 1.
-    if !parent_wait_phase(PHASE_CACHED, &child)
+    if let Err(reason) = await_cached(&child)
     {
         cleanup(ctx, Some(&child), memory_cap);
-        return Err("integration::tlb_widen_retry: child never cached the mapping");
+        return Err(reason);
     }
 
     // Widen R-- → RW-. Same Memory cap, strictly broader rights ⇒ MapOutcome::Widen ⇒
@@ -133,28 +132,12 @@ pub fn run(ctx: &TestContext) -> TestResult
     }
     PHASE.store(PHASE_WIDENED, Ordering::Release);
 
-    // Wait for the child's store to complete via the retry path — or catch a
-    // kill (the child exiting before PHASE_WROTE means the widened write faulted
-    // and was mis-classified as genuine).
-    let mut polls = 0;
-    loop
+    // Wait for the child's store to complete via the retry path, or catch its
+    // kill.
+    if let Err(reason) = await_written(&child)
     {
-        if PHASE.load(Ordering::Acquire) >= PHASE_WROTE
-        {
-            break;
-        }
-        if child_exited(&child)? && PHASE.load(Ordering::Acquire) < PHASE_WROTE
-        {
-            cleanup(ctx, Some(&child), memory_cap);
-            return Err("integration::tlb_widen_retry: child killed writing widened mapping");
-        }
-        polls += 1;
-        if polls >= MAX_POLLS
-        {
-            cleanup(ctx, Some(&child), memory_cap);
-            return Err("integration::tlb_widen_retry: child never completed the write");
-        }
-        thread_sleep(1).ok();
+        cleanup(ctx, Some(&child), memory_cap);
+        return Err(reason);
     }
 
     if RESULT.load(Ordering::Acquire) != SENTINEL
@@ -167,38 +150,53 @@ pub fn run(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
-/// Spin (no yield) until `PHASE` reaches `target`, polling the child's liveness
-/// so a child that died before notifying does not spin to the bound. Returns
-/// `false` on timeout or an early child exit.
-fn parent_wait_phase(target: u32, child: &crate::spawn::SpawnedChild) -> bool
+/// Poll, in 1 ms sleeps, until the child reports `PHASE_CACHED`, probing its
+/// liveness so a child that died before notifying does not poll to the
+/// bound. A refused probe is its own failure, reported as such.
+fn await_cached(child: &crate::spawn::SpawnedChild) -> TestResult
 {
     let mut polls = 0;
-    while PHASE.load(Ordering::Acquire) < target
+    while PHASE.load(Ordering::Acquire) < PHASE_CACHED
     {
-        if child_exited(child).unwrap_or(true) && PHASE.load(Ordering::Acquire) < target
+        // Re-read the phase after the probe: a child that notified and then
+        // exited between the two reads reached the phase.
+        if crate::spawn::is_exited(child.th)? && PHASE.load(Ordering::Acquire) < PHASE_CACHED
         {
-            return false;
+            return Err("integration::tlb_widen_retry: child exited before caching the mapping");
         }
         polls += 1;
         if polls >= MAX_POLLS
         {
-            return false;
+            return Err("integration::tlb_widen_retry: child never cached the mapping");
         }
         thread_sleep(1).ok();
     }
-    true
+    Ok(())
 }
 
-/// Whether the child thread has reached the `Exited` state.
-fn child_exited(child: &crate::spawn::SpawnedChild) -> Result<bool, &'static str>
+/// Poll, in 1 ms sleeps, until the child reports `PHASE_WROTE`, or catch its
+/// kill: a child that exits before it means the widened write faulted and
+/// was mis-classified as genuine, the defect this test catches. A refused
+/// liveness probe is its own failure, not that verdict.
+fn await_written(child: &crate::spawn::SpawnedChild) -> TestResult
 {
-    let packed = cap_info(child.th, CAP_INFO_THREAD_STATE)
-        .map_err(|_| "integration::tlb_widen_retry: cap_info(THREAD_STATE) failed")?;
-    // cast_possible_truncation: the kernel packs an 8-bit state code in the high
-    // word and a 32-bit exit reason in the low word.
-    #[allow(clippy::cast_possible_truncation)]
-    let state = (packed >> 32) as u32;
-    Ok(state == THREAD_STATE_EXITED)
+    let mut polls = 0;
+    while PHASE.load(Ordering::Acquire) < PHASE_WROTE
+    {
+        // Re-read the phase after the probe: a child that notified and then
+        // exited between the two reads completed the write.
+        if crate::spawn::is_exited(child.th)? && PHASE.load(Ordering::Acquire) < PHASE_WROTE
+        {
+            return Err("integration::tlb_widen_retry: child killed writing widened mapping");
+        }
+        polls += 1;
+        if polls >= MAX_POLLS
+        {
+            return Err("integration::tlb_widen_retry: child never completed the write");
+        }
+        thread_sleep(1).ok();
+    }
+    Ok(())
 }
 
 /// Wait for the child to exit cooperatively, then delete its caps, unmap the
@@ -211,7 +209,7 @@ fn cleanup(ctx: &TestContext, child: Option<&crate::spawn::SpawnedChild>, memory
         // cap_delete never races a still-running pinned thread (which can hang
         // the harness on a CPU with no other ready thread).
         let mut polls = 0;
-        while !child_exited(child).unwrap_or(true)
+        while !crate::spawn::is_exited(child.th).unwrap_or(true)
         {
             polls += 1;
             if polls >= MAX_POLLS

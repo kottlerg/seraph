@@ -793,6 +793,9 @@ dependencies = [
 [[package]]
 name = "procmgr-process-table"
 version = "0.1.1"
+dependencies = [
+ "ipc",
+]
 
 [[package]]
 name = "pwrmgr"
@@ -1021,6 +1024,7 @@ dependencies = [
 name = "svcmgr-defs"
 version = "0.1.1"
 dependencies = [
+ "ipc",
  "namespace-protocol",
  "registry",
  "syscall-abi",
@@ -1036,6 +1040,7 @@ dependencies = [
  "process-layout",
  "shmem",
  "syscall",
+ "syscall-abi",
 ]
 
 [[package]]

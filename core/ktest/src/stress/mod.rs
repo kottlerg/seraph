@@ -34,12 +34,23 @@ mod event_try_recv_post_race;
 mod fpu_migration_churn;
 mod idle_wake_race;
 mod load_balance_handoff_steal;
+mod mutual_stop;
 mod priority_dealloc_race;
 mod retype_concurrent;
 mod split_delete_race;
+mod stop_claimed_delete;
+mod stop_fault_sender;
+mod stop_owed_wake;
+mod stop_park_race;
+mod stop_repark;
 mod stop_reply_race;
 mod stop_resume_race;
+mod stop_sleep_window;
+mod stop_target_vanishes;
 mod thread_churn;
+mod timed_wait_reuse;
+mod timed_wait_source_delete;
+mod timed_waiter_thread_delete;
 
 use crate::{ChildStack, TestContext, run_integration_test};
 
@@ -81,6 +92,26 @@ pub fn run_all(ctx: &TestContext)
     );
     run_integration_test!("stress::stop_reply_race", stop_reply_race::run(ctx));
     run_integration_test!("stress::stop_resume_race", stop_resume_race::run(ctx));
+    run_integration_test!("stress::stop_sleep_window", stop_sleep_window::run(ctx));
+    run_integration_test!("stress::stop_park_race", stop_park_race::run(ctx));
+    run_integration_test!("stress::stop_owed_wake", stop_owed_wake::run(ctx));
+    run_integration_test!("stress::stop_fault_sender", stop_fault_sender::run(ctx));
+    run_integration_test!("stress::mutual_stop", mutual_stop::run(ctx));
+    run_integration_test!("stress::stop_repark", stop_repark::run(ctx));
+    run_integration_test!("stress::stop_claimed_delete", stop_claimed_delete::run(ctx));
+    run_integration_test!(
+        "stress::stop_target_vanishes",
+        stop_target_vanishes::run(ctx)
+    );
+    run_integration_test!(
+        "stress::timed_wait_source_delete",
+        timed_wait_source_delete::run(ctx)
+    );
+    run_integration_test!(
+        "stress::timed_waiter_thread_delete",
+        timed_waiter_thread_delete::run(ctx)
+    );
+    run_integration_test!("stress::timed_wait_reuse", timed_wait_reuse::run(ctx));
     run_integration_test!(
         "stress::double_enqueue_storm",
         double_enqueue_storm::run(ctx)

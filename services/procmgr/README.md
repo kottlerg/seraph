@@ -22,8 +22,9 @@ Between memmgr and procmgr).
 procmgr/
 ├── Cargo.toml                  # Workspace member; std-using binary
 ├── README.md
-├── process-table/              # `procmgr-process-table` crate:
-│                                 pure host-tested table + badge logic
+├── process-table/              # `procmgr-process-table` crate: pure host-tested
+│                                 table + badge logic and the create-request
+│                                 argv/env blob decoder
 ├── src/
 │   ├── main.rs                 # _start() entry point, IPC dispatch loop
 │   ├── loader.rs               # ELF load pipeline

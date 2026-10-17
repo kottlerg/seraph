@@ -1117,6 +1117,8 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 sched_lock: crate::sync::Spinlock::new(),
                 wake_pending: false,
                 park_started_tick: 0,
+                park_seq: core::sync::atomic::AtomicU32::new(0),
+                start_seq: 0,
                 ipc_state: IpcThreadState::None,
                 ipc_msg: Message::default(),
                 reply_tcb: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
@@ -1128,6 +1130,8 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 #[cfg(debug_assertions)]
                 deposit_episode: core::sync::atomic::AtomicU32::new(0),
                 ipc_wait_next: None,
+                ipc_wait_prev: core::ptr::null_mut(),
+                ipc_wait_queue: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
                 fault_handler: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
                 fault_badge: core::sync::atomic::AtomicU64::new(0),
                 fault_outcome: core::sync::atomic::AtomicU8::new(0),
@@ -1153,7 +1157,7 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                     crate::sched::thread::MAX_DEATH_OBSERVERS],
                 death_observer_count: 0,
                 exit_reason: 0,
-                sleep_deadline: 0,
+                sleep_deadline: core::sync::atomic::AtomicU64::new(0),
                 extended: crate::sched::thread::ExtendedState::from_raw(extended_area),
                 registry_next: core::ptr::null_mut(),
                 registry_prev: core::ptr::null_mut(),
@@ -1226,8 +1230,9 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             // this TCB and no IPC object has a back-pointer to it. Unlink it
             // from the registry (an object teardown walking it meanwhile saw
             // a `Created` thread and marked it `Exited`, which is harmless
-            // here), drop both in-place objects, return the slot bytes (all
-            // 5 pages) to the ancestor cap, and undo the lease bump.
+            // here), drop both in-place objects, return the slot bytes (the
+            // whole slot, entry.raw_bytes) to the ancestor cap, and undo the
+            // lease bump.
             // SAFETY: tcb and wrapper were just constructed in place above;
             // the registry is the only structure that has observed the TCB.
             unsafe {

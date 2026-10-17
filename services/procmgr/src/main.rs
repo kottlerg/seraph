@@ -724,81 +724,6 @@ fn handle_configure_namespace(
     reply_empty(ipc_buf, code);
 }
 
-/// Argv/env blobs extracted from a create request's label fields and data
-/// words, owning the staging buffers so both create handlers share one
-/// extraction path.
-struct CreateBlobs
-{
-    args_buf: [u8; ipc::ARGS_BLOB_MAX],
-    args_len: usize,
-    args_count: u32,
-    env_buf: [u8; ipc::ARGS_BLOB_MAX],
-    env_len: usize,
-    env_count: u32,
-}
-
-impl CreateBlobs
-{
-    /// Extract the blobs from `req`. `first_word` is the data-word offset
-    /// of the argv blob: 0 for `CREATE_PROCESS`, 1 for `CREATE_FROM_FILE`
-    /// (which carries `file_size` in word 0). Oversized or absent blobs
-    /// degrade to empty, matching the wire contract.
-    fn extract(req: &IpcMessage, first_word: usize) -> Self
-    {
-        let label = req.label;
-        let args_bytes = ((label >> 32) & 0xFFFF) as usize;
-        let mut blobs = Self {
-            args_buf: [0u8; ipc::ARGS_BLOB_MAX],
-            args_len: 0,
-            args_count: ((label >> 48) & 0xFF) as u32,
-            env_buf: [0u8; ipc::ARGS_BLOB_MAX],
-            env_len: 0,
-            env_count: ((label >> 56) & 0xFF) as u32,
-        };
-        if args_bytes > 0 && args_bytes <= ipc::ARGS_BLOB_MAX
-        {
-            copy_bytes_from_msg(req, first_word, args_bytes, &mut blobs.args_buf);
-            blobs.args_len = args_bytes;
-        }
-        // Env blob (when present) sits after the argv words: 1 header word
-        // carrying env_bytes, then the blob itself. Bounds: same
-        // ARGS_BLOB_MAX as argv — env must also fit in the ProcessInfo
-        // page tail.
-        let argv_words = args_bytes.div_ceil(8);
-        if blobs.env_count > 0
-        {
-            let env_bytes = (req.word(first_word + argv_words) & 0xFFFF) as usize;
-            if env_bytes > 0 && env_bytes <= ipc::ARGS_BLOB_MAX
-            {
-                copy_bytes_from_msg(
-                    req,
-                    first_word + argv_words + 1,
-                    env_bytes,
-                    &mut blobs.env_buf,
-                );
-                blobs.env_len = env_bytes;
-            }
-        }
-        blobs
-    }
-
-    fn args(&self) -> process::ChildArgs<'_>
-    {
-        process::ChildArgs {
-            blob: &self.args_buf[..self.args_len],
-            count: self.args_count,
-        }
-    }
-
-    fn env(&self) -> process::ChildEnv<'_>
-    {
-        process::ChildEnv {
-            blob: &self.env_buf[..self.env_len],
-            count: self.env_count,
-        }
-    }
-}
-
 /// Resolve the scheduling fields of a create label against the caller's
 /// spawn ceiling. `None` means the request must be rejected with
 /// `INVALID_ARGUMENT`: still-reserved label bits are set, the requested
@@ -916,7 +841,7 @@ fn handle_create(
         return;
     };
 
-    let blobs = CreateBlobs::extract(req, 0);
+    let blobs = process::CreateBlobs::extract(req, 0);
 
     // Register this child with memmgr. memmgr replies with a badged SEND
     // cap on its endpoint plus the memmgr-side process badge. Procmgr:
@@ -1116,7 +1041,7 @@ fn handle_create_from_file(
 
     let file_size = req.word(0);
 
-    let blobs = CreateBlobs::extract(req, 1);
+    let blobs = process::CreateBlobs::extract(req, 1);
 
     let result = process::create_process_from_file(
         ctx,
@@ -1151,20 +1076,5 @@ fn handle_create_from_file(
             }
             reply_empty(ipc_buf, code);
         }
-    }
-}
-
-/// Copy up to `len` bytes from the IPC message's data-byte view into `dst`,
-/// starting at word offset `word_offset`. Used to extract argv/env blobs
-/// from positions other than the start of the data area.
-fn copy_bytes_from_msg(msg: &IpcMessage, word_offset: usize, len: usize, dst: &mut [u8])
-{
-    let bytes = msg.data_bytes();
-    let src_start = word_offset * 8;
-    let avail = bytes.len().saturating_sub(src_start);
-    let copy_len = len.min(dst.len()).min(avail);
-    if copy_len > 0
-    {
-        dst[..copy_len].copy_from_slice(&bytes[src_start..src_start + copy_len]);
     }
 }

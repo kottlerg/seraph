@@ -69,8 +69,7 @@ permanent loss* (per [service-definitions.md](service-definitions.md#critical)).
      subsequent deaths can.
    * Spawn a fresh instance via the shared primitive
      [`walk_and_create_from_file`](#shared-spawn-primitives) (VFS
-     path) or `CREATE_PROCESS` with a fresh module-cap derivation,
-     replaying the recipe's `argv` / `env` from the stored
+     path), replaying the recipe's `argv` / `env` from the stored
      [`RestartRecipe`](../src/service.rs).
    * Re-apply the per-service namespace policy **and `cwd`** via
      [`apply_namespace_policy`](#shared-spawn-primitives).
@@ -107,7 +106,11 @@ identical across both code paths:
   universal `root_dir_cap` for the binary path, then call
   `procmgr_labels::CREATE_FROM_FILE` with argv / env blobs. Both paths
   build the blobs from the recipe: launch from the parsed `Definition`,
-  restart from the stored [`RestartRecipe`](../src/service.rs).
+  restart from the stored [`RestartRecipe`](../src/service.rs). Before
+  minting any cap the primitive refuses (logged, returns `None`) argv / env
+  whose packed layout exceeds `MSG_DATA_WORDS_MAX`, a backstop behind the
+  parser's `TooLarge` rejection; on restart that `None` fails the attempt
+  and is routed through `permanent_death_outcome`.
 * [`apply_namespace_policy`](../src/restart.rs) — resolve the namespace
   cap for `NS_POLICY_NONE` / `_UNIVERSAL` / `_SUBTREE`, then hand it (and
   the optional `cwd` cap) to the shared `configure_namespace_caps`. Both
@@ -140,7 +143,6 @@ at reconciliation time. The fixed-size fields live on `ServiceEntry`:
 | `ns_policy_kind` / `ns_subtree_path` / `ns_subtree_rights` | `namespace = ...` |
 | `thread_cap` | endowment thread cap (bind-only) or `Launched.thread_cap` (svcmgr-launched) |
 | `process_handle` | `Launched.process_handle` for svcmgr-launched; `0` for init-spawned (see DESTROY_PROCESS comment above) |
-| `module_cap` | `0` (services restart from their `vfs_path`; no module caps are held) |
 
 The heap-backed launch surfaces that don't fit the fixed record are held
 in a parallel [`RestartRecipe`](../src/service.rs) table

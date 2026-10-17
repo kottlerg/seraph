@@ -16,7 +16,7 @@ use process_abi::{
     PROCESS_MAIN_TLS_MAX_PAGES,
 };
 use process_layout::{ProcessLayout, choose_process_layout};
-use syscall_abi::{FAULT_CLASS_ALL, PAGE_SIZE};
+use syscall_abi::{FAULT_CLASS_ALL, PAGE_SIZE, SyscallError};
 
 /// Max file data bytes per VFS read IPC. Word 0 = `bytes_read`, words 1..63 = data.
 const VFS_CHUNK_SIZE: u64 = 63 * 8; // 504 bytes
@@ -158,14 +158,16 @@ pub fn install_logd_death_eq(table: &mut ProcessTable, logd_eq: u32) -> bool
     true
 }
 
-// Pure process-table, badge, and recent-exit logic now lives in the
-// host-testable `procmgr-process-table` crate; the syscall/IPC-bearing
-// operations below stay in the service and drive its lookups. Re-exported so
-// the `process::{ProcessTable, ProcessEntry, RecentExits, MAX_PROCESSES}` paths
-// `main.rs` already uses keep resolving unchanged.
+// Pure process-table, badge, recent-exit, and create-request blob logic
+// (`ChildArgs`, `ChildEnv`, `CreateBlobs`) lives in the host-testable
+// `procmgr-process-table` crate; the syscall/IPC-bearing operations below
+// stay in the service and drive its lookups. Re-exported so the
+// `process::{ProcessTable, ProcessEntry, RecentExits, MAX_PROCESSES}` paths
+// `main.rs` uses, and its `process::CreateBlobs::extract` call sites in the
+// two create handlers, resolve through this module.
 pub use process_table::{
-    MAX_PROCESSES, ProcessEntry, ProcessTable, RecentExits, badge_is_acceptable,
-    resolve_spawn_sched,
+    ChildArgs, ChildEnv, CreateBlobs, MAX_PROCESSES, ProcessEntry, ProcessTable, RecentExits,
+    badge_is_acceptable, resolve_spawn_sched,
 };
 
 // ── Process table (impure operations) ─────────────────────────────────────────
@@ -203,9 +205,12 @@ impl TableExt for ProcessTable
     /// `direction` is one of `ipc::procmgr_labels::PIPE_DIR_STDIN`,
     /// `PIPE_DIR_STDOUT`, `PIPE_DIR_STDERR`. The three caps are
     /// `cap_copy`'d into the child's `CSpace` with `RIGHTS_MEM_MAP_RW` for
-    /// the memory cap and `RIGHTS_ALL` for the two notifications (notification objects
-    /// don't currently distinguish send/wait at the cap-rights level —
-    /// each peer holds a full cap and uses send or wait as appropriate).
+    /// the memory cap and `RIGHTS_ALL` for the two notifications. Per pipe,
+    /// each end kicks one notification and waits on the other (the writer
+    /// kicks `data` and waits on `space`, the reader the reverse; the
+    /// parent's death bridge kicks both), and both ends hold both caps with
+    /// Notify and Wait rights (`abi/process-abi` `ProcessInfo` pipe fields),
+    /// so the child's copies carry Notify and Wait whichever end it holds.
     /// The resulting slot indices are written into the matching
     /// `<dir>_memory_cap` / `<dir>_data_notification_cap` /
     /// `<dir>_space_notification_cap` fields of the child's `ProcessInfo`.
@@ -443,30 +448,6 @@ pub struct UniversalCaps
     /// [`Self::memmgr_endpoint`] (the child's badged cap). Zero when memmgr is
     /// not reachable.
     pub self_memmgr_ep: u32,
-}
-
-/// Program arguments delivered to a child process at spawn time.
-///
-/// `blob` is a concatenation of `count` NUL-terminated UTF-8 strings. Empty
-/// slice + zero count means "no argv". The blob format and its page-remainder
-/// bound are defined by the argv section comment above
-/// `ProcessInfo::args_offset` in `abi/process-abi/src/lib.rs`.
-#[derive(Clone, Copy, Default)]
-pub struct ChildArgs<'a>
-{
-    pub blob: &'a [u8],
-    pub count: u32,
-}
-
-/// Environment variables delivered to a child process at spawn time.
-///
-/// Same shape as [`ChildArgs`] except each entry is `KEY=VALUE`. Empty
-/// slice + zero count means "no env". Same page-remainder bound.
-#[derive(Clone, Copy, Default)]
-pub struct ChildEnv<'a>
-{
-    pub blob: &'a [u8],
-    pub count: u32,
 }
 
 /// TLS template metadata extracted from a child's `PT_TLS` segment,
@@ -2614,6 +2595,22 @@ pub fn teardown_entry(entry: ProcessEntry, memmgr_ep: u32, ipc_buf: *mut u64)
 /// namespace authority. `finalize_creation` already bound the child's
 /// main thread to procmgr's shared death queue, so this just configures
 /// the thread and kicks it.
+///
+/// # Errors
+/// Returns the `START_PROCESS` reply code (`services/procmgr/docs/ipc-interface.md`
+/// § Label 2):
+/// - `procmgr_errors::INVALID_BADGE` (4) — no process in `table` carries
+///   `badge`.
+/// - `procmgr_errors::ALREADY_STARTED` (5) — the process was started before.
+/// - `procmgr_errors::OUT_OF_MEMORY` (2) — a namespace or cwd override is
+///   pending and either the scratch mapping of the child's `ProcessInfo`
+///   page or the `cap_copy` of an override cap into the child's `CSpace`
+///   failed.
+/// - `3` — `thread_configure_with_tls` of the child's main thread failed.
+///   A raw value with no `procmgr_errors` constant.
+/// - `6` — `thread_start` of the child's main thread failed with an error
+///   other than `Interrupted`, which is retried. A raw value with no
+///   `procmgr_errors` constant.
 pub fn start_process(badge: u64, table: &mut ProcessTable, self_aspace: u32) -> Result<(), u64>
 {
     let entry = table
@@ -2666,7 +2663,19 @@ pub fn start_process(badge: u64, table: &mut ProcessTable, self_aspace: u32) -> 
     )
     .map_err(|_| 3u64)?;
 
-    syscall::thread_start(entry.thread_cap).map_err(|_| 6u64)?;
+    // `Interrupted` means procmgr's thread was stopped while the start waited
+    // for the child's thread to settle; nothing was started, so the start is
+    // retried.
+    loop
+    {
+        match syscall::thread_start(entry.thread_cap)
+        {
+            Ok(()) => break,
+            Err(e) if e == SyscallError::Interrupted as i64 =>
+            {}
+            Err(_) => return Err(6),
+        }
+    }
 
     entry.started = true;
     Ok(())

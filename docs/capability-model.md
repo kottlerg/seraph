@@ -692,9 +692,11 @@ including the deleting thread itself, when it holds that last capability to its 
 `AddressSpace` (the delete then never returns to it). The process's resources are reclaimed as their
 capability reference counts reach zero. This path has known kernel memory-safety gaps, tracked in
 [#443](https://github.com/kottlerg/seraph/issues/443) (see
-[IPC Design](ipc-design.md#the-callreply-model) § The Call/Reply Model and
 [capability-internals.md](../core/kernel/docs/capability-internals.md#storage-hybrid-two-level-radix)
-§ Storage: Hybrid Two-Level Radix).
+§ Storage: Hybrid Two-Level Radix,
+[thread-lifecycle-and-sleep.md](../core/kernel/docs/thread-lifecycle-and-sleep.md#dealloc_objectthread-drain-protocol)
+§ `dealloc_object(Thread)` Drain Protocol, step 11, and
+[syscalls.md](../core/kernel/docs/syscalls.md#sys_thread_stop-20) § `SYS_THREAD_STOP`).
 
 Beyond that stop, the kernel's role in death is *notification*. An
 `AddressSpace` carries a death-observer set (mirroring the per-thread death
